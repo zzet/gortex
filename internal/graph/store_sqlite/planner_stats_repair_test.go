@@ -119,6 +119,9 @@ func statRowCount(t *testing.T, stat string) int {
 // test that drops an index rebuilds byte-identical DDL.
 func indexDDLByName(t *testing.T, name string) string {
 	t.Helper()
+	if name == edgesByFileGenerationIndexName {
+		return edgesByFileGenerationIndexDDL // the lazy index (lazy_graph_indexes.go)
+	}
 	for _, group := range [][]bulkDroppableIndex{bulkDroppableIndexes, bulkAlwaysLiveIndexes} {
 		for _, idx := range group {
 			if idx.name == name {

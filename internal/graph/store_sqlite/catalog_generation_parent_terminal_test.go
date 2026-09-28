@@ -71,6 +71,20 @@ func retirementFenceUnclaimed(t *testing.T, f *dedicatedPublicationFixture) (int
 
 func retirementFenceNoWrites(t *testing.T, f *dedicatedPublicationFixture) func() {
 	t.Helper()
+	// The store's own planner-statistics refresh writes sqlite_stat1 after a
+	// publication, on its maintenance lane; settle it first, so the log's
+	// size measures the call under test and nothing beside it.
+	for i := 0; i < 5; i++ {
+		h, err := f.store.EnsurePlannerStatsFresh(context.Background())
+		if err != nil || !h.Stale {
+			break
+		}
+	}
+	waitForCondition(t, "the maintenance lane settles", func() bool {
+		f.store.maintenanceSched.Lock()
+		defer f.store.maintenanceSched.Unlock()
+		return !f.store.maintenanceOwed && !f.store.maintenanceRunning
+	})
 	f.exec(t, `CREATE TABLE retirement_fence_write_audit (n INTEGER NOT NULL)`)
 	f.exec(t, `INSERT INTO retirement_fence_write_audit VALUES(0)`)
 	f.exec(t, `CREATE TRIGGER retirement_fence_write_audit_update AFTER UPDATE ON view_generations BEGIN UPDATE retirement_fence_write_audit SET n=n+1; END`)

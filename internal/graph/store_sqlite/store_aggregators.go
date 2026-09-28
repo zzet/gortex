@@ -454,10 +454,23 @@ func (s *Store) FileSymbolNamesByPaths(paths []string, kinds []graph.NodeKind) [
 	for i := 0; i < len(uniqPaths); i += lookupChunkSize {
 		end := minInt(i+lookupChunkSize, len(uniqPaths))
 		chunk := uniqPaths[i:end]
-		args := append(toAnyArgs(chunk), kindArgs...)
-		args = append(args, s.viewGen)
-		q := `SELECT DISTINCT file_path, name FROM nodes WHERE file_path IN (` +
-			inPlaceholders(len(chunk)) + `) AND kind IN (` + inPlaceholders(len(kindArgs)) + `) AND view_gen = ?`
+		pathsJSON, ok := projectionJSON(chunk)
+		if !ok {
+			continue
+		}
+		args := append([]any{pathsJSON, s.viewGen}, kindArgs...)
+		// Driven from the paths: one (file_path, view_gen) seek each. The
+		// IN-list form let the planner, under the store's sampled
+		// statistics, range over (kind, view_gen) from about 30 paths: every
+		// node of those kinds in the generation, 8 s on the base generation.
+		// The kind is written +n.kind so the choice does not rest on the
+		// statistics: without any, nodes_by_kind (kind, view_gen) keys as many
+		// columns as nodes_by_file and was taken, a range per path.
+		q := `SELECT DISTINCT n.file_path, n.name FROM json_each(?) AS p CROSS JOIN nodes AS n
+ WHERE n.file_path = p.value AND n.view_gen = ? AND +n.kind IN (` + inPlaceholders(len(kindArgs)) + `)`
+		if observe := nameLookupSQLObserver; observe != nil {
+			observe(q)
+		}
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
 		if rows == nil {

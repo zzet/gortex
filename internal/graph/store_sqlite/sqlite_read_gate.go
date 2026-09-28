@@ -370,11 +370,19 @@ type gatedConn struct {
 
 // noteStatement records the statement a connection is running.
 func (c *gatedConn) noteStatement(query string) {
+	if observe := readStatementObserver; observe != nil {
+		observe(query)
+	}
 	if len(query) > readerLabelMax {
 		query = query[:readerLabelMax]
 	}
 	c.label.Store(strings.Join(strings.Fields(query), " "))
 }
+
+// readStatementObserver, when a test sets it, is told every statement a pool
+// connection runs, so a test can plan the statements a read actually issues.
+// nil in production.
+var readStatementObserver func(query string)
 
 // readerLabelMax bounds the logged statement text.
 const readerLabelMax = 160

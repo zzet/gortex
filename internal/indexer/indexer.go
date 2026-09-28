@@ -3461,7 +3461,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				// two health probes, the present-index list, and the set of
 				// indexes that already carry a statistics row. All four are
 				// read-pool queries taking no store lock.
-				graph.MaybeEnsurePlannerStatsFresh(ctx, diskTarget)
+				//
+				// This is the boundary that ends a whole index: no edit is
+				// admitted over the drained rows yet, so a refresh the store
+				// owes (statistics absent for an index that holds rows) runs
+				// to the end here instead of deferring into the edits.
+				graph.MaybeEnsurePlannerStatsFresh(graph.WithPlannerStatsLoadBoundary(ctx), diskTarget)
 
 				if serr := persistShadowCompactSidecars(
 					inMemShadow, diskTarget, idx.RepoPrefix(),
