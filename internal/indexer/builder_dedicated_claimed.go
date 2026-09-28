@@ -231,6 +231,18 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 		adopted = false
 		routeName = claimedBaseRouteName(true)
 	}
+	// The type checker's rows: the re-parse route runs the stage over the
+	// committed tree; the copy route carries the corpus's; a resumed payload
+	// cannot tell whether the interrupted build's stage finished.
+	switch {
+	case resume:
+		req.committedTypes = committedTypesCarried{set: true,
+			reason: "the build resumed an interrupted payload whose type checker's stage is not known to have finished"}
+	case takeCopy:
+		req.committedTypes = b.copiedCorpusTypes(req.RepoPrefix, row.ProvenanceCommitOID)
+	default:
+		req.committedTypecheck = &committedTypecheckStage{CheckoutID: row.CheckoutID}
+	}
 	b.Logger.Info("claimed dedicated base source plan",
 		zap.Int64("generation", claim.GenerationID),
 		zap.String("graph", claim.Desire.Authority.GraphID),

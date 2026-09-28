@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -67,6 +68,10 @@ type Provider struct {
 	// before detached graph apply. Small repos and file-bounded incremental loads do
 	// not take this gate and may use the remaining heavyGate lane.
 	largeGate chan struct{}
+	// committed is the committed-tree passes holding compiler admission, and
+	// interactive counts the loads waiting for it that may overtake them
+	// (see acquireHeavy).
+	committed committedHolders
 
 	// scopeMu guards scopeCache: per module directory, the dependency
 	// metadata index and line-directive set that handle-rooted checkout loads
@@ -220,17 +225,166 @@ func (p *Provider) ReleaseRepoState(repoRoot string) bool {
 	return removed
 }
 
+// committedHolders is the compiler admission's view of committed-tree passes.
+type committedHolders struct {
+	// interactive counts the loads that are waiting for admission and may
+	// preempt a committed pass: every load that is not one.
+	interactive atomic.Int64
+	mu          sync.Mutex
+	seq         uint64
+	preempts    map[uint64]func()
+}
+
+func (c *committedHolders) register(preempt func()) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.preempts == nil {
+		c.preempts = map[uint64]func(){}
+	}
+	c.seq++
+	c.preempts[c.seq] = preempt
+	return c.seq
+}
+
+func (c *committedHolders) unregister(id uint64) {
+	c.mu.Lock()
+	delete(c.preempts, id)
+	c.mu.Unlock()
+}
+
+// preemptAll ends every committed pass holding admission. Each pass releases
+// its admission on its way out.
+func (c *committedHolders) preemptAll() int {
+	c.mu.Lock()
+	preempts := make([]func(), 0, len(c.preempts))
+	for _, preempt := range c.preempts {
+		preempts = append(preempts, preempt)
+	}
+	c.mu.Unlock()
+	for _, preempt := range preempts {
+		preempt()
+	}
+	return len(preempts)
+}
+
+// committedPreempt returns the preemption of a committed-tree pass, nil for
+// every other load.
+func committedPreempt(ctx context.Context) func() {
+	scope, ok := semantic.CheckoutCompilerScopeFrom(ctx)
+	if !ok || !scope.Committed || scope.Preempt == nil {
+		return nil
+	}
+	return scope.Preempt
+}
+
+// committedOverlay is the overlay a committed-tree pass reads its tree
+// through; nil for every other load, which reads the working copy.
+func committedOverlay(ctx context.Context) map[string][]byte {
+	scope, ok := semantic.CheckoutCompilerScopeFrom(ctx)
+	if !ok || !scope.Committed || len(scope.Overlay) == 0 {
+		return nil
+	}
+	return scope.Overlay
+}
+
+// committedEnv is the environment of a committed-tree pass's go command, nil
+// (the process's) for every other load.
+func committedEnv(ctx context.Context) []string {
+	scope, ok := semantic.CheckoutCompilerScopeFrom(ctx)
+	if !ok || !scope.Committed || !scope.GoWorkOff {
+		return nil
+	}
+	return append(os.Environ(), "GOWORK=off")
+}
+
+// ReadsCommittedTree reports that the provider reads a committed tree through
+// a committed pass's overlay (semantic.CommittedTreeReader): every load of the
+// pass hands the overlay to the go command.
+func (p *Provider) ReadsCommittedTree() bool { return true }
+
+// acquireHeavy admits one compiler program.
+//
+// A committed tree's pass (a dedicated base, its advance, a commit layer)
+// yields to every other load: it gives an admission back while another load
+// waits, and a load that finds the admission taken ends the committed passes
+// holding it before it waits. A committed pass that is preempted publishes its generation without
+// the type checker's facts and says so; an edit never waits minutes behind it.
 func (p *Provider) acquireHeavy(ctx context.Context, large bool) (func(), error) {
+	preempt := committedPreempt(ctx)
+	if preempt == nil {
+		p.committed.interactive.Add(1)
+		defer p.committed.interactive.Add(-1)
+		if release, ok := p.tryAcquireHeavy(large); ok {
+			return release, nil
+		}
+		if n := p.committed.preemptAll(); n > 0 && p.logger != nil {
+			p.logger.Info("go-types: a load overtook committed-tree passes",
+				zap.Int("preempted", n), zap.Bool("large", large))
+		}
+		return p.acquireHeavyBlocking(ctx, large)
+	}
+	for {
+		release, err := p.acquireHeavyBlocking(ctx, large)
+		if err != nil {
+			return nil, err
+		}
+		id := p.committed.register(preempt)
+		// A load that is waiting now found nothing to preempt when it began
+		// (this pass was queued, not registered): give the admission back
+		// and queue again behind it. Waiters are admitted in arrival order,
+		// so a pass that arrives while a load waits is admitted after it.
+		if p.committed.interactive.Load() > 0 {
+			p.committed.unregister(id)
+			release()
+			continue
+		}
+		return func() {
+			p.committed.unregister(id)
+			release()
+		}, nil
+	}
+}
+
+// tryAcquireHeavy takes the admission only when it is free now.
+func (p *Provider) tryAcquireHeavy(large bool) (func(), bool) {
+	gate, largeGate := p.admissionGates()
+	if large {
+		select {
+		case largeGate <- struct{}{}:
+		default:
+			return nil, false
+		}
+	}
+	select {
+	case gate <- struct{}{}:
+		return func() {
+			<-gate
+			if large {
+				<-largeGate
+			}
+		}, true
+	default:
+		if large {
+			<-largeGate
+		}
+		return nil, false
+	}
+}
+
+func (p *Provider) admissionGates() (chan struct{}, chan struct{}) {
 	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
 	if p.heavyGate == nil {
 		p.heavyGate = make(chan struct{}, defaultGoTypesConcurrency)
 	}
 	if p.largeGate == nil {
 		p.largeGate = make(chan struct{}, 1)
 	}
-	gate := p.heavyGate
-	largeGate := p.largeGate
-	p.stateMu.Unlock()
+	return p.heavyGate, p.largeGate
+}
+
+func (p *Provider) acquireHeavyBlocking(ctx context.Context, large bool) (func(), error) {
+	gate, largeGate := p.admissionGates()
 
 	largeHeld := false
 	if large {
@@ -500,6 +654,12 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// files; every decision to load the whole module instead is taken now,
 	// before anything is loaded or written.
 	checkoutScope, checkoutPass := semantic.CheckoutCompilerScopeFrom(ctx)
+	if checkoutScope.Committed {
+		// A handle-rooted load keeps per-checkout state keyed by the working
+		// copy's manifests and line directives, which a committed tree does
+		// not share: a committed pass loads the whole module.
+		checkoutScope.HandleRoots = false
+	}
 	compiler := &semantic.CompilerLoadStats{Scope: semantic.CompilerScopeFull}
 	var (
 		handleFiles    map[string]struct{}
@@ -1873,8 +2033,10 @@ func (p *Provider) loadDepModuleIndex(ctx context.Context, dir string) (map[stri
 			packages.NeedImports |
 			packages.NeedDeps |
 			packages.NeedModule,
-		Dir:   dir,
-		Tests: p.includeTest,
+		Dir:     dir,
+		Tests:   p.includeTest,
+		Overlay: committedOverlay(ctx),
+		Env:     committedEnv(ctx),
 	}
 	load := p.packagesLoad
 	if load == nil {
@@ -1942,8 +2104,11 @@ type compilerProgram struct {
 // parser for the source-checked packages.
 func (p *Provider) loadCompilerProgram(ctx context.Context, dir string, parseFile func(*token.FileSet, string, []byte) (*ast.File, error), patterns ...string) (compilerProgram, error) {
 	// A compiler load is interactive work: a background warm-up listing
-	// yields to it.
-	defer p.beginCompilerLoad(dir)()
+	// yields to it. A committed tree's load is background work itself: it
+	// neither preempts nor holds back the working copy's warm-up.
+	if committedPreempt(ctx) == nil {
+		defer p.beginCompilerLoad(dir)()
+	}
 	mode := packages.NeedName |
 		packages.NeedFiles |
 		packages.NeedCompiledGoFiles |
@@ -1971,6 +2136,8 @@ func (p *Provider) loadCompilerProgram(ctx context.Context, dir string, parseFil
 		Tests:     p.includeTest,
 		Fset:      token.NewFileSet(),
 		ParseFile: parseFile,
+		Overlay:   committedOverlay(ctx),
+		Env:       committedEnv(ctx),
 	}
 
 	load := p.packagesLoad

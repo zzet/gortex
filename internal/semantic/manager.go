@@ -304,6 +304,13 @@ type EnrichOptions struct {
 	// exactly as before.
 	CheckoutScope *CheckoutCompilerScope
 
+	// CommittedTreeOnly restricts the pass to providers that read a committed
+	// tree through the scope's overlay (CommittedTreeReader). A pass over a
+	// committed tree whose checkout root holds a different working copy sets
+	// it: any other provider reads the working copy, which is not the tree
+	// the generation describes.
+	CommittedTreeOnly bool
+
 	// Context, when non-nil, is the caller's context: its cancellation
 	// reaches every provider pass (each pass context derives from it), so a
 	// caller that abandons the work (a yielding compaction) stops the
@@ -443,6 +450,13 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 			)
 			continue
 		}
+		if opts.CommittedTreeOnly && !readsCommittedTree(provider) {
+			m.logger.Debug("semantic provider skipped, it cannot read a committed tree",
+				zap.String("provider", provider.Name()),
+				zap.String("language", lang),
+			)
+			continue
+		}
 
 		results = m.runEnrichForProvider(g, roots, lang, provider, nodeCounts, opts, results, partial)
 	}
@@ -460,7 +474,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	// Leaving it out of the synchronous pass is what keeps cold/warm start
 	// fast; the router is still wired, so a query can lazy-spawn a server on
 	// demand.
-	if m.config.EagerLSP && m.lspRouter != nil {
+	if m.config.EagerLSP && m.lspRouter != nil && !opts.CommittedTreeOnly {
 		// Pre-pass: pure metadata, no spawn.
 		bestSpec := make(map[string]string) // language → winning spec name
 		bestPrio := make(map[string]int)
@@ -536,6 +550,9 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	// winner can confirm-but-never-downgrade what it stamped.
 	for _, p := range m.providers {
 		if !isSupplemental(p) || !p.Available() || m.providerDisabled(p.Name()) {
+			continue
+		}
+		if opts.CommittedTreeOnly && !readsCommittedTree(p) {
 			continue
 		}
 		langs := p.Languages()

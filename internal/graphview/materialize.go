@@ -1160,7 +1160,6 @@ func (m *Materializer) completeness(generations []*store_sqlite.Store) (Complete
 		out[id] = StateComplete
 	}
 	topText := StateUnavailable
-	semanticSilent := len(generations) == 0
 	stack := make([]producerLayer, len(generations))
 	for index, handle := range generations {
 		rows, err := handle.ProducerStates()
@@ -1172,9 +1171,6 @@ func (m *Materializer) completeness(generations []*store_sqlite.Store) (Complete
 	}
 	for index, handle := range generations {
 		top := index == len(generations)-1
-		if !declares(stack[index].rows, CapSemantic) {
-			semanticSilent = true
-		}
 		for _, row := range stack[index].rows {
 			id := CapabilityID(row.Producer)
 			state := capabilityStateOf(row.State)
@@ -1200,16 +1196,6 @@ func (m *Materializer) completeness(generations []*store_sqlite.Store) (Complete
 			out[id] = out[id].worst(state)
 		}
 	}
-	// graph.semantic has no seed to stand on: it is complete only when every
-	// generation of the stack declares it, and a silent generation reads as
-	// not complete. A base an older binary built never declares it (the
-	// capability did not exist then), and neither does a build without a
-	// semantic manager or whose stage the admission floor declined; none of
-	// them may read as holding the type checker's rows. Like text search, an
-	// empty stack denies it.
-	if semanticSilent {
-		out[CapSemantic] = out[CapSemantic].worst(StateUnavailable)
-	}
 	// Unconditional, deliberately. An empty stack has no top layer to read a
 	// declaration off, and "no layer declared it" is exactly the denial this
 	// rule exists to report — letting the seeded StateComplete stand there
@@ -1219,16 +1205,6 @@ func (m *Materializer) completeness(generations []*store_sqlite.Store) (Complete
 	// nothing; it also stops depending on that distant precondition.
 	out[CapSearchText] = topText
 	return out, nil
-}
-
-// declares reports whether a generation's producer rows name id.
-func declares(rows []store_sqlite.ProducerCompleteness, id CapabilityID) bool {
-	for _, row := range rows {
-		if CapabilityID(row.Producer) == id {
-			return true
-		}
-	}
-	return false
 }
 
 // capabilityStateOf maps a producer's contribution state onto what a

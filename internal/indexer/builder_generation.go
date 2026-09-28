@@ -235,6 +235,17 @@ type BuildRequest struct {
 	// is sealed with the payload and never outlives a build that did not
 	// publish. Only a working-tree build sets it.
 	inputManifest *generationInputManifest
+
+	// committedTypecheck, when set, asks a build over a committed tree (a
+	// dedicated base on the re-parse route, its advance, a commit layer) for
+	// the type checker's stage, read through an overlay of the checkout root
+	// (committed_typecheck.go).
+	committedTypecheck *committedTypecheckStage
+	// committedTypes reports what a build that ran no stage of its own carries
+	// of the type checker's rows: a dedicated base on the copy route copied
+	// the corpus's, complete when the corpus had finished its enrichment at
+	// the base's commit. Ignored when committedTypecheck is set.
+	committedTypes committedTypesCarried
 	// headProvenance is the HEAD commit and dirty bit the build's sample
 	// already established (a working-tree build); the pass stamps its
 	// provenance from it instead of asking git.
@@ -455,6 +466,10 @@ type BuildReport struct {
 	// Enrichment is what the semantic enrichment stage did, zero when the
 	// build did not ask for it.
 	Enrichment EnrichmentOutcome
+
+	// CommittedTypecheck is what the type checker's stage over a committed
+	// tree did, zero when the build did not ask for it.
+	CommittedTypecheck CommittedTypecheckOutcome
 
 	// PlanningDuration is the wall time spent selecting the sparse file set.
 	PlanningDuration time.Duration
@@ -1132,6 +1147,10 @@ func (b *SparseGenerationBuilder) runEnrichment(
 	handle *store_sqlite.Store,
 	report *BuildReport,
 ) {
+	if req.committedTypecheck != nil && req.Enrich == nil && enrichesWorkingCopy(req.Identity) {
+		b.runCommittedTypecheck(ctx, req, handle, report)
+		return
+	}
 	if req.Enrich == nil || !enrichesWorkingCopy(req.Identity) {
 		return
 	}
@@ -2955,30 +2974,55 @@ func (s *fileSetSource) Walk(ctx context.Context, fn func(source.FileMeta) error
 	return nil
 }
 
-// semanticProducerRow is the graph.semantic row of a working-tree generation.
-// A build that deferred its enrichment owes it to the follow-up (incomplete,
-// with the token); the follow-up, and a build whose enrichment ran inline,
-// declare it complete for the paths they cover. A build with no semantic
-// manager, or whose stage the admission floor declined, declares nothing: the
-// composition's default for a silent generation.
+// semanticProducerRow is the graph.semantic row of a generation. Every
+// generation declares it, because a silent one reads as complete: complete
+// only when the type checker's rows cover every Go file the generation
+// carries, and incomplete with the reason otherwise.
+//
+// A working-tree build that deferred its enrichment owes it to the follow-up
+// (incomplete, with the token); the follow-up, and a build whose enrichment
+// ran inline, declare it complete for the paths they cover. A committed
+// tree's build declares what its own stage did, or, on a dedicated base's
+// copy route, what the corpus it copied carried.
 func (b *SparseGenerationBuilder) semanticProducerRow(req BuildRequest, report *BuildReport) (store_sqlite.ProducerCompleteness, bool) {
-	if b.Semantic == nil || !enrichesWorkingCopy(req.Identity) {
-		return store_sqlite.ProducerCompleteness{}, false
-	}
-	switch {
-	case req.deferEnrichment:
+	incomplete := func(reason string) (store_sqlite.ProducerCompleteness, bool) {
 		return store_sqlite.ProducerCompleteness{
 			Producer: string(graphview.CapSemantic),
 			State:    store_sqlite.ProducerStateIncomplete,
-			Reason:   graphview.ReasonDeferredToFollowup,
-		}, true
-	case req.followup || len(report.Enrichment.Ran) > 0:
-		return store_sqlite.ProducerCompleteness{
-			Producer: string(graphview.CapSemantic),
-			State:    store_sqlite.ProducerStateComplete,
+			Reason:   reason,
 		}, true
 	}
-	return store_sqlite.ProducerCompleteness{}, false
+	complete := store_sqlite.ProducerCompleteness{
+		Producer: string(graphview.CapSemantic),
+		State:    store_sqlite.ProducerStateComplete,
+	}
+	switch {
+	case !enrichesWorkingCopy(req.Identity):
+		return incomplete("a committed tree no checkout holds is not type-checked")
+	case b.Semantic == nil:
+		return incomplete("no semantic enrichment manager is installed")
+	case req.committedTypecheck != nil:
+		out := report.CommittedTypecheck
+		if out.Ran {
+			return complete, true
+		}
+		if out.Reason != "" {
+			return incomplete(out.Reason)
+		}
+		return incomplete("the type checker's stage did not run over this committed tree")
+	case req.committedTypes.set:
+		if req.committedTypes.complete {
+			return complete, true
+		}
+		return incomplete(req.committedTypes.reason)
+	case req.deferEnrichment:
+		return incomplete(graphview.ReasonDeferredToFollowup)
+	case req.followup || len(report.Enrichment.Ran) > 0:
+		return complete, true
+	case !report.Enrichment.Requested:
+		return incomplete("the build ran no type checker's stage")
+	}
+	return incomplete("the type checker's stage did not run: " + enrichmentReason(report.Enrichment))
 }
 
 // measurePrepublish runs a build's pre-publish check and records its CPU,

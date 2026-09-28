@@ -81,13 +81,10 @@ func TestEnrichmentFollowupParityBeforeAndAfter(t *testing.T) {
 			t.Errorf("%s: SemanticComplete is false after the follow-up", label)
 		}
 		view = chainMaterialize(t, f)
-		// The commit base declares no graph.semantic row, and a silent
-		// generation reads as not complete (see
-		// TestSemanticCompletenessNeedsEveryLayerToDeclareIt), so the view
-		// withholds the capability whether or not the follow-up landed; the
-		// landing itself is what SemanticPending and SemanticComplete read.
-		if s := view.Completeness.State(graphview.CapSemantic); s != graphview.StateUnavailable {
-			t.Errorf("%s: graph.semantic reads %s over a silent base, want %s", label, s, graphview.StateUnavailable)
+		// Every layer of the stack declares graph.semantic; once the
+		// follow-up landed nothing is owed, and the view reads it complete.
+		if s := view.Completeness.State(graphview.CapSemantic); s != graphview.StateComplete {
+			t.Errorf("%s: graph.semantic reads %s after the follow-up, want %s", label, s, graphview.StateComplete)
 		}
 		kindParityCheckIndexed(t, label+" after the follow-up", f.worktree, view.Reader, nil,
 			func() graph.Reader { return primary.store }, builderIndexSemantic(mgr))

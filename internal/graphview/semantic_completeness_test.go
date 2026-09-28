@@ -7,27 +7,28 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
-// TestSemanticCompletenessNeedsEveryLayerToDeclareIt pins that graph.semantic
-// is never read off the seed. A generation that has no row for it (a base an
-// older binary built before the capability existed, a commit build, a build
-// without a semantic manager) makes the view's graph.semantic not complete,
-// even when the layer above declares it complete for its own paths.
-func TestSemanticCompletenessNeedsEveryLayerToDeclareIt(t *testing.T) {
+// TestSemanticCompletenessFollowsTheOrdinaryRule pins that graph.semantic
+// composes like every other capability: a layer's silence reads as complete,
+// and a layer that declares it incomplete makes the view incomplete. Every
+// generation the builders write declares it (complete only when the type
+// checker's rows cover its Go files), and a base an older binary built is
+// re-parsed at upgrade because the capability joined the vocabulary, so no
+// silent generation is left to read as holding rows it lacks.
+func TestSemanticCompletenessFollowsTheOrdinaryRule(t *testing.T) {
 	semantic := func(state store_sqlite.ProducerState) store_sqlite.ProducerCompleteness {
-		return store_sqlite.ProducerCompleteness{Producer: string(CapSemantic), State: state}
+		return store_sqlite.ProducerCompleteness{Producer: string(CapSemantic), State: state, Reason: "test"}
 	}
 	complete := semantic(store_sqlite.ProducerStateComplete)
+	incomplete := semantic(store_sqlite.ProducerStateIncomplete)
 	cases := []struct {
 		name          string
 		commit, dirty []store_sqlite.ProducerCompleteness
 		want          CapabilityState
 	}{
-		{"no layer declares it", nil, nil, StateUnavailable},
-		{"the base is silent, the dirty layer complete", nil, []store_sqlite.ProducerCompleteness{complete}, StateUnavailable},
-		{"the base complete, the dirty layer silent", []store_sqlite.ProducerCompleteness{complete}, nil, StateUnavailable},
+		{"no layer declares it", nil, nil, StateComplete},
 		{"both declare it complete", []store_sqlite.ProducerCompleteness{complete}, []store_sqlite.ProducerCompleteness{complete}, StateComplete},
-		{"a declared incomplete still worsts", []store_sqlite.ProducerCompleteness{complete},
-			[]store_sqlite.ProducerCompleteness{semantic(store_sqlite.ProducerStateIncomplete)}, StateIncomplete},
+		{"the base declares it incomplete", []store_sqlite.ProducerCompleteness{incomplete}, []store_sqlite.ProducerCompleteness{complete}, StateIncomplete},
+		{"the dirty layer declares it incomplete", []store_sqlite.ProducerCompleteness{complete}, []store_sqlite.ProducerCompleteness{incomplete}, StateIncomplete},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -45,23 +46,19 @@ func TestSemanticCompletenessNeedsEveryLayerToDeclareIt(t *testing.T) {
 			if got := view.Completeness.State(CapSemantic); got != tc.want {
 				t.Fatalf("%s = %q, want %q", CapSemantic, got, tc.want)
 			}
-			// The rule is about graph.semantic alone.
-			if got := view.Completeness.State(CapSyntaxGraph); got != StateComplete {
-				t.Errorf("%s = %q, want %q", CapSyntaxGraph, got, StateComplete)
-			}
 		})
 	}
-	t.Run("a ref view over a silent generation", func(t *testing.T) {
+	t.Run("a ref view over a generation that declares it incomplete", func(t *testing.T) {
 		store := openStackStore(t, "semantic-refview")
 		seedStackControlPlane(t, store)
-		generation := writeProducerGeneration(t, store, "commit", stackCommitLayerID, 0, 1000)
+		generation := writeProducerGeneration(t, store, "commit", stackCommitLayerID, 0, 1000, incomplete)
 		view, err := newTestMaterializer(store).MaterializeRefView(context.Background(), testGraphID, generation)
 		if err != nil {
 			t.Fatalf("MaterializeRefView: %v", err)
 		}
 		defer view.Close()
-		if got := view.Completeness.State(CapSemantic); got != StateUnavailable {
-			t.Fatalf("%s = %q, want %q", CapSemantic, got, StateUnavailable)
+		if got := view.Completeness.State(CapSemantic); got != StateIncomplete {
+			t.Fatalf("%s = %q, want %q", CapSemantic, got, StateIncomplete)
 		}
 	})
 }

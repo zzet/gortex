@@ -2,6 +2,7 @@ package semantic
 
 import (
 	"context"
+	"errors"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -304,7 +305,31 @@ type CheckoutCompilerScope struct {
 	// whole-module load maps it onto its own copy. Nil keeps the handle-only
 	// behaviour. It decides which node a use binds to, never what is loaded.
 	Declarations CheckoutDeclarationReader
+	// Committed marks a pass over a committed tree rather than over the
+	// checkout's working copy: a dedicated base, its advance or a commit
+	// layer. The checkout root still holds the working copy, so the load
+	// reads the committed tree through Overlay. Such a pass is background
+	// work: an edit's compiler load overtakes it (Preempt), and it never
+	// preempts or holds back the checkout's own warm-up.
+	Committed bool
+	// Overlay maps an absolute path under the checkout root to the bytes the
+	// load reads in its place: the committed content of a file the working
+	// copy modified or deleted, or only the header and package clause of a
+	// Go file the committed tree does not hold, which leaves its package
+	// without any of that file's declarations. Only a committed pass sets it.
+	Overlay map[string][]byte
+	// Preempt ends a committed pass because an edit's load is waiting for
+	// the compiler admission it holds. Nil for a working-copy pass.
+	Preempt func()
+	// GoWorkOff runs a committed pass's loads with GOWORK=off: the committed
+	// tree holds no go.work, so a workspace file the working copy (or a
+	// directory above it) holds must not choose which modules the load sees.
+	GoWorkOff bool
 }
+
+// ErrCommittedPassPreempted is the cause a committed pass is cancelled with
+// when an edit's compiler load overtakes it.
+var ErrCommittedPassPreempted = errors.New("semantic: an edit's compiler load overtook this committed tree's pass")
 
 // CheckoutDeclarationReader is the read a checkout pass needs of the layer
 // below its handle: every node recorded at each of the given graph paths.
@@ -327,4 +352,17 @@ func CheckoutCompilerScopeFrom(ctx context.Context) (scope CheckoutCompilerScope
 	}
 	scope, ok = ctx.Value(checkoutCompilerScopeKey{}).(CheckoutCompilerScope)
 	return scope, ok
+}
+
+// CommittedTreeReader is a provider that reads a committed tree through the
+// overlay a committed pass's scope carries (CheckoutCompilerScope.Overlay)
+// instead of the working copy at the checkout root.
+type CommittedTreeReader interface {
+	ReadsCommittedTree() bool
+}
+
+// readsCommittedTree reports whether provider may run in a committed pass.
+func readsCommittedTree(provider Provider) bool {
+	reader, ok := provider.(CommittedTreeReader)
+	return ok && reader.ReadsCommittedTree()
 }

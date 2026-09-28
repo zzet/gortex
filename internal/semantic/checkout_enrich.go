@@ -56,6 +56,10 @@ type CheckoutEnrichReport struct {
 	// Reason says why the pass did not enrich everything it could have. Empty
 	// when it did.
 	Reason string
+	// Preempted reports that a committed tree's pass gave way to an edit's
+	// compiler load before it finished. The caller's build goes on without
+	// the pass's facts.
+	Preempted bool
 	// Compiler sums the compiler-context work the pass's providers reported.
 	// nil when no provider that ran reports counts.
 	Compiler *CompilerLoadStats
@@ -109,6 +113,22 @@ func (m *Manager) EnrichCheckoutContext(ctx context.Context, g graph.Store, req 
 		report.Reason = "the generation carries no symbols worth enriching"
 		return report, nil
 	}
+	committed := req.Compiler.Committed
+	if committed {
+		if languages = m.committedTreeLanguages(languages); len(languages) == 0 {
+			report.Reason = "no provider that reads a committed tree serves the generation's languages"
+			return report, nil
+		}
+	}
+	// A committed tree's pass is background work: an edit's admission takes
+	// its workspace slot or its compiler admission, and either one ends it
+	// through this context, with its own cause so the pass can say so.
+	var stageCancel context.CancelCauseFunc
+	if committed {
+		ctx, stageCancel = context.WithCancelCause(ctx)
+		defer stageCancel(nil)
+		req.Compiler.Preempt = func() { stageCancel(ErrCommittedPassPreempted) }
+	}
 
 	admitted := make([]string, 0, len(languages))
 	releases := make([]func(), 0, len(languages))
@@ -118,7 +138,15 @@ func (m *Manager) EnrichCheckoutContext(ctx context.Context, g graph.Store, req 
 		}
 	}()
 	for _, language := range languages {
-		release, ok := m.checkouts.Acquire(language, req.Root)
+		var (
+			release func()
+			ok      bool
+		)
+		if committed {
+			release, ok = m.checkouts.AcquireCommitted(language, req.Root, req.Compiler.Preempt)
+		} else {
+			release, ok = m.checkouts.Acquire(language, req.Root)
+		}
 		if !ok {
 			report.Starved = append(report.Starved, language)
 			continue
@@ -142,10 +170,11 @@ func (m *Manager) EnrichCheckoutContext(ctx context.Context, g graph.Store, req 
 			SHA:        req.Fingerprint,
 			CheckoutID: req.CheckoutID,
 		}},
-		MinLanguageNodes: req.MinLanguageNodes,
-		Languages:        admitted,
-		CheckoutScope:    &compiler,
-		Context:          ctx,
+		MinLanguageNodes:  req.MinLanguageNodes,
+		Languages:         admitted,
+		CheckoutScope:     &compiler,
+		CommittedTreeOnly: committed,
+		Context:           ctx,
 	})
 	for _, result := range results {
 		if result == nil || result.Compiler == nil {
@@ -155,6 +184,15 @@ func (m *Manager) EnrichCheckoutContext(ctx context.Context, g graph.Store, req 
 			report.Compiler = &CompilerLoadStats{}
 		}
 		report.Compiler.Add(result.Compiler)
+	}
+	if committed && errors.Is(context.Cause(ctx), ErrCommittedPassPreempted) {
+		report.Preempted = true
+		report.Partial = true
+		report.Reason = ErrCommittedPassPreempted.Error()
+		m.logger.Info("committed tree's enrichment pass preempted by an edit",
+			zap.String("checkout", req.CheckoutID),
+			zap.String("root", req.Root))
+		return report, nil
 	}
 	if err != nil {
 		return report, err
@@ -214,5 +252,18 @@ func enrichedLanguages(results []*EnrichResult) []string {
 		out = append(out, result.Language)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// committedTreeLanguages narrows languages to those whose provider reads a
+// committed tree through the pass's overlay; every other provider would read
+// the checkout's working copy instead of the tree being built.
+func (m *Manager) committedTreeLanguages(languages []string) []string {
+	out := languages[:0:0]
+	for _, language := range languages {
+		if provider := m.ProviderForLanguage(language); provider != nil && readsCommittedTree(provider) {
+			out = append(out, language)
+		}
+	}
 	return out
 }

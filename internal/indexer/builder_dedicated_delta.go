@@ -131,6 +131,7 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedDelta(ctx context.Context
 		Base: request.Base, Changes: changes, RootPath: commit.RootPath,
 		RepoPrefix: claim.Desire.Authority.RepoPrefix, WorkspaceID: request.WorkspaceID,
 		ProjectID: request.ProjectID, PrePublish: request.PrePublish,
+		committedTypecheck: &committedTypecheckStage{CheckoutID: row.CheckoutID},
 	}
 	prepare := func(ctx context.Context) (source.ContentSource, buildPlan, BuildReport, error) {
 		if err := source.VerifyGitTreeObjectsLocal(ctx, commit.RepoDir, commit.TargetTreeOID); err != nil {
