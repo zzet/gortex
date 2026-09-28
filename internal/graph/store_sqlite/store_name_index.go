@@ -2,7 +2,10 @@ package store_sqlite
 
 import (
 	"context"
+	"index/suffixarray"
 	"runtime"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,8 +56,86 @@ var generationNameIndexHeld atomic.Int64
 
 // generationNameIndex is a sealed generation's named rows in id order — the
 // order every substring lookup returns.
+//
+// A large index also carries a suffix array over its ASCII names (whose LIKE
+// folding and Go lower-casing agree), so a substring lookup is a binary search
+// — O(log N) plus the matches — instead of a scan of every entry (0.42 s of
+// CPU per search on the live store). Names with non-ASCII bytes are few and
+// are checked one by one, with the lookup's own folding.
 type generationNameIndex struct {
 	entries []generationNameEntry
+	// sa indexes the ASCII entries' folded names, each followed by a NUL;
+	// starts[i] is the offset of asciiEntries[i]'s name in the data. nil
+	// below generationNameSuffixMinEntries.
+	sa           *suffixarray.Index
+	starts       []int32
+	asciiEntries []int32
+	nonASCII     []int32
+}
+
+// generationNameSuffixMinEntries is the smallest index that gets a suffix
+// array: below it a scan of memory is as fast. A variable so tests can build
+// one on a small generation.
+var generationNameSuffixMinEntries = 4096
+
+// buildSuffixArray indexes the ASCII entries' folded names.
+func (idx *generationNameIndex) buildSuffixArray() {
+	if len(idx.entries) < generationNameSuffixMinEntries {
+		return
+	}
+	var data []byte
+	idx.starts = make([]int32, 0, len(idx.entries))
+	idx.asciiEntries = make([]int32, 0, len(idx.entries))
+	for i := range idx.entries {
+		e := &idx.entries[i]
+		if e.raw != "" {
+			idx.nonASCII = append(idx.nonASCII, int32(i))
+			continue
+		}
+		idx.starts = append(idx.starts, int32(len(data)))
+		idx.asciiEntries = append(idx.asciiEntries, int32(i))
+		data = append(data, e.fold...)
+		data = append(data, 0)
+	}
+	idx.sa = suffixarray.New(data)
+}
+
+// candidateEntries returns, in id order, the entries whose folded name
+// contains needle, using the suffix array; ok=false when the index has none
+// (the caller scans). likeFolding selects SQLite's LIKE folding for the
+// non-ASCII names (ASCII names fold the same either way).
+func (idx *generationNameIndex) candidateEntries(needle string, likeFolding bool) ([]int32, bool) {
+	if idx.sa == nil || needle == "" || strings.IndexByte(needle, 0) >= 0 {
+		return nil, false
+	}
+	offsets := idx.sa.Lookup([]byte(needle), -1)
+	seen := make(map[int32]struct{}, len(offsets))
+	out := make([]int32, 0, len(offsets))
+	for _, off := range offsets {
+		// The entry whose name holds this offset: the last start <= off.
+		k := sort.Search(len(idx.starts), func(i int) bool { return int(idx.starts[i]) > off }) - 1
+		if k < 0 {
+			continue
+		}
+		entry := idx.asciiEntries[k]
+		if _, dup := seen[entry]; dup {
+			continue
+		}
+		seen[entry] = struct{}{}
+		out = append(out, entry)
+	}
+	for _, i := range idx.nonASCII {
+		e := &idx.entries[i]
+		fold := e.fold
+		if likeFolding {
+			fold = e.likeFold()
+		}
+		if strings.Contains(fold, needle) {
+			out = append(out, i)
+		}
+	}
+	slices.Sort(out)
+	return out, true
 }
 
 // generationNameIndexSlot hangs one lazily built index off a generation's
@@ -225,6 +306,7 @@ func (s *Store) loadGenerationNameIndex(ctx context.Context) (*generationNameInd
 		return nil, false, nil
 	}
 	runtime.AddCleanup(index, func(n int64) { generationNameIndexHeld.Add(-n) }, held)
+	index.buildSuffixArray()
 	return index, true, nil
 }
 
@@ -257,6 +339,27 @@ func isASCII(s string) bool {
 // default (ASCII-only) case folding.
 func likeContains(entry *generationNameEntry, foldedSubstr string) bool {
 	return strings.Contains(entry.likeFold(), foldedSubstr)
+}
+
+// containingIDs returns, in id order, the ids whose folded name contains
+// needle, up to limit (0 = no limit): through the suffix array when the index
+// has one, else by matchingIDs with match.
+func (idx *generationNameIndex) containingIDs(ctx context.Context, limit int, needle string, likeFolding bool, match func(*generationNameEntry) bool) ([]string, error) {
+	entries, ok := idx.candidateEntries(needle, likeFolding)
+	if !ok {
+		return idx.matchingIDs(ctx, limit, match)
+	}
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+	if len(entries) == 0 {
+		return nil, ctx.Err()
+	}
+	ids := make([]string, len(entries))
+	for i, e := range entries {
+		ids[i] = idx.entries[e].id
+	}
+	return ids, ctx.Err()
 }
 
 // matchingIDs returns, in id order, the ids whose entry satisfies match, up
@@ -300,7 +403,7 @@ func (s *Store) nodesByIDsInOrder(ctx context.Context, ids []string) ([]*graph.N
 // same limit.
 func (s *Store) findNodesByNameContainingIndexed(ctx context.Context, index *generationNameIndex, substr string, limit int) ([]*graph.Node, error) {
 	folded := asciiLower(substr)
-	ids, err := index.matchingIDs(ctx, limit, func(entry *generationNameEntry) bool {
+	ids, err := index.containingIDs(ctx, limit, folded, true, func(entry *generationNameEntry) bool {
 		return likeContains(entry, folded)
 	})
 	if err != nil {
@@ -324,7 +427,7 @@ func (s *Store) findNodesByNameContainingIndexed(ctx context.Context, index *gen
 // id order, stopping when yield returns false.
 func (s *Store) visitNodesByNameContainingFoldedIndexed(ctx context.Context, index *generationNameIndex, substr string, yield func(*graph.Node) bool) error {
 	needle := strings.ToLower(substr)
-	ids, err := index.matchingIDs(ctx, 0, func(entry *generationNameEntry) bool {
+	ids, err := index.containingIDs(ctx, 0, needle, false, func(entry *generationNameEntry) bool {
 		return strings.Contains(entry.fold, needle)
 	})
 	if err != nil {
