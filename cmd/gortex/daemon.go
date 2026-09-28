@@ -2107,6 +2107,17 @@ func renderDaemonStorage(w io.Writer, st daemon.StatusResponse) {
 	fmt.Fprintf(w, "  db=%s  wal=%s  wal pending frames=%s  close checkpoint estimate=%s\n",
 		formatBytes(nonNegative(s.DBBytes)), formatBytes(nonNegative(s.WALBytes)), pending,
 		(time.Duration(s.CloseCheckpointEstimateMS) * time.Millisecond).String())
+	if rc := s.RowCounters; rc != nil {
+		if rc.Checked {
+			fmt.Fprintf(w, "  row counters: ready=%t  checked generations=%d  drifted=%d  repaired=%t  check=%.0fms\n",
+				rc.Ready, rc.Generations, rc.Drifted, rc.Repaired, rc.CheckMS)
+		} else {
+			fmt.Fprintf(w, "  row counters: ready=%t\n", rc.Ready)
+		}
+		if rc.FirstDrift != "" {
+			fmt.Fprintf(w, "    first drift: %s\n", rc.FirstDrift)
+		}
+	}
 	r := s.WALReclaim
 	if r == nil {
 		return

@@ -490,6 +490,24 @@ type StorageStatus struct {
 	// the whole checkpoint: an interrupted pass records no progress.
 	CloseCheckpointEstimateMS int64             `json:"close_checkpoint_estimate_ms"`
 	WALReclaim                *WALReclaimStatus `json:"wal_reclaim,omitempty"`
+	// RowCounters is the writer-maintained per-generation node/edge counts:
+	// whether NodeCount/EdgeCount read them, and — on an exact status only —
+	// the drift check against a recount.
+	RowCounters *RowCounterStatus `json:"row_counters,omitempty"`
+}
+
+// RowCounterStatus reports the per-generation row counters. Checked is set
+// only by an exact status, which recounts every generation in one snapshot,
+// reports the generations whose counter disagreed and repairs them.
+type RowCounterStatus struct {
+	Ready       bool    `json:"ready"`
+	Checked     bool    `json:"checked,omitempty"`
+	Generations int     `json:"generations,omitempty"`
+	Drifted     int     `json:"drifted,omitempty"`
+	Repaired    bool    `json:"repaired,omitempty"`
+	CheckMS     float64 `json:"check_ms,omitempty"`
+	// FirstDrift describes the first drifted generation, when one did.
+	FirstDrift string `json:"first_drift,omitempty"`
 }
 
 // WALReclaimStatus mirrors the store's bounded WAL-reclaim counters. Pause is

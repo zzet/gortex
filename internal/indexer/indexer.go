@@ -4695,7 +4695,9 @@ func (idx *Indexer) cleanCensusResult(ctx context.Context, detected int, started
 		return nil, err
 	}
 
-	nodes, edges := idx.repoNodeEdgeCount()
+	// The tree is proven unchanged: the counts stored at the last index
+	// are reused instead of counted (census_stored_counts.go).
+	nodes, edges := idx.cleanCensusRepoCounts(ctx)
 	fileCount := idx.trackedFileCount()
 	if fileCount == 0 {
 		fileCount = detected

@@ -62,6 +62,12 @@ type backgroundCheckpointCoordination struct {
 }
 
 type storeCore struct {
+	// rowCountersReady: generation_row_counts is installed and seeded, so
+	// NodeCount / EdgeCount read it (row_counters.go).
+	rowCountersReady atomic.Bool
+	// rowCountersInstall serialises EnsureRowCounters (the lazy loop and a
+	// direct caller must not install over each other).
+	rowCountersInstall sync.Mutex
 	// backgroundCheckpoint coordinates the periodic PASSIVE worker with the
 	// generation-scoped bulk owner before either touches the physical writer.
 	// It lives on the shared core so every AtGeneration handle sees one token.
@@ -3059,6 +3065,9 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 // -- counts and stats -----------------------------------------------------
 
 func (s *Store) NodeCount() int {
+	if n, ok := s.countFromCounters("nodes"); ok {
+		return n
+	}
 	stmt := s.stmtNodeCount
 	if s.viewGen > baseViewGeneration {
 		stmt = s.stmtGenerationNodeCount
@@ -3072,6 +3081,9 @@ func (s *Store) NodeCount() int {
 }
 
 func (s *Store) EdgeCount() int {
+	if n, ok := s.countFromCounters("edges"); ok {
+		return n
+	}
 	stmt := s.stmtEdgeCount
 	if s.viewGen > baseViewGeneration {
 		stmt = s.stmtGenerationEdgeCount

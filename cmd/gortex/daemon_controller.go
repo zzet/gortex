@@ -976,7 +976,13 @@ func (c *realController) StatusExact(ctx context.Context) (daemon.StatusResponse
 		}
 		c.logSupersededEnrichment(gortexmcp.EnrichProducerRepoCounters, "", superseded)
 	}
-	return c.status(ctx, true)
+	resp, err := c.status(ctx, true)
+	if err == nil && resp.Storage != nil {
+		if check := checkRowCounters(ctx, graph.Store(g)); check != nil {
+			resp.Storage.RowCounters = check
+		}
+	}
+	return resp, err
 }
 
 // Status answers within the caller's budget even while the controller mutex
@@ -1708,13 +1714,45 @@ func storageStatusFor(g graph.Store) *daemon.StorageStatus {
 	}
 	dbBytes, walBytes := reporter.DBStats()
 	estimate, pending := reporter.CloseCheckpointEstimate()
-	return &daemon.StorageStatus{
+	out := &daemon.StorageStatus{
 		DBBytes:                   dbBytes,
 		WALBytes:                  walBytes,
 		WALPendingFrames:          pending,
 		CloseCheckpointEstimateMS: estimate.Milliseconds(),
 		WALReclaim:                walReclaimStatus(reporter.WALReclaimStats()),
 	}
+	if counters, ok := g.(storeRowCounterReporter); ok {
+		out.RowCounters = &daemon.RowCounterStatus{Ready: counters.RowCountersReady()}
+	}
+	return out
+}
+
+// storeRowCounterReporter is the store's writer-maintained row counters.
+type storeRowCounterReporter interface {
+	RowCountersReady() bool
+	CheckRowCounters(ctx context.Context, repair bool) (store_sqlite.RowCounterCheck, error)
+}
+
+// checkRowCounters runs the exact status's drift check of the row counters:
+// a recount of every generation in one snapshot, compared with the counters
+// of that snapshot, and a repair of any drift. Nil for a store without them.
+func checkRowCounters(ctx context.Context, g graph.Store) *daemon.RowCounterStatus {
+	counters, ok := g.(storeRowCounterReporter)
+	if !ok {
+		return nil
+	}
+	check, err := counters.CheckRowCounters(ctx, true)
+	out := &daemon.RowCounterStatus{Ready: check.Ready, Checked: err == nil && check.Ready,
+		Generations: check.Generations, Drifted: len(check.Drift), Repaired: check.Repaired,
+		CheckMS: durationMS(check.Elapsed)}
+	if err != nil {
+		out.FirstDrift = "check failed: " + err.Error()
+	} else if len(check.Drift) > 0 {
+		d := check.Drift[0]
+		out.FirstDrift = fmt.Sprintf("generation %d: nodes %d (counted %d), edges %d (counted %d)",
+			d.GenerationID, d.CounterNodes, d.ExactNodes, d.CounterEdges, d.ExactEdges)
+	}
+	return out
 }
 
 func walReclaimStatus(st store_sqlite.WALReclaimStats) *daemon.WALReclaimStatus {

@@ -150,6 +150,13 @@ func (s *Store) runLazyIndexBuilder(done chan<- struct{}) {
 		case <-timer.C:
 		}
 		wait = lazyIndexPollInterval
+		if rowCountersEnabled() && !s.rowCountersReady.Load() {
+			// The writer-maintained row counts ride the same loop: installed
+			// and seeded once, then verified at each open.
+			if err := s.ensureRowCountersUntilStopped(); err != nil {
+				log.Printf("store_sqlite: row counters deferred error=%q next_attempt_in=%s", err, wait)
+			}
+		}
 		if s.fileGenerationIndexPresent() {
 			continue
 		}
