@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"sort"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -67,7 +68,21 @@ func (e *Engine) viewTextCandidates(
 	base []search.SearchResult,
 	refillBase func(int) []search.SearchResult,
 ) []search.SearchResult {
-	if limit <= 0 {
+	return e.viewTextCandidatesContext(context.Background(), query, limit, base, refillBase)
+}
+
+// viewTextCandidatesContext enumerates the text channel across a composed
+// view's stack. Cancellation is terminal: once a source or refill observes it,
+// no lower-priority source is queried.
+func (e *Engine) viewTextCandidatesContext(
+	ctx context.Context,
+	query string,
+	limit int,
+	base []search.SearchResult,
+	refillBase func(int) []search.SearchResult,
+) []search.SearchResult {
+	ctx = liveRequestContext(ctx)
+	if ctx.Err() != nil || limit <= 0 {
 		return nil
 	}
 
@@ -80,11 +95,17 @@ func (e *Engine) viewTextCandidates(
 	raw[0] = base
 	exhausted[0] = refillBase == nil || len(base) < fetch
 	for i, layer := range e.viewLayers {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if layer.Search == nil {
 			exhausted[i+1] = true
 			continue
 		}
-		raw[i+1] = layer.Search.Search(query, fetch)
+		raw[i+1] = requestTextSearch(ctx, layer.Search, query, fetch)
+		if ctx.Err() != nil {
+			return nil
+		}
 		exhausted[i+1] = len(raw[i+1]) < fetch
 	}
 
@@ -103,6 +124,9 @@ func (e *Engine) viewTextCandidates(
 	}
 
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		sources, merged := compose()
 		if len(merged) >= limit {
 			return finish(sources, merged)
@@ -118,12 +142,18 @@ func (e *Engine) viewTextCandidates(
 			if exhausted[i] {
 				continue
 			}
+			if ctx.Err() != nil {
+				return nil
+			}
 			active = true
 			previous := len(raw[i])
 			if i == 0 {
 				raw[i] = refillBase(nextFetch)
 			} else {
-				raw[i] = e.viewLayers[i-1].Search.Search(query, nextFetch)
+				raw[i] = requestTextSearch(ctx, e.viewLayers[i-1].Search, query, nextFetch)
+			}
+			if ctx.Err() != nil {
+				return nil
 			}
 			if len(raw[i]) > previous {
 				grew = true
@@ -147,27 +177,36 @@ func (e *Engine) viewTextCandidates(
 // width. Bundle search is preferred because it preserves repository narrowing
 // and never wakes the vector channel merely to refill masked BM25 candidates.
 func viewBaseTextRefill(backend search.Backend, query string, repoAllow []string) func(int) []search.SearchResult {
+	return viewBaseTextRefillContext(context.Background(), backend, query, repoAllow)
+}
+
+func viewBaseTextRefillContext(ctx context.Context, backend search.Backend, query string, repoAllow []string) func(int) []search.SearchResult {
+	ctx = liveRequestContext(ctx)
 	return func(limit int) []search.SearchResult {
-		if backend == nil || limit <= 0 {
+		if backend == nil || limit <= 0 || ctx.Err() != nil {
 			return nil
 		}
 		if len(repoAllow) > 0 {
-			if scoped, ok := backend.(search.ScopedSymbolBundleSearcherBackend); ok {
-				if bundles := scoped.SearchSymbolBundlesScoped(query, repoAllow, limit); bundles != nil {
-					return viewBundleResults(bundles)
-				}
+			answer := requestScopedSymbolBundles(ctx, backend, query, repoAllow, limit)
+			if answer.failed || ctx.Err() != nil {
+				return nil
+			}
+			if answer.authoritative {
+				return viewBundleResults(answer.bundles)
 			}
 		}
-		if bundled, ok := backend.(search.SymbolBundleSearcherBackend); ok {
-			if bundles := bundled.SearchSymbolBundles(query, limit); bundles != nil {
-				return viewBundleResults(bundles)
-			}
+		answer := requestSymbolBundles(ctx, backend, query, limit)
+		if answer.failed || ctx.Err() != nil {
+			return nil
 		}
-		if channels, ok := backend.(search.ChannelSearcher); ok {
-			text, _ := channels.SearchChannels(query, limit)
-			return text
+		if answer.authoritative {
+			return viewBundleResults(answer.bundles)
 		}
-		return backend.Search(query, limit)
+		text, _, _ := requestSearchChannels(ctx, backend, query, limit)
+		if ctx.Err() != nil {
+			return nil
+		}
+		return text
 	}
 }
 

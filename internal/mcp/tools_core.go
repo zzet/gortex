@@ -1964,12 +1964,15 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	var nodes []*graph.Node
 	var primaryCount int
 	if len(expandedTerms) > 0 {
-		nodes, primaryCount = fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, fetchLimit, scope, timings)
+		nodes, primaryCount = fetchAndMergeBM25TimedContext(ctx, s.engineFor(ctx), q, expandedTerms, fetchLimit, scope, timings)
 	} else {
 		bm25Start := time.Now()
-		nodes = s.engineFor(ctx).SearchSymbolsScoped(q, fetchLimit, scope)
+		nodes = searchSymbolsScopedContext(ctx, s.engineFor(ctx), q, fetchLimit, scope)
 		timings.BM25PrimaryMS += time.Since(bm25Start).Milliseconds()
 		primaryCount = len(nodes)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// Docs retrieval channel: when the corpus admits prose, the single
@@ -1990,6 +1993,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// merge before the corpus filter runs.
 	if corpus.includesContent() {
 		nodes = s.mergeContentChannel(ctx, q, nodes, fetchLimit)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	candsAfterGather := len(nodes)
@@ -2092,9 +2098,12 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			prevDepth = deepLimit
 			var refetched []*graph.Node
 			if len(expandedTerms) > 0 {
-				refetched, _ = fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, deepLimit, scope, timings)
+				refetched, _ = fetchAndMergeBM25TimedContext(ctx, s.engineFor(ctx), q, expandedTerms, deepLimit, scope, timings)
 			} else {
-				refetched = s.engineFor(ctx).SearchSymbolsScoped(q, deepLimit, scope)
+				refetched = searchSymbolsScopedContext(ctx, s.engineFor(ctx), q, deepLimit, scope)
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
 			kept := applyAllPostFilters(refetched)
 			if len(kept) > 0 {
@@ -2115,8 +2124,14 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// caller's repo / project scope), so an over-narrow or typo'd
 	// clause degrades to a useful result set instead of an empty one.
 	filtersRelaxed := false
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(nodes) == 0 && q != "" && (kindArg != "" || flavorArg != "" || fq.hasFieldFilters()) {
-		relaxed := filterNodes(s.engineFor(ctx).SearchSymbolsScoped(q, fetchLimit, scope), allowed)
+		relaxed := filterNodes(searchSymbolsScopedContext(ctx, s.engineFor(ctx), q, fetchLimit, scope), allowed)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if len(relaxed) > 0 {
 			nodes = relaxed
 			filtersRelaxed = true
@@ -2135,7 +2150,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	decomposed := false
 	if len(nodes) == 0 && queryHasDecomposableSeparator(q) {
 		if leaves := decomposeQueryToLeaves(q); len(leaves) > 0 {
-			rescued, _ := fetchAndMergeBM25Timed(s.engineFor(ctx), "", leaves, fetchLimit, scope, timings)
+			rescued, _ := fetchAndMergeBM25TimedContext(ctx, s.engineFor(ctx), "", leaves, fetchLimit, scope, timings)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			rescued = applyAllPostFilters(rescued)
 			if len(rescued) > 0 {
 				nodes = rescued
@@ -2161,6 +2179,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			nodes, verifyDbg, verifyRan = verifyWithLLM(ctx, s, q, nodes)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Force-inject the implicit-feedback channel: symbols the agent has
 	// reached for on this query before but that BM25 did not surface
@@ -2168,6 +2189,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// signals rank them in context; post-filtered so they honour the
 	// caller's repo / kind / lang / path / corpus scope.
 	nodes = s.forceInjectLearnedCandidates(ctx, q, nodes, applyAllPostFilters)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Rerank: run the I13 11-signal pipeline over the candidate set
 	// with the session-aware Context wired in. Structural signals
@@ -2226,6 +2250,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	var rerankBreakdown []*rerank.Candidate
 	var rerankPrepare, rerankSignals time.Duration
 	nodes, rerankPrepare, rerankSignals = applyRerankBoostsTimed(ctx, s, nodes, q, rctx, &rerankBreakdown)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Post-rerank exact-cosine refinement. The merged rerank above
 	// scores the semantic channel by RRF rank and discards the raw
@@ -2250,6 +2277,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			nodes = refinedNodes
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Per-file diversification: keep one file's many symbols from
 	// monopolising the head of the result set. Runs after the rerank
@@ -2258,19 +2288,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	nodes, rerankBreakdown = diversifyByFile(nodes, rerankBreakdown, req.GetInt("max_per_file", defaultMaxPerFile))
 	diversifyMS := time.Since(diversifyStart).Milliseconds()
 
-	// Flush the prior search's implicit skip-above negatives before this
-	// search overwrites the attribution state: results that ranked above
-	// the deepest one the agent consumed but were themselves passed over
-	// lose a little of their learned per-keyword boost.
-	if sess != nil && q != "" {
-		if nq, skipped := sess.drainSkippedNegatives(); nq != "" && len(skipped) > 0 {
-			s.combo.RecordNegative(nq, skipped)
-		}
-	}
-
+	// Slice and decorate the final page before publishing session or
+	// localization state. Context-sensitive fallbacks remain format-gated
+	// below, preserving the compact/GCX/TOON execution contract.
 	total := len(nodes)
-	// Slice the (offset, limit) window. nextCursor is empty when the
-	// last row in `nodes` is included.
 	end := offset + limit
 	if end > total {
 		end = total
@@ -2279,26 +2300,42 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		offset = total
 	}
 	page := nodes[offset:end]
-	// Record only the actual post-cursor page. Empty and out-of-range pages
-	// deliberately clear any prior attribution state.
-	recordLastSearchFromNodes(sess, q, page)
-	// Decorate the page with absolute file paths so every output format
-	// below surfaces an openable path alongside the repo-relative one.
 	page = s.withAbsPaths(ctx, page)
-	// Capture the final ranked, scoped page once, before JSON/TOON/GCX encoding.
-	captureLocalizationSearchSymbols(ctx, page)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	nextCursor := ""
 	if end < total {
 		nextCursor = encodeCursor(end)
 	}
-
 	indexWarning := s.indexFileFailureWarning(ctx, resolved, pathFilter)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	publishSearchState := func() {
+		// Flush the prior search's implicit skip-above negatives only when
+		// this request is about to publish its own final page.
+		if sess != nil && q != "" {
+			if nq, skipped := sess.drainSkippedNegatives(); nq != "" && len(skipped) > 0 {
+				s.combo.RecordNegative(nq, skipped)
+			}
+		}
+		recordLastSearchFromNodes(sess, q, page)
+		captureLocalizationSearchSymbols(ctx, page)
+	}
+
 	if isCompact(req) {
+		publishSearchState()
 		return decorateResultWithScope(decorateIndexFileFailureResult(mcp.NewToolResultText(compactNodes(page)), indexWarning), resolved), nil
 	}
 
 	if s.isGCX(ctx, req) {
 		res, err := s.gcxResponseWithBudget(req)(encodeSearchSymbols(page, total, len(page)))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		publishSearchState()
 		return withScopeResult(decorateIndexFileFailureResult(res, indexWarning), err, resolved)
 	}
 
@@ -2310,6 +2347,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		}
 		data, err := toon.Marshal(result)
 		if err == nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			publishSearchState()
 			return decorateResultWithScope(decorateIndexFileFailureResult(mcp.NewToolResultText(string(data)), indexWarning), resolved), nil
 		}
 	}
@@ -2352,6 +2393,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 				resp["content_matches"] = section
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
 	// A repo-narrowed zero is indistinguishable from "not indexed" in
 	// clients that never render _meta. Say it in the body — and since the
@@ -2360,7 +2404,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if total == 0 && len(resolved.RepoAllow) > 0 {
 		wide := scope
 		wide.RepoAllow = nil
-		wideNodes, _ := fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, offset+limit, wide, timings)
+		wideNodes, _ := fetchAndMergeBM25TimedContext(ctx, s.engineFor(ctx), q, expandedTerms, offset+limit, wide, timings)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		resp["scope_note"] = scopeZeroNote(resolved, len(wideNodes))
 	}
 	if fetchEscalated {
@@ -2480,6 +2527,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	publishSearchState()
 	return s.respondScopedJSONOrTOON(ctx, req, resp, resolved)
 }
 

@@ -634,7 +634,13 @@ func (s *Store) BuildSymbolIndex() error {
 // SQLite's bm25() returns lower-is-better, so the stored Score is its
 // negation (higher-is-better, matching the SymbolHit contract).
 func (s *Store) SearchSymbols(query string, limit int) ([]graph.SymbolHit, error) {
-	return s.SearchSymbolsRepoScoped(query, nil, limit)
+	return s.SearchSymbolsContext(context.Background(), query, limit)
+}
+
+// SearchSymbolsContext is SearchSymbols with request cancellation propagated
+// through both the exact-name and FTS queries.
+func (s *Store) SearchSymbolsContext(ctx context.Context, query string, limit int) ([]graph.SymbolHit, error) {
+	return s.SearchSymbolsRepoScopedContext(ctx, query, nil, limit)
 }
 
 // SearchSymbolsRepoScoped is SearchSymbols narrowed to the repoAllow
@@ -646,6 +652,19 @@ func (s *Store) SearchSymbols(query string, limit int) ([]graph.SymbolHit, error
 // without the IN). A nil / empty repoAllow is the exact unscoped
 // behaviour.
 func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit int) ([]graph.SymbolHit, error) {
+	return s.SearchSymbolsRepoScopedContext(context.Background(), query, repoAllow, limit)
+}
+
+// SearchSymbolsRepoScopedContext is SearchSymbolsRepoScoped with request
+// cancellation propagated to SQLite. Legacy callers retain their original
+// background-context behavior through SearchSymbolsRepoScoped.
+func (s *Store) SearchSymbolsRepoScopedContext(ctx context.Context, query string, repoAllow []string, limit int) ([]graph.SymbolHit, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if query == "" {
 		return nil, nil
 	}
@@ -669,11 +688,14 @@ func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit 
 	// module named "Extensions" would otherwise eclipse every
 	// `*Extensions` class the FTS ranks first.
 	if isIdentifierQuery(query) {
-		ns := s.FindNodesByName(query)
+		ns, err := s.symbolExactNodesContext(ctx, query)
+		if err != nil {
+			return nil, err
+		}
 		if len(ns) > 0 {
 			out := make([]graph.SymbolHit, 0, minInt(len(ns), limit))
 			for _, n := range ns {
-				if n == nil || n.ID == "" || !tier0ShortCircuitKind(n.Kind) {
+				if n.ID == "" || !tier0ShortCircuitKind(n.Kind) {
 					continue
 				}
 				// Unowned nodes (empty prefix) pass every repo narrow —
@@ -719,9 +741,12 @@ WHERE symbol_fts MATCH ?`
 			args = append(args, r)
 		}
 	}
-	q += ` ORDER BY bm25(symbol_fts) LIMIT ?`
+	// FTS5's rank ordering can stop after the requested in-scope hits without
+	// an external sort of every match. Pin the mapping per query so a stored
+	// custom rank configuration cannot change the existing BM25 scores.
+	q += ` AND symbol_fts.rank MATCH 'bm25()' ORDER BY symbol_fts.rank LIMIT ?`
 	args = append(args, limit)
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -748,6 +773,44 @@ WHERE symbol_fts MATCH ?`
 		return nil, err
 	}
 	return hits, nil
+}
+
+type symbolExactNode struct {
+	ID         string
+	Kind       graph.NodeKind
+	RepoPrefix string
+}
+
+// symbolExactNodesContext reads only the fields the tier-0 short circuit uses.
+// Keeping this query local ensures a canceled request never falls back to the
+// legacy background-context node lookup.
+func (s *Store) symbolExactNodesContext(ctx context.Context, name string) ([]symbolExactNode, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, kind, repo_prefix
+FROM nodes
+WHERE name = ? AND view_gen = ?
+ORDER BY id`, name, s.viewGen)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []symbolExactNode
+	for rows.Next() {
+		var (
+			n    symbolExactNode
+			kind string
+		)
+		if err := rows.Scan(&n.ID, &kind, &n.RepoPrefix); err != nil {
+			return nil, err
+		}
+		n.Kind = graph.NodeKind(kind)
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // tier0ShortCircuitKind reports whether an exact-name hit may
@@ -812,8 +875,18 @@ func escapeFTSQuote(t string) string {
 // through this when the backend implements SymbolBundleSearcher,
 // pre-seeding rerank.Context's edge caches.
 func (s *Store) SearchSymbolBundles(query string, limit int) ([]graph.SymbolBundle, error) {
-	hits, err := s.SearchSymbols(query, limit)
+	return s.SearchSymbolBundlesContext(context.Background(), query, limit)
+}
+
+// SearchSymbolBundlesContext is SearchSymbolBundles with request cancellation
+// propagated through the ranked symbol query. Bundle hydration retains its
+// existing batched-read contract and starts only while the request is live.
+func (s *Store) SearchSymbolBundlesContext(ctx context.Context, query string, limit int) ([]graph.SymbolBundle, error) {
+	hits, err := s.SearchSymbolsContext(ctx, query, limit)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return s.bundlesForHits(hits)
@@ -823,8 +896,17 @@ func (s *Store) SearchSymbolBundles(query string, limit int) ([]graph.SymbolBund
 // repo-scoped hit query — see SearchSymbolsRepoScoped for why the
 // narrowing must happen inside the FTS query.
 func (s *Store) SearchSymbolBundlesRepoScoped(query string, repoAllow []string, limit int) ([]graph.SymbolBundle, error) {
-	hits, err := s.SearchSymbolsRepoScoped(query, repoAllow, limit)
+	return s.SearchSymbolBundlesRepoScopedContext(context.Background(), query, repoAllow, limit)
+}
+
+// SearchSymbolBundlesRepoScopedContext is SearchSymbolBundlesRepoScoped with
+// request cancellation propagated through the repository-scoped FTS query.
+func (s *Store) SearchSymbolBundlesRepoScopedContext(ctx context.Context, query string, repoAllow []string, limit int) ([]graph.SymbolBundle, error) {
+	hits, err := s.SearchSymbolsRepoScopedContext(ctx, query, repoAllow, limit)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return s.bundlesForHits(hits)

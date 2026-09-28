@@ -3,6 +3,7 @@ package query
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -530,16 +531,24 @@ func (e *Engine) SearchSymbols(query string, limit int) []*graph.Node {
 // Fan-out callers merge multiple retrieval channels through this method and run
 // one final session-aware rerank over the combined slice.
 func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+	return e.GatherSymbolCandidatesContext(context.Background(), query, limit, opts, rctx)
+}
+
+// GatherSymbolCandidatesContext is the request-aware candidate retrieval path.
+// A canceled request never starts another backend, vector, refill, or fallback
+// operation. Legacy callers retain the background-context behavior above.
+func (e *Engine) GatherSymbolCandidatesContext(ctx context.Context, query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
 	if limit <= 0 {
 		limit = 20
 	}
 	fetchLimit := limit
 	if opts.hasScopeFilter() {
-		// Over-fetch so the post-fetch scope filter still fills the
-		// page, but never clamp below the caller's own ask — an
-		// explicit deep limit (the wipeout-escalation refetch) exists
-		// precisely to dig past this cap, and flattening it turns the
-		// deeper iterations into byte-identical re-queries.
 		fetchLimit = limit * 4
 		if fetchLimit > 200 {
 			fetchLimit = 200
@@ -556,10 +565,16 @@ func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptio
 
 	var cands []*rerank.Candidate
 	if s := e.getSearch(); s != nil && e.backendHasCorpus(s) {
-		cands = e.gatherBackendCandidates(query, fetchLimit, opts, gatherCtx)
+		cands = e.gatherBackendCandidates(ctx, query, fetchLimit, opts, gatherCtx)
 	} else {
+		if ctx.Err() != nil {
+			return nil
+		}
 		start := time.Now()
 		nodes := e.searchSubstring(query, fetchLimit)
+		if ctx.Err() != nil {
+			return nil
+		}
 		if opts.SearchTimings != nil {
 			opts.SearchTimings.FallbackMS += time.Since(start).Milliseconds()
 		}
@@ -591,17 +606,33 @@ func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptio
 // repo + project locality); pass nil to score with structural signals
 // only.
 func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+	return e.SearchSymbolsRankedContext(context.Background(), query, limit, opts, rctx)
+}
+
+// SearchSymbolsRankedContext is SearchSymbolsRanked with request cancellation
+// propagated through candidate gathering and each post-gather ranking stage.
+func (e *Engine) SearchSymbolsRankedContext(ctx context.Context, query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+	ctx = liveRequestContext(ctx)
+	if ctx.Err() != nil {
+		return nil
+	}
 	if limit <= 0 {
 		limit = 20
 	}
-	cands := e.GatherSymbolCandidates(query, limit, opts, rctx)
+	cands := e.GatherSymbolCandidatesContext(ctx, query, limit, opts, rctx)
+	if ctx.Err() != nil {
+		return nil
+	}
 
 	if e.rerank != nil && !opts.SkipInnerRerank {
-		ctx := rctx
-		if ctx == nil {
-			ctx = &rerank.Context{}
+		if ctx.Err() != nil {
+			return nil
 		}
-		ctx.Graph = e.g
+		rerankCtx := rctx
+		if rerankCtx == nil {
+			rerankCtx = &rerank.Context{}
+		}
+		rerankCtx.Graph = e.g
 		// When the caller supplied opts.RerankContext (the bundle-
 		// seeding handler), inherit its cached edges so this per-call
 		// rerank's prepare can read them — saves the 2 batched edge
@@ -610,10 +641,13 @@ func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions,
 		// runs against the merged candidate set); the inner rerank
 		// gets a structural-only context plus the bundle-cached edges.
 		if rctx == nil && opts.RerankContext != nil {
-			ctx.InheritEdgeCacheFrom(opts.RerankContext)
+			rerankCtx.InheritEdgeCacheFrom(opts.RerankContext)
 		}
 		rerankStart := time.Now()
-		e.rerank.Rerank(query, cands, ctx)
+		e.rerank.Rerank(query, cands, rerankCtx)
+		if ctx.Err() != nil {
+			return nil
+		}
 		if opts.SearchTimings != nil {
 			opts.SearchTimings.EngineRerankMS += time.Since(rerankStart).Milliseconds()
 		}
@@ -626,10 +660,19 @@ func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions,
 		// best-effort: refineByCosine is a no-op whenever the vector
 		// channel is inactive, so a text-only search is unaffected.
 		if opts.CosineRerank {
+			if ctx.Err() != nil {
+				return nil
+			}
 			cands = e.RefineByCosine(query, cands, opts.CosineTopN)
+			if ctx.Err() != nil {
+				return nil
+			}
 		}
 	}
 
+	if ctx.Err() != nil {
+		return nil
+	}
 	if len(cands) > limit {
 		cands = cands[:limit]
 	}
@@ -729,7 +772,13 @@ func repoAllowList(allow map[string]bool) []string {
 // the rerank's 2 edge fetches) into 4 server-side queries with no
 // engine→rerank boundary crossings; the GetNodesByIDs cost goes
 // away entirely for the BM25 hits.
-func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
 	backend := e.getSearch()
 	timings := opts.SearchTimings
 
@@ -767,41 +816,27 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		bundleHandled  bool
 		bundleNodeByID = make(map[string]*graph.Node)
 	)
-	if bsb, ok := backend.(search.SymbolBundleSearcherBackend); ok {
-		// Pull the vector channel separately when present. Bundles
-		// cover BM25 only; the engine merges vector hits below.
-		// VectorChannelOnly avoids re-running the text BM25 path —
-		// the bundle already returned the BM25 hits and their full
-		// node + edge payload. Falling back to SearchChannels here
-		// would double-pay the FTS query cost per BM25 fan-out.
-		type vectorOnly interface {
-			VectorChannelOnly(query string, limit int) ([]string, search.ChannelTimings)
-		}
-		vectorOnlyBackend, vectorOnlyOK := backend.(vectorOnly)
+	bundleCapable := false
+	if _, ok := backend.(search.SymbolBundleSearcherBackend); ok {
+		bundleCapable = true
+	}
+	if _, ok := backend.(search.ContextSymbolBundleSearcherBackend); ok {
+		bundleCapable = true
+	}
+	if bundleCapable {
 		bundleStart := time.Now()
-		// Repo-narrowed sessions take the scoped bundle path when the
-		// backend can filter inside the FTS query. The post-fetch
-		// ScopeAllows pass below starves whenever another repo owns the
-		// whole BM25 head deeper than this fetch — only the backend can
-		// narrow without a depth limit.
-		var bundles []search.SymbolBundle
-		// Gate on the flattened list, not the map: an all-false map is
-		// "deny everything" under ScopeAllows and must not select the
-		// scoped path with an empty (= unscoped!) allow list.
-		scopedAnswered := false
+		var answer requestBundleAnswer
 		if allow := repoAllowList(opts.RepoAllow); len(allow) > 0 {
-			if sb, ok := backend.(search.ScopedSymbolBundleSearcherBackend); ok {
-				bundles = sb.SearchSymbolBundlesScoped(query, allow, limit*2)
-				// nil = no scoped support (or error); anything non-nil —
-				// an empty slice included — is the scoped path's answer.
-				scopedAnswered = bundles != nil
-			}
+			answer = requestScopedSymbolBundles(ctx, backend, query, allow, limit*2)
 		}
-		// nil = no scoped support (or error); a non-nil empty slice is
-		// the scoped path's real answer and must NOT trigger the
-		// unscoped flood fetch its emptiness proves useless.
-		if bundles == nil {
-			bundles = bsb.SearchSymbolBundles(query, limit*2)
+		if !answer.authoritative {
+			answer = requestSymbolBundles(ctx, backend, query, limit*2)
+		}
+		bundles := answer.bundles
+		scopedAnswered := answer.authoritative && len(repoAllowList(opts.RepoAllow)) > 0
+		bundleHandled = answer.authoritative
+		if answer.failed || ctx.Err() != nil {
+			return nil
 		}
 		if timings != nil {
 			timings.BundleMS += time.Since(bundleStart).Milliseconds()
@@ -873,9 +908,12 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		// classWeightTable already proves semantic contributes near-
 		// zero signal vs the BM25 channel — see classWeightTable in
 		// internal/search/rerank/query_kind.go.
-		if vectorOnlyOK && !skipVectorChannel {
-			vecIDs, stats := vectorOnlyBackend.VectorChannelOnly(query, limit*2)
-			vectorIDs = vecIDs
+		if bundleHandled && !skipVectorChannel {
+			var stats search.ChannelTimings
+			vectorIDs, stats = requestVectorChannel(ctx, backend, query, limit*2)
+			if ctx.Err() != nil {
+				return nil
+			}
 			if timings != nil {
 				timings.EmbedMS += stats.EmbedMS
 				timings.VectorSearchMS += stats.VectorSearchMS
@@ -883,53 +921,25 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		}
 	}
 
-	// Legacy / fallback path: bundle backend absent OR returned no
-	// hits. Pull text + vector channels separately when the backend
-	// exposes them (HybridBackend). Otherwise treat plain Search()
-	// output as text-only. The wall-clock for the backend search
-	// call lands on the outer caller's BM25*MS bucket — measuring
-	// around the engine boundary captures the full per-call cost
-	// without double-counting against the post-call GetNodesByIDs /
-	// FindNodesByName / Fallback phases that this function
-	// instruments individually below.
 	if !bundleHandled {
-		type timedChan interface {
-			SearchChannelsTimed(query string, limit int) ([]search.SearchResult, []string, search.ChannelTimings)
-		}
 		switch {
 		case skipVectorChannel:
-			// Identifier-shape fast path: skip the vector channel
-			// (no embed, no ANN) and run text-only Search. The cost
-			// saved is the per-call embedder + vector index hit; the
-			// rerank's classWeightTable proves it's not earning its
-			// keep for these query classes.
 			textStart := time.Now()
-			textResults = backend.Search(query, limit*2)
+			textResults = requestTextSearch(ctx, backend, query, limit*2)
 			if timings != nil {
 				timings.TextBackendMS += time.Since(textStart).Milliseconds()
 			}
 		default:
-			if tc, ok := backend.(timedChan); ok {
-				var stats search.ChannelTimings
-				textResults, vectorIDs, stats = tc.SearchChannelsTimed(query, limit*2)
-				if timings != nil {
-					timings.TextBackendMS += stats.TextMS
-					timings.EmbedMS += stats.EmbedMS
-					timings.VectorSearchMS += stats.VectorSearchMS
-				}
-			} else if cs, ok := backend.(search.ChannelSearcher); ok {
-				textStart := time.Now()
-				textResults, vectorIDs = cs.SearchChannels(query, limit*2)
-				if timings != nil {
-					timings.TextBackendMS += time.Since(textStart).Milliseconds()
-				}
-			} else {
-				textStart := time.Now()
-				textResults = backend.Search(query, limit*2)
-				if timings != nil {
-					timings.TextBackendMS += time.Since(textStart).Milliseconds()
-				}
+			var stats search.ChannelTimings
+			textResults, vectorIDs, stats = requestSearchChannels(ctx, backend, query, limit*2)
+			if timings != nil {
+				timings.TextBackendMS += stats.TextMS
+				timings.EmbedMS += stats.EmbedMS
+				timings.VectorSearchMS += stats.VectorSearchMS
 			}
+		}
+		if ctx.Err() != nil {
+			return nil
 		}
 	}
 
@@ -939,12 +949,16 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 	// where every surviving candidate is resolved through the composed
 	// reader and anything the view hides falls out.
 	if viewLayered {
-		textResults = e.viewTextCandidates(
+		textResults = e.viewTextCandidatesContext(
+			ctx,
 			query,
 			limit*2,
 			textResults,
-			viewBaseTextRefill(backend, query, repoAllowList(opts.RepoAllow)),
+			viewBaseTextRefillContext(ctx, backend, query, repoAllowList(opts.RepoAllow)),
 		)
+		if ctx.Err() != nil {
+			return nil
+		}
 	}
 
 	// Collect every ID NOT covered by the bundle path (vector hits +
@@ -968,8 +982,14 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 			idBatch = append(idBatch, id)
 		}
 	}
+	if ctx.Err() != nil {
+		return nil
+	}
 	getNodesStart := time.Now()
 	nodeByID := e.g.GetNodesByIDs(idBatch)
+	if ctx.Err() != nil {
+		return nil
+	}
 	if timings != nil {
 		timings.GetNodesMS += time.Since(getNodesStart).Milliseconds()
 	}
@@ -1032,8 +1052,15 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 	// of expansion terms, for example) — saves the query round-trip
 	// that would unconditionally return zero rows.
 	if !opts.SkipExactNameSplice {
+		if ctx.Err() != nil {
+			return nil
+		}
 		findNameStart := time.Now()
-		for _, n := range e.g.FindNodesByName(query) {
+		nameMatches, err := graph.FindNodesByNameContext(ctx, e.g, query)
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
+		for _, n := range nameMatches {
 			if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 				continue
 			}
@@ -1042,6 +1069,9 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 			}
 			idx[n.ID] = len(cands)
 			cands = append(cands, &rerank.Candidate{Node: n, TextRank: len(textResults), VectorRank: -1})
+		}
+		if ctx.Err() != nil {
+			return nil
 		}
 		if timings != nil {
 			timings.FindNameMS += time.Since(findNameStart).Milliseconds()
@@ -1058,12 +1088,21 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 	// by a small slack factor so dedup against existing cands still
 	// leaves room to fill `limit`.
 	if len(cands) < limit {
+		if ctx.Err() != nil {
+			return nil
+		}
 		fallbackStart := time.Now()
 		fetch := (limit - len(cands)) * 2
 		if fetch < limit {
 			fetch = limit
 		}
-		subMatches := e.g.FindNodesByNameContaining(query, fetch)
+		subMatches, err := graph.FindNodesByNameContainingContext(ctx, e.g, query, fetch)
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
 		// Stable ordering — backends may return in catalog order, which
 		// is not a meaningful relevance signal here.
 		sort.Slice(subMatches, func(i, j int) bool { return subMatches[i].ID < subMatches[j].ID })
@@ -1079,6 +1118,9 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 			if len(cands) >= limit {
 				break
 			}
+		}
+		if ctx.Err() != nil {
+			return nil
 		}
 		if timings != nil {
 			timings.FallbackMS += time.Since(fallbackStart).Milliseconds()
