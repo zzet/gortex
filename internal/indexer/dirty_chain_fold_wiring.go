@@ -143,7 +143,7 @@ func (c *CheckoutCoordinator) copyChainInSteps(ctx context.Context, oldestFirst 
 // landSteppedFold lands a published stepped fold of folded (oldest first)
 // under the cycle lock, waiting for a running cycle to finish. It reports
 // whether the fold entered the route (flip or re-base).
-func (c *CheckoutCoordinator) landSteppedFold(ctx context.Context, commitGeneration int64, folded []int64, built dirtyLayerBuild) (foldLanding, bool) {
+func (c *CheckoutCoordinator) landSteppedFold(ctx context.Context, commitGeneration int64, folded []int64, built dirtyLayerBuild, pub *foldPublication) (foldLanding, bool) {
 	c.retainDirty(ctx, built.Key, built.GenerationID)
 	ticker := time.NewTicker(dirtyChainCompactionYieldPoll)
 	defer ticker.Stop()
@@ -156,6 +156,13 @@ func (c *CheckoutCoordinator) landSteppedFold(ctx context.Context, commitGenerat
 		}
 	}
 	defer c.cycleMu.Unlock()
+	if c.foldLandingClaimed(pub) {
+		// An edit at the cap waited for this fold and landed it.
+		c.logger.Info("checkout coordinator: chain fold landed",
+			zap.String("checkout", c.checkoutID), zap.String("landing", foldLandByEdit),
+			zap.Int64("folded_generation", built.GenerationID), zap.Int("folded_layers", len(folded)))
+		return foldLanding{kind: foldLandByEdit}, true
+	}
 	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
 	if err != nil || !found || route.State != store_sqlite.RouteActive ||
 		route.CommitGenerationID != commitGeneration || route.DirtyGenerationID <= 0 {
@@ -222,6 +229,10 @@ func (c *CheckoutCoordinator) foldAtCap(ctx context.Context, route store_sqlite.
 	slices.Reverse(routed)
 	switch chainBoundAction(routed, folding) {
 	case chainActionFoldUpper:
+		if len(routed)-len(folding) <= 1 {
+			// Nothing above the fold worth folding: wait for the fold.
+			return c.awaitRunningFold(ctx, commitGeneration, routed, folding)
+		}
 		root, found, err := c.catalog.GetViewGeneration(ctx, folding[len(folding)-1])
 		if err != nil || !found {
 			return 0
@@ -256,13 +267,20 @@ func (c *CheckoutCoordinator) compactDirtyChainStepped(
 		folded = slices.Clone(oldestFirst)
 		return c.copyChainInSteps(ctx, oldestFirst, to)
 	}
+	pub := c.offerFoldPublication()
+	defer c.retireFoldPublication(pub)
 	started := time.Now()
 	built, err := c.flattenDirtyChainOver(ctx, commit, commit, route.DirtyGenerationID, copier)
 	report.BuildDuration = time.Since(started)
+	if err != nil {
+		c.settleFoldPublication(pub, dirtyLayerBuild{}, nil)
+	} else {
+		c.settleFoldPublication(pub, built, folded)
+	}
 	switch {
 	case err == nil:
 		report.GenerationID = built.GenerationID
-		landing, entered := c.landSteppedFold(context.WithoutCancel(ctx), trigger.CommitGenerationID, folded, built)
+		landing, entered := c.landSteppedFold(context.WithoutCancel(ctx), trigger.CommitGenerationID, folded, built, pub)
 		report.Landing = landing.kind
 		if entered {
 			report.Outcome = dirtyChainCompactionFlipped

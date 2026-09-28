@@ -175,6 +175,9 @@ type dirtyChainCompactor struct {
 	// copyHook is a test seam: it runs on every copied fold (inline or
 	// stepped) before the fold is checked, and may alter what was copied.
 	copyHook func(ctx context.Context, to int64) error
+	// publication is the running stepped fold's result, offered to an edit
+	// that waits for it at the cap (dirty_chain_fold_await.go).
+	publication *foldPublication
 	// inlineBudget is a test seam: the inline fold's copy budget (0: the
 	// default, dirtyChainInlineFoldBudget).
 	inlineBudget time.Duration
