@@ -36,13 +36,14 @@ import (
 var (
 	// walReclaimPressureHold caps the writer step taken inside a busy lane.
 	walReclaimPressureHold = 50 * time.Millisecond
-	// walReclaimIdleResetHold caps the writer hold of the writer-free
-	// rounds' reset (the log already copied, no reader pinning it).
-	walReclaimIdleResetHold = walReclaimPressureHold
-	// walIdleResetHook, when set by a test, runs once the idle reset holds
-	// the write gate. nil in production.
+	// walReclaimResetHold caps every other hold of the writer the reclaim
+	// takes (the last copy and the reset); the wait for readers never holds
+	// it.
+	walReclaimResetHold = walReclaimPressureHold
+	// walIdleResetHook, when set by a test, runs once a reset hold has the
+	// write gate. nil in production.
 	walIdleResetHook func()
-	// walIdleResetResultHook, when set by a test, replaces the idle reset's
+	// walIdleResetResultHook, when set by a test, replaces a reset hold's
 	// error (an interrupt that arrives after the reset completed). nil in
 	// production.
 	walIdleResetResultHook func(error) error

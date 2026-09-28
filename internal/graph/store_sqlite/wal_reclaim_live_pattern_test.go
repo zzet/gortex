@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"log"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,35 +53,60 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// The live daemon's pattern: pool reads that each hold their read
-// transaction for 2.5–4 s (longer than the former 2 s open-gate wait and far
-// longer than the 250 ms closed-gate drain), always overlapping, and writes
-// that arrive in bursts (an edit's build) with idle writer time in between.
-// The reclaim must reset the log from the open-gate stage, log one line per
-// reset naming the stage, and never keep a queued write waiting longer than
-// the minimum hold.
-func TestWALReclaimResetsUnderLongOverlappingReadersAndBurstyWrites(t *testing.T) {
-	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "16")
-	// A production-like cadence (the daemon polls every 5 s): a 50 ms poll
-	// would retry a yielded attempt straight back into the same write burst
-	// and hold the writer for the minimum hold again at every write.
-	setWALReclaimCadence(t, time.Second, time.Second, 4*time.Second)
-	logs := captureReclaimLog(t)
-	s, path := openWALReclaimStore(t)
-	defer func() { _ = s.Close() }()
-	seedWALChurnTable(t, s)
+// longReaderPattern is the live daemon's pattern: pool reads that each hold
+// their read transaction for readMin..readMax, staggered so one is always in
+// flight, and writes in bursts (an edit's build) separated by gaps: a short
+// gap (shorter than any read, so no reset can land in it) and a long gap
+// (more than twice the longest read, so one can).
+type longReaderPattern struct {
+	readers          int
+	readMin, readMax time.Duration
+	burstWrites      int // churn writes of ~1 MiB each
+	shortGap         time.Duration
+	longGap          time.Duration
+	cycles           int
+}
 
+type longReaderGap struct {
+	start, end time.Time
+	long       bool
+	walAtStart int64
+}
+
+type longReaderRun struct {
+	gaps          []longReaderGap
+	resets        []time.Time
+	maxWAL        int64
+	maxGateWait   time.Duration
+	maxStatement  time.Duration
+	maxBurstBytes int64
+	started       time.Time
+}
+
+// firstResetAfter is the first reset at or after t (zero when none).
+func (r longReaderRun) firstResetAfter(t time.Time) time.Time {
+	for _, at := range r.resets {
+		if !at.Before(t) {
+			return at
+		}
+	}
+	return time.Time{}
+}
+
+func runLongReaderPattern(t *testing.T, s *Store, path string, p longReaderPattern) longReaderRun {
+	t.Helper()
+	run := longReaderRun{started: time.Now()}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	var maxWAL, maxWriteWait atomic.Int64
 	var failed atomic.Value
-	for r := 0; r < 4; r++ {
+	var mu sync.Mutex
+	for r := 0; r < p.readers; r++ {
 		wg.Add(1)
 		go func(seed int64) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(seed))
 			// Stagger so some reader is always mid-transaction.
-			time.Sleep(time.Duration(seed) * 700 * time.Millisecond)
+			time.Sleep(time.Duration(seed) * p.readMin / time.Duration(p.readers))
 			for {
 				select {
 				case <-stop:
@@ -98,7 +124,7 @@ func TestWALReclaimResetsUnderLongOverlappingReadersAndBurstyWrites(t *testing.T
 					failed.Store(err)
 					return
 				}
-				hold := 2500*time.Millisecond + time.Duration(rng.Int63n(int64(1500*time.Millisecond)))
+				hold := p.readMin + time.Duration(rng.Int63n(int64(p.readMax-p.readMin)))
 				select {
 				case <-stop:
 				case <-time.After(hold):
@@ -108,90 +134,162 @@ func TestWALReclaimResetsUnderLongOverlappingReadersAndBurstyWrites(t *testing.T
 		}(int64(r))
 	}
 	wg.Add(1)
-	go func() { // bursty writer: ~12 MiB per burst, then idle
+	go func() { // the log's size and the resets, sampled
 		defer wg.Done()
-		k := 0
-		for {
-			for i := 0; i < 12; i++ {
-				start := time.Now()
-				s.writeMu.Lock()
-				wait := time.Since(start)
-				s.writeMu.Unlock()
-				if int64(wait) > maxWriteWait.Load() {
-					maxWriteWait.Store(int64(wait))
-				}
-				if err := churnWriteOnce(s, k); err != nil {
-					failed.Store(err)
-					return
-				}
-				k++
-			}
-			select {
-			case <-stop:
-				return
-			case <-time.After(6 * time.Second):
-			}
-		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+		resets := s.WALReclaimStats().Resets
 		for {
 			select {
 			case <-stop:
 				return
 			case <-time.After(5 * time.Millisecond):
 			}
-			if size := walFileSize(path + "-wal"); size > maxWAL.Load() {
-				maxWAL.Store(size)
+			size := walFileSize(path + "-wal")
+			now := s.WALReclaimStats().Resets
+			mu.Lock()
+			run.maxWAL = max(run.maxWAL, size)
+			for ; resets < now; resets++ {
+				run.resets = append(run.resets, time.Now())
 			}
+			mu.Unlock()
 		}
 	}()
-	// Run until the open-gate stage has reset the log twice, or a generous
-	// deadline: the count is wall-clock sensitive on a loaded host (an attempt
-	// that yields to a queued write is a skip and retries later), the
-	// mechanism is not.
-	deadline := time.Now().Add(120 * time.Second)
-	for s.WALReclaimStats().OpenGateResets < 2 && time.Now().Before(deadline) {
-		time.Sleep(200 * time.Millisecond)
+	// The writer: bursts and gaps, every write's wait for the gate and its
+	// own statement timed apart.
+	k := 0
+	burst := func() {
+		before := vfsIOMark()
+		for i := 0; i < p.burstWrites; i++ {
+			start := time.Now()
+			s.writeMu.Lock()
+			wait := time.Since(start)
+			s.writeMu.Unlock()
+			stmt := time.Now()
+			if err := churnWriteOnce(s, k); err != nil {
+				failed.Store(err)
+				return
+			}
+			k++
+			mu.Lock()
+			run.maxGateWait = max(run.maxGateWait, wait)
+			run.maxStatement = max(run.maxStatement, time.Since(stmt))
+			mu.Unlock()
+		}
+		written := vfsIOMark().Since(before).WriterWALWriteBytes
+		mu.Lock()
+		run.maxBurstBytes = max(run.maxBurstBytes, written)
+		mu.Unlock()
+	}
+	gap := func(d time.Duration, long bool) {
+		g := longReaderGap{start: time.Now(), long: long, walAtStart: walFileSize(path + "-wal")}
+		time.Sleep(d)
+		g.end = time.Now()
+		mu.Lock()
+		run.gaps = append(run.gaps, g)
+		mu.Unlock()
+	}
+	for c := 0; c < p.cycles; c++ {
+		burst()
+		gap(p.shortGap, false)
+		burst()
+		gap(p.longGap, true)
 	}
 	close(stop)
 	wg.Wait()
 	if err, _ := failed.Load().(error); err != nil {
 		t.Fatal(err)
 	}
-	stats := s.WALReclaimStats()
-	out := logs.String()
-	t.Logf("resets=%d open_gate=%d deferrals=%d skips=%d pause_max=%s writer_hold_max=%s wal_max=%.1fMiB max_write_wait=%s",
-		stats.Resets, stats.OpenGateResets, stats.Deferrals, stats.Skips, stats.PauseMax, stats.WriterHoldMax,
-		float64(maxWAL.Load())/(1<<20), time.Duration(maxWriteWait.Load()))
-	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "wal reclaim") {
-			t.Log(line)
-		}
-	}
-	require.GreaterOrEqual(t, stats.OpenGateResets, int64(1), "the open-gate stage must reset the log under long overlapping readers")
-	if !raceDetectorOn {
-		require.Less(t, stats.Deferrals, stats.OpenGateResets, "attempts must mostly reset, not defer")
-	}
-	require.Contains(t, out, "wal reclaimed stage=open_gate")
-	require.Zero(t, stats.PauseMax, "no reader may be paused: the resets come from the open-gate stage")
-	// Attempts start above the threshold; one that yields to a queued write
-	// lets that burst (12 MiB) and possibly the next land before a retry
-	// resets, so the log stays below threshold + two bursts.
-	walBound := int64(3 * 16 << 20)
-	if raceDetectorOn {
-		walBound = 5 * 16 << 20
-	}
-	require.LessOrEqual(t, maxWAL.Load(), walBound, "the WAL must stay within three times the threshold")
-	require.LessOrEqual(t, time.Duration(maxWriteWait.Load()), walReclaimMaxWriterHold+raceSlack(100*time.Millisecond),
-		"a queued write waited on the reclaim longer than its minimum hold")
+	return run
 }
 
-// A mutation arriving while a reclaim attempt runs is delayed at most
-// walReclaimMaxWriterHold, even when an old reader never leaves: the wait for
-// old readers holds no writer, and the writer is held at most 2 s. Every write
-// succeeds — the store never turns the reclaim into a refused or empty write.
+// The long-reader pattern at a scaled threshold (16 MiB). The contract:
+//   - no write waits for the gate longer than one short hold
+//     (walReclaimResetHold, 50 ms): the reclaim waits for the readers
+//     without the writer and takes it only for the reset;
+//   - a long gap that starts with the log over the threshold ends with the
+//     log reset (the first gap that allows a reset gets it);
+//   - the log stays under the threshold plus the two bursts between such
+//     gaps (a burst can start just under the threshold, the short gap cannot
+//     reset, the next burst lands before the long gap);
+//   - no reader is paused.
+//
+// It replaced a contract under which the writer was held up to 2 s while
+// the reclaim waited for older readers: writes waited up to 2 s, and the log
+// stayed within three times the threshold.
+func TestWALReclaimResetsUnderLongOverlappingReadersAndBurstyWrites(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "16")
+	// A production-like cadence (the daemon polls every 5 s).
+	setWALReclaimCadence(t, time.Second, time.Second, 4*time.Second)
+	logs := captureReclaimLog(t)
+	s, path := openWALReclaimStore(t)
+	defer func() { _ = s.Close() }()
+	seedWALChurnTable(t, s)
+	p := longReaderPattern{
+		readers: 4, readMin: 2500 * time.Millisecond, readMax: 4 * time.Second,
+		burstWrites: 12, shortGap: 1500 * time.Millisecond, longGap: 12 * time.Second, cycles: 3,
+	}
+	run := runLongReaderPattern(t, s, path, p)
+	checkLongReaderContract(t, s, run, 16<<20, logs.String())
+}
+
+// The twin of the case above with the daemon's defaults: the default
+// threshold (256 MiB), cadence and reader wait, no scaling. The bursts are
+// scaled to the threshold (~100 MiB each) and the log reaches ~0.5 GiB, so it
+// is gated (GORTEX_STORE_DEFAULTS_READERS=1). It reports the log's peak, the
+// longest wait for the gate and the time to the first reset.
+func TestWALReclaimResetsUnderLongOverlappingReadersWithTheDaemonDefaults(t *testing.T) {
+	if os.Getenv("GORTEX_STORE_DEFAULTS_READERS") != "1" {
+		t.Skip("set GORTEX_STORE_DEFAULTS_READERS=1 (writes a ~0.5 GiB log)")
+	}
+	logs := captureReclaimLog(t)
+	s, path := openWALReclaimStore(t)
+	defer func() { _ = s.Close() }()
+	seedWALChurnTable(t, s)
+	cfg := resolveWALReclaimConfig()
+	p := longReaderPattern{
+		readers: 4, readMin: 2500 * time.Millisecond, readMax: 4 * time.Second,
+		burstWrites: 100, shortGap: 1500 * time.Millisecond, longGap: 15 * time.Second, cycles: 3,
+	}
+	run := runLongReaderPattern(t, s, path, p)
+	checkLongReaderContract(t, s, run, cfg.thresholdBytes, logs.String())
+}
+
+func checkLongReaderContract(t *testing.T, s *Store, run longReaderRun, threshold int64, logs string) {
+	t.Helper()
+	stats := s.WALReclaimStats()
+	bound := threshold + 2*run.maxBurstBytes
+	firstReset := time.Duration(0)
+	if len(run.resets) > 0 {
+		firstReset = run.resets[0].Sub(run.started)
+	}
+	t.Logf("resets=%d deferrals=%d skips=%d pause_max=%s writer_hold_max=%s wal_max=%.1fMiB bound=%.1fMiB burst=%.1fMiB max_gate_wait=%s max_statement=%s first_reset_after=%s",
+		stats.Resets, stats.Deferrals, stats.Skips, stats.PauseMax, stats.WriterHoldMax,
+		float64(run.maxWAL)/(1<<20), float64(bound)/(1<<20), float64(run.maxBurstBytes)/(1<<20),
+		run.maxGateWait, run.maxStatement, firstReset.Round(time.Millisecond))
+	longGaps := 0
+	for i, g := range run.gaps {
+		at := run.firstResetAfter(g.start)
+		inGap := !at.IsZero() && at.Before(g.end)
+		t.Logf("gap %d long=%v wal_at_start=%.1fMiB length=%s reset_in_gap=%v", i, g.long, float64(g.walAtStart)/(1<<20), g.end.Sub(g.start).Round(time.Millisecond), inGap)
+		if g.long && g.walAtStart > threshold {
+			longGaps++
+			require.True(t, inGap, "gap %d: a long gap over the threshold ended without a reset", i)
+		}
+	}
+	require.Positive(t, longGaps, "no long gap started over the threshold: the pattern did not exercise the reset")
+	require.LessOrEqual(t, run.maxGateWait, walReclaimResetHold+raceSlack(10*time.Millisecond),
+		"a write waited for the gate longer than one short hold")
+	require.LessOrEqual(t, stats.WriterHoldMax, walReclaimResetHold+raceSlack(10*time.Millisecond),
+		"the reclaim held the writer longer than one short hold")
+	require.LessOrEqual(t, run.maxWAL, bound, "the log outgrew the threshold plus two bursts")
+	require.Zero(t, stats.PauseMax, "no reader may be paused")
+	require.Contains(t, logs, "wal reclaimed stage=open_gate")
+}
+
+// A mutation arriving while a reclaim attempt runs is delayed at most one
+// short hold (walReclaimResetHold, 50 ms), even when an old reader never
+// leaves and the log is urgent: the wait for old readers holds no writer, and
+// each hold covers only the last backfill and the reset. Every write succeeds
+// — the store never turns the reclaim into a refused or empty write.
 func TestWALReclaimDelaysAMutationAtMostTheWriterHoldCap(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -201,8 +299,8 @@ func TestWALReclaimDelaysAMutationAtMostTheWriterHoldCap(t *testing.T) {
 		// Not urgent: the old-reader wait runs writer-free and the lane
 		// yields to the mutation stream at once.
 		{name: "not_urgent", threshold: 1 << 30},
-		// Urgent: the lane keeps the writer despite waiting mutations, but
-		// never past the cap.
+		// Urgent: a hold does not yield to waiting mutations, but lasts at
+		// most walReclaimResetHold, and the reader wait runs without it.
 		{name: "urgent", threshold: 1 << 20, urgent: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -224,7 +322,7 @@ func TestWALReclaimDelaysAMutationAtMostTheWriterHoldCap(t *testing.T) {
 			cfg := walReclaimConfig{thresholdBytes: tc.threshold, drainDeadline: 250 * time.Millisecond, truncateBudget: walReclaimTruncateBudget, readerWait: 3 * time.Second}
 
 			stop := make(chan struct{})
-			var maxWait atomic.Int64
+			var maxWait, maxTotal atomic.Int64
 			var writes atomic.Int64
 			var writeErr atomic.Value
 			var wg sync.WaitGroup
@@ -237,13 +335,21 @@ func TestWALReclaimDelaysAMutationAtMostTheWriterHoldCap(t *testing.T) {
 						return
 					default:
 					}
+					// The wait for the write gate, as the long-reader case
+					// measures it; the write itself is timed apart.
 					start := time.Now()
+					s.writeMu.Lock()
+					gate := time.Since(start)
+					s.writeMu.Unlock()
 					if err := churnWriteOnce(s, k); err != nil {
 						writeErr.Store(err)
 						return
 					}
-					if d := int64(time.Since(start)); d > maxWait.Load() {
+					if d := int64(gate); d > maxWait.Load() {
 						maxWait.Store(d)
+					}
+					if d := int64(time.Since(start)); d > maxTotal.Load() {
+						maxTotal.Store(d)
 					}
 					writes.Add(1)
 					time.Sleep(50 * time.Millisecond)
@@ -255,13 +361,13 @@ func TestWALReclaimDelaysAMutationAtMostTheWriterHoldCap(t *testing.T) {
 			if err, _ := writeErr.Load().(error); err != nil {
 				t.Fatalf("a mutation failed during the reclaim: %v", err)
 			}
-			t.Logf("outcome=%s reason=%q open_gate=%q writer_hold=%s max_mutation=%s writes=%d", res.outcome, res.reason, res.openGateReport, res.writerHold, time.Duration(maxWait.Load()), writes.Load())
-			require.LessOrEqual(t, res.writerHold, walReclaimMaxWriterHold+raceSlack(100*time.Millisecond), "the writer was held past the cap")
-			require.LessOrEqual(t, time.Duration(maxWait.Load()), walReclaimMaxWriterHold+raceSlack(100*time.Millisecond), "a mutation was delayed past the cap")
+			t.Logf("outcome=%s reason=%q open_gate=%q writer_hold=%s writer_holds=%d max_gate_wait=%s max_mutation=%s writes=%d", res.outcome, res.reason, res.openGateReport, res.writerHold, res.writerHolds, time.Duration(maxWait.Load()), time.Duration(maxTotal.Load()), writes.Load())
+			require.LessOrEqual(t, res.writerHold, walReclaimResetHold+raceSlack(50*time.Millisecond), "the writer was held past the short hold")
+			require.LessOrEqual(t, time.Duration(maxWait.Load()), walReclaimResetHold+raceSlack(50*time.Millisecond), "a mutation waited for the gate past the short hold")
+			require.Greater(t, writes.Load(), int64(10), "mutations kept flowing while the reclaim waited for the old reader")
 			if !tc.urgent {
-				require.Greater(t, writes.Load(), int64(10), "mutations kept flowing while the reclaim waited for the old reader")
 				require.Contains(t, res.openGateReport, "older_readers_outlasted_wait")
-				require.Less(t, time.Duration(maxWait.Load()), raceSlack(500*time.Millisecond), "a non-urgent attempt must not hold a mutation")
+				require.Less(t, time.Duration(maxTotal.Load()), raceSlack(500*time.Millisecond), "a non-urgent attempt must not hold a mutation")
 			}
 		})
 	}
@@ -383,4 +489,75 @@ func TestResidueDrainHandsABusyTruncateToTheReclaim(t *testing.T) {
 	require.Less(t, elapsed, 5*time.Second, "the drain spun")
 	require.NotContains(t, logs.String(), "busy exhausted")
 	require.Contains(t, logs.String(), "wal residue drain handed to reclaim")
+}
+
+// A hold that finds the log not ready hands the writer back at once: here a
+// reader pins the last frames (it began just before a small write), so the
+// hold's backfill stays incomplete although the remainder is small. The
+// reclaim retakes the writer only for another short hold after the readers
+// it waited for have left; a write never waits for the gate longer than one
+// hold, and no hold lasts longer than walReclaimResetHold.
+func TestAReclaimHoldHandsTheWriterBackWhenTheLogIsNotReady(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
+	s, path := openWALReclaimStore(t)
+	defer func() { _ = s.Close() }()
+	seedWALChurnTable(t, s)
+	growWAL(t, s, 8)
+	ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
+	require.NoError(t, err)
+	defer ckpt.Close()
+	_, err = checkpointWALOnceOn(context.Background(), ckpt, "PASSIVE")
+	require.NoError(t, err)
+	pinned, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	require.NoError(t, err)
+	defer func() { _ = pinned.Rollback() }()
+	var n int
+	require.NoError(t, pinned.QueryRow(`SELECT count(*) FROM wal_churn`).Scan(&n))
+	smallWrite := func(k int) error {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		_, err := s.writerDB.Exec(`UPDATE wal_churn SET payload = randomblob(1024) WHERE id = ?`, 1+k%4000)
+		return err
+	}
+	require.NoError(t, smallWrite(0))
+	snap, ok := readWALIndexSnapshot(path)
+	require.True(t, ok)
+	require.LessOrEqual(t, snap.MxFrame-snap.NBackfill, walReclaimPressureSmallFrames, "precondition: a remainder one hold may copy")
+
+	stop := make(chan struct{})
+	var maxWait atomic.Int64
+	var writes atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { // a stream of small writes, the gate wait timed
+		defer wg.Done()
+		for k := 1; ; k++ {
+			select {
+			case <-stop:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			start := time.Now()
+			s.writeMu.Lock()
+			wait := time.Since(start)
+			s.writeMu.Unlock()
+			if int64(wait) > maxWait.Load() {
+				maxWait.Store(int64(wait))
+			}
+			_ = smallWrite(k)
+			writes.Add(1)
+		}
+	}()
+	// Urgent (no yield to queued writes) and a short writer-free wait, so
+	// the attempt reaches its in-lane holds while the reader still pins.
+	cfg := walReclaimConfig{thresholdBytes: 1, drainDeadline: 250 * time.Millisecond, truncateBudget: walReclaimTruncateBudget, readerWait: 200 * time.Millisecond}
+	res := s.reclaimWALOnce(cfg, ckpt, path+"-wal")
+	close(stop)
+	wg.Wait()
+	t.Logf("outcome=%s reason=%q writer_holds=%d longest_hold=%s max_gate_wait=%s writes=%d", res.outcome, res.reason, res.writerHolds, res.writerHold, time.Duration(maxWait.Load()), writes.Load())
+	require.NotEqual(t, walReclaimReset, res.outcome, "precondition: the pinned reader keeps the log from a reset")
+	require.GreaterOrEqual(t, res.writerHolds, 1)
+	require.LessOrEqual(t, res.writerHold, walReclaimResetHold+raceSlack(10*time.Millisecond), "a hold outlasted its cap")
+	require.LessOrEqual(t, time.Duration(maxWait.Load()), walReclaimResetHold+raceSlack(10*time.Millisecond), "a write waited for the gate past one hold")
+	require.Greater(t, writes.Load(), int64(20), "writes kept flowing while the reclaim waited")
 }

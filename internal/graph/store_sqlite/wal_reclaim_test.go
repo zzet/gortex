@@ -245,17 +245,27 @@ func TestWALGrowsWithoutResetUnderReaderChurn(t *testing.T) {
 	require.Zero(t, s.WALReclaimStats().Resets)
 }
 
-// The fix under the same churn: the reclaim keeps the log bounded, and the
-// reader-visible pause stays inside drain deadline + TRUNCATE budget.
+// The fix under the same churn (a writer that never pauses): the log is
+// bounded by the last resort (walReclaimLastResortBytes, here 4 × a 12 MiB
+// ceiling) plus one attempt's growth, the reader-visible pause stays inside
+// drain deadline + TRUNCATE budget, and once the writes stop the next attempt
+// brings the log back within journal_size_limit with a short hold.
+//
+// It replaced a contract under which the reclaim held the writer up to 2 s
+// at every urgent attempt and the log never outgrew journal_size_limit.
 func TestWALReclaimBoundsWALUnderReaderChurn(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "16")
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_CEILING_MB", "12")
+	prevFloor := walReclaimCeilingFloor
+	walReclaimCeilingFloor = 0
+	t.Cleanup(func() { walReclaimCeilingFloor = prevFloor })
 	setWALReclaimCadence(t, 50*time.Millisecond, 50*time.Millisecond, 400*time.Millisecond)
 	s, path := openWALReclaimStore(t)
 	defer func() { _ = s.Close() }()
 	seedWALChurnTable(t, s)
 
 	churn := startWALChurn(t, s, path, 4, 150*time.Millisecond, 300*time.Millisecond)
-	churn.runUntil(t, 110, 90*time.Second)
+	churn.runUntil(t, 240, 90*time.Second)
 	churn.halt(t)
 
 	// Let the poller act on the residue the last writes left, then read.
@@ -271,10 +281,12 @@ func TestWALReclaimBoundsWALUnderReaderChurn(t *testing.T) {
 		stats.Resets, stats.Deferrals, stats.Skips, stats.Attempts, stats.FramesReclaimed, float64(stats.BytesReclaimed)/(1<<20),
 		stats.PauseCount, stats.PauseMax, avgPause(stats), stats.ReaderWaits, stats.ReaderWaitMax, p50, p99, maxLat, n, churn.resets.Load())
 
+	mark := int64(walReclaimLastResortFactor * (12 << 20))
 	require.GreaterOrEqual(t, stats.Resets, int64(2), "the reclaim must reset the log repeatedly under churn")
 	require.LessOrEqual(t, final, int64(walReclaimJournalLimit), "after reclaim the WAL is back within journal_size_limit")
-	require.LessOrEqual(t, churn.maxWAL.Load(), int64(walReclaimJournalLimit),
-		"under the same churn the WAL never outgrows journal_size_limit")
+	require.LessOrEqual(t, churn.maxWAL.Load(), 2*mark,
+		"under the same churn the WAL stays within the last-resort mark plus one attempt's growth")
+	require.LessOrEqual(t, stats.WriterHoldMax, walReclaimMaxWriterHold+raceSlack(100*time.Millisecond))
 	cfg := resolveWALReclaimConfig()
 	bound := cfg.drainDeadline + cfg.truncateBudget + 100*time.Millisecond
 	require.LessOrEqual(t, stats.PauseMax, bound, "gate closed longer than drain deadline + TRUNCATE budget")

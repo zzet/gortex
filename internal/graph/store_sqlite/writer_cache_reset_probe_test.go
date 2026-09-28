@@ -69,19 +69,24 @@ func TestAReclaimResetColdsTheWritersPageCache(t *testing.T) {
 		name  string
 		reset func(t *testing.T)
 	}{
-		{"idle reset (writer-free rounds)", func(t *testing.T) {
+		// The writer-free rounds' reset hold; the in-lane rounds (after
+		// them) take the same hold, reclaimWALResetHold.
+		{"reset hold (writer-free rounds)", func(t *testing.T) {
 			cfg := walReclaimConfig{thresholdBytes: 64 << 20, drainDeadline: defaultWALReclaimDrainDeadline, truncateBudget: walReclaimTruncateBudget, readerWait: defaultWALReclaimReaderWait}
 			res := s.reclaimWALOnce(cfg, ckpt, path+"-wal")
 			require.Equal(t, walReclaimReset, res.outcome, res.reason)
 			require.True(t, res.resetWriterFree, "the writer-free rounds did not reset")
 			t.Logf("idle reset writer_hold=%s", res.writerHold)
-			require.LessOrEqual(t, res.writerHold, 4*walReclaimIdleResetHold)
+			require.LessOrEqual(t, res.writerHold, 4*walReclaimResetHold)
 		}},
-		{"in-lane reset (urgent log)", func(t *testing.T) {
+		{"closed-gate reset (open-gate stages off)", func(t *testing.T) {
+			prev := walReclaimSkipOpenGate
+			walReclaimSkipOpenGate = true
+			defer func() { walReclaimSkipOpenGate = prev }()
 			cfg := walReclaimConfig{thresholdBytes: 1 << 20, drainDeadline: defaultWALReclaimDrainDeadline, truncateBudget: walReclaimTruncateBudget, readerWait: defaultWALReclaimReaderWait}
 			res := s.reclaimWALOnce(cfg, ckpt, path+"-wal")
 			require.Equal(t, walReclaimReset, res.outcome, res.reason)
-			require.True(t, res.urgent && !res.resetWriterFree, "not the in-lane reset")
+			require.True(t, res.pauseClosed, "not the closed-gate reset")
 		}},
 		{"pressure reset (busy lane)", func(t *testing.T) {
 			if walCopyMethods.Load() == 0 {
@@ -171,8 +176,17 @@ func TestBuildsAlternatingWithResetsKeepTheWritersCacheWithTheDaemonDefaults(t *
 	defer func() { _ = ckpt.Close() }()
 	awaitStoreStartupWork(t, s)
 	reset := func() {
-		res := s.reclaimWALOnce(cfg, ckpt, path+"-wal")
-		require.Equal(t, walReclaimReset, res.outcome, res.reason)
+		// The store's own loop (the defaults) may have an attempt in flight;
+		// the daemon's loop retries, so does this.
+		for {
+			res := s.reclaimWALOnce(cfg, ckpt, path+"-wal")
+			if res.reason == "checkpoint_in_flight" {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			require.Equal(t, walReclaimReset, res.outcome, res.reason)
+			return
+		}
 	}
 	rev := 0
 	build := func(k int) ReaderWaitSplit {
@@ -266,7 +280,7 @@ func TestAReclaimResetOnTheWriterLeavesReadersAsTheyWere(t *testing.T) {
 // The idle reset now takes the write gate (it ran without it when it reset
 // from the checkpoint connection). With the daemon's defaults, an edit that
 // arrives while it holds the gate waits at most the idle hold
-// (walReclaimIdleResetHold, 50 ms): the reset gives the gate back as soon as
+// (walReclaimResetHold, 50 ms): the reset gives the gate back as soon as
 // a writer queues, and never holds it longer than the hold. The logs are
 // ~128 MiB, under the default threshold and the in-place size, so each reset
 // is the idle TRUNCATE; the attempts are called directly rather than by the
@@ -342,7 +356,7 @@ func TestAnEditDuringAnIdleResetWaitsAtMostTheHoldWithTheDaemonDefaults(t *testi
 	t.Logf("idle resets with an edit arriving during the hold=%d, outcomes=%v, edit waits=%v, longest=%s",
 		len(waits), outcomes, waits, longest)
 	require.Len(t, waits, rounds)
-	require.LessOrEqual(t, longest, walReclaimIdleResetHold)
+	require.LessOrEqual(t, longest, walReclaimResetHold)
 }
 
 // An idle reset that completed and then saw its interrupt (a writer queued,

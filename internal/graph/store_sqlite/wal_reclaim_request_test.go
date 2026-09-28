@@ -19,14 +19,30 @@ import (
 // test longer.
 func foldAgainstABusyLane(t *testing.T, s *Store, lane *fakeBuildLane, limit time.Duration) (done bool, refusals int) {
 	t.Helper()
+	return stepFoldAgainstABusyLane(t, s, lane, beginTestFold(t, s), limit)
+}
+
+// beginTestFold begins a fold over a small chain. Built before a test grows
+// the log to where it wants it: the chain's own writes commit, and a commit
+// may let the writer's auto-checkpoint restart a log nothing pins.
+func beginTestFold(t *testing.T, s *Store) *ChainFold {
+	t.Helper()
 	ctx := context.Background()
-	lane.held.Store(true)
-	defer lane.held.Store(false)
 	chain := foldChain(t, s, 200)
 	to := reservedGeneration(t, s, "folded")
 	fold, err := s.BeginChainFold(ctx, ChainFoldRequest{Chain: chain, To: to, Owner: "test"})
 	require.NoError(t, err)
-	defer func() { _ = fold.Release(ctx) }()
+	t.Cleanup(func() { _ = fold.Release(ctx) })
+	return fold
+}
+
+// stepFoldAgainstABusyLane steps fold with the lane held; see
+// foldAgainstABusyLane.
+func stepFoldAgainstABusyLane(t *testing.T, s *Store, lane *fakeBuildLane, fold *ChainFold, limit time.Duration) (done bool, refusals int) {
+	t.Helper()
+	ctx := context.Background()
+	lane.held.Store(true)
+	defer lane.held.Store(false)
 	deadline := time.Now().Add(limit)
 	lastResets := s.WALReclaimStats().Resets
 	for time.Now().Before(deadline) {
@@ -63,13 +79,25 @@ func TestARefusedFoldGetsTheReclaimInsideABusyLane(t *testing.T) {
 	chainFoldWALMarkEditing = 4 << 20
 	t.Cleanup(func() { chainFoldWALMarkEditing = prevMark })
 	s, path, lane := pressureStore(t, 0)
+	fold := beginTestFold(t, s)
 	lane.held.Store(true) // an edit burst from here on: nothing reclaims the log in a gap
-	growWAL(t, s, 8)
-	size := walFileSize(path + "-wal")
+	// The log as the fold measures it (frames, not the file's size: a log
+	// restarted after a complete copy keeps its file). An attempt the loop
+	// began before the lane was held may still reset it meanwhile, so grow
+	// until it is between the marks.
+	logBytes := func() int64 {
+		m := s.WALWriteMark()
+		return int64(m.MxFrame) * (int64(m.PageSize) + walFrameHeaderBytes)
+	}
+	for k := 0; logBytes() <= 8<<20 && k < 64; k++ {
+		require.NoError(t, churnWriteOnce(s, k))
+	}
+	_ = path
+	size := logBytes()
 	require.Greater(t, size, int64(4<<20), "precondition: over the fold's mark")
 	require.Less(t, size, int64(16<<20), "precondition: under the pressure mark")
 	before := s.WALCopyStats()
-	done, refusals := foldAgainstABusyLane(t, s, lane, 20*time.Second)
+	done, refusals := stepFoldAgainstABusyLane(t, s, lane, fold, 20*time.Second)
 	after := s.WALCopyStats()
 	t.Logf("fold done=%t refusals=%d pressure_runs=%d pressure_resets=%d", done, refusals, after.PressureRuns-before.PressureRuns, after.PressureResets-before.PressureResets)
 	require.True(t, done, "the fold never got under its mark inside the busy lane")

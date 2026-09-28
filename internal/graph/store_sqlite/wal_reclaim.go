@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -79,21 +80,20 @@ const (
 	// walReclaimLaneBudget bounds the lane part of one attempt (admission,
 	// writer wait, delta, drain, TRUNCATE).
 	walReclaimLaneBudget = 10 * time.Second
-	// defaultWALReclaimReaderWait bounds the open-gate stage: with the writer
-	// held and the log fully backfilled, new read transactions take read mark
+	// defaultWALReclaimReaderWait bounds the writer-free rounds (step 2):
+	// once the log is fully backfilled, new read transactions take read mark
 	// 0 (they read the database file only and never pin the log), so the
 	// reclaim only has to outlast the reads admitted before that point —
-	// without holding any reader. The writer is held meanwhile, but the stage
-	// yields it the moment another writer queues (see yieldToWriters), so the
-	// wait costs an edit nothing beyond walReclaimUrgentMinHold. Long enough
-	// to outlast the daemon's long analysis reads (tens of seconds).
+	// without holding any reader and without the writer. Long enough to
+	// outlast the daemon's long analysis reads (tens of seconds).
 	defaultWALReclaimReaderWait = 30 * time.Second
 	walReclaimReaderWaitMax     = 60 * time.Second
-	// walReclaimMaxWriterHold caps how long one attempt keeps the application
-	// writer, whatever the reader wait: the wait for old readers runs without
-	// the writer, which is taken only for the final backfill, the short wait
-	// for readers admitted during it, and the TRUNCATE. A queued write or an
-	// announced mutation (AnnounceWrite) ends the hold at once.
+	// walReclaimMaxWriterHold caps how long the closed-gate path (only with
+	// the open-gate stages disabled) keeps the application writer. The
+	// open-gate stages never hold it past walReclaimResetHold (50 ms): the
+	// wait for old readers runs without the writer, which is taken only for
+	// the final backfill and the reset. A queued write or an announced
+	// mutation (AnnounceWrite) ends a hold at once.
 	walReclaimMaxWriterHold = 2 * time.Second
 	// walReclaimUrgentFactor: from this multiple of the threshold the log is
 	// urgent. An urgent attempt does not yield to waiting writes (it still
@@ -114,7 +114,23 @@ const (
 	// walReclaimHardCapFactor: over this multiple of the ceiling one reclaim
 	// attempt may run while an edit cycle holds the build lane.
 	walReclaimHardCapFactor = 4
+	// walReclaimLastResortFactor places the last resort, in multiples of the
+	// ceiling (4: the hard cap, 8 GiB with the defaults). From there an
+	// attempt holds the writer up to walReclaimMaxWriterHold while it waits
+	// for the readers admitted before its copy, and logs it: the one step
+	// that bounds the log when writes never leave a gap long enough for the
+	// short holds. Below it, no attempt holds the writer longer than
+	// walReclaimResetHold.
+	walReclaimLastResortFactor = 4
 )
+
+// walReclaimLastResortBytes is the log size of the last resort (0: none).
+func walReclaimLastResortBytes(cfg walReclaimConfig) int64 {
+	if cfg.ceilingBytes <= 0 {
+		return 0
+	}
+	return walReclaimLastResortFactor * cfg.ceilingBytes
+}
 
 // walReclaimHardCapSpacing spaces the attempts the hard cap lets run during
 // edit cycles. A var only so the in-package cases can shorten it.
@@ -233,10 +249,13 @@ func resolveWALReclaimConfig() walReclaimConfig {
 // read gate was closed per attempt that closed it; ReaderWait is what readers
 // actually spent held at the gate (per held read), measured on their side.
 type WALReclaimStats struct {
-	ThresholdBytes  int64
-	Attempts        int64 // attempts that passed the size check and the lease
-	Resets          int64 // TRUNCATE checkpoints that reset the log
-	OpenGateResets  int64 // resets reached without closing the read gate
+	ThresholdBytes int64
+	Attempts       int64 // attempts that passed the size check and the lease
+	Resets         int64 // TRUNCATE checkpoints that reset the log
+	OpenGateResets int64 // resets reached without closing the read gate
+	// LastResortRuns counts attempts at walReclaimLastResortBytes (each may
+	// hold the writer up to walReclaimMaxWriterHold).
+	LastResortRuns  int64
 	WriterHoldMax   time.Duration
 	WriterHoldLast  time.Duration
 	Deferrals       int64 // attempts that gave up and backed off
@@ -370,7 +389,10 @@ type walReclaimResult struct {
 	pause       time.Duration
 	pauseClosed bool
 	openGate    bool
+	// writerHold is the longest single hold of the writer; writerHolds
+	// counts the holds (the in-lane stage may take several short ones).
 	writerHold  time.Duration
+	writerHolds int
 	// openGateWaited is the writer-free wait for old readers (step 2).
 	openGateWaited time.Duration
 	// converged: step 2 backfilled the whole log (convergedFrames frames)
@@ -380,6 +402,11 @@ type walReclaimResult struct {
 	convergedFrames int
 	// urgent: the log is at walReclaimUrgentFactor × the threshold.
 	urgent bool
+	// hardCap: the attempt runs despite a busy lane (walReclaimHardCapFactor).
+	hardCap bool
+	// lastResort: the log is at walReclaimLastResortBytes; this attempt may
+	// hold the writer up to walReclaimMaxWriterHold (logged).
+	lastResort bool
 	// resetWriterFree: step 2's TRUNCATE reset the log without the
 	// application writer.
 	resetWriterFree bool
@@ -602,7 +629,10 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		return walReclaimResult{outcome: walReclaimSkipped, reason: "copy_budget"}
 	}
 
-	res := walReclaimResult{bytesBefore: walFileSize(walPath), leaseOverride: leaseOverride, began: true, copy: attempt.copy, pressure: pressure}
+	res := walReclaimResult{bytesBefore: walFileSize(walPath), leaseOverride: leaseOverride, began: true, copy: attempt.copy, pressure: pressure, hardCap: hardCap}
+	if mark := walReclaimLastResortBytes(cfg); mark > 0 && res.bytesBefore >= mark {
+		res.lastResort = true
+	}
 	// Nothing in the log and nothing to shrink: never touch the writer.
 	if snap, ok := readWALIndexSnapshot(s.dbPath); ok && snap.MxFrame == 0 && res.bytesBefore <= cfg.thresholdBytes {
 		return walReclaimResult{outcome: walReclaimSkipped, reason: "nothing_to_reclaim", bytesBefore: res.bytesBefore}
@@ -611,28 +641,30 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	// writer. Its error is not fatal — the lane copies whatever remains —
 	// unless the attempt was cancelled.
 	_, _ = s.pacedPassive(attempt.ctx, ckptDB, attempt)
-	// Step 2: without the writer and with the gate OPEN, converge on a log
-	// no reader pins: backfill, then wait out every reader admitted before
-	// that backfill. A reader admitted after a COMPLETE backfill takes read
-	// mark 0 and never pins the log; one admitted while it was incomplete
-	// (an older reader still needed frames) may, so the loop repeats — each
-	// round waits only for readers younger than the last — until a round
-	// starts from a complete backfill. This costs no reader and no write
-	// anything; the writer is taken only afterwards, for at most
-	// walReclaimMaxWriterHold.
-	// An urgent log (see walReclaimUrgentFactor) skips straight to the capped
-	// writer hold: its writes are not pausing, so the writer-free rounds
-	// cannot converge.
+	// Step 2: without the writer and with the gate OPEN, wait for a log no
+	// reader pins: backfill, then wait out every reader admitted before that
+	// backfill. A reader admitted after a COMPLETE backfill takes read mark 0
+	// and never pins the log; one admitted while it was incomplete (writes
+	// landed, or an older reader still needed frames) may, so the rounds
+	// repeat — each waits only for readers admitted before its own backfill —
+	// until a round finds the backfill complete and the reset goes through.
+	// The reset is the only step that takes the writer, for at most
+	// walReclaimResetHold. Nothing here holds the writer while it waits,
+	// so the rounds run for urgent logs too, and through write bursts: the
+	// reset lands in the first writer gap long enough for the readers
+	// admitted before it to end (up to twice the longest read in flight).
 	res.urgent = cfg.thresholdBytes > 0 && res.bytesBefore >= walReclaimUrgentFactor*cfg.thresholdBytes
-	if !res.urgent && !walReclaimSkipQuiescence && !walReclaimSkipOpenGate && s.readGate != nil && cfg.readerWait > 0 {
+	// An attempt that runs through a busy lane (the pressure mark, the hard
+	// cap) goes straight to its converged copy and short hold below: it must
+	// not spend the reader wait inside an edit's burst.
+	if !pressure && !hardCap && !res.lastResort && !walReclaimSkipQuiescence && !walReclaimSkipOpenGate && s.readGate != nil && cfg.readerWait > 0 {
 		started := time.Now()
 		deadline := started.Add(cfg.readerWait)
-		// The rounds end early when the log turns urgent meanwhile: the
-		// capped writer hold takes over.
-		wctx, stopWatch := s.watchWALUrgency(attempt.ctx, walPath, walReclaimUrgentFactor*cfg.thresholdBytes)
+		// The rounds end when the log reaches the last resort's mark: the
+		// attempt goes on to it at once (reclaimWALInLane).
+		wctx, stopWatch := s.watchWALMark(attempt.ctx, walPath, walReclaimLastResortBytes(cfg))
 		defer stopWatch()
 		rounds := 0
-		prevFrames := -1
 		for {
 			rounds++
 			// A paced pass runs on the attempt's own context: the urgency
@@ -648,6 +680,9 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 			}
 			result, perr := s.pacedPassive(pctx, ckptDB, attempt)
 			pcancel()
+			if wctx.Err() != nil && attempt.ctx.Err() == nil && !errors.Is(perr, errWALCheckpointYieldedToCycle) {
+				res.lastResort = true // the log reached the last resort's mark
+			}
 			if wctx.Err() != nil || errors.Is(perr, errWALCheckpointYieldedToCycle) {
 				// Cancelled (an edit, shutdown, an urgent log) or an edit began:
 				// without this the rounds would spin until the deadline, since
@@ -656,50 +691,32 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 				break
 			}
 			complete := perr == nil && !result.incomplete()
-			if complete && !s.writeWanted() && walFileSize(walPath) < walShrinkInPlaceBytes {
-				// Let SQLite decide first: readers that began after a
-				// complete backfill hold slot 0 and do not block a reset. The
-				// TRUNCATE takes SQLite's write lock only for the reset
-				// itself (the log is already copied); a busy one returns
-				// within the checkpoint connection's busy timeout. Not while
-				// a mutation is waiting for the writer.
-				// The reset runs on the writer connection
-				// (resetWALForReclaim), so under the write gate: taken only
-				// if free within the budget, held at most
-				// walReclaimIdleResetHold, and handed back as soon as a
-				// write wants it.
-				tctx, tcancel := context.WithTimeout(wctx, cfg.truncateBudget)
-				terr := s.writeMu.LockContext(tctx)
-				if terr == nil {
-					held := time.Now()
-					if hook := walIdleResetHook; hook != nil {
-						hook()
-					}
-					hctx, hcancel := context.WithTimeout(tctx, walReclaimIdleResetHold)
-					yctx, stopYield := s.yieldToWriters(hctx)
-					_, terr = s.resetWALForReclaim(yctx)
-					if hook := walIdleResetResultHook; hook != nil {
-						terr = hook(terr)
-					}
-					stopYield()
-					hcancel()
-					if terr != nil && walLogIsReset(s.dbPath, walPath) {
-						// The reset completed and the interrupt (a writer
-						// queued, or the hold ran out) arrived after it: the
-						// log is reset, and counted so. Checked before the
-						// gate is released, so no write can refill it first.
-						terr = nil
-					}
-					res.writerHold = time.Since(held)
-					s.writeMu.Unlock()
-				}
-				tcancel()
-				if terr == nil {
+			if complete {
+				res.converged, res.convergedFrames = true, result.WALFrames
+			}
+			// The reset: one short hold of the writer (reclaimWALResetHold, or
+			// the pressure reset inside a busy lane), taken only when what is
+			// left to copy fits in it, and handed back at once when a reader
+			// still pins the log.
+			// Never inside an edit: only an attempt that runs through a busy
+			// lane (pressure, hard cap) may hold the writer during one.
+			yieldsToLane := !res.pressure && !res.hardCap
+			if s.walRemainderFits(&res) && (res.urgent || !s.writeWanted()) && (!yieldsToLane || !s.buildLaneBusy()) {
+				outcome, reason := res.outcome, res.reason
+				var done bool
+				var herr error
+				done, herr = s.reclaimWALResetHold(wctx, cfg, ckptDB, &res, false, yieldsToLane)
+				if done {
 					res.resetWriterFree = true
+					break
+				}
+				res.outcome, res.reason = outcome, reason
+				if errors.Is(herr, errWALCheckpointDeferredBulk) {
 					break
 				}
 			}
 			epoch := s.readGate.advance()
+			waitStart := time.Now()
 			older, werr := s.readGate.waitOlder(wctx, epoch, deadline)
 			res.openGateWaited = time.Since(started)
 			if werr != nil {
@@ -709,27 +726,27 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 				case attempt.ctx.Err() != nil:
 					reason = "cancelled"
 				case wctx.Err() != nil:
-					reason = "log_turned_urgent"
+					reason = "last_resort_mark"
+					res.lastResort = true
 				}
 				res.openGateReport = fmt.Sprintf("reason=%s older_readers=%d waited=%s rounds=%d backfilled=%d/%d",
 					reason, older, res.openGateWaited.Round(time.Millisecond), rounds, result.CheckpointedFrames, result.WALFrames)
 				break
 			}
-			if complete {
-				res.converged, res.convergedFrames = true, result.WALFrames
-				break
-			}
 			if !time.Now().Before(deadline) {
-				break
-			}
-			if prevFrames >= 0 && result.WALFrames > prevFrames {
-				// Writes keep landing: without the writer the log cannot be
-				// fully backfilled. The capped writer hold finishes the job.
-				res.openGateReport = fmt.Sprintf("reason=writes_active waited=%s rounds=%d backfilled=%d/%d",
+				res.openGateReport = fmt.Sprintf("reason=no_reader_free_gap waited=%s rounds=%d backfilled=%d/%d",
 					res.openGateWaited.Round(time.Millisecond), rounds, result.CheckpointedFrames, result.WALFrames)
 				break
 			}
-			prevFrames = result.WALFrames
+			if time.Since(waitStart) < time.Millisecond {
+				// Nobody to wait for, yet no reset (a write wanted the
+				// writer, or writes keep the backfill incomplete): pace the
+				// rounds instead of spinning on the backfill.
+				select {
+				case <-wctx.Done():
+				case <-time.After(walReclaimRoundPause):
+				}
+			}
 		}
 	}
 	if res.resetWriterFree {
@@ -825,6 +842,19 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
 		return errWALReclaimWriterWaiting
 	}
+	if !res.lastResort && !walReclaimSkipQuiescence && s.readGate != nil && !walReclaimSkipOpenGate && cfg.readerWait > 0 {
+		return s.reclaimWALInLaneOpenGate(ctx, cfg, ckptDB, res)
+	}
+	if res.lastResort {
+		at := walFileSize(s.dbPath + "-wal")
+		defer func() {
+			log.Printf("store_sqlite: wal reclaim last resort wal_bytes=%d mark=%d writer_hold=%s reset=%t reason=%q",
+				at, walReclaimLastResortBytes(cfg), res.writerHold.Round(time.Millisecond), res.openGate, res.reason)
+		}()
+		s.walReclaim.update(func(st *WALReclaimStats) { st.LastResortRuns++ })
+	}
+	// Below: the last resort's long hold, or the closed-gate path (the
+	// open-gate stages disabled).
 	// 3. Writer quiescence, capped at walReclaimMaxWriterHold from here on.
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
 	err := s.writeMu.LockContext(wctx)
@@ -884,7 +914,8 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		return errWALReclaimNothing
 	}
 
-	// 5. With writes stopped, finish converging inside the hold cap: if step
+	// 5. The last resort (the log at walReclaimLastResortBytes): with writes
+	// stopped, finish converging inside the hold cap: if step
 	// 2 converged and nothing was committed since, no reader in flight can pin
 	// the log and the reset needs no wait; otherwise backfill, wait out the
 	// readers admitted before that backfill (gate open), and repeat until a
@@ -892,6 +923,10 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	quiesce := !walReclaimSkipQuiescence && s.readGate != nil
 	openGate := quiesce && !walReclaimSkipOpenGate && cfg.readerWait > 0
 	if openGate {
+		// Only the last resort reaches here with the open-gate stages on
+		// (see reclaimWALInLane): the writer stays held, up to
+		// walReclaimMaxWriterHold, while the readers admitted before the
+		// backfill end.
 		capAt := held.Add(walReclaimMaxWriterHold)
 		// A complete backfill may already be resettable: SQLite blocks a
 		// TRUNCATE only on readers holding a WAL read mark (slots 1..n); a
@@ -1280,12 +1315,199 @@ func logWALReclaimOutcome(res walReclaimResult, next time.Duration, skips *walRe
 	}
 }
 
-// watchWALUrgency returns a context cancelled once the -wal file reaches
-// urgentBytes (polled every 50 ms), so the writer-free rounds hand over to the
-// capped writer hold as soon as the log's growth makes them pointless.
-func (s *Store) watchWALUrgency(parent context.Context, walPath string, urgentBytes int64) (context.Context, func()) {
+// walLogIsReset reports whether the log is at its start: an empty file, or a
+// wal-index with no frames. The caller holds the write gate.
+func walLogIsReset(dbPath, walPath string) bool {
+	if walFileSize(walPath) == 0 {
+		return true
+	}
+	snap, ok := readWALIndexSnapshot(dbPath)
+	return ok && snap.MxFrame == 0
+}
+
+// The in-lane reset's open-gate stage. The wait for older readers runs
+// without the writer, and edits go on meanwhile; the writer is taken only for
+// the last backfill and the reset, at most walReclaimResetHold each time (the
+// idle and pressure resets' cap), and a hold that finds the log not ready
+// (a reader still pins it, or more is left than the hold can copy) hands the
+// writer back at once. Rounds repeat until the reset or
+// walReclaimLaneReaderWait: copy without the writer, wait out the readers
+// admitted before that copy, then one short hold.
+var (
+	// walReclaimRoundPause paces the writer-free rounds when there is no
+	// reader to wait for.
+	walReclaimRoundPause     = 20 * time.Millisecond
+	walReclaimLaneReaderWait = 5 * time.Second
+)
+
+func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult) error {
+	deadline := time.Now().Add(walReclaimLaneReaderWait)
+	for round := 1; ; round++ {
+		done, err := s.reclaimWALResetHold(ctx, cfg, ckptDB, res, round == 1, !res.pressure && !res.hardCap)
+		if done || err != nil {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			res.reason = fmt.Sprintf("older_readers_in_flight rounds=%d writer_holds=%d", round, res.writerHolds)
+			return fmt.Errorf("%w: %s", errWALReclaimReadersInFlight, res.reason)
+		}
+		// Without the writer: copy what is left, then wait out the readers
+		// admitted before that copy (a reader admitted after a complete
+		// copy takes read mark 0 and does not block the reset).
+		result, perr := checkpointWALOnceOn(ctx, ckptDB, "PASSIVE")
+		if perr != nil && ctx.Err() != nil {
+			res.reason = "cancelled"
+			return perr
+		}
+		epoch := s.readGate.advance()
+		if older, werr := s.readGate.waitOlder(ctx, epoch, deadline); werr != nil {
+			res.blocker, res.hasBlocker = s.readGate.oldestOlderThan(epoch, time.Now())
+			res.reason = fmt.Sprintf("older_readers_in_flight older_readers=%d rounds=%d writer_holds=%d backfilled=%d/%d",
+				older, round, res.writerHolds, result.CheckpointedFrames, result.WALFrames)
+			return fmt.Errorf("%w: %s", errWALReclaimReadersInFlight, res.reason)
+		}
+	}
+}
+
+// walRemainderFits reports whether what is left to copy fits in one short
+// hold: half the hold at the rate the convergence measured, never less than
+// walReclaimPressureSmallFrames.
+func (s *Store) walRemainderFits(res *walReclaimResult) bool {
+	snap, ok := readWALIndexSnapshot(s.dbPath)
+	if !ok {
+		return false
+	}
+	return snap.MxFrame <= snap.NBackfill || snap.MxFrame-snap.NBackfill <= walHoldAllowedFrames(res)
+}
+
+func walHoldAllowedFrames(res *walReclaimResult) uint32 {
+	allowed := walReclaimPressureSmallFrames
+	if c := res.convergence; c != nil && c.rateFramesPerS > 0 {
+		allowed = max(allowed, uint32(c.rateFramesPerS*(walReclaimResetHold/2).Seconds()))
+	}
+	if rate := walHoldCopyRate.Load(); rate > 0 {
+		allowed = max(allowed, uint32(min(float64(rate)*(walReclaimResetHold/2).Seconds(), 1<<24)))
+	}
+	return allowed
+}
+
+// walHoldCopyRate is the frames per second a hold's copy (unpaced, the
+// writer held) has achieved on this host, a moving average; 0 until a hold
+// has copied enough to measure. A hold takes the remainder that half of it
+// can copy at this rate, so a writer-free copy behind the writes can still
+// finish inside one hold.
+var walHoldCopyRate atomic.Int64
+
+func noteWALHoldCopy(frames int64, took time.Duration) {
+	if frames < 64 || took <= 0 {
+		return
+	}
+	rate := int64(float64(frames) / took.Seconds())
+	for {
+		prev := walHoldCopyRate.Load()
+		next := rate
+		if prev > 0 {
+			next = (3*prev + rate) / 4
+		}
+		if walHoldCopyRate.CompareAndSwap(prev, next) {
+			return
+		}
+	}
+}
+
+// reclaimWALResetHold is one hold of the writer, at most walReclaimResetHold:
+// the backfill of what is left and, when that completes, the reset. done
+// reports the reset; (false, nil) hands the writer back for another round.
+func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult, first, yieldsToLane bool) (done bool, err error) {
+	if !res.urgent && s.writeWanted() {
+		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
+		return false, errWALReclaimWriterWaiting
+	}
+	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
+	err = s.writeMu.LockContext(wctx)
+	wcancel()
+	if err != nil {
+		res.reason = "writer_gate"
+		return false, fmt.Errorf("%w: %w", ErrMaintenanceBusy, err)
+	}
+	held := time.Now()
+	defer func() {
+		res.writerHold = max(res.writerHold, time.Since(held))
+		res.writerHolds++
+		s.writeMu.Unlock()
+	}()
+	if hook := walIdleResetHook; hook != nil {
+		hook()
+	}
+	if s.bulkConn != nil && !res.leaseOverride {
+		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
+		return false, errWALCheckpointDeferredBulk
+	}
+	if yieldsToLane && s.buildLaneBusy() {
+		return false, nil // an edit began while the gate was taken: hand it back
+	}
+	hctx, hcancel := context.WithDeadline(ctx, held.Add(walReclaimResetHold))
+	defer hcancel()
+	yctx, stopYield := hctx, func() {}
+	if !res.urgent {
+		yctx, stopYield = s.yieldToWriters(hctx)
+	}
+	defer stopYield()
+	yielded := func() bool { return errors.Is(context.Cause(yctx), errWALReclaimWriterWaiting) }
+	// The hold copies only a small remainder (walHoldAllowedFrames).
+	snap, ok := readWALIndexSnapshot(s.dbPath)
+	if ok && snap.MxFrame > snap.NBackfill && snap.MxFrame-snap.NBackfill > walHoldAllowedFrames(res) {
+		return false, nil // copy more without the writer first
+	}
+	copyStart := time.Now()
+	delta, derr := checkpointWALOnceOn(yctx, ckptDB, "PASSIVE")
+	if ok && (derr == nil || errors.Is(derr, errSQLiteCheckpointIncomplete)) {
+		noteWALHoldCopy(int64(delta.CheckpointedFrames)-int64(snap.NBackfill), time.Since(copyStart))
+	}
+	if derr != nil && !errors.Is(derr, errSQLiteCheckpointIncomplete) {
+		if yielded() {
+			res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
+			return false, errWALReclaimWriterWaiting
+		}
+		return false, nil
+	}
+	if first {
+		res.frames = delta.WALFrames
+		if delta.WALFrames == 0 && res.bytesBefore <= cfg.thresholdBytes {
+			res.outcome, res.reason = walReclaimSkipped, "nothing_to_reclaim"
+			return false, errWALReclaimNothing
+		}
+	}
+	if delta.incomplete() {
+		return false, nil
+	}
+	_, terr := s.resetWALForReclaim(yctx)
+	if hook := walIdleResetResultHook; hook != nil {
+		terr = hook(terr)
+	}
+	if terr != nil && walLogIsReset(s.dbPath, s.dbPath+"-wal") {
+		// The reset completed and the interrupt (a writer queued, or the
+		// hold ran out) arrived after it: the log is reset, and counted so.
+		// Checked before the gate is released, so no write can refill it.
+		terr = nil
+	}
+	if terr == nil {
+		res.openGate = true
+		return true, nil
+	}
+	if yielded() {
+		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
+		return false, errWALReclaimWriterWaiting
+	}
+	return false, nil
+}
+
+// watchWALMark returns a context cancelled once the -wal file reaches
+// markBytes (polled every 50 ms), so the writer-free rounds hand over to the
+// last resort (walReclaimLastResortBytes) as soon as the log reaches it.
+func (s *Store) watchWALMark(parent context.Context, walPath string, markBytes int64) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(parent)
-	if urgentBytes <= 0 {
+	if markBytes <= 0 {
 		return ctx, cancel
 	}
 	go func() {
@@ -1296,7 +1518,7 @@ func (s *Store) watchWALUrgency(parent context.Context, walPath string, urgentBy
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if walFileSize(walPath) >= urgentBytes {
+				if walFileSize(walPath) >= markBytes {
 					cancel()
 					return
 				}
@@ -1304,14 +1526,4 @@ func (s *Store) watchWALUrgency(parent context.Context, walPath string, urgentBy
 		}
 	}()
 	return ctx, cancel
-}
-
-// walLogIsReset reports whether the log is at its start: an empty file, or a
-// wal-index with no frames. The caller holds the write gate.
-func walLogIsReset(dbPath, walPath string) bool {
-	if walFileSize(walPath) == 0 {
-		return true
-	}
-	snap, ok := readWALIndexSnapshot(dbPath)
-	return ok && snap.MxFrame == 0
 }
