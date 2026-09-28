@@ -439,6 +439,12 @@ type CheckoutCycle struct {
 // reconciliation reports an accessible automatic checkout, and closed when
 // that checkout leaves.
 type CheckoutCoordinator struct {
+	// prewarmCommitGeneration is the commit generation whose stack was last
+	// pre-warmed (RewarmEditDeltaStacks warms it again when its key moved).
+	prewarmCommitGeneration atomic.Int64
+	// prewarmState is the last pre-warm decision (edit_delta_stack_prewarm.go).
+	prewarmState prewarmState
+
 	checkoutID  string
 	root        string
 	sampler     *gitstate.DirtySampler
@@ -1344,6 +1350,12 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	out := c.reconcile(ctx)
 	out.cycleStarted = cycleStarted
 	out.Admission = admission
+	// The stack a working-tree delta over the routed commit generation reads
+	// is warmed in the background, once, after the cycle that routed it
+	// (edit_delta_stack_prewarm.go).
+	if out.Err == nil {
+		c.prewarmEditDeltaStackOnce(out.CommitGenerationID)
+	}
 	// A cycle the yield canceled ends in an error; one that finished its
 	// work anyway (the cancel landed after its last step) keeps its outcome.
 	// Any other background cycle ran to its end, failed or not, so the run
@@ -3032,7 +3044,9 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	}
 
 	selection := c.selectDirtyParentForSlot(ctx, *route, commitGeneration, sample, out)
+	endDelta := editDeltaBegin() // a background stack pre-warm yields to the build
 	generationID, builtKey, err := c.buildDirtyLayerForSlot(ctx, route.GraphID, commitGeneration, selection, sample, out)
+	endDelta()
 	if err != nil {
 		return err
 	}

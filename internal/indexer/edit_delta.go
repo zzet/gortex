@@ -408,6 +408,8 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	handle *store_sqlite.Store,
 	report *BuildReport,
 ) (*EditDeltaReport, error) {
+	// A background stack pre-warm yields while a delta runs.
+	defer editDeltaBegin()()
 	out := &EditDeltaReport{}
 	clock := newPhaseClock(&out.Phases)
 	ioStarted := editDeltaProcessIO()

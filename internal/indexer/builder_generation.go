@@ -504,6 +504,15 @@ type SparseGenerationBuilder struct {
 	// handle-rooted scope — the reference the handle-rooted load's facts are
 	// checked against. Production never sets it.
 	wholeModuleCompilerLoad bool
+
+	// EditCycleActive, when set, reports that an edit cycle holds the build
+	// lane: the stack pre-warm stands down while it does
+	// (edit_delta_stack_prewarm.go).
+	EditCycleActive func() bool
+	// PrewarmDeferred, when set, reports that the pre-warm of a stack with
+	// these generations is held back for a re-warm (a pending correction
+	// will change it).
+	PrewarmDeferred func(stack []int64) bool
 }
 
 const generationAbandonTimeout = 5 * time.Second
