@@ -172,6 +172,15 @@ type dirtyChainCompactor struct {
 	// stepHook is a test seam: it runs before the first step (0) and after
 	// every step of a stepped fold.
 	stepHook func(ctx context.Context, step int)
+	// copyHook is a test seam: it runs on every copied fold (inline or
+	// stepped) before the fold is checked, and may alter what was copied.
+	copyHook func(ctx context.Context, to int64) error
+	// inlineBudget is a test seam: the inline fold's copy budget (0: the
+	// default, dirtyChainInlineFoldBudget).
+	inlineBudget time.Duration
+	// forceDirect sends the next working-tree build direct: an inline fold
+	// failed its background verification.
+	forceDirect atomic.Bool
 }
 
 // CompactionInFlight reports whether a chain fold of this checkout holds the
@@ -389,6 +398,12 @@ func (c *CheckoutCoordinator) selectDirtyParentForSlot(
 	sample gitstate.DirtySnapshot,
 	out *CheckoutCycle,
 ) dirtyParentSelection {
+	if c.takeForceDirect() {
+		// The background verification found an inline fold wrong: this
+		// build stands on nothing it made (dirty_chain_fold_bound.go).
+		out.DirtyChainReason = dirtyChainFallbackFoldUnverified
+		return dirtyParentSelection{Reason: dirtyChainFallbackFoldUnverified}
+	}
 	atBound := route
 	if preferred := c.takePreferredDirtyParent(); preferred > 0 && preferred != route.DirtyGenerationID {
 		alternative := route
@@ -414,8 +429,10 @@ func (c *CheckoutCoordinator) selectDirtyParentForSlot(
 		// a copy of the chain's rows, no file parsed — costs a fraction of
 		// the direct build the edit would otherwise pay over the whole
 		// accumulated dirty set, and the edit then chains on the fold.
-		folded := c.foldAtBoundAroundFold(ctx, atBound, commitGeneration)
-		if folded == 0 {
+		var folded int64
+		if steppedChainFoldEnabled {
+			folded = c.foldAtCap(ctx, atBound, commitGeneration)
+		} else {
 			folded = c.foldChainAtBound(ctx, atBound, commitGeneration)
 		}
 		if folded > 0 {

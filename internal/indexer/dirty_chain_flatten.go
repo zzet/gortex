@@ -12,7 +12,6 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
-	"github.com/zzet/gortex/internal/graphview"
 )
 
 // The copy-based chain compactor.
@@ -67,13 +66,28 @@ func (c *CheckoutCoordinator) copyChainAtOnce(ctx context.Context, oldestFirst [
 func (c *CheckoutCoordinator) flattenDirtyChainOver(
 	ctx context.Context, commit, root store_sqlite.ViewGeneration, top int64, copy chainCopier,
 ) (dirtyLayerBuild, error) {
+	built, _, err := c.flattenDirtyChainChecked(ctx, commit, root, top, copy, c.verifyFlattenedChain)
+	return built, err
+}
+
+// foldVerifier checks a copied fold against the chain it folds (oldest first)
+// over root, before the fold is published.
+type foldVerifier func(ctx context.Context, root int64, oldestFirst []int64, folded int64) error
+
+// flattenDirtyChainChecked is flattenDirtyChainOver with the verifier named:
+// nil publishes the fold unverified (the inline fold at the cap, verified
+// afterwards in the background). It also returns the folded members, oldest
+// first.
+func (c *CheckoutCoordinator) flattenDirtyChainChecked(
+	ctx context.Context, commit, root store_sqlite.ViewGeneration, top int64, copy chainCopier, verify foldVerifier,
+) (dirtyLayerBuild, []int64, error) {
 	started := time.Now()
 	whole, ok, reason, err := c.dirtyChainRoot(ctx, top, commit, maxChainWalkDepth)
 	if err != nil {
-		return dirtyLayerBuild{}, err
+		return dirtyLayerBuild{}, nil, err
 	}
 	if !ok || len(whole) == 0 {
-		return dirtyLayerBuild{}, fmt.Errorf("%w: %s", errFlattenRefused, reason)
+		return dirtyLayerBuild{}, nil, fmt.Errorf("%w: %s", errFlattenRefused, reason)
 	}
 	chain := whole
 	if root.GenerationID != commit.GenerationID {
@@ -85,11 +99,11 @@ func (c *CheckoutCoordinator) flattenDirtyChainOver(
 			chain = append(chain, row)
 		}
 		if len(chain) == len(whole) {
-			return dirtyLayerBuild{}, fmt.Errorf("%w: generation %d is not in the chain", errFlattenRefused, root.GenerationID)
+			return dirtyLayerBuild{}, nil, fmt.Errorf("%w: generation %d is not in the chain", errFlattenRefused, root.GenerationID)
 		}
 	}
 	if len(chain) <= 1 {
-		return dirtyLayerBuild{}, fmt.Errorf("%w: the chain is one generation deep", errFlattenRefused)
+		return dirtyLayerBuild{}, nil, fmt.Errorf("%w: the chain is one generation deep", errFlattenRefused)
 	}
 	head := chain[0]
 	oldestFirst := make([]int64, len(chain))
@@ -102,7 +116,7 @@ func (c *CheckoutCoordinator) flattenDirtyChainOver(
 	}
 	manifest, why := loadDirtyChainManifest(ctx, c.store, wholeOldestFirst)
 	if why != "" {
-		return dirtyLayerBuild{}, fmt.Errorf("%w: %s", errFlattenRefused, why)
+		return dirtyLayerBuild{}, nil, fmt.Errorf("%w: %s", errFlattenRefused, why)
 	}
 
 	generationID, handle, adopted, err := c.store.BeginPayloadGenerationWithStatus(ctx, store_sqlite.PayloadGenerationRequest{
@@ -115,10 +129,10 @@ func (c *CheckoutCoordinator) flattenDirtyChainOver(
 		DependencyRevision: head.DependencyRevision, CreatedAt: time.Now().Unix(),
 	})
 	if err != nil {
-		return dirtyLayerBuild{}, fmt.Errorf("indexer: begin the folded working-tree generation: %w", err)
+		return dirtyLayerBuild{}, nil, fmt.Errorf("indexer: begin the folded working-tree generation: %w", err)
 	}
 	if adopted {
-		return dirtyLayerBuild{}, fmt.Errorf("%w: generation %d is being built by another writer", errFlattenRefused, generationID)
+		return dirtyLayerBuild{}, nil, fmt.Errorf("%w: generation %d is being built by another writer", errFlattenRefused, generationID)
 	}
 	counts, finish, err := copy(ctx, oldestFirst, generationID)
 	abandon := func() {
@@ -129,7 +143,7 @@ func (c *CheckoutCoordinator) flattenDirtyChainOver(
 	}
 	if err != nil {
 		abandon()
-		return dirtyLayerBuild{}, fmt.Errorf("indexer: fold working-tree chain %v: %w", oldestFirst, err)
+		return dirtyLayerBuild{}, nil, fmt.Errorf("indexer: fold working-tree chain %v: %w", oldestFirst, err)
 	}
 	entries := make([]store_sqlite.InputManifestEntry, 0, len(manifest.entries))
 	for _, e := range manifest.entries {
@@ -144,19 +158,19 @@ func (c *CheckoutCoordinator) flattenDirtyChainOver(
 	}
 	if err := handle.WriteInputManifest(ctx, meta, entries); err != nil {
 		abandon()
-		return dirtyLayerBuild{}, fmt.Errorf("indexer: write the folded manifest: %w", err)
+		return dirtyLayerBuild{}, nil, fmt.Errorf("indexer: write the folded manifest: %w", err)
 	}
-	if err := c.verifyFlattenedChain(ctx, root.GenerationID, oldestFirst, generationID); err != nil {
+	if err := verifyFold(ctx, verify, root.GenerationID, oldestFirst, generationID); err != nil {
 		abandon()
-		return dirtyLayerBuild{}, fmt.Errorf("%w: %v", errFlattenRefused, err)
+		return dirtyLayerBuild{}, nil, fmt.Errorf("%w: %v", errFlattenRefused, err)
 	}
 	if err := stampFoldedGeneration(ctx, c.store, oldestFirst, handle); err != nil {
 		abandon()
-		return dirtyLayerBuild{}, err
+		return dirtyLayerBuild{}, nil, err
 	}
 	if err := c.store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
 		abandon()
-		return dirtyLayerBuild{}, fmt.Errorf("indexer: publish the folded working-tree generation %d: %w", generationID, err)
+		return dirtyLayerBuild{}, nil, fmt.Errorf("indexer: publish the folded working-tree generation %d: %w", generationID, err)
 	}
 	finish(context.WithoutCancel(ctx), true)
 	markPublicationPhase(ctx, PublicationPublished)
@@ -166,7 +180,7 @@ func (c *CheckoutCoordinator) flattenDirtyChainOver(
 		if err == nil {
 			err = fmt.Errorf("indexer: folded generation %d vanished", generationID)
 		}
-		return dirtyLayerBuild{}, err
+		return dirtyLayerBuild{}, nil, err
 	}
 	c.logger.Debug("checkout coordinator: working-tree chain folded by copy",
 		zap.String("checkout", c.checkoutID),
@@ -174,97 +188,26 @@ func (c *CheckoutCoordinator) flattenDirtyChainOver(
 		zap.Int64("folded_generation", generationID),
 		zap.Int64("nodes", counts.Nodes), zap.Int64("edges", counts.Edges), zap.Int64("rows", counts.Rows),
 		zap.Duration("elapsed", time.Since(started)))
-	return dirtyLayerBuild{GenerationID: generationID, Key: logicalDirtyKey(row, commit.GenerationID)}, nil
+	return dirtyLayerBuild{GenerationID: generationID, Key: logicalDirtyKey(row, commit.GenerationID)}, oldestFirst, nil
 }
 
 // verifyFlattenedChain compares, over everything the chain speaks for, the
 // chain composed over the commit generation with the folded generation over
 // the same commit generation: the nodes at every path a member claims, every
 // identity a member masks or marks, and the outgoing and incoming edges of
-// all of them.
+// all of them. It reads in steps (verifyFlattenedChainInSteps) and never runs
+// inside an edit: its cost is three reads (the node, its out-edges, its
+// in-edges) per claimed identity through every layer of the chain.
 func (c *CheckoutCoordinator) verifyFlattenedChain(ctx context.Context, commitGeneration int64, oldestFirst []int64, folded int64) error {
-	base, release, err := c.generationLayerReader(ctx, commitGeneration)
-	if err != nil {
-		return err
+	return c.verifyFlattenedChainInSteps(ctx, commitGeneration, oldestFirst, folded)
+}
+
+// verifyFold runs verify, when there is one.
+func verifyFold(ctx context.Context, verify foldVerifier, root int64, oldestFirst []int64, folded int64) error {
+	if verify == nil {
+		return nil
 	}
-	defer release()
-	var chainView graph.Reader = base
-	paths := map[string]struct{}{}
-	ids := map[string]struct{}{}
-	for _, id := range oldestFirst {
-		layer, err := graphview.NewGenerationLayerContext(ctx, c.store.AtGeneration(id))
-		if err != nil {
-			return err
-		}
-		for _, p := range layer.FilePaths() {
-			paths[p] = struct{}{}
-		}
-		for removed := range layer.RemovedIDs() {
-			ids[removed] = struct{}{}
-		}
-		marks, err := c.store.AtGeneration(id).EdgeSourceMasksContext(ctx)
-		if err != nil {
-			return err
-		}
-		for _, m := range marks {
-			ids[m.SourceID] = struct{}{}
-		}
-		chainView = graph.NewOverlaidViewWithLayer(chainView, layer)
-	}
-	foldedLayer, err := graphview.NewGenerationLayerContext(ctx, c.store.AtGeneration(folded))
-	if err != nil {
-		return err
-	}
-	foldedView := graph.NewOverlaidViewWithLayer(base, foldedLayer)
-	if got, want := foldedLayer.FilePaths(), foldSortedKeys(paths); !foldEqualStrings(got, want) {
-		return fmt.Errorf("the fold claims %d paths, the chain %d", len(got), len(want))
-	}
-	render := func(r graph.Reader) []string {
-		var out []string
-		seen := map[string]struct{}{}
-		visit := func(n *graph.Node) {
-			if n == nil {
-				return
-			}
-			if _, dup := seen[n.ID]; dup {
-				return
-			}
-			seen[n.ID] = struct{}{}
-			out = append(out, renderFoldNode(n))
-			for _, e := range r.GetOutEdges(n.ID) {
-				out = append(out, renderFoldEdge(e))
-			}
-			// In-edges too: an edge recorded at a claimed path that names
-			// an identity the chain removed is visible only from its
-			// target's side.
-			for _, e := range r.GetInEdges(n.ID) {
-				out = append(out, "in "+renderFoldEdge(e))
-			}
-		}
-		for p := range paths {
-			for _, n := range r.GetFileNodes(p) {
-				visit(n)
-			}
-		}
-		for id := range ids {
-			if n := r.GetNode(id); n != nil {
-				visit(n)
-			} else {
-				out = append(out, "absent "+id)
-				for _, e := range r.GetOutEdges(id) {
-					out = append(out, renderFoldEdge(e))
-				}
-			}
-		}
-		sort.Strings(out)
-		return out
-	}
-	want, got := render(chainView), render(foldedView)
-	if !foldEqualStrings(got, want) {
-		return fmt.Errorf("the fold serves %d rows where the chain serves %d (first difference: %s)",
-			len(got), len(want), foldFirstDifference(got, want))
-	}
-	return nil
+	return verify(ctx, root, oldestFirst, folded)
 }
 
 func renderFoldNode(n *graph.Node) string {

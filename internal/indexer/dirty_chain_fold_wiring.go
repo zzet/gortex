@@ -128,7 +128,11 @@ func (c *CheckoutCoordinator) copyChainInSteps(ctx context.Context, oldestFirst 
 	}
 	c.logger.Info("checkout coordinator: chain fold stepped",
 		zap.String("checkout", c.checkoutID), zap.Int64s("chain", oldestFirst), zap.Int64("folded_generation", to),
-		zap.Int("steps", steps), zap.Int("retries", retries), zap.Duration("elapsed", time.Since(started)), zap.Error(err))
+		zap.Int("steps", steps), zap.Int("retries", retries), zap.Duration("elapsed", time.Since(started)),
+		zap.Int64("rows", counts.Rows), zap.Int64("nodes", counts.Nodes), zap.Int64("edges", counts.Edges), zap.Error(err))
+	if err == nil {
+		err = c.afterFoldCopy(ctx, to)
+	}
 	if err != nil {
 		finish(context.WithoutCancel(ctx), false)
 		return counts, nil, err
@@ -172,6 +176,14 @@ func (c *CheckoutCoordinator) landSteppedFold(ctx context.Context, commitGenerat
 			c.releaseDirty(ctx, id)
 		}
 	}
+	// The registry the chain's edits kept is the fold's: filed under the
+	// stack the landing makes before the landing, so the first edit over the
+	// fold does not reload it.
+	var above []int64
+	if len(routed) >= len(folded) && slices.Equal(routed[:len(folded)], folded) {
+		above = routed[len(folded):]
+	}
+	c.handOverFoldRegistry(ctx, commitGeneration, nil, folded, built.GenerationID, above)
 	landing, err := c.landChainFold(ctx, c.foldBackend(), routed, folded, built.GenerationID, flip, release)
 	if err != nil {
 		// A re-base guard miss (the layer above moved between the read and
@@ -184,64 +196,41 @@ func (c *CheckoutCoordinator) landSteppedFold(ctx context.Context, commitGenerat
 	return landing, landing.kind == foldLandFlip || landing.kind == foldLandRebase
 }
 
-// foldAboveRunningFold folds, in the edit's own cycle, the routed layers above
-// the running fold into one generation over the fold's top layer, and returns
-// it (0 when refused). The running fold then re-bases that generation when it
-// lands.
-func (c *CheckoutCoordinator) foldAboveRunningFold(ctx context.Context, route store_sqlite.CheckoutRoute, commitGeneration int64, folding []int64) int64 {
-	commit, found, err := c.catalog.GetViewGeneration(ctx, commitGeneration)
-	if err != nil || !found {
-		return 0
-	}
-	root, found, err := c.catalog.GetViewGeneration(ctx, folding[len(folding)-1])
-	if err != nil || !found {
-		return 0
-	}
-	started := time.Now()
-	built, err := c.flattenDirtyChainOver(ctx, commit, root, route.DirtyGenerationID, c.copyChainAtOnce)
-	if err != nil {
-		c.logger.Info("checkout coordinator: fold above the running fold refused",
-			zap.String("checkout", c.checkoutID), zap.Int64("chain_top", route.DirtyGenerationID),
-			zap.Duration("elapsed", time.Since(started)), zap.Error(err))
-		return 0
-	}
-	c.retainDirty(ctx, built.Key, built.GenerationID)
-	c.logger.Info("checkout coordinator: layers above the running fold folded",
-		zap.String("checkout", c.checkoutID), zap.Int64("chain_top", route.DirtyGenerationID),
-		zap.Int64("folded_generation", built.GenerationID), zap.Duration("elapsed", time.Since(started)))
-	return built.GenerationID
-}
-
-// parentChainBound is the depth bound parent selection walks route's chain
-// under: the effective bound, or the physical one while a stepped fold runs
-// and the bound rule lets an edit chain above it.
-func (c *CheckoutCoordinator) parentChainBound(ctx context.Context, route store_sqlite.CheckoutRoute) int {
-	folding := c.foldingChain()
-	if len(folding) == 0 || route.DirtyGenerationID <= 0 {
-		return maxDirtyChainDepth
-	}
-	routed := c.dirtyChainMembers(ctx, route.DirtyGenerationID)
-	slices.Reverse(routed)
-	if chainBoundAction(routed, folding) == chainActionChain {
+// parentChainBound is the depth bound parent selection walks the route's chain
+// under: with the stepped fold, the physical cap (an edit chains until it and
+// the background fold keeps the chain short); otherwise the effective bound.
+func (c *CheckoutCoordinator) parentChainBound(_ context.Context, _ store_sqlite.CheckoutRoute) int {
+	if steppedChainFoldEnabled {
 		return maxChainWalkDepth
 	}
 	return maxDirtyChainDepth
 }
 
-// foldAtBoundAroundFold is the fold an edit at the bound makes while a
-// stepped fold runs: only the layers above it when the route still stands on
-// it (fold_upper), and 0 otherwise (the caller folds the whole chain).
-func (c *CheckoutCoordinator) foldAtBoundAroundFold(ctx context.Context, route store_sqlite.CheckoutRoute, commitGeneration int64) int64 {
-	folding := c.foldingChain()
-	if len(folding) == 0 {
+// foldAtCap is the fold an edit makes when it finds the routed chain at the
+// physical cap: the layers above a running fold, or the whole chain when none
+// runs, inline, bounded and unverified (foldInlineAtCap). 0 when refused.
+func (c *CheckoutCoordinator) foldAtCap(ctx context.Context, route store_sqlite.CheckoutRoute, commitGeneration int64) int64 {
+	if !foldChainAtBoundEnabled || route.DirtyGenerationID <= 0 {
 		return 0
 	}
+	commit, found, err := c.catalog.GetViewGeneration(ctx, commitGeneration)
+	if err != nil || !found {
+		return 0
+	}
+	folding := c.foldingChain()
 	routed := c.dirtyChainMembers(ctx, route.DirtyGenerationID)
 	slices.Reverse(routed)
-	if chainBoundAction(routed, folding) != chainActionFoldUpper {
-		return 0
+	switch chainBoundAction(routed, folding) {
+	case chainActionFoldUpper:
+		root, found, err := c.catalog.GetViewGeneration(ctx, folding[len(folding)-1])
+		if err != nil || !found {
+			return 0
+		}
+		return c.foldInlineAtCap(ctx, commit, root, route.DirtyGenerationID, chainActionFoldUpper)
+	case chainActionFoldAll:
+		return c.foldInlineAtCap(ctx, commit, commit, route.DirtyGenerationID, chainActionFoldAll)
 	}
-	return c.foldAboveRunningFold(ctx, route, commitGeneration, folding)
+	return 0
 }
 
 // compactDirtyChainStepped is the rest of a compaction attempt with the fold

@@ -30,11 +30,10 @@ import (
 //     transition that rewrites that one row's base, since the fold is
 //     content-equal to the chain it replaces and the layer's rows and masks
 //     are relative to that content — and the layers above it keep theirs;
-//   - the depth an edit is held to while a fold runs is the effective one
-//     (effectiveChainDepth): the folding prefix counts as the one layer it
-//     becomes. When the layers above a running fold reach the bound as well,
-//     the edit folds those upper layers itself — a few recent layers, a short
-//     copy — and publishes above that (chainBoundAction).
+//   - an edit chains above the chain, a running fold or not, up to the
+//     physical cap; only at the cap does it fold in its own cycle, as the last
+//     resort, bounded in time and unverified (chainBoundAction,
+//     dirty_chain_fold_bound.go).
 
 // foldStepRetryPoll is how long the driver waits before it asks for the next
 // step after the store gave a step back to an edit or refused one on a WAL
@@ -150,10 +149,12 @@ const (
 )
 
 // chainBoundAction is the rule at the bound. An edit chains while the
-// effective depth leaves room for its layer and the physical depth does too;
-// otherwise it folds, in its own cycle, what it can fold without waiting: the
-// whole chain when no fold runs, or only the layers above the running fold —
-// a few recent layers, whose copy is short — when one does.
+// physical depth leaves room for its layer: the background fold, started at
+// dirtyChainCompactionDepth, is what keeps the chain short, and an edit never
+// folds while it runs. Only at the physical cap does an edit fold in its own
+// cycle, as the last resort and under a time bound (dirty_chain_fold_bound.go):
+// the whole chain when no fold runs, or only the layers above the running
+// fold when one does.
 // The physical limit is maxChainWalkDepth: a chain never outgrows what a reader
 // can compose.
 func chainBoundAction(routed, folding []int64) string {
@@ -162,7 +163,7 @@ func chainBoundAction(routed, folding []int64) string {
 
 // chainBoundActionWithin is chainBoundAction under an explicit physical limit.
 func chainBoundActionWithin(routed, folding []int64, physical int) string {
-	if effectiveChainDepth(routed, folding) < maxDirtyChainDepth && len(routed) < physical {
+	if len(routed) < physical {
 		return chainActionChain
 	}
 	if len(folding) > 1 && len(routed) > len(folding) && slices.Equal(routed[:len(folding)], folding) {

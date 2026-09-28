@@ -558,7 +558,7 @@ func (c *CheckoutCoordinator) reparentDirtyChain(
 	newCommit int64,
 	fingerprint string,
 ) (int64, string, error) {
-	chain, ok, reason, err := c.dirtyChainRoot(ctx, top, oldCommit, maxDirtyChainDepth)
+	chain, ok, reason, err := c.dirtyChainRoot(ctx, top, oldCommit, maxChainWalkDepth)
 	if err != nil {
 		return 0, "", err
 	}

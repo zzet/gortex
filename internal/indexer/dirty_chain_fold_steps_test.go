@@ -140,8 +140,9 @@ func TestLandingAFoldRebasesOnlyTheLowestLayerAbove(t *testing.T) {
 	}
 }
 
-// The depth an edit is held to while a fold runs counts the folding prefix as
-// one layer; at the bound it folds what it can without waiting.
+// An edit chains until the physical cap, whether a fold runs or not; only at
+// the cap does it fold, what it can: the layers above a running fold, or the
+// whole chain.
 func TestChainBoundWhileAFoldRuns(t *testing.T) {
 	folding := []int64{1, 2, 3, 4, 5, 6, 7, 8}
 	above := func(n int) []int64 {
@@ -157,11 +158,17 @@ func TestChainBoundWhileAFoldRuns(t *testing.T) {
 	if got := chainBoundActionWithin(above(3), folding, maxPhysicalChainDepth); got != chainActionChain {
 		t.Fatalf("3 layers above a running fold: %s, want %s", got, chainActionChain)
 	}
-	if got := chainBoundActionWithin(above(7), folding, maxPhysicalChainDepth); got != chainActionFoldUpper {
-		t.Fatalf("7 layers above a running fold (effective 8): %s, want %s", got, chainActionFoldUpper)
+	if got := chainBoundActionWithin(above(7), folding, maxPhysicalChainDepth); got != chainActionChain {
+		t.Fatalf("7 layers above a running fold (15 of 16): %s, want %s", got, chainActionChain)
 	}
-	if got := chainBoundActionWithin(folding, nil, maxPhysicalChainDepth); got != chainActionFoldAll {
-		t.Fatalf("8 layers, no fold: %s, want %s", got, chainActionFoldAll)
+	if got := chainBoundActionWithin(above(8), folding, maxPhysicalChainDepth); got != chainActionFoldUpper {
+		t.Fatalf("8 layers above a running fold (the cap): %s, want %s", got, chainActionFoldUpper)
+	}
+	if got := chainBoundActionWithin(folding, nil, maxPhysicalChainDepth); got != chainActionChain {
+		t.Fatalf("8 layers, no fold, cap 16: %s, want %s", got, chainActionChain)
+	}
+	if got := chainBoundActionWithin(above(8), nil, maxPhysicalChainDepth); got != chainActionFoldAll {
+		t.Fatalf("16 layers, no fold: %s, want %s", got, chainActionFoldAll)
 	}
 	if got := chainBoundActionWithin(folding[:5], nil, maxPhysicalChainDepth); got != chainActionChain {
 		t.Fatalf("5 layers, no fold: %s, want %s", got, chainActionChain)

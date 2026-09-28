@@ -480,7 +480,12 @@ func TestSelectDirtyParentReasonCodes(t *testing.T) {
 	expect(t, "delta not smaller", c.selectDirtyParentDetail(ctx, route, commit, x.sample(t), maxDirtyChainDepth), dirtyChainFallbackDeltaNotSmaller)
 	dirtyChainSmallDelta = savedSmall
 
+	// Every reason this test is named for in dirtyChainReasonProducers is
+	// produced here; the others are produced by the tests the list names.
 	for _, reason := range dirtyChainFallbackReasons {
+		if dirtyChainReasonProducers[reason] != "TestSelectDirtyParentReasonCodes" {
+			continue
+		}
 		if !seen[reason] {
 			t.Errorf("reason %q was never produced", reason)
 		}

@@ -67,6 +67,10 @@ const (
 	// dirtyChainFallbackSymlinkOrSubmoduleChanged: an opaque entry, a symlink
 	// or a gitlink changed; the direct path handles those conservatively.
 	dirtyChainFallbackSymlinkOrSubmoduleChanged = "symlink_or_submodule_changed"
+	// dirtyChainFallbackFoldUnverified: an inline fold at the chain cap did not
+	// reproduce its chain when verified in the background; the next build
+	// stands on nothing the chain made.
+	dirtyChainFallbackFoldUnverified = "fold_unverified"
 )
 
 // dirtyChainFallbackReasons lists every fallback code, for exhaustive tests
@@ -82,6 +86,7 @@ var dirtyChainFallbackReasons = []string{
 	dirtyChainFallbackDeltaNotSmaller,
 	dirtyChainFallbackClosureTruncatedParent,
 	dirtyChainFallbackSymlinkOrSubmoduleChanged,
+	dirtyChainFallbackFoldUnverified,
 }
 
 // dirtyManifestPolicyTag versions the policy digest's own encoding.
