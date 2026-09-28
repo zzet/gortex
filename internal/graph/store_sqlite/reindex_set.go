@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"unicode/utf8"
@@ -92,10 +93,31 @@ func (s *sqliteReindexSetStats) add(other sqliteReindexSetStats) {
 
 func (s *Store) reindexEdgesSetOriented(batch []graph.EdgeReindex) (sqliteReindexSetStats, error) {
 	var stats sqliteReindexSetStats
-	if len(batch) == 0 {
-		return stats, nil
+	for txStart := 0; txStart < len(batch); txStart += reindexChunkSize {
+		txEnd := minInt(txStart+reindexChunkSize, len(batch))
+		txStats, err := s.reindexEdgesSetChunk(batch[txStart:txEnd])
+		stats.add(txStats)
+		if err != nil {
+			if txStart > 0 && errors.Is(err, errReindexWriterGateContended) {
+				// Earlier chunks committed on their own; say how far the batch got
+				// so the dropped remainder is not mistaken for the whole batch.
+				return stats, fmt.Errorf("%w (applied %d of %d rebinds)", err, txStart, len(batch))
+			}
+			return stats, err
+		}
 	}
+	return stats, nil
+}
 
+// reindexEdgesSetChunk applies one bounded transaction of a reindex batch
+// under its own writer-gate hold. The gate is released between chunks so a
+// large rebind (a sparse generation build hands over hundreds of thousands)
+// never starves the edge drain, the reconcile janitor or any other writer for
+// longer than one chunk: chunks were already committed independently, so no
+// caller could observe the batch as atomic, and each chunk re-reads the rows
+// it rewrites inside its own transaction.
+func (s *Store) reindexEdgesSetChunk(chunk []graph.EdgeReindex) (sqliteReindexSetStats, error) {
+	var stats sqliteReindexSetStats
 	gateCtx, cancelGate := context.WithTimeout(context.Background(), s.sqliteBusyRetryWindow())
 	gateErr := s.writeMu.LockContext(gateCtx)
 	cancelGate()
@@ -108,30 +130,25 @@ func (s *Store) reindexEdgesSetOriented(batch []graph.EdgeReindex) (sqliteReinde
 	}
 	defer s.writeMu.Unlock()
 
-	for txStart := 0; txStart < len(batch); txStart += reindexChunkSize {
-		txEnd := minInt(txStart+reindexChunkSize, len(batch))
-		var (
-			txStats             sqliteReindexSetStats
-			changed             bool
-			invalidatedAnalysis bool
-			receipt             *sqliteReindexReceipt
-		)
-		err := s.withSQLiteBusyRetry(context.Background(), "reindex_edges", func(ctx context.Context) error {
-			var txErr error
-			txStats, changed, invalidatedAnalysis, receipt, txErr = s.reindexEdgesSetTransactionLocked(ctx, batch[txStart:txEnd])
-			return txErr
-		})
-		if err != nil {
-			return stats, err
-		}
-		stats.add(txStats)
-		if invalidatedAnalysis {
-			s.analysisGenerationPresent = false
-		}
-		s.finishAnalysisMutationLocked(changed)
-		if changed {
-			s.publishSQLiteReindexReceiptLocked(receipt)
-		}
+	var (
+		changed             bool
+		invalidatedAnalysis bool
+		receipt             *sqliteReindexReceipt
+	)
+	err := s.withSQLiteBusyRetry(context.Background(), "reindex_edges", func(ctx context.Context) error {
+		var txErr error
+		stats, changed, invalidatedAnalysis, receipt, txErr = s.reindexEdgesSetTransactionLocked(ctx, chunk)
+		return txErr
+	})
+	if err != nil {
+		return sqliteReindexSetStats{}, err
+	}
+	if invalidatedAnalysis {
+		s.analysisGenerationPresent = false
+	}
+	s.finishAnalysisMutationLocked(changed)
+	if changed {
+		s.publishSQLiteReindexReceiptLocked(receipt)
 	}
 	return stats, nil
 }
@@ -575,81 +592,68 @@ func resolvedConversionJSONRow(mutation sqliteReindexMutation, updateKind bool) 
 // encodeResolvedConversionRows) and unhex() restores the exact bytes; JSON
 // numbers and nulls land as INTEGER/REAL/NULL, with column affinity settling
 // confidence to REAL.
+//
+// The join order is pinned, not left to the planner. json_each reports a
+// constant cost of 1 per scan, so an UPDATE ... FROM json_each(?) joined on
+// the edge identity was planned as "SEARCH edges USING INDEX (view_gen=?)"
+// outer and json_each inner: every stored edge of the generation re-parsed the
+// entire chunk payload. A chunk of c rows over a generation of G edges cost
+// O(G * c * row bytes), and the whole reindex O(G * N) — a 10k-edge
+// generation took minutes and a 200k-edge sparse build held the writer gate
+// for an hour. The target CTE drives from the patch with CROSS JOIN, so every
+// patch row is one indexed probe of edges on its full logical identity, and
+// the MATERIALIZED id list reaches the UPDATE through the rowid: the only
+// access path for the target is an INTEGER PRIMARY KEY lookup per hit. The
+// JSON payload is parsed exactly once per statement.
 func sqliteResolvedConversionUpdateJSONStatement(updateKind bool) string {
+	newKindColumn, kindSet, shift := "", "", 0
 	if updateKind {
-		return `WITH patch AS (SELECT
-		value ->> 0 AS old_from_id,
-		value ->> 1 AS old_to_id,
-		value ->> 2 AS old_kind,
-		value ->> 3 AS file_path,
-		value ->> 4 AS line,
-		value ->> 5 AS new_to_id,
-		value ->> 6 AS new_kind,
-		CAST(value ->> 7 AS REAL) AS confidence,
-		value ->> 8 AS confidence_label,
-		value ->> 9 AS origin,
-		value ->> 10 AS tier,
-		value ->> 11 AS cross_repo,
-		unhex(value ->> 12) AS meta,
-		value ->> 13 AS resolve_terminal,
-		value ->> 14 AS resolve_terminal_reason,
-		value ->> 15 AS semantic_source
-	FROM json_each(?))
-	UPDATE OR IGNORE edges AS e
-	SET to_id = p.new_to_id,
-		kind = p.new_kind,
-		confidence = p.confidence,
-		confidence_label = p.confidence_label,
-		origin = p.origin,
-		tier = p.tier,
-		cross_repo = p.cross_repo,
-		meta = p.meta,
-		resolve_terminal = p.resolve_terminal,
-		resolve_terminal_reason = p.resolve_terminal_reason,
-		semantic_source = p.semantic_source
-	FROM patch AS p
-	WHERE e.from_id = p.old_from_id
-		AND e.to_id = p.old_to_id
-		AND e.kind = p.old_kind
-		AND e.file_path = p.file_path
-		AND e.line = p.line
-		AND e.view_gen = ?`
+		newKindColumn = `
+			value ->> 6 AS new_kind,`
+		kindSet = `
+			kind = t.new_kind,`
+		shift = 1
 	}
+	col := func(i int) string { return fmt.Sprintf("value ->> %d", i+shift) }
 	return `WITH patch AS (SELECT
-		value ->> 0 AS old_from_id,
-		value ->> 1 AS old_to_id,
-		value ->> 2 AS kind,
-		value ->> 3 AS file_path,
-		value ->> 4 AS line,
-		value ->> 5 AS new_to_id,
-		CAST(value ->> 6 AS REAL) AS confidence,
-		value ->> 7 AS confidence_label,
-		value ->> 8 AS origin,
-		value ->> 9 AS tier,
-		value ->> 10 AS cross_repo,
-		unhex(value ->> 11) AS meta,
-		value ->> 12 AS resolve_terminal,
-		value ->> 13 AS resolve_terminal_reason,
-		value ->> 14 AS semantic_source
-	FROM json_each(?))
-	UPDATE OR IGNORE edges AS e
-	SET to_id = p.new_to_id,
-		confidence = p.confidence,
-		confidence_label = p.confidence_label,
-		origin = p.origin,
-		tier = p.tier,
-		cross_repo = p.cross_repo,
-		meta = p.meta,
-		resolve_terminal = p.resolve_terminal,
-		resolve_terminal_reason = p.resolve_terminal_reason,
-		semantic_source = p.semantic_source
-	FROM patch AS p
-	WHERE e.from_id = p.old_from_id
-		AND e.to_id = p.old_to_id
-		AND e.kind = p.kind
-		AND e.file_path = p.file_path
-		AND e.line = p.line
-		AND e.view_gen = ?`
+			value ->> 0 AS old_from_id,
+			value ->> 1 AS old_to_id,
+			value ->> 2 AS old_kind,
+			value ->> 3 AS file_path,
+			value ->> 4 AS line,
+			value ->> 5 AS new_to_id,` + newKindColumn + `
+			CAST(` + col(6) + ` AS REAL) AS confidence,
+			` + col(7) + ` AS confidence_label,
+			` + col(8) + ` AS origin,
+			` + col(9) + ` AS tier,
+			` + col(10) + ` AS cross_repo,
+			unhex(` + col(11) + `) AS meta,
+			` + col(12) + ` AS resolve_terminal,
+			` + col(13) + ` AS resolve_terminal_reason,
+			` + col(14) + ` AS semantic_source
+		FROM json_each(?)),
+	target AS MATERIALIZED (SELECT e.id AS edge_id, p.*
+		FROM patch AS p
+		CROSS JOIN edges AS e
+		WHERE e.from_id = p.old_from_id
+			AND e.to_id = p.old_to_id
+			AND e.kind = p.old_kind
+			AND e.file_path = p.file_path
+			AND e.line = p.line
+			AND e.view_gen = ?)
+	UPDATE OR IGNORE edges
+	SET to_id = t.new_to_id,` + kindSet + `
+		confidence = t.confidence,
+		confidence_label = t.confidence_label,
+		origin = t.origin,
+		tier = t.tier,
+		cross_repo = t.cross_repo,
+		meta = t.meta,
+		resolve_terminal = t.resolve_terminal,
+		resolve_terminal_reason = t.resolve_terminal_reason,
+		semantic_source = t.semantic_source
+	FROM target AS t
+	WHERE edges.id = t.edge_id`
 }
 
 // sqliteReindexRowsTxLimited reads the stored rows the simulator compares
