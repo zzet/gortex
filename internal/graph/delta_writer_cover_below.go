@@ -42,5 +42,6 @@ func (dw *DeltaWriter) pristine() bool {
 	l := dw.layer
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	return len(l.covered) == 0 && len(l.claimed) == 0 && len(l.removed) == 0
+	return len(l.covered) == 0 && len(l.claimed) == 0 && len(l.removed) == 0 &&
+		len(l.edgeClaims) == 0 && len(l.identityClaims) == 0 && len(l.kindClaims) == 0
 }

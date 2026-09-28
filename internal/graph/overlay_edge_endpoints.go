@@ -88,7 +88,7 @@ func (p overlaidEdgeEndpoints) rowVisible(row EdgeEndpointRow) bool {
 	if v.layer == nil {
 		return true
 	}
-	if v.overlayOwnsBaseEdge(row.From, row.FilePath) {
+	if v.overlayOwnsBaseEdge(row.From, row.FilePath) || v.overlayClaimsBaseEndpoints(row.From, row.To, row.Kind, row.FilePath) {
 		return false
 	}
 	return v.overlayIdentityVisible(row.From) && v.overlayIdentityVisible(row.To)

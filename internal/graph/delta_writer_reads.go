@@ -171,7 +171,8 @@ func (dw *DeltaWriter) deltaLayerTouchedPaths(paths []string) map[string]struct{
 		_, imports := l.importSources[p]
 		_, claimed := l.claimed[p]
 		_, removed := l.removed[p]
-		if covered || imports || claimed || removed {
+		_, edgeClaims := l.edgeClaims[p]
+		if covered || imports || claimed || removed || edgeClaims {
 			touched[p] = struct{}{}
 		}
 	}

@@ -112,17 +112,24 @@ type EditDeltaReport struct {
 	ClaimedSources    int
 	MaterializedNodes int
 	MaterializedEdges int
-	PayloadNodes      int
-	PayloadEdges      int
-	ReplacePaths      int
-	DeletePaths       int
-	EdgeSources       int
-	Tombstones        int
-	DroppedPaths      int
-	DroppedSources    int
-	DroppedNodes      int
-	OrphanEdges       int
-	IdentityClaims    int
+	// EdgeClaims / EdgeClaimsPromoted are the edge-level claims a file
+	// eviction made and the sources of them claimed whole at Payload;
+	// ClaimsByWrite attributes the whole-source claims to their writes
+	// (graph.DeltaWriterStats).
+	EdgeClaims         int
+	EdgeClaimsPromoted int
+	ClaimsByWrite      map[string]graph.ClaimCount
+	PayloadNodes       int
+	PayloadEdges       int
+	ReplacePaths       int
+	DeletePaths        int
+	EdgeSources        int
+	Tombstones         int
+	DroppedPaths       int
+	DroppedSources     int
+	DroppedNodes       int
+	OrphanEdges        int
+	IdentityClaims     int
 	// RestatedNodes / RestatedEdges are the rows at replaced paths identical
 	// to the view below's (DeltaPayload).
 	RestatedNodes int
@@ -793,6 +800,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	stats := dw.DeltaStats()
 	out.CoveredPaths, out.ClaimedSources = stats.CoveredPaths, stats.ClaimedSources
 	out.MaterializedNodes, out.MaterializedEdges = stats.MaterializedNodes, stats.MaterializedEdges
+	out.EdgeClaims, out.EdgeClaimsPromoted, out.ClaimsByWrite = stats.EdgeClaims, stats.EdgeClaimsPromoted, stats.ClaimsByWrite
 	out.SlowReads = stats.SlowReads
 	out.WholeLayerLoads, out.WholeLayerRows = stats.WholeLayerLoads, stats.WholeLayerRows
 	out.LayerRowsRead = stats.LayerRowsRead
@@ -821,6 +829,9 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			zap.Int("claimed", out.ClaimedSources),
 			zap.Int("materialized_nodes", out.MaterializedNodes),
 			zap.Int("materialized_edges", out.MaterializedEdges),
+			zap.Int("edge_claims", out.EdgeClaims),
+			zap.Int("edge_claims_promoted", out.EdgeClaimsPromoted),
+			zap.Any("claims_by_write", out.ClaimsByWrite),
 			zap.Int("payload_nodes", out.PayloadNodes),
 			zap.Int("payload_edges", out.PayloadEdges),
 			zap.Int("edge_sources", out.EdgeSources),

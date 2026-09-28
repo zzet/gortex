@@ -198,6 +198,9 @@ func (s deltaStack) edgeVisibleFrom(e *Edge, from int) bool {
 		} else if l.CoversNodeID(e.From) || l.OwnsOutEdges(e.From) {
 			return false
 		}
+		if layerClaimsEdge(l, e) {
+			return false
+		}
 		for _, id := range [2]string{e.From, e.To} {
 			if id == "" {
 				continue

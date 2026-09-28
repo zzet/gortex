@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // deltaLayer is the DeltaWriter's working graph read as an overlay layer, so
@@ -25,6 +26,17 @@ type deltaLayer struct {
 	// removed is the set of identities the delta removed from outside every
 	// covered path.
 	removed map[string]struct{}
+	// edgeClaims is, per source the delta does not claim whole, the edge
+	// tuples it speaks for (delta_writer_edge_claims.go); hasEdgeClaims is
+	// set once the first is made, so a delta without any skips the lock.
+	edgeClaims    map[string]map[edgeTuple]struct{}
+	hasEdgeClaims atomic.Bool
+	// identityClaims are single rows (exact identity) the delta speaks for
+	// out of such a source; kindClaims are edge kinds whose every lower row
+	// out of it the delta speaks for. A source with either also has an
+	// edgeClaims entry, so edgeClaims lists every partially claimed source.
+	identityClaims map[string]map[edgeHash]struct{}
+	kindClaims     map[string]map[EdgeKind]struct{}
 	// importSources is every path a source of an import edge the working
 	// graph holds or held lives at (DeltaWriter.ProjectImportAdjacency).
 	importSources map[string]struct{}

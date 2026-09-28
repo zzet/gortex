@@ -60,7 +60,7 @@ func placementsOf(nodes map[string]*Node) map[string]NodePlacement {
 func (dw *DeltaWriter) Untouched() bool {
 	l := dw.layer
 	l.mu.RLock()
-	empty := len(l.covered) == 0 && len(l.claimed) == 0 && len(l.removed) == 0 && len(l.importSources) == 0
+	empty := len(l.covered) == 0 && len(l.claimed) == 0 && len(l.removed) == 0 && len(l.edgeClaims) == 0 && len(l.importSources) == 0
 	l.mu.RUnlock()
 	return empty && dw.work.NodeCount() == 0 && dw.work.EdgeCount() == 0
 }

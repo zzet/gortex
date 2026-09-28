@@ -95,6 +95,12 @@ type DeltaWriter struct {
 	// belowOut is the layer below's outgoing set of every claimed source, as
 	// read when the source was claimed (the payload compares against it).
 	belowOut map[string][]*Edge
+	// claimedBelow is, per source with edge claims, the lower rows those
+	// claims hide, keyed by identity (delta_writer_edge_claims.go).
+	claimedBelow map[string]map[edgeHash]*Edge
+	// claimOp names the write in progress, for ClaimsByWrite; set under
+	// writeMu by every write entry point.
+	claimOp string
 
 	// builtinTargets is every builtin sentinel an edge the delta
 	// materialized pointed at: the candidates whose last referrer the delta
@@ -115,6 +121,22 @@ type DeltaWriterStats struct {
 	ClaimedSources    int
 	MaterializedNodes int
 	MaterializedEdges int
+	// EdgeClaims counts the edge tuples a file eviction claimed instead of
+	// their sources' whole outgoing sets; EdgeClaimSources is the sources
+	// still held that way, EdgeClaimsPromoted the ones claimed whole later
+	// (at Payload, because their rows changed).
+	EdgeClaims         int
+	EdgeClaimSources   int
+	EdgeClaimsPromoted int
+	// IdentityClaims / KindClaimRows count the single rows the later writes
+	// claimed by identity and the lower rows kind evictions claimed
+	// (delta_writer_row_claims.go).
+	IdentityClaims int
+	KindClaimRows  int
+	// ClaimsByWrite attributes every whole-source claim to the write that
+	// made it: "<DeltaWriter method>@<engine caller>" -> sources claimed and
+	// edges materialized (delta_writer_claim_attribution.go).
+	ClaimsByWrite map[string]ClaimCount
 	// WholeLayerLoads / WholeLayerRows count the immutable layers below the
 	// delta that had to be read wholesale (a layer with no generation-scoped
 	// projection) and the rows that cost.
@@ -173,6 +195,10 @@ func (dw *DeltaWriter) DeltaStats() DeltaWriterStats {
 	dw.statsMu.Lock()
 	defer dw.statsMu.Unlock()
 	out := dw.stats
+	out.ClaimsByWrite = make(map[string]ClaimCount, len(dw.stats.ClaimsByWrite))
+	for k, v := range dw.stats.ClaimsByWrite {
+		out.ClaimsByWrite[k] = v
+	}
 	out.LayerRowsByRead = make(map[string]int, len(dw.stats.LayerRowsByRead))
 	for k, v := range dw.stats.LayerRowsByRead {
 		out.LayerRowsByRead[k] = v
@@ -184,6 +210,7 @@ func (dw *DeltaWriter) DeltaStats() DeltaWriterStats {
 	dw.layer.mu.RLock()
 	out.CoveredPaths = len(dw.layer.covered)
 	out.ClaimedSources = len(dw.layer.claimed)
+	out.EdgeClaimSources = len(dw.layer.edgeClaims)
 	dw.layer.mu.RUnlock()
 	return out
 }
@@ -533,8 +560,13 @@ func (dw *DeltaWriter) claimSources(ids []string) {
 	for _, id := range fresh {
 		dw.layer.claimed[id] = struct{}{}
 	}
+	// The materialization above left the edge-claimed rows out (the working
+	// graph already holds the delta's rows for them); the whole claim now
+	// speaks for them.
+	dw.dropEdgeClaimsLocked(fresh)
 	dw.layer.mu.Unlock()
 	dw.noteMaterialized(0, len(edges))
+	dw.noteClaim(fresh, len(edges))
 }
 
 // edgeHome reports whether an edge's row lives in the working graph without a
@@ -583,6 +615,7 @@ func (dw *DeltaWriter) AddNode(n *Node) {
 	}
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("AddNode")()
 	dw.prepareNodeWrite(n)
 	if len(dw.keepBelowSharedCopies([]*Node{n})) == 0 {
 		return
@@ -597,6 +630,7 @@ func (dw *DeltaWriter) AddBatch(nodes []*Node, edges []*Edge) {
 	}
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("AddBatch")()
 	var paths, sources []string
 	for _, n := range nodes {
 		if n == nil || n.ID == "" {
@@ -609,14 +643,18 @@ func (dw *DeltaWriter) AddBatch(nodes []*Node, edges []*Edge) {
 		}
 	}
 	dw.coverPaths(paths)
+	var fresh []edgeKey
 	for _, e := range edges {
 		if e == nil || e.From == "" {
 			continue
 		}
-		if !dw.edgeHome(e.From, e.FilePath) {
-			sources = append(sources, e.From)
+		if !dw.edgeHome(e.From, e.FilePath) && !dw.edgeWriteClaimed(e) {
+			fresh = append(fresh, keyOf(e))
 		}
 	}
+	// A row new to a source the delta does not hold is claimed by identity
+	// when the view below holds no row under it (claimNewRows).
+	sources = append(sources, dw.claimNewRows(fresh)...)
 	dw.claimSources(sources)
 	dw.suppressBelowBuiltins(edges)
 	dw.noteImportSources(edges)
@@ -653,7 +691,10 @@ func (dw *DeltaWriter) AddEdge(e *Edge) {
 	}
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
-	dw.prepareEdgeWrite(e.From, e.FilePath)
+	defer dw.claimingFor("AddEdge")()
+	if !dw.edgeHome(e.From, e.FilePath) && !dw.edgeWriteClaimed(e) {
+		dw.claimSources(dw.claimNewRows([]edgeKey{keyOf(e)}))
+	}
 	dw.noteImportSources([]*Edge{e})
 	dw.work.AddEdge(e)
 }
@@ -666,7 +707,8 @@ func (dw *DeltaWriter) SetEdgeProvenance(e *Edge, newOrigin string) bool {
 	}
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
-	dw.prepareEdgeWrite(e.From, e.FilePath)
+	defer dw.claimingFor("SetEdgeProvenance")()
+	dw.claimSources(dw.claimRows([]edgeKey{keyOf(e)}, true))
 	stored := dw.work.storedEdge(keyOf(e))
 	if stored == nil {
 		return false
@@ -698,17 +740,33 @@ func (dw *DeltaWriter) ReindexEdges(batch []EdgeReindex) {
 	}
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("ReindexEdges")()
+	// A retarget, a refresh or a move of one row is claimed by the row's old
+	// and new identities (delta_writer_row_claims.go); a row the claims
+	// cannot express claims its sources whole.
 	var sources []string
+	var oldKeys, newKeys []edgeKey
 	for _, r := range batch {
 		if r.Edge == nil {
 			continue
 		}
-		oldFrom, oldPath := r.Edge.From, r.Edge.FilePath
+		oldFrom, oldPath, oldLine := r.Edge.From, r.Edge.FilePath, r.Edge.Line
 		if r.RefreshIdentity {
 			if r.OldFrom != "" {
 				oldFrom = r.OldFrom
 			}
-			oldPath = r.OldFilePath
+			oldPath, oldLine = r.OldFilePath, r.OldLine
+		}
+		oldKind := r.OldKind
+		if oldKind == "" {
+			oldKind = r.Edge.Kind
+		}
+		// A move between sources or places is two rows: the old identity
+		// removed, the new one created; both are claimed by identity.
+		if r.OldTo != "" {
+			oldKeys = append(oldKeys, edgeKey{From: oldFrom, To: r.OldTo, Kind: oldKind, FilePath: oldPath, Line: oldLine})
+			newKeys = append(newKeys, keyOf(r.Edge))
+			continue
 		}
 		if !dw.edgeHome(oldFrom, oldPath) {
 			sources = append(sources, oldFrom)
@@ -717,6 +775,8 @@ func (dw *DeltaWriter) ReindexEdges(batch []EdgeReindex) {
 			sources = append(sources, r.Edge.From)
 		}
 	}
+	sources = append(sources, dw.claimRows(oldKeys, true)...)
+	sources = append(sources, dw.claimNewRows(newKeys)...)
 	dw.claimSources(sources)
 	for _, r := range batch {
 		if r.Edge != nil && r.Edge.Kind == EdgeImports {
@@ -865,6 +925,7 @@ func (dw *DeltaWriter) SetEdgeProvenanceBatch(batch []EdgeProvenanceUpdate) int 
 func (dw *DeltaWriter) RemoveEdge(from, to string, kind EdgeKind) bool {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("RemoveEdge")()
 	var target *Edge
 	for _, e := range dw.view.GetOutEdges(from) {
 		if e != nil && e.To == to && e.Kind == kind {
@@ -886,6 +947,7 @@ func (dw *DeltaWriter) RemoveEdge(from, to string, kind EdgeKind) bool {
 func (dw *DeltaWriter) EvictFile(filePath string) (int, int) {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("EvictFile")()
 	dw.prepareEviction([]string{filePath})
 	return dw.work.EvictFile(filePath)
 }
@@ -894,6 +956,7 @@ func (dw *DeltaWriter) EvictFile(filePath string) (int, int) {
 func (dw *DeltaWriter) EvictFiles(filePaths []string) (int, int) {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("EvictFiles")()
 	dw.prepareEviction(filePaths)
 	nodes, edges := 0, 0
 	for _, p := range filePaths {
@@ -904,10 +967,13 @@ func (dw *DeltaWriter) EvictFiles(filePaths []string) (int, int) {
 	return nodes, edges
 }
 
-// prepareEviction covers the paths and claims every source outside them
-// whose edge set the eviction changes: the store's eviction removes every edge
-// into an evicted node wherever it was recorded, so each such source's set is
-// copied first and the removal becomes a row difference the payload publishes.
+// prepareEviction covers the paths and claims every edge outside them the
+// eviction removes: the store's eviction removes every edge into an evicted
+// node wherever it was recorded. An edge the working graph already holds (its
+// source is claimed, or its path covered) is removed there; every other one is
+// edge-claimed (delta_writer_edge_claims.go) — the delta speaks for that row
+// and holds none for it, so the removal is a row difference — without reading
+// its source's other edges. The cost is the evicted nodes' incident edges.
 //
 // The evicted nodes' own outgoing edges recorded at other paths are NOT
 // claimed. The published composition settles an edge by the path it was
@@ -937,7 +1003,7 @@ func (dw *DeltaWriter) prepareEviction(paths []string) {
 	if !ok {
 		in = dw.view.GetInEdgesByNodeIDs(ids)
 	}
-	var sources []string
+	var rows []*Edge
 	for _, in := range in {
 		for _, e := range in {
 			if e == nil {
@@ -949,10 +1015,13 @@ func (dw *DeltaWriter) prepareEviction(paths []string) {
 			if _, recordedInside := evicted[e.FilePath]; recordedInside {
 				continue
 			}
-			sources = append(sources, e.From)
+			if dw.edgeHome(e.From, e.FilePath) {
+				continue
+			}
+			rows = append(rows, e)
 		}
 	}
-	dw.claimSources(sources)
+	dw.claimEdges(rows)
 }
 
 // EvictRepo implements Store. A delta describes a file-level change; a whole

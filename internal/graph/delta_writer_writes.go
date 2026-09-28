@@ -86,7 +86,15 @@ func (dw *DeltaWriter) markEvicted(before map[string]*Node) {
 func (dw *DeltaWriter) EvictEdgesFromSourcesByKinds(ctx context.Context, sourceIDs []string, kinds []EdgeKind) (int, error) {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
-	dw.claimSources(sourceIDs)
+	defer dw.claimingFor("EvictEdgesFromSourcesByKinds")()
+	// Every lower row of the kinds out of each source is claimed by kind; the
+	// source's other rows stay below (delta_writer_row_claims.go).
+	rows, ok := dw.composedEdgesByNodeIDs(sourceIDs, false, true)
+	if !ok {
+		dw.claimSources(sourceIDs)
+	} else {
+		dw.claimSources(dw.claimKinds(sourceIDs, kinds, rows))
+	}
 	return dw.work.EvictEdgesFromSourcesByKinds(ctx, sourceIDs, kinds)
 }
 
@@ -94,13 +102,14 @@ func (dw *DeltaWriter) EvictEdgesFromSourcesByKinds(ctx context.Context, sourceI
 func (dw *DeltaWriter) RemoveEdgesExact(edges []*Edge) int {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
-	var sources []string
+	defer dw.claimingFor("RemoveEdgesExact")()
+	keys := make([]edgeKey, 0, len(edges))
 	for _, e := range edges {
-		if e != nil && !dw.edgeHome(e.From, e.FilePath) {
-			sources = append(sources, e.From)
+		if e != nil {
+			keys = append(keys, keyOf(e))
 		}
 	}
-	dw.claimSources(sources)
+	dw.claimSources(dw.claimRows(keys, true))
 	return dw.work.RemoveEdgesExact(edges)
 }
 
@@ -108,6 +117,7 @@ func (dw *DeltaWriter) RemoveEdgesExact(edges []*Edge) int {
 func (dw *DeltaWriter) EvictContractNodesByIDs(ids []string) (int, int) {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("EvictContractNodesByIDs")()
 	before := dw.prepareNodeEviction(ids)
 	nodes, edges := dw.work.EvictContractNodesByIDs(ids)
 	dw.markEvicted(before)
@@ -118,6 +128,7 @@ func (dw *DeltaWriter) EvictContractNodesByIDs(ids []string) (int, int) {
 func (dw *DeltaWriter) EvictPathlessNodesByIDs(ids []string) (int, int) {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("EvictPathlessNodesByIDs")()
 	before := dw.prepareNodeEviction(ids)
 	nodes, edges := dw.work.EvictPathlessNodesByIDs(ids)
 	dw.markEvicted(before)
@@ -128,6 +139,7 @@ func (dw *DeltaWriter) EvictPathlessNodesByIDs(ids []string) (int, int) {
 func (dw *DeltaWriter) EvictConfigNodesByIDs(ids []string) (int, int) {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("EvictConfigNodesByIDs")()
 	before := dw.prepareNodeEviction(ids)
 	nodes, edges := dw.work.EvictConfigNodesByIDs(ids)
 	dw.markEvicted(before)
@@ -138,6 +150,7 @@ func (dw *DeltaWriter) EvictConfigNodesByIDs(ids []string) (int, int) {
 func (dw *DeltaWriter) ReplaceDerivedContracts(replacement DerivedContractReplacement) (DerivedContractReplaceResult, error) {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("ReplaceDerivedContracts")()
 	var sources, paths []string
 	for _, e := range replacement.RemoveEdges {
 		if e != nil && !dw.edgeHome(e.From, e.FilePath) {
@@ -175,7 +188,7 @@ func (dw *DeltaWriter) persistStored(e *Edge) {
 	if e == nil {
 		return
 	}
-	dw.prepareEdgeWrite(e.From, e.FilePath)
+	dw.claimSources(dw.claimRows([]edgeKey{keyOf(e)}, true))
 	stored := dw.work.storedEdge(keyOf(e))
 	if stored == nil || stored == e {
 		return
@@ -192,6 +205,7 @@ func (dw *DeltaWriter) persistStored(e *Edge) {
 func (dw *DeltaWriter) PersistEdgeAttributes(e *Edge) {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("PersistEdgeAttributes")()
 	dw.persistStored(e)
 }
 
@@ -199,6 +213,7 @@ func (dw *DeltaWriter) PersistEdgeAttributes(e *Edge) {
 func (dw *DeltaWriter) PersistEdgeAttributesBatch(edges []*Edge) {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("PersistEdgeAttributesBatch")()
 	for _, e := range edges {
 		dw.persistStored(e)
 	}
@@ -210,6 +225,7 @@ func (dw *DeltaWriter) PersistEdgeAttributesBatch(edges []*Edge) {
 func (dw *DeltaWriter) PersistEdgeTerminalStamps(edges []*Edge) {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("PersistEdgeTerminalStamps")()
 	for _, e := range edges {
 		dw.persistStored(e)
 	}

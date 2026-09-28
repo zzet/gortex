@@ -738,7 +738,7 @@ func (v *OverlaidView) baseEdgeVisible(e *Edge) bool {
 	if v.layer == nil {
 		return true
 	}
-	if v.overlayOwnsBaseEdge(e.From, e.FilePath) {
+	if v.overlayOwnsBaseEdge(e.From, e.FilePath) || v.overlayClaimsBaseEdge(e) {
 		return false
 	}
 	return v.overlayIdentityVisible(e.From) && v.overlayIdentityVisible(e.To)

@@ -167,6 +167,7 @@ func deltaNodeSetsEqual(a, b []*Node) bool {
 func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 	dw.writeMu.Lock()
 	defer dw.writeMu.Unlock()
+	defer dw.claimingFor("Payload")()
 	var out DeltaPayload
 
 	dw.layer.mu.RLock()
@@ -326,6 +327,13 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 	}
 	for _, id := range dw.unreferencedBuiltins() {
 		tombstoned[id] = struct{}{}
+	}
+
+	// Edge-claimed sources: nothing where the claimed rows ended equal to the
+	// rows they hid, a whole claim (and so the marker rule below) otherwise.
+	if promoted := dw.settleEdgeClaims(tombstoned, inFinal, identityVisible, &out); len(promoted) > 0 {
+		claimed = append(claimed, promoted...)
+		sort.Strings(claimed)
 	}
 
 	// Claimed sources: a marker exactly where the final outgoing set, outside
