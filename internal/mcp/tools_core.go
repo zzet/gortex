@@ -3507,14 +3507,42 @@ func (s *Server) handleGetCluster(ctx context.Context, req mcp.CallToolRequest) 
 }
 
 func (s *Server) handleGraphStats(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return s.respondJSONOrTOON(ctx, req, s.buildGraphStatsPayload(ctx))
+	payload, err := s.buildGraphStatsPayloadContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.respondJSONOrTOON(ctx, req, payload)
 }
 
 // buildGraphStatsPayload returns the same data the `graph_stats` tool
 // emits. Shared with the `gortex://stats` resource so both surfaces
 // stay byte-for-byte equal.
 func (s *Server) buildGraphStatsPayload(ctx context.Context) map[string]any {
-	stats := s.engineFor(ctx).Stats()
+	return s.buildGraphStatsPayloadFromStats(ctx, s.engineFor(ctx).Stats())
+}
+
+func (s *Server) buildGraphStatsPayloadContext(ctx context.Context) (map[string]any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stats, err := s.engineFor(ctx).StatsContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	payload := s.buildGraphStatsPayloadFromStats(ctx, stats)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func (s *Server) buildGraphStatsPayloadFromStats(ctx context.Context, stats *graph.GraphStats) map[string]any {
 	result := map[string]any{
 		"total_nodes": stats.TotalNodes,
 		"total_edges": stats.TotalEdges,

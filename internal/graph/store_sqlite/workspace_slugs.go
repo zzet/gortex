@@ -138,6 +138,8 @@ func workspaceSlugValues(slugs []graph.WorkspaceSlug) (string, []any) {
 // relation is a constant VALUES table with no generation of its own, so pairing
 // means holding the joined node row to the writing handle's generation: a
 // backfill through generation 1 must neither count nor fill generation 0's rows.
+// Reuse the same missing-ownership frontier as the existence probe: a positive
+// probe must not turn the count and update into complete repository scans.
 func workspaceSlugResolutionImpact(viewGen int64, slugs []graph.WorkspaceSlug) (string, []any) {
 	values, args := workspaceSlugValues(slugs)
 	// Builtin stubs are target-only synthetic sentinels. They are physically
@@ -147,8 +149,8 @@ func workspaceSlugResolutionImpact(viewGen int64, slugs []graph.WorkspaceSlug) (
 	args = append(args, graph.KindBuiltin, viewGen)
 	query := `WITH updates(repo_prefix, workspace_id, project_id) AS (VALUES ` + values + `)
 	SELECT COUNT(*)
-	FROM nodes AS n
-	JOIN updates AS u ON n.repo_prefix = u.repo_prefix
+	FROM updates AS u
+	CROSS JOIN nodes AS n INDEXED BY nodes_missing_workspace_slugs ON n.repo_prefix = u.repo_prefix
 	WHERE n.workspace_id = ''
 		AND u.workspace_id <> ''
 		AND u.workspace_id <> n.repo_prefix
@@ -161,7 +163,7 @@ func workspaceSlugUpdate(viewGen int64, slugs []graph.WorkspaceSlug) (string, []
 	values, args := workspaceSlugValues(slugs)
 	args = append(args, viewGen)
 	query := `WITH updates(repo_prefix, workspace_id, project_id) AS (VALUES ` + values + `)
-	UPDATE nodes AS n
+	UPDATE nodes AS n INDEXED BY nodes_missing_workspace_slugs
 	SET workspace_id = CASE
 			WHEN n.workspace_id = '' AND u.workspace_id <> '' THEN u.workspace_id
 			ELSE n.workspace_id
@@ -173,6 +175,7 @@ func workspaceSlugUpdate(viewGen int64, slugs []graph.WorkspaceSlug) (string, []
 	FROM updates AS u
 	WHERE n.repo_prefix = u.repo_prefix
 		AND n.view_gen = ?
+		AND (n.workspace_id = '' OR n.project_id = '')
 		AND ((n.workspace_id = '' AND u.workspace_id <> '')
 			OR (n.project_id = '' AND u.project_id <> ''))`
 	return query, args

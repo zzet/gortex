@@ -256,6 +256,25 @@ func normalizeProjectionExtensions(extensions []string) []string {
 
 // RepoNodesByKindsWithMetaKey performs one repository/workspace/kind query and
 // decodes only nodes carrying the requested metadata key.
+func repoNodesByKindsWithMetaKeyQuery(withWorkspace bool) string {
+	query := `
+WITH requested_kinds(kind) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+), selected_ids(id) AS (
+    SELECT candidate.id
+    FROM requested_kinds AS k
+    CROSS JOIN nodes AS candidate
+        ON candidate.repo_prefix = ? AND candidate.kind = k.kind AND candidate.view_gen = ?
+)
+SELECT ` + qualifiedNodeColumns("n", lookupNodeCols) + `
+FROM selected_ids AS selected
+CROSS JOIN nodes AS n ON n.id = selected.id AND n.view_gen = ?`
+	if withWorkspace {
+		query += ` WHERE n.workspace_id = ?`
+	}
+	return query
+}
+
 func (s *Store) RepoNodesByKindsWithMetaKey(repoPrefix, workspaceID string, kinds []graph.NodeKind, metaKey string) []*graph.Node {
 	if len(kinds) == 0 || metaKey == "" {
 		return nil
@@ -268,18 +287,11 @@ func (s *Store) RepoNodesByKindsWithMetaKey(repoPrefix, workspaceID string, kind
 	if !ok {
 		return nil
 	}
-	query := `SELECT ` + qualifiedNodeColumns("n", lookupNodeCols) + `
-FROM nodes AS n
-JOIN json_each(?) AS requested_kind ON CAST(requested_kind.value AS TEXT) = n.kind
-WHERE n.repo_prefix = ?`
-	args := []any{kindsJSON, repoPrefix}
+	args := []any{kindsJSON, repoPrefix, s.viewGen, s.viewGen}
 	if workspaceID != "" {
-		query += ` AND n.workspace_id = ?`
 		args = append(args, workspaceID)
 	}
-	query += ` AND n.view_gen = ? ORDER BY n.id`
-	args = append(args, s.viewGen)
-	candidates := s.scanNodeQuery(query, args...)
+	candidates := s.scanNodeQuery(repoNodesByKindsWithMetaKeyQuery(workspaceID != ""), args...)
 	out := candidates[:0]
 	for _, node := range candidates {
 		if node == nil || node.Meta == nil {
@@ -289,6 +301,7 @@ WHERE n.repo_prefix = ?`
 			out = append(out, node)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
@@ -321,7 +334,11 @@ func (s *Store) RepoEdgesByKinds(repoPrefixes []string, kinds []graph.EdgeKind) 
 	if !ok {
 		return nil
 	}
-	rows, err := s.db.Query(repoEdgesByKindsQuery(), reposJSON, kindsJSON, s.viewGen)
+	query := repoEdgesByKindsQuery()
+	if repoEdgesUseKindFirstPlan(kinds) {
+		query = repoContractEdgesByKindsQuery()
+	}
+	rows, err := s.db.Query(query, reposJSON, kindsJSON, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -366,6 +383,43 @@ func (s *Store) RepoEdgesByKinds(repoPrefixes []string, kinds []graph.EdgeKind) 
 		return a.Edge.Line < b.Edge.Line
 	})
 	return out
+}
+
+func repoEdgesUseKindFirstPlan(kinds []graph.EdgeKind) bool {
+	if len(kinds) == 0 {
+		return false
+	}
+	for _, kind := range kinds {
+		switch kind {
+		case graph.EdgeProvides, graph.EdgeConsumes:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// repoContractEdgesByKindsQuery drives the two sparse durable contract-owner
+// kinds before hydrating their source nodes. Unary plus keeps generation
+// equality exact while preventing SQLite from preferring the broad generation
+// index over the sparse kind seek; unlike INDEXED BY, it remains valid while
+// optional indexes are absent. The generic query remains repository-first
+// because common edge kinds can span most of the graph.
+func repoContractEdgesByKindsQuery() string {
+	return `
+WITH requested_repos(repo_prefix) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+), requested_kinds(kind) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+)
+SELECT n.repo_prefix,
+       e.from_id, e.to_id, e.kind, e.file_path, e.line,
+	       e.confidence, e.confidence_label, e.origin, e.tier,
+	       e.cross_repo, e.meta, e.resolve_terminal, e.resolve_terminal_reason, e.semantic_source
+FROM requested_kinds AS k
+CROSS JOIN edges AS e ON e.kind = k.kind AND +e.view_gen = ?
+CROSS JOIN nodes AS n ON n.id = e.from_id AND n.view_gen = e.view_gen
+CROSS JOIN requested_repos AS r ON r.repo_prefix = n.repo_prefix`
 }
 
 func repoEdgesByKindsQuery() string {

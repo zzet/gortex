@@ -318,11 +318,12 @@ type OverlaidView struct {
 	base  Reader
 	layer OverlayLayerReader
 
-	// statsOnce caches the (potentially expensive) Stats walk so
-	// repeated calls within one request don't pay the AllNodes /
-	// AllEdges cost twice.
-	statsOnce sync.Once
-	stats     GraphStats
+	// statsMu guards the first complete statistics result shared by Stats and
+	// StatsContext. Computation stays outside the lock so a canceled caller
+	// never waits behind another first call; concurrent first calls may duplicate
+	// work, and the first complete success becomes the request-local cache.
+	statsMu sync.Mutex
+	stats   *GraphStats
 }
 
 // NewOverlaidView builds a view over the in-memory layer. If layer is
@@ -1022,6 +1023,19 @@ func (v *OverlaidView) NodesByKind(kind NodeKind) iter.Seq[*Node] {
 		if v.layer == nil {
 			return
 		}
+		if byKind, ok := v.layer.(interface {
+			NodesByKind(NodeKind) iter.Seq[*Node]
+		}); ok {
+			for n := range byKind.NodesByKind(kind) {
+				if n == nil || n.Kind != kind {
+					continue
+				}
+				if !yield(n) {
+					return
+				}
+			}
+			return
+		}
 		for n := range v.layer.Nodes() {
 			if n == nil || n.Kind != kind {
 				continue
@@ -1148,21 +1162,10 @@ func (v *OverlaidView) EdgeIdentityRevisions() int {
 //     per-language rollup, and recomputing one means walking every
 //     node in the graph.
 //
-// Caching keeps repeated Stats() calls inside one request to a single
-// base lookup.
+// After the first complete result, caching keeps repeated Stats and
+// StatsContext calls inside one request from repeating the base lookup.
 func (v *OverlaidView) Stats() GraphStats {
-	if v.base == nil {
-		return GraphStats{}
-	}
-	v.statsOnce.Do(func() {
-		v.stats = v.base.Stats()
-		if v.layer == nil {
-			return
-		}
-		v.stats.TotalNodes += v.nodeCountDelta()
-		v.stats.TotalEdges += v.EdgeCount() - v.base.EdgeCount()
-	})
-	return v.stats
+	return v.statsLegacy()
 }
 
 // RepoStats returns base's per-repo rollup with the overlay's node and
