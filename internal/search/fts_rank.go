@@ -273,6 +273,90 @@ func FTSNonASCIIRows() (tokenized, refused int64) {
 	return ftsNonASCIIRows.Load(), ftsWholeReadRefused.Load()
 }
 
+// FTSFreshRowsSource is a FTSRankSource that hands over, once, the rows a
+// generation's build wrote (the store's fresh-rows hand-off), so the first
+// search over a new generation reads none of its documents.
+type FTSFreshRowsSource interface {
+	TakeFreshGenerationRows(generation int64) (rows []FTSRankRow, complete bool)
+}
+
+// ftsFreshPendingMax bounds the handed-over generations waiting for their
+// first query.
+const ftsFreshPendingMax = 64
+
+// ftsFreshAdopted / ftsFreshRejected count handed-over generations used as the
+// generation's documents, and ones that did not match the generation's
+// statistics (diagnostics and tests).
+var (
+	ftsFreshAdopted  atomic.Int64
+	ftsFreshRejected atomic.Int64
+)
+
+// FTSFreshCounts reports how many handed-over generations were used, and how
+// many were refused for not matching the generation's statistics.
+func FTSFreshCounts() (adopted, rejected int64) {
+	return ftsFreshAdopted.Load(), ftsFreshRejected.Load()
+}
+
+// AdoptFresh takes generation's handed-over rows from the source, if it offers
+// complete ones, and keeps them for the generation's first query. It reads
+// nothing from the store (the hand-off is in memory), so the route pre-warm
+// calls it inside the publication. It reports whether rows were taken.
+func (r *FTSRanker) AdoptFresh(generation int64) bool {
+	src, ok := r.src.(FTSFreshRowsSource)
+	if !ok || generation <= 0 {
+		return false
+	}
+	rows, complete := src.TakeFreshGenerationRows(generation)
+	if !complete || len(rows) == 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fresh == nil {
+		r.fresh = make(map[int64][]FTSRankRow)
+	}
+	r.fresh[generation] = rows
+	r.freshOrder = append(r.freshOrder, generation)
+	for len(r.freshOrder) > ftsFreshPendingMax {
+		delete(r.fresh, r.freshOrder[0])
+		r.freshOrder = r.freshOrder[1:]
+	}
+	return true
+}
+
+// takeFresh returns and forgets generation's pending handed-over rows.
+func (r *FTSRanker) takeFresh(generation int64) []FTSRankRow {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rows, ok := r.fresh[generation]
+	if !ok {
+		return nil
+	}
+	delete(r.fresh, generation)
+	for i, g := range r.freshOrder {
+		if g == generation {
+			r.freshOrder = append(r.freshOrder[:i], r.freshOrder[i+1:]...)
+			break
+		}
+	}
+	return rows
+}
+
+// AdoptFreshFTSRows hands generation's fresh rows to the ranker of
+// searcher's store core (FTSRanker.AdoptFresh).
+func AdoptFreshFTSRows(searcher any, generation int64) bool {
+	src, ok := ftsRankSourceOf(searcher)
+	if !ok {
+		return false
+	}
+	r := ftsRankerFor(src)
+	if r == nil {
+		return false
+	}
+	return r.AdoptFresh(generation)
+}
+
 // FTSGenerationRun is a generation's document count and first and last rowid.
 // Known is false when the run is not reported (the base, one being
 // built).
@@ -468,6 +552,8 @@ type FTSRanker struct {
 
 	docs         map[int64]*ftsGenerationDocs
 	docsLRU      *list.List // generation (int64), most recently used first
+	fresh        map[int64][]FTSRankRow
+	freshOrder   []int64
 	docsBytes    int64
 	entriesBytes int64
 
@@ -590,6 +676,17 @@ func (r *FTSRanker) generationDocsFor(ctx context.Context, generation int64, war
 	}
 	if whole {
 		var rows []FTSRankRow
+		// The rows the generation's build handed over serve instead of a read
+		// when they are exactly the generation's: its document count and first
+		// and last rowid, from the statistics just read.
+		if fresh := r.takeFresh(generation); fresh != nil {
+			if int64(len(fresh)) == run.Docs && (!run.Known || (fresh[0].Rowid == run.Lo && fresh[len(fresh)-1].Rowid == run.Hi)) {
+				rows = fresh
+				ftsFreshAdopted.Add(1)
+			} else {
+				ftsFreshRejected.Add(1)
+			}
+		}
 		if rows == nil {
 			ftsWholeReads.Add(1)
 			ftsStoreReads.Add(1)

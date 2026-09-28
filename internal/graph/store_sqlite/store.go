@@ -1719,6 +1719,7 @@ func (s *Store) Close() error {
 		return nil
 	}
 	unwatchHolds(s.storeCore)
+	forgetFreshFTS(s.storeCore)
 	s.stopCheckpointLoop()
 	// Join the maintenance lane before anything is torn down: a pass in flight
 	// writes through the same pools this method is about to close, and it runs

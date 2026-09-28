@@ -181,6 +181,20 @@ func (a *storeFTSRankSource) SymbolFTSTokenize(ctx context.Context, texts []stri
 	return store_sqlite.SymbolFTSTokenize(ctx, texts)
 }
 
+// TakeFreshGenerationRows hands over the rows the generation's build wrote
+// (the store's fresh-rows hand-off; memory only, no read).
+func (a *storeFTSRankSource) TakeFreshGenerationRows(generation int64) ([]search.FTSRankRow, bool) {
+	rows, complete := a.s.TakeFreshSymbolFTSRows(generation)
+	if !complete {
+		return nil, false
+	}
+	out := make([]search.FTSRankRow, len(rows))
+	for i, r := range rows {
+		out[i] = search.FTSRankRow{Rowid: r.RowID, NodeID: r.NodeID, RepoPrefix: r.RepoPrefix, Tokens: r.Tokens, TokenCount: r.TokenCount}
+	}
+	return out, true
+}
+
 func (a *storeFTSRankSource) SymbolExactHitsViewGenerations(ctx context.Context, query string, repoPrefixes []string, viewGens []int64, limit int) (map[int64][]graph.SymbolHit, []int64, error) {
 	return a.exact.SymbolExactHitsViewGenerations(ctx, query, repoPrefixes, viewGens, limit)
 }

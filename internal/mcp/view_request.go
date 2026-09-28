@@ -298,8 +298,10 @@ func (s *Server) wireRoutePrewarm() {
 		}
 		if err == nil {
 			// No store read for the ranker here, inside the publication: the
-			// route is queued for a background worker to warm its
-			// generations.
+			// new top generation's rows are taken from the store's fresh-rows
+			// hand-off (memory), and the route is queued for a background
+			// worker to warm the generations below it.
+			search.AdoptFreshFTSRows(materializer.Store, generations[len(generations)-1])
 			s.queueRouteFTSWarm(materializer, generations)
 		}
 	})

@@ -124,6 +124,7 @@ func answerPathSnapshot(since int64) map[string]any {
 	installed, declined, preloads := graphview.RowsPreloadDiagnostics()
 	wholeReads, wholeSparse := search.FTSWholeReadCounts()
 	keptDocs, keptBytes := search.FTSKeptDocs()
+	freshAdopted, freshRejected := search.FTSFreshCounts()
 	nonASCIITokenized, wholeRefused := search.FTSNonASCIIRows()
 	views := search.FTSViewMatchDecisions()
 	wholes := search.FTSWholeReadDecisions()
@@ -160,6 +161,8 @@ func answerPathSnapshot(since int64) map[string]any {
 		"fts_kept_bytes":         keptBytes,
 		"fts_kept_evictions":     search.FTSDocsEvictions(),
 		"fts_store_reads":        search.FTSStoreReads(),
+		"fts_fresh_adopted":      freshAdopted,
+		"fts_fresh_rejected":     freshRejected,
 		"fts_non_ascii_rows":     nonASCIITokenized,
 		"fts_whole_read_refused": wholeRefused,
 		"fts_whole_read_recent":  wholes,

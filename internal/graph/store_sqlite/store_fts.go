@@ -113,6 +113,7 @@ type symbolFTSBatchStats struct {
 // appending bounded BatchUpsertSymbolFTS chunks, so no chunk can erase an
 // earlier one and no whole-repository token slice is retained in Go.
 func (s *Store) ResetSymbolFTS(repoPrefix string) error {
+	s.markFreshFTSIncomplete(s.viewGen) // a wipe the fresh-rows buffer does not follow
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	tx, err := s.beginWrite()
@@ -170,7 +171,11 @@ func (s *Store) BatchDeleteSymbolFTS(nodeIDs []string) error {
 	if err := s.deleteSymbolFTSTx(tx, ids); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.forgetFreshFTSNodes(s.viewGen, ids)
+	return nil
 }
 
 // deleteSymbolFTSTx deletes only the supplied IDs in the caller's existing
@@ -221,7 +226,7 @@ func dedupeSymbolFTSItems(items []graph.SymbolFTSItem) []graph.SymbolFTSItem {
 // open write transaction, advancing *nextRowid over the docids it allocates.
 // Shared by the incremental batch path and the whole-repository replacement so
 // the two cannot drift in how they derive ownership or reuse docids.
-func upsertSymbolFTSChunkTx(tx *sql.Tx, viewGen int64, chunk []graph.SymbolFTSItem, nextRowid *int64, stats *symbolFTSBatchStats) error {
+func upsertSymbolFTSChunkTx(tx *sql.Tx, viewGen int64, chunk []graph.SymbolFTSItem, nextRowid *int64, stats *symbolFTSBatchStats, collect *[]SymbolFTSRow) error {
 	type rowState struct {
 		repoPrefix string
 		rowid      int64
@@ -342,6 +347,11 @@ ORDER BY wanted.ord`)
 		return err
 	}
 	stats.ownershipStatements++
+	if collect != nil {
+		for i, item := range chunk {
+			*collect = append(*collect, SymbolFTSRow{RowID: states[i].rowid, NodeID: item.NodeID, RepoPrefix: states[i].repoPrefix, Tokens: item.Tokens})
+		}
+	}
 	return nil
 }
 
@@ -369,9 +379,14 @@ func (s *Store) batchUpsertSymbolFTS(items []graph.SymbolFTSItem) (symbolFTSBatc
 	}
 	stats.allocatorQueries++
 
+	var fresh *[]SymbolFTSRow
+	if s.viewGen > baseViewGeneration && !freshFTSOff.Load() {
+		collected := make([]SymbolFTSRow, 0, len(items))
+		fresh = &collected
+	}
 	for start := 0; start < len(items); start += ftsInsertChunkRows {
 		end := minInt(start+ftsInsertChunkRows, len(items))
-		if err := upsertSymbolFTSChunkTx(tx, s.viewGen, items[start:end], &nextRowid, &stats); err != nil {
+		if err := upsertSymbolFTSChunkTx(tx, s.viewGen, items[start:end], &nextRowid, &stats, fresh); err != nil {
 			return stats, err
 		}
 	}
@@ -380,6 +395,9 @@ func (s *Store) batchUpsertSymbolFTS(items []graph.SymbolFTSItem) (symbolFTSBatc
 		return stats, err
 	}
 	stats.commits++
+	if fresh != nil {
+		s.recordFreshFTS(s.viewGen, *fresh)
+	}
 	return stats, nil
 }
 
@@ -400,6 +418,7 @@ func (s *Store) ReplaceSymbolFTS(repoPrefix string, produce func(emit func([]gra
 	if produce == nil {
 		return nil
 	}
+	s.markFreshFTSIncomplete(s.viewGen) // a replacement the fresh-rows buffer does not follow
 	if s.db == s.writerDB {
 		return fmt.Errorf("store_sqlite: ReplaceSymbolFTS needs independent read and write pools; %q shares one handle", s.dbPath)
 	}
@@ -438,7 +457,7 @@ func (s *Store) ReplaceSymbolFTS(repoPrefix string, produce func(emit func([]gra
 		items = dedupeSymbolFTSItems(items)
 		for start := 0; start < len(items); start += ftsInsertChunkRows {
 			end := minInt(start+ftsInsertChunkRows, len(items))
-			if err := upsertSymbolFTSChunkTx(tx, s.viewGen, items[start:end], &nextRowid, &stats); err != nil {
+			if err := upsertSymbolFTSChunkTx(tx, s.viewGen, items[start:end], &nextRowid, &stats, nil); err != nil {
 				return err
 			}
 		}
@@ -469,6 +488,7 @@ func (s *Store) BulkUpsertSymbolFTS(repoPrefix string, items []graph.SymbolFTSIt
 	if len(items) == 0 {
 		return nil
 	}
+	s.markFreshFTSIncomplete(s.viewGen) // a bulk write the fresh-rows buffer does not follow
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
