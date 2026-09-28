@@ -294,9 +294,16 @@ func (idx *Indexer) reindexIncrementalChunk(
 		// structural stage whatever its fingerprints say
 		// (deletion_importers.go).
 		forced := idx.forceReparse(filePath)
-		if !forced && probeOK && storedGraph.semantic != "" &&
+		inert := probeOK && storedGraph.semantic != "" &&
 			probe.fingerprints.semantic == storedGraph.semantic &&
-			probe.fingerprints.metadata == storedGraph.metadata {
+			probe.fingerprints.metadata == storedGraph.metadata
+		if forced && inert && idx.inertReparsed != nil && !idx.forceReparseDropsResolutions(filePath) {
+			// The delta's change set is re-derived whatever its
+			// fingerprints say; an inert one has its prior rows restated
+			// after the passes (edit_delta.go).
+			idx.inertReparsed[graphPath] = struct{}{}
+		}
+		if !forced && inert {
 			idx.discardPreparedExtraction(filePath)
 			receipts = append(receipts, fileReadReceipt{
 				absPath: filePath, mtimeKey: idx.relKey(filePath), readVersion: probe.readVersion,
@@ -956,6 +963,8 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	// the ones whose SOURCE survives, so an edge the restub frontier left
 	// alone has to be re-stated here or it is lost. See
 	// restubIncomingRefsFromView.
+	// A function re-derived unchanged keeps its clone rows (clone_carry.go).
+	carried = append(carried, idx.carryCloneRowsOfUnchangedBodies(stages, view, nodes)...)
 	idx.graph.AddBatch(nodes, append(edges, carried...))
 	idx.applyLap("add_batch")
 	idx.relinkImportNodesToModules(nodes)

@@ -519,6 +519,11 @@ type Indexer struct {
 	// surviving importers of a deleted file (deletion_importers.go). Set and
 	// cleared by reindexIncrementalFilesBatched, under the repository lane.
 	forcedReparse map[string]struct{}
+	// cloneRecompute names the graph paths whose clone rows a per-file delta
+	// recomputes rather than carries, and cloneChangedBodies collects the
+	// graph paths holding a changed body (clone_carry.go).
+	cloneRecompute     map[string]struct{}
+	cloneChangedBodies map[string]struct{}
 	// reparseKeepingResolutions names files (absolute, cleaned) re-derived
 	// from source whatever their fingerprints say, whose prior resolutions
 	// nonetheless stay reusable: the per-file delta's own change set (it must
@@ -526,6 +531,11 @@ type Indexer struct {
 	// nothing changed what the file's references bind to). forcedReparse, by
 	// contrast, also drops the file's reuse snapshot.
 	reparseKeepingResolutions map[string]struct{}
+	// inertReparsed collects the graph paths of the change set whose content
+	// fingerprints call the save inert, re-derived only because the per-file
+	// delta forces its change set: the delta restates their prior rows
+	// (graph.DeltaWriter.RestateBelowRows), as the primary path keeps them.
+	inertReparsed map[string]struct{}
 	// priorFingerprints, when set, supplies the content fingerprints of a
 	// changed file's prior rows when they carry none (a per-file delta over a
 	// stack written before fingerprints were stamped).

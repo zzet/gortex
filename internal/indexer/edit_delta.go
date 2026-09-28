@@ -160,6 +160,10 @@ type EditDeltaReport struct {
 	// delta's ownership that restated a row the view below serves, removed
 	// before publication (edit_delta_enrich.go).
 	EnrichmentRestated int
+	// EnrichmentNodeClaims counts nodes the enrichment stage wrote outside the
+	// delta's ownership whose identity the view below serves, published under
+	// an identity replacement claim (edit_delta_enrich.go).
+	EnrichmentNodeClaims int
 	// PageFaults / BlockReads are the process's major page faults and block
 	// reads while the delta ran (getrusage; the whole process, so concurrent
 	// work is included): the store pages the delta had to bring in.
@@ -193,6 +197,9 @@ type EditDeltaReport struct {
 	// ChainKeeper is the per-layer keeper's counters after the delta:
 	// layers, rows, hits, loads, declined.
 	ChainKeeper [5]int
+	// InertRestated is how many change-set files had an inert save and keep
+	// the rows the view below holds.
+	InertRestated int
 	// AffectedByKeys is how many declarations of the changed files the
 	// affected-by plan found changed in shape, AffectedByKeySample the first
 	// of them, and AffectedByFiles how many referrer files it re-resolved.
@@ -346,6 +353,11 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 		}
 		if len(report.Enrichment.Ran) > 0 {
 			delta.EnrichmentRestated = editDeltaSettleEnrichment(handle, req.Base, delta.ownership)
+			claimed, err := editDeltaClaimEnrichedNodes(handle, req.Base, delta.ownership)
+			if err != nil {
+				return fmt.Errorf("indexer: claim enrichment-restated nodes: %w", err)
+			}
+			delta.EnrichmentNodeClaims = claimed
 		}
 		if b.Logger != nil {
 			b.Logger.Info("indexer: working-tree edit delta enrichment",
@@ -362,7 +374,8 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 				zap.Int64("major_faults", editDeltaProcessIO().since(enrichIO).majorFaults),
 				zap.Int64("wal_bytes", store_sqlite.WALWrittenBetween(enrichWAL, handle.WALWriteMark()).Bytes),
 				zap.Int64("write_tx", store_sqlite.WriteTransactionsBegun()-enrichTx),
-				zap.Int("restated", delta.EnrichmentRestated))
+				zap.Int("restated", delta.EnrichmentRestated),
+				zap.Int("node_claims", delta.EnrichmentNodeClaims))
 		}
 		report.Work.mark("enrich")
 		markPublicationPhase(ctx, PublicationSemanticDone)
@@ -570,6 +583,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	}
 	chainTouched := dw.ChainTouchedPaths()
 	idx := New(dw, b.Registry, b.Config, b.Logger)
+	idx.cloneRecompute = cloneRecomputePaths(req.RepoPrefix, req.RecomputeDerivedPaths)
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
 	if store := b.Store; store != nil {
@@ -706,6 +720,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// The change set is re-derived from source whatever its fingerprints
 	// say, and its prior resolutions stay reusable (the shape-keyed reuse and
 	// the prior-binding carry): nothing but the files themselves changed.
+	idx.inertReparsed = make(map[string]struct{})
 	idx.reparseKeepingResolutions = make(map[string]struct{}, len(plan.indexed))
 	for _, rel := range plan.indexed {
 		idx.reparseKeepingResolutions[filepath.Clean(filepath.Join(req.RootPath, filepath.FromSlash(rel)))] = struct{}{}
@@ -790,6 +805,21 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	}
 	idx.incrementalCatchupHook = nil
 	report.Work.mark("pass")
+	report.ChangedBodyFiles = idx.cloneChangedBodyFiles()
+
+	// A change-set file whose save is inert (its content fingerprints are
+	// the stored ones) keeps the rows the view below holds, as the primary
+	// per-save path keeps them: what the engine re-derived for it is replaced.
+	if len(idx.inertReparsed) > 0 {
+		inert := make([]string, 0, len(idx.inertReparsed))
+		for p := range idx.inertReparsed {
+			inert = append(inert, p)
+		}
+		sort.Strings(inert)
+		_, _, skipped := dw.RestateBelowRows(inert)
+		out.InertRestated = len(inert) - len(skipped)
+	}
+	idx.inertReparsed = nil
 
 	fixed := make(map[string]struct{}, len(out.Paths))
 	for _, rel := range out.Paths {

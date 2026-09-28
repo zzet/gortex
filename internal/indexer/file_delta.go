@@ -322,7 +322,11 @@ func fingerprintMetaKeys(meta map[string]any, mode fingerprintMode, keepPresenta
 	}
 	keys := make([]string, 0, len(meta))
 	for key := range meta {
-		if isFingerprintMeta(key) {
+		// The body identity is presentation to the semantic and derived
+		// digests, but the metadata digest carries it: an edit inside a body
+		// too short to shingle (a comment, a literal) moves nothing else, and
+		// an inert verdict would keep the prior row's identity.
+		if isFingerprintMeta(key) || key == cloneBodyMetaKey && mode != fingerprintMetadata {
 			continue
 		}
 		if mode != fingerprintMetadata && (!keepPresentation || mode == fingerprintDerived) {
@@ -347,7 +351,7 @@ func fingerprintMetaKeys(meta map[string]any, mode fingerprintMode, keepPresenta
 // reusing that digest removes a third full field/hash pass from cold indexing.
 func semanticFingerprintCoversDerived(meta map[string]any, keepPresentation bool) bool {
 	for key := range meta {
-		if isFingerprintMeta(key) {
+		if isFingerprintMeta(key) || key == cloneBodyMetaKey {
 			continue
 		}
 		if _, presentation := presentationMetaKeys[key]; presentation {

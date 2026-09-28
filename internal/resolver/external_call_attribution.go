@@ -97,10 +97,25 @@ func (r *Resolver) attributeGoExternalCallsForFile(filePath string) {
 	r.materializeGoExternalSeen(seen)
 }
 
+// goExternalAttribKindSet is goExternalAttribKinds as a set.
+var goExternalAttribKindSet = func() map[graph.EdgeKind]struct{} {
+	out := make(map[graph.EdgeKind]struct{}, len(goExternalAttribKinds))
+	for _, k := range goExternalAttribKinds {
+		out[k] = struct{}{}
+	}
+	return out
+}()
+
 // collectGoExternalTarget records e's external target (if any) into seen,
-// deduping by the per-repo (prefix, path, symbol) tuple.
+// deduping by the per-repo (prefix, path, symbol) tuple. Only the kinds the
+// whole-graph sweep reads count: a file's import edge to `external::os`
+// would otherwise materialize a module node (unscoped, since the import
+// target carries no repository) that a whole index never has.
 func collectGoExternalTarget(e *graph.Edge, seen map[extKey]struct{}) {
 	if e == nil || e.To == "" {
+		return
+	}
+	if _, attributed := goExternalAttribKindSet[e.Kind]; !attributed {
 		return
 	}
 	collectGoExternalTargetID(e.To, seen)

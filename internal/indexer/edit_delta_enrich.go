@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"sort"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -81,4 +82,64 @@ func editDeltaSettleEnrichment(handle *store_sqlite.Store, below graph.Reader, o
 		return 0
 	}
 	return handle.RemoveEdgesExact(restated)
+}
+
+// editDeltaClaimEnrichedNodes gives an identity replacement claim to every
+// node the enrichment stage wrote outside the delta's ownership whose identity
+// the view below already serves. The stage reads the generation handle, so it
+// re-emits a row a lower generation of the chain carries (the go/types pass's
+// external symbols and module nodes, at `external::go:<path>`); no file mask
+// reaches such a row, and without a claim the composition would serve both
+// copies. Under the claim it serves this generation's copy only, the row the
+// primary per-save path upserts over the one it held. It returns how many it
+// claimed.
+func editDeltaClaimEnrichedNodes(handle *store_sqlite.Store, below graph.Reader, own editDeltaOwnership) (int, error) {
+	var ids []string
+	for _, n := range handle.AllNodesLight() {
+		if n == nil || n.ID == "" {
+			continue
+		}
+		if _, ok := own.paths[n.FilePath]; ok {
+			continue
+		}
+		if _, ok := own.sources[n.ID]; ok {
+			continue
+		}
+		ids = append(ids, n.ID)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	masks, err := handle.NodeIdentityMasksContext(context.Background())
+	if err != nil {
+		return 0, err
+	}
+	claimed := make(map[string]struct{}, len(masks))
+	for _, m := range masks {
+		claimed[m.NodeID] = struct{}{}
+	}
+	open := ids[:0]
+	for _, id := range ids {
+		if _, ok := claimed[id]; !ok {
+			open = append(open, id)
+		}
+	}
+	if len(open) == 0 {
+		return 0, nil
+	}
+	served := below.GetNodesByIDs(open)
+	var claims []string
+	for _, id := range open {
+		if served[id] != nil {
+			claims = append(claims, id)
+		}
+	}
+	if len(claims) == 0 {
+		return 0, nil
+	}
+	sort.Strings(claims)
+	if err := handle.SetNodeIdentityReplacements(claims); err != nil {
+		return 0, err
+	}
+	return len(claims), nil
 }

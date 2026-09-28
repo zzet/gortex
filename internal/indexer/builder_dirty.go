@@ -55,6 +55,8 @@ func (e *DirtySnapshotChangedError) Retryable() bool { return true }
 
 // DirtyLayerRequest is one working-tree-layer build.
 type DirtyLayerRequest struct {
+	// RecomputeDerivedPaths: see BuildRequest.RecomputeDerivedPaths.
+	RecomputeDerivedPaths []string
 	// Identity names the generation. GenerationKind, TreeOID,
 	// ProvenanceCommitOID and LowerViewFingerprint are stamped by the builder
 	// from the dirty sample, so two builds of the same working-tree state
@@ -334,7 +336,8 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	clock.lap("prepare_chain_census")
 
 	generationID, report, err := b.buildWorkingTreeLayer(ctx, BuildRequest{
-		Identity: identity,
+		Identity:              identity,
+		RecomputeDerivedPaths: req.RecomputeDerivedPaths,
 		// A delta over a parent stands on the parent's dirty chain: its
 		// per-stack caches are the commit stack's, with the chain composed
 		// per read (edit_delta_contract_cache.go).

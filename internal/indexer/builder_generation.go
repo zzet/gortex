@@ -178,6 +178,11 @@ type BuildRequest struct {
 	// Identity names the generation in the catalog.
 	Identity GenerationIdentity
 
+	// RecomputeDerivedPaths are repository-relative paths whose derived data
+	// a previous generation left behind (a follow-up names them): their
+	// clone rows are recomputed, never carried (clone_carry.go).
+	RecomputeDerivedPaths []string
+
 	// Base is the reader the affected closure is computed against: the layer
 	// the generation will sit on. It is read, never written.
 	Base LayerBase
@@ -311,6 +316,11 @@ type EnrichmentOutcome struct {
 // a path no mask claims.
 type BuildReport struct {
 	GenerationID int64
+
+	// ChangedBodyFiles are the graph paths of the files holding a function
+	// whose body the build re-derived changed (or new): their clone rows
+	// were not carried and are owed to the follow-up (clone_carry.go).
+	ChangedBodyFiles []string
 
 	// PrepublishIO is the pre-publish check's CPU, major faults and store
 	// reads and writes (storeWaitMillis), for the build's log line.
@@ -2559,6 +2569,12 @@ func (b *SparseGenerationBuilder) declareProducers(
 		similarity.State = store_sqlite.ProducerStateIncomplete
 		similarity.Reason = "near-duplicate detection ranks bodies against a corpus; " +
 			"a sparse generation ranks them against its file set"
+	}
+	if similarity.State == store_sqlite.ProducerStateIncomplete && len(report.ChangedBodyFiles) > 0 {
+		// The generation holds a body whose clone rows were not carried
+		// (clone_carry.go): they are owed to the follow-up, which is what the
+		// token says; a layer without one keeps the reason above for good.
+		similarity.Reason = graphview.ReasonDeferredToFollowup
 	}
 
 	// Literal and regex search is answered over a working copy on disk rather

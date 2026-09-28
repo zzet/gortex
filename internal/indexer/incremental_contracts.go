@@ -55,7 +55,7 @@ func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResu
 	files = idx.expandIncrementalContractFrontier(files, reg)
 	_, byLang := idx.buildPerFileContractExtractors()
 	result := contractRefreshResult{}
-	var changedFiles []string
+	var changedFiles, restated []string
 	priorIDs := make(map[string]struct{})
 	for start := 0; start < len(files); start += contractFrontierReadBatchSize {
 		end := start + contractFrontierReadBatchSize
@@ -82,6 +82,18 @@ func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResu
 				reg.ReplaceFile(graphPath, fresh)
 				changedFiles = append(changedFiles, graphPath)
 				result.Changed = true
+			} else if !idx.contractRowsPresent(fresh) {
+				// The records did not change, but the graph no longer holds
+				// them: the file's rows were re-derived (a delta that covers
+				// the path restates all of its rows, and the contract rows
+				// are not part of the parse). They are written again, with
+				// no frontier change: nothing a referrer binds to moved.
+				restated = append(restated, graphPath)
+				for _, contract := range fresh {
+					if contract.ID != "" {
+						priorIDs[contract.ID] = struct{}{}
+					}
+				}
 			}
 
 			idx.contractCacheMu.Lock()
@@ -95,10 +107,51 @@ func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResu
 	}
 	result.Groups = mergeContractGroups(nil, result.Groups...)
 	result.SymbolIDs = appendUniqueSorted(nil, result.SymbolIDs...)
-	if result.Changed {
-		idx.commitIncrementalContractFiles(reg, changedFiles, priorIDs)
+	if result.Changed || len(restated) > 0 {
+		idx.commitIncrementalContractFiles(reg, append(changedFiles, restated...), priorIDs)
 	}
 	return result
+}
+
+// contractRowsPresent reports whether the graph holds every record of list:
+// its contract node and, for a record with a symbol, an owner edge from that
+// symbol into it.
+func (idx *Indexer) contractRowsPresent(list []contracts.Contract) bool {
+	if len(list) == 0 {
+		return true
+	}
+	ids := make([]string, 0, len(list))
+	for _, c := range list {
+		if c.ID != "" {
+			ids = append(ids, c.ID)
+		}
+	}
+	ids = appendUniqueSorted(nil, ids...)
+	nodes := idx.graph.GetNodesByIDs(ids)
+	incoming := idx.graph.GetInEdgesByNodeIDs(ids)
+	for _, c := range list {
+		if c.ID == "" {
+			continue
+		}
+		if n := nodes[c.ID]; n == nil || n.Kind != graph.KindContract {
+			return false
+		}
+		if c.SymbolID == "" {
+			continue
+		}
+		owned := false
+		for _, e := range incoming[c.ID] {
+			if e != nil && e.From == c.SymbolID &&
+				(e.Kind == graph.EdgeProvides || e.Kind == graph.EdgeConsumes || e.Kind == graph.EdgeHandlesRoute) {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			return false
+		}
+	}
+	return true
 }
 
 func (idx *Indexer) isIncrementalContractManifest(absPath string) bool {
