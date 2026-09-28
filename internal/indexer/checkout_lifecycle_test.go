@@ -702,6 +702,9 @@ func TestCheckoutLifecycleUntrackSurfaceParity(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tracked.Prefix, result.Prefix)
 			assert.Equal(t, []string{string(tc.source)}, result.Revoked)
+			if result.Pending {
+				finishRepositoryCleanup(t, f.lc, tracked.Prefix)
+			}
 
 			checkouts, err := f.catalog.ListCheckouts(ctx, familyID)
 			require.NoError(t, err)

@@ -308,7 +308,17 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// final WAL checkpoint entirely. Both paths now run the same
 	// once-guarded func, and the deferred call covers whichever exit
 	// actually happens.
-	runTeardown := installDaemonTeardown(controller, controller.StopWatcher, func() error {
+	var retirementWorker *deferredRetirementWorker
+	if state.lifecycle != nil {
+		retirementWorker = startDeferredRetirementWorker(
+			state.lifecycle.SweepDeferredRetirements, logger)
+	}
+	defer retirementWorker.Stop()
+	stopBackground := func() {
+		controller.StopWatcher()
+		retirementWorker.Stop()
+	}
+	runTeardown := installDaemonTeardown(controller, stopBackground, func() error {
 		// Nothing has to be serialized here: per-file mtimes live in the
 		// FileMtime sidecar table, contract records ride on
 		// KindContract.Meta, and the vector index is persisted by the
@@ -525,6 +535,17 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		state.multiIndexer, state.lifecycle, reconcileInterval(), logger)
 	defer stopJanitor()
 
+	// Physical cleanup left by Seed runs only after the ready phase is
+	// published. Install and own the worker before enabling deferral so every
+	// deferred Seed has a cancellable, joined consumer. runDaemonStart invokes
+	// Seed exactly once for this lifecycle; a future additional Seed call must
+	// also install/restart a worker before inheriting this permanent opt-in.
+	deferredRetirements := retirementWorker
+	if state.lifecycle != nil {
+		// The hook-owned worker is fully installed before Seed can defer work.
+		state.lifecycle.EnableDeferredSeedRetirements()
+	}
+
 	if err := srv.Listen(); err != nil {
 		startupReporter.Fail(err)
 		return err
@@ -584,6 +605,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				"warmup_seconds": int64(elapsed.Seconds()),
 				"warmup_ms":      elapsed.Milliseconds(),
 			})
+			if deferredRetirements != nil {
+				deferredRetirements.MarkReady()
+			}
 		})
 		mw, warmup := warmupDaemonState(state, logger, markReady)
 		controller.AttachWatcher(mw)
@@ -757,7 +781,7 @@ func startReconcileJanitor(
 
 					swept := 0
 					if lifecycle != nil {
-						report, err := lifecycle.Sweep(janitorCtx)
+						report, err := lifecycle.SweepDeferredRetirement(janitorCtx)
 						if err != nil {
 							logger.Warn("janitor: checkout sweep incomplete", zap.Error(err))
 						}

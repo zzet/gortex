@@ -46,10 +46,13 @@ func (h *lifecycleFinishBoundaryHooks) prepareDrainedState(ctx context.Context, 
 	}
 	drained := make(chan struct{})
 	close(drained)
+	// A lane handle is valid only with the reservation token that
+	// beginRepositoryCleanupLane issues; this fixture stands in for an
+	// already-finalized lane, so it carries its own token.
 	state = &repositoryCleanupState{
 		graphID: graphID, identity: identity, owner: owner,
 		refs:      h.l.closeRepositoryRefViews(identity.RepoPrefix),
-		lane:      &repositoryCleanupLane{owner: h.l.mi, prefix: identity.RepoPrefix, done: drained, finalized: true},
+		lane:      &repositoryCleanupLane{owner: h.l.mi, prefix: identity.RepoPrefix, reservation: new(byte), done: drained, finalized: true},
 		publisher: drained, initialized: true, producersDone: drained,
 		attemptDone: make(chan struct{}), waitReady: drained,
 	}

@@ -55,10 +55,13 @@ func publisherFinalizationPrepare(t *testing.T, l *CheckoutLifecycle, identity s
 	awaitDedicatedDrain(t, publisher)
 	drained := make(chan struct{})
 	close(drained)
+	// A lane handle is valid only with the reservation token that
+	// beginRepositoryCleanupLane issues; this fixture stands in for an
+	// already-finalized lane, so it carries its own token.
 	state := &repositoryCleanupState{
 		graphID: identity.GraphID, identity: identity, owner: owner,
 		refs:      l.closeRepositoryRefViews(identity.RepoPrefix),
-		lane:      &repositoryCleanupLane{owner: l.mi, prefix: identity.RepoPrefix, done: drained, finalized: true},
+		lane:      &repositoryCleanupLane{owner: l.mi, prefix: identity.RepoPrefix, reservation: new(byte), done: drained, finalized: true},
 		publisher: publisher, initialized: true, producersDone: drained,
 		attemptDone: drained, waitReady: drained, payloadPurged: true,
 	}

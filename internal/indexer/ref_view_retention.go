@@ -144,6 +144,82 @@ func (l *CheckoutLifecycle) sweepRefViewRetention(ctx context.Context) int {
 	return retired
 }
 
+// queueRefViewRetirements applies the same retention decision as the
+// synchronous sweep, but only releases the ref-view pointer, persists the
+// generation as superseded, and hands physical deletion to the bounded
+// retirement worker. The catalog transition is durable before the in-memory
+// queue is updated, so a restart can rediscover every accepted generation.
+func (l *CheckoutLifecycle) queueRefViewRetirements(ctx context.Context) {
+	if l == nil || l.store == nil || l.catalog == nil {
+		return
+	}
+	rows, err := l.catalog.ListViewGenerations(ctx, store_sqlite.ViewGenerationFilter{
+		OwnerKind: refViewOwnerKind,
+	})
+	if err != nil {
+		l.logger.Debug("checkout lifecycle: could not scan ref view generations", zap.Error(err))
+		return
+	}
+	byGraph := map[string][]store_sqlite.ViewGeneration{}
+	states := make(map[int64]store_sqlite.ViewGenerationState, len(rows))
+	for _, row := range rows {
+		if row.GraphID == "" || row.GenerationID <= 0 {
+			continue
+		}
+		byGraph[row.GraphID] = append(byGraph[row.GraphID], row)
+		states[row.GenerationID] = row.State
+	}
+
+	for graphID, generations := range byGraph {
+		for _, candidate := range l.refViewEvictions(ctx, graphID, generations) {
+			if !l.queueRefViewRetirement(ctx, graphID, candidate, states[candidate.generationID]) {
+				continue
+			}
+			viewmetrics.Count(viewmetrics.RefViewEvictedTotal, candidate.reason)
+		}
+	}
+}
+
+// queueRefViewRetirement makes one retention decision durable before adding
+// it to the process-local worker queue. A pointed generation uses one catalog
+// transaction to delete only the exact pointer that was inspected and change
+// ready to superseded. An already-unpointed ready generation is first marked
+// superseded. Other eligible states are already rediscovered by the deferred
+// worker after restart.
+func (l *CheckoutLifecycle) queueRefViewRetirement(
+	ctx context.Context,
+	graphID string,
+	candidate refViewCandidate,
+	state store_sqlite.ViewGenerationState,
+) bool {
+	if candidate.refViewID != "" {
+		released, err := l.catalog.ReleaseRefViewGeneration(
+			ctx, candidate.refViewID, candidate.generationID,
+		)
+		if err != nil {
+			l.logger.Debug("checkout lifecycle: could not release an evicted ref view",
+				zap.String("ref_view", candidate.refViewID), zap.Error(err))
+			return false
+		}
+		if !released {
+			return false
+		}
+	} else if state == store_sqlite.ViewGenerationReady {
+		marked, err := l.catalog.MarkUnreferencedRefViewGenerationSuperseded(ctx, candidate.generationID)
+		if err != nil {
+			l.logger.Debug("checkout lifecycle: could not persist an unpointed ref view eviction",
+				zap.String("graph", graphID),
+				zap.Int64("generation", candidate.generationID), zap.Error(err))
+			return false
+		}
+		if !marked {
+			return false
+		}
+	}
+	l.oweRetirement(candidate.generationID)
+	return true
+}
+
 // refViewEvictions decides which of one graph's ref-view generations the
 // bounds no longer keep, oldest selection first.
 func (l *CheckoutLifecycle) refViewEvictions(

@@ -11,6 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // Retention fixture.
@@ -380,5 +381,160 @@ func TestRefViewRetentionDefaults(t *testing.T) {
 	}
 	if partial.RetainInactive != shipped.RetainInactive || partial.MaxBytesPerGraph != shipped.MaxBytesPerGraph {
 		t.Errorf("an unset bound was not filled from the defaults: %+v", partial)
+	}
+}
+
+func TestQueueRefViewRetirementIsDurableAndWaitsForLease(t *testing.T) {
+	f := newRetentionFixture(t, RefViewRetention{
+		RetainInactive:       time.Hour,
+		MaxCachedGenerations: 100,
+	})
+	f.lifecycle.owed = map[int64]struct{}{}
+	f.lifecycle.coordinators = map[string]*CheckoutCoordinator{}
+	stale := f.publishGeneration("queued-stale")
+	f.serve("queued-stale", stale, f.now.Add(-8*time.Hour))
+
+	lease := f.lifecycle.leases.Acquire(stale)
+	f.lifecycle.queueRefViewRetirements(context.Background())
+
+	if _, found, err := f.catalog.GetRefView(context.Background(), "queued-stale"); err != nil || found {
+		t.Fatalf("queued ref pointer survived: found=%v err=%v", found, err)
+	}
+	row, found, err := f.catalog.GetViewGeneration(context.Background(), stale)
+	if err != nil || !found {
+		t.Fatalf("read queued generation: found=%v err=%v", found, err)
+	}
+	if row.State != store_sqlite.ViewGenerationSuperseded {
+		t.Fatalf("queued generation state = %s, want superseded", row.State)
+	}
+
+	// Lose the process-local queue as a restart would. The catalog state must
+	// be sufficient for the worker to rediscover the generation.
+	f.lifecycle.coordMu.Lock()
+	delete(f.lifecycle.owed, stale)
+	f.lifecycle.coordMu.Unlock()
+	retired, pending, err := f.lifecycle.SweepDeferredRetirements(context.Background())
+	// A leased generation is expected retention, not an operational error:
+	// the worker keeps it pending and reports no error.
+	if retired != 0 || !pending || err != nil {
+		t.Fatalf("leased retirement = (%d,%v,%v), want (0,true,<nil>)", retired, pending, err)
+	}
+	if !f.liveGenerations()[stale] {
+		t.Fatal("bounded worker deleted a leased ref-view generation")
+	}
+
+	lease.Release()
+	for range 4 {
+		retired, _, err = f.lifecycle.SweepDeferredRetirements(context.Background())
+		if err != nil {
+			t.Fatalf("retire released generation: %v", err)
+		}
+		if retired > 0 {
+			break
+		}
+	}
+	if f.liveGenerations()[stale] {
+		t.Fatal("released queued ref-view generation was not collected")
+	}
+}
+
+func TestQueueRefViewRetirementRejectsStalePointerCandidate(t *testing.T) {
+	f := newRetentionFixture(t, RefViewRetention{})
+	f.lifecycle.owed = map[int64]struct{}{}
+	oldGeneration := f.publishGeneration("stale-candidate")
+	replacement := f.publishGeneration("replacement")
+	f.serve("moving-ref", replacement, f.now)
+
+	queued := f.lifecycle.queueRefViewRetirement(context.Background(), retentionGraphID, refViewCandidate{
+		generationID: oldGeneration,
+		refViewID:    "moving-ref",
+		reason:       viewmetrics.EvictedStale,
+	}, store_sqlite.ViewGenerationReady)
+	if queued {
+		t.Fatal("stale ref-view candidate was queued")
+	}
+	view, found, err := f.catalog.GetRefView(context.Background(), "moving-ref")
+	if err != nil || !found {
+		t.Fatalf("read replacement ref view: found=%v err=%v", found, err)
+	}
+	if view.ActiveGenerationID != replacement {
+		t.Fatalf("replacement active generation = %d, want %d", view.ActiveGenerationID, replacement)
+	}
+	row, found, err := f.catalog.GetViewGeneration(context.Background(), oldGeneration)
+	if err != nil || !found || row.State != store_sqlite.ViewGenerationReady {
+		t.Fatalf("stale candidate mutated: found=%v state=%s err=%v", found, row.State, err)
+	}
+}
+
+func TestReleaseRefViewGenerationRollsBackForNonReadyGeneration(t *testing.T) {
+	f := newRetentionFixture(t, RefViewRetention{})
+	generationID := f.publishGeneration("already-superseded")
+	if err := f.store.MarkPayloadGenerationSuperseded(context.Background(), generationID); err != nil {
+		t.Fatalf("mark generation superseded: %v", err)
+	}
+	f.serve("superseded-ref", generationID, f.now)
+
+	released, err := f.catalog.ReleaseRefViewGeneration(
+		context.Background(), "superseded-ref", generationID,
+	)
+	if err == nil {
+		t.Fatal("release of non-ready generation returned no error")
+	}
+	if released {
+		t.Fatal("non-ready generation was reported released")
+	}
+	view, found, err := f.catalog.GetRefView(context.Background(), "superseded-ref")
+	if err != nil || !found || view.ActiveGenerationID != generationID {
+		t.Fatalf("rollback lost ref pointer: found=%v active=%d err=%v",
+			found, view.ActiveGenerationID, err)
+	}
+}
+
+func TestQueueUnpointedCandidateDoesNotSupersedeNewlyPointedGeneration(t *testing.T) {
+	f := newRetentionFixture(t, RefViewRetention{})
+	f.lifecycle.owed = map[int64]struct{}{}
+	generationID := f.publishGeneration("newly-pointed")
+	f.serve("new-pointer", generationID, f.now)
+
+	queued := f.lifecycle.queueRefViewRetirement(context.Background(), retentionGraphID, refViewCandidate{
+		generationID: generationID,
+		reason:       viewmetrics.EvictedStale,
+	}, store_sqlite.ViewGenerationReady)
+	if queued {
+		t.Fatal("unpointed candidate was queued after a ref began serving it")
+	}
+	row, found, err := f.catalog.GetViewGeneration(context.Background(), generationID)
+	if err != nil || !found || row.State != store_sqlite.ViewGenerationReady {
+		t.Fatalf("newly pointed generation mutated: found=%v state=%s err=%v", found, row.State, err)
+	}
+	view, found, err := f.catalog.GetRefView(context.Background(), "new-pointer")
+	if err != nil || !found || view.ActiveGenerationID != generationID {
+		t.Fatalf("new pointer changed: found=%v active=%d err=%v",
+			found, view.ActiveGenerationID, err)
+	}
+}
+
+func TestQueueUnpointedRefViewRetirementPersistsBeforeQueue(t *testing.T) {
+	f := newRetentionFixture(t, RefViewRetention{
+		RetainInactive:       time.Hour,
+		MaxCachedGenerations: 100,
+	})
+	f.lifecycle.owed = map[int64]struct{}{}
+	unpointed := f.publishGeneration("unpointed")
+	f.now = f.now.Add(8 * time.Hour)
+
+	f.lifecycle.queueRefViewRetirements(context.Background())
+	row, found, err := f.catalog.GetViewGeneration(context.Background(), unpointed)
+	if err != nil || !found {
+		t.Fatalf("read unpointed generation: found=%v err=%v", found, err)
+	}
+	if row.State != store_sqlite.ViewGenerationSuperseded {
+		t.Fatalf("unpointed generation state = %s, want superseded", row.State)
+	}
+	f.lifecycle.coordMu.Lock()
+	_, queued := f.lifecycle.owed[unpointed]
+	f.lifecycle.coordMu.Unlock()
+	if !queued {
+		t.Fatal("durably superseded generation was not queued")
 	}
 }

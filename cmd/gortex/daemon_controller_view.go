@@ -763,7 +763,7 @@ func (c *realController) reconcileFamilyForProbeContext(ctx context.Context, fam
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if _, err := c.lifecycle.ReconcileFamily(ctx, familyID); err != nil && c.logger != nil {
+	if _, err := c.lifecycle.ReconcileFamilyDeferredRetirement(ctx, familyID); err != nil && c.logger != nil {
 		c.logger.Debug("probe view: reconciling the family failed",
 			zap.String("family", familyID), zap.Error(err))
 	}

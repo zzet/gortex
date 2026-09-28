@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -244,6 +245,14 @@ type CheckoutLifecycle struct {
 	// and the two slots of a checkout whose route is being withdrawn. The
 	// sweep retries them until the catalog stops refusing.
 	owed map[int64]struct{}
+
+	// deferredRetirementMu guards the daemon-only Seed opt-in. All other
+	// callers retain Seed's synchronous retirement contract. retirementSweepMu
+	// serializes physical retirement passes across explicit and background work.
+	deferredRetirementMu     sync.RWMutex
+	deferSeedRetirements     bool
+	retirementSweepMu        sync.Mutex
+	deferredRetirementCursor int64 // guarded by coordMu
 	// supersededChainRetention is how many replaced dedicated base chains this
 	// daemon keeps per graph before the sweep offers them. A small window is
 	// what makes a revert cheap: the reuse lookup accepts a superseded
@@ -1553,6 +1562,16 @@ type SweepReport struct {
 // evidence and two separate clocks, which is what lets it act on any checkout
 // without risking a corpus over a transient stat failure.
 func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
+	return l.sweep(ctx, true)
+}
+
+// SweepDeferredRetirement performs the janitor's topology and cleanup work but
+// leaves payload retirement to the bounded daemon retirement worker.
+func (l *CheckoutLifecycle) SweepDeferredRetirement(ctx context.Context) (SweepReport, error) {
+	return l.sweep(ctx, false)
+}
+
+func (l *CheckoutLifecycle) sweep(ctx context.Context, retirePayload bool) (SweepReport, error) {
 	var out SweepReport
 	if l == nil || l.rec == nil {
 		return out, nil
@@ -1588,8 +1607,12 @@ func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
 	// Read after applyCoordinators, so the reasons are the ones this pass
 	// either recorded or retracted rather than the ones it inherited.
 	out.CoordinatorStartFailures = l.CoordinatorStartFailures()
-	out.Retired = l.sweepRetirements(ctx)
-	out.RefViewsRetired = l.sweepRefViewRetention(ctx)
+	if retirePayload {
+		out.Retired = l.sweepRetirements(ctx)
+		out.RefViewsRetired = l.sweepRefViewRetention(ctx)
+	} else {
+		l.queueRefViewRetirements(ctx)
+	}
 	recordSweepGauges(out)
 	if out.Removed > 0 {
 		// The cleanup hooks drop the removed repositories from the in-memory
@@ -2979,6 +3002,9 @@ func (l *CheckoutLifecycle) liveCoordinators(familyID string) int {
 // refused while the route still names them and collectable the moment the
 // teardown removes it.
 func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
+	l.retirementSweepMu.Lock()
+	defer l.retirementSweepMu.Unlock()
+
 	l.coordMu.Lock()
 	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
 	served := make(map[string]struct{}, len(l.coordinators))
@@ -3018,6 +3044,28 @@ func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
 		l.coordMu.Unlock()
 	}
 	return retired
+}
+
+// EnableDeferredSeedRetirements lets a daemon move physical retirement off
+// its query-readiness path after it has installed a post-ready worker. Calling
+// it repeatedly is safe. Other Seed callers retain synchronous retirement.
+func (l *CheckoutLifecycle) EnableDeferredSeedRetirements() {
+	if l == nil {
+		return
+	}
+	l.deferredRetirementMu.Lock()
+	l.deferSeedRetirements = true
+	l.deferredRetirementMu.Unlock()
+}
+
+func (l *CheckoutLifecycle) deferredSeedRetirementsEnabled() bool {
+	if l == nil {
+		return false
+	}
+	l.deferredRetirementMu.RLock()
+	enabled := l.deferSeedRetirements
+	l.deferredRetirementMu.RUnlock()
+	return enabled
 }
 
 // orphanedGenerations re-derives, from the catalog, the generations no one is
@@ -3610,26 +3658,98 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	if l == nil {
 		return nil
 	}
+	logger := l.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	configuredRepos := 0
+	if l.cfgMgr != nil {
+		configuredRepos = len(l.cfgMgr.Global().Repos)
+	}
+	seedStarted := time.Now()
+	logger.Info("checkout lifecycle seed started",
+		zap.Int("configured_repositories", configuredRepos),
+		zap.Int("gomaxprocs", runtime.GOMAXPROCS(0)),
+		zap.Int("num_cpu", runtime.NumCPU()))
+	var seedErr error
+	seededFamilies := 0
+	defer func() {
+		fields := []zap.Field{
+			zap.Duration("elapsed", time.Since(seedStarted)),
+			zap.Int("configured_repositories", configuredRepos),
+			zap.Int("seeded_families", seededFamilies),
+		}
+		if seedErr != nil {
+			fields = append(fields, zap.String("outcome", "error"), zap.Error(seedErr))
+		} else {
+			fields = append(fields, zap.String("outcome", "success"))
+		}
+		logger.Info("checkout lifecycle seed completed", fields...)
+	}()
+	stageStarted := func(stage string, fields ...zap.Field) time.Time {
+		started := time.Now()
+		fields = append(fields, zap.String("stage", stage))
+		logger.Info("checkout lifecycle seed stage started", fields...)
+		return started
+	}
+	stageCompleted := func(stage string, started time.Time, stageErr error, fields ...zap.Field) {
+		outcome := "success"
+		if stageErr != nil {
+			outcome = "error"
+			fields = append(fields, zap.Error(stageErr))
+		}
+		fields = append(fields,
+			zap.String("stage", stage),
+			zap.Duration("elapsed", time.Since(started)),
+			zap.String("outcome", outcome))
+		logger.Info("checkout lifecycle seed stage completed", fields...)
+	}
+
 	if l.rec == nil {
-		l.sweepRetirements(ctx)
+		if l.deferredSeedRetirementsEnabled() {
+			started := stageStarted("defer_retirements")
+			stageCompleted("defer_retirements", started, nil,
+				zap.String("resume", "post_ready_retirement_worker"))
+		} else {
+			started := stageStarted("sweep_retirements")
+			retired := l.sweepRetirements(ctx)
+			stageCompleted("sweep_retirements", started, nil, zap.Int("retired_generations", retired))
+		}
 		return nil
 	}
 	var errs []error
+	started := stageStarted("restore_repository_admissions")
 	if err := l.restoreRepositoryAdmissions(ctx); err != nil {
-		return fmt.Errorf("restore repository cleanup admissions: %w", err)
+		stageCompleted("restore_repository_admissions", started, err)
+		seedErr = fmt.Errorf("restore repository cleanup admissions: %w", err)
+		return seedErr
 	}
+	stageCompleted("restore_repository_admissions", started, nil)
 
 	// Finish cleanup that committed before a crash before reading config. A
 	// demotion may have flipped modes and journalled graph retirement while its
 	// stale config entry was still on disk; seeding that entry first would
 	// recreate the intent and graph the cleanup is about to remove.
+	started = stageStarted("resume_reconciler")
 	if err := l.rec.Resume(ctx); err != nil {
+		stageCompleted("resume_reconciler", started, err)
 		errs = append(errs, err)
+	} else {
+		stageCompleted("resume_reconciler", started, nil)
 	}
 	// A crash can leave a populated generation in building state before any
-	// cleanup journal exists. Drain prior-process residue during boot instead
-	// of leaving it for the hourly janitor.
-	l.sweepRetirements(ctx)
+	// cleanup journal exists. Daemons install a post-ready worker before opting
+	// out of this synchronous pass; every other caller retains the original Seed
+	// contract and leaves no retirement backlog behind.
+	if l.deferredSeedRetirementsEnabled() {
+		started = stageStarted("defer_retirements")
+		stageCompleted("defer_retirements", started, nil,
+			zap.String("resume", "post_ready_retirement_worker"))
+	} else {
+		started = stageStarted("sweep_retirements")
+		retired := l.sweepRetirements(ctx)
+		stageCompleted("sweep_retirements", started, nil, zap.Int("retired_generations", retired))
+	}
 
 	seeded := map[string]string{}
 	if l.cfgMgr != nil {
@@ -3648,7 +3768,12 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 			if l.RepositoryAdmissionClosed(prefix) {
 				continue // Durable cleanup owns this stale configuration entry.
 			}
+			started = stageStarted("record_checkout", zap.String("prefix", prefix))
 			identity, err := l.recordCheckout(ctx, prefix, abs, TrackSourceConfig, true)
+			stageCompleted("record_checkout", started, err,
+				zap.String("prefix", prefix),
+				zap.String("family", identity.familyID),
+				zap.String("checkout", identity.checkoutID))
 			if err != nil {
 				errs = append(errs, fmt.Errorf("seed %s: %w", abs, err))
 			}
@@ -3659,8 +3784,13 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 			}
 		}
 	}
+	seededFamilies = len(seeded)
+	started = stageStarted("resume_mode_transitions")
 	if err := l.resumeModeTransitions(ctx); err != nil {
+		stageCompleted("resume_mode_transitions", started, err)
 		errs = append(errs, err)
+	} else {
+		stageCompleted("resume_mode_transitions", started, nil)
 	}
 	// The seeded families are reconciled once here rather than at the janitor's
 	// first tick, so a restart resumes each routed worktree's coordinator within
@@ -3668,9 +3798,28 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	// being served stays dormant until it is selected again — its route is what
 	// marks it worth resuming across the restart.
 	for familyID, probeDir := range seeded {
-		l.reconcileFamilyNow(ctx, familyID, probeDir)
+		familyStarted := stageStarted("reconcile_family", zap.String("family", familyID))
+		reconcileStarted := stageStarted("reconcile_family_catalog", zap.String("family", familyID))
+		report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, probeDir))
+		stageCompleted("reconcile_family_catalog", reconcileStarted, err, zap.String("family", familyID))
+		if err != nil {
+			logger.Debug("checkout lifecycle: could not reconcile the family",
+				zap.String("family", familyID), zap.Error(err))
+			stageCompleted("reconcile_family", familyStarted, err, zap.String("family", familyID))
+			continue
+		}
+		applyStarted := stageStarted("apply_coordinators", zap.String("family", familyID))
+		l.applyCoordinators(ctx, report)
+		stageCompleted("apply_coordinators", applyStarted, nil, zap.String("family", familyID))
+		l.scheduleFamilyRetry(report)
+		if familyReportRemoved(report) {
+			l.saveConfig("reconcile")
+			l.notifyTrackedSetChanged()
+		}
+		stageCompleted("reconcile_family", familyStarted, nil, zap.String("family", familyID))
 	}
-	return errors.Join(errs...)
+	seedErr = errors.Join(errs...)
+	return seedErr
 }
 
 // --- cleanup hooks ------------------------------------------------------
