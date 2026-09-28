@@ -436,6 +436,10 @@ type CheckoutCycle struct {
 	cycleStarted time.Time
 	// Err is what stopped the cycle, nil when it settled both slots.
 	Err error
+	// PlanLaps are the reconcile's reads before the dirty slot (cohort,
+	// primary base, head sample, route, base recomposition, commit slot),
+	// logged with the dirty slot's plan record.
+	PlanLaps []CycleLap
 }
 
 // CheckoutCoordinator keeps one automatic checkout's routed view in step with
@@ -1315,6 +1319,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	}
 	defer c.gate.NoteHolder(ViewBuildLaneHolder{
 		Kind: "checkout_cycle", CheckoutID: c.checkoutID, Priority: viewBuildPriorityLabel(priority),
+		Root: c.root, Reason: reason,
 	})()
 	// A background cycle gives the lane up to an interactive build that
 	// starts waiting for it (another checkout's edit), up to its commit
@@ -1618,6 +1623,13 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	// refresh ticket waits that only a sample taken after it arrived can
 	// complete: then its prepublish fence is that sample.
 	ctx = withPrepublishSampleDemand(ctx, c.refreshWantsNewSample)
+	// The plan's reads before the dirty slot, lapped for its plan record.
+	lapStarted := time.Now()
+	lap := func(name string) {
+		now := time.Now()
+		out.PlanLaps = append(out.PlanLaps, CycleLap{Name: name, Duration: now.Sub(lapStarted)})
+		lapStarted = now
+	}
 
 	// One cohort per cycle, described afresh. Every identity this cycle mints
 	// carries the same revision, so the layer it builds and the cache entry it
@@ -1632,16 +1644,19 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		out.Deferred = true
 		return out
 	}
+	lap("cohort")
 	base, err := c.primaryBase(ctx)
 	if err != nil {
 		out.Err = err
 		return out
 	}
+	lap("primary_base")
 	head, err := c.cycleSample(ctx)
 	if err != nil {
 		out.Err = fmt.Errorf("indexer: sample checkout %s: %w", c.root, err)
 		return out
 	}
+	lap("head_sample")
 	if head.HeadTree == "" {
 		// An unborn branch has no tree to build a commit layer from, and a
 		// checkout with no commit generation has no view. There is nothing to
@@ -1660,6 +1675,7 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		out.Err = err
 		return out
 	}
+	lap("ensure_route")
 
 	// The dependent pin: a checkout whose routed layers were built over a
 	// committed base the family has since advanced past stays on that base. The
@@ -1697,7 +1713,9 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		return out
 	}
 
+	lap("base_recompose")
 	commitGeneration, err := c.reconcileCommitSlot(ctx, base, head.HeadTree, &route, &out)
+	lap("commit_slot")
 	if err != nil {
 		if errors.Is(err, errRouteMoved) {
 			out.Rescheduled = true
@@ -2963,6 +2981,16 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	route *store_sqlite.CheckoutRoute,
 	out *CheckoutCycle,
 ) error {
+	// The plan's own reads between the cycle's admission and the build are
+	// lapped (the sample, the routed row's chain check, the reuse lookup,
+	// the parent selection) and logged once the slot builds.
+	planStarted := time.Now()
+	var planLaps []zap.Field
+	planLap := func(name string) {
+		now := time.Now()
+		planLaps = append(planLaps, zap.Duration(name, now.Sub(planStarted)))
+		planStarted = now
+	}
 	// The cycle's shared sample, unless this cycle just built a commit layer:
 	// the checkout is free to commit while one builds, so the working tree is
 	// sampled again after it.
@@ -2983,6 +3011,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		c.Signal("the checkout moved to another commit under the cycle")
 		return nil
 	}
+	planLap("sample")
 	key := c.dirtySampleKey(route.GraphID, commitGeneration, sample)
 	if route.DirtyGenerationID > 0 {
 		row, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
@@ -3030,6 +3059,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		}
 	}
 
+	planLap("routed")
 	// The reuse path, and the whole of dirty-layer reuse as it ships — an
 	// in-process, fingerprint-keyed cache with no catalog-backed,
 	// survive-restart half: a working tree that has come back to a state this
@@ -3050,7 +3080,15 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		return nil
 	}
 
+	planLap("reuse_lookup")
 	selection := c.selectDirtyParentForSlot(ctx, *route, commitGeneration, sample, out)
+	planLap("parent_selection")
+	for _, l := range out.PlanLaps {
+		planLaps = append(planLaps, zap.Duration(l.Name, l.Duration))
+	}
+	c.logger.Info("checkout coordinator: dirty slot plan",
+		append([]zap.Field{zap.String("checkout", c.checkoutID), zap.Int("dirty_entries", len(sample.Entries)),
+			zap.Int64("parent", selection.Parent), zap.Int("parent_depth", selection.Depth)}, planLaps...)...)
 	endDelta := editDeltaBegin() // a background stack pre-warm yields to the build
 	generationID, builtKey, err := c.buildDirtyLayerForSlot(ctx, route.GraphID, commitGeneration, selection, sample, out)
 	endDelta()
@@ -4804,4 +4842,10 @@ func (a ancestryRefFacts) overlayByTargets(
 		}
 	}
 	return out, err
+}
+
+// CycleLap is one timed step of a checkout cycle.
+type CycleLap struct {
+	Name     string
+	Duration time.Duration
 }

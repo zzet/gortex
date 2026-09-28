@@ -835,6 +835,9 @@ func (c *CheckoutCoordinator) logSlowAdmission(reason string, through uint64, ad
 			zap.String("lane_holder", holder.Kind),
 			zap.String("lane_holder_checkout", holder.CheckoutID),
 			zap.Int64("lane_holder_generation", holder.Generation),
+			zap.String("lane_holder_priority", holder.Priority),
+			zap.String("lane_holder_root", holder.Root),
+			zap.String("lane_holder_reason", holder.Reason),
 			zap.Duration("lane_holder_held_for", time.Since(holder.Since)))
 	}
 	c.logger.Info("checkout coordinator: slow build admission", fields...)

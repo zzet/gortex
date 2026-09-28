@@ -120,6 +120,11 @@ type ViewBuildLaneHolder struct {
 	Generation int64
 	// Since is when the lane was granted to it.
 	Since time.Time
+	// Root is the holder checkout's working tree and Reason why its cycle
+	// runs (a poll, a refresh ticket, a signal): what a waiter's slow
+	// admission names as the lane's owner.
+	Root   string
+	Reason string
 }
 
 // ViewBuildGate serializes physical derived-view builds after daemon warmup.

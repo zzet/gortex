@@ -3289,7 +3289,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						restampedBuiltins = append(restampedBuiltins, &copied)
 					}
 				}
-				diskTarget.AddBatch(nodes, nil)
+				if err := drainAddBatch(ctx, diskTarget, nodes, nil); err != nil && retErr == nil {
+					retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", err)
+				}
+				if retErr != nil && drainYieldable(ctx) && ctx.Err() != nil {
+					break
+				}
 				if !ftsReady || retErr != nil {
 					nodeRows := len(nodes)
 					nodes = nil
@@ -3339,7 +3344,18 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				drainPressure.afterNodeBatch(nodeRows)
 			}
 			for edges := range inMemShadow.DrainEdgeBatches(persistChunkRows, persistChunkBytes) {
-				diskTarget.AddBatch(nil, edges)
+				if drainYieldable(ctx) && ctx.Err() != nil {
+					if retErr == nil {
+						retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", ctx.Err())
+					}
+					break
+				}
+				if err := drainAddBatch(ctx, diskTarget, nil, edges); err != nil {
+					if retErr == nil {
+						retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", err)
+					}
+					break
+				}
 				edgeRows := len(edges)
 				drainPressure.afterEdgeBatch(edgeRows)
 			}
@@ -3386,6 +3402,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				zap.Int("fts_items", ftsItemCount),
 			)
 			finishDrainPressure()
+			if retErr == nil && drainYieldable(ctx) && ctx.Err() != nil {
+				// A background build that gave the lane up during the drain's
+				// last chunk skips the post-drain passes as well.
+				retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", ctx.Err())
+			}
 			if retErr == nil {
 				// End of this repository's drain: this block runs on the way
 				// out of IndexCtx, after persistRepoIndexState. It is not the
