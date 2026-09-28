@@ -96,6 +96,47 @@ type DirtySnapshot struct {
 	// Fingerprint hashes reported effective content over HeadTree. HeadCommit
 	// and staging remain diagnostics; see SampleDirty for admission/cache bounds.
 	Fingerprint string
+	// Contents is the per-path content identity the Fingerprint was built
+	// from, one entry per distinct reported path, sorted by path. It is set
+	// only when every sampling fence passed, so a refused (torn) sample never
+	// exposes it, and it is nil for a clean checkout. The entries whose
+	// HeadEqual is false are exactly the Fingerprint's per-path inputs.
+	Contents []DirtyContent
+}
+
+// DirtyContentState names what the sampler observed at one reported path.
+type DirtyContentState string
+
+const (
+	// DirtyContentPresent is a regular file or symlink whose bytes were
+	// hashed; Mode and SHA256 are set.
+	DirtyContentPresent DirtyContentState = "present"
+	// DirtyContentAbsent is a reported path with nothing on disk.
+	DirtyContentAbsent DirtyContentState = "absent"
+	// DirtyContentOpaque is a directory reported as one path (a gitlink or
+	// nested repository). It is never traversed; SHA256 carries the
+	// diagnostic/stat digest the fingerprint mixes in for it.
+	DirtyContentOpaque DirtyContentState = "opaque"
+)
+
+// DirtyContent is one reported path's content identity as the sampler
+// fingerprinted it.
+type DirtyContent struct {
+	// Path is the path relative to the worktree root, as git spells it.
+	Path string
+	// State is what was observed on disk.
+	State DirtyContentState
+	// Mode is the git octal mode of a present entry ("100644", "100755",
+	// "120000"); empty otherwise.
+	Mode string
+	// SHA256 is the sha256 of the git blob encoding of a present entry's
+	// raw bytes, or an opaque entry's diagnostic digest; empty for absent.
+	SHA256 string
+	// HeadEqual reports that the path contributes nothing to the
+	// fingerprint because it equals HEAD: a present entry whose mode and
+	// raw bytes equal the HEAD blob (staged residue), or an absent entry
+	// HEAD does not hold either.
+	HeadEqual bool
 }
 
 // Octal file modes git prints in the porcelain mode columns. Only these
@@ -128,6 +169,16 @@ type DirtySampler struct {
 	sampling         chan struct{}
 	contentCache     map[string]dirtyContentMemo
 	contentCacheRoot os.FileInfo
+
+	// last is the most recent sample that passed every fence, and lastStarted
+	// the instant its git status began. SampleSince hands it to callers that
+	// only need a sample taken after some instant, so concurrent freshness
+	// checks share one sample instead of queueing for one each.
+	last        DirtySnapshot
+	lastStarted time.Time
+	// taken counts the samples this sampler has taken (not the ones
+	// SampleSince shared).
+	taken uint64
 }
 
 // NewDirtySampler constructs a sampler for a path already known to be the
@@ -155,12 +206,88 @@ func newDirtySampler(root, seedCommit, seedTree string, run dirtyCommandFunc) *D
 // command; dirty samples add a final status fence. An exact-commit tree lookup
 // is needed only after its OID changes, never by resolving mutable HEAD twice.
 func (s *DirtySampler) Sample(ctx context.Context) (DirtySnapshot, error) {
-	if s == nil || s.run == nil || strings.TrimSpace(s.root) == "" {
-		return DirtySnapshot{}, fmt.Errorf("gitstate: dirty sampler is not initialized: %w", ErrDirtyUnavailable)
+	release, err := s.acquire(ctx)
+	if err != nil {
+		return DirtySnapshot{}, err
 	}
+	defer release()
+	return s.sampleHeld(ctx)
+}
 
+// SampleSince returns a sample whose git status began at or after since: the
+// most recent such sample if one exists, one that was in flight when the
+// caller arrived and started at or after since, or a new one. A sample that
+// started before since is never returned, so a caller that passes the instant
+// its request arrived gets a sample taken after the request — the guarantee a
+// freshness check needs — while N concurrent callers pay for one sample
+// between them instead of N serialized ones.
+//
+// The returned snapshot's slices are shared with other callers of SampleSince
+// and must be treated as read-only.
+func (s *DirtySampler) SampleSince(ctx context.Context, since time.Time) (DirtySnapshot, error) {
+	snap, _, err := s.SampleSinceStarted(ctx, since)
+	return snap, err
+}
+
+// SampleSinceStarted is SampleSince that also reports when the returned
+// sample's git status began. A caller that has to decide which of several
+// waiters one sample can answer compares that instant with each waiter's
+// admission: the sample proves the working copy at an instant after every
+// waiter admitted at or before it.
+func (s *DirtySampler) SampleSinceStarted(ctx context.Context, since time.Time) (DirtySnapshot, time.Time, error) {
+	if snap, started, ok := s.sampleStartedSince(since); ok {
+		return snap, started, nil
+	}
+	release, err := s.acquire(ctx)
+	if err != nil {
+		return DirtySnapshot{}, time.Time{}, err
+	}
+	defer release()
+	// A sample that was in flight while this caller waited for the lease may
+	// have started after since; it is as good as a new one.
+	if snap, started, ok := s.sampleStartedSince(since); ok {
+		return snap, started, nil
+	}
+	return s.sampleHeldStarted(ctx)
+}
+
+// LatestSampleSince returns the most recent sample whose git status began at
+// or after since, and when it began, without taking one: ok is false when no
+// such sample exists. It never waits for the sampling lease.
+func (s *DirtySampler) LatestSampleSince(since time.Time) (DirtySnapshot, time.Time, bool) {
+	return s.sampleStartedSince(since)
+}
+
+// LastSampleStarted reports when the most recent successful sample's git
+// status began, zero when there has been none.
+func (s *DirtySampler) LastSampleStarted() time.Time {
+	if s == nil {
+		return time.Time{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastStarted
+}
+
+func (s *DirtySampler) sampleStartedSince(since time.Time) (DirtySnapshot, time.Time, bool) {
+	if s == nil || since.IsZero() {
+		return DirtySnapshot{}, time.Time{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastStarted.IsZero() || s.lastStarted.Before(since) {
+		return DirtySnapshot{}, time.Time{}, false
+	}
+	return s.last, s.lastStarted, true
+}
+
+// acquire takes the sampling lease; the caller must run release.
+func (s *DirtySampler) acquire(ctx context.Context) (func(), error) {
+	if s == nil || s.run == nil || strings.TrimSpace(s.root) == "" {
+		return nil, fmt.Errorf("gitstate: dirty sampler is not initialized: %w", ErrDirtyUnavailable)
+	}
 	if err := ctx.Err(); err != nil {
-		return DirtySnapshot{}, fmt.Errorf("gitstate: sample canceled: %w: %w", ErrDirtyUnavailable, err)
+		return nil, fmt.Errorf("gitstate: sample canceled: %w: %w", ErrDirtyUnavailable, err)
 	}
 	s.mu.Lock()
 	if s.sampling == nil {
@@ -170,11 +297,50 @@ func (s *DirtySampler) Sample(ctx context.Context) (DirtySnapshot, error) {
 	s.mu.Unlock()
 	select {
 	case sampling <- struct{}{}:
-		defer func() { <-sampling }()
+		return func() { <-sampling }, nil
 	case <-ctx.Done():
-		return DirtySnapshot{}, fmt.Errorf("gitstate: wait for sampler: %w: %w", ErrDirtyUnavailable, ctx.Err())
+		return nil, fmt.Errorf("gitstate: wait for sampler: %w: %w", ErrDirtyUnavailable, ctx.Err())
 	}
+}
 
+// sampleHeld takes one sample; the caller holds the sampling lease. A sample
+// that passes every fence is remembered for SampleSince, stamped with the
+// instant its status command began.
+func (s *DirtySampler) sampleHeld(ctx context.Context) (DirtySnapshot, error) {
+	snap, _, err := s.sampleHeldStarted(ctx)
+	return snap, err
+}
+
+// sampleHeldStarted is sampleHeld that also reports when the sample's git
+// status began.
+func (s *DirtySampler) sampleHeldStarted(ctx context.Context) (DirtySnapshot, time.Time, error) {
+	started := time.Now()
+	snap, err := s.sampleHeldUnrecorded(ctx)
+	if err != nil {
+		return DirtySnapshot{}, time.Time{}, err
+	}
+	s.mu.Lock()
+	s.taken++
+	if !started.Before(s.lastStarted) {
+		s.last, s.lastStarted = snap, started
+	}
+	s.mu.Unlock()
+	return snap, started, nil
+}
+
+// SamplesTaken reports how many samples this sampler has taken and fenced
+// successfully; a sample SampleSince shared is not counted again. It is the
+// evidence of how many working-copy samples a caller's sequence cost.
+func (s *DirtySampler) SamplesTaken() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.taken
+}
+
+func (s *DirtySampler) sampleHeldUnrecorded(ctx context.Context) (DirtySnapshot, error) {
 	out, err := s.run(ctx, s.root, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--renames")
 	if err != nil {
 		return DirtySnapshot{}, fmt.Errorf("gitstate: read status in %s: %w: %w", s.root, ErrDirtyUnavailable, err)
@@ -234,7 +400,7 @@ func (s *DirtySampler) Sample(ctx context.Context) (DirtySnapshot, error) {
 	if identityTree == "" && snap.HeadCommit != "" {
 		identityTree = "unresolved-commit:" + snap.HeadCommit
 	}
-	snap.Fingerprint, err = s.contentFingerprint(ctx, identityTree, snap.Entries, out)
+	snap.Fingerprint, snap.Contents, err = s.contentFingerprint(ctx, identityTree, snap.Entries, out)
 	if err != nil {
 		return DirtySnapshot{}, fmt.Errorf("gitstate: fingerprint dirty content in %s: %w: %w", s.root, ErrDirtyUnavailable, err)
 	}
@@ -385,9 +551,9 @@ func dirtyHeadEntries(status []byte) map[string]dirtyHeadEntry {
 	return head
 }
 
-func (s *DirtySampler) contentFingerprint(ctx context.Context, tree string, entries []DirtyEntry, status []byte) (string, error) {
+func (s *DirtySampler) contentFingerprint(ctx context.Context, tree string, entries []DirtyEntry, status []byte) (string, []DirtyContent, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	var canonical dirtyCanonical
 	canonical.str("gortex.gitstate.dirty.content.v2")
@@ -396,21 +562,21 @@ func (s *DirtySampler) contentFingerprint(ctx context.Context, tree string, entr
 		s.contentCache = nil
 		s.contentCacheRoot = nil
 		sum := sha256.Sum256(canonical.buf)
-		return hex.EncodeToString(sum[:]), nil
+		return hex.EncodeToString(sum[:]), nil, nil
 	}
 	root, err := os.OpenRoot(s.root)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer root.Close()
 	pinnedRoot, err := root.Open(".")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	rootInfo, err := pinnedRoot.Stat()
 	closeErr := pinnedRoot.Close()
 	if err != nil || closeErr != nil {
-		return "", errors.Join(err, closeErr)
+		return "", nil, errors.Join(err, closeErr)
 	}
 	cacheRootMatches := s.contentCacheRoot != nil && os.SameFile(rootInfo, s.contentCacheRoot)
 	head := dirtyHeadEntries(status)
@@ -424,44 +590,55 @@ func (s *DirtySampler) contentFingerprint(ctx context.Context, tree string, entr
 	paths = slices.Compact(paths)
 	nextCache := make(map[string]dirtyContentMemo, min(len(paths), dirtyContentCacheLimit))
 	evidence := make(map[string]dirtyContentEvidence, len(paths))
+	// Built from the same evidence as the canonical stream, in the same
+	// sorted path order; exposed only after every fence below passes.
+	contents := make([]DirtyContent, 0, len(paths))
 	for _, path := range paths {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		info, err := root.Lstat(path)
 		if os.IsNotExist(err) {
 			evidence[path] = dirtyContentEvidence{missing: true}
 			if prior, ok := head[path]; ok && prior.mode == absentMode {
+				contents = append(contents, DirtyContent{Path: path, State: DirtyContentAbsent, HeadEqual: true})
 				continue
 			}
+			contents = append(contents, DirtyContent{Path: path, State: DirtyContentAbsent})
 			canonical.str(path)
 			canonical.str(absentMode)
 			continue
 		}
 		if err != nil {
-			return "", fmt.Errorf("stat dirty path %q: %w", path, err)
+			return "", nil, fmt.Errorf("stat dirty path %q: %w", path, err)
 		}
 		if info.IsDir() {
 			// Preserve the existing opaque gitlink/nested-repository contract.
 			// Do not introduce recursive traversal or require initialized submodules.
 			evidence[path] = dirtyContentEvidence{info: info, opaque: true}
+			opaque := fingerprintDirty(s.root, "", byPath[path])
+			contents = append(contents, DirtyContent{Path: path, State: DirtyContentOpaque, SHA256: opaque})
 			canonical.str(path)
 			canonical.str("opaque-directory")
-			canonical.str(fingerprintDirty(s.root, "", byPath[path]))
+			canonical.str(opaque)
 			continue
 		}
 		cached, found := s.contentCache[path]
 		memo, _, err := dirtyContentForPath(ctx, root, path, info, cached, found && cacheRootMatches)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		evidence[path] = dirtyContentEvidence{info: info, memo: memo}
 		if len(nextCache) < dirtyContentCacheLimit {
 			nextCache[path] = memo
 		}
+		content := DirtyContent{Path: path, State: DirtyContentPresent, Mode: memo.mode, SHA256: memo.sha256}
 		if prior, ok := head[path]; ok && prior.mode == memo.mode && (prior.oid == memo.sha1 || prior.oid == memo.sha256) {
+			content.HeadEqual = true
+			contents = append(contents, content)
 			continue // Only actual raw HEAD-blob equality removes staged residue.
 		}
+		contents = append(contents, content)
 		canonical.str(path)
 		canonical.str(memo.mode)
 		canonical.str(memo.sha256)
@@ -469,54 +646,54 @@ func (s *DirtySampler) contentFingerprint(ctx context.Context, tree string, entr
 	// Fence HEAD/index and reported paths, then revalidate file evidence.
 	after, err := s.run(ctx, s.root, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--renames")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if !bytes.Equal(status, after) {
-		return "", errors.New("git dirty status changed while sampling")
+		return "", nil, errors.New("git dirty status changed while sampling")
 	}
 	for _, path := range paths {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		observed := evidence[path]
 		info, err := root.Lstat(path)
 		if observed.missing {
 			if !os.IsNotExist(err) {
-				return "", fmt.Errorf("dirty path %q appeared while sampling", path)
+				return "", nil, fmt.Errorf("dirty path %q appeared while sampling", path)
 			}
 			continue
 		}
 		if err != nil || dirtyVersion(info) != dirtyVersion(observed.info) {
-			return "", fmt.Errorf("dirty path %q changed while sampling", path)
+			return "", nil, fmt.Errorf("dirty path %q changed while sampling", path)
 		}
 		if !observed.opaque && !observed.memo.reusable {
 			// Young, unsupported or incomplete evidence must not certify bytes.
 			current, err := readDirtyContent(ctx, root, path, info)
 			if err != nil {
-				return "", err
+				return "", nil, err
 			}
 			if current.mode != observed.memo.mode || current.sha256 != observed.memo.sha256 {
-				return "", fmt.Errorf("dirty path %q changed while sampling", path)
+				return "", nil, fmt.Errorf("dirty path %q changed while sampling", path)
 			}
 		}
 	}
 	currentRoot, err := os.OpenFile(s.root, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	currentRootInfo, statErr := currentRoot.Stat()
 	closeErr = currentRoot.Close()
 	if statErr != nil || closeErr != nil || !currentRootInfo.IsDir() || !os.SameFile(rootInfo, currentRootInfo) {
-		return "", errors.New("checkout root changed while sampling dirty content")
+		return "", nil, errors.New("checkout root changed while sampling dirty content")
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	// Commit the bounded cache and its physical-root scope only after all fences.
 	s.contentCache = nextCache
 	s.contentCacheRoot = rootInfo
 	sum := sha256.Sum256(canonical.buf)
-	return hex.EncodeToString(sum[:]), nil
+	return hex.EncodeToString(sum[:]), contents, nil
 }
 
 func dirtyStampQuiet(version dirtyFileVersion, now time.Time) bool {
@@ -959,4 +1136,51 @@ func statEvidence(root string, e DirtyEntry) (size, mtimeNanos int64) {
 		return 0, 0
 	}
 	return fi.Size(), fi.ModTime().UnixNano()
+}
+
+// treeHoldsChunk bounds how many pathspecs one ls-tree invocation carries.
+const treeHoldsChunk = 128
+
+// TreeHoldsPaths reports, for each path, whether the committed tree holds it
+// as a blob or symlink. It is the exact HEAD-membership question a working-tree
+// sample cannot answer for a path it no longer reports (a path back at its
+// committed state reports nothing, whether HEAD holds it or not). Paths are
+// matched literally, never as pathspec patterns. An empty tree or path list
+// asks git nothing.
+func TreeHoldsPaths(ctx context.Context, root, tree string, paths []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(paths))
+	if len(paths) == 0 {
+		return out, nil
+	}
+	if !isOID(tree) || isZeroOID(tree) {
+		return nil, fmt.Errorf("gitstate: tree membership needs a tree oid, got %q: %w", tree, ErrDirtyUnavailable)
+	}
+	for _, p := range paths {
+		out[p] = false
+	}
+	for start := 0; start < len(paths); start += treeHoldsChunk {
+		end := min(start+treeHoldsChunk, len(paths))
+		args := append([]string{"--literal-pathspecs", "ls-tree", "-z", "--full-tree", tree, "--"}, paths[start:end]...)
+		listed, err := gitcmd.Run(ctx, root, args...)
+		if err != nil {
+			return nil, fmt.Errorf("gitstate: list %s in %s: %w: %w", tree, root, ErrDirtyUnavailable, err)
+		}
+		for _, record := range bytes.Split(listed, []byte{0}) {
+			// "<mode> SP <type> SP <oid> TAB <path>"
+			tab := bytes.IndexByte(record, '\t')
+			if tab < 0 {
+				continue
+			}
+			fields := strings.Fields(string(record[:tab]))
+			if len(fields) < 2 || fields[1] != "blob" {
+				continue
+			}
+			if name := string(record[tab+1:]); name != "" {
+				if _, asked := out[name]; asked {
+					out[name] = true
+				}
+			}
+		}
+	}
+	return out, nil
 }
