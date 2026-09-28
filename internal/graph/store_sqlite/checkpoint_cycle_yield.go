@@ -131,7 +131,11 @@ func (s *Store) buildLaneBusy() bool {
 		return false
 	}
 	p := s.walReclaim.cycle.busy.Load()
-	return p != nil && (*p)()
+	busy := p != nil && (*p)()
+	if busy {
+		s.walCopy.sawBusy(time.Now())
+	}
+	return busy
 }
 
 func (s *Store) hasBuildLanePredicate() bool {
@@ -173,6 +177,11 @@ func (s *Store) watchBuildLane(attempt *backgroundCheckpointAttempt) {
 			return
 		case <-ticker.C:
 			if s.buildLaneBusy() {
+				if attempt.copy != nil && attempt.copy.copying.Load() {
+					// A paced pass waits in its page writes instead: an
+					// interrupt would discard every page it copied.
+					continue
+				}
 				s.walReclaim.cycle.yields.Add(1)
 				attempt.cancel(errWALCheckpointYieldedToCycle)
 				return

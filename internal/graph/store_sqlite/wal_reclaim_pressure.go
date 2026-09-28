@@ -1,0 +1,154 @@
+package store_sqlite
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log"
+	"time"
+)
+
+// The reclaim under a sustained burst of edits.
+//
+// The paused copy (wal_copy_pause.go) waits while an edit runs, and the
+// reset's writer step waits for a gap between edits. A burst that keeps the
+// lane busy most of the time leaves the copy too little time and the reset no
+// gap: in one measured run the log grew from 0.7 to 6.3 GB over fifteen minutes
+// of back-to-back edits and folds, and reset only when they stopped.
+//
+// Over the pressure mark (walPressureMark: the retirement mark, 1 GiB by
+// default) with the lane busy, an attempt therefore runs anyway:
+//
+//   - its copy is not paused by edits but still paced by the copy budget
+//     (512 MiB per minute while editing), so its cost to an edit is the
+//     budget's;
+//   - it converges the backfill until the remainder is under
+//     walReclaimPressureSmallFrames, so the writer step has almost nothing
+//     left to copy;
+//   - the writer step then holds the write gate for at most
+//     walReclaimPressureHold (not the general 2 s cap): the last backfill and
+//     the reset, nothing else. If that does not finish in time it gives up
+//     (counted as a pressure give-up) and the next attempt tries again.
+//
+// Below the mark nothing changes.
+
+var (
+	// walReclaimPressureHold caps the writer step taken inside a busy lane.
+	walReclaimPressureHold = 50 * time.Millisecond
+	// walReclaimPressureSmallFrames: the remainder the writer step may copy.
+	walReclaimPressureSmallFrames uint32 = 256
+	// walPressureOff disables the pressure mode, for the mutation checks
+	// that prove it carries the bound. Never set in production.
+	walPressureOff = false
+	// walPressureResetHook, when a test sets it, runs while the pressure
+	// reset holds the writer (a slow reset). nil in production.
+	walPressureResetHook func(ctx context.Context)
+)
+
+// A writer refused on the log's size asks for the reclaim.
+//
+// The chain fold stops stepping while the log is over 256 MiB and a checkout
+// is being edited, the sweep waits over its marks, and the reclaim itself
+// ran through a busy lane only over the pressure mark (1 GiB): between those
+// marks nothing could bring the log down during a burst, and the fold made no
+// step for minutes. So a writer refused on the log's size requests the
+// reclaim (RequestWALReclaim), and for walReclaimRequestWindow after a
+// request, a log over the reclaim threshold is reclaimed in a busy lane as it
+// is over the pressure mark: the copy paced by the budget and the reset under
+// walReclaimPressureHold.
+
+// walReclaimRequestWindow is how long a request keeps the pressure mode open.
+var walReclaimRequestWindow = 30 * time.Second
+
+// RequestWALReclaim asks the reclaim to run through a busy lane: the caller
+// was refused on the log's size (a fold step, a retirement slice or chunk).
+func (s *Store) RequestWALReclaim() {
+	if s.coreless() {
+		return
+	}
+	s.walReclaimRequestedAt.Store(time.Now().UnixNano())
+	s.walReclaimNudged.Store(true)
+}
+
+// walReclaimRequested reports a request inside its window with the log over
+// the reclaim threshold.
+func (s *Store) walReclaimRequested(now time.Time, size int64, cfg walReclaimConfig) bool {
+	at := s.walReclaimRequestedAt.Load()
+	if at == 0 || now.Sub(time.Unix(0, at)) > walReclaimRequestWindow {
+		return false
+	}
+	return cfg.thresholdBytes > 0 && size > cfg.thresholdBytes
+}
+
+// walPressureMark is the log size over which the reclaim runs through a busy
+// lane: the retirement mark (4 x the threshold, capped at the ceiling).
+func walPressureMark(cfg walReclaimConfig) int64 {
+	return retirementWALMark(cfg.thresholdBytes, cfg.ceilingBytes)
+}
+
+var errWALPressureHold = errors.New("store_sqlite: wal reclaim: the reset did not fit its hold inside a busy lane")
+
+// reclaimWALPressureReset is the writer step of a pressure attempt: only when
+// the backfill is (nearly) complete, the writer held for at most
+// walReclaimPressureHold, the remainder copied and the log reset.
+func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult) error {
+	// What the hold may still copy: half the cap at the rate the convergence
+	// measured, and never less than walReclaimPressureSmallFrames.
+	allowed := walReclaimPressureSmallFrames
+	if c := res.convergence; c != nil && c.rateFramesPerS > 0 {
+		allowed = max(allowed, uint32(c.rateFramesPerS*(walReclaimPressureHold/2).Seconds()))
+	}
+	// The writer: an edit that holds it keeps it; this waits at most the
+	// hold cap for it, then gives up.
+	wctx, wcancel := context.WithTimeout(ctx, walReclaimPressureHold)
+	err := s.writeMu.LockContext(wctx)
+	wcancel()
+	if err != nil {
+		res.reason = "pressure_writer_busy"
+		s.walCopy.pressureGiveUps.Add(1)
+		return fmt.Errorf("%w: %w", errWALPressureHold, err)
+	}
+	held := time.Now()
+	defer func() {
+		res.writerHold = time.Since(held)
+		s.writeMu.Unlock()
+	}()
+	if s.bulkConn != nil && !res.leaseOverride {
+		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
+		return errWALCheckpointDeferredBulk
+	}
+	// With the writer held the log cannot grow: the remainder is final. Take
+	// the step only when it is small enough for the hold to be the reset.
+	snap, ok := readWALIndexSnapshot(s.dbPath)
+	if !ok {
+		res.reason = "pressure_no_wal_index"
+		s.walCopy.pressureGiveUps.Add(1)
+		return fmt.Errorf("%w: no wal-index", errWALPressureHold)
+	}
+	if snap.MxFrame > snap.NBackfill && snap.MxFrame-snap.NBackfill > allowed {
+		res.reason = fmt.Sprintf("pressure_copy_incomplete remainder_frames=%d allowed=%d", snap.MxFrame-snap.NBackfill, allowed)
+		s.walCopy.pressureGiveUps.Add(1)
+		return errWALPressureHold
+	}
+	hctx, hcancel := context.WithDeadline(ctx, held.Add(walReclaimPressureHold))
+	defer hcancel()
+	if hook := walPressureResetHook; hook != nil {
+		hook(hctx)
+	}
+	if _, err := checkpointWALOnceOn(hctx, ckptDB, "PASSIVE"); err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
+		res.reason = fmt.Sprintf("pressure_backfill error=%v", err)
+		s.walCopy.pressureGiveUps.Add(1)
+		return fmt.Errorf("%w: %w", errWALPressureHold, err)
+	}
+	result, err := checkpointWALOnceOn(hctx, ckptDB, "TRUNCATE")
+	if err != nil {
+		res.reason = fmt.Sprintf("pressure_reset busy=%d wal_frames=%d checkpointed=%d error=%v", result.Busy, result.WALFrames, result.CheckpointedFrames, err)
+		s.walCopy.pressureGiveUps.Add(1)
+		return fmt.Errorf("%w: %w", errWALPressureHold, err)
+	}
+	res.openGate = true
+	s.walCopy.pressureLaneResets.Add(1)
+	log.Printf("store_sqlite: wal reclaim reset inside a busy lane writer_hold=%s", time.Since(held).Round(time.Microsecond))
+	return nil
+}

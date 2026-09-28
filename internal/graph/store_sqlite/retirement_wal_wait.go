@@ -24,7 +24,22 @@ import (
 var (
 	retirementWALWaitMax  = 30 * time.Second
 	retirementWALWaitPoll = 100 * time.Millisecond
+	// retirementWALMarkFactor: the sweep waits once the log reaches this
+	// multiple of the reclaim threshold (1 GiB at the default 256 MiB), or the
+	// ceiling if that is lower. The ceiling alone (2 GiB) let one sweep write
+	// 2.1 GB of log in the first three minutes of an edit session, which every
+	// read and write of those edits then paid for.
+	retirementWALMarkFactor int64 = 4
 )
+
+// retirementWALMark is the log size at which a retirement chunk waits for the
+// reclaim.
+func retirementWALMark(threshold, ceiling int64) int64 {
+	if threshold > 0 && ceiling > 0 {
+		return min(ceiling, retirementWALMarkFactor*threshold)
+	}
+	return ceiling
+}
 
 // retirementWALEpisode is one sweep's over-ceiling state: an episode starts
 // when a chunk finds the log over the ceiling and ends at the first chunk that
@@ -51,7 +66,8 @@ func (s *Store) walReclaimBounds() (threshold, ceiling int64) {
 // It never fails: a timeout or a cancelled context only ends the wait (the
 // caller checks ctx itself).
 func (s *Store) awaitWALUnderCeiling(ctx context.Context, generationID int64, episode *retirementWALEpisode) {
-	_, ceiling := s.walReclaimBounds()
+	threshold, ceiling := s.walReclaimBounds()
+	ceiling = retirementWALMark(threshold, ceiling)
 	if ceiling <= 0 || s.dbPath == "" {
 		return
 	}
@@ -71,7 +87,7 @@ func (s *Store) awaitWALUnderCeiling(ctx context.Context, generationID int64, ep
 			generationID, size, ceiling, retirementWALWaitMax)
 	}
 	s.walReclaim.cycle.retirementWaits.Add(1)
-	s.walReclaimNudged.Store(true)
+	s.RequestWALReclaim()
 	deadline := time.NewTimer(retirementWALWaitMax)
 	defer deadline.Stop()
 	poll := time.NewTicker(retirementWALWaitPoll)

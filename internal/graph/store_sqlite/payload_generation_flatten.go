@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Copy-based generation primitives for the per-file delta model.
@@ -138,8 +139,11 @@ func (s *Store) beginGenerationCopy(ctx context.Context, to int64) (*sql.Tx, fun
 // payload of the empty building generation to. It is the carry-over of a
 // working-tree generation to another parent: the destination's catalog row
 // names the new parent, the rows are the source's.
-func (s *Store) CopyGenerationPayloadWhole(ctx context.Context, from, to int64) (GenerationCopyCounts, error) {
-	var counts GenerationCopyCounts
+func (s *Store) CopyGenerationPayloadWhole(ctx context.Context, from, to int64) (counts GenerationCopyCounts, err error) {
+	if !s.coreless() {
+		mark, started := readWALWriteMark(s.dbPath), time.Now()
+		defer func() { s.logGenerationCopy("copy", []int64{from}, to, &counts, mark, started, err) }()
+	}
 	if from <= baseViewGeneration || from == to {
 		return counts, fmt.Errorf("%w: a whole-generation copy needs a derived source other than its destination (%d -> %d)",
 			ErrCatalogInvalidValue, from, to)
@@ -237,8 +241,11 @@ func manifestTableNames() []string {
 // not know is an error, and so is a row a composition rule would have to
 // overwrite. The caller verifies the result against the chain's composed view
 // before it publishes anything.
-func (s *Store) FlattenGenerationChain(ctx context.Context, chain []int64, to int64) (GenerationCopyCounts, error) {
-	var counts GenerationCopyCounts
+func (s *Store) FlattenGenerationChain(ctx context.Context, chain []int64, to int64) (counts GenerationCopyCounts, err error) {
+	if !s.coreless() {
+		mark, started := readWALWriteMark(s.dbPath), time.Now()
+		defer func() { s.logGenerationCopy("fold", chain, to, &counts, mark, started, err) }()
+	}
 	if len(chain) == 0 {
 		return counts, fmt.Errorf("%w: an empty chain has nothing to flatten", ErrCatalogInvalidValue)
 	}

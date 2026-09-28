@@ -65,6 +65,11 @@ func (c walReclaimConvergence) String() string {
 // checkpoint connection; ctx is the attempt's (shutdown, a bulk window or an
 // edit cycle cancel it).
 func (s *Store) convergeBackfill(ctx context.Context, ckptDB *sql.DB) walReclaimConvergence {
+	return s.convergeBackfillPaced(ctx, ckptDB, nil)
+}
+
+// convergeBackfillPaced is convergeBackfill with the attempt's paced passes.
+func (s *Store) convergeBackfillPaced(ctx context.Context, ckptDB *sql.DB, attempt *backgroundCheckpointAttempt) walReclaimConvergence {
 	started := time.Now()
 	mark := readWALWriteMark(s.dbPath)
 	conv := walReclaimConvergence{frameBytes: int64(mark.PageSize) + 24}
@@ -84,10 +89,10 @@ func (s *Store) convergeBackfill(ctx context.Context, ckptDB *sql.DB) walReclaim
 		}
 		conv.remainderFrames = int64(remainder)
 		switch {
-		case remainder <= walReclaimConvergeSmallFrames:
+		case remainder <= convergeSmallFor(attempt):
 			conv.stop = "small"
 			return conv
-		case conv.rateFramesPerS > 0 && float64(remainder)/conv.rateFramesPerS <= walReclaimConvergeSlice.Seconds():
+		case conv.rateFramesPerS > 0 && float64(remainder)/conv.rateFramesPerS <= convergeSliceFor(attempt).Seconds():
 			conv.stop = "fits"
 			return conv
 		case walReclaimSkipConverge || conv.passes >= walReclaimConvergeMaxPasses:
@@ -98,11 +103,19 @@ func (s *Store) convergeBackfill(ctx context.Context, ckptDB *sql.DB) walReclaim
 			return conv
 		}
 		passStart := time.Now()
-		result, err := checkpointWALOnceOn(ctx, ckptDB, "PASSIVE")
+		var waitedBefore time.Duration
+		if attempt != nil && attempt.copy != nil {
+			waitedBefore = attempt.copy.pauseNs + attempt.copy.budgetNs
+		}
+		result, err := s.pacedPassive(ctx, ckptDB, attempt)
 		took := time.Since(passStart)
+		if attempt != nil && attempt.copy != nil {
+			// Time paused for an edit or waiting for budget is not copy time.
+			took -= attempt.copy.pauseNs + attempt.copy.budgetNs - waitedBefore
+		}
 		conv.passes++
 		if err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, errWALCheckpointYieldedToCycle) {
 				conv.stop = "cancelled"
 			} else {
 				conv.stop = "error"
@@ -144,4 +157,23 @@ var walReclaimLeaseOverrideSpacing = 30 * time.Second
 func (s *Store) leaseOverrideDue(now time.Time) bool {
 	last := s.walReclaim.cycle.lastLeaseOverride.Load()
 	return last == 0 || now.Sub(time.Unix(0, last)) >= walReclaimLeaseOverrideSpacing
+}
+
+// convergeSliceFor is the writer-step time the remainder is planned for: a
+// pressure attempt's reset holds the writer at most walReclaimPressureHold, of
+// which the copy gets half.
+func convergeSliceFor(attempt *backgroundCheckpointAttempt) time.Duration {
+	if attempt != nil && attempt.copy != nil && attempt.copy.pressure {
+		return walReclaimPressureHold / 2
+	}
+	return walReclaimConvergeSlice
+}
+
+// convergeSmallFor is the remainder handed to the writer step without a
+// measured rate: a pressure attempt's short hold takes less.
+func convergeSmallFor(attempt *backgroundCheckpointAttempt) uint32 {
+	if attempt != nil && attempt.copy != nil && attempt.copy.pressure {
+		return walReclaimPressureSmallFrames
+	}
+	return walReclaimConvergeSmallFrames
 }

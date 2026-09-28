@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"strings"
+	"time"
 )
 
 // GenerationCopyCounts is what one row-level generation copy moved.
@@ -22,6 +24,23 @@ type GenerationCopyCounts struct {
 	Nodes int64
 	Edges int64
 	Rows  int64
+	// WALBytes is the log the copy's committed transaction appended (0 for
+	// a rolled-back one: SQLite undoes its frames).
+	WALBytes int64
+}
+
+// logGenerationCopy writes one line per copy or fold: rows, the WAL it
+// appended, the outcome and how long it held the write gate.
+func (s *Store) logGenerationCopy(kind string, sources []int64, to int64, counts *GenerationCopyCounts, before WALWriteMark, started time.Time, err error) {
+	outcome := "committed"
+	if err != nil {
+		outcome = "rolled_back"
+	}
+	if d := WALWrittenBetween(before, readWALWriteMark(s.dbPath)); d.Valid && err == nil {
+		counts.WALBytes = d.Bytes
+	}
+	log.Printf("store_sqlite: generation %s to=%d sources=%v rows=%d nodes=%d edges=%d wal_bytes=%d outcome=%s elapsed=%s",
+		kind, to, sources, counts.Rows, counts.Nodes, counts.Edges, counts.WALBytes, outcome, time.Since(started).Round(time.Millisecond))
 }
 
 // generationCopyFTSChunk bounds the rows one FTS copy statement carries.

@@ -51,6 +51,9 @@ type backgroundCheckpointAttempt struct {
 	timeoutCancel context.CancelFunc
 	done          chan struct{}
 	finishOnce    sync.Once
+	// copy is the attempt's paced copy, set before the lane watcher starts
+	// (its passes pause only once the attempt marks it pausable).
+	copy *walCopyAttempt
 }
 
 type backgroundCheckpointCoordination struct {
@@ -89,6 +92,11 @@ type storeCore struct {
 	readGate *sqliteReadGate
 	// walReclaim holds the reclaim's counters (WALReclaimStats).
 	walReclaim walReclaimState
+	// walCopy is the reclaim copy's budget and counters (wal_copy_pause.go).
+	walCopy walCopyState
+	// walReclaimRequestedAt: when a writer refused on the log's size last
+	// asked for the reclaim (wal_reclaim_pressure.go), unix nanos.
+	walReclaimRequestedAt atomic.Int64
 
 	// busyRetryTimeout is the whole-transaction contention budget. The zero
 	// value selects defaultSQLiteBusyRetryTimeout; tests shorten it to exercise
@@ -712,6 +720,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// it), which is how a 535 MB DB ends up with an 11 GB -wal. This bounds
 	// the file even between the explicit TRUNCATE checkpoints runCheckpointLoop
 	// issues, and even if that loop is not running.
+	installWALCopyPause()
 	writerDSN := sqliteWriterDSN(path)
 	db, err := sql.Open("sqlite", writerDSN)
 	if err != nil {
@@ -1025,6 +1034,7 @@ func (s *Store) beginBackgroundCheckpointAttempt(policy checkpointCyclePolicy) (
 		cancel:        cancel,
 		timeoutCancel: timeoutCancel,
 		done:          make(chan struct{}),
+		copy:          &walCopyAttempt{},
 	}
 
 	coordination := &s.backgroundCheckpoint

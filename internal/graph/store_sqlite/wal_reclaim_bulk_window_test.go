@@ -151,9 +151,18 @@ func TestWALReclaimResetsANearlyBackfilledLogWithAShortHold(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, late.QueryRow(`SELECT count(*) FROM wal_churn`).Scan(&n))
 	growWAL(t, s, 2)
-	_, _ = checkpointWALOnceOn(context.Background(), ckpt, "PASSIVE")
+	// The store's own background PASSIVE can hold the checkpointer lock at
+	// this moment (a busy pass copies nothing), so repeat until a pass ran.
+	var snap walIndexSnapshot
+	var ok bool
+	for i := 0; i < 50; i++ {
+		_, _ = checkpointWALOnceOn(context.Background(), ckpt, "PASSIVE")
+		if snap, ok = readWALIndexSnapshot(path); ok && snap.MxFrame-snap.NBackfill < snap.MxFrame/50 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	require.NoError(t, late.Rollback())
-	snap, ok := readWALIndexSnapshot(path)
 	require.True(t, ok)
 	remainder := snap.MxFrame - snap.NBackfill
 	t.Logf("log: wal=%.0fMiB frames=%d backfilled=%d remainder=%d", float64(walFileSize(path+"-wal"))/(1<<20), snap.MxFrame, snap.NBackfill, remainder)

@@ -187,3 +187,31 @@ func TestFlattenGenerationChainHidesEdgesNamingAnIdentityAMemberAboveDropped(t *
 		t.Errorf("folded nodes = %v, want %v", got, want)
 	}
 }
+
+// A fold and a copy report the WAL their committed transaction appended; a
+// rolled-back one reports none (SQLite undoes its frames).
+func TestGenerationFoldAndCopyReportTheirWAL(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	bottom := flattenMember(t, store, "bottom", []*graph.Node{flatNode("repo/a.go::A", "repo/a.go")}, nil, nil, nil, nil)
+	top := flattenMember(t, store, "top", []*graph.Node{flatNode("repo/b.go::B", "repo/b.go")}, nil, nil, nil, nil)
+	folded := reservedGeneration(t, store, "folded")
+	counts, err := store.FlattenGenerationChain(ctx, []int64{bottom, top}, folded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.WALBytes <= 0 {
+		t.Fatalf("a committed fold reported no WAL: %+v", counts)
+	}
+	copied := reservedGeneration(t, store, "copied")
+	counts, err = store.CopyGenerationPayloadWhole(ctx, top, copied)
+	if err != nil || counts.WALBytes <= 0 {
+		t.Fatalf("a committed copy reported no WAL: %+v err=%v", counts, err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	counts, err = store.FlattenGenerationChain(cancelled, []int64{bottom, top}, reservedGeneration(t, store, "cancelled"))
+	if err == nil || counts.WALBytes != 0 {
+		t.Fatalf("a cancelled fold: %+v err=%v, want an error and no WAL", counts, err)
+	}
+}

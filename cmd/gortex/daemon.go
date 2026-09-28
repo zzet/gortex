@@ -2133,6 +2133,8 @@ func renderDaemonStorage(w io.Writer, st daemon.StatusResponse) {
 		r.CycleDeferrals, r.CycleForced, r.CycleRefusals, r.CycleYields, r.CycleCeilingRuns, formatBytes(nonNegative(r.CeilingBytes)))
 	fmt.Fprintf(w, "    retirement edit yield: waits=%d  timeouts=%d\n",
 		r.RetirementEditYields, r.RetirementEditYieldTimeouts)
+	fmt.Fprintf(w, "    retirement reclaim wait: waits=%d  timeouts=%d  bulk-window overrides=%d\n",
+		r.RetirementWaits, r.RetirementWaitTimeouts, r.LeaseOverrides)
 	if r.BackoffMS > 0 || r.LastOutcome != "" || r.LastReason != "" {
 		fmt.Fprintf(w, "    backoff=%s  last=%s", (time.Duration(r.BackoffMS) * time.Millisecond).String(), orDash(r.LastOutcome))
 		if r.LastReason != "" {

@@ -108,6 +108,9 @@ const (
 	// reclaim threshold. Over it a reclaim runs even while a mutation cycle
 	// holds the build lane (checkpoint_cycle_yield.go).
 	walReclaimCeilingFactor = 8
+	// walReclaimHardCapFactor: over this multiple of the ceiling one reclaim
+	// attempt may run while an edit cycle holds the build lane.
+	walReclaimHardCapFactor = 4
 )
 
 // walReclaimCeilingFloor is the lowest the WAL ceiling may be, so a low
@@ -379,6 +382,50 @@ type walReclaimResult struct {
 	// progressed: the attempt advanced the backfill (nBackfill moved) or the
 	// log was reset — a failure that made progress does not back off.
 	progressed bool
+	// The attempt's stamp (reclaimWALOnce): wall start and length, the
+	// process CPU consumed meanwhile (all goroutines: an upper bound for the
+	// attempt), and whether an edit cycle held the build lane at its start and
+	// at its end.
+	started                time.Time
+	elapsed, processCPU    time.Duration
+	laneAtStart, laneAtEnd bool
+	// began: the attempt got past the refusals and ran at least its first
+	// backfill, so it may have spent real time even when it ends skipped.
+	began bool
+	// The wal-index before and after the attempt (framesKnown when both
+	// reads succeeded). SQLite records nBackfillAttempted before it copies
+	// and nBackfill only after a pass completes, so an attempt cut short
+	// shows attempted ahead of backfilled: the pages it copied do not count.
+	framesBefore, framesAfter walIndexSnapshot
+	framesKnown               bool
+	// copy is what the attempt's paced passes did; passDiscarded: the last
+	// pass was cut short (SQLite recorded an attempt beyond what it
+	// backfilled), so its copied pages count for nothing.
+	copy          *walCopyAttempt
+	passDiscarded bool
+	// pressure: the attempt ran through a busy lane over the pressure mark.
+	pressure bool
+}
+
+// stampSuffix renders the attempt's stamp for the log line.
+func (r walReclaimResult) stampSuffix() string {
+	if r.started.IsZero() {
+		return ""
+	}
+	s := fmt.Sprintf(" started=%s elapsed=%s process_cpu=%s lane_busy_start=%t lane_busy_end=%t",
+		r.started.UTC().Format("15:04:05.000"), r.elapsed.Round(time.Millisecond), r.processCPU.Round(time.Millisecond),
+		r.laneAtStart, r.laneAtEnd)
+	if r.framesKnown {
+		s += fmt.Sprintf(" wal_frames=%d backfilled_before=%d backfilled_after=%d backfill_attempted_after=%d",
+			r.framesBefore.MxFrame, r.framesBefore.NBackfill, r.framesAfter.NBackfill, r.framesAfter.NBackfillAttempted)
+	}
+	if r.passDiscarded {
+		s += " pass_discarded=true"
+	}
+	if r.pressure {
+		s += " pressure=true"
+	}
+	return s + r.copy.suffix()
 }
 
 // reclaimWALOnce runs one bounded reclaim attempt and records its counters.
@@ -386,9 +433,26 @@ type walReclaimResult struct {
 // and never runs while the generation bulk checkpoint lease is held.
 func (s *Store) reclaimWALOnce(cfg walReclaimConfig, ckptDB *sql.DB, walPath string) walReclaimResult {
 	before, beforeOK := readWALIndexSnapshot(s.dbPath)
+	started, cpu0, laneAtStart := time.Now(), storeProcessCPUTime(), s.buildLaneBusy()
 	res := s.reclaimWALAttempt(cfg, ckptDB, walPath)
+	if res.pressure && res.outcome == walReclaimReset {
+		s.walCopy.pressureResets.Add(1)
+	}
+	res.started, res.laneAtStart = started, laneAtStart
+	res.elapsed, res.processCPU, res.laneAtEnd = time.Since(started), storeProcessCPUTime()-cpu0, s.buildLaneBusy()
 	if after, ok := readWALIndexSnapshot(s.dbPath); ok && beforeOK {
 		res.progressed = after.NBackfill > before.NBackfill || after.MxFrame < before.MxFrame
+		res.framesBefore, res.framesAfter, res.framesKnown = before, after, true
+		// Attempted beyond backfilled, and beyond where this attempt began:
+		// a pass of this attempt stopped before it could record its copy.
+		if after.NBackfillAttempted > after.NBackfill && after.NBackfillAttempted > before.NBackfill && after.MxFrame >= before.MxFrame {
+			res.passDiscarded = true
+			s.walCopy.discarded.Add(1)
+		}
+	}
+	if res.outcome == walReclaimSkipped && res.bytesBefore == 0 {
+		// A refusal returns before measuring the log; the skip line reports it.
+		res.bytesBefore = walFileSize(walPath)
 	}
 	if res.outcome == walReclaimReset {
 		res.progressed = true
@@ -441,11 +505,20 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	// The exception is a log over the WAL ceiling: then the attempt runs
 	// despite the lane, bounded by the writer-hold cap instead.
 	policy := checkpointYieldsToCycle
+	hardCap, pressure := false, false
 	if cfg.ceilingBytes > 0 && s.cycleYieldEnabled() && s.buildLaneBusy() {
-		if size := walFileSize(walPath); size >= cfg.ceilingBytes {
-			policy = checkpointIgnoresCycle
+		size := walFileSize(walPath)
+		if size >= cfg.ceilingBytes {
+			policy, hardCap = checkpointIgnoresCycle, true
 			s.walReclaim.cycle.ceiling.Add(1)
 			log.Printf("store_sqlite: wal reclaim running despite the build lane reason=wal_ceiling wal_bytes=%d ceiling=%d", size, cfg.ceilingBytes)
+		} else if mark := walPressureMark(cfg); mark > 0 && !walPressureOff && (size >= mark || s.walReclaimRequested(time.Now(), size, cfg)) {
+			// Over the pressure mark a sustained burst of edits would keep the
+			// lane busy past every pass: the copy runs through the edits
+			// (under the budget) and the reset takes a short hold of its own
+			// (walReclaimPressureHold) once the copy is complete.
+			policy, pressure = checkpointIgnoresCycle, true
+			s.walCopy.pressureRuns.Add(1)
 		}
 	}
 	attempt, berr := s.beginBackgroundCheckpointAttempt(policy)
@@ -479,8 +552,24 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		return walReclaimResult{outcome: walReclaimSkipped, reason: "checkpoint_lease"}
 	}
 	defer s.finishBackgroundCheckpointAttempt(attempt)
+	// Passes of an attempt that yields to edits pause for them; one running
+	// despite the lane (the hard cap) copies straight through.
+	// Only an attempt that yields to edits pauses for them: one begun with no
+	// lane to watch (none installed yet) has nobody to end its pause.
+	attempt.copy.pausable.Store(!hardCap && s.cycleYieldEnabled())
+	attempt.copy.pressure = pressure
+	if cfg.ceilingBytes > 0 {
+		attempt.copy.hardCapBytes, attempt.copy.walPath = walReclaimHardCapFactor*cfg.ceilingBytes, walPath
+		// A pause ends once the log reaches the pressure mark.
+		if mark := walPressureMark(cfg); mark > 0 && !walPressureOff {
+			attempt.copy.hardCapBytes = min(attempt.copy.hardCapBytes, mark)
+		}
+	}
+	if !hardCap && !pressure && !s.copyStartAllowed(time.Now()) {
+		return walReclaimResult{outcome: walReclaimSkipped, reason: "copy_budget"}
+	}
 
-	res := walReclaimResult{bytesBefore: walFileSize(walPath), leaseOverride: leaseOverride}
+	res := walReclaimResult{bytesBefore: walFileSize(walPath), leaseOverride: leaseOverride, began: true, copy: attempt.copy, pressure: pressure}
 	// Nothing in the log and nothing to shrink: never touch the writer.
 	if snap, ok := readWALIndexSnapshot(s.dbPath); ok && snap.MxFrame == 0 && res.bytesBefore <= cfg.thresholdBytes {
 		return walReclaimResult{outcome: walReclaimSkipped, reason: "nothing_to_reclaim", bytesBefore: res.bytesBefore}
@@ -488,7 +577,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	// Step 1: the unbounded backfill (see the file comment), without the
 	// writer. Its error is not fatal — the lane copies whatever remains —
 	// unless the attempt was cancelled.
-	_, _ = checkpointWALOnceOn(attempt.ctx, ckptDB, "PASSIVE")
+	_, _ = s.pacedPassive(attempt.ctx, ckptDB, attempt)
 	// Step 2: without the writer and with the gate OPEN, converge on a log
 	// no reader pins: backfill, then wait out every reader admitted before
 	// that backfill. A reader admitted after a COMPLETE backfill takes read
@@ -513,9 +602,26 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		prevFrames := -1
 		for {
 			rounds++
-			pctx, pcancel := context.WithDeadline(wctx, deadline)
-			result, perr := checkpointWALOnceOn(pctx, ckptDB, "PASSIVE")
+			// A paced pass runs on the attempt's own context: the urgency
+			// watch and the round deadline end the rounds between passes,
+			// never a pass in the middle (that would discard its copy).
+			passCtx := wctx
+			if attempt.copy != nil && attempt.copy.pausable.Load() {
+				passCtx = attempt.ctx
+			}
+			pctx, pcancel := context.WithDeadline(passCtx, deadline)
+			if passCtx == attempt.ctx {
+				pctx, pcancel = context.WithCancel(passCtx)
+			}
+			result, perr := s.pacedPassive(pctx, ckptDB, attempt)
 			pcancel()
+			if wctx.Err() != nil || errors.Is(perr, errWALCheckpointYieldedToCycle) {
+				// Cancelled (an edit, shutdown, an urgent log) or an edit began:
+				// without this the rounds would spin until the deadline, since
+				// waiting for older readers returns at once when there are none.
+				res.openGateWaited = time.Since(started)
+				break
+			}
 			complete := perr == nil && !result.incomplete()
 			if complete && !s.writeWanted() {
 				// Let SQLite decide first: readers that began after a
@@ -574,11 +680,39 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	if cfg.thresholdBytes > 0 && walFileSize(walPath) >= walReclaimUrgentFactor*cfg.thresholdBytes {
 		res.urgent = true
 	}
+	// An edit began meanwhile: the copy so far is kept (every pass that
+	// completed moved nBackfill); the writer is not taken during an edit.
+	if attempt.copy != nil && attempt.copy.pausable.Load() && !attempt.copy.pressure && s.buildLaneBusy() {
+		res.outcome, res.reason = walReclaimSkipped, "build_lane_busy"
+		res.bytesAfter = walFileSize(walPath)
+		return res
+	}
 	// Before the writer: converge the backfill so the capped writer step
 	// only has to copy what fits its slice (wal_reclaim_converge.go).
 	if attempt.ctx.Err() == nil {
-		conv := s.convergeBackfill(attempt.ctx, ckptDB)
+		conv := s.convergeBackfillPaced(attempt.ctx, ckptDB, attempt)
 		res.convergence = &conv
+	}
+	if attempt.copy != nil && attempt.copy.pausable.Load() && !attempt.copy.pressure && s.buildLaneBusy() {
+		res.outcome, res.reason = walReclaimSkipped, "build_lane_busy"
+		res.bytesAfter = walFileSize(walPath)
+		return res
+	}
+	if pressure && s.buildLaneBusy() {
+		// Inside the busy lane: the reset alone, under its own short cap.
+		err := s.reclaimWALPressureReset(attempt.ctx, ckptDB, &res)
+		res.bytesAfter = walFileSize(walPath)
+		if err == nil {
+			res.outcome = walReclaimReset
+			return res
+		}
+		if res.outcome == 0 || res.outcome == walReclaimReset {
+			res.outcome = walReclaimDeferred
+		}
+		if res.reason == "" {
+			res.reason = err.Error()
+		}
+		return res
 	}
 	ctx, cancel := context.WithTimeout(attempt.ctx, walReclaimLaneBudget)
 	defer cancel()
@@ -823,6 +957,7 @@ func (s *Store) AnnounceWrite() (release func()) {
 	if s.coreless() {
 		return func() {}
 	}
+	s.walCopy.sawBusy(time.Now())
 	s.writeIntents.Add(1)
 	var once sync.Once
 	return func() { once.Do(func() { s.writeIntents.Add(-1) }) }
@@ -986,7 +1121,7 @@ func logWALReclaimOutcome(res walReclaimResult, next time.Duration, skips *walRe
 	switch res.outcome {
 	case walReclaimReset:
 		log.Printf("store_sqlite: wal reclaimed stage=%s bytes_before=%d bytes_after=%d frames=%d reader_pause=%s writer_hold=%s%s",
-			stage, res.bytesBefore, res.bytesAfter, res.frames, res.pause, res.writerHold.Round(time.Millisecond), res.convergenceSuffix())
+			stage, res.bytesBefore, res.bytesAfter, res.frames, res.pause, res.writerHold.Round(time.Millisecond), res.convergenceSuffix()+res.stampSuffix())
 	case walReclaimDeferred, walReclaimFailed:
 		if res.hasBlocker && res.blocker.Age >= walReclaimBlockedReaderWarnAge {
 			log.Printf("store_sqlite: WARN wal reclaim blocked by a long reader: age=%s admitted_epoch=%d statement=%q (a read transaction that old pins the WAL snapshot; the log cannot reset until it ends)",
@@ -996,8 +1131,14 @@ func logWALReclaimOutcome(res walReclaimResult, next time.Duration, skips *walRe
 			log.Printf("store_sqlite: wal reclaim open_gate gave up %s writer_hold=%s", res.openGateReport, res.writerHold.Round(time.Millisecond))
 		}
 		log.Printf("store_sqlite: wal reclaim %s reason=%q wal_bytes=%d reader_pause=%s writer_hold=%s progressed=%t next_attempt_in=%s%s",
-			res.outcome, res.reason, res.bytesBefore, res.pause, res.writerHold.Round(time.Millisecond), res.progressed, next, res.convergenceSuffix())
+			res.outcome, res.reason, res.bytesBefore, res.pause, res.writerHold.Round(time.Millisecond), res.progressed, next, res.convergenceSuffix()+res.stampSuffix())
 	case walReclaimSkipped:
+		if res.began {
+			// It ran and was stopped (an edit cycle took the lane, a writer
+			// queued, shutdown): its time is real, so it gets its own line.
+			log.Printf("store_sqlite: wal reclaim abandoned reason=%q wal_bytes=%d%s", res.reason, res.bytesBefore, res.convergenceSuffix()+res.stampSuffix())
+			return
+		}
 		skips.count++
 		skips.reason = res.reason
 		if res.openGateReport != "" {

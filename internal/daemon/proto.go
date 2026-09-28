@@ -552,6 +552,13 @@ type WALReclaimStatus struct {
 	// the waits that ran out and proceeded.
 	RetirementEditYields        int64 `json:"retirement_edit_yields"`
 	RetirementEditYieldTimeouts int64 `json:"retirement_edit_yield_timeouts"`
+	// Retirement chunks that waited for the reclaim with the WAL over its
+	// ceiling, and the waits that ran out and proceeded; reclaim attempts
+	// run inside a generation bulk window because the WAL was over the
+	// ceiling.
+	RetirementWaits        int64 `json:"retirement_waits"`
+	RetirementWaitTimeouts int64 `json:"retirement_wait_timeouts"`
+	LeaseOverrides         int64 `json:"lease_overrides"`
 }
 
 // BuildLaneStatus is the view-build lane's state for daemon status.
