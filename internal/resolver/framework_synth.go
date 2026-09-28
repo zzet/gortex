@@ -354,6 +354,12 @@ type frameworkCandidateSummary struct {
 	// Absence-proof gates (edge census, family/receiver tails) may only
 	// trust counts from a full walk; a partial summary cannot prove absence.
 	fullCensus bool
+	// frontierCSharp counts the C# nodes of an exact changed-file frontier
+	// (partial runs with filePaths only). The receiver-type tail demotes a
+	// call only when both its caller and its target are C#, and a frontier
+	// run reads only calls out of or into the frontier's nodes, so a
+	// frontier with no C# node cannot demote anything.
+	frontierCSharp int
 	// streams carries the shared-stream candidate buffers the census edge
 	// walks collected for the converted synthesizers. Full-census runs only;
 	// nil on a partial run, where every pass keeps its own scoped scans.
@@ -629,6 +635,9 @@ func summarizeFrameworkCandidatesCensus(
 		}
 		if !fullCensus {
 			recordFrameworkNodeCandidates(summary.scopedMarkers, n, family)
+			if len(filePaths) > 0 && strings.EqualFold(strings.TrimSpace(n.Language), "csharp") {
+				summary.frontierCSharp++
+			}
 		}
 		if family == "" {
 			continue
@@ -1208,6 +1217,9 @@ type SynthCount struct {
 	// kind across the whole graph before concluding there is nothing to
 	// bind — so this rides on every row, not just the ones with edges.
 	Millis int64 `json:"ms,omitempty"`
+	// Faults is the process's major page faults during the pass (disk reads
+	// of the store's pages it could not find in memory).
+	Faults int64 `json:"faults,omitempty"`
 	// ScopeRows/ScopeBytes expose the bounded seed plus this pass's private
 	// dependency expansion. They make accidental cross-pass widening visible
 	// without retaining candidate objects after the pass completes.
@@ -1230,6 +1242,12 @@ type FrameworkSynthReport struct {
 	// tier because they attach to a same-named member of a type unrelated to
 	// the edge's receiver_type.
 	ReceiverGated int `json:"receiver_type_gated,omitempty"`
+	// CandidateGated names the scoped passes that did not run because the
+	// change carries no row they select (passHasCandidates).
+	CandidateGated []string `json:"candidate_gated,omitempty"`
+	// CandidateCheckMillis times the candidate checks (passHasCandidates),
+	// which read the run's shared seed; it is not in any pass's row.
+	CandidateCheckMillis int64 `json:"candidate_check_ms,omitempty"`
 	// GDScriptReceiverGated counts the same demotion for GDScript, where the
 	// receiver is stated at every call site and a same-named method in the
 	// caller's own directory is the standing phantom.
@@ -1246,9 +1264,11 @@ type FrameworkSynthReport struct {
 	// here with every synthesizer gated to zero — the census, not the
 	// synthesizers, owned the pass. It must never be silent again.
 	CensusMillis int64 `json:"census_ms,omitempty"`
-	// ScopeMillis times the scoped-store seed construction between the census
-	// and the loop. ScopeRows/ScopeBytes describe that immutable seed; each
-	// SynthCount then reports the seed plus only its private expansion.
+	// ScopeMillis times the scoped seed's reads: the changed files' nodes and
+	// every declared part the passes loaded (each once per run). ScopeRows
+	// counts the rows those reads returned; ScopeBytes the bounded legacy
+	// seed's retained bytes when a legacy pass built it. Each SynthCount
+	// reports its own view plus its private expansion.
 	ScopeMillis int64 `json:"scope_ms,omitempty"`
 	ScopeRows   int   `json:"scope_rows,omitempty"`
 	ScopeBytes  int   `json:"scope_bytes,omitempty"`
@@ -1407,13 +1427,13 @@ func runFrameworkSynthesizersScoped(
 		executionScope = nil
 	}
 
-	scopeStart := time.Now()
-	var genericSeed *frameworkScopedSeed
+	var genericSeed *frameworkDeclaredSeed
 	var fullReadCache *frameworkFullReadCache
 	if executionScope != nil {
-		genericSeed = newFrameworkScopedSeed(g, executionScope, filePaths)
-		rep.ScopeRows = genericSeed.retainedRows
-		rep.ScopeBytes = genericSeed.retainedBytes
+		// Each pass reads the parts of the change its declaration names,
+		// loaded once on first use (framework_seed_declarations.go); the
+		// seed's time and rows are reported after the loop.
+		genericSeed = newFrameworkDeclaredSeed(g, executionScope, filePaths)
 	} else {
 		// Node declarations are immutable throughout the framework registry.
 		// Share their decoded projections across passes under a hard run-local
@@ -1421,13 +1441,21 @@ func runFrameworkSynthesizersScoped(
 		// mutation so this optimization cannot return stale declaration state.
 		fullReadCache = newFrameworkFullReadCache()
 	}
-	rep.ScopeMillis = time.Since(scopeStart).Milliseconds()
 	for _, s := range defaultFrameworkSynthesizers() {
 		if !selection.allows(s.Name()) {
 			candidates.streams.releasePass(s.Name(), nil)
 			continue
 		}
-		start := time.Now()
+		// The candidate check reads the run's shared seed (the incident read,
+		// the changed files' rows) on behalf of every pass that asks next; it
+		// is timed apart so a pass's row is its own work.
+		candidateGated := false
+		if genericSeed != nil && executionScope != nil && frameworkCandidateGatedPasses[s.Name()] {
+			checkStart := time.Now()
+			candidateGated = !genericSeed.passHasCandidates(s.Name())
+			rep.CandidateCheckMillis += time.Since(checkStart).Milliseconds()
+		}
+		start, startFaults := time.Now(), processMajorFaults()
 		var n int
 		var bundle *frameworkPassCandidates
 		var passScope *frameworkScopedStore
@@ -1446,8 +1474,11 @@ func runFrameworkSynthesizersScoped(
 					n = runLegacyFrameworkSynthWithCache(g, fullReadCache, sf.fn)
 				case sf.scopedFn != nil:
 					n = sf.scopedFn(g, executionScope)
+				case candidateGated:
+					// The change carries no row this pass selects.
+					rep.CandidateGated = append(rep.CandidateGated, sf.name)
 				default:
-					passScope = genericSeed.newPassStore()
+					passScope = genericSeed.passStore(sf.name)
 					n = runLegacyFrameworkSynth(passScope, sf.fn)
 				}
 			} else if ss, ok := s.(scopedSynthesizer); ok {
@@ -1460,7 +1491,7 @@ func runFrameworkSynthesizersScoped(
 				panic("framework partial run has an unscoped synthesizer: " + s.Name())
 			}
 		}
-		count := SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds()}
+		count := SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds(), Faults: processMajorFaults() - startFaults}
 		if passScope != nil {
 			stats := passScope.stats()
 			count.ScopeRows = stats.RetainedRows
@@ -1469,6 +1500,13 @@ func runFrameworkSynthesizersScoped(
 		rep.Per = append(rep.Per, count)
 		rep.Total += n
 		candidates.streams.releasePass(s.Name(), bundle)
+	}
+	if genericSeed != nil {
+		rep.ScopeMillis = genericSeed.elapsed.Milliseconds()
+		rep.ScopeRows = genericSeed.rows
+		if genericSeed.legacy != nil {
+			rep.ScopeBytes = genericSeed.legacy.retainedBytes
+		}
 	}
 	// Capture observability before dropping the run-local cache. Tail gates and
 	// claiming resolvers use different projections and must not prolong its
@@ -1507,7 +1545,8 @@ func runFrameworkSynthesizersScoped(
 	// Receiver-type gate runs last: it corrects (demotes) already-bound C#
 	// member calls, so it must see the settled call graph.
 	demoteStart := time.Now()
-	if frameworkReceiverGateNeeded(executionScope, candidates) {
+	if frameworkReceiverGateNeeded(executionScope, candidates) &&
+		frameworkReceiverGateReachesFrontier(filePaths, csharpHierarchyChanged, candidates) {
 		rep.ReceiverGated = demoteCSharpMisattributedMemberCallsScopedForFiles(
 			g, executionScope, filePaths, csharpHierarchyChanged,
 		)
@@ -1570,6 +1609,18 @@ func frameworkGDScriptGateNeeded(summary frameworkCandidateSummary) bool {
 		return summary.allMarkers[frameworkMarkerGDScript] > 0
 	}
 	return summary.scopedMarkers[frameworkMarkerGDScript] > 0
+}
+
+// frameworkReceiverGateReachesFrontier gates the receiver-type tail of an
+// exact changed-file run by language before it reads anything: with an
+// unchanged C# hierarchy the tail examines only calls out of or into the
+// frontier's nodes (csharpCallCandidatesForFiles) and demotes only C#-to-C#
+// member calls, so a frontier without a C# node yields nothing.
+func frameworkReceiverGateReachesFrontier(filePaths []string, csharpHierarchyChanged bool, summary frameworkCandidateSummary) bool {
+	if len(filePaths) == 0 || csharpHierarchyChanged || summary.fullCensus {
+		return true
+	}
+	return summary.frontierCSharp > 0
 }
 
 func frameworkReceiverGateNeeded(_ map[string]bool, summary frameworkCandidateSummary) bool {

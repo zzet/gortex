@@ -116,6 +116,7 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 	// set than the gate uses. The memo still collapses repeated positive and
 	// negative lookups to one bounded store query per distinct global name.
 	nameMemo := make(map[string][]*graph.Node)
+	prefetchCertainFnValueNames(g, candidates, nameMemo)
 	var landed []*graph.Edge
 	for _, edge := range candidates {
 		name, _ := edge.Meta[metaFnValueName].(string)
@@ -510,4 +511,38 @@ func isFnValueNonTarget(name string) bool {
 		return true
 	}
 	return false
+}
+
+// prefetchCertainFnValueNames reads, in one batch, the names the gate is
+// certain to look up across the repository: a gate-skipping value and a
+// member of a named receiver type. Every other candidate binds in its own
+// file first and reads its name lazily only if that fails (an ungated
+// fallback, a self member), so the batch holds exactly the rows the per-name
+// reads would have decoded, in one round trip instead of one per name.
+func prefetchCertainFnValueNames(g graph.Store, candidates []*graph.Edge, memo map[string][]*graph.Node) {
+	var names []string
+	seen := make(map[string]struct{})
+	for _, edge := range candidates {
+		name, _ := edge.Meta[metaFnValueName].(string)
+		if name == "" {
+			continue
+		}
+		recvHint, _ := edge.Meta["fn_ref_recv_hint"].(string)
+		skipGate, _ := edge.Meta["skip_gate"].(bool)
+		if !skipGate && (recvHint == "" || recvHint == "<self>") {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return
+	}
+	found := g.FindNodesByNames(names)
+	for _, name := range names {
+		memo[name] = found[name]
+	}
 }

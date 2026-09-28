@@ -117,12 +117,24 @@ func (r *Resolver) bindDataflowCalleeRefsForFile(filePath string) {
 	dir := filePathDir(filePath)
 	if names := dataflowPackageCalleeNames(fileEdges, idx); len(names) > 0 && len(r.dirIndex[dir]) > 0 {
 		packageFiles := make(map[string]struct{}, len(r.dirIndex[dir]))
+		repos := make(map[string]struct{}, 1)
 		for _, fileNode := range r.dirIndex[dir] {
 			if fileNode.FilePath != "" {
 				packageFiles[fileNode.FilePath] = struct{}{}
+				repos[fileNode.RepoPrefix] = struct{}{}
 			}
 		}
-		found := r.graph.FindNodesByNames(names)
+		// The package's files are one repository's: read the names there
+		// rather than in every tracked repository.
+		var found map[string][]*graph.Node
+		finder, scoped := r.graph.(graph.RepoNamesNodeFinder)
+		if scoped && len(repos) == 1 {
+			for repo := range repos {
+				found = finder.FindNodesByNamesInRepo(names, repo)
+			}
+		} else {
+			found = r.graph.FindNodesByNames(names)
+		}
 		for _, name := range names {
 			for _, n := range found[name] {
 				if n == nil || n.Kind != graph.KindFunction || n.Name != name || n.FilePath == "" {

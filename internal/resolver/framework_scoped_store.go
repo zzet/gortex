@@ -97,6 +97,25 @@ type frameworkScopedSeed struct {
 
 	retainedRows  int
 	retainedBytes int
+
+	// declared is set on a pass's view of a declared seed
+	// (framework_seed_declarations.go): decl is the pass's declaration, and
+	// the view loads its declared parts from declared on first use. A legacy
+	// seed has none and is complete at construction.
+	declared      *frameworkDeclaredSeed
+	decl          frameworkSeedDeclaration
+	nodesReady    bool
+	incidentReady map[graph.EdgeKind]bool
+}
+
+// boundedRows is the seed's share of the retained-row cap: a legacy seed's
+// rows count against it, a declared view's do not (its parts are exactly
+// what its declaration names).
+func (s *frameworkScopedSeed) boundedRows() (rows, bytes int) {
+	if s == nil || s.declared != nil {
+		return 0, 0
+	}
+	return s.retainedRows, s.retainedBytes
 }
 
 type frameworkScopedOutputs struct {
@@ -257,6 +276,7 @@ func (v *frameworkScopedStore) ReindexEdges(batch []graph.EdgeReindex) {
 
 func (v *frameworkScopedStore) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 	removed := v.Store.RemoveEdge(from, to, kind)
+	v.seed.ensureIncident(kind)
 	if removed && v.seed != nil && v.seed.outputs != nil {
 		v.seed.outputs.removeMatching(from, to, kind, v.seed.incidentByKind[kind])
 	}
@@ -322,6 +342,7 @@ func (v *frameworkScopedStore) AllEdges() []*graph.Edge {
 }
 
 func (v *frameworkScopedStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
+	v.seed.ensureNodes()
 	var base iter.Seq[*graph.Node]
 	if len(v.scope.filePaths) > 0 {
 		// Same rows and order as the scoped projection, read by file (see
@@ -358,6 +379,7 @@ func (v *frameworkScopedStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.
 }
 
 func (v *frameworkScopedStore) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
+	v.seed.ensureIncident(kind)
 	base := graph.EdgesInScopeSeq(v.Store, v.scope.repoPrefixes, v.scope.filePaths, kind)
 	return func(yield func(*graph.Edge) bool) {
 		yielded := make(map[graph.EdgeIdentity]struct{})
@@ -653,19 +675,13 @@ func (v *frameworkScopedStore) rememberEdge(edge *graph.Edge) bool {
 // seedAtRowCap reports that no further row can be retained whatever its size:
 // canRetain refuses every row once the row count reaches the cap.
 func (v *frameworkScopedStore) seedAtRowCap() bool {
-	rows := v.retainedRows
-	if v.seed != nil {
-		rows += v.seed.retainedRows
-	}
-	return rows >= frameworkScopeRetainedRowCap
+	seedRows, _ := v.seed.boundedRows()
+	return v.retainedRows+seedRows >= frameworkScopeRetainedRowCap
 }
 
 func (v *frameworkScopedStore) canRetain(size int) bool {
-	rows, bytes := v.retainedRows, v.retainedBytes
-	if v.seed != nil {
-		rows += v.seed.retainedRows
-		bytes += v.seed.retainedBytes
-	}
+	seedRows, seedBytes := v.seed.boundedRows()
+	rows, bytes := v.retainedRows+seedRows, v.retainedBytes+seedBytes
 	return rows < frameworkScopeRetainedRowCap &&
 		bytes+size <= frameworkScopeRetainedByteCap
 }
