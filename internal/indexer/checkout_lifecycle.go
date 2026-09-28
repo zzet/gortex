@@ -176,6 +176,8 @@ type CheckoutLifecycle struct {
 	// generation older than it cannot have been created by this process and is
 	// crash residue unless a process-local payload flight has adopted it.
 	buildingRecoveryCutoff int64
+	// idle records checkout use for the idle release (checkout_idle_release.go).
+	idle idleCheckoutState
 
 	// observationMu bounds and coalesces first-request metadata work. Jobs
 	// belong to this lifecycle, not whichever request first waits for them.
@@ -383,6 +385,16 @@ type CheckoutLifecycle struct {
 	transitionClosed  bool
 }
 
+// clock is the lifecycle's time: its configured clock, or time.Now for a
+// lifecycle built without one (a struct literal, as tests build it), which
+// must not panic on a nil func.
+func (l *CheckoutLifecycle) clock() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	return time.Now()
+}
+
 // NewCheckoutLifecycle builds the lifecycle. It fails only on a missing
 // indexer; everything else degrades to the pre-catalog behaviour.
 func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, error) {
@@ -553,6 +565,7 @@ func (l *CheckoutLifecycle) NoteCheckoutUse(checkoutID, reason string) {
 	if l == nil || checkoutID == "" {
 		return
 	}
+	l.idle.noteUse(checkoutID, l.clock())
 	l.coordMu.Lock()
 	coordinator := l.coordinators[checkoutID]
 	l.coordMu.Unlock()
@@ -798,7 +811,7 @@ func (l *CheckoutLifecycle) recordCheckout(
 			"git does not list %s as a worktree of %s", root, inv.CommonDir)
 	}
 
-	now := l.now()
+	now := l.clock()
 	familyID := FamilyIDFor(inv.CommonDir)
 	if err := l.upsertFamily(ctx, familyID, inv.CommonDir, now.Unix()); err != nil {
 		return checkoutIdentity{}, err
@@ -1770,7 +1783,7 @@ func (l *CheckoutLifecycle) scheduleFamilyRetryAt(familyID string, deadline int6
 	if deadline <= 0 {
 		return
 	}
-	delay := time.Unix(deadline, 0).Sub(l.now())
+	delay := time.Unix(deadline, 0).Sub(l.clock())
 	if delay <= 0 {
 		delay = time.Millisecond
 	}
@@ -1804,7 +1817,7 @@ func (l *CheckoutLifecycle) runFamilyRetry(familyID string, deadline int64) {
 	}
 	l.logger.Warn("checkout lifecycle: scheduled family reconciliation failed",
 		zap.String("family", familyID), zap.Error(err))
-	l.scheduleFamilyRetryAt(familyID, l.now().Add(5*time.Second).Unix())
+	l.scheduleFamilyRetryAt(familyID, l.clock().Add(5*time.Second).Unix())
 }
 
 func familyReportRemoved(report reconcile.FamilyReport) bool {
@@ -2048,6 +2061,7 @@ func (l *CheckoutLifecycle) ActivateCheckout(checkoutID, reason string) bool {
 	if l == nil || checkoutID == "" {
 		return false
 	}
+	l.idle.noteUse(checkoutID, l.clock())
 	// Deliberately does NOT signal a coordinator that is already live. The
 	// coordinator's build loop re-arms its quiet window on every signal and
 	// runs a cycle only once that window elapses with no further signals; a
@@ -2273,7 +2287,7 @@ func (l *CheckoutLifecycle) recordCoordinatorStartFailure(checkout store_sqlite.
 		CheckoutID: checkout.CheckoutID,
 		RootPath:   checkout.RootPath,
 		Reason:     err.Error(),
-		At:         l.now().Unix(),
+		At:         l.clock().Unix(),
 	}
 }
 
@@ -3285,7 +3299,7 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 	// deliberate: healthy or still-referenced rows must not pin older orphaned
 	// generations behind the catalog listing bound.
 	const abandonedBuildingGrace = time.Minute
-	abandonedBuildingBefore := l.now().Add(-abandonedBuildingGrace).Unix()
+	abandonedBuildingBefore := l.clock().Add(-abandonedBuildingGrace).Unix()
 	scanRetirementState := func(state store_sqlite.ViewGenerationState, label string) {
 		var beforeGenerationID int64
 		for {

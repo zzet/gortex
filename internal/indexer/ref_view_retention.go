@@ -244,8 +244,8 @@ func (l *CheckoutLifecycle) refViewEvictions(
 		}
 	}
 
-	cutoff := l.now().Add(-l.refViewRetention.RetainInactive).Unix()
-	inFlightSince := l.now().Add(-refViewBuildLiveness).Unix()
+	cutoff := l.clock().Add(-l.refViewRetention.RetainInactive).Unix()
+	inFlightSince := l.clock().Add(-refViewBuildLiveness).Unix()
 	var (
 		candidates []refViewCandidate
 		total      int64

@@ -26,6 +26,8 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 	if ctx == nil {
 		return 0, true, fmt.Errorf("deferred retirement: nil context")
 	}
+	// Idle checkouts give their layers to this sweep (at most hourly).
+	_, _ = l.ReleaseIdleCheckouts(ctx)
 	if err := l.lockRetirementSweep(ctx); err != nil {
 		return 0, true, err
 	}
@@ -382,7 +384,7 @@ func (l *CheckoutLifecycle) discoverDeferredRetirementsWith(
 	}
 
 	const abandonedBuildingGrace = time.Minute
-	abandonedBefore := l.now().Add(-abandonedBuildingGrace).Unix()
+	abandonedBefore := l.clock().Add(-abandonedBuildingGrace).Unix()
 	scanState := func(state store_sqlite.ViewGenerationState, label string) error {
 		var cursor int64
 		for {

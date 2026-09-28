@@ -119,7 +119,7 @@ func (l *CheckoutLifecycle) startPromoteCheckout(
 			SourceKind:    source,
 			SourceLocator: checkout.RootPath,
 			Active:        true,
-			CreatedAt:     l.now().Unix(),
+			CreatedAt:     l.clock().Unix(),
 		}
 	}
 	transition, err := l.beginModeChange(ctx, checkout,
@@ -168,7 +168,7 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 	}
 	transition = standing
 	if err := l.catalog.UpdateIntentTransitionProgress(ctx, transition.CheckoutID,
-		transition.TransitionID, store_sqlite.IntentTransitionRunning, "", l.now().Unix()); err != nil {
+		transition.TransitionID, store_sqlite.IntentTransitionRunning, "", l.clock().Unix()); err != nil {
 		return out, err
 	}
 	checkout, err := l.checkoutStateOf(ctx, transition.CheckoutID)
@@ -334,7 +334,7 @@ func (l *CheckoutLifecycle) serveFromOwnCorpus(ctx context.Context, checkout sto
 		State:         store_sqlite.CheckoutStateReady,
 		DesiredMode:   store_sqlite.CheckoutModeDedicated,
 		EffectiveMode: store_sqlite.CheckoutModeDedicated,
-		LastSeen:      l.now().Unix(),
+		LastSeen:      l.clock().Unix(),
 	})
 	if err != nil {
 		return err
@@ -406,7 +406,7 @@ func (l *CheckoutLifecycle) beginModeChange(
 	cause string,
 	trackingIntent *store_sqlite.TrackingIntent,
 ) (store_sqlite.IntentTransition, error) {
-	now := l.now().Unix()
+	now := l.clock().Unix()
 	transition := store_sqlite.IntentTransition{
 		TransitionID:       uuid.NewV7().String(),
 		CheckoutID:         checkout.CheckoutID,
@@ -437,7 +437,7 @@ func (l *CheckoutLifecycle) promotionFailed(
 	ctx context.Context, out *PromoteResult, transition store_sqlite.IntentTransition, cause error,
 ) error {
 	err := l.catalog.UpdateIntentTransitionProgress(ctx, out.CheckoutID, transition.TransitionID,
-		store_sqlite.IntentTransitionPending, cause.Error(), l.now().Unix())
+		store_sqlite.IntentTransitionPending, cause.Error(), l.clock().Unix())
 	if err != nil {
 		l.logger.Warn("checkout lifecycle: could not journal a failed promotion",
 			zap.String("checkout", out.CheckoutID), zap.Error(err))
