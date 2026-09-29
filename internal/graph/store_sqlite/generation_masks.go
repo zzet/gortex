@@ -511,12 +511,20 @@ func (s *Store) validateContextMaskClaims() error {
 // COVERING index here because a WITHOUT ROWID index entry carries the primary
 // key — view_gen included — so the generation filter costs no table lookup;
 // content docids on content_fts_rowid_by_file, whose leading columns are
-// exactly (view_gen, file_path). edges_by_file leads with file_path and
-// carries no generation, so that probe seeks the path and filters the
-// generation over the few edges standing at it — a seek, not a scan, and only
-// for the masks that claim a deletion. The whole check is one set-oriented
-// query returning only the violating rows, capped at
-// generationMaskViolationLimit.
+// exactly (view_gen, file_path). The edge probe is different, because no
+// index leads with (view_gen, file_path): it is one uncorrelated list of the
+// paths this generation's own edges are recorded at, built once — and only
+// when a delete or context mask survives the cheaper probes — and then looked
+// up per mask. Its cost is the generation's own edge count. The per-mask
+// alternative, a seek on edges_by_file(file_path) filtered to the generation,
+// reads every edge recorded at the path in EVERY generation, base included,
+// with a table lookup each; for a sparse layer's read-only context (every
+// declared file is a context mask, and a context file of a large package
+// carries thousands of base edges) that made the probe the whole cost of
+// publishing (~300–490 ms on this repository for a 1,619- or 105-edge
+// generation, against well under a millisecond for the generation's own
+// list). The whole check is one set-oriented query returning only the
+// violating rows, capped at generationMaskViolationLimit.
 //
 // The CTE is deliberately left un-materialized: SQLite flattens it, so mask
 // rows stream and the LIMIT stops the walk at the first few contradictions
@@ -525,12 +533,21 @@ func (s *Store) validateContextMaskClaims() error {
 //
 // A base handle has no masks, so this reports nothing rather than refusing.
 func (s *Store) ValidateGenerationMasks() error {
+	return s.validateGenerationMasksTimed(nil)
+}
+
+// validateGenerationMasksTimed is ValidateGenerationMasks with each of its
+// three probes charged to the publish window's timings (nil: untimed).
+func (s *Store) validateGenerationMasksTimed(timings *publishTimings) error {
 	if err := s.validateNodeIdentityMasks(); err != nil {
 		return err
 	}
+	timings.mark(publishStepIdentityMasks)
 	if err := s.validateContextMaskClaims(); err != nil {
 		return err
 	}
+	timings.mark(publishStepContextClaims)
+	defer timings.mark(publishStepFileMasks)
 	rows, err := s.db.Query(validateGenerationMasksSQL,
 		s.viewGen, string(OwnershipReplace), string(OwnershipDelete), string(OwnershipContext),
 		s.viewGen, s.viewGen,
@@ -567,10 +584,11 @@ func (s *Store) ValidateGenerationMasks() error {
 	return fmt.Errorf("%w: generation %d: %s", ErrGenerationMaskIntegrity, s.viewGen, strings.Join(violations, "; "))
 }
 
-// validateGenerationMasksSQL is shared with its plan guard. The edge probe
-// deliberately uses a non-sargable generation operand: delete/context
-// masks ask whether one path has any same-generation edge, and this rules out
-// a generation-leading index while leaving the optional file-leading index usable.
+// validateGenerationMasksSQL is shared with its plan guard. The edge probe is
+// an uncorrelated IN list — SQLite builds it once, on first use, into an
+// ephemeral index — of the paths the generation's own edges are recorded at,
+// so its cost is bounded by the generation's payload and never by how many
+// edges other generations keep at a masked path (see ValidateGenerationMasks).
 const validateGenerationMasksSQL = `
 WITH masked(repo_prefix, file_path, ownership_mode, covered) AS (
     SELECT m.repo_prefix, m.file_path, m.ownership_mode,
@@ -586,8 +604,8 @@ WITH masked(repo_prefix, file_path, ownership_mode, covered) AS (
 SELECT repo_prefix, file_path, ownership_mode FROM masked
  WHERE (ownership_mode = ? AND covered = 0)
     OR (ownership_mode IN (?, ?) AND (covered = 1
-        OR EXISTS (SELECT 1 FROM edges AS e
-                    WHERE e.file_path = masked.file_path AND +e.view_gen = ?)
+        OR masked.file_path IN (SELECT e.file_path FROM edges AS e
+                                 WHERE e.view_gen = ?)
         OR EXISTS (SELECT 1 FROM content_fts_rowid AS c
                     WHERE c.view_gen = ? AND c.file_path = masked.file_path)))
     OR ownership_mode NOT IN (?, ?, ?)

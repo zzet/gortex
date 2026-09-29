@@ -359,13 +359,14 @@ func TestValidateGenerationMasksProbesEdgesAndContent(t *testing.T) {
 	}
 }
 
-func TestValidateGenerationMasksUsesFileIndexForEdgeEmptiness(t *testing.T) {
+func TestValidateGenerationMasksProbesEdgeEmptinessOverTheGenerationsOwnEdges(t *testing.T) {
 	store := openMaskStore(t)
 	current := store.AtGeneration(11)
 
-	// Make the generation-leading edge indexes unattractive for a context path:
-	// all current-generation edges are elsewhere. The validator must still make
-	// the context-path emptiness check through the file-leading index.
+	// All current-generation edges are recorded elsewhere, while retained
+	// generations keep edges at the context path: the emptiness check must
+	// read the generation's own edge paths once rather than every
+	// generation's edges at each masked path.
 	noise := make([]*graph.Edge, 0, 512)
 	for i := 0; i < cap(noise); i++ {
 		noise = append(noise, &graph.Edge{
@@ -390,11 +391,9 @@ func TestValidateGenerationMasksUsesFileIndexForEdgeEmptiness(t *testing.T) {
 		t.Fatalf("SetFileMasks(valid): %v", err)
 	}
 
-	// Retained generations carry a few same-path rows each. This makes the
-	// file-leading range slightly costlier than the current generation's 512
-	// rows: the pre-fix statement therefore chooses generation-leading access,
-	// while the unary candidate must choose the file-leading probe. None of
-	// these rows belongs to the context mask's generation.
+	// Retained generations carry a few same-path rows each. None of these
+	// rows belongs to the context mask's generation, so neither context claim
+	// is contradicted by them.
 	for generation := int64(12); generation < 140; generation++ {
 		retained := store.AtGeneration(generation)
 		edges := make([]*graph.Edge, 0, 8)
@@ -414,18 +413,23 @@ func TestValidateGenerationMasksUsesFileIndexForEdgeEmptiness(t *testing.T) {
 	}
 
 	plan := explainValidateGenerationMasks(t, store, current.ViewGeneration())
-	if !strings.Contains(plan, "SEARCH e USING INDEX edges_by_file (file_path=?)") {
-		t.Fatalf("edge emptiness plan =\n%s\nwant file-leading index", plan)
+	t.Logf("edge emptiness plan =\n%s", plan)
+	// The edge probe is one uncorrelated list over the generation's own edges,
+	// never a per-mask range over every generation's edges at the path.
+	listAt := strings.Index(plan, "LIST SUBQUERY")
+	if listAt < 0 || !strings.Contains(plan[listAt:], "SEARCH e USING INDEX") ||
+		!strings.Contains(plan[listAt:], "(view_gen=?)") {
+		t.Fatalf("edge emptiness plan =\n%s\nwant one uncorrelated list of the generation's own edge paths", plan)
 	}
-	for _, forbidden := range []string{"edges_by_to", "edges_by_generation", "SCAN e"} {
+	for _, forbidden := range []string{"edges_by_file", "SCAN e"} {
 		if strings.Contains(plan, forbidden) {
 			t.Fatalf("edge emptiness plan =\n%s\ncontains forbidden %q", plan, forbidden)
 		}
 	}
 
-	// BeginBulkLoad drops edges_by_file. The public validator remains valid in
-	// that legitimate cold-window state: the unary predicate constrains planning
-	// but does not require the optional index at statement preparation.
+	// BeginBulkLoad drops the optional edge indexes. The public validator
+	// remains valid in that legitimate cold-window state: the statement names
+	// no index, so it prepares without any optional one.
 	cold := openMaskStore(t)
 	cold.BeginBulkLoad()
 	defer func() {

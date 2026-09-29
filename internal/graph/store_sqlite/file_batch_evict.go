@@ -337,20 +337,12 @@ func (s *Store) planContractFileEvictionTx(tx *sql.Tx, predicate string, arg any
 	for _, path := range files {
 		fileSet[path] = struct{}{}
 	}
-	// The second arm follows only outgoing owners of doomed source nodes.
-	// An owner whose file matches but whose two endpoints both survive was
-	// outside EvictFiles' old frontier and remains outside it here.
-	affected := `SELECT id FROM nodes WHERE ` + scoped + `
-UNION
-SELECT to_id FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE ` + scoped + `)
-  AND view_gen = ? AND kind IN (?, ?, ?)`
 	args := []any{s.viewGen, string(graph.KindContract)}
 	args = append(args, scopeArgs...)
 	args = append(args, scopeArgs...)
 	args = append(args, s.viewGen, string(graph.EdgeProvides), string(graph.EdgeConsumes), string(graph.EdgeHandlesRoute))
 	//nolint:rowserrcheck // readNodes checks Err and closes every result below.
-	rows, err := tx.Query(`SELECT `+lookupNodeCols+` FROM nodes
-WHERE view_gen = ? AND kind = ? AND id IN (`+affected+`)`, args...)
+	rows, err := tx.Query(contractFileEvictionFrontierSQL(scoped), args...)
 	if err != nil {
 		return plan, err
 	}
@@ -575,4 +567,25 @@ WHERE to_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
 	}
 	count, err := result.RowsAffected()
 	return nodesChanged, int(count), err
+}
+
+// contractFileEvictionFrontierSQL selects the contract records a file eviction
+// endangers: contract nodes of the doomed files, and contract nodes their doomed
+// source nodes own through provides/consumes/handles_route edges. The second
+// arm follows only outgoing owners of doomed source nodes; an owner whose file
+// matches but whose two endpoints both survive was outside EvictFiles' old
+// frontier and remains outside it here.
+//
+// UNION ALL, not UNION: the list only feeds an IN test, so duplicates are
+// irrelevant, and a de-duplicating UNION is planned as a sorted MERGE whose arms
+// the planner drives from the generation indexes (id order for free), a scan of
+// every node and every edge of the generation per save (4.8 s on a 946k-edge
+// store).
+func contractFileEvictionFrontierSQL(scoped string) string {
+	affected := `SELECT id FROM nodes WHERE ` + scoped + `
+UNION ALL
+SELECT to_id FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE ` + scoped + `)
+  AND view_gen = ? AND kind IN (?, ?, ?)`
+	return `SELECT ` + lookupNodeCols + ` FROM nodes
+WHERE view_gen = ? AND kind = ? AND id IN (` + affected + `)`
 }

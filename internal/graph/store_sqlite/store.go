@@ -1603,6 +1603,14 @@ WHERE view_gen > 0 AND view_gen = ?`
 	generationNodesByKindSQL = `SELECT ` + lookupNodeCols + `
 FROM nodes INDEXED BY nodes_by_generation
 WHERE view_gen > 0 AND view_gen = ? AND kind = ?`
+	// baseEdgesByKindSQL reads one kind of the base generation. "+view_gen"
+	// keeps view_gen out of index selection so the read drives from
+	// edges_by_kind: with view_gen usable the planner seeks the generation's
+	// view_gen prefix (edges_by_generation or edges_by_to) and reads every
+	// edge of the generation to find one kind — seconds for a rare kind such
+	// as provides on a large store, and no faster for a common one.
+	baseEdgesByKindSQL = `SELECT ` + lookupEdgeCols + `
+FROM edges WHERE kind = ? AND +view_gen = ?`
 	generationEdgesByKindSQL = `SELECT ` + lookupEdgeCols + `
 FROM edges INDEXED BY edges_by_generation
 WHERE view_gen > 0 AND view_gen = ? AND kind = ?`
@@ -3368,8 +3376,7 @@ func isStoreClosedErr(err error) bool {
 // edge of the requested kind in generation zero and filtering afterward.
 func (s *Store) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		query := `SELECT ` + lookupEdgeCols + `
-FROM edges WHERE kind = ? AND view_gen = ?`
+		query := baseEdgesByKindSQL
 		args := []any{string(kind), s.viewGen}
 		if s.viewGen > baseViewGeneration {
 			query = generationEdgesByKindSQL

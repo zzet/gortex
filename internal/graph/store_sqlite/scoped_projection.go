@@ -143,8 +143,8 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 		return func(func(graph.ScopedEdgeRow) bool) {}
 	}
 	return func(yield func(graph.ScopedEdgeRow) bool) {
-		var maxID int64
-		if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM edges WHERE view_gen = ?`, s.viewGen).Scan(&maxID); err != nil {
+		maxID, err := s.edgeGenerationHighWater()
+		if err != nil {
 			panicOnFatal(err)
 			return
 		}

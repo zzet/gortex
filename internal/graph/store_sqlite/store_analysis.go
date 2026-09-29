@@ -396,101 +396,9 @@ func (s *Store) CrossRepoCandidatesForMutation(baseKinds []graph.EdgeKind, edgeS
 }
 
 func (s *Store) crossRepoCandidates(baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
-	uniq := anaDedupeEdgeKinds(baseKinds)
-	if len(uniq) == 0 {
+	q, args, ok := s.crossRepoCandidatesQuery(baseKinds, repoPrefixes, edgeSourceFiles, incidentNodeFiles)
+	if !ok {
 		return nil
-	}
-	// The projection is the authoritative generation filter: both endpoint
-	// joins pair with the edge's generation and the edge itself is bound, so
-	// a candidate id the frontier CTE produced for another generation cannot
-	// survive here. The CTE arms pair their own node joins for the same
-	// reason, which costs no extra bind.
-	const projection = `SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line,
-       e.confidence, e.confidence_label, e.origin, e.tier, e.cross_repo,
-       nf.repo_prefix, nt.repo_prefix
-FROM %s
-JOIN nodes nf ON nf.id = e.from_id AND nf.view_gen = e.view_gen
-JOIN nodes nt ON nt.id = e.to_id AND nt.view_gen = e.view_gen
-	WHERE nf.repo_prefix <> '' AND nt.repo_prefix <> ''
-  AND nf.repo_prefix <> nt.repo_prefix
-  AND e.view_gen = ?`
-
-	appendKinds := func(args []any) []any {
-		for _, kind := range uniq {
-			args = append(args, string(kind))
-		}
-		return args
-	}
-	var q string
-	var args []any
-	if len(repoPrefixes) > 0 {
-		scopeJSON, ok := projectionJSON(repoPrefixes)
-		if !ok {
-			return nil
-		}
-		q = `WITH candidate_edges(id) AS (
-  SELECT e.id
-  FROM nodes n
-  JOIN edges e ON e.from_id = n.id AND e.view_gen = n.view_gen
-  WHERE n.repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-    AND e.kind IN (` + inPlaceholders(len(uniq)) + `)
-  UNION
-  SELECT e.id
-  FROM nodes n
-  JOIN edges e ON e.to_id = n.id AND e.view_gen = n.view_gen
-  WHERE n.repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-    AND e.kind IN (` + inPlaceholders(len(uniq)) + `)
-)
-` + fmt.Sprintf(projection, `candidate_edges ce JOIN edges e ON e.id = ce.id`)
-		args = append(args, scopeJSON)
-		args = appendKinds(args)
-		args = append(args, scopeJSON)
-		args = appendKinds(args)
-		args = append(args, s.viewGen)
-	} else if len(edgeSourceFiles) > 0 || len(incidentNodeFiles) > 0 {
-		candidateQueries := make([]string, 0, 3)
-		if len(edgeSourceFiles) > 0 {
-			scopeJSON, ok := projectionJSON(edgeSourceFiles)
-			if !ok {
-				return nil
-			}
-			candidateQueries = append(candidateQueries, `SELECT e.id
-  FROM edges e
-  WHERE e.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-    AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
-			args = append(args, scopeJSON)
-			args = appendKinds(args)
-		}
-		if len(incidentNodeFiles) > 0 {
-			scopeJSON, ok := projectionJSON(incidentNodeFiles)
-			if !ok {
-				return nil
-			}
-			candidateQueries = append(candidateQueries, `SELECT e.id
-  FROM nodes n
-  JOIN edges e ON e.from_id = n.id AND e.view_gen = n.view_gen
-  WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-    AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
-			args = append(args, scopeJSON)
-			args = appendKinds(args)
-			candidateQueries = append(candidateQueries, `SELECT e.id
-  FROM nodes n
-  JOIN edges e ON e.to_id = n.id AND e.view_gen = n.view_gen
-  WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-    AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
-			args = append(args, scopeJSON)
-			args = appendKinds(args)
-		}
-		q = `WITH candidate_edges(id) AS (
-` + strings.Join(candidateQueries, "\n  UNION\n  ") + `
-)
-` + fmt.Sprintf(projection, `candidate_edges ce JOIN edges e ON e.id = ce.id`)
-		args = append(args, s.viewGen)
-	} else {
-		q = fmt.Sprintf(projection, `edges e`) + ` AND e.kind IN (` + inPlaceholders(len(uniq)) + `)`
-		// The projection's generation bind precedes the kind list in the text.
-		args = append(args, s.viewGen)
-		args = appendKinds(args)
 	}
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
@@ -660,4 +568,110 @@ ORDER BY e.id`
 		out = append(out, accums[id].row)
 	}
 	return out
+}
+
+// crossRepoCandidatesQuery builds the candidate query of crossRepoCandidates;
+// ok is false when the scope is empty or cannot be encoded.
+func (s *Store) crossRepoCandidatesQuery(baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) (string, []any, bool) {
+	uniq := anaDedupeEdgeKinds(baseKinds)
+	if len(uniq) == 0 {
+		return "", nil, false
+	}
+	// The projection is the authoritative generation filter: both endpoint
+	// joins pair with the edge's generation and the edge itself is bound, so
+	// a candidate id the frontier CTE produced for another generation cannot
+	// survive here. The CTE arms pair their own node joins for the same
+	// reason, which costs no extra bind.
+	const projection = `SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line,
+       e.confidence, e.confidence_label, e.origin, e.tier, e.cross_repo,
+       nf.repo_prefix, nt.repo_prefix
+FROM %s
+JOIN nodes nf ON nf.id = e.from_id AND nf.view_gen = e.view_gen
+JOIN nodes nt ON nt.id = e.to_id AND nt.view_gen = e.view_gen
+	WHERE nf.repo_prefix <> '' AND nt.repo_prefix <> ''
+  AND nf.repo_prefix <> nt.repo_prefix
+  AND e.view_gen = ?`
+
+	appendKinds := func(args []any) []any {
+		for _, kind := range uniq {
+			args = append(args, string(kind))
+		}
+		return args
+	}
+	var q string
+	var args []any
+	if len(repoPrefixes) > 0 {
+		scopeJSON, ok := projectionJSON(repoPrefixes)
+		if !ok {
+			return "", nil, false
+		}
+		q = `WITH candidate_edges(id) AS (
+  SELECT e.id
+  FROM nodes n
+  JOIN edges e ON e.from_id = n.id AND e.view_gen = n.view_gen
+  WHERE n.repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+    AND e.kind IN (` + inPlaceholders(len(uniq)) + `)
+  UNION
+  SELECT e.id
+  FROM nodes n
+  JOIN edges e ON e.to_id = n.id AND e.view_gen = n.view_gen
+  WHERE n.repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+    AND e.kind IN (` + inPlaceholders(len(uniq)) + `)
+)
+` + fmt.Sprintf(projection, `candidate_edges ce JOIN edges e ON e.id = ce.id`)
+		args = append(args, scopeJSON)
+		args = appendKinds(args)
+		args = append(args, scopeJSON)
+		args = appendKinds(args)
+		args = append(args, s.viewGen)
+	} else if len(edgeSourceFiles) > 0 || len(incidentNodeFiles) > 0 {
+		candidateQueries := make([]string, 0, 3)
+		if len(edgeSourceFiles) > 0 {
+			scopeJSON, ok := projectionJSON(edgeSourceFiles)
+			if !ok {
+				return "", nil, false
+			}
+			candidateQueries = append(candidateQueries, `SELECT e.id
+  FROM edges e
+  WHERE e.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+    AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
+			args = append(args, scopeJSON)
+			args = appendKinds(args)
+		}
+		if len(incidentNodeFiles) > 0 {
+			scopeJSON, ok := projectionJSON(incidentNodeFiles)
+			if !ok {
+				return "", nil, false
+			}
+			candidateQueries = append(candidateQueries, `SELECT e.id
+  FROM nodes n
+  JOIN edges e ON e.from_id = n.id AND e.view_gen = n.view_gen
+  WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+    AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
+			args = append(args, scopeJSON)
+			args = appendKinds(args)
+			candidateQueries = append(candidateQueries, `SELECT e.id
+  FROM nodes n
+  JOIN edges e ON e.to_id = n.id AND e.view_gen = n.view_gen
+  WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+    AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
+			args = append(args, scopeJSON)
+			args = appendKinds(args)
+		}
+		// CROSS JOIN pins the frontier CTE as the driving loop. With a plain
+		// JOIN the planner drove from edges_by_to on view_gen alone (every
+		// edge of the generation) and probed the CTE per edge: 13-21 s per
+		// save on a 946k-edge store for a candidate set of a few hundred ids.
+		q = `WITH candidate_edges(id) AS (
+` + strings.Join(candidateQueries, "\n  UNION\n  ") + `
+)
+` + fmt.Sprintf(projection, `candidate_edges ce CROSS JOIN edges e ON e.id = ce.id`)
+		args = append(args, s.viewGen)
+	} else {
+		q = fmt.Sprintf(projection, `edges e`) + ` AND e.kind IN (` + inPlaceholders(len(uniq)) + `)`
+		// The projection's generation bind precedes the kind list in the text.
+		args = append(args, s.viewGen)
+		args = appendKinds(args)
+	}
+	return q, args, true
 }

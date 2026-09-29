@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
@@ -489,6 +491,7 @@ func (s *Store) publishPayloadGeneration(ctx context.Context, generationID, publ
 		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
 	}
 
+	var timings publishTimings
 	// The publish window is the closure below, and nothing but the transition
 	// happens inside it. Whole-database maintenance (ANALYZE / VACUUM /
 	// TRUNCATE checkpoint) reads publishDrains and waits the window out: a
@@ -499,12 +502,14 @@ func (s *Store) publishPayloadGeneration(ctx context.Context, generationID, publ
 		s.publishDrains.Add(1)
 		defer s.publishDrains.Add(-1)
 
+		timings.started = time.Now()
 		s.setPayloadSeal(generationID, payloadSealSealed)
 		if err := s.drainPayloadWriters(ctx); err != nil {
 			s.setPayloadSeal(generationID, payloadSealUnknown)
 			return err
 		}
-		if err := s.publishSealedGeneration(ctx, catalog, generationID, publishedAt); err != nil {
+		timings.mark(publishStepDrain)
+		if err := s.publishSealedGeneration(ctx, catalog, generationID, publishedAt, &timings); err != nil {
 			s.setPayloadSeal(generationID, payloadSealUnknown)
 			return err
 		}
@@ -512,6 +517,7 @@ func (s *Store) publishPayloadGeneration(ctx context.Context, generationID, publ
 	}(); err != nil {
 		return err
 	}
+	timings.log(generationID)
 	viewmetrics.Count(viewmetrics.GenerationPublishedTotal, generationOwner(row.OwnerKind))
 	// Asked AFTER the window closed, not inside it: the request itself is two
 	// atomics and at most one goroutine start, but a request made inside the
@@ -564,22 +570,29 @@ func (s *Store) drainPayloadWriters(ctx context.Context) error {
 // writes go through the base handle, both guarded on the building state, so a
 // generation another publisher already moved fails here instead of being
 // published twice.
-func (s *Store) publishSealedGeneration(ctx context.Context, catalog *Catalog, generationID, publishedAt int64) error {
+func (s *Store) publishSealedGeneration(ctx context.Context, catalog *Catalog, generationID, publishedAt int64, timings *publishTimings) error {
 	handle := s.AtGeneration(generationID)
-	if err := handle.ValidateGenerationMasks(); err != nil {
+	if err := handle.validateGenerationMasksTimed(timings); err != nil {
 		return err
 	}
 	if err := handle.requireProducersSettled(ctx); err != nil {
 		return err
 	}
+	timings.mark(publishStepProducers)
 	covered, affected, bytes, err := handle.payloadRollup(ctx)
 	if err != nil {
 		return err
 	}
+	timings.mark(publishStepRollup)
 	if err := catalog.UpdateViewGenerationRollup(ctx, generationID, covered, affected, bytes); err != nil {
 		return err
 	}
-	return catalog.PublishViewGeneration(ctx, generationID, publishedAt)
+	timings.mark(publishStepCatalogRollup)
+	if err := catalog.PublishViewGeneration(ctx, generationID, publishedAt); err != nil {
+		return err
+	}
+	timings.mark(publishStepCatalogPublish)
+	return nil
 }
 
 // requireProducersSettled refuses a generation a producer has not finished
@@ -1087,3 +1100,51 @@ func payloadGenerationRetiringTx(ctx context.Context, tx *sql.Tx, generationID i
 	}
 	return ViewGenerationState(state) == ViewGenerationRetiring, nil
 }
+
+// publishTimings attributes one publish window to its steps. It is logged on
+// every successful publish with stable field names, so a slow publication can
+// be decomposed from the daemon log alone.
+type publishTimings struct {
+	started, last time.Time
+	steps         [publishStepCount]time.Duration
+}
+
+type publishStep int
+
+// mark charges the time since the previous mark to step. A nil receiver or an
+// unstarted record is a no-op, so the untimed validation entry point can share
+// the timed body.
+func (t *publishTimings) mark(step publishStep) {
+	if t == nil || t.started.IsZero() {
+		return
+	}
+	now := time.Now()
+	from := t.last
+	if from.IsZero() {
+		from = t.started
+	}
+	t.steps[step] += now.Sub(from)
+	t.last = now
+}
+
+func (t *publishTimings) log(generationID int64) {
+	if t == nil || t.started.IsZero() {
+		return
+	}
+	log.Printf("store_sqlite: publish generation=%d total=%s drain=%s identity_masks=%s context_claims=%s file_masks=%s producers=%s rollup=%s catalog_rollup=%s catalog_publish=%s",
+		generationID, time.Since(t.started), t.steps[publishStepDrain], t.steps[publishStepIdentityMasks],
+		t.steps[publishStepContextClaims], t.steps[publishStepFileMasks], t.steps[publishStepProducers],
+		t.steps[publishStepRollup], t.steps[publishStepCatalogRollup], t.steps[publishStepCatalogPublish])
+}
+
+const (
+	publishStepDrain publishStep = iota
+	publishStepIdentityMasks
+	publishStepContextClaims
+	publishStepFileMasks
+	publishStepProducers
+	publishStepRollup
+	publishStepCatalogRollup
+	publishStepCatalogPublish
+	publishStepCount
+)
