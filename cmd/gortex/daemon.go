@@ -1079,6 +1079,10 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 	// `daemon start` races the still-held lock and dies with the opaque
 	// "failed to open database with status 1".
 	pid, havePID := daemon.RunningPID()
+	// Where the daemon's store reports its close (close progress): read now,
+	// while the runtime state still names the running daemon.
+	stopCloseProgress := installDaemonCloseProgress()
+	defer stopCloseProgress()
 
 	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
 	if err != nil {
@@ -1172,16 +1176,42 @@ func waitForDaemonExitWithin(w io.Writer, pid int, grace time.Duration, draining
 	start := time.Now()
 	deadline := start.Add(grace)
 	nextProgress := start.Add(daemonDrainProgressPeriod)
-	for time.Now().Before(deadline) {
+	extended := false
+	for {
 		if !daemonProcessAlive(pid) {
 			return
 		}
-		if now := time.Now(); draining && daemonDrainProgressPeriod > 0 && !now.Before(nextProgress) {
-			fmt.Fprintf(w, "[gortex daemon] still draining the WAL: %s of up to %s\n",
-				now.Sub(start).Truncate(time.Second), grace.Truncate(time.Second))
-			nextProgress = now.Add(daemonDrainProgressPeriod)
+		now := time.Now()
+		progress, reporting := daemonCloseProgressFor(pid)
+		if now.Before(deadline) {
+			if (draining || reporting) && daemonDrainProgressPeriod > 0 && !now.Before(nextProgress) {
+				fmt.Fprintf(w, "[gortex daemon] still draining the WAL: %s of up to %s%s\n",
+					now.Sub(start).Truncate(time.Second), grace.Truncate(time.Second), describeCloseProgress(progress, reporting, now))
+				nextProgress = now.Add(daemonDrainProgressPeriod)
+			}
+			time.Sleep(50 * time.Millisecond)
+			continue
 		}
-		time.Sleep(50 * time.Millisecond)
+		// Past the grace. A close that is still copying loses its whole copy
+		// if killed (a checkpoint publishes its progress only when the pass
+		// ends), so the wait is bounded on the interval without progress, not
+		// on a fixed total.
+		if reporting {
+			since := progress.Since(now)
+			if since < daemonCloseNoProgressBound {
+				if !extended || !now.Before(nextProgress) {
+					fmt.Fprintf(w, "[gortex daemon] close still making progress after %s — waiting (last progress %s ago, giving up after %s without progress)%s\n",
+						now.Sub(start).Truncate(time.Second), since.Truncate(time.Second), daemonCloseNoProgressBound, describeCloseProgress(progress, reporting, now))
+					extended = true
+					nextProgress = now.Add(daemonDrainProgressPeriod)
+				}
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			fmt.Fprintf(w, "[gortex daemon] close made no progress for %s (bound %s) after %s — force-killing%s\n",
+				since.Truncate(time.Second), daemonCloseNoProgressBound, now.Sub(start).Truncate(time.Second), describeCloseProgress(progress, reporting, now))
+		}
+		break
 	}
 	// Graceful shutdown stalled (e.g. a wedged cgo call). Don't leave a
 	// half-exited daemon clutching the lock — force it, then clean up the

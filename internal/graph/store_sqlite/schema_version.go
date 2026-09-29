@@ -1321,7 +1321,9 @@ func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration, observers ...Mi
 // -shm) plus the rollback -journal a non-WAL fallback would use; keep it in
 // sync if the journal_mode in Open's DSN ever changes.
 func removeStoreFiles(path string) error {
-	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+	// The close-checkpoint progress and rate sidecars (close_progress.go)
+	// describe the store being removed and go with it.
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal", ".close-progress", ".close-rate"} {
 		if err := os.Remove(path + suffix); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove %s: %w", path+suffix, err)
 		}

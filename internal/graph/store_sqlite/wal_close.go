@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -71,14 +72,18 @@ const (
 	// closeCheckpointBaseBudget covers lock acquisition, the fsyncs and a
 	// small copy. It is also the whole estimate when the backlog is unknown.
 	closeCheckpointBaseBudget = 15 * time.Second
-	// closeCheckpointPerFrame is the conservative copy cost per pending frame.
-	// A checkpoint writes each distinct page once, so pending frames (page
-	// rewrites included) over-count the pages it copies; 10 µs per frame
-	// still budgets 9M pending frames at ~105 s.
-	closeCheckpointPerFrame = 10 * time.Microsecond
+	// closeCheckpointPerFrame is the copy cost per pending frame when this
+	// store has no close of its own measured yet (closeRate). Measured on the
+	// live store: the 2026-09-25 08:16:07 close copied 264,431 pending frames
+	// (of 524,077; a 2.16 GB -wal against a 19 GB database) in 50.8 s, 192 µs
+	// per frame. The earlier 10 µs predicted 17.6 s for it. Frames land on
+	// scattered pages of a large file, so the copy is I/O-bound, not memcpy.
+	closeCheckpointPerFrame = 200 * time.Microsecond
 	// closeCheckpointEstimateCap caps the estimate published for the daemon's
-	// stop path.
-	closeCheckpointEstimateCap = 2 * time.Minute
+	// stop path. The stop path no longer gives up on the estimate alone — it
+	// waits while the close makes progress (close_progress.go) — so the cap
+	// only keeps a pathological backlog from publishing nonsense.
+	closeCheckpointEstimateCap = time.Hour
 	// closeReadDrainDeadline bounds Close's wait for in-flight pool reads
 	// before the final TRUNCATE.
 	closeReadDrainDeadline = time.Second
@@ -88,13 +93,21 @@ const (
 // for a backlog of pendingFrames: base + pending × per-frame cost, capped at
 // two minutes; an unknown backlog (-1) gets the base.
 func closeCheckpointEstimate(pendingFrames int64) time.Duration {
+	return closeCheckpointEstimateAt(pendingFrames, closeCheckpointPerFrame)
+}
+
+// closeCheckpointEstimateAt is the estimate at a given per-frame cost.
+func closeCheckpointEstimateAt(pendingFrames int64, perFrame time.Duration) time.Duration {
 	if pendingFrames <= 0 {
 		return closeCheckpointBaseBudget
 	}
-	if pendingFrames > int64((closeCheckpointEstimateCap-closeCheckpointBaseBudget)/closeCheckpointPerFrame) {
+	if perFrame <= 0 {
+		perFrame = closeCheckpointPerFrame
+	}
+	if pendingFrames > int64((closeCheckpointEstimateCap-closeCheckpointBaseBudget)/perFrame) {
 		return closeCheckpointEstimateCap
 	}
-	return closeCheckpointBaseBudget + time.Duration(pendingFrames)*closeCheckpointPerFrame
+	return closeCheckpointBaseBudget + time.Duration(pendingFrames)*perFrame
 }
 
 // closeCheckpointDeadline is the deadline Close actually imposes, zero meaning
@@ -138,7 +151,7 @@ func (s *Store) CloseCheckpointEstimate() (time.Duration, int64) {
 	if snap, ok := readWALIndexSnapshot(s.dbPath); ok {
 		pending = snap.PendingFrames()
 	}
-	return closeCheckpointEstimate(pending), pending
+	return closeCheckpointEstimateAt(pending, closePerFrame(s.dbPath)), pending
 }
 
 // closeCheckpointWAL is Close's final TRUNCATE. The periodic loop and the
@@ -153,10 +166,14 @@ func (s *Store) closeCheckpointWAL() error {
 	if known {
 		pending = before.PendingFrames()
 	}
-	estimate := closeCheckpointEstimate(pending)
+	perFrame := closePerFrame(s.dbPath)
+	estimate := closeCheckpointEstimateAt(pending, perFrame)
 	deadline := closeCheckpointDeadline(pending)
 
 	started := time.Now()
+	// Tell the stop path how the close is going (close_progress.go): a
+	// daemon stop that sees the copy advancing waits instead of killing it.
+	stopProgress := startCloseProgress(s.dbPath, pending, perFrame, estimate, started)
 	reopen := func() {}
 	if s.readGate != nil {
 		// A drain failure is not fatal: the TRUNCATE busy-waits for any read
@@ -180,8 +197,16 @@ func (s *Store) closeCheckpointWAL() error {
 	if err != nil {
 		errText = err.Error()
 	}
-	log.Printf("store_sqlite: close wal checkpoint mode=TRUNCATE frames_pending_before=%d wal_frames_before=%d wal_bytes_before=%d busy=%d checkpointed_frames=%d reset=%t wal_bytes_after=%d duration=%s estimate=%s deadline=%s error=%q",
+	took := time.Since(started)
+	stopProgress(err == nil)
+	learned := ""
+	if err == nil {
+		if rate, ok := recordCloseRate(s.dbPath, pending, took); ok {
+			learned = fmt.Sprintf(" learned_per_frame=%s", rate)
+		}
+	}
+	log.Printf("store_sqlite: close wal checkpoint mode=TRUNCATE frames_pending_before=%d wal_frames_before=%d wal_bytes_before=%d busy=%d checkpointed_frames=%d reset=%t wal_bytes_after=%d duration=%s estimate=%s per_frame=%s deadline=%s error=%q%s",
 		pending, before.MxFrame, before.WALBytes, result.Busy, result.CheckpointedFrames, err == nil,
-		walAfter, time.Since(started).Round(time.Millisecond), estimate, deadline, errText)
+		walAfter, took.Round(time.Millisecond), estimate, perFrame, deadline, errText, learned)
 	return err
 }
