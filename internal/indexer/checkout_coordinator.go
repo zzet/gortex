@@ -2786,9 +2786,9 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 	defer releaseBase()
 	identity := c.dirtyIdentity(graphID, commitGeneration)
 	identity.BaseGenerationID = baseGeneration
-	var baseCensus map[string]int
+	var baseCensus func(context.Context) map[string]int
 	if c.builder != nil && c.builder.Semantic != nil {
-		baseCensus = c.checkoutLanguageCensus(ctx, commitGeneration)
+		baseCensus = func(ctx context.Context) map[string]int { return c.checkoutLanguageCensus(ctx, commitGeneration) }
 	}
 	var stamped GenerationIdentity
 	var work *GenerationWorkCounters
@@ -2804,7 +2804,7 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 			stamped:             &stamped,
 			Sampler:             c.sampler,
 			chainFallbackReason: fallbackReason,
-			baseCensus:          baseCensus,
+			baseCensusFunc:      baseCensus,
 		}
 		if attempt == 0 {
 			req.before = first

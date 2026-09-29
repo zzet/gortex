@@ -148,6 +148,44 @@ func TestDedicatedBaseConfigFingerprintEffectiveFields(t *testing.T) {
 	}
 }
 
+// TestDedicatedBaseConfigFingerprintExemptsDirtyChain pins the one
+// hash-exempt field: index.dirty_chain tunes how a working-tree layer is
+// built (the retained type-check budget), not what it contains, so every
+// value of it — unset, zero, a budget — fingerprints the same configuration,
+// while the frozen snapshot still carries the value it was given.
+func TestDedicatedBaseConfigFingerprintExemptsDirtyChain(t *testing.T) {
+	base := config.Default().Index
+	_, unset, err := snapshotDedicatedBaseConfig(base, "repo", "workspace", "project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mb := range []int{0, 64} {
+		cfg := base
+		cfg.DirtyChain = &config.DirtyChainConfig{SemanticTypecheckCacheMB: mb}
+		owned, fingerprint, err := snapshotDedicatedBaseConfig(cfg, "repo", "workspace", "project")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fingerprint != unset {
+			t.Fatalf("dirty_chain.semantic_typecheck_cache_mb=%d changed the config fingerprint: %s vs %s", mb, fingerprint, unset)
+		}
+		if got := owned.SemanticTypecheckCacheBytes(); got != int64(mb)<<20 {
+			t.Fatalf("the frozen snapshot lost dirty_chain.semantic_typecheck_cache_mb=%d (%d bytes)", mb, got)
+		}
+		if got := checkoutConfigHash(fingerprint, dedicatedBaseConfigSections(config.Default())); got !=
+			checkoutConfigHash(unset, dedicatedBaseConfigSections(config.Default())) {
+			t.Fatalf("dirty_chain.semantic_typecheck_cache_mb=%d changed the checkout config hash", mb)
+		}
+	}
+	// Any other change still re-keys: the exemption is exactly one field.
+	cfg := base
+	cfg.DirtyChain = &config.DirtyChainConfig{SemanticTypecheckCacheMB: 64}
+	cfg.IndexProse = !cfg.IndexProse
+	if _, changed, err := snapshotDedicatedBaseConfig(cfg, "repo", "workspace", "project"); err != nil || changed == unset {
+		t.Fatalf("an effective field beside the switch did not change the fingerprint: %v", err)
+	}
+}
+
 func TestDedicatedBaseConfigJSONShapeGuard(t *testing.T) {
 	if err := dedicatedConfigJSONShape(reflect.TypeOf(config.IndexConfig{}), "IndexConfig"); err != nil {
 		t.Fatal(err)

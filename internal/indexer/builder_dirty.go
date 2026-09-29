@@ -120,7 +120,8 @@ type DirtyLayerRequest struct {
 	// beneath the working tree; the semantic admission floor is then judged
 	// against the checkout's whole language surface (EnrichmentStage.
 	// BaseCensus) rather than this build's own files.
-	baseCensus map[string]int
+	baseCensus     map[string]int
+	baseCensusFunc func(context.Context) map[string]int
 }
 
 // DirtyChainFallbackError reports that a working-tree build over a
@@ -258,11 +259,12 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	// read when a semantic manager could use it.
 	var chainCensus map[string]map[string]int
 	var baseCensus map[string]int
+	var baseCensusFunc func(context.Context) map[string]int
 	if b.Semantic != nil {
 		if req.parent > 0 {
 			chainCensus = dirtyChainLanguageCensus(ctx, b.Store, req.parent, req.RepoPrefix)
 		}
-		baseCensus = req.baseCensus
+		baseCensus, baseCensusFunc = req.baseCensus, req.baseCensusFunc
 	}
 
 	generationID, report, err := b.Build(ctx, BuildRequest{
@@ -280,10 +282,11 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		// is the enrichment manager's call — the build only says it has a
 		// working copy to offer.
 		Enrich: &EnrichmentStage{
-			CheckoutID:  identity.CheckoutID,
-			Fingerprint: before.Fingerprint,
-			ChainCensus: chainCensus,
-			BaseCensus:  baseCensus,
+			CheckoutID:     identity.CheckoutID,
+			Fingerprint:    before.Fingerprint,
+			ChainCensus:    chainCensus,
+			BaseCensus:     baseCensus,
+			BaseCensusFunc: baseCensusFunc,
 		},
 		PrePublish: func(ctx context.Context, generationID int64) error {
 			if req.buildBarrier != nil {

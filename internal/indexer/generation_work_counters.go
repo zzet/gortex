@@ -11,6 +11,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer/source"
+	"github.com/zzet/gortex/internal/semantic"
 )
 
 // GenerationWorkCounters is the physical work one sparse generation build did,
@@ -123,7 +124,24 @@ type CompilerContextCounters struct {
 	Measured  bool
 	Packages  int
 	Files     int
-	Reason    string
+	// Loads counts the type-checking package loads (2 after a handle-rooted
+	// load fell back to the whole module).
+	Loads int
+	// Scope is "full" (every package of the module) or "handle_roots" (the
+	// packages of the generation's Go files); ScopeReason is the fallback or
+	// adjustment code, empty when none applied.
+	Scope       string
+	ScopeReason string
+	// LoadMs is the type-checking loads' wall time and IndexMs the dependency
+	// metadata index's; IndexCached reports that the index needed no `go list`.
+	LoadMs      int64
+	IndexMs     int64
+	IndexCached bool
+	// Cache is the per-checkout closure and type-check state's work (closure
+	// hits and misses, `go list` time spent and saved, retained state size);
+	// nil when the build did not use it.
+	Cache  *semantic.CompilerCacheStats
+	Reason string
 }
 
 // GenerationPhase is one named stage's wall time.
@@ -200,6 +218,19 @@ func (w *GenerationWorkCounters) finish(store *store_sqlite.Store, generationID 
 	w.NodeTombstones, w.EdgeSources = report.NodeTombstones, report.EdgeSourceMarkers
 	w.CompilerContext.Requested = report.Enrichment.Requested
 	w.CompilerContext.Ran = append([]string(nil), report.Enrichment.Ran...)
+	if compiler := report.Enrichment.Compiler; compiler != nil {
+		w.CompilerContext.Measured = true
+		w.CompilerContext.Packages, w.CompilerContext.Files = compiler.Packages, compiler.Files
+		w.CompilerContext.Loads = compiler.Loads
+		w.CompilerContext.Scope, w.CompilerContext.ScopeReason = compiler.Scope, compiler.ScopeReason
+		w.CompilerContext.LoadMs, w.CompilerContext.IndexMs = compiler.LoadMs, compiler.IndexMs
+		w.CompilerContext.IndexCached = compiler.IndexCached
+		if compiler.Cache != nil {
+			cache := *compiler.Cache
+			w.CompilerContext.Cache = &cache
+		}
+		w.CompilerContext.Reason = ""
+	}
 	if !w.CompilerContext.Measured {
 		switch {
 		case !report.Enrichment.Requested:

@@ -638,6 +638,8 @@ type ReviewRule struct {
 // configurable is the budget of that retained state and the resolver's
 // evidence scoping.
 type DirtyChainConfig struct {
+	// SemanticTypecheckCacheMB caps retained compiler state in MiB; zero uses the provider default.
+	SemanticTypecheckCacheMB int `mapstructure:"semantic_typecheck_cache_mb" yaml:"semantic_typecheck_cache_mb,omitempty"`
 }
 
 type IndexConfig struct {
@@ -1964,6 +1966,15 @@ func (c *Config) validateWorkspaceSchema() error {
 		return nil
 	}
 	return fmt.Errorf("%s", strings.Join(errs, "; "))
+}
+
+// SemanticTypecheckCacheBytes reports index.dirty_chain.semantic_typecheck_cache_mb
+// in bytes; zero (unset or non-positive) means the provider default.
+func (c IndexConfig) SemanticTypecheckCacheBytes() int64 {
+	if c.DirtyChain == nil || c.DirtyChain.SemanticTypecheckCacheMB <= 0 {
+		return 0
+	}
+	return int64(c.DirtyChain.SemanticTypecheckCacheMB) << 20
 }
 
 // ValidateSemanticConnectForTest exposes the connect-block validation

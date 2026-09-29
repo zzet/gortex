@@ -1,6 +1,7 @@
 package semantic
 
 import (
+	"context"
 	"errors"
 	"sort"
 
@@ -29,6 +30,11 @@ type CheckoutEnrichRequest struct {
 	// MinLanguageNodes is the admission floor a language must clear to be
 	// worth a server, mirroring the index-time pass.
 	MinLanguageNodes int
+	// Compiler is the compiler scope the pass asks of compiler-backed
+	// providers. The pass always runs as a checkout pass (per-file compact
+	// projections restricted to the files the generation carries); the zero
+	// value asks for a whole-module load.
+	Compiler CheckoutCompilerScope
 }
 
 // CheckoutEnrichReport is what one checkout-scoped pass did. Every field is
@@ -50,6 +56,9 @@ type CheckoutEnrichReport struct {
 	// Reason says why the pass did not enrich everything it could have. Empty
 	// when it did.
 	Reason string
+	// Compiler sums the compiler-context work the pass's providers reported.
+	// nil when no provider that ran reports counts.
+	Compiler *CompilerLoadStats
 }
 
 // EnrichCheckout runs the language-server enrichment stage over one routed
@@ -66,9 +75,22 @@ type CheckoutEnrichReport struct {
 // switched off are all reported in the report and leave the caller's build
 // intact; only a request that names no checkout is refused.
 func (m *Manager) EnrichCheckout(g graph.Store, req CheckoutEnrichRequest) (CheckoutEnrichReport, error) {
+	return m.EnrichCheckoutContext(context.Background(), g, req)
+}
+
+// EnrichCheckoutContext is EnrichCheckout under the caller's context: a
+// cancelled ctx stops the pass before dispatch, reaches every provider (the
+// go/types load and its stages observe it), and is returned as the error.
+func (m *Manager) EnrichCheckoutContext(ctx context.Context, g graph.Store, req CheckoutEnrichRequest) (CheckoutEnrichReport, error) {
 	var report CheckoutEnrichReport
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if req.RepoPrefix == "" || req.Root == "" {
 		return report, errors.New("semantic: a checkout enrichment needs a repo prefix and a checkout root")
+	}
+	if err := ctx.Err(); err != nil {
+		return report, err
 	}
 	switch {
 	case m == nil || !m.config.Enabled:
@@ -114,6 +136,7 @@ func (m *Manager) EnrichCheckout(g graph.Store, req CheckoutEnrichRequest) (Chec
 		return report, nil
 	}
 
+	compiler := req.Compiler
 	results, partial, err := m.EnrichAll(g, roots, EnrichOptions{
 		RepoState: map[string]RepoEnrichState{req.RepoPrefix: {
 			SHA:        req.Fingerprint,
@@ -121,8 +144,22 @@ func (m *Manager) EnrichCheckout(g graph.Store, req CheckoutEnrichRequest) (Chec
 		}},
 		MinLanguageNodes: req.MinLanguageNodes,
 		Languages:        admitted,
+		CheckoutScope:    &compiler,
+		Context:          ctx,
 	})
+	for _, result := range results {
+		if result == nil || result.Compiler == nil {
+			continue
+		}
+		if report.Compiler == nil {
+			report.Compiler = &CompilerLoadStats{}
+		}
+		report.Compiler.Add(result.Compiler)
+	}
 	if err != nil {
+		return report, err
+	}
+	if err := ctx.Err(); err != nil {
 		return report, err
 	}
 	report.Partial = partial[req.RepoPrefix]

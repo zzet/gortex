@@ -212,6 +212,7 @@ type BuildRequest struct {
 	// the publish and supersedes the generation, so a build whose inputs moved
 	// underneath it never becomes readable. nil skips the step.
 	PrePublish func(ctx context.Context, generationID int64) error
+
 	// inputManifest, when set, is the admitted-input manifest the generation
 	// records for the sample it was built from. It is written through the
 	// generation handle after the producer states and before PrePublish, so it
@@ -253,6 +254,14 @@ type EnrichmentStage struct {
 	// the Go pass like an edit to twenty files does. Set by a coordinator
 	// with working-tree chaining on, for every working-tree build it makes.
 	BaseCensus map[string]int
+	// BaseCensusFunc, used when BaseCensus is nil, supplies it on demand. The
+	// floor check calls it only when the generation's own files and the parent
+	// chain leave a language a provider serves below the floor: the base
+	// totals can only raise a total, so a language that clears without them
+	// clears with them, and counting the committed ancestry is a grouped scan
+	// of every full generation beneath the chain (tens of seconds on a cold
+	// store — the whole plan of the first edit after a restart).
+	BaseCensusFunc func(context.Context) map[string]int
 }
 
 // EnrichmentOutcome is what a build's enrichment stage did. It is the evidence
@@ -276,6 +285,15 @@ type EnrichmentOutcome struct {
 	Disabled bool
 	// Reason says why the stage did not enrich everything it could have.
 	Reason string
+	// FloorFromChain reports that the admission floor was judged against the
+	// working-tree state the parent chain and this generation describe
+	// together (EnrichmentStage.ChainCensus) and cleared there, so the pass
+	// ran over this generation's languages without a floor of its own.
+	FloorFromChain bool
+	// Compiler is the compiler-context work the stage's providers reported:
+	// loads, type-checked packages, compiled files and the load scope. nil
+	// when no provider that ran reports counts.
+	Compiler *semantic.CompilerLoadStats
 }
 
 // BuildReport is what one build did — and, as importantly, what it could not
@@ -396,6 +414,7 @@ type BuildReport struct {
 
 	// Work is the build's physical work accounting (generation_work_counters.go).
 	Work *GenerationWorkCounters
+
 	// ParentGenerationID is the working-tree generation a working-tree build
 	// was a delta over, 0 for a build direct over its commit generation.
 	// ChainDepth is the published generation's working-tree chain depth (1 =
@@ -439,6 +458,8 @@ type SparseGenerationBuilder struct {
 	// ask for one. nil declares the lsp.* capabilities disabled for the
 	// generation rather than leaving them unstated.
 	Semantic *semantic.Manager
+	// wholeModuleCompilerLoad is a reference-only test seam.
+	wholeModuleCompilerLoad bool
 }
 
 const generationAbandonTimeout = 5 * time.Second
@@ -625,8 +646,17 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		markPublicationPhase(ctx, PublicationExtracted)
 		// Enrichment runs before the masks so anything it adds to the payload is
 		// covered by the claims derived from it, and before the producer states
-		// so what it did is what they describe.
-		b.runEnrichment(req, handle, &report)
+		// so what it did is what they describe. A cancelled build (a yielding
+		// compaction) stops here, and the enrichment observes the same context,
+		// so a cancel during the go/types load ends the build too.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		b.runEnrichment(ctx, req, handle, &report)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		report.Work.mark("enrich")
 		markPublicationPhase(ctx, PublicationSemanticDone)
 		// The context separation has to have decided before the masks are
 		// derived from what remains. In the read-only-context mode it already
@@ -960,6 +990,7 @@ func (b *SparseGenerationBuilder) runPass(
 // only what this build carries and the edges the providers land are written
 // into the generation rather than into the tree everyone else reads.
 func (b *SparseGenerationBuilder) runEnrichment(
+	ctx context.Context,
 	req BuildRequest,
 	handle *store_sqlite.Store,
 	report *BuildReport,
@@ -974,13 +1005,33 @@ func (b *SparseGenerationBuilder) runEnrichment(
 		out.Reason = "no semantic enrichment manager is installed"
 		return
 	}
-	pass, err := b.Semantic.EnrichCheckout(handle, semantic.CheckoutEnrichRequest{
+	floor := semantic.EnrichmentAdmissionFloor()
+	if stage := req.Enrich; (stage.ChainCensus != nil || stage.BaseCensus != nil || stage.BaseCensusFunc != nil) && floor > 0 {
+		base := enrichmentBaseCensus(ctx, stage)
+		enrichable := func(language string) bool { return b.Semantic.ProviderForLanguage(language) != nil }
+		censusStarted := time.Now()
+		clears, baseRead := chainClearsEnrichmentFloor(handle, req.RepoPrefix, stage.ChainCensus, base, floor, enrichable)
+		if baseRead {
+			b.Logger.Info("indexer: admission floor read the committed state's language census",
+				zap.String("checkout", stage.CheckoutID),
+				zap.Bool("clears", clears),
+				zap.Duration("elapsed", time.Since(censusStarted)))
+		}
+		if clears {
+			floor = 0
+			out.FloorFromChain = true
+		}
+	}
+	scope := withCheckoutDeclarations(b.checkoutCompilerScope(req.Changes), req.Base)
+	pass, err := b.Semantic.EnrichCheckoutContext(ctx, handle, semantic.CheckoutEnrichRequest{
 		RepoPrefix:       req.RepoPrefix,
 		CheckoutID:       req.Enrich.CheckoutID,
 		Root:             req.RootPath,
 		Fingerprint:      req.Enrich.Fingerprint,
-		MinLanguageNodes: semantic.EnrichmentAdmissionFloor(),
+		MinLanguageNodes: floor,
+		Compiler:         scope,
 	})
+	out.Compiler = pass.Compiler
 	if err != nil {
 		out.Reason = err.Error()
 		b.Logger.Warn("indexer: the generation's enrichment stage failed",
@@ -991,6 +1042,22 @@ func (b *SparseGenerationBuilder) runEnrichment(
 	}
 	out.Ran, out.Starved = pass.Ran, pass.Starved
 	out.Partial, out.Disabled, out.Reason = pass.Partial, pass.Disabled, pass.Reason
+}
+
+// enrichmentBaseCensus is the stage's committed-state census as a deferred
+// read: the eager map when the caller supplied one, else the lazy reader,
+// else nil (no base totals).
+func enrichmentBaseCensus(ctx context.Context, stage *EnrichmentStage) func() map[string]int {
+	switch {
+	case stage.BaseCensus != nil:
+		counts := stage.BaseCensus
+		return func() map[string]int { return counts }
+	case stage.BaseCensusFunc != nil:
+		read := stage.BaseCensusFunc
+		return func() map[string]int { return read(ctx) }
+	default:
+		return nil
+	}
 }
 
 // contextSeparation is what one run of the read-only-context separation did.
@@ -2226,4 +2293,112 @@ func (s *fileSetSource) Walk(ctx context.Context, fn func(source.FileMeta) error
 		}
 	}
 	return nil
+}
+
+// checkoutCompilerScope is the compiler scope a working-tree build asks of the
+// go/types provider: rooted at the packages the build carries, sibling bodies
+// stripped, the checkout's type-check state retained, with a whole-module load
+// forced when the build's changes touch a Go module manifest.
+func (b *SparseGenerationBuilder) checkoutCompilerScope(changes []LayerPathChange) semantic.CheckoutCompilerScope {
+	scope := semantic.CheckoutCompilerScope{
+		HandleRoots:         !b.wholeModuleCompilerLoad,
+		StripSiblingBodies:  !b.wholeModuleCompilerLoad,
+		TypecheckCache:      !b.wholeModuleCompilerLoad,
+		TypecheckCacheBytes: b.Config.SemanticTypecheckCacheBytes(),
+	}
+	for _, change := range changes {
+		if goModuleManifestPath(change.Path) {
+			scope.ManifestChanged = true
+			break
+		}
+	}
+	return scope
+}
+
+// goModuleManifestPath reports whether a repository-relative path names a file
+// that decides a Go module's build list.
+func goModuleManifestPath(p string) bool {
+	p = strings.ReplaceAll(p, "\\", "/")
+	switch path.Base(p) {
+	case "go.mod", "go.sum", "go.work", "go.work.sum":
+		return true
+	}
+	return p == "vendor/modules.txt" || strings.HasSuffix(p, "/vendor/modules.txt")
+}
+
+// chainClearsEnrichmentFloor reports whether every language this generation
+// carries clears the admission floor in the census of the whole working-tree
+// state: the parent chain's files (chain) with this generation's own files in
+// place of theirs, plus the committed state's language totals (base) when the
+// caller supplied them. The census applies the same exclusions the manager's does
+// (low-value and fixture paths; user exclusion globs are not known here, so
+// the census can only be larger than the manager's, never admit a language
+// the generation does not carry). A generation that carries no language does
+// not clear it: there is nothing to enrich.
+//
+// Only languages a provider serves are judged (enrichable; nil judges every
+// language): the floor exists to decide whether a provider runs, and a
+// language no provider serves (contract nodes, say) cannot be enriched
+// whatever its count, so it must not veto the languages that can. base is
+// called at most once, and only when the generation's own files and the
+// chain leave a judged language below the floor; baseRead reports whether it
+// was.
+func chainClearsEnrichmentFloor(handle graph.Store, repoPrefix string, chain map[string]map[string]int, base func() map[string]int, floor int, enrichable func(string) bool) (clears, baseRead bool) {
+	own := map[string]map[string]int{}
+	for _, row := range graph.ReadRepoLanguageFileCounts(handle, []string{repoPrefix}) {
+		if row.Language == "" || row.Count <= 0 {
+			continue
+		}
+		if own[row.FilePath] == nil {
+			own[row.FilePath] = map[string]int{}
+		}
+		own[row.FilePath][row.Language] += row.Count
+	}
+	totals := map[string]int{}
+	present := map[string]bool{}
+	add := func(file string, languages map[string]int, mine bool) {
+		if semantic.IsLowValueForEnrichment(file, nil) || semantic.IsFixtureCensusPath(file) {
+			return
+		}
+		for language, count := range languages {
+			totals[language] += count
+			if mine {
+				present[language] = true
+			}
+		}
+	}
+	for file, languages := range own {
+		add(file, languages, true)
+	}
+	for file, languages := range chain {
+		if _, replaced := own[file]; !replaced {
+			add(file, languages, false)
+		}
+	}
+	for language := range present {
+		if enrichable != nil && !enrichable(language) {
+			delete(present, language)
+		}
+	}
+	if len(present) == 0 {
+		return false, false
+	}
+	below := func() bool {
+		for language := range present {
+			if totals[language] < floor {
+				return true
+			}
+		}
+		return false
+	}
+	if !below() {
+		return true, false
+	}
+	if base == nil {
+		return false, false
+	}
+	for language, count := range base() {
+		totals[language] += count
+	}
+	return !below(), true
 }

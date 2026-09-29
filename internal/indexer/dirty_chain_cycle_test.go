@@ -1,9 +1,12 @@
 package indexer
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 // The coordinator with working-tree chaining on: which parent a cycle builds
@@ -14,6 +17,16 @@ import (
 // deletes payload).
 
 const chainIslandTwo = "package fixture\n\nfunc Island() {\n}\n\nfunc IslandTwo() {\n}\n"
+
+func chainMaterialize(t *testing.T, f *coordinatorFixture) *graphview.RepoView {
+	t.Helper()
+	materializer := &graphview.Materializer{Store: f.store, Catalog: f.catalog, Leases: f.leases}
+	view, err := materializer.MaterializeCheckout(context.Background(), f.checkoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	return view
+}
 
 func chainCoordinator(t *testing.T, cfg CheckoutCoordinatorConfig) (*coordinatorFixture, *CheckoutCoordinator) {
 	t.Helper()

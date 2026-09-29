@@ -297,6 +297,19 @@ type EnrichOptions struct {
 	// enrichment pool overlaps the resolve phase so compute proceeds but no
 	// apply can starve the resolver on the shared ResolveMutex.
 	ApplyGate <-chan struct{}
+
+	// CheckoutScope, when non-nil, marks the pass as a checkout pass over a
+	// generation handle and carries its compiler scope to the providers (see
+	// CheckoutCompilerScope). nil is every other caller: providers behave
+	// exactly as before.
+	CheckoutScope *CheckoutCompilerScope
+
+	// Context, when non-nil, is the caller's context: its cancellation
+	// reaches every provider pass (each pass context derives from it), so a
+	// caller that abandons the work (a yielding compaction) stops the
+	// provider at its next check instead of waiting for it. nil keeps the
+	// Manager lifecycle as the only parent.
+	Context context.Context
 }
 
 // defaultEnrichmentAdmissionFloor balances two measured failure modes:
@@ -512,7 +525,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 					if len(langs) == 0 {
 						return
 					}
-					results = m.runEnrichOne(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, results, partial)
+					results = m.runEnrichOneScoped(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, opts.CheckoutScope, opts.Context, results, partial)
 				}()
 			}
 		}
@@ -664,7 +677,7 @@ func (m *Manager) configPriorityFor(name string) (int, bool) {
 // providers.
 func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, opts EnrichOptions, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	for _, repoName := range sortedRootNames(roots, nodeCounts) {
-		results = m.runEnrichOne(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, results, partial)
+		results = m.runEnrichOneScoped(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, opts.CheckoutScope, opts.Context, results, partial)
 	}
 	return results
 }
@@ -1037,6 +1050,13 @@ func shortSHA(sha string) string {
 // failed, or returned a Partial result flips partial[repoName] so the caller
 // knows the repo's enrichment must be retried.
 func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, applyGate <-chan struct{}, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
+	return m.runEnrichOneScoped(g, repoName, repoRoot, lang, provider, nodeCount, rs, applyGate, nil, nil, results, partial)
+}
+
+// runEnrichOneScoped is runEnrichOne for a pass that may carry a checkout
+// compiler scope. A nil scope leaves the pass context exactly as
+// runEnrichOne builds it.
+func (m *Manager) runEnrichOneScoped(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, applyGate <-chan struct{}, checkoutScope *CheckoutCompilerScope, parent context.Context, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	if !m.beginPass() {
 		partial[repoName] = true
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, 0, nil,
@@ -1073,7 +1093,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	// not implement the interface, so gopls / rust-analyzer never wait. Bounded
 	// and best-effort: a probe timeout or error just proceeds.
 	if rp, ok := provider.(ReadinessProber); ok && enrichReadinessBudget > 0 {
-		lifecycleCtx, stopLifecycle := m.passContext(context.Background())
+		lifecycleCtx, stopLifecycle := m.passContext(parent)
 		rctx, rcancel := context.WithTimeout(lifecycleCtx, enrichReadinessBudget)
 		err := rp.WaitReady(rctx, repoRoot)
 		rcancel()
@@ -1144,12 +1164,12 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	// every path below receives from done before returning: a timed-out
 	// in-process writer is never detached and the next provider/repo cannot
 	// overlap it.
-	baseCtx, stopLifecycle := m.passContext(context.Background())
+	baseCtx, stopLifecycle := m.passContext(parent)
 	defer stopLifecycle()
 	if ctxErr := baseCtx.Err(); ctxErr != nil {
 		partial[repoName] = true
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
-			"semantic manager closed before provider dispatch")
+			"semantic manager closed (or the caller cancelled) before provider dispatch")
 		return results
 	}
 	ctx := baseCtx
@@ -1163,6 +1183,9 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	ctx = WithEnrichmentAdmissionNodes(ctx, nodeCount)
 	if applyGate != nil {
 		ctx = WithApplyGate(ctx, applyGate)
+	}
+	if checkoutScope != nil {
+		ctx = WithCheckoutCompilerScope(ctx, *checkoutScope)
 	}
 	defer cancel()
 
