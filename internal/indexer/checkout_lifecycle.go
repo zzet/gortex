@@ -106,6 +106,12 @@ type CheckoutLifecycleConfig struct {
 	// it is selected, the same way the startup inventory is always deferred.
 	// The GORTEX_WORKTREE_LAZY_ACTIVATION env var overrides it either way.
 	LazyWorktrees bool
+	// WatchCheckouts gives every automatic checkout's coordinator a file
+	// watcher rooted at its working tree (checkout_watch.go), so a plain save
+	// in a linked worktree wakes its coordinator instead of waiting for the
+	// poll. The daemon's stack turns it on; GORTEX_CHECKOUT_WATCH=off turns it
+	// off again.
+	WatchCheckouts bool
 
 	// indexBarrier is a test seam: it runs inside a promotion, between the
 	// sample the new corpus has to describe and the index that builds it,
@@ -277,6 +283,8 @@ type CheckoutLifecycle struct {
 	// worktree-heavy trees that never want an unselected view built. Off by
 	// default: a runtime `git worktree add` builds eagerly on discovery.
 	cfgLazyWorktrees bool
+	// cfgWatchCheckouts is CheckoutLifecycleConfig.WatchCheckouts.
+	cfgWatchCheckouts bool
 
 	// refViewMu guards the per-repository ref-view manager cache alone. A
 	// manager holds no per-request state, so the lock covers only the map.
@@ -368,6 +376,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 	// worktree-heavy tree can opt every discovered worktree into dormancy — or
 	// out of it — without editing the file the daemon reads.
 	l.cfgLazyWorktrees = cfg.LazyWorktrees
+	l.cfgWatchCheckouts = cfg.WatchCheckouts
 	if value, ok := worktreeLazyActivationEnv(); ok {
 		l.cfgLazyWorktrees = value
 	}
@@ -2362,6 +2371,7 @@ func (l *CheckoutLifecycle) buildCoordinator(
 			"indexer: repository %s stopped admitting while checkout %s was starting its coordinator",
 			primary.RepoPrefix, checkout.CheckoutID)
 	}
+	l.watchCheckout(coordinator, primary.RepoPrefix, checkout.RootPath)
 	warmCheckoutCompilerAtReady(l, builder, checkout.RootPath)
 	return coordinator, nil
 }
@@ -4283,4 +4293,28 @@ func warmCheckoutCompilerAtReady(l *CheckoutLifecycle, builder *SparseGeneration
 		builder.Semantic.SetForegroundActivity(l.foregroundActivity())
 	}
 	go builder.WarmCheckoutCompiler(root)
+}
+
+// watchCheckout starts the checkout's file watcher and hands it to its
+// coordinator, which closes it with itself. It never delays the coordinator:
+// the watcher starts on a goroutine of its own, and a checkout whose watcher
+// cannot start is still refreshed by its poll.
+func (l *CheckoutLifecycle) watchCheckout(coordinator *CheckoutCoordinator, repoPrefix, root string) {
+	if l == nil || coordinator == nil || !l.cfgWatchCheckouts || !checkoutWatchEnabled() {
+		return
+	}
+	var patterns []string
+	if l.cfgMgr != nil {
+		patterns = l.cfgMgr.EffectiveExclude(repoPrefix)
+	}
+	logger := l.logger.With(zap.String("checkout", coordinator.checkoutID))
+	go func() {
+		w, err := startCheckoutWatch(root, patterns, logger, coordinator.noteFilesystemChange)
+		if err != nil {
+			logger.Info("checkout watch: not started; the checkout is refreshed by its poll",
+				zap.String("root", root), zap.Error(err))
+			return
+		}
+		coordinator.attachFilesystemWatch(w)
+	}()
 }

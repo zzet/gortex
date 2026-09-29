@@ -347,6 +347,10 @@ type CheckoutCycle struct {
 	// a lost route flip, or a working tree that moved under two builds in a
 	// row. The route is left exactly as the cycle found it.
 	Rescheduled bool
+	// Held reports a background cycle kept off the build lane because the
+	// working tree was still changing (checkout_motion.go): it built nothing,
+	// it is Rescheduled, and the quiet window runs the next one.
+	Held bool
 	// Deferred reports that the cycle never ran. Three causes share the field:
 	// daemon warmup has not opened the build lane, its bounded background queue
 	// was saturated, or the resolver-visible input cohort could not be
@@ -581,6 +585,18 @@ type CheckoutCoordinator struct {
 	textIndex *trigram.Searcher
 	textKey   string
 	textState checkoutTextState
+
+	// motion is what the checkout's file watcher reported, and the admission
+	// state of background cycles over a moving working tree
+	// (checkout_motion.go).
+	motion checkoutMotion
+	// holdSample is a focused test seam for the working-copy sample a
+	// background cycle takes before it queues (holdBackgroundCycle); nil
+	// takes cycleSample.
+	holdSample func(context.Context) error
+	// announceWrite replaces the store's AnnounceWrite for a waiting refresh
+	// ticket (a test seam; nil uses the store).
+	announceWrite func() func()
 
 	cycleDone    func(CheckoutCycle)
 	dirtyBarrier func()
@@ -869,6 +885,7 @@ func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 		if c.cancelLifetime != nil {
 			c.cancelLifetime()
 		}
+		c.closeFilesystemWatch()
 		if c.stop != nil {
 			close(c.stop)
 		}
@@ -933,6 +950,10 @@ func (c *CheckoutCoordinator) run() {
 	admitted := c.admissionWait()
 	claimed := false
 	var armed <-chan time.Time
+	// armedSince is when the armed window was first armed: a window re-armed
+	// by a stream of signals is not extended past the coalesce cap, so a
+	// tree that never stops changing still gets a cycle.
+	var armedSince time.Time
 	for {
 		select {
 		case <-c.stop:
@@ -942,6 +963,12 @@ func (c *CheckoutCoordinator) run() {
 		case <-c.signal:
 			// Re-arm on every signal: the window is quiet time since the LAST
 			// claim that the checkout moved, not since the first.
+			now := time.Now()
+			if armed == nil {
+				armedSince = now
+			} else if now.Sub(armedSince) >= c.backgroundCoalesceCap() {
+				continue
+			}
 			stopTimer(quiet)
 			quiet.Reset(c.quiet)
 			armed = quiet.C
@@ -1044,25 +1071,77 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 			c.noteForegroundCycle(time.Now())
 		}
 	}()
+
 	c.mu.Lock()
 	reason := c.reason
 	c.mu.Unlock()
 
+	// A background cycle over a working tree that is still changing builds a
+	// state that is gone before it can publish: it is held here, before its
+	// sample decides anything and before it queues for the lock or the lane
+	// (checkout_motion.go). A ticket's cycle is never held. The hold's
+	// sample is the one the preflight then shares, so its time is counted
+	// as preflight.
+	//
+	// Until it queues for the lane, a background cycle also steps aside for
+	// a refresh ticket of its own checkout (preemptBackgroundOnDemand): its
+	// pre-build steps run under preCtx, which a ticket's arrival cancels.
 	preflightStarted := time.Now()
+	preCtx, stopDemandWatch := ctx, func() bool { return false }
+	if through == 0 {
+		preCtx, stopDemandWatch = c.preemptBackgroundOnDemand(ctx)
+	}
+	demandWatched := true
+	endDemandWatch := func() bool {
+		if !demandWatched {
+			return false
+		}
+		demandWatched = false
+		return stopDemandWatch()
+	}
+	defer endDemandWatch()
+	steppedAside := func() bool {
+		if preCtx.Err() == nil || !endDemandWatch() {
+			return false
+		}
+		out := c.ticketPreemptedCycle()
+		out.cycleStarted = cycleStarted
+		c.reportCheckoutCycle(ctx, through, out)
+		return true
+	}
+	if through == 0 {
+		if why, held := c.holdBackgroundCycle(preCtx); held {
+			if steppedAside() {
+				return
+			}
+			out := c.heldBackgroundCycle(why)
+			out.cycleStarted = cycleStarted
+			c.reportCheckoutCycle(ctx, through, out)
+			return
+		}
+	}
+
 	preflight := c.settledWithoutBuild
 	if c.cyclePreflight != nil {
 		preflight = c.cyclePreflight
 	}
-	if out, settled := preflight(ctx); settled {
+	if out, settled := preflight(preCtx); settled {
 		out.cycleStarted = cycleStarted
 		recordCoordinatorCycle(out)
 		c.reportCheckoutCycle(ctx, through, out)
 		return
 	}
+	if steppedAside() {
+		return
+	}
 
 	preflightDone := time.Now()
 	if through == 0 {
-		ctx = withPhaseRecord(ctx, c.openObservedChangeRecord(ctx))
+		// No ticket names this cycle's work: if its sample shows a change the
+		// route does not describe yet (a filesystem edit, a checkout, a
+		// revert), the cycle opens a record for it so the edit's publication
+		// is timed like a ticket's.
+		ctx = withPhaseRecord(ctx, c.openObservedChangeRecord(preCtx))
 	}
 	priority := ViewBuildBackground
 	if through != 0 {
@@ -1077,9 +1156,19 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	// (refuseStaleAdmission). What remains behind the lock is this checkout's
 	// own work. The wait itself is cancellable, so stop and shutdown still
 	// reach a loop parked here.
-	if err := acquireCycleLock(ctx, c); err != nil {
+	if err := acquireCycleLock(preCtx, c); err != nil {
+		if steppedAside() {
+			return
+		}
 		out := CheckoutCycle{Err: err}
 		recordCoordinatorCycle(out)
+		c.reportCheckoutCycle(ctx, through, out)
+		return
+	}
+	if endDemandWatch() {
+		c.cycleMu.Unlock()
+		out := c.ticketPreemptedCycle()
+		out.cycleStarted = cycleStarted
 		c.reportCheckoutCycle(ctx, through, out)
 		return
 	}
@@ -1117,10 +1206,22 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	defer c.gate.NoteHolder(ViewBuildLaneHolder{
 		Kind: "checkout_cycle", CheckoutID: c.checkoutID, Priority: viewBuildPriorityLabel(priority),
 	})()
+	// A background cycle gives the lane up to an interactive build that
+	// starts waiting for it (another checkout's edit), up to its commit
+	// point: the builder withdraws the yield right before it publishes.
+	// A yielded cycle publishes nothing, releases the lane and queues again
+	// at background priority (yieldedCycle).
 	var laneYield *backgroundLaneYield
+	// treeMove abandons the background build when the checkout's watcher
+	// reports a change to a path it reads (checkout_motion.go), up to the
+	// same commit point.
+	var treeMove *backgroundLaneYield
 	if priority == ViewBuildBackground {
+		// Background cycles remain preemptible at every admission.
 		ctx, laneYield = armBackgroundLaneYield(ctx, c.gate, 0)
 		defer laneYield.close()
+		ctx, treeMove = c.armTreeMoveAbort(ctx, cycleStarted)
+		defer c.disarmTreeMoveAbort(treeMove)
 	}
 	markPublicationPhase(ctx, PublicationAdmitted)
 	if c.cycleBarrier != nil {
@@ -1128,8 +1229,11 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	}
 	if err := ctx.Err(); err != nil {
 		out := CheckoutCycle{Err: err}
-		if laneYield.Yielded() {
+		switch {
+		case laneYield.Yielded():
 			out = c.yieldedCycle(out, admission)
+		case treeMove.Yielded():
+			out = c.treeMovedCycle(out, admission, "watcher")
 		}
 		recordCoordinatorCycle(out)
 		c.reportCheckoutCycle(ctx, through, out)
@@ -1138,10 +1242,27 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	out := c.reconcile(ctx)
 	out.cycleStarted = cycleStarted
 	out.Admission = admission
-	if laneYield.Yielded() && out.Err != nil {
+	// A cycle the yield canceled ends in an error; one that finished its
+	// work anyway (the cancel landed after its last step) keeps its outcome.
+	// Any other background cycle ran to its end, failed or not, so the run
+	// of consecutive yields is over.
+	//
+	// A background build the working tree moved under — the watcher's abort,
+	// or a sample or prepublish fence refusing a moved tree — is rescheduled
+	// through the quiet window, not failed: it published nothing, and the
+	// state it would have built is already gone.
+	switch {
+	case laneYield.Yielded() && out.Err != nil:
 		out = c.yieldedCycle(out, admission)
-	} else if priority == ViewBuildBackground {
+	case treeMove.Yielded() && out.Err != nil:
 		c.resetBackgroundLaneYields()
+		out = c.treeMovedCycle(out, admission, "watcher")
+	case priority == ViewBuildBackground && workingTreeMovedWhileSampling(out.Err):
+		c.resetBackgroundLaneYields()
+		out = c.treeMovedCycle(out, admission, "sample")
+	case priority == ViewBuildBackground:
+		c.resetBackgroundLaneYields()
+		c.settleTreeMoveAborts()
 	}
 	foreground = foreground || out.DirtyBuilt
 	recordCoordinatorCycle(out)

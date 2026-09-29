@@ -79,6 +79,12 @@ type checkoutRefreshRequest struct {
 	// record is the caller's publication record (WithPublicationRecord),
 	// bound to the ticket at admission, before the coordinator is woken.
 	record *PublicationPhaseRecord
+	// releaseWrite ends the store write announcement the ticket holds from
+	// its admission until it completes or fails (store_sqlite AnnounceWrite):
+	// while a ticket waits, background holders of the store's writer (the
+	// WAL reclaim) give it up at once instead of making the edit's build wait
+	// behind them.
+	releaseWrite func()
 }
 
 // Identity returns the immutable checkout identity admitted before a disk edit.
@@ -357,6 +363,7 @@ func (c *CheckoutCoordinator) enqueueCheckoutRefresh(request *checkoutRefreshReq
 	}
 	c.refreshHighWater = sequence
 	c.refreshWaiters[sequence] = request
+	request.releaseWrite = c.announceTicketWrite()
 	// Bind before the wake: the cycle SignalDemand starts marks every record
 	// bound at or below its high-water mark, and one bound after this call
 	// returns could miss cycle_started and admitted.
@@ -366,6 +373,7 @@ func (c *CheckoutCoordinator) enqueueCheckoutRefresh(request *checkoutRefreshReq
 	}
 	c.refreshMu.Unlock()
 	c.SignalDemand("checkout refresh ticket admitted")
+	c.PrioritizeSelection()
 	return request.ticket, nil
 }
 
@@ -599,6 +607,9 @@ func (c *CheckoutCoordinator) finishCheckoutRefresh(request *checkoutRefreshRequ
 	}
 	delete(c.refreshWaiters, sequence)
 	c.refreshMu.Unlock()
+	if request.releaseWrite != nil {
+		request.releaseWrite()
+	}
 	// The coordinator's own completion instant, on the record the ticket was
 	// admitted with (first-wins: the caller's later mark of the same phase,
 	// taken when it receives the result, is a no-op). A failure is left to
@@ -731,4 +742,16 @@ func checkoutRefreshFileHash(ctx context.Context, root string, rootInfo os.FileI
 		return "", "", ErrCheckoutRefreshSuperseded
 	}
 	return path, hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// announceTicketWrite announces a waiting ticket's mutation to the store (see
+// checkoutRefreshRequest.releaseWrite); announceWrite is the test seam.
+func (c *CheckoutCoordinator) announceTicketWrite() func() {
+	if c.announceWrite != nil {
+		return c.announceWrite()
+	}
+	if c.store == nil {
+		return nil
+	}
+	return c.store.AnnounceWrite()
 }

@@ -637,6 +637,8 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			Graph:         g,
 			Logger:        logger,
 			LazyWorktrees: conf.Views.LazyWorktreeActivation,
+			// A linked worktree's plain save wakes its coordinator.
+			WatchCheckouts: true,
 			RefViews: indexer.RefViewRetention{
 				RetainInactive:       conf.Views.RetainInactiveDuration(),
 				MaxCachedGenerations: conf.Views.MaxCachedGenerations,

@@ -130,4 +130,7 @@ func reachBuildCommitPoint(ctx context.Context) {
 	if y, _ := ctx.Value(buildCommitPointKey{}).(*backgroundLaneYield); y != nil {
 		y.commit()
 	}
+	// The movement abort of a background build (checkout_motion.go) shares
+	// the commit point.
+	commitTreeMoveAbort(ctx)
 }
