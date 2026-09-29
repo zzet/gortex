@@ -364,10 +364,10 @@ func (c *CheckoutCoordinator) enqueueCheckoutRefresh(request *checkoutRefreshReq
 	sequence := checkoutRefreshSequence.Add(1)
 	request.ticket.Ticket.Generation = sequence
 	request.admittedAt = time.Now()
-	c.ticketDemand.Store(request.admittedAt.UnixNano())
 	if request.freshAfter.IsZero() {
 		request.freshAfter = request.admittedAt
 	}
+	c.ticketDemand.Store(request.admittedAt.UnixNano())
 	c.refreshHighWater = sequence
 	c.refreshWaiters[sequence] = request
 	request.releaseWrite = c.announceTicketWrite()
