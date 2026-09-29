@@ -2182,6 +2182,12 @@ func walReclaimStatus(st store_sqlite.WALReclaimStats) *daemon.WALReclaimStatus 
 		BackoffMS:        st.Backoff.Milliseconds(),
 		LastOutcome:      st.LastOutcome,
 		LastReason:       st.LastReason,
+		CycleDeferrals:   st.CycleDeferrals,
+		CycleRefusals:    st.CycleRefusals,
+		CycleYields:      st.CycleYields,
+		CycleForced:      st.CycleForced,
+		CycleCeilingRuns: st.CycleCeilingRuns,
+		CeilingBytes:     st.CeilingBytes,
 	}
 	if st.PauseCount > 0 {
 		out.PauseAvgMS = durationMS(st.PauseTotal / time.Duration(st.PauseCount))

@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -33,7 +32,8 @@ import (
 //     publishes backfill progress (nBackfill) only when a checkpoint pass
 //     completes, so a pass interrupted by a deadline copies pages and records
 //     nothing. Only shutdown, a generation bulk window opening (the lease
-//     cancels the attempt) stops it. This is what lets a store that reopened
+//     cancels the attempt) or a mutation cycle taking the build lane
+//     (checkpoint_cycle_yield.go) stops it. This is what lets a store that reopened
 //     over a huge recovered log (nBackfill restarts at zero after a crash or a
 //     killed shutdown) catch up in one pass instead of never;
 //  2. take the write gate (bounded wait) so the application writer is idle,
@@ -105,7 +105,8 @@ const (
 	// walReclaimYieldPoll is how often the stage checks for a queued writer.
 	walReclaimYieldPoll = 5 * time.Millisecond
 	// walReclaimCeilingFactor: the WAL ceiling is this multiple of the
-	// reclaim threshold. Over it a bounded reclaim may run inside a bulk window.
+	// reclaim threshold. Over it a reclaim runs even while a mutation cycle
+	// holds the build lane (checkpoint_cycle_yield.go).
 	walReclaimCeilingFactor = 8
 )
 
@@ -146,8 +147,8 @@ type walReclaimConfig struct {
 	// readerWait bounds the open-gate stage (0: skip it and go straight to
 	// the closed-gate drain).
 	readerWait time.Duration
-	// ceilingBytes is the WAL ceiling: over it an attempt may override the
-	// generation bulk lease (0: never).
+	// ceilingBytes is the WAL ceiling: over it an attempt runs despite a
+	// mutation cycle holding the build lane (0: never).
 	ceilingBytes int64
 }
 
@@ -238,7 +239,18 @@ type WALReclaimStats struct {
 	Backoff         time.Duration // current backoff after the last attempt
 	LastOutcome     string
 	LastReason      string
-	CeilingBytes    int64
+	// Build-lane yield (checkpoint_cycle_yield.go): PASSIVE attempts deferred
+	// while a mutation cycle held the lane, reclaim attempts refused for the
+	// same reason, background attempts of either kind a cycle cut short, and
+	// PASSIVE attempts forced past the deferral bound.
+	CycleDeferrals int64
+	CycleRefusals  int64
+	CycleYields    int64
+	CycleForced    int64
+	// CycleCeilingRuns counts reclaim attempts run despite a held lane
+	// because the WAL was over its ceiling.
+	CycleCeilingRuns int64
+	CeilingBytes     int64
 	// LeaseOverrides counts reclaim attempts run inside a generation bulk
 	// window because the WAL was over its ceiling.
 	LeaseOverrides int64
@@ -247,11 +259,9 @@ type WALReclaimStats struct {
 type walReclaimState struct {
 	mu    sync.Mutex
 	stats WALReclaimStats
-	// cycle holds only bulk-lease override counters at this stage.
-	cycle struct {
-		leaseOverrides    atomic.Int64
-		lastLeaseOverride atomic.Int64
-	}
+	// cycle is the build-lane yield shared by the reclaim and the PASSIVE
+	// loop (checkpoint_cycle_yield.go).
+	cycle checkpointCycleYield
 }
 
 // WALReclaimStats returns a snapshot of the bounded reclaim's counters.
@@ -263,6 +273,11 @@ func (s *Store) WALReclaimStats() WALReclaimStats {
 	out := s.walReclaim.stats
 	s.walReclaim.mu.Unlock()
 	cycle := &s.walReclaim.cycle
+	out.CycleDeferrals = cycle.deferrals.Load()
+	out.CycleRefusals = cycle.refusals.Load()
+	out.CycleYields = cycle.yields.Load()
+	out.CycleForced = cycle.forced.Load()
+	out.CycleCeilingRuns = cycle.ceiling.Load()
 	out.LeaseOverrides = cycle.leaseOverrides.Load()
 	if g := s.readGate; g != nil {
 		out.ReaderWaits = g.waits.Load()
@@ -404,7 +419,26 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	}
 	// Same refusal the background PASSIVE honours: a generation bulk window
 	// holding the lease, or another background checkpoint in flight.
-	attempt, berr := s.beginReclaimCheckpointAttempt(false)
+	// It never starts while a mutation cycle holds the build lane, and a
+	// cycle taking the lane cancels it (checkpoint_cycle_yield.go): the
+	// reclaim's reset takes the writer and a TRUNCATE, so it has no forced
+	// variant — it waits for an idle window.
+	//
+	// The exception is a log over the WAL ceiling: then the attempt runs
+	// despite the lane, bounded by the writer-hold cap instead.
+	policy := checkpointYieldsToCycle
+	if cfg.ceilingBytes > 0 && s.cycleYieldEnabled() && s.buildLaneBusy() {
+		if size := walFileSize(walPath); size >= cfg.ceilingBytes {
+			policy = checkpointIgnoresCycle
+			s.walReclaim.cycle.ceiling.Add(1)
+			log.Printf("store_sqlite: wal reclaim running despite the build lane reason=wal_ceiling wal_bytes=%d ceiling=%d", size, cfg.ceilingBytes)
+		}
+	}
+	attempt, berr := s.beginBackgroundCheckpointAttempt(policy)
+	if errors.Is(berr, errWALCheckpointYieldedToCycle) {
+		s.walReclaim.cycle.refusals.Add(1)
+		return walReclaimResult{outcome: walReclaimSkipped, reason: "build_lane_busy"}
+	}
 	if errors.Is(berr, errWALCheckpointInFlight) {
 		return walReclaimResult{outcome: walReclaimSkipped, reason: "checkpoint_in_flight"}
 	}
@@ -419,7 +453,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		if cfg.ceilingBytes <= 0 || size < cfg.ceilingBytes || !s.leaseOverrideDue(time.Now()) {
 			return walReclaimResult{outcome: walReclaimSkipped, reason: "checkpoint_lease"}
 		}
-		attempt, berr = s.beginReclaimCheckpointAttempt(true)
+		attempt, berr = s.beginBackgroundCheckpointAttempt(checkpointOverridesLease)
 		if berr != nil {
 			return walReclaimResult{outcome: walReclaimSkipped, reason: "checkpoint_in_flight"}
 		}
@@ -549,6 +583,10 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	}
 	if errors.Is(context.Cause(attempt.ctx), errWALCheckpointDeferredBulk) {
 		res.outcome, res.reason = walReclaimSkipped, "bulk_lease"
+		return res
+	}
+	if cycleCancelled(attempt) {
+		res.outcome, res.reason = walReclaimSkipped, "build_lane_busy"
 		return res
 	}
 	if attempt.ctx.Err() != nil {
@@ -855,7 +893,9 @@ func (s *Store) startWALReclaimLoop(walPath string) (join func()) {
 		st.CeilingBytes = cfg.ceilingBytes
 	})
 	done := make(chan struct{})
+	s.walReclaim.cycle.loopThreshold.Store(cfg.thresholdBytes)
 	go func() {
+		defer s.walReclaim.cycle.loopThreshold.Store(0)
 		s.runWALReclaimLoop(cfg, walPath, walReclaimPollInterval, done)
 	}()
 	return func() { <-done }

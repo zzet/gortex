@@ -948,9 +948,58 @@ func sqliteCheckpointDSN(path string) string {
 // goroutine-local state prevent retry goroutine/timer storms.
 var errGenerationBulkCheckpointCoordination = errors.New("store_sqlite: generation bulk checkpoint coordination")
 
-func (s *Store) beginBackgroundCheckpointAttempt() (*backgroundCheckpointAttempt, bool) {
-	a, err := s.beginReclaimCheckpointAttempt(false)
-	return a, err == nil
+// beginBackgroundCheckpointAttempt registers the one background checkpoint
+// attempt. It is refused (errWALCheckpointDeferredBulk) while a generation
+// bulk window holds the lease or another attempt runs, and — for a yielding
+// attempt with a build-lane predicate installed — while a mutation cycle holds
+// the lane (errWALCheckpointYieldedToCycle); a yielding attempt is also
+// cancelled with that cause when a cycle takes the lane (see
+// checkpoint_cycle_yield.go).
+func (s *Store) beginBackgroundCheckpointAttempt(policy checkpointCyclePolicy) (*backgroundCheckpointAttempt, error) {
+	yields := policy == checkpointYieldsToCycle && s.cycleYieldEnabled()
+	overridesLease := policy == checkpointOverridesLease
+	if yields && s.buildLaneBusy() {
+		return nil, errWALCheckpointYieldedToCycle
+	}
+	// Let background PASSIVE finish so SQLite can record WAL backfill progress.
+	// Shutdown, generation bulk admission and (for a yielding attempt) a
+	// mutation cycle cancel the attempt explicitly.
+	base, timeoutCancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(base)
+	attempt := &backgroundCheckpointAttempt{
+		ctx:           ctx,
+		cancel:        cancel,
+		timeoutCancel: timeoutCancel,
+		done:          make(chan struct{}),
+	}
+
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	if (coordination.generationLease != 0 && !overridesLease) || coordination.active != nil {
+		refusal := errWALCheckpointDeferredBulk
+		if coordination.generationLease == 0 || overridesLease {
+			refusal = errWALCheckpointInFlight
+		}
+		coordination.mu.Unlock()
+		cancel(refusal)
+		timeoutCancel()
+		return nil, refusal
+	}
+	coordination.active = attempt
+	coordination.mu.Unlock()
+
+	if yields {
+		go s.watchBuildLane(attempt)
+		return attempt, nil
+	}
+	go func() {
+		select {
+		case <-s.stopCheckpoint:
+			cancel(context.Canceled)
+		case <-attempt.done:
+		}
+	}()
+	return attempt, nil
 }
 
 func (s *Store) finishBackgroundCheckpointAttempt(attempt *backgroundCheckpointAttempt) {
@@ -972,17 +1021,7 @@ func (s *Store) finishBackgroundCheckpointAttempt(attempt *backgroundCheckpointA
 }
 
 func (s *Store) runBackgroundCheckpointAttempt(run func(context.Context) (complete, retry bool)) (complete, retry bool) {
-	attempt, ok := s.beginBackgroundCheckpointAttempt()
-	if !ok {
-		return false, true
-	}
-	defer s.finishBackgroundCheckpointAttempt(attempt)
-
-	complete, retry = run(attempt.ctx)
-	if errors.Is(context.Cause(attempt.ctx), errWALCheckpointDeferredBulk) {
-		return false, true
-	}
-	return complete, retry
+	return s.runBackgroundCheckpointAttemptWith(checkpointYieldsToCycle, run)
 }
 
 func (s *Store) acquireGenerationBulkCheckpointLease() (generationBulkCheckpointLease, error) {
@@ -1080,7 +1119,7 @@ func (s *Store) checkpointWALPassiveBackgroundOutcomeContext(ctx context.Context
 	}
 	result, err := checkpointWALOnceOn(ctx, db, "PASSIVE")
 	ctxErr := ctx.Err()
-	if errors.Is(context.Cause(ctx), errWALCheckpointDeferredBulk) {
+	if cause := context.Cause(ctx); errors.Is(cause, errWALCheckpointDeferredBulk) || errors.Is(cause, errWALCheckpointYieldedToCycle) {
 		return false, true
 	}
 	if err == nil {
@@ -1107,8 +1146,12 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 			log.Printf("store_sqlite: close background WAL checkpoint pool: %v", err)
 		}
 	}
-	checkpoint := func() (complete, retry bool) {
-		return s.runBackgroundCheckpointAttempt(func(ctx context.Context) (bool, bool) {
+	checkpoint := func(forced bool) (complete, retry bool) {
+		policy := checkpointYieldsToCycle
+		if forced {
+			policy = checkpointIgnoresCycle
+		}
+		return s.runBackgroundCheckpointAttemptWith(policy, func(ctx context.Context) (bool, bool) {
 			if ctx.Err() != nil {
 				return false, true
 			}
@@ -1126,6 +1169,9 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 			return s.checkpointWALPassiveBackgroundOutcomeContext(ctx, checkpointDB)
 		})
 	}
+	// The bounded reclaim runs beside the PASSIVE loop on its own goroutine
+	// and is joined by this loop's cleanup, so Close's stopCheckpointLoop
+	// still guarantees no checkpoint of either kind is in flight.
 	stopReclaim := s.startWALReclaimLoop(walPath)
 	stopLazyIndex := s.startLazyIndexBuilder()
 	s.runCheckpointLoopWithAttemptAndCleanup(
@@ -1133,7 +1179,7 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 		walCheckpointRetryInitial,
 		walCheckpointRetryMax,
 		func() bool {
-			return schedule.attempt(time.Now(), walPath, checkpoint)
+			return schedule.attemptYielding(time.Now(), walPath, s.cycleLane(), checkpoint)
 		},
 		func() {
 			stopReclaim()
@@ -1224,6 +1270,8 @@ type walCheckpointSchedule struct {
 	gate         walPressureGate
 	interval     time.Duration
 	nextPeriodic time.Time
+	// cycle is the build-lane deferral episode (checkpoint_cycle_yield.go).
+	cycle cycleDeferral
 }
 
 func newWALCheckpointSchedule(now time.Time, interval time.Duration, thresholdBytes int64) walCheckpointSchedule {
@@ -1239,24 +1287,7 @@ func newWALCheckpointSchedule(now time.Time, interval time.Duration, thresholdBy
 // snapshot, so a pinned reader gets the existing prompt exponential retry even
 // when the WAL's size and mtime do not change.
 func (s *walCheckpointSchedule) attempt(now time.Time, walPath string, checkpoint func() (complete, retry bool)) bool {
-	if now.Before(s.nextPeriodic) && !s.gate.due(now, walPath) {
-		return false
-	}
-	complete, retry := checkpoint()
-	if complete {
-		s.gate.markComplete(now, walPath)
-		s.nextPeriodic = now.Add(s.interval)
-		return false
-	}
-	if retry {
-		return true
-	}
-	// Permanent driver/I/O errors retain the historical ordinary interval;
-	// they neither mark an incomplete WAL as drained nor spin every poll.
-	next := now.Add(s.interval)
-	s.gate.deferUntil = next
-	s.nextPeriodic = next
-	return false
+	return s.attemptYielding(now, walPath, cycleLane{}, func(bool) (bool, bool) { return checkpoint() })
 }
 
 func (s *Store) runCheckpointLoopWithAttempt(
@@ -3642,45 +3673,6 @@ func (s *Store) FindNodesByNames(names []string) map[string][]*graph.Node {
 // the bracket additionally engages a bulk-persist fast path (dropped
 // secondary indexes + synchronous=OFF on a pinned connection).
 
-func (s *Store) beginReclaimCheckpointAttempt(overridesLease bool) (*backgroundCheckpointAttempt, error) {
-	// Let background PASSIVE finish so SQLite can record WAL backfill progress.
-	// Shutdown and generation bulk admission cancel the attempt explicitly.
-	base, timeoutCancel := context.WithCancel(context.Background())
-	ctx, cancel := context.WithCancelCause(base)
-	attempt := &backgroundCheckpointAttempt{
-		ctx:           ctx,
-		cancel:        cancel,
-		timeoutCancel: timeoutCancel,
-		done:          make(chan struct{}),
-	}
-
-	coordination := &s.backgroundCheckpoint
-	coordination.mu.Lock()
-	if (coordination.generationLease != 0 && !overridesLease) || coordination.active != nil {
-		refusal := errWALCheckpointDeferredBulk
-		if coordination.generationLease == 0 || overridesLease {
-			refusal = errWALCheckpointInFlight
-		}
-		coordination.mu.Unlock()
-		cancel(refusal)
-		timeoutCancel()
-		return nil, refusal
-	}
-	coordination.active = attempt
-	coordination.mu.Unlock()
-
-	go func() {
-		select {
-		case <-s.stopCheckpoint:
-			cancel(context.Canceled)
-		case <-attempt.done:
-		}
-	}()
-	return attempt, nil
-}
-
-var errWALCheckpointInFlight = errors.New("store_sqlite: wal checkpoint: another background checkpoint is in flight")
-
 // scanEdgeRows is queryEdgesSQL's scan over already-open rows; it closes them.
 func (s *Store) scanEdgeRows(rows *sql.Rows) []*graph.Edge {
 	defer rows.Close()
@@ -3700,4 +3692,71 @@ func (s *Store) scanEdgeRows(rows *sql.Rows) []*graph.Edge {
 		panicOnFatal(err)
 	}
 	return out
+}
+
+// runBackgroundCheckpointAttemptWith is runBackgroundCheckpointAttempt with
+// an explicit build-lane policy (checkpoint_cycle_yield.go).
+func (s *Store) runBackgroundCheckpointAttemptWith(policy checkpointCyclePolicy, run func(context.Context) (complete, retry bool)) (complete, retry bool) {
+	attempt, err := s.beginBackgroundCheckpointAttempt(policy)
+	if err != nil {
+		return false, true
+	}
+	defer s.finishBackgroundCheckpointAttempt(attempt)
+
+	complete, retry = run(attempt.ctx)
+	if cause := context.Cause(attempt.ctx); errors.Is(cause, errWALCheckpointDeferredBulk) || errors.Is(cause, errWALCheckpointYieldedToCycle) {
+		return false, true
+	}
+	return complete, retry
+}
+
+// attemptYielding is attempt with the build lane consulted (see
+// checkpoint_cycle_yield.go): a due attempt is deferred — without backoff,
+// to the next poll — while a mutation cycle holds the lane, until the
+// deferral bound passes with the WAL above its threshold, when one forced
+// (non-yielding) PASSIVE runs. An attempt a cycle cut short counts toward the
+// same bound and does not back off either.
+func (s *walCheckpointSchedule) attemptYielding(now time.Time, walPath string, lane cycleLane, checkpoint func(forced bool) (complete, retry bool)) bool {
+	if now.Before(s.nextPeriodic) && !s.gate.due(now, walPath) {
+		return false
+	}
+	if lane.reclaimOwns(walPath) {
+		// Over the reclaim's threshold the reclaim backfills and resets the
+		// log itself; a long PASSIVE here would only hold the one background
+		// checkpoint slot and refuse it (checkpoint_lease) for the length of
+		// the copy.
+		return false
+	}
+	run, forced := s.cycle.decide(now, lane.busy(), lane.maxDeferral, func() bool { return s.gate.over(walPath) })
+	if !run {
+		lane.noteDeferral()
+		logCycleDeferral(&s.cycle, now)
+		return false
+	}
+	if forced {
+		lane.noteForced()
+		logCycleForced(&s.cycle, now)
+	}
+	complete, retry := checkpoint(forced)
+	if !complete && !forced && lane.busy() {
+		// A cycle took the lane mid-attempt (or refused it at the start):
+		// neither a failure nor contention the checkpoint caused.
+		s.cycle.yielded(now)
+		return false
+	}
+	s.cycle.ran()
+	if complete {
+		s.gate.markComplete(now, walPath)
+		s.nextPeriodic = now.Add(s.interval)
+		return false
+	}
+	if retry {
+		return true
+	}
+	// Permanent driver/I/O errors retain the historical ordinary interval;
+	// they neither mark an incomplete WAL as drained nor spin every poll.
+	next := now.Add(s.interval)
+	s.gate.deferUntil = next
+	s.nextPeriodic = next
+	return false
 }

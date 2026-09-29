@@ -1126,6 +1126,12 @@ type WALReclaimStatus struct {
 	BackoffMS        int64   `json:"backoff_ms"`
 	LastOutcome      string  `json:"last_outcome,omitempty"`
 	LastReason       string  `json:"last_reason,omitempty"`
+	CycleDeferrals   int64   `json:"cycle_deferrals"`
+	CycleRefusals    int64   `json:"cycle_refusals"`
+	CycleYields      int64   `json:"cycle_yields"`
+	CycleForced      int64   `json:"cycle_forced"`
+	CycleCeilingRuns int64   `json:"cycle_ceiling_runs"`
+	CeilingBytes     int64   `json:"ceiling_bytes,omitempty"`
 }
 
 // BuildLaneStatus is the view-build lane's state for daemon status.

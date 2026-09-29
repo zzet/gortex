@@ -279,6 +279,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// reading a route and serving a published generation never consult it.
 	viewBuilds := indexer.NewViewBuildGate()
 	state.lifecycle.SetBuildGate(viewBuilds)
+	installBuildLaneBusy(state.graph, viewBuilds)
 
 	controller := &realController{
 		graph:         state.graph,
@@ -2336,6 +2337,8 @@ func renderDaemonStorage(w io.Writer, st daemon.StatusResponse) {
 		r.OpenGateResets, r.WriterHoldMaxMS, r.WriterHoldLastMS)
 	fmt.Fprintf(w, "    gate pause n=%d  max=%.1fms  avg=%.1fms  last=%.1fms  reader waits n=%d  max=%.1fms  avg=%.1fms\n",
 		r.PauseCount, r.PauseMaxMS, r.PauseAvgMS, r.PauseLastMS, r.ReaderWaits, r.ReaderWaitMaxMS, r.ReaderWaitAvgMS)
+	fmt.Fprintf(w, "    edit-cycle yield: passive deferrals=%d  forced=%d  reclaim refusals=%d  cut short=%d  ceiling runs=%d  ceiling=%s\n",
+		r.CycleDeferrals, r.CycleForced, r.CycleRefusals, r.CycleYields, r.CycleCeilingRuns, formatBytes(nonNegative(r.CeilingBytes)))
 	if r.BackoffMS > 0 || r.LastOutcome != "" || r.LastReason != "" {
 		fmt.Fprintf(w, "    backoff=%s  last=%s", (time.Duration(r.BackoffMS) * time.Millisecond).String(), orDash(r.LastOutcome))
 		if r.LastReason != "" {
