@@ -2037,8 +2037,16 @@ func (s *Server) materializeRequestView(
 		return &requestView{kind: requestViewKindWorktree, rider: rider, viewRoot: checkout.RootPath, deferred: true}, nil
 	}
 	indexer.StampPublicationPhase(ctx, indexer.PublicationViewUseNoted)
+	_, missesBefore, _ := s.materializer.LayerCacheStats()
+	materializeStarted := time.Now()
 	view, err := s.materializer.MaterializeCheckout(ctx, checkout.CheckoutID)
 	indexer.StampPublicationPhase(ctx, indexer.PublicationViewMaterialized)
+	if elapsed := time.Since(materializeStarted); elapsed > 50*time.Millisecond && s.logger != nil {
+		_, missesAfter, _ := s.materializer.LayerCacheStats()
+		s.logger.Info("graph view: slow checkout materialization",
+			zap.String("checkout", checkout.CheckoutID), zap.Duration("elapsed", elapsed),
+			zap.Int64("mask_loads", missesAfter-missesBefore), zap.Error(err))
+	}
 	if err != nil {
 		// A route that will not materialize is a stale-HEAD or half-built
 		// generation; kick a rebuild the same way before falling back.
