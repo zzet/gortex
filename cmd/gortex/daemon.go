@@ -2369,6 +2369,8 @@ func renderDaemonStorage(w io.Writer, st daemon.StatusResponse) {
 		r.PauseCount, r.PauseMaxMS, r.PauseAvgMS, r.PauseLastMS, r.ReaderWaits, r.ReaderWaitMaxMS, r.ReaderWaitAvgMS)
 	fmt.Fprintf(w, "    edit-cycle yield: passive deferrals=%d  forced=%d  reclaim refusals=%d  cut short=%d  ceiling runs=%d  ceiling=%s\n",
 		r.CycleDeferrals, r.CycleForced, r.CycleRefusals, r.CycleYields, r.CycleCeilingRuns, formatBytes(nonNegative(r.CeilingBytes)))
+	fmt.Fprintf(w, "    retirement edit yield: waits=%d  timeouts=%d\n",
+		r.RetirementEditYields, r.RetirementEditYieldTimeouts)
 	if r.BackoffMS > 0 || r.LastOutcome != "" || r.LastReason != "" {
 		fmt.Fprintf(w, "    backoff=%s  last=%s", (time.Duration(r.BackoffMS) * time.Millisecond).String(), orDash(r.LastOutcome))
 		if r.LastReason != "" {

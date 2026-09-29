@@ -1132,6 +1132,10 @@ type WALReclaimStatus struct {
 	CycleForced      int64   `json:"cycle_forced"`
 	CycleCeilingRuns int64   `json:"cycle_ceiling_runs"`
 	CeilingBytes     int64   `json:"ceiling_bytes,omitempty"`
+	// Retirement chunks that waited for an edit-path writer to finish, and
+	// the waits that ran out and proceeded.
+	RetirementEditYields        int64 `json:"retirement_edit_yields"`
+	RetirementEditYieldTimeouts int64 `json:"retirement_edit_yield_timeouts"`
 }
 
 // BuildLaneStatus is the view-build lane's state for daemon status.

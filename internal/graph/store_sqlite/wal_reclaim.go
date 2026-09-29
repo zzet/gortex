@@ -254,6 +254,16 @@ type WALReclaimStats struct {
 	// LeaseOverrides counts reclaim attempts run inside a generation bulk
 	// window because the WAL was over its ceiling.
 	LeaseOverrides int64
+	// RetirementWaits counts retirement chunks that waited for the reclaim
+	// with the WAL over its ceiling; RetirementWaitTimeouts the waits that
+	// ran out and proceeded anyway.
+	RetirementWaits        int64
+	RetirementWaitTimeouts int64
+	// RetirementEditYields counts retirement chunks that waited for an
+	// edit-path writer (an announced mutation or a writer parked on the
+	// gate); RetirementEditYieldTimeouts the waits that ran out.
+	RetirementEditYields        int64
+	RetirementEditYieldTimeouts int64
 }
 
 type walReclaimState struct {
@@ -279,6 +289,10 @@ func (s *Store) WALReclaimStats() WALReclaimStats {
 	out.CycleForced = cycle.forced.Load()
 	out.CycleCeilingRuns = cycle.ceiling.Load()
 	out.LeaseOverrides = cycle.leaseOverrides.Load()
+	out.RetirementWaits = cycle.retirementWaits.Load()
+	out.RetirementWaitTimeouts = cycle.retirementTimeouts.Load()
+	out.RetirementEditYields = cycle.retirementEditYields.Load()
+	out.RetirementEditYieldTimeouts = cycle.retirementEditYieldTimeouts.Load()
 	if g := s.readGate; g != nil {
 		out.ReaderWaits = g.waits.Load()
 		out.ReaderWaitTotal = time.Duration(g.waitNanos.Load())

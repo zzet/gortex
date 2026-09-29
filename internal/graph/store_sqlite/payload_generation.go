@@ -1046,12 +1046,22 @@ func sqlInt64List(values []int64) string {
 func (s *Store) deletePayloadChunks(
 	ctx context.Context, generationID int64, chunk payloadSweepChunk, pass *payloadSweepPass,
 ) error {
+	var walEpisode retirementWALEpisode
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if pass.spent() {
 			return fmt.Errorf("%w: generation %d", ErrPayloadSweepBudgetExhausted, generationID)
+		}
+		// Over the WAL ceiling, give the reclaim a writer-idle window
+		// first (bounded; the chunk runs afterwards regardless).
+		s.awaitWALUnderCeiling(ctx, generationID, &walEpisode)
+		// An edit's writes go first: the chunk waits (bounded) while an
+		// edit-path mutation is announced or a writer is parked on the gate.
+		s.yieldToEditWriters(ctx)
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		removed, retiring, err := s.deletePayloadChunk(ctx, generationID, chunk)
 		if err != nil {

@@ -100,6 +100,12 @@ type checkpointCycleYield struct {
 	leaseOverrides    atomic.Int64 // reclaim attempts run inside a bulk window: WAL over the ceiling
 	lastLeaseOverride atomic.Int64 // unix nanos of the last one
 
+	retirementWaits    atomic.Int64 // retirement chunks that waited for the reclaim (retirement_wal_wait.go)
+	retirementTimeouts atomic.Int64 // of those, waits that ran out and proceeded
+
+	retirementEditYields        atomic.Int64 // retirement chunks that waited for an edit-path writer
+	retirementEditYieldTimeouts atomic.Int64 // of those, waits that ran out and proceeded
+
 	maxDeferralOnce sync.Once
 	maxDeferral     time.Duration
 }
