@@ -535,6 +535,12 @@ type Resolver struct {
 	// pass skips them. Set/cleared around ResolveFileAndIncoming by the
 	// single-file index path. nil on every batch/whole-graph pass.
 	incrementalSkip map[string]struct{}
+	// priorBindings are the forward leg's carried bindings (prior_bindings.go);
+	// carriedReindex / carriedJobs are the carried edges awaiting the outgoing
+	// leg's apply.
+	priorBindings  map[string]PriorBinding
+	carriedReindex []graph.EdgeReindex
+	carriedJobs    []reindexJob
 
 	// priorDeclarations holds the changed files' declaration surfaces as they
 	// were immediately before the mutation an incremental resolve catches up,
@@ -3036,13 +3042,30 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 	// The preparation leg's bound is a fact about this batch, not a log line:
 	// the incoming leg admitted nothing and the parked edges stay unresolved.
 	recordFrontierIncomingAdmission(logger, stats, frontier, "preparation")
-	if len(frontier.pending) == 0 {
+	var carried []*graph.Edge
+	if len(r.priorBindings) > 0 {
+		finish = startIncrementalPhase(logger, "carry_prior_bindings")
+		carried = r.carryPriorBindingsLocked(&frontier, stats)
+		finish(zap.Int("carried", len(carried)), zap.Int("pending", len(frontier.pending)))
+		// Normally applied by the outgoing leg; an exit before it applies
+		// them here, so no carried edge is left unwritten.
+		defer func() {
+			if batch, jobs := r.takeCarriedReindexes(); len(batch) > 0 {
+				r.applyIncrementalReindexesLocked(batch, jobs, stats)
+			}
+		}()
+	}
+	if len(frontier.pending) == 0 && len(carried) == 0 {
 		outcome = "no_pending"
 		return stats
 	}
+	// The pass indexes cover the carried edges too (the attribution passes
+	// below read them for the changed files, as they do after any resolve);
+	// only the lookup warm-up, which serves resolution, is left to the edges
+	// still pending.
 	finish = startIncrementalPhase(logger, "build_indexes")
-	clear := r.buildPassIndexesForPending(frontier.pending)
-	indexDuration = finish(zap.Int("pending", len(frontier.pending)))
+	clear := r.buildPassIndexesForPending(append(append([]*graph.Edge(nil), frontier.pending...), carried...))
+	indexDuration = finish(zap.Int("pending", len(frontier.pending)), zap.Int("carried", len(carried)))
 	defer clear()
 	finish = startIncrementalPhase(logger, "warm_lookup")
 	if err := r.warmLookupCache(frontier.pending); err != nil {
@@ -3219,13 +3242,14 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 	stats *ResolveStats,
 	detached ...*graph.Edge,
 ) {
+	// Carried bindings (prior_bindings.go) ride this leg's single apply.
+	reindexBatch, jobs := r.takeCarriedReindexes()
 	if pending, err := r.prepareGoPackageFileFrontier(filePaths, nodesByFile, outByNode); err != nil {
 		stats.Unresolved += pending
 		r.logger.Warn("resolver: Go package preparation failed", zap.Error(err))
+		r.applyIncrementalReindexesLocked(reindexBatch, jobs, stats)
 		return
 	}
-	var jobs []reindexJob
-	var reindexBatch []graph.EdgeReindex
 	resolveOne := func(edge *graph.Edge) {
 		if edge == nil || !graph.IsUnresolvedTarget(edge.To) || r.incrementalSkipped(edge) {
 			return

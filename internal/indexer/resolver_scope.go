@@ -60,6 +60,28 @@ func (b *reparsePendingEnrichmentBatch) recordDeferredResolverEvidence(
 	}
 }
 
+// recordDeferredPriorBindings files one structural chunk's carried bindings
+// for the deferred catch-up (edit_delta_prior_bindings.go).
+func (b *reparsePendingEnrichmentBatch) recordDeferredPriorBindings(bindings map[string]resolver.PriorBinding) {
+	if b == nil || len(bindings) == 0 {
+		return
+	}
+	if b.deferredPriorBindings == nil {
+		b.deferredPriorBindings = make(map[string]resolver.PriorBinding, len(bindings))
+	}
+	for key, binding := range bindings {
+		b.deferredPriorBindings[key] = binding
+	}
+}
+
+// dropDeferredPriorBindings forgets the carried bindings: a batch that
+// deletes files removes candidates the carry did not account for.
+func (b *reparsePendingEnrichmentBatch) dropDeferredPriorBindings() {
+	if b != nil {
+		b.deferredPriorBindings = nil
+	}
+}
+
 // takeDeferredResolverEvidence hands the recorded evidence to exactly one
 // catch-up and forgets it, so no later resolve can compare against it.
 func (b *reparsePendingEnrichmentBatch) takeDeferredResolverEvidence() (map[string]resolver.DeclarationSurface, []*graph.Edge) {
@@ -82,6 +104,14 @@ func (b *reparsePendingEnrichmentBatch) takeDeferredResolverEvidence() (map[stri
 // resolve: the affected-by and name passes that follow resolve OTHER files and
 // get the exhaustive legs.
 func (idx *Indexer) resolveWithDeferredEvidence(batch *reparsePendingEnrichmentBatch, resolve func()) {
+	var bindings map[string]resolver.PriorBinding
+	if batch != nil {
+		bindings, batch.deferredPriorBindings = batch.deferredPriorBindings, nil
+	}
+	if idx != nil && idx.resolver != nil && len(bindings) > 0 {
+		idx.resolver.SetPriorBindings(bindings)
+		defer idx.resolver.SetPriorBindings(nil)
+	}
 	prior, priorPending := batch.takeDeferredResolverEvidence()
 	if idx == nil || idx.resolver == nil || (prior == nil && priorPending == nil) {
 		resolve()

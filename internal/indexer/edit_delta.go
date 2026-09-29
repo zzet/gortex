@@ -401,9 +401,12 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// fingerprints call the save inert: the generation claims each changed
 	// path and must carry its complete rows and side tables (the files row's
 	// content hash among them), which an inert save leaves unwritten.
-	idx.forcedReparse = make(map[string]struct{}, len(plan.indexed))
+	// The change set is re-derived from source whatever its fingerprints
+	// say, and its prior resolutions stay reusable (the shape-keyed reuse and
+	// the prior-binding carry): nothing but the files themselves changed.
+	idx.reparseKeepingResolutions = make(map[string]struct{}, len(plan.indexed))
 	for _, rel := range plan.indexed {
-		idx.forcedReparse[filepath.Clean(filepath.Join(req.RootPath, filepath.FromSlash(rel)))] = struct{}{}
+		idx.reparseKeepingResolutions[filepath.Clean(filepath.Join(req.RootPath, filepath.FromSlash(rel)))] = struct{}{}
 	}
 	// An empty change set (the working tree is back at the state below) is
 	// an empty delta. The engine is not run for it: given no path, its
@@ -417,7 +420,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			exactPointSemantic: true,
 		})
 	}
-	idx.forcedReparse = nil
+	idx.reparseKeepingResolutions = nil
 	if err != nil {
 		return nil, fmt.Errorf("indexer: per-file delta pass: %w", err)
 	}

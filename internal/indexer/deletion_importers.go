@@ -94,6 +94,21 @@ func (idx *Indexer) deletionImporterFiles(deleted []string, skip []string) []str
 // forceReparse reports that filePath must be re-derived from source in this
 // batch even when its bytes and stored fingerprints say it is unchanged.
 func (idx *Indexer) forceReparse(filePath string) bool {
+	if idx.forceReparseDropsResolutions(filePath) {
+		return true
+	}
+	if len(idx.reparseKeepingResolutions) == 0 {
+		return false
+	}
+	_, forced := idx.reparseKeepingResolutions[filepath.Clean(filePath)]
+	return forced
+}
+
+// forceReparseDropsResolutions reports a forced re-parse whose prior
+// resolutions must not be reused (forcedReparse): the importer of a deleted
+// file, and the unchanged files a per-file delta re-derives because the change
+// can move their rows.
+func (idx *Indexer) forceReparseDropsResolutions(filePath string) bool {
 	if len(idx.forcedReparse) == 0 {
 		return false
 	}

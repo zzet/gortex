@@ -515,6 +515,13 @@ type Indexer struct {
 	// surviving importers of a deleted file (deletion_importers.go). Set and
 	// cleared by reindexIncrementalFilesBatched, under the repository lane.
 	forcedReparse map[string]struct{}
+	// reparseKeepingResolutions names files (absolute, cleaned) re-derived
+	// from source whatever their fingerprints say, whose prior resolutions
+	// nonetheless stay reusable: the per-file delta's own change set (it must
+	// carry each changed file's complete rows even for an inert save, while
+	// nothing changed what the file's references bind to). forcedReparse, by
+	// contrast, also drops the file's reuse snapshot.
+	reparseKeepingResolutions map[string]struct{}
 	// deletionReparsePaths names the files (graph paths) the same batch
 	// re-derives from source; the deletion leaves their references to the
 	// reparse instead of parking them.

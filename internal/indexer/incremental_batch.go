@@ -543,8 +543,15 @@ func (idx *Indexer) commitIncrementalStages(
 		// references bind to changed: neither the prior resolutions nor the
 		// references the deletion just parked may short-cut its resolution.
 		if idx.forceReparse(stage.absPath) {
-			stage.reuse, stage.priorPending = nil, nil
+			if idx.forceReparseDropsResolutions(stage.absPath) {
+				stage.reuse, stage.priorPending = nil, nil
+			} else {
+				// A per-file delta's change set (reparseKeepingResolutions).
+				pruneBuiltinReuse(stage.reuse)
+			}
 			stage.metadataOnly = false
+		} else {
+			stripReuseSemanticMeta(stage.reuse)
 		}
 	}
 
@@ -742,7 +749,7 @@ func captureIncrementalStateFromView(
 			reuse[key] = &reuseVal{
 				to: edge.To, confidence: edge.Confidence,
 				confLabel: edge.ConfidenceLabel, origin: edge.Origin, tier: edge.Tier,
-				resolution: reuseResolutionTag(edge),
+				resolution: reuseResolutionTag(edge), semanticMeta: reuseSemanticMeta(edge),
 			}
 		}
 	}
@@ -783,6 +790,7 @@ func applyResolvedOutEdgesFromView(
 		edge.Origin = value.origin
 		edge.Tier = value.tier
 		applyReuseResolutionTag(edge, value.resolution)
+		applyReuseSemanticMeta(edge, value.semanticMeta)
 		retargeted = append(retargeted, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
 		reused++
 	}
@@ -876,6 +884,11 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		}
 	}
 
+	if deferResolverCatchup && idx.resolver.EvidenceScoping() {
+		// Read before the eviction below: the prior bindings and their
+		// targets are part of what it deletes.
+		markerBatch.recordDeferredPriorBindings(stagePriorBindings(idx.graph, stages, view))
+	}
 	carried := restubIncomingRefsFromView(idx.graph, stages, view)
 	// The capability state of the files, read before the eviction below
 	// deletes it; the carried set says which incoming accesses_field rows
@@ -2049,7 +2062,10 @@ func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) {
 		return
 	}
 	idx.observeIncrementalCatchup("affected_by", plan.files)
-	idx.resolver.ResolveFilesAndIncoming(plan.files)
+	// The affected files are referrers of the changed declarations: their own
+	// references re-bind, while the references parked on the names they
+	// declare did not move (ResolveFilesOutgoing).
+	idx.resolver.ResolveFilesOutgoing(plan.files)
 	// A changed contract moved the referrers' arguments back to the callee
 	// (argOfIntoSurvivingOwner); map them onto its current parameters.
 	idx.materializeDataflowParamsForFiles(plan.files)

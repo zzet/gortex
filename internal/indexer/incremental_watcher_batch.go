@@ -373,6 +373,9 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		return result, err
 	}
 	files, needed, exact := incrementalResolutionFrontier(result, receipt)
+	if result == nil || result.DeletedFileCount > 0 {
+		batch.dropDeferredPriorBindings()
+	}
 	if needed && len(files) > 0 {
 		idx.runIncrementalResolutionCatchup(files, batch, func(frontier []string) {
 			if idx.incrementalResolveFilesHook != nil {
@@ -457,6 +460,9 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 	exactPointSemantic bool,
 ) {
 	files, needed, _ := incrementalResolutionFrontier(result, receipt)
+	if result == nil || result.DeletedFileCount > 0 {
+		batch.dropDeferredPriorBindings()
+	}
 	crossRepoFiles := appendUniqueSorted(nil, files...)
 	if result != nil {
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, result.DerivedInvalidation.Files...)
