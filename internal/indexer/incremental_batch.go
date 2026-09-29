@@ -524,7 +524,19 @@ func (idx *Indexer) commitIncrementalStages(
 		zap.Int("staged_files", len(stages)))
 	defer timing.abort()
 	var plan DerivedInvalidationPlan
+	idx.startApplyLaps()
 	view := loadIncrementalPriorView(idx.graph, stages)
+	idx.applyLap("prior_view")
+	defer func() {
+		in, out := 0, 0
+		for _, edges := range view.inByNode {
+			in += len(edges)
+		}
+		for _, edges := range view.outByNode {
+			out += len(edges)
+		}
+		idx.finishApplyLaps(len(stages), in, out)
+	}()
 
 	for _, stage := range stages {
 		stage.reuse, stage.priorPending = captureIncrementalStateFromView(
@@ -643,7 +655,9 @@ func (idx *Indexer) commitIncrementalStages(
 		contractBridgeNodeIDsFromPriorView(structural, view)...,
 	)
 
+	idx.applyLap("classify")
 	idx.replaceIncrementalContentBatch(stages)
+	idx.applyLap("content")
 
 	if len(structural) > 0 {
 		idx.commitStructuralIncrementalBatch(structural, view, markerBatch)
@@ -651,9 +665,12 @@ func (idx *Indexer) commitIncrementalStages(
 	if len(metadata) > 0 {
 		idx.commitMetadataIncrementalBatch(metadata)
 	}
+	idx.applyLap("metadata")
 	idx.persistIncrementalSidecars(stages)
+	idx.applyLap("sidecars")
 	idx.updateIncrementalSearch(stages)
 	idx.upsertIncrementalFTS(stages)
+	idx.applyLap("search")
 
 	for _, stage := range stages {
 		if stage.metadataOnly {
@@ -884,27 +901,35 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		}
 	}
 
+	idx.applyLap("structural_prepare")
 	if deferResolverCatchup && idx.resolver.EvidenceScoping() {
 		// Read before the eviction below: the prior bindings and their
 		// targets are part of what it deletes.
 		markerBatch.recordDeferredPriorBindings(stagePriorBindings(idx.graph, stages, view))
 	}
+	idx.applyLap("prior_bindings")
 	carried := restubIncomingRefsFromView(idx.graph, stages, view)
+	idx.applyLap("restub")
 	// The capability state of the files, read before the eviction below
 	// deletes it; the carried set says which incoming accesses_field rows
 	// survive it.
 	idx.noteCapabilityPrior(captureCapabilityPrior(stages, view, carried))
+	idx.applyLap("capability_prior")
 	// Canonical FTS lifetime follows the backend's atomic owner decision.
 	// Retained contracts keep existing rows; actual orphans are deleted there.
 	idx.deleteSymbolFTS(oldFTSNodeIDs)
+	idx.applyLap("fts_delete")
 	evictFilesBatched(idx.graph, paths)
+	idx.applyLap("evict")
 	// The carried in-edges ride the same AddBatch as the fresh payload: the
 	// eviction above deletes every edge incident to a doomed node, including
 	// the ones whose SOURCE survives, so an edge the restub frontier left
 	// alone has to be re-stated here or it is lost. See
 	// restubIncomingRefsFromView.
 	idx.graph.AddBatch(nodes, append(edges, carried...))
+	idx.applyLap("add_batch")
 	idx.relinkImportNodesToModules(nodes)
+	idx.applyLap("relink")
 
 	if !deferResolverCatchup {
 		idx.observeIncrementalCatchup("resolve", paths)
@@ -957,9 +982,12 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 			idx.reresolveAffectedByStages(stages)
 		}
 	} else if !idx.deferGlobalPasses.Load() {
+		idx.applyLap("structural_tail")
 		markerBatch.mergeDeferredAffected(idx.planAffectedByStages(stages))
+		idx.applyLap("affected_plan")
 	}
 	idx.enrichAndMarkIncrementalStages(stages, markerBatch)
+	idx.applyLap("enrich_mark")
 }
 
 func (idx *Indexer) commitMetadataIncrementalBatch(stages []*incrementalBatchStage) {

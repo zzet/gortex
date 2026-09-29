@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/semantic"
@@ -87,6 +89,9 @@ type GenerationWorkCounters struct {
 	ContextWithdrawnEdges int
 	ContextHeldInMemory   bool
 
+	// Logical payload the pass produced and the masks written.
+	PassNodes      int
+	PassEdges      int
 	ReplaceMasks   int
 	DeleteMasks    int
 	NodeTombstones int
@@ -148,6 +153,35 @@ type CompilerContextCounters struct {
 type GenerationPhase struct {
 	Name     string
 	Duration time.Duration
+}
+
+// phaseClock records consecutive named stages: each lap closes the stage that
+// ran since the previous lap (or since the clock started).
+type phaseClock struct {
+	last  time.Time
+	steps *[]GenerationPhase
+}
+
+func newPhaseClock(steps *[]GenerationPhase) phaseClock {
+	return phaseClock{last: time.Now(), steps: steps}
+}
+
+func (c *phaseClock) lap(name string) {
+	if c == nil || c.steps == nil {
+		return
+	}
+	now := time.Now()
+	*c.steps = append(*c.steps, GenerationPhase{Name: name, Duration: now.Sub(c.last)})
+	c.last = now
+}
+
+// phaseFields renders stages as one zap field per stage, in milliseconds.
+func phaseFields(prefix string, phases []GenerationPhase) []zap.Field {
+	fields := make([]zap.Field, 0, len(phases))
+	for _, phase := range phases {
+		fields = append(fields, zap.Float64(prefix+phase.Name+"_ms", float64(phase.Duration.Microseconds())/1000))
+	}
+	return fields
 }
 
 func newGenerationWorkCounters(req BuildRequest) *GenerationWorkCounters {
@@ -214,6 +248,7 @@ func (w *GenerationWorkCounters) finish(store *store_sqlite.Store, generationID 
 	w.ContextRetainedFiles = len(report.ContextRetainedPaths)
 	w.ContextWithdrawnNodes, w.ContextWithdrawnEdges = report.ContextWithdrawnNodes, report.ContextWithdrawnEdges
 	w.ContextHeldInMemory = report.ContextHeldInMemory
+	w.PassNodes, w.PassEdges = report.PassNodeCount, report.PassEdgeCount
 	w.ReplaceMasks, w.DeleteMasks = report.ReplaceMasks, report.DeleteMasks
 	w.NodeTombstones, w.EdgeSources = report.NodeTombstones, report.EdgeSourceMarkers
 	w.CompilerContext.Requested = report.Enrichment.Requested

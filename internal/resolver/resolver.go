@@ -3168,11 +3168,12 @@ func incrementalAdmissionSummary(frontier incrementalFileFrontier, sources map[s
 // returns. Durations use the monotonic component of time.Now, not wall-clock
 // subtraction or sleeps.
 func startIncrementalPhase(logger *zap.Logger, phase string) func(...zap.Field) time.Duration {
-	started := time.Now()
+	started, faults := time.Now(), processMajorFaults()
 	logger.Info("resolver: incremental phase starting", zap.String("phase", phase))
 	return func(fields ...zap.Field) time.Duration {
 		elapsed := time.Since(started)
-		fields = append(fields, zap.String("phase", phase), zap.Duration("elapsed", elapsed))
+		fields = append(fields, zap.String("phase", phase), zap.Duration("elapsed", elapsed),
+			zap.Int64("major_faults", processMajorFaults()-faults))
 		logger.Info("resolver: incremental phase complete", fields...)
 		return elapsed
 	}

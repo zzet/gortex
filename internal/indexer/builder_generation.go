@@ -433,9 +433,17 @@ type BuildReport struct {
 
 	// PlanningDuration is the wall time spent selecting the sparse file set.
 	PlanningDuration time.Duration
+	// PlanSteps are the wall times of the planning stages in execution order
+	// (the working-tree preparation before the plan, then the closure walk's
+	// arms), so a slow plan says which read it waited on.
+	PlanSteps []GenerationPhase
 	// BatchRemaining is how many changed paths a batched working-tree build
 	// left for the next batch (0: the build describes the whole sample).
 	BatchRemaining int
+	// PassSteps split the head of the physical pass: opening the generation's
+	// bulk window and the declared-context seed decision (its layer-below
+	// node read), before the extraction itself.
+	PassSteps []GenerationPhase
 	// Duration is the wall time of the whole build.
 	Duration time.Duration
 
@@ -455,7 +463,6 @@ type BuildReport struct {
 	// generation stored: every sampled path for a full manifest, only the
 	// paths that differ from the parent's for a delta.
 	ManifestEntriesWritten int
-
 	// WAL is the write-ahead log the store appended while the build ran
 	// (store_sqlite.WALWrittenBetween over marks taken at its start and
 	// end): the per-edit log cost a reader pinned across the edit holds.
@@ -599,6 +606,7 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 	runtimeactivity.Begin(sparseGenerationBuildActivity)
 	defer runtimeactivity.End(sparseGenerationBuildActivity)
 	report.Coalesced = false
+	report.Work.startPhases()
 	var buildErr error
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -649,9 +657,11 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 			}
 			physicalErr = closeErr
 		}()
+		passClock := newPhaseClock(&report.PassSteps)
 		if err := window.open(); err != nil {
 			return err
 		}
+		passClock.lap("window_open")
 		if prepare != nil {
 			target, preparedPlan, preparedReport, err := prepare(ctx)
 			if target != nil {
@@ -678,6 +688,7 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 				return err
 			}
 		}
+		report.Work.mark("pass")
 		markPublicationPhase(ctx, PublicationExtracted)
 		// Enrichment runs before the masks so anything it adds to the payload is
 		// covered by the claims derived from it, and before the producer states
@@ -723,6 +734,9 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 				return err
 			}
 		}
+		report.Work.mark("prepublish")
+		// Commit point: a background build that gives the lane up to an
+		// interactive one does it before here, never during publication.
 		reachBuildCommitPoint(ctx)
 		if err := ctx.Err(); err != nil {
 			return err

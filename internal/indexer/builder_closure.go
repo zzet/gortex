@@ -272,6 +272,7 @@ func (b *SparseGenerationBuilder) affectedClosureContext(
 	// of the closure that is not a discovery, and losing one to the cap would
 	// cost the whole generation its module identity for the sake of whichever
 	// source file happened to sort earlier.
+	clock := newPhaseClock(&report.PlanSteps)
 	manifests := make(map[string]struct{})
 	walk.collectManifests(manifests)
 	if err := ctx.Err(); err != nil {
@@ -302,23 +303,28 @@ func (b *SparseGenerationBuilder) affectedClosureContext(
 	// read.
 	dependents := make(map[string]struct{})
 	declared := make(map[string]struct{})
+	clock.lap("closure_manifests")
 	targetEvidence := walk.collectIntroduced(present, dependents, declared)
 	if walk.err != nil {
 		return nil, walk.err
 	}
+	clock.lap("closure_introduced")
 	seedNodeIDs, err := builderSemanticSeedNodeIDs(ctx, req, seeds, deleted, targetEvidence)
 	if err != nil {
 		return nil, err
 	}
+	clock.lap("closure_seed_ids")
 	if err := b.collectDependents(ctx, req, seedNodeIDs.reverse, dependents); err != nil {
 		return nil, err
 	}
+	clock.lap("closure_dependents")
 	// A changed file's clone counterparts are dependents: a body edit can make
 	// or break a near-duplicate pair whose other half is recorded in the
 	// counterpart's own file.
 	if err := b.collectDependenciesSplit(ctx, req, seeds, seedNodeIDs.all, declared, dependents, true); err != nil {
 		return nil, err
 	}
+	clock.lap("closure_dependencies")
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -340,6 +346,7 @@ func (b *SparseGenerationBuilder) affectedClosureContext(
 		}
 	}
 	walk.markDeclared(walk.admitAll(declared))
+	clock.lap("closure_forward_hop")
 
 	closure := append([]string(nil), walk.order...)
 	sort.Strings(closure)

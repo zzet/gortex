@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -126,6 +127,9 @@ type DirtyLayerRequest struct {
 	// BaseCensus) rather than this build's own files.
 	baseCensus     map[string]int
 	baseCensusFunc func(context.Context) map[string]int
+	// baseOpen is how long the caller took to open the layer below (Base),
+	// reported as the plan's first preparation stage.
+	baseOpen time.Duration
 
 	// importLarge imports a change set past importInteractivePaths file by
 	// file (checkout_import.go): this build carries importBatchFiles of it
@@ -206,6 +210,11 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 			"indexer: working-tree build over parent %d names base generation %d", req.parent, req.Identity.BaseGenerationID)
 	}
 	walMark := b.Store.WALWriteMark()
+	var prepare []GenerationPhase
+	if req.baseOpen > 0 {
+		prepare = append(prepare, GenerationPhase{Name: "prepare_base_view", Duration: req.baseOpen})
+	}
+	clock := newPhaseClock(&prepare)
 	var before gitstate.DirtySnapshot
 	var err error
 	switch {
@@ -224,6 +233,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		return 0, BuildReport{}, fmt.Errorf("indexer: open checkout %s: %w", req.CheckoutRoot, err)
 	}
 	defer target.Close() //nolint:errcheck // the source is read-only; a close failure cannot lose work
+	clock.lap("prepare_sample")
 
 	identity := StampDirtyLayerIdentity(req.Identity, before)
 
@@ -275,10 +285,12 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		manifest = &generationInputManifest{meta: meta, entries: entries}
 		next = resolvedFromFull(meta, entries)
 	}
+	clock.lap("prepare_manifest")
 	changes, err = dirtyLayerDiskTruthContext(ctx, changes, target)
 	if err != nil {
 		return 0, BuildReport{}, err
 	}
+	clock.lap("prepare_disk_truth")
 	// A change set past the interactive bound is imported: this generation
 	// carries the first file of the change set over its parent and says so
 	// (a partial identity, a manifest describing exactly commit + what it
@@ -315,6 +327,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		}
 		baseCensus, baseCensusFunc = req.baseCensus, req.baseCensusFunc
 	}
+	clock.lap("prepare_chain_census")
 
 	generationID, report, err := b.buildWorkingTreeLayer(ctx, BuildRequest{
 		Identity:    identity,
@@ -348,6 +361,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		// the pass stamps; asking git again would be a second sample.
 		headProvenance: dirtyHeadProvenance(before),
 	})
+	report.PlanSteps = append(prepare, report.PlanSteps...)
 	report.BatchRemaining = remaining
 	report.WAL = store_sqlite.WALWrittenBetween(walMark, b.Store.WALWriteMark())
 	b.logWorkingTreeBuild(req, generationID, report, err)
@@ -641,8 +655,11 @@ func dirtyLayerChangesContext(ctx context.Context, snap gitstate.DirtySnapshot) 
 	return changes, nil
 }
 
-// logWorkingTreeBuild records working-tree build sizes and the WAL
-// appended during its admitted build interval, including concurrent writes.
+// logWorkingTreeBuild records one line per working-tree build with where its
+// wall time went: the preparation and closure stages of the plan, the
+// physical phases, and the sizes that drive them (closure, dependents,
+// declared context, parser inputs, pass payload). It is the attribution a
+// live daemon gives without a profiler attached.
 func (b *SparseGenerationBuilder) logWorkingTreeBuild(req DirtyLayerRequest, generationID int64, report BuildReport, err error) {
 	if b == nil || b.Logger == nil {
 		return
@@ -666,11 +683,16 @@ func (b *SparseGenerationBuilder) logWorkingTreeBuild(req DirtyLayerRequest, gen
 		zap.Int64("wal_bytes", report.WAL.Bytes),
 		zap.Bool("wal_reset", report.WAL.Reset),
 	}
+	fields = append(fields, phaseFields("plan_", report.PlanSteps)...)
+	fields = append(fields, phaseFields("pass_", report.PassSteps)...)
 	if w := report.Work; w != nil {
 		fields = append(fields,
 			zap.Int("parser_inputs", w.ParserInputs),
+			zap.Int("pass_nodes", w.PassNodes),
+			zap.Int("pass_edges", w.PassEdges),
 			zap.Int("withheld", w.ContextWithheldFiles),
 			zap.Int("retained", w.ContextRetainedFiles))
+		fields = append(fields, phaseFields("phase_", w.Phases)...)
 	}
 	if err != nil {
 		fields = append(fields, zap.Error(err))

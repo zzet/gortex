@@ -598,6 +598,8 @@ type Indexer struct {
 	// contractRegistryLoad is the time ensureIncrementalContractRegistry
 	// spent reading the registry from the graph (a per-file delta reports it).
 	contractRegistryLoad time.Duration
+	// applyLaps times one structural graph apply (incremental_apply_laps.go).
+	applyLaps *applyLaps
 }
 
 // contractCacheEntry is a cached contract-extraction result for one file.

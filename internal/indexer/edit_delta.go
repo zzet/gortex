@@ -135,17 +135,35 @@ type EditDeltaReport struct {
 	// delta's ownership that restated a row the view below serves, removed
 	// before publication (edit_delta_enrich.go).
 	EnrichmentRestated int
+	// PageFaults / BlockReads are the process's major page faults and block
+	// reads while the delta ran (getrusage; the whole process, so concurrent
+	// work is included): the store pages the delta had to bring in.
+	PageFaults int64
+	BlockReads int64
+	// ResolveFrontier / ResolveDuration / ResolveFaults describe the resolver
+	// catch-up inside the pass: the files it resolved, its wall time and the
+	// major page faults the process took meanwhile.
+	// PhaseFaults are the major page faults per delta phase (Phases).
+	PhaseFaults map[string]int64
+	// PhaseWALBytes / PhaseWriteTx are the WAL bytes appended and the write
+	// transactions begun during each phase (process-wide, as PageFaults).
+	// ContractRegistryCached reports that the delta's contract registry came
+	// from the cache kept across deltas instead of a read of the view below.
+	ContractRegistryCached bool
+	PhaseWALBytes          map[string]int64
+	PhaseWriteTx           map[string]int64
+	ResolveFrontier        int
+	ResolveDuration        time.Duration
+	ResolveFaults          int64
 	// WholeLayerLoads / WholeLayerRows: layers below read wholesale
 	// (graph.DeltaWriterStats).
 	WholeLayerLoads int
 	WholeLayerRows  int
 	LayerRowsRead   int
 	SlowReads       map[string]int
+	Phases          []GenerationPhase
 
 	ownership editDeltaOwnership
-	// ContractRegistryCached reports that the delta's contract registry came
-	// from the cache kept across deltas instead of a read of the view below.
-	ContractRegistryCached bool
 }
 
 // lastEditDeltaReport is the most recent delta report, for tests and the
@@ -250,12 +268,23 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		enrichWAL, enrichTx, enrichIO, enrichStarted := handle.WALWriteMark(), store_sqlite.WriteTransactionsBegun(), editDeltaProcessIO(), time.Now()
 		b.runEnrichment(ctx, req, handle, &report)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if len(report.Enrichment.Ran) > 0 {
 			delta.EnrichmentRestated = editDeltaSettleEnrichment(handle, req.Base, delta.ownership)
+		}
+		if b.Logger != nil {
+			b.Logger.Info("indexer: working-tree edit delta enrichment",
+				zap.Strings("paths", delta.Paths),
+				zap.Strings("ran", report.Enrichment.Ran),
+				zap.Float64("ms", float64(time.Since(enrichStarted).Microseconds())/1000),
+				zap.Int64("major_faults", editDeltaProcessIO().since(enrichIO).majorFaults),
+				zap.Int64("wal_bytes", store_sqlite.WALWrittenBetween(enrichWAL, handle.WALWriteMark()).Bytes),
+				zap.Int64("write_tx", store_sqlite.WriteTransactionsBegun()-enrichTx),
+				zap.Int("restated", delta.EnrichmentRestated))
 		}
 		report.Work.mark("enrich")
 		markPublicationPhase(ctx, PublicationSemanticDone)
@@ -352,11 +381,34 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	report *BuildReport,
 ) (*EditDeltaReport, error) {
 	out := &EditDeltaReport{}
+	clock := newPhaseClock(&out.Phases)
+	ioStarted := editDeltaProcessIO()
+	ioLast := ioStarted
+	out.PhaseFaults = make(map[string]int64)
+	out.PhaseWALBytes = make(map[string]int64)
+	out.PhaseWriteTx = make(map[string]int64)
+	walLast, txLast := handle.WALWriteMark(), store_sqlite.WriteTransactionsBegun()
+	lap := func(name string) {
+		clock.lap(name)
+		now := editDeltaProcessIO()
+		out.PhaseFaults[name] += now.since(ioLast).majorFaults
+		ioLast = now
+		walNow, txNow := handle.WALWriteMark(), store_sqlite.WriteTransactionsBegun()
+		if wal := store_sqlite.WALWrittenBetween(walLast, walNow); wal.Bytes > 0 {
+			out.PhaseWALBytes[name] += wal.Bytes
+		}
+		if tx := txNow - txLast; tx > 0 {
+			out.PhaseWriteTx[name] += tx
+		}
+		walLast, txLast = walNow, txNow
+	}
 	dw := graph.NewDeltaWriter(req.Base, handle)
 	var baseCache *graph.BaseProjectionCache
+	var baseFileHits, baseFileMisses, baseImportHits, baseImportMisses int
 	if key, ok := editDeltaBaseCacheKey(req.Base, b.Store); ok {
 		baseCache = editDeltaBaseCache(key)
 		dw.SetBaseProjectionCache(baseCache)
+		baseFileHits, baseFileMisses, baseImportHits, baseImportMisses = baseCache.Stats()
 	}
 	idx := New(dw, b.Registry, b.Config, b.Logger)
 	defer idx.Close()
@@ -383,10 +435,12 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		idx.parseAdmission.Store(b.Admissions.parseAdmission.Load())
 		idx.nativeParseAdmission.Store(b.Admissions.nativeParseAdmission.Load())
 	}
+	lap("open")
 	// The repository's contract registry as the view below holds it, kept
 	// across deltas over the same immutable stack (edit_delta_contract_cache.go).
 	if key, ok := editDeltaContractCacheKey(req.Base, b.Store, req.RepoPrefix, req.WorkspaceID, req.ProjectID); ok {
 		out.ContractRegistryCached = seedEditDeltaContractRegistry(idx, key)
+		lap("contract_registry")
 	}
 
 	absPaths := make([]string, 0, len(plan.indexed)+len(plan.deleted))
@@ -401,6 +455,34 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// fingerprints call the save inert: the generation claims each changed
 	// path and must carry its complete rows and side tables (the files row's
 	// content hash among them), which an inert save leaves unwritten.
+	// The resolver catch-up is the engine's largest phase with no log of its
+	// own; the delta times it and counts the pages it brings in.
+	idx.incrementalResolveFilesHook = func(frontier []string) {
+		started, io := time.Now(), editDeltaProcessIO()
+		idx.resolver.ResolveFilesAndIncoming(frontier)
+		used := editDeltaProcessIO().since(io)
+		out.ResolveFrontier += len(frontier)
+		out.ResolveDuration += time.Since(started)
+		out.ResolveFaults += used.majorFaults
+	}
+	// Each engine pass is split into the stages the engine announces
+	// (observeIncrementalCatchup): the reconcile before the resolver, then
+	// resolve, dataflow, affected_by, ref_facts, semantic and derived, each a
+	// phase with its own fault count. passStage names the running one.
+	passPrefix, passStage := "pass", "reconcile"
+	idx.incrementalCatchupHook = func(kind string, _ []string) {
+		switch kind {
+		case "resolve", "dataflow", "affected_by", "ref_facts", "semantic", "derived":
+		default:
+			return
+		}
+		lap(passPrefix + "_" + passStage)
+		passStage = kind
+	}
+	endPass := func(next string) {
+		lap(passPrefix + "_" + passStage)
+		passPrefix, passStage = next, "reconcile"
+	}
 	// The change set is re-derived from source whatever its fingerprints
 	// say, and its prior resolutions stay reusable (the shape-keyed reuse and
 	// the prior-binding carry): nothing but the files themselves changed.
@@ -430,6 +512,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	if refused := dw.Unsupported(); len(refused) > 0 {
 		return nil, &editDeltaRefusedError{reason: "unsupported writes: " + strings.Join(refused, ", ")}
 	}
+	endPass("shared_rows")
 	// rederive runs the engine again over unchanged files the delta has to
 	// carry. They are unchanged, so their stored fingerprints would classify
 	// them inert; they are re-derived from source regardless, through the
@@ -467,17 +550,24 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			return nil, err
 		}
 		out.SharedRowEmitters = emitters
+		endPass("dependents")
+	} else {
+		lap("shared_rows_plan")
+		passPrefix = "dependents"
 	}
 	dependents, err := b.editDeltaDependents(ctx, req, plan)
 	if err != nil {
 		return nil, err
 	}
+	lap("dependents_plan")
 	if len(dependents) > 0 {
 		if err := rederive("dependent", dependents); err != nil {
 			return nil, err
 		}
 		out.Dependents = dependents
+		endPass("")
 	}
+	idx.incrementalCatchupHook = nil
 	report.Work.mark("pass")
 
 	fixed := make(map[string]struct{}, len(out.Paths))
@@ -485,10 +575,12 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		fixed[builderGraphPath(req.RepoPrefix, rel)] = struct{}{}
 	}
 	payload := dw.Payload(fixed)
+	lap("payload")
 
 	if len(payload.Nodes) > 0 || len(payload.Edges) > 0 {
 		handle.AddBatch(payload.Nodes, payload.Edges)
 	}
+	lap("write_rows")
 	extracted := make(map[string]struct{}, len(fixed)+len(out.SharedRowEmitters))
 	for p := range fixed {
 		extracted[p] = struct{}{}
@@ -499,6 +591,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	if err := editDeltaResolverRowFTS(idx, handle, payload.Nodes, extracted); err != nil {
 		return nil, fmt.Errorf("indexer: write resolver-minted symbol documents: %w", err)
 	}
+	lap("write_fts")
 	// The generation's own freshness provenance: the sample's HEAD and dirty
 	// bit (req.headProvenance), as every generation a pass builds records
 	// it. The Merkle baseline is the view below's; the counts are what the
@@ -512,6 +605,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	if absRoot, err := filepath.Abs(req.RootPath); err == nil {
 		idx.persistRepoIndexState(handle, absRoot, workspaceFP, len(payload.Nodes), len(payload.Edges))
 	}
+	lap("write_state")
 	// The store materializes a builtin sentinel lazily, per generation, for
 	// every edge into one, and the lazily materialized row carries no
 	// repository stamps. The view's row (stamped by the whole index, or by the
@@ -600,6 +694,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	if err := handle.SetEdgeSourceMasks(markers); err != nil {
 		return nil, fmt.Errorf("indexer: write generation edge-source masks: %w", err)
 	}
+	lap("write_masks")
 	report.Work.mark("delta_write")
 
 	stats := dw.DeltaStats()
@@ -622,6 +717,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	report.DeleteMasks = len(masks) - len(payload.ReplacePaths)
 	report.NodeTombstones = len(tombstones)
 	report.EdgeSourceMarkers = len(payload.EdgeSources)
+	report.PassSteps = append(report.PassSteps, out.Phases...)
 	if b.Logger != nil {
 		fields := []zap.Field{
 			zap.String("checkout", req.Identity.CheckoutID),
@@ -640,8 +736,27 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			zap.Int("whole_layer_loads", out.WholeLayerLoads),
 			zap.Int("whole_layer_rows", out.WholeLayerRows),
 			zap.Int("layer_rows_read", out.LayerRowsRead),
+			zap.Int("resolve_frontier", out.ResolveFrontier),
+			zap.Float64("resolve_ms", float64(out.ResolveDuration.Microseconds())/1000),
+			zap.Int64("resolve_major_faults", out.ResolveFaults),
+			zap.Float64("contract_registry_ms", float64(idx.contractRegistryLoad.Microseconds())/1000),
+			zap.Bool("contract_registry_cached", out.ContractRegistryCached),
+			zap.Bool("base_projection_cache", baseCache != nil),
+			zap.Any("phase_major_faults", out.PhaseFaults),
+			zap.Any("phase_wal_bytes", out.PhaseWALBytes),
+			zap.Any("phase_write_tx", out.PhaseWriteTx),
 			zap.Strings("stack", dw.StackShape()),
 		}
+		if baseCache != nil {
+			fh, fm, ih, im := baseCache.Stats()
+			fields = append(fields,
+				zap.Int("base_file_index_hits", fh-baseFileHits), zap.Int("base_file_index_misses", fm-baseFileMisses),
+				zap.Int("base_import_hits", ih-baseImportHits), zap.Int("base_import_misses", im-baseImportMisses))
+		}
+		io := editDeltaProcessIO().since(ioStarted)
+		out.PageFaults, out.BlockReads = io.majorFaults, io.blockReads
+		fields = append(fields, zap.Int64("delta_major_faults", io.majorFaults), zap.Int64("delta_block_reads", io.blockReads))
+		fields = append(fields, phaseFields("delta_", out.Phases)...)
 		b.Logger.Info("indexer: working-tree edit delta", fields...)
 	}
 	return out, nil

@@ -58,12 +58,18 @@ var editDeltaRealDefaultFiles = []string{
 }
 
 type editDeltaRealRecord struct {
-	File      string            `json:"file"`
-	Edit      int               `json:"edit"`
-	Gen       int64             `json:"generation"`
-	WallMS    float64           `json:"wall_ms"`
+	File   string  `json:"file"`
+	Edit   int     `json:"edit"`
+	Gen    int64   `json:"generation"`
+	WallMS float64 `json:"wall_ms"`
+	// CPUMS is the process's user+system CPU time over the build: on a
+	// loaded host the wall time includes waiting for a core, the CPU time
+	// does not.
+	CPUMS     float64           `json:"cpu_ms"`
 	Delta     *EditDeltaReport  `json:"delta"`
 	Phases    []GenerationPhase `json:"phases"`
+	PassSteps []GenerationPhase `json:"pass_steps"`
+	Plan      []GenerationPhase `json:"plan_steps"`
 	Census    map[string]int64  `json:"census"`
 	Nodes     int               `json:"nodes"`
 	Edges     int               `json:"edges"`
@@ -219,11 +225,14 @@ func editDeltaRealFile(
 		}
 		recordLastEditDelta(nil)
 		started := time.Now()
+		cpuStarted := editDeltaProcessCPU()
 		id, report, _ := chains.build()
 		wall := time.Since(started)
+		cpu := editDeltaProcessCPU() - cpuStarted
 		chains.settle()
 		rec := editDeltaRealRecord{
-			File: rel, Edit: i, Gen: id, WallMS: ms(wall), Delta: LastEditDeltaReport(),
+			File: rel, Edit: i, Gen: id, WallMS: ms(wall), CPUMS: ms(cpu), Delta: LastEditDeltaReport(),
+			PassSteps: report.PassSteps, Plan: report.PlanSteps,
 			Nodes: report.NodeCount, Edges: report.EdgeCount,
 			WALValid: report.WAL.Valid, WALFrames: report.WAL.Frames, WALBytes: report.WAL.Bytes, WALReset: report.WAL.Reset,
 		}
@@ -263,9 +272,9 @@ func editDeltaRealFile(
 			published = append(published, id)
 		}
 		records = append(records, rec)
-		t.Logf("%s edit %d: gen=%d wall=%.1fms delta=%v wal=%d bytes (%d frames, valid=%t reset=%t) retired=%d (%d bytes) phases=%s",
-			rel, i, id, rec.WallMS, rec.Delta != nil, rec.WALBytes, rec.WALFrames, rec.WALValid, rec.WALReset, rec.Retired, rec.RetireBytes,
-			editDeltaPhaseLine(rec.Phases))
+		t.Logf("%s edit %d: gen=%d wall=%.1fms cpu=%.1fms delta=%v wal=%d bytes (%d frames, valid=%t reset=%t) retired=%d (%d bytes) phases=%s pass=%s",
+			rel, i, id, rec.WallMS, rec.CPUMS, rec.Delta != nil, rec.WALBytes, rec.WALFrames, rec.WALValid, rec.WALReset, rec.Retired, rec.RetireBytes,
+			editDeltaPhaseLine(rec.Phases), editDeltaPhaseLine(rec.PassSteps))
 		if rec.Delta != nil {
 			t.Logf("%s edit %d: covered=%d claimed=%d materialized=%d/%d payload=%d/%d markers=%d tombstones=%d slow=%v",
 				rel, i, rec.Delta.CoveredPaths, rec.Delta.ClaimedSources, rec.Delta.MaterializedNodes,

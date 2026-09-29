@@ -3047,7 +3047,9 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 	if parent.Parent > 0 {
 		baseGeneration = parent.Parent
 	}
+	baseOpenStarted := time.Now()
 	dirtyBase, releaseBase, err := c.generationLayerReader(ctx, baseGeneration)
+	baseOpen := time.Since(baseOpenStarted)
 	if err != nil {
 		if parent.Parent > 0 && ctx.Err() == nil {
 			return dirtyLayerBuild{Reason: dirtyChainFallbackNoParent}, nil
@@ -3083,6 +3085,7 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 			Sampler:             c.sampler,
 			chainFallbackReason: fallbackReason,
 			baseCensusFunc:      baseCensus,
+			baseOpen:            baseOpen,
 			narrowMotion:        c.narrowTreeMoveAbort,
 			// A large working-tree change is imported file by file
 			// (checkout_import.go); the builder judges that by the change set
