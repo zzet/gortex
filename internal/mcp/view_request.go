@@ -104,7 +104,9 @@ type requestView struct {
 	// route reached the working copy, how long the request waited, and the
 	// bound it waited under. Nil for every request that did not ask, which is
 	// what keeps the rider of an ordinary request byte-identical.
-	freshness *requestFreshnessOutcome
+	freshness      *requestFreshnessOutcome
+	answerIdentity *worktreeAnswerIdentity
+	deferred       bool
 	// routeless marks a view that exists only to carry a freshness answer:
 	// selection produced no view at all (freshnessCarrier). Its rider makes no
 	// route claim — viewRiderFields omits actual_view and exact for it —
@@ -558,7 +560,11 @@ func (s *Server) resolveRequestView(
 	if policy.freshness.err != nil {
 		return nil, policy.freshness.err
 	}
-	view, err := s.selectRequestView(ctx, selector, policy)
+	selectCtx := ctx
+	if policy.freshness.requested() {
+		selectCtx = withDeferredMaterialization(ctx)
+	}
+	view, err := s.selectRequestView(selectCtx, selector, policy)
 	if policy.freshness.requested() {
 		view, err = s.settleRequestFreshness(ctx, selector, policy, view, err)
 		if err != nil {
@@ -621,6 +627,10 @@ func (s *Server) settleRequestFreshness(
 	outcome := &requestFreshnessOutcome{deadline: deadline}
 
 	checkout, notWaitable, waitable := s.freshnessWaitTarget(ctx, selector, view, selectErr)
+	if !waitable && view != nil && view.deferred {
+		view.close()
+		view, selectErr = s.selectRequestView(ctx, selector, policy)
+	}
 	if !waitable {
 		// Nothing this request can wait on. freshnessWaitTarget says which of
 		// the two very different situations that is: the view really reads a
@@ -642,8 +652,14 @@ func (s *Server) settleRequestFreshness(
 	// is gone and every return path answers out of a freshly selected one.
 	view.close()
 
-	fresh, reason := s.awaitCheckoutFreshness(ctx, checkout, deadline)
+	outcome.trace = newFreshnessTrace(ctx, started)
+	fresh, reason := s.awaitCheckoutFreshness(withFreshnessTrace(ctx, outcome.trace), checkout, deadline)
 	outcome.fresh, outcome.reason = fresh, reason
+	// Close the phase record on every way the wait ended — a deadline or an
+	// interruption between tickets included — so a record never stays open
+	// for a wait that is over. First terminal mark wins; nothing without a
+	// record is touched.
+	outcome.trace.noteTicketEnd(fresh)
 	if !fresh && reason == freshReasonDeadlineExceeded && policy.freshness.requireExact {
 		return nil, freshnessDeadlineRefusal(deadline, time.Since(started))
 	}
@@ -656,6 +672,9 @@ func (s *Server) settleRequestFreshness(
 	published, publishedKnown := store_sqlite.CheckoutRoute{}, false
 	if outcome.fresh {
 		published, publishedKnown = s.publishedCheckoutRoute(ctx, checkout.CheckoutID)
+		if publishedKnown {
+			outcome.trace.notePublished(published)
+		}
 	}
 
 	refreshed, refreshedErr := s.selectRequestView(ctx, selector, policy)
@@ -1157,6 +1176,7 @@ func (s *Server) viewForWorktreeSelector(
 	if _, err := s.familyPrimary(ctx, checkout.FamilyID); err != nil {
 		return nil, err
 	}
+	indexer.StampPublicationPhase(ctx, indexer.PublicationViewCheckoutResolved)
 	return s.materializeRequestView(ctx, selector, checkout, true)
 }
 
@@ -2000,7 +2020,12 @@ func (s *Server) materializeRequestView(
 		return viewFallback(strict, rider, graphview.NewViewError(graphview.CodeViewBuilding,
 			fmt.Sprintf("checkout %q is not fully routed yet", checkout.CheckoutID)))
 	}
+	if deferredMaterialization(ctx) {
+		return &requestView{kind: requestViewKindWorktree, rider: rider, viewRoot: checkout.RootPath, deferred: true}, nil
+	}
+	indexer.StampPublicationPhase(ctx, indexer.PublicationViewUseNoted)
 	view, err := s.materializer.MaterializeCheckout(ctx, checkout.CheckoutID)
+	indexer.StampPublicationPhase(ctx, indexer.PublicationViewMaterialized)
 	if err != nil {
 		// A route that will not materialize is a stale-HEAD or half-built
 		// generation; kick a rebuild the same way before falling back.
@@ -2011,11 +2036,12 @@ func (s *Server) materializeRequestView(
 	rider.GraphID = view.ID.BaseGraphID
 	rider.CheckoutID = checkout.CheckoutID
 	routed := &requestView{
-		kind:         requestViewKindWorktree,
-		reader:       view.Reader,
-		materialized: view,
-		rider:        rider,
-		viewRoot:     checkout.RootPath,
+		kind:           requestViewKindWorktree,
+		reader:         view.Reader,
+		materialized:   view,
+		rider:          rider,
+		viewRoot:       checkout.RootPath,
+		answerIdentity: s.worktreeAnswerIdentity(ctx, checkout, view),
 	}
 	routed.bindSources(view.GenerationSources(), s.graph)
 	return routed, nil
@@ -2342,6 +2368,7 @@ func viewRiderFields(view *requestView) map[string]any {
 	if view.rider.RetryAfter > 0 {
 		fields["retry_after"] = view.rider.RetryAfter
 	}
+	view.answerIdentity.riderFields(fields)
 	// The base corpus moved while this request read it. Said as its own flag
 	// rather than only through the reason string, so a client can branch on it
 	// without parsing: exact:false with this set means "re-run for a coherent
@@ -2364,6 +2391,7 @@ func viewRiderFields(view *requestView) map[string]any {
 		if !outcome.fresh && outcome.reason != "" {
 			fields["fresh_reason"] = outcome.reason
 		}
+		outcome.trace.riderFields(fields)
 	}
 	// The capability annotations: what the view served thinly, and what a
 	// base-scoped engine answered instead of the view. Both are omitted when
@@ -2378,4 +2406,19 @@ func viewRiderFields(view *requestView) map[string]any {
 		}
 	}
 	return fields
+}
+
+type deferredMaterializationKey struct{}
+
+// withDeferredMaterialization marks ctx as a pre-wait selection: a routed
+// checkout whose route is ready is named without composing its generation
+// stack. Only resolveRequestView sets it, and only for a require_fresh
+// request, which re-selects before any handler reads.
+func withDeferredMaterialization(ctx context.Context) context.Context {
+	return context.WithValue(ctx, deferredMaterializationKey{}, true)
+}
+
+func deferredMaterialization(ctx context.Context) bool {
+	deferred, _ := ctx.Value(deferredMaterializationKey{}).(bool)
+	return deferred
 }

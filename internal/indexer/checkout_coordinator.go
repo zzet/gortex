@@ -599,6 +599,10 @@ type CheckoutCoordinator struct {
 	// a burst coalesces into one cycle, and demand that arrives during a
 	// cycle is answered by exactly one more.
 	demand chan struct{}
+	// signaledAt is when Signal last claimed the checkout moved (under mu):
+	// a cycle's shared sample must postdate it (cycleSample).
+	signaledAt time.Time
+
 	// retireCalled is a test seam: it observes every generation offerRetire
 	// retires inline. nil in production.
 	retireCalled func(int64)
@@ -816,16 +820,7 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 // signal that arrives while a cycle is running schedules the next one rather
 // than being dropped.
 func (c *CheckoutCoordinator) Signal(reason string) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	c.reason = reason
-	c.mu.Unlock()
-	select {
-	case c.signal <- struct{}{}:
-	default:
-	}
+	c.signalWindow(reason, true)
 }
 
 // signalWindow wakes the loop through the quiet window. claim records the
@@ -833,11 +828,18 @@ func (c *CheckoutCoordinator) Signal(reason string) {
 // shared sample must postdate; a ticket's demand routed through the window
 // (debounceDemand) claims nothing its ticket does not already bound.
 func (c *CheckoutCoordinator) signalWindow(reason string, claim bool) {
+	if c == nil {
+		return
+	}
 	c.mu.Lock()
 	c.reason = reason
+	if claim {
+		c.signaledAt = time.Now()
+	}
 	c.mu.Unlock()
 	select {
 	case c.signal <- struct{}{}:
+	default:
 	}
 }
 
@@ -1025,6 +1027,9 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	// Taken after through: every ticket at or below it was admitted before
 	// this instant, which is what lets the cycle's steps share one sample.
 	cycleStarted := time.Now()
+	ctx = withCycleStart(ctx, cycleStarted)
+	ctx = withPublicationTarget(ctx, c.checkoutID, through)
+	markPublicationPhase(ctx, PublicationCycleStarted)
 	defer c.guardCheckoutRefreshCycle(ctx, through)
 	c.mu.Lock()
 	reason := c.reason
@@ -1035,11 +1040,15 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		preflight = c.cyclePreflight
 	}
 	if out, settled := preflight(ctx); settled {
+		out.cycleStarted = cycleStarted
 		recordCoordinatorCycle(out)
 		c.reportCheckoutCycle(ctx, through, out)
 		return
 	}
 
+	if through == 0 {
+		ctx = withPhaseRecord(ctx, c.openObservedChangeRecord(ctx))
+	}
 	priority := ViewBuildBackground
 	if through != 0 {
 		priority = ViewBuildInteractive
@@ -1077,6 +1086,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		return
 	}
 	defer release()
+	markPublicationPhase(ctx, PublicationAdmitted)
 	if c.cycleBarrier != nil {
 		c.cycleBarrier(ctx)
 	}
@@ -1139,7 +1149,7 @@ func (c *CheckoutCoordinator) settledWithoutBuild(ctx context.Context) (Checkout
 	if err != nil {
 		return out, false
 	}
-	sample, err := c.sampler.Sample(ctx)
+	sample, err := c.cycleSample(ctx)
 	if err != nil || sample.HeadTree == "" {
 		return out, false
 	}
@@ -1264,7 +1274,7 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		out.Err = err
 		return out
 	}
-	head, err := c.sampler.Sample(ctx)
+	head, err := c.cycleSample(ctx)
 	if err != nil {
 		out.Err = fmt.Errorf("indexer: sample checkout %s: %w", c.root, err)
 		return out
@@ -1490,7 +1500,7 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 	// a HEAD the layer beneath knows nothing about, so the cycle stops and the
 	// next one rebuilds for the head the checkout is really at — the same
 	// guard, and the same counter, reconcileDirtySlot makes for itself.
-	sample, err := c.sampler.Sample(ctx)
+	sample, err := c.cycleSample(ctx)
 	if err != nil {
 		c.abandonBuild(ctx, commitGeneration, !reused)
 		return true, fmt.Errorf("indexer: sample %s: %w", c.root, err)
@@ -2527,7 +2537,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	route *store_sqlite.CheckoutRoute,
 	out *CheckoutCycle,
 ) error {
-	sample, err := c.sampler.Sample(ctx)
+	sample, err := c.cycleSample(ctx)
 	if err != nil {
 		return fmt.Errorf("indexer: sample %s: %w", c.root, err)
 	}
@@ -2600,6 +2610,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 			// a lost flip leaves it exactly as it was.
 			return err
 		}
+		markPublicationPhase(ctx, PublicationRouteFlipped)
 		out.DirtyReused = true
 		out.DirtyGenerationID = cached
 		c.retainDirty(ctx, key, cached)
@@ -2627,6 +2638,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		c.deferRetire(generationID, "lost route flip")
 		return err
 	}
+	markPublicationPhase(ctx, PublicationRouteFlipped)
 	out.DirtyGenerationID = generationID
 	// The built layer is filed under the key the BUILD stamped rather than
 	// the one this cycle looked it up by, and the one the route leaves is
@@ -4110,6 +4122,31 @@ func (a ancestryRefFacts) LoadRefFactsByFiles(repoPrefix string, files []string)
 		}
 	}
 	return out, firstErr
+}
+
+// SignalDemand wakes the loop for a cycle now, without the quiet window. It is
+// the wake for refresh tickets: their content is already bound (an MCP edit's
+// committed hash) or they ask for a fresh answer, and a ticket completes only
+// through the post-admission verification against a sample taken after it
+// arrived, so the window would add delay and prove nothing. A burst coalesces
+// into one cycle; demand during a running cycle is answered by exactly one
+// more. Filesystem, poll and HEAD signals keep the debounced Signal.
+func (c *CheckoutCoordinator) SignalDemand(reason string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.reason = reason
+	c.mu.Unlock()
+	demand := c.demand
+	if demand == nil {
+		c.signalWindow(reason, false)
+		return
+	}
+	select {
+	case demand <- struct{}{}:
+	default:
+	}
 }
 
 // LoadRefFactsByTargets unions the reverse facts every composed generation

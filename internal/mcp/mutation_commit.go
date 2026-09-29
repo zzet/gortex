@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/indexer"
 )
 
 // The commit ledger exists because a tool call has two independent terminal
@@ -529,6 +530,7 @@ func (s *Server) commitFileMutation(
 		record.markNotApplied(err)
 		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
 	}
+	indexer.StampPublicationPhase(ctx, indexer.PublicationDiskWriteStarted)
 	if err := agents.AtomicWriteFile(absPath, data, perm); err != nil {
 		record.markFailed(err)
 		return record, err

@@ -153,8 +153,10 @@ func (s *Server) refreshCheckoutMutation(ctx context.Context, path string, state
 		// the generations this request read stay pinned for exactly as long as
 		// the detached publication is outstanding, cancellation tail included.
 		pin := handoffRequestView(ctx, viewmetrics.HandoffCheckoutRefresh)
-		ticket, err := scheduler.EnqueueRefresh(context.WithoutCancel(ctx), path)
+		record, interimKey := openMutationPhases(ctx, state.checkoutID, path)
+		ticket, err := scheduler.EnqueueRefresh(indexer.WithPublicationRecord(context.WithoutCancel(ctx), record), path)
 		if err != nil {
+			failMutationPhases(record)
 			pin.release()
 			outcome.Err = fmt.Errorf("checkout graph refresh admission failed after disk commit: %w", err)
 			return outcome
@@ -165,27 +167,32 @@ func (s *Server) refreshCheckoutMutation(ctx context.Context, path string, state
 			// retirement forever, which is strictly worse than the unpinned
 			// window this error already describes, so the handoff is dropped
 			// on every rejection path below.
+			failMutationPhases(record)
 			pin.release()
 			outcome.Err = fmt.Errorf("checkout graph refresh admission returned no scoped completion ticket")
 			return outcome
 		}
 		if state.checkoutID != "" && (ticket.CheckoutID != state.checkoutID || ticket.Incarnation != state.incarnation) {
+			failMutationPhases(record)
 			pin.release()
 			outcome.Err = fmt.Errorf("checkout graph refresh ticket does not belong to the committed checkout incarnation")
 			return outcome
 		}
 		if !pathkey.EqualPaths(ticket.Ticket.Path, path) {
+			failMutationPhases(record)
 			pin.release()
 			outcome.Err = fmt.Errorf("checkout graph refresh ticket does not name the committed file")
 			return outcome
 		}
 		if state.committedHash != "" && (!pathkey.EqualPaths(state.committedPath, path) || ticket.ContentHash != state.committedHash) {
+			failMutationPhases(record)
 			pin.release()
 			outcome.Err = fmt.Errorf("%w: checkout file changed after disk commit before publication admission", indexer.ErrCheckoutRefreshSuperseded)
 			return outcome
 		}
 		receipt := s.trackCheckoutRefreshTicket(ticket)
 		receipt.pinView(pin)
+		s.beginMutationPhases(record, interimKey, receipt, ticket)
 		return receipt.outcome(true)
 	}
 	// Embedded adapters without queue support retain their synchronous contract.

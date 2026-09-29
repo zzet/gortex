@@ -311,6 +311,9 @@ type requestFreshnessOutcome struct {
 	reason   string
 	waited   time.Duration
 	deadline time.Time
+	// trace is which path settled the wait and what it saw
+	// (view_freshness_proof.go). Nil for an outcome that never waited.
+	trace *freshnessTrace
 }
 
 // checkoutFreshnessWaiter is the coordinator-backed settle signal require_fresh
@@ -379,6 +382,14 @@ func (s *Server) awaitCheckoutFreshness(
 		// advancement is not on demand.
 		return false, freshReasonCommittedBaseAdvance
 	}
+	// A route that already describes the working copy is proven so by one
+	// sample taken now, without a ticket, a quiet window or a settle cycle
+	// (checkout_fresh_proof.go). Anything short of that proof — including an
+	// error — takes the ticket path below unchanged.
+	trace := freshnessTraceFromContext(ctx)
+	if proved, fresh := s.proveCheckoutFresh(ctx, waiter, checkout, deadline, trace); proved {
+		return fresh, ""
+	}
 	// abandoned records what the LAST attempt died of: a bound this wait did
 	// not set. It decides what the wait is called if the caller's own bound
 	// then runs out — "the route never caught up" and "no ticket was ever
@@ -392,7 +403,7 @@ func (s *Server) awaitCheckoutFreshness(
 			return false, freshnessWaitEnd(ctx, abandoned)
 		}
 		waitCtx, cancel := context.WithDeadline(ctx, deadline)
-		ticket, err := waiter.RequestCheckoutRefresh(waitCtx, checkout.CheckoutID, checkout.RootPath)
+		ticket, err := requestFreshnessTicket(waitCtx, waiter, checkout, trace)
 		cancel()
 		if err != nil {
 			if freshnessWaitRetryable(err) {
@@ -437,8 +448,10 @@ func (s *Server) awaitCheckoutFreshness(
 		if ticket == nil || ticket.Ticket == nil || ticket.Ticket.Done == nil {
 			return false, freshReasonCoordinatorUnavailable
 		}
+		trace.noteTicket(checkout.CheckoutID, ticket.Ticket.Generation)
 		fresh, reason, retry, ticketAbandoned := awaitFreshnessTicket(ctx, ticket, deadline)
 		if !retry {
+			trace.noteTicketEnd(fresh)
 			return fresh, reason
 		}
 		abandoned = ticketAbandoned

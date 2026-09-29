@@ -1110,6 +1110,7 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 		LSPRouter:          agg.lspRouter,
 		Enrichment:         agg.enrichment,
 		Views:              views,
+		PublicationPhases:  publicationPhasesStatus(indexer.DefaultPublicationPhases()),
 		ToolPreset:         agg.toolPreset,
 		ToolPresetMode:     agg.toolPresetMode,
 		LearnedTools:       agg.learnedTools,
@@ -1646,6 +1647,35 @@ func (c *realController) collectLSPRouterStatus() *daemon.LSPRouterStatus {
 			LastUsed:  s.LastUsed.Format(time.RFC3339),
 			InUse:     s.InUse,
 		})
+	}
+	return out
+}
+
+// publicationPhasesStatus renders the recorder's per-checkout publication
+// records for daemon status, checkouts sorted and records oldest first. It is
+// its own block beside the view census, which carries no identities.
+func publicationPhasesStatus(recorder *indexer.PublicationPhaseRecorder) []daemon.PublicationPhaseStatus {
+	var out []daemon.PublicationPhaseStatus
+	for _, checkoutID := range recorder.Checkouts() {
+		for _, record := range recorder.Snapshot(checkoutID) {
+			status := daemon.PublicationPhaseStatus{
+				Key:               record.Key,
+				CheckoutID:        record.CheckoutID,
+				Source:            record.Source,
+				Ticket:            record.Ticket,
+				DirtyGenerationID: record.DirtyGenerationID,
+				OriginWall:        record.OriginWall,
+				Clock:             record.Clock,
+				Terminal:          record.Terminal,
+				Phases:            make([]daemon.PublicationPhaseOffset, 0, len(record.Phases)),
+			}
+			for _, phase := range record.Phases {
+				status.Phases = append(status.Phases, daemon.PublicationPhaseOffset{
+					Phase: string(phase.Phase), OffsetNS: phase.OffsetNS, OffsetMS: phase.OffsetMS,
+				})
+			}
+			out = append(out, status)
+		}
 	}
 	return out
 }

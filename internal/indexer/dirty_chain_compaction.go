@@ -4,7 +4,10 @@ import (
 	"context"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // dirtyChainCompactionDepth is the soft chain depth: a build that publishes a
@@ -83,4 +86,55 @@ func (c *CheckoutCoordinator) checkoutLanguageCensus(ctx context.Context, commit
 	c.compaction.census[commitGeneration] = census
 	c.compaction.mu.Unlock()
 	return census
+}
+
+const publicationSourceObservedChange = "observed_change"
+
+var observedChangeSequence atomic.Uint64
+
+// openObservedChangeRecord opens the publication record of a change a
+// ticketless cycle found: the cycle's shared sample (taken by its settle
+// check) differs from what the routed working-tree generation describes. Its
+// origin is when that sample's git status started, and change_observed is
+// marked now, when the cycle has it. nil when nothing changed or the route
+// cannot be read.
+func (c *CheckoutCoordinator) openObservedChangeRecord(ctx context.Context) *PublicationPhaseRecord {
+	sample, err := c.cycleSample(ctx)
+	if err != nil || sample.Fingerprint == "" {
+		return nil
+	}
+	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil {
+		return nil
+	}
+	if found && route.DirtyGenerationID > 0 {
+		row, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
+		if err != nil || (found && row.LowerViewFingerprint == sample.Fingerprint) {
+			return nil
+		}
+	}
+	origin := c.sampler.LastSampleStarted()
+	if origin.IsZero() {
+		origin = time.Now()
+	}
+	key := "observed-" + strconv.FormatUint(observedChangeSequence.Add(1), 10)
+	record := DefaultPublicationPhases().Begin(c.checkoutID, key, publicationSourceObservedChange, origin)
+	record.Mark(PublicationChangeObserved)
+	return record
+}
+
+// finishObservedChangeRecord closes a cycle's observed-change record with
+// what the cycle published: completed when the route names a working-tree
+// generation it built or re-routed, failed otherwise.
+func finishObservedChangeRecord(ctx context.Context, out CheckoutCycle) {
+	record := phaseRecordFrom(ctx)
+	if record == nil {
+		return
+	}
+	if out.Err == nil && out.DirtyGenerationID > 0 && (out.DirtyBuilt || out.DirtyReused) {
+		record.SetGeneration(out.DirtyGenerationID)
+		record.Mark(PublicationTicketCompleted)
+		return
+	}
+	record.Mark(PublicationTicketFailed)
 }

@@ -897,6 +897,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		if gate.Blocked && !allowParseErrors && !dryRun {
 			return mcp.NewToolResultError(parseGateError(relPath, gate)), nil
 		}
+		indexer.StampPublicationPhase(ctx, indexer.PublicationParseGated)
 	}
 
 	if dryRun {

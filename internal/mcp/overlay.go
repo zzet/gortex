@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -95,6 +96,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 	// leaf handler — the overlay build, the freshness sweep, and the response
 	// capture below all touch the graph and can block on the same locks.
 	return s.boundToolHandler(func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+		// The instant the call entered the middleware: the origin a mutation's
+		// or a fresh request's publication phases are measured from.
+		ctx = withToolReceivedAt(ctx, time.Now())
+		ctx = s.withMutationPublicationStamps(ctx, req.Params.Name)
 		beginMCPToolCall()
 		defer func() {
 			endMCPToolCall(s.logger, req.Params.Name)
@@ -241,6 +246,8 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withRequestView(ctx, view)
 			defer view.close()
 		}
+		indexer.StampPublicationPhase(ctx, indexer.PublicationViewSelected)
+		indexer.StampPublicationPhase(ctx, indexer.PublicationViewResolved)
 		// Tell the deadline firewall what this call is reading and what
 		// repositories it is admitted to. If it stops waiting for this handler
 		// — its deadline fired, or the client hung up — the handler keeps
@@ -306,6 +313,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx, _ = withResultCount(ctx)
 			qStart = time.Now()
 		}
+		indexer.StampPublicationPhase(ctx, indexer.PublicationHandlerStarted)
 		res, hErr := h(ctx, req)
 		// require_exact, a second time. The gate above runs before the handler
 		// and can only see the substitutions SELECTION made; an answer that

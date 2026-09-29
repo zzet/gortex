@@ -470,6 +470,7 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 	}
 	report.Work = work
 	work.recordPlan(plan, report, report.PlanningDuration)
+	markPublicationPhase(ctx, PublicationPlanned)
 
 	return b.buildPlannedGeneration(ctx, req, plan, report, started)
 }
@@ -621,10 +622,12 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 				return err
 			}
 		}
+		markPublicationPhase(ctx, PublicationExtracted)
 		// Enrichment runs before the masks so anything it adds to the payload is
 		// covered by the claims derived from it, and before the producer states
 		// so what it did is what they describe.
 		b.runEnrichment(req, handle, &report)
+		markPublicationPhase(ctx, PublicationSemanticDone)
 		// The context separation has to have decided before the masks are
 		// derived from what remains. In the read-only-context mode it already
 		// ran, inside the pass, against the in-memory corpus — the store never
@@ -659,10 +662,12 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 			return err
 		}
 		report.Work.mark("bulk_window_close")
+		markPublicationPhase(ctx, PublicationPayloadFlushed)
 		if err := b.Store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
 			return fmt.Errorf("indexer: publish generation %d: %w", generationID, err)
 		}
 		report.Work.mark("publish")
+		markPublicationPhase(ctx, PublicationPublished)
 		published = true
 		return nil
 	}()

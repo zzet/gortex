@@ -147,6 +147,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 			c.cycleMu.Unlock()
 		}
 	}()
+	StampPublicationPhase(ctx, PublicationMutationLocked)
 	m := &CheckoutMutation{coordinator: c, checkout: checkout, rootInfo: rootInfo}
 	if err := m.validateCheckout(waitCtx); err != nil {
 		return nil, err
@@ -159,7 +160,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 		return nil, err
 	}
 	m.route = route
-	if err := m.validateSnapshot(waitCtx); err != nil {
+	if err := m.validateSnapshot(waitCtx, false); err != nil {
 		return nil, err
 	}
 	// The lease names exactly one output generation: this checkout's routed
@@ -178,6 +179,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 	}
 	m.receipt = receipt
 	admitted, cycleOwned = false, false // Close now owns every acquired resource.
+	StampPublicationPhase(ctx, PublicationMutationAdmitted)
 	return m, nil
 }
 
@@ -256,9 +258,10 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 	if err := m.validateCheckout(ctx); err != nil {
 		return err
 	}
-	if err := m.validateSnapshot(ctx); err != nil {
+	if err := m.validateSnapshot(ctx, true); err != nil {
 		return err
 	}
+	StampPublicationPhase(ctx, PublicationWriteValidated)
 	if err := m.coordinator.reserveCheckoutRefresh(); err != nil {
 		return err
 	}
@@ -269,6 +272,7 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 		return fmt.Errorf("%w: withdraw dirty route: %w", ErrCheckoutMutationStale, err)
 	}
 	m.prepared = true
+	StampPublicationPhase(ctx, PublicationRouteWithdrawn)
 	return nil
 }
 
@@ -433,11 +437,14 @@ func sameMutationRoot(a, b string) bool {
 // An unchanged route epoch does not imply unchanged disk: external editors and
 // git can run before the watcher reconciles. Refuse their newer state instead
 // of applying symbol offsets from the previously materialized generation.
-func (m *CheckoutMutation) validateSnapshot(ctx context.Context) error {
+func (m *CheckoutMutation) validateSnapshot(ctx context.Context, stampWrite bool) error {
 	c := m.coordinator
 	sample, err := c.sampler.Sample(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: sample checkout: %w", ErrCheckoutMutationStale, err)
+	}
+	if stampWrite {
+		StampPublicationPhase(ctx, PublicationWriteSampled)
 	}
 	if err := c.checkRoutedSnapshot(ctx, m.route, sample); err != nil {
 		return err

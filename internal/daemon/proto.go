@@ -419,6 +419,13 @@ type StatusResponse struct {
 	// block that is a report rather than a fact the caller asked for.
 	Views *ViewsStatus `json:"views,omitempty"`
 
+	// PublicationPhases is the recent per-checkout record of how edits and
+	// require_fresh requests reached publication: each phase as a monotonic
+	// offset from the record's origin. It is a separate block from Views on
+	// purpose — the census carries no checkout or generation identities,
+	// and these records are keyed by both. Nil when nothing was recorded.
+	PublicationPhases []PublicationPhaseStatus `json:"publication_phases,omitempty"`
+
 	// BinaryStale is true when the file at the daemon's os.Executable()
 	// path no longer matches the image the daemon is running (size or
 	// mtime differ) — the signature of a package-manager upgrade that
@@ -432,6 +439,30 @@ type StatusResponse struct {
 	BinaryChecked bool `json:"binary_checked,omitempty"`
 	// BinaryReplacedAtUnix is the on-disk file's mtime when stale.
 	BinaryReplacedAtUnix int64 `json:"binary_replaced_at_unix,omitempty"`
+}
+
+// PublicationPhaseStatus is one recorded path to publication: an MCP edit
+// (keyed by its graph-refresh receipt) or a require_fresh wait that needed a
+// refresh ticket. Offsets are nanoseconds on the daemon's monotonic clock from
+// the record's origin; OriginWall is the origin's wall time, for correlating
+// with logs only.
+type PublicationPhaseStatus struct {
+	Key               string                   `json:"key"`
+	CheckoutID        string                   `json:"checkout_id"`
+	Source            string                   `json:"source"`
+	Ticket            uint64                   `json:"ticket,omitempty"`
+	DirtyGenerationID int64                    `json:"dirty_generation_id,omitempty"`
+	OriginWall        string                   `json:"origin_wall"`
+	Clock             string                   `json:"clock"`
+	Terminal          bool                     `json:"terminal"`
+	Phases            []PublicationPhaseOffset `json:"phases"`
+}
+
+// PublicationPhaseOffset is one phase of a PublicationPhaseStatus.
+type PublicationPhaseOffset struct {
+	Phase    string  `json:"phase"`
+	OffsetNS int64   `json:"offset_ns"`
+	OffsetMS float64 `json:"offset_ms"`
 }
 
 // LSPRouterStatus reflects one daemon's LSP-router state for the
