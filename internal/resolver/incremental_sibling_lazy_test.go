@@ -24,10 +24,11 @@ func (s *siblingReadStore) GetFileNodes(path string) []*graph.Node {
 	return s.Store.GetFileNodes(path)
 }
 
-// The incremental attribution tail reads the changed file's same-package
-// files only when a dataflow edge of the file needs a same-package callee; a
-// file without one never reads its package's nodes, and a file with one still
-// binds exactly as before.
+// The incremental attribution tail never reads the changed file's
+// same-package files: a dataflow edge that needs a same-package callee is
+// bound through a name lookup filtered to the package's files, so a file
+// without one reads nothing and a file with one still binds exactly as
+// before, without loading its package's nodes.
 func TestIncrementalAttributionReadsSiblingsOnlyWhenADataflowEdgeNeedsThem(t *testing.T) {
 	build := func(withDataflow bool) (*graph.Graph, *graph.Edge) {
 		g := graph.New()
@@ -65,8 +66,8 @@ func TestIncrementalAttributionReadsSiblingsOnlyWhenADataflowEdgeNeedsThem(t *te
 	r := New(store)
 	r.SetIncrementalSkip([]*graph.Edge{flow})
 	r.ResolveFilesAndIncoming([]string{"pkg/a.go"})
-	if store.requested["pkg/b.go"] != 1 {
-		t.Fatalf("the sibling was read %d time(s), want one batch", store.requested["pkg/b.go"])
+	if store.requested["pkg/b.go"] != 0 {
+		t.Fatalf("the sibling file was read %d time(s); the same-package callee is found by name", store.requested["pkg/b.go"])
 	}
 	var bound bool
 	for _, e := range g.GetOutEdges("pkg/a.go::Run") {
