@@ -1315,6 +1315,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	}
 	foreground = foreground || out.DirtyBuilt
 	recordCoordinatorCycle(out)
+	c.logSlowAdmission(reason, through, admission)
 	if out.CompactionScheduled {
 		c.scheduleDirtyChainCompaction(out)
 	}
