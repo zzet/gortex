@@ -10,6 +10,20 @@ func indirectMutationEdgesForMethods(
 	g graph.Store,
 	seedMethods []*graph.Node,
 ) ([]indirectMutSpec, map[string]*graph.Node) {
+	return indirectMutationEdgesForRoots(g, seedMethods, nil)
+}
+
+// indirectMutationEdgesForRoots is indirectMutationEdgesForMethods with the
+// backward expansion restricted to the roots named in expandFrom (every root
+// when expandFrom is nil). Every root is evaluated and emitted; only callers
+// reachable backwards from an expanding root join them. A root whose mutated
+// field set is unchanged cannot change any caller's summary — callers read a
+// callee only through that set — so it need not expand.
+func indirectMutationEdgesForRoots(
+	g graph.Store,
+	seedMethods []*graph.Node,
+	expandFrom map[string]struct{},
+) ([]indirectMutSpec, map[string]*graph.Node) {
 	if g == nil || len(seedMethods) == 0 {
 		return nil, nil
 	}
@@ -39,6 +53,11 @@ func indirectMutationEdgesForMethods(
 			continue
 		}
 		impacted[method.ID] = method
+		if expandFrom != nil {
+			if _, expand := expandFrom[method.ID]; !expand {
+				continue
+			}
+		}
 		frontier = append(frontier, method.ID)
 	}
 	// Receiver-call dependants are the only unchanged sources whose mutation

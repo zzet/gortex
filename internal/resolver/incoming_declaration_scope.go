@@ -301,3 +301,39 @@ func (c *incomingCarry) filter(stubKeys []string, inByStub map[string][]*graph.E
 	}
 	return out
 }
+
+// vanishedDeclarationKeys names the stub keys the frontier files owned before
+// the mutation (their installed prior declaration surfaces) and own no more: a
+// name the edit renamed away or deleted.
+//
+// The incoming leg enumerates the stub keys of what the files declare now, so
+// a reference parked under a vanished name — including the ones the re-parse
+// itself restubbed off the dead definition — is not reached by it. A whole
+// index attempts every reference once against the tree as it is: it binds such
+// a reference to another definition of the name if one exists and otherwise
+// leaves it unresolved, with no restub bookkeeping. Enumerating the vanished
+// keys gives the per-save leg that same attempt (the receipt name pass does it
+// too, but only when the mutation receipt is complete). The keys are never
+// carried (incomingCarryFor refuses a key that disappeared), so every reference
+// on them is admitted. Without installed evidence there is nothing to name.
+func (r *Resolver) vanishedDeclarationKeys(paths []string, nodesByFile map[string][]*graph.Node) []string {
+	if len(r.priorDeclarations) == 0 || len(paths) == 0 {
+		return nil
+	}
+	current := make(map[string]struct{})
+	for _, path := range paths {
+		for key := range DeclarationSurfaceOf(nodesByFile[path]) {
+			current[key] = struct{}{}
+		}
+	}
+	var out []string
+	for _, path := range paths {
+		for key := range r.priorDeclarations[path] {
+			if _, still := current[key]; !still {
+				out = append(out, key)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}

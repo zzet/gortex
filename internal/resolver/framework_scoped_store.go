@@ -319,7 +319,14 @@ func (v *frameworkScopedStore) AllEdges() []*graph.Edge {
 }
 
 func (v *frameworkScopedStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
-	base := graph.NodesInScopeSeq(v.Store, v.scope.repoPrefixes, v.scope.filePaths, kind)
+	var base iter.Seq[*graph.Node]
+	if len(v.scope.filePaths) > 0 {
+		// Same rows and order as the scoped projection, read by file (see
+		// frameworkFileFrontierNodes): the projection walks the generation.
+		base = frameworkFileFrontierNodes(v.Store, v.scope.repoPrefixes, v.scope.filePaths, kind)
+	} else {
+		base = graph.NodesInScopeSeq(v.Store, v.scope.repoPrefixes, v.scope.filePaths, kind)
+	}
 	return func(yield func(*graph.Node) bool) {
 		for node := range base {
 			v.lastNode = node

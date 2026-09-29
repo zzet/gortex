@@ -829,6 +829,8 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	}
 
 	carried := restubIncomingRefsFromView(idx.graph, stages, view)
+	// Capture capability state before eviction removes its rows.
+	idx.noteCapabilityPrior(captureCapabilityPrior(stages, view, carried))
 	// Canonical FTS lifetime follows the backend's atomic owner decision.
 	// Retained contracts keep existing rows; actual orphans are deleted there.
 	idx.deleteSymbolFTS(oldFTSNodeIDs)
@@ -1082,6 +1084,22 @@ func restubIncomingRefsFromView(
 			restub := frontier.requiresRestub(node)
 			stub := graph.UnresolvedMarker + node.Name
 			for _, edge := range view.inByNode[node.ID] {
+				if edge != nil && edge.Kind == graph.EdgeAccessesField {
+					// A derived field access into a definition whose ID and
+					// contract survive: its inputs (the source's carried
+					// read/write edge, the field's identity and receiver) are
+					// unchanged, so the row the eviction would delete is the
+					// row the capability pass would derive. Re-state it
+					// instead of losing it; the capability pass re-derives
+					// the rest (captureCapabilityPrior's restoration set).
+					if _, sourceEvicted := evicted[edge.From]; !sourceEvicted && !restub {
+						if _, duplicate := carriedSeen[edge]; !duplicate {
+							carriedSeen[edge] = struct{}{}
+							carried = append(carried, edge)
+						}
+					}
+					continue
+				}
 				if edge == nil || !graph.IsResolvableRefEdge(edge.Kind) || graph.IsUnresolvedTarget(edge.To) {
 					continue
 				}

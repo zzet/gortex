@@ -46,6 +46,17 @@ type IncrementalDerivedReport struct {
 	CrossRepo              int
 	Contracts              int
 	DurationMs             int64
+	// Per-family wall times of the passes above, so a slow settle names its
+	// owner: hierarchy (implements/overrides/entry-point propagation), test
+	// projection, capability synthesis, framework dispatch, external-call and
+	// cross-repository synthesis, and contract reconciliation.
+	HierarchyMs     int64
+	TestsMs         int64
+	CapabilityMs    int64
+	FrameworkMs     int64
+	ExternalCallsMs int64
+	CrossRepoMs     int64
+	ContractsMs     int64
 }
 
 // runStandaloneIncrementalDerivedPasses reuses the exact MultiIndexer derived
@@ -53,6 +64,16 @@ type IncrementalDerivedReport struct {
 // contains only this repository; real shared-graph callers must use their owning
 // MultiIndexer so contract and cross-repository passes see every sibling.
 func (idx *Indexer) runStandaloneIncrementalDerivedPasses(plan DerivedInvalidationPlan) IncrementalDerivedReport {
+	return idx.runStandaloneIncrementalDerivedPassesWithPrior(plan, nil)
+}
+
+// runStandaloneIncrementalDerivedPassesWithPrior is the form an incremental
+// mutation uses for its own catch-up: prior is the capability state its reparse
+// read before eviction (nil runs the full capability frontier).
+func (idx *Indexer) runStandaloneIncrementalDerivedPassesWithPrior(
+	plan DerivedInvalidationPlan,
+	prior *capabilityPrior,
+) IncrementalDerivedReport {
 	if idx == nil || idx.graph == nil || idx.deferGlobalPasses.Load() || plan.Empty() {
 		return IncrementalDerivedReport{}
 	}
@@ -67,9 +88,9 @@ func (idx *Indexer) runStandaloneIncrementalDerivedPasses(plan DerivedInvalidati
 		RepoPrefix: prefix,
 		RootPath:   idx.RootPath(),
 	}
-	return mi.runIncrementalDerivedPassesTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{
+	return mi.runIncrementalDerivedPassesWithPriorTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{
 		prefix: plan,
-	})
+	}, prior)
 }
 
 // drainRetargetedTestCallFiles collects, from each named repo's resolver,
@@ -161,6 +182,20 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 	ctx context.Context,
 	plans map[string]DerivedInvalidationPlan,
 ) IncrementalDerivedReport {
+	return mi.runIncrementalDerivedPassesWithPriorTopologyHeld(ctx, plans, nil)
+}
+
+// runIncrementalDerivedPassesWithPriorTopologyHeld also takes the capability
+// state the mutation's own reparse captured before eviction. When it covers
+// every file of the frontier, the capability pass re-derives only the changed
+// files, the sources whose edges into them the eviction deleted, and the
+// receiver callers of methods whose mutated-field set changed; otherwise (nil
+// or partial) it runs the full frontier.
+func (mi *MultiIndexer) runIncrementalDerivedPassesWithPriorTopologyHeld(
+	ctx context.Context,
+	plans map[string]DerivedInvalidationPlan,
+	prior *capabilityPrior,
+) IncrementalDerivedReport {
 	started := time.Now()
 	report := IncrementalDerivedReport{}
 	if mi == nil || mi.graph == nil || len(plans) == 0 {
@@ -226,9 +261,14 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 		for _, id := range merged.TypeIDs {
 			typeFrontier[id] = true
 		}
+		phase := time.Now()
+		// Same edges as InferImplementsScoped / InferOverridesScoped over the
+		// frontier, read from the frontier's own adjacency rather than the
+		// repository's member_of and parent-edge streams (4-12 s per save).
 		r := resolver.New(mi.graph)
-		report.Implements = r.InferImplementsScoped(typeFrontier, typeFrontier)
-		report.Overrides = r.InferOverridesScoped(typeFrontier)
+		report.Implements = r.InferImplementsForFrontier(typeFrontier)
+		report.Overrides = r.InferOverridesForFrontier(typeFrontier)
+		report.HierarchyMs += time.Since(phase).Milliseconds()
 	}
 
 	// The resolution step of this same apply may have bound pending calls
@@ -237,6 +277,7 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 	// only). Drain that retargeted frontier and reconcile those callers
 	// regardless of plan flags — without it a call that resolves later
 	// than its projection pass never gains its EdgeTests.
+	phase := time.Now()
 	retargeted := mi.drainRetargetedTestCallFiles(prefixSet)
 	if merged.Flags.Has(DerivedInvalidatesRuntime) || merged.Flags.Has(DerivedInvalidatesTests) {
 		files := merged.Files
@@ -247,19 +288,40 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 	} else if len(retargeted) > 0 {
 		report.TestSymbols, report.TestEdges = markTestSymbolsAndEmitEdgesScoped(mi.graph, scopedPrefixes, retargeted...)
 	}
+	report.TestsMs = time.Since(phase).Milliseconds()
 	if merged.Flags.Has(DerivedInvalidatesDeclarations) && len(merged.TypeIDs) > 0 {
+		phase = time.Now()
 		// A save that adds/re-parents a type can hang a new derived type
 		// off a stamped hierarchy (or stamp a new base); the changed-type
 		// frontier drives seed discovery, like the scoped passes above.
 		report.EntryPointHierarchy = entrypoints.PropagateEntryPointsDownHierarchyScoped(mi.graph, merged.TypeIDs)
+		report.HierarchyMs += time.Since(phase).Milliseconds()
 	}
 	if merged.Flags.Has(DerivedInvalidatesRuntime) {
-		readsEnv, execProc, fields := synthesizeCapabilityEdgesScoped(mi.graph, scopedPrefixes, merged.Files...)
+		phase = time.Now()
+		var readsEnv, execProc, fields int
+		if prior.covers(merged.Files) {
+			readsEnv, execProc, fields = synthesizeCapabilityEdgesForFilesWithPrior(mi.graph, prior, merged.Files)
+		} else {
+			readsEnv, execProc, fields = synthesizeCapabilityEdgesScoped(mi.graph, scopedPrefixes, merged.Files...)
+		}
 		report.Capability = readsEnv + execProc + fields
+		report.CapabilityMs = time.Since(phase).Milliseconds()
+	} else if prior.covers(merged.Files) {
+		// The runtime fingerprint is unchanged, but every file here was
+		// structurally re-parsed: the eviction deleted the capability rows its
+		// nodes source (and the ones pointing at its re-keyed definitions), and
+		// nothing else re-derives them. The prior bounds that to the files and
+		// the sources whose rows the eviction deleted.
+		phase = time.Now()
+		readsEnv, execProc, fields := synthesizeCapabilityEdgesForFilesWithPrior(mi.graph, prior, merged.Files)
+		report.Capability = readsEnv + execProc + fields
+		report.CapabilityMs = time.Since(phase).Milliseconds()
 	}
 	if merged.Flags.Has(DerivedInvalidatesDeclarations) ||
 		merged.Flags.Has(DerivedInvalidatesImports) ||
 		merged.Flags.Has(DerivedInvalidatesRuntime) {
+		phase = time.Now()
 		framework := resolver.RunFrameworkSynthesizersScopedForFilesWithSelection(
 			mi.graph,
 			scopedPrefixes,
@@ -278,13 +340,20 @@ func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 		report.FrameworkDemoteMs = framework.DemoteMillis
 		report.FrameworkScopeRows = framework.ScopeRows
 		report.FrameworkScopeBytes = framework.ScopeBytes
+		report.FrameworkMs = time.Since(phase).Milliseconds()
+		phase = time.Now()
 		report.ExternalCalls = resolver.SynthesizeExternalCallsForFiles(
 			mi.graph, mi.externalCallSynthesisEnabled(), merged.Files,
 		)
+		report.ExternalCallsMs = time.Since(phase).Milliseconds()
+		phase = time.Now()
 		report.CrossRepo = resolver.DetectCrossRepoEdgesForFiles(mi.graph, merged.Files)
+		report.CrossRepoMs = time.Since(phase).Milliseconds()
 	}
 	if merged.Flags.Has(DerivedInvalidatesContracts) {
+		phase = time.Now()
 		report.Contracts = mi.ReconcileContractEdgesForFrontier(merged)
+		report.ContractsMs = time.Since(phase).Milliseconds()
 	}
 
 	report.DurationMs = time.Since(started).Milliseconds()
@@ -322,5 +391,12 @@ func (mi *MultiIndexer) logIncrementalDerived(report IncrementalDerivedReport, p
 		zap.Int("external_calls", report.ExternalCalls),
 		zap.Int("cross_repo_edges", report.CrossRepo),
 		zap.Int("contract_edges", report.Contracts),
+		zap.Int64("hierarchy_ms", report.HierarchyMs),
+		zap.Int64("tests_ms", report.TestsMs),
+		zap.Int64("capability_ms", report.CapabilityMs),
+		zap.Int64("framework_ms", report.FrameworkMs),
+		zap.Int64("external_calls_ms", report.ExternalCallsMs),
+		zap.Int64("cross_repo_ms", report.CrossRepoMs),
+		zap.Int64("contracts_ms", report.ContractsMs),
 		zap.Int64("duration_ms", report.DurationMs))
 }

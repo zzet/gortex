@@ -58,6 +58,10 @@ type IndexResult struct {
 	// `daemon status` shows a stable file count across both full-track
 	// and incremental-reconcile paths.
 	FileCount int `json:"file_count"`
+	// CountsCached reports reuse of the last whole-repository count.
+	CountsCached bool `json:"counts_cached,omitempty"`
+	// capabilityPrior belongs only to this incremental mutation catch-up.
+	capabilityPrior *capabilityPrior
 	// StaleFileCount is the number of files that were actually
 	// re-indexed in this pass (only populated by IncrementalReindexPaths
 	// — full-index passes treat every file as stale and would
@@ -518,6 +522,10 @@ type Indexer struct {
 	// the shared global-pass pipeline exactly once at the end. Has no effect on the
 	// deferResolve path (multi-repo IndexCtx already skips those passes).
 	deferGlobalPasses atomic.Bool
+	// lastRepoCounts caches whole-repository counts for scoped saves.
+	lastRepoCounts         atomic.Pointer[repoCountSnapshot]
+	capabilityPriorMu      sync.Mutex
+	capabilityPriorPending *capabilityPrior
 
 	// skipResolveInDeferred, when set, makes RunDeferredPasses skip the
 	// per-repo resolver.ResolveAll() call. ResolveAll walks the entire
@@ -4579,11 +4587,15 @@ func recoverIndexCtxRawStoragePanic(result **IndexResult, retErr *error) {
 // so callers that stamp RepoMetadata.NodeCount/EdgeCount no longer
 // freeze the workspace-wide total at TrackRepo time.
 func (idx *Indexer) repoNodeEdgeCount() (int, int) {
+	var nodes, edges int
 	if idx.repoPrefix == "" {
-		return idx.graph.NodeCount(), idx.graph.EdgeCount()
+		nodes, edges = idx.graph.NodeCount(), idx.graph.EdgeCount()
+	} else {
+		est := idx.graph.RepoMemoryEstimate(idx.repoPrefix)
+		nodes, edges = est.NodeCount, est.EdgeCount
 	}
-	est := idx.graph.RepoMemoryEstimate(idx.repoPrefix)
-	return est.NodeCount, est.EdgeCount
+	idx.lastRepoCounts.Store(&repoCountSnapshot{nodes: nodes, edges: edges})
+	return nodes, edges
 }
 
 // cleanCensusResult publishes the same zero-delta state as the full-root
@@ -6434,6 +6446,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 ) (*IndexResult, error) {
 	idx.loadFileIndexFailures()
 	defer idx.flushFileIndexFailures()
+	idx.resetCapabilityPrior()
 	fullRoot := len(paths) == 0
 	if fullRoot {
 		// An empty scope means the repository root. detectDeletions decides
@@ -6789,7 +6802,13 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		idx.indexGen.Add(1) // files changed — invalidate the trigram cache
 	}
 
-	nodes, edges := idx.repoNodeEdgeCount()
+	var nodes, edges int
+	countsCached := false
+	if fullRoot {
+		nodes, edges = idx.repoNodeEdgeCount()
+	} else {
+		nodes, edges, countsCached = idx.scopedPassRepoCounts()
+	}
 	// FileCount must describe the repo, never this pass. diskFiles holds
 	// only the files under the caller's scope, so len(diskFiles) is the
 	// size of the batch — stamping that onto RepoMetadata is what made
@@ -6811,6 +6830,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		FailedFiles:         failedFiles,
 		DurationMs:          time.Since(start).Milliseconds(),
 		DerivedInvalidation: invalidation,
+		CountsCached:        countsCached,
+		capabilityPrior:     idx.takeCapabilityPrior(),
 	}
 	for _, path := range failedFiles {
 		result.Errors = append(result.Errors, IndexError{FilePath: path, Error: idx.fileIndexFailureError(path).Error()})
@@ -6847,7 +6868,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	recoveredFiles = append(recoveredFiles, walkedDirs...)
 	idx.clearRecoveredParseErrors(recoveredFiles, failedFiles, nil)
 	finalizeTiming.complete(nil, zap.Int("failed_files", len(failedFiles)),
-		zap.Int("nodes", result.NodeCount), zap.Int("edges", result.EdgeCount))
+		zap.Int("nodes", result.NodeCount), zap.Int("edges", result.EdgeCount),
+		zap.Bool("counts_cached", countsCached))
 	return result, nil
 }
 
@@ -9618,4 +9640,35 @@ func (idx *Indexer) TrackedFileState(relPath string) FileFreshness {
 // same reason as setPassCorpusFilter.
 func (idx *Indexer) setPassCorpusSeed(fn func(graph.Store) error) {
 	idx.passCorpusSeed = fn
+}
+
+// repoCountSnapshot is the repository's node/edge count as last measured by a
+// whole-repository count (a full index, a full-root reconcile, or the first
+// scoped pass of this Indexer).
+type repoCountSnapshot struct{ nodes, edges int }
+
+// scopedPassRepoCounts returns the counts a scoped (explicit-path) incremental
+// pass reports. Counting is O(repository) — every node of the repository and
+// every edge they source, 0.7-1.2 s per save on a 185k-node / 946k-edge store —
+// while the pass itself is O(changed files), so a scoped pass reuses the last
+// whole-repository count and reports cached=true. The count was never exact
+// for a save anyway: it is taken before the resolver catch-up and the derived
+// passes that follow it. Whole-repository passes and `daemon status --exact`
+// still count. The first scoped pass of an Indexer with no prior count reads
+// the store's persisted per-repository counters, and counts once only when the
+// store has none.
+func (idx *Indexer) scopedPassRepoCounts() (nodes, edges int, cached bool) {
+	if snapshot := idx.lastRepoCounts.Load(); snapshot != nil {
+		return snapshot.nodes, snapshot.edges, true
+	}
+	// No count in this process yet (a warm restart): the counters the store
+	// persisted at the last whole index are the same kind of answer.
+	if idx.repoPrefix != "" && idx.graph != nil {
+		if est, ok := idx.graph.AllRepoMemoryEstimates()[idx.repoPrefix]; ok && (est.NodeCount > 0 || est.EdgeCount > 0) {
+			idx.lastRepoCounts.Store(&repoCountSnapshot{nodes: est.NodeCount, edges: est.EdgeCount})
+			return est.NodeCount, est.EdgeCount, true
+		}
+	}
+	nodes, edges = idx.repoNodeEdgeCount()
+	return nodes, edges, false
 }

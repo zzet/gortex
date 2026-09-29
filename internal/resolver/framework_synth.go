@@ -498,6 +498,85 @@ func summarizeFrameworkCandidatesForFiles(
 	return summarizeFrameworkCandidatesCensus(g, scope, filePaths, false)
 }
 
+// frameworkFileFrontierNodes yields the nodes of an exact changed-file frontier
+// whose repository is in prefixes (every repository when prefixes is empty) and,
+// when kinds are given, whose kind is one of them; kind by kind in the order
+// given, each kind in node-ID order. That is the row set and order of
+// graph.NodesInScopeSeq(prefixes, filePaths, kinds...) (and, with no kinds, of
+// NodesLightInScopeSeq(prefixes, filePaths)), read through the file index in
+// one batch. The SQLite projections keep an ID-ordered keyset walk for their
+// paging contract, which the planner drives from the generation index when a
+// file list is given: every node of the generation per call (0.2-2 s on a
+// 185k-node store) for a frontier of a few hundred rows. The file batch carries
+// every column, so the census's identity/kind/name/file/language reads and the
+// synthesizers' full-node reads see the same values.
+func frameworkFileFrontierNodes(g graph.Store, prefixes, filePaths []string, kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
+	return func(yield func(*graph.Node) bool) {
+		if g == nil || len(filePaths) == 0 {
+			return
+		}
+		wantRepo := make(map[string]struct{}, len(prefixes))
+		for _, prefix := range prefixes {
+			wantRepo[prefix] = struct{}{}
+		}
+		files := make([]string, 0, len(filePaths))
+		seen := make(map[string]struct{}, len(filePaths))
+		for _, file := range filePaths {
+			if file == "" {
+				continue
+			}
+			if _, dup := seen[file]; dup {
+				continue
+			}
+			seen[file] = struct{}{}
+			files = append(files, file)
+		}
+		byFile := g.GetFileNodesByPaths(files)
+		byID := make(map[string]*graph.Node)
+		for _, file := range files {
+			for _, node := range byFile[file] {
+				if node == nil || node.ID == "" {
+					continue
+				}
+				if len(wantRepo) > 0 {
+					if _, ok := wantRepo[node.RepoPrefix]; !ok {
+						continue
+					}
+				}
+				byID[node.ID] = node
+			}
+		}
+		ids := make([]string, 0, len(byID))
+		for id := range byID {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		if len(kinds) == 0 {
+			for _, id := range ids {
+				if !yield(byID[id]) {
+					return
+				}
+			}
+			return
+		}
+		seenKind := make(map[graph.NodeKind]struct{}, len(kinds))
+		for _, kind := range kinds {
+			if kind == "" {
+				continue
+			}
+			if _, dup := seenKind[kind]; dup {
+				continue
+			}
+			seenKind[kind] = struct{}{}
+			for _, id := range ids {
+				if node := byID[id]; node.Kind == kind && !yield(node) {
+					return
+				}
+			}
+		}
+	}
+}
+
 // summarizeFrameworkCandidatesCensus is the census-aware form. censusEligible
 // carries the daemon's attestation that a non-nil scope covers every tracked
 // repository (a cold / full-reconciliation batch): the summary then reads the
@@ -523,7 +602,9 @@ func summarizeFrameworkCandidatesCensus(
 	var observerRoles map[string]uint8
 	observerRolesOverflow := false
 	var nodes iter.Seq[*graph.Node]
-	if !fullCensus {
+	if !fullCensus && len(filePaths) > 0 {
+		nodes = frameworkFileFrontierNodes(g, frameworkScopePrefixes(scope), filePaths)
+	} else if !fullCensus {
 		nodes = graph.NodesLightInScopeSeq(g, frameworkScopePrefixes(scope), filePaths)
 	} else {
 		nodes = graph.NodesLightSeq(g)

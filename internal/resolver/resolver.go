@@ -2752,7 +2752,8 @@ type incrementalFileFrontier struct {
 // written back) without multiplying the pass's statements. See
 // TestIncrementalFrontierKeepsOneIncomingReadPastTheScopedKeyCap.
 func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementalFileFrontier {
-	return collectIncrementalFileFrontierCarry(r.graph, filePaths, r.incrementalSkipped, true, r.incomingCarryFor)
+	return collectIncrementalFileFrontierKeys(
+		r.graph, filePaths, r.incrementalSkipped, true, r.incomingCarryFor, r.vanishedDeclarationKeys)
 }
 
 func collectIncrementalFileFrontier(
@@ -2785,147 +2786,7 @@ func collectIncrementalFileFrontierCarry(
 	lightweightIncoming bool,
 	carryFor func([]string, map[string][]*graph.Node) *incomingCarry,
 ) incrementalFileFrontier {
-	var frontier incrementalFileFrontier
-	if g == nil {
-		return frontier
-	}
-	seenPaths := make(map[string]struct{}, len(filePaths))
-	for _, path := range filePaths {
-		if path == "" {
-			continue
-		}
-		if _, duplicate := seenPaths[path]; duplicate {
-			continue
-		}
-		seenPaths[path] = struct{}{}
-		frontier.paths = append(frontier.paths, path)
-	}
-	if len(frontier.paths) == 0 {
-		return frontier
-	}
-
-	outgoingStarted := time.Now()
-	frontier.nodesByFile = g.GetFileNodesByPaths(frontier.paths)
-	var nodeIDs []string
-	for _, path := range frontier.paths {
-		for _, node := range frontier.nodesByFile[path] {
-			if node != nil && node.ID != "" {
-				nodeIDs = append(nodeIDs, node.ID)
-			}
-		}
-	}
-	frontier.outByNode = g.GetOutEdgesByNodeIDs(nodeIDs)
-
-	seenStubKeys := make(map[string]struct{})
-	appendStubKey := func(key string) {
-		if key == "" {
-			return
-		}
-		if _, duplicate := seenStubKeys[key]; duplicate {
-			return
-		}
-		seenStubKeys[key] = struct{}{}
-		frontier.stubKeys = append(frontier.stubKeys, key)
-	}
-	for _, path := range frontier.paths {
-		for _, node := range frontier.nodesByFile[path] {
-			if node == nil {
-				continue
-			}
-			for _, edge := range frontier.outByNode[node.ID] {
-				if graph.IsUnresolvedTarget(edge.To) && (skip == nil || !skip(edge)) {
-					frontier.pending = append(frontier.pending, edge)
-				}
-			}
-			if node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
-				continue
-			}
-			// The four name-owned forms are one contract. This builder is
-			// the batched incremental path's incoming leg, and it was the
-			// last one still hand-building the bare pair: a member
-			// reference parked under a wildcard form stayed pending until
-			// the next whole-graph resolve.
-			for _, key := range graph.UnresolvedNameCandidateIDs(node) {
-				appendStubKey(key)
-			}
-		}
-	}
-	frontier.outgoingPending = len(frontier.pending)
-	frontier.outgoingCollect = time.Since(outgoingStarted)
-	if carryFor != nil {
-		frontier.carry = carryFor(frontier.paths, frontier.nodesByFile)
-	}
-	incomingStarted := time.Now()
-	// The unresolved target string is the incoming-edge bucket key even when
-	// no node with that ID exists.
-	//
-	// The admission is bounded: a changed file that defines a common name
-	// (Close, Get, New) parks every unbound reference to that name in the whole
-	// corpus on its stub ids, and admitting them all is the reverse leg's write
-	// amplification. graph.AdmitIncomingRowsBounded charges the physical rows
-	// against the shared incoming-source ceiling and refuses the WHOLE leg at
-	// the ceiling — the parked edges stay exactly as they are, and the refusal
-	// rides the frontier as a completeness fact instead of being a silent
-	// truncation. It neither widens nor splits the read: the same keys in the
-	// same single batched call, the same rows.
-	if frontier.carry != nil {
-		// A carried key admits only restubbed references, and the restub
-		// mark rides the edge Meta, which the identity projection omits:
-		// read the full rows. Same keys, same single bounded call, same rows.
-		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
-			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
-		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
-		for _, key := range frontier.stubKeys {
-			carried := frontier.carry.carried(key)
-			for _, edge := range inByStub[key] {
-				if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
-					continue
-				}
-				if !frontier.carry.admits(key, edge) {
-					frontier.carriedSkipped++
-					continue
-				}
-				if carried {
-					frontier.carriedAdmitted++
-				}
-				frontier.pending = append(frontier.pending, edge)
-			}
-		}
-	} else if lightweightIncoming {
-		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
-			context.Background(),
-			func(keys []string) map[string][]graph.EdgeIdentity {
-				return graph.InEdgeIdentitiesByNodeIDs(g, keys)
-			},
-			frontier.stubKeys, nil)
-		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
-		for _, key := range frontier.stubKeys {
-			for _, identity := range inByStub[key] {
-				if !graph.IsUnresolvedTarget(identity.To) {
-					continue
-				}
-				// Preparation needs only the logical identity. Resolution performs a
-				// fresh full-edge read after forward reindexing has settled.
-				frontier.pending = append(frontier.pending, &graph.Edge{
-					From: identity.From, To: identity.To, Kind: identity.Kind,
-					FilePath: identity.FilePath, Line: identity.Line,
-				})
-			}
-		}
-	} else {
-		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
-			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
-		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
-		for _, key := range frontier.stubKeys {
-			for _, edge := range inByStub[key] {
-				if edge != nil && graph.IsUnresolvedTarget(edge.To) {
-					frontier.pending = append(frontier.pending, edge)
-				}
-			}
-		}
-	}
-	frontier.incomingCollect = time.Since(incomingStarted)
-	return frontier
+	return collectIncrementalFileFrontierKeys(g, filePaths, skip, lightweightIncoming, carryFor, nil)
 }
 
 // ResolveFilesAndIncoming runs the forward and reverse passes for a
@@ -6124,4 +5985,166 @@ func (r *Resolver) callerWorkspaceID(e *graph.Edge) string {
 		return fromNode.WorkspaceID
 	}
 	return fromNode.RepoPrefix
+}
+
+// collectIncrementalFileFrontierCarry is collectIncrementalFileFrontierMode
+// with the incoming leg scoped by declaration evidence: carryFor, when
+// non-nil, names the stub keys whose declarations the mutation left unchanged,
+// and on those keys only restubbed references are admitted. The incoming read
+// is the same single bounded call over the same keys either way — only the
+// admitted subset differs — so the ceiling and its refusal are unchanged.
+func collectIncrementalFileFrontierKeys(
+	g graph.Store,
+	filePaths []string,
+	skip func(*graph.Edge) bool,
+	lightweightIncoming bool,
+	carryFor func([]string, map[string][]*graph.Node) *incomingCarry,
+	extraKeys func([]string, map[string][]*graph.Node) []string,
+) incrementalFileFrontier {
+	var frontier incrementalFileFrontier
+	if g == nil {
+		return frontier
+	}
+	seenPaths := make(map[string]struct{}, len(filePaths))
+	for _, path := range filePaths {
+		if path == "" {
+			continue
+		}
+		if _, duplicate := seenPaths[path]; duplicate {
+			continue
+		}
+		seenPaths[path] = struct{}{}
+		frontier.paths = append(frontier.paths, path)
+	}
+	if len(frontier.paths) == 0 {
+		return frontier
+	}
+
+	outgoingStarted := time.Now()
+	frontier.nodesByFile = g.GetFileNodesByPaths(frontier.paths)
+	var nodeIDs []string
+	for _, path := range frontier.paths {
+		for _, node := range frontier.nodesByFile[path] {
+			if node != nil && node.ID != "" {
+				nodeIDs = append(nodeIDs, node.ID)
+			}
+		}
+	}
+	frontier.outByNode = g.GetOutEdgesByNodeIDs(nodeIDs)
+
+	seenStubKeys := make(map[string]struct{})
+	appendStubKey := func(key string) {
+		if key == "" {
+			return
+		}
+		if _, duplicate := seenStubKeys[key]; duplicate {
+			return
+		}
+		seenStubKeys[key] = struct{}{}
+		frontier.stubKeys = append(frontier.stubKeys, key)
+	}
+	for _, path := range frontier.paths {
+		for _, node := range frontier.nodesByFile[path] {
+			if node == nil {
+				continue
+			}
+			for _, edge := range frontier.outByNode[node.ID] {
+				if graph.IsUnresolvedTarget(edge.To) && (skip == nil || !skip(edge)) {
+					frontier.pending = append(frontier.pending, edge)
+				}
+			}
+			if node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
+				continue
+			}
+			// The four name-owned forms are one contract. This builder is
+			// the batched incremental path's incoming leg, and it was the
+			// last one still hand-building the bare pair: a member
+			// reference parked under a wildcard form stayed pending until
+			// the next whole-graph resolve.
+			for _, key := range graph.UnresolvedNameCandidateIDs(node) {
+				appendStubKey(key)
+			}
+		}
+	}
+	if extraKeys != nil {
+		for _, key := range extraKeys(frontier.paths, frontier.nodesByFile) {
+			appendStubKey(key)
+		}
+	}
+	frontier.outgoingPending = len(frontier.pending)
+	frontier.outgoingCollect = time.Since(outgoingStarted)
+	if carryFor != nil {
+		frontier.carry = carryFor(frontier.paths, frontier.nodesByFile)
+	}
+	incomingStarted := time.Now()
+	// The unresolved target string is the incoming-edge bucket key even when
+	// no node with that ID exists.
+	//
+	// The admission is bounded: a changed file that defines a common name
+	// (Close, Get, New) parks every unbound reference to that name in the whole
+	// corpus on its stub ids, and admitting them all is the reverse leg's write
+	// amplification. graph.AdmitIncomingRowsBounded charges the physical rows
+	// against the shared incoming-source ceiling and refuses the WHOLE leg at
+	// the ceiling — the parked edges stay exactly as they are, and the refusal
+	// rides the frontier as a completeness fact instead of being a silent
+	// truncation. It neither widens nor splits the read: the same keys in the
+	// same single batched call, the same rows.
+	if frontier.carry != nil {
+		// A carried key admits only restubbed references, and the restub
+		// mark rides the edge Meta, which the identity projection omits:
+		// read the full rows. Same keys, same single bounded call, same rows.
+		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
+		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
+		for _, key := range frontier.stubKeys {
+			carried := frontier.carry.carried(key)
+			for _, edge := range inByStub[key] {
+				if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
+					continue
+				}
+				if !frontier.carry.admits(key, edge) {
+					frontier.carriedSkipped++
+					continue
+				}
+				if carried {
+					frontier.carriedAdmitted++
+				}
+				frontier.pending = append(frontier.pending, edge)
+			}
+		}
+	} else if lightweightIncoming {
+		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(),
+			func(keys []string) map[string][]graph.EdgeIdentity {
+				return graph.InEdgeIdentitiesByNodeIDs(g, keys)
+			},
+			frontier.stubKeys, nil)
+		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
+		for _, key := range frontier.stubKeys {
+			for _, identity := range inByStub[key] {
+				if !graph.IsUnresolvedTarget(identity.To) {
+					continue
+				}
+				// Preparation needs only the logical identity. Resolution performs a
+				// fresh full-edge read after forward reindexing has settled.
+				frontier.pending = append(frontier.pending, &graph.Edge{
+					From: identity.From, To: identity.To, Kind: identity.Kind,
+					FilePath: identity.FilePath, Line: identity.Line,
+				})
+			}
+		}
+	} else {
+		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
+		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
+		for _, key := range frontier.stubKeys {
+			for _, edge := range inByStub[key] {
+				if edge != nil && graph.IsUnresolvedTarget(edge.To) {
+					frontier.pending = append(frontier.pending, edge)
+				}
+			}
+		}
+	}
+	frontier.incomingCollect = time.Since(incomingStarted)
+	return frontier
 }

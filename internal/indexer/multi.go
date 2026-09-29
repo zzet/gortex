@@ -920,7 +920,7 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 			// Evicted definitions' pending references live outside the file
 			// frontier (their name is no longer declared in any frontier
 			// file); rebind them by the names the receipt recorded.
-			mi.runMasterResolveNames(receipt.EvictedNames)
+			mi.runMasterResolveNames(vanishedReceiptNames(mi.graph, receipt))
 		}
 		// Resolve only files that can create or bind unresolved edges. Resolved
 		// edge sources still materialise their cross_repo_* generation without
@@ -2769,9 +2769,9 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	mi.mu.Unlock()
 
 	idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
-	mi.runIncrementalDerivedPassesTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{
+	mi.runIncrementalDerivedPassesWithPriorTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{
 		repoPrefix: result.DerivedInvalidation,
-	})
+	}, result.capabilityPrior)
 
 	topologyChanged = incrementalTopologyChanged(result)
 	return result, nil

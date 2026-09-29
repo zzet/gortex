@@ -30,6 +30,7 @@ type frameworkScopeTrapStore struct {
 	scopedNodeScans   int
 	scopedEdgeScans   int
 	scopedLightScan   int
+	fileBatchReads    int
 	pointNodes        int
 	pointInEdges      int
 	pointOutEdges     int
@@ -120,6 +121,11 @@ func (s *frameworkScopeTrapStore) NodesLightInScopeSeq(
 ) iter.Seq[*graph.Node] {
 	s.scopedLightScan++
 	return graph.NodesLightInScopeSeq(s.Store, repos, files)
+}
+
+func (s *frameworkScopeTrapStore) GetFileNodesByPaths(paths []string) map[string][]*graph.Node {
+	s.fileBatchReads++
+	return s.Store.GetFileNodesByPaths(paths)
 }
 
 func (s *frameworkScopeTrapStore) RepoEdgesByKinds(
@@ -302,7 +308,10 @@ func TestRunFrameworkSynthesizersScopedForFilesHasNoLegacyGlobalFallback(t *test
 	)
 
 	requireNoFrameworkGlobalScans(t, trap)
-	require.Equal(t, 1, trap.scopedLightScan, "candidate census must be one scoped stream")
+	// An exact file frontier's census reads those files' rows in one batch
+	// (frameworkFileFrontierNodes), not a keyset projection of the scope.
+	require.Zero(t, trap.scopedLightScan, "candidate census of a file frontier must read the files")
+	require.Positive(t, trap.fileBatchReads, "candidate census must be one bounded file read")
 }
 
 func TestFrameworkFamilyGateForFilesUsesExactFrontier(t *testing.T) {
