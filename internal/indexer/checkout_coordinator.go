@@ -578,6 +578,7 @@ type CheckoutCoordinator struct {
 	textMu    sync.Mutex
 	textIndex *trigram.Searcher
 	textKey   string
+	textState checkoutTextState
 
 	cycleDone    func(CheckoutCycle)
 	dirtyBarrier func()

@@ -1,6 +1,6 @@
 package indexer
 
-import ()
+import "testing"
 
 // The coordinator with working-tree chaining on: which parent a cycle builds
 // over, what a reader pinned before a flip keeps seeing, what a torn or
@@ -10,3 +10,9 @@ import ()
 // deletes payload).
 
 const chainIslandTwo = "package fixture\n\nfunc Island() {\n}\n\nfunc IslandTwo() {\n}\n"
+
+func chainCoordinator(t *testing.T, cfg CheckoutCoordinatorConfig) (*coordinatorFixture, *CheckoutCoordinator) {
+	t.Helper()
+	f := newCoordinatorFixture(t)
+	return f, f.inertCoordinator(t, cfg)
+}
