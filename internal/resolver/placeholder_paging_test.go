@@ -85,7 +85,10 @@ func TestResolveAllPlaceholderSourcedDataflowIsIndependentOfPaging(t *testing.T)
 					rows := placeholderPagingDigest(g)
 					if reference == nil {
 						reference, referenceName = rows, name
-						want := "repo/pkg/b.go::Cmd0 -> stdlib::strings::TrimSpace arg_of repo/pkg/a.go:10"
+						// The stub carries the repository its placeholder
+						// source spells (stubRepoPrefix): the same
+						// `repo::stdlib::…` the call at the site binds to.
+						want := "repo/pkg/b.go::Cmd0 -> repo::stdlib::strings::TrimSpace arg_of repo/pkg/a.go:10"
 						found := false
 						for _, row := range rows {
 							found = found || row == want
