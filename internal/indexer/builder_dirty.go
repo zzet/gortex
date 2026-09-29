@@ -292,7 +292,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 			if req.buildBarrier != nil {
 				req.buildBarrier()
 			}
-			return b.confirmDirtySnapshotWith(ctx, req.Sampler, req.CheckoutRoot, generationID, before.Fingerprint)
+			return b.confirmDirtyBuildInputs(ctx, req.Sampler, req.CheckoutRoot, generationID, before)
 		},
 		inputManifest: manifest,
 	})

@@ -176,6 +176,15 @@ type DirtySampler struct {
 	// checks share one sample instead of queueing for one each.
 	last        DirtySnapshot
 	lastStarted time.Time
+	// lastHead is the HEAD-deciding files' identity taken just before last's
+	// status command started (ConfirmReadSet).
+	lastHead headEvidence
+	// gitDir/commonDir resolve the checkout's .git without running git, and
+	// stampsTrusted whether its filesystem's change stamps are trusted; both
+	// are computed once (read_set_confirm.go).
+	gitDir, commonDir            string
+	gitDirsResolved              bool
+	stampsChecked, stampsTrusted bool
 	// taken counts the samples this sampler has taken (not the ones
 	// SampleSince shared).
 	taken uint64
@@ -315,6 +324,7 @@ func (s *DirtySampler) sampleHeld(ctx context.Context) (DirtySnapshot, error) {
 // status began.
 func (s *DirtySampler) sampleHeldStarted(ctx context.Context) (DirtySnapshot, time.Time, error) {
 	started := time.Now()
+	head := s.captureHeadEvidence()
 	snap, err := s.sampleHeldUnrecorded(ctx)
 	if err != nil {
 		return DirtySnapshot{}, time.Time{}, err
@@ -322,7 +332,7 @@ func (s *DirtySampler) sampleHeldStarted(ctx context.Context) (DirtySnapshot, ti
 	s.mu.Lock()
 	s.taken++
 	if !started.Before(s.lastStarted) {
-		s.last, s.lastStarted = snap, started
+		s.last, s.lastStarted, s.lastHead = snap, started, head
 	}
 	s.mu.Unlock()
 	return snap, started, nil

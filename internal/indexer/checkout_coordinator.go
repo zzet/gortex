@@ -1302,6 +1302,10 @@ func recordCoordinatorCycle(out CheckoutCycle) {
 // right now.
 func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	var out CheckoutCycle
+	// A working-tree build confirms its inputs by its read set unless a
+	// refresh ticket waits that only a sample taken after it arrived can
+	// complete: then its prepublish fence is that sample.
+	ctx = withPrepublishSampleDemand(ctx, c.refreshWantsNewSample)
 
 	// One cohort per cycle, described afresh. Every identity this cycle mints
 	// carries the same revision, so the layer it builds and the cache entry it
@@ -2699,7 +2703,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	// the row cannot render — dead weight in a bounded cache, evicting an
 	// entry that could still be hit.
 	c.retainDirty(ctx, builtKey, generationID)
-	c.releaseDirty(ctx, previous)
+	c.releaseDirtyChain(ctx, previous, generationID)
 	return nil
 }
 
@@ -4169,6 +4173,24 @@ func (a ancestryRefFacts) LoadRefFactsByFiles(repoPrefix string, files []string)
 		}
 	}
 	return out, firstErr
+}
+
+// refreshWantsNewSample reports whether a refresh ticket waits whose
+// freshAfter is later than the latest working-copy sample: completing it with
+// this cycle's publication takes a sample begun after it arrived.
+func (c *CheckoutCoordinator) refreshWantsNewSample() bool {
+	if c == nil || c.sampler == nil {
+		return false
+	}
+	latest := c.sampler.LastSampleStarted()
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	for _, request := range c.refreshWaiters {
+		if request != nil && request.freshAfter.After(latest) {
+			return true
+		}
+	}
+	return false
 }
 
 // backgroundLaneYields is how many background cycles in a row yielded the lane.

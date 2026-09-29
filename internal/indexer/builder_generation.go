@@ -688,7 +688,7 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		}
 		report.Work.mark("separate_masks_producers")
 		if req.PrePublish != nil {
-			if err := req.PrePublish(ctx, generationID); err != nil {
+			if err := req.PrePublish(withBuildReadSet(ctx, plan.indexed, plan.context, plan.deleted), generationID); err != nil {
 				return err
 			}
 		}
