@@ -59,6 +59,12 @@ type Engine struct {
 	// hung up or whose deadline fired stops consuming the daemon's CPU. See
 	// WithRequestContext.
 	requestCtx context.Context
+	// viewExcludesBase says the composed view's stack does not include the
+	// indexed corpus (generation zero): its bottom is a dedicated full root.
+	// Candidate enumeration then asks only the stack's own corpora — a
+	// generation-zero hit could only name a row the view does not read, or
+	// re-rank a row the stack's own corpus already answers for.
+	viewExcludesBase bool
 }
 
 // WithRequestContext returns a shallow clone of the engine whose long graph
@@ -76,9 +82,18 @@ func (e *Engine) WithRequestContext(ctx context.Context) *Engine {
 // WithViewLayersContext is WithViewLayers and WithRequestContext in one
 // clone, so binding a routed request's lifetime costs no second copy.
 func (e *Engine) WithViewLayersContext(r graph.Reader, layers []ViewLayerSource, ctx context.Context) *Engine {
+	return e.WithComposedView(r, layers, ctx, false)
+}
+
+// WithComposedView is WithViewLayersContext for a view that may not compose
+// the indexed corpus: excludesBase=true (a stack rooted in a dedicated full
+// root) makes candidate enumeration skip generation zero entirely. It only
+// takes effect when layers are bound.
+func (e *Engine) WithComposedView(r graph.Reader, layers []ViewLayerSource, ctx context.Context, excludesBase bool) *Engine {
 	clone := e.WithViewLayers(r, layers)
 	if clone != nil {
 		clone.requestCtx = ctx
+		clone.viewExcludesBase = excludesBase && len(clone.viewLayers) > 0
 	}
 	return clone
 }
@@ -124,6 +139,7 @@ func (e *Engine) WithReader(r graph.Reader) *Engine {
 	// previous reader named never carries over — WithViewLayers is the
 	// only way one is bound.
 	clone.viewLayers = nil
+	clone.viewExcludesBase = false
 	if view, ok := r.(overlayLayered); ok {
 		clone.overlay = view.Layer()
 	}
@@ -870,6 +886,14 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 	if _, ok := backend.(search.ContextSymbolBundleSearcherBackend); ok {
 		bundleCapable = true
 	}
+	// A stack that does not compose the indexed corpus is enumerated from its
+	// own generations alone: skip every base-corpus lane (bundles, channels,
+	// the base refill below).
+	skipBase := viewLayered && e.viewExcludesBase
+	if skipBase {
+		bundleCapable = false
+		bundleHandled = true
+	}
 	if bundleCapable {
 		bundleStart := time.Now()
 		var answer requestBundleAnswer
@@ -996,12 +1020,16 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 	// where every surviving candidate is resolved through the composed
 	// reader and anything the view hides falls out.
 	if viewLayered {
+		refillBase := viewBaseTextRefillContext(ctx, backend, query, repoAllowList(opts.RepoAllow))
+		if skipBase {
+			refillBase = nil
+		}
 		textResults = e.viewTextCandidatesContext(
 			ctx,
 			query,
 			limit*2,
 			textResults,
-			viewBaseTextRefillContext(ctx, backend, query, repoAllowList(opts.RepoAllow)),
+			refillBase,
 		)
 		if ctx.Err() != nil {
 			return nil

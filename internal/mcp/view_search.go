@@ -166,6 +166,17 @@ func (v *requestView) bindSources(sources []graphview.GenerationSource, base gra
 	v.content = &viewContentSearcher{sources: content}
 }
 
+// excludesBaseCorpus reports a routed view whose stack does not compose the
+// indexed corpus (its bottom is a dedicated full root), so symbol candidate
+// enumeration must not consult generation zero. A buffer overlay, a base
+// request and a labelled base selector all keep the base corpus.
+func (v *requestView) excludesBaseCorpus() bool {
+	if v == nil || v.materialized == nil || v.baseNarrowed || len(v.candidates) == 0 {
+		return false
+	}
+	return !v.materialized.ComposesBaseCorpus()
+}
+
 // candidateLayers is the stack the query engine enumerates candidates across,
 // nil for a request the base corpus serves.
 func (v *requestView) candidateLayers() []query.ViewLayerSource {

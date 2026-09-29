@@ -213,7 +213,7 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 		return s.engine.WithViewLayersContext(v, view.candidateLayers(), ctx)
 	}
 	if view.routed() {
-		return s.engine.WithViewLayersContext(view.reader, view.candidateLayers(), ctx)
+		return s.engine.WithComposedView(view.reader, view.candidateLayers(), ctx, view.excludesBaseCorpus())
 	}
 	return s.engine
 }

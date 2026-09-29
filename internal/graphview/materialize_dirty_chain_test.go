@@ -152,6 +152,161 @@ func assertNotLeased(t *testing.T, materializer *Materializer, generations ...in
 	}
 }
 
+// TestMaterializeCheckoutComposesDirtyChain: a route [C, D2] with D2 over D1
+// over C reads the tree all three describe — the same answers as the manual
+// overlay composition and as a flat index of that tree — lists every chain
+// member as a generation source, leases all of them, and keeps the view's
+// identity at (C, D2).
+func TestMaterializeCheckoutComposesDirtyChain(t *testing.T) {
+	ctx := context.Background()
+	store := openStackStore(t, "dirty-chain")
+	seedStackCorpus(t, store)
+	seedStackControlPlane(t, store)
+	commit, d1, d2 := seedDirtyChainStack(t, store)
+	flat := openStackStore(t, "dirty-chain-flat")
+	seedDirtyChainFlatCorpus(t, flat)
+
+	materializer := newTestMaterializer(store)
+	view, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout: %v", err)
+	}
+	want := []int64{commit, d1, d2}
+	if got := view.Generations(); !slicesEqualInt64(got, want) {
+		t.Fatalf("Generations() = %v, want %v", got, want)
+	}
+	sources := view.GenerationSources()
+	if len(sources) != len(want) {
+		t.Fatalf("GenerationSources() has %d entries, want %d", len(sources), len(want))
+	}
+	for index, generationID := range want {
+		if sources[index].Generation != generationID {
+			t.Fatalf("GenerationSources()[%d] = %d, want %d", index, sources[index].Generation, generationID)
+		}
+	}
+	if view.ID.BaseGeneration != commit {
+		t.Fatalf("identity base generation = %d, want %d", view.ID.BaseGeneration, commit)
+	}
+	if len(view.ID.Layers) != 1 || view.ID.Layers[0].Generation != d2 || view.ID.Layers[0].Kind != LayerDirty {
+		t.Fatalf("identity layers = %+v, want exactly the routed top %d as the working-tree layer", view.ID.Layers, d2)
+	}
+	for _, generationID := range append(slices.Clone(want), BaseCorpusGeneration) {
+		if !materializer.Leases.InUse(generationID) {
+			t.Fatalf("generation %d is not leased by the chained view", generationID)
+		}
+	}
+
+	manual := manualChainReader(t, store, store.AtGeneration(0), commit, d1, d2)
+	assertReadersAgree(t, view.Reader, manual)
+	assertReadersAgree(t, view.Reader, flat)
+	if got := view.Reader.GetNode(stackKeeperID); got == nil || got.StartLine != 2 {
+		t.Fatalf("parent D1's rewrite of Keeper = %+v, want line 2 from the chain parent", got)
+	}
+	if got := view.Reader.GetNode(stackNewID); got == nil || got.StartLine != 40 {
+		t.Fatalf("top D2's New = %+v, want line 40", got)
+	}
+
+	// The same stack, routed directly [C, D1], is still the one-hop view it
+	// always was: a chain parent is an ordinary routable generation.
+	view.Close()
+	for _, generationID := range want {
+		if materializer.Leases.InUse(generationID) {
+			t.Fatalf("generation %d still leased after Close", generationID)
+		}
+	}
+	routeStack(t, store, commit, d1, store_sqlite.RouteActive)
+	direct, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+	if err != nil {
+		t.Fatalf("MaterializeCheckout(direct): %v", err)
+	}
+	defer direct.Close()
+	if got := direct.Generations(); !slicesEqualInt64(got, []int64{commit, d1}) {
+		t.Fatalf("direct Generations() = %v, want [%d %d]", got, commit, d1)
+	}
+}
+
+// TestMaterializeCheckoutDirtyChainLegacyRegimeKeepsBaseCorpus: with the commit
+// generation standing on generation zero (BaseGenerationID = 0), a two-deep
+// dirty chain makes the ancestry longer than the route, yet the view still
+// stands on the shared corpus: it reads dep.go, which only generation zero
+// carries, and it leases generation zero. Over a dedicated root the same chain
+// reads the root and leaves generation zero alone.
+func TestMaterializeCheckoutDirtyChainLegacyRegimeKeepsBaseCorpus(t *testing.T) {
+	ctx := context.Background()
+	t.Run("legacy", func(t *testing.T) {
+		store := openStackStore(t, "dirty-chain-legacy")
+		seedStackCorpus(t, store)
+		seedStackControlPlane(t, store)
+		commit, d1, d2 := seedDirtyChainStack(t, store)
+		materializer := newTestMaterializer(store)
+
+		view, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+		if err != nil {
+			t.Fatalf("MaterializeCheckout: %v", err)
+		}
+		defer view.Close()
+		if got := view.Generations(); !slicesEqualInt64(got, []int64{commit, d1, d2}) {
+			t.Fatalf("Generations() = %v", got)
+		}
+		if !view.PinsBaseCorpus() || !materializer.Leases.InUse(BaseCorpusGeneration) {
+			t.Fatal("a legacy-regime chained view did not lease generation zero")
+		}
+		if !view.ComposesBaseCorpus() {
+			t.Fatal("a view over generation zero does not report composing it")
+		}
+		if got := view.Reader.GetNode(stackCallerID); got == nil || got.StartLine != 5 {
+			t.Fatalf("corpus-only Caller = %+v, want the generation-zero row", got)
+		}
+		if got := view.Reader.GetNode(stackConfigID); got != nil {
+			t.Fatalf("D1 deleted Config by rewriting keep.go, but the view serves %+v", got)
+		}
+
+		ref, err := materializer.MaterializeRefView(ctx, testGraphID, d2)
+		if err != nil {
+			t.Fatalf("MaterializeRefView(d2): %v", err)
+		}
+		defer ref.Close()
+		if !ref.PinsBaseCorpus() {
+			t.Fatal("a ref view of a legacy-regime dirty chain did not lease generation zero")
+		}
+		if got := ref.Reader.GetNode(stackCallerID); got == nil || got.StartLine != 5 {
+			t.Fatalf("ref view corpus-only Caller = %+v", got)
+		}
+	})
+	t.Run("dedicated_root", func(t *testing.T) {
+		store := openStackStore(t, "dirty-chain-dedicated")
+		seedStackCorpus(t, store)
+		// Poison generation zero: a view that reads it instead of the
+		// dedicated root returns line 99.
+		store.AddBatch([]*graph.Node{stackSymbol(stackCallerID, "Caller", graph.KindFunction, stackDepFile, 99)}, nil)
+		base := writeStackBaseGeneration(t, store)
+		seedStackControlPlane(t, store, base)
+		commit, d1, d2 := seedDirtyChainStack(t, store, base)
+		materializer := newTestMaterializer(store)
+
+		view, err := materializer.MaterializeCheckout(ctx, testCheckoutID)
+		if err != nil {
+			t.Fatalf("MaterializeCheckout: %v", err)
+		}
+		defer view.Close()
+		if got := view.Generations(); !slicesEqualInt64(got, []int64{base, commit, d1, d2}) {
+			t.Fatalf("Generations() = %v", got)
+		}
+		if view.PinsBaseCorpus() || materializer.Leases.InUse(BaseCorpusGeneration) {
+			t.Fatal("a chained view over a dedicated root leased generation zero")
+		}
+		if view.ComposesBaseCorpus() {
+			t.Fatal("a chained view over a dedicated root claims to compose generation zero")
+		}
+		if got := view.Reader.GetNode(stackCallerID); got == nil || got.StartLine != 5 {
+			t.Fatalf("Caller = %+v, want the dedicated root's line 5", got)
+		}
+		flat := openStackStore(t, "dirty-chain-dedicated-flat")
+		seedDirtyChainFlatCorpus(t, flat)
+		assertReadersAgree(t, view.Reader, flat)
+	})
+}
+
 // TestMaterializeCheckoutRefusesForeignDirtyChain: a chain parent from another
 // checkout, built under another configuration, or a chain that ends at a
 // commit generation other than the routed one, is refused as view_building

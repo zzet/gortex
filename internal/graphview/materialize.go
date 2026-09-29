@@ -99,7 +99,9 @@ type Materializer struct {
 
 	newGenerationLayer func(context.Context, *store_sqlite.Store) (*GenerationLayer, error)
 
-	// layerCache keeps each published generation's masks across requests.
+	// layerCache keeps each published generation's masks across requests so
+	// a view over an ancestry chain does not re-read them per request. See
+	// generationLayerCache.
 	layerCacheOnce sync.Once
 	layerCache     *generationLayerCache
 }
@@ -192,6 +194,13 @@ func (v *RepoView) PinsBaseCorpus() bool {
 	}
 	return slices.Contains(v.lease.IDs(), BaseCorpusGeneration)
 }
+
+// ComposesBaseCorpus reports whether generation zero is part of this view's
+// composition. A stack rooted in a dedicated full root does not inherit the
+// shared corpus at all (validateDedicatedFullRoot), so nothing generation zero
+// holds can be answered through the view's reader; the lease pins generation
+// zero exactly when the composition reads it (composesBaseCorpus).
+func (v *RepoView) ComposesBaseCorpus() bool { return v.PinsBaseCorpus() }
 
 // Close releases the view's lease. Calling it twice, or on a nil view,
 // does nothing.
