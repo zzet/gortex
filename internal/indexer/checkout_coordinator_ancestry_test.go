@@ -303,6 +303,9 @@ func TestCoordinatorCommitBuildUsesOldestAncestorClosure(t *testing.T) {
 }
 
 func TestCoordinatorDirtyRetriesRetainAndReleaseWholeAncestry(t *testing.T) {
+	// The barrier tears the build with a file it never read; the full
+	// re-sample is the fence that retries on it.
+	t.Setenv(prepublishFullResampleEnv, "1")
 	f, c, ids, tree := coordinatorParsedAncestry(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

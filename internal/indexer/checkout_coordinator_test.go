@@ -973,6 +973,11 @@ func TestCoordinatorCleanCheckoutReachesAReadyRoute(t *testing.T) {
 // build whose checkout moved under it is worth exactly one more attempt, and
 // what gets published is the state the checkout ended in.
 func TestCoordinatorRebuildsOnceWhenTheWorkingTreeMoves(t *testing.T) {
+	// The move below adds a file the build never read. The read-set
+	// prepublish fence publishes the state the build sampled and leaves the
+	// new file to the next cycle (TestPrepublishReadSetAcceptsAnUnrelatedNewFile);
+	// the in-cycle retry pinned here is the full re-sample's.
+	t.Setenv(prepublishFullResampleEnv, "1")
 	f := newCoordinatorFixture(t)
 
 	var once sync.Once
@@ -1390,6 +1395,10 @@ func TestCoordinatorRefusesAWorkingTreeLayerOverAStaleHead(t *testing.T) {
 // collect it on the spot, and the reason stops applying when the reader
 // closes — which is what the janitor's sweep is for.
 func TestCoordinatorSweepCollectsATornAttempt(t *testing.T) {
+	// The tear below adds a file the (empty) build never read, which the
+	// read-set prepublish fence rightly accepts; the full re-sample is the
+	// fence that tears on it, and a torn attempt is what this test sweeps.
+	t.Setenv(prepublishFullResampleEnv, "1")
 	f := newCoordinatorFixture(t)
 	ctx := context.Background()
 
