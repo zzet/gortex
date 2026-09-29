@@ -12,6 +12,9 @@ const (
 	frameworkScopeRetainedRowCap  = 4096
 	frameworkScopeRetainedByteCap = 16 << 20
 	frameworkScopeTokenCap        = 2048
+	// frameworkSeedNameChunk is how many name dependencies the changed-file
+	// seed reads per batch before re-checking the row cap.
+	frameworkSeedNameChunk = 128
 )
 
 // frameworkExecutionScope is intentionally richer than the public legacy
@@ -647,6 +650,16 @@ func (v *frameworkScopedStore) rememberEdge(edge *graph.Edge) bool {
 	return true
 }
 
+// seedAtRowCap reports that no further row can be retained whatever its size:
+// canRetain refuses every row once the row count reaches the cap.
+func (v *frameworkScopedStore) seedAtRowCap() bool {
+	rows := v.retainedRows
+	if v.seed != nil {
+		rows += v.seed.retainedRows
+	}
+	return rows >= frameworkScopeRetainedRowCap
+}
+
 func (v *frameworkScopedStore) canRetain(size int) bool {
 	rows, bytes := v.retainedRows, v.retainedBytes
 	if v.seed != nil {
@@ -731,6 +744,16 @@ func (v *frameworkScopedStore) seedChangedFileFrontier() {
 	outgoing := v.Store.GetOutEdgesByNodeIDs(ids)
 	v.rememberAdjacency(ids, incoming, true)
 	v.rememberAdjacency(ids, outgoing, false)
+	// Every row below is only ever offered to rememberNode, which retains
+	// nothing once the row cap is reached (canRetain). A frontier whose own
+	// rows and adjacency already fill the cap — a large changed file — gains
+	// nothing from reading its endpoints or its name dependencies, and the
+	// name read is the seed's dominant cost (every same-named node of the
+	// repository), so the seed stops here with exactly the retained set it
+	// would have ended with.
+	if v.seedAtRowCap() {
+		return
+	}
 	endpointIDs := make([]string, 0)
 	seenEndpoint := make(map[string]struct{})
 	for _, rows := range []map[string][]*graph.Edge{incoming, outgoing} {
@@ -759,6 +782,9 @@ func (v *frameworkScopedStore) seedChangedFileFrontier() {
 			addFrameworkNodeTokens(tokens, node)
 		}
 	}
+	if v.seedAtRowCap() {
+		return
+	}
 	names := make([]string, 0, len(tokens))
 	for token := range tokens {
 		names = append(names, token)
@@ -767,9 +793,23 @@ func (v *frameworkScopedStore) seedChangedFileFrontier() {
 	if len(names) > frameworkScopeTokenCap {
 		names = names[:frameworkScopeTokenCap]
 	}
-	if len(names) > 0 {
-		for _, matches := range v.Store.FindNodesByNames(names) {
-			for _, node := range matches {
+	// The name dependencies are read in sorted chunks and offered in name,
+	// then identity order, and the read stops once the row cap is reached:
+	// rememberNode retains nothing past it. A large changed file's tokens
+	// match every same-named node of the repository (thousands of rows per
+	// common name), so reading them all to retain the first few hundred is
+	// the seed's dominant cost; the chunked read is bounded by the cap
+	// instead, and the rows the cap keeps no longer depend on map order.
+	for start := 0; start < len(names); start += frameworkSeedNameChunk {
+		if v.seedAtRowCap() {
+			return
+		}
+		chunk := names[start:min(start+frameworkSeedNameChunk, len(names))]
+		matches := v.Store.FindNodesByNames(chunk)
+		for _, name := range chunk {
+			nodes := append([]*graph.Node(nil), matches[name]...)
+			sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+			for _, node := range nodes {
 				v.rememberNode(node)
 			}
 		}
