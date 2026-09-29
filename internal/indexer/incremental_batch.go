@@ -1149,18 +1149,6 @@ func restubIncomingRefsFromView(
 							carried = append(carried, edge)
 						}
 					}
-				} else {
-					// The owner's contract changed: its callers' arguments
-					// go back to the owner (argOfIntoSurvivingOwner) for the
-					// affected-by pass to re-materialize.
-					for _, edge := range view.inByNode[node.ID] {
-						if _, sourceEvicted := evicted[edge.From]; edge == nil || sourceEvicted {
-							continue
-						}
-						if moved := argOfIntoSurvivingOwner(frontier, node, edge); moved != nil {
-							carried = append(carried, moved)
-						}
-					}
 				}
 				continue
 			}
@@ -1181,6 +1169,18 @@ func restubIncomingRefsFromView(
 						if _, duplicate := carriedSeen[edge]; !duplicate {
 							carriedSeen[edge] = struct{}{}
 							carried = append(carried, edge)
+						}
+					}
+				} else {
+					// The owner's contract changed: its callers' arguments
+					// go back to the owner (argOfIntoSurvivingOwner) for the
+					// affected-by pass to re-materialize.
+					for _, edge := range view.inByNode[node.ID] {
+						if _, sourceEvicted := evicted[edge.From]; edge == nil || sourceEvicted {
+							continue
+						}
+						if moved := argOfIntoSurvivingOwner(frontier, node, edge); moved != nil {
+							carried = append(carried, moved)
 						}
 					}
 				}
