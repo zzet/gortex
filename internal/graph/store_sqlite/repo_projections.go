@@ -451,3 +451,36 @@ var (
 	_ graph.RepoFilePathReader          = (*Store)(nil)
 	_ graph.RepoMetaNodeReader          = (*Store)(nil)
 )
+
+// publishedLanguageCountKey keys PublishedRepoLanguageCounts' memo.
+type publishedLanguageCountKey struct {
+	generation int64
+	repoPrefix string
+}
+
+// PublishedRepoLanguageCounts is RepoLanguageCounts for one repository on
+// this handle's generation, memoized on the shared store core. It is only
+// for a published generation above the base: the caller asserts the
+// generation is ready, and a ready generation's node rows never change (a
+// retired generation's id is never reused). The base generation is mutable
+// and is never memoized. Every working-tree build of every checkout stands
+// on the same committed ancestry, and one count of a full dedicated
+// generation reads all of its ~180k node rows (tens of seconds cold on the
+// live store), so the count is paid once per generation per process instead
+// of once per checkout and commit generation. The returned map is shared:
+// callers must not modify it.
+func (s *Store) PublishedRepoLanguageCounts(repoPrefix string) map[string]int {
+	if s.viewGen <= baseViewGeneration || s.coreless() {
+		return s.RepoLanguageCounts([]string{repoPrefix})[repoPrefix]
+	}
+	key := publishedLanguageCountKey{generation: s.viewGen, repoPrefix: repoPrefix}
+	if cached, ok := s.publishedLanguageCounts.Load(key); ok {
+		return cached.(map[string]int)
+	}
+	counts := s.RepoLanguageCounts([]string{repoPrefix})[repoPrefix]
+	if counts == nil {
+		counts = map[string]int{}
+	}
+	actual, _ := s.publishedLanguageCounts.LoadOrStore(key, counts)
+	return actual.(map[string]int)
+}

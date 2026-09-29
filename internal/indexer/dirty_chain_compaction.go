@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"go.uber.org/zap"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -53,9 +54,16 @@ type cycleAdmission struct {
 }
 
 // checkoutLanguageCensus is the language census of the committed state a
-// working-tree layer over commitGeneration composes over: the base corpus
-// plus the commit generation and its committed ancestry, each a
-// generation-scoped grouped count. It is cached per commit generation, which
+// working-tree layer over commitGeneration composes over: the commit
+// generation and its committed ancestry, each a generation-scoped grouped
+// count, plus the base corpus (generation 0) when the view actually composes
+// over it. The materializer stands a chain whose root is a full dedicated
+// generation on that generation alone (graphview's assemble: base =
+// firstHandle), so generation 0 is not part of such a view and is not
+// counted; counting it paid a whole-repository grouped scan of the flat base
+// per coordinator and commit generation for rows the view never serves. A
+// chain whose root is not a dedicated generation, or whose walk did not reach
+// its root, keeps the base count. It is cached per commit generation, which
 // is immutable.
 func (c *CheckoutCoordinator) checkoutLanguageCensus(ctx context.Context, commitGeneration int64) map[string]int {
 	c.compaction.mu.Lock()
@@ -64,13 +72,25 @@ func (c *CheckoutCoordinator) checkoutLanguageCensus(ctx context.Context, commit
 		return cached
 	}
 	c.compaction.mu.Unlock()
+	started := time.Now()
+	counted := 0
 	census := map[string]int{}
-	add := func(generationID int64) {
-		for language, count := range c.store.AtGeneration(generationID).RepoLanguageCounts([]string{c.repoPrefix})[c.repoPrefix] {
+	add := func(generationID int64, published bool) {
+		counted++
+		handle := c.store.AtGeneration(generationID)
+		var counts map[string]int
+		if published {
+			// A ready generation's rows are immutable: its count is shared by
+			// every checkout standing on it and paid once per process.
+			counts = handle.PublishedRepoLanguageCounts(c.repoPrefix)
+		} else {
+			counts = handle.RepoLanguageCounts([]string{c.repoPrefix})[c.repoPrefix]
+		}
+		for language, count := range counts {
 			census[language] += count
 		}
 	}
-	add(0)
+	dedicatedRoot := false
 	seen := map[int64]bool{0: true}
 	id := commitGeneration
 	for depth := 0; id > 0 && !seen[id] && depth < graphview.MaxGenerationAncestryDepth; depth++ {
@@ -79,8 +99,14 @@ func (c *CheckoutCoordinator) checkoutLanguageCensus(ctx context.Context, commit
 		if err != nil || !found {
 			break
 		}
-		add(id)
+		add(id, row.State == store_sqlite.ViewGenerationReady)
+		if row.BaseGenerationID <= 0 {
+			dedicatedRoot = row.GenerationKind == dedicatedGenerationKind
+		}
 		id = row.BaseGenerationID
+	}
+	if !dedicatedRoot {
+		add(0, false)
 	}
 	c.compaction.mu.Lock()
 	if c.compaction.census == nil {
@@ -91,6 +117,19 @@ func (c *CheckoutCoordinator) checkoutLanguageCensus(ctx context.Context, commit
 	}
 	c.compaction.census[commitGeneration] = census
 	c.compaction.mu.Unlock()
+	// The one cold cost of the census: a whole-generation count per level the
+	// process has not counted yet (the published ones are memoized per
+	// process), paid only by a build whose own files leave an enrichable
+	// language below the admission floor.
+	if c.logger == nil {
+		return census
+	}
+	c.logger.Info("indexer: checkout language census counted",
+		zap.String("checkout", c.checkoutID),
+		zap.Int64("commit_generation", commitGeneration),
+		zap.Int("generations", counted),
+		zap.Bool("base_counted", !dedicatedRoot),
+		zap.Duration("elapsed", time.Since(started)))
 	return census
 }
 
@@ -158,3 +197,7 @@ func (c *CheckoutCoordinator) noteForegroundCycle(ended time.Time) {
 		k.lastForeground = ended
 	}
 }
+
+// dedicatedGenerationKind is the catalog kind of a dedicated graph's
+// generations; a chain rooted at one does not compose over generation 0.
+const dedicatedGenerationKind = "dedicated"

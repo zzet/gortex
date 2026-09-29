@@ -112,6 +112,10 @@ type storeCore struct {
 	// int64 generation; values are *sync.Mutex. See ResolveMutex.
 	resolveLanes sync.Map
 
+	// publishedLanguageCounts memoizes immutable READY-generation language
+	// counts; mutable generation zero is never memoized.
+	publishedLanguageCounts sync.Map
+
 	// walReclaimNudged asks the WAL reclaim loop to attempt at its next poll
 	// regardless of backoff (a residue drain handed it a busy TRUNCATE).
 	walReclaimNudged atomic.Bool
