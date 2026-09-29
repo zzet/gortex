@@ -284,24 +284,37 @@ func contractGraphRows(store graph.Store, all []contracts.Contract, includeDepen
 		}
 		all = eligible
 	}
+	// A contract ID shared by several records (an environment variable read in
+	// two files, a route with a provider and consumers) is ONE node. Its row is
+	// the record that sorts first by contractNodeRecordLess — the smallest file
+	// — so the node a whole index writes
+	// and the one a per-file refresh re-emits (which re-emits every sibling of
+	// a touched ID) are the same whatever order the registry — a map, filled by
+	// parallel extraction — listed the records in. Every record keeps its own
+	// ownership edges.
+	all = append([]contracts.Contract(nil), all...)
+	sort.SliceStable(all, func(i, j int) bool { return contractNodeRecordLess(all[i], all[j]) })
 	fileOwners := contractFileOwners(store, all)
 	symbolOwners := contractSymbolOwners(store, all)
 	nodes = make([]*graph.Node, 0, len(all))
 	edges = make([]*graph.Edge, 0, len(all)*2)
-	for _, c := range all {
+	for i, c := range all {
 		ownerID := contractOwnerEndpoint(c, fileOwners, symbolOwners)
 		if ownerID == "" {
 			missingSourceOwners++
 		}
-		nodes = append(nodes, &graph.Node{
-			ID: c.ID, Kind: graph.KindContract, Name: c.ID, FilePath: c.FilePath, Language: "contract",
-			RepoPrefix: c.RepoPrefix, WorkspaceID: c.EffectiveWorkspace(), ProjectID: c.EffectiveProject(),
-			Meta: map[string]any{
-				"type": string(c.Type), "role": string(c.Role), "symbol_id": c.SymbolID,
-				"line": c.Line, "confidence": c.Confidence, "contract_meta": c.Meta,
-				"contract_owner_record": ownerID != "",
-			},
-		})
+		// Only the ID's first record writes its node.
+		if i == 0 || all[i-1].ID != c.ID {
+			nodes = append(nodes, &graph.Node{
+				ID: c.ID, Kind: graph.KindContract, Name: c.ID, FilePath: c.FilePath, Language: "contract",
+				RepoPrefix: c.RepoPrefix, WorkspaceID: c.EffectiveWorkspace(), ProjectID: c.EffectiveProject(),
+				Meta: map[string]any{
+					"type": string(c.Type), "role": string(c.Role), "symbol_id": c.SymbolID,
+					"line": c.Line, "confidence": c.Confidence, "contract_meta": c.Meta,
+					"contract_owner_record": ownerID != "",
+				},
+			})
+		}
 		if ownerID == "" {
 			continue
 		}
@@ -385,6 +398,24 @@ func (idx *Indexer) commitIncrementalContractFiles(
 	for _, id := range ids {
 		current = append(current, reg.ByID(id)...)
 	}
+	// The same holds for an ID the changed files introduce: a record another
+	// file already holds for it may be the one that writes its node
+	// (contractGraphRows), so every record of every touched ID is re-emitted.
+	changedIDs := make(map[string]struct{}, len(current))
+	for _, contract := range current {
+		changedIDs[contract.ID] = struct{}{}
+	}
+	for _, id := range ids {
+		delete(changedIDs, id)
+	}
+	newIDs := make([]string, 0, len(changedIDs))
+	for id := range changedIDs {
+		newIDs = append(newIDs, id)
+	}
+	sort.Strings(newIDs)
+	for _, id := range newIDs {
+		current = append(current, reg.ByID(id)...)
+	}
 	seen := make(map[string]struct{}, len(current))
 	unique := current[:0]
 	for _, contract := range current {
@@ -415,6 +446,24 @@ func (idx *Indexer) commitIncrementalContractFiles(
 		idx.logger.Warn("incremental contract owner replacement failed: " + err.Error())
 	}
 	idx.contractRegistry = reg
+}
+
+// contractNodeRecordLess orders the records of one contract ID for the choice
+// of the record its node carries: by ID, then file, symbol, role and line —
+// the registry key's order, completed by the line.
+func contractNodeRecordLess(a, b contracts.Contract) bool {
+	switch {
+	case a.ID != b.ID:
+		return a.ID < b.ID
+	case a.FilePath != b.FilePath:
+		return a.FilePath < b.FilePath
+	case a.SymbolID != b.SymbolID:
+		return a.SymbolID < b.SymbolID
+	case a.Role != b.Role:
+		return a.Role < b.Role
+	default:
+		return a.Line < b.Line
+	}
 }
 
 func contractRegistryKey(contract contracts.Contract) string {

@@ -416,6 +416,10 @@ type BuildReport struct {
 	// the resolver's repo-scoped stubs. Each one is tombstoned, so the count is
 	// how much of the payload the file masks could not reach on their own.
 	UnmaskedPayloadNodes int
+	// OrphanStubTombstones counts the pathless stubs the generation withdraws
+	// because the files it replaces or deletes held their last references
+	// (graph.OrphanedPathlessStubs); they are tombstoned with no row.
+	OrphanStubTombstones int
 
 	// ContestedEdgeSources counts the pathless edge sources whose adjacency the
 	// generation replaced while the layer below still carried edges from them
@@ -1930,6 +1934,22 @@ func (b *SparseGenerationBuilder) writeMasks(
 		}
 		tombstones = append(tombstones, node.ID)
 		report.UnmaskedPayloadNodes++
+	}
+	// A pathless stub (a builtin sentinel, a stdlib or dependency symbol)
+	// whose last references the layer below held in the files this
+	// generation replaces or deletes is withdrawn with them: a whole index of
+	// the tree has no such stub, and no file mask can reach it.
+	if req.Base != nil {
+		claimed := make(map[string]struct{}, len(covered)+len(plan.deleted))
+		for graphPath := range covered {
+			claimed[graphPath] = struct{}{}
+		}
+		for _, rel := range plan.deleted {
+			claimed[builderGraphPath(req.RepoPrefix, rel)] = struct{}{}
+		}
+		orphans := graph.OrphanedPathlessStubs(req.Base, claimed, nodes, handle.AllEdges())
+		tombstones = append(tombstones, orphans...)
+		report.OrphanStubTombstones = len(orphans)
 	}
 	sort.Strings(tombstones)
 	if err := handle.SetNodeTombstones(tombstones); err != nil {

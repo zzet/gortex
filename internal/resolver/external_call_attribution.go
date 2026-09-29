@@ -136,14 +136,14 @@ func (r *Resolver) materializeGoExternalSeen(seen map[extKey]struct{}) {
 	for k := range seen {
 		mk := modKey{repoPrefix: k.repoPrefix, importPath: k.importPath}
 		module := modules[mk]
+		role := goExternalModuleRole(k.prefix)
+		if module != nil && goExternalModuleRoleRank(role) > goExternalModuleRoleRank(module.Meta["role"]) {
+			// One module reached through several terminal shapes (a call
+			// bound to `dep::`, an import landing on `external::`) carries
+			// the strongest role whatever order the keys were visited in.
+			module.Meta["role"] = role
+		}
 		if module == nil {
-			role := "external"
-			switch k.prefix {
-			case "stdlib::":
-				role = "stdlib"
-			case "dep::":
-				role = "dep"
-			}
 			module = &graph.Node{
 				ID:         graph.StubID(k.repoPrefix, graph.StubKindModule, "go:"+k.importPath),
 				Kind:       graph.KindModule,
@@ -205,6 +205,28 @@ func (r *Resolver) materializeGoExternalSeen(seen map[extKey]struct{}) {
 		ids = append(ids, id)
 	}
 	existingNodes := graph.LookupExistingNodeIDs(r.graph, ids)
+	// A module node that already exists is rewritten only when this pass
+	// reaches it with a stronger role, so the stored role is the strongest
+	// one any pass saw — the same row a whole index writes, whichever pass
+	// (an import leg, a call leg) minted the module first.
+	upgrade := map[string]bool{}
+	if len(modules) > 0 {
+		moduleIDs := make([]string, 0, len(modules))
+		for _, module := range modules {
+			if _, exists := existingNodes[module.ID]; exists {
+				moduleIDs = append(moduleIDs, module.ID)
+			}
+		}
+		if len(moduleIDs) > 0 {
+			stored := r.graph.GetNodesByIDs(moduleIDs)
+			for _, module := range modules {
+				if prior := stored[module.ID]; prior != nil &&
+					goExternalModuleRoleRank(module.Meta["role"]) > goExternalModuleRoleRank(prior.Meta["role"]) {
+					upgrade[module.ID] = true
+				}
+			}
+		}
+	}
 	endpoints := make([]graph.EdgeEndpoint, 0, len(endpointSet))
 	endpointsBySymbol := make(map[string][]graph.EdgeEndpoint, len(symbols))
 	for endpoint := range endpointSet {
@@ -225,7 +247,7 @@ func (r *Resolver) materializeGoExternalSeen(seen map[extKey]struct{}) {
 		edges = edges[:0]
 	}
 	for _, module := range modules {
-		if _, exists := existingNodes[module.ID]; !exists {
+		if _, exists := existingNodes[module.ID]; !exists || upgrade[module.ID] {
 			nodes = append(nodes, module)
 		}
 		if len(nodes) >= materializeBatchSize {
@@ -249,6 +271,35 @@ func (r *Resolver) materializeGoExternalSeen(seen map[extKey]struct{}) {
 		}
 	}
 	flush()
+}
+
+// goExternalModuleRole is the role a Go module node gets from one terminal
+// prefix.
+func goExternalModuleRole(prefix string) string {
+	switch prefix {
+	case "stdlib::":
+		return "stdlib"
+	case "dep::":
+		return "dep"
+	default:
+		return "external"
+	}
+}
+
+// goExternalModuleRoleRank orders module roles: a module reached as a
+// declared dependency (or the standard library) is described by that, not by
+// the weaker "external" an unmatched import gives it.
+func goExternalModuleRoleRank(role any) int {
+	switch role {
+	case "stdlib":
+		return 3
+	case "dep":
+		return 2
+	case "external":
+		return 1
+	default:
+		return 0
+	}
 }
 
 // splitGoExternalTarget recognises the three external-target prefixes

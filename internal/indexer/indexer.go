@@ -518,6 +518,16 @@ type Indexer struct {
 	// two claims distinct. A fresh Indexer per daemon run starts it false.
 	reparsedThisRun atomic.Bool
 
+	// forcedReparse names the files (absolute, cleaned) a per-save batch must
+	// re-derive from source even when their bytes are unchanged: the
+	// surviving importers of a deleted file (deletion_importers.go). Set and
+	// cleared by reindexIncrementalFilesBatched, under the repository lane.
+	forcedReparse map[string]struct{}
+	// deletionReparsePaths names the files (graph paths) the same batch
+	// re-derives from source; the deletion leaves their references to the
+	// reparse instead of parking them.
+	deletionReparsePaths map[string]struct{}
+
 	// deferGlobalPasses, when set, makes IndexCtx and IncrementalReindexPaths
 	// skip the graph-wide derivation passes (InferImplements,
 	// InferOverrides, markTestSymbolsAndEmitEdges). These passes walk the
@@ -1174,6 +1184,7 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 		reporter.Report("resolving references", 0, 0)
 		idx.populateCppIncludeDirs(false)
 		idx.resolver.ResolveAll()
+		idx.materializeDataflowParams()
 	}
 	dResolve = time.Since(tphase)
 	tphase = time.Now()
@@ -3940,6 +3951,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					if !skipped && !omitSecondarySourceScans {
 						idx.applyCoverageDomains(relPath, lang, src, result)
 					}
+					if !skipped {
+						stampExtractionGraphFingerprint(result)
+					}
 
 					idx.applyRepoPrefix(result.Nodes, result.Edges)
 
@@ -4322,6 +4336,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		resolveStarted := time.Now()
 		resolveStats := idx.resolver.ResolveAll()
 		idx.logResolvePass(resolveStats, time.Since(resolveStarted))
+		idx.materializeDataflowParams()
 
 		// Infer structural interface satisfaction + method-level
 		// overrides. Skipped under deferGlobalPasses so a batch caller

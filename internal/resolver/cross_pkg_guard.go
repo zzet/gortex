@@ -84,6 +84,13 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		if !isCallLikeEdge(j.kind) {
 			continue
 		}
+		// A parked reference that bound back to its own prior target is the
+		// binding the whole index already judged with the extractor's
+		// target; re-judging it on the restub's bare placeholder would give
+		// the per-save path a different answer from the same tree.
+		if j.restubRoundTrip {
+			continue
+		}
 		// Only the two weakest tiers — a name-only guess — are in scope.
 		// DefaultOriginFor backfills the tier for edges whose Origin the
 		// resolver left unset (the heuristic fallbacks never stamp it).
@@ -171,6 +178,23 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 	}
 	if len(provBatch) > 0 {
 		r.graph.SetEdgeProvenanceBatch(provBatch)
+		// The reindex below persists each edge struct as it stands. The
+		// in-memory store's SetEdgeProvenance clears Origin on this very
+		// pointer, but a store that answers reads with copies (the per-file
+		// delta writer) may leave the caller's copy untouched, and the
+		// reverted row would then keep the abandoned bind's origin — a row a
+		// whole index (which reverts in memory) never writes. Apply the same
+		// clear to the struct, with SetEdgeProvenance's Tier rule; on the
+		// in-memory store it is already done.
+		for _, u := range provBatch {
+			if u.Edge == nil || u.Edge.Origin == u.NewOrigin {
+				continue
+			}
+			u.Edge.Origin = u.NewOrigin
+			if u.Edge.Tier != "" {
+				u.Edge.Tier = graph.ResolvedBy(u.NewOrigin)
+			}
+		}
 	}
 	if len(reindexBatch) > 0 {
 		r.graph.ReindexEdges(reindexBatch)

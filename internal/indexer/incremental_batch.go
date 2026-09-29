@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"go.uber.org/zap"
 
@@ -98,6 +99,34 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		idx.ensureIncrementalContractRegistry()
 	}
 	var invalidation DerivedInvalidationPlan
+	// The surviving importers of a deleted file are re-derived from source in
+	// this batch (deletion_importers.go), read before the eviction removes
+	// the in-edges that name them.
+	if importers := idx.deletionImporterFiles(deletedFiles, staleFiles); len(importers) > 0 {
+		staleFiles = appendUniqueSorted(append([]string(nil), staleFiles...), importers...)
+		// A caller may already force files of its own (the per-file delta
+		// forces its change set); the importers join them for this batch.
+		prior := idx.forcedReparse
+		forced := make(map[string]struct{}, len(prior)+len(importers))
+		for path := range prior {
+			forced[path] = struct{}{}
+		}
+		for _, path := range importers {
+			forced[path] = struct{}{}
+		}
+		idx.forcedReparse = forced
+		defer func() { idx.forcedReparse = prior }()
+	}
+	// A reference recorded in a file this batch re-derives from source is not
+	// parked by the deletion: the reparse re-emits it from the extractor, and
+	// a parked copy under the same key would shadow the fresh row.
+	if len(deletedFiles) > 0 && len(staleFiles) > 0 {
+		idx.deletionReparsePaths = make(map[string]struct{}, len(staleFiles))
+		for _, path := range staleFiles {
+			idx.deletionReparsePaths[idx.prefixPath(idx.relKey(path))] = struct{}{}
+		}
+		defer func() { idx.deletionReparsePaths = nil }()
+	}
 	deleteTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "graph_delete",
 		zap.Int("deleted_files", len(deletedFiles)))
 	defer deleteTiming.abort()
@@ -238,7 +267,11 @@ func (idx *Indexer) reindexIncrementalChunk(
 		}
 		consumed++
 
-		if probeOK && storedGraph.semantic != "" &&
+		// An importer of a deleted file is re-derived from source as a
+		// structural stage whatever its fingerprints say
+		// (deletion_importers.go).
+		forced := idx.forceReparse(filePath)
+		if !forced && probeOK && storedGraph.semantic != "" &&
 			probe.fingerprints.semantic == storedGraph.semantic &&
 			probe.fingerprints.metadata == storedGraph.metadata {
 			idx.discardPreparedExtraction(filePath)
@@ -285,7 +318,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 			relPath:     prepared.relPath, graphPath: graphPath,
 			src: prepared.src, result: prepared.result, prepared: prepared, priorNodes: priorNodes,
 			storedGraph: storedGraph, storedDerived: storedDerived, probe: probe,
-			metadataOnly: storedGraph.semantic != "" &&
+			metadataOnly: !forced && storedGraph.semantic != "" &&
 				probe.fingerprints.semantic == storedGraph.semantic,
 		}
 		stage.bytes = estimateParseGraphBytes(stage.result.Nodes, stage.result.Edges) + int64(len(stage.src))
@@ -506,6 +539,13 @@ func (idx *Indexer) commitIncrementalStages(
 			stage.reuse, stage.priorPending = nil, nil
 			stage.metadataOnly = false
 		}
+		// The importer of a deleted file is re-derived because what its
+		// references bind to changed: neither the prior resolutions nor the
+		// references the deletion just parked may short-cut its resolution.
+		if idx.forceReparse(stage.absPath) {
+			stage.reuse, stage.priorPending = nil, nil
+			stage.metadataOnly = false
+		}
 	}
 
 	// A metadata-only edge refresh cannot safely race a sibling structural
@@ -718,6 +758,7 @@ func applyResolvedOutEdgesFromView(
 		return 0
 	}
 	reused := 0
+	var retargeted []graph.EdgeReindex
 	for _, edge := range edges {
 		if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
 			continue
@@ -735,14 +776,21 @@ func applyResolvedOutEdgesFromView(
 		if _, ok := existing[value.to]; !ok {
 			continue
 		}
+		oldTo := edge.To
 		edge.To = value.to
 		edge.Confidence = value.confidence
 		edge.ConfidenceLabel = value.confLabel
 		edge.Origin = value.origin
 		edge.Tier = value.tier
 		applyReuseResolutionTag(edge, value.resolution)
+		retargeted = append(retargeted, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
 		reused++
 	}
+	// A re-used reference is bound here, not by a resolution batch, so the
+	// from-side placeholder move a batch triggers has to happen here too: the
+	// dataflow edges the extractor keyed from its placeholder at the same site
+	// take the bound source, as in a whole index.
+	resolver.RepointPlaceholderSourcesInBatch(edges, retargeted)
 	return reused
 }
 
@@ -829,7 +877,9 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	}
 
 	carried := restubIncomingRefsFromView(idx.graph, stages, view)
-	// Capture capability state before eviction removes its rows.
+	// The capability state of the files, read before the eviction below
+	// deletes it; the carried set says which incoming accesses_field rows
+	// survive it.
 	idx.noteCapabilityPrior(captureCapabilityPrior(stages, view, carried))
 	// Canonical FTS lifetime follows the backend's atomic owner decision.
 	// Retained contracts keep existing rows; actual orphans are deleted there.
@@ -841,6 +891,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	// alone has to be re-stated here or it is lost. See
 	// restubIncomingRefsFromView.
 	idx.graph.AddBatch(nodes, append(edges, carried...))
+	idx.relinkImportNodesToModules(nodes)
 
 	if !deferResolverCatchup {
 		idx.observeIncrementalCatchup("resolve", paths)
@@ -851,7 +902,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		idx.resolver.SetPriorDeclarations(nil)
 		idx.observeIncrementalCatchup("dataflow", paths)
 		idx.materializeDataflowParamsForStages(stages)
-	} else if markerBatch != nil {
+	} else {
 		markerBatch.recordDeferredResolverEvidence(idx.resolver.EvidenceScoping(), stagePriorDeclarations(stages), priorPending)
 	}
 
@@ -1072,17 +1123,91 @@ func restubIncomingRefsFromView(
 	view incrementalPriorView,
 ) []*graph.Edge {
 	evicted := structuralPriorIDs(stages)
+	reparsed := reparsedPaths(stages)
 	var reindexes []graph.EdgeReindex
 	var carried []*graph.Edge
 	carriedSeen := make(map[*graph.Edge]struct{})
 	for _, stage := range stages {
 		frontier := restubFrontierForStage(stage, view)
 		for _, node := range stage.priorNodes {
+			if node != nil && node.Kind == graph.KindFile {
+				// Another file's import of this one is recorded in the
+				// importer and names this file node, whose identity (the
+				// path) survives its own reparse. The eviction deletes the
+				// row and no pass of this save re-derives it — the importer
+				// is not reparsed — so re-state it.
+				if _, survives := frontier.survivingIDs[node.ID]; survives || frontier.conservative {
+					for _, edge := range view.inByNode[node.ID] {
+						if edge == nil || edge.Kind != graph.EdgeImports {
+							continue
+						}
+						if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
+							continue
+						}
+						if _, duplicate := carriedSeen[edge]; !duplicate {
+							carriedSeen[edge] = struct{}{}
+							carried = append(carried, edge)
+						}
+					}
+				}
+				continue
+			}
+			if node != nil && node.Kind == graph.KindParam {
+				// An argument another file passes into this parameter is
+				// recorded in the caller and names the parameter's identity.
+				// While the owner and its contract survive, the dataflow pass
+				// re-derives the parameter under the same identity and the row
+				// the eviction deletes is the one a whole index holds.
+				if carryIntoParam(frontier, stage, node) {
+					for _, edge := range view.inByNode[node.ID] {
+						if edge == nil || !callerOwnedDataflowIn(edge.Kind) || graph.IsUnresolvedTarget(edge.To) {
+							continue
+						}
+						if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
+							continue
+						}
+						if _, duplicate := carriedSeen[edge]; !duplicate {
+							carriedSeen[edge] = struct{}{}
+							carried = append(carried, edge)
+						}
+					}
+				}
+				continue
+			}
 			if node == nil || node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
 				continue
 			}
 			restub := frontier.requiresRestub(node)
 			stub := graph.UnresolvedMarker + node.Name
+			// The sites (file, line) of the references another file keeps
+			// into this definition, and the repository prefix their
+			// placeholder carries: the dataflow edges keyed FROM the
+			// definition at those sites follow the reference below.
+			var refSites map[dataflowSourceSite]string
+			for _, edge := range view.inByNode[node.ID] {
+				if edge == nil || !graph.IsResolvableRefEdge(edge.Kind) || graph.IsUnresolvedTarget(edge.To) {
+					continue
+				}
+				if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
+					continue
+				}
+				if refSites == nil {
+					refSites = make(map[dataflowSourceSite]string)
+				}
+				site := dataflowSourceSite{filePath: edge.FilePath, line: edge.Line}
+				if _, seen := refSites[site]; !seen {
+					refSites[site] = graph.RepoPrefixOfID(edge.From)
+				}
+			}
+			if len(refSites) > 0 || !restub {
+				for _, edge := range dataflowSourcesFollowingReferences(
+					view.outByNode[node.ID], refSites, reparsed, restub, stub) {
+					if _, duplicate := carriedSeen[edge]; !duplicate {
+						carriedSeen[edge] = struct{}{}
+						carried = append(carried, edge)
+					}
+				}
+			}
 			for _, edge := range view.inByNode[node.ID] {
 				if edge != nil && edge.Kind == graph.EdgeAccessesField {
 					// A derived field access into a definition whose ID and
@@ -1093,6 +1218,22 @@ func restubIncomingRefsFromView(
 					// instead of losing it; the capability pass re-derives
 					// the rest (captureCapabilityPrior's restoration set).
 					if _, sourceEvicted := evicted[edge.From]; !sourceEvicted && !restub {
+						if _, duplicate := carriedSeen[edge]; !duplicate {
+							carriedSeen[edge] = struct{}{}
+							carried = append(carried, edge)
+						}
+					}
+					continue
+				}
+				if edge != nil && callerOwnedDataflowIn(edge.Kind) {
+					// A dataflow edge another file records into this
+					// definition (an argument it passes, a value a closure
+					// captures) is derived from that file's source and the
+					// target's identity alone. While the identity and the
+					// contract survive, the row the eviction would delete is
+					// the row a whole index of the edited tree holds, and no
+					// pass of this save re-derives it: re-state it.
+					if _, sourceEvicted := evicted[edge.From]; !sourceEvicted && !restub && !graph.IsUnresolvedTarget(edge.To) {
 						if _, duplicate := carriedSeen[edge]; !duplicate {
 							carriedSeen[edge] = struct{}{}
 							carried = append(carried, edge)
@@ -1127,6 +1268,93 @@ func restubIncomingRefsFromView(
 	return carried
 }
 
+// dataflowSourceSite is a reference's site: the file that records it and its
+// line.
+type dataflowSourceSite struct {
+	filePath string
+	line     int
+}
+
+// reparsedPaths is the set of graph paths the batch re-parses.
+func reparsedPaths(stages []*incrementalBatchStage) map[string]struct{} {
+	out := make(map[string]struct{}, len(stages))
+	for _, stage := range stages {
+		if stage != nil {
+			out[stage.graphPath] = struct{}{}
+		}
+	}
+	return out
+}
+
+// dataflowSourcesFollowingReferences decides the edges another file records
+// FROM a re-parsed definition, and returns the rows to re-state.
+//
+// The eviction of the re-parsed file deletes every edge out of the
+// definition, including rows recorded in files this save does not re-parse
+// (the value a caller's file takes from it: value_flow, returns_to, and
+// arg_of when its result is passed on), and no pass of the save re-derives
+// them. They are derived from the recording file's source and the
+// definition's identity:
+//
+//   - the definition's identity and contract survive (no restub): a whole
+//     index of the edited tree holds exactly these rows, so all of them are
+//     re-stated — the whole set, so a store that composes the re-stated
+//     source over the layer below sees it unchanged;
+//   - the references into it are parked under the name's stub: a whole index
+//     keys a dataflow edge (arg_of, value_flow) from the placeholder of the
+//     reference at its site and moves it to what the reference binds to, so
+//     the dataflow rows at a parked reference's site are re-stated keyed from
+//     the stub's placeholder, and the incoming leg's placeholder move
+//     re-points them to whatever the reference binds to — or leaves them on
+//     the placeholder, as a whole index does, when it stays unresolved.
+//
+// The rows ride the re-stated batch after the eviction (never a reindex of the
+// doomed row, whose identity refresh would void the mutation receipt). Rows
+// recorded in a re-parsed file are left alone: its fresh extraction re-emits
+// them.
+func dataflowSourcesFollowingReferences(
+	out []*graph.Edge,
+	refSites map[dataflowSourceSite]string,
+	reparsed map[string]struct{},
+	restub bool,
+	stub string,
+) []*graph.Edge {
+	var restate []*graph.Edge
+	for _, edge := range out {
+		if edge == nil || edge.FilePath == "" {
+			continue
+		}
+		if _, own := reparsed[edge.FilePath]; own {
+			continue
+		}
+		if !restub {
+			restate = append(restate, edge)
+			continue
+		}
+		if !graph.PlaceholderSourceKind(edge.Kind) {
+			continue
+		}
+		prefix, atReference := refSites[dataflowSourceSite{filePath: edge.FilePath, line: edge.Line}]
+		if !atReference {
+			continue
+		}
+		parked := *edge
+		parked.From = stub
+		if prefix != "" {
+			parked.From = prefix + "/" + stub
+		}
+		restate = append(restate, &parked)
+	}
+	return restate
+}
+
+// callerOwnedDataflowIn reports the dataflow edge kinds a caller's file records
+// into a definition elsewhere, re-stated by the restub step while the
+// definition's identity and contract survive.
+func callerOwnedDataflowIn(kind graph.EdgeKind) bool {
+	return kind == graph.EdgeArgOf || kind == graph.EdgeCaptures
+}
+
 func evictFilesBatched(g graph.Store, paths []string) (int, int) {
 	paths = appendUniqueSorted(nil, paths...)
 	// Only the caller's own spellings are evicted. Rows a pre-fix binary
@@ -1140,16 +1368,44 @@ func evictFilesBatched(g graph.Store, paths []string) (int, int) {
 	if len(paths) == 0 {
 		return 0, 0
 	}
+	var nodes, edges int
 	if batch, ok := g.(graph.FileBatchEvicter); ok {
-		return batch.EvictFiles(paths)
+		nodes, edges = batch.EvictFiles(paths)
+	} else {
+		for _, path := range paths {
+			n, e := g.EvictFile(path)
+			nodes += n
+			edges += e
+		}
 	}
-	nodes, edges := 0, 0
-	for _, path := range paths {
-		n, e := g.EvictFile(path)
-		nodes += n
-		edges += e
+	return nodes, edges + evictDetachedRecordedEdges(g, paths)
+}
+
+// evictDetachedRecordedEdges removes the edges recorded in paths that the
+// file eviction leaves behind: the ones whose source is no node (a dataflow
+// edge keyed from a call's placeholder, or from the stdlib / dependency stub
+// the placeholder was moved to). The eviction takes every edge touching one
+// of the files' nodes; these touch none, so a re-parse used to keep them next
+// to the fresh extraction's rows — the old site's row survived an edit that
+// moved the call to another line, which a whole index never shows. It runs
+// after the eviction, when the paths are covered, so a writer that tracks
+// ownership by recording file owns these rows. A store that cannot serve rows
+// by recording file keeps the old behaviour.
+func evictDetachedRecordedEdges(g graph.Store, paths []string) int {
+	reader, ok := graph.RecordedEdgesOf(g)
+	if !ok {
+		return 0
 	}
-	return nodes, edges
+	var doomed []*graph.Edge
+	for _, edge := range reader.RecordedEdgesAt(paths) {
+		if edge != nil && (strings.Contains(edge.From, graph.UnresolvedMarker) || graph.IsStub(edge.From)) {
+			doomed = append(doomed, edge)
+		}
+	}
+	if len(doomed) == 0 {
+		return 0
+	}
+	return graph.RemoveEdgesExact(g, doomed)
 }
 
 func (idx *Indexer) deleteSymbolFTS(nodeIDs []string) {
@@ -1912,6 +2168,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 			_ = i
 		}
 		view := loadIncrementalPriorView(idx.graph, stages)
+		view.inByNode = withoutEdgesRecordedAt(view.inByNode, idx.deletionReparsePaths)
 		plan.ContractBridgeNodeIDs = appendUniqueSorted(
 			plan.ContractBridgeNodeIDs,
 			contractBridgeNodeIDsFromPriorView(stages, view)...,

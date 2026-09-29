@@ -92,15 +92,41 @@ func (r *Resolver) EvidenceScoping() bool {
 // changing what can bind to it.
 type DeclarationSurface map[string]string
 
-// surfacePositionalMetaKeys are node Meta entries that describe where or how
-// large a declaration's body is, never what can bind to it. They change on an
-// ordinary body edit and nothing in resolution reads them; every other Meta
-// entry is part of the surface, so an unrecognised key can only make the
-// surface compare unequal (the conservative direction).
+// surfacePositionalMetaKeys are node Meta entries that describe where, how
+// large or what shape a declaration's body is, never what can bind to it. They
+// change on an ordinary body edit and nothing in resolution reads them; every
+// other Meta entry is part of the surface, so an unrecognised key can only make
+// the surface compare unequal (the conservative direction).
+//
+// Besides the size keys this covers the body metrics the extractors stamp
+// (parser/languages/helpers_complexity.go) and the body-derived keys the
+// indexer's derived fingerprint already sets aside (clone_sig and the body
+// texts, indexer/file_delta.go). clone_sig matters most: a whole index stamps
+// it on every function, while a freshly extracted declaration does not carry
+// it until the clone pass runs, so leaving it in made every declaration of an
+// edited file compare changed and re-opened every parked reference on every
+// name the file declares — each save of config.go re-attempted, and re-wrote,
+// the thousands of `*.Load` references parked across the repository.
 var surfacePositionalMetaKeys = map[string]struct{}{
 	"complexity": {},
 	"loc":        {},
 	"lines":      {},
+	// body metrics
+	"cognitive":           {},
+	"loop_depth":          {},
+	"max_access_depth":    {},
+	"linear_scan_in_loop": {},
+	"alloc_in_loop":       {},
+	"recursion_in_loop":   {},
+	// body-derived texts and signatures
+	"clone_sig":   {},
+	"body":        {},
+	"body_hash":   {},
+	"body_text":   {},
+	"content":     {},
+	"raw_source":  {},
+	"snippet":     {},
+	"source_text": {},
 }
 
 // DeclarationSurfaceOf derives the declaration surface of one file's nodes.

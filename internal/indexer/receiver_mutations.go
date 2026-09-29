@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -33,6 +34,51 @@ var stdlibMutators = map[string]bool{
 
 func isStdlibMutator(name string) bool { return stdlibMutators[name] }
 
+// receiverOwnerKey identifies the type a method or field belongs to: its
+// receiver type name qualified by the package directory of the declaring file
+// (the file part of the node ID). The receiver-call facts this fixpoint reads
+// are Go's, where a method's receiver type and that type's fields are always
+// declared in the method's own package, so the directory makes the owner exact
+// where the bare name is not: two packages each declaring a type Server with a
+// field store must never share one owner, or which package's field a call binds
+// to would depend on scan order. Empty when the receiver is.
+func receiverOwnerKey(nodeID, receiver string) string {
+	if receiver == "" {
+		return ""
+	}
+	file := nodeID
+	if i := strings.Index(file, "::"); i >= 0 {
+		file = file[:i]
+	}
+	dir := ""
+	if i := strings.LastIndex(file, "/"); i >= 0 {
+		dir = file[:i]
+	}
+	return dir + "\x00" + receiver
+}
+
+// receiverCallLess is the order the fixpoint visits receiver calls in: by
+// caller, then site, then callee. The emitted edge of a (caller, field, via)
+// triple carries the site of the first call visited, so the order has to be a
+// total one over the facts themselves, never the order a store listed them.
+func receiverCallLess(aFrom, aFile string, aLine int, aCallee, aField string, aSelf bool,
+	bFrom, bFile string, bLine int, bCallee, bField string, bSelf bool) bool {
+	switch {
+	case aFrom != bFrom:
+		return aFrom < bFrom
+	case aFile != bFile:
+		return aFile < bFile
+	case aLine != bLine:
+		return aLine < bLine
+	case aCallee != bCallee:
+		return aCallee < bCallee
+	case aField != bField:
+		return aField < bField
+	default:
+		return !aSelf && bSelf
+	}
+}
+
 // bareCallName returns the trailing method name of an edge target id, stripping
 // any repo / unresolved / package qualifier ("unresolved::*.Store" → "Store").
 func bareCallName(id string) string {
@@ -58,13 +104,13 @@ func indirectMutationEdges(g graph.Store) []indirectMutSpec {
 	if scanner, ok := g.(graph.ReceiverMutationScanner); ok {
 		return indirectMutationEdgesProjected(scanner)
 	}
-	recvType := map[string]string{} // methodID → its receiver type
+	recvType := map[string]string{} // methodID → its receiver owner (receiverOwnerKey)
 	for n := range g.NodesByKind(graph.KindMethod) {
 		if n == nil || n.Meta == nil {
 			continue
 		}
 		if rt, _ := n.Meta["receiver"].(string); rt != "" {
-			recvType[n.ID] = rt
+			recvType[n.ID] = receiverOwnerKey(n.ID, rt)
 		}
 	}
 	if len(recvType) == 0 {
@@ -76,14 +122,17 @@ func indirectMutationEdges(g graph.Store) []indirectMutSpec {
 		if n == nil || n.Meta == nil {
 			continue
 		}
-		owner, _ := n.Meta["receiver"].(string)
+		receiver, _ := n.Meta["receiver"].(string)
+		owner := receiverOwnerKey(n.ID, receiver)
 		if owner == "" || n.Name == "" {
 			continue
 		}
 		if fieldByOwner[owner] == nil {
 			fieldByOwner[owner] = map[string]string{}
 		}
-		fieldByOwner[owner][n.Name] = n.ID
+		if current := fieldByOwner[owner][n.Name]; current == "" || n.ID < current {
+			fieldByOwner[owner][n.Name] = n.ID
+		}
 	}
 
 	// mutators[methodID] = set of own-receiver field names it mutates.
@@ -120,7 +169,7 @@ func indirectMutationEdges(g graph.Store) []indirectMutSpec {
 		if fn == nil || fn.Kind != graph.KindField {
 			continue
 		}
-		if fowner, _ := fn.Meta["receiver"].(string); fowner == owner {
+		if freceiver, _ := fn.Meta["receiver"].(string); receiverOwnerKey(fn.ID, freceiver) == owner {
 			addMut(e.From, fn.Name)
 		}
 	}
@@ -163,6 +212,11 @@ func indirectMutationEdges(g graph.Store) []indirectMutSpec {
 			recvField: rf, recvSelf: rs, file: e.FilePath, line: e.Line,
 		})
 	}
+	sort.Slice(ocalls, func(i, j int) bool {
+		a, b := ocalls[i], ocalls[j]
+		return receiverCallLess(a.from, a.file, a.line, a.calleeID, a.recvField, a.recvSelf,
+			b.from, b.file, b.line, b.calleeID, b.recvField, b.recvSelf)
+	})
 
 	// Transitive fixpoint.
 	for {

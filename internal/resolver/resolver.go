@@ -2464,10 +2464,10 @@ func (r *Resolver) cachedFindNodesByName(name string) []*graph.Node {
 	}
 	if r.nodesByName != nil {
 		if hits, ok := r.nodesByName[name]; ok {
-			return hits
+			return withoutAttributedTerminals(hits)
 		}
 	}
-	return r.graph.FindNodesByName(name)
+	return withoutAttributedTerminals(r.graph.FindNodesByName(name))
 }
 
 // cachedFindNodesByQualName serves resolveImport's complete candidate lookup
@@ -2504,11 +2504,11 @@ func (r *Resolver) cachedFindNodesByNameInRepo(name, repo string) []*graph.Node 
 	if r.nodesByRepoName != nil {
 		if byName, warmed := r.nodesByRepoName[repo]; warmed {
 			if hits, queried := byName[name]; queried {
-				return hits
+				return withoutAttributedTerminals(hits)
 			}
 		}
 	}
-	return r.graph.FindNodesByNameInRepo(name, repo)
+	return withoutAttributedTerminals(r.graph.FindNodesByNameInRepo(name, repo))
 }
 
 // buildDepModuleIndex collects every dep::<module-path> contract node
@@ -2720,8 +2720,13 @@ type incrementalFileFrontier struct {
 	paths       []string
 	nodesByFile map[string][]*graph.Node
 	outByNode   map[string][]*graph.Edge
-	stubKeys    []string
-	pending     []*graph.Edge
+	// detached are the unresolved edges recorded in the frontier files whose
+	// source is not a node: dataflow edges keyed from a call's placeholder or
+	// from the stub it was moved to. They are the files' own outgoing
+	// references like any node's out-edge, but no by-node read reaches them.
+	detached []*graph.Edge
+	stubKeys []string
+	pending  []*graph.Edge
 	// Admissions may overlap between outgoing and incoming frontiers.
 	outgoingPending int
 	outgoingCollect time.Duration
@@ -2787,6 +2792,172 @@ func collectIncrementalFileFrontierCarry(
 	carryFor func([]string, map[string][]*graph.Node) *incomingCarry,
 ) incrementalFileFrontier {
 	return collectIncrementalFileFrontierKeys(g, filePaths, skip, lightweightIncoming, carryFor, nil)
+}
+
+// collectIncrementalFileFrontierKeys is collectIncrementalFileFrontierCarry
+// whose incoming leg also enumerates the stub keys extraKeys names for the
+// frontier (vanishedDeclarationKeys: the names the files declared before the
+// mutation and no longer declare).
+func collectIncrementalFileFrontierKeys(
+	g graph.Store,
+	filePaths []string,
+	skip func(*graph.Edge) bool,
+	lightweightIncoming bool,
+	carryFor func([]string, map[string][]*graph.Node) *incomingCarry,
+	extraKeys func([]string, map[string][]*graph.Node) []string,
+) incrementalFileFrontier {
+	var frontier incrementalFileFrontier
+	if g == nil {
+		return frontier
+	}
+	seenPaths := make(map[string]struct{}, len(filePaths))
+	for _, path := range filePaths {
+		if path == "" {
+			continue
+		}
+		if _, duplicate := seenPaths[path]; duplicate {
+			continue
+		}
+		seenPaths[path] = struct{}{}
+		frontier.paths = append(frontier.paths, path)
+	}
+	if len(frontier.paths) == 0 {
+		return frontier
+	}
+
+	outgoingStarted := time.Now()
+	frontier.nodesByFile = g.GetFileNodesByPaths(frontier.paths)
+	var nodeIDs []string
+	for _, path := range frontier.paths {
+		for _, node := range frontier.nodesByFile[path] {
+			if node != nil && node.ID != "" {
+				nodeIDs = append(nodeIDs, node.ID)
+			}
+		}
+	}
+	frontier.outByNode = g.GetOutEdgesByNodeIDs(nodeIDs)
+	frontier.detached = detachedPendingAt(g, frontier.paths, frontier.outByNode)
+	for _, edge := range frontier.detached {
+		if skip == nil || !skip(edge) {
+			frontier.pending = append(frontier.pending, edge)
+		}
+	}
+
+	seenStubKeys := make(map[string]struct{})
+	appendStubKey := func(key string) {
+		if key == "" {
+			return
+		}
+		if _, duplicate := seenStubKeys[key]; duplicate {
+			return
+		}
+		seenStubKeys[key] = struct{}{}
+		frontier.stubKeys = append(frontier.stubKeys, key)
+	}
+	for _, path := range frontier.paths {
+		for _, node := range frontier.nodesByFile[path] {
+			if node == nil {
+				continue
+			}
+			for _, edge := range frontier.outByNode[node.ID] {
+				if graph.IsUnresolvedTarget(edge.To) && (skip == nil || !skip(edge)) {
+					frontier.pending = append(frontier.pending, edge)
+				}
+			}
+			if node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
+				continue
+			}
+			// The four name-owned forms are one contract. This builder is
+			// the batched incremental path's incoming leg, and it was the
+			// last one still hand-building the bare pair: a member
+			// reference parked under a wildcard form stayed pending until
+			// the next whole-graph resolve.
+			for _, key := range graph.UnresolvedNameCandidateIDs(node) {
+				appendStubKey(key)
+			}
+		}
+	}
+	if extraKeys != nil {
+		for _, key := range extraKeys(frontier.paths, frontier.nodesByFile) {
+			appendStubKey(key)
+		}
+	}
+	frontier.outgoingPending = len(frontier.pending)
+	frontier.outgoingCollect = time.Since(outgoingStarted)
+	if carryFor != nil {
+		frontier.carry = carryFor(frontier.paths, frontier.nodesByFile)
+	}
+	incomingStarted := time.Now()
+	// The unresolved target string is the incoming-edge bucket key even when
+	// no node with that ID exists.
+	//
+	// The admission is bounded: a changed file that defines a common name
+	// (Close, Get, New) parks every unbound reference to that name in the whole
+	// corpus on its stub ids, and admitting them all is the reverse leg's write
+	// amplification. graph.AdmitIncomingRowsBounded charges the physical rows
+	// against the shared incoming-source ceiling and refuses the WHOLE leg at
+	// the ceiling — the parked edges stay exactly as they are, and the refusal
+	// rides the frontier as a completeness fact instead of being a silent
+	// truncation. It neither widens nor splits the read: the same keys in the
+	// same single batched call, the same rows.
+	if frontier.carry != nil {
+		// A carried key admits only restubbed references, and the restub
+		// mark rides the edge Meta, which the identity projection omits:
+		// read the full rows. Same keys, same single bounded call, same rows.
+		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
+		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
+		for _, key := range frontier.stubKeys {
+			carried := frontier.carry.carried(key)
+			for _, edge := range inByStub[key] {
+				if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
+					continue
+				}
+				if !frontier.carry.admits(key, edge) {
+					frontier.carriedSkipped++
+					continue
+				}
+				if carried {
+					frontier.carriedAdmitted++
+				}
+				frontier.pending = append(frontier.pending, edge)
+			}
+		}
+	} else if lightweightIncoming {
+		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(),
+			func(keys []string) map[string][]graph.EdgeIdentity {
+				return graph.InEdgeIdentitiesByNodeIDs(g, keys)
+			},
+			frontier.stubKeys, nil)
+		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
+		for _, key := range frontier.stubKeys {
+			for _, identity := range inByStub[key] {
+				if !graph.IsUnresolvedTarget(identity.To) {
+					continue
+				}
+				// Preparation needs only the logical identity. Resolution performs a
+				// fresh full-edge read after forward reindexing has settled.
+				frontier.pending = append(frontier.pending, &graph.Edge{
+					From: identity.From, To: identity.To, Kind: identity.Kind,
+					FilePath: identity.FilePath, Line: identity.Line,
+				})
+			}
+		}
+	} else {
+		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
+		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
+		for _, key := range frontier.stubKeys {
+			for _, edge := range inByStub[key] {
+				if edge != nil && graph.IsUnresolvedTarget(edge.To) {
+					frontier.pending = append(frontier.pending, edge)
+				}
+			}
+		}
+	}
+	frontier.incomingCollect = time.Since(incomingStarted)
+	return frontier
 }
 
 // ResolveFilesAndIncoming runs the forward and reverse passes for a
@@ -2896,7 +3067,7 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 	// old forward-before-reverse semantics without one query/transaction per
 	// file. Phase durations include each leg's batched graph mutation.
 	finish = startIncrementalPhase(logger, "resolve_outgoing")
-	r.resolvePreparedFileEdgesLocked(frontier.paths, frontier.nodesByFile, frontier.outByNode, stats)
+	r.resolvePreparedFileEdgesLocked(frontier.paths, frontier.nodesByFile, frontier.outByNode, stats, frontier.detached...)
 	outgoingDuration = finish(
 		zap.Int("resolved", stats.Resolved), zap.Int("unresolved", stats.Unresolved), zap.Int("external", stats.External))
 	beforeIncoming := *stats
@@ -3046,6 +3217,7 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 	nodesByFile map[string][]*graph.Node,
 	outByNode map[string][]*graph.Edge,
 	stats *ResolveStats,
+	detached ...*graph.Edge,
 ) {
 	if pending, err := r.prepareGoPackageFileFrontier(filePaths, nodesByFile, outByNode); err != nil {
 		stats.Unresolved += pending
@@ -3054,32 +3226,38 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 	}
 	var jobs []reindexJob
 	var reindexBatch []graph.EdgeReindex
+	resolveOne := func(edge *graph.Edge) {
+		if edge == nil || !graph.IsUnresolvedTarget(edge.To) || r.incrementalSkipped(edge) {
+			return
+		}
+		oldKind := edge.Kind
+		oldTo, changed := r.resolveEdge(edge, stats)
+		if !changed {
+			return
+		}
+		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: edge, OldTo: oldTo, OldKind: oldKind})
+		jobs = append(jobs, reindexJob{
+			edge:       edge,
+			oldTo:      oldTo,
+			oldKind:    oldKind,
+			newTo:      edge.To,
+			kind:       edge.Kind,
+			confidence: edge.Confidence,
+			origin:     edge.Origin,
+		})
+	}
 	for _, filePath := range filePaths {
 		for _, node := range nodesByFile[filePath] {
 			if node == nil {
 				continue
 			}
 			for _, edge := range outByNode[node.ID] {
-				if edge == nil || !graph.IsUnresolvedTarget(edge.To) || r.incrementalSkipped(edge) {
-					continue
-				}
-				oldKind := edge.Kind
-				oldTo, changed := r.resolveEdge(edge, stats)
-				if !changed {
-					continue
-				}
-				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: edge, OldTo: oldTo, OldKind: oldKind})
-				jobs = append(jobs, reindexJob{
-					edge:       edge,
-					oldTo:      oldTo,
-					oldKind:    oldKind,
-					newTo:      edge.To,
-					kind:       edge.Kind,
-					confidence: edge.Confidence,
-					origin:     edge.Origin,
-				})
+				resolveOne(edge)
 			}
 		}
+	}
+	for _, edge := range detached {
+		resolveOne(edge)
 	}
 	r.applyIncrementalReindexesLocked(reindexBatch, jobs, stats)
 }
@@ -3410,6 +3588,7 @@ func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub ma
 				continue
 			}
 			oldKind := edge.Kind
+			stashed, prevTo := restubStash(edge)
 			oldTo, changed := r.resolveEdge(edge, stats)
 			// Restore the provenance the restub stashed when the stub rebound
 			// to the same target it had before the re-parse.
@@ -3425,9 +3604,24 @@ func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub ma
 					kind:       edge.Kind,
 					confidence: edge.Confidence,
 					origin:     edge.Origin,
+					// The re-parse parked this reference and it bound back to
+					// the very target it held: the binding, its caller's file
+					// and the target's file are the ones the whole index
+					// already judged, so the guard must not judge it again
+					// on the restub's bare-name placeholder — a whole index
+					// never sees that placeholder (it resolves the
+					// extractor's own, often import-pinned, target).
+					restubRoundTrip: stashed && prevTo != "" && prevTo == edge.To,
 				})
 			case restored:
 				// Persist an in-place provenance restore even when To is unchanged.
+				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: edge, OldTo: edge.To})
+			case stashed:
+				// The reference stays unresolved. RestoreRestubProvenance
+				// dropped the transient stash keys in place; persist that, or
+				// the row keeps restub bookkeeping a whole index never writes.
+				// Only the stash keys are persisted: an unresolved edge keeps
+				// the provenance the restub cleared.
 				reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: edge, OldTo: edge.To})
 			}
 		}
@@ -3462,6 +3656,24 @@ type reindexJob struct {
 	confidence    float64
 	origin        string
 	meta          map[string]any
+	// restubRoundTrip marks an incoming-leg job whose parked reference
+	// bound back to the target it held before the re-parse; the
+	// cross-package guard leaves it alone (guardCrossPackageCallEdges).
+	restubRoundTrip bool
+}
+
+// restubPrevToKey is the edge Meta key graph.StashRestubProvenance records
+// the pre-restub target under.
+const restubPrevToKey = "restub_prev_to"
+
+// restubStash reports whether e carries the restub stash and, if so, the
+// target it held before the re-parse parked it.
+func restubStash(e *graph.Edge) (bool, string) {
+	if !graph.HasRestubProvenance(e) {
+		return false, ""
+	}
+	prev, _ := e.Meta[restubPrevToKey].(string)
+	return true, prev
 }
 
 // resolverClonePool recycles the *graph.Edge shells handed out by
@@ -3773,7 +3985,7 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 	// pinned to different Go SDK versions get distinct fmt::Errorf nodes
 	// instead of one shared, version-conflated terminal.
 	if isStdlibLike(importPath) {
-		e.To = graph.StubID(callerRepo, graph.StubKindStdlib, importPath, symbol)
+		e.To = graph.StubID(r.stubRepoPrefix(e), graph.StubKindStdlib, importPath, symbol)
 	} else {
 		e.To = "dep::" + importPath + "::" + symbol
 	}
@@ -3915,7 +4127,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// Look for every package node with this qualified name. The same import
 	// path may legitimately exist in several tracked repositories/workspaces;
 	// bind the caller-local instance instead of whichever row sorted first.
-	if candidates := goOwnership.filterNodes(r.cachedFindNodesByQualName(importPath)); len(candidates) > 0 {
+	if candidates := goOwnership.filterNodes(withoutSynthesizedExternalCalls(r.cachedFindNodesByQualName(importPath))); len(candidates) > 0 {
 		node, ambiguous := pickResolverQualNameCandidate(candidates, callerRepo, callerWorkspace)
 		if node != nil {
 			e.To = node.ID
@@ -4933,7 +5145,7 @@ func (r *Resolver) applyBuiltinIfKnown(e *graph.Edge, methodName string, stats *
 	if !ok {
 		return false
 	}
-	e.To = graph.StubID(r.callerRepoPrefix(e), graph.StubKindBuiltin, lang, category, methodName)
+	e.To = graph.StubID(r.stubRepoPrefix(e), graph.StubKindBuiltin, lang, category, methodName)
 	stats.External++
 	return true
 }
@@ -5974,6 +6186,125 @@ func (r *Resolver) callerRepoPrefix(e *graph.Edge) string {
 	return ""
 }
 
+// withoutAttributedTerminals drops, from a name lookup's candidates, the nodes
+// the post-resolution attribution passes mint for external terminals: the
+// stdlib / dependency symbol stubs (`repo::stdlib::C::bool`,
+// `dep::…::New`), the Go builtin stubs (`repo::builtin::go::type::bool`) and
+// the external-call nodes. A whole index resolves every reference before any
+// of them exists, so none is ever a candidate there; a per-save resolve runs
+// over a graph that holds them, and a bare `bool` / `New` / `Load` reference
+// could bind to one — a row a whole index never has. Dependency contract
+// nodes (`dep::<module>`, from go.mod) exist before resolution and stay.
+func withoutAttributedTerminals(nodes []*graph.Node) []*graph.Node {
+	drop := func(n *graph.Node) bool {
+		if n == nil {
+			return false
+		}
+		if n.Kind == graph.KindContract {
+			return false
+		}
+		id := n.ID
+		return graph.IsStub(id) || strings.HasPrefix(id, "dep::") || strings.HasPrefix(id, externalCallPrefix)
+	}
+	for i, n := range nodes {
+		if drop(n) {
+			kept := append([]*graph.Node(nil), nodes[:i]...)
+			for _, m := range nodes[i+1:] {
+				if !drop(m) {
+					kept = append(kept, m)
+				}
+			}
+			return kept
+		}
+	}
+	return nodes
+}
+
+// withoutSynthesizedExternalCalls drops the external-call bookkeeping nodes
+// (`external-call::<ecosystem>:<import path>`, QualName = the import path) from
+// an import's qualified-name candidates. The external-call pass mints them
+// after resolution from the calls into an un-indexed package; a whole index
+// resolves every import before any exists, so its import edge keeps the
+// external terminal (`dep::…`, with the import node's depends_on_module). A
+// per-save resolve runs over a graph that already holds them, and binding the
+// import to one gave the per-save path a row a whole index never has.
+func withoutSynthesizedExternalCalls(nodes []*graph.Node) []*graph.Node {
+	for i, n := range nodes {
+		if n != nil && strings.HasPrefix(n.ID, externalCallPrefix) {
+			kept := append([]*graph.Node(nil), nodes[:i]...)
+			for _, m := range nodes[i+1:] {
+				if m != nil && !strings.HasPrefix(m.ID, externalCallPrefix) {
+					kept = append(kept, m)
+				}
+			}
+			return kept
+		}
+	}
+	return nodes
+}
+
+// detachedPendingAt reads the unresolved edges recorded at paths whose source
+// is not a node — a placeholder (`…unresolved::…`) or a stub — and that no
+// by-node read in outByNode already returned. A whole index resolves them in
+// the same pass as the call edges; a store that cannot serve rows by
+// recording file returns none (the in-memory graph).
+func detachedPendingAt(g graph.Store, paths []string, outByNode map[string][]*graph.Edge) []*graph.Edge {
+	reader, ok := graph.RecordedEdgesOf(g)
+	if !ok || len(paths) == 0 {
+		return nil
+	}
+	var out []*graph.Edge
+	for _, edge := range reader.RecordedEdgesAt(paths) {
+		if edge == nil || !graph.IsUnresolvedTarget(edge.To) || !detachedSource(edge.From) {
+			continue
+		}
+		if _, byNode := outByNode[edge.From]; byNode {
+			continue
+		}
+		out = append(out, edge)
+	}
+	return out
+}
+
+// detachedSource reports whether a source id names no node: a placeholder or
+// a stub.
+func detachedSource(from string) bool {
+	return strings.Contains(from, graph.UnresolvedMarker) || graph.IsStub(from)
+}
+
+// stubRepoPrefix is the repository prefix a stub target minted for e carries:
+// the caller's repository. When the source is not a node — a dataflow edge
+// keyed from a call's placeholder (`repo/unresolved::…`) or from the stub it
+// was already moved to (`repo::stdlib::…`) — the repository is the one that
+// spelling names. Without that fallback such an edge minted the unprefixed
+// `stdlib::…` stub while the call at the same site minted `repo::stdlib::…`,
+// so one symbol had two stub spellings, and which one a dataflow edge showed
+// depended on the order the whole index and the per-save path resolved the
+// site's edges in.
+func (r *Resolver) stubRepoPrefix(e *graph.Edge) string {
+	if repo := r.callerRepoPrefix(e); repo != "" {
+		return repo
+	}
+	if e == nil || r.cachedGetNode(e.From) != nil {
+		return ""
+	}
+	return sourceSpellingRepoPrefix(e.From)
+}
+
+// sourceSpellingRepoPrefix is the repository prefix a non-node source id
+// spells: a repository-prefixed stub (`repo::stdlib::…`) or a
+// repository-prefixed placeholder (`repo/unresolved::…`). Anything else has
+// none.
+func sourceSpellingRepoPrefix(from string) string {
+	if repo := graph.StubRepoPrefix(from); repo != "" {
+		return repo
+	}
+	if i := strings.Index(from, "/"+graph.UnresolvedMarker); i > 0 && !strings.Contains(from[:i], "::") {
+		return from[:i]
+	}
+	return ""
+}
+
 // callerWorkspaceID returns the source workspace, falling back to its exact
 // repository prefix just like candidateWorkspaceID.
 func (r *Resolver) callerWorkspaceID(e *graph.Edge) string {
@@ -5985,166 +6316,4 @@ func (r *Resolver) callerWorkspaceID(e *graph.Edge) string {
 		return fromNode.WorkspaceID
 	}
 	return fromNode.RepoPrefix
-}
-
-// collectIncrementalFileFrontierCarry is collectIncrementalFileFrontierMode
-// with the incoming leg scoped by declaration evidence: carryFor, when
-// non-nil, names the stub keys whose declarations the mutation left unchanged,
-// and on those keys only restubbed references are admitted. The incoming read
-// is the same single bounded call over the same keys either way — only the
-// admitted subset differs — so the ceiling and its refusal are unchanged.
-func collectIncrementalFileFrontierKeys(
-	g graph.Store,
-	filePaths []string,
-	skip func(*graph.Edge) bool,
-	lightweightIncoming bool,
-	carryFor func([]string, map[string][]*graph.Node) *incomingCarry,
-	extraKeys func([]string, map[string][]*graph.Node) []string,
-) incrementalFileFrontier {
-	var frontier incrementalFileFrontier
-	if g == nil {
-		return frontier
-	}
-	seenPaths := make(map[string]struct{}, len(filePaths))
-	for _, path := range filePaths {
-		if path == "" {
-			continue
-		}
-		if _, duplicate := seenPaths[path]; duplicate {
-			continue
-		}
-		seenPaths[path] = struct{}{}
-		frontier.paths = append(frontier.paths, path)
-	}
-	if len(frontier.paths) == 0 {
-		return frontier
-	}
-
-	outgoingStarted := time.Now()
-	frontier.nodesByFile = g.GetFileNodesByPaths(frontier.paths)
-	var nodeIDs []string
-	for _, path := range frontier.paths {
-		for _, node := range frontier.nodesByFile[path] {
-			if node != nil && node.ID != "" {
-				nodeIDs = append(nodeIDs, node.ID)
-			}
-		}
-	}
-	frontier.outByNode = g.GetOutEdgesByNodeIDs(nodeIDs)
-
-	seenStubKeys := make(map[string]struct{})
-	appendStubKey := func(key string) {
-		if key == "" {
-			return
-		}
-		if _, duplicate := seenStubKeys[key]; duplicate {
-			return
-		}
-		seenStubKeys[key] = struct{}{}
-		frontier.stubKeys = append(frontier.stubKeys, key)
-	}
-	for _, path := range frontier.paths {
-		for _, node := range frontier.nodesByFile[path] {
-			if node == nil {
-				continue
-			}
-			for _, edge := range frontier.outByNode[node.ID] {
-				if graph.IsUnresolvedTarget(edge.To) && (skip == nil || !skip(edge)) {
-					frontier.pending = append(frontier.pending, edge)
-				}
-			}
-			if node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
-				continue
-			}
-			// The four name-owned forms are one contract. This builder is
-			// the batched incremental path's incoming leg, and it was the
-			// last one still hand-building the bare pair: a member
-			// reference parked under a wildcard form stayed pending until
-			// the next whole-graph resolve.
-			for _, key := range graph.UnresolvedNameCandidateIDs(node) {
-				appendStubKey(key)
-			}
-		}
-	}
-	if extraKeys != nil {
-		for _, key := range extraKeys(frontier.paths, frontier.nodesByFile) {
-			appendStubKey(key)
-		}
-	}
-	frontier.outgoingPending = len(frontier.pending)
-	frontier.outgoingCollect = time.Since(outgoingStarted)
-	if carryFor != nil {
-		frontier.carry = carryFor(frontier.paths, frontier.nodesByFile)
-	}
-	incomingStarted := time.Now()
-	// The unresolved target string is the incoming-edge bucket key even when
-	// no node with that ID exists.
-	//
-	// The admission is bounded: a changed file that defines a common name
-	// (Close, Get, New) parks every unbound reference to that name in the whole
-	// corpus on its stub ids, and admitting them all is the reverse leg's write
-	// amplification. graph.AdmitIncomingRowsBounded charges the physical rows
-	// against the shared incoming-source ceiling and refuses the WHOLE leg at
-	// the ceiling — the parked edges stay exactly as they are, and the refusal
-	// rides the frontier as a completeness fact instead of being a silent
-	// truncation. It neither widens nor splits the read: the same keys in the
-	// same single batched call, the same rows.
-	if frontier.carry != nil {
-		// A carried key admits only restubbed references, and the restub
-		// mark rides the edge Meta, which the identity projection omits:
-		// read the full rows. Same keys, same single bounded call, same rows.
-		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
-			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
-		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
-		for _, key := range frontier.stubKeys {
-			carried := frontier.carry.carried(key)
-			for _, edge := range inByStub[key] {
-				if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
-					continue
-				}
-				if !frontier.carry.admits(key, edge) {
-					frontier.carriedSkipped++
-					continue
-				}
-				if carried {
-					frontier.carriedAdmitted++
-				}
-				frontier.pending = append(frontier.pending, edge)
-			}
-		}
-	} else if lightweightIncoming {
-		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
-			context.Background(),
-			func(keys []string) map[string][]graph.EdgeIdentity {
-				return graph.InEdgeIdentitiesByNodeIDs(g, keys)
-			},
-			frontier.stubKeys, nil)
-		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
-		for _, key := range frontier.stubKeys {
-			for _, identity := range inByStub[key] {
-				if !graph.IsUnresolvedTarget(identity.To) {
-					continue
-				}
-				// Preparation needs only the logical identity. Resolution performs a
-				// fresh full-edge read after forward reindexing has settled.
-				frontier.pending = append(frontier.pending, &graph.Edge{
-					From: identity.From, To: identity.To, Kind: identity.Kind,
-					FilePath: identity.FilePath, Line: identity.Line,
-				})
-			}
-		}
-	} else {
-		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
-			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
-		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
-		for _, key := range frontier.stubKeys {
-			for _, edge := range inByStub[key] {
-				if edge != nil && graph.IsUnresolvedTarget(edge.To) {
-					frontier.pending = append(frontier.pending, edge)
-				}
-			}
-		}
-	}
-	frontier.incomingCollect = time.Since(incomingStarted)
-	return frontier
 }

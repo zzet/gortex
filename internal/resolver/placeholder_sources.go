@@ -194,6 +194,49 @@ func (idx *placeholderSourceIndex) applyDeferred(g graph.Store) int {
 	return graph.ReconcilePlaceholderSources(g, repoints)
 }
 
+// RepointPlaceholderSourcesInBatch applies the from-side placeholder
+// reconciliation to edges that are not in a store yet: the fresh extraction of
+// a re-parsed file, whose reference edges a per-save path re-targets in memory
+// from the prior resolution (the out-edge reuse) instead of through a
+// resolution batch. Without it the re-used reference is bound while the
+// dataflow edges the extractor keyed from its placeholder at the same site
+// keep the placeholder source, where a whole index — which resolves the
+// reference and then moves them — shows the bound source.
+//
+// resolved lists the reference edges the caller re-targeted, each with the
+// unresolved target it had (EdgeReindex.OldTo). The site contract is
+// graph.PlaceholderSourceRepoints': a dataflow edge moves only when its source
+// is that placeholder (bare, or repository-prefixed) at the reference's exact
+// file and line, and the first repoint of a site wins. Returns the number of
+// edges re-pointed.
+func RepointPlaceholderSourcesInBatch(edges []*graph.Edge, resolved []graph.EdgeReindex) int {
+	repoints := graph.PlaceholderSourceRepoints(resolved)
+	if len(repoints) == 0 || os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") == "0" {
+		return 0
+	}
+	newFromBySite := make(map[placeholderSourceSite]string, len(repoints))
+	for _, rp := range repoints {
+		if rp.OldFrom == "" || rp.NewFrom == "" || rp.OldFrom == rp.NewFrom {
+			continue
+		}
+		site := placeholderSourceSite{from: rp.OldFrom, filePath: rp.FilePath, line: rp.Line}
+		if _, claimed := newFromBySite[site]; !claimed {
+			newFromBySite[site] = rp.NewFrom
+		}
+	}
+	moved := 0
+	for _, e := range edges {
+		if e == nil || !graph.PlaceholderSourceKind(e.Kind) || !strings.Contains(e.From, graph.UnresolvedMarker) {
+			continue
+		}
+		if newFrom, ok := newFromBySite[placeholderSourceSite{from: e.From, filePath: e.FilePath, line: e.Line}]; ok {
+			e.From = newFrom
+			moved++
+		}
+	}
+	return moved
+}
+
 // reconcileIndexedPlaceholderSources exact-refetches only claimed identities
 // in bounded pages. Each backend closes its read cursor (or releases graph
 // locks) before ReindexEdges runs, so the SQLite one-connection contract and

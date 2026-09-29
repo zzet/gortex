@@ -260,8 +260,9 @@ func TestRestubFrontierConservativeWithoutExtraction(t *testing.T) {
 	assert.Empty(t, carried)
 }
 
-// The deletion path through the production entrypoint: a deleted definition
-// must still park its referrers, and the gate must not reach it.
+// The deletion path through the production entrypoint: a deleted definition's
+// referrer ends on an unresolved stub — re-derived from its own source in the
+// same batch rather than parked — and the gate must not reach it.
 func TestIncrementalBatchDeletedFileStillRestubsIncoming(t *testing.T) {
 	idx, st, dir, defPath := restubPipelineFixture(t)
 
@@ -269,8 +270,12 @@ func TestIncrementalBatchDeletedFileStillRestubsIncoming(t *testing.T) {
 	_, err := idx.IncrementalReindexPaths(dir, []string{defPath})
 	require.NoError(t, err)
 
-	assert.GreaterOrEqual(t, st.restubWrites("Foo"), 1,
-		"a deleted definition must still park its referrers under a stub")
+	// The referrer's file is re-derived from source in the same batch
+	// (deletion_importers.go), which is what a whole index of the tree
+	// gives it; parking its reference under a stub first would only be
+	// overwritten.
+	assert.Zero(t, st.restubWrites("Foo"),
+		"a deleted definition's referrer is re-derived from source, not parked")
 	assert.True(t, graph.IsUnresolvedTarget(
 		callTargetFrom(t, st, fnNodeID(t, st, "caller.go", "Bar"))),
 		"the caller's edge must degrade to an unresolved stub once the definition is gone")

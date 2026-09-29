@@ -1,6 +1,10 @@
 package indexer
 
-import "github.com/zzet/gortex/internal/graph"
+import (
+	"sort"
+
+	"github.com/zzet/gortex/internal/graph"
+)
 
 // indirectMutationEdgesForMethods computes the indirect-mutation slice whose
 // truth can change when seedMethods change. It expands backwards through
@@ -167,27 +171,31 @@ func indirectMutationEdgesForRoots(
 	}
 	writeTargets := g.GetNodesByIDs(writeTargetIDs)
 	fieldsByName := g.FindNodesByNames(fieldNames)
-	fieldFor := func(method *graph.Node, name string) *graph.Node {
-		receiver := receiverOf(method)
-		var fallback *graph.Node
-		ambiguous := false
-		for _, field := range fieldsByName[name] {
-			if field == nil || field.Kind != graph.KindField || receiverOf(field) != receiver {
-				continue
-			}
-			if field.RepoPrefix == method.RepoPrefix {
-				return field
-			}
-			if fallback == nil {
-				fallback = field
-			} else if fallback.ID != field.ID {
-				ambiguous = true
-			}
+	// ownerOf is the receiver type a method or field belongs to, qualified by
+	// its package directory (receiverOwnerKey) exactly as the whole-graph
+	// fixpoint keys it, so a per-save re-derivation binds the field a whole
+	// index binds.
+	ownerOf := func(node *graph.Node) string {
+		if node == nil {
+			return ""
 		}
-		if ambiguous {
+		return receiverOwnerKey(node.ID, receiverOf(node))
+	}
+	fieldFor := func(method *graph.Node, name string) *graph.Node {
+		owner := ownerOf(method)
+		if owner == "" {
 			return nil
 		}
-		return fallback
+		var found *graph.Node
+		for _, field := range fieldsByName[name] {
+			if field == nil || field.Kind != graph.KindField || ownerOf(field) != owner {
+				continue
+			}
+			if found == nil || field.ID < found.ID {
+				found = field
+			}
+		}
+		return found
 	}
 
 	mutators := make(map[string]map[string]bool)
@@ -210,10 +218,7 @@ func indirectMutationEdgesForRoots(
 				continue
 			}
 			field := writeTargets[edge.To]
-			if field == nil || field.Kind != graph.KindField || receiverOf(field) != receiverOf(method) {
-				continue
-			}
-			if field.RepoPrefix != "" && method.RepoPrefix != "" && field.RepoPrefix != method.RepoPrefix {
+			if field == nil || field.Kind != graph.KindField || ownerOf(field) != ownerOf(method) {
 				continue
 			}
 			addMutation(id, field.ID)
@@ -242,6 +247,11 @@ func indirectMutationEdgesForRoots(
 			})
 		}
 	}
+	sort.Slice(calls, func(i, j int) bool {
+		a, b := calls[i], calls[j]
+		return receiverCallLess(a.from, a.file, a.line, a.calleeID, a.recvField, a.recvSelf,
+			b.from, b.file, b.line, b.calleeID, b.recvField, b.recvSelf)
+	})
 	for {
 		changed := false
 		for _, call := range calls {
@@ -257,10 +267,7 @@ func indirectMutationEdgesForRoots(
 			case call.recvSelf:
 				caller := analysisMethods[call.from]
 				callee := analysisMethods[call.calleeID]
-				if !calleeMutates || caller == nil || callee == nil || receiverOf(caller) != receiverOf(callee) {
-					continue
-				}
-				if caller.RepoPrefix != "" && callee.RepoPrefix != "" && caller.RepoPrefix != callee.RepoPrefix {
+				if !calleeMutates || caller == nil || callee == nil || ownerOf(caller) != ownerOf(callee) {
 					continue
 				}
 				for fieldID := range mutators[call.calleeID] {
@@ -292,10 +299,7 @@ func indirectMutationEdgesForRoots(
 		case call.recvSelf:
 			caller := analysisMethods[call.from]
 			callee := analysisMethods[call.calleeID]
-			if !calleeMutates || caller == nil || callee == nil || receiverOf(caller) != receiverOf(callee) {
-				continue
-			}
-			if caller.RepoPrefix != "" && callee.RepoPrefix != "" && caller.RepoPrefix != callee.RepoPrefix {
+			if !calleeMutates || caller == nil || callee == nil || ownerOf(caller) != ownerOf(callee) {
 				continue
 			}
 			for fieldID := range mutators[call.calleeID] {
