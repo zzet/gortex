@@ -14,6 +14,11 @@ var _ graph.RecordedEdgeReader = (*Store)(nil)
 const recordedEdgesAtPrefix = `SELECT ` + lookupEdgeCols + ` FROM edges WHERE file_path IN (`
 const recordedEdgesAtSuffix = `) AND +view_gen = ?`
 
+// recordedEdgesAtPinnedPrefix is the same read through
+// edges_by_file_generation once it exists (see
+// edgeEndpointsRecordedAtPinnedPrefix).
+const recordedEdgesAtPinnedPrefix = `SELECT ` + lookupEdgeCols + ` FROM edges INDEXED BY ` + edgesByFileGenerationIndexName + ` WHERE file_path IN (`
+
 // RecordedEdgesAt returns every edge recorded in one of paths on this
 // handle's generation, full rows. The empty path names the edges recorded at
 // no file (a stub's module membership, say).
@@ -26,8 +31,13 @@ func (s *Store) RecordedEdgesAt(paths []string) []*graph.Edge {
 	for i := 0; i < len(uniq); i += lookupChunkSize {
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
+		args := append(toAnyArgs(chunk), s.viewGen)
+		if rows, ok := s.queryByFileGeneration(recordedEdgesAtPinnedPrefix+inPlaceholders(len(chunk))+recordedAtPinnedSuffix, args); ok {
+			out = append(out, s.scanEdgeRows(rows)...)
+			continue
+		}
 		q := recordedEdgesAtPrefix + inPlaceholders(len(chunk)) + recordedEdgesAtSuffix
-		out = append(out, s.queryEdgesSQL(q, append(toAnyArgs(chunk), s.viewGen)...)...)
+		out = append(out, s.queryEdgesSQL(q, args...)...)
 	}
 	return out
 }

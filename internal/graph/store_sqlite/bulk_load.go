@@ -441,6 +441,11 @@ func (s *Store) beginBulkLoadLocked() {
 	for _, idx := range bulkDroppableIndexes {
 		_, _ = conn.ExecContext(ctx, "DROP INDEX IF EXISTS "+idx.name)
 	}
+	// The lazily built file-generation index goes too (the builder restores
+	// it once the window closes); clear the presence cache first so no new
+	// reader pins it.
+	s.forgetFileGenerationIndex()
+	_, _ = conn.ExecContext(ctx, "DROP INDEX IF EXISTS "+edgesByFileGenerationIndexName)
 
 	s.bulkConn = conn
 	s.syncBulkWindowLocked()

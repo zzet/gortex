@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"database/sql"
 	"sort"
 	"strings"
 
@@ -23,6 +24,34 @@ var _ graph.EdgeEndpointReader = (*Store)(nil)
 // index, which would scan the whole generation to find a handful of files.
 const edgeEndpointsRecordedAtPrefix = `SELECT from_id, to_id, kind, file_path FROM edges WHERE file_path IN (`
 const edgeEndpointsRecordedAtSuffix = `) AND +view_gen = ?`
+
+// edgeEndpointsRecordedAtPinnedPrefix is the same read through
+// edges_by_file_generation (file_path, view_gen) once the lazy builder has
+// built it: a seek per (file, generation), so a file's rows in other
+// generations are never visited. recordedAtPinnedSuffix closes both pinned
+// forms.
+const edgeEndpointsRecordedAtPinnedPrefix = `SELECT from_id, to_id, kind, file_path FROM edges INDEXED BY ` + edgesByFileGenerationIndexName + ` WHERE file_path IN (`
+const recordedAtPinnedSuffix = `) AND view_gen = ?`
+
+// queryByFileGeneration runs a pinned by-file read when
+// edges_by_file_generation is present. It reports false (and the caller runs
+// the legacy edges_by_file form) when the index is absent or was dropped
+// between the presence probe and the statement.
+func (s *Store) queryByFileGeneration(q string, args []any) (*sql.Rows, bool) {
+	if !s.fileGenerationIndexPresent() {
+		return nil, false
+	}
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		if isNoSuchIndexErr(err) {
+			s.forgetFileGenerationIndex()
+			return nil, false
+		}
+		panicOnFatal(err)
+		return nil, false
+	}
+	return rows, true
+}
 
 // edgeEndpointsFromSQL seeks edges_by_from (view_gen, from_id, kind); with a
 // kind list the whole predicate is served by the index key.
@@ -62,8 +91,13 @@ func (s *Store) EdgeEndpointsRecordedAt(paths []string) []graph.EdgeEndpointRow 
 	for i := 0; i < len(uniq); i += lookupChunkSize {
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
+		args := append(toAnyArgs(chunk), s.viewGen)
+		if rows, ok := s.queryByFileGeneration(edgeEndpointsRecordedAtPinnedPrefix+inPlaceholders(len(chunk))+recordedAtPinnedSuffix, args); ok {
+			out = s.appendEdgeEndpointRows(out, rows)
+			continue
+		}
 		q := edgeEndpointsRecordedAtPrefix + inPlaceholders(len(chunk)) + edgeEndpointsRecordedAtSuffix
-		out = s.appendEdgeEndpoints(out, q, append(toAnyArgs(chunk), s.viewGen)...)
+		out = s.appendEdgeEndpoints(out, q, args...)
 	}
 	return out
 }
@@ -184,6 +218,11 @@ func (s *Store) appendEdgeEndpoints(out []graph.EdgeEndpointRow, q string, args 
 		panicOnFatal(err)
 		return out
 	}
+	return s.appendEdgeEndpointRows(out, rows)
+}
+
+// appendEdgeEndpointRows scans an endpoint projection's rows and closes them.
+func (s *Store) appendEdgeEndpointRows(out []graph.EdgeEndpointRow, rows *sql.Rows) []graph.EdgeEndpointRow {
 	defer rows.Close()
 	for rows.Next() {
 		var e graph.EdgeEndpointRow

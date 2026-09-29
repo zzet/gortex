@@ -116,6 +116,11 @@ type storeCore struct {
 	// counts; mutable generation zero is never memoized.
 	publishedLanguageCounts sync.Map
 
+	// fileGenerationIndex caches edges_by_file_generation's presence
+	// (lazy_graph_indexes.go); lazyIndex is its builder's telemetry.
+	fileGenerationIndex atomic.Int32
+	lazyIndex           lazyIndexCounters
+
 	// walReclaimNudged asks the WAL reclaim loop to attempt at its next poll
 	// regardless of backoff (a residue drain handed it a busy TRUNCATE).
 	walReclaimNudged atomic.Bool
@@ -1119,6 +1124,7 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 		})
 	}
 	stopReclaim := s.startWALReclaimLoop(walPath)
+	stopLazyIndex := s.startLazyIndexBuilder()
 	s.runCheckpointLoopWithAttemptAndCleanup(
 		walPressurePollInterval,
 		walCheckpointRetryInitial,
@@ -1126,7 +1132,11 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 		func() bool {
 			return schedule.attempt(time.Now(), walPath, checkpoint)
 		},
-		func() { stopReclaim(); closeCheckpointDB() },
+		func() {
+			stopReclaim()
+			stopLazyIndex()
+			closeCheckpointDB()
+		},
 	)
 }
 
@@ -3470,23 +3480,7 @@ func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 		panicOnFatal(err)
 		return nil
 	}
-	defer rows.Close()
-	var out []*graph.Edge
-	for rows.Next() {
-		e, err := s.scanEdgeCursor(rows)
-		if err != nil {
-			panicOnFatal(err)
-			return out
-		}
-		if e == nil {
-			continue
-		}
-		out = append(out, e)
-	}
-	if err := rows.Err(); err != nil {
-		panicOnFatal(err)
-	}
-	return out
+	return s.scanEdgeRows(rows)
 }
 
 // queryNodesSQL is the node-shaped sibling of queryEdgesSQL, with the same
@@ -3655,3 +3649,24 @@ func (s *Store) beginReclaimCheckpointAttempt(overridesLease bool) (*backgroundC
 }
 
 var errWALCheckpointInFlight = errors.New("store_sqlite: wal checkpoint: another background checkpoint is in flight")
+
+// scanEdgeRows is queryEdgesSQL's scan over already-open rows; it closes them.
+func (s *Store) scanEdgeRows(rows *sql.Rows) []*graph.Edge {
+	defer rows.Close()
+	var out []*graph.Edge
+	for rows.Next() {
+		e, err := s.scanEdgeCursor(rows)
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		if e == nil {
+			continue
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
+	return out
+}
