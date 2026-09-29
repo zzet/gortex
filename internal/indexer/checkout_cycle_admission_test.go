@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"slices"
 	"testing"
 	"time"
@@ -97,4 +98,45 @@ func TestObservedChangeCycleOpensAPublicationRecord(t *testing.T) {
 			t.Fatalf("a settled cycle opened an observed-change record: %+v", r)
 		}
 	}
+}
+
+func TestCycleReportsTheLaneHolderItWaitedFor(t *testing.T) {
+	_, c, _ := newCheckoutMutationFixture(t)
+	ctx := context.Background()
+	builderWriteFile(t, c.root, "helper.go", chainHelperEdit)
+
+	// Another builder holds the lane and says what it is.
+	release, err := c.gate.Acquire(ctx, ViewBuildInteractive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withdraw := c.gate.NoteHolder(ViewBuildLaneHolder{Kind: "ref_view_build", CheckoutID: "elsewhere", Generation: 42})
+	if holder := c.gate.Stats().Holder; holder == nil || holder.Kind != "ref_view_build" || holder.Since.IsZero() {
+		t.Fatalf("gate stats holder = %+v", holder)
+	}
+	done := make(chan CheckoutCycle, 1)
+	c.cycleDone = func(out CheckoutCycle) { done <- out }
+	go c.cycle(ctx)
+	const held = 150 * time.Millisecond
+	time.Sleep(held)
+	withdraw()
+	release()
+	var out CheckoutCycle
+	select {
+	case out = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cycle never finished")
+	}
+	if !out.DirtyBuilt {
+		t.Fatalf("the cycle = %+v, want a working-tree build", out)
+	}
+	a := out.Admission
+	if a.Lane < held/2 || a.LaneHeldBy == nil || a.LaneHeldBy.Kind != "ref_view_build" ||
+		a.LaneHeldBy.CheckoutID != "elsewhere" || a.LaneHeldBy.Generation != 42 {
+		t.Fatalf("the cycle's admission = %+v (holder %+v), want a lane wait attributed to the ref view build", a, a.LaneHeldBy)
+	}
+	if holder := c.gate.Stats().Holder; holder != nil {
+		t.Fatalf("a released lane still names a holder: %+v", holder)
+	}
+	t.Logf("admission: preflight %v, cycle lock %v, lane %v held by %s", a.Preflight, a.CycleLock, a.Lane, a.LaneHeldBy.Kind)
 }

@@ -658,6 +658,10 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 				return err
 			}
 		}
+		reachBuildCommitPoint(ctx)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := window.close(); err != nil {
 			return err
 		}

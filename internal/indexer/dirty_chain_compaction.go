@@ -44,6 +44,10 @@ func (c *CheckoutCoordinator) deferFailedGeneration(ctx context.Context, generat
 // build lane; and what held the lane when the cycle queued for it (a Kind
 // "undeclared" holder is a builder that declares nothing, nil an idle lane).
 type cycleAdmission struct {
+	Preflight  time.Duration
+	CycleLock  time.Duration
+	Lane       time.Duration
+	LaneHeldBy *ViewBuildLaneHolder
 }
 
 // checkoutLanguageCensus is the language census of the committed state a

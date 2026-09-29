@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -353,7 +354,8 @@ type CheckoutCycle struct {
 	// validated the inputs of. Opening the gate, an invalidation event or the
 	// 15-second coordinator poll retries the demand. Nothing was read or
 	// written, so every other field is zero.
-	Deferred bool
+	Deferred  bool
+	YieldedTo string
 	// DirtyParentCandidate and DirtyChainReason report, for a cycle that
 	// reached a working-tree build, which generation a chained build could
 	// stand on (selectDirtyParent) and, when none, the fallback reason code.
@@ -591,6 +593,8 @@ type CheckoutCoordinator struct {
 	// selectionDemand promotes a queued build independently of the debounce
 	// signal. mu guards initialization; the buffered channel coalesces demand.
 	selectionDemand chan struct{}
+	ticketDemand    atomic.Int64
+	laneYields      int
 
 	// demand wakes the loop for a cycle without a quiet window: a refresh
 	// ticket (an MCP edit's committed content, or a request that needs a
@@ -1035,6 +1039,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	reason := c.reason
 	c.mu.Unlock()
 
+	preflightStarted := time.Now()
 	preflight := c.settledWithoutBuild
 	if c.cyclePreflight != nil {
 		preflight = c.cyclePreflight
@@ -1046,6 +1051,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		return
 	}
 
+	preflightDone := time.Now()
 	if through == 0 {
 		ctx = withPhaseRecord(ctx, c.openObservedChangeRecord(ctx))
 	}
@@ -1069,7 +1075,9 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		return
 	}
 	defer c.cycleMu.Unlock()
-	release, err := c.gate.AcquirePromotable(ctx, priority, c.selectionRequests())
+	laneQueued := time.Now()
+	laneBefore := c.gate.Stats()
+	release, err := c.gate.AcquireRanked(ctx, priority, c.selectionRequests(), c.ticketDemand.Load)
 	if err != nil {
 		if errors.Is(err, ErrViewBuildQueueFull) {
 			c.logger.Debug("checkout coordinator: build deferred by admission capacity",
@@ -1086,18 +1094,46 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		return
 	}
 	defer release()
+	admission := cycleAdmission{
+		Preflight: preflightDone.Sub(preflightStarted),
+		CycleLock: laneQueued.Sub(preflightDone),
+		Lane:      time.Since(laneQueued),
+	}
+	if laneBefore.Active {
+		admission.LaneHeldBy = laneBefore.Holder
+		if admission.LaneHeldBy == nil {
+			admission.LaneHeldBy = &ViewBuildLaneHolder{Kind: "undeclared", Since: laneBefore.ActiveSince}
+		}
+	}
+	defer c.gate.NoteHolder(ViewBuildLaneHolder{
+		Kind: "checkout_cycle", CheckoutID: c.checkoutID, Priority: viewBuildPriorityLabel(priority),
+	})()
+	var laneYield *backgroundLaneYield
+	if priority == ViewBuildBackground {
+		ctx, laneYield = armBackgroundLaneYield(ctx, c.gate, 0)
+		defer laneYield.close()
+	}
 	markPublicationPhase(ctx, PublicationAdmitted)
 	if c.cycleBarrier != nil {
 		c.cycleBarrier(ctx)
 	}
 	if err := ctx.Err(); err != nil {
 		out := CheckoutCycle{Err: err}
+		if laneYield.Yielded() {
+			out = c.yieldedCycle(out, admission)
+		}
 		recordCoordinatorCycle(out)
 		c.reportCheckoutCycle(ctx, through, out)
 		return
 	}
 	out := c.reconcile(ctx)
 	out.cycleStarted = cycleStarted
+	out.Admission = admission
+	if laneYield.Yielded() && out.Err != nil {
+		out = c.yieldedCycle(out, admission)
+	} else if priority == ViewBuildBackground {
+		c.resetBackgroundLaneYields()
+	}
 	recordCoordinatorCycle(out)
 	switch {
 	case out.Err != nil && !errors.Is(out.Err, context.Canceled):
@@ -1125,6 +1161,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 // resetBackgroundLaneYields records a background cycle that ran to an outcome.
 func (c *CheckoutCoordinator) resetBackgroundLaneYields() {
 	c.mu.Lock()
+	c.laneYields = 0
 	c.mu.Unlock()
 }
 
@@ -4122,6 +4159,52 @@ func (a ancestryRefFacts) LoadRefFactsByFiles(repoPrefix string, files []string)
 		}
 	}
 	return out, firstErr
+}
+
+// backgroundLaneYields is how many background cycles in a row yielded the lane.
+func (c *CheckoutCoordinator) backgroundLaneYields() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.laneYields
+}
+
+// yieldedCycle turns the outcome of a background cycle that was canceled to
+// give the lane up into a rescheduled one: nothing it began was published
+// (the builder abandons an unpublished generation on cancel), the route is as
+// the cycle found it, and the loop runs the cycle again through the quiet
+// window, queueing at background priority behind the interactive build. The
+// lane itself is released by the caller's deferred release when cycle returns.
+//
+// A cycle the lifetime canceled is not a yield, whatever the gate asked: it
+// stays an error so shutdown is not rescheduled.
+func (c *CheckoutCoordinator) yieldedCycle(out CheckoutCycle, admission cycleAdmission) CheckoutCycle {
+	if c.lifetimeContext().Err() != nil {
+		return out
+	}
+	c.mu.Lock()
+	c.laneYields++
+	yields := c.laneYields
+	c.mu.Unlock()
+	if out.Err != nil && !errors.Is(out.Err, context.Canceled) {
+		// Not necessarily the cancel itself (a wrapped build error, say);
+		// logged so a real failure hidden behind the yield stays visible.
+		c.logger.Debug("checkout coordinator: background cycle ended with an error while yielding the build lane",
+			zap.String("checkout", c.checkoutID), zap.Error(out.Err))
+	}
+	out.Err = nil
+	out.Rescheduled = true
+	out.YieldedTo = laneYieldedToInteractive
+	out.Admission = admission
+	viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeRescheduled)
+	c.logger.Info("checkout coordinator: background build yielded the lane to an interactive build",
+		zap.String("checkout", c.checkoutID),
+		zap.String("yielded_to", laneYieldedToInteractive),
+		zap.Int("attempt", yields),
+		zap.Int("max_yields", maxViewBuildYields),
+		zap.Bool("dirty_built", out.DirtyBuilt),
+		zap.Bool("commit_built", out.CommitBuilt))
+	c.Signal("background build yielded the lane to an interactive build")
+	return out
 }
 
 // SignalDemand wakes the loop for a cycle now, without the quiet window. It is
