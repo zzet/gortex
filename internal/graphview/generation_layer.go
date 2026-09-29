@@ -128,7 +128,12 @@ type GenerationLayer struct {
 	// Explicit mask-backed rows at unclaimed paths carry node identity. The
 	// checked marker-ID projection is captured once for this immutable layer;
 	// lower-row membership probes never turn into per-row SQL.
-	detachedIDs         map[string]struct{}
+	detachedIDs map[string]struct{}
+	// claimedIDs are identity-claimed rows carried at a covered path whose
+	// identity names no covered path (a shared registry row a file emits
+	// under an identity of its own). The file mask serves the row with its
+	// file; the claim is what makes the generation speak for the identity.
+	claimedIDs          map[string]struct{}
 	detachedNodes       []graph.Node
 	detachedFileIndexes map[string][]int
 	detachedPaths       map[string]struct{}
@@ -278,6 +283,12 @@ func NewGenerationLayerContext(ctx context.Context, handle *store_sqlite.Store) 
 			return nil, fmt.Errorf("graphview: invalid node identity in generation %d", generation)
 		}
 		if l.HasFile(node.FilePath) || l.isContextPath(node.FilePath) {
+			if l.HasFile(node.FilePath) && !l.CoversNodeID(node.ID) {
+				if l.claimedIDs == nil {
+					l.claimedIDs = make(map[string]struct{})
+				}
+				l.claimedIDs[node.ID] = struct{}{}
+			}
 			continue
 		}
 		if l.detachedIDs == nil {
@@ -404,6 +415,9 @@ func (l *GenerationLayer) OwnsNodeIdentity(id string) bool {
 	if _, replaced := l.detachedIDs[id]; replaced {
 		return true
 	}
+	if _, claimed := l.claimedIDs[id]; claimed {
+		return true
+	}
 	return l.CoversNodeID(id) && l.NodeByID(id) != nil
 }
 
@@ -416,12 +430,21 @@ func (l *GenerationLayer) OwnsNodeIdentity(id string) bool {
 // and an edge-source replacement marker, which is the case a
 // file-granular layer cannot express: the node stays where it was and
 // only what it points at moved.
+//
+// An explicit marker is honoured for a source at a claimed path too. The
+// sparse builder never writes one there (its markers cover unclaimed sources
+// only), but a per-file delta does when an evicted symbol's edges recorded in
+// OTHER files changed: the marker replaces exactly that symbol's adjacency,
+// where claiming the other files instead would hide their side tables.
 func (l *GenerationLayer) OwnsOutEdges(id string) bool {
-	if id == "" || l.CoversNodeID(id) {
+	if id == "" {
 		return false
 	}
 	if _, marked := l.edgeSources[id]; marked {
 		return true
+	}
+	if l.CoversNodeID(id) {
+		return false
 	}
 	// Identity-only masks do not own adjacency. Legacy tombstones retain
 	// outgoing ownership, whether or not they also carry a node row.

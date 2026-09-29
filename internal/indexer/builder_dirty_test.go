@@ -185,17 +185,11 @@ func TestDirtyLayerComposesLikeAFlatIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildDirtyLayer: %v", err)
 	}
-	if report.ClosureTruncated {
-		t.Fatalf("closure truncated at %d in a six-file fixture", report.ClosureCap)
-	}
-	// caller.go is dirty in no sense at all — it is the dependent the closure
-	// exists to find. island.go is neither dirty nor a dependent and must stay
-	// out of the generation entirely.
-	if !slices.Contains(report.ClosurePaths, "caller.go") {
-		t.Fatalf("closure %v does not carry caller.go", report.ClosurePaths)
-	}
-	if slices.Contains(report.IndexedPaths, "island.go") {
-		t.Fatalf("island.go is in the generation's file set %v — the build is not sparse", report.IndexedPaths)
+	// caller.go is dirty in no sense at all — it is the dependent whose call
+	// the delta re-binds without re-deriving it. island.go is neither dirty
+	// nor a dependent and must stay out of the generation entirely.
+	if slices.Contains(report.IndexedPaths, "caller.go") || slices.Contains(report.IndexedPaths, "island.go") {
+		t.Fatalf("the generation's file set %v holds more than the change set — the build is not a delta", report.IndexedPaths)
 	}
 	if report.DeleteMasks != 2 {
 		t.Fatalf("delete masks = %d, want gone.go and the rename's source", report.DeleteMasks)

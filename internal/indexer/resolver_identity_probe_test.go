@@ -1,16 +1,21 @@
 package indexer
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/resolver"
 )
 
 // TestResolverIdentityProbeInvalidationClasses prints, for each invalidation
@@ -79,6 +84,147 @@ func TestResolverIdentityProbeInvalidationClasses(t *testing.T) {
 	}
 }
 
+// TestResolverIdentityProbeRealRepoPayload applies one body edit of each file
+// in GX_RESOLVER_IDENTITY_REAL_FILES to a copy of GX_RESOLVER_IDENTITY_REAL_STORE
+// (a whole index of the clone at GX_RESOLVER_IDENTITY_REAL_TREE) through the
+// per-file delta path and prints, for every edge-source marker the generation
+// carries, the rows by which the source's served out-set differs from the
+// base: the rows the edit actually changed. Diagnostic only.
+func TestResolverIdentityProbeRealRepoPayload(t *testing.T) {
+	tree := os.Getenv("GX_RESOLVER_IDENTITY_REAL_TREE")
+	storePath := os.Getenv("GX_RESOLVER_IDENTITY_REAL_STORE")
+	if tree == "" || storePath == "" {
+		t.Skip("GX_RESOLVER_IDENTITY_REAL_TREE / _STORE not set")
+	}
+	builderIsolateGit(t)
+	cfg, err := config.Load(filepath.Join(tree, ".gortex.yaml"))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	editCfg := cfg.Index
+	files := strings.Split(os.Getenv("GX_RESOLVER_IDENTITY_REAL_FILES"), ",")
+	for _, rel := range files {
+		rel = strings.TrimSpace(rel)
+		if rel == "" {
+			continue
+		}
+		t.Run(strings.ReplaceAll(rel, "/", "_"), func(t *testing.T) {
+			full := filepath.Join(tree, filepath.FromSlash(rel))
+			original, err := os.ReadFile(full)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.WriteFile(full, original, 0o644) })
+			copyPath := filepath.Join(t.TempDir(), "store.sqlite")
+			if out, err := exec.Command("cp", "-c", storePath, copyPath).CombinedOutput(); err != nil {
+				t.Fatalf("clone store: %v %s", err, out)
+			}
+			store := builderOpenStoreAt(t, copyPath)
+			t.Cleanup(func() { _ = store.Close() })
+			logger := zap.NewNop()
+			if os.Getenv("GX_RESOLVER_IDENTITY_LOG") != "" {
+				t.Setenv("GX_DELTA_REAL_LOG", os.Getenv("GX_RESOLVER_IDENTITY_LOG"))
+				logger = editDeltaRealLogger(t)
+			}
+			builder := &SparseGenerationBuilder{Store: store, Registry: builderRegistry(), Config: editCfg, Logger: logger}
+			chains := newDirtyChainBuilder(t, builder, store, tree, true)
+			sampler, err := gitstate.NewDirtySampler(tree, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			chains.sampler = sampler
+			edited, ok := realRepositoryInsertBodyStatementN(string(original), 1)
+			if !ok {
+				t.Fatalf("no body in %s", rel)
+			}
+			if err := os.WriteFile(full, []byte(edited), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			recordLastEditDelta(nil)
+			started := time.Now()
+			id, _, chain := chains.build()
+			t.Logf("build %s: gen=%d %s", rel, id, time.Since(started))
+			rep := LastEditDeltaReport()
+			if rep == nil {
+				t.Fatalf("not built by the delta path")
+			}
+			t.Logf("delta: covered=%d claimed=%d payload=%d/%d markers=%d tombstones=%d",
+				rep.CoveredPaths, rep.ClaimedSources, rep.PayloadNodes, rep.PayloadEdges, rep.EdgeSources, rep.Tombstones)
+			db := parityOpenRaw(t, store)
+			rows, err := db.Query(`SELECT source_id FROM generation_edge_sources WHERE view_gen = ? ORDER BY source_id`, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var sources []string
+			for rows.Next() {
+				var s string
+				_ = rows.Scan(&s)
+				sources = append(sources, s)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			_ = rows.Close()
+			composed := dirtyChainComposed(t, store, chain)
+			graphPath := builderRepoPrefix + "/" + rel
+			beforeNodes := store.GetFileNodes(graphPath)
+			afterNodes := composed.GetFileNodes(graphPath)
+			sb, sa := resolver.DeclarationSurfaceOf(beforeNodes), resolver.DeclarationSurfaceOf(afterNodes)
+			for key, digest := range sa {
+				if sb[key] != digest {
+					t.Logf("surface key changed: %s", key)
+					if len(sb[key]) < 4000 {
+						t.Logf("   before %q", sb[key])
+						t.Logf("   after  %q", digest)
+					}
+				}
+			}
+			kinds := map[string]int{}
+			for _, src := range sources {
+				served := builderRenderEdges(composed.GetOutEdges(src))
+				base := builderRenderEdges(store.GetOutEdges(src))
+				sc, bc := map[string]int{}, map[string]int{}
+				for _, r := range served {
+					sc[r]++
+				}
+				for _, r := range base {
+					bc[r]++
+				}
+				changed := 0
+				for r, n := range sc {
+					if bc[r] != n {
+						changed++
+						if changed <= 3 {
+							t.Logf("  %s served-only %s", src, r)
+						}
+					}
+				}
+				for r, n := range bc {
+					if sc[r] != n {
+						changed++
+						if changed <= 6 {
+							t.Logf("  %s base-only   %s", src, r)
+						}
+					}
+				}
+				for _, e := range composed.GetOutEdges(src) {
+					if e.FilePath != graphPath {
+						t.Logf("  %s served elsewhere: %s", src, builderRenderEdge(e))
+					}
+				}
+				for _, e := range store.GetOutEdges(src) {
+					if e.FilePath != graphPath {
+						t.Logf("  %s base elsewhere:   %s", src, builderRenderEdge(e))
+					}
+				}
+				kinds[fmt.Sprintf("out=%d changed=%d", len(served), changed)]++
+				t.Logf("marker %s: served out=%d base out=%d changed rows=%d", src, len(served), len(base), changed)
+			}
+			t.Logf("markers=%d %v", len(sources), kinds)
+		})
+	}
+}
+
 // TestResolverIdentityProbeStdlibSpelling prints the stdlib/dep rows of a
 // whole index and of a per-save of the same tree. Diagnostic only.
 func TestResolverIdentityProbeStdlibSpelling(t *testing.T) {
@@ -138,42 +284,20 @@ func TestResolverIdentityProbeStdlibSpelling(t *testing.T) {
 	}
 }
 
-// primaryPerSaveOf indexes HEAD of repoDir whole into a fresh store, brings a
-// scratch checkout to the working tree's bytes at paths, and applies them
-// through the primary per-save path.
-func primaryPerSaveOf(t *testing.T, repoDir string, paths []string, cfg config.IndexConfig) *store_sqlite.Store {
-	t.Helper()
-	scratch := builderTempDir(t, "primary")
-	builderGit(t, repoDir, "worktree", "add", "--detach", scratch, "HEAD")
-	store := builderOpenStore(t, "primary")
-	idx := New(store, builderRegistry(), cfg, zap.NewNop())
-	t.Cleanup(func() { idx.Close() })
-	idx.SetRepoPrefix(builderRepoPrefix)
-	idx.SetWorkspaceID(builderRepoPrefix)
-	idx.SetProjectID(builderRepoPrefix)
-	if _, err := idx.Index(scratch); err != nil {
-		t.Fatalf("primary index: %v", err)
-	}
-	for _, rel := range paths {
-		src := filepath.Join(repoDir, filepath.FromSlash(rel))
-		dst := filepath.Join(scratch, filepath.FromSlash(rel))
-		data, err := os.ReadFile(src)
-		switch {
-		case err == nil:
-			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-				t.Fatalf("mkdir %s: %v", dst, err)
-			}
-			if err := os.WriteFile(dst, data, 0o644); err != nil {
-				t.Fatalf("write %s: %v", dst, err)
-			}
-		case os.IsNotExist(err):
-			_ = os.Remove(dst)
-		default:
-			t.Fatalf("read %s: %v", src, err)
+// realRepositoryInsertBodyStatementN adds `_ = n` as the first statement of
+// the first function whose signature ends its line with an opening brace. The
+// edit changes no declaration, import or signature: a body edit.
+func realRepositoryInsertBodyStatementN(src string, n int) (string, bool) {
+	lines := strings.SplitAfter(src, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(trimmed, "func ") && strings.HasSuffix(trimmed, "{") {
+			out := make([]string, 0, len(lines)+1)
+			out = append(out, lines[:i+1]...)
+			out = append(out, "\t_ = "+strconv.Itoa(n)+"\n")
+			out = append(out, lines[i+1:]...)
+			return strings.Join(out, ""), true
 		}
 	}
-	if _, err := idx.IncrementalReindexPaths(scratch, paths); err != nil {
-		t.Fatalf("primary per-save: %v", err)
-	}
-	return store
+	return "", false
 }

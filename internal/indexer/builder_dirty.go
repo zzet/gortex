@@ -270,7 +270,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		baseCensus, baseCensusFunc = req.baseCensus, req.baseCensusFunc
 	}
 
-	generationID, report, err := b.Build(ctx, BuildRequest{
+	generationID, report, err := b.buildWorkingTreeLayer(ctx, BuildRequest{
 		Identity:    identity,
 		Base:        req.Base,
 		Target:      target,

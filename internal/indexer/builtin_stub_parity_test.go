@@ -1,6 +1,8 @@
 package indexer
 
 import (
+	"context"
+	"slices"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -50,5 +52,79 @@ func TestWholeIndexStampsBuiltinStubsWithTheRepositoryBoundary(t *testing.T) {
 	intID := builderRepoPrefix + "::builtin::go::type::int"
 	if n := store.GetNode(intID); n == nil || n.WorkspaceID != builderRepoPrefix || n.ProjectID != builderRepoPrefix {
 		t.Errorf("GetNode(%s) = %+v, want the repository-stamped stub", intID, n)
+	}
+}
+
+// TestDirtyLayerBuiltinStubMatchesAWholeIndex is the direct regression of the
+// one identity the clean-parity oracle used to find: a working-tree generation
+// re-carries the builtin stub stamped, and a clean index of the same checkout
+// must serve the identical row.
+func TestDirtyLayerBuiltinStubMatchesAWholeIndex(t *testing.T) {
+	builderIsolateGit(t)
+	store := builderOpenStore(t, "builtin-dirty-base")
+	repoDir := builderTempDir(t, "checkout")
+	builderGit(t, repoDir, "init", "--initial-branch=main")
+	builderWriteTree(t, repoDir, builtinStubTree(false))
+	builderGit(t, repoDir, "add", "-A")
+	builderGit(t, repoDir, "commit", "-q", "-m", "base")
+	builderIndex(t, store, repoDir)
+
+	builderWriteTree(t, repoDir, builtinStubTree(true))
+	recordLastEditDelta(nil)
+	generationID, _, err := builderNewBuilder(store).BuildDirtyLayer(context.Background(), DirtyLayerRequest{
+		Identity:     builderDirtyIdentity(),
+		Base:         store,
+		CheckoutRoot: repoDir,
+		RepoPrefix:   builderRepoPrefix,
+		WorkspaceID:  builderRepoPrefix,
+		ProjectID:    builderRepoPrefix,
+	})
+	if err != nil {
+		t.Fatalf("BuildDirtyLayer: %v", err)
+	}
+	if delta := LastEditDeltaReport(); delta == nil || delta.IdentityClaims == 0 {
+		t.Fatal("the generation claims no pathless builtin — it pins nothing")
+	}
+
+	clean := builderOpenStore(t, "builtin-dirty-clean")
+	builderIndex(t, clean, repoDir)
+	composed := builderComposed(t, store, generationID)
+	for _, id := range []string{
+		builderRepoPrefix + "::builtin::go::type::int",
+		builderRepoPrefix + "::builtin::go::len",
+	} {
+		got, want := builderRenderNode(composed.GetNode(id)), builderRenderNode(clean.GetNode(id))
+		if got != want {
+			t.Errorf("%s: the composed view serves\n  %s\nthe clean index serves\n  %s", id, got, want)
+		}
+	}
+	// Every surface matches a clean index strictly; nodes too, except the
+	// clone signature of the edited function, which the per-file delta does
+	// not recompute (a documented class: the delta's private indexer holds no
+	// corpus to sign against).
+	result := assertCleanIndexParity(t, store, generationID, repoDir, "builtin-dirty", false)
+	if !result.EdgesEqual || !result.FilesEqual || !result.SemanticEqual || !result.ConstantsEqual ||
+		!result.SymbolFTSEqual || !result.MasksValid {
+		t.Errorf("the composed view does not match the clean index: %+v", result)
+	}
+	withoutCloneSig := func(nodes []*graph.Node) []string {
+		out := make([]*graph.Node, 0, len(nodes))
+		for _, n := range nodes {
+			if n != nil && n.Meta["clone_sig"] != nil {
+				c := *n
+				c.Meta = make(map[string]any, len(n.Meta))
+				for k, v := range n.Meta {
+					if k != "clone_sig" {
+						c.Meta[k] = v
+					}
+				}
+				n = &c
+			}
+			out = append(out, n)
+		}
+		return builderRenderNodes(out)
+	}
+	if got, want := withoutCloneSig(composed.AllNodes()), withoutCloneSig(clean.AllNodes()); !slices.Equal(got, want) {
+		t.Errorf("the composed nodes differ from the clean index beyond clone signatures: %v", parityDiff("nodes", got, want))
 	}
 }

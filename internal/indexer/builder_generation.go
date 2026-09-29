@@ -368,10 +368,6 @@ type BuildReport struct {
 	PassNodeCount int
 	PassEdgeCount int
 
-	// DeclaredContextSeeded lists, sorted, the declared closure context paths
-	// the pass seeded from the layer below instead of parsing them.
-	DeclaredContextSeeded []string
-
 	// ContextPaths lists, in sorted order, the closure paths the generation
 	// declared read-only context: files the pass read to resolve the change
 	// set, whose re-derivation matched the layer below exactly, and which the
@@ -435,12 +431,6 @@ type BuildReport struct {
 	// build did not ask for it.
 	Enrichment EnrichmentOutcome
 
-	// WAL is the write-ahead log the store appended while the build ran
-	// (store_sqlite.WALWrittenBetween over marks taken at its start and
-	// end): the per-edit log cost a reader pinned across the edit holds.
-	// Filled by the working-tree entry points; zero-valued otherwise.
-	WAL store_sqlite.WALWriteDelta
-
 	// PlanningDuration is the wall time spent selecting the sparse file set.
 	PlanningDuration time.Duration
 	// Duration is the wall time of the whole build.
@@ -462,6 +452,12 @@ type BuildReport struct {
 	// generation stored: every sampled path for a full manifest, only the
 	// paths that differ from the parent's for a delta.
 	ManifestEntriesWritten int
+
+	// WAL is the write-ahead log the store appended while the build ran
+	// (store_sqlite.WALWrittenBetween over marks taken at its start and
+	// end): the per-edit log cost a reader pinned across the edit holds.
+	// Filled by the working-tree entry points; zero-valued otherwise.
+	WAL store_sqlite.WALWriteDelta
 }
 
 // SparseGenerationBuilder builds sparse payload generations over one store.
@@ -673,7 +669,6 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		var separation contextSeparation
 		if adopted || len(plan.indexed) > 0 {
 			var err error
-			plan.seeded, plan.seedBase = decideDeclaredSeed(req, plan)
 			if separation, err = b.runPass(ctx, req, plan, handle, &report); err != nil {
 				return err
 			}
@@ -829,13 +824,6 @@ type buildPlan struct {
 	// against a corpus that deliberately omits what IT resolves into, so it is
 	// never compared with the layer below: it is withheld whole.
 	declared map[string]struct{}
-	// seeded is the repo-relative subset of declared that the pass seeds from
-	// the layer below instead of parsing (builder_declared_context.go),
-	// decided once before the pass so both context routes see the same set.
-	// seedBase holds the layer below's nodes at those paths, read for that
-	// decision and reused by the seed.
-	seeded   []string
-	seedBase map[string][]*graph.Node
 }
 
 func (b *SparseGenerationBuilder) planFileSetContext(
@@ -1032,14 +1020,7 @@ func (b *SparseGenerationBuilder) runPass(
 		idx.parseAdmission.Store(b.Admissions.parseAdmission.Load())
 		idx.nativeParseAdmission.Store(b.Admissions.nativeParseAdmission.Load())
 	}
-	// Declared context is seeded from the layer below instead of parsed
-	// (builder_declared_context.go); the parse reads the rest of the plan.
-	seeded := plan.seeded
-	if len(seeded) > 0 {
-		idx.setPassCorpusSeed(declaredContextSeed(req.Base, req.RepoPrefix, seeded, plan.seedBase, b.Logger))
-		report.DeclaredContextSeeded = seeded
-	}
-	idx.setContentSourceWithManifests(report.Work.extractionSource(newFileSetSource(req.Target, parsedPlanPaths(plan.indexed, seeded))), req.Target)
+	idx.setContentSourceWithManifests(report.Work.extractionSource(newFileSetSource(req.Target, plan.indexed)), req.Target)
 
 	result, err := idx.IndexCtx(ctx, req.RootPath)
 	if err != nil {
@@ -1331,10 +1312,6 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 			}
 		}
 	}
-	seededPaths := make(map[string]struct{}, len(plan.seeded))
-	for _, rel := range plan.seeded {
-		seededPaths[builderGraphPath(req.RepoPrefix, rel)] = struct{}{}
-	}
 	withheld := make(map[string]struct{}, len(contextPaths))
 	var withheldPaths []string
 	var withheldContracts []string
@@ -1369,15 +1346,6 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 			withheldContracts = append(withheldContracts, contractIDsAt[graphPath]...)
 			declaredWithheld = true
 			continue
-		}
-		if _, isSeeded := seededPaths[graphPath]; isSeeded {
-			// A seeded path carries only the subset of the file the change
-			// set binds into. Keeping it would write that subset under a
-			// replace mask and hide the rest of the file's payload below, so
-			// a seeded path is withheld or the build is refused.
-			return contextSeparation{}, fmt.Errorf(
-				"indexer: seeded declared context %q cannot be withheld (content body %v); a partial payload is never published",
-				graphPath, carried.holdsContentBody(graphPath))
 		}
 		if _, hasContract := contractPaths[graphPath]; hasContract {
 			out.retainedPaths = append(out.retainedPaths, graphPath)
@@ -2907,24 +2875,6 @@ func (b *SparseGenerationBuilder) separateAndPrune(
 	}
 	if err := purgeIdentitySidecars(corpus, pruned); err != nil {
 		return contextSeparation{}, err
-	}
-	// Invariant: seeded payload never reaches the generation. A seeded path
-	// is withheld whole or the withholding refused the build; a node still at
-	// one here would be written as the seeded subset of its file.
-	if len(plan.seeded) > 0 {
-		seededPaths := make(map[string]struct{}, len(plan.seeded))
-		for _, rel := range plan.seeded {
-			seededPaths[builderGraphPath(req.RepoPrefix, rel)] = struct{}{}
-		}
-		for _, node := range corpus.AllNodes() {
-			if node == nil {
-				continue
-			}
-			if _, isSeeded := seededPaths[node.FilePath]; isSeeded {
-				return contextSeparation{}, fmt.Errorf(
-					"indexer: seeded payload %q at %q survived the withholding; refusing to publish a partial file", node.ID, node.FilePath)
-			}
-		}
 	}
 	return separation, nil
 }

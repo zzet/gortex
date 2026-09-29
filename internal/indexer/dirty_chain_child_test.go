@@ -311,7 +311,7 @@ func TestDirtyChildSamePackageIsolatesOutput(t *testing.T) {
 	r.parity(chain, "same-package")
 }
 
-func TestDirtyChildSignatureChangeReDerivesDependents(t *testing.T) {
+func TestDirtyChildSignatureChangeKeepsDependentsBound(t *testing.T) {
 	r := newChainChildRun(t, "signature", accumulatedDirtyIndependent, 3)
 	r.write("chain/b/b.go", `package b
 
@@ -322,9 +322,11 @@ func B(delta int) int {
 	return c.C() + delta
 }
 `)
+	// a, the changed signature's caller, is not re-derived: the delta re-binds
+	// its call through the incoming leg.
 	id, report, chain := r.child(r.root)
-	if !slices.Contains(report.ClosurePaths, "chain/a/a.go") {
-		t.Errorf("the closure %v does not name a, the changed signature's caller", report.ClosurePaths)
+	if slices.Contains(report.IndexedPaths, "chain/a/a.go") {
+		t.Errorf("the child re-derived the caller a: %v", report.IndexedPaths)
 	}
 	r.assertOnlyTouched(id, report)
 	composed := dirtyChainComposed(t, r.store, chain)
@@ -355,4 +357,44 @@ func (r *chainChildRun) assertOnlyTouched(id int64, report BuildReport, touched 
 			r.t.Errorf("the child stores node rows at the untouched dirty file %s", rel)
 		}
 	}
+}
+
+func TestDirtyChildReusesParentPayload(t *testing.T) {
+	r := newChainChildRun(t, "reuse", accumulatedDirtyIndependent, accumulatedDirtyUnits)
+	edited := accumulatedDirtyUnitPath(accumulatedDirtyIndependent, accumulatedDirtyBodyTarget)
+	accumulatedDirtyWriteUnit(t, r.repoDir, accumulatedDirtyIndependent, accumulatedDirtyBodyTarget, true, false)
+
+	recordLastEditDelta(nil)
+	id, report, chain := r.child(r.root)
+	if got, want := report.IndexedPaths, []string{edited}; !slices.Equal(got, want) {
+		t.Errorf("the child indexed %v, want the edited file alone %v", got, want)
+	}
+	if delta := LastEditDeltaReport(); delta == nil || !slices.Equal(delta.Paths, []string{edited}) || len(delta.SharedRowEmitters) > 0 {
+		t.Errorf("the child's delta re-derived %+v, want the edited file alone", delta)
+	}
+	if got := report.Work.ReusedPriorPayloadFiles; got != accumulatedDirtyUnits {
+		t.Errorf("the child reused %d parent files, want %d", got, accumulatedDirtyUnits)
+	}
+	if report.ManifestEntriesWritten != 1 {
+		t.Errorf("the child wrote %d manifest rows, want 1 (the edited path)", report.ManifestEntriesWritten)
+	}
+	r.assertOnlyTouched(id, report, edited)
+	for _, f := range r.nodeFiles(id) {
+		if f != "" && f != builderRepoPrefix+"/"+edited {
+			t.Errorf("the child stores node rows at %s", f)
+		}
+	}
+	census, err := r.store.GenerationPayloadRowCensus(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if census.NodeFiles > 2 {
+		t.Errorf("the child stores nodes at %d files, want the edited file and the pathless stubs", census.NodeFiles)
+	}
+	meta, entries, found, err := r.store.AtGeneration(id).InputManifest(context.Background())
+	if err != nil || !found || meta.IsFull || len(entries) != 1 || entries[0].FilePath != edited {
+		t.Errorf("the child's manifest is meta=%+v entries=%+v found=%v err=%v, want one delta row for %s",
+			meta, entries, found, err, edited)
+	}
+	r.parity(chain, "reuse")
 }

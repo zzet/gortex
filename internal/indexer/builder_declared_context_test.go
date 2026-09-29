@@ -2,7 +2,6 @@ package indexer
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 	"testing"
 )
@@ -82,64 +81,4 @@ func TestDeclaredContextKeepsCleanIndexParity(t *testing.T) {
 		t.Fatalf("no declared context was read: closure=%v", report.ClosurePaths)
 	}
 	assertCleanIndexParity(t, store, generationID, repoDir, "declared-context", true)
-}
-
-// TestDeclaredContextSeedParsesOnlyTheChangeSet: with declared context seeded
-// from the layer below, a body edit parses the edited file and the manifest
-// alone, the declared file it calls into is neither parsed nor written, the
-// type-resolved call into it survives, and the served view matches a clean
-// semantic index.
-func TestDeclaredContextSeedParsesOnlyTheChangeSet(t *testing.T) {
-	t.Setenv("GORTEX_CLOSURE_SEED_DECLARED", "on")
-	module := accumulatedDirtyModule
-	f, c, mgr := scopeChainFixture(t, true, nil)
-	builderWriteFile(t, f.worktree, "chain/a/a.go", `package a
-
-import "`+module+`/chain/b"
-
-// X takes its type from b.B.
-var X = b.B()
-
-// A calls down the chain.
-func A() int {
-	v := b.B()
-	_ = v
-	v++
-	return 1
-}
-`)
-	out := coordinatorReconcile(t, c)
-	if out.DirtyParentGenerationID == 0 || out.DirtyWork == nil {
-		t.Fatalf("the edit = %+v, want a chained build", out)
-	}
-	w := out.DirtyWork
-	t.Logf("parser_inputs=%d paths=%v withheld=%d retained=%d", w.ParserInputs, w.ParserInputPaths, w.ContextWithheldFiles, w.ContextRetainedFiles)
-	if want := []string{"chain/a/a.go", "go.mod"}; !slices.Equal(w.ParserInputPaths, want) {
-		t.Errorf("parsed %v, want only the edited file and the manifest %v", w.ParserInputPaths, want)
-	}
-	if w.ContextRetainedFiles != 0 {
-		t.Errorf("a body edit retained %d context files", w.ContextRetainedFiles)
-	}
-	if !scopeHasSemanticEdge(t, f, "chain/a/a.go::A", "chain/b/b.go::B") {
-		t.Error("the served view lost the type-resolved call A -> b.B")
-	}
-	assertSemanticParity(t, f, mgr, "seeded-declared-context")
-}
-
-// TestNameScopedSeedKeepsCleanIndexParity: with the seed scoped to the
-// declarations the change set names (the default), a body edit that reaches a
-// declared method through a declared constructor's result type still serves
-// exactly what a clean index serves.
-func TestNameScopedSeedKeepsCleanIndexParity(t *testing.T) {
-	for _, scope := range []string{"names", "files"} {
-		t.Run(scope, func(t *testing.T) {
-			t.Setenv("GORTEX_CLOSURE_SEED_SCOPE", scope)
-			store := builderOpenStore(t, "name-seed-"+scope)
-			repoDir, generationID, report := builderContextGeneration(t, store, memberChainTree(false), memberChainTree(true))
-			if len(report.DeclaredContextSeeded) == 0 {
-				t.Fatalf("nothing was seeded: declared=%v", report.ClosureDeclaredPaths)
-			}
-			assertCleanIndexParity(t, store, generationID, repoDir, "name-seed-"+scope, true)
-		})
-	}
 }

@@ -1149,6 +1149,18 @@ func restubIncomingRefsFromView(
 							carried = append(carried, edge)
 						}
 					}
+				} else {
+					// The owner's contract changed: its callers' arguments
+					// go back to the owner (argOfIntoSurvivingOwner) for the
+					// affected-by pass to re-materialize.
+					for _, edge := range view.inByNode[node.ID] {
+						if _, sourceEvicted := evicted[edge.From]; edge == nil || sourceEvicted {
+							continue
+						}
+						if moved := argOfIntoSurvivingOwner(frontier, node, edge); moved != nil {
+							carried = append(carried, moved)
+						}
+					}
 				}
 				continue
 			}
@@ -2038,6 +2050,9 @@ func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) {
 	}
 	idx.observeIncrementalCatchup("affected_by", plan.files)
 	idx.resolver.ResolveFilesAndIncoming(plan.files)
+	// A changed contract moved the referrers' arguments back to the callee
+	// (argOfIntoSurvivingOwner); map them onto its current parameters.
+	idx.materializeDataflowParamsForFiles(plan.files)
 	resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), plan.files)
 }
 
