@@ -1936,6 +1936,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.NodesByKindsSequencer)(nil), probe: "NodesByKindsSeq"},
 		{iface: (*graph.NodesInFilesByKindFinder)(nil), probe: "NodesInFilesByKind"},
 		{iface: (*graph.OverrideDispatchCallBatchScanner)(nil), probe: "ScanOverrideDispatchCalls"},
+		{iface: (*graph.PathlessNodeBatchEvicter)(nil), skip: skipWrite, writeFence: writerFamilyFence("pathless_node_evict")},
 		{iface: (*graph.PlannerStatsFreshener)(nil), skip: skipPhysical},
 		{iface: (*graph.QualifiedNodeIdentitySequencer)(nil), probe: "NodesInScopeSeq"},
 		{iface: (*graph.RecordedEdgeReader)(nil), probe: "RecordedEdgesAt"},

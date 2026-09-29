@@ -702,6 +702,18 @@ func generationWriteCases() []generationWriteCase {
 			},
 		},
 		{
+			name: "pathless_node_evict",
+			seed: func(t *testing.T, base, derived *Store) {
+				addToBothGenerations(base, derived, generationWriteContractMaterial)
+			},
+			disturb: func(t *testing.T, s *Store) {
+				nodes, edges := s.EvictPathlessNodesByIDs([]string{genWriteContract})
+				if nodes != 1 || edges != 1 {
+					t.Fatalf("EvictPathlessNodesByIDs removed (%d nodes, %d edges), want (1, 1)", nodes, edges)
+				}
+			},
+		},
+		{
 			name: "contract_owner_replace",
 			seed: func(t *testing.T, base, derived *Store) {
 				addToBothGenerations(base, derived, generationWriteContractMaterial)
