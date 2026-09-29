@@ -3022,8 +3022,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if idx.passCorpusFilter == nil || ctx.Err() != nil {
 				return nil, err
 			}
-			idx.logger.Debug("indexer: no shadow slot for a filtered pass; writing and withdrawing instead",
-				zap.String("repo", idx.RepoPrefix()), zap.Error(err))
+			idx.logger.Info("indexer: no shadow slot for a filtered pass; writing and withdrawing instead",
+				zap.String("repo", idx.RepoPrefix()),
+				zap.Duration("wait_budget", admissionWait), zap.Error(err))
 			shadowLease = nil
 		}
 	}
@@ -3056,6 +3057,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		zap.Uint64("shadow_admissions", shadowStats.admissions),
 		zap.Uint64("shadow_queued_admissions", shadowStats.queued),
 		zap.Duration("shadow_waited", time.Since(shadowAdmissionStarted)),
+		zap.Duration("shadow_wait_budget", admissionWait),
 		zap.Bool("shadow_budget_granted", shadowTaken),
 		zap.Bool("shadow_taken", shadowTaken),
 	)
