@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -779,6 +780,12 @@ func TestPrivateGenerationFirstEdgeIndexQuiescesScheduledDrain(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	store.passiveCheckpointTimeout = time.Nanosecond
+	// Keep the window end on its inline PASSIVE (which the nanosecond budget
+	// times out) instead of the large-backlog deferral, which measures the
+	// residue from the wal-index and schedules the drain.
+	previousMaxFrames := generationInlineCheckpointMaxFrames
+	generationInlineCheckpointMaxFrames = math.MaxInt64
+	t.Cleanup(func() { generationInlineCheckpointMaxFrames = previousMaxFrames })
 
 	beforeRequests := store.walDrainRequests.Load()
 	privateInsertGeneratedEdgesBulk(t, store, 201, 0, 25_000, 8_192)

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -45,7 +47,7 @@ func (s *Store) emitBulkFinalizeEvent(event bulkFinalizeEvent) {
 		log.Printf("store_sqlite: bulk finalize stage=%s name=%s elapsed=%s nodes=%d edges=%d error=%q", event.Stage, event.Name, event.Elapsed, event.NodeRows, event.EdgeRows, event.Err)
 		return
 	}
-	if event.Stage == "checkpoint" || event.Stage == "checkpoint_passive" {
+	if event.Stage == "checkpoint" || event.Stage == "checkpoint_passive" || event.Stage == "checkpoint_deferred" {
 		log.Printf("store_sqlite: bulk finalize stage=%s name=%s elapsed=%s busy=%d wal_frames=%d checkpointed_frames=%d", event.Stage, event.Name, event.Elapsed, event.Busy, event.WALFrames, event.CheckpointedFrames)
 		return
 	}
@@ -200,6 +202,42 @@ const (
 	// this one terminal PASSIVE drain gets a larger, still-bounded I/O window.
 	bulkFinalCheckpointTimeout = 30 * time.Second
 )
+
+// A generation bulk window is the write half of an interactive build: its
+// rows are what a checkout view waits on, so a checkpoint it runs inline is
+// charged straight to publication. The window therefore copies no backlog
+// inline. At every row-limit interval and at window end it reads the backlog
+// from the wal-index (a lock-free read of the -shm header, microseconds) and
+// defers: the residue gate at window end schedules the maintenance lane's
+// drain, and the WAL reclaim poller takes over once the window's checkpoint
+// lease is released. Only a backlog within generationInlineCheckpointMaxFrames
+// (zero by default: nothing left to copy) or an unreadable wal-index still
+// runs a PASSIVE inline, bounded by generationInlineCheckpointWindow.
+//
+// Why no inline copy at all: SQLite publishes checkpoint progress (nBackfill)
+// only when a pass completes, so a pass cut off by its deadline records nothing
+// and the next one copies the same frames again; the live log showed
+// "checkpoint_passive name=row_limit elapsed=1.0s error=context deadline
+// exceeded" at every row-limit interval plus a second one at window end. And
+// even a completed small copy is not cheap: on the real-repository clone at
+// GOMAXPROCS=1 a window-end PASSIVE took 822 ms for 3,392 frames and 381 ms
+// for 1,398 (two syncs plus ~0.2 ms a frame), and a 50 ms deadline on the
+// latter returned only after 232 ms because the copy checks for an interrupt
+// between pages.
+//
+// Variables rather than constants so tests can pin both branches.
+// GORTEX_SQLITE_GENERATION_CHECKPOINT=inline restores the former policy (an
+// inline PASSIVE bounded at the routine passive window at every row-limit
+// interval and at window end, and the residue drain scheduled at window end
+// rather than after publication) for comparison and as a kill switch.
+var (
+	generationInlineCheckpointWindow    = 50 * time.Millisecond
+	generationInlineCheckpointMaxFrames = int64(0)
+)
+
+func generationCheckpointInlinePolicy() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("GORTEX_SQLITE_GENERATION_CHECKPOINT")), "inline")
+}
 
 // bulkCacheSizeKiB is the page cache the fast path requests on its pinned
 // connection. SQLite reads a negative cache_size as a KiB budget, so this is
@@ -603,8 +641,11 @@ func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
 // the readers this window runs beside are generation 0's — the ones a
 // committed-base build exists to keep serving. Charging that wait to the build
 // is the coupling the maintenance lane exists to remove, so the measurement
-// happens inline (one PASSIVE, which never waits for a reader) and the
-// follow-up TRUNCATE runs on the lane.
+// happens inline and the follow-up TRUNCATE runs on the lane. The measurement
+// is the wal-index backlog, plus a PASSIVE only when that backlog is small
+// enough to copy inside generationInlineCheckpointWindow (see
+// generationWindowCheckpointLocked); a large backlog is never copied on the
+// publication path.
 //
 // Idempotent and inert when no generation window is open, so a deferred call
 // is always safe.
@@ -637,7 +678,8 @@ func (s *Store) endGenerationBulkLoad(expectedGeneration int64) error {
 		s.writeMu.Unlock()
 		return nil
 	}
-	result, _ := s.checkpointBulkWALPassiveResultLockedWithin("generation_bulk_end", s.passiveCheckpointWindow())
+	s.noteGenerationWriteWindowClose(context.Background(), s.bulkConn, generationID)
+	result := s.generationWindowCheckpointLocked("generation_bulk_end")
 	closeErr := s.closeBulkConnectionLocked()
 	s.jsonbIngestBuffers.release()
 	// Clear the matching bound generation while writeMu still protects the
@@ -646,8 +688,55 @@ func (s *Store) endGenerationBulkLoad(expectedGeneration int64) error {
 	s.writeMu.Unlock()
 	s.releaseGenerationBulkCheckpointLease(lease)
 	s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "generation_bulk_end", Name: strconv.FormatInt(generationID, 10), WALFrames: result.WALFrames, CheckpointedFrames: result.CheckpointedFrames})
-	s.scheduleWALDrainAboveLine(result, "generation_bulk_load")
+	if generationCheckpointInlinePolicy() {
+		s.scheduleWALDrainAboveLine(result, "generation_bulk_load")
+	} else {
+		s.oweWALDrainAfterPublication(result, "generation_bulk_load")
+	}
 	return closeErr
+}
+
+// generationDrainWakeDelay bounds how long a drain owed by a generation window
+// waits for the publication that normally follows the window. A var only so
+// tests can shorten it.
+var generationDrainWakeDelay = 30 * time.Second
+
+// oweWALDrainAfterPublication is the residue gate of a generation window. It
+// owes the maintenance lane's drain exactly when scheduleWALDrainAboveLine
+// would, but does not wake the lane: the window closes immediately before the
+// build publishes, and a TRUNCATE started now copies the residue under the
+// write gate that PublishPayloadGeneration must take next (measured on the
+// real-repository clone: publication 1.8 s -> 6.5 s behind a 127,916-frame
+// drain). The publication's own maintenance request wakes the lane after the
+// generation is published, and the lane runs an owed drain before anything
+// else. A window whose build never publishes wakes the lane after
+// generationDrainWakeDelay instead, so the drain is never stranded.
+func (s *Store) oweWALDrainAfterPublication(result walCheckpointResult, boundary string) {
+	line := sqliteWALAutoCheckpointPages()
+	if line <= 0 || result.WALFrames < 0 || result.WALFrames <= line || s.coreless() {
+		return
+	}
+	s.walDrainRequests.Add(1)
+	s.maintenanceSched.Lock()
+	if s.maintenanceClosed || s.maintenanceSignal == nil || s.maintenanceDrainOwed {
+		s.maintenanceSched.Unlock()
+		return
+	}
+	s.maintenanceDrainOwed = true
+	s.maintenanceDrainReason = boundary
+	signal := s.maintenanceSignal
+	s.maintenanceSched.Unlock()
+	time.AfterFunc(generationDrainWakeDelay, func() {
+		s.maintenanceSched.Lock()
+		defer s.maintenanceSched.Unlock()
+		if s.maintenanceClosed || !s.maintenanceDrainOwed || s.maintenanceSignal != signal {
+			return
+		}
+		select {
+		case signal <- struct{}{}:
+		default:
+		}
+	})
 }
 
 // ErrGenerationBulkCheckpointBusy reports that a periodic checkpoint still
@@ -960,10 +1049,57 @@ func (s *Store) noteBulkRowsLocked(nodeRows, edgeRows int) error {
 	nodeInterval, edgeInterval := s.bulkCheckpointIntervalsLocked()
 	if s.bulkCheckpointNodeRows >= nodeInterval ||
 		s.bulkCheckpointEdgeRows >= edgeInterval {
+		if s.generationBulkLoad != 0 && !generationCheckpointInlinePolicy() {
+			s.generationWindowCheckpointLocked("row_limit")
+			return nil
+		}
 		err := s.checkpointBulkWALPassiveLocked("row_limit")
 		s.noteBulkRowCheckpointResultLocked(err)
 	}
 	return nil
+}
+
+// generationWindowCheckpointLocked is the checkpoint policy of a generation
+// bulk window (see generationInlineCheckpointWindow). The caller holds writeMu
+// and the window's pinned writer.
+//
+// It returns the WAL shape the residue gate needs: the PASSIVE's own counters
+// when one ran, the wal-index header's otherwise (mxFrame as the log's frame
+// count, nBackfill as the frames already copied) — the same two quantities.
+// When the wal-index cannot be read it falls back to a bounded PASSIVE, so the
+// gate always acts on a measurement.
+//
+// A deferred or failed attempt backs the automatic row cadence off for the
+// rest of the window: one deferral already proves the backlog outgrew the
+// inline budget, and it only grows while the window writes.
+func (s *Store) generationWindowCheckpointLocked(boundary string) walCheckpointResult {
+	if generationCheckpointInlinePolicy() {
+		result, _ := s.checkpointBulkWALPassiveResultLockedWithin(boundary, s.passiveCheckpointWindow())
+		return result
+	}
+	nodeRows, edgeRows := s.bulkCheckpointNodeRows, s.bulkCheckpointEdgeRows
+	snap, ok := readWALIndexSnapshot(s.dbPath)
+	if !ok || snap.PendingFrames() <= generationInlineCheckpointMaxFrames {
+		window := generationInlineCheckpointWindow
+		if configured := s.passiveCheckpointWindow(); configured < window {
+			window = configured
+		}
+		result, err := s.checkpointBulkWALPassiveResultLockedWithin(boundary, window)
+		if err != nil {
+			s.bulkRowCheckpointBackoff = true
+		}
+		return result
+	}
+	s.bulkCheckpointNodeRows = 0
+	s.bulkCheckpointEdgeRows = 0
+	s.bulkRowCheckpointBackoff = true
+	result := walCheckpointResult{WALFrames: int(snap.MxFrame), CheckpointedFrames: int(snap.NBackfill)}
+	s.emitBulkFinalizeEvent(bulkFinalizeEvent{
+		Stage: "checkpoint_deferred", Name: boundary,
+		NodeRows: nodeRows, EdgeRows: edgeRows,
+		WALFrames: result.WALFrames, CheckpointedFrames: result.CheckpointedFrames,
+	})
+	return result
 }
 
 func (s *Store) bulkCheckpointIntervalsLocked() (nodeRows, edgeRows int64) {

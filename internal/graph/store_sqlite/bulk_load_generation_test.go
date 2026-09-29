@@ -134,6 +134,9 @@ func TestGenerationBulkLoadDefersTheAutomaticDrainToOneAtItsEnd(t *testing.T) {
 	if got := store.walDrainRequests.Load(); got != requestsBefore+1 {
 		t.Fatalf("bulk end posted %d drains, want one", got-requestsBefore)
 	}
+	// The window owes the drain to the publication that follows it; the
+	// publication's maintenance request is what wakes the lane.
+	store.schedulePublishMaintenance()
 	waitForCondition(t, "scheduled drain under line", func() bool { return store.walDrains.Load() > 0 && walFileFrames(t, path, pageSize) <= line })
 	nodeRows, edgeRows := generationRowCounts(t, store, generationID)
 	if nodeRows != nodeCount || edgeRows == 0 {
