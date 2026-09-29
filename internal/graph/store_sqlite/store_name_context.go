@@ -50,6 +50,9 @@ func (s *Store) FindNodesByNameContainingContext(ctx context.Context, substr str
 	if substr == "" {
 		return nil, nil
 	}
+	if index, ok := s.sealedNameIndex(ctx); ok {
+		return s.findNodesByNameContainingIndexed(ctx, index, substr, limit)
+	}
 	pattern := "%" + escapeLikePattern(substr) + "%"
 	q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE name LIKE ? ESCAPE '\' AND view_gen = ? ORDER BY id`
 	if limit > 0 {
@@ -71,6 +74,14 @@ func (s *Store) VisitNodesByNameContainingFoldedContext(ctx context.Context, sub
 	if substr == "" || yield == nil {
 		return nil
 	}
+	if index, ok := s.sealedNameIndex(ctx); ok {
+		return s.visitNodesByNameContainingFoldedIndexed(ctx, index, substr, yield)
+	}
+	return s.visitNodesByNameContainingFoldedSQL(ctx, substr, yield)
+}
+
+// visitNodesByNameContainingFoldedSQL is the scan without a name index.
+func (s *Store) visitNodesByNameContainingFoldedSQL(ctx context.Context, substr string, yield func(*graph.Node) bool) error {
 	needle := strings.ToLower(substr)
 	nonASCII := false
 	for i := 0; i < len(needle); i++ {

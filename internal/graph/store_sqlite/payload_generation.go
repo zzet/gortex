@@ -76,6 +76,10 @@ type payloadSeal struct {
 	// is dropped at exactly the moment that state stops being true: when the
 	// generation is finally retired. See payload_generation_sweep.go.
 	sweep payloadSweepState
+	// names is the published generation's in-memory name index, shared by
+	// every handle and dropped with the seal at retirement
+	// (store_name_index.go).
+	names generationNameIndexSlot
 	// ftsPages memoizes the published generation's ranked symbol pages
 	// (store_fts_generation_range.go).
 	ftsPages symbolFTSPageCache
