@@ -874,6 +874,7 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 	// empty revision, which is the one value the reuse guards read as "matches
 	// anything".
 	c.describeDependencyCohort(lifetime)
+	go c.healRacyIndex(lifetime)
 	go c.run()
 	return c, nil
 }

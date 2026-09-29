@@ -3787,6 +3787,12 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	// the boot rather than within the hour. An automatic worktree that was not
 	// being served stays dormant until it is selected again — its route is what
 	// marks it worth resuming across the restart.
+	// Once per daemon start, every registered checkout's index is checked for
+	// the racily clean state and healed in the background (dormant checkouts
+	// included; see healFamilyRacyIndexes).
+	for familyID := range seeded {
+		go l.healFamilyRacyIndexes(context.WithoutCancel(ctx), familyID)
+	}
 	for familyID, probeDir := range seeded {
 		familyStarted := stageStarted("reconcile_family", zap.String("family", familyID))
 		reconcileStarted := stageStarted("reconcile_family_catalog", zap.String("family", familyID))
