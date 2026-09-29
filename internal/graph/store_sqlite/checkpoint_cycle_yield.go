@@ -285,3 +285,41 @@ func (l cycleLane) reclaimOwns(walPath string) bool {
 	threshold := l.store.walReclaim.cycle.loopThreshold.Load()
 	return threshold > 0 && walFileSize(walPath) > threshold
 }
+
+// cancelOnEditCycle cancels an in-flight maintenance statement (through
+// cancel) when an edit-driven cycle takes the build lane, polling at
+// walCheckpointCycleYieldPoll. yielded reports whether it fired; stop ends the
+// watch and must be called when the statement returns. Without a predicate it
+// watches nothing.
+func (s *Store) cancelOnEditCycle(cancel context.CancelFunc) (stop func(), yielded *atomic.Bool) {
+	yielded = new(atomic.Bool)
+	if !s.hasBuildLanePredicate() {
+		return func() {}, yielded
+	}
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		ticker := time.NewTicker(walCheckpointCycleYieldPoll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if s.buildLaneBusy() {
+					yielded.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			<-finished
+		})
+	}, yielded
+}

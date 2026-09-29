@@ -174,11 +174,15 @@ const plannerStatsBulkWindowReason = "bulk_window_active"
 //	                   another goroutine); defensive, unreachable in practice.
 const (
 	plannerStatsWriterBusyReason = "writer_busy:"
-	plannerStatsRacedReason      = "raced"
-	plannerStatsCanceledReason   = "canceled:"
-	plannerStatsTimeoutReason    = "timeout:"
-	plannerStatsBudgetReason     = "budget:"
-	plannerStatsNoIndexesReason  = "no_indexes"
+	// plannerStatsEditCycleReason: an edit-driven mutation cycle holds the
+	// build lane (SetBuildLaneBusy). No ANALYZE starts inside an edit window,
+	// and one in flight when a cycle takes the lane is interrupted.
+	plannerStatsEditCycleReason = "edit_cycle:"
+	plannerStatsRacedReason     = "raced"
+	plannerStatsCanceledReason  = "canceled:"
+	plannerStatsTimeoutReason   = "timeout:"
+	plannerStatsBudgetReason    = "budget:"
+	plannerStatsNoIndexesReason = "no_indexes"
 )
 
 // plannerStatsPassBudget bounds the wall-clock ONE cooperative pass spends
@@ -1064,6 +1068,9 @@ func (s *Store) cooperativePlannerStatsRefresh(ctx context.Context, key string, 
 		if i > 0 && time.Since(started) >= plannerStatsPassBudget {
 			return analyzed, plannerStatsBudgetReason + name, nil
 		}
+		if s.buildLaneBusy() {
+			return analyzed, plannerStatsEditCycleReason + name, nil
+		}
 		if !s.writeMu.TryLock() {
 			return analyzed, plannerStatsWriterBusyReason + name, nil
 		}
@@ -1076,10 +1083,15 @@ func (s *Store) cooperativePlannerStatsRefresh(ctx context.Context, key string, 
 		// strictly below the 15 s the bounded-gate droppers give this gate
 		// before discarding their batches.
 		indexCtx, cancelIndex := context.WithTimeout(ctx, plannerStatsIndexTimeout)
+		stopYield, yielded := s.cancelOnEditCycle(cancelIndex)
 		removed, bulk, analyzeErr := s.plannerStatsHoldLocked(indexCtx, name)
-		timedOut := analyzeErr != nil && indexCtx.Err() != nil && ctx.Err() == nil
+		stopYield()
+		timedOut := analyzeErr != nil && indexCtx.Err() != nil && ctx.Err() == nil && !yielded.Load()
 		cancelIndex()
 		s.writeMu.Unlock()
+		if analyzeErr != nil && yielded.Load() && ctx.Err() == nil {
+			return analyzed, plannerStatsEditCycleReason + name, nil
+		}
 		if bulk {
 			return analyzed, plannerStatsBulkWindowReason, nil
 		}
