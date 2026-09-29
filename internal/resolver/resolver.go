@@ -2460,20 +2460,24 @@ func (r *Resolver) cachedGetNode(id string) *graph.Node {
 	return r.graph.GetNode(id)
 }
 
-// cachedFindNodesByName returns the candidates for name, consulting
-// the per-pass cache first and falling through to the store on miss.
-// Returns the in-cache slice directly when hit — callers MUST treat
-// the result as read-only.
-func (r *Resolver) cachedFindNodesByName(name string) []*graph.Node {
+// cachedFindNodesByNameWithStubs returns every node of name, stubs included,
+// consulting the per-pass cache first and falling through to the store on
+// miss. Returns the in-cache slice directly when hit — callers MUST treat the
+// result as read-only. It is deliberately unfiltered: its caller, the terminal
+// classifier, classifies rather than binds, and "matches only a stub"
+// (stub_only) is an outcome of its own. Binding lookups
+// (cachedFindNodesByNameInRepo / …ForEdge) drop the attributed terminals
+// (withoutAttributedTerminals), which a whole index's resolution never sees.
+func (r *Resolver) cachedFindNodesByNameWithStubs(name string) []*graph.Node {
 	if name == "" {
 		return nil
 	}
 	if r.nodesByName != nil {
 		if hits, ok := r.nodesByName[name]; ok {
-			return withoutAttributedTerminals(hits)
+			return hits
 		}
 	}
-	return withoutAttributedTerminals(r.graph.FindNodesByName(name))
+	return r.graph.FindNodesByName(name)
 }
 
 // cachedFindNodesByQualName serves resolveImport's complete candidate lookup
