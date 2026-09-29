@@ -3049,6 +3049,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	var releaseIndexMemoryAdmission func(reason string)
 	if memoryLease != nil {
 		memoryAdmittedAt := time.Now()
+		memoryAtAdmission := sampleProcessMemory()
 		stats := memoryBudget.snapshot()
 		idx.logger.Info("indexer: memory envelope admitted",
 			zap.String("repo", idx.RepoPrefix()),
@@ -3081,7 +3082,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					zap.Int64("used_bytes", after.used),
 					zap.Int("waiters", after.waiters),
 					zap.Int("bounded_bypasses", after.bypasses),
-					zap.Uint64("queued_admissions", after.queued))
+					zap.Uint64("queued_admissions", after.queued),
+					zap.Object("process_memory", memoryAtAdmission.until(sampleProcessMemory())))
 			})
 		}
 		// Registered before the GC restore and shadow drain defers. Reverse
