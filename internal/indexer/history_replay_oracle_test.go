@@ -71,24 +71,25 @@ type replayStep struct {
 
 // replayStepRecord is what one step measured.
 type replayStepRecord struct {
-	Step            string         `json:"step"`
-	CycleMS         float64        `json:"cycle_ms"`
-	DirtyBuilt      bool           `json:"dirty_built"`
-	Generation      int64          `json:"generation"`
-	Parent          int64          `json:"parent"`
-	Depth           int            `json:"depth"`
-	Fallback        string         `json:"fallback,omitempty"`
-	CleanIndexMS    float64        `json:"clean_index_ms"`
-	CompareMS       float64        `json:"compare_ms"`
-	Nodes           int            `json:"nodes"`
-	Edges           int            `json:"edges"`
-	ServedOnlyNodes int            `json:"served_only_nodes"`
-	CleanOnlyNodes  int            `json:"clean_only_nodes"`
-	ServedOnlyEdges int            `json:"served_only_edges"`
-	CleanOnlyEdges  int            `json:"clean_only_edges"`
-	Allowed         int            `json:"allowed"`
-	ByKind          map[string]int `json:"differing_by_kind,omitempty"`
-	Sample          []string       `json:"sample,omitempty"`
+	Step            string                     `json:"step"`
+	CycleMS         float64                    `json:"cycle_ms"`
+	WAL             store_sqlite.WALWriteDelta `json:"wal"`
+	DirtyBuilt      bool                       `json:"dirty_built"`
+	Generation      int64                      `json:"generation"`
+	Parent          int64                      `json:"parent"`
+	Depth           int                        `json:"depth"`
+	Fallback        string                     `json:"fallback,omitempty"`
+	CleanIndexMS    float64                    `json:"clean_index_ms"`
+	CompareMS       float64                    `json:"compare_ms"`
+	Nodes           int                        `json:"nodes"`
+	Edges           int                        `json:"edges"`
+	ServedOnlyNodes int                        `json:"served_only_nodes"`
+	CleanOnlyNodes  int                        `json:"clean_only_nodes"`
+	ServedOnlyEdges int                        `json:"served_only_edges"`
+	CleanOnlyEdges  int                        `json:"clean_only_edges"`
+	Allowed         int                        `json:"allowed"`
+	ByKind          map[string]int             `json:"differing_by_kind,omitempty"`
+	Sample          []string                   `json:"sample,omitempty"`
 	// NodePlacement names, for each differing node ID (at most the sample
 	// limit), the generations holding a row or a tombstone for it: where a
 	// served-only or missing node comes from.
@@ -438,9 +439,11 @@ func (h *replayHarness) run(t *testing.T, steps []replayStep) []replayStepRecord
 	var records []replayStepRecord
 	for i, step := range steps {
 		step.apply(t, h.f.worktree)
+		mark := h.f.store.WALWriteMark()
 		started := time.Now()
 		out := coordinatorReconcile(t, h.c)
 		cycle := time.Since(started)
+		wal := store_sqlite.WALWrittenBetween(mark, h.f.store.WALWriteMark())
 		h.c.SweepRetirements(ctx)
 
 		view := chainMaterialize(t, h.f)
@@ -455,6 +458,7 @@ func (h *replayHarness) run(t *testing.T, steps []replayStep) []replayStepRecord
 		}
 		rec.Step = step.name
 		rec.CycleMS = ms(cycle)
+		rec.WAL = wal
 		rec.DirtyBuilt = out.DirtyBuilt
 		rec.Generation = out.DirtyGenerationID
 		rec.Parent = out.DirtyParentGenerationID
@@ -463,10 +467,10 @@ func (h *replayHarness) run(t *testing.T, steps []replayStep) []replayStepRecord
 		rec.CleanIndexMS = cleanMS
 		rec.CompareMS = ms(time.Since(compareStarted))
 		rec.NodePlacement = replayNodePlacement(t, h.f.store, rec.differingIDs)
-		t.Logf("replay step %d %q: cycle %.1f ms built=%t gen=%d parent=%d depth=%d "+
+		t.Logf("replay step %d %q: cycle %.1f ms built=%t gen=%d parent=%d depth=%d wal{frames=%d bytes=%d reset=%t} "+
 			"rows{nodes=%d edges=%d} differing{served-only nodes=%d clean-only nodes=%d served-only edges=%d clean-only edges=%d allowed=%d} by kind %v",
 			i, step.name, rec.CycleMS, rec.DirtyBuilt, rec.Generation, rec.Parent, rec.Depth,
-			rec.Nodes, rec.Edges,
+			rec.WAL.Frames, rec.WAL.Bytes, rec.WAL.Reset, rec.Nodes, rec.Edges,
 			rec.ServedOnlyNodes, rec.CleanOnlyNodes, rec.ServedOnlyEdges, rec.CleanOnlyEdges, rec.Allowed, rec.ByKind)
 		if rec.differing() != 0 {
 			t.Errorf("replay step %d %q: the served view differs from a whole index of the working tree by %d rows outside the allow-list; first rows:\n  %s",

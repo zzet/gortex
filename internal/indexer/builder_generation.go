@@ -435,6 +435,12 @@ type BuildReport struct {
 	// build did not ask for it.
 	Enrichment EnrichmentOutcome
 
+	// WAL is the write-ahead log the store appended while the build ran
+	// (store_sqlite.WALWrittenBetween over marks taken at its start and
+	// end): the per-edit log cost a reader pinned across the edit holds.
+	// Filled by the working-tree entry points; zero-valued otherwise.
+	WAL store_sqlite.WALWriteDelta
+
 	// PlanningDuration is the wall time spent selecting the sparse file set.
 	PlanningDuration time.Duration
 	// Duration is the wall time of the whole build.

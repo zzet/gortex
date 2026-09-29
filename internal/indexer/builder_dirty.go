@@ -7,6 +7,8 @@ import (
 	"path"
 	"sort"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -181,6 +183,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		return 0, BuildReport{}, fmt.Errorf(
 			"indexer: working-tree build over parent %d names base generation %d", req.parent, req.Identity.BaseGenerationID)
 	}
+	walMark := b.Store.WALWriteMark()
 	var before gitstate.DirtySnapshot
 	var err error
 	switch {
@@ -299,6 +302,8 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		// the pass stamps; asking git again would be a second sample.
 		headProvenance: dirtyHeadProvenance(before),
 	})
+	report.WAL = store_sqlite.WALWrittenBetween(walMark, b.Store.WALWriteMark())
+	b.logWorkingTreeBuild(req, generationID, report, err)
 	report.ChainFallbackReason = req.chainFallbackReason
 	report.ChainDepth = 1
 	if req.parent > 0 {
@@ -587,6 +592,50 @@ func dirtyLayerChangesContext(ctx context.Context, snap gitstate.DirtySnapshot) 
 		return nil, err
 	}
 	return changes, nil
+}
+
+// logWorkingTreeBuild records working-tree build sizes and the WAL
+// appended during its admitted build interval, including concurrent writes.
+func (b *SparseGenerationBuilder) logWorkingTreeBuild(req DirtyLayerRequest, generationID int64, report BuildReport, err error) {
+	if b == nil || b.Logger == nil {
+		return
+	}
+	fields := []zap.Field{
+		zap.String("checkout", req.Identity.CheckoutID),
+		zap.Int64("generation", generationID),
+		zap.Int64("parent", req.parent),
+		zap.String("chain_fallback", req.chainFallbackReason),
+		zap.Bool("coalesced", report.Coalesced),
+		zap.Float64("plan_ms", float64(report.PlanningDuration.Microseconds())/1000),
+		zap.Float64("duration_ms", float64(report.Duration.Microseconds())/1000),
+		zap.Int("changed", report.ChangedFiles+report.AddedFiles+report.DeletedFiles),
+		zap.Int("closure", report.ClosureFiles),
+		zap.Int("dependents", len(report.ClosureDependentPaths)),
+		zap.Int("declared", len(report.ClosureDeclaredPaths)),
+		zap.Strings("dependent_paths", firstPaths(report.ClosureDependentPaths, 12)),
+		zap.Bool("wal_valid", report.WAL.Valid),
+		zap.Int64("wal_frames", report.WAL.Frames),
+		zap.Int64("wal_bytes", report.WAL.Bytes),
+		zap.Bool("wal_reset", report.WAL.Reset),
+	}
+	if w := report.Work; w != nil {
+		fields = append(fields,
+			zap.Int("parser_inputs", w.ParserInputs),
+			zap.Int("withheld", w.ContextWithheldFiles),
+			zap.Int("retained", w.ContextRetainedFiles))
+	}
+	if err != nil {
+		fields = append(fields, zap.Error(err))
+	}
+	b.Logger.Info("indexer: working-tree build phases", fields...)
+}
+
+// firstPaths is at most n of paths, for a log line.
+func firstPaths(paths []string, n int) []string {
+	if len(paths) <= n {
+		return paths
+	}
+	return paths[:n]
 }
 
 // dirtyHeadProvenance is the HEAD commit and dirty bit a working-tree sample
