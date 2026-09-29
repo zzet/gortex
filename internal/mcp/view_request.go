@@ -431,12 +431,17 @@ type requestViewPolicy struct {
 	// declare, and these are declared by no tool — cannot take a knob off the
 	// request before the request has read it.
 	freshness requestFreshness
+	// awaitRoute makes an explicit worktree selector whose route is being
+	// rebuilt wait for the route instead of refusing; set for source
+	// mutations (awaitMutationRoute).
+	awaitRoute bool
 }
 
 func (s *Server) requestViewPolicy(req *mcp.CallToolRequest, freshness requestFreshness) requestViewPolicy {
 	return requestViewPolicy{
 		allowGraceBaseFallback: s.requestAllowsGraceBaseFallback(req),
 		freshness:              freshness,
+		awaitRoute:             req != nil && s != nil && s.facades != nil && s.facades.mutatesSource(req.Params.Name),
 	}
 }
 
@@ -566,6 +571,7 @@ func (s *Server) resolveRequestView(
 		selectCtx = withDeferredMaterialization(ctx)
 	}
 	view, err := s.selectRequestView(selectCtx, selector, policy)
+	view, err = s.awaitMutationRoute(selectCtx, selector, policy, view, err)
 	if policy.freshness.requested() {
 		view, err = s.settleRequestFreshness(ctx, selector, policy, view, err)
 		if err != nil {

@@ -126,12 +126,18 @@ func TestCheckoutMutationRejectsWrongRootEpochAndExternalChanges(t *testing.T) {
 		t.Fatalf("external edit between begin and prepare was not refused: %v", err)
 	}
 	m.Close()
-	if m, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, before.RouteEpoch); !errors.Is(err, ErrCheckoutMutationStale) {
-		if m != nil {
-			m.Close()
-		}
-		t.Fatalf("stale disk at admission was not refused: %v", err)
+	// A tree already stale at admission: admission samples nothing, so the
+	// lease is granted and the write's own sample refuses it before any byte
+	// is written.
+	stale, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, before.RouteEpoch)
+	if err != nil {
+		t.Fatalf("admission over a stale tree: %v", err)
 	}
+	if err := stale.Prepare(t.Context()); !errors.Is(err, ErrCheckoutMutationStale) {
+		stale.Close()
+		t.Fatalf("stale disk at admission was not refused before the write: %v", err)
+	}
+	stale.Close()
 	if f.route() != before {
 		t.Fatal("rejected mutations changed the catalog route")
 	}

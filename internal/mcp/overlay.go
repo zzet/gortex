@@ -225,6 +225,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// read that must stay reachable while publication is pending, and the
 		// tools that must not be hostage to the binding they exist to fix.
 		viewless := catalogOnlyCheckoutControl(controlOperation) || viewlessCatalogTool(legacyName)
+		// Source writes announce before route/cycle waits; release at request end.
+		releaseWriteIntent := s.announceSourceMutation(req.Params.Name)
+		defer releaseWriteIntent()
 		var view *requestView
 		if !viewless {
 			var viewErr error
@@ -265,11 +268,15 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// Approved source tools serialize with the selected checkout's index
 		// coordinator. The lease does not invalidate or rebuild for dry runs;
 		// the shared disk-commit and reindex helpers perform those steps.
-		mutationCtx, releaseMutation, mutationErr := s.prepareRoutedViewMutation(ctx, &req)
+		mutationCtx, releaseMutation, mutationErr := s.prepareRoutedViewMutation(ctx, &req, selector, s.requestViewPolicy(&req, freshness))
 		if mutationErr != nil {
 			return mutationErr, nil
 		}
 		ctx = mutationCtx
+		// Admission may reselect after a route move; following reads use it.
+		if reselected := requestViewFromContext(ctx); reselected != nil {
+			view = reselected
+		}
 		defer releaseMutation()
 		if refused := s.refuseRoutedViewMutation(ctx, req.Params.Name); refused != nil {
 			return refused, nil
