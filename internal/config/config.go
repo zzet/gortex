@@ -638,6 +638,10 @@ type ReviewRule struct {
 // configurable is the budget of that retained state and the resolver's
 // evidence scoping.
 type DirtyChainConfig struct {
+	// SemanticTypecheckCacheMB caps the retained type-check state across
+	// checkouts, in MiB of estimated heap. The least recently used checkout's
+	// state is dropped first. Zero means the provider default (256).
+	SemanticTypecheckCacheMB int `mapstructure:"semantic_typecheck_cache_mb" yaml:"semantic_typecheck_cache_mb,omitempty"`
 	// ResolverEvidenceScope lets an incremental resolve of an edited file
 	// skip re-attempting parked references whose candidate declarations the
 	// edit left unchanged (the incoming leg's declaration carry, and the
@@ -647,9 +651,24 @@ type DirtyChainConfig struct {
 	// and re-bind edges a whole index leaves alone). On when unset; false
 	// turns it off. GORTEX_RESOLVER_EVIDENCE_SCOPE=on|off overrides it.
 	ResolverEvidenceScope *bool `mapstructure:"resolver_evidence_scope" yaml:"resolver_evidence_scope,omitempty"`
+}
 
-	// SemanticTypecheckCacheMB caps retained compiler state in MiB; zero uses the provider default.
-	SemanticTypecheckCacheMB int `mapstructure:"semantic_typecheck_cache_mb" yaml:"semantic_typecheck_cache_mb,omitempty"`
+// ResolverEvidenceScopeEnabled reports
+// index.dirty_chain.resolver_evidence_scope; unset is true.
+func (c IndexConfig) ResolverEvidenceScopeEnabled() bool {
+	if c.DirtyChain == nil || c.DirtyChain.ResolverEvidenceScope == nil {
+		return true
+	}
+	return *c.DirtyChain.ResolverEvidenceScope
+}
+
+// SemanticTypecheckCacheBytes reports index.dirty_chain.semantic_typecheck_cache_mb
+// in bytes; zero (unset or non-positive) means the provider default.
+func (c IndexConfig) SemanticTypecheckCacheBytes() int64 {
+	if c.DirtyChain == nil || c.DirtyChain.SemanticTypecheckCacheMB <= 0 {
+		return 0
+	}
+	return int64(c.DirtyChain.SemanticTypecheckCacheMB) << 20
 }
 
 type IndexConfig struct {
@@ -1976,24 +1995,6 @@ func (c *Config) validateWorkspaceSchema() error {
 		return nil
 	}
 	return fmt.Errorf("%s", strings.Join(errs, "; "))
-}
-
-// ResolverEvidenceScopeEnabled reports
-// index.dirty_chain.resolver_evidence_scope; unset is true.
-func (c IndexConfig) ResolverEvidenceScopeEnabled() bool {
-	if c.DirtyChain == nil || c.DirtyChain.ResolverEvidenceScope == nil {
-		return true
-	}
-	return *c.DirtyChain.ResolverEvidenceScope
-}
-
-// SemanticTypecheckCacheBytes reports index.dirty_chain.semantic_typecheck_cache_mb
-// in bytes; zero (unset or non-positive) means the provider default.
-func (c IndexConfig) SemanticTypecheckCacheBytes() int64 {
-	if c.DirtyChain == nil || c.DirtyChain.SemanticTypecheckCacheMB <= 0 {
-		return 0
-	}
-	return int64(c.DirtyChain.SemanticTypecheckCacheMB) << 20
 }
 
 // ValidateSemanticConnectForTest exposes the connect-block validation

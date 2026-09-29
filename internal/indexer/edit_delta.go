@@ -43,8 +43,10 @@ import (
 // pass corpus: the view below answers every read the engine makes, so nothing
 // has to be parsed to be visible.
 //
-// A caller that hands the builder one large change set gets one large delta.
-// Two cases are built by the sparse closure builder
+// Every change set goes through the delta whatever its size: the coordinator
+// imports a large working-tree change as a chain of small deltas
+// (checkout_import.go), and a caller that hands the builder one large change
+// set gets one large delta. Two cases are built by the sparse closure builder
 // (Build) instead, and the log says which:
 //
 //   - a change to a file that decides how the rest of the tree is read (a

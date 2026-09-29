@@ -112,15 +112,14 @@ type storeCore struct {
 	// int64 generation; values are *sync.Mutex. See ResolveMutex.
 	resolveLanes sync.Map
 
-	// publishedLanguageCounts memoizes immutable READY-generation language
-	// counts; mutable generation zero is never memoized.
+	// publishedLanguageCounts memoizes RepoLanguageCounts of published
+	// generations, keyed by publishedLanguageCountKey; values are
+	// map[string]int. See PublishedRepoLanguageCounts.
 	publishedLanguageCounts sync.Map
 
 	// fileGenerationIndex caches edges_by_file_generation's presence
 	// (lazy_graph_indexes.go); lazyIndex is its builder's telemetry.
 	fileGenerationIndex atomic.Int32
-	lazyIndex           lazyIndexCounters
-
 	// walReclaimNudged asks the WAL reclaim loop to attempt at its next poll
 	// regardless of backoff (a residue drain handed it a busy TRUNCATE).
 	walReclaimNudged atomic.Bool
@@ -128,6 +127,7 @@ type storeCore struct {
 	writeIntents atomic.Int32
 	// walDrainHandoffs counts residue drains handed to the reclaim.
 	walDrainHandoffs atomic.Int64
+	lazyIndex        lazyIndexCounters
 
 	// payloadBuildFlights maps a catalog generation to its sole process-local
 	// physical writer. Every handle over this core joins the same rendezvous;
@@ -494,8 +494,39 @@ type Store struct {
 	// still using the same database.
 	ownsCore bool
 
-	// readCtx bounds whole-store paged analysis to its caller.
+	// readCtx, when set, is the caller's context the whole-store paged reads
+	// (NodesByKinds, DeadCodeCandidates) honour between pages: a handle bound
+	// with WithReadContext stops such a read within one page of the context
+	// ending, and so releases its WAL snapshot. Nil reads with no deadline.
 	readCtx context.Context
+}
+
+// WithReadContext returns a handle over the same generation whose paged
+// whole-store reads stop within one page once ctx ends. It shares everything
+// else with s; it never owns the core.
+func (s *Store) WithReadContext(ctx context.Context) *Store {
+	if s == nil {
+		return nil
+	}
+	bound := *s
+	bound.ownsCore = false
+	bound.readCtx = ctx
+	return &bound
+}
+
+// BindReadContext implements graph.ReadContextBinder.
+func (s *Store) BindReadContext(ctx context.Context) graph.Reader {
+	return s.WithReadContext(ctx)
+}
+
+var _ graph.ReadContextBinder = (*Store)(nil)
+
+// readContext is the handle's bound read context, or Background.
+func (s *Store) readContext() context.Context {
+	if s != nil && s.readCtx != nil {
+		return s.readCtx
+	}
+	return context.Background()
 }
 
 // coreless reports a handle with nothing behind it: a nil pointer, or a zero
@@ -1024,6 +1055,22 @@ func (s *Store) runBackgroundCheckpointAttempt(run func(context.Context) (comple
 	return s.runBackgroundCheckpointAttemptWith(checkpointYieldsToCycle, run)
 }
 
+// runBackgroundCheckpointAttemptWith is runBackgroundCheckpointAttempt with
+// an explicit build-lane policy (checkpoint_cycle_yield.go).
+func (s *Store) runBackgroundCheckpointAttemptWith(policy checkpointCyclePolicy, run func(context.Context) (complete, retry bool)) (complete, retry bool) {
+	attempt, err := s.beginBackgroundCheckpointAttempt(policy)
+	if err != nil {
+		return false, true
+	}
+	defer s.finishBackgroundCheckpointAttempt(attempt)
+
+	complete, retry = run(attempt.ctx)
+	if cause := context.Cause(attempt.ctx); errors.Is(cause, errWALCheckpointDeferredBulk) || errors.Is(cause, errWALCheckpointYieldedToCycle) {
+		return false, true
+	}
+	return complete, retry
+}
+
 func (s *Store) acquireGenerationBulkCheckpointLease() (generationBulkCheckpointLease, error) {
 	coordination := &s.backgroundCheckpoint
 	coordination.mu.Lock()
@@ -1288,6 +1335,57 @@ func newWALCheckpointSchedule(now time.Time, interval time.Duration, thresholdBy
 // when the WAL's size and mtime do not change.
 func (s *walCheckpointSchedule) attempt(now time.Time, walPath string, checkpoint func() (complete, retry bool)) bool {
 	return s.attemptYielding(now, walPath, cycleLane{}, func(bool) (bool, bool) { return checkpoint() })
+}
+
+// attemptYielding is attempt with the build lane consulted (see
+// checkpoint_cycle_yield.go): a due attempt is deferred — without backoff,
+// to the next poll — while a mutation cycle holds the lane, until the
+// deferral bound passes with the WAL above its threshold, when one forced
+// (non-yielding) PASSIVE runs. An attempt a cycle cut short counts toward the
+// same bound and does not back off either.
+func (s *walCheckpointSchedule) attemptYielding(now time.Time, walPath string, lane cycleLane, checkpoint func(forced bool) (complete, retry bool)) bool {
+	if now.Before(s.nextPeriodic) && !s.gate.due(now, walPath) {
+		return false
+	}
+	if lane.reclaimOwns(walPath) {
+		// Over the reclaim's threshold the reclaim backfills and resets the
+		// log itself; a long PASSIVE here would only hold the one background
+		// checkpoint slot and refuse it (checkpoint_lease) for the length of
+		// the copy.
+		return false
+	}
+	run, forced := s.cycle.decide(now, lane.busy(), lane.maxDeferral, func() bool { return s.gate.over(walPath) })
+	if !run {
+		lane.noteDeferral()
+		logCycleDeferral(&s.cycle, now)
+		return false
+	}
+	if forced {
+		lane.noteForced()
+		logCycleForced(&s.cycle, now)
+	}
+	complete, retry := checkpoint(forced)
+	if !complete && !forced && lane.busy() {
+		// A cycle took the lane mid-attempt (or refused it at the start):
+		// neither a failure nor contention the checkpoint caused.
+		s.cycle.yielded(now)
+		return false
+	}
+	s.cycle.ran()
+	if complete {
+		s.gate.markComplete(now, walPath)
+		s.nextPeriodic = now.Add(s.interval)
+		return false
+	}
+	if retry {
+		return true
+	}
+	// Permanent driver/I/O errors retain the historical ordinary interval;
+	// they neither mark an incomplete WAL as drained nor spin every poll.
+	next := now.Add(s.interval)
+	s.gate.deferUntil = next
+	s.nextPeriodic = next
+	return false
 }
 
 func (s *Store) runCheckpointLoopWithAttempt(
@@ -1598,8 +1696,10 @@ func (s *Store) Close() error {
 		} else {
 			// Close is a durability boundary, not an interactive checkpoint.
 			// A successful filesystem sync can exceed CheckpointWAL's deadline
-			// on a busy disk. Let it finish; withSQLiteBusyRetry still bounds
-			// repeated lock contention, and checkpoint errors remain fatal.
+			// on a busy disk, and a large backlog needs far longer, so the
+			// deadline scales with the pending frames (closeCheckpointWAL);
+			// withSQLiteBusyRetry still bounds repeated lock contention, and
+			// checkpoint errors remain fatal.
 			checkpointErr = s.closeCheckpointWAL()
 		}
 	}
@@ -2743,34 +2843,6 @@ func (s *Store) queryNodesContext(ctx context.Context, stmt *sql.Stmt, args ...a
 	return out
 }
 
-// WithReadContext returns a handle over the same generation whose paged
-// whole-store reads stop within one page once ctx ends. It shares everything
-// else with s; it never owns the core.
-func (s *Store) WithReadContext(ctx context.Context) *Store {
-	if s == nil {
-		return nil
-	}
-	bound := *s
-	bound.ownsCore = false
-	bound.readCtx = ctx
-	return &bound
-}
-
-// BindReadContext implements graph.ReadContextBinder.
-func (s *Store) BindReadContext(ctx context.Context) graph.Reader {
-	return s.WithReadContext(ctx)
-}
-
-// readContext is the handle's bound read context, or Background.
-func (s *Store) readContext() context.Context {
-	if s != nil && s.readCtx != nil {
-		return s.readCtx
-	}
-	return context.Background()
-}
-
-var _ graph.ReadContextBinder = (*Store)(nil)
-
 // GetRepoNonContentNodes is the graph.NonContentNodeReader fast path: a
 // SQL-level enumeration that drops CONTENT (data_class="content") section
 // nodes, so the code-oriented passes never materialise a content-heavy
@@ -3545,6 +3617,27 @@ func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 	return s.scanEdgeRows(rows)
 }
 
+// scanEdgeRows is queryEdgesSQL's scan over already-open rows; it closes them.
+func (s *Store) scanEdgeRows(rows *sql.Rows) []*graph.Edge {
+	defer rows.Close()
+	var out []*graph.Edge
+	for rows.Next() {
+		e, err := s.scanEdgeCursor(rows)
+		if err != nil {
+			panicOnFatal(err)
+			return out
+		}
+		if e == nil {
+			continue
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
+	return out
+}
+
 // queryNodesSQL is the node-shaped sibling of queryEdgesSQL, with the same
 // error contract.
 func (s *Store) queryNodesSQL(q string, args ...any) []*graph.Node {
@@ -3672,91 +3765,3 @@ func (s *Store) FindNodesByNames(names []string) map[string][]*graph.Node {
 // the resolved graph to sqlite in one shot. On a first/empty cold index
 // the bracket additionally engages a bulk-persist fast path (dropped
 // secondary indexes + synchronous=OFF on a pinned connection).
-
-// scanEdgeRows is queryEdgesSQL's scan over already-open rows; it closes them.
-func (s *Store) scanEdgeRows(rows *sql.Rows) []*graph.Edge {
-	defer rows.Close()
-	var out []*graph.Edge
-	for rows.Next() {
-		e, err := s.scanEdgeCursor(rows)
-		if err != nil {
-			panicOnFatal(err)
-			return out
-		}
-		if e == nil {
-			continue
-		}
-		out = append(out, e)
-	}
-	if err := rows.Err(); err != nil {
-		panicOnFatal(err)
-	}
-	return out
-}
-
-// runBackgroundCheckpointAttemptWith is runBackgroundCheckpointAttempt with
-// an explicit build-lane policy (checkpoint_cycle_yield.go).
-func (s *Store) runBackgroundCheckpointAttemptWith(policy checkpointCyclePolicy, run func(context.Context) (complete, retry bool)) (complete, retry bool) {
-	attempt, err := s.beginBackgroundCheckpointAttempt(policy)
-	if err != nil {
-		return false, true
-	}
-	defer s.finishBackgroundCheckpointAttempt(attempt)
-
-	complete, retry = run(attempt.ctx)
-	if cause := context.Cause(attempt.ctx); errors.Is(cause, errWALCheckpointDeferredBulk) || errors.Is(cause, errWALCheckpointYieldedToCycle) {
-		return false, true
-	}
-	return complete, retry
-}
-
-// attemptYielding is attempt with the build lane consulted (see
-// checkpoint_cycle_yield.go): a due attempt is deferred — without backoff,
-// to the next poll — while a mutation cycle holds the lane, until the
-// deferral bound passes with the WAL above its threshold, when one forced
-// (non-yielding) PASSIVE runs. An attempt a cycle cut short counts toward the
-// same bound and does not back off either.
-func (s *walCheckpointSchedule) attemptYielding(now time.Time, walPath string, lane cycleLane, checkpoint func(forced bool) (complete, retry bool)) bool {
-	if now.Before(s.nextPeriodic) && !s.gate.due(now, walPath) {
-		return false
-	}
-	if lane.reclaimOwns(walPath) {
-		// Over the reclaim's threshold the reclaim backfills and resets the
-		// log itself; a long PASSIVE here would only hold the one background
-		// checkpoint slot and refuse it (checkpoint_lease) for the length of
-		// the copy.
-		return false
-	}
-	run, forced := s.cycle.decide(now, lane.busy(), lane.maxDeferral, func() bool { return s.gate.over(walPath) })
-	if !run {
-		lane.noteDeferral()
-		logCycleDeferral(&s.cycle, now)
-		return false
-	}
-	if forced {
-		lane.noteForced()
-		logCycleForced(&s.cycle, now)
-	}
-	complete, retry := checkpoint(forced)
-	if !complete && !forced && lane.busy() {
-		// A cycle took the lane mid-attempt (or refused it at the start):
-		// neither a failure nor contention the checkpoint caused.
-		s.cycle.yielded(now)
-		return false
-	}
-	s.cycle.ran()
-	if complete {
-		s.gate.markComplete(now, walPath)
-		s.nextPeriodic = now.Add(s.interval)
-		return false
-	}
-	if retry {
-		return true
-	}
-	// Permanent driver/I/O errors retain the historical ordinary interval;
-	// they neither mark an incomplete WAL as drained nor spin every poll.
-	next := now.Add(s.interval)
-	s.gate.deferUntil = next
-	s.nextPeriodic = next
-	return false
-}

@@ -418,6 +418,47 @@ func (idx *Indexer) resolveReceiptNamePendings(receipt *graph.MutationReceipt) {
 	idx.resolver.ResolveIncomingForNames(names, []string{idx.repoPrefix})
 }
 
+// vanishedReceiptNames is the part of receipt.EvictedNames that no definition
+// file of the receipt declares any more. A reparse evicts every node of the
+// file before it re-adds them, so the receipt records every name the file
+// declares — including the ones the same save re-declares. Those names are
+// already covered: the definition files are in the resolution frontier, whose
+// incoming leg enumerates the stub forms of every name they declare (the
+// contract EvictedNames documents). Re-resolving them by name again re-attempted
+// every reference parked on them (thousands for a widely used file, 1.7 s per
+// save) and bypassed the incoming leg's declaration evidence. Only a name the
+// definition files no longer declare is reachable by name alone.
+func vanishedReceiptNames(g graph.Store, receipt *graph.MutationReceipt) []string {
+	if receipt == nil || len(receipt.EvictedNames) == 0 {
+		return nil
+	}
+	if g == nil || len(receipt.DefinitionFiles) == 0 {
+		return receipt.EvictedNames
+	}
+	declared := make(map[string]struct{})
+	for _, nodes := range g.GetFileNodesByPaths(receipt.DefinitionFiles) {
+		for _, node := range nodes {
+			if node == nil {
+				continue
+			}
+			names, exact := graph.ReceiptNamesForEvictedSymbol(node.Kind, node.Name, node.QualName)
+			if !exact {
+				continue
+			}
+			for _, name := range names {
+				declared[name] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(receipt.EvictedNames))
+	for _, name := range receipt.EvictedNames {
+		if _, still := declared[name]; !still {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 func (w *Watcher) reindexStormPaths(paths []string) (*IndexResult, error) {
 	if w.batchReindex != nil {
 		return w.batchReindex(paths)
@@ -522,45 +563,4 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 			mi.runCrossRepoResolve(false)
 		}
 	}
-}
-
-// vanishedReceiptNames is the part of receipt.EvictedNames that no definition
-// file of the receipt declares any more. A reparse evicts every node of the
-// file before it re-adds them, so the receipt records every name the file
-// declares — including the ones the same save re-declares. Those names are
-// already covered: the definition files are in the resolution frontier, whose
-// incoming leg enumerates the stub forms of every name they declare (the
-// contract EvictedNames documents). Re-resolving them by name again re-attempted
-// every reference parked on them (thousands for a widely used file, 1.7 s per
-// save) and bypassed the incoming leg's declaration evidence. Only a name the
-// definition files no longer declare is reachable by name alone.
-func vanishedReceiptNames(g graph.Store, receipt *graph.MutationReceipt) []string {
-	if receipt == nil || len(receipt.EvictedNames) == 0 {
-		return nil
-	}
-	if g == nil || len(receipt.DefinitionFiles) == 0 {
-		return receipt.EvictedNames
-	}
-	declared := make(map[string]struct{})
-	for _, nodes := range g.GetFileNodesByPaths(receipt.DefinitionFiles) {
-		for _, node := range nodes {
-			if node == nil {
-				continue
-			}
-			names, exact := graph.ReceiptNamesForEvictedSymbol(node.Kind, node.Name, node.QualName)
-			if !exact {
-				continue
-			}
-			for _, name := range names {
-				declared[name] = struct{}{}
-			}
-		}
-	}
-	out := make([]string, 0, len(receipt.EvictedNames))
-	for _, name := range receipt.EvictedNames {
-		if _, still := declared[name]; !still {
-			out = append(out, name)
-		}
-	}
-	return out
 }

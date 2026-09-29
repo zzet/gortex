@@ -62,8 +62,8 @@ func (c walReclaimConvergence) String() string {
 }
 
 // convergeBackfill runs the writer-free passes. It holds nothing but the
-// checkpoint connection; ctx is the attempt's (shutdown or a new bulk window
-// cancels it).
+// checkpoint connection; ctx is the attempt's (shutdown, a bulk window or an
+// edit cycle cancel it).
 func (s *Store) convergeBackfill(ctx context.Context, ckptDB *sql.DB) walReclaimConvergence {
 	started := time.Now()
 	mark := readWALWriteMark(s.dbPath)

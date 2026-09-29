@@ -498,7 +498,11 @@ type SparseGenerationBuilder struct {
 	// ask for one. nil declares the lsp.* capabilities disabled for the
 	// generation rather than leaving them unstated.
 	Semantic *semantic.Manager
-	// wholeModuleCompilerLoad is a reference-only test seam.
+
+	// wholeModuleCompilerLoad is a test seam: the go/types pass loads every
+	// package of the module, with no retained state, instead of the
+	// handle-rooted scope — the reference the handle-rooted load's facts are
+	// checked against. Production never sets it.
 	wholeModuleCompilerLoad bool
 }
 
@@ -1057,6 +1061,17 @@ func (b *SparseGenerationBuilder) runPass(
 	return separation, nil
 }
 
+// passCorpusCounts measures a pass corpus the way Indexer.repoNodeEdgeCount
+// measures the pass's graph: the repository's own nodes and edges when the
+// pass is prefixed, the whole corpus otherwise.
+func passCorpusCounts(corpus *graph.Graph, repoPrefix string) (int, int) {
+	if repoPrefix == "" {
+		return corpus.NodeCount(), corpus.EdgeCount()
+	}
+	est := corpus.RepoMemoryEstimate(repoPrefix)
+	return est.NodeCount, est.EdgeCount
+}
+
 // runEnrichment runs the semantic enrichment stage over the generation's own
 // payload, against the checkout root the build read its bytes from.
 //
@@ -1130,6 +1145,131 @@ func (b *SparseGenerationBuilder) runEnrichment(
 	}
 	out.Ran, out.Starved = pass.Ran, pass.Starved
 	out.Partial, out.Disabled, out.Reason = pass.Partial, pass.Disabled, pass.Reason
+}
+
+// checkoutCompilerScope is the compiler scope a working-tree build asks of the
+// go/types provider: rooted at the packages the build carries, sibling bodies
+// stripped, the checkout's type-check state retained, with a whole-module load
+// forced when the build's changes touch a Go module manifest.
+func (b *SparseGenerationBuilder) checkoutCompilerScope(changes []LayerPathChange) semantic.CheckoutCompilerScope {
+	scope := semantic.CheckoutCompilerScope{
+		HandleRoots:         !b.wholeModuleCompilerLoad,
+		StripSiblingBodies:  !b.wholeModuleCompilerLoad,
+		TypecheckCache:      !b.wholeModuleCompilerLoad,
+		TypecheckCacheBytes: b.Config.SemanticTypecheckCacheBytes(),
+	}
+	for _, change := range changes {
+		if goModuleManifestPath(change.Path) {
+			scope.ManifestChanged = true
+			break
+		}
+	}
+	return scope
+}
+
+// WarmCheckoutCompiler asks the enrichment manager to warm the compiler
+// state of the checkout rooted at root in the background (a whole-module
+// listing that later working-tree builds' go/types passes reuse). It returns
+// at once with each provider's outcome. A coordinator calls it when its checkout becomes
+// ready; every build's enrichment stage also calls it after its pass, which
+// is a no-op while the checkout is warm for its module manifests.
+func (b *SparseGenerationBuilder) WarmCheckoutCompiler(root string) map[string]string {
+	return b.warmCheckoutCompiler(root, b.checkoutCompilerScope(nil))
+}
+
+func (b *SparseGenerationBuilder) warmCheckoutCompiler(root string, scope semantic.CheckoutCompilerScope) map[string]string {
+	if b == nil || b.Semantic == nil || root == "" || !scope.HandleRoots {
+		return nil
+	}
+	return b.Semantic.WarmCheckoutCompiler(root, scope)
+}
+
+// goModuleManifestPath reports whether a repository-relative path names a file
+// that decides a Go module's build list.
+func goModuleManifestPath(p string) bool {
+	p = strings.ReplaceAll(p, "\\", "/")
+	switch path.Base(p) {
+	case "go.mod", "go.sum", "go.work", "go.work.sum":
+		return true
+	}
+	return p == "vendor/modules.txt" || strings.HasSuffix(p, "/vendor/modules.txt")
+}
+
+// chainClearsEnrichmentFloor reports whether every language this generation
+// carries clears the admission floor in the census of the whole working-tree
+// state: the parent chain's files (chain) with this generation's own files in
+// place of theirs, plus the committed state's language totals (base) when the
+// caller supplied them. The census applies the same exclusions the manager's does
+// (low-value and fixture paths; user exclusion globs are not known here, so
+// the census can only be larger than the manager's, never admit a language
+// the generation does not carry). A generation that carries no language does
+// not clear it: there is nothing to enrich.
+//
+// Only languages a provider serves are judged (enrichable; nil judges every
+// language): the floor exists to decide whether a provider runs, and a
+// language no provider serves (contract nodes, say) cannot be enriched
+// whatever its count, so it must not veto the languages that can. base is
+// called at most once, and only when the generation's own files and the
+// chain leave a judged language below the floor; baseRead reports whether it
+// was.
+func chainClearsEnrichmentFloor(handle graph.Store, repoPrefix string, chain map[string]map[string]int, base func() map[string]int, floor int, enrichable func(string) bool) (clears, baseRead bool) {
+	own := map[string]map[string]int{}
+	for _, row := range graph.ReadRepoLanguageFileCounts(handle, []string{repoPrefix}) {
+		if row.Language == "" || row.Count <= 0 {
+			continue
+		}
+		if own[row.FilePath] == nil {
+			own[row.FilePath] = map[string]int{}
+		}
+		own[row.FilePath][row.Language] += row.Count
+	}
+	totals := map[string]int{}
+	present := map[string]bool{}
+	add := func(file string, languages map[string]int, mine bool) {
+		if semantic.IsLowValueForEnrichment(file, nil) || semantic.IsFixtureCensusPath(file) {
+			return
+		}
+		for language, count := range languages {
+			totals[language] += count
+			if mine {
+				present[language] = true
+			}
+		}
+	}
+	for file, languages := range own {
+		add(file, languages, true)
+	}
+	for file, languages := range chain {
+		if _, replaced := own[file]; !replaced {
+			add(file, languages, false)
+		}
+	}
+	for language := range present {
+		if enrichable != nil && !enrichable(language) {
+			delete(present, language)
+		}
+	}
+	if len(present) == 0 {
+		return false, false
+	}
+	below := func() bool {
+		for language := range present {
+			if totals[language] < floor {
+				return true
+			}
+		}
+		return false
+	}
+	if !below() {
+		return true, false
+	}
+	if base == nil {
+		return false, false
+	}
+	for language, count := range base() {
+		totals[language] += count
+	}
+	return !below(), true
 }
 
 // enrichmentBaseCensus is the stage's committed-state census as a deferred
@@ -1483,6 +1623,31 @@ func (b *SparseGenerationBuilder) separateContextPayload(
 	return b.separateAndPrune(ctx, req, plan, handle)
 }
 
+// separateAndPrune is the one post-pass step both routes take: the in-memory
+// corpus filter before the drain, and the withdrawal from the generation
+// handle after it. Withholding the context and pruning the redundant pathless
+// identities are decided here, on the corpus either route holds, so the two
+// routes carry the same generation by construction.
+func (b *SparseGenerationBuilder) separateAndPrune(
+	ctx context.Context,
+	req BuildRequest,
+	plan buildPlan,
+	corpus contextCorpus,
+) (contextSeparation, error) {
+	separation, err := b.withholdContextPayload(ctx, req, plan, corpus)
+	if err != nil {
+		return contextSeparation{}, err
+	}
+	_, _, pruned, err := pruneRedundantPathless(corpus, req.Base)
+	if err != nil {
+		return contextSeparation{}, err
+	}
+	if err := purgeIdentitySidecars(corpus, pruned); err != nil {
+		return contextSeparation{}, err
+	}
+	return separation, nil
+}
+
 // builderPathPayload is the generation's own payload, grouped by the candidate
 // context paths and nothing else. It is built from the one whole-generation
 // read the mask derivation already performs, so the separation costs no extra
@@ -1783,6 +1948,166 @@ func (p *builderPathPayload) edgesIntoWithdrawn(withdrawn map[string]struct{}) [
 	return out
 }
 
+// pruneUnanchoredPathless removes the identities that live at no source file
+// and that only withheld context reached.
+//
+// A declared context file is re-derived against a corpus that deliberately
+// omits what IT resolves into, so its references into those files bind to
+// whatever the resolver mints for an absent target: a dependency stub, a
+// synthesised external-call module, a module identity. They live at no path,
+// so withholding the file does not take them along, and a generation that kept
+// them would tombstone and serve identities a whole index of the tree never
+// has. What stays is every pathless identity touched by an edge that has an
+// endpoint at a path the generation keeps or is recorded at such a path, and
+// every pathless identity those reach along outgoing edges across pathless
+// identities only. The rest was minted for withheld context alone and leaves
+// with it.
+func pruneUnanchoredPathless(
+	repoPrefix string,
+	corpus contextCorpus,
+	withheld map[string]struct{},
+) (nodesRemoved, edgesRemoved int, pruned []string, err error) {
+	kept := func(graphPath string) bool {
+		if graphPath == "" {
+			return false
+		}
+		if _, owned := builderRelPath(repoPrefix, graphPath); !owned {
+			return false
+		}
+		_, gone := withheld[graphPath]
+		return !gone
+	}
+	isFile := func(graphPath string) bool {
+		if graphPath == "" {
+			return false
+		}
+		_, owned := builderRelPath(repoPrefix, graphPath)
+		return owned
+	}
+	pathless := make(map[string]struct{})
+	anchored := make(map[string]struct{})
+	for _, node := range corpus.AllNodes() {
+		if node == nil || node.ID == "" {
+			continue
+		}
+		if isFile(node.FilePath) {
+			if kept(node.FilePath) {
+				anchored[node.ID] = struct{}{}
+			}
+			continue
+		}
+		pathless[node.ID] = struct{}{}
+	}
+	if len(pathless) == 0 {
+		return 0, 0, nil, nil
+	}
+	adjacent := make(map[string][]string)
+	reached := make(map[string]struct{})
+	var queue []string
+	reach := func(id string) {
+		if _, isPathless := pathless[id]; !isPathless {
+			return
+		}
+		if _, done := reached[id]; done {
+			return
+		}
+		reached[id] = struct{}{}
+		queue = append(queue, id)
+	}
+	for _, edge := range corpus.AllEdges() {
+		if edge == nil {
+			continue
+		}
+		_, fromPathless := pathless[edge.From]
+		_, toPathless := pathless[edge.To]
+		if fromPathless && toPathless {
+			// Forward only: a reached stub keeps what it points at (its
+			// module, say), but a shared target must not pull back every
+			// other stub pointing at it. A module identity is the hub of
+			// every stub of its package, so the reverse step used to keep
+			// the stubs only withheld context reached, and their
+			// edge-source markers then hid the base's adjacency of those
+			// stubs recorded in files the generation never touched.
+			adjacent[edge.From] = append(adjacent[edge.From], edge.To)
+		}
+		_, fromAnchored := anchored[edge.From]
+		_, toAnchored := anchored[edge.To]
+		if fromAnchored || toAnchored || kept(edge.FilePath) {
+			reach(edge.From)
+			reach(edge.To)
+		}
+	}
+	for len(queue) > 0 {
+		id := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		for _, next := range adjacent[id] {
+			reach(next)
+		}
+	}
+	for id := range pathless {
+		if _, ok := reached[id]; !ok {
+			pruned = append(pruned, id)
+		}
+	}
+	if len(pruned) == 0 {
+		return 0, 0, nil, nil
+	}
+	sort.Strings(pruned)
+	evicter, ok := corpus.(graph.PathlessNodeBatchEvicter)
+	if !ok {
+		return 0, 0, nil, fmt.Errorf(
+			"indexer: withhold generation context: the corpus cannot evict %d pathless identities minted for withheld context",
+			len(pruned))
+	}
+	nodesRemoved, edgesRemoved = evicter.EvictPathlessNodesByIDs(pruned)
+	return nodesRemoved, edgesRemoved, pruned, nil
+}
+
+// builderBaseServesContracts reports whether withholding a declared path
+// leaves every contract identity the pass placed there served by the layer
+// below exactly as a whole index serves it: the layer below holds the identity
+// either at this same path or at a path the generation neither claims nor
+// reads, so no mask of this generation can hide it.
+func builderBaseServesContracts(
+	base map[string]*graph.Node,
+	graphPath string,
+	contractIDs []string,
+	candidates, changedPaths map[string]struct{},
+) bool {
+	for _, id := range contractIDs {
+		node := base[id]
+		if node == nil || node.Kind != graph.KindContract {
+			return false
+		}
+		if node.FilePath == graphPath {
+			continue
+		}
+		if _, claimed := changedPaths[node.FilePath]; claimed {
+			return false
+		}
+		if _, read := candidates[node.FilePath]; read {
+			return false
+		}
+	}
+	return true
+}
+
+// holdsContentBody reports whether a candidate path carries a content
+// section, whose body lives in an index the withdrawal does not reach.
+func (p *builderPathPayload) holdsContentBody(graphPath string) bool {
+	_, ok := p.contentBody[graphPath]
+	return ok
+}
+
+// edgesRecordedAt lists the carried edges recorded at the withdrawn paths.
+func (p *builderPathPayload) edgesRecordedAt(withdrawn map[string]struct{}) []*graph.Edge {
+	var out []*graph.Edge
+	for graphPath := range withdrawn {
+		out = append(out, p.edgesByPath[graphPath]...)
+	}
+	return out
+}
+
 // nodeIDsAt lists the identities the generation carried at the withdrawn
 // paths, sorted, so the sidecars keyed by identity can be withdrawn with them.
 func (p *builderPathPayload) nodeIDsAt(withdrawn map[string]struct{}) []string {
@@ -2058,6 +2383,85 @@ func (b *SparseGenerationBuilder) unclaimedEdgeSources(
 		})
 	}
 	return masks, contested
+}
+
+// withoutSettledContextSources drops the edge-source markers a withheld context
+// file's symbols would otherwise need.
+//
+// A changed file records edges whose SOURCE is a symbol of a file it only read
+// — a value flowing out of a callee into the caller is recorded at the caller.
+// Those edges are the changed file's own payload, and the composition settles
+// them edge by edge against the file masks (graph.OverlaidView.baseEdgeVisible):
+// the generation's copy is served because it is recorded at a claimed path,
+// base's copy recorded at the same path is hidden, and the symbol's other edges,
+// recorded in its own unclaimed file, keep showing through from below. A
+// replace marker would instead hide ALL of the symbol's base adjacency, which
+// the generation does not carry. So a marker is dropped exactly when its source
+// lives at a withheld context path or is not a node the generation carries (a
+// dataflow placeholder, a pathless identity the layer below serves), and every
+// edge the generation carries out of it is recorded at a claimed, non-empty path;
+// anything else keeps the marker and meets the build-failure guard below.
+func withoutSettledContextSources(
+	handle *store_sqlite.Store,
+	markers []store_sqlite.EdgeSourceMask,
+	withdrawn map[string]struct{},
+	covered map[string]struct{},
+) []store_sqlite.EdgeSourceMask {
+	if len(markers) == 0 {
+		return markers
+	}
+	// A candidate is a source the generation carries no node for: a symbol
+	// at a withheld context path, a dataflow placeholder source
+	// (`<repo>/unresolved::<name>`, no node and no file: every file that
+	// flows a value out of the unresolved name records its own edge from
+	// it), or a pathless identity the layer below already serves
+	// (pruneRedundantPathless). Its adjacency is settled edge by edge, and a
+	// replace marker would hide every other file's edge from it — a whole
+	// index keeps them. A source the generation does carry keeps its
+	// marker: its tombstone speaks for its adjacency anyway.
+	ids := make([]string, 0, len(markers))
+	for _, marker := range markers {
+		ids = append(ids, marker.SourceID)
+	}
+	carriedSources := handle.GetNodesByIDs(ids)
+	var candidates []string
+	for _, marker := range markers {
+		if _, isContext := withdrawn[builderMaskKey(marker.SourceID)]; isContext {
+			candidates = append(candidates, marker.SourceID)
+			continue
+		}
+		if carriedSources[marker.SourceID] == nil {
+			candidates = append(candidates, marker.SourceID)
+		}
+	}
+	if len(candidates) == 0 {
+		return markers
+	}
+	settled := make(map[string]struct{}, len(candidates))
+	edges := handle.GetOutEdgesByNodeIDs(candidates)
+	for _, id := range candidates {
+		ok := true
+		for _, edge := range edges[id] {
+			if edge == nil {
+				continue
+			}
+			if _, claimed := covered[edge.FilePath]; edge.FilePath == "" || !claimed {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			settled[id] = struct{}{}
+		}
+	}
+	kept := markers[:0:0]
+	for _, marker := range markers {
+		if _, drop := settled[marker.SourceID]; drop {
+			continue
+		}
+		kept = append(kept, marker)
+	}
+	return kept
 }
 
 // builderMaskKey is the path a file mask must claim for the composition to
@@ -2496,404 +2900,4 @@ func (s *fileSetSource) Walk(ctx context.Context, fn func(source.FileMeta) error
 		}
 	}
 	return nil
-}
-
-// checkoutCompilerScope is the compiler scope a working-tree build asks of the
-// go/types provider: rooted at the packages the build carries, sibling bodies
-// stripped, the checkout's type-check state retained, with a whole-module load
-// forced when the build's changes touch a Go module manifest.
-func (b *SparseGenerationBuilder) checkoutCompilerScope(changes []LayerPathChange) semantic.CheckoutCompilerScope {
-	scope := semantic.CheckoutCompilerScope{
-		HandleRoots:         !b.wholeModuleCompilerLoad,
-		StripSiblingBodies:  !b.wholeModuleCompilerLoad,
-		TypecheckCache:      !b.wholeModuleCompilerLoad,
-		TypecheckCacheBytes: b.Config.SemanticTypecheckCacheBytes(),
-	}
-	for _, change := range changes {
-		if goModuleManifestPath(change.Path) {
-			scope.ManifestChanged = true
-			break
-		}
-	}
-	return scope
-}
-
-// goModuleManifestPath reports whether a repository-relative path names a file
-// that decides a Go module's build list.
-func goModuleManifestPath(p string) bool {
-	p = strings.ReplaceAll(p, "\\", "/")
-	switch path.Base(p) {
-	case "go.mod", "go.sum", "go.work", "go.work.sum":
-		return true
-	}
-	return p == "vendor/modules.txt" || strings.HasSuffix(p, "/vendor/modules.txt")
-}
-
-// chainClearsEnrichmentFloor reports whether every language this generation
-// carries clears the admission floor in the census of the whole working-tree
-// state: the parent chain's files (chain) with this generation's own files in
-// place of theirs, plus the committed state's language totals (base) when the
-// caller supplied them. The census applies the same exclusions the manager's does
-// (low-value and fixture paths; user exclusion globs are not known here, so
-// the census can only be larger than the manager's, never admit a language
-// the generation does not carry). A generation that carries no language does
-// not clear it: there is nothing to enrich.
-//
-// Only languages a provider serves are judged (enrichable; nil judges every
-// language): the floor exists to decide whether a provider runs, and a
-// language no provider serves (contract nodes, say) cannot be enriched
-// whatever its count, so it must not veto the languages that can. base is
-// called at most once, and only when the generation's own files and the
-// chain leave a judged language below the floor; baseRead reports whether it
-// was.
-func chainClearsEnrichmentFloor(handle graph.Store, repoPrefix string, chain map[string]map[string]int, base func() map[string]int, floor int, enrichable func(string) bool) (clears, baseRead bool) {
-	own := map[string]map[string]int{}
-	for _, row := range graph.ReadRepoLanguageFileCounts(handle, []string{repoPrefix}) {
-		if row.Language == "" || row.Count <= 0 {
-			continue
-		}
-		if own[row.FilePath] == nil {
-			own[row.FilePath] = map[string]int{}
-		}
-		own[row.FilePath][row.Language] += row.Count
-	}
-	totals := map[string]int{}
-	present := map[string]bool{}
-	add := func(file string, languages map[string]int, mine bool) {
-		if semantic.IsLowValueForEnrichment(file, nil) || semantic.IsFixtureCensusPath(file) {
-			return
-		}
-		for language, count := range languages {
-			totals[language] += count
-			if mine {
-				present[language] = true
-			}
-		}
-	}
-	for file, languages := range own {
-		add(file, languages, true)
-	}
-	for file, languages := range chain {
-		if _, replaced := own[file]; !replaced {
-			add(file, languages, false)
-		}
-	}
-	for language := range present {
-		if enrichable != nil && !enrichable(language) {
-			delete(present, language)
-		}
-	}
-	if len(present) == 0 {
-		return false, false
-	}
-	below := func() bool {
-		for language := range present {
-			if totals[language] < floor {
-				return true
-			}
-		}
-		return false
-	}
-	if !below() {
-		return true, false
-	}
-	if base == nil {
-		return false, false
-	}
-	for language, count := range base() {
-		totals[language] += count
-	}
-	return !below(), true
-}
-
-// WarmCheckoutCompiler asks the enrichment manager to warm the compiler
-// state of the checkout rooted at root in the background (a whole-module
-// listing that later working-tree builds' go/types passes reuse). It returns
-// at once with each provider's outcome. A coordinator calls it when its checkout becomes
-// ready; every build's enrichment stage also calls it after its pass, which
-// is a no-op while the checkout is warm for its module manifests.
-func (b *SparseGenerationBuilder) WarmCheckoutCompiler(root string) map[string]string {
-	return b.warmCheckoutCompiler(root, b.checkoutCompilerScope(nil))
-}
-
-func (b *SparseGenerationBuilder) warmCheckoutCompiler(root string, scope semantic.CheckoutCompilerScope) map[string]string {
-	if b == nil || b.Semantic == nil || root == "" || !scope.HandleRoots {
-		return nil
-	}
-	return b.Semantic.WarmCheckoutCompiler(root, scope)
-}
-
-// passCorpusCounts measures a pass corpus the way Indexer.repoNodeEdgeCount
-// measures the pass's graph: the repository's own nodes and edges when the
-// pass is prefixed, the whole corpus otherwise.
-func passCorpusCounts(corpus *graph.Graph, repoPrefix string) (int, int) {
-	if repoPrefix == "" {
-		return corpus.NodeCount(), corpus.EdgeCount()
-	}
-	est := corpus.RepoMemoryEstimate(repoPrefix)
-	return est.NodeCount, est.EdgeCount
-}
-
-// pruneUnanchoredPathless removes the identities that live at no source file
-// and that only withheld context reached.
-//
-// A declared context file is re-derived against a corpus that deliberately
-// omits what IT resolves into, so its references into those files bind to
-// whatever the resolver mints for an absent target: a dependency stub, a
-// synthesised external-call module, a module identity. They live at no path,
-// so withholding the file does not take them along, and a generation that kept
-// them would tombstone and serve identities a whole index of the tree never
-// has. What stays is every pathless identity touched by an edge that has an
-// endpoint at a path the generation keeps or is recorded at such a path, and
-// every pathless identity those reach along outgoing edges across pathless
-// identities only. The rest was minted for withheld context alone and leaves
-// with it.
-func pruneUnanchoredPathless(
-	repoPrefix string,
-	corpus contextCorpus,
-	withheld map[string]struct{},
-) (nodesRemoved, edgesRemoved int, pruned []string, err error) {
-	kept := func(graphPath string) bool {
-		if graphPath == "" {
-			return false
-		}
-		if _, owned := builderRelPath(repoPrefix, graphPath); !owned {
-			return false
-		}
-		_, gone := withheld[graphPath]
-		return !gone
-	}
-	isFile := func(graphPath string) bool {
-		if graphPath == "" {
-			return false
-		}
-		_, owned := builderRelPath(repoPrefix, graphPath)
-		return owned
-	}
-	pathless := make(map[string]struct{})
-	anchored := make(map[string]struct{})
-	for _, node := range corpus.AllNodes() {
-		if node == nil || node.ID == "" {
-			continue
-		}
-		if isFile(node.FilePath) {
-			if kept(node.FilePath) {
-				anchored[node.ID] = struct{}{}
-			}
-			continue
-		}
-		pathless[node.ID] = struct{}{}
-	}
-	if len(pathless) == 0 {
-		return 0, 0, nil, nil
-	}
-	adjacent := make(map[string][]string)
-	reached := make(map[string]struct{})
-	var queue []string
-	reach := func(id string) {
-		if _, isPathless := pathless[id]; !isPathless {
-			return
-		}
-		if _, done := reached[id]; done {
-			return
-		}
-		reached[id] = struct{}{}
-		queue = append(queue, id)
-	}
-	for _, edge := range corpus.AllEdges() {
-		if edge == nil {
-			continue
-		}
-		_, fromPathless := pathless[edge.From]
-		_, toPathless := pathless[edge.To]
-		if fromPathless && toPathless {
-			// Forward only: a reached stub keeps what it points at (its
-			// module, say), but a shared target must not pull back every
-			// other stub pointing at it. A module identity is the hub of
-			// every stub of its package, so the reverse step used to keep
-			// the stubs only withheld context reached, and their
-			// edge-source markers then hid the base's adjacency of those
-			// stubs recorded in files the generation never touched.
-			adjacent[edge.From] = append(adjacent[edge.From], edge.To)
-		}
-		_, fromAnchored := anchored[edge.From]
-		_, toAnchored := anchored[edge.To]
-		if fromAnchored || toAnchored || kept(edge.FilePath) {
-			reach(edge.From)
-			reach(edge.To)
-		}
-	}
-	for len(queue) > 0 {
-		id := queue[len(queue)-1]
-		queue = queue[:len(queue)-1]
-		for _, next := range adjacent[id] {
-			reach(next)
-		}
-	}
-	for id := range pathless {
-		if _, ok := reached[id]; !ok {
-			pruned = append(pruned, id)
-		}
-	}
-	if len(pruned) == 0 {
-		return 0, 0, nil, nil
-	}
-	sort.Strings(pruned)
-	evicter, ok := corpus.(graph.PathlessNodeBatchEvicter)
-	if !ok {
-		return 0, 0, nil, fmt.Errorf(
-			"indexer: withhold generation context: the corpus cannot evict %d pathless identities minted for withheld context",
-			len(pruned))
-	}
-	nodesRemoved, edgesRemoved = evicter.EvictPathlessNodesByIDs(pruned)
-	return nodesRemoved, edgesRemoved, pruned, nil
-}
-
-// builderBaseServesContracts reports whether withholding a declared path
-// leaves every contract identity the pass placed there served by the layer
-// below exactly as a whole index serves it: the layer below holds the identity
-// either at this same path or at a path the generation neither claims nor
-// reads, so no mask of this generation can hide it.
-func builderBaseServesContracts(
-	base map[string]*graph.Node,
-	graphPath string,
-	contractIDs []string,
-	candidates, changedPaths map[string]struct{},
-) bool {
-	for _, id := range contractIDs {
-		node := base[id]
-		if node == nil || node.Kind != graph.KindContract {
-			return false
-		}
-		if node.FilePath == graphPath {
-			continue
-		}
-		if _, claimed := changedPaths[node.FilePath]; claimed {
-			return false
-		}
-		if _, read := candidates[node.FilePath]; read {
-			return false
-		}
-	}
-	return true
-}
-
-// holdsContentBody reports whether a candidate path carries a content
-// section, whose body lives in an index the withdrawal does not reach.
-func (p *builderPathPayload) holdsContentBody(graphPath string) bool {
-	_, ok := p.contentBody[graphPath]
-	return ok
-}
-
-// edgesRecordedAt lists the carried edges recorded at the withdrawn paths.
-func (p *builderPathPayload) edgesRecordedAt(withdrawn map[string]struct{}) []*graph.Edge {
-	var out []*graph.Edge
-	for graphPath := range withdrawn {
-		out = append(out, p.edgesByPath[graphPath]...)
-	}
-	return out
-}
-
-// withoutSettledContextSources drops the edge-source markers a withheld context
-// file's symbols would otherwise need.
-//
-// A changed file records edges whose SOURCE is a symbol of a file it only read
-// — a value flowing out of a callee into the caller is recorded at the caller.
-// Those edges are the changed file's own payload, and the composition settles
-// them edge by edge against the file masks (graph.OverlaidView.baseEdgeVisible):
-// the generation's copy is served because it is recorded at a claimed path,
-// base's copy recorded at the same path is hidden, and the symbol's other edges,
-// recorded in its own unclaimed file, keep showing through from below. A
-// replace marker would instead hide ALL of the symbol's base adjacency, which
-// the generation does not carry. So a marker is dropped exactly when its source
-// lives at a withheld context path or is not a node the generation carries (a
-// dataflow placeholder, a pathless identity the layer below serves), and every
-// edge the generation carries out of it is recorded at a claimed, non-empty path;
-// anything else keeps the marker and meets the build-failure guard below.
-func withoutSettledContextSources(
-	handle *store_sqlite.Store,
-	markers []store_sqlite.EdgeSourceMask,
-	withdrawn map[string]struct{},
-	covered map[string]struct{},
-) []store_sqlite.EdgeSourceMask {
-	if len(markers) == 0 {
-		return markers
-	}
-	// A candidate is a source the generation carries no node for: a symbol
-	// at a withheld context path, a dataflow placeholder source
-	// (`<repo>/unresolved::<name>`, no node and no file: every file that
-	// flows a value out of the unresolved name records its own edge from
-	// it), or a pathless identity the layer below already serves
-	// (pruneRedundantPathless). Its adjacency is settled edge by edge, and a
-	// replace marker would hide every other file's edge from it — a whole
-	// index keeps them. A source the generation does carry keeps its
-	// marker: its tombstone speaks for its adjacency anyway.
-	ids := make([]string, 0, len(markers))
-	for _, marker := range markers {
-		ids = append(ids, marker.SourceID)
-	}
-	carriedSources := handle.GetNodesByIDs(ids)
-	var candidates []string
-	for _, marker := range markers {
-		if _, isContext := withdrawn[builderMaskKey(marker.SourceID)]; isContext {
-			candidates = append(candidates, marker.SourceID)
-			continue
-		}
-		if carriedSources[marker.SourceID] == nil {
-			candidates = append(candidates, marker.SourceID)
-		}
-	}
-	if len(candidates) == 0 {
-		return markers
-	}
-	settled := make(map[string]struct{}, len(candidates))
-	edges := handle.GetOutEdgesByNodeIDs(candidates)
-	for _, id := range candidates {
-		ok := true
-		for _, edge := range edges[id] {
-			if edge == nil {
-				continue
-			}
-			if _, claimed := covered[edge.FilePath]; edge.FilePath == "" || !claimed {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			settled[id] = struct{}{}
-		}
-	}
-	kept := markers[:0:0]
-	for _, marker := range markers {
-		if _, drop := settled[marker.SourceID]; drop {
-			continue
-		}
-		kept = append(kept, marker)
-	}
-	return kept
-}
-
-// separateAndPrune is the one post-pass step both routes take: the in-memory
-// corpus filter before the drain, and the withdrawal from the generation
-// handle after it. Withholding the context and pruning the redundant pathless
-// identities are decided here, on the corpus either route holds, so the two
-// routes carry the same generation by construction.
-func (b *SparseGenerationBuilder) separateAndPrune(
-	ctx context.Context,
-	req BuildRequest,
-	plan buildPlan,
-	corpus contextCorpus,
-) (contextSeparation, error) {
-	separation, err := b.withholdContextPayload(ctx, req, plan, corpus)
-	if err != nil {
-		return contextSeparation{}, err
-	}
-	_, _, pruned, err := pruneRedundantPathless(corpus, req.Base)
-	if err != nil {
-		return contextSeparation{}, err
-	}
-	if err := purgeIdentitySidecars(corpus, pruned); err != nil {
-		return contextSeparation{}, err
-	}
-	return separation, nil
 }

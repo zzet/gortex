@@ -2035,6 +2035,8 @@ func (w *closureWalk) buildDirIndexes() {
 	}
 }
 
+// builderSeedNodeIDsContext reads every node the base layer carries at the
+// given paths, in one batched read, stopping when ctx is done.
 func builderSeedNodeIDsContext(ctx context.Context, base LayerBase, paths []string) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -2328,6 +2330,10 @@ func builderAddNodeFilesContext(
 	return nil
 }
 
+// closureReadChunk is how many paths one closure read covers between context
+// checks.
+const closureReadChunk = 32
+
 // closureChunks splits values into consecutive chunks of at most n.
 func closureChunks(values []string, n int) [][]string {
 	if len(values) <= n {
@@ -2340,5 +2346,3 @@ func closureChunks(values []string, n int) [][]string {
 	}
 	return out
 }
-
-const closureReadChunk = 32

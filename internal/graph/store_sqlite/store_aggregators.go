@@ -560,95 +560,6 @@ func (s *Store) NodesByKinds(kinds []graph.NodeKind) []*graph.Node {
 	return out
 }
 
-// EdgeAdjacencyForKinds streams (from, to) id pairs for edges whose
-// kind is in edgeKinds and whose endpoints both have a kind in
-// nodeKinds; honours early-stop. Empty kinds yields nothing.
-func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []graph.NodeKind) iter.Seq[[2]string] {
-	_, eArgs := aggDedupeEdgeKinds(edgeKinds)
-	_, nArgs := aggDedupeNodeKinds(nodeKinds)
-	return func(yield func([2]string) bool) {
-		if len(eArgs) == 0 || len(nArgs) == 0 {
-			return
-		}
-		args := append([]any(nil), eArgs...)
-		args = append(args, nArgs...)
-		args = append(args, nArgs...)
-		args = append(args, s.viewGen)
-		q := `SELECT e.from_id, e.to_id
-			FROM edges e
-			JOIN nodes nf ON e.from_id = nf.id AND nf.view_gen = e.view_gen
-			JOIN nodes nt ON e.to_id = nt.id AND nt.view_gen = e.view_gen
-			WHERE e.kind IN (` + inPlaceholders(len(eArgs)) + `)
-			AND nf.kind IN (` + inPlaceholders(len(nArgs)) + `)
-			AND nt.kind IN (` + inPlaceholders(len(nArgs)) + `)
-			AND e.view_gen = ?`
-		rows, err := s.db.Query(q, args...)
-		panicOnFatal(err)
-		if rows == nil {
-			// swallowed teardown-race error: read returns empty (see panicOnFatal)
-			return
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var from, to string
-			panicOnFatal(rows.Scan(&from, &to))
-			if !yield([2]string{from, to}) {
-				return
-			}
-		}
-		panicOnFatal(rows.Err())
-	}
-}
-
-// NodeDegreeCounts returns per-node in/out/usage-in edge counts for the
-// supplied id set. Unknown ids produce no row; duplicates collapse.
-func (s *Store) NodeDegreeCounts(ids []string, usageKinds []graph.EdgeKind) []graph.NodeDegreeRow {
-	uniq := dedupeNonEmpty(ids)
-	if len(uniq) == 0 {
-		return nil
-	}
-	_, usageArgs := aggDedupeEdgeKinds(usageKinds)
-	out := make([]graph.NodeDegreeRow, 0, len(uniq))
-	for i := 0; i < len(uniq); i += lookupChunkSize {
-		end := minInt(i+lookupChunkSize, len(uniq))
-		chunk := uniq[i:end]
-		// Usage-in subquery: a literal 0 when no usage kinds are given.
-		usageExpr := `0`
-		var usageInline []any
-		if len(usageArgs) > 0 {
-			usageExpr = `(SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id AND e.kind IN (` +
-				inPlaceholders(len(usageArgs)) + `) AND e.view_gen = ?)`
-			usageInline = append(append([]any(nil), usageArgs...), s.viewGen)
-		}
-		q := `SELECT n.id,
-			(SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id AND e.view_gen = ?) AS in_count,
-			(SELECT COUNT(*) FROM edges e WHERE e.from_id = n.id AND e.view_gen = ?) AS out_count,
-			` + usageExpr + ` AS usage_in
-		FROM nodes n
-		WHERE n.id IN (` + inPlaceholders(len(chunk)) + `) AND n.view_gen = ?`
-		// Bind order matches placeholder order: the two degree subqueries,
-		// the usage subquery, the id IN-list, then the node-side generation.
-		args := []any{s.viewGen, s.viewGen}
-		args = append(args, usageInline...)
-		args = append(args, toAnyArgs(chunk)...)
-		args = append(args, s.viewGen)
-		rows, err := s.db.Query(q, args...)
-		panicOnFatal(err)
-		if rows == nil {
-			// swallowed teardown-race error: read returns empty (see panicOnFatal)
-			return out
-		}
-		for rows.Next() {
-			var r graph.NodeDegreeRow
-			panicOnFatal(rows.Scan(&r.NodeID, &r.InCount, &r.OutCount, &r.UsageInCount))
-			out = append(out, r)
-		}
-		panicOnFatal(rows.Err())
-		_ = rows.Close()
-	}
-	return out
-}
-
 // NodesByKindsContext returns every node whose kind is in the supplied set,
 // in id order, and stops within one page once ctx ends (returning the rows
 // read so far and ctx's error).
@@ -740,27 +651,93 @@ func nodesByKindsPageSQL(kinds int) string {
 		inPlaceholders(kinds) + `) ORDER BY id LIMIT ?`
 }
 
-// scanNodeCursorID is scanNodeCursor that also reports the row's id, which a
-// keyset page needs even for a row the scanner filters out (nil node).
-func scanNodeCursorID(rows *sql.Rows, id *string) (*graph.Node, error) {
-	return scanNodeCursor(idCapturingScanner{rows: rows, id: id})
-}
-
-type idCapturingScanner struct {
-	rows *sql.Rows
-	id   *string
-}
-
-func (c idCapturingScanner) Scan(dest ...any) error {
-	if err := c.rows.Scan(dest...); err != nil {
-		return err
-	}
-	if len(dest) > 0 {
-		if p, ok := dest[0].(*string); ok {
-			*c.id = *p
+// EdgeAdjacencyForKinds streams (from, to) id pairs for edges whose
+// kind is in edgeKinds and whose endpoints both have a kind in
+// nodeKinds; honours early-stop. Empty kinds yields nothing.
+func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []graph.NodeKind) iter.Seq[[2]string] {
+	_, eArgs := aggDedupeEdgeKinds(edgeKinds)
+	_, nArgs := aggDedupeNodeKinds(nodeKinds)
+	return func(yield func([2]string) bool) {
+		if len(eArgs) == 0 || len(nArgs) == 0 {
+			return
 		}
+		args := append([]any(nil), eArgs...)
+		args = append(args, nArgs...)
+		args = append(args, nArgs...)
+		args = append(args, s.viewGen)
+		q := `SELECT e.from_id, e.to_id
+			FROM edges e
+			JOIN nodes nf ON e.from_id = nf.id AND nf.view_gen = e.view_gen
+			JOIN nodes nt ON e.to_id = nt.id AND nt.view_gen = e.view_gen
+			WHERE e.kind IN (` + inPlaceholders(len(eArgs)) + `)
+			AND nf.kind IN (` + inPlaceholders(len(nArgs)) + `)
+			AND nt.kind IN (` + inPlaceholders(len(nArgs)) + `)
+			AND e.view_gen = ?`
+		rows, err := s.db.Query(q, args...)
+		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var from, to string
+			panicOnFatal(rows.Scan(&from, &to))
+			if !yield([2]string{from, to}) {
+				return
+			}
+		}
+		panicOnFatal(rows.Err())
 	}
-	return nil
+}
+
+// NodeDegreeCounts returns per-node in/out/usage-in edge counts for the
+// supplied id set. Unknown ids produce no row; duplicates collapse.
+func (s *Store) NodeDegreeCounts(ids []string, usageKinds []graph.EdgeKind) []graph.NodeDegreeRow {
+	uniq := dedupeNonEmpty(ids)
+	if len(uniq) == 0 {
+		return nil
+	}
+	_, usageArgs := aggDedupeEdgeKinds(usageKinds)
+	out := make([]graph.NodeDegreeRow, 0, len(uniq))
+	for i := 0; i < len(uniq); i += lookupChunkSize {
+		end := minInt(i+lookupChunkSize, len(uniq))
+		chunk := uniq[i:end]
+		// Usage-in subquery: a literal 0 when no usage kinds are given.
+		usageExpr := `0`
+		var usageInline []any
+		if len(usageArgs) > 0 {
+			usageExpr = `(SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id AND e.kind IN (` +
+				inPlaceholders(len(usageArgs)) + `) AND e.view_gen = ?)`
+			usageInline = append(append([]any(nil), usageArgs...), s.viewGen)
+		}
+		q := `SELECT n.id,
+			(SELECT COUNT(*) FROM edges e WHERE e.to_id = n.id AND e.view_gen = ?) AS in_count,
+			(SELECT COUNT(*) FROM edges e WHERE e.from_id = n.id AND e.view_gen = ?) AS out_count,
+			` + usageExpr + ` AS usage_in
+		FROM nodes n
+		WHERE n.id IN (` + inPlaceholders(len(chunk)) + `) AND n.view_gen = ?`
+		// Bind order matches placeholder order: the two degree subqueries,
+		// the usage subquery, the id IN-list, then the node-side generation.
+		args := []any{s.viewGen, s.viewGen}
+		args = append(args, usageInline...)
+		args = append(args, toAnyArgs(chunk)...)
+		args = append(args, s.viewGen)
+		rows, err := s.db.Query(q, args...)
+		panicOnFatal(err)
+		if rows == nil {
+			// swallowed teardown-race error: read returns empty (see panicOnFatal)
+			return out
+		}
+		for rows.Next() {
+			var r graph.NodeDegreeRow
+			panicOnFatal(rows.Scan(&r.NodeID, &r.InCount, &r.OutCount, &r.UsageInCount))
+			out = append(out, r)
+		}
+		panicOnFatal(rows.Err())
+		_ = rows.Close()
+	}
+	return out
 }
 
 // NodeFanCounts returns per-node fan-in (incoming edges in fanInKinds)
@@ -858,4 +835,27 @@ func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[
 		return nil
 	}
 	return out
+}
+
+// scanNodeCursorID is scanNodeCursor that also reports the row's id, which a
+// keyset page needs even for a row the scanner filters out (nil node).
+func scanNodeCursorID(rows *sql.Rows, id *string) (*graph.Node, error) {
+	return scanNodeCursor(idCapturingScanner{rows: rows, id: id})
+}
+
+type idCapturingScanner struct {
+	rows *sql.Rows
+	id   *string
+}
+
+func (c idCapturingScanner) Scan(dest ...any) error {
+	if err := c.rows.Scan(dest...); err != nil {
+		return err
+	}
+	if len(dest) > 0 {
+		if p, ok := dest[0].(*string); ok {
+			*c.id = *p
+		}
+	}
+	return nil
 }

@@ -379,8 +379,18 @@ func (c *CheckoutCoordinator) enqueueCheckoutRefresh(request *checkoutRefreshReq
 		request.record.MarkAt(PublicationTicketEnqueued, request.admittedAt)
 	}
 	c.refreshMu.Unlock()
+	// A ticket is demand: its cycle starts now rather than after a quiet
+	// window. It still completes only through completeCheckoutRefreshTickets'
+	// verification against a sample taken after it was admitted.
+	// A ticket is a use: the cycle it demands applies a pending base
+	// advance (checkout_propagation.go). Recorded before the selection below,
+	// which would otherwise signal a second window for it.
 	c.wantRebase("refresh ticket", false)
 	c.SignalDemand("checkout refresh ticket admitted")
+	// A cycle of this checkout already queued for the build lane at
+	// background priority (a filesystem change the loop found first) now
+	// serves a waiting caller: promote it to the interactive queue rather
+	// than leave it behind other checkouts' background work.
 	c.PrioritizeSelection()
 	return request.ticket, nil
 }

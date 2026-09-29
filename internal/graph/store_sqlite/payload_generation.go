@@ -602,6 +602,54 @@ func (s *Store) publishSealedGeneration(ctx context.Context, catalog *Catalog, g
 	return nil
 }
 
+// publishTimings attributes one publish window to its steps. It is logged on
+// every successful publish with stable field names, so a slow publication can
+// be decomposed from the daemon log alone.
+type publishTimings struct {
+	started, last time.Time
+	steps         [publishStepCount]time.Duration
+}
+
+type publishStep int
+
+const (
+	publishStepDrain publishStep = iota
+	publishStepIdentityMasks
+	publishStepContextClaims
+	publishStepFileMasks
+	publishStepProducers
+	publishStepRollup
+	publishStepCatalogRollup
+	publishStepCatalogPublish
+	publishStepCount
+)
+
+// mark charges the time since the previous mark to step. A nil receiver or an
+// unstarted record is a no-op, so the untimed validation entry point can share
+// the timed body.
+func (t *publishTimings) mark(step publishStep) {
+	if t == nil || t.started.IsZero() {
+		return
+	}
+	now := time.Now()
+	from := t.last
+	if from.IsZero() {
+		from = t.started
+	}
+	t.steps[step] += now.Sub(from)
+	t.last = now
+}
+
+func (t *publishTimings) log(generationID int64) {
+	if t == nil || t.started.IsZero() {
+		return
+	}
+	log.Printf("store_sqlite: publish generation=%d total=%s drain=%s identity_masks=%s context_claims=%s file_masks=%s producers=%s rollup=%s catalog_rollup=%s catalog_publish=%s",
+		generationID, time.Since(t.started), t.steps[publishStepDrain], t.steps[publishStepIdentityMasks],
+		t.steps[publishStepContextClaims], t.steps[publishStepFileMasks], t.steps[publishStepProducers],
+		t.steps[publishStepRollup], t.steps[publishStepCatalogRollup], t.steps[publishStepCatalogPublish])
+}
+
 // requireProducersSettled refuses a generation a producer has not finished
 // contributing to. The probe is a leading-key seek on the completeness table's
 // primary key, so it costs one index range regardless of graph size.
@@ -1117,51 +1165,3 @@ func payloadGenerationRetiringTx(ctx context.Context, tx *sql.Tx, generationID i
 	}
 	return ViewGenerationState(state) == ViewGenerationRetiring, nil
 }
-
-// publishTimings attributes one publish window to its steps. It is logged on
-// every successful publish with stable field names, so a slow publication can
-// be decomposed from the daemon log alone.
-type publishTimings struct {
-	started, last time.Time
-	steps         [publishStepCount]time.Duration
-}
-
-type publishStep int
-
-// mark charges the time since the previous mark to step. A nil receiver or an
-// unstarted record is a no-op, so the untimed validation entry point can share
-// the timed body.
-func (t *publishTimings) mark(step publishStep) {
-	if t == nil || t.started.IsZero() {
-		return
-	}
-	now := time.Now()
-	from := t.last
-	if from.IsZero() {
-		from = t.started
-	}
-	t.steps[step] += now.Sub(from)
-	t.last = now
-}
-
-func (t *publishTimings) log(generationID int64) {
-	if t == nil || t.started.IsZero() {
-		return
-	}
-	log.Printf("store_sqlite: publish generation=%d total=%s drain=%s identity_masks=%s context_claims=%s file_masks=%s producers=%s rollup=%s catalog_rollup=%s catalog_publish=%s",
-		generationID, time.Since(t.started), t.steps[publishStepDrain], t.steps[publishStepIdentityMasks],
-		t.steps[publishStepContextClaims], t.steps[publishStepFileMasks], t.steps[publishStepProducers],
-		t.steps[publishStepRollup], t.steps[publishStepCatalogRollup], t.steps[publishStepCatalogPublish])
-}
-
-const (
-	publishStepDrain publishStep = iota
-	publishStepIdentityMasks
-	publishStepContextClaims
-	publishStepFileMasks
-	publishStepProducers
-	publishStepRollup
-	publishStepCatalogRollup
-	publishStepCatalogPublish
-	publishStepCount
-)

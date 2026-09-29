@@ -501,6 +501,35 @@ func (l *CheckoutLifecycle) PropagateBaseAdvance(
 	return 0
 }
 
+// NoteCheckoutUse tells a live coordinator that a request is reading its
+// checkout, so a base advance left pending for the next use is applied now.
+// It never starts a coordinator (ActivateCheckout does) and costs nothing when
+// nothing is pending.
+func (l *CheckoutLifecycle) NoteCheckoutUse(checkoutID, reason string) {
+	if l == nil || checkoutID == "" {
+		return
+	}
+	l.coordMu.Lock()
+	coordinator := l.coordinators[checkoutID]
+	l.coordMu.Unlock()
+	coordinator.wantRebase(reason, true)
+}
+
+// CheckoutPropagationStats reports one live coordinator's propagation state;
+// found is false when the checkout has no live coordinator.
+func (l *CheckoutLifecycle) CheckoutPropagationStats(checkoutID string) (PropagationStats, bool) {
+	if l == nil || checkoutID == "" {
+		return PropagationStats{}, false
+	}
+	l.coordMu.Lock()
+	coordinator := l.coordinators[checkoutID]
+	l.coordMu.Unlock()
+	if coordinator == nil {
+		return PropagationStats{}, false
+	}
+	return coordinator.PropagationStats(), true
+}
+
 // SetWatcherSource installs the accessor for the live file watcher. The
 // watcher is built during warmup, long after the lifecycle, so it is read
 // through a function rather than captured. The accessor must return a nil
@@ -2352,6 +2381,61 @@ func (l *CheckoutLifecycle) buildCoordinator(
 	l.watchCheckout(coordinator, primary.RepoPrefix, checkout.RootPath)
 	warmCheckoutCompilerAtReady(l, builder, checkout.RootPath)
 	return coordinator, nil
+}
+
+// watchCheckout starts the checkout's file watcher and hands it to its
+// coordinator, which closes it with itself. It never delays the coordinator:
+// the watcher starts on a goroutine of its own, and a checkout whose watcher
+// cannot start is still refreshed by its poll.
+func (l *CheckoutLifecycle) watchCheckout(coordinator *CheckoutCoordinator, repoPrefix, root string) {
+	if l == nil || coordinator == nil || !l.cfgWatchCheckouts || !checkoutWatchEnabled() {
+		return
+	}
+	var patterns []string
+	if l.cfgMgr != nil {
+		patterns = l.cfgMgr.EffectiveExclude(repoPrefix)
+	}
+	logger := l.logger.With(zap.String("checkout", coordinator.checkoutID))
+	go func() {
+		w, err := startCheckoutWatch(root, patterns, logger, coordinator.noteFilesystemChange)
+		if err != nil {
+			logger.Info("checkout watch: not started; the checkout is refreshed by its poll",
+				zap.String("root", root), zap.Error(err))
+			return
+		}
+		coordinator.attachFilesystemWatch(w)
+	}()
+}
+
+// warmCheckoutCompilerAtReady starts the background warm-up of a ready
+// checkout's compiler state (the whole-module listing its working-tree builds'
+// go/types passes reuse), so the first edit in a package no build has listed
+// yet does not pay the cold listing. Without it a checkout whose tree is clean
+// when it is routed warms only after its first build, and that first edit is
+// the cold one.
+//
+// It never delays readiness: the module probe, the manifest digest and the
+// provider's own bookkeeping run on a goroutine of its own, outside the
+// construction-time admission and every lifecycle lock. The provider's listing
+// is itself asynchronous, yields to every compiler load, and is a no-op while
+// the checkout is already warm for its module manifests; a provider closed
+// first answers without starting anything. Without a semantic manager nothing
+// starts.
+//
+// The provider is handed the lifecycle's foreground-activity view first, so a
+// warm-up asked for here — typically at daemon start, for every automatic
+// checkout of a family at once — lists one checkout at a time, after the
+// daemon has been idle for a while (longer for a checkout nobody has touched
+// since the start), and stops as soon as an edit or a fresh request arrives
+// (lifecycleForegroundActivity).
+func warmCheckoutCompilerAtReady(l *CheckoutLifecycle, builder *SparseGenerationBuilder, root string) {
+	if builder == nil || builder.Semantic == nil || root == "" {
+		return
+	}
+	if l != nil {
+		builder.Semantic.SetForegroundActivity(l.foregroundActivity())
+	}
+	go builder.WarmCheckoutCompiler(root)
 }
 
 // holdRepositoryOwnerRead keeps one coordinator's repository-owner admission
@@ -4246,88 +4330,4 @@ func dirExists(path string) bool {
 	}
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
-}
-
-// warmCheckoutCompilerAtReady starts the background warm-up of a ready
-// checkout's compiler state (the whole-module listing its working-tree builds'
-// go/types passes reuse), so the first edit in a package no build has listed
-// yet does not pay the cold listing. Without it a checkout whose tree is clean
-// when it is routed warms only after its first build, and that first edit is
-// the cold one.
-//
-// It never delays readiness: the module probe, the manifest digest and the
-// provider's own bookkeeping run on a goroutine of its own, outside the
-// construction-time admission and every lifecycle lock. The provider's listing
-// is itself asynchronous, yields to every compiler load, and is a no-op while
-// the checkout is already warm for its module manifests; a provider closed
-// first answers without starting anything. Without a semantic manager nothing
-// starts.
-//
-// The provider is handed the lifecycle's foreground-activity view first, so a
-// warm-up asked for here — typically at daemon start, for every automatic
-// checkout of a family at once — lists one checkout at a time, after the
-// daemon has been idle for a while (longer for a checkout nobody has touched
-// since the start), and stops as soon as an edit or a fresh request arrives
-// (lifecycleForegroundActivity).
-func warmCheckoutCompilerAtReady(l *CheckoutLifecycle, builder *SparseGenerationBuilder, root string) {
-	if builder == nil || builder.Semantic == nil || root == "" {
-		return
-	}
-	if l != nil {
-		builder.Semantic.SetForegroundActivity(l.foregroundActivity())
-	}
-	go builder.WarmCheckoutCompiler(root)
-}
-
-// watchCheckout starts the checkout's file watcher and hands it to its
-// coordinator, which closes it with itself. It never delays the coordinator:
-// the watcher starts on a goroutine of its own, and a checkout whose watcher
-// cannot start is still refreshed by its poll.
-func (l *CheckoutLifecycle) watchCheckout(coordinator *CheckoutCoordinator, repoPrefix, root string) {
-	if l == nil || coordinator == nil || !l.cfgWatchCheckouts || !checkoutWatchEnabled() {
-		return
-	}
-	var patterns []string
-	if l.cfgMgr != nil {
-		patterns = l.cfgMgr.EffectiveExclude(repoPrefix)
-	}
-	logger := l.logger.With(zap.String("checkout", coordinator.checkoutID))
-	go func() {
-		w, err := startCheckoutWatch(root, patterns, logger, coordinator.noteFilesystemChange)
-		if err != nil {
-			logger.Info("checkout watch: not started; the checkout is refreshed by its poll",
-				zap.String("root", root), zap.Error(err))
-			return
-		}
-		coordinator.attachFilesystemWatch(w)
-	}()
-}
-
-// NoteCheckoutUse tells a live coordinator that a request is reading its
-// checkout, so a base advance left pending for the next use is applied now.
-// It never starts a coordinator (ActivateCheckout does) and costs nothing when
-// nothing is pending.
-func (l *CheckoutLifecycle) NoteCheckoutUse(checkoutID, reason string) {
-	if l == nil || checkoutID == "" {
-		return
-	}
-	l.coordMu.Lock()
-	coordinator := l.coordinators[checkoutID]
-	l.coordMu.Unlock()
-	coordinator.wantRebase(reason, true)
-}
-
-// CheckoutPropagationStats reports one live coordinator's propagation state;
-// found is false when the checkout has no live coordinator.
-func (l *CheckoutLifecycle) CheckoutPropagationStats(checkoutID string) (PropagationStats, bool) {
-	if l == nil || checkoutID == "" {
-		return PropagationStats{}, false
-	}
-	l.coordMu.Lock()
-	coordinator := l.coordinators[checkoutID]
-	l.coordMu.Unlock()
-	if coordinator == nil {
-		return PropagationStats{}, false
-	}
-	return coordinator.PropagationStats(), true
 }

@@ -104,9 +104,14 @@ type requestView struct {
 	// route reached the working copy, how long the request waited, and the
 	// bound it waited under. Nil for every request that did not ask, which is
 	// what keeps the rider of an ordinary request byte-identical.
-	freshness      *requestFreshnessOutcome
+	freshness *requestFreshnessOutcome
+	// answerIdentity is the generation identity of the worktree stack that
+	// answered; nil for every other view (view_answer_identity.go).
 	answerIdentity *worktreeAnswerIdentity
-	deferred       bool
+	// deferred marks a pre-wait selection whose generation stack was not
+	// composed (withDeferredMaterialization): it names its checkout and
+	// nothing reads through it.
+	deferred bool
 	// routeless marks a view that exists only to carry a freshness answer:
 	// selection produced no view at all (freshnessCarrier). Its rider makes no
 	// route claim — viewRiderFields omits actual_view and exact for it —
@@ -270,6 +275,27 @@ func (s *Server) SetMaterializer(m *graphview.Materializer) {
 	}
 	s.materializer = m
 	s.wireRoutePrewarm()
+}
+
+// wireRoutePrewarm installs the materializer's WarmRoute as the lifecycle's
+// route prewarmer, so every coordinator loads the layer masks of a stack it
+// is about to route before the route flips: the first request on a new
+// generation (an edit's selection most of all) then composes its view from
+// the cache instead of loading the new generation's masks inline.
+func (s *Server) wireRoutePrewarm() {
+	if s == nil || s.lifecycle == nil || s.materializer == nil {
+		return
+	}
+	materializer, logger := s.materializer, s.logger
+	s.lifecycle.SetRoutePrewarmer(func(ctx context.Context, generations []int64) {
+		started := time.Now()
+		loaded, err := materializer.WarmRoute(ctx, generations...)
+		if logger != nil && (err != nil || time.Since(started) > 50*time.Millisecond) {
+			logger.Info("graph view: route prewarmed before its flip",
+				zap.Int64s("generations", generations), zap.Int("mask_sets_loaded", loaded),
+				zap.Duration("elapsed", time.Since(started)), zap.Error(err))
+		}
+	})
 }
 
 // Materializer returns the routed-view materializer the server reads through,
@@ -568,6 +594,14 @@ func (s *Server) resolveRequestView(
 	}
 	selectCtx := ctx
 	if policy.freshness.requested() {
+		// The view selected before a freshness wait is closed unread: a
+		// request that can wait re-selects after the wait. It is selected
+		// with its generation stack deferred, so every scope, state and
+		// route refusal is still made first, but the stack a routed
+		// checkout composes (every generation of its ancestry opened, ~0.8 s
+		// of CPU per request on the live store) is composed once, after the
+		// wait, instead of twice. settleRequestFreshness composes it in full
+		// on the one path that answers out of the pre-wait selection.
 		selectCtx = withDeferredMaterialization(ctx)
 	}
 	view, err := s.selectRequestView(selectCtx, selector, policy)
@@ -635,6 +669,8 @@ func (s *Server) settleRequestFreshness(
 
 	checkout, notWaitable, waitable := s.freshnessWaitTarget(ctx, selector, view, selectErr)
 	if !waitable && view != nil && view.deferred {
+		// The one path that answers out of the pre-wait selection: compose
+		// the stack that selection deferred.
 		view.close()
 		view, selectErr = s.selectRequestView(ctx, selector, policy)
 	}
@@ -2034,6 +2070,9 @@ func (s *Server) materializeRequestView(
 		s.lifecycle.NoteCheckoutUse(checkout.CheckoutID, "view requested")
 	}
 	if deferredMaterialization(ctx) {
+		// A pre-wait selection: the route is ready and its checkout is in
+		// scope, which is all a freshness wait needs to name its target.
+		// The caller re-selects before anything reads (resolveRequestView).
 		return &requestView{kind: requestViewKindWorktree, rider: rider, viewRoot: checkout.RootPath, deferred: true}, nil
 	}
 	indexer.StampPublicationPhase(ctx, indexer.PublicationViewUseNoted)
@@ -2389,6 +2428,9 @@ func viewRiderFields(view *requestView) map[string]any {
 	if view.rider.RetryAfter > 0 {
 		fields["retry_after"] = view.rider.RetryAfter
 	}
+	// The identity of the stack that answered a worktree view: its route
+	// epoch, its two generations and the fingerprint of the composed view
+	// (view_answer_identity.go). Omitted for every other view.
 	view.answerIdentity.riderFields(fields)
 	// The base corpus moved while this request read it. Said as its own flag
 	// rather than only through the reason string, so a client can branch on it
@@ -2442,25 +2484,4 @@ func withDeferredMaterialization(ctx context.Context) context.Context {
 func deferredMaterialization(ctx context.Context) bool {
 	deferred, _ := ctx.Value(deferredMaterializationKey{}).(bool)
 	return deferred
-}
-
-// wireRoutePrewarm installs the materializer's WarmRoute as the lifecycle's
-// route prewarmer, so every coordinator loads the layer masks of a stack it
-// is about to route before the route flips: the first request on a new
-// generation (an edit's selection most of all) then composes its view from
-// the cache instead of loading the new generation's masks inline.
-func (s *Server) wireRoutePrewarm() {
-	if s == nil || s.lifecycle == nil || s.materializer == nil {
-		return
-	}
-	materializer, logger := s.materializer, s.logger
-	s.lifecycle.SetRoutePrewarmer(func(ctx context.Context, generations []int64) {
-		started := time.Now()
-		loaded, err := materializer.WarmRoute(ctx, generations...)
-		if logger != nil && (err != nil || time.Since(started) > 50*time.Millisecond) {
-			logger.Info("graph view: route prewarmed before its flip",
-				zap.Int64s("generations", generations), zap.Int("mask_sets_loaded", loaded),
-				zap.Duration("elapsed", time.Since(started)), zap.Error(err))
-		}
-	})
 }

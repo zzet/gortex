@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 // modernc applies every _pragma entry when each physical connection opens.

@@ -370,6 +370,12 @@ type CheckoutCycle struct {
 	// a lost route flip, or a working tree that moved under two builds in a
 	// row. The route is left exactly as the cycle found it.
 	Rescheduled bool
+	// YieldedTo names what a background cycle gave the build lane up to
+	// ("interactive_build"), or why it abandoned its build
+	// ("working_tree_moved": the checkout's working tree moved under it,
+	// checkout_motion.go): it was canceled before its commit point, nothing
+	// it began was published, and it is Rescheduled. Empty otherwise.
+	YieldedTo string
 	// Held reports a background cycle kept off the build lane because the
 	// working tree was still changing (checkout_motion.go): it built nothing,
 	// it is Rescheduled, and the quiet window runs the next one.
@@ -381,8 +387,7 @@ type CheckoutCycle struct {
 	// validated the inputs of. Opening the gate, an invalidation event or the
 	// 15-second coordinator poll retries the demand. Nothing was read or
 	// written, so every other field is zero.
-	Deferred  bool
-	YieldedTo string
+	Deferred bool
 	// DirtyParentCandidate and DirtyChainReason report, for a cycle that
 	// reached a working-tree build, which generation a chained build could
 	// stand on (selectDirtyParent) and, when none, the fallback reason code.
@@ -453,6 +458,9 @@ type CheckoutCoordinator struct {
 	// instead of re-reading the identity masks of the whole chain.
 	baseViewsOnce sync.Once
 	baseViews     *graphview.Materializer
+	// announceWrite replaces the store's AnnounceWrite for a waiting refresh
+	// ticket (a test seam; nil uses the store).
+	announceWrite func() func()
 
 	// requestBase is CheckoutCoordinatorConfig.RequestBase; nil asks nothing.
 	requestBase func(string)
@@ -619,18 +627,6 @@ type CheckoutCoordinator struct {
 	textKey   string
 	textState checkoutTextState
 
-	// motion is what the checkout's file watcher reported, and the admission
-	// state of background cycles over a moving working tree
-	// (checkout_motion.go).
-	motion checkoutMotion
-	// holdSample is a focused test seam for the working-copy sample a
-	// background cycle takes before it queues (holdBackgroundCycle); nil
-	// takes cycleSample.
-	holdSample func(context.Context) error
-	// announceWrite replaces the store's AnnounceWrite for a waiting refresh
-	// ticket (a test seam; nil uses the store).
-	announceWrite func() func()
-
 	cycleDone func(CheckoutCycle)
 	// prewarm loads the view reader's masks for a stack a flip will route
 	// (CheckoutCoordinatorConfig.PrewarmRoute); nil when none is installed.
@@ -641,12 +637,20 @@ type CheckoutCoordinator struct {
 	// settledWithoutBuild and has no barrier.
 	cyclePreflight func(context.Context) (CheckoutCycle, bool)
 	cycleBarrier   func(context.Context)
+	// holdSample is a focused test seam for the working-copy sample a
+	// background cycle takes before it queues (holdBackgroundCycle); nil
+	// takes cycleSample.
+	holdSample func(context.Context) error
+
+	// laneYields is how many background cycles in a row gave the build lane
+	// up to an interactive build (ViewBuildGate.NoteYieldable). A cycle that
+	// runs to an outcome resets it; past maxViewBuildYields the gate arms
+	// nothing and the background work runs to completion. Guarded by mu.
+	laneYields int
 
 	// selectionDemand promotes a queued build independently of the debounce
 	// signal. mu guards initialization; the buffered channel coalesces demand.
 	selectionDemand chan struct{}
-	ticketDemand    atomic.Int64
-	laneYields      int
 
 	// demand wakes the loop for a cycle without a quiet window: a refresh
 	// ticket (an MCP edit's committed content, or a request that needs a
@@ -655,11 +659,19 @@ type CheckoutCoordinator struct {
 	// a burst coalesces into one cycle, and demand that arrives during a
 	// cycle is answered by exactly one more.
 	demand chan struct{}
+	// ticketDemand is when this checkout's newest refresh ticket was
+	// admitted (Unix nanoseconds, 0 before the first): the rank its cycles
+	// carry on the shared build lane (ViewBuildGate.AcquireRanked), so the
+	// checkout a caller is waiting on right now is built before another
+	// checkout's cycle queued earlier.
+	ticketDemand atomic.Int64
 	// signaledAt is when Signal last claimed the checkout moved (under mu):
 	// a cycle's shared sample must postdate it (cycleSample).
 	signaledAt time.Time
 
-	// propagation is the primary-to-worktree advance noted until next use.
+	// propagation is the primary-to-worktree propagation state: a base
+	// advance noted without a cycle, and whether a use asked for it to be
+	// applied (checkout_propagation.go).
 	propagation basePropagation
 
 	// retireCalled is a test seam: it observes every generation offerRetire
@@ -669,6 +681,11 @@ type CheckoutCoordinator struct {
 	// compaction is the background working-tree chain compaction's state
 	// (dirty_chain_compaction.go).
 	compaction dirtyChainCompactor
+
+	// motion is what the checkout's file watcher reported, and the admission
+	// state of background cycles over a moving working tree
+	// (checkout_motion.go).
+	motion checkoutMotion
 }
 
 func (c *CheckoutCoordinator) selectionRequests() chan struct{} {
@@ -907,6 +924,31 @@ func (c *CheckoutCoordinator) signalWindow(reason string, claim bool) {
 	}
 }
 
+// SignalDemand wakes the loop for a cycle now, without the quiet window. It is
+// the wake for refresh tickets: their content is already bound (an MCP edit's
+// committed hash) or they ask for a fresh answer, and a ticket completes only
+// through the post-admission verification against a sample taken after it
+// arrived, so the window would add delay and prove nothing. A burst coalesces
+// into one cycle; demand during a running cycle is answered by exactly one
+// more. Filesystem, poll and HEAD signals keep the debounced Signal.
+func (c *CheckoutCoordinator) SignalDemand(reason string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.reason = reason
+	c.mu.Unlock()
+	demand := c.demand
+	if demand == nil {
+		c.signalWindow(reason, false)
+		return
+	}
+	select {
+	case demand <- struct{}{}:
+	default:
+	}
+}
+
 // Close stops the loop and waits for cooperative cancellation to finish.
 func (c *CheckoutCoordinator) Close() error {
 	return c.CloseContext(context.Background())
@@ -1119,7 +1161,6 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 			c.noteForegroundCycle(time.Now())
 		}
 	}()
-
 	c.mu.Lock()
 	reason := c.reason
 	c.mu.Unlock()
@@ -1183,6 +1224,10 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		return
 	}
 
+	// This cycle needs the build lane, and a background chain compaction of
+	// this checkout would hold it: foreground work goes first, so the
+	// compaction is canceled before the cycle queues (it is rescheduled by the
+	// next build that reaches the soft depth).
 	preflightDone := time.Now()
 	if through == 0 {
 		// No ticket names this cycle's work: if its sample shows a change the
@@ -1266,7 +1311,12 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	// same commit point.
 	var treeMove *backgroundLaneYield
 	if priority == ViewBuildBackground {
-		// Background cycles remain preemptible at every admission.
+		// Always armed: a background cycle gives the lane up to every
+		// interactive build, however often it has yielded. Its work is
+		// bounded so it still completes between edits (a large working tree
+		// is built in batches that survive a yield), whereas a cycle that
+		// stopped yielding held other checkouts' edits for its whole build
+		// (live: 95 s and 313 s behind a 389-file working tree).
 		ctx, laneYield = armBackgroundLaneYield(ctx, c.gate, 0)
 		defer laneYield.close()
 		ctx, treeMove = c.armTreeMoveAbort(ctx, cycleStarted)
@@ -1294,7 +1344,9 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	// A cycle the yield canceled ends in an error; one that finished its
 	// work anyway (the cancel landed after its last step) keeps its outcome.
 	// Any other background cycle ran to its end, failed or not, so the run
-	// of consecutive yields is over.
+	// of consecutive yields is over: a checkout whose builds fail on their
+	// own (a working tree edited faster than it is sampled) must not stay
+	// unpreemptible once it has yielded maxViewBuildYields times.
 	//
 	// A background build the working tree moved under — the watcher's abort,
 	// or a sample or prepublish fence refusing a moved tree — is rescheduled
@@ -1342,11 +1394,75 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	c.reportCheckoutCycle(ctx, through, out)
 }
 
+// refreshWantsNewSample reports whether a refresh ticket waits whose
+// freshAfter is later than the latest working-copy sample: completing it with
+// this cycle's publication takes a sample begun after it arrived.
+func (c *CheckoutCoordinator) refreshWantsNewSample() bool {
+	if c == nil || c.sampler == nil {
+		return false
+	}
+	latest := c.sampler.LastSampleStarted()
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	for _, request := range c.refreshWaiters {
+		if request != nil && request.freshAfter.After(latest) {
+			return true
+		}
+	}
+	return false
+}
+
+// backgroundLaneYields is how many background cycles in a row yielded the lane.
+func (c *CheckoutCoordinator) backgroundLaneYields() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.laneYields
+}
+
 // resetBackgroundLaneYields records a background cycle that ran to an outcome.
 func (c *CheckoutCoordinator) resetBackgroundLaneYields() {
 	c.mu.Lock()
 	c.laneYields = 0
 	c.mu.Unlock()
+}
+
+// yieldedCycle turns the outcome of a background cycle that was canceled to
+// give the lane up into a rescheduled one: nothing it began was published
+// (the builder abandons an unpublished generation on cancel), the route is as
+// the cycle found it, and the loop runs the cycle again through the quiet
+// window, queueing at background priority behind the interactive build. The
+// lane itself is released by the caller's deferred release when cycle returns.
+//
+// A cycle the lifetime canceled is not a yield, whatever the gate asked: it
+// stays an error so shutdown is not rescheduled.
+func (c *CheckoutCoordinator) yieldedCycle(out CheckoutCycle, admission cycleAdmission) CheckoutCycle {
+	if c.lifetimeContext().Err() != nil {
+		return out
+	}
+	c.mu.Lock()
+	c.laneYields++
+	yields := c.laneYields
+	c.mu.Unlock()
+	if out.Err != nil && !errors.Is(out.Err, context.Canceled) {
+		// Not necessarily the cancel itself (a wrapped build error, say);
+		// logged so a real failure hidden behind the yield stays visible.
+		c.logger.Debug("checkout coordinator: background cycle ended with an error while yielding the build lane",
+			zap.String("checkout", c.checkoutID), zap.Error(out.Err))
+	}
+	out.Err = nil
+	out.Rescheduled = true
+	out.YieldedTo = laneYieldedToInteractive
+	out.Admission = admission
+	viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeRescheduled)
+	c.logger.Info("checkout coordinator: background build yielded the lane to an interactive build",
+		zap.String("checkout", c.checkoutID),
+		zap.String("yielded_to", laneYieldedToInteractive),
+		zap.Int("attempt", yields),
+		zap.Int("max_yields", maxViewBuildYields),
+		zap.Bool("dirty_built", out.DirtyBuilt),
+		zap.Bool("commit_built", out.CommitBuilt))
+	c.Signal("background build yielded the lane to an interactive build")
+	return out
 }
 
 // settledWithoutBuild recognizes the overwhelmingly common poll result before
@@ -3036,6 +3152,19 @@ func (c *CheckoutCoordinator) buildDirtyLayerOverParent(
 	return built.GenerationID, built.Key, built.Reason, err
 }
 
+// dirtyLayerBuild is what buildDirtyLayerAttempts produced: the published
+// generation and its logical reuse key, or the chained delta's refusal reason,
+// and the physical work of the attempt that decided it.
+type dirtyLayerBuild struct {
+	GenerationID int64
+	Key          string
+	Reason       string
+	Work         *GenerationWorkCounters
+	// Remaining is BuildReport.BatchRemaining: > 0 when the build carried one
+	// batch of a larger change set.
+	Remaining int
+}
+
 // buildDirtyLayerAttempts is buildDirtyLayerOverParent reporting the build's
 // work counters as well. A chained parent whose view can no longer be opened
 // (retired or unservable since it was selected) is a no_parent refusal, not a
@@ -3117,8 +3246,8 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 		}
 		if !errors.Is(err, ErrDirtySnapshotChanged) {
 			// A build that died part way left its generation failed; it is
-			// owed a retirement like a torn attempt, so a failed edit leaks
-			// no payload.
+			// owed a retirement like a torn attempt, so a canceled compaction
+			// or a failed edit leaks no payload.
 			c.deferFailedGeneration(ctx, generationID)
 			return dirtyLayerBuild{Work: work}, err
 		}
@@ -3133,19 +3262,6 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 		}
 	}
 	return dirtyLayerBuild{Work: work}, nil
-}
-
-// dirtyLayerBuild is what buildDirtyLayerAttempts produced: the published
-// generation and its logical reuse key, or the chained delta's refusal reason,
-// and the physical work of the attempt that decided it.
-type dirtyLayerBuild struct {
-	GenerationID int64
-	Key          string
-	Reason       string
-	Work         *GenerationWorkCounters
-	// Remaining is BuildReport.BatchRemaining: > 0 when the build carried one
-	// batch of a larger change set.
-	Remaining int
 }
 
 // commitLayerReader is the reader a dirty-layer build computes its affected
@@ -4461,95 +4577,6 @@ func (a ancestryRefFacts) LoadRefFactsByFiles(repoPrefix string, files []string)
 		}
 	}
 	return out, firstErr
-}
-
-// refreshWantsNewSample reports whether a refresh ticket waits whose
-// freshAfter is later than the latest working-copy sample: completing it with
-// this cycle's publication takes a sample begun after it arrived.
-func (c *CheckoutCoordinator) refreshWantsNewSample() bool {
-	if c == nil || c.sampler == nil {
-		return false
-	}
-	latest := c.sampler.LastSampleStarted()
-	c.refreshMu.Lock()
-	defer c.refreshMu.Unlock()
-	for _, request := range c.refreshWaiters {
-		if request != nil && request.freshAfter.After(latest) {
-			return true
-		}
-	}
-	return false
-}
-
-// backgroundLaneYields is how many background cycles in a row yielded the lane.
-func (c *CheckoutCoordinator) backgroundLaneYields() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.laneYields
-}
-
-// yieldedCycle turns the outcome of a background cycle that was canceled to
-// give the lane up into a rescheduled one: nothing it began was published
-// (the builder abandons an unpublished generation on cancel), the route is as
-// the cycle found it, and the loop runs the cycle again through the quiet
-// window, queueing at background priority behind the interactive build. The
-// lane itself is released by the caller's deferred release when cycle returns.
-//
-// A cycle the lifetime canceled is not a yield, whatever the gate asked: it
-// stays an error so shutdown is not rescheduled.
-func (c *CheckoutCoordinator) yieldedCycle(out CheckoutCycle, admission cycleAdmission) CheckoutCycle {
-	if c.lifetimeContext().Err() != nil {
-		return out
-	}
-	c.mu.Lock()
-	c.laneYields++
-	yields := c.laneYields
-	c.mu.Unlock()
-	if out.Err != nil && !errors.Is(out.Err, context.Canceled) {
-		// Not necessarily the cancel itself (a wrapped build error, say);
-		// logged so a real failure hidden behind the yield stays visible.
-		c.logger.Debug("checkout coordinator: background cycle ended with an error while yielding the build lane",
-			zap.String("checkout", c.checkoutID), zap.Error(out.Err))
-	}
-	out.Err = nil
-	out.Rescheduled = true
-	out.YieldedTo = laneYieldedToInteractive
-	out.Admission = admission
-	viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeRescheduled)
-	c.logger.Info("checkout coordinator: background build yielded the lane to an interactive build",
-		zap.String("checkout", c.checkoutID),
-		zap.String("yielded_to", laneYieldedToInteractive),
-		zap.Int("attempt", yields),
-		zap.Int("max_yields", maxViewBuildYields),
-		zap.Bool("dirty_built", out.DirtyBuilt),
-		zap.Bool("commit_built", out.CommitBuilt))
-	c.Signal("background build yielded the lane to an interactive build")
-	return out
-}
-
-// SignalDemand wakes the loop for a cycle now, without the quiet window. It is
-// the wake for refresh tickets: their content is already bound (an MCP edit's
-// committed hash) or they ask for a fresh answer, and a ticket completes only
-// through the post-admission verification against a sample taken after it
-// arrived, so the window would add delay and prove nothing. A burst coalesces
-// into one cycle; demand during a running cycle is answered by exactly one
-// more. Filesystem, poll and HEAD signals keep the debounced Signal.
-func (c *CheckoutCoordinator) SignalDemand(reason string) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	c.reason = reason
-	c.mu.Unlock()
-	demand := c.demand
-	if demand == nil {
-		c.signalWindow(reason, false)
-		return
-	}
-	select {
-	case demand <- struct{}{}:
-	default:
-	}
 }
 
 // LoadRefFactsByTargets unions the reverse facts every composed generation

@@ -1153,6 +1153,68 @@ const (
 	daemonDrainProgressEvery = 15 * time.Second
 )
 
+// Seams over the stop path's clocks and process control, so the wait can be
+// driven by a fake daemon in tests without a real process to kill.
+var (
+	daemonShutdownAckWait     = daemonShutdownAckTimeout
+	daemonNoAckExitGrace      = daemonBusyExitGrace
+	daemonAckedExitGrace      = daemonExitGrace
+	daemonExitGraceCap        = daemonMaxExitGrace
+	daemonDrainProgressPeriod = daemonDrainProgressEvery
+	daemonProcessAlive        = platform.ProcessAlive
+	daemonKillProcess         = platform.KillProcess
+)
+
+// daemonStopPreflight is what the stop path learned from the daemon before
+// asking it to shut down: its uptime (for the summary card) and the store's
+// close-checkpoint estimate — the backlog Close's final checkpoint has to
+// drain and how long it should be given.
+type daemonStopPreflight struct {
+	uptime        time.Duration
+	closeEstimate time.Duration
+	pendingFrames int64
+	// estimateKnown is false when the status call failed, timed out, or came
+	// from a daemon that does not report its store (older, or not SQLite).
+	estimateKnown bool
+}
+
+// daemonStopExitGrace is how long the stop path waits for the process to exit
+// before force-killing it.
+//
+// After an ack the store is already closed — the daemon checkpoints and closes
+// it before answering — so the short grace covers only the process exit.
+// Without one the close is presumed still running: the wait is the no-ack
+// grace, raised to the store's close-checkpoint estimate plus the normal exit
+// grace when the daemon reported a larger backlog, and capped at
+// daemonExitGraceCap. Killing the checkpoint early is the worst outcome
+// available: an interrupted pass records no progress, so the next open
+// recovers the whole log with nothing backfilled, and a large WAL survives the
+// restart it was supposed to be truncated by.
+func daemonStopExitGrace(acked bool, pre daemonStopPreflight) time.Duration {
+	if acked {
+		return daemonAckedExitGrace
+	}
+	grace := daemonNoAckExitGrace
+	if pre.estimateKnown && pre.closeEstimate > 0 {
+		if need := pre.closeEstimate + daemonAckedExitGrace; need > grace {
+			grace = need
+		}
+	}
+	if daemonExitGraceCap > 0 && grace > daemonExitGraceCap {
+		grace = daemonExitGraceCap
+	}
+	return grace
+}
+
+// formatPendingFrames renders the backlog for the drain line; -1 is the
+// store's "wal-index unreadable".
+func formatPendingFrames(n int64) string {
+	if n < 0 {
+		return "an unknown number of"
+	}
+	return fmt.Sprintf("%d", n)
+}
+
 // waitForDaemonExitWithin blocks until the daemon process pid has exited — and
 // thus released the store's on-disk lock — force-killing it if a graceful
 // shutdown stalls. This is what makes `daemon stop` honest: when it returns,
@@ -1223,6 +1285,44 @@ func waitForDaemonExitWithin(w io.Writer, pid int, grace time.Duration, draining
 	}
 	_ = os.Remove(daemon.PIDFilePath())
 	_ = os.Remove(daemon.SocketPath())
+}
+
+// daemonStatusBeforeStop best-effort-fetches the daemon's reported uptime via
+// a Status control before shutdown so the summary card can show how long the
+// process ran. Returns 0 on any error — we'd rather degrade the card than
+// fail the stop.
+//
+// Bounded hard: Status aggregates the whole store and serialises behind the
+// controller mutex, so on a busy daemon this decorative lookup was the first
+// thing `daemon stop` blocked on — the stop request had not even been sent
+// yet. A card without an uptime is a fine outcome; a stop that never returns
+// is not.
+//
+// The same answer carries the store's close-checkpoint estimate, which sizes
+// the exit wait when the shutdown ack does not arrive (daemonStopExitGrace). A
+// status that times out leaves it unknown and the wait on its old schedule.
+func daemonStatusBeforeStop() daemonStopPreflight {
+	var pre daemonStopPreflight
+	c, err := daemonControlClient()
+	if err != nil {
+		return pre
+	}
+	defer c.Close()
+	resp, err := c.ControlWithTimeout(daemon.ControlStatus, nil, daemonStatusCardTimeout)
+	if err != nil || !resp.OK {
+		return pre
+	}
+	var st daemon.StatusResponse
+	if jerr := json.Unmarshal(resp.Result, &st); jerr != nil {
+		return pre
+	}
+	pre.uptime = time.Duration(st.UptimeSeconds) * time.Second
+	if st.Storage != nil {
+		pre.closeEstimate = time.Duration(st.Storage.CloseCheckpointEstimateMS) * time.Millisecond
+		pre.pendingFrames = st.Storage.WALPendingFrames
+		pre.estimateKnown = true
+	}
+	return pre
 }
 
 // emitDaemonStopAlreadyDown prints the "not running" message: a one-liner on
@@ -1991,6 +2091,91 @@ func renderDaemonViews(w io.Writer, st daemon.StatusResponse) {
 	}
 }
 
+// renderDaemonStorage writes the store's write-ahead-log block: sizes, the
+// backlog a stop would have to drain, and the bounded reclaim's counters.
+// Absent when the daemon sent none (not SQLite, or an older daemon).
+func renderDaemonStorage(w io.Writer, st daemon.StatusResponse) {
+	s := st.Storage
+	if s == nil {
+		return
+	}
+	fmt.Fprintln(w, "\nstorage:")
+	pending := "unknown"
+	if s.WALPendingFrames >= 0 {
+		pending = fmt.Sprintf("%d", s.WALPendingFrames)
+	}
+	fmt.Fprintf(w, "  db=%s  wal=%s  wal pending frames=%s  close checkpoint estimate=%s\n",
+		formatBytes(nonNegative(s.DBBytes)), formatBytes(nonNegative(s.WALBytes)), pending,
+		(time.Duration(s.CloseCheckpointEstimateMS) * time.Millisecond).String())
+	r := s.WALReclaim
+	if r == nil {
+		return
+	}
+	fmt.Fprintf(w, "  wal reclaim: threshold=%s  attempts=%d  resets=%d  deferrals=%d  skips=%d  failures=%d\n",
+		formatBytes(nonNegative(r.ThresholdBytes)), r.Attempts, r.Resets, r.Deferrals, r.Skips, r.Failures)
+	fmt.Fprintf(w, "    reclaimed frames=%d  bytes=%s\n", r.FramesReclaimed, formatBytes(nonNegative(r.BytesReclaimed)))
+	fmt.Fprintf(w, "    open-gate resets=%d  writer hold max=%.1fms  last=%.1fms\n",
+		r.OpenGateResets, r.WriterHoldMaxMS, r.WriterHoldLastMS)
+	fmt.Fprintf(w, "    gate pause n=%d  max=%.1fms  avg=%.1fms  last=%.1fms  reader waits n=%d  max=%.1fms  avg=%.1fms\n",
+		r.PauseCount, r.PauseMaxMS, r.PauseAvgMS, r.PauseLastMS, r.ReaderWaits, r.ReaderWaitMaxMS, r.ReaderWaitAvgMS)
+	fmt.Fprintf(w, "    edit-cycle yield: passive deferrals=%d  forced=%d  reclaim refusals=%d  cut short=%d  ceiling runs=%d  ceiling=%s\n",
+		r.CycleDeferrals, r.CycleForced, r.CycleRefusals, r.CycleYields, r.CycleCeilingRuns, formatBytes(nonNegative(r.CeilingBytes)))
+	fmt.Fprintf(w, "    retirement edit yield: waits=%d  timeouts=%d\n",
+		r.RetirementEditYields, r.RetirementEditYieldTimeouts)
+	if r.BackoffMS > 0 || r.LastOutcome != "" || r.LastReason != "" {
+		fmt.Fprintf(w, "    backoff=%s  last=%s", (time.Duration(r.BackoffMS) * time.Millisecond).String(), orDash(r.LastOutcome))
+		if r.LastReason != "" {
+			fmt.Fprintf(w, " (%s)", r.LastReason)
+		}
+		fmt.Fprintln(w)
+	}
+}
+
+// renderDaemonBuildLane writes the view-build lane: who holds it and for how
+// long, and what is queued behind it. Absent when the daemon sent none.
+func renderDaemonBuildLane(w io.Writer, st daemon.StatusResponse) {
+	l := st.BuildLane
+	if l == nil {
+		return
+	}
+	fmt.Fprintln(w, "\nbuild lane:")
+	switch h := l.Holder; {
+	case !l.Open:
+		fmt.Fprintln(w, "  closed (warmup)")
+	case h == nil:
+		fmt.Fprintln(w, "  idle")
+	default:
+		fmt.Fprintf(w, "  held by %s", h.Kind)
+		if h.CheckoutID != "" {
+			fmt.Fprintf(w, "  checkout=%s", h.CheckoutID)
+		}
+		if h.Generation != 0 {
+			fmt.Fprintf(w, "  generation=%d", h.Generation)
+		}
+		if h.Priority != "" {
+			fmt.Fprintf(w, "  priority=%s", h.Priority)
+		}
+		fmt.Fprintf(w, "  for %.0fms\n", h.HeldForMS)
+	}
+	fmt.Fprintf(w, "  queued interactive=%d  background=%d  (high water %d/%d)  admitted %d/%d  waits n=%d  max=%.1fms  avg=%.1fms\n",
+		l.InteractiveQueued, l.BackgroundQueued, l.InteractiveHighWater, l.BackgroundHighWater,
+		l.AdmittedInteractive, l.AdmittedBackground, l.WaitSamples, l.WaitMaxMS, l.WaitAvgMS)
+}
+
+func nonNegative(n int64) uint64 {
+	if n < 0 {
+		return 0
+	}
+	return uint64(n)
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
 // formatViewCounts renders one state→count map as "ready=3  retiring=1", in a
 // stable key order. An empty map renders as nothing so the caller can drop the
 // whole line: a census section with no instances is absent, not "{}".
@@ -2241,186 +2426,3 @@ func formatBytes(n uint64) string {
 
 // stubController is a placeholder Controller so `gortex daemon start`
 // works end-to-end before the real MultiIndexer integration lands. It
-
-var (
-	daemonShutdownAckWait     = daemonShutdownAckTimeout
-	daemonNoAckExitGrace      = daemonBusyExitGrace
-	daemonAckedExitGrace      = daemonExitGrace
-	daemonExitGraceCap        = daemonMaxExitGrace
-	daemonDrainProgressPeriod = daemonDrainProgressEvery
-	daemonProcessAlive        = platform.ProcessAlive
-	daemonKillProcess         = platform.KillProcess
-)
-
-// daemonStopPreflight is what the stop path learned from the daemon before
-// asking it to shut down: its uptime (for the summary card) and the store's
-// close-checkpoint estimate — the backlog Close's final checkpoint has to
-// drain and how long it should be given.
-type daemonStopPreflight struct {
-	uptime        time.Duration
-	closeEstimate time.Duration
-	pendingFrames int64
-	// estimateKnown is false when the status call failed, timed out, or came
-	// from a daemon that does not report its store (older, or not SQLite).
-	estimateKnown bool
-}
-
-// daemonStopExitGrace is how long the stop path waits for the process to exit
-// before force-killing it.
-//
-// After an ack the store is already closed — the daemon checkpoints and closes
-// it before answering — so the short grace covers only the process exit.
-// Without one the close is presumed still running: the wait is the no-ack
-// grace, raised to the store's close-checkpoint estimate plus the normal exit
-// grace when the daemon reported a larger backlog, and capped at
-// daemonExitGraceCap. Killing the checkpoint early is the worst outcome
-// available: an interrupted pass records no progress, so the next open
-// recovers the whole log with nothing backfilled, and a large WAL survives the
-// restart it was supposed to be truncated by.
-func daemonStopExitGrace(acked bool, pre daemonStopPreflight) time.Duration {
-	if acked {
-		return daemonAckedExitGrace
-	}
-	grace := daemonNoAckExitGrace
-	if pre.estimateKnown && pre.closeEstimate > 0 {
-		if need := pre.closeEstimate + daemonAckedExitGrace; need > grace {
-			grace = need
-		}
-	}
-	if daemonExitGraceCap > 0 && grace > daemonExitGraceCap {
-		grace = daemonExitGraceCap
-	}
-	return grace
-}
-
-// formatPendingFrames renders the backlog for the drain line; -1 is the
-// store's "wal-index unreadable".
-func formatPendingFrames(n int64) string {
-	if n < 0 {
-		return "an unknown number of"
-	}
-	return fmt.Sprintf("%d", n)
-}
-
-// daemonStatusBeforeStop best-effort-fetches the daemon's reported uptime via
-// a Status control before shutdown so the summary card can show how long the
-// process ran. Returns 0 on any error — we'd rather degrade the card than
-// fail the stop.
-//
-// Bounded hard: Status aggregates the whole store and serialises behind the
-// controller mutex, so on a busy daemon this decorative lookup was the first
-// thing `daemon stop` blocked on — the stop request had not even been sent
-// yet. A card without an uptime is a fine outcome; a stop that never returns
-// is not.
-//
-// The same answer carries the store's close-checkpoint estimate, which sizes
-// the exit wait when the shutdown ack does not arrive (daemonStopExitGrace). A
-// status that times out leaves it unknown and the wait on its old schedule.
-func daemonStatusBeforeStop() daemonStopPreflight {
-	var pre daemonStopPreflight
-	c, err := daemonControlClient()
-	if err != nil {
-		return pre
-	}
-	defer c.Close()
-	resp, err := c.ControlWithTimeout(daemon.ControlStatus, nil, daemonStatusCardTimeout)
-	if err != nil || !resp.OK {
-		return pre
-	}
-	var st daemon.StatusResponse
-	if jerr := json.Unmarshal(resp.Result, &st); jerr != nil {
-		return pre
-	}
-	pre.uptime = time.Duration(st.UptimeSeconds) * time.Second
-	if st.Storage != nil {
-		pre.closeEstimate = time.Duration(st.Storage.CloseCheckpointEstimateMS) * time.Millisecond
-		pre.pendingFrames = st.Storage.WALPendingFrames
-		pre.estimateKnown = true
-	}
-	return pre
-}
-
-// renderDaemonStorage writes the store's write-ahead-log block: sizes, the
-// backlog a stop would have to drain, and the bounded reclaim's counters.
-// Absent when the daemon sent none (not SQLite, or an older daemon).
-func renderDaemonStorage(w io.Writer, st daemon.StatusResponse) {
-	s := st.Storage
-	if s == nil {
-		return
-	}
-	fmt.Fprintln(w, "\nstorage:")
-	pending := "unknown"
-	if s.WALPendingFrames >= 0 {
-		pending = fmt.Sprintf("%d", s.WALPendingFrames)
-	}
-	fmt.Fprintf(w, "  db=%s  wal=%s  wal pending frames=%s  close checkpoint estimate=%s\n",
-		formatBytes(nonNegative(s.DBBytes)), formatBytes(nonNegative(s.WALBytes)), pending,
-		(time.Duration(s.CloseCheckpointEstimateMS) * time.Millisecond).String())
-	r := s.WALReclaim
-	if r == nil {
-		return
-	}
-	fmt.Fprintf(w, "  wal reclaim: threshold=%s  attempts=%d  resets=%d  deferrals=%d  skips=%d  failures=%d\n",
-		formatBytes(nonNegative(r.ThresholdBytes)), r.Attempts, r.Resets, r.Deferrals, r.Skips, r.Failures)
-	fmt.Fprintf(w, "    reclaimed frames=%d  bytes=%s\n", r.FramesReclaimed, formatBytes(nonNegative(r.BytesReclaimed)))
-	fmt.Fprintf(w, "    open-gate resets=%d  writer hold max=%.1fms  last=%.1fms\n",
-		r.OpenGateResets, r.WriterHoldMaxMS, r.WriterHoldLastMS)
-	fmt.Fprintf(w, "    gate pause n=%d  max=%.1fms  avg=%.1fms  last=%.1fms  reader waits n=%d  max=%.1fms  avg=%.1fms\n",
-		r.PauseCount, r.PauseMaxMS, r.PauseAvgMS, r.PauseLastMS, r.ReaderWaits, r.ReaderWaitMaxMS, r.ReaderWaitAvgMS)
-	fmt.Fprintf(w, "    edit-cycle yield: passive deferrals=%d  forced=%d  reclaim refusals=%d  cut short=%d  ceiling runs=%d  ceiling=%s\n",
-		r.CycleDeferrals, r.CycleForced, r.CycleRefusals, r.CycleYields, r.CycleCeilingRuns, formatBytes(nonNegative(r.CeilingBytes)))
-	fmt.Fprintf(w, "    retirement edit yield: waits=%d  timeouts=%d\n",
-		r.RetirementEditYields, r.RetirementEditYieldTimeouts)
-	if r.BackoffMS > 0 || r.LastOutcome != "" || r.LastReason != "" {
-		fmt.Fprintf(w, "    backoff=%s  last=%s", (time.Duration(r.BackoffMS) * time.Millisecond).String(), orDash(r.LastOutcome))
-		if r.LastReason != "" {
-			fmt.Fprintf(w, " (%s)", r.LastReason)
-		}
-		fmt.Fprintln(w)
-	}
-}
-
-// renderDaemonBuildLane writes the view-build lane: who holds it and for how
-// long, and what is queued behind it. Absent when the daemon sent none.
-func renderDaemonBuildLane(w io.Writer, st daemon.StatusResponse) {
-	l := st.BuildLane
-	if l == nil {
-		return
-	}
-	fmt.Fprintln(w, "\nbuild lane:")
-	switch h := l.Holder; {
-	case !l.Open:
-		fmt.Fprintln(w, "  closed (warmup)")
-	case h == nil:
-		fmt.Fprintln(w, "  idle")
-	default:
-		fmt.Fprintf(w, "  held by %s", h.Kind)
-		if h.CheckoutID != "" {
-			fmt.Fprintf(w, "  checkout=%s", h.CheckoutID)
-		}
-		if h.Generation != 0 {
-			fmt.Fprintf(w, "  generation=%d", h.Generation)
-		}
-		if h.Priority != "" {
-			fmt.Fprintf(w, "  priority=%s", h.Priority)
-		}
-		fmt.Fprintf(w, "  for %.0fms\n", h.HeldForMS)
-	}
-	fmt.Fprintf(w, "  queued interactive=%d  background=%d  (high water %d/%d)  admitted %d/%d  waits n=%d  max=%.1fms  avg=%.1fms\n",
-		l.InteractiveQueued, l.BackgroundQueued, l.InteractiveHighWater, l.BackgroundHighWater,
-		l.AdmittedInteractive, l.AdmittedBackground, l.WaitSamples, l.WaitMaxMS, l.WaitAvgMS)
-}
-
-func orDash(s string) string {
-	if s == "" {
-		return "-"
-	}
-	return s
-}
-
-func nonNegative(n int64) uint64 {
-	if n < 0 {
-		return 0
-	}
-	return uint64(n)
-}

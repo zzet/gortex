@@ -125,7 +125,11 @@ type DirtyLayerRequest struct {
 	// beneath the working tree; the semantic admission floor is then judged
 	// against the checkout's whole language surface (EnrichmentStage.
 	// BaseCensus) rather than this build's own files.
-	baseCensus     map[string]int
+	baseCensus map[string]int
+	// baseCensusFunc supplies baseCensus lazily (EnrichmentStage.
+	// BaseCensusFunc): the floor check calls it only when the build's own
+	// files and the parent chain leave an enrichable language below the
+	// floor. A coordinator with chaining on sets it.
 	baseCensusFunc func(context.Context) map[string]int
 	// baseOpen is how long the caller took to open the layer below (Base),
 	// reported as the plan's first preparation stage.
@@ -655,6 +659,59 @@ func dirtyLayerChangesContext(ctx context.Context, snap gitstate.DirtySnapshot) 
 	return changes, nil
 }
 
+// dirtyLayerDiskTruth rewrites a present claim into a deletion when the
+// checkout does not hold the path.
+//
+// git's two status columns can call one path present and gone at the same
+// time. `git add f` followed by `rm f` reports "AD"; a staged modification
+// whose file was then removed reports "MD"; a staged rename whose destination
+// was removed reports the destination as a rename. gitstate emits one entry
+// per record and lets the staged column decide, so all three arrive here as a
+// present claim for a path that is not on disk.
+//
+// The disk wins, because the layer describes what a reader sees there and what
+// a reader sees at such a path is nothing. Passing the claim through instead
+// would refuse the whole build — planFileSet reads a present claim the target
+// cannot serve as a caller whose diff contradicts its own content — and the
+// refusal would repeat on every retry until the user staged the deletion.
+// `git add f && rm f` is a legal state an agent reaches routinely; it is not
+// a contradiction for the builder to report.
+//
+// Only "the target does not hold it" demotes. Any other stat failure is left
+// for planFileSet to refuse: an unreadable path is a broken read rather than
+// an absent file, and turning one into a delete mask would hide the layer
+// below behind a permissions error.
+func dirtyLayerDiskTruth(changes []LayerPathChange, target source.ContentSource) []LayerPathChange {
+	changes, _ = dirtyLayerDiskTruthContext(context.Background(), changes, target)
+	return changes
+}
+
+func dirtyLayerDiskTruthContext(
+	ctx context.Context,
+	changes []LayerPathChange,
+	target source.ContentSource,
+) ([]LayerPathChange, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for i := range changes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if changes[i].Kind == LayerPathDeleted {
+			continue
+		}
+		_, statErr := target.Stat(changes[i].Path)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if errors.Is(statErr, source.ErrNotInSource) {
+			changes[i].Kind = LayerPathDeleted
+		}
+	}
+	return changes, nil
+}
+
 // logWorkingTreeBuild records one line per working-tree build with where its
 // wall time went: the preparation and closure stages of the plan, the
 // physical phases, and the sizes that drive them (closure, dependents,
@@ -715,59 +772,6 @@ func dirtyHeadProvenance(snap gitstate.DirtySnapshot) *repoHeadProvenance {
 		return nil
 	}
 	return &repoHeadProvenance{sha: snap.HeadCommit, dirty: len(snap.Entries) > 0}
-}
-
-// dirtyLayerDiskTruth rewrites a present claim into a deletion when the
-// checkout does not hold the path.
-//
-// git's two status columns can call one path present and gone at the same
-// time. `git add f` followed by `rm f` reports "AD"; a staged modification
-// whose file was then removed reports "MD"; a staged rename whose destination
-// was removed reports the destination as a rename. gitstate emits one entry
-// per record and lets the staged column decide, so all three arrive here as a
-// present claim for a path that is not on disk.
-//
-// The disk wins, because the layer describes what a reader sees there and what
-// a reader sees at such a path is nothing. Passing the claim through instead
-// would refuse the whole build — planFileSet reads a present claim the target
-// cannot serve as a caller whose diff contradicts its own content — and the
-// refusal would repeat on every retry until the user staged the deletion.
-// `git add f && rm f` is a legal state an agent reaches routinely; it is not
-// a contradiction for the builder to report.
-//
-// Only "the target does not hold it" demotes. Any other stat failure is left
-// for planFileSet to refuse: an unreadable path is a broken read rather than
-// an absent file, and turning one into a delete mask would hide the layer
-// below behind a permissions error.
-func dirtyLayerDiskTruth(changes []LayerPathChange, target source.ContentSource) []LayerPathChange {
-	changes, _ = dirtyLayerDiskTruthContext(context.Background(), changes, target)
-	return changes
-}
-
-func dirtyLayerDiskTruthContext(
-	ctx context.Context,
-	changes []LayerPathChange,
-	target source.ContentSource,
-) ([]LayerPathChange, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	for i := range changes {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if changes[i].Kind == LayerPathDeleted {
-			continue
-		}
-		_, statErr := target.Stat(changes[i].Path)
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if errors.Is(statErr, source.ErrNotInSource) {
-			changes[i].Kind = LayerPathDeleted
-		}
-	}
-	return changes, nil
 }
 
 // selectWorkingTreeBatch is the first size changes to import: dependency and
