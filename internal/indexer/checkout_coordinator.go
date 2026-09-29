@@ -403,6 +403,11 @@ type CheckoutCycle struct {
 	// not name yet, or the generation an edit lease withdrew from the route —
 	// rather than on the routed top.
 	DirtyParentPreferred bool
+	// CompactionScheduled reports that the cycle's build reached the soft
+	// chain depth and a background compaction was owed for it
+	// (dirty_chain_compaction.go). The compaction itself runs after the cycle,
+	// off the cycle lock, and reports separately.
+	CompactionScheduled bool
 	// DirtyWork is the physical work of the cycle's working-tree build, nil
 	// when the cycle built none.
 	DirtyWork *GenerationWorkCounters
@@ -916,6 +921,7 @@ func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 		c.mu.Lock()
 		c.sourceMutationsClosing = true
 		c.mu.Unlock()
+		c.closeDirtyChainCompactor()
 		if c.cancelLifetime != nil {
 			c.cancelLifetime()
 		}
@@ -926,6 +932,9 @@ func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 	})
 	select {
 	case <-c.done:
+		if err := c.waitDirtyChainCompactions(ctx); err != nil {
+			return err
+		}
 		return c.waitSourceMutations(ctx)
 	case <-ctx.Done():
 		return ctx.Err()
@@ -1177,6 +1186,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		// is timed like a ticket's.
 		ctx = withPhaseRecord(ctx, c.openObservedChangeRecord(preCtx))
 	}
+	c.cancelDirtyChainCompaction("foreground cycle")
 	priority := ViewBuildBackground
 	if through != 0 {
 		priority = ViewBuildInteractive
@@ -1300,6 +1310,9 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	}
 	foreground = foreground || out.DirtyBuilt
 	recordCoordinatorCycle(out)
+	if out.CompactionScheduled {
+		c.scheduleDirtyChainCompaction(out)
+	}
 	switch {
 	case out.Err != nil && !errors.Is(out.Err, context.Canceled):
 		c.logger.Warn("checkout coordinator: reconcile failed",
@@ -1976,6 +1989,7 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 		return out, fmt.Errorf("indexer: wait for checkout route lock: %w", err)
 	}
 	defer c.cycleMu.Unlock()
+	c.cancelDirtyChainCompaction("checkout transition")
 	release, err := c.gate.Acquire(ctx, ViewBuildInteractive)
 	if err != nil {
 		return out, fmt.Errorf("indexer: wait for checkout build admission: %w", err)
@@ -2888,7 +2902,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		return nil
 	}
 
-	selection := c.reportDirtyParent(ctx, *route, commitGeneration, sample, out)
+	selection := c.selectDirtyParentForSlot(ctx, *route, commitGeneration, sample, out)
 	generationID, builtKey, err := c.buildDirtyLayerForSlot(ctx, route.GraphID, commitGeneration, selection, sample, out)
 	if err != nil {
 		return err
@@ -2941,6 +2955,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		c.Signal("the next batch of the working tree")
 		return nil
 	}
+	out.CompactionScheduled = c.dirtyChainCompactionDue(*out) || (out.DirtyBuilt && c.foldDue(ctx, *out))
 	return nil
 }
 

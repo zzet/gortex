@@ -14,6 +14,7 @@ func TestChainedDirtyBuildConfirmsByReadSet(t *testing.T) {
 	f := newCoordinatorFixture(t)
 	builder := builderNewBuilder(f.store)
 	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{Builder: builder})
+	c.compaction.quiet = -1
 	coordinatorReconcile(t, c)
 
 	for step, body := range []string{

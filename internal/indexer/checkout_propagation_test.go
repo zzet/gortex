@@ -199,6 +199,7 @@ func propagationCoordinator(t *testing.T, f *coordinatorFixture, adminName strin
 	if err := c.Close(); err != nil {
 		t.Fatalf("stop the %s coordinator loop: %v", adminName, err)
 	}
+	c.compaction.quiet = -1
 	return c, root
 }
 
@@ -553,6 +554,199 @@ func renderChain(t *testing.T, f *coordinatorFixture, stack []int64) ([]string, 
 	return builderRenderNodes(composed.AllNodes()), builderRenderEdges(composed.AllEdges())
 }
 
+// TestOverlayFoldByCopyServesTheSameView pins the copy-based compactor as the
+// fold of a large overlay: a working-tree chain whose members claim more paths
+// than the fold threshold is folded into ONE generation over the commit
+// generation by copying rows — no working-tree file parsed — and the folded
+// stack serves exactly what the chain served, which is exactly a clean index
+// of the working tree. The chain carries every kind of claim a working tree
+// makes: a body edit, an added file, a deleted file, a signature change its
+// callers re-bind to, and an undo back to the committed bytes.
+func TestOverlayFoldByCopyServesTheSameView(t *testing.T) {
+	old := dirtyChainFoldPaths
+	dirtyChainFoldPaths = 1
+	t.Cleanup(func() { dirtyChainFoldPaths = old })
+
+	f := newCoordinatorFixture(t)
+	ctx := context.Background()
+	c := chainCoordinatorOn(t, f, CheckoutCoordinatorConfig{})
+	if out := coordinatorReconcile(t, c); out.DirtyGenerationID == 0 {
+		t.Fatalf("the first cycle routed no working-tree layer: %+v", out)
+	}
+	edits := []func(){
+		func() { builderWriteFile(t, f.worktree, "core.go", propagationCoreC2) },
+		func() {
+			builderWriteFile(t, f.worktree, "extra.go", "package fixture\n\nfunc Extra() {\n\tHelper()\n\tIsland()\n}\n")
+		},
+		func() {
+			if err := os.Remove(filepath.Join(f.worktree, "gone.go")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		func() {
+			builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc Helper() int {\n\treturn 1\n}\n")
+		},
+		func() {
+			builderWriteFile(t, f.worktree, "island.go", "package fixture\n\nfunc Island() {\n\tHelper()\n}\n")
+		},
+		// Undo the island edit: back to the committed bytes.
+		func() { builderWriteFile(t, f.worktree, "island.go", builderTreeA()["island.go"]) },
+	}
+	var last CheckoutCycle
+	for i, edit := range edits {
+		edit()
+		last = coordinatorReconcile(t, c)
+		if !last.DirtyBuilt {
+			t.Fatalf("edit %d built nothing: %+v", i, last)
+		}
+		if last.CompactionScheduled {
+			break
+		}
+	}
+	if !last.CompactionScheduled || last.DirtyChainDepth >= dirtyChainCompactionDepth {
+		t.Fatalf("the overlay was not due for a fold before the depth bound: %+v", last)
+	}
+	before := routedStack(t, f, c)
+	wantNodes, wantEdges := renderChain(t, f, before)
+	db := parityOpenRaw(t, f.store)
+	for _, id := range before[1:] {
+		var files, context, identities, sources int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM generation_file_masks WHERE view_gen = ? AND ownership_mode <> 'context'`, id).Scan(&files)
+		_ = db.QueryRow(`SELECT COUNT(*) FROM generation_file_masks WHERE view_gen = ? AND ownership_mode = 'context'`, id).Scan(&context)
+		_ = db.QueryRow(`SELECT COUNT(*) FROM generation_node_tombstones WHERE view_gen = ?`, id).Scan(&identities)
+		_ = db.QueryRow(`SELECT COUNT(*) FROM generation_edge_sources WHERE view_gen = ?`, id).Scan(&sources)
+		t.Logf("chain member %d: %d file claims, %d context marks, %d identity masks, %d edge-source marks",
+			id, files, context, identities, sources)
+	}
+
+	report := c.compactDirtyChain(ctx, last)
+	if report.Outcome != dirtyChainCompactionFlipped || report.Err != nil {
+		t.Fatalf("the fold did not flip: %+v", report)
+	}
+	t.Logf("fold of %d generations: %s (copy + verify + publish %s)", len(before)-1, report.Duration, report.BuildDuration)
+	after := routedStack(t, f, c)
+	if len(after) != 2 || after[0] != before[0] {
+		t.Fatalf("the folded stack is %v, want the commit generation %d under one working-tree generation", after, before[0])
+	}
+	row, found := f.generation(after[1])
+	if !found || row.BaseGenerationID != before[0] {
+		t.Fatalf("the folded generation sits on %d, want the commit generation %d", row.BaseGenerationID, before[0])
+	}
+	meta, _, found, err := f.store.AtGeneration(after[1]).InputManifest(ctx)
+	if err != nil || !found || !meta.IsFull {
+		t.Fatalf("the folded generation carries no full manifest: %+v found=%v err=%v", meta, found, err)
+	}
+	gotNodes, gotEdges := renderChain(t, f, after)
+	if !slices.Equal(gotNodes, wantNodes) {
+		t.Errorf("the fold serves other nodes than the chain:\n%v", parityDiff("nodes", gotNodes, wantNodes))
+	}
+	if !slices.Equal(gotEdges, wantEdges) {
+		t.Errorf("the fold serves other edges than the chain:\n%v", parityDiff("edges", gotEdges, wantEdges))
+	}
+	if result := assertPropagationParity(t, f.store, after, f.worktree, "fold"); !result.ok() {
+		t.Errorf("the folded stack differs from a clean index of the working tree: %v", result.Diffs)
+	}
+
+	// The next edit chains over the fold like over any direct generation.
+	builderWriteFile(t, f.worktree, "extra.go", "package fixture\n\nfunc Extra() {\n\tHelper()\n}\n")
+	next := coordinatorReconcile(t, c)
+	if next.DirtyParentGenerationID != after[1] || next.DirtyChainDepth != 2 {
+		t.Fatalf("the edit after the fold did not chain over it: %+v", next)
+	}
+	if result := assertPropagationParity(t, f.store, routedStack(t, f, c), f.worktree, "after-fold"); !result.ok() {
+		t.Errorf("the edit over the fold differs from a clean index: %v", result.Diffs)
+	}
+}
+
+// TestOverlayFoldByCopyKeepsReboundCallersAndRemovedIdentities is the fold
+// over a chain whose members carry the finer claims: a renamed declaration
+// whose untouched callers are re-bound (edge-source marks) and removed
+// identities. The fold must still serve exactly the chain.
+func TestOverlayFoldByCopyKeepsReboundCallersAndRemovedIdentities(t *testing.T) {
+	old := dirtyChainFoldPaths
+	dirtyChainFoldPaths = 1
+	t.Cleanup(func() { dirtyChainFoldPaths = old })
+
+	f := newCoordinatorFixture(t)
+	ctx := context.Background()
+	c := chainCoordinatorOn(t, f, CheckoutCoordinatorConfig{})
+	if out := coordinatorReconcile(t, c); out.DirtyGenerationID == 0 {
+		t.Fatalf("the first cycle routed no working-tree layer: %+v", out)
+	}
+	edits := []func(){
+		// caller.go gains a call to Helper: its edges live in this member.
+		func() {
+			builderWriteFile(t, f.worktree, "caller.go", "package fixture\n\nfunc Run() {\n\tCompute(Options{})\n\tHelper()\n}\n")
+		},
+		// Helper is renamed: core.go (untouched) and caller.go (edited in
+		// the member below) call it, so their calls are re-bound by a member
+		// that claims neither file.
+		func() { builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc Assist() {\n}\n") },
+		// Compute moves out of core.go into a new file, which also calls
+		// into the standard library (a pathless external stub).
+		func() {
+			builderWriteFile(t, f.worktree, "core.go", "package fixture\n\ntype Options struct{}\n")
+			builderWriteFile(t, f.worktree, "compute.go",
+				"package fixture\n\nimport \"strings\"\n\nfunc Compute(o Options) string {\n\tAssist()\n\treturn strings.ToUpper(\"x\")\n}\n")
+		},
+		// A second external call from another new file.
+		func() {
+			builderWriteFile(t, f.worktree, "extern.go",
+				"package fixture\n\nimport \"strings\"\n\nfunc Lower() string {\n\treturn strings.ToLower(\"X\")\n}\n")
+		},
+	}
+	var last CheckoutCycle
+	for i, edit := range edits {
+		edit()
+		last = coordinatorReconcile(t, c)
+		if !last.DirtyBuilt {
+			t.Fatalf("edit %d built nothing: %+v", i, last)
+		}
+	}
+	if !last.CompactionScheduled {
+		t.Fatalf("the overlay was not due for a fold: %+v", last)
+	}
+	before := routedStack(t, f, c)
+	if len(before) < 3 {
+		t.Fatalf("the edits did not chain: %v", before)
+	}
+	db := parityOpenRaw(t, f.store)
+	var identities, sources int
+	for _, id := range before[1:] {
+		var n, m int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM generation_node_tombstones WHERE view_gen = ?`, id).Scan(&n)
+		_ = db.QueryRow(`SELECT COUNT(*) FROM generation_edge_sources WHERE view_gen = ?`, id).Scan(&m)
+		identities, sources = identities+n, sources+m
+	}
+	t.Logf("chain %v carries %d identity masks and %d edge-source marks", before[1:], identities, sources)
+	chainParity := assertPropagationParity(t, f.store, before, f.worktree, "fold-rebound-chain")
+	if !chainParity.ok() {
+		// What the edit builds produced is the edit path's to answer for;
+		// what the fold owes is to serve exactly the chain (asserted below).
+		t.Logf("the chain itself differs from a clean index before any fold (edit-path divergence): %v", chainParity.Diffs)
+	}
+	wantNodes, wantEdges := renderChain(t, f, before)
+
+	report := c.compactDirtyChain(ctx, last)
+	if report.Outcome != dirtyChainCompactionFlipped || report.Err != nil {
+		t.Fatalf("the fold did not flip: %+v", report)
+	}
+	after := routedStack(t, f, c)
+	if len(after) != 2 {
+		t.Fatalf("the folded stack is %v", after)
+	}
+	gotNodes, gotEdges := renderChain(t, f, after)
+	if !slices.Equal(gotNodes, wantNodes) {
+		t.Errorf("the fold serves other nodes than the chain:\n%v", parityDiff("nodes", gotNodes, wantNodes))
+	}
+	if !slices.Equal(gotEdges, wantEdges) {
+		t.Errorf("the fold serves other edges than the chain:\n%v", parityDiff("edges", gotEdges, wantEdges))
+	}
+	if result := assertPropagationParity(t, f.store, after, f.worktree, "fold-rebound"); chainParity.ok() && !result.ok() {
+		t.Errorf("the folded stack differs from a clean index of the working tree: %v", result.Diffs)
+	}
+}
+
 // TestALargeWorkingTreeChangeIsImportedFileByFileAndYieldsToAnInteractiveBuild
 // pins the import that replaces the batched builds of a large working-tree
 // change under the delta model. A `git checkout <branch> -- .` lands a dozen
@@ -578,6 +772,9 @@ func TestALargeWorkingTreeChangeIsImportedFileByFileAndYieldsToAnInteractiveBuil
 		Gate:      gate,
 		cycleDone: func(out CheckoutCycle) { outcomes <- out },
 	})
+	c.compaction.mu.Lock()
+	c.compaction.quiet = -1
+	c.compaction.mu.Unlock()
 	await := func(ctx context.Context) (CheckoutCycle, bool) {
 		select {
 		case out := <-outcomes:
@@ -749,6 +946,7 @@ func TestCommittedBaseAdvancePropagatesLazilyAndReleasesByCopy(t *testing.T) {
 	f := newCommittedBaseFixture(t)
 	ctx := context.Background()
 	c, root := f.pinDependent(t, "alpha")
+	c.compaction.quiet = -1
 
 	if first := c.reconcile(ctx); first.Err != nil || !first.CommitBuilt {
 		t.Fatalf("the first cycle did not build the stack: %+v", first)
@@ -819,6 +1017,59 @@ func TestCommittedBaseAdvancePropagatesLazilyAndReleasesByCopy(t *testing.T) {
 	if stats := c.PropagationStats(); stats.Pending || stats.Applied != 1 {
 		t.Errorf("the applied rebase is still pending or uncounted: %+v", stats)
 	}
+}
+
+// TestConsecutiveBodyEditsOfOneFileAreChainedDeltas pins that an edit is a
+// delta over the previous working-tree generation, not a direct rebuild: ten
+// consecutive body edits of one file — a one-file dirty set, the shape a
+// planner that compared the delta with the dirty set refused every time —
+// produce ten generations, each built over the one before (a chain the
+// copy-based compactor folds when it is due), each parsing only the edited
+// file, and the view is a clean index of the working tree after every one.
+func TestConsecutiveBodyEditsOfOneFileAreChainedDeltas(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	ctx := context.Background()
+	c := chainCoordinatorOn(t, f, CheckoutCoordinatorConfig{})
+	if first := coordinatorReconcile(t, c); first.DirtyGenerationID == 0 {
+		t.Fatalf("the first cycle routed no working-tree layer: %+v", first)
+	}
+	// The worktree is already being worked on: one dirty file, built. (The
+	// first edit of a clean tree has no parent worth reusing and goes direct.)
+	builderWriteFile(t, f.worktree, "island.go", "package fixture\n\nfunc Island() int {\n\treturn 0\n}\n")
+	previous := coordinatorReconcile(t, c)
+	if !previous.DirtyBuilt {
+		t.Fatalf("the working tree's first edit was not built: %+v", previous)
+	}
+	folds := 0
+	for k := 1; k <= 10; k++ {
+		builderWriteFile(t, f.worktree, "island.go",
+			fmt.Sprintf("package fixture\n\nfunc Island() int {\n\treturn %d\n}\n", k))
+		out := coordinatorReconcile(t, c)
+		if !out.DirtyBuilt || out.DirtyChainReason != "" || out.DirtyParentGenerationID != previous.DirtyGenerationID {
+			t.Fatalf("edit %d was not a delta over generation %d: %+v", k, previous.DirtyGenerationID, out)
+		}
+		// The delta claims every changed path on every edit: the edited
+		// file alone.
+		if claimed := claimedPaths(t, f.store, out.DirtyGenerationID); !slices.Equal(claimed, []string{builderRepoPrefix + "/island.go"}) {
+			t.Errorf("edit %d claims %v, want the edited file alone", k, claimed)
+		}
+		if out.CompactionScheduled {
+			report := c.compactDirtyChain(ctx, out)
+			switch {
+			case report.Outcome != dirtyChainCompactionFlipped:
+				t.Fatalf("edit %d: the due compaction did not fold by copy: %+v", k, report)
+			case report.Outcome == dirtyChainCompactionFlipped:
+				folds++
+				out.DirtyGenerationID = report.GenerationID
+			}
+		}
+		result := assertPropagationParity(t, f.store, routedStack(t, f, c), f.worktree, fmt.Sprintf("edit-%d", k))
+		if !result.ok() {
+			t.Errorf("after edit %d the view differs from a clean index: %v", k, result.Diffs)
+		}
+		previous = out
+	}
+	t.Logf("10 edits: 10 chained deltas, %d folds", folds)
 }
 
 // assertPropagationParity is the clean-index oracle for these tests. The

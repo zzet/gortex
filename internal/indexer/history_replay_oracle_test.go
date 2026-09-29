@@ -73,12 +73,13 @@ type replayStep struct {
 type replayStepRecord struct {
 	Step            string                     `json:"step"`
 	CycleMS         float64                    `json:"cycle_ms"`
-	WAL             store_sqlite.WALWriteDelta `json:"wal"`
 	DirtyBuilt      bool                       `json:"dirty_built"`
 	Generation      int64                      `json:"generation"`
 	Parent          int64                      `json:"parent"`
 	Depth           int                        `json:"depth"`
 	Fallback        string                     `json:"fallback,omitempty"`
+	WAL             store_sqlite.WALWriteDelta `json:"wal"`
+	CompactionWAL   store_sqlite.WALWriteDelta `json:"compaction_wal"`
 	CleanIndexMS    float64                    `json:"clean_index_ms"`
 	CompareMS       float64                    `json:"compare_ms"`
 	Nodes           int                        `json:"nodes"`
@@ -451,6 +452,12 @@ func (h *replayHarness) run(t *testing.T, steps []replayStep) []replayStepRecord
 		}
 		cycle := time.Since(started)
 		wal := store_sqlite.WALWrittenBetween(mark, h.f.store.WALWriteMark())
+		var compactionWAL store_sqlite.WALWriteDelta
+		if out.CompactionScheduled {
+			mark := h.f.store.WALWriteMark()
+			h.c.compactDirtyChain(ctx, out)
+			compactionWAL = store_sqlite.WALWrittenBetween(mark, h.f.store.WALWriteMark())
+		}
 		h.c.SweepRetirements(ctx)
 
 		view := chainMaterialize(t, h.f)
@@ -465,12 +472,13 @@ func (h *replayHarness) run(t *testing.T, steps []replayStep) []replayStepRecord
 		}
 		rec.Step = step.name
 		rec.CycleMS = ms(cycle)
-		rec.WAL = wal
 		rec.DirtyBuilt = out.DirtyBuilt
 		rec.Generation = out.DirtyGenerationID
 		rec.Parent = out.DirtyParentGenerationID
 		rec.Depth = out.DirtyChainDepth
 		rec.Fallback = out.DirtyChainReason
+		rec.WAL = wal
+		rec.CompactionWAL = compactionWAL
 		rec.CleanIndexMS = cleanMS
 		rec.CompareMS = ms(time.Since(compareStarted))
 		rec.NodePlacement = replayNodePlacement(t, h.f.store, rec.differingIDs)
@@ -607,10 +615,16 @@ func E() string {
 func TestHistoryReplayMatchesAWholeIndexAfterEveryStep(t *testing.T) {
 	arms := []struct {
 		name        string
+		foldPaths   int
 		importPaths int
-	}{{"chained", 0}, {"import-file-by-file", 1}}
+	}{{"chained", 0, 0}, {"fold-every-edit", 1, 0}, {"import-file-by-file", 0, 1}}
 	for _, arm := range arms {
 		t.Run(arm.name, func(t *testing.T) {
+			if arm.foldPaths > 0 {
+				old := dirtyChainFoldPaths
+				dirtyChainFoldPaths = arm.foldPaths - 1
+				t.Cleanup(func() { dirtyChainFoldPaths = old })
+			}
 			if arm.importPaths > 0 {
 				old := importInteractivePaths
 				importInteractivePaths = arm.importPaths
@@ -618,6 +632,7 @@ func TestHistoryReplayMatchesAWholeIndexAfterEveryStep(t *testing.T) {
 			}
 			f := newCoordinatorFixtureWithTree(t, replayTree())
 			c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+			c.compaction.quiet = -1
 			coordinatorReconcile(t, c)
 			h := &replayHarness{f: f, c: c, sampleLimit: 40, clean: func(t *testing.T, label string) (graph.Reader, func()) {
 				store := builderOpenStore(t, label)
@@ -817,7 +832,7 @@ func TestHistoryReplayRealRepository(t *testing.T) {
 }
 
 // replayRealCoordinator is fixture.coordinator with the clone's own index
-// configuration (excludes and languages) instead of the
+// configuration (excludes, languages, dirty-chain switch) instead of the
 // defaults, so the coordinator builds what the base index was built with.
 func replayRealCoordinator(t *testing.T, f *coordinatorFixture, full *config.Config, logger *zap.Logger) *CheckoutCoordinator {
 	t.Helper()
@@ -844,5 +859,6 @@ func replayRealCoordinator(t *testing.T, f *coordinatorFixture, full *config.Con
 	if err := coordinator.Close(); err != nil {
 		t.Fatalf("stop the coordinator loop: %v", err)
 	}
+	coordinator.compaction.quiet = -1
 	return coordinator
 }

@@ -74,6 +74,7 @@ func semanticChainFixtureWith(t *testing.T, tree map[string]string, handleRoots 
 	builder.Semantic = mgr
 	builder.wholeModuleCompilerLoad = !handleRoots
 	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{Builder: builder})
+	c.compaction.quiet = -1
 	return f, c, mgr
 }
 

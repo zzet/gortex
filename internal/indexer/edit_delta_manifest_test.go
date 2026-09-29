@@ -19,6 +19,7 @@ import (
 func TestEditDeltaManifestChangesMatchAWholeIndex(t *testing.T) {
 	f := newCoordinatorFixtureWithTree(t, replayTree())
 	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	c.compaction.quiet = -1
 	coordinatorReconcile(t, c)
 	h := &replayHarness{f: f, c: c, sampleLimit: 40, clean: func(t *testing.T, label string) (graph.Reader, func()) {
 		store := builderOpenStore(t, label)

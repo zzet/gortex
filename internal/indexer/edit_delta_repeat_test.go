@@ -16,6 +16,7 @@ import (
 func TestEditDeltaClaimsEveryChangedPathOnRepeatEdits(t *testing.T) {
 	f := newCoordinatorFixtureWithTree(t, sharedRowsTree())
 	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	c.compaction.quiet = -1
 	coordinatorReconcile(t, c)
 	full := filepath.Join(f.worktree, "c", "c.go")
 	original, err := os.ReadFile(full)

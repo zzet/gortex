@@ -37,6 +37,7 @@ func TestTornBuildNeverBecomesAChainParent(t *testing.T) {
 			})
 		},
 	})
+	c.compaction.quiet = -1
 	coordinatorReconcile(t, c)
 
 	builderWriteFile(t, f.worktree, "other.go", "package fixture\n\nfunc Other() int { return 1 }\n")

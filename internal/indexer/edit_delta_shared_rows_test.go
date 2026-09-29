@@ -137,6 +137,7 @@ func sharedRowsRender(r graph.Reader, id string) string {
 func TestEditDeltaServesSharedRowsLikeAWholeIndex(t *testing.T) {
 	f := newCoordinatorFixtureWithTree(t, sharedRowsTree())
 	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	c.compaction.quiet = -1
 	coordinatorReconcile(t, c)
 	for i, step := range sharedRowsSteps(sharedRowsTree()) {
 		step.apply(t, f.worktree)
@@ -178,6 +179,7 @@ func TestEditDeltaKeepsABuiltinsEdgesRecordedInOtherFiles(t *testing.T) {
 	}
 	f := newCoordinatorFixtureWithTree(t, tree)
 	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	c.compaction.quiet = -1
 	coordinatorReconcile(t, c)
 	full := filepath.Join(f.worktree, "a", "a.go")
 	for i, body := range []string{

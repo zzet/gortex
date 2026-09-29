@@ -23,8 +23,19 @@ import (
 // folded generation is checked against the chain's own composed view at every
 // path and identity the chain speaks for BEFORE it is published, and a fold
 // that does not reproduce it is abandoned — the chain stays routed and nothing
-// changes for a reader. The file-by-file import folds its chain at the
-// depth bound (checkout_import.go); background folding lands at K43.
+// changes for a reader. It serves three callers:
+//
+//   - the chain compaction at depth (dirty_chain_compaction.go), which
+//     otherwise rebuilds the whole working tree direct;
+//   - the fold of a large overlay (dirtyChainFoldPaths), so an overlay a
+//     long-lived branch or a large import grew stays one layer deep;
+//   - the file-by-file import of a large working-tree change, which folds its
+//     chain whenever it reaches the depth bound (checkout_import.go).
+
+// dirtyChainFoldPaths is the covered-path count past which a working-tree
+// chain of depth > 1 is folded into one generation. A variable only so a
+// fixture can fold a small overlay.
+var dirtyChainFoldPaths = 2000
 
 // errFlattenRefused is a fold the coordinator declines; nothing was published.
 var errFlattenRefused = errors.New("indexer: working-tree chain not folded")
@@ -252,4 +263,21 @@ func foldFirstDifference(a, b []string) string {
 		return "missing " + b[len(a)]
 	}
 	return ""
+}
+
+// chainCoveredPaths counts the paths a working-tree chain's members claim.
+func (c *CheckoutCoordinator) chainCoveredPaths(ctx context.Context, top int64) int {
+	covered, err := c.coveredPaths(ctx, c.dirtyChainMembers(ctx, top)...)
+	if err != nil {
+		return 0
+	}
+	return len(covered)
+}
+
+// foldDue reports whether the routed chain is large enough to fold.
+func (c *CheckoutCoordinator) foldDue(ctx context.Context, out CheckoutCycle) bool {
+	if out.DirtyGenerationID <= 0 || out.DirtyChainDepth < 2 {
+		return false
+	}
+	return c.chainCoveredPaths(ctx, out.DirtyGenerationID) > dirtyChainFoldPaths
 }

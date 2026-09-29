@@ -266,11 +266,14 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 		return err
 	}
 	m.refreshReserved = true
+	// Hold the withdrawn top as the edit's preferred chained parent.
+	withdrawn := m.coordinator.holdWithdrawnDirty(ctx, m.route)
 	if err := m.coordinator.clearDirtySlot(ctx, &m.route); err != nil {
 		m.coordinator.releaseCheckoutRefreshReservation()
 		m.refreshReserved = false
 		return fmt.Errorf("%w: withdraw dirty route: %w", ErrCheckoutMutationStale, err)
 	}
+	m.coordinator.setPreferredDirtyParent(withdrawn, "withdrawn by a checkout mutation")
 	m.prepared = true
 	StampPublicationPhase(ctx, PublicationRouteWithdrawn)
 	return nil
@@ -310,6 +313,7 @@ func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 	if err := m.validateCheckout(ctx); err != nil {
 		return CheckoutCycle{}, err
 	}
+	m.coordinator.cancelDirtyChainCompaction("synchronous checkout mutation")
 	releaseLane, err := m.coordinator.gate.Acquire(ctx, ViewBuildInteractive)
 	if err != nil {
 		return CheckoutCycle{}, checkoutMutationAdmissionError(ctx, "shared view-build gate", err)
@@ -327,6 +331,9 @@ func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 	}
 	out := m.coordinator.reconcile(withInteractiveBuild(ctx))
 	recordCoordinatorCycle(out)
+	if out.CompactionScheduled {
+		m.coordinator.scheduleDirtyChainCompaction(out)
+	}
 	if out.Err != nil {
 		return out, out.Err
 	}
