@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -33,21 +34,32 @@ import (
 var (
 	semMu sync.Mutex
 	// sem is the package-global limiter, swapped under semMu by
-	// SetConcurrency. Its default weight is min(GOMAXPROCS, 8).
+	// SetConcurrency. Its default weight is min(NumCPU, 8), or
+	// GORTEX_GIT_CONCURRENCY.
 	sem *semaphore.Weighted = semaphore.NewWeighted(defaultConcurrency())
 )
 
-// defaultConcurrency returns the default semaphore weight:
-// min(runtime.GOMAXPROCS(0), 8).
+// concurrencyEnv overrides the default limiter weight (a positive integer,
+// capped at maxDefaultConcurrency*4).
+const concurrencyEnv = "GORTEX_GIT_CONCURRENCY"
+
+const maxDefaultConcurrency = 8
+
+// defaultConcurrency returns the default semaphore weight: min(NumCPU, 8),
+// unless GORTEX_GIT_CONCURRENCY names another positive weight.
+//
+// It follows the host's CPUs, not GOMAXPROCS: a git child is a separate
+// process the kernel schedules on any CPU, and GOMAXPROCS bounds only this
+// process's Go threads. A daemon run at GOMAXPROCS=1 used to get a weight of
+// 1, so every git call in it — an edit's working-copy sample included —
+// queued behind whichever other git child was running.
 func defaultConcurrency() int64 {
-	n := runtime.GOMAXPROCS(0)
-	if n > 8 {
-		n = 8
+	if raw := strings.TrimSpace(os.Getenv(concurrencyEnv)); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return int64(min(n, maxDefaultConcurrency*4))
+		}
 	}
-	if n < 1 {
-		n = 1
-	}
-	return int64(n)
+	return int64(max(1, min(runtime.NumCPU(), maxDefaultConcurrency)))
 }
 
 // SetConcurrency resizes the global git limiter, called once at

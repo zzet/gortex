@@ -18,6 +18,14 @@ import (
 // the current writable checkout. No disk write has been admitted by Prepare.
 var ErrCheckoutMutationStale = errors.New("indexer: checkout mutation view is stale")
 
+// ErrCheckoutMutationRouteMoved is an admission refused because the route the
+// caller selected, or the primary base under its commit layer, moved after
+// the selection — a rebuild published, a base advance applied. It says
+// nothing about the working copy (admission takes no sample; a HEAD change is
+// refused by Prepare's sample), so the caller may select the view again and
+// retry admission. It is ErrCheckoutMutationStale too.
+var ErrCheckoutMutationRouteMoved = fmt.Errorf("%w: the selected route moved", ErrCheckoutMutationStale)
+
 // ErrCheckoutMutationPending means a disk mutation has not yet reached a fresh
 // routed generation. It does not mean the disk mutation was rolled back.
 var ErrCheckoutMutationPending = errors.New("indexer: checkout mutation refresh is pending")
@@ -47,9 +55,14 @@ type CheckoutMutation struct {
 	refreshQueued   bool
 	refreshReserved bool
 	snapshotPinned  bool
-	headRef         string
-	headCommit      string
-	headTree        string
+	// admittedHead is the HEAD evidence taken at admission, without running
+	// git; the write's sample is refused when HEAD moved since (a branch
+	// switch or a commit between admission and the write). Unusable evidence
+	// makes admission sample instead, as it always did.
+	admittedHead gitstate.HeadEvidence
+	headRef      string
+	headCommit   string
+	headTree     string
 	// receipt is this lease's authority over the routed dirty generation it
 	// withdraws and republishes. Exactly one output generation per mutation.
 	receipt    *OutputMutationReceipt
@@ -135,7 +148,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 	// view and refuses a stale one now. Prepare's sample, under the lock,
 	// stays the authority.
 	if !c.cycleMu.TryLock() {
-		if err := c.refuseStaleAdmission(waitCtx, expectedRouteEpoch); err != nil {
+		if err := c.refuseStaleAdmission(gitstate.WithUrgentSample(waitCtx), expectedRouteEpoch); err != nil {
 			return nil, err
 		}
 		if err := acquireCycleLock(waitCtx, c); err != nil {
@@ -161,10 +174,30 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 		return nil, err
 	}
 	m.route = route
-	// Admission validates the routed catalog layers only. Prepare samples the
-	// working copy before any write; HEAD evidence and urgent/since sampling
-	// are not part of this admission path.
-	if _, err := c.checkRouteLayers(waitCtx, route); err != nil {
+	// Admission takes no working-copy sample of its own. It pins HEAD by the
+	// identity of the files that decide it (no git), and refuses a route
+	// whose layers no longer compose over the current primary base (the
+	// catalog half of the snapshot check). The working copy is proved once,
+	// by the sample Prepare takes immediately before the write: that sample
+	// begins after the request arrived and after the caller computed its
+	// edit, so it proves everything an admission sample would and more, and
+	// an edit pays for one sample before its write instead of two. A tree
+	// already stale here is refused there, before any byte is written; a dry
+	// run, which never prepares, validates the route, HEAD's files and the
+	// checkout identity only.
+	m.admittedHead = c.sampler.CaptureHeadEvidence()
+	if !m.admittedHead.Usable() {
+		// HEAD cannot be pinned without git on this layout: sample now, so
+		// the write's sample is compared with a HEAD read at admission.
+		since := freshRequestSince(waitCtx, time.Now())
+		if err := m.validateSnapshot(waitCtx, since); err != nil {
+			return nil, err
+		}
+	} else if _, err := c.checkRouteLayers(waitCtx, route); err != nil {
+		// At admission no working-copy sample is involved, so a refusal
+		// here is never HEAD's: the routed layers no longer compose over
+		// the current primary base (a base advance published between the
+		// caller's view selection and now). The caller may select again.
 		if errors.Is(err, ErrCheckoutMutationStale) {
 			return nil, fmt.Errorf("%w: %w", ErrCheckoutMutationRouteMoved, err)
 		}
@@ -265,7 +298,14 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 	if err := m.validateCheckout(ctx); err != nil {
 		return err
 	}
-	if err := m.validateSnapshot(ctx); err != nil {
+	// The lease's one working-copy sample before the write, taken fresh: a
+	// tree that was stale at admission, or an external writer between
+	// admission and the disk commit (while the caller computed its edit from
+	// the routed view), is refused before any byte is written. The ticket's
+	// sample is the serving cycle's first after the write (EnqueueRefresh).
+	// Any sample begun from here on will do, so one another caller starts
+	// while this one waits for the sampling lease is shared, not repeated.
+	if err := m.validateSnapshot(ctx, time.Now()); err != nil {
 		return err
 	}
 	StampPublicationPhase(ctx, PublicationWriteValidated)
@@ -273,7 +313,11 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 		return err
 	}
 	m.refreshReserved = true
-	// Hold the withdrawn top as the edit's preferred chained parent.
+	// With chaining on, the generation the lease withdraws is the natural
+	// parent of the edit's own build: file it in the reuse cache (so the
+	// withdrawal owes it no retirement) and remember it as the preferred
+	// parent, or the build that follows would find no routed top and go
+	// direct.
 	withdrawn := m.coordinator.holdWithdrawnDirty(ctx, m.route)
 	if err := m.coordinator.clearDirtySlot(ctx, &m.route); err != nil {
 		m.coordinator.releaseCheckoutRefreshReservation()
@@ -474,9 +518,21 @@ func sameMutationRoot(a, b string) bool {
 // An unchanged route epoch does not imply unchanged disk: external editors and
 // git can run before the watcher reconciles. Refuse their newer state instead
 // of applying symbol offsets from the previously materialized generation.
-func (m *CheckoutMutation) validateSnapshot(ctx context.Context) error {
+//
+// since bounds the sample: any sample whose git status began at or after it
+// will do (DirtySampler.SampleSince); zero takes a new one.
+func (m *CheckoutMutation) validateSnapshot(ctx context.Context, since time.Time) error {
 	c := m.coordinator
-	sample, err := c.sampler.Sample(ctx)
+	// The edit's own sample: served before, and never queued behind, a
+	// background sample of this checkout (gitstate.WithUrgentSample).
+	ctx = gitstate.WithUrgentSample(ctx)
+	var sample gitstate.DirtySnapshot
+	var err error
+	if since.IsZero() {
+		sample, err = c.sampler.Sample(ctx)
+	} else {
+		sample, err = c.sampler.SampleSince(ctx, since)
+	}
 	if err != nil {
 		return fmt.Errorf("%w: sample checkout: %w", ErrCheckoutMutationStale, err)
 	}
@@ -485,6 +541,9 @@ func (m *CheckoutMutation) validateSnapshot(ctx context.Context) error {
 		return err
 	}
 	if m.snapshotPinned && (m.headRef != sample.HeadRef || m.headCommit != sample.HeadCommit || m.headTree != sample.HeadTree) {
+		return fmt.Errorf("%w: checkout HEAD changed since source admission", ErrCheckoutMutationStale)
+	}
+	if !m.snapshotPinned && m.admittedHead.Usable() && !m.admittedHead.Unchanged() {
 		return fmt.Errorf("%w: checkout HEAD changed since source admission", ErrCheckoutMutationStale)
 	}
 	m.snapshotPinned = true
@@ -509,6 +568,61 @@ func (c *CheckoutCoordinator) checkRoutedSnapshot(ctx context.Context, route sto
 		return fmt.Errorf("%w: checkout disk changed; wait for a fresh view and retry", ErrCheckoutMutationStale)
 	}
 	return nil
+}
+
+// routeLayers is what checkRouteLayers read: the primary base the route's
+// commit layer must be built over, and the route's two servable layers.
+type routeLayers struct {
+	base   primaryBase
+	commit store_sqlite.ViewGeneration
+	dirty  store_sqlite.ViewGeneration
+}
+
+// checkRouteLayers is the catalog half of checkRoutedSnapshot, the half that
+// needs no working-copy sample: both routed layers are servable, the commit
+// layer belongs to the current (or pinned) primary base's graph, and the
+// working-tree layer is rooted at it, directly or through a chain of this
+// checkout's working-tree generations. Admission runs it alone; the write's
+// sample runs it again with the comparisons that need the sample.
+func (c *CheckoutCoordinator) checkRouteLayers(ctx context.Context, route store_sqlite.CheckoutRoute) (routeLayers, error) {
+	var layers routeLayers
+	base, err := c.primaryBase(ctx)
+	if err != nil {
+		return layers, err
+	}
+	routedBase, pinned, err := c.pinnedBaseFor(ctx, base, route)
+	if err != nil {
+		return layers, err
+	}
+	if pinned {
+		base = routedBase
+	}
+	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	if err != nil {
+		return layers, err
+	}
+	// The commit layer must be the one this base builds for the tree it
+	// names; whether that tree is still HEAD's is the sample's question.
+	if !found || !servableGeneration(commit.State) || route.GraphID != base.graphID ||
+		generationRowKey(commit) != generationIdentityKey(c.commitIdentity(base, commit.TreeOID)) {
+		return layers, fmt.Errorf("%w: checkout HEAD or primary base changed", ErrCheckoutMutationStale)
+	}
+	dirty, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
+	if err != nil {
+		return layers, err
+	}
+	if !found || !servableGeneration(dirty.State) {
+		return layers, fmt.Errorf("%w: checkout disk changed; wait for a fresh view and retry", ErrCheckoutMutationStale)
+	}
+	rooted, err := c.dirtyRootedAtCommit(ctx, dirty, commit)
+	if err != nil {
+		return layers, err
+	}
+	if !rooted {
+		return layers, fmt.Errorf("%w: checkout disk changed; wait for a fresh view and retry", ErrCheckoutMutationStale)
+	}
+	layers.base, layers.commit, layers.dirty = base, commit, dirty
+	return layers, nil
 }
 
 // refuseStaleAdmission is the lock-free half of admission's snapshot check. It
@@ -607,67 +721,4 @@ func (c *CheckoutCoordinator) waitSourceMutations(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-// ErrCheckoutMutationRouteMoved is an admission refused because the route the
-// caller selected, or the primary base under its commit layer, moved after
-// the selection — a rebuild published, a base advance applied. It says
-// nothing about the working copy (admission takes no sample; a HEAD change is
-// refused by Prepare's sample), so the caller may select the view again and
-// retry admission. It is ErrCheckoutMutationStale too.
-var ErrCheckoutMutationRouteMoved = fmt.Errorf("%w: the selected route moved", ErrCheckoutMutationStale)
-
-// routeLayers is what checkRouteLayers read: the primary base the route's
-// commit layer must be built over, and the route's two servable layers.
-type routeLayers struct {
-	base   primaryBase
-	commit store_sqlite.ViewGeneration
-	dirty  store_sqlite.ViewGeneration
-}
-
-// checkRouteLayers is the catalog half of checkRoutedSnapshot, the half that
-// needs no working-copy sample: both routed layers are servable, the commit
-// layer belongs to the current (or pinned) primary base's graph, and the
-// working-tree layer is rooted at it, directly or through a chain of this
-// checkout's working-tree generations. Admission runs it alone; the write's
-// sample runs it again with the comparisons that need the sample.
-func (c *CheckoutCoordinator) checkRouteLayers(ctx context.Context, route store_sqlite.CheckoutRoute) (routeLayers, error) {
-	var layers routeLayers
-	base, err := c.primaryBase(ctx)
-	if err != nil {
-		return layers, err
-	}
-	routedBase, pinned, err := c.pinnedBaseFor(ctx, base, route)
-	if err != nil {
-		return layers, err
-	}
-	if pinned {
-		base = routedBase
-	}
-	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
-	if err != nil {
-		return layers, err
-	}
-	// The commit layer must be the one this base builds for the tree it
-	// names; whether that tree is still HEAD's is the sample's question.
-	if !found || !servableGeneration(commit.State) || route.GraphID != base.graphID ||
-		generationRowKey(commit) != generationIdentityKey(c.commitIdentity(base, commit.TreeOID)) {
-		return layers, fmt.Errorf("%w: checkout HEAD or primary base changed", ErrCheckoutMutationStale)
-	}
-	dirty, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
-	if err != nil {
-		return layers, err
-	}
-	if !found || !servableGeneration(dirty.State) {
-		return layers, fmt.Errorf("%w: checkout disk changed; wait for a fresh view and retry", ErrCheckoutMutationStale)
-	}
-	rooted, err := c.dirtyRootedAtCommit(ctx, dirty, commit)
-	if err != nil {
-		return layers, err
-	}
-	if !rooted {
-		return layers, fmt.Errorf("%w: checkout disk changed; wait for a fresh view and retry", ErrCheckoutMutationStale)
-	}
-	layers.base, layers.commit, layers.dirty = base, commit, dirty
-	return layers, nil
 }

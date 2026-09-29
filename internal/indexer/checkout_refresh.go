@@ -116,7 +116,14 @@ func (m *CheckoutMutation) EnqueueRefresh(ctx context.Context, path string) (*Ch
 	if err := m.validateCheckout(ctx); err != nil {
 		return nil, err
 	}
-	request, err := m.coordinator.captureCheckoutRefresh(ctx, m.checkout, m.rootInfo, path)
+	// The capture sample binds the exact post-commit snapshot (an unrelated
+	// edit or a branch switch after it supersedes the ticket). It is also the
+	// serving cycle's decision sample: it began after the disk commit, which
+	// is all that cycle needs of it (freshAfter, cycleSample), so the edit
+	// pays for one working-copy sample between its write and its build.
+	// The capture sample is on the edit's path to its ticket: urgent, like
+	// the lease's pre-write sample.
+	request, err := m.coordinator.captureCheckoutRefresh(gitstate.WithUrgentSample(ctx), m.checkout, m.rootInfo, path)
 	if err != nil {
 		return nil, err
 	}

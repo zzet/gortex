@@ -149,7 +149,8 @@ type checkoutHeadIdentity struct {
 	commit string
 }
 type CheckoutLifecycle struct {
-	// routePrewarm is read by every coordinator before a route flip.
+	// routePrewarm is the prewarmer every coordinator calls before a route
+	// flip (SetRoutePrewarmer).
 	routePrewarm routePrewarmerSlot
 	mi           *MultiIndexer
 	cfgMgr       *config.ConfigManager

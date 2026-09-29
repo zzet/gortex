@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -188,6 +189,15 @@ type DirtySampler struct {
 	// taken counts the samples this sampler has taken (not the ones
 	// SampleSince shared).
 	taken uint64
+	// stampProven and fenced count dirty samples whose content evidence was
+	// proven by change stamps alone, and those that needed the git fence
+	// (contentFingerprint).
+	stampProven, fenced uint64
+	// urgentWaiting counts urgent callers waiting for the lease; yields how
+	// often a holder gave the lease up to one.
+	urgentWaiting atomic.Int32
+	urgentActive  atomic.Int32
+	yields        uint64
 }
 
 // NewDirtySampler constructs a sampler for a path already known to be the
@@ -290,7 +300,10 @@ func (s *DirtySampler) sampleStartedSince(since time.Time) (DirtySnapshot, time.
 	return s.last, s.lastStarted, true
 }
 
-// acquire takes the sampling lease; the caller must run release.
+// acquire takes the sampling lease; the caller must run release. An urgent
+// caller (WithUrgentSample) is served before every other waiter, and a holder
+// that is not urgent gives the lease up at its next git boundary while one
+// waits (yieldToUrgent).
 func (s *DirtySampler) acquire(ctx context.Context) (func(), error) {
 	if s == nil || s.run == nil || strings.TrimSpace(s.root) == "" {
 		return nil, fmt.Errorf("gitstate: dirty sampler is not initialized: %w", ErrDirtyUnavailable)
@@ -298,18 +311,108 @@ func (s *DirtySampler) acquire(ctx context.Context) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("gitstate: sample canceled: %w: %w", ErrDirtyUnavailable, err)
 	}
+	sampling := s.lease()
+	urgent := urgentSample(ctx)
+	if err := s.takeLease(ctx, sampling, urgent); err != nil {
+		return nil, fmt.Errorf("gitstate: wait for sampler: %w: %w", ErrDirtyUnavailable, err)
+	}
+	if urgent {
+		s.urgentActive.Add(1)
+		return func() { s.urgentActive.Add(-1); <-sampling }, nil
+	}
+	return func() { <-sampling }, nil
+}
+
+func (s *DirtySampler) lease() chan struct{} {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.sampling == nil {
 		s.sampling = make(chan struct{}, 1)
 	}
-	sampling := s.sampling
-	s.mu.Unlock()
-	select {
-	case sampling <- struct{}{}:
-		return func() { <-sampling }, nil
-	case <-ctx.Done():
-		return nil, fmt.Errorf("gitstate: wait for sampler: %w: %w", ErrDirtyUnavailable, ctx.Err())
+	return s.sampling
+}
+
+// urgentLeasePoll is how often a non-urgent waiter looks again while an
+// urgent sample is waiting for, or holding, the lease.
+const urgentLeasePoll = time.Millisecond
+
+// takeLease blocks until the caller holds the lease. A non-urgent caller that
+// gets the lease while an urgent one waits hands it straight back and tries
+// again once no urgent caller waits.
+func (s *DirtySampler) takeLease(ctx context.Context, sampling chan struct{}, urgent bool) error {
+	if urgent {
+		s.urgentWaiting.Add(1)
+		defer s.urgentWaiting.Add(-1)
 	}
+	for {
+		select {
+		case sampling <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if urgent || s.urgentWaiting.Load() == 0 {
+			return nil
+		}
+		<-sampling
+		timer := time.NewTimer(urgentLeasePoll)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
+}
+
+// yieldToUrgent is a non-urgent sample's git boundary: when an urgent sample
+// waits for the lease, the holder gives it up, lets the urgent sample run to
+// its end, and takes it back before its own next step. The wait for the lease
+// back ignores cancellation (it is bounded by one urgent sample), so the
+// holder's deferred release always has a lease to release; a cancellation
+// that arrived meanwhile is returned then.
+func (s *DirtySampler) yieldToUrgent(ctx context.Context) error {
+	if urgentSample(ctx) || s.urgentWaiting.Load() == 0 {
+		return ctx.Err()
+	}
+	sampling := s.lease()
+	s.mu.Lock()
+	s.yields++
+	s.mu.Unlock()
+	<-sampling
+	_ = s.takeLease(context.WithoutCancel(ctx), sampling, false)
+	return ctx.Err()
+}
+
+type urgentSampleKey struct{}
+
+// WithUrgentSample marks ctx's samples urgent: an edit's own working-copy
+// sample, on the path between the tool call and its disk commit or its
+// refresh ticket. An urgent sample takes the sampling lease before any other
+// waiter, and a background sample holding it gives it up at its next git
+// boundary (or between two hashed files) until the urgent one is done. The
+// urgent sample therefore waits for at most one git command or one file hash
+// of the background sample, never for the whole of it.
+func WithUrgentSample(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, urgentSampleKey{}, true)
+}
+
+func urgentSample(ctx context.Context) bool {
+	urgent, _ := ctx.Value(urgentSampleKey{}).(bool)
+	return urgent
+}
+
+// UrgentYields reports how many times a non-urgent sample gave the lease up
+// to an urgent one.
+func (s *DirtySampler) UrgentYields() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.yields
 }
 
 // sampleHeld takes one sample; the caller holds the sampling lease. A sample
@@ -325,7 +428,7 @@ func (s *DirtySampler) sampleHeld(ctx context.Context) (DirtySnapshot, error) {
 func (s *DirtySampler) sampleHeldStarted(ctx context.Context) (DirtySnapshot, time.Time, error) {
 	started := time.Now()
 	head := s.captureHeadEvidence()
-	snap, err := s.sampleHeldUnrecorded(ctx)
+	snap, err := s.sampleHeldUnrecorded(ctx, started, head)
 	if err != nil {
 		return DirtySnapshot{}, time.Time{}, err
 	}
@@ -350,13 +453,27 @@ func (s *DirtySampler) SamplesTaken() uint64 {
 	return s.taken
 }
 
-func (s *DirtySampler) sampleHeldUnrecorded(ctx context.Context) (DirtySnapshot, error) {
+// started is the instant before head was captured and the status command
+// began; head is the HEAD-deciding files' identity at that instant. Together
+// they let the content fingerprint prove its dirty evidence without a second
+// status (contentFingerprint).
+func (s *DirtySampler) sampleHeldUnrecorded(ctx context.Context, started time.Time, head headEvidence) (DirtySnapshot, error) {
 	out, err := s.run(ctx, s.root, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--renames")
 	if err != nil {
 		return DirtySnapshot{}, fmt.Errorf("gitstate: read status in %s: %w: %w", s.root, ErrDirtyUnavailable, err)
 	}
 	ref, commit, err := parseBranchStatusZ(out)
+	if err == nil && ref == "(detached)" && commit != "" {
+		// A detached HEAD whose file says so needs no symbolic-ref call: the
+		// status already named the commit, and the fence below re-runs status.
+		if detached, known := s.headFileDetached(); known && detached {
+			ref = ""
+		}
+	}
 	if err == nil && (ref == "(detached)" || ref == "(unknown)") {
+		if err := s.yieldToUrgent(ctx); err != nil {
+			return DirtySnapshot{}, fmt.Errorf("gitstate: read HEAD in %s: %w: %w", s.root, ErrDirtyUnavailable, err)
+		}
 		var symbolic []byte
 		symbolic, err = s.run(ctx, s.root, "symbolic-ref", "-q", "HEAD")
 		switch {
@@ -383,6 +500,9 @@ func (s *DirtySampler) sampleHeldUnrecorded(ctx context.Context) (DirtySnapshot,
 		if commit == s.commitOID && s.treeOID != "" {
 			tree = s.treeOID
 		} else {
+			if err := s.yieldToUrgent(ctx); err != nil {
+				return DirtySnapshot{}, fmt.Errorf("gitstate: resolve tree for %s in %s: %w: %w", commit, s.root, ErrDirtyUnavailable, err)
+			}
 			treeOut, treeErr := s.run(ctx, s.root, "rev-parse", "--verify", "-q", commit+"^{tree}")
 			if treeErr != nil {
 				// SampleHEAD historically treats an ordinary tree-resolution
@@ -410,7 +530,7 @@ func (s *DirtySampler) sampleHeldUnrecorded(ctx context.Context) (DirtySnapshot,
 	if identityTree == "" && snap.HeadCommit != "" {
 		identityTree = "unresolved-commit:" + snap.HeadCommit
 	}
-	snap.Fingerprint, snap.Contents, err = s.contentFingerprint(ctx, identityTree, snap.Entries, out)
+	snap.Fingerprint, snap.Contents, err = s.contentFingerprint(ctx, identityTree, snap.Entries, out, started, head)
 	if err != nil {
 		return DirtySnapshot{}, fmt.Errorf("gitstate: fingerprint dirty content in %s: %w: %w", s.root, ErrDirtyUnavailable, err)
 	}
@@ -561,7 +681,58 @@ func dirtyHeadEntries(status []byte) map[string]dirtyHeadEntry {
 	return head
 }
 
-func (s *DirtySampler) contentFingerprint(ctx context.Context, tree string, entries []DirtyEntry, status []byte) (string, []DirtyContent, error) {
+// dirtyContentHashed, when set, runs after the dirty paths were hashed and
+// before their evidence is proven. It is a test seam: it lets a test change a
+// file inside the window the proof has to notice.
+var dirtyContentHashed func()
+
+// fenceDirtyEvidence is the git fence: a second status must equal the first,
+// and every dirty path must still carry the identity it was hashed under
+// (bytes re-read when the hash was not taken from a settled cache entry).
+func (s *DirtySampler) fenceDirtyEvidence(ctx context.Context, root *os.Root, paths []string, evidence map[string]dirtyContentEvidence, status []byte) error {
+	if err := s.yieldToUrgent(ctx); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.fenced++
+	s.mu.Unlock()
+	after, err := s.run(ctx, s.root, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--renames")
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(status, after) {
+		return errors.New("git dirty status changed while sampling")
+	}
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		observed := evidence[path]
+		info, err := root.Lstat(path)
+		if observed.missing {
+			if !os.IsNotExist(err) {
+				return fmt.Errorf("dirty path %q appeared while sampling", path)
+			}
+			continue
+		}
+		if err != nil || dirtyVersion(info) != dirtyVersion(observed.info) {
+			return fmt.Errorf("dirty path %q changed while sampling", path)
+		}
+		if !observed.opaque && !observed.memo.reusable {
+			// Young, unsupported or incomplete evidence must not certify bytes.
+			current, err := readDirtyContent(ctx, root, path, info)
+			if err != nil {
+				return err
+			}
+			if current.mode != observed.memo.mode || current.sha256 != observed.memo.sha256 {
+				return fmt.Errorf("dirty path %q changed while sampling", path)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *DirtySampler) contentFingerprint(ctx context.Context, tree string, entries []DirtyEntry, status []byte, started time.Time, headAtStart headEvidence) (string, []DirtyContent, error) {
 	if err := ctx.Err(); err != nil {
 		return "", nil, err
 	}
@@ -604,7 +775,7 @@ func (s *DirtySampler) contentFingerprint(ctx context.Context, tree string, entr
 	// sorted path order; exposed only after every fence below passes.
 	contents := make([]DirtyContent, 0, len(paths))
 	for _, path := range paths {
-		if err := ctx.Err(); err != nil {
+		if err := s.yieldToUrgent(ctx); err != nil {
 			return "", nil, err
 		}
 		info, err := root.Lstat(path)
@@ -653,39 +824,20 @@ func (s *DirtySampler) contentFingerprint(ctx context.Context, tree string, entr
 		canonical.str(memo.mode)
 		canonical.str(memo.sha256)
 	}
-	// Fence HEAD/index and reported paths, then revalidate file evidence.
-	after, err := s.run(ctx, s.root, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--renames")
-	if err != nil {
+	if dirtyContentHashed != nil {
+		dirtyContentHashed()
+	}
+	// The status describes the working copy as git saw it from started on.
+	// What remains to prove is that every hashed dirty path still held, when
+	// it was hashed, what it held then. The change stamps prove it without
+	// running git (stampsProveDirtyEvidence); anything they cannot prove is
+	// fenced by a second status and a re-validation, as before.
+	if s.stampsProveDirtyEvidence(ctx, root, paths, evidence, started, headAtStart) {
+		s.mu.Lock()
+		s.stampProven++
+		s.mu.Unlock()
+	} else if err := s.fenceDirtyEvidence(ctx, root, paths, evidence, status); err != nil {
 		return "", nil, err
-	}
-	if !bytes.Equal(status, after) {
-		return "", nil, errors.New("git dirty status changed while sampling")
-	}
-	for _, path := range paths {
-		if err := ctx.Err(); err != nil {
-			return "", nil, err
-		}
-		observed := evidence[path]
-		info, err := root.Lstat(path)
-		if observed.missing {
-			if !os.IsNotExist(err) {
-				return "", nil, fmt.Errorf("dirty path %q appeared while sampling", path)
-			}
-			continue
-		}
-		if err != nil || dirtyVersion(info) != dirtyVersion(observed.info) {
-			return "", nil, fmt.Errorf("dirty path %q changed while sampling", path)
-		}
-		if !observed.opaque && !observed.memo.reusable {
-			// Young, unsupported or incomplete evidence must not certify bytes.
-			current, err := readDirtyContent(ctx, root, path, info)
-			if err != nil {
-				return "", nil, err
-			}
-			if current.mode != observed.memo.mode || current.sha256 != observed.memo.sha256 {
-				return "", nil, fmt.Errorf("dirty path %q changed while sampling", path)
-			}
-		}
 	}
 	currentRoot, err := os.OpenFile(s.root, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {

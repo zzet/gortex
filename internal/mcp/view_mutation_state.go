@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/viewmetrics"
@@ -154,7 +155,7 @@ func (s *Server) refreshCheckoutMutation(ctx context.Context, path string, state
 		// the detached publication is outstanding, cancellation tail included.
 		pin := handoffRequestView(ctx, viewmetrics.HandoffCheckoutRefresh)
 		record, interimKey := openMutationPhases(ctx, state.checkoutID, path)
-		ticket, err := scheduler.EnqueueRefresh(indexer.WithPublicationRecord(context.WithoutCancel(ctx), record), path)
+		ticket, err := scheduler.EnqueueRefresh(indexer.WithPublicationRecord(withCommittedWrite(context.WithoutCancel(ctx), state, path), record), path)
 		if err != nil {
 			failMutationPhases(record)
 			pin.release()
@@ -214,4 +215,19 @@ func (s *Server) refreshCheckoutMutation(ctx context.Context, path string, state
 	outcome.Reindexed = true
 	outcome.AppliedGeneration = uint64(cycle.DirtyGenerationID)
 	return outcome
+}
+
+// withCommittedWrite tells the ticket's capture sample which file this request
+// just wrote and the exact bytes it wrote (their SHA-256), so the sample can
+// prove that one young file by content instead of paying the git fence for it
+// (gitstate.WithKnownWrite). Any other young file still takes the fence.
+func withCommittedWrite(ctx context.Context, state *checkoutMutationState, path string) context.Context {
+	if state == nil || state.committedHash == "" || !pathkey.EqualPaths(state.committedPath, path) || state.root == "" {
+		return ctx
+	}
+	rel, err := filepath.Rel(state.root, resolveNearestExistingAncestor(path))
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return ctx
+	}
+	return gitstate.WithKnownWrite(ctx, rel, state.committedHash)
 }

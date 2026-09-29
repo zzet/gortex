@@ -192,7 +192,10 @@ type CheckoutCoordinatorConfig struct {
 	// CheckoutID is the catalog identity of the checkout, and the key its
 	// route row is stored under.
 	CheckoutID string
-	// PrewarmRoute loads the new route's masks before the flip, best effort.
+	// PrewarmRoute, when set, is called with the generations a route flip is
+	// about to name (commit generation first, then the working-tree layer),
+	// before the flip: the view reader loads their layer masks then, so the
+	// first request on the new route does not (RoutePrewarmer).
 	PrewarmRoute RoutePrewarmer
 	// CheckoutRoot is the working tree the coordinator samples and builds from.
 	CheckoutRoot string
@@ -629,7 +632,8 @@ type CheckoutCoordinator struct {
 	announceWrite func() func()
 
 	cycleDone func(CheckoutCycle)
-	// prewarm is the installed route-mask prewarmer.
+	// prewarm loads the view reader's masks for a stack a flip will route
+	// (CheckoutCoordinatorConfig.PrewarmRoute); nil when none is installed.
 	prewarm      RoutePrewarmer
 	dirtyBarrier func()
 
