@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
@@ -168,6 +169,7 @@ func (idx *Indexer) ensureIncrementalContractRegistry() *contracts.Registry {
 	if idx.contractRegistry != nil {
 		return idx.contractRegistry
 	}
+	started := time.Now()
 	reg := contracts.NewRegistry()
 	if restored := contracts.LoadRegistryFromGraphWithScope(idx.graph, idx.repoPrefix, idx.workspaceID, idx.projectID); restored != nil {
 		for _, c := range restored.ByRepo(idx.repoPrefix) {
@@ -175,6 +177,7 @@ func (idx *Indexer) ensureIncrementalContractRegistry() *contracts.Registry {
 		}
 	}
 	idx.contractRegistry = reg
+	idx.contractRegistryLoad += time.Since(started)
 	return reg
 }
 

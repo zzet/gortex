@@ -39,7 +39,22 @@ func (dw *DeltaWriter) FileNodeIdentitiesSeq(repoPrefixes []string) iter.Seq[Fil
 		repos := stringKeySet(repoPrefixes)
 		out := make([]FileNodeIdentity, 0, 1024)
 		baseRows := seq.FileNodeIdentitiesSeq(repoPrefixes)
-
+		if dw.baseCache != nil {
+			rows := dw.baseCache.fileIdentities(repoPrefixes, func() []FileNodeIdentity {
+				var loaded []FileNodeIdentity
+				for row := range seq.FileNodeIdentitiesSeq(repoPrefixes) {
+					loaded = append(loaded, row)
+				}
+				return loaded
+			})
+			baseRows = func(yield func(FileNodeIdentity) bool) {
+				for _, row := range rows {
+					if !yield(row) {
+						return
+					}
+				}
+			}
+		}
 		for row := range baseRows {
 			if !s.hiddenAbove(row.ID, 0) {
 				out = append(out, row)

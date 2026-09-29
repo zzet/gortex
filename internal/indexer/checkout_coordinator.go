@@ -3198,7 +3198,11 @@ func (c *CheckoutCoordinator) baseViewMaterializer() *graphview.Materializer {
 // generation writes facts at all, it answers "no facts" for every file in the
 // repository. See ancestryRefFacts.
 func (c *CheckoutCoordinator) ancestryLayerBase(view *graphview.RepoView) LayerBase {
-	return commitLayerBase{Reader: view.Reader, facts: newAncestryRefFacts(c.store, view)}
+	base := commitLayerBase{Reader: view.Reader, facts: newAncestryRefFacts(c.store, view)}
+	if !view.ComposesBaseCorpus() {
+		base.stack = view.Generations()
+	}
+	return base
 }
 
 // flip repoints one slot under the route epoch this cycle read, and advances
@@ -4310,6 +4314,11 @@ type commitLayerBase struct {
 	// corpus is the single-generation fact handle the older callers hand in.
 	// It is consulted only when no ancestry was composed.
 	corpus *store_sqlite.Store
+	// stack is the view's generation ancestry, bottom first, when every
+	// generation in it is immutable (the view does not compose the mutable
+	// generation zero); nil otherwise. Equal stacks read equal rows, so a
+	// per-file delta keys what it derives from the base by it.
+	stack []int64
 }
 
 var _ LayerBase = commitLayerBase{}

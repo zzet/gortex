@@ -49,8 +49,11 @@ import (
 // of a cache other readers see, which is the same isolation a SQLite store
 // gives by decoding a fresh row per read.
 type DeltaWriter struct {
-	below   Reader
-	sidecar any
+	// baseCache memoizes the bottom store's projections across deltas over
+	// one immutable stack (delta_writer_base_cache.go); nil when none.
+	baseCache *BaseProjectionCache
+	below     Reader
+	sidecar   any
 
 	work  *Graph
 	layer *deltaLayer

@@ -143,6 +143,9 @@ type EditDeltaReport struct {
 	SlowReads       map[string]int
 
 	ownership editDeltaOwnership
+	// ContractRegistryCached reports that the delta's contract registry came
+	// from the cache kept across deltas instead of a read of the view below.
+	ContractRegistryCached bool
 }
 
 // lastEditDeltaReport is the most recent delta report, for tests and the
@@ -350,6 +353,11 @@ func (b *SparseGenerationBuilder) runEditDelta(
 ) (*EditDeltaReport, error) {
 	out := &EditDeltaReport{}
 	dw := graph.NewDeltaWriter(req.Base, handle)
+	var baseCache *graph.BaseProjectionCache
+	if key, ok := editDeltaBaseCacheKey(req.Base, b.Store); ok {
+		baseCache = editDeltaBaseCache(key)
+		dw.SetBaseProjectionCache(baseCache)
+	}
 	idx := New(dw, b.Registry, b.Config, b.Logger)
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
@@ -375,6 +383,12 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		idx.parseAdmission.Store(b.Admissions.parseAdmission.Load())
 		idx.nativeParseAdmission.Store(b.Admissions.nativeParseAdmission.Load())
 	}
+	// The repository's contract registry as the view below holds it, kept
+	// across deltas over the same immutable stack (edit_delta_contract_cache.go).
+	if key, ok := editDeltaContractCacheKey(req.Base, b.Store, req.RepoPrefix, req.WorkspaceID, req.ProjectID); ok {
+		out.ContractRegistryCached = seedEditDeltaContractRegistry(idx, key)
+	}
+
 	absPaths := make([]string, 0, len(plan.indexed)+len(plan.deleted))
 	for _, rel := range plan.indexed {
 		absPaths = append(absPaths, filepath.Join(req.RootPath, filepath.FromSlash(rel)))

@@ -46,7 +46,13 @@ func (dw *DeltaWriter) ProjectImportAdjacency(filePaths []string) (map[string][]
 			}
 		}
 		if len(clean) > 0 {
-			projected, complete := base.ProjectImportAdjacency(clean)
+			var projected map[string][]string
+			var complete bool
+			if dw.baseCache != nil {
+				projected, complete = dw.baseCache.importAdjacency(clean, base.ProjectImportAdjacency)
+			} else {
+				projected, complete = base.ProjectImportAdjacency(clean)
+			}
 			if !complete {
 				rest = paths
 			} else {
