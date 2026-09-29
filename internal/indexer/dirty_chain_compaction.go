@@ -19,6 +19,8 @@ type dirtyChainCompactor struct {
 	mu sync.Mutex
 	// census caches checkoutLanguageCensus per commit generation.
 	census map[int64]map[string]int
+	// lastForeground is when this checkout's latest foreground cycle ended.
+	lastForeground time.Time
 }
 
 // deferFailedGeneration owes a failed build's generation a retirement: one the
@@ -141,4 +143,18 @@ func finishObservedChangeRecord(ctx context.Context, out CheckoutCycle) {
 		return
 	}
 	record.Mark(PublicationTicketFailed)
+}
+
+// noteForegroundCycle records the end of one foreground cycle of this
+// checkout (one that served a ticket or built a working tree).
+func (c *CheckoutCoordinator) noteForegroundCycle(ended time.Time) {
+	if c == nil {
+		return
+	}
+	k := &c.compaction
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if ended.After(k.lastForeground) {
+		k.lastForeground = ended
+	}
 }

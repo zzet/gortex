@@ -79,6 +79,11 @@ type Provider struct {
 	// checkoutTypecheckState). Each state has its own lock.
 	tcMu     sync.Mutex
 	tcStates map[string]*checkoutTypecheckState
+
+	// warm runs the background whole-module listings that warm checkouts'
+	// retained closures, and preempts them for compiler loads (see
+	// typecheck_warmup.go).
+	warm warmupRegistry
 }
 
 type bindingLookupKey struct {
@@ -162,6 +167,7 @@ func (p *Provider) Languages() []string { return []string{"go"} }
 // Close drops the compact in-memory binding index. Full compiler programs are
 // local to an enrichment call and therefore require no provider-level cleanup.
 func (p *Provider) Close() error {
+	p.stopWarmups()
 	p.stateMu.Lock()
 	p.bindingTypes = nil
 	p.bindingOwners = nil
@@ -824,9 +830,18 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				zap.Int("source_dependency_files", c.SourceDependencyFiles),
 				zap.Int64("source_dependency_parse_ms", c.SourceDependencyParseMs),
 				zap.String("source_dependency_fallback", c.SourceDependencyFallback),
+				zap.Int("retained_kept", c.RetainedKept),
+				zap.Bool("warm_served", c.WarmServed),
+				zap.Int("working_set_packages", c.WorkingSetPackages),
 				zap.Int("state_packages", c.StatePackages),
 				zap.Int64("state_bytes", c.StateBytes),
-				zap.Bool("state_evicted", c.StateEvicted))
+				zap.Bool("state_evicted", c.StateEvicted),
+				zap.Int("evicted_packages", c.EvictedPackages),
+				zap.Int("evicted_files", c.EvictedFiles),
+				zap.Int("relist_scheduled", c.RelistScheduled),
+				zap.Int64("targeted_wait_ms", c.TargetedWaitMs),
+				zap.String("targeted_wait", c.TargetedWait),
+				zap.String("warmup_state", c.WarmupState))
 		}
 		p.logger.Info("go-types: package load done", fields...)
 	}
@@ -1916,6 +1931,9 @@ type compilerProgram struct {
 // unfiltered package list. parseFile, when non-nil, replaces go/packages'
 // parser for the source-checked packages.
 func (p *Provider) loadCompilerProgram(ctx context.Context, dir string, parseFile func(*token.FileSet, string, []byte) (*ast.File, error), patterns ...string) (compilerProgram, error) {
+	// A compiler load is interactive work: a background warm-up listing
+	// yields to it.
+	defer p.beginCompilerLoad(dir)()
 	mode := packages.NeedName |
 		packages.NeedFiles |
 		packages.NeedCompiledGoFiles |

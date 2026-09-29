@@ -2297,28 +2297,29 @@ func (l *CheckoutLifecycle) buildCoordinator(
 			"indexer: freeze the index configuration for checkout %s: %w", checkout.CheckoutID, err)
 	}
 	index = frozen
+	builder := &SparseGenerationBuilder{
+		Store:      l.store,
+		Registry:   l.mi.registry,
+		Config:     index,
+		Logger:     l.logger,
+		Admissions: idx,
+		Embedder:   l.mi.embedder,
+		// The daemon's one enrichment manager, so every checkout's
+		// language servers are admitted against the same global cap
+		// rather than one cap per coordinator.
+		Semantic: l.mi.semanticMgr,
+	}
 	coordinator, err := NewCheckoutCoordinator(CheckoutCoordinatorConfig{
-		CheckoutID:   checkout.CheckoutID,
-		CheckoutRoot: checkout.RootPath,
-		FamilyID:     checkout.FamilyID,
-		HeadCommit:   checkout.HeadCommit,
-		HeadTree:     checkout.HeadTree,
-		RepoPrefix:   primary.RepoPrefix,
-		WorkspaceID:  idx.WorkspaceID(),
-		ProjectID:    idx.ProjectID(),
-		Store:        l.store,
-		Builder: &SparseGenerationBuilder{
-			Store:      l.store,
-			Registry:   l.mi.registry,
-			Config:     index,
-			Logger:     l.logger,
-			Admissions: idx,
-			Embedder:   l.mi.embedder,
-			// The daemon's one enrichment manager, so every checkout's
-			// language servers are admitted against the same global cap
-			// rather than one cap per coordinator.
-			Semantic: l.mi.semanticMgr,
-		},
+		CheckoutID:     checkout.CheckoutID,
+		CheckoutRoot:   checkout.RootPath,
+		FamilyID:       checkout.FamilyID,
+		HeadCommit:     checkout.HeadCommit,
+		HeadTree:       checkout.HeadTree,
+		RepoPrefix:     primary.RepoPrefix,
+		WorkspaceID:    idx.WorkspaceID(),
+		ProjectID:      idx.ProjectID(),
+		Store:          l.store,
+		Builder:        builder,
 		Leases:         l.leases,
 		Config:         index,
 		ConfigSections: dedicatedBaseConfigSections(repoCfg),
@@ -2361,6 +2362,7 @@ func (l *CheckoutLifecycle) buildCoordinator(
 			"indexer: repository %s stopped admitting while checkout %s was starting its coordinator",
 			primary.RepoPrefix, checkout.CheckoutID)
 	}
+	warmCheckoutCompilerAtReady(l, builder, checkout.RootPath)
 	return coordinator, nil
 }
 
@@ -4250,4 +4252,35 @@ func dirExists(path string) bool {
 	}
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
+}
+
+// warmCheckoutCompilerAtReady starts the background warm-up of a ready
+// checkout's compiler state (the whole-module listing its working-tree builds'
+// go/types passes reuse), so the first edit in a package no build has listed
+// yet does not pay the cold listing. Without it a checkout whose tree is clean
+// when it is routed warms only after its first build, and that first edit is
+// the cold one.
+//
+// It never delays readiness: the module probe, the manifest digest and the
+// provider's own bookkeeping run on a goroutine of its own, outside the
+// construction-time admission and every lifecycle lock. The provider's listing
+// is itself asynchronous, yields to every compiler load, and is a no-op while
+// the checkout is already warm for its module manifests; a provider closed
+// first answers without starting anything. Without a semantic manager nothing
+// starts.
+//
+// The provider is handed the lifecycle's foreground-activity view first, so a
+// warm-up asked for here — typically at daemon start, for every automatic
+// checkout of a family at once — lists one checkout at a time, after the
+// daemon has been idle for a while (longer for a checkout nobody has touched
+// since the start), and stops as soon as an edit or a fresh request arrives
+// (lifecycleForegroundActivity).
+func warmCheckoutCompilerAtReady(l *CheckoutLifecycle, builder *SparseGenerationBuilder, root string) {
+	if builder == nil || builder.Semantic == nil || root == "" {
+		return
+	}
+	if l != nil {
+		builder.Semantic.SetForegroundActivity(l.foregroundActivity())
+	}
+	go builder.WarmCheckoutCompiler(root)
 }

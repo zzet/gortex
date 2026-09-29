@@ -130,6 +130,24 @@ type CompilerCacheStats struct {
 	// this pass (nor by a whole-module load of it); the count lets the
 	// caller widen the handle.
 	DeclChangedFiles int `json:"decl_changed_files,omitempty"`
+	// WarmServed reports a closure hit whose root metadata came from the
+	// checkout's background whole-module listing (no pass had listed the
+	// root before).
+	WarmServed bool `json:"warm_served,omitempty"`
+	// WarmupState is the checkout's background whole-module listing as the
+	// pass found it: empty (never started), running, preempted (an
+	// interactive load cancelled it; it retries once the provider is quiet),
+	// warm, failed, superseded (the module manifests changed under it) or
+	// cancelled (the provider closed).
+	WarmupState string `json:"warmup_state,omitempty"`
+	// WarmupMs is the wall time of the last completed warm-up listing,
+	// WarmupPackages the packages it listed, WarmupAttempts the listings
+	// started for the current manifests and WarmupPreemptions how many of
+	// them an interactive load cancelled.
+	WarmupMs          int64 `json:"warmup_ms,omitempty"`
+	WarmupPackages    int   `json:"warmup_packages,omitempty"`
+	WarmupAttempts    int   `json:"warmup_attempts,omitempty"`
+	WarmupPreemptions int   `json:"warmup_preemptions,omitempty"`
 	// ChangedDependencies counts the closure's mutable dependencies whose
 	// files changed (content only) since they were listed. Instead of
 	// listing the closure again (which rebuilds the export data of every
@@ -143,6 +161,30 @@ type CompilerCacheStats struct {
 	SourceDependencyFiles    int    `json:"source_dependency_files,omitempty"`
 	SourceDependencyParseMs  int64  `json:"source_dependency_parse_ms,omitempty"`
 	SourceDependencyFallback string `json:"source_dependency_fallback,omitempty"`
+	// RetainedKept counts the packages a listing this pass ran brought
+	// back degraded (no export data: a dependency did not compile while it
+	// ran) whose retained, still valid metadata the state kept instead.
+	RetainedKept int `json:"retained_kept,omitempty"`
+	// WorkingSetPackages is the pass's working set (its roots, their
+	// closure and the dependencies checked from source), which the memory
+	// cap never evicts. EvictedPackages and EvictedFiles count the retained
+	// dependency types and parsed files the cap dropped after the pass,
+	// least recently touched first (see the checkout typecheck state).
+	WorkingSetPackages int `json:"working_set_packages,omitempty"`
+	EvictedPackages    int `json:"evicted_packages,omitempty"`
+	EvictedFiles       int `json:"evicted_files,omitempty"`
+	// RelistScheduled counts the background export relists this pass
+	// scheduled: it compiled, and its working set held packages retained
+	// without export data (listed while they did not compile).
+	RelistScheduled int `json:"relist_scheduled,omitempty"`
+	// TargetedWaitMs is how long the pass waited for the checkout's
+	// warm-up to merge the listing of its own (dirty or recently touched)
+	// package instead of listing it; TargetedWait why the wait ended:
+	// adopted (it joined the running listing), merged, stopped (the
+	// warm-up was preempted or ended), timeout (still queued), small (the
+	// package's closure is small: the pass listed itself).
+	TargetedWaitMs int64  `json:"targeted_wait_ms,omitempty"`
+	TargetedWait   string `json:"targeted_wait,omitempty"`
 }
 
 // Add accumulates another pass's cache work.
@@ -174,12 +216,29 @@ func (s *CompilerCacheStats) Add(o *CompilerCacheStats) {
 	s.StateBytes += o.StateBytes
 	s.StateEvicted = s.StateEvicted || o.StateEvicted
 	s.DeclChangedFiles += o.DeclChangedFiles
+	s.WarmServed = s.WarmServed || o.WarmServed
 	s.ChangedDependencies += o.ChangedDependencies
 	s.SourceDependencies += o.SourceDependencies
 	s.SourceDependencyFiles += o.SourceDependencyFiles
 	s.SourceDependencyParseMs += o.SourceDependencyParseMs
 	if s.SourceDependencyFallback == "" {
 		s.SourceDependencyFallback = o.SourceDependencyFallback
+	}
+	s.RetainedKept += o.RetainedKept
+	s.WorkingSetPackages += o.WorkingSetPackages
+	s.EvictedPackages += o.EvictedPackages
+	s.EvictedFiles += o.EvictedFiles
+	s.RelistScheduled += o.RelistScheduled
+	s.TargetedWaitMs += o.TargetedWaitMs
+	if s.TargetedWait == "" {
+		s.TargetedWait = o.TargetedWait
+	}
+	if s.WarmupState == "" {
+		s.WarmupState = o.WarmupState
+		s.WarmupMs = o.WarmupMs
+		s.WarmupPackages = o.WarmupPackages
+		s.WarmupAttempts = o.WarmupAttempts
+		s.WarmupPreemptions = o.WarmupPreemptions
 	}
 }
 

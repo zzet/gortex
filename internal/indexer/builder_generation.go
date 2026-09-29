@@ -294,6 +294,10 @@ type EnrichmentOutcome struct {
 	// loads, type-checked packages, compiled files and the load scope. nil
 	// when no provider that ran reports counts.
 	Compiler *semantic.CompilerLoadStats
+	// CompilerWarmup is, per provider, what asking it to warm the checkout's
+	// compiler state after the pass returned (started, running, warm, or
+	// why not); nil when the build did not ask.
+	CompilerWarmup map[string]string
 }
 
 // BuildReport is what one build did — and, as importantly, what it could not
@@ -1032,6 +1036,11 @@ func (b *SparseGenerationBuilder) runEnrichment(
 		Compiler:         scope,
 	})
 	out.Compiler = pass.Compiler
+	// After the pass, never before it: the warm-up yields to compiler loads,
+	// so starting it ahead of this build's own load would only be preempted.
+	if ctx.Err() == nil {
+		out.CompilerWarmup = b.warmCheckoutCompiler(req.RootPath, scope)
+	}
 	if err != nil {
 		out.Reason = err.Error()
 		b.Logger.Warn("indexer: the generation's enrichment stage failed",
@@ -2401,4 +2410,21 @@ func chainClearsEnrichmentFloor(handle graph.Store, repoPrefix string, chain map
 		totals[language] += count
 	}
 	return !below(), true
+}
+
+// WarmCheckoutCompiler asks the enrichment manager to warm the compiler
+// state of the checkout rooted at root in the background (a whole-module
+// listing that later working-tree builds' go/types passes reuse). It returns
+// at once with each provider's outcome. A coordinator calls it when its checkout becomes
+// ready; every build's enrichment stage also calls it after its pass, which
+// is a no-op while the checkout is warm for its module manifests.
+func (b *SparseGenerationBuilder) WarmCheckoutCompiler(root string) map[string]string {
+	return b.warmCheckoutCompiler(root, b.checkoutCompilerScope(nil))
+}
+
+func (b *SparseGenerationBuilder) warmCheckoutCompiler(root string, scope semantic.CheckoutCompilerScope) map[string]string {
+	if b == nil || b.Semantic == nil || root == "" || !scope.HandleRoots {
+		return nil
+	}
+	return b.Semantic.WarmCheckoutCompiler(root, scope)
 }

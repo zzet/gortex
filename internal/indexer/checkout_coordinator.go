@@ -1035,6 +1035,15 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	ctx = withPublicationTarget(ctx, c.checkoutID, through)
 	markPublicationPhase(ctx, PublicationCycleStarted)
 	defer c.guardCheckoutRefreshCycle(ctx, through)
+	// A cycle that serves a ticket or builds a working tree is foreground
+	// work: its end is what the ready-time warm-up's idle rule measures from
+	// (noteForegroundCycle, lifecycleForegroundActivity).
+	foreground := through != 0
+	defer func() {
+		if foreground {
+			c.noteForegroundCycle(time.Now())
+		}
+	}()
 	c.mu.Lock()
 	reason := c.reason
 	c.mu.Unlock()
@@ -1134,6 +1143,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	} else if priority == ViewBuildBackground {
 		c.resetBackgroundLaneYields()
 	}
+	foreground = foreground || out.DirtyBuilt
 	recordCoordinatorCycle(out)
 	switch {
 	case out.Err != nil && !errors.Is(out.Err, context.Canceled):

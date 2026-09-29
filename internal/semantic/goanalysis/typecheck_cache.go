@@ -145,8 +145,10 @@ type checkoutTypecheckState struct {
 	byDir     map[string]*packages.Package
 	manifests map[string]*tcManifest
 	// listedAt is, per package path, the start of the listing its metadata
-	// came from; an older listing never replaces newer metadata.
-	listedAt map[string]time.Time
+	// came from, and fromWarmup whether that listing was the background
+	// whole-module warm-up: an older listing never replaces newer metadata.
+	listedAt   map[string]time.Time
+	fromWarmup map[string]bool
 	// exportStale marks retained packages whose metadata still describes
 	// their files but whose export data was compiled against a dependency
 	// version the state no longer holds (see markExportStale): a pass
@@ -154,6 +156,8 @@ type checkoutTypecheckState struct {
 	exportStale map[string]bool
 	sizes       types.Sizes
 	lastList    time.Duration
+	// warmList is the wall time of the last warm-up listing merged.
+	warmList time.Duration
 
 	// Retained type state.
 	fset        *token.FileSet
@@ -167,10 +171,31 @@ type checkoutTypecheckState struct {
 	// syntaxBytes is the retained syntax's estimated heap (syntaxWeight).
 	syntaxBytes int64
 
-	// lastUsed orders whole-checkout budget eviction; guarded by Provider.tcMu.
-	lastUsed time.Time
-	hits     int
-	misses   int
+	// touch is, per package path, the pass clock of the last pass whose
+	// working set held the package (see typecheck_retention.go); clock
+	// counts the passes. A warm-up or a pre-check never touches.
+	touch map[string]uint64
+	clock uint64
+	// lastKept counts the packages the last merged listing brought back
+	// degraded whose retained metadata was kept (keepRetained).
+	lastKept int
+	// relistSig is the signature of the last scheduled export relist and
+	// relistRunning whether one runs (typecheck_relist.go).
+	relistSig     string
+	relistRunning bool
+
+	// lastUsed is when anything (a pass, a warm-up, a status read) last
+	// asked for the state; touchedAt when a pass last used it. Both are
+	// guarded by Provider.tcMu. The memory cap and the checkout bound
+	// order checkouts by touchedAt, so a warm-up never makes a checkout
+	// look more recently used than the ones edits keep touching.
+	lastUsed  time.Time
+	touchedAt time.Time
+	hits      int
+	misses    int
+	// warmHits counts closure hits whose root metadata came from the
+	// background warm-up listing.
+	warmHits int
 }
 
 func newCheckoutTypecheckState(loadDir, digest string) *checkoutTypecheckState {
@@ -185,6 +210,7 @@ func (st *checkoutTypecheckState) resetMetadata() {
 	st.byDir = map[string]*packages.Package{}
 	st.manifests = map[string]*tcManifest{}
 	st.listedAt = map[string]time.Time{}
+	st.fromWarmup = map[string]bool{}
 	st.exportStale = map[string]bool{}
 }
 
@@ -220,7 +246,7 @@ func (p *Provider) typecheckState(loadDir, digest string) *checkoutTypecheckStat
 	for len(p.tcStates) > maxTypecheckCheckouts {
 		var oldest *checkoutTypecheckState
 		for _, other := range p.tcStates {
-			if other != st && (oldest == nil || other.lastUsed.Before(oldest.lastUsed)) {
+			if other != st && (oldest == nil || lessRecentlyTouched(other, oldest)) {
 				oldest = other
 			}
 		}
@@ -239,7 +265,11 @@ type TypecheckCacheStatus struct {
 	Closure       int
 	EstimateBytes int64
 	Hits, Misses  int
-	LastUsed      time.Time
+	// WarmHits counts the hits served from the background warm-up listing.
+	WarmHits int
+	LastUsed time.Time
+	// Warmup is the checkout's background whole-module listing.
+	Warmup CheckoutWarmupStatus
 }
 
 // TypecheckCacheStatus reports the retained per-checkout compiler state.
@@ -259,9 +289,10 @@ func (p *Provider) TypecheckCacheStatus() []TypecheckCacheStatus {
 		if st.mu.TryLock() {
 			row.Packages, row.Closure = len(st.view), len(st.meta)
 			row.EstimateBytes = st.estimatedBytes()
-			row.Hits, row.Misses = st.hits, st.misses
+			row.Hits, row.Misses, row.WarmHits = st.hits, st.misses, st.warmHits
 			st.mu.Unlock()
 		}
+		row.Warmup = p.CheckoutWarmup(st.loadDir)
 		out = append(out, row)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
@@ -445,13 +476,15 @@ func (m *tcManifest) unchangedRootFileSet(dir string, vc *semantic.CompilerCache
 
 // tcListing is one `go list -export -deps` result, flattened, with the
 // manifests of its mutable packages recorded right after it. It is built
-// and merged under the state lock.
+// without the state lock (the warm-up lists the whole module in the
+// background) and merged under it.
 type tcListing struct {
 	pkgs      []*packages.Package
 	manifests map[string]*tcManifest
 	sizes     types.Sizes
 	start     time.Time
 	elapsed   time.Duration
+	warmup    bool
 }
 
 // runListing runs the metadata+export listing of patterns in loadDir and
@@ -505,13 +538,33 @@ func (p *Provider) runListing(ctx context.Context, loadDir string, patterns, bui
 	return out, nil
 }
 
-// mergeListing updates closure metadata and invalidates changed retained types.
+// mergeListing merges a listing into the state; the caller holds st.mu.
+//
+// A package whose retained metadata came from a listing that started later
+// keeps it, and so does one whose retained metadata still describes its
+// directory while the listing's entry would not serve better (keepRetained:
+// a warm-up never replaces valid metadata a pass relies on, and no listing
+// replaces it with an entry that lost its export data because a dependency
+// did not compile while the go command ran). Retained types of a package
+// whose export file changed describe the old export data: they are dropped
+// with the retained types of every package that imports it, directly or
+// not (invalidateTypes); every other package's types stay. Finally every
+// package whose direct import no longer has the export file it was compiled
+// against is marked export-stale (see markExportStale). It returns the
+// packages taken from the listing.
 func (st *checkoutTypecheckState) mergeListing(l *tcListing) int {
 	invalid := map[string]bool{}
 	replaced := map[string]*packages.Package{}
 	taken := 0
+	st.lastKept = 0
 	for _, pkg := range l.pkgs {
 		if at, ok := st.listedAt[pkg.PkgPath]; ok && at.After(l.start) {
+			continue
+		}
+		if st.keepRetained(pkg, l) {
+			if !l.warmup {
+				st.lastKept++
+			}
 			continue
 		}
 		if l.sizes != nil && st.sizes == nil {
@@ -537,6 +590,7 @@ func (st *checkoutTypecheckState) mergeListing(l *tcListing) int {
 		}
 		st.meta[pkg.PkgPath] = pkg
 		st.listedAt[pkg.PkgPath] = l.start
+		st.fromWarmup[pkg.PkgPath] = l.warmup
 		if pkg.Dir != "" {
 			st.byDir[filepath.Clean(pkg.Dir)] = pkg
 		}
@@ -551,7 +605,11 @@ func (st *checkoutTypecheckState) mergeListing(l *tcListing) int {
 		invalid[path] = true
 	}
 	st.invalidateTypes(invalid, replaced)
-	st.lastList = l.elapsed
+	if l.warmup {
+		st.warmList = l.elapsed
+	} else {
+		st.lastList = l.elapsed
+	}
 	return taken
 }
 
@@ -613,6 +671,7 @@ func (st *checkoutTypecheckState) markExportStale(dropped map[string]*packages.P
 			delete(st.meta, path)
 			delete(st.manifests, path)
 			delete(st.listedAt, path)
+			delete(st.fromWarmup, path)
 			delete(stale, path)
 		}
 	}
@@ -623,7 +682,10 @@ func (st *checkoutTypecheckState) markExportStale(dropped map[string]*packages.P
 // listClosure runs the metadata+export listing of the roots and merges it
 // into the state (the caller holds st.mu).
 func (p *Provider) listClosure(ctx context.Context, st *checkoutTypecheckState, patterns []string) (time.Duration, error) {
+	// A pass's listing is interactive work: a background warm-up yields.
+	endLoad := p.beginCompilerLoad(st.loadDir)
 	listing, err := p.runListing(ctx, st.loadDir, patterns, nil)
+	endLoad()
 	if err != nil {
 		return listing.elapsed, err
 	}
@@ -1431,6 +1493,7 @@ type cachedProgram struct {
 // retained state. The returned release must be called exactly once, after
 // the pass stops reading the program (also on error and bypass).
 func (p *Provider) loadCheckoutProgramCached(ctx context.Context, loadDir, digest string, plan handleRootPlan, scope semantic.CheckoutCompilerScope, stats *semantic.CompilerCacheStats) (cachedProgram, error) {
+	p.warmupSnapshot(loadDir, stats)
 	st := p.typecheckState(loadDir, digest)
 	st.mu.Lock()
 	var once sync.Once
@@ -1451,7 +1514,7 @@ func (p *Provider) loadCheckoutProgramCached(ctx context.Context, loadDir, diges
 		return bypass("vendor")
 	}
 
-	listed, exportRetried := false, false
+	listed, exportRetried, targetedWaited := false, false, false
 	relist := func(reason string) error {
 		if stats.MissReason == "" {
 			stats.MissReason = reason
@@ -1460,6 +1523,10 @@ func (p *Provider) loadCheckoutProgramCached(ctx context.Context, loadDir, diges
 		st.misses++
 		elapsed, err := p.listClosure(ctx, st, plan.patterns)
 		stats.GoListMs += elapsed.Milliseconds()
+		if err == nil {
+			p.warm.dropPending(filepath.Clean(loadDir), plan.rootDirs)
+		}
+		stats.RetainedKept += st.lastKept
 		listed = true
 		return err
 	}
@@ -1474,6 +1541,19 @@ func (p *Provider) loadCheckoutProgramCached(ctx context.Context, loadDir, diges
 		}
 		if check.missReason != "" {
 			stats.ValidateMs += time.Since(validateStart).Milliseconds()
+			if !listed && !targetedWaited && (check.missReason == "root_unlisted" || check.missReason == "cold") {
+				// The warm-up is listing this root's package right now
+				// (a dirty or recently touched package): wait for that
+				// listing, bounded, instead of listing it a second time.
+				targetedWaited = true
+				st.mu.Unlock()
+				waited, outcome := p.waitTargetedListing(ctx, filepath.Clean(loadDir), plan.rootDirs, targetedWaitBound())
+				st.mu.Lock()
+				stats.TargetedWaitMs, stats.TargetedWait = waited.Milliseconds(), outcome
+				if outcome != "" {
+					continue
+				}
+			}
 			if listed {
 				// A fresh listing that still does not validate (a root with
 				// no metadata, a file changing under the go command): the
@@ -1535,6 +1615,18 @@ func (p *Provider) loadCheckoutProgramCached(ctx context.Context, loadDir, diges
 			stats.ClosureHits++
 			st.hits++
 			saved := st.lastList
+			for _, root := range check.roots {
+				if st.fromWarmup[root.PkgPath] {
+					// The root was never listed by a pass: the background
+					// warm-up's listing is what this hit did not pay for.
+					stats.WarmServed = true
+					st.warmHits++
+					if saved == 0 {
+						saved = st.warmList
+					}
+					break
+				}
+			}
 			stats.GoListSavedMs += saved.Milliseconds()
 		}
 
@@ -1550,6 +1642,7 @@ func (p *Provider) loadCheckoutProgramCached(ctx context.Context, loadDir, diges
 		stats.CheckMs += time.Since(checkStart).Milliseconds()
 		// Hard errors anywhere in what this pass checked (a dependency
 		// checked from source included) mean the tree does not compile.
+		compiles := err == nil && classifyLoadErrors(pkgs).hard == 0
 		if err == nil && source != nil {
 			pkgs = source.rootsOnly(pkgs, st.meta)
 		}
@@ -1574,7 +1667,21 @@ func (p *Provider) loadCheckoutProgramCached(ctx context.Context, loadDir, diges
 		}
 		out.program = program
 		out.closure = st.meta
-		stats.StateEvicted = p.enforceTypecheckBudget(st, scope.TypecheckCacheBytes)
+		p.warm.noteRoots(loadDir, plan.rootDirs)
+		// The pass's working set is what the next delta over these roots
+		// needs: it is touched, and the memory cap evicts everything else
+		// first, least recently touched first.
+		work := st.touchWorkingSet(check.roots, source)
+		p.markTouched(st)
+		stats.WorkingSetPackages = len(work.packages)
+		if compiles {
+			if exportless := st.exportlessWorkingSet(work); len(exportless) > 0 && p.scheduleExportRelist(st, check.roots, exportless) {
+				stats.RelistScheduled++
+			}
+		}
+		eviction := p.enforceTypecheckBudget(st, scope.TypecheckCacheBytes, work)
+		stats.StateEvicted = eviction.self
+		stats.EvictedPackages, stats.EvictedFiles = eviction.packages, eviction.files
 		stats.StatePackages = len(st.view)
 		stats.StateBytes = st.estimatedBytes()
 		return out, nil
@@ -1667,170 +1774,4 @@ func (s *sourceDependencies) rootsOnly(checked []*packages.Package, meta map[str
 		}
 	}
 	return roots
-}
-
-// enforceTypecheckBudget drops retained type state, least recently used
-// checkout first, until the estimate fits the cap. The current checkout's
-// own state goes last, and only when it alone exceeds the cap. The caller
-// holds cur.mu; other checkouts' states are dropped only when their lock is
-// free (a busy one is skipped this time).
-func (p *Provider) enforceTypecheckBudget(cur *checkoutTypecheckState, budget int64) (evictedSelf bool) {
-	if budget <= 0 {
-		budget = defaultTypecheckCacheBytes
-	}
-	p.tcMu.Lock()
-	others := make([]*checkoutTypecheckState, 0, len(p.tcStates))
-	used := map[*checkoutTypecheckState]time.Time{}
-	for _, st := range p.tcStates {
-		if st != cur {
-			others = append(others, st)
-			used[st] = st.lastUsed
-		}
-	}
-	p.tcMu.Unlock()
-	sort.Slice(others, func(i, j int) bool { return used[others[i]].Before(used[others[j]]) })
-	total := cur.estimatedBytes()
-	sizes := make([]int64, len(others))
-	for i, st := range others {
-		if st.mu.TryLock() {
-			sizes[i] = st.estimatedBytes()
-			st.mu.Unlock()
-		}
-		total += sizes[i]
-	}
-	for i, st := range others {
-		if total <= budget {
-			break
-		}
-		if sizes[i] == 0 || !st.mu.TryLock() {
-			continue
-		}
-		st.resetTypes()
-		st.mu.Unlock()
-		total -= sizes[i]
-	}
-	if total > budget {
-		cur.resetTypes()
-		return true
-	}
-	return false
-}
-
-// invalidateTypes drops the retained types of the invalid packages and of
-// every retained package importing one of them, directly or not (over the
-// current metadata and the metadata the merge replaced or dropped), and of
-// any retained package without metadata. Every other package's types,
-// the retained syntax and the FileSet stay. It returns the packages
-// dropped.
-func (st *checkoutTypecheckState) invalidateTypes(invalid map[string]bool, replaced map[string]*packages.Package) int {
-	if len(invalid) == 0 || len(st.view) == 0 {
-		return 0
-	}
-	importers := map[string][]string{}
-	edges := func(pkg *packages.Package) {
-		for _, imp := range pkg.Imports {
-			if imp != nil && imp.PkgPath != "" {
-				importers[imp.PkgPath] = append(importers[imp.PkgPath], pkg.PkgPath)
-			}
-		}
-	}
-	for _, pkg := range st.meta {
-		edges(pkg)
-	}
-	for _, pkg := range replaced {
-		if pkg != nil {
-			edges(pkg)
-		}
-	}
-	drop := make(map[string]bool, len(invalid))
-	queue := make([]string, 0, len(invalid))
-	for path := range invalid {
-		drop[path] = true
-		queue = append(queue, path)
-	}
-	for len(queue) > 0 {
-		path := queue[len(queue)-1]
-		queue = queue[:len(queue)-1]
-		for _, importer := range importers[path] {
-			if !drop[importer] {
-				drop[importer] = true
-				queue = append(queue, importer)
-			}
-		}
-	}
-	for path := range st.view {
-		if st.meta[path] == nil {
-			drop[path] = true
-		}
-	}
-	n := 0
-	for path := range drop {
-		if st.dropViewPackage(path) {
-			n++
-		}
-	}
-	return n
-}
-
-// dropViewPackage forgets one package's retained types.
-func (st *checkoutTypecheckState) dropViewPackage(path string) bool {
-	if st.view[path] == nil {
-		return false
-	}
-	delete(st.view, path)
-	delete(st.viewExport, path)
-	st.exportBytes -= st.viewBytes[path]
-	delete(st.viewBytes, path)
-	return true
-}
-
-// brokenDependencyUnchanged reports whether a mutable package in root's
-// listed closure has no export data and still has exactly the files it had
-// when listed: listing again would not compile it either.
-func (st *checkoutTypecheckState) brokenDependencyUnchanged(root *packages.Package, vc *semantic.CompilerCacheStats) bool {
-	seen := map[string]bool{root.PkgPath: true}
-	var queue []string
-	for path := range root.Imports {
-		queue = append(queue, path)
-	}
-	for len(queue) > 0 {
-		path := queue[len(queue)-1]
-		queue = queue[:len(queue)-1]
-		if seen[path] {
-			continue
-		}
-		seen[path] = true
-		meta := st.meta[path]
-		if meta == nil {
-			continue
-		}
-		if mutablePackage(meta) && meta.ExportFile == "" && meta.Dir != "" &&
-			st.manifests[path].dependencyState(meta.Dir, vc) == dependencyUnchanged {
-			return true
-		}
-		for imp := range meta.Imports {
-			queue = append(queue, imp)
-		}
-	}
-	return false
-}
-
-// covers reports whether every given package is checked from source.
-func (s *sourceDependencies) covers(paths []string) bool {
-	if len(paths) == 0 {
-		return true
-	}
-	if s == nil {
-		return false
-	}
-	in := make(map[string]bool, len(s.pkgs))
-	for _, pkg := range s.pkgs {
-		in[pkg.PkgPath] = true
-	}
-	for _, path := range paths {
-		if !in[path] {
-			return false
-		}
-	}
-	return true
 }
