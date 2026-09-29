@@ -324,8 +324,8 @@ func Sneaked() {
 	if err != nil || !found {
 		t.Fatalf("read generation %d: found=%v err=%v", generationID, found, err)
 	}
-	if row.State != store_sqlite.ViewGenerationSuperseded {
-		t.Fatalf("generation %d is %s, want superseded", generationID, row.State)
+	if row.State != store_sqlite.ViewGenerationFailed {
+		t.Fatalf("generation %d is %s, want failed (a torn build is never servable nor a chain parent)", generationID, row.State)
 	}
 	if row.PublishedAt != 0 {
 		t.Fatalf("generation %d carries a publish timestamp %d", generationID, row.PublishedAt)

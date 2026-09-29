@@ -295,6 +295,9 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 			return b.confirmDirtyBuildInputs(ctx, req.Sampler, req.CheckoutRoot, generationID, before)
 		},
 		inputManifest: manifest,
+		// The sample this build describes answers HEAD and the dirty bit
+		// the pass stamps; asking git again would be a second sample.
+		headProvenance: dirtyHeadProvenance(before),
 	})
 	report.ChainFallbackReason = req.chainFallbackReason
 	report.ChainDepth = 1
@@ -584,6 +587,15 @@ func dirtyLayerChangesContext(ctx context.Context, snap gitstate.DirtySnapshot) 
 		return nil, err
 	}
 	return changes, nil
+}
+
+// dirtyHeadProvenance is the HEAD commit and dirty bit a working-tree sample
+// establishes, nil when HEAD is unborn (the pass then asks git as before).
+func dirtyHeadProvenance(snap gitstate.DirtySnapshot) *repoHeadProvenance {
+	if snap.HeadCommit == "" {
+		return nil
+	}
+	return &repoHeadProvenance{sha: snap.HeadCommit, dirty: len(snap.Entries) > 0}
 }
 
 // dirtyLayerDiskTruth rewrites a present claim into a deletion when the

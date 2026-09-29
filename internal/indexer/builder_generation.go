@@ -219,6 +219,10 @@ type BuildRequest struct {
 	// is sealed with the payload and never outlives a build that did not
 	// publish. Only a working-tree build sets it.
 	inputManifest *generationInputManifest
+	// headProvenance is the HEAD commit and dirty bit the build's sample
+	// already established (a working-tree build); the pass stamps its
+	// provenance from it instead of asking git.
+	headProvenance *repoHeadProvenance
 }
 
 // generationInputManifest is one build's manifest write: its meta row and the
@@ -972,6 +976,7 @@ func (b *SparseGenerationBuilder) runPass(
 ) (contextSeparation, error) {
 	idx := New(handle, b.Registry, b.Config, b.Logger)
 	defer idx.Close()
+	idx.headProvenance = req.headProvenance
 
 	// The read-only-context mode. Installing the filter is what lets a pass
 	// writing through a derived generation handle hold its corpus in memory at

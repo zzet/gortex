@@ -344,6 +344,11 @@ type Indexer struct {
 	// and every later query would call that healthy tier unbuilt.
 	// Set during the shadow swap, cleared when idx.graph is restored.
 	contractStateSink graph.ContractStateStore
+	// headProvenance, when set, is the HEAD commit and dirty bit the caller
+	// already sampled for rootPath (a working-tree generation build knows
+	// both from its snapshot); the provenance stamps use it instead of
+	// shelling out to git (see headAndDirty).
+	headProvenance *repoHeadProvenance
 
 	// passCorpusFilter is the read-only-context mode. When a caller installs
 	// one, the pass corpus it produces is held in memory for the whole
@@ -7188,7 +7193,7 @@ func (idx *Indexer) recordContractStateMarker(count int) {
 	}
 	if err := store.SetContractState(graph.ContractState{
 		RepoPrefix:    idx.repoPrefix,
-		IndexedSHA:    repoHead(idx.rootPath),
+		IndexedSHA:    idx.head(idx.rootPath),
 		CompletedAt:   time.Now().Unix(),
 		ContractCount: count,
 	}); err != nil {
