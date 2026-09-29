@@ -500,7 +500,10 @@ func TestResolveFilesAndIncomingAvoidsPerFilePointQueries(t *testing.T) {
 		t.Fatalf("point reads leaked: node=%d file=%d out=%d in=%d",
 			counting.getNodeCalls, counting.getFileNodesCalls, counting.getOutEdgesCalls, counting.getInEdgesCalls)
 	}
-	if counting.getFileNodesByPathsCalls > 3 || counting.getOutEdgesByNodeIDsCalls > 4 || counting.getInEdgesByNodeIDsCalls > 3 {
+	// The cross-package guard's caller-scoped import closure adds one file
+	// batch per guarded leg (it replaced a scan of every file node and import
+	// edge of the store); the bound is still independent of the file count.
+	if counting.getFileNodesByPathsCalls > 4 || counting.getOutEdgesByNodeIDsCalls > 4 || counting.getInEdgesByNodeIDsCalls > 3 {
 		t.Fatalf("batch reads grew with %d files: file=%d out=%d in=%d", files,
 			counting.getFileNodesByPathsCalls, counting.getOutEdgesByNodeIDsCalls, counting.getInEdgesByNodeIDsCalls)
 	}

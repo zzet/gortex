@@ -624,6 +624,7 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 	// own package-manager workspace member. Same lazy-build rationale.
 	idx.resolver.SetWorkspaceMembership(idx.indexerWorkspaceMembership)
 	idx.resolver.SetGoPackageOwnershipFactory(idx.prepareGoPackageOwnership)
+	idx.resolver.SetEvidenceScoping(cfg.ResolverEvidenceScopeEnabled())
 	return idx
 }
 
@@ -4293,7 +4294,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		reporter.Report("resolving references", 0, 0)
 		// Resolve cross-file references.
 		idx.populateCppIncludeDirs(true)
-		idx.resolver.ResolveAll()
+		resolveStarted := time.Now()
+		resolveStats := idx.resolver.ResolveAll()
+		idx.logResolvePass(resolveStats, time.Since(resolveStarted))
 
 		// Infer structural interface satisfaction + method-level
 		// overrides. Skipped under deferGlobalPasses so a batch caller
@@ -4927,6 +4930,7 @@ func (idx *Indexer) indexFile(
 	var abSnap *affectedBySnapshot
 	var reuseIdx map[reuseKey]*reuseVal
 	var priorUnresolved []*graph.Edge
+	var priorDeclarations resolver.DeclarationSurface
 	var priorVis csharpVisibilityStamp
 	visCaptured := false
 	deferredResolverCatchup := markerBatch != nil && markerBatch.deferResolverCatchup
@@ -4939,6 +4943,8 @@ func (idx *Indexer) indexFile(
 		// (priorUnresolved). Together this makes a save re-resolve only the
 		// references it actually changed instead of the whole file.
 		reuseIdx, priorUnresolved, priorVis = captureIncrementalState(idx.graph, graphPath)
+		// The declaration surface the incoming leg compares against.
+		priorDeclarations = resolver.DeclarationSurfaceOf(idx.graph.GetFileNodes(graphPath))
 		visCaptured = true
 		snapshotDuration = time.Since(snapshotStarted)
 	}
@@ -4981,7 +4987,7 @@ func (idx *Indexer) indexFile(
 	// captured resolutions and the prior-unresolved skip are stale.
 	freshVis := csharpVisibilityStampForNodes(result.Nodes)
 	if visCaptured && priorVis != freshVis {
-		reuseIdx, priorUnresolved = nil, nil
+		reuseIdx, priorUnresolved, priorDeclarations = nil, nil, nil
 	}
 	if reused := applyResolvedOutEdges(idx.graph, result.Edges, reuseIdx, newNodeIDs); reused > 0 {
 		idx.logger.Debug("indexer: reused prior resolutions",
@@ -5050,10 +5056,14 @@ func (idx *Indexer) indexFile(
 		// incoming pass, so a small edit to a reference-heavy file no longer
 		// re-runs the candidate cascade on thousands of stdlib/external calls.
 		idx.resolver.SetIncrementalSkip(priorUnresolved)
+		if priorDeclarations != nil {
+			idx.resolver.SetPriorDeclarations(map[string]resolver.DeclarationSurface{graphPath: priorDeclarations})
+		}
 		resolveStarted := time.Now()
 		idx.resolver.ResolveFileAndIncoming(graphPath)
 		resolveDuration = time.Since(resolveStarted)
 		idx.resolver.SetIncrementalSkip(nil)
+		idx.resolver.SetPriorDeclarations(nil)
 		// A global-using edit changes every dependent file's visibility
 		// without touching the files themselves — nothing above re-resolves
 		// them.

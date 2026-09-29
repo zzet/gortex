@@ -106,17 +106,21 @@ func (r *Resolver) bindDataflowCalleeRefsForFile(filePath string) {
 			indexName(idx.byFile, n.FilePath, n.Name, n.ID)
 		}
 	}
+	fileEdges := r.fileOutEdges(filePath)
 	// Same-package functions: r.dirIndex[dir] carries one KindFile node per
 	// file in the directory, so each package file is visited exactly once.
+	// Only a bare-name dataflow edge the file itself cannot bind consults
+	// them, so a file without one never reads its package's nodes.
 	dir := filePathDir(filePath)
-	for _, fileNode := range r.dirIndex[dir] {
-		for _, n := range r.incrementalFileNodes(fileNode.FilePath) {
-			if n != nil && n.Kind == graph.KindFunction && n.Name != "" && n.FilePath != "" {
-				indexName(idx.byDir, dir, n.Name, n.ID)
+	if dataflowEdgesNeedPackageCallees(fileEdges, idx) {
+		for _, fileNode := range r.dirIndex[dir] {
+			for _, n := range r.incrementalFileNodes(fileNode.FilePath) {
+				if n != nil && n.Kind == graph.KindFunction && n.Name != "" && n.FilePath != "" {
+					indexName(idx.byDir, dir, n.Name, n.ID)
+				}
 			}
 		}
 	}
-	fileEdges := r.fileOutEdges(filePath)
 	for _, e := range fileEdges {
 		if e != nil && (e.Kind == graph.EdgeCalls || e.Kind == graph.EdgeReferences) {
 			idx.indexCallSite(e)
@@ -242,4 +246,23 @@ func uniqueSiteCallee(callees []string, method string) string {
 		}
 	}
 	return chosen
+}
+
+// dataflowEdgesNeedPackageCallees reports whether bindDataflowCalleeEdge would
+// consult the same-package index for any of edges: an arg_of / value_flow edge
+// whose target is a bare unresolved name with no same-file candidate.
+func dataflowEdgesNeedPackageCallees(edges []*graph.Edge, idx *calleeIndex) bool {
+	for _, e := range edges {
+		if e == nil || (e.Kind != graph.EdgeArgOf && e.Kind != graph.EdgeValueFlow) || !dataflowCalleeTargetShape(e.To) {
+			continue
+		}
+		name := graph.UnresolvedName(e.To)
+		if strings.HasPrefix(name, "*.") {
+			continue
+		}
+		if len(idx.byFile[e.FilePath][name]) == 0 {
+			return true
+		}
+	}
+	return false
 }

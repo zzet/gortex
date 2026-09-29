@@ -200,7 +200,7 @@ func (idx *Indexer) runIncrementalResolutionCatchup(
 		return nil
 	}
 	idx.observeIncrementalCatchup("resolve", files)
-	resolveFiles(files)
+	idx.resolveWithDeferredEvidence(batch, func() { resolveFiles(files) })
 
 	idx.observeIncrementalCatchup("dataflow", files)
 	idx.materializeDataflowParamsForFiles(files)
@@ -464,7 +464,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 				idx.incrementalResolveFilesHook(frontier)
 				return
 			}
-			mi.runMasterResolveFiles(frontier, false)
+			mi.runMasterResolveFilesWithEvidence(frontier, false, idx.resolver)
 		})
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, resolvedFiles...)
 		if receipt != nil && receipt.Complete {

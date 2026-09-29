@@ -1,6 +1,8 @@
 package resolver
 
 import (
+	"sort"
+
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -29,15 +31,28 @@ func (r *Resolver) prepareIncrementalAttributionCache(frontier incrementalFileFr
 			}
 		}
 	}
-	missing := make([]string, 0, len(missingSet))
-	for path := range missingSet {
+	// The same-package files are read only if a pass asks for one of them
+	// (the dataflow callee pass, and only when an edge needs a same-package
+	// candidate); the first such read loads them all in one batch. A large
+	// package's nodes are otherwise read on every save for nothing.
+	r.incrementalSiblingPaths = missingSet
+}
+
+// loadIncrementalSiblings batch-loads every pending same-package file of the
+// frontier into the attribution cache.
+func (r *Resolver) loadIncrementalSiblings() {
+	if len(r.incrementalSiblingPaths) == 0 {
+		return
+	}
+	missing := make([]string, 0, len(r.incrementalSiblingPaths))
+	for path := range r.incrementalSiblingPaths {
 		missing = append(missing, path)
 	}
-	if len(missing) > 0 {
-		fetched := r.graph.GetFileNodesByPaths(missing)
-		for _, path := range missing {
-			r.incrementalNodesByFile[path] = fetched[path]
-		}
+	sort.Strings(missing)
+	r.incrementalSiblingPaths = nil
+	fetched := r.graph.GetFileNodesByPaths(missing)
+	for _, path := range missing {
+		r.incrementalNodesByFile[path] = fetched[path]
 	}
 }
 
@@ -106,6 +121,7 @@ func (r *Resolver) clearIncrementalAttributionCache() {
 	r.flushIncrementalAttributionReindexes()
 	r.incrementalNodesByFile = nil
 	r.incrementalOutByNode = nil
+	r.incrementalSiblingPaths = nil
 }
 
 func (r *Resolver) persistAttributionReindexes(batch []graph.EdgeReindex) {
@@ -144,6 +160,9 @@ func (r *Resolver) persistAttributionReindexes(batch []graph.EdgeReindex) {
 
 func (r *Resolver) incrementalFileNodes(filePath string) []*graph.Node {
 	if r.incrementalNodesByFile != nil {
+		if _, pending := r.incrementalSiblingPaths[filePath]; pending {
+			r.loadIncrementalSiblings()
+		}
 		if nodes, cached := r.incrementalNodesByFile[filePath]; cached {
 			return nodes
 		}

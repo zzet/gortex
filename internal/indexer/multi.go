@@ -1021,19 +1021,7 @@ func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope
 }
 
 func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
-	master := mi.newMasterResolver(useLSP)
-	if master == nil {
-		return
-	}
-	mt := time.Now()
-	stats := master.ResolveFilesAndIncoming(files)
-	mi.logger.Info("DEFERRED-TIMING master.ResolveFilesAndIncoming",
-		zap.Duration("elapsed", time.Since(mt)),
-		zap.Bool("lsp_enabled", useLSP && mi.resolverLSPHelper != nil),
-		zap.Int("files", len(files)),
-		zap.Int("pending_scanned", stats.PendingBefore),
-		zap.Int("pending_admitted", stats.PendingAfter))
-	mi.reconcileRetargetedTestCalls(master.TakeRetargetedTestCallFiles())
+	mi.runMasterResolveFilesWithEvidence(files, useLSP, nil)
 }
 
 // reconcileRetargetedTestCalls re-runs the scoped test projection over the
@@ -4571,4 +4559,25 @@ func (mi *MultiIndexer) applyRemoteStitch(cr *resolver.CrossRepoResolver) {
 // Search returns the shared search backend.
 func (mi *MultiIndexer) Search() search.Backend {
 	return mi.search
+}
+
+// runMasterResolveFilesWithEvidence is runMasterResolveFiles for a repository
+// mutation's catch-up: evidence, when non-nil, is the repository's resolver
+// holding the mutation's pre-eviction evidence (resolveWithDeferredEvidence),
+// which the master resolver inherits for this one resolve.
+func (mi *MultiIndexer) runMasterResolveFilesWithEvidence(files []string, useLSP bool, evidence *resolver.Resolver) {
+	master := mi.newMasterResolver(useLSP)
+	if master == nil {
+		return
+	}
+	master.InheritIncrementalEvidence(evidence)
+	mt := time.Now()
+	stats := master.ResolveFilesAndIncoming(files)
+	mi.logger.Info("DEFERRED-TIMING master.ResolveFilesAndIncoming",
+		zap.Duration("elapsed", time.Since(mt)),
+		zap.Bool("lsp_enabled", useLSP && mi.resolverLSPHelper != nil),
+		zap.Int("files", len(files)),
+		zap.Int("pending_scanned", stats.PendingBefore),
+		zap.Int("pending_admitted", stats.PendingAfter))
+	mi.reconcileRetargetedTestCalls(master.TakeRetargetedTestCallFiles())
 }

@@ -536,6 +536,18 @@ type Resolver struct {
 	// single-file index path. nil on every batch/whole-graph pass.
 	incrementalSkip map[string]struct{}
 
+	// priorDeclarations holds the changed files' declaration surfaces as they
+	// were immediately before the mutation an incremental resolve catches up,
+	// and incomingCarried the stub keys whose declarations that mutation left
+	// unchanged (see incoming_declaration_scope.go). Both are set and cleared
+	// around one incremental file resolve; nil on every other pass.
+	priorDeclarations map[string]DeclarationSurface
+	incomingCarried   *incomingCarry
+	// evidenceScopingOff is the configuration turning evidence scoping off
+	// (SetEvidenceScoping(false)); the zero value is on. EvidenceScopeEnv
+	// overrides it.
+	evidenceScopingOff bool
+
 	// incrementalNodesByFile / incrementalOutByNode are the bounded file and
 	// adjacency frontier preloaded by ResolveFilesAndIncoming. The attribution
 	// tail reuses them across its six passes so a package-sized partial resolve
@@ -543,6 +555,10 @@ type Resolver struct {
 	incrementalNodesByFile        map[string][]*graph.Node
 	incrementalOutByNode          map[string][]*graph.Edge
 	incrementalAttributionReindex []graph.EdgeReindex
+	// incrementalSiblingPaths are the frontier's same-package files whose
+	// nodes are not loaded yet: the first attribution read of any of them
+	// batch-loads them all (incrementalFileNodes).
+	incrementalSiblingPaths map[string]struct{}
 
 	// lspHelper, when non-nil, is consulted before falling back to
 	// AST heuristics for cross-file dispatch in languages whose
@@ -994,6 +1010,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	guardRepos := make(map[string]struct{})
 	total := &ResolveStats{}
 	resolveError := func(err error) (*ResolveStats, error) {
+		// Moves the pass deferred belong to references it already bound; an
+		// interrupted pass must not strand them (no later pass re-derives a
+		// repoint once its reference is resolved).
+		r.placeholderSrcIdx.applyDeferred(r.graph)
 		total.PendingBefore = pendingBefore
 		total.PendingAfter = pendingAfter
 		return total, err
@@ -1222,7 +1242,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				r.graph.ReindexEdges(reindexBatch)
 				applyStoreElapsed += time.Since(storeStart)
 				placeholderStart := time.Now()
-				reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
+				// Moves wait for the last page (placeholderSourceIndex.deferRepoints):
+				// applying them per page made the result depend on the paging.
+				r.placeholderSrcIdx.deferRepoints(r.graph, reindexBatch)
 				applyPlaceholderElapsed += time.Since(placeholderStart)
 				for _, ri := range reindexBatch {
 					r.noteRetargetedCall(ri.Edge)
@@ -1316,6 +1338,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			return resolveError(err)
 		}
 	}
+	placeholderFlushStart := time.Now()
+	r.placeholderSrcIdx.applyDeferred(r.graph)
+	applyPlaceholderElapsed += time.Since(placeholderFlushStart)
 	stopProgress()
 	loopElapsed := time.Since(passStart) - warmElapsed
 	if err := ctx.Err(); err != nil {
@@ -2106,6 +2131,13 @@ func (r *Resolver) buildDirIndexes() {
 			r.lastDirIndex[last] = append(r.lastDirIndex[last], file)
 		}
 	}
+	// Path order, not store order (sortFileIdentities).
+	for _, files := range r.dirIndex {
+		sortFileIdentities(files)
+	}
+	for _, files := range r.lastDirIndex {
+		sortFileIdentities(files)
+	}
 }
 
 func (r *Resolver) clearDirIndexes() {
@@ -2605,6 +2637,8 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	// for the whole duration.
 	pendingStarted := time.Now()
 	frontier := r.collectIncrementalFileFrontier([]string{filePath})
+	r.incomingCarried = frontier.carry
+	defer func() { r.incomingCarried = nil }()
 	pending := frontier.pending
 	pendingDuration := time.Since(pendingStarted)
 	stats := &ResolveStats{}
@@ -2657,6 +2691,8 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 		r.logger.Info("resolver: incremental file phases",
 			zap.String("file", filePath),
 			zap.Int("pending", len(pending)),
+			zap.Int("carried_keys", frontier.carriedKeys()),
+			zap.Int("carried_skipped", frontier.carriedSkipped),
 			zap.Duration("pending_collect", pendingDuration),
 			zap.Duration("build_indexes", indexDuration),
 			zap.Duration("warm_lookup", warmDuration),
@@ -2697,6 +2733,13 @@ type incrementalFileFrontier struct {
 	// refused frontier as an exhaustive one.
 	incomingAdmission graph.IncomingSourceAdmission
 	incomingRefusal   error
+	// carry is the set of stub keys the mutation provably left unchanged
+	// (nil without prior declaration evidence); carriedSkipped counts the
+	// parked references on those keys the incoming leg did not admit and
+	// carriedAdmitted the restubbed ones it still admitted there.
+	carry           *incomingCarry
+	carriedSkipped  int
+	carriedAdmitted int
 }
 
 // collectIncrementalFileFrontier performs the complete read side of a
@@ -2709,7 +2752,7 @@ type incrementalFileFrontier struct {
 // written back) without multiplying the pass's statements. See
 // TestIncrementalFrontierKeepsOneIncomingReadPastTheScopedKeyCap.
 func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementalFileFrontier {
-	return collectIncrementalFileFrontierForPreparation(r.graph, filePaths, r.incrementalSkipped)
+	return collectIncrementalFileFrontierCarry(r.graph, filePaths, r.incrementalSkipped, true, r.incomingCarryFor)
 }
 
 func collectIncrementalFileFrontier(
@@ -2720,19 +2763,27 @@ func collectIncrementalFileFrontier(
 	return collectIncrementalFileFrontierMode(g, filePaths, skip, false)
 }
 
-func collectIncrementalFileFrontierForPreparation(
-	g graph.Store,
-	filePaths []string,
-	skip func(*graph.Edge) bool,
-) incrementalFileFrontier {
-	return collectIncrementalFileFrontierMode(g, filePaths, skip, true)
-}
-
 func collectIncrementalFileFrontierMode(
 	g graph.Store,
 	filePaths []string,
 	skip func(*graph.Edge) bool,
 	lightweightIncoming bool,
+) incrementalFileFrontier {
+	return collectIncrementalFileFrontierCarry(g, filePaths, skip, lightweightIncoming, nil)
+}
+
+// collectIncrementalFileFrontierCarry is collectIncrementalFileFrontierMode
+// with the incoming leg scoped by declaration evidence: carryFor, when
+// non-nil, names the stub keys whose declarations the mutation left unchanged,
+// and on those keys only restubbed references are admitted. The incoming read
+// is the same single bounded call over the same keys either way — only the
+// admitted subset differs — so the ceiling and its refusal are unchanged.
+func collectIncrementalFileFrontierCarry(
+	g graph.Store,
+	filePaths []string,
+	skip func(*graph.Edge) bool,
+	lightweightIncoming bool,
+	carryFor func([]string, map[string][]*graph.Node) *incomingCarry,
 ) incrementalFileFrontier {
 	var frontier incrementalFileFrontier
 	if g == nil {
@@ -2801,6 +2852,9 @@ func collectIncrementalFileFrontierMode(
 	}
 	frontier.outgoingPending = len(frontier.pending)
 	frontier.outgoingCollect = time.Since(outgoingStarted)
+	if carryFor != nil {
+		frontier.carry = carryFor(frontier.paths, frontier.nodesByFile)
+	}
 	incomingStarted := time.Now()
 	// The unresolved target string is the incoming-edge bucket key even when
 	// no node with that ID exists.
@@ -2814,7 +2868,30 @@ func collectIncrementalFileFrontierMode(
 	// rides the frontier as a completeness fact instead of being a silent
 	// truncation. It neither widens nor splits the read: the same keys in the
 	// same single batched call, the same rows.
-	if lightweightIncoming {
+	if frontier.carry != nil {
+		// A carried key admits only restubbed references, and the restub
+		// mark rides the edge Meta, which the identity projection omits:
+		// read the full rows. Same keys, same single bounded call, same rows.
+		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
+			context.Background(), g.GetInEdgesByNodeIDs, frontier.stubKeys, nil)
+		frontier.incomingAdmission, frontier.incomingRefusal = fact, err
+		for _, key := range frontier.stubKeys {
+			carried := frontier.carry.carried(key)
+			for _, edge := range inByStub[key] {
+				if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
+					continue
+				}
+				if !frontier.carry.admits(key, edge) {
+					frontier.carriedSkipped++
+					continue
+				}
+				if carried {
+					frontier.carriedAdmitted++
+				}
+				frontier.pending = append(frontier.pending, edge)
+			}
+		}
+	} else if lightweightIncoming {
 		inByStub, fact, err := graph.AdmitIncomingRowsBounded(
 			context.Background(),
 			func(keys []string) map[string][]graph.EdgeIdentity {
@@ -2884,6 +2961,9 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 			zap.Int("pending", len(frontier.pending)),
 			zap.Int("outgoing_pending", frontier.outgoingPending),
 			zap.Int("incoming_pending", len(frontier.pending)-frontier.outgoingPending),
+			zap.Int("carried_keys", frontier.carriedKeys()),
+			zap.Int("carried_skipped", frontier.carriedSkipped),
+			zap.Int("carried_admitted", frontier.carriedAdmitted),
 			zap.Duration("wait_lock", lockDuration),
 			zap.Duration("visibility", visibilityDuration),
 			zap.Duration("pending_collect", pendingDuration),
@@ -2909,11 +2989,16 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 
 	finish = startIncrementalPhase(logger, "pending_collect")
 	frontier = r.collectIncrementalFileFrontier(filePaths)
+	r.incomingCarried = frontier.carry
+	defer func() { r.incomingCarried = nil }()
 	pendingDuration = finish(
 		zap.Int("files", len(frontier.paths)),
 		zap.Int("outgoing_pending", frontier.outgoingPending),
 		zap.Int("incoming_pending", len(frontier.pending)-frontier.outgoingPending),
 		zap.Int("stub_keys", len(frontier.stubKeys)),
+		zap.Int("carried_keys", frontier.carriedKeys()),
+		zap.Int("carried_skipped", frontier.carriedSkipped),
+		zap.Int("carried_admitted", frontier.carriedAdmitted),
 		zap.Duration("outgoing_collect", frontier.outgoingCollect),
 		zap.Duration("incoming_collect", frontier.incomingCollect))
 	// The preparation leg's bound is a fact about this batch, not a log line:
@@ -3157,7 +3242,15 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	if len(jobs) == 0 {
 		return
 	}
-	if closure := r.buildImportClosure(); len(closure) > 0 {
+	// The guard reads the closure only for these jobs' caller files; build
+	// just their entries (identical to the whole-graph build's).
+	callerFiles := make([]string, 0, len(jobs))
+	for i := range jobs {
+		if file := r.edgeCallerFile(jobs[i].edge); file != "" {
+			callerFiles = append(callerFiles, file)
+		}
+	}
+	if closure := r.buildImportClosureForCallerFiles(callerFiles); len(closure) > 0 {
 		if guarded := r.guardCrossPackageCallEdges(jobs, closure); guarded > 0 {
 			if stats.Resolved >= guarded {
 				stats.Resolved -= guarded
@@ -3440,6 +3533,9 @@ func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub ma
 	if len(stubKeys) == 0 {
 		return
 	}
+	// A carried key's parked references were last attempted against the same
+	// candidates; only the restubbed ones are re-attempted (and prepared).
+	inByStub = r.incomingCarried.filter(stubKeys, inByStub)
 	if pending, err := r.prepareGoPackageIncomingFrontier(stubKeys, inByStub); err != nil {
 		stats.Unresolved += pending
 		r.logger.Warn("resolver: Go package preparation failed", zap.Error(err))

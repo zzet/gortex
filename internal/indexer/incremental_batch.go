@@ -843,10 +843,14 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	if !deferResolverCatchup {
 		idx.observeIncrementalCatchup("resolve", paths)
 		idx.resolver.SetIncrementalSkip(priorPending)
+		idx.resolver.SetPriorDeclarations(stagePriorDeclarations(stages))
 		idx.resolver.ResolveFilesAndIncoming(paths)
 		idx.resolver.SetIncrementalSkip(nil)
+		idx.resolver.SetPriorDeclarations(nil)
 		idx.observeIncrementalCatchup("dataflow", paths)
 		idx.materializeDataflowParamsForStages(stages)
+	} else if markerBatch != nil {
+		markerBatch.recordDeferredResolverEvidence(idx.resolver.EvidenceScoping(), stagePriorDeclarations(stages), priorPending)
 	}
 
 	// A global-using edit changes every dependent file's visibility

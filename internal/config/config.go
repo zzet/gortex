@@ -638,6 +638,16 @@ type ReviewRule struct {
 // configurable is the budget of that retained state and the resolver's
 // evidence scoping.
 type DirtyChainConfig struct {
+	// ResolverEvidenceScope lets an incremental resolve of an edited file
+	// skip re-attempting parked references whose candidate declarations the
+	// edit left unchanged (the incoming leg's declaration carry, and the
+	// deferred catch-up's prior-unresolved skip). It is not row-identical to
+	// the exhaustive legs, but measured against a clean index of the edited
+	// tree it differs only where the exhaustive legs differ too (they re-stamp
+	// and re-bind edges a whole index leaves alone). On when unset; false
+	// turns it off. GORTEX_RESOLVER_EVIDENCE_SCOPE=on|off overrides it.
+	ResolverEvidenceScope *bool `mapstructure:"resolver_evidence_scope" yaml:"resolver_evidence_scope,omitempty"`
+
 	// SemanticTypecheckCacheMB caps retained compiler state in MiB; zero uses the provider default.
 	SemanticTypecheckCacheMB int `mapstructure:"semantic_typecheck_cache_mb" yaml:"semantic_typecheck_cache_mb,omitempty"`
 }
@@ -1966,6 +1976,15 @@ func (c *Config) validateWorkspaceSchema() error {
 		return nil
 	}
 	return fmt.Errorf("%s", strings.Join(errs, "; "))
+}
+
+// ResolverEvidenceScopeEnabled reports
+// index.dirty_chain.resolver_evidence_scope; unset is true.
+func (c IndexConfig) ResolverEvidenceScopeEnabled() bool {
+	if c.DirtyChain == nil || c.DirtyChain.ResolverEvidenceScope == nil {
+		return true
+	}
+	return *c.DirtyChain.ResolverEvidenceScope
 }
 
 // SemanticTypecheckCacheBytes reports index.dirty_chain.semantic_typecheck_cache_mb

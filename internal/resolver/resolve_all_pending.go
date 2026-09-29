@@ -22,6 +22,10 @@ type resolveAllPassIndexes struct {
 	dirRepos     map[string]struct{}
 	depRepos     map[string]struct{}
 	provideRepos map[string]struct{}
+	// providesByRepo buckets, per pass, every EdgeProvides row of the store
+	// by its source node's repository (see ensureProvides); nil until the
+	// first partial ensureProvides reads it.
+	providesByRepo map[string][]*graph.Edge
 
 	// reachabilityFiles retains only stable direct-import directory sets for
 	// caller files already seen in this pass. Page-local active maps remain on
@@ -86,11 +90,33 @@ func pendingRepoPrefixes(r *Resolver, pending []*graph.Edge) ([]string, map[stri
 	// name ("internal/foo.go::Bar" → "internal"). Feeding that into the
 	// dep / provides / dir indexes below keys them on something nothing
 	// matches, and they come back empty with no error anywhere.
-	known := make(map[string]struct{})
-	if lister, ok := r.graph.(interface{ RepoPrefixes() []string }); ok {
-		for _, p := range lister.RepoPrefixes() {
-			known[p] = struct{}{}
+	//
+	// The listing is a DISTINCT over every node of the generation, so it is
+	// read only when some source could not be hydrated: a page whose sources
+	// all carry their repository never consults it, and an interactive edit
+	// must not pay a whole-store scan to validate guesses it never makes.
+	//
+	// A prefix some hydrated source of this page carries is known without the
+	// listing: that node is in the store under it, so the listing would name
+	// it. Only a guess no hydrated source confirms pays for the listing.
+	confirmed := make(map[string]struct{})
+	for _, source := range sources {
+		if source != nil && source.RepoPrefix != "" {
+			confirmed[source.RepoPrefix] = struct{}{}
 		}
+	}
+	var known map[string]struct{}
+	knownPrefixes := func() map[string]struct{} {
+		if known != nil {
+			return known
+		}
+		known = make(map[string]struct{})
+		if lister, ok := r.graph.(interface{ RepoPrefixes() []string }); ok {
+			for _, p := range lister.RepoPrefixes() {
+				known[p] = struct{}{}
+			}
+		}
+		return known
 	}
 
 	set := make(map[string]struct{})
@@ -103,7 +129,9 @@ func pendingRepoPrefixes(r *Resolver, pending []*graph.Edge) ([]string, map[stri
 		if source := sources[edge.From]; source != nil && source.RepoPrefix != "" {
 			// Confirmed by the hydrated node — authoritative.
 			prefix = source.RepoPrefix
-		} else if prefix != "" && len(known) > 0 {
+		} else if _, ok := confirmed[prefix]; ok {
+			// Confirmed by another hydrated source of the page.
+		} else if prefix != "" && len(knownPrefixes()) > 0 {
 			if _, ok := known[prefix]; !ok {
 				// A guess that names no tracked repo. Drop it rather
 				// than scope the pass to a key nothing can match.
@@ -255,6 +283,7 @@ func (p *resolveAllPassIndexes) resetAfterInterleave() {
 	p.dirRepos = make(map[string]struct{})
 	p.depRepos = make(map[string]struct{})
 	p.provideRepos = make(map[string]struct{})
+	p.providesByRepo = nil
 	p.reachabilityFiles = make(map[string]map[string]struct{})
 	p.importAdjacency = make(map[string][]string)
 }
@@ -344,14 +373,39 @@ func (p *resolveAllPassIndexes) ensureDir(prefixes []string) {
 		p.resolver.dirIndex = make(map[string][]graph.FileNodeIdentity, 128)
 		p.resolver.lastDirIndex = make(map[string][]graph.FileNodeIdentity, 128)
 	}
+	touchedDirs := make(map[string]struct{})
+	touchedLast := make(map[string]struct{})
 	for file := range graph.FileNodeIdentitiesSeq(p.resolver.graph, missing) {
 		dir := filePathDir(file.FilePath)
 		p.resolver.dirIndex[dir] = append(p.resolver.dirIndex[dir], file)
+		touchedDirs[dir] = struct{}{}
 		last := lastPathComponent(dir)
 		if last != "" && last != dir {
 			p.resolver.lastDirIndex[last] = append(p.resolver.lastDirIndex[last], file)
+			touchedLast[last] = struct{}{}
 		}
 	}
+	for dir := range touchedDirs {
+		sortFileIdentities(p.resolver.dirIndex[dir])
+	}
+	for last := range touchedLast {
+		sortFileIdentities(p.resolver.lastDirIndex[last])
+	}
+}
+
+// sortFileIdentities orders a directory bucket by path, then ID. Import
+// resolution takes the first eligible file of a bucket as the import's
+// representative target; in store order that choice followed whatever plan
+// SQLite picked for the listing (planner statistics change during a pass), so
+// the same import bound to different files of one package from one index to
+// the next.
+func sortFileIdentities(files []graph.FileNodeIdentity) {
+	sort.SliceStable(files, func(i, j int) bool {
+		if files[i].FilePath != files[j].FilePath {
+			return files[i].FilePath < files[j].FilePath
+		}
+		return files[i].ID < files[j].ID
+	})
 }
 
 func (p *resolveAllPassIndexes) ensureDep(prefixes []string) {
@@ -407,27 +461,75 @@ func (p *resolveAllPassIndexes) ensureProvides(prefixes []string) {
 	if p.resolver.providesForIdx == nil {
 		p.resolver.providesForIdx = make(map[string]map[string]struct{})
 	}
-	for row := range graph.EdgesInScopeSeq(p.resolver.graph, missing, nil, graph.EdgeProvides) {
-		edge := row.Edge
-		if edge == nil || edge.Meta == nil {
-			continue
+	// The rows a repository-scoped read would return — every provides edge
+	// whose source node belongs to one of the missing repositories — come
+	// from one kind-indexed read per pass, bucketed by source repository. A
+	// repository-scoped edge read has no repository+kind access path and
+	// walks every edge of the repositories by id (up to seconds per save on
+	// a large repository); provides edges are few (DI module declarations).
+	byRepo := p.providesRowsByRepo()
+	for _, prefix := range missing {
+		for _, edge := range byRepo[prefix] {
+			p.resolver.indexProvidesEdge(edge)
 		}
-		providesFor, _ := edge.Meta[graph.MetaDIProvidesFor].(string)
-		binding, _ := edge.Meta[graph.MetaDIBinding].(string)
-		if providesFor == "" || binding != graph.DIBindingUseClass {
-			continue
-		}
-		name := edge.To
-		if graph.IsUnresolvedTarget(name) {
-			name = graph.UnresolvedName(name)
-		} else if cut := strings.LastIndex(name, "::"); cut >= 0 {
-			name = name[cut+2:]
-		}
-		if p.resolver.providesForIdx[providesFor] == nil {
-			p.resolver.providesForIdx[providesFor] = make(map[string]struct{})
-		}
-		p.resolver.providesForIdx[providesFor][name] = struct{}{}
 	}
+}
+
+// providesRowsByRepo reads the store's EdgeProvides rows once per pass and
+// buckets them by the repository of their source node. A row whose source
+// node is missing belongs to no repository, as in the scoped read's join.
+func (p *resolveAllPassIndexes) providesRowsByRepo() map[string][]*graph.Edge {
+	if p.providesByRepo != nil {
+		return p.providesByRepo
+	}
+	var rows []*graph.Edge
+	sources := make(map[string]struct{})
+	for edge := range p.resolver.graph.EdgesByKind(graph.EdgeProvides) {
+		if edge == nil {
+			continue
+		}
+		rows = append(rows, edge)
+		sources[edge.From] = struct{}{}
+	}
+	ids := make([]string, 0, len(sources))
+	for id := range sources {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	placements := graph.NodePlacementsByIDs(p.resolver.graph, ids)
+	p.providesByRepo = make(map[string][]*graph.Edge)
+	for _, edge := range rows {
+		placement, ok := placements[edge.From]
+		if !ok || placement.RepoPrefix == "" {
+			continue
+		}
+		p.providesByRepo[placement.RepoPrefix] = append(p.providesByRepo[placement.RepoPrefix], edge)
+	}
+	return p.providesByRepo
+}
+
+// indexProvidesEdge records one `provides_for: X, useClass: Y` binding in
+// providesForIdx (the per-row body of buildProvidesForIndex). The caller has
+// allocated providesForIdx.
+func (r *Resolver) indexProvidesEdge(edge *graph.Edge) {
+	if edge == nil || edge.Meta == nil {
+		return
+	}
+	providesFor, _ := edge.Meta[graph.MetaDIProvidesFor].(string)
+	binding, _ := edge.Meta[graph.MetaDIBinding].(string)
+	if providesFor == "" || binding != graph.DIBindingUseClass {
+		return
+	}
+	name := edge.To
+	if graph.IsUnresolvedTarget(name) {
+		name = graph.UnresolvedName(name)
+	} else if cut := strings.LastIndex(name, "::"); cut >= 0 {
+		name = name[cut+2:]
+	}
+	if r.providesForIdx[providesFor] == nil {
+		r.providesForIdx[providesFor] = make(map[string]struct{})
+	}
+	r.providesForIdx[providesFor][name] = struct{}{}
 }
 
 // scopedBackendResolver is an optional backend capability. A scoped

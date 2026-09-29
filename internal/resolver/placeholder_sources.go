@@ -15,6 +15,14 @@ import (
 type placeholderSourceIndex struct {
 	built  bool
 	bySite map[placeholderSourceSite][]graph.EdgeIdentity
+
+	// deferred holds, for a ResolveAll pass, the repoints of every page whose
+	// site the census knows; they are applied once, after the last page
+	// (applyDeferred). retargeted maps the census identity of a
+	// placeholder-sourced dataflow edge the pass itself re-targeted to its
+	// current identity, so the deferred move finds it.
+	deferred   []graph.PlaceholderRepoint
+	retargeted map[graph.EdgeIdentity]graph.EdgeIdentity
 }
 
 type placeholderSourceSite struct {
@@ -87,6 +95,103 @@ func (idx *placeholderSourceIndex) take(repoints []graph.PlaceholderRepoint) []p
 		}
 	}
 	return moves
+}
+
+// defer records one page's repoints for the end of a ResolveAll pass instead
+// of applying them now.
+//
+// Applying them per page made the pass's result depend on how it was paged: a
+// dataflow edge sourced from a placeholder whose reference resolved in an
+// earlier page was moved to the resolved source before its own page ran, and
+// its page then either resolved its callee against the moved source or (a
+// spooled page rehydrated by the old site) dropped it, while in one page the
+// same edge kept its source and bound its callee. Deferring every move to the
+// end gives each edge exactly one resolution attempt against the source it had
+// when the pass began, then the move — the single-page outcome, whatever the
+// page size. Only repoints whose site holds a placeholder-sourced dataflow edge
+// are kept, so the deferred set is bounded by the census, not by the pass.
+func (idx *placeholderSourceIndex) deferRepoints(g graph.Store, reindexes []graph.EdgeReindex) {
+	if len(reindexes) == 0 || os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") == "0" {
+		return
+	}
+	idx.ensure(g)
+	for _, ri := range reindexes {
+		e := ri.Edge
+		if e == nil || !graph.PlaceholderSourceKind(e.Kind) || !strings.Contains(e.From, graph.UnresolvedMarker) {
+			continue
+		}
+		// A census edge the pass re-targeted: remember where it went.
+		oldKind := ri.OldKind
+		if oldKind == "" {
+			oldKind = e.Kind
+		}
+		from := ri.OldFrom
+		if from == "" {
+			from = e.From
+		}
+		filePath, line := ri.OldFilePath, ri.OldLine
+		if filePath == "" {
+			filePath = e.FilePath
+		}
+		if line == 0 {
+			line = e.Line
+		}
+		before := graph.EdgeIdentity{From: from, To: ri.OldTo, Kind: oldKind, FilePath: filePath, Line: line}
+		if before.To == "" {
+			continue
+		}
+		after := graph.EdgeIdentityFor(e)
+		if before == after {
+			continue
+		}
+		if idx.retargeted == nil {
+			idx.retargeted = make(map[graph.EdgeIdentity]graph.EdgeIdentity)
+		}
+		idx.retargeted[before] = after
+	}
+	for _, rp := range graph.PlaceholderSourceRepoints(reindexes) {
+		site := placeholderSourceSite{from: rp.OldFrom, filePath: rp.FilePath, line: rp.Line}
+		if len(idx.bySite[site]) != 0 {
+			idx.deferred = append(idx.deferred, rp)
+		}
+	}
+}
+
+// currentIdentity follows the pass's re-targets of a census identity (an edge
+// re-targeted twice resolves to its latest form).
+func (idx *placeholderSourceIndex) currentIdentity(identity graph.EdgeIdentity) graph.EdgeIdentity {
+	for hops := 0; hops <= len(idx.retargeted); hops++ {
+		next, moved := idx.retargeted[identity]
+		if !moved || next == identity {
+			break
+		}
+		identity = next
+	}
+	return identity
+}
+
+// applyDeferred applies the repoints deferRepoints recorded, in page order
+// (first repoint of a site wins, as before), and forgets them.
+func (idx *placeholderSourceIndex) applyDeferred(g graph.Store) int {
+	repoints := idx.deferred
+	idx.deferred = nil
+	if len(repoints) == 0 {
+		idx.retargeted = nil
+		return 0
+	}
+	defer func() { idx.retargeted = nil }()
+	if finder, ok := g.(graph.EdgeIdentityBatchFinder); ok {
+		moves := idx.take(repoints)
+		for i := range moves {
+			moves[i].identity = idx.currentIdentity(moves[i].identity)
+		}
+		return reconcileIndexedPlaceholderSources(g, finder, moves)
+	}
+	repoints = idx.filter(repoints)
+	if len(repoints) == 0 {
+		return 0
+	}
+	return graph.ReconcilePlaceholderSources(g, repoints)
 }
 
 // reconcileIndexedPlaceholderSources exact-refetches only claimed identities
