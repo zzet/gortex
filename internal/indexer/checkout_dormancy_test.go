@@ -226,13 +226,14 @@ func TestDormancyRuntimeDiscovery(t *testing.T) {
 	})
 }
 
-// TestDormancyAdmitsRoutedAndConvergingButNotStartupAutomatic pins the
-// admission predicate itself: a routed checkout resumes across a restart, a
-// checkout a track or promote is converging keeps building, and a freshly
-// minted worktree after the inventory is a runtime addition — while a plain
-// automatic checkout re-seen on a later pass stays dormant. The primary is a
-// dedicated checkout the gate never reaches, so it is never dormant.
-func TestDormancyAdmitsRoutedAndConvergingButNotStartupAutomatic(t *testing.T) {
+// TestDormancyAdmitsConvergingButNotStartupAutomatic pins the admission
+// predicate itself: a checkout a track or promote is converging keeps
+// building, and a freshly minted worktree after the inventory is a runtime
+// addition — while a plain automatic checkout re-seen on a later pass stays
+// dormant, routed or not (a route is a durable overlay; nothing is rebuilt
+// until the checkout is selected). The primary is a dedicated checkout the
+// gate never reaches, so it is never dormant.
+func TestDormancyAdmitsConvergingButNotStartupAutomatic(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
 
@@ -251,32 +252,25 @@ func TestDormancyAdmitsRoutedAndConvergingButNotStartupAutomatic(t *testing.T) {
 	converging := base
 	converging.CheckoutID = "checkout-converging"
 	converging.ActiveIntentTransitionID = "transition-1"
-	require.True(t, f.lc.coordinatorAdmitted(converging, false, reconcile.ActionReadyConfirmed),
+	require.True(t, f.lc.coordinatorAdmitted(converging, reconcile.ActionReadyConfirmed),
 		"a checkout with an active intent transition must keep building")
-
-	// A routed checkout resumes across a restart — the route is what marks the
-	// view it was serving worth resuming without a fresh selection.
-	routed := base
-	routed.CheckoutID = "checkout-routed"
-	require.True(t, f.lc.coordinatorAdmitted(routed, true, reconcile.ActionReadyConfirmed),
-		"a routed checkout resumes across a restart")
 
 	// A freshly minted automatic after the inventory is a runtime addition.
 	minted := base
 	minted.CheckoutID = "checkout-minted"
-	require.True(t, f.lc.coordinatorAdmitted(minted, false, reconcile.ActionIdentityAllocated),
+	require.True(t, f.lc.coordinatorAdmitted(minted, reconcile.ActionIdentityAllocated),
 		"a worktree minted after the inventory is eager by default")
 
 	// A plain automatic re-seen on a later pass is startup inventory and stays
 	// dormant until it is selected.
 	reseen := base
 	reseen.CheckoutID = "checkout-reseen"
-	require.False(t, f.lc.coordinatorAdmitted(reseen, false, reconcile.ActionReadyConfirmed),
+	require.False(t, f.lc.coordinatorAdmitted(reseen, reconcile.ActionReadyConfirmed),
 		"a re-seen startup worktree stays dormant")
 
 	// The lazy flag suppresses even a runtime addition.
 	f.lc.cfgLazyWorktrees = true
-	require.False(t, f.lc.coordinatorAdmitted(minted, false, reconcile.ActionIdentityAllocated),
+	require.False(t, f.lc.coordinatorAdmitted(minted, reconcile.ActionIdentityAllocated),
 		"lazy activation keeps a runtime addition dormant too")
 }
 

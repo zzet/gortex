@@ -457,7 +457,8 @@ func (l *CheckoutLifecycle) dedicatedBaseAdopted(event store_sqlite.DedicatedBas
 	}
 	reason := fmt.Sprintf("committed base of %s advanced to generation %d",
 		event.GraphID, event.Adoption.GenerationID)
-	woken := l.signalFamilyCoordinators(event.FamilyID, event.Owner.CheckoutID, reason)
+	woken := l.PropagateBaseAdvance(event.FamilyID, event.Owner.CheckoutID,
+		event.Adoption.GenerationID, event.Adoption.TreeOID, reason)
 	l.logger.Debug("checkout lifecycle: committed base advanced",
 		zap.String("graph", event.GraphID), zap.String("family", event.FamilyID),
 		zap.Int64("generation", event.Adoption.GenerationID),
@@ -467,15 +468,20 @@ func (l *CheckoutLifecycle) dedicatedBaseAdopted(event store_sqlite.DedicatedBas
 		zap.Int("dependents_signalled", woken))
 }
 
-// signalFamilyCoordinators signals every live coordinator in one family,
-// skipping the named checkout, and reports how many it reached.
+// PropagateBaseAdvance tells every live coordinator in one family, skipping
+// the named checkout, that the family's base advanced, and reports how many it
+// signalled.
 //
 // The registry snapshot is taken under coordMu and the signals are sent outside
 // it, as every other fan-out here does: Signal is buffered to one and never
 // blocks, but a coordinator's own locks are not this lock's to wait behind. An
 // empty familyID matches nothing — a fan-out that cannot name its family would
-// otherwise wake every checkout in the daemon.
-func (l *CheckoutLifecycle) signalFamilyCoordinators(familyID, skipCheckoutID, reason string) int {
+// otherwise wake every checkout in the daemon. A coordinator only NOTES the
+// advance — no cycle, no sample, no build — and applies it on its next use
+// (checkout_propagation.go), so nothing is signalled: the count is 0.
+func (l *CheckoutLifecycle) PropagateBaseAdvance(
+	familyID, skipCheckoutID string, generationID int64, treeOID, reason string,
+) int {
 	if l == nil || familyID == "" {
 		return 0
 	}
@@ -489,9 +495,9 @@ func (l *CheckoutLifecycle) signalFamilyCoordinators(familyID, skipCheckoutID, r
 	}
 	l.coordMu.Unlock()
 	for _, coordinator := range coordinators {
-		coordinator.Signal(reason)
+		coordinator.NoteBaseAdvance(generationID, treeOID, reason)
 	}
-	return len(coordinators)
+	return 0
 }
 
 // SetWatcherSource installs the accessor for the live file watcher. The
@@ -1874,7 +1880,6 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 	if l == nil || l.store == nil || l.catalog == nil {
 		return
 	}
-	routed := l.durableRoutes(ctx, report)
 	for _, entry := range report.Checkouts {
 		if entry.CheckoutID == "" || !entry.Durable {
 			continue
@@ -1894,57 +1899,26 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 			l.withdrawStaleRoute(ctx, entry.CheckoutID)
 			continue
 		}
-		if l.coordinatorAdmitted(checkout, routed[entry.CheckoutID], entry.Action) {
+		if l.coordinatorAdmitted(checkout, entry.Action) {
 			l.ensureCoordinator(ctx, report.PrimaryGraphID, checkout)
 		}
 	}
 	l.markInitialInventory(report)
 }
 
-// durableRoutes reads, in one batched catalog call, which of a family's durable
-// checkouts already hold a route. A routed checkout was built before, so its
-// coordinator is admitted on sight — a restart resumes the view it was serving
-// rather than leaving it dark until something selects it again. A read failure
-// degrades to no routes: the checkout falls to the other admission arms and is
-// re-activated on its next selection.
-func (l *CheckoutLifecycle) durableRoutes(ctx context.Context, report reconcile.FamilyReport) map[string]bool {
-	ids := make([]string, 0, len(report.Checkouts))
-	for _, entry := range report.Checkouts {
-		if entry.CheckoutID == "" || !entry.Durable {
-			continue
-		}
-		ids = append(ids, entry.CheckoutID)
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	routes, err := l.catalog.GetCheckoutRoutes(ctx, ids)
-	if err != nil {
-		l.logger.Debug("checkout lifecycle: could not batch-load routes for admission",
-			zap.String("family", report.FamilyID), zap.Error(err))
-		return nil
-	}
-	routed := make(map[string]bool, len(routes))
-	for id := range routes {
-		routed[id] = true
-	}
-	return routed
-}
-
 // coordinatorAdmitted decides whether one ready, automatic, primary-backed
 // checkout gets a coordinator now, or stays dormant until it is selected. A
-// live coordinator keeps running, a routed checkout resumes across a restart,
-// and a checkout a track or promote is converging keeps building. Everything
-// else is admitted only when it is a genuine runtime addition — minted after
-// its family's initial inventory was taken, and not opted into lazy activation.
+// live coordinator keeps running and a checkout a track or promote is
+// converging keeps building. A routed checkout does not resume across a
+// restart: its route is a durable overlay, so nothing needs rebuilding and a
+// checkout nobody selects costs nothing until it is selected. Everything else
+// is admitted only when it is a genuine runtime addition — minted after its
+// family's initial inventory was taken, and not opted into lazy activation.
 // The startup inventory itself, and anything under the lazy flag, stays dormant.
 func (l *CheckoutLifecycle) coordinatorAdmitted(
-	checkout store_sqlite.Checkout, routed bool, action reconcile.CheckoutAction,
+	checkout store_sqlite.Checkout, action reconcile.CheckoutAction,
 ) bool {
 	if l.hasCoordinator(checkout.CheckoutID) {
-		return true
-	}
-	if routed {
 		return true
 	}
 	if checkout.ActiveIntentTransitionID != "" {
@@ -4320,4 +4294,33 @@ func (l *CheckoutLifecycle) watchCheckout(coordinator *CheckoutCoordinator, repo
 		}
 		coordinator.attachFilesystemWatch(w)
 	}()
+}
+
+// NoteCheckoutUse tells a live coordinator that a request is reading its
+// checkout, so a base advance left pending for the next use is applied now.
+// It never starts a coordinator (ActivateCheckout does) and costs nothing when
+// nothing is pending.
+func (l *CheckoutLifecycle) NoteCheckoutUse(checkoutID, reason string) {
+	if l == nil || checkoutID == "" {
+		return
+	}
+	l.coordMu.Lock()
+	coordinator := l.coordinators[checkoutID]
+	l.coordMu.Unlock()
+	coordinator.wantRebase(reason, true)
+}
+
+// CheckoutPropagationStats reports one live coordinator's propagation state;
+// found is false when the checkout has no live coordinator.
+func (l *CheckoutLifecycle) CheckoutPropagationStats(checkoutID string) (PropagationStats, bool) {
+	if l == nil || checkoutID == "" {
+		return PropagationStats{}, false
+	}
+	l.coordMu.Lock()
+	coordinator := l.coordinators[checkoutID]
+	l.coordMu.Unlock()
+	if coordinator == nil {
+		return PropagationStats{}, false
+	}
+	return coordinator.PropagationStats(), true
 }

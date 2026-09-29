@@ -442,6 +442,13 @@ func (h *replayHarness) run(t *testing.T, steps []replayStep) []replayStepRecord
 		mark := h.f.store.WALWriteMark()
 		started := time.Now()
 		out := coordinatorReconcile(t, h.c)
+		// A change imported file by file takes one cycle per file; the step
+		// is compared once the import reached the working tree.
+		for out.DirtyBatchRemaining > 0 {
+			next := coordinatorReconcile(t, h.c)
+			next.DirtyBuilt = next.DirtyBuilt || out.DirtyBuilt
+			out = next
+		}
 		cycle := time.Since(started)
 		wal := store_sqlite.WALWrittenBetween(mark, h.f.store.WALWriteMark())
 		h.c.SweepRetirements(ctx)
@@ -594,13 +601,21 @@ func E() string {
 }
 
 // TestHistoryReplayMatchesAWholeIndexAfterEveryStep is the fixture arm of the
-// oracle: every step through the coordinator's chained working-tree path.
+// oracle: every step through the coordinator, in three arms — chained deltas
+// compacted at the depth bound, a chain folded by copy after every edit, and
+// every multi-file change imported file by file.
 func TestHistoryReplayMatchesAWholeIndexAfterEveryStep(t *testing.T) {
 	arms := []struct {
-		name string
-	}{{"chained"}}
+		name        string
+		importPaths int
+	}{{"chained", 0}, {"import-file-by-file", 1}}
 	for _, arm := range arms {
 		t.Run(arm.name, func(t *testing.T) {
+			if arm.importPaths > 0 {
+				old := importInteractivePaths
+				importInteractivePaths = arm.importPaths
+				t.Cleanup(func() { importInteractivePaths = old })
+			}
 			f := newCoordinatorFixtureWithTree(t, replayTree())
 			c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
 			coordinatorReconcile(t, c)

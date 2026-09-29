@@ -174,6 +174,17 @@ func (b *SparseGenerationBuilder) builderClosureCap(req BuildRequest) (int, stri
 	if operator > 0 {
 		return operator, ClosureCapFromOperator
 	}
+	// A working-tree build of many changes (a batch of a large working tree)
+	// is sized by its change set like a committed base: under the flat
+	// default its closure truncates, a truncated generation is refused as a
+	// chain parent (closure_truncated_parent), and every later build of that
+	// checkout falls back to the same direct build of the whole dirty set.
+	// A one-file edit's cap is the default either way.
+	if req.Identity.GenerationKind == DirtyLayerGenerationKind {
+		if sized := builderCommittedBaseClosureCap(len(req.Changes)); sized > defaultAffectedByMax {
+			return sized, ClosureCapFromChangeSized
+		}
+	}
 	return defaultAffectedByMax, ClosureCapFromDefault
 }
 

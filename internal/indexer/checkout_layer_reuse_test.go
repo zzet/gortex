@@ -278,7 +278,9 @@ func TestCoordinatorNeverAdoptsALayerBuiltOverAnotherBase(t *testing.T) {
 			generationID, f.treeA, base.treeOID)
 	}
 
-	// And the checkout that arrives there builds its own rather than adopting.
+	// And the checkout that arrives there — used, so the base advance is
+	// applied rather than deferred — builds its own rather than adopting.
+	useCheckout(moved)
 	out := coordinatorReconcile(t, moved)
 	if out.CommitReused {
 		t.Fatalf("a cycle over the advanced base reused a layer: %+v", out)

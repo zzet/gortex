@@ -171,16 +171,6 @@ func newFanoutCoordinator(t *testing.T, checkoutID, familyID string) *fanoutCoor
 	return out
 }
 
-// waitForCycle waits for one cycle to complete.
-func (c *fanoutCoordinator) waitForCycle(t *testing.T, what string) {
-	t.Helper()
-	select {
-	case <-c.cycles:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("%s never recomposed: the base advance did not reach its coordinator", what)
-	}
-}
-
 // requireQuiet fails when a cycle arrives inside the settle window.
 func (c *fanoutCoordinator) requireQuiet(t *testing.T, what string) {
 	t.Helper()
@@ -191,10 +181,24 @@ func (c *fanoutCoordinator) requireQuiet(t *testing.T, what string) {
 	}
 }
 
-// TestBaseAdvanceWakesEveryDependentExactlyOnce is the production trace: a
+// waitForNote waits until the coordinator has noted n base advances.
+func (c *fanoutCoordinator) waitForNote(t *testing.T, what string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for c.coordinator.PropagationStats().Noted < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never noted the base advance: %+v", what, c.coordinator.PropagationStats())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestBaseAdvanceIsNotedOnEveryDependentExactlyOnce is the production trace: a
 // committed base adopted through the catalog reaches the coordinators the
-// lifecycle is running, without any poll and without anything else being woken.
-func TestBaseAdvanceWakesEveryDependentExactlyOnce(t *testing.T) {
+// lifecycle is running, without any poll: every dependent notes it once and
+// applies it on its next use, and nothing is woken — neither the dependents,
+// nor the base's own owner, nor a checkout in another family.
+func TestBaseAdvanceIsNotedOnEveryDependentExactlyOnce(t *testing.T) {
 	f := newFanoutFixture(t)
 
 	first := f.dependent("checkout-one", "one")
@@ -216,13 +220,15 @@ func TestBaseAdvanceWakesEveryDependentExactlyOnce(t *testing.T) {
 	adoption := f.publish(t, "tree-a", "commit-a", 1000, 0)
 	require.True(t, adoption.GenerationID > 0)
 
-	one.waitForCycle(t, "the first dependent")
-	two.waitForCycle(t, "the second dependent")
-	owner.requireQuiet(t, "the base's own owner")
-	stranger.requireQuiet(t, "a checkout in another family")
-	// Exactly once: one advance is one recomposition, not a burst.
-	one.requireQuiet(t, "the first dependent, after its recomposition")
-	two.requireQuiet(t, "the second dependent, after its recomposition")
+	one.waitForNote(t, "the first dependent", 1)
+	two.waitForNote(t, "the second dependent", 1)
+	for _, c := range []*fanoutCoordinator{one, two, owner, stranger} {
+		c.requireQuiet(t, c.coordinator.checkoutID+" after the base advance")
+	}
+	require.Equal(t, 1, one.coordinator.PropagationStats().Noted, "one advance is one note")
+	require.Equal(t, 1, two.coordinator.PropagationStats().Noted, "one advance is one note")
+	require.Zero(t, owner.coordinator.PropagationStats().Noted, "the base's own owner noted its own publication")
+	require.Zero(t, stranger.coordinator.PropagationStats().Noted, "a checkout in another family noted the advance")
 
 	// The head the dependents key on moved with the adoption, in the adoption's
 	// own transaction — not an hour later when the janitor next samples.
@@ -232,11 +238,11 @@ func TestBaseAdvanceWakesEveryDependentExactlyOnce(t *testing.T) {
 	require.True(t, adoption.HeadAdvanced)
 }
 
-// TestBaseReplayWakesNobody keeps the fan-out honest about what it is
+// TestBaseReplayNotesNothing keeps the fan-out honest about what it is
 // announcing. Re-adopting the pointer that is already installed changes nothing
-// a dependent could observe, and a signal for it would be a cycle — and, on a
+// a dependent could observe, and a note for it would be a rebase — and, on a
 // checkout whose identity has moved, a build — bought with nothing.
-func TestBaseReplayWakesNobody(t *testing.T) {
+func TestBaseReplayNotesNothing(t *testing.T) {
 	f := newFanoutFixture(t)
 	dependent := f.dependent("checkout-one", "one")
 	one := newFanoutCoordinator(t, dependent.CheckoutID, f.familyID)
@@ -245,7 +251,7 @@ func TestBaseReplayWakesNobody(t *testing.T) {
 	}, one.coordinator))
 
 	f.publish(t, "tree-a", "commit-a", 1000, 0)
-	one.waitForCycle(t, "the dependent")
+	one.waitForNote(t, "the dependent", 1)
 
 	ctx := context.Background()
 	publication, found, err := f.catalog.DedicatedBasePublication(ctx, f.graphID)
@@ -255,12 +261,13 @@ func TestBaseReplayWakesNobody(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, replay.AlreadyAdopted)
 	one.requireQuiet(t, "the dependent, on a replayed adoption")
+	require.Equal(t, 1, one.coordinator.PropagationStats().Noted, "a replayed adoption was noted again")
 }
 
 // TestClosedLifecycleStopsHearingAdoptions pins the release half. A lifecycle
 // that has shut down still shares the store with whatever publishes next — a
 // one-shot server in the same process, another fixture — and an announcement
-// that reached its torn-down registry would signal coordinators it has joined.
+// that reached its torn-down registry would reach coordinators it has joined.
 func TestClosedLifecycleStopsHearingAdoptions(t *testing.T) {
 	f := newFanoutFixture(t)
 	dependent := f.dependent("checkout-one", "one")
@@ -279,4 +286,5 @@ func TestClosedLifecycleStopsHearingAdoptions(t *testing.T) {
 
 	f.publish(t, "tree-a", "commit-a", 1000, 0)
 	fresh.requireQuiet(t, "a coordinator held by a closed lifecycle")
+	require.Zero(t, fresh.coordinator.PropagationStats().Noted, "a closed lifecycle announced the adoption")
 }

@@ -372,6 +372,7 @@ func (c *CheckoutCoordinator) enqueueCheckoutRefresh(request *checkoutRefreshReq
 		request.record.MarkAt(PublicationTicketEnqueued, request.admittedAt)
 	}
 	c.refreshMu.Unlock()
+	c.wantRebase("refresh ticket", false)
 	c.SignalDemand("checkout refresh ticket admitted")
 	c.PrioritizeSelection()
 	return request.ticket, nil

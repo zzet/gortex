@@ -334,6 +334,24 @@ type CheckoutCycle struct {
 	// "the base moved, so the checkout was recomposed over it" — the old pair
 	// keeps serving for the whole of the rebuild.
 	Recomposed bool
+	// DirtyReparented reports that a recomposition carried the working-tree
+	// chain over to the new commit layer by copying its rows (no parse, no
+	// pass) instead of rebuilding it: the layers below compose to the same
+	// committed tree over either base, so the chain's payload is still exact
+	// (checkout_propagation.go). DirtyBuilt is false when it is set.
+	DirtyReparented bool
+	// ImportFolded reports that a file-by-file import cycle folded the chain
+	// it extended into one generation by copy (checkout_import.go); the
+	// route names the fold and DirtyChainDepth is 1.
+	ImportFolded bool
+	// RebaseDeferred reports that the primary's base advanced under a
+	// checkout nobody is using and the cycle left the routed stack exactly as
+	// it was: the rebase is applied when the checkout is next selected,
+	// edited or asked to release its base (checkout_propagation.go).
+	RebaseDeferred bool
+	// Propagation is the per-path scope of a base advance for this checkout,
+	// by content, when the cycle computed one.
+	Propagation *PropagationScope
 	// BasePinned reports that the cycle served the checkout from the committed
 	// base generation its routed layers were BUILT against, while the family's
 	// primary has already advanced past it. It is the dependent pin's saving
@@ -367,6 +385,11 @@ type CheckoutCycle struct {
 	// stand on (selectDirtyParent) and, when none, the fallback reason code.
 	DirtyParentCandidate int64
 	DirtyChainReason     string
+	// DirtyBatchRemaining is how many changed paths the cycle's working-tree
+	// build left for the next batch: the routed layer is a step towards the
+	// working tree, not the working tree, so the cycle completes no refresh
+	// ticket and the next batch is scheduled at once (0: whole sample).
+	DirtyBatchRemaining int
 	// DirtyParentGenerationID is the physical parent the cycle's working-tree
 	// build actually stood on when it was built over a working-tree parent,
 	// and DirtyChainDepth the published generation's chain depth (1 = built
@@ -627,6 +650,9 @@ type CheckoutCoordinator struct {
 	// a cycle's shared sample must postdate it (cycleSample).
 	signaledAt time.Time
 
+	// propagation is the primary-to-worktree advance noted until next use.
+	propagation basePropagation
+
 	// retireCalled is a test seam: it observes every generation offerRetire
 	// retires inline. nil in production.
 	retireCalled func(int64)
@@ -652,6 +678,9 @@ func (c *CheckoutCoordinator) PrioritizeSelection() {
 	if c == nil {
 		return
 	}
+	// A selection is a use: a base advance left pending for this checkout's
+	// next use is applied now (checkout_propagation.go).
+	c.wantRebase("selection", true)
 	select {
 	case c.selectionRequests() <- struct{}{}:
 	default:
@@ -1666,6 +1695,21 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 	if err != nil || !ok {
 		return false, err
 	}
+	// Only the base moved. Nobody is using the checkout: leave the stack it
+	// is routed to and apply the advance on its next use
+	// (checkout_propagation.go).
+	if !c.rebaseWantedNow() {
+		c.deferRebase(base, out)
+		return true, nil
+	}
+	scope, err := c.propagationScopeFor(ctx, commitRow.LowerViewFingerprint, base.treeOID,
+		commitRow.GenerationID, dirtyRow.GenerationID)
+	if err != nil {
+		c.logger.Debug("checkout coordinator: could not scope the base advance by content",
+			zap.String("checkout", c.checkoutID), zap.Error(err))
+	} else {
+		out.Propagation = scope
+	}
 
 	previousCommit, previousDirty := commitRow.GenerationID, dirtyRow.GenerationID
 	commitGeneration, reused, err := c.resolveCommitLayer(ctx, base, head.HeadTree)
@@ -1677,7 +1721,7 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 	// a HEAD the layer beneath knows nothing about, so the cycle stops and the
 	// next one rebuilds for the head the checkout is really at — the same
 	// guard, and the same counter, reconcileDirtySlot makes for itself.
-	sample, err := c.cycleSample(ctx)
+	sample, err := c.sampler.Sample(ctx)
 	if err != nil {
 		c.abandonBuild(ctx, commitGeneration, !reused)
 		return true, fmt.Errorf("indexer: sample %s: %w", c.root, err)
@@ -1694,8 +1738,36 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 		return true, nil
 	}
 
-	dirtyGeneration, dirtyKey, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration)
-	if err != nil {
+	// The working-tree chain is carried over by copy: base + commit layer
+	// composes to the same committed tree over either base, so the chain's
+	// rows are still exact (checkout_propagation.go).
+	var (
+		dirtyGeneration int64
+		dirtyKey        string
+		reparented      bool
+	)
+	dirtyGeneration, dirtyKey, err = c.reparentDirtyChain(ctx, base.graphID, dirtyRow.GenerationID,
+		commitRow, commitGeneration, sample.Fingerprint)
+	switch {
+	case err == nil:
+		reparented = true
+		// The carried-over chain is written; the same window a rebuilt
+		// working-tree layer opens before it is installed.
+		if c.dirtyBarrier != nil {
+			c.dirtyBarrier()
+		}
+	case errors.Is(err, errReparentRefused):
+		c.logger.Debug("checkout coordinator: working-tree chain rebuilt instead of carried over",
+			zap.String("checkout", c.checkoutID), zap.Error(err))
+		dirtyGeneration, dirtyKey = 0, ""
+	default:
+		c.abandonBuild(ctx, commitGeneration, !reused)
+		return true, err
+	}
+	if !reparented {
+		dirtyGeneration, dirtyKey, err = c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration)
+	}
+	if err != nil && !reparented {
 		c.abandonBuild(ctx, commitGeneration, !reused)
 		return true, err
 	}
@@ -1709,9 +1781,22 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 	// The base may have advanced again while this pair was being built.
 	// Installing now would route a delta over a base the family has already
 	// left, which is the splice this whole path exists to avoid.
+	abandonDirty := func() {
+		if !reparented {
+			c.abandonBuild(ctx, dirtyGeneration, true)
+			return
+		}
+		// A carried-over chain is new generations top to bottom, none of
+		// them routed; the old chain is still the routed one.
+		for _, id := range c.dirtyChainMembers(ctx, dirtyGeneration) {
+			if id != dirtyRow.GenerationID {
+				c.abandonBuild(ctx, id, true)
+			}
+		}
+	}
 	moved, err := c.baseMovedUnderCycle(ctx, base)
 	if err != nil || moved {
-		c.abandonBuild(ctx, dirtyGeneration, true)
+		abandonDirty()
 		c.abandonBuild(ctx, commitGeneration, !reused)
 		if err != nil {
 			return true, err
@@ -1721,7 +1806,7 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 	}
 
 	if err := c.installStack(ctx, *route, true, base.graphID, commitGeneration, dirtyGeneration); err != nil {
-		c.abandonBuild(ctx, dirtyGeneration, true)
+		abandonDirty()
 		c.abandonBuild(ctx, commitGeneration, !reused)
 		return true, err
 	}
@@ -1733,7 +1818,9 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 
 	out.Recomposed = true
 	out.CommitGenerationID, out.DirtyGenerationID = commitGeneration, dirtyGeneration
-	out.CommitBuilt, out.CommitReused, out.DirtyBuilt = !reused, reused, true
+	out.CommitBuilt, out.CommitReused, out.DirtyBuilt = !reused, reused, !reparented
+	out.DirtyReparented = reparented
+	c.rebaseApplied()
 	c.retainCommit(ctx, generationIdentityKey(c.commitIdentity(base, head.HeadTree)), commitGeneration)
 	// The recomposed pair is filed in both reuse caches, and the pair it
 	// replaced is RELEASED into them rather than retired. The old
@@ -2714,7 +2801,13 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	route *store_sqlite.CheckoutRoute,
 	out *CheckoutCycle,
 ) error {
+	// The cycle's shared sample, unless this cycle just built a commit layer:
+	// the checkout is free to commit while one builds, so the working tree is
+	// sampled again after it.
 	sample, err := c.cycleSample(ctx)
+	if out.CommitBuilt {
+		sample, err = c.sampler.Sample(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("indexer: sample %s: %w", c.root, err)
 	}
@@ -2830,6 +2923,24 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	// entry that could still be hit.
 	c.retainDirty(ctx, builtKey, generationID)
 	c.releaseDirtyChain(ctx, previous, generationID)
+	if out.DirtyBatchRemaining > 0 {
+		// One batch of a large working tree: routed (it is a state closer to
+		// the working tree than what the route named, and the next batch
+		// stands on it), but not the working tree, so no ticket completes on
+		// it and no compaction folds a chain that is still growing.
+		out.Rescheduled = true
+		// An import folds its own chain by copy whenever it reaches the
+		// compaction depth, so the next file always chains and the import
+		// never falls back to a direct build of what it already imported.
+		c.foldImportChain(ctx, commitGeneration, route, out)
+		c.logger.Info("checkout coordinator: working tree built in batches",
+			zap.String("checkout", c.checkoutID),
+			zap.Int64("generation", generationID),
+			zap.Int("chain_depth", out.DirtyChainDepth),
+			zap.Int("remaining_paths", out.DirtyBatchRemaining))
+		c.Signal("the next batch of the working tree")
+		return nil
+	}
 	return nil
 }
 
@@ -2926,9 +3037,16 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 	defer releaseBase()
 	identity := c.dirtyIdentity(graphID, commitGeneration)
 	identity.BaseGenerationID = baseGeneration
+	// The committed state's language census is read only when the build's
+	// own files leave an enrichable language below the admission floor (the
+	// floor check calls it): counting the committed ancestry is a grouped scan
+	// of every full generation beneath the chain, tens of seconds on a cold
+	// store, and an ordinary edit's own files clear the floor without it.
 	var baseCensus func(context.Context) map[string]int
 	if c.builder != nil && c.builder.Semantic != nil {
-		baseCensus = func(ctx context.Context) map[string]int { return c.checkoutLanguageCensus(ctx, commitGeneration) }
+		baseCensus = func(ctx context.Context) map[string]int {
+			return c.checkoutLanguageCensus(ctx, commitGeneration)
+		}
 	}
 	var stamped GenerationIdentity
 	var work *GenerationWorkCounters
@@ -2945,6 +3063,13 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 			Sampler:             c.sampler,
 			chainFallbackReason: fallbackReason,
 			baseCensusFunc:      baseCensus,
+			narrowMotion:        c.narrowTreeMoveAbort,
+			// A large working-tree change is imported file by file
+			// (checkout_import.go); the builder judges that by the change set
+			// it carries, so a delta over a parent that covers the dirty set
+			// stays one delta.
+			importLarge:    true,
+			continueImport: c.importInProgress(ctx, parent.Parent),
 		}
 		if attempt == 0 {
 			req.before = first
@@ -2960,7 +3085,7 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 		}
 		if err == nil {
 			stamped.BaseGenerationID = commitGeneration
-			return dirtyLayerBuild{GenerationID: generationID, Key: generationIdentityKey(stamped), Work: work}, nil
+			return dirtyLayerBuild{GenerationID: generationID, Key: generationIdentityKey(stamped), Work: work, Remaining: report.BatchRemaining}, nil
 		}
 		var fallback *DirtyChainFallbackError
 		if errors.As(err, &fallback) {
@@ -2994,6 +3119,9 @@ type dirtyLayerBuild struct {
 	Key          string
 	Reason       string
 	Work         *GenerationWorkCounters
+	// Remaining is BuildReport.BatchRemaining: > 0 when the build carried one
+	// batch of a larger change set.
+	Remaining int
 }
 
 // commitLayerReader is the reader a dirty-layer build computes its affected

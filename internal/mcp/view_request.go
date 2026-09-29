@@ -2021,6 +2021,12 @@ func (s *Server) materializeRequestView(
 		return viewFallback(strict, rider, graphview.NewViewError(graphview.CodeViewBuilding,
 			fmt.Sprintf("checkout %q is not fully routed yet", checkout.CheckoutID)))
 	}
+	// A query of a routed worktree is a use: a primary base advance left
+	// pending for this checkout's next use is applied now (a no-op when
+	// nothing is pending).
+	if s.lifecycle != nil {
+		s.lifecycle.NoteCheckoutUse(checkout.CheckoutID, "view requested")
+	}
 	if deferredMaterialization(ctx) {
 		return &requestView{kind: requestViewKindWorktree, rider: rider, viewRoot: checkout.RootPath, deferred: true}, nil
 	}

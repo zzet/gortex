@@ -13,8 +13,7 @@ import (
 
 // Seed must register the state written by the real lifecycle, both when the
 // catalog is first populated and when persisted owners are restored at boot.
-// A resumed coordinator needs that read admission even while warmup holds the
-// build gate closed. All stores, config, and Git repositories are test-owned.
+// A coordinator started for a restored checkout needs that read admission. All stores, config, and Git repositories are test-owned.
 func TestCheckoutLifecycleSeedRestoresReadyOwnersAndCoordinators(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
@@ -69,9 +68,13 @@ func TestCheckoutLifecycleSeedRestoresReadyOwnersAndCoordinators(t *testing.T) {
 			}
 		}
 		if phase == "restart" {
-			require.True(t, f.lc.coordinatorRegistered(automaticID), "Seed resumes the routed checkout before the build gate opens")
-			require.Equal(t, 1, f.lc.LiveCoordinators(""))
+			// A routed checkout stays dormant across the restart — its route
+			// is a durable overlay — until a selection starts it.
+			require.False(t, f.lc.coordinatorRegistered(automaticID), "Seed resumed an unselected routed checkout")
+			require.Zero(t, f.lc.LiveCoordinators(""))
 			gate.Open()
+			f.activateAndWait(automaticID)
+			require.Equal(t, 1, f.lc.LiveCoordinators(""))
 			refresh, err := f.lc.RequestCheckoutRefresh(ctx, automaticID, worktree)
 			require.NoError(t, err)
 			require.NoError(t, awaitCheckoutRefresh(t, refresh).Err)

@@ -731,6 +731,7 @@ func TestALegacyBaseAdvanceIsNeverPinned(t *testing.T) {
 	}
 
 	advancePrimaryBase(t, f)
+	useCheckout(c)
 	out := coordinatorReconcile(t, c)
 	if out.BasePinned {
 		t.Fatalf("a base with no published generation was pinned: %+v", out)

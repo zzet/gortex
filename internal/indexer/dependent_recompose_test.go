@@ -47,6 +47,14 @@ import (
 // bounded rebuild per dependent per advance, the old pair routed for the whole
 // of it, and never a new base under an old delta.
 
+// useCheckout marks c used with a base advance pending — what a selection
+// after the lifecycle noted the advance does — so its next cycle applies the
+// advance instead of deferring it to the next use (checkout_propagation.go).
+func useCheckout(c *CheckoutCoordinator) {
+	c.NoteBaseAdvance(0, "advanced", "the family's base advanced")
+	c.wantRebase("selected", false)
+}
+
 // advancePrimaryBase commits one new file on the primary checkout and records
 // its tree as the family's committed base, which is what every dependent's
 // graphBase reads. It returns the new base tree and the file's name.
@@ -264,6 +272,7 @@ func TestADependentOnGenerationZeroRecomposesOntoTheFirstPublishedBase(t *testin
 		t.Fatalf("the fixture published no base: %d", baseGeneration)
 	}
 
+	useCheckout(c)
 	recomposed := coordinatorReconcile(t, c)
 	if recomposed.CommitGenerationID == legacy.CommitGenerationID {
 		t.Fatalf("the dependent is still routed over the generation-0 layer %d after the family "+
@@ -338,19 +347,22 @@ func TestBaseAdvanceRecomposesTheStackWithoutDroppingTheRoute(t *testing.T) {
 	armed = true
 	mu.Unlock()
 
+	useCheckout(c)
 	out := coordinatorReconcile(t, c)
 	if !out.Recomposed {
 		t.Fatalf("the base advance did not recompose the dependent: %+v", out)
 	}
-	if !out.CommitBuilt || !out.DirtyBuilt {
-		t.Fatalf("the recomposition did not rebuild both layers: %+v", out)
+	// The commit layer is rebuilt over the new base; the working-tree chain
+	// is carried over to it by copy (checkout_propagation.go).
+	if !out.CommitBuilt || out.DirtyBuilt || !out.DirtyReparented {
+		t.Fatalf("the recomposition did not rebuild the commit layer and carry the chain over: %+v", out)
 	}
 
 	mu.Lock()
 	observedRoute, observedSeen := observed, seen
 	mu.Unlock()
 	if !observedSeen {
-		t.Fatalf("the working-tree build never reached the barrier")
+		t.Fatalf("the carried-over working-tree layer never reached the barrier")
 	}
 	if observedRoute.CommitGenerationID != before.CommitGenerationID ||
 		observedRoute.DirtyGenerationID != before.DirtyGenerationID {
@@ -517,9 +529,10 @@ func TestBaseAdvanceRecomposesTwoDependentsOnceEachWithABoundedDelta(t *testing.
 	beforeMetrics := viewmetrics.Read()
 	beforeCensus := generationCensus(f)
 	for _, dependent := range dependents {
+		useCheckout(dependent.c)
 		out := coordinatorReconcile(t, dependent.c)
-		if !out.Recomposed || !out.CommitBuilt || !out.DirtyBuilt {
-			t.Fatalf("%s did not recompose over the advanced base: %+v", dependent.name, out)
+		if !out.Recomposed || !out.CommitBuilt || out.DirtyBuilt || !out.DirtyReparented {
+			t.Fatalf("%s did not recompose over the advanced base, the chain carried over: %+v", dependent.name, out)
 		}
 		if out.CommitGenerationID == initial[dependent.name].CommitGenerationID {
 			t.Fatalf("%s kept its old delta over the advanced base: %+v", dependent.name, out)
@@ -571,10 +584,11 @@ func TestBaseAdvanceRecomposesTwoDependentsOnceEachWithABoundedDelta(t *testing.
 		}
 	}
 
-	// Two dependents, one advance: two commit-delta builds and two
-	// working-tree builds. Not four, and not one apiece plus a retry.
+	// Two dependents, one advance: two commit-delta builds and no
+	// working-tree build (each chain is carried over by copy). Not four, and
+	// not one apiece plus a retry.
 	afterMetrics := viewmetrics.Read()
-	for slot, want := range map[string]int64{viewmetrics.SlotCommit: 2, viewmetrics.SlotDirty: 2} {
+	for slot, want := range map[string]int64{viewmetrics.SlotCommit: 2, viewmetrics.SlotDirty: 0} {
 		if got := buildSeconds(afterMetrics, slot) - buildSeconds(beforeMetrics, slot); got != want {
 			t.Fatalf("the advance ran %d %s-slot builds, want %d", got, slot, want)
 		}
@@ -737,6 +751,7 @@ func TestRecompositionRefusesToInstallOverABaseThatMovedUnderIt(t *testing.T) {
 	mu.Unlock()
 
 	beforeMetrics := viewmetrics.Read()
+	useCheckout(c)
 	out := coordinatorReconcile(t, c)
 
 	mu.Lock()
@@ -824,6 +839,7 @@ func TestRecompositionStopsWhenTheCheckoutCommitsUnderIt(t *testing.T) {
 	route := before
 	var out CheckoutCycle
 	beforeMetrics := viewmetrics.Read()
+	useCheckout(c)
 	handled, err := c.recomposeOverAdvancedBase(ctx, advanced, head, &route, &out)
 	if err != nil {
 		t.Fatalf("recomposeOverAdvancedBase: %v", err)
@@ -886,6 +902,7 @@ func TestRecompositionRefusesAWorkingTreeLayerOverAnotherCommitLayer(t *testing.
 	strandedDirty := first.DirtyGenerationID
 
 	advancePrimaryBase(t, f)
+	useCheckout(c)
 	recomposed := coordinatorReconcile(t, c)
 	if !recomposed.Recomposed {
 		t.Fatalf("the base advance did not recompose: %+v", recomposed)

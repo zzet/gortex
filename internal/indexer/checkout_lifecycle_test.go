@@ -1138,21 +1138,24 @@ func TestCoordinatorLivenessFollowsTheLoopNotTheRegistry(t *testing.T) {
 	defer f.close()
 	ctx := context.Background()
 
-	// Route the automatic checkout before the restart: a served worktree is the
-	// one a restart resumes, and its persisted route is what marks it worth
-	// bringing back rather than leaving dormant.
+	// Route the automatic checkout before the restart.
 	f.runCoordinator(f.automatic.CheckoutID)
 
 	// The daemon's restart path: a fresh stack over the same store, the tracked
 	// set re-registered the way warmup re-tracks it, and the seeding that
-	// reconciles every family it touched — which is what brings a routed
-	// worktree's coordinator back up.
+	// reconciles every family it touched. A routed worktree stays dormant —
+	// its route is a durable overlay — until a selection brings its
+	// coordinator back up.
 	f.restart()
 	_, err := f.mi.TrackRepoCtx(ctx, config.RepoEntry{Path: f.main, Name: f.mainPrefix})
 	require.NoError(t, err)
 	require.NoError(t, f.lc.Seed(ctx))
+	require.False(t, f.coordinatorReported(f.automatic.CheckoutID),
+		"the restart's own reconciliation started a coordinator for an unselected worktree")
+	require.Zero(t, f.lc.liveCoordinators(""))
+	f.activateAndWait(f.automatic.CheckoutID)
 	require.True(t, f.coordinatorReported(f.automatic.CheckoutID),
-		"the restart's own reconciliation brought no coordinator back")
+		"the selection brought no coordinator back")
 	require.Equal(t, 1, f.lc.liveCoordinators(""))
 
 	// The window every transition opens: the registered coordinator is dropped

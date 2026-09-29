@@ -261,6 +261,8 @@ func (c *CheckoutCoordinator) noteFilesystemChange(paths []string) {
 	abort := m.abort
 	touched := false
 	if abort != nil {
+		// Under the lock: a batched build narrows the paths it watches
+		// (narrowTreeMoveAbort) while the watcher reports.
 		touched = paths == nil
 		for _, rel := range rels {
 			if touched = abort.touches(rel); touched {
@@ -451,6 +453,31 @@ func (c *CheckoutCoordinator) armTreeMoveAbort(ctx context.Context, cycleStarted
 		abort.y.fire()
 	}
 	return context.WithValue(ctx, treeMoveCommitKey{}, abort.y), abort.y
+}
+
+// narrowTreeMoveAbort restricts the armed movement abort to the paths the
+// build actually builds (a batch of a large working tree): a write elsewhere
+// in the dirty set does not touch what the batch generation claims, and the
+// next batch reads it from the next sample. A write to one of these paths, to
+// their directories or to a build manifest still aborts, and the prepublish
+// fence still proves the batch's own reads.
+func (c *CheckoutCoordinator) narrowTreeMoveAbort(paths []string) {
+	if c == nil {
+		return
+	}
+	m := &c.motion
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.abort == nil {
+		return
+	}
+	dirty := make(map[string]struct{}, len(paths))
+	dirs := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		dirty[p] = struct{}{}
+		dirs[path.Dir(p)] = struct{}{}
+	}
+	m.abort.dirty, m.abort.dirs = dirty, dirs
 }
 
 // disarmTreeMoveAbort ends the build's movement abort.

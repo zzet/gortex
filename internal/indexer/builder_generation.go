@@ -433,6 +433,9 @@ type BuildReport struct {
 
 	// PlanningDuration is the wall time spent selecting the sparse file set.
 	PlanningDuration time.Duration
+	// BatchRemaining is how many changed paths a batched working-tree build
+	// left for the next batch (0: the build describes the whole sample).
+	BatchRemaining int
 	// Duration is the wall time of the whole build.
 	Duration time.Duration
 

@@ -453,3 +453,36 @@ func TestSelectDirtyParentReasonCodes(t *testing.T) {
 		}
 	}
 }
+
+func TestRecomposeOverAdvancedBaseCarriesTheChainOver(t *testing.T) {
+	x := newDirtyChainFixture(t, CheckoutCoordinatorConfig{})
+	ctx := context.Background()
+	advancePrimaryBase(t, x.f)
+	advanced, err := x.c.primaryBase(ctx)
+	if err != nil {
+		t.Fatalf("primaryBase: %v", err)
+	}
+	if _, _, ok, err := x.c.recomposableStack(ctx, advanced, x.sample(t), x.f.route()); err != nil || !ok {
+		t.Fatalf("a rooted chain was refused by the recomposition path: ok=%v err=%v", ok, err)
+	}
+	useCheckout(x.c)
+	out := coordinatorReconcile(t, x.c)
+	if !out.Recomposed || out.DirtyBuilt || !out.DirtyReparented {
+		t.Fatalf("the base advance did not recompose the chained checkout by copy: %+v", out)
+	}
+	after := x.f.route()
+	if after.CommitGenerationID == x.commit || after.DirtyGenerationID == x.d2 {
+		t.Fatalf("the recomposition left the old pair routed: %+v", after)
+	}
+	// The chain is carried over member by member: its root sits on the new
+	// commit generation, and it keeps its depth.
+	members := x.c.dirtyChainMembers(ctx, after.DirtyGenerationID)
+	if len(members) != 2 {
+		t.Fatalf("the carried-over chain has %d members %v, want the routed chain's 2", len(members), members)
+	}
+	root, _ := x.f.generation(members[len(members)-1])
+	if root.BaseGenerationID != after.CommitGenerationID {
+		t.Fatalf("the carried-over chain's root sits on %d, want the new commit %d",
+			root.BaseGenerationID, after.CommitGenerationID)
+	}
+}

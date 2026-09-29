@@ -2,6 +2,8 @@ package indexer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path"
@@ -124,6 +126,26 @@ type DirtyLayerRequest struct {
 	// BaseCensus) rather than this build's own files.
 	baseCensus     map[string]int
 	baseCensusFunc func(context.Context) map[string]int
+
+	// importLarge imports a change set past importInteractivePaths file by
+	// file (checkout_import.go): this build carries importBatchFiles of it
+	// over its parent, and the next cycle carries the next file. It is the
+	// coordinator's choice, never the builder's default: a caller that asks
+	// for one generation of the whole state (a direct build a test composes a
+	// chain over) gets exactly that, as one delta. The import is judged on
+	// the change set this build actually carries, so a delta over a parent
+	// that already covers the working tree's dirty set stays one delta
+	// however large the dirty set is.
+	importLarge bool
+	// continueImport keeps importing file by file however small the change
+	// set has become: the parent is a link of an import still in progress, so
+	// the import stays file by file to its end.
+	continueImport bool
+	// narrowMotion, when set, is told the paths a batched build actually
+	// builds, so the caller's movement abort watches those rather than the
+	// whole dirty set: a change elsewhere does not touch what this
+	// generation claims.
+	narrowMotion func(paths []string)
 }
 
 // DirtyChainFallbackError reports that a working-tree build over a
@@ -204,15 +226,14 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	defer target.Close() //nolint:errcheck // the source is read-only; a close failure cannot lose work
 
 	identity := StampDirtyLayerIdentity(req.Identity, before)
-	if req.stamped != nil {
-		*req.stamped = identity
-	}
 
 	policy := b.dirtyManifestPolicyDigest(identity)
 	var (
 		changes  []LayerPathChange
 		manifest *generationInputManifest
 		reused   int
+		// next is the full resolved state the sample describes.
+		next resolvedManifest
 	)
 	if req.parent > 0 {
 		// A delta over the parent: plan only the paths whose admitted input
@@ -220,7 +241,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		// that difference as this generation's manifest.
 		admit := chainManifestAdmitter(req.parentManifest, before, b.manifestAdmitter(req.CheckoutRoot, target))
 		nextMeta, nextEntries := admittedManifest(before, admit, policy)
-		next := resolvedFromFull(nextMeta, nextEntries)
+		next = resolvedFromFull(nextMeta, nextEntries)
 		headHolds, err := dirtyChainHeadHolds(ctx, req.CheckoutRoot, before, req.parentManifest, next)
 		if err != nil {
 			return 0, BuildReport{}, err
@@ -252,10 +273,35 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		// publishes.
 		meta, entries := admittedManifest(before, b.manifestAdmitter(req.CheckoutRoot, target), policy)
 		manifest = &generationInputManifest{meta: meta, entries: entries}
+		next = resolvedFromFull(meta, entries)
 	}
 	changes, err = dirtyLayerDiskTruthContext(ctx, changes, target)
 	if err != nil {
 		return 0, BuildReport{}, err
+	}
+	// A change set past the interactive bound is imported: this generation
+	// carries the first file of the change set over its parent and says so
+	// (a partial identity, a manifest describing exactly commit + what it
+	// built), and the next cycle carries the next file over it as an ordinary
+	// chained delta. Each link is short, preemptible between links, and never
+	// lost to a yield or a movement abort of a later one.
+	remaining := 0
+	if req.importLarge && (len(changes) > importInteractivePaths || req.continueImport) {
+		if batch := selectWorkingTreeBatch(changes, importBatchFiles); len(batch) < len(changes) {
+			remaining = len(changes) - len(batch)
+			changes = batch
+			manifest, identity.LowerViewFingerprint = partialWorkingTreeManifest(req.parent > 0, req.parentManifest, next, batch, policy)
+			if req.narrowMotion != nil {
+				paths := make([]string, 0, len(batch))
+				for _, change := range batch {
+					paths = append(paths, change.Path)
+				}
+				req.narrowMotion(paths)
+			}
+		}
+	}
+	if req.stamped != nil {
+		*req.stamped = identity
 	}
 	// A delta over a parent is judged for semantic enrichment by the census of
 	// the whole working-tree state, as a direct build of it would be; only
@@ -286,7 +332,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		// working copy to offer.
 		Enrich: &EnrichmentStage{
 			CheckoutID:     identity.CheckoutID,
-			Fingerprint:    before.Fingerprint,
+			Fingerprint:    identity.LowerViewFingerprint,
 			ChainCensus:    chainCensus,
 			BaseCensus:     baseCensus,
 			BaseCensusFunc: baseCensusFunc,
@@ -302,6 +348,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		// the pass stamps; asking git again would be a second sample.
 		headProvenance: dirtyHeadProvenance(before),
 	})
+	report.BatchRemaining = remaining
 	report.WAL = store_sqlite.WALWrittenBetween(walMark, b.Store.WALWriteMark())
 	b.logWorkingTreeBuild(req, generationID, report, err)
 	report.ChainFallbackReason = req.chainFallbackReason
@@ -605,6 +652,7 @@ func (b *SparseGenerationBuilder) logWorkingTreeBuild(req DirtyLayerRequest, gen
 		zap.Int64("generation", generationID),
 		zap.Int64("parent", req.parent),
 		zap.String("chain_fallback", req.chainFallbackReason),
+		zap.Int("batch_remaining", report.BatchRemaining),
 		zap.Bool("coalesced", report.Coalesced),
 		zap.Float64("plan_ms", float64(report.PlanningDuration.Microseconds())/1000),
 		zap.Float64("duration_ms", float64(report.Duration.Microseconds())/1000),
@@ -698,4 +746,79 @@ func dirtyLayerDiskTruthContext(
 		}
 	}
 	return changes, nil
+}
+
+// selectWorkingTreeBatch is the first size changes to import: dependency and
+// root manifests first (a module's identity decides how everything else in it
+// resolves), then by path, so successive batches of one state are the same.
+func selectWorkingTreeBatch(changes []LayerPathChange, size int) []LayerPathChange {
+	if len(changes) <= size {
+		return changes
+	}
+	ordered := append([]LayerPathChange(nil), changes...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		mi, mj := dependencyManifestPath(ordered[i].Path), dependencyManifestPath(ordered[j].Path)
+		if mi != mj {
+			return mi
+		}
+		return ordered[i].Path < ordered[j].Path
+	})
+	return ordered[:size]
+}
+
+// partialWorkingTreeManifest is the manifest and identity fingerprint of an
+// import link: the state it describes is its parent's (the commit for a
+// direct build) with exactly the batch's paths moved to the sample's entries.
+// The fingerprint names that state, never the sample's: every freshness and
+// reuse check compares it with a whole-checkout fingerprint, so a batch is
+// never taken for the working tree it is on its way to.
+func partialWorkingTreeManifest(
+	chained bool,
+	parent, next resolvedManifest,
+	batch []LayerPathChange,
+	policy string,
+) (*generationInputManifest, string) {
+	state := resolvedManifest{policy: policy, entries: map[string]store_sqlite.InputManifestEntry{}}
+	if chained {
+		for p, e := range parent.entries {
+			state.entries[p] = e
+		}
+	}
+	for _, change := range batch {
+		if e, ok := next.entries[change.Path]; ok {
+			state.entries[change.Path] = e
+		} else {
+			delete(state.entries, change.Path)
+		}
+	}
+	var entries []store_sqlite.InputManifestEntry
+	if chained {
+		entries = manifestDeltaEntries(parent, state)
+	} else {
+		entries = make([]store_sqlite.InputManifestEntry, 0, len(state.entries))
+		for _, e := range state.entries {
+			entries = append(entries, e)
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].FilePath < entries[j].FilePath })
+	}
+	paths := make([]string, 0, len(state.entries))
+	for p := range state.entries {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	h := sha256.New()
+	h.Write([]byte(policy))
+	for _, p := range paths {
+		e := state.entries[p]
+		fmt.Fprintf(h, "\x00%s\x00%s\x00%s\x00%s\x00%s", p, e.State, e.Mode, e.ContentSHA256, e.Admission)
+	}
+	return &generationInputManifest{
+		meta: store_sqlite.InputManifestMeta{
+			ManifestVersion: store_sqlite.InputManifestVersion,
+			IsFull:          !chained,
+			EntryCount:      len(entries),
+			PolicyDigest:    policy,
+		},
+		entries: entries,
+	}, "partial:" + hex.EncodeToString(h.Sum(nil))
 }
