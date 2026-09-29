@@ -2673,10 +2673,7 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 	started := time.Now()
 	var baseReader LayerBase = c.store.AtGeneration(base.generationID)
 	if base.generationID > 0 {
-		materializer := graphview.Materializer{
-			Store: c.store, Catalog: c.catalog, Leases: c.leases, Logger: c.logger,
-		}
-		view, openErr := materializer.MaterializeRefView(ctx, base.graphID, base.generationID)
+		view, openErr := c.baseViewMaterializer().MaterializeRefView(ctx, base.graphID, base.generationID)
 		if openErr != nil {
 			return 0, false, fmt.Errorf("indexer: open primary generation %d: %w", base.generationID, openErr)
 		}
