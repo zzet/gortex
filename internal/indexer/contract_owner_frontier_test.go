@@ -562,7 +562,10 @@ func newContractFTSEvictionFixture(t *testing.T) contractFTSEvictionFixture {
 	t.Helper()
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, "provider.go"), []byte("package fixture\nfunc Provide() {}\n"), 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "consumer.go"), []byte("package fixture\nfunc Consume() {}\n"), 0o600))
+	// The consumer's file sorts after the provider's, so the shared canonical
+	// node carries the provider's record (contractGraphRows keeps the record of
+	// the smallest file) and lives in A's node-file eviction frontier.
+	require.NoError(t, os.WriteFile(filepath.Join(root, "reader.go"), []byte("package fixture\nfunc Consume() {}\n"), 0o600))
 	storePath := filepath.Join(t.TempDir(), "graph.sqlite")
 	store, err := store_sqlite.Open(storePath)
 	require.NoError(t, err)
@@ -584,7 +587,7 @@ func newContractFTSEvictionFixture(t *testing.T) contractFTSEvictionFixture {
 	}
 	consumer := provider
 	consumer.Role = contracts.RoleConsumer
-	consumer.FilePath, consumer.SymbolID = "fixture/consumer.go", "fixture/consumer.go::Consume"
+	consumer.FilePath, consumer.SymbolID = "fixture/reader.go", "fixture/reader.go::Consume"
 	store.AddBatch([]*graph.Node{
 		{ID: provider.FilePath, Kind: graph.KindFile, FilePath: provider.FilePath, RepoPrefix: provider.RepoPrefix},
 		{ID: consumer.FilePath, Kind: graph.KindFile, FilePath: consumer.FilePath, RepoPrefix: consumer.RepoPrefix},
@@ -666,9 +669,9 @@ func TestContractFTSFileEvictionPreservesRetainedCanonicalRows(t *testing.T) {
 				// scalar path. Its now-orphaned FTS row must not leak just because
 				// B's initial by-file node set does not include the canonical.
 				f.idx.contractRegistry = nil
-				require.NoError(t, os.Remove(filepath.Join(f.root, "consumer.go")))
+				require.NoError(t, os.Remove(filepath.Join(f.root, "reader.go")))
 				require.NoError(t, f.idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
-					f.idx.evictFileIncrementalRaw("consumer.go")
+					f.idx.evictFileIncrementalRaw("reader.go")
 					return nil
 				}))
 				assert.Nil(t, f.store.GetNode(f.provider.ID))
