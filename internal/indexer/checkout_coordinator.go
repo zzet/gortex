@@ -2001,6 +2001,9 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 		return out, fmt.Errorf("indexer: wait for checkout build admission: %w", err)
 	}
 	defer release()
+	defer c.gate.NoteHolder(ViewBuildLaneHolder{
+		Kind: "checkout_transition", CheckoutID: c.checkoutID, Priority: viewBuildPriorityLabel(ViewBuildInteractive),
+	})()
 
 	if err := ctx.Err(); err != nil {
 		return out, err
