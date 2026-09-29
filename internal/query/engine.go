@@ -53,6 +53,53 @@ type Engine struct {
 	// text corpus, so candidate enumeration queries them alongside the
 	// backend's — see viewTextCandidates.
 	viewLayers []ViewLayerSource
+	// requestCtx is the lifetime of the request this engine clone serves,
+	// nil for the shared engine. Graph walks that can run long (bfs and the
+	// backend BFS capability) stop when it ends, so a handler whose caller
+	// hung up or whose deadline fired stops consuming the daemon's CPU. See
+	// WithRequestContext.
+	requestCtx context.Context
+}
+
+// WithRequestContext returns a shallow clone of the engine whose long graph
+// walks stop when ctx ends. A walk cut short answers what it had gathered (or
+// nothing), never a fallback walk that repeats the cancelled work.
+func (e *Engine) WithRequestContext(ctx context.Context) *Engine {
+	if e == nil {
+		return nil
+	}
+	clone := *e
+	clone.requestCtx = ctx
+	return &clone
+}
+
+// WithViewLayersContext is WithViewLayers and WithRequestContext in one
+// clone, so binding a routed request's lifetime costs no second copy.
+func (e *Engine) WithViewLayersContext(r graph.Reader, layers []ViewLayerSource, ctx context.Context) *Engine {
+	clone := e.WithViewLayers(r, layers)
+	if clone != nil {
+		clone.requestCtx = ctx
+	}
+	return clone
+}
+
+// walkContext is the request lifetime a walk honours: the caller's
+// QueryOptions.Context first, then the engine clone's own.
+func (e *Engine) walkContext(opts QueryOptions) context.Context {
+	if opts.Context != nil {
+		return opts.Context
+	}
+	return e.requestCtx
+}
+
+// walkDone reports whether the request a walk serves has ended.
+func walkDone(ctx context.Context) bool {
+	return ctx != nil && ctx.Err() != nil
+}
+
+// bfsContextCapable is the request-aware form of graph.BFSCapable.
+type bfsContextCapable interface {
+	BFSContext(ctx context.Context, seeds []string, dir graph.Direction, kinds []graph.EdgeKind, maxDepth, limit int) ([]graph.BFSHop, error)
 }
 
 // overlayLayered is the view side of the reader swap: a reader that
@@ -1382,6 +1429,10 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 	if opts.Limit <= 0 {
 		opts.Limit = 50
 	}
+	walkCtx := e.walkContext(opts)
+	if walkDone(walkCtx) {
+		return &SubGraph{}
+	}
 	seed := e.g.GetNode(nodeID)
 	if opts.hasScopeFilter() && (seed == nil || !opts.ScopeAllows(seed)) {
 		return &SubGraph{}
@@ -1506,7 +1557,7 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 		!opts.ExcludeTests && !opts.hasScopeFilter()
 
 	frontier := []string{nodeID}
-	for depth := 0; depth < opts.Depth && len(frontier) > 0 && len(allNodes) < opts.Limit; depth++ {
+	for depth := 0; depth < opts.Depth && len(frontier) > 0 && len(allNodes) < opts.Limit && !walkDone(walkCtx); depth++ {
 		var next []string
 		if batched {
 			for _, h := range expander.ExpandFrontier(frontier, forward, edgeKinds, opts.Limit) {
@@ -1709,7 +1760,21 @@ func (e *Engine) bfsViaCapability(
 	if !forward {
 		dir = graph.DirectionBackward
 	}
-	hops, err := capStore.BFS([]string{nodeID}, dir, edgeKinds, opts.Depth, opts.Limit)
+	var (
+		hops []graph.BFSHop
+		err  error
+	)
+	walkCtx := e.walkContext(opts)
+	if contextual, ok := capStore.(bfsContextCapable); ok && walkCtx != nil {
+		hops, err = contextual.BFSContext(walkCtx, []string{nodeID}, dir, edgeKinds, opts.Depth, opts.Limit)
+	} else {
+		hops, err = capStore.BFS([]string{nodeID}, dir, edgeKinds, opts.Depth, opts.Limit)
+	}
+	if walkDone(walkCtx) {
+		// The request ended: answer nothing rather than letting the caller
+		// fall back to the layer walk, which would redo the abandoned work.
+		return &SubGraph{}, true
+	}
 	if err != nil {
 		return nil, false
 	}

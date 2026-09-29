@@ -25,6 +25,11 @@ func (s *Store) SharesSymbolSearchCore(other any) bool {
 	return ok && !s.coreless() && !peer.coreless() && s.storeCore == peer.storeCore
 }
 
+// symbolFTSStreamObserver, when set by a test, is told which generations a
+// batch search sends through the shared unbounded rank stream. nil in
+// production.
+var symbolFTSStreamObserver func(generations []int64)
+
 func symbolFTSViewBatchQuery(generations, repos int) string {
 	q := `SELECT symbol_fts_rowid.view_gen, symbol_fts.node_id, bm25(symbol_fts)
 FROM symbol_fts
@@ -133,6 +138,41 @@ func (s *Store) SearchSymbolsViewGenerationsRepoScopedContext(
 			return nil, err
 		}
 		return hitsByGeneration, nil
+	}
+
+	// A derived generation whose documents form a dense rowid run is ranked
+	// inside that run on its own; one with no documents answers nothing.
+	// Only the rest (the base corpus, a scattered generation) share the
+	// unbounded rank stream below. See symbolFTSSpanFraction.
+	streamed := unresolved[:0:0]
+	for _, generation := range unresolved {
+		span, measured, err := s.symbolFTSGenerationSpan(ctx, generation)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case measured && span.empty():
+			continue
+		case measured && span.dense():
+			hits, err := s.searchSymbolFTSSpan(ctx, match, span, repoAllow, limit, false)
+			if err != nil {
+				return nil, err
+			}
+			hitsByGeneration[generation] = hits
+		default:
+			streamed = append(streamed, generation)
+		}
+	}
+	unresolved = streamed
+	if len(unresolved) == 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return hitsByGeneration, nil
+	}
+
+	if observe := symbolFTSStreamObserver; observe != nil {
+		observe(append([]int64(nil), unresolved...))
 	}
 
 	// CROSS JOIN fixes symbol_fts as the single outer rank stream. The UNIQUE

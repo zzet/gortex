@@ -76,6 +76,9 @@ type payloadSeal struct {
 	// is dropped at exactly the moment that state stops being true: when the
 	// generation is finally retired. See payload_generation_sweep.go.
 	sweep payloadSweepState
+	// ftsPages memoizes the published generation's ranked symbol pages
+	// (store_fts_generation_range.go).
+	ftsPages symbolFTSPageCache
 }
 
 const (

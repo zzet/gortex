@@ -203,12 +203,17 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	if s == nil || s.engine == nil {
 		return nil
 	}
+	// A routed or overlaid request engine is already a per-request clone, and
+	// it carries the request's lifetime so its long graph walks stop when the
+	// caller hangs up or the tool deadline fires. A base request keeps the
+	// shared engine untouched (zero overhead); its handlers pass their
+	// context through QueryOptions.Context instead.
 	view := requestViewFromContext(ctx)
 	if v := OverlayViewFromContext(ctx); v != nil {
-		return s.engine.WithViewLayers(v, view.candidateLayers())
+		return s.engine.WithViewLayersContext(v, view.candidateLayers(), ctx)
 	}
 	if view.routed() {
-		return s.engine.WithViewLayers(view.reader, view.candidateLayers())
+		return s.engine.WithViewLayersContext(view.reader, view.candidateLayers(), ctx)
 	}
 	return s.engine
 }

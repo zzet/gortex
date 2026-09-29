@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -197,6 +198,12 @@ type QueryOptions struct {
 	// engine-side rerank invocations to zero. The merge-side rerank
 	// is the source of truth either way.
 	SkipInnerRerank bool `json:"-"`
+
+	// Context is the lifetime of the request this walk serves. When it ends,
+	// long graph walks (bfs and the backend BFS capability) stop and answer
+	// nothing rather than running on as abandoned work. nil falls back to the
+	// engine's own request context, if any. Never serialised.
+	Context context.Context `json:"-"`
 
 	// SkipVectorChannel, when true, makes gatherBackendCandidates skip
 	// the vector channel entirely — no embedder call, no ANN search.

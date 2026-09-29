@@ -1518,7 +1518,7 @@ func (s *Server) handleGetTestTargets(ctx context.Context, req mcp.CallToolReque
 
 		// Fallback for graphs that haven't been re-indexed since the
 		// EdgeTests pass shipped, or for indirect coverage (depth > 1).
-		callers := s.engineFor(ctx).GetCallers(id, query.QueryOptions{Depth: depth, Limit: 100, Detail: "brief"})
+		callers := s.engineFor(ctx).GetCallers(id, query.QueryOptions{Depth: depth, Limit: 100, Detail: "brief", Context: ctx})
 		for _, cn := range callers.Nodes {
 			if !isTestFile(cn.FilePath) {
 				continue

@@ -721,6 +721,16 @@ func (s *Store) SearchSymbolsRepoScopedContext(ctx context.Context, query string
 		return nil, nil
 	}
 
+	// A derived generation with a dense rowid run is ranked inside it; see
+	// symbolFTSSpanFraction. The page is the one the unbounded query returns.
+	if span, measured, err := s.symbolFTSGenerationSpan(ctx, s.viewGen); err != nil {
+		return nil, err
+	} else if measured && span.empty() {
+		return nil, nil
+	} else if measured && span.dense() {
+		return s.searchSymbolFTSSpan(ctx, match, span, repoAllow, limit, true)
+	}
+
 	// symbol_fts is one shared virtual table across every generation, so the
 	// MATCH alone would rank rows this handle cannot see. The rowid map carries
 	// the generation and its symbol_fts_rowid_by_rowid index is UNIQUE on
