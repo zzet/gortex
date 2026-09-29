@@ -484,3 +484,25 @@ func (s *Store) PublishedRepoLanguageCounts(repoPrefix string) map[string]int {
 	actual, _ := s.publishedLanguageCounts.LoadOrStore(key, counts)
 	return actual.(map[string]int)
 }
+
+// generationPayloadPresenceSQL answers whether the handle's generation holds
+// any node row and any edge row: two EXISTS probes, each one seek of an index
+// leading with view_gen.
+const generationPayloadPresenceSQL = `SELECT
+  EXISTS(SELECT 1 FROM nodes WHERE view_gen = ?),
+  EXISTS(SELECT 1 FROM edges WHERE view_gen = ?)`
+
+// GenerationPayloadPresence reports whether this handle's generation carries
+// node rows and edge rows of its own. A layer with neither (a clean commit
+// generation, a dirty layer that only masks) can answer its row reads without
+// SQL. On a read error it reports both present, so a caller never skips rows
+// it could not prove absent.
+func (s *Store) GenerationPayloadPresence() (nodes, edges bool) {
+	if s.coreless() {
+		return true, true
+	}
+	if err := s.db.QueryRow(generationPayloadPresenceSQL, s.viewGen, s.viewGen).Scan(&nodes, &edges); err != nil {
+		return true, true
+	}
+	return nodes, edges
+}

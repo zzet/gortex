@@ -269,6 +269,7 @@ func (s *Server) SetMaterializer(m *graphview.Materializer) {
 		return
 	}
 	s.materializer = m
+	s.wireRoutePrewarm()
 }
 
 // Materializer returns the routed-view materializer the server reads through,
@@ -2421,4 +2422,25 @@ func withDeferredMaterialization(ctx context.Context) context.Context {
 func deferredMaterialization(ctx context.Context) bool {
 	deferred, _ := ctx.Value(deferredMaterializationKey{}).(bool)
 	return deferred
+}
+
+// wireRoutePrewarm installs the materializer's WarmRoute as the lifecycle's
+// route prewarmer, so every coordinator loads the layer masks of a stack it
+// is about to route before the route flips: the first request on a new
+// generation (an edit's selection most of all) then composes its view from
+// the cache instead of loading the new generation's masks inline.
+func (s *Server) wireRoutePrewarm() {
+	if s == nil || s.lifecycle == nil || s.materializer == nil {
+		return
+	}
+	materializer, logger := s.materializer, s.logger
+	s.lifecycle.SetRoutePrewarmer(func(ctx context.Context, generations []int64) {
+		started := time.Now()
+		loaded, err := materializer.WarmRoute(ctx, generations...)
+		if logger != nil && (err != nil || time.Since(started) > 50*time.Millisecond) {
+			logger.Info("graph view: route prewarmed before its flip",
+				zap.Int64s("generations", generations), zap.Int("mask_sets_loaded", loaded),
+				zap.Duration("elapsed", time.Since(started)), zap.Error(err))
+		}
+	})
 }

@@ -149,11 +149,13 @@ type checkoutHeadIdentity struct {
 	commit string
 }
 type CheckoutLifecycle struct {
-	mi      *MultiIndexer
-	cfgMgr  *config.ConfigManager
-	catalog *store_sqlite.Catalog
-	store   *store_sqlite.Store
-	leases  *graphview.LeaseManager
+	// routePrewarm is read by every coordinator before a route flip.
+	routePrewarm routePrewarmerSlot
+	mi           *MultiIndexer
+	cfgMgr       *config.ConfigManager
+	catalog      *store_sqlite.Catalog
+	store        *store_sqlite.Store
+	leases       *graphview.LeaseManager
 
 	// Owner registration and closure share this lock; serving acquisition is
 	// registry-only and always precedes the reader's catalog snapshot.
@@ -2319,6 +2321,7 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		Semantic: l.mi.semanticMgr,
 	}
 	coordinator, err := NewCheckoutCoordinator(CheckoutCoordinatorConfig{
+		PrewarmRoute:   l.routePrewarm.call,
 		CheckoutID:     checkout.CheckoutID,
 		CheckoutRoot:   checkout.RootPath,
 		FamilyID:       checkout.FamilyID,

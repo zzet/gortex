@@ -192,6 +192,8 @@ type CheckoutCoordinatorConfig struct {
 	// CheckoutID is the catalog identity of the checkout, and the key its
 	// route row is stored under.
 	CheckoutID string
+	// PrewarmRoute loads the new route's masks before the flip, best effort.
+	PrewarmRoute RoutePrewarmer
 	// CheckoutRoot is the working tree the coordinator samples and builds from.
 	CheckoutRoot string
 	// FamilyID is the family whose primary dedicated graph the checkout's
@@ -598,7 +600,9 @@ type CheckoutCoordinator struct {
 	// ticket (a test seam; nil uses the store).
 	announceWrite func() func()
 
-	cycleDone    func(CheckoutCycle)
+	cycleDone func(CheckoutCycle)
+	// prewarm is the installed route-mask prewarmer.
+	prewarm      RoutePrewarmer
 	dirtyBarrier func()
 
 	// cyclePreflight and cycleBarrier are focused test seams. Production uses
@@ -782,6 +786,7 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 		cancelLifetime: cancelLifetime,
 		backlog:        map[int64]struct{}{},
 		cycleDone:      cfg.cycleDone,
+		prewarm:        cfg.PrewarmRoute,
 		dirtyBarrier:   cfg.dirtyBarrier,
 	}
 	if !cfg.debounceDemand {
@@ -3061,6 +3066,7 @@ func (c *CheckoutCoordinator) flip(
 	// already ready and PublishAndRoute — which publishes and then flips —
 	// would refuse it for not being in the building state. The flip alone is
 	// what is left of that pair for a caller holding a published generation.
+	c.prewarmRoute(ctx, route, slot, generationID)
 	err := c.catalog.FlipCheckoutRouteSlot(ctx, store_sqlite.FlipCheckoutRouteSlotRequest{
 		CheckoutID:         c.checkoutID,
 		Slot:               slot,

@@ -98,6 +98,10 @@ type Materializer struct {
 	Logger *zap.Logger
 
 	newGenerationLayer func(context.Context, *store_sqlite.Store) (*GenerationLayer, error)
+
+	// layerCache keeps each published generation's masks across requests.
+	layerCacheOnce sync.Once
+	layerCache     *generationLayerCache
 }
 
 // GenerationSource is one persisted generation of a view's stack seen by
@@ -1017,14 +1021,19 @@ func (m *Materializer) openGeneration(ctx context.Context, generationID int64) (
 ) {
 	row, err := m.servableGeneration(ctx, generationID)
 	if err != nil {
+		// A generation that stopped being servable must not keep its masks
+		// cached; the refusal above is what every later open sees first.
+		m.ForgetGeneration(generationID)
 		return nil, nil, row, err
 	}
 	handle := m.Store.AtGeneration(generationID)
-	newLayer := m.newGenerationLayer
-	if newLayer == nil {
-		newLayer = NewGenerationLayerContext
+	var layer *GenerationLayer
+	if newLayer := m.newGenerationLayer; newLayer != nil {
+		layer, err = newLayer(ctx, handle)
+	} else {
+		key := layerCacheKey{generation: generationID, createdAt: row.CreatedAt, publishedAt: row.PublishedAt}
+		layer, err = m.layerCacheFor().open(ctx, key, handle, NewGenerationLayerContext)
 	}
-	layer, err := newLayer(ctx, handle)
 	if err != nil {
 		return nil, nil, row, WrapViewError(CodeCheckoutInaccessible,
 			fmt.Sprintf("open generation %d", generationID), err)

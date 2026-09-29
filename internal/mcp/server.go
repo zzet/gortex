@@ -1825,6 +1825,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 			}
 		}
 		s.lifecycle.SetNotifier(s)
+		s.wireRoutePrewarm()
 	}
 
 	// Proactive-notification broadcasters. Constructed up-front so

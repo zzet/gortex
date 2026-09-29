@@ -144,6 +144,34 @@ type GenerationLayer struct {
 
 	edgesOnce sync.Once
 	edges     []*graph.Edge
+
+	// presenceOnce caches whether the generation holds node and edge rows of
+	// its own. A generation is immutable once a layer is opened over it, so a
+	// layer without rows answers its row reads without SQL — its masks still
+	// apply through the composed view. The live chain carries such levels
+	// (a clean commit generation, an unchanged dirty layer).
+	presenceOnce sync.Once
+	hasNodes     bool
+	hasEdges     bool
+}
+
+// payloadPresence reports, once per layer, whether the generation carries
+// node rows and edge rows.
+func (l *GenerationLayer) payloadPresence() (nodes, edges bool) {
+	l.presenceOnce.Do(func() {
+		l.hasNodes, l.hasEdges = l.handle.GenerationPayloadPresence()
+	})
+	return l.hasNodes, l.hasEdges
+}
+
+func (l *GenerationLayer) noNodeRows() bool {
+	nodes, _ := l.payloadPresence()
+	return !nodes
+}
+
+func (l *GenerationLayer) noEdgeRows() bool {
+	_, edges := l.payloadPresence()
+	return !edges
 }
 
 // Compile-time assertion that the persisted layer answers the same
@@ -458,7 +486,10 @@ func (l *GenerationLayer) NodeByID(id string) *graph.Node {
 	if ok {
 		return cached
 	}
-	node := l.handle.GetNode(id)
+	var node *graph.Node
+	if !l.noNodeRows() {
+		node = l.handle.GetNode(id)
+	}
 	if !l.servesNode(node) {
 		node = nil
 	}
@@ -538,7 +569,10 @@ func (l *GenerationLayer) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph
 	if len(ids) == 0 {
 		return nil
 	}
-	batch := l.handle.GetOutEdgesByNodeIDs(ids)
+	var batch map[string][]*graph.Edge
+	if !l.noEdgeRows() {
+		batch = l.handle.GetOutEdgesByNodeIDs(ids)
+	}
 	out := make(map[string][]*graph.Edge, len(ids))
 	seen := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
@@ -613,7 +647,10 @@ func (l *GenerationLayer) FileNodes(graphPath string) []*graph.Node {
 	if ok {
 		return cached
 	}
-	nodes := l.serveNodes(l.handle.GetFileNodes(graphPath))
+	var nodes []*graph.Node
+	if !l.noNodeRows() {
+		nodes = l.serveNodes(l.handle.GetFileNodes(graphPath))
+	}
 	l.mu.Lock()
 	l.fileNodes[graphPath] = nodes
 	l.mu.Unlock()
@@ -622,7 +659,7 @@ func (l *GenerationLayer) FileNodes(graphPath string) []*graph.Node {
 
 // OutEdges returns the generation's edges leaving one node.
 func (l *GenerationLayer) OutEdges(nodeID string) []*graph.Edge {
-	if nodeID == "" {
+	if nodeID == "" || l.noEdgeRows() {
 		return nil
 	}
 	return l.serveEdges(l.handle.GetOutEdges(nodeID))
@@ -630,7 +667,7 @@ func (l *GenerationLayer) OutEdges(nodeID string) []*graph.Edge {
 
 // InEdges returns the generation's edges entering one node.
 func (l *GenerationLayer) InEdges(nodeID string) []*graph.Edge {
-	if nodeID == "" {
+	if nodeID == "" || l.noEdgeRows() {
 		return nil
 	}
 	return l.serveEdges(l.handle.GetInEdges(nodeID))
