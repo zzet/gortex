@@ -325,7 +325,7 @@ func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 	if err := m.receiptStillCurrent(); err != nil {
 		return CheckoutCycle{}, err
 	}
-	out := m.coordinator.reconcile(ctx)
+	out := m.coordinator.reconcile(withInteractiveBuild(ctx))
 	recordCoordinatorCycle(out)
 	if out.Err != nil {
 		return out, out.Err

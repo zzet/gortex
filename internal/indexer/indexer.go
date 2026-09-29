@@ -1724,14 +1724,10 @@ func (idx *Indexer) SetResolverLSPHelper(h resolver.LSPHelper) {
 	}
 }
 
-// filteredShadowAdmissionWait bounds how long a pass with a corpus filter
-// installed will queue for a process-wide in-memory slot before giving up and
-// running against the store directly.
-//
-// The number is a latency budget, not a capacity estimate: the slot is worth
-// having but never worth waiting on, because the path without it is the one
-// that shipped before the mode existed and is correct on its own.
-const filteredShadowAdmissionWait = 2 * time.Second
+// filteredShadowAdmissionWait and interactiveShadowAdmissionWait
+// (shadow_admission.go) bound how long a pass with a corpus filter installed
+// queues for an in-memory slot before running against the store directly.
+// They are latency budgets, not capacity estimates.
 
 // setPassCorpusFilter installs the read-only-context mode described on
 // Indexer.passCorpusFilter. It must be called before IndexCtx: the eligibility
@@ -2969,6 +2965,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	if admission == nil {
 		admission = processShadowAdmission
 	}
+	admissionWait := shadowAdmissionWaitFor(ctx, idx.passCorpusFilter != nil)
 	shadowAdmissionStarted := time.Now()
 	var shadowLease *shadowAdmissionLease
 	if shadowLocallyEligible {
@@ -2983,8 +2980,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// closure and withdrawing it, which is exactly the behaviour that
 		// shipped before this mode existed.
 		acquireCtx, cancelAcquire := ctx, context.CancelFunc(nil)
-		if idx.passCorpusFilter != nil {
-			acquireCtx, cancelAcquire = context.WithTimeout(ctx, filteredShadowAdmissionWait)
+		if admissionWait > 0 {
+			acquireCtx, cancelAcquire = context.WithTimeout(ctx, admissionWait)
 		}
 		shadowLease, err = admission.acquire(acquireCtx, shadowWeight)
 		if cancelAcquire != nil {
