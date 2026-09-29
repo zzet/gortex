@@ -302,12 +302,12 @@ func (r *Resolver) cachedFindNodesByNameInRepoForEdge(name, repo string, edge *g
 	if r.nodesByRepoLanguageName != nil {
 		if byName, ok := r.nodesByRepoLanguageName[scope]; ok {
 			if hits, warmed := byName[name]; warmed {
-				return genericInstantiationOnly(edge, hits)
+				return genericInstantiationOnly(edge, withoutAttributedTerminals(hits))
 			}
 		}
 	}
-	return genericInstantiationOnly(edge,
-		graph.FindNodesByNamesInRepoLanguages(r.graph, []string{name}, scope.repo, languages)[name])
+	return genericInstantiationOnly(edge, withoutAttributedTerminals(
+		graph.FindNodesByNamesInRepoLanguages(r.graph, []string{name}, scope.repo, languages)[name]))
 }
 
 // genericInstantiationOnly narrows a call edge's candidates when the
