@@ -747,6 +747,22 @@ func generationReadProbes() []genProbe {
 			}
 			return out
 		}},
+		// A handle bound to a request context reads its own generation:
+		// binding changes only when a paged read stops, never what it serves.
+		{name: "BindReadContext", run: func(t *testing.T, s *Store) []string {
+			bound, ok := s.BindReadContext(context.Background()).(*Store)
+			if !ok || bound.ViewGeneration() != s.ViewGeneration() {
+				t.Fatalf("BindReadContext left generation %d", s.ViewGeneration())
+			}
+			kinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindInterface, graph.KindVariable}
+			out := nodeTokens(bound.NodesByKinds(kinds))
+			out = append(out, nodeTokens(bound.DeadCodeCandidates(kinds, nil))...)
+			var probes []*graph.Node
+			for _, id := range genReadProbeIDs() {
+				probes = append(probes, bound.GetNode(id))
+			}
+			return append(out, nodeTokens(probes)...)
+		}},
 		{name: "RecordedEdgesAt", run: func(t *testing.T, s *Store) []string {
 			return edgeTokens(s.RecordedEdgesAt([]string{genReadFileA, genImportFile(genZeroMark), genImportFile(genOneMark)}))
 		}},
@@ -1940,6 +1956,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.PlannerStatsFreshener)(nil), skip: skipPhysical},
 		{iface: (*graph.QualifiedNodeIdentitySequencer)(nil), probe: "NodesInScopeSeq"},
 		{iface: (*graph.RecordedEdgeReader)(nil), probe: "RecordedEdgesAt"},
+		{iface: (*graph.ReadContextBinder)(nil), probe: "BindReadContext"},
 		{iface: (*graph.ReachableForwardByKinds)(nil), probe: "ReachableForwardByKinds"},
 		{iface: (*graph.ReceiverMutationScanner)(nil), probe: "ScanReceiverMutation"},
 		{iface: (*graph.RefFactsReader)(nil), skip: skipSidecar},
