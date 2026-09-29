@@ -553,10 +553,10 @@ func (s *Store) DistinctExternalTargets(kinds []graph.EdgeKind) []string {
 }
 
 // NodesByKinds returns every node whose kind is in the supplied set, in id
-// order. Each keyset page is a separate short read transaction; the
-// compatibility method uses a background context.
+// order. It is NodesByKindsContext under the handle's bound read context (see
+// WithReadContext); a read cut short by that context returns what it read.
 func (s *Store) NodesByKinds(kinds []graph.NodeKind) []*graph.Node {
-	out, _ := s.NodesByKindsContext(context.Background(), kinds)
+	out, _ := s.NodesByKindsContext(s.readContext(), kinds)
 	return out
 }
 

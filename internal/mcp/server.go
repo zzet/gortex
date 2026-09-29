@@ -2582,7 +2582,9 @@ func (s *Server) scopedNodesByKinds(ctx context.Context, kinds []graph.NodeKind)
 	if len(kinds) == 0 {
 		return nil
 	}
-	reader := s.readerFor(ctx)
+	// Bound to the request: an abandoned call stops reading within one page
+	// of its deadline instead of pinning the store's WAL snapshot.
+	reader := graph.BindReadContext(s.readerFor(ctx), ctx)
 	var nodes []*graph.Node
 	if scan, ok := reader.(graph.NodesByKindsScanner); ok {
 		nodes = scan.NodesByKinds(kinds)

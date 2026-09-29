@@ -493,6 +493,9 @@ type Store struct {
 	// and closing them from a derived handle would break every other handle
 	// still using the same database.
 	ownsCore bool
+
+	// readCtx bounds whole-store paged analysis to its caller.
+	readCtx context.Context
 }
 
 // coreless reports a handle with nothing behind it: a nil pointer, or a zero
@@ -2708,6 +2711,34 @@ func (s *Store) queryNodesContext(ctx context.Context, stmt *sql.Stmt, args ...a
 	}
 	return out
 }
+
+// WithReadContext returns a handle over the same generation whose paged
+// whole-store reads stop within one page once ctx ends. It shares everything
+// else with s; it never owns the core.
+func (s *Store) WithReadContext(ctx context.Context) *Store {
+	if s == nil {
+		return nil
+	}
+	bound := *s
+	bound.ownsCore = false
+	bound.readCtx = ctx
+	return &bound
+}
+
+// BindReadContext implements graph.ReadContextBinder.
+func (s *Store) BindReadContext(ctx context.Context) graph.Reader {
+	return s.WithReadContext(ctx)
+}
+
+// readContext is the handle's bound read context, or Background.
+func (s *Store) readContext() context.Context {
+	if s != nil && s.readCtx != nil {
+		return s.readCtx
+	}
+	return context.Background()
+}
+
+var _ graph.ReadContextBinder = (*Store)(nil)
 
 // GetRepoNonContentNodes is the graph.NonContentNodeReader fast path: a
 // SQL-level enumeration that drops CONTENT (data_class="content") section

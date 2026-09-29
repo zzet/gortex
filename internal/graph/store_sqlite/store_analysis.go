@@ -12,6 +12,7 @@ package store_sqlite
 // created in schema.go (edges_by_from / edges_by_to / nodes_by_kind).
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -59,48 +60,7 @@ func anaDedupeEdgeKinds(in []graph.EdgeKind) []graph.EdgeKind {
 // node-id exclusion happens here. The NOT-EXISTS filter runs server-side
 // per node kind.
 func (s *Store) DeadCodeCandidates(allowedNodeKinds []graph.NodeKind, allowedInEdgeKinds map[graph.NodeKind][]graph.EdgeKind) []*graph.Node {
-	if len(allowedNodeKinds) == 0 {
-		return nil
-	}
-	var out []*graph.Node
-	for _, nk := range allowedNodeKinds {
-		allowed := anaDedupeEdgeKinds(allowedInEdgeKinds[nk])
-		anyKindCounts := len(allowed) == 0
-
-		var q string
-		var args []any
-		// The reachability probe pairs generations with the node it is
-		// testing. Without the pairing an incoming edge from any other
-		// generation answers "used", and every node reads as reachable.
-		if anyKindCounts {
-			// Any incoming edge disqualifies the node.
-			q = `SELECT ` + lookupNodeCols + ` FROM nodes n
-WHERE n.kind = ?
-  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.view_gen = n.view_gen)
-  AND n.view_gen = ?
-ORDER BY n.id`
-			args = []any{string(nk), s.viewGen}
-		} else {
-			// Only an incoming edge of one of the allowed kinds counts.
-			q = `SELECT ` + lookupNodeCols + ` FROM nodes n
-WHERE n.kind = ?
-  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.kind IN (` + inPlaceholders(len(allowed)) + `) AND e.view_gen = n.view_gen)
-  AND n.view_gen = ?
-ORDER BY n.id`
-			args = make([]any, 0, 2+len(allowed))
-			args = append(args, string(nk))
-			for _, ek := range allowed {
-				args = append(args, string(ek))
-			}
-			args = append(args, s.viewGen)
-		}
-
-		for _, n := range s.queryNodesSQL(q, args...) {
-			if n != nil {
-				out = append(out, n)
-			}
-		}
-	}
+	out, _ := s.DeadCodeCandidatesContext(s.readContext(), allowedNodeKinds, allowedInEdgeKinds)
 	return out
 }
 
@@ -674,4 +634,142 @@ JOIN nodes nt ON nt.id = e.to_id AND nt.view_gen = e.view_gen
 		args = appendKinds(args)
 	}
 	return q, args, true
+}
+
+// deadCodePageSize bounds one DeadCodeCandidates page: how many nodes of a
+// kind one short read transaction examines.
+var deadCodePageSize = 4096
+
+// DeadCodeCandidatesContext is DeadCodeCandidates in keyset pages, stopping
+// within one page once ctx ends (returning the candidates found so far and
+// ctx's error). Per kind, each page is two short read transactions: the
+// next deadCodePageSize node ids of the kind in id order, each with its
+// "no counting incoming edge" verdict (nodes_by_generation seek plus one
+// NOT EXISTS probe per id), then the full rows of the candidates among them.
+// The former single statement per kind scanned the whole generation inside
+// one read transaction — minutes on a large store, pinning the WAL snapshot
+// the whole time. Rows and their order equal the single statement's on an
+// unchanging generation.
+func (s *Store) DeadCodeCandidatesContext(ctx context.Context, allowedNodeKinds []graph.NodeKind, allowedInEdgeKinds map[graph.NodeKind][]graph.EdgeKind) ([]*graph.Node, error) {
+	if len(allowedNodeKinds) == 0 {
+		return nil, nil
+	}
+	var out []*graph.Node
+	for _, nk := range allowedNodeKinds {
+		allowed := anaDedupeEdgeKinds(allowedInEdgeKinds[nk])
+		q := deadCodeVerdictPageSQL(len(allowed))
+		after := ""
+		for {
+			if err := ctx.Err(); err != nil {
+				return out, err
+			}
+			args := make([]any, 0, 4+len(allowed))
+			args = append(args, s.viewGen, after, string(nk))
+			for _, ek := range allowed {
+				args = append(args, string(ek))
+			}
+			args = append(args, deadCodePageSize)
+			dead, scanned, lastID, err := s.deadCodeVerdictPage(ctx, q, args...)
+			if err != nil {
+				return out, err
+			}
+			if len(dead) > 0 {
+				nodes, err := s.nodesByIDsOrdered(ctx, dead)
+				out = append(out, nodes...)
+				if err != nil {
+					return out, err
+				}
+			}
+			if scanned < deadCodePageSize {
+				break
+			}
+			after = lastID
+		}
+	}
+	return out, nil
+}
+
+// deadCodeVerdictPageSQL is one page of a kind's ids with their verdict. The
+// reachability probe pairs generations with the node it is testing: without
+// the pairing an incoming edge from any other generation answers "used".
+// With no allowed edge kinds, any incoming edge counts as usage.
+func deadCodeVerdictPageSQL(allowedEdgeKinds int) string {
+	probe := `NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.view_gen = n.view_gen)`
+	if allowedEdgeKinds > 0 {
+		probe = `NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.kind IN (` + inPlaceholders(allowedEdgeKinds) + `) AND e.view_gen = n.view_gen)`
+	}
+	return `SELECT n.id, ` + probe + ` FROM nodes n WHERE n.view_gen = ? AND n.id > ? AND n.kind = ? ORDER BY n.id LIMIT ?`
+}
+
+// deadCodeVerdictPage runs one verdict page: the dead ids (in id order), how
+// many ids it examined, and the last one.
+func (s *Store) deadCodeVerdictPage(ctx context.Context, q string, args ...any) ([]string, int, string, error) {
+	// The probe's edge-kind placeholders sit in the SELECT list, before the
+	// WHERE clause's; reorder the arguments to match.
+	ordered := reorderDeadCodeArgs(args)
+	rows, err := s.db.QueryContext(ctx, q, ordered...)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, 0, "", ctx.Err()
+		}
+		panicOnFatal(err)
+		return nil, 0, "", err
+	}
+	defer rows.Close()
+	var dead []string
+	scanned := 0
+	var lastID string
+	for rows.Next() {
+		var id string
+		var isDead bool
+		if err := rows.Scan(&id, &isDead); err != nil {
+			if ctx.Err() != nil {
+				return dead, scanned, lastID, ctx.Err()
+			}
+			panicOnFatal(err)
+			return dead, scanned, lastID, err
+		}
+		scanned++
+		lastID = id
+		if isDead {
+			dead = append(dead, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		if ctx.Err() != nil {
+			return dead, scanned, lastID, ctx.Err()
+		}
+		panicOnFatal(err)
+		return dead, scanned, lastID, err
+	}
+	return dead, scanned, lastID, nil
+}
+
+// reorderDeadCodeArgs maps (viewGen, after, kind, edgeKinds..., limit) onto
+// the SQL's placeholder order: the probe's edge kinds (in the SELECT list),
+// then viewGen, after, kind, limit.
+func reorderDeadCodeArgs(args []any) []any {
+	viewGen, after, kind := args[0], args[1], args[2]
+	edgeKinds := args[3 : len(args)-1]
+	limit := args[len(args)-1]
+	out := make([]any, 0, len(args))
+	out = append(out, edgeKinds...)
+	return append(out, viewGen, after, kind, limit)
+}
+
+// nodesByIDsOrdered reads the full rows of ids (sorted) on this handle's
+// generation, in id order, in one short read.
+func (s *Store) nodesByIDsOrdered(ctx context.Context, ids []string) ([]*graph.Node, error) {
+	var out []*graph.Node
+	for i := 0; i < len(ids); i += lookupChunkSize {
+		end := minInt(i+lookupChunkSize, len(ids))
+		chunk := ids[i:end]
+		q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE id IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ? ORDER BY id`
+		page, _, _, err := s.scanNodePage(ctx, q, append(toAnyArgs(chunk), s.viewGen)...)
+		out = append(out, page...)
+		if err != nil {
+			return out, err
+		}
+	}
+	return out, nil
 }

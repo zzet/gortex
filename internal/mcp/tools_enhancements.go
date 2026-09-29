@@ -2571,7 +2571,7 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	reader := s.readerFor(ctx)
-	entries := analysis.FindDeadCode(reader, s.getProcesses(), nil, opts)
+	entries := analysis.FindDeadCode(graph.BindReadContext(reader, ctx), s.getProcesses(), nil, opts)
 
 	// dead_code reads the whole graph directly, bypassing the scoped-node
 	// accessors, so narrow its rows to the session workspace + optional
@@ -2695,7 +2695,7 @@ func (s *Server) handleFindHotspots(ctx context.Context, req mcp.CallToolRequest
 	if threshold == 0 {
 		entries = s.getHotspots()
 	} else {
-		entries = analysis.FindHotspots(s.graph, s.getCommunities(), threshold)
+		entries = analysis.FindHotspots(graph.BindReadContext(s.graph, ctx), s.getCommunities(), threshold)
 	}
 
 	// K17: optional novelty / directional reranking modes. Default
