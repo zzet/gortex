@@ -240,7 +240,7 @@ func TestClosureQualNameLookupIsBatchedOncePerBuild(t *testing.T) {
 		present[rel] = struct{}{}
 	}
 	out := map[string]struct{}{}
-	counted.collectIntroduced(present, out)
+	counted.collectIntroduced(present, out, out)
 
 	if calls != 1 {
 		t.Errorf("the build issued %d batched qualified-name lookups, want exactly 1: "+

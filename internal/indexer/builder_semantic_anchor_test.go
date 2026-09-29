@@ -108,8 +108,8 @@ func TestEditingAPackagesImportAnchorLeavesItsImportersOut(t *testing.T) {
 				t.Fatalf("app's import lands on %s, not %s: the edit does not cover the anchor", got, anchor)
 			}
 			if slices.Contains(c.report.ClosurePaths, "app/main.go") {
-				t.Errorf("an edit of the import anchor %s re-derives its importer: closure %v",
-					anchor, c.report.ClosurePaths)
+				t.Errorf("an edit of the import anchor %s re-derives its importer: closure %v, dependents %v",
+					anchor, c.report.ClosurePaths, c.report.ClosureDependentPaths)
 			}
 			builderAssertReadersAgree(t, c.composed, c.flat)
 		})

@@ -323,6 +323,13 @@ type BuildReport struct {
 	// the change set, and ClosurePaths lists them in sorted order.
 	ClosureFiles int
 	ClosurePaths []string
+	// ClosureDeclaredPaths is the part of ClosurePaths read only so the change
+	// set and its dependents resolve (the manifests and the files they bind
+	// into); the generation withholds it without comparison.
+	// ClosureDependentPaths is the rest: the files whose own payload the change
+	// can move, re-derived and compared with the layer below.
+	ClosureDeclaredPaths  []string
+	ClosureDependentPaths []string
 
 	// ClosureTruncated reports that the closure hit ClosureCap and was cut. The
 	// generation is then knowingly incomplete: a dependent that fell past the
@@ -351,6 +358,15 @@ type BuildReport struct {
 	// NodeCount and EdgeCount are what the generation carries.
 	NodeCount int
 	EdgeCount int
+	// PassNodeCount and PassEdgeCount are what the pass produced before the
+	// read-only context was withheld from it; with nothing withheld they
+	// equal NodeCount and EdgeCount.
+	PassNodeCount int
+	PassEdgeCount int
+
+	// DeclaredContextSeeded lists, sorted, the declared closure context paths
+	// the pass seeded from the layer below instead of parsing them.
+	DeclaredContextSeeded []string
 
 	// ContextPaths lists, in sorted order, the closure paths the generation
 	// declared read-only context: files the pass read to resolve the change
@@ -643,6 +659,7 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		var separation contextSeparation
 		if adopted || len(plan.indexed) > 0 {
 			var err error
+			plan.seeded, plan.seedBase = decideDeclaredSeed(req, plan)
 			if separation, err = b.runPass(ctx, req, plan, handle, &report); err != nil {
 				return err
 			}
@@ -793,6 +810,18 @@ type buildPlan struct {
 	// so the mask derivation needs no extra parameter; a plan that never
 	// reached the separation leaves it nil and the derivation is unchanged.
 	withdrawn map[string]struct{}
+	// declared is the repo-relative subset of context read only for
+	// resolution (BuildReport.ClosureDeclaredPaths). Its re-derivation runs
+	// against a corpus that deliberately omits what IT resolves into, so it is
+	// never compared with the layer below: it is withheld whole.
+	declared map[string]struct{}
+	// seeded is the repo-relative subset of declared that the pass seeds from
+	// the layer below instead of parsing (builder_declared_context.go),
+	// decided once before the pass so both context routes see the same set.
+	// seedBase holds the layer below's nodes at those paths, read for that
+	// decision and reused by the seed.
+	seeded   []string
+	seedBase map[string][]*graph.Node
 }
 
 func (b *SparseGenerationBuilder) planFileSetContext(
@@ -879,6 +908,18 @@ func (b *SparseGenerationBuilder) planFileSetContext(
 		}
 		plan.context = append(plan.context, p)
 	}
+	for _, p := range report.ClosureDeclaredPaths {
+		if _, gone := deleted[p]; gone {
+			continue
+		}
+		if _, isChange := present[p]; isChange {
+			continue
+		}
+		if plan.declared == nil {
+			plan.declared = make(map[string]struct{}, len(report.ClosureDeclaredPaths))
+		}
+		plan.declared[p] = struct{}{}
+	}
 	for p := range deleted {
 		if err := ctx.Err(); err != nil {
 			return buildPlan{}, report, err
@@ -946,10 +987,22 @@ func (b *SparseGenerationBuilder) runPass(
 	// called, separation.applied stays false, and the caller falls back to
 	// withdrawing the same set from the generation after the fact.
 	var separation contextSeparation
+	// The pass takes its node and edge counts before the drain, which is
+	// before this filter runs; what the generation holds is what survives
+	// the filter. The counts are re-taken here with the pass's own measure so
+	// the report describes the payload that is written, not the corpus the
+	// pass read.
+	var filteredNodes, filteredEdges int
+	filtered := false
 	idx.setPassCorpusFilter(func(corpus *graph.Graph) error {
 		var err error
-		separation, err = b.withholdContextPayload(ctx, req, plan, corpus)
-		return err
+		separation, err = b.separateAndPrune(ctx, req, plan, corpus)
+		if err != nil {
+			return err
+		}
+		filteredNodes, filteredEdges = passCorpusCounts(corpus, req.RepoPrefix)
+		filtered = true
+		return nil
 	})
 
 	idx.SetRepoPrefix(req.RepoPrefix)
@@ -964,7 +1017,14 @@ func (b *SparseGenerationBuilder) runPass(
 		idx.parseAdmission.Store(b.Admissions.parseAdmission.Load())
 		idx.nativeParseAdmission.Store(b.Admissions.nativeParseAdmission.Load())
 	}
-	idx.setContentSourceWithManifests(report.Work.extractionSource(newFileSetSource(req.Target, plan.indexed)), req.Target)
+	// Declared context is seeded from the layer below instead of parsed
+	// (builder_declared_context.go); the parse reads the rest of the plan.
+	seeded := plan.seeded
+	if len(seeded) > 0 {
+		idx.setPassCorpusSeed(declaredContextSeed(req.Base, req.RepoPrefix, seeded, plan.seedBase, b.Logger))
+		report.DeclaredContextSeeded = seeded
+	}
+	idx.setContentSourceWithManifests(report.Work.extractionSource(newFileSetSource(req.Target, parsedPlanPaths(plan.indexed, seeded))), req.Target)
 
 	result, err := idx.IndexCtx(ctx, req.RootPath)
 	if err != nil {
@@ -973,6 +1033,10 @@ func (b *SparseGenerationBuilder) runPass(
 	if result != nil {
 		report.NodeCount = result.NodeCount
 		report.EdgeCount = result.EdgeCount
+		report.PassNodeCount, report.PassEdgeCount = result.NodeCount, result.EdgeCount
+		if filtered {
+			report.NodeCount, report.EdgeCount = filteredNodes, filteredEdges
+		}
 	}
 	report.ContextHeldInMemory = separation.applied
 	return separation, nil
@@ -1144,6 +1208,9 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 	corpus contextCorpus,
 ) (contextSeparation, error) {
 	out := contextSeparation{applied: true}
+	if err := requireContextCorpus(corpus); err != nil {
+		return contextSeparation{}, err
+	}
 	if len(plan.context) == 0 {
 		return out, nil
 	}
@@ -1152,10 +1219,14 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 	}
 	contextPaths := make([]string, 0, len(plan.context))
 	candidates := make(map[string]struct{}, len(plan.context))
+	declaredPaths := make(map[string]struct{}, len(plan.declared))
 	for _, rel := range plan.context {
 		graphPath := builderGraphPath(req.RepoPrefix, rel)
 		contextPaths = append(contextPaths, graphPath)
 		candidates[graphPath] = struct{}{}
+		if _, isDeclared := plan.declared[rel]; isDeclared {
+			declaredPaths[graphPath] = struct{}{}
+		}
 	}
 	// The change set, in graph-path spelling: indexed minus context, plus the
 	// paths the change removed. The comparison needs it to tell a difference
@@ -1180,9 +1251,11 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 	// payload eviction, keep contract-bearing paths as explicit output rather
 	// than partially evicting them and claiming they are read-only context.
 	contractPaths := make(map[string]struct{})
+	contractIDsAt := make(map[string][]string)
 	for _, node := range carriedNodes {
 		if node != nil && node.Kind == graph.KindContract {
 			contractPaths[node.FilePath] = struct{}{}
+			contractIDsAt[node.FilePath] = append(contractIDsAt[node.FilePath], node.ID)
 		}
 	}
 	if len(carried.nodesByPath) == 0 && len(carried.edgesByPath) == 0 {
@@ -1191,11 +1264,25 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 	if err := ctx.Err(); err != nil {
 		return contextSeparation{}, err
 	}
-	baseNodes := req.Base.GetFileNodesByPaths(contextPaths)
+	// Declared context is never compared, so neither its base nodes nor its
+	// adjacency are read.
+	comparedPaths := contextPaths
+	if len(declaredPaths) > 0 {
+		comparedPaths = make([]string, 0, len(contextPaths))
+		for _, graphPath := range contextPaths {
+			if _, isDeclared := declaredPaths[graphPath]; !isDeclared {
+				comparedPaths = append(comparedPaths, graphPath)
+			}
+		}
+	}
+	var baseNodes map[string][]*graph.Node
+	if len(comparedPaths) > 0 {
+		baseNodes = req.Base.GetFileNodesByPaths(comparedPaths)
+	}
 	if err := ctx.Err(); err != nil {
 		return contextSeparation{}, err
 	}
-	adjacencyIDs := carried.sourceIDs(contextPaths, baseNodes)
+	adjacencyIDs := carried.sourceIDs(comparedPaths, baseNodes)
 	baseEdges := req.Base.GetOutEdgesByNodeIDs(adjacencyIDs)
 	if err := ctx.Err(); err != nil {
 		return contextSeparation{}, err
@@ -1211,8 +1298,32 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 		return contextSeparation{}, err
 	}
 
+	// The layer below's copy of every contract identity the pass placed at a
+	// declared path: a canonical contract lands on whichever owner the pass
+	// saw first, which on a bounded corpus need not be the owner a whole index
+	// saw first.
+	var baseContracts map[string]*graph.Node
+	if len(declaredPaths) > 0 {
+		var ids []string
+		for graphPath := range declaredPaths {
+			ids = append(ids, contractIDsAt[graphPath]...)
+		}
+		if len(ids) > 0 {
+			sort.Strings(ids)
+			baseContracts = req.Base.GetNodesByIDs(ids)
+			if err := ctx.Err(); err != nil {
+				return contextSeparation{}, err
+			}
+		}
+	}
+	seededPaths := make(map[string]struct{}, len(plan.seeded))
+	for _, rel := range plan.seeded {
+		seededPaths[builderGraphPath(req.RepoPrefix, rel)] = struct{}{}
+	}
 	withheld := make(map[string]struct{}, len(contextPaths))
 	var withheldPaths []string
+	var withheldContracts []string
+	declaredWithheld := false
 	for _, graphPath := range contextPaths {
 		if err := ctx.Err(); err != nil {
 			return contextSeparation{}, err
@@ -1224,6 +1335,34 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 			// generation stays silent about it and PlannedNotCovered keeps
 			// reporting the absence for what it is.
 			continue
+		}
+		if _, isDeclared := declaredPaths[graphPath]; isDeclared && !carried.holdsContentBody(graphPath) &&
+			builderBaseServesContracts(baseContracts, graphPath, contractIDsAt[graphPath], candidates, changedPaths) {
+			// Declared context: read so the change set resolves, never
+			// output. Its bytes are unchanged and no declaration it reads
+			// changed shape (that would have made it a dependent), so the
+			// layer below already serves its payload; its re-derivation here
+			// ran against a corpus that omits what it resolves into and is
+			// not evidence of anything.
+			//
+			// Its contract nodes go with it, explicitly: file eviction keeps
+			// a canonical contract while another owner survives, and the
+			// layer below holds each one at this same path (checked above),
+			// so the unclaimed path keeps serving it.
+			withheld[graphPath] = struct{}{}
+			withheldPaths = append(withheldPaths, graphPath)
+			withheldContracts = append(withheldContracts, contractIDsAt[graphPath]...)
+			declaredWithheld = true
+			continue
+		}
+		if _, isSeeded := seededPaths[graphPath]; isSeeded {
+			// A seeded path carries only the subset of the file the change
+			// set binds into. Keeping it would write that subset under a
+			// replace mask and hide the rest of the file's payload below, so
+			// a seeded path is withheld or the build is refused.
+			return contextSeparation{}, fmt.Errorf(
+				"indexer: seeded declared context %q cannot be withheld (content body %v); a partial payload is never published",
+				graphPath, carried.holdsContentBody(graphPath))
 		}
 		if _, hasContract := contractPaths[graphPath]; hasContract {
 			out.retainedPaths = append(out.retainedPaths, graphPath)
@@ -1250,33 +1389,52 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 	// again the moment the path is unclaimed.
 	restore := carried.edgesIntoWithdrawn(withheld)
 	nodes, edges := corpus.EvictFiles(withheldPaths)
+	if len(withheldContracts) > 0 {
+		evicter := corpus.(graph.ContractNodeBatchEvicter) // required: requireContextCorpus
+		sort.Strings(withheldContracts)
+		contractNodes, contractEdges := evicter.EvictContractNodesByIDs(withheldContracts)
+		nodes += contractNodes
+		edges += contractEdges
+	}
+	// The eviction reaches the edges touching a withheld path's symbols. An
+	// edge RECORDED at a withheld path between two identities that live
+	// elsewhere (a synthesised stub pair, say) survives it; the layer below
+	// holds its own copy at the unclaimed path, so the generation's is
+	// dropped too. Compared paths never reach here with such an edge — the
+	// comparison refuses them — so only declared context is affected.
+	if stray := carried.edgesRecordedAt(withheld); len(stray) > 0 {
+		remover := corpus.(interface{ RemoveEdgesExact([]*graph.Edge) int }) // required
+		edges += remover.RemoveEdgesExact(stray)
+	}
 	if len(restore) > 0 {
 		corpus.AddBatch(nil, restore)
+	}
+	var phantomIDs []string
+	if declaredWithheld {
+		prunedNodes, prunedEdges, ids, err := pruneUnanchoredPathless(req.RepoPrefix, corpus, withheld)
+		if err != nil {
+			return contextSeparation{}, err
+		}
+		nodes += prunedNodes
+		edges += prunedEdges
+		phantomIDs = ids
 	}
 	if err := corpus.DeleteFileMetasByFiles(req.RepoPrefix, withheldPaths); err != nil {
 		return contextSeparation{}, fmt.Errorf("indexer: withhold generation file inventory: %w", err)
 	}
 	// Constant values are keyed by file and survive a node eviction, so they
-	// are removed by path. A corpus without the capability has none to remove.
-	if deleter, ok := corpus.(interface {
+	// are removed by path.
+	constants := corpus.(interface {
 		DeleteConstantValuesByFiles(repoPrefix string, files []string) error
-	}); ok {
-		if err := deleter.DeleteConstantValuesByFiles(req.RepoPrefix, withheldPaths); err != nil {
-			return contextSeparation{}, fmt.Errorf("indexer: withhold generation constant values: %w", err)
-		}
+	}) // required: requireContextCorpus
+	if err := constants.DeleteConstantValuesByFiles(req.RepoPrefix, withheldPaths); err != nil {
+		return contextSeparation{}, fmt.Errorf("indexer: withhold generation constant values: %w", err)
 	}
-	// Symbol FTS is keyed by identity, not by file, so it is removed by id —
-	// and only where the corpus keeps one. The in-memory pass corpus does not:
-	// its FTS rows are derived at the drain from the nodes that survive this
-	// call, so there is nothing to clean.
-	if deleter, ok := corpus.(interface {
-		BatchDeleteSymbolFTS(nodeIDs []string) error
-	}); ok {
-		if ids := carried.nodeIDsAt(withheld); len(ids) > 0 {
-			if err := deleter.BatchDeleteSymbolFTS(ids); err != nil {
-				return contextSeparation{}, fmt.Errorf("indexer: withhold generation symbol index: %w", err)
-			}
-		}
+	// Symbol FTS (a store corpus; the in-memory corpus derives it at the
+	// drain) and clone shingles are keyed by identity and survive the node
+	// eviction, so the withheld and pruned identities' rows go by id.
+	if err := purgeIdentitySidecars(corpus, append(carried.nodeIDsAt(withheld), phantomIDs...)); err != nil {
+		return contextSeparation{}, err
 	}
 	out.withheld = withheld
 	out.withheldPaths = withheldPaths
@@ -1320,7 +1478,7 @@ func (b *SparseGenerationBuilder) separateContextPayload(
 	plan buildPlan,
 	handle *store_sqlite.Store,
 ) (contextSeparation, error) {
-	return b.withholdContextPayload(ctx, req, plan, handle)
+	return b.separateAndPrune(ctx, req, plan, handle)
 }
 
 // builderPathPayload is the generation's own payload, grouped by the candidate
@@ -1775,6 +1933,7 @@ func (b *SparseGenerationBuilder) writeMasks(
 	report.NodeTombstones = len(tombstones)
 
 	markers, contested := b.unclaimedEdgeSources(req, handle, covered)
+	markers = withoutSettledContextSources(handle, markers, withdrawn, covered)
 	for _, marker := range markers {
 		// A marker over a context path would claim an outgoing set the layer
 		// no longer carries, so the composition would serve it empty. The
@@ -1847,16 +2006,33 @@ func (b *SparseGenerationBuilder) unclaimedEdgeSources(
 	sort.Strings(sources)
 
 	contested := 0
-	baseEdges := req.Base.GetOutEdgesByNodeIDs(sources)
+	// Only the files each source's base out-edges are recorded in matter
+	// here; the endpoint projection answers that without the full rows.
+	var basePaths map[string][]string
+	var baseEdges map[string][]*graph.Edge
+	if proj, ok := graph.EdgeEndpointsOf(req.Base); ok {
+		basePaths = proj.OutEdgePathsFrom(sources)
+	} else {
+		baseEdges = req.Base.GetOutEdgesByNodeIDs(sources)
+	}
 	masks := make([]store_sqlite.EdgeSourceMask, 0, len(sources))
 	for _, id := range sources {
-		for _, edge := range baseEdges[id] {
-			if edge == nil {
-				continue
+		if basePaths != nil {
+			for _, p := range basePaths[id] {
+				if _, claimed := covered[p]; !claimed {
+					contested++
+					break
+				}
 			}
-			if _, claimed := covered[edge.FilePath]; !claimed {
-				contested++
-				break
+		} else {
+			for _, edge := range baseEdges[id] {
+				if edge == nil {
+					continue
+				}
+				if _, claimed := covered[edge.FilePath]; !claimed {
+					contested++
+					break
+				}
 			}
 		}
 		masks = append(masks, store_sqlite.EdgeSourceMask{
@@ -2427,4 +2603,297 @@ func (b *SparseGenerationBuilder) warmCheckoutCompiler(root string, scope semant
 		return nil
 	}
 	return b.Semantic.WarmCheckoutCompiler(root, scope)
+}
+
+// passCorpusCounts measures a pass corpus the way Indexer.repoNodeEdgeCount
+// measures the pass's graph: the repository's own nodes and edges when the
+// pass is prefixed, the whole corpus otherwise.
+func passCorpusCounts(corpus *graph.Graph, repoPrefix string) (int, int) {
+	if repoPrefix == "" {
+		return corpus.NodeCount(), corpus.EdgeCount()
+	}
+	est := corpus.RepoMemoryEstimate(repoPrefix)
+	return est.NodeCount, est.EdgeCount
+}
+
+// pruneUnanchoredPathless removes the identities that live at no source file
+// and that only withheld context reached.
+//
+// A declared context file is re-derived against a corpus that deliberately
+// omits what IT resolves into, so its references into those files bind to
+// whatever the resolver mints for an absent target: a dependency stub, a
+// synthesised external-call module, a module identity. They live at no path,
+// so withholding the file does not take them along, and a generation that kept
+// them would tombstone and serve identities a whole index of the tree never
+// has. What stays is every pathless identity touched by an edge that has an
+// endpoint at a path the generation keeps or is recorded at such a path, and
+// every pathless identity those reach along outgoing edges across pathless
+// identities only. The rest was minted for withheld context alone and leaves
+// with it.
+func pruneUnanchoredPathless(
+	repoPrefix string,
+	corpus contextCorpus,
+	withheld map[string]struct{},
+) (nodesRemoved, edgesRemoved int, pruned []string, err error) {
+	kept := func(graphPath string) bool {
+		if graphPath == "" {
+			return false
+		}
+		if _, owned := builderRelPath(repoPrefix, graphPath); !owned {
+			return false
+		}
+		_, gone := withheld[graphPath]
+		return !gone
+	}
+	isFile := func(graphPath string) bool {
+		if graphPath == "" {
+			return false
+		}
+		_, owned := builderRelPath(repoPrefix, graphPath)
+		return owned
+	}
+	pathless := make(map[string]struct{})
+	anchored := make(map[string]struct{})
+	for _, node := range corpus.AllNodes() {
+		if node == nil || node.ID == "" {
+			continue
+		}
+		if isFile(node.FilePath) {
+			if kept(node.FilePath) {
+				anchored[node.ID] = struct{}{}
+			}
+			continue
+		}
+		pathless[node.ID] = struct{}{}
+	}
+	if len(pathless) == 0 {
+		return 0, 0, nil, nil
+	}
+	adjacent := make(map[string][]string)
+	reached := make(map[string]struct{})
+	var queue []string
+	reach := func(id string) {
+		if _, isPathless := pathless[id]; !isPathless {
+			return
+		}
+		if _, done := reached[id]; done {
+			return
+		}
+		reached[id] = struct{}{}
+		queue = append(queue, id)
+	}
+	for _, edge := range corpus.AllEdges() {
+		if edge == nil {
+			continue
+		}
+		_, fromPathless := pathless[edge.From]
+		_, toPathless := pathless[edge.To]
+		if fromPathless && toPathless {
+			// Forward only: a reached stub keeps what it points at (its
+			// module, say), but a shared target must not pull back every
+			// other stub pointing at it. A module identity is the hub of
+			// every stub of its package, so the reverse step used to keep
+			// the stubs only withheld context reached, and their
+			// edge-source markers then hid the base's adjacency of those
+			// stubs recorded in files the generation never touched.
+			adjacent[edge.From] = append(adjacent[edge.From], edge.To)
+		}
+		_, fromAnchored := anchored[edge.From]
+		_, toAnchored := anchored[edge.To]
+		if fromAnchored || toAnchored || kept(edge.FilePath) {
+			reach(edge.From)
+			reach(edge.To)
+		}
+	}
+	for len(queue) > 0 {
+		id := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		for _, next := range adjacent[id] {
+			reach(next)
+		}
+	}
+	for id := range pathless {
+		if _, ok := reached[id]; !ok {
+			pruned = append(pruned, id)
+		}
+	}
+	if len(pruned) == 0 {
+		return 0, 0, nil, nil
+	}
+	sort.Strings(pruned)
+	evicter, ok := corpus.(graph.PathlessNodeBatchEvicter)
+	if !ok {
+		return 0, 0, nil, fmt.Errorf(
+			"indexer: withhold generation context: the corpus cannot evict %d pathless identities minted for withheld context",
+			len(pruned))
+	}
+	nodesRemoved, edgesRemoved = evicter.EvictPathlessNodesByIDs(pruned)
+	return nodesRemoved, edgesRemoved, pruned, nil
+}
+
+// builderBaseServesContracts reports whether withholding a declared path
+// leaves every contract identity the pass placed there served by the layer
+// below exactly as a whole index serves it: the layer below holds the identity
+// either at this same path or at a path the generation neither claims nor
+// reads, so no mask of this generation can hide it.
+func builderBaseServesContracts(
+	base map[string]*graph.Node,
+	graphPath string,
+	contractIDs []string,
+	candidates, changedPaths map[string]struct{},
+) bool {
+	for _, id := range contractIDs {
+		node := base[id]
+		if node == nil || node.Kind != graph.KindContract {
+			return false
+		}
+		if node.FilePath == graphPath {
+			continue
+		}
+		if _, claimed := changedPaths[node.FilePath]; claimed {
+			return false
+		}
+		if _, read := candidates[node.FilePath]; read {
+			return false
+		}
+	}
+	return true
+}
+
+// holdsContentBody reports whether a candidate path carries a content
+// section, whose body lives in an index the withdrawal does not reach.
+func (p *builderPathPayload) holdsContentBody(graphPath string) bool {
+	_, ok := p.contentBody[graphPath]
+	return ok
+}
+
+// edgesRecordedAt lists the carried edges recorded at the withdrawn paths.
+func (p *builderPathPayload) edgesRecordedAt(withdrawn map[string]struct{}) []*graph.Edge {
+	var out []*graph.Edge
+	for graphPath := range withdrawn {
+		out = append(out, p.edgesByPath[graphPath]...)
+	}
+	return out
+}
+
+// withoutSettledContextSources drops the edge-source markers a withheld context
+// file's symbols would otherwise need.
+//
+// A changed file records edges whose SOURCE is a symbol of a file it only read
+// — a value flowing out of a callee into the caller is recorded at the caller.
+// Those edges are the changed file's own payload, and the composition settles
+// them edge by edge against the file masks (graph.OverlaidView.baseEdgeVisible):
+// the generation's copy is served because it is recorded at a claimed path,
+// base's copy recorded at the same path is hidden, and the symbol's other edges,
+// recorded in its own unclaimed file, keep showing through from below. A
+// replace marker would instead hide ALL of the symbol's base adjacency, which
+// the generation does not carry. So a marker is dropped exactly when its source
+// lives at a withheld context path or is not a node the generation carries (a
+// dataflow placeholder, a pathless identity the layer below serves), and every
+// edge the generation carries out of it is recorded at a claimed, non-empty path;
+// anything else keeps the marker and meets the build-failure guard below.
+func withoutSettledContextSources(
+	handle *store_sqlite.Store,
+	markers []store_sqlite.EdgeSourceMask,
+	withdrawn map[string]struct{},
+	covered map[string]struct{},
+) []store_sqlite.EdgeSourceMask {
+	if len(markers) == 0 {
+		return markers
+	}
+	// A candidate is a source the generation carries no node for: a symbol
+	// at a withheld context path, a dataflow placeholder source
+	// (`<repo>/unresolved::<name>`, no node and no file: every file that
+	// flows a value out of the unresolved name records its own edge from
+	// it), or a pathless identity the layer below already serves
+	// (pruneRedundantPathless). Its adjacency is settled edge by edge, and a
+	// replace marker would hide every other file's edge from it — a whole
+	// index keeps them. A source the generation does carry keeps its
+	// marker: its tombstone speaks for its adjacency anyway.
+	ids := make([]string, 0, len(markers))
+	for _, marker := range markers {
+		ids = append(ids, marker.SourceID)
+	}
+	carriedSources := handle.GetNodesByIDs(ids)
+	var candidates []string
+	for _, marker := range markers {
+		if _, isContext := withdrawn[builderMaskKey(marker.SourceID)]; isContext {
+			candidates = append(candidates, marker.SourceID)
+			continue
+		}
+		if carriedSources[marker.SourceID] == nil {
+			candidates = append(candidates, marker.SourceID)
+		}
+	}
+	if len(candidates) == 0 {
+		return markers
+	}
+	settled := make(map[string]struct{}, len(candidates))
+	edges := handle.GetOutEdgesByNodeIDs(candidates)
+	for _, id := range candidates {
+		ok := true
+		for _, edge := range edges[id] {
+			if edge == nil {
+				continue
+			}
+			if _, claimed := covered[edge.FilePath]; edge.FilePath == "" || !claimed {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			settled[id] = struct{}{}
+		}
+	}
+	kept := markers[:0:0]
+	for _, marker := range markers {
+		if _, drop := settled[marker.SourceID]; drop {
+			continue
+		}
+		kept = append(kept, marker)
+	}
+	return kept
+}
+
+// separateAndPrune is the one post-pass step both routes take: the in-memory
+// corpus filter before the drain, and the withdrawal from the generation
+// handle after it. Withholding the context and pruning the redundant pathless
+// identities are decided here, on the corpus either route holds, so the two
+// routes carry the same generation by construction.
+func (b *SparseGenerationBuilder) separateAndPrune(
+	ctx context.Context,
+	req BuildRequest,
+	plan buildPlan,
+	corpus contextCorpus,
+) (contextSeparation, error) {
+	separation, err := b.withholdContextPayload(ctx, req, plan, corpus)
+	if err != nil {
+		return contextSeparation{}, err
+	}
+	_, _, pruned, err := pruneRedundantPathless(corpus, req.Base)
+	if err != nil {
+		return contextSeparation{}, err
+	}
+	if err := purgeIdentitySidecars(corpus, pruned); err != nil {
+		return contextSeparation{}, err
+	}
+	// Invariant: seeded payload never reaches the generation. A seeded path
+	// is withheld whole or the withholding refused the build; a node still at
+	// one here would be written as the seeded subset of its file.
+	if len(plan.seeded) > 0 {
+		seededPaths := make(map[string]struct{}, len(plan.seeded))
+		for _, rel := range plan.seeded {
+			seededPaths[builderGraphPath(req.RepoPrefix, rel)] = struct{}{}
+		}
+		for _, node := range corpus.AllNodes() {
+			if node == nil {
+				continue
+			}
+			if _, isSeeded := seededPaths[node.FilePath]; isSeeded {
+				return contextSeparation{}, fmt.Errorf(
+					"indexer: seeded payload %q at %q survived the withholding; refusing to publish a partial file", node.ID, node.FilePath)
+			}
+		}
+	}
+	return separation, nil
 }

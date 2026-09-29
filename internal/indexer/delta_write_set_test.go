@@ -328,7 +328,7 @@ func TestDedicatedDeltaWriteSetIsTheChangeNotTheClosure(t *testing.T) {
 	t.Logf("write set: closure=%d truncated=%v cap=%d | pass produced %d nodes / %d edges | "+
 		"generation carries %d paths, %d nodes, %d edges | context masks=%d retained=%d in_memory=%v",
 		len(report.ClosurePaths), report.ClosureTruncated, report.ClosureCap,
-		report.NodeCount, report.EdgeCount,
+		report.PassNodeCount, report.PassEdgeCount,
 		len(carried), len(handle.AllNodes()), len(handle.AllEdges()),
 		report.ContextMasks, len(report.ContextRetainedPaths), report.ContextHeldInMemory)
 
@@ -366,8 +366,10 @@ func TestDedicatedDeltaWriteSetOnACrossPackageCorpus(t *testing.T) {
 	// intra-package calls, the inbound value flow — present at ten files each.
 	const files, packages = 120, 12
 	// wideClosure is five eighths of the corpus: the same proportion the
-	// original 240-file fixture expressed as a flat 150, so the gate is no
-	// looser for the corpus being smaller.
+	// original 240-file fixture expressed as a flat 150. It was a precondition
+	// while the closure walk was transitive; the one-hop closure with
+	// declared-context withholding reaches about twenty files for this commit,
+	// so it is logged, not required, and the write set is pinned exactly.
 	const wideClosure = files * 5 / 8
 	fixture := newDeltaWriteSetFixtureWithRegistry(t, deltaWriteSetPkgTree(files, packages, false), builderGoRegistry())
 	before := deltaWriteSetStoreBytes(t, fixture.request.StorePath)
@@ -381,18 +383,36 @@ func TestDedicatedDeltaWriteSetOnACrossPackageCorpus(t *testing.T) {
 	t.Logf("write set: closure=%d truncated=%v cap=%d | pass produced %d nodes / %d edges | "+
 		"generation carries %d paths, %d nodes, %d edges | context masks=%d retained=%d in_memory=%v",
 		len(report.ClosurePaths), report.ClosureTruncated, report.ClosureCap,
-		report.NodeCount, report.EdgeCount,
+		report.PassNodeCount, report.PassEdgeCount,
 		len(carried), nodes, len(handle.AllEdges()),
 		report.ContextMasks, len(report.ContextRetainedPaths), report.ContextHeldInMemory)
 
-	if len(report.ClosurePaths) < wideClosure {
-		t.Fatalf("closure spans %d files, want at least %d; the measurement needs a wide closure",
-			len(report.ClosurePaths), wideClosure)
+	changed := deltaWriteSetPkgChangedPaths(fixture.request.RepoPrefix, packages)
+	if len(report.ClosurePaths) < len(changed) {
+		t.Fatalf("closure spans %d files, fewer than the %d changed files",
+			len(report.ClosurePaths), len(changed))
 	}
-	for _, want := range deltaWriteSetPkgChangedPaths(fixture.request.RepoPrefix, packages) {
+	if report.ClosureTruncated {
+		t.Fatalf("closure truncated at %d files (cap %d); the measurement needs the whole closure",
+			len(report.ClosurePaths), report.ClosureCap)
+	}
+	if len(report.ClosurePaths) >= wideClosure {
+		t.Logf("closure spans %d files (wide, the pre-one-hop shape)", len(report.ClosurePaths))
+	}
+	for _, want := range changed {
 		if !slices.Contains(carried, want) {
 			t.Fatalf("the delta does not carry its own changed file %q: %v", want, carried)
 		}
+	}
+	// A body-only commit places no dependents, so the write set is exactly the
+	// change set: the closure's declared-context files are read and withheld.
+	sortedCarried := slices.Clone(carried)
+	slices.Sort(sortedCarried)
+	sortedChanged := slices.Clone(changed)
+	slices.Sort(sortedChanged)
+	if !slices.Equal(sortedCarried, sortedChanged) {
+		t.Fatalf("the delta carries payload at %d paths, want exactly the %d changed files\ngot %v",
+			len(carried), len(changed), carried)
 	}
 	// The write set used to be the whole closure at full node density: 203
 	// paths and 2,029 nodes for this fixture, ~10 nodes a file, the same
@@ -408,9 +428,9 @@ func TestDedicatedDeltaWriteSetOnACrossPackageCorpus(t *testing.T) {
 			len(carried), len(report.ClosurePaths), ceiling,
 			len(report.ContextRetainedPaths), report.ContextRetainedPaths)
 	}
-	if ceiling := report.NodeCount / 2; nodes > ceiling {
+	if ceiling := report.PassNodeCount / 2; nodes > ceiling {
 		t.Fatalf("the delta keeps %d of the %d nodes the pass produced (ceiling %d)",
-			nodes, report.NodeCount, ceiling)
+			nodes, report.PassNodeCount, ceiling)
 	}
 }
 

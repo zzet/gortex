@@ -426,7 +426,7 @@ func TestContextSeparationScalesWithTheChangeSetNotTheClosure(t *testing.T) {
 	t.Logf("write audit: pass indexed %d files (%d bytes) producing %d nodes / %d edges; "+
 		"the generation keeps %d files (%d bytes), %d nodes / %d edges; "+
 		"context masks %d, retained %d",
-		len(report.IndexedPaths), report.SourceBytes, report.NodeCount, report.EdgeCount,
+		len(report.IndexedPaths), report.SourceBytes, report.PassNodeCount, report.PassEdgeCount,
 		len(carried), carriedBytes, carriedNodes, carriedEdges,
 		report.ContextMasks, len(report.ContextRetainedPaths))
 
@@ -443,9 +443,12 @@ func TestContextSeparationScalesWithTheChangeSetNotTheClosure(t *testing.T) {
 		t.Fatalf("the generation carries payload at %d paths, want the %d changed files",
 			len(carried), len(want))
 	}
-	if carriedNodes >= report.NodeCount {
+	if carriedNodes >= report.PassNodeCount {
 		t.Fatalf("the generation keeps %d of the %d nodes the pass produced — nothing was separated",
-			carriedNodes, report.NodeCount)
+			carriedNodes, report.PassNodeCount)
+	}
+	if carriedNodes != report.NodeCount {
+		t.Fatalf("the generation keeps %d nodes, the report says it carries %d", carriedNodes, report.NodeCount)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -241,4 +242,117 @@ func TestDirtyChildManifestChangeFallsBackDirect(t *testing.T) {
 		t.Errorf("the direct fallback's manifest is %+v found=%v err=%v, want a full manifest", meta, found, err)
 	}
 	r.parity(chain, "manifest")
+}
+
+func TestDirtyChildImportChangeRemovesOldFacts(t *testing.T) {
+	r := newChainChildRun(t, "import", accumulatedDirtyIndependent, 3)
+	r.write("consumer/consumer.go", `package consumer
+
+import "`+accumulatedDirtyModule+`/chain/b"
+
+// Consume is the chain's one importing consumer.
+func Consume() int {
+	return b.B()
+}
+`)
+	id, report, chain := r.child(r.root)
+	r.assertOnlyTouched(id, report)
+	composed := dirtyChainComposed(t, r.store, chain)
+	for _, e := range composed.GetOutEdges(builderRepoPrefix + "/consumer/consumer.go::Consume") {
+		if e != nil && strings.Contains(e.To, "/chain/a/") {
+			t.Errorf("the consumer still reaches %s after dropping the import", e.To)
+		}
+	}
+	r.parity(chain, "import")
+}
+
+func TestDirtyChildPartialUndoReemitsCommittedFile(t *testing.T) {
+	r := newChainChildRun(t, "partial-undo", accumulatedDirtyIndependent, 5)
+	undone := accumulatedDirtyUnitPath(accumulatedDirtyIndependent, 2)
+	accumulatedDirtyWriteUnit(t, r.repoDir, accumulatedDirtyIndependent, 2, false, false)
+
+	id, report, chain := r.child(r.root)
+	if report.ChangedFiles != 1 || !slices.Contains(report.IndexedPaths, undone) {
+		t.Fatalf("the undo planned changed=%d indexed=%v, want %s re-emitted", report.ChangedFiles, report.IndexedPaths, undone)
+	}
+	if mode := r.masks(id)[undone]; mode != string(store_sqlite.OwnershipReplace) {
+		t.Errorf("the undone file carries mask %q, want replace (the committed bytes re-emitted)", mode)
+	}
+	base := builderRenderNodes(r.store.AtGeneration(0).GetFileNodes(builderRepoPrefix + "/" + undone))
+	composed := dirtyChainComposed(t, r.store, chain)
+	if got := builderRenderNodes(composed.GetFileNodes(builderRepoPrefix + "/" + undone)); !slices.Equal(got, base) {
+		t.Errorf("after the partial undo the view serves\n  %v\nthe committed base serves\n  %v", got, base)
+	}
+	r.assertOnlyTouched(id, report, undone)
+	r.parity(chain, "partial-undo")
+}
+
+func TestDirtyChildSamePackageIsolatesOutput(t *testing.T) {
+	r := newChainChildRun(t, "same-package", accumulatedDirtySamePackage, accumulatedDirtyUnits)
+	edited := accumulatedDirtyUnitPath(accumulatedDirtySamePackage, accumulatedDirtyBodyTarget)
+	accumulatedDirtyWriteUnit(t, r.repoDir, accumulatedDirtySamePackage, accumulatedDirtyBodyTarget, true, false)
+
+	id, report, chain := r.child(r.root)
+	allowed := map[string]struct{}{"": {}, builderRepoPrefix + "/" + edited: {}}
+	for _, p := range report.ContextRetainedPaths {
+		allowed[builderRepoPrefix+"/"+p] = struct{}{}
+	}
+	for _, f := range r.nodeFiles(id) {
+		if _, ok := allowed[f]; !ok {
+			t.Errorf("the child stores node rows at %s, outside the edited file and its retained closure %v",
+				f, report.ContextRetainedPaths)
+		}
+	}
+	if report.Work.ParserInputs > 1+len(report.ContextPaths)+len(report.ContextRetainedPaths) {
+		t.Errorf("the child parsed %d files for one edit (context %v, retained %v)",
+			report.Work.ParserInputs, report.ContextPaths, report.ContextRetainedPaths)
+	}
+	r.assertOnlyTouched(id, report, edited)
+	r.parity(chain, "same-package")
+}
+
+func TestDirtyChildSignatureChangeReDerivesDependents(t *testing.T) {
+	r := newChainChildRun(t, "signature", accumulatedDirtyIndependent, 3)
+	r.write("chain/b/b.go", `package b
+
+import "`+accumulatedDirtyModule+`/chain/c"
+
+// B calls down the chain.
+func B(delta int) int {
+	return c.C() + delta
+}
+`)
+	id, report, chain := r.child(r.root)
+	if !slices.Contains(report.ClosurePaths, "chain/a/a.go") {
+		t.Errorf("the closure %v does not name a, the changed signature's caller", report.ClosurePaths)
+	}
+	r.assertOnlyTouched(id, report)
+	composed := dirtyChainComposed(t, r.store, chain)
+	var callsB bool
+	for _, e := range composed.GetOutEdges(builderRepoPrefix + "/chain/a/a.go::A") {
+		if e != nil && e.To == builderRepoPrefix+"/chain/b/b.go::B" {
+			callsB = true
+		}
+	}
+	if !callsB {
+		t.Error("a's call no longer reaches B after its signature changed")
+	}
+	r.parity(chain, "signature")
+}
+
+// assertOnlyTouched fails when a parser input or a node row of the child
+// lands on an accumulated dirty path the edit did not touch.
+func (r *chainChildRun) assertOnlyTouched(id int64, report BuildReport, touched ...string) {
+	r.t.Helper()
+	for _, p := range report.Work.ParserInputPaths {
+		if _, acc := r.dirty[p]; acc && !slices.Contains(touched, p) {
+			r.t.Errorf("the child parsed the untouched dirty file %s", p)
+		}
+	}
+	for _, f := range r.nodeFiles(id) {
+		rel := strings.TrimPrefix(f, builderRepoPrefix+"/")
+		if _, acc := r.dirty[rel]; acc && !slices.Contains(touched, rel) {
+			r.t.Errorf("the child stores node rows at the untouched dirty file %s", rel)
+		}
+	}
 }

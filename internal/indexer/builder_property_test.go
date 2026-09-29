@@ -612,3 +612,20 @@ func propRunDirtyCase(t *testing.T, seed int64) {
 	builderAssertMasksValidate(t, store, commitGeneration)
 	builderAssertMasksValidate(t, store, dirtyGeneration)
 }
+
+// propAssertRedundantPathlessPruned is the clause for the invariant "a
+// pathless node identical to the layer below owns no adjacency": the
+// generation carries no pathless node (builtins aside, which it claims for
+// their stamped row) whose layer-below copy is identical, because a carried
+// one would own, and so hide, every other file's edges out of it.
+func propAssertRedundantPathlessPruned(t *testing.T, store *store_sqlite.Store, generationID int64, below graph.Reader) {
+	t.Helper()
+	for _, node := range store.AtGeneration(generationID).AllNodes() {
+		if node == nil || node.FilePath != "" || node.Kind == graph.KindBuiltin {
+			continue
+		}
+		if pathlessNodeEquivalent(node, below.GetNode(node.ID)) {
+			t.Errorf("generation %d carries pathless %s identical to the layer below; it owns that node's adjacency", generationID, node.ID)
+		}
+	}
+}

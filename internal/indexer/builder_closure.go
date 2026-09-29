@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 
@@ -57,19 +58,34 @@ import (
 //     the closure, because a whole index of the target binds them to the new
 //     definition and a generation that never re-derives them would not.
 //
-// The walk iterates to a FIXED POINT. Every file it admits is asked the same
-// forward question, so a closure file's own cross-file references bind in the
-// generation exactly as they would in a whole index of the same tree, rather
-// than parking on a stub one hop past the change. The reverse direction stays
-// at ONE hop, and that is not a bound but a fact about the walk: a file the
-// closure pulls in is re-derived from unchanged content, so it re-derives to
-// the same identities, and its own dependents' edges into it still name
-// something live.
+// The walk is ONE hop in each direction, and it keeps two sets apart
+// (BuildReport.ClosureDependentPaths and ClosureDeclaredPaths):
 //
-// The one thing that IS bounded is the size of the result. Iterating a
-// dependency graph to a fixed point is the whole repository in the limit, which
-// is the thing a sparse generation exists to avoid, so the walk stops at
-// ClosureCap files and says so: ClosureTruncated rides on the report and the
+//   - DEPENDENTS are the files whose own payload the change can move: the
+//     reverse dependents of a declaration whose shape changed (the reverse
+//     read is shape-gated, builderSemanticSeedNodeIDs), the files whose unbound
+//     references park on a name the change now defines, and a changed body's
+//     clone counterparts. They are re-derived and compared with the layer
+//     below; a disagreement keeps them claimed.
+//   - DECLARED context is what the changed files and the dependents bind INTO,
+//     plus the manifests. It is read so their references resolve the way a
+//     whole index resolves them, and withheld from the generation without
+//     comparison: its bytes are unchanged and every declaration it reads that
+//     the change altered has already made it a dependent, so the layer below
+//     serves exactly its whole-index payload. Because its own payload is never
+//     output, nothing IT resolves into is read — which is what stops the walk
+//     at one hop instead of iterating the dependency graph to a fixed point
+//     (the whole repository in the limit; measured, a one-line body edit on
+//     this repository filled the 200-file cap).
+//
+// A body or comment edit — no declaration shape, import or defined name
+// changes — therefore reads the edited file, what it binds into and the
+// manifests, and writes the edited file alone. A signature or import change
+// widens only through the named frontier: the reverse dependents of the
+// changed declarations and the files the new imports name.
+//
+// The size of the result stays bounded as a backstop: the walk stops at
+// ClosureCap files and says so — ClosureTruncated rides on the report and the
 // build narrows the resolution and incoming-edge producer states. A truncated
 // closure is a knowingly incomplete generation, published as one, rather than a
 // silent divergence.
@@ -250,13 +266,32 @@ func (b *SparseGenerationBuilder) affectedClosureContext(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	taken := walk.admitAll(manifests)
+	walk.markDeclared(walk.admitAll(manifests))
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	frontier := make(map[string]struct{})
-	targetEvidence := walk.collectIntroduced(present, frontier)
+	// Two sets, kept apart because they answer different questions.
+	//
+	// dependents are the files whose OWN payload the change can move: the
+	// reverse dependents of a declaration whose shape changed, the files whose
+	// unbound references park on a name the change now defines, and the clone
+	// counterparts of a changed body. They are re-derived and compared with
+	// the layer below, and a disagreement keeps them claimed.
+	//
+	// declared is the context the pass reads so that a file it re-derives
+	// binds the way a whole index binds it: the files the changed files and
+	// the dependents resolve into, and the manifests. Nothing in the change
+	// reaches their payload — their bytes are unchanged, and every declaration
+	// they read that the change altered has already made them a dependent —
+	// so they are withheld without comparison (withholdContextPayload), and
+	// nothing about them has to bind the way it does in a whole index. That is
+	// what bounds the walk at ONE hop in each direction: a declared file's own
+	// references are never output, so the files IT resolves into are never
+	// read.
+	dependents := make(map[string]struct{})
+	declared := make(map[string]struct{})
+	targetEvidence := walk.collectIntroduced(present, dependents, declared)
 	if walk.err != nil {
 		return nil, walk.err
 	}
@@ -264,44 +299,44 @@ func (b *SparseGenerationBuilder) affectedClosureContext(
 	if err != nil {
 		return nil, err
 	}
-	if err := b.collectDependents(ctx, req, seedNodeIDs.reverse, frontier); err != nil {
+	if err := b.collectDependents(ctx, req, seedNodeIDs.reverse, dependents); err != nil {
 		return nil, err
 	}
-	if err := b.collectDependencies(ctx, req, seeds, seedNodeIDs.all, frontier); err != nil {
+	// A changed file's clone counterparts are dependents: a body edit can make
+	// or break a near-duplicate pair whose other half is recorded in the
+	// counterpart's own file.
+	if err := b.collectDependenciesSplit(ctx, req, seeds, seedNodeIDs.all, declared, dependents, true); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	taken = append(taken, walk.admitAll(frontier)...)
+	admittedDependents := walk.admitAll(dependents)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	// Fixed point: every file the walk admits is asked what IT resolves into,
-	// and the answer feeds the next round. The loop terminates because
-	// admission is monotone and capped — a round that admits nothing new ends
-	// the walk, and one that hits the cap ends it too.
-	for len(taken) > 0 && !walk.truncated {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		next := make(map[string]struct{})
-		nodeIDs, err := builderSeedNodeIDsContext(ctx, req.Base, taken)
+	// One forward hop from the dependents, so their re-derivation binds against
+	// the same definitions the layer below bound them to. A dependent's clone
+	// counterpart is read for the same reason: its content did not change, so
+	// the pair re-derives only if both halves are in the corpus.
+	if len(admittedDependents) > 0 && !walk.truncated {
+		nodeIDs, err := builderSeedNodeIDsContext(ctx, req.Base, admittedDependents)
 		if err != nil {
 			return nil, err
 		}
-		if err := b.collectDependencies(ctx, req, taken, nodeIDs, next); err != nil {
+		if err := b.collectDependencies(ctx, req, admittedDependents, nodeIDs, declared); err != nil {
 			return nil, err
 		}
-		taken = walk.admitAll(next)
 	}
+	walk.markDeclared(walk.admitAll(declared))
 
 	closure := append([]string(nil), walk.order...)
 	sort.Strings(closure)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	report.ClosureDeclaredPaths = walk.declaredPaths()
+	report.ClosureDependentPaths = walk.dependentPaths()
 	if walk.truncated {
 		report.ClosureTruncated = true
 		b.Logger.Warn("indexer: sparse generation closure truncated",
@@ -335,6 +370,9 @@ type closureWalk struct {
 	chosen    map[string]struct{}
 	order     []string
 	truncated bool
+	// declared is the repo-relative subset of order admitted as declared
+	// context: read by the pass, withheld from the generation unconditionally.
+	declared map[string]struct{}
 
 	// dirIndex and lastDirIndex place an import path on the base corpus's own
 	// files, by the same two-step rule the resolver's import cascade uses:
@@ -417,6 +455,46 @@ func (w *closureWalk) admitAll(candidates map[string]struct{}) []string {
 	return taken
 }
 
+// markDeclared records graph paths the walk just admitted as declared context.
+func (w *closureWalk) markDeclared(graphPaths []string) {
+	for _, graphPath := range graphPaths {
+		rel, owned := builderRelPath(w.req.RepoPrefix, graphPath)
+		if !owned {
+			continue
+		}
+		if w.declared == nil {
+			w.declared = make(map[string]struct{})
+		}
+		w.declared[rel] = struct{}{}
+	}
+}
+
+// declaredPaths is the declared context, sorted and repo-relative.
+func (w *closureWalk) declaredPaths() []string {
+	if len(w.declared) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(w.declared))
+	for rel := range w.declared {
+		out = append(out, rel)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// dependentPaths is the rest of the closure: the files the change can move,
+// sorted and repo-relative.
+func (w *closureWalk) dependentPaths() []string {
+	var out []string
+	for _, rel := range w.order {
+		if _, isDeclared := w.declared[rel]; !isDeclared {
+			out = append(out, rel)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // collectManifests offers every root manifest the target holds.
 func (w *closureWalk) collectManifests(out map[string]struct{}) {
 	for _, manifest := range rootManifests() {
@@ -435,10 +513,25 @@ func (w *closureWalk) collectManifests(out map[string]struct{}) {
 // no base nodes, and a modified file's base edges describe the references it
 // USED to make, so a reference the change introduces — and a definition it
 // introduces — is a link nothing in the base layer draws to the change.
+//
+// What a changed file now binds INTO is declared context (declared): the pass
+// reads it so the changed file resolves the way a whole index resolves it.
+// What now binds into a definition the change introduces is a dependent
+// (dependents): its own payload moves.
+//
+// An import specifier the changed file already named in the layer below is not
+// placed again. Its binding is one of the file's resolved base edges, which
+// collectDependencies already carries, so re-running the directory cascade for
+// it could only add every same-named directory in the repository. The rule is
+// held to a change set that adds and deletes nothing: an added or removed file
+// can change which candidate the cascade reaches first, and then every
+// specifier is placed again as before.
 func (w *closureWalk) collectIntroduced(
 	present map[string]struct{},
-	out map[string]struct{},
+	dependents map[string]struct{},
+	declared map[string]struct{},
 ) builderSemanticTarget {
+	out := declared
 	semantic := newBuilderSemanticTarget(present)
 	if len(present) == 0 {
 		return semantic
@@ -460,10 +553,21 @@ func (w *closureWalk) collectIntroduced(
 		defines:  map[string]struct{}{},
 		semantic: &semantic,
 	}
+	if w.err != nil {
+		return semantic
+	}
 	for _, rel := range rels {
+		// One parse per changed file: a large dirty set is tens of seconds of
+		// parsing, so a preempting interactive build is noticed per file.
+		if w.ctx != nil {
+			if err := w.ctx.Err(); err != nil {
+				w.err = err
+				return semantic
+			}
+		}
 		w.extractInto(rel, &refs)
 	}
-	w.collectPlaceholderReferrers(refs.defines, out)
+	w.collectPlaceholderReferrers(refs.defines, dependents)
 	if w.err != nil {
 		return semantic
 	}
@@ -492,8 +596,17 @@ func (w *closureWalk) collectIntroduced(
 		}
 	}
 
+	w.placeQualified(refs.qualified, accounted, out)
+	if w.err != nil {
+		return semantic
+	}
+
+	named := w.baseNamedImports(graphPaths)
 	imports := make([]string, 0, len(refs.imports))
-	for importPath := range refs.imports {
+	for importPath, callers := range refs.imports {
+		if closureImportAlreadyNamed(importPath, callers, named) {
+			continue
+		}
 		imports = append(imports, importPath)
 	}
 	sort.Strings(imports)
@@ -510,6 +623,115 @@ func (w *closureWalk) collectIntroduced(
 		}
 	}
 	return semantic
+}
+
+// placeQualified offers the files that define a symbol the change reaches
+// through an import specifier, restricted to the directories the resolver's
+// own extern arm accepts for a same-repository candidate
+// (resolver.resolveExtern): the directory is the specifier, ends with it, or
+// ends with its last path segment. The lookup is by the symbol's name, so it
+// places only files DEFINING it, never a whole directory. A name the layer
+// below already binds from these files is skipped, as the bare-name set skips
+// it; a specifier no directory of the repository matches is an external module
+// and places nothing. When the specifier is new to its importer,
+// importedFiles places its whole candidate set as well.
+func (w *closureWalk) placeQualified(
+	qualified map[string]map[string]struct{},
+	accounted map[string]struct{},
+	out map[string]struct{},
+) {
+	specs := make([]string, 0, len(qualified))
+	for spec := range qualified {
+		specs = append(specs, spec)
+	}
+	sort.Strings(specs)
+	for _, spec := range specs {
+		names := make([]string, 0, len(qualified[spec]))
+		for name := range qualified[spec] {
+			if _, known := accounted[name]; known {
+				continue
+			}
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			nodes := w.findNodesByName(name)
+			if w.err != nil {
+				return
+			}
+			for _, node := range nodes {
+				if node == nil || node.FilePath == "" || !graph.IsReferenceableSymbol(node.Kind) {
+					continue
+				}
+				if _, owned := builderRelPath(w.req.RepoPrefix, node.FilePath); !owned ||
+					!closureDirNamedBySpec(path.Dir(node.FilePath), spec) {
+					continue
+				}
+				out[node.FilePath] = struct{}{}
+			}
+		}
+	}
+}
+
+// closureDirNamedBySpec mirrors resolveExtern's same-repository directory
+// test on a graph-path directory: the directory ends with the specifier's last
+// path segment, is the specifier, or ends with it.
+func closureDirNamedBySpec(dir, spec string) bool {
+	if dir == "" || dir == "." || spec == "" {
+		return false
+	}
+	return strings.HasSuffix(dir, "/"+path.Base(spec)) || dir == spec || strings.HasSuffix(dir, spec)
+}
+
+// baseNamedImports is, per changed file, every import specifier the layer
+// below already records the file importing — its import nodes' paths. It is nil
+// (nothing may be skipped) when the change set adds or deletes a file, because
+// either can change which candidate the resolver's import cascade reaches.
+func (w *closureWalk) baseNamedImports(graphPaths []string) map[string]map[string]struct{} {
+	if len(w.req.Changes) == 0 {
+		return nil
+	}
+	for _, change := range w.req.Changes {
+		if change.Kind != LayerPathModified {
+			return nil
+		}
+	}
+	byFile := w.req.Base.GetFileNodesByPaths(graphPaths)
+	named := make(map[string]map[string]struct{}, len(byFile))
+	for graphPath, nodes := range byFile {
+		rel, owned := builderRelPath(w.req.RepoPrefix, graphPath)
+		if !owned {
+			continue
+		}
+		for _, node := range nodes {
+			if node == nil || node.Kind != graph.KindImport {
+				continue
+			}
+			spec, _ := node.Meta["path"].(string)
+			if spec == "" {
+				continue
+			}
+			if named[rel] == nil {
+				named[rel] = make(map[string]struct{})
+			}
+			named[rel][spec] = struct{}{}
+		}
+	}
+	return named
+}
+
+// closureImportAlreadyNamed reports whether every file that names spec in the
+// target already named it in the layer below.
+func closureImportAlreadyNamed(spec string, callers map[string]struct{}, named map[string]map[string]struct{}) bool {
+	if named == nil || len(callers) == 0 {
+		return false
+	}
+	for caller := range callers {
+		if _, ok := named[caller][spec]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // collectPlaceholderReferrers offers the base files whose references park on a
@@ -708,28 +930,129 @@ func closurePlaceholderIDs(repoPrefix, name string) []string {
 // the same corpus does not bind either. Re-offering both is how a comment-only
 // change to a file in a large package ends up dragging a third of the package
 // in behind the word "Close".
+//
+// It reads in bounded chunks and checks the build context between them: a
+// background build over a large dirty set spends tens of seconds here, and an
+// interactive build waiting for the lane cancels that context to preempt it.
 func (w *closureWalk) baseAccountedNames(graphPaths []string) map[string]struct{} {
-	ids := builderSeedNodeIDs(w.req.Base, graphPaths)
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var ids []string
+	for _, chunk := range closureChunks(graphPaths, closureReadChunk) {
+		chunkIDs, err := builderSeedNodeIDsContext(ctx, w.req.Base, chunk)
+		if err != nil {
+			w.err = err
+			return nil
+		}
+		ids = append(ids, chunkIDs...)
+	}
 	if len(ids) == 0 {
 		return nil
 	}
 	names := make(map[string]struct{})
 	targets := make(map[string]struct{})
+	account := func(id string) {
+		if id == "" {
+			return
+		}
+		if graph.IsUnresolvedTarget(id) {
+			// An import placeholder spells a module path, not a symbol
+			// name; there is nothing about it for a name lookup to skip.
+			parked := graph.UnresolvedName(id)
+			if name := closureBareName(parked); name != "" && !strings.HasPrefix(parked, "import::") {
+				names[name] = struct{}{}
+			}
+			return
+		}
+		targets[id] = struct{}{}
+	}
+	// Every edge the layer below recorded in these files is read, whatever
+	// its kind and whichever side of it the file's symbol stands on. The
+	// extraction's vocabulary is read from both endpoints of every edge
+	// (closureRefs.collect) — a value flowing out of a callee is recorded in
+	// the caller with the CALLEE as its source — so a name is accounted from
+	// the same place, or every callee a value flows out of looks newly
+	// introduced and the name lookup offers every file defining that name.
+	recorded := make(map[string]struct{}, len(graphPaths))
+	for _, graphPath := range graphPaths {
+		recorded[graphPath] = struct{}{}
+	}
+	// Endpoint-only projections, when the base serves them: the same rows
+	// without decoding every edge's Meta (the full-row read below was most of
+	// the plan phase on a real repository).
+	if proj, ok := graph.EdgeEndpointsOf(w.req.Base); ok {
+		seeds := make(map[string]struct{}, len(ids))
+		for _, id := range ids {
+			seeds[id] = struct{}{}
+		}
+		// Every edge recorded in these files, whichever side stands on a
+		// seed: the out-edge "recorded here" arm and the whole in-edge arm.
+		for _, chunk := range closureChunks(graphPaths, closureReadChunk) {
+			if err := ctx.Err(); err != nil {
+				w.err = err
+				return nil
+			}
+			for _, e := range proj.EdgeEndpointsRecordedAt(chunk) {
+				if _, out := seeds[e.From]; out {
+					account(e.To)
+				}
+				if _, in := seeds[e.To]; in {
+					account(e.From)
+				}
+			}
+		}
+		// Carried-kind out-edges recorded anywhere; overlaps the above
+		// idempotently.
+		for _, chunk := range closureChunks(ids, closureReadChunk*64) {
+			if err := ctx.Err(); err != nil {
+				w.err = err
+				return nil
+			}
+			for _, e := range proj.EdgeEndpointsFrom(chunk, closureCarriedEdgeKinds) {
+				account(e.To)
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			w.err = err
+			return nil
+		}
+		if len(targets) == 0 {
+			return names
+		}
+		list := make([]string, 0, len(targets))
+		for id := range targets {
+			list = append(list, id)
+		}
+		sort.Strings(list)
+		for _, name := range proj.NodeNamesByIDs(list) {
+			if name != "" {
+				names[name] = struct{}{}
+			}
+		}
+		return names
+	}
 	for _, edges := range w.req.Base.GetOutEdgesByNodeIDs(ids) {
 		for _, edge := range edges {
-			if edge == nil || edge.To == "" || !closureCarriesEdge(edge.Kind) {
+			if edge == nil {
 				continue
 			}
-			if graph.IsUnresolvedTarget(edge.To) {
-				// An import placeholder spells a module path, not a symbol
-				// name; there is nothing about it for a name lookup to skip.
-				parked := graph.UnresolvedName(edge.To)
-				if name := closureBareName(parked); name != "" && !strings.HasPrefix(parked, "import::") {
-					names[name] = struct{}{}
-				}
+			if _, here := recorded[edge.FilePath]; !here && !closureCarriesEdge(edge.Kind) {
 				continue
 			}
-			targets[edge.To] = struct{}{}
+			account(edge.To)
+		}
+	}
+	for _, edges := range w.req.Base.GetInEdgesByNodeIDs(ids) {
+		for _, edge := range edges {
+			if edge == nil {
+				continue
+			}
+			if _, here := recorded[edge.FilePath]; !here {
+				continue
+			}
+			account(edge.From)
 		}
 	}
 	if len(targets) == 0 {
@@ -833,6 +1156,9 @@ type closureRefs struct {
 	names   map[string]struct{}
 	imports map[string]map[string]struct{}
 	defines map[string]struct{}
+	// qualified is, per import specifier, the symbol names reached through it
+	// (`extern::<specifier>::<name>` placeholders).
+	qualified map[string]map[string]struct{}
 	// current is the repo-relative path of the file being collected. It is
 	// what attributes each import path to its importer.
 	current  string
@@ -917,7 +1243,7 @@ func (r *closureRefs) addEndpoint(id string) {
 		rest := strings.TrimPrefix(name, "extern::")
 		if i := strings.LastIndex(rest, "::"); i > 0 {
 			r.addImport(rest[:i])
-			r.addName(rest[i+len("::"):])
+			r.addQualified(rest[:i], rest[i+len("::"):])
 			return
 		}
 		r.addImport(rest)
@@ -937,6 +1263,25 @@ func (r *closureRefs) addImportSpecifier(specifier string) {
 	if i := strings.Index(specifier, "::"); i > 0 {
 		r.addImport(specifier[:i])
 	}
+}
+
+// addQualified records a symbol reached THROUGH an import specifier. The
+// resolver binds it inside the package the specifier names, never by the bare
+// name across the repository, so it is placed that way too (see
+// closureWalk.qualifiedFiles) rather than joining the bare-name set, where a
+// `viper.New()` offers every file in the repository that defines a New.
+func (r *closureRefs) addQualified(spec, raw string) {
+	name := closureBareName(raw)
+	if spec == "" || name == "" {
+		return
+	}
+	if r.qualified == nil {
+		r.qualified = map[string]map[string]struct{}{}
+	}
+	if r.qualified[spec] == nil {
+		r.qualified[spec] = map[string]struct{}{}
+	}
+	r.qualified[spec][name] = struct{}{}
 }
 
 // addName records the bare symbol name a placeholder carries.
@@ -1672,13 +2017,6 @@ func (w *closureWalk) buildDirIndexes() {
 	}
 }
 
-// builderSeedNodeIDs reads every node the base layer carries at the given
-// paths, in one batched read.
-func builderSeedNodeIDs(base LayerBase, paths []string) []string {
-	ids, _ := builderSeedNodeIDsContext(context.Background(), base, paths)
-	return ids
-}
-
 func builderSeedNodeIDsContext(ctx context.Context, base LayerBase, paths []string) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1776,10 +2114,36 @@ func (b *SparseGenerationBuilder) collectDependencies(
 	nodeIDs []string,
 	out map[string]struct{},
 ) error {
+	return b.collectDependenciesSplit(ctx, req, files, nodeIDs, out, out, false)
+}
+
+// collectDependenciesSplit is collectDependencies with the similarity relation
+// routed to its own set: the files a changed body's clone pairs live in are
+// dependents of the change, not context it merely reads.
+//
+// allKinds widens the forward read from the reference kinds closureCarriesEdge
+// names to every resolved edge the files' symbols have. It is what the changed
+// files get: baseAccountedNames treats every name the layer below already
+// bound from these files as not introduced, whatever the edge kind that bound
+// it, so the file behind each such binding has to be in the pass or the name
+// would bind differently there.
+func (b *SparseGenerationBuilder) collectDependenciesSplit(
+	ctx context.Context,
+	req BuildRequest,
+	files []string,
+	nodeIDs []string,
+	out map[string]struct{},
+	similar map[string]struct{},
+	allKinds bool,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	targetIDs := make(map[string]struct{})
+	similarIDs := make(map[string]struct{})
+	recordedHere := func(edge *graph.Edge) bool {
+		return allKinds && slices.Contains(files, edge.FilePath)
+	}
 	if len(nodeIDs) > 0 {
 		edgesByNode := req.Base.GetOutEdgesByNodeIDs(nodeIDs)
 		if err := ctx.Err(); err != nil {
@@ -1790,10 +2154,39 @@ func (b *SparseGenerationBuilder) collectDependencies(
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				if edge == nil || !closureCarriesEdge(edge.Kind) || graph.IsUnresolvedTarget(edge.To) {
+				if edge == nil || graph.IsUnresolvedTarget(edge.To) {
+					continue
+				}
+				if !closureCarriesEdge(edge.Kind) && !recordedHere(edge) {
+					continue
+				}
+				if closureSimilarityEdge(edge.Kind) {
+					similarIDs[edge.To] = struct{}{}
 					continue
 				}
 				targetIDs[edge.To] = struct{}{}
+			}
+		}
+		// The inbound half of the files' OWN recorded adjacency: an edge
+		// recorded in a changed file whose source lives elsewhere (a value
+		// flowing out of a callee into the caller) names a definition the
+		// changed file binds to exactly as a call does.
+		if allKinds {
+			inByNode := req.Base.GetInEdgesByNodeIDs(nodeIDs)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			for _, edges := range inByNode {
+				for _, edge := range edges {
+					if edge == nil || edge.From == "" || graph.IsUnresolvedTarget(edge.From) || !recordedHere(edge) {
+						continue
+					}
+					if closureSimilarityEdge(edge.Kind) {
+						similarIDs[edge.From] = struct{}{}
+						continue
+					}
+					targetIDs[edge.From] = struct{}{}
+				}
 			}
 		}
 	}
@@ -1814,7 +2207,25 @@ func (b *SparseGenerationBuilder) collectDependencies(
 			}
 		}
 	}
+	if err := builderAddNodeFilesContext(ctx, req.Base, similarIDs, similar); err != nil {
+		return err
+	}
 	return builderAddNodeFilesContext(ctx, req.Base, targetIDs, out)
+}
+
+// closureSimilarityEdge reports whether an edge kind is the similarity relation
+// rather than a reference.
+func closureSimilarityEdge(kind graph.EdgeKind) bool {
+	return kind == graph.EdgeSimilarTo || kind == graph.EdgeSemanticallyRelated
+}
+
+// closureCarriedEdgeKinds is closureCarriesEdge as a list, for the
+// endpoint projections' kind filter. TestClosureCarriedEdgeKindsMatchThePredicate
+// pins the two together.
+var closureCarriedEdgeKinds = []graph.EdgeKind{
+	graph.EdgeImports, graph.EdgeReExports, graph.EdgeSimilarTo, graph.EdgeSemanticallyRelated,
+	graph.EdgeCalls, graph.EdgeReferences, graph.EdgeReads, graph.EdgeWrites, graph.EdgeTypedAs,
+	graph.EdgeReturns, graph.EdgeInstantiates, graph.EdgeImplements, graph.EdgeExtends, graph.EdgeComposes,
 }
 
 // closureCarriesEdge reports whether an edge of this kind names content in
@@ -1898,3 +2309,18 @@ func builderAddNodeFilesContext(
 	}
 	return nil
 }
+
+// closureChunks splits values into consecutive chunks of at most n.
+func closureChunks(values []string, n int) [][]string {
+	if len(values) <= n {
+		return [][]string{values}
+	}
+	out := make([][]string, 0, (len(values)+n-1)/n)
+	for start := 0; start < len(values); start += n {
+		end := min(start+n, len(values))
+		out = append(out, values[start:end])
+	}
+	return out
+}
+
+const closureReadChunk = 32

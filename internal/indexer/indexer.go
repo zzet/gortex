@@ -357,6 +357,13 @@ type Indexer struct {
 	// handle is disqualified, because nothing would then bound what the drain
 	// writes.
 	passCorpusFilter func(*graph.Graph) error
+	// passCorpusSeed, when installed, is handed the pass graph once, after
+	// extraction and before resolution, to add payload the pass did not
+	// parse: the sparse generation builder seeds its declared closure
+	// context from the layer below instead of re-parsing it (see
+	// builder_declared_context.go). Whatever it adds must be withheld again
+	// by passCorpusFilter; the two are installed together.
+	passCorpusSeed func(graph.Store) error
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
@@ -4286,6 +4293,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		idx.pendingContractReg = contractReg
 		idx.deferredGoModDone = false
 	} else {
+		// Seed the payload the pass read from the layer below instead of
+		// parsing it (the sparse builder's declared context), so resolution
+		// and every subpass see it exactly where parsing would have put it.
+		if idx.passCorpusSeed != nil {
+			if err := idx.passCorpusSeed(idx.graph); err != nil {
+				return nil, fmt.Errorf("indexer: seed pass corpus: %w", err)
+			}
+		}
 		// Materialise dep::<module> contract nodes from go.mod BEFORE
 		// ResolveAll so the resolver's import bridge can re-target Go
 		// imports of declared modules to their dep contract node.
@@ -9600,4 +9615,10 @@ func (idx *Indexer) TrackedFileState(relPath string) FileFreshness {
 		return FileStale
 	}
 	return FileFresh
+}
+
+// setPassCorpusSeed installs Indexer.passCorpusSeed. Package-internal for the
+// same reason as setPassCorpusFilter.
+func (idx *Indexer) setPassCorpusSeed(fn func(graph.Store) error) {
+	idx.passCorpusSeed = fn
 }
