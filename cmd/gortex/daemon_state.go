@@ -1027,19 +1027,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		markReady()
 	}
 
-	// Committed-base publication starts HERE, after the readiness flip, and
-	// not in the dispatch that scheduled it. The dispatch runs upstream of
-	// markReady, so draining there would put one full index of a committed
-	// tree per dedicated repository in front of the moment the graph becomes
-	// queryable. Releasing the queue after the flip makes "ready, then
-	// publish" an ordering the code guarantees rather than one the scheduler
-	// usually wins.
-	//
-	// Unconditional on purpose: a resolve that failed (resolveOK == false) or
-	// a caller that passed no markReady still gets its bases published —
-	// readiness is what publication must not precede, not what it depends on.
-	state.basePublisher.BeginDraining()
-
 	// Drain deferred per-repo passes (semantic enrich / contract
 	// extract+commit). These finish after ready: enrichment is a precision
 	// upgrade on top of the already-queryable reference graph. The tail
@@ -1242,6 +1229,28 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	publishReadinessPhase(state, "end_batch_done", true, map[string]any{
 		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
 	})
+
+	// Committed-base publication starts HERE, after the readiness flip and
+	// after the batch's derived passes, and not in the dispatch that scheduled
+	// it. The dispatch runs upstream of markReady, so draining there would put
+	// one full index of a committed tree per dedicated repository in front of
+	// the moment the graph becomes queryable. Releasing the queue after the
+	// flip makes "ready, then publish" an ordering the code guarantees rather
+	// than one the scheduler usually wins.
+	//
+	// After end_batch as well: a clean tree's base is a copy of generation 0
+	// (copy_generation_zero), which is the committed tree's index only once
+	// the deferred passes and the batch's derived passes (implements,
+	// capability, framework and cross-repo edges, the references the
+	// deferred tail resolves) have landed in it. Released at the readiness
+	// flip, the copy was taken mid-warmup and the base served none of those
+	// edges: every checkout reading it lost them, and every per-file delta
+	// over it re-derived them as new rows.
+	//
+	// Unconditional on purpose: a resolve that failed (resolveOK == false) or
+	// a caller that passed no markReady still gets its bases published —
+	// readiness is what publication must not precede, not what it depends on.
+	state.basePublisher.BeginDraining()
 
 	finishWatchers := startWarmupStep(logger, "watcher_start")
 	watchCfgs := make(map[string]config.WatchConfig)

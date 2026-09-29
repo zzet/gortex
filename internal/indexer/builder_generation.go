@@ -613,7 +613,9 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		// a retry cannot re-adopt payload the failed writer left behind.
 		published := false
 		defer func() {
-			if !published {
+			// A claimed full snapshot cancelled by shutdown keeps its
+			// reservation for the next start (builder_dedicated_claimed_resume.go).
+			if !published && !keepsReservationOnCancel(ctx) {
 				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), generationAbandonTimeout)
 				defer cancel()
 				b.abandon(cleanupCtx, generationID)

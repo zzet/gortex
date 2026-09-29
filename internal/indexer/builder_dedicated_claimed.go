@@ -202,9 +202,22 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 		return prepareOwnedDedicatedSnapshot(ctx, target, func() error { return b.validate(ctx, &validation) })
 	}
 	route := reparse
+	routeName := claimedBaseRouteName(false)
 	copier, hasCopier := b.generationCopier(request)
-	takeCopy, zeroState, why := b.claimedBaseCopyPlan(ctx, handle, request.RootPath, req.RepoPrefix,
-		identity.TreeOID, identity.ExtractorVersions, hasCopier)
+	// An interrupted build that left the complete payload continues after it
+	// (builder_dedicated_claimed_resume.go).
+	resume, why := claimedBaseResumable(handle, req.RepoPrefix, row)
+	takeCopy := false
+	var zeroState graph.RepoIndexState
+	if resume {
+		route = b.prepareResumedDedicatedBase(req.RepoPrefix, claim.GenerationID, handle)
+		routeName = claimedBaseResumeRoute
+		// The payload is complete: no pass may re-derive (or purge) it.
+		adopted = false
+	} else {
+		takeCopy, zeroState, why = b.claimedBaseCopyPlan(ctx, handle, request.RootPath, req.RepoPrefix,
+			identity.TreeOID, identity.ExtractorVersions, hasCopier)
+	}
 	if takeCopy {
 		route = b.prepareCopiedDedicatedBase(copier, req.RepoPrefix, claim.GenerationID, handle, zeroState)
 		// The copy route re-derives the whole generation from generation zero
@@ -216,16 +229,25 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 		// landed. The flag has no other behaviour at this call site — the build
 		// flight reads it only to label an error message.
 		adopted = false
+		routeName = claimedBaseRouteName(true)
 	}
 	b.Logger.Info("claimed dedicated base source plan",
 		zap.Int64("generation", claim.GenerationID),
 		zap.String("graph", claim.Desire.Authority.GraphID),
-		zap.String("route", claimedBaseRouteName(takeCopy)),
+		zap.String("route", routeName),
 		zap.String("reason", why))
+	// A shutdown inside this build keeps the reservation for the next start
+	// (builder_dedicated_claimed_resume.go).
+	ctx = withKeepReservationOnCancel(ctx)
 
 	// One bracket, both routes. See generationBulkWindow for why it is opened
 	// from inside the payload preparation and closed from out here.
 	loader, _ := b.generationBulkLoader(request)
+	if resume {
+		// The generation already holds its payload; a bulk window opens only
+		// over an empty generation.
+		loader = nil
+	}
 	window := &generationBulkWindow{
 		loader: loader, generationID: claim.GenerationID, logger: b.Logger,
 		wholeGeneration: takeCopy,

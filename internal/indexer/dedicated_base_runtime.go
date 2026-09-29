@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"sync"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/viewmetrics"
@@ -401,6 +403,19 @@ func (p *dedicatedBasePublisher) ensureObserved(ctx context.Context, observe fun
 	out.Claim, err = catalog.ClaimDedicatedBaseBuild(ctx, claimRequest)
 	if err != nil {
 		return out, err
+	}
+	// A failed claim's generation is referenced by nothing once the claim
+	// above rebound: retire it now (builder_dedicated_claimed_resume.go).
+	var inUse func(int64) bool
+	if r.leases != nil {
+		inUse = r.leases.InUse
+	}
+	if retired, retireErr := retireReplacedDedicatedClaim(ctx, r.store, publication.Claim, publication.AttemptState, out.Claim, inUse); retireErr != nil {
+		observation.Builder.Logger.Warn("dedicated base: could not retire a replaced failed claim; the retirement sweep collects it",
+			zap.Int64("generation", publication.Claim.GenerationID), zap.Error(retireErr))
+	} else if retired {
+		observation.Builder.Logger.Info("dedicated base: retired a replaced failed claim",
+			zap.Int64("generation", publication.Claim.GenerationID), zap.Int64("claim", out.Claim.GenerationID))
 	}
 	if leases == nil && (out.Claim.BaseGenerationID != 0 || out.Claim.LayerID != "" || out.Claim.LowerViewFingerprint != "") {
 		return out, fmt.Errorf("%w: initial runtime cannot consume a claimed delta", store_sqlite.ErrDedicatedBaseCandidate)

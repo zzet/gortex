@@ -468,6 +468,7 @@ func (p *InitialBasePublisher) BeginDraining() {
 	if stopped {
 		return
 	}
+	p.logger.Info("daemon: committed-base publication released")
 	p.worker.Do(func() { go p.run() })
 	p.nudge()
 }

@@ -68,7 +68,7 @@ func TestClaimedPhysicalFailureReleasesSameDesireForRetry(t *testing.T) {
 	}
 }
 
-func TestClaimedCanceledPhysicalLeaderMarksAttemptFailed(t *testing.T) {
+func TestClaimedCanceledPhysicalLeaderKeepsItsReservation(t *testing.T) {
 	f := newDedicatedAdvanceFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -117,16 +117,24 @@ func TestClaimedCanceledPhysicalLeaderMarksAttemptFailed(t *testing.T) {
 	}
 	checkCtx, checkCancel := context.WithTimeout(context.Background(), time.Minute)
 	defer checkCancel()
+	// A cancelled full-snapshot leader (a daemon stopping) keeps its
+	// reservation: the claim stays live on the same generation, which stays
+	// building, so the next start resumes the payload instead of building it
+	// again (builder_dedicated_claimed_resume.go). A build that FAILS still
+	// fails its claim (TestClaimedPhysicalFailureReleasesSameDesireForRetry).
 	publication, found, err := f.builder.Store.Catalog().DedicatedBasePublication(checkCtx, f.publisher.authority.GraphID)
-	if err != nil || !found || publication.AttemptState != "failed" || publication.Claim.GenerationID != id {
-		t.Fatalf("canceled leader skipped uncanceled terminal cleanup: %+v found=%v err=%v", publication, found, err)
+	if err != nil || !found || publication.AttemptState != "building" || publication.Claim.GenerationID != id {
+		t.Fatalf("canceled leader did not keep its reservation: %+v found=%v err=%v", publication, found, err)
+	}
+	if row, found, err := f.builder.Store.Catalog().GetViewGeneration(checkCtx, id); err != nil || !found || row.State != store_sqlite.ViewGenerationBuilding {
+		t.Fatalf("canceled leader's generation %d is %q (found=%v err=%v), want building", id, row.State, found, err)
 	}
 	if f.builder.Store.PayloadBuildFlightActive(id) {
 		t.Fatal("canceled physical flight retained")
 	}
 	retry := f.ensure(t, checkCtx)
-	if retry.Claim.GenerationID <= id {
-		t.Fatalf("canceled-leader retry reused failed payload: %+v", retry)
+	if retry.Claim.GenerationID != id || retry.Adoption.GenerationID != id {
+		t.Fatalf("canceled-leader retry did not resume and publish the kept reservation %d: %+v", id, retry)
 	}
 }
 
