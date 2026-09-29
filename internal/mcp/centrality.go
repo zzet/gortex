@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"sort"
 	"strconv"
 
@@ -196,8 +197,20 @@ func (s *Server) boundedCentralityForRequest(ctx context.Context, seeds, candida
 	if ctx != nil && ctx.Err() != nil {
 		return rerank.CentralityResult{}
 	}
+	// The build itself is not cancellable, so it reads through a reader that
+	// stops at the request's end: once the request is abandoned (its tool
+	// deadline cancelled ctx) no further batch is read, and a store that can
+	// interrupt a batch in flight is asked to. Before this, an abandoned
+	// symbol search kept reading adjacency for minutes after its caller had
+	// gone, on the reader connection and the single scheduler slot the next
+	// requests needed.
 	snapshot, stats := analysis.BuildBoundedAdjacencySnapshot(
-		s.readerFor(ctx), candidateIDs, proximityAdjacencyDepth, rerankBoundedMaxNodes, rerankBoundedMaxEdges)
+		requestBoundReader(ctx, s.readerFor(ctx)), candidateIDs, proximityAdjacencyDepth, rerankBoundedMaxNodes, rerankBoundedMaxEdges)
+	if ctx != nil && ctx.Err() != nil {
+		// A snapshot cut short by the request's end is partial. Nobody reads
+		// the answer, and a walk over it must not reach the shared walk cache.
+		return rerank.CentralityResult{}
+	}
 	return rerank.CentralityResult{
 		Scores:      s.personalizedPageRankScoped(boundedCentralityScope(ctx, candidateIDs), snapshot, seeds),
 		NodeCount:   stats.NodeCount,
@@ -265,4 +278,65 @@ func boundedSnapshotDigest(depth, maxNodes, maxEdges int, roots []string) string
 		_, _ = h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil)[:16])
+}
+
+// requestBoundedReader is the reader a bounded adjacency build reads through
+// for one request. Its two batch reads return nothing once ctx is done, and
+// use the cancellable form of the read when the underlying reader has one, so
+// a batch in flight ends with the request instead of running to completion.
+// Every other method is the underlying reader's.
+type requestBoundedReader struct {
+	graph.Reader
+	ctx context.Context
+}
+
+// boundedReadsContextNodes and boundedReadsContextEdges are the cancellable
+// batch reads a reader may offer (the SQLite store offers both; a composed
+// view offers the node read).
+type boundedReadsContextNodes interface {
+	GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error)
+}
+
+type boundedReadsContextEdges interface {
+	GetOutEdgesByNodeIDsContext(context.Context, []string, int) (map[string][]*graph.Edge, bool, error)
+}
+
+// boundedReadsNoEdgeBudget asks a budgeted edge read for every outgoing edge:
+// the adjacency build applies its own caps after it filters edge kinds, so
+// the read itself must not truncate.
+const boundedReadsNoEdgeBudget = math.MaxInt32
+
+func requestBoundReader(ctx context.Context, g graph.Reader) graph.Reader {
+	if ctx == nil || g == nil || ctx.Done() == nil {
+		return g
+	}
+	return requestBoundedReader{Reader: g, ctx: ctx}
+}
+
+func (r requestBoundedReader) GetNodesByIDs(ids []string) map[string]*graph.Node {
+	if r.ctx.Err() != nil {
+		return map[string]*graph.Node{}
+	}
+	if reader, ok := r.Reader.(boundedReadsContextNodes); ok {
+		out, err := reader.GetNodesByIDsContext(r.ctx, ids)
+		if err != nil && out == nil {
+			return map[string]*graph.Node{}
+		}
+		return out
+	}
+	return r.Reader.GetNodesByIDs(ids)
+}
+
+func (r requestBoundedReader) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	if r.ctx.Err() != nil {
+		return map[string][]*graph.Edge{}
+	}
+	if reader, ok := r.Reader.(boundedReadsContextEdges); ok {
+		out, _, err := reader.GetOutEdgesByNodeIDsContext(r.ctx, ids, boundedReadsNoEdgeBudget)
+		if err != nil && out == nil {
+			return map[string][]*graph.Edge{}
+		}
+		return out
+	}
+	return r.Reader.GetOutEdgesByNodeIDs(ids)
 }
