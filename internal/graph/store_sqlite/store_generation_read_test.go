@@ -727,6 +727,26 @@ func generationReadProbes() []genProbe {
 			out = append(out, edgeTokens(set.Site(genReadShared, 12, graph.EdgeReferences))...)
 			return out
 		}},
+		{name: "EdgeEndpointProjections", run: func(t *testing.T, s *Store) []string {
+			// All four endpoint projections in one probe: each must answer from
+			// the handle's own generation only.
+			var out []string
+			render := func(label string, rows []graph.EdgeEndpointRow) {
+				for _, r := range rows {
+					out = append(out, fmt.Sprintf("%s %s->%s|%s|%s", label, r.From, r.To, r.Kind, r.FilePath))
+				}
+			}
+			render("recorded", s.EdgeEndpointsRecordedAt([]string{genReadFileA, genImportFile(genZeroMark), genImportFile(genOneMark)}))
+			render("from", s.EdgeEndpointsFrom(genReadProbeIDs(), nil))
+			render("from-calls", s.EdgeEndpointsFrom(genReadProbeIDs(), []graph.EdgeKind{graph.EdgeCalls}))
+			for id, name := range s.NodeNamesByIDs(genReadProbeIDs()) {
+				out = append(out, fmt.Sprintf("name %s=%s", id, name))
+			}
+			for from, paths := range s.OutEdgePathsFrom(genReadProbeIDs()) {
+				out = append(out, fmt.Sprintf("paths %s=%s", from, strings.Join(paths, ",")))
+			}
+			return out
+		}},
 		{name: "FindEdgesByIdentities", run: func(t *testing.T, s *Store) []string {
 			ids := []graph.EdgeIdentity{
 				{From: genReadShared, To: genOnlyID(genZeroMark), Kind: graph.EdgeCalls, FilePath: genReadFileA, Line: 11},
@@ -1846,6 +1866,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.DeadCodeCandidator)(nil), probe: "DeadCodeCandidates"},
 		{iface: (*graph.DerivedContractReplacer)(nil), skip: skipWrite, writeFence: writerFamilyFence("derived_contract_replace")},
 		{iface: (*graph.EdgeAdjacencyForKinds)(nil), probe: "EdgeAdjacencyForKinds"},
+		{iface: (*graph.EdgeEndpointReader)(nil), probe: "EdgeEndpointProjections"},
 		{iface: (*graph.EdgeIdentityBatchFinder)(nil), probe: "FindEdgesByIdentities"},
 		{iface: (*graph.EdgeKindCounter)(nil), probe: "EdgeKindCounts"},
 		{iface: (*graph.EdgeKindEvicter)(nil), skip: skipWrite, writeFence: writerFamilyFence("edge_kind_evict")},
