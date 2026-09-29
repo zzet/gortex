@@ -747,6 +747,9 @@ func generationReadProbes() []genProbe {
 			}
 			return out
 		}},
+		{name: "RecordedEdgesAt", run: func(t *testing.T, s *Store) []string {
+			return edgeTokens(s.RecordedEdgesAt([]string{genReadFileA, genImportFile(genZeroMark), genImportFile(genOneMark)}))
+		}},
 		{name: "FindEdgesByIdentities", run: func(t *testing.T, s *Store) []string {
 			ids := []graph.EdgeIdentity{
 				{From: genReadShared, To: genOnlyID(genZeroMark), Kind: graph.EdgeCalls, FilePath: genReadFileA, Line: 11},
@@ -1935,6 +1938,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.OverrideDispatchCallBatchScanner)(nil), probe: "ScanOverrideDispatchCalls"},
 		{iface: (*graph.PlannerStatsFreshener)(nil), skip: skipPhysical},
 		{iface: (*graph.QualifiedNodeIdentitySequencer)(nil), probe: "NodesInScopeSeq"},
+		{iface: (*graph.RecordedEdgeReader)(nil), probe: "RecordedEdgesAt"},
 		{iface: (*graph.ReachableForwardByKinds)(nil), probe: "ReachableForwardByKinds"},
 		{iface: (*graph.ReceiverMutationScanner)(nil), probe: "ScanReceiverMutation"},
 		{iface: (*graph.RefFactsReader)(nil), skip: skipSidecar},

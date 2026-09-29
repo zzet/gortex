@@ -167,6 +167,22 @@ func epAssertIdentity(t *testing.T, label string, view graph.Reader) {
 		}
 	}
 
+	recorded, ok := graph.RecordedEdgesOf(view)
+	if !ok {
+		t.Fatalf("%s: the composed view serves no by-file edge reader", label)
+	}
+	for _, subset := range [][]string{paths, {epCaller}, {epContext, epDeleted}, {epReplaced, epSource}} {
+		want := map[string]struct{}{}
+		for _, p := range subset {
+			want[p] = struct{}{}
+		}
+		got := epRenderFull(recorded.RecordedEdgesAt(subset), nil)
+		full := epRenderFull(view.AllEdges(), func(e *graph.Edge) bool { _, ok := want[e.FilePath]; return ok })
+		if !slices.Equal(got, full) {
+			t.Errorf("%s: RecordedEdgesAt(%v)\n reader:    %v\n full rows: %v", label, subset, got, full)
+		}
+	}
+
 	var outEdges []*graph.Edge
 	for _, list := range view.GetOutEdgesByNodeIDs(ids) {
 		outEdges = append(outEdges, list...)
@@ -282,7 +298,23 @@ func TestComposedViewEdgeEndpointsNeedEveryReaderBelow(t *testing.T) {
 	if _, ok := graph.EdgeEndpointsOf(graph.NewOverlaidViewWithLayer(graph.New(), layer)); ok {
 		t.Fatal("a view over an in-memory graph claimed endpoint projections")
 	}
+	if _, ok := graph.RecordedEdgesOf(graph.NewOverlaidViewWithLayer(graph.New(), layer)); ok {
+		t.Fatal("a view over an in-memory graph claimed the by-file edge reader")
+	}
 	if _, ok := graph.EdgeEndpointsOf(graph.NewOverlaidViewWithLayer(store, layer)); !ok {
 		t.Fatal("a view over a store handle served no endpoint projections")
 	}
+}
+
+// epRenderFull renders every field of each edge (line, confidence, Meta), so
+// the by-file reader is held to full-row identity, not endpoints.
+func epRenderFull(edges []*graph.Edge, keep func(*graph.Edge) bool) []string {
+	var out []string
+	for _, e := range edges {
+		if e != nil && (keep == nil || keep(e)) {
+			out = append(out, fmt.Sprintf("%+v", *e))
+		}
+	}
+	sort.Strings(out)
+	return out
 }

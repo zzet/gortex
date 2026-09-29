@@ -12,3 +12,11 @@ func (b commitLayerBase) EdgeEndpoints() (graph.EdgeEndpointReader, bool) {
 }
 
 var _ graph.EdgeEndpointProvider = commitLayerBase{}
+
+// RecordedEdges serves full edge rows by recording file through the composed
+// view the base wraps, when every reader in it can (graph.RecordedEdgesOf).
+func (b commitLayerBase) RecordedEdges() (graph.RecordedEdgeReader, bool) {
+	return graph.RecordedEdgesOf(b.Reader)
+}
+
+var _ graph.RecordedEdgeProvider = commitLayerBase{}
