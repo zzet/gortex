@@ -73,6 +73,14 @@ type storeCore struct {
 	db       *sql.DB
 	writerDB *sql.DB
 
+	// readGate is the admission point of the on-disk read pool (nil for
+	// in-memory stores, whose single pool has no WAL). The bounded WAL reclaim
+	// closes it for a moment so a TRUNCATE checkpoint can reset a log no pool
+	// reader holds; see sqliteReadGate and wal_reclaim.go.
+	readGate *sqliteReadGate
+	// walReclaim holds the reclaim's counters (WALReclaimStats).
+	walReclaim walReclaimState
+
 	// busyRetryTimeout is the whole-transaction contention budget. The zero
 	// value selects defaultSQLiteBusyRetryTimeout; tests shorten it to exercise
 	// persistent-lock exhaustion deterministically.
@@ -103,6 +111,14 @@ type storeCore struct {
 	// coordination mutex every handle over that generation shares. Keyed by
 	// int64 generation; values are *sync.Mutex. See ResolveMutex.
 	resolveLanes sync.Map
+
+	// walReclaimNudged asks the WAL reclaim loop to attempt at its next poll
+	// regardless of backoff (a residue drain handed it a busy TRUNCATE).
+	walReclaimNudged atomic.Bool
+	// writeIntents counts mutations announced through AnnounceWrite.
+	writeIntents atomic.Int32
+	// walDrainHandoffs counts residue drains handed to the reclaim.
+	walDrainHandoffs atomic.Int64
 
 	// payloadBuildFlights maps a catalog generation to its sole process-local
 	// physical writer. Every handle over this core joins the same rendezvous;
@@ -797,8 +813,12 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	}
 
 	readDB := db
+	var readGate *sqliteReadGate
 	if !isMemoryPath(path) {
-		readDB, err = openSQLiteReadPool(path)
+		if sqliteReadGateEnabled() {
+			readGate = newSQLiteReadGate()
+		}
+		readDB, err = openSQLiteReadPool(path, readGate)
 		if err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite open read pool: %w", err)
@@ -809,7 +829,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// close the pools and prepared statements. Handles derived later by
 	// AtGeneration share this core and leave teardown to this one.
 	s := &Store{
-		storeCore: &storeCore{db: readDB, writerDB: db, dbPath: path, wiped: didWipe},
+		storeCore: &storeCore{db: readDB, writerDB: db, readGate: readGate, dbPath: path, wiped: didWipe},
 		ownsCore:  true,
 	}
 	// Initialise the bundle cache at construction so its pointer is
@@ -917,36 +937,8 @@ func sqliteCheckpointDSN(path string) string {
 var errGenerationBulkCheckpointCoordination = errors.New("store_sqlite: generation bulk checkpoint coordination")
 
 func (s *Store) beginBackgroundCheckpointAttempt() (*backgroundCheckpointAttempt, bool) {
-	// Let background PASSIVE finish so SQLite can record WAL backfill progress.
-	// Shutdown and generation bulk admission cancel the attempt explicitly.
-	base, timeoutCancel := context.WithCancel(context.Background())
-	ctx, cancel := context.WithCancelCause(base)
-	attempt := &backgroundCheckpointAttempt{
-		ctx:           ctx,
-		cancel:        cancel,
-		timeoutCancel: timeoutCancel,
-		done:          make(chan struct{}),
-	}
-
-	coordination := &s.backgroundCheckpoint
-	coordination.mu.Lock()
-	if coordination.generationLease != 0 || coordination.active != nil {
-		coordination.mu.Unlock()
-		cancel(errWALCheckpointDeferredBulk)
-		timeoutCancel()
-		return nil, false
-	}
-	coordination.active = attempt
-	coordination.mu.Unlock()
-
-	go func() {
-		select {
-		case <-s.stopCheckpoint:
-			cancel(context.Canceled)
-		case <-attempt.done:
-		}
-	}()
-	return attempt, true
+	a, err := s.beginReclaimCheckpointAttempt(false)
+	return a, err == nil
 }
 
 func (s *Store) finishBackgroundCheckpointAttempt(attempt *backgroundCheckpointAttempt) {
@@ -1064,6 +1056,9 @@ func (s *Store) releaseGenerationBulkCheckpointLease(lease generationBulkCheckpo
 		return false
 	}
 	coordination.generationLease = 0
+	// The window held the reclaim off; let it try at its next poll rather
+	// than after whatever backoff it was on.
+	s.walReclaimNudged.Store(true)
 	return true
 }
 
@@ -1119,6 +1114,7 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 			return s.checkpointWALPassiveBackgroundOutcomeContext(ctx, checkpointDB)
 		})
 	}
+	stopReclaim := s.startWALReclaimLoop(walPath)
 	s.runCheckpointLoopWithAttemptAndCleanup(
 		walPressurePollInterval,
 		walCheckpointRetryInitial,
@@ -1126,7 +1122,7 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 		func() bool {
 			return schedule.attempt(time.Now(), walPath, checkpoint)
 		},
-		closeCheckpointDB,
+		func() { stopReclaim(); closeCheckpointDB() },
 	)
 }
 
@@ -1556,7 +1552,7 @@ func (s *Store) Close() error {
 			// A successful filesystem sync can exceed CheckpointWAL's deadline
 			// on a busy disk. Let it finish; withSQLiteBusyRetry still bounds
 			// repeated lock contention, and checkpoint errors remain fatal.
-			checkpointErr = s.checkpointWALWithContext(context.Background())
+			checkpointErr = s.closeCheckpointWAL()
 		}
 	}
 	stmts := []*sql.Stmt{
@@ -3609,3 +3605,42 @@ func (s *Store) FindNodesByNames(names []string) map[string][]*graph.Node {
 // the resolved graph to sqlite in one shot. On a first/empty cold index
 // the bracket additionally engages a bulk-persist fast path (dropped
 // secondary indexes + synchronous=OFF on a pinned connection).
+
+func (s *Store) beginReclaimCheckpointAttempt(overridesLease bool) (*backgroundCheckpointAttempt, error) {
+	// Let background PASSIVE finish so SQLite can record WAL backfill progress.
+	// Shutdown and generation bulk admission cancel the attempt explicitly.
+	base, timeoutCancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(base)
+	attempt := &backgroundCheckpointAttempt{
+		ctx:           ctx,
+		cancel:        cancel,
+		timeoutCancel: timeoutCancel,
+		done:          make(chan struct{}),
+	}
+
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	if (coordination.generationLease != 0 && !overridesLease) || coordination.active != nil {
+		refusal := errWALCheckpointDeferredBulk
+		if coordination.generationLease == 0 || overridesLease {
+			refusal = errWALCheckpointInFlight
+		}
+		coordination.mu.Unlock()
+		cancel(refusal)
+		timeoutCancel()
+		return nil, refusal
+	}
+	coordination.active = attempt
+	coordination.mu.Unlock()
+
+	go func() {
+		select {
+		case <-s.stopCheckpoint:
+			cancel(context.Canceled)
+		case <-attempt.done:
+		}
+	}()
+	return attempt, nil
+}
+
+var errWALCheckpointInFlight = errors.New("store_sqlite: wal checkpoint: another background checkpoint is in flight")

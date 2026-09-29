@@ -549,10 +549,17 @@ func (s *Store) runScheduledWALDrain(ctx context.Context, boundary string) {
 			return
 		}
 		drainCtx, cancel := context.WithTimeout(ctx, walCheckpointTimeout)
-		err := s.runMaintenance(drainCtx, maintenanceCheckpoint, false, s.checkpointWALWithContext)
+		err := s.runMaintenance(drainCtx, maintenanceCheckpoint, false, s.drainWALResidue)
 		cancel()
 		if err == nil {
 			s.walDrains.Add(1)
+			return
+		}
+		if errors.Is(err, errWALResidueHandedOff) {
+			// A reader holds the log: retrying would only spin. The reclaim,
+			// which can wait readers out without holding anyone, takes it.
+			s.walDrainHandoffs.Add(1)
+			log.Printf("store_sqlite: wal residue drain handed to reclaim boundary=%s attempts=%d error=%q", boundary, attempt, err)
 			return
 		}
 		if attempt == walDrainAttempts {
@@ -827,4 +834,54 @@ func (s *Store) vacuum(ctx context.Context) error {
 	}
 	_, err := s.writerDB.ExecContext(ctx, `VACUUM`)
 	return err
+}
+
+// errWALResidueHandedOff reports that a residue drain found the log held by a
+// reader and handed it to the WAL reclaim instead of retrying.
+var errWALResidueHandedOff = errors.New("store_sqlite: wal residue drain: log held by a reader, handed to the reclaim")
+
+// walResidueTruncateBudget bounds the drain's TRUNCATE while it holds the
+// application writer: the backfill already ran without the writer, so the
+// TRUNCATE only resets the log — or finds a reader and gives up.
+const walResidueTruncateBudget = 500 * time.Millisecond
+
+// drainWALResidue is the scheduled residue drain's one attempt. It backfills
+// with a PASSIVE that holds no writer, then takes the writer for a single
+// TRUNCATE on a checkpoint connection whose busy handler waits at most
+// sqliteCheckpointBusyTimeoutMillis, bounded by walResidueTruncateBudget. A
+// busy or incomplete TRUNCATE is not retried: a reader holding the log will
+// still hold it a few hundred milliseconds later, and the former retry loop
+// held the writer 7–9 s per attempt on the live store while every edit queued
+// behind it. The residue is handed to the WAL reclaim (nudged to attempt at
+// its next poll), which waits readers out with the gate open. A store without
+// a separate checkpoint connection (in-memory) keeps the writer-connection
+// TRUNCATE.
+func (s *Store) drainWALResidue(ctx context.Context) error {
+	if s.dbPath == "" || s.db == s.writerDB {
+		return s.checkpointWALWithContext(ctx)
+	}
+	ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
+	if err != nil {
+		return err
+	}
+	defer ckpt.Close()
+	_, _ = checkpointWALOnceOn(ctx, ckpt, "PASSIVE")
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer s.writeMu.Unlock()
+	if s.bulkConn != nil {
+		return errWALCheckpointDeferredBulk
+	}
+	tctx, cancel := context.WithTimeout(ctx, walResidueTruncateBudget)
+	result, err := checkpointWALOnceOn(tctx, ckpt, "TRUNCATE")
+	cancel()
+	if err != nil {
+		if ctx.Err() != nil {
+			return err
+		}
+		s.walReclaimNudged.Store(true)
+		return fmt.Errorf("%w: busy=%d wal_frames=%d checkpointed=%d: %v", errWALResidueHandedOff, result.Busy, result.WALFrames, result.CheckpointedFrames, err)
+	}
+	return nil
 }

@@ -62,6 +62,8 @@ type realController struct {
 	// track over MCP leave identical state behind. Nil only in tests that
 	// build a controller by hand; the methods that need it say so.
 	lifecycle *indexer.CheckoutLifecycle
+	// buildGate is the daemon-wide lane already supplied to the lifecycle.
+	buildGate *indexer.ViewBuildGate
 	// viewMaterializer composes the routed stack a probing path reads. It
 	// MUST be the one the rest of the stack materializes through: retirement
 	// runs with that instance's lease manager as its in-use predicate, so a
@@ -1111,6 +1113,8 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 		Enrichment:         agg.enrichment,
 		Views:              views,
 		PublicationPhases:  publicationPhasesStatus(indexer.DefaultPublicationPhases()),
+		Storage:            storageStatusFor(g),
+		BuildLane:          buildLaneStatusFor(c.buildGate, time.Now()),
 		ToolPreset:         agg.toolPreset,
 		ToolPresetMode:     agg.toolPresetMode,
 		LearnedTools:       agg.learnedTools,
@@ -2124,4 +2128,118 @@ func (c *realController) setShutdownHook(hook func() error) {
 	c.shutdownMu.Lock()
 	c.onShutdown = hook
 	c.shutdownMu.Unlock()
+}
+
+// storeWALReporter is the part of the SQLite store the storage block reads.
+// Every method is cheap: file stats, a read of the wal-index header, and a
+// counter snapshot under a short mutex — nothing that waits on the writer or
+// the read pool, so it is safe on the status path of a busy daemon.
+type storeWALReporter interface {
+	DBStats() (dbBytes, walBytes int64)
+	CloseCheckpointEstimate() (time.Duration, int64)
+	WALReclaimStats() store_sqlite.WALReclaimStats
+}
+
+// storageStatusFor renders the store's write-ahead-log state, nil for a store
+// that is not SQLite (or none).
+func storageStatusFor(g graph.Store) *daemon.StorageStatus {
+	if g == nil {
+		return nil
+	}
+	reporter, ok := g.(storeWALReporter)
+	if !ok {
+		return nil
+	}
+	dbBytes, walBytes := reporter.DBStats()
+	estimate, pending := reporter.CloseCheckpointEstimate()
+	return &daemon.StorageStatus{
+		DBBytes:                   dbBytes,
+		WALBytes:                  walBytes,
+		WALPendingFrames:          pending,
+		CloseCheckpointEstimateMS: estimate.Milliseconds(),
+		WALReclaim:                walReclaimStatus(reporter.WALReclaimStats()),
+	}
+}
+
+func walReclaimStatus(st store_sqlite.WALReclaimStats) *daemon.WALReclaimStatus {
+	out := &daemon.WALReclaimStatus{
+		OpenGateResets:   st.OpenGateResets,
+		WriterHoldMaxMS:  durationMS(st.WriterHoldMax),
+		WriterHoldLastMS: durationMS(st.WriterHoldLast),
+		ThresholdBytes:   st.ThresholdBytes,
+		Attempts:         st.Attempts,
+		Resets:           st.Resets,
+		Deferrals:        st.Deferrals,
+		Skips:            st.Skips,
+		Failures:         st.Failures,
+		FramesReclaimed:  st.FramesReclaimed,
+		BytesReclaimed:   st.BytesReclaimed,
+		PauseCount:       st.PauseCount,
+		PauseMaxMS:       durationMS(st.PauseMax),
+		PauseLastMS:      durationMS(st.PauseLast),
+		ReaderWaits:      st.ReaderWaits,
+		ReaderWaitMaxMS:  durationMS(st.ReaderWaitMax),
+		BackoffMS:        st.Backoff.Milliseconds(),
+		LastOutcome:      st.LastOutcome,
+		LastReason:       st.LastReason,
+	}
+	if st.PauseCount > 0 {
+		out.PauseAvgMS = durationMS(st.PauseTotal / time.Duration(st.PauseCount))
+	}
+	if st.ReaderWaits > 0 {
+		out.ReaderWaitAvgMS = durationMS(st.ReaderWaitTotal / time.Duration(st.ReaderWaits))
+	}
+	return out
+}
+
+// buildLaneStatusFor renders the view-build lane: its holder (kind, checkout,
+// generation, how long it has held the lane) and the queues behind it. nil
+// when the daemon has no gate.
+func buildLaneStatusFor(gate *indexer.ViewBuildGate, now time.Time) *daemon.BuildLaneStatus {
+	if gate == nil {
+		return nil
+	}
+	st := gate.Stats()
+	out := &daemon.BuildLaneStatus{
+		Open:                 st.Open,
+		Active:               st.Active,
+		InteractiveQueued:    st.InteractiveQueued,
+		BackgroundQueued:     st.BackgroundQueued,
+		InteractiveHighWater: st.InteractiveHighWater,
+		BackgroundHighWater:  st.BackgroundHighWater,
+		AdmittedInteractive:  st.AdmittedInteractive,
+		AdmittedBackground:   st.AdmittedBackground,
+		WaitSamples:          st.WaitSamples,
+		WaitMaxMS:            durationMS(st.MaxWait),
+	}
+	if st.WaitSamples > 0 {
+		out.WaitAvgMS = durationMS(st.TotalWait / time.Duration(st.WaitSamples))
+	}
+	if st.Active {
+		holder := &daemon.BuildLaneHolderStatus{Kind: "undeclared"}
+		since := st.ActiveSince
+		if h := st.Holder; h != nil {
+			holder.Kind = h.Kind
+			holder.CheckoutID = h.CheckoutID
+			holder.Priority = h.Priority
+			holder.Generation = h.Generation
+			if !h.Since.IsZero() {
+				since = h.Since
+			}
+		}
+		if !since.IsZero() {
+			holder.SinceUnixMS = since.UnixMilli()
+			if held := now.Sub(since); held > 0 {
+				holder.HeldForMS = durationMS(held)
+			}
+		}
+		out.Holder = holder
+	}
+	return out
+}
+
+// durationMS renders a duration as fractional milliseconds, rounded to the
+// microsecond so the JSON stays readable.
+func durationMS(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000
 }

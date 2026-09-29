@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
 
 // sqliteWriteGate is a zero-value, context-aware binary semaphore. It keeps
@@ -14,7 +15,14 @@ import (
 type sqliteWriteGate struct {
 	once  sync.Once
 	token chan struct{}
+	// waiters counts callers parked in LockContext because the gate was held.
+	// A holder that can give the gate up early (the WAL reclaim's open-gate
+	// stage) watches it and yields as soon as a writer queues.
+	waiters atomic.Int32
 }
+
+// waiting reports how many callers are parked waiting for the gate.
+func (g *sqliteWriteGate) waiting() int32 { return g.waiters.Load() }
 
 func (g *sqliteWriteGate) init() {
 	g.once.Do(func() {
@@ -36,6 +44,13 @@ func (g *sqliteWriteGate) LockContext(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	select {
+	case <-g.token:
+		return nil
+	default:
+	}
+	g.waiters.Add(1)
+	defer g.waiters.Add(-1)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()

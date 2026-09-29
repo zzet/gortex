@@ -425,6 +425,8 @@ type StatusResponse struct {
 	// purpose — the census carries no checkout or generation identities,
 	// and these records are keyed by both. Nil when nothing was recorded.
 	PublicationPhases []PublicationPhaseStatus `json:"publication_phases,omitempty"`
+	Storage           *StorageStatus           `json:"storage,omitempty"`
+	BuildLane         *BuildLaneStatus         `json:"build_lane,omitempty"`
 
 	// BinaryStale is true when the file at the daemon's os.Executable()
 	// path no longer matches the image the daemon is running (size or
@@ -1083,4 +1085,75 @@ func WriteJSONLine(w io.Writer, v any) error {
 	buf = append(buf, '\n')
 	_, err = w.Write(buf)
 	return err
+}
+
+// StorageStatus is the store's write-ahead-log state for daemon status.
+type StorageStatus struct {
+	DBBytes  int64 `json:"db_bytes"`
+	WALBytes int64 `json:"wal_bytes"`
+	// WALPendingFrames is the backlog not yet copied into the database
+	// (mxFrame - nBackfill), -1 when the wal-index could not be read.
+	WALPendingFrames int64 `json:"wal_pending_frames"`
+	// CloseCheckpointEstimateMS is how long Close's final checkpoint should
+	// be given for that backlog. A stop path that force-kills sooner loses
+	// the whole checkpoint: an interrupted pass records no progress.
+	CloseCheckpointEstimateMS int64             `json:"close_checkpoint_estimate_ms"`
+	WALReclaim                *WALReclaimStatus `json:"wal_reclaim,omitempty"`
+}
+
+// WALReclaimStatus mirrors the store's bounded WAL-reclaim counters. Pause is
+// the time the read gate was closed for a reset; ReaderWait is the time new
+// reads spent waiting at it.
+type WALReclaimStatus struct {
+	OpenGateResets   int64   `json:"open_gate_resets"`
+	WriterHoldMaxMS  float64 `json:"writer_hold_max_ms"`
+	WriterHoldLastMS float64 `json:"writer_hold_last_ms"`
+	ThresholdBytes   int64   `json:"threshold_bytes"`
+	Attempts         int64   `json:"attempts"`
+	Resets           int64   `json:"resets"`
+	Deferrals        int64   `json:"deferrals"`
+	Skips            int64   `json:"skips"`
+	Failures         int64   `json:"failures"`
+	FramesReclaimed  int64   `json:"frames_reclaimed"`
+	BytesReclaimed   int64   `json:"bytes_reclaimed"`
+	PauseCount       int64   `json:"pause_count"`
+	PauseMaxMS       float64 `json:"pause_max_ms"`
+	PauseAvgMS       float64 `json:"pause_avg_ms"`
+	PauseLastMS      float64 `json:"pause_last_ms"`
+	ReaderWaits      int64   `json:"reader_waits"`
+	ReaderWaitMaxMS  float64 `json:"reader_wait_max_ms"`
+	ReaderWaitAvgMS  float64 `json:"reader_wait_avg_ms"`
+	BackoffMS        int64   `json:"backoff_ms"`
+	LastOutcome      string  `json:"last_outcome,omitempty"`
+	LastReason       string  `json:"last_reason,omitempty"`
+}
+
+// BuildLaneStatus is the view-build lane's state for daemon status.
+type BuildLaneStatus struct {
+	Open   bool `json:"open"`
+	Active bool `json:"active"`
+	// Holder is what holds the lane, nil when it is idle. An active lane
+	// whose builder declared nothing reports Kind "undeclared".
+	Holder               *BuildLaneHolderStatus `json:"holder,omitempty"`
+	InteractiveQueued    int                    `json:"interactive_queued"`
+	BackgroundQueued     int                    `json:"background_queued"`
+	InteractiveHighWater int                    `json:"interactive_high_water"`
+	BackgroundHighWater  int                    `json:"background_high_water"`
+	AdmittedInteractive  uint64                 `json:"admitted_interactive"`
+	AdmittedBackground   uint64                 `json:"admitted_background"`
+	WaitSamples          uint64                 `json:"wait_samples"`
+	WaitMaxMS            float64                `json:"wait_max_ms"`
+	WaitAvgMS            float64                `json:"wait_avg_ms"`
+}
+
+// BuildLaneHolderStatus names the build holding the lane: its kind
+// (checkout_cycle, dirty_chain_compaction, checkout_mutation, ...), the
+// checkout it builds for, and the generation it builds over, when it has one.
+type BuildLaneHolderStatus struct {
+	Kind        string  `json:"kind"`
+	CheckoutID  string  `json:"checkout_id,omitempty"`
+	Priority    string  `json:"priority,omitempty"`
+	Generation  int64   `json:"generation,omitempty"`
+	SinceUnixMS int64   `json:"since_unix_ms,omitempty"`
+	HeldForMS   float64 `json:"held_for_ms"`
 }

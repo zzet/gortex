@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"modernc.org/sqlite"
 )
 
 // modernc applies every _pragma entry when each physical connection opens.
@@ -233,10 +235,24 @@ func configureWriterPool(db *sql.DB) {
 	db.SetMaxIdleConns(1)
 }
 
-func openSQLiteReadPool(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", sqliteReaderDSN(path))
-	if err != nil {
-		return nil, err
+// openSQLiteReadPool opens the bounded read pool. When gate is non-nil every
+// physical connection is wrapped so the start of each read passes through it
+// (see sqliteReadGate); the WAL reclaim closes that gate for a bounded moment
+// so a TRUNCATE checkpoint can reset a log no pool reader is holding.
+func openSQLiteReadPool(path string, gate *sqliteReadGate) (*sql.DB, error) {
+	var db *sql.DB
+	if gate == nil {
+		opened, err := sql.Open("sqlite", sqliteReaderDSN(path))
+		if err != nil {
+			return nil, err
+		}
+		db = opened
+	} else {
+		connector, err := sqlite.NewConnector(sqliteReaderDSN(path))
+		if err != nil {
+			return nil, err
+		}
+		db = sql.OpenDB(gatedConnector{inner: connector, gate: gate})
 	}
 	configureConnectionPool(db)
 	// Force one physical connection now. This catches an invalid/per-connection
