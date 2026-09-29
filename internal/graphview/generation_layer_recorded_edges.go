@@ -8,5 +8,8 @@ var _ graph.OverlayLayerRecordedEdgeReader = (*GenerationLayer)(nil)
 // generation's own full rows by recording file, through the same context-path
 // filter its full-row readers apply.
 func (l *GenerationLayer) LayerRecordedEdgesAt(paths []string) []*graph.Edge {
+	if l.noEdgeRows() {
+		return nil
+	}
 	return l.serveEdges(l.handle.RecordedEdgesAt(paths))
 }

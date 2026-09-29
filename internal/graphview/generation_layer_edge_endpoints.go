@@ -11,12 +11,18 @@ var _ graph.OverlayLayerEdgeEndpointReader = (*GenerationLayer)(nil)
 
 // LayerEdgeEndpointsRecordedAt is Edges() filtered to FilePath ∈ paths.
 func (l *GenerationLayer) LayerEdgeEndpointsRecordedAt(paths []string) []graph.EdgeEndpointRow {
+	if l.noEdgeRows() {
+		return nil
+	}
 	return l.serveEndpointRows(l.handle.EdgeEndpointsRecordedAt(paths))
 }
 
 // LayerEdgeEndpointsFrom is OutEdges(id) per id, reduced to endpoints and
 // restricted to kinds when kinds is non-empty.
 func (l *GenerationLayer) LayerEdgeEndpointsFrom(ids []string, kinds []graph.EdgeKind) []graph.EdgeEndpointRow {
+	if l.noEdgeRows() {
+		return nil
+	}
 	return l.serveEndpointRows(l.handle.EdgeEndpointsFrom(ids, kinds))
 }
 
