@@ -188,17 +188,31 @@ type walCopyPacer struct {
 	walPath      string
 	// noPause: a pressure attempt's pass is paced by the budget, never paused.
 	noPause bool
-	// overFoldMark: the log is over the fold's mark (chainFoldWALMark), read
-	// every walCopyMarkCheckPages pages. There the pass is not paced by the
-	// budget: a fold waits for this reset, and a paced copy (8.5 MiB/s)
-	// chasing an edit burst's writes took 30 s to converge.
-	overFoldMark bool
-	pages        int
+	// overPacingMark: the log is over the pacing mark (walCopyPacingMark),
+	// read every walCopyMarkCheckPages pages. There the pass is not paced by
+	// the budget: a fold or a pressure attempt waits for this reset, and a
+	// copy paced below the writers' rate would never converge (a paced copy
+	// at 8.5 MiB/s chasing an edit burst's writes took 30 s).
+	overPacingMark bool
+	pages          int
 }
 
 // walCopyMarkCheckPages: how often (in pages written) a pass reads the log's
-// size against the fold's mark.
+// size against the pacing mark.
 const walCopyMarkCheckPages = 256
+
+// walCopyPacingMark is the log size over which a pass is not paced by the
+// editing budget: the fold's mark, or the mark at which a pause ends (the
+// reclaim's pressure mark, or its hard cap if lower; hardCapBytes) when that
+// is lower. With the daemon's defaults both are 1 GiB. Below it the budget
+// applies, so a writer faster than the budget grows the log up to this mark,
+// where the copy runs at full speed.
+func walCopyPacingMark(hardCapBytes int64) int64 {
+	if hardCapBytes > 0 && hardCapBytes < chainFoldWALMark {
+		return hardCapBytes
+	}
+	return chainFoldWALMark
+}
 
 func (p *walCopyPacer) stopped() bool {
 	if p.ctx.Err() != nil {
@@ -271,11 +285,11 @@ func (p *walCopyPacer) beforeWrite(n int64) {
 	}
 	if p.pages%walCopyMarkCheckPages == 0 {
 		if mark := st.WALWriteMark(); mark.Valid {
-			p.overFoldMark = int64(mark.MxFrame)*(int64(mark.PageSize)+walFrameHeaderBytes) > chainFoldWALMark
+			p.overPacingMark = int64(mark.MxFrame)*(int64(mark.PageSize)+walFrameHeaderBytes) > walCopyPacingMark(p.hardCapBytes)
 		}
 	}
 	p.pages++
-	if p.rate > 0 && !p.overFoldMark && st.walCopy.editing(now) && !p.stopped() {
+	if p.rate > 0 && !p.overPacingMark && st.walCopy.editing(now) && !p.stopped() {
 		if wait := st.walCopy.take(now, n, p.rate); wait > 0 {
 			deadline := now.Add(wait)
 			for time.Now().Before(deadline) && !p.stopped() {
