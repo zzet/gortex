@@ -163,13 +163,19 @@ func sqliteWALPressureTarget(db *sql.DB, fallbackPath string, pages int) (string
 		defer cancel()
 		rows, err := db.QueryContext(ctx, `PRAGMA database_list`)
 		if err == nil {
+			mainFile := ""
 			for rows.Next() {
 				var seq int
 				var name, file string
 				if err := rows.Scan(&seq, &name, &file); err == nil && name == "main" && file != "" {
-					path = file
+					mainFile = file
 					break
 				}
+			}
+			// A failed iteration keeps the fallback path rather than trusting a
+			// partially read database list.
+			if rows.Err() == nil && mainFile != "" {
+				path = mainFile
 			}
 			_ = rows.Close()
 		}
