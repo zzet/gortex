@@ -99,7 +99,6 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// The instant the call entered the middleware: the origin a mutation's
 		// or a fresh request's publication phases are measured from.
 		ctx = withToolReceivedAt(ctx, time.Now())
-		ctx = s.withMutationPublicationStamps(ctx, req.Params.Name)
 		beginMCPToolCall()
 		defer func() {
 			endMCPToolCall(s.logger, req.Params.Name)
@@ -225,9 +224,11 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// read that must stay reachable while publication is pending, and the
 		// tools that must not be hostage to the binding they exist to fix.
 		viewless := catalogOnlyCheckoutControl(controlOperation) || viewlessCatalogTool(legacyName)
-		// Source writes announce before route/cycle waits; release at request end.
+		// A source mutation announces itself to the store before it waits on
+		// the route, the lane or the cycle; released when the request ends.
 		releaseWriteIntent := s.announceSourceMutation(req.Params.Name)
 		defer releaseWriteIntent()
+		ctx = s.withMutationPublicationStamps(ctx, req.Params.Name)
 		var view *requestView
 		if !viewless {
 			var viewErr error
@@ -249,7 +250,6 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withRequestView(ctx, view)
 			defer view.close()
 		}
-		indexer.StampPublicationPhase(ctx, indexer.PublicationViewSelected)
 		indexer.StampPublicationPhase(ctx, indexer.PublicationViewResolved)
 		// Tell the deadline firewall what this call is reading and what
 		// repositories it is admitted to. If it stops waiting for this handler
@@ -273,7 +273,8 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			return mutationErr, nil
 		}
 		ctx = mutationCtx
-		// Admission may reselect after a route move; following reads use it.
+		// Admission may have selected the view again (a route that moved
+		// between selection and admission); what follows reads that one.
 		if reselected := requestViewFromContext(ctx); reselected != nil {
 			view = reselected
 		}
