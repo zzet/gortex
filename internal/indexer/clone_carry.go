@@ -86,12 +86,30 @@ func (idx *Indexer) carryCloneRowsOfUnchangedBodies(stages []*incrementalBatchSt
 	// as a whole index and the primary per-save path write them: the next
 	// clone finalize over the generation reads them from here.
 	shingles := make(map[string][]uint64)
+	corpus := make([]graph.CloneCorpusRow, 0)
 	for _, n := range fresh {
 		if n == nil || (n.Kind != graph.KindFunction && n.Kind != graph.KindMethod) {
 			continue
 		}
 		if sh, ok := n.Meta[cloneShinglesMetaKey].([]uint64); ok && len(sh) > 0 {
 			shingles[n.ID] = sh
+			if tokens := tokensFromMeta(n); tokens > 0 {
+				corpus = append(corpus, graph.CloneCorpusRow{
+					NodeID: n.ID, Shingles: sh, TokenCount: tokens,
+				})
+			}
+		}
+	}
+	// DeltaWriter forwards legacy shingle writes, but its sidecar can retain
+	// the exact token count too. The latter is required when a later follow-up
+	// composes this generation with unchanged clone partners.
+	var corpusWriter graph.CloneCorpusWriter
+	if dw, ok := idx.graph.(*graph.DeltaWriter); ok {
+		corpusWriter, _ = dw.Sidecar().(graph.CloneCorpusWriter)
+	}
+	if corpusWriter != nil && len(corpus) > 0 && corpusWriter.BulkSetCloneCorpus(idx.repoPrefix, corpus) == nil {
+		for _, row := range corpus {
+			delete(shingles, row.NodeID)
 		}
 	}
 	if w, ok := idx.graph.(graph.CloneShingleWriter); ok && len(shingles) > 0 {

@@ -72,6 +72,9 @@ const (
 func (b *SparseGenerationBuilder) buildWorkingTreeLayer(ctx context.Context, req BuildRequest) (int64, BuildReport, error) {
 	for _, change := range req.Changes {
 		if dependencyManifestPath(change.Path) {
+			if req.followup && b.Config.Coverage.IsEnabled("clones") {
+				return 0, BuildReport{}, fmt.Errorf("indexer: clone follow-up cannot use the sparse manifest path: %s", change.Path)
+			}
 			b.logEditDeltaFallback(req, editDeltaFallbackManifest+": "+change.Path)
 			return b.Build(ctx, req)
 		}
@@ -79,6 +82,9 @@ func (b *SparseGenerationBuilder) buildWorkingTreeLayer(ctx context.Context, req
 	generationID, report, err := b.buildEditDelta(ctx, req)
 	var refused *editDeltaRefusedError
 	if err != nil && errors.As(err, &refused) {
+		if req.followup && b.Config.Coverage.IsEnabled("clones") {
+			return generationID, report, err
+		}
 		b.logEditDeltaFallback(req, editDeltaFallbackRefused+": "+refused.reason)
 		return b.Build(ctx, req)
 	}
@@ -335,7 +341,8 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 				b.abandon(cleanupCtx, generationID)
 			}
 		}()
-		delta, err := b.runEditDelta(ctx, req, plan, handle, &report)
+		var cloneProjection *cloneFollowupProjection
+		delta, err := b.runEditDelta(ctx, req, plan, handle, &report, &cloneProjection)
 		if err != nil {
 			return err
 		}
@@ -358,6 +365,41 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 				return fmt.Errorf("indexer: claim enrichment-restated nodes: %w", err)
 			}
 			delta.EnrichmentNodeClaims = claimed
+		}
+		if cloneProjection != nil {
+			projectStarted := time.Now()
+			detached, err := cloneProjection.apply(ctx, handle, req.Base)
+			if err != nil {
+				return fmt.Errorf("indexer: project clone follow-up: %w", err)
+			}
+			// Enrichment and detached identity overrides can add rows after the
+			// delta's payload count was stamped. Reconcile only this successful
+			// follow-up's per-repo count; pass/payload counters remain unchanged.
+			counts, err := handle.ScanRepoMemoryEstimates(ctx)
+			if err != nil {
+				return fmt.Errorf("indexer: count clone follow-up repo rows: %w", err)
+			}
+			report.NodeCount = counts[req.RepoPrefix].NodeCount
+			state, found, err := handle.GetRepoIndexState(req.RepoPrefix)
+			if err != nil {
+				return fmt.Errorf("indexer: read clone follow-up index state: %w", err)
+			}
+			if found {
+				state.NodeCount = report.NodeCount
+				if err := handle.SetRepoIndexState(state); err != nil {
+					return fmt.Errorf("indexer: count clone follow-up repo rows: %w", err)
+				}
+			}
+			if b.Logger != nil {
+				b.Logger.Info("indexer: clone follow-up projection",
+					zap.Int("signature_rows", len(cloneProjection.rows)),
+					zap.Int("detached_nodes", detached),
+					zap.Int("repo_nodes", report.NodeCount),
+					zap.Float64("ms", float64(time.Since(projectStarted).Microseconds())/1000))
+			}
+			report.Work.mark("clone_followup_projection")
+			report.cloneFollowupComplete = true
+			cloneProjection = nil
 		}
 		if b.Logger != nil {
 			b.Logger.Info("indexer: working-tree edit delta enrichment",
@@ -478,6 +520,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	plan buildPlan,
 	handle *store_sqlite.Store,
 	report *BuildReport,
+	cloneProjection **cloneFollowupProjection,
 ) (*EditDeltaReport, error) {
 	// A background stack pre-warm yields while a delta runs.
 	defer editDeltaBegin()()
@@ -824,6 +867,14 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	fixed := make(map[string]struct{}, len(out.Paths))
 	for _, rel := range out.Paths {
 		fixed[builderGraphPath(req.RepoPrefix, rel)] = struct{}{}
+	}
+	if req.followup && b.Config.Coverage.IsEnabled("clones") {
+		projection, err := prepareCloneFollowup(ctx, req.Base, dw, handle, req.RepoPrefix, idx.cloneThreshold())
+		if err != nil {
+			return nil, fmt.Errorf("indexer: recompute composed clone corpus: %w", err)
+		}
+		*cloneProjection = projection
+		lap("clone_followup")
 	}
 	payload := dw.Payload(fixed)
 	lap("payload")

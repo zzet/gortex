@@ -343,6 +343,9 @@ type BuildReport struct {
 	// whose body the build re-derived changed (or new): their clone rows
 	// were not carried and are owed to the follow-up (clone_carry.go).
 	ChangedBodyFiles []string
+	// cloneFollowupComplete is set only after the composed-corpus clone
+	// projection was written successfully by a working-tree follow-up.
+	cloneFollowupComplete bool
 
 	// PrepublishIO is the pre-publish check's CPU, major faults and store
 	// reads and writes (storeWaitMillis), for the build's log line.
@@ -572,6 +575,9 @@ func (b *SparseGenerationBuilder) Build(ctx context.Context, req BuildRequest) (
 	started := time.Now()
 	if err := b.validate(ctx, &req); err != nil {
 		return 0, BuildReport{}, err
+	}
+	if req.followup && b.Config.Coverage.IsEnabled("clones") {
+		return 0, BuildReport{}, fmt.Errorf("indexer: sparse clone follow-up has no composed-corpus recomputation")
 	}
 	work := newGenerationWorkCounters(req)
 	req.Target = work.admissionSource(req.Target)
@@ -2600,7 +2606,7 @@ func (b *SparseGenerationBuilder) declareProducers(
 		similarity.Reason = "near-duplicate detection ranks bodies against a corpus; " +
 			"a sparse generation ranks them against its file set"
 	}
-	if req.followup && similarity.State == store_sqlite.ProducerStateIncomplete {
+	if req.followup && report.cloneFollowupComplete && similarity.State == store_sqlite.ProducerStateIncomplete {
 		// The follow-up recomputed the owed paths' clone rows
 		// (RecomputeDerivedPaths): it completes what the layers below it
 		// deferred to it (graphview.followupSatisfied).

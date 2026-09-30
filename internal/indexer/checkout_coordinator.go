@@ -3410,7 +3410,13 @@ func (c *CheckoutCoordinator) baseViewMaterializer() *graphview.Materializer {
 // generation writes facts at all, it answers "no facts" for every file in the
 // repository. See ancestryRefFacts.
 func (c *CheckoutCoordinator) ancestryLayerBase(view *graphview.RepoView) LayerBase {
-	base := commitLayerBase{Reader: view.Reader, facts: newAncestryRefFacts(c.store, view)}
+	base := commitLayerBase{
+		Reader: view.Reader, facts: newAncestryRefFacts(c.store, view),
+		cloneSources: view.GenerationSources(),
+	}
+	if view.ComposesBaseCorpus() {
+		base.cloneCorpusBase = c.store.AtGeneration(graphview.BaseCorpusGeneration)
+	}
 	if !view.ComposesBaseCorpus() {
 		base.stack = view.Generations()
 	}
@@ -4594,6 +4600,10 @@ func extractorVersionsFingerprint() string {
 // authority on what depends on what.
 type commitLayerBase struct {
 	graph.Reader
+	// The clone follow-up uses the pinned ancestry's per-generation corpus
+	// sidecars with the same ownership layers as Reader's composition.
+	cloneSources    []graphview.GenerationSource
+	cloneCorpusBase *store_sqlite.Store
 	// facts serves the reference-fact hints from the whole materialized
 	// ancestry. A base assembled with one takes it; a base assembled with a
 	// single corpus handle below keeps the older scope. See ancestryRefFacts
