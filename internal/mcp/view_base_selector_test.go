@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 
@@ -480,11 +481,12 @@ func TestBaseSelectorStillAdmitsSourceEdits(t *testing.T) {
 		t.Error("the mutation gate stopped an edit_file the base corpus used to admit")
 	}
 
-	// The gate is not disarmed: an inexact answer is still read-only, which is
-	// the case the same function refuses one branch earlier.
+	// The gate is not disarmed: an unresolved automatic checkout now waits
+	// within this request's budget and refuses without reaching a write leaf.
 	routeViewCheckout(t, stack.store, stack.graphID, stack.commit, 0, store_sqlite.RouteActive)
 	fallbackReached := false
-	refused, err := stack.callWithView(t, stack.worktreeRoot, "edit_file", nil,
+	refused, err := stack.callWithView(t, stack.worktreeRoot, "edit_file",
+		map[string]any{"wait_deadline": time.Now().Add(100 * time.Millisecond).Format(time.RFC3339Nano)},
 		func(context.Context) (*mcplib.CallToolResult, error) {
 			fallbackReached = true
 			return mcplib.NewToolResultText(`{"ok":true}`), nil
@@ -492,7 +494,7 @@ func TestBaseSelectorStillAdmitsSourceEdits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("edit_file on a fallback: %v", err)
 	}
-	assertToolError(t, refused, graphview.CodeViewReadOnly)
+	assertToolError(t, refused, graphview.CodeViewBuilding)
 	if fallbackReached {
 		t.Error("a read-only fallback admitted a source edit")
 	}

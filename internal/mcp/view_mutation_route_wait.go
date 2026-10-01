@@ -51,7 +51,7 @@ func (s *Server) awaitMutationRoute(
 	if ctxDeadline, ok := ctx.Deadline(); ok {
 		deadline = ctxDeadline.Add(-mutationRouteWaitMargin)
 	}
-	if policy.freshness.requested() {
+	if policy.freshness.requested() || policy.freshness.hasDeadline {
 		if bounded := policy.freshness.effectiveDeadline(time.Now(), ctx); bounded.Before(deadline) {
 			deadline = bounded
 		}
