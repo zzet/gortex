@@ -618,6 +618,18 @@ func (s *Server) resolveRequestView(
 	if policy.freshness.err != nil {
 		return nil, policy.freshness.err
 	}
+	if policy.awaitRoute && selector.Kind == graphview.SelectorAuto && SessionCWDFromContext(ctx) != "" {
+		checkout, found, err := s.checkoutForRequestPath(ctx, canonicalWorktreeSelectorRoot(SessionCWDFromContext(ctx)))
+		if err != nil {
+			return s.viewForCWDLookupError(SessionCWDFromContext(ctx), err)
+		}
+		if found && graphview.ServesAutomaticView(checkout) {
+			// A lexical read may precede relationship publication. The next
+			// edit waits for this known checkout, rather than choosing a
+			// read-only canonical fallback and requiring a client retry.
+			selector = graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: checkout.CheckoutID}
+		}
+	}
 	selectCtx := ctx
 	if policy.freshness.requested() {
 		// The view selected before a freshness wait is closed unread: a

@@ -8,7 +8,9 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 func shortenMutationRouteWait(t *testing.T, poll time.Duration) {
@@ -130,4 +132,25 @@ func TestMutationRouteWaitPollIsAFractionOfTheEditBudget(t *testing.T) {
 	if mutationRouteWaitPoll <= 0 || mutationRouteWaitCap/mutationRouteWaitPoll < 8 {
 		t.Fatalf("poll %v against cap %v: the wait re-selects too rarely to notice the route inside its cap", mutationRouteWaitPoll, mutationRouteWaitCap)
 	}
+}
+
+func TestAutomaticMutationWaitsBeyondLexicalReadForItsOwnRoute(t *testing.T) {
+	stack := newViewStack(t)
+	routeViewCheckout(t, stack.store, stack.graphID, stack.commit, stack.dirty, store_sqlite.RoutePending)
+	ctx, cancel := context.WithTimeout(WithSessionCWD(WithSessionID(context.Background(), viewTestSession), stack.worktreeRoot), 5*time.Second)
+	defer cancel()
+	published := make(chan error, 1)
+	go func() {
+		time.Sleep(350 * time.Millisecond)
+		published <- stack.store.Catalog().UpsertCheckoutRoute(context.Background(), store_sqlite.CheckoutRoute{CheckoutID: viewTestWorktree, GraphID: stack.graphID, CommitGenerationID: stack.commit, DirtyGenerationID: stack.dirty, State: store_sqlite.RouteActive})
+	}()
+	started := time.Now()
+	view, err := stack.srv.resolveRequestView(ctx, graphview.Selector{Kind: graphview.SelectorAuto}, requestViewPolicy{awaitRoute: true})
+	require.NoError(t, <-published)
+	require.NoError(t, err)
+	defer view.close()
+	require.GreaterOrEqual(t, time.Since(started), 300*time.Millisecond)
+	require.True(t, view.routed())
+	require.True(t, view.rider.Exact)
+	require.Equal(t, viewTestWorktree, view.rider.CheckoutID)
 }

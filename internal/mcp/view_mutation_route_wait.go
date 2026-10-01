@@ -8,10 +8,9 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 )
 
-// mutationRouteWaitCap bounds how long a source mutation on an explicit
-// worktree waits for that worktree's route to finish rebuilding before it is
-// refused. The request's own deadline bounds it further.
-const mutationRouteWaitCap = 250 * time.Millisecond
+// mutationRouteWaitCap bounds an otherwise unbounded source mutation. Bounded
+// requests use their original deadline, reserving time for the mutation itself.
+const mutationRouteWaitCap = 5 * time.Second
 
 // mutationRouteWaitMargin is the part of the request's deadline the wait
 // leaves for the mutation itself.
@@ -50,7 +49,10 @@ func (s *Server) awaitMutationRoute(
 	}
 	deadline := time.Now().Add(mutationRouteWaitCap)
 	if ctxDeadline, ok := ctx.Deadline(); ok {
-		if bounded := ctxDeadline.Add(-mutationRouteWaitMargin); bounded.Before(deadline) {
+		deadline = ctxDeadline.Add(-mutationRouteWaitMargin)
+	}
+	if policy.freshness.requested() {
+		if bounded := policy.freshness.effectiveDeadline(time.Now(), ctx); bounded.Before(deadline) {
 			deadline = bounded
 		}
 	}
