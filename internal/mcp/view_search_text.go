@@ -203,6 +203,9 @@ func viewCheckoutID(view *requestView) string {
 }
 
 func viewRepoPrefix(view *requestView) string {
+	if view != nil && view.sourceScope != "" {
+		return view.sourceRepoPrefix
+	}
 	if view == nil || view.materialized == nil {
 		return ""
 	}

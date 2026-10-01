@@ -293,7 +293,7 @@ func TestWithdrawnSourceSnapshotFailsReadsNotSearches(t *testing.T) {
 	stack.declareProducer(t, stack.dirty, graphview.CapSourceSnapshot, store_sqlite.ProducerStateUnavailable)
 
 	read, err := stack.callHandler(t, stack.worktreeRoot, "read_file",
-		map[string]any{"path": "repo/keep.go", requireCompleteArgName: true}, stubLeaf)
+		map[string]any{"path": "repo/keep.go", "keep": "Handle", requireCompleteArgName: true}, stubLeaf)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}

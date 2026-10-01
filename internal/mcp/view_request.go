@@ -34,6 +34,11 @@ type requestViewCtxKey struct{}
 // requestView is what one request reads through, plus what the response says
 // about it.
 type requestView struct {
+	sourceScope               string
+	sourceCheckoutIncarnation string
+	sourceRepoPrefix          string
+	sourceGraphPending        bool
+	sourcePendingPaths        []string
 	// reader is the composed routed stack. Nil means the base corpus serves,
 	// which is what every request read before routed views existed.
 	reader graph.Reader
@@ -181,7 +186,9 @@ func (v *requestView) routed() bool { return v != nil && v.reader != nil }
 // of its own rather than through the shared corpus. It is routed() minus the
 // base narrowing: a base selector has a reader, but the bytes behind it are
 // the same canonical checkouts an unrouted request resolved against.
-func (v *requestView) readsOwnCheckout() bool { return v.routed() && !v.baseNarrowed }
+func (v *requestView) readsOwnCheckout() bool {
+	return v != nil && (v.sourceScope != "" || (v.routed() && !v.baseNarrowed))
+}
 
 // acceptsBufferOverlay reports whether session-local editor buffers may layer
 // over this answer. A grace fallback deliberately returns the stable primary
@@ -2456,6 +2463,19 @@ func viewRiderFields(view *requestView) map[string]any {
 		"requested_view": view.rider.RequestedView,
 		"actual_view":    view.rider.ActualView,
 		"exact":          view.rider.Exact,
+	}
+	if view.sourceScope != "" {
+		fields["freshness_scope"] = view.sourceScope
+		fields["checkout_incarnation"] = view.sourceCheckoutIncarnation
+		fields["capability_scope"] = view.sourceScope
+		fields["graph_freshness"] = "unknown"
+		if view.sourceGraphPending {
+			fields["graph_freshness"] = "pending"
+		}
+		if len(view.sourcePendingPaths) > 0 {
+			fields["pending_file_count"] = len(view.sourcePendingPaths)
+			fields["pending_files"] = view.sourcePendingPaths[:min(16, len(view.sourcePendingPaths))]
+		}
 	}
 	if view.routeless {
 		// A carrier for a freshness answer, not a view: selection produced

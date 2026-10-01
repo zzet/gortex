@@ -21,6 +21,7 @@ import (
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/tokens"
 )
 
@@ -1435,15 +1436,25 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		if guardErr := s.guardSymlinkWithinRepo(ctx, absPath); guardErr != nil {
 			return mcp.NewToolResultError(guardErr.Error()), nil
 		}
+		sourceView := sourceRequestView(ctx)
+		overlayContent, overlayPresent, overlayDeleted, overlayBaseSHA := s.sourceOverlayFile(ctx, absPath)
+		if sourceView != nil {
+			if !requestViewPathRoot(ctx).contains(absPath) {
+				return mcp.NewToolResultError("source path is outside the selected checkout"), nil
+			}
+			if overlayDeleted {
+				return mcp.NewToolResultError("file is deleted in the current editor buffer"), nil
+			}
+		}
 		info, statErr := os.Stat(absPath)
-		if statErr != nil {
+		if statErr != nil && !(sourceView != nil && overlayPresent && !physicalEvidenceRequested) {
 			return mcp.NewToolResultError(fmt.Sprintf("could not stat file: %v", statErr)), nil
 		}
-		if info.IsDir() {
+		if info != nil && info.IsDir() {
 			return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
 		}
 
-		if physicalEvidenceRequested {
+		if physicalEvidenceRequested || (sourceView != nil && info != nil) {
 			var readErr error
 			read := readPhysicalFileEvidence
 			if s.physicalEvidenceOverride != nil {
@@ -1459,6 +1470,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			if guardErr := s.guardResolvedPathWithinRepo(ctx, absPath, physicalEvidence.resolvedPath); guardErr != nil {
 				return mcp.NewToolResultError(guardErr.Error()), nil
 			}
+			if sourceView != nil && !requestViewPathRoot(ctx).contains(physicalEvidence.resolvedPath) {
+				return mcp.NewToolResultError("resolved source path is outside the selected checkout"), nil
+			}
 			// Also reject a path retargeted outside after the evidence snapshot.
 			if guardErr := s.guardSymlinkWithinRepo(ctx, absPath); guardErr != nil {
 				return mcp.NewToolResultError(guardErr.Error()), nil
@@ -1469,10 +1483,16 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		// drifted overlay is already rejected upstream by the overlay view
 		// guard; what reaches here is a live buffer, which we flag as such so
 		// the caller knows the bytes are an unsaved editor view, not disk.
-		if buf, ok := s.overlayContentFor(ctx, absPath); ok {
+		if sourceView != nil && overlayPresent {
+			if expected := normalizeExpectedSHA(overlayBaseSHA); expected != "" && (info == nil || gitBlobSHA(diskContent) != expected) {
+				return mcp.NewToolResultError("overlay drift: current disk bytes differ from the editor buffer base"), nil
+			}
+			content = []byte(overlayContent)
+			servedFromOverlay = true
+		} else if buf, ok := s.overlayContentFor(ctx, absPath); ok {
 			content = []byte(buf)
 			servedFromOverlay = true
-		} else if physicalEvidenceRequested {
+		} else if physicalEvidenceRequested || sourceRequestView(ctx) != nil {
 			content = diskContent
 		} else {
 			b, rerr := os.ReadFile(absPath)
@@ -1484,6 +1504,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 
 	originalBytes := len(content)
+	sourceHead := content[:min(512, len(content))]
 
 	// Line-window: when offset/limit are given, return only that slice of
 	// the file's lines. This is the bounded-read path for large files — the
@@ -1498,12 +1519,19 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	isBinary := looksBinary(content)
 	bodiesElided := false
 	var keptSymbols []string
-	language := s.detectLanguageForPath(ctx, absPath, relPath)
+	var language string
+	if sourceRequestView(ctx) != nil {
+		language = s.detectLanguageForContent(absPath, sourceHead)
+	} else {
+		language = s.detectLanguageForPath(ctx, absPath, relPath)
+	}
 	// Tool-call observer: credit the recent search for the symbols in
 	// the file the agent is reading.
-	s.creditFileConsumption(ctx, relPath)
-	// File symbols power both the `keep` predicate and frecency credit.
-	sg := s.engineFor(ctx).GetFileSymbols(relPath)
+	var sg *query.SubGraph
+	if sourceRequestView(ctx) == nil {
+		s.creditFileConsumption(ctx, relPath)
+		sg = s.engineFor(ctx).GetFileSymbols(relPath)
+	}
 	if req.GetBool("compress_bodies", false) && language != "" && elide.IsSupported(language) {
 		var symbols []*graph.Node
 		if sg != nil {
@@ -1572,12 +1600,27 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	maxChars := req.GetInt("max_chars", 0)
 	content, contentTruncated := capReadFileContent(content, maxChars, isBinary)
 
+	if view := sourceRequestView(ctx); view != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if view.freshness != nil {
+			view.freshness.fresh = true
+		}
+	}
 	result := map[string]any{
 		"path":           relPath,
 		"language":       language,
 		"bytes":          len(content),
 		"original_bytes": originalBytes,
 		"content":        string(content),
+	}
+	if sourceRequestView(ctx) != nil {
+		source := "disk"
+		if servedFromOverlay {
+			source = "overlay"
+		}
+		result["source_evidence"] = map[string]any{"verified": true, "content_source": source, "byte_count": originalBytes}
 	}
 	if contentTruncated {
 		result["content_truncated"] = true
@@ -1695,7 +1738,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		stats.record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)
 	}
 
-	s.attachFileDependents(ctx, result, relPath)
+	if sourceRequestView(ctx) == nil {
+		s.attachFileDependents(ctx, result, relPath)
+	}
 
 	if s.isTOON(ctx, req) {
 		return returnTOON(result)
@@ -1709,11 +1754,13 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 // Registry's extension-based detection so unindexed files (or files
 // outside any tracked repo) still get a language tag.
 func (s *Server) detectLanguageForPath(ctx context.Context, absPath, relPath string) string {
-	// Try the indexed file node first.
-	if sg := s.engineFor(ctx).GetFileSymbols(relPath); sg != nil {
-		for _, n := range sg.Nodes {
-			if n != nil && n.Kind == graph.KindFile && n.Language != "" {
-				return n.Language
+	// Source-only reads detect from bytes/registry, never from an older graph.
+	if sourceRequestView(ctx) == nil {
+		if sg := s.engineFor(ctx).GetFileSymbols(relPath); sg != nil {
+			for _, n := range sg.Nodes {
+				if n != nil && n.Kind == graph.KindFile && n.Language != "" {
+					return n.Language
+				}
 			}
 		}
 	}
@@ -1731,6 +1778,10 @@ func (s *Server) detectLanguageForPath(ctx context.Context, absPath, relPath str
 		}
 		_ = f.Close()
 	}
+	return s.detectLanguageForContent(absPath, head)
+}
+
+func (s *Server) detectLanguageForContent(absPath string, head []byte) string {
 	if s.multiIndexer != nil {
 		for _, prefix := range s.multiIndexer.RepoPrefixes() {
 			if idx := s.multiIndexer.GetIndexer(prefix); idx != nil {

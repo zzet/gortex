@@ -366,6 +366,12 @@ func (s *Server) prepareOverlayRequest(ctx context.Context) (context.Context, *g
 	if view := OverlayViewFromContext(ctx); view != nil {
 		return ctx, view, nil
 	}
+	if view := requestViewFromContext(ctx); view != nil && view.sourceScope != "" {
+		if err := s.validateOverlaySnapshotDrift(ctx, snapshot); err != nil {
+			return ctx, nil, err
+		}
+		return ctx, nil, nil
+	}
 	view, err := s.buildOverlayViewForCtx(ctx)
 	if err != nil {
 		return ctx, nil, err
@@ -468,27 +474,8 @@ func (s *Server) buildOverlayViewForCtx(ctx context.Context) (*graph.OverlaidVie
 	files := snapshot.files
 	sessID := OverlayCohortIDFromContext(ctx)
 
-	// Drift check up front for every overlay that carries a BaseSHA.
-	// We do it here, before parsing, so a stale overlay never costs
-	// the extractor time and the client gets a clear error.
-	for _, ov := range files {
-		if ov.BaseSHA == "" {
-			continue
-		}
-		// Drift is a property of the working copy THIS request reads. Stating
-		// it against the repository's canonical checkout would refuse a buffer
-		// that matches the worktree it was opened from, and accept one that
-		// drifted from it.
-		abs, resolveErr := s.resolveOverlayRequestAbsPath(ctx, ov.Path)
-		if resolveErr != nil {
-			return nil, resolveErr
-		}
-		if abs == "" {
-			continue
-		}
-		if !overlaySHAMatches(abs, ov.BaseSHA) {
-			return nil, fmt.Errorf("%w: %s", daemon.ErrOverlayDrift, ov.Path)
-		}
+	if err := s.validateOverlaySnapshotDrift(ctx, snapshot); err != nil {
+		return nil, err
 	}
 
 	hash := hashOverlayFiles(files)
@@ -1480,3 +1467,33 @@ func (s *Server) overlayCacheInvalidate(sessID string) {
 // Compile-time sanity: a sync.Mutex usage placeholder so future
 // linter-driven import pruning doesn't strip the package.
 var _ sync.Mutex
+
+func (s *Server) validateOverlaySnapshotDrift(ctx context.Context, snapshot *overlayRequestSnapshot) error {
+	if snapshot == nil {
+		return nil
+	}
+	// Drift check up front for every overlay that carries a BaseSHA.
+	// We do it here, before parsing, so a stale overlay never costs
+	// the extractor time and the client gets a clear error.
+	for _, ov := range snapshot.files {
+		if ov.BaseSHA == "" {
+			continue
+		}
+		// Drift is a property of the working copy THIS request reads. Stating
+		// it against the repository's canonical checkout would refuse a buffer
+		// that matches the worktree it was opened from, and accept one that
+		// drifted from it.
+		abs, resolveErr := s.resolveOverlayRequestAbsPath(ctx, ov.Path)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if abs == "" {
+			continue
+		}
+		if !overlaySHAMatches(abs, ov.BaseSHA) {
+			return fmt.Errorf("%w: %s", daemon.ErrOverlayDrift, ov.Path)
+		}
+	}
+
+	return nil
+}

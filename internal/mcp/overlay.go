@@ -232,7 +232,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		var view *requestView
 		if !viewless {
 			var viewErr error
-			view, viewErr = s.resolveRequestView(ctx, selector, s.requestViewPolicy(&req, freshness))
+			view, viewErr = s.resolveSourceRequestView(ctx, selector, &req, legacyName, freshness, capabilities)
+			if view == nil && viewErr == nil {
+				view, viewErr = s.resolveRequestView(ctx, selector, s.requestViewPolicy(&req, freshness))
+			}
 			if viewErr != nil {
 				control := checkoutControlFromContext(ctx)
 				if controlOperation != "detect_changes" || control == nil || !control.CheckoutScoped {
