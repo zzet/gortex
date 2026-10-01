@@ -59,3 +59,31 @@ func TestPendingSourceRecoveryPreservesHistoricalFailure(t *testing.T) {
 	require.Empty(t, s.pendingSourcePaths("", ""))
 	require.Equal(t, mutationGraphStale, record.snapshot().GraphStatus, "recovery must not rewrite historical receipt")
 }
+
+func TestPendingSourcePrimaryRepairPreservesHistoricalFailure(t *testing.T) {
+	s := &Server{}
+	record := s.beginMutationCommit(context.Background(), "edit", "", "", "a.go", "/repo/a.go")
+	record.markCommitted("new", 3)
+	record.recordGraph(mutationReindexOutcome{Receipt: "failed"})
+	receipt := &mutationReceipt{id: "failed", completed: true, result: indexer.MutationResult{Reindexed: true}}
+	s.mutationReceipts.Store(receipt.id, receipt)
+	require.Empty(t, s.pendingSourcePaths("", ""))
+	s.mutationReceipts.Delete(receipt.id)
+	require.Empty(t, s.pendingSourcePaths("", ""))
+	require.Equal(t, mutationGraphStale, record.snapshot().GraphStatus)
+}
+
+func TestPendingSourceRecoveryAfterReceiptExpiryOnlyClearsCapturedVersion(t *testing.T) {
+	s := &Server{}
+	old := s.beginMutationCommit(context.Background(), "edit", "", "", "a.go", "/repo/a.go")
+	old.markCommitted("old", 3)
+	old.recordGraph(mutationReindexOutcome{Receipt: "expired"})
+	eligible := s.failedReceiptsBefore([]string{"a.go"}, "/repo")
+	require.Contains(t, eligible, old.id)
+	newer := s.beginMutationCommit(context.Background(), "edit", "", "", "a.go", "/repo/a.go")
+	newer.markCommitted("new", 3)
+	s.resolveReindexedPathReceipts("/repo/a.go", eligible)
+	require.Equal(t, []string{"/repo/a.go"}, s.pendingSourcePaths("", ""))
+	require.NotContains(t, s.pendingSourceFiles.versions, old.id)
+	require.Contains(t, s.pendingSourceFiles.versions, newer.id)
+}

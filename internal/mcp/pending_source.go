@@ -75,9 +75,60 @@ func (s *Server) refreshPendingSourceRecord(record *mutationCommitRecord) {
 				return
 			}
 			outcome := receipt.outcome(true)
+			if !outcome.Pending && outcome.Reindexed && outcome.Err == nil && snap.GraphStatus != mutationGraphPending {
+				record.mu.Lock()
+				record.pendingSourceRecovered = true
+				record.mu.Unlock()
+				return
+			}
 			if !outcome.Pending && snap.GraphStatus == mutationGraphPending {
 				record.recordGraph(outcome)
 			}
 		}
+	}
+}
+
+// Capture only failed versions that existed before recovery sampling. IDs are
+// commit versions, so a new edit to the same path cannot be retired by it.
+func (s *Server) captureFailedSourceVersions(eligible map[string]struct{}, checkoutID, incarnation, absPath string) {
+	p := &s.pendingSourceFiles
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id, record := range p.versions {
+		snap := record.snapshot()
+		if snap.DiskStatus != mutationDiskCommitted || !snap.GraphRecorded || snap.GraphStatus == mutationGraphPending || snap.GraphStatus == mutationGraphFresh {
+			continue
+		}
+		if snap.CheckoutID != checkoutID || snap.CheckoutIncarnation != incarnation {
+			continue
+		}
+		if absPath != "" && filepath.Clean(record.absPath) != filepath.Clean(absPath) {
+			continue
+		}
+		eligible[id] = struct{}{}
+	}
+}
+
+func (s *Server) resolveCapturedSourceVersions(eligible map[string]struct{}, checkoutID, incarnation, absPath string) {
+	p := &s.pendingSourceFiles
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id := range eligible {
+		record := p.versions[id]
+		if record == nil {
+			continue
+		}
+		snap := record.snapshot()
+		if snap.CheckoutID != checkoutID || snap.CheckoutIncarnation != incarnation {
+			continue
+		}
+		if absPath != "" && filepath.Clean(record.absPath) != filepath.Clean(absPath) {
+			continue
+		}
+		// The eligible set is a pre-sampling witness; versions are never reused.
+		record.mu.Lock()
+		record.pendingSourceRecovered = true
+		record.mu.Unlock()
+		delete(p.versions, id)
 	}
 }

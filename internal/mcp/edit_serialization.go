@@ -303,6 +303,7 @@ func (s *Server) failedCheckoutRefreshReceiptsBefore(checkoutID, incarnation str
 		}
 		return true
 	})
+	s.captureFailedSourceVersions(eligible, checkoutID, incarnation, "")
 	return eligible
 }
 
@@ -322,23 +323,9 @@ func (s *Server) resolveCheckoutRecoveryReceipts(recovery *mutationReceipt, elig
 		}
 		receipt.mu.Unlock()
 	}
+	s.resolveCapturedSourceVersions(eligible, recovery.checkoutID, recovery.checkoutIncarnation, "")
 }
 
-// resolveSupersededFailedReceipts resolves terminally failed receipts for a
-// path once a later generation of the same path has been applied
-// successfully. The graph then reflects newer bytes than the failed
-// generation ever wrote, so the stale failure no longer describes a real
-// freshness gap — keeping it would only fail freshness barriers that waiting
-// cannot heal, because a terminal error never completes differently.
-//
-// The failed receipt is resolved in place rather than deleted: the
-// mutation-commit ledger refreshes its graph half through
-// mutationReceiptState, and a deleted receipt would leave that record
-// reading "pending" forever. Stamping the superseding apply mirrors how
-// completeMutationWaiters resolves earlier waiters with the later apply's
-// result. Pending receipts and failures at or above the succeeded
-// generation are left untouched. The succeeded result is passed by value so
-// the sweep holds no lock besides the receipt it is stamping.
 func (s *Server) resolveSupersededFailedReceipts(succeededPath string, succeededGeneration uint64, applied indexer.MutationResult) {
 	cleanPath := filepath.Clean(succeededPath)
 	s.mutationReceipts.Range(func(_, value any) bool {
@@ -400,6 +387,7 @@ func (s *Server) failedReceiptsBefore(paths []string, root string) map[string]st
 		}
 		return true
 	})
+	s.captureFailedSourceVersions(eligible, "", "", candidate)
 	return eligible
 }
 
@@ -429,6 +417,7 @@ func (s *Server) resolveReindexedPathReceipts(reindexedPath string, eligible map
 		receipt.mu.Unlock()
 		return true
 	})
+	s.resolveCapturedSourceVersions(eligible, "", "", cleanPath)
 	s.pendingSourcePaths("", "")
 }
 
