@@ -48,3 +48,14 @@ func TestPendingSourcePublicationOutlivesReceipt(t *testing.T) {
 	s.mutationReceipts.Delete(receipt.id)
 	require.Empty(t, s.pendingSourcePaths("", ""))
 }
+
+func TestPendingSourceRecoveryPreservesHistoricalFailure(t *testing.T) {
+	s := &Server{}
+	record := s.beginMutationCommit(context.Background(), "edit", "", "", "a.go", "/repo/a.go")
+	record.markCommitted("new", 3)
+	record.recordGraph(mutationReindexOutcome{Receipt: "failed"})
+	receipt := &mutationReceipt{id: "failed", completed: true, barrierRecoveredGeneration: 8}
+	s.mutationReceipts.Store(receipt.id, receipt)
+	require.Empty(t, s.pendingSourcePaths("", ""))
+	require.Equal(t, mutationGraphStale, record.snapshot().GraphStatus, "recovery must not rewrite historical receipt")
+}

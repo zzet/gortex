@@ -93,8 +93,9 @@ var mutationCommitSequence atomic.Uint64
 var errMutationNotApplied = errors.New("mutation not applied")
 
 type mutationCommitRecord struct {
-	mu    sync.RWMutex
-	owner *Server
+	mu                     sync.RWMutex
+	owner                  *Server
+	pendingSourceRecovered bool
 
 	id      string
 	tool    string

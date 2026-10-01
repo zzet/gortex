@@ -429,6 +429,7 @@ func (s *Server) resolveReindexedPathReceipts(reindexedPath string, eligible map
 		receipt.mu.Unlock()
 		return true
 	})
+	s.pendingSourcePaths("", "")
 }
 
 func (r *mutationReceipt) outcome(pending bool) mutationReindexOutcome {

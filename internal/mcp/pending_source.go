@@ -36,7 +36,10 @@ func (s *Server) pendingSourcePaths(checkoutID, incarnation string) []string {
 		snap := record.snapshot()
 		s.refreshPendingSourceRecord(record)
 		snap = record.snapshot()
-		if snap.DiskStatus == mutationDiskNotApplied || snap.DiskStatus == mutationDiskFailed ||
+		record.mu.RLock()
+		recovered := record.pendingSourceRecovered
+		record.mu.RUnlock()
+		if recovered || snap.DiskStatus == mutationDiskNotApplied || snap.DiskStatus == mutationDiskFailed ||
 			(snap.DiskStatus == mutationDiskCommitted && snap.GraphStatus == mutationGraphFresh) {
 			delete(p.versions, id)
 			continue
@@ -57,13 +60,22 @@ func (s *Server) pendingSourcePaths(checkoutID, incarnation string) []string {
 // receipt can finish before the mutation handler records its pending outcome.
 func (s *Server) refreshPendingSourceRecord(record *mutationCommitRecord) {
 	snap := record.snapshot()
-	if snap.GraphStatus != mutationGraphPending || snap.ReindexReceipt == "" {
+	if snap.GraphStatus == mutationGraphFresh || snap.ReindexReceipt == "" {
 		return
 	}
 	if value, ok := s.mutationReceipts.Load(snap.ReindexReceipt); ok {
 		if receipt, ok := value.(*mutationReceipt); ok {
+			receipt.mu.RLock()
+			recovered := receipt.barrierRecoveredGeneration > 0 && receipt.checkoutID == snap.CheckoutID && receipt.checkoutIncarnation == snap.CheckoutIncarnation
+			receipt.mu.RUnlock()
+			if recovered {
+				record.mu.Lock()
+				record.pendingSourceRecovered = true
+				record.mu.Unlock()
+				return
+			}
 			outcome := receipt.outcome(true)
-			if !outcome.Pending {
+			if !outcome.Pending && snap.GraphStatus == mutationGraphPending {
 				record.recordGraph(outcome)
 			}
 		}
