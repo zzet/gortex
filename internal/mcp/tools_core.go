@@ -1759,6 +1759,14 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if err != nil {
 		return mcp.NewToolResultError("query is required"), nil
 	}
+	if view := sourceRequestView(ctx); view != nil && view.sourceScope == "declarations" {
+		fq := parseFieldQuery(q)
+		resolved, refusal := s.resolveScope(ctx, requestWithInlineScopeClauses(req, fq), IntentLocate)
+		if refusal != nil {
+			return refusal, nil
+		}
+		return s.handleSourceSearchSymbols(ctx, req, view, fq.Text, fq, resolved)
+	}
 	limit := req.GetInt("limit", 20)
 	offset := decodeCursor(req.GetString("cursor", ""))
 

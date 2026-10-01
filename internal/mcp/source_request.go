@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 // Source operations prove the bytes they serve rather than wait for unrelated
@@ -27,6 +30,7 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 		req = &policyReq
 	}
 	scope := ""
+	fq := fieldQuery{}
 	switch name {
 	case "read_file":
 		if req.GetString("keep", "") != "" || installedSkillPath(req.GetString("path", "")) {
@@ -35,11 +39,38 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 		scope = "file"
 	case "search_text":
 		scope = "text"
+	case "search_symbols":
+		if capabilities.requireComplete {
+			return nil, nil
+		}
+		fq = parseFieldQuery(req.GetString("query", ""))
+		for _, char := range fq.Text {
+			if !unicode.IsLetter(char) && !unicode.IsDigit(char) && !strings.ContainsRune("_.$:", char) {
+				return nil, nil
+			}
+		}
+		class := rerank.ClassifyQuery(fq.Text)
+		if pinned := strings.TrimSpace(req.GetString("query_class", "")); pinned != "" {
+			parsed, ok := rerank.ParseQueryClass(pinned)
+			if !ok {
+				return nil, nil
+			}
+			if parsed != rerank.QueryClassUnknown {
+				class = parsed
+			}
+		}
+		corpus, err := parseCorpus(*req)
+		if err != nil || corpus != corpusCode || class != rerank.QueryClassSymbol || strings.TrimSpace(fq.Text) == "" || parseAssistMode(*req) == assistDeep || parseAssistMode(*req) == assistOn || req.GetBool("debug", false) || isCompact(*req) || s.isGCX(ctx, *req) {
+			return nil, nil
+		}
+		scope = "declarations"
+		policyReq = requestWithInlineScopeClauses(*req, fq)
+		req = &policyReq
 	default:
 		return nil, nil
 	}
 	for _, cap := range capabilities.required {
-		if cap != graphview.CapSourceSnapshot && !(scope == "text" && cap == graphview.CapSearchText) {
+		if cap != graphview.CapSourceSnapshot && !(scope == "text" && cap == graphview.CapSearchText) && !(scope == "declarations" && cap == graphview.CapSearchSymbols) {
 			return nil, nil
 		}
 	}
@@ -78,7 +109,7 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 		}
 	}
 	graphPending := len(paths) > 0 || control.Route == nil || control.Route.State != store_sqlite.RouteActive || control.Route.DirtyGenerationID == 0
-	if scope == "text" && !graphPending && len(s.resolvePathFilter(*req, fieldQuery{})) == 0 {
+	if scope != "file" && !graphPending && len(s.resolvePathFilter(*req, fq)) == 0 {
 		return nil, nil
 	}
 	view := &requestView{
@@ -88,7 +119,7 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 		sourceGraphPending: graphPending,
 		declared:           graphview.Completeness{graphview.CapSourceSnapshot: graphview.StateComplete},
 	}
-	if scope == "text" {
+	if scope != "file" {
 		resolved, err := s.resolveScopeForRequest(ctx, *req, IntentLocate)
 		if err != nil {
 			return nil, err
@@ -96,7 +127,11 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 		if !s.sourceSearchDomainContained(view, resolved) {
 			return nil, nil
 		}
-		view.declared[graphview.CapSearchText] = graphview.StateComplete
+		if scope == "text" {
+			view.declared[graphview.CapSearchText] = graphview.StateComplete
+		} else {
+			view.declared[graphview.CapSearchSymbols] = graphview.StateComplete
+		}
 	}
 	if freshness.requested() {
 		view.freshness = &requestFreshnessOutcome{deadline: freshness.effectiveDeadline(time.Now(), ctx)}
