@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/parser"
 )
 
 func TestSourceSearchRequiresContainedRepositoryDomain(t *testing.T) {
@@ -95,4 +97,63 @@ func TestSourceNameSearchRetainsGraphDispatchForGraphRequirements(t *testing.T) 
 	require.Nil(t, resolve(map[string]any{"query": "how request validation works", "query_class": "symbol"}, capabilityRequest{}), "pinning symbol class cannot turn a concept into literal declaration lookup")
 	require.Nil(t, resolve(map[string]any{"query": "Keeper"}, capabilityRequest{required: []graphview.CapabilityID{graphview.CapSyntaxGraph}}))
 	require.Nil(t, resolve(map[string]any{"query": "Keeper"}, capabilityRequest{requireComplete: true}))
+}
+
+type sourceNameCountingExtractor struct {
+	parser.Extractor
+	paths []string
+}
+
+func (e *sourceNameCountingExtractor) Extract(path string, content []byte) (*parser.ExtractionResult, error) {
+	e.paths = append(e.paths, path)
+	return e.Extractor.Extract(path, content)
+}
+
+func TestSourceNameGoEscapesDoNotParseUnrelatedFiles(t *testing.T) {
+	srv, root := setupTestServer(t)
+	extractor, ok := srv.indexer.Registry().GetByLanguage("go")
+	require.True(t, ok)
+	counting := &sourceNameCountingExtractor{Extractor: extractor}
+	srv.indexer.Registry().Register(counting)
+	for i := 0; i < 22; i++ {
+		require.NoError(t, os.WriteFile(filepath.Join(root, fmt.Sprintf("escaped%d.go", i)), []byte("package main\nconst Escaped = \"\\u0041\\U00000042\"\n"), 0644))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(root, "target.go"), []byte("package main\nfunc MatchedName() {}\nfunc Étude() {}\n"), 0644))
+	view := &requestView{sourceScope: "declarations", viewRoot: root}
+	ctx := withRequestView(context.Background(), view)
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"query": "MatchedName"}
+	result, err := srv.handleSourceSearchSymbols(ctx, req, view, "MatchedName", fieldQuery{}, ResolvedScope{})
+	require.NoError(t, err)
+	require.False(t, result.IsError, viewResultText(t, result))
+	require.Equal(t, []string{"target.go"}, counting.paths)
+	var answer map[string]any
+	require.NoError(t, json.Unmarshal([]byte(viewResultText(t, result)), &answer))
+	evidence := answer["source_evidence"].(map[string]any)
+	require.Equal(t, float64(24), evidence["files_scanned"])
+	require.Equal(t, float64(1), evidence["files_parsed"])
+	require.Contains(t, viewResultText(t, result), "target.go::MatchedName")
+	counting.paths = nil
+	result, err = srv.handleSourceSearchSymbols(ctx, req, view, "étude", fieldQuery{}, ResolvedScope{})
+	require.NoError(t, err)
+	require.False(t, result.IsError, viewResultText(t, result))
+	require.Equal(t, []string{"target.go"}, counting.paths)
+	require.Contains(t, viewResultText(t, result), "target.go::Étude")
+}
+
+func TestSourceNameNonGoEscapesKeepConservativeExtraction(t *testing.T) {
+	srv, root := setupTestServer(t)
+	extractor, ok := srv.indexer.Registry().GetByLanguage("java")
+	require.True(t, ok)
+	counting := &sourceNameCountingExtractor{Extractor: extractor}
+	srv.indexer.Registry().Register(counting)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "escaped.java"), []byte("class Escaped { String token = \"\\u0041\"; }\n"), 0644))
+	view := &requestView{sourceScope: "declarations", viewRoot: root}
+	ctx := withRequestView(context.Background(), view)
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"query": "AbsentName"}
+	result, err := srv.handleSourceSearchSymbols(ctx, req, view, "AbsentName", fieldQuery{}, ResolvedScope{})
+	require.NoError(t, err)
+	require.False(t, result.IsError, viewResultText(t, result))
+	require.Equal(t, []string{"escaped.java"}, counting.paths)
 }

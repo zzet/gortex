@@ -40,7 +40,8 @@ func (s *Server) handleSourceSearchSymbols(ctx context.Context, req mcp.CallTool
 			return nil, err
 		}
 		// Qualified names may be synthesized from package/receiver facts.
-		// Unicode escape spelling can also differ from the declared name.
+		// Some languages allow escape spelling in identifiers. Go identifiers
+		// are literal UTF-8, so escapes in strings do not require extraction.
 		graphPath := sourceSearchGraphPath(view, file.path)
 		extractor, source, ok, prepareErr := idx.PrepareSourceDeclaration(file.abs, graphPath, file.content)
 		if prepareErr != nil {
@@ -50,7 +51,8 @@ func (s *Server) handleSourceSearchSymbols(ctx context.Context, req mcp.CallTool
 			continue
 		}
 		raw := string(source)
-		if prefilter != "" && !strings.Contains(raw, "\\u") && !strings.Contains(raw, "\\U") && !strings.Contains(strings.ToLower(raw), prefilter) {
+		escapedIdentifierPossible := extractor.Language() != "go" && (strings.Contains(raw, "\\u") || strings.Contains(raw, "\\U"))
+		if prefilter != "" && !escapedIdentifierPossible && !strings.Contains(strings.ToLower(raw), prefilter) {
 			continue
 		}
 		result, parseErr := parser.Extract(extractor, graphPath, source, parser.ExtractionOptions{})
