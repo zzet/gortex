@@ -95,9 +95,19 @@ func Inspect(home string) InstallState {
 	}
 
 	state.PluginPath = PluginPath(home)
+	v2Present := false
 	if data, err := os.ReadFile(state.PluginPath); err == nil {
-		state.PluginPresent = strings.Contains(string(data), PluginMarker)
+		v2Present = strings.Contains(string(data), PluginMarker)
 	}
+
+	// Also check V1 location for backward compatibility
+	v1Path := V1PluginPath(home)
+	v1Present := false
+	if data, err := os.ReadFile(v1Path); err == nil {
+		v1Present = strings.Contains(string(data), PluginMarker)
+	}
+
+	state.PluginPresent = v2Present || v1Present
 	// The plugin is the whole hook surface: present means every event it
 	// drives is wired, absent means none are. There is no per-event
 	// configuration to count, which is why this is a fan-out of one bool

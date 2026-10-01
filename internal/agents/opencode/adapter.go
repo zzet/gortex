@@ -32,7 +32,7 @@
 //
 //	ModeGlobal:  <home>/.config/opencode/skills/<id>/SKILL.md   (curated pack)
 //	             <home>/.config/opencode/commands/<id>.md       (slash commands)
-//	             <home>/.config/opencode/plugin/gortex.js       (enforcement bridge)
+//	             <home>/.config/opencode/plugins/gortex/        (enforcement bridge, V2 layout)
 //
 // skills.go explains the split (codebase-agnostic playbooks are a
 // user-level concern, repo-derived skills are not) and plugin.go explains

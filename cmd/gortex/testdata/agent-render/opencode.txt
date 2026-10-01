@@ -629,8 +629,8 @@ description: "Preview an edit's blast radius on the shadow graph before writing.
     }
   }
 }
-=== global/home/.config/opencode/plugin/gortex.js ===
-// Gortex plugin for OpenCode (1.18.18).
+=== global/home/.config/opencode/plugins/gortex/index.js ===
+// Gortex plugin for OpenCode (dual V1/V2).
 //
 // OpenCode has no lifecycle-hook configuration at all — there is no
 // settings key that runs a command on session start or before a tool
@@ -657,6 +657,13 @@ description: "Preview an edit's blast radius on the shadow graph before writing.
 // startup. Anything beyond a `node:` built-in would need a package.json
 // this installer does not own, and a failed install would take the plugin
 // down with it.
+//
+// V2: default-exports Plugin.define({ id: "gortex", setup })
+// V1: exports { server } returning the V1 hook object
+// OpenCode 1.18.29+ reads the V1 `server` export; V2 reads the default.
+//
+// The @opencode/plugin import is dynamic so V1 (which lacks the package)
+// can load the file and read the `server` export without resolution errors.
 
 import { execFileSync } from "node:child_process";
 
@@ -796,35 +803,26 @@ function appendToLastTextPart(parts, text) {
   }
 }
 
-export const GortexPlugin = async ({ directory, worktree }) => {
-  // The repo the Go side resolves indexed-source coverage against.
-  // `worktree` is the git root and `directory` the CWD OpenCode started
-  // in; prefer the former so a session opened in a subdirectory is still
-  // recognised as covered.
+// --- Shared mutable state (module-level, single instance per process) ---
+// NOTE: V1 and V2 plugins are mutually exclusive at runtime (only one loads per
+// OpenCode process). Each has its own module-level state (decided, oriented).
+// If both somehow loaded, deduplication and briefing would not coordinate.
+const decided = new Map();
+// Assumption: OpenCode creates fresh plugin context per session.
+// If module persists across sessions, `oriented` would prevent briefing.
+let oriented = false;
+
+function remember(callID, tip) {
+  if (!callID) return;
+  if (decided.size >= DECISION_CACHE_MAX) decided.clear();
+  decided.set(callID, tip || "");
+}
+
+// --- V1 Server Entry Point (for OpenCode 1.18.29+) ---
+async function server({ directory, worktree }) {
   const cwd = worktree || directory || process.cwd();
 
-  // callID -> soft guidance parked by tool.execute.before for
-  // tool.execute.after to deliver. Presence of a key also records "this
-  // call was already decided", which is what keeps permission.ask from
-  // asking the same question twice for one tool call.
-  const decided = new Map();
-
-  // The session briefing is a once-per-session injection; OpenCode has no
-  // session-start hook in the stable set, so the first chat message is
-  // where it goes.
-  let oriented = false;
-
-  function remember(callID, tip) {
-    if (!callID) return;
-    if (decided.size >= DECISION_CACHE_MAX) decided.clear();
-    decided.set(callID, tip || "");
-  }
-
   return {
-    // Throwing from tool.execute.before is OpenCode's documented way to
-    // refuse a tool call: the throw becomes the tool's error and the
-    // model reads the message. That makes the thrown reason the deny
-    // text, which is why it is the Go decision's Reason verbatim.
     "tool.execute.before": async (input, output) => {
       if (!ENFORCE) return;
       const tool = String(input?.tool ?? "");
@@ -848,12 +846,6 @@ export const GortexPlugin = async ({ directory, worktree }) => {
       }
     },
 
-    // This hook deliberately does NOT shell the bridge. The Go router
-    // maps no "after" phase, so every call would spend a subprocess to
-    // receive a guaranteed-empty decision. What it is for is delivery:
-    // it is the only stable hook that can put text in front of the model
-    // without blocking anything, so it hands over the soft guidance the
-    // before-hook parked (the enrich and nudge postures' whole output).
     "tool.execute.after": async (input, output) => {
       const callID = String(input?.callID ?? "");
       if (!callID || !decided.has(callID)) return;
@@ -869,14 +861,6 @@ export const GortexPlugin = async ({ directory, worktree }) => {
       }
     },
 
-    // permission.ask is a second gate, not a duplicate one: OpenCode
-    // raises it from inside a tool that needs approval, after
-    // tool.execute.before has already run for that callID. Deferring to
-    // the earlier decision keeps one tool call from being scored twice —
-    // double-counting would inflate doctor's run tallies and, under
-    // consult-unlock / adaptive-nudge, move per-session state twice for
-    // one action. A permission with no matching before-hook is still
-    // asked about.
     "permission.ask": async (input, output) => {
       if (!ENFORCE) return;
       const callID = String(input?.callID ?? "");
@@ -898,10 +882,6 @@ export const GortexPlugin = async ({ directory, worktree }) => {
       }
     },
 
-    // chat.message carries the user's turn with a mutable parts array —
-    // the one place a bridged host can inject context the way Claude's
-    // UserPromptSubmit hook does. Two envelopes go out on the first turn:
-    // the session briefing (once) and the per-turn symbol context.
     "chat.message": async (input, output) => {
       const role = output?.message?.role;
       if (role && role !== "user") return;
@@ -931,7 +911,141 @@ export const GortexPlugin = async ({ directory, worktree }) => {
       }
     },
   };
-};
+}
+
+// --- V2 Plugin Definition (lazy, dynamic import with top-level await) ---
+// OpenCode V2 requires the default export to be a PluginDefinition, not a Promise.
+// Using top-level await ensures the default export is the resolved definition.
+let v2Plugin;
+try {
+  const { Plugin } = await import("@opencode/plugin");
+  v2Plugin = Plugin.define({
+    id: "gortex",
+    async setup(ctx) {
+      // The repo the Go side resolves indexed-source coverage against.
+      // `ctx.location.project.root` is the git root and `ctx.location.directory`
+      // the CWD OpenCode started in; prefer the former so a session opened in a
+      // subdirectory is still recognised as covered.
+      const cwd = ctx.location.project?.root || ctx.location.directory || process.cwd();
+
+      // tool.execute.before — throw to deny
+      await ctx.tool.hook("execute.before", (event) => {
+        if (!ENFORCE) return;
+        const tool = String(event.tool ?? "");
+        const gortexTool = isGortexTool(tool);
+        const callID = String(event.callID ?? "");
+
+        const decision = callHook({
+          event: "tool.execute.before",
+          tool_name: gortexTool ? tool : normalizeToolName(tool),
+          tool_input: normalizeToolInput(event.input),
+          cwd,
+          session_id: String(event.sessionID ?? ""),
+          is_gortex_tool: gortexTool,
+        });
+
+        remember(callID, decision.additional_context);
+        if (decision.block) {
+          throw new Error(
+            decision.reason || "[Gortex] blocked — use the Gortex graph tools instead of raw file reads.",
+          );
+        }
+      });
+
+      // tool.execute.after — deliver parked guidance
+      await ctx.tool.hook("execute.after", (event) => {
+        const callID = String(event.callID ?? "");
+        if (!callID || !decided.has(callID)) return;
+        const tip = decided.get(callID);
+        decided.delete(callID);
+        if (!tip) return;
+        try {
+          if (event.output && typeof event.output === "string") {
+            event.output = event.output + "\n\n" + tip;
+          }
+        } catch {
+          // Never let context delivery break a tool result.
+        }
+      });
+
+      // permission.ask → permission.evaluate
+      await ctx.permission.hook("evaluate", (event) => {
+        if (!ENFORCE) return;
+        const callID = String(event.callID ?? "");
+        if (callID && decided.has(callID)) return;
+        const type = String(event.tool ?? "");
+        if (isGortexTool(type)) return;
+
+        const decision = callHook({
+          event: "permission.ask",
+          tool_name: normalizeToolName(type),
+          tool_input: normalizeToolInput(event.input),
+          cwd,
+          session_id: String(event.sessionID ?? ""),
+        });
+
+        remember(callID, "");
+        if (decision.block) {
+          event.effect = "deny";
+          event.message = decision.reason;
+        }
+      });
+
+      // chat.message → session.prompt (briefing + per-turn context)
+      await ctx.session.hook("prompt", (event) => {
+        const sessionID = String(event.sessionID ?? "");
+        const injected = [];
+
+        if (!oriented) {
+          oriented = true;
+          const briefing = callHook({ event: "session", cwd, session_id: sessionID });
+          if (briefing.orientation) injected.push(briefing.orientation);
+        }
+
+        const decision = callHook({
+          event: "chat.message",
+          prompt: event.prompt?.text || "",
+          cwd,
+          session_id: sessionID,
+        });
+        if (decision.additional_context) injected.push(decision.additional_context);
+
+        if (injected.length > 0) {
+          try {
+            // event.prompt is { text: string, parts: Part[] }
+            if (event.prompt && typeof event.prompt.text === "string") {
+              event.prompt.text = event.prompt.text + "\n\n" + injected.join("\n\n");
+            } else if (event.prompt && Array.isArray(event.prompt.parts)) {
+              appendToLastTextPart(event.prompt.parts, injected.join("\n\n"));
+            }
+          } catch {
+            // Best effort — never break message assembly.
+          }
+        }
+      });
+    },
+  });
+} catch {
+  // @opencode/plugin not available (V1 environment) — V1 uses `server` export.
+  v2Plugin = undefined;
+}
+
+// Export V2 default as the resolved PluginDefinition (or undefined in V1).
+// OpenCode V2 expects a PluginDefinition, not a Promise.
+export default v2Plugin;
+
+// Export V1 server function
+export { server };
+=== global/home/.config/opencode/plugins/gortex/package.json ===
+{
+  "name": "gortex",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "@opencode/plugin": "*"
+  }
+}
 === global/home/.config/opencode/skills/gortex-add-test/SKILL.md ===
 ---
 name: gortex-add-test

@@ -42,11 +42,24 @@ case "$GORTEX_STUB_MODE" in
 esac
 `
 
+// opencodePluginMock is a minimal @opencode/plugin implementation for testing.
+// The real package is provided by the OpenCode runtime; in a bare Node test
+// we need a shim that exports Plugin.define.
+const opencodePluginMock = `export const Plugin = {
+  define(def) {
+    return def;
+  },
+};`
+
 // driver exercises every hook the plugin exposes and reports what
 // happened, so one node run covers the whole surface.
-const driver = `import { GortexPlugin } from "./gortex.mjs";
+//
+// The plugin now uses a dual export: V2 reads the default export
+// (Plugin.define), V1 (1.18.29+) reads the named `server` export.
+// This test exercises the V1 surface.
+const driver = `import { server } from "./gortex.mjs";
 
-const hooks = await GortexPlugin({ directory: process.cwd(), worktree: process.cwd() });
+const hooks = await server({ directory: process.cwd(), worktree: process.cwd() });
 const result = { threw: null, toolOutput: null, promptText: null, permission: null };
 
 try {
@@ -139,10 +152,20 @@ func TestPluginBehaviourUnderNode(t *testing.T) {
 		{mode: "empty", check: assertNoInterference},
 	}
 
-	for _, tc := range cases {
+
+for _, tc := range cases {
 		t.Run(tc.mode, func(t *testing.T) {
 			dir := t.TempDir()
 			capture := filepath.Join(dir, "capture.jsonl")
+
+			// Provide a mock @opencode/plugin so the rendered bridge can import it.
+			mockDir := filepath.Join(dir, "node_modules", "@opencode", "plugin")
+			if err := os.MkdirAll(mockDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(mockDir, "index.js"), []byte(opencodePluginMock), 0o644); err != nil {
+				t.Fatal(err)
+			}
 
 			stub := filepath.Join(dir, "gortex")
 			if err := os.WriteFile(stub, []byte(stubHook), 0o755); err != nil {
@@ -164,9 +187,9 @@ func TestPluginBehaviourUnderNode(t *testing.T) {
 				"GORTEX_STUB_MODE="+tc.mode,
 				"GORTEX_STUB_CAPTURE="+capture,
 			)
-			out, err := cmd.Output()
+			out, err := cmd.CombinedOutput()
 			if err != nil {
-				t.Fatalf("driver failed: %v\n%s", err, out)
+				t.Fatalf("driver failed: %v\n%s", err, string(out))
 			}
 			var got driverResult
 			if err := json.Unmarshal(out, &got); err != nil {
@@ -209,6 +232,16 @@ func TestPluginEnvelopeMatchesTheBridgeContract(t *testing.T) {
 
 	dir := t.TempDir()
 	capture := filepath.Join(dir, "capture.jsonl")
+
+	// Provide a mock @opencode/plugin so the rendered bridge can import it.
+	mockDir := filepath.Join(dir, "node_modules", "@opencode", "plugin")
+	if err := os.MkdirAll(mockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mockDir, "index.js"), []byte(opencodePluginMock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	stub := filepath.Join(dir, "gortex")
 	if err := os.WriteFile(stub, []byte(stubHook), 0o755); err != nil {
 		t.Fatal(err)

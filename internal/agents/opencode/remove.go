@@ -123,6 +123,9 @@ func GlobalArtifacts(home string) []string {
 	if path := PluginPath(home); opencodeFileContains(path, PluginMarker) {
 		present = append(present, path)
 	}
+	if path := V1PluginPath(home); opencodeFileContains(path, PluginMarker) {
+		present = append(present, path)
+	}
 	// The config is listed only when our server entry is actually in it,
 	// so the preview matches what removal will do rather than naming a
 	// file that will be left byte-identical.
@@ -144,27 +147,75 @@ func GlobalArtifacts(home string) []string {
 // Gortex bridge; matching on it rather than on the file name is what keeps
 // a same-named plugin somebody else wrote out of the blast radius.
 func removePlugin(env agents.Env, opts agents.ApplyOpts) (removed int, failures []string) {
-	path := PluginPath(env.Home)
-	data, err := os.ReadFile(path)
+	// Remove V2 plugin
+	v2Path := PluginPath(env.Home)
+	data, err := os.ReadFile(v2Path)
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
+		// V2 not present, continue to check V1
+	} else if err != nil {
+		return 0, []string{fmt.Sprintf("%s: %v", v2Path, err)}
+	} else if strings.Contains(string(data), PluginMarker) {
+		if opts.DryRun {
+			// Will count V2 + package.json + V1 below
+		} else {
+			if err := os.Remove(v2Path); err != nil {
+				return 0, []string{fmt.Sprintf("%s: %v", v2Path, err)}
+			}
+			internalutil.Logf(env.Stderr, "[gortex uninstall] removed %s", v2Path)
+
+			// Also remove the package.json
+			pkgPath := PluginPkgPath(env.Home)
+			if err := os.Remove(pkgPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return 1, []string{fmt.Sprintf("%s: %v", pkgPath, err)}
+			}
+			internalutil.Logf(env.Stderr, "[gortex uninstall] removed %s", pkgPath)
+
+			// Prune the plugin directory and its parent if empty
+			pruneEmptyDir(filepath.Dir(v2Path))
+			pruneEmptyDir(filepath.Dir(filepath.Dir(v2Path)))
+		}
+		removed++
 	}
-	if err != nil {
-		return 0, []string{fmt.Sprintf("%s: %v", path, err)}
+
+	// Remove V1 plugin
+	v1Path := V1PluginPath(env.Home)
+	data, err = os.ReadFile(v1Path)
+	if errors.Is(err, os.ErrNotExist) {
+		// V1 not present
+	} else if err != nil {
+		return removed, []string{fmt.Sprintf("%s: %v", v1Path, err)}
+	} else if strings.Contains(string(data), PluginMarker) {
+		if !opts.DryRun {
+			if err := os.Remove(v1Path); err != nil {
+				return removed, []string{fmt.Sprintf("%s: %v", v1Path, err)}
+			}
+			internalutil.Logf(env.Stderr, "[gortex uninstall] removed %s", v1Path)
+			pruneEmptyDir(filepath.Dir(v1Path))
+		}
+		removed++
 	}
-	if !strings.Contains(string(data), PluginMarker) {
-		internalutil.Warnf(env.Stderr, "keeping %s: it is not a Gortex bridge", path)
-		return 0, nil
-	}
+
 	if opts.DryRun {
-		return 1, nil
+		// Dry run: count what would be removed.
+		// Only count files that exist AND contain PluginMarker (i.e., are ours).
+		// V2 plugin file was already counted above if it had PluginMarker.
+		// Package.json is only ours if the V2 plugin file is ours (same dir).
+		v2Path := PluginPath(env.Home)
+		if v2Present := opencodeFileContains(v2Path, PluginMarker); v2Present {
+			// Count package.json only if V2 plugin is ours
+			if _, err := os.Stat(PluginPkgPath(env.Home)); err == nil {
+				removed++
+			}
+		}
+		// Count V1 plugin only if it has PluginMarker
+		v1Path := V1PluginPath(env.Home)
+		if opencodeFileContains(v1Path, PluginMarker) {
+			removed++
+		}
+		return removed, nil
 	}
-	if err := os.Remove(path); err != nil {
-		return 0, []string{fmt.Sprintf("%s: %v", path, err)}
-	}
-	internalutil.Logf(env.Stderr, "[gortex uninstall] removed %s", path)
-	pruneEmptyDir(filepath.Dir(path))
-	return 1, nil
+
+	return removed, nil
 }
 
 // ownedPackFiles maps every curated skill / command path to the body

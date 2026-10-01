@@ -29,22 +29,29 @@ func TestPluginLandsInTheGlobalPluginDir(t *testing.T) {
 		t.Fatalf("apply: %v", err)
 	}
 
-	if got := filepath.Join(env.Home, ".config", "opencode", "plugin", "gortex.js"); got != want {
+	if got := filepath.Join(env.Home, ".config", "opencode", "plugins", "gortex", "index.js"); got != want {
 		t.Fatalf("PluginPath drifted: %s != %s", want, got)
 	}
 	if _, err := os.Stat(want); err != nil {
 		t.Fatalf("plugin not installed at %s: %v", want, err)
+	}
+	// Also verify package.json exists for V2 plugin layout
+	pkgPath := filepath.Join(env.Home, ".config", "opencode", "plugins", "gortex", "package.json")
+	if _, err := os.Stat(pkgPath); err != nil {
+		t.Fatalf("package.json not installed at %s: %v", pkgPath, err)
 	}
 	if _, err := os.Stat(filepath.Join(env.Root, ".opencode")); err == nil {
 		t.Fatalf("the bridge must never be written into the repo tree")
 	}
 }
 
-// TestPluginIsTopLevelInPluginDir: the plugin glob is single-level
-// (`{plugin,plugins}/*.{ts,js}`) — unlike skills, commands and agents it
-// does NOT recurse, so a nested file is never loaded and the install
-// would look healthy while enforcing nothing.
-func TestPluginIsTopLevelInPluginDir(t *testing.T) {
+// TestPluginIsInPluginsDir: V2 plugin layout uses a dedicated directory
+// under plugins/ with a package.json, so the plugin can resolve
+// @opencode/plugin. The directory structure is:
+//   ~/.config/opencode/plugins/gortex/
+//     ├── index.js
+//     └── package.json
+func TestPluginIsInPluginsDir(t *testing.T) {
 	env, path := globalEnv(t)
 	if _, err := New().Apply(env, agents.ApplyOpts{ForceDetect: true}); err != nil {
 		t.Fatalf("apply: %v", err)
@@ -54,10 +61,21 @@ func TestPluginIsTopLevelInPluginDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read %s: %v", dir, err)
 	}
+	foundIndex := false
+	foundPkg := false
 	for _, entry := range entries {
-		if entry.IsDir() {
-			t.Fatalf("%s contains a subdirectory %q; the plugin glob does not recurse", dir, entry.Name())
+		if entry.Name() == "index.js" {
+			foundIndex = true
 		}
+		if entry.Name() == "package.json" {
+			foundPkg = true
+		}
+	}
+	if !foundIndex {
+		t.Fatalf("%s missing index.js", dir)
+	}
+	if !foundPkg {
+		t.Fatalf("%s missing package.json", dir)
 	}
 }
 
@@ -250,6 +268,9 @@ func TestRenderedPluginParses(t *testing.T) {
 // `.opencode/package.json` with a bun install at startup. We write no
 // package.json, so any import beyond a node: built-in would fail at load
 // and take the bridge down with it.
+//
+// Exception: @opencode/plugin is provided by the OpenCode runtime itself
+// (both V1 1.18.29+ and V2), not installed via package.json.
 func TestPluginHasNoPackageDependencies(t *testing.T) {
 	for _, line := range strings.Split(pluginSource, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -257,6 +278,9 @@ func TestPluginHasNoPackageDependencies(t *testing.T) {
 			continue
 		}
 		if strings.Contains(trimmed, `"node:`) {
+			continue
+		}
+		if strings.Contains(trimmed, `"@opencode/plugin"`) {
 			continue
 		}
 		t.Fatalf("plugin has a non-builtin dependency: %s", trimmed)
