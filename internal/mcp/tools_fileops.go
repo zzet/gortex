@@ -1270,16 +1270,13 @@ func samePhysicalFileVersion(a, b os.FileInfo) bool {
 		os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
 }
 
-// readAllSized reads f into a buffer presized from the size the caller already
+// readAllSizedBounded reads f into a buffer presized from the size the caller already
 // observed on the open handle, so the whole-file read costs one allocation
 // instead of io.ReadAll's repeated append-and-copy growth (measured 2.1x the
 // file size in total allocation for a 128 MiB file, 1.0x once presized). The
-// hint is advisory: a file that grew since the stat still reads completely,
-// and an implausible size falls back to unhinted growth.
-func readAllSized(f *os.File, size int64) ([]byte, error) {
-	return readAllSizedBounded(f, size, 0)
-}
-
+// hint is advisory: growth still reads completely subject to an optional
+// maxBytes bound; exceeding a positive bound returns a budget error. An
+// implausible size falls back to unhinted growth.
 func readAllSizedBounded(f *os.File, size, maxBytes int64) ([]byte, error) {
 	var reader io.Reader = f
 	if maxBytes > 0 {
@@ -1480,7 +1477,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			}
 		}
 		info, statErr := os.Stat(absPath)
-		if statErr != nil && !(sourceView != nil && overlayPresent && !physicalEvidenceRequested) {
+		if statErr != nil && (sourceView == nil || !overlayPresent || physicalEvidenceRequested) {
 			return mcp.NewToolResultError(fmt.Sprintf("could not stat file: %v", statErr)), nil
 		}
 		if info != nil && info.IsDir() {

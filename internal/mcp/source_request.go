@@ -71,7 +71,7 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 		return nil, nil
 	}
 	for _, cap := range capabilities.required {
-		if cap != graphview.CapSourceSnapshot && !(scope == "text" && cap == graphview.CapSearchText) && !(scope == "declarations" && cap == graphview.CapSearchSymbols) {
+		if cap != graphview.CapSourceSnapshot && (scope != "text" || cap != graphview.CapSearchText) && (scope != "declarations" || cap != graphview.CapSearchSymbols) {
 			return nil, nil
 		}
 	}

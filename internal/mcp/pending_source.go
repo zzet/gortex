@@ -33,9 +33,8 @@ func (s *Server) pendingSourcePaths(checkoutID, incarnation string) []string {
 	defer p.mu.Unlock()
 	paths := make(map[string]struct{})
 	for id, record := range p.versions {
-		snap := record.snapshot()
 		s.refreshPendingSourceRecord(record)
-		snap = record.snapshot()
+		snap := record.snapshot()
 		record.mu.RLock()
 		recovered := record.pendingSourceRecovered
 		record.mu.RUnlock()
