@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
 )
 
 func TestSourceSearchRequiresContainedRepositoryDomain(t *testing.T) {
@@ -101,16 +103,33 @@ func TestSourceNameSearchRetainsGraphDispatchForGraphRequirements(t *testing.T) 
 
 type sourceNameCountingExtractor struct {
 	parser.Extractor
+	mu    sync.Mutex
 	paths []string
 }
 
 func (e *sourceNameCountingExtractor) Extract(path string, content []byte) (*parser.ExtractionResult, error) {
+	e.mu.Lock()
 	e.paths = append(e.paths, path)
+	e.mu.Unlock()
 	return e.Extractor.Extract(path, content)
 }
 
+func (e *sourceNameCountingExtractor) snapshotPaths() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.paths...)
+}
+
+func (e *sourceNameCountingExtractor) resetPaths() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.paths = nil
+}
+
 func TestSourceNameGoEscapesDoNotParseUnrelatedFiles(t *testing.T) {
-	srv, root := setupTestServer(t)
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
+	srv, root := setupTestServerWithRegistry(t, reg)
 	extractor, ok := srv.indexer.Registry().GetByLanguage("go")
 	require.True(t, ok)
 	counting := &sourceNameCountingExtractor{Extractor: extractor}
@@ -126,23 +145,25 @@ func TestSourceNameGoEscapesDoNotParseUnrelatedFiles(t *testing.T) {
 	result, err := srv.handleSourceSearchSymbols(ctx, req, view, "MatchedName", fieldQuery{}, ResolvedScope{})
 	require.NoError(t, err)
 	require.False(t, result.IsError, viewResultText(t, result))
-	require.Equal(t, []string{"target.go"}, counting.paths)
+	require.Equal(t, []string{"target.go"}, counting.snapshotPaths())
 	var answer map[string]any
 	require.NoError(t, json.Unmarshal([]byte(viewResultText(t, result)), &answer))
 	evidence := answer["source_evidence"].(map[string]any)
 	require.Equal(t, float64(24), evidence["files_scanned"])
 	require.Equal(t, float64(1), evidence["files_parsed"])
 	require.Contains(t, viewResultText(t, result), "target.go::MatchedName")
-	counting.paths = nil
+	counting.resetPaths()
 	result, err = srv.handleSourceSearchSymbols(ctx, req, view, "étude", fieldQuery{}, ResolvedScope{})
 	require.NoError(t, err)
 	require.False(t, result.IsError, viewResultText(t, result))
-	require.Equal(t, []string{"target.go"}, counting.paths)
+	require.Equal(t, []string{"target.go"}, counting.snapshotPaths())
 	require.Contains(t, viewResultText(t, result), "target.go::Étude")
 }
 
 func TestSourceNameNonGoEscapesKeepConservativeExtraction(t *testing.T) {
-	srv, root := setupTestServer(t)
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
+	srv, root := setupTestServerWithRegistry(t, reg)
 	extractor, ok := srv.indexer.Registry().GetByLanguage("java")
 	require.True(t, ok)
 	counting := &sourceNameCountingExtractor{Extractor: extractor}
@@ -155,5 +176,5 @@ func TestSourceNameNonGoEscapesKeepConservativeExtraction(t *testing.T) {
 	result, err := srv.handleSourceSearchSymbols(ctx, req, view, "AbsentName", fieldQuery{}, ResolvedScope{})
 	require.NoError(t, err)
 	require.False(t, result.IsError, viewResultText(t, result))
-	require.Equal(t, []string{"escaped.java"}, counting.paths)
+	require.Equal(t, []string{"escaped.java"}, counting.snapshotPaths())
 }
