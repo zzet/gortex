@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"iter"
 	"maps"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -38,6 +39,8 @@ type requestView struct {
 	sourceRequestFreshness    requestFreshness
 	sourceCapabilities        capabilityRequest
 	sourceScope               string
+	sourceRootInfo            os.FileInfo
+	sourceResolvedRoot        string
 	sourceCheckoutIncarnation string
 	sourceRepoPrefix          string
 	sourceGraphPending        bool

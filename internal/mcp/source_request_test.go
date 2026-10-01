@@ -102,3 +102,18 @@ func TestSourceCarrierNormalizesFacadePolicyArguments(t *testing.T) {
 	require.NotNil(t, view, "facade path scope must select scoped scanner")
 	require.Equal(t, "text", view.sourceScope)
 }
+
+func TestSourceCarrierRejectsReplacedPhysicalRoot(t *testing.T) {
+	stack := newViewStack(t)
+	ctx := WithSessionCWD(WithSessionID(context.Background(), viewTestSession), stack.worktreeRoot)
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"path": "keep.go"}
+	view, err := stack.srv.resolveSourceRequestView(ctx, graphview.Selector{Kind: graphview.SelectorAuto}, &req, "read_file", requestFreshness{}, capabilityRequest{})
+	require.NoError(t, err)
+	require.NotNil(t, view)
+	displaced := stack.worktreeRoot + "-displaced"
+	require.NoError(t, os.Rename(stack.worktreeRoot, displaced))
+	t.Cleanup(func() { _ = os.RemoveAll(stack.worktreeRoot); _ = os.Rename(displaced, stack.worktreeRoot) })
+	require.NoError(t, os.MkdirAll(stack.worktreeRoot, 0755))
+	require.ErrorContains(t, stack.srv.validateSourceCheckoutIdentity(ctx, view), "physical root changed")
+}

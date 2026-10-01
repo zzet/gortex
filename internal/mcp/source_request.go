@@ -9,6 +9,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer"
 )
 
 // Source operations prove the bytes they serve rather than wait for unrelated
@@ -59,6 +60,14 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 	if _, err := s.familyPrimary(ctx, checkout.FamilyID); err != nil {
 		return nil, err
 	}
+	resolvedRoot, err := filepath.EvalSymlinks(checkout.RootPath)
+	if err != nil {
+		return nil, err
+	}
+	rootInfo, err := indexer.SourceRootFileInfo(checkout.RootPath)
+	if err != nil {
+		return nil, err
+	}
 	rider := graphview.NewViewRider(selector)
 	rider.MarkExact(control.Selector.String())
 	rider.CheckoutID, rider.GraphID = checkout.CheckoutID, control.GraphID
@@ -73,6 +82,7 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 		return nil, nil
 	}
 	view := &requestView{
+		sourceRootInfo: rootInfo, sourceResolvedRoot: resolvedRoot,
 		kind: requestViewKindWorktree, sourceRequestFreshness: freshness, sourceCapabilities: capabilities, rider: rider, viewRoot: checkout.RootPath,
 		sourceScope: scope, sourceCheckoutIncarnation: checkout.Incarnation, sourceRepoPrefix: control.RepoPrefix, sourcePendingPaths: paths,
 		sourceGraphPending: graphPending,

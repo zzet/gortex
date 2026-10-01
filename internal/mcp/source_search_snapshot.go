@@ -37,6 +37,13 @@ func (s *Server) sourceSearchIndexer(view *requestView) *indexer.Indexer {
 }
 
 func (s *Server) validateSourceCheckoutIdentity(ctx context.Context, view *requestView) error {
+	if view != nil && view.sourceRootInfo != nil {
+		info, err := indexer.SourceRootFileInfo(view.viewRoot)
+		resolved, resolveErr := filepath.EvalSymlinks(view.viewRoot)
+		if err != nil || resolveErr != nil || !os.SameFile(view.sourceRootInfo, info) || filepath.Clean(resolved) != filepath.Clean(view.sourceResolvedRoot) {
+			return graphview.NewViewError(graphview.CodeCheckoutInaccessible, "source checkout physical root changed while reading")
+		}
+	}
 	if view == nil || view.rider == nil || s.materializer == nil || s.materializer.Catalog == nil {
 		return nil
 	}
