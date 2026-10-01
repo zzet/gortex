@@ -3517,7 +3517,14 @@ func capGrepMatches(matches []trigram.Match, limit int) []trigram.Match {
 // single-Indexer path (Indexer.GrepText) is used by callers without a
 // MultiIndexer.
 func (mi *MultiIndexer) GrepText(query string, limit int) []trigram.Match {
-	return capGrepMatches(mi.GrepTextForRepos(query, nil, limit), limit)
+	return capGrepMatches(mi.GrepTextForReposPaths(query, nil, nil, limit), limit)
+}
+
+// GrepTextPaths is GrepText restricted to repo-relative forward-slash
+// path prefixes applied inside each per-repo search, before that
+// repo's limit cut (issue #827). Empty prefixes mean unscoped.
+func (mi *MultiIndexer) GrepTextPaths(query string, pathPrefixes []string, limit int) []trigram.Match {
+	return capGrepMatches(mi.GrepTextForReposPaths(query, nil, pathPrefixes, limit), limit)
 }
 
 // GrepTextForRepos is the scoped variant of GrepText. When repoAllow is
@@ -3525,6 +3532,15 @@ func (mi *MultiIndexer) GrepText(query string, limit int) []trigram.Match {
 // searched repo independently; the returned union is intentionally not
 // globally capped so callers can apply path / graph-scope filters first.
 func (mi *MultiIndexer) GrepTextForRepos(query string, repoAllow map[string]bool, perRepoLimit int) []trigram.Match {
+	return mi.GrepTextForReposPaths(query, repoAllow, nil, perRepoLimit)
+}
+
+// GrepTextForReposPaths is GrepTextForRepos with an in-search path
+// restriction: pathPrefixes are repo-relative forward-slash prefixes
+// each per-repo Indexer applies BEFORE its perRepoLimit cut, so a repo
+// whose unscoped head is all out-of-scope files still contributes its
+// in-scope matches (issue #827). Empty pathPrefixes mean unscoped.
+func (mi *MultiIndexer) GrepTextForReposPaths(query string, repoAllow map[string]bool, pathPrefixes []string, perRepoLimit int) []trigram.Match {
 	if mi == nil || query == "" {
 		return nil
 	}
@@ -3533,7 +3549,7 @@ func (mi *MultiIndexer) GrepTextForRepos(query string, repoAllow map[string]bool
 		if idx == nil {
 			return nil
 		}
-		return stampGrepMatchPaths(prefix, idx.GrepText(query, perRepoLimit))
+		return stampGrepMatchPaths(prefix, idx.GrepTextPaths(query, pathPrefixes, perRepoLimit))
 	}
 
 	// Per-repo cap mirrors the caller's page size when set. The caller
@@ -3543,7 +3559,7 @@ func (mi *MultiIndexer) GrepTextForRepos(query string, repoAllow map[string]bool
 	jobs := mi.grepRepoJobs(repoAllow)
 	out := make([]trigram.Match, 0, len(jobs)*8)
 	for _, j := range jobs {
-		hits := j.idx.GrepText(query, perRepoLimit)
+		hits := j.idx.GrepTextPaths(query, pathPrefixes, perRepoLimit)
 		if len(hits) == 0 {
 			continue
 		}

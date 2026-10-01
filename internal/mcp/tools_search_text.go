@@ -100,12 +100,15 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 			return mcp.NewToolResultError("search_text: invalid regexp: " + err.Error()), nil
 		}
 	} else if scopedMultiGrep {
-		matches = s.multiIndexer.GrepTextForRepos(query, resolved.RepoAllow, limit)
+		matches = s.multiIndexer.GrepTextForReposPaths(query, resolved.RepoAllow, pathFilter, limit)
 		needsFinalLimit = true
 	} else if s.multiIndexer != nil {
-		matches = s.multiIndexer.GrepText(query, limit)
+		// A path filter rides into the search itself, before the limit
+		// cut (issue #827): a subtree slice must not be wiped out by a
+		// head of out-of-scope matches owning the global ordering.
+		matches = s.multiIndexer.GrepTextPaths(query, pathFilter, limit)
 	} else {
-		matches = s.indexer.GrepText(query, limit)
+		matches = s.indexer.GrepTextPaths(query, pathFilter, limit)
 	}
 
 	// Counted BEFORE the filters below, and that ordering is the whole point.
@@ -189,7 +192,7 @@ func searchTextMaxLimit() int {
 	return n
 }
 
-const searchTextTruncationNote = "the search stopped at `limit`, so `count` is a floor rather than a total and the matches are a prefix of the real result set. Raise `limit` (or the GORTEX_SEARCH_TEXT_MAX_LIMIT ceiling) to widen. Narrowing with `path` will NOT recover the remainder: the path filter runs over what survived truncation, not over the corpus, so a subtree slice returns whatever was left of the global cut."
+const searchTextTruncationNote = "the search stopped at `limit`, so `count` is a floor rather than a total and the matches are a prefix of the real result set. Raise `limit` (or the GORTEX_SEARCH_TEXT_MAX_LIMIT ceiling) to widen. A `path` filter (when supplied) is applied before this cut, so the floor is a floor of the scoped result set, not of the global one."
 
 // searchTextBoundByLimit reports whether the search stopped because of the
 // limit rather than because the corpus ran out.

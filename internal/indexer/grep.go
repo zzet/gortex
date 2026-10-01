@@ -6,6 +6,7 @@ import (
 	"regexp/syntax"
 	"sort"
 
+	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/search/trigram"
 )
 
@@ -28,6 +29,44 @@ func (idx *Indexer) GrepText(query string, limit int) []trigram.Match {
 	// only for the budget to evict all but a few.
 	matches, _ := idx.GrepTextBounded(context.Background(), query, limit, 0)
 	return matches
+}
+
+// GrepTextPaths is GrepText restricted to files under one of the
+// forward-slash repo-relative prefixes. The restriction applies BEFORE
+// the limit cut — a scoped sweep must surface scoped matches even when
+// out-of-scope files own the head of the global ordering (issue #827).
+// Empty prefixes mean unscoped (identical to GrepText).
+func (idx *Indexer) GrepTextPaths(query string, prefixes []string, limit int) []trigram.Match {
+	if query == "" {
+		return nil
+	}
+	if len(prefixes) == 0 {
+		return idx.GrepText(query, limit)
+	}
+	if s := idx.warmTrigramSearcher(); s != nil {
+		return s.GrepPaths(query, prefixes, limit)
+	}
+	// Streaming fallback: apply the prefix restriction to the known file
+	// list before the bounded scan, so the cold path keeps the same
+	// pre-truncation semantics as the warm one.
+	matches, _ := trigram.GrepPathsBounded(context.Background(), idx.rootPath,
+		filterKnownPathsByPrefix(idx.knownFilePaths(), prefixes), query, limit, 0)
+	return matches
+}
+
+// filterKnownPathsByPrefix keeps the known file list entries sitting
+// under one of the forward-slash repo-relative prefixes.
+func filterKnownPathsByPrefix(paths, prefixes []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, rel := range paths {
+		for _, pre := range prefixes {
+			if graphpath.HasPrefix(rel, pre) {
+				out = append(out, rel)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // warmTrigramSearcher returns the current trigram searcher, rebuilding it

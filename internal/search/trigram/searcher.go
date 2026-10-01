@@ -187,6 +187,17 @@ func (s *Searcher) openConfined(rel string) (*os.File, error) {
 // its lines. Results are ordered by file, then by line. A non-positive
 // limit returns every match.
 func (s *Searcher) Grep(query string, limit int) []Match {
+	return s.GrepPaths(query, nil, limit)
+}
+
+// GrepPaths is Grep restricted to documents under one of the
+// forward-slash path prefixes. The restriction runs BEFORE the limit
+// cut: a scoped query must surface scoped matches even when a wall of
+// out-of-scope files owns the head of the global ordering (issue #827).
+// Empty prefixes mean unscoped — identical to Grep. Prefixes are
+// matched on the same segment-boundary semantics GrepRegexp's
+// pathPrefix uses (graphpath.HasPrefix).
+func (s *Searcher) GrepPaths(query string, prefixes []string, limit int) []Match {
 	if query == "" {
 		return nil
 	}
@@ -197,6 +208,9 @@ func (s *Searcher) Grep(query string, limit int) []Match {
 			continue
 		}
 		rel := paths[docID]
+		if !pathUnderAnyPrefix(rel, prefixes) {
+			continue
+		}
 		f, err := s.openConfined(rel)
 		if err != nil {
 			continue
@@ -218,6 +232,18 @@ func (s *Searcher) Grep(query string, limit int) []Match {
 		_ = f.Close()
 	}
 	return matches
+}
+
+// pathUnderAnyPrefix reports whether path sits under one of the
+// forward-slash prefixes on segment boundaries. An empty prefix set
+// matches everything — the unscoped default.
+func pathUnderAnyPrefix(path string, prefixes []string) bool {
+	for _, pre := range prefixes {
+		if graphpath.HasPrefix(path, pre) {
+			return true
+		}
+	}
+	return len(prefixes) == 0
 }
 
 // DocCount returns the number of indexed files.

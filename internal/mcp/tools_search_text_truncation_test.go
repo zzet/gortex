@@ -58,10 +58,10 @@ func TestSearchText_LimitBoundResultDisclosesTruncation(t *testing.T) {
 		"count is a floor here, and saying so is the half a caller can act on")
 	note, _ := out["truncation_note"].(string)
 	require.Contains(t, note, "floor")
-	// The recovery that looks obvious and does not work: `path` filters run
-	// over what survived truncation, so narrowing cannot recover the rest.
+	// Since #827 the path filter runs before the limit cut, so the note
+	// now says the opposite of the old trap: the floor is scoped.
 	require.Contains(t, note, "path")
-	require.Contains(t, note, "NOT recover")
+	require.Contains(t, note, "applied before this cut")
 }
 
 func TestSearchText_CompleteResultCarriesNoTruncationKeys(t *testing.T) {
@@ -103,25 +103,24 @@ func TestSearchText_RequestWithinTheCeilingReportsNoRequestedLimit(t *testing.T)
 }
 
 func TestSearchText_TruncationIsMeasuredBeforeThePathFilter(t *testing.T) {
-	// The ordering this whole fix turns on. The searcher stops at `limit`,
-	// and the path filter then runs over what survived — so the count can sit
-	// below the limit while the result is still a truncated prefix. Measuring
-	// after the filter would miss exactly the case a caller cannot detect.
-	//
-	// Four matching files, limit 3, filtered to one directory of two: the
-	// searcher is bound whichever three it returns, and at most two survive
-	// the filter.
+	// Since #827 the path filter rides into the search itself, before the
+	// limit cut. Four matching files, limit 3, filtered to one directory
+	// of two: the scoped search stops on corpus exhaustion at two, so the
+	// result is exact and carries no truncation keys. Before the fix the
+	// global cut landed first and the filter left a misleading floor of
+	// whatever survived it.
 	srv := searchTextServerWith(t, "a/1.go", "a/2.go", "b/1.go", "b/2.go")
 
 	out := searchTextResponse(t, srv, map[string]any{
 		"query": "package app", "limit": 3, "path": "a",
 	})
 
-	count, _ := out["count"].(float64)
-	require.Less(t, count, float64(3),
-		"the fixture must leave the count below the limit, or it proves nothing")
-	require.Equal(t, true, out["_truncated_by_limit"],
-		"a filtered result below the limit is still a truncated prefix of the corpus")
+	require.Equal(t, float64(2), out["count"])
+	for _, key := range []string{"_truncated_by_limit", "_limit_applied", "count_is_exact", "truncation_note"} {
+		_, present := out[key]
+		require.False(t, present,
+			"the scoped search stopped on corpus exhaustion, not on the limit — %q must not fire", key)
+	}
 }
 
 func TestSearchTextBoundByLimit(t *testing.T) {
