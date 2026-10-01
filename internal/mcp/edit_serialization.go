@@ -265,6 +265,8 @@ func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo,
 		if result.Err == nil && result.Reindexed && result.AppliedGeneration > 0 && receipt.checkoutScoped {
 			s.resolveCheckoutRecoveryReceipts(receipt, recoveryCandidates, result.AppliedGeneration)
 		}
+		// Publication truth outlives recovery-receipt TTL and ledger eviction.
+		s.pendingSourcePaths(receipt.checkoutID, receipt.checkoutIncarnation)
 		// The admitted work has reported, so the payload it was admitted
 		// against no longer has to be held for it. Released before done
 		// closes, so a caller that waited on the receipt observes a drained

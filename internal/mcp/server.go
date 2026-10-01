@@ -408,7 +408,8 @@ type Server struct {
 	// transport cannot: when a tool call is abandoned at its deadline, did the
 	// bytes actually land? The zero value is usable, so directly-constructed
 	// test and embedded servers need no constructor wiring.
-	mutationCommits mutationCommitLedger
+	mutationCommits    mutationCommitLedger
+	pendingSourceFiles pendingSourceRegistry
 
 	// mutationPreCommitHook is a fault-injection seam, nil in production. It
 	// fires between registering a commit and the cancellation gate that guards
