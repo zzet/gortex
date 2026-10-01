@@ -74,6 +74,9 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	// enrichment so callers get the same shape either way.
 	useRegexp := req.GetBool("regexp", false)
 	pathFilter := s.resolvePathFilter(req, fieldQuery{})
+	if view := sourceRequestView(ctx); view != nil {
+		return s.handleSourceSearchText(ctx, req, view, query, useRegexp, limit, requestedLimit, resolved, pathFilter)
+	}
 	scopedMultiGrep := s.multiIndexer != nil && (resolved.RepoAllow != nil || len(pathFilter) > 0)
 	var matches []trigram.Match
 	needsFinalLimit := false

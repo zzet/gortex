@@ -326,6 +326,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		}
 		indexer.StampPublicationPhase(ctx, indexer.PublicationHandlerStarted)
 		res, hErr := h(ctx, req)
+		if view != nil && view.sourceFallback != nil {
+			view = view.sourceFallback
+			ctx = withRequestView(ctx, view)
+		}
 		// require_exact, a second time. The gate above runs before the handler
 		// and can only see the substitutions SELECTION made; an answer that
 		// was selected exactly can still stop being exact while it is being

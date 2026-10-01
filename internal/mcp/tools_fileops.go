@@ -1255,6 +1255,8 @@ func capReadFileContent(content []byte, maxChars int, binary bool) ([]byte, bool
 	return []byte(strings.ToValidUTF8(string(prefix), "")), true
 }
 
+var errPhysicalFileMoved = errors.New("physical file changed while it was being read; retry")
+
 type physicalReadEvidence struct {
 	resolvedPath    string
 	contentSHA256   string
@@ -1275,12 +1277,24 @@ func samePhysicalFileVersion(a, b os.FileInfo) bool {
 // hint is advisory: a file that grew since the stat still reads completely,
 // and an implausible size falls back to unhinted growth.
 func readAllSized(f *os.File, size int64) ([]byte, error) {
+	return readAllSizedBounded(f, size, 0)
+}
+
+func readAllSizedBounded(f *os.File, size, maxBytes int64) ([]byte, error) {
+	var reader io.Reader = f
+	if maxBytes > 0 {
+		reader = io.LimitReader(f, maxBytes+1)
+		size = min(size, maxBytes)
+	}
 	var buf bytes.Buffer
 	if size > 0 && size < math.MaxInt32 {
 		buf.Grow(int(size) + bytes.MinRead)
 	}
-	if _, err := buf.ReadFrom(f); err != nil {
+	if _, err := buf.ReadFrom(reader); err != nil {
 		return nil, err
+	}
+	if maxBytes > 0 && int64(buf.Len()) > maxBytes {
+		return nil, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
 	}
 	return buf.Bytes(), nil
 }
@@ -1293,6 +1307,14 @@ func readPhysicalFileEvidence(absPath string) ([]byte, physicalReadEvidence, err
 }
 
 func readPhysicalFileEvidenceObserved(absPath string, afterRead func()) ([]byte, physicalReadEvidence, error) {
+	return readPhysicalFileEvidenceObservedBounded(absPath, afterRead, 0)
+}
+
+func readPhysicalFileEvidenceBounded(absPath string, maxBytes int64) ([]byte, physicalReadEvidence, error) {
+	return readPhysicalFileEvidenceObservedBounded(absPath, nil, maxBytes)
+}
+
+func readPhysicalFileEvidenceObservedBounded(absPath string, afterRead func(), maxBytes int64) ([]byte, physicalReadEvidence, error) {
 	linkInfo, err := os.Lstat(absPath)
 	if err != nil {
 		return nil, physicalReadEvidence{}, fmt.Errorf("could not inspect physical path: %w", err)
@@ -1317,7 +1339,10 @@ func readPhysicalFileEvidenceObserved(absPath string, afterRead func()) ([]byte,
 	if !before.Mode().IsRegular() {
 		return nil, physicalReadEvidence{}, fmt.Errorf("physical evidence requires a regular file, got %s", before.Mode().Type())
 	}
-	content, err := readAllSized(f, before.Size())
+	if maxBytes > 0 && before.Size() > maxBytes {
+		return nil, physicalReadEvidence{}, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
+	}
+	content, err := readAllSizedBounded(f, before.Size(), maxBytes)
 	if err != nil {
 		return nil, physicalReadEvidence{}, fmt.Errorf("could not read physical file: %w", err)
 	}
@@ -1334,11 +1359,19 @@ func readPhysicalFileEvidenceObserved(absPath string, afterRead func()) ([]byte,
 		return nil, physicalReadEvidence{}, fmt.Errorf("could not rewind physical file for verification: %w", err)
 	}
 	verificationHash := sha256.New()
-	if _, err := io.Copy(verificationHash, f); err != nil {
+	var verificationReader io.Reader = f
+	if maxBytes > 0 {
+		verificationReader = io.LimitReader(f, maxBytes+1)
+	}
+	verifiedBytes, err := io.Copy(verificationHash, verificationReader)
+	if err != nil {
 		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical file content: %w", err)
 	}
+	if maxBytes > 0 && verifiedBytes > maxBytes {
+		return nil, physicalReadEvidence{}, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
+	}
 	if !bytes.Equal(sum[:], verificationHash.Sum(nil)) {
-		return nil, physicalReadEvidence{}, errors.New("physical file changed while it was being read; retry")
+		return nil, physicalReadEvidence{}, errPhysicalFileMoved
 	}
 
 	after, err := f.Stat()
@@ -1356,7 +1389,7 @@ func readPhysicalFileEvidenceObserved(absPath string, afterRead func()) ([]byte,
 	if filepath.Clean(resolvedBefore) != filepath.Clean(resolvedAfter) ||
 		!samePhysicalFileVersion(before, after) ||
 		!samePhysicalFileVersion(after, pathInfo) {
-		return nil, physicalReadEvidence{}, errors.New("physical file changed while it was being read; retry")
+		return nil, physicalReadEvidence{}, errPhysicalFileMoved
 	}
 
 	return content, physicalReadEvidence{
@@ -1603,6 +1636,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if view := sourceRequestView(ctx); view != nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if err := s.validateSourceCheckoutIdentity(ctx, view); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
 		}
 		if view.freshness != nil {
 			view.freshness.fresh = true

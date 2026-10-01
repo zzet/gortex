@@ -15,11 +15,30 @@ import (
 // relationship publication. Explicit graph capabilities and immutable selectors
 // retain whole-view selection and its freshness contract.
 func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphview.Selector, req *mcp.CallToolRequest, name string, freshness requestFreshness, capabilities capabilityRequest) (*requestView, error) {
-	if name != "read_file" || req.GetString("keep", "") != "" || installedSkillPath(req.GetString("path", "")) {
+	policyReq := *req
+	if isFacadeToolName(req.Params.Name) {
+		spec, ok := s.viewFacadeOperation(req)
+		if !ok {
+			return nil, nil
+		}
+		policyReq.Params.Name = spec.Legacy
+		policyReq.Params.Arguments = normalizeFacadeArguments(spec, req.GetArguments())
+		req = &policyReq
+	}
+	scope := ""
+	switch name {
+	case "read_file":
+		if req.GetString("keep", "") != "" || installedSkillPath(req.GetString("path", "")) {
+			return nil, nil
+		}
+		scope = "file"
+	case "search_text":
+		scope = "text"
+	default:
 		return nil, nil
 	}
 	for _, cap := range capabilities.required {
-		if cap != graphview.CapSourceSnapshot {
+		if cap != graphview.CapSourceSnapshot && !(scope == "text" && cap == graphview.CapSearchText) {
 			return nil, nil
 		}
 	}
@@ -49,11 +68,25 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 			paths[i] = filepath.ToSlash(relative)
 		}
 	}
+	graphPending := len(paths) > 0 || control.Route == nil || control.Route.State != store_sqlite.RouteActive || control.Route.DirtyGenerationID == 0
+	if scope == "text" && !graphPending && len(s.resolvePathFilter(*req, fieldQuery{})) == 0 {
+		return nil, nil
+	}
 	view := &requestView{
-		kind: requestViewKindWorktree, rider: rider, viewRoot: checkout.RootPath,
-		sourceScope: "file", sourceCheckoutIncarnation: checkout.Incarnation, sourceRepoPrefix: control.RepoPrefix, sourcePendingPaths: paths,
-		sourceGraphPending: len(paths) > 0 || control.Route == nil || control.Route.State != store_sqlite.RouteActive || control.Route.DirtyGenerationID == 0,
+		kind: requestViewKindWorktree, sourceRequestFreshness: freshness, sourceCapabilities: capabilities, rider: rider, viewRoot: checkout.RootPath,
+		sourceScope: scope, sourceCheckoutIncarnation: checkout.Incarnation, sourceRepoPrefix: control.RepoPrefix, sourcePendingPaths: paths,
+		sourceGraphPending: graphPending,
 		declared:           graphview.Completeness{graphview.CapSourceSnapshot: graphview.StateComplete},
+	}
+	if scope == "text" {
+		resolved, err := s.resolveScopeForRequest(ctx, *req, IntentLocate)
+		if err != nil {
+			return nil, err
+		}
+		if !s.sourceSearchDomainContained(view, resolved) {
+			return nil, nil
+		}
+		view.declared[graphview.CapSearchText] = graphview.StateComplete
 	}
 	if freshness.requested() {
 		view.freshness = &requestFreshnessOutcome{deadline: freshness.effectiveDeadline(time.Now(), ctx)}
@@ -86,4 +119,64 @@ func (s *Server) sourceOverlayFile(ctx context.Context, absPath string) (content
 		}
 	}
 	return
+}
+
+// Broad source queries that exceed the scanner's resource budget retain the
+// existing indexed path. Waiting here uses the original request budget.
+func (s *Server) fallbackSourceSearch(ctx context.Context, req mcp.CallToolRequest, source *requestView, handler func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)) (*mcp.CallToolResult, error) {
+	freshness := source.sourceRequestFreshness
+	freshness.requireFresh = true
+	if source.freshness != nil {
+		freshness.deadline = source.freshness.deadline
+		freshness.hasDeadline = true
+	}
+	selector := graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: source.rider.CheckoutID}
+	view, err := s.resolveRequestView(ctx, selector, requestViewPolicy{freshness: freshness})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	source.sourceFallback = view
+	ctx = withRequestView(ctx, view)
+	noteRetainedRequest(ctx, view, requestRepositoryScopeFromContext(ctx))
+	if refused := s.evaluateRequestCapabilities(ctx, &req, source.sourceCapabilities); refused != nil {
+		return refused, nil
+	}
+	ctx, _, err = s.prepareOverlayRequest(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return handler(ctx, req)
+}
+
+func (s *Server) sourceSearchDomainContained(view *requestView, resolved ResolvedScope) bool {
+	if resolved.RepoAllow != nil {
+		for prefix, allowed := range resolved.RepoAllow {
+			if allowed && prefix != view.sourceRepoPrefix {
+				return false
+			}
+		}
+		return resolved.RepoAllow[view.sourceRepoPrefix]
+	}
+	if s.multiIndexer == nil {
+		idx := s.sourceSearchIndexer(view)
+		return idx != nil && (resolved.WorkspaceID == "" || resolved.WorkspaceID == idx.WorkspaceID()) && (resolved.ProjectID == "" || resolved.ProjectID == idx.ProjectID())
+	}
+	found := false
+	for _, prefix := range s.multiIndexer.RepoPrefixes() {
+		idx := s.multiIndexer.GetIndexer(prefix)
+		if idx == nil {
+			continue
+		}
+		if resolved.WorkspaceID != "" && resolved.WorkspaceID != idx.WorkspaceID() {
+			continue
+		}
+		if resolved.ProjectID != "" && resolved.ProjectID != idx.ProjectID() {
+			continue
+		}
+		if prefix != view.sourceRepoPrefix {
+			return false
+		}
+		found = true
+	}
+	return found
 }

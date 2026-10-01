@@ -459,3 +459,29 @@ func TestAnchoredRemainders_DoubleStarDoesNotExplode(t *testing.T) {
 	}
 	assert.NotEmpty(t, anchoredRemainders(pat, sub))
 }
+
+func TestEffectiveExcludeForRootReplacesCanonicalGitignore(t *testing.T) {
+	canonical := t.TempDir()
+	selected := t.TempDir()
+	mkGitRepo(t, canonical)
+	mkGitRepo(t, selected)
+	writeGitignore(t, canonical, "old.go\n")
+	writeGitignore(t, selected, "new.go\n")
+	cm := newTestConfigManager(t)
+	cm.LoadWorkspaceConfig("r", canonical)
+	ordinary := excludes.New(cm.EffectiveExclude("r"))
+	require.True(t, ordinary.MatchRel("old.go"))
+	alternate := excludes.New(cm.EffectiveExcludeForRoot("r", selected))
+	require.False(t, alternate.MatchRel("old.go"), "selected checkout must not inherit canonical gitignore")
+	require.True(t, alternate.MatchRel("new.go"))
+	info, err := os.Stat(filepath.Join(selected, ".gitignore"))
+	require.NoError(t, err)
+	writeGitignore(t, selected, "old.go\n")
+	require.NoError(t, os.Chtimes(filepath.Join(selected, ".gitignore"), info.ModTime(), info.ModTime()))
+	alternate = excludes.New(cm.EffectiveExcludeForRoot("r", selected))
+	require.True(t, alternate.MatchRel("old.go"), "scoped source policy must read same-size restored-mtime edits")
+	require.False(t, alternate.MatchRel("new.go"))
+	ordinary = excludes.New(cm.EffectiveExclude("r"))
+	require.True(t, ordinary.MatchRel("old.go"), "alternate cache must not poison canonical root")
+	require.False(t, ordinary.MatchRel("new.go"))
+}

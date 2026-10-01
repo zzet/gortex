@@ -85,3 +85,20 @@ func TestSourceReadCurrentOverlayAdditionAndDeletion(t *testing.T) {
 		}
 	}
 }
+
+func TestSourceCarrierNormalizesFacadePolicyArguments(t *testing.T) {
+	stack := newViewStack(t)
+	ctx := WithSessionCWD(WithSessionID(context.Background(), viewTestSession), stack.worktreeRoot)
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "read"
+	req.Params.Arguments = map[string]any{"operation": "file", "target": map[string]any{"file": "keep.go"}, "options": map[string]any{"compress_bodies": true, "keep": "Keeper"}}
+	view, err := stack.srv.resolveSourceRequestView(ctx, graphview.Selector{Kind: graphview.SelectorAuto}, &req, "read_file", requestFreshness{}, capabilityRequest{})
+	require.NoError(t, err)
+	require.Nil(t, view, "facade keep predicate must retain indexed symbol selection")
+	req.Params.Name = "search"
+	req.Params.Arguments = map[string]any{"operation": "text", "query": "Keeper", "options": map[string]any{"path": "keep.go"}}
+	view, err = stack.srv.resolveSourceRequestView(ctx, graphview.Selector{Kind: graphview.SelectorAuto}, &req, "search_text", requestFreshness{}, capabilityRequest{})
+	require.NoError(t, err)
+	require.NotNil(t, view, "facade path scope must select scoped scanner")
+	require.Equal(t, "text", view.sourceScope)
+}

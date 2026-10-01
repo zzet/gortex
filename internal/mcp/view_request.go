@@ -34,6 +34,9 @@ type requestViewCtxKey struct{}
 // requestView is what one request reads through, plus what the response says
 // about it.
 type requestView struct {
+	sourceFallback            *requestView
+	sourceRequestFreshness    requestFreshness
+	sourceCapabilities        capabilityRequest
 	sourceScope               string
 	sourceCheckoutIncarnation string
 	sourceRepoPrefix          string
@@ -204,6 +207,7 @@ func (v *requestView) close() {
 	if v == nil {
 		return
 	}
+	v.sourceFallback.close()
 	v.files.close()
 	v.materialized.Close()
 	v.basePin.Release()
