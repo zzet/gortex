@@ -708,64 +708,110 @@ func (s *Server) settleRequestFreshness(
 	view.close()
 
 	outcome.trace = newFreshnessTrace(ctx, started)
-	fresh, reason := s.awaitCheckoutFreshness(withFreshnessTrace(ctx, outcome.trace), checkout, deadline)
-	outcome.fresh, outcome.reason = fresh, reason
-	// Close the phase record on every way the wait ended — a deadline or an
-	// interruption between tickets included — so a record never stays open
-	// for a wait that is over. First terminal mark wins; nothing without a
-	// record is touched.
-	outcome.trace.noteTicketEnd(fresh)
-	if !fresh && reason == freshReasonDeadlineExceeded && policy.freshness.requireExact {
-		return nil, freshnessDeadlineRefusal(deadline, time.Since(started))
-	}
-
-	// The route the coordinator just published, read once and BEFORE the
-	// re-selection so it is the route the wait's success is a statement about
-	// rather than whatever the catalog holds after it. Only the success path
-	// reads it: a wait that did not go fresh has no publication to check an
-	// answer against.
-	published, publishedKnown := store_sqlite.CheckoutRoute{}, false
-	if outcome.fresh {
-		published, publishedKnown = s.publishedCheckoutRoute(ctx, checkout.CheckoutID)
-		if publishedKnown {
-			outcome.trace.notePublished(published)
+	for {
+		fresh, reason := s.awaitCheckoutFreshness(withFreshnessTrace(ctx, outcome.trace), checkout, deadline)
+		outcome.fresh, outcome.reason = fresh, reason
+		// Close the phase record on every way the wait ended — a deadline or an
+		// interruption between tickets included — so a record never stays open
+		// for a wait that is over. First terminal mark wins; nothing without a
+		// record is touched.
+		outcome.trace.noteTicketEnd(fresh)
+		if !fresh && reason == freshReasonDeadlineExceeded && policy.freshness.requireExact {
+			return nil, freshnessDeadlineRefusal(deadline, time.Since(started))
 		}
-	}
 
-	refreshed, refreshedErr := s.selectRequestView(ctx, selector, policy)
-	if refreshedErr != nil {
-		return nil, refreshedErr
-	}
-	if outcome.fresh {
-		switch {
-		case !publishedKnown:
-			// The coordinator published and the route behind it cannot be
-			// read back — no catalog, a read that failed, or a route row that
-			// is gone. Nothing here can show that the view about to answer is
-			// that publication, and an unverifiable claim is not made. It is a
-			// fact about the lookup, not about the view, so it rides as
-			// wait_target_unavailable.
-			outcome.fresh, outcome.reason = false, freshReasonWaitTargetUnavailable
-		case !servesPublishedRoute(refreshed, checkout.CheckoutID, published):
-			// The coordinator published, and something else is answering: a
-			// labelled base fallback, a routeless carrier, another checkout,
-			// or a route that moved again under the re-selection. fresh:true
-			// here would claim the wait's success for an answer that is not
-			// the thing waited on — next to actual_view:"base", exact:false.
-			outcome.fresh, outcome.reason = false, freshReasonRouteWithdrawn
+		// The route the coordinator just published, read once and BEFORE the
+		// re-selection so it is the route the wait's success is a statement about
+		// rather than whatever the catalog holds after it. Only the success path
+		// reads it: a wait that did not go fresh has no publication to check an
+		// answer against.
+		published, publishedKnown := store_sqlite.CheckoutRoute{}, false
+		if outcome.fresh {
+			published, publishedKnown = s.publishedCheckoutRoute(ctx, checkout.CheckoutID)
+			if publishedKnown {
+				outcome.trace.notePublished(published)
+			}
 		}
+
+		refreshed, refreshedErr := s.selectRequestView(ctx, selector, policy)
+		if refreshedErr != nil {
+			// Publication and selection are separate observations. A new write
+			// can withdraw the route between them; keep using the original budget.
+			if outcome.fresh && publishedKnown && graphview.CodeOf(refreshedErr) == graphview.CodeViewBuilding {
+				if !time.Now().Before(deadline) {
+					if policy.freshness.requireExact {
+						return nil, freshnessDeadlineRefusal(deadline, time.Since(started))
+					}
+					outcome.fresh, outcome.reason = false, freshReasonDeadlineExceeded
+					return annotateRequestFreshness(s.freshnessCarrier(selector, nil), outcome, started), nil
+				}
+				refreshed.close()
+				if err := waitFreshnessRetry(ctx, deadline); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			return nil, refreshedErr
+		}
+		if outcome.fresh {
+			switch {
+			case !publishedKnown:
+				// The coordinator published and the route behind it cannot be
+				// read back — no catalog, a read that failed, or a route row that
+				// is gone. Nothing here can show that the view about to answer is
+				// that publication, and an unverifiable claim is not made. It is a
+				// fact about the lookup, not about the view, so it rides as
+				// wait_target_unavailable.
+				outcome.fresh, outcome.reason = false, freshReasonWaitTargetUnavailable
+			case !servesPublishedRoute(refreshed, checkout.CheckoutID, published):
+				// The coordinator published, and something else is answering: a
+				// labelled base fallback, a routeless carrier, another checkout,
+				// or a route that moved again under the re-selection. fresh:true
+				// here would claim the wait's success for an answer that is not
+				// the thing waited on — next to actual_view:"base", exact:false.
+				outcome.fresh, outcome.reason = false, freshReasonRouteWithdrawn
+			}
+		}
+		if outcome.reason == freshReasonRouteWithdrawn && refreshed != nil && refreshed.rider != nil && refreshed.rider.CheckoutID == checkout.CheckoutID {
+			if time.Now().Before(deadline) {
+				refreshed.close()
+				if err := waitFreshnessRetry(ctx, deadline); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			outcome.reason = freshReasonDeadlineExceeded
+		}
+		if !outcome.fresh && policy.freshness.requireExact {
+			// Every remaining way the wait failed — an unavailable coordinator, a
+			// failed publication, an interrupted request, a withdrawn route. The
+			// deadline case refused above with its own message; these refuse here
+			// rather than answering out of a route the caller just said it would
+			// not accept. Without this, require_exact silently meant "exact route"
+			// and not "exact AND as fresh as I asked for".
+			refreshed.close()
+			return nil, freshnessExactRefusal(outcome.reason, time.Since(started))
+		}
+		return annotateRequestFreshness(s.freshnessCarrier(selector, refreshed), outcome, started), nil
 	}
-	if !outcome.fresh && policy.freshness.requireExact {
-		// Every remaining way the wait failed — an unavailable coordinator, a
-		// failed publication, an interrupted request, a withdrawn route. The
-		// deadline case refused above with its own message; these refuse here
-		// rather than answering out of a route the caller just said it would
-		// not accept. Without this, require_exact silently meant "exact route"
-		// and not "exact AND as fresh as I asked for".
-		refreshed.close()
-		return nil, freshnessExactRefusal(outcome.reason, time.Since(started))
+}
+
+// A completed ticket can repeatedly race withdrawal. Yield between retries so
+// even a waiter returning already-completed tickets cannot spin, and never
+// extend the caller's absolute deadline or ignore its cancellation.
+func waitFreshnessRetry(ctx context.Context, deadline time.Time) error {
+	delay := min(10*time.Millisecond, time.Until(deadline))
+	if delay <= 0 {
+		return nil
 	}
-	return annotateRequestFreshness(s.freshnessCarrier(selector, refreshed), outcome, started), nil
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // freshnessWaitTarget names the checkout a require_fresh wait may advance, and

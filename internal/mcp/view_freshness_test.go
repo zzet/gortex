@@ -800,6 +800,37 @@ func TestFreshWaitWhoseRouteWithdrewIsNotReportedFresh(t *testing.T) {
 	require.True(t, view.routeless, "the carrier must make no route claim")
 }
 
+// A second write can withdraw the just-published route before selection.
+// The same request must wait again, without requiring an agent retry.
+func TestFreshWaitRetriesWithdrawalBeforeSelection(t *testing.T) {
+	stack := newViewStack(t)
+	selector := graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: viewTestWorktree}
+	policy := requestViewPolicy{freshness: requestFreshness{requireFresh: true, requireExact: true, deadline: time.Now().Add(time.Second), hasDeadline: true}}
+	pre, err := stack.srv.selectRequestView(context.Background(), selector, policy)
+	require.NoError(t, err)
+	calls := 0
+	stack.srv.freshnessWaiter = &fakeFreshnessWaiter{answer: func(_ int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
+		calls++
+		state := store_sqlite.RouteActive
+		if calls == 1 {
+			state = store_sqlite.RoutePending
+		}
+		routeViewCheckout(t, stack.store, stack.graphID, stack.commit, stack.dirty, state)
+		return settledTicket(checkoutID, root, uint64(stack.dirty)), nil
+	}}
+	view, err := stack.srv.settleRequestFreshness(context.Background(), selector, policy, pre, nil)
+	require.NoError(t, err)
+	defer view.close()
+	require.Equal(t, 2, calls)
+	require.True(t, view.freshnessOutcome().fresh)
+}
+
+func TestFreshnessRetryHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, waitFreshnessRetry(ctx, time.Now().Add(time.Hour)), context.Canceled)
+}
+
 // ------------------------------------------- production waiter selection ---
 
 // The seam every test above installs is a test seam. Nothing pinned which
@@ -1195,9 +1226,9 @@ func TestRequireExactRefusesEveryUnfreshOutcome(t *testing.T) {
 						return settledTicket(checkoutID, root, uint64(stack.dirty)), nil
 					},
 				}
-				return freshArgs(nil, time.Minute)
+				return freshArgs(nil, 25*time.Millisecond)
 			},
-			reason: freshReasonRouteWithdrawn,
+			reason: freshReasonDeadlineExceeded,
 		},
 		"a failed publication": {
 			arrange: func(stack *viewStack) map[string]any {
@@ -1241,7 +1272,11 @@ func TestRequireExactRefusesEveryUnfreshOutcome(t *testing.T) {
 			require.NoError(t, err)
 			assertToolError(t, res, graphview.CodeViewBuilding)
 			text := viewResultText(t, res)
-			require.Contains(t, text, tc.reason,
+			reason := tc.reason
+			if reason == freshReasonDeadlineExceeded {
+				reason = "wait_deadline"
+			}
+			require.Contains(t, text, reason,
 				"the refusal must name the outcome the caller has to act on: %s", text)
 			require.Contains(t, text, requireExactArgName, "refusal = %s", text)
 		})
@@ -1480,7 +1515,7 @@ func TestAFreshWaitAnsweredByABaseFallbackIsNotReportedFresh(t *testing.T) {
 	}
 
 	res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol",
-		freshArgs(nil, time.Minute), captureReader(stack.srv, new(graph.Reader)))
+		freshArgs(nil, 25*time.Millisecond), captureReader(stack.srv, new(graph.Reader)))
 	require.NoError(t, err)
 	require.False(t, res.IsError, "without require_exact the fallback must still answer: %s", viewResultText(t, res))
 
@@ -1492,7 +1527,7 @@ func TestAFreshWaitAnsweredByABaseFallbackIsNotReportedFresh(t *testing.T) {
 	// …and the freshness half must not contradict it.
 	require.Equal(t, false, rider["fresh"],
 		"a base fallback was stamped with the wait's success: rider = %v", rider)
-	require.Equal(t, freshReasonRouteWithdrawn, rider["fresh_reason"], "rider = %v", rider)
+	require.Equal(t, freshReasonDeadlineExceeded, rider["fresh_reason"], "rider = %v", rider)
 }
 
 // The same shape under require_exact: the pair means "a route that reflects
@@ -1506,11 +1541,11 @@ func TestAFreshWaitAnsweredByABaseFallbackRefusesUnderRequireExact(t *testing.T)
 			return settledTicket(checkoutID, root, uint64(stack.dirty)), nil
 		},
 	}
-	args := freshArgs(map[string]any{requireExactArgName: true}, time.Minute)
+	args := freshArgs(map[string]any{requireExactArgName: true}, 25*time.Millisecond)
 	res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", args, captureReader(stack.srv, new(graph.Reader)))
 	require.NoError(t, err)
 	assertToolError(t, res, graphview.CodeViewBuilding)
-	require.Contains(t, viewResultText(t, res), freshReasonRouteWithdrawn)
+	require.Contains(t, viewResultText(t, res), "wait_deadline")
 }
 
 // The positive control for both tests above, and the thing that keeps them
