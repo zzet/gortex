@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -77,7 +78,21 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 	if selector.Kind != graphview.SelectorAuto && selector.Kind != graphview.SelectorWorktree {
 		return nil, nil
 	}
+	if selector.Kind == graphview.SelectorWorktree {
+		checkout, err := s.registeredWorktreeSelector(ctx, selector)
+		if err != nil {
+			return nil, err
+		}
+		if checkout.State != store_sqlite.CheckoutStateReady {
+			// Preserve the original state-specific whole-view refusal rather
+			// than letting a source scope lookup change its ordering.
+			return nil, nil
+		}
+	}
 	control, err := s.resolveCheckoutControlScope(ctx, selector, req)
+	if selector.Kind == graphview.SelectorAuto && (errors.Is(err, indexer.ErrCheckoutMutationBusy) || errors.Is(err, indexer.ErrCheckoutMutationStale) || errors.Is(err, indexer.ErrCheckoutRefreshStopped)) {
+		return s.viewForCWDLookupError("", err)
+	}
 	if err != nil || control == nil {
 		return nil, err
 	}

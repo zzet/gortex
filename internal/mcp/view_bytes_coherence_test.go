@@ -814,8 +814,11 @@ func TestRouteDriftWithdrawsExactnessThroughTheMiddleware(t *testing.T) {
 	read := func(t *testing.T, moveTheRoute bool) *mcplib.CallToolResult {
 		t.Helper()
 		args := map[string]any{
-			"path": "repo/keep.go",
-			"view": map[string]any{"kind": "worktree", "checkout_id": viewTestWorktree},
+			// This fixture exercises whole-graph route drift, while ordinary
+			// file reads now verify an independent current source scope.
+			"required_capabilities": []any{"graph.syntax"},
+			"path":                  "repo/keep.go",
+			"view":                  map[string]any{"kind": "worktree", "checkout_id": viewTestWorktree},
 		}
 		res, err := stack.callWithView(t, stack.repoRoot, "read_file", args,
 			func(ctx context.Context) (*mcplib.CallToolResult, error) {
@@ -950,8 +953,9 @@ func TestRequireExactRefusesAnAnswerReadAcrossARouteMove(t *testing.T) {
 	read := func(t *testing.T, requireExact, moveTheRoute bool) *mcplib.CallToolResult {
 		t.Helper()
 		args := map[string]any{
-			"path": "repo/keep.go",
-			"view": map[string]any{"kind": "worktree", "checkout_id": viewTestWorktree},
+			"required_capabilities": []any{"graph.syntax"},
+			"path":                  "repo/keep.go",
+			"view":                  map[string]any{"kind": "worktree", "checkout_id": viewTestWorktree},
 		}
 		if requireExact {
 			args[requireExactArgName] = true

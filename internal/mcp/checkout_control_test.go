@@ -449,7 +449,9 @@ func TestCheckoutControlDoesNotRelaxExactAutoCWDQueries(t *testing.T) {
 	}{
 		{"legacy-source", "get_symbol", map[string]any{"require_exact": true}},
 		{"facade-source", "read", map[string]any{"operation": "source", "target": map[string]any{"symbol": "repo/edit.go::New"}, "require_exact": true}},
-		{"facade-search-options", "search", map[string]any{"operation": "symbols", "query": "New", "options": map[string]any{"require_exact": true}}},
+		// A lexical name request proves its own current source scope. Require
+		// graph syntax here to keep this whole-view boundary regression strict.
+		{"facade-search-options", "search", map[string]any{"operation": "symbols", "query": "New", "required_capabilities": []any{"graph.syntax"}, "options": map[string]any{"require_exact": true}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.operation != "get_symbol" {
