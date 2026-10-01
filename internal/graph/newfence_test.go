@@ -28,6 +28,10 @@ var stagingCallers = []string{
 	// receives the indexed corpus: the reserved positive SQLite generation is
 	// the durable payload target, and workers stream their output into it.
 	"internal/indexer/builder_dedicated_claimed.go",
+	// Clone follow-ups recompute derived relations in a private scratch graph.
+	// Only the edge diff is drained through DeltaWriter into the SQLite
+	// generation; signature rows are projected into that same durable handle.
+	"internal/indexer/clone_followup.go",
 }
 
 // harnessCallers lists the non-test files that construct it for a test and are
