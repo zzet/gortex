@@ -217,7 +217,9 @@ func TestFrameworkFullReadCacheFailedPreflightDoesNotEvict(t *testing.T) {
 	cache.nodesByKinds([]graph.NodeKind{targetKind}, load)
 
 	stats := cache.stats()
-	if stats.EvictionRebuilds != 1 || stats.EvictionRowsScanned != protectedRows || stats.EvictionNanos <= 0 {
+	// Coarse clocks can report zero elapsed time for this small preflight.
+	// The rebuild and scanned-row counters prove that the work was measured.
+	if stats.EvictionRebuilds != 1 || stats.EvictionRowsScanned != protectedRows || stats.EvictionNanos < 0 {
 		t.Fatalf("failed constructed preflight was not measured: %+v", stats)
 	}
 	if stats.EvictedQueries != 0 {
