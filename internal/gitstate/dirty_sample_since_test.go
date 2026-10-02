@@ -39,7 +39,17 @@ func TestSampleSinceSharesOnlyASampleTakenAfterTheInstant(t *testing.T) {
 		t.Fatalf("SamplesTaken = %d after one sample and one share, want 1", got)
 	}
 
+	// SampleSince permits sharing at an equal instant. Wait for a strictly
+	// later clock reading so coarse clocks exercise the resampling branch too.
 	afterFirst := time.Now()
+	clockDeadline := afterFirst.Add(time.Second)
+	for !afterFirst.After(sampler.LastSampleStarted()) {
+		if !afterFirst.Before(clockDeadline) {
+			t.Fatal("clock did not advance beyond the first sample")
+		}
+		time.Sleep(time.Millisecond)
+		afterFirst = time.Now()
+	}
 	if _, err := sampler.SampleSince(ctx, afterFirst); err != nil {
 		t.Fatalf("SampleSince(after the first sample): %v", err)
 	}
