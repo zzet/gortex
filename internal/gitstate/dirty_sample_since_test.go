@@ -93,19 +93,22 @@ func TestTreeHoldsPathsAnswersLiteralMembership(t *testing.T) {
 	git(t, dir, "init", "-q", "--initial-branch=main")
 	writeIn(t, dir, "kept.go", "package x\n")
 	writeIn(t, dir, "sub/deep.go", "package sub\n")
-	writeIn(t, dir, "star*.go", "package x\n")
+	// Brackets exercise Git's glob syntax while remaining a valid Windows
+	// filename. Keep a real glob lookalike alongside the literal path.
+	writeIn(t, dir, "bracket[ab].go", "package x\n")
+	writeIn(t, dir, "bracketa.go", "package x\n")
 	git(t, dir, "add", "-A")
 	git(t, dir, "commit", "-q", "-m", "base")
 	tree := git(t, dir, "rev-parse", "HEAD^{tree}")
 
 	held, err := TreeHoldsPaths(context.Background(), dir, tree,
-		[]string{"kept.go", "sub/deep.go", "star*.go", "stars.go", "missing.go", "sub"})
+		[]string{"kept.go", "sub/deep.go", "bracket[ab].go", "bracketa.go", "bracketb.go", "bracket[ac].go", "missing.go", "sub"})
 	if err != nil {
 		t.Fatalf("TreeHoldsPaths: %v", err)
 	}
 	want := map[string]bool{
-		"kept.go": true, "sub/deep.go": true, "star*.go": true,
-		"stars.go": false, "missing.go": false, "sub": false,
+		"kept.go": true, "sub/deep.go": true, "bracket[ab].go": true, "bracketa.go": true,
+		"bracketb.go": false, "bracket[ac].go": false, "missing.go": false, "sub": false,
 	}
 	for p, w := range want {
 		if held[p] != w {
