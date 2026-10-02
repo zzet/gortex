@@ -45,7 +45,9 @@ func TestCheckoutMutationPrepareSamplesAsAnUrgentCaller(t *testing.T) {
 // An admission against a route that moved after the caller selected it — a
 // newer epoch, or layers that no longer compose over the current base — is
 // refused as a moved route, which the caller may select again for. A HEAD
-// change is not one: admission samples nothing, and Prepare refuses it.
+// change is not one: with usable HEAD file evidence admission samples
+// nothing, and Prepare refuses it. Without that proof admission samples
+// and may only establish a conservative stale HEAD-or-base refusal.
 func TestCheckoutMutationAdmissionNamesAMovedRoute(t *testing.T) {
 	f, _, l := newCheckoutMutationFixture(t)
 	route := f.route()
@@ -59,10 +61,14 @@ func TestCheckoutMutationAdmissionNamesAMovedRoute(t *testing.T) {
 	if !fixture.coordinator.RequestBaseRelease(fixture.baseGeneration, "test release") {
 		t.Fatal("release request was not accepted")
 	}
-	if m, err := fixture.lifecycle.BeginCheckoutMutation(t.Context(), fixture.family.checkoutID, fixture.family.worktree, fixture.route.RouteEpoch); !errors.Is(err, ErrCheckoutMutationRouteMoved) {
+	wantErr := ErrCheckoutMutationRouteMoved
+	if !fixture.coordinator.sampler.CaptureHeadEvidence().Usable() {
+		wantErr = ErrCheckoutMutationStale
+	}
+	if m, err := fixture.lifecycle.BeginCheckoutMutation(t.Context(), fixture.family.checkoutID, fixture.family.worktree, fixture.route.RouteEpoch); m != nil || !errors.Is(err, wantErr) {
 		if m != nil {
 			m.Close()
 		}
-		t.Fatalf("an admission whose base moved = %v, want a moved route", err)
+		t.Fatalf("an admission whose base moved = lease %v, error %v, want no lease and %v", m, err, wantErr)
 	}
 }

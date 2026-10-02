@@ -27,6 +27,25 @@ func (s mutationEditSamples) afterWrite() uint64 { return s.Enqueue + s.Cycle }
 func TestCheckoutMutationEditSamplesTheWorkingCopyOnceAfterTheWrite(t *testing.T) {
 	f, c, l := newCheckoutMutationFixture(t)
 	ctx := t.Context()
+	headProof := c.sampler.CaptureHeadEvidence().Usable()
+	sample, err := c.sampler.Sample(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := c.sampler.ConfirmReadSet(ctx, sample, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !proof.Confirmed && proof.Reason != "the checkout's filesystem gives no change stamps" {
+		t.Fatalf("fixture cannot establish its read-set capability: %+v", proof)
+	}
+	wantBegin, wantCycle := uint64(0), uint64(0)
+	if !headProof {
+		wantBegin = 1 // Admission must sample HEAD without usable file evidence.
+	}
+	if !proof.Confirmed {
+		wantCycle = 1 // Prepublish must fully sample without change stamps.
+	}
 	taken := c.sampler.SamplesTaken
 	var got mutationEditSamples
 
@@ -70,21 +89,23 @@ func TestCheckoutMutationEditSamplesTheWorkingCopyOnceAfterTheWrite(t *testing.T
 	if row.LowerViewFingerprint != after.Fingerprint {
 		t.Fatalf("the published generation describes %s, the working copy %s", row.LowerViewFingerprint, after.Fingerprint)
 	}
-	// Admission samples nothing; Prepare validates the routed snapshot once,
+	// With usable HEAD evidence admission samples nothing; otherwise it
+	// samples once. Prepare validates the routed snapshot once,
 	// right before the write (a stale tree, or an external edit after
 	// admission, is refused there, TestCheckoutMutationRejectsWrongRootEpochAndExternalChanges);
 	// the ticket's capture sample binds the exact post-commit snapshot and is
 	// the serving cycle's decision sample, and the ticket's completion sample,
 	// too. The build's pre-publish fence confirms its read set against that
-	// sample without taking another (confirmDirtyBuildInputs).
-	if got.Begin != 0 || got.Prepare != 1 || got.Enqueue != 1 || got.Cycle != 0 || cycles != 1 {
-		t.Fatalf("lease edit samples = %+v in %d cycles, want begin=0 prepare=1 enqueue=1 cycle=0 in one cycle", got, cycles)
+	// sample without taking another (confirmDirtyBuildInputs), or samples
+	// once more when the filesystem supplies no trusted change stamps.
+	if got.Begin != wantBegin || got.Prepare != 1 || got.Enqueue != 1 || got.Cycle != wantCycle || cycles != 1 {
+		t.Fatalf("lease edit samples = %+v in %d cycles, want begin=%d prepare=1 enqueue=1 cycle=%d in one cycle", got, cycles, wantBegin, wantCycle)
 	}
-	if before := got.Begin + got.Prepare; before != 1 {
-		t.Fatalf("the edit sampled %d times before its write, want 1 (Prepare's)", before)
+	if before := got.Begin + got.Prepare; before != 1+wantBegin {
+		t.Fatalf("the edit sampled %d times before its write, want %d (Prepare plus admission's HEAD fallback)", before, 1+wantBegin)
 	}
-	if got.afterWrite() != 1 {
-		t.Fatalf("the edit sampled %d times after its write, want 1 (the capture sample the cycle shares; the pre-publish fence is the read set)", got.afterWrite())
+	if got.afterWrite() != 1+wantCycle {
+		t.Fatalf("the edit sampled %d times after its write, want %d (capture plus the prepublish fallback when stamps are unsupported)", got.afterWrite(), 1+wantCycle)
 	}
 }
 
