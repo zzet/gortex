@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,10 +92,15 @@ func TestDeadCodeCandidatesPagesAndMatchesTheSingleStatements(t *testing.T) {
 // promptly and a TRUNCATE (which no reader on the old snapshot may block)
 // succeeds right after.
 func TestAbandonedAnalysisReadReleasesItsSnapshot(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_READ_GATE", "on")
 	prevNodes, prevDead := nodesByKindsPageSize, deadCodePageSize
-	nodesByKindsPageSize, deadCodePageSize = 1, 1 // one row per page: the read runs long
+	nodesByKindsPageSize, deadCodePageSize = 1, 1 // force a second page after the connection handoff
 	t.Cleanup(func() { nodesByKindsPageSize, deadCodePageSize = prevNodes, prevDead })
 	s, path := openTempStore(t)
+	// Only the analysis reader may use the pool during the handoff below.
+	s.stopCheckpointLoop()
+	s.stopMaintenanceLane()
+	s.db.SetMaxOpenConns(1)
 	writeDeadCodeFixture(t, s, []int64{0}, 3000)
 	ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
 	require.NoError(t, err)
@@ -113,10 +119,44 @@ func TestAbandonedAnalysisReadReleasesItsSnapshot(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			growWALForReadTest(t, s)
 			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			bound := graph.BindReadContext(s, ctx)
 			done := make(chan error, 1)
+			before := s.ReaderWaitMark().ReadTxns
+			// Pause the first query after it borrows the sole connection,
+			// before SQL admission. Queue our connection request before
+			// releasing it: database/sql must hand us the connection at the
+			// first page's return, so the reader cannot finish all its pages.
+			s.readGate.mu.Lock()
+			var unlockOnce sync.Once
+			unlock := func() { unlockOnce.Do(s.readGate.mu.Unlock) }
+			defer unlock()
 			go func() { done <- read(bound) }()
-			time.Sleep(150 * time.Millisecond) // mid-read
+			waitForCondition(t, "first page holding the sole connection", func() bool {
+				return s.db.Stats().InUse == 1
+			})
+			queued := s.db.Stats().WaitCount
+			borrowCtx, borrowCancel := context.WithTimeout(ctx, 5*time.Second)
+			defer borrowCancel()
+			go func() {
+				defer unlock()
+				ticker := time.NewTicker(time.Millisecond)
+				defer ticker.Stop()
+				for s.db.Stats().WaitCount == queued {
+					select {
+					case <-borrowCtx.Done():
+						return
+					case <-ticker.C:
+					}
+				}
+			}()
+			conn, err := s.db.Conn(borrowCtx)
+			require.NoError(t, err)
+			defer conn.Close()
+			require.Greater(t, s.ReaderWaitMark().ReadTxns, before, "the first page must have read and released its snapshot")
+			waitForCondition(t, "next analysis page queued behind the held connection", func() bool {
+				return s.db.Stats().WaitCount > queued+1
+			})
 			cancelled := time.Now()
 			cancel()
 			select {
@@ -126,6 +166,7 @@ func TestAbandonedAnalysisReadReleasesItsSnapshot(t *testing.T) {
 				t.Fatal("the bound read did not stop after its context ended")
 			}
 			stopped := time.Since(cancelled)
+			require.NoError(t, conn.Close())
 			_, terr := checkpointWALOnceOn(context.Background(), ckpt, "TRUNCATE")
 			t.Logf("stopped %s after cancel; truncate err=%v wal=%d", stopped, terr, walFileSize(path+"-wal"))
 			require.Less(t, stopped, time.Second, "the read held its snapshot past one page")
