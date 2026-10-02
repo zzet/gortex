@@ -1295,10 +1295,6 @@ func substringScore(id, name string, kind graph.NodeKind, query, lower string) (
 	}
 }
 
-func (e *Engine) scanSubstringCandidates(query, lower string, limit int) ([]substringCandidate, error) {
-	return e.scanSubstringCandidatesScoped(context.Background(), query, lower, limit, QueryOptions{})
-}
-
 func (e *Engine) scanSubstringCandidatesScoped(ctx context.Context, query, lower string, limit int, opts QueryOptions) ([]substringCandidate, error) {
 	top := make(substringCandidateHeap, 0, limit)
 	err := graph.ScanNodeSearchKeys(ctx, e.g, substringSearchPageSize, func(page []graph.NodeSearchKey) bool {
@@ -1335,10 +1331,6 @@ func (e *Engine) scanSubstringCandidatesScoped(ctx context.Context, query, lower
 		return substringCandidateBetter(top[i], top[j])
 	})
 	return top, nil
-}
-
-func (e *Engine) hydrateSubstringCandidates(candidates []substringCandidate, query, lower string, limit int) []*graph.Node {
-	return e.hydrateSubstringCandidatesScoped(candidates, query, lower, limit, QueryOptions{})
 }
 
 func (e *Engine) hydrateSubstringCandidatesScoped(candidates []substringCandidate, query, lower string, limit int, opts QueryOptions) []*graph.Node {

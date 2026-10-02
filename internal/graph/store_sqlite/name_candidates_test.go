@@ -67,6 +67,9 @@ func TestNameCandidateProjectionIsCoveringForEveryRepoScope(t *testing.T) {
 			}
 			plan += detail + "\n"
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
 		if err := rows.Close(); err != nil {
 			t.Fatal(err)
 		}
