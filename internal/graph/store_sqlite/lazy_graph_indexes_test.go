@@ -201,7 +201,7 @@ func TestFileGenerationReadPlansLockedAcrossStatisticsRegimes(t *testing.T) {
 	})
 }
 
-// A schema-v29 store opens and serves identical by-file rows with and without
+// A current-schema store opens and serves identical by-file rows with and without
 // edges_by_file_generation, and the index never moves the schema version: an
 // older binary can open the same file (the index is just one more index to
 // it), so a binary rollback stays possible.
@@ -224,8 +224,8 @@ func TestFileGenerationIndexIsVersionNeutral(t *testing.T) {
 			t.Fatalf("reopen (index=%v): %v", withIndex, err)
 		}
 		defer func() { _ = s.Close() }()
-		if v, err := readUserVersion(s.writerDB); err != nil || v != currentSchemaVersion || currentSchemaVersion != 29 {
-			t.Fatalf("user_version=%d (err %v), want 29", v, err)
+		if v, err := readUserVersion(s.writerDB); err != nil || v != currentSchemaVersion {
+			t.Fatalf("user_version=%d (err %v), want %d", v, err, currentSchemaVersion)
 		}
 		if got := s.fileGenerationIndexPresent(); got != withIndex {
 			t.Fatalf("index present=%v, want %v", got, withIndex)

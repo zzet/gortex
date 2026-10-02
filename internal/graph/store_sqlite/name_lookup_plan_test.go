@@ -74,9 +74,11 @@ func TestRepoNameReadsSeekUnderTheLiveStoreStatistics(t *testing.T) {
 	namesJSON, _ := json.Marshal(names)
 	langsJSON, _ := json.Marshal(langs)
 
-	// Precondition: under these statistics the IN-list form ranges over the
-	// repository's entries of every generation.
-	inList := `SELECT id FROM nodes WHERE repo_prefix = ? AND language IN (?, ?, ?) AND name IN (` +
+	// Reproduce the historical IN-list range-access counterfactual. Pin its
+	// original index so newer candidate indexes do not change the reference;
+	// the production seek statements and their plan assertions below remain
+	// the current behavior under the live-store statistics.
+	inList := `SELECT id FROM nodes INDEXED BY nodes_by_repo_language_name WHERE repo_prefix = ? AND language IN (?, ?, ?) AND name IN (` +
 		strings.TrimSuffix(strings.Repeat("?,", len(names)), ",") + `) AND name <> '' AND view_gen = ?`
 	inArgs := []any{"repo", langs[0], langs[1], langs[2]}
 	for _, n := range names {

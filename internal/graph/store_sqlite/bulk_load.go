@@ -149,6 +149,9 @@ const (
 
 	nodesByGenerationIndexDDL = `CREATE INDEX IF NOT EXISTS nodes_by_generation ON nodes(view_gen, id)`
 	edgesByGenerationIndexDDL = `CREATE INDEX IF NOT EXISTS edges_by_generation ON edges(view_gen, id)`
+	// Compact supplementary-name scans never visit the wide nodes payload.
+	// Repo equality narrows the scan; trailing columns cover scope predicates.
+	nodesNameCandidatesIndexDDL = `CREATE INDEX IF NOT EXISTS nodes_name_candidates ON nodes(view_gen, repo_prefix, id, name, kind, file_path, workspace_id, project_id) WHERE name <> ''`
 )
 
 // bulkAlwaysLiveIndexes preserve bounded maintenance and resolver/repository
@@ -169,6 +172,7 @@ var bulkAlwaysLiveIndexes = []bulkDroppableIndex{
 	// are index-only.
 	{"nodes_by_repo_kind", `CREATE INDEX IF NOT EXISTS nodes_by_repo_kind ON nodes(repo_prefix, kind)`},
 	{nodesByGenerationIndexName, nodesByGenerationIndexDDL},
+	{"nodes_name_candidates", nodesNameCandidatesIndexDDL},
 	{edgesByGenerationIndexName, edgesByGenerationIndexDDL},
 	{"nodes_repo_files", `CREATE INDEX IF NOT EXISTS nodes_repo_files ON nodes(repo_prefix, workspace_id, language, file_path, id) WHERE kind = 'file'`},
 	{"edges_by_unresolved", `CREATE INDEX IF NOT EXISTS edges_by_unresolved ON edges(is_unresolved) WHERE is_unresolved = 1`},

@@ -142,20 +142,16 @@ func (s *Store) CountNodesByNameClass(names []string, definitionKinds []graph.No
 // FindNodesByNameContaining returns nodes whose Name contains substr,
 // case-insensitively (SQLite's LIKE is ASCII case-insensitive). An empty
 // substring matches nothing (parity with the in-memory store); a limit > 0
-// caps the result set. The leading-wildcard LIKE is a deliberate full scan —
-// no index accelerates an unanchored substring — matching the in-memory
-// strings.Contains fallback. % and _ in substr are escaped so they match
-// literally.
+// caps the result set. Leading-wildcard LIKE scans compact candidate index
+// entries, then hydrates only the selected rows. % and _ in substr are escaped
+// so they match literally.
 func (s *Store) FindNodesByNameContaining(substr string, limit int) []*graph.Node {
 	if substr == "" {
 		return nil
 	}
-	pattern := "%" + escapeLikePattern(substr) + "%"
-	q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE name LIKE ? ESCAPE '\' AND view_gen = ? ORDER BY id`
-	if limit > 0 {
-		return s.queryNodesSQL(q+` LIMIT ?`, pattern, s.viewGen, limit)
-	}
-	return s.queryNodesSQL(q, pattern, s.viewGen)
+	nodes, err := s.FindNodesByNameContainingContext(context.Background(), substr, limit)
+	panicOnFatal(err)
+	return nodes
 }
 
 // VisitNodesByNameContainingFolded streams this generation's nodes whose

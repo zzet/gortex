@@ -38,7 +38,7 @@ func (s *Store) FindNodesByNameContext(ctx context.Context, name string) ([]*gra
 }
 
 // FindNodesByNameContainingContext is the cancellable form of
-// FindNodesByNameContaining. It preserves the same full-scan LIKE, ordering,
+// FindNodesByNameContaining. It preserves the same LIKE, ordering,
 // literal wildcard escaping, generation scope, and result limit.
 func (s *Store) FindNodesByNameContainingContext(ctx context.Context, substr string, limit int) ([]*graph.Node, error) {
 	if ctx == nil {
@@ -53,12 +53,7 @@ func (s *Store) FindNodesByNameContainingContext(ctx context.Context, substr str
 	if index, ok := s.sealedNameIndex(ctx); ok {
 		return s.findNodesByNameContainingIndexed(ctx, index, substr, limit)
 	}
-	pattern := "%" + escapeLikePattern(substr) + "%"
-	q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE name LIKE ? ESCAPE '\' AND view_gen = ? ORDER BY id`
-	if limit > 0 {
-		return s.queryNodesSQLContext(ctx, q+` LIMIT ?`, pattern, s.viewGen, limit)
-	}
-	return s.queryNodesSQLContext(ctx, q, pattern, s.viewGen)
+	return s.FindNodesByNameContainingFilteredContext(ctx, substr, limit, graph.NameSearchFilter{})
 }
 
 // VisitNodesByNameContainingFoldedContext is the cancellable form of

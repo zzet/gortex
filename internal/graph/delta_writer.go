@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"iter"
 	"slices"
 	"sort"
@@ -1088,6 +1089,13 @@ func (dw *DeltaWriter) FindNodesByNameInRepo(name, repoPrefix string) []*Node {
 // FindNodesByNameContaining implements Store.
 func (dw *DeltaWriter) FindNodesByNameContaining(substr string, limit int) []*Node {
 	return cloneDeltaNodes(dw.view.FindNodesByNameContaining(substr, limit))
+}
+
+// FindNodesByNameContainingFilteredContext preserves the composed view's scope
+// and mask-before-limit behavior while protecting the delta's mutable payloads.
+func (dw *DeltaWriter) FindNodesByNameContainingFilteredContext(ctx context.Context, substr string, limit int, filter NameSearchFilter) ([]*Node, error) {
+	nodes, err := dw.view.FindNodesByNameContainingFilteredContext(ctx, substr, limit, filter)
+	return cloneDeltaNodes(nodes), err
 }
 
 // GetFileNodes implements Store.

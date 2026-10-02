@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 29
+const currentSchemaVersion = 30
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -126,6 +126,12 @@ var schemaMigrations = []schemaMigration{
 	{version: 27, name: "scope kind and fn-value indexes by view generation", inPlace: scopeKindAndFnValueIndexesByViewGeneration},
 	{version: 28, name: "lead edge candidate indexes with view generation", inPlace: scopeEdgeCandidateIndexesByViewGeneration},
 	{version: 29, name: "persist admitted-input manifests per generation", inPlace: createGenerationInputManifestTables},
+	{version: 30, name: "cover scoped supplementary name candidates", inPlace: createNameCandidateIndex},
+}
+
+func createNameCandidateIndex(tx *sql.Tx) error {
+	_, err := tx.Exec(nodesNameCandidatesIndexDDL)
+	return err
 }
 
 // generationFirstEdgeCandidateIndexNames covers precisely the indexes used by

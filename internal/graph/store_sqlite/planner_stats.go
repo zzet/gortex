@@ -52,6 +52,7 @@ var plannerStatsIndexesOutside = map[string]string{
 	"nodes_by_qual":                 "partial, qual_name <> '': the qualified-name reads only",
 	"nodes_missing_workspace_slugs": "partial, workspace_id = '' OR project_id = '': the slug backfill only",
 	"nodes_repo_files":              "partial, kind = 'file': the repository file listing only",
+	"nodes_name_candidates":         "partial, name <> '': supplementary reads select it explicitly; competing production name-key reads pin the stronger name or repo/language/name indexes",
 	"edges_by_unresolved":           "partial, is_unresolved = 1: the resolver's unresolved scan only",
 	"edges_fnvalue_prefixed":        "partial, to_id LIKE '%::unresolved::fnvalue::%': the fnvalue pass only",
 	"edges_external":                "partial, the external-call target predicate: the external-call synthesizer only",

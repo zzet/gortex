@@ -131,6 +131,12 @@ func (v *OverlaidView) FindNodesByNameContext(ctx context.Context, name string) 
 // FindNodesByNameContainingContext is the request-aware sibling of
 // FindNodesByNameContaining.
 func (v *OverlaidView) FindNodesByNameContainingContext(ctx context.Context, substr string, limit int) ([]*Node, error) {
+	return v.FindNodesByNameContainingFilteredContext(ctx, substr, limit, NameSearchFilter{})
+}
+
+// FindNodesByNameContainingFilteredContext applies scope and upper-layer
+// ownership before either layer consumes the candidate budget.
+func (v *OverlaidView) FindNodesByNameContainingFilteredContext(ctx context.Context, substr string, limit int, filter NameSearchFilter) ([]*Node, error) {
 	ctx = normalizeNameLookupContext(ctx)
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -150,6 +156,9 @@ func (v *OverlaidView) FindNodesByNameContainingContext(ctx context.Context, sub
 				if node == nil || node.Name == "" || !strings.Contains(strings.ToLower(node.Name), needle) {
 					return true
 				}
+				if !filter.Allows(node) {
+					return true
+				}
 				out = append(out, node)
 				return limit <= 0 || len(out) < limit
 			})
@@ -167,6 +176,9 @@ func (v *OverlaidView) FindNodesByNameContainingContext(ctx context.Context, sub
 					return false
 				}
 				if node == nil || node.Name == "" || !strings.Contains(strings.ToLower(node.Name), needle) {
+					return true
+				}
+				if !filter.Allows(node) {
 					return true
 				}
 				out = append(out, node)
@@ -191,6 +203,9 @@ func (v *OverlaidView) FindNodesByNameContainingContext(ctx context.Context, sub
 					if err := ctx.Err(); err != nil {
 						return nil, err
 					}
+					if !filter.Allows(node) {
+						continue
+					}
 					out = append(out, node)
 					if limit > 0 && len(out) >= limit {
 						return out[:limit], nil
@@ -205,6 +220,16 @@ func (v *OverlaidView) FindNodesByNameContainingContext(ctx context.Context, sub
 	if v.base == nil {
 		return out, ctx.Err()
 	}
+	baseFilter := filter
+	baseFilter.Accept = func(node *Node) bool { return v.baseNodeVisible(node) && filter.Allows(node) }
+	if _, ok := v.base.(FilteredContainingNameReader); ok {
+		remaining := 0
+		if limit > 0 {
+			remaining = limit - len(out)
+		}
+		candidates, err := FindNodesByNameContainingFilteredContext(ctx, v.base, substr, remaining, baseFilter)
+		return append(out, candidates...), err
+	}
 	if limit <= 0 {
 		candidates, err := FindNodesByNameContainingContext(ctx, v.base, substr, 0)
 		if err != nil {
@@ -214,7 +239,7 @@ func (v *OverlaidView) FindNodesByNameContainingContext(ctx context.Context, sub
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			if v.baseNodeVisible(node) {
+			if baseFilter.Allows(node) {
 				out = append(out, node)
 			}
 		}
@@ -243,7 +268,7 @@ func (v *OverlaidView) FindNodesByNameContainingContext(ctx context.Context, sub
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			if !v.baseNodeVisible(node) {
+			if !baseFilter.Allows(node) {
 				continue
 			}
 			out = append(out, node)
