@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -178,6 +179,14 @@ func sqliteWALPressureTarget(db *sql.DB, fallbackPath string, pages int) (string
 				path = mainFile
 			}
 			_ = rows.Close()
+		}
+	}
+	// SQLite's Windows VFS may preserve a drive path's 8.3 spelling in
+	// database_list. Resolve the existing parent so WAL pressure/reclaim use
+	// the same physical path as an ordinary long-name open of that database.
+	if runtime.GOOS == "windows" {
+		if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+			path = filepath.Join(dir, filepath.Base(path))
 		}
 	}
 	if pages <= 0 {

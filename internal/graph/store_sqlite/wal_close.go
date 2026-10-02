@@ -44,8 +44,8 @@ func (w walIndexSnapshot) PendingFrames() int64 {
 // stores its checkpoint sequence big-endian at offset 12.
 func readWALIndexSnapshot(dbPath string) (walIndexSnapshot, bool) {
 	var snap walIndexSnapshot
-	// Never os.Open + Close the -shm: closing any descriptor of it releases
-	// every SQLite lock this process holds on it (wal_index_file.go).
+	// The platform reader preserves SQLite's locks: POSIX retains the
+	// observation descriptor; Windows closes only its separate reader handle.
 	var hdr [136]byte
 	if err := readWALIndexHeader(dbPath, hdr[:]); err != nil {
 		return snap, false
