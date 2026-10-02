@@ -2945,12 +2945,14 @@ func inferEdgeKindFromObj(obj types.Object) graph.EdgeKind {
 
 // relativePath converts an absolute file path to a repo-relative path.
 func relativePath(absPath, repoRoot string) string {
-	// Skip files outside the repo (stdlib, dependencies).
-	if !strings.HasPrefix(absPath, repoRoot) {
+	if repoRoot == "" || absPath == "" {
 		return ""
 	}
-	rel, err := filepath.Rel(repoRoot, absPath)
-	if err != nil {
+	// Compiler export positions use forward slashes on Windows, whereas
+	// checkout roots use native separators. Rel also respects path boundaries
+	// and platform case rules, unlike a raw string prefix check.
+	rel, err := filepath.Rel(filepath.FromSlash(repoRoot), filepath.FromSlash(absPath))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return ""
 	}
 	return filepath.ToSlash(rel)
