@@ -41,7 +41,7 @@ func dirtyContentGit(tb testing.TB, repo string, args ...string) string {
 	cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		tb.Fatalf("git %v: %v\n%s", args, err, out)
+		tb.Fatalf("git %v: %v (context: %v)\n%s", args, err, ctx.Err(), out)
 	}
 	return strings.TrimSpace(string(out))
 }
