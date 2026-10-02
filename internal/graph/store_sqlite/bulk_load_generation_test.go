@@ -495,56 +495,73 @@ func TestPassiveCheckpointRetriesWALPinnedByReader(t *testing.T) {
 }
 
 func TestCheckpointLoopStartupProbeCannotBlockClose(t *testing.T) {
-	physical := filepath.Join(t.TempDir(), "startup space # question ?.sqlite")
-	uri := sqliteDSN(physical, "mode=rwc")
-	store, err := Open(uri)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store.stopCheckpointLoop()
-	ctx := context.Background()
-	connections := make([]*sql.Conn, 0, sqliteMaxOpenConns)
-	for range sqliteMaxOpenConns {
-		conn, err := store.db.Conn(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		connections = append(connections, conn)
-	}
-	var once sync.Once
-	release := func() {
-		once.Do(func() {
-			for _, conn := range connections {
-				_ = conn.Close()
+	for _, poolSize := range []int{1, 2, sqliteMaxOpenConns} {
+		t.Run(fmt.Sprintf("readers_%d", poolSize), func(t *testing.T) {
+			physical := filepath.Join(t.TempDir(), "startup space # question ?.sqlite")
+			uri := sqliteDSN(physical, "mode=rwc")
+			store, err := Open(uri)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store.stopCheckpointLoop()
+			storeClosed := false
+			defer func() {
+				if !storeClosed {
+					_ = store.Close()
+				}
+			}()
+			store.db.SetMaxOpenConns(poolSize)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			// Match the actual pool limit: low-core CI runners have fewer
+			// readers than the global ceiling. Every acquisition is bounded.
+			readers := store.db.Stats().MaxOpenConnections
+			connections := make([]*sql.Conn, 0, readers)
+			var once sync.Once
+			release := func() {
+				once.Do(func() {
+					for _, conn := range connections {
+						_ = conn.Close()
+					}
+				})
+			}
+			defer release()
+			for range readers {
+				conn, err := store.db.Conn(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				connections = append(connections, conn)
+			}
+			store.stopOnce = sync.Once{}
+			store.stopCheckpoint = make(chan struct{})
+			store.checkpointDone = make(chan struct{})
+			waits := store.db.Stats().WaitCount
+			go store.runCheckpointLoop(time.Hour)
+			waitForCondition(t, "startup probe wait", func() bool { return store.db.Stats().WaitCount > waits })
+			// The order of events is the assertion: Close returns while the test
+			// still holds every pool connection, so the probe cannot have finished
+			// by getting one; it gave up on its own bound and the loop stopped.
+			// Close's final checkpoint (a disk write) is not what this guards, so
+			// its time is only logged. The wait below is a safety net, not a limit:
+			// a probe that waited for a connection would hold Close until release.
+			closed := make(chan error, 1)
+			started := time.Now()
+			go func() { closed <- store.Close() }()
+			select {
+			case err := <-closed:
+				storeClosed = true
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Logf("Close returned with the pool still held, after %s", time.Since(started).Round(time.Millisecond))
+			case <-time.After(30 * time.Second):
+				release()
+				<-closed
+				storeClosed = true
+				t.Fatalf("Close waited for the startup probe: it returned only after the pool's connections were released")
 			}
 		})
-	}
-	defer release()
-	store.stopOnce = sync.Once{}
-	store.stopCheckpoint = make(chan struct{})
-	store.checkpointDone = make(chan struct{})
-	waits := store.db.Stats().WaitCount
-	go store.runCheckpointLoop(time.Hour)
-	waitForCondition(t, "startup probe wait", func() bool { return store.db.Stats().WaitCount > waits })
-	// The order of events is the assertion: Close returns while the test
-	// still holds every pool connection, so the probe cannot have finished
-	// by getting one; it gave up on its own bound and the loop stopped.
-	// Close's final checkpoint (a disk write) is not what this guards, so
-	// its time is only logged. The wait below is a safety net, not a limit:
-	// a probe that waited for a connection would hold Close until release.
-	closed := make(chan error, 1)
-	started := time.Now()
-	go func() { closed <- store.Close() }()
-	select {
-	case err := <-closed:
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Logf("Close returned with the pool still held, after %s", time.Since(started).Round(time.Millisecond))
-	case <-time.After(30 * time.Second):
-		release()
-		<-closed
-		t.Fatalf("Close waited for the startup probe: it returned only after the pool's connections were released")
 	}
 }
 

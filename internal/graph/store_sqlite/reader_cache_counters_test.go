@@ -71,6 +71,11 @@ func BenchmarkReadGateCacheCounters(b *testing.B) {
 func TestReaderWaitMarkCountsWriterPageReads(t *testing.T) {
 	s, _ := openWALReclaimStore(t)
 	defer func() { _ = s.Close() }()
+	// These exact counter deltas belong to the writes below. Join the
+	// startup/index/reclaim workers before sampling: a slow race run can
+	// otherwise count their gate releases while the test pins the writer.
+	s.stopCheckpointLoop()
+	s.stopMaintenanceLane()
 	seedWALChurnTable(t, s)
 	before := s.ReaderWaitMark()
 	growWAL(t, s, 4)
@@ -83,7 +88,7 @@ func TestReaderWaitMarkCountsWriterPageReads(t *testing.T) {
 	before = s.ReaderWaitMark()
 	s.writeMu.Lock()
 	_, err := s.writerDB.Exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 12000)
-		INSERT INTO wal_churn(id, payload) SELECT 100000+i, randomblob(4000) FROM n`)
+		INSERT INTO wal_churn(id, payload) SELECT 100000+i, zeroblob(4000) FROM n`)
 	s.writeMu.Unlock()
 	require.NoError(t, err)
 	d = s.ReaderWaitMark().Split(before)
