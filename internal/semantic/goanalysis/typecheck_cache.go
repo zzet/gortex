@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"golang.org/x/tools/go/gcexportdata"
@@ -88,18 +87,8 @@ type fileStamp struct {
 	size  int64
 	mtime int64
 	ino   uint64
-}
-
-func statStamp(path string) (fileStamp, bool) {
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		return fileStamp{}, false
-	}
-	st := fileStamp{size: info.Size(), mtime: info.ModTime().UnixNano()}
-	if sys, ok := info.Sys().(*syscall.Stat_t); ok {
-		st.ino = uint64(sys.Ino)
-	}
-	return st, true
+	// Windows file indices are unique within a volume.
+	volume uint32
 }
 
 // tcFileRecord is one source file of a mutable package as it was when the
