@@ -143,6 +143,15 @@ func TestConfirmReadSet(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// Windows supplies no trusted change stamps. Confirmation must
+			// conservatively refuse, even when the content did not change.
+			// A mismatched latest fingerprint is checked before stamp support.
+			if !s.changeStampsTrusted() && tc.name != "a_later_sample_disagrees" {
+				if got.Confirmed || !strings.Contains(got.Reason, "no change stamps") || got.Rehashed != 0 || got.Files != 0 || got.Dirs != 0 {
+					t.Fatalf("unsupported change stamps must refuse without claiming checked paths: %+v", got)
+				}
+				return
+			}
 			if got.Confirmed != tc.confirmed {
 				t.Fatalf("confirmed = %v (reason %q), want %v", got.Confirmed, got.Reason, tc.confirmed)
 			}
@@ -181,6 +190,20 @@ func TestConfirmReadSetRefusesWithoutEvidence(t *testing.T) {
 	cancel()
 	if _, err := s.ConfirmReadSet(ctx, before, readSetFiles, readSetDirs); err == nil {
 		t.Fatal("a canceled confirmation returned no error")
+	}
+}
+
+func TestConfirmReadSetRefusesWithoutTrustedChangeStamps(t *testing.T) {
+	root := readSetRepo(t, false)
+	s, before := sampleForReadSet(t, root)
+	// Exercise the conservative filesystem fallback on every test platform.
+	s.stampsChecked, s.stampsTrusted = true, false
+	got, err := s.ConfirmReadSet(context.Background(), before, readSetFiles, readSetDirs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Confirmed || !strings.Contains(got.Reason, "no change stamps") || got.Rehashed != 0 || got.Files != 0 || got.Dirs != 0 {
+		t.Fatalf("unsupported change stamps must refuse without claiming checked paths: %+v", got)
 	}
 }
 
