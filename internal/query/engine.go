@@ -634,7 +634,7 @@ func (e *Engine) GatherSymbolCandidatesContext(ctx context.Context, query string
 			return nil
 		}
 		start := time.Now()
-		nodes := e.searchSubstring(query, fetchLimit)
+		nodes := e.searchSubstringScoped(ctx, query, fetchLimit, opts)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -647,10 +647,10 @@ func (e *Engine) GatherSymbolCandidatesContext(ctx context.Context, query string
 		}
 	}
 
-	if opts.hasScopeFilter() {
+	if opts.hasScopeFilter() || opts.SearchNodeFilter != nil {
 		kept := cands[:0]
 		for _, c := range cands {
-			if !opts.ScopeAllows(c.Node) {
+			if !opts.searchAllows(c.Node) {
 				continue
 			}
 			kept = append(kept, c)
@@ -1036,6 +1036,10 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 		}
 	}
 
+	if opts.SymbolSearchStats != nil && len(textResults) >= limit*2 {
+		opts.SymbolSearchStats.TextSaturated = true
+	}
+
 	// Collect every ID NOT covered by the bundle path (vector hits +
 	// fallback path's text hits) and materialise them with one
 	// batched fetch. Empty IDs are tolerated — the batch lookup
@@ -1087,7 +1091,7 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 			return
 		}
 		node := nodeByID[id]
-		if node == nil || node.Kind == graph.KindFile || node.Kind == graph.KindImport {
+		if node == nil || node.Kind == graph.KindFile || node.Kind == graph.KindImport || !opts.searchAllows(node) {
 			return
 		}
 		if pos, ok := idx[id]; ok {
@@ -1136,7 +1140,7 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 			return nil
 		}
 		for _, n := range nameMatches {
-			if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+			if n.Kind == graph.KindFile || n.Kind == graph.KindImport || !opts.searchAllows(n) {
 				continue
 			}
 			if _, seen := idx[n.ID]; seen {
@@ -1171,7 +1175,12 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 		if fetch < limit {
 			fetch = limit
 		}
-		subMatches, err := graph.FindNodesByNameContainingContext(ctx, e.g, query, fetch)
+		subMatches, err := graph.FindNodesByNameContainingFilteredContext(ctx, e.g, query, fetch, graph.NameSearchFilter{
+			RepoAllow: opts.RepoAllow,
+			Accept: func(n *graph.Node) bool {
+				return n.Kind != graph.KindFile && n.Kind != graph.KindImport && opts.searchAllows(n)
+			},
+		})
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil
 		}
@@ -1287,9 +1296,20 @@ func substringScore(id, name string, kind graph.NodeKind, query, lower string) (
 }
 
 func (e *Engine) scanSubstringCandidates(query, lower string, limit int) ([]substringCandidate, error) {
+	return e.scanSubstringCandidatesScoped(context.Background(), query, lower, limit, QueryOptions{})
+}
+
+func (e *Engine) scanSubstringCandidatesScoped(ctx context.Context, query, lower string, limit int, opts QueryOptions) ([]substringCandidate, error) {
 	top := make(substringCandidateHeap, 0, limit)
-	err := graph.ScanNodeSearchKeys(context.Background(), e.g, substringSearchPageSize, func(page []graph.NodeSearchKey) bool {
+	err := graph.ScanNodeSearchKeys(ctx, e.g, substringSearchPageSize, func(page []graph.NodeSearchKey) bool {
 		for _, key := range page {
+			if ctx.Err() != nil {
+				return false
+			}
+			if !opts.searchAllows(&graph.Node{ID: key.ID, Kind: key.Kind, Name: key.Name, FilePath: key.FilePath,
+				RepoPrefix: key.RepoPrefix, WorkspaceID: key.WorkspaceID, ProjectID: key.ProjectID}) {
+				continue
+			}
 			score, ok := substringScore(key.ID, key.Name, key.Kind, query, lower)
 			if !ok {
 				continue
@@ -1318,6 +1338,10 @@ func (e *Engine) scanSubstringCandidates(query, lower string, limit int) ([]subs
 }
 
 func (e *Engine) hydrateSubstringCandidates(candidates []substringCandidate, query, lower string, limit int) []*graph.Node {
+	return e.hydrateSubstringCandidatesScoped(candidates, query, lower, limit, QueryOptions{})
+}
+
+func (e *Engine) hydrateSubstringCandidatesScoped(candidates []substringCandidate, query, lower string, limit int, opts QueryOptions) []*graph.Node {
 	ids := make([]string, len(candidates))
 	for i := range candidates {
 		ids[i] = candidates[i].id
@@ -1331,7 +1355,7 @@ func (e *Engine) hydrateSubstringCandidates(candidates []substringCandidate, que
 	hydrated := make([]hydratedCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
 		node := nodeByID[candidate.id]
-		if node == nil {
+		if node == nil || !opts.searchAllows(node) {
 			continue
 		}
 		score, ok := substringScore(node.ID, node.Name, node.Kind, query, lower)
@@ -1360,13 +1384,20 @@ func (e *Engine) hydrateSubstringCandidates(candidates []substringCandidate, que
 }
 
 func (e *Engine) searchSubstring(query string, limit int) []*graph.Node {
+	return e.searchSubstringScoped(context.Background(), query, limit, QueryOptions{})
+}
+
+func (e *Engine) searchSubstringScoped(ctx context.Context, query string, limit int, opts QueryOptions) []*graph.Node {
 	if limit <= 0 {
 		return nil
 	}
 	lower := strings.ToLower(query)
 	for attempt := 0; attempt < 2; attempt++ {
 		before, revisionKnown := nodeMutationRevision(e.g)
-		candidates, err := e.scanSubstringCandidates(query, lower, limit)
+		candidates, err := e.scanSubstringCandidatesScoped(ctx, query, lower, limit, opts)
+		if ctx.Err() != nil {
+			return nil
+		}
 		if err != nil {
 			// SearchSymbols cannot return an error. Preserve the Reader contract:
 			// unexpected storage failures must remain visible, not look like an
@@ -1376,7 +1407,10 @@ func (e *Engine) searchSubstring(query string, limit int) []*graph.Node {
 		if attempt == 0 && nodeMutationChanged(e.g, before, revisionKnown) {
 			continue
 		}
-		out := e.hydrateSubstringCandidates(candidates, query, lower, limit)
+		out := e.hydrateSubstringCandidatesScoped(candidates, query, lower, limit, opts)
+		if ctx.Err() != nil {
+			return nil
+		}
 		if attempt == 0 && nodeMutationChanged(e.g, before, revisionKnown) {
 			continue
 		}

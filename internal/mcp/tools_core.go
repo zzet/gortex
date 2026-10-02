@@ -1802,6 +1802,13 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	timings := &query.SearchTimings{}
 	phaseStart := time.Now()
 	scope := query.QueryOptions{WorkspaceID: scopeWS, ProjectID: scopeProj, RepoAllow: resolved.RepoAllow, SearchTimings: timings}
+	pathFilter := s.resolvePathFilter(req, fq)
+	if prefixes := normalizePathPrefixes(pathFilter); len(prefixes) > 0 {
+		scope.SymbolSearchStats = &query.SymbolSearchStats{}
+		scope.SearchNodeFilter = func(n *graph.Node) bool {
+			return pathMatchesAnyPrefix(repoRelativePath(n), prefixes)
+		}
+	}
 
 	// Keyword-soup defense: a degenerate boolean / OR-list query
 	// ("A OR B OR 'no access'") defeats ordinary retrieval. Detect it
@@ -2037,8 +2044,6 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			}
 		}
 	}
-	pathFilter := s.resolvePathFilter(req, fq)
-
 	// applyAllPostFilters runs the full post-search filter sequence
 	// (repo / kind / lang+path clauses / sub-path scope / corpus) over
 	// a candidate slice in the order the primary path uses it. Lifted
@@ -2078,7 +2083,8 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// Content sections live only in content_fts — this channel cannot
 	// rescue them, so a content-corpus wipeout skips the refetch.
 	fetchEscalated := false
-	if len(nodes) == 0 && candsAfterGather > 0 && q != "" && corpus != corpusContent {
+	pathUnderfilled := scope.SymbolSearchStats != nil && scope.SymbolSearchStats.TextSaturated && len(nodes) < offset+limit
+	if (len(nodes) == 0 && candsAfterGather > 0 || pathUnderfilled) && q != "" && corpus != corpusContent {
 		// The requested cursor window must be reachable: a shallow
 		// rescue that survives the filters but ends before offset+limit
 		// would slice to an empty later page (with no next cursor) even
@@ -2086,7 +2092,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		// best set so far and keeps escalating until the window is
 		// reachable or the corpus is exhausted.
 		want := offset + limit
-		prevDepth := 0
+		prevDepth := fetchLimit
 		for _, mult := range []int{5, 25} {
 			if ctx.Err() != nil {
 				break
@@ -2100,10 +2106,13 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			// The cap can collapse successive multipliers into the same
 			// effective depth — an identical re-query cannot change the
 			// outcome, so don't pay it twice.
-			if deepLimit == prevDepth {
+			if deepLimit <= prevDepth {
 				break
 			}
 			prevDepth = deepLimit
+			if scope.SymbolSearchStats != nil {
+				scope.SymbolSearchStats.TextSaturated = false
+			}
 			var refetched []*graph.Node
 			if len(expandedTerms) > 0 {
 				refetched, _ = fetchAndMergeBM25TimedContext(ctx, s.engineFor(ctx), q, expandedTerms, deepLimit, scope, timings)
@@ -2114,14 +2123,15 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 				return nil, err
 			}
 			kept := applyAllPostFilters(refetched)
-			if len(kept) > 0 {
+			if len(kept) > 0 && len(kept) >= len(nodes) {
 				nodes = kept
 				fetchEscalated = true
 			}
 			// Done when the window is reachable, or the corpus is
 			// exhausted — a short raw page means a deeper fetch cannot
 			// surface anything new.
-			if len(kept) >= want || len(refetched) < deepLimit {
+			textSaturated := scope.SymbolSearchStats != nil && scope.SymbolSearchStats.TextSaturated
+			if len(kept) >= want || len(refetched) < deepLimit && !textSaturated {
 				break
 			}
 		}
@@ -2136,7 +2146,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		return nil, err
 	}
 	if len(nodes) == 0 && q != "" && (kindArg != "" || flavorArg != "" || fq.hasFieldFilters()) {
-		relaxed := filterNodes(searchSymbolsScopedContext(ctx, s.engineFor(ctx), q, fetchLimit, scope), allowed)
+		relaxedScope := scope
+		relaxedScope.SearchNodeFilter = nil
+		relaxedScope.SymbolSearchStats = nil
+		relaxed := filterNodes(searchSymbolsScopedContext(ctx, s.engineFor(ctx), q, fetchLimit, relaxedScope), allowed)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -2412,6 +2425,8 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if total == 0 && len(resolved.RepoAllow) > 0 {
 		wide := scope
 		wide.RepoAllow = nil
+		wide.SearchNodeFilter = nil
+		wide.SymbolSearchStats = nil
 		wideNodes, _ := fetchAndMergeBM25TimedContext(ctx, s.engineFor(ctx), q, expandedTerms, offset+limit, wide, timings)
 		if err := ctx.Err(); err != nil {
 			return nil, err

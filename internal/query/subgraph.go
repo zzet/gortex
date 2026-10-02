@@ -144,6 +144,14 @@ type QueryOptions struct {
 	// soft breadth control inside any workspace boundary, not a
 	// replacement for caller-side workspace isolation.
 	RepoAllow map[string]bool `json:"repo_allow,omitempty"`
+	// SearchNodeFilter restricts symbol-search candidates before bounded ranking
+	// and supplementary fills. It sees compact scope fields only and must be a
+	// pure predicate. Traversal and by-ID scope policy remain in ScopeAllows.
+	SearchNodeFilter func(*graph.Node) bool `json:"-"`
+	// SymbolSearchStats, used by path-scoped searches, retains raw text-channel
+	// saturation across a fan-out. A filtered short page alone cannot prove
+	// that the backend is exhausted. The caller resets it before a deeper pass.
+	SymbolSearchStats *SymbolSearchStats `json:"-"`
 	// ExcludeTests, when true, drops edges originating in test code —
 	// nodes flagged by the indexer's test-edge pass (Node.Meta["is_test"]
 	// = true) plus unflagged node kinds whose file path matches the
@@ -338,6 +346,14 @@ func (o QueryOptions) ScopeAllows(n *graph.Node) bool {
 
 func (o QueryOptions) hasScopeFilter() bool {
 	return o.WorkspaceID != "" || len(o.RepoAllow) > 0
+}
+
+func (o QueryOptions) searchAllows(n *graph.Node) bool {
+	return n != nil && o.ScopeAllows(n) && (o.SearchNodeFilter == nil || o.SearchNodeFilter(n))
+}
+
+type SymbolSearchStats struct {
+	TextSaturated bool
 }
 
 // FilterByMinTier drops edges whose Origin rank is below minTier.
