@@ -11,11 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 type privateEdgeIndexLayout int
@@ -1866,11 +1866,11 @@ func privateRequireTempCap(tb testing.TB, limit int64, paths ...string) {
 
 func privateRequireFreeBytes(tb testing.TB, path string, want int64) {
 	tb.Helper()
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		tb.Fatalf("statfs %s: %v", path, err)
+	available, err := platform.DiskAvailBytes(path)
+	if err != nil {
+		tb.Fatalf("available disk bytes %s: %v", path, err)
 	}
-	free := int64(stat.Bavail) * int64(stat.Bsize)
+	free := int64(available)
 	if free < want {
 		tb.Skipf("need %d free bytes for bounded fixture, have %d", want, free)
 	}

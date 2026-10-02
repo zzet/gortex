@@ -8,16 +8,17 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // What a long log costs the reads and the edits.
@@ -435,13 +436,9 @@ func lcAwaitStartupWork(t *testing.T, s *Store) {
 
 func lcFreeDisk(t *testing.T, path string) int64 {
 	t.Helper()
-	var st syscall.Statfs_t
-	dir := path
-	if i := strings.LastIndexByte(path, '/'); i > 0 {
-		dir = path[:i]
-	}
-	require.NoError(t, syscall.Statfs(dir, &st))
-	return int64(st.Bavail) * int64(st.Bsize)
+	available, err := platform.DiskAvailBytes(filepath.Dir(path))
+	require.NoError(t, err)
+	return int64(available)
 }
 
 func lcEnvInt(name string, def int) int {
