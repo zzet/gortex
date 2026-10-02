@@ -2418,20 +2418,11 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			return nil, err
 		}
 	}
-	// A repo-narrowed zero is indistinguishable from "not indexed" in
-	// clients that never render _meta. Say it in the body — and since the
-	// result is empty anyway, pay one extra BM25 fetch to report whether
-	// widening would actually help.
+	// Make a narrowed zero visible to clients that never render _meta.
+	// Offer widening guidance without running another search or making
+	// claims about matches outside the active scope.
 	if total == 0 && len(resolved.RepoAllow) > 0 {
-		wide := scope
-		wide.RepoAllow = nil
-		wide.SearchNodeFilter = nil
-		wide.SymbolSearchStats = nil
-		wideNodes, _ := fetchAndMergeBM25TimedContext(ctx, s.engineFor(ctx), q, expandedTerms, offset+limit, wide, timings)
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		resp["scope_note"] = scopeZeroNote(resolved, len(wideNodes))
+		resp["scope_note"] = scopeZeroNote(resolved, -1)
 	}
 	if fetchEscalated {
 		resp["fetch_escalated"] = true
