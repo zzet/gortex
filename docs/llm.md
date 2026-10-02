@@ -24,6 +24,7 @@ The backend is chosen by the `llm.provider` key. Every provider except `local` i
 | `gemini` | Google Gemini `generateContent` REST | `GEMINI_API_KEY` |
 | `bedrock` | AWS Bedrock Converse API (SigV4-signed, no AWS SDK) | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`) |
 | `deepseek` | DeepSeek Chat Completions (OpenAI-compatible) | `DEEPSEEK_API_KEY` |
+| `requesty` | Requesty gateway (OpenAI-compatible, one key for many vendors) | `REQUESTY_API_KEY` |
 | _`<custom>`_ | any OpenAI-compatible endpoint | registered with `gortex provider add` — see [Custom providers](#custom-providers) |
 
 ## Configuration
@@ -33,7 +34,7 @@ The `llm:` block goes in `~/.gortex/config.yaml` or a per-repo `.gortex.yaml` (r
 ```yaml
 # ~/.gortex/config.yaml (or per-repo .gortex.yaml)
 llm:
-  provider: local            # local | anthropic | openai | azure | ollama | claudecli | codex | copilot | cursor | opencode | gemini | bedrock | deepseek | <custom>
+  provider: local            # local | anthropic | openai | azure | ollama | claudecli | codex | copilot | cursor | opencode | gemini | bedrock | deepseek | requesty | <custom>
   max_steps: 16              # agent tool-loop cap (provider-agnostic)
 
   local:                     # provider: local — requires a `-tags llama` build
@@ -108,6 +109,12 @@ llm:
     model: deepseek-chat
     api_key_env: DEEPSEEK_API_KEY
     # base_url: https://api.deepseek.com
+
+  requesty:                  # provider: requesty, OpenAI-compatible gateway (https://docs.requesty.ai)
+    model: openai/gpt-4o-mini   # vendor/model ids, e.g. anthropic/claude-sonnet-4-5, google/gemini-2.5-flash
+    api_key_env: REQUESTY_API_KEY   # key from https://app.requesty.ai/api-keys
+    # base_url: https://router.requesty.ai/v1   # EU: https://router.eu.requesty.ai/v1
+    # effort: high            # optional reasoning_effort, forwarded to models that support it
 
   routing:                   # optional — model routing for the `ask` agent
     enabled: false           # off by default; every run uses the provider's model

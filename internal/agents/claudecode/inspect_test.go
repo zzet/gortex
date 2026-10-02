@@ -32,7 +32,7 @@ func TestInspectSeesWhatApplyWrote(t *testing.T) {
 
 	after := Inspect(env.Home)
 	if !after.ConfigPresent {
-		t.Error("settings.local.json not seen after install")
+		t.Error("settings.json not seen after install")
 	}
 	if !after.MCPServer {
 		t.Error("mcpServers.gortex not seen after install")
@@ -53,7 +53,7 @@ func TestInspectSeesWhatApplyWrote(t *testing.T) {
 // someone else's hook, which would mask a missing Gortex one.
 func TestInspectIgnoresForeignHooks(t *testing.T) {
 	env, _ := agentstest.NewEnv(t)
-	path := userSettingsLocalPath(env.Home)
+	path := userSettingsPath(env.Home)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestInspectIgnoresForeignHooks(t *testing.T) {
 
 	state := Inspect(env.Home)
 	if !state.ConfigPresent {
-		t.Fatal("settings.local.json not seen")
+		t.Fatal("settings.json not seen")
 	}
 	if state.Hooks["SessionStart"] != 0 {
 		t.Errorf("counted a non-Gortex hook: %d", state.Hooks["SessionStart"])
@@ -74,7 +74,7 @@ func TestInspectIgnoresForeignHooks(t *testing.T) {
 // TestInspectSurvivesBrokenConfig — doctor exists to describe broken machines.
 func TestInspectSurvivesBrokenConfig(t *testing.T) {
 	env, _ := agentstest.NewEnv(t)
-	path := userSettingsLocalPath(env.Home)
+	path := userSettingsPath(env.Home)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestInspectDetectsPostToolUsePosture(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			env, _ := agentstest.NewEnv(t)
-			path := userSettingsLocalPath(env.Home)
+			path := userSettingsPath(env.Home)
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				t.Fatal(err)
 			}

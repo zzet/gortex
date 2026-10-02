@@ -38,6 +38,7 @@ import (
 	javalang "github.com/zzet/gortex/internal/parser/tsitter/java"
 	jslang "github.com/zzet/gortex/internal/parser/tsitter/javascript"
 	kotlinlang "github.com/zzet/gortex/internal/parser/tsitter/kotlin"
+	mqllang "github.com/zzet/gortex/internal/parser/tsitter/mql"
 	phplang "github.com/zzet/gortex/internal/parser/tsitter/php"
 	pylang "github.com/zzet/gortex/internal/parser/tsitter/python"
 	rubylang "github.com/zzet/gortex/internal/parser/tsitter/ruby"
@@ -435,6 +436,15 @@ func initSpecs() {
 		},
 		"cpp": {
 			grammarFn: cpplang.GetLanguage,
+			parents:   parents("function_definition", "template_function"),
+			findBody:  fieldFinder("body", "compound_statement"),
+			style:     stubBrace,
+		},
+		// MQL4 (build 600+) and MQL5 share the tree-sitter-mql5 grammar,
+		// a tree-sitter-cpp fork — same function_definition shape and
+		// brace-bodied bodies, so the cpp spec applies unchanged.
+		"mql": {
+			grammarFn: mqllang.GetLanguage,
 			parents:   parents("function_definition", "template_function"),
 			findBody:  fieldFinder("body", "compound_statement"),
 			style:     stubBrace,

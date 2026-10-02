@@ -46,7 +46,7 @@ Checkout removal and primary changes are destructive administration. Preview pri
 | `oh-my-pi`      | `.omp/mcp.json`                                                                                 | project    | https://github.com/can1357/oh-my-pi/blob/main/docs/mcp-config.md   |
 | `opencode`      | `opencode.json` (or existing `opencode.jsonc`) and `~/.config/opencode/opencode.json` MCP stanzas, `AGENTS.md` communities block, repo `.opencode/skills/gortex-*`, `~/.config/opencode/skills/gortex-*`, `~/.config/opencode/commands/gortex-*.md`, `~/.config/opencode/plugin/gortex.js` | both       | https://opencode.ai/docs/mcp                                        |
 | `openclaw`      | `~/.openclaw/openclaw.json` (`mcp.servers.gortex`)                                              | user       | https://docs.openclaw.ai/cli/mcp                                    |
-| `pi`            | `.pi/extensions/gortex/index.ts` (project) or `~/.pi/agent/extensions/gortex/index.ts`; `AGENTS.md` communities block only when `--skills` | both | https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md |
+| `pi`            | `.pi/settings.json` (`packages`) + `.pi/gortex.json` sidecar, or `~/.pi/agent/settings.json` + `~/.pi/agent/extensions/gortex.json`; `AGENTS.md` communities block only when `--skills` | both | https://github.com/gortexhq/pi#readme |
 | `vscode`        | `.vscode/mcp.json` (`servers` key, 1.102+), `.github/copilot-instructions.md` communities block | project    | https://code.visualstudio.com/docs/copilot/chat/mcp-servers         |
 | `windsurf`      | `~/.codeium/mcp_config.json`, `.windsurfrules` communities block                                | both       | https://docs.windsurf.com/plugins/cascade/mcp                       |
 | `zed`           | OS-specific `settings.json` (`context_servers`), `.rules` communities block                     | both       | https://zed.dev/docs/ai/mcp                                         |
@@ -86,7 +86,7 @@ The gaps are the hosts', not ours:
   request as superseded by skills.
 - **OpenCode has no lifecycle-hook configuration at all.** Its only
   extension point is a JS/TS plugin, so Gortex installs one that speaks
-  the same bridge protocol the Pi extension uses. It goes to the
+  the same bridge protocol the `pi-gortex` package uses. It goes to the
   user-level plugin directory rather than the repo: it is the only
   executable artifact Gortex writes, and the repo-level directory is
   committed.
@@ -268,7 +268,7 @@ The primary integration, split across the two commands.
 **`gortex install` (user-level, once per machine)** writes:
 
 - `~/.claude.json` — MCP stanza pointing at `gortex mcp`
-- `~/.claude/settings.local.json` — user-level Claude Code hooks
+- `~/.claude/settings.json` — user-level Claude Code hooks
   (unless `--no-hooks`)
 - `~/.claude/skills/gortex-*/SKILL.md` — curated tool-usage skills
   (`gortex-guide`, `gortex-explore`, `gortex-debug`, `gortex-impact`,
@@ -523,18 +523,18 @@ under `mcp.servers.<name>`.
 
 ### pi
 
-**Pi has no MCP support — by design**, so instead of an `mcpServers`
-stanza this adapter ships a self-contained TypeScript extension at
-`.pi/extensions/gortex/index.ts` (project) or
-`~/.pi/agent/extensions/gortex/index.ts` (global). The extension is a
-thin MCP client of its own: it spawns one persistent `gortex mcp`
-child per session, registers the daemon's tool surface natively, 
-and re-creates the same read-discipline enforcement the other
-agents get.
+**Pi has no MCP support, by design**, so instead of an `mcpServers`
+stanza the bridge is a Pi package:
+[`pi-gortex`](https://github.com/gortexhq/pi). It is a thin MCP client of
+its own, spawning one persistent `gortex mcp` child per session,
+registering the daemon's tool surface as native Pi tools, and re-creating
+the same read-discipline enforcement the other agents get. It is
+versioned and released independently of the gortex binary, and `pi
+update` moves it.
 
-**Project-local extensions require a one-time trust confirmation** the
-first time Pi opens the repo — nothing the installer can do beyond
-writing the file.
+**Project-local settings require a one-time trust confirmation** the first
+time Pi opens the repo, and Pi installs the package itself on the next
+startup after that. Nothing the installer can do beyond writing the entry.
 
 ### vscode
 

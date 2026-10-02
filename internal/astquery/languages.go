@@ -11,6 +11,7 @@ import (
 	javalang "github.com/zzet/gortex/internal/parser/tsitter/java"
 	jslang "github.com/zzet/gortex/internal/parser/tsitter/javascript"
 	kotlinlang "github.com/zzet/gortex/internal/parser/tsitter/kotlin"
+	mqllang "github.com/zzet/gortex/internal/parser/tsitter/mql"
 	phplang "github.com/zzet/gortex/internal/parser/tsitter/php"
 	pylang "github.com/zzet/gortex/internal/parser/tsitter/python"
 	rubylang "github.com/zzet/gortex/internal/parser/tsitter/ruby"
@@ -54,6 +55,11 @@ func DefaultLanguageResolver(name string) *sitter.Language {
 		return javalang.GetLanguage()
 	case "kotlin":
 		return kotlinlang.GetLanguage()
+	case "mql":
+		// MQL4 (build 600+) and MQL5 share the tree-sitter-mql5 grammar,
+		// which is tree-sitter-cpp plus MQL5 rule extensions — cpp-shaped
+		// patterns (call_expression, function_definition, …) apply as-is.
+		return mqllang.GetLanguage()
 	case "scala":
 		return scalalang.GetLanguage()
 	case "rust":

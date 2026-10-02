@@ -221,6 +221,7 @@ func renderEnvPins(home string) map[string]string {
 
 		"CLAUDE_CONFIG_DIR":           "",
 		"KIMI_CODE_HOME":              "",
+		"PI_CODING_AGENT_DIR":         "",
 		"GORTEX_CODEX_HOOK_MODE":      "",
 		"GORTEX_INSTRUCTIONS_PROFILE": "",
 		"XDG_CONFIG_HOME":             "",

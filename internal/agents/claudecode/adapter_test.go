@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -171,7 +172,6 @@ func TestClaudeCodeGlobalModeWritesUserFiles(t *testing.T) {
 	expected := []string{
 		filepath.Join(env.Home, ".claude.json"),
 		filepath.Join(env.Home, ".claude", "settings.json"),
-		filepath.Join(env.Home, ".claude", "settings.local.json"),
 	}
 	for name := range SlashCommands {
 		expected = append(expected, filepath.Join(env.Home, ".claude", "commands", name))
@@ -245,7 +245,6 @@ func TestClaudeCodeGlobalModeHonorsClaudeConfigDir(t *testing.T) {
 	expected := []string{
 		filepath.Join(configDir, ".claude.json"),
 		filepath.Join(configDir, "settings.json"),
-		filepath.Join(configDir, "settings.local.json"),
 		filepath.Join(configDir, "CLAUDE.md"),
 	}
 	for name := range SlashCommands {
@@ -392,9 +391,9 @@ func TestClaudeCodeRemoveGlobal(t *testing.T) {
 		t.Errorf("settings.json still allows mcp__gortex__:\n%s", settings)
 	}
 
-	// settings.local.json: gortex hooks gone.
-	if local, _ := os.ReadFile(filepath.Join(configDir, "settings.local.json")); strings.Contains(string(local), "gortex") {
-		t.Errorf("settings.local.json still references gortex:\n%s", local)
+	// settings.json: gortex hooks gone too.
+	if settings, _ := os.ReadFile(filepath.Join(configDir, "settings.json")); strings.Contains(string(settings), "gortex") {
+		t.Errorf("settings.json still references gortex:\n%s", settings)
 	}
 
 	// .claude.json: gortex server gone, the user's other server kept.
@@ -546,5 +545,149 @@ func TestProjectModeWritesMCPWhenNoUserScope(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(env.Root, ".mcp.json")); err != nil {
 		t.Errorf("project .mcp.json should be written when no user-scope entry exists: %v", err)
+	}
+}
+
+// TestClaudeCodeGlobalHooksLandInUserSettings pins where the user-level hooks
+// go. Claude Code loads user-scope settings from ~/.claude/settings.json;
+// settings.local.json is only read as a project file, so hooks written to
+// ~/.claude/settings.local.json never run (#840).
+func TestClaudeCodeGlobalHooksLandInUserSettings(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	env.Mode = agents.ModeGlobal
+	env.InstallHooks = true
+
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	userSettings, _ := os.ReadFile(filepath.Join(env.Home, ".claude", "settings.json"))
+	if !strings.Contains(string(userSettings), `"hooks"`) || !strings.Contains(string(userSettings), "gortex") {
+		t.Errorf("user-level hooks missing from ~/.claude/settings.json:\n%s", userSettings)
+	}
+	if local, err := os.ReadFile(filepath.Join(env.Home, ".claude", "settings.local.json")); err == nil &&
+		strings.Contains(string(local), `"hooks"`) {
+		t.Errorf("user-level hooks written to ~/.claude/settings.local.json, which is never loaded as user settings:\n%s", local)
+	}
+}
+
+// TestInspectReadsHooksFromUserSettings keeps doctor on the file the host
+// loads: hooks only in settings.local.json must not read as configured.
+func TestInspectReadsHooksFromUserSettings(t *testing.T) {
+	body := `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/usr/local/bin/gortex hook"}]}]}}`
+	write := func(t *testing.T, home, name string) {
+		t.Helper()
+		dir := filepath.Join(home, ".claude")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("settings.json is counted", func(t *testing.T) {
+		env, _ := agentstest.NewEnv(t)
+		write(t, env.Home, "settings.json")
+		if got := Inspect(env.Home).Hooks["SessionStart"]; got != 1 {
+			t.Errorf("SessionStart hooks in settings.json = %d, want 1", got)
+		}
+	})
+	t.Run("settings.local.json is not counted", func(t *testing.T) {
+		env, _ := agentstest.NewEnv(t)
+		write(t, env.Home, "settings.local.json")
+		if got := Inspect(env.Home).Hooks["SessionStart"]; got != 0 {
+			t.Errorf("SessionStart hooks in settings.local.json = %d, want 0 (never loaded as user settings)", got)
+		}
+	})
+}
+
+// TestRemoveGlobalCleansLegacyLocalHooks: installs from before #840 left hooks
+// in ~/.claude/settings.local.json; uninstall must still remove them.
+func TestRemoveGlobalCleansLegacyLocalHooks(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	env.Mode = agents.ModeGlobal
+	env.InstallHooks = true
+	a := New()
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	dir := filepath.Join(env.Home, ".claude")
+	legacy := filepath.Join(dir, "settings.local.json")
+	if err := os.WriteFile(legacy, []byte(legacyLocalHooks), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := GlobalArtifacts(env.Home); !slices.Contains(got, legacy) {
+		t.Errorf("GlobalArtifacts should list the legacy file, got %v", got)
+	}
+	if _, failures := a.RemoveGlobal(env, agents.ApplyOpts{}); len(failures) != 0 {
+		t.Fatalf("RemoveGlobal failures: %v", failures)
+	}
+	for _, name := range []string{"settings.json", "settings.local.json"} {
+		if b, _ := os.ReadFile(filepath.Join(dir, name)); strings.Contains(string(b), "gortex hook") {
+			t.Errorf("%s still carries a gortex hook:\n%s", name, b)
+		}
+	}
+}
+
+const legacyLocalHooks = `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/old/bin/gortex hook"}]}]}}`
+
+// TestApplyGlobalMigratesLegacyLocalHooks: re-running install after upgrading
+// moves the hooks out of settings.local.json so a session rooted at $HOME
+// does not load them twice.
+func TestApplyGlobalMigratesLegacyLocalHooks(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	env.Mode = agents.ModeGlobal
+	env.InstallHooks = true
+	dir := filepath.Join(env.Home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "settings.local.json"), []byte(legacyLocalHooks), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "settings.local.json")); strings.Contains(string(b), "gortex") {
+		t.Errorf("legacy hooks left in settings.local.json:\n%s", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "settings.json")); !strings.Contains(string(b), "gortex") {
+		t.Errorf("hooks missing from settings.json:\n%s", b)
+	}
+}
+
+// TestRemoveGlobalCountsSettingsOnce: permissions and hooks share
+// settings.json, which must count as one removed artifact, and a user-owned
+// entry that merely mentions gortex is neither listed nor removed.
+func TestRemoveGlobalCountsSettingsOnce(t *testing.T) {
+	env, _ := agentstest.NewEnv(t)
+	env.Mode = agents.ModeGlobal
+	env.InstallHooks = true
+	dir := filepath.Join(env.Home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settings := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(settings, []byte(`{"permissions":{"allow":["Bash(gortex status)"]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := GlobalArtifacts(env.Home); slices.Contains(got, settings) {
+		t.Errorf("user-owned entry should not be listed, got %v", got)
+	}
+	a := New()
+	if _, err := a.Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	artifacts := GlobalArtifacts(env.Home)
+	removed, failures := a.RemoveGlobal(env, agents.ApplyOpts{})
+	if len(failures) != 0 {
+		t.Fatalf("RemoveGlobal failures: %v", failures)
+	}
+	if removed != len(artifacts) {
+		t.Errorf("RemoveGlobal removed %d, GlobalArtifacts listed %d: %v", removed, len(artifacts), artifacts)
+	}
+	if b, _ := os.ReadFile(settings); !strings.Contains(string(b), "Bash(gortex status)") {
+		t.Errorf("user-owned entry was removed:\n%s", b)
 	}
 }

@@ -132,7 +132,7 @@ type CompletionResponse struct {
 type Provider interface {
 	// Name returns the provider's short identifier — one of "local",
 	// "anthropic", "openai", "ollama", "claudecli", "codex", "gemini",
-	// "bedrock", "deepseek". Used to pick the prompt tier (see
+	// "bedrock", "deepseek", "requesty". Used to pick the prompt tier (see
 	// PromptProfile) and for diagnostics.
 	Name() string
 	// Complete runs one single-turn completion, honouring req.Shape

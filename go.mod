@@ -221,10 +221,11 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/coder/hnsw v0.6.1
+	github.com/davalillo/tree-sitter-mql5 v0.2.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/fwcd/tree-sitter-kotlin v0.0.0-20260411204054-55622a49bd59
 	github.com/gofrs/flock v0.13.1
-	github.com/gomlx/go-huggingface v0.4.8
+	github.com/gomlx/go-huggingface v0.4.12
 	github.com/google/go-github/v88 v88.0.0
 	github.com/google/renameio v1.0.1
 	github.com/google/uuid v1.6.0
@@ -238,9 +239,9 @@ require (
 	github.com/gortexhq/tree-sitter-swift v0.1.1-0.20260424235305-8dde3a3327dd
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/jedib0t/go-pretty/v6 v6.8.3
-	github.com/knights-analytics/hugot v0.7.8
+	github.com/knights-analytics/hugot v0.8.0
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
-	github.com/mark3labs/mcp-go v1.0.0
+	github.com/mark3labs/mcp-go v1.1.1
 	github.com/muesli/termenv v0.16.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/pkoukk/tiktoken-go v0.1.8
@@ -267,8 +268,8 @@ require (
 	github.com/tree-sitter/tree-sitter-html v0.23.2
 	github.com/tree-sitter/tree-sitter-java v0.23.5
 	github.com/tree-sitter/tree-sitter-javascript v0.25.0
-	github.com/tree-sitter/tree-sitter-ocaml v0.25.0
-	github.com/tree-sitter/tree-sitter-php v0.24.2
+	github.com/tree-sitter/tree-sitter-ocaml v0.26.0
+	github.com/tree-sitter/tree-sitter-php v0.25.0
 	github.com/tree-sitter/tree-sitter-python v0.25.0
 	github.com/tree-sitter/tree-sitter-ruby v0.23.1
 	github.com/tree-sitter/tree-sitter-rust v0.24.2
@@ -285,8 +286,8 @@ require (
 	golang.org/x/text v0.42.0
 	golang.org/x/tools v0.50.0
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/libc v1.75.6
-	modernc.org/sqlite v1.58.0
+	modernc.org/libc v1.75.7
+	modernc.org/sqlite v1.59.0
 	pgregory.net/rapid v1.3.0
 )
 
@@ -305,12 +306,12 @@ require (
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
-	github.com/gomlx/compute v0.1.11 // indirect
-	github.com/gomlx/compute-onnx v0.1.10 // indirect
+	github.com/gomlx/compute v0.1.14 // indirect
+	github.com/gomlx/compute-onnx v0.1.13 // indirect
 	github.com/gomlx/exceptions v0.0.3 // indirect
-	github.com/gomlx/go-xla v0.4.10 // indirect
-	github.com/gomlx/gomlx v0.28.13 // indirect
-	github.com/gomlx/onnx-gomlx v0.5.5 // indirect
+	github.com/gomlx/go-xla v0.4.13 // indirect
+	github.com/gomlx/gomlx v0.28.16 // indirect
+	github.com/gomlx/onnx-gomlx v0.5.13 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
@@ -323,6 +324,7 @@ require (
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.27 // indirect
+	github.com/microsoft/onnxruntime/go v0.0.0-20260922015325-62e95311b771 // indirect
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect

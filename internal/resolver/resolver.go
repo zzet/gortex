@@ -4062,6 +4062,13 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 	}
 	importPath := spec[:sep]
 	symbol := spec[sep+2:]
+	callerRepo := r.callerRepoPrefix(e)
+
+	// Python absolute imports carry a dotted module path, which the
+	// directory match below cannot read — see python_absolute_imports.go.
+	if r.resolvePythonModuleExtern(e, importPath, symbol, callerRepo, stats) {
+		return
+	}
 	goOwnership := r.goImportGateForEdge(e, importPath)
 
 	// Pass 1: does the symbol live in a file under this import path?
@@ -4069,7 +4076,6 @@ func (r *Resolver) resolveExtern(e *graph.Edge, spec string, stats *ResolveStats
 	// cachedFindNodesByName lands in the per-pass batch cache for
 	// the common worker hot path; falls through to the store when
 	// called outside ResolveAll.
-	callerRepo := r.callerRepoPrefix(e)
 	candidates, lookupErr := r.cachedFindExternNodesByName(symbol, e)
 	if lookupErr != nil {
 		r.logger.Warn("resolver: extern candidate lookup failed",

@@ -141,7 +141,7 @@ from](#what-gortex-does-not-protect-you-from) for what this boundary is not.
   - **LLM providers** (`llm.provider`): the `ask` agent and `search_symbols`
     assist modes can call an LLM. The default provider is `local` (in-process,
     no network). When configured for a hosted provider (Anthropic, OpenAI, Azure
-    OpenAI, Google Gemini, AWS Bedrock, DeepSeek, or a remote Ollama) or a
+    OpenAI, Google Gemini, AWS Bedrock, DeepSeek, Requesty, or a remote Ollama) or a
     subprocess CLI provider (Claude, Codex, Copilot, Cursor, opencode), prompts
     **derived from your source code** are sent to that endpoint or third-party
     tool. No provider is configured by default, and `ask` / assist stay disabled

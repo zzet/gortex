@@ -9,7 +9,7 @@
 //   - ~/.claude/skills/gortex-*    (user-level skills)
 //
 // Global mode additionally writes ~/.claude.json (user-level MCP
-// stanza) and ~/.claude/settings.local.json (user-level hooks).
+// stanza) and ~/.claude/settings.json (user-level hooks).
 //
 // The content comes from the parent agents package; the names below are
 // this package's handles on it, spelled the way Claude Code's artifacts

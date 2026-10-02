@@ -29,8 +29,9 @@ type Config struct {
 	// "openai", "ollama", "claudecli" (subprocess against the
 	// user's `claude` binary), "codex" (subprocess against the
 	// user's OpenAI `codex` binary), "gemini" (Google Gemini REST
-	// API), "bedrock" (AWS Bedrock Converse API, SigV4-signed) or
-	// "deepseek" (DeepSeek Chat Completions, OpenAI-compatible).
+	// API), "bedrock" (AWS Bedrock Converse API, SigV4-signed),
+	// "deepseek" (DeepSeek Chat Completions, OpenAI-compatible) or
+	// "requesty" (Requesty gateway, OpenAI-compatible).
 	// Empty defaults to "local".
 	Provider string `mapstructure:"provider" yaml:"provider,omitempty"`
 
@@ -63,6 +64,10 @@ type Config struct {
 	// DeepSeek configures the hosted DeepSeek Chat Completions
 	// provider (api.deepseek.com, OpenAI-compatible wire format).
 	DeepSeek RemoteConfig `mapstructure:"deepseek" yaml:"deepseek,omitempty"`
+	// Requesty configures the hosted Requesty gateway provider
+	// (router.requesty.ai, OpenAI-compatible wire format). Model ids
+	// carry a vendor prefix, e.g. "openai/gpt-4o-mini".
+	Requesty RemoteConfig `mapstructure:"requesty" yaml:"requesty,omitempty"`
 	// Codex configures the OpenAI Codex CLI subprocess provider.
 	Codex CodexConfig `mapstructure:"codex" yaml:"codex,omitempty"`
 	// Copilot configures the GitHub Copilot CLI subprocess provider
@@ -398,6 +403,10 @@ const (
 	defaultDeepSeekModel   = "deepseek-chat"
 	defaultDeepSeekBaseURL = "https://api.deepseek.com"
 	defaultDeepSeekKeyEnv  = "DEEPSEEK_API_KEY"
+
+	defaultRequestyModel   = "openai/gpt-4o-mini"
+	defaultRequestyBaseURL = "https://router.requesty.ai/v1"
+	defaultRequestyKeyEnv  = "REQUESTY_API_KEY"
 )
 
 // builtinProviders is the set of reserved provider names — the ones
@@ -407,7 +416,7 @@ var builtinProviders = map[string]bool{
 	"local": true, "anthropic": true, "openai": true, "azure": true,
 	"ollama": true, "claudecli": true, "codex": true, "copilot": true,
 	"cursor": true, "opencode": true, "gemini": true, "bedrock": true,
-	"deepseek": true,
+	"deepseek": true, "requesty": true,
 }
 
 // IsBuiltinProvider reports whether name is a reserved built-in provider
@@ -455,6 +464,8 @@ func (c Config) ActiveModel() string {
 		return c.Bedrock.ModelID
 	case "deepseek":
 		return c.DeepSeek.Model
+	case "requesty":
+		return c.Requesty.Model
 	default:
 		if cp, ok := c.Custom[c.ProviderName()]; ok {
 			return cp.Model
@@ -496,6 +507,8 @@ func (c Config) WithModel(model string) Config {
 		c.Bedrock.ModelID = model
 	case "deepseek":
 		c.DeepSeek.Model = model
+	case "requesty":
+		c.Requesty.Model = model
 	default:
 		// For a custom provider, copy-on-write the Custom map so routing
 		// (which derives per-request configs via WithModel) never
@@ -540,6 +553,8 @@ func (c Config) IsEnabled() bool {
 		return strings.TrimSpace(c.Bedrock.ModelID) != ""
 	case "deepseek":
 		return strings.TrimSpace(c.DeepSeek.Model) != ""
+	case "requesty":
+		return strings.TrimSpace(c.Requesty.Model) != ""
 	default:
 		// A registered custom OpenAI-compatible provider is enabled
 		// once it carries a model; the API key (if any) is validated at
@@ -590,6 +605,8 @@ func (c Config) MergeEnv() Config {
 			c.Bedrock.ModelID = v
 		case "deepseek":
 			c.DeepSeek.Model = v
+		case "requesty":
+			c.Requesty.Model = v
 		default:
 			c.Local.Model = v
 		}
@@ -637,6 +654,8 @@ func (c Config) MergeEnv() Config {
 			c.Gemini.Effort = v
 		case "deepseek":
 			c.DeepSeek.Effort = v
+		case "requesty":
+			c.Requesty.Effort = v
 		}
 	}
 	if v := os.Getenv("GORTEX_LLM_CTX"); v != "" {
@@ -776,6 +795,17 @@ func (c Config) ApplyDefaults() Config {
 		c.DeepSeek.BaseURL = defaultDeepSeekBaseURL
 	}
 
+	// requesty
+	if c.Requesty.Model == "" {
+		c.Requesty.Model = defaultRequestyModel
+	}
+	if c.Requesty.APIKeyEnv == "" {
+		c.Requesty.APIKeyEnv = defaultRequestyKeyEnv
+	}
+	if c.Requesty.BaseURL == "" {
+		c.Requesty.BaseURL = defaultRequestyBaseURL
+	}
+
 	return c
 }
 
@@ -800,6 +830,7 @@ func (c Config) MergedWith(fb Config) Config {
 	c.Gemini = c.Gemini.mergedWith(fb.Gemini)
 	c.Bedrock = c.Bedrock.mergedWith(fb.Bedrock)
 	c.DeepSeek = c.DeepSeek.mergedWith(fb.DeepSeek)
+	c.Requesty = c.Requesty.mergedWith(fb.Requesty)
 	c.Codex = c.Codex.mergedWith(fb.Codex)
 	c.Copilot = c.Copilot.mergedWith(fb.Copilot)
 	c.Cursor = c.Cursor.mergedWith(fb.Cursor)

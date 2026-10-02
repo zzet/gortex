@@ -39,6 +39,7 @@ The core registry (`internal/semantic/lsp/registry.go`):
 | `elixir-ls`                  | `elixir-ls`                      | elixir                      | 5                |
 | `ocamllsp`                   | `ocamllsp`                       | ocaml                       | 5                |
 | `zls`                        | `zls`                            | zig                         | 5                |
+| `mql-lsp-server`             | `mql-lsp-server`                 | mql                         | 5                |
 
 Several specs declare `AlternativeCommands` — Gortex picks the first
 binary on `PATH`:
@@ -148,6 +149,20 @@ opam install ocaml-lsp-server
 
 # Zig
 brew install zls
+
+# MQL4/MQL5 (pick one)
+# Standalone binary from GitHub Releases (no .NET runtime needed, recommended).
+# Pinned to a tagged release with SHA256 verification — never install from
+# releases/latest (that silently tracks whatever shipped last):
+wget https://github.com/davalillo/mql-language-server/releases/download/v2.4.2/CHECKSUMS.txt \
+     https://github.com/davalillo/mql-language-server/releases/download/v2.4.2/mql-lsp-server-linux-x64
+sha256sum -c --ignore-missing CHECKSUMS.txt
+chmod +x mql-lsp-server-linux-x64 && sudo mv mql-lsp-server-linux-x64 /usr/local/bin/mql-lsp-server
+# Releases also ship mql-lsp-server-{linux-arm64,osx-arm64,osx-x64,win-arm64,win-x64.exe}:
+# swap the asset name, then the binary name, to match your platform.
+# Upgrading: bump the tag (and its checksums) deliberately with the same commands.
+# or as a .NET global tool (requires .NET 10):
+dotnet tool install -g mql-language-server --version 2.4.2
 ```
 
 Verify with `gortex daemon status` — the `lsp` row reports `alive`

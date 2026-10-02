@@ -1,7 +1,6 @@
 package pi
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,18 +10,34 @@ import (
 	"github.com/zzet/gortex/internal/agents/agentstest"
 )
 
-// readExtension returns the rendered extension file content for the env.
-func writeAndRead(t *testing.T, env agents.Env) string {
+// defaultPostureEnv returns an env whose every posture is the package's
+// own default, so the adapter has nothing to write into a sidecar.
+// NewEnv's HookCommand names an off-PATH binary on purpose, which is a
+// non-default; the tests that want no sidecar clear it here.
+func defaultPostureEnv(t *testing.T) agents.Env {
 	t.Helper()
-	a := New()
-	if _, err := a.Apply(env, agents.ApplyOpts{ForceDetect: true}); err != nil {
-		t.Fatalf("apply: %v", err)
+	env, _ := agentstest.NewEnv(t)
+	env.HookCommand = defaultBin + " hook"
+	mkPiDir(t, env.Root)
+	return env
+}
+
+func mkPiDir(t *testing.T, root string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, ".pi"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	data, err := os.ReadFile(extensionPath(env))
-	if err != nil {
-		t.Fatalf("read extension: %v", err)
+}
+
+// packagesOf reads the `packages` array out of a settings file.
+func packagesOf(t *testing.T, path string) []any {
+	t.Helper()
+	root := agentstest.ReadJSON(t, path)
+	list, ok := root["packages"].([]any)
+	if !ok {
+		t.Fatalf("%s: packages is %T, want an array", path, root["packages"])
 	}
-	return string(data)
+	return list
 }
 
 func TestPiDetect(t *testing.T) {
@@ -30,9 +45,7 @@ func TestPiDetect(t *testing.T) {
 		env, _ := agentstest.NewEnv(t)
 		// NewEnv's Home is a fresh temp dir with no .pi, so detection
 		// hinges on the project marker (PATH may or may not have pi).
-		if err := os.MkdirAll(filepath.Join(env.Root, ".pi"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		mkPiDir(t, env.Root)
 		ok, err := New().Detect(env)
 		if err != nil || !ok {
 			t.Fatalf("expected detect=true with .pi/, got %v (err %v)", ok, err)
@@ -51,11 +64,9 @@ func TestPiDetect(t *testing.T) {
 	})
 }
 
-func TestPiApplyWritesExtensionAndRouting(t *testing.T) {
+func TestPiApplyDeclaresPackageAndRouting(t *testing.T) {
 	env, _ := agentstest.NewEnv(t) // NewEnv seeds SkillsRouting → routing block written.
-	if err := os.MkdirAll(filepath.Join(env.Root, ".pi"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	mkPiDir(t, env.Root)
 
 	a := New()
 	res, err := a.Apply(env, agents.ApplyOpts{})
@@ -66,32 +77,13 @@ func TestPiApplyWritesExtensionAndRouting(t *testing.T) {
 		t.Fatalf("expected detected+configured, got %+v", res)
 	}
 
-	// Extension written.
-	ext := filepath.Join(env.Root, ".pi", "extensions", "gortex", "index.ts")
-	data, err := os.ReadFile(ext)
-	if err != nil {
-		t.Fatalf("extension not written: %v", err)
-	}
-	src := string(data)
-
-	// Sentinels must be fully substituted — no template left behind.
-	for _, sentinel := range []string{sentinelBin, sentinelArgv, sentinelEnforce, sentinelInstructions} {
-		if strings.Contains(src, sentinel) {
-			t.Errorf("unsubstituted sentinel %q remains in extension", sentinel)
-		}
-	}
-	// NewEnv sets InstallHooks=true → ENFORCE true.
-	if !strings.Contains(src, "const ENFORCE: boolean = true;") {
-		t.Errorf("expected ENFORCE true with InstallHooks=true")
-	}
-	// argv must carry the pi agent flag.
-	if !strings.Contains(src, `"--agent=pi"`) {
-		t.Errorf("expected --agent=pi in hook argv; got source without it")
+	list := packagesOf(t, filepath.Join(env.Root, ".pi", "settings.json"))
+	if len(list) != 1 || list[0] != PackageSpec {
+		t.Fatalf("packages = %v, want [%s]", list, PackageSpec)
 	}
 
-	// AGENTS.md carries the community-routing block — but NOT the
-	// read-discipline rules: those are injected by the extension at runtime,
-	// not persisted to an instructions file (mirrors opencode).
+	// AGENTS.md carries the community-routing block, but NOT the
+	// read-discipline rules: the package injects those at runtime.
 	agentsMd, err := os.ReadFile(filepath.Join(env.Root, "AGENTS.md"))
 	if err != nil {
 		t.Fatalf("AGENTS.md not written: %v", err)
@@ -100,22 +92,18 @@ func TestPiApplyWritesExtensionAndRouting(t *testing.T) {
 		t.Errorf("AGENTS.md missing communities block")
 	}
 	if strings.Contains(string(agentsMd), agents.InstructionsSentinel) {
-		t.Errorf("AGENTS.md must NOT carry the read-discipline rules block — the extension injects them at runtime")
+		t.Errorf("AGENTS.md must NOT carry the read-discipline rules block; the package injects them at runtime")
 	}
 
-	// Idempotent re-run.
 	agentstest.AssertIdempotent(t, a, env)
 }
 
-// Without skills routing, the adapter writes the extension only and never
-// touches AGENTS.md — the read-discipline rules ride the extension's
-// `context` hook, so there's nothing to persist to an instructions file.
+// Without skills routing the adapter never touches AGENTS.md: the
+// read-discipline rules ride the package, so there is nothing to persist
+// to an instructions file.
 func TestPiApplyNoSkillsLeavesAgentsMdUntouched(t *testing.T) {
-	env, _ := agentstest.NewEnv(t)
+	env := defaultPostureEnv(t)
 	env.SkillsRouting = ""
-	if err := os.MkdirAll(filepath.Join(env.Root, ".pi"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -124,58 +112,164 @@ func TestPiApplyNoSkillsLeavesAgentsMdUntouched(t *testing.T) {
 	}
 }
 
-func TestPiNoHooksDisablesEnforcement(t *testing.T) {
-	env, _ := agentstest.NewEnv(t)
-	env.InstallHooks = false
-	if err := os.MkdirAll(filepath.Join(env.Root, ".pi"), 0o755); err != nil {
-		t.Fatal(err)
+// An install that changes nothing leaves no sidecar: the package applies
+// the same defaults, so a file restating them is noise in a repo teams
+// commit.
+func TestPiDefaultPostureWritesNoSidecar(t *testing.T) {
+	env := defaultPostureEnv(t)
+	res, err := New().Apply(env, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
 	}
-	src := writeAndRead(t, env)
-	if !strings.Contains(src, "const ENFORCE: boolean = false;") {
-		t.Errorf("expected ENFORCE false with InstallHooks=false")
+	sidecar := filepath.Join(env.Root, ".pi", "gortex.json")
+	if _, err := os.Stat(sidecar); err == nil {
+		t.Errorf("expected no sidecar for an all-default install, found %s", sidecar)
 	}
-	// Tools are still registered regardless of enforcement.
-	if !strings.Contains(src, "registerGortexTools") {
-		t.Errorf("tool registration should remain present with --no-hooks")
+	for _, f := range res.Files {
+		if f.Path == sidecar {
+			t.Errorf("all-default install reported an action on the sidecar: %s", f.Action)
+		}
 	}
 }
 
-func TestPiEnrichModeAppendsModeFlag(t *testing.T) {
-	env, _ := agentstest.NewEnv(t)
+func TestPiSidecarCarriesNonDefaults(t *testing.T) {
+	env := defaultPostureEnv(t)
 	env.HookMode = "enrich"
-	if err := os.MkdirAll(filepath.Join(env.Root, ".pi"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	var sawEnrich bool
-	for _, arg := range parseArgv(t, writeAndRead(t, env)) {
-		if arg == "--mode=enrich" {
-			sawEnrich = true
-		}
-	}
-	if !sawEnrich {
-		t.Errorf("expected --mode=enrich in hook argv for enrich posture")
+	env.InstallHooks = false
+
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
 	}
 
-	// Default (deny) posture must NOT append a --mode flag to the argv.
-	// (Check the parsed argv, not the raw source — the template's doc
-	// comment legitimately mentions "--mode=<mode>".)
-	env2, _ := agentstest.NewEnv(t)
-	if err := os.MkdirAll(filepath.Join(env2.Root, ".pi"), 0o755); err != nil {
+	cfg := agentstest.ReadJSON(t, filepath.Join(env.Root, ".pi", "gortex.json"))
+	if cfg["hook_mode"] != "enrich" {
+		t.Errorf("hook_mode = %v, want enrich", cfg["hook_mode"])
+	}
+	if cfg["enforce"] != false {
+		t.Errorf("enforce = %v, want false", cfg["enforce"])
+	}
+	// The deny posture rides as an absent key, and a PATH-resolvable
+	// binary needs no pin.
+	if _, ok := cfg["bin"]; ok {
+		t.Errorf("bin should be absent when a bare %q resolves to the same binary, got %v", defaultBin, cfg["bin"])
+	}
+}
+
+// An off-PATH binary is pinned, because the agent's PATH is frequently
+// not the shell's.
+func TestPiSidecarPinsOffPathBinary(t *testing.T) {
+	env := defaultPostureEnv(t)
+	env.HookCommand = filepath.Join(t.TempDir(), "gortex") + " hook"
+
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	cfg := agentstest.ReadJSON(t, filepath.Join(env.Root, ".pi", "gortex.json"))
+	if cfg["bin"] != strings.Fields(env.HookCommand)[0] {
+		t.Errorf("bin = %v, want %s", cfg["bin"], strings.Fields(env.HookCommand)[0])
+	}
+}
+
+// Gortex owns the sidecar, so a plain re-run resets the posture rather
+// than leaving a stale value behind.
+func TestPiDefaultRerunRemovesStaleSidecar(t *testing.T) {
+	env := defaultPostureEnv(t)
+	env.HookMode = "enrich"
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	sidecar := filepath.Join(env.Root, ".pi", "gortex.json")
+	if _, err := os.Stat(sidecar); err != nil {
+		t.Fatalf("expected a sidecar after the enrich install: %v", err)
+	}
+
+	env.HookMode = ""
+	res, err := New().Apply(env, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+		t.Errorf("expected the stale sidecar to be removed, stat err = %v", err)
+	}
+	var sawDelete bool
+	for _, f := range res.Files {
+		if f.Path == sidecar && f.Action == agents.ActionDelete {
+			sawDelete = true
+		}
+	}
+	if !sawDelete {
+		t.Errorf("expected a delete action for %s, got %+v", sidecar, res.Files)
+	}
+}
+
+// Every spelling Pi accepts for the package is recognised, and a
+// deliberate one (a pin, a filter object, a local checkout) is left
+// exactly as the user wrote it.
+func TestPiExistingPackageEntryIsLeftAlone(t *testing.T) {
+	checkout := t.TempDir()
+	if err := os.WriteFile(filepath.Join(checkout, "package.json"),
+		[]byte(`{"name":"pi-gortex","version":"0.1.0"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for _, arg := range parseArgv(t, writeAndRead(t, env2)) {
-		if strings.HasPrefix(arg, "--mode=") {
-			t.Errorf("deny posture should not append a --mode flag, got argv arg %q", arg)
-		}
+
+	for _, tc := range []struct {
+		name  string
+		entry any
+	}{
+		{"bare name", packageName},
+		{"npm prefix", PackageSpec},
+		{"pinned version", PackageSpec + "@1.2.3"},
+		{"filter object", map[string]any{"source": PackageSpec, "skills": []any{}}},
+		{"local checkout", checkout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := defaultPostureEnv(t)
+			settings := filepath.Join(env.Root, ".pi", "settings.json")
+			agentstest.WriteJSON(t, settings, map[string]any{
+				"packages": []any{tc.entry},
+			})
+
+			if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+				t.Fatalf("apply: %v", err)
+			}
+			list := packagesOf(t, settings)
+			if len(list) != 1 {
+				t.Fatalf("packages = %v, want the single existing entry preserved", list)
+			}
+		})
+	}
+}
+
+// A packages array that does not mention us still gets the entry, and
+// every other entry survives.
+func TestPiAppendsBesideOtherPackages(t *testing.T) {
+	env := defaultPostureEnv(t)
+	settings := filepath.Join(env.Root, ".pi", "settings.json")
+	agentstest.WriteJSON(t, settings, map[string]any{
+		"packages":   []any{"npm:pi-skills", "git:github.com/someone/repo@v1"},
+		"npmCommand": []any{"mise", "exec", "--", "npm"},
+	})
+
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	list := packagesOf(t, settings)
+	if len(list) != 3 || list[2] != PackageSpec {
+		t.Fatalf("packages = %v, want the two originals plus %s", list, PackageSpec)
+	}
+	if _, ok := agentstest.ReadJSON(t, settings)["npmCommand"]; !ok {
+		t.Errorf("unrelated settings keys must survive the merge")
 	}
 }
 
 func TestPiGlobalMode(t *testing.T) {
-	env, _ := agentstest.NewEnv(t)
+	env := defaultPostureEnv(t)
 	env.Mode = agents.ModeGlobal
+	env.HookMode = "enrich"
 	if err := os.MkdirAll(filepath.Join(env.Home, ".pi"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+
 	a := New()
 	res, err := a.Apply(env, agents.ApplyOpts{})
 	if err != nil {
@@ -184,187 +278,223 @@ func TestPiGlobalMode(t *testing.T) {
 	if !res.Configured {
 		t.Fatal("expected configured in global mode")
 	}
-	// Global extension lands under ~/.pi/agent/extensions; no AGENTS.md.
-	if _, err := os.ReadFile(filepath.Join(env.Home, ".pi", "agent", "extensions", "gortex", "index.ts")); err != nil {
-		t.Fatalf("global extension not written: %v", err)
+
+	agent := filepath.Join(env.Home, ".pi", "agent")
+	list := packagesOf(t, filepath.Join(agent, "settings.json"))
+	if len(list) != 1 || list[0] != PackageSpec {
+		t.Fatalf("packages = %v, want [%s]", list, PackageSpec)
+	}
+	// The global sidecar sits inside the agent dir's extensions folder,
+	// not beside its settings.
+	cfg := agentstest.ReadJSON(t, filepath.Join(agent, "extensions", "gortex.json"))
+	if cfg["hook_mode"] != "enrich" {
+		t.Errorf("hook_mode = %v, want enrich", cfg["hook_mode"])
 	}
 	if _, err := os.Stat(filepath.Join(env.Root, "AGENTS.md")); err == nil {
 		t.Errorf("global mode should not write repo AGENTS.md")
 	}
+
+	agentstest.AssertIdempotent(t, a, env)
+}
+
+// The installer has to resolve the agent dir exactly as the package's
+// config.ts does, or the sidecar lands where nothing reads it.
+func TestPiHonoursAgentDirOverride(t *testing.T) {
+	t.Run("absolute", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("PI_CODING_AGENT_DIR", dir)
+		if got := AgentDir("/home/someone"); got != dir {
+			t.Errorf("AgentDir = %q, want %q", got, dir)
+		}
+	})
+
+	t.Run("tilde prefix", func(t *testing.T) {
+		t.Setenv("PI_CODING_AGENT_DIR", "~/custom/agent")
+		want := filepath.Join("/home/someone", "custom", "agent")
+		if got := AgentDir("/home/someone"); got != want {
+			t.Errorf("AgentDir = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("bare tilde", func(t *testing.T) {
+		t.Setenv("PI_CODING_AGENT_DIR", "~")
+		if got := AgentDir("/home/someone"); got != "/home/someone" {
+			t.Errorf("AgentDir = %q, want the home directory", got)
+		}
+	})
+
+	t.Run("unset", func(t *testing.T) {
+		t.Setenv("PI_CODING_AGENT_DIR", "")
+		want := filepath.Join("/home/someone", ".pi", "agent")
+		if got := AgentDir("/home/someone"); got != want {
+			t.Errorf("AgentDir = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("sidecar follows the override", func(t *testing.T) {
+		env := defaultPostureEnv(t)
+		env.Mode = agents.ModeGlobal
+		env.HookMode = "nudge"
+		dir := t.TempDir()
+		t.Setenv("PI_CODING_AGENT_DIR", dir)
+
+		if _, err := New().Apply(env, agents.ApplyOpts{ForceDetect: true}); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "settings.json")); err != nil {
+			t.Errorf("settings not written under the override: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "extensions", "gortex.json")); err != nil {
+			t.Errorf("sidecar not written under the override: %v", err)
+		}
+	})
 }
 
 func TestPiApplyDryRun(t *testing.T) {
-	env, _ := agentstest.NewEnv(t)
-	if err := os.MkdirAll(filepath.Join(env.Root, ".pi"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	env := defaultPostureEnv(t)
+	env.HookMode = "enrich"
+	legacy := writeLegacyExtension(t, filepath.Join(env.Root, ".pi", "extensions"),
+		legacyMarker+"\nexport default {};\n")
+
 	res, err := New().Apply(env, agents.ApplyOpts{DryRun: true})
 	if err != nil {
 		t.Fatalf("apply dry-run: %v", err)
 	}
-	// Nothing written to disk under dry-run.
-	if _, err := os.Stat(extensionPath(env)); err == nil {
-		t.Errorf("dry-run must not write the extension file")
+	for _, path := range []string{
+		filepath.Join(env.Root, ".pi", "settings.json"),
+		filepath.Join(env.Root, ".pi", "gortex.json"),
+	} {
+		if _, err := os.Stat(path); err == nil {
+			t.Errorf("dry-run must not write %s", path)
+		}
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Errorf("dry-run must not delete %s: %v", legacy, err)
 	}
 	if len(res.Files) == 0 {
 		t.Errorf("dry-run should still report planned actions")
 	}
 }
 
-// parseArgv extracts and JSON-decodes the HOOK_ARGV literal templated into
-// the rendered extension. It doubles as a guard that the argv sentinel
-// round-trips into a valid string array (so the TS `HOOK_ARGV[0]` access
-// is sound).
-func parseArgv(t *testing.T, src string) []string {
-	t.Helper()
-	const marker = "const HOOK_ARGV: string[] = "
-	i := strings.Index(src, marker)
-	if i < 0 {
-		t.Fatal("HOOK_ARGV line not found")
-	}
-	rest := src[i+len(marker):]
-	end := strings.Index(rest, ";")
-	if end < 0 {
-		t.Fatal("HOOK_ARGV line not terminated")
-	}
-	var argv []string
-	if err := json.Unmarshal([]byte(rest[:end]), &argv); err != nil {
-		t.Fatalf("HOOK_ARGV is not valid JSON array: %v", err)
-	}
-	return argv
-}
+// Plan is what --dry-run and `gortex init doctor` render, so it has to
+// predict the same set of paths Apply touches.
+func TestPiPlanMatchesApply(t *testing.T) {
+	env := defaultPostureEnv(t)
+	env.HookMode = "enrich"
+	writeLegacyExtension(t, filepath.Join(env.Root, ".pi", "extensions"),
+		legacyMarker+"\nexport default {};\n")
 
-func TestPiRendersCompactPublicTools(t *testing.T) {
-	env, _ := agentstest.NewEnv(t)
-	src := renderExtension(env)
-
-	// B: on-demand discovery reuses the server's own tools_search tool —
-	// no client-side meta-tool re-implementation. Promotions arrive via
-	// notifications/tools/list_changed and a tools/list re-sync.
-	if strings.Contains(src, "registerSearchTool") {
-		t.Error("expected no client-side tools_search meta-tool; the server's own tool is registered like any other")
+	plan, err := New().Plan(env)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
 	}
-	if !strings.Contains(src, `"notifications/tools/list_changed"`) {
-		t.Error("expected the bridge to handle tools/list_changed for server-side promotion")
-	}
-	if !strings.Contains(src, "syncTools(pi)") {
-		t.Error("expected promoted tools to be registered via a tools/list re-sync")
+	planned := make(map[string]agents.ActionKind, len(plan.Files))
+	for _, f := range plan.Files {
+		planned[f.Path] = f.Action
 	}
 
-	// Tools are registered under their bare daemon names — the names the
-	// server's tools_search reply cites must be exactly the names the
-	// model can call, so no client-side prefix.
-	if strings.Contains(src, "TOOL_PREFIX") {
-		t.Error("expected tools to be registered under bare daemon names, not a client-side prefix")
+	res, err := New().Apply(env, agents.ApplyOpts{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
 	}
-
-	// Only recognised presets are forwarded to the proxy: an unknown
-	// value would parse server-side as a one-tool allow-list and strip
-	// every promoted tool from the session (fail open instead).
-	if !strings.Contains(src, `new Set(["edit", "nav", "readonly"])`) {
-		t.Error("expected only recognised presets to be forwarded into GORTEX_TOOLS")
+	for _, f := range res.Files {
+		if _, ok := planned[f.Path]; !ok {
+			t.Errorf("Apply touched %s, which Plan never named", f.Path)
+		}
 	}
-	// D: the MCP bridge identifies itself as "pi" and self-declares its
-	// GCX decoder via the gortex/wire capability (no server-side
-	// allowlist entry), and never lets a preset hide-block promoted
-	// tools.
-	if !strings.Contains(src, `const CLIENT_NAME = "pi"`) {
-		t.Error("expected the bridge to send clientInfo.name \"pi\"")
-	}
-	if !strings.Contains(src, `"gortex/wire": WIRE_FORMATS`) {
-		t.Error("expected the bridge to declare the gortex/wire capability in initialize")
-	}
-	if !strings.Contains(src, `env.GORTEX_TOOLS_MODE = "defer"`) {
-		t.Error("expected the bridge to force GORTEX_TOOLS_MODE=defer when a preset is active")
-	}
-	// Tool calls carry a generous-but-finite cap: long analyzers can
-	// finish, a wedged daemon can't hang the agent turn forever.
-	if !strings.Contains(src, "const CALL_TIMEOUT_MS = 600_000") {
-		t.Error("expected tools/call to run under the 10-minute cap")
-	}
-	if strings.Contains(src, "Number.POSITIVE_INFINITY") {
-		t.Error("tools/call must not run without a timeout")
-	}
-	// A tools_search call re-syncs synchronously so every name its reply
-	// cites is already a callable Pi tool when the model reads it.
-	if !strings.Contains(src, `if (name === "tools_search")`) {
-		t.Error("expected tools_search to await a tools/list re-sync before returning its reply")
-	}
-}
-
-// TestPiRegistersToolsPerSession guards the /new regression: Pi resets the
-// session tool registry on every session_start, so tools must be
-// (re)registered there — registering only at factory load loses them after
-// the first session. The persistent name guard must be cleared first or
-// re-registration is suppressed into the new (empty) registry.
-func TestPiRegistersToolsPerSession(t *testing.T) {
-	env, _ := agentstest.NewEnv(t)
-	src := renderExtension(env)
-
-	// Registration happens inside a session_start handler.
-	sIdx := strings.Index(src, `pi.on("session_start"`)
-	if sIdx < 0 {
-		t.Fatal("expected a session_start handler")
-	}
-	// Bound the search to the handler body so we assert these calls live
-	// *inside* session_start, not merely somewhere in the file.
-	body := src[sIdx:]
-	if end := strings.Index(body, "pi.on(\"before_agent_start\""); end > 0 {
-		body = body[:end]
-	}
-	for _, want := range []string{"gortexToolNames.clear()", "registerGortexTools(pi)", "ensureDaemon()"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("expected %q inside the session_start handler (per-session re-registration)", want)
+	for path := range planned {
+		var seen bool
+		for _, f := range res.Files {
+			if f.Path == path {
+				seen = true
+			}
+		}
+		if !seen {
+			t.Errorf("Plan named %s, which Apply never touched", path)
 		}
 	}
 }
 
-// TestPiInjectsOrientationViaContextHook guards the cache-safe injection
-// contract: the orientation rides a `context`-hook tail user message, never
-// a systemPrompt mutation (which would bust prefix prompt caching).
-func TestPiInjectsOrientationViaContextHook(t *testing.T) {
-	env, _ := agentstest.NewEnv(t)
-	src := renderExtension(env)
-
-	// A `context` hook must exist and push a user message.
-	if !strings.Contains(src, `pi.on("context"`) {
-		t.Error("expected a context hook to inject the orientation")
-	}
-	if !strings.Contains(src, `event.messages.push`) {
-		t.Error("expected the context hook to append a message to event.messages")
-	}
-	// The decision field is `orientation`, matching the Go PiDecision.
-	if !strings.Contains(src, "decision.orientation") {
-		t.Error("expected the extension to read decision.orientation")
-	}
-	// before_agent_start must NOT fold the orientation into systemPrompt —
-	// that path is what we removed for cache safety.
-	if strings.Contains(src, "systemPrompt: (event") {
-		t.Error("orientation must not be appended to systemPrompt (breaks prompt caching)")
+// MergeJSON's fallback for a file encoding/json rejects is to back it up
+// and write ours over the original. This one is the user's, and Pi may
+// accept syntax this parser does not, so it is left exactly as it is.
+func TestPiKeepsUnparseableSettings(t *testing.T) {
+	env := defaultPostureEnv(t)
+	path := settingsPath(env)
+	body := "{\n  // a comment Pi's own parser may allow\n  \"packages\": []\n}\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	// Orientation injection is unconditional; only tool_call enforcement is
-	// gated by ENFORCE. Assert the `if (!ENFORCE) return;` guard sits AFTER
-	// the before_agent_start + context registrations and BEFORE tool_call —
-	// so --no-hooks still teaches the model how to use Gortex.
-	guard := strings.Index(src, "if (!ENFORCE) return;")
-	beforeAgent := strings.Index(src, `pi.on("before_agent_start"`)
-	context := strings.Index(src, `pi.on("context"`)
-	toolCall := strings.Index(src, `pi.on("tool_call"`)
-	if guard < 0 || beforeAgent < 0 || context < 0 || toolCall < 0 {
-		t.Fatalf("missing a required handler/guard (guard=%d before_agent_start=%d context=%d tool_call=%d)",
-			guard, beforeAgent, context, toolCall)
+	plan, err := New().Plan(env)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
 	}
-	if beforeAgent >= guard || context >= guard || guard >= toolCall {
-		t.Errorf("ENFORCE guard misplaced: orientation hooks must precede it and tool_call must follow it "+
-			"(before_agent_start=%d context=%d guard=%d tool_call=%d)", beforeAgent, context, guard, toolCall)
+	if plan.Files[0].Action != agents.ActionSkip {
+		t.Errorf("plan must not promise a write Apply will decline: %+v", plan.Files[0])
+	}
+
+	if _, err := New().Apply(env, agents.ApplyOpts{}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != body {
+		t.Errorf("settings were rewritten:\n%s", got)
+	}
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Errorf("nothing should have been backed up, stat err = %v", err)
 	}
 }
 
-func TestRenderedExtensionParsesArgv(t *testing.T) {
-	env, _ := agentstest.NewEnv(t)
-	argv := parseArgv(t, renderExtension(env))
-	if len(argv) < 3 || argv[1] != "hook" || argv[2] != "--agent=pi" {
-		t.Errorf("unexpected argv: %v", argv)
+func TestPackageEntryName(t *testing.T) {
+	checkout := t.TempDir()
+	if err := os.WriteFile(filepath.Join(checkout, "package.json"),
+		[]byte(`{"name":"pi-gortex"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		entry any
+		want  string
+	}{
+		{"npm:pi-gortex", "pi-gortex"},
+		{"pi-gortex", "pi-gortex"},
+		{"npm:pi-gortex@1.2.3", "pi-gortex"},
+		{"npm:@scope/pkg@2.0.0", "@scope/pkg"},
+		{"@scope/pkg", "@scope/pkg"},
+		{map[string]any{"source": "npm:pi-gortex"}, "pi-gortex"},
+		{map[string]any{"source": "pi-gortex", "skills": []any{}}, "pi-gortex"},
+		{checkout, "pi-gortex"},
+		{"git:github.com/user/repo@v1", ""},
+		{"https://github.com/user/repo", ""},
+		{"/nonexistent/checkout", ""},
+		{map[string]any{"extensions": []any{}}, ""},
+		{"", ""},
+		{42, ""},
+	} {
+		if got := packageEntryName(tc.entry, checkout); got != tc.want {
+			t.Errorf("packageEntryName(%#v) = %q, want %q", tc.entry, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizeMode(t *testing.T) {
+	for in, want := range map[string]string{
+		"enrich":          "enrich",
+		"ENRICH":          "enrich",
+		"consult-unlock":  "consult-unlock",
+		"nudge":           "nudge",
+		"adaptive-nudge":  "nudge",
+		"deny":            "deny",
+		"":                "deny",
+		"something-else":  "deny",
+		"  enrich       ": "enrich",
+	} {
+		if got := normalizeMode(in); got != want {
+			t.Errorf("normalizeMode(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

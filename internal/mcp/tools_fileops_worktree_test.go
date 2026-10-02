@@ -243,7 +243,8 @@ func TestWorktreeRootedPath(t *testing.T) {
 	t.Run("re-roots a file that lives only in the worktree", func(t *testing.T) {
 		// Resolved under the main checkout, but the file is not there.
 		abs := filepath.Join(mainRepo, "only_wt.go")
-		got := worktreeRootedPath(abs, mainRepo, mi)
+		got, err := worktreeRootedPath(abs, mainRepo, mi, true)
+		require.NoError(t, err)
 		assert.Equal(t, resolvePath(t, filepath.Join(worktree, "only_wt.go")),
 			resolvePath(t, got),
 			"a file present only in the worktree must be re-rooted there")
@@ -251,16 +252,37 @@ func TestWorktreeRootedPath(t *testing.T) {
 
 	t.Run("leaves a file that exists in the resolved root", func(t *testing.T) {
 		abs := filepath.Join(mainRepo, "in_main.go")
-		got := worktreeRootedPath(abs, mainRepo, mi)
+		got, err := worktreeRootedPath(abs, mainRepo, mi, true)
+		require.NoError(t, err)
 		assert.Equal(t, abs, got,
 			"a file that exists under the resolved root must not be moved")
+	})
+
+	// TestWorktreeRootedPath/refuses-a-file-that-exists-in-both-main-and-a-worktree
+	// pins the 2026-09-24 live incident: a session ran `git worktree add`,
+	// never moved its cwd into the new worktree, then issued an unrouted
+	// mutating edit for a path that git worktree add had copied into BOTH
+	// checkouts. worktreeRootedPath used to short-circuit on the first
+	// os.Stat hit against main and silently return main's path without ever
+	// looking at the linked worktrees — landing the edit in main while the
+	// caller's real intent was the worktree. It must now refuse instead.
+	t.Run("refuses a file that exists in both main and a worktree", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(filepath.Join(worktree, "in_main.go"),
+			[]byte("package main\n"), 0o644))
+		abs := filepath.Join(mainRepo, "in_main.go")
+		got, err := worktreeRootedPath(abs, mainRepo, mi, true)
+		assert.Empty(t, got)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, errPathAmbiguousCheckout,
+			"a file present in both main and a ready worktree must be refused, not silently defaulted to main")
 	})
 
 	t.Run("leaves a brand-new file under the named prefix", func(t *testing.T) {
 		// A file in no checkout — a fresh write_file. It must stay
 		// where the caller addressed it.
 		abs := filepath.Join(mainRepo, "brand_new.go")
-		got := worktreeRootedPath(abs, mainRepo, mi)
+		got, err := worktreeRootedPath(abs, mainRepo, mi, true)
+		require.NoError(t, err)
 		assert.Equal(t, abs, got,
 			"a new file must land under the prefix the caller named")
 	})
@@ -269,13 +291,175 @@ func TestWorktreeRootedPath(t *testing.T) {
 		// Root is the worktree itself — the file is already in the
 		// right checkout, nothing to re-root.
 		abs := filepath.Join(worktree, "only_wt.go")
-		got := worktreeRootedPath(abs, worktree, mi)
+		got, err := worktreeRootedPath(abs, worktree, mi, true)
+		require.NoError(t, err)
 		assert.Equal(t, abs, got,
 			"a path resolved against a worktree root must be left untouched")
 	})
 
 	t.Run("nil lookup is a no-op", func(t *testing.T) {
 		abs := filepath.Join(mainRepo, "only_wt.go")
-		assert.Equal(t, abs, worktreeRootedPath(abs, mainRepo, nil))
+		got, err := worktreeRootedPath(abs, mainRepo, nil, true)
+		require.NoError(t, err)
+		assert.Equal(t, abs, got)
 	})
+}
+
+// TestWorktreeRootedPath_MultipleWorktrees pins the ambiguity guard
+// when more than one linked worktree carries the inferred target. The
+// worktree loop used to return abs on the second match, before the
+// main-vs-worktree refusal could run — so an unrouted edit still landed
+// in (or created a file in) the main checkout.
+func TestWorktreeRootedPath_MultipleWorktrees(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not available in PATH")
+	}
+
+	mainRepo := filepath.Join(t.TempDir(), "main")
+	require.NoError(t, os.MkdirAll(mainRepo, 0o755))
+	gitInit(t, mainRepo, "init", "-q", "-b", "main")
+	gitInit(t, mainRepo, "config", "user.email", "test@example.com")
+	gitInit(t, mainRepo, "config", "user.name", "Test")
+	gitInit(t, mainRepo, "config", "commit.gpgsign", "false")
+	require.NoError(t, os.WriteFile(filepath.Join(mainRepo, "seed.go"),
+		[]byte("package main\n"), 0o644))
+	gitInit(t, mainRepo, "add", ".")
+	gitInit(t, mainRepo, "commit", "-q", "-m", "init")
+
+	wtA := filepath.Join(t.TempDir(), "wt-a")
+	gitInit(t, mainRepo, "worktree", "add", "-q", "-b", "feature-a", wtA)
+	wtB := filepath.Join(t.TempDir(), "wt-b")
+	gitInit(t, mainRepo, "worktree", "add", "-q", "-b", "feature-b", wtB)
+
+	write := func(dir, name string) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name),
+			[]byte("package main\n"), 0o644))
+	}
+	// in_all.go: main + both worktrees. only_wts.go: both worktrees, not main.
+	for _, dir := range []string{mainRepo, wtA, wtB} {
+		write(dir, "in_all.go")
+	}
+	write(wtA, "only_wts.go")
+	write(wtB, "only_wts.go")
+
+	mi := fakeWorktreeLookup{worktrees: map[string][]string{
+		mainRepo: {wtA, wtB},
+	}}
+
+	t.Run("refuses a file in main and two worktrees", func(t *testing.T) {
+		got, err := worktreeRootedPath(filepath.Join(mainRepo, "in_all.go"), mainRepo, mi, true)
+		assert.Empty(t, got)
+		assert.ErrorIs(t, err, errPathAmbiguousCheckout,
+			"main + two worktrees must be refused, not defaulted to main")
+	})
+
+	t.Run("refuses a file in two worktrees but not main", func(t *testing.T) {
+		got, err := worktreeRootedPath(filepath.Join(mainRepo, "only_wts.go"), mainRepo, mi, true)
+		assert.Empty(t, got)
+		assert.ErrorIs(t, err, errPathAmbiguousCheckout,
+			"two worktree candidates must be refused, not create the file in main")
+		_, statErr := os.Stat(filepath.Join(mainRepo, "only_wts.go"))
+		assert.True(t, os.IsNotExist(statErr), "main must not gain the file")
+	})
+
+	t.Run("explicit selection keeps the resolved path", func(t *testing.T) {
+		// refuseAmbiguous=false is a caller-stated checkout: keep abs.
+		for _, name := range []string{"in_all.go", "only_wts.go"} {
+			abs := filepath.Join(mainRepo, name)
+			got, err := worktreeRootedPath(abs, mainRepo, mi, false)
+			require.NoError(t, err)
+			assert.Equal(t, abs, got)
+		}
+	})
+}
+
+// TestEditTools_UnprefixedPathAmbiguousAcrossTwoWorktrees drives the
+// multi-worktree refusal end to end through the tool handlers, against a
+// real MultiIndexer tracking a main checkout and two linked worktrees. An
+// unprefixed path reaches worktreeRootedPath via anchorUnprefixedExisting;
+// the refusal must surface as the tool error, and no checkout may change.
+func TestEditTools_UnprefixedPathAmbiguousAcrossTwoWorktrees(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not available in PATH")
+	}
+
+	mainRepo := filepath.Join(t.TempDir(), "main-checkout")
+	require.NoError(t, os.MkdirAll(mainRepo, 0o755))
+	gitInit(t, mainRepo, "init", "-q", "-b", "main")
+	gitInit(t, mainRepo, "config", "user.email", "test@example.com")
+	gitInit(t, mainRepo, "config", "user.name", "Test")
+	gitInit(t, mainRepo, "config", "commit.gpgsign", "false")
+	require.NoError(t, os.WriteFile(filepath.Join(mainRepo, "shared.go"),
+		[]byte("package main\n\nfunc Shared() string { return \"main\" }\n"), 0o644))
+	gitInit(t, mainRepo, "add", ".")
+	gitInit(t, mainRepo, "commit", "-q", "-m", "init")
+
+	// Both worktrees check out shared.go; only_wts.go exists in the two
+	// worktrees and not in main.
+	wtA := filepath.Join(t.TempDir(), "wt-a")
+	gitInit(t, mainRepo, "worktree", "add", "-q", "-b", "feature-a", wtA)
+	wtB := filepath.Join(t.TempDir(), "wt-b")
+	gitInit(t, mainRepo, "worktree", "add", "-q", "-b", "feature-b", wtB)
+	for _, wt := range []string{wtA, wtB} {
+		require.NoError(t, os.WriteFile(filepath.Join(wt, "only_wts.go"),
+			[]byte("package main\n\nfunc OnlyWts() {}\n"), 0o644))
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{
+		{Path: mainRepo, Name: "main-checkout"},
+		{Path: wtA, Name: "wt-a"},
+		{Path: wtB, Name: "wt-b"},
+	}}
+	gc.SetConfigPath(cfgPath)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(cfgPath)
+	require.NoError(t, err)
+
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	g := graph.New()
+	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
+		ConfigManager: cm,
+		MultiIndexer:  mi,
+	})
+
+	snapshot := func() map[string]string {
+		out := map[string]string{}
+		for _, dir := range []string{mainRepo, wtA, wtB} {
+			for _, name := range []string{"shared.go", "only_wts.go"} {
+				if b, rerr := os.ReadFile(filepath.Join(dir, name)); rerr == nil {
+					out[filepath.Join(dir, name)] = string(b)
+				}
+			}
+		}
+		return out
+	}
+	before := snapshot()
+
+	t.Run("edit_file refuses a file in main and two worktrees", func(t *testing.T) {
+		result := callTool(t, srv, "edit_file", map[string]any{
+			"path":       "shared.go",
+			"old_string": `return "main"`,
+			"new_string": `return "edited"`,
+		})
+		require.True(t, result.IsError, "an unprefixed edit ambiguous across checkouts must refuse")
+		assert.Contains(t, resultText(result), errPathAmbiguousCheckout.Error())
+	})
+
+	t.Run("write_file refuses a file in two worktrees but not main", func(t *testing.T) {
+		result := callTool(t, srv, "write_file", map[string]any{
+			"path":    "only_wts.go",
+			"content": "package main\n\nfunc Written() {}\n",
+		})
+		require.True(t, result.IsError, "an unprefixed write ambiguous across worktrees must refuse")
+		assert.Contains(t, resultText(result), errPathAmbiguousCheckout.Error())
+	})
+
+	assert.Equal(t, before, snapshot(), "a refused mutation must leave every checkout untouched")
+	_, statErr := os.Stat(filepath.Join(mainRepo, "only_wts.go"))
+	assert.True(t, os.IsNotExist(statErr), "main must not gain the file")
 }

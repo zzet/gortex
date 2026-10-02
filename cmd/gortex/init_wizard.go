@@ -62,7 +62,7 @@ var agentDetails = map[string]string{
 	"oh-my-pi":    ".omp/mcp.json",
 	"opencode":    "opencode.json",
 	"openclaw":    ".openclaw/mcp.json",
-	"pi":          ".pi/extensions/gortex",
+	"pi":          ".pi/settings.json packages + .pi/gortex.json",
 	"vscode":      ".vscode/mcp.json",
 	"windsurf":    ".windsurf/mcp.json",
 	"zed":         ".zed/settings.json",

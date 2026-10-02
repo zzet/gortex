@@ -53,6 +53,9 @@ func parseGateLanguage(path string) string {
 		return "cpp"
 	case ".cs":
 		return "csharp"
+	case ".mq4", ".mq5", ".mqh":
+		// MQL shares the tree-sitter-mql5 grammar (a tree-sitter-cpp fork).
+		return "mql"
 	case ".sh", ".bash":
 		return "bash"
 	}

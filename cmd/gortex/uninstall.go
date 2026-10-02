@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/agents/copilotcli"
 	"github.com/zzet/gortex/internal/agents/opencode"
+	"github.com/zzet/gortex/internal/agents/pi"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/tui"
@@ -49,10 +50,12 @@ var uninstallCmd = &cobra.Command{
 Counterpart to ` + "`gortex init`" + `. For machine-wide setup (user MCP config,
 rule blocks, user hooks) installed by ` + "`gortex install`" + `, pass --global
 to also strip the user-level footprint of every host Gortex configures —
-Claude Code, Codex, GitHub Copilot CLI and OpenCode: MCP entries,
+Claude Code, Codex, GitHub Copilot CLI, OpenCode and Pi: MCP entries,
 permission allowlists, hooks, the rule blocks, and the gortex skills /
-commands / sub-agents / bridge plugin. Merged files keep everything that
-is not ours, and a gortex skill you have edited is kept, not deleted.
+commands / sub-agents / bridge plugin / Pi sidecar. Merged files keep
+everything that is not ours, and a gortex skill you have edited is kept
+rather than deleted. Pi's own ` + "`packages`" + ` entry stays: that file is
+yours, and ` + "`pi remove npm:pi-gortex`" + ` is what takes it back.
 --global honors $CLAUDE_CONFIG_DIR; target a specific Claude Code profile
 with --claude-config-dir.
 
@@ -320,6 +323,7 @@ func globalHosts() []globalHost {
 		{artifacts: codex.GlobalArtifacts, remove: codex.New().RemoveGlobal},
 		{artifacts: copilotcli.GlobalArtifacts, remove: copilotcli.New().RemoveGlobal},
 		{artifacts: opencode.GlobalArtifacts, remove: opencode.New().RemoveGlobal},
+		{artifacts: pi.GlobalArtifacts, remove: pi.New().RemoveGlobal},
 	}
 }
 
@@ -454,7 +458,7 @@ func emitUninstallSummary(w io.Writer, removed int, failures []string, totalPres
 		}
 		fmt.Fprintf(w, "[gortex uninstall] done (%d/%d items removed)\n", removed, totalPresent)
 		if globalCleaned {
-			fmt.Fprintln(w, "Note: the user-level footprint was removed for Claude Code, Codex, Copilot CLI and OpenCode (rule blocks, MCP entries, hooks, skills/commands/agents/plugin). Other content in those files was preserved, and any gortex skill you had edited was kept.")
+			fmt.Fprintln(w, "Note: the user-level footprint was removed for Claude Code, Codex, Copilot CLI, OpenCode and Pi (rule blocks, MCP entries, hooks, skills/commands/agents/plugin, Pi sidecar). Other content in those files was preserved, and any gortex skill you had edited was kept. Pi's `packages` entry stays: run `pi remove npm:pi-gortex` to drop it.")
 		} else {
 			fmt.Fprintln(w, "Note: CLAUDE.md was not modified — remove the Gortex block manually if needed (or re-run with --global).")
 		}

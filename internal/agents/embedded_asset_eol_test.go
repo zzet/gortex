@@ -16,7 +16,6 @@ import (
 // endings changes what users receive.
 var embeddedTextAssets = []string{
 	"internal/agents/opencode/plugin/gortex.js",
-	"internal/agents/pi/extension/index.ts",
 }
 
 // TestEmbeddedTextAssetsArePinnedToLF guards the `* text=auto eol=lf` line
@@ -31,7 +30,7 @@ var embeddedTextAssets = []string{
 //
 // TestPluginFailsOpen detects the same corruption, but only as a side
 // effect of splitting the plugin source on "\n}\n"; this states the
-// contract directly and covers the pi extension too.
+// contract directly.
 func TestEmbeddedTextAssetsArePinnedToLF(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {

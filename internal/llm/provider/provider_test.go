@@ -157,6 +157,25 @@ func TestNew_DeepSeekOK(t *testing.T) {
 	}
 }
 
+func TestNew_RequestyMissingKey(t *testing.T) {
+	t.Setenv("REQUESTY_API_KEY", "")
+	if _, err := New(llm.Config{Provider: "requesty"}.ApplyDefaults()); err == nil {
+		t.Fatal("expected error when REQUESTY_API_KEY is unset")
+	}
+}
+
+func TestNew_RequestyOK(t *testing.T) {
+	t.Setenv("REQUESTY_API_KEY", "k")
+	p, err := New(llm.Config{Provider: "requesty"}.ApplyDefaults())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer p.Close()
+	if p.Name() != "requesty" {
+		t.Errorf("Name()=%q want requesty", p.Name())
+	}
+}
+
 func TestNew_ClaudeCLIOK(t *testing.T) {
 	// Use a real binary that exists on every Unix to satisfy the
 	// PATH lookup — the factory only verifies presence, it doesn't

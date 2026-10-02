@@ -133,6 +133,18 @@ func (r *Resolver) warmRepoLanguageNameCache(pending []*graph.Edge) (groupCount 
 					externGroups[globalScope.languageKey] = global
 				}
 				global.names[name] = struct{}{}
+				// A Python absolute import is also looked up by the name
+				// it binds (resolvePythonModuleExtern's second reading).
+				if isPythonSourcePath(edge.FilePath) {
+					if sep := strings.LastIndex(target, "::"); sep > len("extern::") {
+						importPath := target[len("extern::"):sep]
+						if isDottedPythonModule(importPath) {
+							if imported := pythonImportedName(importPath); imported != "" {
+								global.names[imported] = struct{}{}
+							}
+						}
+					}
+				}
 			}
 			continue
 		}

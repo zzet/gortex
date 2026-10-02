@@ -22,7 +22,7 @@ func TestGuideCmd_PrintsRelocatedReference(t *testing.T) {
 	if !strings.Contains(full, "# Gortex Guide") {
 		t.Error("full guide missing header")
 	}
-	if !strings.Contains(full, "bedrock` / `deepseek`") {
+	if !strings.Contains(full, "bedrock` / `deepseek` / `requesty`") {
 		t.Error("full guide missing the provider matrix")
 	}
 

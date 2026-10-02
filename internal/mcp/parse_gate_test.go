@@ -11,6 +11,9 @@ func TestParseGateLanguage(t *testing.T) {
 		"x.jsx":         "javascript",
 		"main.rs":       "rust",
 		"App.java":      "java",
+		"EA.mq5":        "mql",
+		"ea.mq4":        "mql",
+		"include.mqh":   "mql",
 		"README.md":     "",
 		"data.json":     "",
 		"Makefile":      "",
@@ -41,6 +44,17 @@ func TestParseErrorCountGo(t *testing.T) {
 	}
 	if n, ok := parseErrorCount("", clean); ok || n != 0 {
 		t.Fatalf("empty lang: got (%d, %v), want (0, false)", n, ok)
+	}
+
+	// MQL rides the tree-sitter-cpp-fork grammar; the gate must have an
+	// opinion (regression: .mq* fell through and the gate silently skipped).
+	mqlClean := []byte("int Add(int a, int b) { return a + b; }\n")
+	if n, ok := parseErrorCount("mql", mqlClean); !ok || n != 0 {
+		t.Fatalf("clean MQL: got (%d, %v), want (0, true)", n, ok)
+	}
+	mqlBroken := []byte("int Add(int a, int b { return a + b; }\n")
+	if n, ok := parseErrorCount("mql", mqlBroken); !ok || n == 0 {
+		t.Fatalf("broken MQL: got (%d, %v), want (>0, true)", n, ok)
 	}
 }
 

@@ -41,10 +41,10 @@ func Inspect(home string) InstallState {
 		state.Hooks[event] = 0
 	}
 
-	// Hooks live in settings.local.json; the MCP server stanza lives in
+	// Hooks live in settings.json; the MCP server stanza lives in
 	// ~/.claude.json. Report the hooks file as the config path, since that is
 	// the one whose contents the runtime section is about.
-	state.ConfigPath = userSettingsLocalPath(home)
+	state.ConfigPath = userSettingsPath(home)
 	if data, err := os.ReadFile(state.ConfigPath); err == nil {
 		state.ConfigPresent = true
 		var settings struct {

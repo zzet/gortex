@@ -483,6 +483,69 @@ func TestAPIProvider_NoKeyOmitsAuthorizationHeader(t *testing.T) {
 	assert.False(t, hadAuth, "no Authorization header without a configured key")
 }
 
+// TestAPIProvider_RequestyKeyFallback asserts REQUESTY_API_KEY is picked
+// up only for a requesty.ai endpoint, mirroring the OPENAI_API_KEY rule
+// for openai.com: the vendor key must never leak to another host, and an
+// explicit GORTEX_EMBEDDINGS_API_KEY still wins.
+func TestAPIProvider_RequestyKeyFallback(t *testing.T) {
+	t.Setenv("GORTEX_EMBEDDINGS_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("REQUESTY_API_KEY", "rq-secret")
+
+	p := NewAPIProvider("https://router.requesty.ai/v1", "openai/text-embedding-3-small")
+	assert.Equal(t, "rq-secret", p.apiKey, "requesty host falls back to REQUESTY_API_KEY")
+
+	p = NewAPIProvider("https://router.eu.requesty.ai/v1", "openai/text-embedding-3-small")
+	assert.Equal(t, "rq-secret", p.apiKey, "regional requesty host falls back too")
+
+	p = NewAPIProvider("https://api.openai.com/v1", "text-embedding-3-small")
+	assert.Equal(t, "", p.apiKey, "REQUESTY_API_KEY must not leak to a non-requesty host")
+
+	t.Setenv("GORTEX_EMBEDDINGS_API_KEY", "explicit")
+	p = NewAPIProvider("https://router.requesty.ai/v1", "openai/text-embedding-3-small")
+	assert.Equal(t, "explicit", p.apiKey, "an explicit embeddings key wins over the fallback")
+}
+
+// TestAPIProvider_VendorKeyFallbackExactHost asserts the OPENAI_API_KEY and
+// REQUESTY_API_KEY fallbacks match the parsed hostname exactly over https:
+// lookalike prefix/suffix domains, userinfo tricks and plain http must not
+// receive either vendor key.
+func TestAPIProvider_VendorKeyFallbackExactHost(t *testing.T) {
+	t.Setenv("GORTEX_EMBEDDINGS_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "oa-secret")
+	t.Setenv("REQUESTY_API_KEY", "rq-secret")
+
+	cases := []struct {
+		url  string
+		want string
+	}{
+		{"https://api.openai.com/v1", "oa-secret"},
+		{"https://API.OpenAI.com/v1", "oa-secret"},
+		{"https://api.openai.com:443/v1", "oa-secret"},
+		{"https://router.requesty.ai/v1", "rq-secret"},
+		{"https://router.eu.requesty.ai/v1", "rq-secret"},
+		{"https://router.us.requesty.ai/v1", "rq-secret"},
+		{"https://router.ap.requesty.ai/v1", "rq-secret"},
+
+		{"https://requesty.ai.attacker.example/v1", ""},
+		{"https://router.requesty.ai.attacker.example/v1", ""},
+		{"https://evilrequesty.ai/v1", ""},
+		{"https://evil.requesty.ai/v1", ""},
+		{"https://attacker.example/requesty.ai/v1", ""},
+		{"https://router.requesty.ai@attacker.example/v1", ""},
+		{"http://router.requesty.ai/v1", ""},
+		{"https://api.openai.com.attacker.example/v1", ""},
+		{"https://evilopenai.com/v1", ""},
+		{"https://attacker.example/v1?h=api.openai.com", ""},
+		{"http://api.openai.com/v1", ""},
+		{"router.requesty.ai/v1", ""},
+	}
+	for _, tc := range cases {
+		p := NewAPIProvider(tc.url, "text-embedding-3-small")
+		assert.Equal(t, tc.want, p.apiKey, tc.url)
+	}
+}
+
 // TestAPIProvider_AccumulatesTokenUsage asserts the provider reads the
 // OpenAI `usage.total_tokens` field off each embedding response and
 // accumulates it across calls — the signal the indexer logs so the paid

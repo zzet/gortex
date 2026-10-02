@@ -726,24 +726,6 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
 - Untracking a non-primary dedicated worktree demotes it to automatic only if another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 === global/home/.claude/settings.json ===
 {
-  "permissions": {
-    "allow": [
-      "mcp__gortex__analyze",
-      "mcp__gortex__capabilities",
-      "mcp__gortex__change",
-      "mcp__gortex__explore",
-      "mcp__gortex__read",
-      "mcp__gortex__recall",
-      "mcp__gortex__relations",
-      "mcp__gortex__response",
-      "mcp__gortex__search",
-      "mcp__gortex__trace",
-      "mcp__gortex__workspace"
-    ]
-  }
-}
-=== global/home/.claude/settings.local.json ===
-{
   "hooks": {
     "PostToolUse": [
       {
@@ -842,6 +824,21 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           }
         ]
       }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "mcp__gortex__analyze",
+      "mcp__gortex__capabilities",
+      "mcp__gortex__change",
+      "mcp__gortex__explore",
+      "mcp__gortex__read",
+      "mcp__gortex__recall",
+      "mcp__gortex__relations",
+      "mcp__gortex__response",
+      "mcp__gortex__search",
+      "mcp__gortex__trace",
+      "mcp__gortex__workspace"
     ]
   }
 }

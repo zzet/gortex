@@ -39,6 +39,8 @@ func TestConfig_IsEnabled(t *testing.T) {
 		{"bedrock no model_id", Config{Provider: "bedrock"}, false},
 		{"deepseek with model", Config{Provider: "deepseek", DeepSeek: RemoteConfig{Model: "deepseek-chat"}}, true},
 		{"deepseek no model", Config{Provider: "deepseek"}, false},
+		{"requesty with model", Config{Provider: "requesty", Requesty: RemoteConfig{Model: "openai/gpt-4o-mini"}}, true},
+		{"requesty no model", Config{Provider: "requesty"}, false},
 		{"codex no model", Config{Provider: "codex"}, true},
 		{"codex with model", Config{Provider: "codex", Codex: CodexConfig{Model: "gpt-5-codex"}}, true},
 		{"copilot no model", Config{Provider: "copilot"}, true},
@@ -98,6 +100,9 @@ func TestConfig_ApplyDefaults(t *testing.T) {
 	if c.DeepSeek.Model != defaultDeepSeekModel || c.DeepSeek.APIKeyEnv != defaultDeepSeekKeyEnv || c.DeepSeek.BaseURL != defaultDeepSeekBaseURL {
 		t.Errorf("deepseek defaults wrong: %+v", c.DeepSeek)
 	}
+	if c.Requesty.Model != defaultRequestyModel || c.Requesty.APIKeyEnv != defaultRequestyKeyEnv || c.Requesty.BaseURL != defaultRequestyBaseURL {
+		t.Errorf("requesty defaults wrong: %+v", c.Requesty)
+	}
 }
 
 func TestConfig_MergeEnv_GeminiModel(t *testing.T) {
@@ -128,6 +133,19 @@ func TestConfig_MergeEnv_DeepSeekModel(t *testing.T) {
 	c := Config{}.MergeEnv()
 	if c.DeepSeek.Model != "deepseek-reasoner" {
 		t.Errorf("deepseek model=%q", c.DeepSeek.Model)
+	}
+}
+
+func TestConfig_MergeEnv_RequestyModelAndEffort(t *testing.T) {
+	t.Setenv("GORTEX_LLM_PROVIDER", "requesty")
+	t.Setenv("GORTEX_LLM_MODEL", "anthropic/claude-sonnet-4-5")
+	t.Setenv("GORTEX_LLM_EFFORT", "high")
+	c := Config{}.MergeEnv()
+	if c.Requesty.Model != "anthropic/claude-sonnet-4-5" {
+		t.Errorf("requesty model=%q", c.Requesty.Model)
+	}
+	if c.Requesty.Effort != "high" {
+		t.Errorf("requesty effort=%q want high", c.Requesty.Effort)
 	}
 }
 
@@ -329,6 +347,7 @@ func TestConfig_MergedWith_NewProviders(t *testing.T) {
 		Bedrock:  BedrockConfig{ModelID: "anthropic.claude-sonnet-4-20250514-v1:0", Region: "us-east-1"},
 		Gemini:   RemoteConfig{APIKeyEnv: "GEMINI_API_KEY", Model: "gemini-2.5-pro"},
 		DeepSeek: RemoteConfig{APIKeyEnv: "DEEPSEEK_API_KEY"},
+		Requesty: RemoteConfig{APIKeyEnv: "REQUESTY_API_KEY"},
 	}
 	local := Config{Bedrock: BedrockConfig{Region: "eu-west-1"}}
 	got := local.MergedWith(global)
@@ -343,6 +362,9 @@ func TestConfig_MergedWith_NewProviders(t *testing.T) {
 	}
 	if got.DeepSeek.APIKeyEnv != "DEEPSEEK_API_KEY" {
 		t.Errorf("deepseek api_key_env=%q — global should fill", got.DeepSeek.APIKeyEnv)
+	}
+	if got.Requesty.APIKeyEnv != "REQUESTY_API_KEY" {
+		t.Errorf("requesty api_key_env=%q, global should fill", got.Requesty.APIKeyEnv)
 	}
 }
 
@@ -413,6 +435,7 @@ func TestConfig_ActiveModelAndWithModel(t *testing.T) {
 		{"gemini", Config{Provider: "gemini"}},
 		{"bedrock", Config{Provider: "bedrock"}},
 		{"deepseek", Config{Provider: "deepseek"}},
+		{"requesty", Config{Provider: "requesty"}},
 		{"local", Config{Provider: "local"}},
 	}
 	for _, c := range cases {
