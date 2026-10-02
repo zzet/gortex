@@ -17,6 +17,15 @@ func readWALIndexHeader(dbPath string, buf []byte) error {
 	if err != nil {
 		return err
 	}
-	_, readErr := f.ReadAt(buf, 0)
+	// SQLite reserves bytes 120..127 for mandatory Windows byte-range locks.
+	// A snapshot may be read while our writer owns one of those locks through
+	// another handle. The lock bytes carry no header data; avoid reading them.
+	_, readErr := f.ReadAt(buf[:min(len(buf), 120)], 0)
+	if len(buf) > 120 {
+		clear(buf[120:min(len(buf), 128)])
+	}
+	if readErr == nil && len(buf) > 128 {
+		_, readErr = f.ReadAt(buf[128:], 128)
+	}
 	return errors.Join(readErr, f.Close())
 }
