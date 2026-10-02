@@ -14,7 +14,7 @@ func statStamp(path string) (fileStamp, bool) {
 	}
 	st := fileStamp{size: info.Size(), mtime: info.ModTime().UnixNano()}
 	if sys, ok := info.Sys().(*syscall.Stat_t); ok {
-		st.ino = uint64(sys.Ino)
+		st.identity[0] = uint64(sys.Ino)
 	}
 	return st, true
 }

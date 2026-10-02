@@ -70,7 +70,7 @@ func (st *checkoutTypecheckState) relistSignature(paths []string) string {
 		names, _ := listGoSources(meta.Dir)
 		for _, name := range names {
 			stamp, _ := statStamp(filepath.Join(meta.Dir, name))
-			fmt.Fprintf(&b, "%s:%d:%d:%d\x00", name, stamp.size, stamp.mtime, stamp.ino)
+			fmt.Fprintf(&b, "%s:%d:%d:%d:%d\x00", name, stamp.size, stamp.mtime, stamp.identity[0], stamp.identity[1])
 		}
 	}
 	return b.String()

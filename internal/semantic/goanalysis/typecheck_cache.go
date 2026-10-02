@@ -86,9 +86,8 @@ var errTypecheckExportUnavailable = errors.New("dependency export data unavailab
 type fileStamp struct {
 	size  int64
 	mtime int64
-	ino   uint64
-	// Windows file indices are unique within a volume.
-	volume uint32
+	// An inode on Unix; a file index and volume serial on Windows.
+	identity [2]uint64
 }
 
 // tcFileRecord is one source file of a mutable package as it was when the

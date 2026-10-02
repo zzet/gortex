@@ -24,9 +24,11 @@ func statStamp(path string) (fileStamp, bool) {
 		return fileStamp{}, false
 	}
 	return fileStamp{
-		size:   int64(uint64(info.FileSizeHigh)<<32 | uint64(info.FileSizeLow)),
-		mtime:  info.LastWriteTime.Nanoseconds(),
-		ino:    uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow),
-		volume: info.VolumeSerialNumber,
+		size:  int64(uint64(info.FileSizeHigh)<<32 | uint64(info.FileSizeLow)),
+		mtime: info.LastWriteTime.Nanoseconds(),
+		identity: [2]uint64{
+			uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow),
+			uint64(info.VolumeSerialNumber),
+		},
 	}, true
 }
