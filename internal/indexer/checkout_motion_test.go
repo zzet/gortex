@@ -537,8 +537,11 @@ func TestAWorkingTreeWrittenEvery300msCoalescesWithoutFailedBuilds(t *testing.T)
 	if failed != 0 {
 		t.Fatalf("%d background cycles failed over a moving working tree", failed)
 	}
-	if len(cycles.cycles)-before >= writes {
-		t.Fatalf("%d cycles for %d writes: the changes were not coalesced", len(cycles.cycles)-before, writes)
+	// A held cycle samples the moving tree but never admits build work.
+	// Count abandoned and completed builds, rather than watcher wakes, when
+	// checking that the writes were coalesced.
+	if admitted := abandoned + built; admitted >= writes {
+		t.Fatalf("%d admitted builds for %d writes: the changes were not coalesced", admitted, writes)
 	}
 	if took > 2*time.Second {
 		t.Fatalf("the final state was published %s after the last write, want about the quiet window plus one build", took)

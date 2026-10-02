@@ -753,10 +753,13 @@ func TestOverlayFoldByCopyKeepsReboundCallersAndRemovedIdentities(t *testing.T) 
 // files in the worktree at once; the coordinator imports them one file per
 // cycle, each a chained generation, through the real admission path and the
 // shared build lane, folding the chain by copy whenever it reaches the
-// compaction depth. Interactive builds of another checkout probe the lane all
-// the while: each is admitted within 100 ms, because the import holds the lane
-// for one file at a time and yields a file in flight. Nothing is re-parsed
-// after it was imported, and the end state is exactly a clean index.
+// compaction depth. Three controlled interactive interruptions arrive after a
+// real file payload is written and before it is published. Each must get the
+// lane promptly, and the interrupted file must then publish before the next
+// interruption. Nothing is re-parsed after it was imported, and the end state
+// is exactly a clean index. This finite schedule does not establish progress
+// under uninterrupted interactive demand: cancellation of unpublished work
+// can still starve an import under sustained 40 ms probes (a known NO-GO).
 func TestALargeWorkingTreeChangeIsImportedFileByFileAndYieldsToAnInteractiveBuild(t *testing.T) {
 	oldPaths := importInteractivePaths
 	importInteractivePaths = 4
@@ -766,12 +769,30 @@ func TestALargeWorkingTreeChangeIsImportedFileByFileAndYieldsToAnInteractiveBuil
 	gate := NewViewBuildGate()
 	gate.Open()
 	outcomes := make(chan CheckoutCycle, 512)
+	interrupt := make(chan struct{}, 1)
+	atPayload := make(chan context.Context, 1)
+	var cycleContext context.Context // used only by the coordinator's cycle goroutine
 	// The coordinator's own loop drives the import, exactly as in the daemon:
 	// each file's cycle signals the next one through the quiet window.
 	c := f.coordinator(t, CheckoutCoordinatorConfig{
 		Gate:      gate,
 		cycleDone: func(out CheckoutCycle) { outcomes <- out },
+		dirtyBarrier: func() {
+			select {
+			case <-interrupt:
+				atPayload <- cycleContext
+				// The interactive waiter cancels this context. Coordinator
+				// cleanup also cancels it if an assertion fails here.
+				<-cycleContext.Done()
+			default:
+			}
+		},
 	})
+	// Install the context capture before signaling any cycle, under the same
+	// lock that guards cycleBarrier's invocation.
+	c.cycleMu.Lock()
+	c.cycleBarrier = func(ctx context.Context) { cycleContext = ctx }
+	c.cycleMu.Unlock()
 	c.compaction.mu.Lock()
 	c.compaction.quiet = -1
 	c.compaction.mu.Unlock()
@@ -806,56 +827,125 @@ func TestALargeWorkingTreeChangeIsImportedFileByFileAndYieldsToAnInteractiveBuil
 		files []string
 	}
 	var cycles []importCycle
-	importDone := make(chan struct{})
-	go func() {
-		defer close(importDone)
-		c.Signal("git checkout")
-		for i := 0; i < 400; i++ {
-			out, ok := await(ctx)
-			if !ok {
-				return
-			}
-			// The files a link imported are the imported paths its own
-			// generation claims (whichever builder produced it); a fold
-			// claims everything before it and is counted separately.
-			var files []string
-			if out.DirtyBuilt && !out.ImportFolded && out.DirtyGenerationID > 0 {
-				for _, p := range claimedPaths(t, f.store, out.DirtyGenerationID) {
-					if rel := strings.TrimPrefix(p, builderRepoPrefix+"/"); strings.HasPrefix(rel, "imported_") {
-						files = append(files, rel)
-					}
+	complete := func(out CheckoutCycle) bool {
+		return out.DirtyBuilt && out.DirtyBatchRemaining == 0 && !out.Rescheduled
+	}
+	record := func(out CheckoutCycle) {
+		// The files a link imported are the imported paths its own generation
+		// claims; a fold claims everything before it and is counted separately.
+		var files []string
+		if out.DirtyBuilt && !out.ImportFolded && out.DirtyGenerationID > 0 {
+			for _, p := range claimedPaths(t, f.store, out.DirtyGenerationID) {
+				if rel := strings.TrimPrefix(p, builderRepoPrefix+"/"); strings.HasPrefix(rel, "imported_") {
+					files = append(files, rel)
 				}
 			}
-			cycles = append(cycles, importCycle{out: out, files: files})
-			if out.Err != nil {
-				return
-			}
-			if out.DirtyBuilt && out.DirtyBatchRemaining == 0 && !out.Rescheduled {
-				return
+		}
+		cycles = append(cycles, importCycle{out: out, files: files})
+		if out.Err != nil {
+			t.Fatalf("import cycle failed: %+v", out)
+		}
+		if len(cycles) > 400 {
+			t.Fatal("the finite import exceeded its cycle bound")
+		}
+	}
+	routedFiles := func() map[string]struct{} {
+		files := map[string]struct{}{}
+		for _, id := range routedStack(t, f, c)[1:] {
+			for _, p := range claimedPaths(t, f.store, id) {
+				if rel := strings.TrimPrefix(p, builderRepoPrefix+"/"); strings.HasPrefix(rel, "imported_") {
+					files[rel] = struct{}{}
+				}
 			}
 		}
-	}()
+		return files
+	}
 
-	// Interactive builds of another checkout, while the import runs.
+	// Interrupt three distinct in-flight file payloads, then let each retry
+	// make durable progress before introducing another interactive waiter.
 	var waits []time.Duration
-	probe := time.NewTicker(40 * time.Millisecond)
-	defer probe.Stop()
-probing:
-	for {
-		select {
-		case <-importDone:
-			break probing
-		case <-probe.C:
-			asked := time.Now()
-			actx, acancel := context.WithTimeout(ctx, 5*time.Second)
-			release, err := gate.Acquire(actx, ViewBuildInteractive)
-			acancel()
-			if err != nil {
-				t.Fatalf("an interactive build was not admitted during the import: %v", err)
-			}
-			waits = append(waits, time.Since(asked))
-			release()
+	interruptedFiles := map[string]struct{}{}
+	for n := 0; n < 3; n++ {
+		before := routedFiles()
+		interrupt <- struct{}{}
+		if n == 0 {
+			c.Signal("git checkout")
 		}
+		var payloadContext context.Context
+		for payloadContext == nil {
+			select {
+			case payloadContext = <-atPayload:
+			case out := <-outcomes:
+				record(out)
+				if complete(out) {
+					t.Fatal("the import completed before all three controlled interruptions")
+				}
+			case <-ctx.Done():
+				t.Fatal("the import never reached its payload barrier")
+			}
+		}
+		// A building generation and its claimed file prove this interruption
+		// reached actual payload work, rather than a pre-admission refusal.
+		var inFlight []string
+		for _, row := range f.generations() {
+			if row.GenerationKind != DirtyLayerGenerationKind || row.State != store_sqlite.ViewGenerationBuilding {
+				continue
+			}
+			for _, p := range claimedPaths(t, f.store, row.GenerationID) {
+				if rel := strings.TrimPrefix(p, builderRepoPrefix+"/"); strings.HasPrefix(rel, "imported_") {
+					inFlight = append(inFlight, rel)
+				}
+			}
+		}
+		if len(inFlight) != 1 {
+			t.Fatalf("the admitted payload claims %v, want one imported file", inFlight)
+		}
+		file := inFlight[0]
+		if _, repeated := interruptedFiles[file]; repeated {
+			t.Fatalf("interrupted %s twice instead of progressing across files", file)
+		}
+		interruptedFiles[file] = struct{}{}
+		asked := time.Now()
+		actx, acancel := context.WithTimeout(ctx, 5*time.Second)
+		release, err := gate.Acquire(actx, ViewBuildInteractive)
+		acancel()
+		if err != nil {
+			t.Fatalf("an interactive build was not admitted during the import: %v", err)
+		}
+		waits = append(waits, time.Since(asked))
+		release()
+		if payloadContext.Err() == nil {
+			t.Fatal("interactive admission did not cancel the in-flight payload")
+		}
+		yielded := false
+		for {
+			out, ok := await(ctx)
+			if !ok {
+				t.Fatal("the interrupted import never resumed")
+			}
+			record(out)
+			if out.YieldedTo == laneYieldedToInteractive {
+				yielded = true
+			}
+			// An earlier published cycle may already be queued when the
+			// payload barrier wins the select. Its outcome precedes this
+			// yield and cannot prove that the interrupted file resumed.
+			if !out.DirtyBuilt || !yielded {
+				continue
+			}
+			after := routedFiles()
+			if _, published := after[file]; !published || len(after) <= len(before) {
+				t.Fatalf("interruption of %s made no durable progress: yielded=%v, before=%v, after=%v", file, yielded, before, after)
+			}
+			break
+		}
+	}
+	for !complete(cycles[len(cycles)-1].out) {
+		out, ok := await(ctx)
+		if !ok {
+			t.Fatal("the finite import never completed")
+		}
+		record(out)
 	}
 	if len(cycles) == 0 {
 		t.Fatal("the import ran no cycle")
