@@ -28,9 +28,7 @@ func sentinelNode(prefix, name string) *graph.Node {
 	}
 }
 
-// TestPublicUntrackKeepsAPinnedReadersCorpusUntilItCloses is the design's
-// confirmed defect (docs/incremental-indexing-write-amplification.md, the
-// public-untrack reader-lifetime paragraph), reduced to the lifecycle: a
+// TestPublicUntrackKeepsAPinnedReadersCorpusUntilItCloses verifies that a
 // request that pinned the repository's base corpus through the serving door
 // must keep reading coherent rows across a concurrent public untrack, and the
 // untrack must finish only after that reader closes.
