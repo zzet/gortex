@@ -10,17 +10,63 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/semantic"
+	"github.com/zzet/gortex/internal/semantic/tstypes"
+	"go.uber.org/zap"
 )
 
 // A committed-base import must publish every file while interactive requests
 // continue arriving faster than one file can prepare, without replaying a
 // successful import or blocking the interactive lane for that file's work.
 func TestALargeWorkingTreeImportCompletesUnderSustainedInteractiveDemand(t *testing.T) {
+	testSustainedImportProgress(t, false)
+}
+
+func TestALargeWorkingTreeImportWithInlineGoSemanticsCompletesUnderSustainedInteractiveDemand(t *testing.T) {
+	testSustainedImportProgress(t, true)
+}
+
+func testSustainedImportProgress(t *testing.T, inline bool) {
 	oldPaths := importInteractivePaths
 	importInteractivePaths = 4
 	t.Cleanup(func() { importInteractivePaths = oldPaths })
 
-	f := newCommittedBaseFixture(t).coordinatorFixture
+	fixture := newUnpublishedCommittedBaseFixture(t)
+	var manager *semantic.Manager
+	if inline {
+		manager = goTypesManager(t)
+		for _, provider := range tstypes.DefaultProviders(zap.NewNop()) {
+			manager.RegisterProvider(provider)
+		}
+		builderWriteFile(t, fixture.primary, "go.mod", "module example.com/fixture\n\ngo 1.22\n")
+		baseFunctions := "package fixture\n\n"
+		for i := 0; i < 16; i++ {
+			baseFunctions += fmt.Sprintf("func BaseExtra%d() int { return %d }\n", i, i)
+		}
+		builderWriteFile(t, fixture.primary, "extra_base.go", baseFunctions)
+		builderGit(t, fixture.primary, "add", "-A")
+		builderGit(t, fixture.primary, "commit", "-q", "-m", "Go semantic baseline")
+		builderGit(t, fixture.worktree, "reset", "--hard", "main")
+		provider := manager.ProviderForLanguage("go")
+		parallel, ok := provider.(interface {
+			ConcurrentCheckoutPreparation(context.Context, string, string, semantic.CheckoutCompilerScope, []string) bool
+		})
+		if !ok || !parallel.ConcurrentCheckoutPreparation(t.Context(), fixture.worktree, builderRepoPrefix, semantic.CheckoutCompilerScope{HandleRoots: true}, []string{builderRepoPrefix + "/core.go"}) {
+			t.Skip("actual Go provider has no concurrent admission for this ordinary module; conservative inline fallback remains enabled")
+		}
+		// The immutable baseline already carries real semantic facts, so the
+		// final oracle can compare every node/edge with a clean semantic index.
+		builderIndexSemantic(manager)(t, fixture.store, fixture.primary)
+		fixture.newBuilder = func(store *store_sqlite.Store) *SparseGenerationBuilder {
+			b := builderNewBuilder(store)
+			b.Semantic = manager
+			return b
+		}
+	}
+	fixture.publishBase(t)
+	f := fixture.coordinatorFixture
+	builder := builderNewBuilder(f.store)
+	builder.Semantic = manager
 	gate := NewViewBuildGate()
 	gate.Open()
 	outcomes := make(chan CheckoutCycle, 512)
@@ -28,6 +74,7 @@ func TestALargeWorkingTreeImportCompletesUnderSustainedInteractiveDemand(t *test
 	var cycleContext context.Context
 	c := f.coordinator(t, CheckoutCoordinatorConfig{
 		Gate:      gate,
+		Builder:   builder,
 		cycleDone: func(out CheckoutCycle) { outcomes <- out },
 		dirtyBarrier: func() {
 			if importing.Load() {
@@ -88,6 +135,7 @@ func TestALargeWorkingTreeImportCompletesUnderSustainedInteractiveDemand(t *test
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
+	requireImportReadSetProof(t, c)
 	c.Signal("first build")
 	if out, ok := await(ctx); !ok || out.DirtyGenerationID == 0 {
 		t.Fatalf("the first cycle routed no working-tree layer: %+v", out)
@@ -96,8 +144,11 @@ func TestALargeWorkingTreeImportCompletesUnderSustainedInteractiveDemand(t *test
 	const imported = 12
 	builderGit(t, f.primary, "checkout", "-q", "-b", "import-src")
 	for i := 0; i < imported; i++ {
-		builderWriteFile(t, f.primary, fmt.Sprintf("imported_%02d.go", i),
-			fmt.Sprintf("package fixture\n\nfunc Imported%02d() int {\n\treturn %d\n}\n", i, i))
+		source := fmt.Sprintf("package fixture\n\nfunc Imported%02d() int {\n\treturn %d\n}\n", i, i)
+		if inline {
+			source = fmt.Sprintf("package fixture\n\nfunc Imported%02d() Options {\n\tHelper()\n\tvalue := Options{}\n\treturn value\n}\n", i)
+		}
+		builderWriteFile(t, f.primary, fmt.Sprintf("imported_%02d.go", i), source)
 	}
 	builderGit(t, f.primary, "add", "-A")
 	builderGit(t, f.primary, "commit", "-q", "-m", "import source")
@@ -202,7 +253,7 @@ func TestALargeWorkingTreeImportCompletesUnderSustainedInteractiveDemand(t *test
 	}
 
 	seen := map[string]int{}
-	folds, links, yields := 0, 0, 0
+	folds, links, yields, compilerPasses := 0, 0, 0, 0
 	for i, cy := range cycles {
 		if cy.out.YieldedTo != "" {
 			yields++
@@ -212,6 +263,12 @@ func TestALargeWorkingTreeImportCompletesUnderSustainedInteractiveDemand(t *test
 			continue
 		}
 		links++
+		if goTypesRan(cy.out.DirtyWork) {
+			if inline {
+				t.Logf("import compiler cycle %d: %+v", i, cy.out.DirtyWork.CompilerContext)
+			}
+			compilerPasses++
+		}
 		if len(cy.files) > 1 {
 			t.Errorf("import cycle %d imported %d files %v, want one", i, len(cy.files), cy.files)
 		}
@@ -262,7 +319,27 @@ func TestALargeWorkingTreeImportCompletesUnderSustainedInteractiveDemand(t *test
 	if worst > 100*time.Millisecond {
 		t.Errorf("an interactive build waited %s for the import, want ≤ 100ms", worst)
 	}
-	if result := assertPropagationParity(t, f.store, routedStack(t, f, c), f.worktree, "import"); !result.ok() {
+	if inline {
+		if compilerPasses != imported {
+			t.Errorf("inline provider ran in %d/%d imported file publications", compilerPasses, imported)
+		}
+		view := chainMaterialize(t, f)
+		knownCalls := 0
+		for _, edge := range view.Reader.AllEdges() {
+			if edge.Kind == graph.EdgeCalls && strings.Contains(edge.From, "::Imported") && strings.HasSuffix(edge.To, "::Helper") && edge.Origin == graph.OriginLSPResolved {
+				knownCalls++
+			}
+		}
+		view.Close()
+		if knownCalls != imported {
+			t.Errorf("known type-resolved imported calls=%d, want %d", knownCalls, imported)
+		}
+		t.Logf("inline compiler passes=%d resolved imported calls=%d", compilerPasses, knownCalls)
+		if bindings := semanticReferenceBindingRows(t, f, "sustained-import-proof"); len(bindings) < imported {
+			t.Errorf("reference named bindings=%d, want at least %d; parity must not compare empty sets", len(bindings), imported)
+		}
+		assertSemanticParity(t, f, manager, "sustained-import")
+	} else if result := assertPropagationParity(t, f.store, routedStack(t, f, c), f.worktree, "import"); !result.ok() {
 		t.Errorf("the imported working tree differs from a clean index: %v", result.Diffs)
 	}
 }

@@ -457,6 +457,13 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane); lane != nil && lane.detached && !b.importHandleEnrichmentReady(ctx, req, handle) {
+			var err error
+			ctx, err = lane.reenter(ctx, true)
+			if err != nil {
+				return err
+			}
+		}
 		enrichWAL, enrichTx, enrichIO, enrichStarted := handle.WALWriteMark(), store_sqlite.WriteTransactionsBegun(), editDeltaProcessIO(), time.Now()
 		enrichCPU, enrichStore := processCPUTime(), b.storeWaitMark()
 		b.runEnrichment(ctx, req, handle, &report)

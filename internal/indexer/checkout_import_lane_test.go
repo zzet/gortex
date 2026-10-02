@@ -12,7 +12,26 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer/source"
+	"github.com/zzet/gortex/internal/semantic/tstypes"
+	"go.uber.org/zap"
 )
+
+func TestImportPreparationChecksApplicableProvidersAndActualHandleLanguages(t *testing.T) {
+	store := builderOpenStore(t, "import-provider-applicability")
+	b := builderNewBuilder(store)
+	b.Semantic = goTypesManager(t)
+	for _, provider := range tstypes.DefaultProviders(zap.NewNop()) {
+		b.Semantic.RegisterProvider(provider)
+	}
+	req := BuildRequest{RepoPrefix: builderRepoPrefix, Changes: []LayerPathChange{{Path: "structural.c", Kind: LayerPathAdded}}, Enrich: &EnrichmentStage{}}
+	if !b.canPrepareImportEnrichment(t.Context(), req) {
+		t.Fatal("unrelated configured providers blocked a file with no semantic provider")
+	}
+	store.AddNode(&graph.Node{ID: "pathless-java-stub", Kind: graph.KindFunction, Language: "java", RepoPrefix: builderRepoPrefix})
+	if b.importHandleEnrichmentReady(t.Context(), req, store) {
+		t.Fatal("actual pathless language with an active supplemental provider bypassed admission")
+	}
+}
 
 func TestImportPreparationSlotCancellationReleasesCapacity(t *testing.T) {
 	gate := NewViewBuildGate()
@@ -189,6 +208,7 @@ func TestDetachedImportRejectsMovedInputsAndReleasesOnStop(t *testing.T) {
 			if out := await(); out.Err != nil || out.DirtyGenerationID == 0 {
 				t.Fatalf("warmup: %+v", out)
 			}
+			requireImportReadSetProof(t, c)
 			for i := 0; i < 4; i++ {
 				builderWriteFile(t, f.worktree, fmt.Sprintf("import_%d.go", i), fmt.Sprintf("package fixture\nfunc Import%d() {}\n", i))
 			}
@@ -419,4 +439,25 @@ func TestImportPreparationWaitDoesNotHoldTheBuildLane(t *testing.T) {
 		t.Fatal(err)
 	}
 	reused()
+}
+
+// Fast detachment depends on a real kernel change-stamp proof. Unsupported
+// filesystems keep the conservative, yieldable lane path; only that explicit
+// platform verdict is a prerequisite skip for physical-detachment fixtures.
+func requireImportReadSetProof(t *testing.T, c *CheckoutCoordinator) {
+	t.Helper()
+	sample, err := c.sampler.Sample(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := c.sampler.ConfirmReadSet(t.Context(), sample, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proof.Reason == "the checkout's filesystem gives no change stamps" {
+		t.Skip(proof.Reason)
+	}
+	if !proof.Confirmed {
+		t.Fatalf("fixture cannot prove its read set: %s", proof.Reason)
+	}
 }

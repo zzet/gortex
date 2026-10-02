@@ -8,6 +8,7 @@ import (
 
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/semantic"
 )
 
 type importBuildLaneKey struct{}
@@ -90,7 +91,7 @@ func resumeImportBuildLane(ctx context.Context, yieldable bool) (context.Context
 func (c *CheckoutCoordinator) prepareImportPlan(ctx context.Context, commit int64, sample gitstate.DirtySnapshot, route store_sqlite.CheckoutRoute) (func(), error) {
 	noop := func() {}
 	lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane)
-	if lane == nil || lane.gate == nil || c.builder == nil || (c.builder.Semantic != nil && !c.defersEnrichment()) {
+	if lane == nil || lane.gate == nil || c.builder == nil {
 		return noop, nil
 	}
 	if len(sample.Entries) <= importInteractivePaths && !c.importInProgress(ctx, route.DirtyGenerationID) {
@@ -133,7 +134,7 @@ func (g *ViewBuildGate) acquireImportPreparation(ctx context.Context) (func(), e
 // startup correction still needs to modify. A lease alone prevents retirement,
 // not writes to generation zero or correction of old derivation versions.
 func (b *SparseGenerationBuilder) importPreparationEpochs(ctx context.Context, req BuildRequest) (map[int64]uint64, bool, error) {
-	if !req.importBatch || req.followup || len(req.Changes) != 1 || (req.Enrich != nil && b.Semantic != nil) {
+	if !req.importBatch || req.followup || len(req.Changes) != 1 || !b.canPrepareImportEnrichment(ctx, req) {
 		return nil, false, nil
 	}
 	if req.importReadSetReady == nil || !req.importReadSetReady(ctx) {
@@ -169,4 +170,59 @@ func (b *SparseGenerationBuilder) checkImportPreparationEpochs(epochs map[int64]
 		}
 	}
 	return nil
+}
+
+// A manager without a provider for this file does no semantic work. An actual
+// provider must advertise independent admission for this exact checkout scope;
+// manager presence alone does not establish that foreground work can proceed.
+func (b *SparseGenerationBuilder) canPrepareImportEnrichment(ctx context.Context, req BuildRequest) bool {
+	if req.Enrich == nil || b.Semantic == nil {
+		return true
+	}
+	languages := map[string][]string{}
+	for _, change := range req.Changes {
+		language, known := b.Registry.DetectLanguage(change.Path)
+		if !known {
+			return !b.Semantic.HasProviders()
+		}
+		languages[language] = append(languages[language], builderGraphPath(req.RepoPrefix, change.Path))
+	}
+	return b.importEnrichmentProvidersReady(ctx, req, languages)
+}
+
+func (b *SparseGenerationBuilder) importEnrichmentProvidersReady(ctx context.Context, req BuildRequest, languages map[string][]string) bool {
+	if req.Enrich == nil || b.Semantic == nil {
+		return true
+	}
+	for language, files := range languages {
+		providers, known := b.Semantic.CheckoutPreparationProviders(language)
+		if !known {
+			return false
+		}
+		for _, provider := range providers {
+			parallel, ok := provider.(interface {
+				ConcurrentCheckoutPreparation(context.Context, string, string, semantic.CheckoutCompilerScope, []string) bool
+			})
+			if !ok || !parallel.ConcurrentCheckoutPreparation(ctx, req.RootPath, req.RepoPrefix, b.checkoutCompilerScope(req.Changes), files) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// The resolver can materialize dependents/shared emitters beyond Changes.
+// Check that actual payload before allowing any provider to execute off lane.
+func (b *SparseGenerationBuilder) importHandleEnrichmentReady(ctx context.Context, req BuildRequest, handle *store_sqlite.Store) bool {
+	languages := map[string][]string{}
+	for _, node := range handle.AllNodes() {
+		if node != nil && node.RepoPrefix == req.RepoPrefix && node.Language != "" {
+			if node.FilePath != "" {
+				languages[node.Language] = append(languages[node.Language], node.FilePath)
+			} else if _, ok := languages[node.Language]; !ok {
+				languages[node.Language] = nil
+			}
+		}
+	}
+	return b.importEnrichmentProvidersReady(ctx, req, languages)
 }

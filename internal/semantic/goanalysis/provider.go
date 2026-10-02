@@ -3058,3 +3058,31 @@ func loadErrorKind(kind packages.ErrorKind) string {
 		return "unknown"
 	}
 }
+
+// ConcurrentCheckoutPreparation reports whether this file-bounded working-copy
+// pass uses shareable compiler admission with a second slot for other roots.
+// It follows the same module and handle-root planning as enrichRepoContext;
+// full/exclusive initial loads and one-slot configurations are declined. A
+// later scoped-load retry retains that same shareable token.
+func (p *Provider) ConcurrentCheckoutPreparation(ctx context.Context, root, repoPrefix string, scope semantic.CheckoutCompilerScope, files []string) bool {
+	if ctx.Err() != nil || root == "" || !scope.HandleRoots || scope.Committed || scope.ManifestChanged || p.includeTest {
+		return false
+	}
+	gate, _ := p.admissionGates()
+	if cap(gate) < 2 {
+		return false
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	loadDir, modules := goLoadDir(absRoot)
+	if modules == 0 {
+		return true
+	} // The provider reports no-module without loading a compiler.
+	handle := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		handle[file] = struct{}{}
+	}
+	return !planHandleRoots(absRoot, loadDir, repoPrefix, handle, scope).full && ctx.Err() == nil
+}

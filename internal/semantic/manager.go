@@ -1695,3 +1695,42 @@ func (m *Manager) ProviderForLanguage(lang string) Provider {
 	candidates := m.selectProviders()
 	return candidates[lang]
 }
+
+// CheckoutPreparationProviders describes every eager provider this checkout
+// language can dispatch, including supplemental passes. A router-only winner
+// is unknown until instantiated and must stay in ordinary lane admission.
+// This metadata query never spawns a language server.
+func (m *Manager) CheckoutPreparationProviders(language string) ([]Provider, bool) {
+	if m == nil || !m.config.Enabled || !m.config.checkoutLSPEnabled() {
+		return nil, true
+	}
+	selected := m.selectProviders()
+	var out []Provider
+	if provider := selected[language]; provider != nil {
+		out = append(out, provider)
+	}
+	for _, provider := range m.providers {
+		if !isSupplemental(provider) || !provider.Available() || m.providerDisabled(provider.Name()) {
+			continue
+		}
+		for _, lang := range provider.Languages() {
+			if lang == language {
+				out = append(out, provider)
+				break
+			}
+		}
+	}
+	if m.config.EagerLSP && m.lspRouter != nil && selected[language] == nil {
+		for _, name := range m.lspRouter.EnabledSpecNames() {
+			if !m.lspRouter.SpecAvailable(name) {
+				continue
+			}
+			for _, lang := range m.lspRouter.SpecLanguages(name) {
+				if lang == language {
+					return nil, false
+				}
+			}
+		}
+	}
+	return out, true
+}

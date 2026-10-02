@@ -1512,7 +1512,9 @@ type cachedProgram struct {
 func (p *Provider) loadCheckoutProgramCached(ctx context.Context, loadDir, digest string, plan handleRootPlan, scope semantic.CheckoutCompilerScope, stats *semantic.CompilerCacheStats) (cachedProgram, error) {
 	p.warmupSnapshot(loadDir, stats)
 	st := p.typecheckState(loadDir, digest)
-	st.mu.Lock()
+	if err := lockResolveContext(ctx, &st.mu); err != nil {
+		return cachedProgram{}, err
+	}
 	var once sync.Once
 	release := func() { once.Do(st.mu.Unlock) }
 	out := cachedProgram{release: release}
@@ -1565,7 +1567,10 @@ func (p *Provider) loadCheckoutProgramCached(ctx context.Context, loadDir, diges
 				targetedWaited = true
 				st.mu.Unlock()
 				waited, outcome := p.waitTargetedListing(ctx, filepath.Clean(loadDir), plan.rootDirs, targetedWaitBound())
-				st.mu.Lock()
+				if err := lockResolveContext(ctx, &st.mu); err != nil {
+					out.release = nil // The listing wait released this lock.
+					return out, err
+				}
 				stats.TargetedWaitMs, stats.TargetedWait = waited.Milliseconds(), outcome
 				if outcome != "" {
 					continue
