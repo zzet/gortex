@@ -132,6 +132,8 @@ type ViewBuildLaneHolder struct {
 // imposing a semantic limit on worktrees, refs, or overlays.
 type ViewBuildGate struct {
 	mu sync.Mutex
+	// importPreparation bounds unpublished one-file work outside the lane.
+	importPreparation chan struct{}
 
 	open   bool
 	opened chan struct{}

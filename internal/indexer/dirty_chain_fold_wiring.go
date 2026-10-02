@@ -54,7 +54,11 @@ const compactionYieldCheckoutMutation = "synchronous checkout mutation"
 type storeChainFoldBackend struct{ store *store_sqlite.Store }
 
 func (b storeChainFoldBackend) BeginChainFold(ctx context.Context, chain []int64, to int64, owner string) (chainFoldSteps, error) {
-	fold, err := b.store.BeginChainFold(ctx, store_sqlite.ChainFoldRequest{Chain: chain, To: to, Owner: owner})
+	target := time.Duration(0)
+	if fold, _ := ctx.Value(importFoldPublicationKey{}).(*importFoldPublication); fold != nil {
+		target = 10 * time.Millisecond
+	}
+	fold, err := b.store.BeginChainFold(ctx, store_sqlite.ChainFoldRequest{Chain: chain, To: to, Owner: owner, StepTarget: target})
 	if err != nil {
 		return nil, err
 	}

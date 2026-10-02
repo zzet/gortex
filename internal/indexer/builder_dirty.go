@@ -314,7 +314,9 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	// chained delta. Each link is short, preemptible between links, and never
 	// lost to a yield or a movement abort of a later one.
 	remaining := 0
+	importBatch := false
 	if req.importLarge && (len(changes) > importInteractivePaths || req.continueImport) {
+		importBatch = true
 		if batch := selectWorkingTreeBatch(changes, importBatchFiles); len(batch) < len(changes) {
 			remaining = len(changes) - len(batch)
 			changes = batch
@@ -362,7 +364,27 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		}
 	}
 	generationID, report, err := b.buildWorkingTreeLayer(ctx, BuildRequest{
-		Identity:              identity,
+		Identity:          identity,
+		importBatch:       importBatch,
+		prePublishBarrier: req.buildBarrier,
+		importReadSetReady: func(ctx context.Context) bool {
+			if req.Sampler == nil {
+				return false
+			}
+			verdict, err := req.Sampler.ConfirmReadSet(ctx, before, nil, nil)
+			return err == nil && verdict.Confirmed
+		},
+		prePublishRecheck: func(ctx context.Context) (bool, error) {
+			if prepublishSampleWanted(ctx) {
+				return false, nil
+			}
+			set, ok := buildReadSetFrom(ctx)
+			if !ok || req.Sampler == nil {
+				return false, nil
+			}
+			verdict, err := req.Sampler.ConfirmReadSet(ctx, before, set.files, set.dirs)
+			return verdict.Confirmed && !prepublishSampleWanted(ctx), err
+		},
 		RecomputeDerivedPaths: req.RecomputeDerivedPaths,
 		deferEnrichment:       req.deferEnrichment,
 		followup:              len(req.followupPaths) > 0,
@@ -378,9 +400,6 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		ProjectID:   req.ProjectID,
 		Enrich:      enrich,
 		PrePublish: func(ctx context.Context, generationID int64) error {
-			if req.buildBarrier != nil {
-				req.buildBarrier()
-			}
 			return b.confirmDirtyBuildInputs(ctx, req.Sampler, req.CheckoutRoot, generationID, before)
 		},
 		inputManifest: manifest,

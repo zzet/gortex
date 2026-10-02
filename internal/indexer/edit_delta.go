@@ -70,13 +70,99 @@ const (
 // path, falling back to the sparse closure builder for a manifest change and
 // for a delta the DeltaWriter refused.
 func (b *SparseGenerationBuilder) buildWorkingTreeLayer(ctx context.Context, req BuildRequest) (int64, BuildReport, error) {
+	prepublish := req.PrePublish
+	var reenter func(context.Context, bool) (context.Context, error)
+	var leave func()
+	req.PrePublish = func(ctx context.Context, generation int64) error {
+		if req.prePublishBarrier != nil {
+			req.prePublishBarrier()
+		}
+		for attempt := 0; ; attempt++ {
+			if reenter != nil && attempt == 3 {
+				fallbackCtx, err := reenter(ctx, true)
+				if err != nil {
+					return err
+				}
+				if prepublish != nil {
+					if err := prepublish(fallbackCtx, generation); err != nil {
+						return err
+					}
+				}
+				reachBuildCommitPoint(fallbackCtx)
+				return fallbackCtx.Err()
+			}
+			// Full sampling (including refresh demand and git admission) stays
+			// outside the lane. A retry retains this complete private payload.
+			if prepublish != nil {
+				if err := prepublish(ctx, generation); err != nil {
+					return err
+				}
+			}
+			if reenter == nil {
+				return nil
+			}
+			if _, err := reenter(ctx, false); err != nil {
+				return err
+			}
+			proofCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+			confirmed, err := req.prePublishRecheck(proofCtx)
+			if proofCtx.Err() != nil {
+				confirmed = false
+			}
+			cancel()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			if confirmed {
+				return nil
+			}
+			leave()
+		}
+	}
+
 	for _, change := range req.Changes {
 		if dependencyManifestPath(change.Path) {
 			if req.followup && b.Config.Coverage.IsEnabled("clones") {
 				return 0, BuildReport{}, fmt.Errorf("indexer: clone follow-up cannot use the sparse manifest path: %s", change.Path)
 			}
+			var err error
+			ctx, err = resumeImportBuildLane(ctx, true)
+			if err != nil {
+				return 0, BuildReport{}, err
+			}
 			b.logEditDeltaFallback(req, editDeltaFallbackManifest+": "+change.Path)
 			return b.Build(ctx, req)
+		}
+	}
+	if lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane); lane != nil && lane.gate != nil {
+		epochs, eligible, err := b.importPreparationEpochs(ctx, req)
+		if err != nil {
+			return 0, BuildReport{}, err
+		}
+		if eligible {
+			// begin releases the lane before waiting for the preparation slot.
+			release, err := lane.begin(ctx)
+			if err != nil {
+				return 0, BuildReport{}, err
+			}
+			defer release()
+			leave = lane.leave
+			reenter = func(ctx context.Context, yieldable bool) (context.Context, error) {
+				var err error
+				ctx, err = lane.reenter(ctx, yieldable)
+				if err != nil {
+					return ctx, err
+				}
+				return ctx, b.checkImportPreparationEpochs(epochs)
+			}
+		} else {
+			ctx, err = lane.reenter(ctx, true)
+			if err != nil {
+				return 0, BuildReport{}, err
+			}
 		}
 	}
 	generationID, report, err := b.buildEditDelta(ctx, req)
@@ -85,8 +171,28 @@ func (b *SparseGenerationBuilder) buildWorkingTreeLayer(ctx context.Context, req
 		if req.followup && b.Config.Coverage.IsEnabled("clones") {
 			return generationID, report, err
 		}
+		if reenter != nil {
+			var admissionErr error
+			ctx, admissionErr = reenter(ctx, true)
+			if admissionErr != nil {
+				return generationID, report, admissionErr
+			}
+		}
+		// Sparse fallback owns a bulk window: it must never leave the lane.
+		reenter, leave = nil, nil
 		b.logEditDeltaFallback(req, editDeltaFallbackRefused+": "+refused.reason)
 		return b.Build(ctx, req)
+	}
+	// A ready generation or a coalesced flight bypasses PrePublish. The
+	// coordinator still reenters before it changes the route to that payload.
+	if reenter != nil && ctx.Err() == nil {
+		_, admissionErr := reenter(ctx, false)
+		if err == nil {
+			err = admissionErr
+		}
+	}
+	if reenter != nil && errors.Is(err, ErrDirtySnapshotChanged) {
+		err = fmt.Errorf("%w: %w", errImportPreparationChanged, err)
 	}
 	return generationID, report, err
 }

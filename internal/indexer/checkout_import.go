@@ -48,7 +48,50 @@ func (c *CheckoutCoordinator) foldImportChain(
 	if err != nil || !found {
 		return
 	}
-	built, err := c.flattenDirtyChain(ctx, commit, out.DirtyGenerationID)
+	copier := c.copyChainAtOnce
+	lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane)
+	if lane != nil && lane.gate != nil && c.builder != nil {
+		// The copied inputs are sealed generations, held throughout verification
+		// and publication. The stepped copier already protects them with its
+		// reservation; this lease also covers the pre-copy manifest planning.
+		base, closeBase, err := c.generationLayerReader(ctx, out.DirtyGenerationID)
+		if err != nil {
+			return
+		}
+		defer closeBase()
+		epochs, eligible, err := c.builder.importPreparationEpochs(ctx, BuildRequest{
+			Base: base, importBatch: true,
+			Changes:            []LayerPathChange{{Path: "fold", Kind: LayerPathAdded}},
+			importReadSetReady: func(context.Context) bool { return true },
+		})
+		if err != nil {
+			return
+		}
+		if eligible {
+			release, err := lane.begin(ctx)
+			if err != nil {
+				return
+			}
+			defer release()
+			// All live exits restore the caller's lane ownership, including a
+			// refused or interrupted copy. A cancelled cycle only cleans up.
+			defer func() {
+				if ctx.Err() == nil {
+					_, _ = lane.reenter(ctx, false)
+				}
+			}()
+			ctx = context.WithValue(ctx, importFoldPublicationKey{}, &importFoldPublication{
+				beforePublish: func(ctx context.Context) error {
+					if _, err := lane.reenter(ctx, false); err != nil {
+						return err
+					}
+					return c.builder.checkImportPreparationEpochs(epochs)
+				},
+			})
+			copier = c.copyChainInSteps
+		}
+	}
+	built, err := c.flattenDirtyChainOver(ctx, commit, commit, out.DirtyGenerationID, copier)
 	if err != nil {
 		c.logger.Debug("checkout coordinator: import chain not folded",
 			zap.String("checkout", c.checkoutID), zap.Error(err))

@@ -1330,7 +1330,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		c.reportCheckoutCycle(ctx, through, out)
 		return
 	}
-	defer release()
+	defer func() { release() }()
 	admission := cycleAdmission{
 		Preflight: preflightDone.Sub(preflightStarted),
 		CycleLock: laneQueued.Sub(preflightDone),
@@ -1365,6 +1365,34 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		// (live: 95 s and 313 s behind a 389-file working tree).
 		ctx, laneYield = armBackgroundLaneYield(ctx, c.gate, 0)
 		defer laneYield.close()
+		ctx = context.WithValue(ctx, importBuildLaneKey{}, &importBuildLane{
+			detach: func() bool {
+				if !laneYield.commit() {
+					return false
+				}
+				release()
+				release = func() {}
+				return true
+			},
+			resume: func(ctx context.Context, yieldable bool) (context.Context, error) {
+				next, err := c.gate.AcquireRanked(ctx, ViewBuildBackground, c.selectionRequests(), c.ticketDemand.Load)
+				if err != nil {
+					return ctx, err
+				}
+				withdraw := c.gate.NoteHolder(ViewBuildLaneHolder{
+					Kind: "checkout_import_publication", CheckoutID: c.checkoutID,
+					Priority: viewBuildPriorityLabel(ViewBuildBackground), Root: c.root, Reason: reason,
+				})
+				release = func() { withdraw(); next() }
+				return ctx, nil
+			},
+			arm: func(ctx context.Context) error {
+				var err error
+				laneYield, err = rearmBackgroundLaneYield(ctx, c.gate, laneYield)
+				return err
+			},
+			gate: c.gate,
+		})
 		ctx, treeMove = c.armTreeMoveAbort(ctx, cycleStarted)
 		defer c.disarmTreeMoveAbort(treeMove)
 	}
@@ -2959,6 +2987,11 @@ func (c *CheckoutCoordinator) moveCommitSlot(
 // or a slot-at-a-time flip from another surface. The rebuild that follows
 // would serve that pair for its whole duration, so the slot goes first.
 func (c *CheckoutCoordinator) clearDirtySlot(ctx context.Context, route *store_sqlite.CheckoutRoute) error {
+	var admissionErr error
+	ctx, admissionErr = resumeImportBuildLane(ctx, false)
+	if admissionErr != nil {
+		return admissionErr
+	}
 	err := c.catalog.FlipCheckoutRouteSlot(ctx, store_sqlite.FlipCheckoutRouteSlotRequest{
 		CheckoutID:         c.checkoutID,
 		Slot:               store_sqlite.RouteSlotDirty,
@@ -3011,7 +3044,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	targetTree string,
 	route *store_sqlite.CheckoutRoute,
 	out *CheckoutCycle,
-) error {
+) (slotErr error) {
 	// The plan's own reads between the cycle's admission and the build are
 	// lapped (the sample, the routed row's chain check, the reuse lookup,
 	// the parent selection) and logged once the slot builds.
@@ -3043,6 +3076,19 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		return nil
 	}
 	planLap("sample")
+	finishPlanning, err := c.prepareImportPlan(ctx, commitGeneration, sample, *route)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if ctx.Err() == nil {
+			_, err := resumeImportBuildLane(ctx, false)
+			if slotErr == nil {
+				slotErr = err
+			}
+		}
+		finishPlanning()
+	}()
 	key := c.dirtySampleKey(route.GraphID, commitGeneration, sample)
 	if route.DirtyGenerationID > 0 {
 		row, found, err := c.catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
@@ -3347,7 +3393,7 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 		if errors.As(err, &fallback) {
 			return dirtyLayerBuild{Reason: fallback.Reason, Work: work}, nil
 		}
-		if !errors.Is(err, ErrDirtySnapshotChanged) {
+		if !errors.Is(err, ErrDirtySnapshotChanged) || errors.Is(err, errImportPreparationChanged) {
 			// A build that died part way left its generation failed; it is
 			// owed a retirement like a torn attempt, so a canceled compaction
 			// or a failed edit leaks no payload.
@@ -3449,6 +3495,11 @@ func (c *CheckoutCoordinator) flip(
 	slot store_sqlite.RouteSlot,
 	generationID int64,
 ) error {
+	var admissionErr error
+	ctx, admissionErr = resumeImportBuildLane(ctx, false)
+	if admissionErr != nil {
+		return admissionErr
+	}
 	// The builder publishes as its last step, so a generation reaching here is
 	// already ready and PublishAndRoute — which publishes and then flips —
 	// would refuse it for not being in the building state. The flip alone is

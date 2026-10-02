@@ -81,6 +81,17 @@ type foldVerifier func(ctx context.Context, root int64, oldestFirst []int64, fol
 func (c *CheckoutCoordinator) flattenDirtyChainChecked(
 	ctx context.Context, commit, root store_sqlite.ViewGeneration, top int64, copy chainCopier, verify foldVerifier,
 ) (dirtyLayerBuild, []int64, error) {
+	// A planning fold must reenter with ordinary interactive cancellation.
+	// A fold following a committed import already owns its protected publication
+	// lane; rearming it here could prevent compaction under sustained demand.
+	foldPublication, _ := ctx.Value(importFoldPublicationKey{}).(*importFoldPublication)
+	if lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane); lane != nil && lane.detached && foldPublication == nil {
+		var admissionErr error
+		ctx, admissionErr = lane.reenter(ctx, true)
+		if admissionErr != nil {
+			return dirtyLayerBuild{}, nil, admissionErr
+		}
+	}
 	started := time.Now()
 	whole, ok, reason, err := c.dirtyChainRoot(ctx, top, commit, maxChainWalkDepth)
 	if err != nil {
@@ -167,6 +178,12 @@ func (c *CheckoutCoordinator) flattenDirtyChainChecked(
 	if err := stampFoldedGeneration(ctx, c.store, oldestFirst, handle); err != nil {
 		abandon()
 		return dirtyLayerBuild{}, nil, err
+	}
+	if foldPublication != nil {
+		if err := foldPublication.beforePublish(ctx); err != nil {
+			abandon()
+			return dirtyLayerBuild{}, nil, err
+		}
 	}
 	if err := c.store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
 		abandon()

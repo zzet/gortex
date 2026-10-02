@@ -175,6 +175,14 @@ type LayerBase interface {
 
 // BuildRequest is one sparse generation build.
 type BuildRequest struct {
+	// importBatch marks the one-file quantum of a large working-tree import.
+	importBatch bool
+	// prePublishBarrier runs before lane reentry and the final freshness fence.
+	prePublishBarrier func()
+	// importReadSetReady excludes filesystems without a short reentry proof.
+	importReadSetReady func(context.Context) bool
+	prePublishRecheck  func(context.Context) (bool, error)
+
 	// Identity names the generation in the catalog.
 	Identity GenerationIdentity
 

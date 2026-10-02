@@ -29,6 +29,9 @@ type backgroundLaneYield struct {
 	withdraw  func()
 	committed bool
 	yielded   bool
+	// next is a rearmed yield sharing this cycle's cancellation context. Old
+	// contexts still reach the current commit point through this delegation.
+	next *backgroundLaneYield
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -82,6 +85,10 @@ func (y *backgroundLaneYield) commit() bool {
 		return true
 	}
 	y.mu.Lock()
+	if next := y.next; next != nil {
+		y.mu.Unlock()
+		return next.commit()
+	}
 	if y.yielded {
 		y.mu.Unlock()
 		return false
@@ -112,10 +119,41 @@ func (y *backgroundLaneYield) close() {
 		return
 	}
 	y.stopOnce.Do(func() {
+		y.mu.Lock()
+		next := y.next
+		y.mu.Unlock()
+		next.close()
 		close(y.stop)
 		y.withdraw()
 		y.cancel()
 	})
+}
+
+// rearmBackgroundLaneYield preserves the cycle context: a new ordinary
+// fallback's preemption cancels every caller retaining it, while every retained
+// commit-point value reaches the newest yield. Cleanup belongs to the cycle.
+func rearmBackgroundLaneYield(ctx context.Context, gate *ViewBuildGate, previous *backgroundLaneYield) (*backgroundLaneYield, error) {
+	if previous == nil || !previous.commit() {
+		return previous, ctx.Err()
+	}
+	yield, withdraw := gate.NoteYieldable(0)
+	if yield == nil {
+		withdraw()
+		return previous, nil
+	}
+	next := &backgroundLaneYield{cancel: previous.cancel, withdraw: withdraw, stop: make(chan struct{})}
+	previous.mu.Lock()
+	previous.next = next
+	previous.mu.Unlock()
+	go func() {
+		select {
+		case <-yield:
+			next.fire()
+		case <-next.stop:
+		case <-ctx.Done():
+		}
+	}()
+	return next, nil
 }
 
 // reachBuildCommitPoint is called by a build right before it publishes. For a

@@ -85,6 +85,9 @@ type ChainFoldRequest struct {
 	Chain []int64
 	To    int64
 	Owner string
+	// StepTarget may request smaller transactions for a fold sharing the writer
+	// with frequent interactive edits. Zero retains the default target.
+	StepTarget time.Duration
 }
 
 // chainFoldPhase is where in a member the fold is.
@@ -122,11 +125,12 @@ type ChainFold struct {
 	masks                                 generationMaskSet
 	exclude                               *flattenExclusion
 
-	usPerRow float64
-	counts   GenerationCopyCounts
-	steps    int
-	yields   int
-	released bool
+	usPerRow   float64
+	counts     GenerationCopyCounts
+	steps      int
+	yields     int
+	released   bool
+	stepTarget time.Duration
 }
 
 // chainFoldHeld is the store's one fold and the members it holds.
@@ -204,7 +208,7 @@ func (s *Store) BeginChainFold(ctx context.Context, req ChainFoldRequest) (*Chai
 		return fail(fmt.Errorf("%w: generation %d has another writer", ErrChainFoldBusy, req.To))
 	}
 	f := &ChainFold{
-		s: s, chain: append([]int64(nil), req.Chain...), to: req.To, owner: req.Owner, flight: flight,
+		s: s, chain: append([]int64(nil), req.Chain...), to: req.To, owner: req.Owner, flight: flight, stepTarget: req.StepTarget,
 		member: len(req.Chain) - 1, phase: foldPhasePrepare,
 		hiddenPaths: map[string]struct{}{}, hiddenIDs: map[string]struct{}{}, hiddenSources: map[string]struct{}{},
 	}
@@ -336,12 +340,19 @@ func (s *Store) walOverFoldMark(now time.Time) bool {
 	return int64(mark.MxFrame)*(int64(mark.PageSize)+walFrameHeaderBytes) > chainFoldWALMark
 }
 
+func (f *ChainFold) targetDuration() time.Duration {
+	if f.stepTarget > 0 && f.stepTarget < chainFoldStepTarget {
+		return f.stepTarget
+	}
+	return chainFoldStepTarget
+}
+
 // stepRows is the row budget of the next step.
 func (f *ChainFold) stepRows() int {
 	if f.usPerRow <= 0 {
 		return chainFoldFirstRows
 	}
-	rows := int(float64(chainFoldStepTarget.Microseconds()) / f.usPerRow)
+	rows := int(float64(f.targetDuration().Microseconds()) / f.usPerRow)
 	return min(max(rows, chainFoldMinRows), chainFoldMaxRows)
 }
 
@@ -395,7 +406,7 @@ func (f *ChainFold) Step(ctx context.Context) (done bool, err error) {
 				return nil
 			}
 			next()
-			if f.phase == foldPhaseDone || int(moved) >= budget || time.Since(started) >= chainFoldStepTarget {
+			if f.phase == foldPhaseDone || int(moved) >= budget || time.Since(started) >= f.targetDuration() {
 				return nil
 			}
 		}
