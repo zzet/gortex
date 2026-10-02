@@ -24,7 +24,14 @@ func dirtyContentGit(tb testing.TB, repo string, args ...string) string {
 	tb.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	argv := []string{"-c", "user.name=Dirty Content Test", "-c", "user.email=dirty-content@example.invalid", "-c", "core.hooksPath=" + os.DevNull, "-C", repo}
+	// Join automatic maintenance before returning: a detached Git worker can
+	// otherwise write into the test-owned repository during TempDir cleanup.
+	argv := []string{
+		"-c", "user.name=Dirty Content Test", "-c", "user.email=dirty-content@example.invalid",
+		"-c", "core.hooksPath=" + os.DevNull,
+		"-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
+		"-C", repo,
+	}
 	cmd := exec.CommandContext(ctx, "git", append(argv, args...)...)
 	for _, item := range os.Environ() {
 		if !strings.HasPrefix(item, "GIT_") {
