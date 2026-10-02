@@ -497,7 +497,7 @@ func TestPassiveCheckpointRetriesWALPinnedByReader(t *testing.T) {
 func TestCheckpointLoopStartupProbeCannotBlockClose(t *testing.T) {
 	for _, poolSize := range []int{1, 2, sqliteMaxOpenConns} {
 		t.Run(fmt.Sprintf("readers_%d", poolSize), func(t *testing.T) {
-			physical := filepath.Join(t.TempDir(), "startup space # question ?.sqlite")
+			physical := filepath.Join(t.TempDir(), "startup space # percent %.sqlite")
 			uri := sqliteDSN(physical, "mode=rwc")
 			store, err := Open(uri)
 			if err != nil {
