@@ -66,10 +66,7 @@
         "workspace"
       ],
       "command": "gortex",
-      "disabled": false,
-      "env": {
-        "GORTEX_INDEX_WORKERS": "8"
-      }
+      "disabled": false
     }
   }
 }
@@ -161,10 +158,7 @@ For durable context, use `recall` (`surface`/`notes`/`memories`) before editing 
         "workspace"
       ],
       "command": "gortex",
-      "disabled": false,
-      "env": {
-        "GORTEX_INDEX_WORKERS": "8"
-      }
+      "disabled": false
     }
   }
 }

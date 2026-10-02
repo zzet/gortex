@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/zzet/gortex/internal/daemon"
+	semver "github.com/zzet/gortex/internal/version"
 )
 
 // daemonDecision is the resolved auto-start outcome.
@@ -130,10 +132,49 @@ func daemonStartupHeartbeatFresh(now time.Time) bool {
 // Injectable seams so the race/fallback/spawn-failure branches are
 // testable without a real daemon.
 var (
-	isDaemonRunning  = daemon.IsRunning
-	spawnDaemon      = spawnBareDaemon
-	stopIntentActive = daemon.StopIntentActive
+	isDaemonRunning      = daemon.IsRunning
+	spawnDaemon          = spawnBareDaemon
+	stopIntentActive     = daemon.StopIntentActive
+	runningDaemonVersion = dialRunningDaemonVersion
+	binaryVersion        = canonicalVersion
+	stopStaleDaemon      = func() error { return stopRunningDaemon(io.Discard) }
 )
+
+// dialRunningDaemonVersion reports the build the live daemon announces in its
+// handshake ack. ok is false when the daemon cannot be reached or rejects the
+// handshake (a protocol mismatch carries no version to compare).
+func dialRunningDaemonVersion() (string, bool) {
+	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
+	if err != nil {
+		return "", false
+	}
+	defer c.Close()
+	return c.Ack.DaemonVersion, c.Ack.DaemonVersion != ""
+}
+
+// daemonOlderThanBinary reports whether the running daemon is a strictly
+// older release than this binary — the state a package-manager upgrade leaves
+// behind, since the old process keeps running from the replaced image and
+// keeps holding the store lock. Dev builds and unparseable versions never
+// qualify: there is no direction to trust, and replacing in both directions
+// would let two installs keep bouncing one daemon. Only "older" qualifies, so
+// an older CLI never downgrades a newer daemon.
+func daemonOlderThanBinary() bool {
+	local := binaryVersion()
+	if local == "" || local == "v0.0.0-dev" {
+		return false
+	}
+	running, ok := runningDaemonVersion()
+	if !ok || running == "v0.0.0-dev" {
+		return false
+	}
+	d, dErr := semver.Parse(running)
+	l, lErr := semver.Parse(local)
+	if dErr != nil || lErr != nil {
+		return false
+	}
+	return semver.Compare(d, l) < 0
+}
 
 // spawnBareDaemon is the autostart default for spawnDaemon. Autostart has no
 // `daemon start` flags to forward — it is `gortex mcp` / `gortex track`
@@ -153,6 +194,9 @@ func resolveDaemonDecision() daemonDecision {
 // shared by `gortex mcp` and `gortex track`.
 func ensureDaemonReady(autostart bool) daemonDecision {
 	if isDaemonRunning() {
+		if autostart && daemonOlderThanBinary() {
+			return replaceStaleDaemon()
+		}
 		return daemonReady
 	}
 	if !autostart {
@@ -193,6 +237,55 @@ func ensureDaemonReady(autostart bool) daemonDecision {
 	// K callers don't serially retry a broken spawn.
 	if spawnFailedRecently() {
 		return daemonUnavailable
+	}
+	if err := spawnDaemon(); err != nil {
+		stampSpawnFailure()
+		return daemonUnavailable
+	}
+	return daemonAutostarted
+}
+
+// replaceStaleDaemon swaps a live daemon that is older than this binary for
+// one started from it. Upgrades used to do this from the Homebrew cask's
+// postflight hook; doing it here covers every install channel and runs
+// outside any package-manager sandbox, under the user's real HOME.
+//
+// It runs under the spawn lock so concurrent callers (several editors
+// reconnecting after an upgrade) replace the daemon once: losers wait for
+// the lock, then re-check and find the new daemon current. Any failure to
+// stop leaves the old daemon serving — the proxy's skew warning still tells
+// the user to restart it.
+func replaceStaleDaemon() daemonDecision {
+	lockPath := daemon.SpawnLockPath()
+	_ = os.MkdirAll(filepath.Dir(lockPath), 0o700)
+	lock := flock.New(lockPath)
+
+	locked, err := waitForSpawnLock(context.Background(), lock, spawnLockWaitOptions{
+		startupProgress: daemonStartupHeartbeatFresh,
+	})
+	if err != nil || !locked {
+		if isDaemonRunning() {
+			return daemonReady
+		}
+		return daemonUnavailable
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	if !isDaemonRunning() || !daemonOlderThanBinary() {
+		// A peer replaced it (or it went away) while we waited for the lock.
+		if isDaemonRunning() {
+			return daemonReady
+		}
+		return daemonUnavailable
+	}
+	// A supervised daemon is bounced through its supervisor, as `daemon
+	// restart` does; a manual stop+start would orphan it from the unit.
+	if serviceActive() {
+		_ = serviceRestart(io.Discard)
+		return daemonReady
+	}
+	if err := stopStaleDaemon(); err != nil {
+		return daemonReady
 	}
 	if err := spawnDaemon(); err != nil {
 		stampSpawnFailure()

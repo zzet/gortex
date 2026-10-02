@@ -52,7 +52,18 @@ echo "==> loading the rendered cask through brew"
 # `brew info --cask` evaluates every stanza, so an unknown one (the #639 bug)
 # fails here. Output is kept: a reviewer should see the artifact list change
 # when the template changes.
+log="$(mktemp)"
+trap 'cleanup; rm -f "$log"' EXIT
 HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 \
-	brew info --cask "$tap_user/tap/gortex"
+	brew info --cask "$tap_user/tap/gortex" 2>&1 | tee "$log"
+
+# A deprecated stanza still loads, so the check above passes, but Homebrew
+# warns every user who installs or upgrades and later turns the deprecation
+# into a load error, which is #639 again on a delay. The legacy `postflight`
+# block went this way. Fail on the warning instead of waiting for the error.
+if grep -qi "deprecated" "$log"; then
+	echo "FATAL: the rendered cask uses a stanza Homebrew has deprecated (see above)" >&2
+	exit 1
+fi
 
 echo "==> cask loads cleanly"

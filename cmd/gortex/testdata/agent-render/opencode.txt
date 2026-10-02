@@ -31,9 +31,6 @@ Routing stub for the example-two community.
         "mcp"
       ],
       "enabled": true,
-      "environment": {
-        "GORTEX_INDEX_WORKERS": "8"
-      },
       "type": "local"
     }
   }
@@ -622,9 +619,6 @@ description: "Preview an edit's blast radius on the shadow graph before writing.
         "mcp"
       ],
       "enabled": true,
-      "environment": {
-        "GORTEX_INDEX_WORKERS": "8"
-      },
       "type": "local"
     }
   }

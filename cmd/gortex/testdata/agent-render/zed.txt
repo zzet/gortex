@@ -6,9 +6,6 @@
         "mcp"
       ],
       "command": "gortex",
-      "env": {
-        "GORTEX_INDEX_WORKERS": "8"
-      },
       "source": "custom"
     }
   }
@@ -26,9 +23,6 @@
         "mcp"
       ],
       "command": "gortex",
-      "env": {
-        "GORTEX_INDEX_WORKERS": "8"
-      },
       "source": "custom"
     }
   }

@@ -1064,6 +1064,16 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 			return serviceStop(w)
 		}
 	}
+	return stopRunningDaemon(w)
+}
+
+// stopRunningDaemon is the unsupervised stop: shut the daemon down over its
+// control socket (or by PID when the socket is gone or won't answer) and
+// block until the process has exited and released the store lock. It records
+// no stop intent, so callers that start a replacement right after — `daemon
+// restart`, and autostart replacing a daemon older than this binary — leave
+// autostart enabled.
+func stopRunningDaemon(w io.Writer) error {
 	if !daemon.IsRunning() {
 		// The socket is gone, but a process may still be alive and holding
 		// the store lock — a daemon mid-shutdown, or one whose socket wedged.

@@ -6,9 +6,6 @@
         "mcp"
       ],
       "command": "gortex",
-      "env": {
-        "GORTEX_INDEX_WORKERS": "8"
-      },
       "type": "local"
     }
   }
@@ -172,9 +169,6 @@ Never restart the daemon, delete its store, or re-track merely to expose a workt
         "mcp"
       ],
       "command": "gortex",
-      "env": {
-        "GORTEX_INDEX_WORKERS": "8"
-      },
       "type": "local"
     }
   }

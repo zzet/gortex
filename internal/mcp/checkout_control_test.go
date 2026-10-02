@@ -405,7 +405,10 @@ func TestCheckoutStaleDiscoveryProofNeverReturnsBaseData(t *testing.T) {
 		result := f.facade(t, root, "search", map[string]any{
 			"operation": "symbols", "query": "Old", "options": map[string]any{"limit": 10},
 		})
-		require.Less(t, time.Since(started), time.Second)
+		// Each discovery wait is capped at 250ms, but one facade call can wait
+		// at several admission points plus catalog and Git work. 5s keeps a
+		// hang check without failing loaded CI runners.
+		require.Less(t, time.Since(started), 5*time.Second)
 		require.True(t, result.IsError, "stale proof must not expose the primary's Old symbol: %+v", result.Content)
 		if strings.Contains(viewResultText(t, result), graphview.CodeViewBuilding) {
 			require.True(t, time.Now().Before(deadline), "stale proof was never resolved")

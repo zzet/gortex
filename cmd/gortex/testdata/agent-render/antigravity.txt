@@ -45,10 +45,7 @@ Use `recall` before revisiting prior work and `remember` immediately for durable
       "args": [
         "mcp"
       ],
-      "command": "gortex",
-      "env": {
-        "GORTEX_INDEX_WORKERS": "8"
-      }
+      "command": "gortex"
     }
   }
 }
@@ -131,10 +128,7 @@ Use `recall` before revisiting prior work and `remember` immediately for durable
       "args": [
         "mcp"
       ],
-      "command": "gortex",
-      "env": {
-        "GORTEX_INDEX_WORKERS": "8"
-      }
+      "command": "gortex"
     }
   }
 }

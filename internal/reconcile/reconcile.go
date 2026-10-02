@@ -217,6 +217,7 @@ type familyPass struct {
 	inventoryErr   error
 	primaryGraphID string
 	now            time.Time
+	beforeAllocate func() error
 }
 
 // ReconcileFamily brings one family's catalog rows in line with what git and
@@ -616,6 +617,11 @@ func (r *Reconciler) observeNew(
 		LastSeen:       pass.now.Unix(),
 	}
 	checkout.HeadRef, checkout.HeadCommit, checkout.HeadTree, _ = r.headFor(ctx, record)
+	if pass.beforeAllocate != nil {
+		if err := pass.beforeAllocate(); err != nil {
+			return entry, err
+		}
+	}
 	if err := r.catalog.AllocateCheckout(ctx, checkout); err != nil {
 		if errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
 			// Another actor allocated this administrative name between this

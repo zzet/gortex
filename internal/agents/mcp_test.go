@@ -118,6 +118,9 @@ func TestUpsertMCPServerWithMigrationReplacesLegacy(t *testing.T) {
 			t.Fatalf("migration left legacy --index in args: %v", got)
 		}
 	}
+	if _, hasEnv := got["env"]; hasEnv {
+		t.Fatalf("migration kept the legacy GORTEX_INDEX_WORKERS env: %v", got)
+	}
 }
 
 // TestUpsertMCPServerWithMigrationIdempotent verifies the second run
@@ -131,7 +134,6 @@ func TestUpsertMCPServerWithMigrationIdempotent(t *testing.T) {
 			"gortex": map[string]any{
 				"command": "gortex",
 				"args":    []any{"mcp"},
-				"env":     map[string]any{"GORTEX_INDEX_WORKERS": "8"},
 			},
 		},
 	}

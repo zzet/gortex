@@ -9,9 +9,10 @@ import (
 	"time"
 )
 
-func scheduleOnlyCoordinator(checkoutID string, poll, quiet time.Duration, cycleDone func()) *CheckoutCoordinator {
+func scheduleOnlyCoordinator(checkoutID, root string, poll, quiet time.Duration, cycleDone func()) *CheckoutCoordinator {
 	c := &CheckoutCoordinator{
 		checkoutID: checkoutID,
+		root:       root,
 		quiet:      quiet,
 		poll:       poll,
 		signal:     make(chan struct{}, 1),
@@ -82,7 +83,7 @@ func TestCheckoutPollFleetUsesPhasedInitialDeadlinesOnFakeClock(t *testing.T) {
 				coordinators := make([]*CheckoutCoordinator, 0, size)
 				for i := 0; i < size; i++ {
 					id := fmt.Sprintf("checkout-%04d", i)
-					coordinator := scheduleOnlyCoordinator(id, interval, quiet, func() {
+					coordinator := scheduleOnlyCoordinator(id, ".", interval, quiet, func() {
 						mu.Lock()
 						if _, recorded := first[id]; !recorded {
 							first[id] = time.Since(started)
@@ -137,7 +138,7 @@ func TestCheckoutExplicitSignalDoesNotWaitForPollPhase(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		started := time.Now()
 		cycleAt := make(chan time.Duration, 1)
-		coordinator := scheduleOnlyCoordinator(id, interval, quiet, func() {
+		coordinator := scheduleOnlyCoordinator(id, ".", interval, quiet, func() {
 			select {
 			case cycleAt <- time.Since(started):
 			default:

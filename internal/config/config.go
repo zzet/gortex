@@ -202,15 +202,13 @@ type SemanticConfig struct {
 	WatchDebounceMs   int                      `mapstructure:"watch_debounce_ms" yaml:"watch_debounce_ms,omitempty"`
 	RefuteUnconfirmed bool                     `mapstructure:"refute_unconfirmed" yaml:"refute_unconfirmed,omitempty"`
 	Providers         []SemanticProviderConfig `mapstructure:"providers" yaml:"providers,omitempty"`
-	// GoTypes enables the heavyweight go/packages type-check provider
-	// ("go-types"): a full `go list ./...` + go/types pass over the module
-	// (and its dependencies) on every index. The in-process tree-sitter Go
-	// resolver (go-ast-types) is the always-on floor and resolves the common
-	// receiver / cross-file call cases with no toolchain; the go/packages
-	// provider adds full cross-package / generic type precision but costs
-	// tens of seconds per Go module per warmup and, on an already-resolved
-	// graph, frequently confirms zero new edges. Tri-state, DEFAULT OFF —
-	// opt in for maximum Go type precision. Env override GORTEX_GO_TYPES=1/0.
+	// GoTypes enables the in-process go/packages type-check provider
+	// ("go-types"). Tri-state, DEFAULT ON: it type-checks the module once
+	// rather than driving gopls per request. Each pass runs `go list ./...`
+	// and go/types over the module and its dependencies, which can take tens
+	// of seconds per module; set false to rely on the tree-sitter Go floor.
+	// Registration requires a Go toolchain; the floor works without one.
+	// Env override GORTEX_GO_TYPES=1/0 takes precedence at registration.
 	GoTypes *bool `mapstructure:"go_types" yaml:"go_types,omitempty"`
 	// AdditionalWorkspaceFolders are extra directory roots passed to
 	// every LSP server's `initialize` request as workspace folders.
@@ -279,12 +277,11 @@ type SemanticConfig struct {
 }
 
 // GoTypesEnabledOrDefault resolves the tri-state SemanticConfig.GoTypes.
-// The heavyweight go/packages type-check provider is OFF by default — the
-// always-on tree-sitter Go floor (go-ast-types) serves Go resolution — so
-// opt in explicitly for full cross-package type precision.
+// The in-process go/packages type-check provider is ON by default.
+// Environment overrides are applied separately at provider registration.
 func (s SemanticConfig) GoTypesEnabledOrDefault() bool {
 	if s.GoTypes == nil {
-		return false
+		return true
 	}
 	return *s.GoTypes
 }

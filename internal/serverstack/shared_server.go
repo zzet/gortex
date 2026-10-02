@@ -917,10 +917,7 @@ func goTypesEnrichEnabled(sem config.SemanticConfig) bool {
 	if v := os.Getenv("GORTEX_GO_TYPES"); v != "" {
 		return v == "1" || strings.EqualFold(v, "true")
 	}
-	if sem.GoTypes != nil {
-		return *sem.GoTypes
-	}
-	return true
+	return sem.GoTypesEnabledOrDefault()
 }
 
 // goTypesIncludeTests reports whether the go-types provider should load

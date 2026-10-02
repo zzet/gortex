@@ -8,6 +8,13 @@ on:
   schedule:
     - cron: '0 6 * * *'
 
+# One run per PR: a new push cancels the PR's older run. Every other event
+# (pushes to main, schedules) gets its own group from the run ID, so none of
+# those runs is ever cancelled or replaced while pending.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   security-events: write
@@ -18,10 +25,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache: true
+      # No separate setup-go step: the action sets up Go itself. A second
+      # setup-go restore failed on the module files the first one had already
+      # unpacked, so every PR saved its own copy of the Go cache.
       - name: govulncheck
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
         with:

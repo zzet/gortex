@@ -17,6 +17,13 @@ import (
 // the catalog exactly like an inventory read here, and never retained. This
 // avoids a second whole-family Git probe in the first-request admission path.
 func (r *Reconciler) ObserveCheckout(ctx context.Context, familyID, root string, sampled ...*gitstate.FamilyInventory) (CheckoutReport, error) {
+	return r.ObserveCheckoutWithAdmission(ctx, familyID, root, nil, sampled...)
+}
+
+// ObserveCheckoutWithAdmission checks a caller's discovery proof after metadata
+// sampling and immediately before allocating a new identity. Existing catalog
+// identities are returned unchanged, without running the allocation check.
+func (r *Reconciler) ObserveCheckoutWithAdmission(ctx context.Context, familyID, root string, beforeAllocate func() error, sampled ...*gitstate.FamilyInventory) (CheckoutReport, error) {
 	family, found, err := r.catalog.GetRepositoryFamily(ctx, familyID)
 	if err != nil {
 		return CheckoutReport{}, err
@@ -53,7 +60,7 @@ func (r *Reconciler) ObserveCheckout(ctx context.Context, familyID, root string,
 	if err != nil {
 		return CheckoutReport{}, err
 	}
-	pass := &familyPass{family: family, inventory: inv, now: r.now()}
+	pass := &familyPass{family: family, inventory: inv, now: r.now(), beforeAllocate: beforeAllocate}
 	for _, graph := range graphs {
 		if graph.IsPrimaryBase {
 			pass.primaryGraphID = graph.GraphID

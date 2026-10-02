@@ -616,7 +616,7 @@ jobs:
             --arg autourl "https://github.com/${GITHUB_REPOSITORY}/releases/download/v\$version/gortex_windows_amd64.zip" \
             '{
                version: $version,
-               description: "Code intelligence engine that indexes repositories into an in-memory knowledge graph.",
+               description: "Code intelligence engine that indexes repositories into a knowledge graph.",
                homepage: $homepage,
                license: "Apache-2.0",
                architecture: { "64bit": { url: $url, hash: $hash } },

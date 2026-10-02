@@ -82,9 +82,8 @@ func TestApplyWritesMcpServersWithLocalTransport(t *testing.T) {
 	if len(args) != 1 || args[0] != "mcp" {
 		t.Fatalf("args = %v, want [mcp]", entry["args"])
 	}
-	envMap, _ := entry["env"].(map[string]any)
-	if envMap["GORTEX_INDEX_WORKERS"] != "8" {
-		t.Fatalf("env GORTEX_INDEX_WORKERS = %v, want the literal \"8\"", envMap["GORTEX_INDEX_WORKERS"])
+	if _, hasEnv := entry["env"]; hasEnv {
+		t.Fatalf("env = %v, want none — the parse worker count is the daemon's default", entry["env"])
 	}
 }
 

@@ -13,8 +13,7 @@
 //	    "gortex": {
 //	      "source": "custom",
 //	      "command": "gortex",
-//	      "args": ["mcp", "--index", ".", "--watch"],
-//	      "env": {"GORTEX_INDEX_WORKERS": "8"}
+//	      "args": ["mcp", "--index", ".", "--watch"]
 //	    }
 //	  }
 //	}
@@ -121,7 +120,6 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 			"source":  "custom",
 			"command": "gortex",
 			"args":    []string{"mcp"},
-			"env":     map[string]string{"GORTEX_INDEX_WORKERS": "8"},
 		}
 		root["context_servers"] = servers
 		return true, nil

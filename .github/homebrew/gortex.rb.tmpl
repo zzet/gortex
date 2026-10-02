@@ -25,7 +25,7 @@ cask "gortex" do
   end
 
   name "gortex"
-  desc "Code intelligence engine that indexes repositories into an in-memory knowledge graph."
+  desc "Code intelligence engine that indexes repositories into a knowledge graph."
   homepage "https://github.com/zzet/gortex"
 
   livecheck do
@@ -36,31 +36,6 @@ cask "gortex" do
 
   generate_completions_from_executable "gortex",
     shell_parameter_format: :cobra
-
-  # After an upgrade the old daemon is still live on the previous
-  # binary's image and still owns the store's on-disk lock, so bounce
-  # it onto the new binary. "daemon restart" stops the old process
-  # (blocking until it exits, which releases the lock) before starting
-  # the new one, so any store migration runs alone.
-  #
-  # postflight is the only hook that can do this: the cask DSL has no
-  # pre_install/post_install (those are formula-only), and preflight
-  # is too early — brew unlinks the old cask's binary before the new
-  # cask's artifacts install, so preflight sees no gortex at all.
-  #
-  # Guarded on a daemon actually answering, so a fresh install and CI
-  # (which never launch one) skip the restart instead of starting a
-  # daemon nobody asked for. must_succeed: false on the probe — the
-  # cask DSL's system_command raises on a non-zero exit, and "daemon
-  # status" exits 1 precisely in the "not running" case we branch on.
-  postflight do
-    bin = File.join(HOMEBREW_PREFIX, "bin", "gortex")
-    next unless File.executable?(bin)
-    probe = system_command(bin, args: ["daemon", "status"],
-                           must_succeed: false, print_stdout: false)
-    next unless probe.success?
-    system_command(bin, args: ["daemon", "restart"], must_succeed: false)
-  end
 
   # No zap stanza required
 end

@@ -3,6 +3,7 @@ package codex
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -282,6 +283,9 @@ GORTEX_INDEX_WORKERS = '8'
 	}
 	if server["startup_timeout_sec"] != int64(codexMCPStartupTimeoutSeconds) {
 		t.Fatalf("startup timeout lost during the migration: %#v", server)
+	}
+	if _, exists := server["env"]; exists {
+		t.Fatalf("upgrade left the managed GORTEX_INDEX_WORKERS env behind: %#v", server)
 	}
 }
 
@@ -1442,5 +1446,46 @@ func TestCodexHookInstallWarnsAboutTrust(t *testing.T) {
 	}
 	if len(res2.Warnings) != 0 {
 		t.Fatalf("unchanged hooks should not re-warn: %#v", res2.Warnings)
+	}
+}
+
+func TestCodexPruneManagedIndexWorkers(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		entry   map[string]any
+		changed bool
+		want    map[string]any
+	}{
+		{
+			name:    "managed value alone drops the env table",
+			entry:   map[string]any{"env": map[string]any{"GORTEX_INDEX_WORKERS": "8"}},
+			changed: true,
+			want:    map[string]any{},
+		},
+		{
+			name:    "managed value beside a user key keeps the user key",
+			entry:   map[string]any{"env": map[string]any{"GORTEX_INDEX_WORKERS": "8", "GORTEX_LOG": "debug"}},
+			changed: true,
+			want:    map[string]any{"env": map[string]any{"GORTEX_LOG": "debug"}},
+		},
+		{
+			name:  "a user-chosen value is preserved",
+			entry: map[string]any{"env": map[string]any{"GORTEX_INDEX_WORKERS": "4"}},
+			want:  map[string]any{"env": map[string]any{"GORTEX_INDEX_WORKERS": "4"}},
+		},
+		{
+			name:  "no env stays untouched",
+			entry: map[string]any{},
+			want:  map[string]any{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pruneManagedCodexIndexWorkers(tc.entry); got != tc.changed {
+				t.Fatalf("changed = %v, want %v", got, tc.changed)
+			}
+			if !reflect.DeepEqual(tc.entry, tc.want) {
+				t.Fatalf("entry = %#v, want %#v", tc.entry, tc.want)
+			}
+		})
 	}
 }

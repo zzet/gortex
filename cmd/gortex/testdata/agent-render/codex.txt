@@ -50,9 +50,6 @@ type = 'command'
 args = ['mcp']
 command = 'gortex'
 startup_timeout_sec = 90
-
-[mcp_servers.gortex.env]
-GORTEX_INDEX_WORKERS = '8'
 === project/root/.agents/skills/gortex-example-one/SKILL.md ===
 ---
 name: gortex-example-one
@@ -842,6 +839,3 @@ type = 'command'
 args = ['mcp']
 command = 'gortex'
 startup_timeout_sec = 90
-
-[mcp_servers.gortex.env]
-GORTEX_INDEX_WORKERS = '8'

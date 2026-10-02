@@ -6,10 +6,7 @@
         "args": [
           "mcp"
         ],
-        "command": "gortex",
-        "env": {
-          "GORTEX_INDEX_WORKERS": "8"
-        }
+        "command": "gortex"
       }
     }
   }
@@ -22,10 +19,7 @@
         "args": [
           "mcp"
         ],
-        "command": "gortex",
-        "env": {
-          "GORTEX_INDEX_WORKERS": "8"
-        }
+        "command": "gortex"
       }
     }
   }

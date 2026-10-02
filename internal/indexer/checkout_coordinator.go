@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -284,7 +285,9 @@ type CheckoutCoordinatorConfig struct {
 	// Debounce is the quiet window; <= 0 takes defaultCheckoutQuietWindow.
 	Debounce time.Duration
 	// PollInterval is how often the coordinator signals itself; < 0 disables
-	// the self-signal and 0 takes defaultCheckoutPollInterval.
+	// the self-signal and 0 takes defaultCheckoutPollInterval. Missing roots are
+	// probed with exponential backoff up to five minutes (or PollInterval if
+	// longer); lifecycle reconciliation owns retirement.
 	PollInterval time.Duration
 	// Retain bounds the commit generations kept for re-routing; <= 0 takes
 	// defaultRetainedCommitLayers.
@@ -1055,6 +1058,7 @@ func (c *CheckoutCoordinator) run() {
 	stopTimer(quiet)
 	defer stopTimer(quiet)
 
+	pollDelay := c.poll
 	var pollC <-chan time.Time
 	var pollTimer *time.Timer
 	if c.poll > 0 {
@@ -1111,8 +1115,21 @@ func (c *CheckoutCoordinator) run() {
 			}
 			c.cycle(lifetime)
 		case <-pollC:
-			c.Signal("poll")
-			pollTimer.Reset(c.poll)
+			// Absence is not removal evidence. Keep the coordinator available
+			// for explicit demand and leave clocks, routes and leases to the
+			// lifecycle, but do not fork git against a missing directory.
+			if _, err := os.Stat(c.root); errors.Is(err, os.ErrNotExist) {
+				limit := max(c.poll, 5*time.Minute)
+				if pollDelay > limit/2 {
+					pollDelay = limit
+				} else {
+					pollDelay *= 2
+				}
+			} else {
+				pollDelay = c.poll
+				c.Signal("poll")
+			}
+			pollTimer.Reset(pollDelay)
 		case <-armed:
 			armed = nil
 			if admitted != nil {

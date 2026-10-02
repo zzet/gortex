@@ -392,8 +392,9 @@ func upsertCopilotMCPServer(root map[string]any, w io.Writer, path string, opts 
 // reconcileRepoMCPJSON repairs a Gortex-authored entry in the repo's
 // .mcp.json so the file the CLI finds first does not shadow the config
 // we just wrote with one it cannot use. The claudecode adapter owns
-// that file and writes an entry with no "type" and a shell-style
-// "${GORTEX_WORKERS:-8}" default the CLI never expands.
+// that file and writes an entry with no "type"; entries written before
+// the worker default was dropped also carry a shell-style
+// "${GORTEX_WORKERS:-8}" env value the CLI never expands.
 //
 // The file is only ever edited, never created: an absent .mcp.json is
 // claudecode's to author, and every non-Gortex server entry in it is

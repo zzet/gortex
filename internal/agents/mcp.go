@@ -292,7 +292,7 @@ func MCPEntriesEqual(a, b any) bool {
 	return reflect.DeepEqual(av, bv)
 }
 
-// DefaultGortexMCPEntry returns the shared {command, args, env}
+// DefaultGortexMCPEntry returns the shared {command, args}
 // stanza most clients accept for project-local MCP configs (where
 // the editor launches the process with cwd set to the project root).
 // Adapters that want extra keys wrap this and add them (e.g. Cline's
@@ -315,7 +315,6 @@ func DefaultGortexMCPEntry() map[string]any {
 	return map[string]any{
 		"command": "gortex",
 		"args":    gortexMCPArgs(),
-		"env":     map[string]string{"GORTEX_INDEX_WORKERS": "8"},
 	}
 }
 

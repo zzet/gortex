@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -196,7 +197,7 @@ func (cm *ConfigManager) readWorkspaceConfig(repoPrefix, repoPath string) (*Conf
 	// a partial .gortex.yaml didn't mention lost its documented default
 	// (unset index.workers → parse pool of 1, unset
 	// max_parse_bytes_in_flight → admission semaphore disabled).
-	cfg := Default()
+	cfg := repoConfigSeed()
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		// Malformed workspace config — log warning, keep the last good parse.
 		cm.logger.Warn("malformed workspace config, keeping the last good parse",
@@ -267,6 +268,24 @@ func (cm *ConfigManager) WorkspacePrefixes() []string {
 	return out
 }
 
+// indexWorkersEnv names the variable that sets the parse worker count.
+const indexWorkersEnv = "GORTEX_INDEX_WORKERS"
+
+// repoConfigSeed returns Default() with the GORTEX_INDEX_WORKERS override
+// applied. Every per-repository config starts from it. config.Load binds
+// GORTEX_* variables through viper, but per-repository configs are read
+// with yaml.Unmarshal, so without this seed the daemon's per-repository
+// indexers never saw the variable. A repository's own index.workers still
+// wins because the file is unmarshalled over the seed. Invalid or
+// non-positive values are ignored and keep the NumCPU default.
+func repoConfigSeed() *Config {
+	cfg := Default()
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(indexWorkersEnv))); err == nil && n > 0 {
+		cfg.Index.Workers = n
+	}
+	return cfg
+}
+
 // getWorkspaceConfig returns the cached workspace config for a repo, or nil.
 func (cm *ConfigManager) getWorkspaceConfig(repoPrefix string) *Config {
 	cm.mu.RLock()
@@ -284,7 +303,7 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 		dup := *ws
 		out = &dup
 	} else {
-		out = Default()
+		out = repoConfigSeed()
 	}
 	effective := cm.EffectiveExclude(repoPrefix)
 	out.Exclude = effective

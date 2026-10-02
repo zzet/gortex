@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# One run per PR: a new push cancels the PR's older run. Every other event
+# (pushes to main, schedules) gets its own group from the run ID, so none of
+# those runs is ever cancelled or replaced while pending.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -178,4 +185,4 @@ jobs:
           go-version-file: go.mod
 
       - name: Run benchmarks
-        run: go test -bench=. -benchmem -count=1 -benchtime=1s -timeout=20m ./internal/parser/languages/ ./internal/query/ ./internal/graph/
+        run: go test -bench=. -benchmem -count=1 -benchtime=1x -timeout=20m ./internal/parser/languages/ ./internal/query/ ./internal/graph/

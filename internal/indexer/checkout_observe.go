@@ -194,9 +194,11 @@ func (l *CheckoutLifecycle) runCheckoutObservation(path string, job *checkoutObs
 		job.err = errors.Join(job.ctx.Err(), job.err)
 	}
 	close(job.done)
-	if job.err == nil && job.found {
-		// A caller that timed out just before publication can retrieve this
-		// result. One bounded worker owns expiry; no unbounded timer registry.
+	if (job.err == nil && job.found) || errors.Is(job.err, ErrCheckoutMutationStale) {
+		// Retain successes for callers that timed out, and stale admission
+		// refusals so retries within this job's work budget reuse the refusal
+		// instead of admitting a fresh proof. One bounded worker owns expiry;
+		// no unbounded timer registry.
 		<-job.ctx.Done()
 	}
 }
@@ -362,7 +364,9 @@ func (l *CheckoutLifecycle) applyCheckoutObservation(ctx context.Context, proof 
 	if err := l.validateCheckoutObservation(ctx, proof); err != nil {
 		return store_sqlite.Checkout{}, false, err
 	}
-	entry, err := l.rec.ObserveCheckout(ctx, proof.familyID, proof.selected.Path, proof.inventory)
+	entry, err := l.rec.ObserveCheckoutWithAdmission(ctx, proof.familyID, proof.selected.Path, func() error {
+		return l.validateCheckoutObservation(ctx, proof)
+	}, proof.inventory)
 	if err != nil {
 		return store_sqlite.Checkout{}, false, err
 	}

@@ -139,9 +139,6 @@ func upsertMCPServer(opts agents.ApplyOpts) func(map[string]any, bool) (bool, er
 		mcpSection["gortex"] = map[string]any{
 			"type":    "local",
 			"command": []string{"gortex", "mcp"},
-			"environment": map[string]string{
-				"GORTEX_INDEX_WORKERS": "8",
-			},
 			"enabled": true,
 		}
 		root["mcp"] = mcpSection

@@ -5,10 +5,7 @@
       "args": [
         "mcp"
       ],
-      "command": "gortex",
-      "env": {
-        "GORTEX_INDEX_WORKERS": "8"
-      }
+      "command": "gortex"
     }
   }
 }
@@ -56,10 +53,7 @@ Use **recall** before editing known code and **remember** for durable decisions 
       "args": [
         "mcp"
       ],
-      "command": "gortex",
-      "env": {
-        "GORTEX_INDEX_WORKERS": "8"
-      }
+      "command": "gortex"
     }
   }
 }
