@@ -1963,7 +1963,11 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// pre-fetch construction the engine's bundle would build a
 	// throwaway cache on each BM25 call and the handler's later
 	// rerank would still fetch every candidate's edges itself.
-	rctx := s.buildRerankContext(ctx, q)
+	loadingClass := queryClass
+	if isSoup {
+		loadingClass = rerank.QueryClassKeywordSoup
+	}
+	rctx := s.buildSymbolRerankContext(ctx, q, loadingClass)
 	scope.RerankContext = rctx
 
 	// Corpus selection: `code` (default) keeps only code symbols,

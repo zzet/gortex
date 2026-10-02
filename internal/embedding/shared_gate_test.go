@@ -15,6 +15,7 @@ func resetSharedCode(t *testing.T) {
 		sharedCodeLoaded = false
 		sharedCodeEnable = true
 		sharedCodeReaper = false
+		sharedCodeReady.Store(nil)
 		sharedCodeMu.Unlock()
 	}
 	restore()
@@ -63,8 +64,9 @@ func TestCodeEmbedderReaperDropsIdleModel(t *testing.T) {
 	sharedCodeMu.Lock()
 	sharedCodeLoaded = true
 	// Backdate the last use past the TTL, the state the reaper wakes to.
-	sharedCodeUsedAt = time.Now().Add(-2 * codeEmbedderIdleTTL)
-	idle := sharedCodeLoaded && time.Since(sharedCodeUsedAt) >= codeEmbedderIdleTTL
+	ready := &codeEmbedderReady{provider: sharedCodeInst, usedAt: time.Now().Add(-2 * codeEmbedderIdleTTL)}
+	sharedCodeReady.Store(ready)
+	idle := sharedCodeLoaded && time.Since(ready.usedAt) >= codeEmbedderIdleTTL
 	sharedCodeMu.Unlock()
 	if !idle {
 		t.Fatal("the reaper's idle predicate did not fire on a backdated model")
@@ -73,7 +75,7 @@ func TestCodeEmbedderReaperDropsIdleModel(t *testing.T) {
 	// A use refreshes the stamp, so an active daemon never reloads.
 	SharedCodeEmbedder()
 	sharedCodeMu.Lock()
-	stillIdle := time.Since(sharedCodeUsedAt) >= codeEmbedderIdleTTL
+	stillIdle := time.Since(sharedCodeReady.Load().usedAt) >= codeEmbedderIdleTTL
 	sharedCodeMu.Unlock()
 	if stillIdle {
 		t.Error("using the embedder did not refresh its idle stamp")
