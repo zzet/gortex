@@ -99,7 +99,8 @@ func (c *CheckoutCoordinator) foldingChain() []int64 {
 // its end. While it runs the chain is published as the folding chain.
 func (c *CheckoutCoordinator) copyChainInSteps(ctx context.Context, oldestFirst []int64, to int64) (store_sqlite.GenerationCopyCounts, func(context.Context, bool), error) {
 	backend := c.foldBackend()
-	fold, err := backend.BeginChainFold(ctx, oldestFirst, to, c.checkoutID)
+	watch := c.newFoldStepWatch(to)
+	fold, beginRetries, err := beginChainFoldWatched(ctx, backend, oldestFirst, to, c.checkoutID, watch)
 	if err != nil {
 		return store_sqlite.GenerationCopyCounts{}, nil, err
 	}
@@ -123,7 +124,8 @@ func (c *CheckoutCoordinator) copyChainInSteps(ctx context.Context, oldestFirst 
 		if hook != nil {
 			hook(ctx, step)
 		}
-	}, c.newFoldStepWatch(to))
+	}, watch)
+	retries += beginRetries
 	var counts store_sqlite.GenerationCopyCounts
 	if stepped, ok := fold.(interface {
 		Counts() (store_sqlite.GenerationCopyCounts, int, int)

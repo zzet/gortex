@@ -162,3 +162,35 @@ func runChainFoldStepsWatched(ctx context.Context, fold chainFoldSteps, retryabl
 		}
 	}
 }
+
+// Begin can yield too: its empty-target transaction takes the same writer
+// gate as a step. A rolled-back begin leaves no reservation or payload behind,
+// so retry that same target under the driver's existing cancellation and
+// starvation bounds rather than marking a live fold failed on the first edit.
+func beginChainFoldWatched(ctx context.Context, backend chainFoldBackend, chain []int64, to int64, owner string, watch *foldStepWatch) (chainFoldSteps, int, error) {
+	for retries := 0; ; retries++ {
+		if err := ctx.Err(); err != nil {
+			return nil, retries, err
+		}
+		fold, err := backend.BeginChainFold(ctx, chain, to, owner)
+		if err == nil {
+			return fold, retries, nil
+		}
+		if ctx.Err() != nil {
+			return nil, retries, ctx.Err()
+		}
+		if !backend.StepRetryable(err) {
+			return nil, retries, err
+		}
+		if err := watch.refused(err); err != nil {
+			return nil, retries, err
+		}
+		timer := time.NewTimer(foldStepRetryPoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, retries + 1, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
