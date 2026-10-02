@@ -462,6 +462,35 @@ func (m *tcManifest) unchangedRootFileSet(dir string, vc *semantic.CompilerCache
 	return true
 }
 
+// The directory scan follows go/packages, so it may see an added or renamed
+// file that the listed package never saw. Account for compiler-excluded Go
+// candidates too; CompiledGoFiles instead can contain generated cgo paths.
+func (m *tcManifest) matchesListedCandidates(meta *packages.Package) bool {
+	if m == nil {
+		return false
+	}
+	names := make(map[string]struct{}, len(meta.GoFiles)+len(meta.IgnoredFiles))
+	add := func(files []string) {
+		for _, file := range files {
+			file = filepath.Clean(file)
+			if filepath.Dir(file) == filepath.Clean(meta.Dir) && goSourceName(filepath.Base(file)) {
+				names[filepath.Base(file)] = struct{}{}
+			}
+		}
+	}
+	add(meta.GoFiles)
+	add(meta.IgnoredFiles)
+	if len(names) != len(m.files) {
+		return false
+	}
+	for name := range m.files {
+		if _, ok := names[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // tcListing is one `go list -export -deps` result, flattened, with the
 // manifests of its mutable packages recorded right after it. It is built
 // without the state lock (the warm-up lists the whole module in the
@@ -722,7 +751,7 @@ func (st *checkoutTypecheckState) checkRoots(rootDirs map[string]struct{}, vc *s
 			return closureCheck{bypass: "root_not_mutable"}
 		}
 		manifest := st.manifests[meta.PkgPath]
-		if !manifest.unchangedRootFileSet(meta.Dir, vc) {
+		if !manifest.matchesListedCandidates(meta) || !manifest.unchangedRootFileSet(meta.Dir, vc) {
 			return closureCheck{missReason: "root_files_changed"}
 		}
 		if !sameFiles(meta.CompiledGoFiles, meta.GoFiles) && !manifest.unchangedCgo(meta, vc) {
