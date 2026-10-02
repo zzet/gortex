@@ -61,6 +61,7 @@ func TestEditDeltaClaimsEveryChangedPathOnRepeatEdits(t *testing.T) {
 // path, its scoped discovery would take the whole root as the scope and
 // re-derive the repository into the generation.
 func TestEditDeltaEmptyChangeSetIsAnEmptyDelta(t *testing.T) {
+	builderIsolateGit(t)
 	repo := builderTempDir(t, "repo")
 	builderWriteTree(t, repo, sharedRowsTree())
 	builderGit(t, repo, "init", "-q")
