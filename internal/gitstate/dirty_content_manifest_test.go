@@ -12,12 +12,18 @@ import (
 	"testing"
 )
 
-// dirtyManifestFixture lays out one of every per-path content shape the
-// sampler distinguishes and returns the porcelain stream describing it.
+// dirtyManifestFixture lays out portable per-path content shapes and returns
+// the porcelain stream describing them. Executable mode has a separate POSIX
+// fixture because Windows Chmod cannot add execute bits.
 // Without the opaque directory nothing in it depends on timestamps, so the
 // fingerprint it yields is a stable golden value; an opaque directory's
 // identity carries its stat evidence and is excluded from the golden.
 func dirtyManifestFixture(t *testing.T, withOpaque bool) (string, []byte) {
+	t.Helper()
+	return dirtyManifestFixtureWithExecutable(t, withOpaque, false)
+}
+
+func dirtyManifestFixtureWithExecutable(t *testing.T, withOpaque, executable bool) (string, []byte) {
 	t.Helper()
 	root := t.TempDir()
 	blob := func(contents string) string {
@@ -33,15 +39,19 @@ func dirtyManifestFixture(t *testing.T, withOpaque bool) (string, []byte) {
 	dirtyContentWrite(t, root, "mod.txt", "edited body\n")
 	dirtyContentWrite(t, root, "new.txt", "untracked body\n")
 	exec := dirtyContentWrite(t, root, "exec.sh", "#!/bin/sh\n")
-	if err := os.Chmod(exec, 0o755); err != nil {
-		t.Fatal(err)
+	execMode := "100644"
+	if executable {
+		if err := os.Chmod(exec, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		execMode = "100755"
 	}
 	dirtyContentWrite(t, root, "same.txt", "restored body\n")
 	records := []string{
 		"1 .M N... 100644 100644 100644 " + headOld + " " + headOld + " mod.txt",
 		"1 .D N... 100644 100644 000000 " + headOld + " " + headOld + " gone.txt",
 		"? new.txt",
-		"1 .M N... 100644 100644 100755 " + blob("#!/bin/sh\n") + " " + blob("#!/bin/sh\n") + " exec.sh",
+		"1 .M N... 100644 100644 " + execMode + " " + blob("#!/bin/sh\n") + " " + blob("#!/bin/sh\n") + " exec.sh",
 		"1 M. N... 100644 100644 100644 " + blob("restored body\n") + " " + headOld + " same.txt",
 		"1 AD N... 000000 100644 000000 " + zero + " " + headOld + " ghost.txt",
 	}
@@ -54,21 +64,34 @@ func dirtyManifestFixture(t *testing.T, withOpaque bool) (string, []byte) {
 	return root, dirtyContentStatus(records...)
 }
 
-// dirtyManifestGoldenFingerprint is the fingerprint the sampler produced for
-// dirtyManifestFixture before per-path contents were exposed. Exposing the
-// contents must never move it.
+// dirtyManifestGoldenFingerprint preserves the original executable fixture's
+// fingerprint from before per-path contents were exposed. The portable golden
+// uses the same canonical input stream without the mode-only executable change.
 const dirtyManifestGoldenFingerprint = "fa408adde46df66c14dc942b3f95f876971fd8854e9c8bb631a3dee66bb689ac"
+const dirtyManifestPortableGoldenFingerprint = "47f0d19fa0d33e6db59fdadeac44e4f524d844e6bceab785ca1812cad20f0c64"
 
 func TestSampleDirtyFingerprintUnchangedByContents(t *testing.T) {
-	root, status := dirtyManifestFixture(t, false)
+	t.Run("portable", func(t *testing.T) {
+		root, status := dirtyManifestFixture(t, false)
+		assertDirtyManifestFingerprint(t, root, status, dirtyManifestPortableGoldenFingerprint)
+	})
+	t.Run("POSIX executable legacy golden", func(t *testing.T) {
+		requirePOSIXCheckout(t)
+		root, status := dirtyManifestFixtureWithExecutable(t, false, true)
+		assertDirtyManifestFingerprint(t, root, status, dirtyManifestGoldenFingerprint)
+	})
+}
+
+func assertDirtyManifestFingerprint(t *testing.T, root string, status []byte, want string) {
+	t.Helper()
 	calls := 0
 	s := dirtyContentFake(t, root, func(context.Context, string, ...string) ([]byte, error) {
 		calls++
 		return status, nil
 	})
 	got := dirtyContentSample(t, s)
-	if got.Fingerprint != dirtyManifestGoldenFingerprint {
-		t.Fatalf("fingerprint moved: got %s want %s", got.Fingerprint, dirtyManifestGoldenFingerprint)
+	if got.Fingerprint != want {
+		t.Fatalf("fingerprint moved: got %s want %s", got.Fingerprint, want)
 	}
 	if calls != 2 {
 		t.Fatalf("git commands=%d want 2", calls)
@@ -103,7 +126,7 @@ func TestSampleDirtyExposesContentPerPath(t *testing.T) {
 		"mod.txt":   {Path: "mod.txt", State: DirtyContentPresent, Mode: "100644", SHA256: sha("edited body\n")},
 		"gone.txt":  {Path: "gone.txt", State: DirtyContentAbsent},
 		"new.txt":   {Path: "new.txt", State: DirtyContentPresent, Mode: "100644", SHA256: sha("untracked body\n")},
-		"exec.sh":   {Path: "exec.sh", State: DirtyContentPresent, Mode: "100755", SHA256: sha("#!/bin/sh\n")},
+		"exec.sh":   {Path: "exec.sh", State: DirtyContentPresent, Mode: "100644", SHA256: sha("#!/bin/sh\n"), HeadEqual: true},
 		"same.txt":  {Path: "same.txt", State: DirtyContentPresent, Mode: "100644", SHA256: sha("restored body\n"), HeadEqual: true},
 		"ghost.txt": {Path: "ghost.txt", State: DirtyContentAbsent, HeadEqual: true},
 	}
