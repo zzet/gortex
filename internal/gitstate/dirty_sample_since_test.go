@@ -89,7 +89,7 @@ func TestSampleSinceNeverSharesAFailedSample(t *testing.T) {
 // TreeHoldsPaths answers literal HEAD membership, including for a path whose
 // name would be a pathspec pattern.
 func TestTreeHoldsPathsAnswersLiteralMembership(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempRoot(t)
 	git(t, dir, "init", "-q", "--initial-branch=main")
 	writeIn(t, dir, "kept.go", "package x\n")
 	writeIn(t, dir, "sub/deep.go", "package sub\n")
