@@ -9,15 +9,15 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
-    # Give the largest packages separate runners so they do not compete for
-    # CPU and memory. Keep the existing package and job time limits.
+    # Give the largest packages three exhaustive top-level test shards so
+    # race/coverage runs fit within the existing package and job time limits.
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         go-version: ['1.27']
-        partition: [remaining, store, indexer, mcp]
+        partition: [remaining, store-0, store-1, store-2, indexer-0, indexer-1, indexer-2, mcp]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -28,7 +28,7 @@ jobs:
       - name: Build
         run: go build -o gortex ./cmd/gortex/
 
-      # Derive each platform's package census and assign every package once.
+      # Derive each platform's compiled census; assign every top-level case once.
       # Linux and macOS retain race/coverage checks; Windows retains its
       # normal verbose run, whose per-test timings expose slow fixtures.
       - name: Test
@@ -37,30 +37,10 @@ jobs:
           TEST_PARTITION: ${{ matrix.partition }}
           TEST_WINDOWS: ${{ matrix.os == 'windows-latest' }}
         run: |
-          set -euo pipefail
-          module="$(go list -m)"
-          packages="$(go list ./...)"
-          selected=()
-          while IFS= read -r package; do
-            case "$package" in
-              "$module/internal/indexer") partition=indexer ;;
-              "$module/internal/graph/store_sqlite") partition=store ;;
-              "$module/internal/mcp") partition=mcp ;;
-              *) partition=remaining ;;
-            esac
-            if [[ "$partition" == "$TEST_PARTITION" ]]; then
-              selected+=("$package")
-            fi
-          done <<< "$packages"
-          if [[ ${#selected[@]} -eq 0 ]]; then
-            echo "No packages selected for $TEST_PARTITION" >&2
-            exit 1
-          fi
-          printf 'Running %s packages in %s partition\n' "${#selected[@]}" "$TEST_PARTITION"
           if [[ "$TEST_WINDOWS" == true ]]; then
-            go test -v -timeout=45m "${selected[@]}"
+            python scripts/ci-test-partition.py
           else
-            go test -race -timeout=45m -coverprofile=coverage.out "${selected[@]}"
+            python3 scripts/ci-test-partition.py
           fi
 
       - name: Upload coverage
