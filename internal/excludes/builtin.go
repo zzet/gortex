@@ -48,6 +48,14 @@ var Builtin = []string{
 	".bundle/",    // Ruby Bundler cache
 	".dart_tool/", // Dart/Flutter build cache
 	".pub-cache/", // Dart global pub cache, occasionally vendored
+	// Agent-tool state directories that document their cache subdirectory.
+	// Only the cache is dropped — a tool's project config and its memory/
+	// notes files stay visible. Serena (the language-server harness)
+	// rewrites .serena/cache/*.pkl on every session; the .pkl extension
+	// is claimed by the Pkl language, so without this entry the binary
+	// caches re-entered discovery on every rewrite and burned the parse
+	// budget on each reconcile.
+	".serena/cache/",
 	// Dependency caches a repo-local toolchain home materializes inside the
 	// working tree. A harness that pins M2_HOME / store-dir at the repo
 	// (CI images, benchmark runners, reproducible-build setups) lands tens

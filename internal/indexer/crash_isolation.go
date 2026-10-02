@@ -244,6 +244,23 @@ func (idx *Indexer) extractFileCtxWithRawLease(
 	pool *crashpool.Pool, q *crashpool.Quarantine,
 	path, relPath, lang string, ext parser.Extractor, src []byte,
 ) (result *parser.ExtractionResult, skipped bool, err error) {
+	// Binary payloads — not text any grammar can consume. A tool cache
+	// rewritten under a claimed extension (Serena's .serena/cache/*.pkl
+	// against the Pkl grammar) used to reach tree-sitter, burn the full
+	// parse budget twice (first pass + fallback, retried), and re-arm on
+	// every reconcile. Detect by content and skip with telemetry: the
+	// skip node keeps the file visible, the recorded receipt keeps it
+	// inert until its content actually changes, and the parse budget is
+	// never spent on bytes that could never yield a node.
+	//
+	// Non-code extractors are exempt: an image / document / data asset
+	// extractor (AssetClass set) deliberately reads binary payloads, so
+	// the guard applies only where a TEXT grammar would consume the bytes.
+	if parser.AssetClassOf(ext) == "" {
+		if reason := binaryArtifactReason(src); reason != "" {
+			return binarySkipResult(relPath, lang, reason), true, nil
+		}
+	}
 	// Bundled / minified build artifacts are synthetic source — a
 	// minified bundle or a sourcemap has no meaningful symbols and
 	// only pollutes the graph. Detect by content and skip with

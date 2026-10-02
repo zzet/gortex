@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -74,9 +75,22 @@ func parseErrorCount(lang string, content []byte) (int, bool) {
 		return 0, false
 	}
 	tree, err := parser.ParseFile(content, sl)
-	if err != nil || tree == nil {
-		// A failure here is a tree-sitter cancellation / timeout, not a
+	if err != nil {
+		// ErrBinarySource is a content verdict, not infrastructure: stay
+		// opinionated instead of going silent — otherwise the ParseFile
+		// guard would switch the gate off for exactly the content it
+		// refuses. It scores as one error so a direct caller blocks on
+		// it; checkParseGate decides the text→binary transition on its
+		// own, before the counts, so a NUL dropped into an already-broken
+		// file cannot hide behind a lower score.
+		if errors.Is(err, parser.ErrBinarySource) {
+			return 1, true
+		}
+		// Any other failure is a tree-sitter cancellation / timeout, not a
 		// syntax verdict — stay silent rather than block on infrastructure.
+		return 0, false
+	}
+	if tree == nil {
 		return 0, false
 	}
 	pt := parser.NewParseTree(tree, content, lang)
@@ -86,11 +100,12 @@ func parseErrorCount(lang string, content []byte) (int, bool) {
 
 // parseGateResult is the verdict of the pre-write syntax gate.
 type parseGateResult struct {
-	Checked   bool   // the language was parseable and the gate ran
-	Blocked   bool   // newContent introduces parse errors the old content did not
-	OldErrors int    // parse errors in the pre-edit content
-	NewErrors int    // parse errors in the candidate content
-	Language  string // gate language (may be set even when Checked is false)
+	Checked      bool   // the language was parseable and the gate ran
+	Blocked      bool   // newContent is a regression over oldContent
+	BecameBinary bool   // the edit turns a text file into NUL-bearing binary content
+	OldErrors    int    // parse errors in the pre-edit content
+	NewErrors    int    // parse errors in the candidate content
+	Language     string // gate language (may be set even when Checked is false)
 }
 
 // parseGateEnabled reports whether the pre-write parse gate is active. On by
@@ -107,8 +122,31 @@ func parseGateEnabled() bool {
 // introduce new syntax errors. oldContent may be nil (a brand-new file), in
 // which case any parse error in newContent counts as a regression. The gate
 // blocks only a regression — newErrors strictly greater than oldErrors.
+//
+// Turning a text file into NUL-bearing binary content is a regression of
+// its own, decided independently of the error counts: scoring a binary
+// payload as exactly one parse error would let a NUL slip into a file
+// that already has two or more tree-sitter errors (new=1 < old=2), an
+// edit a count-only gate lets through. The reverse directions — binary
+// to text, binary to binary — carry no parse-error baseline at all, so
+// they are never a regression.
 func checkParseGate(path string, oldContent, newContent []byte) parseGateResult {
 	lang := parseGateLanguage(path)
+	if lang == "" {
+		return parseGateResult{Language: lang}
+	}
+	// The sniff is the same definition ParseFile's ErrBinarySource guard
+	// uses, so the gate and the parse guard classify content identically.
+	newBinary := parser.LooksBinary(newContent)
+	oldBinary := len(oldContent) > 0 && parser.LooksBinary(oldContent)
+	if oldBinary || newBinary {
+		return parseGateResult{
+			Checked:      true,
+			Blocked:      newBinary && !oldBinary,
+			BecameBinary: newBinary && !oldBinary,
+			Language:     lang,
+		}
+	}
 	newErrs, newOK := parseErrorCount(lang, newContent)
 	if !newOK {
 		return parseGateResult{Language: lang}
@@ -130,6 +168,11 @@ func checkParseGate(path string, oldContent, newContent []byte) parseGateResult 
 
 // parseGateError renders the agent-facing refusal message for a blocked write.
 func parseGateError(relPath string, r parseGateResult) string {
+	if r.BecameBinary {
+		return fmt.Sprintf(
+			"parse gate: writing %s would turn %s source into binary (NUL-bearing) content — the edit appears to corrupt the file and was refused. Fix the fragment, or pass allow_parse_errors=true to write anyway.",
+			relPath, r.Language)
+	}
 	return fmt.Sprintf(
 		"parse gate: writing %s would introduce %d new %s parse error(s) (was %d, would be %d) — the edit appears to leave the file syntactically broken and was refused. Fix the fragment, or pass allow_parse_errors=true to write anyway.",
 		relPath, r.NewErrors-r.OldErrors, r.Language, r.OldErrors, r.NewErrors)
@@ -142,7 +185,7 @@ func parseGateInfo(r parseGateResult, allowed bool) map[string]any {
 	if !r.Checked {
 		return nil
 	}
-	if r.OldErrors == r.NewErrors && r.NewErrors == 0 {
+	if r.OldErrors == r.NewErrors && r.NewErrors == 0 && !r.Blocked {
 		return nil // nothing to report — a clean file stayed clean
 	}
 	m := map[string]any{
@@ -150,6 +193,9 @@ func parseGateInfo(r parseGateResult, allowed bool) map[string]any {
 		"old_errors": r.OldErrors,
 		"new_errors": r.NewErrors,
 		"blocked":    r.Blocked && !allowed,
+	}
+	if r.BecameBinary {
+		m["became_binary"] = true
 	}
 	if r.Blocked && allowed {
 		m["overridden"] = true

@@ -1,7 +1,9 @@
 package parser
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -62,9 +64,44 @@ type QueryResult struct {
 	Captures map[string]*CapturedNode
 }
 
+// ErrBinarySource is returned when the source carries a NUL byte within
+// its first binarySniffBytes — the same tell git uses to classify a blob
+// as binary. A NUL-bearing source is not text a text grammar can consume
+// without pathological error recovery: a binary payload that a language
+// extension nonetheless claimed (a tool cache .pkl, an object file)
+// drives tree-sitter into pathological balancing, burning the whole
+// parse budget for zero nodes. UTF-16 text is NUL-interleaved too and is
+// classified here as binary — the pipeline never transcodes it, so it
+// never yielded useful nodes as "text" either.
+var ErrBinarySource = errors.New("source is binary: refusing to feed NUL-bearing bytes to a text grammar")
+
+// binarySniffBytes bounds the binary content sniff. Git classifies a blob
+// as binary when its first 8000 bytes contain a NUL; 8 KiB is the same
+// heuristic rounded to a page-friendly bound.
+const binarySniffBytes = 8192
+
+// LooksBinary reports whether src carries a NUL byte within its first
+// binarySniffBytes. Exported so the indexer's extraction admission can
+// share one definition with this parse guard — a file the indexer skips
+// as binary and one ParseFile refuses must be the same file.
+func LooksBinary(src []byte) bool {
+	if len(src) > binarySniffBytes {
+		src = src[:binarySniffBytes]
+	}
+	return bytes.IndexByte(src, 0) >= 0
+}
+
 // ParseFile parses source bytes with the given language and returns the tree.
 // The caller must call tree.Close() when done.
 func ParseFile(src []byte, lang *sitter.Language) (*sitter.Tree, error) {
+	// Guard before the parser pool: a binary payload (a tool-cache pickle,
+	// an object file) claimed by a language extension is not text a grammar
+	// can consume, and its error recovery is pathological. The indexer's
+	// extraction admission skips these before they reach here; this backstop
+	// covers every other ParseFile caller.
+	if LooksBinary(src) {
+		return nil, ErrBinarySource
+	}
 	parser := getParser(lang)
 	// Pool the parser only on a clean parse. An errored parse (cancelled
 	// / timed out) may have left the C parser's canceled_balancing flag

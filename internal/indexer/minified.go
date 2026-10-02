@@ -1,6 +1,10 @@
 package indexer
 
-import "bytes"
+import (
+	"bytes"
+
+	"github.com/zzet/gortex/internal/parser"
+)
 
 // Tuning constants for build-artifact detection. The thresholds are
 // deliberately conservative — a false positive silently drops a real
@@ -24,6 +28,33 @@ var minifiableLang = map[string]bool{
 	"javascript": true,
 	"typescript": true,
 	"css":        true,
+}
+
+// binaryArtifactReason classifies src as a binary payload — not text any
+// grammar can consume — and returns a short human reason, or "" when src
+// could still be genuine source. The sniff is the same NUL-prefix tell
+// git uses and shares one definition with the parser's ParseFile guard
+// (parser.LooksBinary), so a file the indexer skips as binary is exactly
+// the file the parse guard would refuse.
+//
+// There is deliberately no config gate on this class: unlike a minified
+// bundle, NUL-bearing bytes can never parse as text, so "index it anyway"
+// is never a meaningful user choice — only a slower way to burn the parse
+// budget. Tool caches under a claimed extension are the
+// reported case: Serena rewrites .serena/cache/*.pkl, the .pkl extension
+// belongs to the Pkl language, and every reconcile re-fed the binary into
+// the fallback chunker for a ~15s timeout with zero nodes.
+func binaryArtifactReason(src []byte) string {
+	if !parser.LooksBinary(src) {
+		return ""
+	}
+	// A UTF-16 text source is NUL-interleaved like any binary payload;
+	// name it distinctly so a text file is not mislabelled as binary in
+	// index_health telemetry.
+	if len(src) >= 2 && ((src[0] == 0xFF && src[1] == 0xFE) || (src[0] == 0xFE && src[1] == 0xFF)) {
+		return "utf-16 text source (NUL-interleaved; nothing a text grammar can extract)"
+	}
+	return "binary source (NUL byte within the first 8 KiB)"
 }
 
 // minifiedArtifactReason classifies src as a build artifact that

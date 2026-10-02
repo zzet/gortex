@@ -87,6 +87,40 @@ func TestBuiltinExcludesRepoLocalToolchainCaches(t *testing.T) {
 	}
 }
 
+// Agent-tool state directories that document a cache subdirectory: the
+// cache is dropped, the tool's config and notes stay visible.
+func TestBuiltinExcludesAgentToolCaches(t *testing.T) {
+	t.Parallel()
+
+	matcher := New(Builtin)
+	for _, path := range []string{
+		".serena/cache/mql/raw_document_symbols.pkl",
+		".serena/cache/some/other/cache.pkl",
+		"nested/.serena/cache/raw_document_symbols.pkl",
+	} {
+		if !matcher.MatchRel(path) {
+			t.Errorf("Builtin should exclude agent tool cache path %q", path)
+		}
+	}
+}
+
+// The cache entries are directory-anchored: a first-party file under the
+// tool's own directory, or anywhere else, stays indexed.
+func TestBuiltinDoesNotExcludeAgentToolState(t *testing.T) {
+	t.Parallel()
+
+	matcher := New(Builtin)
+	for _, path := range []string{
+		".serena/project.yml",
+		".serena/memories/conventions.md",
+		"serena/cache/handler.go", // no leading dot: first-party package
+	} {
+		if matcher.MatchRel(path) {
+			t.Errorf("Builtin unexpectedly excludes first-party path %q", path)
+		}
+	}
+}
+
 // The cache entries are directory-anchored, so a first-party package or file
 // that merely shares the stem stays indexed.
 func TestBuiltinDoesNotExcludeSimilarToolchainNames(t *testing.T) {

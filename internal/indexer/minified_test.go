@@ -7,6 +7,30 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestBinaryArtifactReason(t *testing.T) {
+	// A Serena-style tool-cache pickle: a claimed extension holding a
+	// binary payload — the exact file class this guard targets.
+	pickle := append([]byte("\x80\x04\x95\x1a\x00"), 0x00, 0x00)
+	assert.NotEqual(t, "", binaryArtifactReason(pickle))
+
+	// A NUL byte inside the sniff window is binary, however late it lands.
+	lateNUL := append([]byte(strings.Repeat("package main\n", 500)), 0x00)
+	assert.NotEqual(t, "", binaryArtifactReason(lateNUL))
+
+	// The sniff covers the first 8 KiB only (the git heuristic): a NUL
+	// past the window is not caught here. The ParseFile guard shares the
+	// same window by design, and tree-sitter is error-tolerant on the
+	// tail — the pathological input class is a binary header, which
+	// always NULs within the window.
+	pastWindow := append([]byte(strings.Repeat("package main\n", 900)), 0x00)
+	assert.Equal(t, "", binaryArtifactReason(pastWindow))
+
+	// Genuine source — including embedded odd bytes but no NUL — is text.
+	normal := strings.Repeat("func handle(req Request) error { return nil }\n", 60)
+	assert.Equal(t, "", binaryArtifactReason([]byte(normal)))
+	assert.Equal(t, "", binaryArtifactReason(nil))
+}
+
 func TestMinifiedArtifactReason(t *testing.T) {
 	// A minified bundle — the whole file on one very long line.
 	minified := strings.Repeat("function a(b){return b+1};", 200)

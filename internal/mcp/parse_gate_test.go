@@ -1,6 +1,9 @@
 package mcp
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseGateLanguage(t *testing.T) {
 	cases := map[string]string{
@@ -38,6 +41,14 @@ func TestParseErrorCountGo(t *testing.T) {
 		t.Fatalf("broken Go: got (%d, %v), want (>0, true)", n, ok)
 	}
 
+	// A NUL byte is a content verdict (parser.ErrBinarySource), not a
+	// parse-infrastructure failure: the gate must keep its opinion so an
+	// edit that would write binary bytes is treated as a regression.
+	nul := []byte("package main\n\nfunc Add(a, b int) int { return a\x00 + b }\n")
+	if n, ok := parseErrorCount("go", nul); !ok || n == 0 {
+		t.Fatalf("NUL-bearing Go: got (%d, %v), want (>0, true)", n, ok)
+	}
+
 	// Unsupported language degrades to no-opinion.
 	if n, ok := parseErrorCount("cobol", clean); ok || n != 0 {
 		t.Fatalf("unsupported lang: got (%d, %v), want (0, false)", n, ok)
@@ -66,6 +77,12 @@ func TestCheckParseGate(t *testing.T) {
 	if r := checkParseGate("x.go", clean, broken); !r.Checked || !r.Blocked {
 		t.Errorf("clean->broken: got %+v, want Checked && Blocked", r)
 	}
+	// clean -> NUL-bearing: the ErrBinarySource verdict counts as a
+	// regression, so an edit that writes binary bytes is refused.
+	nul := []byte("package main\n\nfunc Add(a, b int) int { return a\x00 + b }\n")
+	if r := checkParseGate("x.go", clean, nul); !r.Checked || !r.Blocked {
+		t.Errorf("clean->nul: got %+v, want Checked && Blocked", r)
+	}
 	// clean -> clean: no regression.
 	if r := checkParseGate("x.go", clean, clean); !r.Checked || r.Blocked {
 		t.Errorf("clean->clean: got %+v, want Checked && !Blocked", r)
@@ -88,6 +105,37 @@ func TestCheckParseGate(t *testing.T) {
 	}
 }
 
+// TestCheckParseGate_BinaryVerdict pins the text→binary transition as a
+// verdict decided before the error counts: scoring a NUL as exactly one
+// parse error would let a NUL slip into a file that already has two
+// tree-sitter errors (new=1 < old=2) — an edit a count-only gate allows,
+// but which main's parse refused because there the NUL added errors on
+// top of the existing ones.
+func TestCheckParseGate_BinaryVerdict(t *testing.T) {
+	twoErrs := []byte("package main\n\nfunc A() { x := }\nfunc B() { y := }\n")
+	nul := []byte("package main\n\nfunc A() { x := }\nfunc B() { y := \"a\x00b\" }\n")
+
+	// broken -> NUL-bearing: the transition blocks regardless of counts.
+	if r := checkParseGate("a.go", twoErrs, nul); !r.Checked || !r.Blocked || !r.BecameBinary {
+		t.Errorf("broken->nul: got %+v, want Checked && Blocked && BecameBinary", r)
+	}
+	// Binary -> binary: no baseline to regress, never blocked.
+	if r := checkParseGate("a.go", nul, nul); !r.Checked || r.Blocked || r.BecameBinary {
+		t.Errorf("nul->nul: got %+v, want Checked && !Blocked && !BecameBinary", r)
+	}
+	// Binary -> text is a fix (binary carries no parse-error baseline).
+	if r := checkParseGate("a.go", nul, twoErrs); !r.Checked || r.Blocked {
+		t.Errorf("nul->broken: got %+v, want Checked && !Blocked", r)
+	}
+}
+
+func TestParseGateErrorBinary(t *testing.T) {
+	msg := parseGateError("a.go", parseGateResult{Checked: true, Blocked: true, BecameBinary: true, Language: "go"})
+	if !strings.Contains(msg, "binary (NUL-bearing)") || strings.Contains(msg, "new go parse error") {
+		t.Errorf("binary refusal message = %q, want the binary wording without a count delta", msg)
+	}
+}
+
 func TestParseGateInfo(t *testing.T) {
 	if parseGateInfo(parseGateResult{}, false) != nil {
 		t.Error("unchecked gate should produce no info")
@@ -102,5 +150,10 @@ func TestParseGateInfo(t *testing.T) {
 	info = parseGateInfo(parseGateResult{Checked: true, Blocked: true, NewErrors: 2, Language: "go"}, true)
 	if info == nil || info["blocked"] != false || info["overridden"] != true {
 		t.Errorf("overridden gate info = %v, want blocked:false overridden:true", info)
+	}
+	// A text→binary block carries no count delta but must still report.
+	info = parseGateInfo(parseGateResult{Checked: true, Blocked: true, BecameBinary: true, Language: "go"}, false)
+	if info == nil || info["blocked"] != true || info["became_binary"] != true {
+		t.Errorf("binary gate info = %v, want blocked:true became_binary:true", info)
 	}
 }

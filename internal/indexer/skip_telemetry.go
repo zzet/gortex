@@ -175,6 +175,30 @@ func timeoutSkipResult(relPath, lang string, budgetMS int) *parser.ExtractionRes
 	}
 }
 
+// binarySkipResult builds a synthetic single-node result for a binary
+// payload a language extension nonetheless claimed (a tool-cache .pkl, an
+// object file), detected by content and skipped before any parse. It
+// stays visible in the graph with the skip reason attached, and — like
+// the minified class — counts as a successful read, so its receipt is
+// recorded and the file goes inert until its content changes instead of
+// re-arming the parse-retry path on every reconcile.
+func binarySkipResult(relPath, lang, reason string) *parser.ExtractionResult {
+	return &parser.ExtractionResult{
+		Nodes: []*graph.Node{{
+			ID:       relPath,
+			Kind:     graph.KindFile,
+			Name:     filepath.Base(relPath),
+			FilePath: relPath,
+			Language: lang,
+			Meta: map[string]any{
+				"skip_reason":           "binary",
+				"skipped_due_to_binary": true,
+				"binary_reason":         reason,
+			},
+		}},
+	}
+}
+
 // minifiedSkipResult builds a synthetic single-node result for a build
 // artifact (a minified bundle or a sourcemap) detected by content and
 // skipped, so it stays visible in the graph with the skip reason
