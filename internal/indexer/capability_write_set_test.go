@@ -99,9 +99,11 @@ func TestPerSaveCapabilityWriteSetMatchesTheWholeIndex(t *testing.T) {
 	builderIsolateGit(t)
 	for name, edited := range capabilityWriteSetEdits {
 		t.Run(name, func(t *testing.T) {
-			dir := builderTempDir(t, "capws-"+name)
+			// Keep the semantic case name while using Windows-safe disk paths.
+			fixtureName := strings.ReplaceAll(name, ":", "-")
+			dir := builderTempDir(t, "capws-"+fixtureName)
 			builderWriteTree(t, dir, capabilityWriteSetTree())
-			store := builderOpenStore(t, "capws-"+name)
+			store := builderOpenStore(t, "capws-"+fixtureName)
 			builderIndex(t, store, dir)
 			core, logs := observer.New(zap.InfoLevel)
 			idx := New(store, builderRegistry(), config.Default().Index, zap.New(core))
@@ -175,11 +177,11 @@ func TestPerSaveCapabilityWriteSetMatchesTheWholeIndex(t *testing.T) {
 					t.Fatal("no derived pass ran")
 				}
 			}
-			cleanDir := builderTempDir(t, "capws-clean-"+name)
+			cleanDir := builderTempDir(t, "capws-clean-"+fixtureName)
 			tree := capabilityWriteSetTree()
 			tree["pkg/"+file] = edited
 			builderWriteTree(t, cleanDir, tree)
-			clean := builderOpenStore(t, "capws-clean-"+name)
+			clean := builderOpenStore(t, "capws-clean-"+fixtureName)
 			builderIndex(t, clean, cleanDir)
 			whole := capabilityRows(t, clean)
 			onlyPerSave, onlyWhole := diffRows(perSave, whole)
