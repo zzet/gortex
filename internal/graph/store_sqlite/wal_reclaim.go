@@ -892,6 +892,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	}
 	held := time.Now()
 	writer := newWALReclaimWriterCredit(s, held)
+	writer.yieldToWriters = !res.urgent
 	defer func() {
 		writer.release()
 		res.writerHold = max(res.writerHold, writer.longest)
@@ -925,6 +926,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	// spun on while the writer is held.
 	backfill := func() (walCheckpointResult, error) {
 		result, err := writer.passive(yctx, ctx, ckptDB, walReclaimMaxWriterHold, res.leaseOverride)
+		yctx = writer.resetContext(yctx)
 		if err != nil && errors.Is(err, errSQLiteCheckpointIncomplete) && yctx.Err() == nil {
 			// Incomplete is a result, not a failure: a reader still needs
 			// frames (result carries the counts).
@@ -1475,6 +1477,7 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 	}
 	held := time.Now()
 	writer := newWALReclaimWriterCredit(s, held)
+	writer.yieldToWriters = !res.urgent
 	defer func() {
 		writer.release()
 		res.writerHold = max(res.writerHold, writer.longest)
@@ -1505,6 +1508,7 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 	}
 	copyStart := time.Now()
 	delta, derr := writer.passive(yctx, ctx, ckptDB, walReclaimResetHold/2, res.leaseOverride)
+	yctx = writer.resetContext(yctx)
 	if ok && (derr == nil || errors.Is(derr, errSQLiteCheckpointIncomplete)) {
 		noteWALHoldCopy(int64(delta.CheckpointedFrames)-int64(snap.NBackfill), time.Since(copyStart))
 	}
@@ -1513,7 +1517,7 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 		return false, derr
 	}
 	if derr != nil && !errors.Is(derr, errSQLiteCheckpointIncomplete) {
-		if yielded() {
+		if yielded() || errors.Is(derr, errWALReclaimWriterWaiting) {
 			res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
 			return false, errWALReclaimWriterWaiting
 		}
@@ -1532,7 +1536,7 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 	if delta.incomplete() {
 		return false, nil
 	}
-	_, terr := s.resetWALForReclaim(yctx)
+	_, terr := s.resetWALForReclaim(writer.resetContext(yctx))
 	if hook := walIdleResetResultHook; hook != nil {
 		terr = hook(terr)
 	}

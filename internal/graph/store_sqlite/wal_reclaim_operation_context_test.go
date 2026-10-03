@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -154,6 +155,38 @@ func TestReclaimOperationCancellationJoinsSlowCheckpoint(t *testing.T) {
 	s.writeMu.Unlock()
 }
 
+// A completed slow copy gets one final admission opportunity from the unused
+// portion of the original writer allowance, not a fresh full hold budget.
+func TestReclaimSlowCopyCanResetWithinRemainingWriterCredit(t *testing.T) {
+	for _, kind := range []string{"pressure", "short"} {
+		t.Run(kind, func(t *testing.T) {
+			s, db := finalBackfillFixture(t)
+			var syncs atomic.Int64
+			observeDelayedReclaimSync(t, db, func(fileKind int) {
+				if fileKind == vfsFileWAL {
+					syncs.Add(1)
+					time.Sleep(300 * time.Millisecond)
+				}
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			res := &walReclaimResult{}
+			started := time.Now()
+			err := runFinalReclaimStep(ctx, kind, s, db, res)
+			t.Logf("kind=%s joined_copy=%s max_writer_hold=%s reset=%t reason=%q err=%v", kind, time.Since(started), res.writerHold, res.openGate, res.reason, err)
+			require.NoError(t, err)
+			require.True(t, res.openGate, "joined durable copy never reached reset admission")
+			require.Positive(t, syncs.Load(), "the real WAL sync was not delayed")
+			require.LessOrEqual(t, res.writerHold, walReclaimPressureHold+raceSlack(10*time.Millisecond))
+			require.True(t, s.writeMu.TryLock(), "reset retained writer ownership")
+			s.writeMu.Unlock()
+			var payload string
+			require.NoError(t, s.db.QueryRow(`SELECT payload FROM wal_churn WHERE id = 1`).Scan(&payload))
+			require.Equal(t, "before", payload)
+		})
+	}
+}
+
 func TestReclaimSlowFinalBackfillRefusesContinuousWrites(t *testing.T) {
 	s, db := finalBackfillFixture(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
@@ -171,9 +204,17 @@ func TestReclaimSlowFinalBackfillRefusesContinuousWrites(t *testing.T) {
 			wctx, end := context.WithTimeout(ctx, 100*time.Millisecond)
 			start := time.Now()
 			err := s.writeMu.LockContext(wctx)
+			gateElapsed := time.Since(start)
+			stage := "gate"
+			var sqlElapsed, releaseElapsed time.Duration
 			if err == nil {
+				stage = "SQL"
+				beforeSQL := time.Now()
 				_, err = s.writerDB.ExecContext(wctx, `UPDATE wal_churn SET payload = ? WHERE id = 1`, fmt.Sprintf("continuous-%d", writes.Load()+1))
+				sqlElapsed = time.Since(beforeSQL)
+				beforeRelease := time.Now()
 				s.writeMu.Unlock()
+				releaseElapsed = time.Since(beforeRelease)
 			}
 			end()
 			elapsed := time.Since(start).Nanoseconds()
@@ -183,13 +224,29 @@ func TestReclaimSlowFinalBackfillRefusesContinuousWrites(t *testing.T) {
 				if ctx.Err() != nil {
 					done <- nil
 				} else {
-					done <- err
+					done <- fmt.Errorf("foreground %s failed (gate=%s SQL=%s release=%s): %w", stage, gateElapsed, sqlElapsed, releaseElapsed, err)
 				}
 				return
 			}
 			writes.Add(1)
 		}
 	}()
+	// Require an actual foreground commit after each completed copy. A
+	// coincidental safe gap in a continuous producer is not a stale-tail
+	// refusal oracle.
+	walCheckpointCallObserver = func(mode string, _ time.Time, _ time.Duration) {
+		if mode != "PASSIVE" {
+			return
+		}
+		before := writes.Load()
+		for writes.Load() == before && ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	t.Cleanup(func() { walCheckpointCallObserver = nil })
 	var backfill uint32
 	for range 3 {
 		observeDelayedReclaimSync(t, db, func(kind int) {
@@ -214,4 +271,99 @@ func TestReclaimSlowFinalBackfillRefusesContinuousWrites(t *testing.T) {
 	require.Positive(t, backfill, "completed slow copies discarded their durable frontier")
 	require.Less(t, time.Duration(worst.Load()), 100*time.Millisecond)
 	t.Logf("continuous_writes=%d retained_backfill=%d worst_foreground_gate_and_sql=%s", writes.Load(), backfill, time.Duration(worst.Load()))
+}
+
+func TestReclaimReadmissionSharesAggregateCredit(t *testing.T) {
+	s, db := finalBackfillFixture(t)
+	observeDelayedReclaimSync(t, db, func(kind int) {
+		if kind == vfsFileWAL {
+			time.Sleep(300 * time.Millisecond)
+		}
+	})
+	operation, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	s.writeMu.Lock()
+	writer := newWALReclaimWriterCredit(s, time.Now())
+	defer writer.release()
+	original, stop := context.WithTimeout(operation, 50*time.Millisecond)
+	defer stop()
+	_, err := writer.passive(original, operation, db, 25*time.Millisecond, false)
+	require.NoError(t, err)
+	require.True(t, writer.readmitted)
+	require.GreaterOrEqual(t, writer.spent, 20*time.Millisecond)
+	resetCtx := writer.resetContext(original)
+	deadline, bounded := resetCtx.Deadline()
+	require.True(t, bounded)
+	require.LessOrEqual(t, time.Until(deadline), 50*time.Millisecond-writer.spent+time.Millisecond, "readmission renewed a full allowance")
+	_, err = s.resetWALForReclaim(resetCtx)
+	require.NoError(t, err)
+	writer.release()
+	require.LessOrEqual(t, writer.spent, 50*time.Millisecond+raceSlack(10*time.Millisecond), "writer slices exceeded their aggregate allowance")
+}
+
+func TestReclaimReadmissionDoesNotReviveCancellationOrSpentCredit(t *testing.T) {
+	for _, kind := range []string{"spent", "cancel_cause", "writer_demand"} {
+		t.Run(kind, func(t *testing.T) {
+			s, db := finalBackfillFixture(t)
+			operation, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			s.writeMu.Lock()
+			writer := newWALReclaimWriterCredit(s, time.Now())
+			defer writer.release()
+			original, stop := context.WithTimeout(operation, 50*time.Millisecond)
+			defer stop()
+			original, cancelCause := context.WithCancelCause(original)
+			defer cancelCause(context.Canceled)
+			credit := 25 * time.Millisecond
+			if kind == "spent" {
+				credit = 50 * time.Millisecond
+			}
+			writer.yieldToWriters = kind == "writer_demand"
+			releaseDemand := func() {}
+			defer func() { releaseDemand() }()
+			observeDelayedReclaimSync(t, db, func(fileKind int) {
+				if fileKind != vfsFileWAL {
+					return
+				}
+				if kind == "cancel_cause" {
+					cancelCause(context.DeadlineExceeded)
+				}
+				time.Sleep(300 * time.Millisecond)
+				if kind == "writer_demand" {
+					releaseDemand = s.AnnounceWrite()
+				}
+			})
+			_, err := writer.passive(original, operation, db, credit, false)
+			want := error(context.DeadlineExceeded)
+			if kind == "cancel_cause" {
+				want = context.Canceled
+			} else if kind == "writer_demand" {
+				want = errWALReclaimWriterWaiting
+			}
+			require.True(t, errors.Is(err, want), "readmission error %v, want %v", err, want)
+			require.False(t, writer.held)
+			require.False(t, writer.readmitted)
+		})
+	}
+}
+
+func TestReclaimReadmissionPreservesNonurgentWithdrawal(t *testing.T) {
+	s, db := finalBackfillFixture(t)
+	releaseDemand := func() {}
+	defer func() { releaseDemand() }()
+	observeDelayedReclaimSync(t, db, func(kind int) {
+		if kind == vfsFileWAL {
+			time.Sleep(300 * time.Millisecond)
+			releaseDemand = s.AnnounceWrite()
+		}
+	})
+	operation, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	res := &walReclaimResult{}
+	done, err := s.reclaimWALResetHold(operation, walReclaimConfig{thresholdBytes: 1}, db, res, false, false)
+	require.ErrorIs(t, err, errWALReclaimWriterWaiting)
+	require.False(t, done)
+	require.Equal(t, "writer_waiting", res.reason)
+	require.True(t, s.writeMu.TryLock())
+	s.writeMu.Unlock()
 }

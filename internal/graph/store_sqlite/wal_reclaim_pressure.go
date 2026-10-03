@@ -181,7 +181,7 @@ func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res
 		s.walCopy.pressureGiveUps.Add(1)
 		return errWALPressureHold
 	}
-	result, err := s.resetWALForReclaim(hctx)
+	result, err := s.resetWALForReclaim(writer.resetContext(hctx))
 	if err != nil {
 		res.reason = fmt.Sprintf("pressure_reset busy=%d wal_frames=%d checkpointed=%d error=%v", result.Busy, result.WALFrames, result.CheckpointedFrames, err)
 		s.walCopy.pressureGiveUps.Add(1)
