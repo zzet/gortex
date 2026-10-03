@@ -88,7 +88,7 @@ func (d *windowsWALDiagnostic) recordAttempt(kind string, reader int64, err erro
 	d.mu.Unlock()
 }
 func (d *windowsWALDiagnostic) install() {
-	if d.t.Name() == "TestWALReclaimResetsUnderReadersLongerThanTheDrain" {
+	if d.t.Name() == "TestWALReclaimResetsUnderReadersLongerThanTheDrain" || d.t.Name() == "TestWALReclaimBoundsWALUnderReaderChurn" {
 		d.installCreditVFSObservation()
 	}
 	previousCheckpoint := walCheckpointCallObserver
@@ -234,10 +234,10 @@ func (d *windowsWALDiagnostic) installCreditVFSObservation() {
 		}
 		state := &reclaimSyncStall{tls: tls}
 		state.beforeSync = func(file int) {
-			d.creditRecord("sync entry tls=%x file=%d at=%s", tls, file, time.Now().UTC().Format(time.RFC3339Nano))
+			d.creditRecord("sync entry tls=%x file=%d at=%s sampled_go_write_gate_held=%v operation_ctx_err=%v", tls, file, time.Now().UTC().Format(time.RFC3339Nano), store.writeMu.held(), ctx.Err())
 		}
 		state.afterSync = func(file int, from, to time.Time) {
-			d.creditRecord("sync return tls=%x file=%d from=%s to=%s elapsed=%s", tls, file, from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano), to.Sub(from))
+			d.creditRecord("sync return tls=%x file=%d from=%s to=%s elapsed=%s sampled_go_write_gate_held=%v operation_ctx_err=%v", tls, file, from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano), to.Sub(from), store.writeMu.held(), ctx.Err())
 		}
 		if !reclaimSyncStallState.CompareAndSwap(nil, state) {
 			_ = conn.Close()

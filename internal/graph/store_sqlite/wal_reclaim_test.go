@@ -78,6 +78,7 @@ type walChurn struct {
 	latMu    sync.Mutex
 	readLats []time.Duration
 	maxWAL   atomic.Int64
+	maxWALAt atomic.Int64 // existing peak sample timestamp; no extra WAL read
 	resets   atomic.Int64 // observed log resets (mxFrame moved backwards)
 	caughtUp atomic.Int64 // samples with nBackfill == mxFrame > 0
 }
@@ -187,6 +188,7 @@ func startWALChurn(t *testing.T, s *Store, path string, readers int, holdMin, ho
 		for !stopped() {
 			if size := walFileSize(path + "-wal"); size > c.maxWAL.Load() {
 				c.maxWAL.Store(size)
+				c.maxWALAt.Store(time.Now().UnixNano())
 			}
 			if snap, ok := readWALIndexSnapshot(path); ok {
 				// A reset restarts the log at frame 1, so mxFrame going
@@ -277,7 +279,14 @@ func TestWALReclaimBoundsWALUnderReaderChurn(t *testing.T) {
 	walReclaimCeilingFloor = 0
 	t.Cleanup(func() { walReclaimCeilingFloor = prevFloor })
 	setWALReclaimCadence(t, 50*time.Millisecond, 50*time.Millisecond, 400*time.Millisecond)
+	diag := newWindowsWALDiagnostic(t)
+	diag.install()
+	defer diag.finish()
+	previousReaderObserver := windowsWALReaderObserver
+	windowsWALReaderObserver = func(reader int64, stage string, err error) { diag.record("reader:"+stage, reader, err) }
+	defer func() { windowsWALReaderObserver = previousReaderObserver }()
 	s, path := openWALReclaimStore(t)
+	diag.store.Store(s)
 	defer func() { _ = s.Close() }()
 	seedWALChurnTable(t, s)
 
@@ -294,6 +303,7 @@ func TestWALReclaimBoundsWALUnderReaderChurn(t *testing.T) {
 	stats := s.WALReclaimStats()
 	final := walFileSize(path + "-wal")
 	p50, p99, maxLat, n := churn.latencies()
+	t.Logf("reader churn sampled peak at=%s wal_bytes=%d; existing5ms sampler, timestamp after size read, not continuous exact peak", time.Unix(0, churn.maxWALAt.Load()).UTC().Format(time.RFC3339Nano), churn.maxWAL.Load())
 	t.Logf("fix: writes=%d wal_final=%.1fMiB wal_max=%.1fMiB resets=%d deferrals=%d skips=%d attempts=%d frames=%d bytes=%.1fMiB pause_n=%d pause_max=%s pause_avg=%s reader_waits=%d reader_wait_max=%s read_lat p50=%s p99=%s max=%s n=%d observed_resets=%d",
 		churn.writes.Load(), float64(final)/(1<<20), float64(churn.maxWAL.Load())/(1<<20),
 		stats.Resets, stats.Deferrals, stats.Skips, stats.Attempts, stats.FramesReclaimed, float64(stats.BytesReclaimed)/(1<<20),
