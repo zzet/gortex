@@ -35,6 +35,8 @@ func TestWALReclaimRunsInsideALongBulkWindowOverTheCeiling(t *testing.T) {
 	require.True(t, engaged, "the bulk window must open")
 	defer func() { _ = s.EndGenerationBulkLoadFor(77) }()
 
+	initial := s.WALReclaimStats()
+	started := time.Now()
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	var writes atomic.Int64
@@ -102,9 +104,46 @@ func TestWALReclaimRunsInsideALongBulkWindowOverTheCeiling(t *testing.T) {
 			}
 		}
 	}()
-	time.Sleep(25 * time.Second)
-	close(stop)
-	wg.Wait()
+	var stopOnce sync.Once
+	stopWorkers := func() {
+		stopOnce.Do(func() { close(stop) })
+		wg.Wait()
+	}
+	defer stopWorkers()
+
+	// Filling the log is setup for this oracle: give the first ceiling
+	// override a bounded activation window, then observe a full 25 seconds
+	// of pressure with the bulk window, writers, and readers still active.
+	// The maximum WAL sampler spans both setup and observation.
+	activationDeadline := time.NewTimer(25 * time.Second)
+	activationPoll := time.NewTicker(5 * time.Millisecond)
+	activated := false
+	var activation WALReclaimStats
+activationLoop:
+	for {
+		activation = s.WALReclaimStats()
+		if activation.LeaseOverrides > initial.LeaseOverrides {
+			activated = true
+			break
+		}
+		select {
+		case <-activationPoll.C:
+		case <-activationDeadline.C:
+			break activationLoop
+		}
+	}
+	activationPoll.Stop()
+	activationDeadline.Stop()
+	activatedAt := time.Now()
+	activationWrites := writes.Load()
+	activationWAL := walFileSize(path + "-wal")
+	if activated {
+		time.Sleep(25 * time.Second)
+	}
+	// Capture progress before withdrawing the active producers. Shutdown or
+	// their final drained transactions cannot supply the required reset.
+	observation := s.WALReclaimStats()
+	stopWorkers()
 	if err, _ := writeErr.Load().(error); err != nil {
 		t.Fatal(err)
 	}
@@ -115,10 +154,13 @@ func TestWALReclaimRunsInsideALongBulkWindowOverTheCeiling(t *testing.T) {
 			t.Log(line)
 		}
 	}
-	t.Logf("bulk window 25 s: writes=%d wal_max=%.1fMiB ceiling=48MiB lease_overrides=%d resets=%d writer_hold_max=%s",
-		writes.Load(), float64(maxWAL.Load())/(1<<20), st.LeaseOverrides, st.Resets, st.WriterHoldMax)
+	t.Logf("bulk pressure activation: reached=%t at=%s elapsed=%s writes=%d wal=%.1fMiB lease_overrides=%d resets=%d",
+		activated, activatedAt.Format("15:04:05.000"), activatedAt.Sub(started), activationWrites, float64(activationWAL)/(1<<20), activation.LeaseOverrides, activation.Resets)
+	t.Logf("bulk pressure observation 25 s: writes=%d wal_max=%.1fMiB ceiling=48MiB lease_overrides=%d resets=%d active_resets=%d writer_hold_max=%s",
+		writes.Load(), float64(maxWAL.Load())/(1<<20), st.LeaseOverrides, st.Resets, observation.Resets-activation.Resets, st.WriterHoldMax)
+	require.True(t, activated, "no ceiling override activated within the bounded setup window")
 	require.Positive(t, st.LeaseOverrides, "no reclaim ran inside the bulk window")
-	require.Positive(t, st.Resets, "the log was never reset while the window stayed open")
+	require.Greater(t, observation.Resets, activation.Resets, "the log was never reset during the active pressure observation")
 	require.LessOrEqual(t, maxWAL.Load(), int64(2*48)<<20, "the log passed twice its ceiling inside the bulk window")
 	require.LessOrEqual(t, st.WriterHoldMax, walReclaimMaxWriterHold+250*time.Millisecond)
 	require.Contains(t, out, "wal reclaim running inside a bulk window reason=wal_ceiling")
