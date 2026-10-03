@@ -40,7 +40,8 @@ import (
 //     they carry stronger, language-specific evidence.
 //  2. Module-local definition — a same-file function/method candidate is
 //     bound directly by the file-local tier in resolveFunctionCall, and
-//     any same-file candidate (any kind) blocks the import pick. A
+//     any same-file declaration blocks the import pick (import nodes are
+//     statement metadata, not implementations). A
 //     top-level local definition cannot legally coexist with an imported
 //     binding of the same name (redeclaration), and a function-scoped
 //     shadow may be the true callee; in both cases the local symbol wins
