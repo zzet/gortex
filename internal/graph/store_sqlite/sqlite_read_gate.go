@@ -269,6 +269,42 @@ func (g *sqliteReadGate) olderCount(epoch uint64) int {
 	return g.olderLocked(epoch)
 }
 
+// waitOlderDecrease waits for a connection from the captured older cohort to
+// retire. Newer-reader releases cannot trigger a retry. Unlike waitOlder, it
+// does not require every older connection to end: after complete backfill,
+// SQLite can reset while an older database-only (read-slot-0) reader remains.
+func (g *sqliteReadGate) waitOlderDecrease(ctx context.Context, epoch uint64, before int, deadline time.Time) (int, error) {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return g.olderCount(epoch), err
+		}
+		g.mu.Lock()
+		older := g.olderLocked(epoch)
+		if older < before || older == 0 {
+			g.mu.Unlock()
+			return older, nil
+		}
+		if g.changed == nil {
+			g.changed = make(chan struct{})
+		}
+		changed := g.changed
+		g.mu.Unlock()
+		select {
+		case <-changed:
+		case <-timer.C:
+			older = g.olderCount(epoch)
+			if older < before || older == 0 {
+				return older, nil
+			}
+			return older, errWALReclaimReadersInFlight
+		case <-ctx.Done():
+			return g.olderCount(epoch), ctx.Err()
+		}
+	}
+}
+
 var errReadGateBusy = errors.New("store_sqlite: read gate already quiescing")
 
 // quiesce closes the gate and waits until no pool connection is active, the

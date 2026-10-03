@@ -1019,7 +1019,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 			// gets the rest of the hold cap rather than a fixed slice: a big
 			// -wal can take longer than walReclaimTruncateBudget to free.
 			tctx, tcancel := context.WithDeadline(yctx, capAt)
-			_, terr := s.resetWALForReclaim(tctx)
+			_, terr := s.resetWALAfterOlderReaderProgress(tctx, capAt)
 			tcancel()
 			if terr == nil {
 				res.openGate = true
@@ -1045,7 +1045,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 			}
 		}
 		tctx, tcancel := context.WithDeadline(yctx, capAt)
-		result, terr := s.resetWALForReclaim(tctx)
+		result, terr := s.resetWALAfterOlderReaderProgress(tctx, capAt)
 		tcancel()
 		if terr == nil {
 			res.openGate = true
@@ -1082,6 +1082,27 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		return giveUp(fmt.Sprintf("truncate busy=%d wal_frames=%d checkpointed=%d error=%v", result.Busy, result.WALFrames, result.CheckpointedFrames, err), err)
 	}
 	return nil
+}
+
+// resetWALAfterOlderReaderProgress is used only by the held, complete-backfill
+// path. An epoch counts database-only readers as well as actual WAL pins, so
+// ask SQLite again when an older connection retires instead of waiting for the
+// whole cohort. Capture the cohort before the first reset: a pin ending during
+// that call must not be missed. Every retry keeps the original hold deadline.
+func (s *Store) resetWALAfterOlderReaderProgress(ctx context.Context, deadline time.Time) (walCheckpointResult, error) {
+	epoch := s.readGate.advance()
+	older := s.readGate.olderCount(epoch)
+	for {
+		result, err := s.resetWALForReclaim(ctx)
+		if err == nil || !errors.Is(err, errSQLiteCheckpointIncomplete) || result.Busy == 0 || result.WALFrames <= 0 || result.WALFrames != result.CheckpointedFrames || older == 0 {
+			return result, err
+		}
+		var waitErr error
+		older, waitErr = s.readGate.waitOlderDecrease(ctx, epoch, older, deadline)
+		if waitErr != nil {
+			return result, waitErr
+		}
+	}
 }
 
 // yieldToWriters returns a context that is cancelled (cause
