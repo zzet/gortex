@@ -42,3 +42,19 @@ func TestImportEvidence_SymbolBindingBeatsFileClosure(t *testing.T) {
 	New(g).ResolveAll()
 	require.Equal(t, "a/one.ts::createStore", callEdgeTo(g, "app/main.ts::run", 3))
 }
+
+func TestImportEvidence_ImportNodeIsNotLocalShadow(t *testing.T) {
+	g := buildGraphFromSources(t, map[string]string{
+		"app/composables/useRedirect.ts": "export const useRedirect = () => 1",
+		"app/pages/index.ts": "import { useRedirect } from '../composables/useRedirect'\nexport function run() { return useRedirect() }\n",
+	})
+	New(g).ResolveAll()
+	for _, edge := range g.GetOutEdges("app/pages/index.ts::run") {
+		if edge.Kind == graph.EdgeCalls {
+			require.Equal(t, "app/composables/useRedirect.ts::useRedirect", edge.To)
+			require.Equal(t, graph.OriginASTResolved, edge.Origin)
+			return
+		}
+	}
+	t.Fatal("missing imported call")
+}
