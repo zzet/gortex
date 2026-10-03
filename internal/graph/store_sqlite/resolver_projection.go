@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"database/sql"
 	"iter"
+	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -204,6 +205,17 @@ func resolverScopedNodeProjectionSeq[T any](
 
 const resolverScopedProjectionHighWaterQuery = `SELECT id FROM nodes WHERE repo_prefix = ? AND kind = ? AND view_gen = ? ORDER BY id DESC LIMIT 1`
 
+// Base file/contract projections must seek the requested repository's sparse kind,
+// rather than visit all of its nodes before filtering. Positive generations
+// retain the generation predicate's planner eligibility: a dirty layer can
+// contain just one file beside a large base corpus.
+func resolverScopedProjectionQueryForGeneration(query string, generation int64, kind graph.NodeKind) string {
+	if generation == baseViewGeneration && (kind == graph.KindFile || kind == graph.KindContract) {
+		return strings.Replace(query, "view_gen = ?", "+view_gen = ?", 1)
+	}
+	return query
+}
+
 func resolverScopedProjectionPageQuery(columns string, started bool) string {
 	if started {
 		return `SELECT ` + columns + `
@@ -231,7 +243,7 @@ func streamResolverScopedKindProjection[T any](
 	for _, prefix := range prefixes {
 		var highWater string
 		err := s.db.QueryRow(
-			resolverScopedProjectionHighWaterQuery, prefix, kind, s.viewGen,
+			resolverScopedProjectionQueryForGeneration(resolverScopedProjectionHighWaterQuery, s.viewGen, kind), prefix, kind, s.viewGen,
 		).Scan(&highWater)
 		if err == sql.ErrNoRows {
 			continue
@@ -301,7 +313,7 @@ func fillResolverProjectionPage[T any](
 	pageSize int,
 	state *resolverProjectionPrefixState[T],
 ) bool {
-	query := resolverScopedProjectionPageQuery(columns, state.started)
+	query := resolverScopedProjectionQueryForGeneration(resolverScopedProjectionPageQuery(columns, state.started), s.viewGen, kind)
 	args := []any{state.prefix, kind, state.highWater, s.viewGen, pageSize}
 	if state.started {
 		args = []any{state.prefix, kind, state.after, state.highWater, s.viewGen, pageSize}

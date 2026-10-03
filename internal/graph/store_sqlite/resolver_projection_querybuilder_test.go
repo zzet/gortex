@@ -16,19 +16,19 @@ func TestResolverScopedProjectionProductionQueriesUseRepoKindIndex(t *testing.T)
 		planClause string
 	}{
 		{
-			name: "high water", query: resolverScopedProjectionHighWaterQuery,
+			name: "high water", query: resolverScopedProjectionQueryForGeneration(resolverScopedProjectionHighWaterQuery, baseViewGeneration, graph.KindFile),
 			args:       []any{"repo", graph.KindFile, baseViewGeneration},
 			planClause: "nodes_by_repo_kind",
 		},
 		{
-			name: "first page", query: resolverScopedProjectionPageQuery("id, file_path, repo_prefix, workspace_id", false),
+			name: "first page", query: resolverScopedProjectionQueryForGeneration(resolverScopedProjectionPageQuery("id, file_path, repo_prefix, workspace_id", false), baseViewGeneration, graph.KindFile),
 			args:       []any{"repo", graph.KindFile, "repo::z", baseViewGeneration, resolverProjectionPageSize},
-			planClause: "SEARCH nodes USING INDEX nodes_by_repo (repo_prefix=? AND view_gen=? AND id<?)",
+			planClause: "SEARCH nodes USING INDEX nodes_by_repo_kind (repo_prefix=? AND kind=? AND id<?)",
 		},
 		{
-			name: "next page", query: resolverScopedProjectionPageQuery("id, file_path, repo_prefix, workspace_id", true),
+			name: "next page", query: resolverScopedProjectionQueryForGeneration(resolverScopedProjectionPageQuery("id, file_path, repo_prefix, workspace_id", true), baseViewGeneration, graph.KindFile),
 			args:       []any{"repo", graph.KindFile, "repo::a", "repo::z", baseViewGeneration, resolverProjectionPageSize},
-			planClause: "SEARCH nodes USING INDEX nodes_by_repo (repo_prefix=? AND view_gen=? AND id>? AND id<?)",
+			planClause: "SEARCH nodes USING INDEX nodes_by_repo_kind (repo_prefix=? AND kind=? AND id>? AND id<?)",
 		},
 	}
 
