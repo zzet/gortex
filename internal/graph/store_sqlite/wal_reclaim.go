@@ -1418,6 +1418,9 @@ var (
 func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult) error {
 	deadline := time.Now().Add(walReclaimLaneReaderWait)
 	for round := 1; ; round++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		done, err := s.reclaimWALResetHold(ctx, cfg, ckptDB, res, round == 1, !res.pressure && !res.hardCap)
 		if done || err != nil {
 			return err
@@ -1425,6 +1428,15 @@ func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConf
 		if !time.Now().Before(deadline) {
 			res.reason = fmt.Sprintf("older_readers_in_flight rounds=%d writer_holds=%d", round, res.writerHolds)
 			return fmt.Errorf("%w: %s", errWALReclaimReadersInFlight, res.reason)
+		}
+		// A yielding hold may have declined on a newly busy lane before the
+		// watcher polls. Do not start another real checkpoint inside that cycle.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !res.pressure && !res.hardCap && s.cycleYieldEnabled() && s.buildLaneBusy() {
+			res.outcome, res.reason = walReclaimSkipped, "build_lane_busy"
+			return errWALCheckpointYieldedToCycle
 		}
 		// Without the writer: copy what is left, then wait out the readers
 		// admitted before that copy (a reader admitted after a complete

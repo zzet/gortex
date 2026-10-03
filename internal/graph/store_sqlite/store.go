@@ -1042,7 +1042,8 @@ var errGenerationBulkCheckpointCoordination = errors.New("store_sqlite: generati
 // cancelled with that cause when a cycle takes the lane (see
 // checkpoint_cycle_yield.go).
 func (s *Store) beginBackgroundCheckpointAttempt(policy checkpointCyclePolicy) (*backgroundCheckpointAttempt, error) {
-	yields := (policy == checkpointYieldsToCycle || policy == checkpointOverridesLease) && s.cycleYieldEnabled()
+	yieldPolicy := policy == checkpointYieldsToCycle || policy == checkpointOverridesLease
+	yields := yieldPolicy && s.cycleYieldEnabled()
 	overridesLease := policy == checkpointOverridesLease || policy == checkpointOverridesLeaseAndCycle
 	if yields && s.buildLaneBusy() {
 		return nil, errWALCheckpointYieldedToCycle
@@ -1075,7 +1076,9 @@ func (s *Store) beginBackgroundCheckpointAttempt(policy checkpointCyclePolicy) (
 	coordination.active = attempt
 	coordination.mu.Unlock()
 
-	if yields {
+	// The daemon may install its predicate after this attempt starts. Select
+	// the watcher by policy; it checks current enablement on every poll.
+	if yieldPolicy {
 		go s.watchBuildLane(attempt)
 		return attempt, nil
 	}

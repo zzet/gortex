@@ -183,7 +183,7 @@ func (s *Store) watchBuildLane(attempt *backgroundCheckpointAttempt) {
 		case <-attempt.done:
 			return
 		case <-ticker.C:
-			if s.buildLaneBusy() {
+			if s.cycleYieldEnabled() && s.buildLaneBusy() {
 				if attempt.copy != nil && attempt.copy.copying.Load() {
 					// A paced pass waits in its page writes instead: an
 					// interrupt would discard every page it copied.
