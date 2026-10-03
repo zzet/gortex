@@ -248,10 +248,12 @@ func TestWALReclaimResetsUnderLongOverlappingReadersAndBurstyWrites(t *testing.T
 	setWALReclaimCadence(t, time.Second, time.Second, 4*time.Second)
 	diagnostic := installQuietGapDiagnostic(t)
 	logs := captureReclaimLog(t)
+	t.Cleanup(func() { t.Logf("complete_captured_store_log:\n%s", logs.String()) })
 	s, path := openWALReclaimStore(t)
 	diagnostic.store.Store(s)
 	defer func() { _ = s.Close() }()
 	seedWALChurnTable(t, s)
+	prepareSteadyStateLongReaderStore(t, s)
 	p := longReaderPattern{
 		readers: 4, readMin: 2500 * time.Millisecond, readMax: 4 * time.Second,
 		burstWrites: 12, shortGap: 1500 * time.Millisecond, longGap: 12 * time.Second, cycles: 3,
@@ -273,6 +275,7 @@ func TestWALReclaimResetsUnderLongOverlappingReadersWithTheDaemonDefaults(t *tes
 	s, path := openWALReclaimStore(t)
 	defer func() { _ = s.Close() }()
 	seedWALChurnTable(t, s)
+	prepareSteadyStateLongReaderStore(t, s)
 	cfg := resolveWALReclaimConfig()
 	p := longReaderPattern{
 		readers: 4, readMin: 2500 * time.Millisecond, readMax: 4 * time.Second,
@@ -280,6 +283,26 @@ func TestWALReclaimResetsUnderLongOverlappingReadersWithTheDaemonDefaults(t *tes
 	}
 	run := runLongReaderPattern(t, s, path, p)
 	checkLongReaderContract(t, s, run, cfg.thresholdBytes, logs.String())
+}
+
+func prepareSteadyStateLongReaderStore(t *testing.T, s *Store) {
+	t.Helper()
+	// Measure steady-state reclamation after the real one-time maintenance.
+	// Otherwise its metadata writes can add WAL frames inside a writer gap.
+	setupCtx, cancelSetup := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancelSetup()
+	if err := s.EnsureRowCounters(setupCtx); err != nil {
+		t.Fatalf("initialize row counters before steady-state workload: %v", err)
+	}
+	if err := s.buildLazyIndexOnce(setupCtx); err != nil {
+		t.Fatalf("build lazy index before steady-state workload: %v", err)
+	}
+	installed, err := s.rowCountersInstalled(setupCtx)
+	if err != nil || !installed || !s.rowCountersReady.Load() || !s.fileGenerationIndexPresent() {
+		t.Fatalf("steady-state maintenance readiness: counters_installed=%t counters_ready=%t index_present=%t error=%v",
+			installed, s.rowCountersReady.Load(), s.fileGenerationIndexPresent(), err)
+	}
+	t.Log("steady-state maintenance ready: row counters installed and seeded; lazy file-generation index present; background workers remain enabled")
 }
 
 func checkLongReaderContract(t *testing.T, s *Store, run longReaderRun, threshold int64, logs string) {
