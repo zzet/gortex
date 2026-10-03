@@ -1,0 +1,51 @@
+name: Windows completed-copy guard control
+
+on:
+  push:
+    branches: [codex/windows-copy-guard-control-20261004]
+
+permissions:
+  contents: read
+
+jobs:
+  old-and-new-same-main-sync:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Record old controlled source
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          git rev-parse HEAD^{tree}
+          git status --porcelain --untracked-files=normal
+          sha256sum internal/graph/store_sqlite/wal_reclaim_converged_credit_test.go
+          go version
+      - name: Require old five-second guard to miss its full-copy prerequisite
+        shell: bash
+        run: |
+          set +e
+          go test -v -count=1 -timeout=45m -run '^TestSlowConvergenceProofRefusesInvalidCopies$/^cancelled$' ./internal/graph/store_sqlite 2>&1 | tee old-guard.log
+          old_code=${PIPESTATUS[0]}
+          set -e
+          if [[ "$old_code" == 0 ]]; then
+            echo "Old guard unexpectedly passed; causal counterfactual is not qualified"
+            exit 1
+          fi
+          python .github/windows-wal-controls/verify.py old old-guard.log
+      - name: Apply only the reviewed negative setup phase correction
+        shell: bash
+        run: |
+          git apply .github/windows-wal-controls/completed-copy-guard.patch
+          git diff --stat
+          git diff -- internal/graph/store_sqlite/wal_reclaim_converged_credit_test.go
+          sha256sum internal/graph/store_sqlite/wal_reclaim_converged_credit_test.go
+      - name: Require completed-copy cancellation and no entitlement under the same six-second sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -v -count=1 -timeout=45m -run '^TestSlowConvergenceProofRefusesInvalidCopies$/^cancelled$' ./internal/graph/store_sqlite 2>&1 | tee new-guard.log
+          python .github/windows-wal-controls/verify.py new new-guard.log

@@ -1,0 +1,50 @@
+--- a/internal/graph/store_sqlite/wal_reclaim_converged_credit_test.go
++++ b/internal/graph/store_sqlite/wal_reclaim_converged_credit_test.go
+@@ -202,7 +202,12 @@
+ 			lane.install(s)
+ 			lane.held.Store(true)
+ 			t.Cleanup(func() { lane.held.Store(false) })
+-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
++			// Every case must establish real copied/backfilled state before
++			// testing invalid proof. This is a finite fixture setup guard,
++			// not a five-second production SLA for writer-free SQL or sync.
++			// Cancellation below remains tied to a returned full-copy tuple.
++			const copySetupBudget = 30 * time.Second
++			ctx, cancel := context.WithTimeout(t.Context(), copySetupBudget)
+ 			defer cancel()
+ 			if kind == "incomplete" {
+ 				reader, err := s.db.BeginTx(ctx, nil)
+@@ -222,7 +227,7 @@
+ 			}
+ 			beforeFrontier, frontierKnown := readWALReclaimFrontier(s.dbPath)
+ 			require.True(t, frontierKnown)
+-			var observed, forcedSync atomic.Bool
++			var observed, controlledCancel, forcedSync atomic.Bool
+ 			var nativeSyncNs, paddingNs, effectiveSyncNs atomic.Int64
+ 			var firstScanErr error
+ 			var first walCheckpointResult
+@@ -235,7 +240,10 @@
+ 				firstScanErr = scanErr
+ 				switch kind {
+ 				case "cancelled":
+-					cancel()
++					if scanErr == nil && result.Busy == 0 && result.WALFrames > 0 && result.CheckpointedFrames == result.WALFrames {
++						controlledCancel.Store(true)
++						cancel()
++					}
+ 				case "new_WAL":
+ 					_, err := checkpointWALOnceOn(t.Context(), s.writerDB, "TRUNCATE")
+ 					require.NoError(t, err)
+@@ -278,7 +286,11 @@
+ 				require.True(t, forcedSync.Load(), "real checkpoint main-file sync boundary was not reached")
+ 				require.GreaterOrEqual(t, time.Duration(effectiveSyncNs.Load()), 6*time.Second)
+ 			}
+-			t.Logf("kind=%s actual_first_tuple=%+v observed=%v stop=%s passes=%d context=%v", kind, first, observed.Load(), result.stop, result.passes, ctx.Err())
++			t.Logf("kind=%s copy_setup_budget=%s controlled_cancel_requested=%v actual_first_tuple=%+v observed=%v stop=%s passes=%d context=%v", kind, copySetupBudget, controlledCancel.Load(), first, observed.Load(), result.stop, result.passes, ctx.Err())
++			if kind == "cancelled" {
++				require.True(t, controlledCancel.Load(), "the error-free full-copy cancellation boundary was not reached")
++				require.ErrorIs(t, ctx.Err(), context.Canceled, "fixture setup expiry is not the intended cancellation witness")
++			}
+ 			require.Nil(t, result.slowTail, "invalid copy earned adaptive entitlement")
+ 			require.NotEqual(t, "slow_tail_plateau", result.stop)
+ 			if kind == "no_actual_copy" {

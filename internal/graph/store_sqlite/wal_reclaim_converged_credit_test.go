@@ -222,14 +222,17 @@ func TestSlowConvergenceProofRefusesInvalidCopies(t *testing.T) {
 			}
 			beforeFrontier, frontierKnown := readWALReclaimFrontier(s.dbPath)
 			require.True(t, frontierKnown)
-			var observed atomic.Bool
+			var observed, forcedSync atomic.Bool
+			var nativeSyncNs, paddingNs, effectiveSyncNs atomic.Int64
+			var firstScanErr error
 			var first walCheckpointResult
 			previousObserver := walCheckpointResultObserver
-			walCheckpointResultObserver = func(mode string, _ time.Time, _ time.Duration, result walCheckpointResult, _ error) {
+			walCheckpointResultObserver = func(mode string, _ time.Time, _ time.Duration, result walCheckpointResult, scanErr error) {
 				if mode != "PASSIVE" || !observed.CompareAndSwap(false, true) {
 					return
 				}
 				first = result
+				firstScanErr = scanErr
 				switch kind {
 				case "cancelled":
 					cancel()
@@ -254,9 +257,27 @@ func TestSlowConvergenceProofRefusesInvalidCopies(t *testing.T) {
 				if file == vfsFileWAL {
 					time.Sleep(75 * time.Millisecond)
 				}
-			}, nil)
+			}, func(file int, from, to time.Time) {
+				if kind != "cancelled" || file != vfsFileMain || !forcedSync.CompareAndSwap(false, true) {
+					return
+				}
+				// This is a controlled six-second minimum after the real OS
+				// sync, not a claim that Windows naturally took six seconds.
+				nativeSyncNs.Store(int64(to.Sub(from)))
+				if remaining := time.Until(from.Add(6 * time.Second)); remaining > 0 {
+					paddingStarted := time.Now()
+					time.Sleep(remaining)
+					paddingNs.Store(int64(time.Since(paddingStarted)))
+				}
+				effectiveSyncNs.Store(int64(time.Since(from)))
+			})
 			attempt := &backgroundCheckpointAttempt{copy: &walCopyAttempt{pressure: true}}
 			result := s.convergeBackfillPacedWithSmallRemainder(ctx, db, attempt, walReclaimPressureSmallFrames)
+			t.Logf("COPY_GUARD_CONTROL kind=%s forced_main_sync=%v minimum_requested=6s native_sync=%s padding=%s effective_sync=%s first_scan_error=%v", kind, forcedSync.Load(), time.Duration(nativeSyncNs.Load()), time.Duration(paddingNs.Load()), time.Duration(effectiveSyncNs.Load()), firstScanErr)
+			if kind == "cancelled" {
+				require.True(t, forcedSync.Load(), "real checkpoint main-file sync boundary was not reached")
+				require.GreaterOrEqual(t, time.Duration(effectiveSyncNs.Load()), 6*time.Second)
+			}
 			t.Logf("kind=%s actual_first_tuple=%+v observed=%v stop=%s passes=%d context=%v", kind, first, observed.Load(), result.stop, result.passes, ctx.Err())
 			require.Nil(t, result.slowTail, "invalid copy earned adaptive entitlement")
 			require.NotEqual(t, "slow_tail_plateau", result.stop)
