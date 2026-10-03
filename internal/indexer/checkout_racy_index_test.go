@@ -77,6 +77,9 @@ func TestCheckoutCoordinatorStartHealsARacilyCleanIndex(t *testing.T) {
 // runs once the edit is done.
 func TestCheckoutCoordinatorIndexRefreshWaitsForTheEdit(t *testing.T) {
 	f := newCoordinatorFixture(t)
+	// Control the start-time refresh precondition independently of whether
+	// fixture creation and the index rewrite land in the same wall-clock second.
+	racifyWorktreeIndex(t, f)
 	c := f.coordinator(t, CheckoutCoordinatorConfig{Debounce: time.Hour, debounceDemand: true})
 	awaitWorktreeIndexHealed(t, f, "the coordinator's start")
 	racifyWorktreeIndex(t, f)
