@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,8 +15,36 @@ import (
 // A pinned WAL reader keeps its writer-free round open while checked writes
 // cross that mark; the same attempt must admit the existing bounded completion.
 func TestWALAttemptPromotesWhenItsLogCrossesLastResortMark(t *testing.T) {
+	previousQueryer := walReclaimCreditPassiveQueryerObserver
+	var target atomic.Pointer[Store]
+	waiting, heldCopy := make(chan struct{}), make(chan struct{})
+	var waitOnce, heldOnce sync.Once
+	var heldEntered, heldDeadline time.Time
+	var heldContextError error
+	walReclaimCreditPassiveQueryerObserver = func(ctx context.Context, store *Store, db *sql.DB) (walCheckpointQueryer, func()) {
+		queryer, cleanup := walCheckpointQueryer(db), func() {}
+		if previousQueryer != nil {
+			queryer, cleanup = previousQueryer(ctx, store, db)
+		}
+		return dynamicMarkEntryQueryer{queryer: queryer, before: func(callCtx context.Context) {
+			if store == target.Load() && store.writeMu.held() && store.WALReclaimStats().LastResortRuns > 0 {
+				heldOnce.Do(func() {
+					heldEntered = time.Now()
+					heldDeadline, _ = callCtx.Deadline()
+					heldContextError = callCtx.Err()
+					close(heldCopy)
+				})
+			}
+		}}, cleanup
+	}
+	t.Cleanup(func() { walReclaimCreditPassiveQueryerObserver = previousQueryer })
 	s, db := finalBackfillFixture(t)
-	growWAL(t, s, 12)
+	target.Store(s)
+	// Seed close to the mark before the bounded attempt starts. Only a few
+	// checked commits after its reader wait are needed to cross it.
+	for writes := 0; walFileSize(s.dbPath+"-wal") < 42<<20 && writes < 64; writes++ {
+		require.NoError(t, churnWriteOnce(s, writes))
+	}
 	cfg := walReclaimConfig{thresholdBytes: 16 << 20, ceilingBytes: 12 << 20, readerWait: time.Second, truncateBudget: walReclaimTruncateBudget}
 	path := s.dbPath + "-wal"
 	pin, err := s.db.BeginTx(t.Context(), &sql.TxOptions{ReadOnly: true})
@@ -29,19 +58,13 @@ func TestWALAttemptPromotesWhenItsLogCrossesLastResortMark(t *testing.T) {
 	require.Less(t, entryBytes, walReclaimLastResortBytes(cfg))
 	oldRate := walHoldCopyRate.Swap(0)
 	defer walHoldCopyRate.Store(oldRate)
-	waiting, heldCopy := make(chan struct{}), make(chan struct{})
-	var waitOnce, heldOnce sync.Once
-	previousRound, previousCall := walReclaimRoundObserver, walCheckpointCallObserver
+	previousRound := walReclaimRoundObserver
 	walReclaimRoundObserver = func(stage string, _ uint64, older int, _ error) {
 		if older > 0 && (stage == "lane_post_copy_full_wait_start" || stage == "partial_wait_start") {
 			waitOnce.Do(func() { close(waiting) })
 		}
 	}
-	walCheckpointCallObserver = func(mode string, _ time.Time, _ time.Duration) {
-		if mode == "PASSIVE" && s.writeMu.held() && s.WALReclaimStats().LastResortRuns > 0 {
-			heldOnce.Do(func() { close(heldCopy) })
-		}
-	}
+
 	done := make(chan walReclaimResult, 1)
 	var owned *backgroundCheckpointAttempt
 	joined := false
@@ -57,7 +80,7 @@ func TestWALAttemptPromotesWhenItsLogCrossesLastResortMark(t *testing.T) {
 				t.Error("owned crossing attempt did not join")
 			}
 		}
-		walReclaimRoundObserver, walCheckpointCallObserver = previousRound, previousCall
+		walReclaimRoundObserver = previousRound
 	}()
 	go func() { done <- s.reclaimWALAttempt(cfg, db, path) }()
 	select {
@@ -75,6 +98,7 @@ func TestWALAttemptPromotesWhenItsLogCrossesLastResortMark(t *testing.T) {
 	_, err = s.writerDB.Exec(`UPDATE wal_churn SET payload='crossed-mark' WHERE id=1`)
 	s.writeMu.Unlock()
 	require.NoError(t, err)
+	producerStartedAt := time.Now()
 	writes := 0
 	for walFileSize(path) < walReclaimLastResortBytes(cfg) && writes < 64 {
 		require.NoError(t, churnWriteOnce(s, 2*writes))
@@ -83,11 +107,17 @@ func TestWALAttemptPromotesWhenItsLogCrossesLastResortMark(t *testing.T) {
 	grownBytes := walFileSize(path)
 	require.GreaterOrEqual(t, grownBytes, walReclaimLastResortBytes(cfg))
 	crossingAt := time.Now()
+	t.Logf("reader_wait_observed=true entry_bytes=%d grown_bytes=%d checked_writes=%d producer_duration=%s crossing_at=%s", entryBytes, grownBytes, writes+1, time.Since(producerStartedAt), crossingAt.Format(time.RFC3339Nano))
 	select {
 	case <-heldCopy:
+	case result := <-done:
+		joined = true
+		t.Fatalf("attempt ended before held entry: outcome=%s reason=%s%s", result.outcome.String(), result.reason, result.stampSuffix())
 	case <-time.After(time.Second):
-		t.Fatal("same attempt did not admit a held completion after crossing the existing mark")
+		t.Fatalf("same attempt did not admit a held completion after crossing the existing mark; attempt_ctx_error=%v cause=%v", owned.ctx.Err(), context.Cause(owned.ctx))
 	}
+	t.Logf("held_entry_at=%s held_SQL_deadline=%s held_context_error=%v entry_after_crossing=%s remaining_SQL_context_budget=%s", heldEntered.Format(time.RFC3339Nano), heldDeadline.Format(time.RFC3339Nano), heldContextError, heldEntered.Sub(crossingAt), time.Until(heldDeadline))
+	require.NoError(t, heldContextError)
 	require.False(t, s.readGate.closed.Load())
 	require.NoError(t, pin.Rollback())
 	var result walReclaimResult
@@ -190,4 +220,16 @@ func TestWALPromotedCompletionKeepsCreditAndAdmissionFences(t *testing.T) {
 			s.writeMu.Unlock()
 		})
 	}
+}
+
+// Observe the actual query dispatch boundary, before SQL, rather than the
+// post-return checkpoint observer. The real query and its context are unchanged.
+type dynamicMarkEntryQueryer struct {
+	queryer walCheckpointQueryer
+	before  func(context.Context)
+}
+
+func (q dynamicMarkEntryQueryer) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	q.before(ctx)
+	return q.queryer.QueryRowContext(ctx, query, args...)
 }
