@@ -283,6 +283,9 @@ func TestCopyStoreFileRemovesPartialCopyOnSourceReadFailure(t *testing.T) {
 }
 
 func TestMain(m *testing.M) {
+	// The test VFS wrapper must be installed before any store or background
+	// checkpoint can dispatch through SQLite's shared io_methods tables.
+	installReclaimSyncWrapper()
 	code := m.Run()
 	if packageScratchDir != "" {
 		_ = os.RemoveAll(packageScratchDir)

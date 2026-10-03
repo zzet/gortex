@@ -891,9 +891,10 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		return fmt.Errorf("%w: %w", ErrMaintenanceBusy, err)
 	}
 	held := time.Now()
+	writer := newWALReclaimWriterCredit(s, held)
 	defer func() {
-		res.writerHold = time.Since(held)
-		s.writeMu.Unlock()
+		writer.release()
+		res.writerHold = max(res.writerHold, writer.longest)
 	}()
 	if s.bulkConn != nil && !res.leaseOverride {
 		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
@@ -923,7 +924,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	// retry: an interrupted or refused PASSIVE reports 0/0 and must not be
 	// spun on while the writer is held.
 	backfill := func() (walCheckpointResult, error) {
-		result, err := checkpointWALOnceOn(yctx, ckptDB, "PASSIVE")
+		result, err := writer.passive(yctx, ckptDB, walReclaimMaxWriterHold, res.leaseOverride)
 		if err != nil && errors.Is(err, errSQLiteCheckpointIncomplete) && yctx.Err() == nil {
 			// Incomplete is a result, not a failure: a reader still needs
 			// frames (result carries the counts).
@@ -932,6 +933,13 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		return result, err
 	}
 	delta, derr := backfill()
+	if errors.Is(derr, errWALCheckpointDeferredBulk) {
+		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
+		return derr
+	}
+	if !writer.held {
+		return giveUp(fmt.Sprintf("backfill_failed error=%v", derr), derr)
+	}
 	res.frames = delta.WALFrames
 	if derr != nil {
 		return giveUp(fmt.Sprintf("backfill_failed error=%v", derr), errWALReclaimReadersInFlight)
@@ -988,8 +996,8 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 			if complete {
 				break
 			}
-			if delta, derr = backfill(); derr != nil {
-				return giveUp(fmt.Sprintf("backfill_failed error=%v", derr), nil)
+			if delta, derr = backfill(); derr != nil || !writer.held {
+				return giveUp(fmt.Sprintf("backfill_failed error=%v", derr), derr)
 			}
 		}
 		tctx, tcancel := context.WithDeadline(yctx, capAt)
@@ -1466,10 +1474,11 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 		return false, fmt.Errorf("%w: %w", ErrMaintenanceBusy, err)
 	}
 	held := time.Now()
+	writer := newWALReclaimWriterCredit(s, held)
 	defer func() {
-		res.writerHold = max(res.writerHold, time.Since(held))
+		writer.release()
+		res.writerHold = max(res.writerHold, writer.longest)
 		res.writerHolds++
-		s.writeMu.Unlock()
 	}()
 	if hook := walIdleResetHook; hook != nil {
 		hook()
@@ -1495,9 +1504,13 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 		return false, nil // copy more without the writer first
 	}
 	copyStart := time.Now()
-	delta, derr := checkpointWALOnceOn(yctx, ckptDB, "PASSIVE")
+	delta, derr := writer.passive(yctx, ckptDB, walReclaimResetHold/2, res.leaseOverride)
 	if ok && (derr == nil || errors.Is(derr, errSQLiteCheckpointIncomplete)) {
 		noteWALHoldCopy(int64(delta.CheckpointedFrames)-int64(snap.NBackfill), time.Since(copyStart))
+	}
+	if errors.Is(derr, errWALCheckpointDeferredBulk) {
+		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
+		return false, derr
 	}
 	if derr != nil && !errors.Is(derr, errSQLiteCheckpointIncomplete) {
 		if yielded() {
@@ -1505,6 +1518,9 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 			return false, errWALReclaimWriterWaiting
 		}
 		return false, nil
+	}
+	if !writer.held {
+		return false, derr
 	}
 	if first {
 		res.frames = delta.WALFrames

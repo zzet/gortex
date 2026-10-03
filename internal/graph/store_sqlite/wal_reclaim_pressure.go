@@ -144,9 +144,10 @@ func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res
 		return fmt.Errorf("%w: %w", errWALPressureHold, err)
 	}
 	held := time.Now()
+	writer := newWALReclaimWriterCredit(s, held)
 	defer func() {
-		res.writerHold = time.Since(held)
-		s.writeMu.Unlock()
+		writer.release()
+		res.writerHold = max(res.writerHold, writer.longest)
 	}()
 	if s.bulkConn != nil && !res.leaseOverride {
 		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
@@ -170,10 +171,15 @@ func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res
 	if hook := walPressureResetHook; hook != nil {
 		hook(hctx)
 	}
-	if _, err := checkpointWALOnceOn(hctx, ckptDB, "PASSIVE"); err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
+	if _, err := writer.passive(hctx, ckptDB, walReclaimPressureHold/2, res.leaseOverride); err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
 		res.reason = fmt.Sprintf("pressure_backfill error=%v", err)
 		s.walCopy.pressureGiveUps.Add(1)
 		return fmt.Errorf("%w: %w", errWALPressureHold, err)
+	}
+	if !writer.held {
+		res.reason = "pressure_writer_credit_expired"
+		s.walCopy.pressureGiveUps.Add(1)
+		return errWALPressureHold
 	}
 	result, err := s.resetWALForReclaim(hctx)
 	if err != nil {
