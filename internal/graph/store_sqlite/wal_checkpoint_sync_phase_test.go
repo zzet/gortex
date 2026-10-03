@@ -307,7 +307,19 @@ func TestHeldCreditCheckpointMeasuresOnlyItsEnteredSync(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("credit PASSIVE did not enter real xSync")
 	}
-	editStart := time.Now()
+	// The entered channel proves xSync is parked. Windows clock samples can
+	// tie across that handoff; require an actual later clock sample for this
+	// fixture's strict pre-edit premise, without relaxing the classifier.
+	parkedAt := time.Now()
+	editStart := parkedAt
+	clockDeadline := parkedAt.Add(time.Second)
+	for !editStart.After(parkedAt) {
+		if !time.Now().Before(clockDeadline) {
+			t.Fatal("clock did not advance after parked xSync")
+		}
+		time.Sleep(time.Millisecond)
+		editStart = time.Now()
+	}
 	before := vfsIOMark()
 	cancel()
 	bound := walCheckpointCycleYieldPoll + 60*time.Millisecond
@@ -331,6 +343,10 @@ func TestHeldCreditCheckpointMeasuresOnlyItsEnteredSync(t *testing.T) {
 	mu.Lock()
 	observed := append([]reclaimCheckpointSyncInterval(nil), phases...)
 	mu.Unlock()
+	t.Logf("credit call_start=%s call_end=%s parked_at=%s edit_start=%s", call.start.Format(time.RFC3339Nano), call.end.Format(time.RFC3339Nano), parkedAt.Format(time.RFC3339Nano), editStart.Format(time.RFC3339Nano))
+	for i, p := range observed {
+		t.Logf("credit sync=%d TLS=%x store=%p pacer=%p token=%p start=%s end=%s pre_edit=%t contained=%t", i, p.tls, p.store, p.pacer, p.credit, p.span.start.Format(time.RFC3339Nano), p.span.end.Format(time.RFC3339Nano), p.span.start.Before(editStart), !p.span.start.Before(call.start) && !p.span.end.After(call.end))
+	}
 	require.NotEmpty(t, observed)
 	require.Greater(t, call.end.Sub(editStart), bound)
 	known := knownPreEditCheckpointSync(s, []reclaimCheckpointSpan{call}, 0, observed, editStart, call.end)
