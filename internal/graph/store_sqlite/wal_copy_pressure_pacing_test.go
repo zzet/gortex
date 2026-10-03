@@ -17,10 +17,14 @@ import (
 // every 2.2 s. When only the fold's mark ended the pacing, no attempt
 // converged: the log reached 61 MiB in 15 s with no reset.
 func TestTheCopyIsNotPacedOverThePressureMark(t *testing.T) {
+	diag := newWindowsWALDiagnostic(t)
+	diag.install()
+	defer diag.finish()
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "4")
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_CEILING_MB", "64")
 	setWALReclaimCadence(t, 25*time.Millisecond, 25*time.Millisecond, 200*time.Millisecond)
 	s, path := openWALReclaimStore(t)
+	diag.store.Store(s)
 	defer func() { _ = s.Close() }()
 	if walCopyMethods.Load() == 0 {
 		t.Skip("the copy pause is not installed in this process")
