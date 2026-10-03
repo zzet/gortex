@@ -108,7 +108,8 @@ func TestReclaimFinalBackfillRefusesAWriteAfterCopy(t *testing.T) {
 			var copied sync.Once
 			var resets atomic.Int64
 			walCheckpointCallObserver = func(mode string, _ time.Time, _ time.Duration) {
-				if mode == "PASSIVE" {
+				switch mode {
+				case "PASSIVE":
 					copied.Do(func() {
 						// The checkpoint completed, but this write wins admission
 						// before reset. Its frames are outside the saved counts.
@@ -126,7 +127,7 @@ func TestReclaimFinalBackfillRefusesAWriteAfterCopy(t *testing.T) {
 						s.writeMu.Unlock()
 						require.NoError(t, err)
 					})
-				} else if mode == "TRUNCATE" || mode == "RESTART" {
+				case "TRUNCATE", "RESTART":
 					resets.Add(1)
 				}
 			}
