@@ -430,7 +430,7 @@ func queuedImportAdmissionProbe(t *testing.T, c *CheckoutCoordinator, gate *View
 			t.Error("early admission requests did not stop")
 		}
 		t.Logf("early admission actual queued-before-arm witnesses=%d", queued.Load())
-		if queued.Load() == 0 {
+		if !t.Skipped() && queued.Load() == 0 {
 			t.Error("early admission had no registered pre-arm demand")
 		}
 	})
