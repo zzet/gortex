@@ -122,6 +122,11 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 			}
 		},
 	}, admissionLogger)
+	// Startup refresh intentionally writes the Git index. Join it before
+	// this fixture's own checkout commands; a routed cycle is not its join.
+	if !c.awaitRacyIndexHeal(30 * time.Second) {
+		t.Fatal("startup Git index refresh did not finish before import setup")
+	}
 	c.cycleMu.Lock()
 	c.cycleBarrier = func(ctx context.Context) { cycleContext = ctx }
 	if earlyDemand {
