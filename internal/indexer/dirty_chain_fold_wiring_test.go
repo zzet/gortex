@@ -523,15 +523,29 @@ func mcpChainFixture(t *testing.T, tree map[string]string, background bool) (*co
 // and the lease's synchronous republish.
 func mcpEdit(t *testing.T, l *CheckoutLifecycle, f *coordinatorFixture, write func()) CheckoutCycle {
 	t.Helper()
-	ctx := context.Background()
-	m, err := l.BeginCheckoutMutation(ctx, f.checkoutID, f.worktree, f.route().RouteEpoch)
-	if err != nil {
-		t.Fatalf("begin the edit: %v", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var m *CheckoutMutation
+	var err error
+	for {
+		m, err = l.BeginCheckoutMutation(ctx, f.checkoutID, f.worktree, f.route().RouteEpoch)
+		if err == nil {
+			err = m.Prepare(ctx)
+		}
+		if err == nil {
+			break
+		}
+		if m != nil {
+			m.Close()
+		}
+		if !errors.Is(err, ErrCheckoutMutationRouteMoved) || ctx.Err() != nil {
+			t.Fatalf("admit the edit: %v", err)
+		}
+		// A fold can swap the route between selection and admission. No disk
+		// write has happened; select the exact route again within the budget.
+		time.Sleep(time.Millisecond)
 	}
 	defer m.Close()
-	if err := m.Prepare(ctx); err != nil {
-		t.Fatalf("prepare the edit: %v", err)
-	}
 	write()
 	out, err := m.Refresh(ctx)
 	if errors.Is(err, ErrCheckoutMutationPending) {
