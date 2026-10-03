@@ -53,6 +53,9 @@ func (s *Server) handleGraphQuery(ctx context.Context, req mcp.CallToolRequest) 
 	if limit < 1 {
 		limit = 100
 	}
+	// Kept so the response can say the cap, not the caller, chose the
+	// effective limit (see the query.SubGraph disclosure fields).
+	requestedLimit := limit
 	if limit > 1000 {
 		limit = 1000
 	}
@@ -67,6 +70,29 @@ func (s *Server) handleGraphQuery(ctx context.Context, req mcp.CallToolRequest) 
 	if evalErr != nil {
 		return mcp.NewToolResultError("graph_query: " + evalErr.Error()), nil
 	}
+	// Measured before the repo filter below can shrink the set: landing
+	// on the cap is the only visible signal that the pipeline stopped on
+	// `limit` rather than exhausting the graph (#672). A result of
+	// exactly limit nodes is disclosed even when the graph held exactly
+	// that many — a spurious "verify this" is the safe direction.
+	if boundByLimit(len(sg.Nodes), limit) {
+		// sg.Truncated folds the limit cut into the flag the compact
+		// renderers already emit: gcx's `truncated` meta and TOON's
+		// `truncated` field were rendering `false` next to a limit-clamped
+		// count — the exact #672 failure mode in compact formats (#845).
+		sg.Truncated = true
+		// JSON rides the flat disclosure shape search_text and
+		// find_declaration emit, so a client checking
+		// `_truncated_by_limit === true` handles every tool the same way.
+		sg.TruncatedByLimit = true
+		sg.LimitApplied = limit
+		exact := false
+		sg.CountIsExact = &exact
+		sg.TruncationNote = graphQueryTruncationNote
+		if requestedLimit > limit {
+			sg.LimitRequested = requestedLimit
+		}
+	}
 
 	allowed, filterErr := s.resolveRepoFilter(ctx, req)
 	if filterErr != nil {
@@ -76,6 +102,11 @@ func (s *Server) handleGraphQuery(ctx context.Context, req mcp.CallToolRequest) 
 	enrichSubGraphEdges(sg)
 	return s.returnSubGraph(ctx, req, sg)
 }
+
+// graphQueryTruncationNote explains a pipeline whose working set stopped on
+// the limit. The cap runs after every stage, so nodes dropped at any point
+// cannot re-enter the result in a later stage.
+const graphQueryTruncationNote = "the pipeline stopped at `limit` nodes, so the node set is a floor rather than the full result — nodes dropped by the per-stage cap cannot come back in a later stage. Raise `limit` to widen."
 
 // gqStageKind enumerates the three pipeline verbs.
 type gqStageKind int

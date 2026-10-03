@@ -188,7 +188,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 		if repoRoot == "" {
 			return mcp.NewToolResultError("could not resolve a repository root for the changeset diff"), nil
 		}
-		d, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, s.diffJoinPrefix(repoRoot), scope, baseRef)
+		d, err := analysis.MapGitDiffContext(ctx, s.readerFor(ctx), repoRoot, s.diffJoinPrefix(repoRoot), scope, baseRef)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -232,12 +232,14 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 		}
 	}
 
-	communities := s.getCommunities()
-	processes := s.getProcesses()
+	communities, processes, err := s.analysisMembershipsForNodes(ctx, ids)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	// --- composite impact (verdict input; also exposed) ---
 	if len(ids) > 0 {
-		imp := analysis.AnalyzeImpact(s.readerFor(ctx), ids, communities, processes)
+		imp := diffImpactContext(ctx, s.readerFor(ctx), ids, communities, processes)
 		out.Impact = &prReviewImpact{
 			Risk:          string(imp.Risk),
 			TotalAffected: imp.TotalAffected,
@@ -293,6 +295,9 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 		out.Gates = append(out.Gates, prReviewAuditGate(report))
 	}
 
+	if err := ctx.Err(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 	out.Verdict = worstVerdict(out.Gates)
 
 	payload := prReviewContextPayload(out)
@@ -352,6 +357,9 @@ func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.Dif
 	// Pre-compute per-file risk so every symbol in a file shares one tier.
 	fileIDs := map[string][]string{}
 	for _, cs := range diff.ChangedSymbols {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if cs.ID == "" {
 			continue
 		}
@@ -363,12 +371,18 @@ func (s *Server) buildDiffContextSection(ctx context.Context, diff *analysis.Dif
 	}
 	fileRisk := map[string]string{}
 	for fp, fids := range fileIDs {
-		imp := analysis.AnalyzeImpact(reader, fids, communities, processes)
+		if ctx.Err() != nil {
+			return nil
+		}
+		imp := diffImpactContext(ctx, reader, fids, communities, processes)
 		fileRisk[fp] = string(imp.Risk)
 	}
 
 	var syms []diffContextSymbol
 	for _, cs := range diff.ChangedSymbols {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if len(syms) >= cap {
 			break
 		}

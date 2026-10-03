@@ -120,6 +120,13 @@ type AnalysisProcessStep struct {
 	Depth     int
 }
 
+// AnalysisMembership retains one row per process step, including repeated nodes.
+type AnalysisMembership struct {
+	NodeID      string
+	CommunityID string
+	ProcessID   string
+}
+
 type AnalysisProcessMembership struct {
 	NodeID    string
 	ProcessID string
@@ -177,6 +184,7 @@ type AnalysisQueryStore interface {
 	ListAnalysisProcessSummaries(generationID int64, limit int, cursorID string) ([]AnalysisProcessSummary, string, error)
 	AnalysisProcessSteps(generationID int64, processID string, limit int, cursorOrdinal int) ([]AnalysisProcessStep, int, error)
 	AnalysisProcessesForNodes(generationID int64, nodeIDs []string) ([]AnalysisProcessMembership, error)
+	AnalysisMembershipsContext(ctx context.Context, generationID int64, nodeIDs []string) ([]AnalysisMembership, error)
 	AnalysisConcepts(generationID int64, tokens []string, direction AnalysisConceptDirection) (AnalysisConceptQueryResult, error)
 	ListAnalysisConcepts(generationID int64, limit int, cursorToken string) (AnalysisConceptQueryResult, string, error)
 	LoadAnalysisBlob(generationID int64, component AnalysisBlobComponent) ([]byte, bool, error)

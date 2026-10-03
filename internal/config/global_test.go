@@ -115,6 +115,23 @@ projects:
 	assert.Equal(t, "work", proj.Repos[0].Ref)
 }
 
+func TestLoadGlobal_DaemonHTTPAddr(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("daemon:\n  http_addr: 127.0.0.1:7411\n"), 0644))
+
+	gc, err := LoadGlobal(path)
+	require.NoError(t, err)
+	assert.Equal(t, "127.0.0.1:7411", gc.Daemon.HTTPAddr)
+}
+
+func TestUnknownGlobalKeysRecognizesDaemon(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte("daemon:\n  memory_limit: 4GiB\ntypo: true\n")
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+
+	require.Equal(t, []string{"typo"}, UnknownGlobalKeys(path))
+}
+
 func TestLoadGlobal_MalformedYAML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

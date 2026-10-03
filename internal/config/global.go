@@ -111,6 +111,12 @@ type DaemonConfig struct {
 	// to a sane band). The GORTEX_DAEMON_MEMLIMIT env var overrides this,
 	// and a runtime-honored GOMEMLIMIT overrides both.
 	MemoryLimit string `mapstructure:"memory_limit" yaml:"memory_limit,omitempty"`
+
+	// HTTPAddr is the TCP listen address for the daemon HTTP surface
+	// (/mcp + /v1), resolved at startup. Empty leaves HTTP disabled unless
+	// overridden by GORTEX_DAEMON_HTTP_ADDR; a non-empty --http-addr flag
+	// overrides both. Non-loopback binds require an auth token.
+	HTTPAddr string `mapstructure:"http_addr" yaml:"http_addr,omitempty"`
 }
 
 // GlobalMCPConfig is the `mcp:` block in ~/.gortex/config.yaml. It contains
@@ -186,6 +192,7 @@ func (gc *GlobalConfig) MergeEmbeddingInto(local EmbeddingConfig) EmbeddingConfi
 var knownGlobalTopLevelKeys = map[string]bool{
 	"projects": true, "repos": true, "active_project": true,
 	"exclude": true, "llm": true, "embedding": true, "mcp": true,
+	"daemon": true,
 }
 
 // UnknownGlobalKeys returns the top-level keys present in the global config file

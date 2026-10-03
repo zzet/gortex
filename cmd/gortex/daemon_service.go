@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"text/template"
 
@@ -94,6 +95,30 @@ func xdgServiceEnv() []serviceEnvVar {
 	return out
 }
 
+// servicePath captures the installing shell's PATH so supervised language
+// servers can be found outside the standard locations. Re-run install-service
+// to re-capture changed values. Only absolute entries are kept: relative and
+// empty entries would resolve against the service's working directory. An
+// entry containing CR or LF is dropped, because it would split a systemd
+// Environment= line. Entries need not exist yet; duplicates are removed without
+// changing the shell's order.
+// Missing defaults are appended for launchd; systemd keeps its default when the
+// captured PATH is empty.
+func servicePath(defaults []string) string {
+	var entries []string
+	for _, entry := range strings.Split(os.Getenv("PATH"), string(os.PathListSeparator)) {
+		if filepath.IsAbs(entry) && !strings.ContainsAny(entry, "\r\n") && !slices.Contains(entries, entry) {
+			entries = append(entries, entry)
+		}
+	}
+	for _, entry := range defaults {
+		if !slices.Contains(entries, entry) {
+			entries = append(entries, entry)
+		}
+	}
+	return strings.Join(entries, string(os.PathListSeparator))
+}
+
 // xmlEscape renders s safe for an XML text node (the launchd plist) so a
 // home path containing an XML metacharacter can't produce a malformed,
 // unloadable plist.
@@ -105,17 +130,20 @@ func xmlEscape(s string) string {
 	return b.String()
 }
 
-// systemdEnvValue renders a value safe for a systemd Environment= line.
+// systemdEnvValue renders a KEY=value assignment safe for a systemd
+// Environment= line.
 // `%` is escaped to `%%` because systemd treats it as a specifier
 // introducer across the whole unit file (systemd.unit(5)) — an
 // unescaped `%d` in a path would expand to a directory specifier and
-// silently change the value the daemon sees. Values containing
-// whitespace are additionally double-quoted (with embedded quotes /
-// backslashes escaped) per systemd's quoting rules. Plain paths (the
-// common case) pass through unchanged.
+// silently change the value the daemon sees. An assignment containing
+// whitespace, a backslash or a quote is additionally double-quoted as a whole
+// (with embedded quotes / backslashes escaped): systemd.syntax(7) recognizes
+// a quote only at the start of an item, so `KEY="a b"` would not be unquoted,
+// and systemd applies C-style escapes such as `\t` to unquoted text too.
+// Plain paths (the common case) pass through unchanged.
 func systemdEnvValue(v string) string {
 	v = strings.ReplaceAll(v, "%", "%%")
-	if !strings.ContainsAny(v, " \t") {
+	if !strings.ContainsAny(v, " \t\\\"'") {
 		return v
 	}
 	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
@@ -200,10 +228,9 @@ func runDaemonServiceStatus(cmd *cobra.Command, _ []string) error {
 // StandardOutPath / StandardErrorPath redirect logs into the same file
 // `gortex daemon logs` tails, so users don't need to remember two paths.
 //
-// EnvironmentVariables carries PATH (so a Homebrew-installed binary is
-// found in launchd's minimal environment) plus any XDG_* overrides that
-// were in effect at install time — see xdgServiceEnv for why that
-// capture is necessary.
+// EnvironmentVariables carries the installing shell's PATH with missing
+// Homebrew / system defaults appended, plus any XDG_* overrides in effect at
+// install time — see servicePath and xdgServiceEnv for the capture rules.
 const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -230,7 +257,7 @@ const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <string>{{.Path}}</string>
 {{- range .EnvVars}}
         <key>{{.Key}}</key>
         <string>{{.Value}}</string>
@@ -245,12 +272,13 @@ const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 // malformed, unloadable plist.
 func renderLaunchdPlist(label, exe, logPath string, env []serviceEnvVar) (string, error) {
 	data := struct {
-		Label, Exe, LogPath string
-		EnvVars             []serviceEnvVar
+		Label, Exe, LogPath, Path string
+		EnvVars                   []serviceEnvVar
 	}{
 		Label:   xmlEscape(label),
 		Exe:     xmlEscape(exe),
 		LogPath: xmlEscape(logPath),
+		Path:    xmlEscape(servicePath([]string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"})),
 		EnvVars: make([]serviceEnvVar, len(env)),
 	}
 	for i, e := range env {
@@ -564,9 +592,10 @@ func noteRunningDaemon(w io.Writer, daemonRunning func() bool) {
 // systemdUnitTemplate renders a user-level systemd service. Type=simple
 // because `gortex daemon start` (without --detach) runs in the
 // foreground; Restart=on-failure covers the crash-restart case without
-// pounding on successful exits. Environment= lines carry any XDG_*
-// overrides that were in effect at install time so the supervised daemon
-// resolves the same paths as the installing shell — see xdgServiceEnv.
+// pounding on successful exits. Environment= lines carry a non-empty captured
+// PATH and any XDG_* overrides in effect at install time so the supervised
+// daemon resolves the same paths as the installing shell — see servicePath
+// and xdgServiceEnv.
 const systemdUnitTemplate = `[Unit]
 Description=Gortex code intelligence daemon
 Documentation=https://github.com/zzet/gortex
@@ -576,7 +605,7 @@ After=network.target
 Type=simple
 ExecStart={{.Exe}} daemon start
 {{- range .EnvVars}}
-Environment={{.Key}}={{.Value}}
+Environment={{.}}
 {{- end}}
 Restart=on-failure
 RestartSec=2
@@ -588,14 +617,17 @@ WantedBy=default.target
 `
 
 // renderSystemdUnit fills systemdUnitTemplate, quoting Environment=
-// values that need it.
+// assignments that need it.
 func renderSystemdUnit(exe, logPath string, env []serviceEnvVar) (string, error) {
+	if path := servicePath(nil); path != "" {
+		env = append([]serviceEnvVar{{Key: "PATH", Value: path}}, env...)
+	}
 	data := struct {
 		Exe, LogPath string
-		EnvVars      []serviceEnvVar
-	}{Exe: exe, LogPath: logPath, EnvVars: make([]serviceEnvVar, len(env))}
+		EnvVars      []string
+	}{Exe: exe, LogPath: logPath, EnvVars: make([]string, len(env))}
 	for i, e := range env {
-		data.EnvVars[i] = serviceEnvVar{Key: e.Key, Value: systemdEnvValue(e.Value)}
+		data.EnvVars[i] = systemdEnvValue(e.Key + "=" + e.Value)
 	}
 	var buf bytes.Buffer
 	if err := template.Must(template.New("unit").Parse(systemdUnitTemplate)).Execute(&buf, data); err != nil {

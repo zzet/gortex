@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -280,6 +282,56 @@ func TestIndexFile_BinarySkip(t *testing.T) {
 	require.Equal(t, true, n.Meta["skipped_due_to_binary"])
 	// The extractor never ran on the binary bytes.
 	require.Equal(t, before, ext.calls.Load())
+}
+
+
+// csExtractor claims the .cs extension so the UTF-16 fixture reaches the
+// admission path like a real C# source would.
+type csExtractor struct{ countingExtractor }
+
+func (e *csExtractor) Extensions() []string { return []string{".cs"} }
+
+// TestIndexFile_UTF16SkipLabel pins the label users see for a UTF-16
+// source (#812): since #834's admission check runs before the parser,
+// an ordinary UTF-16LE file never reaches ErrUTF16Source — the BOM-strip
+// leaves its mark in place, the admission sniff classifies it as a UTF-16
+// text source (not "binary"), and the extractor never runs on it. The
+// skip is a successful read: no failure-ledger row, no reconcile retry.
+func TestIndexFile_UTF16SkipLabel(t *testing.T) {
+	ext := &csExtractor{}
+	reg := parser.NewRegistry()
+	reg.Register(ext)
+	cfg := config.Default().Index
+	idx := New(graph.New(), reg, cfg, zap.NewNop())
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "ok.cs"), "real source")
+	units := utf16.Encode([]rune("public class Legacy\n{\n    public int B() { return 1; }\n}\n"))
+	var b bytes.Buffer
+	b.WriteByte(0xFF)
+	b.WriteByte(0xFE)
+	for _, u := range units {
+		b.WriteByte(byte(u))
+		b.WriteByte(byte(u >> 8))
+	}
+	writeFile(t, filepath.Join(dir, "legacy.cs"), b.String())
+
+	result, err := idx.Index(dir)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.SkippedFiles, "the UTF-16 file must skip, the text file must index")
+	n := idx.graph.GetNode("legacy.cs")
+	require.NotNil(t, n, "a UTF-16 skip must leave a visible node")
+	require.Equal(t, true, n.Meta["skipped_due_to_binary"])
+	require.Equal(t, "utf-16 text source (NUL-interleaved; nothing a text grammar can extract)",
+		n.Meta["binary_reason"], "a text file must not be mislabelled as binary")
+	// The extractor ran once — for the text file; never on the
+	// NUL-interleaved bytes.
+	require.Equal(t, int32(1), ext.calls.Load())
+	// The skip is a successful read: no failure-ledger row to retry.
+	for _, graphPath := range idx.fileIndexFailurePaths() {
+		require.NotEqual(t, "legacy.cs", graphPath,
+			"a UTF-16 skip must not land in the failure ledger")
+	}
 }
 
 func walkedFilePaths(fs []walkedFile) []string {

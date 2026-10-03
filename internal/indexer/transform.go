@@ -274,7 +274,10 @@ func (idx *Indexer) effectiveLanguage(path string, src []byte) (string, bool) {
 // bomStripTransform removes a leading UTF-8 / UTF-16 byte-order mark. A
 // BOM at offset 0 is not whitespace to a tree-sitter grammar and breaks
 // the first token (e.g. a Go file's `package` clause), so stripping it
-// is always correct — this transform is on for every file.
+// is always correct — this transform is on for every file. UTF-16 marks
+// are deliberately left in place: parser.ParseFile rejects UTF-16
+// sources via that mark, and stripping it would turn the file into
+// NUL-interleaved garbage no downstream check can recognise.
 type bomStripTransform struct{}
 
 func (bomStripTransform) name() string        { return "bom-strip" }
@@ -284,18 +287,15 @@ func (bomStripTransform) apply(_ string, src []byte) ([]byte, error) {
 	return stripBOM(src), nil
 }
 
-// stripBOM drops a leading UTF-8, UTF-16LE or UTF-16BE byte-order mark.
+// stripBOM drops a leading UTF-8 byte-order mark. UTF-16 marks are
+// preserved on purpose: stripping the two BOM bytes would leave the
+// NUL-interleaved body unrecognisable as UTF-16, and the body must
+// never reach tree-sitter (see parser.ErrUTF16Source).
 func stripBOM(src []byte) []byte {
-	switch {
-	case len(src) >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF:
+	if len(src) >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF {
 		return src[3:]
-	case len(src) >= 2 && src[0] == 0xFF && src[1] == 0xFE:
-		return src[2:]
-	case len(src) >= 2 && src[0] == 0xFE && src[1] == 0xFF:
-		return src[2:]
-	default:
-		return src
 	}
+	return src
 }
 
 // --- user-pluggable: external command ------------------------------------

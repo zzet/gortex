@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/xml"
 	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -96,6 +97,7 @@ func TestRenderLaunchdPlist_EscapesXML(t *testing.T) {
 // contract and that no Environment= line is emitted when nothing was
 // captured.
 func TestRenderSystemdUnit_NoXDG(t *testing.T) {
+	t.Setenv("PATH", "")
 	out, err := renderSystemdUnit(
 		"/home/u/.local/bin/gortex",
 		"/home/u/.gortex/cache/daemon.log",
@@ -127,8 +129,9 @@ func TestRenderSystemdUnit_PropagatesXDG(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Contains(t, out, "Environment=XDG_CACHE_HOME=/home/u/.cache")
-	// A value containing whitespace is double-quoted per systemd rules.
-	assert.Contains(t, out, `Environment=XDG_DATA_HOME="/home/u/has space"`)
+	// An assignment containing whitespace is double-quoted as a whole,
+	// because systemd recognizes a quote only at the start of an item.
+	assert.Contains(t, out, `Environment="XDG_DATA_HOME=/home/u/has space"`)
 
 	// Environment lines must sit inside [Service], ahead of [Install].
 	svcStart := strings.Index(out, "[Service]")
@@ -163,9 +166,130 @@ func TestXDGServiceEnv_OnlyAbsoluteSet(t *testing.T) {
 	assert.False(t, hasCache, "empty XDG_CACHE_HOME must be ignored")
 }
 
+func TestServicePath(t *testing.T) {
+	sep := string(os.PathListSeparator)
+	root := t.TempDir()
+	first := filepath.Join(root, "go", "bin")
+	second := filepath.Join(root, "dotnet")
+	require.NoDirExists(t, first, "PATH entries need not exist at install time")
+	defaults := []string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"}
+
+	for _, tt := range []struct {
+		name     string
+		path     string
+		defaults []string
+		want     string
+	}{
+		{
+			name: "absolute entries only, first occurrence and order kept",
+			path: strings.Join([]string{"", ".", second, "relative/bin", first, second, ""}, sep),
+			want: second + sep + first,
+		},
+		{
+			name:     "launchd appends missing defaults without changing precedence",
+			path:     strings.Join([]string{second, first, second}, sep),
+			defaults: []string{first, second, filepath.Join(root, "default")},
+			want:     strings.Join([]string{second, first, filepath.Join(root, "default")}, sep),
+		},
+		{
+			name: "systemd has no appended defaults",
+			path: first,
+			want: first,
+		},
+		{
+			name:     "empty launchd PATH preserves the old defaults",
+			defaults: defaults,
+			want:     strings.Join(defaults, sep),
+		},
+		{name: "empty systemd PATH stays empty"},
+		{name: "all relative systemd PATH stays empty", path: sep + "." + sep + "relative/bin"},
+		{
+			name: "entries containing CR or LF are dropped",
+			path: strings.Join([]string{first + "\nExecStartPre=/bin/false", second + "\r", first}, sep),
+			want: first,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PATH", tt.path)
+			assert.Equal(t, tt.want, servicePath(tt.defaults))
+		})
+	}
+}
+
+func TestRenderLaunchdPlist_CapturesPATH(t *testing.T) {
+	sep := string(os.PathListSeparator)
+	custom := filepath.Join(t.TempDir(), "a&b", "100% tools")
+	t.Setenv("PATH", custom)
+	t.Setenv("GORTEX_DAEMON_HTTP_TOKEN", "must-not-be-captured")
+	out, err := renderLaunchdPlist("com.zzet.gortex", "/bin/gortex", "/log", nil)
+	require.NoError(t, err)
+
+	want := strings.ReplaceAll(custom, "&", "&amp;") + sep +
+		strings.Join([]string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"}, sep)
+	assert.Contains(t, out, "<key>PATH</key>\n        <string>"+want+"</string>")
+	assert.NotContains(t, out, "a&b")
+	assert.NotContains(t, out, "GORTEX_")
+	assert.NotContains(t, out, "must-not-be-captured")
+	assertWellFormedXML(t, out)
+}
+
+func TestRenderLaunchdPlist_EmptyPATH(t *testing.T) {
+	t.Setenv("PATH", "")
+	out, err := renderLaunchdPlist("com.zzet.gortex", "/bin/gortex", "/log", nil)
+	require.NoError(t, err)
+
+	// This is exactly the old PATH on launchd's Unix host; adapt only the
+	// path-list separator when these render tests run on Windows.
+	want := strings.ReplaceAll("/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin", ":", string(os.PathListSeparator))
+	assert.Contains(t, out, "<key>PATH</key>\n        <string>"+want+"</string>")
+	assert.Equal(t, 1, strings.Count(out, "<key>PATH</key>"))
+	assertWellFormedXML(t, out)
+}
+
+func TestRenderSystemdUnit_CapturesPATH(t *testing.T) {
+	sep := string(os.PathListSeparator)
+	root := t.TempDir()
+	first := filepath.Join(root, "a&b", "100% tools")
+	second := filepath.Join(root, "bin")
+	t.Setenv("PATH", first+sep+second)
+	t.Setenv("GORTEX_DAEMON_HTTP_TOKEN", "must-not-be-captured")
+	out, err := renderSystemdUnit("/bin/gortex", "/log", nil)
+	require.NoError(t, err)
+
+	// systemd quotes whitespace and escapes backslashes within a quoted
+	// value (relevant to this native fixture when tests run on Windows).
+	want := strings.ReplaceAll(first+sep+second, "\\", "\\\\")
+	want = strings.ReplaceAll(want, "%", "%%")
+	assert.Contains(t, out, "\nEnvironment=\"PATH="+want+"\"\n")
+	assert.Equal(t, 1, strings.Count(out, "PATH="))
+	assert.NotContains(t, out, "/opt/homebrew/bin")
+	assert.NotContains(t, out, "GORTEX_")
+	assert.NotContains(t, out, "must-not-be-captured")
+}
+
+func TestRenderSystemdUnit_EmptyPATH(t *testing.T) {
+	for _, path := range []string{"", ".", string(os.PathListSeparator) + "relative/bin"} {
+		t.Run(path, func(t *testing.T) {
+			t.Setenv("PATH", path)
+			out, err := renderSystemdUnit("/bin/gortex", "/log", nil)
+			require.NoError(t, err)
+			assert.NotContains(t, out, "PATH=")
+		})
+	}
+}
+
 func TestSystemdEnvValue_QuotesWhitespace(t *testing.T) {
 	assert.Equal(t, "/home/u/.config", systemdEnvValue("/home/u/.config"))
 	assert.Equal(t, `"/home/u/my data"`, systemdEnvValue("/home/u/my data"))
+}
+
+// TestSystemdEnvValue_QuotesEscapesAndQuotes covers characters systemd
+// interprets in unquoted text: a backslash starts a C-style escape (`\t`
+// would become a tab), and a quote starts a quoted section.
+func TestSystemdEnvValue_QuotesEscapesAndQuotes(t *testing.T) {
+	assert.Equal(t, `"PATH=/opt/a\\tools"`, systemdEnvValue(`PATH=/opt/a\tools`))
+	assert.Equal(t, `"PATH=/opt/\"q\"/bin"`, systemdEnvValue(`PATH=/opt/"q"/bin`))
+	assert.Equal(t, `"PATH=/opt/it's/bin"`, systemdEnvValue(`PATH=/opt/it's/bin`))
 }
 
 // TestSystemdEnvValue_EscapesPercent guards the systemd specifier escape:

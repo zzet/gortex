@@ -381,7 +381,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		reader = nil
 	}
 
-	diff, err := analysis.MapGitDiff(reader, repoRoot, repoPrefix, scope, baseRef)
+	diff, err := analysis.MapGitDiffContext(ctx, reader, repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -433,7 +433,10 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		symbolIDs[i] = cs.ID
 	}
 
-	impact := analysis.AnalyzeImpact(s.readerFor(ctx), symbolIDs, s.getCommunities(), s.getProcesses())
+	impact, err := s.analyzeDiffImpact(ctx, symbolIDs)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	detectResult := map[string]any{
 		"changed_symbols":      diff.ChangedSymbols,

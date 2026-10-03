@@ -3035,7 +3035,7 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 		return mcp.NewToolResultError(rootErr.Error()), nil
 	}
 
-	diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
+	diff, err := analysis.MapGitDiffContext(ctx, s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -3047,8 +3047,14 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 		})
 	}
 
-	communities := s.getCommunities()
-	processes := s.getProcesses()
+	ids := make([]string, 0, len(diff.ChangedSymbols))
+	for _, cs := range diff.ChangedSymbols {
+		ids = append(ids, cs.ID)
+	}
+	communities, processes, err := s.analysisMembershipsForNodes(ctx, ids)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	// Build enriched symbol info. The lookups run on the request's
 	// reader, matching the caller/chain walks below which already go
@@ -3056,6 +3062,9 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 	reader := s.readerFor(ctx)
 	var allSymbols []diffSymbolInfo
 	for _, cs := range diff.ChangedSymbols {
+		if err := ctx.Err(); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		node := reader.GetNode(cs.ID)
 		if node == nil {
 			continue
@@ -3129,12 +3138,15 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 	// Compute per-file risk
 	var groups []diffFileGroup
 	for fp, syms := range fileMap {
+		if err := ctx.Err(); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		// Compute risk based on blast radius of symbols in this file
 		symbolIDs := make([]string, len(syms))
 		for i, sym := range syms {
 			symbolIDs[i] = sym.ID
 		}
-		impact := analysis.AnalyzeImpact(reader, symbolIDs, communities, processes)
+		impact := diffImpactContext(ctx, reader, symbolIDs, communities, processes)
 
 		groups = append(groups, diffFileGroup{
 			FilePath: fp,
@@ -3176,6 +3188,10 @@ func (s *Server) handleDiffContext(ctx context.Context, req mcp.CallToolRequest)
 			count += len(g.Symbols)
 		}
 		groups = truncGroups
+	}
+
+	if err := ctx.Err(); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	if isCompact(req) {

@@ -249,6 +249,18 @@ func (s *Searcher) openConfined(rel string) (*os.File, error) {
 // its lines. Results are ordered by file, then by line. A non-positive
 // limit returns every match.
 func (s *Searcher) Grep(query string, limit int) []Match {
+	return s.GrepPaths(query, nil, limit)
+}
+
+// GrepPaths is Grep restricted to documents under one of the
+// forward-slash path prefixes. The restriction runs BEFORE the limit
+// cut: a scoped query must surface scoped matches even when a wall of
+// out-of-scope files owns the head of the global ordering (issue #827).
+// Empty prefixes mean unscoped — identical to Grep. Prefixes are
+// matched on segment boundaries (trigram.PathUnderAnyPrefix): a prefix
+// matches when the path equals it exactly or continues past it at a
+// slash, so "pkg/su" does not match "pkg/sub/x.go" (#845).
+func (s *Searcher) GrepPaths(query string, prefixes []string, limit int) []Match {
 	if query == "" {
 		return nil
 	}
@@ -259,6 +271,9 @@ func (s *Searcher) Grep(query string, limit int) []Match {
 			continue
 		}
 		rel := paths[docID]
+		if !PathUnderAnyPrefix(rel, prefixes) {
+			continue
+		}
 		f, err := s.openConfined(rel)
 		if err != nil {
 			continue
@@ -282,6 +297,25 @@ func (s *Searcher) Grep(query string, limit int) []Match {
 	return matches
 }
 
+// PathUnderAnyPrefix reports whether a forward-slash path sits under
+// one of the prefixes on segment boundaries: the path equals the prefix
+// exactly or continues past it at a slash — the same semantics the
+// post-filter's pathMatchesAnyPrefix applies, so an in-search prefix
+// cannot match a path the post-filter would then drop after it has
+// already consumed a limit slot (#845). An empty prefix set, or an
+// empty prefix entry, matches everything — the unscoped default.
+func PathUnderAnyPrefix(path string, prefixes []string) bool {
+	if len(prefixes) == 0 {
+		return true
+	}
+	for _, pre := range prefixes {
+		if pre == "" || path == pre || strings.HasPrefix(path, pre+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // DocCount returns the number of indexed files.
 func (s *Searcher) DocCount() int { return s.ix.DocCount() }
 
@@ -295,8 +329,31 @@ func (s *Searcher) DocCount() int { return s.ix.DocCount() }
 // A non-positive limit returns every match.
 //
 // pathPrefix, when non-empty, restricts the scan to files whose
-// forward-slash repo-relative path starts with it.
+// forward-slash repo-relative path starts with it (raw string prefix —
+// the semantics these filters always had).
 func (s *Searcher) GrepRegexp(re *regexp.Regexp, requiredLiterals []string, pathPrefix string, limit int) []Match {
+	under := func(rel string) bool { return graphpath.HasPrefix(rel, pathPrefix) }
+	return s.grepRegexpUnder(re, requiredLiterals, limit, under)
+}
+
+// GrepRegexpPaths is GrepRegexp restricted to documents under one of
+// the forward-slash path prefixes, matched on segment boundaries
+// (PathUnderAnyPrefix). The restriction runs BEFORE the limit cut,
+// mirroring GrepPaths — a regexp query scoped with `path` must surface
+// scoped matches even when out-of-scope files own the head of the
+// global ordering (issue #827 for regexp queries, #845). Empty
+// prefixes mean unscoped — identical to GrepRegexp with "".
+func (s *Searcher) GrepRegexpPaths(re *regexp.Regexp, requiredLiterals []string, prefixes []string, limit int) []Match {
+	return s.grepRegexpUnder(re, requiredLiterals, limit, func(rel string) bool {
+		return PathUnderAnyPrefix(rel, prefixes)
+	})
+}
+
+// grepRegexpUnder is the shared body of GrepRegexp and GrepRegexpPaths:
+// the prefix restriction applies before the limit cut; the entry points
+// differ only in how a path qualifies (raw prefix vs segment
+// boundaries).
+func (s *Searcher) grepRegexpUnder(re *regexp.Regexp, requiredLiterals []string, limit int, under func(rel string) bool) []Match {
 	if re == nil {
 		return nil
 	}
@@ -347,7 +404,7 @@ func (s *Searcher) GrepRegexp(re *regexp.Regexp, requiredLiterals []string, path
 			continue
 		}
 		rel := paths[docID]
-		if !graphpath.HasPrefix(rel, pathPrefix) {
+		if !under(rel) {
 			continue
 		}
 		f, err := s.openConfined(rel)

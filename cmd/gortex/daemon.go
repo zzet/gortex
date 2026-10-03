@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/pflag"
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm/conversationlog"
@@ -149,7 +150,7 @@ func init() {
 	daemonStartCmd.Flags().StringVar(&daemonEmbeddingsModel, "embeddings-model", "",
 		"embedding model for --embeddings-url (default: auto-detect — text-embedding-3-small for OpenAI, nomic-embed-text for Ollama)")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPAddr, "http-addr", "",
-		"also expose the MCP 2026 Streamable HTTP transport on this TCP address (e.g. 127.0.0.1:7411); empty disables")
+		"also expose /mcp and /v1 on this TCP address (e.g. 127.0.0.1:7411); non-empty overrides $GORTEX_DAEMON_HTTP_ADDR and daemon.http_addr config; unset in all three disables HTTP")
 	daemonStartCmd.Flags().StringVar(&daemonHTTPAuthToken, "http-auth-token", "",
 		"bearer token required on every Streamable HTTP request (default: read $GORTEX_DAEMON_HTTP_TOKEN; empty allows unauthenticated localhost binds)")
 	daemonStartCmd.Flags().StringSliceVar(&daemonHTTPAllowedOrigins, "http-allowed-origin", nil,
@@ -189,6 +190,20 @@ func init() {
 	daemonCmd.AddCommand(daemonStatusCmd)
 	daemonCmd.AddCommand(daemonLogsCmd)
 	rootCmd.AddCommand(daemonCmd)
+}
+
+// resolveDaemonHTTPAddr selects the startup listen address: flag, env, then config.
+func resolveDaemonHTTPAddr(flag, env string, gc *config.GlobalConfig) string {
+	if flag != "" {
+		return flag
+	}
+	if env != "" {
+		return env
+	}
+	if gc != nil {
+		return gc.Daemon.HTTPAddr
+	}
+	return ""
 }
 
 // runDaemonStart starts the daemon in foreground (default) or detached
@@ -430,7 +445,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	var v1EventHub *hub.Hub
 
 	// Optional MCP 2026 Streamable HTTP transport. Off by default
-	// (--http-addr unset) so a fresh `gortex daemon start` keeps
+	// (flag, env and config unset) so a fresh `gortex daemon start` keeps
 	// the unix-socket-only behaviour every existing client already
 	// expects. When set, the daemon mounts /mcp on the supplied
 	// TCP address using the in-process streamable.Transport;
@@ -439,12 +454,13 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// it. The auth token is mandatory for non-localhost binds —
 	// exposing an unauthenticated MCP server on an external
 	// interface is a footgun, not a feature.
-	if daemonHTTPAddr != "" {
+	httpAddr := resolveDaemonHTTPAddr(daemonHTTPAddr, os.Getenv("GORTEX_DAEMON_HTTP_ADDR"), state.configManager.Global())
+	if httpAddr != "" {
 		token := daemonHTTPAuthToken
 		if token == "" {
 			token = os.Getenv("GORTEX_DAEMON_HTTP_TOKEN")
 		}
-		if err := httpTokenRequirementError(daemonHTTPAddr, token); err != nil {
+		if err := httpTokenRequirementError(httpAddr, token); err != nil {
 			return err
 		}
 		// Resolve the expected token per request so $GORTEX_DAEMON_HTTP_TOKEN
@@ -501,9 +517,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		v1.SetConversationGuard(daemonHTTPConversationAllow, tokenFn)
 
 		srv.HTTPHandler = composeDaemonHTTPHandler(streamH, v1, tokenFn, daemonHTTPCORSOrigin)
-		srv.HTTPAddr = daemonHTTPAddr
+		srv.HTTPAddr = httpAddr
 		logger.Info("daemon: HTTP surface configured (/mcp + /v1)",
-			zap.String("addr", daemonHTTPAddr),
+			zap.String("addr", httpAddr),
 			zap.Bool("authenticated", token != ""),
 			zap.String("cors_origin", daemonHTTPCORSOrigin))
 	}

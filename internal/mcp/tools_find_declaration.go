@@ -68,6 +68,9 @@ func (s *Server) handleFindDeclaration(ctx context.Context, req mcp.CallToolRequ
 	if limit < 1 {
 		limit = 20
 	}
+	// Kept so the response can say the cap, not the caller, chose the
+	// effective limit (see stampLimitTruncation).
+	requestedLimit := limit
 	if limit > 1000 {
 		limit = 1000
 	}
@@ -125,13 +128,27 @@ func (s *Server) handleFindDeclaration(ctx context.Context, req mcp.CallToolRequ
 		ordered = append(ordered, groups[id])
 	}
 
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	resp := map[string]any{
 		"use_site":          useSite,
 		"declarations":      ordered,
 		"count":             len(ordered),
 		"use_sites_scanned": len(matches),
-	})
+	}
+	// A stage-1 scan that stopped on the limit leaves the response a floor
+	// claiming to be a total: use_sites_scanned corroborates the wrong
+	// number exactly like search_text's count did (#672). The signal is
+	// measured before the resolution pass drops sites, so a scan of
+	// exactly limit sites is disclosed even when every site resolved.
+	if boundByLimit(len(matches), limit) {
+		stampLimitTruncation(resp, requestedLimit, limit, findDeclTruncationNote)
+	}
+	return s.respondJSONOrTOON(ctx, req, resp)
 }
+
+// findDeclTruncationNote explains a stage-1 use-site scan that stopped on
+// the limit. Declarations reachable only from later use sites are missing;
+// the resolution pass over the retained sites still ran to completion.
+const findDeclTruncationNote = "the use-site scan stopped at `limit`, so `use_sites_scanned` is a floor rather than a total and declarations reachable only from later use sites are missing. Raise `limit` to widen."
 
 // findUseSiteMatches runs Stage 1 — the trigram-accelerated search that
 // locates candidate use sites. For a literal it uses GrepText and

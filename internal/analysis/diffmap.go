@@ -84,11 +84,19 @@ type DiffResult struct {
 // changed files and file changes are preserved, but symbols are not mapped.
 // This does not add changes that Git diff itself does not report.
 func MapGitDiff(g graph.Reader, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, error) {
+	return MapGitDiffContext(context.Background(), g, repoRoot, repoPrefix, scope, baseRef)
+}
+
+// MapGitDiffContext preserves the Git timeout inside the request lifetime.
+func MapGitDiffContext(ctx context.Context, g graph.Reader, repoRoot, repoPrefix, scope, baseRef string) (*DiffResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := gitcmd.ValidateRef(baseRef); err != nil {
 		return nil, err
 	}
 	args := buildDiffArgs(scope, baseRef)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	// gitcmd runs `git -C repoRoot args...`; use Run (raw stdout, no trailing
 	// trim) so the parsed diff stays byte-identical to the pre-gitcmd output.
@@ -102,7 +110,7 @@ func MapGitDiff(g graph.Reader, repoRoot, repoPrefix, scope, baseRef string) (*D
 	}
 
 	hunks, files := parseDiffFiles(string(output))
-	return joinHunksToSymbols(g, repoPrefix, hunks, files), nil
+	return joinHunksToSymbolsContext(ctx, g, repoPrefix, hunks, files)
 }
 
 // PathDomain names the vocabulary a file path is spelled in. The two overlap,
@@ -175,6 +183,23 @@ func JoinFileNodes(g graph.Reader, repoPrefix, path string, domain PathDomain) [
 // the diff-relative paths (callers re-join them with git pathspecs); only
 // the node lookup is prefix-aware.
 func joinHunksToSymbols(g graph.Reader, repoPrefix string, hunks []DiffHunk, files []FileChange) *DiffResult {
+	result, _ := joinHunksToSymbolsContext(context.Background(), g, repoPrefix, hunks, files)
+	return result
+}
+
+func joinFileNodesContext(ctx context.Context, g graph.Reader, repoPrefix, file string) []*graph.Node {
+	if reader, ok := g.(interface {
+		GetFileNodesContext(context.Context, string) []*graph.Node
+	}); ok {
+		return reader.GetFileNodesContext(ctx, GraphKey(repoPrefix, file, RepoRelativePath))
+	}
+	return JoinFileNodes(g, repoPrefix, file, RepoRelativePath)
+}
+
+func joinHunksToSymbolsContext(ctx context.Context, g graph.Reader, repoPrefix string, hunks []DiffHunk, files []FileChange) (*DiffResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	result := &DiffResult{Hunks: hunks, FileChanges: files}
 
 	fileSet := make(map[string]bool)
@@ -195,6 +220,9 @@ func joinHunksToSymbols(g graph.Reader, repoPrefix string, hunks []DiffHunk, fil
 	}
 
 	for _, hunk := range hunks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		fileSet[hunk.FilePath] = true
 
 		// A nil reader requests file-only metadata, not a substitute graph.
@@ -202,7 +230,10 @@ func joinHunksToSymbols(g graph.Reader, repoPrefix string, hunks []DiffHunk, fil
 			continue
 		}
 		// Find symbols whose line range overlaps the hunk
-		for _, n := range JoinFileNodes(g, repoPrefix, hunk.FilePath, RepoRelativePath) {
+		for _, n := range joinFileNodesContext(ctx, g, repoPrefix, hunk.FilePath) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			// Check if symbol's line range overlaps with the hunk
 			if n.StartLine <= hunk.EndLine && n.EndLine >= hunk.StartLine {
 				addSymbol(n)
@@ -216,6 +247,9 @@ func joinHunksToSymbols(g graph.Reader, repoPrefix string, hunks []DiffHunk, fil
 	// under its old path, and no line range in the diff describes that — so
 	// those symbols are taken whole rather than by overlap.
 	for _, fc := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if fc.Path != "" {
 			fileSet[fc.Path] = true
 		}
@@ -230,7 +264,10 @@ func joinHunksToSymbols(g graph.Reader, repoPrefix string, hunks []DiffHunk, fil
 		if g == nil {
 			continue
 		}
-		for _, n := range JoinFileNodes(g, repoPrefix, vanished, RepoRelativePath) {
+		for _, n := range joinFileNodesContext(ctx, g, repoPrefix, vanished) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			addSymbol(n)
 		}
 	}
@@ -240,7 +277,10 @@ func joinHunksToSymbols(g graph.Reader, repoPrefix string, hunks []DiffHunk, fil
 	}
 	sort.Strings(result.ChangedFiles)
 
-	return result
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // GitDiffArgs builds the `git diff` argv for a scope ("unstaged", "staged",

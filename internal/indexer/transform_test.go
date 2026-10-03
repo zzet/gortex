@@ -16,9 +16,13 @@ import (
 
 func TestStripBOM(t *testing.T) {
 	body := []byte("package main\n")
-	require.Equal(t, body, stripBOM(append([]byte{0xEF, 0xBB, 0xBF}, body...))) // UTF-8
-	require.Equal(t, body, stripBOM(append([]byte{0xFF, 0xFE}, body...)))       // UTF-16LE
-	require.Equal(t, body, stripBOM(append([]byte{0xFE, 0xFF}, body...)))       // UTF-16BE
+	require.Equal(t, body, stripBOM(append([]byte{0xEF, 0xBB, 0xBF}, body...)))  // UTF-8: stripped
+	// UTF-16 marks are preserved on purpose: they are the detection signal
+	// parser.ParseFile uses to reject the file before a pathological parse.
+	utf16LE := append([]byte{0xFF, 0xFE}, body...)
+	require.Equal(t, utf16LE, stripBOM(utf16LE))
+	utf16BE := append([]byte{0xFE, 0xFF}, body...)
+	require.Equal(t, utf16BE, stripBOM(utf16BE))
 	require.Equal(t, body, stripBOM(body))                                      // no BOM
 	require.Equal(t, []byte{}, stripBOM([]byte{}))                              // empty
 }

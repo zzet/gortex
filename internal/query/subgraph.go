@@ -108,6 +108,20 @@ type SubGraph struct {
 	// an agent see at a glance whether the usage list already covers
 	// tests instead of re-grepping *_test.go files to find out.
 	UsageSummary *UsageSummary `json:"usage_summary,omitempty"`
+	// Limit-bound disclosure (#672), flat — the same shape the
+	// map-returning tools (search_text, find_declaration) stamp onto
+	// their responses via stampLimitTruncation, so a client checking
+	// `_truncated_by_limit === true` handles every clamping tool the
+	// same way (#845). graph_query populates these when the working set
+	// stopped at the caller's `limit` rather than exhausting the graph —
+	// so a result of exactly `limit` nodes is legible as "possibly more",
+	// not "exhaustive". Zero-valued for every other traversal that
+	// shares this struct, and for results the corpus exhausted.
+	TruncatedByLimit bool   `json:"_truncated_by_limit,omitempty"`
+	LimitApplied     int    `json:"_limit_applied,omitempty"`
+	LimitRequested   int    `json:"_limit_requested,omitempty"`
+	CountIsExact     *bool  `json:"count_is_exact,omitempty"`
+	TruncationNote   string `json:"truncation_note,omitempty"`
 }
 
 // UsageSummary is the compact completeness rollup on a find_usages

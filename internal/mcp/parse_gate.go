@@ -76,14 +76,15 @@ func parseErrorCount(lang string, content []byte) (int, bool) {
 	}
 	tree, err := parser.ParseFile(content, sl)
 	if err != nil {
-		// ErrBinarySource is a content verdict, not infrastructure: stay
-		// opinionated instead of going silent — otherwise the ParseFile
-		// guard would switch the gate off for exactly the content it
-		// refuses. It scores as one error so a direct caller blocks on
-		// it; checkParseGate decides the text→binary transition on its
-		// own, before the counts, so a NUL dropped into an already-broken
-		// file cannot hide behind a lower score.
-		if errors.Is(err, parser.ErrBinarySource) {
+		// ErrBinarySource and ErrUTF16Source are content verdicts, not
+		// infrastructure: stay opinionated instead of going silent —
+		// otherwise the ParseFile guards would switch the gate off for
+		// exactly the content they refuse. It scores as one error so a
+		// direct caller blocks on it; checkParseGate decides the text→
+		// binary transition on its own, before the counts, so a NUL
+		// dropped into an already-broken file cannot hide behind a lower
+		// score.
+		if errors.Is(err, parser.ErrBinarySource) || errors.Is(err, parser.ErrUTF16Source) {
 			return 1, true
 		}
 		// Any other failure is a tree-sitter cancellation / timeout, not a
