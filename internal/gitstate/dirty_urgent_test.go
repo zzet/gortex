@@ -2,6 +2,9 @@ package gitstate
 
 import (
 	"context"
+	"fmt"
+	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -15,57 +18,105 @@ func TestUrgentSampleOvertakesABackgroundSampleAtItsNextGitBoundary(t *testing.T
 	root := t.TempDir()
 	dirtyContentWrite(t, root, "note.txt", "bytes\n")
 	status := dirtyContentStatus("? note.txt")
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	backgroundInStatus := make(chan struct{})
 	releaseBackground := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseBackground) }) }
+	var workers sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		release()
+		joined := make(chan struct{})
+		go func() { workers.Wait(); close(joined) }()
+		select {
+		case <-joined:
+		case <-time.After(5 * time.Second):
+			t.Error("sampling workers did not join after fixture cancellation")
+		}
+	})
 	var mu sync.Mutex
-	var order []string
-	calls := 0
+	var commands []string
+	calls := make(map[string]int)
 	s := dirtyContentFake(t, root, func(ctx context.Context, dir string, args ...string) ([]byte, error) {
+		if !slices.Contains(args, "status") {
+			return nil, fmt.Errorf("unexpected fake Git command: %v", args)
+		}
+		class := "background"
+		if urgentSample(ctx) {
+			class = "urgent"
+		}
 		mu.Lock()
-		calls++
-		first := calls == 1
+		calls[class]++
+		call := calls[class]
+		commands = append(commands, fmt.Sprintf("%s/status%d", class, call))
 		mu.Unlock()
-		if first {
-			// The background sample's first status: hold it until the urgent
-			// sample is queued for the lease.
+		if class == "background" && call == 1 {
+			// Hold the background's actual first command until the urgent
+			// sample is queued for the lease, then observe command order.
 			close(backgroundInStatus)
-			<-releaseBackground
+			select {
+			case <-releaseBackground:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 		return status, nil
 	})
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	var background, urgent DirtySnapshot
 	var backgroundErr, urgentErr error
+	backgroundDone := make(chan struct{})
+	workers.Add(1)
 	go func() {
-		defer wg.Done()
-		_, backgroundErr = s.Sample(context.Background())
-		mu.Lock()
-		order = append(order, "background")
-		mu.Unlock()
+		defer workers.Done()
+		defer close(backgroundDone)
+		background, backgroundErr = s.Sample(ctx)
 	}()
-	<-backgroundInStatus
-	go func() {
-		defer wg.Done()
-		_, urgentErr = s.Sample(WithUrgentSample(context.Background()))
-		mu.Lock()
-		order = append(order, "urgent")
-		mu.Unlock()
-	}()
-	deadline := time.Now().Add(5 * time.Second)
-	for s.urgentWaiting.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	select {
+	case <-backgroundInStatus:
+	case <-ctx.Done():
+		t.Fatal("background sample did not reach its first Git command")
 	}
-	close(releaseBackground)
-	wg.Wait()
+	urgentDone := make(chan struct{})
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		defer close(urgentDone)
+		urgent, urgentErr = s.Sample(WithUrgentSample(ctx))
+	}()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for s.urgentWaiting.Load() == 0 {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatal("urgent sample did not queue behind the blocked Git command")
+		}
+	}
+	release()
+	for _, done := range []<-chan struct{}{backgroundDone, urgentDone} {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			t.Fatal("samples did not complete after releasing the Git command")
+		}
+	}
 	if backgroundErr != nil || urgentErr != nil {
 		t.Fatalf("background=%v urgent=%v", backgroundErr, urgentErr)
 	}
-	if len(order) != 2 || order[0] != "urgent" {
-		t.Fatalf("finish order %v: the urgent sample waited for the whole background sample", order)
+	// Sample releases its lease before its caller resumes. Caller finish
+	// order can invert after correct yielding; actual Git command order
+	// proves the urgent sample's complete status fence ran before resumption.
+	want := []string{"background/status1", "urgent/status1", "urgent/status2", "background/status2"}
+	if !slices.Equal(commands, want) {
+		t.Fatalf("Git command order %v, want %v", commands, want)
 	}
 	if s.UrgentYields() == 0 {
 		t.Fatal("the background sample never yielded")
+	}
+	if background.Fingerprint == "" || !reflect.DeepEqual(background, urgent) {
+		t.Fatalf("successful samples disagree: background=%+v urgent=%+v", background, urgent)
 	}
 }
 
