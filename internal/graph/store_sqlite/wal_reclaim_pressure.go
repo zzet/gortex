@@ -155,7 +155,15 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	// to about 2.4 s in a burst), then gives up. The hold itself stays
 	// walReclaimPressureHold.
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimPressureWriterWait)
+	acquireStarted := time.Now()
+	acquireObserver := walWindowsDiagnosticPhase
+	if acquireObserver != nil {
+		acquireObserver("pressure_writer_acquire_enter", wctx, acquireStarted, 0, nil)
+	}
 	err := s.writeMu.LockContext(wctx)
+	if acquireObserver != nil {
+		acquireObserver("pressure_writer_acquire_return", wctx, acquireStarted, time.Since(acquireStarted), err)
+	}
 	wcancel()
 	if err != nil {
 		res.reason = "pressure_writer_busy"
@@ -228,3 +236,7 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	log.Printf("store_sqlite: wal reclaim reset inside a busy lane writer_hold=%s", time.Since(held).Round(time.Microsecond))
 	return nil
 }
+
+// walWindowsDiagnosticPhase is nil outside the isolated diagnostic branch.
+// It reports existing call boundaries without changing SQL or admission contexts.
+var walWindowsDiagnosticPhase func(string, context.Context, time.Time, time.Duration, error)

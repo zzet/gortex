@@ -18,6 +18,7 @@ func TestCompletedSlowConvergenceRecoversContinuousWrites(t *testing.T) {
 	for _, delay := range []time.Duration{0, 4660 * time.Millisecond} {
 		t.Run(fmt.Sprintf("DB_sync_delay_%s", delay), func(t *testing.T) {
 			s, db := finalBackfillFixture(t)
+			diagnostic := installWindowsConvergenceDiagnostic(t)
 			lane := &fakeBuildLane{}
 			lane.install(s)
 			lane.held.Store(true)
@@ -67,6 +68,7 @@ func TestCompletedSlowConvergenceRecoversContinuousWrites(t *testing.T) {
 						sqlTime = time.Since(started)
 						s.writeMu.Unlock()
 					}
+					diagnostic.event("producer_return index=%d gate=%s SQL=%s error=%v context_error=%v", writes.Load()+1, gate, sqlTime, err, wctx.Err())
 					done()
 					for previous := worstGate.Load(); int64(gate) > previous && !worstGate.CompareAndSwap(previous, int64(gate)); previous = worstGate.Load() {
 					}
@@ -108,17 +110,25 @@ func TestCompletedSlowConvergenceRecoversContinuousWrites(t *testing.T) {
 					return db, func() {}
 				}
 				heldSQL.Store(true)
-				return db, func() { heldSQL.Store(false); armed.Store(false) }
+				creditStarted := time.Now()
+				diagnostic.record("credit_scope_enter", sqlCtx, creditStarted, 0, nil)
+				return db, func() {
+					diagnostic.record("credit_scope_return", sqlCtx, creditStarted, time.Since(creditStarted), nil)
+					heldSQL.Store(false)
+					armed.Store(false)
+				}
 			}
 			t.Cleanup(func() { walReclaimCreditPassiveQueryerObserver = previousQueryer })
 			previousPressureHook := walPressureResetHook
 			walPressureResetHook = func(heldCtx context.Context) {
+				diagnostic.record("pressure_hold_admitted", heldCtx, time.Now(), 0, nil)
 				if deadline, ok := heldCtx.Deadline(); ok && time.Until(deadline) > walReclaimPressureHold {
 					armed.Store(true)
 				}
 			}
 			t.Cleanup(func() { walPressureResetHook = previousPressureHook })
 			observeAdaptiveMultiFrameSync(t, db, func(file int) {
+				diagnostic.event("xSync_enter file=%d held_credit=%v", file, s.writeMu.held())
 				if file == vfsFileWAL {
 					walSyncs.Add(1)
 					time.Sleep(300 * time.Millisecond)
@@ -126,7 +136,9 @@ func TestCompletedSlowConvergenceRecoversContinuousWrites(t *testing.T) {
 				if file == vfsFileMain && heldSQL.Load() && armed.Load() {
 					mainSyncWrites.Store(writes.Load())
 				}
+				diagnostic.event("xSync_OS_dispatch file=%d", file)
 			}, func(file int, from, to time.Time) {
+				diagnostic.event("xSync_return file=%d from_ns=%d to_ns=%d wrapper_sync_includes_before_callback=%s held_credit=%v", file, from.UnixNano(), to.UnixNano(), to.Sub(from), s.writeMu.held())
 				if file != vfsFileMain {
 					return
 				}
@@ -140,6 +152,7 @@ func TestCompletedSlowConvergenceRecoversContinuousWrites(t *testing.T) {
 						time.Sleep(remaining)
 						injectionNs.Store(int64(time.Since(paddingStarted)))
 					}
+					diagnostic.event("main_sync_padding_return from_ns=%d padding=%s", from.UnixNano(), time.Duration(injectionNs.Load()))
 					commitsDuringSync.Store(writes.Load() - mainSyncWrites.Load())
 				}
 				effectiveDBSyncNs.Store(max(effectiveDBSyncNs.Load(), int64(time.Since(from))))
@@ -171,6 +184,7 @@ func TestCompletedSlowConvergenceRecoversContinuousWrites(t *testing.T) {
 			}
 			active := ctx.Err() == nil
 			join()
+			diagnostic.flush()
 			t.Logf("minimum_DB_sync_requested=%s padding_added=%s actual_DB_sync=%s effective_DB_sync=%s writes_during_sync=%d resets=%d writes=%d WAL_syncs=%d adaptive_attempts=%d plateau_passes=%d aggregate_max=%s gate_max=%s SQL_max=%s elapsed=%s producer_error=%v", delay, time.Duration(injectionNs.Load()), time.Duration(actualDBSyncNs.Load()), time.Duration(effectiveDBSyncNs.Load()), commitsDuringSync.Load(), resets, writes.Load(), walSyncs.Load(), adaptiveAttempts, plateauPasses, aggregateMax, time.Duration(worstGate.Load()), time.Duration(worstSQL.Load()), time.Since(started), producerErr)
 			require.NoError(t, producerErr)
 			require.True(t, active, "actual outer attempt did not recover within its original lifetime")
@@ -198,6 +212,7 @@ func TestSlowConvergenceProofRefusesInvalidCopies(t *testing.T) {
 	for _, kind := range []string{"cancelled", "new_WAL", "incomplete", "no_actual_copy"} {
 		t.Run(kind, func(t *testing.T) {
 			s, db := finalBackfillFixture(t)
+			diagnostic := installWindowsConvergenceDiagnostic(t)
 			lane := &fakeBuildLane{}
 			lane.install(s)
 			lane.held.Store(true)
@@ -225,7 +240,8 @@ func TestSlowConvergenceProofRefusesInvalidCopies(t *testing.T) {
 			var observed atomic.Bool
 			var first walCheckpointResult
 			previousObserver := walCheckpointResultObserver
-			walCheckpointResultObserver = func(mode string, _ time.Time, _ time.Duration, result walCheckpointResult, _ error) {
+			walCheckpointResultObserver = func(mode string, from time.Time, took time.Duration, result walCheckpointResult, scanErr error) {
+				diagnostic.event("checkpoint_return mode=%s from_ns=%d took=%s tuple=%+v scan_error=%v", mode, from.UnixNano(), took, result, scanErr)
 				if mode != "PASSIVE" || !observed.CompareAndSwap(false, true) {
 					return
 				}
@@ -251,12 +267,17 @@ func TestSlowConvergenceProofRefusesInvalidCopies(t *testing.T) {
 			}
 			t.Cleanup(func() { walCheckpointResultObserver = previousObserver })
 			observeAdaptiveMultiFrameSync(t, db, func(file int) {
+				diagnostic.event("xSync_enter file=%d held_credit=%v", file, s.writeMu.held())
 				if file == vfsFileWAL {
 					time.Sleep(75 * time.Millisecond)
 				}
-			}, nil)
+				diagnostic.event("xSync_OS_dispatch file=%d", file)
+			}, func(file int, from, to time.Time) {
+				diagnostic.event("xSync_return file=%d from_ns=%d to_ns=%d wrapper_sync_includes_before_callback=%s", file, from.UnixNano(), to.UnixNano(), to.Sub(from))
+			})
 			attempt := &backgroundCheckpointAttempt{copy: &walCopyAttempt{pressure: true}}
 			result := s.convergeBackfillPacedWithSmallRemainder(ctx, db, attempt, walReclaimPressureSmallFrames)
+			diagnostic.flush()
 			t.Logf("kind=%s actual_first_tuple=%+v observed=%v stop=%s passes=%d context=%v", kind, first, observed.Load(), result.stop, result.passes, ctx.Err())
 			require.Nil(t, result.slowTail, "invalid copy earned adaptive entitlement")
 			require.NotEqual(t, "slow_tail_plateau", result.stop)
@@ -275,4 +296,63 @@ func TestSlowConvergenceProofRefusesInvalidCopies(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Diagnostic events are buffered to avoid synchronous log output while a writer
+// credit or VFS sync is active. Every workload and assertion above is unchanged.
+type windowsConvergenceDiagnostic struct {
+	t       *testing.T
+	mu      sync.Mutex
+	events  []string
+	dropped int
+	once    sync.Once
+}
+
+func (d *windowsConvergenceDiagnostic) event(format string, args ...any) {
+	stamp := time.Now()
+	line := fmt.Sprintf("at_ns=%d ", stamp.UnixNano()) + fmt.Sprintf(format, args...)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.events) >= 512 {
+		d.dropped++
+		return
+	}
+	d.events = append(d.events, line)
+}
+
+func (d *windowsConvergenceDiagnostic) record(phase string, ctx context.Context, from time.Time, took time.Duration, err error) {
+	deadline, hasDeadline := ctx.Deadline()
+	d.event("phase=%s from_ns=%d elapsed=%s deadline_ns=%d has_deadline=%v context_error=%v cause=%v result_error=%v", phase, from.UnixNano(), took, deadline.UnixNano(), hasDeadline, ctx.Err(), context.Cause(ctx), err)
+}
+
+func (d *windowsConvergenceDiagnostic) flush() {
+	d.once.Do(func() {
+		d.mu.Lock()
+		events := append([]string(nil), d.events...)
+		dropped := d.dropped
+		d.mu.Unlock()
+		for _, event := range events {
+			d.t.Logf("WINDOWS_PHASE %s", event)
+		}
+		d.t.Logf("WINDOWS_PHASE events=%d dropped=%d", len(events), dropped)
+	})
+}
+
+func installWindowsConvergenceDiagnostic(t *testing.T) *windowsConvergenceDiagnostic {
+	d := &windowsConvergenceDiagnostic{t: t}
+	previousPhase := walWindowsDiagnosticPhase
+	walWindowsDiagnosticPhase = d.record
+	previousResult := walCheckpointResultObserver
+	walCheckpointResultObserver = func(mode string, from time.Time, took time.Duration, result walCheckpointResult, err error) {
+		d.event("checkpoint_return mode=%s from_ns=%d took=%s tuple=%+v scan_error=%v", mode, from.UnixNano(), took, result, err)
+		if previousResult != nil {
+			previousResult(mode, from, took, result, err)
+		}
+	}
+	t.Cleanup(func() {
+		walWindowsDiagnosticPhase = previousPhase
+		walCheckpointResultObserver = previousResult
+		d.flush()
+	})
+	return d
 }

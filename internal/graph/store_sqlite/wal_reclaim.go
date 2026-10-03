@@ -680,7 +680,15 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	// Step 1: the unbounded backfill (see the file comment), without the
 	// writer. Its error is not fatal — the lane copies whatever remains —
 	// unless the attempt was cancelled.
+	initialStarted := time.Now()
+	initialObserver := walWindowsDiagnosticPhase
+	if initialObserver != nil {
+		initialObserver("initial_PASSIVE_enter", attempt.ctx, initialStarted, 0, nil)
+	}
 	initial, initialErr := s.pacedPassive(attempt.ctx, ckptDB, attempt)
+	if initialObserver != nil {
+		initialObserver("initial_PASSIVE_return", attempt.ctx, initialStarted, time.Since(initialStarted), initialErr)
+	}
 	if s.walAttemptHandsOverToPressure(attempt.ctx, cfg, walPath, &res, initial, initialErr) {
 		res.outcome, res.reason = walReclaimSkipped, "pressure_mark"
 		res.bytesAfter = walFileSize(walPath)
