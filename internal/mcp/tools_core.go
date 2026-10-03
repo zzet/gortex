@@ -526,9 +526,9 @@ func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest,
 		}
 		var trimmed bool
 		if shape, ok := degradeShapes[req.Params.Name]; ok {
-			payload, trimmed = applyDegradation(payload, shape, budget)
+			payload, trimmed = applyDegradationObserved(payload, shape, budget, symbolBudgetRetainer(ctx, req))
 		} else {
-			payload, trimmed = applyBudget(payload, budget)
+			payload, trimmed = applySymbolObservedBudget(payload, budget, symbolBudgetRetainer(ctx, req))
 		}
 		if trimmed && decorate {
 			payload = decorateTokenBudgetJSON(payload, req)
@@ -1755,6 +1755,9 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 }
 
 func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if result, err, handled := s.continueSymbolPage(ctx, req); handled {
+		return result, err
+	}
 	q, err := req.RequireString("query")
 	if err != nil {
 		return mcp.NewToolResultError("query is required"), nil
@@ -1770,8 +1773,23 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	limit := req.GetInt("limit", 20)
 	offset := decodeCursor(req.GetString("cursor", ""))
 
-	sess := s.sessionFor(ctx)
-	sess.recordSearch(q)
+	sess, _ := ctx.Value(symbolPageOwnerKey{}).(*sessionState)
+	if sess == nil {
+		sess = s.sessionFor(ctx)
+	}
+	if offset == 0 && !isCompact(req) && !s.isGCX(ctx, req) && !s.isTOON(ctx, req) && ctx.Value(symbolPageCallKey{}) == nil {
+		ctx = context.WithValue(ctx, symbolPageOwnerKey{}, sess)
+		cache := s.symbolPages(ctx)
+		owned, call, live := cache.beginCall(ctx)
+		if !live {
+			return symbolPageError("session ended"), nil
+		}
+		defer call.finish()
+		ctx = context.WithValue(owned, symbolPageCacheKey{}, cache)
+	}
+	if ctx.Value(symbolPageRefillKey{}) == nil {
+		sess.recordSearch(q)
+	}
 
 	// Field-qualified query syntax: lift `kind:` / `lang:` / `path:` /
 	// `repo:` / `project:` clauses out of the query string. The
@@ -1792,6 +1810,15 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if errResult != nil {
 		return errResult, nil
 	}
+	if offset == 0 && !isCompact(req) && !s.isGCX(ctx, req) && !s.isTOON(ctx, req) {
+		ctx = context.WithValue(ctx, symbolPageOwnerKey{}, sess)
+		ctx = context.WithValue(ctx, symbolPageCacheKey{}, s.symbolPages(ctx))
+		if identity, identityErr := s.symbolPageIdentity(ctx, req, resolved); identityErr == nil {
+			ctx = context.WithValue(ctx, symbolPageIdentityKey{}, identity)
+		} else {
+			return nil, identityErr
+		}
+	}
 	scopeWS, scopeProj := resolved.WorkspaceID, resolved.ProjectID
 	// Per-phase timing for the search hot path. The struct is populated
 	// across the engine boundary (BM25 backend call wall-clock attributes
@@ -1802,6 +1829,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	timings := &query.SearchTimings{}
 	phaseStart := time.Now()
 	scope := query.QueryOptions{WorkspaceID: scopeWS, ProjectID: scopeProj, RepoAllow: resolved.RepoAllow, SearchTimings: timings}
+	if offset == 0 && !isCompact(req) && !s.isGCX(ctx, req) && !s.isTOON(ctx, req) {
+		scope.SymbolSearchStats = &query.SymbolSearchStats{}
+	}
 	pathFilter := s.resolvePathFilter(req, fq)
 	if prefixes := normalizePathPrefixes(pathFilter); len(prefixes) > 0 {
 		scope.SymbolSearchStats = &query.SymbolSearchStats{}
@@ -1934,6 +1964,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		}
 	}
 
+	if refill, _ := ctx.Value(symbolPageRefillKey{}).(*symbolPageRefill); refill != nil {
+		fetchLimit = refill.horizon
+	}
+
 	// Expansion terms feeding the BM25 OR-merge: LLM-derived synonyms
 	// when assist engaged, or the soup's split disjuncts when this is
 	// a soup query handled in "split" mode. The two are mutually
@@ -2018,6 +2052,8 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 
 	candsAfterGather := len(nodes)
+	pageHorizon := fetchLimit
+	pageMore := len(nodes) >= fetchLimit || scope.SymbolSearchStats != nil && scope.SymbolSearchStats.TextSaturated
 	mergedCount := len(nodes) // pre-filter; comparable to primaryCount
 
 	allowed := resolved.RepoAllow
@@ -2087,7 +2123,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// Content sections live only in content_fts — this channel cannot
 	// rescue them, so a content-corpus wipeout skips the refetch.
 	fetchEscalated := false
-	pathUnderfilled := scope.SymbolSearchStats != nil && scope.SymbolSearchStats.TextSaturated && len(nodes) < offset+limit
+	pathUnderfilled := len(pathFilter) > 0 && scope.SymbolSearchStats != nil && scope.SymbolSearchStats.TextSaturated && len(nodes) < offset+limit
 	if (len(nodes) == 0 && candsAfterGather > 0 || pathUnderfilled) && q != "" && corpus != corpusContent {
 		// The requested cursor window must be reachable: a shallow
 		// rescue that survives the filters but ends before offset+limit
@@ -2126,6 +2162,8 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
+			pageHorizon = deepLimit
+			pageMore = len(refetched) >= deepLimit || scope.SymbolSearchStats != nil && scope.SymbolSearchStats.TextSaturated
 			kept := applyAllPostFilters(refetched)
 			if len(kept) > 0 && len(kept) >= len(nodes) {
 				nodes = kept
@@ -2547,6 +2585,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if offset == 0 && !isCompact(req) && !s.isGCX(ctx, req) && !s.isTOON(ctx, req) {
+		return s.publishSymbolPage(ctx, req, resp, nodes, rerankBreakdown, pageHorizon, pageMore, resolved, q)
 	}
 	publishSearchState()
 	return s.respondScopedJSONOrTOON(ctx, req, resp, resolved)

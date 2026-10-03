@@ -451,7 +451,8 @@ func (s *Server) scheduleAnalysisGenerationPrune(writer graph.AnalysisGeneration
 	}()
 }
 
-// DrainBackground waits for any in-flight analysis-generation prune and
+// DrainBackground retires and joins owned cursor calls, then waits for any
+// in-flight analysis-generation prune and
 // permanently refuses to schedule new ones. Call it before closing the backend
 // store: the prune keeps writing on its already-acquired connection after
 // sql.DB.Close, and a commit there recreates WAL files under a directory being
@@ -462,6 +463,7 @@ func (s *Server) scheduleAnalysisGenerationPrune(writer graph.AnalysisGeneration
 // the track_repository worker) keeps writing generations through the store,
 // and stopping those is the caller's lifecycle problem, not this drain's.
 func (s *Server) DrainBackground() {
+	s.retireSymbolPages()
 	s.backgroundMaintenanceMu.Lock()
 	s.backgroundMaintenanceDrained = true
 	s.backgroundMaintenanceMu.Unlock()

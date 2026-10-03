@@ -664,6 +664,13 @@ type Server struct {
 // Never returns nil — callers can chain `.recordFile(...)` etc.
 // unconditionally.
 func (s *Server) sessionFor(ctx context.Context) *sessionState {
+	// A cursor call pins its owner before retrieval; release must not let
+	// an active call lazily recreate a disconnected session.
+	if ctx != nil {
+		if owner, ok := ctx.Value(symbolPageOwnerKey{}).(*sessionState); ok {
+			return owner
+		}
+	}
 	id := SessionIDFromContext(ctx)
 	if id == "" || s.sessions == nil {
 		return s.session
@@ -743,7 +750,8 @@ type sessionState struct {
 	// subsequent get_symbol_source / get_editing_context on one of its
 	// results can be attributed back to the query — this is the raw input
 	// to the combo tracker. Reset on every search.
-	lastSearch lastSearchState
+	lastSearch  lastSearchState
+	symbolPages *symbolPageCache
 
 	// Workspace scope for this session, resolved lazily from the
 	// session cwd on first query and cached here. scopeResolved
@@ -3328,6 +3336,7 @@ func (s *Server) SetEventRules(rules []config.EventRule) {
 
 // ServeStdio starts the MCP server on stdin/stdout.
 func (s *Server) ServeStdio() error {
+	defer s.retireSymbolPages()
 	return server.ServeStdio(s.mcpServer)
 }
 
