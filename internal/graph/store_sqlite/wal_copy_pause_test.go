@@ -120,10 +120,14 @@ func TestInterruptedReclaimPassIsDetectedAndCounted(t *testing.T) {
 // must keep the log under 32 MiB and keep resetting it. Ordinary no-busy-copy
 // behavior is checked separately by TestReclaimCopyPausesForAnEditAndKeepsItsProgress.
 func TestReclaimKeepsTheLogBoundedWithEditsEveryFewSeconds(t *testing.T) {
+	diag := newWindowsWALDiagnostic(t)
+	diag.install()
+	defer diag.finish()
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "4")
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_CEILING_MB", "64") // hard cap 256 MiB: out of reach
 	setWALReclaimCadence(t, 25*time.Millisecond, 25*time.Millisecond, 200*time.Millisecond)
 	s, path := openWALReclaimStore(t)
+	diag.store.Store(s)
 	defer func() { _ = s.Close() }()
 	if walCopyMethods.Load() == 0 {
 		t.Skip("the copy pause is not installed in this process")
@@ -158,8 +162,10 @@ func TestReclaimKeepsTheLogBoundedWithEditsEveryFewSeconds(t *testing.T) {
 			case <-time.After(2200 * time.Millisecond):
 			}
 			lane.held.Store(true)
+			diag.record("edit-start", -1, nil)
 			time.Sleep(300 * time.Millisecond)
 			lane.held.Store(false)
+			diag.record("edit-end", -1, nil)
 		}
 	}()
 	go func() { // about 4 MiB/s of page rewrites

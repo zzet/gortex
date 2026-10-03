@@ -49,7 +49,11 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 	}
 	t.Cleanup(func() { walCopyPassObserver = nil })
 
+	diag := newWindowsWALDiagnostic(t)
+	diag.install()
+	defer diag.finish()
 	s, path := openWALReclaimStore(t)
+	diag.store.Store(s)
 	defer func() { _ = s.Close() }()
 	seedWALChurnTable(t, s)
 	growWAL(t, s, 12) // start over the threshold, below the pressure mark
@@ -69,8 +73,10 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 			}
 			start := time.Now()
 			lane.held.Store(true)
+			diag.record("edit-start", -1, nil)
 			time.Sleep(400 * time.Millisecond)
 			lane.held.Store(false)
+			diag.record("edit-end", -1, nil)
 			mu.Lock()
 			cycles = append(cycles, span{start, time.Now()})
 			mu.Unlock()

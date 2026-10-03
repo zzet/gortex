@@ -17,7 +17,19 @@ func runLongReaderChurn(t *testing.T, skipOpenGate bool, writes int64) (WALRecla
 	prev := walReclaimSkipOpenGate
 	walReclaimSkipOpenGate = skipOpenGate
 	t.Cleanup(func() { walReclaimSkipOpenGate = prev })
+	var diag *windowsWALDiagnostic
+	if t.Name() == "TestWALReclaimResetsUnderReadersLongerThanTheDrain" {
+		diag = newWindowsWALDiagnostic(t)
+		diag.install()
+		defer diag.finish()
+		previous := windowsWALReaderObserver
+		windowsWALReaderObserver = func(reader int64, stage string, err error) { diag.record("reader:"+stage, reader, err) }
+		defer func() { windowsWALReaderObserver = previous }()
+	}
 	s, path := openWALReclaimStore(t)
+	if diag != nil {
+		diag.store.Store(s)
+	}
 	defer func() { _ = s.Close() }()
 	seedWALChurnTable(t, s)
 

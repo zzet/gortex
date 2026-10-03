@@ -112,6 +112,12 @@ func startWALChurn(t *testing.T, s *Store, path string, readers int, holdMin, ho
 			c.writes.Add(1)
 		}
 	}()
+	observeReader := windowsWALReaderObserver
+	readerEvent := func(reader int64, stage string, err error) {
+		if observeReader != nil {
+			observeReader(reader, stage, err)
+		}
+	}
 	for r := 0; r < readers; r++ {
 		c.wg.Add(1)
 		go func(seed int64) { // rotating reader
@@ -119,27 +125,38 @@ func startWALChurn(t *testing.T, s *Store, path string, readers int, holdMin, ho
 			rng := rand.New(rand.NewSource(seed))
 			for !stopped() {
 				start := time.Now()
+				readerEvent(seed, "begin-start", nil)
 				tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+				readerEvent(seed, "begin-end", err)
 				if err != nil {
 					c.fail(fmt.Errorf("reader begin: %w", err))
 					return
 				}
 				var n int
+				readerEvent(seed, "query-start", nil)
 				if err := tx.QueryRow(`SELECT count(*) FROM wal_churn WHERE id % 97 = 0`).Scan(&n); err != nil {
-					_ = tx.Rollback()
+					readerEvent(seed, "query-end", err)
+					readerEvent(seed, "rollback-start", nil)
+					rollbackErr := tx.Rollback()
+					readerEvent(seed, "rollback-end", rollbackErr)
 					c.fail(fmt.Errorf("reader query: %w", err))
 					return
 				}
+				readerEvent(seed, "query-end", nil)
 				lat := time.Since(start)
 				c.latMu.Lock()
 				c.readLats = append(c.readLats, lat)
 				c.latMu.Unlock()
 				hold := holdMin + time.Duration(rng.Int63n(int64(holdMax-holdMin)+1))
+				readerEvent(seed, "hold-start", nil)
 				select {
 				case <-c.stop:
 				case <-time.After(hold):
 				}
-				_ = tx.Rollback()
+				readerEvent(seed, "hold-end", nil)
+				readerEvent(seed, "rollback-start", nil)
+				rollbackErr := tx.Rollback()
+				readerEvent(seed, "rollback-end", rollbackErr)
 			}
 		}(int64(r + 1))
 	}
