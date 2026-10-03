@@ -23,10 +23,39 @@ func makeRacyIndexRepo(t *testing.T, files int) string {
 	repo := dirtyContentRepo(t)
 	body := strings.Repeat("racily clean content line\n", 600)
 	for i := 0; i < files; i++ {
-		dirtyContentWrite(t, repo, fmt.Sprintf("pkg/f%04d.txt", i), body+strconv.Itoa(i)+"\n")
+		dirtyContentWrite(t, repo, fmt.Sprintf("pkg/f%04d.txt", i), body)
 	}
 	dirtyContentGit(t, repo, "add", "-A")
 	dirtyContentGit(t, repo, "commit", "-q", "-m", "files")
+	// Racy refresh is a per-path stat/content check. Keep every regular file
+	// and its full 600-line payload, but share one blob: creating hundreds of
+	// unrelated loose objects is not part of the refresh contract.
+	staged := dirtyContentGit(t, repo, "ls-files", "--stage", "-z", "--", "pkg")
+	entries := strings.Split(strings.TrimSuffix(staged, "\x00"), "\x00")
+	if len(entries) != files {
+		t.Fatalf("racy fixture has %d index entries, want %d", len(entries), files)
+	}
+	objects := make(map[string]bool)
+	for i, entry := range entries {
+		parts := strings.SplitN(entry, "\t", 2)
+		if len(parts) != 2 {
+			t.Fatalf("invalid fixture index entry %q", entry)
+		}
+		metadata := strings.Fields(parts[0])
+		wantPath := fmt.Sprintf("pkg/f%04d.txt", i)
+		if len(metadata) != 3 || metadata[0] != "100644" || !isOID(metadata[1]) || metadata[2] != "0" || parts[1] != wantPath {
+			t.Fatalf("unexpected fixture index entry %q for %s", entry, wantPath)
+		}
+		objects[metadata[1]] = true
+		info, err := os.Lstat(filepath.Join(repo, filepath.FromSlash(parts[1])))
+		if err != nil || !info.Mode().IsRegular() || info.Size() != int64(len(body)) {
+			t.Fatalf("fixture path %s is not a complete regular payload: info=%v err=%v", parts[1], info, err)
+		}
+	}
+	if len(objects) != 1 {
+		t.Fatalf("racy fixture has %d content objects, want one shared blob", len(objects))
+	}
+	t.Logf("racy fixture: %d independent regular paths, one content object, %d bytes/path", files, len(body))
 	past := time.Now().Add(-time.Hour).Truncate(time.Second)
 	err := filepath.WalkDir(repo, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || strings.Contains(path, string(filepath.Separator)+".git"+string(filepath.Separator)) {
