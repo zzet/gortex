@@ -662,6 +662,8 @@ type CheckoutCoordinator struct {
 	// importPreambleBarrier delays the read-only pin/recomposition decisions
 	// in progress tests; production has no barrier.
 	importPreambleBarrier func(context.Context)
+	// importAdmissionBarrier observes a grant before its initial yield arm (tests only).
+	importAdmissionBarrier func(context.Context)
 	// importFoldPlanningBarrier delays read-only post-publication fold planning
 	// in admission tests; production has no barrier.
 	importFoldPlanningBarrier func(context.Context)
@@ -1323,6 +1325,9 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		return
 	}
 	defer c.cycleMu.Unlock()
+	// A hint changes only read-only preparation admission; live reentry still
+	// confirms route, source and immutable ancestry before any payload mutation.
+	earlyImport := priority == ViewBuildBackground && c.importPreparationHint(ctx)
 	laneQueued := time.Now()
 	laneBefore := c.gate.Stats()
 	release, err := c.gate.AcquireRanked(ctx, priority, c.selectionRequests(), c.ticketDemand.Load)
@@ -1367,6 +1372,9 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	// reports a change to a path it reads (checkout_motion.go), up to the
 	// same commit point.
 	var treeMove *backgroundLaneYield
+	if priority == ViewBuildBackground && c.importAdmissionBarrier != nil {
+		c.importAdmissionBarrier(ctx)
+	}
 	if priority == ViewBuildBackground {
 		// Always armed: a background cycle gives the lane up to every
 		// interactive build, however often it has yielded. Its work is
@@ -1374,7 +1382,13 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		// is built in batches that survive a yield), whereas a cycle that
 		// stopped yielding held other checkouts' edits for its whole build
 		// (live: 95 s and 313 s behind a 389-file working tree).
-		ctx, laneYield = armBackgroundLaneYield(ctx, c.gate, 0)
+		if earlyImport {
+			// Keep one cancellation lineage while private work is off lane.
+			// Ordinary fallback re-arms this same lineage on live reentry.
+			ctx, laneYield = privateImportLaneContext(ctx)
+		} else {
+			ctx, laneYield = armBackgroundLaneYield(ctx, c.gate, 0)
+		}
 		defer laneYield.close()
 		ctx = context.WithValue(ctx, importBuildLaneKey{}, &importBuildLane{
 			detach: func() bool {
@@ -1406,6 +1420,15 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		})
 		ctx, treeMove = c.armTreeMoveAbort(ctx, cycleStarted)
 		defer c.disarmTreeMoveAbort(treeMove)
+	}
+	if earlyImport {
+		lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane)
+		finish, err := lane.begin(ctx)
+		if err != nil {
+			c.reportCheckoutCycle(ctx, through, CheckoutCycle{Err: err, Admission: admission, cycleStarted: cycleStarted})
+			return
+		}
+		defer finish()
 	}
 	markPublicationPhase(ctx, PublicationAdmitted)
 	if c.cycleBarrier != nil {
@@ -2729,6 +2752,10 @@ func (c *CheckoutCoordinator) ensureRoute(ctx context.Context, base primaryBase)
 		return route, err
 	}
 	if !found {
+		ctx, err = resumeImportBuildLane(ctx, true)
+		if err != nil {
+			return route, err
+		}
 		route = store_sqlite.CheckoutRoute{
 			CheckoutID: c.checkoutID,
 			GraphID:    base.graphID,
@@ -2741,6 +2768,10 @@ func (c *CheckoutCoordinator) ensureRoute(ctx context.Context, base primaryBase)
 	}
 	if route.GraphID == base.graphID {
 		return route, nil
+	}
+	ctx, err = resumeImportBuildLane(ctx, true)
+	if err != nil {
+		return route, err
 	}
 	err = c.catalog.FlipCheckoutRoute(ctx, store_sqlite.FlipCheckoutRouteRequest{
 		CheckoutID:         c.checkoutID,

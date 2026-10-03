@@ -100,8 +100,14 @@ func resumeImportBuildLane(ctx context.Context, yieldable bool) (context.Context
 func (c *CheckoutCoordinator) prepareImportPreamble(ctx context.Context, sample gitstate.DirtySnapshot, route store_sqlite.CheckoutRoute) (func(), error) {
 	noop := func() {}
 	lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane)
-	if lane == nil || route.State != store_sqlite.RouteActive || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+	if lane == nil {
 		return noop, nil
+	}
+	if route.State != store_sqlite.RouteActive || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+		// A read-only early hint is not authority to continue after a route
+		// moved. Restore ordinary admission before any live fallback.
+		_, err := lane.reenter(ctx, true)
+		return noop, err
 	}
 	finishPlan, err := c.prepareImportPlan(ctx, route.CommitGenerationID, sample, route)
 	if err != nil || !lane.detached {
@@ -167,22 +173,29 @@ func (c *CheckoutCoordinator) prepareImportPlan(ctx context.Context, commit int6
 	if lane == nil || lane.gate == nil || c.builder == nil {
 		return noop, nil
 	}
-	if len(sample.Entries) <= importInteractivePaths && !c.importInProgress(ctx, route.DirtyGenerationID) {
+	decline := func() (func(), error) {
+		if lane.detached {
+			_, err := lane.reenter(ctx, true)
+			return noop, err
+		}
 		return noop, nil
+	}
+	if len(sample.Entries) <= importInteractivePaths && !c.importInProgress(ctx, route.DirtyGenerationID) {
+		return decline()
 	}
 	row, found, err := c.catalog.GetViewGeneration(ctx, commit)
 	if err != nil {
 		return noop, err
 	}
 	if !found || row.BaseGenerationID <= 0 {
-		return noop, nil
+		return decline()
 	}
 	verdict, err := c.sampler.ConfirmReadSet(ctx, sample, nil, nil)
 	if err != nil {
 		return noop, err
 	}
 	if !verdict.Confirmed {
-		return noop, nil
+		return decline()
 	}
 	return lane.begin(ctx)
 }
@@ -305,4 +318,38 @@ func (b *SparseGenerationBuilder) importHandleEnrichmentReady(ctx context.Contex
 		}
 	}
 	return b.importEnrichmentProvidersReady(ctx, req, languages)
+}
+
+// importPreparationHint is sampled outside the physical lane under cycleMu.
+// It recognizes both the first large dirty set and a partial import. It grants
+// no mutation authority: prepareImportPreamble retains/validates the complete
+// ancestry and its live reentry fence confirms route, correction epochs and
+// source; every fallback or route mutation reacquires ordinary admission.
+func (c *CheckoutCoordinator) importPreparationHint(ctx context.Context) bool {
+	if c.builder == nil || c.gate == nil || ctx.Err() != nil {
+		return false
+	}
+	sample, err := c.cycleSample(ctx)
+	if err != nil || sample.HeadTree == "" {
+		return false
+	}
+	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil || !found || route.State != store_sqlite.RouteActive || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+		return false
+	}
+	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	if err != nil || !found || !servableGeneration(commit.State) || commit.OwnerKind != checkoutLayerOwnerKind || commit.GenerationKind != CommitLayerGenerationKind || commit.BaseGenerationID <= 0 || commit.TreeOID != sample.HeadTree {
+		return false
+	}
+	return ctx.Err() == nil && (len(sample.Entries) > importInteractivePaths || c.importInProgress(ctx, route.DirtyGenerationID))
+}
+
+// privateImportLaneContext starts the same cancellable cycle lineage without
+// arming a physical-lane yield. begin releases its brief initial grant before
+// private checks. rearmBackgroundLaneYield adds ordinary preemption if a live
+// fallback needs the lane; no canceled context is revived.
+func privateImportLaneContext(ctx context.Context) (context.Context, *backgroundLaneYield) {
+	ctx, cancel := context.WithCancel(ctx)
+	y := &backgroundLaneYield{cancel: cancel, withdraw: func() {}, committed: true, stop: make(chan struct{})}
+	return context.WithValue(ctx, buildCommitPointKey{}, y), y
 }

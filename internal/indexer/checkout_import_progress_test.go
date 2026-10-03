@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,27 +20,34 @@ import (
 // continue arriving faster than one file can prepare, without replaying a
 // successful import or blocking the interactive lane for that file's work.
 func TestALargeWorkingTreeImportCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, false, false, false)
+	testSustainedImportProgress(t, false, false, false, false)
 }
 
 func TestALargeWorkingTreeImportWithInlineGoSemanticsCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, true, false, false)
+	testSustainedImportProgress(t, true, false, false, false)
 }
 
 // Catalog planning can outlast the same 40ms producer interval as private
 // payload preparation. Preserve the original producer, bounds and parity
 // oracle while making that pre-handoff delay deterministic.
 func TestImportPreambleCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, false, true, false)
+	testSustainedImportProgress(t, false, true, false, false)
 }
 
 // An import's post-publication fold prepares its materialized ancestry before
 // copying. This work must admit foreground requests while it is still private.
 func TestImportFoldPreparationCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, false, false, true)
+	testSustainedImportProgress(t, false, false, true, false)
 }
 
-func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPlanning bool) {
+// Demand queued at the initial grant must not cancel an eligible import before
+// it can establish private preparation. Keep the original sustained producer,
+// file-by-file progress, foreground latency, deadline and parity checks.
+func TestImportEarlyAdmissionQueuePreservesProgress(t *testing.T) {
+	testSustainedImportProgress(t, false, true, false, true)
+}
+
+func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPlanning, earlyDemand bool) {
 	oldPaths := importInteractivePaths
 	importInteractivePaths = 4
 	t.Cleanup(func() { importInteractivePaths = oldPaths })
@@ -104,6 +112,9 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 	})
 	c.cycleMu.Lock()
 	c.cycleBarrier = func(ctx context.Context) { cycleContext = ctx }
+	if earlyDemand {
+		c.importAdmissionBarrier = queuedImportAdmissionProbe(t, c, gate, &importing)
+	}
 	if slowPreamble {
 		c.importPreambleBarrier = func(ctx context.Context) {
 			if !importing.Load() {
@@ -396,5 +407,72 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 		assertSemanticParity(t, f, manager, "sustained-import")
 	} else if result := assertPropagationParity(t, f.store, routedStack(t, f, c), f.worktree, "import"); !result.ok() {
 		t.Errorf("the imported working tree differs from a clean index: %v", result.Diffs)
+	}
+}
+
+// The barrier identifies its own registered waiter under the gate lock; the
+// original periodic producer cannot satisfy this witness. A negative rank tags
+// the request without promoting it ahead of ordinary arrival order.
+func queuedImportAdmissionProbe(t *testing.T, c *CheckoutCoordinator, gate *ViewBuildGate, importing *atomic.Bool) func(context.Context) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	var requests sync.WaitGroup
+	var sequence, queued atomic.Int64
+	t.Cleanup(func() {
+		importing.Store(false)
+		cancel()
+		c.Close() // No later cycle can add to requests once the loop has joined.
+		joined := make(chan struct{})
+		go func() { requests.Wait(); close(joined) }()
+		select {
+		case <-joined:
+		case <-time.After(5 * time.Second):
+			t.Error("early admission requests did not stop")
+		}
+		t.Logf("early admission actual queued-before-arm witnesses=%d", queued.Load())
+		if queued.Load() == 0 {
+			t.Error("early admission had no registered pre-arm demand")
+		}
+	})
+	return func(cycleCtx context.Context) {
+		if !importing.Load() {
+			return
+		}
+		tag := -sequence.Add(1)
+		requests.Add(1)
+		go func() {
+			defer requests.Done()
+			release, err := gate.AcquireRanked(ctx, ViewBuildInteractive, nil, func() int64 { return tag })
+			if err == nil {
+				release()
+			}
+		}()
+		timer := time.NewTimer(time.Second)
+		defer timer.Stop()
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			gate.mu.Lock()
+			registered := false
+			for _, waiter := range gate.interactive {
+				if waiter.rank != nil && waiter.rank() == tag {
+					registered = true
+					break
+				}
+			}
+			gate.mu.Unlock()
+			if registered {
+				queued.Add(1)
+				return
+			}
+			select {
+			case <-ticker.C:
+			case <-cycleCtx.Done():
+				return
+			case <-timer.C:
+				t.Error("early request did not register before yield arming")
+				return
+			}
+		}
 	}
 }
