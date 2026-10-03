@@ -84,7 +84,7 @@ func (storage *symbolPageStorage) spill(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	pending := make(map[string]bool, len(storage.memory.pending))
 	for _, candidate := range storage.memory.pending {
 		pending[candidate.id] = true
