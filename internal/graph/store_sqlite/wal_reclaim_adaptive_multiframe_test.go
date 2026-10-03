@@ -14,16 +14,41 @@ import (
 
 // One ordinary final copy starts with a small tail, then the slow sync lets
 // real writes leave more than256frames. Its adaptive completion must use the
-// bounded time credit. Repeated pipeline convergence is covered by load tests.
+// bounded time credit. If that direct helper leaves a new tail, recovery uses
+// production convergence and admission, not repeated helper calls or a
+// separate background PASSIVE checkpoint.
 func TestUrgentAdaptiveCopyAdmitsMultiFrameTail(t *testing.T) {
 	for _, kind := range []string{"short", "pressure"} {
 		t.Run(kind, func(t *testing.T) {
 			s, db := finalBackfillFixture(t)
+			lane := &fakeBuildLane{}
+			lane.install(s)
+			lane.held.Store(true)
+			t.Cleanup(func() { lane.held.Store(false) })
 			priorRate := walHoldCopyRate.Swap(0)
 			t.Cleanup(func() { walHoldCopyRate.Store(priorRate) })
 			// The operation may join an uninterruptible sync after its writer credit
 			// expires. Use its existing finite lifetime; held credit remains <=2 s.
 			ctx, cancel := context.WithTimeout(t.Context(), walReclaimLaneBudget)
+			cancelJoined := make(chan struct{})
+			stopCancellation := context.AfterFunc(ctx, func() {
+				defer close(cancelJoined)
+				s.backgroundCheckpoint.mu.Lock()
+				attempt := s.backgroundCheckpoint.active
+				s.backgroundCheckpoint.mu.Unlock()
+				if attempt != nil {
+					attempt.cancel(context.Cause(ctx))
+				}
+			})
+			t.Cleanup(func() {
+				if !stopCancellation() {
+					select {
+					case <-cancelJoined:
+					case <-time.After(time.Second):
+						t.Error("owned attempt cancellation did not join")
+					}
+				}
+			})
 			var writes, syncs, worstGate, worstSQL atomic.Int64
 			committed := make(chan struct{}, 1)
 			producer := make(chan error, 1)
@@ -112,6 +137,7 @@ func TestUrgentAdaptiveCopyAdmitsMultiFrameTail(t *testing.T) {
 			var maxAdaptiveEntryTail uint32
 			t.Cleanup(func() { walIdleResetHook = nil; walPressureResetHook = nil })
 			iteration := 0
+			recoverThroughPipeline := false
 			var lastResult walReclaimResult
 			var lastError error
 			var lastDone, lastSnapshotOK bool
@@ -127,10 +153,22 @@ func TestUrgentAdaptiveCopyAdmitsMultiFrameTail(t *testing.T) {
 					record("entry iteration=%d phase=%s adaptive_witness=%v snapshot_ok=%v post_or_held_frontier=%+v", iteration, phase, res.slowTail != nil, ok, snap)
 				}
 				walIdleResetHook = func() { entry("short") }
-				walPressureResetHook = func(context.Context) { entry("pressure") }
+				walPressureResetHook = func(heldCtx context.Context) {
+					entry("pressure")
+					if deadline, ok := heldCtx.Deadline(); ok && time.Until(deadline) > walReclaimPressureHold {
+						if snap, known := readWALIndexSnapshot(s.dbPath); known && snap.MxFrame > snap.NBackfill {
+							maxAdaptiveEntryTail = max(maxAdaptiveEntryTail, snap.MxFrame-snap.NBackfill)
+						}
+					}
+				}
 				done := false
 				var helperErr error
-				if kind == "pressure" {
+				if recoverThroughPipeline {
+					cfg := walReclaimConfig{thresholdBytes: 1, ceilingBytes: 64 << 20, readerWait: time.Second, truncateBudget: walReclaimTruncateBudget}
+					*res = s.reclaimWALOnce(cfg, db, s.dbPath+"-wal")
+					done = res.outcome == walReclaimReset
+					record("production recovery iteration=%d outcome=%s reason=%s%s", iteration, res.outcome.String(), res.reason, res.stampSuffix())
+				} else if kind == "pressure" {
 					helperErr = s.reclaimWALPressureReset(ctx, db, res)
 					done = helperErr == nil
 				} else {
@@ -147,6 +185,7 @@ func TestUrgentAdaptiveCopyAdmitsMultiFrameTail(t *testing.T) {
 					require.LessOrEqual(t, res.writerSpent, walReclaimMaxWriterHold)
 				}
 				if !done {
+					recoverThroughPipeline = true
 					continue
 				}
 				resets++
