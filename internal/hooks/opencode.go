@@ -7,13 +7,16 @@ import (
 	"strings"
 )
 
-// opencode.go is the Go side of the OpenCode (v1.18.18) integration.
+// opencode.go is the Go side of the OpenCode (v1.18.18+ and 2.x) integration.
 //
 // OpenCode has no lifecycle-hook configuration at all — there is no settings
 // key that runs a command on session start or before a tool call. Its only
 // extension point is a JS/TS plugin exposing `tool.execute.before` (throwing
 // from it blocks the call), `tool.execute.after`, `permission.ask` (returns
-// "ask" | "deny" | "allow"), `chat.message`, and a bus `event` hook. So
+// "ask" | "deny" | "allow"), `chat.message`, and a bus `event` hook. OpenCode
+// 2 moves the same points onto domains (`tool` execute.before/after,
+// `permission` evaluate, `session` prompt); the plugin serves both and keeps
+// sending the 1.x event names below, so the router has one vocabulary. So
 // OpenCode gets the same treatment Pi does: the Gortex-owned bridge envelope
 // (pi.go), with a small JavaScript plugin that shells
 // `gortex hook --agent=opencode`, writes a BridgeEvent to stdin, and applies
@@ -43,6 +46,10 @@ var openCodeToolNames = map[string]string{
 	"grep":  "Grep",
 	"glob":  "Glob",
 	"task":  "Task",
+	// OpenCode 2 renamed bash, task and the multi-file edit.
+	"shell":    "Bash",
+	"patch":    "Edit",
+	"subagent": "Task",
 }
 
 // RunOpenCode reads a single bridge envelope from stdin, dispatches on the
