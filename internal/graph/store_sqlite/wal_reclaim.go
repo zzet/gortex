@@ -680,7 +680,12 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	// Step 1: the unbounded backfill (see the file comment), without the
 	// writer. Its error is not fatal — the lane copies whatever remains —
 	// unless the attempt was cancelled.
-	_, _ = s.pacedPassive(attempt.ctx, ckptDB, attempt)
+	initial, initialErr := s.pacedPassive(attempt.ctx, ckptDB, attempt)
+	if s.walAttemptHandsOverToPressure(attempt.ctx, cfg, walPath, &res, initial, initialErr) {
+		res.outcome, res.reason = walReclaimSkipped, "pressure_mark"
+		res.bytesAfter = walFileSize(walPath)
+		return res
+	}
 	// Step 2: without the writer and with the gate OPEN, wait for a log no
 	// reader pins: backfill, then wait out every reader admitted before that
 	// backfill. A reader admitted after a COMPLETE backfill takes read mark 0
@@ -720,6 +725,11 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 			}
 			result, perr := s.pacedPassive(pctx, ckptDB, attempt)
 			pcancel()
+			if s.walAttemptHandsOverToPressure(attempt.ctx, cfg, walPath, &res, result, perr) {
+				res.outcome, res.reason = walReclaimSkipped, "pressure_mark"
+				res.bytesAfter = walFileSize(walPath)
+				return res
+			}
 			if s.walAttemptHandsOverToRequest(&res) {
 				// A request is pending and this attempt may not reset inside
 				// the busy lane: hand over to the loop (below).
@@ -899,6 +909,23 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		res.outcome = walReclaimFailed
 	}
 	return res
+}
+
+// walAttemptHandsOverToPressure ends an ordinary attempt at a returned copy
+// boundary once the current WAL qualifies for pressure. Page pacing can already
+// resume at that mark, but the attempt's watcher and reset policy are immutable.
+// Fresh admission rechecks the mark, lane and lease; handoff itself grants no
+// writer credit or reset authority. A usable reader-limited result can hand off
+// too, while cancelled/failed SQL and bulk overrides retain their own policy.
+func (s *Store) walAttemptHandsOverToPressure(ctx context.Context, cfg walReclaimConfig, walPath string, res *walReclaimResult, result walCheckpointResult, err error) bool {
+	if ctx.Err() != nil || walPressureOff || res.pressure || res.hardCap || res.leaseOverride {
+		return false
+	}
+	if result.WALFrames < 0 || result.CheckpointedFrames < 0 || (err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete)) {
+		return false
+	}
+	mark := walPressureMark(cfg)
+	return mark > 0 && walFileSize(walPath) >= mark
 }
 
 // walAttemptHandsOverToRequest reports an attempt that should end so the loop
@@ -1385,6 +1412,15 @@ func (s *Store) runWALReclaimLoop(cfg walReclaimConfig, walPath string, poll tim
 		schedule.observeProgress(now, res.outcome, res.progressed)
 		s.walReclaim.update(func(st *WALReclaimStats) { st.Backoff = schedule.backoff })
 		logWALReclaimOutcome(res, schedule.nextAt.Sub(now), &skipLog, now)
+		if res.outcome == walReclaimSkipped && res.reason == "pressure_mark" {
+			// Re-admit promptly with current policy after the old attempt has
+			// joined. Coalesce with existing wakes without renewing a request
+			// timestamp, operation deadline, or writer credit.
+			select {
+			case wake <- struct{}{}:
+			default:
+			}
+		}
 		if res.outcome == walReclaimReset && s.walShrinkNeeded() {
 			s.shrinkWALUntilStopped(ckptDB)
 		}
