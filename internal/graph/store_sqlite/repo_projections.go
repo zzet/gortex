@@ -33,6 +33,23 @@ func projectionJSON(values []string) (string, bool) {
 	return string(data), true
 }
 
+// repoLanguageFileCountsSQL keeps requested repositories on the driving side.
+// Without CROSS JOIN, SQLite can scan an entire generation before testing each
+// requested prefix. Do not pin a physical index: bulk loads may drop nodes_by_repo.
+const repoLanguageFileCountsSQL = `
+WITH requested(repo_prefix) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+)
+SELECT n.repo_prefix, n.file_path, n.language, COUNT(*)
+FROM requested AS r
+CROSS JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
+WHERE n.language <> ''
+  AND n.kind <> ?
+  AND (n.kind <> ? OR n.data_class IS NOT 'content')
+  AND n.view_gen = ?
+GROUP BY n.repo_prefix, n.file_path, n.language
+ORDER BY n.repo_prefix, n.file_path, n.language`
+
 // RepoLanguageFileCounts projects only the flat repository, file, language,
 // kind, and data-class columns. Node.Meta, docs, signatures, and edges never
 // cross the SQLite boundary.
@@ -41,19 +58,7 @@ func (s *Store) RepoLanguageFileCounts(repoPrefixes []string) []graph.RepoLangua
 	if !ok {
 		return nil
 	}
-	rows, err := s.db.Query(`
-WITH requested(repo_prefix) AS (
-    SELECT CAST(value AS TEXT) FROM json_each(?)
-)
-SELECT n.repo_prefix, n.file_path, n.language, COUNT(*)
-FROM requested AS r
-JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
-WHERE n.language <> ''
-  AND n.kind <> ?
-  AND (n.kind <> ? OR n.data_class IS NOT 'content')
-  AND n.view_gen = ?
-GROUP BY n.repo_prefix, n.file_path, n.language
-ORDER BY n.repo_prefix, n.file_path, n.language`, reposJSON, string(graph.KindModule), string(graph.KindDoc), s.viewGen)
+	rows, err := s.db.Query(repoLanguageFileCountsSQL, reposJSON, string(graph.KindModule), string(graph.KindDoc), s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil

@@ -39,18 +39,7 @@ const generationLookupIncomingQuery = `SELECT id, meta FROM edges WHERE to_id = 
 const generationLookupOutgoingQuery = `SELECT id, meta FROM edges WHERE from_id = ? AND view_gen = ?`
 const generationLookupEdgeGenerationQuery = `SELECT id, meta FROM edges WHERE view_gen = ? ORDER BY id`
 
-const generationLookupRepoProjectionQuery = `WITH requested(repo_prefix) AS (
-    SELECT CAST(value AS TEXT) FROM json_each(?)
-)
-SELECT n.repo_prefix, n.file_path, n.language, COUNT(*)
-FROM requested AS r
-JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
-WHERE n.language <> ''
-  AND n.kind <> ?
-  AND (n.kind <> ? OR n.data_class IS NOT 'content')
-  AND n.view_gen = ?
-GROUP BY n.repo_prefix, n.file_path, n.language
-ORDER BY n.repo_prefix, n.file_path, n.language`
+const generationLookupRepoProjectionQuery = repoLanguageFileCountsSQL
 
 const generationLookupRepoLanguageCountQuery = `SELECT COUNT(*) FROM nodes WHERE repo_prefix = ? AND language IN (?) AND kind <> ? AND kind <> ? AND view_gen = ?`
 
@@ -341,14 +330,8 @@ func generationLookupBatchArgs(generation, count int) []any {
 	return append(args, generation)
 }
 
-func requireAllGenerationLookupPlans(t *testing.T, db *sql.DB, allowGenerationFallback bool) {
+func requireAllGenerationLookupPlans(t *testing.T, db *sql.DB) {
 	t.Helper()
-	projectionIndex := "nodes_by_repo"
-	projectionConstraints := []string{"repo_prefix=?", "view_gen=?"}
-	if allowGenerationFallback {
-		projectionIndex = nodesByGenerationIndexName
-		projectionConstraints = []string{"view_gen=?"}
-	}
 	for _, test := range []struct {
 		name        string
 		query       string
@@ -365,8 +348,8 @@ func requireAllGenerationLookupPlans(t *testing.T, db *sql.DB, allowGenerationFa
 		{"incoming", generationLookupIncomingPlanQuery, "edges_by_to", false, []any{"repo/target.go::T03", 3}, []string{"to_id=?", "view_gen=?"}},
 		{"outgoing", generationLookupOutgoingPlanQuery, "edges_by_from", false, []any{"repo/source03.go::F00003", 3}, []string{"from_id=?", "view_gen=?"}},
 		{"edge_generation", generationLookupEdgeGenerationPlanQuery, edgesByGenerationIndexName, false, []any{3}, []string{"view_gen=?"}},
-		{"repo_projection_gen0", generationLookupRepoProjectionQuery, projectionIndex, true, []any{`["","repo"]`, "directory", "file", 0}, projectionConstraints},
-		{"repo_projection_gen3", generationLookupRepoProjectionQuery, projectionIndex, true, []any{`["","repo"]`, "directory", "file", 3}, projectionConstraints},
+		{"repo_projection_gen0", generationLookupRepoProjectionQuery, "nodes_by_repo", true, []any{`["","repo"]`, "directory", "file", 0}, []string{"repo_prefix=?", "view_gen=?"}},
+		{"repo_projection_gen3", generationLookupRepoProjectionQuery, "nodes_by_repo", true, []any{`["","repo"]`, "directory", "file", 3}, []string{"repo_prefix=?", "view_gen=?"}},
 		{"repo_language_count", generationLookupRepoLanguageCountQuery, "nodes_by_repo", false, []any{"repo", "go", "file", "import", 3}, []string{"repo_prefix=?", "view_gen=?"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -426,17 +409,17 @@ func TestGenerationLookupIndexesSeekWithinGeneration(t *testing.T) {
 	seedGenerationLookupRows(t, db, 0, 4, 256)
 
 	t.Run("no_statistics", func(t *testing.T) {
-		requireAllGenerationLookupPlans(t, db, true)
+		requireAllGenerationLookupPlans(t, db)
 	})
 	if _, err := db.Exec(`ANALYZE`); err != nil {
 		t.Fatal(err)
 	}
 	t.Run("fresh_statistics", func(t *testing.T) {
-		requireAllGenerationLookupPlans(t, db, false)
+		requireAllGenerationLookupPlans(t, db)
 	})
 	seedGenerationLookupRows(t, db, 4, 4, 256)
 	t.Run("valid_stale_statistics", func(t *testing.T) {
-		requireAllGenerationLookupPlans(t, db, false)
+		requireAllGenerationLookupPlans(t, db)
 	})
 
 	for _, generation := range []int{0, 3} {
@@ -492,7 +475,7 @@ func TestGenerationLookupIndexesMigrateWithoutPayloadChanges(t *testing.T) {
 		}
 		requireGenerationLookupIndexShapes(t, store.db)
 		requireCurrentGenerationLookupDefinitionsShape(t, store.db)
-		requireAllGenerationLookupPlans(t, store.db, false)
+		requireAllGenerationLookupPlans(t, store.db)
 		if err := store.Close(); err != nil {
 			t.Fatal(err)
 		}
