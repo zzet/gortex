@@ -3,7 +3,7 @@ package analysis
 import (
 	"fmt"
 	"iter"
-	"math"
+	"reflect"
 	"runtime"
 	"sort"
 	"sync/atomic"
@@ -144,14 +144,15 @@ func TestCallRefProjectionReplaysTheStoreExactly(t *testing.T) {
 	if !adjacencyEqual(gotAdj, wantAdj) {
 		t.Fatalf("the adjacency snapshot over the projection differs from the direct read")
 	}
-	// HITS normalizes by summing over a Go map, so two direct runs over the
-	// same store already differ in the last bits (map iteration order). The
-	// projection must stay inside that envelope: the bound is the direct
-	// run's own run-to-run spread, measured here, plus one ulp-scale margin.
-	again := ComputeHITS(projectionFixture(400))
-	spread := hitsSpread(wantHITS, again)
-	if d := hitsSpread(wantHITS, gotHITS); d > spread+1e-15 {
-		t.Fatalf("HITS over the projection differs by %g from the direct read; direct runs differ by %g", d, spread)
+	if !reflect.DeepEqual(gotHITS, wantHITS) {
+		t.Fatal("HITS over the projection differs from the direct read")
+	}
+	// Replaying the same ordered input must reproduce every score bit and
+	// both maxima, even when each result owns freshly allocated maps.
+	for run := 0; run < 8; run++ {
+		if again := ComputeHITS(projectionFixture(400)); !reflect.DeepEqual(again, wantHITS) {
+			t.Fatalf("HITS direct replay %d differs from the first read", run)
+		}
 	}
 	if gotPR.Max != wantPR.Max {
 		t.Fatalf("PageRank maxima differ")
@@ -301,22 +302,13 @@ func TestNilPaceNeverParks(t *testing.T) {
 	}
 }
 
-// hitsSpread is the largest relative difference between two HITS results.
-func hitsSpread(a, b *HITSResult) float64 {
-	worst := 0.0
-	rel := func(x, y float64) float64 {
-		d := math.Abs(x - y)
-		if m := math.Max(math.Abs(x), math.Abs(y)); m > 0 {
-			d /= m
-		}
-		return d
+// BenchmarkComputeHITSOrderedInput includes the same ordered graph reads in
+// every iteration; fixture construction is outside the measured work.
+func BenchmarkComputeHITSOrderedInput(b *testing.B) {
+	store := projectionFixture(400)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ComputeHITS(store)
 	}
-	for id, v := range a.Authorities {
-		worst = math.Max(worst, rel(v, b.Authorities[id]))
-		worst = math.Max(worst, rel(a.Hubs[id], b.Hubs[id]))
-	}
-	if len(a.Authorities) != len(b.Authorities) {
-		return math.Inf(1)
-	}
-	return worst
 }

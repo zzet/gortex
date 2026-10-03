@@ -140,8 +140,8 @@ func ComputeHITSPaced(g graph.Store, pace *Pace) *HITSResult {
 			}
 			nextHub[id] = sum
 		}
-		normalizeL2(nextAuth)
-		normalizeL2(nextHub)
+		normalizeL2(nextAuth, ids)
+		normalizeL2(nextHub, ids)
 		auth, hub = nextAuth, nextHub
 	}
 
@@ -162,9 +162,12 @@ func ComputeHITSPaced(g graph.Store, pace *Pace) *HITSResult {
 // normalizeL2 scales a score vector in place to unit L2 norm. A
 // zero vector (no edges in the participating set) is left untouched
 // so the next iteration starts from a defined state.
-func normalizeL2(m map[string]float64) {
+func normalizeL2(m map[string]float64, ids []string) {
 	var sumSq float64
-	for _, v := range m {
+	// Use the same node order as the updates so replaying an ordered input
+	// also reproduces the floating-point normalization exactly.
+	for _, id := range ids {
+		v := m[id]
 		sumSq += v * v
 	}
 	if sumSq == 0 {
