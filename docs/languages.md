@@ -110,6 +110,14 @@ language, so a missing definition is not a missing implementation.
 
 Recent extraction refinements (each covered by a per-feature CI golden): Java `@interface` annotation types index as interfaces and participate in implementation matching; Java `new T(){…}` and C# `new { … }` anonymous classes/types become synthetic type nodes with an `extends` edge (to the instantiated type, or to `object` for C#); JS/TS arrow-valued class fields (`x = () => {…}`) are emitted as callable methods; JS/TS named imports emit one `imports` edge per binding (alias-aware via `Edge.Alias`) and barrel re-exports emit `re_exports` edges; JS/TS cross-file imports resolve onto the target file/symbol for relative specifiers (`./x`, `../x`) and for `tsconfig.json` / `jsconfig.json` `compilerOptions.paths` / `baseUrl` path aliases (`@/lib/x`), so callers / usages / blast-radius span aliased imports the same as relative ones; chained / factory-call receivers (`New().Build()`) carry an inferred `receiver_type`. See [features.md](features.md) and [architecture.md](architecture.md) for the edge semantics.
 
+### JS/TS import evidence
+
+Bare JS/TS calls with import evidence resolve at `ast_resolved`, including when
+the repository has only one definition. A named import of the defining symbol
+outranks file-level closure evidence; otherwise a unique directly imported or
+barrel-re-exported defining file supplies the binding. Same-file declarations
+still win, and ambiguous import evidence does not promote a guessed target.
+
 ### Julia specifics
 
 `module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`
