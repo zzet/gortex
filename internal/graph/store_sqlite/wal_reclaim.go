@@ -392,6 +392,11 @@ func (o walReclaimOutcome) String() string {
 	}
 }
 
+type walReclaimResetReaders struct {
+	epoch uint64
+	older int
+}
+
 type walReclaimResult struct {
 	outcome     walReclaimOutcome
 	reason      string
@@ -410,6 +415,11 @@ type walReclaimResult struct {
 	slowTail       *walReclaimSlowTail
 	// openGateWaited is the writer-free wait for old readers (step 2).
 	openGateWaited time.Duration
+	// resetReaders is captured before a positive complete-copy reset. A busy
+	// reset (including exhaustion of its own short context) can wait for one
+	// member to retire, then ask SQLite again without waiting for harmless
+	// database-only readers. Each reset hold clears this transient witness.
+	resetReaders *walReclaimResetReaders
 	// converged: step 2 backfilled the whole log (convergedFrames frames)
 	// and every reader admitted before that point has left, so any reader
 	// still in flight took read mark 0 unless the log grew since.
@@ -750,9 +760,8 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 					break
 				}
 			}
-			epoch := s.readGate.advance()
 			waitStart := time.Now()
-			older, werr := s.readGate.waitOlder(wctx, epoch, deadline)
+			epoch, older, werr := s.waitWALRoundReaders(wctx, &res, deadline)
 			res.openGateWaited = time.Since(started)
 			if werr != nil {
 				res.blocker, res.hasBlocker = s.readGate.oldestOlderThan(epoch, time.Now())
@@ -1471,6 +1480,15 @@ func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConf
 			res.outcome, res.reason = walReclaimSkipped, "build_lane_busy"
 			return errWALCheckpointYieldedToCycle
 		}
+		if res.resetReaders != nil {
+			epoch, older, werr := s.waitWALRoundReaders(ctx, res, deadline)
+			if werr != nil {
+				res.blocker, res.hasBlocker = s.readGate.oldestOlderThan(epoch, time.Now())
+				res.reason = fmt.Sprintf("older_readers_in_flight older_readers=%d rounds=%d writer_holds=%d", older, round, res.writerHolds)
+				return fmt.Errorf("%w: %s", errWALReclaimReadersInFlight, res.reason)
+			}
+			continue
+		}
 		// Without the writer: copy what is left, then wait out the readers
 		// admitted before that copy (a reader admitted after a complete
 		// copy takes read mark 0 and does not block the reset).
@@ -1487,6 +1505,21 @@ func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConf
 			return fmt.Errorf("%w: %s", errWALReclaimReadersInFlight, res.reason)
 		}
 	}
+}
+
+// waitWALRoundReaders keeps the full-drain rule for incomplete copies. A
+// positively complete reset that was refused can instead retry when a member
+// of its captured cohort retires; newer readers do not cause retries. Capture
+// happened before reset SQL, so retirement during SQL cannot be missed.
+func (s *Store) waitWALRoundReaders(ctx context.Context, res *walReclaimResult, deadline time.Time) (uint64, int, error) {
+	if cohort := res.resetReaders; cohort != nil {
+		res.resetReaders = nil
+		older, err := s.readGate.waitOlderDecrease(ctx, cohort.epoch, cohort.older, deadline)
+		return cohort.epoch, older, err
+	}
+	epoch := s.readGate.advance()
+	older, err := s.readGate.waitOlder(ctx, epoch, deadline)
+	return epoch, older, err
 }
 
 // walRemainderFits reports whether what is left to copy fits in one short
@@ -1561,6 +1594,7 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 }
 
 func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult, first, yieldsToLane bool, budget time.Duration) (done bool, err error) {
+	res.resetReaders = nil
 	if !res.urgent && s.writeWanted() {
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
 		return false, errWALReclaimWriterWaiting
@@ -1650,6 +1684,13 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 	if delta.incomplete() {
 		return false, nil
 	}
+	var cohort *walReclaimResetReaders
+	if delta.WALFrames > 0 && s.readGate != nil {
+		epoch := s.readGate.advance()
+		if older := s.readGate.olderCount(epoch); older > 0 {
+			cohort = &walReclaimResetReaders{epoch: epoch, older: older}
+		}
+	}
 	_, terr := s.resetWALForReclaim(writer.resetContext(yctx))
 	if hook := walIdleResetResultHook; hook != nil {
 		terr = hook(terr)
@@ -1667,6 +1708,9 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 	if yielded() {
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
 		return false, errWALReclaimWriterWaiting
+	}
+	if errors.Is(terr, errSQLiteCheckpointIncomplete) || errors.Is(terr, context.DeadlineExceeded) {
+		res.resetReaders = cohort
 	}
 	return false, nil
 }
