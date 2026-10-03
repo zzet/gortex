@@ -414,8 +414,8 @@ func TestReclaimResetsDuringABurstOverThePressureMark(t *testing.T) {
 	close(stop)
 	wg.Wait()
 	cp, st := s.WALCopyStats(), s.WALReclaimStats()
-	t.Logf("burst: wal_max=%.1fMiB resets=%d pressure_runs=%d pressure_resets=%d (inside the lane %d) pressure_give_ups=%d writer_hold_max=%s",
-		float64(maxWAL)/(1<<20), st.Resets, cp.PressureRuns, cp.PressureResets, cp.PressureLaneResets, cp.PressureGiveUps, st.WriterHoldMax)
+	t.Logf("burst: wal_max=%.1fMiB resets=%d pressure_runs=%d pressure_resets=%d (inside the lane %d) pressure_give_ups=%d writer_hold_max=%s adaptive_attempts=%d adaptive_hold_max=%s adaptive_budget_max=%s",
+		float64(maxWAL)/(1<<20), st.Resets, cp.PressureRuns, cp.PressureResets, cp.PressureLaneResets, cp.PressureGiveUps, st.WriterHoldMax, st.AdaptiveWriterAttempts, st.AdaptiveWriterHoldMax, st.AdaptiveWriterBudgetMax)
 	require.NoError(t, writeErr)
 	// Plain runs pin at least two; the race detector slows every attempt past
 	// the test's window, so there one is enough to prove the path.
@@ -427,7 +427,18 @@ func TestReclaimResetsDuringABurstOverThePressureMark(t *testing.T) {
 	// The mark (16 MiB) plus what the writes add while one attempt converges
 	// (~5 s at 6.7 MiB/s); without the pressure mode the log grows past 90 MiB.
 	require.Less(t, maxWAL, int64(64<<20), "the log outgrew the pressure mark plus one attempt")
-	require.Less(t, st.WriterHoldMax, walReclaimPressureHold+100*time.Millisecond)
+	// The fast path retains its original short cap. A measured adaptive
+	// urgent completion uses the separately bounded slow-storage policy;
+	// WAL size, reset cadence and ordinary fast controls stay unchanged.
+	// Durations are integral nanoseconds: preserve the original strict
+	// short bound while allowing equality with the measured adaptive max.
+	holdBound := walReclaimPressureHold + 100*time.Millisecond - time.Nanosecond
+	if st.AdaptiveWriterHoldMax > 0 {
+		require.Positive(t, st.AdaptiveWriterAttempts)
+		require.Less(t, st.AdaptiveWriterHoldMax, walReclaimMaxWriterHold+100*time.Millisecond)
+		holdBound = max(holdBound, st.AdaptiveWriterHoldMax)
+	}
+	require.LessOrEqual(t, st.WriterHoldMax, holdBound, "a hold exceeded both the ordinary bound and the measured adaptive hold")
 }
 
 // The reset inside a busy lane holds the writer for at most its own cap: a
