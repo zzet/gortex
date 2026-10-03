@@ -14,6 +14,7 @@ import (
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/semantic/tstypes"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // A committed-base import must publish every file while interactive requests
@@ -86,14 +87,16 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 	}
 	fixture.publishBase(t)
 	f := fixture.coordinatorFixture
+	admissionLogger, admissionLogs := newImportAdmissionLogCapture()
 	builder := builderNewBuilder(f.store)
 	builder.Semantic = manager
+	builder.Logger = admissionLogger
 	gate := NewViewBuildGate()
 	gate.Open()
 	outcomes := make(chan CheckoutCycle, 512)
 	var importing atomic.Bool
 	var cycleContext context.Context
-	c := f.coordinator(t, CheckoutCoordinatorConfig{
+	c := f.coordinatorWithLogger(t, CheckoutCoordinatorConfig{
 		Gate:      gate,
 		Builder:   builder,
 		cycleDone: func(out CheckoutCycle) { outcomes <- out },
@@ -109,7 +112,7 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 				}
 			}
 		},
-	})
+	}, admissionLogger)
 	c.cycleMu.Lock()
 	c.cycleBarrier = func(ctx context.Context) { cycleContext = ctx }
 	if earlyDemand {
@@ -245,8 +248,12 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 		probe          int
 		asked, granted time.Time
 		wait           time.Duration
+		beforeAcquire  time.Time
+		beforeStats    ViewBuildGateStats
 	}
 	var slowAdmissions []slowAdmission // Single producer, read after probeDone.
+	var worstAdmission slowAdmission
+	var droppedSlowAdmissions int
 	var probeErr error
 	go func() {
 		defer close(probeDone)
@@ -257,6 +264,9 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 			case <-probeCtx.Done():
 				return
 			case <-ticker.C:
+				// Existing-state snapshot precedes the unchanged measured Acquire interval.
+				beforeAcquire := time.Now()
+				beforeStats := gate.Stats()
 				asked := time.Now()
 				release, err := gate.Acquire(probeCtx, ViewBuildInteractive)
 				if err != nil {
@@ -269,9 +279,18 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 				if wait := waits[len(waits)-1]; wait >= 50*time.Millisecond {
 					// Snapshot the grant while this probe still owns its lease.
 					// The original measured Acquire interval above is unchanged.
-					slowAdmissions = append(slowAdmissions, slowAdmission{
+					sample := slowAdmission{
 						probe: len(waits), asked: asked, granted: gate.Stats().ActiveSince, wait: wait,
-					})
+						beforeAcquire: beforeAcquire, beforeStats: beforeStats,
+					}
+					if len(slowAdmissions) < 64 {
+						slowAdmissions = append(slowAdmissions, sample)
+					} else {
+						droppedSlowAdmissions++
+					}
+					if sample.wait > worstAdmission.wait {
+						worstAdmission = sample
+					}
 				}
 				// Exercise the shared writer while the import payload is private.
 				err = f.store.AtGeneration(0).SetRepoIndexState(graph.RepoIndexState{RepoPrefix: "interactive-probe"})
@@ -383,6 +402,29 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 	t.Logf("import: %d cycles, %d file links, %d folds, %d yields; %d interactive probes, worst wait %s (all: %v)",
 		len(cycles), links, folds, yields, len(waits), worst, waits)
 	if worst > 100*time.Millisecond {
+		// Snapshotting the displaced holder after Acquire would name this
+		// interactive probe instead. These pre-Acquire snapshots are bounded
+		// observations, not proof that the holder stayed unchanged throughout.
+		for _, sample := range append(slowAdmissions, worstAdmission) {
+			t.Logf("import pre-Acquire observation: probe=%d sampled=%s asked=%s granted=%s returned=%s wait=%s active=%t active_since=%s holder=%+v interactive_queued=%d background_queued=%d admitted_interactive=%d admitted_background=%d yield_requests=%d yield_refusals=%d",
+				sample.probe, sample.beforeAcquire.UTC().Format(time.RFC3339Nano), sample.asked.UTC().Format(time.RFC3339Nano), sample.granted.UTC().Format(time.RFC3339Nano), sample.asked.Add(sample.wait).UTC().Format(time.RFC3339Nano), sample.wait,
+				sample.beforeStats.Active, sample.beforeStats.ActiveSince.UTC().Format(time.RFC3339Nano), sample.beforeStats.Holder,
+				sample.beforeStats.InteractiveQueued, sample.beforeStats.BackgroundQueued, sample.beforeStats.AdmittedInteractive, sample.beforeStats.AdmittedBackground, sample.beforeStats.YieldRequests, sample.beforeStats.YieldRefusals)
+		}
+		logs, droppedLogs, writeCost := admissionLogs.snapshot()
+		t.Logf("import admission diagnostics: slow_dropped=%d logs=%d logs_dropped=%d sink_write_cost=%s (excludes JSON encoding); coordinator/builder timestamps are existing-log emission times, not every lane boundary",
+			droppedSlowAdmissions, len(logs), droppedLogs, writeCost)
+		for _, entry := range logs {
+			t.Logf("import existing phase log: %s", strings.TrimSpace(entry))
+		}
+		for i, cy := range cycles {
+			var physical []GenerationPhase
+			if cy.out.DirtyWork != nil {
+				physical = cy.out.DirtyWork.Phases
+			}
+			t.Logf("import cycle diagnostic: cycle=%d started=%s generation=%d remaining=%d folded=%t plan=%v physical=%v",
+				i, cy.out.cycleStarted.UTC().Format(time.RFC3339Nano), cy.out.DirtyGenerationID, cy.out.DirtyBatchRemaining, cy.out.ImportFolded, cy.out.PlanLaps, physical)
+		}
 		t.Errorf("an interactive build waited %s for the import, want ≤ 100ms", worst)
 	}
 	if inline {
@@ -475,4 +517,55 @@ func queuedImportAdmissionProbe(t *testing.T, c *CheckoutCoordinator, gate *View
 			}
 		}
 	}
+}
+
+// importAdmissionLogCapture is a bounded in-memory sink used only by the
+// sustained-import fixture. Injection happens before coordinator construction,
+// so constructor-spawned Git healing sees the same immutable logger pointer.
+// No diagnostic I/O, SQL, sampling, stacks or sleeps run in the producer.
+type importAdmissionLogCapture struct {
+	mu        sync.Mutex
+	lines     []string
+	bytes     int
+	dropped   int
+	writeCost time.Duration
+}
+
+func newImportAdmissionLogCapture() (*zap.Logger, *importAdmissionLogCapture) {
+	sink := &importAdmissionLogCapture{}
+	cfg := zap.NewProductionEncoderConfig()
+	cfg.TimeKey = "at"
+	cfg.EncodeTime = zapcore.RFC3339NanoTimeEncoder
+	logger := zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(cfg), sink, zap.DebugLevel))
+	return logger, sink
+}
+
+func (s *importAdmissionLogCapture) Write(p []byte) (int, error) {
+	started := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(p) > 512*1024 {
+		s.dropped++
+	} else {
+		// Keep the latest phases: a final publication can be the slow one.
+		for len(s.lines) > 0 && (len(s.lines) >= 256 || s.bytes+len(p) > 512*1024) {
+			s.bytes -= len(s.lines[0])
+			copy(s.lines, s.lines[1:])
+			s.lines[len(s.lines)-1] = ""
+			s.lines = s.lines[:len(s.lines)-1]
+			s.dropped++
+		}
+		s.lines = append(s.lines, string(p))
+		s.bytes += len(p)
+	}
+	s.writeCost += time.Since(started)
+	return len(p), nil
+}
+
+func (*importAdmissionLogCapture) Sync() error { return nil }
+
+func (s *importAdmissionLogCapture) snapshot() ([]string, int, time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.lines...), s.dropped, s.writeCost
 }

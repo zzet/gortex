@@ -207,6 +207,12 @@ func (f *coordinatorFixture) writeCatalogIdentity() {
 // decide when a cycle runs, either by signalling inside a synctest bubble or by
 // calling the cycle directly.
 func (f *coordinatorFixture) coordinator(t testing.TB, cfg CheckoutCoordinatorConfig) *CheckoutCoordinator {
+	return f.coordinatorWithLogger(t, cfg, zap.NewNop())
+}
+
+// coordinatorWithLogger injects a scoped fixture logger before construction;
+// the ordinary helper retains its default Nop logger for every other test.
+func (f *coordinatorFixture) coordinatorWithLogger(t testing.TB, cfg CheckoutCoordinatorConfig, logger *zap.Logger) *CheckoutCoordinator {
 	t.Helper()
 	cfg.CheckoutID = f.checkoutID
 	cfg.CheckoutRoot = f.worktree
@@ -227,7 +233,7 @@ func (f *coordinatorFixture) coordinator(t testing.TB, cfg CheckoutCoordinatorCo
 		// cohort is deliberately not reusable across coordinators.
 		cfg.ConfigSections = dedicatedBaseConfigSections(config.Default())
 	}
-	cfg.Logger = zap.NewNop()
+	cfg.Logger = logger
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = -1
 	}
