@@ -80,6 +80,21 @@ func (s *Store) RepoLanguageFileCounts(repoPrefixes []string) []graph.RepoLangua
 	return out
 }
 
+// Keep requested repositories driving the census, without pinning an index
+// that a legitimate bulk-load window may have dropped.
+const repoLanguageCountsSQL = `
+WITH requested(repo_prefix) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+)
+SELECT n.repo_prefix, n.language, COUNT(*)
+FROM requested AS r
+CROSS JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
+WHERE n.language <> ''
+  AND (n.kind <> ? OR n.data_class IS NOT 'content')
+  AND n.view_gen = ?
+GROUP BY n.repo_prefix, n.language
+ORDER BY n.repo_prefix, n.language`
+
 // RepoLanguageCounts returns node-only language counts for all requested repos
 // in one query. It deliberately does not touch the edges table (unlike
 // RepoStats), and filters content sections using the promoted data_class column.
@@ -89,18 +104,7 @@ func (s *Store) RepoLanguageCounts(repoPrefixes []string) map[string]map[string]
 	if !ok {
 		return out
 	}
-	rows, err := s.db.Query(`
-WITH requested(repo_prefix) AS (
-    SELECT CAST(value AS TEXT) FROM json_each(?)
-)
-SELECT n.repo_prefix, n.language, COUNT(*)
-FROM requested AS r
-JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
-WHERE n.language <> ''
-  AND (n.kind <> ? OR n.data_class IS NOT 'content')
-  AND n.view_gen = ?
-GROUP BY n.repo_prefix, n.language
-ORDER BY n.repo_prefix, n.language`, reposJSON, string(graph.KindDoc), s.viewGen)
+	rows, err := s.db.Query(repoLanguageCountsSQL, reposJSON, string(graph.KindDoc), s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return out
