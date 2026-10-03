@@ -117,6 +117,8 @@ the repository has only one definition. A named import of the defining symbol
 outranks file-level closure evidence; otherwise a unique directly imported or
 barrel-re-exported defining file supplies the binding. Same-file declarations
 still win, and ambiguous import evidence does not promote a guessed target.
+Import statement evidence is batch-loaded per resolver page and cleared after
+interleaved mutations, so promotion does not add per-call adjacency queries.
 
 ### Julia specifics
 

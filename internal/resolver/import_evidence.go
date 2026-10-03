@@ -96,7 +96,7 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 		}
 	}
 	var symbolPick *graph.Node
-	for _, e := range r.graph.GetOutEdges(callerFile) {
+	for _, e := range r.importEvidenceEdges(callerFile) {
 		if e.Kind != graph.EdgeImports || e.Alias != "" {
 			continue
 		}
@@ -191,7 +191,7 @@ func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
 		pendingBarrels = append(pendingBarrels, f)
 	}
 
-	for _, e := range r.graph.GetOutEdges(callerFile) {
+	for _, e := range r.importEvidenceEdges(callerFile) {
 		if e.Kind != graph.EdgeImports {
 			continue
 		}
@@ -208,7 +208,7 @@ func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
 			continue
 		}
 		seen[f] = true
-		for _, e := range r.graph.GetOutEdges(f) {
+		for _, e := range r.importEvidenceEdges(f) {
 			if e.Kind != graph.EdgeReExports {
 				continue
 			}
@@ -278,4 +278,66 @@ func (r *Resolver) nodeFilePath(id string) string {
 		return n.ID
 	}
 	return ""
+}
+
+// Import statements are page-scoped structural evidence. Hydrate callers in
+// one batch before worker fan-out, including known-empty files, rather than
+// querying the store once per call. The ordinary cache clear also drops them
+// after an interleaved mutation.
+func (r *Resolver) warmImportEvidenceEdges(pending []*graph.Edge) {
+	files := make(map[string]struct{})
+	for _, edge := range pending {
+		if edge == nil || edge.Kind != graph.EdgeCalls || !isBareNameCallTarget(edge.To) {
+			continue
+		}
+		file := r.edgeCallerFile(edge)
+		if isJSTSPath(file) {
+			files[file] = struct{}{}
+		}
+	}
+	if len(files) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(files))
+	for file := range files {
+		ids = append(ids, file)
+	}
+	byFile := r.graph.GetOutEdgesByNodeIDs(ids)
+	r.importEdgesByFile = make(map[string][]*graph.Edge, len(ids))
+	for _, file := range ids {
+		for _, edge := range byFile[file] {
+			if edge.Kind == graph.EdgeImports || edge.Kind == graph.EdgeReExports {
+				r.importEdgesByFile[file] = append(r.importEdgesByFile[file], edge)
+			}
+		}
+		if _, present := r.importEdgesByFile[file]; !present {
+			r.importEdgesByFile[file] = nil
+		}
+	}
+}
+
+// Barrel files reached after the caller batch are memoised once per page too.
+func (r *Resolver) importEvidenceEdges(file string) []*graph.Edge {
+	r.importFilesMu.RLock()
+	edges, loaded := r.importEdgesByFile[file]
+	r.importFilesMu.RUnlock()
+	if loaded {
+		return edges
+	}
+	r.importFilesMu.Lock()
+	defer r.importFilesMu.Unlock()
+	if edges, loaded = r.importEdgesByFile[file]; loaded {
+		return edges
+	}
+	byFile := r.graph.GetOutEdgesByNodeIDs([]string{file})
+	for _, edge := range byFile[file] {
+		if edge.Kind == graph.EdgeImports || edge.Kind == graph.EdgeReExports {
+			edges = append(edges, edge)
+		}
+	}
+	if r.importEdgesByFile == nil {
+		r.importEdgesByFile = make(map[string][]*graph.Edge)
+	}
+	r.importEdgesByFile[file] = edges
+	return edges
 }
