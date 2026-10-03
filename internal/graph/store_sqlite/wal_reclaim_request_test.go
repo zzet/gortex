@@ -154,72 +154,105 @@ func TestARequestEndsAPausedCopy(t *testing.T) {
 	require.Positive(t, after.PressureResets-before.PressureResets)
 }
 
-// An attempt that began before the lane's predicate was installed (the
-// daemon installs it after Open; a test store installs it after seeding) is
-// not watched and its passes do not pause. If an edit then holds the lane, it
-// waits inside the edit for a gap: its writer-free rounds go on until the
-// reader wait (30 s) runs out, and the loop, inside it, serves no request. A
-// writer refused on the log's size now ends such an attempt, and the loop
-// runs the pressure attempt that resets the log inside the busy lane. Scaled
-// as the tests above.
-func TestARequestEndsAnAttemptWaitingForAGap(t *testing.T) {
+// A yielding attempt that began before the daemon installed its lane predicate
+// must observe a later busy predicate and finish. A fold refused on the WAL
+// mark can then request a pressure reset inside the still-busy lane. Installing
+// the predicate at a real PASSIVE completion pins the same active attempt;
+// its cancellation and completion are observed directly, not inferred from
+// additional checkpoints continuing inside the edit. Scaled as above.
+func TestARequestRunsAfterALatePredicateCancelsAnAttempt(t *testing.T) {
 	prevMark := chainFoldWALMark
 	chainFoldWALMark = 4 << 20
 	t.Cleanup(func() { chainFoldWALMark = prevMark })
-	// Every PASSIVE is counted; an armed observer installs the lane's
-	// predicate at the next one, so the attempt that ran it began without
-	// it and is inside an edit from then on.
-	var passives atomic.Int64
 	var armed atomic.Bool
 	var store atomic.Pointer[Store]
 	var laneRef atomic.Pointer[fakeBuildLane]
+	type capture struct {
+		attempt  *backgroundCheckpointAttempt
+		pausable bool
+	}
+	captured := make(chan capture, 1)
+	stopObserver := make(chan struct{})
 	prevObserver := walCheckpointCallObserver
 	walCheckpointCallObserver = func(mode string, _ time.Time, _ time.Duration) {
-		if mode != "PASSIVE" {
+		if mode != "PASSIVE" || !armed.CompareAndSwap(true, false) {
 			return
 		}
-		passives.Add(1)
-		if armed.CompareAndSwap(true, false) {
-			if st, l := store.Load(), laneRef.Load(); st != nil && l != nil {
-				l.install(st)
+		st, l := store.Load(), laneRef.Load()
+		if st == nil || l == nil {
+			captured <- capture{}
+			return
+		}
+		st.backgroundCheckpoint.mu.Lock()
+		attempt := st.backgroundCheckpoint.active
+		st.backgroundCheckpoint.mu.Unlock()
+		pausable := attempt != nil && attempt.copy != nil && attempt.copy.pausable.Load()
+		l.install(st)
+		if attempt != nil && !pausable {
+			// Keep this real completion callback alive until the dynamic
+			// watcher cancels the attempt, so normal attempt cleanup cannot
+			// replace its cancellation cause before it is witnessed.
+			timer := time.NewTimer(5 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-attempt.ctx.Done():
+			case <-timer.C:
+			case <-stopObserver:
 			}
 		}
+		captured <- capture{attempt: attempt, pausable: pausable}
 	}
 	t.Cleanup(func() { walCheckpointCallObserver = prevObserver })
 	s, _, lane := pressureStore(t, 0)
+	// Unblock the callback before pressureStore's joined Close cleanup on
+	// every assertion failure. Hook restoration follows Store closure.
+	t.Cleanup(func() { close(stopObserver) })
 	store.Store(s)
 	laneRef.Store(lane)
 	fold := beginTestFold(t, s)
+	// Join any older attempt before removing the predicate. The setup lease
+	// prevents a pass from starting or resetting the seeded WAL until armed.
+	lease, err := s.acquireGenerationBulkCheckpointLease()
+	require.NoError(t, err)
+	t.Cleanup(func() { s.releaseGenerationBulkCheckpointLease(lease) })
+	s.SetBuildLaneBusy(nil)
 	logBytes := func() int64 {
 		m := s.WALWriteMark()
 		return int64(m.MxFrame) * (int64(m.PageSize) + walFrameHeaderBytes)
 	}
-	caught := false
-	for try := 0; try < 20 && !caught; try++ {
-		lane.held.Store(true)
-		for k := 0; logBytes() <= 8<<20 && k < 256; k++ {
-			require.NoError(t, churnWriteOnce(s, k))
-		}
-		require.Less(t, logBytes(), int64(16<<20), "precondition: under the pressure mark")
-		armed.Store(true)
-		s.SetBuildLaneBusy(nil) // the next attempt begins without the predicate
-		for wait := time.Now().Add(2 * time.Second); time.Now().Before(wait) && armed.Load(); {
-			time.Sleep(100 * time.Microsecond)
-		}
-		if armed.Swap(false) {
-			lane.install(s)
-		}
-		time.Sleep(100 * time.Millisecond)
-		mid := passives.Load()
-		time.Sleep(100 * time.Millisecond)
-		caught = passives.Load() > mid && logBytes() > 4<<20
+	lane.held.Store(true)
+	for k := 0; logBytes() <= 8<<20 && k < 256; k++ {
+		require.NoError(t, churnWriteOnce(s, k))
 	}
-	require.True(t, caught, "precondition: an attempt waiting for a gap inside the edit")
+	require.Greater(t, logBytes(), int64(4<<20), "precondition: over the fold's mark")
+	require.Less(t, logBytes(), int64(16<<20), "precondition: under the pressure mark")
+	armed.Store(true)
+	require.True(t, s.releaseGenerationBulkCheckpointLease(lease))
+	var seen capture
+	select {
+	case seen = <-captured:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no real PASSIVE completed before late predicate installation")
+	}
+	attempt := seen.attempt
+	require.False(t, seen.pausable, "precondition: the captured pass began before predicate installation")
+	require.NotNil(t, attempt, "precondition: PASSIVE belonged to an active attempt")
+	require.ErrorIs(t, context.Cause(attempt.ctx), errWALCheckpointYieldedToCycle,
+		"the late predicate must cancel the active yielding attempt")
+	select {
+	case <-attempt.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cancelled checkpoint attempt did not finish")
+	}
+	require.True(t, lane.held.Load(), "the lane stays busy through the request")
+	require.Greater(t, logBytes(), int64(4<<20), "precondition: refused fold still needs reclaim")
+	require.Less(t, logBytes(), int64(16<<20), "precondition: request, not pressure size, grants admission")
 	before := s.WALCopyStats()
 	done, refusals := stepFoldAgainstABusyLane(t, s, lane, fold, 20*time.Second)
 	after := s.WALCopyStats()
-	t.Logf("fold done=%t refusals=%d pressure_runs=%d pressure_resets=%d", done, refusals, after.PressureRuns-before.PressureRuns, after.PressureResets-before.PressureResets)
-	require.True(t, done, "the fold waited on an attempt waiting for a gap")
+	t.Logf("late_attempt_cancelled=true fold done=%t refusals=%d pressure_runs=%d pressure_resets=%d",
+		done, refusals, after.PressureRuns-before.PressureRuns, after.PressureResets-before.PressureResets)
+	require.True(t, done, "the fold waited after the late-predicate attempt ended")
 	require.Positive(t, refusals, "precondition: the fold was refused at first")
 	require.Positive(t, after.PressureResets-before.PressureResets)
 }
