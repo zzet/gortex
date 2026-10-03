@@ -850,11 +850,13 @@ const walResidueTruncateBudget = 500 * time.Millisecond
 // with a PASSIVE that holds no writer, then takes the writer for a single
 // TRUNCATE on a checkpoint connection whose busy handler waits at most
 // sqliteCheckpointBusyTimeoutMillis, bounded by walResidueTruncateBudget. A
-// busy or incomplete TRUNCATE is not retried: a reader holding the log will
-// still hold it a few hundred milliseconds later, and the former retry loop
-// held the writer 7–9 s per attempt on the live store while every edit queued
-// behind it. The residue is handed to the WAL reclaim (nudged to attempt at
-// its next poll), which waits readers out with the gate open. A store without
+// reader-busy TRUNCATE with usable frame counts is handed off rather than
+// retried: the reader may still hold the log a few hundred milliseconds later,
+// and the former retry loop held the writer 7–9 s per attempt on the live
+// store while every edit queued behind it. WAL reclaim is nudged to attempt
+// at its next poll and waits readers out with the gate open. Unknown counts
+// from checkpoint-lock contention retain the scheduled drain's bounded retry.
+// A store without
 // a separate checkpoint connection (in-memory) keeps the writer-connection
 // TRUNCATE.
 func (s *Store) drainWALResidue(ctx context.Context) error {
@@ -885,6 +887,13 @@ func (s *Store) drainWALResidue(ctx context.Context) error {
 	cancel()
 	if err != nil {
 		if ctx.Err() != nil {
+			return err
+		}
+		// An unknown frame tuple can be checkpoint-lock contention, not a
+		// reader holding a copied WAL. Keep it (and genuine SQL failures) in
+		// the scheduled drain's existing bounded retry path instead of losing
+		// a small residue below the reclaim threshold through a false handoff.
+		if !errors.Is(err, errSQLiteCheckpointIncomplete) || result.Busy <= 0 || result.WALFrames < 0 || result.CheckpointedFrames < 0 {
 			return err
 		}
 		s.walReclaimNudged.Store(true)
