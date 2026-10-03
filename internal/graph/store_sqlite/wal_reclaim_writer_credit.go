@@ -20,6 +20,7 @@ type walReclaimWriterCredit struct {
 	cancelReset    context.CancelFunc
 	readmitted     bool
 	yieldToWriters bool
+	slowTail       *walReclaimSlowTail
 }
 
 func newWALReclaimWriterCredit(s *Store, held time.Time) *walReclaimWriterCredit {
@@ -116,13 +117,25 @@ func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *
 	// Neither reset admission nor the writer hold inherits this longer scope.
 	opCtx, cancelOperation := context.WithTimeout(operationCtx, walReclaimLaneBudget)
 	defer cancelOperation()
+	before, beforeOK := readWALReclaimFrontier(w.store.dbPath)
+	beforeOK = beforeOK && time.Now().Before(deadline) && ctx.Err() == nil
+	copyStarted := time.Now()
 	result, err := checkpointWALOnceOn(opCtx, db, "PASSIVE")
+	copyElapsed := time.Since(copyStarted)
 	finish()
 	if w.held {
 		return result, err
 	}
 	if err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
 		return result, err
+	}
+	// Observe a completed frontier before queuing for the remaining short
+	// credit: a real foreground SQL writer may consume that entire queue
+	// window. This is only a budget hint; the adaptive entry checks it again.
+	if ctx.Err() == nil || (errors.Is(ctx.Err(), context.DeadlineExceeded) && errors.Is(context.Cause(ctx), context.DeadlineExceeded)) {
+		if after, afterOK := readWALReclaimFrontier(w.store.dbPath); beforeOK && afterOK && err == nil && copyElapsed > allowance && result.WALFrames > 0 && result.CheckpointedFrames == result.WALFrames && uint32(result.CheckpointedFrames) >= before.mx && after.backfill >= before.mx && after.mx > after.backfill && before.salt == after.salt {
+			w.slowTail = &walReclaimSlowTail{salt: after.salt, copyElapsed: copyElapsed, covered: before.mx}
+		}
 	}
 	// A completed copy may outlive the original hold deadline without
 	// consuming its remaining writer credit. Give reset admission one fresh

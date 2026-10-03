@@ -30,11 +30,15 @@ import (
 //     walReclaimPressureHold (not the general 2 s cap): the last backfill and
 //     the reset, nothing else. If that does not finish in time it gives up
 //     (counted as a pressure give-up) and the next attempt tries again.
+//     A proven slow completed copy with a new tail permits one adaptive
+//     completion slice for an urgent attempt; its aggregate writer time is
+//     still capped by walReclaimMaxWriterHold.
 //
 // Below the mark nothing changes.
 
 var (
-	// walReclaimPressureHold caps the writer step taken inside a busy lane.
+	// walReclaimPressureHold is the ordinary writer step inside a busy lane;
+	// proven urgent slow-copy tails may use one bounded adaptive slice.
 	walReclaimPressureHold = 50 * time.Millisecond
 	// walReclaimPressureWriterWait bounds how long that step queues for the
 	// writer.
@@ -122,14 +126,29 @@ const walPressureMarkFactor int64 = 4
 var errWALPressureHold = errors.New("store_sqlite: wal reclaim: the reset did not fit its hold inside a busy lane")
 
 // reclaimWALPressureReset is the writer step of a pressure attempt: only when
-// the backfill is (nearly) complete, the writer held for at most
-// walReclaimPressureHold, the remainder copied and the log reset.
+// the backfill is nearly complete, then a short final copy/reset. A proven
+// urgent slow-copy tail gets one longer slice under the aggregate two-second
+// allowance, rather than repeatedly letting writes overtake the final sync.
 func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult) error {
+	operationCtx, cancel := context.WithTimeout(ctx, walReclaimLaneBudget)
+	defer cancel()
+	err := s.reclaimWALPressureResetOnce(operationCtx, ckptDB, res, walReclaimPressureHold)
+	if err == nil || operationCtx.Err() != nil {
+		return err
+	}
+	if budget := res.takeAdaptiveWriterBudget(); budget > 0 {
+		res.reason = ""
+		return s.reclaimWALPressureResetOnce(operationCtx, ckptDB, res, budget)
+	}
+	return err
+}
+
+func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult, budget time.Duration) error {
 	// What the hold may still copy: half the cap at the rate the convergence
 	// measured, and never less than walReclaimPressureSmallFrames.
 	allowed := walReclaimPressureSmallFrames
 	if c := res.convergence; c != nil && c.rateFramesPerS > 0 {
-		allowed = max(allowed, uint32(c.rateFramesPerS*(walReclaimPressureHold/2).Seconds()))
+		allowed = max(allowed, uint32(c.rateFramesPerS*(budget/2).Seconds()))
 	}
 	// The writer: an edit that holds it keeps it; this queues for it up to
 	// walReclaimPressureWriterWait (one edit statement holds the gate for up
@@ -147,11 +166,14 @@ func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res
 	writer := newWALReclaimWriterCredit(s, held)
 	defer func() {
 		writer.release()
-		res.writerHold = max(res.writerHold, writer.longest)
+		res.recordWriterCredit(writer, budget > walReclaimPressureHold)
 	}()
 	if s.bulkConn != nil && !res.leaseOverride {
 		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
 		return errWALCheckpointDeferredBulk
+	}
+	if budget > walReclaimPressureHold && !res.adaptiveFrontierCurrent(s) {
+		return errWALReclaimReadersInFlight
 	}
 	// With the writer held the log cannot grow: the remainder is final. Take
 	// the step only when it is small enough for the hold to be the reset.
@@ -166,12 +188,16 @@ func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res
 		s.walCopy.pressureGiveUps.Add(1)
 		return errWALPressureHold
 	}
-	hctx, hcancel := context.WithDeadline(ctx, held.Add(walReclaimPressureHold))
+	hctx, hcancel := context.WithDeadline(ctx, held.Add(budget))
 	defer hcancel()
 	if hook := walPressureResetHook; hook != nil {
 		hook(hctx)
 	}
-	if _, err := writer.passive(hctx, ctx, ckptDB, walReclaimPressureHold/2, res.leaseOverride); err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
+	copyCredit := budget / 2
+	if budget > walReclaimPressureHold {
+		copyCredit = budget - walReclaimPressureHold
+	}
+	if _, err := writer.passive(hctx, ctx, ckptDB, copyCredit, res.leaseOverride); err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
 		res.reason = fmt.Sprintf("pressure_backfill error=%v", err)
 		s.walCopy.pressureGiveUps.Add(1)
 		return fmt.Errorf("%w: %w", errWALPressureHold, err)

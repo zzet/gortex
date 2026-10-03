@@ -255,7 +255,9 @@ func TestReclaimSlowFinalBackfillRefusesContinuousWrites(t *testing.T) {
 			}
 		})
 		res := &walReclaimResult{urgent: true}
-		reset, _ := s.reclaimWALResetHold(ctx, walReclaimConfig{thresholdBytes: 1}, db, res, false, false)
+		// This oracle concerns one copy admission, not the urgent policy
+		// that may copy the new tail in a separate bounded adaptive slice.
+		reset, _ := s.reclaimWALResetHoldOnce(ctx, walReclaimConfig{thresholdBytes: 1}, db, res, false, false, walReclaimResetHold)
 		if reset {
 			cancel()
 			require.NoError(t, <-done)

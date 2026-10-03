@@ -90,7 +90,9 @@ const (
 	walReclaimReaderWaitMax     = 60 * time.Second
 	// walReclaimMaxWriterHold caps how long the closed-gate path (only with
 	// the open-gate stages disabled) keeps the application writer. The
-	// open-gate stages never hold it past walReclaimResetHold (50 ms): the
+	// open-gate stages normally use walReclaimResetHold (50 ms); an urgent
+	// attempt with a proven slow-copy tail may take one adaptive completion
+	// slice, sharing this two-second cap with all its prior holds. The
 	// wait for old readers runs without the writer, which is taken only for
 	// the final backfill and the reset. A queued write or an announced
 	// mutation (AnnounceWrite) ends a hold at once.
@@ -120,7 +122,7 @@ const (
 	// for the readers admitted before its copy, and logs it: the one step
 	// that bounds the log when writes never leave a gap long enough for the
 	// short holds. Below it, no attempt holds the writer longer than
-	// walReclaimResetHold.
+	// walReclaimResetHold, except for that proven urgent slow-copy tail.
 	walReclaimLastResortFactor = 4
 )
 
@@ -255,24 +257,29 @@ type WALReclaimStats struct {
 	OpenGateResets int64 // resets reached without closing the read gate
 	// LastResortRuns counts attempts at walReclaimLastResortBytes (each may
 	// hold the writer up to walReclaimMaxWriterHold).
-	LastResortRuns  int64
-	WriterHoldMax   time.Duration
-	WriterHoldLast  time.Duration
-	Deferrals       int64 // attempts that gave up and backed off
-	Skips           int64 // refused: bulk lease/connection, checkpoint in flight
-	Failures        int64 // driver/I/O errors (also backed off)
-	FramesReclaimed int64 // WAL frames discarded by successful resets
-	BytesReclaimed  int64 // -wal bytes returned to the filesystem
-	PauseCount      int64
-	PauseTotal      time.Duration
-	PauseMax        time.Duration
-	PauseLast       time.Duration
-	ReaderWaits     int64
-	ReaderWaitTotal time.Duration
-	ReaderWaitMax   time.Duration
-	Backoff         time.Duration // current backoff after the last attempt
-	LastOutcome     string
-	LastReason      string
+	LastResortRuns int64
+	WriterHoldMax  time.Duration
+	WriterHoldLast time.Duration
+	// AdaptiveWriterAttempts counts attempts selecting the longer urgent slice
+	// permitted after a completed slow copy acquires a new WAL tail.
+	AdaptiveWriterAttempts  int64
+	AdaptiveWriterHoldMax   time.Duration
+	AdaptiveWriterBudgetMax time.Duration
+	Deferrals               int64 // attempts that gave up and backed off
+	Skips                   int64 // refused: bulk lease/connection, checkpoint in flight
+	Failures                int64 // driver/I/O errors (also backed off)
+	FramesReclaimed         int64 // WAL frames discarded by successful resets
+	BytesReclaimed          int64 // -wal bytes returned to the filesystem
+	PauseCount              int64
+	PauseTotal              time.Duration
+	PauseMax                time.Duration
+	PauseLast               time.Duration
+	ReaderWaits             int64
+	ReaderWaitTotal         time.Duration
+	ReaderWaitMax           time.Duration
+	Backoff                 time.Duration // current backoff after the last attempt
+	LastOutcome             string
+	LastReason              string
 	// Build-lane yield (checkpoint_cycle_yield.go): PASSIVE attempts deferred
 	// while a mutation cycle held the lane, reclaim attempts refused for the
 	// same reason, background attempts of either kind a cycle cut short, and
@@ -391,8 +398,13 @@ type walReclaimResult struct {
 	openGate    bool
 	// writerHold is the longest single hold of the writer; writerHolds
 	// counts the holds (the in-lane stage may take several short ones).
-	writerHold  time.Duration
-	writerHolds int
+	writerHold     time.Duration
+	writerHolds    int
+	writerSpent    time.Duration
+	adaptiveUsed   bool
+	adaptiveBudget time.Duration
+	adaptiveHold   time.Duration
+	slowTail       *walReclaimSlowTail
 	// openGateWaited is the writer-free wait for old readers (step 2).
 	openGateWaited time.Duration
 	// converged: step 2 backfilled the whole log (convergedFrames frames)
@@ -468,6 +480,12 @@ func (r walReclaimResult) stampSuffix() string {
 	if r.passDiscarded {
 		s += " pass_discarded=true"
 	}
+	if r.slowTail != nil {
+		s += fmt.Sprintf(" slow_copy_tail=true slow_copy=%s", r.slowTail.copyElapsed)
+	}
+	if r.adaptiveUsed {
+		s += fmt.Sprintf(" adaptive_budget=%s adaptive_hold=%s aggregate_writer_hold=%s", r.adaptiveBudget, r.adaptiveHold, r.writerSpent)
+	}
 	if r.pressure {
 		s += " pressure=true"
 	}
@@ -507,6 +525,11 @@ func (s *Store) reclaimWALOnce(cfg walReclaimConfig, ckptDB *sql.DB, walPath str
 		st.ThresholdBytes = cfg.thresholdBytes
 		st.LastOutcome = res.outcome.String()
 		st.LastReason = res.reason
+		if res.adaptiveUsed {
+			st.AdaptiveWriterAttempts++
+			st.AdaptiveWriterBudgetMax = max(st.AdaptiveWriterBudgetMax, res.adaptiveBudget)
+			st.AdaptiveWriterHoldMax = max(st.AdaptiveWriterHoldMax, res.adaptiveHold)
+		}
 		if res.writerHold > 0 {
 			st.WriterHoldLast = res.writerHold
 			st.WriterHoldMax = max(st.WriterHoldMax, res.writerHold)
@@ -879,6 +902,13 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 				at, walReclaimLastResortBytes(cfg), res.writerHold.Round(time.Millisecond), res.openGate, res.reason)
 		}()
 		s.walReclaim.update(func(st *WALReclaimStats) { st.LastResortRuns++ })
+	}
+	// An adaptive slice already used this attempt's completion opportunity.
+	// A subsequent last-resort/closed-gate phase must not mint another full
+	// two-second allowance; let a new attempt own that separate budget.
+	if res.adaptiveUsed {
+		res.reason = "adaptive_completion_deferred"
+		return errWALReclaimReadersInFlight
 	}
 	// Below: the last resort's long hold, or the closed-gate path (the
 	// open-gate stages disabled).
@@ -1426,12 +1456,16 @@ func (s *Store) walRemainderFits(res *walReclaimResult) bool {
 }
 
 func walHoldAllowedFrames(res *walReclaimResult) uint32 {
+	return walHoldAllowedFramesFor(res, walReclaimResetHold)
+}
+
+func walHoldAllowedFramesFor(res *walReclaimResult, budget time.Duration) uint32 {
 	allowed := walReclaimPressureSmallFrames
 	if c := res.convergence; c != nil && c.rateFramesPerS > 0 {
-		allowed = max(allowed, uint32(c.rateFramesPerS*(walReclaimResetHold/2).Seconds()))
+		allowed = max(allowed, uint32(c.rateFramesPerS*(budget/2).Seconds()))
 	}
 	if rate := walHoldCopyRate.Load(); rate > 0 {
-		allowed = max(allowed, uint32(min(float64(rate)*(walReclaimResetHold/2).Seconds(), 1<<24)))
+		allowed = max(allowed, uint32(min(float64(rate)*(budget/2).Seconds(), 1<<24)))
 	}
 	return allowed
 }
@@ -1464,6 +1498,24 @@ func noteWALHoldCopy(frames int64, took time.Duration) {
 // the backfill of what is left and, when that completes, the reset. done
 // reports the reset; (false, nil) hands the writer back for another round.
 func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult, first, yieldsToLane bool) (done bool, err error) {
+	budget := walReclaimResetHold
+	if res.adaptiveUsed {
+		budget = min(budget, walReclaimMaxWriterHold-res.writerSpent)
+		if budget <= 0 {
+			return false, errWALReclaimReadersInFlight
+		}
+	}
+	done, err = s.reclaimWALResetHoldOnce(ctx, cfg, ckptDB, res, first, yieldsToLane, budget)
+	if done || err != nil || ctx.Err() != nil {
+		return done, err
+	}
+	if budget := res.takeAdaptiveWriterBudget(); budget > 0 {
+		return s.reclaimWALResetHoldOnce(ctx, cfg, ckptDB, res, first, yieldsToLane, budget)
+	}
+	return done, err
+}
+
+func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult, first, yieldsToLane bool, budget time.Duration) (done bool, err error) {
 	if !res.urgent && s.writeWanted() {
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
 		return false, errWALReclaimWriterWaiting
@@ -1480,8 +1532,7 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 	writer.yieldToWriters = !res.urgent
 	defer func() {
 		writer.release()
-		res.writerHold = max(res.writerHold, writer.longest)
-		res.writerHolds++
+		res.recordWriterCredit(writer, budget > walReclaimResetHold)
 	}()
 	if hook := walIdleResetHook; hook != nil {
 		hook()
@@ -1490,10 +1541,13 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
 		return false, errWALCheckpointDeferredBulk
 	}
+	if budget > walReclaimResetHold && !res.adaptiveFrontierCurrent(s) {
+		return false, errWALReclaimReadersInFlight
+	}
 	if yieldsToLane && s.buildLaneBusy() {
 		return false, nil // an edit began while the gate was taken: hand it back
 	}
-	hctx, hcancel := context.WithDeadline(ctx, held.Add(walReclaimResetHold))
+	hctx, hcancel := context.WithDeadline(ctx, held.Add(budget))
 	defer hcancel()
 	yctx, stopYield := hctx, func() {}
 	if !res.urgent {
@@ -1503,11 +1557,15 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 	yielded := func() bool { return errors.Is(context.Cause(yctx), errWALReclaimWriterWaiting) }
 	// The hold copies only a small remainder (walHoldAllowedFrames).
 	snap, ok := readWALIndexSnapshot(s.dbPath)
-	if ok && snap.MxFrame > snap.NBackfill && snap.MxFrame-snap.NBackfill > walHoldAllowedFrames(res) {
+	if ok && snap.MxFrame > snap.NBackfill && snap.MxFrame-snap.NBackfill > walHoldAllowedFramesFor(res, budget) {
 		return false, nil // copy more without the writer first
 	}
 	copyStart := time.Now()
-	delta, derr := writer.passive(yctx, ctx, ckptDB, walReclaimResetHold/2, res.leaseOverride)
+	copyCredit := budget / 2
+	if budget > walReclaimResetHold {
+		copyCredit = budget - walReclaimResetHold
+	}
+	delta, derr := writer.passive(yctx, ctx, ckptDB, copyCredit, res.leaseOverride)
 	yctx = writer.resetContext(yctx)
 	if ok && (derr == nil || errors.Is(derr, errSQLiteCheckpointIncomplete)) {
 		noteWALHoldCopy(int64(delta.CheckpointedFrames)-int64(snap.NBackfill), time.Since(copyStart))
