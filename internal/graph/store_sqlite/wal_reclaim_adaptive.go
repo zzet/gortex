@@ -68,7 +68,10 @@ func (r *walReclaimResult) takeAdaptiveWriterBudget() time.Duration {
 		return 0
 	}
 	remaining := walReclaimMaxWriterHold - r.writerSpent
-	budget := min(2*r.slowTail.copyElapsed+walReclaimResetHold, remaining)
+	// A completed slow copy witnesses the need for completion credit, but
+	// its duration does not bound the next durable sync. Spend the existing
+	// remaining allowance once; fast copies release it immediately.
+	budget := remaining
 	if budget <= walReclaimResetHold {
 		return 0
 	}
