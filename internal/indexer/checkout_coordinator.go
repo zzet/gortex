@@ -667,6 +667,8 @@ type CheckoutCoordinator struct {
 	// importFoldPlanningBarrier delays read-only post-publication fold planning
 	// in admission tests; production has no barrier.
 	importFoldPlanningBarrier func(context.Context)
+	// importPublicationTailBarrier parks metadata cleanup after a retained route (tests only).
+	importPublicationTailBarrier func(context.Context)
 	// holdSample is a focused test seam for the working-copy sample a
 	// background cycle takes before it queues (holdBackgroundCycle); nil
 	// takes cycleSample.
@@ -3219,6 +3221,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		out.DirtyReused = true
 		out.DirtyGenerationID = cached
 		c.retainDirty(ctx, key, cached)
+		c.releaseImportPublicationLane(ctx)
 		c.releaseDirtyChain(ctx, previous, cached)
 		return nil
 	}
@@ -3267,6 +3270,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	// the row cannot render — dead weight in a bounded cache, evicting an
 	// entry that could still be hit.
 	c.retainDirty(ctx, builtKey, generationID)
+	c.releaseImportPublicationLane(ctx)
 	c.releaseDirtyChain(ctx, previous, generationID)
 	if out.DirtyBatchRemaining > 0 {
 		// One batch of a large working tree: routed (it is a state closer to

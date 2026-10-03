@@ -21,34 +21,40 @@ import (
 // continue arriving faster than one file can prepare, without replaying a
 // successful import or blocking the interactive lane for that file's work.
 func TestALargeWorkingTreeImportCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, false, false, false, false)
+	testSustainedImportProgress(t, false, false, false, false, false)
 }
 
 func TestALargeWorkingTreeImportWithInlineGoSemanticsCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, true, false, false, false)
+	testSustainedImportProgress(t, true, false, false, false, false)
 }
 
 // Catalog planning can outlast the same 40ms producer interval as private
 // payload preparation. Preserve the original producer, bounds and parity
 // oracle while making that pre-handoff delay deterministic.
 func TestImportPreambleCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, false, true, false, false)
+	testSustainedImportProgress(t, false, true, false, false, false)
 }
 
 // An import's post-publication fold prepares its materialized ancestry before
 // copying. This work must admit foreground requests while it is still private.
 func TestImportFoldPreparationCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, false, false, true, false)
+	testSustainedImportProgress(t, false, false, true, false, false)
 }
 
 // Demand queued at the initial grant must not cancel an eligible import before
 // it can establish private preparation. Keep the original sustained producer,
 // file-by-file progress, foreground latency, deadline and parity checks.
 func TestImportEarlyAdmissionQueuePreservesProgress(t *testing.T) {
-	testSustainedImportProgress(t, false, true, false, true)
+	testSustainedImportProgress(t, false, true, false, true, false)
 }
 
-func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPlanning, earlyDemand bool) {
+// Retained-route metadata cleanup must not monopolize the physical build lane.
+// Keep the original twelve files, three folds, 40ms SQL producer and all bounds.
+func TestImportPublicationTailAdmitsForegroundSQL(t *testing.T) {
+	testSustainedImportProgress(t, false, false, false, false, true)
+}
+
+func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPlanning, earlyDemand, slowPublicationTail bool) {
 	oldPaths := importInteractivePaths
 	importInteractivePaths = 4
 	t.Cleanup(func() { importInteractivePaths = oldPaths })
@@ -95,6 +101,9 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 	gate.Open()
 	outcomes := make(chan CheckoutCycle, 512)
 	var importing atomic.Bool
+	var publicationTailActive atomic.Bool
+	var publicationTails, publicationTailSQL atomic.Int64
+	var publicationTailWorst atomic.Int64
 	var cycleContext context.Context
 	c := f.coordinatorWithLogger(t, CheckoutCoordinatorConfig{
 		Gate:      gate,
@@ -133,6 +142,22 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 	}
 	if slowFoldPlanning {
 		c.importFoldPlanningBarrier = func(ctx context.Context) {
+			timer := time.NewTimer(150 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+		}
+	}
+	if slowPublicationTail {
+		c.importPublicationTailBarrier = func(ctx context.Context) {
+			if !importing.Load() {
+				return
+			}
+			publicationTails.Add(1)
+			publicationTailActive.Store(true)
+			defer publicationTailActive.Store(false)
 			timer := time.NewTimer(150 * time.Millisecond)
 			defer timer.Stop()
 			select {
@@ -294,6 +319,16 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 				}
 				// Exercise the shared writer while the import payload is private.
 				err = f.store.AtGeneration(0).SetRepoIndexState(graph.RepoIndexState{RepoPrefix: "interactive-probe"})
+				if err == nil && publicationTailActive.Load() {
+					publicationTailSQL.Add(1)
+					elapsed := time.Since(asked).Nanoseconds()
+					for {
+						before := publicationTailWorst.Load()
+						if elapsed <= before || publicationTailWorst.CompareAndSwap(before, elapsed) {
+							break
+						}
+					}
+				}
 				release()
 				if err != nil {
 					probeErr = err
@@ -394,6 +429,15 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 	}
 	if len(routedImported) != imported {
 		t.Errorf("the imported working tree claims %d imported files, want %d", len(routedImported), imported)
+	}
+	if slowPublicationTail {
+		t.Logf("publication-tail witness: parks=%d actual foreground SQL commits while parked=%d maxAcquireAndSQL=%s", publicationTails.Load(), publicationTailSQL.Load(), time.Duration(publicationTailWorst.Load()))
+		if publicationTails.Load() == 0 || publicationTailSQL.Load() == 0 {
+			t.Error("no actual foreground SQL committed while retained-route tail remained parked")
+		}
+		if time.Duration(publicationTailWorst.Load()) > 100*time.Millisecond {
+			t.Error("foreground admission plus real SQL exceeded100ms during retained-route metadata tail")
+		}
 	}
 	var worst time.Duration
 	for _, w := range waits {

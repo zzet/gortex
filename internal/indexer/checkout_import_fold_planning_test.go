@@ -85,6 +85,11 @@ func TestImportFoldPlanningRestoresFallbackAndDeclineOwnership(t *testing.T) {
 				t.Fatal("fold preparation barrier was not reached")
 			}
 			wantResumed := 1
+			if mode == "mutable_ancestry" {
+				// The fallback reacquires before payload mutation, releases its
+				// retained publication tail, then restores caller ownership.
+				wantResumed = 2
+			}
 			if mode == "cancelled" || mode == "reentry_failure" {
 				wantResumed = 0
 			}

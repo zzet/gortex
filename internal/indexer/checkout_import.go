@@ -123,6 +123,7 @@ func (c *CheckoutCoordinator) foldImportChain(
 		return
 	}
 	c.retainDirty(ctx, built.Key, built.GenerationID)
+	c.releaseImportPublicationLane(ctx)
 	c.releaseDirtyChain(ctx, previous, built.GenerationID)
 	out.DirtyGenerationID = built.GenerationID
 	out.DirtyChainDepth = 1
@@ -138,4 +139,17 @@ func (c *CheckoutCoordinator) importInProgress(ctx context.Context, parent int64
 	}
 	row, found, err := c.catalog.GetViewGeneration(ctx, parent)
 	return err == nil && found && strings.HasPrefix(row.LowerViewFingerprint, "partial:")
+}
+
+// releaseImportPublicationLane ends only the physical publication hold. The
+// route CAS and retention have succeeded; ancestry/cache bookkeeping is not
+// publication. The checkout cycle lock and existing ancestry/preparation
+// ownership remain. Every later fold mutation or route flip explicitly reenters.
+func (c *CheckoutCoordinator) releaseImportPublicationLane(ctx context.Context) {
+	if lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane); lane != nil {
+		lane.leave()
+		if c.importPublicationTailBarrier != nil {
+			c.importPublicationTailBarrier(ctx)
+		}
+	}
 }
