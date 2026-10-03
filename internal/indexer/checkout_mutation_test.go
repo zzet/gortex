@@ -100,7 +100,8 @@ func TestCheckoutMutationPublishesOnlyDirtyLayerAndPreservesPinnedView(t *testin
 }
 
 func TestCheckoutMutationRejectsWrongRootEpochAndExternalChanges(t *testing.T) {
-	f, _, l := newCheckoutMutationFixture(t)
+	f, c, l := newCheckoutMutationFixture(t)
+	headProof := c.sampler.CaptureHeadEvidence().Usable()
 	before := f.route()
 	for _, tc := range []struct {
 		root  string
@@ -126,18 +127,31 @@ func TestCheckoutMutationRejectsWrongRootEpochAndExternalChanges(t *testing.T) {
 		t.Fatalf("external edit between begin and prepare was not refused: %v", err)
 	}
 	m.Close()
-	// A tree already stale at admission: admission samples nothing, so the
-	// lease is granted and the write's own sample refuses it before any byte
-	// is written.
+	// With usable HEAD evidence, admission grants a lease without sampling;
+	// Prepare samples and refuses stale disk. Without that evidence admission
+	// must sample, discover the stale tree, and refuse without any lease.
 	stale, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, before.RouteEpoch)
-	if err != nil {
-		t.Fatalf("admission over a stale tree: %v", err)
-	}
-	if err := stale.Prepare(t.Context()); !errors.Is(err, ErrCheckoutMutationStale) {
+	if !headProof {
+		if stale != nil {
+			stale.Close()
+			t.Fatal("unsupported HEAD evidence admitted a lease over stale disk")
+		}
+		if !errors.Is(err, ErrCheckoutMutationStale) {
+			t.Fatalf("stale disk at admission was not refused: %v", err)
+		}
+	} else {
+		if err != nil {
+			t.Fatalf("admission over a stale tree: %v", err)
+		}
+		if err := stale.Prepare(t.Context()); !errors.Is(err, ErrCheckoutMutationStale) {
+			stale.Close()
+			t.Fatalf("stale disk at admission was not refused before the write: %v", err)
+		}
 		stale.Close()
-		t.Fatalf("stale disk at admission was not refused before the write: %v", err)
 	}
-	stale.Close()
+	if got, err := os.ReadFile(filepath.Join(f.worktree, "helper.go")); err != nil || string(got) != "package fixture\n\nfunc ExternalEdit() {}\n" {
+		t.Fatalf("refused mutation changed external source: %q, %v", got, err)
+	}
 	if f.route() != before {
 		t.Fatal("rejected mutations changed the catalog route")
 	}

@@ -107,23 +107,45 @@ func TestPrepublishReadSetAcceptsAnUnrelatedNewFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	confirmedBefore, _ := readSetCounts()
+	probe, err := sampler.Sample(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := sampler.ConfirmReadSet(context.Background(), probe, nil, nil)
+	if err != nil || (!proof.Confirmed && proof.Reason != "the checkout's filesystem gives no change stamps") {
+		t.Fatalf("fixture cannot establish read-set capability: %+v, %v", proof, err)
+	}
+	confirmedBefore, fallbackBefore := readSetCounts()
 	takenBefore := sampler.SamplesTaken()
 	generationID, err := buildReadSetLayer(t, store, repoDir, sampler, func() {
 		builderWriteFile(t, repoDir, "other/d.go", "package other\n\nfunc D() {}\n")
 	})
-	if err != nil {
+	wantConfirmed, wantFallback, wantSamples := confirmedBefore+1, fallbackBefore, uint64(1)
+	if !proof.Confirmed {
+		// Without change stamps the full sample cannot prove this file was
+		// unrelated to the payload. It must refuse, not publish stale evidence.
+		if !errors.Is(err, ErrDirtySnapshotChanged) {
+			t.Fatalf("unsupported read-set proof did not refuse the changed sample: %v", err)
+		}
+		wantConfirmed, wantFallback, wantSamples = confirmedBefore, fallbackBefore+1, 2
+	} else if err != nil {
 		t.Fatalf("an unrelated new file refused the publish: %v", err)
 	}
-	if confirmed, _ := readSetCounts(); confirmed != confirmedBefore+1 {
-		t.Fatalf("read-set confirmations = %d, want %d", confirmed, confirmedBefore+1)
+	if confirmed, fallback := readSetCounts(); confirmed != wantConfirmed || fallback != wantFallback {
+		t.Fatalf("read-set counts = %d/%d, want %d/%d", confirmed, fallback, wantConfirmed, wantFallback)
 	}
-	if taken := sampler.SamplesTaken() - takenBefore; taken != 1 {
-		t.Fatalf("the build took %d working-copy samples, want 1 (the read set replaces the second)", taken)
+	if taken := sampler.SamplesTaken() - takenBefore; taken != wantSamples {
+		t.Fatalf("the build took %d working-copy samples, want %d", taken, wantSamples)
 	}
 	row, found, err := store.Catalog().GetViewGeneration(context.Background(), generationID)
-	if err != nil || !found || row.PublishedAt == 0 {
-		t.Fatalf("generation %d not published: found=%v row=%+v err=%v", generationID, found, row, err)
+	if err != nil || !found {
+		t.Fatalf("generation %d missing: found=%v row=%+v err=%v", generationID, found, row, err)
+	}
+	if proof.Confirmed && row.PublishedAt == 0 {
+		t.Fatalf("confirmed generation %d not published: %+v", generationID, row)
+	}
+	if !proof.Confirmed && (row.PublishedAt != 0 || row.State != store_sqlite.ViewGenerationFailed) {
+		t.Fatalf("unsupported confirmation published or retained a servable generation: %+v", row)
 	}
 	next, err := sampler.Sample(context.Background())
 	if err != nil {

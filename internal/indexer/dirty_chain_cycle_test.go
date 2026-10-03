@@ -307,6 +307,7 @@ func TestCycleSharesOneWorkingCopySample(t *testing.T) {
 	// every cycle here is the one the test runs; the fixture has already
 	// brought both slots up.
 	f, c, _ := newCheckoutMutationFixture(t)
+	confirmsReadSet := coordinatorReadSetCapability(t, c)
 	ctx := context.Background()
 	cycle := func() CheckoutCycle {
 		t.Helper()
@@ -326,9 +327,14 @@ func TestCycleSharesOneWorkingCopySample(t *testing.T) {
 	// One sample decides the settle check, the reconcile, the slot and the
 	// build's change set; the pre-publish fence confirms the build's read set
 	// against it without another (confirmDirtyBuildInputs).
-	if got := c.sampler.SamplesTaken() - before; got != 1 {
-		t.Fatalf("a working-tree build cycle took %d samples, want 1 (shared; the fence is the read set)", got)
+	wantSamples := uint64(1)
+	if !confirmsReadSet {
+		wantSamples++ // Unsupported change stamps require a full prepublish sample.
 	}
+	if got := c.sampler.SamplesTaken() - before; got != wantSamples {
+		t.Fatalf("a working-tree build cycle took %d samples, want %d (shared decision sample plus required prepublish fallback)", got, wantSamples)
+	}
+	chainAssertFlat(t, f, "shared working-copy sample")
 
 	// A refresh ticket served by a settled cycle: the ticket's own capture
 	// sample, the cycle's one sample, and no re-sample at completion.
