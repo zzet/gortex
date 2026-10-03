@@ -212,33 +212,72 @@ func (s *Store) BeginChainFold(ctx context.Context, req ChainFoldRequest) (*Chai
 		member: len(req.Chain) - 1, phase: foldPhasePrepare,
 		hiddenPaths: map[string]struct{}{}, hiddenIDs: map[string]struct{}{}, hiddenSources: map[string]struct{}{},
 	}
-	// The destination must be empty, proved in a transaction of its own.
-	err = s.withFoldTx(ctx, req.To, func(ctx context.Context, tx *sql.Tx) error {
-		empty, err := generationPayloadEmptyTx(ctx, tx, req.To)
-		if err != nil {
-			return err
-		}
-		if !empty {
-			return fmt.Errorf("%w: generation %d", ErrGenerationBulkLoadPopulated, req.To)
-		}
-		shapes, err := payloadRowTables(ctx, tx)
-		if err != nil {
-			return err
-		}
-		f.shapes = shapes
-		return nil
-	})
+
+	// Prepare the immutable table shapes and key layout without holding the
+	// writer. A slow catalog query must not repeatedly lose its entire work to
+	// foreground writes before the first fold step can begin.
+	metadata, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		flight.Complete(err)
 		return fail(err)
 	}
-	for _, shape := range f.shapes {
-		keys, err := s.chainFoldKeys(shape.table)
-		if err != nil {
-			flight.Complete(err)
-			return fail(err)
+	prepare := func() error {
+		defer metadata.Rollback() //nolint:errcheck // read-only metadata snapshot; explicit close below
+		if chainFoldMetadataHook != nil {
+			if err := chainFoldMetadataHook(ctx, false); err != nil {
+				return err
+			}
 		}
-		f.keys = append(f.keys, keys)
+		var schema int
+		if err := metadata.QueryRowContext(ctx, "PRAGMA schema_version").Scan(&schema); err != nil {
+			return err
+		}
+		shapes, err := payloadRowTables(ctx, metadata)
+		if err != nil {
+			return err
+		}
+		f.shapes = shapes
+		for _, shape := range shapes {
+			keys, err := chainFoldKeys(ctx, metadata, shape.table)
+			if err != nil {
+				return err
+			}
+			f.keys = append(f.keys, keys)
+		}
+		if err := metadata.Rollback(); err != nil {
+			if canceled := ctx.Err(); canceled != nil {
+				return canceled
+			}
+			return err
+		}
+		if chainFoldMetadataHook != nil {
+			if err := chainFoldMetadataHook(ctx, true); err != nil {
+				return err
+			}
+		}
+		// Recheck the shape snapshot and destination in the same transaction that
+		// protects empty admission. Schema changes retry within the existing bounds.
+		return s.withFoldTx(ctx, req.To, func(ctx context.Context, tx *sql.Tx) error {
+			var current int
+			if err := tx.QueryRowContext(ctx, "PRAGMA schema_version").Scan(&current); err != nil {
+				return err
+			}
+			if current != schema {
+				return fmt.Errorf("%w: payload schema changed during preparation", ErrChainFoldYielded)
+			}
+			empty, err := generationPayloadEmptyTx(ctx, tx, req.To)
+			if err != nil {
+				return err
+			}
+			if !empty {
+				return fmt.Errorf("%w: generation %d", ErrGenerationBulkLoadPopulated, req.To)
+			}
+			return nil
+		})
+	}
+	if err := prepare(); err != nil {
+		flight.Complete(err)
+		return fail(err)
 	}
 	return f, nil
 }
@@ -246,13 +285,25 @@ func (s *Store) BeginChainFold(ctx context.Context, req ChainFoldRequest) (*Chai
 // chainFoldKeys is the column list a table's rows are paged by within one
 // generation: its primary key without the generation column, or the table's
 // id where the key is the row's physical id.
-func (s *Store) chainFoldKeys(table string) ([]string, error) {
+func chainFoldKeys(ctx context.Context, tx *sql.Tx, table string) ([]string, error) {
 	switch table {
 	case "nodes", "edges":
 		return []string{"id"}, nil // nodes_by_generation / edges_by_generation
 	}
-	pk, err := s.primaryKeyColumns(table)
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk`, table)
 	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var pk []string
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return nil, err
+		}
+		pk = append(pk, column)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	var keys []string
@@ -757,3 +808,8 @@ func copyFTSDocidsTx(ctx context.Context, tx *sql.Tx, docidMap ftsDocidMap, to i
 	}
 	return moved, nil
 }
+
+// chainFoldMetadataHook is a serialized test seam: false before metadata reads,
+// true after the read transaction closes and before writer admission.
+// Production leaves it nil.
+var chainFoldMetadataHook func(context.Context, bool) error
