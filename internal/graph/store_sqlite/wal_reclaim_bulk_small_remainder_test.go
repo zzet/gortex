@@ -19,6 +19,9 @@ import (
 // writer-free. This is a VFS boundary delay, not an actual OS latency claim.
 func TestBulkCompletionConvergesUnmeasuredTailBeforeWriterCredit(t *testing.T) {
 	var walSyncs atomic.Int32
+	var writes atomic.Int64
+	secondSyncEntered := make(chan struct{})
+	var writesDuringSecondSync int64
 	var secondMu sync.Mutex
 	var secondBefore, secondAfter walIndexSnapshot
 	var secondAfterOK bool
@@ -84,7 +87,12 @@ func TestBulkCompletionConvergesUnmeasuredTailBeforeWriterCredit(t *testing.T) {
 				break
 			}
 		}
+		// Capture the planted tail before unrelated commits can change its premise.
+		// The real producer then remains active throughout this parked WAL sync.
+		close(secondSyncEntered)
+		beforeWrites := writes.Load()
 		time.Sleep(walReclaimMaxWriterHold + 500*time.Millisecond)
+		writesDuringSecondSync = writes.Load() - beforeWrites
 	}
 	var releaseOnce sync.Once
 	unpark := func() { releaseOnce.Do(func() { close(release) }) }
@@ -143,12 +151,16 @@ func TestBulkCompletionConvergesUnmeasuredTailBeforeWriterCredit(t *testing.T) {
 		cancel()
 		require.NoError(t, err)
 	}
-	var writes atomic.Int64
 	var worstForeground atomic.Int64
 	var producerErr error
 	producerStarted = true
 	go func() {
 		defer close(producerJoined)
+		select {
+		case <-producerCtx.Done():
+			return
+		case <-secondSyncEntered:
+		}
 		for {
 			select {
 			case <-producerCtx.Done():
@@ -213,8 +225,9 @@ func TestBulkCompletionConvergesUnmeasuredTailBeforeWriterCredit(t *testing.T) {
 	frontier, frontierOK := secondAfter, secondAfterOK
 	copied, scanErr, observed := secondResult, secondScanErr, secondObserved
 	secondMu.Unlock()
-	t.Logf("bulk=%v pressure=%v outcome=%v reason=%s second_sync_stage=%s planted_tail=%d second_checkpoint_post_return_frontier=%+v valid=%v actual_scan_tuple=%+v scan_error=%v observed=%v convergence=%v actual_writer_hold=%s writes_at_return=%d final_writes=%d foreground_gate_SQL_max=%s producer_error=%v", result.bulkCompletion, result.pressure, result.outcome, result.reason, secondStage, secondTail, frontier, frontierOK, copied, scanErr, observed, result.convergence, result.writerHold, writesAtReturn, writes.Load(), time.Duration(worstForeground.Load()), producerErr)
+	t.Logf("bulk=%v pressure=%v outcome=%v reason=%s second_sync_stage=%s planted_tail=%d second_checkpoint_post_return_frontier=%+v valid=%v actual_scan_tuple=%+v scan_error=%v observed=%v convergence=%v actual_writer_hold=%s writes_at_return=%d final_writes=%d foreground_gate_SQL_max=%s producer_error=%v writes_during_second_sync=%d", result.bulkCompletion, result.pressure, result.outcome, result.reason, secondStage, secondTail, frontier, frontierOK, copied, scanErr, observed, result.convergence, result.writerHold, writesAtReturn, writes.Load(), time.Duration(worstForeground.Load()), producerErr, writesDuringSecondSync)
 	require.NoError(t, producerErr)
+	require.Positive(t, writesDuringSecondSync, "actual commits must continue during the parked writer-free copy")
 	require.True(t, result.bulkCompletion)
 	require.False(t, result.pressure, "bulk lease override retains its own policy")
 	require.Greater(t, secondTail, walReclaimPressureSmallFrames)
