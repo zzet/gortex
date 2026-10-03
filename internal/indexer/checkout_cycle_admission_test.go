@@ -102,7 +102,8 @@ func TestObservedChangeCycleOpensAPublicationRecord(t *testing.T) {
 
 func TestCycleReportsTheLaneHolderItWaitedFor(t *testing.T) {
 	_, c, _ := newCheckoutMutationFixture(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	builderWriteFile(t, c.root, "helper.go", chainHelperEdit)
 
 	// Another builder holds the lane and says what it is.
@@ -116,15 +117,29 @@ func TestCycleReportsTheLaneHolderItWaitedFor(t *testing.T) {
 	}
 	done := make(chan CheckoutCycle, 1)
 	c.cycleDone = func(out CheckoutCycle) { done <- out }
-	go c.cycle(ctx)
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		c.cycle(ctx)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-returned:
+		case <-time.After(30 * time.Second):
+			t.Error("the cycle did not return after cancellation")
+		}
+	}()
 	const held = 150 * time.Millisecond
 	time.Sleep(held)
 	withdraw()
 	release()
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
 	var out CheckoutCycle
 	select {
 	case out = <-done:
-	case <-time.After(30 * time.Second):
+	case <-deadline.C:
 		t.Fatal("the cycle never finished")
 	}
 	if !out.DirtyBuilt {
@@ -134,6 +149,13 @@ func TestCycleReportsTheLaneHolderItWaitedFor(t *testing.T) {
 	if a.Lane < held/2 || a.LaneHeldBy == nil || a.LaneHeldBy.Kind != "ref_view_build" ||
 		a.LaneHeldBy.CheckoutID != "elsewhere" || a.LaneHeldBy.Generation != 42 {
 		t.Fatalf("the cycle's admission = %+v (holder %+v), want a lane wait attributed to the ref view build", a, a.LaneHeldBy)
+	}
+	// cycleDone reports publication before cycle's deferred holder and lane
+	// cleanup. Join the actual return before inspecting the released lane.
+	select {
+	case <-returned:
+	case <-deadline.C:
+		t.Fatal("the reported cycle never returned")
 	}
 	if holder := c.gate.Stats().Holder; holder != nil {
 		t.Fatalf("a released lane still names a holder: %+v", holder)
