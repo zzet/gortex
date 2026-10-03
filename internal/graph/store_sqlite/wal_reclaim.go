@@ -92,7 +92,9 @@ const (
 	// the open-gate stages disabled) keeps the application writer. The
 	// open-gate stages normally use walReclaimResetHold (50 ms); an urgent
 	// attempt with a proven slow-copy tail may take one adaptive completion
-	// slice, sharing this two-second cap with all its prior holds. The
+	// slice, sharing this two-second cap with all its prior holds. An admitted
+	// over-ceiling bulk override uses the existing two-second completion hold
+	// with the read gate open, before continuous writes grow the log further. The
 	// wait for old readers runs without the writer, which is taken only for
 	// the final backfill and the reset. A queued write or an announced
 	// mutation (AnnounceWrite) ends a hold at once.
@@ -122,7 +124,8 @@ const (
 	// for the readers admitted before its copy, and logs it: the one step
 	// that bounds the log when writes never leave a gap long enough for the
 	// short holds. Below it, no attempt holds the writer longer than
-	// walReclaimResetHold, except for that proven urgent slow-copy tail.
+	// walReclaimResetHold, except for that proven urgent slow-copy tail or an
+	// admitted over-ceiling bulk completion.
 	walReclaimLastResortFactor = 4
 )
 
@@ -419,6 +422,9 @@ type walReclaimResult struct {
 	// lastResort: the log is at walReclaimLastResortBytes; this attempt may
 	// hold the writer up to walReclaimMaxWriterHold (logged).
 	lastResort bool
+	// bulkCompletion: an admitted over-ceiling bulk lease override may finish
+	// a reader-pinned tail inside the same bounded, open-read-gate hold.
+	bulkCompletion bool
 	// resetWriterFree: step 2's TRUNCATE reset the log without the
 	// application writer.
 	resetWriterFree bool
@@ -652,7 +658,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		return walReclaimResult{outcome: walReclaimSkipped, reason: "copy_budget"}
 	}
 
-	res := walReclaimResult{bytesBefore: walFileSize(walPath), leaseOverride: leaseOverride, began: true, copy: attempt.copy, pressure: pressure, hardCap: hardCap}
+	res := walReclaimResult{bytesBefore: walFileSize(walPath), leaseOverride: leaseOverride, began: true, copy: attempt.copy, pressure: pressure, hardCap: hardCap, bulkCompletion: leaseOverride}
 	if mark := walReclaimLastResortBytes(cfg); mark > 0 && res.bytesBefore >= mark {
 		res.lastResort = true
 	}
@@ -680,7 +686,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	// An attempt that runs through a busy lane (the pressure mark, the hard
 	// cap) goes straight to its converged copy and short hold below: it must
 	// not spend the reader wait inside an edit's burst.
-	if !pressure && !hardCap && !res.lastResort && !walReclaimSkipQuiescence && !walReclaimSkipOpenGate && s.readGate != nil && cfg.readerWait > 0 {
+	if !pressure && !hardCap && !res.lastResort && !res.bulkCompletion && !walReclaimSkipQuiescence && !walReclaimSkipOpenGate && s.readGate != nil && cfg.readerWait > 0 {
 		started := time.Now()
 		deadline := started.Add(cfg.readerWait)
 		// The rounds end when the log reaches the last resort's mark: the
@@ -892,8 +898,14 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
 		return errWALReclaimWriterWaiting
 	}
-	if !res.lastResort && !walReclaimSkipQuiescence && s.readGate != nil && !walReclaimSkipOpenGate && cfg.readerWait > 0 {
+	if !res.lastResort && !res.bulkCompletion && !walReclaimSkipQuiescence && s.readGate != nil && !walReclaimSkipOpenGate && cfg.readerWait > 0 {
 		return s.reclaimWALInLaneOpenGate(ctx, cfg, ckptDB, res)
+	}
+	if res.bulkCompletion && !res.lastResort {
+		defer func() {
+			log.Printf("store_sqlite: wal reclaim bulk completion ceiling=%d writer_hold=%s reset=%t reason=%q",
+				cfg.ceilingBytes, res.writerHold.Round(time.Millisecond), res.openGate, res.reason)
+		}()
 	}
 	if res.lastResort {
 		at := walFileSize(s.dbPath + "-wal")
@@ -910,7 +922,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		res.reason = "adaptive_completion_deferred"
 		return errWALReclaimReadersInFlight
 	}
-	// Below: the last resort's long hold, or the closed-gate path (the
+	// Below: the last resort or over-ceiling bulk completion hold, or the closed-gate path (the
 	// open-gate stages disabled).
 	// 3. Writer quiescence, capped at walReclaimMaxWriterHold from here on.
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
@@ -981,7 +993,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		return errWALReclaimNothing
 	}
 
-	// 5. The last resort (the log at walReclaimLastResortBytes): with writes
+	// 5. The last resort or admitted over-ceiling bulk completion: with writes
 	// stopped, finish converging inside the hold cap: if step
 	// 2 converged and nothing was committed since, no reader in flight can pin
 	// the log and the reset needs no wait; otherwise backfill, wait out the
@@ -990,7 +1002,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	quiesce := !walReclaimSkipQuiescence && s.readGate != nil
 	openGate := quiesce && !walReclaimSkipOpenGate && cfg.readerWait > 0
 	if openGate {
-		// Only the last resort reaches here with the open-gate stages on
+		// Only the last resort or bulk completion reaches here with the open-gate stages on
 		// (see reclaimWALInLane): the writer stays held, up to
 		// walReclaimMaxWriterHold, while the readers admitted before the
 		// backfill end.
