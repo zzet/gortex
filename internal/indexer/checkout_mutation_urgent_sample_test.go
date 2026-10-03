@@ -47,7 +47,7 @@ func TestCheckoutMutationPrepareSamplesAsAnUrgentCaller(t *testing.T) {
 // refused as a moved route, which the caller may select again for. A HEAD
 // change is not one: with usable HEAD file evidence admission samples
 // nothing, and Prepare refuses it. Without that proof admission samples
-// and may only establish a conservative stale HEAD-or-base refusal.
+// and still distinguishes catalog motion from a stale HEAD or disk sample.
 func TestCheckoutMutationAdmissionNamesAMovedRoute(t *testing.T) {
 	f, _, l := newCheckoutMutationFixture(t)
 	route := f.route()
@@ -62,9 +62,6 @@ func TestCheckoutMutationAdmissionNamesAMovedRoute(t *testing.T) {
 		t.Fatal("release request was not accepted")
 	}
 	wantErr := ErrCheckoutMutationRouteMoved
-	if !fixture.coordinator.sampler.CaptureHeadEvidence().Usable() {
-		wantErr = ErrCheckoutMutationStale
-	}
 	if m, err := fixture.lifecycle.BeginCheckoutMutation(t.Context(), fixture.family.checkoutID, fixture.family.worktree, fixture.route.RouteEpoch); m != nil || !errors.Is(err, wantErr) {
 		if m != nil {
 			m.Close()

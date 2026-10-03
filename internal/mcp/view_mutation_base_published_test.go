@@ -32,37 +32,49 @@ import (
 // the recomposed route: the first edit after the publication is written and
 // served, not refused.
 func TestFirstEditAfterTheCommittedBasePublishesLands(t *testing.T) {
-	fixture, publisher, prefix := newBasePublishingMutationFixture(t)
-	ctx := context.Background()
-	before, _, err := fixture.store.Catalog().GetCheckoutRoute(ctx, fixture.checkoutID)
-	require.NoError(t, err)
-
-	published := false
-	previous := mutationBeforeAdmission
-	mutationBeforeAdmission = func(context.Context) {
-		if published {
-			return
+	for _, sampledAdmission := range []bool{false, true} {
+		name := "native HEAD evidence"
+		if sampledAdmission {
+			name = "sampled HEAD admission"
 		}
-		published = true
-		out := publisher.PublishRepo(ctx, prefix)
-		require.NoError(t, out.Err)
-		require.Empty(t, out.Skipped, "the committed base was not published: %s", out.Skipped)
-		require.Positive(t, out.GenerationID)
-	}
-	t.Cleanup(func() { mutationBeforeAdmission = previous })
+		t.Run(name, func(t *testing.T) {
+			fixture, publisher, prefix := newBasePublishingMutationFixture(t)
+			if sampledAdmission {
+				// Disable only the stat-based proof; Git retains its configured files ref store.
+				require.NoError(t, os.Mkdir(filepath.Join(fixture.primary, ".git", "reftable"), 0o755))
+			}
+			ctx := context.Background()
+			before, _, err := fixture.store.Catalog().GetCheckoutRoute(ctx, fixture.checkoutID)
+			require.NoError(t, err)
 
-	written := fixture.edit(t, fixture.worktree, map[string]any{
-		"path": "repo/edit.go", "old_string": "func New() {}", "new_string": "func AfterThePublication() {}",
-	})
-	require.True(t, published, "the base publication was never injected")
-	require.False(t, written.IsError, viewResultText(t, written))
-	data, err := os.ReadFile(filepath.Join(fixture.worktree, "edit.go"))
-	require.NoError(t, err)
-	require.Contains(t, string(data), "func AfterThePublication() {}")
-	after, _, err := fixture.store.Catalog().GetCheckoutRoute(ctx, fixture.checkoutID)
-	require.NoError(t, err)
-	require.NotEqual(t, before.RouteEpoch, after.RouteEpoch, "the route was never recomposed over the published base")
-	fixture.awaitMutation(t, fixture.worktree, written)
+			published := false
+			previous := mutationBeforeAdmission
+			mutationBeforeAdmission = func(context.Context) {
+				if published {
+					return
+				}
+				published = true
+				out := publisher.PublishRepo(ctx, prefix)
+				require.NoError(t, out.Err)
+				require.Empty(t, out.Skipped, "the committed base was not published: %s", out.Skipped)
+				require.Positive(t, out.GenerationID)
+			}
+			t.Cleanup(func() { mutationBeforeAdmission = previous })
+
+			written := fixture.edit(t, fixture.worktree, map[string]any{
+				"path": "repo/edit.go", "old_string": "func New() {}", "new_string": "func AfterThePublication() {}",
+			})
+			require.True(t, published, "the base publication was never injected")
+			require.False(t, written.IsError, viewResultText(t, written))
+			data, err := os.ReadFile(filepath.Join(fixture.worktree, "edit.go"))
+			require.NoError(t, err)
+			require.Contains(t, string(data), "func AfterThePublication() {}")
+			after, _, err := fixture.store.Catalog().GetCheckoutRoute(ctx, fixture.checkoutID)
+			require.NoError(t, err)
+			require.NotEqual(t, before.RouteEpoch, after.RouteEpoch, "the route was never recomposed over the published base")
+			fixture.awaitMutation(t, fixture.worktree, written)
+		})
+	}
 }
 
 // newBasePublishingMutationFixture is newRealCheckoutMutationFixture with the
