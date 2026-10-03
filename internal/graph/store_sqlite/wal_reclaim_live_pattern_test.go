@@ -325,6 +325,41 @@ func TestWALReclaimDelaysAMutationAtMostTheWriterHoldCap(t *testing.T) {
 			var maxWait, maxTotal atomic.Int64
 			var writes atomic.Int64
 			var writeErr atomic.Value
+			type mutationStages struct {
+				started                             time.Time
+				gate, begin, update, commit, unlock time.Duration
+				total                               time.Duration
+			}
+			var worst mutationStages // The single producer is joined before reading.
+			writeObserved := func(k int) (stages mutationStages, err error) {
+				stages.started = time.Now()
+				stage := time.Now()
+				s.writeMu.Lock()
+				stages.gate = time.Since(stage)
+				defer func() {
+					stage = time.Now()
+					s.writeMu.Unlock()
+					stages.unlock = time.Since(stage)
+					stages.total = time.Since(stages.started)
+				}()
+				stage = time.Now()
+				tx, err := s.writerDB.Begin()
+				stages.begin = time.Since(stage)
+				if err != nil {
+					return stages, err
+				}
+				stage = time.Now()
+				_, err = tx.Exec(`UPDATE wal_churn SET payload = randomblob(1024) WHERE id % 16 = ?`, k%16)
+				stages.update = time.Since(stage)
+				if err != nil {
+					_ = tx.Rollback()
+					return stages, err
+				}
+				stage = time.Now()
+				err = tx.Commit()
+				stages.commit = time.Since(stage)
+				return stages, err
+			}
 			var wg sync.WaitGroup
 			wg.Add(1)
 			go func() { // a mutation stream
@@ -335,13 +370,14 @@ func TestWALReclaimDelaysAMutationAtMostTheWriterHoldCap(t *testing.T) {
 						return
 					default:
 					}
-					// The wait for the write gate, as the long-reader case
-					// measures it; the write itself is timed apart.
+					// This first gate acquisition is a probe. The actual mutation
+					// takes the gate again; log its stages separately.
 					start := time.Now()
 					s.writeMu.Lock()
 					gate := time.Since(start)
 					s.writeMu.Unlock()
-					if err := churnWriteOnce(s, k); err != nil {
+					observed, err := writeObserved(k)
+					if err != nil {
 						writeErr.Store(err)
 						return
 					}
@@ -351,6 +387,9 @@ func TestWALReclaimDelaysAMutationAtMostTheWriterHoldCap(t *testing.T) {
 					if d := int64(time.Since(start)); d > maxTotal.Load() {
 						maxTotal.Store(d)
 					}
+					if observed.total > worst.total {
+						worst = observed
+					}
 					writes.Add(1)
 					time.Sleep(50 * time.Millisecond)
 				}
@@ -358,10 +397,11 @@ func TestWALReclaimDelaysAMutationAtMostTheWriterHoldCap(t *testing.T) {
 			res := s.reclaimWALOnce(cfg, ckpt, path+"-wal")
 			close(stop)
 			wg.Wait()
+			t.Logf("actual mutation stages: started=%s second_gate=%s begin=%s update=%s commit=%s unlock=%s total=%s", worst.started.UTC().Format(time.RFC3339Nano), worst.gate, worst.begin, worst.update, worst.commit, worst.unlock, worst.total)
 			if err, _ := writeErr.Load().(error); err != nil {
 				t.Fatalf("a mutation failed during the reclaim: %v", err)
 			}
-			t.Logf("outcome=%s reason=%q open_gate=%q writer_hold=%s writer_holds=%d max_gate_wait=%s max_mutation=%s writes=%d", res.outcome, res.reason, res.openGateReport, res.writerHold, res.writerHolds, time.Duration(maxWait.Load()), time.Duration(maxTotal.Load()), writes.Load())
+			t.Logf("outcome=%s reason=%q open_gate=%q writer_hold=%s writer_holds=%d max_probe_gate_wait=%s max_mutation=%s writes=%d", res.outcome, res.reason, res.openGateReport, res.writerHold, res.writerHolds, time.Duration(maxWait.Load()), time.Duration(maxTotal.Load()), writes.Load())
 			require.LessOrEqual(t, res.writerHold, walReclaimResetHold+raceSlack(50*time.Millisecond), "the writer was held past the short hold")
 			require.LessOrEqual(t, time.Duration(maxWait.Load()), walReclaimResetHold+raceSlack(50*time.Millisecond), "a mutation waited for the gate past the short hold")
 			require.Greater(t, writes.Load(), int64(10), "mutations kept flowing while the reclaim waited for the old reader")
