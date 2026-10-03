@@ -59,7 +59,7 @@ type symbolPageReplay struct {
 }
 type symbolPageSequence struct {
 	token                      chan struct{}
-	id, identity               string
+	id, identity, firstSeed    string
 	created                    time.Time
 	query                      string
 	owner                      *sessionState
@@ -149,11 +149,34 @@ func (cache *symbolPageCache) lookup(id string) *symbolPageSequence {
 	return entry
 }
 func (cache *symbolPageCache) add(entry *symbolPageSequence) bool {
+	_, added := cache.publishFirst(entry)
+	return added
+}
+
+// First-page publication chooses one live sequence for an identical full
+// retrieval seed. Random IDs remain lifetime-scoped: retirement or expiry
+// never recreates the ownership of an earlier cursor.
+func (cache *symbolPageCache) publishFirst(entry *symbolPageSequence) (*symbolPageSequence, bool) {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	if cache.closed {
 		entry.retire()
-		return false
+		return nil, false
+	}
+	if entry.firstSeed != "" {
+		for _, id := range append([]string(nil), cache.order...) {
+			existing := cache.entries[id]
+			if existing == nil || existing.firstSeed != entry.firstSeed {
+				continue
+			}
+			if existing.retired.Load() || time.Since(existing.created) >= symbolPageTTL {
+				delete(cache.entries, id)
+				cache.order = slices.DeleteFunc(cache.order, func(key string) bool { return key == id })
+				existing.retire()
+				continue
+			}
+			return existing, true
+		}
 	}
 	for len(cache.order) >= symbolPageCacheEntries {
 		cache.entries[cache.order[0]].retire()
@@ -162,8 +185,27 @@ func (cache *symbolPageCache) add(entry *symbolPageSequence) bool {
 	}
 	cache.entries[entry.id] = entry
 	cache.order = append(cache.order, entry.id)
-	return true
+	return entry, true
 }
+
+func symbolFirstPageSeed(identity string, template []byte, candidates []symbolPageCandidate, horizon int, more bool) string {
+	hash := sha256.New()
+	write := func(raw []byte) {
+		_, _ = hash.Write(raw)
+		_, _ = hash.Write([]byte{0})
+	}
+	write([]byte(identity))
+	write(template)
+	write([]byte(fmt.Sprintf("%d:%t", horizon, more)))
+	for _, candidate := range candidates {
+		write([]byte(candidate.id))
+		write(candidate.node)
+		write(candidate.row)
+		write(candidate.rank)
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
 func symbolPageError(reason string) *mcplib.CallToolResult {
 	return mcplib.NewToolResultError("search cursor " + reason + "; restart the query without cursor")
 }
@@ -414,6 +456,9 @@ func (s *Server) publishSymbolPage(ctx context.Context, req mcplib.CallToolReque
 	if err = json.Unmarshal(rawTemplate, &copiedTemplate); err != nil {
 		return nil, err
 	}
+	if refill == nil {
+		entry.firstSeed = symbolFirstPageSeed(entry.identity, rawTemplate, candidates, horizon, more)
+	}
 	stage, err := entry.storage.begin(ctx, candidates)
 	if err != nil {
 		return nil, err
@@ -431,8 +476,35 @@ func (s *Server) publishSymbolPage(ctx context.Context, req mcplib.CallToolReque
 		return result, nil
 	}
 	if refill == nil {
-		if !s.symbolPages(ctx).add(entry) {
+		winner, live := s.symbolPages(ctx).publishFirst(entry)
+		if !live {
 			return symbolPageError("session ended"), nil
+		}
+		if winner != entry {
+			admitted, err := winner.acquire(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if !admitted {
+				return symbolPageError("expired or was evicted"), nil
+			}
+			defer func() {
+				if winner.retired.Load() {
+					winner.storage.close()
+				}
+				winner.token <- struct{}{}
+			}()
+			replay, ok, err := winner.storage.replay(ctx, 0)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return symbolPageError("first page is unavailable"), nil
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return cloneSymbolResult(replay.result), nil
 		}
 	}
 	published = true
