@@ -176,6 +176,18 @@ func (s *Store) EnsureRowCounters(ctx context.Context) error {
 	}
 	s.rowCountersReady.Store(false)
 	started := time.Now()
+	// Reserve the read connection before taking the writer. Acquiring it
+	// while holding the gate would wait behind long pool readers and stall
+	// mutations. BeginTx and its first read still pin the seed snapshot only
+	// after the trigger transaction commits, under the writer below.
+	if rowCountersBeforeReadConnHook != nil {
+		rowCountersBeforeReadConnHook()
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 
 	// 1. Triggers and zeroed counters, then the seed snapshot, under the
 	// writer.
@@ -249,11 +261,6 @@ SELECT v, 1 FROM g WHERE v IS NOT NULL`); err != nil {
 	// opening) needs it.
 	installed = true
 	releaseInstall()
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
 	snap, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
@@ -358,6 +365,10 @@ var errRowCountersBulkWindow = errors.New("row counters: a bulk window is open")
 // errRowCountersEditCycle defers the install while an edit cycle holds the
 // build lane.
 var errRowCountersEditCycle = errors.New("row counters: an edit cycle holds the build lane")
+
+// rowCountersBeforeReadConnHook parks seed reader admission in deterministic
+// pool-saturation fixtures. nil in production.
+var rowCountersBeforeReadConnHook func()
 
 // rowCountersAfterPinHook runs right after the seed snapshot is pinned and
 // the writer released (a seam for the case that commits a write there).
