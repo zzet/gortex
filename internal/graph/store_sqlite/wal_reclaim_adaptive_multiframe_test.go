@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -80,32 +81,65 @@ func TestUrgentAdaptiveCopyAdmitsMultiFrameTail(t *testing.T) {
 				})
 			}
 			t.Cleanup(join)
+			var eventsMu sync.Mutex
+			var events, syncEvents []string
+			record := func(format string, args ...any) {
+				eventsMu.Lock()
+				defer eventsMu.Unlock()
+				if len(events) < 16 {
+					events = append(events, fmt.Sprintf(format, args...))
+				}
+			}
+			// Record the exact checkpoint-connection TLS sync interval. Its span
+			// includes the existing artificial delay and the underlying VFS sync.
+			observeAdaptiveMultiFrameSync(t, db, func(file int) {
+				if file != vfsFileWAL {
+					return
+				}
+				syncs.Add(1)
+				time.Sleep(300 * time.Millisecond)
+			}, func(file int, from, to time.Time) {
+				eventsMu.Lock()
+				defer eventsMu.Unlock()
+				if len(syncEvents) < 16 {
+					syncEvents = append(syncEvents, fmt.Sprintf("TLS sync file=%d start=%s end=%s span_including_test_delay=%s", file, from.Format(time.RFC3339Nano), to.Format(time.RFC3339Nano), to.Sub(from)))
+				}
+			})
 			started := time.Now()
 			resets := 0
 			adaptiveAttempts := 0
 			var aggregateMax time.Duration
 			var maxAdaptiveEntryTail uint32
-			t.Cleanup(func() { walIdleResetHook = nil })
+			t.Cleanup(func() { walIdleResetHook = nil; walPressureResetHook = nil })
+			iteration := 0
+			var lastResult walReclaimResult
+			var lastError error
+			var lastDone, lastSnapshotOK bool
+			var lastSnapshot walIndexSnapshot
 			for ctx.Err() == nil && resets < 1 {
-				observeDelayedReclaimSync(t, db, func(file int) {
-					if file == vfsFileWAL {
-						syncs.Add(1)
-						time.Sleep(300 * time.Millisecond)
-					}
-				})
+				iteration++
 				res := &walReclaimResult{urgent: true}
-				walIdleResetHook = func() {
-					if res.slowTail != nil {
-						if snap, ok := readWALIndexSnapshot(s.dbPath); ok && snap.MxFrame > snap.NBackfill {
-							maxAdaptiveEntryTail = max(maxAdaptiveEntryTail, snap.MxFrame-snap.NBackfill)
-						}
+				entry := func(phase string) {
+					snap, ok := readWALIndexSnapshot(s.dbPath)
+					if res.slowTail != nil && ok && snap.MxFrame > snap.NBackfill {
+						maxAdaptiveEntryTail = max(maxAdaptiveEntryTail, snap.MxFrame-snap.NBackfill)
 					}
+					record("entry iteration=%d phase=%s adaptive_witness=%v snapshot_ok=%v post_or_held_frontier=%+v", iteration, phase, res.slowTail != nil, ok, snap)
 				}
+				walIdleResetHook = func() { entry("short") }
+				walPressureResetHook = func(context.Context) { entry("pressure") }
 				done := false
+				var helperErr error
 				if kind == "pressure" {
-					done = s.reclaimWALPressureReset(ctx, db, res) == nil
+					helperErr = s.reclaimWALPressureReset(ctx, db, res)
+					done = helperErr == nil
 				} else {
-					done, _ = s.reclaimWALResetHold(ctx, walReclaimConfig{thresholdBytes: 1}, db, res, false, false)
+					done, helperErr = s.reclaimWALResetHold(ctx, walReclaimConfig{thresholdBytes: 1}, db, res, false, false)
+				}
+				snap, snapshotOK := readWALIndexSnapshot(s.dbPath)
+				lastResult, lastError, lastDone, lastSnapshotOK, lastSnapshot = *res, helperErr, done, snapshotOK, snap
+				if iteration <= 16 {
+					record("helper iteration=%d done=%v error=%v reason=%s adaptive=%v budget=%s spent=%s context=%v snapshot_ok=%v post_return_frontier=%+v", iteration, done, helperErr, res.reason, res.adaptiveUsed, res.adaptiveBudget, res.writerSpent, ctx.Err(), snapshotOK, snap)
 				}
 				if res.adaptiveUsed {
 					adaptiveAttempts++
@@ -127,6 +161,13 @@ func TestUrgentAdaptiveCopyAdmitsMultiFrameTail(t *testing.T) {
 			active := ctx.Err() == nil
 			join()
 			t.Logf("resets=%d writes=%d WAL_syncs=%d adaptive_attempts=%d aggregate_hold_max=%s worst_gate=%s worst_SQL=%s elapsed=%s producer_error=%v adaptive_entry_tail_frames=%d", resets, writes.Load(), syncs.Load(), adaptiveAttempts, aggregateMax, time.Duration(worstGate.Load()), time.Duration(worstSQL.Load()), time.Since(started), producerErr, maxAdaptiveEntryTail)
+			for _, event := range events {
+				t.Log(event)
+			}
+			for _, event := range syncEvents {
+				t.Log(event)
+			}
+			t.Logf("last helper iteration=%d done=%v error=%v reason=%s adaptive=%v budget=%s spent=%s snapshot_ok=%v post_return_frontier=%+v", iteration, lastDone, lastError, lastResult.reason, lastResult.adaptiveUsed, lastResult.adaptiveBudget, lastResult.writerSpent, lastSnapshotOK, lastSnapshot)
 			require.NoError(t, producerErr)
 			if kind == "short" {
 				require.Greater(t, maxAdaptiveEntryTail, walReclaimPressureSmallFrames, "causal precondition: actual adaptive entry tail exceeds the ordinary frame allowance")
@@ -181,4 +222,17 @@ func TestAdaptiveDeclinedEntryPreservesCopyEntitlement(t *testing.T) {
 			require.Less(t, r.writerSpent, walReclaimResetHold)
 		})
 	}
+}
+
+// This test-only scope publishes a fully initialized TLS observer. It neither
+// restores live VFS method tables nor changes SQL/copy contexts or writer credit.
+func observeAdaptiveMultiFrameSync(t *testing.T, db *sql.DB, before func(int), after func(int, time.Time, time.Time)) {
+	t.Helper()
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	key, ok := pausableConn(conn)
+	require.NoError(t, conn.Close())
+	require.True(t, ok)
+	reclaimSyncStallState.Store(&reclaimSyncStall{tls: key, beforeSync: before, afterSync: after})
+	t.Cleanup(func() { reclaimSyncStallState.Store(nil) })
 }
