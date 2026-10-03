@@ -23,7 +23,7 @@ func (r *Resolver) tryResolveNuxtAutoImport(e *graph.Edge, name string, candidat
 		}
 	}
 	// Even an unresolved explicit binding shadows a generated global.
-	for _, edge := range r.graph.GetOutEdges(e.FilePath) {
+	for _, edge := range r.importEvidenceEdges(e.FilePath) {
 		if edge.Kind != graph.EdgeImports {
 			continue
 		}
