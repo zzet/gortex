@@ -285,9 +285,10 @@ func TestWALReclaimBoundsWALUnderReaderChurn(t *testing.T) {
 	churn.runUntil(t, 240, 90*time.Second)
 	churn.halt(t)
 
-	// Let the poller act on the residue the last writes left, then read.
+	// Physical truncation precedes completion-stat publication. Observe both
+	// the required completed resets and the final WAL bound before sampling.
 	deadline := time.Now().Add(5 * time.Second)
-	for walFileSize(path+"-wal") > walReclaimJournalLimit && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) && (s.WALReclaimStats().Resets < 2 || walFileSize(path+"-wal") > walReclaimJournalLimit) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	stats := s.WALReclaimStats()
