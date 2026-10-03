@@ -2,6 +2,8 @@ package store_sqlite
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -25,18 +27,21 @@ type windowsWALEvent struct {
 	sleep                SQLiteSleepMark
 }
 type windowsWALDiagnostic struct {
-	t             *testing.T
-	store         atomic.Pointer[Store]
-	mu            sync.Mutex
-	events        []windowsWALEvent
-	dropped       int
-	cost          time.Duration
-	stop, joined  chan struct{}
-	stack         []byte
-	stackAt       time.Time
-	stackCost     time.Duration
-	finishRestore func()
-	initialSleep  SQLiteSleepMark
+	t                  *testing.T
+	store              atomic.Pointer[Store]
+	mu                 sync.Mutex
+	events             []windowsWALEvent
+	dropped            int
+	cost               time.Duration
+	stop, joined       chan struct{}
+	stack              []byte
+	stackAt            time.Time
+	stackCost          time.Duration
+	finishRestore      func()
+	initialSleep       SQLiteSleepMark
+	creditScopeStarted atomic.Int64
+	creditEvents       []string
+	creditDropped      int
 }
 
 // The optional reader hook is copied once before the reader goroutines start.
@@ -83,6 +88,9 @@ func (d *windowsWALDiagnostic) recordAttempt(kind string, reader int64, err erro
 	d.mu.Unlock()
 }
 func (d *windowsWALDiagnostic) install() {
+	if d.t.Name() == "TestWALReclaimResetsUnderReadersLongerThanTheDrain" {
+		d.installCreditVFSObservation()
+	}
 	previousCheckpoint := walCheckpointCallObserver
 	walCheckpointCallObserver = func(mode string, start time.Time, took time.Duration) {
 		d.record("checkpoint-return:"+mode, -1, nil)
@@ -145,6 +153,12 @@ func (d *windowsWALDiagnostic) install() {
 					stop := context.AfterFunc(a.ctx, func() { defer close(done); d.recordAttempt("attempt-cancel-dispatch", -1, nil, a) })
 					seen[a] = notification{stop, done}
 				}
+				if at := d.creditScopeStarted.Load(); at != 0 && d.stack == nil && time.Since(time.Unix(0, at)) > 500*time.Millisecond {
+					began := time.Now()
+					b := make([]byte, 128<<10)
+					n := runtime.Stack(b, true)
+					d.stack, d.stackAt, d.stackCost = b[:n], began, time.Since(began)
+				}
 				if a.ctx.Err() != nil {
 					if canceledSince.IsZero() {
 						canceledSince = time.Now()
@@ -163,7 +177,14 @@ func (d *windowsWALDiagnostic) install() {
 		}
 	}()
 	// Register before Store.Close's defer: close joins drivers before hook restoration.
-	d.finishRestore = func() { walCheckpointCallObserver = previousCheckpoint; walIdleResetResultHook = previousReset }
+	previousRestore := d.finishRestore
+	d.finishRestore = func() {
+		walCheckpointCallObserver = previousCheckpoint
+		walIdleResetResultHook = previousReset
+		if previousRestore != nil {
+			previousRestore()
+		}
+	}
 }
 func (d *windowsWALDiagnostic) finish() {
 	close(d.stop)
@@ -176,7 +197,72 @@ func (d *windowsWALDiagnostic) finish() {
 	for _, e := range d.events {
 		d.t.Logf("WAL diagnostic event at=%s kind=%s reader=%d attempt=%p context_err=%v cause=%v reported_error=%v copying=%v pausable=%v sampled_epoch=%d sampled_active=%d sampled_older=%d process_wide_sqlite_sleep=%+v", e.at.Format(time.RFC3339Nano), e.kind, e.reader, e.attempt, e.err, e.cause, e.reported, e.copying, e.pausable, e.epoch, e.active, e.older, e.sleep)
 	}
+	for _, e := range d.creditEvents {
+		d.t.Logf("credit PASSIVE VFS diagnostic: %s", e)
+	}
+	d.t.Logf("credit PASSIVE VFS diagnostic dropped=%d; write counters are process-wide, not per-connection", d.creditDropped)
 	if len(d.stack) > 0 {
-		d.t.Logf("WAL one-shot canceled-still-active stack at=%s cost=%s\n%s", d.stackAt.Format(time.RFC3339Nano), d.stackCost, d.stack)
+		d.t.Logf("WAL one-shot long-credit-scope-or-canceled-still-active stack at=%s cost=%s\n%s", d.stackAt.Format(time.RFC3339Nano), d.stackCost, d.stack)
+	}
+}
+
+// The actual held-copy connection is pinned until SQL returns. TLS identity is
+// scoped to that credit helper, including possible writer readmission after SQL.
+// Existing checkpoint wrapper events delimit SQL. No context or VFS table changes.
+func (d *windowsWALDiagnostic) installCreditVFSObservation() {
+	previous := walReclaimCreditPassiveQueryerObserver
+	delegate := func(ctx context.Context, store *Store, db *sql.DB) (walCheckpointQueryer, func()) {
+		if previous != nil {
+			return previous(ctx, store, db)
+		}
+		return db, nil
+	}
+	walReclaimCreditPassiveQueryerObserver = func(ctx context.Context, store *Store, db *sql.DB) (walCheckpointQueryer, func()) {
+		if d.store.Load() != store {
+			return delegate(ctx, store, db)
+		}
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			d.creditRecord("identity unavailable: %v", err)
+			return delegate(ctx, store, db)
+		}
+		tls, ok := pausableConn(conn)
+		if !ok {
+			_ = conn.Close()
+			d.creditRecord("identity unavailable: TLS")
+			return delegate(ctx, store, db)
+		}
+		state := &reclaimSyncStall{tls: tls}
+		state.beforeSync = func(file int) {
+			d.creditRecord("sync entry tls=%x file=%d at=%s", tls, file, time.Now().UTC().Format(time.RFC3339Nano))
+		}
+		state.afterSync = func(file int, from, to time.Time) {
+			d.creditRecord("sync return tls=%x file=%d from=%s to=%s elapsed=%s", tls, file, from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano), to.Sub(from))
+		}
+		if !reclaimSyncStallState.CompareAndSwap(nil, state) {
+			_ = conn.Close()
+			d.creditRecord("identity unavailable: another sync scope")
+			return delegate(ctx, store, db)
+		}
+		before := vfsIOMark()
+		started := time.Now()
+		d.creditRecord("credit scope entry tls=%x at=%s", tls, started.UTC().Format(time.RFC3339Nano))
+		d.creditScopeStarted.Store(started.UnixNano())
+		return conn, func() {
+			d.creditScopeStarted.Store(0)
+			d.creditRecord("credit scope return tls=%x at=%s elapsed=%s process_wide_IO=%+v", tls, time.Now().UTC().Format(time.RFC3339Nano), time.Since(started), vfsIOMark().Since(before))
+			reclaimSyncStallState.CompareAndSwap(state, nil)
+			_ = conn.Close()
+		}
+	}
+	d.finishRestore = func() { walReclaimCreditPassiveQueryerObserver = previous }
+}
+func (d *windowsWALDiagnostic) creditRecord(format string, args ...any) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.creditEvents) < 64 {
+		d.creditEvents = append(d.creditEvents, fmt.Sprintf(format, args...))
+	} else {
+		d.creditDropped++
 	}
 }
