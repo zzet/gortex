@@ -17,6 +17,11 @@ func TestABackgroundCycleThatRanToItsEndResetsTheYieldCount(t *testing.T) {
 	gate := NewViewBuildGate()
 	gate.Open()
 	store := builderOpenStoreAt(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	outcomes := make(chan CheckoutCycle, 1)
 	c := &CheckoutCoordinator{
 		checkoutID: "background",

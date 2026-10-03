@@ -76,6 +76,11 @@ func Open() (*Store, error) {
 	storePath := filepath.Join(t.TempDir(), "store.sqlite")
 	baseID := editDeltaRealDedicatedBase(t, repoDir, storePath, config.Default().Index, zap.NewNop())
 	store := builderOpenStoreAt(t, storePath)
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	m := &graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: graphview.NewLeaseManager()}
 	view, err := m.MaterializeRefView(context.Background(), editDeltaRealDedicatedGraph, baseID)
 	if err != nil {
