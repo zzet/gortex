@@ -260,17 +260,30 @@ func TestShadowReplacementCompletesUnderUnrelatedWriters(t *testing.T) {
 	defer cancel()
 	var wg sync.WaitGroup
 	var baseWrites, checkoutWrites atomic.Int32
+	var producerErrorMu sync.Mutex
+	var producerErrors []string
+	producerErrorSnapshot := func() []string {
+		producerErrorMu.Lock()
+		defer producerErrorMu.Unlock()
+		return append([]string(nil), producerErrors...)
+	}
 	for _, producer := range []struct {
+		name  string
 		store *Store
 		count *atomic.Int32
-	}{{s, &baseWrites}, {checkout, &checkoutWrites}} {
+	}{{"base", s, &baseWrites}, {"checkout", checkout, &checkoutWrites}} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := 0; ctx.Err() == nil; i++ {
 				node := *anchors[0]
 				node.Name = fmt.Sprint(i)
-				producer.store.AddBatch([]*graph.Node{&node}, []*graph.Edge{{From: anchors[0].ID, To: anchors[1].ID, Kind: graph.EdgeCalls, Line: 10000 + i}})
+				if err := producer.store.AddBatchChecked([]*graph.Node{&node}, []*graph.Edge{{From: anchors[0].ID, To: anchors[1].ID, Kind: graph.EdgeCalls, Line: 10000 + i}}); err != nil {
+					producerErrorMu.Lock()
+					producerErrors = append(producerErrors, fmt.Sprintf("%s: %v", producer.name, err))
+					producerErrorMu.Unlock()
+					return
+				}
 				producer.count.Add(1)
 			}
 		}()
@@ -289,13 +302,19 @@ func TestShadowReplacementCompletesUnderUnrelatedWriters(t *testing.T) {
 	for (baseWrites.Load() < 2 || checkoutWrites.Load() < 2) && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
+	t.Logf("producer qualification: base_commits=%d checkout_commits=%d errors=%v context=%v", baseWrites.Load(), checkoutWrites.Load(), producerErrorSnapshot(), ctx.Err())
 	require.GreaterOrEqual(t, baseWrites.Load(), int32(2))
 	require.GreaterOrEqual(t, checkoutWrites.Load(), int32(2))
 	beforeBase, beforeCheckout := baseWrites.Load(), checkoutWrites.Load()
-	attempt, cancelAttempt := context.WithTimeout(t.Context(), 2*time.Second)
+	// This is an algorithm-completion fixture cap, not a foreground latency
+	// promise. Normal runs retain two seconds; race instrumentation gets the
+	// existing allowance while both checked producers must keep committing.
+	attempt, cancelAttempt := context.WithTimeout(t.Context(), raceSlack(2*time.Second))
 	defer cancelAttempt()
 	start := time.Now()
 	n, e, err := s.EvictRepoForShadowReplacement(attempt, "shadow")
+	t.Logf("retirement attempt: elapsed=%s nodes_removed=%d edges_removed=%d base_commits=%d checkout_commits=%d attempt_context=%v producer_context=%v errors=%v returned_error=%v", time.Since(start), n, e, baseWrites.Load()-beforeBase, checkoutWrites.Load()-beforeCheckout, attempt.Err(), ctx.Err(), producerErrorSnapshot(), err)
+	require.Empty(t, producerErrorSnapshot())
 	require.NoError(t, err)
 	require.Equal(t, len(nodes), n)
 	require.Zero(t, e)
@@ -305,6 +324,7 @@ func TestShadowReplacementCompletesUnderUnrelatedWriters(t *testing.T) {
 	t.Logf("total=%s removed=%d active base commits=%d checkout commits=%d", time.Since(start), n, baseWrites.Load()-beforeBase, checkoutWrites.Load()-beforeCheckout)
 	cancel()
 	<-joined
+	require.Empty(t, producerErrorSnapshot())
 	require.Equal(t, 2, s.NodeCount())
 	require.Equal(t, 2, checkout.NodeCount())
 	require.GreaterOrEqual(t, s.EdgeCount(), 8000)
