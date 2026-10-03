@@ -85,7 +85,12 @@ func (b *SparseGenerationBuilder) runCommittedTypecheck(ctx context.Context, req
 	}
 	// graph.semantic is the go/types level: a generation that carries no Go
 	// file has nothing for the type checker to add, and is whole without it.
-	if !carriesGoFiles(handle, req.RepoPrefix) {
+	carried, censusErr := carriesGoFilesContext(ctx, handle, req.RepoPrefix)
+	if censusErr != nil {
+		out.Reason = "the committed payload language could not be inspected: " + censusErr.Error()
+		return
+	}
+	if !carried {
 		out.Ran, out.NothingToCheck = true, true
 		return
 	}
@@ -308,13 +313,28 @@ func (b *SparseGenerationBuilder) copiedCorpusTypes(repoPrefix, commit string) c
 		reason: "the corpus the base was copied from had not finished its enrichment at commit " + commit}
 }
 
-// carriesGoFiles reports whether the generation holds a Go file of the
-// repository.
-func carriesGoFiles(handle graph.Store, repoPrefix string) bool {
+func carriesGoFilesContext(ctx context.Context, handle graph.Store, repoPrefix string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if reader, ok := handle.(interface {
+		RepoHasLanguageContext(context.Context, string, string) (bool, error)
+	}); ok {
+		return reader.RepoHasLanguageContext(ctx, repoPrefix, "go")
+	}
+	// Adapter stores retain the existing compact file-count contract.
+	present := false
 	for _, row := range graph.ReadRepoLanguageFileCounts(handle, []string{repoPrefix}) {
 		if row.Language == "go" && row.Count > 0 {
-			return true
+			present = true
+			break
 		}
 	}
-	return false
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return present, nil
 }
