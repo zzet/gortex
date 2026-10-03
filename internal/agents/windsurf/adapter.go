@@ -49,7 +49,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return filepath.Join(env.Root, ".windsurfrules")
 }
 
-
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if p, err := exec.LookPath("windsurf"); err == nil && p != "" {
 		return true, nil

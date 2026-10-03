@@ -100,7 +100,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return filepath.Join(env.Root, "AGENTS.md")
 }
 
-
 // Detect checks for the codex CLI on PATH or ~/.codex/.
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if p, err := exec.LookPath("codex"); err == nil && p != "" {

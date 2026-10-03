@@ -103,7 +103,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return repoInstructionsPath(env.Root)
 }
 
-
 // Detect looks for the `copilot` binary or an existing config home.
 // Deliberately never keys off .vscode — Copilot-in-VS-Code is the
 // `vscode` adapter's host, and detecting on it here would configure the

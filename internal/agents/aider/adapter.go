@@ -54,7 +54,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return filepath.Join(env.Root, "CONVENTIONS.md")
 }
 
-
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if p, err := exec.LookPath("aider"); err == nil && p != "" {
 		return true, nil

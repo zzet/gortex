@@ -39,7 +39,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return filepath.Join(env.Root, "GEMINI.md")
 }
 
-
 // Detect checks for the gemini CLI on PATH or an existing user-level
 // settings.json. We avoid colliding with the antigravity adapter's
 // detection by looking at ~/.gemini/settings.json specifically

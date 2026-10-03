@@ -69,7 +69,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return filepath.Join(env.Root, ".clinerules", "gortex-communities.md")
 }
 
-
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if env.Home == "" {
 		return false, nil

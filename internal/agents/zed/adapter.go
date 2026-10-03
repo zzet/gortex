@@ -70,7 +70,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return filepath.Join(env.Root, ".rules")
 }
 
-
 // Detect checks for the zed CLI on PATH or the platform-specific
 // settings.json directory.
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
