@@ -1166,6 +1166,7 @@ func TestRequireExactRefusesEveryUnfreshOutcome(t *testing.T) {
 	type unfreshCase struct {
 		// arrange installs the failure and returns the request arguments.
 		arrange func(stack *viewStack) map[string]any
+		verify  func(t *testing.T, stack *viewStack)
 		reason  string
 	}
 	cases := map[string]unfreshCase{
@@ -1220,14 +1221,10 @@ func TestRequireExactRefusesEveryUnfreshOutcome(t *testing.T) {
 		},
 		"a publication another view answered": {
 			arrange: func(stack *viewStack) map[string]any {
-				stack.srv.freshnessWaiter = &fakeFreshnessWaiter{
-					answer: func(_ int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
-						routeViewCheckout(t, stack.store, stack.graphID, stack.commit, stack.dirty, store_sqlite.RoutePending)
-						return settledTicket(checkoutID, root, uint64(stack.dirty)), nil
-					},
-				}
-				return freshArgs(nil, 25*time.Millisecond)
+				stack.srv.freshnessWaiter = withdrawnPublicationFreshnessWaiter(t, stack)
+				return freshArgs(nil, 2*time.Second)
 			},
+			verify: assertWithdrawnPublicationWaited,
 			reason: freshReasonDeadlineExceeded,
 		},
 		"a failed publication": {
@@ -1261,6 +1258,9 @@ func TestRequireExactRefusesEveryUnfreshOutcome(t *testing.T) {
 				tc.arrange(lenient), captureReader(lenient.srv, new(graph.Reader)))
 			require.NoError(t, err)
 			require.False(t, res.IsError, "without require_exact this outcome must still answer: %s", viewResultText(t, res))
+			if tc.verify != nil {
+				tc.verify(t, lenient)
+			}
 			rider := resultFreshness(t, res)
 			require.Equal(t, false, rider["fresh"], "rider = %v", rider)
 			require.Equal(t, tc.reason, rider["fresh_reason"], "rider = %v", rider)
@@ -1268,9 +1268,14 @@ func TestRequireExactRefusesEveryUnfreshOutcome(t *testing.T) {
 			strict := newViewStack(t)
 			args := tc.arrange(strict)
 			args[requireExactArgName] = true
-			res, err = strict.callWithView(t, strict.worktreeRoot, "get_symbol", args, captureReader(strict.srv, new(graph.Reader)))
+			var served graph.Reader
+			res, err = strict.callWithView(t, strict.worktreeRoot, "get_symbol", args, captureReader(strict.srv, &served))
 			require.NoError(t, err)
 			assertToolError(t, res, graphview.CodeViewBuilding)
+			require.Nil(t, served, "require_exact must refuse before the handler reads a fallback")
+			if tc.verify != nil {
+				tc.verify(t, strict)
+			}
 			text := viewResultText(t, res)
 			reason := tc.reason
 			if reason == freshReasonDeadlineExceeded {
@@ -1486,6 +1491,30 @@ func TestAnExpiredBoundIsNotReportedAsAnUnavailableCoordinator(t *testing.T) {
 
 // ------------------------------------- the answer the wait is about ---
 
+// The first settle withdraws its route. The next admission waits for the
+// request's own bound, so the deadline refusal is exercised after observing
+// the substitution rather than racing initial selection on a 25ms budget.
+func withdrawnPublicationFreshnessWaiter(t *testing.T, stack *viewStack) *fakeFreshnessWaiter {
+	t.Helper()
+	return &fakeFreshnessWaiter{
+		answerCtx: func(ctx context.Context, call int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
+			if call == 1 {
+				routeViewCheckout(t, stack.store, stack.graphID, stack.commit, stack.dirty, store_sqlite.RoutePending)
+				return settledTicket(checkoutID, root, uint64(stack.dirty)), nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+}
+
+func assertWithdrawnPublicationWaited(t *testing.T, stack *viewStack) {
+	t.Helper()
+	waiter, ok := stack.srv.freshnessWaiter.(*fakeFreshnessWaiter)
+	require.True(t, ok)
+	require.Len(t, waiter.observed(), 2, "the request must observe the withdrawn publication before waiting out its bound")
+}
+
 // The wait's success is a statement about ONE route: the coordinator completes
 // a ticket only once the active route names a servable dirty generation whose
 // fingerprint equals the tree it just sampled. That claim belongs to the view
@@ -1504,19 +1533,12 @@ func TestAnExpiredBoundIsNotReportedAsAnUnavailableCoordinator(t *testing.T) {
 // copy it asked to wait for. This drives the whole middleware, not the helper.
 func TestAFreshWaitAnsweredByABaseFallbackIsNotReportedFresh(t *testing.T) {
 	stack := newViewStack(t)
-	stack.srv.freshnessWaiter = &fakeFreshnessWaiter{
-		answer: func(_ int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
-			// The coordinator publishes and reports success; the route then
-			// stops being ready, exactly as ensureRoute's flip or a dirty-slot
-			// clear leaves it. Both happen before the request looks again.
-			routeViewCheckout(t, stack.store, stack.graphID, stack.commit, stack.dirty, store_sqlite.RoutePending)
-			return settledTicket(checkoutID, root, uint64(stack.dirty)), nil
-		},
-	}
+	stack.srv.freshnessWaiter = withdrawnPublicationFreshnessWaiter(t, stack)
 
 	res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol",
-		freshArgs(nil, 25*time.Millisecond), captureReader(stack.srv, new(graph.Reader)))
+		freshArgs(nil, 2*time.Second), captureReader(stack.srv, new(graph.Reader)))
 	require.NoError(t, err)
+	assertWithdrawnPublicationWaited(t, stack)
 	require.False(t, res.IsError, "without require_exact the fallback must still answer: %s", viewResultText(t, res))
 
 	rider := resultFreshness(t, res)
@@ -1535,16 +1557,14 @@ func TestAFreshWaitAnsweredByABaseFallbackIsNotReportedFresh(t *testing.T) {
 // the refusal names what happened.
 func TestAFreshWaitAnsweredByABaseFallbackRefusesUnderRequireExact(t *testing.T) {
 	stack := newViewStack(t)
-	stack.srv.freshnessWaiter = &fakeFreshnessWaiter{
-		answer: func(_ int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
-			routeViewCheckout(t, stack.store, stack.graphID, stack.commit, stack.dirty, store_sqlite.RoutePending)
-			return settledTicket(checkoutID, root, uint64(stack.dirty)), nil
-		},
-	}
-	args := freshArgs(map[string]any{requireExactArgName: true}, 25*time.Millisecond)
-	res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", args, captureReader(stack.srv, new(graph.Reader)))
+	stack.srv.freshnessWaiter = withdrawnPublicationFreshnessWaiter(t, stack)
+	args := freshArgs(map[string]any{requireExactArgName: true}, 2*time.Second)
+	var served graph.Reader
+	res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", args, captureReader(stack.srv, &served))
 	require.NoError(t, err)
+	assertWithdrawnPublicationWaited(t, stack)
 	assertToolError(t, res, graphview.CodeViewBuilding)
+	require.Nil(t, served, "require_exact must refuse before the handler reads a fallback")
 	require.Contains(t, viewResultText(t, res), "wait_deadline")
 }
 
