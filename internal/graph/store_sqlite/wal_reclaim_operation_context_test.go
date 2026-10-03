@@ -335,9 +335,10 @@ func TestReclaimReadmissionDoesNotReviveCancellationOrSpentCredit(t *testing.T) 
 			})
 			_, err := writer.passive(original, operation, db, credit, false)
 			want := error(context.DeadlineExceeded)
-			if kind == "cancel_cause" {
+			switch kind {
+			case "cancel_cause":
 				want = context.Canceled
-			} else if kind == "writer_demand" {
+			case "writer_demand":
 				want = errWALReclaimWriterWaiting
 			}
 			require.True(t, errors.Is(err, want), "readmission error %v, want %v", err, want)
