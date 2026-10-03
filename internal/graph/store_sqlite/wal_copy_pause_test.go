@@ -117,7 +117,12 @@ func TestInterruptedReclaimPassIsDetectedAndCounted(t *testing.T) {
 // refresh, 2.2 s gap) against a copy slower than one gap: with the pause the
 // ordinary passes pause across edits, while pressure may resume copying
 // inside edits once the producer outpaces that budget. The combined policy
-// must keep the log under 32 MiB and keep resetting it. Ordinary no-busy-copy
+// must keep the log under 32 MiB and keep resetting it over the intended 60
+// completed mutations, with at least 15 s of live observation. The 250 ms
+// cadence follows each SQL completion, so 15 s alone does not prove that work
+// was delivered on slower storage. The 30 s delivery deadline bounds this
+// fixed-work fixture without changing production or request budgets.
+// Ordinary no-busy-copy
 // behavior is checked separately by TestReclaimCopyPausesForAnEditAndKeepsItsProgress.
 func TestReclaimKeepsTheLogBoundedWithEditsEveryFewSeconds(t *testing.T) {
 	diag := newWindowsWALDiagnostic(t)
@@ -152,6 +157,17 @@ func TestReclaimKeepsTheLogBoundedWithEditsEveryFewSeconds(t *testing.T) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var writeErr error
+	var completedWrites int
+	var firstWriteAt, workDeliveredAt, worstWriteStarted, worstWriteFinished time.Time
+	var maxWriteDuration time.Duration
+	started := time.Now()
+	deliveryDeadline := started.Add(30 * time.Second)
+	var stopOnce sync.Once
+	stopWorkers := func() {
+		stopOnce.Do(func() { close(stop) })
+		wg.Wait()
+	}
+	defer stopWorkers()
 	wg.Add(2)
 	go func() { // the edits
 		defer wg.Done()
@@ -176,28 +192,74 @@ func TestReclaimKeepsTheLogBoundedWithEditsEveryFewSeconds(t *testing.T) {
 				return
 			case <-time.After(250 * time.Millisecond):
 			}
-			if err := churnWriteOnce(s, k); err != nil {
-				mu.Lock()
+			writeStarted := time.Now()
+			err := churnWriteOnce(s, k)
+			writeFinished := time.Now()
+			mu.Lock()
+			if duration := writeFinished.Sub(writeStarted); duration > maxWriteDuration {
+				maxWriteDuration = duration
+				worstWriteStarted, worstWriteFinished = writeStarted, writeFinished
+			}
+			if err != nil {
 				writeErr = err
 				mu.Unlock()
 				return
 			}
-			mu.Lock()
+			completedWrites++
+			if completedWrites == 1 {
+				firstWriteAt = writeFinished
+			}
+			if completedWrites == 60 {
+				workDeliveredAt = writeFinished
+			}
 			if w := walFileSize(path + "-wal"); w > maxWAL {
 				maxWAL = w
 			}
 			mu.Unlock()
 		}
 	}()
-	time.Sleep(15 * time.Second)
-	close(stop)
-	wg.Wait()
+	deadline := time.NewTimer(time.Until(deliveryDeadline))
+	defer deadline.Stop()
+	poll := time.NewTicker(20 * time.Millisecond)
+	defer poll.Stop()
+	delivered := false
+observe:
+	for {
+		mu.Lock()
+		complete := completedWrites >= 60 && !workDeliveredAt.After(deliveryDeadline)
+		failed := writeErr != nil
+		mu.Unlock()
+		if complete && time.Since(started) >= 15*time.Second {
+			delivered = true
+			break
+		}
+		if failed {
+			break
+		}
+		select {
+		case <-deadline.C:
+			break observe
+		case <-poll.C:
+		}
+	}
+	observationFinished := time.Now()
+	stopWorkers()
+	// A deadline notification can race the final pre-deadline completion. The
+	// joined completion timestamp decides delivery, not which select case won.
+	delivered = completedWrites >= 60 && !workDeliveredAt.IsZero() &&
+		!workDeliveredAt.After(deliveryDeadline) && observationFinished.Sub(started) >= 15*time.Second
 	st, cp := s.WALReclaimStats(), s.WALCopyStats()
+	t.Logf("periodic workload: completed_writes=%d required_writes=60 delivered=%t observation=%s delivery_deadline=30s first_write_at=%s work_delivered_at=%s write_gate_and_sql_max=%s worst_write_start=%s worst_write_end=%s",
+		completedWrites, delivered, observationFinished.Sub(started), firstWriteAt.Format(time.RFC3339Nano), workDeliveredAt.Format(time.RFC3339Nano),
+		maxWriteDuration, worstWriteStarted.Format(time.RFC3339Nano), worstWriteFinished.Format(time.RFC3339Nano))
 	t.Logf("wal_max=%.1fMiB resets=%d copy: passes=%d paused_passes=%d paused=%s budget_wait=%s written=%.1fMiB written_while_busy=%d attempts_with_a_discarded_pass=%d paced_cut_short=%d pressure_runs=%d pressure_resets=%d pressure_lane_resets=%d pause_mark_or_cap_overruns=%d",
 		float64(maxWAL)/(1<<20), st.Resets, cp.Passes, cp.PausedPasses, cp.Paused.Round(time.Millisecond), cp.BudgetWait.Round(time.Millisecond),
 		float64(cp.WrittenBytes)/(1<<20), cp.WrittenWhileBusyBytes, cp.DiscardedPasses, cp.PacedPassesCutShort,
 		cp.PressureRuns, cp.PressureResets, cp.PressureLaneResets, cp.PauseCapOverruns)
 	require.NoError(t, writeErr)
+	require.True(t, delivered, "60 mutations were not delivered within the 30 s fixture deadline")
+	require.GreaterOrEqual(t, completedWrites, 60)
+	require.GreaterOrEqual(t, observationFinished.Sub(started), 15*time.Second)
 	require.Less(t, maxWAL, int64(32<<20), "the log outgrew its bound under edits every 2.5 s")
 	require.Zero(t, cp.PacedPassesCutShort, "a paced pass was cut short")
 	// Copying through a busy lane is permitted once pressure is reached.
