@@ -1092,7 +1092,7 @@ func (p *Provider) runWarmup(e *checkoutWarmup) {
 	again := e.want != digest
 	attempts, preemptions, forced := e.status.Attempts, e.status.Preemptions, e.status.Forced
 	if listed > 0 {
-		st.warmList = listed
+		st.warmList.Store(int64(listed))
 	}
 	r.mu.Unlock()
 	if p.logger != nil {

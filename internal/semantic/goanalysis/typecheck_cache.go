@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/tools/go/gcexportdata"
@@ -144,8 +145,10 @@ type checkoutTypecheckState struct {
 	exportStale map[string]bool
 	sizes       types.Sizes
 	lastList    time.Duration
-	// warmList is the wall time of the last warm-up listing merged.
-	warmList time.Duration
+	// warmList is the wall time of the last warm-up listing merged. The
+	// aggregate is published asynchronously, without waiting for a foreground
+	// cached program to release the state lock it retains during extraction.
+	warmList atomic.Int64
 
 	// Retained type state.
 	fset        *token.FileSet
@@ -623,7 +626,7 @@ func (st *checkoutTypecheckState) mergeListing(l *tcListing) int {
 	}
 	st.invalidateTypes(invalid, replaced)
 	if l.warmup {
-		st.warmList = l.elapsed
+		st.warmList.Store(int64(l.elapsed))
 	} else {
 		st.lastList = l.elapsed
 	}
@@ -1644,7 +1647,7 @@ func (p *Provider) loadCheckoutProgramCached(ctx context.Context, loadDir, diges
 					stats.WarmServed = true
 					st.warmHits++
 					if saved == 0 {
-						saved = st.warmList
+						saved = time.Duration(st.warmList.Load())
 					}
 					break
 				}
