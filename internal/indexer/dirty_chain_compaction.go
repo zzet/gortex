@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -891,7 +892,7 @@ func (c *CheckoutCoordinator) recordDirtyChainCompaction(report DirtyChainCompac
 // generations; a chain rooted at one does not compose over generation 0.
 const dedicatedGenerationKind = "dedicated"
 
-// checkoutLanguageCensus is the language census of the committed state a
+// checkoutLanguageCensusContext is the language census of the committed state a
 // working-tree layer over commitGeneration composes over: the commit
 // generation and its committed ancestry, each a generation-scoped grouped
 // count, plus the base corpus (generation 0) when the view actually composes
@@ -900,33 +901,47 @@ const dedicatedGenerationKind = "dedicated"
 // firstHandle), so generation 0 is not part of such a view and is not
 // counted; counting it paid a whole-repository grouped scan of the flat base
 // per coordinator and commit generation for rows the view never serves. A
-// chain whose root is not a dedicated generation, or whose walk did not reach
-// its root, keeps the base count. It is cached per commit generation, which
-// is immutable.
-func (c *CheckoutCoordinator) checkoutLanguageCensus(ctx context.Context, commitGeneration int64) map[string]int {
+// chain whose root is not a dedicated generation keeps the base count.
+// Complete counts are cached per immutable commit generation. Missing catalog
+// rows, failed SQL and cancellation are errors, not an invitation to count the
+// base or memoize a partial ancestry.
+func (c *CheckoutCoordinator) checkoutLanguageCensusContext(ctx context.Context, commitGeneration int64) (map[string]int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c.compaction.mu.Lock()
 	if cached, ok := c.compaction.census[commitGeneration]; ok {
 		c.compaction.mu.Unlock()
-		return cached
+		return cached, nil
 	}
 	c.compaction.mu.Unlock()
 	started := time.Now()
 	counted := 0
 	census := map[string]int{}
-	add := func(generationID int64, published bool) {
+	add := func(generationID int64, published bool) error {
 		counted++
 		handle := c.store.AtGeneration(generationID)
 		var counts map[string]int
+		var err error
 		if published {
 			// A ready generation's rows are immutable: its count is shared by
 			// every checkout standing on it and paid once per process.
-			counts = handle.PublishedRepoLanguageCounts(c.repoPrefix)
+			counts, err = handle.PublishedRepoLanguageCountsContext(ctx, c.repoPrefix)
 		} else {
-			counts = handle.RepoLanguageCounts([]string{c.repoPrefix})[c.repoPrefix]
+			all, readErr := handle.RepoLanguageCountsContext(ctx, []string{c.repoPrefix})
+			err = readErr
+			counts = all[c.repoPrefix]
+		}
+		if err != nil {
+			return err
 		}
 		for language, count := range counts {
 			census[language] += count
 		}
+		return nil
 	}
 	dedicatedRoot := false
 	seen := map[int64]bool{0: true}
@@ -934,17 +949,30 @@ func (c *CheckoutCoordinator) checkoutLanguageCensus(ctx context.Context, commit
 	for depth := 0; id > 0 && !seen[id] && depth < graphview.MaxGenerationAncestryDepth; depth++ {
 		seen[id] = true
 		row, found, err := c.catalog.GetViewGeneration(ctx, id)
-		if err != nil || !found {
-			break
+		if err != nil {
+			return nil, err
 		}
-		add(id, row.State == store_sqlite.ViewGenerationReady)
+		if !found {
+			return nil, fmt.Errorf("indexer: census generation %d is missing", id)
+		}
+		if err := add(id, row.State == store_sqlite.ViewGenerationReady); err != nil {
+			return nil, err
+		}
 		if row.BaseGenerationID <= 0 {
 			dedicatedRoot = row.GenerationKind == dedicatedGenerationKind
 		}
 		id = row.BaseGenerationID
 	}
+	if id > 0 {
+		return nil, fmt.Errorf("indexer: census ancestry did not reach its root at generation %d", id)
+	}
 	if !dedicatedRoot {
-		add(0, false)
+		if err := add(0, false); err != nil {
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	c.compaction.mu.Lock()
 	if c.compaction.census == nil {
@@ -960,7 +988,7 @@ func (c *CheckoutCoordinator) checkoutLanguageCensus(ctx context.Context, commit
 	// process), paid only by a build whose own files leave an enrichable
 	// language below the admission floor.
 	if c.logger == nil {
-		return census
+		return census, nil
 	}
 	c.logger.Info("indexer: checkout language census counted",
 		zap.String("checkout", c.checkoutID),
@@ -968,7 +996,7 @@ func (c *CheckoutCoordinator) checkoutLanguageCensus(ctx context.Context, commit
 		zap.Int("generations", counted),
 		zap.Bool("base_counted", !dedicatedRoot),
 		zap.Duration("elapsed", time.Since(started)))
-	return census
+	return census, nil
 }
 
 // cycleAdmission is how long a cycle waited before building, by stage: the

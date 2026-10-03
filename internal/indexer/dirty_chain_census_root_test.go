@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -58,10 +59,28 @@ func TestCheckoutLanguageCensusCountsTheBaseOnlyUnderANonDedicatedRoot(t *testin
 	commit := root("commit", "checkout", "")
 
 	c := &CheckoutCoordinator{store: store, catalog: catalog, repoPrefix: "repo"}
-	if got := c.checkoutLanguageCensus(ctx, dedicated); got["python"] != 0 || got["go"] != 5 {
+	if got, err := c.checkoutLanguageCensusContext(ctx, dedicated); err != nil || got["python"] != 0 || got["go"] != 5 {
 		t.Fatalf("dedicated root census = %v, want go=5 and no generation-0 python", got)
 	}
-	if got := c.checkoutLanguageCensus(ctx, commit); got["python"] != 20 || got["go"] != 5 {
+	if got, err := c.checkoutLanguageCensusContext(ctx, commit); err != nil || got["python"] != 20 || got["go"] != 5 {
 		t.Fatalf("non-dedicated root census = %v, want go=5 python=20", got)
 	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if got, err := c.checkoutLanguageCensusContext(canceled, dedicated); got != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled cache hit: %v/%v", got, err)
+	}
+	// A missing catalog row is an incomplete walk, not a base-only answer.
+	const broken int64 = 999999
+	if got, err := c.checkoutLanguageCensusContext(ctx, broken); got != nil || err == nil {
+		t.Fatalf("incomplete ancestry: %v/%v", got, err)
+	}
+
+	c.compaction.mu.Lock()
+	_, cached := c.compaction.census[broken]
+	c.compaction.mu.Unlock()
+	if cached {
+		t.Fatal("partial ancestry was memoized")
+	}
+
 }

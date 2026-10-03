@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"encoding/json"
 	"sort"
 	"strings"
@@ -99,24 +100,44 @@ ORDER BY n.repo_prefix, n.language`
 // in one query. It deliberately does not touch the edges table (unlike
 // RepoStats), and filters content sections using the promoted data_class column.
 func (s *Store) RepoLanguageCounts(repoPrefixes []string) map[string]map[string]int {
+	counts, err := s.RepoLanguageCountsContext(context.Background(), repoPrefixes)
+	if err != nil {
+		panicOnFatal(err)
+		return map[string]map[string]int{}
+	}
+	return counts
+}
+
+// RepoLanguageCountsContext returns a complete census or an error. A canceled
+// or failed read never returns partial counts that could admit enrichment.
+func (s *Store) RepoLanguageCountsContext(ctx context.Context, repoPrefixes []string) (map[string]map[string]int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	out := make(map[string]map[string]int)
 	reposJSON, ok := projectionJSON(repoPrefixes)
 	if !ok {
-		return out
+		return out, nil
 	}
-	rows, err := s.db.Query(repoLanguageCountsSQL, reposJSON, string(graph.KindDoc), s.viewGen)
+	rows, err := s.db.QueryContext(ctx, repoLanguageCountsSQL, reposJSON, string(graph.KindDoc), s.viewGen)
 	if err != nil {
-		panicOnFatal(err)
-		return out
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
 	}
 	defer rows.Close()
-
 	for rows.Next() {
 		var repoPrefix, language string
 		var count int
 		if err := rows.Scan(&repoPrefix, &language, &count); err != nil {
-			panicOnFatal(err)
-			return out
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
 		}
 		byLanguage := out[repoPrefix]
 		if byLanguage == nil {
@@ -126,9 +147,15 @@ func (s *Store) RepoLanguageCounts(repoPrefixes []string) map[string]map[string]
 		byLanguage[language] = count
 	}
 	if err := rows.Err(); err != nil {
-		panicOnFatal(err)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
 	}
-	return out
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // RepoNodeIDsByKinds projects only node IDs for the full repository/kind set.
@@ -479,19 +506,47 @@ type publishedLanguageCountKey struct {
 // of once per checkout and commit generation. The returned map is shared:
 // callers must not modify it.
 func (s *Store) PublishedRepoLanguageCounts(repoPrefix string) map[string]int {
+	counts, err := s.PublishedRepoLanguageCountsContext(context.Background(), repoPrefix)
+	if err != nil {
+		panicOnFatal(err)
+		return nil
+	}
+	return counts
+}
+
+// PublishedRepoLanguageCountsContext memoizes only a complete successful read.
+// Cancellation is checked even on a cache hit; mutable base counts are uncached.
+func (s *Store) PublishedRepoLanguageCountsContext(ctx context.Context, repoPrefix string) (map[string]int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s.viewGen <= baseViewGeneration || s.coreless() {
-		return s.RepoLanguageCounts([]string{repoPrefix})[repoPrefix]
+		all, err := s.RepoLanguageCountsContext(ctx, []string{repoPrefix})
+		if err != nil {
+			return nil, err
+		}
+		return all[repoPrefix], nil
 	}
 	key := publishedLanguageCountKey{generation: s.viewGen, repoPrefix: repoPrefix}
 	if cached, ok := s.publishedLanguageCounts.Load(key); ok {
-		return cached.(map[string]int)
+		return cached.(map[string]int), nil
 	}
-	counts := s.RepoLanguageCounts([]string{repoPrefix})[repoPrefix]
+	all, err := s.RepoLanguageCountsContext(ctx, []string{repoPrefix})
+	if err != nil {
+		return nil, err
+	}
+	counts := all[repoPrefix]
 	if counts == nil {
 		counts = map[string]int{}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	actual, _ := s.publishedLanguageCounts.LoadOrStore(key, counts)
-	return actual.(map[string]int)
+	return actual.(map[string]int), nil
 }
 
 // generationPayloadPresenceSQL answers whether the handle's generation holds

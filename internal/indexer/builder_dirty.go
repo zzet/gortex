@@ -139,7 +139,7 @@ type DirtyLayerRequest struct {
 	// BaseCensusFunc): the floor check calls it only when the build's own
 	// files and the parent chain leave an enrichable language below the
 	// floor. A coordinator with chaining on sets it.
-	baseCensusFunc func(context.Context) map[string]int
+	baseCensusFunc func(context.Context) (map[string]int, error)
 	// baseOpen is how long the caller took to open the layer below (Base),
 	// reported as the plan's first preparation stage.
 	baseOpen time.Duration
@@ -338,7 +338,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	// read when a semantic manager could use it.
 	var chainCensus map[string]map[string]int
 	var baseCensus map[string]int
-	var baseCensusFunc func(context.Context) map[string]int
+	var baseCensusFunc func(context.Context) (map[string]int, error)
 	if b.Semantic != nil {
 		if req.parent > 0 {
 			chainCensus = dirtyChainLanguageCensus(ctx, b.Store, req.parent, req.RepoPrefix)

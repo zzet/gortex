@@ -3408,10 +3408,10 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 	// floor check calls it): counting the committed ancestry is a grouped scan
 	// of every full generation beneath the chain, tens of seconds on a cold
 	// store, and an ordinary edit's own files clear the floor without it.
-	var baseCensus func(context.Context) map[string]int
+	var baseCensus func(context.Context) (map[string]int, error)
 	if c.builder != nil && c.builder.Semantic != nil {
-		baseCensus = func(ctx context.Context) map[string]int {
-			return c.checkoutLanguageCensus(ctx, commitGeneration)
+		baseCensus = func(ctx context.Context) (map[string]int, error) {
+			return c.checkoutLanguageCensusContext(ctx, commitGeneration)
 		}
 	}
 	var stamped GenerationIdentity

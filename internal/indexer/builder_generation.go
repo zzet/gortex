@@ -293,14 +293,15 @@ type EnrichmentStage struct {
 	// the Go pass like an edit to twenty files does. Set by a coordinator
 	// with working-tree chaining on, for every working-tree build it makes.
 	BaseCensus map[string]int
-	// BaseCensusFunc, used when BaseCensus is nil, supplies it on demand. The
+	// BaseCensusFunc, used when BaseCensus is nil, supplies complete counts or
+	// an error on demand. A failed read cannot admit enrichment. The
 	// floor check calls it only when the generation's own files and the parent
 	// chain leave a language a provider serves below the floor: the base
 	// totals can only raise a total, so a language that clears without them
 	// clears with them, and counting the committed ancestry is a grouped scan
 	// of every full generation beneath the chain (tens of seconds on a cold
 	// store — the whole plan of the first edit after a restart).
-	BaseCensusFunc func(context.Context) map[string]int
+	BaseCensusFunc func(context.Context) (map[string]int, error)
 }
 
 // EnrichmentOutcome is what a build's enrichment stage did. It is the evidence
@@ -1177,10 +1178,23 @@ func (b *SparseGenerationBuilder) runEnrichment(
 	}
 	floor := semantic.EnrichmentAdmissionFloor()
 	if stage := req.Enrich; (stage.ChainCensus != nil || stage.BaseCensus != nil || stage.BaseCensusFunc != nil) && floor > 0 {
-		base := enrichmentBaseCensus(ctx, stage)
+		checkedBase := enrichmentBaseCensus(ctx, stage)
+		var censusErr error
+		var base func() map[string]int
+		if checkedBase != nil {
+			base = func() map[string]int {
+				counts, err := checkedBase()
+				censusErr = err
+				return counts
+			}
+		}
 		enrichable := func(language string) bool { return b.Semantic.ProviderForLanguage(language) != nil }
 		censusStarted := time.Now()
 		clears, baseRead := chainClearsEnrichmentFloor(handle, req.RepoPrefix, stage.ChainCensus, base, floor, enrichable)
+		if censusErr != nil {
+			out.Reason = "the committed language census could not be read: " + censusErr.Error()
+			return
+		}
 		if baseRead {
 			b.Logger.Info("indexer: admission floor read the committed state's language census",
 				zap.String("checkout", stage.CheckoutID),
@@ -1347,14 +1361,14 @@ func chainClearsEnrichmentFloor(handle graph.Store, repoPrefix string, chain map
 // enrichmentBaseCensus is the stage's committed-state census as a deferred
 // read: the eager map when the caller supplied one, else the lazy reader,
 // else nil (no base totals).
-func enrichmentBaseCensus(ctx context.Context, stage *EnrichmentStage) func() map[string]int {
+func enrichmentBaseCensus(ctx context.Context, stage *EnrichmentStage) func() (map[string]int, error) {
 	switch {
 	case stage.BaseCensus != nil:
 		counts := stage.BaseCensus
-		return func() map[string]int { return counts }
+		return func() (map[string]int, error) { return counts, nil }
 	case stage.BaseCensusFunc != nil:
 		read := stage.BaseCensusFunc
-		return func() map[string]int { return read(ctx) }
+		return func() (map[string]int, error) { return read(ctx) }
 	default:
 		return nil
 	}

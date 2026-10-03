@@ -1,9 +1,15 @@
 package indexer
 
 import (
+	"context"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/semantic"
+	"go.uber.org/zap"
 )
 
 // floorCensusHandle is a generation handle that answers only the per-file
@@ -116,5 +122,36 @@ func TestWorkingTreeBuildReadsTheCommittedCensusOnlyWhenItsOwnFilesFallShort(t *
 	}
 	if got := censusEntries(); got != 0 {
 		t.Fatalf("eight-unit edit read the committed census (%d entries); its own files clear the floor", got)
+	}
+}
+
+func TestEnrichmentRefusesACanceledCommittedCensus(t *testing.T) {
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "16")
+	s, err := store_sqlite.Open(filepath.Join(t.TempDir(), "census.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.AddBatchChecked([]*graph.Node{{ID: "r/f.go::F", Name: "F", Kind: graph.KindFunction, RepoPrefix: "r", FilePath: "r/f.go", Language: "go"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	provider := &retainingRepoProvider{retained: map[string]struct{}{}, leased: map[string]struct{}{}}
+	manager := semantic.NewManager(semantic.Config{Enabled: true}, zap.NewNop())
+	manager.RegisterProvider(provider)
+	t.Cleanup(func() { _ = manager.Close() })
+	b := &SparseGenerationBuilder{Semantic: manager, Logger: zap.NewNop()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	called := 0
+	req := BuildRequest{RepoPrefix: "r", Identity: GenerationIdentity{OwnerKind: checkoutLayerOwnerKind}, Enrich: &EnrichmentStage{
+		BaseCensusFunc: func(readCtx context.Context) (map[string]int, error) { called++; cancel(); return nil, readCtx.Err() },
+	}}
+	report := &BuildReport{}
+	b.runEnrichment(ctx, req, s, report)
+	if called != 1 || !strings.Contains(report.Enrichment.Reason, context.Canceled.Error()) || report.Enrichment.FloorFromChain || len(report.Enrichment.Ran) > 0 {
+		t.Fatalf("canceled census: calls=%d outcome=%+v", called, report.Enrichment)
+	}
+	if provider.retains != 0 {
+		t.Fatal("provider ran after failed committed census")
 	}
 }
