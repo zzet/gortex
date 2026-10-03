@@ -31,7 +31,7 @@ func TestCopyBudgetStopsWhenCurrentWALCrossesPressureMark(t *testing.T) {
 	reserved := s.walCopy.take(time.Now(), 3<<20, 1<<20)
 	require.Greater(t, reserved, 2*time.Second)
 	s.walCopy.mu.Lock()
-	initialRefill := s.walCopy.refilled
+	initialRefill, initialTokens := s.walCopy.refilled, s.walCopy.tokens
 	s.walCopy.mu.Unlock()
 	done := make(chan error, 1)
 	var joined bool
@@ -48,14 +48,19 @@ func TestCopyBudgetStopsWhenCurrentWALCrossesPressureMark(t *testing.T) {
 	go func() { pacer.beforeWrite(4096); done <- nil }()
 	until := time.Now().Add(time.Second)
 	entered := false
+	var observedRefill time.Time
+	var observedTokens float64
 	for !entered && time.Now().Before(until) {
 		s.walCopy.mu.Lock()
-		entered = s.walCopy.refilled.After(initialRefill)
+		observedRefill, observedTokens = s.walCopy.refilled, s.walCopy.tokens
+		// A take at the same coarse clock instant still spends tokens.
+		entered = !observedRefill.Equal(initialRefill) || observedTokens != initialTokens
 		s.walCopy.mu.Unlock()
 		if !entered {
 			time.Sleep(time.Millisecond)
 		}
 	}
+	t.Logf("budget_take_witness=%t initial_refill=%s observed_refill=%s initial_tokens=%f observed_tokens=%f", entered, initialRefill.Format(time.RFC3339Nano), observedRefill.Format(time.RFC3339Nano), initialTokens, observedTokens)
 	require.True(t, entered, "the page callback must first enter its below-mark budget wait")
 	require.NoError(t, churnWriteOnce(s, 0))
 	crossed := s.WALWriteMark()
