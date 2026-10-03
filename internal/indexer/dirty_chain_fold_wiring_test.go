@@ -272,7 +272,15 @@ func TestSteppedFoldCanceledHalfWayIsSweptAndTheNextFoldStartsClean(t *testing.T
 func TestSteppedFoldOverALargeChainObeysTheWALMark(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "1")
 	const perEdit = accumulatedDirtyUnits / 4
+	// This fixture measures the stepped fold of four large layers. Admit each
+	// 50-file edit as one delta rather than importing and folding it file by
+	// file during setup; the separate import tests cover that default path.
+	oldImportPaths := importInteractivePaths
+	importInteractivePaths = perEdit
+	t.Cleanup(func() { importInteractivePaths = oldImportPaths })
 	f, c, l := mcpChainFixture(t, accumulatedDirtyTree(accumulatedDirtyIndependent), false)
+	previous := f.route().CommitGenerationID
+	seen := make(map[int64]struct{}, 4)
 	var trigger CheckoutCycle
 	for e := 0; e < 4; e++ {
 		trigger = mcpEdit(t, l, f, func() {
@@ -280,6 +288,35 @@ func TestSteppedFoldOverALargeChainObeysTheWALMark(t *testing.T) {
 				accumulatedDirtyWriteUnit(t, f.worktree, accumulatedDirtyIndependent, u, true, false)
 			}
 		})
+		if trigger.DirtyBatchRemaining != 0 || trigger.ImportFolded || trigger.DirtyChainDepth != e+1 {
+			t.Fatalf("edit %d did not produce one large layer: %+v", e, trigger)
+		}
+		if _, duplicate := seen[trigger.DirtyGenerationID]; duplicate {
+			t.Fatalf("edit %d reused generation %d", e, trigger.DirtyGenerationID)
+		}
+		seen[trigger.DirtyGenerationID] = struct{}{}
+		row, found, err := f.catalog.GetViewGeneration(t.Context(), trigger.DirtyGenerationID)
+		if err != nil || !found || row.BaseGenerationID != previous {
+			t.Fatalf("edit %d layer is not over %d: %+v, found %v, err %v", e, previous, row, found, err)
+		}
+		masks, err := f.store.AtGeneration(trigger.DirtyGenerationID).FileMasksContext(t.Context())
+		if err != nil || len(masks) != perEdit {
+			t.Fatalf("edit %d layer claims %d files, want %d: %v", e, len(masks), perEdit, err)
+		}
+		wanted := make(map[string]struct{}, perEdit)
+		for u := e * perEdit; u < (e+1)*perEdit; u++ {
+			wanted[builderRepoPrefix+"/"+accumulatedDirtyUnitPath(accumulatedDirtyIndependent, u)] = struct{}{}
+		}
+		for _, mask := range masks {
+			if _, ok := wanted[mask.FilePath]; !ok || mask.Mode != store_sqlite.OwnershipReplace {
+				t.Fatalf("edit %d layer has an unexpected file claim: %+v", e, mask)
+			}
+			delete(wanted, mask.FilePath)
+		}
+		if len(wanted) != 0 {
+			t.Fatalf("edit %d layer omitted %d edited files", e, len(wanted))
+		}
+		previous = trigger.DirtyGenerationID
 	}
 	if trigger.DirtyChainDepth != 4 {
 		t.Fatalf("depth %d after four edits (%s)", trigger.DirtyChainDepth, trigger.DirtyChainReason)
