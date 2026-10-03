@@ -86,11 +86,11 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	}
 	// A candidate defined in the caller's own file is (or may be) module-
 	// local — the import pick must stand down and let the locality/scope
-	// cascade bind it. Any kind blocks: a local class, const, or nested
-	// helper of the same name all shadow an import at some scope, and
-	// falling through only preserves today's behaviour.
+	// cascade bind it. Local classes, consts and nested helpers all shadow
+	// imports. Import nodes only describe statements; they declare no local
+	// implementation and must not stand down their own import evidence.
 	for _, c := range candidates {
-		if c.FilePath == callerFile {
+		if c.FilePath == callerFile && c.Kind != graph.KindImport {
 			return nil
 		}
 	}
