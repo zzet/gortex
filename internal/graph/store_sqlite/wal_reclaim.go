@@ -432,6 +432,8 @@ type walReclaimResult struct {
 	// lastResort: the log is at walReclaimLastResortBytes; this attempt may
 	// hold the writer up to walReclaimMaxWriterHold (logged).
 	lastResort bool
+	// A round promoted after growth must recheck its same-WAL frontier at writer admission.
+	lastResortPromotion *walReclaimFrontier
 	// bulkCompletion: an admitted over-ceiling bulk lease override may finish
 	// a reader-pinned tail inside the same bounded, open-read-gate hold.
 	bulkCompletion bool
@@ -939,6 +941,14 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		res.reason = "adaptive_completion_deferred"
 		return errWALReclaimReadersInFlight
 	}
+	allowance := walReclaimMaxWriterHold
+	if res.lastResortPromotion != nil {
+		allowance -= res.writerSpent
+		if allowance <= 0 {
+			res.reason = "last_resort_credit_spent"
+			return errWALReclaimReadersInFlight
+		}
+	}
 	// Below: the last resort or over-ceiling bulk completion hold, or the closed-gate path (the
 	// open-gate stages disabled).
 	// 3. Writer quiescence, capped at walReclaimMaxWriterHold from here on.
@@ -955,12 +965,24 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	defer func() {
 		writer.release()
 		res.writerHold = max(res.writerHold, writer.longest)
+		res.writerSpent += writer.spent
 	}()
 	if s.bulkConn != nil && !res.leaseOverride {
 		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
 		return errWALCheckpointDeferredBulk
 	}
-	hctx, hcancel := context.WithDeadline(ctx, held.Add(walReclaimMaxWriterHold))
+	if expected := res.lastResortPromotion; expected != nil {
+		current, ok := readWALReclaimFrontier(s.dbPath)
+		if !ok || current.salt != expected.salt || current.mx < expected.mx || current.backfill < expected.backfill || walFileSize(s.dbPath+"-wal") < walReclaimLastResortBytes(cfg) {
+			res.reason = "last_resort_frontier_changed"
+			return errWALReclaimReadersInFlight
+		}
+		if !res.pressure && !res.hardCap && s.cycleYieldEnabled() && s.buildLaneBusy() {
+			res.outcome, res.reason = walReclaimSkipped, "build_lane_busy"
+			return errWALCheckpointYieldedToCycle
+		}
+	}
+	hctx, hcancel := context.WithDeadline(ctx, held.Add(allowance))
 	defer hcancel()
 	yctx, stopYield := hctx, func() {}
 	if !urgent {
@@ -984,7 +1006,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	// retry: an interrupted or refused PASSIVE reports 0/0 and must not be
 	// spun on while the writer is held.
 	backfill := func() (walCheckpointResult, error) {
-		result, err := writer.passive(yctx, ctx, ckptDB, walReclaimMaxWriterHold, res.leaseOverride)
+		result, err := writer.passive(yctx, ctx, ckptDB, allowance, res.leaseOverride)
 		yctx = writer.resetContext(yctx)
 		if err != nil && errors.Is(err, errSQLiteCheckpointIncomplete) && yctx.Err() == nil {
 			// Incomplete is a result, not a failure: a reader still needs
@@ -1023,7 +1045,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		// (see reclaimWALInLane): the writer stays held, up to
 		// walReclaimMaxWriterHold, while the readers admitted before the
 		// backfill end.
-		capAt := held.Add(walReclaimMaxWriterHold)
+		capAt := held.Add(allowance)
 		// A complete backfill may already be resettable: SQLite blocks a
 		// TRUNCATE only on readers holding a WAL read mark (slots 1..n); a
 		// reader that began after the backfill completed took slot 0 and does
@@ -1077,7 +1099,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	if residue := delta.WALFrames - delta.CheckpointedFrames; residue > walReclaimClosedGateMaxResidue {
 		return giveUp(fmt.Sprintf("backfill_incomplete residue_frames=%d", residue), nil)
 	}
-	if room := time.Until(held.Add(walReclaimMaxWriterHold)); room < cfg.truncateBudget {
+	if room := time.Until(held.Add(allowance)); room < cfg.truncateBudget {
 		return giveUp(fmt.Sprintf("writer_hold_cap room=%s", room.Round(time.Millisecond)), nil)
 	}
 	start := time.Now()
@@ -1467,9 +1489,31 @@ var (
 
 func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult) error {
 	deadline := time.Now().Add(walReclaimLaneReaderWait)
+	entry, entryOK := readWALReclaimFrontier(s.dbPath)
+	mark := walReclaimLastResortBytes(cfg)
+	waitCtx, stopMarkWatch := s.watchWALMark(ctx, s.dbPath+"-wal", mark)
+	defer stopMarkWatch()
 	for round := 1; ; round++ {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if mark > 0 && walFileSize(s.dbPath+"-wal") >= mark {
+			current, ok := readWALReclaimFrontier(s.dbPath)
+			if !entryOK || !ok || current.salt != entry.salt || current.mx < entry.mx || current.backfill < entry.backfill {
+				res.reason = "last_resort_frontier_changed"
+				return errWALReclaimReadersInFlight
+			}
+			if !res.pressure && !res.hardCap && s.cycleYieldEnabled() && s.buildLaneBusy() {
+				res.outcome, res.reason = walReclaimSkipped, "build_lane_busy"
+				return errWALCheckpointYieldedToCycle
+			}
+			res.lastResort, res.lastResortPromotion = true, &current
+			if cfg.thresholdBytes > 0 && walFileSize(s.dbPath+"-wal") >= walReclaimUrgentFactor*cfg.thresholdBytes {
+				res.urgent = true
+			}
+			// Keep this operation's deadline and charge every preceding short
+			// hold to the existing completion allowance. SQLite still decides reset.
+			return s.reclaimWALInLane(ctx, cfg, ckptDB, res)
 		}
 		done, err := s.reclaimWALResetHold(ctx, cfg, ckptDB, res, round == 1, !res.pressure && !res.hardCap)
 		if done || err != nil {
@@ -1489,7 +1533,10 @@ func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConf
 			return errWALCheckpointYieldedToCycle
 		}
 		if res.resetReaders != nil {
-			epoch, older, werr := s.waitWALRoundReaders(ctx, res, deadline)
+			epoch, older, werr := s.waitWALRoundReaders(waitCtx, res, deadline)
+			if werr != nil && ctx.Err() == nil && waitCtx.Err() != nil && mark > 0 && walFileSize(s.dbPath+"-wal") >= mark {
+				continue // recheck current identity/mark at the round boundary
+			}
 			if werr != nil {
 				res.blocker, res.hasBlocker = s.readGate.oldestOlderThan(epoch, time.Now())
 				res.reason = fmt.Sprintf("older_readers_in_flight older_readers=%d rounds=%d writer_holds=%d", older, round, res.writerHolds)
@@ -1510,9 +1557,12 @@ func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConf
 		if observer != nil {
 			observer("lane_post_copy_full_wait_start", epoch, s.readGate.olderCount(epoch), nil)
 		}
-		older, werr := s.readGate.waitOlder(ctx, epoch, deadline)
+		older, werr := s.readGate.waitOlder(waitCtx, epoch, deadline)
 		if observer != nil {
 			observer("lane_post_copy_full_wait_end", epoch, older, werr)
+		}
+		if werr != nil && ctx.Err() == nil && waitCtx.Err() != nil && mark > 0 && walFileSize(s.dbPath+"-wal") >= mark {
+			continue // a growing WAL now qualifies the existing completion class
 		}
 		if werr != nil {
 			res.blocker, res.hasBlocker = s.readGate.oldestOlderThan(epoch, time.Now())
