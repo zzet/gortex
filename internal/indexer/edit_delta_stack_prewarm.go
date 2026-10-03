@@ -322,7 +322,7 @@ func likelyEditedFiles(ctx context.Context, root string) []string {
 		data, _ := exec.CommandContext(ctx, "git", append([]string{"-C", root}, args...)...).Output()
 		return string(data)
 	}
-	for _, line := range strings.Split(run("status", "--porcelain", "--untracked-files=no"), "\n") {
+	for _, line := range strings.Split(run("--no-optional-locks", "status", "--porcelain", "--untracked-files=no"), "\n") {
 		if len(line) > 3 {
 			path := line[3:]
 			if i := strings.Index(path, " -> "); i >= 0 {
