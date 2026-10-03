@@ -120,7 +120,15 @@ func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *
 	before, beforeOK := readWALReclaimFrontier(w.store.dbPath)
 	beforeOK = beforeOK && time.Now().Before(deadline) && ctx.Err() == nil
 	copyStarted := time.Now()
-	result, err := checkpointWALOnceOn(opCtx, db, "PASSIVE")
+	queryer := walCheckpointQueryer(db)
+	if observe := walReclaimCreditPassiveQueryerObserver; observe != nil {
+		var cleanup func()
+		queryer, cleanup = observe(opCtx, w.store, db)
+		if cleanup != nil {
+			defer cleanup()
+		}
+	}
+	result, err := checkpointWALOnceOn(opCtx, queryer, "PASSIVE")
 	copyElapsed := time.Since(copyStarted)
 	finish()
 	if w.held {
@@ -177,3 +185,9 @@ func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *
 	}
 	return walCheckpointResult{WALFrames: int(snap.MxFrame), CheckpointedFrames: int(snap.NBackfill)}, nil
 }
+
+// walReclaimCreditPassiveQueryerObserver lets a scoped test pin the actual
+// checkpoint connection for VFS phase attribution. Nil keeps the direct DB
+// query unchanged; it does not install a page pacer or change writer credit.
+// Install before owned workers start and restore after they have joined.
+var walReclaimCreditPassiveQueryerObserver func(context.Context, *Store, *sql.DB) (walCheckpointQueryer, func())

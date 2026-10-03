@@ -14,13 +14,14 @@ import (
 type reclaimCheckpointSpan struct{ start, end time.Time }
 
 type reclaimCheckpointSyncInterval struct {
-	span  reclaimCheckpointSpan
-	tls   uintptr
-	store *Store
-	pacer *walCopyPacer
+	span   reclaimCheckpointSpan
+	tls    uintptr
+	store  *Store
+	pacer  *walCopyPacer
+	credit *reclaimCheckpointCreditIdentity
 }
 
-// Call attribution is conservative: the exact same live TLS/pacer/Store was
+// Call attribution is conservative: the exact same live TLS/pacer-or-credit/Store was
 // observed at both VFS boundaries, and the span must be wholly contained in
 // exactly one checkpoint call with no overlap with another recorded call.
 // Sorting and merging clipped intervals prevents duplicate or overlapping
@@ -32,7 +33,9 @@ func knownPreEditCheckpointSync(store *Store, calls []reclaimCheckpointSpan, cal
 	call := calls[callIndex]
 	var qualified []reclaimCheckpointSpan
 	for _, p := range syncs {
-		if p.store != store || p.pacer == nil || p.pacer.store != store || p.tls == 0 ||
+		pacedIdentity := p.pacer != nil && p.pacer.store == store
+		creditIdentity := p.credit != nil && p.credit.store == store && p.credit.tls == p.tls
+		if p.store != store || (!pacedIdentity && !creditIdentity) || p.tls == 0 ||
 			!p.span.end.After(p.span.start) || !p.span.start.Before(editStart) ||
 			p.span.start.Before(call.start) || p.span.end.After(call.end) {
 			continue

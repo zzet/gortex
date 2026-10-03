@@ -258,6 +258,10 @@ var reclaimSyncWrapper = func(tls *libc.TLS, pFile uintptr, flags int32) int32 {
 	}
 	phaseTLS := uintptr(unsafe.Pointer(tls))
 	phaseProbe, phasePacer := reclaimCheckpointSyncProbeAt(phaseTLS)
+	var phaseCredit *reclaimCheckpointCreditIdentity
+	if phaseProbe == nil {
+		phaseProbe, phaseCredit = reclaimCheckpointCreditProbeAt(phaseTLS)
+	}
 	var phaseStarted time.Time
 	if phaseProbe != nil {
 		phaseStarted = time.Now()
@@ -287,9 +291,11 @@ var reclaimSyncWrapper = func(tls *libc.TLS, pFile uintptr, flags int32) int32 {
 	if phaseProbe != nil {
 		ended := time.Now()
 		currentProbe, currentPacer := reclaimCheckpointSyncProbeAt(phaseTLS)
-		if currentProbe == phaseProbe && currentPacer == phasePacer {
+		currentCreditProbe, currentCredit := reclaimCheckpointCreditProbeAt(phaseTLS)
+		if (phasePacer != nil && currentProbe == phaseProbe && currentPacer == phasePacer) ||
+			(phaseCredit != nil && currentCreditProbe == phaseProbe && currentCredit == phaseCredit) {
 			phaseProbe.observe(reclaimCheckpointSyncInterval{
-				tls: phaseTLS, store: phaseProbe.store, pacer: phasePacer,
+				tls: phaseTLS, store: phaseProbe.store, pacer: phasePacer, credit: phaseCredit,
 				span: reclaimCheckpointSpan{start: phaseStarted, end: ended},
 			})
 		}

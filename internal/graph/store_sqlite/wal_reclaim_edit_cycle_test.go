@@ -52,6 +52,7 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 	}
 	t.Cleanup(func() { walCopyPassObserver = nil })
 
+	installCreditCheckpointSyncObservation(t)
 	diag := newWindowsWALDiagnostic(t)
 	diag.install()
 	defer diag.finish()
@@ -257,6 +258,9 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 	var worstForeground time.Duration
 	for _, w := range committedWrites {
 		worstForeground = max(worstForeground, w.end.Sub(w.start))
+	}
+	for i, p := range checkpointSyncs {
+		t.Logf("checkpoint_sync i=%d TLS=%x store=%p pacer=%p credit=%p start=%s end=%s duration=%s", i, p.tls, p.store, p.pacer, p.credit, p.span.start.Format(time.RFC3339Nano), p.span.end.Format(time.RFC3339Nano), p.span.end.Sub(p.span.start))
 	}
 	t.Logf("all_raw_checkpoint_overlap=%s original_nonpaused_raw_overlap=%s raw_late_stops=%d observed_sync_intervals=%d foreground_gate_SQL_max=%s", allRawInside, rawInside, rawLateStops, len(checkpointSyncs), worstForeground)
 	require.LessOrEqual(t, worstForeground, 500*time.Millisecond, "actual foreground SQL exceeded existing mutation latency contract")
