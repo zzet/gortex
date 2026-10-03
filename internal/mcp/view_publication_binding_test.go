@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -242,37 +243,65 @@ func TestWorktreeEditPublicationRecordCarriesTheDemandWokenCycle(t *testing.T) {
 // disk commit, and the ticket capture after it, in the order they run: a
 // slow commit is then attributable to one named step.
 func TestWorktreeEditPublicationRecordTimesTheCommitSubPhases(t *testing.T) {
-	fixture := newRealCheckoutMutationFixture(t)
-	cwd := fixture.worktree
-	written := fixture.edit(t, cwd, map[string]any{
-		"path": "repo/edit.go", "old_string": "func New() {}", "new_string": "func SubPhasedInWorktree() {}",
-	})
-	require.False(t, written.IsError, viewResultText(t, written))
-	fixture.awaitMutation(t, cwd, written)
-
-	var snapshot indexer.PublicationPhaseSnapshot
-	require.Eventually(t, func() bool {
-		for _, record := range indexer.DefaultPublicationPhases().Snapshot(fixture.checkoutID) {
-			if record.Source == indexer.PublicationSourceMCPEdit && record.Terminal {
-				snapshot = record
-				return true
-			}
+	for _, sampledAdmission := range []bool{false, true} {
+		name := "native HEAD evidence"
+		if sampledAdmission {
+			name = "sampled HEAD admission"
 		}
-		return false
-	}, 20*time.Second, 10*time.Millisecond, "the edit's record never closed")
-	offsets := publicationOffsets(snapshot)
-	order := []indexer.PublicationPhase{
-		indexer.PublicationReceived, indexer.PublicationViewSelected, indexer.PublicationViewResolved, indexer.PublicationMutationLocked,
-		indexer.PublicationMutationAdmitted, indexer.PublicationHandlerStarted, indexer.PublicationParseGated,
-		indexer.PublicationWriteSampled, indexer.PublicationWriteValidated, indexer.PublicationRouteWithdrawn,
-		indexer.PublicationDiskWriteStarted, indexer.PublicationReceiptCommitted, indexer.PublicationTicketCaptured,
-		indexer.PublicationTicketEnqueued,
-	}
-	previous := int64(-1)
-	for _, phase := range order {
-		offset, ok := offsets[phase]
-		require.True(t, ok, "the edit's record lacks %s: %+v", phase, snapshot.Phases)
-		require.GreaterOrEqual(t, offset, previous, "%s precedes the phase before it: %+v", phase, snapshot.Phases)
-		previous = offset
+		t.Run(name, func(t *testing.T) {
+			fixture := newRealCheckoutMutationFixture(t)
+			if sampledAdmission {
+				require.NoError(t, os.Mkdir(filepath.Join(fixture.primary, ".git", "reftable"), 0o755))
+			}
+			cwd := fixture.worktree
+			written := fixture.edit(t, cwd, map[string]any{
+				"path": "repo/edit.go", "old_string": "func New() {}", "new_string": "func SubPhasedInWorktree() {}",
+			})
+			require.False(t, written.IsError, viewResultText(t, written))
+			fixture.awaitMutation(t, cwd, written)
+
+			var snapshot indexer.PublicationPhaseSnapshot
+			require.Eventually(t, func() bool {
+				for _, record := range indexer.DefaultPublicationPhases().Snapshot(fixture.checkoutID) {
+					if record.Source == indexer.PublicationSourceMCPEdit && record.Terminal {
+						snapshot = record
+						return true
+					}
+				}
+				return false
+			}, 20*time.Second, 10*time.Millisecond, "the edit's record never closed")
+			offsets := publicationOffsets(snapshot)
+			order := []indexer.PublicationPhase{
+				indexer.PublicationReceived, indexer.PublicationViewSelected, indexer.PublicationViewResolved, indexer.PublicationMutationLocked,
+				indexer.PublicationMutationAdmitted, indexer.PublicationHandlerStarted, indexer.PublicationParseGated,
+				indexer.PublicationWriteValidated, indexer.PublicationRouteWithdrawn,
+				indexer.PublicationDiskWriteStarted, indexer.PublicationReceiptCommitted, indexer.PublicationTicketCaptured,
+				indexer.PublicationTicketEnqueued,
+			}
+			previous := int64(-1)
+			for _, phase := range order {
+				offset, ok := offsets[phase]
+				require.True(t, ok, "the edit's record lacks %s: %+v", phase, snapshot.Phases)
+				require.GreaterOrEqual(t, offset, previous, "%s precedes the phase before it: %+v", phase, snapshot.Phases)
+				previous = offset
+			}
+			// The record retains the first sample: on unsupported HEAD layouts it
+			// belongs to admission; with usable evidence it belongs to Prepare.
+			sampled, ok := offsets[indexer.PublicationWriteSampled]
+			require.True(t, ok, "the edit's record lacks write_sampled: %+v", snapshot.Phases)
+			require.GreaterOrEqual(t, sampled, offsets[indexer.PublicationMutationLocked])
+			require.LessOrEqual(t, sampled, offsets[indexer.PublicationWriteValidated])
+			if sampledAdmission {
+				require.LessOrEqual(t, sampled, offsets[indexer.PublicationMutationAdmitted], "unsupported HEAD evidence must sample during admission")
+			}
+			if sampled > offsets[indexer.PublicationMutationAdmitted] {
+				require.GreaterOrEqual(t, sampled, offsets[indexer.PublicationParseGated], "Prepare must sample after the parse gate")
+			}
+			previous = -1
+			for _, phase := range snapshot.Phases {
+				require.GreaterOrEqual(t, phase.OffsetNS, previous, "phase record is not chronological: %+v", snapshot.Phases)
+				previous = phase.OffsetNS
+			}
+		})
 	}
 }
