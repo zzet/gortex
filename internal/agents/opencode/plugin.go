@@ -17,20 +17,18 @@ package opencode
 // shells out on every tool call into the user's git tree would push it
 // onto every teammate who clones — an executable they never asked for,
 // arriving through a code review that reads like a config change. The
-// global dir (`~/.config/opencode/plugin/`) covers every project the user
-// opens without that, so it is where the bridge goes and the repo tree
-// keeps only inert markdown.
+// global dir (`~/.config/opencode/plugins/gortex/`) covers every project
+// the user opens without that, so it is where the bridge goes and the repo
+// tree keeps only inert markdown.
 //
-// # Why `plugin/`, singular, when everything else is plural
+// # V2 plugin layout
 //
-// OpenCode accepts `plugin/` and `plugins/` alike, and this file picks
-// the singular for the one reason the choice is not arbitrary: unlike
-// skills, commands and agents, the plugin glob is single-level
-// (`{plugin,plugins}/*.{ts,js}`) and does not recurse. Using the
-// odd-one-out spelling keeps that odd-one-out rule attached to a name a
-// reader will notice, so a later "tidy this up to match the others" edit
-// has to stop and read this comment before nesting the file into a
-// subdirectory where it would silently never load again.
+// OpenCode V2 discovers local plugins from `.opencode/plugins/` (and
+// `.config/opencode/plugins/` for global). Each plugin lives in its own
+// directory with a package.json. The V1 single-file `plugin/` layout is
+// still read for backward compatibility but cannot resolve the
+// `@opencode/plugin` import that V2 plugins need. This file installs the
+// V2 layout so the bridge works on OpenCode 2.x.
 
 import (
 	"encoding/json"
@@ -55,10 +53,13 @@ const (
 	sentinelEnforce = "{{GORTEX_ENFORCE}}"
 )
 
+// PluginDir is the directory name for the bridge inside the plugins directory.
+const PluginDir = "gortex"
+
 // PluginFileName is the bridge's file name inside the plugin directory.
 // Stable across releases so a re-install overwrites in place rather than
 // leaving two plugins racing each other on every tool call.
-const PluginFileName = "gortex.js"
+const PluginFileName = "index.js"
 
 // PluginMarker is a string every rendered bridge contains. inspect.go
 // matches on it to tell "a Gortex bridge is installed" from "some other
@@ -71,10 +72,29 @@ const PluginFileName = "gortex.js"
 // away by a formatter without changing a thing.
 const PluginMarker = `"--agent=` + Name + `"`
 
+// packageJSON is the package.json for the V2 plugin layout.
+// @opencode/plugin is provided by the OpenCode runtime; "*" lets bun/npm
+// accept it without needing an exact version from the registry.
+const packageJSON = `{
+  "name": "gortex",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "@opencode/plugin": "*"
+  }
+}
+`
+
 // PluginPath is where the bridge is installed for a given home. Exported
 // so inspect.go and the doctor wiring name the same file the writer does.
 func PluginPath(home string) string {
-	return filepath.Join(globalConfigDir(home), "plugin", PluginFileName)
+	return filepath.Join(globalConfigDir(home), "plugins", PluginDir, PluginFileName)
+}
+
+// PluginPkgPath is the package.json location for the V2 plugin layout.
+func PluginPkgPath(home string) string {
+	return filepath.Join(globalConfigDir(home), "plugins", PluginDir, "package.json")
 }
 
 // hookArgv is the command the plugin shells for every bridged event.
@@ -86,7 +106,7 @@ func hookArgv(env agents.Env) []string {
 	return argv
 }
 
-// renderPlugin fills the embedded JavaScript template with the resolved
+// renderPlugin fills the embedded V2 JavaScript template with the resolved
 // gortex binary, the hook argv, and the enforcement flag.
 func renderPlugin(env agents.Env) string {
 	argv := hookArgv(env)
@@ -95,6 +115,12 @@ func renderPlugin(env agents.Env) string {
 	src = substituteSentinel(src, sentinelArgv, jsonValue(argv))
 	src = substituteSentinel(src, sentinelEnforce, jsonValue(env.InstallHooks))
 	return src
+}
+
+// V1PluginPath is the legacy V1 plugin location (~/.config/opencode/plugin/gortex.js).
+// Kept for inspect.go and remove.go to detect/clean up old installs.
+func V1PluginPath(home string) string {
+	return filepath.Join(globalConfigDir(home), "plugin", "gortex.js")
 }
 
 // applyPlugin writes the bridge, or reports that it deliberately did not.
@@ -113,11 +139,31 @@ func applyPlugin(env agents.Env, opts agents.ApplyOpts) ([]agents.FileAction, er
 	if !env.InstallHooks || env.Home == "" {
 		return nil, nil
 	}
+	actions := make([]agents.FileAction, 0, 2)
+
+	// Write the V2 plugin file (plugins/gortex/index.js)
+	// This single file serves both V2 (default export) and V1 (named `server` export).
 	action, err := agents.WriteOwnedFile(env.Stderr, PluginPath(env.Home), renderPlugin(env), opts)
 	if err != nil {
 		return nil, err
 	}
-	return []agents.FileAction{action}, nil
+	actions = append(actions, action)
+
+	// Write the package.json for V2 plugin layout
+	action, err = agents.WriteOwnedFile(env.Stderr, PluginPkgPath(env.Home), packageJSON, opts)
+	if err != nil {
+		return nil, err
+	}
+	actions = append(actions, action)
+
+	// NOTE: We no longer write the legacy V1 plugin file (plugin/gortex.js)
+	// because OpenCode V2 loads plugins from both plugin/ and plugins/
+	// directories, and the V1 file lacks the V2 default export (id + setup).
+	// The V2 plugin at plugins/gortex/index.js already exports both
+	// `export default v2Plugin` (for V2) and `export { server }` (for V1),
+	// making the separate V1 file redundant and a source of load errors.
+
+	return actions, nil
 }
 
 // planPlugin mirrors applyPlugin's gating so `--dry-run` and `doctor`
@@ -126,7 +172,12 @@ func planPlugin(env agents.Env) []agents.FileAction {
 	if env.Mode != agents.ModeGlobal || !env.InstallHooks || env.Home == "" {
 		return nil
 	}
-	return []agents.FileAction{{Path: PluginPath(env.Home), Action: agents.ActionWouldCreate}}
+	return []agents.FileAction{
+		{Path: PluginPath(env.Home), Action: agents.ActionWouldCreate},
+		{Path: PluginPkgPath(env.Home), Action: agents.ActionWouldCreate},
+		// NOTE: V1 plugin file (plugin/gortex.js) is no longer written.
+		// The V2 plugin at plugins/gortex/index.js serves both V2 and V1.
+	}
 }
 
 // resolveGortexBin prefers the binary the caller already resolved into
