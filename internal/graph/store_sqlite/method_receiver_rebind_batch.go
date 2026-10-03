@@ -167,6 +167,7 @@ WHERE id IN (SELECT edge_id FROM temp.go_receiver_rebind_candidates)`); err != n
 		s.analysisGenerationPresent = s.analysisLatchRemaining
 	}
 	s.finishAnalysisMutationLocked(true)
+	s.noteBaseEdgeEndpointRewriteLocked(true)
 	return int(candidates), nil
 }
 

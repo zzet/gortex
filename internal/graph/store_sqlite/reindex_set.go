@@ -147,6 +147,7 @@ func (s *Store) reindexEdgesSetChunk(chunk []graph.EdgeReindex) (sqliteReindexSe
 		s.analysisGenerationPresent = s.analysisLatchRemaining
 	}
 	s.finishAnalysisMutationLocked(changed)
+	s.noteBaseEdgeEndpointRewriteLocked(changed)
 	if changed {
 		s.publishSQLiteReindexReceiptLocked(receipt)
 	}

@@ -2704,6 +2704,24 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			successfulFiles.Store(path, struct{}{})
 		}
 	}
+	// The shadow drains in a later defer. Publish its successful provenance
+	// only after that drain, never against rows a canceled replacement retired.
+	var publishShadowBaseline func()
+	var shadowPublicationComplete, shadowReplacementStarted, shadowAttemptCounted bool
+	defer func() {
+		if shadowAttemptCounted && !shadowPublicationComplete {
+			idx.indexCount.Add(-1) // retry the failed staging attempt as a full replacement
+		}
+		if shadowReplacementStarted && !shadowPublicationComplete {
+			if err := os.Remove(merkleTreeFile(idx.rootPath)); err != nil && !os.IsNotExist(err) {
+				idx.logger.Warn("indexer: discard interrupted shadow baseline", zap.Error(err))
+			}
+		}
+		if retErr == nil && shadowPublicationComplete && publishShadowBaseline != nil {
+			publishShadowBaseline()
+			graph.MaybeEnsurePlannerStatsFresh(graph.WithPlannerStatsLoadBoundary(ctx), idx.graph)
+		}
+	}()
 	// Register before panic recovery and shadow restoration: failures remain
 	// durable even when a full pass fails, while recovery is acknowledged only
 	// after its replacement graph has committed to the original store.
@@ -3182,6 +3200,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// into the durable store, which is far cheaper than writing each node
 		// and edge through as it is parsed.
 		idx.indexCount.Add(1)
+		shadowAttemptCounted = true
 		if err := idx.markSymbolFTSNormalizationPending(idx.graph); err != nil {
 			return nil, err
 		}
@@ -3261,7 +3280,19 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// this handle's generation after the replacement parse succeeds and
 			// before its first disk write. Immutable payload generations sharing
 			// the prefix remain queryable through their catalog pointers.
-			if n, e := evictRepoCurrentGeneration(diskTarget, idx.RepoPrefix()); n > 0 || e > 0 {
+			var evictedNodes, evictedEdges int
+			if sqlite, ok := diskTarget.(*store_sqlite.Store); ok && sqlite.ViewGeneration() == 0 {
+				var err error
+				shadowReplacementStarted = true
+				evictedNodes, evictedEdges, err = sqlite.EvictRepoForShadowReplacement(ctx, idx.RepoPrefix())
+				if err != nil {
+					retErr = fmt.Errorf("indexer: retire shadow replacement rows: %w", err)
+					return
+				}
+			} else {
+				evictedNodes, evictedEdges = evictRepoCurrentGeneration(diskTarget, idx.RepoPrefix())
+			}
+			if n, e := evictedNodes, evictedEdges; n > 0 || e > 0 {
 				idx.logger.Info("indexer: evicted stale generation rows before shadow drain",
 					zap.String("repo", idx.RepoPrefix()),
 					zap.Int("nodes", n), zap.Int("edges", e))
@@ -3425,50 +3456,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", ctx.Err())
 			}
 			if retErr == nil {
-				// End of this repository's drain: this block runs on the way
-				// out of IndexCtx, after persistRepoIndexState. It is not the
-				// last thing the pass does — the compact sidecars below it,
-				// the backend symbol index and the FTS normalization all still
-				// follow — but it is the first point at which BOTH halves of
-				// the freshness verdict are current, and nothing earlier on
-				// this path has them: the rows have just landed in the
-				// physical tables, and the counters describing them were
-				// written a moment ago.
-				//
-				// BeginBulkLoad was a no-op if the store was already
-				// populated, so FlushBulk returned without re-analyzing
-				// anything; nothing else has, since the store was a fraction
-				// of this size. Cheap when the statistics are already fresh.
-				//
-				// This runs INSIDE the process-global reach topology writer
-				// gate and the caller's repository mutation lane (see the
-				// BeginTopologyMutation window in IndexRepo). Reach readers
-				// give up rather than wait, so anything blocking here turns
-				// MCP answers empty for its duration.
-				//
-				// What the cooperative shape buys, exactly: the refresh never
-				// QUEUES on the store's write gate underneath these, and never
-				// holds it across more than one bounded index — so other store
-				// writers, and the bounded-gate writers that drop their
-				// batches after 15 s, keep making progress. It also bounds
-				// what THIS boundary pays under the gates above: a pass stops
-				// starting indexes once its budget is spent, so the
-				// gate-holding cost here is that budget plus one index's
-				// ANALYZE plus one bounded sqlite_schema reload. It does not
-				// make the cost zero — the remaining indexes are carried to
-				// the next boundary on a resume cursor, which is where the
-				// mechanism converges.
-				//
-				// Outside that bound, and paid under these same wider gates:
-				// two health probes, the present-index list, and the set of
-				// indexes that already carry a statistics row. All four are
-				// read-pool queries taking no store lock.
-				//
-				// This is the boundary that ends a whole index: no edit is
-				// admitted over the drained rows yet, so a refresh the store
-				// owes (statistics absent for an index that holds rows) runs
-				// to the end here instead of deferring into the edits.
-				graph.MaybeEnsurePlannerStatsFresh(graph.WithPlannerStatsLoadBoundary(ctx), diskTarget)
+				// Success provenance and its planner-statistics boundary run after
+				// this complete drain in the earlier-registered publication defer.
 
 				if serr := persistShadowCompactSidecars(
 					inMemShadow, diskTarget, idx.RepoPrefix(),
@@ -3511,6 +3500,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					deferredVectorPlan = nil
 				}
 			}
+			shadowPublicationComplete = retErr == nil
 		}()
 	} else if diskTarget == nil && idx.graph.NodeCount() == 0 && idx.graph.EdgeCount() == 0 {
 		if _, isBulk := idx.graph.(graph.BulkLoader); isBulk && firstIndex && (!belowShadowMax || !belowShadowBytes || !shadowTaken) {
@@ -4590,18 +4580,24 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 
 	// Persist the Merkle baseline so the next incremental pass diffs
 	// against content hashes rather than re-indexing the whole repo.
-	workspaceFP := ""
-	if merkleBaseline != nil {
-		paths := make([]string, len(files))
-		for i, wf := range files {
-			paths[i] = wf.path
+	nodes, edges := idx.repoNodeEdgeCount()
+	publishBaseline := func() {
+		workspaceFP := ""
+		if merkleBaseline != nil {
+			paths := make([]string, len(files))
+			for i, wf := range files {
+				paths[i] = wf.path
+			}
+			workspaceFP = idx.saveMerkleBaselineWithKnownFiles(absRoot, paths, merkleBaseline.take())
 		}
-		workspaceFP = idx.saveMerkleBaselineWithKnownFiles(absRoot, paths, merkleBaseline.take())
+		idx.persistRepoIndexState(diskTarget, absRoot, workspaceFP, nodes, edges)
+	}
+	if diskTarget != nil {
+		publishShadowBaseline = publishBaseline
+	} else {
+		publishBaseline()
 	}
 	idx.indexGen.Add(1) // invalidate the trigram search cache
-
-	nodes, edges := idx.repoNodeEdgeCount()
-	idx.persistRepoIndexState(diskTarget, absRoot, workspaceFP, nodes, edges)
 	// The persisted counters are what the planner-statistics freshness check
 	// measures growth with, and on the direct-SQLite path this is the only
 	// point in the pass where they and the corpus are both current — which is

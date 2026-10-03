@@ -208,6 +208,10 @@ type storeCore struct {
 	// edge payload/topology mutation, including same-key replacements. Resolver
 	// liveness snapshots use it to reject stale work after watcher interleaves.
 	edgeMutationRevision atomic.Uint64
+	// baseEdgeEndpointRevision changes only for committed endpoint-rewrite
+	// families on generation zero. Append-only ingest does not restart a
+	// bounded shadow retirement, and checkout generations are independent.
+	baseEdgeEndpointRevision atomic.Uint64
 
 	// analysisMutationRevision closes the in-process race between loading or
 	// computing a persisted whole-graph analysis and a concurrent graph write.
