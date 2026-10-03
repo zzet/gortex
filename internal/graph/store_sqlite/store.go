@@ -1688,6 +1688,12 @@ var walCheckpointCallObserver func(mode string, start time.Time, took time.Durat
 var walCheckpointResultObserver func(mode string, start time.Time, took time.Duration, result walCheckpointResult, scanErr error)
 
 func checkpointWALOnceOn(ctx context.Context, q walCheckpointQueryer, mode string) (walCheckpointResult, error) {
+	// A withdrawn attempt is not a dispatched checkpoint. Refuse before both
+	// test observers and the query boundary so late loop iterations cannot
+	// report checkpoint work that database/sql will reject without SQL.
+	if err := ctx.Err(); err != nil {
+		return walCheckpointResult{}, err
+	}
 	resultObserver := walCheckpointResultObserver
 	var observedStart time.Time
 	if resultObserver != nil {
