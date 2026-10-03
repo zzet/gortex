@@ -28,8 +28,9 @@ import (
 // bulk window drops it with the other dense indexes and the builder restores
 // it after the window closes.
 const (
-	edgesByFileGenerationIndexName = "edges_by_file_generation"
-	edgesByFileGenerationIndexDDL  = `CREATE INDEX IF NOT EXISTS edges_by_file_generation ON edges(file_path, view_gen)`
+	edgesByFileGenerationIndexName        = "edges_by_file_generation"
+	edgesByFileGenerationIndexDDL         = `CREATE INDEX IF NOT EXISTS edges_by_file_generation ON edges(file_path, view_gen)`
+	edgesByFileGenerationIndexPresenceSQL = `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?)`
 )
 
 // maintenanceLazyIndex is the lane job kind of the lazy index build.
@@ -70,12 +71,30 @@ func (s *Store) fileGenerationIndexPresent() bool {
 		return true
 	}
 	var present bool
-	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?)`,
+	if err := s.db.QueryRow(edgesByFileGenerationIndexPresenceSQL,
 		edgesByFileGenerationIndexName).Scan(&present); err != nil || !present {
 		return false
 	}
 	s.fileGenerationIndex.Store(lazyIndexPresent)
 	return true
+}
+
+// The builder already owns writeMu. Its metadata probe must use the writer
+// pool too: long readers can occupy every s.db connection and otherwise keep
+// the application's writer parked before any index work starts.
+func (s *Store) fileGenerationIndexPresentLocked(ctx context.Context) (bool, error) {
+	if s.fileGenerationIndex.Load() == lazyIndexPresent {
+		return true, nil
+	}
+	var present bool
+	if err := s.writerDB.QueryRowContext(ctx, edgesByFileGenerationIndexPresenceSQL,
+		edgesByFileGenerationIndexName).Scan(&present); err != nil {
+		return false, fmt.Errorf("probe lazy index %s: %w", edgesByFileGenerationIndexName, err)
+	}
+	if present {
+		s.fileGenerationIndex.Store(lazyIndexPresent)
+	}
+	return present, nil
 }
 
 // forgetFileGenerationIndex clears the presence cache before the index is
@@ -192,7 +211,11 @@ func (s *Store) buildLazyIndexOnce(ctx context.Context) error {
 		if s.bulkConn != nil {
 			return fmt.Errorf("bulk window open")
 		}
-		if s.fileGenerationIndexPresent() {
+		present, err := s.fileGenerationIndexPresentLocked(ctx)
+		if err != nil {
+			return err
+		}
+		if present {
 			return nil
 		}
 		started := time.Now()
@@ -210,7 +233,7 @@ func (s *Store) buildLazyIndexOnce(ctx context.Context) error {
 				}
 			}
 		}()
-		_, err := s.writerDB.ExecContext(ctx, edgesByFileGenerationIndexDDL)
+		_, err = s.writerDB.ExecContext(ctx, edgesByFileGenerationIndexDDL)
 		close(beat)
 		elapsed := time.Since(started)
 		if err != nil {
