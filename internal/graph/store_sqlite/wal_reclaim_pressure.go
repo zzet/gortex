@@ -171,7 +171,7 @@ func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res
 	if hook := walPressureResetHook; hook != nil {
 		hook(hctx)
 	}
-	if _, err := writer.passive(hctx, ckptDB, walReclaimPressureHold/2, res.leaseOverride); err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
+	if _, err := writer.passive(hctx, ctx, ckptDB, walReclaimPressureHold/2, res.leaseOverride); err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
 		res.reason = fmt.Sprintf("pressure_backfill error=%v", err)
 		s.walCopy.pressureGiveUps.Add(1)
 		return fmt.Errorf("%w: %w", errWALPressureHold, err)

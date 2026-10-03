@@ -924,7 +924,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	// retry: an interrupted or refused PASSIVE reports 0/0 and must not be
 	// spun on while the writer is held.
 	backfill := func() (walCheckpointResult, error) {
-		result, err := writer.passive(yctx, ckptDB, walReclaimMaxWriterHold, res.leaseOverride)
+		result, err := writer.passive(yctx, ctx, ckptDB, walReclaimMaxWriterHold, res.leaseOverride)
 		if err != nil && errors.Is(err, errSQLiteCheckpointIncomplete) && yctx.Err() == nil {
 			// Incomplete is a result, not a failure: a reader still needs
 			// frames (result carries the counts).
@@ -1504,7 +1504,7 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 		return false, nil // copy more without the writer first
 	}
 	copyStart := time.Now()
-	delta, derr := writer.passive(yctx, ckptDB, walReclaimResetHold/2, res.leaseOverride)
+	delta, derr := writer.passive(yctx, ctx, ckptDB, walReclaimResetHold/2, res.leaseOverride)
 	if ok && (derr == nil || errors.Is(derr, errSQLiteCheckpointIncomplete)) {
 		noteWALHoldCopy(int64(delta.CheckpointedFrames)-int64(snap.NBackfill), time.Since(copyStart))
 	}

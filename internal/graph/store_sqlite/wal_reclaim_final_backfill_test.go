@@ -231,7 +231,7 @@ func TestReclaimFinalBackfillRefusesBulkWindowAtReadmission(t *testing.T) {
 	defer writer.release()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	_, err := writer.passive(ctx, db, 25*time.Millisecond, false)
+	_, err := writer.passive(ctx, t.Context(), db, 25*time.Millisecond, false)
 	require.ErrorIs(t, err, errWALCheckpointDeferredBulk)
 	require.Zero(t, resets)
 	require.True(t, bulkStarted)
@@ -244,6 +244,7 @@ type reclaimSyncStall struct {
 	tls              uintptr
 	entered, release chan struct{}
 	once             sync.Once
+	beforeSync       func(int)
 }
 
 var reclaimSyncStallState atomic.Pointer[reclaimSyncStall]
@@ -255,7 +256,16 @@ var reclaimSyncWrapper = func(tls *libc.TLS, pFile uintptr, flags int32) int32 {
 		panic("missing original VFS xSync")
 	}
 	if state := reclaimSyncStallState.Load(); state != nil && uintptr(unsafe.Pointer(tls)) == state.tls {
-		state.once.Do(func() { close(state.entered); <-state.release })
+		if state.beforeSync != nil {
+			kind := vfsFileOther
+			if k, ok := vfsFileKinds.Load(pFile); ok {
+				kind = k.(int)
+			}
+			state.beforeSync(kind)
+		}
+		if state.entered != nil {
+			state.once.Do(func() { close(state.entered); <-state.release })
+		}
 	}
 	fp := original.(uintptr)
 	return (*(*func(*libc.TLS, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{fp})))(tls, pFile, flags)
@@ -309,7 +319,7 @@ func TestReclaimFinalBackfillPanicJoinsCreditTimer(t *testing.T) {
 		s.writeMu.Lock()
 		writer := newWALReclaimWriterCredit(s, time.Now())
 		defer writer.release()
-		_, _ = writer.passive(t.Context(), db, 25*time.Millisecond, false)
+		_, _ = writer.passive(t.Context(), t.Context(), db, 25*time.Millisecond, false)
 	})
 	time.Sleep(50 * time.Millisecond) // the original timer must not unlock again
 	require.True(t, s.writeMu.TryLock())

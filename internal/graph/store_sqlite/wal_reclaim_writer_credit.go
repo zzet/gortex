@@ -34,7 +34,7 @@ func (w *walReclaimWriterCredit) release() {
 // retain a short writer gap so queued writes cannot starve reset admission;
 // an uninterruptible call outliving its credit releases only our Go gate.
 // The checkpoint reservation and connection remain owned until the call ends.
-func (w *walReclaimWriterCredit) passive(ctx context.Context, db *sql.DB, credit time.Duration, leaseOverride bool) (walCheckpointResult, error) {
+func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *sql.DB, credit time.Duration, leaseOverride bool) (walCheckpointResult, error) {
 	if !w.held {
 		return walCheckpointResult{}, ErrMaintenanceBusy
 	}
@@ -81,7 +81,14 @@ func (w *walReclaimWriterCredit) passive(ctx context.Context, db *sql.DB, credit
 		})
 	}
 	defer finish() // includes panic/Goexit cleanup of the timer handoff
-	result, err := checkpointWALOnceOn(ctx, db, "PASSIVE")
+	// The writer credit may end during an uninterruptible sync. Interrupting
+	// the SQL at that point discards its copied frontier and connection; the
+	// next short hold would repeat the same work. Keep SQL under its parent
+	// operation cancellation and the existing finite lane budget instead.
+	// Neither reset admission nor the writer hold inherits this longer scope.
+	opCtx, cancelOperation := context.WithTimeout(operationCtx, walReclaimLaneBudget)
+	defer cancelOperation()
+	result, err := checkpointWALOnceOn(opCtx, db, "PASSIVE")
 	finish()
 	if w.held {
 		return result, err
