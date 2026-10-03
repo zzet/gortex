@@ -129,6 +129,18 @@ still win, and ambiguous import evidence does not promote a guessed target.
 Import statement evidence is batch-loaded per resolver page and cleared after
 interleaved mutations, so promotion does not add per-call adjacency queries.
 
+### Nuxt app auto-imports
+
+Prepared Nuxt projects supply their own binding evidence in `.nuxt/imports.d.ts`.
+Relative named exports into the repository, including `original as local`
+renames, resolve bare JS/TS and SFC calls at `ast_resolved` with
+`resolution: nuxt_auto_import`. Explicit imports and same-file definitions win.
+Package imports, `#app` specifiers, conflicting generated names, and paths
+outside the repository are ignored. Missing generated lists disable this path;
+no composable-directory guessing is performed. Nested Nuxt roots stay scoped.
+The app list is never applied under `server/`; Nitro imports are not handled.
+List changes invalidate cached bindings on repository reindexing, like aliases.
+
 ### Julia specifics
 
 `module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`

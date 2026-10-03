@@ -591,6 +591,7 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 	// against the local index so cross-directory alias imports resolve
 	// to their real file. Same lazy-build rationale.
 	idx.resolver.SetPathAliasResolver(idx.resolvePathAliasImport)
+	idx.resolver.SetNuxtAutoImportResolver(idx.resolveNuxtAutoImport)
 	// Break same-named import collisions in favour of the importer's
 	// own package-manager workspace member. Same lazy-build rationale.
 	idx.resolver.SetWorkspaceMembership(idx.indexerWorkspaceMembership)

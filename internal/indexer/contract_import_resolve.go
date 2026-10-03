@@ -356,6 +356,7 @@ func invalidateTSAliasCollection(rootPath string) {
 	if rootPath == "" {
 		return
 	}
+	invalidateNuxtImports(rootPath)
 	tsAliasCacheMu.Lock()
 	delete(tsAliasCache, rootPath)
 	tsAliasCacheMu.Unlock()
@@ -364,18 +365,19 @@ func invalidateTSAliasCollection(rootPath string) {
 // A config edit changes resolution even when callers' source shapes did not.
 // Refresh once per mutation pass and report whether old bindings may be reused.
 func refreshTSAliasCollection(rootPath string) bool {
+	nuxtChanged := refreshNuxtImports(rootPath)
 	tsAliasCacheMu.Lock()
 	defer tsAliasCacheMu.Unlock()
 	previous, loaded := tsAliasCache[rootPath]
 	current := tsalias.Load(rootPath)
 	tsAliasCache[rootPath] = current
 	if !loaded {
-		return false
+		return nuxtChanged
 	}
 	if previous == nil || current == nil {
-		return previous != current
+		return nuxtChanged || previous != current
 	}
-	return !reflect.DeepEqual(previous.Maps(), current.Maps())
+	return nuxtChanged || !reflect.DeepEqual(previous.Maps(), current.Maps())
 }
 
 func isAliasCallerPath(filePath string) bool {

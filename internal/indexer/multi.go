@@ -957,6 +957,7 @@ func (mi *MultiIndexer) newMasterResolver(useLSP bool) *resolver.Resolver {
 	master.SetNpmAliasResolver(mi.npmAliasResolver())
 	master.SetNpmDependencyLookup(mi.npmDependencyLookup())
 	master.SetPathAliasResolver(mi.pathAliasResolver())
+	master.SetNuxtAutoImportResolver(mi.nuxtAutoImportResolver())
 	master.SetWorkspaceMembership(mi.workspaceMembershipResolver())
 	return master
 }

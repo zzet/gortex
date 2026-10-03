@@ -465,6 +465,8 @@ type Resolver struct {
 	// contract. Set via SetPathAliasResolver before ResolveAll runs.
 	pathAlias PathAliasResolver
 
+	nuxtAutoImport NuxtAutoImportResolver
+
 	// workspaceMembers, when non-nil, maps a file path to the
 	// package-manager workspace it belongs to. Used to break a
 	// same-named import collision in favour of the candidate that
@@ -3879,6 +3881,9 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	callerRepo := r.callerRepoPrefix(e)
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
 	if len(candidates) == 0 {
+		if r.tryResolveNuxtAutoImport(e, funcName, nil, stats) {
+			return
+		}
 		// No same-repo candidate. A genuine cross-repo callee is left
 		// unresolved here for CrossRepoResolver — which alone carries the
 		// import-reachability + workspace-boundary evidence — to lift.
@@ -4016,6 +4021,9 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		}
 		e.Meta["resolution"] = "import_closure"
 		stats.Resolved++
+		return
+	}
+	if r.tryResolveNuxtAutoImport(e, funcName, candidates, stats) {
 		return
 	}
 
