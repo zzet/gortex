@@ -5,22 +5,31 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
 const shadowEvictBatchRows = 256
 
-// EvictRepoForShadowReplacement retires the mutable base rows before a
-// successfully parsed shadow is drained. The caller must own the repository's
+// EvictRepoForShadowReplacement retires mutable base or private building
+// payload rows before a successfully parsed shadow is drained. The caller must own the repository's
 // replacement lane and source/output receipt until the replacement completes.
 // This is deliberately not the atomic EvictRepo/EvictFiles API: cancellation
 // returns the counts already committed and the caller must abandon publication.
-// Positive, possibly published payload generations are never accepted here.
+// Positive handles require explicit managed admission: each transaction verifies
+// the payload remains unsealed and its catalog reservation is still building.
 func (s *Store) EvictRepoForShadowReplacement(ctx context.Context, repo string) (nodesRemoved, edgesRemoved int, retErr error) {
-	if s.viewGen != 0 {
-		return 0, 0, fmt.Errorf("shadow replacement requires the mutable base generation")
+	if !s.SupportsShadowReplacementRetirement() {
+		return 0, 0, fmt.Errorf("shadow replacement requires a mutable base or managed building payload")
 	}
-	// Cross-repository base resolution can create incoming edges. Fence it while
+	if s.viewGen > 0 {
+		// Refuse ready/retired/sealed reservations before even taking a payload
+		// snapshot. Every subsequent chunk repeats admission in its own tx.
+		if _, err := s.shadowEvictStep(ctx, func(*sql.Tx) (int, *sqliteMutationReceiptAccumulator, error) { return 0, nil, nil }); err != nil {
+			return 0, 0, err
+		}
+	}
+	// Cross-repository resolution can create incoming edges. Fence this view while
 	// the frozen retirement set is consumed; derived checkout resolver lanes are
 	// independent. Do not hold writeMu while waiting for this fence or reading.
 	mu := s.ResolveMutex()
@@ -61,7 +70,7 @@ func (s *Store) EvictRepoForShadowReplacement(ctx context.Context, repo string) 
 		return 0, 0, err
 	}
 
-	// Retire successful base provenance before the first partial graph commit.
+	// Retire successful replacement provenance before the first partial graph commit.
 	// A canceled replacement must not be reused as a clean dedicated base.
 	if _, err := s.shadowEvictStep(ctx, func(tx *sql.Tx) (int, *sqliteMutationReceiptAccumulator, error) {
 		result, err := tx.ExecContext(ctx, `DELETE FROM repo_index_state WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repo)
@@ -77,17 +86,18 @@ func (s *Store) EvictRepoForShadowReplacement(ctx context.Context, repo string) 
 	// optional endpoint indexes. Scan actual rows across all generations, then
 	// filter in Go: a generation predicate before LIMIT could skip an unbounded
 	// positive-generation population. Catch up newly appended sibling edges in
-	// the same writer transaction before each node deletion. Base endpoint
+	// the same writer transaction before each node deletion. This generation's endpoint
 	// rebinds normally use ResolveMutex; the endpoint revision also catches
 	// direct rebind APIs that update a physical row behind the cursor. Raw
 	// sibling inserts receive fresh keys.
 	var cursor int64
-	endpointRevision := s.baseEdgeEndpointRevision.Load()
+	endpointClock := s.shadowEndpointRevision()
+	endpointRevision := endpointClock.Load()
 	for position := 0; len(ids) > 0; {
 		var pageRows, nodeStep, edgeStep int
 		nextCursor := cursor
 		_, err := s.shadowEvictStep(ctx, func(tx *sql.Tx) (int, *sqliteMutationReceiptAccumulator, error) {
-			if current := s.baseEdgeEndpointRevision.Load(); current != endpointRevision {
+			if current := endpointClock.Load(); current != endpointRevision {
 				cursor = 0
 				nextCursor = 0
 				endpointRevision = current
@@ -274,9 +284,23 @@ func (s *Store) shadowEvictStep(ctx context.Context, mutate func(*sql.Tx) (int, 
 // Endpoint-rewrite families call this after a successful transaction, still
 // holding writeMu. Some families also delete collisions/change edge kind, so
 // their changed flag is conservative; ordinary append and attribute writes do
-// not touch this clock. It is an in-process retirement fence, not provenance.
-func (s *Store) noteBaseEdgeEndpointRewriteLocked(changed bool) {
-	if changed && s.viewGen == 0 {
-		s.baseEdgeEndpointRevision.Add(1)
+// not touch this generation's clock. It is a retirement fence, not provenance.
+func (s *Store) noteEdgeEndpointRewriteLocked(changed bool) {
+	if changed {
+		s.shadowEndpointRevision().Add(1)
 	}
+}
+
+// SupportsShadowReplacementRetirement reports only the handle capability.
+// Actual positive lifecycle admission is freshly checked by each transaction;
+// a true result never authorizes writing a ready, retired or sealed payload.
+func (s *Store) SupportsShadowReplacementRetirement() bool {
+	return s != nil && (s.viewGen == 0 || s.managedPayloadGeneration)
+}
+
+func (s *Store) shadowEndpointRevision() *atomic.Uint64 {
+	if s.viewGen == 0 {
+		return &s.baseEdgeEndpointRevision
+	}
+	return &s.payloadSealFor(s.viewGen).endpointRevision
 }

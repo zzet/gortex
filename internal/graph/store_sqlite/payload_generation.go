@@ -71,6 +71,9 @@ var (
 // one.)
 type payloadSeal struct {
 	state atomic.Int32
+	// endpointRevision fences in-place endpoint rebinds during private shadow
+	// retirement. It is shared by this generation and dropped with the seal.
+	endpointRevision atomic.Uint64
 	// sweep is the generation's retirement state — how far the last sweep pass
 	// got and why it stopped. It lives beside the flag because the seal is the
 	// one object every handle on the generation already shares, and because it

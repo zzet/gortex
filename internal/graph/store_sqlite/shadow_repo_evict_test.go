@@ -240,7 +240,7 @@ func TestShadowReplacementCancelInvalidatesPriorProvenanceAndRetries(t *testing.
 	require.Zero(t, e)
 	require.Zero(t, s.NodeCount())
 	require.Equal(t, 600, checkout.NodeCount())
-	_, _, err = checkout.EvictRepoForShadowReplacement(t.Context(), "shadow")
+	_, _, err = s.AtGeneration(checkout.viewGen).EvictRepoForShadowReplacement(t.Context(), "shadow")
 	require.Error(t, err)
 }
 
@@ -312,89 +312,98 @@ func TestShadowReplacementCompletesUnderUnrelatedWriters(t *testing.T) {
 }
 
 func TestShadowReplacementTracksRetargetBehindPhysicalCursor(t *testing.T) {
-	s, nodes := shadowEvictionFixture(t, 600)
-	survivor := &graph.Node{ID: "other::survivor", Kind: graph.KindFunction, Name: "Survivor", FilePath: "other::file.go", RepoPrefix: "other"}
-	s.AddNode(survivor)
-	oldTo := graph.UnresolvedMarker + "Missing"
-	oldEdge := &graph.Edge{From: survivor.ID, To: oldTo, Kind: graph.EdgeCalls, Line: 9999}
-	s.AddEdge(oldEdge)
-	edges := make([]*graph.Edge, 700)
-	for i := range edges {
-		edges[i] = &graph.Edge{From: survivor.ID, To: nodes[i%600].ID, Kind: graph.EdgeCalls, Line: i + 1}
-	}
-	s.AddBatch(nil, edges)
-	var originalID int64
-	require.NoError(t, s.db.QueryRow(`SELECT id FROM edges WHERE view_gen=0 AND line=9999`).Scan(&originalID))
-	entered, release := make(chan struct{}), make(chan struct{})
-	var once, releaseOnce sync.Once
-	unpark := func() { releaseOnce.Do(func() { close(release) }) }
-	shadowDeleteObserver.Store(&shadowDeleteProbe{fire: func(string) { once.Do(func() { close(entered); <-release }) }})
-	shadowDeleteTrigger(t, s, "edges", "CAST(OLD.id AS TEXT)")
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	done := make(chan error, 1)
-	retargeted := make(chan error, 1)
-	var writerStarted bool
-	t.Cleanup(func() {
-		cancel()
-		unpark()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Error("evict join")
-		}
-		if writerStarted {
-			select {
-			case <-retargeted:
-			case <-time.After(5 * time.Second):
-				t.Error("retarget join")
+	for _, managed := range []bool{false, true} {
+		t.Run(fmt.Sprint(managed), func(t *testing.T) {
+			base, nodes := shadowEvictionFixture(t, 600)
+			s := base
+			if managed {
+				_, s = beginGenerationEvictionHandle(t, base, 1)
+				require.NoError(t, s.AddBatchChecked(nodes, nil))
 			}
-		}
-	})
-	go func() {
-		n, e, err := s.EvictRepoForShadowReplacement(ctx, "shadow")
-		if err == nil && (n != 600 || e != 701) {
-			err = fmt.Errorf("removed %d/%d want600/701", n, e)
-		}
-		done <- err
-	}()
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("no deletion witness")
+			survivor := &graph.Node{ID: "other::survivor", Kind: graph.KindFunction, Name: "Survivor", FilePath: "other::file.go", RepoPrefix: "other"}
+			s.AddNode(survivor)
+			oldTo := graph.UnresolvedMarker + "Missing"
+			oldEdge := &graph.Edge{From: survivor.ID, To: oldTo, Kind: graph.EdgeCalls, Line: 9999}
+			s.AddEdge(oldEdge)
+			edges := make([]*graph.Edge, 700)
+			for i := range edges {
+				edges[i] = &graph.Edge{From: survivor.ID, To: nodes[i%600].ID, Kind: graph.EdgeCalls, Line: i + 1}
+			}
+			s.AddBatch(nil, edges)
+			var originalID int64
+			require.NoError(t, s.db.QueryRow(`SELECT id FROM edges WHERE view_gen=? AND line=9999`, s.viewGen).Scan(&originalID))
+			entered, release := make(chan struct{}), make(chan struct{})
+			var once, releaseOnce sync.Once
+			unpark := func() { releaseOnce.Do(func() { close(release) }) }
+			shadowDeleteObserver.Store(&shadowDeleteProbe{fire: func(string) { once.Do(func() { close(entered); <-release }) }})
+			shadowDeleteTrigger(t, s, "edges", "CAST(OLD.id AS TEXT)")
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			retargeted := make(chan error, 1)
+			var writerStarted bool
+			t.Cleanup(func() {
+				cancel()
+				unpark()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Error("evict join")
+				}
+				if writerStarted {
+					select {
+					case <-retargeted:
+					case <-time.After(5 * time.Second):
+						t.Error("retarget join")
+					}
+				}
+			})
+			go func() {
+				n, e, err := s.EvictRepoForShadowReplacement(ctx, "shadow")
+				if err == nil && (n != 600 || e != 701) {
+					err = fmt.Errorf("removed %d/%d want600/701", n, e)
+				}
+				done <- err
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("no deletion witness")
+			}
+			writerStarted = true
+			go func() {
+				stats, err := s.reindexEdgesSetOriented([]graph.EdgeReindex{{OldTo: oldTo, Edge: &graph.Edge{From: survivor.ID, To: nodes[599].ID, Kind: graph.EdgeCalls, Line: 9999}}})
+				if err == nil && stats.updatedRows != 1 {
+					err = fmt.Errorf("not an in-place UPDATE: %+v", stats)
+				}
+				retargeted <- err
+			}()
+			deadline := time.Now().Add(5 * time.Second)
+			for s.writeMu.waiting() == 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			require.Positive(t, s.writeMu.waiting())
+			unpark()
+			select {
+			case err := <-retargeted:
+				retargeted <- err
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("retarget stalled")
+			}
+			select {
+			case err := <-done:
+				done <- err
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("eviction stalled")
+			}
+			require.Positive(t, s.shadowEndpointRevision().Load())
+			require.Zero(t, s.EdgeCount())
+			require.Equal(t, 1, s.NodeCount())
+			t.Logf("retargeted actual physical edge %d behind first scan page; surviving edges=0", originalID)
+		})
 	}
-	writerStarted = true
-	go func() {
-		stats, err := s.reindexEdgesSetOriented([]graph.EdgeReindex{{OldTo: oldTo, Edge: &graph.Edge{From: survivor.ID, To: nodes[599].ID, Kind: graph.EdgeCalls, Line: 9999}}})
-		if err == nil && stats.updatedRows != 1 {
-			err = fmt.Errorf("not an in-place UPDATE: %+v", stats)
-		}
-		retargeted <- err
-	}()
-	deadline := time.Now().Add(5 * time.Second)
-	for s.writeMu.waiting() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	require.Positive(t, s.writeMu.waiting())
-	unpark()
-	select {
-	case err := <-retargeted:
-		retargeted <- err
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("retarget stalled")
-	}
-	select {
-	case err := <-done:
-		done <- err
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("eviction stalled")
-	}
-	require.Positive(t, s.baseEdgeEndpointRevision.Load())
-	require.Zero(t, s.EdgeCount())
-	require.Equal(t, 1, s.NodeCount())
-	t.Logf("retargeted actual physical edge %d behind first scan page; surviving edges=0", originalID)
 }
 
 func TestShadowReplacementHighFanoutWithoutEndpointIndexes(t *testing.T) {
@@ -462,12 +471,22 @@ func TestShadowEndpointRevisionIgnoresPositiveWritesAndRollback(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.updatedRows)
 	require.Zero(t, s.baseEdgeEndpointRevision.Load())
+	require.Equal(t, uint64(1), checkout.shadowEndpointRevision().Load())
+	_, other := beginGenerationEvictionHandle(t, s, 2)
+	require.Zero(t, other.shadowEndpointRevision().Load())
 	s.AddEdge(seed)
+	secondSeed := *seed
+	secondSeed.Line = 2
+	checkout.AddEdge(&secondSeed)
+	secondBatch := []graph.EdgeReindex{{OldTo: old, Edge: &graph.Edge{From: seed.From, To: "other::SecondTarget", Kind: seed.Kind, FilePath: seed.FilePath, Line: 2}}}
 	_, err = s.writerDB.Exec(`CREATE TRIGGER reject_test_retarget BEFORE UPDATE OF to_id ON edges BEGIN SELECT RAISE(ABORT,'controlled rollback'); END`)
 	require.NoError(t, err)
 	_, err = s.reindexEdgesSetOriented(batch)
 	require.Error(t, err)
 	require.Zero(t, s.baseEdgeEndpointRevision.Load())
+	_, err = checkout.reindexEdgesSetOriented(secondBatch)
+	require.Error(t, err)
+	require.Equal(t, uint64(1), checkout.shadowEndpointRevision().Load(), "rolled-back positive endpoint update advanced its clock")
 	_, err = s.writerDB.Exec(`DROP TRIGGER reject_test_retarget`)
 	require.NoError(t, err)
 	stats, err = s.reindexEdgesSetOriented(batch)

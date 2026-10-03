@@ -3266,7 +3266,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				shadowEstimateReady = true
 			}
 			drainPressure := newShadowDrainPressure(shadowEstimate, idx.RepoPrefix(), idx.logger)
+			drainViewGeneration := int64(-1)
+			if sqlite, ok := diskTarget.(*store_sqlite.Store); ok {
+				drainViewGeneration = sqlite.ViewGeneration()
+			}
 			idx.logger.Info("indexer: drain start (shadow → disk)",
+				zap.Int64("view_generation", drainViewGeneration),
 				zap.String("repo", idx.RepoPrefix()),
 				zap.Int("shadow_nodes", shadowNodeCount),
 				zap.Int("shadow_edges", shadowEdgeCount),
@@ -3281,7 +3286,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// before its first disk write. Immutable payload generations sharing
 			// the prefix remain queryable through their catalog pointers.
 			var evictedNodes, evictedEdges int
-			if sqlite, ok := diskTarget.(*store_sqlite.Store); ok && sqlite.ViewGeneration() == 0 {
+			if sqlite, ok := diskTarget.(*store_sqlite.Store); ok && sqlite.SupportsShadowReplacementRetirement() {
 				var err error
 				shadowReplacementStarted = true
 				evictedNodes, evictedEdges, err = sqlite.EvictRepoForShadowReplacement(ctx, idx.RepoPrefix())
@@ -3294,6 +3299,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 			if n, e := evictedNodes, evictedEdges; n > 0 || e > 0 {
 				idx.logger.Info("indexer: evicted stale generation rows before shadow drain",
+					zap.Int64("view_generation", drainViewGeneration),
 					zap.String("repo", idx.RepoPrefix()),
 					zap.Int("nodes", n), zap.Int("edges", e))
 			}

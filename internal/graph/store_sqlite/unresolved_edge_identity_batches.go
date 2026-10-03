@@ -197,7 +197,7 @@ func (s *Store) reindexUnresolvedEdgeTargetsOriented(
 			s.analysisGenerationPresent = s.analysisLatchRemaining
 		}
 		s.finishAnalysisMutationLocked(changed)
-		s.noteBaseEdgeEndpointRewriteLocked(changed)
+		s.noteEdgeEndpointRewriteLocked(changed)
 	}
 	return stats, nil
 }
