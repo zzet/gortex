@@ -3,6 +3,7 @@
 package store_sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -57,8 +58,10 @@ func probeShmLocks(t *testing.T, shm string) string {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperShmLockProbe$")
 	cmd.Env = append(os.Environ(), "GORTEX_TEST_SHM_PROBE="+shm)
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, string(out))
+	var diagnostics bytes.Buffer
+	cmd.Stderr = &diagnostics
+	out, err := cmd.Output()
+	require.NoError(t, err, "stdout: %s\nstderr: %s", out, diagnostics.Bytes())
 	return strings.TrimSpace(string(out))
 }
 
