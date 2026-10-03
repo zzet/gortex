@@ -245,6 +245,7 @@ type reclaimSyncStall struct {
 	entered, release chan struct{}
 	once             sync.Once
 	beforeSync       func(int)
+	afterSync        func(int, time.Time, time.Time) // test phase observer, nil in existing controls
 }
 
 var reclaimSyncStallState atomic.Pointer[reclaimSyncStall]
@@ -255,12 +256,23 @@ var reclaimSyncWrapper = func(tls *libc.TLS, pFile uintptr, flags int32) int32 {
 	if !ok {
 		panic("missing original VFS xSync")
 	}
-	if state := reclaimSyncStallState.Load(); state != nil && uintptr(unsafe.Pointer(tls)) == state.tls {
+	phaseTLS := uintptr(unsafe.Pointer(tls))
+	phaseProbe, phasePacer := reclaimCheckpointSyncProbeAt(phaseTLS)
+	var phaseStarted time.Time
+	if phaseProbe != nil {
+		phaseStarted = time.Now()
+	}
+	state := reclaimSyncStallState.Load()
+	observed := state != nil && uintptr(unsafe.Pointer(tls)) == state.tls
+	kind, started := vfsFileOther, time.Time{}
+	if observed {
+		if k, ok := vfsFileKinds.Load(pFile); ok {
+			kind = k.(int)
+		}
+		if state.afterSync != nil {
+			started = time.Now()
+		}
 		if state.beforeSync != nil {
-			kind := vfsFileOther
-			if k, ok := vfsFileKinds.Load(pFile); ok {
-				kind = k.(int)
-			}
 			state.beforeSync(kind)
 		}
 		if state.entered != nil {
@@ -268,7 +280,21 @@ var reclaimSyncWrapper = func(tls *libc.TLS, pFile uintptr, flags int32) int32 {
 		}
 	}
 	fp := original.(uintptr)
-	return (*(*func(*libc.TLS, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{fp})))(tls, pFile, flags)
+	rc := (*(*func(*libc.TLS, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{fp})))(tls, pFile, flags)
+	if observed && state.afterSync != nil {
+		state.afterSync(kind, started, time.Now())
+	}
+	if phaseProbe != nil {
+		ended := time.Now()
+		currentProbe, currentPacer := reclaimCheckpointSyncProbeAt(phaseTLS)
+		if currentProbe == phaseProbe && currentPacer == phasePacer {
+			phaseProbe.observe(reclaimCheckpointSyncInterval{
+				tls: phaseTLS, store: phaseProbe.store, pacer: phasePacer,
+				span: reclaimCheckpointSpan{start: phaseStarted, end: ended},
+			})
+		}
+	}
+	return rc
 }
 
 // TestMain calls this once, before m.Run. installWALCopyPause closes its probe
@@ -290,7 +316,7 @@ func installReclaimSyncWrapper() {
 	}
 }
 
-func stallReclaimCheckpointSync(t *testing.T, db *sql.DB) (chan struct{}, chan struct{}) {
+func stallReclaimCheckpointSync(t *testing.T, db *sql.DB, afterSync ...func(int, time.Time, time.Time)) (chan struct{}, chan struct{}) {
 	t.Helper()
 	conn, err := db.Conn(t.Context())
 	require.NoError(t, err)
@@ -299,6 +325,9 @@ func stallReclaimCheckpointSync(t *testing.T, db *sql.DB) (chan struct{}, chan s
 	require.True(t, ok, "checkpoint VFS connection is not observable")
 	require.NotZero(t, walCopyMethods.Load(), "test VFS wrapper was not installed before the stores opened")
 	state := &reclaimSyncStall{tls: key, entered: make(chan struct{}), release: make(chan struct{})}
+	if len(afterSync) > 0 {
+		state.afterSync = afterSync[0]
+	} // immutable before publication
 	// Keep wrapper/original mappings permanent: a driver may already have
 	// resolved the wrapper when a fixture ends. Only its TLS-specific stall
 	// is removed, so unrelated connections always retain their real xSync.

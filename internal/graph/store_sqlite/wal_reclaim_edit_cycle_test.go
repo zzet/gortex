@@ -13,8 +13,10 @@ import (
 // a few hundred between them, while admitted writes take the log over its threshold
 // but stay under the pressure mark. The reclaim loop's checkpoint work may run only in the
 // gaps: no checkpoint starts inside a cycle, and one running when a cycle
-// starts ends within the lane poll (20 ms) plus scheduling slack. Its share of
-// the cycles' wall time is measured from every checkpoint call.
+// starts stops active work within the lane poll (20 ms) plus scheduling slack.
+// Positively observed same-call VFS sync entered before the edit is reported
+// separately from active work; unknown or ambiguous spans retain the wall bound.
+// Raw overlap and late returns remain visible alongside the active-work share.
 func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "8")
 	// Ceiling 64 MiB: the pressure mark (4 x the threshold) is 32 MiB, above
@@ -25,7 +27,7 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 	t.Cleanup(func() { walReclaimCeilingFloor = prevFloor })
 	setWALReclaimCadence(t, 25*time.Millisecond, 25*time.Millisecond, 200*time.Millisecond)
 
-	type span struct{ start, end time.Time }
+	type span = reclaimCheckpointSpan
 	var mu sync.Mutex
 	var calls []span
 	var cycles []span
@@ -40,6 +42,7 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 	// it writes nothing there. Those passes are judged by the pages they
 	// wrote inside the edits, not by their span.
 	var pausedPasses []span
+	var checkpointSyncs []reclaimCheckpointSyncInterval
 	walCopyPassObserver = func(start, end time.Time, pauses int) {
 		if pauses > 0 {
 			mu.Lock()
@@ -54,11 +57,34 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 	defer diag.finish()
 	s, path := openWALReclaimStore(t)
 	diag.store.Store(s)
+	// Register Close before lease acquisition so any failed setup still joins
+	// active SQL. A successful lease cancels and joins the previous attempt,
+	// then prevents another background attempt during observer/policy setup.
+	var phaseProbeInstalled bool
+	defer func() {
+		if phaseProbeInstalled {
+			reclaimCheckpointSyncProbeState.Store(nil)
+		}
+	}()
 	defer func() { _ = s.Close() }()
+	lease, leaseErr := s.acquireGenerationBulkCheckpointLease()
+	require.NoError(t, leaseErr)
+	defer s.releaseGenerationBulkCheckpointLease(lease)
+	s.backgroundCheckpoint.mu.Lock()
+	activeAtInstallation := s.backgroundCheckpoint.active
+	s.backgroundCheckpoint.mu.Unlock()
+	require.Nil(t, activeAtInstallation, "setup lease must join the prior background attempt")
+	reclaimCheckpointSyncProbeState.Store(&reclaimCheckpointSyncProbe{store: s, observe: func(p reclaimCheckpointSyncInterval) {
+		mu.Lock()
+		checkpointSyncs = append(checkpointSyncs, p)
+		mu.Unlock()
+	}})
+	phaseProbeInstalled = true
 	seedWALChurnTable(t, s)
 	growWAL(t, s, 12) // start over the threshold, below the pressure mark
 	lane := &fakeBuildLane{}
 	lane.install(s)
+	require.True(t, s.releaseGenerationBulkCheckpointLease(lease))
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -153,6 +179,15 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 	time.Sleep(8 * time.Second)
 	close(stop)
 	wg.Wait()
+	// Freeze progress before cleanup. Join the owned checkpoint loop before
+	// matching calls: an unfinished concurrent call must not be invisible to
+	// the ambiguity check, and shutdown must not supply observation resets.
+	stats := s.WALReclaimStats()
+	s.stopCheckpointLoop()
+	s.backgroundCheckpoint.mu.Lock()
+	activeAtClassification := s.backgroundCheckpoint.active
+	s.backgroundCheckpoint.mu.Unlock()
+	require.Nil(t, activeAtClassification, "classification requires all owned checkpoint calls joined")
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -171,27 +206,40 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 		}
 		return false
 	}
-	var inside, cycleTime time.Duration
-	startedInside, lateStops := 0, 0
+	// A same-TLS/Store span must belong wholly to exactly this call and overlap
+	// no other call. Ambiguous, post-edit and unknown spans waive nothing.
+	knownSync := func(callIndex int, editStart, end time.Time) time.Duration {
+		return knownPreEditCheckpointSync(s, calls, callIndex, checkpointSyncs, editStart, end)
+	}
+	var inside, rawInside, allRawInside, cycleTime time.Duration
+	startedInside, lateStops, rawLateStops := 0, 0, 0
 	for _, c := range cycles {
 		cycleTime += c.end.Sub(c.start)
-		for _, k := range calls {
+		for callIndex, k := range calls {
+			allLo, allHi := maxTime(c.start, k.start), minTime(c.end, k.end)
+			if allHi.After(allLo) {
+				allRawInside += allHi.Sub(allLo)
+			}
 			if paused(k) {
 				continue
 			}
 			lo, hi := maxTime(c.start, k.start), minTime(c.end, k.end)
 			if hi.After(lo) {
-				inside += hi.Sub(lo)
+				rawInside += hi.Sub(lo)
+				inside += max(time.Duration(0), hi.Sub(lo)-knownSync(callIndex, c.start, hi))
 			}
 			if k.start.After(c.start.Add(slack)) && k.start.Before(c.end) {
 				startedInside++
 			}
 			if k.start.Before(c.start) && k.end.After(c.start.Add(walCheckpointCycleYieldPoll+slack)) {
-				lateStops++
+				rawLateStops++
+				activeStop := k.end.Sub(c.start) - knownSync(callIndex, c.start, k.end)
+				if activeStop > walCheckpointCycleYieldPoll+slack {
+					lateStops++
+				}
 			}
 		}
 	}
-	stats := s.WALReclaimStats()
 	writesInsideCycles := 0
 	for _, w := range committedWrites {
 		for _, c := range cycles {
@@ -206,6 +254,12 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 	require.Positive(t, writesInsideCycles, "the fixture must include actual committed writes during edit cycles")
 	require.Positive(t, stats.Resets-initialResets, "setup or shutdown must not supply the observation's reset progress")
 	require.Positive(t, writesAfterReset, "real writes must resume after an authoritative reset")
+	var worstForeground time.Duration
+	for _, w := range committedWrites {
+		worstForeground = max(worstForeground, w.end.Sub(w.start))
+	}
+	t.Logf("all_raw_checkpoint_overlap=%s original_nonpaused_raw_overlap=%s raw_late_stops=%d observed_sync_intervals=%d foreground_gate_SQL_max=%s", allRawInside, rawInside, rawLateStops, len(checkpointSyncs), worstForeground)
+	require.LessOrEqual(t, worstForeground, 500*time.Millisecond, "actual foreground SQL exceeded existing mutation latency contract")
 	share := float64(inside) / float64(max(cycleTime, 1))
 	t.Logf("cycles=%d checkpoint_calls=%d time_inside_cycles=%s of %s (%.2f%%) started_inside=%d late_stops=%d resets=%d wal_max=%.1fMiB",
 		len(cycles), len(calls), inside.Round(time.Millisecond), cycleTime.Round(time.Millisecond), 100*share,
@@ -221,7 +275,7 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 	if raceDetectorOn {
 		maxShare = 0.10
 	}
-	require.Less(t, share, maxShare, "the reclaim used the core inside edit cycles")
+	require.Less(t, share, maxShare, "the reclaim exceeded active-work share outside positively observed sync inside edit cycles")
 }
 
 func maxTime(a, b time.Time) time.Time {
