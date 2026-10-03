@@ -293,6 +293,13 @@ func (p *walCopyPacer) beforeWrite(n int64) {
 		if wait := st.walCopy.take(now, n, p.rate); wait > 0 {
 			deadline := now.Add(wait)
 			for time.Now().Before(deadline) && !p.stopped() {
+				// Writers can cross the pressure mark while this page waits
+				// for budget. Do not retain a below-mark decision until the
+				// next 256 copied pages while those writers keep appending.
+				if mark := st.WALWriteMark(); mark.Valid && int64(mark.MxFrame)*(int64(mark.PageSize)+walFrameHeaderBytes) > walCopyPacingMark(p.hardCapBytes) {
+					p.overPacingMark = true
+					break
+				}
 				time.Sleep(min(time.Until(deadline), 10*time.Millisecond))
 			}
 			p.budgetNs += time.Since(now)
