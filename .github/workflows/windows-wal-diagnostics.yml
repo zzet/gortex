@@ -8,9 +8,9 @@ permissions:
   contents: read
 
 jobs:
-  two-existing-tests:
+  full-store-0-reproduction:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -23,6 +23,11 @@ jobs:
           git rev-parse HEAD^{tree}
           git status --porcelain --untracked-files=normal
           go version
-      - name: Run two original Windows cases with phase diagnostics
+      - name: Build as required CI
+        run: go build -o gortex ./cmd/gortex/
+      - name: Run exact required Windows store-0 shard with scoped phase diagnostics
         shell: bash
-        run: go test -v -count=1 -timeout=45m -run '^(TestCompletedSlowConvergenceRecoversContinuousWrites|TestSlowConvergenceProofRefusesInvalidCopies)$' ./internal/graph/store_sqlite
+        env:
+          TEST_PARTITION: store-0
+          TEST_WINDOWS: true
+        run: python scripts/ci-test-partition.py
