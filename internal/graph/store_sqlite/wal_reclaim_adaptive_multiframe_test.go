@@ -20,7 +20,9 @@ func TestUrgentAdaptiveCopyAdmitsMultiFrameTail(t *testing.T) {
 			s, db := finalBackfillFixture(t)
 			priorRate := walHoldCopyRate.Swap(0)
 			t.Cleanup(func() { walHoldCopyRate.Store(priorRate) })
-			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			// The operation may join an uninterruptible sync after its writer credit
+			// expires. Use its existing finite lifetime; held credit remains <=2 s.
+			ctx, cancel := context.WithTimeout(t.Context(), walReclaimLaneBudget)
 			var writes, syncs, worstGate, worstSQL atomic.Int64
 			committed := make(chan struct{}, 1)
 			producer := make(chan error, 1)
