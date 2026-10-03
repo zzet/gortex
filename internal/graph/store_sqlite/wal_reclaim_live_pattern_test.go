@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,7 +94,7 @@ func (r longReaderRun) firstResetAfter(t time.Time) time.Time {
 	return time.Time{}
 }
 
-func runLongReaderPattern(t *testing.T, s *Store, path string, p longReaderPattern) longReaderRun {
+func runLongReaderPattern(t *testing.T, s *Store, path string, p longReaderPattern, diagnostic ...*quietGapDiagnostic) longReaderRun {
 	t.Helper()
 	run := longReaderRun{started: time.Now()}
 	stop := make(chan struct{})
@@ -105,6 +106,12 @@ func runLongReaderPattern(t *testing.T, s *Store, path string, p longReaderPatte
 		go func(seed int64) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(seed))
+			iteration := 0
+			record := func(kind string, took time.Duration, err error) {
+				if len(diagnostic) > 0 {
+					diagnostic[0].event(kind, "", "reader="+strconv.FormatInt(seed, 10)+" iteration="+strconv.Itoa(iteration), took, err)
+				}
+			}
 			// Stagger so some reader is always mid-transaction.
 			time.Sleep(time.Duration(seed) * p.readMin / time.Duration(p.readers))
 			for {
@@ -113,23 +120,37 @@ func runLongReaderPattern(t *testing.T, s *Store, path string, p longReaderPatte
 					return
 				default:
 				}
+				iteration++
+				begin := time.Now()
+				record("reader_begin_start", 0, nil)
 				tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+				record("reader_begin_end", time.Since(begin), err)
 				if err != nil {
 					failed.Store(err)
 					return
 				}
 				var n int
-				if err := tx.QueryRow(`SELECT count(*) FROM wal_churn WHERE id % 97 = 0`).Scan(&n); err != nil {
+				query := time.Now()
+				record("reader_query_start", 0, nil)
+				queryErr := tx.QueryRow(`SELECT count(*) FROM wal_churn WHERE id % 97 = 0`).Scan(&n)
+				record("reader_query_end", time.Since(query), queryErr)
+				if err := queryErr; err != nil {
 					_ = tx.Rollback()
 					failed.Store(err)
 					return
 				}
 				hold := p.readMin + time.Duration(rng.Int63n(int64(p.readMax-p.readMin)))
+				holdStarted := time.Now()
+				record("reader_hold_start", hold, nil)
 				select {
 				case <-stop:
 				case <-time.After(hold):
 				}
-				_ = tx.Rollback()
+				record("reader_hold_end", time.Since(holdStarted), nil)
+				rollback := time.Now()
+				record("reader_rollback_start", 0, nil)
+				rollbackErr := tx.Rollback()
+				record("reader_rollback_end", time.Since(rollback), rollbackErr)
 			}
 		}(int64(r))
 	}
@@ -181,8 +202,14 @@ func runLongReaderPattern(t *testing.T, s *Store, path string, p longReaderPatte
 	}
 	gap := func(d time.Duration, long bool) {
 		g := longReaderGap{start: time.Now(), long: long, walAtStart: walFileSize(path + "-wal")}
+		if len(diagnostic) > 0 {
+			diagnostic[0].gap(g, true)
+		}
 		time.Sleep(d)
 		g.end = time.Now()
+		if len(diagnostic) > 0 {
+			diagnostic[0].gap(g, false)
+		}
 		mu.Lock()
 		run.gaps = append(run.gaps, g)
 		mu.Unlock()
@@ -219,15 +246,17 @@ func TestWALReclaimResetsUnderLongOverlappingReadersAndBurstyWrites(t *testing.T
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "16")
 	// A production-like cadence (the daemon polls every 5 s).
 	setWALReclaimCadence(t, time.Second, time.Second, 4*time.Second)
+	diagnostic := installQuietGapDiagnostic(t)
 	logs := captureReclaimLog(t)
 	s, path := openWALReclaimStore(t)
+	diagnostic.store.Store(s)
 	defer func() { _ = s.Close() }()
 	seedWALChurnTable(t, s)
 	p := longReaderPattern{
 		readers: 4, readMin: 2500 * time.Millisecond, readMax: 4 * time.Second,
 		burstWrites: 12, shortGap: 1500 * time.Millisecond, longGap: 12 * time.Second, cycles: 3,
 	}
-	run := runLongReaderPattern(t, s, path, p)
+	run := runLongReaderPattern(t, s, path, p, diagnostic)
 	checkLongReaderContract(t, s, run, 16<<20, logs.String())
 }
 
@@ -600,4 +629,131 @@ func TestAReclaimHoldHandsTheWriterBackWhenTheLogIsNotReady(t *testing.T) {
 	require.LessOrEqual(t, res.writerHold, walReclaimResetHold+raceSlack(10*time.Millisecond), "a hold outlasted its cap")
 	require.LessOrEqual(t, time.Duration(maxWait.Load()), walReclaimResetHold+raceSlack(10*time.Millisecond), "a write waited for the gate past one hold")
 	require.Greater(t, writes.Load(), int64(20), "writes kept flowing while the reclaim waited")
+}
+
+// quietGapDiagnostic records timestamps, raw checkpoint tuples, branch
+// decisions and reader lifecycle for this serial fixture. Callbacks do not
+// read SHM/files, snapshot pools or capture stacks.
+type quietGapDiagnostic struct {
+	store            atomic.Pointer[Store] // Used only after Close to qualify hook restoration.
+	observationNanos atomic.Int64
+	mu               sync.Mutex
+	origin           time.Time
+	events           []quietGapEvent
+	omitted          int
+	next             int
+}
+type quietGapEvent struct {
+	at                     time.Duration
+	kind, mode, phase, err string
+	took                   time.Duration
+	sqlStart               time.Duration
+	result                 walCheckpointResult
+	tupleValid             bool
+	capturedEpoch          uint64
+	capturedOlder          int
+}
+
+func (d *quietGapDiagnostic) event(kind, mode, phase string, took time.Duration, err error) {
+	e := quietGapEvent{at: time.Since(d.origin), kind: kind, mode: mode, phase: phase, took: took}
+	if err != nil {
+		e.err = err.Error()
+	}
+	d.appendMinimal(e)
+}
+func (d *quietGapDiagnostic) gap(g longReaderGap, beginning bool) {
+	kind := "gap_end"
+	if beginning {
+		kind = "gap_start"
+	}
+	elapsed := time.Duration(0)
+	if !beginning {
+		elapsed = g.end.Sub(g.start)
+	}
+	d.event(kind, "", "long="+strconv.FormatBool(g.long), elapsed, nil)
+}
+func installQuietGapDiagnostic(t *testing.T) *quietGapDiagnostic {
+	t.Helper()
+	d := &quietGapDiagnostic{origin: time.Now()}
+	priorResult, priorRound := walCheckpointResultObserver, walReclaimRoundObserver
+	walCheckpointResultObserver = func(mode string, start time.Time, took time.Duration, result walCheckpointResult, err error) {
+		e := quietGapEvent{at: time.Since(d.origin), kind: "checkpoint_scan_result", mode: mode, took: took, sqlStart: start.Sub(d.origin), result: result, tupleValid: err == nil}
+		if err != nil {
+			e.err = err.Error()
+		}
+		d.appendMinimal(e)
+		if priorResult != nil {
+			priorResult(mode, start, took, result, err)
+		}
+	}
+	walReclaimRoundObserver = func(stage string, epoch uint64, older int, err error) {
+		e := quietGapEvent{at: time.Since(d.origin), kind: "outer_branch", phase: stage, capturedEpoch: epoch, capturedOlder: older}
+		if err != nil {
+			e.err = err.Error()
+		}
+		d.appendMinimal(e)
+		if priorRound != nil {
+			priorRound(stage, epoch, older, err)
+		}
+	}
+	// Selected fixture defers Close after this cleanup is registered, and its
+	// reader workers are joined before return. Close always joins checkpointDone;
+	// maintenance shutdown can time out, so verify that worker actually exited.
+	// If any worker survives, do not race it by restoring global hook pointers.
+	t.Cleanup(func() {
+		quiescent := true
+		if s := d.store.Load(); s != nil {
+			if done := s.checkpointDone; done != nil {
+				select {
+				case <-done:
+				default:
+					quiescent = false
+				}
+			}
+			s.maintenanceSched.Lock()
+			maintenanceDone := s.maintenanceDone
+			s.maintenanceSched.Unlock()
+			if maintenanceDone != nil {
+				select {
+				case <-maintenanceDone:
+				default:
+					quiescent = false
+				}
+			}
+		}
+		if quiescent {
+			walCheckpointResultObserver, walReclaimRoundObserver = priorResult, priorRound
+		} else {
+			// Captured closures remain immutable for the selected process lifetime;
+			// continued bounded appends use d.mu and never call testing.T.
+			t.Errorf("quiet-gap diagnostics: background worker still live after Close; hooks not restored and qualification invalid")
+		}
+		d.mu.Lock()
+		events := append([]quietGapEvent(nil), d.events...)
+		if d.omitted > 0 {
+			events = append(events[d.next:], events[:d.next]...)
+		}
+		dropped := d.omitted
+		d.mu.Unlock()
+		t.Logf("quiet-gap v4 diagnostic overhead: bounded_append=%s (excludes event construction, prior hooks and deferred rendering); events=%d dropped=%d hooks_restored=%t", time.Duration(d.observationNanos.Load()), len(events), dropped, quiescent)
+		for _, e := range events {
+			t.Logf("quiet-gap v4 diagnostic: %+v", e)
+		}
+	})
+	return d
+}
+
+// Bounded latest-event ring; no SHM, pools, gates or SQL inside callbacks.
+func (d *quietGapDiagnostic) appendMinimal(e quietGapEvent) {
+	start := time.Now()
+	d.mu.Lock()
+	if len(d.events) < 2048 {
+		d.events = append(d.events, e)
+	} else {
+		d.events[d.next] = e
+		d.next = (d.next + 1) % len(d.events)
+		d.omitted++
+	}
+	d.mu.Unlock()
+	d.observationNanos.Add(time.Since(start).Nanoseconds())
 }

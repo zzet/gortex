@@ -1682,7 +1682,17 @@ func (s *Store) checkpointWALOnce(ctx context.Context, mode string) (walCheckpoi
 // PRAGMA this package runs: its mode, start and duration. nil in production.
 var walCheckpointCallObserver func(mode string, start time.Time, took time.Duration)
 
+// walCheckpointResultObserver records raw checkpoint Scan results for tests.
+// A tuple is valid only when scanErr is nil. Nil in production; install before
+// Open and restore only after all owned checkpoint/maintenance workers exit.
+var walCheckpointResultObserver func(mode string, start time.Time, took time.Duration, result walCheckpointResult, scanErr error)
+
 func checkpointWALOnceOn(ctx context.Context, q walCheckpointQueryer, mode string) (walCheckpointResult, error) {
+	resultObserver := walCheckpointResultObserver
+	var observedStart time.Time
+	if resultObserver != nil {
+		observedStart = time.Now()
+	}
 	if observe := walCheckpointCallObserver; observe != nil {
 		start := time.Now()
 		defer func() { observe(mode, start, time.Since(start)) }()
@@ -1702,6 +1712,9 @@ func checkpointWALOnceOn(ctx context.Context, q walCheckpointQueryer, mode strin
 		&result.WALFrames,
 		&result.CheckpointedFrames,
 	)
+	if resultObserver != nil {
+		resultObserver(mode, observedStart, time.Since(observedStart), result, err)
+	}
 	if err != nil {
 		return result, err
 	}
