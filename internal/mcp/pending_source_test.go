@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -18,9 +19,9 @@ func TestPendingSourceVersionsSurviveLedgerEviction(t *testing.T) {
 	newer.markCommitted("new", 3)
 	_, found := s.mutationCommits.byReceipt(old.id)
 	require.False(t, found)
-	require.Equal(t, []string{"/repo/a.go"}, s.pendingSourcePaths("", ""))
+	require.Equal(t, []string{filepath.Clean("/repo/a.go")}, s.pendingSourcePaths("", ""))
 	old.recordGraph(mutationReindexOutcome{Reindexed: true})
-	require.Equal(t, []string{"/repo/a.go"}, s.pendingSourcePaths("", ""), "older publication must not clear newer version")
+	require.Equal(t, []string{filepath.Clean("/repo/a.go")}, s.pendingSourcePaths("", ""), "older publication must not clear newer version")
 	newer.recordGraph(mutationReindexOutcome{Reindexed: true})
 	require.Empty(t, s.pendingSourcePaths("", ""))
 }
@@ -28,13 +29,13 @@ func TestPendingSourceVersionsSurviveLedgerEviction(t *testing.T) {
 func TestPendingSourceFailureIsNotPublication(t *testing.T) {
 	s := &Server{}
 	record := s.beginMutationCommit(context.Background(), "edit", "", "", "a.go", "/repo/a.go")
-	require.Equal(t, []string{"/repo/a.go"}, s.pendingSourcePaths("", ""), "registered before write")
+	require.Equal(t, []string{filepath.Clean("/repo/a.go")}, s.pendingSourcePaths("", ""), "registered before write")
 	record.markCommitted("new", 3)
 	record.recordGraph(mutationReindexOutcome{})
 	require.NotEmpty(t, s.pendingSourcePaths("", ""))
 	rejected := s.beginMutationCommit(context.Background(), "edit", "", "", "b.go", "/repo/b.go")
 	rejected.markNotApplied(context.Canceled)
-	require.Equal(t, []string{"/repo/a.go"}, s.pendingSourcePaths("", ""))
+	require.Equal(t, []string{filepath.Clean("/repo/a.go")}, s.pendingSourcePaths("", ""))
 }
 
 func TestPendingSourcePublicationOutlivesReceipt(t *testing.T) {
@@ -83,7 +84,7 @@ func TestPendingSourceRecoveryAfterReceiptExpiryOnlyClearsCapturedVersion(t *tes
 	newer := s.beginMutationCommit(context.Background(), "edit", "", "", "a.go", "/repo/a.go")
 	newer.markCommitted("new", 3)
 	s.resolveReindexedPathReceipts("/repo/a.go", eligible)
-	require.Equal(t, []string{"/repo/a.go"}, s.pendingSourcePaths("", ""))
+	require.Equal(t, []string{filepath.Clean("/repo/a.go")}, s.pendingSourcePaths("", ""))
 	require.NotContains(t, s.pendingSourceFiles.versions, old.id)
 	require.Contains(t, s.pendingSourceFiles.versions, newer.id)
 }
