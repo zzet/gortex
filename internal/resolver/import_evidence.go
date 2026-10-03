@@ -76,13 +76,12 @@ import (
 // an import edge has already been resolved by this pass or not — the pick
 // is order-independent inside the parallel worker phase.
 
-// pickImportEvidenceCallee returns the single candidate whose defining
-// file the caller file imports (directly or through re-export hops), or
-// nil when the evidence is absent or ambiguous. Only consulted for JS/TS
-// callers with ≥2 candidates — the single-candidate paths keep today's
-// behaviour, and the cross-package guard still polices them.
+// pickImportEvidenceCallee returns the uniquely imported callable. A named
+// binding to the symbol outranks file-level import closure evidence. Candidate
+// count does not weaken an explicit import; absent or ambiguous evidence
+// leaves the existing cascade unchanged. Only JS/TS callers are eligible.
 func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candidates []*graph.Node) *graph.Node {
-	if callerFile == "" || len(candidates) < 2 || !isJSTSPath(callerFile) {
+	if callerFile == "" || len(candidates) == 0 || !isJSTSPath(callerFile) {
 		return nil
 	}
 	// A candidate defined in the caller's own file is (or may be) module-
@@ -94,6 +93,25 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 		if c.FilePath == callerFile {
 			return nil
 		}
+	}
+	var symbolPick *graph.Node
+	for _, e := range r.graph.GetOutEdges(callerFile) {
+		if e.Kind != graph.EdgeImports || e.Alias != "" {
+			continue
+		}
+		target := r.importedTargetOf(e)
+		for _, c := range candidates {
+			if c.ID != target || !isImportableCallee(c, funcName) {
+				continue
+			}
+			if symbolPick != nil && symbolPick.ID != c.ID {
+				return nil
+			}
+			symbolPick = c
+		}
+	}
+	if symbolPick != nil {
+		return symbolPick
 	}
 	imported := r.importedFilesFor(callerFile)
 	if len(imported) == 0 {
@@ -210,6 +228,12 @@ func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
 // of the module it names, or "" when the edge targets nothing indexable
 // (third-party package, stdlib stub, dep contract, unexpandable specifier).
 func (r *Resolver) importedFileOf(e *graph.Edge) string {
+	return r.nodeFilePath(r.importedTargetOf(e))
+}
+
+// importedTargetOf shares symbol/file expansion across both evidence tiers.
+// Parallel resolve workers mutate cloned edges, not these stored import edges.
+func (r *Resolver) importedTargetOf(e *graph.Edge) string {
 	to := e.To
 	if to == "" {
 		return ""
@@ -227,12 +251,12 @@ func (r *Resolver) importedFileOf(e *graph.Edge) string {
 				target = resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), rewritten)
 			}
 		}
-		return r.nodeFilePath(target)
+		return target
 	}
 	if strings.HasPrefix(to, "external::") || strings.HasPrefix(to, "dep::") || graph.IsStdlibStub(to) {
 		return ""
 	}
-	return r.nodeFilePath(to)
+	return to
 }
 
 // nodeFilePath returns the file path of the node id names — the node's own

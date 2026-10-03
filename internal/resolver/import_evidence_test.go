@@ -93,24 +93,21 @@ function setup(): unknown {
 			wantUnresolved: true,
 		},
 		{
-			// Both candidates' files are imported (one for an unrelated
-			// binding): the import statement alone cannot arbitrate, so
-			// the pick refuses exactly like the no-import case.
-			// Alias-cast exports (KindVariable) keep today's behaviour
-			// deterministic: the value-callee fallback refuses on
-			// repo-wide ambiguity.
-			name: "multiple imported candidates still refuse",
+			// No named binding selects either candidate. Importing both
+			// modules for unrelated helpers leaves file evidence ambiguous.
+			name: "ambiguous file closure still refuses",
 			files: map[string]string{
 				"a/one.ts": `type MakeA = () => unknown;
 const implA = () => ({ a: true });
 export const createStore = implA as MakeA;
+export const other = () => 1;
 `,
 				"b/two.ts": `type MakeB = () => unknown;
 const implB = () => ({ b: true });
 export const createStore = implB as MakeB;
 export const helper = () => 1;
 `,
-				"app/main.ts": `import { createStore } from '../a/one';
+				"app/main.ts": `import { other } from '../a/one';
 import { helper } from '../b/two';
 function run(): unknown {
   helper();

@@ -121,6 +121,12 @@ is not scanned as an independent scope. Package-specifier `extends` and project
 `references` are not traversed. Cycles and chains deeper than 32 configs stop.
 Repository indexing/reindexing and untracking invalidate the lazy alias cache.
 
+Bare JS/TS calls with import evidence resolve at `ast_resolved`, including when
+the repository has only one definition. A named import of the defining symbol
+outranks file-level closure evidence; otherwise a unique directly imported or
+barrel-re-exported defining file supplies the binding. Same-file declarations
+still win, and ambiguous import evidence does not promote a guessed target.
+
 ### Julia specifics
 
 `module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`
