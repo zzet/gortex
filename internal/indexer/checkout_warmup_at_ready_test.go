@@ -2,9 +2,12 @@ package indexer
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -81,7 +84,7 @@ func newWarmAtReadyFixture(t *testing.T, name string) *warmAtReadyFixture {
 // holdGoList puts a go command first on PATH that blocks every `go list`
 // until the returned release is called (other go commands pass straight
 // through), and reports through listed whether a listing has begun.
-func holdGoList(t *testing.T) (listed func() bool, release func()) {
+func holdGoList(t *testing.T, provider *goanalysis.Provider) (listed func() bool, release func()) {
 	t.Helper()
 	realGo, err := exec.LookPath("go")
 	if err != nil {
@@ -90,16 +93,23 @@ func holdGoList(t *testing.T) (listed func() bool, release func()) {
 	dir := t.TempDir()
 	mark := filepath.Join(dir, "listed")
 	open := filepath.Join(dir, "released")
-	shim := "#!/bin/sh\n" +
-		"for a in \"$@\"; do\n" +
-		"  if [ \"$a\" = list ]; then\n" +
-		"    : > '" + mark + "'\n" +
-		"    while [ ! -f '" + open + "' ]; do sleep 0.05; done\n" +
-		"    break\n" +
-		"  fi\n" +
-		"done\n" +
-		"exec '" + realGo + "' \"$@\"\n"
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "go"), []byte(shim), 0o755))
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	name := "go"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	shim := filepath.Join(dir, name)
+	if err := os.Link(executable, shim); err != nil {
+		// The test executable and TempDir can be on different volumes.
+		raw, err := os.ReadFile(executable)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(shim, raw, 0o755))
+	}
+	t.Setenv(goListHoldEnv, "1")
+	t.Setenv(goListRealEnv, realGo)
+	t.Setenv(goListMarkEnv, mark)
+	t.Setenv(goListReleaseEnv, open)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	released := false
 	release = func() {
@@ -110,12 +120,59 @@ func holdGoList(t *testing.T) (listed func() bool, release func()) {
 	}
 	// A test that fails before releasing must not leave a warm-up's go
 	// command parked on the marker past the test.
-	t.Cleanup(release)
+	t.Cleanup(func() {
+		// Join/cancel the held command before TempDir removes its executable.
+		// On a failing test this also avoids forwarding a new compiler child.
+		require.NoError(t, provider.Close())
+		release()
+	})
 	listed = func() bool {
 		_, err := os.Stat(mark)
 		return err == nil
 	}
 	return listed, release
+}
+
+const (
+	goListHoldEnv    = "GORTEX_INDEXER_TEST_GO_LIST_HOLD"
+	goListRealEnv    = "GORTEX_INDEXER_TEST_REAL_GO"
+	goListMarkEnv    = "GORTEX_INDEXER_TEST_GO_LIST_MARK"
+	goListReleaseEnv = "GORTEX_INDEXER_TEST_GO_LIST_RELEASE"
+)
+
+// The running test binary is also a portable go-command shim. TestMain
+// dispatches here before flag parsing, so genuine go arguments stay intact.
+func runGoListHoldHelper() (int, bool) {
+	if os.Getenv(goListHoldEnv) != "1" || (filepath.Base(os.Args[0]) != "go" && filepath.Base(os.Args[0]) != "go.exe") {
+		return 0, false
+	}
+	for _, arg := range os.Args[1:] {
+		if arg != "list" {
+			continue
+		}
+		if err := os.WriteFile(os.Getenv(goListMarkEnv), nil, 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1, true
+		}
+		for {
+			if _, err := os.Stat(os.Getenv(goListReleaseEnv)); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		break
+	}
+	cmd := exec.Command(os.Getenv(goListRealEnv), os.Args[1:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			return exit.ExitCode(), true
+		}
+		fmt.Fprintln(os.Stderr, err)
+		return 1, true
+	}
+	return 0, true
 }
 
 // activateWithin selects a dormant checkout and waits for its coordinator to
@@ -149,7 +206,7 @@ func activateWithin(t *testing.T, f *lifecycleFixture, checkoutID string, within
 // registry lock is free while that listing is still held in its go command.
 func TestCheckoutReadyStartsTheCompilerWarmup(t *testing.T) {
 	f := newWarmAtReadyFixture(t, "warmready")
-	listed, release := holdGoList(t)
+	listed, release := holdGoList(t, f.provider)
 
 	require.Empty(t, f.provider.CheckoutWarmups(), "a warm-up ran before the checkout was ready")
 	activateWithin(t, f.lifecycleFixture, f.automatic.CheckoutID, 15*time.Second)
@@ -204,8 +261,7 @@ func TestCheckoutReadyStartsTheCompilerWarmup(t *testing.T) {
 // has been idle.
 func TestCheckoutReadyWarmupYieldsToTheCheckoutsForegroundWork(t *testing.T) {
 	f := newWarmAtReadyFixture(t, "warmyield")
-	listed, release := holdGoList(t)
-	defer release()
+	listed, release := holdGoList(t, f.provider)
 	activateWithin(t, f.lifecycleFixture, f.automatic.CheckoutID, 15*time.Second)
 
 	// A waiting refresh ticket on the ready checkout, planted before the
