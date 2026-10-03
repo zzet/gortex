@@ -1010,6 +1010,11 @@ func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 	})
 	select {
 	case <-c.done:
+		// The start-time Git index refresh has its own goroutine. Cancellation
+		// alone does not prove its process and index lock have been released.
+		if err := c.waitRacyIndexHeal(ctx); err != nil {
+			return err
+		}
 		if err := c.waitDirtyChainCompactions(ctx); err != nil {
 			return err
 		}

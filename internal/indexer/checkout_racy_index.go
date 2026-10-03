@@ -260,3 +260,17 @@ func (c *CheckoutCoordinator) awaitRacyIndexHeal(bound time.Duration) bool {
 		return false
 	}
 }
+
+// waitRacyIndexHeal joins the start-time refresh after lifetime cancellation.
+// A deadline ends only this wait; later CloseContext calls join the same work.
+func (c *CheckoutCoordinator) waitRacyIndexHeal(ctx context.Context) error {
+	if c == nil || c.racyHeal.done == nil {
+		return nil
+	}
+	select {
+	case <-c.racyHeal.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
