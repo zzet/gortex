@@ -10,8 +10,8 @@ import (
 )
 
 // Edit cycles take the build lane for a few hundred milliseconds with gaps of
-// a few hundred between them, while writes keep the log over its ceiling (and
-// under the hard cap). The reclaim loop's checkpoint work may run only in the
+// a few hundred between them, while admitted writes take the log over its threshold
+// but stay under the pressure mark. The reclaim loop's checkpoint work may run only in the
 // gaps: no checkpoint starts inside a cycle, and one running when a cycle
 // starts ends within the lane poll (20 ms) plus scheduling slack. Its share of
 // the cycles' wall time is measured from every checkpoint call.
@@ -52,7 +52,7 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 	s, path := openWALReclaimStore(t)
 	defer func() { _ = s.Close() }()
 	seedWALChurnTable(t, s)
-	growWAL(t, s, 12) // start over the ceiling
+	growWAL(t, s, 12) // start over the threshold, below the pressure mark
 	lane := &fakeBuildLane{}
 	lane.install(s)
 
@@ -76,8 +76,15 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 			mu.Unlock()
 		}
 	}()
-	// The store's own writes (about 1 MiB each) and a reader; no checkpoint
-	// of the test's own, so every call observed is the store's.
+	// Qualify the ordinary nonpressure policy: stop admitting new fixture
+	// writes at 24 MiB until the store itself resets. This preserves headroom
+	// below the 32 MiB pressure exception; it is not a sustained-throughput
+	// workload (the separate pressure and bulk cases exercise that policy).
+	// No checkpoint of the test's own supplies progress.
+	initialResets := s.WALReclaimStats().Resets
+	var committedWrites []span
+	var writesAfterReset, admissionPauses int
+	var admissionWait time.Duration
 	var maxWAL int64
 	var writeErr error
 	wg.Add(2)
@@ -89,11 +96,36 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 				return
 			case <-time.After(20 * time.Millisecond):
 			}
+			// Read the reset counter first: a reset racing the size sample
+			// must release this wait rather than require another reset.
+			resets := s.WALReclaimStats().Resets
+			size := walFileSize(path + "-wal")
+			maxWAL = max(maxWAL, size)
+			if size >= 24<<20 {
+				admissionPauses++
+				started := time.Now()
+				for s.WALReclaimStats().Resets <= resets {
+					maxWAL = max(maxWAL, walFileSize(path+"-wal"))
+					select {
+					case <-stop:
+						admissionWait += time.Since(started)
+						return
+					case <-time.After(20 * time.Millisecond):
+					}
+				}
+				admissionWait += time.Since(started)
+			}
+			wasReset := s.WALReclaimStats().Resets > initialResets
+			started := time.Now()
 			if err := churnWriteOnce(s, k); err != nil {
 				mu.Lock()
 				writeErr = err
 				mu.Unlock()
 				return
+			}
+			committedWrites = append(committedWrites, span{started, time.Now()})
+			if wasReset {
+				writesAfterReset++
 			}
 			if w := walFileSize(path + "-wal"); w > maxWAL {
 				maxWAL = w
@@ -154,6 +186,20 @@ func TestWALReclaimUsesNoTimeInsideEditCycles(t *testing.T) {
 		}
 	}
 	stats := s.WALReclaimStats()
+	writesInsideCycles := 0
+	for _, w := range committedWrites {
+		for _, c := range cycles {
+			if !w.start.Before(c.start) && !w.end.After(c.end) {
+				writesInsideCycles++
+				break
+			}
+		}
+	}
+	t.Logf("nonpressure producer: commits=%d entirely_inside_cycles=%d commits_after_reset=%d actual_observation_resets=%d admission_pauses=%d admission_wait=%s high_water=24MiB", len(committedWrites), writesInsideCycles, writesAfterReset, stats.Resets-initialResets, admissionPauses, admissionWait)
+	require.GreaterOrEqual(t, len(committedWrites), 12, "the nonpressure fixture must commit meaningful real writes")
+	require.Positive(t, writesInsideCycles, "the fixture must include actual committed writes during edit cycles")
+	require.Positive(t, stats.Resets-initialResets, "setup or shutdown must not supply the observation's reset progress")
+	require.Positive(t, writesAfterReset, "real writes must resume after an authoritative reset")
 	share := float64(inside) / float64(max(cycleTime, 1))
 	t.Logf("cycles=%d checkpoint_calls=%d time_inside_cycles=%s of %s (%.2f%%) started_inside=%d late_stops=%d resets=%d wal_max=%.1fMiB",
 		len(cycles), len(calls), inside.Round(time.Millisecond), cycleTime.Round(time.Millisecond), 100*share,
