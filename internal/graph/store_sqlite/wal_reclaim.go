@@ -818,7 +818,14 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	// Before the writer: converge the backfill so the capped writer step
 	// only has to copy what fits its slice (wal_reclaim_converge.go).
 	if attempt.ctx.Err() == nil {
-		conv := s.convergeBackfillPaced(attempt.ctx, ckptDB, attempt)
+		smallFrames := convergeSmallFor(attempt)
+		if res.bulkCompletion {
+			// A near4MiB unmeasured tail can spend the entire existing2s
+			// hold on slow storage. Converge it writer-free before completing
+			// the admitted over-ceiling bulk override under the same cap.
+			smallFrames = min(smallFrames, walReclaimPressureSmallFrames)
+		}
+		conv := s.convergeBackfillPacedWithSmallRemainder(attempt.ctx, ckptDB, attempt, smallFrames)
 		res.convergence = &conv
 	}
 	if attempt.copy != nil && attempt.copy.pausable.Load() && !attempt.copy.pressure && s.buildLaneBusy() {

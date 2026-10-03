@@ -70,6 +70,13 @@ func (s *Store) convergeBackfill(ctx context.Context, ckptDB *sql.DB) walReclaim
 
 // convergeBackfillPaced is convergeBackfill with the attempt's paced passes.
 func (s *Store) convergeBackfillPaced(ctx context.Context, ckptDB *sql.DB, attempt *backgroundCheckpointAttempt) walReclaimConvergence {
+	return s.convergeBackfillPacedWithSmallRemainder(ctx, ckptDB, attempt, convergeSmallFor(attempt))
+}
+
+// The admitted bulk-completion caller uses the existing smaller pressure
+// fallback for an unmeasured tail. Measured-rate admission and all time budgets
+// remain identical; ordinary callers retain their existing fallback.
+func (s *Store) convergeBackfillPacedWithSmallRemainder(ctx context.Context, ckptDB *sql.DB, attempt *backgroundCheckpointAttempt, smallFrames uint32) walReclaimConvergence {
 	started := time.Now()
 	mark := readWALWriteMark(s.dbPath)
 	conv := walReclaimConvergence{frameBytes: int64(mark.PageSize) + 24}
@@ -89,7 +96,7 @@ func (s *Store) convergeBackfillPaced(ctx context.Context, ckptDB *sql.DB, attem
 		}
 		conv.remainderFrames = int64(remainder)
 		switch {
-		case remainder <= convergeSmallFor(attempt):
+		case remainder <= smallFrames:
 			conv.stop = "small"
 			return conv
 		case conv.rateFramesPerS > 0 && float64(remainder)/conv.rateFramesPerS <= convergeSliceFor(attempt).Seconds():
