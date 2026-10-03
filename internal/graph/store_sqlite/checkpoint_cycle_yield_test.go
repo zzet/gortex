@@ -92,20 +92,55 @@ func TestBackgroundCheckpointInFlightYieldsWhenACycleTakesTheLane(t *testing.T) 
 	defer ckpt.Close()
 	cfg := walReclaimConfig{thresholdBytes: 64 << 20, drainDeadline: 250 * time.Millisecond, truncateBudget: walReclaimTruncateBudget, readerWait: 20 * time.Second}
 
+	require.NotNil(t, s.readGate)
+	s.readGate.mu.Lock()
+	initialEpoch := s.readGate.epoch
+	s.readGate.mu.Unlock()
 	done := make(chan walReclaimResult, 1)
 	go func() { done <- s.reclaimWALOnce(cfg, ckpt, path+"-wal") }()
-	// Let it reach the reader wait.
-	time.Sleep(500 * time.Millisecond)
-	select {
-	case res := <-done:
-		t.Fatalf("reclaim finished before the cycle began: outcome=%s reason=%q", res.outcome, res.reason)
-	default:
+	reclaimReturned := false
+	defer func() {
+		if !reclaimReturned {
+			// Release the fixture's pinned reader and join the real attempt before
+			// its checkpoint connection and store are closed, even on setup failure.
+			lane.held.Store(false)
+			_ = pinned.Rollback()
+			select {
+			case <-done:
+			case <-time.After(25 * time.Second):
+				t.Error("reclaim did not return during fixture cleanup")
+			}
+		}
+	}()
+	// Wait for the real writer-free old-reader boundary. The initial PASSIVE
+	// may take longer than a guessed sleep on a slow filesystem.
+	ready := time.NewTicker(time.Millisecond)
+	defer ready.Stop()
+	warmup := time.NewTimer(20 * time.Second)
+	defer warmup.Stop()
+waitForReader:
+	for {
+		s.readGate.mu.Lock()
+		waiting := s.readGate.epoch > initialEpoch && s.readGate.changed != nil && s.readGate.olderLocked(s.readGate.epoch) > 0
+		s.readGate.mu.Unlock()
+		if waiting {
+			break waitForReader
+		}
+		select {
+		case res := <-done:
+			reclaimReturned = true
+			t.Fatalf("reclaim finished before the cycle began: outcome=%s reason=%q", res.outcome, res.reason)
+		case <-warmup.C:
+			t.Fatal("reclaim did not reach its writer-free old-reader wait")
+		case <-ready.C:
+		}
 	}
 	began := time.Now()
 	lane.held.Store(true)
 	var res walReclaimResult
 	select {
 	case res = <-done:
+		reclaimReturned = true
 	case <-time.After(5 * time.Second):
 		t.Fatal("an in-flight reclaim kept running after a cycle took the build lane")
 	}
