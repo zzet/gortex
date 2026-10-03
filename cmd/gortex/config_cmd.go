@@ -268,7 +268,7 @@ func runConfigExcludeRemove(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func runConfigExcludeList(_ *cobra.Command, _ []string) error {
+func runConfigExcludeList(cmd *cobra.Command, _ []string) error {
 	rows := [][2]string{}
 	for _, p := range excludes.Builtin {
 		rows = append(rows, [2]string{"builtin", p})
@@ -295,7 +295,12 @@ func runConfigExcludeList(_ *cobra.Command, _ []string) error {
 		// returns a prospective path for the create case.
 		if _, err := os.Stat(wsPath); err == nil {
 			ws, err := readWorkspaceYAML(wsPath)
-			if err == nil && ws != nil {
+			if err != nil {
+				// A malformed workspace file reduces the layer to zero
+				// patterns — say so instead of just omitting it, so the
+				// user sees why their excludes are not in effect.
+				rows = append(rows, [2]string{"workspace", fmt.Sprintf("0 patterns loaded — file failed to parse: %v", err)})
+			} else if ws != nil {
 				for _, p := range ws.Exclude {
 					rows = append(rows, [2]string{"workspace", p})
 				}
@@ -307,6 +312,13 @@ func runConfigExcludeList(_ *cobra.Command, _ []string) error {
 						rows = append(rows, [2]string{"workspace (legacy watch.exclude)", p})
 					}
 				}
+			}
+			// Unknown keys at any depth are silently dropped by yaml.Unmarshal;
+			// flag them here where a config typo is cheapest to spot.
+			if unknown := config.UnknownWorkspaceKeys(wsPath); len(unknown) > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"[gortex] warning: %s contains keys gortex does not recognize (they are ignored): %s\n",
+					wsPath, strings.Join(unknown, ", "))
 			}
 		}
 	}
@@ -417,21 +429,23 @@ func gitToplevel(start string) string {
 	}
 }
 
-// readWorkspaceYAML loads .gortex.yaml. Returns nil with no error when
-// the file is absent — the workspace target creates it on save.
+// readWorkspaceYAML loads .gortex.yaml into a zero-value Config: callers
+// mutate and write the result back, and seeding it with Default() would
+// persist computed defaults into the file on save. Parse acceptance is
+// still the daemon's — it goes through the shared
+// config.ParseWorkspaceFileInto parser, so this surface agrees with the
+// daemon and with `gortex init` on which files are honored. Returns nil
+// with no error when the file is absent — the workspace target creates it
+// on save.
 func readWorkspaceYAML(path string) (*config.Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
+	cfg := &config.Config{}
+	if err := config.ParseWorkspaceFileInto(path, cfg); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	var cfg config.Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", path, err)
-	}
-	return &cfg, nil
+	return cfg, nil
 }
 
 // writeWorkspaceYAML writes .gortex.yaml. The round-trip through the

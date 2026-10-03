@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,7 +13,6 @@ import (
 	"sync/atomic"
 
 	"go.uber.org/zap"
-	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/excludes"
 )
@@ -178,33 +178,44 @@ func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
 func (cm *ConfigManager) readWorkspaceConfig(repoPrefix, repoPath string) (*Config, bool) {
 	configPath := filepath.Join(repoPath, ".gortex.yaml")
 
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// No workspace config — global defaults will apply.
-			return nil, true
+	// The read and parse go through ParseWorkspaceFileInto (the shared
+	// acceptance semantics — yaml.Unmarshal over the caller's seed): what
+	// the daemon ignores here is exactly what `gortex init` warns about
+	// and what `config exclude list` annotates. The seed is repoConfigSeed
+	// so the daemon's index-workers env override survives.
+	cfg := repoConfigSeed()
+	err := ParseWorkspaceFileInto(configPath, cfg)
+	switch {
+	case err == nil:
+	case os.IsNotExist(err):
+		// No workspace config — global defaults will apply.
+		return nil, true
+	default:
+		// Malformed or unreadable workspace config — log warning, keep
+		// the last good parse rather than silently downgrading the repo
+		// to global defaults on a transient I/O error or a half-saved
+		// edit.
+		msg := "malformed workspace config, keeping the last good parse"
+		var pe *workspaceParseError
+		if !errors.As(err, &pe) {
+			msg = "failed to read workspace config"
 		}
-		cm.logger.Warn("failed to read workspace config",
+		cm.logger.Warn(msg,
 			zap.String("repo", repoPrefix),
 			zap.String("path", configPath),
 			zap.Error(err))
 		return nil, false
 	}
 
-	// Seed with Default() and unmarshal the file OVER it — the same
-	// overlay semantics config.Load() applies. A zero-value seed turned
-	// the file's mere presence into a wholesale replacement: every field
-	// a partial .gortex.yaml didn't mention lost its documented default
-	// (unset index.workers → parse pool of 1, unset
-	// max_parse_bytes_in_flight → admission semaphore disabled).
-	cfg := repoConfigSeed()
-	if err := yaml.Unmarshal(data, cfg); err != nil {
-		// Malformed workspace config — log warning, keep the last good parse.
-		cm.logger.Warn("malformed workspace config, keeping the last good parse",
+	// yaml.Unmarshal silently drops keys at any depth that it does not
+	// know — most often a mistyped key such as `index.ignore` (the real
+	// ones are top-level exclude / legacy index.exclude). Surface them so
+	// a one-word typo does not silently change what gets indexed.
+	if unknown := UnknownWorkspaceKeys(configPath); len(unknown) > 0 {
+		cm.logger.Warn("workspace config contains keys gortex does not recognize — they are ignored",
 			zap.String("repo", repoPrefix),
 			zap.String("path", configPath),
-			zap.Error(err))
-		return nil, false
+			zap.Strings("keys", unknown))
 	}
 
 	return cfg, true
