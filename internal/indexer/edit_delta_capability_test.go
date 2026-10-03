@@ -42,6 +42,7 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"anonymous{Catalog}":                          "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
 	"anonymous{CheckpointWAL}":                    "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
 	"anonymous{Concurrent}":                       "embedder capability probe, asserted on the embedding provider, not on the store",
+	"anonymous{ConcurrentCheckoutPreparation}":    "compiler-admission and off-lane preparation eligibility, asserted on semantic providers, never on a store or delta; providers without it keep preparation on the serialized lane",
 	"anonymous{DeleteContentFilesForRepoNotIn}":   "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
 	"anonymous{HasLanguage}":                      "read accelerator: without it the caller takes the Store/Reader form, which DeltaWriter answers through the composed view (a cost, not a different answer)",
 	"anonymous{MutationRevision}":                 "telemetry, cache-liveness or scheduling probe; absent, the metric or the cache shortcut is simply off",
