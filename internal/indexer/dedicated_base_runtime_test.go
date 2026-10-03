@@ -279,9 +279,9 @@ func TestDedicatedBaseRuntimeCanceledFollowerDoesNotFailClaim(t *testing.T) {
 	runtime, publisher, observation, _ := dedicatedRuntimeFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	leaderReady, releaseLeader := make(chan struct{}), make(chan struct{})
-	observation.PrePublish = func(ctx context.Context, _ int64) error {
-		close(leaderReady)
+	leaderReady, releaseLeader := make(chan int64, 1), make(chan struct{})
+	observation.PrePublish = func(ctx context.Context, generationID int64) error {
+		leaderReady <- generationID
 		select {
 		case <-releaseLeader:
 			return nil
@@ -298,8 +298,9 @@ func TestDedicatedBaseRuntimeCanceledFollowerDoesNotFailClaim(t *testing.T) {
 		done <- err
 	}()
 	defer func() { cancel(); wg.Wait() }()
+	var leaderGenerationID int64
 	select {
-	case <-leaderReady:
+	case leaderGenerationID = <-leaderReady:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
@@ -326,9 +327,9 @@ func TestDedicatedBaseRuntimeCanceledFollowerDoesNotFailClaim(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	// Once its observation gate is gone, this call has completed Claim and
-	// released the gate before entering/waiting for physical work.
-	dedicatedRuntimeWait(t, ctx, func() bool { runtime.mu.Lock(); defer runtime.mu.Unlock(); return len(runtime.gates) == 0 })
+	// Observation/gate release alone does not prove a follower has passed its
+	// catalog ready-check and joined physical work. Cancel the actual waiter.
+	dedicatedRuntimeWait(t, ctx, func() bool { return runtime.store.PayloadBuildFlightWaiters(leaderGenerationID) == 1 })
 	cancelFollower()
 	got := <-follower
 	if !errors.Is(got.err, context.Canceled) || got.result.Claim.GenerationID <= 0 {
