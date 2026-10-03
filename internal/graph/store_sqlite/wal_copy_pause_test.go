@@ -222,7 +222,6 @@ func TestReclaimKeepsTheLogBoundedWithEditsEveryFewSeconds(t *testing.T) {
 	defer deadline.Stop()
 	poll := time.NewTicker(20 * time.Millisecond)
 	defer poll.Stop()
-	delivered := false
 observe:
 	for {
 		mu.Lock()
@@ -230,7 +229,6 @@ observe:
 		failed := writeErr != nil
 		mu.Unlock()
 		if complete && time.Since(started) >= 15*time.Second {
-			delivered = true
 			break
 		}
 		if failed {
@@ -246,7 +244,7 @@ observe:
 	stopWorkers()
 	// A deadline notification can race the final pre-deadline completion. The
 	// joined completion timestamp decides delivery, not which select case won.
-	delivered = completedWrites >= 60 && !workDeliveredAt.IsZero() &&
+	delivered := completedWrites >= 60 && !workDeliveredAt.IsZero() &&
 		!workDeliveredAt.After(deliveryDeadline) && observationFinished.Sub(started) >= 15*time.Second
 	st, cp := s.WALReclaimStats(), s.WALCopyStats()
 	t.Logf("periodic workload: completed_writes=%d required_writes=60 delivered=%t observation=%s delivery_deadline=30s first_write_at=%s work_delivered_at=%s write_gate_and_sql_max=%s worst_write_start=%s worst_write_end=%s",
