@@ -153,8 +153,8 @@ func TestWALPromotedCompletionKeepsCreditAndAdmissionFences(t *testing.T) {
 			size := walFileSize(s.dbPath + "-wal")
 			cfg := walReclaimConfig{thresholdBytes: 1, ceilingBytes: size / 4, readerWait: time.Second, truncateBudget: walReclaimTruncateBudget}
 			res := &walReclaimResult{urgent: true, lastResort: true, lastResortPromotion: &current}
-			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-			defer cancel()
+			setupCtx, cancelSetup := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancelSetup()
 			switch kind {
 			case "spent":
 				res.writerSpent = walReclaimMaxWriterHold
@@ -163,7 +163,7 @@ func TestWALPromotedCompletionKeepsCreditAndAdmissionFences(t *testing.T) {
 			case "below_mark":
 				cfg.ceilingBytes = size
 			case "new_wal":
-				_, err := checkpointWALOnceOn(ctx, db, "TRUNCATE")
+				_, err := checkpointWALOnceOn(setupCtx, db, "TRUNCATE")
 				require.NoError(t, err)
 				for writes := 0; walFileSize(s.dbPath+"-wal") < walReclaimLastResortBytes(cfg) && writes < 64; writes++ {
 					require.NoError(t, churnWriteOnce(s, writes))
@@ -177,10 +177,8 @@ func TestWALPromotedCompletionKeepsCreditAndAdmissionFences(t *testing.T) {
 				lane.install(s)
 				lane.held.Store(true)
 				defer lane.held.Store(false)
-			case "cancelled":
-				cancel()
 			case "remaining_credit":
-				pin, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+				pin, err := s.db.BeginTx(setupCtx, &sql.TxOptions{ReadOnly: true})
 				require.NoError(t, err)
 				defer func() { _ = pin.Rollback() }()
 				var payload string
@@ -190,6 +188,12 @@ func TestWALPromotedCompletionKeepsCreditAndAdmissionFences(t *testing.T) {
 				s.writeMu.Unlock()
 				require.NoError(t, err)
 				res.writerSpent = walReclaimMaxWriterHold - 200*time.Millisecond
+			}
+			// The unchanged one-second operation allowance starts after real setup.
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			if kind == "cancelled" {
+				cancel()
 			}
 			spent := res.writerSpent
 			err := s.reclaimWALInLane(ctx, cfg, db, res)
