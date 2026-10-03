@@ -35,7 +35,7 @@ func TestRepoHasLanguageMatchesFileCountsAndCancellation(t *testing.T) {
 							want = true
 						}
 					}
-					got, err := s.RepoHasLanguageContext(nil, repo, lang)
+					got, err := s.RepoHasLanguageContext(context.Background(), repo, lang)
 					if err != nil || got != want {
 						t.Fatalf("gen%d repo%q lang%q got%t/%v want%t", gen, repo, lang, got, err, want)
 					}

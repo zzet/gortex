@@ -28,7 +28,7 @@ func TestCommittedGoPresenceUsesCheckedReaderAndGraphFallback(t *testing.T) {
 	}, nil)
 	for _, repo := range []string{"go", "module", "content", "symbol", "missing"} {
 		want := repo == "go" || repo == "symbol"
-		got, err := carriesGoFilesContext(nil, g, repo)
+		got, err := carriesGoFilesContext(context.Background(), g, repo)
 		if got != want || err != nil {
 			t.Fatalf("fallback%q got%t/%v want%t", repo, got, err, want)
 		}

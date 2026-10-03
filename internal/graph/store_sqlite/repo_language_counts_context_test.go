@@ -44,11 +44,11 @@ func TestLanguageCensusCancellationDoesNotMemoizeFailure(t *testing.T) {
 	if _, ok := s.publishedLanguageCounts.Load(publishedLanguageCountKey{generation: 7, repoPrefix: "r"}); ok {
 		t.Fatal("failed read was memoized")
 	}
-	got, err = h.PublishedRepoLanguageCountsContext(nil, "r")
+	got, err = h.PublishedRepoLanguageCountsContext(context.Background(), "r")
 	if err != nil || got["go"] != 1 {
 		t.Fatalf("retry: %v/%v", got, err)
 	}
-	want, err := h.RepoLanguageCountsContext(nil, []string{"r"})
+	want, err := h.RepoLanguageCountsContext(context.Background(), []string{"r"})
 	if err != nil || !reflect.DeepEqual(got, want["r"]) {
 		t.Fatalf("counts parity %v/%v", want, err)
 	}
