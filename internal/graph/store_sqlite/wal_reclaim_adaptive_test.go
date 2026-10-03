@@ -224,7 +224,28 @@ func TestWALAdaptiveEntryKeepsStateAndCancellationFences(t *testing.T) {
 }
 
 func TestWALAdaptiveCreditRefusesANewTailAfterTimerRelease(t *testing.T) {
+	assertAdaptiveCreditCommittedTailRefusal(t, 0)
+}
+
+// The original hold deadline can expire while a real WAL sync continues. A
+// fresh admission slice may use only its unused aggregate credit; a committed
+// foreground tail must still be refused by the current-frontier fence.
+func TestWALAdaptiveCreditRefusesCommittedTailAfterHoldExpiry(t *testing.T) {
+	assertAdaptiveCreditCommittedTailRefusal(t, 150*time.Millisecond)
+}
+
+func assertAdaptiveCreditCommittedTailRefusal(t *testing.T, syncDelay time.Duration) {
+	t.Helper()
 	s, db := finalBackfillFixture(t)
+	var delayedSyncs atomic.Int64
+	if syncDelay > 0 {
+		observeDelayedReclaimSync(t, db, func(kind int) {
+			if kind == vfsFileWAL {
+				delayedSyncs.Add(1)
+				time.Sleep(syncDelay)
+			}
+		})
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	completedCopy := make(chan struct{})
@@ -271,7 +292,14 @@ func TestWALAdaptiveCreditRefusesANewTailAfterTimerRelease(t *testing.T) {
 	defer stop()
 	_, err := writer.passive(holdCtx, ctx, db, budget-walReclaimResetHold/2, false)
 	require.ErrorIs(t, err, errWALReclaimReadersInFlight)
-	require.NoError(t, holdCtx.Err(), "refusal came from deadline instead of the committed tail")
+	// The returned frontier-fence error is authoritative; the original hold
+	// context may legitimately have expired before a fresh admission slice.
+	require.NotErrorIs(t, err, context.DeadlineExceeded)
+	if syncDelay > 0 {
+		require.Positive(t, delayedSyncs.Load(), "the controlled WAL sync was not exercised")
+		require.True(t, writer.readmitted, "the expired hold did not use unused credit for fresh admission")
+		require.NotNil(t, writer.resetCtx, "fresh admission did not retain its effective scope")
+	}
 	writer.release()
 	join()
 	require.NoError(t, writeErr)
