@@ -160,6 +160,9 @@ type dirtyCommandFunc func(context.Context, string, ...string) ([]byte, error)
 type DirtySampler struct {
 	root string
 	run  dirtyCommandFunc
+	// refreshRun is separate from read-only sampling's immediate cancellation.
+	// Test-injected samplers leave it nil and keep their existing run seam.
+	refreshRun dirtyCommandFunc
 
 	mu        sync.Mutex
 	commitOID string
@@ -209,7 +212,9 @@ func NewDirtySampler(root, seedCommit, seedTree string) (*DirtySampler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gitstate: resolve checkout root %q: %w: %w", root, ErrDirtyUnavailable, err)
 	}
-	return newDirtySampler(abs, seedCommit, seedTree, gitcmd.Run), nil
+	s := newDirtySampler(abs, seedCommit, seedTree, gitcmd.Run)
+	s.refreshRun = gitcmd.RunIndexRefresh
+	return s, nil
 }
 
 func newDirtySampler(root, seedCommit, seedTree string, run dirtyCommandFunc) *DirtySampler {

@@ -231,8 +231,15 @@ func (s *DirtySampler) RefreshRacyIndex(ctx context.Context) (before, after Racy
 			return before, before, false, ErrIndexLocked
 		}
 	}
-	out, runErr := s.run(ctx, s.root, "update-index", "-q", "--refresh")
+	run := s.refreshRun
+	if run == nil {
+		run = s.run
+	}
+	out, runErr := run(ctx, s.root, "update-index", "-q", "--refresh")
 	after = s.RacyIndex()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return before, after, true, fmt.Errorf("gitstate: refresh index in %s: %w", s.root, ctxErr)
+	}
 	switch {
 	case runErr == nil:
 	case strings.Contains(runErr.Error(), "index.lock") || indexLocked(gitDir, ok):

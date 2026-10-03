@@ -92,7 +92,14 @@ func currentSem() *semaphore.Weighted {
 // fmt.Errorf("git %s: %w: %s", args[0], err, bytes.TrimSpace(stderr)).
 // The captured stdout is always returned, even on error.
 func Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	return run(ctx, dir, nil, args...)
+	return run(ctx, dir, nil, nil, args...)
+}
+
+// RunIndexRefresh has Run's limiter, environment and output contract. On Unix,
+// cancellation first lets Git remove its own index lock before bounded force
+// termination. Windows retains the existing CommandContext termination policy.
+func RunIndexRefresh(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	return run(ctx, dir, nil, configureIndexRefreshCancellation, args...)
 }
 
 // RunNoLazy has Run's semaphore, context, output, and error contract, but
@@ -100,10 +107,10 @@ func Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
 // immutable object graphs where a promisor lookup must fail locally instead
 // of fetching from a remote.
 func RunNoLazy(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	return run(ctx, dir, noLazyGitEnv(), args...)
+	return run(ctx, dir, noLazyGitEnv(), nil, args...)
 }
 
-func run(ctx context.Context, dir string, env []string, args ...string) ([]byte, error) {
+func run(ctx context.Context, dir string, env []string, configure func(*exec.Cmd), args ...string) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -128,6 +135,9 @@ func run(ctx context.Context, dir string, env []string, args ...string) ([]byte,
 		cmd.Env = env
 	}
 	platform.ConfigureBackgroundCommand(cmd)
+	if configure != nil {
+		configure(cmd)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
