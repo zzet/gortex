@@ -829,6 +829,9 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		}
 		conv := s.convergeBackfillPacedWithSmallRemainder(attempt.ctx, ckptDB, attempt, smallFrames)
 		res.convergence = &conv
+		if conv.slowTail != nil {
+			res.slowTail = conv.slowTail
+		}
 	}
 	if attempt.copy != nil && attempt.copy.pausable.Load() && !attempt.copy.pressure && s.buildLaneBusy() {
 		res.outcome, res.reason = walReclaimSkipped, "build_lane_busy"

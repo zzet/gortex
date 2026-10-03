@@ -52,7 +52,8 @@ type walReclaimConvergence struct {
 	frameBytes      int64
 	rateFramesPerS  float64
 	elapsed         time.Duration
-	stop            string // fits | small | no_progress | max_passes | cancelled | error
+	stop            string              // fits | small | slow_tail_plateau | no_progress | max_passes | cancelled | error
+	slowTail        *walReclaimSlowTail // completed same-WAL writer-free copy with a newly appended tail
 }
 
 func (c walReclaimConvergence) String() string {
@@ -109,16 +110,36 @@ func (s *Store) convergeBackfillPacedWithSmallRemainder(ctx context.Context, ckp
 			conv.stop = "cancelled"
 			return conv
 		}
-		passStart := time.Now()
+		before, beforeOK := readWALReclaimFrontier(s.dbPath)
+		slowTailPlateau := false
 		var waitedBefore time.Duration
 		if attempt != nil && attempt.copy != nil {
 			waitedBefore = attempt.copy.pauseNs + attempt.copy.budgetNs
 		}
+		passStart := time.Now()
 		result, err := s.pacedPassive(ctx, ckptDB, attempt)
 		took := time.Since(passStart)
 		if attempt != nil && attempt.copy != nil {
 			// Time paused for an edit or waiting for budget is not copy time.
 			took -= attempt.copy.pauseNs + attempt.copy.budgetNs - waitedBefore
+		}
+		// A slow writer-free copy can finish its admitted frontier while new
+		// writes leave a tail too large for an ordinary short reset. Preserve
+		// that positive proof for the same existing one-shot adaptive credit;
+		// incomplete/cancelled copies and changed WAL identities earn none.
+		if ctx.Err() == nil && err == nil && beforeOK && took > walReclaimResetHold && result.WALFrames > 0 && result.CheckpointedFrames == result.WALFrames && uint32(result.CheckpointedFrames) >= before.mx {
+			if after, afterOK := readWALReclaimFrontier(s.dbPath); afterOK && before.salt == after.salt && after.backfill >= before.mx && after.mx > after.backfill {
+				conv.slowTail = &walReclaimSlowTail{salt: after.salt, copyElapsed: took, covered: before.mx}
+				// Under pressure, a completed slow pass whose new tail does not
+				// shrink has disproved this pass's geometric convergence premise.
+				// Hand the positive same-WAL proof to the existing single adaptive
+				// writer step instead of spending the operation lifetime repeating
+				// writer-free copies. Admission and aggregate credit remain guarded.
+				slowTailPlateau = attempt != nil && attempt.copy != nil && attempt.copy.pressure && before.mx > before.backfill && after.mx-after.backfill > smallFrames && after.mx-after.backfill >= before.mx-before.backfill
+				if slowTailPlateau {
+					conv.remainderFrames = int64(after.mx - after.backfill)
+				}
+			}
 		}
 		conv.passes++
 		if err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
@@ -142,6 +163,11 @@ func (s *Store) convergeBackfillPacedWithSmallRemainder(ctx context.Context, ckp
 		conv.copiedFrames += copied
 		if took > 0 {
 			conv.rateFramesPerS = float64(copied) / took.Seconds()
+		}
+		if slowTailPlateau {
+			conv.stop = "slow_tail_plateau"
+			conv.elapsed = time.Since(started)
+			return conv
 		}
 	}
 }
