@@ -582,34 +582,27 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	}
 	// Same refusal the background PASSIVE honours: a generation bulk window
 	// holding the lease, or another background checkpoint in flight.
-	// It never starts while a mutation cycle holds the build lane, and a
-	// cycle taking the lane cancels it (checkpoint_cycle_yield.go): the
-	// reclaim's reset takes the writer and a TRUNCATE, so it has no forced
-	// variant — it waits for an idle window.
-	//
-	// Over the WAL ceiling it still waits for the gaps between edit cycles
-	// (and yields within walCheckpointCycleYieldPoll when one starts): the
-	// log may pass the ceiling during a burst of edits rather than take the
-	// core from them. Only over the hard cap (walReclaimHardCapFactor × the
-	// ceiling) does one attempt run despite the lane, bounded by the
-	// writer-hold cap, at most once per walReclaimHardCapSpacing, logged.
+	// Ordinary below-pressure attempts wait for an idle lane and yield when
+	// an edit starts. A positively above-pressure WAL/request qualifies the
+	// bounded pressure class even when it starts in an idle gap; later edits
+	// must not withdraw the completion needed to keep the log bounded.
+	// Hard-cap qualification still requires a busy lane and its spacing gate;
+	// bulk lease overrides retain their distinct yielding policy below hard cap.
 	policy := checkpointYieldsToCycle
 	laneBusy := s.cycleYieldEnabled() && s.buildLaneBusy()
 	hardCap, pressure := false, false
-	if laneBusy && cfg.ceilingBytes > 0 {
+	if cfg.ceilingBytes > 0 {
 		size := walFileSize(walPath)
-		if size >= walReclaimHardCapFactor*cfg.ceilingBytes && s.hardCapDue(time.Now()) {
+		if laneBusy && size >= walReclaimHardCapFactor*cfg.ceilingBytes && s.hardCapDue(time.Now()) {
 			policy, hardCap = checkpointIgnoresCycle, true
 			s.walReclaim.cycle.ceiling.Add(1)
 			s.walReclaim.cycle.lastHardCap.Store(time.Now().UnixNano())
 			log.Printf("store_sqlite: wal reclaim running despite the build lane reason=wal_hard_cap wal_bytes=%d hard_cap=%d", size, walReclaimHardCapFactor*cfg.ceilingBytes)
 		} else if mark := walPressureMark(cfg); mark > 0 && !walPressureOff && (size >= mark || s.walReclaimRequested(time.Now(), size, cfg)) {
-			// Over the pressure mark a sustained burst of edits would keep the
-			// lane busy past every pass: the copy runs through the edits
-			// (under the budget) and the reset takes a short hold of its own
-			// (walReclaimPressureHold) once the copy is complete.
+			// Pressure is a property of this admitted WAL/request, not the
+			// lane's instantaneous state. An above-mark pass begun in a gap
+			// must retain the same bounded completion policy when an edit starts.
 			policy, pressure = checkpointIgnoresCycle, true
-			s.walCopy.pressureRuns.Add(1)
 		}
 	}
 	attempt, berr := s.beginBackgroundCheckpointAttempt(policy)
@@ -644,6 +637,9 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 			return walReclaimResult{outcome: walReclaimSkipped, reason: "checkpoint_in_flight"}
 		}
 		leaseOverride = true
+		// A bulk lease override retains its existing yielding policy unless
+		// the independently qualified hard-cap class also overrides the lane.
+		pressure = false
 		s.walReclaim.cycle.leaseOverrides.Add(1)
 		s.walReclaim.cycle.lastLeaseOverride.Store(time.Now().UnixNano())
 		log.Printf("store_sqlite: wal reclaim running inside a bulk window reason=wal_ceiling wal_bytes=%d ceiling=%d", size, cfg.ceilingBytes)
@@ -651,6 +647,9 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		return walReclaimResult{outcome: walReclaimSkipped, reason: "checkpoint_lease"}
 	}
 	defer s.finishBackgroundCheckpointAttempt(attempt)
+	if pressure {
+		s.walCopy.pressureRuns.Add(1)
+	}
 	// Passes of an attempt that yields to edits pause for them; one running
 	// despite the lane (the hard cap) copies straight through.
 	// Only an attempt that yields to edits pauses for them: one begun with no
