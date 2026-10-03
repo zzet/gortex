@@ -1,7 +1,9 @@
 package gitstate
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -81,13 +83,18 @@ func statusRefreshSeconds(t *testing.T, repo string) float64 {
 	t.Helper()
 	cmd := exec.Command("git", "-C", repo, "--no-optional-locks", "status", "--porcelain=v2", "-z", "--untracked-files=all")
 	cmd.Env = append(os.Environ(), "GIT_TRACE_PERFORMANCE=1", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
-	out, err := cmd.CombinedOutput()
+	var trace bytes.Buffer
+	cmd.Stderr = &trace
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("status: %v\n%s", err, out)
+		t.Fatalf("status: %v\n%s", err, trace.Bytes())
 	}
-	match := refreshIndexTrace.FindSubmatch(out)
+	if len(out) != 0 {
+		t.Fatalf("status reported a changed fixture: %q", out)
+	}
+	match := refreshIndexTrace.FindSubmatch(trace.Bytes())
 	if match == nil {
-		t.Fatalf("no refresh-index trace in:\n%s", out)
+		t.Fatalf("no refresh-index trace in:\n%s", trace.Bytes())
 	}
 	seconds, err := strconv.ParseFloat(string(match[1]), 64)
 	if err != nil {
@@ -96,13 +103,36 @@ func statusRefreshSeconds(t *testing.T, repo string) float64 {
 	return seconds
 }
 
+// racyFixtureContent records every independent path and its complete payload.
+// Index stat fields may change during healing; staged modes/OIDs/paths and source
+// bytes must not.
+func racyFixtureContent(t *testing.T, repo string, files int) [sha256.Size]byte {
+	t.Helper()
+	hash := sha256.New()
+	for i := 0; i < files; i++ {
+		path := fmt.Sprintf("pkg/f%04d.txt", i)
+		body, err := os.ReadFile(filepath.Join(repo, filepath.FromSlash(path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = hash.Write([]byte(path + "\x00"))
+		_, _ = hash.Write(body)
+	}
+	var result [sha256.Size]byte
+	copy(result[:], hash.Sum(nil))
+	return result
+}
+
 // A racily clean index makes every status hash every tracked file, and the
 // daemon's statuses never write the refreshed index back, so it stays slow.
 // RefreshRacyIndex detects it from the index file and heals it with one
-// locked refresh: the next status is fast.
+// locked refresh. Preserve timings as diagnostics; correctness is the actual
+// index transition with clean status and unchanged staged/source content.
 func TestRefreshRacyIndexHealsARacilyCleanCheckout(t *testing.T) {
 	repo := makeRacyIndexRepo(t, 800)
 	s := dirtyContentSampler(t, repo)
+	staged := dirtyContentGit(t, repo, "ls-files", "--stage", "-z")
+	content := racyFixtureContent(t, repo, 800)
 	report := s.RacyIndex()
 	if !report.Known || report.Racy < 800 || !report.NeedsRefresh() {
 		t.Fatalf("racy fixture not detected: %+v", report)
@@ -122,8 +152,11 @@ func TestRefreshRacyIndexHealsARacilyCleanCheckout(t *testing.T) {
 	}
 	fast := max(statusRefreshSeconds(t, repo), statusRefreshSeconds(t, repo))
 	t.Logf("refresh index: %.4fs racily clean, %.4fs after the refresh", slow, fast)
-	if fast*3 > slow {
-		t.Fatalf("status refresh-index time %.4fs after the refresh, %.4fs before: not healed", fast, slow)
+	if got := dirtyContentGit(t, repo, "ls-files", "--stage", "-z"); got != staged {
+		t.Fatal("healing changed staged modes, object IDs, or paths")
+	}
+	if got := racyFixtureContent(t, repo, 800); got != content {
+		t.Fatal("healing changed source content")
 	}
 	if _, _, ranAgain, err := s.RefreshRacyIndex(context.Background()); ranAgain || err != nil {
 		t.Fatalf("a healthy index was refreshed again: ran=%v err=%v", ranAgain, err)
