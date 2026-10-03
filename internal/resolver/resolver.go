@@ -331,6 +331,7 @@ type Resolver struct {
 	// pickImportEvidenceCallee to disambiguate bare JS/TS calls; see
 	// import_evidence.go for the precedence design.
 	importFilesByCaller map[string]map[string]struct{}
+	importEdgesByFile   map[string][]*graph.Edge
 	importFilesMu       sync.RWMutex
 
 	// csharpNSByFile memoises each C# file's visible namespaces (usings
@@ -2088,6 +2089,7 @@ func (r *Resolver) warmLookupCacheWithSources(pending []*graph.Edge, sources map
 		}
 	}
 	qualElapsed := time.Since(qualStart)
+	r.warmImportEvidenceEdges(pending)
 	// Make the previously-silent warm phase observable — the batched store
 	// reads over ~0.5M keys land before the first compute progress tick.
 	r.logger.Info("resolver: warm lookup cache",
@@ -2210,6 +2212,7 @@ func (r *Resolver) clearLookupCache() {
 	r.nodesByExternLanguageName = nil
 	r.importFilesMu.Lock()
 	r.importFilesByCaller = nil
+	r.importEdgesByFile = nil
 	r.importFilesMu.Unlock()
 	r.csharpNSMu.Lock()
 	r.csharpNSByFile = nil
