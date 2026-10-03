@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestTSConfigPathAlias_ConfigChangeOnFullRetrack(t *testing.T) {
+func TestTSConfigPathAlias_ConfigChangeOnFullReindex(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "tsconfig.json")
 	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["old/*"]}}}`)
@@ -19,9 +19,6 @@ func TestTSConfigPathAlias_ConfigChangeOnFullRetrack(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
 	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
-	// Tracking the same root again creates a fresh per-repository Indexer,
-	// while the package cache survives in the same process.
-	idx, _ = newSQLiteIndexer(t)
 	_, err = idx.Index(root)
 	require.NoError(t, err)
 	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"), "same-root reindex must not keep the old config")
@@ -76,3 +73,4 @@ func TestTSConfigPathAlias_ConfigOnlyIncrementalReindex(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
 }
+
