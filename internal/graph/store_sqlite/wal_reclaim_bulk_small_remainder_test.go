@@ -167,7 +167,9 @@ func TestBulkCompletionConvergesUnmeasuredTailBeforeWriterCredit(t *testing.T) {
 				return
 			case <-time.After(150 * time.Millisecond):
 			}
-			ctx, cancel := context.WithTimeout(producerCtx, walReclaimWriterWait)
+			// Completion may hold the writer for the existing two-second cap.
+			// Match the foreground transaction to the asserted allowance below.
+			ctx, cancel := context.WithTimeout(producerCtx, walReclaimMaxWriterHold+250*time.Millisecond)
 			start := time.Now()
 			err := s.writeMu.LockContext(ctx)
 			if err == nil {

@@ -24,7 +24,11 @@ func TestCompletedSlowConvergenceRecoversContinuousWrites(t *testing.T) {
 			t.Cleanup(func() { lane.held.Store(false) })
 			previousRate := walHoldCopyRate.Swap(0)
 			t.Cleanup(func() { walHoldCopyRate.Store(previousRate) })
-			ctx, cancel := context.WithTimeout(t.Context(), walReclaimLaneBudget)
+			// This scenario includes multiple writer-free copies and admitted
+			// reset attempts. Its finite progress guard is separate from each
+			// production lane operation's unchanged ten-second budget.
+			const scenarioProgressBudget = 30 * time.Second
+			ctx, cancel := context.WithTimeout(t.Context(), scenarioProgressBudget)
 			defer cancel()
 			cancelJoined := make(chan struct{})
 			stopCancellation := context.AfterFunc(ctx, func() {
@@ -144,6 +148,7 @@ func TestCompletedSlowConvergenceRecoversContinuousWrites(t *testing.T) {
 				}
 				effectiveDBSyncNs.Store(max(effectiveDBSyncNs.Load(), int64(time.Since(from))))
 			})
+			t.Logf("scenario_progress_budget=%s lane_operation_budget=%s", scenarioProgressBudget, walReclaimLaneBudget)
 			started := time.Now()
 			resets, adaptiveAttempts, plateauPasses := 0, 0, 0
 			var aggregateMax time.Duration
@@ -173,7 +178,7 @@ func TestCompletedSlowConvergenceRecoversContinuousWrites(t *testing.T) {
 			join()
 			t.Logf("minimum_DB_sync_requested=%s padding_added=%s actual_DB_sync=%s effective_DB_sync=%s writes_during_sync=%d resets=%d writes=%d WAL_syncs=%d adaptive_attempts=%d plateau_passes=%d aggregate_max=%s gate_max=%s SQL_max=%s elapsed=%s producer_error=%v", delay, time.Duration(injectionNs.Load()), time.Duration(actualDBSyncNs.Load()), time.Duration(effectiveDBSyncNs.Load()), commitsDuringSync.Load(), resets, writes.Load(), walSyncs.Load(), adaptiveAttempts, plateauPasses, aggregateMax, time.Duration(worstGate.Load()), time.Duration(worstSQL.Load()), time.Since(started), producerErr)
 			require.NoError(t, producerErr)
-			require.True(t, active, "actual outer attempt did not recover within its original lifetime")
+			require.True(t, active, "recovery did not complete within the scenario progress guard")
 			require.Equal(t, 1, resets)
 			require.Positive(t, adaptiveAttempts)
 			require.Positive(t, plateauPasses)
@@ -202,7 +207,12 @@ func TestSlowConvergenceProofRefusesInvalidCopies(t *testing.T) {
 			lane.install(s)
 			lane.held.Store(true)
 			t.Cleanup(func() { lane.held.Store(false) })
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			// Every case must establish real copied/backfilled state before
+			// testing invalid proof. This is a finite fixture setup guard,
+			// not a five-second production SLA for writer-free SQL or sync.
+			// Cancellation below remains tied to a returned full-copy tuple.
+			const copySetupBudget = 30 * time.Second
+			ctx, cancel := context.WithTimeout(t.Context(), copySetupBudget)
 			defer cancel()
 			if kind == "incomplete" {
 				reader, err := s.db.BeginTx(ctx, nil)
@@ -222,17 +232,20 @@ func TestSlowConvergenceProofRefusesInvalidCopies(t *testing.T) {
 			}
 			beforeFrontier, frontierKnown := readWALReclaimFrontier(s.dbPath)
 			require.True(t, frontierKnown)
-			var observed atomic.Bool
+			var observed, controlledCancel atomic.Bool
 			var first walCheckpointResult
 			previousObserver := walCheckpointResultObserver
-			walCheckpointResultObserver = func(mode string, _ time.Time, _ time.Duration, result walCheckpointResult, _ error) {
+			walCheckpointResultObserver = func(mode string, _ time.Time, _ time.Duration, result walCheckpointResult, scanErr error) {
 				if mode != "PASSIVE" || !observed.CompareAndSwap(false, true) {
 					return
 				}
 				first = result
 				switch kind {
 				case "cancelled":
-					cancel()
+					if scanErr == nil && result.Busy == 0 && result.WALFrames > 0 && result.CheckpointedFrames == result.WALFrames {
+						controlledCancel.Store(true)
+						cancel()
+					}
 				case "new_WAL":
 					_, err := checkpointWALOnceOn(t.Context(), s.writerDB, "TRUNCATE")
 					require.NoError(t, err)
@@ -257,7 +270,11 @@ func TestSlowConvergenceProofRefusesInvalidCopies(t *testing.T) {
 			}, nil)
 			attempt := &backgroundCheckpointAttempt{copy: &walCopyAttempt{pressure: true}}
 			result := s.convergeBackfillPacedWithSmallRemainder(ctx, db, attempt, walReclaimPressureSmallFrames)
-			t.Logf("kind=%s actual_first_tuple=%+v observed=%v stop=%s passes=%d context=%v", kind, first, observed.Load(), result.stop, result.passes, ctx.Err())
+			t.Logf("kind=%s copy_setup_budget=%s controlled_cancel_requested=%v actual_first_tuple=%+v observed=%v stop=%s passes=%d context=%v", kind, copySetupBudget, controlledCancel.Load(), first, observed.Load(), result.stop, result.passes, ctx.Err())
+			if kind == "cancelled" {
+				require.True(t, controlledCancel.Load(), "the error-free full-copy cancellation boundary was not reached")
+				require.ErrorIs(t, ctx.Err(), context.Canceled, "fixture setup expiry is not the intended cancellation witness")
+			}
 			require.Nil(t, result.slowTail, "invalid copy earned adaptive entitlement")
 			require.NotEqual(t, "slow_tail_plateau", result.stop)
 			if kind == "no_actual_copy" {
