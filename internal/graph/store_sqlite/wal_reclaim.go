@@ -1530,9 +1530,10 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 	held := time.Now()
 	writer := newWALReclaimWriterCredit(s, held)
 	writer.yieldToWriters = !res.urgent
+	adaptiveCopy := false
 	defer func() {
 		writer.release()
-		res.recordWriterCredit(writer, budget > walReclaimResetHold)
+		res.recordWriterCredit(writer, adaptiveCopy)
 	}()
 	if hook := walIdleResetHook; hook != nil {
 		hook()
@@ -1555,15 +1556,25 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 	}
 	defer stopYield()
 	yielded := func() bool { return errors.Is(context.Cause(yctx), errWALReclaimWriterWaiting) }
-	// The hold copies only a small remainder (walHoldAllowedFrames).
+	// Ordinary holds copy only a fitted small remainder. A positively witnessed
+	// adaptive copy is admitted by its remaining bounded time credit instead.
 	snap, ok := readWALIndexSnapshot(s.dbPath)
-	if ok && snap.MxFrame > snap.NBackfill && snap.MxFrame-snap.NBackfill > walHoldAllowedFramesFor(res, budget) {
+	if budget <= walReclaimResetHold && ok && snap.MxFrame > snap.NBackfill && snap.MxFrame-snap.NBackfill > walHoldAllowedFramesFor(res, budget) {
 		return false, nil // copy more without the writer first
 	}
 	copyStart := time.Now()
 	copyCredit := budget / 2
 	if budget > walReclaimResetHold {
 		copyCredit = budget - walReclaimResetHold
+	}
+	if budget > walReclaimResetHold {
+		if yctx.Err() != nil {
+			return false, yctx.Err()
+		}
+		if !res.beginAdaptiveWriterCopy(budget) {
+			return false, errWALReclaimReadersInFlight
+		}
+		adaptiveCopy = true
 	}
 	delta, derr := writer.passive(yctx, ctx, ckptDB, copyCredit, res.leaseOverride)
 	yctx = writer.resetContext(yctx)

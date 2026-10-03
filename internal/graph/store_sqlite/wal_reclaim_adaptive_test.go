@@ -148,7 +148,9 @@ func TestWALAdaptiveWriterBudgetIsSingleAndBounded(t *testing.T) {
 				return
 			}
 			require.Equal(t, walReclaimMaxWriterHold-r.writerSpent, budget)
-			require.Zero(t, r.takeAdaptiveWriterBudget(), "another helper round renewed adaptive credit")
+			require.Equal(t, budget, r.takeAdaptiveWriterBudget(), "a proposal consumed credit before an actual copy")
+			require.True(t, r.beginAdaptiveWriterCopy(budget))
+			require.Zero(t, r.takeAdaptiveWriterBudget(), "another helper round renewed adaptive credit after a copy began")
 		})
 	}
 }

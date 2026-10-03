@@ -164,9 +164,10 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	}
 	held := time.Now()
 	writer := newWALReclaimWriterCredit(s, held)
+	adaptiveCopy := false
 	defer func() {
 		writer.release()
-		res.recordWriterCredit(writer, budget > walReclaimPressureHold)
+		res.recordWriterCredit(writer, adaptiveCopy)
 	}()
 	if s.bulkConn != nil && !res.leaseOverride {
 		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
@@ -175,15 +176,15 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	if budget > walReclaimPressureHold && !res.adaptiveFrontierCurrent(s) {
 		return errWALReclaimReadersInFlight
 	}
-	// With the writer held the log cannot grow: the remainder is final. Take
-	// the step only when it is small enough for the hold to be the reset.
+	// With the writer held the remainder is final. Ordinary holds require a
+	// fitted small tail; a witnessed adaptive copy uses its bounded time credit.
 	snap, ok := readWALIndexSnapshot(s.dbPath)
 	if !ok {
 		res.reason = "pressure_no_wal_index"
 		s.walCopy.pressureGiveUps.Add(1)
 		return fmt.Errorf("%w: no wal-index", errWALPressureHold)
 	}
-	if snap.MxFrame > snap.NBackfill && snap.MxFrame-snap.NBackfill > allowed {
+	if budget <= walReclaimPressureHold && snap.MxFrame > snap.NBackfill && snap.MxFrame-snap.NBackfill > allowed {
 		res.reason = fmt.Sprintf("pressure_copy_incomplete remainder_frames=%d allowed=%d", snap.MxFrame-snap.NBackfill, allowed)
 		s.walCopy.pressureGiveUps.Add(1)
 		return errWALPressureHold
@@ -196,6 +197,15 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	copyCredit := budget / 2
 	if budget > walReclaimPressureHold {
 		copyCredit = budget - walReclaimPressureHold
+	}
+	if budget > walReclaimPressureHold {
+		if hctx.Err() != nil {
+			return hctx.Err()
+		}
+		if !res.beginAdaptiveWriterCopy(budget) {
+			return errWALReclaimReadersInFlight
+		}
+		adaptiveCopy = true
 	}
 	if _, err := writer.passive(hctx, ctx, ckptDB, copyCredit, res.leaseOverride); err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
 		res.reason = fmt.Sprintf("pressure_backfill error=%v", err)

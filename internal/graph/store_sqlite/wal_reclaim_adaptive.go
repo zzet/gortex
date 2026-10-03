@@ -61,6 +61,8 @@ func (r *walReclaimResult) recordWriterCredit(w *walReclaimWriterCredit, adaptiv
 // and sync to finish before more writes append. All holds charged to this
 // attempt, including the previous short holds, share the existing two-second
 // ceiling. The caller's operation cancellation and edit-lane policy still apply.
+// takeAdaptiveWriterBudget proposes credit without consuming it. The caller
+// consumes the opportunity only when a qualified adaptive copy actually starts.
 func (r *walReclaimResult) takeAdaptiveWriterBudget() time.Duration {
 	if !r.urgent || r.lastResort || r.adaptiveUsed || r.slowTail == nil {
 		return 0
@@ -70,12 +72,21 @@ func (r *walReclaimResult) takeAdaptiveWriterBudget() time.Duration {
 	if budget <= walReclaimResetHold {
 		return 0
 	}
-	r.adaptiveUsed, r.adaptiveBudget = true, budget
-	log.Printf("store_sqlite: wal reclaim adaptive urgent writer credit budget=%s prior_hold=%s slow_copy=%s", budget, r.writerSpent, r.slowTail.copyElapsed)
 	return budget
 }
 
 func (r *walReclaimResult) adaptiveFrontierCurrent(s *Store) bool {
 	current, ok := readWALReclaimFrontier(s.dbPath)
 	return ok && r.slowTail != nil && current.salt == r.slowTail.salt && current.backfill >= r.slowTail.covered
+}
+
+// beginAdaptiveWriterCopy consumes the single completion opportunity only
+// after writer admission and the current lane/bulk/WAL identity guards.
+func (r *walReclaimResult) beginAdaptiveWriterCopy(budget time.Duration) bool {
+	if r.adaptiveUsed || !r.urgent || r.lastResort || r.slowTail == nil || budget <= walReclaimResetHold || budget > walReclaimMaxWriterHold-r.writerSpent {
+		return false
+	}
+	r.adaptiveUsed, r.adaptiveBudget = true, budget
+	log.Printf("store_sqlite: wal reclaim adaptive urgent writer credit budget=%s prior_hold=%s slow_copy=%s", budget, r.writerSpent, r.slowTail.copyElapsed)
+	return true
 }
