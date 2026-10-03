@@ -3,6 +3,7 @@ package indexer
 import (
 	"os"
 	"path"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -300,7 +301,7 @@ func (mi *MultiIndexer) rustImportCandidateNames(srcFile, name string, srcCache 
 
 // tsAliasCache caches the per-repo Collection of tsconfig/jsconfig
 // alias maps. Loaded lazily on first lookup for a repo ROOT PATH and
-// reused across all import resolutions in the same session. A nil
+// reused within an indexing pass; repository mutations invalidate the entry. A nil
 // entry means "scanned, no usable config" — distinct from "not yet
 // scanned" (missing key).
 var (
@@ -349,6 +350,40 @@ func loadTSAliasCollection(rootPath string) *tsalias.Collection {
 	c := tsalias.Load(rootPath)
 	tsAliasCache[rootPath] = c
 	return c
+}
+
+func invalidateTSAliasCollection(rootPath string) {
+	if rootPath == "" {
+		return
+	}
+	tsAliasCacheMu.Lock()
+	delete(tsAliasCache, rootPath)
+	tsAliasCacheMu.Unlock()
+}
+
+// A config edit changes resolution even when callers' source shapes did not.
+// Refresh once per mutation pass and report whether old bindings may be reused.
+func refreshTSAliasCollection(rootPath string) bool {
+	tsAliasCacheMu.Lock()
+	defer tsAliasCacheMu.Unlock()
+	previous, loaded := tsAliasCache[rootPath]
+	current := tsalias.Load(rootPath)
+	tsAliasCache[rootPath] = current
+	if !loaded {
+		return false
+	}
+	if previous == nil || current == nil {
+		return previous != current
+	}
+	return !reflect.DeepEqual(previous.Maps(), current.Maps())
+}
+
+func isAliasCallerPath(filePath string) bool {
+	switch path.Ext(filePath) {
+	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".vue", ".svelte", ".astro":
+		return true
+	}
+	return false
 }
 
 // readFileFromAnyRepo finds the on-disk bytes for a repo-prefixed

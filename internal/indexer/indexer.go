@@ -342,6 +342,10 @@ type Indexer struct {
 	// Set during the shadow swap, cleared when idx.graph is restored.
 	contractStateSink graph.ContractStateStore
 
+	// Set only while the repository mutation lane is held. Alias changes
+	// invalidate source-shape resolution reuse, including unchanged callers.
+	aliasResolutionChanged bool
+
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
 	// its package defaults.
@@ -2488,6 +2492,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
+	idx.aliasResolutionChanged = refreshTSAliasCollection(absRoot)
+	defer func() { idx.aliasResolutionChanged = false }()
 	idx.projectName = search.DetectProjectName(absRoot)
 
 	reporter.Report("walking files", 0, 0)
@@ -2654,6 +2660,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	}
 	idx.warnIfWalkAdmittedNothing(absRoot, len(files))
 	reporter.Report("walking files", len(files), len(files))
+	if idx.aliasResolutionChanged {
+		for _, file := range files {
+			if isAliasCallerPath(file.path) {
+				idx.graph.EvictFile(idx.prefixPath(idx.relKey(file.path)))
+			}
+		}
+	}
 	// Capture raw content identities while the parser already owns each source
 	// buffer. A nil collector keeps the disabled path allocation-free.
 	merkleBaseline := newMerkleBaselineCollector(idx.merkleEnabled(), len(files))
@@ -4650,6 +4663,9 @@ func (idx *Indexer) indexFile(
 		visCaptured = true
 		snapshotDuration = time.Since(snapshotStarted)
 	}
+	if idx.aliasResolutionChanged && isAliasCallerPath(filePath) {
+		reuseIdx, priorUnresolved = nil, nil
+	}
 
 	// We hold a usable result: evict the old state now, then add the
 	// new — the window where the file has no nodes is just this gap.
@@ -6136,6 +6152,13 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
+	idx.aliasResolutionChanged = refreshTSAliasCollection(absRoot)
+	defer func() { idx.aliasResolutionChanged = false }()
+	if idx.aliasResolutionChanged {
+		// Alias scopes may change independently of every source mtime.
+		paths = []string{absRoot}
+		fullRoot = true
+	}
 
 	// Reconcile the complete durable corpus before any scoped mutation writes
 	// rows with this process's normalization mode. Doing this after a partial
@@ -6298,6 +6321,13 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	for _, graphPath := range idx.fileIndexFailurePaths() {
 		if relPath, ok := idx.graphPathRelKey(graphPath); ok && diskFiles[relPath] {
 			staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
+		}
+	}
+	if idx.aliasResolutionChanged {
+		for relPath := range diskFiles {
+			if isAliasCallerPath(relPath) {
+				staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
+			}
 		}
 	}
 	staleFiles = appendUniqueSorted(nil, staleFiles...)

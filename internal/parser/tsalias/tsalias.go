@@ -33,9 +33,9 @@
 //
 // tsconfig JSONC features the TypeScript tooling itself accepts — `//` and
 // `/* */` comments and trailing commas — are stripped before parsing, so a
-// commented config does not silently drop every alias for the repo. The
-// package still does not follow `extends:` chains or monorepo `references[]`
-// traversal; those can be layered on without touching the resolver API.
+// commented config does not silently drop every alias for the repo. Relative
+// `extends` chains (including arrays) are followed with TypeScript option
+// precedence; package specifiers and project references are not traversed.
 package tsalias
 
 import (
@@ -87,6 +87,10 @@ type Map struct {
 	// DirPrefix is the repo-relative path of the config file's
 	// directory. Used by Collection to pick the nearest ancestor scope.
 	DirPrefix string
+	// targetBase is the repo-relative directory against which effective paths
+	// resolve. Unlike DirPrefix (the child scope), it may belong to a parent
+	// config. "." denotes the root; empty preserves hand-built Map semantics.
+	targetBase string
 	// repoRoot is the absolute repository root, set by Load, used to
 	// disk-probe multi-target aliases. Empty for hand-built maps, which
 	// then resolve by first-match without touching the filesystem.
@@ -186,6 +190,9 @@ func matchAlias(a *Alias, modulePath string) (string, bool) {
 // and an uncleaned `./` prefix would never match a graph file node, so
 // every paths-alias import in such a repo silently failed to resolve.
 func (m *Map) joinTarget(matched string) string {
+	if m.targetBase != "" {
+		return path.Clean(path.Join(m.targetBase, filepath.ToSlash(matched)))
+	}
 	joined := matched
 	if m.BaseURL != "" {
 		joined = filepath.ToSlash(filepath.Join(m.BaseURL, matched))
@@ -303,33 +310,31 @@ func Load(repoRoot string) *Collection {
 }
 
 func parseConfigFile(absPath, dirPrefix, repoRoot string) *Map {
-	data, err := os.ReadFile(absPath)
+	co := loadConfigOptions(absPath, make(map[string]bool), 0)
+	if co.baseURL == "" && co.paths == nil {
+		return nil
+	}
+	targetDir := co.pathsDir
+	if co.baseURL != "" {
+		targetDir = co.baseURL
+	}
+	targetBase, err := filepath.Rel(repoRoot, targetDir)
 	if err != nil {
 		return nil
 	}
-	var raw struct {
-		CompilerOptions struct {
-			BaseURL string              `json:"baseUrl"`
-			Paths   map[string][]string `json:"paths"`
-		} `json:"compilerOptions"`
-	}
-	// tsconfig files routinely use the JSONC features tsserver itself
-	// accepts — // and /* */ comments and trailing commas. A strict JSON
-	// parse fails the WHOLE file on any of them, silently dropping every
-	// alias for the repo, so strip JSONC first.
-	if err := json.Unmarshal(stripJSONC(data), &raw); err != nil {
-		return nil
-	}
-	co := raw.CompilerOptions
-	if co.BaseURL == "" && len(co.Paths) == 0 {
-		return nil
-	}
 	m := &Map{
-		BaseURL:   filepath.ToSlash(strings.TrimSpace(co.BaseURL)),
-		DirPrefix: dirPrefix,
-		repoRoot:  repoRoot,
+		DirPrefix:  dirPrefix,
+		targetBase: filepath.ToSlash(targetBase),
+		repoRoot:   repoRoot,
 	}
-	for pattern, targets := range co.Paths {
+	if co.baseURL != "" {
+		baseURL, relErr := filepath.Rel(filepath.Dir(absPath), co.baseURL)
+		if relErr != nil {
+			return nil
+		}
+		m.BaseURL = filepath.ToSlash(baseURL)
+	}
+	for pattern, targets := range co.paths {
 		if len(targets) == 0 {
 			continue
 		}
@@ -340,9 +345,81 @@ func parseConfigFile(absPath, dirPrefix, repoRoot string) *Map {
 		m.Entries = append(m.Entries, entry)
 	}
 	sort.SliceStable(m.Entries, func(i, j int) bool {
-		return len(m.Entries[i].AliasPrefix) > len(m.Entries[j].AliasPrefix)
+		if len(m.Entries[i].AliasPrefix) != len(m.Entries[j].AliasPrefix) {
+			return len(m.Entries[i].AliasPrefix) > len(m.Entries[j].AliasPrefix)
+		}
+		if m.Entries[i].AliasPrefix != m.Entries[j].AliasPrefix {
+			return m.Entries[i].AliasPrefix < m.Entries[j].AliasPrefix
+		}
+		return m.Entries[i].AliasSuffix < m.Entries[j].AliasSuffix
 	})
 	return m
+}
+
+type configOptions struct {
+	baseURL  string
+	paths    map[string][]string
+	pathsDir string
+}
+
+// Each option retains its declaring directory. Inherited paths without a
+// baseUrl must not become relative to the child config's directory.
+func loadConfigOptions(absPath string, active map[string]bool, depth int) configOptions {
+	const maxExtendsDepth = 32
+	absPath = filepath.Clean(absPath)
+	if depth >= maxExtendsDepth || active[absPath] {
+		return configOptions{}
+	}
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return configOptions{}
+	}
+	var raw struct {
+		Extends         json.RawMessage `json:"extends"`
+		CompilerOptions struct {
+			BaseURL *string             `json:"baseUrl"`
+			Paths   map[string][]string `json:"paths"`
+		} `json:"compilerOptions"`
+	}
+	if err := json.Unmarshal(stripJSONC(data), &raw); err != nil {
+		return configOptions{}
+	}
+	active[absPath] = true
+	defer delete(active, absPath)
+	var parents []string
+	var parent string
+	if json.Unmarshal(raw.Extends, &parent) == nil {
+		parents = []string{parent}
+	} else {
+		_ = json.Unmarshal(raw.Extends, &parents)
+	}
+	var effective configOptions
+	for _, parent := range parents {
+		// TS package config resolution is intentionally outside this reader.
+		if !strings.HasPrefix(parent, "./") && !strings.HasPrefix(parent, "../") &&
+			!strings.HasPrefix(parent, `.\`) && !strings.HasPrefix(parent, `..\`) {
+			continue
+		}
+		if filepath.Ext(parent) == "" {
+			parent += ".json"
+		}
+		inherited := loadConfigOptions(filepath.Join(filepath.Dir(absPath), parent), active, depth+1)
+		if inherited.baseURL != "" {
+			effective.baseURL = inherited.baseURL
+		}
+		if inherited.paths != nil {
+			effective.paths = inherited.paths
+			effective.pathsDir = inherited.pathsDir
+		}
+	}
+	if raw.CompilerOptions.BaseURL != nil {
+		effective.baseURL = filepath.Join(filepath.Dir(absPath), *raw.CompilerOptions.BaseURL)
+	}
+	if raw.CompilerOptions.Paths != nil {
+		effective.paths = raw.CompilerOptions.Paths
+		effective.pathsDir = filepath.Dir(absPath)
+	}
+	return effective
 }
 
 // splitAlias splits one `paths` entry (pattern → ordered targets) into an

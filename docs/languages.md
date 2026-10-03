@@ -110,6 +110,17 @@ language, so a missing definition is not a missing implementation.
 
 Recent extraction refinements (each covered by a per-feature CI golden): Java `@interface` annotation types index as interfaces and participate in implementation matching; Java `new T(){…}` and C# `new { … }` anonymous classes/types become synthetic type nodes with an `extends` edge (to the instantiated type, or to `object` for C#); JS/TS arrow-valued class fields (`x = () => {…}`) are emitted as callable methods; JS/TS named imports emit one `imports` edge per binding (alias-aware via `Edge.Alias`) and barrel re-exports emit `re_exports` edges; JS/TS cross-file imports resolve onto the target file/symbol for relative specifiers (`./x`, `../x`) and for `tsconfig.json` / `jsconfig.json` `compilerOptions.paths` / `baseUrl` path aliases (`@/lib/x`), so callers / usages / blast-radius span aliased imports the same as relative ones; chained / factory-call receivers (`New().Build()`) carry an inferred `receiver_type`. See [features.md](features.md) and [architecture.md](architecture.md) for the edge semantics.
 
+### TypeScript path aliases
+
+`tsconfig.json` and `jsconfig.json` accept JSONC comments and trailing commas.
+Relative `extends` chains, including TypeScript 5 arrays, inherit `baseUrl` and
+replace (not merge) `paths`. Targets without a `baseUrl` remain relative to the
+config that declares them, while the child config determines the caller scope.
+Generated `.nuxt` configs are read only when explicitly extended; the directory
+is not scanned as an independent scope. Package-specifier `extends` and project
+`references` are not traversed. Cycles and chains deeper than 32 configs stop.
+Repository indexing/reindexing and untracking invalidate the lazy alias cache.
+
 ### Julia specifics
 
 `module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`

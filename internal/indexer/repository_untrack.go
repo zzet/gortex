@@ -129,6 +129,9 @@ func (mi *MultiIndexer) untrackRepoChecked(
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if state.metadata != nil {
+		invalidateTSAliasCollection(state.metadata.RootPath)
+	}
 	if state.finalize == nil && finalize != nil {
 		state.finalize = finalize
 	}

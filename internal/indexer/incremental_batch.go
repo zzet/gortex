@@ -238,7 +238,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 		}
 		consumed++
 
-		if probeOK && storedGraph.semantic != "" &&
+		if !idx.aliasResolutionChanged && probeOK && storedGraph.semantic != "" &&
 			probe.fingerprints.semantic == storedGraph.semantic &&
 			probe.fingerprints.metadata == storedGraph.metadata {
 			idx.discardPreparedExtraction(filePath)
@@ -285,7 +285,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 			relPath:     prepared.relPath, graphPath: graphPath,
 			src: prepared.src, result: prepared.result, prepared: prepared, priorNodes: priorNodes,
 			storedGraph: storedGraph, storedDerived: storedDerived, probe: probe,
-			metadataOnly: storedGraph.semantic != "" &&
+			metadataOnly: !idx.aliasResolutionChanged && storedGraph.semantic != "" &&
 				probe.fingerprints.semantic == storedGraph.semantic,
 		}
 		stage.bytes = estimateParseGraphBytes(stage.result.Nodes, stage.result.Edges) + int64(len(stage.src))
@@ -497,6 +497,10 @@ func (idx *Indexer) commitIncrementalStages(
 		stage.reuse, stage.priorPending = captureIncrementalStateFromView(
 			stage.priorNodes, view.outByNode, view.nodesByID,
 		)
+		if idx.aliasResolutionChanged && isAliasCallerPath(stage.graphPath) {
+			stage.reuse, stage.priorPending = nil, nil
+			stage.metadataOnly = false
+		}
 		// A using-stamp change re-prices every visibility-narrowed verdict
 		// in the file: reuse would restore an extension target the new
 		// usings refuse, and the prior-unresolved skip would park a call
