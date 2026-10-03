@@ -115,8 +115,10 @@ func TestInterruptedReclaimPassIsDetectedAndCounted(t *testing.T) {
 
 // Edits every 2.5 s (the measured 25 s cadence at a tenth of the scale: 0.3 s
 // refresh, 2.2 s gap) against a copy slower than one gap: with the pause the
-// passes complete across the edits and the log stays under 32 MiB; with the
-// interrupt no pass ever completes and the log grows with the writes.
+// ordinary passes pause across edits, while pressure may resume copying
+// inside edits once the producer outpaces that budget. The combined policy
+// must keep the log under 32 MiB and keep resetting it. Ordinary no-busy-copy
+// behavior is checked separately by TestReclaimCopyPausesForAnEditAndKeepsItsProgress.
 func TestReclaimKeepsTheLogBoundedWithEditsEveryFewSeconds(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "4")
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_CEILING_MB", "64") // hard cap 256 MiB: out of reach
@@ -126,6 +128,12 @@ func TestReclaimKeepsTheLogBoundedWithEditsEveryFewSeconds(t *testing.T) {
 	if walCopyMethods.Load() == 0 {
 		t.Skip("the copy pause is not installed in this process")
 	}
+	// Configure the predicate and slow copy before an observed attempt starts.
+	// A startup pass begun before installation would correctly yield instead
+	// of using the paused-copy policy this workload is meant to exercise.
+	lease, err := s.acquireGenerationBulkCheckpointLease()
+	require.NoError(t, err)
+	defer func() { s.releaseGenerationBulkCheckpointLease(lease) }()
 	seedWALChurnTable(t, s)
 	growWAL(t, s, 16)
 	lane := &fakeBuildLane{}
@@ -133,11 +141,12 @@ func TestReclaimKeepsTheLogBoundedWithEditsEveryFewSeconds(t *testing.T) {
 	// 2 MiB/s: a pass over the table's ~6 MiB of pages (about 2.8 s) takes
 	// longer than a gap between edits (2.2 s).
 	slowCopy(t, s, 120<<20)
+	maxWAL := walFileSize(path + "-wal") // include the seed before a reset can clear it
+	require.True(t, s.releaseGenerationBulkCheckpointLease(lease))
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var maxWAL int64
 	var writeErr error
 	wg.Add(2)
 	go func() { // the edits
@@ -178,13 +187,15 @@ func TestReclaimKeepsTheLogBoundedWithEditsEveryFewSeconds(t *testing.T) {
 	close(stop)
 	wg.Wait()
 	st, cp := s.WALReclaimStats(), s.WALCopyStats()
-	t.Logf("wal_max=%.1fMiB resets=%d copy: passes=%d paused_passes=%d paused=%s budget_wait=%s written=%.1fMiB written_while_busy=%d attempts_with_a_discarded_pass=%d paced_cut_short=%d",
+	t.Logf("wal_max=%.1fMiB resets=%d copy: passes=%d paused_passes=%d paused=%s budget_wait=%s written=%.1fMiB written_while_busy=%d attempts_with_a_discarded_pass=%d paced_cut_short=%d pressure_runs=%d pressure_resets=%d pressure_lane_resets=%d pause_mark_or_cap_overruns=%d",
 		float64(maxWAL)/(1<<20), st.Resets, cp.Passes, cp.PausedPasses, cp.Paused.Round(time.Millisecond), cp.BudgetWait.Round(time.Millisecond),
-		float64(cp.WrittenBytes)/(1<<20), cp.WrittenWhileBusyBytes, cp.DiscardedPasses, cp.PacedPassesCutShort)
+		float64(cp.WrittenBytes)/(1<<20), cp.WrittenWhileBusyBytes, cp.DiscardedPasses, cp.PacedPassesCutShort,
+		cp.PressureRuns, cp.PressureResets, cp.PressureLaneResets, cp.PauseCapOverruns)
 	require.NoError(t, writeErr)
 	require.Less(t, maxWAL, int64(32<<20), "the log outgrew its bound under edits every 2.5 s")
 	require.Zero(t, cp.PacedPassesCutShort, "a paced pass was cut short")
-	require.Zero(t, cp.WrittenWhileBusyBytes, "pages were copied inside an edit")
+	// Copying through a busy lane is permitted once pressure is reached.
+	// Keep it visible above; the dedicated ordinary-copy case forbids it.
 	require.GreaterOrEqual(t, st.Resets, int64(3), "the log was reset too rarely")
 	require.Positive(t, cp.PausedPasses, "precondition: passes spanned edits")
 }
