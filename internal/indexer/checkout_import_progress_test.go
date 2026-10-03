@@ -19,14 +19,21 @@ import (
 // continue arriving faster than one file can prepare, without replaying a
 // successful import or blocking the interactive lane for that file's work.
 func TestALargeWorkingTreeImportCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, false)
+	testSustainedImportProgress(t, false, false)
 }
 
 func TestALargeWorkingTreeImportWithInlineGoSemanticsCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, true)
+	testSustainedImportProgress(t, true, false)
 }
 
-func testSustainedImportProgress(t *testing.T, inline bool) {
+// Catalog planning can outlast the same 40ms producer interval as private
+// payload preparation. Preserve the original producer, bounds and parity
+// oracle while making that pre-handoff delay deterministic.
+func TestImportPreambleCompletesUnderSustainedInteractiveDemand(t *testing.T) {
+	testSustainedImportProgress(t, false, true)
+}
+
+func testSustainedImportProgress(t *testing.T, inline, slowPreamble bool) {
 	oldPaths := importInteractivePaths
 	importInteractivePaths = 4
 	t.Cleanup(func() { importInteractivePaths = oldPaths })
@@ -91,6 +98,19 @@ func testSustainedImportProgress(t *testing.T, inline bool) {
 	})
 	c.cycleMu.Lock()
 	c.cycleBarrier = func(ctx context.Context) { cycleContext = ctx }
+	if slowPreamble {
+		c.importPreambleBarrier = func(ctx context.Context) {
+			if !importing.Load() {
+				return
+			}
+			timer := time.NewTimer(150 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+		}
+	}
 	c.cycleMu.Unlock()
 	c.compaction.mu.Lock()
 	c.compaction.quiet = -1

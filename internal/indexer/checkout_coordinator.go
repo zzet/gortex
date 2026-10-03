@@ -659,6 +659,9 @@ type CheckoutCoordinator struct {
 	// settledWithoutBuild and has no barrier.
 	cyclePreflight func(context.Context) (CheckoutCycle, bool)
 	cycleBarrier   func(context.Context)
+	// importPreambleBarrier delays the read-only pin/recomposition decisions
+	// in progress tests; production has no barrier.
+	importPreambleBarrier func(context.Context)
 	// holdSample is a focused test seam for the working-copy sample a
 	// background cycle takes before it queues (holdBackgroundCycle); nil
 	// takes cycleSample.
@@ -1734,6 +1737,15 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 		return out
 	}
 	lap("ensure_route")
+	finishPreamble, err := c.prepareImportPreamble(ctx, head, route)
+	if err != nil {
+		out.Err = err
+		return out
+	}
+	defer finishPreamble()
+	if c.importPreambleBarrier != nil {
+		c.importPreambleBarrier(ctx)
+	}
 
 	// The dependent pin: a checkout whose routed layers were built over a
 	// committed base the family has since advanced past stays on that base. The
@@ -1927,6 +1939,10 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 	commitRow, dirtyRow, ok, err := c.recomposableStack(ctx, base, head, *route)
 	if err != nil || !ok {
 		return false, err
+	}
+	ctx, err = resumeImportBuildLane(ctx, true)
+	if err != nil {
+		return true, err
 	}
 	// Only the base moved. Nobody is using the checkout: leave the stack it
 	// is routed to and apply the advance on its next use
@@ -2780,6 +2796,12 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 				// this state (sharedCommit): filed under this checkout's key.
 				rowKey = key
 			}
+			if rowKey != key {
+				ctx, err = resumeImportBuildLane(ctx, true)
+				if err != nil {
+					return 0, err
+				}
+			}
 			c.retainCommit(ctx, rowKey, row.GenerationID)
 			if rowKey == key {
 				return row.GenerationID, nil
@@ -2787,6 +2809,11 @@ func (c *CheckoutCoordinator) reconcileCommitSlot(
 		}
 	}
 
+	var admissionErr error
+	ctx, admissionErr = resumeImportBuildLane(ctx, true)
+	if admissionErr != nil {
+		return 0, admissionErr
+	}
 	previous := route.CommitGenerationID
 	generationID, reused, err := c.resolveCommitLayer(ctx, base, targetTree)
 	if err != nil {
@@ -3767,7 +3794,11 @@ func (c *CheckoutCoordinator) retainCommit(ctx context.Context, key string, gene
 	c.mu.Unlock()
 
 	for _, generation := range evicted {
-		c.offerRetire(ctx, generation)
+		if lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane); lane != nil && lane.detached {
+			c.deferRetire(generation, "evicted during import planning")
+		} else {
+			c.offerRetire(ctx, generation)
+		}
 	}
 }
 

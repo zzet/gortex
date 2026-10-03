@@ -31,6 +31,7 @@ type importBuildLane struct {
 	arm                func(context.Context) error
 	detached           bool
 	preparationRelease func()
+	preambleFence      func(context.Context) error
 }
 
 func (l *importBuildLane) begin(ctx context.Context) (func(), error) {
@@ -62,6 +63,13 @@ func (l *importBuildLane) reenter(ctx context.Context, yieldable bool) (context.
 		}
 		l.detached = false
 	}
+	if l.preambleFence != nil {
+		fence := l.preambleFence
+		l.preambleFence = nil
+		if err := fence(ctx); err != nil {
+			return ctx, err
+		}
+	}
 	if yieldable && l.arm != nil {
 		if err := l.arm(ctx); err != nil {
 			return ctx, err
@@ -82,6 +90,71 @@ func resumeImportBuildLane(ctx context.Context, yieldable bool) (context.Context
 		return lane.reenter(ctx, yieldable)
 	}
 	return ctx, nil
+}
+
+// The catalog pin/recomposition decisions precede dirty-slot planning and can
+// themselves outlast foreground demand. Start their read-only handoff once the
+// routed commit names an immutable base and the sample can be confirmed. Open
+// and retain that complete positive ancestry before making those decisions;
+// the first mutation reentry checks the route, correction epochs and source.
+func (c *CheckoutCoordinator) prepareImportPreamble(ctx context.Context, sample gitstate.DirtySnapshot, route store_sqlite.CheckoutRoute) (func(), error) {
+	noop := func() {}
+	lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane)
+	if lane == nil || route.State != store_sqlite.RouteActive || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+		return noop, nil
+	}
+	finishPlan, err := c.prepareImportPlan(ctx, route.CommitGenerationID, sample, route)
+	if err != nil || !lane.detached {
+		return finishPlan, err
+	}
+	base, closeBase, err := c.generationLayerReader(ctx, route.CommitGenerationID)
+	if err != nil {
+		finishPlan()
+		return noop, err
+	}
+	var once sync.Once
+	finish := func() {
+		once.Do(func() {
+			lane.preambleFence = nil
+			closeBase()
+			finishPlan()
+		})
+	}
+	ancestry, ok := base.(commitLayerBase)
+	if !ok {
+		finish()
+		_, err := lane.reenter(ctx, true)
+		return noop, err
+	}
+	epochs, eligible, err := c.builder.immutableImportEpochs(ctx, ancestry.stack)
+	if err != nil || !eligible {
+		finish()
+		if err == nil {
+			_, err = lane.reenter(ctx, true)
+		}
+		return noop, err
+	}
+	lane.preambleFence = func(ctx context.Context) error {
+		current, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+		if err != nil {
+			return err
+		}
+		if !found || current.RouteEpoch != route.RouteEpoch || current.GraphID != route.GraphID || current.State != route.State || current.CommitGenerationID != route.CommitGenerationID || current.DirtyGenerationID != route.DirtyGenerationID {
+			return fmt.Errorf("%w: route changed during import preamble", errRouteMoved)
+		}
+		if err := c.builder.checkImportPreparationEpochs(epochs); err != nil {
+			return err
+		}
+		proof, err := c.sampler.ConfirmReadSet(ctx, sample, nil, nil)
+		if err != nil {
+			return err
+		}
+		if !proof.Confirmed {
+			return fmt.Errorf("%w: import preamble source could not be confirmed: %s", ErrDirtySnapshotChanged, proof.Reason)
+		}
+		return nil
+	}
+	return finish, nil
 }
 
 // Planning may be slower than the interactive request interval too. It writes
@@ -141,11 +214,18 @@ func (b *SparseGenerationBuilder) importPreparationEpochs(ctx context.Context, r
 		return nil, false, nil
 	}
 	base, ok := req.Base.(commitLayerBase)
-	if !ok || len(base.stack) == 0 {
+	if !ok {
 		return nil, false, nil
 	}
-	epochs := make(map[int64]uint64, len(base.stack))
-	for _, generation := range base.stack {
+	return b.immutableImportEpochs(ctx, base.stack)
+}
+
+func (b *SparseGenerationBuilder) immutableImportEpochs(ctx context.Context, stack []int64) (map[int64]uint64, bool, error) {
+	if len(stack) == 0 {
+		return nil, false, nil
+	}
+	epochs := make(map[int64]uint64, len(stack))
+	for _, generation := range stack {
 		if generation <= 0 {
 			return nil, false, nil
 		}
