@@ -662,6 +662,9 @@ type CheckoutCoordinator struct {
 	// importPreambleBarrier delays the read-only pin/recomposition decisions
 	// in progress tests; production has no barrier.
 	importPreambleBarrier func(context.Context)
+	// importFoldPlanningBarrier delays read-only post-publication fold planning
+	// in admission tests; production has no barrier.
+	importFoldPlanningBarrier func(context.Context)
 	// holdSample is a focused test seam for the working-copy sample a
 	// background cycle takes before it queues (holdBackgroundCycle); nil
 	// takes cycleSample.

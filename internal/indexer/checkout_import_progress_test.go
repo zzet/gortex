@@ -19,21 +19,27 @@ import (
 // continue arriving faster than one file can prepare, without replaying a
 // successful import or blocking the interactive lane for that file's work.
 func TestALargeWorkingTreeImportCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, false, false)
+	testSustainedImportProgress(t, false, false, false)
 }
 
 func TestALargeWorkingTreeImportWithInlineGoSemanticsCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, true, false)
+	testSustainedImportProgress(t, true, false, false)
 }
 
 // Catalog planning can outlast the same 40ms producer interval as private
 // payload preparation. Preserve the original producer, bounds and parity
 // oracle while making that pre-handoff delay deterministic.
 func TestImportPreambleCompletesUnderSustainedInteractiveDemand(t *testing.T) {
-	testSustainedImportProgress(t, false, true)
+	testSustainedImportProgress(t, false, true, false)
 }
 
-func testSustainedImportProgress(t *testing.T, inline, slowPreamble bool) {
+// An import's post-publication fold prepares its materialized ancestry before
+// copying. This work must admit foreground requests while it is still private.
+func TestImportFoldPreparationCompletesUnderSustainedInteractiveDemand(t *testing.T) {
+	testSustainedImportProgress(t, false, false, true)
+}
+
+func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPlanning bool) {
 	oldPaths := importInteractivePaths
 	importInteractivePaths = 4
 	t.Cleanup(func() { importInteractivePaths = oldPaths })
@@ -103,6 +109,16 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble bool) {
 			if !importing.Load() {
 				return
 			}
+			timer := time.NewTimer(150 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+		}
+	}
+	if slowFoldPlanning {
+		c.importFoldPlanningBarrier = func(ctx context.Context) {
 			timer := time.NewTimer(150 * time.Millisecond)
 			defer timer.Stop()
 			select {

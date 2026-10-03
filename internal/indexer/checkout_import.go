@@ -44,21 +44,46 @@ func (c *CheckoutCoordinator) foldImportChain(
 	if out.DirtyChainDepth < dirtyChainCompactionDepth || out.DirtyGenerationID <= 0 {
 		return
 	}
+	lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane)
+	var releasePreparation, closeBase func()
+	if lane != nil && lane.gate != nil && c.builder != nil && commitGeneration > 0 {
+		// Catalog traversal and ancestry materialization can outlast a
+		// foreground request too. Release the physical lane before this
+		// read-only planning; the routed chain remains retained, and the
+		// materializer pins its ancestry before assembling the reader.
+		var err error
+		releasePreparation, err = lane.begin(ctx)
+		if err != nil {
+			return
+		}
+		defer func() {
+			// Every live decline restores the caller's ownership. Keep the
+			// preparation slot and any ancestry lease through that reentry.
+			if ctx.Err() == nil {
+				_, _ = lane.reenter(ctx, false)
+			}
+			releasePreparation()
+			if closeBase != nil {
+				closeBase()
+			}
+		}()
+	}
+	if c.importFoldPlanningBarrier != nil {
+		c.importFoldPlanningBarrier(ctx)
+	}
 	commit, found, err := c.catalog.GetViewGeneration(ctx, commitGeneration)
 	if err != nil || !found {
 		return
 	}
 	copier := c.copyChainAtOnce
-	lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane)
-	if lane != nil && lane.gate != nil && c.builder != nil {
+	if releasePreparation != nil {
 		// The copied inputs are sealed generations, held throughout verification
-		// and publication. The stepped copier already protects them with its
-		// reservation; this lease also covers the pre-copy manifest planning.
-		base, closeBase, err := c.generationLayerReader(ctx, out.DirtyGenerationID)
+		// and publication. The stepped copier also protects its copy reservation.
+		var base LayerBase
+		base, closeBase, err = c.generationLayerReader(ctx, out.DirtyGenerationID)
 		if err != nil {
 			return
 		}
-		defer closeBase()
 		epochs, eligible, err := c.builder.importPreparationEpochs(ctx, BuildRequest{
 			Base: base, importBatch: true,
 			Changes:            []LayerPathChange{{Path: "fold", Kind: LayerPathAdded}},
@@ -68,18 +93,6 @@ func (c *CheckoutCoordinator) foldImportChain(
 			return
 		}
 		if eligible {
-			release, err := lane.begin(ctx)
-			if err != nil {
-				return
-			}
-			defer release()
-			// All live exits restore the caller's lane ownership, including a
-			// refused or interrupted copy. A cancelled cycle only cleans up.
-			defer func() {
-				if ctx.Err() == nil {
-					_, _ = lane.reenter(ctx, false)
-				}
-			}()
 			ctx = context.WithValue(ctx, importFoldPublicationKey{}, &importFoldPublication{
 				beforePublish: func(ctx context.Context) error {
 					if _, err := lane.reenter(ctx, false); err != nil {
@@ -89,6 +102,13 @@ func (c *CheckoutCoordinator) foldImportChain(
 				},
 			})
 			copier = c.copyChainInSteps
+		} else {
+			// An unqualified ancestry uses the ordinary one-shot copy; it
+			// must own the physical lane before any payload mutation.
+			ctx, err = lane.reenter(ctx, false)
+			if err != nil {
+				return
+			}
 		}
 	}
 	built, err := c.flattenDirtyChainOver(ctx, commit, commit, out.DirtyGenerationID, copier)
