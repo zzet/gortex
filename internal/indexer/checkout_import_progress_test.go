@@ -230,6 +230,12 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 	probeCtx, stopProbes := context.WithCancel(ctx)
 	probeDone := make(chan struct{})
 	var waits []time.Duration
+	type slowAdmission struct {
+		probe          int
+		asked, granted time.Time
+		wait           time.Duration
+	}
+	var slowAdmissions []slowAdmission // Single producer, read after probeDone.
 	var probeErr error
 	go func() {
 		defer close(probeDone)
@@ -249,6 +255,13 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 					return
 				}
 				waits = append(waits, time.Since(asked))
+				if wait := waits[len(waits)-1]; wait >= 50*time.Millisecond {
+					// Snapshot the grant while this probe still owns its lease.
+					// The original measured Acquire interval above is unchanged.
+					slowAdmissions = append(slowAdmissions, slowAdmission{
+						probe: len(waits), asked: asked, granted: gate.Stats().ActiveSince, wait: wait,
+					})
+				}
 				// Exercise the shared writer while the import payload is private.
 				err = f.store.AtGeneration(0).SetRepoIndexState(graph.RepoIndexState{RepoPrefix: "interactive-probe"})
 				release()
@@ -274,6 +287,12 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 	}
 	stopProbes()
 	<-probeDone
+	for _, sample := range slowAdmissions {
+		returned := sample.asked.Add(sample.wait)
+		validGrant := !sample.granted.IsZero() && !sample.granted.Before(sample.asked) && !sample.granted.After(returned)
+		t.Logf("slow interactive admission: probe=%d asked=%s granted=%s returned=%s total=%s grant_valid=%t request_to_grant=%s grant_to_return=%s",
+			sample.probe, sample.asked.UTC().Format(time.RFC3339Nano), sample.granted.UTC().Format(time.RFC3339Nano), returned.UTC().Format(time.RFC3339Nano), sample.wait, validGrant, sample.granted.Sub(sample.asked), returned.Sub(sample.granted))
+	}
 	if probeErr != nil {
 		t.Fatalf("interactive writer failed: %v", probeErr)
 	}
