@@ -1,0 +1,282 @@
+package store_sqlite
+
+import (
+	"context"
+	"errors"
+	"github.com/zzet/gortex/internal/graph"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
+
+func attachmentState(fingerprint string) graph.ContractInputState {
+	return graph.ContractInputState{RepoPrefix: "repo", CheckoutID: "wt", InputVersion: "boundary-v1", InputFingerprint: fingerprint, Accepted: true}
+}
+func attachmentPayload(t *testing.T, s *Store) int64 {
+	t.Helper()
+	id := reservedGeneration(t, s, "contract-attachment")
+	if err := s.AtGeneration(id).SetProducerState(ProducerCompleteness{Producer: "graph.contracts", State: ProducerStateComplete}); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+func attachmentFor(state graph.ContractInputState, payload int64, work ...graph.ContractWork) graph.ContractAttachment {
+	a := graph.ContractAttachment{RepoPrefix: state.RepoPrefix, CheckoutID: state.CheckoutID, InputVersion: state.InputVersion, InputFingerprint: state.InputFingerprint, PayloadGeneration: payload}
+	for _, w := range work {
+		a.CompletedTokens = append(a.CompletedTokens, w.Token)
+	}
+	return a
+}
+func attachmentKey(state graph.ContractInputState) graph.ContractAttachmentKey {
+	return graph.ContractAttachmentKey{RepoPrefix: state.RepoPrefix, CheckoutID: state.CheckoutID, InputVersion: state.InputVersion, InputFingerprint: state.InputFingerprint}
+}
+
+func TestContractInputPrimaryPendingCASAndCancellation(t *testing.T) {
+	s := openCatalogStore(t)
+	ctx := context.Background()
+	old := attachmentState("old")
+	old.CheckoutID = ""
+	w := contractWorkFixture("removed-owner")
+	w.CheckoutID = ""
+	if err := s.BeginContractInputMutationContext(ctx, nil, old, []graph.ContractWork{w}); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := s.ContractInputStateContext(ctx, "repo", "")
+	if err != nil || !found || got.Accepted {
+		t.Fatalf("pending=%#v %v %v", got, found, err)
+	}
+	if err := s.PublishContractAttachmentContext(ctx, old, attachmentFor(old, attachmentPayload(t, s), w), []graph.ContractWork{w}, 1); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("pending publication=%v", err)
+	}
+	if err := s.AcceptContractInputMutationContext(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err = s.ContractInputStateContext(ctx, "repo", "")
+	if err != nil || !found || !got.Accepted {
+		t.Fatalf("accepted=%#v %v %v", got, found, err)
+	}
+	next := attachmentState("new")
+	next.CheckoutID = ""
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := s.BeginContractInputMutationContext(canceled, &got, next, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled=%v", err)
+	}
+	if err := s.BeginContractInputMutationContext(ctx, &next, next, nil); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("stale begin=%v", err)
+	}
+	still, _, _ := s.ContractInputStateContext(ctx, "repo", "")
+	if still != got {
+		t.Fatal("failed begin modified input")
+	}
+}
+
+func TestContractAttachmentAtomicExactWorkAndHistoricalIsolation(t *testing.T) {
+	s := openCatalogStore(t)
+	ctx := context.Background()
+	core := reservedGeneration(t, s, "core-input")
+	h := s.AtGeneration(core)
+	old := attachmentState("old")
+	w := contractWorkFixture("deleted-shared-owner")
+	w.OriginGeneration = core
+	if err := h.SetContractInputStateWithWorkContext(ctx, nil, old, []graph.ContractWork{w}); err != nil {
+		t.Fatal(err)
+	}
+	payload := attachmentPayload(t, s)
+	a := attachmentFor(old, payload, w)
+	wrong := w
+	wrong.Scope.Deleted = false
+	if err := h.PublishContractAttachmentContext(ctx, old, a, []graph.ContractWork{wrong}, 1); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("wrong captured scope=%v", err)
+	}
+	if got, err := h.GetContractAttachmentContext(ctx, attachmentKey(old)); err != nil || got != nil {
+		t.Fatalf("partial attachment=%#v %v", got, err)
+	}
+	rows, err := h.ContractWorkContext(ctx)
+	if err != nil || len(rows) != 1 || rows[0].State != graph.ContractWorkPending {
+		t.Fatalf("partial ack=%#v %v", rows, err)
+	}
+	if err := h.PublishContractAttachmentContext(ctx, old, a, []graph.ContractWork{w}, 1); err != nil {
+		t.Fatal(err)
+	}
+	got, err := h.GetContractAttachmentContext(ctx, attachmentKey(old))
+	if err != nil || !reflect.DeepEqual(got, &a) {
+		t.Fatalf("attachment=%#v %v", got, err)
+	}
+	wrongKey := attachmentKey(old)
+	wrongKey.CheckoutID = "sibling"
+	if got, err := h.GetContractAttachmentContext(ctx, wrongKey); err != nil || got != nil {
+		t.Fatalf("sibling leaked=%#v %v", got, err)
+	}
+	wrongKey = attachmentKey(old)
+	wrongKey.InputFingerprint = "new"
+	if got, err := h.GetContractAttachmentContext(ctx, wrongKey); err != nil || got != nil {
+		t.Fatalf("latest fallback=%#v %v", got, err)
+	}
+	rows, err = h.PendingContractWorkForScopeContext(ctx, "repo", "wt")
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("pending ack=%#v %v", rows, err)
+	}
+	all, err := h.ContractWorkContext(ctx)
+	if err != nil || all[0].State != graph.ContractWorkComplete || !all[0].Scope.Deleted {
+		t.Fatalf("ack lost old frontier=%#v %v", all, err)
+	}
+	refs, err := s.Catalog().ViewGenerationReferences(ctx, payload)
+	if err != nil || !refs.ContractAttached {
+		t.Fatalf("payload refs=%#v %v", refs, err)
+	}
+	if err := s.Catalog().DeleteViewGeneration(ctx, payload); !errors.Is(err, ErrCatalogGenerationReferenced) {
+		t.Fatalf("referenced delete=%v", err)
+	}
+}
+
+func TestContractInputFoldAndPreviousSnapshot(t *testing.T) {
+	s := openCatalogStore(t)
+	ctx := context.Background()
+	bottom := reservedGeneration(t, s, "input-bottom")
+	upper := reservedGeneration(t, s, "input-upper")
+	folded := reservedGeneration(t, s, "input-folded")
+	old := attachmentState("old")
+	w := contractWorkFixture("old-deleted")
+	w.OriginGeneration = bottom
+	if err := s.AtGeneration(bottom).SetContractInputStateWithWorkContext(ctx, nil, old, []graph.ContractWork{w}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AtGeneration(bottom).PublishContractAttachmentContext(ctx, old, attachmentFor(old, attachmentPayload(t, s), w), []graph.ContractWork{w}, 1); err != nil {
+		t.Fatal(err)
+	}
+	// Explicit carry is permitted only from real catalog ancestry. This fixture
+	// uses a physical accepted row to exercise fold precedence independently.
+	if err := s.AtGeneration(upper).SetContractInputStateWithWorkContext(ctx, nil, old, nil); err != nil {
+		t.Fatal(err)
+	}
+	next := attachmentState("new")
+	if err := s.AtGeneration(upper).SetContractInputStateWithWorkContext(ctx, &old, next, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FlattenGenerationChain(ctx, []int64{bottom, upper}, folded); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := s.AtGeneration(folded).ContractInputStateContext(ctx, "repo", "wt")
+	if err != nil || !found || got.InputFingerprint != "new" || got.PreviousInputFingerprint != "old" {
+		t.Fatalf("fold state=%#v %v %v", got, found, err)
+	}
+	debt, err := s.AtGeneration(folded).ContractWorkContext(ctx)
+	if err != nil || len(debt) != 0 {
+		t.Fatalf("fold retained completed history=%#v %v", debt, err)
+	}
+	copy := reservedGeneration(t, s, "input-copy")
+	if _, err := s.CopyGenerationPayloadWhole(ctx, folded, copy); err != nil {
+		t.Fatal(err)
+	}
+	copied, _, err := s.AtGeneration(copy).ContractInputStateContext(ctx, "repo", "wt")
+	if err != nil || copied != got {
+		t.Fatalf("copied=%#v %v", copied, err)
+	}
+}
+
+func TestContractInputRestartPendingPreservesRemovedFrontierAndPrevious(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "contract-restart.sqlite")
+	s, err := openPristine(t, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := attachmentState("first")
+	state.CheckoutID = ""
+	w := contractWorkFixture("removed-first")
+	w.CheckoutID = ""
+	if err := s.BeginContractInputMutationContext(ctx, nil, state, []graph.ContractWork{w}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AcceptContractInputMutationContext(ctx, state); err != nil {
+		t.Fatal(err)
+	}
+	payload := attachmentPayload(t, s)
+	a := attachmentFor(state, payload, w)
+	if err := s.PublishContractAttachmentContext(ctx, state, a, []graph.ContractWork{w}, 1); err != nil {
+		t.Fatal(err)
+	}
+	next := attachmentState("pending-second")
+	next.CheckoutID = ""
+	debt := w
+	debt.Token = "renamed-second"
+	debt.Scope.Causes = []string{"renamed_owner"}
+	if err := s.BeginContractInputMutationContext(ctx, &state, next, []graph.ContractWork{debt}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = openPristine(t, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	pending, found, err := s.ContractInputStateContext(ctx, "repo", "")
+	if err != nil || !found || pending.Accepted || pending.PreviousInputFingerprint != "first" {
+		t.Fatalf("restarted pending=%#v %v %v", pending, found, err)
+	}
+	got, err := s.GetContractAttachmentContext(ctx, attachmentKey(state))
+	if err != nil || got == nil || got.PayloadGeneration != payload {
+		t.Fatalf("previous unavailable=%#v %v", got, err)
+	}
+	captured, err := s.PendingContractWorkForScopeContext(ctx, "repo", "")
+	if err != nil || len(captured) != 1 || !captured[0].Scope.Deleted {
+		t.Fatalf("restart deletion frontier=%#v %v", captured, err)
+	}
+	replacement := next
+	replacement.InputFingerprint = "pending-third"
+	newDebt := debt
+	newDebt.Token = "removed-third"
+	if err := s.BeginContractInputMutationContext(ctx, &pending, replacement, []graph.ContractWork{newDebt}); err != nil {
+		t.Fatal(err)
+	}
+	captured, err = s.PendingContractWorkForScopeContext(ctx, "repo", "")
+	if err != nil || len(captured) != 2 {
+		t.Fatalf("superseded debt lost=%#v %v", captured, err)
+	}
+	if err := s.AcceptContractInputMutationContext(ctx, next); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("old acceptance=%v", err)
+	}
+}
+
+func TestContractAttachmentEmptyNamespaceCancellationAndSeal(t *testing.T) {
+	s := openCatalogStore(t)
+	ctx := context.Background()
+	core := reservedGeneration(t, s, "empty-input")
+	h := s.AtGeneration(core)
+	state := attachmentState("empty")
+	state.RepoPrefix = ""
+	state.CheckoutID = ""
+	if err := h.SetContractInputStateWithWorkContext(ctx, nil, state, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := h.ContractInputStateContext(ctx, "repo", ""); err != nil || found {
+		t.Fatalf("empty namespace broadened %v %v", found, err)
+	}
+	payload := attachmentPayload(t, s)
+	a := attachmentFor(state, payload)
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := h.PublishContractAttachmentContext(canceled, state, a, nil, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel publish=%v", err)
+	}
+	if got, err := h.GetContractAttachmentContext(ctx, attachmentKey(state)); err != nil || got != nil {
+		t.Fatalf("cancel wrote header=%#v %v", got, err)
+	}
+	if err := h.PublishContractAttachmentContext(ctx, state, a, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AtManagedGenerationMustForContractTest(t, payload).SetContractWork(ctx, []graph.ContractWork{contractWorkFixture("sealed-write")}); !errors.Is(err, ErrPayloadGenerationSealed) {
+		t.Fatalf("sealed payload write=%v", err)
+	}
+}
+func (s *Store) AtManagedGenerationMustForContractTest(t *testing.T, id int64) *Store {
+	t.Helper()
+	h, err := s.AtManagedGeneration(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}

@@ -2165,12 +2165,13 @@ type ViewGenerationReferences struct {
 	GraphActive bool
 	// DedicatedPublication is the graph's current build/publication association.
 	DedicatedPublication bool
+	ContractAttached     bool
 }
 
 // Any reports whether any pointer names the generation. It is the boolean the
 // delete guard enforces.
 func (r ViewGenerationReferences) Any() bool {
-	return r.Routed || r.RefViewed || r.Based || r.GraphActive || r.DedicatedPublication
+	return r.Routed || r.RefViewed || r.Based || r.GraphActive || r.DedicatedPublication || r.ContractAttached
 }
 
 // ViewGenerationReferenced reports whether anything still points at a
@@ -2193,8 +2194,8 @@ func (c *Catalog) ViewGenerationReferences(
 		return refs, fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
 	}
 	err := c.store.db.QueryRowContext(ctx, viewGenerationReferencesSQL,
-		generationID, generationID, generationID, generationID, generationID, generationID,
-	).Scan(&refs.Routed, &refs.RefViewed, &refs.Based, &refs.GraphActive, &refs.DedicatedPublication)
+		generationID, generationID, generationID, generationID, generationID, generationID, generationID,
+	).Scan(&refs.Routed, &refs.RefViewed, &refs.Based, &refs.GraphActive, &refs.DedicatedPublication, &refs.ContractAttached)
 	return refs, err
 }
 
@@ -2206,7 +2207,8 @@ SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR di
     OR EXISTS(SELECT 1 FROM view_generations WHERE base_generation_id = ?)
     OR EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?)
     OR EXISTS(SELECT 1 FROM dedicated_base_publications
-              WHERE generation_id = ? AND attempt_state IN ('building', 'ready', 'adopted'))`
+              WHERE generation_id = ? AND attempt_state IN ('building', 'ready', 'adopted'))
+    OR ` + contractAttachmentReferenceSQL
 
 // viewGenerationReferencesSQL is the same guard with its clauses kept apart,
 // so one round trip answers both "is it referenced" and "by what".
@@ -2216,7 +2218,8 @@ SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR di
        EXISTS(SELECT 1 FROM view_generations WHERE base_generation_id = ?),
        EXISTS(SELECT 1 FROM dedicated_graphs WHERE active_generation_id = ?),
        EXISTS(SELECT 1 FROM dedicated_base_publications
-               WHERE generation_id = ? AND attempt_state IN ('building', 'ready', 'adopted'))`
+               WHERE generation_id = ? AND attempt_state IN ('building', 'ready', 'adopted')),
+       ` + contractAttachmentReferenceSQL
 
 // DeleteViewGeneration removes a generation nothing points at. SQLite's own
 // foreign keys already refuse a delete under a route, a ref view, or another
@@ -2232,12 +2235,18 @@ func (c *Catalog) DeleteViewGeneration(ctx context.Context, generationID int64) 
 	return c.withTx(ctx, func(tx *sql.Tx) error {
 		var referenced bool
 		if err := tx.QueryRowContext(ctx, viewGenerationReferencedSQL,
-			generationID, generationID, generationID, generationID, generationID, generationID,
+			generationID, generationID, generationID, generationID, generationID, generationID, generationID,
 		).Scan(&referenced); err != nil {
 			return err
 		}
 		if referenced {
 			return fmt.Errorf("%w: generation %d", ErrCatalogGenerationReferenced, generationID)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM contract_attachment_work WHERE (repo_prefix,checkout_id,attachment_version,attachment_fingerprint) IN (SELECT repo_prefix,checkout_id,input_version,input_fingerprint FROM contract_attachments WHERE payload_generation=?)`, generationID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM contract_attachments WHERE payload_generation=?`, generationID); err != nil {
+			return err
 		}
 		result, err := tx.ExecContext(ctx, `DELETE FROM view_generations WHERE generation_id = ?`, generationID)
 		if err != nil {

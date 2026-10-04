@@ -11,6 +11,7 @@ import (
 )
 
 var _ graph.ContractWorkReader = (*Store)(nil)
+var _ graph.PendingContractWorkReader = (*Store)(nil)
 
 const contractWorkReadLimit = 32768
 
@@ -43,19 +44,9 @@ func (s *Store) SetContractWork(ctx context.Context, work []graph.ContractWork) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	encoded := make([][]byte, len(work))
-	seen := make(map[string]bool, len(work))
-	for i, row := range work {
-		if row.Token == "" || row.OriginGeneration < 0 || row.FilePath == "" || row.InputVersion == "" || row.InputFingerprint == "" || seen[row.Token] ||
-			(row.State != graph.ContractWorkPending && row.State != graph.ContractWorkComplete) {
-			return fmt.Errorf("%w: invalid contract work row", ErrCatalogInvalidValue)
-		}
-		seen[row.Token] = true
-		var err error
-		encoded[i], err = json.Marshal(row.Scope)
-		if err != nil {
-			return fmt.Errorf("encode contract work: %w", err)
-		}
+	encoded, err := encodeContractWork(work)
+	if err != nil {
+		return err
 	}
 	if len(work) == 0 {
 		return nil
@@ -73,27 +64,8 @@ func (s *Store) SetContractWork(ctx context.Context, work []graph.ContractWork) 
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	for i, row := range work {
-		result, err := tx.ExecContext(ctx, `INSERT INTO generation_contract_work
- (view_gen, token, origin_generation, checkout_id, repo_prefix, file_path, input_version, input_fingerprint, state, scope)
- VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
- ON CONFLICT(view_gen, token) DO UPDATE SET state = excluded.state
- WHERE generation_contract_work.origin_generation = excluded.origin_generation
- AND generation_contract_work.checkout_id = excluded.checkout_id
- AND generation_contract_work.repo_prefix = excluded.repo_prefix
- AND generation_contract_work.file_path = excluded.file_path
- AND generation_contract_work.input_version = excluded.input_version
- AND generation_contract_work.input_fingerprint = excluded.input_fingerprint
- AND generation_contract_work.scope = excluded.scope
- AND (generation_contract_work.state = 'pending' OR excluded.state = 'complete')`,
-			s.viewGen, row.Token, row.OriginGeneration, row.CheckoutID, row.RepoPrefix, row.FilePath,
-			row.InputVersion, row.InputFingerprint, string(row.State), string(encoded[i]))
-		if err != nil {
-			return err
-		}
-		if affected, err := result.RowsAffected(); err != nil || affected != 1 {
-			return fmt.Errorf("%w: contract work token identity changed or acknowledgment withdrawn", ErrCatalogInvalidValue)
-		}
+	if err := setContractWorkTx(ctx, tx, s.viewGen, work, encoded); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -120,7 +92,7 @@ func (s *Store) readContractWork(ctx context.Context, filter string, args []any)
 	}
 	args = append([]any{s.viewGen}, args...)
 	rows, err := s.db.QueryContext(ctx, `SELECT token, origin_generation, checkout_id, repo_prefix, file_path,
- input_version, input_fingerprint, state, scope FROM generation_contract_work
+ input_version, input_fingerprint, CASE WHEN `+contractWorkAcknowledgedSQL+` THEN 'complete' ELSE state END, scope FROM generation_contract_work d
  WHERE view_gen = ?`+filter+` ORDER BY token LIMIT 32769`, args...)
 	if err != nil {
 		return nil, err
@@ -158,4 +130,54 @@ func createContractWorkTable(tx *sql.Tx) error {
 	}
 	_, err := tx.Exec(contractWorkScopeIndexDDL)
 	return err
+}
+
+func encodeContractWork(work []graph.ContractWork) ([][]byte, error) {
+	encoded := make([][]byte, len(work))
+	seen := make(map[string]bool, len(work))
+	for i, row := range work {
+		if row.Token == "" || row.OriginGeneration < 0 || row.FilePath == "" || row.InputVersion == "" || row.InputFingerprint == "" || seen[row.Token] ||
+			(row.State != graph.ContractWorkPending && row.State != graph.ContractWorkComplete) {
+			return nil, fmt.Errorf("%w: invalid contract work row", ErrCatalogInvalidValue)
+		}
+		seen[row.Token] = true
+		var err error
+		encoded[i], err = json.Marshal(row.Scope)
+		if err != nil {
+			return nil, fmt.Errorf("encode contract work: %w", err)
+		}
+	}
+	return encoded, nil
+}
+
+func setContractWorkTx(ctx context.Context, tx *sql.Tx, generation int64, work []graph.ContractWork, encoded [][]byte) error {
+	for i, row := range work {
+		result, err := tx.ExecContext(ctx, `INSERT INTO generation_contract_work
+ (view_gen, token, origin_generation, checkout_id, repo_prefix, file_path, input_version, input_fingerprint, state, scope)
+ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ ON CONFLICT(view_gen, token) DO UPDATE SET state = excluded.state
+ WHERE generation_contract_work.origin_generation = excluded.origin_generation
+ AND generation_contract_work.checkout_id = excluded.checkout_id
+ AND generation_contract_work.repo_prefix = excluded.repo_prefix
+ AND generation_contract_work.file_path = excluded.file_path
+ AND generation_contract_work.input_version = excluded.input_version
+ AND generation_contract_work.input_fingerprint = excluded.input_fingerprint
+ AND generation_contract_work.scope = excluded.scope
+ AND (generation_contract_work.state = 'pending' OR excluded.state = 'complete')`,
+			generation, row.Token, row.OriginGeneration, row.CheckoutID, row.RepoPrefix, row.FilePath,
+			row.InputVersion, row.InputFingerprint, string(row.State), string(encoded[i]))
+		if err != nil {
+			return err
+		}
+		if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+			return fmt.Errorf("%w: contract work token identity changed or acknowledgment withdrawn", ErrCatalogInvalidValue)
+		}
+	}
+	return nil
+}
+
+// PendingContractWorkForScopeContext reads only unacknowledged debt, so request
+// cost is bounded by active work rather than lifetime completion history.
+func (s *Store) PendingContractWorkForScopeContext(ctx context.Context, repo, checkout string) ([]graph.ContractWork, error) {
+	return s.readContractWork(ctx, " AND repo_prefix=? AND checkout_id=? AND state='pending' AND NOT "+contractWorkAcknowledgedSQL, []any{repo, checkout})
 }

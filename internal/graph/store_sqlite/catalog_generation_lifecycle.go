@@ -79,6 +79,6 @@ func (c *Catalog) BeginViewGenerationRetirement(ctx context.Context, generationI
 func viewGenerationRetirementReferencedTx(ctx context.Context, tx *sql.Tx, generationID int64) (bool, error) {
 	var referenced bool
 	err := tx.QueryRowContext(ctx, viewGenerationReferencedSQL,
-		generationID, generationID, generationID, generationID, generationID, generationID).Scan(&referenced)
+		generationID, generationID, generationID, generationID, generationID, generationID, generationID).Scan(&referenced)
 	return referenced, err
 }

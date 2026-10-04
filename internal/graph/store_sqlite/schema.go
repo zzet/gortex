@@ -1628,6 +1628,7 @@ var generationMaskTables = []generationMaskTable{
 	{table: "generation_edge_sources", body: generationEdgeSourcesTableBody},
 	{table: "generation_producer_completeness", body: generationProducerCompletenessTableBody},
 	{table: "generation_contract_work", body: contractWorkTableBody},
+	{table: "generation_contract_input_state", body: contractInputStateTableBody},
 }
 
 // generationMaskSchemaSQL is the fresh-store CREATE TABLE DDL for every entry
@@ -1645,6 +1646,7 @@ func buildGenerationMaskSchemaSQL() string {
 		b.WriteString(";\n")
 	}
 	b.WriteString(contractWorkScopeIndexDDL)
+	b.WriteString(contractAttachmentSchemaSQL)
 	return b.String()
 }
 

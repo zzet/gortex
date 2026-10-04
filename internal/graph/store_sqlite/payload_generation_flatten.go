@@ -683,12 +683,15 @@ SELECT `+strings.Join(projection, ", ")+` FROM `+table+` WHERE `+viewGenColumnNa
 // the member above (already carried) winning every key both hold. Context
 // marks are not carried: they claim nothing.
 func flattenMasksTx(ctx context.Context, tx *sql.Tx, member, to int64, masks generationMaskSet) error {
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_input_state(view_gen,repo_prefix,checkout_id,input_version,input_fingerprint,accepted,previous_input_version,previous_input_fingerprint) SELECT ?,repo_prefix,checkout_id,input_version,input_fingerprint,accepted,previous_input_version,previous_input_fingerprint FROM generation_contract_input_state WHERE view_gen=?`, to, member); err != nil {
+		return err
+	}
 	// Upper acknowledgments win over the matching lower pending token.
 	// Different tokens are retained even for deleted or replaced file paths.
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_work
  (view_gen, token, origin_generation, checkout_id, repo_prefix, file_path, input_version, input_fingerprint, state, scope)
  SELECT ?, token, origin_generation, checkout_id, repo_prefix, file_path, input_version, input_fingerprint, state, scope
- FROM generation_contract_work WHERE view_gen = ?`, to, member); err != nil {
+ FROM generation_contract_work d WHERE view_gen = ? AND NOT `+contractWorkAcknowledgedSQL, to, member); err != nil {
 		return fmt.Errorf("store_sqlite: flatten contract work of generation %d: %w", member, err)
 	}
 	if _, err := tx.ExecContext(ctx, `
