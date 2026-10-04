@@ -156,7 +156,11 @@ func (idx *Indexer) collectContractBoundaryReceipt(ctx context.Context, path, la
 		}
 		_, byID := handlers[node.ID]
 		_, byName := handlers[node.Name]
-		if byID || byName {
+		// Provider SymbolID is the extractor's source attribution, which can
+		// name a route constant. Go body facts belong only to callables; constant
+		// dependencies are captured separately in ProducedInputs below.
+		callable := language != "go" || node.Kind == graph.KindFunction || node.Kind == graph.KindMethod
+		if (byID || byName) && callable {
 			if node.StartLine <= 0 || node.EndLine < node.StartLine || node.EndLine > len(lines) {
 				return contractBoundaryReceipt{}, fmt.Errorf("contract boundary receipt: missing accepted handler span %s", node.ID)
 			}

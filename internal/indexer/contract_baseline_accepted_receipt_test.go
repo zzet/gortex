@@ -22,6 +22,8 @@ func TestContractBaselineAcceptedReceiptMatchesRawParserFacts(t *testing.T) {
 	want, err := idx.collectContractBoundaryReceipt(ctx, file.Path, file.Language, src, parsed)
 	require.NoError(t, err)
 	require.NotEmpty(t, want.Groups, "constant-derived endpoint must be reconstructed")
+	require.NotContains(t, want.HandlerInputs, "fixture/routes.go::route", "source attribution to a constant must not require function body facts")
+	require.NotEmpty(t, want.ProducedInputs[contractBoundaryLookupKey("fixture", "constant_name", "route")], "route constant must retain dependency invalidation evidence")
 	// Selected durable evidence may have been enriched/reordered. These rows
 	// must not be substituted for the raw accepted parse during reconstruction.
 	core.AddBatch([]*graph.Node{{ID: "fixture/routes.go::route", Name: "route", Kind: graph.KindFunction, FilePath: file.Path, RepoPrefix: "fixture", StartLine: 2, EndLine: 2}}, nil)
