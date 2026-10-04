@@ -114,21 +114,21 @@ func TestBaseGraphReaderBatchAdjacencyHydratesFarEndpointsOnce(t *testing.T) {
 func TestBaseGraphReaderBatchAdjacencyPreservesSelectedMasks(t *testing.T) {
 	base := graph.New()
 	base.AddBatch([]*graph.Node{
-		{ID: "anchor", Kind: graph.KindFunction, FilePath: "repo/a.go", RepoPrefix: "repo"},
-		{ID: "current", Kind: graph.KindFunction, FilePath: "repo/target.go", RepoPrefix: "repo"},
-		{ID: "deleted", Kind: graph.KindFunction, FilePath: "repo/deleted.go", RepoPrefix: "repo"},
+		{ID: "repo/a.go::anchor", Kind: graph.KindFunction, FilePath: "repo/a.go", RepoPrefix: "repo"},
+		{ID: "repo/target.go::current", Kind: graph.KindFunction, FilePath: "repo/target.go", RepoPrefix: "repo"},
+		{ID: "repo/deleted.go::deleted", Kind: graph.KindFunction, FilePath: "repo/deleted.go", RepoPrefix: "repo"},
 	}, []*graph.Edge{
-		{From: "anchor", To: "current", Kind: graph.EdgeCalls, FilePath: "repo/a.go", Line: 1},
-		{From: "anchor", To: "deleted", Kind: graph.EdgeCalls, FilePath: "repo/a.go", Line: 2},
+		{From: "repo/a.go::anchor", To: "repo/target.go::current", Kind: graph.EdgeCalls, FilePath: "repo/a.go", Line: 1},
+		{From: "repo/a.go::anchor", To: "repo/deleted.go::deleted", Kind: graph.EdgeCalls, FilePath: "repo/a.go", Line: 2},
 	})
 	layer := graph.NewOverlayLayer()
 	layer.MarkFile("repo/deleted.go", true)
-	layer.AddNode("repo/target.go", &graph.Node{ID: "current", Kind: graph.KindFunction, FilePath: "repo/target.go", RepoPrefix: "other"})
-	fresh := &graph.Edge{From: "anchor", To: "unresolved", Kind: graph.EdgeReferences, FilePath: "repo/new.go", Line: 3, Meta: map[string]any{"source": "selected"}}
+	layer.AddNode("repo/target.go", &graph.Node{ID: "repo/target.go::current", Kind: graph.KindFunction, FilePath: "repo/target.go", RepoPrefix: "other"})
+	fresh := &graph.Edge{From: "repo/a.go::anchor", To: "repo/new.go::unresolved", Kind: graph.EdgeReferences, FilePath: "repo/new.go", Line: 3, Meta: map[string]any{"source": "selected"}}
 	layer.AddEdge(fresh)
 	selected := graph.NewOverlaidView(base, layer)
 	scoped := newBaseGraphReader(selected, "repo")
-	require.Equal(t, []*graph.Edge{fresh}, scoped.GetOutEdgesByNodeIDs([]string{"anchor"})["anchor"])
-	require.Equal(t, scoped.GetOutEdges("anchor"), scoped.GetOutEdgesByNodeIDs([]string{"anchor"})["anchor"])
-	require.Empty(t, scoped.GetInEdgesByNodeIDs([]string{"current", "deleted"}), "selected foreign or deleted anchors remain unavailable")
+	require.Equal(t, []*graph.Edge{fresh}, scoped.GetOutEdgesByNodeIDs([]string{"repo/a.go::anchor"})["repo/a.go::anchor"])
+	require.Equal(t, scoped.GetOutEdges("repo/a.go::anchor"), scoped.GetOutEdgesByNodeIDs([]string{"repo/a.go::anchor"})["repo/a.go::anchor"])
+	require.Empty(t, scoped.GetInEdgesByNodeIDs([]string{"repo/target.go::current", "repo/deleted.go::deleted"}), "selected foreign or deleted anchors remain unavailable")
 }
