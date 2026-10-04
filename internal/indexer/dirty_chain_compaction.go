@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -257,12 +258,17 @@ func (c *CheckoutCoordinator) scheduleDirtyChainCompaction(trigger CheckoutCycle
 	}
 	k := &c.compaction
 	lifetime := c.lifetimeContext()
+	// A cycle owns cycleMu here. Capture catalog evidence before k.mu; the
+	// old fold may be finishing and waiting for that same cycle lock to land.
+	activeChain := c.activeChainForFoldReplacement(lifetime, trigger)
 	k.mu.Lock()
 	if k.closed || lifetime.Err() != nil {
 		k.mu.Unlock()
 		return false
 	}
-	if k.stepping.Load() || (steppedChainFoldEnabled && compactionOwed(k.running)) {
+	obsolete := k.stepping.Load() && k.cancel != nil && compactionOwed(k.running) && len(k.foldingChain) > 1 && len(activeChain) > 0 &&
+		!chainHasFoldPrefix(activeChain, k.foldingChain)
+	if !obsolete && (k.stepping.Load() || (steppedChainFoldEnabled && compactionOwed(k.running))) {
 		// A stepped fold is running, or a compaction is queued: it folds
 		// the chain the route holds when it starts, and lands on whatever
 		// was published above it. Replacing a queued one with a newer
@@ -270,6 +276,13 @@ func (c *CheckoutCoordinator) scheduleDirtyChainCompaction(trigger CheckoutCycle
 		// from ever starting.
 		k.mu.Unlock()
 		return false
+	}
+	var replaced []int64
+	if obsolete {
+		// Cancellation is narrow: a known active branch no longer contains
+		// this fold's exact ancestry. Useful prefix folds keep progressing.
+		// Joining happens in the new worker, never under cycleMu or k.mu.
+		replaced = slices.Clone(k.foldingChain)
 	}
 	if k.cancel != nil {
 		k.cancel()
@@ -281,6 +294,10 @@ func (c *CheckoutCoordinator) scheduleDirtyChainCompaction(trigger CheckoutCycle
 	k.stats.Scheduled++
 	k.wg.Add(1)
 	k.mu.Unlock()
+	if len(replaced) > 0 {
+		c.logger.Debug("checkout coordinator: replacing an obsolete divergent chain fold",
+			zap.String("checkout", c.checkoutID), zap.Int64s("folding", replaced), zap.Int64s("active_chain", activeChain))
+	}
 	go func() {
 		defer k.wg.Done()
 		defer close(done)
@@ -299,6 +316,38 @@ func (c *CheckoutCoordinator) scheduleDirtyChainCompaction(trigger CheckoutCycle
 		k.mu.Unlock()
 	}()
 	return true
+}
+
+func chainHasFoldPrefix(active, folding []int64) bool {
+	return len(active) >= len(folding) && slices.Equal(active[:len(folding)], folding)
+}
+
+// Only a complete, currently active chain can displace a running fold. A
+// missing row or a publication that moved is unknown, not proof of divergence.
+func (c *CheckoutCoordinator) activeChainForFoldReplacement(ctx context.Context, trigger CheckoutCycle) []int64 {
+	k := &c.compaction
+	k.mu.Lock()
+	needed := steppedChainFoldEnabled && k.stepping.Load() && k.cancel != nil && compactionOwed(k.running) && len(k.foldingChain) > 1 && !k.closed
+	k.mu.Unlock()
+	if !needed {
+		return nil
+	}
+	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil || !found || route.State != store_sqlite.RouteActive ||
+		route.CommitGenerationID != trigger.CommitGenerationID || route.DirtyGenerationID != trigger.DirtyGenerationID {
+		return nil
+	}
+	active := c.dirtyChainMembers(ctx, route.DirtyGenerationID)
+	if len(active) == 0 || len(active) > maxChainWalkDepth {
+		return nil
+	}
+	root, found, err := c.catalog.GetViewGeneration(ctx, active[len(active)-1])
+	if err != nil || !found || root.GenerationKind != DirtyLayerGenerationKind ||
+		root.CheckoutID != c.checkoutID || root.BaseGenerationID != route.CommitGenerationID {
+		return nil
+	}
+	slices.Reverse(active)
+	return active
 }
 
 // cancelDirtyChainCompaction cancels the owed compaction, if any. It reports
