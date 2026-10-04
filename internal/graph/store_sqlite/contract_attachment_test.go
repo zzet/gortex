@@ -702,3 +702,85 @@ func TestContractAttachmentExplicitInheritedPrimaryWork(t *testing.T) {
 		t.Fatalf("linked completed sibling=%#v %v", viewed, err)
 	}
 }
+
+func TestContractAttachmentCompanionPositiveFromSelectedAncestry(t *testing.T) {
+	s := openCatalogStore(t)
+	ctx := context.Background()
+	baseA := attachmentState("a-primary")
+	baseA.RepoPrefix = "repo-a"
+	baseA.CheckoutID = ""
+	baseB := attachmentState("b-primary")
+	baseB.RepoPrefix = "repo-b"
+	baseB.CheckoutID = ""
+	debt := contractWorkFixture("b-primary-debt")
+	debt.RepoPrefix = "repo-b"
+	debt.CheckoutID = ""
+	debt.FilePath = "repo-b/handler.go"
+	for _, input := range []graph.ContractInputState{baseA, baseB} {
+		var work []graph.ContractWork
+		if input.RepoPrefix == baseB.RepoPrefix {
+			work = []graph.ContractWork{debt}
+		}
+		if err := s.BeginContractInputMutationContext(ctx, nil, input, work); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AcceptContractInputMutationContext(ctx, input); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selected := reservedGeneration(t, s, "selected-a-positive")
+	positiveA := attachmentState("a-linked")
+	positiveA.RepoPrefix = "repo-a"
+	positiveA.CheckoutID = "linked-a"
+	if err := s.AtGeneration(selected).SetContractInputStateWithWorkContext(ctx, nil, positiveA, nil); err != nil {
+		t.Fatal(err)
+	}
+	publishContractCoreForTest(t, s, selected)
+	baseA.Accepted = true
+	baseB.Accepted = true
+	positiveA.Accepted = true
+	ownMissing := graph.ContractInputWitness{GenerationID: selected, State: graph.ContractInputState{RepoPrefix: "repo-b", CheckoutID: "linked-a"}}
+	witnesses := []graph.ContractInputWitness{{GenerationID: 0, State: baseA, Found: true}, {GenerationID: 0, State: baseB, Found: true}, {GenerationID: selected, State: positiveA, Found: true}, ownMissing}
+	logical, err := graph.ComposeContractInputState("repo-b", "linked-a", witnesses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibling := reservedGeneration(t, s, "unselected-a-sibling")
+	if err := s.AtGeneration(sibling).SetContractInputStateWithWorkContext(ctx, nil, positiveA, nil); err != nil {
+		t.Fatal(err)
+	}
+	publishContractCoreForTest(t, s, sibling)
+	wrong := append([]graph.ContractInputWitness(nil), witnesses...)
+	wrong[2].GenerationID = sibling
+	payload := attachmentPayload(t, s)
+	if err := s.AtGeneration(selected).PublishContractAttachmentWithInputsContext(ctx, logical, wrong, attachmentFor(logical, payload), nil, 1); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("real foreign sibling accepted=%v", err)
+	}
+	if err := s.AtGeneration(selected).PublishContractAttachmentWithInputsContext(ctx, logical, witnesses, attachmentFor(logical, payload, debt), []graph.ContractWork{debt}, 1); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := s.PendingContractWorkForScopeContext(ctx, "repo-b", "")
+	if err != nil || len(raw) != 1 || raw[0].State != graph.ContractWorkPending {
+		t.Fatalf("linked cohort cleared primary=%#v %v", raw, err)
+	}
+	other := logical
+	other.CheckoutID = "linked-sibling"
+	viewed, err := s.ContractWorkForAttachmentScopeContext(ctx, attachmentKey(other), "repo-b", "")
+	if err != nil || len(viewed) != 1 || viewed[0].State != graph.ContractWorkPending {
+		t.Fatalf("linked cohort completed sibling=%#v %v", viewed, err)
+	}
+	// An accepted companion mutation invalidates the exact captured cohort,
+	// even if this receiver is still an accepted leased historical generation.
+	nextA := baseA
+	nextA.InputFingerprint = "a-new"
+	if err := s.BeginContractInputMutationContext(ctx, &baseA, nextA, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AcceptContractInputMutationContext(ctx, nextA); err != nil {
+		t.Fatal(err)
+	}
+	stalePayload := attachmentPayload(t, s)
+	if err := s.AtGeneration(selected).PublishContractAttachmentWithInputsContext(ctx, logical, witnesses, attachmentFor(logical, stalePayload), nil, 1); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("mutated companion input accepted=%v", err)
+	}
+}

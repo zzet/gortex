@@ -380,24 +380,29 @@ func validateSelectedContractWitnessAncestry(chain []int64, repo string, witness
 		ranks[id] = i
 	}
 	covered := make(map[int64]bool)
-	last := len(chain)
+	lastByRepo := make(map[string]int)
 	for _, w := range witnesses {
-		if w.State.RepoPrefix != repo {
-			if w.GenerationID != 0 {
-				return ErrCatalogStaleGuard
-			}
-			continue
-		}
 		if w.GenerationID == 0 {
 			continue
-		} // actual inherited0 selection is captured by the view caller
+		} // actual inherited0 remains trusted selected-view capture
 		rank, ok := ranks[w.GenerationID]
-		if !ok || rank > last {
+		if !ok {
 			return ErrCatalogStaleGuard
 		}
-		last = rank
-		covered[w.GenerationID] = true
+		last, seen := lastByRepo[w.State.RepoPrefix]
+		if !seen {
+			last = len(chain)
+		}
+		if rank > last {
+			return ErrCatalogStaleGuard
+		}
+		lastByRepo[w.State.RepoPrefix] = rank
+		if w.State.RepoPrefix == repo {
+			covered[w.GenerationID] = true
+		}
 	}
+	// A companion may share the selected receiver's positive ancestry, but may
+	// never substitute a sibling source. Own-repo absence coverage is mandatory.
 	for _, id := range chain {
 		if id != 0 && !covered[id] {
 			return ErrCatalogStaleGuard
