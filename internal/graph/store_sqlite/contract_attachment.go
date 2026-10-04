@@ -58,7 +58,9 @@ func (s *Store) GetContractAttachmentContext(ctx context.Context, key graph.Cont
 // PublishContractAttachmentContext seals the isolated managed payload and binds
 // it to the selected accepted input together with immutable debt acknowledgments.
 // The receiver selects the core generation whose ancestry the worker captured;
-// no mutable corpus clock or latest-actor attachment is consulted.
+// no mutable corpus clock or latest-actor attachment is consulted. Actual
+// inherited0 inclusion is a trusted leased RepoView capture boundary: catalog
+// ancestry alone cannot recover historical routed commitIndex/fullroot selection.
 func (s *Store) PublishContractAttachmentContext(ctx context.Context, expected graph.ContractInputState, attachment graph.ContractAttachment, work []graph.ContractWork, publishedAt int64) error {
 	return s.publishContractAttachment(ctx, expected, nil, attachment, work, publishedAt)
 }
@@ -155,8 +157,16 @@ func (s *Store) publishContractAttachment(ctx context.Context, expected graph.Co
 	if masks != 0 {
 		return fmt.Errorf("%w: isolated attachment cannot mask core", ErrCatalogInvalidValue)
 	}
+	// SQL NULL catalog bases do not encode live primary inheritance. A checked
+	// own-repo found primary witness is the explicit trusted capture authority.
+	workChain := slices.Clone(chain)
+	for _, witness := range witnesses {
+		if witness.GenerationID == 0 && witness.Found && witness.State.Accepted && witness.State.RepoPrefix == expected.RepoPrefix && !slices.Contains(workChain, int64(0)) {
+			workChain = append(workChain, 0)
+		}
+	}
 	for i, row := range work {
-		if err := validateCapturedContractWorkTx(ctx, tx, chain, row, string(encoded[i])); err != nil {
+		if err := validateCapturedContractWorkTx(ctx, tx, workChain, row, string(encoded[i])); err != nil {
 			return err
 		}
 	}

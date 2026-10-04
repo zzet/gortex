@@ -652,3 +652,53 @@ func TestContractAttachmentAcknowledgmentsNeverCertifyAnotherViewOrHistoricalInp
 		t.Fatalf("future rewrote raw historicalN=%#v %v", historical, err)
 	}
 }
+
+func TestContractAttachmentExplicitInheritedPrimaryWork(t *testing.T) {
+	s := openCatalogStore(t)
+	ctx := context.Background()
+	primary := attachmentState("inherited-primary")
+	primary.CheckoutID = ""
+	work := contractWorkFixture("only-primary-token")
+	work.CheckoutID = ""
+	if err := s.BeginContractInputMutationContext(ctx, nil, primary, []graph.ContractWork{work}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AcceptContractInputMutationContext(ctx, primary); err != nil {
+		t.Fatal(err)
+	}
+	core := reservedGeneration(t, s, "sparse-no-copied-debt")
+	positive := attachmentState("positive-cumulative")
+	positive.CheckoutID = "linked-b"
+	if err := s.AtGeneration(core).SetContractInputStateWithWorkContext(ctx, nil, positive, nil); err != nil {
+		t.Fatal(err)
+	}
+	publishContractCoreForTest(t, s, core)
+	primary.Accepted = true
+	positive.Accepted = true
+	own := []graph.ContractInputWitness{{GenerationID: core, State: positive, Found: true}}
+	noBase, err := graph.ComposeContractInputState("repo", "linked-b", own)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AtGeneration(core).PublishContractAttachmentWithInputsContext(ctx, noBase, own, attachmentFor(noBase, attachmentPayload(t, s), work), []graph.ContractWork{work}, 1); err == nil {
+		t.Fatal("unselected primary work accepted without inherited witness")
+	}
+	selected := append([]graph.ContractInputWitness{{GenerationID: 0, State: primary, Found: true}}, own...)
+	logical, err := graph.ComposeContractInputState("repo", "linked-b", selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AtGeneration(core).PublishContractAttachmentWithInputsContext(ctx, logical, selected, attachmentFor(logical, attachmentPayload(t, s), work), []graph.ContractWork{work}, 1); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := s.PendingContractWorkForScopeContext(ctx, "repo", "")
+	if err != nil || len(raw) != 1 || raw[0].State != graph.ContractWorkPending {
+		t.Fatalf("linked cleared primary=%#v %v", raw, err)
+	}
+	sibling := logical
+	sibling.CheckoutID = "linked-c"
+	viewed, err := s.ContractWorkForAttachmentScopeContext(ctx, attachmentKey(sibling), "repo", "")
+	if err != nil || len(viewed) != 1 || viewed[0].State != graph.ContractWorkPending {
+		t.Fatalf("linked completed sibling=%#v %v", viewed, err)
+	}
+}
