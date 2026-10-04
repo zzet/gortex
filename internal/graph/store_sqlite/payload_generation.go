@@ -533,6 +533,10 @@ func (p *PreparedPayloadGenerationPublication) Publish(ctx context.Context, publ
 }
 
 func (p *PreparedPayloadGenerationPublication) publish(ctx context.Context, publishedAt int64, scheduleMaintenance bool) error {
+	return p.publishWithInputWitness(ctx, publishedAt, scheduleMaintenance, nil)
+}
+
+func (p *PreparedPayloadGenerationPublication) publishWithInputWitness(ctx context.Context, publishedAt int64, scheduleMaintenance bool, witness *PayloadInputWitness) error {
 	if ctx == nil || p == nil || p.store == nil {
 		return fmt.Errorf("%w: invalid publication", ErrCatalogInvalidValue)
 	}
@@ -556,7 +560,7 @@ func (p *PreparedPayloadGenerationPublication) publish(ctx context.Context, publ
 			return err
 		}
 		timings.mark(publishStepDrain)
-		if err := s.publishSealedGeneration(ctx, catalog, generationID, publishedAt, &timings); err != nil {
+		if err := s.publishSealedGeneration(ctx, catalog, generationID, publishedAt, &timings, witness); err != nil {
 			s.setPayloadSeal(generationID, payloadSealUnknown)
 			return err
 		}
@@ -617,7 +621,7 @@ func (s *Store) drainPayloadWriters(ctx context.Context) error {
 // writes go through the base handle, both guarded on the building state, so a
 // generation another publisher already moved fails here instead of being
 // published twice.
-func (s *Store) publishSealedGeneration(ctx context.Context, catalog *Catalog, generationID, publishedAt int64, timings *publishTimings) error {
+func (s *Store) publishSealedGeneration(ctx context.Context, catalog *Catalog, generationID, publishedAt int64, timings *publishTimings, witness *PayloadInputWitness) error {
 	handle := s.AtGeneration(generationID)
 	if err := handle.validateGenerationMasksTimed(timings); err != nil {
 		return err
@@ -635,7 +639,7 @@ func (s *Store) publishSealedGeneration(ctx context.Context, catalog *Catalog, g
 		return err
 	}
 	timings.mark(publishStepCatalogRollup)
-	if err := catalog.PublishViewGeneration(ctx, generationID, publishedAt); err != nil {
+	if err := catalog.publishViewGenerationWithInputWitness(ctx, generationID, publishedAt, witness); err != nil {
 		return err
 	}
 	timings.mark(publishStepCatalogPublish)

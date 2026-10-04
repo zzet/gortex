@@ -1995,10 +1995,14 @@ func (c *Catalog) ListViewGenerations(ctx context.Context, filter ViewGeneration
 // retiring) is immutable: the update matches nothing and reports
 // ErrCatalogStaleGuard.
 func (c *Catalog) PublishViewGeneration(ctx context.Context, generationID, publishedAt int64) error {
+	return c.publishViewGenerationWithInputWitness(ctx, generationID, publishedAt, nil)
+}
+
+func (c *Catalog) publishViewGenerationWithInputWitness(ctx context.Context, generationID, publishedAt int64, witness *PayloadInputWitness) error {
 	if generationID <= 0 {
 		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
 	}
-	return c.execGuarded(ctx, fmt.Sprintf("view generation %d is not building", generationID), `
+	return c.execGuardedWithInputWitness(ctx, witness, fmt.Sprintf("view generation %d is not building", generationID), `
 UPDATE view_generations SET state = ?, published_at = ?
  WHERE generation_id = ? AND state = ?`,
 		string(ViewGenerationReady), publishedAt, generationID, string(ViewGenerationBuilding))
