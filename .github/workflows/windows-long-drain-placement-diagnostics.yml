@@ -1,0 +1,77 @@
+name: Windows LongDrain storage placement diagnostics
+
+on:
+  push:
+    branches: [codex/windows-long-drain-placement-20261004]
+
+permissions:
+  contents: read
+
+jobs:
+  full-store-0:
+    name: Full store-0 (${{ matrix.placement }})
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        placement: [default, runner-scratch]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Record exact source and storage environment
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          git status --porcelain --untracked-files=normal
+          python - <<'PYENV'
+          import os
+          from pathlib import Path
+          import hashlib
+          print("PLACEMENT_VARIANT", "${{ matrix.placement }}")
+          for key in ("GOTMPDIR", "TEMP", "TMP", "RUNNER_TEMP", "GITHUB_WORKSPACE"):
+              print(key, repr(os.environ.get(key)))
+          for name in ("internal/graph/store_sqlite/wal_reclaim_open_gate_test.go", "internal/graph/store_sqlite/wal_windows_diagnostic_test.go", "internal/graph/store_sqlite/wal_reclaim.go", "go.mod", "go.sum"):
+              print("SOURCE_SHA256", name, hashlib.sha256(Path(name).read_bytes()).hexdigest())
+          PYENV
+      - name: Build as required CI
+        run: go build -o gortex ./cmd/gortex/
+      # The matrix jobs are independent hosts, not a matched throughput benchmark.
+      # Each retains the full original 45-minute package limit and its own failure.
+      - name: Run original store-0 with declared temp placement
+        shell: bash
+        env:
+          TEST_PARTITION: store-0
+          TEST_WINDOWS: 'true'
+          STORAGE_PLACEMENT: ${{ matrix.placement }}
+        run: |
+          python - <<'PYTEST'
+          import os
+          import subprocess
+          from pathlib import Path
+          if os.environ["STORAGE_PLACEMENT"] == "runner-scratch":
+              scratch = Path(os.environ["RUNNER_TEMP"]) / "gortex-storage-tests"
+              scratch.mkdir(parents=True, exist_ok=True)
+              os.environ["GOTMPDIR"] = str(scratch)
+          print("EFFECTIVE_GOTMPDIR", repr(os.environ.get("GOTMPDIR")), flush=True)
+          subprocess.run(["python", "scripts/ci-test-partition.py"], check=True)
+          PYTEST
+      - name: Preserve compiled membership regardless of test result
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PYCOVER'
+          import hashlib
+          import json
+          from pathlib import Path
+          path = Path("test-selection.json")
+          assert path.exists(), "compiled selection was not produced"
+          manifest = json.loads(path.read_text())
+          assert manifest["partition"] == "store-0"
+          required = "TestWALReclaimResetsUnderReadersLongerThanTheDrain"
+          assert required in manifest["census"], "LongDrain absent from compiled census"
+          assert required in manifest["shards"][0], "LongDrain moved out of the selected shard"
+          print("LONG_DRAIN_COMPILED_MEMBERSHIP", json.dumps({"census": len(manifest["census"]), "store0": len(manifest["shards"][0]), "name": required, "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}))
+          PYCOVER

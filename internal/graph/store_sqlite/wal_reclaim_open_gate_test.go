@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ func runLongReaderChurn(t *testing.T, skipOpenGate bool, writes int64) (WALRecla
 	s, path := openWALReclaimStore(t)
 	if diag != nil {
 		diag.store.Store(s)
+		t.Logf("long-reader storage placement db=%q os_temp=%q GOTMPDIR=%q TEMP=%q TMP=%q RUNNER_TEMP=%q", path, os.TempDir(), os.Getenv("GOTMPDIR"), os.Getenv("TEMP"), os.Getenv("TMP"), os.Getenv("RUNNER_TEMP"))
 	}
 	defer func() { _ = s.Close() }()
 	seedWALChurnTable(t, s)
@@ -36,6 +38,9 @@ func runLongReaderChurn(t *testing.T, skipOpenGate bool, writes int64) (WALRecla
 	churn := startWALChurn(t, s, path, 4, 500*time.Millisecond, 1200*time.Millisecond)
 	churn.runUntil(t, writes, 90*time.Second)
 	churn.halt(t)
+	if diag != nil {
+		t.Logf("long-reader physical peak bytes=%d sampled_at_unix_ns=%d final_completed_writes=%d", churn.maxWAL.Load(), churn.maxWALAt.Load(), churn.writes.Load())
+	}
 	stats := s.WALReclaimStats()
 	p50, p99, maxLat, n := churn.latencies()
 	t.Logf("skip_open_gate=%v writes=%d wal_final=%.1fMiB wal_max=%.1fMiB resets=%d open_gate_resets=%d deferrals=%d attempts=%d pause_n=%d pause_max=%s reader_waits=%d reader_wait_max=%s writer_hold_max=%s read_lat p50=%s p99=%s max=%s n=%d",

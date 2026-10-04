@@ -26,22 +26,46 @@ type windowsWALEvent struct {
 	reader               int64
 	sleep                SQLiteSleepMark
 }
+
+// Constant-size summaries retain late slow spans even after the event buffer fills.
+// xSync spans include the existing before-observer callback; no delay is injected.
+type windowsWALCreditInterval struct {
+	from, to              time.Time
+	tls                   uintptr
+	file                  int
+	gateBefore, gateAfter bool
+	errBefore, errAfter   error
+}
+
+type windowsWALCreditSummary struct {
+	count   int64
+	total   time.Duration
+	longest windowsWALCreditInterval
+	latest  windowsWALCreditInterval
+}
+
 type windowsWALDiagnostic struct {
-	t                  *testing.T
-	store              atomic.Pointer[Store]
-	mu                 sync.Mutex
-	events             []windowsWALEvent
-	dropped            int
-	cost               time.Duration
-	stop, joined       chan struct{}
-	stack              []byte
-	stackAt            time.Time
-	stackCost          time.Duration
-	finishRestore      func()
-	initialSleep       SQLiteSleepMark
-	creditScopeStarted atomic.Int64
-	creditEvents       []string
-	creditDropped      int
+	t                      *testing.T
+	store                  atomic.Pointer[Store]
+	mu                     sync.Mutex
+	events                 []windowsWALEvent
+	dropped                int
+	cost                   time.Duration
+	stop, joined           chan struct{}
+	stack                  []byte
+	stackAt                time.Time
+	stackCost              time.Duration
+	finishRestore          func()
+	initialSleep           SQLiteSleepMark
+	creditScopeStarted     atomic.Int64
+	creditEvents           []string
+	creditDropped          int
+	creditSyncSummary      [3]windowsWALCreditSummary // other, main, WAL
+	creditScopeSummary     windowsWALCreditSummary
+	lateStack              []byte
+	lateStackAt            time.Time
+	lateStackCost          time.Duration
+	lateStackCreditStarted time.Time
 }
 
 // The optional reader hook is copied once before the reader goroutines start.
@@ -159,6 +183,13 @@ func (d *windowsWALDiagnostic) install() {
 					n := runtime.Stack(b, true)
 					d.stack, d.stackAt, d.stackCost = b[:n], began, time.Since(began)
 				}
+				if at := d.creditScopeStarted.Load(); at != 0 && d.lateStack == nil && time.Since(time.Unix(0, at)) > 5*time.Second {
+					began := time.Now()
+					b := make([]byte, 128<<10)
+					n := runtime.Stack(b, true)
+					d.lateStack, d.lateStackAt, d.lateStackCost = b[:n], began, time.Since(began)
+					d.lateStackCreditStarted = time.Unix(0, at)
+				}
 				if a.ctx.Err() != nil {
 					if canceledSince.IsZero() {
 						canceledSince = time.Now()
@@ -201,6 +232,24 @@ func (d *windowsWALDiagnostic) finish() {
 		d.t.Logf("credit PASSIVE VFS diagnostic: %s", e)
 	}
 	d.t.Logf("credit PASSIVE VFS diagnostic dropped=%d; write counters are process-wide, not per-connection", d.creditDropped)
+	for file, summary := range d.creditSyncSummary {
+		if summary.count == 0 {
+			continue
+		}
+		last := summary.latest
+		d.t.Logf("credit PASSIVE retained latest xSync file=%d tls=%x from=%s to=%s elapsed=%s gate_before=%v gate_after=%v ctx_before=%v ctx_after=%v", file, last.tls, last.from.UTC().Format(time.RFC3339Nano), last.to.UTC().Format(time.RFC3339Nano), last.to.Sub(last.from), last.gateBefore, last.gateAfter, last.errBefore, last.errAfter)
+		span := summary.longest
+		d.t.Logf("credit PASSIVE retained xSync summary file=%d count=%d total=%s longest=%s tls=%x from=%s to=%s gate_before=%v gate_after=%v ctx_before=%v ctx_after=%v; includes before-observer callback, no injected delay", file, summary.count, summary.total, span.to.Sub(span.from), span.tls, span.from.UTC().Format(time.RFC3339Nano), span.to.UTC().Format(time.RFC3339Nano), span.gateBefore, span.gateAfter, span.errBefore, span.errAfter)
+	}
+	if summary := d.creditScopeSummary; summary.count > 0 {
+		last := summary.latest
+		d.t.Logf("credit PASSIVE retained latest scope tls=%x from=%s to=%s elapsed=%s ctx_after=%v; may include shutdown/cancelled calls", last.tls, last.from.UTC().Format(time.RFC3339Nano), last.to.UTC().Format(time.RFC3339Nano), last.to.Sub(last.from), last.errAfter)
+		span := summary.longest
+		d.t.Logf("credit PASSIVE retained scope summary count=%d total=%s longest=%s tls=%x from=%s to=%s ctx_after=%v; scope includes SQL and possible write-gate readmission, not a SQL-only duration", summary.count, summary.total, span.to.Sub(span.from), span.tls, span.from.UTC().Format(time.RFC3339Nano), span.to.UTC().Format(time.RFC3339Nano), span.errAfter)
+	}
+	if len(d.lateStack) > 0 {
+		d.t.Logf("WAL one-shot late credit-scope stack at=%s sampled_credit_start=%s cost=%s bytes=%d buffer_bytes=%d; scope was live at trigger, may end during capture\n%s", d.lateStackAt.UTC().Format(time.RFC3339Nano), d.lateStackCreditStarted.UTC().Format(time.RFC3339Nano), d.lateStackCost, len(d.lateStack), 128<<10, d.lateStack)
+	}
 	if len(d.stack) > 0 {
 		d.t.Logf("WAL one-shot long-credit-scope-or-canceled-still-active stack at=%s cost=%s\n%s", d.stackAt.Format(time.RFC3339Nano), d.stackCost, d.stack)
 	}
@@ -233,10 +282,26 @@ func (d *windowsWALDiagnostic) installCreditVFSObservation() {
 			return delegate(ctx, store, db)
 		}
 		state := &reclaimSyncStall{tls: tls}
+		var beforeSync [3]windowsWALCreditInterval
 		state.beforeSync = func(file int) {
+			index := file
+			if index < 0 || index >= len(beforeSync) {
+				index = 0
+			}
+			beforeSync[index] = windowsWALCreditInterval{tls: tls, file: file, gateBefore: store.writeMu.held(), errBefore: ctx.Err()}
 			d.creditRecord("sync entry tls=%x file=%d at=%s sampled_go_write_gate_held=%v operation_ctx_err=%v", tls, file, time.Now().UTC().Format(time.RFC3339Nano), store.writeMu.held(), ctx.Err())
 		}
 		state.afterSync = func(file int, from, to time.Time) {
+			index := file
+			if index < 0 || index >= len(beforeSync) {
+				index = 0
+			}
+			span := beforeSync[index]
+			span.from, span.to = from, to
+			span.gateAfter, span.errAfter = store.writeMu.held(), ctx.Err()
+			d.mu.Lock()
+			d.creditSyncSummary[index].add(span)
+			d.mu.Unlock()
 			d.creditRecord("sync return tls=%x file=%d from=%s to=%s elapsed=%s sampled_go_write_gate_held=%v operation_ctx_err=%v", tls, file, from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano), to.Sub(from), store.writeMu.held(), ctx.Err())
 		}
 		if !reclaimSyncStallState.CompareAndSwap(nil, state) {
@@ -249,6 +314,10 @@ func (d *windowsWALDiagnostic) installCreditVFSObservation() {
 		d.creditRecord("credit scope entry tls=%x at=%s", tls, started.UTC().Format(time.RFC3339Nano))
 		d.creditScopeStarted.Store(started.UnixNano())
 		return conn, func() {
+			ended := time.Now()
+			d.mu.Lock()
+			d.creditScopeSummary.add(windowsWALCreditInterval{from: started, to: ended, tls: tls, errAfter: ctx.Err()})
+			d.mu.Unlock()
 			d.creditScopeStarted.Store(0)
 			d.creditRecord("credit scope return tls=%x at=%s elapsed=%s process_wide_IO=%+v", tls, time.Now().UTC().Format(time.RFC3339Nano), time.Since(started), vfsIOMark().Since(before))
 			reclaimSyncStallState.CompareAndSwap(state, nil)
@@ -264,5 +333,15 @@ func (d *windowsWALDiagnostic) creditRecord(format string, args ...any) {
 		d.creditEvents = append(d.creditEvents, fmt.Sprintf(format, args...))
 	} else {
 		d.creditDropped++
+	}
+}
+
+func (summary *windowsWALCreditSummary) add(span windowsWALCreditInterval) {
+	elapsed := span.to.Sub(span.from)
+	summary.count++
+	summary.latest = span
+	summary.total += elapsed
+	if summary.count == 1 || elapsed > summary.longest.to.Sub(summary.longest.from) {
+		summary.longest = span
 	}
 }
