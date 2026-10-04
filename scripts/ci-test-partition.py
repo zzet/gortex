@@ -11,6 +11,7 @@ from pathlib import Path
 
 SHARDS = 3
 NAME_BUNDLE = 32
+WINDOWS_COMMAND_BUDGET = 30000
 LARGE_PACKAGES = {
     "store": "/internal/graph/store_sqlite",
     "indexer": "/internal/indexer",
@@ -62,7 +63,7 @@ def exact_pattern(names):
     return "^(?:" + render(trie) + ")$"
 
 
-def plan_shards(names):
+def plan_shards(names, bundle_size=NAME_BUNDLE):
     # Small adjacent bundles share enough prefixes for Windows command lines,
     # while round-robin assignment spreads name families across every runner.
     # Capacity limits keep the top-level case counts balanced to one case.
@@ -70,8 +71,8 @@ def plan_shards(names):
                for index in range(SHARDS)]
     assignments = [[] for _ in range(SHARDS)]
     index = 0
-    for start in range(0, len(names), NAME_BUNDLE):
-        bundle = names[start:start + NAME_BUNDLE]
+    for start in range(0, len(names), bundle_size):
+        bundle = names[start:start + bundle_size]
         while bundle:
             count = min(len(bundle), targets[index] - len(assignments[index]))
             assignments[index].extend(bundle[:count])
@@ -93,12 +94,36 @@ def plan_shards(names):
     return assignments, patterns
 
 
+def command_units(command):
+    return len(subprocess.list2cmdline(command).encode("utf-16-le")) // 2
+
+
+def plan_shard_commands(names, census_prefix, test_prefix, package, windows_api=None):
+    # Keep existing membership when it fits. Larger adjacent bundles retain
+    # exact coverage and balance while factoring more shared name prefixes.
+    if windows_api is None:
+        windows_api = os.name == "nt"
+    bundle_size = NAME_BUNDLE
+    while True:
+        assignments, patterns = plan_shards(names, bundle_size)
+        commands = [prefix + [flag, pattern, package]
+                    for pattern in patterns
+                    for prefix, flag in ((census_prefix, "-list"), (test_prefix, "-run"))]
+        if not windows_api or all(command_units(command) <= WINDOWS_COMMAND_BUDGET
+                                  for command in commands):
+            return assignments, patterns, bundle_size
+        if bundle_size >= len(names):
+            raise ValueError("no balanced factored shard plan fits Windows budget: "
+                             + str(max(map(command_units, commands))))
+        bundle_size = min(bundle_size * 2, len(names))
+
+
 def guard_command(command):
     # Reserve room for Go's own test-binary flags and path below CreateProcess's
     # 32,767 UTF-16 code-unit limit on Windows. Other platforms do not use
     # CreateProcess. Never drop names to make an argument fit.
-    units = len(subprocess.list2cmdline(command).encode("utf-16-le")) // 2
-    if os.name == "nt" and units > 30000:
+    units = command_units(command)
+    if os.name == "nt" and units > WINDOWS_COMMAND_BUDGET:
         raise ValueError(f"factored test command exceeds Windows budget: {units}")
     return units
 
@@ -135,7 +160,8 @@ def main():
             raise ValueError("a test shard must own exactly one package")
         census_command = ["go", "test"] + ([] if windows else ["-race"]) + ["-list", ".", selected[0]]
         names = test_names(capture(census_command))
-        assignments, patterns = plan_shards(names)
+        assignments, patterns, bundle_size = plan_shard_commands(
+            names, census_command[:-3], command, selected[0])
         # Verify the Python-generated expressions with Go's own test matcher.
         # The per-platform compiled census is the authority for all three.
         for pattern in patterns:
@@ -147,7 +173,8 @@ def main():
                 raise ValueError(f"Go matcher disagrees with shard {index}")
         index = int(args.partition.rsplit("-", 1)[1])
         command += ["-run", patterns[index]]
-        manifest.update(census=names, shards=assignments, patterns=patterns)
+        manifest.update(census=names, shards=assignments, patterns=patterns,
+                        name_bundle=bundle_size)
         print(f"{selected[0]}: {len(names)} compiled tests/examples/fuzz seeds; "
               f"shards={[len(shard) for shard in assignments]}; selected={index}", flush=True)
     command += selected
