@@ -767,6 +767,12 @@ func (s *Store) searchSymbolsPathScopedContext(ctx context.Context, query string
 		}
 	}
 
+	if s.viewGen == baseViewGeneration && len(pathPrefixes) == 0 && len(repoAllow) == 1 {
+		if hits, handled, err := s.searchSymbolRepoSpanPlan(ctx, match, repoAllow[0], limit); handled {
+			return hits, err
+		}
+	}
+
 	// symbol_fts is one shared virtual table across every generation, so the
 	// MATCH alone would rank rows this handle cannot see. The rowid map carries
 	// the generation and its symbol_fts_rowid_by_rowid index is UNIQUE on
