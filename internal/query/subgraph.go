@@ -288,6 +288,8 @@ type SearchTimings struct {
 	TextBackendMS  int64 // strictly inside Backend.Search / text channel
 	EmbedMS        int64 // inside embedder.Embed (vector path only)
 	VectorSearchMS int64 // inside vector.Search ANN call (vector path only)
+	RerankInner    rerank.Timing
+	RerankOuter    rerank.Timing
 	EngineRerankMS int64 // inside rerank.Pipeline.Rerank in SearchSymbolsRanked
 	// BundleMS accumulates the wall-clock spent inside
 	// SymbolBundleSearcherBackend.SearchSymbolBundles (one query per

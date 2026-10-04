@@ -32,6 +32,10 @@ type CentralityResult struct {
 // All fields are optional; signals must gracefully degrade when a
 // data source is absent. The zero value is a valid Context.
 type Context struct {
+	// ObserveTiming receives request-local costs without changing ranking or reads.
+	// Nil leaves clock/count collection disabled.
+	ObserveTiming func(Timing)
+
 	// Graph is the indexed knowledge graph reader. Required for any
 	// signal that reads node metadata or walks edges (FanIn, FanOut,
 	// MinHash). When nil, those signals contribute 0. Held as the
@@ -408,6 +412,8 @@ func (c *Context) now() int64 {
 // were already gathered server-side; a second round-trip here would
 // pure-overhead the win.
 func (c *Context) prepare(cands []*Candidate) {
+	observer := c.ObserveTiming
+	timing := newPrepareTiming(observer)
 	c.preparedCands = cands
 	c.communityCount = make(map[string]int, len(cands))
 	c.maxCommunityCount = 0
@@ -439,9 +445,16 @@ func (c *Context) prepare(cands []*Candidate) {
 		c.candidateIDs[cand.Node.ID] = struct{}{}
 		ids = append(ids, cand.Node.ID)
 	}
+	if timing != nil {
+		timing.Candidates = len(ids)
+		timing.mark(&timing.Bookkeeping)
+	}
 	c.analysisMetrics = nil
 	if c.AnalysisMetricsOf != nil && len(ids) > 0 {
 		c.analysisMetrics = c.AnalysisMetricsOf(ids)
+		if timing != nil {
+			timing.mark(&timing.Metrics)
+		}
 	}
 
 	// Populate the non-edge scratch fields from the candidate batch.
@@ -518,24 +531,56 @@ func (c *Context) prepare(cands []*Candidate) {
 		if c.EdgeBatches != nil {
 			batches = c.EdgeBatches
 		}
+		if timing != nil {
+			timing.MissingOut = len(missingOut)
+			timing.MissingIn = len(missingIn)
+			timing.mark(&timing.Bookkeeping)
+		}
 		if len(missingOut) > 0 {
+			if timing != nil {
+				timing.mark(&timing.Bookkeeping)
+			}
 			fetched := batches.GetOutEdgesByNodeIDs(missingOut)
+			if timing != nil {
+				timing.mark(&timing.Outgoing)
+			}
 			if c.outEdgeCache == nil {
 				c.outEdgeCache = make(map[string][]*graph.Edge, len(fetched))
 			}
 			for id, es := range fetched {
 				c.outEdgeCache[id] = es
+				if timing != nil {
+					timing.OutRows += len(es)
+				}
+			}
+			if timing != nil {
+				timing.mark(&timing.MergeFan)
 			}
 		}
 		if len(missingIn) > 0 {
+			if timing != nil {
+				timing.mark(&timing.Bookkeeping)
+			}
 			fetched := batches.GetInEdgesByNodeIDs(missingIn)
+			if timing != nil {
+				timing.mark(&timing.Incoming)
+			}
 			if c.inEdgeCache == nil {
 				c.inEdgeCache = make(map[string][]*graph.Edge, len(fetched))
 			}
 			for id, es := range fetched {
 				c.inEdgeCache[id] = es
+				if timing != nil {
+					timing.InRows += len(es)
+				}
+			}
+			if timing != nil {
+				timing.mark(&timing.MergeFan)
 			}
 		}
+	}
+	if timing != nil {
+		timing.mark(&timing.Bookkeeping)
 	}
 	for _, id := range ids {
 		if fi := len(c.inEdgeCache[id]); fi > c.fanInMax {
@@ -546,11 +591,18 @@ func (c *Context) prepare(cands []*Candidate) {
 		}
 	}
 
+	if timing != nil {
+		timing.mark(&timing.MergeFan)
+	}
 	// Centrality: one Random-Walk-with-Restart per Rerank, seeded from
 	// the strongest candidates, scored over the whole batch. Computed
 	// here (not per-candidate) so the walk runs once; ProximitySignal
 	// then reads the per-node result. Skipped when no provider is wired.
 	c.computeCentrality(cands)
+	if timing != nil {
+		timing.mark(&timing.Centrality)
+	}
+	timing.finish(observer)
 }
 
 func (c *Context) communityFor(nodeID string) string {

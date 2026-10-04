@@ -2038,6 +2038,15 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		loadingClass = rerank.QueryClassKeywordSoup
 	}
 	rctx := s.buildSymbolRerankContext(ctx, q, loadingClass)
+	if s.logger != nil && s.logger.Core().Enabled(zap.DebugLevel) {
+		rctx.ObserveTiming = func(timing rerank.Timing) {
+			if timing.Stage == rerank.TimingInner {
+				timings.RerankInner.Add(timing)
+			} else {
+				timings.RerankOuter.Add(timing)
+			}
+		}
+	}
 	scope.RerankContext = rctx
 
 	// Corpus selection: `code` (default) keeps only code symbols,
@@ -2598,7 +2607,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// the engine), rerank prepare (batched edge fetch) and signals
 	// (in-process scoring), diversify, and the candidate counts at
 	// gather → filter → final.
-	if s.logger != nil {
+	if s.logger != nil && s.logger.Core().Enabled(zap.DebugLevel) {
 		totalMS := time.Since(phaseStart).Milliseconds()
 		// "BM25 backend" cost = the BM25 wall-clock minus the inner
 		// phases the engine also accumulated under that call. Negative
@@ -2637,6 +2646,8 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			zap.Int64("get_nodes_ms", timings.GetNodesMS),
 			zap.Int64("find_name_ms", timings.FindNameMS),
 			zap.Int64("fallback_ms", timings.FallbackMS),
+			zap.Any("rerank_inner", symbolRerankTimingFields(timings.RerankInner)),
+			zap.Any("rerank_outer", symbolRerankTimingFields(timings.RerankOuter)),
 			zap.Float64("rerank_prepare_ms", float64(rerankPrepare)/float64(time.Millisecond)),
 			zap.Float64("rerank_signals_ms", float64(rerankSignals)/float64(time.Millisecond)),
 			zap.Int64("diversify_ms", diversifyMS),

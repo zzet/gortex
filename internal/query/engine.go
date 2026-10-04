@@ -706,6 +706,13 @@ func (e *Engine) SearchSymbolsRankedContext(ctx context.Context, query string, l
 		if rctx == nil && opts.RerankContext != nil {
 			rerankCtx.InheritEdgeCacheFrom(opts.RerankContext)
 		}
+		if observer := rerankCtx.ObserveTiming; observer != nil {
+			rerankCtx.ObserveTiming = func(timing rerank.Timing) {
+				timing.Stage = rerank.TimingInner
+				observer(timing)
+			}
+			defer func() { rerankCtx.ObserveTiming = observer }()
+		}
 		rerankStart := time.Now()
 		e.rerank.Rerank(query, cands, rerankCtx)
 		if ctx.Err() != nil {
