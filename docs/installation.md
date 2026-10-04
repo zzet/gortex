@@ -30,7 +30,7 @@ Homebrew strips the `homebrew-` prefix from tap repositories, so `zzet/homebrew-
 irm https://get.gortex.dev/install.ps1 | iex
 ```
 
-Detects the architecture, downloads the signed `gortex_windows_amd64.zip`, verifies the SHA256 against `checksums.txt`, installs `gortex.exe` to `%LOCALAPPDATA%\Programs\gortex`, and adds that directory to your user `PATH`. Re-runs upgrade in place and back up the previous binary as `gortex.exe.previous`.
+Detects the architecture, downloads the signed `gortex_windows_amd64.zip`, verifies the SHA256 against `checksums.txt`, installs `gortex.exe` to `%LOCALAPPDATA%\Programs\gortex`, and adds that directory to your user `PATH`. Re-runs upgrade in place and back up the previous binary as `gortex.exe.previous`. `gortex upgrade` recognises this install and re-runs the installer (`gortex upgrade --run` executes it through `powershell`; pass a version to pin one).
 
 Override defaults via environment variables: `GORTEX_VERSION=v0.15.0` (pin a version), `GORTEX_INSTALL_DIR` (custom install directory), `GORTEX_NO_PATH=1` (skip the PATH update), `GORTEX_NO_VERIFY=1` (skip checksum verification), `GORTEX_FORCE=1` (overwrite without backup). Source: [`scripts/install.ps1`](../scripts/install.ps1).
 

@@ -144,9 +144,16 @@ func TestAbandonedCallReportsCommittedDiskWrite(t *testing.T) {
 	target := filepath.Join(dir, "landed.go")
 
 	s := newMutationServer()
-	s.ToolCallTimeout = 150 * time.Millisecond
+	// The deadline must fire after the commit, and it starts before the
+	// handler runs, so the budget has to cover the atomic write. A 150ms
+	// budget lost that race on a slow Windows runner and the answer correctly
+	// said the write was still in flight. Two seconds is a wide margin over one
+	// small write.
+	s.ToolCallTimeout = 2 * time.Second
 
 	committed := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
 	handler := func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		record, err := s.commitFileMutation(ctx, "write_file", "", "fp", "landed.go", target,
 			[]byte("package p\n"), 0o644)
@@ -156,7 +163,9 @@ func TestAbandonedCallReportsCommittedDiskWrite(t *testing.T) {
 		// Stand in for the post-commit graph refresh that outran the budget:
 		// mutationReindexState can fall through to a synchronous, contextless
 		// IncrementalReindexRepo, which is where the reporter's 59s went.
-		time.Sleep(500 * time.Millisecond)
+		// Holding until the test has its answer keeps the handler running
+		// past the deadline however fast or slow the runner is.
+		<-release
 		return mcp.NewToolResultText("applied"), nil
 	}
 

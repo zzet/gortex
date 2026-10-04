@@ -59,6 +59,12 @@ func TestPurgeBinaryNoteByMethod(t *testing.T) {
 	assert.Contains(t, purgeBinaryNote(purgePlan{binary: "/x/gortex", binMethod: InstallScoop}), "scoop uninstall")
 	assert.Contains(t, purgeBinaryNote(purgePlan{binary: "/x/gortex", binMethod: InstallGoInstall}), "/x/gortex")
 	assert.Contains(t, purgeBinaryNote(purgePlan{binary: "/x/gortex", binMethod: InstallUnknown}), "manually")
+	// install.ps1: a running .exe can't be deleted on Windows, so purge
+	// advises — naming the folder and the PATH entry the installer added.
+	ps := purgePlan{binary: filepath.Join("x", "gortex", "gortex.exe"), binMethod: InstallScriptPS}
+	assert.False(t, ps.binaryRemovable())
+	assert.Contains(t, purgeBinaryNote(ps), filepath.Join("x", "gortex"))
+	assert.Contains(t, purgeBinaryNote(ps), "user PATH")
 	assert.Equal(t, "", purgeBinaryNote(purgePlan{binary: "", binMethod: InstallBrew}))
 }
 
