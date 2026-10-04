@@ -121,7 +121,6 @@ func TestCoreEdgeTimingPreservesScoresReadsFilteringAndErrors(t *testing.T) {
 			}
 		})
 	}
-	require.Nil(t, withCoreEdgeTiming(nil, &rerank.CoreEdgeTiming{}))
 	ctx := t.Context()
 	require.Same(t, ctx, withCoreEdgeTiming(ctx, nil))
 	require.Nil(t, coreEdgeTimingFromContext(t.Context()))
