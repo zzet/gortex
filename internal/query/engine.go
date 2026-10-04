@@ -896,15 +896,19 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 	}
 	if bundleCapable {
 		bundleStart := time.Now()
+		bundleCtx := ctx
+		if timings != nil {
+			bundleCtx = search.WithSymbolBundleTimingsObserver(ctx, timings.BundleLegs.Add)
+		}
 		var answer requestBundleAnswer
 		if len(opts.SearchPathPrefixes) > 0 && !viewLayered && e.overlay == nil {
-			answer = requestPathScopedSymbolBundles(ctx, backend, query, repoAllowList(opts.RepoAllow), opts.SearchPathPrefixes, limit*2)
+			answer = requestPathScopedSymbolBundles(bundleCtx, backend, query, repoAllowList(opts.RepoAllow), opts.SearchPathPrefixes, limit*2)
 		}
 		if allow := repoAllowList(opts.RepoAllow); !answer.authoritative && len(allow) > 0 {
-			answer = requestScopedSymbolBundles(ctx, backend, query, allow, limit*2)
+			answer = requestScopedSymbolBundles(bundleCtx, backend, query, allow, limit*2)
 		}
 		if !answer.authoritative {
-			answer = requestSymbolBundles(ctx, backend, query, limit*2)
+			answer = requestSymbolBundles(bundleCtx, backend, query, limit*2)
 		}
 		bundles := answer.bundles
 		scopedAnswered := answer.authoritative && len(repoAllowList(opts.RepoAllow)) > 0

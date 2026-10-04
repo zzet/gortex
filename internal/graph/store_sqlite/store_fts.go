@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/search"
@@ -940,14 +941,23 @@ func (s *Store) SearchSymbolBundles(query string, limit int) ([]graph.SymbolBund
 // propagated through the ranked symbol query. Bundle hydration retains its
 // existing batched-read contract and starts only while the request is live.
 func (s *Store) SearchSymbolBundlesContext(ctx context.Context, query string, limit int) ([]graph.SymbolBundle, error) {
+	stats, observe := bundleTimingsForContext(ctx)
+	if observe != nil {
+		defer func() { observe(*stats) }()
+	}
+	rankStart := bundleLegStart(stats)
 	hits, err := s.SearchSymbolsContext(ctx, query, limit)
+	if stats != nil {
+		stats.RankMS = bundleLegMS(rankStart)
+		stats.RankedHits = len(hits)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return s.bundlesForHits(hits)
+	return s.bundlesForHits(hits, stats)
 }
 
 // SearchSymbolBundlesRepoScoped is SearchSymbolBundles over the
@@ -960,19 +970,28 @@ func (s *Store) SearchSymbolBundlesRepoScoped(query string, repoAllow []string, 
 // SearchSymbolBundlesRepoScopedContext is SearchSymbolBundlesRepoScoped with
 // request cancellation propagated through the repository-scoped FTS query.
 func (s *Store) SearchSymbolBundlesRepoScopedContext(ctx context.Context, query string, repoAllow []string, limit int) ([]graph.SymbolBundle, error) {
+	stats, observe := bundleTimingsForContext(ctx)
+	if observe != nil {
+		defer func() { observe(*stats) }()
+	}
+	rankStart := bundleLegStart(stats)
 	hits, err := s.SearchSymbolsRepoScopedContext(ctx, query, repoAllow, limit)
+	if stats != nil {
+		stats.RankMS = bundleLegMS(rankStart)
+		stats.RankedHits = len(hits)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return s.bundlesForHits(hits)
+	return s.bundlesForHits(hits, stats)
 }
 
 // bundlesForHits materialises ranked hits into SymbolBundles through
 // the content-addressed cache + batched node/edge fetches.
-func (s *Store) bundlesForHits(hits []graph.SymbolHit) ([]graph.SymbolBundle, error) {
+func (s *Store) bundlesForHits(hits []graph.SymbolHit, stats *search.SymbolBundleTimings) ([]graph.SymbolBundle, error) {
 	if len(hits) == 0 {
 		return nil, nil
 	}
@@ -1012,14 +1031,39 @@ func (s *Store) bundlesForHits(hits []graph.SymbolHit) ([]graph.SymbolBundle, er
 		}
 	}
 
+	if stats != nil {
+		stats.UniqueIDs = len(ids)
+		stats.CacheHits = len(cached)
+		stats.CacheMisses = len(missIDs)
+	}
+
 	// Fetch the misses' nodes + in/out edges in one batched round-trip
 	// each. A full cache hit skips all three fetches entirely.
 	var nodes map[string]*graph.Node
 	var out, in map[string][]*graph.Edge
 	if len(missIDs) > 0 {
+		legStart := bundleLegStart(stats)
 		nodes = s.GetNodesByIDs(missIDs)
+		if stats != nil {
+			stats.NodeMS = bundleLegMS(legStart)
+			stats.NodeRows = len(nodes)
+		}
+		legStart = bundleLegStart(stats)
 		out = s.GetOutEdgesByNodeIDs(missIDs)
+		if stats != nil {
+			stats.OutMS = bundleLegMS(legStart)
+			for _, rows := range out {
+				stats.OutRows += len(rows)
+			}
+		}
+		legStart = bundleLegStart(stats)
 		in = s.GetInEdgesByNodeIDs(missIDs)
+		if stats != nil {
+			stats.InMS = bundleLegMS(legStart)
+			for _, rows := range in {
+				stats.InRows += len(rows)
+			}
+		}
 	}
 
 	bundles := make([]graph.SymbolBundle, 0, len(ids))
@@ -1074,14 +1118,23 @@ func isIdentifierQuery(q string) bool {
 // LIMIT and bundle hydration. Prefixes use literal, case-sensitive slash-boundary
 // matching, exactly as the MCP repo-relative path predicate does.
 func (s *Store) SearchSymbolBundlesPathScopedContext(ctx context.Context, query string, repos, paths []string, limit int) ([]graph.SymbolBundle, error) {
+	stats, observe := bundleTimingsForContext(ctx)
+	if observe != nil {
+		defer func() { observe(*stats) }()
+	}
+	rankStart := bundleLegStart(stats)
 	hits, err := s.searchSymbolsPathScopedContext(ctx, query, repos, paths, limit)
+	if stats != nil {
+		stats.RankMS = bundleLegMS(rankStart)
+		stats.RankedHits = len(hits)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if ctx != nil && ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	return s.bundlesForHits(hits)
+	return s.bundlesForHits(hits, stats)
 }
 
 func symbolPathAllowed(filePath, repo string, paths []string) bool {
@@ -1112,4 +1165,22 @@ func symbolPathPredicate(paths []string) (string, []any) {
 		args = append(args, path, path, path)
 	}
 	return strings.Join(clauses, " OR "), args
+}
+
+// Observers are installed only for the engine's existing request timing record.
+func bundleTimingsForContext(ctx context.Context) (*search.SymbolBundleTimings, func(search.SymbolBundleTimings)) {
+	observe := search.SymbolBundleTimingsObserver(ctx)
+	if observe == nil {
+		return nil, nil
+	}
+	return &search.SymbolBundleTimings{Calls: 1}, observe
+}
+func bundleLegStart(stats *search.SymbolBundleTimings) time.Time {
+	if stats == nil {
+		return time.Time{}
+	}
+	return time.Now()
+}
+func bundleLegMS(start time.Time) float64 {
+	return float64(time.Since(start)) / float64(time.Millisecond)
 }

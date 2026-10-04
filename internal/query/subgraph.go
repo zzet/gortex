@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/search/rerank"
 )
 
@@ -296,6 +297,8 @@ type SearchTimings struct {
 	// derivation in the handler subtracts BundleMS so the existing
 	// fields stay meaningful.
 	BundleMS int64
+	// BundleLegs accumulates observed SQLite bundle legs across this request.
+	BundleLegs search.SymbolBundleTimings
 	// CacheHitRate is the fraction of post-merge candidates whose
 	// in/out edges were already in the rerank Context cache when the
 	// handler-side prepare() ran. 1.0 means every candidate was
