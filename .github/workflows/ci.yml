@@ -45,7 +45,18 @@ jobs:
           TEST_WINDOWS: ${{ matrix.os == 'windows-latest' }}
         run: |
           if [[ "$TEST_WINDOWS" == true ]]; then
-            python scripts/ci-test-partition.py
+            python - <<'PY_WINDOWS_TESTS'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          scratch = Path(os.environ["RUNNER_TEMP"]) / "gortex-storage-tests"
+          scratch.mkdir(parents=True, exist_ok=True)
+          os.environ["GOTMPDIR"] = str(scratch)
+          print("Windows test GOTMPDIR:", scratch, flush=True)
+          sys.exit(subprocess.call([sys.executable, "scripts/ci-test-partition.py"]))
+          PY_WINDOWS_TESTS
           else
             python3 scripts/ci-test-partition.py
           fi
