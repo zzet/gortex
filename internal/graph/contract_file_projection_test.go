@@ -126,3 +126,35 @@ func TestContractFileProjectionRefusesOrphanOwnershipInsteadOfRevivingScalar(t *
 	require.ErrorIs(t, err, ErrContractProjectionIncomplete)
 	require.Equal(t, ContractFileProjection{}, p)
 }
+
+func TestContractSourceNodesContextKeepsCurrentDeclarationsAndMasks(t *testing.T) {
+	base := New()
+	old := &Node{ID: "a.go::handler", Kind: KindFunction, FilePath: "a.go", Name: "handler"}
+	base.AddNode(old)
+	layer := NewOverlayLayer()
+	current := &Node{ID: old.ID, Kind: KindFunction, FilePath: old.FilePath, Name: old.Name, Meta: map[string]any{"body": "current"}}
+	layer.MarkFile("a.go", false)
+	layer.AddNode("a.go", current)
+	view := NewOverlaidViewWithLayer(base, layer)
+	nodes, err := ContractSourceNodesContext(context.Background(), view, []string{old.ID})
+	require.NoError(t, err)
+	require.Same(t, current, nodes[old.ID])
+	deleted := NewOverlayLayer()
+	deleted.MarkFile("a.go", true)
+	nodes, err = ContractSourceNodesContext(context.Background(), NewOverlaidViewWithLayer(view, deleted), []string{old.ID})
+	require.NoError(t, err)
+	require.Empty(t, nodes)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	nodes, err = ContractSourceNodesContext(ctx, view, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, nodes)
+}
+
+func TestContractSourceNodesContextDropsPartialCheckedFailure(t *testing.T) {
+	sentinel := errors.New("source projection failed")
+	layer := &failedContractLayer{OverlayLayer: NewOverlayLayer(), failure: sentinel}
+	nodes, err := ContractSourceNodesContext(context.Background(), NewOverlaidViewWithLayer(New(), layer), []string{"source"})
+	require.ErrorIs(t, err, sentinel)
+	require.Nil(t, nodes)
+}

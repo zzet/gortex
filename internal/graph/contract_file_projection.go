@@ -50,6 +50,29 @@ type OverlayLayerContractProjectionReader interface {
 	LayerContractIDProjectionContext(context.Context, []string) (ContractFileProjection, error)
 }
 
+// ContractSourceNodesContext reads selected source identities without canonical
+// group hydration. Contract-only attachments use these checked, mask-aware rows
+// to resolve owners whose current declarations live in the separate core view.
+func ContractSourceNodesContext(ctx context.Context, reader Reader, ids []string) (map[string]*Node, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p, err := rawContractProjection(ctx, reader, "", nil, ids, false)
+	if err != nil {
+		return nil, err
+	}
+	if !contractProjectionWithinLimit(p) {
+		return nil, ErrContractProjectionLimit
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return p.SourceNodes, nil
+}
+
 // FilterContractFileProjection applies a generation's existing context/mask
 // serving rules without routing through errorless point readers.
 func FilterContractFileProjection(p ContractFileProjection, nodeVisible func(*Node) bool, edgeVisible func(*Edge) bool) ContractFileProjection {

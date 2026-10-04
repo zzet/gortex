@@ -97,7 +97,8 @@ type Materializer struct {
 	// diagnosable. nil silences it.
 	Logger *zap.Logger
 
-	newGenerationLayer func(context.Context, *store_sqlite.Store) (*GenerationLayer, error)
+	newGenerationLayer       func(context.Context, *store_sqlite.Store) (*GenerationLayer, error)
+	contractAttachmentReader graph.ContractAttachmentReader
 
 	// layerCache keeps each published generation's masks across requests so
 	// a view over an ancestry chain does not re-read them per request. See
@@ -125,6 +126,9 @@ type Materializer struct {
 type GenerationSource struct {
 	// Generation is the payload generation this source reads.
 	Generation int64
+	// CheckoutID is the physical input namespace recorded by the catalog,
+	// which can differ from the actor selecting a copied or inherited layer.
+	CheckoutID string
 	// Handle is pinned to Generation, so every index it queries answers
 	// with that generation's rows alone.
 	Handle *store_sqlite.Store
@@ -950,7 +954,7 @@ func (m *Materializer) assemble(
 			layer.failureRepoScoped = true
 			handles = append(handles, handle)
 			sources = append(sources, GenerationSource{
-				Generation: generationID, Handle: handle, Layer: layer,
+				Generation: generationID, CheckoutID: row.CheckoutID, Handle: handle, Layer: layer,
 			})
 		}
 		return handle, layer, row, openErr
