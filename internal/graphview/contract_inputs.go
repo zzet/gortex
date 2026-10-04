@@ -130,6 +130,12 @@ func readSelectedContractInputs(ctx context.Context, sources []contractInputSour
 		if err != nil {
 			return nil, false, err
 		}
+		if len(states) == 0 {
+			// Before the async protocol, a sealed layer could change contracts
+			// without carrying an input identity. Inherited0 cannot certify it
+			// inert, even when a newer selected layer carries a summary.
+			return nil, false, NewViewError(CodeCapabilityUnavailable, "a selected legacy layer has no certified contract input identity")
+		}
 		var selected *graph.ContractInputState
 		for _, state := range states {
 			if state.RepoPrefix != repo {

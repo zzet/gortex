@@ -96,6 +96,24 @@ func TestSelectedContractInputsCannotLaunderUnknownInheritedBaseline(t *testing.
 	require.Nil(t, capture)
 }
 
+func TestSelectedContractInputsCannotLaunderLegacyPositiveLayers(t *testing.T) {
+	store := openTestStore(t)
+	acceptPrimaryContractInput(t, store, nil, acceptedContractInput(stackRepo, "", "primary-known"))
+	root := contractInputGeneration(t, store, "commit", 0)
+	upper := contractInputGeneration(t, store, "dirty", root)
+	seedStackControlPlane(t, store, root)
+	routeStack(t, store, root, upper, store_sqlite.RouteActive)
+	m := newTestMaterializer(store)
+	view, err := m.MaterializeCheckout(t.Context(), testCheckoutID)
+	require.NoError(t, err)
+	defer view.Close()
+	require.True(t, view.ComposesBaseCorpus())
+	require.Len(t, view.GenerationSources(), 2)
+	capture, err := m.CaptureContractInputs(t.Context(), view, stackRepo, testCheckoutID)
+	require.Equal(t, CodeCapabilityUnavailable, CodeOf(err))
+	require.Nil(t, capture, "known primary baseline cannot certify either legacy positive layer contract-inert")
+}
+
 func TestSelectedContractInputsRetainCopiedActorAndRejectClaimedKeyMutation(t *testing.T) {
 	store := openTestStore(t)
 	carried := acceptedContractInput(stackRepo, "original-actor", "carried")
