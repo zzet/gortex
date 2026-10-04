@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"database/sql"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -34,6 +35,7 @@ func (s *Store) SetFileMetas(repoPrefix string, rows []graph.FileMetaRow) error 
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
+	changed := false
 	for start := 0; start < len(rows); start += fileMetaChunk {
 		end := start + fileMetaChunk
 		if end > len(rows) {
@@ -42,7 +44,7 @@ func (s *Store) SetFileMetas(repoPrefix string, rows []graph.FileMetaRow) error 
 		batch := rows[start:end]
 		args := make([]any, 0, len(batch)*7)
 		stmt := make([]byte, 0, 96+len(batch)*24)
-		stmt = append(stmt, "INSERT OR REPLACE INTO files (view_gen, repo_prefix, file_path, content_hash, size, node_count, errors) VALUES "...)
+		stmt = append(stmt, "INSERT INTO files (view_gen, repo_prefix, file_path, content_hash, size, node_count, errors) VALUES "...)
 		for i, r := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -50,11 +52,18 @@ func (s *Store) SetFileMetas(repoPrefix string, rows []graph.FileMetaRow) error 
 			stmt = append(stmt, "(?, ?, ?, ?, ?, ?, ?)"...)
 			args = append(args, s.viewGen, repoPrefix, r.FilePath, r.ContentHash, r.Size, r.NodeCount, r.Errors)
 		}
-		if _, err := tx.Exec(string(stmt), args...); err != nil {
+		stmt = append(stmt, " ON CONFLICT(view_gen, repo_prefix, file_path) DO UPDATE SET content_hash=excluded.content_hash, size=excluded.size, node_count=excluded.node_count, errors=excluded.errors WHERE files.content_hash IS NOT excluded.content_hash OR files.size IS NOT excluded.size OR files.node_count IS NOT excluded.node_count OR files.errors IS NOT excluded.errors"...)
+		result, err := tx.Exec(string(stmt), args...)
+		if err != nil {
 			return err
 		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		changed = changed || n > 0
 	}
-	return tx.Commit()
+	return s.commitConstantInput(tx, changed)
 }
 
 // ReplaceFileMetas atomically replaces the authoritative repository
@@ -69,6 +78,13 @@ func (s *Store) ReplaceFileMetas(repoPrefix string, rows []graph.FileMetaRow) er
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+	equal, err := s.fileMetaRepoEqualsTx(tx, repoPrefix, rows)
+	if err != nil {
+		return err
+	}
+	if equal {
+		return tx.Commit()
+	}
 	if _, err := tx.Exec(`DELETE FROM files WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
@@ -92,7 +108,7 @@ func (s *Store) ReplaceFileMetas(repoPrefix string, rows []graph.FileMetaRow) er
 			return err
 		}
 	}
-	return tx.Commit()
+	return s.commitConstantInput(tx, true)
 }
 
 // DeleteFileMetasByFiles drops the metadata rows for the supplied files in one
@@ -110,6 +126,7 @@ func (s *Store) DeleteFileMetasByFiles(repoPrefix string, files []string) error 
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
+	changed := false
 	for start := 0; start < len(files); start += fileMetaChunk {
 		end := start + fileMetaChunk
 		if end > len(files) {
@@ -128,11 +145,17 @@ func (s *Store) DeleteFileMetasByFiles(repoPrefix string, files []string) error 
 			args = append(args, f)
 		}
 		stmt = append(stmt, ')')
-		if _, err := tx.Exec(string(stmt), args...); err != nil {
+		result, err := tx.Exec(string(stmt), args...)
+		if err != nil {
 			return err
 		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		changed = changed || n > 0
 	}
-	return tx.Commit()
+	return s.commitConstantInput(tx, changed)
 }
 
 // FileMetasForRepo returns every recorded file row for the repo prefix.
@@ -202,4 +225,40 @@ func (s *Store) FileMetasByPaths(repoPrefix string, filePaths []string) (map[str
 		}
 	}
 	return out, nil
+}
+
+// The files inventory determines inherited constant ownership. Compare only in
+// the authoritative replacement path; bounded Set/Delete need no repository scan.
+func (s *Store) fileMetaRepoEqualsTx(tx *sql.Tx, repo string, want []graph.FileMetaRow) (bool, error) {
+	rows, err := tx.Query("SELECT file_path,content_hash,size,node_count,errors FROM files WHERE view_gen=? AND repo_prefix=?", s.viewGen, repo)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	actual := make(map[string]graph.FileMetaRow)
+	for rows.Next() {
+		var row graph.FileMetaRow
+		if err := rows.Scan(&row.FilePath, &row.ContentHash, &row.Size, &row.NodeCount, &row.Errors); err != nil {
+			return false, err
+		}
+		actual[row.FilePath] = row
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if len(actual) != len(want) {
+		return false, nil
+	}
+	seen := make(map[string]bool, len(want))
+	for _, row := range want {
+		if seen[row.FilePath] {
+			return false, nil
+		}
+		seen[row.FilePath] = true
+		old, ok := actual[row.FilePath]
+		if !ok || old != row {
+			return false, nil
+		}
+	}
+	return true, nil
 }
