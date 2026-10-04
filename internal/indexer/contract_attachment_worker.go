@@ -54,10 +54,12 @@ type ContractFollowupSnapshot struct {
 	Work   []graph.ContractWork
 	Files  []ContractFollowupFile
 	// RepoConfigs is captured immutable extractor/transform policy authority.
-	RepoConfigs  map[string]config.IndexConfig
-	ReadAccepted func(context.Context, ContractFollowupFile) (ContractAcceptedSource, error)
-	ReadCoreFile func(context.Context, ContractFollowupFile) (ContractFollowupCoreFile, error)
-	Release      func()
+	RepoConfigs map[string]config.IndexConfig
+	// TrackedRepoModules freezes accepted companion module identity.
+	TrackedRepoModules map[string]string
+	ReadAccepted       func(context.Context, ContractFollowupFile) (ContractAcceptedSource, error)
+	ReadCoreFile       func(context.Context, ContractFollowupFile) (ContractFollowupCoreFile, error)
+	Release            func()
 }
 
 // ContractFollowupRequest receives an installer-reserved Building managed
@@ -356,7 +358,7 @@ func runContractFollowupPrepared(ctx context.Context, req ContractFollowupReques
 				tree.Release()
 			}
 			if file.Language == "gomod" || strings.HasSuffix(file.Path, "/go.mod") || file.Path == "go.mod" {
-				found = append(found, (&contracts.GoModExtractor{}).Extract(file.Path, src, nodes, edges)...)
+				found = append(found, (&contracts.GoModExtractor{TrackedRepos: snap.TrackedRepoModules}).Extract(file.Path, src, nodes, edges)...)
 			}
 			registry.AddAllScoped(found, file.RepoPrefix, file.WorkspaceID, file.ProjectID)
 			encoded, encodeErr := json.Marshal(found)

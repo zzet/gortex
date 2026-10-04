@@ -255,11 +255,12 @@ func contractAnalysisCohortID(snapshot ContractFollowupSnapshot, cfg config.Inde
 	// Exact physical witnesses preserve source actor, order, Found and Accepted.
 	// No source clock or latest attachment substitutes for immutable authority.
 	encoded, err := json.Marshal(struct {
-		Inputs      []graph.ContractInputWitness
-		Files       []ContractFollowupFile
-		Config      config.IndexConfig
-		RepoConfigs map[string]config.IndexConfig
-	}{snapshot.Inputs, snapshot.Files, cfg, snapshot.RepoConfigs})
+		Inputs             []graph.ContractInputWitness
+		Files              []ContractFollowupFile
+		Config             config.IndexConfig
+		RepoConfigs        map[string]config.IndexConfig
+		TrackedRepoModules map[string]string
+	}{snapshot.Inputs, snapshot.Files, cfg, snapshot.RepoConfigs, snapshot.TrackedRepoModules})
 	if err != nil {
 		return "", err
 	}

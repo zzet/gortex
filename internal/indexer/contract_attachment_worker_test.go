@@ -14,6 +14,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/modules"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/search"
@@ -617,5 +618,55 @@ func TestContractFollowupIndexesSyntheticSearchOnlyInPayload(t *testing.T) {
 	ordinaryCount, err := f.store.SymbolFTSCount()
 	if err != nil || ordinaryCount != 0 {
 		t.Fatalf("worker modified core FTS=%d %v", ordinaryCount, err)
+	}
+}
+
+func TestContractFollowupManifestUsesRealCoreOwnerAndTrackedModuleIdentity(t *testing.T) {
+	f := newContractWorkerFixture(t)
+	src := []byte("module example.test/server\nrequire example.test/client v1.2.3\n")
+	idx := New(f.store, f.registry, f.cfg, zap.NewNop())
+	idx.repoPrefix = "repo-a"
+	idx.workspaceID = "workspace"
+	idx.projectID = "project"
+	// Invoke the production module source writer, which creates the genuine
+	// selected manifest KindFile; the analysis worker creates no core owner.
+	idx.extractOneModuleManifestSource("go.mod", src, modules.ParseGoMod, readGoModModulePath)
+	path := "repo-a/go.mod"
+	f.sources[path] = src
+	policy, err := contractFollowupPolicy(idx, "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.files = append(f.files, ContractFollowupFile{RepoPrefix: "repo-a", WorkspaceID: "workspace", ProjectID: "project", Path: path, Language: "go", SourceFingerprint: contractInputHash(src), Policy: policy})
+	expected := f.inputs[0].State
+	next := expected
+	next.InputFingerprint = "repo-a-manifest-accepted"
+	next.Accepted = false
+	work := graph.ContractWork{Token: "manifest-token", RepoPrefix: "repo-a", FilePath: path, InputVersion: next.InputVersion, InputFingerprint: next.InputFingerprint, State: graph.ContractWorkPending, Scope: graph.ContractWorkScope{Unknown: true}}
+	if err := f.store.BeginContractInputMutationContext(context.Background(), &expected, next, []graph.ContractWork{work}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.AcceptContractInputMutationContext(context.Background(), next); err != nil {
+		t.Fatal(err)
+	}
+	next.Accepted = true
+	f.inputs[0].State = next
+	req := f.request(t, "repo-a", "manifest-analysis")
+	req.Snapshot.Work = append(req.Snapshot.Work, work)
+	req.Snapshot.TrackedRepoModules = map[string]string{"repo-b": "example.test/client"}
+	if _, err := RunContractFollowup(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := contracts.LoadRegistryFromGraphChecked(context.Background(), req.Payload, contracts.RegistryLoadOptions{RepoPrefix: "repo-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := registry.ByID("dep::repo-b::client")
+	if len(rows) != 1 || rows[0].FilePath != path || rows[0].Meta["target_repo"] != "repo-b" {
+		t.Fatalf("manifest dependency identity=%#v", rows)
+	}
+	nodes, err := f.store.GetNodesByIDsContext(context.Background(), []string{path})
+	if err != nil || nodes[path] == nil || nodes[path].Kind != graph.KindFile {
+		t.Fatalf("genuine manifest owner missing=%#v %v", nodes, err)
 	}
 }
