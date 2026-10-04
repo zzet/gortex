@@ -246,6 +246,7 @@ type Server struct {
 	backgroundMaintenance        sync.WaitGroup
 	backgroundMaintenanceMu      sync.Mutex
 	backgroundMaintenanceDrained bool
+	analysisPruneCancel          context.CancelFunc // guarded by backgroundMaintenanceMu
 	analysisMaterializeMu        sync.Mutex
 	analysisMu                   sync.RWMutex
 
