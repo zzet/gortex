@@ -12,7 +12,12 @@ var ErrSourceDeclarationGraphRequired = errors.New("source declaration needs ind
 func (idx *Indexer) PrepareSourceDeclaration(path, graphPath string, src []byte) (parser.Extractor, []byte, bool, error) {
 	if idx.transforms != nil {
 		for _, transform := range idx.transforms.transforms {
-			if _, builtin := transform.(bomStripTransform); !builtin && (transform.matches(graphPath) || transform.matches(path)) {
+			switch transform.(type) {
+			case bomStripTransform, utf16DecodeTransform:
+				// Read-only declarations use the same built-in decoding as indexing.
+				continue
+			}
+			if transform.matches(graphPath) || transform.matches(path) {
 				return nil, nil, false, ErrSourceDeclarationGraphRequired
 			}
 		}

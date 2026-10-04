@@ -79,6 +79,18 @@ func TestSourceNameSearchQualifiedNamePrefilter(t *testing.T) {
 	require.Contains(t, viewResultText(t, res), "client.go::Client.Send")
 }
 
+func TestSourceNameSearchUTF16Declarations(t *testing.T) {
+	srv, root := setupTestServer(t)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "current.go"), utf16LEWithBOM(t, "package main\nfunc DecodedDeclaration() {}\n"), 0644))
+	view := &requestView{sourceScope: "declarations", viewRoot: root}
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"query": "DecodedDeclaration", "path": "current.go"}
+	res, err := srv.handleSourceSearchSymbols(withRequestView(t.Context(), view), req, view, "DecodedDeclaration", fieldQuery{}, ResolvedScope{})
+	require.NoError(t, err)
+	require.False(t, res.IsError, viewResultText(t, res))
+	require.Contains(t, viewResultText(t, res), "current.go::DecodedDeclaration")
+}
+
 func TestSourceNameSearchRetainsGraphDispatchForGraphRequirements(t *testing.T) {
 	stack := newViewStack(t)
 	ctx := WithSessionCWD(WithSessionID(context.Background(), viewTestSession), stack.worktreeRoot)
