@@ -76,29 +76,34 @@ func TestReaderWaitMarkCountsWriterPageReads(t *testing.T) {
 	// otherwise count their gate releases while the test pins the writer.
 	s.stopCheckpointLoop()
 	s.stopMaintenanceLane()
+	// Counter values are the subject here. With every competing worker joined,
+	// each write returns the sole writer before Unlock, so sample that known-free
+	// connection exactly. The runtime hook's 100 us deadline can legitimately
+	// expire during scheduler/GC pauses, even though the connection is available.
+	runtimeSampler := s.writeMu.onRelease.Load()
+	exactSampler := func() { s.collectWriterCacheCountersContext(t.Context()) }
+	s.writeMu.onRelease.Store(&exactSampler)
+	defer s.writeMu.onRelease.Store(runtimeSampler)
 	seedWALChurnTable(t, s)
 	before := s.ReaderWaitMark()
 	growWAL(t, s, 4)
 	d := s.ReaderWaitMark().Split(before)
-	t.Logf("writer: hits=%d misses=%d spills=%d", d.WriterCacheHits, d.WriterCacheMisses, d.WriterCacheSpills)
+	t.Logf("writer: hits=%d misses=%d spills=%d skipped=%d", d.WriterCacheHits, d.WriterCacheMisses, d.WriterCacheSpills, d.WriterCacheSkipped)
 	require.Positive(t, d.WriterCacheHits+d.WriterCacheMisses, "the writes' page reads were not counted")
 	require.Zero(t, d.WriterCacheSpills)
 
 	// One transaction of ~48 MiB of new pages: more than the cache holds.
 	before = s.ReaderWaitMark()
-	s.writeMu.Lock()
-	_, err := s.writerDB.Exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 12000)
-		INSERT INTO wal_churn(id, payload) SELECT 100000+i, zeroblob(4000) FROM n`)
-	s.writeMu.Unlock()
-	require.NoError(t, err)
+	writeOversizedWriterCacheTransaction(t, s)
 	d = s.ReaderWaitMark().Split(before)
-	t.Logf("big transaction: hits=%d misses=%d spills=%d", d.WriterCacheHits, d.WriterCacheMisses, d.WriterCacheSpills)
+	t.Logf("big transaction: hits=%d misses=%d spills=%d skipped=%d", d.WriterCacheHits, d.WriterCacheMisses, d.WriterCacheSpills, d.WriterCacheSkipped)
 	require.Positive(t, d.WriterCacheSpills, "a transaction larger than the cache did not spill")
 	require.Zero(t, d.WriterCacheSkipped)
 
 	// A release of the write gate while a holder still has the writer
 	// connection (conn below) skips its sample, and the split says so. The
 	// hold itself is what triggers the release hook.
+	s.writeMu.onRelease.Store(runtimeSampler)
 	before = s.ReaderWaitMark()
 	conn, err := s.writerDB.Conn(context.Background())
 	require.NoError(t, err)
@@ -108,6 +113,61 @@ func TestReaderWaitMarkCountsWriterPageReads(t *testing.T) {
 	require.True(t, heldDuring)
 	require.NoError(t, conn.Close())
 	require.Equal(t, int64(1), s.ReaderWaitMark().Split(before).WriterCacheSkipped)
+}
+
+func writeOversizedWriterCacheTransaction(t *testing.T, s *Store) {
+	t.Helper()
+	s.writeMu.Lock()
+	_, err := s.writerDB.Exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 12000)
+		INSERT INTO wal_churn(id, payload) SELECT 100000+i, zeroblob(4000) FROM n`)
+	s.writeMu.Unlock()
+	require.NoError(t, err)
+}
+
+func TestWriterCacheSkippedSampleCatchesUpAndResets(t *testing.T) {
+	s, _ := openWALReclaimStore(t)
+	defer func() { _ = s.Close() }()
+	s.stopCheckpointLoop()
+	s.stopMaintenanceLane()
+	// Drive collection explicitly, still under the writer gate, to force an
+	// acquisition deadline independently of the platform's timer resolution.
+	runtimeSampler := s.writeMu.onRelease.Load()
+	s.writeMu.onRelease.Store(nil)
+	defer s.writeMu.onRelease.Store(runtimeSampler)
+	sample := func(ctx context.Context) {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		s.collectWriterCacheCountersContext(ctx)
+	}
+	seedWALChurnTable(t, s)
+	sample(t.Context())
+	before := s.ReaderWaitMark()
+	writeOversizedWriterCacheTransaction(t, s)
+	expired, cancel := context.WithCancel(t.Context())
+	cancel()
+	sample(expired)
+	missedMark := s.ReaderWaitMark()
+	missed := missedMark.Split(before)
+	t.Logf("missed sample: hits=%d misses=%d spills=%d skipped=%d", missed.WriterCacheHits, missed.WriterCacheMisses, missed.WriterCacheSpills, missed.WriterCacheSkipped)
+	require.Equal(t, int64(1), missed.WriterCacheSkipped)
+	require.Zero(t, missed.WriterCacheHits)
+	require.Zero(t, missed.WriterCacheMisses)
+	require.Zero(t, missed.WriterCacheSpills)
+
+	sample(t.Context())
+	caughtUpMark := s.ReaderWaitMark()
+	caughtUp := caughtUpMark.Split(missedMark)
+	t.Logf("catch-up sample: hits=%d misses=%d spills=%d skipped=%d", caughtUp.WriterCacheHits, caughtUp.WriterCacheMisses, caughtUp.WriterCacheSpills, caughtUp.WriterCacheSkipped)
+	require.Positive(t, caughtUp.WriterCacheHits+caughtUp.WriterCacheMisses)
+	require.Positive(t, caughtUp.WriterCacheSpills, "skipping collection must retain the transaction's spills for the next sample")
+	require.Zero(t, caughtUp.WriterCacheSkipped)
+
+	sample(t.Context())
+	reset := s.ReaderWaitMark().Split(caughtUpMark)
+	require.Zero(t, reset.WriterCacheHits)
+	require.Zero(t, reset.WriterCacheMisses)
+	require.Zero(t, reset.WriterCacheSpills)
+	require.Zero(t, reset.WriterCacheSkipped)
 }
 
 // The cost of one release's sample of the writer's counters.

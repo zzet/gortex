@@ -47,6 +47,17 @@ func (s *Store) collectWriterCacheCounters() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), writerCacheTakeWait)
 	defer cancel()
+	s.collectWriterCacheCountersContext(ctx)
+}
+
+// collectWriterCacheCountersContext samples under the caller-held write gate.
+// The release hook supplies its best-effort acquisition deadline; an explicit
+// sampler can use its own context when it knows the writer has been returned.
+// A failed acquisition leaves SQLite's counters intact for the next sample.
+func (s *Store) collectWriterCacheCountersContext(ctx context.Context) {
+	if s.bulkConn != nil {
+		return
+	}
 	conn, err := s.writerDB.Conn(ctx)
 	if err != nil {
 		s.writerCache.skipped.Add(1)
