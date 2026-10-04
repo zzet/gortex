@@ -24,6 +24,35 @@ type payloadInputRevision struct {
 	state               string
 }
 
+// PayloadInputRevision is an opaque comparable revision of one selected handle.
+// It describes cached input ownership, not catalog lifetime or publication authority.
+type PayloadInputRevision struct {
+	core                   *storeCore
+	generation             int64
+	analysis, input, admin uint64
+}
+
+// PayloadInputRevision samples only this handle's raw generation clocks. It
+// includes sidecar/ownership changes and rare administration without implicitly
+// adding base zero. The monotonic tuple is a conservative before/after check, not a
+// coherent committed snapshot. The locked publication witness remains authority;
+// no database read, writer gate or connection acquisition occurs.
+func (s *Store) PayloadInputRevision() PayloadInputRevision {
+	revision, _ := s.PayloadInputRevisionContext(context.Background())
+	return revision
+}
+
+// PayloadInputRevisionContext permits checked readers to fail promptly after cancellation.
+func (s *Store) PayloadInputRevisionContext(ctx context.Context) (PayloadInputRevision, error) {
+	if ctx == nil || s == nil || s.coreless() {
+		return PayloadInputRevision{}, ErrCatalogInvalidValue
+	}
+	if err := ctx.Err(); err != nil {
+		return PayloadInputRevision{}, err
+	}
+	return PayloadInputRevision{core: s.storeCore, generation: s.viewGen, analysis: s.analysisViewCounter(s.viewGen).Load(), input: s.constantInputCounter(s.viewGen).Load(), admin: s.payloadInputAdminRevision.Load()}, nil
+}
+
 // CapturePayloadInputWitness must precede the checked projection. It includes
 // exactly the supplied generations, holds no gate after return, and excludes no supplied
 // ancestor. Callers must omit the generation they are about to build.
