@@ -58,9 +58,15 @@ func installDaemonContractAnalysis(state *daemonState, logger *zap.Logger) (*dae
 	}
 	runtime.coordinator = coordinator
 	hooks := indexer.ContractCoreRuntimeHooks{Published: coordinator.Published}
+	if err := state.lifecycle.SetContractCoreRuntime(hooks); err != nil {
+		cancel()
+		if closeErr := coordinator.CloseContext(context.Background()); closeErr != nil {
+			return nil, fmt.Errorf("contract analysis: installation refused: %v; close coordinator: %w", err, closeErr)
+		}
+		return nil, fmt.Errorf("contract analysis: installation refused: %w", err)
+	}
 	state.indexer.SetContractCoreRuntime(hooks)
 	state.multiIndexer.SetContractCoreRuntime(hooks)
-	state.lifecycle.SetContractCoreRuntime(hooks)
 	state.mcpServer.SetContractAnalysisRuntime(&gortexmcp.ContractAnalysisRuntime{Request: coordinator.Request, WaitChange: coordinator.WaitChange})
 	return runtime, nil
 }

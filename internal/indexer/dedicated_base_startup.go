@@ -923,7 +923,7 @@ func (p *InitialBasePublisher) observe(ctx context.Context, graphID, repoPrefix 
 		}},
 		Producers:         cohortProducerPolicy(frozen, l.mi.embedder != nil),
 		Capabilities:      cohortCapabilityVocabulary(),
-		ExtractorVersions: extractorVersionsFingerprint(),
+		ExtractorVersions: builder.extractorVersionsFingerprint(),
 		SourceBudget:      dependencyRevisionSourceBudget,
 	}
 	// The revision is never empty. An empty revision is the legacy value the
@@ -946,7 +946,7 @@ func (p *InitialBasePublisher) observe(ctx context.Context, graphID, repoPrefix 
 		Identity: store_sqlite.DedicatedBaseIdentity{
 			TreeOID:            target.TreeOID,
 			ConfigHash:         checkoutConfigHash(fingerprint, sections),
-			ExtractorVersions:  extractorVersionsFingerprint(),
+			ExtractorVersions:  builder.extractorVersionsFingerprint(),
 			ResolverVersion:    resolverVersionFingerprint(),
 			DependencyRevision: revision,
 		},

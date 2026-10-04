@@ -867,7 +867,7 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 		config:          frozen,
 		configSections:  slices.Clone(cfg.ConfigSections),
 		configHash:      checkoutConfigHash(configFingerprint, cfg.ConfigSections),
-		extractors:      extractorVersionsFingerprint(),
+		extractors:      cfg.Builder.extractorVersionsFingerprint(),
 		resolverVersion: resolverVersionFingerprint(),
 
 		signal:         make(chan struct{}, 1),
@@ -4744,7 +4744,7 @@ var resolverVersionFingerprint = sync.OnceValue(resolver.Version)
 // way the per-repo freshness row does, so a language whose extractor was
 // bumped re-builds the layers that carry its files.
 func extractorVersionsFingerprint() string {
-	encoded, err := json.Marshal(contractGenerationProducerVersions(extractorVersionsSnapshot()))
+	encoded, err := json.Marshal(extractorVersionsSnapshot())
 	if err != nil {
 		return ""
 	}

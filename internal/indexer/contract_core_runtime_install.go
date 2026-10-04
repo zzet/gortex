@@ -53,15 +53,19 @@ func (idx *Indexer) SetContractCoreRuntime(hooks ContractCoreRuntimeHooks) {
 	idx.contractCoreRuntime.Store(&hooks)
 }
 
-func (l *CheckoutLifecycle) SetContractCoreRuntime(hooks ContractCoreRuntimeHooks) {
-	l.contractCoreRuntime.Store(&hooks)
-	l.mu.RLock()
-	for _, coordinator := range l.coordinators {
-		if coordinator != nil && coordinator.builder != nil {
-			coordinator.builder.SetContractCoreRuntime(hooks)
-		}
+// Install before checkout/ref coordinator construction: those owners freeze
+// their producer identity when they are created. Updating only their builder
+// afterward would make new receipts carry the old, synchronous identity.
+func (l *CheckoutLifecycle) SetContractCoreRuntime(hooks ContractCoreRuntimeHooks) error {
+	l.refViewMu.Lock()
+	defer l.refViewMu.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.coordinators) != 0 || len(l.refViews) != 0 {
+		return fmt.Errorf("contract core runtime: install before checkout or ref coordinators are constructed")
 	}
-	l.mu.RUnlock()
+	l.contractCoreRuntime.Store(&hooks)
+	return nil
 }
 
 func (l *CheckoutLifecycle) installContractCoreBuilder(builder *SparseGenerationBuilder) *SparseGenerationBuilder {

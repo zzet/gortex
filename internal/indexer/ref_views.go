@@ -357,7 +357,7 @@ func NewRefViewManager(cfg RefViewManagerConfig) (*RefViewManager, error) {
 		configSections:    append([]DependencyRevisionConfigSection(nil), cfg.ConfigSections...),
 		configSectionsFor: cfg.ConfigSectionsFor,
 		leases:            cfg.Leases,
-		extractors:        extractorVersionsFingerprint(),
+		extractors:        cfg.Builder.extractorVersionsFingerprint(),
 		resolverVersion:   resolverVersionFingerprint(),
 		identityKeys:      map[string]refViewIdentityKeys{},
 		identityRefused:   map[string]refViewIdentityKeys{},
