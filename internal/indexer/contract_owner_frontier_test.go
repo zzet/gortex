@@ -684,6 +684,23 @@ func TestContractFTSFileEvictionPreservesRetainedCanonicalRows(t *testing.T) {
 
 func TestContractFTSStructuralReparsePreservesRetainedCanonicalRows(t *testing.T) {
 	f := newContractFTSEvictionFixture(t)
+	// This is a sidecar-retention test. Bind the old input receipt to the
+	// actual accepted parse so a structural function rename does not masquerade
+	// as an unknown legacy shared-input change and re-extract unrelated B.
+	path := filepath.Join(f.root, "provider.go")
+	src, err := os.ReadFile(path)
+	require.NoError(t, err)
+	_, _, parsed, complete := f.idx.extractionFingerprintsOfContent(path, src)
+	require.True(t, complete)
+	_, stamped := storedContractDependencyInputs(parsed)
+	require.True(t, stamped)
+	for _, node := range parsed {
+		if node.Kind == graph.KindFile {
+			f.store.AddBatch([]*graph.Node{node}, nil)
+		}
+	}
+	beforeOwner := registeredBridgeOwnerSnapshot(t, f.store, f.consumer.SymbolID)
+	require.Len(t, beforeOwner, 1)
 	beforeCanonical := contractFTSRowsForID(t, f.db, f.provider.ID)
 	beforeB := contractFTSRowsForID(t, f.db, f.consumer.SymbolID)
 	require.Len(t, beforeCanonical, 1)
@@ -697,7 +714,7 @@ func TestContractFTSStructuralReparsePreservesRetainedCanonicalRows(t *testing.T
 	f.idx.contractRegistry = nil
 	// Reuse the receipt-aware entry and relative-path convention exercised by
 	// SIZE's applyCensus; do not add another mutation-coordinator wrapper.
-	_, _, _, err := f.idx.incrementalReindexPathsWithReceiptMode(f.root,
+	_, _, _, err = f.idx.incrementalReindexPathsWithReceiptMode(f.root,
 		[]string{"provider.go"}, incrementalPathMode{forceExplicitFiles: true, detectDeletions: true})
 	require.NoError(t, err)
 
@@ -719,8 +736,51 @@ func TestContractFTSStructuralReparsePreservesRetainedCanonicalRows(t *testing.T
 	}
 	require.True(t, reparsedDeclaration, "the new A declaration must be parsed and committed")
 	require.NotNil(t, f.store.GetNode(f.provider.ID), "B still owns the canonical after A's structural reparse")
+	assert.Equal(t, beforeOwner, registeredBridgeOwnerSnapshot(t, f.store, f.consumer.SymbolID), "untouched B owner payload remains exact")
+	for _, entry := range observed.All() {
+		if reasons, ok := entry.ContextMap()["reasons"].(map[string]int); ok {
+			assert.Zero(t, reasons["dependency_stamp_missing"], "accepted ordinary function rename has known prior inputs")
+		}
+	}
 	assert.Equal(t, beforeCanonical, contractFTSRowsForID(t, f.db, f.provider.ID),
 		"the real rebuilt canonical FTS row must survive structural eviction exactly")
 	assert.Equal(t, beforeB, contractFTSRowsForID(t, f.db, f.consumer.SymbolID),
 		"B's ordinary FTS row stays outside A's structural frontier")
+}
+
+func TestContractFTSStructuralReparseLegacyFrontierRefreshesRealSurvivingOwner(t *testing.T) {
+	f := newContractFTSEvictionFixture(t)
+	_, stamped := storedContractDependencyInputs(f.store.GetFileNodes(f.provider.FilePath))
+	require.False(t, stamped, "control intentionally retains unknown legacy input provenance")
+	// Unlike the synthetic sidecar isolation fixture, B's accepted source must
+	// reproduce its ownership when the conservative legacy frontier includes it.
+	require.NoError(t, os.WriteFile(filepath.Join(f.root, "reader.go"), []byte("package fixture\nfunc Consume() { os.Getenv(\"FTS_FILE_EVICTION\") }\n"), 0o600))
+	readerPath := filepath.Join(f.root, "reader.go")
+	readerSource, err := os.ReadFile(readerPath)
+	require.NoError(t, err)
+	_, _, readerNodes, complete := f.idx.extractionFingerprintsOfContent(readerPath, readerSource)
+	require.True(t, complete)
+	f.store.AddBatch(readerNodes, nil)
+	require.NoError(t, os.WriteFile(filepath.Join(f.root, "provider.go"), []byte("package fixture\nfunc ReparsedProvider() {}\n"), 0o600))
+	core, observed := observer.New(zap.DebugLevel)
+	f.idx.logger = zap.New(core)
+	f.idx.contractRegistry = nil
+	_, _, _, err = f.idx.incrementalReindexPathsWithReceiptMode(f.root,
+		[]string{"provider.go"}, incrementalPathMode{forceExplicitFiles: true, detectDeletions: true})
+	require.NoError(t, err)
+	var missingReceiptFallback bool
+	for _, entry := range observed.All() {
+		if reasons, ok := entry.ContextMap()["reasons"].(map[string]int); ok && reasons["dependency_stamp_missing"] > 0 {
+			missingReceiptFallback = true
+		}
+	}
+	require.True(t, missingReceiptFallback, "missing prior receipt keeps conservative shared refresh")
+	require.NotNil(t, f.store.GetNode(f.provider.ID), "real B source re-establishes the shared canonical")
+	owners := contracts.LoadRegistryFromGraphWithScope(f.store, "fixture", "workspace", "project").ByID(f.provider.ID)
+	require.Len(t, owners, 1)
+	assert.Equal(t, f.consumer.FilePath, owners[0].FilePath)
+	assert.Equal(t, f.consumer.SymbolID, owners[0].SymbolID)
+	assert.Equal(t, contracts.RoleConsumer, owners[0].Role)
+	assert.Empty(t, registeredBridgeOwnerSnapshot(t, f.store, f.provider.SymbolID), "replaced A no longer owns the contract")
+	assert.Len(t, contractFTSRowsForID(t, f.db, f.provider.ID), 1, "surviving canonical remains searchable")
 }
