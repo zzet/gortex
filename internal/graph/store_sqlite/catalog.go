@@ -2242,6 +2242,7 @@ func (c *Catalog) DeleteViewGeneration(ctx context.Context, generationID int64) 
 		if referenced {
 			return fmt.Errorf("%w: generation %d", ErrCatalogGenerationReferenced, generationID)
 		}
+ if _,err:=tx.ExecContext(ctx,`DELETE FROM contract_attachment_inputs WHERE (repo_prefix,checkout_id,input_version,input_fingerprint) IN (SELECT repo_prefix,checkout_id,input_version,input_fingerprint FROM contract_attachments WHERE payload_generation=?)`,generationID);err!=nil{return err}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM contract_attachment_work WHERE (repo_prefix,checkout_id,attachment_version,attachment_fingerprint) IN (SELECT repo_prefix,checkout_id,input_version,input_fingerprint FROM contract_attachments WHERE payload_generation=?)`, generationID); err != nil {
 			return err
 		}

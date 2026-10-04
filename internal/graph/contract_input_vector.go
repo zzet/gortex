@@ -39,11 +39,12 @@ func composeContractInputState(repo,checkout string,witnesses []ContractInputWit
  type sources struct{base,positive *ContractInputState}
  selected:=make(map[string]sources)
  for _,w:=range witnesses{
-  if w.GenerationID<0{return state,ErrContractInputVector};if !w.Found{continue}
+  if w.GenerationID<0{return state,ErrContractInputVector};if !w.Found{if w.GenerationID==0{return state,ErrContractInputVector};continue}
   copyState:=w.State;row:=selected[copyState.RepoPrefix]
   if w.GenerationID==0{row.base=&copyState}else{row.positive=&copyState}
   selected[copyState.RepoPrefix]=row
  }
+ if _,ok:=selected[repo];!ok{return state,ErrContractInputVector}
  type identity struct{Repo,Version,Fingerprint string}
  repos:=make([]string,0,len(selected));for r:=range selected{repos=append(repos,r)};sort.Strings(repos)
  var identities []identity

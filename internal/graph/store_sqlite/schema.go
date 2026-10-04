@@ -1647,6 +1647,7 @@ func buildGenerationMaskSchemaSQL() string {
 	}
 	b.WriteString(contractWorkScopeIndexDDL)
 	b.WriteString(contractAttachmentSchemaSQL)
+	b.WriteString(contractAttachmentInputsSchemaSQL)
 	return b.String()
 }
 

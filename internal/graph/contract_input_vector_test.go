@@ -19,5 +19,11 @@ func TestContractInputVectorStableCarryPendingAndPredecessor(t *testing.T){
  witnesses[1].State.Accepted=false
  pending,err:=ComposeContractInputState("repo","wt",witnesses);if err!=nil||pending.Accepted{t.Fatal("pending fell through accepted lower")}
  previous,err:=ComposePreviousContractInputState("repo","wt",witnesses);if err!=nil||previous.InputFingerprint!="a"{t.Fatalf("predecessor=%#v %v",previous,err)}
+ updatedBase:=primary;updatedBase.InputFingerprint="primary-new"
+ changedSparse,err:=ComposeContractInputState("repo","wt",[]ContractInputWitness{{GenerationID:0,State:updatedBase,Found:true},{GenerationID:100,State:changed,Found:true}});if err!=nil||changedSparse.InputFingerprint==combined.InputFingerprint{t.Fatal("inherited0 change ignored")}
+ dedicated,err:=ComposeContractInputState("repo","wt",[]ContractInputWitness{{GenerationID:100,State:changed,Found:true}});if err!=nil||dedicated.InputFingerprint!="b"{t.Fatal("full root did not omit0")}
+ if _,err:=ComposeContractInputState("repo","wt",[]ContractInputWitness{{GenerationID:0,State:primary,Found:false},{GenerationID:100,State:changed,Found:true}});err==nil{t.Fatal("missing inherited baseline certified by positive")}
+ foreign:=primary;foreign.RepoPrefix="foreign"
+ if _,err:=ComposeContractInputState("repo","wt",[]ContractInputWitness{{GenerationID:1,State:foreign,Found:true}});err==nil{t.Fatal("foreign only vector certified root repo")}
  if _,err:=ComposeContractInputState("repo","wt",[]ContractInputWitness{{Found:false}});err==nil{t.Fatal("empty vector became usable")}
 }

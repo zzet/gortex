@@ -337,3 +337,56 @@ func TestContractAttachmentNonemptyOwnerShapeAndMaskRefusal(t *testing.T) {
 		t.Fatal("core file masks accepted")
 	}
 }
+
+func TestContractAttachmentSelectedVectorCASAbsenceAndUnrelatedPrimary(t *testing.T){
+ s:=openCatalogStore(t);ctx:=context.Background();primary:=attachmentState("primary-a");primary.CheckoutID=""
+ if err:=s.BeginContractInputMutationContext(ctx,nil,primary,nil);err!=nil{t.Fatal(err)};if err:=s.AcceptContractInputMutationContext(ctx,primary);err!=nil{t.Fatal(err)}
+ core:=reservedGeneration(t,s,"selected-vector");linked:=attachmentState("linked-b")
+ if err:=s.AtGeneration(core).SetContractInputStateWithWorkContext(ctx,nil,linked,nil);err!=nil{t.Fatal(err)}
+ zero,_,err:=s.ContractInputStateContext(ctx,"repo","");if err!=nil{t.Fatal(err)}
+ physical,_,err:=s.AtGeneration(core).ContractInputStateContext(ctx,"repo","wt");if err!=nil{t.Fatal(err)}
+ witnesses:=[]graph.ContractInputWitness{{GenerationID:0,State:zero,Found:true},{GenerationID:core,State:physical,Found:true},{GenerationID:core,State:graph.ContractInputState{RepoPrefix:"unresolved",CheckoutID:"wt"},Found:false}}
+ logical,err:=graph.ComposeContractInputState("repo","wt",witnesses);if err!=nil{t.Fatal(err)}
+ missing:=attachmentState("new-negative-input");missing.RepoPrefix="unresolved"
+ if err:=s.AtGeneration(core).SetContractInputStateWithWorkContext(ctx,nil,missing,nil);err!=nil{t.Fatal(err)}
+ payload:=attachmentPayload(t,s)
+ if err:=s.AtGeneration(core).PublishContractAttachmentWithInputsContext(ctx,logical,witnesses,attachmentFor(logical,payload),nil,1);!errors.Is(err,ErrCatalogStaleGuard){t.Fatalf("missing witness changed=%v",err)}
+ witnesses=witnesses[:2]
+ if err:=s.AtGeneration(core).PublishContractAttachmentWithInputsContext(ctx,logical,witnesses,attachmentFor(logical,payload),nil,1);err!=nil{t.Fatal(err)}
+ refs,err:=s.Catalog().ViewGenerationReferences(ctx,payload);if err!=nil||!refs.ContractAttached{t.Fatalf("compound ref=%#v %v",refs,err)}
+ next:=primary;next.InputFingerprint="primary-new"
+ if err:=s.BeginContractInputMutationContext(ctx,&zero,next,nil);err!=nil{t.Fatal(err)}
+ stalePayload:=attachmentPayload(t,s)
+ if err:=s.AtGeneration(core).PublishContractAttachmentWithInputsContext(ctx,logical,witnesses,attachmentFor(logical,stalePayload),nil,1);!errors.Is(err,ErrCatalogStaleGuard){t.Fatalf("changed inherited0=%v",err)}
+ // A full root contains no physical0 witness, so the same primary change
+ // does not tax or invalidate its independently accepted input.
+ own:=[]graph.ContractInputWitness{{GenerationID:core,State:physical,Found:true}}
+ ownLogical,err:=graph.ComposeContractInputState("repo","wt",own);if err!=nil{t.Fatal(err)}
+ if err:=s.AtGeneration(core).PublishContractAttachmentWithInputsContext(ctx,ownLogical,own,attachmentFor(ownLogical,stalePayload),nil,1);err!=nil{t.Fatal(err)}
+ copied:=reservedGeneration(t,s,"selected-vector-copy")
+ if _,err:=s.CopyGenerationPayloadWhole(ctx,core,copied);err!=nil{t.Fatal(err)}
+ if err:=s.Catalog().DeleteViewGeneration(ctx,core);err!=nil{t.Fatal(err)}
+ refs,err=s.Catalog().ViewGenerationReferences(ctx,stalePayload);if err!=nil||!refs.ContractAttached{t.Fatalf("copy lost input reference=%#v %v",refs,err)}
+}
+
+func TestContractAttachmentCumulativePositiveFoldPreservesInheritedIdentity(t *testing.T){
+ s:=openCatalogStore(t);ctx:=context.Background();base:=attachmentState("live0");base.CheckoutID=""
+ if err:=s.BeginContractInputMutationContext(ctx,nil,base,nil);err!=nil{t.Fatal(err)};if err:=s.AcceptContractInputMutationContext(ctx,base);err!=nil{t.Fatal(err)}
+ lower:=reservedGeneration(t,s,"cumulative-lower");upper:=reservedGeneration(t,s,"cumulative-upper");folded:=reservedGeneration(t,s,"cumulative-fold")
+ a,b:=attachmentState("positive-a"),attachmentState("positive-b-includes-a")
+ if err:=s.AtGeneration(lower).SetContractInputStateWithWorkContext(ctx,nil,a,nil);err!=nil{t.Fatal(err)}
+ if err:=s.AtGeneration(upper).SetContractInputStateWithWorkContext(ctx,nil,b,nil);err!=nil{t.Fatal(err)}
+ zero,_,_:=s.ContractInputStateContext(ctx,"repo","");lo,_,_:=s.AtGeneration(lower).ContractInputStateContext(ctx,"repo","wt");hi,_,_:=s.AtGeneration(upper).ContractInputStateContext(ctx,"repo","wt")
+ before:=[]graph.ContractInputWitness{{GenerationID:0,State:zero,Found:true},{GenerationID:lower,State:lo,Found:true},{GenerationID:upper,State:hi,Found:true}}
+ key,err:=graph.ComposeContractInputState("repo","wt",before);if err!=nil{t.Fatal(err)}
+ payload:=attachmentPayload(t,s)
+ if err:=s.AtGeneration(upper).PublishContractAttachmentWithInputsContext(ctx,key,before,attachmentFor(key,payload),nil,1);err!=nil{t.Fatal(err)}
+ if _,err:=s.FlattenGenerationChain(ctx,[]int64{lower,upper},folded);err!=nil{t.Fatal(err)}
+ current,found,err:=s.AtGeneration(folded).ContractInputStateContext(ctx,"repo","wt");if err!=nil||!found{t.Fatalf("fold input=%#v %v %v",current,found,err)}
+ after,err:=graph.ComposeContractInputState("repo","wt",[]graph.ContractInputWitness{{GenerationID:0,State:zero,Found:true},{GenerationID:folded,State:current,Found:true}});if err!=nil||after!=key{t.Fatalf("fold identity changed %#v -> %#v %v",key,after,err)}
+ // Retiring old physical witnesses cannot unpin the logical payload when
+ // cumulative top authority survives in the folded positive generation.
+ if _,err:=s.writerDB.Exec(`DELETE FROM generation_contract_input_state WHERE view_gen IN (?,?)`,lower,upper);err!=nil{t.Fatal(err)}
+ refs,err:=s.Catalog().ViewGenerationReferences(ctx,payload);if err!=nil||!refs.ContractAttached{t.Fatalf("fold logical ref=%#v %v",refs,err)}
+ got,err:=s.GetContractAttachmentContext(ctx,attachmentKey(after));if err!=nil||got==nil||got.PayloadGeneration!=payload{t.Fatalf("historical binding lost %#v %v",got,err)}
+}

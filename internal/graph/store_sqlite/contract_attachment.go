@@ -60,6 +60,17 @@ func (s *Store) GetContractAttachmentContext(ctx context.Context, key graph.Cont
 // The receiver selects the core generation whose ancestry the worker captured;
 // no mutable corpus clock or latest-actor attachment is consulted.
 func (s *Store) PublishContractAttachmentContext(ctx context.Context, expected graph.ContractInputState, attachment graph.ContractAttachment, work []graph.ContractWork, publishedAt int64) error {
+ return s.publishContractAttachment(ctx,expected,nil,attachment,work,publishedAt)
+}
+
+// PublishContractAttachmentWithInputsContext compares every exact selected
+// physical witness while binding the deduplicated logical attachment identity.
+func (s *Store) PublishContractAttachmentWithInputsContext(ctx context.Context,expected graph.ContractInputState,witnesses []graph.ContractInputWitness,attachment graph.ContractAttachment,work []graph.ContractWork,publishedAt int64) error {
+ if len(witnesses)==0{return graph.ErrContractInputVector}
+ return s.publishContractAttachment(ctx,expected,witnesses,attachment,work,publishedAt)
+}
+
+func(s *Store) publishContractAttachment(ctx context.Context,expected graph.ContractInputState,witnesses []graph.ContractInputWitness,attachment graph.ContractAttachment,work []graph.ContractWork,publishedAt int64) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
 	}
@@ -104,7 +115,14 @@ func (s *Store) PublishContractAttachmentContext(ctx context.Context, expected g
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	chain, err := contractInputAncestryTx(ctx, tx, s.viewGen, expected)
+ var chain []int64
+ if len(witnesses)==0 {chain,err=contractInputAncestryTx(ctx,tx,s.viewGen,expected)} else {
+  var logical graph.ContractInputState
+  logical,err=graph.ComposeContractInputState(expected.RepoPrefix,expected.CheckoutID,witnesses)
+  if err==nil && (!logical.Accepted || !sameContractInput(logical,expected)){err=ErrCatalogStaleGuard}
+  if err==nil {chain,err=contractGenerationAncestryTx(ctx,tx,s.viewGen)}
+  if err==nil {err=validateContractInputWitnessesTx(ctx,tx,witnesses)}
+ }
 	if err != nil {
 		return err
 	}
@@ -131,6 +149,10 @@ func (s *Store) PublishContractAttachmentContext(ctx context.Context, expected g
 	if _, err := tx.ExecContext(ctx, `INSERT INTO contract_attachments(repo_prefix,checkout_id,input_version,input_fingerprint,payload_generation) VALUES(?,?,?,?,?)`, expected.RepoPrefix, expected.CheckoutID, expected.InputVersion, expected.InputFingerprint, attachment.PayloadGeneration); err != nil {
 		return err
 	}
+ effective:=effectiveContractWitnesses(witnesses)
+ for i,w:=range witnesses {
+  if _,err:=tx.ExecContext(ctx,`INSERT INTO contract_attachment_inputs(repo_prefix,checkout_id,input_version,input_fingerprint,source_generation,source_repo,source_checkout,source_version,source_fingerprint,source_accepted,source_found,source_effective) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,expected.RepoPrefix,expected.CheckoutID,expected.InputVersion,expected.InputFingerprint,w.GenerationID,w.State.RepoPrefix,w.State.CheckoutID,w.State.InputVersion,w.State.InputFingerprint,w.State.Accepted,w.Found,effective[i]);err!=nil{return err}
+ }
 	for i, row := range work {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO contract_attachment_work(repo_prefix,checkout_id,attachment_version,attachment_fingerprint,token,origin_generation,file_path,input_version,input_fingerprint,scope) VALUES(?,?,?,?,?,?,?,?,?,?)`, row.RepoPrefix, row.CheckoutID, expected.InputVersion, expected.InputFingerprint, row.Token, row.OriginGeneration, row.FilePath, row.InputVersion, row.InputFingerprint, string(encoded[i])); err != nil {
 			return err
@@ -210,4 +232,31 @@ func validateCapturedContractWorkTx(ctx context.Context, tx *sql.Tx, chain []int
 		return nil
 	}
 	return ErrCatalogStaleGuard
+}
+
+func contractGenerationAncestryTx(ctx context.Context,tx *sql.Tx,generation int64)([]int64,error){
+ var chain []int64
+ for steps:=0;steps<1024;steps++{chain=append(chain,generation);if generation==0{return chain,nil};var base sql.NullInt64
+  if err:=tx.QueryRowContext(ctx,`SELECT base_generation_id FROM view_generations WHERE generation_id=?`,generation).Scan(&base);err!=nil{return nil,err}
+  if !base.Valid{return chain,nil};if base.Int64>=generation||base.Int64<0{return nil,ErrCatalogStaleGuard};generation=base.Int64
+ };return nil,graph.ErrContractInputVector
+}
+
+func validateContractInputWitnessesTx(ctx context.Context,tx *sql.Tx,witnesses []graph.ContractInputWitness)error{
+ type witnessKey struct{generation int64;repo,checkout string};seen:=make(map[witnessKey]bool)
+ for _,w:=range witnesses{
+  key:=witnessKey{w.GenerationID,w.State.RepoPrefix,w.State.CheckoutID};if seen[key]{return graph.ErrContractInputVector};seen[key]=true
+  if w.GenerationID!=0 {var state string;if err:=tx.QueryRowContext(ctx,`SELECT state FROM view_generations WHERE generation_id=?`,w.GenerationID).Scan(&state);err!=nil{return err};if state!=string(ViewGenerationBuilding)&&state!=string(ViewGenerationReady)&&state!=string(ViewGenerationSuperseded){return ErrCatalogStaleGuard}}
+  actual:=graph.ContractInputState{RepoPrefix:w.State.RepoPrefix,CheckoutID:w.State.CheckoutID}
+  err:=tx.QueryRowContext(ctx,`SELECT input_version,input_fingerprint,accepted,previous_input_version,previous_input_fingerprint FROM generation_contract_input_state WHERE view_gen=? AND repo_prefix=? AND checkout_id=?`,w.GenerationID,w.State.RepoPrefix,w.State.CheckoutID).Scan(&actual.InputVersion,&actual.InputFingerprint,&actual.Accepted,&actual.PreviousInputVersion,&actual.PreviousInputFingerprint)
+  if errors.Is(err,sql.ErrNoRows){if w.Found{return ErrCatalogStaleGuard};continue};if err!=nil{return err};if !w.Found||actual!=w.State{return ErrCatalogStaleGuard}
+ };return nil
+}
+
+// Cumulative positive authority means GC depends on top logical components,
+// while every historical/absence row remains part of publication's exact CAS.
+func effectiveContractWitnesses(w []graph.ContractInputWitness)map[int]bool{
+ type pair struct{base,positive int};selected:=make(map[string]pair)
+ for i,row:=range w{if !row.Found{continue};p,ok:=selected[row.State.RepoPrefix];if !ok{p=pair{-1,-1}};if row.GenerationID==0{p.base=i}else{p.positive=i};selected[row.State.RepoPrefix]=p}
+ out:=make(map[int]bool);for _,p:=range selected{if p.base>=0{out[p.base]=true};if p.positive>=0{out[p.positive]=true}};return out
 }

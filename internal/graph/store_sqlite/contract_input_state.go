@@ -34,7 +34,7 @@ func (s *Store) ContractInputStateContext(ctx context.Context, repo, checkout st
 	var accepted bool
 	err := s.db.QueryRowContext(ctx, `SELECT input_version,input_fingerprint,accepted,previous_input_version,previous_input_fingerprint FROM generation_contract_input_state WHERE view_gen=? AND repo_prefix=? AND checkout_id=?`, s.viewGen, repo, checkout).Scan(&state.InputVersion, &state.InputFingerprint, &accepted, &state.PreviousInputVersion, &state.PreviousInputFingerprint)
 	if errors.Is(err, sql.ErrNoRows) {
-		return graph.ContractInputState{}, false, nil
+		return state, false, nil
 	}
 	if err != nil {
 		return graph.ContractInputState{}, false, err
@@ -150,7 +150,7 @@ func (s *Store) setContractInputStateWithWorkTx(ctx context.Context, tx *sql.Tx,
 	previousVersion, previousFingerprint := actual.PreviousInputVersion, actual.PreviousInputFingerprint
 	if found {
 		var published bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM contract_attachments a JOIN view_generations v ON v.generation_id=a.payload_generation WHERE a.repo_prefix=? AND a.checkout_id=? AND a.input_version=? AND a.input_fingerprint=? AND v.state IN ('ready','superseded'))`, actual.RepoPrefix, actual.CheckoutID, actual.InputVersion, actual.InputFingerprint).Scan(&published); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM contract_attachments a JOIN view_generations v ON v.generation_id=a.payload_generation WHERE a.repo_prefix=? AND a.checkout_id=? AND a.input_version=? AND a.input_fingerprint=? AND v.state IN ('ready','superseded')) OR EXISTS(SELECT 1 FROM contract_attachment_inputs x JOIN contract_attachments a ON a.repo_prefix=x.repo_prefix AND a.checkout_id=x.checkout_id AND a.input_version=x.input_version AND a.input_fingerprint=x.input_fingerprint JOIN view_generations v ON v.generation_id=a.payload_generation WHERE x.source_repo=? AND x.source_version=? AND x.source_fingerprint=? AND x.source_found=1 AND x.source_effective=1 AND v.state IN ('ready','superseded'))`, actual.RepoPrefix, actual.CheckoutID, actual.InputVersion, actual.InputFingerprint,actual.RepoPrefix,actual.InputVersion,actual.InputFingerprint).Scan(&published); err != nil {
 			return err
 		}
 		if published {

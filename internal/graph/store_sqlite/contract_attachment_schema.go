@@ -55,7 +55,17 @@ func createContractAttachmentTables(tx *sql.Tx) error {
 const contractAttachmentReferenceSQL = `EXISTS(SELECT 1 FROM contract_attachments a
  WHERE a.payload_generation=? AND (
  EXISTS(SELECT 1 FROM generation_contract_input_state i WHERE i.repo_prefix=a.repo_prefix AND i.checkout_id=a.checkout_id AND ((i.input_version=a.input_version AND i.input_fingerprint=a.input_fingerprint) OR (i.previous_input_version=a.input_version AND i.previous_input_fingerprint=a.input_fingerprint)))
+ OR (EXISTS(SELECT 1 FROM contract_attachment_inputs x WHERE x.repo_prefix=a.repo_prefix AND x.checkout_id=a.checkout_id AND x.input_version=a.input_version AND x.input_fingerprint=a.input_fingerprint AND x.source_found=1 AND x.source_effective=1)
+ AND NOT EXISTS(SELECT 1 FROM contract_attachment_inputs x WHERE x.repo_prefix=a.repo_prefix AND x.checkout_id=a.checkout_id AND x.input_version=a.input_version AND x.input_fingerprint=a.input_fingerprint AND x.source_found=1 AND x.source_effective=1 AND NOT EXISTS(SELECT 1 FROM generation_contract_input_state i WHERE i.repo_prefix=x.source_repo AND ((i.input_version=x.source_version AND i.input_fingerprint=x.source_fingerprint) OR (i.previous_input_version=x.source_version AND i.previous_input_fingerprint=x.source_fingerprint)))))
  OR EXISTS(SELECT 1 FROM contract_attachment_work w JOIN generation_contract_work d ON d.repo_prefix=w.repo_prefix AND d.checkout_id=w.checkout_id AND d.token=w.token AND d.origin_generation=w.origin_generation AND d.file_path=w.file_path AND d.input_version=w.input_version AND d.input_fingerprint=w.input_fingerprint AND d.scope=w.scope WHERE w.repo_prefix=a.repo_prefix AND w.checkout_id=a.checkout_id AND w.attachment_version=a.input_version AND w.attachment_fingerprint=a.input_fingerprint)))`
 
 const contractWorkAcknowledgedSQL = `EXISTS(SELECT 1 FROM contract_attachment_work a JOIN contract_attachments h ON h.repo_prefix=a.repo_prefix AND h.checkout_id=a.checkout_id AND h.input_version=a.attachment_version AND h.input_fingerprint=a.attachment_fingerprint JOIN view_generations v ON v.generation_id=h.payload_generation
  WHERE a.repo_prefix=d.repo_prefix AND a.checkout_id=d.checkout_id AND a.token=d.token AND a.origin_generation=d.origin_generation AND a.file_path=d.file_path AND a.input_version=d.input_version AND a.input_fingerprint=d.input_fingerprint AND a.scope=d.scope AND v.state IN ('ready','superseded'))`
+
+const contractAttachmentInputsSchemaSQL = `CREATE TABLE IF NOT EXISTS contract_attachment_inputs (
+ repo_prefix TEXT NOT NULL,checkout_id TEXT NOT NULL,input_version TEXT NOT NULL,input_fingerprint TEXT NOT NULL,
+ source_generation INTEGER NOT NULL,source_repo TEXT NOT NULL,source_checkout TEXT NOT NULL,source_version TEXT NOT NULL,source_fingerprint TEXT NOT NULL,source_accepted INTEGER NOT NULL,source_found INTEGER NOT NULL,source_effective INTEGER NOT NULL,
+ PRIMARY KEY(repo_prefix,checkout_id,input_version,input_fingerprint,source_generation,source_repo,source_checkout)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS contract_attachment_input_source ON contract_attachment_inputs(source_repo,source_version,source_fingerprint,source_found,source_effective);`
+func createContractAttachmentInputsTable(tx *sql.Tx)error{_,err:=tx.Exec(contractAttachmentInputsSchemaSQL);return err}
