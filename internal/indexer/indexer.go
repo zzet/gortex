@@ -193,9 +193,15 @@ type Indexer struct {
 	pendingColdManifests *coldManifestCensus
 	deferredAttempt      *deferredPassAttempt
 
-	graph             graph.Store
-	fileIndexFailures fileIndexFailureState
-	parseErrorsMu     sync.RWMutex
+	graph graph.Store
+	// Contract followups use accepted selected-view evidence exclusively. These
+	// fields are installed only on the private analysis Indexer, never the core
+	// publisher; a missing source callback is an incomplete analysis input.
+	contractAnalysisOnly       bool
+	contractAcceptedFileSource func(string) ([]byte, error)
+	contractSemanticReader     graph.SemanticBindingTypeReader
+	fileIndexFailures          fileIndexFailureState
+	parseErrorsMu              sync.RWMutex
 
 	// shadowAdmission is shared by every Indexer in the process. Cold repos
 	// acquire a weighted lease before constructing an in-memory shadow; when the
@@ -7421,11 +7427,15 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 	// value-redacted config-key nodes and reads_config edges from the @Value /
 	// @ConfigurationProperties beans the Java extractor stamped. Cheap to skip
 	// on non-Spring repos (no config files + no stamped beans = no work).
-	contracts.BindSpringConfig(idx.graph, contracts.SpringConfigScope{
+	springScope := contracts.SpringConfigScope{
 		RepoPrefix:  idx.repoPrefix,
 		RepoRoot:    idx.rootPath,
 		WorkspaceID: idx.workspaceID,
-	})
+	}
+	if idx.contractAnalysisOnly {
+		springScope.ReadSource = idx.readAcceptedContractSource
+	}
+	contracts.BindSpringConfig(idx.graph, springScope)
 
 	// Trace response variables back to their call-site return types.
 	// Handles `source, err := h.svc.Get(...)` → response_type is
@@ -7578,6 +7588,10 @@ func (idx *Indexer) routerPrefixScanFiles(reg *contracts.Registry) []string {
 // bytes they see come from the same place the parse pipeline read: the
 // installed content source when there is one, and the working tree otherwise.
 func (idx *Indexer) contractFileSrc(filePath string) []byte {
+	if idx.contractAnalysisOnly {
+		data, _ := idx.readAcceptedContractSource(filePath)
+		return data
+	}
 	diskPath := filePath
 	if idx.repoPrefix != "" && strings.HasPrefix(diskPath, idx.repoPrefix+"/") {
 		diskPath = strings.TrimPrefix(diskPath, idx.repoPrefix+"/")
@@ -7588,6 +7602,20 @@ func (idx *Indexer) contractFileSrc(filePath string) []byte {
 		return nil
 	}
 	return data
+}
+
+func (idx *Indexer) readAcceptedContractSource(filePath string) ([]byte, error) {
+	if idx.contractAcceptedFileSource == nil {
+		err := fmt.Errorf("accepted contract source unavailable: %s", filePath)
+		idx.rememberContractInputError(err)
+		return nil, err
+	}
+	data, err := idx.contractAcceptedFileSource(filePath)
+	idx.rememberContractInputError(err)
+	if err != nil {
+		return nil, err
+	}
+	return data, err
 }
 
 // isRouteContractType reports whether a ContractType corresponds to a
@@ -8511,12 +8539,17 @@ func (idx *Indexer) readSemanticBindingTypes(sites []graph.SemanticBindingSite) 
 	})
 
 	readers := make([]graph.SemanticBindingTypeReader, 0, 2)
+	if idx.contractAnalysisOnly && idx.contractSemanticReader != nil {
+		readers = append(readers, idx.contractSemanticReader)
+	}
 	if reader, ok := idx.graph.(graph.SemanticBindingTypeReader); ok {
 		readers = append(readers, reader)
 	}
-	if bindingResolver := contracts.CurrentBindingResolver(); bindingResolver != nil {
-		if reader, ok := bindingResolver.(graph.SemanticBindingTypeReader); ok {
-			readers = append(readers, reader)
+	if !idx.contractAnalysisOnly {
+		if bindingResolver := contracts.CurrentBindingResolver(); bindingResolver != nil {
+			if reader, ok := bindingResolver.(graph.SemanticBindingTypeReader); ok {
+				readers = append(readers, reader)
+			}
 		}
 	}
 
@@ -8525,6 +8558,10 @@ func (idx *Indexer) readSemanticBindingTypes(sites []graph.SemanticBindingSite) 
 			break
 		}
 		found, err := reader.SemanticBindingTypes(missing)
+		if err != nil && idx.contractAnalysisOnly {
+			idx.rememberContractInputError(err)
+			return resolved
+		}
 		if err != nil && idx.logger != nil {
 			idx.logger.Debug("semantic binding batch lookup failed",
 				zap.Int("reader_index", readerIndex),
