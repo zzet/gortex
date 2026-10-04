@@ -54,7 +54,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return communitiesRulePath(env)
 }
 
-
 // Detect succeeds when any of: project has .cursor/, user has
 // ~/.cursor/, Cursor's application data directory exists, or the
 // `cursor` CLI is on PATH.

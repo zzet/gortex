@@ -74,7 +74,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return filepath.Join(env.Root, ".kilocoderules")
 }
 
-
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	// Project-level hint: .kilocode/ in the repo.
 	if _, err := os.Stat(filepath.Join(env.Root, ".kilocode")); err == nil {

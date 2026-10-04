@@ -32,7 +32,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return filepath.Join(env.Root, ".continue", "rules", "gortex-communities.md")
 }
 
-
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if _, err := os.Stat(filepath.Join(env.Root, ".continue")); err == nil {
 		return true, nil

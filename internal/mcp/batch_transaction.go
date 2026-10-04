@@ -17,6 +17,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 )
@@ -836,6 +837,11 @@ func batchAliasedPathPairs(paths []string, followed func(string) os.FileInfo) []
 }
 
 func applyBatchFileToContent(edit batchEditItem, content []byte) ([]byte, bool, error) {
+	// Same UTF-16 refusal as edit_file: the match below would fail with
+	// a misleading "not found" against NUL-interleaved bytes (#846).
+	if indexer.LooksUTF16Source(content) {
+		return nil, false, refuseUTF16Edit("batch edit_file", edit.Path)
+	}
 	fileStr := string(content)
 	matches := findEOLMatches(fileStr, edit.OldString)
 	if matches.count == 0 {
@@ -866,6 +872,12 @@ func applyBatchFileToContent(edit batchEditItem, content []byte) ([]byte, bool, 
 }
 
 func applyBatchSymbolToContent(edit batchEditItem, node *graph.Node, content []byte) ([]byte, bool, error) {
+	// A UTF-16 file's text is NUL-interleaved, so the match would fail
+	// with a misleading "old_source not found"; the batch refuses with
+	// the same message the single edit tools use (#846).
+	if indexer.LooksUTF16Source(content) {
+		return nil, false, refuseUTF16Edit("batch edit_symbol", node.FilePath)
+	}
 	fileStr := string(content)
 	lines := strings.Split(fileStr, "\n")
 	regionMatches := findEOLMatches(fileStr, edit.OldSource)

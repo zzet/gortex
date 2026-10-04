@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -996,6 +997,7 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		totalFileChars int
 		viewURI        string
 		absPath        string
+		utf16Served    bool
 	)
 	if files := refViewFilesFor(ctx); files != nil {
 		// The symbol's lines belong to the committed tree the view pins, not
@@ -1004,9 +1006,13 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		if viewErr != nil {
 			return mcp.NewToolResultError(viewErr.Error()), nil
 		}
+		decoded, utf16Decoded := decodedSourceForRead(content)
 		viewURI = files.uri(rel)
 		source, startLine, totalFileChars, _ = extractLinesFromContent(
-			string(content), node.StartLine, node.EndLine, contextLines)
+			string(decoded), node.StartLine, node.EndLine, contextLines)
+		if utf16Decoded {
+			utf16Served = true
+		}
 	} else {
 		var resolveErr error
 		absPath, resolveErr = s.resolveNodePath(ctx, node)
@@ -1104,6 +1110,11 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		omissions = append(omissions, omission("secrets_withheld",
 			"secret-shaped values in this config symbol were withheld; pass allow_secrets:true to read them"))
 	}
+	// The disk path decodes inside readLines; this bounded probe only
+	// decides whether to say so.
+	if utf16Served || (absPath != "" && fileLooksUTF16(absPath)) {
+		omissions = append(omissions, utf16DecodedOmission())
+	}
 	if len(omissions) > 0 {
 		result["omissions"] = omissions
 	}
@@ -1137,11 +1148,15 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 // Production handlers should call (*Server).readLinesForCtx so the
 // editor-buffer overlay is honoured when active.
 func readLines(path string, startLine, endLine, contextLines int) (string, int, int, error) {
-	f, err := os.Open(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return "", 0, 0, err
 	}
-	defer f.Close()
+	// Decode a UTF-16 source before line-scanning (#846): the graph holds
+	// symbols extracted from decoded text, so this path must serve the
+	// same text or discovery and reads disagree. Identity for every other
+	// file; the decode preserves line structure 1:1.
+	src := indexer.DecodeUTF16Source(raw)
 
 	from := startLine - contextLines
 	if from < 1 {
@@ -1151,7 +1166,7 @@ func readLines(path string, startLine, endLine, contextLines int) (string, int, 
 
 	var lines []string
 	var totalChars int
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(bytes.NewReader(src))
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
@@ -3002,6 +3017,13 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	content, err := os.ReadFile(absPath)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("could not read file: %v", err)), nil
+	}
+	// Refuse before any match attempt: a UTF-16 file's failure mode below
+	// this point is "old_source not found", which sends the agent to
+	// get_symbol_source — which serves the decoded text — a loop with no
+	// exit (#846).
+	if indexer.LooksUTF16Source(content) {
+		return mcp.NewToolResultError(refuseUTF16Edit("edit_symbol", node.FilePath).Error()), nil
 	}
 	if baseSHA != "" && gitBlobSHA(content) != baseSHA {
 		return mcp.NewToolResultError(errBaseSHADrift), nil

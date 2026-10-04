@@ -112,8 +112,11 @@ func ParseFile(src []byte, lang *sitter.Language) (*sitter.Tree, error) {
 	// Guard before the parser pool. The UTF-16 check must run BEFORE any
 	// binary/NUL sniff: a UTF-16 source's NUL-interleaved bytes would
 	// otherwise be labelled "binary" instead of "UTF-16", and nothing would
-	// name the real cause. The indexer's BOM-strip transform deliberately
-	// leaves UTF-16 marks in place so this check can fire.
+	// name the real cause. The indexer's utf16-decode transform decodes
+	// healthy UTF-16 sources ahead of extraction (its BOM-strip then
+	// removes the mark), and a coordinate-stable preparation refuses a
+	// declined UTF-16 source outright — so this guard is a backstop for
+	// direct ParseFile callers, not the primary defence.
 	if hasUTF16BOM(src) {
 		return nil, ErrUTF16Source
 	}

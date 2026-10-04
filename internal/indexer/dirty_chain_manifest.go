@@ -531,7 +531,7 @@ func (b *SparseGenerationBuilder) manifestAdmitter(root string, target source.Co
 	idx := &Indexer{
 		registry:   b.Registry,
 		config:     b.Config,
-		transforms: newTransformPipeline(b.Config.Transforms, b.Logger),
+		transforms: newTransformPipeline(b.Config.Transforms, b.Registry, b.Logger),
 		logger:     b.Logger,
 		rootPath:   absRoot,
 	}

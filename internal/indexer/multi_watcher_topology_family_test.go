@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
+	"github.com/zzet/gortex/internal/thirdparty/fsnotify"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"

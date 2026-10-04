@@ -48,6 +48,18 @@ linters:
       - path: internal/thirdparty/fswatcher/
         linters:
           - unused
+      # internal/thirdparty/fsnotify is upstream fsnotify v1.10.1, verbatim
+      # apart from the Windows patches listed in its README. Its per-platform
+      # backends share helpers that each single-GOOS `unused` pass sees as
+      # dead, and upstream style (ignored CloseHandle / startRead results,
+      # the xErr naming) trips errcheck and staticcheck. Fixing those would
+      # mean diverging from upstream for no behavioural gain, so those three
+      # linters are exempt on this path; govet and ineffassign still apply.
+      - path: internal/thirdparty/fsnotify/
+        linters:
+          - unused
+          - errcheck
+          - staticcheck
     presets:
       # Drops the well-known stdlib error-handling false positives that
       # errcheck flags: the fmt print family, (*T).Close / .Flush,

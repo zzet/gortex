@@ -47,7 +47,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return filepath.Join(env.Root, "AGENTS.md")
 }
 
-
 // Detect always returns true. Claude Code is the "home" agent for
 // `gortex init` — a project may not be opened in Claude Code today
 // but we always want the integration files on disk so the team's

@@ -276,6 +276,12 @@ type Indexer struct {
 	// extractionLifecycle rejects new parses once Close begins and waits for
 	// every admitted in-process, crash-worker, streaming, and overlay request.
 	extractionLifecycle extractionLifecycle
+	// silentZero queues files whose extraction reported success but minted
+	// zero symbols from a partial parse (#812 defense in depth). Drained
+	// into the failure ledger at pass end, after the version receipts that
+	// clear ledger entries, so the diagnostic survives.
+	silentZeroMu sync.Mutex
+	silentZero   map[string]struct{}
 	// extractionOptions is loaded once after the repository root is established.
 	// The pointed-to value is immutable for the Indexer's lifetime.
 	extractionOptionsOnce sync.Once
@@ -696,7 +702,7 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 		// store already spends on the graph itself.
 		search:        search.NewSwappable(initialSearchBackend(g)),
 		config:        cfg,
-		transforms:    newTransformPipeline(cfg.Transforms, logger),
+		transforms:    newTransformPipeline(cfg.Transforms, reg, logger),
 		logger:        logger,
 		fileMtimes:    make(map[string]int64),
 		contractCache: make(map[string]*contractCacheEntry),

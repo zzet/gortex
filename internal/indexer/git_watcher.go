@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/zzet/gortex/internal/gitcmd"
 	"github.com/zzet/gortex/internal/gitstate"
+	"github.com/zzet/gortex/internal/thirdparty/fsnotify"
 	"go.uber.org/zap"
 )
 

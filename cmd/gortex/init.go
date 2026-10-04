@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
@@ -209,6 +210,12 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 	if err != nil {
 		return err
 	}
+
+	// A repo .gortex.yaml that fails to parse, or carries unknown keys
+	// (at any depth), is silently reduced to defaults — the exact moment
+	// a one-character typo turns into "indexing proceeds on the wrong
+	// file set". Say it out loud before anything else runs.
+	warnIfWorkspaceConfigIgnored(cmd.ErrOrStderr(), absRoot)
 
 	// Bind this directory as a single-project entry point so the MCP
 	// server can resolve it without --hooks-only setups, daemon-less
@@ -431,6 +438,36 @@ func skillsStageLabel(n int, running []agents.Adapter, env agents.Env) string {
 		return fmt.Sprintf("%d community skill(s)", n)
 	default:
 		return fmt.Sprintf("communities block(s) in %d instruction file(s) (no skill files)", routing)
+	}
+}
+
+// warnIfWorkspaceConfigIgnored surfaces a repo .gortex.yaml that exists but
+// will not take effect: either it fails to parse (the whole file is ignored
+// and builtins apply) or it contains keys at any depth that gortex does not
+// recognize (those keys are silently dropped by yaml.Unmarshal). Both
+// otherwise surface as "indexing proceeds on the wrong file set" with no
+// hint at the cause.
+//
+// The parse goes through config.ParseWorkspaceFile — the daemon's own
+// acceptance semantics — not config.Load: viper's weak decode and the
+// workspace schema rules accept/reject a different file set than
+// yaml.Unmarshal does, so this warning must not use them. Warn exactly
+// when the daemon would ignore the file, stay silent when the daemon
+// accepts it. Schema-only violations (e.g. both `project` and `projects`
+// set) surface where they are enforced, not as a false "failed to parse"
+// here.
+func warnIfWorkspaceConfigIgnored(w io.Writer, root string) {
+	cfgPath := filepath.Join(root, ".gortex.yaml")
+	if _, err := os.Stat(cfgPath); err != nil {
+		return
+	}
+	if _, err := config.ParseWorkspaceFile(cfgPath); err != nil {
+		fmt.Fprintf(w, "[gortex init] warning: %s failed to parse — its settings are being ignored: %v\n", cfgPath, err)
+		return
+	}
+	if unknown := config.UnknownWorkspaceKeys(cfgPath); len(unknown) > 0 {
+		fmt.Fprintf(w, "[gortex init] warning: %s contains keys gortex does not recognize (they are ignored): %s\n",
+			cfgPath, strings.Join(unknown, ", "))
 	}
 }
 

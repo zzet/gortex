@@ -79,7 +79,6 @@ func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
 	return filepath.Join(env.Root, "AGENTS.md")
 }
 
-
 // Detect reports whether Pi is in use: a project-local `.pi/` dir, a
 // user-level `~/.pi/`, or the `pi` CLI on PATH.
 func (a *Adapter) Detect(env agents.Env) (bool, error) {

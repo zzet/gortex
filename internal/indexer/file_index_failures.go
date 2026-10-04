@@ -213,6 +213,11 @@ func (idx *Indexer) pruneMissingFileIndexFailures() {
 }
 
 func (idx *Indexer) flushFileIndexFailures() {
+	// Drain the silent-zero pending set first, inside the same lock the
+	// persistence below reads: the notes must be in state.rows before the
+	// rows slice is built, and this runs after the pass's version
+	// receipts, so nothing clears them again this pass.
+	idx.flushSilentZeroNotes()
 	state := &idx.fileIndexFailures
 	state.mu.Lock()
 	defer state.mu.Unlock()

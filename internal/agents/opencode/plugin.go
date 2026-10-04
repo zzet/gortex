@@ -10,6 +10,10 @@ package opencode
 // ships one — a thin shim that shells `gortex hook --agent=opencode` and
 // applies the decision. The policy stays in Go; see plugin/gortex.js.
 //
+// OpenCode 2 changed the plugin contract (a default export `{ id, setup }`
+// that registers hooks on domains) and refuses to run a 1.x plugin, so the
+// one file carries both entrypoints: `setup` for 2.x, `server` for 1.18.x.
+//
 // # Why the user-level plugin dir, never the repo's
 //
 // This is the only executable artifact Gortex writes anywhere. The

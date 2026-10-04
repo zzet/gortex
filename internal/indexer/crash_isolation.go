@@ -261,6 +261,18 @@ func (idx *Indexer) extractFileCtxWithRawLease(
 			return binarySkipResult(relPath, lang, reason), true, nil
 		}
 	}
+	// #812 defense in depth: an extraction that reports success but
+	// minted zero symbols from a partial parse used to vanish from the
+	// graph with no diagnostic. The UTF-16 decode transform removes the
+	// known cause; this catches every remaining silent-zero shape. The
+	// note goes through the pending set, not the ledger directly — the
+	// version receipt this file's caller records afterwards would clear
+	// a direct entry before any flush persisted it.
+	defer func() {
+		if err == nil && !skipped && silentZeroExtraction(result) {
+			idx.noteSilentZeroExtraction(relPath)
+		}
+	}()
 	// Bundled / minified build artifacts are synthetic source — a
 	// minified bundle or a sourcemap has no meaningful symbols and
 	// only pollutes the graph. Detect by content and skip with

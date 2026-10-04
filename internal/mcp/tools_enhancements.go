@@ -2841,7 +2841,11 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 
 	if !dryRun && s.indexer != nil {
-		// Apply edits by writing files
+		// Apply edits by writing files. Every write funnels through
+		// commitFileMutation — the UTF-16 refusal (#846), the cancellation
+		// gate, and the mutation receipt live there. A direct os.WriteFile
+		// used to splice UTF-8 into NUL-interleaved bytes and corrupt the
+		// file from the insertion point on.
 		for _, edit := range result.Edits {
 			absPath := edit.FilePath
 			if root := s.indexer.RootPath(); root != "" {
@@ -2859,7 +2863,19 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 			newLines = append(newLines, "")
 			newLines = append(newLines, edit.Code)
 			newLines = append(newLines, lines[insertIdx:]...)
-			if writeErr := os.WriteFile(absPath, []byte(strings.Join(newLines, "\n")), 0o644); writeErr != nil {
+			// Keep the file's existing mode: the atomic commit applies perm
+			// to the replacement, so a fixed 0o644 would strip a script's
+			// executable bit.
+			perm := os.FileMode(0o644)
+			if info, err := os.Stat(absPath); err == nil {
+				perm = info.Mode().Perm()
+			}
+			commit, writeErr := s.commitFileMutation(ctx, "scaffold", "", "", edit.FilePath, absPath,
+				[]byte(strings.Join(newLines, "\n")), perm)
+			if writeErr != nil {
+				if errors.Is(writeErr, errMutationNotApplied) {
+					return mcp.NewToolResultError(mutationNotAppliedMessage("scaffold", commit, writeErr)), nil
+				}
 				return mcp.NewToolResultError(fmt.Sprintf("could not write %s: %v", edit.FilePath, writeErr)), nil
 			}
 		}
@@ -4367,6 +4383,12 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem, w
 		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
 		return res
 	}
+	// Same UTF-16 refusal as edit_symbol: the match below would fail
+	// with a misleading "not found" against NUL-interleaved bytes (#846).
+	if indexer.LooksUTF16Source(content) {
+		res.Status, res.Error = "failed", refuseUTF16Edit("batch edit_symbol", node.FilePath).Error()
+		return res
+	}
 	fileStr := string(content)
 	lines := strings.Split(fileStr, "\n")
 
@@ -4493,6 +4515,12 @@ func (s *Server) applyBatchFileEdit(ctx context.Context, edit batchEditItem, wri
 	content, readErr := os.ReadFile(absPath)
 	if readErr != nil {
 		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
+		return res
+	}
+	// Same UTF-16 refusal as edit_file: the match below would fail with a
+	// misleading "not found" against NUL-interleaved bytes (#846).
+	if indexer.LooksUTF16Source(content) {
+		res.Status, res.Error = "failed", refuseUTF16Edit("batch edit_file", relPath).Error()
 		return res
 	}
 	fileStr := string(content)

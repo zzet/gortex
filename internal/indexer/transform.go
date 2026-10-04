@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/platform"
 )
 
@@ -58,10 +59,13 @@ type transformPipeline struct {
 	logger     *zap.Logger
 }
 
-// newTransformPipeline builds the pipeline: the always-on BOM stripper
-// followed by every user-declared external-command transform, in
-// config order.
-func newTransformPipeline(rules []config.TransformRule, logger *zap.Logger) *transformPipeline {
+// newTransformPipeline builds the pipeline: the always-on UTF-16
+// decoder (which must see the BOM before the stripper consumes it, and
+// which skips asset extensions — content extractors read binary on
+// purpose) followed by the BOM stripper and every user-declared
+// external-command transform, in config order. reg may be nil, which
+// leaves the decoder unskipped.
+func newTransformPipeline(rules []config.TransformRule, reg *parser.Registry, logger *zap.Logger) *transformPipeline {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -69,7 +73,11 @@ func newTransformPipeline(rules []config.TransformRule, logger *zap.Logger) *tra
 	// Offset-preserving pre-parse slot: built-ins that blank parser-hostile
 	// spans to spaces without shifting positions.
 	p.prePass = append(p.prePass, csharpPreprocBlankTransform{})
-	p.transforms = append(p.transforms, bomStripTransform{})
+	decoder := utf16DecodeTransform{}
+	if reg != nil {
+		decoder.assetExts = reg.AssetExtensions()
+	}
+	p.transforms = append(p.transforms, decoder, bomStripTransform{})
 	for _, r := range rules {
 		if len(r.Command) == 0 {
 			logger.Warn("indexer: transform rule has no command; ignored",
@@ -150,6 +158,15 @@ func (p *transformPipeline) prepareCoordinateStable(path string, src []byte) ([]
 			out, err = neutralizeSourceBOM(out)
 			if err != nil {
 				return nil, err
+			}
+		case utf16DecodeTransform:
+			// The decoder is coordinate-stable for every non-UTF-16 source
+			// (identity), and that is all this path may admit: a real
+			// transcode shifts every byte offset, so rename recovery —
+			// which edits the raw file — must still refuse it.
+			decoded := decodeUTF16Source(out)
+			if !bytes.Equal(decoded, out) {
+				return nil, fmt.Errorf("UTF-16 source cannot be prepared without changing source coordinates")
 			}
 		default:
 			return nil, fmt.Errorf("source transform %q does not guarantee coordinate preservation", transform.name())
@@ -271,13 +288,11 @@ func (idx *Indexer) effectiveLanguage(path string, src []byte) (string, bool) {
 
 // --- built-in: BOM strip -------------------------------------------------
 
-// bomStripTransform removes a leading UTF-8 / UTF-16 byte-order mark. A
-// BOM at offset 0 is not whitespace to a tree-sitter grammar and breaks
-// the first token (e.g. a Go file's `package` clause), so stripping it
-// is always correct — this transform is on for every file. UTF-16 marks
-// are deliberately left in place: parser.ParseFile rejects UTF-16
-// sources via that mark, and stripping it would turn the file into
-// NUL-interleaved garbage no downstream check can recognise.
+// bomStripTransform removes a leading UTF-8 byte-order mark, and the
+// UTF-16 marks too (see stripBOM). A BOM at offset 0 is not whitespace to
+// a tree-sitter grammar and breaks the first token (e.g. a Go file's
+// `package` clause), so stripping it is always correct — this transform
+// is on for every file.
 type bomStripTransform struct{}
 
 func (bomStripTransform) name() string        { return "bom-strip" }
@@ -287,15 +302,24 @@ func (bomStripTransform) apply(_ string, src []byte) ([]byte, error) {
 	return stripBOM(src), nil
 }
 
-// stripBOM drops a leading UTF-8 byte-order mark. UTF-16 marks are
-// preserved on purpose: stripping the two BOM bytes would leave the
-// NUL-interleaved body unrecognisable as UTF-16, and the body must
-// never reach tree-sitter (see parser.ErrUTF16Source).
+// stripBOM drops a leading UTF-8, UTF-16LE or UTF-16BE byte-order mark.
+// The UTF-16 branches only ever fire on a source the utf16-decode
+// transform ahead of this one declined (its validation passes the
+// payload through byte-for-byte, mark included): removing the mark costs
+// nothing there — the diagnostic value lives in the NUL pattern that
+// remains, and a coordinate-stable preparation still refuses the source
+// outright (see neutralizeSourceBOM).
 func stripBOM(src []byte) []byte {
-	if len(src) >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF {
+	switch {
+	case len(src) >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF:
 		return src[3:]
+	case len(src) >= 2 && src[0] == 0xFF && src[1] == 0xFE:
+		return src[2:]
+	case len(src) >= 2 && src[0] == 0xFE && src[1] == 0xFF:
+		return src[2:]
+	default:
+		return src
 	}
-	return src
 }
 
 // --- user-pluggable: external command ------------------------------------
