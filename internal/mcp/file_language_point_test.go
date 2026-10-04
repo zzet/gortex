@@ -17,7 +17,7 @@ import (
 )
 
 type fileLanguagePointSpy struct {
-	graph.Reader
+	graph.Store
 	ids              []string
 	err              error
 	scans, adjacency int
@@ -28,7 +28,7 @@ func (r *fileLanguagePointSpy) GetNodeContext(ctx context.Context, id string) (*
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return r.Reader.GetNode(id), r.err
+	return r.Store.GetNode(id), r.err
 }
 func (r *fileLanguagePointSpy) GetFileNodes(string) []*graph.Node { r.scans++; return nil }
 func (r *fileLanguagePointSpy) AllNodes() []*graph.Node           { r.scans++; return nil }
@@ -41,7 +41,7 @@ func (r *fileLanguagePointSpy) GetInEdgesByNodeIDs([]string) map[string][]*graph
 	return nil
 }
 
-func newFileLanguageServer(reader graph.Reader) *Server {
+func newFileLanguageServer(reader graph.Store) *Server {
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
 	idx := indexer.New(graph.New(), reg, config.Default().Index, zap.NewNop())
@@ -52,7 +52,7 @@ func TestDetectFileLanguageUsesOnlySelectedCanonicalPoint(t *testing.T) {
 	g := graph.New()
 	path := "repo/file.go"
 	g.AddNode(&graph.Node{ID: path, Kind: graph.KindFile, FilePath: path, RepoPrefix: "repo", Language: "indexed-go"})
-	spy := &fileLanguagePointSpy{Reader: g}
+	spy := &fileLanguagePointSpy{Store: g}
 	s := newFileLanguageServer(spy)
 	require.Equal(t, "indexed-go", s.detectLanguageForPath(t.Context(), filepath.Join(t.TempDir(), "file.go"), path))
 	require.Equal(t, []string{path}, spy.ids)
@@ -95,7 +95,7 @@ func TestDetectFileLanguageRegistryFallbackAndSourceBypass(t *testing.T) {
 				n.RepoPrefix = "other"
 			}
 			g.AddNode(n)
-			spy := &fileLanguagePointSpy{Reader: g}
+			spy := &fileLanguagePointSpy{Store: g}
 			if mode == "read_error" {
 				spy.err = errors.New("checked lookup failed")
 			}
