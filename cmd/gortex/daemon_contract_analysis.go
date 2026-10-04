@@ -21,10 +21,10 @@ type daemonContractAnalysis struct {
 	baselineJobs        sync.WaitGroup
 }
 
-// installDaemonContractAnalysis is explicitly gated until integrated native
-// qualification. It installs the single implementation, never a stub capture.
+// installDaemonContractAnalysis installs the production runtime before warmup.
+// The explicit opt-out keeps the diagnostic comparison on its legacy path.
 func installDaemonContractAnalysis(state *daemonState, logger *zap.Logger) (*daemonContractAnalysis, error) {
-	if os.Getenv("GORTEX_ASYNC_CONTRACTS") != "1" {
+	if os.Getenv("GORTEX_ASYNC_CONTRACTS") == "0" {
 		return nil, nil
 	}
 	if state == nil || state.mcpServer == nil || state.indexer == nil || state.multiIndexer == nil || state.lifecycle == nil {

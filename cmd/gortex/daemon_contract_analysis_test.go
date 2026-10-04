@@ -11,12 +11,12 @@ import (
 )
 
 func TestInstallDaemonContractAnalysisGate(t *testing.T) {
-	t.Setenv("GORTEX_ASYNC_CONTRACTS", "")
+	t.Setenv("GORTEX_ASYNC_CONTRACTS", "0")
 	runtime, err := installDaemonContractAnalysis(nil, zap.NewNop())
 	if err != nil || runtime != nil {
 		t.Fatalf("inactive gate installed runtime=%#v err=%v", runtime, err)
 	}
-	t.Setenv("GORTEX_ASYNC_CONTRACTS", "1")
+	t.Setenv("GORTEX_ASYNC_CONTRACTS", "")
 	runtime, err = installDaemonContractAnalysis(nil, zap.NewNop())
 	if err == nil || runtime != nil {
 		t.Fatalf("incomplete runtime accepted=%#v err=%v", runtime, err)
