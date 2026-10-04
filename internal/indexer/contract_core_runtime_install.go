@@ -59,9 +59,9 @@ func (idx *Indexer) SetContractCoreRuntime(hooks ContractCoreRuntimeHooks) {
 func (l *CheckoutLifecycle) SetContractCoreRuntime(hooks ContractCoreRuntimeHooks) error {
 	l.refViewMu.Lock()
 	defer l.refViewMu.Unlock()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if len(l.coordinators) != 0 || len(l.refViews) != 0 {
+	l.coordMu.Lock()
+	defer l.coordMu.Unlock()
+	if len(l.coordinators) != 0 || len(l.started) != 0 || len(l.coordinatorActivating) != 0 || len(l.refViews) != 0 || l.coordinatorClosing || l.refViewsClosed {
 		return fmt.Errorf("contract core runtime: install before checkout or ref coordinators are constructed")
 	}
 	l.contractCoreRuntime.Store(&hooks)
