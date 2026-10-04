@@ -374,6 +374,29 @@ func testSustainedImportProgress(t *testing.T, inline, slowPreamble, slowFoldPla
 	for {
 		out, ok := await(ctx)
 		if !ok {
+			// Completion failure otherwise skips the existing diagnostics below.
+			// Snapshot only already-captured facts: no graph/catalog reads or new
+			// timing assertion, and the active producer need not be stopped first.
+			deadline, _ := ctx.Deadline()
+			t.Logf("import timeout: context=%v deadline=%s completed_cycles=%d gate=%+v",
+				ctx.Err(), deadline.UTC().Format(time.RFC3339Nano), len(cycles), gate.Stats())
+			logs, droppedLogs, writeCost := admissionLogs.snapshot()
+			t.Logf("import timeout captured diagnostics: logs=%d logs_dropped=%d sink_write_cost=%s (excludes JSON encoding)", len(logs), droppedLogs, writeCost)
+			for _, entry := range logs { // The sink retains at most 256 lines / 512 KiB.
+				t.Logf("import timeout existing phase log: %s", strings.TrimSpace(entry))
+			}
+			first := max(0, len(cycles)-40)
+			for i := first; i < len(cycles); i++ {
+				cy := cycles[i]
+				var physical []GenerationPhase
+				if cy.out.DirtyWork != nil {
+					physical = cy.out.DirtyWork.Phases
+				}
+				plan := cy.out.PlanLaps
+				t.Logf("import timeout cycle: cycle=%d started=%s generation=%d remaining=%d built=%t folded=%t rescheduled=%t yield=%s err=%v plan_count=%d physical_count=%d plan=%v physical=%v",
+					i, cy.out.cycleStarted.UTC().Format(time.RFC3339Nano), cy.out.DirtyGenerationID, cy.out.DirtyBatchRemaining, cy.out.DirtyBuilt, cy.out.ImportFolded, cy.out.Rescheduled, cy.out.YieldedTo, cy.out.Err,
+					len(plan), len(physical), plan[max(0, len(plan)-32):], physical[max(0, len(physical)-32):])
+			}
 			t.Fatal("the import did not complete while interactive demand remained active")
 		}
 		record(out)
