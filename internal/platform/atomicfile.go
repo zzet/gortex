@@ -12,20 +12,24 @@ import (
 const ClaimMarkerSuffix = ".claim"
 
 const (
-	// A rename, a read or a delete can lose a race with a concurrent holder
-	// on Windows; 20 attempts 3ms apart bound the wait at 60ms.
-	transientAttempts = 20
-	transientDelay    = 3 * time.Millisecond
+	// A rename, read or delete can lose a race with a concurrent holder on
+	// Windows. Give editors, language servers, antivirus and indexers a few
+	// seconds to release the handle while keeping an interactive failure bounded.
+	transientRetryBudget   = 3 * time.Second
+	transientRetryDelay    = 5 * time.Millisecond
+	transientRetryMaxDelay = 250 * time.Millisecond
 )
 
 const (
-	// The delete a won claim still owes runs on a much longer budget than the
-	// 60ms above, because it is no longer racing anybody: the claim is already
-	// decided and only the file name is outstanding, while the readers that
-	// refuse the delete on Windows hold the file for as long as their own read
-	// takes. Go's own testing.TempDir cleanup waits about this long for the
-	// same refusal to clear. The backoff starts short so an uncontended delete
-	// still lands on the first retry.
+	// ClaimFile and ConsumeFile keep a short first probe: their callers use
+	// those primitives to arbitrate concurrent ownership, so an external reader
+	// must not make arbitration wait for the full user-facing write budget.
+	claimProbeBudget = 60 * time.Millisecond
+	claimProbeDelay  = 3 * time.Millisecond
+
+	// Once a claim is won, retiring the payload runs on a longer budget because
+	// only the file name is outstanding and readers may hold it for the duration
+	// of their own read.
 	claimRemoveBudget   = 2 * time.Second
 	claimRemoveDelay    = time.Millisecond
 	claimRemoveMaxDelay = 64 * time.Millisecond
@@ -39,11 +43,21 @@ const (
 // or "Access is denied" while any handle to either end is open — including one
 // held for microseconds by another goroutine that is reading the destination
 // or replacing it at the same instant — so on Windows those transient failures
-// are retried briefly. A vanished source is never retried: it reports
+// retry with bounded exponential backoff. The wait is deliberately long enough
+// for antivirus, language servers and indexers, while errors outside the
+// platform's sharing classification still fail immediately. A vanished source
+// is never retried: it reports
 // ERROR_FILE_NOT_FOUND, which means another caller already moved it and no
 // amount of waiting brings it back.
 func ReplaceFile(oldpath, newpath string) error {
-	return retryTransient(func() error { return os.Rename(oldpath, newpath) })
+	return retryTransientWithin(func() error { return os.Rename(oldpath, newpath) }, transientRetryBudget, transientRetryDelay, transientRetryMaxDelay)
+}
+
+// RemoveFile deletes path, absorbing transient Windows sharing refusals caused
+// by readers that have not yet released their handle. On POSIX no error is
+// transient, so the remove runs exactly once.
+func RemoveFile(path string) error {
+	return retryTransientWithin(func() error { return os.Remove(path) }, transientRetryBudget, transientRetryDelay, transientRetryMaxDelay)
 }
 
 // ClaimFile grants exactly one caller the right to consume path and retires it
@@ -104,11 +118,11 @@ func ConsumeFile(path string) ([]byte, bool) {
 	}
 	defer release()
 	var data []byte
-	err := retryTransient(func() error {
+	err := retryTransientWithin(func() error {
 		var readErr error
 		data, readErr = os.ReadFile(path) //nolint:gosec // the caller owns the path
 		return readErr
-	})
+	}, claimProbeBudget, claimProbeDelay, claimProbeDelay)
 	if err != nil {
 		return nil, false
 	}
@@ -164,32 +178,20 @@ func collectConsumedPayload(path string) {
 // Go opens files with FILE_SHARE_WRITE — so the content goes away even when
 // the name cannot yet.
 func emptyPayload(path string) error {
-	return retryTransient(func() error {
+	return retryTransientWithin(func() error {
 		f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // the caller owns the path
 		if err != nil {
 			return err
 		}
 		return f.Close()
-	})
+	}, claimProbeBudget, claimProbeDelay, claimProbeDelay)
 }
 
 // removeWithin deletes path, retrying a transient sharing refusal with an
 // exponential backoff until the budget is spent. On POSIX no error is
 // transient, so the delete runs exactly once.
 func removeWithin(path string, budget time.Duration) error {
-	deadline := time.Now().Add(budget)
-	err := os.Remove(path)
-	for delay := claimRemoveDelay; err != nil && transientSharingError(err); {
-		if time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(delay)
-		if delay < claimRemoveMaxDelay {
-			delay *= 2
-		}
-		err = os.Remove(path)
-	}
-	return err
+	return retryTransientWithin(func() error { return os.Remove(path) }, budget, claimRemoveDelay, claimRemoveMaxDelay)
 }
 
 // claimMarker exclusively creates path's claim marker, returning the release
@@ -214,19 +216,31 @@ func claimMarker(path string) (func(), bool) {
 // microseconds of its read makes DeleteFile fail with "Access is denied" —
 // which on POSIX cannot happen at all, since unlink(2) only detaches the name.
 func removeFile(path string) error {
-	return retryTransient(func() error { return os.Remove(path) })
+	return retryTransientWithin(func() error { return os.Remove(path) }, claimProbeBudget, claimProbeDelay, claimProbeDelay)
 }
 
-// retryTransient runs op, repeating it while it fails with a sharing failure
-// another holder will shortly release. On POSIX no error is transient, so op
-// runs exactly once.
-func retryTransient(op func() error) error {
+// retryTransientWithin runs op, repeating it with exponential backoff while it
+// fails with a sharing failure another holder will release. The final sleep is
+// capped by the remaining budget. On POSIX no error is transient, so op runs
+// exactly once.
+func retryTransientWithin(op func() error, budget, delay, maxDelay time.Duration) error {
+	deadline := time.Now().Add(budget)
 	err := op()
-	for attempt := 1; err != nil && attempt < transientAttempts; attempt++ {
-		if !transientSharingError(err) {
+	for err != nil && transientSharingError(err) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			break
 		}
-		time.Sleep(transientDelay)
+		if delay > remaining {
+			delay = remaining
+		}
+		time.Sleep(delay)
+		if delay < maxDelay {
+			delay *= 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+		}
 		err = op()
 	}
 	return err

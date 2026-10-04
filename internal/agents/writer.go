@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // writer.go centralises every write `gortex init` performs. Going
@@ -152,7 +154,7 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		cleanup()
 		return fmt.Errorf("close %s: %w", tmpPath, err)
 	}
-	if err := renameWithRetry(tmpPath, path); err != nil {
+	if err := platform.ReplaceFile(tmpPath, path); err != nil {
 		cleanup()
 		return fmt.Errorf("rename %s -> %s: %w", tmpPath, path, err)
 	}
@@ -168,10 +170,9 @@ const tempInfix = ".gortex.tmp-"
 
 // staleTempAge is how long an orphaned temp must sit untouched before a
 // later write reaps it. It only has to exceed the lifetime of one
-// in-flight AtomicWriteFile — a data write plus renameWithRetry's
-// ~225ms worst-case backoff — so an hour is orders of magnitude of
-// headroom and guarantees a concurrent write's fresh temp is never
-// mistaken for debris.
+// in-flight AtomicWriteFile — a data write plus platform.ReplaceFile's bounded
+// retry budget — so an hour is orders of magnitude of headroom and guarantees
+// a concurrent write's fresh temp is never mistaken for debris.
 const staleTempAge = time.Hour
 
 // cleanStaleTempFiles best-effort removes temp files an earlier
@@ -199,37 +200,6 @@ func cleanStaleTempFiles(dir string) {
 		}
 		_ = os.Remove(filepath.Join(dir, e.Name()))
 	}
-}
-
-// renameWithRetry renames oldPath onto newPath, retrying briefly when the
-// failure is a transient, Windows-specific sharing violation (see
-// isRetryableRenameErr). On POSIX the predicate is always false, so this
-// collapses to a single os.Rename with no added latency.
-//
-// os.Rename maps to MoveFileEx(MOVEFILE_REPLACE_EXISTING) on Windows,
-// which fails with ERROR_SHARING_VIOLATION / ERROR_ACCESS_DENIED when
-// another process still holds the destination open without
-// FILE_SHARE_DELETE — an editor's language server, antivirus, a search
-// indexer, or Gortex's own file watcher re-indexing the file we just
-// wrote. Those holders release the handle within milliseconds, so a
-// short bounded retry turns a spurious "file is being used by another
-// process" error into the atomic replace the caller asked for. Worst
-// case is ~225ms of backoff, imperceptible for an interactive write.
-func renameWithRetry(oldPath, newPath string) error {
-	const attempts = 10
-	var err error
-	for attempt := range attempts {
-		if err = os.Rename(oldPath, newPath); err == nil {
-			return nil
-		}
-		if !isRetryableRenameErr(err) {
-			return err
-		}
-		if attempt < attempts-1 {
-			time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
-		}
-	}
-	return err
 }
 
 // MergeJSON reads path (if present), parses it as a JSON object,
