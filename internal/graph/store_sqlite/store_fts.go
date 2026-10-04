@@ -748,6 +748,12 @@ func (s *Store) searchSymbolsPathScopedContext(ctx context.Context, query string
 		return nil, nil
 	}
 
+	if len(pathPrefixes) > 0 {
+		if hits, handled, err := s.searchSymbolPathPointPlan(ctx, match, repoAllow, pathPrefixes, limit); handled {
+			return hits, err
+		}
+	}
+
 	// A derived generation with a dense rowid run is ranked inside it; see
 	// symbolFTSSpanFraction. The page is the one the unbounded query returns.
 	if len(pathPrefixes) == 0 {
