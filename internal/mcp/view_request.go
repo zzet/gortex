@@ -1746,13 +1746,38 @@ func (r *baseGraphReader) keepEdges(edges []*graph.Edge, far func(*graph.Edge) s
 	if len(edges) == 0 {
 		return edges
 	}
-	ids := make([]string, 0, len(edges))
-	for _, edge := range edges {
-		if edge != nil && far(edge) != "" {
-			ids = append(ids, far(edge))
-		}
+	return r.keepEdgesWithFarNodes(edges, far, r.hydrateFarNodes(edges, far))
+}
+
+// hydrateFarNodes shares repeated far endpoints within one adjacency read.
+// Missing rows remain missing: the filter deliberately keeps unresolved ends.
+func (r *baseGraphReader) hydrateFarNodes(edges []*graph.Edge, far func(*graph.Edge) string) map[string]*graph.Node {
+	if len(edges) == 0 {
+		return nil
 	}
-	hydrated := r.base.GetNodesByIDs(ids)
+	ids := make([]string, 0, len(edges))
+	seen := make(map[string]struct{}, len(edges))
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+		id := far(edge)
+		if id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return r.base.GetNodesByIDs(ids)
+}
+
+func (r *baseGraphReader) keepEdgesWithFarNodes(edges []*graph.Edge, far func(*graph.Edge) string, hydrated map[string]*graph.Node) []*graph.Edge {
+	if len(edges) == 0 {
+		return edges
+	}
 	local := make([]*graph.Edge, 0, len(edges))
 	for _, edge := range edges {
 		if edge == nil {
@@ -1924,18 +1949,18 @@ func (r *baseGraphReader) adjacencyByNodeIDs(
 		return map[string][]*graph.Edge{}
 	}
 	walked := walk(scoped)
-	// One batched site lookup for the whole walk, not one per anchor: the
-	// per-list filter below then finds every decision already memoized. The
-	// union is what keeps a fan-out over anchors from reappearing as a fan-out
-	// over batches.
+	// Share endpoint hydration and site decisions across the whole walk.
+	// Filtering each anchor's list must not issue another far-node batch:
+	// that turns one adjacency read into one metadata query per anchor.
 	union := make([]*graph.Edge, 0, len(walked))
 	for _, edges := range walked {
 		union = append(union, edges...)
 	}
+	hydrated := r.hydrateFarNodes(union, far)
 	r.prefetchSites(union)
 	out := make(map[string][]*graph.Edge, len(walked))
 	for id, edges := range walked {
-		out[id] = r.keepEdges(edges, far)
+		out[id] = r.keepEdgesWithFarNodes(edges, far, hydrated)
 	}
 	return out
 }
