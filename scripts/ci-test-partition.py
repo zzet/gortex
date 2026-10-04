@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-SHARDS = 3
+SHARDS = {"store": 3, "indexer": 6}
 NAME_BUNDLE = 32
 WINDOWS_COMMAND_BUDGET = 30000
 TEST_EXECUTION_BUDGET_SECONDS = 45 * 60
@@ -65,13 +65,13 @@ def exact_pattern(names):
     return "^(?:" + render(trie) + ")$"
 
 
-def plan_shards(names, bundle_size=NAME_BUNDLE):
+def plan_shards(names, bundle_size=NAME_BUNDLE, shard_count=3):
     # Small adjacent bundles share enough prefixes for Windows command lines,
     # while round-robin assignment spreads name families across every runner.
     # Capacity limits keep the top-level case counts balanced to one case.
-    targets = [len(names) // SHARDS + (index < len(names) % SHARDS)
-               for index in range(SHARDS)]
-    assignments = [[] for _ in range(SHARDS)]
+    targets = [len(names) // shard_count + (index < len(names) % shard_count)
+               for index in range(shard_count)]
+    assignments = [[] for _ in range(shard_count)]
     index = 0
     for start in range(0, len(names), bundle_size):
         bundle = names[start:start + bundle_size]
@@ -79,7 +79,7 @@ def plan_shards(names, bundle_size=NAME_BUNDLE):
             count = min(len(bundle), targets[index] - len(assignments[index]))
             assignments[index].extend(bundle[:count])
             bundle = bundle[count:]
-            index = (index + 1) % SHARDS
+            index = (index + 1) % shard_count
     assignments = [sorted(assignment) for assignment in assignments]
     if any(not assignment for assignment in assignments):
         raise ValueError("every shard must have at least one compiled test")
@@ -106,14 +106,14 @@ def planned_command_units(command):
                           for arg in command])
 
 
-def plan_shard_commands(names, census_prefix, test_prefix, package, windows_api=None):
+def plan_shard_commands(names, census_prefix, test_prefix, package, windows_api=None, shard_count=3):
     # Keep existing membership when it fits. Larger adjacent bundles retain
     # exact coverage and balance while factoring more shared name prefixes.
     if windows_api is None:
         windows_api = os.name == "nt"
     bundle_size = NAME_BUNDLE
     while True:
-        assignments, patterns = plan_shards(names, bundle_size)
+        assignments, patterns = plan_shards(names, bundle_size, shard_count)
         commands = [prefix + [flag, pattern, package]
                     for pattern in patterns
                     for prefix, flag in ((census_prefix, "-list"), (test_prefix, "-run"))]
@@ -186,7 +186,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--manifest", type=Path, default=Path("test-selection.json"))
     args = parser.parse_args()
-    valid = {"remaining", "mcp"} | {f"{package}-{index}" for package in ("store", "indexer") for index in range(SHARDS)}
+    valid = {"remaining", "mcp"} | {f"{package}-{index}" for package, count in SHARDS.items() for index in range(count)}
     if args.partition not in valid:
         parser.error(f"partition must be one of {sorted(valid)}")
     windows = os.environ.get("TEST_WINDOWS", "false") == "true"
@@ -213,9 +213,9 @@ def main():
         census_command = ["go", "test"] + ([] if windows else ["-race"]) + ["-list", ".", selected[0]]
         names = test_names(capture(census_command))
         assignments, pattern_chunks, bundle_size = plan_shard_commands(
-            names, census_command[:-3], command, selected[0])
+            names, census_command[:-3], command, selected[0], shard_count=SHARDS[family])
         # Verify the Python-generated expressions with Go's own test matcher.
-        # The per-platform compiled census is the authority for all three.
+        # The per-platform compiled census is the authority for every shard.
         for index, chunks in enumerate(pattern_chunks):
             matched = []
             for pattern in chunks:
@@ -227,7 +227,7 @@ def main():
         index = int(args.partition.rsplit("-", 1)[1])
         commands = [command + ["-run", pattern] + selected for pattern in pattern_chunks[index]]
         manifest.update(census=names, shards=assignments, pattern_chunks=pattern_chunks,
-                        name_bundle=bundle_size)
+                        name_bundle=bundle_size, shard_count=SHARDS[family])
         if all(len(chunks) == 1 for chunks in pattern_chunks):
             manifest["patterns"] = [chunks[0] for chunks in pattern_chunks]
         print(f"{selected[0]}: {len(names)} compiled tests/examples/fuzz seeds; "

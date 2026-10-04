@@ -16,7 +16,7 @@ concurrency:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
-    # Give the largest packages three exhaustive top-level test shards so
+    # Give the store three and indexer six exhaustive top-level test shards so
     # race/coverage runs fit within the existing package and job time limits.
     timeout-minutes: 60
     strategy:
@@ -24,7 +24,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         go-version: ['1.27']
-        partition: [remaining, store-0, store-1, store-2, indexer-0, indexer-1, indexer-2, mcp]
+        partition: [remaining, store-0, store-1, store-2, indexer-0, indexer-1, indexer-2, indexer-3, indexer-4, indexer-5, mcp]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

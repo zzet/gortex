@@ -58,6 +58,32 @@ class PartitionTests(unittest.TestCase):
         self.assertEqual(chunks, [[pattern] for pattern in patterns])
         self.assertEqual(bundle, planner.NAME_BUNDLE)
 
+    def test_family_counts_preserve_exhaustive_windows_and_race_plans(self):
+        names = self.names(91) + ["ExampleFamily", "FuzzFamily"]
+        names.sort()
+        self.assertEqual(planner.SHARDS, {"store": 3, "indexer": 6})
+        for family, count in planner.SHARDS.items():
+            for windows in (False, True):
+                with self.subTest(family=family, windows=windows):
+                    prefix = ["go", "test"] + (["-v"] if windows else ["-race"])
+                    with mock.patch.object(planner, "WINDOWS_COMMAND_BUDGET", 650):
+                        assignments, chunks, _ = planner.plan_shard_commands(
+                            names, prefix, prefix + ["-timeout=45m"], "package",
+                            windows_api=windows, shard_count=count)
+                    self.assertEqual(len(assignments), count)
+                    self.assertEqual(sorted(name for shard in assignments for name in shard), names)
+                    self.assertLessEqual(max(map(len, assignments)) - min(map(len, assignments)), 1)
+                    for name in names:
+                        self.assertEqual(sum(bool(re.fullmatch(pattern, name))
+                                             for shard in chunks for pattern in shard), 1)
+        workflow = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
+        for family, count in planner.SHARDS.items():
+            for index in range(count):
+                self.assertIn(f"{family}-{index}", workflow)
+            self.assertNotIn(f"{family}-{count}", workflow)
+        self.assertIn("timeout-minutes: 60", workflow)
+        self.assertEqual(planner.TEST_EXECUTION_BUDGET_SECONDS, 2700)
+
     def test_single_test_overflow_fails_without_dropping_it(self):
         with mock.patch.object(planner, "WINDOWS_COMMAND_BUDGET", 10):
             with self.assertRaisesRegex(ValueError, "one compiled test cannot fit"):
@@ -131,7 +157,7 @@ class PartitionTests(unittest.TestCase):
             with mock.patch.object(planner, "capture", side_effect=capture), \
                     mock.patch.object(planner, "WINDOWS_COMMAND_BUDGET", 650), \
                     mock.patch.object(planner, "plan_shard_commands", side_effect=
-                                      lambda *args: original_plan(*args, windows_api=True)), \
+                                      lambda *args, **kwargs: original_plan(*args, windows_api=True, **kwargs)), \
                     mock.patch.dict(planner.os.environ, {"TEST_WINDOWS": "true"}), \
                     mock.patch.object(planner.sys, "argv", ["partition", "--partition", "indexer-1",
                                                            "--dry-run", "--manifest", str(path)]), \
@@ -147,7 +173,7 @@ class PartitionTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_main_refuses_duplicate_go_matcher_results_before_execution(self):
-        names = ["TestA", "TestB", "TestC"]
+        names = ["TestA", "TestB", "TestC", "TestD", "TestE", "TestF"]
         package = "example.org/gortex/internal/indexer"
 
         def capture(command):
