@@ -2,8 +2,11 @@ package goanalysis
 
 import (
 	"context"
+	"fmt"
 	"go/types"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -192,21 +195,124 @@ func TestTypecheckRetentionPassListingDuringEditKeepsRetainedMetadata(t *testing
 func TestTypecheckRetentionCgoRootListedDuringBrokenDependencyHeals(t *testing.T) {
 	fx := newRetentionFixture(t)
 	cached := newTestProvider(t)
-	writeFile(t, fx.root, "leaf/leaf.go", fx.broken)
+	// This oracle requires completed sequential edits, not a source file
+	// stamped during go list. Distinct past stamps preserve change detection
+	// without depending on the filesystem clock advancing between calls.
+	fixtureStamp := time.Now().Add(-time.Minute)
+	for _, rel := range []string{"native/native.go", "native/value.go", "top/top.go", "side/side.go"} {
+		require.NoError(t, os.Chtimes(filepath.Join(fx.root, rel), fixtureStamp, fixtureStamp))
+	}
+	writeLeaf := func(content string) {
+		t.Helper()
+		writeFile(t, fx.root, "leaf/leaf.go", content)
+		require.NoError(t, os.Chtimes(filepath.Join(fx.root, "leaf/leaf.go"), fixtureStamp, fixtureStamp))
+		fixtureStamp = fixtureStamp.Add(time.Second)
+	}
+	writeLeaf(fx.broken)
 	c := retentionPass(t, cached, fx.root, nativeHandle, false, "native while leaf is broken")
 	require.Equal(t, "cgo", c.Bypass, "the dependency is still the broken version: the plain load")
 
-	writeFile(t, fx.root, "leaf/leaf.go", fx.leaf)
+	writeLeaf(fx.leaf)
 	c = retentionPass(t, cached, fx.root, nativeHandle, true, "leaf compiles again")
-	require.Empty(t, c.Bypass)
+	diagnostics := ""
+	if c.Bypass != "" {
+		diagnostics = retentionCgoListingDiagnostics(cached, fx.root)
+	}
+	require.Empty(t, c.Bypass, "counters=%+v retained=%s", *c, diagnostics)
 	require.Equal(t, "cgo_unlisted", c.MissReason)
 	require.Equal(t, 1, c.ClosureMisses)
 
 	c = retentionPass(t, cached, fx.root, nativeHandle, true, "repeat")
-	require.Empty(t, c.Bypass)
+	if c.Bypass != "" {
+		diagnostics = retentionCgoListingDiagnostics(cached, fx.root)
+	}
+	require.Empty(t, c.Bypass, "counters=%+v retained=%s", *c, diagnostics)
 	require.Equal(t, 1, c.ClosureHits)
 	require.Equal(t, 0, c.ClosureMisses)
 	require.Equal(t, 0, c.ExportReads)
+}
+
+// Diagnostic observations do not mutate the retained state. They identify
+// which fresh-listing gate refused it and whether generated cgo files remain.
+func retentionCgoListingDiagnostics(p *Provider, root string) string {
+	p.tcMu.Lock()
+	st := p.tcStates[root]
+	p.tcMu.Unlock()
+	if st == nil {
+		return "no retained state"
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var out strings.Builder
+	stats := &semantic.CompilerCacheStats{}
+	check := st.checkRoots(map[string]struct{}{filepath.Join(root, "native"): {}}, stats)
+	fmt.Fprintf(&out, "root_check=%+v ", check)
+	if len(check.roots) > 0 {
+		imports := make(map[string][]string)
+		for _, pkg := range check.roots {
+			for path := range pkg.Imports {
+				imports[pkg.PkgPath] = append(imports[pkg.PkgPath], path)
+			}
+			sort.Strings(imports[pkg.PkgPath])
+		}
+		deps := st.checkDependencies(check.roots, imports, stats)
+		fmt.Fprintf(&out, "metadata_dependency_check=%+v ", deps)
+	}
+	for _, path := range []string{"example.com/retain/native", "example.com/retain/leaf"} {
+		manifest := st.manifests[path]
+		fmt.Fprintf(&out, "package=%s listing_start_ns=%d manifest=%+v ", path, st.listedAt[path].UnixNano(), manifest)
+		meta := st.meta[path]
+		if meta == nil {
+			continue
+		}
+		files := append([]string(nil), meta.CompiledGoFiles...)
+		sort.Strings(files)
+		for _, file := range files {
+			_, err := os.Stat(file)
+			fmt.Fprintf(&out, "compiled_file=%s present=%t stat_error=%v ", file, err == nil, err)
+		}
+		fmt.Fprintf(&out, "go_files=%q export=%q ", meta.GoFiles, meta.ExportFile)
+	}
+	return out.String()
+}
+
+func TestTypecheckRetentionAtOrAfterListingStampRequiresRelist(t *testing.T) {
+	root := resolvedTempDir(t)
+	writeFile(t, root, "source.go", "package fixture\nfunc F() {}\n")
+	file := filepath.Join(root, "source.go")
+	stamp := time.Now().Add(-time.Minute)
+	require.NoError(t, os.Chtimes(file, stamp, stamp))
+	info, err := os.Stat(file)
+	require.NoError(t, err)
+	// Read the actual filesystem stamp so Windows timestamp precision cannot
+	// turn the equality boundary into a timing-dependent control.
+	stamp = info.ModTime()
+	for _, test := range []struct {
+		name         string
+		listingStart time.Time
+		stale        bool
+	}{
+		{"before", stamp.Add(time.Second), false},
+		{"at", stamp, true},
+		{"after", stamp.Add(-time.Second), true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := recordManifest(root, test.listingStart)
+			require.Equal(t, test.stale, manifest.stale)
+			meta := &packages.Package{PkgPath: "example.com/fixture", Dir: root, GoFiles: []string{file}, CompiledGoFiles: []string{file}, Module: &packages.Module{Main: true}}
+			st := newCheckoutTypecheckState(root, "fixture")
+			st.meta[meta.PkgPath], st.byDir[root], st.manifests[meta.PkgPath] = meta, meta, manifest
+			check := st.checkRoots(map[string]struct{}{root: {}}, &semantic.CompilerCacheStats{})
+			if test.stale {
+				require.Equal(t, "root_files_changed", check.missReason, "fresh metadata remains unusable until a stable relist")
+				require.Empty(t, check.roots)
+				require.Equal(t, dependencyShapeChanged, manifest.dependencyState(root, &semantic.CompilerCacheStats{}))
+			} else {
+				require.Empty(t, check.missReason)
+				require.Len(t, check.roots, 1)
+			}
+		})
+	}
 }
 
 // retentionPolicyState is a synthetic state: r imports a imports b (the
