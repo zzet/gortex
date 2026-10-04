@@ -7,11 +7,13 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 SHARDS = 3
 NAME_BUNDLE = 32
 WINDOWS_COMMAND_BUDGET = 30000
+TEST_EXECUTION_BUDGET_SECONDS = 45 * 60
 LARGE_PACKAGES = {
     "store": "/internal/graph/store_sqlite",
     "indexer": "/internal/indexer",
@@ -98,6 +100,12 @@ def command_units(command):
     return len(subprocess.list2cmdline(command).encode("utf-16-le")) // 2
 
 
+def planned_command_units(command):
+    # Leave room for the longer remaining-budget flag used by split commands.
+    return command_units(["-timeout=2700.000s" if arg == "-timeout=45m" else arg
+                          for arg in command])
+
+
 def plan_shard_commands(names, census_prefix, test_prefix, package, windows_api=None):
     # Keep existing membership when it fits. Larger adjacent bundles retain
     # exact coverage and balance while factoring more shared name prefixes.
@@ -109,13 +117,57 @@ def plan_shard_commands(names, census_prefix, test_prefix, package, windows_api=
         commands = [prefix + [flag, pattern, package]
                     for pattern in patterns
                     for prefix, flag in ((census_prefix, "-list"), (test_prefix, "-run"))]
-        if not windows_api or all(command_units(command) <= WINDOWS_COMMAND_BUDGET
+        if not windows_api or all(planned_command_units(command) <= WINDOWS_COMMAND_BUDGET
                                   for command in commands):
-            return assignments, patterns, bundle_size
+            return assignments, [[pattern] for pattern in patterns], bundle_size
         if bundle_size >= len(names):
-            raise ValueError("no balanced factored shard plan fits Windows budget: "
-                             + str(max(map(command_units, commands))))
+            # Preserve this balanced assignment. Splitting invocations does not
+            # move tests between runners or increase their execution budget.
+            chunks = [bounded_patterns(assignment, census_prefix, test_prefix, package)
+                      for assignment in assignments]
+            return assignments, chunks, bundle_size
         bundle_size = min(bundle_size * 2, len(names))
+
+
+def bounded_patterns(names, census_prefix, test_prefix, package):
+    pattern = exact_pattern(names)
+    commands = [prefix + [flag, pattern, package]
+                for prefix, flag in ((census_prefix, "-list"), (test_prefix, "-run"))]
+    if all(planned_command_units(command) <= WINDOWS_COMMAND_BUDGET for command in commands):
+        return [pattern]
+    if len(names) == 1:
+        raise ValueError("one compiled test cannot fit Windows command budget: " + names[0])
+    middle = len(names) // 2
+    return (bounded_patterns(names[:middle], census_prefix, test_prefix, package)
+            + bounded_patterns(names[middle:], census_prefix, test_prefix, package))
+
+
+def write_manifest(path, manifest):
+    path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def run_commands(commands, manifest, manifest_path):
+    # Only oversized Windows shards have multiple commands. One deadline covers
+    # all chunks, including Go startup between them; no chunk receives a new 45m.
+    deadline = time.monotonic() + TEST_EXECUTION_BUDGET_SECONDS
+    manifest["executed_commands"] = []
+    try:
+        for command in commands:
+            actual = list(command)
+            remaining = deadline - time.monotonic()
+            if len(commands) > 1:
+                if remaining <= 0:
+                    raise ValueError("aggregate test execution budget exhausted")
+                actual[actual.index("-timeout=45m")] = f"-timeout={remaining:.3f}s"
+            units = guard_command(actual)
+            manifest["executed_commands"].append({"command": actual, "utf16_units": units})
+            write_manifest(manifest_path, manifest)
+            if len(commands) > 1:
+                subprocess.run(actual, check=True, timeout=remaining)
+            else:
+                subprocess.run(actual, check=True)
+    finally:
+        write_manifest(manifest_path, manifest)
 
 
 def guard_command(command):
@@ -160,36 +212,45 @@ def main():
             raise ValueError("a test shard must own exactly one package")
         census_command = ["go", "test"] + ([] if windows else ["-race"]) + ["-list", ".", selected[0]]
         names = test_names(capture(census_command))
-        assignments, patterns, bundle_size = plan_shard_commands(
+        assignments, pattern_chunks, bundle_size = plan_shard_commands(
             names, census_command[:-3], command, selected[0])
         # Verify the Python-generated expressions with Go's own test matcher.
         # The per-platform compiled census is the authority for all three.
-        for pattern in patterns:
-            guard_command(census_command[:-3] + ["-list", pattern, selected[0]])
-            guard_command(command + ["-run", pattern, selected[0]])
-        for index, pattern in enumerate(patterns):
-            matched = test_names(capture(census_command[:-3] + ["-list", pattern, selected[0]]))
-            if matched != assignments[index]:
+        for index, chunks in enumerate(pattern_chunks):
+            matched = []
+            for pattern in chunks:
+                guard_command(census_command[:-3] + ["-list", pattern, selected[0]])
+                guard_command(command + ["-run", pattern, selected[0]])
+                matched.extend(test_names(capture(census_command[:-3] + ["-list", pattern, selected[0]])))
+            if sorted(matched) != assignments[index] or len(matched) != len(set(matched)):
                 raise ValueError(f"Go matcher disagrees with shard {index}")
         index = int(args.partition.rsplit("-", 1)[1])
-        command += ["-run", patterns[index]]
-        manifest.update(census=names, shards=assignments, patterns=patterns,
+        commands = [command + ["-run", pattern] + selected for pattern in pattern_chunks[index]]
+        manifest.update(census=names, shards=assignments, pattern_chunks=pattern_chunks,
                         name_bundle=bundle_size)
+        if all(len(chunks) == 1 for chunks in pattern_chunks):
+            manifest["patterns"] = [chunks[0] for chunks in pattern_chunks]
         print(f"{selected[0]}: {len(names)} compiled tests/examples/fuzz seeds; "
               f"shards={[len(shard) for shard in assignments]}; selected={index}", flush=True)
-    command += selected
-    command_units = guard_command(command)
-    manifest["command"] = command
-    manifest["command_utf16_units"] = command_units
-    args.manifest.write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"Running {len(selected)} packages in {args.partition}; command units={command_units}", flush=True)
+    else:
+        commands = [command + selected]
+    units = [guard_command(command) for command in commands]
+    manifest["commands"] = commands
+    manifest["commands_utf16_units"] = units
+    if len(commands) > 1:
+        manifest["aggregate_test_execution_budget_seconds"] = TEST_EXECUTION_BUDGET_SECONDS
+    if len(commands) == 1:
+        manifest["command"] = commands[0]
+        manifest["command_utf16_units"] = units[0]
+    write_manifest(args.manifest, manifest)
+    print(f"Running {len(selected)} packages in {args.partition}; command units={units}", flush=True)
     if not args.dry_run:
-        subprocess.run(command, check=True)
+        run_commands(commands, manifest, args.manifest)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, subprocess.CalledProcessError) as error:
+    except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         print(f"CI test partition failed: {error}", file=sys.stderr)
         sys.exit(1)
