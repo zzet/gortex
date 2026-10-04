@@ -42,7 +42,12 @@ func (s *Store) CapturePayloadInputWitness(ctx context.Context, generationIDs []
 		return nil, err
 	}
 	defer s.writeMu.Unlock()
-	if err := s.writerDB.PingContext(ctx); err != nil {
+	conn, release, err := s.activeWriteConnLocked(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := conn.PingContext(ctx); err != nil {
 		return nil, err
 	}
 	w := &PayloadInputWitness{core: s.storeCore}

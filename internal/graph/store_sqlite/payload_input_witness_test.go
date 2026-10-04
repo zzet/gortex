@@ -140,3 +140,19 @@ func TestPayloadInputWitnessCancelledWhileQueued(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, ViewGenerationBuilding, row.State)
 }
+
+func TestPayloadInputWitnessCaptureDuringPinnedBulkWindow(t *testing.T) {
+	s, handle, id := reparseWindowFixture(t)
+	opened, err := s.BeginGenerationBulkLoad(id)
+	require.NoError(t, err)
+	require.True(t, opened)
+	defer func() { require.NoError(t, handle.EndGenerationBulkLoadFor(id)) }()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	w, err := s.CapturePayloadInputWitness(ctx, []int64{0})
+	require.NoError(t, err)
+	require.NotNil(t, w)
+	_, active := s.InGenerationBulkLoad()
+	require.True(t, active, "capture must not require teardown of pinned writer")
+}
+
