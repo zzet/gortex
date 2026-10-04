@@ -187,6 +187,9 @@ func (s *Store) CopyGenerationPayloadWhole(ctx context.Context, from, to int64) 
 	if err := tx.Commit(); err != nil {
 		return GenerationCopyCounts{}, err
 	}
+	if counts.Rows > 0 {
+		s.constantInputCounter(to).Add(1)
+	}
 	return counts, nil
 }
 
@@ -354,6 +357,9 @@ DELETE FROM generation_node_tombstones
 	}
 	if err := tx.Commit(); err != nil {
 		return GenerationCopyCounts{}, err
+	}
+	if counts.Rows > 0 {
+		s.constantInputCounter(to).Add(1)
 	}
 	return counts, nil
 }

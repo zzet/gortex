@@ -381,7 +381,11 @@ func (s *Store) writeMaskRowsWithSuffix(insert, suffix string, total int, row fu
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.constantInputCounter(s.viewGen).Add(1)
+	return nil
 }
 
 // ContextMaskPaths returns the paths this generation declared read-only

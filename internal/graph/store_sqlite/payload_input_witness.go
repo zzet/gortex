@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -14,11 +15,13 @@ var ErrPayloadInputChanged = fmt.Errorf("%w: payload input changed", ErrCatalogS
 // It is process-local proof, not persisted cache authority.
 type PayloadInputWitness struct {
 	core      *storeCore
+	admin     uint64
 	revisions []payloadInputRevision
 }
 type payloadInputRevision struct {
 	generation          int64
 	analysis, constants uint64
+	state               string
 }
 
 // CapturePayloadInputWitness must precede the checked projection. It includes
@@ -50,19 +53,43 @@ func (s *Store) CapturePayloadInputWitness(ctx context.Context, generationIDs []
 	if err := conn.PingContext(ctx); err != nil {
 		return nil, err
 	}
-	w := &PayloadInputWitness{core: s.storeCore}
+	w := &PayloadInputWitness{core: s.storeCore, admin: s.payloadInputAdminRevision.Load()}
 	for g := range ids {
-		w.revisions = append(w.revisions, payloadInputRevision{g, s.analysisViewCounter(g).Load(), s.constantInputCounter(g).Load()})
+		var state string
+		if g > 0 {
+			if err := conn.QueryRowContext(ctx, "SELECT state FROM view_generations WHERE generation_id=?", g).Scan(&state); err != nil {
+				return nil, err
+			}
+		}
+		w.revisions = append(w.revisions, payloadInputRevision{g, s.analysisViewCounter(g).Load(), s.constantInputCounter(g).Load(), state})
 	}
 	sort.Slice(w.revisions, func(i, j int) bool { return w.revisions[i].generation < w.revisions[j].generation })
 	return w, nil
 }
 
-func (w *PayloadInputWitness) validateLocked(s *Store) error {
-	if w.core != s.storeCore || len(w.revisions) == 0 {
+func (w *PayloadInputWitness) validateLocked(s *Store, ctx context.Context) error {
+	if w.core != s.storeCore || len(w.revisions) == 0 || w.admin != s.payloadInputAdminRevision.Load() {
 		return ErrPayloadInputChanged
 	}
+	conn, release, err := s.activeWriteConnLocked(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	for _, r := range w.revisions {
+		if r.generation > 0 {
+			var state string
+			err := conn.QueryRowContext(ctx, "SELECT state FROM view_generations WHERE generation_id=?", r.generation).Scan(&state)
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrPayloadInputChanged
+			}
+			if err != nil {
+				return err
+			}
+			if state != r.state {
+				return ErrPayloadInputChanged
+			}
+		}
 		if r.analysis != s.analysisViewCounter(r.generation).Load() || r.constants != s.constantInputCounter(r.generation).Load() {
 			return ErrPayloadInputChanged
 		}
@@ -104,7 +131,7 @@ func (c *Catalog) execGuardedWithInputWitness(ctx context.Context, w *PayloadInp
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := w.validateLocked(c.store); err != nil {
+	if err := w.validateLocked(c.store, ctx); err != nil {
 		return err
 	}
 	result, err := c.store.execActiveWriteLocked(ctx, query, args...)

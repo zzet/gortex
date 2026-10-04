@@ -384,6 +384,7 @@ func (s *Store) withFoldTx(ctx context.Context, to int64, fn func(ctx context.Co
 	if err := tx.Commit(); err != nil {
 		return foldCause(stepCtx, err)
 	}
+	destination.constantInputCounter(destination.viewGen).Add(1)
 	return nil
 }
 

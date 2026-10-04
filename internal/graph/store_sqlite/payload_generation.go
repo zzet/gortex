@@ -1284,6 +1284,9 @@ func (s *Store) deletePayloadChunk(ctx context.Context, generationID int64, chun
 		return 0, false, err
 	}
 	committed = true
+	if removed > 0 {
+		s.constantInputCounter(generationID).Add(1)
+	}
 	return removed, true, nil
 }
 

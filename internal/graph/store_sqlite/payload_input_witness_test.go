@@ -97,7 +97,7 @@ func TestPayloadInputWitnessDoesNotHoldBuildGate(t *testing.T) {
 		t.Fatal("capture retained write gate during simulated slow build")
 	}
 	s.writeMu.Lock()
-	err = w.validateLocked(s)
+	err = w.validateLocked(s, t.Context())
 	s.writeMu.Unlock()
 	require.True(t, errors.Is(err, ErrPayloadInputChanged))
 }
@@ -156,3 +156,72 @@ func TestPayloadInputWitnessCaptureDuringPinnedBulkWindow(t *testing.T) {
 	require.True(t, active, "capture must not require teardown of pinned writer")
 }
 
+func TestPayloadInputWitnessAdministrativeCoverage(t *testing.T) {
+	for _, kind := range []string{"purge-constant-only", "purge-positive", "evict-positive", "rekey-constant-only"} {
+		t.Run(kind, func(t *testing.T) {
+			s := openPayloadStore(t)
+			seedPayloadControlPlane(t, s)
+			input := witnessBuilding(t, s, "input")
+			output := witnessBuilding(t, s, "output")
+			h := s.AtGeneration(input)
+			if kind == "purge-positive" || kind == "evict-positive" {
+				h.AddNode(&graph.Node{ID: "repo/n", Name: "n", Kind: graph.KindFunction, FilePath: "n.go", RepoPrefix: "repo"})
+			} else {
+				require.NoError(t, h.BulkSetConstantValues("repo", []graph.ConstantValueRow{{NodeID: "c", FilePath: "n.go", Value: "v"}}))
+			}
+			w, err := s.CapturePayloadInputWitness(t.Context(), []int64{input})
+			require.NoError(t, err)
+			switch kind {
+			case "evict-positive":
+				_, _, err = s.EvictRepoAllGenerationsChecked("repo")
+				require.NoError(t, err)
+			case "rekey-constant-only":
+				require.NoError(t, s.RekeyRepoPrefix("repo", "other"))
+			default:
+				require.NoError(t, s.PurgeRepo("repo"))
+			}
+			require.ErrorIs(t, s.PublishPayloadGenerationWithInputWitness(t.Context(), output, 100, w), ErrPayloadInputChanged)
+		})
+	}
+}
+
+func TestPayloadInputWitnessGenerationCopyAndRetirement(t *testing.T) {
+	for _, kind := range []string{"copy", "flatten", "retire"} {
+		t.Run(kind, func(t *testing.T) {
+			s := openPayloadStore(t)
+			seedPayloadControlPlane(t, s)
+			input := witnessBuilding(t, s, "input")
+			source := witnessBuilding(t, s, "source")
+			output := witnessBuilding(t, s, "output")
+			s.AtGeneration(source).AddNode(&graph.Node{ID: "repo/n", Name: "n", Kind: graph.KindFunction, FilePath: "n.go", RepoPrefix: "repo"})
+			require.NoError(t, s.PublishPayloadGeneration(t.Context(), source, 100))
+			if kind == "retire" {
+				s.AtGeneration(input).AddNode(&graph.Node{ID: "repo/i", Name: "i", Kind: graph.KindFunction, FilePath: "i.go", RepoPrefix: "repo"})
+				require.NoError(t, s.PublishPayloadGeneration(t.Context(), input, 100))
+			}
+			w, err := s.CapturePayloadInputWitness(t.Context(), []int64{input})
+			require.NoError(t, err)
+			switch kind {
+			case "copy":
+				_, err = s.CopyGenerationPayloadWhole(t.Context(), source, input)
+			case "flatten":
+				_, err = s.FlattenGenerationChain(t.Context(), []int64{source}, input)
+			case "retire":
+				err = s.RetirePayloadGeneration(t.Context(), input, func(int64) bool { return false })
+			}
+			require.NoError(t, err)
+			require.ErrorIs(t, s.PublishPayloadGenerationWithInputWitness(t.Context(), output, 100, w), ErrPayloadInputChanged)
+		})
+	}
+}
+
+func TestPayloadInputWitnessOwnershipMaskChange(t *testing.T) {
+	s := openPayloadStore(t)
+	seedPayloadControlPlane(t, s)
+	input := witnessBuilding(t, s, "input")
+	output := witnessBuilding(t, s, "output")
+	w, err := s.CapturePayloadInputWitness(t.Context(), []int64{input})
+	require.NoError(t, err)
+	require.NoError(t, s.AtGeneration(input).SetFileMasks([]FileMask{{RepoPrefix: "repo", FilePath: "f.go", Mode: OwnershipDelete}}))
+	require.ErrorIs(t, s.PublishPayloadGenerationWithInputWitness(t.Context(), output, 100, w), ErrPayloadInputChanged)
+}

@@ -248,6 +248,9 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 		s.analysisGenerationPresent = s.analysisLatchRemaining
 	}
 	s.finishAnalysisMutationLocked(changed)
+	if changed && scope == evictAllGenerations {
+		s.payloadInputAdminRevision.Add(1)
+	}
 	if changed {
 		if receiptDelta != nil && scalarChanges == 0 {
 			s.mergeMutationReceiptLocked(receiptDelta)
