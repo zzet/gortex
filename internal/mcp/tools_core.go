@@ -1834,6 +1834,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 	pathFilter := s.resolvePathFilter(req, fq)
 	if prefixes := normalizePathPrefixes(pathFilter); len(prefixes) > 0 {
+		scope.SearchPathPrefixes = prefixes
 		scope.SymbolSearchStats = &query.SymbolSearchStats{}
 		scope.SearchNodeFilter = func(n *graph.Node) bool {
 			return pathMatchesAnyPrefix(repoRelativePath(n), prefixes)
@@ -2190,6 +2191,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if len(nodes) == 0 && q != "" && (kindArg != "" || flavorArg != "" || fq.hasFieldFilters()) {
 		relaxedScope := scope
 		relaxedScope.SearchNodeFilter = nil
+		relaxedScope.SearchPathPrefixes = nil
 		relaxedScope.SymbolSearchStats = nil
 		relaxed := filterNodes(searchSymbolsScopedContext(ctx, s.engineFor(ctx), q, fetchLimit, relaxedScope), allowed)
 		if err := ctx.Err(); err != nil {

@@ -150,3 +150,19 @@ func requestSearchChannels(ctx context.Context, backend search.Backend, query st
 	}
 	return requestTextSearch(ctx, backend, query, limit), nil, search.ChannelTimings{}
 }
+
+func requestPathScopedSymbolBundles(ctx context.Context, backend search.Backend, query string, repos, paths []string, limit int) requestBundleAnswer {
+	ctx = liveRequestContext(ctx)
+	if ctx.Err() != nil {
+		return requestBundleAnswer{supported: true, authoritative: true, failed: true}
+	}
+	source, ok := backend.(search.PathScopedContextSymbolBundleSearcherBackend)
+	if !ok {
+		return requestBundleAnswer{}
+	}
+	bundles, handled := source.SearchSymbolBundlesPathScopedContext(ctx, query, repos, paths, limit)
+	if ctx.Err() != nil {
+		return requestBundleAnswer{supported: true, authoritative: true, failed: true}
+	}
+	return requestBundleAnswer{bundles: bundles, supported: true, authoritative: handled, failed: handled && bundles == nil}
+}

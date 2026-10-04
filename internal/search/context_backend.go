@@ -29,6 +29,13 @@ type ScopedContextSymbolBundleSearcherBackend interface {
 	SearchSymbolBundlesScopedContext(ctx context.Context, query string, repoAllow []string, limit int) []SymbolBundle
 }
 
+// PathScopedContextSymbolBundleSearcherBackend applies normalized repo-relative
+// path prefixes before the text limit and node/edge bundle hydration. handled=false means
+// unsupported; handled=true preserves authoritative empty or failed answers.
+type PathScopedContextSymbolBundleSearcherBackend interface {
+	SearchSymbolBundlesPathScopedContext(context.Context, string, []string, []string, int) ([]SymbolBundle, bool)
+}
+
 // ContextChannelSearcher is the request-aware text/vector channel path.
 type ContextChannelSearcher interface {
 	SearchChannelsContext(ctx context.Context, query string, limit int) (textResults []SearchResult, vectorIDs []string)
@@ -64,6 +71,10 @@ type contextSymbolBundleSearcher interface {
 
 type scopedContextSymbolBundleSearcher interface {
 	SearchSymbolBundlesRepoScopedContext(ctx context.Context, query string, repoAllow []string, limit int) ([]graph.SymbolBundle, error)
+}
+
+type pathScopedContextSymbolBundleSearcher interface {
+	SearchSymbolBundlesPathScopedContext(context.Context, string, []string, []string, int) ([]graph.SymbolBundle, error)
 }
 
 // contextViewGenerationSymbolSearcher is the Store-side batch contract used by
@@ -594,4 +605,50 @@ func searchViewGenerations(ctx context.Context, batcher contextViewGenerationSym
 		}
 	}
 	return hits, nil
+}
+
+func (b *SymbolSearcherBackend) SearchSymbolBundlesPathScopedContext(ctx context.Context, query string, repos, paths []string, limit int) ([]SymbolBundle, bool) {
+	ctx = liveSearchContext(ctx)
+	if b == nil || b.s == nil || ctx.Err() != nil {
+		return nil, true
+	}
+	source, ok := b.s.(pathScopedContextSymbolBundleSearcher)
+	if !ok {
+		return nil, false
+	}
+	bundles, err := source.SearchSymbolBundlesPathScopedContext(ctx, query, repos, paths, limit)
+	if err != nil || ctx.Err() != nil {
+		return nil, true
+	}
+	if bundles == nil {
+		return []SymbolBundle{}, true
+	}
+	return bundles, true
+}
+
+func (h *HybridBackend) SearchSymbolBundlesPathScopedContext(ctx context.Context, query string, repos, paths []string, limit int) ([]SymbolBundle, bool) {
+	ctx = liveSearchContext(ctx)
+	if h == nil || h.text == nil || ctx.Err() != nil {
+		return nil, true
+	}
+	if source, ok := h.text.(PathScopedContextSymbolBundleSearcherBackend); ok {
+		return source.SearchSymbolBundlesPathScopedContext(ctx, query, repos, paths, limit)
+	}
+	return nil, false
+}
+
+func (s *Swappable) SearchSymbolBundlesPathScopedContext(ctx context.Context, query string, repos, paths []string, limit int) ([]SymbolBundle, bool) {
+	ctx = liveSearchContext(ctx)
+	if ctx.Err() != nil {
+		return nil, true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if ctx.Err() != nil {
+		return nil, true
+	}
+	if source, ok := s.inner.(PathScopedContextSymbolBundleSearcherBackend); ok {
+		return source.SearchSymbolBundlesPathScopedContext(ctx, query, repos, paths, limit)
+	}
+	return nil, false
 }

@@ -162,6 +162,10 @@ type QueryOptions struct {
 	// and supplementary fills. It sees compact scope fields only and must be a
 	// pure predicate. Traversal and by-ID scope policy remain in ScopeAllows.
 	SearchNodeFilter func(*graph.Node) bool `json:"-"`
+	// SearchPathPrefixes are normalized, repo-relative slash-boundary prefixes.
+	// Capable base backends apply them before candidate limits and hydration;
+	// SearchNodeFilter remains the authoritative filter for every channel.
+	SearchPathPrefixes []string `json:"-"`
 	// SymbolSearchStats, used by path-scoped searches, retains raw text-channel
 	// saturation across a fan-out. A filtered short page alone cannot prove
 	// that the backend is exhausted. The caller resets it before a deeper pass.

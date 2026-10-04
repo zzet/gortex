@@ -897,7 +897,10 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 	if bundleCapable {
 		bundleStart := time.Now()
 		var answer requestBundleAnswer
-		if allow := repoAllowList(opts.RepoAllow); len(allow) > 0 {
+		if len(opts.SearchPathPrefixes) > 0 && !viewLayered && e.overlay == nil {
+			answer = requestPathScopedSymbolBundles(ctx, backend, query, repoAllowList(opts.RepoAllow), opts.SearchPathPrefixes, limit*2)
+		}
+		if allow := repoAllowList(opts.RepoAllow); !answer.authoritative && len(allow) > 0 {
 			answer = requestScopedSymbolBundles(ctx, backend, query, allow, limit*2)
 		}
 		if !answer.authoritative {
