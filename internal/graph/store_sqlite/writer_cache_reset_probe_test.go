@@ -42,6 +42,10 @@ func TestAReclaimResetColdsTheWritersPageCache(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_LAZY_INDEXES", "off")
 	s, path := openWALReclaimStore(t)
 	defer func() { _ = s.Close() }()
+	// Isolate the cold-cache baseline from the store's background PASSIVE.
+	lease, leaseErr := s.acquireGenerationBulkCheckpointLease()
+	require.NoError(t, leaseErr)
+	defer s.releaseGenerationBulkCheckpointLease(lease)
 	seedWALChurnTable(t, s)
 	lane := &fakeBuildLane{}
 	lane.install(s)
@@ -64,6 +68,7 @@ func TestAReclaimResetColdsTheWritersPageCache(t *testing.T) {
 	cold := write()
 	t.Logf("after a reset on another connection: hits=%d misses=%d", cold.Hits, cold.Misses)
 	require.Greater(t, cold.Misses, int64(1000), "precondition: another connection's reset empties the writer's cache")
+	require.True(t, s.releaseGenerationBulkCheckpointLease(lease))
 
 	resetCases := []struct {
 		name  string
