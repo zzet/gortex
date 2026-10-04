@@ -1060,13 +1060,15 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	// Server-side accounting only — the savings value isn't returned to
 	// the caller (agents don't act on it and it burns tokens in every
 	// response). Aggregated stats remain available via the `savings` tool.
-	returned := tokens.CachedCountInt64(source)
-	fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-	symStats := s.tokenStatsFor(ctx)
-	afterFreshSymbolAcceptance(ctx, func() {
-		symStats.creditFile(absPath)
-		symStats.record(s.savingsAttributionNode(node), "get_symbol_source", returned, fullFile)
-	})
+	// Buffer until after the if_none_match gate so a warm poll does not
+	// book a whole-file baseline for a transfer of nothing.
+	pending := []pendingSavings{{
+		node:     node,
+		absPath:  absPath,
+		tool:     "get_symbol_source",
+		returned: tokens.CachedCountInt64(source),
+		fullFile: int64(tokens.EstimateFromSample(totalFileChars, source)),
+	}}
 
 	result := map[string]any{
 		"id":         node.ID,
@@ -1128,6 +1130,9 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}
+	afterFreshSymbolAcceptance(ctx, func() {
+		s.recordPendingSavings(ctx, pending)
+	})
 	result["etag"] = etag
 
 	if s.isGCX(ctx, req) {
@@ -1285,6 +1290,7 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 	sessWS, _, _ := s.sessionScope(ctx)
 
 	var results []map[string]any
+	var pending []pendingSavings
 	for _, id := range ids {
 		node := s.engineFor(ctx).GetSymbol(id)
 		// A node outside the session's workspace is reported as a
@@ -1350,11 +1356,13 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 				if source, fromLine, totalFileChars, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, contextLines); err == nil {
 					entry["source"] = source
 					entry["from_line"] = fromLine
-					returned := tokens.CachedCountInt64(source)
-					fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-					batchStats := s.tokenStatsFor(ctx)
-					batchStats.creditFile(absPath)
-					batchStats.record(s.savingsAttributionNode(node), "batch_symbols", returned, fullFile)
+					pending = append(pending, pendingSavings{
+						node:     node,
+						absPath:  absPath,
+						tool:     "batch_symbols",
+						returned: tokens.CachedCountInt64(source),
+						fullFile: int64(tokens.EstimateFromSample(totalFileChars, source)),
+					})
 				}
 			}
 		}
@@ -1372,6 +1380,7 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}
+	s.recordPendingSavings(ctx, pending)
 	batchResult["etag"] = etag
 
 	if s.isGCX(ctx, req) {
@@ -2258,6 +2267,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	// need more can follow up with get_symbol_source for specific IDs.
 	sourcesEmbedded := 0
 	var symbolContexts []map[string]any
+	var pending []pendingSavings
 	for _, sym := range relevantSymbols {
 		entry := map[string]any{
 			"id":         sym.ID,
@@ -2280,11 +2290,13 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 					}
 					entry["source"] = source
 					sourcesEmbedded++
-					returned := tokens.CachedCountInt64(source)
-					fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
-					ctxStats := s.tokenStatsFor(ctx)
-					ctxStats.creditFile(absPath)
-					ctxStats.record(s.savingsAttributionNode(sym), "smart_context", returned, fullFile)
+					pending = append(pending, pendingSavings{
+						node:     sym,
+						absPath:  absPath,
+						tool:     "smart_context",
+						returned: tokens.CachedCountInt64(source),
+						fullFile: int64(tokens.EstimateFromSample(totalFileChars, source)),
+					})
 				}
 			}
 		}
@@ -2468,6 +2480,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}
+	s.recordPendingSavings(ctx, pending)
 	result["etag"] = etag
 
 	// Delta context packing: cache this pack's canonical view under its

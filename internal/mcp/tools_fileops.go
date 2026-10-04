@@ -753,6 +753,29 @@ func (s *Server) recordFileBaselineSavings(ctx context.Context, tool, relPath, l
 	stats.record(s.fileAttributionNode(relPath, language), tool, returned, fullFile)
 }
 
+// pendingSavings is one source-read observation assembled before an
+// if_none_match gate. Flush only after a not-modified return is ruled
+// out — otherwise a warm poll mints a whole-file baseline for a
+// transfer of nothing.
+type pendingSavings struct {
+	node     *graph.Node
+	absPath  string
+	tool     string
+	returned int64
+	fullFile int64
+}
+
+func (s *Server) recordPendingSavings(ctx context.Context, pending []pendingSavings) {
+	if len(pending) == 0 {
+		return
+	}
+	stats := s.tokenStatsFor(ctx)
+	for _, obs := range pending {
+		stats.creditFile(obs.absPath)
+		stats.record(s.savingsAttributionNode(obs.node), obs.tool, obs.returned, obs.fullFile)
+	}
+}
+
 // repoRelative converts an absolute path to a repo-prefixed or root-relative
 // string if it falls under any indexed repo, otherwise returns the absolute
 // path unchanged.
