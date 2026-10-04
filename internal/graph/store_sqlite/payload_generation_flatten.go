@@ -683,6 +683,14 @@ SELECT `+strings.Join(projection, ", ")+` FROM `+table+` WHERE `+viewGenColumnNa
 // the member above (already carried) winning every key both hold. Context
 // marks are not carried: they claim nothing.
 func flattenMasksTx(ctx context.Context, tx *sql.Tx, member, to int64, masks generationMaskSet) error {
+	// Upper acknowledgments win over the matching lower pending token.
+	// Different tokens are retained even for deleted or replaced file paths.
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_work
+ (view_gen, token, origin_generation, checkout_id, repo_prefix, file_path, input_version, input_fingerprint, state, scope)
+ SELECT ?, token, origin_generation, checkout_id, repo_prefix, file_path, input_version, input_fingerprint, state, scope
+ FROM generation_contract_work WHERE view_gen = ?`, to, member); err != nil {
+		return fmt.Errorf("store_sqlite: flatten contract work of generation %d: %w", member, err)
+	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT OR IGNORE INTO generation_file_masks (view_gen, repo_prefix, file_path, ownership_mode)
 SELECT ?, repo_prefix, file_path, ownership_mode FROM generation_file_masks

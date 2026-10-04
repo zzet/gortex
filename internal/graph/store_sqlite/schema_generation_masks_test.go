@@ -70,8 +70,10 @@ func TestSchemaV17StoreGainsGenerationMaskTables(t *testing.T) {
 		FilePath: "repo/a.go", RepoPrefix: maskTestRepo,
 	}}, nil)
 	fresh := generationMaskSchemaObjects(t, seed.writerDB)
-	if len(fresh) != len(generationMaskTables) {
-		t.Fatalf("fresh store has %d mask schema objects, want %d", len(fresh), len(generationMaskTables))
+	// Contract debt additionally has an index for repo/checkout-scoped base0
+	// reads. It must migrate with its table, not disappear from this comparison.
+	if len(fresh) != len(generationMaskTables)+1 {
+		t.Fatalf("fresh store has %d mask schema objects, want %d", len(fresh), len(generationMaskTables)+1)
 	}
 	if err := seed.Close(); err != nil {
 		t.Fatalf("close seed store: %v", err)
