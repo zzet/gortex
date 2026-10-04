@@ -96,7 +96,6 @@ func TestSymbolPathSQLMatchesLiteralRepoRelativePredicate(t *testing.T) {
 	s, _ := newSymbolSearchContextStore(t)
 	paths := []string{"repo/a%_[/x.go", "repo/aXYZQ/x.go", "repo/A%_[/x.go", "repo/目录/x.go", "repo/目录X/x.go", `repo\目录\x.go`, "a%_[", "a%_[/child", "repo/repo/a%_[/x.go"}
 	var nodes []*graph.Node
-	var items []graph.SymbolFTSItem
 	for i, path := range paths {
 		repo := "repo"
 		if i == 6 || i == 7 {
@@ -104,7 +103,6 @@ func TestSymbolPathSQLMatchesLiteralRepoRelativePredicate(t *testing.T) {
 		}
 		n := &graph.Node{ID: fmt.Sprintf("literal/%d", i), Name: "LiteralHit", Kind: graph.KindFunction, FilePath: path, RepoPrefix: repo}
 		nodes = append(nodes, n)
-		items = append(items, graph.SymbolFTSItem{NodeID: n.ID, Tokens: "literal needle"})
 	}
 	if err := s.AddBatchChecked(nodes, nil); err != nil {
 		t.Fatal(err)
