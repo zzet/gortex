@@ -51,7 +51,7 @@ func initialDrainDemand(ctx context.Context) func() bool {
 
 // A continuously announced ticket must not prevent initial publication. Each
 // bounded stand-down is followed by one slice, even when demand remains.
-const initialDrainStandDownMax = 100 * time.Millisecond
+const initialDrainStandDownMax = 500 * time.Millisecond
 
 func awaitInitialDrainTurn(ctx context.Context, wanted func() bool) error {
 	if wanted == nil || !wanted() {
