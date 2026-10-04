@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
@@ -51,7 +50,7 @@ func installDaemonContractAnalysis(state *daemonState, logger *zap.Logger) (*dae
 		return nil, fmt.Errorf("contract analysis: primary configuration unavailable")
 	}
 	cfg := primaryConfig.Index
-	captureOptions := indexer.ContractFollowupCaptureOptions{Context: ctx, Store: store, Materializer: materializer, MultiIndexer: state.multiIndexer, Registry: state.indexer.Registry(), Config: cfg, Logger: logger, BaselineAdmissionMu: &runtime.baselineAdmissionMu, BaselineJobs: &runtime.baselineJobs}
+	captureOptions := indexer.ContractFollowupCaptureOptions{Context: ctx, Store: store, Materializer: materializer, MultiIndexer: state.multiIndexer, Registry: state.indexer.Registry(), Config: cfg, Logger: logger, BaselineAdmissionMu: &runtime.baselineAdmissionMu, BaselineJobs: &runtime.baselineJobs, Yield: contractAnalysisYield(state.mcpServer.ContractAnalysisShouldYield)}
 	coordinator, err := indexer.NewContractAnalysisCoordinator(indexer.ContractAnalysisCoordinatorOptions{RequireRepoConfigs: true, Store: store, Leases: materializer.Leases, Registry: state.indexer.Registry(), Config: cfg, Logger: logger, Capture: indexer.NewContractFollowupCapture(captureOptions), ReconcileBaseline: indexer.NewContractBaselineReconciler(captureOptions), Yield: contractAnalysisYield(state.mcpServer.ContractAnalysisShouldYield)})
 	if err != nil {
 		cancel()
@@ -59,6 +58,7 @@ func installDaemonContractAnalysis(state *daemonState, logger *zap.Logger) (*dae
 	}
 	runtime.coordinator = coordinator
 	hooks := indexer.ContractCoreRuntimeHooks{Published: coordinator.Published}
+	state.indexer.SetContractCoreRuntime(hooks)
 	state.multiIndexer.SetContractCoreRuntime(hooks)
 	state.lifecycle.SetContractCoreRuntime(hooks)
 	state.mcpServer.SetContractAnalysisRuntime(&gortexmcp.ContractAnalysisRuntime{Request: coordinator.Request, WaitChange: coordinator.WaitChange})
@@ -69,28 +69,7 @@ func installDaemonContractAnalysis(state *daemonState, logger *zap.Logger) (*dae
 // holding a core build lane. The producer gets a bounded progress opportunity
 // after sustained demand; strict contract waiters are excluded by the server.
 func contractAnalysisYield(shouldYield func() bool) func(context.Context) error {
-	return func(ctx context.Context) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if shouldYield == nil || !shouldYield() {
-			return nil
-		}
-		capTimer := time.NewTimer(30 * time.Second)
-		defer capTimer.Stop()
-		poll := time.NewTicker(5 * time.Millisecond)
-		defer poll.Stop()
-		for shouldYield() {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-capTimer.C:
-				return nil
-			case <-poll.C:
-			}
-		}
-		return ctx.Err()
-	}
+	return indexer.ContractAnalysisYield(shouldYield)
 }
 
 // Close refuses to declare drained ownership on timeout. The caller must leave
