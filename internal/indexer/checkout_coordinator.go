@@ -4744,7 +4744,7 @@ var resolverVersionFingerprint = sync.OnceValue(resolver.Version)
 // way the per-repo freshness row does, so a language whose extractor was
 // bumped re-builds the layers that carry its files.
 func extractorVersionsFingerprint() string {
-	encoded, err := json.Marshal(extractorVersionsSnapshot())
+	encoded, err := json.Marshal(contractGenerationProducerVersions(extractorVersionsSnapshot()))
 	if err != nil {
 		return ""
 	}
