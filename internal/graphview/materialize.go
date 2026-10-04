@@ -126,8 +126,8 @@ type Materializer struct {
 type GenerationSource struct {
 	// Generation is the payload generation this source reads.
 	Generation int64
-	// CheckoutID is the physical input namespace recorded by the catalog,
-	// which can differ from the actor selecting a copied or inherited layer.
+	// CheckoutID is the catalog owner, preferred when selecting input state.
+	// Copied payloads can retain a different carried input namespace.
 	CheckoutID string
 	// Handle is pinned to Generation, so every index it queries answers
 	// with that generation's rows alone.

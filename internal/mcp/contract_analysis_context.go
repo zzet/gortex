@@ -61,6 +61,21 @@ func (binding *contractAnalysisContext) readError() error {
 	return binding.readErr
 }
 
+func (binding *contractAnalysisContext) validate(ctx context.Context) error {
+	if err := binding.readError(); err != nil {
+		return err
+	}
+	if binding == nil || len(binding.views) == 0 {
+		return graphview.NewViewError(graphview.CodeRequiredCapabilityIncomplete, "selected contract analysis is unavailable")
+	}
+	for _, view := range binding.views {
+		if err := view.Validate(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (binding *contractAnalysisContext) loadRegistry(ctx context.Context) (*contracts.Registry, error) {
 	binding.once.Do(func() {
 		binding.registry = contracts.NewRegistry()

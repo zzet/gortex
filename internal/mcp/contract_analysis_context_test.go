@@ -63,4 +63,5 @@ func TestContractAnalysisContextCapturesShapeReadFailure(t *testing.T) {
 	lookup := binding.shapeLookup(context.Background())
 	require.Nil(t, lookup("repo/types.go::Response"))
 	require.ErrorIs(t, binding.readError(), graph.ErrContractProjectionUnsupported, "errorless ShapeLookup must not erase checked read failure")
+	require.ErrorIs(t, binding.validate(context.Background()), graph.ErrContractProjectionUnsupported, "late freshness validation must refuse a swallowed shape failure")
 }

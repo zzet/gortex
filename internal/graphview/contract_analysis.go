@@ -27,7 +27,62 @@ type ContractAnalysisView struct {
 	RegistryReader graph.Reader
 	Layer          *GenerationLayer
 	lease          *Lease
+	inputs         *SelectedContractInputs
 	closeOnce      sync.Once
+}
+
+// OpenSelectedContractAnalysis derives attachment authority from the selected
+// core view instead of accepting a request-supplied fingerprint.
+func (m *Materializer) OpenSelectedContractAnalysis(ctx context.Context, view *RepoView, repo, checkout string) (*ContractAnalysisView, error) {
+	inputs, err := m.CaptureContractInputs(ctx, view, repo, checkout)
+	if err != nil {
+		return nil, err
+	}
+	return m.OpenContractAnalysisForInputs(ctx, view, inputs)
+}
+
+// OpenContractAnalysisForInputs binds an analysis to checked local and companion
+// input captures. Those captures must come from CaptureContractInputs, optionally
+// combined by ComposeSelectedContractInputs; request assertions are insufficient.
+func (m *Materializer) OpenContractAnalysisForInputs(ctx context.Context, view *RepoView, inputs *SelectedContractInputs) (*ContractAnalysisView, error) {
+	if m == nil || inputs == nil || inputs.store != m.Store || len(inputs.sources)+len(inputs.dependencies) == 0 {
+		return nil, graph.ErrContractInputVector
+	}
+	if view != nil && (view.contractStore != m.Store || view.ID.RepoPrefix != inputs.State.RepoPrefix) {
+		return nil, graph.ErrContractInputVector
+	}
+	if err := inputs.Validate(ctx); err != nil {
+		return nil, err
+	}
+	if !inputs.State.Accepted {
+		return nil, NewViewError(CodeRequiredCapabilityIncomplete, "selected contract inputs are still being accepted")
+	}
+	var core graph.Reader = m.Store.AtGeneration(BaseCorpusGeneration)
+	if view != nil {
+		core = view.Reader
+	}
+	analysis, err := m.OpenContractAnalysis(ctx, core, ContractAnalysisInput{RepoPrefix: inputs.State.RepoPrefix, CheckoutID: inputs.State.CheckoutID, InputVersion: inputs.State.InputVersion, InputFingerprint: inputs.State.InputFingerprint})
+	if err != nil {
+		return nil, err
+	}
+	if err := inputs.Validate(ctx); err != nil {
+		analysis.Close()
+		return nil, err
+	}
+	analysis.inputs = inputs
+	return analysis, nil
+}
+
+// Validate is the consumer's post-read input fence, independent of unrelated
+// core graph clocks. A failed fence never certifies a fresh contract answer.
+func (v *ContractAnalysisView) Validate(ctx context.Context) error {
+	if v == nil || v.inputs == nil {
+		return graph.ErrContractInputVector
+	}
+	if err := v.inputs.Validate(ctx); err != nil {
+		return err
+	}
+	return v.Layer.checkContractInputRevision(ctx)
 }
 
 func (v *ContractAnalysisView) Close() {
