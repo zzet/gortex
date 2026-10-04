@@ -115,6 +115,7 @@ func (t *CentralityTiming) Add(o CentralityTiming) {
 
 // CoreEdgeTiming is nested inside CentralityTiming.EdgeRead. EndpointLookup
 // is part of Filter, not another additive cost alongside the containing total.
+// EndpointDistinctIDs sums each lookup's distinct IDs, not request-wide uniques.
 type CoreEdgeTiming struct {
 	RawRead, Filter, EndpointLookup                 time.Duration
 	RawReads, RawRows, KeptRows                     int
