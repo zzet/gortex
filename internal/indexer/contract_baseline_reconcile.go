@@ -34,6 +34,21 @@ func NewContractBaselineReconciler(options ContractFollowupCaptureOptions) func(
 		if view != nil || checkout != "" {
 			return false, nil
 		}
+		pin := options.Materializer.Leases.AcquireBaseCorpus(repo)
+		fenceErr := pin.ValidateAcceptedCurrent()
+		pin.Release()
+		if fenceErr != nil {
+			// Core is still applying or has no accepted source authority. Its
+			// outer publication will wake the already registered observation.
+			return false, nil
+		}
+		baseline, err := options.Store.AtGeneration(0).ContractBoundaryReceiptBaselineContext(ctx, repo, "")
+		if err != nil {
+			return false, err
+		}
+		if baseline != nil && baseline.Version == contractBoundaryReceiptVersion {
+			return false, nil
+		}
 		options.BaselineAdmissionMu.Lock()
 		defer options.BaselineAdmissionMu.Unlock()
 		if err := options.Context.Err(); err != nil {

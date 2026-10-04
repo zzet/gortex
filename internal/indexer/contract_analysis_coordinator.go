@@ -124,6 +124,13 @@ func (c *ContractAnalysisCoordinator) Request(ctx context.Context, view *graphvi
 	key := graph.ContractAttachmentKey{RepoPrefix: repo, CheckoutID: checkout, InputVersion: inputs.State.InputVersion, InputFingerprint: inputs.State.InputFingerprint}
 	if !inputs.State.Accepted {
 		c.observeProgress(ctx, key)
+		if c.options.ReconcileBaseline != nil {
+			// The callback admits repair only when accepted core authority exists
+			// and its baseline is missing. Active core application stays waitable.
+			if _, err := c.options.ReconcileBaseline(ctx, view, repo, checkout); err != nil {
+				return false, err
+			}
+		}
 		return true, nil // Core acceptance/supersession owns eligibility, not this job.
 	}
 	if key.InputVersion != "" && key.InputFingerprint != "" {
