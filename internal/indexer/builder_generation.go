@@ -2289,7 +2289,8 @@ func (b *SparseGenerationBuilder) writeMasks(
 			covered[row.FilePath] = struct{}{}
 		}
 	}
-	nodes := handle.AllNodes()
+	// Mask derivation and the orphan keep set need only node IDs and file paths.
+	nodes := handle.AllNodesLight()
 	for _, node := range nodes {
 		if node != nil && node.FilePath != "" {
 			covered[node.FilePath] = struct{}{}
