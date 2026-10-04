@@ -276,16 +276,27 @@ func (s *Store) beginWriteOnConnContext(ctx context.Context, conn *sql.Conn) (*s
 }
 
 func (s *Store) beginWriteOnContext(ctx context.Context, beginner sqliteTxBeginner) (*sql.Tx, error) {
+	return s.beginWriteOnWithLifetimeContext(ctx, ctx, beginner)
+}
+
+// beginWriteOnWithLifetimeContext separates cancellation of admission and SQL
+// work from transaction ownership. A caller using a detached lifetime must
+// check ctx before commit and synchronously roll back before releasing writeMu.
+func (s *Store) beginWriteOnWithLifetimeContext(ctx, lifetime context.Context, beginner sqliteTxBeginner) (*sql.Tx, error) {
 	var tx *sql.Tx
-	err := s.withSQLiteBusyRetry(ctx, "begin_write", func(attemptCtx context.Context) error {
+	err := s.withSQLiteBusyRetry(ctx, "begin_write", func(context.Context) error {
 		var beginErr error
-		tx, beginErr = beginner.BeginTx(attemptCtx, nil)
+		tx, beginErr = beginner.BeginTx(lifetime, nil)
 		return beginErr
 	})
 	if err != nil {
 		return tx, err
 	}
 	writeTransactionsBegun.Add(1)
+	if err := ctx.Err(); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
 	if s.managedPayloadGeneration {
 		if err := checkManagedPayloadWriteTx(ctx, tx, s.viewGen); err != nil {
 			if tx != nil {

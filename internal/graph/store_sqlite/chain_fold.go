@@ -333,6 +333,9 @@ func (s *Store) withFoldTx(ctx context.Context, to int64, fn func(ctx context.Co
 		return err
 	}
 	defer s.writeMu.Unlock()
+	if err := destination.refuseSealedPayloadWrite(); err != nil {
+		return err
+	}
 	stepCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	watchDone := make(chan struct{})
@@ -354,18 +357,28 @@ func (s *Store) withFoldTx(ctx context.Context, to int64, fn func(ctx context.Co
 		}
 	}()
 	defer close(watchDone)
-	tx, err := destination.beginWriteContext(stepCtx)
+	// Own the transaction's lifetime under writeMu. database/sql's automatic
+	// rollback marks a canceled Tx done before SQLite has rolled it back, so a
+	// second Rollback may return ErrTxDone and release the gate too early. A bulk
+	// window pins the connection: the next writer could then begin inside this
+	// fold's transaction. Keep cancellation on admission and every statement,
+	// and finish rollback synchronously before handing the writer to anyone else.
+	conn, release, err := s.activeWriteConnLocked(stepCtx)
 	if err != nil {
 		return foldCause(stepCtx, err)
 	}
+	defer release()
+	tx, err := destination.beginWriteOnWithLifetimeContext(stepCtx, context.WithoutCancel(stepCtx), conn)
+	if err != nil {
+		return foldCause(stepCtx, err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	// The statements run on the step's own context: cancelling it
 	// interrupts the one in flight (a rollback alone would wait for it).
 	if err := fn(stepCtx, tx); err != nil {
-		_ = tx.Rollback()
 		return foldCause(stepCtx, err)
 	}
 	if err := stepCtx.Err(); err != nil {
-		_ = tx.Rollback()
 		return foldCause(stepCtx, err)
 	}
 	if err := tx.Commit(); err != nil {
