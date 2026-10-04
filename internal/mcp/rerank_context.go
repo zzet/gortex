@@ -40,9 +40,14 @@ func (s *Server) buildRerankContextWithEmbedder(ctx context.Context, query strin
 		RepoPrefix:        repo,
 		ProjectID:         project,
 		AnalysisMetricsOf: s.rerankAnalysisMetrics,
-		BatchedCentrality: func(seeds, candidateIDs []string) rerank.CentralityResult {
-			return s.rerankBoundedCentrality(ctx, seeds, candidateIDs)
-		},
+	}
+	rctx.BatchedCentrality = func(seeds, candidateIDs []string) rerank.CentralityResult {
+		if observer := rctx.ObserveTiming; observer != nil {
+			return s.boundedCentralityForRequestObserved(ctx, seeds, candidateIDs, func(timing rerank.CentralityTiming) {
+				observer(rerank.Timing{CentralityWork: timing})
+			})
+		}
+		return s.rerankBoundedCentrality(ctx, seeds, candidateIDs)
 	}
 	// On a routed stack the candidates' fan-in / fan-out batch reads through
 	// the stacked memo (centrality_stack_memo.go): a candidate's edges are

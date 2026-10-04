@@ -33,6 +33,10 @@ import (
 // it. A caller that cannot name its snapshot passes the zero scope, which
 // computes the walk and returns it without touching the cache at all.
 func (s *Server) personalizedPageRankScoped(scope pprCacheScope, snap *analysis.AdjacencySnapshot, seeds []string) map[string]float64 {
+	return s.personalizedPageRankScopedObserved(scope, snap, seeds, nil)
+}
+
+func (s *Server) personalizedPageRankScopedObserved(scope pprCacheScope, snap *analysis.AdjacencySnapshot, seeds []string, timing *centralityTimingRecorder) map[string]float64 {
 	if snap == nil || len(seeds) == 0 {
 		return nil
 	}
@@ -46,7 +50,18 @@ func (s *Server) personalizedPageRankScoped(scope pprCacheScope, snap *analysis.
 		topK = cache.topK
 	}
 	if cache == nil || !cache.enabled {
-		return snap.PersonalizedPageRankTopK(seeds, 0, topK)
+		if timing != nil {
+			timing.CacheDisabled++
+			timing.mark(&timing.Bookkeeping)
+		}
+		scores := snap.PersonalizedPageRankTopK(seeds, 0, topK)
+		if timing != nil {
+			timing.mark(&timing.Walk)
+		}
+		return scores
+	}
+	if timing != nil {
+		timing.mark(&timing.Bookkeeping)
 	}
 	// Merkle-keyed walk cache: the key embeds the per-package content
 	// roots the walk depends on, so an unchanged walk hits even across
@@ -55,13 +70,37 @@ func (s *Server) personalizedPageRankScoped(scope pprCacheScope, snap *analysis.
 	// scope that names no shareable identity) falls through to an uncached
 	// walk.
 	key := scope.key(snap.WalkCacheKey(seeds, 0))
+	if timing != nil {
+		timing.mark(&timing.ScopeKey)
+	}
 	if key != "" {
-		if scores, ok := cache.get(key); ok {
+		scores, ok := cache.get(key)
+		if timing != nil {
+			timing.mark(&timing.CacheLookup)
+		}
+		if ok {
+			if timing != nil {
+				timing.CacheHits++
+			}
 			return scores
 		}
+		if timing != nil {
+			timing.CacheMisses++
+		}
+	} else if timing != nil {
+		timing.CacheUncacheable++
+	}
+	if timing != nil {
+		timing.mark(&timing.Bookkeeping)
 	}
 	scores := snap.PersonalizedPageRankTopK(seeds, 0, topK)
+	if timing != nil {
+		timing.mark(&timing.Walk)
+	}
 	cache.put(key, scores)
+	if timing != nil {
+		timing.mark(&timing.CacheStore)
+	}
 	return scores
 }
 
@@ -177,11 +216,11 @@ const (
 // the reader THIS request reads through, and runs the seeded walk over it
 // through the snapshot-scoped walk cache.
 //
-// The memoisation is what makes a repeated query cheap. The walk is the
-// expensive half — BuildBoundedAdjacencySnapshot is a bounded batched read,
-// the walk iterates the CSR to convergence — and without a namespace the
-// walk could not be cached at all: the content-addressed walk key describes
-// the seed neighbourhood only, so the base corpus, a routed checkout and a
+// The walk cache saves repeated fixed-iteration PPR work, but the CSR is
+// rebuilt before lookup. The output caps do not bound all fetched targets:
+// high-fanout candidate batches can make construction expensive too.
+// Without a namespace the walk could not be cached at all: its content key
+// describes the seed neighbourhood only, so the base corpus, a routed checkout and a
 // session's editor buffers all collide on it. The scope supplies the missing
 // identity (which view produced the CSR, and which root set bounded it), so
 // one request's ranking can never be served from another snapshot's scores.
@@ -191,6 +230,14 @@ const (
 // (adjacency_bounded.go:46) — so the digest names it exactly, truncated or
 // not.
 func (s *Server) boundedCentralityForRequest(ctx context.Context, seeds, candidateIDs []string) rerank.CentralityResult {
+	return s.boundedCentralityForRequestObserved(ctx, seeds, candidateIDs, nil)
+}
+
+func (s *Server) boundedCentralityForRequestObserved(ctx context.Context, seeds, candidateIDs []string, observer func(rerank.CentralityTiming)) rerank.CentralityResult {
+	timing := newCentralityTimingRecorder(observer)
+	if timing != nil {
+		defer timing.finish(observer)
+	}
 	// Same reasoning as requestProximityAdjacency: the build is uninterruptible
 	// once entered, so an abandoned request is refused at the door. An empty
 	// result is the shape the caller already handles for an empty neighbourhood.
@@ -212,16 +259,38 @@ func (s *Server) boundedCentralityForRequest(ctx context.Context, seeds, candida
 	reader := s.stackedAdjacencyReader(ctx)
 	if reader == nil {
 		reader = s.readerFor(ctx)
+	} else if timing != nil {
+		timing.MemoCalls++
+	}
+	reader = requestBoundReader(ctx, reader)
+	if timing != nil {
+		timing.mark(&timing.ReaderSetup)
+		// The builder calls only these two basic batch methods. Wrap AFTER
+		// requestBoundReader chooses its contextual reads; never hide traits
+		// from that choice or change the underlying cancellation path.
+		reader = centralityObservedReader{Reader: reader, timing: timing}
 	}
 	snapshot, stats := analysis.BuildBoundedAdjacencySnapshot(
-		requestBoundReader(ctx, reader), candidateIDs, proximityAdjacencyDepth, rerankBoundedMaxNodes, rerankBoundedMaxEdges)
+		reader, candidateIDs, proximityAdjacencyDepth, rerankBoundedMaxNodes, rerankBoundedMaxEdges)
+	if timing != nil {
+		timing.mark(&timing.Snapshot)
+		timing.SnapshotNodes = stats.NodeCount
+		timing.SnapshotEdges = stats.EdgeCount
+		if stats.Truncated {
+			timing.Truncated++
+		}
+	}
 	if ctx != nil && ctx.Err() != nil {
 		// A snapshot cut short by the request's end is partial. Nobody reads
 		// the answer, and a walk over it must not reach the shared walk cache.
 		return rerank.CentralityResult{}
 	}
+	scope := boundedCentralityScope(ctx, candidateIDs)
+	if timing != nil {
+		timing.mark(&timing.ScopeKey)
+	}
 	return rerank.CentralityResult{
-		Scores:      s.personalizedPageRankScoped(boundedCentralityScope(ctx, candidateIDs), snapshot, seeds),
+		Scores:      s.personalizedPageRankScopedObserved(scope, snapshot, seeds, timing),
 		NodeCount:   stats.NodeCount,
 		EdgeCount:   stats.EdgeCount,
 		NodeBatches: stats.NodeBatches,

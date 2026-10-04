@@ -57,6 +57,11 @@ func TestSearchSymbolsRerankTimingLabelsPreserveResults(t *testing.T) {
 		legs := fields[label].(map[string]any)
 		require.Equal(t, 1, legs["prepare_calls"])
 		require.Equal(t, 1, legs["scoring_calls"])
+		centrality := legs["centrality_work"].(map[string]any)
+		require.Equal(t, 1, centrality["calls"])
+		require.Equal(t, rerankBoundedMaxNodes, centrality["max_nodes"])
+		require.IsType(t, float64(0), centrality["snapshot_ms"])
+		require.IsType(t, float64(0), centrality["walk_topk_ms"])
 		for _, key := range []string{"prepare_ms", "metrics_ms", "centrality_ms", "scoring_ms"} {
 			require.IsType(t, float64(0), legs[key])
 		}
