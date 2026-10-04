@@ -96,12 +96,25 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	// retires its source edges. Later contract refresh uses this registry to
 	// describe removed records and schedule the existing derived frontier.
 	// A true no-op batch must not hydrate any contract state.
-	if len(deletedFiles) > 0 {
+	if len(deletedFiles) > 0 && idx.contractCoreInputs == nil {
 		// Removed constant/type/mount inputs may have same-package users with
 		// no import edge. Deleted source cannot provide a new trigger stamp.
 		idx.contractDependenciesChanged = true
 		idx.contractSharedInputsChanged = true
 		idx.ensureIncrementalContractRegistry()
+	}
+	if journal := idx.contractCoreInputs; journal != nil && len(deletedFiles) > 0 {
+		for _, path := range deletedFiles {
+			graphPath := idx.prefixPath(idx.relKey(path))
+			if err := journal.prepare(journal.ctx, idx, graphPath, "", nil, nil, true); err != nil {
+				idx.contractRestatementErr = err
+				return DerivedInvalidationPlan{}, nil, deletedFiles, nil
+			}
+			if err := journal.begin([]string{graphPath}); err != nil {
+				idx.contractRestatementErr = err
+				return DerivedInvalidationPlan{}, nil, deletedFiles, nil
+			}
+		}
 	}
 	var invalidation DerivedInvalidationPlan
 	// The surviving importers of a deleted file are re-derived from source in
@@ -302,11 +315,30 @@ func (idx *Indexer) reindexIncrementalChunk(
 			probe.fingerprints.semantic == storedGraph.semantic &&
 			probe.fingerprints.metadata == storedGraph.metadata &&
 			unchangedProbeContractInputs(priorNodes, probe)
-		if forced && inert && idx.inertReparsed != nil && !idx.forceReparseDropsResolutions(filePath) {
+		if idx.contractCoreInputs == nil && forced && inert && idx.inertReparsed != nil && !idx.forceReparseDropsResolutions(filePath) {
 			// The delta's change set is re-derived whatever its
 			// fingerprints say; an inert one has its prior rows restated
 			// after the passes (edit_delta.go).
 			idx.inertReparsed[graphPath] = struct{}{}
+		}
+		if !forced && inert && idx.contractCoreInputs != nil {
+			prepared, ok := idx.takePreparedSnapshot(filePath)
+			if !ok || prepared == nil || prepared.result == nil {
+				prepared.release()
+				inert = false
+			} else {
+				idx.applyRepoPrefix(prepared.result.Nodes, prepared.result.Edges)
+				inputErr := idx.contractCoreInputs.prepare(idx.contractCoreInputs.ctx, idx, graphPath, prepared.lang, prepared.src, prepared.result, false)
+				if inputErr == nil {
+					inputErr = idx.contractCoreInputs.begin([]string{graphPath})
+				}
+				prepared.release()
+				if inputErr != nil {
+					idx.noteFileIndexFailure(filePath, inputErr)
+					readFailed = append(readFailed, filePath)
+					continue
+				}
+			}
 		}
 		if !forced && inert {
 			idx.discardPreparedExtraction(filePath)
@@ -421,7 +453,9 @@ func (idx *Indexer) reindexIncrementalChunk(
 	}
 	failedBeforeFallback := len(failed)
 	for _, fallback := range fallbacks {
-		idx.ensureIncrementalContractRegistry()
+		if idx.contractCoreInputs == nil {
+			idx.ensureIncrementalContractRegistry()
+		}
 		if err := idx.reindexIncrementalFallback(fallback, markerBatch, &plan); err != nil {
 			idx.noteFileIndexFailure(fallback.filePath, err)
 			idx.discardPreparedExtraction(fallback.filePath)
@@ -575,15 +609,30 @@ func (idx *Indexer) commitIncrementalStages(
 		zap.Int("staged_files", len(stages)))
 	defer timing.abort()
 	var plan DerivedInvalidationPlan
-	for _, stage := range stages {
-		delete(idx.incrementalUnchangedContracts, stage.graphPath)
-		unchanged := idx.stageUnchangedContracts(stage)
-		if err := idx.contractInputError(); err != nil {
+	if journal := idx.contractCoreInputs; journal != nil {
+		paths := make([]string, 0, len(stages))
+		for _, stage := range stages {
+			if err := journal.prepare(journal.ctx, idx, stage.graphPath, stage.prepared.lang, stage.src, stage.result, false); err != nil {
+				idx.contractRestatementErr = err
+				return DerivedInvalidationPlan{}
+			}
+			paths = append(paths, stage.graphPath)
+		}
+		if err := journal.begin(paths); err != nil {
 			idx.contractRestatementErr = err
 			return DerivedInvalidationPlan{}
 		}
-		if !unchanged {
-			idx.ensureIncrementalContractRegistry()
+	} else {
+		for _, stage := range stages {
+			delete(idx.incrementalUnchangedContracts, stage.graphPath)
+			unchanged := idx.stageUnchangedContracts(stage)
+			if err := idx.contractInputError(); err != nil {
+				idx.contractRestatementErr = err
+				return DerivedInvalidationPlan{}
+			}
+			if !unchanged {
+				idx.ensureIncrementalContractRegistry()
+			}
 		}
 	}
 	idx.startApplyLaps()

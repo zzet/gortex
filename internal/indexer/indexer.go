@@ -323,6 +323,10 @@ type Indexer struct {
 	// this indexer carries the repo-default value.
 	projectID string
 
+	// contractCoreInputs is installed only by the complete asynchronous runtime.
+	// Nil preserves the legacy contract path while that runtime is disabled.
+	contractCoreInputs *contractCoreInputJournal
+
 	// contractRegistry holds detected API contracts (HTTP routes, gRPC, etc.).
 	contractRegistry *contracts.Registry
 	// contractRegistrySeed defers immutable-stack hydration until an edit
@@ -1520,6 +1524,11 @@ func (idx *Indexer) MaybeSeedPendingEnrich() bool {
 // binding types are resolved in one batch from SQLite, with the provider's
 // compact string index as the in-memory-store fallback.
 func (idx *Indexer) runDeferredContracts() {
+	if idx.contractCoreInputs != nil {
+		idx.pendingContractReg = nil
+		idx.deferredGoModDone = false
+		return
+	}
 	reg := idx.pendingContractReg
 	if reg == nil {
 		return
@@ -2694,6 +2703,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 				}
 			}
 			owner.mu.Unlock()
+		}
+		if journal := current.contractCoreInputs; journal != nil {
+			return journal.accept(nil)
 		}
 		return nil
 	})
@@ -4059,6 +4071,21 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					}
 
 					idx.applyRepoPrefix(result.Nodes, result.Edges)
+					if journal := idx.contractCoreInputs; journal != nil {
+						inputErr := journal.prepare(ctx, idx, idx.prefixPath(relPath), lang, src, result, false)
+						if inputErr == nil {
+							inputErr = journal.begin([]string{idx.prefixPath(relPath)})
+						}
+						if inputErr != nil {
+							recordFileOutcome(path, inputErr)
+							errMu.Lock()
+							errors = append(errors, IndexError{FilePath: path, Error: inputErr.Error()})
+							errMu.Unlock()
+							result.ReleaseTree()
+							parseLease.Release()
+							continue
+						}
+					}
 
 					// Find the file node (if the extractor produced one)
 					// and collect its outgoing edges — contract extractors
@@ -4120,7 +4147,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					}
 					sidecars.add(relPath, src, result)
 
-					if !skipped && !omitSecondarySourceScans && fileGraphPath != "" {
+					if idx.contractCoreInputs == nil && !skipped && !omitSecondarySourceScans && fileGraphPath != "" {
 						exts := contractExtractorsByLang[lang]
 						if len(exts) > 0 {
 							var constantLookupAttempted bool
@@ -4416,11 +4443,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	idx.parseErrorsMu.Unlock()
 	idx.totalDetected = len(files)
 	idx.lastIndexTime = time.Now()
-	if err := idx.refreshColdConstantContractFiles(ctx, contractReg, constantContractFiles, contractExtractorsByLang); err != nil {
-		return nil, err
-	}
-	if err := idx.contractInputError(); err != nil {
-		return nil, err
+	if idx.contractCoreInputs == nil {
+		if err := idx.refreshColdConstantContractFiles(ctx, contractReg, constantContractFiles, contractExtractorsByLang); err != nil {
+			return nil, err
+		}
+		if err := idx.contractInputError(); err != nil {
+			return nil, err
+		}
 	}
 
 	if coldManifests != nil {
@@ -4518,9 +4547,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// nodes were available during ResolveAll's import-bridge pass;
 		// commitContracts is idempotent for those.
 		reporter.Report("extracting contracts", 0, 0)
-		idx.extractExternalModulesForCensus(contractReg)
-		idx.extractDIContracts(contractReg)
-		idx.commitContracts(contractReg)
+		if idx.contractCoreInputs == nil {
+			idx.extractExternalModulesForCensus(contractReg)
+			idx.extractDIContracts(contractReg)
+			idx.commitContracts(contractReg)
+		}
 		if coldManifests != nil {
 			coldManifests.contractsReady = true
 		}
@@ -4877,6 +4908,13 @@ func (idx *Indexer) IndexFile(filePath string) error {
 		if len(result.FailedFiles) > 0 {
 			return fmt.Errorf("indexing %q failed after retry: %s", canonical, strings.Join(result.FailedFiles, ", "))
 		}
+		current, currentErr := idx.currentRepositoryMutationIndexer()
+		if currentErr != nil {
+			return currentErr
+		}
+		if journal := current.contractCoreInputs; journal != nil {
+			return journal.accept(nil)
+		}
 		return nil
 	})
 }
@@ -5050,6 +5088,14 @@ func (idx *Indexer) indexFile(
 				relPath: relPath, lang: lang, size: int64(len(src)),
 			}, maxSize)
 			idx.applyRepoPrefix([]*graph.Node{n}, nil)
+			if journal := idx.contractCoreInputs; journal != nil {
+				if err := journal.prepare(journal.ctx, idx, graphPath, lang, src, nil, false); err != nil {
+					return err
+				}
+				if err := journal.begin([]string{graphPath}); err != nil {
+					return err
+				}
+			}
 			evictExisting()
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
@@ -5066,6 +5112,14 @@ func (idx *Indexer) indexFile(
 				relPath: relPath, lang: lang, size: int64(len(src)), reason: reason,
 			})
 			idx.applyRepoPrefix([]*graph.Node{n}, nil)
+			if journal := idx.contractCoreInputs; journal != nil {
+				if err := journal.prepare(journal.ctx, idx, graphPath, lang, src, nil, false); err != nil {
+					return err
+				}
+				if err := journal.begin([]string{graphPath}); err != nil {
+					return err
+				}
+			}
 			evictExisting()
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
@@ -5160,6 +5214,14 @@ func (idx *Indexer) indexFile(
 	// We hold a usable result: evict the old state now, then add the
 	// new — the window where the file has no nodes is just this gap.
 	commitStarted := time.Now()
+	if journal := idx.contractCoreInputs; journal != nil {
+		if err := journal.prepare(journal.ctx, idx, graphPath, lang, src, result, false); err != nil {
+			return err
+		}
+		if err := journal.begin([]string{graphPath}); err != nil {
+			return err
+		}
+	}
 	evictExisting()
 
 	// Coverage extractors (todos, licenses, ownership). A prepared watcher
@@ -7301,6 +7363,9 @@ func (idx *Indexer) upgradeContractBareTypeRefs(reg *contracts.Registry) {
 // once per index pass after all per-file contracts have been collected
 // (inline from parse workers) plus go.mod has been processed.
 func (idx *Indexer) commitContracts(reg *contracts.Registry) {
+	if idx.contractCoreInputs != nil {
+		return
+	}
 	// Upgrade bare type names in contract Meta (e.g. "UserResp") to
 	// full symbol IDs (e.g. "pkg/resp.go::UserResp") now that the
 	// graph is complete. During extraction the enricher only saw
@@ -9414,6 +9479,9 @@ func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 // are already cached). IndexCtx instead runs the per-file work inline
 // with parsing — see the worker loop — and skips this function.
 func (idx *Indexer) extractContracts() {
+	if idx.contractCoreInputs != nil {
+		return
+	}
 	reg := contracts.NewRegistry()
 	_, byLang := idx.buildPerFileContractExtractors()
 

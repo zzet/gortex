@@ -31,6 +31,7 @@ type contractBoundaryReceipt struct {
 	HandlerInputs  map[string]string            `json:"handler_inputs,omitempty"`
 	ProducedInputs map[string]string            `json:"produced_inputs,omitempty"`
 	LookupKeys     []string                     `json:"lookup_keys,omitempty"`
+	MatcherInputs  map[string]string            `json:"matcher_inputs,omitempty"`
 	MountInputs    string                       `json:"mount_inputs,omitempty"`
 }
 
@@ -49,6 +50,28 @@ func (idx *Indexer) collectContractBoundaryReceipt(ctx context.Context, path, la
 	if result.Tree != nil && !bytes.Equal(result.Tree.Source(), src) {
 		return contractBoundaryReceipt{}, fmt.Errorf("contract boundary receipt: source differs from accepted tree")
 	}
+	// Cold/staged parses may already carry the repo namespace; the direct
+	// fallback still owns raw extraction rows. Normalize detached copies so
+	// dependency identities are identical without mutating the core parse.
+	if idx.repoPrefix != "" && len(result.Nodes) > 0 && result.Nodes[0].RepoPrefix != idx.repoPrefix {
+		detached := *result
+		detached.Nodes = make([]*graph.Node, len(result.Nodes))
+		for i, node := range result.Nodes {
+			if node != nil {
+				copyNode := *node
+				detached.Nodes[i] = &copyNode
+			}
+		}
+		detached.Edges = make([]*graph.Edge, len(result.Edges))
+		for i, edge := range result.Edges {
+			if edge != nil {
+				copyEdge := *edge
+				detached.Edges[i] = &copyEdge
+			}
+		}
+		idx.applyRepoPrefix(detached.Nodes, detached.Edges)
+		result = &detached
+	}
 	_, byLanguage := idx.buildPerFileContractExtractors()
 	local := &localContractBoundaryInputs{nodes: make(map[string][]*graph.Node), values: make(map[string]string), lookups: make(map[string]struct{}), scope: idx.repoPrefix}
 	for _, node := range result.Nodes {
@@ -57,7 +80,11 @@ func (idx *Indexer) collectContractBoundaryReceipt(ctx context.Context, path, la
 		}
 	}
 	for _, value := range result.ConstValues {
-		local.values[value.NodeID] = value.Value
+		id := value.NodeID
+		if idx.repoPrefix != "" && !strings.HasPrefix(id, idx.repoPrefix+"/") {
+			id = idx.repoPrefix + "/" + id
+		}
+		local.values[id] = value.Value
 	}
 	records := idx.collectContractRecordsForFile(path, src, result.Nodes, result.Edges, byLanguage[language], result.Tree, local)
 	fingerprints, err := contracts.FingerprintRecords(records)
@@ -65,15 +92,15 @@ func (idx *Indexer) collectContractBoundaryReceipt(ctx context.Context, path, la
 		return contractBoundaryReceipt{}, err
 	}
 	policy, err := json.Marshal(struct {
-		Config                       any
-		EventBus                     any
-		Parser, PostExtraction       int
-		ContractPolicy, RecordPolicy string
-	}{idx.config, idx.eventBusBoundaries(), extractorVersionForLang(language), postExtractionPolicyVersion, contractExtractionPolicyVersion, contracts.RecordFingerprintVersion})
+		Config                                    any
+		EventBus                                  any
+		Parser, PostExtraction                    int
+		ContractPolicy, RecordPolicy, MatchPolicy string
+	}{idx.config, idx.eventBusBoundaries(), extractorVersionForLang(language), postExtractionPolicyVersion, contractExtractionPolicyVersion, contracts.RecordFingerprintVersion, contracts.MatchDependencyKeyVersion})
 	if err != nil {
 		return contractBoundaryReceipt{}, err
 	}
-	receipt := contractBoundaryReceipt{Version: contractBoundaryReceiptVersion, FilePath: path, Language: language, Source: contractInputHash(src), Policy: contractInputHash(policy), Records: fingerprints, HandlerInputs: make(map[string]string), ProducedInputs: make(map[string]string)}
+	receipt := contractBoundaryReceipt{Version: contractBoundaryReceiptVersion, FilePath: path, Language: language, Source: contractInputHash(src), Policy: contractInputHash(policy), Records: fingerprints, HandlerInputs: make(map[string]string), ProducedInputs: make(map[string]string), MatcherInputs: make(map[string]string)}
 	var bodyFacts map[string]contracts.BodyFacts
 	if language == "go" {
 		bodyFacts, err = contracts.GoBodyFactsForFile(ctx, result.Tree, result.Nodes)
@@ -86,6 +113,10 @@ func (idx *Indexer) collectContractBoundaryReceipt(ctx context.Context, path, la
 	handlers := make(map[string]struct{})
 	for _, record := range records {
 		groups[graph.ContractWorkGroup{WorkspaceID: record.EffectiveWorkspace(), ProjectID: record.EffectiveProject(), ContractID: record.ID}] = struct{}{}
+		for _, key := range contracts.MatchDependencyKeys(record) {
+			local.lookups[key] = struct{}{}
+			receipt.MatcherInputs[key] = fingerprints.Full
+		}
 		if record.Role == contracts.RoleProvider {
 			handlers[record.SymbolID] = struct{}{}
 		}
@@ -368,7 +399,30 @@ func diffContractBoundaryReceipts(old, current *contractBoundaryReceipt) contrac
 		sort.Strings(out.Scope.SymbolIDs)
 		sort.Strings(out.Scope.LookupKeys)
 	}
-	sort.Strings(out.ChangedProducedKeys)
+	matcher := make(map[string]struct{})
+	if old != nil {
+		for k := range old.MatcherInputs {
+			matcher[k] = struct{}{}
+		}
+	}
+	if current != nil {
+		for k := range current.MatcherInputs {
+			matcher[k] = struct{}{}
+		}
+	}
+	for key := range matcher {
+		a, b := "", ""
+		if old != nil {
+			a = old.MatcherInputs[key]
+		}
+		if current != nil {
+			b = current.MatcherInputs[key]
+		}
+		if a != b {
+			out.ChangedProducedKeys = append(out.ChangedProducedKeys, key)
+		}
+	}
+	out.ChangedProducedKeys = appendUniqueSorted(nil, out.ChangedProducedKeys...)
 	return out
 }
 func equalContractBoundaryMap(a, b map[string]string) bool {

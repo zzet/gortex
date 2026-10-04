@@ -46,6 +46,9 @@ func (result *contractRefreshResult) addFrontier(contractsToAdd ...[]contracts.C
 }
 
 func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResult {
+	if idx.contractCoreInputs != nil {
+		return contractRefreshResult{}
+	}
 	files = appendUniqueSorted(nil, files...)
 	if !idx.contractDependenciesChanged {
 		remaining := files[:0]
@@ -217,6 +220,16 @@ func (idx *Indexer) refreshIncrementalContractManifests(files []string) (Derived
 			idx.noteFileIndexFailure(absPath, err)
 			failed = append(failed, absPath)
 			continue
+		}
+		if journal := idx.contractCoreInputs; journal != nil {
+			if err := journal.prepare(journal.ctx, idx, graphPath, "manifest", src, nil, false); err != nil {
+				idx.contractRestatementErr = err
+				return plan, append(failed, absPath)
+			}
+			if err := journal.begin([]string{graphPath}); err != nil {
+				idx.contractRestatementErr = err
+				return plan, append(failed, absPath)
+			}
 		}
 		switch filepath.ToSlash(relPath) {
 		case "go.mod":

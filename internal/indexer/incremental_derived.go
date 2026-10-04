@@ -108,6 +108,9 @@ func (idx *Indexer) runStandaloneIncrementalDerivedPassesWithPrior(
 	if idx == nil || idx.graph == nil || idx.deferGlobalPasses.Load() || plan.Empty() {
 		return IncrementalDerivedReport{}
 	}
+	if idx.contractCoreInputs != nil {
+		plan.Flags &^= DerivedInvalidatesContracts
+	}
 	logger := idx.logger
 	if logger == nil {
 		logger = zap.NewNop()
