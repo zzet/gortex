@@ -257,16 +257,24 @@ func (s *Server) boundedCentralityForRequestObserved(ctx context.Context, seeds,
 	// answers from memory, so a search after a publication reads only the
 	// new generation, and a repeated search reads nothing.
 	reader := s.stackedAdjacencyReader(ctx)
+	var presence *centralityPresenceReader
 	if reader == nil {
 		if timing != nil {
 			// Install before readerFor constructs the request's core wrapper.
 			ctx = withCoreEdgeTiming(ctx, &timing.CoreEdges)
 		}
 		reader = s.readerFor(ctx)
+		if checked, ok := centralityCheckedPresence(reader); ok {
+			presence = &centralityPresenceReader{ctx: ctx, checked: checked}
+		}
 	} else if timing != nil {
 		timing.MemoCalls++
 	}
 	reader = requestBoundReader(ctx, reader)
+	if presence != nil {
+		presence.Reader = reader
+		reader = presence
+	}
 	if timing != nil {
 		timing.mark(&timing.ReaderSetup)
 		// The builder calls only these two basic batch methods. Wrap AFTER
@@ -283,6 +291,10 @@ func (s *Server) boundedCentralityForRequestObserved(ctx context.Context, seeds,
 		if stats.Truncated {
 			timing.Truncated++
 		}
+	}
+	if presence != nil && presence.err != nil {
+		recordContractCoreReadError(ctx, presence.err)
+		return rerank.CentralityResult{}
 	}
 	if ctx != nil && ctx.Err() != nil {
 		// A snapshot cut short by the request's end is partial. Nobody reads
