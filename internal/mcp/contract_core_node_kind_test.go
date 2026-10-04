@@ -10,6 +10,7 @@ import (
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 type contractCoreKindSpy struct {
@@ -64,9 +65,24 @@ func TestContractCoreEdgesClassifyEndpointKindsWithoutFullNodes(t *testing.T) {
 	require.Zero(t, spy.fullReads)
 }
 
+func installContractCoreKindTestRuntime(t *testing.T, srv *Server) {
+	t.Helper()
+	srv.SetContractAnalysisRuntime(&ContractAnalysisRuntime{
+		Request: func(context.Context, *graphview.RepoView, *graphview.SelectedContractInputs, string, string) (bool, error) {
+			t.Error("ordinary core request scheduled contract work")
+			return false, nil
+		},
+		WaitChange: func(context.Context, graph.ContractAttachmentKey) error {
+			t.Error("ordinary core request waited for contract work")
+			return nil
+		},
+	})
+	require.NotNil(t, srv.contractAnalysisRuntime)
+}
+
 func TestContractCoreKindReadFailureRefusesHandlerAnswer(t *testing.T) {
 	srv, _ := setupTestServer(t)
-	srv.SetContractAnalysisRuntime(&ContractAnalysisRuntime{})
+	installContractCoreKindTestRuntime(t, srv)
 	base := graph.New()
 	base.AddBatch([]*graph.Node{{ID: "caller", Kind: graph.KindFunction}, {ID: "callee", Kind: graph.KindFunction}}, []*graph.Edge{{From: "caller", To: "callee", Kind: graph.EdgeCalls}})
 	sentinel := errors.New("endpoint kind projection unavailable")
@@ -74,12 +90,15 @@ func TestContractCoreKindReadFailureRefusesHandlerAnswer(t *testing.T) {
 	request := mcpsdk.CallToolRequest{}
 	request.Params.Name = "get_callers"
 	request.Params.Arguments = map[string]any{"id": "callee"}
+	var observed []*graph.Edge
 	result, err := srv.wrapToolHandler(func(ctx context.Context, _ mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		reader := newContractCoreEdges(spy, ctx, nil)
-		require.Empty(t, reader.GetInEdges("callee"))
+		observed = reader.GetInEdges("callee")
 		return mcpsdk.NewToolResultText("no callers"), nil
 	})(t.Context(), request)
 	require.NoError(t, err)
+	require.Empty(t, observed)
+	require.Equal(t, 1, spy.kindReads)
 	require.True(t, result.IsError, "failed structural proof must not certify no callers")
 	body := result.Content[0].(mcpsdk.TextContent).Text
 	require.Contains(t, body, sentinel.Error())
@@ -104,7 +123,7 @@ func TestContractCoreKindProjectionPreservesBaseRepositoryScope(t *testing.T) {
 
 func TestContractCoreKindGuardPreservesCommittedMutationReceipt(t *testing.T) {
 	srv, _ := setupTestServer(t)
-	srv.SetContractAnalysisRuntime(&ContractAnalysisRuntime{})
+	installContractCoreKindTestRuntime(t, srv)
 	base := graph.New()
 	base.AddBatch([]*graph.Node{{ID: "caller", Kind: graph.KindFunction}, {ID: "callee", Kind: graph.KindFunction}}, []*graph.Edge{{From: "caller", To: "callee", Kind: graph.EdgeCalls}})
 	sentinel := errors.New("late endpoint read failure")
@@ -113,9 +132,12 @@ func TestContractCoreKindGuardPreservesCommittedMutationReceipt(t *testing.T) {
 	request := mcpsdk.CallToolRequest{}
 	request.Params.Name = "write_file"
 	request.Params.Arguments = map[string]any{"path": path, "content": "committed"}
+	var observed []*graph.Edge
 	result, err := srv.wrapToolHandler(func(ctx context.Context, _ mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
-		require.NoError(t, os.WriteFile(path, []byte("committed"), 0600))
-		require.Len(t, newContractCoreEdges(spy, ctx, nil).GetInEdges("callee"), 1)
+		if err := os.WriteFile(path, []byte("committed"), 0600); err != nil {
+			return nil, err
+		}
+		observed = newContractCoreEdges(spy, ctx, nil).GetInEdges("callee")
 		// Even a late recorded read error cannot withdraw a mutation receipt.
 		recordContractCoreReadError(ctx, sentinel)
 		return mcpsdk.NewToolResultText("committed mutation receipt"), nil
@@ -123,6 +145,7 @@ func TestContractCoreKindGuardPreservesCommittedMutationReceipt(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, result.IsError)
 	require.Contains(t, result.Content[0].(mcpsdk.TextContent).Text, "committed mutation receipt")
+	require.Len(t, observed, 1)
 	content, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, "committed", string(content))
@@ -134,7 +157,7 @@ func TestContractCoreKindGuardPreservesHandlerErrors(t *testing.T) {
 	for _, transportError := range []bool{false, true} {
 		t.Run(map[bool]string{false: "error_result", true: "handler_error"}[transportError], func(t *testing.T) {
 			srv, _ := setupTestServer(t)
-			srv.SetContractAnalysisRuntime(&ContractAnalysisRuntime{})
+			installContractCoreKindTestRuntime(t, srv)
 			request := mcpsdk.CallToolRequest{}
 			request.Params.Name = "get_callers"
 			sentinel := errors.New("original handler failure")

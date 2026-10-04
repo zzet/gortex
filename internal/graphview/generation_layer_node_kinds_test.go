@@ -22,7 +22,6 @@ func TestNodeKindProjectionGenerationMasksContextAndStaleCorrection(t *testing.T
 	newNode := &graph.Node{ID: path + "::New", Kind: graph.KindFunction, FilePath: path, RepoPrefix: "repo"}
 	handle.AddBatch([]*graph.Node{
 		{ID: path, Kind: graph.KindFile, FilePath: path, RepoPrefix: "repo"}, newNode,
-		{ID: ctxPath + "::C", Kind: graph.KindContract, FilePath: ctxPath, RepoPrefix: "repo"},
 	}, nil)
 	require.NoError(t, handle.SetFileMasks([]store_sqlite.FileMask{
 		{FilePath: path, Mode: store_sqlite.OwnershipReplace},

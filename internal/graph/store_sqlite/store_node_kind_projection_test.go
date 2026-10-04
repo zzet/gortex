@@ -25,7 +25,7 @@ func TestNodeKindProjectionSQLChunksGenerationAndNoMetadataDecode(t *testing.T) 
 	positive := s.AtGeneration(7)
 	positive.AddNode(&graph.Node{ID: ids[0], Kind: graph.KindContract, FilePath: "repo/contract.go", RepoPrefix: "other"})
 	// Structural reads must succeed even when a full-node payload is corrupt.
-	_, err = s.db.Exec(`UPDATE nodes SET meta = ? WHERE view_gen = 0`, []byte{0xff, 0xfe})
+	_, err = s.writerDB.Exec(`UPDATE nodes SET meta = ? WHERE view_gen = 0`, []byte{0xff, 0xfe})
 	require.NoError(t, err)
 	ids = append(ids, "", ids[0], ids[0], "missing")
 	rows, err := s.GetNodeKindsByIDsContext(t.Context(), ids)
