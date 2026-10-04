@@ -21,7 +21,7 @@ func TestBundleLegTimingsStayWithinSearchRequest(t *testing.T) {
 	g := graph.New()
 	n := &graph.Node{ID: "repo/a.go::Needle", Kind: graph.KindFunction, Name: "needle", RepoPrefix: "repo", FilePath: "repo/a.go"}
 	g.AddNode(n)
-	b := &timingBundleBackend{pathBundleBackend: pathBundleBackend{answer: []search.SymbolBundle{{Node: n}}, handled: true}}
+	b := &timingBundleBackend{pathBundleBackend: pathBundleBackend{answer: []search.SymbolBundle{{Node: n}}, handled: true, scopedBundleBackend: scopedBundleBackend{flood: []search.SymbolBundle{{Node: n}}}}}
 	eng := NewEngine(g)
 	eng.SetSearch(b)
 	eng.SetRerank(nil)
@@ -37,6 +37,9 @@ func TestBundleLegTimingsStayWithinSearchRequest(t *testing.T) {
 	eng.GatherSymbolCandidatesContext(context.Background(), "needle", 1, opts, nil)
 	if first.BundleLegs.Calls != 2 || first.BundleLegs.RankMS != 2.5 || first.BundleLegs.NodeMS != 5 || first.BundleLegs.OutMS != 7.5 || first.BundleLegs.InMS != 9 || first.BundleLegs.CacheMisses != 2 || first.BundleLegs.NodeRows != 2 || first.BundleLegs.OutRows != 4 || first.BundleLegs.InRows != 6 {
 		t.Fatalf("accumulated timings=%+v", first.BundleLegs)
+	}
+	if b.pathCalls != 3 || b.scopedCalls != 0 || b.unscopedCalls != 0 || b.searchCalls != 0 {
+		t.Fatalf("bundle legs bypassed: backend=%+v", b)
 	}
 	if second.BundleLegs.Calls != 1 || second.BundleLegs.RankMS != 1.25 {
 		t.Fatalf("cross-request timing leak=%+v", second.BundleLegs)
