@@ -2,9 +2,12 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"iter"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 // A contract analysis owns identities and derived edges, never source files.
@@ -23,6 +26,7 @@ type contractCoreEdges struct {
 	graph.Reader
 	ctx         context.Context
 	contractIDs map[string]bool
+	edgeTiming  *rerank.CoreEdgeTiming
 }
 
 func (r *contractCoreEdges) visible(edge *graph.Edge) bool {
@@ -47,9 +51,28 @@ func (r *contractCoreEdges) filter(rows []*graph.Edge) []*graph.Edge {
 	}
 	var kinds map[string]graph.NodeKindRow
 	if r.contractIDs == nil && len(ids) > 0 {
+		var started time.Time
+		if t := r.edgeTiming; t != nil {
+			t.EndpointReads++
+			t.EndpointIDs += len(ids)
+			unique := make(map[string]struct{}, len(ids))
+			for _, id := range ids {
+				if id != "" {
+					unique[id] = struct{}{}
+				}
+			}
+			t.EndpointDistinctIDs += len(unique)
+		}
 		if hasContractCoreReadErrors(r.ctx) {
+			if r.edgeTiming != nil {
+				r.edgeTiming.CheckedClassifiers++
+				started = time.Now()
+			}
 			var err error
 			kinds, err = graph.GetNodeKindsByIDsContext(r.ctx, r.Reader, ids)
+			if r.edgeTiming != nil {
+				r.edgeTiming.EndpointLookup += time.Since(started)
+			}
 			if err != nil {
 				recordContractCoreReadError(r.ctx, err)
 				return nil
@@ -57,7 +80,14 @@ func (r *contractCoreEdges) filter(rows []*graph.Edge) []*graph.Edge {
 		} else {
 			// Potential writers keep the previous errorless classifier. A late
 			// read refusal must never discard their committed mutation receipt.
+			if r.edgeTiming != nil {
+				r.edgeTiming.LegacyClassifiers++
+				started = time.Now()
+			}
 			nodes := r.GetNodesByIDs(ids)
+			if r.edgeTiming != nil {
+				r.edgeTiming.EndpointLookup += time.Since(started)
+			}
 			kinds = make(map[string]graph.NodeKindRow, len(nodes))
 			for id, node := range nodes {
 				if node != nil {
@@ -86,7 +116,27 @@ func (r *contractCoreEdges) GetInEdges(id string) []*graph.Edge {
 	return r.filter(r.Reader.GetInEdges(id))
 }
 func (r *contractCoreEdges) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
-	return r.filterBatch(r.Reader.GetOutEdgesByNodeIDs(ids))
+	if r.edgeTiming == nil {
+		return r.filterBatch(r.Reader.GetOutEdgesByNodeIDs(ids))
+	}
+	t := r.edgeTiming
+	if t.RawReads == 0 {
+		t.ReaderType = fmt.Sprintf("%T", r.Reader)
+	}
+	started := time.Now()
+	rows := r.Reader.GetOutEdgesByNodeIDs(ids)
+	t.RawRead += time.Since(started)
+	t.RawReads++
+	for _, edges := range rows {
+		t.RawRows += len(edges)
+	}
+	started = time.Now()
+	filtered := r.filterBatch(rows)
+	t.Filter += time.Since(started)
+	for _, edges := range filtered {
+		t.KeptRows += len(edges)
+	}
+	return filtered
 }
 func (r *contractCoreEdges) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
 	return r.filterBatch(r.Reader.GetInEdgesByNodeIDs(ids))

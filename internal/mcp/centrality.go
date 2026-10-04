@@ -258,6 +258,10 @@ func (s *Server) boundedCentralityForRequestObserved(ctx context.Context, seeds,
 	// new generation, and a repeated search reads nothing.
 	reader := s.stackedAdjacencyReader(ctx)
 	if reader == nil {
+		if timing != nil {
+			// Install before readerFor constructs the request's core wrapper.
+			ctx = withCoreEdgeTiming(ctx, &timing.CoreEdges)
+		}
 		reader = s.readerFor(ctx)
 	} else if timing != nil {
 		timing.MemoCalls++

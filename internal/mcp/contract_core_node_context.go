@@ -29,7 +29,7 @@ type contractCoreBoundedFiles struct {
 type contractCoreFilteredNamesBoundedFiles struct{ *contractCoreBoundedFiles }
 
 func newContractCoreEdges(reader graph.Reader, ctx context.Context, ids map[string]bool) graph.Reader {
-	core := &contractCoreEdges{Reader: reader, ctx: ctx, contractIDs: ids}
+	core := &contractCoreEdges{Reader: reader, ctx: ctx, contractIDs: ids, edgeTiming: coreEdgeTimingFromContext(ctx)}
 	_, filtered := reader.(graph.FilteredContainingNameReader)
 	if files, ok := reader.(graph.BoundedFileNodeReader); ok {
 		bounded := &contractCoreBoundedFiles{contractCoreEdges: core, files: files}

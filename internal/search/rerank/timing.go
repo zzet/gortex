@@ -75,6 +75,7 @@ func (t *prepareTiming) finish(observer func(Timing)) {
 // contains NodeRead + EdgeRead + SnapshotCompute; never add both levels.
 // Cache lookup/store durations include mutex waiting and the cache operation.
 type CentralityTiming struct {
+	CoreEdges                                                          CoreEdgeTiming
 	Total, ReaderSetup, Snapshot, NodeRead, EdgeRead, SnapshotCompute  time.Duration
 	ScopeKey, CacheLookup, Walk, CacheStore, Bookkeeping               time.Duration
 	Calls, NodeReads, EdgeReads, NodeIDs, EdgeIDs, NodeRows, EdgeRows  int
@@ -83,6 +84,7 @@ type CentralityTiming struct {
 }
 
 func (t *CentralityTiming) Add(o CentralityTiming) {
+	t.CoreEdges.Add(o.CoreEdges)
 	t.Total += o.Total
 	t.ReaderSetup += o.ReaderSetup
 	t.Snapshot += o.Snapshot
@@ -109,4 +111,33 @@ func (t *CentralityTiming) Add(o CentralityTiming) {
 	t.SnapshotNodes += o.SnapshotNodes
 	t.SnapshotEdges += o.SnapshotEdges
 	t.Truncated += o.Truncated
+}
+
+// CoreEdgeTiming is nested inside CentralityTiming.EdgeRead. EndpointLookup
+// is part of Filter, not another additive cost alongside the containing total.
+type CoreEdgeTiming struct {
+	RawRead, Filter, EndpointLookup                 time.Duration
+	RawReads, RawRows, KeptRows                     int
+	EndpointReads, EndpointIDs, EndpointDistinctIDs int
+	CheckedClassifiers, LegacyClassifiers           int
+	ReaderType                                      string
+}
+
+func (t *CoreEdgeTiming) Add(o CoreEdgeTiming) {
+	t.RawRead += o.RawRead
+	t.Filter += o.Filter
+	t.EndpointLookup += o.EndpointLookup
+	t.RawReads += o.RawReads
+	t.RawRows += o.RawRows
+	t.KeptRows += o.KeptRows
+	t.EndpointReads += o.EndpointReads
+	t.EndpointIDs += o.EndpointIDs
+	t.EndpointDistinctIDs += o.EndpointDistinctIDs
+	t.CheckedClassifiers += o.CheckedClassifiers
+	t.LegacyClassifiers += o.LegacyClassifiers
+	if t.ReaderType == "" {
+		t.ReaderType = o.ReaderType
+	} else if o.ReaderType != "" && t.ReaderType != o.ReaderType {
+		t.ReaderType = "mixed"
+	}
 }
