@@ -1843,10 +1843,19 @@ func (idx *Indexer) withOutputGenerationSource(
 	if err != nil {
 		return err
 	}
-	current, err := idx.currentRepositoryMutationIndexer()
-	if err != nil {
-		receipt.Abandon()
-		return err
+	current := idx
+	if idx.contractCoreRuntime.Load() != nil && entry != OutputEntryRepositoryTopology {
+		// Point/watch doors use the live executor after acquiring their lane.
+		// Topology admission owns its explicit candidate before registration:
+		// resolving it through the live map would refuse valid restart restore.
+		// Its existing lane, output receipt and in-body topology recheck remain
+		// the authority for installing that candidate. Runtime-off keeps the
+		// legacy receipt path without a newly introduced executor lookup.
+		current, err = idx.currentRepositoryMutationIndexer()
+		if err != nil {
+			receipt.Abandon()
+			return err
+		}
 	}
 	restore, err := current.beginInstalledContractCoreInputs(ctx)
 	if err != nil {
