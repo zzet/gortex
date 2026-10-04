@@ -34,22 +34,32 @@ func TestSymbolRepoRangeMatchesSharedScoresTiesAndLimits(t *testing.T) {
 	s := viewBatchTestStore(t)
 	seedRepoRange(t, s, "repo", "owned-first", 3)
 	seedRepoRange(t, s, "other", "foreign-inside-range", 4)
+	seedRepoRange(t, viewBatchHandle(s, 12), "repo", "foreign-generation", 2)
 	seedRepoRange(t, s, "", "unowned", 2)
 	seedRepoRange(t, s, "repo", "owned-last", 3)
-	for _, limit := range []int{1, 3, 7, 100} {
-		want := unboundedSingleGeneration(t, s, 0, "needle shared", []string{"repo"}, limit)
-		got, handled, err := s.searchSymbolRepoSpanPlan(t.Context(), s.buildFTSMatch("needle shared", true), "repo", limit)
+	for _, tc := range []struct {
+		query string
+		limit int
+	}{{"needle shared", 1}, {"needle shared", 3}, {"needle shared", 7}, {"needle shared", 100}, {"absentRareTerm", 100}} {
+		want := unboundedSingleGeneration(t, s, 0, tc.query, []string{"repo"}, tc.limit)
+		if tc.query == "needle shared" && tc.limit == 100 && len(want) != 8 {
+			t.Fatalf("reference must retain six repo and two unowned rows, got %v", want)
+		}
+		if tc.query == "absentRareTerm" && len(want) != 0 {
+			t.Fatalf("reference must have no matches, got %v", want)
+		}
+		got, handled, err := s.searchSymbolRepoSpanPlan(t.Context(), s.buildFTSMatch(tc.query, true), "repo", tc.limit)
 		if err != nil || !handled || !reflect.DeepEqual(got, want) {
-			t.Fatalf("limit %d handled=%v err=%v got=%v want=%v", limit, handled, err, got, want)
+			t.Fatalf("query %s limit %d handled=%v err=%v got=%v want=%v", tc.query, tc.limit, handled, err, got, want)
 		}
 		for i := range got {
 			if math.Float64bits(got[i].Score) != math.Float64bits(want[i].Score) {
-				t.Fatalf("limit %d score bits differ at %d", limit, i)
+				t.Fatalf("query %s limit %d score bits differ at %d", tc.query, tc.limit, i)
 			}
 		}
-		public, err := s.SearchSymbolsRepoScopedContext(t.Context(), "needle shared", []string{"repo"}, limit)
+		public, err := s.SearchSymbolsRepoScopedContext(t.Context(), tc.query, []string{"repo"}, tc.limit)
 		if err != nil || !reflect.DeepEqual(public, want) {
-			t.Fatalf("public limit %d err=%v got=%v want=%v", limit, err, public, want)
+			t.Fatalf("public query %s limit %d err=%v got=%v want=%v", tc.query, tc.limit, err, public, want)
 		}
 	}
 }
