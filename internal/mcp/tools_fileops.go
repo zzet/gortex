@@ -1877,14 +1877,44 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 // Registry's extension-based detection so unindexed files (or files
 // outside any tracked repo) still get a language tag.
 func (s *Server) detectLanguageForPath(ctx context.Context, absPath, relPath string) string {
-	// Source-only reads detect from bytes/registry, never from an older graph.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return ""
+	}
+	// File nodes use the graph path as their canonical identity, including
+	// the repo prefix. Language attribution needs that one selected node,
+	// never the file's declarations or adjacency. Legacy custom identities
+	// use the bounded registry/content fallback below.
+	// Source-only reads still bypass graph evidence entirely.
 	if sourceRequestView(ctx) == nil {
-		if sg := s.engineFor(ctx).GetFileSymbols(relPath); sg != nil {
-			for _, n := range sg.Nodes {
-				if n != nil && n.Kind == graph.KindFile && n.Language != "" {
-					return n.Language
-				}
+		reader := s.readerFor(ctx)
+		var node *graph.Node
+		var err error
+		switch checked := reader.(type) {
+		case interface {
+			GetNodeContext(context.Context, string) (*graph.Node, error)
+		}:
+			node, err = checked.GetNodeContext(ctx, relPath)
+		case interface {
+			GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error)
+		}:
+			var nodes map[string]*graph.Node
+			nodes, err = checked.GetNodesByIDsContext(ctx, []string{relPath})
+			node = nodes[relPath]
+		default:
+			if reader != nil {
+				node = reader.GetNode(relPath)
 			}
+		}
+		if ctx.Err() != nil {
+			return ""
+		}
+		// Attribution is best effort, including after a committed operation:
+		// a failed checked read uses the registry, never a late tool refusal.
+		if err == nil && node != nil && node.ID == relPath && node.Kind == graph.KindFile && node.FilePath == relPath && node.Language != "" && s.nodeInSessionScope(ctx, node) {
+			return node.Language
 		}
 	}
 	// Fall back to the parser registry from whichever indexer owns
