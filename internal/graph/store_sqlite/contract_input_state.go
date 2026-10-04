@@ -157,13 +157,6 @@ func (s *Store) setContractInputStateWithWorkTx(ctx context.Context, tx *sql.Tx,
 			previousVersion, previousFingerprint = actual.InputVersion, actual.InputFingerprint
 		}
 	}
-	// Completed publication rows need no new physical copy. Older retained
-	// generations still pin their exact acknowledgments until their own sweep.
-	if s.viewGen == 0 {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM generation_contract_work AS d WHERE view_gen=0 AND `+contractWorkAcknowledgedSQL); err != nil {
-			return err
-		}
-	}
 	if err := setContractWorkTx(ctx, tx, s.viewGen, work, encoded); err != nil {
 		return err
 	}

@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS contract_attachments (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS contract_attachment_payload ON contract_attachments(payload_generation);
 CREATE INDEX IF NOT EXISTS contract_input_identity ON generation_contract_input_state(repo_prefix, checkout_id, input_version, input_fingerprint);
+CREATE INDEX IF NOT EXISTS contract_work_pending_scope ON generation_contract_work(view_gen,repo_prefix,checkout_id,state,token);
 CREATE TABLE IF NOT EXISTS contract_attachment_work (
  repo_prefix TEXT NOT NULL,
  checkout_id TEXT NOT NULL,

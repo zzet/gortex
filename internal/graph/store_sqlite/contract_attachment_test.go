@@ -280,3 +280,60 @@ func (s *Store) AtManagedGenerationMustForContractTest(t *testing.T, id int64) *
 	}
 	return h
 }
+
+func TestContractAttachmentNonemptyOwnerShapeAndMaskRefusal(t *testing.T) {
+	s := openCatalogStore(t)
+	ctx := context.Background()
+	core := reservedGeneration(t, s, "nonempty-core")
+	h := s.AtGeneration(core)
+	state := attachmentState("shaped")
+	if err := h.SetContractInputStateWithWorkContext(ctx, nil, state, nil); err != nil {
+		t.Fatal(err)
+	}
+	payload := attachmentPayload(t, s)
+	layer, err := s.AtManagedGeneration(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := &graph.Node{ID: "repo/provider.go::serve", Kind: graph.KindFunction, RepoPrefix: "repo", FilePath: "repo/provider.go", Name: "serve"}
+	shape := &graph.Node{ID: "repo/shared.go::Reply", Kind: graph.KindType, RepoPrefix: "repo", FilePath: "repo/shared.go", Meta: map[string]any{"shape": map[string]any{"fields": []any{map[string]any{"name": "new_wire", "type": "string"}}}}}
+	canonical := &graph.Node{ID: "http::GET::/new", Kind: graph.KindContract, RepoPrefix: "repo", FilePath: source.FilePath, Meta: map[string]any{"type": "http", "role": "provider", "symbol_id": source.ID, "contract_owner_record": true, "contract_meta": map[string]any{"method": "GET", "path": "/new", "response_type": shape.ID}}}
+	owner := &graph.Edge{From: source.ID, To: canonical.ID, Kind: graph.EdgeProvides, FilePath: source.FilePath, Line: 7, Meta: map[string]any{"contract_owner_repo_prefix": "repo", "contract_owner_role": "provider", "contract_owner_symbol_id": source.ID, "contract_owner_meta": map[string]any{"method": "GET", "path": "/new", "response_type": shape.ID}}}
+	if err := layer.AddBatchChecked([]*graph.Node{source, canonical, shape}, []*graph.Edge{owner}); err != nil {
+		t.Fatal(err)
+	}
+	a := attachmentFor(state, payload)
+	if err := h.PublishContractAttachmentContext(ctx, state, a, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := layer.LoadContractRepoProjectionContext(ctx, "repo")
+	if err != nil || len(projection.OwnerRows) != 1 || projection.Targets[canonical.ID] == nil {
+		t.Fatalf("owner projection=%#v %v", projection, err)
+	}
+	if projection.OwnerRows[0].Edge.Meta["contract_owner_meta"].(map[string]any)["response_type"] != shape.ID {
+		t.Fatal("owner payload lost type")
+	}
+	typed, err := layer.LayerContractIDProjectionContext(ctx, []string{shape.ID})
+	if err != nil || typed.SourceNodes[shape.ID] == nil {
+		t.Fatalf("shape projection=%#v %v", typed, err)
+	}
+	if !reflect.DeepEqual(typed.SourceNodes[shape.ID].Meta, shape.Meta) {
+		t.Fatalf("shape bytes changed=%#v", typed.SourceNodes[shape.ID].Meta)
+	}
+	if s.GetNode(canonical.ID) != nil || s.GetNode(shape.ID) != nil {
+		t.Fatal("isolated payload leaked into ordinary primary")
+	}
+	masked := attachmentPayload(t, s)
+	if err := s.AtGeneration(masked).SetFileMasks([]FileMask{{RepoPrefix: "repo", FilePath: source.FilePath, Mode: OwnershipReplace}}); err != nil {
+		t.Fatal(err)
+	}
+	changed := state
+	changed.InputFingerprint = "mask-input"
+	other := reservedGeneration(t, s, "mask-core")
+	if err := s.AtGeneration(other).SetContractInputStateWithWorkContext(ctx, nil, changed, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AtGeneration(other).PublishContractAttachmentContext(ctx, changed, attachmentFor(changed, masked), nil, 1); err == nil {
+		t.Fatal("core file masks accepted")
+	}
+}

@@ -63,6 +63,9 @@ func (s *Store) PublishContractAttachmentContext(ctx context.Context, expected g
 	if ctx == nil {
 		return fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
 	}
+	if !expected.Accepted {
+		return fmt.Errorf("%w: worker captured pending input", ErrCatalogStaleGuard)
+	}
 	if err := validateContractInput(expected); err != nil {
 		return err
 	}
@@ -131,6 +134,15 @@ func (s *Store) PublishContractAttachmentContext(ctx context.Context, expected g
 	for i, row := range work {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO contract_attachment_work(repo_prefix,checkout_id,attachment_version,attachment_fingerprint,token,origin_generation,file_path,input_version,input_fingerprint,scope) VALUES(?,?,?,?,?,?,?,?,?,?)`, row.RepoPrefix, row.CheckoutID, expected.InputVersion, expected.InputFingerprint, row.Token, row.OriginGeneration, row.FilePath, row.InputVersion, row.InputFingerprint, string(encoded[i])); err != nil {
 			return err
+		}
+	}
+	// Primary completion reclaims only this exact captured batch; no foreground
+	// mutation or other actor pays a lifetime acknowledgment scan.
+	if s.viewGen == 0 {
+		for i, row := range work {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM generation_contract_work WHERE view_gen=0 AND token=? AND repo_prefix=? AND checkout_id=? AND origin_generation=? AND file_path=? AND input_version=? AND input_fingerprint=? AND scope=?`, row.Token, row.RepoPrefix, row.CheckoutID, row.OriginGeneration, row.FilePath, row.InputVersion, row.InputFingerprint, string(encoded[i])); err != nil {
+				return err
+			}
 		}
 	}
 	if err := execGuardedTx(ctx, tx, "contract attachment payload is not building", `UPDATE view_generations SET state=?,published_at=? WHERE generation_id=? AND state=?`, string(ViewGenerationReady), publishedAt, attachment.PayloadGeneration, string(ViewGenerationBuilding)); err != nil {

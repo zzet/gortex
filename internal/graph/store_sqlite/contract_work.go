@@ -177,7 +177,8 @@ func setContractWorkTx(ctx context.Context, tx *sql.Tx, generation int64, work [
 }
 
 // PendingContractWorkForScopeContext reads only unacknowledged debt, so request
-// cost is bounded by active work rather than lifetime completion history.
+// returned rows are bounded. Primary publication deletes its exact completed
+// batch; positive generations reclaim acknowledged physical rows on fold.
 func (s *Store) PendingContractWorkForScopeContext(ctx context.Context, repo, checkout string) ([]graph.ContractWork, error) {
 	return s.readContractWork(ctx, " AND repo_prefix=? AND checkout_id=? AND state='pending' AND NOT "+contractWorkAcknowledgedSQL, []any{repo, checkout})
 }
