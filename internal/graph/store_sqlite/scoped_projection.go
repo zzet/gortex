@@ -1,7 +1,9 @@
 package store_sqlite
 
 import (
+	"encoding/json"
 	"iter"
+	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -269,6 +271,15 @@ func scopedNodeProjectionQuery(
 			` AND n.id > ? ORDER BY n.id LIMIT ?`
 		return query, []any{repoPrefixes[0], kind, viewGen}, true
 	}
+	// FindFiles admits unowned rows beside a selected repository. A global
+	// file-kind cursor still visits every repository before applying that
+	// filter. Bound each repo-first arm, then merge in the same global ID
+	// order. Positive generations and broader frontiers keep their old SQL.
+	if haveRepos && !haveFiles && viewGen == baseViewGeneration && kind == string(graph.KindFile) {
+		if query, args, ok := scopedBaseFileRepoUnionQuery(reposJSON, columns, kind, viewGen); ok {
+			return query, args, true
+		}
+	}
 	ctes := make([]string, 0, 2)
 	joins := make([]string, 0, 2)
 	args := make([]any, 0, 3)
@@ -300,6 +311,35 @@ func scopedNodeProjectionQuery(
 		` FROM nodes AS n ` + strings.Join(joins, " ") +
 		` WHERE ` + kindPredicate + `n.view_gen = ? AND n.id > ? ORDER BY n.id LIMIT ?`
 	return query, args, true
+}
+
+// At most sixteen repo-first arms keep SQL size/parameter count and the
+// intermediate rows bounded. The pager still appends one cursor and limit.
+const scopedBaseFileRepoUnionArms = 16
+
+func scopedBaseFileRepoUnionQuery(reposJSON, columns, kind string, viewGen int64) (string, []any, bool) {
+	var repos []string
+	if err := json.Unmarshal([]byte(reposJSON), &repos); err != nil || len(repos) < 2 || len(repos) > scopedBaseFileRepoUnionArms {
+		return "", nil, false
+	}
+	parameter := func(index int) string { return "?" + strconv.Itoa(index) }
+	kindParam, generationParam := parameter(len(repos)+1), parameter(len(repos)+2)
+	cursorParam, limitParam := parameter(len(repos)+3), parameter(len(repos)+4)
+	ctes := make([]string, 0, len(repos))
+	arms := make([]string, 0, len(repos))
+	args := make([]any, 0, len(repos)+2)
+	for i, repo := range repos {
+		name := "repo_" + strconv.Itoa(i)
+		ctes = append(ctes, name+` AS (SELECT `+qualifiedNodeColumns("n", columns)+
+			` FROM nodes AS n WHERE n.repo_prefix = `+parameter(i+1)+
+			` AND n.kind = `+kindParam+` AND +n.view_gen = `+generationParam+
+			` AND n.id > `+cursorParam+` ORDER BY n.id LIMIT `+limitParam+`)`)
+		arms = append(arms, `SELECT * FROM `+name)
+		args = append(args, repo)
+	}
+	args = append(args, kind, viewGen)
+	return `WITH ` + strings.Join(ctes, ", ") + ` ` + strings.Join(arms, ` UNION ALL `) +
+		` ORDER BY id LIMIT ` + limitParam, args, true
 }
 
 // scopedEdgeProjectionQuery is the canonical exact-file path. The requested
