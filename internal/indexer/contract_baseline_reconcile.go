@@ -260,6 +260,8 @@ func collectContractBaselineAcceptedReceipt(ctx context.Context, idx *Indexer, f
 // withContractBaselineOutput names the contract-only output after its repository
 // lane is held. It deliberately avoids core-input journal/source mutation entry:
 // the reconstruction's own accepted-source and sidecar CAS fences remain in fn.
+// Callers pass the actual runtime Store used for these writes, not a temporary
+// AtGeneration handle, and already own the repository mutation lane.
 func (mi *MultiIndexer) withContractBaselineOutput(ctx context.Context, output *store_sqlite.Store, repo string, entry OutputMutationEntry, fn func() error) error {
 	if fn == nil {
 		return nil
@@ -267,13 +269,17 @@ func (mi *MultiIndexer) withContractBaselineOutput(ctx context.Context, output *
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if mi == nil || output == nil || output.SymbolSearchViewGeneration() != 0 || repo == "" || mi.repoRootPath(repo) == "" {
+	if mi == nil || output == nil || output.SymbolSearchViewGeneration() != 0 || repo == "" {
 		return fmt.Errorf("%w: contract baseline requires its generation-zero store and repository root", ErrOutputMutationTargetInvalid)
+	}
+	root := mi.repoRootPath(repo)
+	if root == "" {
+		return fmt.Errorf("%w: contract baseline requires its repository root", ErrOutputMutationTargetInvalid)
 	}
 	if entry != OutputEntryContractBaseline {
 		return fmt.Errorf("%w: contract baseline entry %q", ErrOutputMutationEntryUnregistered, entry)
 	}
-	target := legacyOutputTargetFor(outputStoreIdentity(output), repo, mi.repoRootPath(repo), "")
+	target := legacyOutputTargetFor(outputStoreIdentity(output), repo, root, "")
 	target.OwnerKey += "|producer:contract-baseline"
 	receipt, err := mi.outputGenerationAuthority().Begin(ctx, entry, target)
 	if err != nil {
