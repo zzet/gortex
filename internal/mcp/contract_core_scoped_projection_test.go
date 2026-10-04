@@ -93,7 +93,7 @@ func TestContractCoreScopedProjectionOptionalTraits(t *testing.T) {
 	require.Implements(t, (*graph.FilteredContainingNameReader)(nil), reader)
 	projection := reader.(graph.ScopedProjectionSequencer)
 	var retained []graph.ScopedEdgeRow
-	for row := range projection.EdgesInScopeSeq([]string{"a"}, nil) {
+	for row := range projection.EdgesInScopeSeq([]string{"a"}, nil, graph.EdgeCalls, graph.EdgeHandlesRoute) {
 		retained = append(retained, row)
 	}
 	require.Len(t, retained, 1, "projection must not bypass contract edge filtering")
