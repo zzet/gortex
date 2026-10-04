@@ -95,9 +95,10 @@ def plan_shards(names):
 
 def guard_command(command):
     # Reserve room for Go's own test-binary flags and path below CreateProcess's
-    # 32,767 UTF-16 code-unit limit. Never drop names to make an argument fit.
+    # 32,767 UTF-16 code-unit limit on Windows. Other platforms do not use
+    # CreateProcess. Never drop names to make an argument fit.
     units = len(subprocess.list2cmdline(command).encode("utf-16-le")) // 2
-    if units > 30000:
+    if os.name == "nt" and units > 30000:
         raise ValueError(f"factored test command exceeds Windows budget: {units}")
     return units
 
