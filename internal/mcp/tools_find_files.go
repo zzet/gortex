@@ -9,9 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/mark3labs/mcp-go/mcp"
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 	querypkg "github.com/zzet/gortex/internal/query"
