@@ -96,7 +96,7 @@ func (idx *Indexer) collectContractBoundaryReceipt(ctx context.Context, path, la
 		EventBus                                  any
 		Parser, PostExtraction                    int
 		ContractPolicy, RecordPolicy, MatchPolicy string
-	}{idx.config, idx.eventBusBoundaries(), extractorVersionForLang(language), postExtractionPolicyVersion, contractExtractionPolicyVersion, contracts.RecordFingerprintVersion, contracts.MatchDependencyKeyVersion})
+	}{contractExtractionSettings(idx.config), idx.eventBusBoundaries(), extractorVersionForLang(language), postExtractionPolicyVersion, contractExtractionPolicyVersion, contracts.RecordFingerprintVersion, contracts.MatchDependencyKeyVersion})
 	if err != nil {
 		return contractBoundaryReceipt{}, err
 	}

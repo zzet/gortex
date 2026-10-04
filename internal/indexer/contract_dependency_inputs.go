@@ -48,7 +48,7 @@ func (idx *Indexer) stampContractDependencyInputs(relPath, language string, src 
 		Records                                   string
 		ContractPolicy                            string
 		ExtractorVersion, ExtractionPolicyVersion int
-	}{idx.config, idx.eventBusBoundaries(), contractExtractorIdentity(idx, language), contracts.RecordFingerprintVersion, contractExtractionPolicyVersion,
+	}{contractExtractionSettings(idx.config), idx.eventBusBoundaries(), contractExtractorIdentity(idx, language), contracts.RecordFingerprintVersion, contractExtractionPolicyVersion,
 		extractorVersionForLang(language), postExtractionPolicyVersion})
 	if err != nil {
 		return
