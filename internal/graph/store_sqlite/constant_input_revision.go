@@ -1,0 +1,10 @@
+package store_sqlite
+
+import "sync/atomic"
+
+// constantInputCounter covers committed constant sidecar changes separately
+// from graph analysis clocks. Access and increments are serialized by writeMu.
+func (s *Store) constantInputCounter(g int64) *atomic.Uint64 {
+	v, _ := s.constantInputRevisions.LoadOrStore(g, &atomic.Uint64{})
+	return v.(*atomic.Uint64)
+}

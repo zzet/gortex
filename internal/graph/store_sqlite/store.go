@@ -221,7 +221,8 @@ type storeCore struct {
 	analysisGenerationPresent bool
 	// analysisViewRevisions is the per-view-generation mutation clock
 	// (generation id → *atomic.Uint64; AnalysisViewRevision).
-	analysisViewRevisions sync.Map
+	analysisViewRevisions  sync.Map
+	constantInputRevisions sync.Map
 	// analysisLatchRemaining is what the last scoped durable invalidation
 	// left for the latch: whether any view still holds a pointer or a
 	// building analysis. Guarded by writeMu.

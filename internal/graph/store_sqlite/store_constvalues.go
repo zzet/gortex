@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"database/sql"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -35,6 +36,7 @@ func (s *Store) BulkSetConstantValues(repoPrefix string, rows []graph.ConstantVa
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
+	changed := false
 	for start := 0; start < len(rows); start += constValueChunk {
 		end := start + constValueChunk
 		if end > len(rows) {
@@ -43,7 +45,7 @@ func (s *Store) BulkSetConstantValues(repoPrefix string, rows []graph.ConstantVa
 		batch := rows[start:end]
 		args := make([]any, 0, len(batch)*5)
 		stmt := make([]byte, 0, 96+len(batch)*16)
-		stmt = append(stmt, "INSERT OR REPLACE INTO constant_values (view_gen, node_id, repo_prefix, file_path, value) VALUES "...)
+		stmt = append(stmt, "INSERT INTO constant_values (view_gen, node_id, repo_prefix, file_path, value) VALUES "...)
 		for i, r := range batch {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -51,11 +53,18 @@ func (s *Store) BulkSetConstantValues(repoPrefix string, rows []graph.ConstantVa
 			stmt = append(stmt, "(?, ?, ?, ?, ?)"...)
 			args = append(args, s.viewGen, r.NodeID, repoPrefix, r.FilePath, r.Value)
 		}
-		if _, err := tx.Exec(string(stmt), args...); err != nil {
+		stmt = append(stmt, " ON CONFLICT(view_gen,node_id) DO UPDATE SET repo_prefix=excluded.repo_prefix,file_path=excluded.file_path,value=excluded.value WHERE repo_prefix IS NOT excluded.repo_prefix OR file_path IS NOT excluded.file_path OR value IS NOT excluded.value"...)
+		result, err := tx.Exec(string(stmt), args...)
+		if err != nil {
 			return err
 		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		changed = changed || n > 0
 	}
-	return tx.Commit()
+	return s.commitConstantInput(tx, changed)
 }
 
 // ReplaceConstantValues atomically replaces the authoritative repository
@@ -70,6 +79,13 @@ func (s *Store) ReplaceConstantValues(repoPrefix string, rows []graph.ConstantVa
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+	equal, err := s.constantRepoEqualsTx(tx, repoPrefix, rows)
+	if err != nil {
+		return err
+	}
+	if equal {
+		return tx.Commit()
+	}
 	if _, err := tx.Exec(`DELETE FROM constant_values WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
@@ -93,7 +109,7 @@ func (s *Store) ReplaceConstantValues(repoPrefix string, rows []graph.ConstantVa
 			return err
 		}
 	}
-	return tx.Commit()
+	return s.commitConstantInput(tx, true)
 }
 
 // DeleteConstantValuesByFiles drops all constant values sourced in the
@@ -112,6 +128,7 @@ func (s *Store) DeleteConstantValuesByFiles(repoPrefix string, files []string) e
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
+	changed := false
 	for start := 0; start < len(files); start += constValueChunk {
 		end := start + constValueChunk
 		if end > len(files) {
@@ -130,11 +147,17 @@ func (s *Store) DeleteConstantValuesByFiles(repoPrefix string, files []string) e
 			args = append(args, f)
 		}
 		stmt = append(stmt, ')')
-		if _, err := tx.Exec(string(stmt), args...); err != nil {
+		result, err := tx.Exec(string(stmt), args...)
+		if err != nil {
 			return err
 		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		changed = changed || n > 0
 	}
-	return tx.Commit()
+	return s.commitConstantInput(tx, changed)
 }
 
 // ConstantValuesByNodeIDs returns the persisted values for the supplied
@@ -181,4 +204,50 @@ func (s *Store) ConstantValuesByNodeIDs(nodeIDs []string) (map[string]string, er
 		_ = rows.Close()
 	}
 	return out, nil
+}
+
+// commitConstantInput runs under writeMu. Failed or unchanged transactions do
+// not withdraw an input witness; every committed sidecar change does.
+func (s *Store) commitConstantInput(tx *sql.Tx, changed bool) error {
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed {
+		s.constantInputCounter(s.viewGen).Add(1)
+	}
+	return nil
+}
+
+func (s *Store) constantRepoEqualsTx(tx *sql.Tx, repo string, want []graph.ConstantValueRow) (bool, error) {
+	rows, err := tx.Query("SELECT node_id,file_path,value FROM constant_values WHERE view_gen=? AND repo_prefix=?", s.viewGen, repo)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	current := map[string]graph.ConstantValueRow{}
+	for rows.Next() {
+		var r graph.ConstantValueRow
+		if err := rows.Scan(&r.NodeID, &r.FilePath, &r.Value); err != nil {
+			return false, err
+		}
+		current[r.NodeID] = r
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if len(current) != len(want) {
+		return false, nil
+	}
+	seen := map[string]bool{}
+	for _, r := range want {
+		if seen[r.NodeID] {
+			return false, nil
+		}
+		seen[r.NodeID] = true
+		old, ok := current[r.NodeID]
+		if !ok || old != r {
+			return false, nil
+		}
+	}
+	return true, nil
 }
