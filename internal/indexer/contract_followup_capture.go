@@ -234,7 +234,12 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 			scopes[repo] = [2]string{idx.workspaceID, idx.projectID}
 		}
 		options.MultiIndexer.mu.RUnlock()
-		configs[repo] = snapshotDedicatedBaseConfig(cfg)
+		scope := scopes[repo]
+		owned, _, err := snapshotDedicatedBaseConfig(cfg, repo, scope[0], scope[1])
+		if err != nil {
+			return ContractFollowupSnapshot{}, err
+		}
+		configs[repo] = owned
 		// A selected linked actor's own source lives at its catalog root. The
 		// accepted hash still fences historical and dirty-file movement.
 		if view != nil && view.ID.RepoPrefix == repo {
@@ -342,6 +347,11 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 		// Admission reads durable receipt identities, never every source file.
 		// Missing legacy proof is usable only by background baseline rebuilding.
 		repoHandles := handlesByRepo[repo]
+		if options.selectedInputs == nil {
+			// Baseline repair derives its source proof from accepted core metadata,
+			// even when old optional analysis receipts are incomplete or obsolete.
+			repoHandles = nil
+		}
 		for i := len(repoHandles) - 1; i >= 0; i-- {
 			actors := []string{""}
 			if options.selectedInputs != nil {

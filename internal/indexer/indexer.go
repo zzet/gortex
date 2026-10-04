@@ -4931,10 +4931,6 @@ func (idx *Indexer) IndexFile(filePath string) error {
 		if len(result.FailedFiles) > 0 {
 			return fmt.Errorf("indexing %q failed after retry: %s", canonical, strings.Join(result.FailedFiles, ", "))
 		}
-		current, currentErr := idx.currentRepositoryMutationIndexer()
-		if currentErr != nil {
-			return currentErr
-		}
 		return nil
 	})
 }
