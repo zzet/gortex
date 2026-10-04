@@ -48,6 +48,7 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"anonymous{MutationRevision}":                 "telemetry, cache-liveness or scheduling probe; absent, the metric or the cache shortcut is simply off",
 	"anonymous{NodesByKindLang}":                  "read accelerator: without it the caller takes the Store/Reader form, which DeltaWriter answers through the composed view (a cost, not a different answer)",
 	"anonymous{PurgeRepo}":                        "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
+	"anonymous{RepoHasLanguageContext}":           "read accelerator: without it the caller takes the composed file-count fallback; forwarding the base EXISTS would miss delta additions and shadows",
 	"anonymous{SearchMutationRevision}":           "composition contract of an overlay layer, a composed view or a reader wrapper; asserted on those objects, never on the store the engine writes",
 	"anonymous{TokensUsed}":                       "embedder usage probe, asserted on the embedding provider",
 	"anonymous{Unwrap}":                           "error or wrapper unwrapping, asserted on errors and cleanup wrappers",
