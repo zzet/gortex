@@ -18,10 +18,15 @@ type ScopedEdgeRow struct {
 // frontier. When filePaths is non-empty it is the tighter predicate; repository
 // prefixes remain an additional safety filter. Implementations must keep their
 // cursor/page bounded and must not materialise a whole repository.
-type ScopedProjectionSequencer interface {
+// ScopedNodeProjectionSequencer exposes selected node streams without edge traversal.
+type ScopedNodeProjectionSequencer interface {
 	NodesInScopeSeq(repoPrefixes, filePaths []string, kinds ...NodeKind) iter.Seq[*Node]
-	EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...EdgeKind) iter.Seq[ScopedEdgeRow]
 	NodesLightInScopeSeq(repoPrefixes, filePaths []string) iter.Seq[*Node]
+}
+
+type ScopedProjectionSequencer interface {
+	ScopedNodeProjectionSequencer
+	EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...EdgeKind) iter.Seq[ScopedEdgeRow]
 }
 
 // NodesInScopeSeq selects the production streaming capability. The adapter

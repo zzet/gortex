@@ -5,11 +5,10 @@ import (
 	"iter"
 )
 
-// Keep the selected projection optional without allowing its edge stream to
-// bypass ordinary-core adjacency filtering.
+// Preserve selected node projection without advertising edge traversal.
 type contractCoreScopedProjection struct {
 	core     *contractCoreEdges
-	selected graph.ScopedProjectionSequencer
+	selected graph.ScopedNodeProjectionSequencer
 }
 
 func (p *contractCoreScopedProjection) NodesInScopeSeq(repos, files []string, kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
@@ -17,18 +16,6 @@ func (p *contractCoreScopedProjection) NodesInScopeSeq(repos, files []string, ki
 }
 func (p *contractCoreScopedProjection) NodesLightInScopeSeq(repos, files []string) iter.Seq[*graph.Node] {
 	return p.selected.NodesLightInScopeSeq(repos, files)
-}
-func (p *contractCoreScopedProjection) EdgesInScopeSeq(repos, files []string, kinds ...graph.EdgeKind) iter.Seq[graph.ScopedEdgeRow] {
-	return func(yield func(graph.ScopedEdgeRow) bool) {
-		for row := range p.selected.EdgesInScopeSeq(repos, files, kinds...) {
-			if len(p.core.filter([]*graph.Edge{row.Edge})) == 0 {
-				continue
-			}
-			if !yield(row) {
-				return
-			}
-		}
-	}
 }
 
 type contractCoreScoped struct {
@@ -49,7 +36,7 @@ type contractCoreScopedFilteredBounded struct {
 }
 
 func preserveContractCoreScopedProjection(wrapped graph.Reader, selected graph.Reader, core *contractCoreEdges) graph.Reader {
-	projection, ok := selected.(graph.ScopedProjectionSequencer)
+	projection, ok := selected.(graph.ScopedNodeProjectionSequencer)
 	if !ok {
 		return wrapped
 	}

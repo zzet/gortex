@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"iter"
 	"path"
 	"sort"
 	"strings"
@@ -95,8 +96,8 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 		RepoAllow:   resolved.RepoAllow,
 	}
 
-	files := reader.NodesByKind(graph.KindFile)
-	if projection, ok := reader.(graph.ScopedProjectionSequencer); ok && len(resolved.RepoAllow) > 0 {
+	var files iter.Seq[*graph.Node]
+	if projection, ok := reader.(graph.ScopedNodeProjectionSequencer); ok && len(resolved.RepoAllow) > 0 {
 		// ScopeAllows also admits unowned nodes. Keep one projection so its
 		// ID order matches the original kind traversal for equal-path ties.
 		repos := []string{""}
@@ -107,6 +108,8 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 		}
 		sort.Strings(repos)
 		files = projection.NodesInScopeSeq(repos, nil, graph.KindFile)
+	} else {
+		files = reader.NodesByKind(graph.KindFile)
 	}
 
 	hits := make([]fileHit, 0, 64)

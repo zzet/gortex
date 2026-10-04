@@ -29,7 +29,7 @@ func TestFindFilesRuntimeScopedProjectionPreservesScopeAndOverlay(t *testing.T) 
 	srv.graph = tracked
 	installContractCoreKindTestRuntime(t, srv)
 	srv.scopeWorkspace, srv.scopeProject = "ws", "p"
-	require.Implements(t, (*graph.ScopedProjectionSequencer)(nil), srv.readerFor(context.Background()))
+	require.Implements(t, (*graph.ScopedNodeProjectionSequencer)(nil), srv.readerFor(context.Background()))
 	read := func(ctx context.Context, args map[string]any) map[string]any {
 		res, err := srv.handleFindFiles(ctx, makeReq("find_files", args))
 		require.NoError(t, err)
@@ -78,29 +78,13 @@ func TestContractCoreScopedProjectionOptionalTraits(t *testing.T) {
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "traits.sqlite"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.Close() })
-	store.AddBatch([]*graph.Node{
-		{ID: "a/source", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/main.go"},
-		{ID: "a/target", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/main.go"},
-		{ID: "a/contract", Kind: graph.KindContract, RepoPrefix: "a", FilePath: "a/main.go"},
-	}, []*graph.Edge{
-		{From: "a/source", To: "a/target", Kind: graph.EdgeCalls, Meta: map[string]any{"via": "plain"}},
-		{From: "a/source", To: "a/contract", Kind: graph.EdgeCalls},
-		{From: "a/source", To: "a/target", Kind: graph.EdgeHandlesRoute},
-	})
 	reader := newContractCoreEdges(store, context.Background(), nil)
-	require.Implements(t, (*graph.ScopedProjectionSequencer)(nil), reader)
+	require.Implements(t, (*graph.ScopedNodeProjectionSequencer)(nil), reader)
 	require.Implements(t, (*graph.BoundedFileNodeReader)(nil), reader)
 	require.Implements(t, (*graph.FilteredContainingNameReader)(nil), reader)
-	projection := reader.(graph.ScopedProjectionSequencer)
-	var retained []graph.ScopedEdgeRow
-	for row := range projection.EdgesInScopeSeq([]string{"a"}, nil, graph.EdgeCalls, graph.EdgeHandlesRoute) {
-		retained = append(retained, row)
-	}
-	require.Len(t, retained, 1, "projection must not bypass contract edge filtering")
-	require.Equal(t, "plain", retained[0].Edge.Meta["via"])
-	require.Equal(t, "a/target", retained[0].Edge.To)
-
+	_, full := reader.(graph.ScopedProjectionSequencer)
+	require.False(t, full, "node forwarding must not advertise edge traversal")
 	hidden := newContractCoreEdges(struct{ graph.Reader }{store}, context.Background(), nil)
-	_, ok := hidden.(graph.ScopedProjectionSequencer)
+	_, ok := hidden.(graph.ScopedNodeProjectionSequencer)
 	require.False(t, ok, "unsupported projection must remain absent")
 }
