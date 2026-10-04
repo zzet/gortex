@@ -519,6 +519,15 @@ func (s *Server) commitFileMutation(
 		record.markNotApplied(err)
 		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
 	}
+	// UTF-16 sources refuse every write (#846): the indexer decodes them for
+	// extraction, so their symbols are discoverable and every tool that
+	// writes from graph positions — present or future — funnels here.
+	// Splicing UTF-8 into NUL-interleaved bytes corrupts the file; the
+	// refusal names the encoding and the re-encode escape hatch.
+	if err := guardUTF16SourceWrite(tool, relPath, absPath); err != nil {
+		record.markNotApplied(err)
+		return record, err
+	}
 	if err := prepareCheckoutMutation(ctx, absPath); err != nil {
 		record.markNotApplied(err)
 		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)

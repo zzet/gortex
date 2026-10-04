@@ -359,6 +359,12 @@ func (s *Server) planRenameWrites(ctx context.Context, edits []renameEdit, allow
 		if err != nil {
 			return nil, fmt.Errorf("could not read %s: %w", relPath, err)
 		}
+		// The rename rewrites graph lines into the raw bytes. On a UTF-16
+		// source that splices UTF-8 into NUL-interleaved text (#846); refuse
+		// at plan time so even a dry run shows the encoding refusal.
+		if indexer.LooksUTF16Source(content) {
+			return nil, refuseUTF16Edit("rename_symbol", relPath)
+		}
 		lines := splitLinesKeepEnds(string(content))
 
 		fileEdits := byFile[relPath]

@@ -898,6 +898,13 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("could not read file: %v", err)), nil
 	}
+	// Refuse before any match attempt: a UTF-16 file's text is
+	// NUL-interleaved, so the failure mode below this point is
+	// "old_string not found", which sends the agent to the read tools
+	// — which serve the decoded text — a loop with no exit (#846).
+	if indexer.LooksUTF16Source(content) {
+		return mcp.NewToolResultError(refuseUTF16Edit("edit_file", relPath).Error()), nil
+	}
 	// Drift guard: when the caller observed the file at base_sha,
 	// refuse to apply on top of a divergent on-disk SHA. Match the
 	// overlay-push error shape so callers can re-read and retry.
@@ -1463,6 +1470,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		diskContent       []byte
 		physicalEvidence  physicalReadEvidence
 		servedFromOverlay bool
+		utf16Decoded      bool
 	)
 
 	if files := refViewFilesFor(ctx); files != nil {
@@ -1478,6 +1486,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		if viewErr != nil {
 			return mcp.NewToolResultError(viewErr.Error()), nil
 		}
+		bytes, utf16Decoded = decodedSourceForRead(bytes)
 		content = bytes
 		relPath = files.graphPath(rel)
 		viewURI = files.uri(rel)
@@ -1547,6 +1556,11 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			if rerr != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("could not read file: %v", rerr)), nil
 			}
+			// Decode a UTF-16 source so the served text matches what the
+			// indexer extracted (#846); the indexer holds symbols from the
+			// decoded file, so serving raw NUL-interleaved bytes makes
+			// discovery and reads disagree.
+			b, utf16Decoded = decodedSourceForRead(b)
 			content = b
 		}
 	}
@@ -1681,7 +1695,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		}
 	}
 	if physicalEvidenceRequested {
-		contentAltered := servedFromOverlay || isBinary || bodiesElided || salienceTruncated || windowed || secretsRedacted || contentTruncated || !utf8.Valid(content)
+		contentAltered := servedFromOverlay || isBinary || bodiesElided || salienceTruncated || windowed || secretsRedacted || contentTruncated || utf16Decoded || !utf8.Valid(content)
 		contentSource := "disk"
 		if servedFromOverlay {
 			contentSource = "overlay"
@@ -1721,6 +1735,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if contentTruncated {
 		omissions = append(omissions, omission("content_truncated",
 			fmt.Sprintf("content limited to max_chars=%d encoded bytes at a valid UTF-8 boundary", maxChars)))
+	}
+	if utf16Decoded {
+		omissions = append(omissions, utf16DecodedOmission())
 	}
 	if windowed {
 		omissions = append(omissions, omission("windowed",

@@ -78,7 +78,7 @@ func newIntakeIndexer(cfg config.IndexConfig, reg *parser.Registry, logger *zap.
 	return &Indexer{
 		registry:   reg,
 		config:     cfg,
-		transforms: newTransformPipeline(cfg.Transforms, logger),
+		transforms: newTransformPipeline(cfg.Transforms, reg, logger),
 		logger:     logger,
 	}
 }

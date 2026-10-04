@@ -155,3 +155,23 @@ func (r *Registry) AssetClasses() map[string]AssetClass {
 	}
 	return out
 }
+
+// AssetExtensions returns the set of file extensions (with dot, as the
+// extMap keys) whose extractor is an AssetExtractor — content consumed as
+// raw bytes by image / PDF / office / data extractors. Lets the content-
+// transform pipeline keep its byte-rewriting built-ins (the UTF-16
+// decoder) away from payloads that exist to be read binary (#846).
+func (r *Registry) AssetExtensions() map[string]bool {
+	out := make(map[string]bool)
+	for lang, ext := range r.extractors {
+		if AssetClassOf(ext) == "" {
+			continue
+		}
+		for e, l := range r.extMap {
+			if l == lang {
+				out[e] = true
+			}
+		}
+	}
+	return out
+}

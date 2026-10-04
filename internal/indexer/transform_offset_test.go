@@ -23,7 +23,7 @@ func (shrinkingPreParse) rewrite(_ string, src []byte) []byte {
 func TestTransformPipeline_OffsetPreserving(t *testing.T) {
 	t.Run("builtin csharp blanker blanks directives and preserves offsets", func(t *testing.T) {
 		src := []byte("class C {\n#if DEBUG\n    void Dbg() {}\n#endif\n    void M() {}\n}\n")
-		p := newTransformPipeline(nil, nil)
+		p := newTransformPipeline(nil, nil, nil)
 		out := p.run("a.cs", src)
 
 		if len(out) != len(src) {
@@ -53,7 +53,7 @@ func TestTransformPipeline_OffsetPreserving(t *testing.T) {
 
 	t.Run("non-cs file is untouched by the csharp blanker", func(t *testing.T) {
 		src := []byte("# this is a markdown heading, not a directive\n")
-		p := newTransformPipeline(nil, nil)
+		p := newTransformPipeline(nil, nil, nil)
 		out := p.run("a.md", src)
 		if !bytes.Equal(out, src) {
 			t.Errorf("markdown file was altered:\n%s", out)
@@ -62,7 +62,7 @@ func TestTransformPipeline_OffsetPreserving(t *testing.T) {
 
 	t.Run("length-changing pre-parse transform is rejected", func(t *testing.T) {
 		src := []byte("hello world")
-		p := newTransformPipeline(nil, nil)
+		p := newTransformPipeline(nil, nil, nil)
 		p.prePass = append(p.prePass, shrinkingPreParse{})
 		out := p.run("x.txt", src)
 		if !bytes.Equal(out, src) {
