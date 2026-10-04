@@ -3400,7 +3400,11 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 		}
 		return dirtyLayerBuild{}, err
 	}
-	defer releaseBase()
+	defer func() {
+		if releaseBase != nil {
+			releaseBase()
+		}
+	}()
 	identity := c.dirtyIdentity(graphID, commitGeneration)
 	identity.BaseGenerationID = baseGeneration
 	// The committed state's language census is read only when the build's
@@ -3478,6 +3482,23 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 		var torn *DirtySnapshotChangedError
 		if errors.As(err, &torn) {
 			c.deferRetire(torn.GenerationID, "torn working-tree build")
+		}
+		if errors.Is(err, errContractInputsChanged) {
+			c.deferFailedGeneration(ctx, generationID)
+		}
+		if errors.Is(err, errContractInputsChanged) && attempt+1 < 2 {
+			// A source correction invalidated construction-time layer masks.
+			// Re-sampling the checkout with the same reader cannot repair that;
+			// rebuild the materialized ancestry for the existing bounded retry.
+			releaseBase()
+			releaseBase = nil
+			baseOpenStarted = time.Now()
+			freshBase, freshRelease, openErr := c.generationLayerReader(ctx, baseGeneration)
+			if openErr != nil {
+				return dirtyLayerBuild{Work: work}, openErr
+			}
+			dirtyBase, releaseBase = freshBase, freshRelease
+			baseOpen = time.Since(baseOpenStarted)
 		}
 	}
 	return dirtyLayerBuild{Work: work}, nil

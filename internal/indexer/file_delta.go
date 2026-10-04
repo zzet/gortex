@@ -49,14 +49,16 @@ type preparedExtraction struct {
 // fileDeltaProbe exposes phase timings and the three delta boundaries used by
 // the watcher: metadata-only, artifact-only, and semantic topology.
 type fileDeltaProbe struct {
-	readErr         error
-	fingerprints    fileDeltaFingerprints
-	derived         derivedFingerprints
-	read            time.Duration
-	extract         time.Duration
-	coverage        time.Duration
-	fingerprintTime time.Duration
-	readVersion     fileReadVersion
+	readErr                error
+	contractInputs         contractDependencyInputs
+	contractInputsComplete bool
+	fingerprints           fileDeltaFingerprints
+	derived                derivedFingerprints
+	read                   time.Duration
+	extract                time.Duration
+	coverage               time.Duration
+	fingerprintTime        time.Duration
+	readVersion            fileReadVersion
 }
 
 // prepareFileDelta parses the current file once and caches that exact
@@ -164,7 +166,6 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 
 	started = time.Now()
 	fingerprints, derived, ok := extractionFingerprints(result)
-	probe.fingerprintTime = time.Since(started)
 	if !ok {
 		return probe, false, false
 	}
@@ -172,6 +173,9 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 	probe.derived = derived
 	stampExtractionGraphFingerprints(result, fingerprints)
 	stampDerivedFingerprints(result, derived)
+	idx.stampContractDependencyInputs(relPath, lang, src, result)
+	probe.contractInputs, probe.contractInputsComplete = storedContractDependencyInputs(result.Nodes)
+	probe.fingerprintTime = time.Since(started)
 
 	idx.preparedMu.Lock()
 	if idx.prepared == nil {
@@ -298,6 +302,7 @@ var presentationMetaKeys = map[string]struct{}{
 func isFingerprintMeta(key string) bool {
 	switch key {
 	case sourceSemanticFingerprintMeta, sourceMetadataFingerprintMeta, sourceCoreFingerprintMeta,
+		contractDependencyInputMeta,
 		sourceDerivedDeclFingerprintMeta, sourceDerivedImportFingerprintMeta,
 		sourceDerivedRuntimeFingerprintMeta, sourceDerivedArtifactFingerprintMeta,
 		sourceDerivedHierarchyFingerprintMeta:

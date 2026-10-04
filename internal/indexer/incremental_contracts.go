@@ -47,6 +47,15 @@ func (result *contractRefreshResult) addFrontier(contractsToAdd ...[]contracts.C
 
 func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResult {
 	files = appendUniqueSorted(nil, files...)
+	if !idx.contractDependenciesChanged {
+		remaining := files[:0]
+		for _, path := range files {
+			if idx.incrementalUnchangedContracts[path] == nil {
+				remaining = append(remaining, path)
+			}
+		}
+		files = remaining
+	}
 	if len(files) == 0 {
 		return contractRefreshResult{}
 	}
@@ -69,6 +78,10 @@ func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResu
 			fresh, mtimeNano, exists, preservePrior := idx.extractContractsForGraphFileFromBatch(
 				graphPath, byLang, nodesByFile[graphPath], edgesByNode,
 			)
+			fresh = idx.normalizeFreshContractRecords(fresh)
+			if idx.contractInputError() != nil {
+				return result
+			}
 			if preservePrior {
 				continue
 			}
@@ -103,6 +116,17 @@ func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResu
 				delete(idx.contractCache, graphPath)
 			}
 			idx.contractCacheMu.Unlock()
+		}
+	}
+	if idx.contractSharedInputsChanged {
+		// Raw file extraction does not include cross-file mount prefixes.
+		// Shared-input changes already retained the full registry/frontier;
+		// join before persisting owner payloads, as the cold pass does.
+		if scanFiles := idx.routerPrefixScanFiles(reg); len(scanFiles) > 0 {
+			contracts.JoinRouterPrefixes(reg, scanFiles, idx.contractFileSrc)
+			for _, path := range changedFiles {
+				result.addFrontier(reg.ByFile(path))
+			}
 		}
 	}
 	result.Groups = mergeContractGroups(nil, result.Groups...)
@@ -228,7 +252,16 @@ func (idx *Indexer) ensureIncrementalContractRegistry() *contracts.Registry {
 	if idx.contractRegistry != nil {
 		return idx.contractRegistry
 	}
+	if seed := idx.contractRegistrySeed; seed != nil {
+		idx.contractRegistrySeedCalls++
+		idx.contractRegistrySeed = nil
+		seed()
+		if idx.contractRegistry != nil {
+			return idx.contractRegistry
+		}
+	}
 	started := time.Now()
+	idx.contractRegistryLoads++
 	reg := contracts.NewRegistry()
 	restored, stats := contracts.LoadRegistryFromGraphWithScopeAndStats(idx.graph, idx.repoPrefix, idx.workspaceID, idx.projectID)
 	phases := &contractRegistryLoadPhases{RegistryLoadStats: stats}
@@ -406,11 +439,11 @@ func contractGraphRows(store graph.Store, all []contracts.Contract, includeDepen
 	return nodes, edges, missingSourceOwners
 }
 
-// expandIncrementalContractFrontier promotes only cross-file contract constructs
-// to the existing contract-file dependency set. It never enumerates every source
-// file in the repository; go.mod/go.work remain exact single-file refreshes.
+// Cross-file constructs promote the existing contract-file dependency set.
+// Changed shared inputs additionally include previous-empty consumers, which
+// have no registry record to discover. Ordinary edits remain file-local.
 func (idx *Indexer) expandIncrementalContractFrontier(files []string, reg *contracts.Registry) []string {
-	needsDependencies := false
+	needsDependencies := idx.contractDependenciesChanged
 	for _, graphPath := range files {
 		base := strings.ToLower(filepath.Base(graphPath))
 		if base == "go.mod" || base == "go.work" {
@@ -440,6 +473,13 @@ func (idx *Indexer) expandIncrementalContractFrontier(files []string, reg *contr
 	}
 	for _, contract := range reg.ByRepo(idx.repoPrefix) {
 		files = append(files, contract.FilePath)
+	}
+	if idx.contractSharedInputsChanged {
+		for node := range graph.NodesInScopeSeq(idx.graph, []string{idx.repoPrefix}, nil, graph.KindFile) {
+			if node != nil && node.FilePath != "" {
+				files = append(files, node.FilePath)
+			}
+		}
 	}
 	return appendUniqueSorted(nil, files...)
 }
@@ -680,11 +720,16 @@ func contractSourceNeedsFullRefresh(graphPath, language string, src []byte) bool
 	// These constructs can rewrite contracts owned by sibling files. They are
 	// uncommon, so retain the full pass only when the changed bytes actually
 	// contain a cross-file mount or DI declaration.
-	if language == "python" && strings.Contains(lowerSource, "include_router") {
+	if language == "python" && (strings.Contains(lowerSource, "include_router") ||
+		strings.Contains(lowerSource, "register_blueprint") || strings.Contains(lowerSource, "apirouter") || strings.Contains(lowerSource, "blueprint") || strings.Contains(lowerSource, "include")) {
 		return true
 	}
 	if (language == "typescript" || language == "javascript") &&
-		(strings.Contains(lowerSource, ".use(") || strings.Contains(lowerSource, "@controller(")) {
+		(strings.Contains(lowerSource, ".use") || strings.Contains(lowerSource, "@controller") || strings.Contains(lowerSource, "routermodule")) {
+		return true
+	}
+	if language == "rust" && (strings.Contains(lowerSource, ".nest") || strings.Contains(lowerSource, ".merge") ||
+		strings.Contains(lowerSource, ".configure") || strings.Contains(lowerSource, ".service")) {
 		return true
 	}
 	if language == "java" &&
@@ -719,4 +764,23 @@ func contractSetsEqual(left, right []contracts.Contract) bool {
 		}
 	}
 	return true
+}
+
+// Apply the same record normalization as cold extraction before owner payloads
+// are persisted. A later canonical-node patch cannot repair stale owner Meta.
+func (idx *Indexer) normalizeFreshContractRecords(records []contracts.Contract) []contracts.Contract {
+	if len(records) == 0 {
+		return records
+	}
+	local := contracts.NewRegistry()
+	for _, record := range records {
+		record.WorkspaceID, record.ProjectID = record.EffectiveWorkspace(), record.EffectiveProject()
+		local.Add(record)
+	}
+	idx.upgradeContractBareTypeRefs(local)
+	idx.resolveProviderHandlers(local)
+	idx.resolveCallReturnTypes(local)
+	idx.snapshotContractShapes(local)
+	idx.inlineEnvelopeShapes(local)
+	return local.All()
 }

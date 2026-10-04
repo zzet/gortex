@@ -163,6 +163,20 @@ func copyContractMetaValue(v any) any {
 		return out
 	case []string:
 		return append([]string(nil), x...)
+	case []map[string]any:
+		out := make([]map[string]any, len(x))
+		for i, value := range x {
+			out[i] = copyContractMetaMap(value)
+		}
+		return out
+	case *contracts.Shape:
+		if x == nil {
+			return (*contracts.Shape)(nil)
+		}
+		out := *x
+		out.Fields = append([]contracts.ShapeField(nil), x.Fields...)
+		out.Notes = append([]string(nil), x.Notes...)
+		return &out
 	default:
 		return v
 	}

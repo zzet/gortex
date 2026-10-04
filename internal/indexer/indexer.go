@@ -325,6 +325,28 @@ type Indexer struct {
 
 	// contractRegistry holds detected API contracts (HTTP routes, gRPC, etc.).
 	contractRegistry *contracts.Registry
+	// contractRegistrySeed defers immutable-stack hydration until an edit
+	// actually needs the complete repository registry.
+	contractRegistrySeed           func()
+	incrementalUnchangedContracts  map[string]*unchangedFileContracts
+	contractDependenciesChanged    bool
+	contractSharedInputsChanged    bool
+	contractProjectionContext      context.Context
+	contractRestatementErr         error
+	contractInputWitness           *store_sqlite.PayloadInputWitness
+	contractProjectionNeedsWitness bool
+	contractUnchangedFiles         int
+	contractProofUsed              bool
+	contractShortcutReasons        map[string]int
+	contractProjectionTime         time.Duration
+	contractValidationTime         time.Duration
+	contractRegistryLoads          int
+	contractRegistrySeedCalls      int
+	contractGenerationID           int64
+	contractInputErrMu             sync.Mutex
+	contractInputErr               error
+	contractInputWitnessSeed       func() (*store_sqlite.PayloadInputWitness, error)
+	priorContractInputs            func(*incrementalBatchStage) (contractDependencyInputs, bool)
 
 	// trackedRepoModules maps repo names to Go module paths for cross-repo dependency detection.
 	// Populated by MultiIndexer from go.mod files of tracked repos.
@@ -2682,6 +2704,10 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 // indexCtxRaw performs full-tree indexing while the caller holds the
 // repository mutation lane.
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
+	priorContractContext := idx.contractProjectionContext
+	idx.contractProjectionContext = ctx
+	idx.clearContractInputError()
+	defer func() { idx.contractProjectionContext = priorContractContext }()
 	idx.loadFileIndexFailures()
 	idx.pendingColdManifests = nil // older attempts cannot publish into this one
 	idx.deferredAttempt = nil
@@ -4028,6 +4054,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// fingerprinted fast paths.
 					if !skipped {
 						stampExtractionGraphFingerprint(result)
+						if err == nil {
+							idx.stampContractDependencyInputs(relPath, lang, src, result)
+						}
 					}
 
 					idx.applyRepoPrefix(result.Nodes, result.Edges)
@@ -4389,6 +4418,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	idx.totalDetected = len(files)
 	idx.lastIndexTime = time.Now()
 	if err := idx.refreshColdConstantContractFiles(ctx, contractReg, constantContractFiles, contractExtractorsByLang); err != nil {
+		return nil, err
+	}
+	if err := idx.contractInputError(); err != nil {
 		return nil, err
 	}
 
@@ -5142,6 +5174,7 @@ func (idx *Indexer) indexFile(
 		// Future watcher probes compare against it and skip only when every
 		// graph artifact — nodes, edges, locations and metadata — is equal.
 		stampExtractionGraphFingerprint(result)
+		idx.stampContractDependencyInputs(relPath, lang, src, result)
 	}
 
 	idx.applyRepoPrefix(result.Nodes, result.Edges)
@@ -5178,8 +5211,8 @@ func (idx *Indexer) indexFile(
 	idx.replaceContentSections(graphPath, result.Nodes, false)
 
 	idx.graph.AddBatch(result.Nodes, result.Edges)
-	idx.persistConstValues(result)
 	idx.persistFileMeta(relPath, src, result)
+	idx.persistConstValues(result)
 	// No subsequent stage reads source bytes or the parse tree. Release both
 	// here instead of retaining them through resolver/enrichment work; the
 	// deferred calls above remain as idempotent guards for every early return.
@@ -6597,6 +6630,31 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	mode incrementalPathMode,
 	markerBatches ...*reparsePendingEnrichmentBatch,
 ) (*IndexResult, error) {
+	idx.incrementalUnchangedContracts = make(map[string]*unchangedFileContracts)
+	idx.contractDependenciesChanged = false
+	idx.contractSharedInputsChanged = false
+	idx.contractRestatementErr = nil
+	idx.contractShortcutReasons = make(map[string]int)
+	idx.contractProjectionTime = 0
+	idx.contractValidationTime = 0
+	idx.contractRegistryLoads = 0
+	idx.contractRegistrySeedCalls = 0
+	idx.contractUnchangedFiles = 0
+	if !idx.contractProjectionNeedsWitness || !idx.contractProofUsed {
+		idx.contractInputWitness = nil
+		idx.contractProofUsed = false
+	}
+	idx.clearContractInputError()
+	defer func() {
+		idx.logger.Info("indexer: contract input shortcut",
+			zap.String("repo", idx.repoPrefix), zap.Int64("generation", idx.contractGenerationID), zap.Int("unchanged_files", idx.contractUnchangedFiles),
+			zap.Int("global_registry_loads", idx.contractRegistryLoads), zap.Int("registry_seed_calls", idx.contractRegistrySeedCalls),
+			zap.Duration("local_contract_validation", idx.contractValidationTime), zap.Duration("file_projection", idx.contractProjectionTime), zap.Any("reasons", idx.contractShortcutReasons),
+			zap.Bool("publication_guard", idx.contractInputWitness != nil), zap.Error(idx.contractRestatementErr))
+		idx.incrementalUnchangedContracts = nil
+		idx.contractDependenciesChanged = false
+		idx.contractSharedInputsChanged = false
+	}()
 	idx.loadFileIndexFailures()
 	defer idx.flushFileIndexFailures()
 	idx.resetCapabilityPrior()
@@ -6896,6 +6954,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	invalidation, reparsedFiles, failedFiles, versionChangedFiles := idx.reindexIncrementalFilesBatched(
 		sourceStaleFiles, deletedFiles, markerBatch, mode.surfaceFirstVersionChange,
 	)
+	if idx.contractRestatementErr != nil {
+		return nil, idx.contractRestatementErr
+	}
 	finalizeTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "contracts_and_metadata",
 		zap.Int("manifest_files", len(manifestFiles)), zap.Int("reparsed_files", len(reparsedFiles)))
 	defer finalizeTiming.abort()
@@ -6937,6 +6998,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		}
 		if contractRefresh.LegacyFallback {
 			invalidation.LegacyFallback = true
+		}
+		if err := idx.contractInputError(); err != nil {
+			return nil, err
 		}
 		// Hand the exact changed set to the trigram cache so the next
 		// search patches those files instead of re-reading the corpus.
@@ -7115,6 +7179,20 @@ func (idx *Indexer) runContractExtractorsForFileObserved(
 	tree *parser.ParseTree,
 	constantLookupAttempted *bool,
 ) []contracts.Contract {
+	var endpointStore contracts.EndpointConstStore
+	if _, ok := idx.graph.(contracts.EndpointConstStore); ok {
+		endpointStore = checkedContractEndpointConstants{indexer: idx, ctx: idx.contractProjectionContext}
+		if constantLookupAttempted != nil {
+			endpointStore = observedEndpointConstants{EndpointConstStore: endpointStore, attempted: constantLookupAttempted}
+		}
+	}
+	return idx.runContractExtractorsForFileWithInputs(graphPath, src, fileNodes, fileEdges, exts, tree, endpointStore)
+}
+
+func (idx *Indexer) runContractExtractorsForFileWithInputs(
+	graphPath string, src []byte, fileNodes []*graph.Node, fileEdges []*graph.Edge,
+	exts []contracts.Extractor, tree *parser.ParseTree, endpointStore contracts.EndpointConstStore,
+) []contracts.Contract {
 	if len(exts) == 0 {
 		return nil
 	}
@@ -7129,13 +7207,6 @@ func (idx *Indexer) runContractExtractorsForFileObserved(
 	// once per call; nil when the backend can't satisfy the reader (const
 	// dereference is then disabled and store-aware extractors degrade to their
 	// tree-aware behaviour).
-	var endpointStore contracts.EndpointConstStore
-	if es, ok := idx.graph.(contracts.EndpointConstStore); ok {
-		endpointStore = es
-		if constantLookupAttempted != nil {
-			endpointStore = observedEndpointConstants{EndpointConstStore: es, attempted: constantLookupAttempted}
-		}
-	}
 	for _, ex := range exts {
 		var found []contracts.Contract
 		if sae, ok := ex.(contracts.StoreAwareExtractor); ok {
@@ -7168,6 +7239,7 @@ func (idx *Indexer) runContractExtractorsForFileObserved(
 		}
 		out = append(out, found...)
 	}
+	idx.rememberContractReaderStatus()
 	return out
 }
 

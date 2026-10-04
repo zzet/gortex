@@ -96,7 +96,11 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	// retires its source edges. Later contract refresh uses this registry to
 	// describe removed records and schedule the existing derived frontier.
 	// A true no-op batch must not hydrate any contract state.
-	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
+	if len(deletedFiles) > 0 {
+		// Removed constant/type/mount inputs may have same-package users with
+		// no import edge. Deleted source cannot provide a new trigger stamp.
+		idx.contractDependenciesChanged = true
+		idx.contractSharedInputsChanged = true
 		idx.ensureIncrementalContractRegistry()
 	}
 	var invalidation DerivedInvalidationPlan
@@ -296,7 +300,8 @@ func (idx *Indexer) reindexIncrementalChunk(
 		forced := idx.forceReparse(filePath)
 		inert := probeOK && storedGraph.semantic != "" &&
 			probe.fingerprints.semantic == storedGraph.semantic &&
-			probe.fingerprints.metadata == storedGraph.metadata
+			probe.fingerprints.metadata == storedGraph.metadata &&
+			unchangedProbeContractInputs(priorNodes, probe)
 		if forced && inert && idx.inertReparsed != nil && !idx.forceReparseDropsResolutions(filePath) {
 			// The delta's change set is re-derived whatever its
 			// fingerprints say; an inert one has its prior rows restated
@@ -349,7 +354,8 @@ func (idx *Indexer) reindexIncrementalChunk(
 			src: prepared.src, result: prepared.result, prepared: prepared, priorNodes: priorNodes,
 			storedGraph: storedGraph, storedDerived: storedDerived, probe: probe,
 			metadataOnly: !forced && storedGraph.semantic != "" &&
-				probe.fingerprints.semantic == storedGraph.semantic,
+				probe.fingerprints.semantic == storedGraph.semantic &&
+				unchangedProbeContractInputs(priorNodes, probe),
 		}
 		stage.bytes = estimateParseGraphBytes(stage.result.Nodes, stage.result.Edges) + int64(len(stage.src))
 		stages = append(stages, stage)
@@ -368,6 +374,13 @@ func (idx *Indexer) reindexIncrementalChunk(
 		zap.Duration("prior_fingerprints", priorFingerprintTime))
 	if len(stages) > 0 {
 		plan.Merge(idx.commitIncrementalStages(stages, markerBatch))
+		if idx.contractRestatementErr != nil {
+			for _, stage := range stages {
+				idx.noteFileIndexFailure(stage.absPath, idx.contractRestatementErr)
+				readFailed = append(readFailed, stage.absPath)
+			}
+			return consumed, plan, nil, readFailed, nil
+		}
 		for _, stage := range stages {
 			receipts = append(receipts, fileReadReceipt{
 				absPath: stage.absPath, mtimeKey: stage.mtimeKey, readVersion: stage.readVersion,
@@ -408,6 +421,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 	}
 	failedBeforeFallback := len(failed)
 	for _, fallback := range fallbacks {
+		idx.ensureIncrementalContractRegistry()
 		if err := idx.reindexIncrementalFallback(fallback, markerBatch, &plan); err != nil {
 			idx.noteFileIndexFailure(fallback.filePath, err)
 			idx.discardPreparedExtraction(fallback.filePath)
@@ -561,6 +575,17 @@ func (idx *Indexer) commitIncrementalStages(
 		zap.Int("staged_files", len(stages)))
 	defer timing.abort()
 	var plan DerivedInvalidationPlan
+	for _, stage := range stages {
+		delete(idx.incrementalUnchangedContracts, stage.graphPath)
+		unchanged := idx.stageUnchangedContracts(stage)
+		if err := idx.contractInputError(); err != nil {
+			idx.contractRestatementErr = err
+			return DerivedInvalidationPlan{}
+		}
+		if !unchanged {
+			idx.ensureIncrementalContractRegistry()
+		}
+	}
 	idx.startApplyLaps()
 	view := loadIncrementalPriorView(idx.graph, stages)
 	idx.applyLap("prior_view")
@@ -966,6 +991,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	// A function re-derived unchanged keeps its clone rows (clone_carry.go).
 	carried = append(carried, idx.carryCloneRowsOfUnchangedBodies(stages, view, nodes)...)
 	idx.graph.AddBatch(nodes, append(edges, carried...))
+	idx.restateUnchangedContracts(stages)
 	idx.applyLap("add_batch")
 	idx.relinkImportNodesToModules(nodes)
 	idx.applyLap("relink")
@@ -2310,9 +2336,12 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		// Canonical FTS lifetime is decided with its owners in the backend.
 		idx.deleteSymbolFTS(ftsNodeIDs)
 		idx.deleteRefFactsForFiles(idx.repoPrefix, graphPaths)
-		idx.deleteIncrementalSidecars(graphPaths)
 		idx.clearIncrementalContent(graphPaths)
 		nodes, edges := evictFilesBatched(idx.graph, graphPaths)
+		// This is an authoritative deletion, including legacy files without
+		// accepted inventory. Establish the graph tombstone before sidecar
+		// cleanup so constant ownership cannot restore a live file receipt.
+		idx.deleteIncrementalSidecars(graphPaths)
 		nodesRemoved += nodes
 		edgesRemoved += edges
 	}
@@ -2345,11 +2374,14 @@ func (idx *Indexer) deleteEnrichmentByNodeIDs(nodeIDs []string) {
 }
 
 func (idx *Indexer) deleteIncrementalSidecars(graphPaths []string) {
-	if writer, ok := idx.graph.(graph.FileMetaWriter); ok {
-		_ = writer.DeleteFileMetasByFiles(idx.repoPrefix, graphPaths)
-	}
+	// Delta constant deletion may establish accepted ownership while the
+	// graph file is still live. Retire inventory last so a true file deletion
+	// cannot restore physical metadata underneath the later tombstone.
 	if writer, ok := idx.graph.(graph.ConstantValueWriter); ok {
 		_ = writer.DeleteConstantValuesByFiles(idx.repoPrefix, graphPaths)
+	}
+	if writer, ok := idx.graph.(graph.FileMetaWriter); ok {
+		_ = writer.DeleteFileMetasByFiles(idx.repoPrefix, graphPaths)
 	}
 }
 

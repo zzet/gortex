@@ -175,6 +175,10 @@ func (idx *Indexer) extractionFingerprintsOfContent(absPath string, src []byte) 
 		return fileDeltaFingerprints{}, derivedFingerprints{}, nil, false
 	}
 	defer lease.Release()
+	return idx.extractionFingerprintsOfContentAdmitted(absPath, src)
+}
+
+func (idx *Indexer) extractionFingerprintsOfContentAdmitted(absPath string, src []byte) (fileDeltaFingerprints, derivedFingerprints, []*graph.Node, bool) {
 	relPath := idx.relKey(absPath)
 	lang, ok := idx.effectiveLanguage(absPath, src)
 	if !ok {
@@ -187,6 +191,7 @@ func (idx *Indexer) extractionFingerprintsOfContent(absPath string, src []byte) 
 	src = idx.transforms.run(relPath, src)
 	var result *parser.ExtractionResult
 	var skipped bool
+	var err error
 	result, skipped, err = idx.extractFileWithRawLease(nil, nil, nil, absPath, relPath, lang, ext, src)
 	defer result.ReleaseTree()
 	if result == nil || skipped || err != nil {
@@ -199,6 +204,9 @@ func (idx *Indexer) extractionFingerprintsOfContent(absPath string, src []byte) 
 	if !ok {
 		return fileDeltaFingerprints{}, derivedFingerprints{}, nil, false
 	}
+	stampExtractionGraphFingerprints(result, g)
+	stampDerivedFingerprints(result, d)
+	idx.stampContractDependencyInputs(relPath, lang, src, result)
 	nodes := make([]*graph.Node, 0, len(result.Nodes))
 	for _, n := range result.Nodes {
 		if n == nil {

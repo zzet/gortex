@@ -321,7 +321,8 @@ type EditDeltaReport struct {
 	// carryRegistry files the delta's final contract registry under the
 	// published generation's stack (edit_delta_contract_cache.go); nil when
 	// the delta's registry was not keyed.
-	carryRegistry func(generation int64)
+	carryRegistry        func(generation int64)
+	contractInputWitness *store_sqlite.PayloadInputWitness
 	// StackCacheKey is the key the delta's per-stack caches were kept under
 	// (edit_delta_contract_cache.go), empty when the stack below has none.
 	StackCacheKey string
@@ -560,7 +561,19 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 			return err
 		}
 		markPublicationPhase(ctx, PublicationPayloadFlushed)
-		if err := b.Store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
+		var publishErr error
+		if delta.contractInputWitness != nil {
+			publishErr = b.Store.PublishPayloadGenerationWithInputWitness(ctx, generationID, time.Now().Unix(), delta.contractInputWitness)
+		} else {
+			publishErr = b.Store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix())
+		}
+		if errors.Is(publishErr, store_sqlite.ErrPayloadInputChanged) {
+			if b.Logger != nil {
+				b.Logger.Info("indexer: contract input publication refused", zap.Int64("generation", generationID), zap.String("reason", "selected_input_changed"))
+			}
+			return fmt.Errorf("%w: %w: contract inputs changed before publication", ErrDirtySnapshotChanged, errContractInputsChanged)
+		}
+		if err := publishErr; err != nil {
 			return fmt.Errorf("indexer: publish generation %d: %w", generationID, err)
 		}
 		if delta.carryRegistry != nil {
@@ -739,6 +752,14 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	}
 	chainTouched := dw.ChainTouchedPaths()
 	idx := New(dw, b.Registry, b.Config, b.Logger)
+	idx.contractGenerationID = handle.ViewGeneration()
+	idx.contractProjectionContext = ctx
+	idx.contractProjectionNeedsWitness = true
+	if generations, complete := editDeltaContractInputGenerations(req.Base, b.Store); complete {
+		idx.contractInputWitnessSeed = func() (*store_sqlite.PayloadInputWitness, error) {
+			return b.Store.CapturePayloadInputWitness(ctx, generations)
+		}
+	}
 	idx.cloneRecompute = cloneRecomputePaths(req.RepoPrefix, req.RecomputeDerivedPaths)
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
@@ -773,8 +794,12 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// The registry is kept for the whole stack below the delta, the chain
 	// included: it is not composed per read (edit_delta_contract_cache.go).
 	if key, ok := editDeltaRegistryKey(keyBase, b.Store, req.RepoPrefix, req.WorkspaceID, req.ProjectID); ok {
-		out.ContractRegistryCached = seedEditDeltaContractRegistry(idx, key)
-		lap("contract_registry")
+		idx.contractRegistrySeed = func() {
+			out.ContractRegistryCached = seedEditDeltaContractRegistry(idx, key)
+		}
+	}
+	if req.headProvenance != nil {
+		idx.priorContractInputs = idx.verifiedHeadContractInputs(req.RootPath, req.headProvenance.sha)
 	}
 	// Prior rows without fingerprints are given their HEAD content's
 	// (edit_delta_prior_fingerprints.go).
@@ -1247,6 +1272,9 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		b.Logger.Info("indexer: working-tree edit delta", fields...)
 	}
 	out.carryRegistry = editDeltaRegistryCarry(idx, req.Base, b.Store, req.RepoPrefix, req.WorkspaceID, req.ProjectID)
+	if idx.contractProofUsed {
+		out.contractInputWitness = idx.contractInputWitness
+	}
 	return out, nil
 }
 
