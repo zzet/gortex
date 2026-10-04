@@ -13,6 +13,7 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/search"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 )
 
 func TestContractBaselineRepairsStaleReceiptsFromAcceptedCore(t *testing.T) {
@@ -43,7 +44,7 @@ func TestContractBaselineRepairsStaleReceiptsFromAcceptedCore(t *testing.T) {
 			_, err = leases.CaptureInitialRawRepositorySource(ctx, registration, "accepted-core-source")
 			require.NoError(t, err)
 			materializer := &graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: leases}
-			options := ContractFollowupCaptureOptions{Context: ctx, Store: store, Materializer: materializer, MultiIndexer: mi, Registry: idx.registry, Config: idx.config, Logger: zap.NewNop(), Yield: func(ctx context.Context) error { return ctx.Err() }}
+			options := ContractFollowupCaptureOptions{Context: ctx, Store: store, Materializer: materializer, MultiIndexer: mi, Registry: idx.registry, Config: idx.config, Logger: zaptest.NewLogger(t), Yield: func(ctx context.Context) error { return ctx.Err() }}
 			prior := contractBoundaryReceipt{Version: contractBoundaryReceiptVersion, FilePath: "fixture/routes.go", Source: "old-source", Policy: "old-policy"}
 			if mode == "unknown" {
 				prior.Version = "unknown-legacy-version"
