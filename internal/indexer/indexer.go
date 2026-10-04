@@ -7461,7 +7461,10 @@ func (idx *Indexer) commitContracts(reg *contracts.Registry) {
 	idx.inlineEnvelopeShapes(reg)
 
 	all := reg.All()
-	nodes, edges, missingOwners := contractGraphRows(idx.graph, all, false)
+	// Dependency identities were seeded before resolution. Persist their full
+	// records and source ownership now, as incremental refresh does, so a cold
+	// baseline does not lose owners that later per-file passes legitimately emit.
+	nodes, edges, missingOwners := contractGraphRows(idx.graph, all, true)
 	idx.warnMissingContractOwners(missingOwners)
 
 	bulkStart := time.Now()
@@ -9441,16 +9444,12 @@ func readGoModModulePath(src []byte) string {
 }
 
 // extractGoModContracts runs the go.mod-specific extractor once against
-// the repo root (go.mod isn't represented as a file node in the graph).
-// Results are added to reg. Safe to call when no go.mod exists.
+// the repo root. Results are added to reg. Safe when no go.mod exists.
+// Module coverage separately emits the manifest's genuine KindFile node.
 //
-// Also materialises the dep::<module> contracts as graph nodes
-// immediately, so the resolver's import-bridge (Resolver.lookupDepModule)
-// can find them during ResolveAll. commitContracts later AddNode is
-// idempotent — it skips nodes that already exist — so this doesn't
-// double-emit. We only do this for type=dependency; everything else
-// goes through the normal commit path which depends on a resolved
-// graph (UpgradeBareTypeRefs, resolveProviderHandlers).
+// Minimal dep::<module> graph identities are seeded immediately for the
+// resolver's import bridge. The completed contract pass later persists full
+// dependency records and ownership where a genuine manifest file node exists.
 func (idx *Indexer) extractGoModContracts(reg *contracts.Registry) {
 	var manifest *coldManifestRead
 	if b := idx.coldManifestsForRegistry(reg); b != nil {

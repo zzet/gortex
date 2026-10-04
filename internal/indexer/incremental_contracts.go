@@ -385,9 +385,9 @@ func contractOwnerEndpoint(c contracts.Contract, files map[contractFileOwnerKey]
 	return files[contractFileOwnerKey{c.RepoPrefix, c.FilePath}]
 }
 
-// contractGraphRows is the common persistence emitter. Full passes leave
-// dependency nodes to their pre-resolution single writer; incremental refresh
-// includes dependencies as before. No extraction/enrichment work moves here.
+// contractGraphRows is the common persistence emitter. Dependency identities
+// are seeded before resolution; completed cold and incremental passes both
+// persist their records and ownership here. No extraction work moves here.
 func contractGraphRows(store graph.Store, all []contracts.Contract, includeDependencies bool) (nodes []*graph.Node, edges []*graph.Edge, missingSourceOwners int) {
 	if !includeDependencies {
 		eligible := make([]contracts.Contract, 0, len(all))
