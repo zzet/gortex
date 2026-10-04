@@ -35,6 +35,7 @@ func newSelectedContractCoreStorageBackend(ctx context.Context, target *store_sq
 	}
 	actors := make(map[int64]string)
 	var cumulative *graph.ContractInputState
+	var cumulativeGeneration int64
 	for _, source := range sources {
 		if source.Handle == nil {
 			return nil, graph.ErrContractInputVector
@@ -54,6 +55,7 @@ func newSelectedContractCoreStorageBackend(ctx context.Context, target *store_sq
 		if len(states) == 1 {
 			copyState := states[0]
 			cumulative = &copyState
+			cumulativeGeneration = generation
 			actors[generation] = copyState.CheckoutID
 		} else {
 			actors[generation] = source.CheckoutID
@@ -125,7 +127,17 @@ func newSelectedContractCoreStorageBackend(ctx context.Context, target *store_sq
 	carried := *cumulative
 	carried.CheckoutID = checkout
 	carried.Accepted = true
-	if e := target.SetContractInputStateWithWorkReceiptsAndSourcesContext(ctx, nil, carried, nil, nil, nil); e != nil {
+	var inherited *graph.ContractInputState
+	if cumulativeGeneration > 0 && cumulative.CheckoutID == checkout {
+		row, found, err := target.Catalog().GetViewGeneration(ctx, target.ViewGeneration())
+		if err != nil { return nil, err }
+		if found && row.BaseGenerationID == cumulativeGeneration {
+			// The storage CAS deliberately follows explicit catalog ancestry.
+			// It must see the same original selected parent, not expect absence.
+			inherited = cumulative
+		}
+	}
+	if e := target.SetContractInputStateWithWorkReceiptsAndSourcesContext(ctx, inherited, carried, nil, nil, nil); e != nil {
 		return nil, e
 	}
 	backend.state = &carried
