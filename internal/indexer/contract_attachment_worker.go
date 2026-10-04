@@ -59,6 +59,7 @@ type ContractFollowupSnapshot struct {
 	TrackedRepoModules map[string]string
 	ReadAccepted       func(context.Context, ContractFollowupFile) (ContractAcceptedSource, error)
 	ReadCoreFile       func(context.Context, ContractFollowupFile) (ContractFollowupCoreFile, error)
+	ValidateAccepted   func(context.Context) error
 	Release            func()
 }
 
@@ -603,6 +604,11 @@ func runContractFollowupPrepared(ctx context.Context, req ContractFollowupReques
 		tokens = append(tokens, w.Token)
 	}
 	attachment := graph.ContractAttachment{RepoPrefix: snap.Key.RepoPrefix, CheckoutID: snap.Key.CheckoutID, InputVersion: snap.Key.InputVersion, InputFingerprint: snap.Key.InputFingerprint, PayloadGeneration: generation, CompletedTokens: tokens}
+	if snap.ValidateAccepted != nil {
+		if err := snap.ValidateAccepted(ctx); err != nil {
+			return report, err
+		}
+	}
 	if err := req.Catalog.PublishContractAttachmentWithInputsContext(ctx, logical, snap.Inputs, attachment, snap.Work, time.Now().Unix()); err != nil {
 		return report, err
 	}
