@@ -107,13 +107,16 @@ var sagaPhases = map[sagaKind][]sagaPhase{
 // exactly the rows the saga is deleting. By the later phases there is nothing
 // left to read them back from.
 type sagaTarget struct {
-	Kind         sagaKind  `json:"kind"`
-	Phase        sagaPhase `json:"phase"`
-	CheckoutID   string    `json:"checkout_id,omitempty"`
-	Incarnation  string    `json:"incarnation,omitempty"`
-	FamilyID     string    `json:"family_id,omitempty"`
-	GraphID      string    `json:"graph_id,omitempty"`
-	PrimaryEpoch int64     `json:"primary_epoch,omitempty"`
+	AttemptID string `json:"cleanup_attempt_id,omitempty"`
+	// Exact persisted snapshot for one-time legacy recovery; never serialized.
+	journalSnapshot *store_sqlite.CleanupEntry
+	Kind            sagaKind  `json:"kind"`
+	Phase           sagaPhase `json:"phase"`
+	CheckoutID      string    `json:"checkout_id,omitempty"`
+	Incarnation     string    `json:"incarnation,omitempty"`
+	FamilyID        string    `json:"family_id,omitempty"`
+	GraphID         string    `json:"graph_id,omitempty"`
+	PrimaryEpoch    int64     `json:"primary_epoch,omitempty"`
 }
 
 // cleanupID is the journal key. It is derived from the target rather than
@@ -274,6 +277,8 @@ func (r *Reconciler) enterSaga(ctx context.Context, target sagaTarget) error {
 		return err
 	}
 	if found {
+		target.AttemptID = resumed.AttemptID
+		target.journalSnapshot = resumed.journalSnapshot
 		// The journal is the authority on progress. Ids the caller supplied
 		// still win, because the rows the entry was written against may since
 		// have been deleted and re-created.
@@ -303,6 +308,19 @@ func (r *Reconciler) runSaga(ctx context.Context, target sagaTarget) error {
 	if len(plan) == 0 {
 		return fmt.Errorf("%w: unknown saga kind %q", ErrSagaTarget, target.Kind)
 	}
+	var releaseExecution func()
+	var err error
+	target, releaseExecution, err = r.prepareCleanupExecution(ctx, target)
+	if err != nil {
+		return err
+	}
+	defer releaseExecution()
+
+	// LIFO is intentional: final graph notifications precede release of the
+	// stable-ID gate, so an old finish callback cannot mark a successor done.
+	ctx, finishAttempt := r.repositoryCleanupAttempt(ctx, target.GraphID)
+	defer finishAttempt()
+
 	start := 0
 	if target.Phase != "" {
 		start = slices.Index(plan, target.Phase)
@@ -310,20 +328,26 @@ func (r *Reconciler) runSaga(ctx context.Context, target sagaTarget) error {
 			return fmt.Errorf("%w: phase %q is not part of saga %q", ErrSagaTarget, target.Phase, target.Kind)
 		}
 	}
-
 	id := target.cleanupID()
 	for _, phase := range plan[start:] {
 		target.Phase = phase
 		if err := r.persistPhase(ctx, id, target, store_sqlite.CleanupPhaseDeleting); err != nil {
 			return err
 		}
+		if target.Kind != sagaPurgeLayers {
+			if err := r.beginRepositoryCleanup(ctx, target.GraphID); err != nil {
+				return errors.Join(err, r.persistPhase(ctx, id, target, store_sqlite.CleanupPhaseFailed))
+			}
+		}
 		if err := r.runPhase(ctx, target); err != nil {
 			return errors.Join(err, r.persistPhase(ctx, id, target, store_sqlite.CleanupPhaseFailed))
 		}
 	}
-
 	if target.Kind == sagaPurgeLayers {
 		return r.persistPhase(ctx, id, target, store_sqlite.CleanupPhaseDone)
+	}
+	if target.AttemptID != "" {
+		return r.catalog.DeleteCleanupAttempt(ctx, id, target.AttemptID)
 	}
 	if err := r.catalog.DeleteCleanupEntry(ctx, id); err != nil && !errors.Is(err, store_sqlite.ErrCatalogNotFound) {
 		return err
@@ -625,14 +649,14 @@ func (r *Reconciler) persistPhase(ctx context.Context, id string, target sagaTar
 	if err != nil {
 		return fmt.Errorf("%w: encoding %s: %w", ErrSagaTarget, target.Kind, err)
 	}
-	return r.catalog.UpsertCleanupEntry(ctx, store_sqlite.CleanupEntry{
+	return r.persistCleanupEntry(ctx, store_sqlite.CleanupEntry{
 		CleanupID:       id,
 		OpaqueTargetIDs: string(payload),
 		Reason:          string(target.Kind),
 		Phase:           phase,
 		PrimaryEpoch:    target.PrimaryEpoch,
 		LastProgress:    r.now().Unix(),
-	})
+	}, target)
 }
 
 // loadSagaTarget reads back an unfinished journal entry. A finished one is
@@ -658,6 +682,7 @@ func decodeSagaTarget(entry store_sqlite.CleanupEntry) (sagaTarget, error) {
 	if target.Kind == "" {
 		return sagaTarget{}, fmt.Errorf("%w: entry %s names no saga kind", ErrSagaTarget, entry.CleanupID)
 	}
+	target.journalSnapshot = &entry
 	return target, nil
 }
 

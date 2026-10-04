@@ -1098,7 +1098,7 @@ func (s *Server) gatherExploreSyntacticAnchorCandidatesCollecting(
 			addProtected(index, ordinaryCandidate)
 			continue
 		}
-		rows := eng.GatherSymbolCandidates(anchor.query, exploreSyntacticAnchorFetchLimit(anchor, ordinaryCandidate), anchorOpts, rctx)
+		rows := eng.GatherSymbolCandidatesContext(ctx, anchor.query, exploreSyntacticAnchorFetchLimit(anchor, ordinaryCandidate), anchorOpts, rctx)
 		combined := rows
 		if ordinaryCandidate != nil {
 			combined = append([]*rerank.Candidate{ordinaryCandidate}, rows...)

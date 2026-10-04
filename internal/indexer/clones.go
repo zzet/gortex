@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/clones"
@@ -35,6 +36,40 @@ const cloneTokensMetaKey = "clone_tokens"
 // large (≈ tokens − 2 entries per body) and persisting it across the
 // clone-detection pass would waste tens of MB on a monorepo.
 const cloneShinglesMetaKey = "clone_shingles"
+
+// cloneBodyMetaKey is the Node.Meta key under which a function/method's
+// body identity is kept: a 64-bit FNV-1a hash of its sorted shingle set,
+// hex-encoded. It is what lets a per-file delta tell a body it re-derived
+// unchanged (its clone rows still hold) from a changed one, without the
+// prior bytes. Additive: excluded from every fingerprint
+// (fingerprintMetaKeys), and ignored by a binary that does not know it.
+const cloneBodyMetaKey = "clone_body"
+
+// cloneBodyTextIdentity is the body identity of a body too short to shingle:
+// the same hash over its whitespace-normalised text, marked so it never equals
+// a shingle-set identity.
+func cloneBodyTextIdentity(body string) string {
+	var h uint64 = 14695981039346656037
+	for _, b := range []byte("t:" + strings.Join(strings.Fields(body), " ")) {
+		h ^= uint64(b)
+		h *= 1099511628211
+	}
+	return "t" + strconv.FormatUint(h, 16)
+}
+
+// cloneBodyIdentity is the body identity of a shingle set.
+func cloneBodyIdentity(shingles []uint64) string {
+	sorted := append([]uint64(nil), shingles...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	var h uint64 = 14695981039346656037
+	for _, s := range sorted {
+		for i := 0; i < 8; i++ {
+			h ^= (s >> (8 * i)) & 0xff
+			h *= 1099511628211
+		}
+	}
+	return strconv.FormatUint(h, 16)
+}
 
 // CMS-filter tuning.
 //
@@ -141,6 +176,13 @@ func applyCloneSignatures(src []byte, result *parser.ExtractionResult) {
 		// the real signature.
 		shingles, tokens, ok := clones.Shingles(body)
 		if !ok {
+			// Too short to shingle: no clone rows, but the body identity is
+			// still what tells a delta the body is unchanged (clone_carry.go),
+			// taken over the whitespace-normalised text.
+			if n.Meta == nil {
+				n.Meta = map[string]any{}
+			}
+			n.Meta[cloneBodyMetaKey] = cloneBodyTextIdentity(body)
 			continue
 		}
 		if n.Meta == nil {
@@ -148,6 +190,7 @@ func applyCloneSignatures(src []byte, result *parser.ExtractionResult) {
 		}
 		n.Meta[cloneShinglesMetaKey] = shingles
 		n.Meta[cloneTokensMetaKey] = tokens
+		n.Meta[cloneBodyMetaKey] = cloneBodyIdentity(shingles)
 	}
 }
 

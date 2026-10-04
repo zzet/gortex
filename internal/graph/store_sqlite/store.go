@@ -43,13 +43,73 @@ import (
 // mutation state of one open SQLite database. Exactly one storeCore exists
 // per Open; every Store handle over that database points at it, so they all
 // share the same pools, locks and caches.
+type generationBulkCheckpointLease uint64
+
+type backgroundCheckpointAttempt struct {
+	ctx           context.Context
+	cancel        context.CancelCauseFunc
+	timeoutCancel context.CancelFunc
+	done          chan struct{}
+	finishOnce    sync.Once
+	// copy is the attempt's paced copy, set before the lane watcher starts
+	// (its passes pause only once the attempt marks it pausable).
+	copy *walCopyAttempt
+}
+
+type backgroundCheckpointCoordination struct {
+	mu              sync.Mutex
+	nextLease       uint64
+	generationLease generationBulkCheckpointLease
+	boundGeneration int64
+	active          *backgroundCheckpointAttempt
+}
+
 type storeCore struct {
+	// derivedCorrectionEpochs counts finished derived-row corrections per
+	// generation (generation id → *atomic.Uint64); see derivation_stamps.go.
+	derivedCorrectionEpochs sync.Map
+	// walShrinkPending: the WAL reclaim reset a big log in place and its
+	// file still has to be shrunk in slices (wal_shrink.go).
+	walShrinkPending atomic.Bool
+	// rowCountersReady: generation_row_counts is installed and seeded, so
+	// NodeCount / EdgeCount read it (row_counters.go).
+	rowCountersReady atomic.Bool
+	// rowCountersInstall serialises EnsureRowCounters (the lazy loop and a
+	// direct caller must not install over each other).
+	rowCountersInstall sync.Mutex
+	// sweepBatch is the retirement chunk size learned from the last chunk's
+	// time (payload_generation.go, nextSweepBatch); 0 before the first.
+	sweepBatch atomic.Int64
+	// sweepWALPerRow is the learned WAL bytes per retired row (float64 bits).
+	sweepWALPerRow atomic.Uint64
+	// backgroundCheckpoint coordinates the periodic PASSIVE worker with the
+	// generation-scoped bulk owner before either touches the physical writer.
+	// It lives on the shared core so every AtGeneration handle sees one token.
+	backgroundCheckpoint backgroundCheckpointCoordination
 	// db is the bounded, logically read-dedicated pool for on-disk stores.
 	// writerDB is a separate read-write pool capped at one physical connection. In-memory
 	// stores use the same max-one handle for both because independent
 	// :memory: handles would address different databases.
 	db       *sql.DB
 	writerDB *sql.DB
+
+	// readGate is the admission point of the on-disk read pool (nil for
+	// in-memory stores, whose single pool has no WAL). The bounded WAL reclaim
+	// closes it for a moment so a TRUNCATE checkpoint can reset a log no pool
+	// reader holds; see sqliteReadGate and wal_reclaim.go.
+	readGate *sqliteReadGate
+	// walReclaim holds the reclaim's counters (WALReclaimStats).
+	walReclaim walReclaimState
+	// walCopy is the reclaim copy's budget and counters (wal_copy_pause.go).
+	walCopy walCopyState
+	// writerCache sums the writer connection's page-cache counters.
+	writerCache writerCacheCounters
+	// walReclaimRequestedAt: when a writer refused on the log's size last
+	// asked for the reclaim (wal_reclaim_pressure.go), unix nanos.
+	walReclaimRequestedAt atomic.Int64
+	// chainFold is the store's one stepped fold and the members it holds
+	// (chain_fold.go).
+	chainFold chainFoldHeld
 
 	// busyRetryTimeout is the whole-transaction contention budget. The zero
 	// value selects defaultSQLiteBusyRetryTimeout; tests shorten it to exercise
@@ -81,6 +141,30 @@ type storeCore struct {
 	// coordination mutex every handle over that generation shares. Keyed by
 	// int64 generation; values are *sync.Mutex. See ResolveMutex.
 	resolveLanes sync.Map
+
+	// publishedLanguageCounts memoizes RepoLanguageCounts of published
+	// generations, keyed by publishedLanguageCountKey; values are
+	// map[string]int. See PublishedRepoLanguageCounts.
+	publishedLanguageCounts sync.Map
+
+	// fileGenerationIndex caches edges_by_file_generation's presence
+	// (lazy_graph_indexes.go); lazyIndex is its builder's telemetry.
+	fileGenerationIndex atomic.Int32
+	// walReclaimNudged asks the WAL reclaim loop to attempt at its next poll
+	// regardless of backoff (a residue drain handed it a busy TRUNCATE).
+	walReclaimNudged atomic.Bool
+	// walReclaimWake wakes the reclaim loop at a request (RequestWALReclaim)
+	// instead of at its next poll; nil while no loop runs.
+	walReclaimWake atomic.Pointer[chan struct{}]
+	// writeIntents counts mutations announced through AnnounceWrite.
+	writeIntents atomic.Int32
+	// intentsSince is when writeIntents last rose from zero (unix nanos, 0
+	// while none); intentLeakLogged marks the episode's leak line.
+	intentsSince     atomic.Int64
+	intentLeakLogged atomic.Bool
+	// walDrainHandoffs counts residue drains handed to the reclaim.
+	walDrainHandoffs atomic.Int64
+	lazyIndex        lazyIndexCounters
 
 	// payloadBuildFlights maps a catalog generation to its sole process-local
 	// physical writer. Every handle over this core joins the same rendezvous;
@@ -117,10 +201,17 @@ type storeCore struct {
 	resolveMu sync.Mutex
 
 	edgeIdentityRevs atomic.Int64
+	// edgeIdentityRevsByView is edgeIdentityRevs per view generation
+	// (generation id → *atomic.Int64; EdgeIdentityRevisions).
+	edgeIdentityRevsByView sync.Map
 	// edgeMutationRevision is a coarse monotonic generation for every durable
 	// edge payload/topology mutation, including same-key replacements. Resolver
 	// liveness snapshots use it to reject stale work after watcher interleaves.
 	edgeMutationRevision atomic.Uint64
+	// baseEdgeEndpointRevision changes only for committed endpoint-rewrite
+	// families on generation zero. Append-only ingest does not restart a
+	// bounded shadow retirement, and checkout generations are independent.
+	baseEdgeEndpointRevision atomic.Uint64
 
 	// analysisMutationRevision closes the in-process race between loading or
 	// computing a persisted whole-graph analysis and a concurrent graph write.
@@ -128,6 +219,13 @@ type storeCore struct {
 	// DELETE on every row after the first fail-closed invalidation.
 	analysisMutationRevision  atomic.Uint64
 	analysisGenerationPresent bool
+	// analysisViewRevisions is the per-view-generation mutation clock
+	// (generation id → *atomic.Uint64; AnalysisViewRevision).
+	analysisViewRevisions sync.Map
+	// analysisLatchRemaining is what the last scoped durable invalidation
+	// left for the latch: whether any view still holds a pointer or a
+	// building analysis. Guarded by writeMu.
+	analysisLatchRemaining bool
 
 	// wiped records that Open dropped an incompatible on-disk DB and
 	// recreated it empty (a schema-version mismatch that an in-place ALTER
@@ -149,6 +247,96 @@ type storeCore struct {
 	stopCheckpoint chan struct{} // closed by Close to stop the loop
 	checkpointDone chan struct{} // closed by the loop when it returns
 	stopOnce       sync.Once     // makes stopCheckpointLoop idempotent
+
+	// Whole-database maintenance lane (store_compact.go). ANALYZE, VACUUM and
+	// TRUNCATE checkpoints are one-per-file actions: no generation owns them,
+	// so none of them may be charged to a generation's publish. The lane is
+	// the single admission point — maintenanceGate admits one action at a
+	// time, and the scheduling fields below coalesce publish requests so a
+	// burst of publishes owes at most one further pass.
+	//
+	// Lock order: the maintenance gate is taken BEFORE writeMu and never
+	// after. Every writeMu holder inside this package therefore stays free to
+	// finish; nothing that holds the write gate may enter the lane.
+	maintenanceGate sqliteWriteGate
+
+	// maintenanceCtx is the lane's own lifetime, created with the store and
+	// cancelled by Close. It lives on the core deliberately: a scheduled pass
+	// outlives the caller that asked for it, so it must not borrow that
+	// caller's context — a publish returning must never cancel the maintenance
+	// it just requested.
+	//
+	// maintenanceSignal is the coalescing slot (capacity one) the publish
+	// boundaries post to and the lane's worker consumes; maintenanceDone is
+	// closed by that worker when it returns, so Close can join it.
+	// maintenanceSched guards the ctx/cancel pair, the signal slot's companion
+	// owed flag, the running / closed scheduling state and the priority
+	// bookkeeping below.
+	//
+	// maintenancePriority counts the whole-file jobs (VACUUM, TRUNCATE
+	// checkpoint) that are waiting for or holding the lane right now, and
+	// maintenancePass is the planner-statistics pass they pre-empt: those jobs
+	// sit on latency budgets of their own — CheckpointWAL's is 10 s — while a
+	// pass can legitimately hold the token for longer, so a pass yields to
+	// them rather than making them defer. maintenancePriorityResume records
+	// that the worker declined to start a pass because of one, so the last
+	// such job to finish re-posts the signal the worker parked on.
+	maintenanceSched          sync.Mutex
+	maintenanceCtx            context.Context
+	maintenanceCancel         context.CancelFunc
+	maintenanceSignal         chan struct{}
+	maintenanceDone           chan struct{}
+	maintenanceRunning        bool
+	maintenanceOwed           bool
+	maintenanceClosed         bool
+	maintenancePriority       int
+	maintenancePriorityResume bool
+	maintenancePass           *maintenancePassHandle
+
+	// maintenanceDrainOwed is the one-slot request for a bounded follow-up
+	// TRUNCATE checkpoint, posted by a finalize that measured a WAL above the
+	// auto-checkpoint line and consumed by the same worker that runs the
+	// statistics pass. It is a separate flag rather than a second signal
+	// channel because the worker parks on exactly one slot, and it is
+	// coalesced for the same reason the pass request is: two finalizes owe one
+	// drain. maintenanceDrainReason names the boundary that asked, for the
+	// log line; maintenanceDrainRunning is what the lane's settle point reads
+	// so a test (or Close) can tell "drain finished" from "drain not started".
+	maintenanceDrainOwed    bool
+	maintenanceDrainRunning bool
+	maintenanceDrainReason  string
+
+	// Lane counters. Requests counts scheduling calls, passes counts lane
+	// passes actually started (so a burst of requests collapsing into one
+	// pass is observable), jobs counts actions that reached their SQL,
+	// deferrals counts actions that gave up short of it — the store never went
+	// quiescent inside their budget, the lane token never came free, or a
+	// priority job asked a pass to yield — and preemptions counts the passes
+	// asked to yield so a whole-file job could have the token.
+	//
+	// Jobs and deferrals partition every lane entry that got past the
+	// coreless check: an entry is counted in exactly one of them, so a pass
+	// that yields is a deferral and never also a job.
+	maintenanceRequests    atomic.Int64
+	maintenancePasses      atomic.Int64
+	maintenanceJobs        atomic.Int64
+	maintenanceDeferrals   atomic.Int64
+	maintenancePreemptions atomic.Int64
+
+	// Follow-up WAL drain counters. Requests counts finalize boundaries that
+	// measured a residue above the auto-checkpoint line, drains counts the
+	// TRUNCATE checkpoints that actually completed. They differ whenever a
+	// drain gave up its bounded attempts against a reader that never left —
+	// which is a deferral, not a loss: the residue is still there and the next
+	// finalize asks again.
+	walDrainRequests atomic.Int64
+	walDrains        atomic.Int64
+
+	// publishDrains counts publish windows in flight: a generation that is
+	// sealed but whose transition has not committed yet. A whole-file
+	// maintenance action waits them out rather than rewriting the file
+	// underneath one.
+	publishDrains atomic.Int64
 
 	// bundles is the content-addressed package-scoped cache over
 	// SearchSymbolBundles: a query serves cached Node + in/out edges for
@@ -175,6 +363,15 @@ type storeCore struct {
 	bulkPrevAutoCheckpoint int64
 	coordinatedBulkLoad    bool
 	bulkIndexesDeferred    bool
+	// generationBulkLoad names the payload generation a generation-scoped bulk
+	// window was opened for, or 0 when the pinned connection (if any) belongs
+	// to the cold-load fast path instead. It is the flag that keeps the two
+	// windows apart: the cold one proves the whole STORE is empty and may
+	// therefore drop indexes and durability, while this one proves only that
+	// one GENERATION holds no rows and must leave both alone — generation 0's
+	// readers and its durable rows are live underneath it. See
+	// BeginGenerationBulkLoad.
+	generationBulkLoad     int64
 	bulkDeferredNodeRows   int64
 	bulkDeferredEdgeRows   int64
 	bulkCheckpointNodeRows int64
@@ -319,7 +516,7 @@ type storeCore struct {
 // and write gate are shared by every handle over the same database.
 //
 // Open returns the owning handle. AtGeneration derives further handles that
-// differ only in viewGen; a derived handle must never tear the core down, so
+// select a payload view; a derived handle must never tear the core down, so
 // only the owning handle's Close does any work (see ownsCore).
 type Store struct {
 	*storeCore
@@ -327,6 +524,14 @@ type Store struct {
 	// viewGen is the payload view generation this handle reads and writes.
 	// Generation 0 is the base corpus every store starts with.
 	viewGen int64
+
+	// managedPayloadGeneration requires fresh lifecycle admission for writes.
+	// It is immutable per handle, not shared write authority or a seal verdict.
+	managedPayloadGeneration bool
+
+	// analysisViewScoped keys this handle's analysis protocol on its view
+	// generation's clock (ViewScopedAnalysis).
+	analysisViewScoped bool
 
 	// seal is the write-admission flag for viewGen, shared with every other
 	// handle over the same generation. It is nil on the base handle, which is
@@ -343,6 +548,40 @@ type Store struct {
 	// and closing them from a derived handle would break every other handle
 	// still using the same database.
 	ownsCore bool
+
+	// readCtx, when set, is the caller's context the whole-store paged reads
+	// (NodesByKinds, DeadCodeCandidates) honour between pages: a handle bound
+	// with WithReadContext stops such a read within one page of the context
+	// ending, and so releases its WAL snapshot. Nil reads with no deadline.
+	readCtx context.Context
+}
+
+// WithReadContext returns a handle over the same generation whose paged
+// whole-store reads stop within one page once ctx ends. It shares everything
+// else with s; it never owns the core.
+func (s *Store) WithReadContext(ctx context.Context) *Store {
+	if s == nil {
+		return nil
+	}
+	bound := *s
+	bound.ownsCore = false
+	bound.readCtx = ctx
+	return &bound
+}
+
+// BindReadContext implements graph.ReadContextBinder.
+func (s *Store) BindReadContext(ctx context.Context) graph.Reader {
+	return s.WithReadContext(ctx)
+}
+
+var _ graph.ReadContextBinder = (*Store)(nil)
+
+// readContext is the handle's bound read context, or Background.
+func (s *Store) readContext() context.Context {
+	if s != nil && s.readCtx != nil {
+		return s.readCtx
+	}
+	return context.Background()
 }
 
 // coreless reports a handle with nothing behind it: a nil pointer, or a zero
@@ -485,6 +724,12 @@ func openWith(path string, current int, migrations []schemaMigration, allowRebui
 }
 
 func openWithObserver(path string, current int, migrations []schemaMigration, allowRebuild bool, observe MigrationObserver) (*Store, error) {
+	// Refuse unsupported newer schemas before a writer connection can change
+	// journal mode or checkpoint their WAL. WithRebuild does not override this.
+	if err := checkSchemaDowngrade(path, current); err != nil {
+		return nil, err
+	}
+
 	// Pragmas: WAL + synchronous=NORMAL is the standard write-heavy
 	// embedded tradeoff. cache_size(-32768) gives each pooled connection a
 	// 32 MiB page cache; temp_store(MEMORY) keeps GROUP BY / ORDER BY scratch
@@ -499,6 +744,8 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// it), which is how a 535 MB DB ends up with an 11 GB -wal. This bounds
 	// the file even between the explicit TRUNCATE checkpoints runCheckpointLoop
 	// issues, and even if that loop is not running.
+	installSQLiteSleepGauge()
+	installWALCopyPause()
 	writerDSN := sqliteWriterDSN(path)
 	db, err := sql.Open("sqlite", writerDSN)
 	if err != nil {
@@ -510,17 +757,20 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// A separate bounded query pool is opened after schema reconciliation.
 	configureWriterPool(db)
 
-	// Reconcile the on-disk schema version before applying schemaSQL. The graph
-	// store is a rebuildable cache, so an incompatible (older needing a rebuild
-	// step, or newer) DB is dropped and reindexed rather than migrated in place
-	// (see schema_version.go). The daemon holds an exclusive store.lock around
-	// Open, so wiping the file here cannot race another process.
+	// Recheck on the writer handle before applying schemaSQL, including for
+	// shared in-memory stores and a version changed after the read-only probe.
+	// Only known older rebuild boundaries may use destructive rebuild authority.
+	// The daemon holds an exclusive store.lock around Open and that rebuild.
 	stored, err := readUserVersion(db)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite read schema version: %w", err)
 	}
 	plan := planSchemaMigrationWith(stored, current, migrations)
+	if plan.err != nil {
+		_ = db.Close()
+		return nil, plan.err
+	}
 	// A rebuild migration applies to an existing pre-versioning database, but
 	// not to the brand-new empty file sql.Open just created. Distinguish those
 	// two user_version=0 cases before requiring destructive-rebuild authority.
@@ -663,8 +913,12 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	}
 
 	readDB := db
+	var readGate *sqliteReadGate
 	if !isMemoryPath(path) {
-		readDB, err = openSQLiteReadPool(path)
+		if sqliteReadGateEnabled() {
+			readGate = newSQLiteReadGate()
+		}
+		readDB, err = openSQLiteReadPool(path, readGate)
 		if err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite open read pool: %w", err)
@@ -675,7 +929,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// close the pools and prepared statements. Handles derived later by
 	// AtGeneration share this core and leave teardown to this one.
 	s := &Store{
-		storeCore: &storeCore{db: readDB, writerDB: db, dbPath: path, wiped: didWipe},
+		storeCore: &storeCore{db: readDB, writerDB: db, readGate: readGate, dbPath: path, wiped: didWipe},
 		ownsCore:  true,
 	}
 	// Initialise the bundle cache at construction so its pointer is
@@ -684,6 +938,8 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// own mutex-guarded maps, not on the Store field. The cache stays
 	// inert (every lookup a miss) until the daemon supplies fingerprints.
 	s.bundles = newBundleCache()
+	s.installWriterCacheCounters()
+	watchHolds(s.storeCore)
 	if err := s.initAnalysisGenerationState(); err != nil {
 		_ = closeSQLitePools(readDB, db)
 		return nil, fmt.Errorf("sqlite analysis generation state: %w", err)
@@ -719,6 +975,13 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 		s.checkpointDone = make(chan struct{})
 		go s.runCheckpointLoop(walCheckpointInterval)
 	}
+	// Start the whole-database maintenance lane with the store rather than with
+	// the first publish that needs it — see startMaintenanceLane for why the
+	// worker's birthplace matters. Unconditional, unlike the checkpoint loop
+	// above: an in-memory store has no WAL to drain, but it does have the one
+	// sqlite_stat1 a publish can outgrow. Last, so no failed Open above leaves
+	// a worker behind a closed pool.
+	s.startMaintenanceLane()
 	return s, nil
 }
 
@@ -760,24 +1023,452 @@ func (r walCheckpointResult) incomplete() bool {
 	return r.Busy != 0 || r.CheckpointedFrames < r.WALFrames
 }
 
+const sqliteCheckpointBusyTimeoutMillis = 100
+
+func sqliteCheckpointDSN(path string) string {
+	params := fmt.Sprintf("_pragma=busy_timeout(%d)&", sqliteCheckpointBusyTimeoutMillis) +
+		sqlitePerConnectionPragmas() +
+		"&_pragma=journal_size_limit(67108864)&_pragma=wal_autocheckpoint(0)"
+	return sqliteDSN(path, params)
+}
+
 // runCheckpointLoop attempts one non-blocking PASSIVE checkpoint per interval.
 // Transient deferrals retry on a bounded 1s..30s exponential cadence rather
 // than disappearing until the next five-minute tick. One reusable timer and
 // goroutine-local state prevent retry goroutine/timer storms.
+var errGenerationBulkCheckpointCoordination = errors.New("store_sqlite: generation bulk checkpoint coordination")
+
+// beginBackgroundCheckpointAttempt registers the one background checkpoint
+// attempt. It is refused (errWALCheckpointDeferredBulk) while a generation
+// bulk window holds the lease or another attempt runs, and — for a yielding
+// attempt with a build-lane predicate installed — while a mutation cycle holds
+// the lane (errWALCheckpointYieldedToCycle); a yielding attempt is also
+// cancelled with that cause when a cycle takes the lane (see
+// checkpoint_cycle_yield.go).
+func (s *Store) beginBackgroundCheckpointAttempt(policy checkpointCyclePolicy) (*backgroundCheckpointAttempt, error) {
+	yieldPolicy := policy == checkpointYieldsToCycle || policy == checkpointOverridesLease
+	yields := yieldPolicy && s.cycleYieldEnabled()
+	overridesLease := policy == checkpointOverridesLease || policy == checkpointOverridesLeaseAndCycle
+	if yields && s.buildLaneBusy() {
+		return nil, errWALCheckpointYieldedToCycle
+	}
+	// Let background PASSIVE finish so SQLite can record WAL backfill progress.
+	// Shutdown, generation bulk admission and (for a yielding attempt) a
+	// mutation cycle cancel the attempt explicitly.
+	base, timeoutCancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(base)
+	attempt := &backgroundCheckpointAttempt{
+		ctx:           ctx,
+		cancel:        cancel,
+		timeoutCancel: timeoutCancel,
+		done:          make(chan struct{}),
+		copy:          &walCopyAttempt{},
+	}
+
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	if (coordination.generationLease != 0 && !overridesLease) || coordination.active != nil {
+		refusal := errWALCheckpointDeferredBulk
+		if coordination.generationLease == 0 || overridesLease {
+			refusal = errWALCheckpointInFlight
+		}
+		coordination.mu.Unlock()
+		cancel(refusal)
+		timeoutCancel()
+		return nil, refusal
+	}
+	coordination.active = attempt
+	coordination.mu.Unlock()
+
+	// The daemon may install its predicate after this attempt starts. Select
+	// the watcher by policy; it checks current enablement on every poll.
+	if yieldPolicy {
+		go s.watchBuildLane(attempt)
+		return attempt, nil
+	}
+	go func() {
+		select {
+		case <-s.stopCheckpoint:
+			cancel(context.Canceled)
+		case <-attempt.done:
+		}
+	}()
+	return attempt, nil
+}
+
+func (s *Store) finishBackgroundCheckpointAttempt(attempt *backgroundCheckpointAttempt) {
+	if attempt == nil {
+		return
+	}
+	attempt.finishOnce.Do(func() {
+		attempt.timeoutCancel()
+		attempt.cancel(context.Canceled)
+
+		coordination := &s.backgroundCheckpoint
+		coordination.mu.Lock()
+		if coordination.active == attempt {
+			coordination.active = nil
+		}
+		coordination.mu.Unlock()
+		close(attempt.done)
+	})
+}
+
+func (s *Store) runBackgroundCheckpointAttempt(run func(context.Context) (complete, retry bool)) (complete, retry bool) {
+	return s.runBackgroundCheckpointAttemptWith(checkpointYieldsToCycle, run)
+}
+
+// runBackgroundCheckpointAttemptWith is runBackgroundCheckpointAttempt with
+// an explicit build-lane policy (checkpoint_cycle_yield.go).
+func (s *Store) runBackgroundCheckpointAttemptWith(policy checkpointCyclePolicy, run func(context.Context) (complete, retry bool)) (complete, retry bool) {
+	attempt, err := s.beginBackgroundCheckpointAttempt(policy)
+	if err != nil {
+		return false, true
+	}
+	defer s.finishBackgroundCheckpointAttempt(attempt)
+
+	complete, retry = run(attempt.ctx)
+	if cause := context.Cause(attempt.ctx); errors.Is(cause, errWALCheckpointDeferredBulk) || errors.Is(cause, errWALCheckpointYieldedToCycle) {
+		return false, true
+	}
+	return complete, retry
+}
+
+func (s *Store) acquireGenerationBulkCheckpointLease() (generationBulkCheckpointLease, error) {
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	if coordination.generationLease != 0 {
+		coordination.mu.Unlock()
+		return 0, errGenerationBulkCheckpointCoordination
+	}
+	coordination.nextLease++
+	if coordination.nextLease == 0 {
+		coordination.nextLease++
+	}
+	lease := generationBulkCheckpointLease(coordination.nextLease)
+	coordination.generationLease = lease
+	attempt := coordination.active
+	if attempt != nil {
+		attempt.cancel(errWALCheckpointDeferredBulk)
+	}
+	coordination.mu.Unlock()
+
+	if attempt == nil {
+		return lease, nil
+	}
+	wait := s.passiveCheckpointWindow()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-attempt.done:
+		return lease, nil
+	case <-timer.C:
+		s.releaseGenerationBulkCheckpointLease(lease)
+		return 0, fmt.Errorf("%w: background PASSIVE did not stop within %s", errGenerationBulkCheckpointCoordination, wait)
+	}
+}
+
+func (s *Store) bindGenerationBulkCheckpointLease(lease generationBulkCheckpointLease, generationID int64) bool {
+	if lease == 0 || generationID <= 0 {
+		return false
+	}
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	defer coordination.mu.Unlock()
+	if coordination.generationLease != lease || coordination.boundGeneration != 0 {
+		return false
+	}
+	coordination.boundGeneration = generationID
+	return true
+}
+
+func (s *Store) takeGenerationBulkCheckpointLease(generationID int64) generationBulkCheckpointLease {
+	if generationID <= 0 {
+		return 0
+	}
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	defer coordination.mu.Unlock()
+	if coordination.boundGeneration != generationID {
+		return 0
+	}
+	lease := coordination.generationLease
+	coordination.boundGeneration = 0
+	return lease
+}
+
+func (s *Store) takeBoundGenerationBulkCheckpointLease() generationBulkCheckpointLease {
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	defer coordination.mu.Unlock()
+	lease := coordination.generationLease
+	coordination.boundGeneration = 0
+	return lease
+}
+
+func (s *Store) releaseGenerationBulkCheckpointLease(lease generationBulkCheckpointLease) bool {
+	if lease == 0 {
+		return false
+	}
+	coordination := &s.backgroundCheckpoint
+	coordination.mu.Lock()
+	defer coordination.mu.Unlock()
+	if coordination.generationLease != lease || coordination.boundGeneration != 0 {
+		return false
+	}
+	coordination.generationLease = 0
+	// The window held the reclaim off; let it try at its next poll rather
+	// than after whatever backoff it was on.
+	s.walReclaimNudged.Store(true)
+	return true
+}
+
+func (s *Store) checkpointWALPassiveBackgroundOutcomeContext(ctx context.Context, db *sql.DB) (complete, retry bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := checkpointWALOnceOn(ctx, db, "PASSIVE")
+	ctxErr := ctx.Err()
+	if cause := context.Cause(ctx); errors.Is(cause, errWALCheckpointDeferredBulk) || errors.Is(cause, errWALCheckpointYieldedToCycle) {
+		return false, true
+	}
+	if err == nil {
+		return true, false
+	}
+	select {
+	case <-s.stopCheckpoint:
+		return false, false
+	default:
+	}
+	log.Print(passiveCheckpointReport(result, err, ctxErr))
+	return false, shouldRetryPassiveCheckpoint(err, ctxErr)
+}
+
 func (s *Store) runCheckpointLoop(interval time.Duration) {
-	s.runCheckpointLoopWithAttempt(
-		interval,
+	walPath, pressureBytes := sqliteWALPressureTarget(s.db, s.dbPath, sqliteWALAutoCheckpointPages())
+	schedule := newWALCheckpointSchedule(time.Now(), interval, pressureBytes)
+	var checkpointDB *sql.DB
+	closeCheckpointDB := func() {
+		if checkpointDB == nil {
+			return
+		}
+		if err := checkpointDB.Close(); err != nil {
+			log.Printf("store_sqlite: close background WAL checkpoint pool: %v", err)
+		}
+	}
+	checkpoint := func(forced bool) (complete, retry bool) {
+		policy := checkpointYieldsToCycle
+		if forced {
+			policy = checkpointIgnoresCycle
+		}
+		return s.runBackgroundCheckpointAttemptWith(policy, func(ctx context.Context) (bool, bool) {
+			if ctx.Err() != nil {
+				return false, true
+			}
+			if checkpointDB == nil {
+				db, err := sql.Open("sqlite", sqliteCheckpointDSN(s.dbPath))
+				if err != nil {
+					if ctx.Err() == nil {
+						log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=open error=%q", err)
+					}
+					return false, ctx.Err() != nil
+				}
+				configureWriterPool(db)
+				checkpointDB = db
+			}
+			return s.checkpointWALPassiveBackgroundOutcomeContext(ctx, checkpointDB)
+		})
+	}
+	// The bounded reclaim runs beside the PASSIVE loop on its own goroutine
+	// and is joined by this loop's cleanup, so Close's stopCheckpointLoop
+	// still guarantees no checkpoint of either kind is in flight.
+	stopReclaim := s.startWALReclaimLoop(walPath)
+	stopLazyIndex := s.startLazyIndexBuilder()
+	s.runCheckpointLoopWithAttemptAndCleanup(
+		walPressurePollInterval,
 		walCheckpointRetryInitial,
 		walCheckpointRetryMax,
-		s.checkpointWALPassive,
+		func() bool {
+			return schedule.attemptYielding(time.Now(), walPath, s.cycleLane(), checkpoint)
+		},
+		func() {
+			stopReclaim()
+			stopLazyIndex()
+			closeCheckpointDB()
+		},
 	)
+}
+
+// checkpointWALPassiveBackgroundOutcome runs a periodic checkpoint on its own
+// connection pool. It deliberately does not take writeMu: PASSIVE may copy a
+// finite committed WAL snapshot while a writer appends later frames, and a
+// large copy must not hold the application's sole writer or write gate.
+// Shutdown is the only cancellation boundary so SQLite can durably advance
+// nBackfill instead of repeatedly abandoning the same copied prefix.
+func (s *Store) checkpointWALPassiveBackgroundOutcome(db *sql.DB) (complete, retry bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	queryDone := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-s.stopCheckpoint:
+			cancel()
+		case <-queryDone:
+		}
+	}()
+
+	result, err := checkpointWALOnceOn(ctx, db, "PASSIVE")
+	ctxErr := ctx.Err()
+	close(queryDone)
+	cancel()
+	<-watchDone
+	if err == nil {
+		return true, false
+	}
+	select {
+	case <-s.stopCheckpoint:
+		return false, false
+	default:
+	}
+	log.Print(passiveCheckpointReport(result, err, ctxErr))
+	return false, shouldRetryPassiveCheckpoint(err, ctxErr)
+}
+
+const (
+	walPressurePollInterval     = 5 * time.Second
+	walPressureUnchangedRecheck = 30 * time.Second
+)
+
+type walPressureGate struct {
+	thresholdBytes int64
+	last           sqliteWALFileState
+	lastValid      bool
+	lastComplete   time.Time
+	deferUntil     time.Time
+}
+
+func (g *walPressureGate) due(now time.Time, walPath string) bool {
+	if g.thresholdBytes <= 0 || now.Before(g.deferUntil) {
+		return false
+	}
+	state, found, err := readSQLiteWALFileState(walPath)
+	if err != nil {
+		// A stat failure must not turn pressure control off. The SQL attempt is
+		// context-bounded and its own result chooses prompt versus ordinary retry.
+		return true
+	}
+	if !found || state.size <= g.thresholdBytes {
+		g.last, g.lastValid = state, found
+		return false
+	}
+	return !g.lastValid || state != g.last || g.lastComplete.IsZero() || now.Sub(g.lastComplete) >= walPressureUnchangedRecheck
+}
+
+func (g *walPressureGate) markComplete(now time.Time, walPath string) {
+	state, found, err := readSQLiteWALFileState(walPath)
+	if err != nil {
+		g.lastValid = false
+	} else {
+		g.last, g.lastValid = state, found
+	}
+	g.lastComplete = now
+	g.deferUntil = time.Time{}
+}
+
+type walCheckpointSchedule struct {
+	gate         walPressureGate
+	interval     time.Duration
+	nextPeriodic time.Time
+	// cycle is the build-lane deferral episode (checkpoint_cycle_yield.go).
+	cycle cycleDeferral
+}
+
+func newWALCheckpointSchedule(now time.Time, interval time.Duration, thresholdBytes int64) walCheckpointSchedule {
+	return walCheckpointSchedule{
+		gate:         walPressureGate{thresholdBytes: thresholdBytes},
+		interval:     interval,
+		nextPeriodic: now.Add(interval),
+	}
+}
+
+// attempt runs a checkpoint only at an ordinary periodic boundary or after the
+// WAL crosses its pressure line. An incomplete attempt never marks the file
+// snapshot, so a pinned reader gets the existing prompt exponential retry even
+// when the WAL's size and mtime do not change.
+func (s *walCheckpointSchedule) attempt(now time.Time, walPath string, checkpoint func() (complete, retry bool)) bool {
+	return s.attemptYielding(now, walPath, cycleLane{}, func(bool) (bool, bool) { return checkpoint() })
+}
+
+// attemptYielding is attempt with the build lane consulted (see
+// checkpoint_cycle_yield.go): a due attempt is deferred — without backoff,
+// to the next poll — while a mutation cycle holds the lane, until the
+// deferral bound passes with the WAL above its threshold, when one forced
+// (non-yielding) PASSIVE runs. An attempt a cycle cut short counts toward the
+// same bound and does not back off either.
+func (s *walCheckpointSchedule) attemptYielding(now time.Time, walPath string, lane cycleLane, checkpoint func(forced bool) (complete, retry bool)) bool {
+	if now.Before(s.nextPeriodic) && !s.gate.due(now, walPath) {
+		return false
+	}
+	if lane.reclaimOwns(walPath) {
+		// Over the reclaim's threshold the reclaim backfills and resets the
+		// log itself; a long PASSIVE here would only hold the one background
+		// checkpoint slot and refuse it (checkpoint_lease) for the length of
+		// the copy.
+		return false
+	}
+	run, forced := s.cycle.decide(now, lane.busy(), lane.maxDeferral, func() bool { return s.gate.over(walPath) })
+	if !run {
+		lane.noteDeferral()
+		logCycleDeferral(&s.cycle, now)
+		return false
+	}
+	if forced {
+		lane.noteForced()
+		logCycleForced(&s.cycle, now)
+	}
+	complete, retry := checkpoint(forced)
+	if !complete && !forced && lane.busy() {
+		// A cycle took the lane mid-attempt (or refused it at the start):
+		// neither a failure nor contention the checkpoint caused.
+		s.cycle.yielded(now)
+		return false
+	}
+	s.cycle.ran()
+	if complete {
+		s.gate.markComplete(now, walPath)
+		s.nextPeriodic = now.Add(s.interval)
+		return false
+	}
+	if retry {
+		return true
+	}
+	// Permanent driver/I/O errors retain the historical ordinary interval;
+	// they neither mark an incomplete WAL as drained nor spin every poll.
+	next := now.Add(s.interval)
+	s.gate.deferUntil = next
+	s.nextPeriodic = next
+	return false
 }
 
 func (s *Store) runCheckpointLoopWithAttempt(
 	interval, retryInitial, retryMax time.Duration,
 	attempt func() bool,
 ) {
+	s.runCheckpointLoopWithAttemptAndCleanup(interval, retryInitial, retryMax, attempt, nil)
+}
+
+func (s *Store) runCheckpointLoopWithAttemptAndCleanup(
+	interval, retryInitial, retryMax time.Duration,
+	attempt func() bool,
+	cleanup func(),
+) {
 	defer close(s.checkpointDone)
+	if cleanup != nil {
+		// Registered after checkpointDone so LIFO defer order closes the
+		// checkpoint pool before Close may tear down the main pools.
+		defer cleanup()
+	}
 	if retryInitial <= 0 {
 		retryInitial = walCheckpointRetryInitial
 	}
@@ -793,7 +1484,7 @@ func (s *Store) runCheckpointLoopWithAttempt(
 			return
 		case <-timer.C:
 			// If shutdown and the timer become ready together, prefer shutdown
-			// before starting another bounded SQLite call.
+			// before starting another SQLite call.
 			select {
 			case <-s.stopCheckpoint:
 				return
@@ -833,14 +1524,21 @@ func (s *Store) passiveCheckpointWindow() time.Duration {
 // ordinary interval; contention, deadlines and measured incomplete drains do
 // not silently wait five minutes.
 func (s *Store) checkpointWALPassive() bool {
+	_, retry := s.checkpointWALPassiveOutcome()
+	return retry
+}
+
+// checkpointWALPassiveOutcome separates a complete drain from retry policy so
+// the pressure gate never treats a partial busy=0 checkpoint as serviced.
+func (s *Store) checkpointWALPassiveOutcome() (complete, retry bool) {
 	if !s.writeMu.TryLock() {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_gate")
-		return true
+		return false, true
 	}
 	defer s.writeMu.Unlock()
 	if s.bulkConn != nil {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=bulk_writer")
-		return true
+		return false, true
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.passiveCheckpointWindow())
@@ -854,16 +1552,16 @@ func (s *Store) checkpointWALPassive() bool {
 	conn, err := s.writerDB.Conn(ctx)
 	if err != nil {
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_busy error=%q", err)
-		return shouldRetryPassiveCheckpoint(err, ctx.Err())
+		return false, shouldRetryPassiveCheckpoint(err, ctx.Err())
 	}
 	defer func() { _ = conn.Close() }()
 
 	result, err := checkpointWALOnceOn(ctx, conn, "PASSIVE")
 	if err == nil {
-		return false
+		return true, false
 	}
 	log.Print(passiveCheckpointReport(result, err, ctx.Err()))
-	return shouldRetryPassiveCheckpoint(err, ctx.Err())
+	return false, shouldRetryPassiveCheckpoint(err, ctx.Err())
 }
 
 func shouldRetryPassiveCheckpoint(err, ctxErr error) bool {
@@ -905,10 +1603,35 @@ func passiveCheckpointReport(result walCheckpointResult, err, ctxErr error) stri
 // zero. It is the explicit/final maintenance boundary; the timer uses PASSIVE.
 // Acquisition and incomplete-checkpoint retries are context bounded and
 // serialized with the sole SQLite writer.
+//
+// A TRUNCATE checkpoint is a whole-file action, so it goes through the
+// maintenance lane and can never interleave with a VACUUM rewriting the same
+// file. It does NOT wait for the store to go quiescent: the checkpoint is
+// serialized against writers by the write gate it already takes and is already
+// deferred while a bulk connection is pinned, and its callers (the indexer's
+// read boundary, Compact's tail) reach it inside latency budgets that a
+// build-length wait would blow. Failing to enter the lane inside
+// walCheckpointTimeout is reported as a deferral, which every caller already
+// treats as skip-and-continue.
+//
+// It is a PRIORITY job in that lane, and the reason is the cost of the
+// deferral rather than the cost of the checkpoint. This boundary is why the
+// indexer's global read passes are not run against a multi-gigabyte WAL (the
+// census the caller at internal/indexer/multi.go measures went from ~11 s
+// against a checkpointed store to ~533 s against an undrained one), and the
+// checkpoint gets ONE 10 s attempt with no retry. The other occupant of the
+// lane is the planner-statistics pass, which can hold the token for its pass
+// budget plus one index's ANALYZE plus a reload — longer than this budget —
+// so admitting the checkpoint behind it would put that 48x boundary behind a
+// statistics refresh. Instead the pass yields: runMaintenance marks this job
+// priority on entry, which cancels the pass in flight and stops the worker
+// starting another until the checkpoint is done. The pass loses nothing
+// durable — a cancelled cooperative refresh is a deferral that keeps its
+// cursor and resumes at the next boundary.
 func (s *Store) CheckpointWAL() error {
 	ctx, cancel := context.WithTimeout(context.Background(), walCheckpointTimeout)
 	defer cancel()
-	return s.checkpointWALWithContext(ctx)
+	return s.runMaintenance(ctx, maintenanceCheckpoint, false, s.checkpointWALWithContext)
 }
 
 func (s *Store) checkpointWALWithContext(ctx context.Context) error {
@@ -955,13 +1678,49 @@ func (s *Store) checkpointWALOnce(ctx context.Context, mode string) (walCheckpoi
 	return checkpointWALOnceOn(ctx, s.writerDB, mode)
 }
 
+// walCheckpointCallObserver, when set by a test, is told every checkpoint
+// PRAGMA this package runs: its mode, start and duration. nil in production.
+var walCheckpointCallObserver func(mode string, start time.Time, took time.Duration)
+
+// walCheckpointResultObserver records raw checkpoint Scan results for tests.
+// A tuple is valid only when scanErr is nil. Nil in production; install before
+// Open and restore only after all owned checkpoint/maintenance workers exit.
+var walCheckpointResultObserver func(mode string, start time.Time, took time.Duration, result walCheckpointResult, scanErr error)
+
 func checkpointWALOnceOn(ctx context.Context, q walCheckpointQueryer, mode string) (walCheckpointResult, error) {
+	// A withdrawn attempt is not a dispatched checkpoint. Refuse before both
+	// test observers and the query boundary so late loop iterations cannot
+	// report checkpoint work that database/sql will reject without SQL.
+	if err := ctx.Err(); err != nil {
+		return walCheckpointResult{}, err
+	}
+	resultObserver := walCheckpointResultObserver
+	var observedStart time.Time
+	if resultObserver != nil {
+		observedStart = time.Now()
+	}
+	if observe := walCheckpointCallObserver; observe != nil {
+		start := time.Now()
+		defer func() { observe(mode, start, time.Since(start)) }()
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		start := time.Now()
+		defer func() {
+			if over := time.Since(deadline); over > 50*time.Millisecond {
+				log.Printf("store_sqlite: wal checkpoint overran its deadline mode=%s overrun=%s elapsed=%s (the WAL and database syncs cannot be interrupted)",
+					mode, over.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
+			}
+		}()
+	}
 	var result walCheckpointResult
 	err := q.QueryRowContext(ctx, "PRAGMA wal_checkpoint("+mode+")").Scan(
 		&result.Busy,
 		&result.WALFrames,
 		&result.CheckpointedFrames,
 	)
+	if resultObserver != nil {
+		resultObserver(mode, observedStart, time.Since(observedStart), result, err)
+	}
 	if err != nil {
 		return result, err
 	}
@@ -996,7 +1755,14 @@ func (s *Store) Close() error {
 	if !s.ownsCore {
 		return nil
 	}
+	unwatchHolds(s.storeCore)
+	forgetFreshFTS(s.storeCore)
 	s.stopCheckpointLoop()
+	// Join the maintenance lane before anything is torn down: a pass in flight
+	// writes through the same pools this method is about to close, and it runs
+	// on a goroutine no caller holds. stopMaintenanceLane cancels it and waits
+	// for it under its own bound.
+	s.stopMaintenanceLane()
 	// A caller normally ends an outer cold-load window explicitly, but Close is
 	// also the last durability boundary on cancellation or startup failure.
 	// Flush while the database and pinned connection are still live so a
@@ -1017,7 +1783,12 @@ func (s *Store) Close() error {
 		sealErr := s.sealBulkIndexesLocked("close")
 		bulkErr = errors.Join(sealErr, s.closeBulkConnectionLocked())
 	}
+	// The periodic loop is already joined. Clear any bound or in-flight
+	// generation lease while writeMu still protects the physical bulk owner,
+	// then release its exact token outside the write gate.
+	generationLease := s.takeBoundGenerationBulkCheckpointLease()
 	s.writeMu.Unlock()
+	s.releaseGenerationBulkCheckpointLease(generationLease)
 
 	var checkpointErr error
 	if s.checkpointDone != nil { // on-disk store: drain the WAL one last time
@@ -1026,9 +1797,11 @@ func (s *Store) Close() error {
 		} else {
 			// Close is a durability boundary, not an interactive checkpoint.
 			// A successful filesystem sync can exceed CheckpointWAL's deadline
-			// on a busy disk. Let it finish; withSQLiteBusyRetry still bounds
-			// repeated lock contention, and checkpoint errors remain fatal.
-			checkpointErr = s.checkpointWALWithContext(context.Background())
+			// on a busy disk, and a large backlog needs far longer, so the
+			// deadline scales with the pending frames (closeCheckpointWAL);
+			// withSQLiteBusyRetry still bounds repeated lock contention, and
+			// checkpoint errors remain fatal.
+			checkpointErr = s.closeCheckpointWAL()
 		}
 	}
 	stmts := []*sql.Stmt{
@@ -1058,6 +1831,10 @@ func (s *Store) Close() error {
 }
 
 const (
+	baseAllEdgesSQL = `SELECT ` + lookupEdgeCols + `
+FROM edges INDEXED BY edges_by_generation
+WHERE view_gen = ?
+ORDER BY id`
 	generationAllNodesSQL = `SELECT ` + lookupNodeCols + `
 FROM nodes INDEXED BY nodes_by_generation
 WHERE view_gen > 0 AND view_gen = ?
@@ -1075,6 +1852,14 @@ WHERE view_gen > 0 AND view_gen = ?`
 	generationNodesByKindSQL = `SELECT ` + lookupNodeCols + `
 FROM nodes INDEXED BY nodes_by_generation
 WHERE view_gen > 0 AND view_gen = ? AND kind = ?`
+	// baseEdgesByKindSQL reads one kind of the base generation. "+view_gen"
+	// keeps view_gen out of index selection so the read drives from
+	// edges_by_kind: with view_gen usable the planner seeks the generation's
+	// view_gen prefix (edges_by_generation or edges_by_to) and reads every
+	// edge of the generation to find one kind — seconds for a rare kind such
+	// as provides on a large store, and no faster for a common one.
+	baseEdgesByKindSQL = `SELECT ` + lookupEdgeCols + `
+FROM edges WHERE kind = ? AND +view_gen = ?`
 	generationEdgesByKindSQL = `SELECT ` + lookupEdgeCols + `
 FROM edges INDEXED BY edges_by_generation
 WHERE view_gen > 0 AND view_gen = ? AND kind = ?`
@@ -1177,11 +1962,16 @@ func (s *Store) prepare() error {
 		 GROUP BY n.repo_prefix`)
 	prep(&s.stmtRepoNodeCount,
 		`SELECT COUNT(*) FROM nodes WHERE repo_prefix = ? AND view_gen = ?`)
+	// Select the repository's source IDs before counting edges. A flat join
+	// can scan every edge in the generation for each small repository. The
+	// explicit outer generation predicate also bounds the bulk-load fallback
+	// while the adjacency index is absent. Numbered parameters keep the same
+	// (repo prefix, generation) binding contract as the node count above.
 	prep(&s.stmtRepoEdgeCount,
-		`SELECT COUNT(*)
-		 FROM edges e
-		 JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
-		 WHERE n.repo_prefix = ? AND e.view_gen = ?`)
+		`SELECT COUNT(*) FROM edges
+		 WHERE view_gen = ?2 AND from_id IN (
+		     SELECT id FROM nodes WHERE repo_prefix = ?1 AND view_gen = ?2
+		 )`)
 	prep(&s.stmtAllRepoCountsNodes,
 		`SELECT repo_prefix, COUNT(*) FROM nodes WHERE repo_prefix <> '' AND view_gen = ? GROUP BY repo_prefix`)
 	prep(&s.stmtAllRepoCountsEdges,
@@ -1230,10 +2020,9 @@ func (s *Store) prepare() error {
 		   FROM edges e
 		   JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen
 		  WHERE n.repo_prefix = ? AND e.view_gen = ?`)
-	// id is the rowid alias, so the full scan already yields insertion order
-	// and the clause adds no sorter — same reasoning as stmtAllNodes above.
-	prep(&s.stmtAllEdges,
-		`SELECT `+edgeCols+` FROM edges WHERE view_gen = ? ORDER BY id`)
+	// The dense, always-live generation index yields insertion order within
+	// generation zero. Pin it so adjacency indexes cannot add an export sort.
+	prep(&s.stmtAllEdges, baseAllEdgesSQL)
 	prep(&s.stmtGenerationAllEdges, generationAllEdgesSQL)
 	prep(&s.stmtEdgeCount,
 		`SELECT COUNT(*) FROM edges WHERE view_gen = ?`)
@@ -1610,7 +2399,7 @@ func (s *Store) SetEdgeProvenance(e *graph.Edge, newOrigin string) bool {
 	if e.Tier != "" {
 		e.Tier = newTier
 	}
-	s.edgeIdentityRevs.Add(1)
+	s.noteEdgeIdentityRevisions(1)
 	s.finishAnalysisMutationLocked(true)
 	return true
 }
@@ -1729,7 +2518,7 @@ func (s *Store) persistEdgeAttributesBatch(edges []*graph.Edge) (statements int,
 		// signal, so an idempotent warm pass keeps its active generation.
 		invalidatedAnalysis := false
 		if chunkChanged && s.analysisGenerationPresent {
-			if err := invalidateAnalysisGenerationTx(tx); err != nil {
+			if err := s.invalidateAnalysisViewTx(tx); err != nil {
 				_ = tx.Rollback()
 				return statements, err
 			}
@@ -1739,7 +2528,7 @@ func (s *Store) persistEdgeAttributesBatch(edges []*graph.Edge) (statements int,
 			return statements, err
 		}
 		if invalidatedAnalysis {
-			s.analysisGenerationPresent = false
+			s.analysisGenerationPresent = s.analysisLatchRemaining
 		}
 		s.finishAnalysisMutationLocked(chunkChanged)
 	}
@@ -2371,6 +3160,9 @@ func (s *Store) queryEdges(stmt *sql.Stmt, args ...any) []*graph.Edge {
 // -- counts and stats -----------------------------------------------------
 
 func (s *Store) NodeCount() int {
+	if n, ok := s.countFromCounters("nodes"); ok {
+		return n
+	}
 	stmt := s.stmtNodeCount
 	if s.viewGen > baseViewGeneration {
 		stmt = s.stmtGenerationNodeCount
@@ -2384,6 +3176,9 @@ func (s *Store) NodeCount() int {
 }
 
 func (s *Store) EdgeCount() int {
+	if n, ok := s.countFromCounters("edges"); ok {
+		return n
+	}
 	stmt := s.stmtEdgeCount
 	if s.viewGen > baseViewGeneration {
 		stmt = s.stmtGenerationEdgeCount
@@ -2563,8 +3358,43 @@ func (s *Store) RepoPrefixes() []string {
 
 // -- provenance verification ---------------------------------------------
 
+// EdgeIdentityRevisions counts the provenance-bearing edge-identity changes
+// visible to this handle's view: those committed at its generation plus those
+// at the base generation (every view composes over it). A change in another
+// generation — a worktree's layer — leaves it unchanged, so an analysis over
+// the base view (the incremental Leiden cache) is not forced into a full
+// recompute by a worktree edit. EdgeIdentityRevisionsAll is the whole store's
+// count.
 func (s *Store) EdgeIdentityRevisions() int {
+	if s.coreless() {
+		return 0
+	}
+	n := s.edgeIdentityCounter(s.viewGen).Load()
+	if s.viewGen != baseViewGeneration {
+		n += s.edgeIdentityCounter(baseViewGeneration).Load()
+	}
+	return int(n)
+}
+
+// EdgeIdentityRevisionsAll is the whole store's count of edge-identity
+// changes, whatever the handle.
+func (s *Store) EdgeIdentityRevisionsAll() int {
 	return int(s.edgeIdentityRevs.Load())
+}
+
+func (s *Store) edgeIdentityCounter(g int64) *atomic.Int64 {
+	if v, ok := s.edgeIdentityRevsByView.Load(g); ok {
+		return v.(*atomic.Int64)
+	}
+	v, _ := s.edgeIdentityRevsByView.LoadOrStore(g, &atomic.Int64{})
+	return v.(*atomic.Int64)
+}
+
+// noteEdgeIdentityRevisions records n edge-identity changes committed through
+// this handle, on the whole-store count and on its generation's.
+func (s *Store) noteEdgeIdentityRevisions(n int64) {
+	s.edgeIdentityRevs.Add(n)
+	s.edgeIdentityCounter(s.viewGen).Add(n)
 }
 
 // VerifyEdgeIdentities is a no-op for the SQL backend: the in-memory
@@ -2791,6 +3621,11 @@ func panicOnFatal(err error) {
 	if errors.Is(err, sql.ErrConnDone) || isStoreClosedErr(err) {
 		return
 	}
+	// Keep sealed lifecycle refusals and actual SQLite-full failures typed so
+	// index/build recovery recognizes them without absorbing other panics.
+	if errors.Is(err, ErrPayloadGenerationSealed) || isSQLiteFullFailure(err) {
+		panic(&StorageError{err: err})
+	}
 	panic(fmt.Errorf("store_sqlite: %w", err))
 }
 
@@ -2831,8 +3666,7 @@ func isStoreClosedErr(err error) bool {
 // edge of the requested kind in generation zero and filtering afterward.
 func (s *Store) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		query := `SELECT ` + lookupEdgeCols + `
-FROM edges WHERE kind = ? AND view_gen = ?`
+		query := baseEdgesByKindSQL
 		args := []any{string(kind), s.viewGen}
 		if s.viewGen > baseViewGeneration {
 			query = generationEdgesByKindSQL
@@ -2852,12 +3686,7 @@ FROM edges WHERE kind = ? AND view_gen = ?`
 func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
 		query := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE kind = ? AND view_gen = ?`
-		args := []any{string(kind), s.viewGen}
-		if s.viewGen > baseViewGeneration {
-			query = generationNodesByKindSQL
-			args = []any{s.viewGen, string(kind)}
-		}
-		out := s.queryNodesSQL(query, args...)
+		out := s.queryNodesSQL(query, string(kind), s.viewGen)
 		for _, n := range out {
 			if !yield(n) {
 				return
@@ -2927,6 +3756,11 @@ func (s *Store) queryEdgesSQL(q string, args ...any) []*graph.Edge {
 		panicOnFatal(err)
 		return nil
 	}
+	return s.scanEdgeRows(rows)
+}
+
+// scanEdgeRows is queryEdgesSQL's scan over already-open rows; it closes them.
+func (s *Store) scanEdgeRows(rows *sql.Rows) []*graph.Edge {
 	defer rows.Close()
 	var out []*graph.Edge
 	for rows.Next() {

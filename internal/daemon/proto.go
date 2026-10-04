@@ -419,6 +419,26 @@ type StatusResponse struct {
 	// block that is a report rather than a fact the caller asked for.
 	Views *ViewsStatus `json:"views,omitempty"`
 
+	// PublicationPhases is the recent per-checkout record of how edits and
+	// require_fresh requests reached publication: each phase as a monotonic
+	// offset from the record's origin. It is a separate block from Views on
+	// purpose — the census carries no checkout or generation identities,
+	// and these records are keyed by both. Nil when nothing was recorded.
+	PublicationPhases []PublicationPhaseStatus `json:"publication_phases,omitempty"`
+
+	// Storage reports the SQLite store's write-ahead log: file sizes, the
+	// backlog Close's final checkpoint would have to drain right now and how
+	// long the stop path should give it, and the bounded reclaim's counters.
+	// Nil on a daemon whose store is not SQLite.
+	Storage *StorageStatus `json:"storage,omitempty"`
+
+	// BuildLane reports the daemon-wide view-build lane: who holds it (the
+	// holder's kind, checkout and generation), since when, and the queues
+	// behind it, so a slow edit's lane wait can be attributed. A separate
+	// block from Views for the same reason as PublicationPhases: it names a
+	// checkout. Nil on a daemon with no build gate.
+	BuildLane *BuildLaneStatus `json:"build_lane,omitempty"`
+
 	// BinaryStale is true when the file at the daemon's os.Executable()
 	// path no longer matches the image the daemon is running (size or
 	// mtime differ) — the signature of a package-manager upgrade that
@@ -432,6 +452,149 @@ type StatusResponse struct {
 	BinaryChecked bool `json:"binary_checked,omitempty"`
 	// BinaryReplacedAtUnix is the on-disk file's mtime when stale.
 	BinaryReplacedAtUnix int64 `json:"binary_replaced_at_unix,omitempty"`
+}
+
+// PublicationPhaseStatus is one recorded path to publication: an MCP edit
+// (keyed by its graph-refresh receipt) or a require_fresh wait that needed a
+// refresh ticket. Offsets are nanoseconds on the daemon's monotonic clock from
+// the record's origin; OriginWall is the origin's wall time, for correlating
+// with logs only.
+type PublicationPhaseStatus struct {
+	Key               string                   `json:"key"`
+	CheckoutID        string                   `json:"checkout_id"`
+	Source            string                   `json:"source"`
+	Ticket            uint64                   `json:"ticket,omitempty"`
+	DirtyGenerationID int64                    `json:"dirty_generation_id,omitempty"`
+	OriginWall        string                   `json:"origin_wall"`
+	Clock             string                   `json:"clock"`
+	Terminal          bool                     `json:"terminal"`
+	Phases            []PublicationPhaseOffset `json:"phases"`
+}
+
+// PublicationPhaseOffset is one phase of a PublicationPhaseStatus.
+type PublicationPhaseOffset struct {
+	Phase    string  `json:"phase"`
+	OffsetNS int64   `json:"offset_ns"`
+	OffsetMS float64 `json:"offset_ms"`
+}
+
+// StorageStatus is the store's write-ahead-log state for daemon status.
+type StorageStatus struct {
+	DBBytes  int64 `json:"db_bytes"`
+	WALBytes int64 `json:"wal_bytes"`
+	// WALPendingFrames is the backlog not yet copied into the database
+	// (mxFrame - nBackfill), -1 when the wal-index could not be read.
+	WALPendingFrames int64 `json:"wal_pending_frames"`
+	// CloseCheckpointEstimateMS is how long Close's final checkpoint should
+	// be given for that backlog. A stop path that force-kills sooner loses
+	// the whole checkpoint: an interrupted pass records no progress.
+	CloseCheckpointEstimateMS int64             `json:"close_checkpoint_estimate_ms"`
+	WALReclaim                *WALReclaimStatus `json:"wal_reclaim,omitempty"`
+	// RowCounters is the writer-maintained per-generation node/edge counts:
+	// whether NodeCount/EdgeCount read them, and — on an exact status only —
+	// the drift check against a recount.
+	RowCounters *RowCounterStatus `json:"row_counters,omitempty"`
+}
+
+// RowCounterStatus reports the per-generation row counters. Checked is set
+// only by an exact status, which recounts every generation in one snapshot,
+// reports the generations whose counter disagreed and repairs them.
+type RowCounterStatus struct {
+	Ready       bool    `json:"ready"`
+	Checked     bool    `json:"checked,omitempty"`
+	Generations int     `json:"generations,omitempty"`
+	Drifted     int     `json:"drifted,omitempty"`
+	Repaired    bool    `json:"repaired,omitempty"`
+	CheckMS     float64 `json:"check_ms,omitempty"`
+	// FirstDrift describes the first drifted generation, when one did.
+	FirstDrift string `json:"first_drift,omitempty"`
+}
+
+// WALReclaimStatus mirrors the store's bounded WAL-reclaim counters. Pause is
+// the time the read gate was closed for a reset; ReaderWait is the time new
+// reads spent waiting at it.
+type WALReclaimStatus struct {
+	ThresholdBytes int64 `json:"threshold_bytes"`
+	Attempts       int64 `json:"attempts"`
+	Resets         int64 `json:"resets"`
+	// OpenGateResets counts resets reached without closing the read gate;
+	// WriterHold* is how long the reclaim held the application writer.
+	OpenGateResets   int64   `json:"open_gate_resets"`
+	WriterHoldMaxMS  float64 `json:"writer_hold_max_ms"`
+	WriterHoldLastMS float64 `json:"writer_hold_last_ms"`
+	Deferrals        int64   `json:"deferrals"`
+	Skips            int64   `json:"skips"`
+	Failures         int64   `json:"failures"`
+	FramesReclaimed  int64   `json:"frames_reclaimed"`
+	BytesReclaimed   int64   `json:"bytes_reclaimed"`
+	PauseCount       int64   `json:"pause_count"`
+	PauseMaxMS       float64 `json:"pause_max_ms"`
+	PauseAvgMS       float64 `json:"pause_avg_ms"`
+	PauseLastMS      float64 `json:"pause_last_ms"`
+	ReaderWaits      int64   `json:"reader_waits"`
+	ReaderWaitMaxMS  float64 `json:"reader_wait_max_ms"`
+	ReaderWaitAvgMS  float64 `json:"reader_wait_avg_ms"`
+	BackoffMS        int64   `json:"backoff_ms"`
+	LastOutcome      string  `json:"last_outcome,omitempty"`
+	LastReason       string  `json:"last_reason,omitempty"`
+	// Build-lane yield of the background checkpoints: PASSIVE attempts
+	// deferred while an edit cycle held the lane, reclaim attempts refused
+	// for the same reason, attempts of either kind a cycle cut short, PASSIVE
+	// attempts run past the deferral bound, and reclaim attempts run despite
+	// the lane because the WAL was over CeilingBytes.
+	CycleDeferrals   int64 `json:"cycle_deferrals"`
+	CycleRefusals    int64 `json:"cycle_refusals"`
+	CycleYields      int64 `json:"cycle_yields"`
+	CycleForced      int64 `json:"cycle_forced"`
+	CycleCeilingRuns int64 `json:"cycle_ceiling_runs"`
+	CeilingBytes     int64 `json:"ceiling_bytes,omitempty"`
+	// Retirement chunks that waited for an edit-path writer to finish, and
+	// the waits that ran out and proceeded.
+	RetirementEditYields        int64 `json:"retirement_edit_yields"`
+	RetirementEditYieldTimeouts int64 `json:"retirement_edit_yield_timeouts"`
+	// Retirement chunks that waited for the reclaim with the WAL over its
+	// ceiling, and the waits that ran out and proceeded; reclaim attempts
+	// run inside a generation bulk window because the WAL was over the
+	// ceiling.
+	RetirementWaits        int64 `json:"retirement_waits"`
+	RetirementWaitTimeouts int64 `json:"retirement_wait_timeouts"`
+	LeaseOverrides         int64 `json:"lease_overrides"`
+	// The incremental shrink: big logs reset in place, the slices that
+	// shrank their file, the bytes returned, the longest slice's writer hold.
+	ShrinkInPlaceResets  int64   `json:"shrink_in_place_resets"`
+	ShrinkSlices         int64   `json:"shrink_slices"`
+	ShrinkBytes          int64   `json:"shrink_bytes"`
+	ShrinkSliceHoldMaxMS float64 `json:"shrink_slice_hold_max_ms"`
+}
+
+// BuildLaneStatus is the view-build lane's state for daemon status.
+type BuildLaneStatus struct {
+	Open   bool `json:"open"`
+	Active bool `json:"active"`
+	// Holder is what holds the lane, nil when it is idle. An active lane
+	// whose builder declared nothing reports Kind "undeclared".
+	Holder               *BuildLaneHolderStatus `json:"holder,omitempty"`
+	InteractiveQueued    int                    `json:"interactive_queued"`
+	BackgroundQueued     int                    `json:"background_queued"`
+	InteractiveHighWater int                    `json:"interactive_high_water"`
+	BackgroundHighWater  int                    `json:"background_high_water"`
+	AdmittedInteractive  uint64                 `json:"admitted_interactive"`
+	AdmittedBackground   uint64                 `json:"admitted_background"`
+	WaitSamples          uint64                 `json:"wait_samples"`
+	WaitMaxMS            float64                `json:"wait_max_ms"`
+	WaitAvgMS            float64                `json:"wait_avg_ms"`
+}
+
+// BuildLaneHolderStatus names the build holding the lane: its kind
+// (checkout_cycle, dirty_chain_compaction, checkout_mutation, ...), the
+// checkout it builds for, and the generation it builds over, when it has one.
+type BuildLaneHolderStatus struct {
+	Kind        string  `json:"kind"`
+	CheckoutID  string  `json:"checkout_id,omitempty"`
+	Priority    string  `json:"priority,omitempty"`
+	Generation  int64   `json:"generation,omitempty"`
+	SinceUnixMS int64   `json:"since_unix_ms,omitempty"`
+	HeldForMS   float64 `json:"held_for_ms"`
 }
 
 // LSPRouterStatus reflects one daemon's LSP-router state for the
@@ -557,11 +720,79 @@ type ViewsStatus struct {
 	Leases int `json:"leases"`
 	// RefViews counts named views of committed state by state.
 	RefViews map[string]int `json:"ref_views,omitempty"`
+	// CoordinatorStartFailures is the one entry here that is not a count, and
+	// it is the exception the rule above exists for: Coordinators says how many
+	// build loops this daemon runs, and a census reading "three checkouts, one
+	// loop" states a problem it cannot explain. Every path that starts a
+	// coordinator is a background reconciliation with no caller to fail, so
+	// without this the checkout that has no view has its reason stated nowhere
+	// a person can read.
+	//
+	// It stays bounded and it stays honest about cardinality: entries exist
+	// only for checkouts that have no loop AND have been tried, each is
+	// retracted the moment a loop is installed, and the ordinary answer is the
+	// empty one — omitted, not rendered as an empty list. A daemon whose views
+	// are healthy carries exactly the payload it carried before.
+	CoordinatorStartFailures []CoordinatorStartFailure `json:"coordinator_start_failures,omitempty"`
+	// StorageFailures is the second exception, and it is here for the reason
+	// the first one is: Generations says how much derived payload the store is
+	// holding and in what state, and a generation stuck in retiring because
+	// the volume is full states a problem no count beside it can explain.
+	//
+	// Retirement is a background pass with no caller to fail, so a store that
+	// cannot delete anything looks, from every count here, exactly like a
+	// store with nothing to delete. The list is bounded (one entry per
+	// generation whose last maintenance attempt failed), path-free, and each
+	// entry is retracted at the start of the next attempt on that generation —
+	// so the ordinary answer is the absent one.
+	StorageFailures []StorageFailure `json:"storage_failures,omitempty"`
 	// Counters is the view-lifecycle metric registry flattened to series key
 	// and value, zero-valued series omitted. Every label in a key comes from
 	// a fixed vocabulary, so the map's size is a property of the build rather
 	// than of the workload.
 	Counters map[string]int64 `json:"counters,omitempty"`
+}
+
+// StorageFailure is one payload generation's last storage-maintenance failure.
+//
+// Like CoordinatorStartFailure it mirrors the producing type
+// (store_sqlite.StorageFailure) on the wire rather than aliasing it: this
+// package is the daemon PROTOCOL, and a client must be able to decode it
+// without linking the graph store. The controller translates.
+//
+// It carries no error, no path and no SQL. The full cause stays on the
+// *StorageError the failing call returned and in the daemon log; what rides on
+// a status poll is the bounded sentence a person can act on.
+type StorageFailure struct {
+	// GenerationID names the generation whose maintenance failed. It is an
+	// identity, which the counts above otherwise refuse — carried for the same
+	// reason CoordinatorStartFailure carries a checkout id: a reason that does
+	// not say which generation it is about cannot be acted on, and the list is
+	// bounded by failures rather than by how much payload a store holds.
+	GenerationID int64 `json:"generation_id"`
+	// Reason is the bounded, path-free sentence the storage layer rendered.
+	Reason string `json:"reason"`
+}
+
+// CoordinatorStartFailure is one checkout whose build loop could not be
+// started, and why.
+//
+// It mirrors indexer.CoordinatorStartFailure on the wire rather than aliasing
+// it: this package is the daemon PROTOCOL, and every other payload here is a
+// plain struct that an older or newer client can decode without linking the
+// indexer. The controller translates.
+type CoordinatorStartFailure struct {
+	// CheckoutID and RootPath name the working copy that has no view. They are
+	// identities, which the block above otherwise refuses — carried here
+	// because a reason that does not say WHICH checkout it is about cannot be
+	// acted on, and because the list is bounded by failures rather than by the
+	// number of worktrees a user keeps.
+	CheckoutID string `json:"checkout_id"`
+	RootPath   string `json:"root_path,omitempty"`
+	// Reason is what stopped it, as the failing step stated it.
+	Reason string `json:"reason"`
+	// At is when the attempt failed, as a Unix timestamp on the daemon's clock.
+	At int64 `json:"at"`
 }
 
 // SearchBackendStats identifies which search backend is currently
@@ -755,6 +986,12 @@ type EnrichChurnResult struct {
 	Branch     string `json:"branch"`
 	HeadSHA    string `json:"head_sha"`
 	DurationMS int64  `json:"duration_ms"`
+	// Superseded reports that a newer run of the same enricher over the same
+	// corpus took the output-generation authority while this one ran. It is an
+	// ORDERING statement, not a skip: the enricher stamps as it goes and had
+	// written everything above before it settled, so the counts are real and
+	// the call succeeded. Omitted in the ordinary case.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // EnrichReleasesParams is the payload for ControlEnrichReleases.
@@ -777,6 +1014,12 @@ type EnrichReleasesResult struct {
 	Files      int    `json:"files"`
 	Branch     string `json:"branch,omitempty"`
 	DurationMS int64  `json:"duration_ms"`
+	// Superseded reports that a newer run of the same enricher over the same
+	// corpus took the output-generation authority while this one ran. It is an
+	// ORDERING statement, not a skip: the enricher stamps as it goes and had
+	// written everything above before it settled, so the counts are real and
+	// the call succeeded. Omitted in the ordinary case.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // EnrichBlameParams is the payload for ControlEnrichBlame.
@@ -794,6 +1037,12 @@ type EnrichBlameParams struct {
 type EnrichBlameResult struct {
 	Nodes      int   `json:"nodes"`
 	DurationMS int64 `json:"duration_ms"`
+	// Superseded reports that a newer run of the same enricher over the same
+	// corpus took the output-generation authority while this one ran. It is an
+	// ORDERING statement, not a skip: the enricher stamps as it goes and had
+	// written everything above before it settled, so the counts are real and
+	// the call succeeded. Omitted in the ordinary case.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // EnrichCoverageSegment mirrors coverage.Segment on the wire so the
@@ -828,6 +1077,12 @@ type EnrichCoverageResult struct {
 	Symbols    int   `json:"symbols"`
 	Segments   int   `json:"segments"`
 	DurationMS int64 `json:"duration_ms"`
+	// Superseded reports that a newer run of the same enricher over the same
+	// corpus took the output-generation authority while this one ran. It is an
+	// ORDERING statement, not a skip: the enricher stamps as it goes and had
+	// written everything above before it settled, so the counts are real and
+	// the call succeeded. Omitted in the ordinary case.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // EnrichCochangeParams is the payload for ControlEnrichCochange.
@@ -844,6 +1099,12 @@ type EnrichCochangeParams struct {
 type EnrichCochangeResult struct {
 	Edges      int   `json:"edges"`
 	DurationMS int64 `json:"duration_ms"`
+	// Superseded reports that a newer run of the same enricher over the same
+	// corpus took the output-generation authority while this one ran. It is an
+	// ORDERING statement, not a skip: the enricher stamps as it goes and had
+	// written everything above before it settled, so the counts are real and
+	// the call succeeded. Omitted in the ordinary case.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // TrackedRepoStatus is one row in StatusResponse.TrackedRepos.

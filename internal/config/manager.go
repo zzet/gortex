@@ -359,19 +359,39 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 // elements. It is clipped (len == cap), so appending to it is safe —
 // append reallocates rather than writing through the shared backing array.
 func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
+	return cm.effectiveExcludeForRoot(repoPrefix, "")
+}
+
+// EffectiveExcludeForRoot keeps configured repository layers while reading
+// the gitignore layer from a selected checkout's root. This scoped proof path
+// reads ignore bytes afresh, including edits that preserve size and mtime.
+func (cm *ConfigManager) EffectiveExcludeForRoot(repoPrefix, root string) []string {
+	return cm.effectiveExcludeForRoot(repoPrefix, root)
+}
+
+func (cm *ConfigManager) effectiveExcludeForRoot(repoPrefix, root string) []string {
 	cm.mu.RLock()
 	gc := cm.global
 	ws := cm.workspace[repoPrefix]
 	repoPath := cm.workspacePaths[repoPrefix]
 	cm.mu.RUnlock()
 
+	if root != "" {
+		repoPath = root
+	}
 	respect := shouldRespectGitignore(ws)
 	var chain []gitignoreLayer
 	if respect && repoPath != "" {
-		chain = cm.excludeCache.chain(repoPath)
+		if root != "" {
+			chain = gitignoreChain(repoPath)
+		} else {
+			chain = cm.excludeCache.chain(repoPath)
+		}
 	}
-	if m, ok := cm.excludeCache.lookupMerged(repoPrefix, gc, ws, repoPath, respect, chain); ok {
-		return m
+	if root == "" {
+		if m, ok := cm.excludeCache.lookupMerged(repoPrefix, gc, ws, repoPath, respect, chain); ok {
+			return m
+		}
 	}
 
 	out := make([]string, 0, 32)
@@ -384,7 +404,13 @@ func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 	// excludeCache), so a mid-session edit is still picked up on the next
 	// call.
 	for _, layer := range chain {
-		out = append(out, reanchorGitignore(cm.excludeCache.patterns(layer.dir, layer.stat), layer.sub)...)
+		patterns := []string(nil)
+		if root != "" {
+			patterns = loadRepoGitignore(layer.dir)
+		} else {
+			patterns = cm.excludeCache.patterns(layer.dir, layer.stat)
+		}
+		out = append(out, reanchorGitignore(patterns, layer.sub)...)
 	}
 
 	if gc != nil {
@@ -424,7 +450,9 @@ func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 	// forced to reallocate and can never write through the shared backing
 	// array the cache hands to every reader.
 	out = out[:len(out):len(out)]
-	cm.excludeCache.storeMerged(repoPrefix, gc, ws, repoPath, respect, chain, out)
+	if root == "" {
+		cm.excludeCache.storeMerged(repoPrefix, gc, ws, repoPath, respect, chain, out)
+	}
 	return out
 }
 

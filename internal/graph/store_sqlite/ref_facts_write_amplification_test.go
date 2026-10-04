@@ -268,6 +268,9 @@ func TestRefFactRefreshWithoutOptionalNodeFileIndex(t *testing.T) {
 func TestRefFactRefreshEmbeddedQueryPlanUsesIndexedFrontier(t *testing.T) {
 	store := openRefFactRebuildStore(t)
 	seedRefFactWriteFixture(t, store, 256, 1024)
+	var facts int
+	require.NoError(t, store.db.QueryRow(`SELECT COUNT(*) FROM ref_facts WHERE view_gen = ?`, store.viewGen).Scan(&facts))
+	require.Equal(t, 256, facts, "requested-file projection must not admit unrelated source files")
 	filesJSON := `["repo/changed.go"]`
 	for _, fixture := range []struct {
 		name string
@@ -292,7 +295,7 @@ func TestRefFactRefreshEmbeddedQueryPlanUsesIndexedFrontier(t *testing.T) {
 			plan := fmt.Sprint(details)
 			t.Logf("embedded SQLite %s plan: %s", fixture.name, plan)
 			require.Contains(t, plan, "nodes_by_file", "file-frontier refresh must not scan all repository source nodes")
-			require.Contains(t, plan, "edges_by_from", "edge lookup must start from selected source IDs")
+			require.Contains(t, plan, "edges_by_from (view_gen=? AND from_id=?", "edge lookup must bind generation and each selected source ID")
 			if fixture.name == "obsolete" {
 				require.Regexp(t, `\bSEARCH d\b`, plan, "each old fact must probe the indexed desired-key set")
 				require.NotRegexp(t, `\bSCAN d\b`, plan, "a correlated full desired-set scan makes no-op refresh quadratic")

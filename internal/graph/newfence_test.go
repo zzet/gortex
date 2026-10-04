@@ -23,7 +23,16 @@ import (
 // stagingCallers lists the non-test files allowed to construct it. Keeping the
 // list this short is the point: a new entry means some production path is about
 // to hold graph data that no restart can recover.
-var stagingCallers []string
+var stagingCallers = []string{
+	// Initial claimed snapshots need an empty lower operand. This graph never
+	// receives the indexed corpus: the reserved positive SQLite generation is
+	// the durable payload target, and workers stream their output into it.
+	"internal/indexer/builder_dedicated_claimed.go",
+	// Clone follow-ups recompute derived relations in a private scratch graph.
+	// Only the edge diff is drained through DeltaWriter into the SQLite
+	// generation; signature rows are projected into that same durable handle.
+	"internal/indexer/clone_followup.go",
+}
 
 // harnessCallers lists the non-test files that construct it for a test and are
 // only reachable from one.

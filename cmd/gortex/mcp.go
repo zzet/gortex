@@ -16,7 +16,9 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm/conversationlog"
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/platform"
+	"github.com/zzet/gortex/internal/savings"
 	"github.com/zzet/gortex/internal/server"
 	"github.com/zzet/gortex/internal/server/hub"
 	"github.com/zzet/gortex/internal/serverstack"
@@ -403,6 +405,14 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	mi := ss.MultiIndexer
 	srv := ss.MCP
 
+	// Bound this process's savings window and commit it on the way out.
+	// Registered AFTER `defer ss.Close()`, so LIFO runs it BEFORE the stack
+	// teardown — covering every exit path from here on: the errCh return,
+	// the SIGINT/SIGTERM return, and any error return in between. A SIGKILL
+	// still loses whatever is buffered, which is why the bound is seconds
+	// and a handful of events rather than the daemon's minute.
+	defer installOneshotSavingsFlush(srv)()
+
 	// Announce the degraded mode to the CLIENT, not just to stderr. An
 	// MCP host that discards stderr — most of them — otherwise cannot
 	// tell an embedded single-tree answer from a daemon-backed one, and
@@ -554,4 +564,28 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "\n[gortex] received %s, shutting down\n", sig)
 		return nil
 	}
+}
+
+// installOneshotSavingsFlush tightens the token-savings ledger's coalescing
+// window for a one-shot stdio server and returns the flush to defer.
+//
+// The coalescing that makes an idle agent session cheap was built for the
+// daemon: a long-lived process where losing the last minute of accounting on
+// a crash is nothing against the ~37 KB sidecar transaction every read-only
+// tool call used to pay. A `gortex mcp` / `gortex server` process is the
+// other shape — MCP hosts SIGKILL their stdio servers, and a whole session
+// can be shorter than the default window, which is the flat-file era's
+// "permanently empty under SIGKILLing MCP clients" bug all over again. So the
+// window here is savings.OneshotFlushInterval / savings.OneshotFlushMax, and
+// every graceful exit commits explicitly rather than relying on the stack's
+// teardown chain reaching its savings step.
+//
+// Returns a no-op closure when the server has no ledger wired (embedded
+// fixtures, persistence disabled), so the call site can defer it blind.
+func installOneshotSavingsFlush(srv *gortexmcp.Server) func() {
+	if srv == nil {
+		return func() {}
+	}
+	srv.SetSavingsFlushBounds(savings.OneshotFlushInterval, savings.OneshotFlushMax)
+	return func() { _ = srv.FlushSavings() }
 }

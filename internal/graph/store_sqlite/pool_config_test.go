@@ -45,7 +45,10 @@ func TestConnectionPoolBoundsPerConnectionMemory(t *testing.T) {
 	if stats.Idle > sqliteMaxIdleConns {
 		t.Fatalf("idle connections = %d, want <= %d", stats.Idle, sqliteMaxIdleConns)
 	}
-	if stats.OpenConnections > sqliteMaxIdleConns {
-		t.Fatalf("open connections after burst = %d, want <= %d", stats.OpenConnections, sqliteMaxIdleConns)
-	}
+	// The store's own background reads (the planner-statistics check after
+	// open) may hold one connection at this instant; they return it within
+	// moments, and then no more than the idle bound stays open.
+	waitForCondition(t, "the pool shrinks to its idle bound", func() bool {
+		return store.db.Stats().OpenConnections <= sqliteMaxIdleConns
+	})
 }

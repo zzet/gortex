@@ -84,6 +84,13 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		if !isCallLikeEdge(j.kind) {
 			continue
 		}
+		// A parked reference that bound back to its own prior target is the
+		// binding the whole index already judged with the extractor's
+		// target; re-judging it on the restub's bare placeholder would give
+		// the per-save path a different answer from the same tree.
+		if j.restubRoundTrip {
+			continue
+		}
 		// Only the two weakest tiers — a name-only guess — are in scope.
 		// DefaultOriginFor backfills the tier for edges whose Origin the
 		// resolver left unset (the heuristic fallbacks never stamp it).
@@ -171,6 +178,23 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 	}
 	if len(provBatch) > 0 {
 		r.graph.SetEdgeProvenanceBatch(provBatch)
+		// The reindex below persists each edge struct as it stands. The
+		// in-memory store's SetEdgeProvenance clears Origin on this very
+		// pointer, but a store that answers reads with copies (the per-file
+		// delta writer) may leave the caller's copy untouched, and the
+		// reverted row would then keep the abandoned bind's origin — a row a
+		// whole index (which reverts in memory) never writes. Apply the same
+		// clear to the struct, with SetEdgeProvenance's Tier rule; on the
+		// in-memory store it is already done.
+		for _, u := range provBatch {
+			if u.Edge == nil || u.Edge.Origin == u.NewOrigin {
+				continue
+			}
+			u.Edge.Origin = u.NewOrigin
+			if u.Edge.Tier != "" {
+				u.Edge.Tier = graph.ResolvedBy(u.NewOrigin)
+			}
+		}
 	}
 	if len(reindexBatch) > 0 {
 		r.graph.ReindexEdges(reindexBatch)
@@ -469,12 +493,7 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 	// symbol it calls lives behind the re-export hop. Without this, the
 	// guard reverts every legitimate barrel-mediated call as
 	// "not import-reachable".
-	skipTarget := func(to string) bool {
-		return strings.HasPrefix(to, unresolvedPrefix) ||
-			strings.HasPrefix(to, "external::") ||
-			graph.IsStdlibStub(to) ||
-			strings.HasPrefix(to, "dep::")
-	}
+	skipTarget := importClosureSkipsTarget
 	var imports, reexports []*graph.Edge
 	ids := make(map[string]struct{})
 	collect := func(e *graph.Edge) {
@@ -507,6 +526,188 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 		reexports = append(reexports, e)
 		collect(e)
 	}
+	return r.assembleImportClosure(closure, imports, reexports, ids, nil)
+}
+
+// importClosureSkipsTarget reports an import / re-export target that names no
+// in-repo directory: a still-unresolved placeholder or an out-of-repo stub.
+func importClosureSkipsTarget(to string) bool {
+	return strings.HasPrefix(to, unresolvedPrefix) ||
+		strings.HasPrefix(to, "external::") ||
+		graph.IsStdlibStub(to) ||
+		strings.HasPrefix(to, "dep::")
+}
+
+// buildImportClosureForCallerFiles is buildImportClosure restricted to the
+// given caller files: the entry of every listed file is exactly the entry the
+// whole-graph build gives it, and no other file has one. An entry depends only
+// on the file's own file node, the import edges whose caller is the file, and
+// the re-export edges reachable from those imports' targets, so the build reads
+// just those: the files' file nodes, the import edges out of their nodes, and a
+// breadth-first walk of re-export edges out of the imported (barrel) files. The
+// guard consults the closure only for the caller files of the jobs it checks,
+// so an incremental resolve pays for its own callers instead of a scan of
+// every file node and import edge of the store.
+//
+// One shape is read differently: an import edge whose source node is missing
+// or has no file path is attributed to its own file_path by the whole-graph
+// build, and is found here only when the store answers the file projection
+// from edge provenance. Such edges do not occur in an indexed graph (eviction
+// removes a node's edges with it).
+func (r *Resolver) buildImportClosureForCallerFiles(files []string) map[string]map[string]struct{} {
+	closure := make(map[string]map[string]struct{})
+	callers := make(map[string]struct{}, len(files))
+	wanted := make([]string, 0, len(files))
+	for _, file := range files {
+		if file == "" {
+			continue
+		}
+		if _, dup := callers[file]; !dup {
+			callers[file] = struct{}{}
+			wanted = append(wanted, file)
+		}
+	}
+	if len(wanted) == 0 {
+		return closure
+	}
+	sort.Strings(wanted)
+	seed := func(filePath string) {
+		dir := filePathDir(filePath)
+		if dir == "" {
+			return
+		}
+		set := closure[filePath]
+		if set == nil {
+			set = make(map[string]struct{})
+			closure[filePath] = set
+		}
+		set[dir] = struct{}{}
+	}
+	// A caller file the pass's directory index lists is a file node already
+	// read; only the others are read here (a file-scoped projection composed
+	// through a delta's layers costs seconds per call).
+	unknown := wanted
+	if r.dirIndex != nil {
+		unknown = nil
+		for _, file := range wanted {
+			listed := false
+			for _, identity := range r.dirIndex[filePathDir(file)] {
+				if identity.FilePath == file {
+					listed = true
+					break
+				}
+			}
+			if listed {
+				seed(file)
+			} else {
+				unknown = append(unknown, file)
+			}
+		}
+	}
+	if len(unknown) > 0 {
+		for node := range graph.NodesInScopeSeq(r.graph, nil, unknown, graph.KindFile) {
+			if node == nil || node.FilePath == "" {
+				continue
+			}
+			if _, ok := callers[node.FilePath]; !ok {
+				continue
+			}
+			seed(node.FilePath)
+		}
+	}
+	var imports, reexports []*graph.Edge
+	ids := make(map[string]struct{})
+	collect := func(e *graph.Edge) {
+		if e.From != "" {
+			ids[e.From] = struct{}{}
+		}
+		if e.To != "" {
+			ids[e.To] = struct{}{}
+		}
+	}
+	targets := make(map[string]struct{})
+	addImport := func(e *graph.Edge) {
+		if e == nil || importClosureSkipsTarget(e.To) {
+			return
+		}
+		imports = append(imports, e)
+		collect(e)
+		if e.To != "" {
+			targets[e.To] = struct{}{}
+		}
+	}
+	// The import projection answers a caller file's direct import targets
+	// (the same rows, from the file's nodes) and is kept per stack by a
+	// delta; the file-scoped edge projection is the fallback.
+	projected, complete := map[string][]string(nil), false
+	if projector, ok := r.graph.(graph.ImportAdjacencyProjector); ok {
+		projected, complete = projector.ProjectImportAdjacency(wanted)
+	}
+	if complete {
+		for _, file := range wanted {
+			for _, to := range projected[file] {
+				addImport(&graph.Edge{From: file, To: to, Kind: graph.EdgeImports, FilePath: file})
+			}
+		}
+	} else {
+		for row := range graph.EdgesInScopeSeq(r.graph, nil, wanted, graph.EdgeImports) {
+			addImport(row.Edge)
+		}
+	}
+	if len(imports) == 0 {
+		return closure
+	}
+	// Re-export hops: walk barrel files breadth-first from the imported files.
+	visited := make(map[string]struct{})
+	nextFiles := func(ids map[string]struct{}) []string {
+		list := make([]string, 0, len(ids))
+		for id := range ids {
+			list = append(list, id)
+		}
+		var out []string
+		for _, placement := range graph.NodePlacementsByIDs(r.graph, list) {
+			if placement.FilePath == "" || !mayCarryReExports(placement.FilePath) {
+				continue
+			}
+			if _, seen := visited[placement.FilePath]; seen {
+				continue
+			}
+			visited[placement.FilePath] = struct{}{}
+			out = append(out, placement.FilePath)
+		}
+		sort.Strings(out)
+		return out
+	}
+	for frontier := nextFiles(targets); len(frontier) > 0; {
+		hop := make(map[string]struct{})
+		for row := range graph.EdgesInScopeSeq(r.graph, nil, frontier, graph.EdgeReExports) {
+			e := row.Edge
+			if e == nil || importClosureSkipsTarget(e.To) {
+				continue
+			}
+			reexports = append(reexports, e)
+			collect(e)
+			if e.To != "" {
+				hop[e.To] = struct{}{}
+			}
+		}
+		frontier = nextFiles(hop)
+	}
+	return r.assembleImportClosure(closure, imports, reexports, ids, callers)
+}
+
+// assembleImportClosure folds import and re-export edges into closure (already
+// seeded with each caller file's own directory): every non-placeholder import
+// adds its target's directory, plus every directory reachable from that target
+// through re-export hops. ids are the edges' endpoint IDs. callers, when
+// non-nil, keeps only imports whose caller file is in the set (the scoped
+// build fetches a superset of their import edges).
+func (r *Resolver) assembleImportClosure(
+	closure map[string]map[string]struct{},
+	imports, reexports []*graph.Edge,
+	ids map[string]struct{},
+	callers map[string]struct{},
+) map[string]map[string]struct{} {
 	if len(imports) == 0 {
 		return closure
 	}
@@ -515,6 +716,17 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 		idList = append(idList, id)
 	}
 	placements := graph.NodePlacementsByIDs(r.graph, idList)
+	add := func(file, dir string) {
+		if file == "" || dir == "" {
+			return
+		}
+		set := closure[file]
+		if set == nil {
+			set = make(map[string]struct{})
+			closure[file] = set
+		}
+		set[dir] = struct{}{}
+	}
 
 	// Collapse symbol-level re-export edges to unique file targets.
 	reexpTargets := make(map[string]map[string]struct{})
@@ -555,6 +767,11 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 		if from, ok := placements[e.From]; ok && from.FilePath != "" {
 			callerFile = from.FilePath
 		}
+		if callers != nil {
+			if _, wanted := callers[callerFile]; !wanted {
+				continue
+			}
+		}
 		if target, ok := placements[e.To]; ok && target.FilePath != "" && callerFile != "" {
 			add(callerFile, filePathDir(target.FilePath))
 			if len(reexpTargets[target.FilePath]) == 0 {
@@ -571,4 +788,25 @@ func (r *Resolver) buildImportClosureFiltered(repos map[string]struct{}) map[str
 		}
 	}
 	return closure
+}
+
+// reExportFreeExtensions are source extensions whose extractors never emit a
+// re-export edge (only the JavaScript / TypeScript extractors and the formats
+// that embed them do). A file with one of them is never a barrel, so the
+// re-export walk does not read its edges.
+var reExportFreeExtensions = map[string]struct{}{
+	".go": {}, ".py": {}, ".java": {}, ".kt": {}, ".kts": {}, ".scala": {},
+	".rs": {}, ".rb": {}, ".php": {}, ".cs": {}, ".swift": {}, ".dart": {},
+	".c": {}, ".h": {}, ".cc": {}, ".cpp": {}, ".cxx": {}, ".hpp": {}, ".hh": {},
+	".m": {}, ".mm": {}, ".ex": {}, ".exs": {}, ".erl": {}, ".hs": {}, ".lua": {},
+	".sh": {}, ".bash": {}, ".sql": {}, ".proto": {}, ".md": {}, ".yaml": {}, ".yml": {},
+	".json": {}, ".toml": {},
+}
+
+// mayCarryReExports reports whether filePath can hold re-export edges: any
+// file except one whose extension belongs to a language that never emits them
+// (an unknown or missing extension may be a content-detected script).
+func mayCarryReExports(filePath string) bool {
+	_, free := reExportFreeExtensions[jsTSExt(filePath)]
+	return !free
 }

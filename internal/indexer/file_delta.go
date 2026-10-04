@@ -299,7 +299,8 @@ func isFingerprintMeta(key string) bool {
 	switch key {
 	case sourceSemanticFingerprintMeta, sourceMetadataFingerprintMeta, sourceCoreFingerprintMeta,
 		sourceDerivedDeclFingerprintMeta, sourceDerivedImportFingerprintMeta,
-		sourceDerivedRuntimeFingerprintMeta, sourceDerivedArtifactFingerprintMeta:
+		sourceDerivedRuntimeFingerprintMeta, sourceDerivedArtifactFingerprintMeta,
+		sourceDerivedHierarchyFingerprintMeta:
 		return true
 	default:
 		return false
@@ -321,7 +322,11 @@ func fingerprintMetaKeys(meta map[string]any, mode fingerprintMode, keepPresenta
 	}
 	keys := make([]string, 0, len(meta))
 	for key := range meta {
-		if isFingerprintMeta(key) {
+		// The body identity is presentation to the semantic and derived
+		// digests, but the metadata digest carries it: an edit inside a body
+		// too short to shingle (a comment, a literal) moves nothing else, and
+		// an inert verdict would keep the prior row's identity.
+		if isFingerprintMeta(key) || key == cloneBodyMetaKey && mode != fingerprintMetadata {
 			continue
 		}
 		if mode != fingerprintMetadata && (!keepPresentation || mode == fingerprintDerived) {
@@ -346,7 +351,7 @@ func fingerprintMetaKeys(meta map[string]any, mode fingerprintMode, keepPresenta
 // reusing that digest removes a third full field/hash pass from cold indexing.
 func semanticFingerprintCoversDerived(meta map[string]any, keepPresentation bool) bool {
 	for key := range meta {
-		if isFingerprintMeta(key) {
+		if isFingerprintMeta(key) || key == cloneBodyMetaKey {
 			continue
 		}
 		if _, presentation := presentationMetaKeys[key]; presentation {
@@ -507,7 +512,7 @@ func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerpri
 	metadataRows := make([]fingerprintDigest, 0, capacity)
 	semanticRows := make([]fingerprintDigest, 0, capacity)
 	coreRows := make([]fingerprintDigest, 0, capacity)
-	var declarations, imports, runtimeRows, artifacts []fingerprintDigest
+	var declarations, imports, runtimeRows, artifacts, hierarchy []fingerprintDigest
 	h := sha256.New()
 	for _, node := range result.Nodes {
 		if node == nil {
@@ -536,6 +541,9 @@ func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerpri
 		semanticRows = append(semanticRows, semantic)
 		if isDeclarationNodeKind(node.Kind) {
 			declarations = append(declarations, derived)
+		}
+		if isHierarchyNodeKind(node.Kind) {
+			hierarchy = append(hierarchy, derived)
 		}
 		if isImportNodeKind(node.Kind) {
 			imports = append(imports, derived)
@@ -572,6 +580,7 @@ func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerpri
 		semanticRows = append(semanticRows, semantic)
 		if isDeclarationEdgeKind(edge.Kind) {
 			declarations = append(declarations, derived)
+			hierarchy = append(hierarchy, derived)
 		}
 		if isImportEdgeKind(edge.Kind) {
 			imports = append(imports, derived)
@@ -584,15 +593,16 @@ func extractionFingerprints(result *parser.ExtractionResult) (fileDeltaFingerpri
 		}
 	}
 	return fileDeltaFingerprints{
-			metadata: stableFingerprintDigests(metadataRows),
-			semantic: stableFingerprintDigests(semanticRows),
-			core:     stableFingerprintDigests(coreRows),
-		}, derivedFingerprints{
-			declarations: stableFingerprintDigests(declarations),
-			imports:      stableFingerprintDigests(imports),
-			runtime:      stableFingerprintDigests(runtimeRows),
-			artifacts:    stableFingerprintDigests(artifacts),
-		}, true
+		metadata: stableFingerprintDigests(metadataRows),
+		semantic: stableFingerprintDigests(semanticRows),
+		core:     stableFingerprintDigests(coreRows),
+	}, derivedFingerprints{
+		declarations: stableFingerprintDigests(declarations),
+		imports:      stableFingerprintDigests(imports),
+		runtime:      stableFingerprintDigests(runtimeRows),
+		artifacts:    stableFingerprintDigests(artifacts),
+		hierarchy:    stableFingerprintDigests(hierarchy),
+	}, true
 }
 
 func stampExtractionGraphFingerprints(result *parser.ExtractionResult, fingerprints fileDeltaFingerprints) {
@@ -659,6 +669,82 @@ type edgeRefreshKey struct {
 	alias string
 }
 
+// pairMetadataEdgeRefreshes matches source-owned edges by resolved target, not
+// their relative line ordering. Repeated targets have no stable callsite key,
+// so they must use the structural path instead of guessing a correspondence.
+func pairMetadataEdgeRefreshes(graphPath string, priorByID map[string]*graph.Node, oldEdges, freshEdges []*graph.Edge) ([]graph.EdgeReindex, bool) {
+	type identity struct {
+		edgeRefreshKey
+		to string
+	}
+	owned := func(edge *graph.Edge) bool {
+		return edge.FilePath == graphPath || edge.FilePath == "" && priorByID[edge.From] != nil
+	}
+	freshCounts := make(map[edgeRefreshKey]int)
+	freshByID := make(map[identity]*graph.Edge)
+	for _, edge := range freshEdges {
+		if edge == nil {
+			continue
+		}
+		if !owned(edge) {
+			return nil, false
+		}
+		key := edgeRefreshKey{from: edge.From, kind: edge.Kind, alias: edge.Alias}
+		id := identity{edgeRefreshKey: key, to: edge.To}
+		if freshByID[id] != nil {
+			return nil, false
+		}
+		freshByID[id] = edge
+		freshCounts[key]++
+	}
+	oldCounts := make(map[edgeRefreshKey]int)
+	oldByID := make(map[identity]*graph.Edge)
+	for _, edge := range oldEdges {
+		if edge == nil || !owned(edge) {
+			continue
+		}
+		key := edgeRefreshKey{from: edge.From, kind: edge.Kind, alias: edge.Alias}
+		if freshCounts[key] == 0 {
+			continue
+		}
+		oldCounts[key]++
+		id := identity{edgeRefreshKey: key, to: edge.To}
+		if freshByID[id] == nil {
+			continue
+		}
+		if oldByID[id] != nil {
+			return nil, false
+		}
+		oldByID[id] = edge
+	}
+	for key, count := range freshCounts {
+		if oldCounts[key] != count {
+			return nil, false
+		}
+	}
+	updates := make([]graph.EdgeReindex, 0, len(freshByID))
+	for _, fresh := range freshEdges {
+		if fresh == nil {
+			continue
+		}
+		key := edgeRefreshKey{from: fresh.From, kind: fresh.Kind, alias: fresh.Alias}
+		before := oldByID[identity{edgeRefreshKey: key, to: fresh.To}]
+		if before == nil {
+			return nil, false
+		}
+		after := *before
+		after.FilePath = fresh.FilePath
+		after.Line = fresh.Line
+		after.Alias = fresh.Alias
+		after.Meta = mergeRefreshMeta(before.Meta, fresh.Meta)
+		updates = append(updates, graph.EdgeReindex{
+			Edge: &after, OldTo: before.To, OldFilePath: before.FilePath,
+			OldLine: before.Line, RefreshIdentity: true,
+		})
+	}
+	return updates, true
+}
+
 func metadataEdgeRefreshes(g graph.Store, graphPath string, priorNodes, freshNodes []*graph.Node, freshEdges []*graph.Edge) ([]graph.EdgeReindex, bool) {
 	if len(freshNodes) == 0 {
 		return nil, false
@@ -692,62 +778,16 @@ func metadataEdgeRefreshes(g graph.Store, graphPath string, priorNodes, freshNod
 	}
 	applyResolvedOutEdges(g, freshEdges, reuse, newIDs)
 
-	freshByKey := make(map[edgeRefreshKey][]*graph.Edge)
 	for _, edge := range freshEdges {
-		if edge == nil {
-			continue
-		}
-		if _, local := priorByID[edge.From]; !local {
+		if edge != nil && priorByID[edge.From] == nil {
 			return nil, false
 		}
-		key := edgeRefreshKey{from: edge.From, kind: edge.Kind, alias: edge.Alias}
-		freshByKey[key] = append(freshByKey[key], edge)
 	}
-	oldByKey := make(map[edgeRefreshKey][]*graph.Edge)
+	var oldEdges []*graph.Edge
 	for _, edges := range graph.OutEdgesForNodes(g, ids) {
-		for _, edge := range edges {
-			if edge == nil {
-				continue
-			}
-			key := edgeRefreshKey{from: edge.From, kind: edge.Kind, alias: edge.Alias}
-			if _, needed := freshByKey[key]; needed {
-				oldByKey[key] = append(oldByKey[key], edge)
-			}
-		}
+		oldEdges = append(oldEdges, edges...)
 	}
-
-	updates := make([]graph.EdgeReindex, 0, len(freshEdges))
-	for key, fresh := range freshByKey {
-		old := oldByKey[key]
-		if len(old) != len(fresh) {
-			return nil, false
-		}
-		sort.Slice(old, func(i, j int) bool {
-			if old[i].Line != old[j].Line {
-				return old[i].Line < old[j].Line
-			}
-			return old[i].To < old[j].To
-		})
-		sort.Slice(fresh, func(i, j int) bool {
-			if fresh[i].Line != fresh[j].Line {
-				return fresh[i].Line < fresh[j].Line
-			}
-			return fresh[i].To < fresh[j].To
-		})
-		for i := range fresh {
-			before := old[i]
-			after := *before
-			after.FilePath = fresh[i].FilePath
-			after.Line = fresh[i].Line
-			after.Alias = fresh[i].Alias
-			after.Meta = mergeRefreshMeta(before.Meta, fresh[i].Meta)
-			updates = append(updates, graph.EdgeReindex{
-				Edge: &after, OldTo: before.To, OldFilePath: before.FilePath,
-				OldLine: before.Line, RefreshIdentity: true,
-			})
-		}
-	}
-	return updates, true
+	return pairMetadataEdgeRefreshes(graphPath, priorByID, oldEdges, freshEdges)
 }
 
 // applyPreparedMetadataRefresh updates source-owned node metadata/locations and

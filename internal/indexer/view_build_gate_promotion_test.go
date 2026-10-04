@@ -140,6 +140,9 @@ func TestViewBuildGatePromotionPreservesInteractiveFIFO(t *testing.T) {
 
 func TestViewBuildGatePromotionsPreserveBackgroundBurstFairness(t *testing.T) {
 	g := newViewBuildGateWithLimits(8, 8)
+	// The burst mechanics alone: the background waiter counts as starved at
+	// once (the age bound is TestViewBuildGateStarvedBackgroundStillRuns).
+	g.backgroundStarvation = 0
 	releaseHolder := holdPromotionTestGate(t, g)
 	background := queuePromotionTestAcquisition(t, g, ViewBuildBackground, nil)
 	waitPromotionTestQueued(t, g, 1)

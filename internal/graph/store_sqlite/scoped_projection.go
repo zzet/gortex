@@ -143,8 +143,8 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 		return func(func(graph.ScopedEdgeRow) bool) {}
 	}
 	return func(yield func(graph.ScopedEdgeRow) bool) {
-		var maxID int64
-		if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM edges WHERE view_gen = ?`, s.viewGen).Scan(&maxID); err != nil {
+		maxID, err := s.edgeGenerationHighWater()
+		if err != nil {
 			panicOnFatal(err)
 			return
 		}
@@ -254,6 +254,20 @@ func scopedNodeProjectionQuery(
 	filesJSON, haveFiles := projectionJSON(filePaths)
 	if !haveRepos && !haveFiles {
 		return "", nil, false
+	}
+	if haveRepos && !haveFiles && kind != "" && len(repoPrefixes) == 1 && repoPrefixes[0] != "" {
+		generationColumn := "n.view_gen"
+		if viewGen == baseViewGeneration && (kind == string(graph.KindFile) || kind == string(graph.KindContract)) {
+			// The base repository contains many ordinary symbols beside its
+			// sparse file/contract kinds. Keep generation equality exact but
+			// drive this cursor from the existing repo/kind keyset index.
+			generationColumn = "+n.view_gen"
+		}
+		query := `SELECT ` + qualifiedNodeColumns("n", columns) +
+			` FROM nodes AS n` +
+			` WHERE n.repo_prefix = ? AND n.kind = ? AND ` + generationColumn + ` = ?` +
+			` AND n.id > ? ORDER BY n.id LIMIT ?`
+		return query, []any{repoPrefixes[0], kind, viewGen}, true
 	}
 	ctes := make([]string, 0, 2)
 	joins := make([]string, 0, 2)

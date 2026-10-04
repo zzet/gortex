@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"encoding/json"
 	"sort"
 	"strings"
@@ -33,6 +34,23 @@ func projectionJSON(values []string) (string, bool) {
 	return string(data), true
 }
 
+// repoLanguageFileCountsSQL keeps requested repositories on the driving side.
+// Without CROSS JOIN, SQLite can scan an entire generation before testing each
+// requested prefix. Do not pin a physical index: bulk loads may drop nodes_by_repo.
+const repoLanguageFileCountsSQL = `
+WITH requested(repo_prefix) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+)
+SELECT n.repo_prefix, n.file_path, n.language, COUNT(*)
+FROM requested AS r
+CROSS JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
+WHERE n.language <> ''
+  AND n.kind <> ?
+  AND (n.kind <> ? OR n.data_class IS NOT 'content')
+  AND n.view_gen = ?
+GROUP BY n.repo_prefix, n.file_path, n.language
+ORDER BY n.repo_prefix, n.file_path, n.language`
+
 // RepoLanguageFileCounts projects only the flat repository, file, language,
 // kind, and data-class columns. Node.Meta, docs, signatures, and edges never
 // cross the SQLite boundary.
@@ -41,19 +59,7 @@ func (s *Store) RepoLanguageFileCounts(repoPrefixes []string) []graph.RepoLangua
 	if !ok {
 		return nil
 	}
-	rows, err := s.db.Query(`
-WITH requested(repo_prefix) AS (
-    SELECT CAST(value AS TEXT) FROM json_each(?)
-)
-SELECT n.repo_prefix, n.file_path, n.language, COUNT(*)
-FROM requested AS r
-JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
-WHERE n.language <> ''
-  AND n.kind <> ?
-  AND (n.kind <> ? OR n.data_class IS NOT 'content')
-  AND n.view_gen = ?
-GROUP BY n.repo_prefix, n.file_path, n.language
-ORDER BY n.repo_prefix, n.file_path, n.language`, reposJSON, string(graph.KindModule), string(graph.KindDoc), s.viewGen)
+	rows, err := s.db.Query(repoLanguageFileCountsSQL, reposJSON, string(graph.KindModule), string(graph.KindDoc), s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -75,39 +81,63 @@ ORDER BY n.repo_prefix, n.file_path, n.language`, reposJSON, string(graph.KindMo
 	return out
 }
 
-// RepoLanguageCounts returns node-only language counts for all requested repos
-// in one query. It deliberately does not touch the edges table (unlike
-// RepoStats), and filters content sections using the promoted data_class column.
-func (s *Store) RepoLanguageCounts(repoPrefixes []string) map[string]map[string]int {
-	out := make(map[string]map[string]int)
-	reposJSON, ok := projectionJSON(repoPrefixes)
-	if !ok {
-		return out
-	}
-	rows, err := s.db.Query(`
+// Keep requested repositories driving the census, without pinning an index
+// that a legitimate bulk-load window may have dropped.
+const repoLanguageCountsSQL = `
 WITH requested(repo_prefix) AS (
     SELECT CAST(value AS TEXT) FROM json_each(?)
 )
 SELECT n.repo_prefix, n.language, COUNT(*)
 FROM requested AS r
-JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
+CROSS JOIN nodes AS n ON n.repo_prefix = r.repo_prefix
 WHERE n.language <> ''
   AND (n.kind <> ? OR n.data_class IS NOT 'content')
   AND n.view_gen = ?
 GROUP BY n.repo_prefix, n.language
-ORDER BY n.repo_prefix, n.language`, reposJSON, string(graph.KindDoc), s.viewGen)
+ORDER BY n.repo_prefix, n.language`
+
+// RepoLanguageCounts returns node-only language counts for all requested repos
+// in one query. It deliberately does not touch the edges table (unlike
+// RepoStats), and filters content sections using the promoted data_class column.
+func (s *Store) RepoLanguageCounts(repoPrefixes []string) map[string]map[string]int {
+	counts, err := s.RepoLanguageCountsContext(context.Background(), repoPrefixes)
 	if err != nil {
 		panicOnFatal(err)
-		return out
+		return map[string]map[string]int{}
+	}
+	return counts
+}
+
+// RepoLanguageCountsContext returns a complete census or an error. A canceled
+// or failed read never returns partial counts that could admit enrichment.
+func (s *Store) RepoLanguageCountsContext(ctx context.Context, repoPrefixes []string) (map[string]map[string]int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out := make(map[string]map[string]int)
+	reposJSON, ok := projectionJSON(repoPrefixes)
+	if !ok {
+		return out, nil
+	}
+	rows, err := s.db.QueryContext(ctx, repoLanguageCountsSQL, reposJSON, string(graph.KindDoc), s.viewGen)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
 	}
 	defer rows.Close()
-
 	for rows.Next() {
 		var repoPrefix, language string
 		var count int
 		if err := rows.Scan(&repoPrefix, &language, &count); err != nil {
-			panicOnFatal(err)
-			return out
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
 		}
 		byLanguage := out[repoPrefix]
 		if byLanguage == nil {
@@ -117,9 +147,15 @@ ORDER BY n.repo_prefix, n.language`, reposJSON, string(graph.KindDoc), s.viewGen
 		byLanguage[language] = count
 	}
 	if err := rows.Err(); err != nil {
-		panicOnFatal(err)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
 	}
-	return out
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // RepoNodeIDsByKinds projects only node IDs for the full repository/kind set.
@@ -256,6 +292,25 @@ func normalizeProjectionExtensions(extensions []string) []string {
 
 // RepoNodesByKindsWithMetaKey performs one repository/workspace/kind query and
 // decodes only nodes carrying the requested metadata key.
+func repoNodesByKindsWithMetaKeyQuery(withWorkspace bool) string {
+	query := `
+WITH requested_kinds(kind) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+), selected_ids(id) AS (
+    SELECT candidate.id
+    FROM requested_kinds AS k
+    CROSS JOIN nodes AS candidate
+        ON candidate.repo_prefix = ? AND candidate.kind = k.kind AND candidate.view_gen = ?
+)
+SELECT ` + qualifiedNodeColumns("n", lookupNodeCols) + `
+FROM selected_ids AS selected
+CROSS JOIN nodes AS n ON n.id = selected.id AND n.view_gen = ?`
+	if withWorkspace {
+		query += ` WHERE n.workspace_id = ?`
+	}
+	return query
+}
+
 func (s *Store) RepoNodesByKindsWithMetaKey(repoPrefix, workspaceID string, kinds []graph.NodeKind, metaKey string) []*graph.Node {
 	if len(kinds) == 0 || metaKey == "" {
 		return nil
@@ -268,18 +323,11 @@ func (s *Store) RepoNodesByKindsWithMetaKey(repoPrefix, workspaceID string, kind
 	if !ok {
 		return nil
 	}
-	query := `SELECT ` + qualifiedNodeColumns("n", lookupNodeCols) + `
-FROM nodes AS n
-JOIN json_each(?) AS requested_kind ON CAST(requested_kind.value AS TEXT) = n.kind
-WHERE n.repo_prefix = ?`
-	args := []any{kindsJSON, repoPrefix}
+	args := []any{kindsJSON, repoPrefix, s.viewGen, s.viewGen}
 	if workspaceID != "" {
-		query += ` AND n.workspace_id = ?`
 		args = append(args, workspaceID)
 	}
-	query += ` AND n.view_gen = ? ORDER BY n.id`
-	args = append(args, s.viewGen)
-	candidates := s.scanNodeQuery(query, args...)
+	candidates := s.scanNodeQuery(repoNodesByKindsWithMetaKeyQuery(workspaceID != ""), args...)
 	out := candidates[:0]
 	for _, node := range candidates {
 		if node == nil || node.Meta == nil {
@@ -289,6 +337,7 @@ WHERE n.repo_prefix = ?`
 			out = append(out, node)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
@@ -321,7 +370,11 @@ func (s *Store) RepoEdgesByKinds(repoPrefixes []string, kinds []graph.EdgeKind) 
 	if !ok {
 		return nil
 	}
-	rows, err := s.db.Query(repoEdgesByKindsQuery(), reposJSON, kindsJSON, s.viewGen)
+	query := repoEdgesByKindsQuery()
+	if repoEdgesUseKindFirstPlan(kinds) {
+		query = repoContractEdgesByKindsQuery()
+	}
+	rows, err := s.db.Query(query, reposJSON, kindsJSON, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -368,6 +421,43 @@ func (s *Store) RepoEdgesByKinds(repoPrefixes []string, kinds []graph.EdgeKind) 
 	return out
 }
 
+func repoEdgesUseKindFirstPlan(kinds []graph.EdgeKind) bool {
+	if len(kinds) == 0 {
+		return false
+	}
+	for _, kind := range kinds {
+		switch kind {
+		case graph.EdgeProvides, graph.EdgeConsumes:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// repoContractEdgesByKindsQuery drives the two sparse durable contract-owner
+// kinds before hydrating their source nodes. Unary plus keeps generation
+// equality exact while preventing SQLite from preferring the broad generation
+// index over the sparse kind seek; unlike INDEXED BY, it remains valid while
+// optional indexes are absent. The generic query remains repository-first
+// because common edge kinds can span most of the graph.
+func repoContractEdgesByKindsQuery() string {
+	return `
+WITH requested_repos(repo_prefix) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+), requested_kinds(kind) AS (
+    SELECT CAST(value AS TEXT) FROM json_each(?)
+)
+SELECT n.repo_prefix,
+       e.from_id, e.to_id, e.kind, e.file_path, e.line,
+	       e.confidence, e.confidence_label, e.origin, e.tier,
+	       e.cross_repo, e.meta, e.resolve_terminal, e.resolve_terminal_reason, e.semantic_source
+FROM requested_kinds AS k
+CROSS JOIN edges AS e ON e.kind = k.kind AND +e.view_gen = ?
+CROSS JOIN nodes AS n ON n.id = e.from_id AND n.view_gen = e.view_gen
+CROSS JOIN requested_repos AS r ON r.repo_prefix = n.repo_prefix`
+}
+
 func repoEdgesByKindsQuery() string {
 	// r → n → k → e under CROSS JOIN (never reordered): every edge lookup is
 	// a full (from_id, kind) seek on edges_by_from — the flat-kind global
@@ -397,3 +487,86 @@ var (
 	_ graph.RepoFilePathReader          = (*Store)(nil)
 	_ graph.RepoMetaNodeReader          = (*Store)(nil)
 )
+
+// publishedLanguageCountKey keys PublishedRepoLanguageCounts' memo.
+type publishedLanguageCountKey struct {
+	generation int64
+	repoPrefix string
+}
+
+// PublishedRepoLanguageCounts is RepoLanguageCounts for one repository on
+// this handle's generation, memoized on the shared store core. It is only
+// for a published generation above the base: the caller asserts the
+// generation is ready, and a ready generation's node rows never change (a
+// retired generation's id is never reused). The base generation is mutable
+// and is never memoized. Every working-tree build of every checkout stands
+// on the same committed ancestry, and one count of a full dedicated
+// generation reads all of its ~180k node rows (tens of seconds cold on the
+// live store), so the count is paid once per generation per process instead
+// of once per checkout and commit generation. The returned map is shared:
+// callers must not modify it.
+func (s *Store) PublishedRepoLanguageCounts(repoPrefix string) map[string]int {
+	counts, err := s.PublishedRepoLanguageCountsContext(context.Background(), repoPrefix)
+	if err != nil {
+		panicOnFatal(err)
+		return nil
+	}
+	return counts
+}
+
+// PublishedRepoLanguageCountsContext memoizes only a complete successful read.
+// Cancellation is checked even on a cache hit; mutable base counts are uncached.
+func (s *Store) PublishedRepoLanguageCountsContext(ctx context.Context, repoPrefix string) (map[string]int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.viewGen <= baseViewGeneration || s.coreless() {
+		all, err := s.RepoLanguageCountsContext(ctx, []string{repoPrefix})
+		if err != nil {
+			return nil, err
+		}
+		return all[repoPrefix], nil
+	}
+	key := publishedLanguageCountKey{generation: s.viewGen, repoPrefix: repoPrefix}
+	if cached, ok := s.publishedLanguageCounts.Load(key); ok {
+		return cached.(map[string]int), nil
+	}
+	all, err := s.RepoLanguageCountsContext(ctx, []string{repoPrefix})
+	if err != nil {
+		return nil, err
+	}
+	counts := all[repoPrefix]
+	if counts == nil {
+		counts = map[string]int{}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	actual, _ := s.publishedLanguageCounts.LoadOrStore(key, counts)
+	return actual.(map[string]int), nil
+}
+
+// generationPayloadPresenceSQL answers whether the handle's generation holds
+// any node row and any edge row: two EXISTS probes, each one seek of an index
+// leading with view_gen.
+const generationPayloadPresenceSQL = `SELECT
+  EXISTS(SELECT 1 FROM nodes WHERE view_gen = ?),
+  EXISTS(SELECT 1 FROM edges WHERE view_gen = ?)`
+
+// GenerationPayloadPresence reports whether this handle's generation carries
+// node rows and edge rows of its own. A layer with neither (a clean commit
+// generation, a dirty layer that only masks) can answer its row reads without
+// SQL. On a read error it reports both present, so a caller never skips rows
+// it could not prove absent.
+func (s *Store) GenerationPayloadPresence() (nodes, edges bool) {
+	if s.coreless() {
+		return true, true
+	}
+	if err := s.db.QueryRow(generationPayloadPresenceSQL, s.viewGen, s.viewGen).Scan(&nodes, &edges); err != nil {
+		return true, true
+	}
+	return nodes, edges
+}

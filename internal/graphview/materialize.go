@@ -3,6 +3,7 @@ package graphview
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
 	"go.uber.org/zap"
@@ -11,6 +12,65 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
+
+// MaxDedicatedBaseChainDepth is how many persisted generations one dedicated
+// base's delta chain may contain, counting its full root.
+//
+// It is a READ-time number that the write side is required to respect, not a
+// storage tuning knob: assemble nests one OverlaidView and opens one full
+// GenerationLayer mask read set per ancestor, so every generation in the chain
+// is another indirection on every node and edge lookup for every reader of
+// that base, forever — the chain is persisted, so the cost is paid long after
+// the advance that added the link. The publisher therefore proposes a new full
+// root instead of extending a chain that already holds this many generations
+// (internal/indexer/dedicated_base_advance.go, maxDedicatedBaseDeltaAncestors,
+// which is defined as this constant so the two sides cannot drift apart).
+//
+// It is deliberately well under the catalog's hard ancestry limit
+// (store_sqlite, maxDedicatedBaseAncestry = 64): the hard limit is the last
+// line of defence against a corrupt chain, and a policy that only stopped
+// there would make every refusal a publication failure instead of a re-root.
+const MaxDedicatedBaseChainDepth = 32
+
+// MaxGenerationAncestryDepth bounds the persisted BaseGenerationID chain a
+// materialized view will compose, counting the identity generation the walk
+// starts from.
+//
+// It is the dedicated chain bound plus the one checkout layer that legitimately
+// stands on a dedicated head: a checkout's commit generation names the
+// dedicated base as its BaseGenerationID (indexer.CheckoutCoordinator's
+// commitIdentity), so materializing a checkout routed over a maximal dedicated
+// chain walks one generation further than materializing that base as a ref
+// view. The working-tree generation is not in this walk — it is a routed
+// generation stacked above the identity generation, and MaxRepoViewLayers
+// bounds that half of the stack.
+//
+// Exceeding it is refused, never truncated: see generationAncestry.
+const MaxGenerationAncestryDepth = MaxDedicatedBaseChainDepth + 1
+
+// MaxDirtyChainDepth bounds how many working-tree ("dirty") generations one
+// checkout may stack above its routed commit generation, counting the routed
+// top itself: a dirty generation may name the previously published dirty
+// generation of the same checkout as its BaseGenerationID, and the chain of
+// such parents must reach the route's commit generation within this many
+// hops.
+//
+// Like MaxDedicatedBaseChainDepth it is a READ-time number the write side must
+// respect: every chain member is another GenerationLayer mask read set and
+// another OverlaidView indirection on every read of the checkout. The builder
+// that chooses a dirty parent refuses to extend a chain that already holds
+// this many generations and builds directly over the commit instead, so the
+// indexer reads this constant rather than keeping its own.
+//
+// The checkout walk is therefore bounded by MaxGenerationAncestryDepth on the
+// commit side plus MaxDirtyChainDepth on the working-tree side, and so is a
+// ref view of a dirty generation. Exceeding either half is refused, never
+// truncated: see generationAncestry.
+const MaxDirtyChainDepth = 8
+
+// dirtyGenerationKind is the catalog generation kind of a working-tree layer
+// (indexer.DirtyLayerGenerationKind; graphview cannot import the indexer).
+const dirtyGenerationKind = "dirty"
 
 // Materializer turns a checkout's route into a readable view.
 //
@@ -36,6 +96,19 @@ type Materializer struct {
 	// stack was being built from, which is what makes the code
 	// diagnosable. nil silences it.
 	Logger *zap.Logger
+
+	newGenerationLayer func(context.Context, *store_sqlite.Store) (*GenerationLayer, error)
+
+	// layerCache keeps each published generation's masks across requests so
+	// a view over an ancestry chain does not re-read them per request. See
+	// generationLayerCache.
+	layerCacheOnce sync.Once
+	layerCache     *generationLayerCache
+
+	// forgetObservers are told every generation ForgetGeneration drops, so a
+	// cache kept beside the materializer (the search ranker's) drops it too.
+	forgetMu        sync.Mutex
+	forgetObservers []func(generation int64)
 }
 
 // GenerationSource is one persisted generation of a view's stack seen by
@@ -116,13 +189,116 @@ func (v *RepoView) GenerationSources() []GenerationSource {
 	return out
 }
 
+// PinsBaseCorpus reports whether this view's lease holds generation zero as
+// well as its derived stack. Generations() deliberately does not list it — the
+// identity and the composition are about the derived generations — so this is
+// how a caller checks that the bottom of the stack is pinned too.
+func (v *RepoView) PinsBaseCorpus() bool {
+	if v == nil {
+		return false
+	}
+	return slices.Contains(v.lease.IDs(), BaseCorpusGeneration)
+}
+
+// ComposesBaseCorpus reports whether generation zero is part of this view's
+// composition. A stack rooted in a dedicated full root does not inherit the
+// shared corpus at all (validateDedicatedFullRoot), so nothing generation zero
+// holds can be answered through the view's reader; the lease pins generation
+// zero exactly when the composition reads it (composesBaseCorpus).
+func (v *RepoView) ComposesBaseCorpus() bool { return v.PinsBaseCorpus() }
+
 // Close releases the view's lease. Calling it twice, or on a nil view,
 // does nothing.
+//
+// It releases the pinned generations only when no handed-off consumer is
+// still live: a request that detached work through Handoff keeps its payload
+// readable until that work closes its own handle.
 func (v *RepoView) Close() {
 	if v == nil {
 		return
 	}
 	v.closeOnce.Do(func() { v.lease.Release() })
+}
+
+// ViewHandoff is a joined consumer of a RepoView: the same reader over the
+// same pinned generations, handed to work that outlives the request that
+// materialized it — a detached worker, a cancellation tail, a background
+// build.
+//
+// Close is mandatory and idempotent. Until it runs, every generation the
+// original view read stays pinned and retirement of any of them is refused,
+// whether or not the originating view has been closed.
+type ViewHandoff struct {
+	// ID names the exact content this handle reads: the identity the
+	// originating view was materialized under.
+	ID RepoViewID
+	// CheckoutRouteEpoch is the catalog route snapshot the originating view
+	// pinned. It is zero for immutable ref views.
+	CheckoutRouteEpoch int64
+	// Reader is the composed graph the originating view served.
+	Reader graph.Reader
+	// Completeness is what that view could answer.
+	Completeness Completeness
+
+	generations []int64
+	sources     []GenerationSource
+	lease       *LeaseHandoff
+	closeOnce   sync.Once
+}
+
+// Handoff joins a consumer to this view's lease and returns a handle that
+// keeps the whole pinned generation ancestry alive on its own.
+//
+// It returns nil when there is nothing left to join: a nil view, a view with
+// no lease, or a view whose every holder has already released. A caller that
+// wanted to detach work must treat nil as a refusal — the payload underneath
+// may already be gone — and never as a successful handoff.
+func (v *RepoView) Handoff() *ViewHandoff {
+	if v == nil {
+		return nil
+	}
+	joined := v.lease.Handoff()
+	if joined == nil {
+		return nil
+	}
+	return &ViewHandoff{
+		ID:                 v.ID,
+		CheckoutRouteEpoch: v.CheckoutRouteEpoch,
+		Reader:             v.Reader,
+		Completeness:       v.Completeness,
+		generations:        slices.Clone(v.generations),
+		sources:            slices.Clone(v.sources),
+		lease:              joined,
+	}
+}
+
+// Generations lists every payload generation this handle keeps pinned,
+// bottom first, exactly as the originating view reported them.
+func (h *ViewHandoff) Generations() []int64 {
+	if h == nil {
+		return nil
+	}
+	return slices.Clone(h.generations)
+}
+
+// GenerationSources lists the stack's generations bottom first, in the order
+// they compose. The sources are valid for as long as this handle is open:
+// every handle is pinned to a generation the joined lease keeps from
+// retiring, even after the originating view closed.
+func (h *ViewHandoff) GenerationSources() []GenerationSource {
+	if h == nil {
+		return nil
+	}
+	return slices.Clone(h.sources)
+}
+
+// Close releases the joined consumer's hold on the view's generations.
+// Calling it twice, or on a nil handle, does nothing.
+func (h *ViewHandoff) Close() {
+	if h == nil {
+		return
+	}
+	h.closeOnce.Do(h.lease.Release)
 }
 
 // MaterializeCheckout builds the view a checkout's queries currently
@@ -237,12 +413,17 @@ func (m *Materializer) pinCheckoutRoute(
 		provisional.Release()
 		return nil, true, nil
 	}
-	ancestry, err := m.generationAncestry(ctx, generations)
+	ancestry, commitIndex, err := m.generationAncestry(ctx, generations)
 	if err != nil {
 		provisional.Release()
 		return nil, false, err
 	}
-	lease := m.Leases.Acquire(ancestry...)
+	pinned, err := m.leaseSet(ctx, ancestry, commitIndex)
+	if err != nil {
+		provisional.Release()
+		return nil, false, err
+	}
+	lease := m.Leases.Acquire(pinned...)
 	provisional.Release()
 
 	// A route can move while ancestry is being resolved. Re-read it after the
@@ -264,61 +445,322 @@ func (m *Materializer) pinCheckoutRoute(
 // provisionally pinned while the immutable BaseGenerationID chain is read.
 func (m *Materializer) pinGenerationAncestry(ctx context.Context, generations []int64) (*Lease, error) {
 	provisional := m.Leases.Acquire(generations...)
-	ancestry, err := m.generationAncestry(ctx, generations)
+	ancestry, commitIndex, err := m.generationAncestry(ctx, generations)
 	if err != nil {
 		provisional.Release()
 		return nil, err
 	}
-	lease := m.Leases.Acquire(ancestry...)
+	pinned, err := m.leaseSet(ctx, ancestry, commitIndex)
+	if err != nil {
+		provisional.Release()
+		return nil, err
+	}
+	lease := m.Leases.Acquire(pinned...)
 	provisional.Release()
 	return lease, nil
 }
 
+// leaseSet is what a view's lease must hold: the derived ancestry, plus
+// generation zero when the composed reader actually reads through it.
+//
+// generationAncestry walks BaseGenerationID until it reaches zero and stops
+// there, so the set it returns is the derived generations only. Generation
+// zero is the terminator of that chain, not a link in it — and in the legacy
+// regime it is also the reader's bottom layer, the one thing in the stack a
+// reader held nothing over. assemble decides that with exactly the condition
+// mirrored here: a stack whose commit-side ancestry is deeper than the commit
+// generation itself stands on that ancestry's root, and so does one whose
+// first row is a dedicated corpus; everything else is composed over
+// Store.AtGeneration(0). The working-tree chain above the commit generation
+// never decides it — a dirty chain in the legacy regime still reads the
+// shared corpus beneath its commit generation.
+//
+// Pinning it only in that regime is deliberate. A view that does not read
+// generation zero has no business holding it — an over-broad pin is an
+// untruthful statement about what a reader depends on, and retirement and
+// cleanup bookkeeping read these pins. The corpus at index zero of a routed
+// content search is a separate consumer with a separate hold; see BasePin.
+func (m *Materializer) leaseSet(ctx context.Context, ancestry []int64, commitIndex int) ([]int64, error) {
+	composed, err := m.composesBaseCorpus(ctx, ancestry, commitIndex)
+	if err != nil {
+		return nil, err
+	}
+	if !composed || slices.Contains(ancestry, BaseCorpusGeneration) {
+		return ancestry, nil
+	}
+	return append(slices.Clone(ancestry), BaseCorpusGeneration), nil
+}
+
+// composesBaseCorpus reports whether the reader assemble will build reads the
+// shared indexed corpus as its bottom layer. It mirrors assemble's own arm —
+// commitIndex > 0 || firstRow.GenerationKind == "dedicated" — so the lease set
+// and the composition cannot disagree about what the view stands on.
+//
+// commitIndex is the position of the commit-side identity generation in the
+// ancestry (generationAncestry): everything at or below it is the committed
+// ancestry, everything above it the working-tree chain and routed layers. The
+// decision reads only the commit side, so a longer dirty chain can never make
+// a legacy-regime view drop the corpus it stands on.
+func (m *Materializer) composesBaseCorpus(ctx context.Context, ancestry []int64, commitIndex int) (bool, error) {
+	if len(ancestry) == 0 || commitIndex != 0 {
+		return false, nil
+	}
+	row, err := m.servableGeneration(ctx, ancestry[0])
+	if err != nil {
+		return false, err
+	}
+	return row.GenerationKind != "dedicated", nil
+}
+
+// AncestryTooDeepError reports a persisted generation chain that is longer
+// than MaxGenerationAncestryDepth, so the view cannot be composed.
+//
+// It is labelled rather than anonymous because the labels are what a diagnosis
+// needs and what a message cannot be parsed for: which view was asked for,
+// which ancestor the walk was standing on when the bound was reached, how deep
+// the chain already was there, and the bound itself. Depth is the depth of
+// Ancestor within the chain, counting Generation itself as depth one; it is
+// the bound plus one whenever the refusal fired, since the walk stops at the
+// first generation past the bound rather than measuring the whole chain.
+//
+// The wire code is CodeViewBuilding, which is the code every other structural
+// refusal in generationAncestry already carries, and it is honest about the
+// remedy: the publisher's allocation policy roots a new full base rather than
+// extending a chain this long, so the condition clears when that base
+// publishes and the retry hint the code carries is the right advice. It is not
+// CodeCheckoutInaccessible — the checkout is perfectly readable and a ref view
+// has no checkout at all — and it is not a new code, because the code list is
+// a wire contract owned by errors.go.
+type AncestryTooDeepError struct {
+	*ViewError
+	// Generation is the identity generation the view was asked for.
+	Generation int64 `json:"generation"`
+	// Ancestor is the generation the walk refused to descend into.
+	Ancestor int64 `json:"ancestor"`
+	// Depth is how deep Ancestor sits, counting Generation as depth one.
+	Depth int `json:"depth"`
+	// Limit is the bound that was exceeded: MaxGenerationAncestryDepth.
+	Limit int `json:"limit"`
+}
+
+// Unwrap puts the embedded *ViewError in the unwrap chain, so errors.Is
+// against ErrViewBuilding and errors.As against **ViewError both match. The
+// promoted Unwrap would otherwise skip it and return the ViewError's own
+// cause.
+func (e *AncestryTooDeepError) Unwrap() error { return e.ViewError }
+
+// newAncestryTooDeep builds the labelled refusal.
+func newAncestryTooDeep(generationID, ancestorID int64, depth int) *AncestryTooDeepError {
+	return &AncestryTooDeepError{
+		ViewError: NewViewError(CodeViewBuilding, fmt.Sprintf(
+			"generation %d stands on a chain at least %d generations deep at ancestor %d, over the %d-generation read bound",
+			generationID, depth, ancestorID, MaxGenerationAncestryDepth)),
+		Generation: generationID,
+		Ancestor:   ancestorID,
+		Depth:      depth,
+		Limit:      MaxGenerationAncestryDepth,
+	}
+}
+
+// newDirtyChainTooDeep builds the same labelled refusal for the working-tree
+// half of the walk: Generation is the dirty generation the chain was walked
+// from, Depth counts it as depth one, and Limit is MaxDirtyChainDepth. The
+// remedy is the same retryable one — the builder re-roots a chain at this
+// depth directly over the commit generation.
+func newDirtyChainTooDeep(generationID, ancestorID int64, depth int) *AncestryTooDeepError {
+	return &AncestryTooDeepError{
+		ViewError: NewViewError(CodeViewBuilding, fmt.Sprintf(
+			"dirty generation %d stands on a working-tree chain at least %d generations deep at ancestor %d, over the %d-generation chain bound",
+			generationID, depth, ancestorID, MaxDirtyChainDepth)),
+		Generation: generationID,
+		Ancestor:   ancestorID,
+		Depth:      depth,
+		Limit:      MaxDirtyChainDepth,
+	}
+}
+
 // generationAncestry resolves the physical stack beneath the routed
-// generations. The first routed generation may sit on a dedicated full base;
-// later routed generations must form an exact chain above it.
-func (m *Materializer) generationAncestry(ctx context.Context, generations []int64) ([]int64, error) {
+// generations and reports where the commit side of it ends.
+//
+// The stack has two halves, walked with separate bounds:
+//
+//   - The commit side: generations[0] (for a ref view of a dirty generation,
+//     the generation its working-tree chain stands on) and its
+//     BaseGenerationID ancestry down to zero — at most a dedicated full root,
+//     its deltas, and the commit layer — bounded by MaxGenerationAncestryDepth.
+//   - The working-tree side: each later routed generation, walked down its own
+//     BaseGenerationID through dirty parents until it reaches the routed
+//     generation below it, bounded by MaxDirtyChainDepth. Every parent in that
+//     walk must be a servable dirty generation of the same checkout, layer,
+//     graph and policy identity as the routed generation it was reached from;
+//     anything else is a foreign chain and is refused.
+//
+// The result is bottom first: the commit side oldest to newest, then each
+// routed generation's chain oldest to newest ending in the routed generation
+// itself. commitIndex is the position of the commit-side identity generation,
+// so ancestry[:commitIndex+1] is the commit side and everything above it is
+// the working-tree side.
+//
+// Both bounds are refusals, never truncations: a stack this function returned
+// short would be a view silently missing the oldest generations' content,
+// which is a wrong answer rather than a degraded one.
+func (m *Materializer) generationAncestry(ctx context.Context, generations []int64) ([]int64, int, error) {
 	if len(generations) == 0 {
-		return nil, NewViewError(CodeViewBuilding, "the view has no generations")
+		return nil, 0, NewViewError(CodeViewBuilding, "the view has no generations")
 	}
-	ancestry := make([]int64, 0, len(generations)+1)
 	seen := make(map[int64]struct{}, len(generations)+1)
-	for generationID := generations[0]; generationID > 0; {
-		if _, duplicate := seen[generationID]; duplicate {
-			return nil, NewViewError(CodeViewBuilding,
-				fmt.Sprintf("generation ancestry contains a cycle at %d", generationID))
-		}
-		seen[generationID] = struct{}{}
-		row, err := m.servableGeneration(ctx, generationID)
+
+	// A ref view of a dirty generation stands on the commit its chain reaches.
+	commitRoot := generations[0]
+	var refChain []int64
+	if len(generations) == 1 {
+		top, err := m.servableGeneration(ctx, generations[0])
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		ancestry = append(ancestry, generationID)
-		generationID = row.BaseGenerationID
-	}
-	for left, right := 0, len(ancestry)-1; left < right; left, right = left+1, right-1 {
-		ancestry[left], ancestry[right] = ancestry[right], ancestry[left]
+		if top.GenerationKind == dirtyGenerationKind {
+			chain, root, err := m.dirtyChain(ctx, generations[0], 0, seen)
+			if err != nil {
+				return nil, 0, err
+			}
+			refChain, commitRoot = chain, root
+		}
 	}
 
+	commitSide := make([]int64, 0, len(generations)+1)
+	for generationID := commitRoot; generationID > 0; {
+		if _, duplicate := seen[generationID]; duplicate {
+			return nil, 0, NewViewError(CodeViewBuilding,
+				fmt.Sprintf("generation ancestry contains a cycle at %d", generationID))
+		}
+		if len(commitSide) >= MaxGenerationAncestryDepth {
+			return nil, 0, newAncestryTooDeep(commitRoot, generationID, len(commitSide)+1)
+		}
+		seen[generationID] = struct{}{}
+		row, err := m.servableGeneration(ctx, generationID)
+		if err != nil {
+			return nil, 0, err
+		}
+		commitSide = append(commitSide, generationID)
+		generationID = row.BaseGenerationID
+	}
+	slices.Reverse(commitSide)
+	commitIndex := len(commitSide) - 1
+
+	ancestry := make([]int64, 0, len(commitSide)+len(refChain)+len(generations))
+	ancestry = append(ancestry, commitSide...)
+	if len(refChain) > 0 {
+		return append(ancestry, refChain...), commitIndex, nil
+	}
 	lower := generations[0]
 	for _, generationID := range generations[1:] {
+		chain, _, err := m.dirtyChain(ctx, generationID, lower, seen)
+		if err != nil {
+			return nil, 0, err
+		}
+		ancestry = append(ancestry, chain...)
+		lower = generationID
+	}
+	return ancestry, commitIndex, nil
+}
+
+// dirtyChain walks one working-tree chain down from top and returns it oldest
+// first, ending with top, plus the generation it stands on.
+//
+// With lower > 0 the walk must reach exactly lower (the routed generation
+// beneath top) within MaxDirtyChainDepth generations; lower itself is not part
+// of the chain. With lower == 0 the chain's root is discovered instead: the
+// walk stops at the first generation that is not a dirty generation, or that
+// stands on generation zero, and returns that generation as the root without
+// including it. Every generation the chain includes is marked in seen.
+//
+// A routed generation sitting directly on lower is accepted exactly as it
+// always was, with no identity check; the checks apply only to a generation
+// reached as a chain parent and to the routed top that names one.
+func (m *Materializer) dirtyChain(ctx context.Context, top, lower int64, seen map[int64]struct{}) ([]int64, int64, error) {
+	var (
+		chain []int64
+		head  store_sqlite.ViewGeneration
+	)
+	for generationID := top; ; {
 		if _, duplicate := seen[generationID]; duplicate {
-			return nil, NewViewError(CodeViewBuilding,
+			return nil, 0, NewViewError(CodeViewBuilding,
 				fmt.Sprintf("generation ancestry contains a cycle at %d", generationID))
 		}
 		row, err := m.servableGeneration(ctx, generationID)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		if row.BaseGenerationID != lower {
-			return nil, NewViewError(CodeViewBuilding, fmt.Sprintf(
-				"generation %d sits on %d, want %d", generationID, row.BaseGenerationID, lower))
+		if lower == 0 && len(chain) > 0 && (row.GenerationKind != dirtyGenerationKind || row.BaseGenerationID <= 0) {
+			slices.Reverse(chain)
+			return chain, generationID, nil
+		}
+		if len(chain) >= MaxDirtyChainDepth {
+			return nil, 0, newDirtyChainTooDeep(top, generationID, len(chain)+1)
+		}
+		if len(chain) == 0 {
+			head = row
+		} else if err := sameDirtyChain(head, row); err != nil {
+			return nil, 0, err
 		}
 		seen[generationID] = struct{}{}
-		ancestry = append(ancestry, generationID)
-		lower = generationID
+		chain = append(chain, generationID)
+
+		next := row.BaseGenerationID
+		switch {
+		case lower > 0 && next == lower:
+			slices.Reverse(chain)
+			return chain, lower, nil
+		case lower > 0 && next <= 0:
+			return nil, 0, NewViewError(CodeViewBuilding, fmt.Sprintf(
+				"generation %d sits on a chain that ends at %d, want %d", top, generationID, lower))
+		case lower == 0 && next <= 0:
+			// Only reachable for top itself: a dirty generation standing
+			// directly on the corpus is its own root, which the commit-side
+			// walk then visits.
+			delete(seen, generationID)
+			return nil, generationID, nil
+		}
+		if len(chain) == 1 && head.GenerationKind != dirtyGenerationKind {
+			return nil, 0, NewViewError(CodeViewBuilding, fmt.Sprintf(
+				"generation %d sits on %d, want %d", top, next, lower))
+		}
+		generationID = next
 	}
-	return ancestry, nil
+}
+
+// sameDirtyChain refuses a chain parent that does not belong to the chain it
+// was reached from: it must be a working-tree generation of the same checkout,
+// layer and graph, built under the same extraction, resolution and dependency
+// policy. A chain spliced across checkouts or policies would compose payload
+// no build of this checkout ever derived.
+func sameDirtyChain(head, parent store_sqlite.ViewGeneration) error {
+	mismatch := ""
+	switch {
+	case parent.GenerationKind != dirtyGenerationKind:
+		mismatch = "kind " + parent.GenerationKind
+	case parent.OwnerKind != head.OwnerKind:
+		mismatch = "owner " + parent.OwnerKind
+	case parent.CheckoutID != head.CheckoutID:
+		mismatch = "checkout " + parent.CheckoutID
+	case parent.LayerID != head.LayerID:
+		mismatch = "layer " + parent.LayerID
+	case parent.GraphID != head.GraphID:
+		mismatch = "graph " + parent.GraphID
+	case parent.ConfigHash != head.ConfigHash:
+		mismatch = "config hash"
+	case parent.ExtractorVersions != head.ExtractorVersions:
+		mismatch = "extractor versions"
+	case parent.ResolverVersion != head.ResolverVersion:
+		mismatch = "resolver version"
+	case parent.DependencyRevision != head.DependencyRevision:
+		mismatch = "dependency revision"
+	default:
+		return nil
+	}
+	return NewViewError(CodeViewBuilding, fmt.Sprintf(
+		"dirty generation %d names parent %d from a foreign chain (%s)",
+		head.GenerationID, parent.GenerationID, mismatch))
 }
 
 // MaterializeRefView builds the view one ref-view generation serves.
@@ -472,7 +914,11 @@ func (m *Materializer) repoPrefix(ctx context.Context, graphID string) (string, 
 // The routed commit generation remains the identity base. Its physical
 // BaseGenerationID ancestry is a storage concern: the oldest nonzero ancestor
 // is a flat dedicated corpus, any descendants compose above it, and all of them
-// are exposed and leased as generation sources.
+// are exposed and leased as generation sources. A routed working-tree
+// generation's own dirty parents are storage too: they compose into the base
+// reader exactly like commit-side ancestry, and only the routed generation
+// itself becomes a LayerDirty layer, so the view's identity and layer count do
+// not depend on how deep the chain beneath it is.
 func (m *Materializer) assemble(
 	ctx context.Context,
 	graphID string,
@@ -480,13 +926,16 @@ func (m *Materializer) assemble(
 	generations []int64,
 	lease *Lease,
 ) (*RepoView, error) {
-	ancestry, err := m.generationAncestry(ctx, generations)
+	ancestry, commitIndex, err := m.generationAncestry(ctx, generations)
 	if err != nil {
 		return nil, err
 	}
-	routedStart := len(ancestry) - len(generations)
-	if routedStart < 0 {
+	if commitIndex < 0 || len(ancestry)-commitIndex < len(generations) {
 		return nil, NewViewError(CodeViewBuilding, "generation ancestry is incomplete")
+	}
+	routedLayer := make(map[int64]struct{}, len(generations))
+	for _, generationID := range generations[1:] {
+		routedLayer[generationID] = struct{}{}
 	}
 
 	handles := make([]*store_sqlite.Store, 0, len(ancestry))
@@ -504,33 +953,49 @@ func (m *Materializer) assemble(
 		return handle, layer, row, openErr
 	}
 
-	var base graph.Reader = m.Store.AtGeneration(0)
-	firstOverlay := 0
-	if routedStart > 0 {
-		handle, _, _, err := open(ancestry[0])
-		if err != nil {
-			return nil, err
-		}
-		base = handle
-		firstOverlay = 1
+	firstHandle, firstLayer, firstRow, err := open(ancestry[0])
+	if err != nil {
+		return nil, err
 	}
-	for index := firstOverlay; index <= routedStart; index++ {
-		_, layer, _, err := open(ancestry[index])
-		if err != nil {
+	if firstRow.GenerationKind == "dedicated" {
+		binding, found, bindingErr := m.Catalog.GetDedicatedGraph(ctx, graphID)
+		if bindingErr != nil {
+			return nil, WrapViewError(CodeCheckoutInaccessible, "read dedicated root graph "+graphID, bindingErr)
+		}
+		if !found {
+			return nil, NewViewError(CodeViewBuilding, "dedicated root graph is not in the catalog")
+		}
+		if err := validateDedicatedFullRoot(firstRow, binding, graphID, repoPrefix); err != nil {
 			return nil, err
 		}
-		base = graph.NewOverlaidViewWithLayer(base, layer)
+	}
+	var base graph.Reader
+	if commitIndex > 0 || firstRow.GenerationKind == "dedicated" {
+		base = firstHandle
+	} else {
+		base = graph.NewOverlaidViewWithLayer(m.Store.AtGeneration(0), firstLayer)
 	}
 
 	var (
 		layers    []graph.OverlayLayerReader
 		layerRefs []LayerRef
 	)
-	for index := routedStart + 1; index < len(ancestry); index++ {
+	for index := 1; index < len(ancestry); index++ {
 		generationID := ancestry[index]
 		_, layer, row, err := open(generationID)
 		if err != nil {
 			return nil, err
+		}
+		if _, routed := routedLayer[generationID]; !routed || index <= commitIndex {
+			// Commit-side ancestry and working-tree chain parents compose
+			// into the base. A chain parent above a routed layer would have
+			// to sit between two layers, which no route can name.
+			if len(layers) > 0 {
+				return nil, NewViewError(CodeViewBuilding, fmt.Sprintf(
+					"generation %d is a chain parent above a routed layer", generationID))
+			}
+			base = graph.NewOverlaidViewWithLayer(base, layer)
+			continue
 		}
 		ref, err := dirtyLayerRef(row)
 		if err != nil {
@@ -570,10 +1035,18 @@ func (m *Materializer) openGeneration(ctx context.Context, generationID int64) (
 ) {
 	row, err := m.servableGeneration(ctx, generationID)
 	if err != nil {
+		// A generation that stopped being servable must not keep its masks
+		// cached; the refusal above is what every later open sees first.
+		m.ForgetGeneration(generationID)
 		return nil, nil, row, err
 	}
 	handle := m.Store.AtGeneration(generationID)
-	layer, err := NewGenerationLayer(handle)
+	var layer *GenerationLayer
+	if newLayer := m.newGenerationLayer; newLayer != nil {
+		layer, err = newLayer(ctx, handle)
+	} else {
+		layer, err = m.layerCacheFor().open(ctx, layerCacheKeyFor(m.Store, generationID, row), handle, NewGenerationLayerContext)
+	}
 	if err != nil {
 		return nil, nil, row, WrapViewError(CodeCheckoutInaccessible,
 			fmt.Sprintf("open generation %d", generationID), err)
@@ -648,27 +1121,89 @@ func dirtyLayerRef(row store_sqlite.ViewGeneration) (LayerRef, error) {
 // than recorded: producer names are a build-side vocabulary and the ones
 // that do not correspond to something a caller can require are build
 // stages, not answers a view offers.
+//
+// CapSearchText is the one capability the union is the wrong rule for.
+// generations is bottom first — assemble opens the ancestry in order and
+// appends the routed layers last — so the final handle is the view's top
+// layer, and for text search that top layer's declaration is the whole
+// answer:
+//
+// Text search is not answered out of the generations at all. A trigram index
+// is built from bytes on a checkout root (indexer/checkout_text_search.go,
+// trigram.Build(c.root, paths)), so what decides whether a search over that
+// root describes this view is whether the view's TOP layer is the working
+// copy the root holds. A working-tree layer is those bytes by construction; a
+// commit layer, a dedicated base and a ref-view generation each name a
+// committed tree that the root is free to have moved on from.
+//
+// Both halves of the union are wrong here, in opposite directions:
+//
+//   - Worst-casing would let a layer BELOW the working-tree layer withdraw a
+//     capability the live checkout answers exactly. That is why the producers
+//     under a working copy declare nothing at all (indexer/builder_generation.go,
+//     textSearchProducer) — and it is also why silence cannot be read as
+//     "inherited" here.
+//   - Seeding every capability at StateComplete and only ever worsting means a
+//     stack whose every layer stays silent contributes Complete. A directly
+//     selected committed identity — a ref view, a dedicated base with no dirty
+//     layer over it, a checkout whose working-tree slot is withdrawn — would
+//     then claim whole text search while the only searcher that could answer
+//     runs over a root that is not that snapshot.
+//
+// So the top layer's declaration is authoritative, and its silence is a
+// denial rather than an inheritance: StateUnavailable, which is what
+// Completeness.State already reports for a capability nothing declared.
 func (m *Materializer) completeness(generations []*store_sqlite.Store) (Completeness, error) {
 	known := KnownCapabilities()
 	out := make(Completeness, len(known))
 	for _, id := range known {
 		out[id] = StateComplete
 	}
-	for _, handle := range generations {
+	topText := StateUnavailable
+	stack := make([]producerLayer, len(generations))
+	for index, handle := range generations {
 		rows, err := handle.ProducerStates()
 		if err != nil {
 			return nil, WrapViewError(CodeCheckoutInaccessible,
 				fmt.Sprintf("read producer states of generation %d", handle.ViewGeneration()), err)
 		}
-		for _, row := range rows {
+		stack[index].rows = rows
+	}
+	for index, handle := range generations {
+		top := index == len(generations)-1
+		for _, row := range stack[index].rows {
 			id := CapabilityID(row.Producer)
 			state := capabilityStateOf(row.State)
 			if !id.Valid() || !state.Valid() {
 				continue
 			}
+			if id == CapSearchText {
+				if top {
+					topText = state
+				}
+				continue
+			}
+			if row.State == store_sqlite.ProducerStateIncomplete && row.Reason == ReasonDeferredToFollowup {
+				satisfied, err := followupSatisfied(generations, stack, index, id)
+				if err != nil {
+					return nil, WrapViewError(CodeCheckoutInaccessible,
+						fmt.Sprintf("read file masks of generation %d", handle.ViewGeneration()), err)
+				}
+				if satisfied {
+					continue
+				}
+			}
 			out[id] = out[id].worst(state)
 		}
 	}
+	// Unconditional, deliberately. An empty stack has no top layer to read a
+	// declaration off, and "no layer declared it" is exactly the denial this
+	// rule exists to report — letting the seeded StateComplete stand there
+	// would reinstate the false positive at the one moment there is not even a
+	// generation to blame for it. generationAncestry refuses an empty
+	// generation list before this is reached today, so the invariant costs
+	// nothing; it also stops depending on that distant precondition.
+	out[CapSearchText] = topText
 	return out, nil
 }
 
@@ -691,4 +1226,81 @@ func capabilityStateOf(state store_sqlite.ProducerState) CapabilityState {
 	default:
 		return CapabilityState("")
 	}
+}
+
+// producerLayer is one generation of a materialized stack as completeness
+// reads it: its producer rows, and (read on demand) the paths its file masks
+// cover.
+type producerLayer struct {
+	rows    []store_sqlite.ProducerCompleteness
+	covered map[string]struct{}
+	deleted map[string]struct{}
+	read    bool
+}
+
+func (l *producerLayer) coveredPaths(handle *store_sqlite.Store) (map[string]struct{}, error) {
+	if l.read {
+		return l.covered, nil
+	}
+	masks, err := handle.FileMasks()
+	if err != nil {
+		return nil, err
+	}
+	l.covered = make(map[string]struct{}, len(masks))
+	l.deleted = make(map[string]struct{})
+	for _, m := range masks {
+		if m.Mode == store_sqlite.OwnershipDelete {
+			l.deleted[m.FilePath] = struct{}{}
+			continue
+		}
+		l.covered[m.FilePath] = struct{}{}
+	}
+	l.read = true
+	return l.covered, nil
+}
+
+// followupSatisfied is the landing rule for data left behind to the
+// post-publication follow-up. A generation that recorded a producer
+// incomplete with ReasonDeferredToFollowup is satisfied, for this view, when
+// generations above it in the same stack that record the producer complete
+// cover every path it replaces (its deletions owe nothing; a path removed
+// above owes nothing either). Nothing sealed is rewritten: a view whose stack
+// lacks the follow-up's layer still reads incomplete, and an older binary,
+// which does not apply this rule, reads incomplete too (the cautious side).
+func followupSatisfied(generations []*store_sqlite.Store, stack []producerLayer, index int, id CapabilityID) (bool, error) {
+	owed, err := stack[index].coveredPaths(generations[index])
+	if err != nil {
+		return false, err
+	}
+	remaining := make(map[string]struct{}, len(owed))
+	for p := range owed {
+		remaining[p] = struct{}{}
+	}
+	for j := index + 1; j < len(generations) && len(remaining) > 0; j++ {
+		if _, err := stack[j].coveredPaths(generations[j]); err != nil {
+			return false, err
+		}
+		for p := range stack[j].deleted {
+			// A file removed above owes nothing.
+			delete(remaining, p)
+		}
+		complete := false
+		for _, row := range stack[j].rows {
+			if CapabilityID(row.Producer) == id && row.State == store_sqlite.ProducerStateComplete {
+				complete = true
+				break
+			}
+		}
+		if !complete {
+			continue
+		}
+		covered, err := stack[j].coveredPaths(generations[j])
+		if err != nil {
+			return false, err
+		}
+		for p := range covered {
+			delete(remaining, p)
+		}
+	}
+	return len(remaining) == 0, nil
 }

@@ -16,14 +16,15 @@ concurrency:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
-    # The suite runs ~30m on the ubuntu runners and slower on macos, so the
-    # per-step budget needs headroom; this job-level cap still bounds a hang.
+    # Give the largest packages three exhaustive top-level test shards so
+    # race/coverage runs fit within the existing package and job time limits.
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         go-version: ['1.27']
+        partition: [remaining, store-0, store-1, store-2, indexer-0, indexer-1, indexer-2, mcp]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -34,24 +35,31 @@ jobs:
       - name: Build
         run: go build -o gortex ./cmd/gortex/
 
+      # Derive each platform's compiled census; assign every top-level case once.
+      # Linux and macOS retain race/coverage checks; Windows retains its
+      # normal verbose run, whose per-test timings expose slow fixtures.
       - name: Test
-        if: matrix.os != 'windows-latest'
-        run: go test -race -timeout=45m -coverprofile=coverage.out ./...
+        shell: bash
+        env:
+          TEST_PARTITION: ${{ matrix.partition }}
+          TEST_WINDOWS: ${{ matrix.os == 'windows-latest' }}
+        run: |
+          if [[ "$TEST_WINDOWS" == true ]]; then
+            python - <<'PY_WINDOWS_TESTS'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
 
-      # The Windows shard checks the platform contract, not the race
-      # contract: the race detector multiplies runtime several times over and
-      # the windows runners are already the slowest of the three, so the two
-      # together overran the job cap before the suite finished. Linux and
-      # macOS keep -race, which is where a data race would surface anyway.
-      # -v is temporary: per-test timings are how we find which packages hang
-      # here, and it comes out once the shard is reliably green.
-      # It writes no coverage profile either: nothing uploads one from this
-      # shard, and the runner's default PowerShell tokenises
-      # -coverprofile=coverage.out into an extra ".out" package argument, so
-      # the job failed on an unresolvable package before any test ran.
-      - name: Test (windows, no race detector)
-        if: matrix.os == 'windows-latest'
-        run: go test -v -timeout=45m ./...
+          scratch = Path(os.environ["RUNNER_TEMP"]) / "gortex-storage-tests"
+          scratch.mkdir(parents=True, exist_ok=True)
+          os.environ["GOTMPDIR"] = str(scratch)
+          print("Windows test GOTMPDIR:", scratch, flush=True)
+          sys.exit(subprocess.call([sys.executable, "scripts/ci-test-partition.py"]))
+          PY_WINDOWS_TESTS
+          else
+            python3 scripts/ci-test-partition.py
+          fi
 
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.27'

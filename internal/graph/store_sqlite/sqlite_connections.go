@@ -1,14 +1,18 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+
+	sqlite "modernc.org/sqlite"
 )
 
 // modernc applies every _pragma entry when each physical connection opens.
@@ -54,30 +58,154 @@ func sqlitePerConnectionPragmas() string {
 	return fmt.Sprintf("%s&_pragma=mmap_size(%d)", sqlitePerConnectionPragmasBase, sqliteMmapBytes())
 }
 
-// sqliteWALAutoCheckpointPages spaces WAL auto-checkpoints at 8k pages
-// (~32 MiB). The SQLite default of 1000 pages (~4 MB) forces a checkpoint —
-// frames copied into the main file plus an mmap-view flush — every few MB of
-// a scattered write burst, so index-write bursts spend a measurable share of
-// their time in flush calls rather than row writes. Wider spacing is NOT
-// free, though: pages resident in a large WAL are served to readers by
-// wal-index probe + pread instead of the main file's mmap, and the deferred
-// frames come due as one big drain — at 100k pages the three-phase seeded
-// bench shows read-back +46% and a 330 ms drain, a net production loss.
-// 8k pages keeps the write-side win (~12%) with flat read-back and
-// negligible drain. journal_size_limit still truncates the WAL after every
-// checkpoint; the indexer checkpoints TRUNCATE at the end of each global
-// batch, at Compact and at Close. Readers never append to the WAL, so only
-// the writer DSN carries the override.
-const sqliteWALAutoCheckpointPages = 8000
+// defaultSQLiteWALAutoCheckpointPages is the application-owned WAL pressure
+// line: 8k 4-KiB pages is about 32 MiB. SQLite's commit hook is deliberately
+// disabled on every writer connection because it charges an unbounded WAL copy
+// to whichever graph or catalog transaction happens to cross the line. The
+// checkpoint loop polls the WAL file cheaply and runs the existing bounded
+// PASSIVE attempt in the background once this line is exceeded; generation
+// finalization additionally schedules its bounded TRUNCATE drain.
+//
+// Wider spacing is not free: WAL-resident pages bypass the main-file mmap and
+// make the eventual drain larger. The historical three-phase seeded benchmark
+// found 8k pages kept the write-side win (~12%) with flat read-back, while 100k
+// pages regressed read-back by 46%. journal_size_limit still truncates the file
+// after a successful checkpoint.
+const defaultSQLiteWALAutoCheckpointPages = 8000
+
+// sqliteWALAutoCheckpointPages resolves the application pressure line.
+// GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES overrides the 8,000-page default;
+// zero disables pressure-triggered attempts while leaving the ordinary
+// periodic/final checkpoints intact. Unparseable or negative input fails open
+// to the default. The historical name and environment variable are retained
+// so existing measurements keep selecting the same boundary.
+func sqliteWALAutoCheckpointPages() int {
+	raw := strings.TrimSpace(os.Getenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES"))
+	if raw == "" {
+		return defaultSQLiteWALAutoCheckpointPages
+	}
+	pages, err := strconv.Atoi(raw)
+	if err != nil || pages < 0 {
+		return defaultSQLiteWALAutoCheckpointPages
+	}
+	return pages
+}
 
 func sqliteWriterDSN(path string) string {
 	// IMMEDIATE reserves the single SQLite writer at BEGIN. It avoids the
 	// un-retryable DEFERRED read-to-write promotion/BUSY_SNAPSHOT class.
+	// wal_autocheckpoint stays off on every replacement physical connection;
+	// the bounded checkpoint loop owns WAL copying outside commit latency.
 	params := sqliteBusyPragma + "&_pragma=journal_mode(WAL)&" +
 		sqlitePerConnectionPragmas() + "&_pragma=journal_size_limit(67108864)" +
-		fmt.Sprintf("&_pragma=wal_autocheckpoint(%d)", sqliteWALAutoCheckpointPages) +
-		"&_txlock=immediate"
+		"&_pragma=wal_autocheckpoint(0)&_txlock=immediate"
 	return sqliteDSN(path, params)
+}
+
+type sqliteWALFileState struct {
+	size         int64
+	modTimeNanos int64
+}
+
+func readSQLiteWALFileState(path string) (sqliteWALFileState, bool, error) {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return sqliteWALFileState{}, false, nil
+	}
+	if err != nil {
+		return sqliteWALFileState{}, false, err
+	}
+	return sqliteWALFileState{size: info.Size(), modTimeNanos: info.ModTime().UnixNano()}, true, nil
+}
+
+// sqliteWALFallbackPath converts a supported explicit file: URI into the path
+// os.Stat needs when SQLite cannot answer PRAGMA database_list inside the
+// bounded startup budget. A successful probe remains authoritative. Invalid or
+// remote-authority URIs are returned unchanged; Open would reject those before
+// the checkpoint loop starts.
+func sqliteWALFallbackPath(path string) string {
+	if !strings.HasPrefix(path, "file:") {
+		return path
+	}
+	parsed, err := url.Parse(path)
+	if err != nil || parsed.Scheme != "file" || (parsed.Host != "" && parsed.Host != "localhost") {
+		return path
+	}
+	candidate := parsed.Path // url.Parse already decodes an ordinary URI path.
+	if candidate == "" && parsed.Opaque != "" {
+		candidate, err = url.PathUnescape(parsed.Opaque)
+		if err != nil {
+			return path
+		}
+	}
+	if candidate == "" {
+		return path
+	}
+	candidate = filepath.FromSlash(candidate)
+	if os.PathSeparator == '\\' && len(candidate) >= 3 &&
+		(candidate[0] == '\\' || candidate[0] == '/') && candidate[2] == ':' {
+		candidate = candidate[1:]
+	}
+	return candidate
+}
+
+// sqliteWALPressureTarget resolves the real main-database filename (including
+// URI opens) and converts a frame count into the exact WAL byte boundary for
+// the database's actual page size. Both PRAGMA probes share one bounded startup
+// budget so an exhausted read pool cannot keep Store.Close waiting forever.
+// Failed probes retain a conservative 4-KiB page fallback; a stat failure later
+// causes more checkpointing, never less.
+func sqliteWALPressureTarget(db *sql.DB, fallbackPath string, pages int) (string, int64) {
+	path := sqliteWALFallbackPath(fallbackPath)
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if db != nil {
+		ctx, cancel = context.WithTimeout(context.Background(), walPassiveCheckpointTimeout)
+		defer cancel()
+		rows, err := db.QueryContext(ctx, `PRAGMA database_list`)
+		if err == nil {
+			mainFile := ""
+			for rows.Next() {
+				var seq int
+				var name, file string
+				if err := rows.Scan(&seq, &name, &file); err == nil && name == "main" && file != "" {
+					mainFile = file
+					break
+				}
+			}
+			// A failed iteration keeps the fallback path rather than trusting a
+			// partially read database list.
+			if rows.Err() == nil && mainFile != "" {
+				path = mainFile
+			}
+			_ = rows.Close()
+		}
+	}
+	// SQLite's Windows VFS may preserve a drive path's 8.3 spelling in
+	// database_list. Resolve the existing parent so WAL pressure/reclaim use
+	// the same physical path as an ordinary long-name open of that database.
+	if runtime.GOOS == "windows" {
+		if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+			path = filepath.Join(dir, filepath.Base(path))
+		}
+	}
+	if pages <= 0 {
+		return path + "-wal", 0
+	}
+	pageSize := int64(4096)
+	if db != nil {
+		var observed int64
+		if err := db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&observed); err == nil && observed > 0 {
+			pageSize = observed
+		}
+	}
+	const walHeaderBytes int64 = 32
+	frameBytes := pageSize + 24
+	maxInt64 := int64(^uint64(0) >> 1)
+	if int64(pages) > (maxInt64-walHeaderBytes)/frameBytes {
+		return path + "-wal", maxInt64
+	}
+	return path + "-wal", walHeaderBytes + int64(pages)*frameBytes
 }
 
 func sqliteReaderDSN(path string) string {
@@ -90,7 +218,7 @@ func sqliteReaderDSN(path string) string {
 func sqliteDSN(path, rawQuery string) string {
 	// Preserve explicit URI and in-memory callers. Their existing query string
 	// may carry cache=shared/mode=memory, so append rather than replace it.
-	if isMemoryPath(path) || strings.HasPrefix(path, "file:") {
+	if path == ":memory:" || strings.HasPrefix(path, "file:") {
 		separator := "?"
 		if strings.Contains(path, "?") {
 			separator = "&"
@@ -122,10 +250,24 @@ func configureWriterPool(db *sql.DB) {
 	db.SetMaxIdleConns(1)
 }
 
-func openSQLiteReadPool(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", sqliteReaderDSN(path))
-	if err != nil {
-		return nil, err
+// openSQLiteReadPool opens the bounded read pool. When gate is non-nil every
+// physical connection is wrapped so the start of each read passes through it
+// (see sqliteReadGate); the WAL reclaim closes that gate for a bounded moment
+// so a TRUNCATE checkpoint can reset a log no pool reader is holding.
+func openSQLiteReadPool(path string, gate *sqliteReadGate) (*sql.DB, error) {
+	var db *sql.DB
+	if gate == nil {
+		opened, err := sql.Open("sqlite", sqliteReaderDSN(path))
+		if err != nil {
+			return nil, err
+		}
+		db = opened
+	} else {
+		connector, err := sqlite.NewConnector(sqliteReaderDSN(path))
+		if err != nil {
+			return nil, err
+		}
+		db = sql.OpenDB(gatedConnector{inner: connector, gate: gate})
 	}
 	configureConnectionPool(db)
 	// Force one physical connection now. This catches an invalid/per-connection

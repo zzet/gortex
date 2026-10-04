@@ -2,6 +2,7 @@ package graph
 
 import (
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -417,5 +418,280 @@ func TestMutationReceiptEvictUnmappedImportCandidateKindFailsClosed(t *testing.T
 
 	if receipt.Complete {
 		t.Fatalf("receipt = %+v, want incomplete: the kind is a qualified-name import candidate without an exact stub mapping", receipt)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bounded-derived-pass completeness (FanoutTruncations)
+// ---------------------------------------------------------------------------
+//
+// A bounded derived pass (the incremental affected-by re-resolution) knowingly
+// leaves dependants holding edges and persisted reference facts derived against
+// the pre-mutation shape. Until this axis existed the fact stopped at a Warn
+// line and a hook whose only setters are tests, so nothing a caller, an API or
+// a receipt consumer reads could tell a truncated fan-out from a complete one.
+
+// The receipt a truncating window returns must NAME the hole: which pass, how
+// big the union was, what the cap was, and exactly which files were left stale.
+// A window with no cut must return a receipt that says so by carrying nothing.
+func TestMutationReceiptCarriesBoundedFanoutTruncation(t *testing.T) {
+	g := New()
+
+	token := g.BeginMutationReceipt()
+	g.RecordMutationFanoutTruncation(ReceiptFanoutTruncation{
+		Pass: "affected_by", Cap: 4, Considered: 6,
+		Dropped: 2, DroppedFiles: []string{"src/z.go", "src/y.go"},
+	})
+	receipt := g.EndMutationReceipt(token)
+
+	if receipt.DerivedFanoutComplete() {
+		t.Fatalf("truncated window reports a complete fan-out: %+v", receipt)
+	}
+	if got := receipt.DroppedFanoutFiles(); got != 2 {
+		t.Fatalf("dropped files = %d, want 2 (%+v)", got, receipt.FanoutTruncations)
+	}
+	fact, ok := receipt.FanoutTruncationFor("affected_by")
+	if !ok {
+		t.Fatalf("receipt does not name the affected_by pass: %+v", receipt.FanoutTruncations)
+	}
+	if fact.Cap != 4 || fact.Considered != 6 || fact.Dropped != 2 {
+		t.Fatalf("fact = %+v, want cap 4 / considered 6 / dropped 2", fact)
+	}
+	if want := []string{"src/y.go", "src/z.go"}; !slices.Equal(fact.DroppedFiles, want) {
+		t.Fatalf("dropped files = %v, want %v (sorted)", fact.DroppedFiles, want)
+	}
+
+	// The fan-out axis is additive: it must not void the delta description,
+	// because an incomplete receipt forces the conservative whole-frontier
+	// fallback the bound exists to avoid.
+	if !receipt.Complete || receipt.IncompleteReason != "" {
+		t.Fatalf("a bounded fan-out voided the delta receipt: %+v", receipt)
+	}
+
+	clean := g.BeginMutationReceipt()
+	cleanReceipt := g.EndMutationReceipt(clean)
+	if !cleanReceipt.DerivedFanoutComplete() || len(cleanReceipt.FanoutTruncations) != 0 {
+		t.Fatalf("untruncated window carries a fact: %+v", cleanReceipt.FanoutTruncations)
+	}
+}
+
+// A deferred batch commits in chunks and re-applies the whole-batch bound on
+// every merge, so the SAME file can be rejected by two chunks. Summing the
+// per-cut counts would report it twice and overstate the hole; the receipt
+// merges on the union of names instead.
+func TestMutationReceiptFanoutMergesOnTheUnionNotTheSum(t *testing.T) {
+	g := New()
+	token := g.BeginMutationReceipt()
+	g.RecordMutationFanoutTruncation(ReceiptFanoutTruncation{
+		Pass: "affected_by", Cap: 2, Considered: 4,
+		Dropped: 2, DroppedFiles: []string{"src/c.go", "src/d.go"},
+	})
+	g.RecordMutationFanoutTruncation(ReceiptFanoutTruncation{
+		Pass: "affected_by", Cap: 2, Considered: 6,
+		Dropped: 2, DroppedFiles: []string{"src/d.go", "src/e.go"},
+	})
+	receipt := g.EndMutationReceipt(token)
+
+	if n := len(receipt.FanoutTruncations); n != 1 {
+		t.Fatalf("two cuts by one pass produced %d facts, want 1: %+v", n, receipt.FanoutTruncations)
+	}
+	fact := receipt.FanoutTruncations[0]
+	if want := []string{"src/c.go", "src/d.go", "src/e.go"}; !slices.Equal(fact.DroppedFiles, want) {
+		t.Fatalf("dropped files = %v, want %v", fact.DroppedFiles, want)
+	}
+	if fact.Dropped != 3 {
+		t.Fatalf("dropped = %d, want 3 (the union, not the 2+2 sum)", fact.Dropped)
+	}
+	if fact.Considered != 6 {
+		t.Fatalf("considered = %d, want the largest union the pass saw (6)", fact.Considered)
+	}
+}
+
+// cloneReceiptFanoutTruncations is the detachment primitive, and it is pinned
+// HERE rather than through a receipt pair.
+//
+// The earlier version of this pin mutated one receipt and asserted on another
+// window's receipt — two accumulators that are never aliased to each other
+// under any implementation, so replacing the whole clone with `return facts`
+// left the package green. Calling the primitive directly is the only way to
+// observe the aliasing it prevents: EndMutationReceipt retires an accumulator
+// before receipt() runs, so the live-accumulator alias is unreachable through
+// the public API and a receipt-level test cannot bind.
+//
+// Revert-red: replace the body of cloneReceiptFanoutTruncations with
+// `return facts` and both the slice-identity and the element-slice assertions
+// below fail.
+func TestCloneReceiptFanoutTruncationsDetachesEveryDroppedFileSlice(t *testing.T) {
+	if got := cloneReceiptFanoutTruncations(nil); got != nil {
+		t.Fatalf("clone of nothing = %v, want nil", got)
+	}
+
+	source := []ReceiptFanoutTruncation{{
+		Pass: "affected_by", Cap: 1, Considered: 3, Dropped: 2,
+		DroppedFiles: []string{"src/a.go", "src/b.go"},
+	}}
+	clone := cloneReceiptFanoutTruncations(source)
+
+	if &clone[0] == &source[0] {
+		t.Fatalf("the clone shares the fact array with the accumulator")
+	}
+	if len(clone[0].DroppedFiles) > 0 && &clone[0].DroppedFiles[0] == &source[0].DroppedFiles[0] {
+		t.Fatalf("the clone shares the DroppedFiles array with the accumulator")
+	}
+
+	clone[0].DroppedFiles[0] = "MUTATED"
+	clone[0].Dropped = 99
+	if want := []string{"src/a.go", "src/b.go"}; !slices.Equal(source[0].DroppedFiles, want) {
+		t.Fatalf("accumulator files = %v, want %v — a consumer reached the live accumulator",
+			source[0].DroppedFiles, want)
+	}
+	if source[0].Dropped != 2 {
+		t.Fatalf("accumulator dropped = %d, want 2", source[0].Dropped)
+	}
+}
+
+// The facts a receipt hands out must be detached from the accumulator: a
+// consumer that sorts or appends to DroppedFiles must not be able to reach
+// back into a store that is still serving other windows.
+func TestMutationReceiptFanoutFactsAreDetachedAndScopedToTheirWindow(t *testing.T) {
+	g := New()
+	outer := g.BeginMutationReceipt()
+	g.RecordMutationFanoutTruncation(ReceiptFanoutTruncation{
+		Pass: "affected_by", Cap: 1, Dropped: 1, DroppedFiles: []string{"src/a.go"},
+	})
+	inner := g.BeginMutationReceipt()
+	g.RecordMutationFanoutTruncation(ReceiptFanoutTruncation{
+		Pass: "affected_by", Cap: 1, Dropped: 1, DroppedFiles: []string{"src/b.go"},
+	})
+	outerReceipt := g.EndMutationReceipt(outer)
+
+	// The outer window saw both cuts, the inner only the second.
+	if got := outerReceipt.DroppedFanoutFiles(); got != 2 {
+		t.Fatalf("outer window dropped = %d, want 2: %+v", got, outerReceipt.FanoutTruncations)
+	}
+	outerReceipt.FanoutTruncations[0].DroppedFiles[0] = "MUTATED"
+
+	innerReceipt := g.EndMutationReceipt(inner)
+	if got := innerReceipt.DroppedFanoutFiles(); got != 1 {
+		t.Fatalf("inner window dropped = %d, want 1: %+v", got, innerReceipt.FanoutTruncations)
+	}
+	if want := []string{"src/b.go"}; !slices.Equal(innerReceipt.FanoutTruncations[0].DroppedFiles, want) {
+		t.Fatalf("inner files = %v, want %v — a consumer mutated the accumulator",
+			innerReceipt.FanoutTruncations[0].DroppedFiles, want)
+	}
+
+	// A fact with no window open is discarded, never buffered onto the next.
+	g.RecordMutationFanoutTruncation(ReceiptFanoutTruncation{
+		Pass: "affected_by", Dropped: 1, DroppedFiles: []string{"src/stray.go"},
+	})
+	later := g.EndMutationReceipt(g.BeginMutationReceipt())
+	if !later.DerivedFanoutComplete() {
+		t.Fatalf("a fact recorded with no window open leaked onto a later receipt: %+v", later)
+	}
+}
+
+// receiptOnlyStore bears receipts but cannot carry a fan-out fact — the shape
+// every backend has before it implements the sink.
+type receiptOnlyStore struct{ ended MutationReceipt }
+
+func (s *receiptOnlyStore) BeginMutationReceipt() MutationReceiptToken { return 1 }
+func (s *receiptOnlyStore) EndMutationReceipt(MutationReceiptToken) MutationReceipt {
+	return s.ended
+}
+
+// A cut that reaches no carrier must be REPORTED as uncarried, never silently
+// swallowed: the caller has to be able to say so through its own channel
+// instead of letting a truncated pass read as a complete one.
+func TestNoteMutationFanoutTruncationReportsAMissingCarrier(t *testing.T) {
+	fact := ReceiptFanoutTruncation{Pass: "affected_by", Dropped: 1, DroppedFiles: []string{"src/a.go"}}
+
+	var bare MutationReceiptStore = &receiptOnlyStore{}
+	if ReceiptFanoutCarrier(bare) {
+		t.Fatalf("a store without the sink advertises itself as a carrier")
+	}
+	if got := NoteMutationFanoutTruncation(bare, fact); got != MutationFanoutNoteNoCarrier {
+		t.Fatalf("note on a sinkless store = %v, want MutationFanoutNoteNoCarrier", got)
+	}
+
+	g := New()
+	if !ReceiptFanoutCarrier(g) {
+		t.Fatalf("the in-memory backend does not advertise the sink it implements")
+	}
+	if got := NoteMutationFanoutTruncation(g, fact); got != MutationFanoutNoteRecorded {
+		t.Fatalf("note on a carrier = %v, want MutationFanoutNoteRecorded", got)
+	}
+	// An empty fact is not a fact, and refusing it must NOT read as a missing
+	// carrier: the caller announces "this store drops the fact on the floor"
+	// only on MutationFanoutNoteNoCarrier, so a producer that reports a size
+	// without names must never be able to provoke that message.
+	if got := NoteMutationFanoutTruncation(g, ReceiptFanoutTruncation{Pass: "affected_by"}); got != MutationFanoutNoteEmpty {
+		t.Fatalf("note on an empty cut = %v, want MutationFanoutNoteEmpty", got)
+	}
+	if got := NoteMutationFanoutTruncation(bare, ReceiptFanoutTruncation{Pass: "affected_by"}); got != MutationFanoutNoteEmpty {
+		t.Fatalf("an empty cut on a sinkless store = %v, want MutationFanoutNoteEmpty "+
+			"(nothing to carry is not a carrier gap)", got)
+	}
+	// A count without names is a fact: a producer that knows the size of the
+	// hole but not its members must still reach the carrier.
+	if got := NoteMutationFanoutTruncation(g, ReceiptFanoutTruncation{Pass: "affected_by", Dropped: 4}); got != MutationFanoutNoteRecorded {
+		t.Fatalf("note on a count-only cut = %v, want MutationFanoutNoteRecorded", got)
+	}
+}
+
+// DroppedFanoutFiles answers "how many DISTINCT files did this window leave
+// stale". Two bounded passes over one mutation window routinely reject the
+// same dependant; summing their counts reports it twice — the exact
+// double-count MergeReceiptFanoutTruncation exists to prevent WITHIN a pass.
+//
+// Revert-red: sum fact.Dropped across passes and the shared file is counted
+// twice (5 instead of 4).
+func TestDroppedFanoutFilesUnionsAcrossPasses(t *testing.T) {
+	receipt := MutationReceipt{
+		Complete: true,
+		FanoutTruncations: []ReceiptFanoutTruncation{
+			{Pass: "affected_by", Dropped: 2, DroppedFiles: []string{"src/a.go", "src/shared.go"}},
+			{Pass: "ref_facts", Dropped: 3, DroppedFiles: []string{"src/shared.go", "src/b.go", "src/c.go"}},
+		},
+	}
+	if got := receipt.DroppedFanoutFiles(); got != 4 {
+		t.Fatalf("dropped = %d, want 4 distinct files (a, b, c, shared counted once)", got)
+	}
+	if receipt.DerivedFanoutComplete() {
+		t.Fatalf("a receipt naming two cuts reports a complete fan-out")
+	}
+
+	// A producer that reported a size without names cannot be unioned with
+	// anything, so its count is added whole rather than dropped.
+	countOnly := MutationReceipt{
+		Complete: true,
+		FanoutTruncations: []ReceiptFanoutTruncation{
+			{Pass: "affected_by", Dropped: 2, DroppedFiles: []string{"src/a.go", "src/b.go"}},
+			{Pass: "ref_facts", Dropped: 3},
+		},
+	}
+	if got := countOnly.DroppedFanoutFiles(); got != 5 {
+		t.Fatalf("dropped = %d, want 5 (2 named + 3 unnamed)", got)
+	}
+}
+
+// Concurrent recorders and concurrent windows must not race or lose facts.
+func TestMutationReceiptFanoutRecordingIsConcurrencySafe(t *testing.T) {
+	g := New()
+	token := g.BeginMutationReceipt()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			g.RecordMutationFanoutTruncation(ReceiptFanoutTruncation{
+				Pass: "affected_by", Cap: 1, Considered: 2, Dropped: 1,
+				DroppedFiles: []string{"src/f" + strconv.Itoa(i) + ".go"},
+			})
+		}(i)
+	}
+	wg.Wait()
+	receipt := g.EndMutationReceipt(token)
+	if got := receipt.DroppedFanoutFiles(); got != 8 {
+		t.Fatalf("dropped = %d, want 8 concurrent cuts merged: %+v", got, receipt.FanoutTruncations)
 	}
 }

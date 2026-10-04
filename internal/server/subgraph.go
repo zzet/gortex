@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 // subgraphNodeCap bounds the neighbour ring returned by /v1/subgraph so a
@@ -26,6 +27,10 @@ type SubGraphResponse struct {
 	Nodes []*graph.Node `json:"nodes"`
 	Edges []*graph.Edge `json:"edges"`
 	Stats SubGraphMeta  `json:"stats"`
+	// View is the base-scoped rider; see HealthResponse.View. A hydrating
+	// remote reads it to learn that the ring it just fetched describes the
+	// base corpus, not the checkout its caller is in.
+	View *BaseScopedRider `json:"view,omitempty"`
 }
 
 // SubGraphMeta carries the freshness + truncation metadata the hydrator
@@ -56,6 +61,14 @@ func (h *Handler) handleSubGraph(w http.ResponseWriter, r *http.Request) {
 	if depth > subgraphMaxDepth {
 		depth = subgraphMaxDepth
 	}
+
+	// The BFS below walks the store one hop at a time. Pin the base corpus
+	// for the whole walk so the ring cannot be assembled from two
+	// generations, and so a retirement sweep waits behind this reader
+	// rather than through it.
+	read := h.beginBaseRead(r, "",
+		graphview.CapSyntaxGraph, graphview.CapResolutionLocal, graphview.CapIncomingEdges)
+	defer read.release()
 
 	root := h.graph.GetNode(id)
 	if root == nil {
@@ -133,5 +146,6 @@ func (h *Handler) handleSubGraph(w http.ResponseWriter, r *http.Request) {
 			FetchedAt:     time.Now(),
 			Truncated:     truncated,
 		},
+		View: read.close(),
 	})
 }

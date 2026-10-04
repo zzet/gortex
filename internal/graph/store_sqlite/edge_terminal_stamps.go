@@ -69,7 +69,7 @@ func (s *Store) persistEdgeTerminalStamps(edges []*graph.Edge) (edgeTerminalStam
 
 		invalidatedAnalysis := false
 		if txChanged > 0 && s.analysisGenerationPresent {
-			if err := invalidateAnalysisGenerationTx(tx); err != nil {
+			if err := s.invalidateAnalysisViewTx(tx); err != nil {
 				_ = tx.Rollback()
 				return stats, err
 			}
@@ -80,7 +80,7 @@ func (s *Store) persistEdgeTerminalStamps(edges []*graph.Edge) (edgeTerminalStam
 		}
 		stats.changedRows += txChanged
 		if invalidatedAnalysis {
-			s.analysisGenerationPresent = false
+			s.analysisGenerationPresent = s.analysisLatchRemaining
 		}
 		s.finishAnalysisMutationLocked(txChanged > 0)
 	}

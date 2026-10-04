@@ -58,7 +58,9 @@ func TestReachabilityProjectionReusesStableCallerAcrossPages(t *testing.T) {
 
 	for page := 0; page < 2; page++ {
 		sources := indexes.prepare(pending)
-		r.warmLookupCacheWithSources(pending, sources)
+		if err := r.warmLookupCacheWithSources(t.Context(), pending, sources); err != nil {
+			t.Fatal(err)
+		}
 		if _, ok := r.reachableDirsByFile["repo/caller.go"]["dep"]; !ok {
 			t.Fatalf("page %d missing projected dependency directory", page)
 		}
@@ -133,12 +135,16 @@ func TestReachabilityProjectionRefreshInvalidatesPassCache(t *testing.T) {
 	_, store, r, indexes, pending := newReachabilityProjectionFixture(t)
 
 	sources := indexes.prepare(pending)
-	r.warmLookupCacheWithSources(pending, sources)
+	if err := r.warmLookupCacheWithSources(t.Context(), pending, sources); err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := r.reachableDirsByFile["repo/caller.go"]["dep"]; !ok {
 		t.Fatal("initial projection missing dep")
 	}
 	store.projected["repo/caller.go"] = []string{"dep2/two.go"}
-	if !indexes.refreshAfterInterleave(pending, true) {
+	if refreshed, err := indexes.refreshAfterInterleave(t.Context(), pending, true); err != nil {
+		t.Fatal(err)
+	} else if !refreshed {
 		t.Fatal("forced refresh did not rebuild page indexes")
 	}
 	if store.projectionCalls != 2 {

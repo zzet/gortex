@@ -250,10 +250,12 @@ func newSessionLocal(id string, persistent *savings.Store, repoPath string, pare
 // automatically. Updating it via setPersistent propagates to every
 // existing entry as well.
 type sessionMap struct {
-	mu         sync.Mutex
-	sessions   map[string]*sessionLocal
-	persistent *savings.Store
-	repoPath   string
+	mu                 sync.Mutex
+	symbolPagesClosed  bool
+	retiredSymbolPages []*symbolPageCache
+	sessions           map[string]*sessionLocal
+	persistent         *savings.Store
+	repoPath           string
 	// parent is the process-wide tokenStats aggregate. Each per-session
 	// counter created by get() inherits it as its parent so record()
 	// calls fan out to the daemon-wide totals.
@@ -289,6 +291,9 @@ func (m *sessionMap) get(id string) *sessionLocal {
 	sl, ok := m.sessions[id]
 	if !ok {
 		sl = newSessionLocal(id, m.persistent, m.repoPath, m.parent)
+		if m.symbolPagesClosed {
+			sl.session.symbolPages = &symbolPageCache{closed: true, entries: make(map[string]*symbolPageSequence)}
+		}
 		m.sessions[id] = sl
 	}
 	return sl
@@ -298,8 +303,28 @@ func (m *sessionMap) get(id string) *sessionLocal {
 // accept loop sees a proxy disconnect.
 func (m *sessionMap) release(id string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Finished removed owners are pruned without retaining session IDs or
+	// changing the live-session inventory. Active closed caches are joined by
+	// terminal teardown, including HTTP session expiry while a call is active.
+	kept := m.retiredSymbolPages[:0]
+	for _, cache := range m.retiredSymbolPages {
+		if cache.hasCalls() {
+			kept = append(kept, cache)
+		}
+	}
+	clear(m.retiredSymbolPages[len(kept):])
+	m.retiredSymbolPages = kept
+	finish := func() {}
+	if local := m.sessions[id]; local != nil {
+		cache := symbolSessionPages(local.session)
+		finish = cache.beginClose()
+		if cache.hasCalls() {
+			m.retiredSymbolPages = append(m.retiredSymbolPages, cache)
+		}
+	}
 	delete(m.sessions, id)
+	m.mu.Unlock()
+	finish()
 }
 
 // snapshotSessions returns every live session's state. The map lock is

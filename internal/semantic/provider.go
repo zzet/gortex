@@ -185,6 +185,10 @@ type EnrichResult struct {
 	// hover types and hierarchy edges are absent. DegradedReason carries why.
 	Degraded       bool   `json:"degraded,omitempty"`
 	DegradedReason string `json:"degraded_reason,omitempty"`
+	// Compiler is the compiler-context work of a go/packages-backed pass:
+	// loads, type-checked packages and compiled files, and the load scope.
+	// nil when the provider reports none.
+	Compiler *CompilerLoadStats `json:"compiler,omitempty"`
 }
 
 // Bounding reasons for the enrichment add-phase (EnrichResult.BoundReason /

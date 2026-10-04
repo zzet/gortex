@@ -157,6 +157,9 @@ func TestFindEdgesByIdentitiesSQLiteBoundsRetainedArgumentBytes(t *testing.T) {
 }
 
 func TestFindEdgesByIdentitiesSQLiteAdaptsToConnectionVariableLimit(t *testing.T) {
+	// sqlite.Limit type-asserts the bare driver connection via Raw, so this
+	// case opens the read pool without the WAL-reclaim read gate wrapper.
+	t.Setenv("GORTEX_SQLITE_READ_GATE", "off")
 	store := openReindexReceiptTestStore(t)
 	store.db.SetMaxOpenConns(1)
 	store.db.SetMaxIdleConns(1)

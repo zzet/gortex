@@ -78,7 +78,7 @@ func (s *Store) markEdgesCrossRepo(edges []*graph.Edge) (changed, statements int
 
 		invalidatedAnalysis := false
 		if txChanged > 0 && s.analysisGenerationPresent {
-			if invalidateErr := invalidateAnalysisGenerationTx(tx); invalidateErr != nil {
+			if invalidateErr := s.invalidateAnalysisViewTx(tx); invalidateErr != nil {
 				_ = tx.Rollback()
 				return changed, statements, invalidateErr
 			}
@@ -89,7 +89,7 @@ func (s *Store) markEdgesCrossRepo(edges []*graph.Edge) (changed, statements int
 		}
 		changed += txChanged
 		if invalidatedAnalysis {
-			s.analysisGenerationPresent = false
+			s.analysisGenerationPresent = s.analysisLatchRemaining
 		}
 		s.finishAnalysisMutationLocked(txChanged > 0)
 	}

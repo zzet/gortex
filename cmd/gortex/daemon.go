@@ -108,6 +108,20 @@ var daemonReloadCmd = &cobra.Command{
 // counters and into a full recount. See the flag help for the cost.
 var daemonStatusExact bool
 
+// daemonStatusFormat selects the one-shot renderer.
+//
+// The text tables are written for a person and are free to drop, round and
+// re-shape what the payload carries. `--format json` is the other contract:
+// the StatusResponse exactly as the daemon sent it, which is what a
+// measurement harness or a script has to read — the view-lifecycle counters in
+// particular are a map of series keys that no table can render without
+// choosing which ones matter.
+var daemonStatusFormat string
+
+// daemonStatusFormats is the accepted vocabulary, listed once so the flag help
+// and the validation cannot drift.
+var daemonStatusFormats = []string{"text", "json"}
+
 var daemonStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show daemon PID, uptime, tracked repos, memory, sessions",
@@ -165,6 +179,9 @@ func init() {
 		"continuously refresh the status until interrupted (alt-screen buffer)")
 	daemonStatusCmd.Flags().DurationVar(&daemonStatusInterval, "interval", 2*time.Second,
 		"refresh interval in --watch mode (clamped to >=200ms)")
+	daemonStatusCmd.Flags().StringVar(&daemonStatusFormat, "format", "text",
+		"output format: text (human tables) or json (the raw status payload, including the "+
+			"view-lifecycle counters). Not available with --watch")
 
 	daemonCmd.AddCommand(daemonStartCmd)
 	daemonCmd.AddCommand(daemonStopCmd)
@@ -277,6 +294,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// reading a route and serving a published generation never consult it.
 	viewBuilds := indexer.NewViewBuildGate()
 	state.lifecycle.SetBuildGate(viewBuilds)
+	installBuildLaneBusy(state.graph, viewBuilds)
 
 	controller := &realController{
 		graph:         state.graph,
@@ -284,6 +302,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		multiIndexer:  state.multiIndexer,
 		configManager: state.configManager,
 		lifecycle:     state.lifecycle,
+		buildGate:     viewBuilds,
 		logger:        logger,
 	}
 	if state.mcpServer != nil {
@@ -306,7 +325,29 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// final WAL checkpoint entirely. Both paths now run the same
 	// once-guarded func, and the deferred call covers whichever exit
 	// actually happens.
-	runTeardown := installDaemonTeardown(controller, controller.StopWatcher, func() error {
+	var retirementWorker *deferredRetirementWorker
+	if state.lifecycle != nil {
+		retirementWorker = startDeferredRetirementWorker(
+			state.lifecycle.SweepDeferredRetirements, logger)
+		lifecycle := state.lifecycle
+		// Stacks the startup correction will change are warmed after it,
+		// not before (their caches would be orphaned).
+		lifecycle.DeferPrewarmsUntilCorrected(context.Background())
+		retirementWorker.SetAfterReady(func(ctx context.Context) {
+			if _, err := lifecycle.CorrectStaleDerivations(ctx); err != nil && ctx.Err() == nil {
+				logger.Warn("daemon: stale derivation correction stopped", zap.Error(err))
+			}
+			// A corrected generation moved the cache key of every stack over
+			// it: warm those stacks again before an edit finds them cold.
+			lifecycle.RewarmEditDeltaStacks()
+		})
+	}
+	defer retirementWorker.Stop()
+	stopBackground := func() {
+		controller.StopWatcher()
+		retirementWorker.Stop()
+	}
+	runTeardown := installDaemonTeardown(controller, stopBackground, func() error {
 		// Nothing has to be serialized here: per-file mtimes live in the
 		// FileMtime sidecar table, contract records ride on
 		// KindContract.Meta, and the vector index is persisted by the
@@ -524,6 +565,17 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		state.multiIndexer, state.lifecycle, reconcileInterval(), logger)
 	defer stopJanitor()
 
+	// Physical cleanup left by Seed runs only after the ready phase is
+	// published. Install and own the worker before enabling deferral so every
+	// deferred Seed has a cancellable, joined consumer. runDaemonStart invokes
+	// Seed exactly once for this lifecycle; a future additional Seed call must
+	// also install/restart a worker before inheriting this permanent opt-in.
+	deferredRetirements := retirementWorker
+	if state.lifecycle != nil {
+		// The hook-owned worker is fully installed before Seed can defer work.
+		state.lifecycle.EnableDeferredSeedRetirements()
+	}
+
 	if err := srv.Listen(); err != nil {
 		startupReporter.Fail(err)
 		return err
@@ -583,6 +635,9 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 				"warmup_seconds": int64(elapsed.Seconds()),
 				"warmup_ms":      elapsed.Milliseconds(),
 			})
+			if deferredRetirements != nil {
+				deferredRetirements.MarkReady()
+			}
 		})
 		mw, warmup := warmupDaemonState(state, logger, markReady)
 		controller.AttachWatcher(mw)
@@ -741,8 +796,9 @@ func startReconcileJanitor(
 		logger.Info("daemon: reconcile janitor disabled")
 		return func() {}
 	}
-	stop := make(chan struct{})
+	janitorCtx, janitorDone, stop := newReconcileJanitorLifetime()
 	go func() {
+		defer close(janitorDone)
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		logger.Info("daemon: reconcile janitor running", zap.Duration("interval", interval))
@@ -755,7 +811,7 @@ func startReconcileJanitor(
 
 					swept := 0
 					if lifecycle != nil {
-						report, err := lifecycle.Sweep(context.Background())
+						report, err := lifecycle.SweepDeferredRetirement(janitorCtx)
 						if err != nil {
 							logger.Warn("janitor: checkout sweep incomplete", zap.Error(err))
 						}
@@ -765,6 +821,9 @@ func startReconcileJanitor(
 								zap.Int("count", swept),
 								zap.Int("families", report.Families))
 						}
+					}
+					if janitorCtx.Err() != nil {
+						return swept, 0
 					}
 					results := mi.ReconcileAll()
 					reconciled := 0
@@ -780,12 +839,12 @@ func startReconcileJanitor(
 				if reconciled > 0 || gcedCount > 0 {
 					releaseMemoryToOS(logger, "reconcile_janitor")
 				}
-			case <-stop:
+			case <-janitorCtx.Done():
 				return
 			}
 		}
 	}()
-	return func() { close(stop) }
+	return stop
 }
 
 // daemonStartAcceptedFlags returns every flag the re-exec'd `daemon start`
@@ -1046,7 +1105,11 @@ func stopRunningDaemon(w io.Writer) error {
 	// Capture uptime + socket *before* shutdown so we can show them in the
 	// post-stop summary (the socket file vanishes on clean shutdown).
 	socket := daemon.SocketPath()
-	uptime := daemonUptimeBeforeStop()
+	// The same advisory status call also carries the store's close-checkpoint
+	// estimate: the backlog Close's final TRUNCATE has to drain, sized before
+	// the shutdown starts it.
+	pre := daemonStatusBeforeStop()
+	uptime := pre.uptime
 	// Capture the PID too. ControlShutdown only *acks* — the daemon then
 	// flushes and closes the store (releasing its on-disk lock) and exits
 	// asynchronously (see server.go: the handler Shutdown()s ~100ms later in
@@ -1054,6 +1117,10 @@ func stopRunningDaemon(w io.Writer) error {
 	// `daemon start` races the still-held lock and dies with the opaque
 	// "failed to open database with status 1".
 	pid, havePID := daemon.RunningPID()
+	// Where the daemon's store reports its close (close progress): read now,
+	// while the runtime state still names the running daemon.
+	stopCloseProgress := installDaemonCloseProgress()
+	defer stopCloseProgress()
 
 	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
 	if err != nil {
@@ -1066,7 +1133,7 @@ func stopRunningDaemon(w io.Writer) error {
 	// half-done flush is worse than a slow stop). The wait belongs here
 	// instead, where giving up is safe — the daemon is already on its way
 	// down and the exit wait below finishes the job.
-	resp, err := c.ControlWithTimeout(daemon.ControlShutdown, nil, daemonShutdownAckTimeout)
+	resp, err := c.ControlWithTimeout(daemon.ControlShutdown, nil, daemonShutdownAckWait)
 	_ = c.Close()
 	// A daemon that accepted the request but hasn't acked is not a reason to
 	// abandon the stop. The ack is synchronous with the controller's
@@ -1077,19 +1144,24 @@ func stopRunningDaemon(w io.Writer) error {
 	// wait instead: it force-kills and cleans up if the daemon really is
 	// wedged, so `daemon stop` always terminates and always leaves the socket
 	// and PID file in a startable state.
-	grace := daemonExitGrace
+	acked := true
 	switch {
 	case errors.Is(err, daemon.ErrDaemonUnresponsive),
 		err == nil && !resp.OK && resp.ErrorCode == daemon.ErrTimeout:
 		fmt.Fprintln(w, "[gortex daemon] no shutdown ack yet — the daemon is busy; waiting for it to exit")
-		grace = daemonBusyExitGrace
+		acked = false
 	case err != nil:
 		return err
 	case !resp.OK:
 		return fmt.Errorf("shutdown rejected: %s %s", resp.ErrorCode, resp.ErrorMsg)
 	}
+	grace := daemonStopExitGrace(acked, pre)
 	if havePID {
-		waitForDaemonExitWithin(pid, grace)
+		if !acked && pre.estimateKnown {
+			fmt.Fprintf(w, "[gortex daemon] draining %s WAL frames, up to %s before force-killing\n",
+				formatPendingFrames(pre.pendingFrames), grace.Truncate(time.Second))
+		}
+		waitForDaemonExitWithin(w, pid, grace, !acked && pre.estimateKnown)
 	}
 	emitDaemonStopSummary(w, socket, uptime)
 	return nil
@@ -1110,7 +1182,76 @@ const (
 	// shutdown ack before switching to watching the process itself. Generous,
 	// because the ack trails a real store flush.
 	daemonShutdownAckTimeout = 30 * time.Second
+	// daemonMaxExitGrace is the hard cap on the exit wait, however large the
+	// WAL backlog the daemon reported. Past it the stop force-kills as before:
+	// a daemon that has not exited in five minutes is wedged, not draining.
+	daemonMaxExitGrace = 5 * time.Minute
+	// daemonDrainProgressEvery is how often a long drain wait says it is
+	// still waiting.
+	daemonDrainProgressEvery = 15 * time.Second
 )
+
+// Seams over the stop path's clocks and process control, so the wait can be
+// driven by a fake daemon in tests without a real process to kill.
+var (
+	daemonShutdownAckWait     = daemonShutdownAckTimeout
+	daemonNoAckExitGrace      = daemonBusyExitGrace
+	daemonAckedExitGrace      = daemonExitGrace
+	daemonExitGraceCap        = daemonMaxExitGrace
+	daemonDrainProgressPeriod = daemonDrainProgressEvery
+	daemonProcessAlive        = platform.ProcessAlive
+	daemonKillProcess         = platform.KillProcess
+)
+
+// daemonStopPreflight is what the stop path learned from the daemon before
+// asking it to shut down: its uptime (for the summary card) and the store's
+// close-checkpoint estimate — the backlog Close's final checkpoint has to
+// drain and how long it should be given.
+type daemonStopPreflight struct {
+	uptime        time.Duration
+	closeEstimate time.Duration
+	pendingFrames int64
+	// estimateKnown is false when the status call failed, timed out, or came
+	// from a daemon that does not report its store (older, or not SQLite).
+	estimateKnown bool
+}
+
+// daemonStopExitGrace is how long the stop path waits for the process to exit
+// before force-killing it.
+//
+// After an ack the store is already closed — the daemon checkpoints and closes
+// it before answering — so the short grace covers only the process exit.
+// Without one the close is presumed still running: the wait is the no-ack
+// grace, raised to the store's close-checkpoint estimate plus the normal exit
+// grace when the daemon reported a larger backlog, and capped at
+// daemonExitGraceCap. Killing the checkpoint early is the worst outcome
+// available: an interrupted pass records no progress, so the next open
+// recovers the whole log with nothing backfilled, and a large WAL survives the
+// restart it was supposed to be truncated by.
+func daemonStopExitGrace(acked bool, pre daemonStopPreflight) time.Duration {
+	if acked {
+		return daemonAckedExitGrace
+	}
+	grace := daemonNoAckExitGrace
+	if pre.estimateKnown && pre.closeEstimate > 0 {
+		if need := pre.closeEstimate + daemonAckedExitGrace; need > grace {
+			grace = need
+		}
+	}
+	if daemonExitGraceCap > 0 && grace > daemonExitGraceCap {
+		grace = daemonExitGraceCap
+	}
+	return grace
+}
+
+// formatPendingFrames renders the backlog for the drain line; -1 is the
+// store's "wal-index unreadable".
+func formatPendingFrames(n int64) string {
+	if n < 0 {
+		return "an unknown number of"
+	}
+	return fmt.Sprintf("%d", n)
+}
 
 // waitForDaemonExitWithin blocks until the daemon process pid has exited — and
 // thus released the store's on-disk lock — force-killing it if a graceful
@@ -1124,27 +1265,67 @@ const (
 // already happened), daemonBusyExitGrace when none arrived (it probably has
 // not, and force-killing on the normal schedule would interrupt the store
 // write we want to complete).
-func waitForDaemonExitWithin(pid int, grace time.Duration) {
-	deadline := time.Now().Add(grace)
-	for time.Now().Before(deadline) {
-		if !platform.ProcessAlive(pid) {
+//
+// draining marks a wait that is covering the store's final checkpoint; it
+// prints a progress line every daemonDrainProgressPeriod so a long stop is
+// visibly waiting on the WAL rather than hung.
+func waitForDaemonExitWithin(w io.Writer, pid int, grace time.Duration, draining bool) {
+	if w == nil {
+		w = os.Stderr
+	}
+	start := time.Now()
+	deadline := start.Add(grace)
+	nextProgress := start.Add(daemonDrainProgressPeriod)
+	extended := false
+	for {
+		if !daemonProcessAlive(pid) {
 			return
 		}
-		time.Sleep(50 * time.Millisecond)
+		now := time.Now()
+		progress, reporting := daemonCloseProgressFor(pid)
+		if now.Before(deadline) {
+			if (draining || reporting) && daemonDrainProgressPeriod > 0 && !now.Before(nextProgress) {
+				fmt.Fprintf(w, "[gortex daemon] still draining the WAL: %s of up to %s%s\n",
+					now.Sub(start).Truncate(time.Second), grace.Truncate(time.Second), describeCloseProgress(progress, reporting, now))
+				nextProgress = now.Add(daemonDrainProgressPeriod)
+			}
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		// Past the grace. A close that is still copying loses its whole copy
+		// if killed (a checkpoint publishes its progress only when the pass
+		// ends), so the wait is bounded on the interval without progress, not
+		// on a fixed total.
+		if reporting {
+			since := progress.Since(now)
+			if since < daemonCloseNoProgressBound {
+				if !extended || !now.Before(nextProgress) {
+					fmt.Fprintf(w, "[gortex daemon] close still making progress after %s — waiting (last progress %s ago, giving up after %s without progress)%s\n",
+						now.Sub(start).Truncate(time.Second), since.Truncate(time.Second), daemonCloseNoProgressBound, describeCloseProgress(progress, reporting, now))
+					extended = true
+					nextProgress = now.Add(daemonDrainProgressPeriod)
+				}
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			fmt.Fprintf(w, "[gortex daemon] close made no progress for %s (bound %s) after %s — force-killing%s\n",
+				since.Truncate(time.Second), daemonCloseNoProgressBound, now.Sub(start).Truncate(time.Second), describeCloseProgress(progress, reporting, now))
+		}
+		break
 	}
 	// Graceful shutdown stalled (e.g. a wedged cgo call). Don't leave a
 	// half-exited daemon clutching the lock — force it, then clean up the
 	// socket/PID so the next start isn't tripped by stale files.
-	fmt.Fprintln(os.Stderr, "[gortex daemon] graceful shutdown timed out — force-killing")
-	_ = platform.KillProcess(pid)
-	for i := 0; i < 60 && platform.ProcessAlive(pid); i++ {
+	fmt.Fprintln(w, "[gortex daemon] graceful shutdown timed out — force-killing")
+	_ = daemonKillProcess(pid)
+	for i := 0; i < 60 && daemonProcessAlive(pid); i++ {
 		time.Sleep(50 * time.Millisecond)
 	}
 	_ = os.Remove(daemon.PIDFilePath())
 	_ = os.Remove(daemon.SocketPath())
 }
 
-// daemonUptimeBeforeStop best-effort-fetches the daemon's reported uptime via
+// daemonStatusBeforeStop best-effort-fetches the daemon's reported uptime via
 // a Status control before shutdown so the summary card can show how long the
 // process ran. Returns 0 on any error — we'd rather degrade the card than
 // fail the stop.
@@ -1154,21 +1335,32 @@ func waitForDaemonExitWithin(pid int, grace time.Duration) {
 // thing `daemon stop` blocked on — the stop request had not even been sent
 // yet. A card without an uptime is a fine outcome; a stop that never returns
 // is not.
-func daemonUptimeBeforeStop() time.Duration {
+//
+// The same answer carries the store's close-checkpoint estimate, which sizes
+// the exit wait when the shutdown ack does not arrive (daemonStopExitGrace). A
+// status that times out leaves it unknown and the wait on its old schedule.
+func daemonStatusBeforeStop() daemonStopPreflight {
+	var pre daemonStopPreflight
 	c, err := daemonControlClient()
 	if err != nil {
-		return 0
+		return pre
 	}
 	defer c.Close()
 	resp, err := c.ControlWithTimeout(daemon.ControlStatus, nil, daemonStatusCardTimeout)
 	if err != nil || !resp.OK {
-		return 0
+		return pre
 	}
 	var st daemon.StatusResponse
 	if jerr := json.Unmarshal(resp.Result, &st); jerr != nil {
-		return 0
+		return pre
 	}
-	return time.Duration(st.UptimeSeconds) * time.Second
+	pre.uptime = time.Duration(st.UptimeSeconds) * time.Second
+	if st.Storage != nil {
+		pre.closeEstimate = time.Duration(st.Storage.CloseCheckpointEstimateMS) * time.Millisecond
+		pre.pendingFrames = st.Storage.WALPendingFrames
+		pre.estimateKnown = true
+	}
+	return pre
 }
 
 // emitDaemonStopAlreadyDown prints the "not running" message: a one-liner on
@@ -1279,20 +1471,75 @@ func runDaemonReload(_ *cobra.Command, _ []string) error {
 }
 
 func runDaemonStatus(cmd *cobra.Command, _ []string) error {
+	format, err := daemonStatusFormatChoice(daemonStatusFormat)
+	if err != nil {
+		return err
+	}
 	if daemonStatusWatch {
+		if format != "text" {
+			// The watch mode is an alt-screen TUI; there is no honest way to
+			// also be a machine-readable stream. Refuse rather than silently
+			// ignoring one of the two flags.
+			return fmt.Errorf("--format %s cannot be combined with --watch", format)
+		}
 		return runDaemonStatusWatch(cmd)
 	}
 	st, err := fetchDaemonStatusWithOptions(daemon.StatusParams{Exact: daemonStatusExact})
 	if err != nil {
 		return err
 	}
-	w := cmd.OutOrStdout()
+	return renderDaemonStatusTo(cmd.OutOrStdout(), st, format)
+}
+
+// renderDaemonStatusTo is the whole of the one-shot status output minus the
+// socket dial, so the section order — and the fact that the views block is in
+// it at all — is checkable without a live daemon.
+//
+// json REPLACES the tables rather than being appended to them: a payload with
+// a table header in front of it is not JSON.
+func renderDaemonStatusTo(w io.Writer, st daemon.StatusResponse, format string) error {
+	if format == "json" {
+		return renderDaemonStatusJSON(w, st)
+	}
 	renderDaemonHeader(w, st)
 	renderDaemonWorkspaces(w, st)
 	renderDaemonRepos(w, st)
+	renderDaemonViews(w, st)
+	renderDaemonStorage(w, st)
+	renderDaemonBuildLane(w, st)
 	renderDaemonSessions(w, st)
 	renderDaemonServers(w, st)
 	return nil
+}
+
+// daemonStatusFormatChoice normalises and validates --format. An unknown value
+// is refused by name with the accepted set, rather than falling back to text:
+// a script that asked for json and silently got tables would parse garbage.
+func daemonStatusFormatChoice(raw string) (string, error) {
+	choice := strings.ToLower(strings.TrimSpace(raw))
+	if choice == "" {
+		return "text", nil
+	}
+	for _, allowed := range daemonStatusFormats {
+		if choice == allowed {
+			return choice, nil
+		}
+	}
+	return "", fmt.Errorf("unknown --format %q (want one of: %s)",
+		raw, strings.Join(daemonStatusFormats, ", "))
+}
+
+// renderDaemonStatusJSON writes the status payload verbatim.
+//
+// It marshals the decoded StatusResponse rather than echoing the raw control
+// frame so the output is this binary's declared schema — a field an older
+// daemon did not send is absent, not silently passed through — and it is
+// indented because the one thing a person does with it is read one field out
+// of it.
+func renderDaemonStatusJSON(w io.Writer, st daemon.StatusResponse) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(st)
 }
 
 // fetchDaemonStatusForCLI dials the control socket once and returns a parsed
@@ -1820,6 +2067,200 @@ func renderDaemonWorkspaces(w io.Writer, st daemon.StatusResponse) {
 		t.AppendRow(table.Row{ws.Slug, len(ws.Repos), projects, ws.Files, ws.Nodes, ws.Edges})
 	}
 	t.Render()
+}
+
+// renderDaemonViews writes the checkout-view lifecycle census: the levels, the
+// metric series behind them, and the two reason lists that explain a level no
+// count can.
+//
+// Before this the whole block was shipped over the socket and rendered by
+// nobody — `daemon status` had no reader for StatusResponse.Views at all, so
+// the counters that say whether committed advancement is reusing payload or
+// rebuilding it existed only inside the daemon's heap.
+//
+// It is omitted entirely when the daemon holds no view lifecycle (no families,
+// no coordinators, no series, nothing stuck), so a single-repo daemon's status
+// keeps exactly the shape it had.
+func renderDaemonViews(w io.Writer, st daemon.StatusResponse) {
+	v := st.Views
+	if v == nil {
+		return
+	}
+	if v.Families == 0 && v.Coordinators == 0 && v.Leases == 0 &&
+		len(v.Counters) == 0 && len(v.CoordinatorStartFailures) == 0 && len(v.StorageFailures) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "\nviews:")
+	fmt.Fprintf(w, "  families=%d  coordinators=%d  leases=%d\n",
+		v.Families, v.Coordinators, v.Leases)
+	for _, section := range []struct {
+		label  string
+		counts map[string]int
+	}{
+		{"checkouts", v.Checkouts},
+		{"generations", v.Generations},
+		{"ref views", v.RefViews},
+	} {
+		if line := formatViewCounts(section.counts); line != "" {
+			fmt.Fprintf(w, "  %s: %s\n", section.label, line)
+		}
+	}
+	if len(v.Counters) > 0 {
+		fmt.Fprintln(w, "  counters:")
+		for _, key := range sortedCounterKeys(v.Counters) {
+			fmt.Fprintf(w, "    %-58s %d\n", key, v.Counters[key])
+		}
+	}
+	if len(v.CoordinatorStartFailures) > 0 {
+		fmt.Fprintln(w, "  checkouts with no build loop:")
+		for _, f := range v.CoordinatorStartFailures {
+			root := f.RootPath
+			if root == "" {
+				root = "(unknown path)"
+			}
+			fmt.Fprintf(w, "    %s  %s: %s\n", f.CheckoutID, root, f.Reason)
+		}
+	}
+	if len(v.StorageFailures) > 0 {
+		fmt.Fprintln(w, "  generations whose storage maintenance failed:")
+		for _, f := range v.StorageFailures {
+			fmt.Fprintf(w, "    generation %d: %s\n", f.GenerationID, f.Reason)
+		}
+	}
+}
+
+// renderDaemonStorage writes the store's write-ahead-log block: sizes, the
+// backlog a stop would have to drain, and the bounded reclaim's counters.
+// Absent when the daemon sent none (not SQLite, or an older daemon).
+func renderDaemonStorage(w io.Writer, st daemon.StatusResponse) {
+	s := st.Storage
+	if s == nil {
+		return
+	}
+	fmt.Fprintln(w, "\nstorage:")
+	pending := "unknown"
+	if s.WALPendingFrames >= 0 {
+		pending = fmt.Sprintf("%d", s.WALPendingFrames)
+	}
+	fmt.Fprintf(w, "  db=%s  wal=%s  wal pending frames=%s  close checkpoint estimate=%s\n",
+		formatBytes(nonNegative(s.DBBytes)), formatBytes(nonNegative(s.WALBytes)), pending,
+		(time.Duration(s.CloseCheckpointEstimateMS) * time.Millisecond).String())
+	if rc := s.RowCounters; rc != nil {
+		if rc.Checked {
+			fmt.Fprintf(w, "  row counters: ready=%t  checked generations=%d  drifted=%d  repaired=%t  check=%.0fms\n",
+				rc.Ready, rc.Generations, rc.Drifted, rc.Repaired, rc.CheckMS)
+		} else {
+			fmt.Fprintf(w, "  row counters: ready=%t\n", rc.Ready)
+		}
+		if rc.FirstDrift != "" {
+			fmt.Fprintf(w, "    first drift: %s\n", rc.FirstDrift)
+		}
+	}
+	r := s.WALReclaim
+	if r == nil {
+		return
+	}
+	fmt.Fprintf(w, "  wal reclaim: threshold=%s  attempts=%d  resets=%d  deferrals=%d  skips=%d  failures=%d\n",
+		formatBytes(nonNegative(r.ThresholdBytes)), r.Attempts, r.Resets, r.Deferrals, r.Skips, r.Failures)
+	fmt.Fprintf(w, "    reclaimed frames=%d  bytes=%s\n", r.FramesReclaimed, formatBytes(nonNegative(r.BytesReclaimed)))
+	fmt.Fprintf(w, "    open-gate resets=%d  writer hold max=%.1fms  last=%.1fms\n",
+		r.OpenGateResets, r.WriterHoldMaxMS, r.WriterHoldLastMS)
+	fmt.Fprintf(w, "    gate pause n=%d  max=%.1fms  avg=%.1fms  last=%.1fms  reader waits n=%d  max=%.1fms  avg=%.1fms\n",
+		r.PauseCount, r.PauseMaxMS, r.PauseAvgMS, r.PauseLastMS, r.ReaderWaits, r.ReaderWaitMaxMS, r.ReaderWaitAvgMS)
+	fmt.Fprintf(w, "    edit-cycle yield: passive deferrals=%d  forced=%d  reclaim refusals=%d  cut short=%d  ceiling runs=%d  ceiling=%s\n",
+		r.CycleDeferrals, r.CycleForced, r.CycleRefusals, r.CycleYields, r.CycleCeilingRuns, formatBytes(nonNegative(r.CeilingBytes)))
+	fmt.Fprintf(w, "    retirement edit yield: waits=%d  timeouts=%d\n",
+		r.RetirementEditYields, r.RetirementEditYieldTimeouts)
+	fmt.Fprintf(w, "    retirement reclaim wait: waits=%d  timeouts=%d  bulk-window overrides=%d\n",
+		r.RetirementWaits, r.RetirementWaitTimeouts, r.LeaseOverrides)
+	if r.ShrinkInPlaceResets > 0 || r.ShrinkSlices > 0 {
+		fmt.Fprintf(w, "    incremental shrink: in-place resets=%d  slices=%d  bytes=%s  slice hold max=%.1fms\n",
+			r.ShrinkInPlaceResets, r.ShrinkSlices, formatBytes(nonNegative(r.ShrinkBytes)), r.ShrinkSliceHoldMaxMS)
+	}
+	if r.BackoffMS > 0 || r.LastOutcome != "" || r.LastReason != "" {
+		fmt.Fprintf(w, "    backoff=%s  last=%s", (time.Duration(r.BackoffMS) * time.Millisecond).String(), orDash(r.LastOutcome))
+		if r.LastReason != "" {
+			fmt.Fprintf(w, " (%s)", r.LastReason)
+		}
+		fmt.Fprintln(w)
+	}
+}
+
+// renderDaemonBuildLane writes the view-build lane: who holds it and for how
+// long, and what is queued behind it. Absent when the daemon sent none.
+func renderDaemonBuildLane(w io.Writer, st daemon.StatusResponse) {
+	l := st.BuildLane
+	if l == nil {
+		return
+	}
+	fmt.Fprintln(w, "\nbuild lane:")
+	switch h := l.Holder; {
+	case !l.Open:
+		fmt.Fprintln(w, "  closed (warmup)")
+	case h == nil:
+		fmt.Fprintln(w, "  idle")
+	default:
+		fmt.Fprintf(w, "  held by %s", h.Kind)
+		if h.CheckoutID != "" {
+			fmt.Fprintf(w, "  checkout=%s", h.CheckoutID)
+		}
+		if h.Generation != 0 {
+			fmt.Fprintf(w, "  generation=%d", h.Generation)
+		}
+		if h.Priority != "" {
+			fmt.Fprintf(w, "  priority=%s", h.Priority)
+		}
+		fmt.Fprintf(w, "  for %.0fms\n", h.HeldForMS)
+	}
+	fmt.Fprintf(w, "  queued interactive=%d  background=%d  (high water %d/%d)  admitted %d/%d  waits n=%d  max=%.1fms  avg=%.1fms\n",
+		l.InteractiveQueued, l.BackgroundQueued, l.InteractiveHighWater, l.BackgroundHighWater,
+		l.AdmittedInteractive, l.AdmittedBackground, l.WaitSamples, l.WaitMaxMS, l.WaitAvgMS)
+}
+
+func nonNegative(n int64) uint64 {
+	if n < 0 {
+		return 0
+	}
+	return uint64(n)
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// formatViewCounts renders one state→count map as "ready=3  retiring=1", in a
+// stable key order. An empty map renders as nothing so the caller can drop the
+// whole line: a census section with no instances is absent, not "{}".
+func formatViewCounts(counts map[string]int) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", key, counts[key]))
+	}
+	return strings.Join(parts, "  ")
+}
+
+// sortedCounterKeys orders the metric series by name. Map iteration order
+// would make two consecutive `daemon status` runs on an unchanged daemon
+// produce different output, which is the one property a diff-and-watch
+// workflow needs this block not to have.
+func sortedCounterKeys(counters map[string]int64) []string {
+	keys := make([]string, 0, len(counters))
+	for key := range counters {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // renderDaemonSessions lists every connected MCP client. Skipped

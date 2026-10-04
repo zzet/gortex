@@ -9,9 +9,18 @@ const DefaultNodeSearchKeyPageSize = 256
 // NodeSearchKey is the metadata-free projection needed to rank degraded-mode
 // symbol-search candidates. Full nodes are loaded only for the winning IDs.
 type NodeSearchKey struct {
-	ID   string
-	Kind NodeKind
-	Name string
+	ID          string
+	Kind        NodeKind
+	Name        string
+	FilePath    string
+	RepoPrefix  string
+	WorkspaceID string
+	ProjectID   string
+}
+
+func nodeSearchKey(node *Node) NodeSearchKey {
+	return NodeSearchKey{ID: node.ID, Kind: node.Kind, Name: node.Name,
+		FilePath: node.FilePath, RepoPrefix: node.RepoPrefix, WorkspaceID: node.WorkspaceID, ProjectID: node.ProjectID}
 }
 
 // NodeSearchKeyScanner is an optional Reader capability. Implementations must
@@ -51,7 +60,7 @@ func ScanNodeSearchKeys(ctx context.Context, r Reader, pageSize int, yield func(
 		if node == nil {
 			continue
 		}
-		page = append(page, NodeSearchKey{ID: node.ID, Kind: node.Kind, Name: node.Name})
+		page = append(page, nodeSearchKey(node))
 		if len(page) < pageSize {
 			continue
 		}
@@ -87,7 +96,7 @@ func (g *Graph) ScanNodeSearchKeys(ctx context.Context, pageSize int, yield func
 		if node == nil {
 			continue
 		}
-		page = append(page, NodeSearchKey{ID: node.ID, Kind: node.Kind, Name: node.Name})
+		page = append(page, nodeSearchKey(node))
 		if len(page) < pageSize {
 			continue
 		}

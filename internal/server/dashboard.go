@@ -18,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/server/hub"
 )
@@ -199,8 +200,15 @@ func reposFromGraph(g graph.Store) []repoEntry {
 	return out
 }
 
-func (h *Handler) handleRepos(w http.ResponseWriter, _ *http.Request) {
-	WriteJSON(w, http.StatusOK, map[string]any{"repos": reposFromGraph(h.graph)})
+func (h *Handler) handleRepos(w http.ResponseWriter, r *http.Request) {
+	read := h.beginBaseRead(r, "", graphview.CapSyntaxGraph)
+	defer read.release()
+	repos := reposFromGraph(h.graph)
+	payload := map[string]any{"repos": repos}
+	if rider := read.close(); rider != nil {
+		payload["view"] = rider
+	}
+	WriteJSON(w, http.StatusOK, payload)
 }
 
 // --- /v1/overlay/* ---
@@ -380,6 +388,12 @@ func (h *Handler) handleWorkspaceRoster(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "workspace slug required", http.StatusBadRequest)
 		return
 	}
+	// Whole-store scan for one workspace's repo prefixes. Pinned for the
+	// duration so the roster a peer caches for a minute describes one
+	// generation rather than a scan that straddled a publication.
+	read := h.beginBaseRead(r, "", graphview.CapSyntaxGraph)
+	defer read.release()
+
 	seen := make(map[string]struct{})
 	for _, n := range h.graph.AllNodes() {
 		// Effective workspace match — match on either the explicit
@@ -406,10 +420,14 @@ func (h *Handler) handleWorkspaceRoster(w http.ResponseWriter, r *http.Request) 
 	for p := range seen {
 		repos = append(repos, p)
 	}
-	WriteJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"workspace": ws,
 		"repos":     repos,
-	})
+	}
+	if rider := read.close(); rider != nil {
+		payload["view"] = rider
+	}
+	WriteJSON(w, http.StatusOK, payload)
 }
 
 // --- /v1/processes ---
@@ -495,7 +513,7 @@ func categorizeProcess(entry string) string {
 }
 
 func (h *Handler) handleProcesses(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "processes"})
+	raw, err := h.CallToolStrict(h.requestToolContext(r), "analyze", map[string]any{"kind": "processes"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -638,7 +656,7 @@ type contractLocation struct {
 }
 
 func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "contracts", "action": "list"})
+	raw, err := h.CallToolStrict(h.requestToolContext(r), "analyze", map[string]any{"kind": "contracts", "action": "list"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -748,7 +766,7 @@ func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
 // counts and render a per-contract diff panel.
 
 func (h *Handler) handleContractsValidate(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "contracts", "action": "validate"})
+	raw, err := h.CallToolStrict(h.requestToolContext(r), "analyze", map[string]any{"kind": "contracts", "action": "validate"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1140,7 +1158,7 @@ type communityEntry struct {
 }
 
 func (h *Handler) handleCommunities(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.CallToolStrict(r.Context(), "analyze", map[string]any{"kind": "communities"})
+	raw, err := h.CallToolStrict(h.requestToolContext(r), "analyze", map[string]any{"kind": "communities"})
 	if err != nil {
 		WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1281,7 +1299,7 @@ type caveatEntry struct {
 }
 
 func (h *Handler) handleCaveats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.requestToolContext(r)
 	out := make([]caveatEntry, 0, 32)
 
 	// check_guards is intentionally NOT called here — the MCP tool
@@ -1319,8 +1337,25 @@ func (h *Handler) handleCaveats(w http.ResponseWriter, r *http.Request) {
 		"deprecated": 5,
 	}
 	sortByRank(out, severityRank)
+
+	// The enrichment half is a direct store read — GetNode plus GetInEdges
+	// plus a GetNode per caller, once per caveat — and it runs AFTER every
+	// CallToolStrict above has returned, so the request view each of those
+	// held has already been released. Pin the base corpus for the walk:
+	// unleased, a retirement sweep could collect the generation between two
+	// caveats and the page would splice two of them together. The rider on
+	// the way out says which corpus answered, exactly as the direct-store
+	// endpoints do.
+	read := h.beginBaseRead(r, "",
+		graphview.CapSyntaxGraph, graphview.CapResolutionLocal, graphview.CapIncomingEdges)
+	defer read.release()
 	enrichCaveats(h.Graph(), out)
-	WriteJSON(w, http.StatusOK, map[string]any{"caveats": out})
+
+	payload := map[string]any{"caveats": out}
+	if rider := read.close(); rider != nil {
+		payload["view"] = rider
+	}
+	WriteJSON(w, http.StatusOK, payload)
 }
 
 // enrichCaveats fills in file_path, repo_prefix, kind, fan_in, and
@@ -1534,6 +1569,9 @@ type dashboardSnapshot struct {
 	Activity  []indexer.GraphChangeEvent `json:"activity"`
 	Caveats   []caveatEntry              `json:"caveats"`
 	Processes []processEntry             `json:"processes"`
+	// View is the base-scoped rider for the direct-store half of this
+	// snapshot (stats + repos); see HealthResponse.View.
+	View *BaseScopedRider `json:"view,omitempty"`
 }
 
 type kvEntry struct {
@@ -1551,6 +1589,12 @@ func mapToOrderedKV(m map[string]int) []kvEntry {
 }
 
 func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	// The hero numbers come straight off the store; the caveats and
+	// processes sections come from tools, which resolve their own view
+	// through the seam. Pin the base corpus for the direct half so the
+	// counters and the repo table describe one generation.
+	read := h.beginBaseRead(r, "", graphview.CapSyntaxGraph)
+	defer read.release()
 	stats := h.graph.Stats()
 	snap := dashboardSnapshot{}
 	snap.Stats.TotalNodes = stats.TotalNodes
@@ -1567,7 +1611,9 @@ func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		snap.Activity = []indexer.GraphChangeEvent{}
 	}
 
-	ctx, cancel := context.WithCancel(r.Context())
+	snap.View = read.close()
+
+	ctx, cancel := context.WithCancel(h.requestToolContext(r))
 	defer cancel()
 
 	// Reuse the caveats aggregator so the count and the inline preview

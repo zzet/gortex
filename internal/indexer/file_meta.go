@@ -12,6 +12,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/resolver"
 )
 
 var errFileVersionChanged = errors.New("file changed while index mutation was in progress")
@@ -197,6 +198,14 @@ type reparsePendingEnrichmentBatch struct {
 	byFile                map[string]bool
 	deferResolverCatchup  bool
 	deferredAffectedFiles map[string]struct{}
+	// deferredPriorDeclarations / deferredPriorPending carry the evicted
+	// files' pre-mutation declaration surfaces and prior-unresolved out-edges
+	// to the deferred resolver catch-up (resolver_scope.go).
+	deferredPriorDeclarations map[string]resolver.DeclarationSurface
+	deferredPriorPending      []*graph.Edge
+	// deferredPriorBindings are the forward leg's carried bindings
+	// (edit_delta_prior_bindings.go); dropped when the batch deletes files.
+	deferredPriorBindings map[string]resolver.PriorBinding
 }
 
 func (b *reparsePendingEnrichmentBatch) add(graphPath string, pending bool) bool {

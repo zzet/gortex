@@ -783,16 +783,47 @@ func requireReindexedTarget(t *testing.T, store *Store, want string) {
 	assert.Equal(t, want, edges[0].To)
 }
 
-// TestWriterDSNSpacesWALAutoCheckpoints pins the widened auto-checkpoint
-// spacing on the writer DSN: the SQLite default (1000 pages ≈ 4 MB) forces a
-// checkpoint flush every few MB of a scattered index-write burst. Readers
-// never append to the WAL, so the reader DSN stays untouched.
-func TestWriterDSNSpacesWALAutoCheckpoints(t *testing.T) {
+// TestWriterConnectionsDisableSQLiteAutoCheckpointAfterReplacement pins the
+// connection-level half of the application-owned WAL pressure policy. SQLite's
+// commit hook stays disabled on every physical writer connection, including a
+// replacement from the same pool; the configured page line remains available
+// to the Store checkpoint scheduler instead of running inside an arbitrary
+// graph or catalog commit.
+func TestWriterConnectionsDisableSQLiteAutoCheckpointAfterReplacement(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", "128")
+
 	dsn := sqliteWriterDSN("x.sqlite")
-	if !strings.Contains(dsn, "_pragma=wal_autocheckpoint(8000)") {
-		t.Fatalf("writer DSN missing wal_autocheckpoint spacing: %s", dsn)
+	if !strings.Contains(dsn, "_pragma=wal_autocheckpoint(0)") {
+		t.Fatalf("writer DSN did not disable SQLite's commit hook: %s", dsn)
 	}
 	if strings.Contains(sqliteReaderDSN("x.sqlite"), "wal_autocheckpoint") {
 		t.Fatal("reader DSN should not carry wal_autocheckpoint")
+	}
+	if got := sqliteWALAutoCheckpointPages(); got != 128 {
+		t.Fatalf("application pressure line = %d, want 128", got)
+	}
+
+	store, _ := openTempStore(t)
+	if got := pragmaIntDB(t, store.writerDB, "wal_autocheckpoint"); got != 0 {
+		t.Fatalf("Store writer starts at wal_autocheckpoint=%d, want 0", got)
+	}
+	if _, err := store.writerDB.Exec(`CREATE TABLE checkpoint_policy_probe (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatalf("catalog-shaped writer commit: %v", err)
+	}
+	if got := pragmaIntDB(t, store.writerDB, "wal_autocheckpoint"); got != 0 {
+		t.Fatalf("ordinary writer commit restored wal_autocheckpoint=%d, want 0", got)
+	}
+
+	// pragmaIntDB returned its connection to the one-idle writer pool. Dropping
+	// the idle allowance retires that physical connection; the next PRAGMA must
+	// therefore be served by a newly opened connection from the same pool.
+	before := store.writerDB.Stats().MaxIdleClosed
+	store.writerDB.SetMaxIdleConns(0)
+	if after := store.writerDB.Stats().MaxIdleClosed; after <= before {
+		t.Fatalf("forcing the writer pool idle limit to zero closed %d connections, want at least one", after-before)
+	}
+	store.writerDB.SetMaxIdleConns(1)
+	if got := pragmaIntDB(t, store.writerDB, "wal_autocheckpoint"); got != 0 {
+		t.Fatalf("replacement writer connection runs at wal_autocheckpoint=%d, want 0", got)
 	}
 }

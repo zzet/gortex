@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 )
@@ -48,6 +49,56 @@ func (s *Server) refreshIndexHealthInBackground() {
 
 func (s *Server) indexHealthNeedsRefresh(updatedAt time.Time) bool {
 	return updatedAt.IsZero() || time.Since(updatedAt) >= indexHealthSnapshotTTL
+}
+
+// indexHealthScopeField is the payload key that names the corpus an
+// index_health answer describes. It is deliberately the same key and the same
+// vocabulary the view rider uses (view_request.go, viewRiderFields), because
+// the statement is the same statement: part of this answer was produced by an
+// engine that read the indexed corpus itself rather than the view the request
+// selected.
+const indexHealthScopeField = "base_scoped"
+
+// withIndexHealthCorpusScope states, inside the payload, the corpus the
+// payload describes.
+//
+// index_health answers out of a whole-daemon probe — s.graph.Stats() plus a
+// NodesByKind(KindFile) walk of the corpus and the indexer's own mtime ledger
+// (tools_enhancements.go, buildIndexHealthBasePayloadCtx) — so under a routed
+// view the health score, the node count, the stale-file list and the path
+// audit all describe the base corpus and not the checkout the caller selected.
+// The TOOL already says so on its rider (view_capabilities.go,
+// baseScopedEngineCapabilities). The gortex://index-health RESOURCE carries no
+// rider at all (tool_deadline.go, requestScoped: "no rider to report a
+// fallback on"), so the payload is the only channel it has, and until this it
+// had none: a session bound to a worktree read corpus-wide numbers presented
+// as its own.
+//
+// The predicate is view.routed(), byte for byte the one annotateBaseScoped
+// uses, so the resource and the tool fire on exactly the same requests. Both
+// surfaces are stamped, which keeps the PAYLOAD equality the resource's own
+// description promises ("Same payload as the `index_health` tool") — the two
+// results are not byte-equal, because a routed tool result also carries the
+// view rider a resources/read has no channel for.
+//
+// Two properties this must not cost:
+//
+//   - the probe stays cheap. It reads the request's view and nothing else — no
+//     NodeCount()/EdgeCount() (a whole-generation COUNT(*) on the SQL backend)
+//     and no second Stats(). Re-scoping the counts themselves to the view is
+//     the larger change this deliberately is not; what ships here is the
+//     honest label on the corpus-scoped numbers.
+//   - the shared cache stays unstamped. The snapshot in indexHealthCache is
+//     built once for every session, so the stamp is applied at READ time on a
+//     clone — a routed session can never leave its label on the payload an
+//     unrouted one then reads.
+func withIndexHealthCorpusScope(ctx context.Context, payload map[string]any) map[string]any {
+	if payload == nil || !requestViewFromContext(ctx).routed() {
+		return payload
+	}
+	scoped := maps.Clone(payload)
+	scoped[indexHealthScopeField] = sortedCapabilityNames(baseScopedEngineCapabilities["index_health"])
+	return scoped
 }
 
 func compactIndexHealth(payload map[string]any, updatedAt time.Time, refreshing bool) string {

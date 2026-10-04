@@ -173,14 +173,20 @@ func wideProgram(n int) string {
 func timePerRun(t *testing.T, root *sitter.Node, want, repeats int, walk func(*sitter.Node) int) time.Duration {
 	t.Helper()
 	// One warmup pass (touch caches, fault in pages) before timing.
-	if got := walk(root); got != want {
-		t.Fatalf("warmup visited %d, want %d", got, want)
-	}
+	root.WithScratch(func() {
+		if got := walk(root); got != want {
+			t.Fatalf("warmup visited %d, want %d", got, want)
+		}
+	})
 	start := time.Now()
 	for r := 0; r < repeats; r++ {
-		if got := walk(root); got != want {
-			t.Fatalf("visited %d on repeat %d, want %d", got, r, want)
-		}
+		// Both walkers return only counts. No child wrapper escapes this
+		// pass, so subsequent repeats reuse one traversal's arena capacity.
+		root.WithScratch(func() {
+			if got := walk(root); got != want {
+				t.Fatalf("visited %d on repeat %d, want %d", got, r, want)
+			}
+		})
 	}
 	return time.Since(start) / time.Duration(repeats)
 }

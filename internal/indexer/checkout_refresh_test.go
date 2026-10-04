@@ -401,22 +401,78 @@ func TestCheckoutRefreshHashRejectsOutsideAndReplacedPhysicalRoot(t *testing.T) 
 }
 
 func TestCheckoutMutationConcurrentAdmissionIsBoundedByCaller(t *testing.T) {
-	f, _, l := newCheckoutMutationFixture(t)
-	m, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, f.route().RouteEpoch)
+	f, c, l := newCheckoutMutationFixture(t)
+	epoch := f.route().RouteEpoch
+	m, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
+	// Hold the existing sampler lease so admission positively reaches its
+	// urgent held-cycle pre-check before the caller's budget expires.
+	releaseSample, err := c.sampler.Hold(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	type admissionResult struct {
+		lease   *CheckoutMutation
+		err     error
+		elapsed time.Duration
+	}
+	done := make(chan admissionResult, 1)
+	joined := false
+	defer func() {
+		cancel()
+		if !joined {
+			select {
+			case got := <-done:
+				if got.lease != nil {
+					got.lease.Close()
+				}
+			case <-time.After(2 * time.Second):
+				t.Error("owned admission did not join after cancellation")
+			}
+		}
+		releaseSample()
+	}()
 	started := time.Now()
-	other, err := l.BeginCheckoutMutation(ctx, f.checkoutID, f.worktree, f.route().RouteEpoch)
-	if other != nil {
-		other.Close()
+	go func() {
+		lease, err := l.BeginCheckoutMutation(ctx, f.checkoutID, f.worktree, epoch)
+		done <- admissionResult{lease: lease, err: err, elapsed: time.Since(started)}
+	}()
+	witnessed := false
+	for !witnessed {
+		select {
+		case got := <-done:
+			joined = true
+			if got.lease != nil {
+				got.lease.Close()
+			}
+			t.Fatalf("admission returned before a live urgent pre-check wait was witnessed: elapsed=%s error=%v", got.elapsed, got.err)
+		case <-ctx.Done():
+			t.Fatal("caller budget expired before a live urgent pre-check wait was witnessed")
+		default:
+			witnessed = c.sampler.UrgentWaiting() > 0 && ctx.Err() == nil
+			if !witnessed {
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}
+	var got admissionResult
+	select {
+	case got = <-done:
+		joined = true
+	case <-time.After(2 * time.Second):
+		t.Fatal("admission did not return after its caller deadline")
+	}
+	if got.lease != nil {
+		got.lease.Close()
 		t.Fatal("admitted concurrent source mutation")
 	}
-	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrCheckoutMutationBusy) || time.Since(started) > 2*time.Second {
-		t.Fatalf("admission did not preserve caller deadline: elapsed=%s error=%v", time.Since(started), err)
+	t.Logf("urgent_precheck_wait_witnessed=%v caller_budget=500ms elapsed=%s error=%v", witnessed, got.elapsed, got.err)
+	if !errors.Is(got.err, context.DeadlineExceeded) || !errors.Is(got.err, ErrCheckoutMutationBusy) || got.elapsed > 2*time.Second {
+		t.Fatalf("admission did not preserve caller deadline: elapsed=%s error=%v", got.elapsed, got.err)
 	}
 }
 

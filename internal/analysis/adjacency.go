@@ -70,6 +70,12 @@ func (a *AdjacencySnapshot) EdgeCount() int {
 // whose endpoint is not a real graph node (an unresolved or dangling
 // target) is skipped so the dense index stays consistent.
 func BuildAdjacencySnapshot(g graph.Store) *AdjacencySnapshot {
+	return BuildAdjacencySnapshotPaced(g, nil)
+}
+
+// BuildAdjacencySnapshotPaced is BuildAdjacencySnapshot with a cooperative
+// scheduling point in every hot loop (see Pace). A nil Pace never parks.
+func BuildAdjacencySnapshotPaced(g graph.Store, pace *Pace) *AdjacencySnapshot {
 	snap := &AdjacencySnapshot{index: map[string]int{}}
 	if g == nil {
 		return snap
@@ -77,6 +83,7 @@ func BuildAdjacencySnapshot(g graph.Store) *AdjacencySnapshot {
 
 	ids := make([]string, 0, g.NodeCount())
 	for n := range graph.NodesLightSeq(g) {
+		pace.Tick()
 		if n == nil || n.ID == "" {
 			continue
 		}
@@ -102,6 +109,7 @@ func BuildAdjacencySnapshot(g graph.Store) *AdjacencySnapshot {
 	// Meta-less kind-scoped scan (see LightEdgeScanner): the CSR build reads only
 	// e.Kind, endpoints, and graph.ProvenanceWeight.
 	for e := range graph.EdgesLightSeq(g, graph.EdgeCalls, graph.EdgeReferences) {
+		pace.Tick()
 		if e == nil {
 			continue
 		}
@@ -133,6 +141,7 @@ func BuildAdjacencySnapshot(g graph.Store) *AdjacencySnapshot {
 	for i := range adj {
 		// Sort each node's out-neighbours by dense index so the CSR row
 		// order is deterministic (AllEdges order is backend-specific).
+		pace.Tick()
 		row := adj[i]
 		sort.Slice(row, func(a, b int) bool { return row[a].to < row[b].to })
 		for _, l := range row {

@@ -95,8 +95,22 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 		RepoAllow:   resolved.RepoAllow,
 	}
 
+	files := reader.NodesByKind(graph.KindFile)
+	if projection, ok := reader.(graph.ScopedProjectionSequencer); ok && len(resolved.RepoAllow) > 0 {
+		// ScopeAllows also admits unowned nodes. Keep one projection so its
+		// ID order matches the original kind traversal for equal-path ties.
+		repos := []string{""}
+		for repo, allowed := range resolved.RepoAllow {
+			if allowed && repo != "" {
+				repos = append(repos, repo)
+			}
+		}
+		sort.Strings(repos)
+		files = projection.NodesInScopeSeq(repos, nil, graph.KindFile)
+	}
+
 	hits := make([]fileHit, 0, 64)
-	for n := range reader.NodesByKind(graph.KindFile) {
+	for n := range files {
 		if n == nil {
 			continue
 		}

@@ -269,12 +269,12 @@ func TestCheckoutSourceFallbackRemainsReadOnly(t *testing.T) {
 	for _, dryRun := range []bool{true, false} {
 		ran := false
 		res, err := stack.callWithView(t, stack.worktreeRoot, "edit_file",
-			map[string]any{"dry_run": dryRun}, func(context.Context) (*mcplib.CallToolResult, error) {
+			map[string]any{"dry_run": dryRun, "wait_deadline": time.Now().Add(100 * time.Millisecond).Format(time.RFC3339Nano)}, func(context.Context) (*mcplib.CallToolResult, error) {
 				ran = true
 				return mcplib.NewToolResultText(`{"ok":true}`), nil
 			})
 		require.NoError(t, err)
-		assertToolError(t, res, graphview.CodeViewReadOnly)
+		assertToolError(t, res, graphview.CodeViewBuilding)
 		require.False(t, ran, "base fallback must not grant permission to edit the primary checkout")
 	}
 }

@@ -381,6 +381,9 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	// Fresh placeholder-source set per pass — same rationale as ResolveAll
 	// on the master resolver.
 	cr.placeholderSrcIdx = placeholderSourceIndex{}
+	// Every exit applies the moves the pass deferred (a no-op after the
+	// normal flush below); it runs before the deferred unlock above.
+	defer cr.placeholderSrcIdx.applyDeferred(cr.graph)
 	// Share the master resolver's stable high-water/keyset stream. The cold
 	// residual can exceed 200k edges; retaining it plus the cross-repo name,
 	// raw-name, repo and qualified-name caches was the second whole-corpus heap
@@ -551,7 +554,9 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 					scBatch = cr.filterLiveReindex(scBatch)
 				}
 				cr.graph.ReindexEdges(scBatch)
-				reconcilePlaceholderSources(cr.graph, &cr.placeholderSrcIdx, scBatch)
+				// Moves wait for the last page, as in ResolveAll
+				// (placeholderSourceIndex.deferRepoints).
+				cr.placeholderSrcIdx.deferRepoints(cr.graph, scBatch)
 				reindexTotal += len(scBatch)
 				DetectCrossRepoEdgesForReindexes(cr.graph, scBatch)
 			}
@@ -586,6 +591,7 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 		}
 		pendingLoaded.Add(int64(len(pending)))
 	}
+	cr.placeholderSrcIdx.applyDeferred(cr.graph)
 	stopProgress()
 	cr.logger.Info("cross-repo resolve: compute done",
 		zap.Int64("pending", pendingLoaded.Load()),
@@ -716,6 +722,13 @@ func (cr *CrossRepoResolver) buildDirIndexes() {
 		if last != "" && last != dir {
 			cr.lastDirIndex[last] = append(cr.lastDirIndex[last], file)
 		}
+	}
+	// Path order, not store order (sortFileIdentities).
+	for _, files := range cr.dirIndex {
+		sortFileIdentities(files)
+	}
+	for _, files := range cr.lastDirIndex {
+		sortFileIdentities(files)
 	}
 }
 

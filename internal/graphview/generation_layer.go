@@ -1,6 +1,7 @@
 package graphview
 
 import (
+	"context"
 	"fmt"
 	"iter"
 	"maps"
@@ -25,7 +26,7 @@ import (
 //
 // # What the masks mean here
 //
-//   - A file mask covers a path whether it says replace or delete;
+//   - A file mask covers a path when it says replace or delete;
 //     either way the layer below stops showing through for the nodes
 //     that live at the path and the edges recorded there. Edges the
 //     layer below recorded in OTHER paths keep showing through even
@@ -33,6 +34,17 @@ import (
 //     not re-derive the file that holds them. A delete mask
 //     additionally reports the path as a tombstone, so the composition
 //     answers it as empty rather than from the layer's own payload.
+//   - A CONTEXT mask covers nothing. It is the generation saying it
+//     read the path to resolve its own change set and claims nothing
+//     about it, so the layer below answers for the file whole —
+//     identity, adjacency and every derived output it carries. The
+//     layer treats such a path as if the generation had no payload for
+//     it at all: not claimed, not a tombstone, absent from FilePaths,
+//     and — should a row nevertheless be carried at one — never served
+//     from this layer, so a carried context row can no more shadow the
+//     layer below than duplicate it. Publish validation refuses the
+//     mask over payload (store_sqlite.ValidateGenerationMasks), which
+//     makes that last defence a second lock rather than the only one.
 //   - A node tombstone removes one identity the generation did not
 //     re-emit and whose file it does not claim.
 //   - An edge-source marker replaces one node's outgoing edge set
@@ -48,12 +60,10 @@ import (
 // it runs per node or per edge, and content reads, which it runs per
 // key the caller named. They are served differently on purpose.
 //
-//   - Prefetched whole, once, at construction: the covered-path set with
-//     its modes, the node tombstones, and the edge-source markers. These
-//     are the membership probes — HasFile, CoversNodeID, IsRemovedID,
-//     OwnsOutEdges — and a base edge scan runs one per edge endpoint. A
-//     query per probe would be a query per graph row; three queries
-//     bounded by the generation's own footprint are not.
+//   - Prefetched whole, once, at construction: covered paths, node-identity
+//     masks, edge-source markers, and summaries fetched ONLY for mask IDs.
+//     Membership probes run per lower node/edge without per-row SQL; ordinary
+//     file deltas perform no upper-node enumeration for identity membership.
 //   - Point reads, memoized for the layer's lifetime: NodeByID (misses
 //     included, so a repeated absence costs one query too) and FileNodes
 //     (prefetched per touched file, since a file's nodes are always
@@ -78,12 +88,12 @@ import (
 //
 // # Precondition
 //
-// Every node a generation carries lives at a path the same generation
-// masks. The payload lifecycle writes payload and mask together, and the
-// in-memory layer's builder maintains the same invariant by marking a
-// node's file when the node is added. The composition relies on it: a
-// node at an unmasked path would surface next to the copy still showing
-// through from below instead of replacing it.
+// A stored node at a masked path participates in whole-file replacement.
+// An explicit node-identity mask speaks for its ID outside masked files.
+// Identity-only replacement preserves adjacency; legacy tombstones retain
+// their old outgoing-set ownership with or without a carried node row.
+// Payload and masks must be immutable before construction; this cached layer
+// is not a live BUILDING-generation reader.
 //
 // A GenerationLayer is safe for concurrent reads from one request.
 type GenerationLayer struct {
@@ -102,12 +112,32 @@ type GenerationLayer struct {
 	// paths is covered's key set in sorted order, built once because
 	// FilePaths promises that order.
 	paths []string
+	// contextPaths are the paths the generation declared read-only
+	// context. They are deliberately NOT in covered: the generation
+	// states no claim over them, so every ownership question about one
+	// answers "the layer below". contextList is the sorted key set.
+	contextPaths map[string]struct{}
+	contextList  []string
 	// removed is the node-tombstone set, and removedIDs its sorted form.
 	removed   map[string]struct{}
 	removedID []string
 	// edgeSources is the set of nodes whose outgoing edge set this
 	// generation replaces without claiming their file.
 	edgeSources map[string]struct{}
+
+	// Explicit mask-backed rows at unclaimed paths carry node identity. The
+	// checked marker-ID projection is captured once for this immutable layer;
+	// lower-row membership probes never turn into per-row SQL.
+	detachedIDs map[string]struct{}
+	// claimedIDs are identity-claimed rows carried at a covered path whose
+	// identity names no covered path (a shared registry row a file emits
+	// under an identity of its own). The file mask serves the row with its
+	// file; the claim is what makes the generation speak for the identity.
+	claimedIDs          map[string]struct{}
+	detachedNodes       []graph.Node
+	detachedFileIndexes map[string][]int
+	detachedPaths       map[string]struct{}
+	detachedRepos       map[string]struct{}
 
 	mu        sync.Mutex
 	nodeByID  map[string]*graph.Node
@@ -119,6 +149,39 @@ type GenerationLayer struct {
 
 	edgesOnce sync.Once
 	edges     []*graph.Edge
+
+	// presenceOnce caches whether the generation holds node and edge rows of
+	// its own. A generation is immutable once a layer is opened over it, so a
+	// layer without rows answers its row reads without SQL — its masks still
+	// apply through the composed view. The live chain carries such levels
+	// (a clean commit generation, an unchanged dirty layer).
+	presenceOnce sync.Once
+	hasNodes     bool
+	hasEdges     bool
+
+	// rowsRef is the generation's shared row slot (generation_layer_rows.go):
+	// when a small generation's rows are preloaded, the layer answers its
+	// point and batch row reads from them instead of SQL.
+	rowsRef *generationRowsRef
+}
+
+// payloadPresence reports, once per layer, whether the generation carries
+// node rows and edge rows.
+func (l *GenerationLayer) payloadPresence() (nodes, edges bool) {
+	l.presenceOnce.Do(func() {
+		l.hasNodes, l.hasEdges = l.handle.GenerationPayloadPresence()
+	})
+	return l.hasNodes, l.hasEdges
+}
+
+func (l *GenerationLayer) noNodeRows() bool {
+	nodes, _ := l.payloadPresence()
+	return !nodes
+}
+
+func (l *GenerationLayer) noEdgeRows() bool {
+	_, edges := l.payloadPresence()
+	return !edges
 }
 
 // Compile-time assertion that the persisted layer answers the same
@@ -131,25 +194,56 @@ var _ graph.OverlayLayerReader = (*GenerationLayer)(nil)
 // covers nothing, so it is refused rather than silently serving an empty
 // overlay.
 func NewGenerationLayer(handle *store_sqlite.Store) (*GenerationLayer, error) {
+	return NewGenerationLayerContext(context.Background(), handle)
+}
+
+// NewGenerationLayerContext builds one immutable generation layer while
+// honoring cancellation across every mask read. NewGenerationLayer preserves
+// the historical background-context behavior for callers without a request
+// lifetime to propagate.
+func NewGenerationLayerContext(ctx context.Context, handle *store_sqlite.Store) (*GenerationLayer, error) {
 	if handle == nil {
 		return nil, fmt.Errorf("graphview: generation layer needs a store handle")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	generation := handle.ViewGeneration()
 	if generation <= 0 {
 		return nil, fmt.Errorf("graphview: generation layer needs a derived generation, got %d", generation)
 	}
 
-	fileMasks, err := handle.FileMasks()
+	fileMasks, err := handle.FileMasksContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("graphview: read file masks of generation %d: %w", generation, err)
 	}
-	tombstones, err := handle.NodeTombstones()
+	// Read the node masks once. Derive legacy removals from the same checked
+	// enumeration rather than adding a second query for identity-only masks.
+	identityMasks, err := handle.NodeIdentityMasksContext(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("graphview: read node tombstones of generation %d: %w", generation, err)
+		return nil, fmt.Errorf("graphview: read node identity masks of generation %d: %w", generation, err)
 	}
-	edgeSources, err := handle.EdgeSourceMasks()
+	var tombstones []string
+	for _, mask := range identityMasks {
+		if mask.Kind == store_sqlite.NodeIdentityMaskLegacy {
+			tombstones = append(tombstones, mask.NodeID)
+		}
+	}
+	edgeSources, err := handle.EdgeSourceMasksContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("graphview: read edge-source masks of generation %d: %w", generation, err)
+	}
+	// Fetch only explicit marker IDs, never enumerate the upper payload.
+	// An empty marker set performs no node query.
+	summaries, err := handle.NodeIdentityMaskSummariesContext(ctx, identityMasks)
+	if err != nil {
+		return nil, fmt.Errorf("graphview: read node identities of generation %d: %w", generation, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	l := &GenerationLayer{
@@ -160,17 +254,63 @@ func NewGenerationLayer(handle *store_sqlite.Store) (*GenerationLayer, error) {
 		edgeSources: make(map[string]struct{}, len(edgeSources)),
 		nodeByID:    make(map[string]*graph.Node),
 		fileNodes:   make(map[string][]*graph.Node),
+		rowsRef:     &generationRowsRef{},
 	}
 	for _, mask := range fileMasks {
-		l.covered[mask.FilePath] = mask.Mode
+		switch mask.Mode {
+		case store_sqlite.OwnershipReplace, store_sqlite.OwnershipDelete:
+			l.covered[mask.FilePath] = mask.Mode
+		case store_sqlite.OwnershipContext:
+			if l.contextPaths == nil {
+				l.contextPaths = make(map[string]struct{})
+			}
+			l.contextPaths[mask.FilePath] = struct{}{}
+		default:
+			// A mode this reader does not know cannot be composed: every
+			// arm below would have to guess whether it hides the layer
+			// beneath. Refusing is the same answer the store's publish
+			// validation gives such a row.
+			return nil, fmt.Errorf(
+				"graphview: generation %d claims %q on %q with an unknown ownership mode",
+				generation, mask.Mode, mask.FilePath)
+		}
 	}
 	l.paths = slices.Sorted(maps.Keys(l.covered))
+	l.contextList = slices.Sorted(maps.Keys(l.contextPaths))
 	for _, id := range tombstones {
 		l.removed[id] = struct{}{}
 	}
 	slices.Sort(l.removedID)
 	for _, mask := range edgeSources {
 		l.edgeSources[mask.SourceID] = struct{}{}
+	}
+	for _, node := range summaries {
+		if node == nil || node.ID == "" {
+			return nil, fmt.Errorf("graphview: invalid node identity in generation %d", generation)
+		}
+		if l.HasFile(node.FilePath) || l.isContextPath(node.FilePath) {
+			if l.HasFile(node.FilePath) && !l.CoversNodeID(node.ID) {
+				if l.claimedIDs == nil {
+					l.claimedIDs = make(map[string]struct{})
+				}
+				l.claimedIDs[node.ID] = struct{}{}
+			}
+			continue
+		}
+		if l.detachedIDs == nil {
+			l.detachedIDs = make(map[string]struct{})
+			l.detachedPaths = make(map[string]struct{})
+			l.detachedRepos = make(map[string]struct{})
+			l.detachedFileIndexes = make(map[string][]int)
+		}
+		l.detachedIDs[node.ID] = struct{}{}
+		l.detachedFileIndexes[node.FilePath] = append(l.detachedFileIndexes[node.FilePath], len(l.detachedNodes))
+		l.detachedNodes = append(l.detachedNodes, *node)
+		l.detachedPaths[node.FilePath] = struct{}{}
+		l.detachedRepos[node.RepoPrefix] = struct{}{}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return l, nil
 }
@@ -189,8 +329,70 @@ func (l *GenerationLayer) IsTombstone(graphPath string) bool {
 	return l.covered[graphPath] == store_sqlite.OwnershipDelete
 }
 
-// FilePaths lists every claimed path in sorted order.
+// FilePaths lists every claimed path in sorted order. A context path is not
+// claimed and is deliberately absent: a caller walking this list is walking
+// what the generation speaks for.
 func (l *GenerationLayer) FilePaths() []string { return slices.Clone(l.paths) }
+
+// ContextPaths lists, in sorted order, the paths the generation declared it
+// read as context and claims nothing about. It is the audit surface for the
+// separation — a reader can tell "the generation was silent about this path"
+// from "the generation read it and decided the layer below still answers".
+func (l *GenerationLayer) ContextPaths() []string { return slices.Clone(l.contextList) }
+
+// isContextPath reports whether the generation declared a path read-only
+// context. The nil-map fast path keeps every per-row probe below free for the
+// ordinary generation, which declares none.
+func (l *GenerationLayer) isContextPath(graphPath string) bool {
+	if len(l.contextPaths) == 0 || graphPath == "" {
+		return false
+	}
+	_, ok := l.contextPaths[graphPath]
+	return ok
+}
+
+// servesNode reports whether a row this layer's handle returned may be served
+// from this layer. Payload at a context path may not: the generation carries
+// it only as the by-product of a pass it ran for other files, and the layer
+// below is the one that speaks for the path.
+func (l *GenerationLayer) servesNode(node *graph.Node) bool {
+	return node != nil && !l.isContextPath(node.FilePath)
+}
+
+// servesEdge is servesNode for the adjacency side, keyed by the file the edge
+// was recorded in — the same key the file masks settle edges by.
+func (l *GenerationLayer) servesEdge(edge *graph.Edge) bool {
+	return edge != nil && !l.isContextPath(edge.FilePath)
+}
+
+// serveNodes filters a batch answer, returning the input untouched when the
+// generation declares no context at all.
+func (l *GenerationLayer) serveNodes(nodes []*graph.Node) []*graph.Node {
+	if len(l.contextPaths) == 0 || len(nodes) == 0 {
+		return nodes
+	}
+	out := make([]*graph.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if l.servesNode(node) {
+			out = append(out, node)
+		}
+	}
+	return out
+}
+
+// serveEdges is serveNodes for edges.
+func (l *GenerationLayer) serveEdges(edges []*graph.Edge) []*graph.Edge {
+	if len(l.contextPaths) == 0 || len(edges) == 0 {
+		return edges
+	}
+	out := make([]*graph.Edge, 0, len(edges))
+	for _, edge := range edges {
+		if l.servesEdge(edge) {
+			out = append(out, edge)
+		}
+	}
+	return out
+}
 
 // CoversNodeID reports whether the generation claims the file an ID
 // belongs to. A symbol ID carries its file before the "::" separator; a
@@ -206,16 +408,20 @@ func (l *GenerationLayer) CoversNodeID(id string) bool {
 	return l.HasFile(id)
 }
 
-// OwnsNodeIdentity reports whether the generation speaks for an ID
-// itself. A tombstoned ID is answered from memory; for any other ID the
-// generation can only carry a node at a path it claims, so an ID whose
-// file it does not claim is not one it speaks for and no storage read is
-// needed to say so.
+// OwnsNodeIdentity reports whether the generation speaks for an ID.
+// An explicit identity-only marker replaces a node without owning outgoing
+// adjacency. Legacy tombstones preserve their independent outgoing claim.
 func (l *GenerationLayer) OwnsNodeIdentity(id string) bool {
 	if id == "" {
 		return false
 	}
 	if l.IsRemovedID(id) {
+		return true
+	}
+	if _, replaced := l.detachedIDs[id]; replaced {
+		return true
+	}
+	if _, claimed := l.claimedIDs[id]; claimed {
 		return true
 	}
 	return l.CoversNodeID(id) && l.NodeByID(id) != nil
@@ -230,14 +436,25 @@ func (l *GenerationLayer) OwnsNodeIdentity(id string) bool {
 // and an edge-source replacement marker, which is the case a
 // file-granular layer cannot express: the node stays where it was and
 // only what it points at moved.
+//
+// An explicit marker is honoured for a source at a claimed path too. The
+// sparse builder never writes one there (its markers cover unclaimed sources
+// only), but a per-file delta does when an evicted symbol's edges recorded in
+// OTHER files changed: the marker replaces exactly that symbol's adjacency,
+// where claiming the other files instead would hide their side tables.
 func (l *GenerationLayer) OwnsOutEdges(id string) bool {
-	if id == "" || l.CoversNodeID(id) {
+	if id == "" {
 		return false
 	}
 	if _, marked := l.edgeSources[id]; marked {
 		return true
 	}
-	return l.OwnsNodeIdentity(id)
+	if l.CoversNodeID(id) {
+		return false
+	}
+	// Identity-only masks do not own adjacency. Legacy tombstones retain
+	// outgoing ownership, whether or not they also carry a node row.
+	return l.IsRemovedID(id)
 }
 
 // IsRemovedID reports whether the generation tombstoned an identity.
@@ -292,13 +509,22 @@ func (l *GenerationLayer) NodeByID(id string) *graph.Node {
 	if id == "" {
 		return nil
 	}
+	if rows := l.preloadedRows(); rows != nil {
+		return l.rowsNode(rows, id)
+	}
 	l.mu.Lock()
 	cached, ok := l.nodeByID[id]
 	l.mu.Unlock()
 	if ok {
 		return cached
 	}
-	node := l.handle.GetNode(id)
+	var node *graph.Node
+	if !l.noNodeRows() {
+		node = l.handle.GetNode(id)
+	}
+	if !l.servesNode(node) {
+		node = nil
+	}
 	l.mu.Lock()
 	l.nodeByID[id] = node
 	l.mu.Unlock()
@@ -310,7 +536,28 @@ func (l *GenerationLayer) NodeByQualName(qualName string) *graph.Node {
 	if qualName == "" {
 		return nil
 	}
-	return l.handle.GetNodeByQualName(qualName)
+	node := l.handle.GetNodeByQualName(qualName)
+	if !l.servesNode(node) {
+		return nil
+	}
+	return node
+}
+
+// GetNodesByQualNames reads only candidates for the requested qualified names.
+// The handle binds the generation; context-only payload stays invisible just
+// as it does in the point and whole-layer reads. This deliberately leaves the
+// whole-generation node cache untouched.
+func (l *GenerationLayer) GetNodesByQualNames(qualNames []string) map[string][]*graph.Node {
+	hits := l.handle.GetNodesByQualNames(qualNames)
+	for name, nodes := range hits {
+		visible := l.serveNodes(nodes)
+		if len(visible) == 0 {
+			delete(hits, name)
+		} else {
+			hits[name] = visible
+		}
+	}
+	return hits
 }
 
 // NodesByName returns the generation's nodes carrying one short name.
@@ -318,7 +565,7 @@ func (l *GenerationLayer) NodesByName(name string) []*graph.Node {
 	if name == "" {
 		return nil
 	}
-	return l.handle.FindNodesByName(name)
+	return l.serveNodes(l.handle.FindNodesByName(name))
 }
 
 // NamedNodes iterates the generation's short names with the nodes
@@ -334,6 +581,53 @@ func (l *GenerationLayer) NamedNodes() iter.Seq2[string, []*graph.Node] {
 	}
 }
 
+// VisitNodesByNameContainingFolded streams matching payload rows through the
+// generation's context mask. The Store applies the exact Unicode-folded name
+// predicate; filtering context rows here lets the caller count only rows this
+// layer is allowed to serve.
+func (l *GenerationLayer) VisitNodesByNameContainingFolded(substr string, yield func(*graph.Node) bool) {
+	l.handle.VisitNodesByNameContainingFolded(substr, func(node *graph.Node) bool {
+		if !l.servesNode(node) {
+			return true
+		}
+		return yield(node)
+	})
+}
+
+// GetOutEdgesByNodeIDs is the batched sibling of OutEdges. It preserves an
+// entry for every distinct non-empty requested ID and filters each adjacency
+// through the same context-path predicate as the point read.
+func (l *GenerationLayer) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	if len(ids) == 0 {
+		return nil
+	}
+	var batch map[string][]*graph.Edge
+	rows := l.preloadedRows()
+	switch {
+	case rows != nil:
+		batch = rows.outBatch
+	case !l.noEdgeRows():
+		batch = l.handle.GetOutEdgesByNodeIDs(ids)
+	}
+	out := make(map[string][]*graph.Edge, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		if rows != nil {
+			out[id] = l.copyServedEdges(batch[id])
+			continue
+		}
+		out[id] = l.serveEdges(batch[id])
+	}
+	return out
+}
+
 // Nodes iterates every node the generation carries.
 func (l *GenerationLayer) Nodes() iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
@@ -346,12 +640,29 @@ func (l *GenerationLayer) Nodes() iter.Seq[*graph.Node] {
 	}
 }
 
+// NodesByKind iterates only payload rows of kind. Unlike Nodes, it does not
+// populate the whole-generation node/name cache: composed kind readers need
+// neither the other kinds nor the bulk-name index. The Store may materialize
+// this bounded kind result before yielding it.
+func (l *GenerationLayer) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
+	return func(yield func(*graph.Node) bool) {
+		for n := range l.handle.NodesByKind(kind) {
+			if n == nil || !l.servesNode(n) {
+				continue
+			}
+			if !yield(n) {
+				return
+			}
+		}
+	}
+}
+
 // loadNodes materializes the generation's node set and its short-name
 // index in one scan. Both are whole-layer reads, so paying for the scan
 // twice would only add a second round trip for the same rows.
 func (l *GenerationLayer) loadNodes() {
 	l.nodesOnce.Do(func() {
-		l.nodes = l.handle.AllNodes()
+		l.nodes = l.serveNodes(l.handle.AllNodes())
 		l.named = make(map[string][]*graph.Node, len(l.nodes))
 		for _, n := range l.nodes {
 			if n == nil || n.Name == "" {
@@ -376,7 +687,10 @@ func (l *GenerationLayer) FileNodes(graphPath string) []*graph.Node {
 	if ok {
 		return cached
 	}
-	nodes := l.handle.GetFileNodes(graphPath)
+	var nodes []*graph.Node
+	if !l.noNodeRows() {
+		nodes = l.serveNodes(l.handle.GetFileNodes(graphPath))
+	}
 	l.mu.Lock()
 	l.fileNodes[graphPath] = nodes
 	l.mu.Unlock()
@@ -385,24 +699,30 @@ func (l *GenerationLayer) FileNodes(graphPath string) []*graph.Node {
 
 // OutEdges returns the generation's edges leaving one node.
 func (l *GenerationLayer) OutEdges(nodeID string) []*graph.Edge {
-	if nodeID == "" {
+	if rows := l.preloadedRows(); rows != nil && nodeID != "" {
+		return l.copyServedEdges(rows.outLine[nodeID])
+	}
+	if nodeID == "" || l.noEdgeRows() {
 		return nil
 	}
-	return l.handle.GetOutEdges(nodeID)
+	return l.serveEdges(l.handle.GetOutEdges(nodeID))
 }
 
 // InEdges returns the generation's edges entering one node.
 func (l *GenerationLayer) InEdges(nodeID string) []*graph.Edge {
-	if nodeID == "" {
+	if rows := l.preloadedRows(); rows != nil && nodeID != "" {
+		return l.copyServedEdges(rows.inKind[nodeID])
+	}
+	if nodeID == "" || l.noEdgeRows() {
 		return nil
 	}
-	return l.handle.GetInEdges(nodeID)
+	return l.serveEdges(l.handle.GetInEdges(nodeID))
 }
 
 // Edges iterates every edge the generation carries.
 func (l *GenerationLayer) Edges() iter.Seq[*graph.Edge] {
 	return func(yield func(*graph.Edge) bool) {
-		l.edgesOnce.Do(func() { l.edges = l.handle.AllEdges() })
+		l.edgesOnce.Do(func() { l.edges = l.serveEdges(l.handle.AllEdges()) })
 		for _, e := range l.edges {
 			if !yield(e) {
 				return

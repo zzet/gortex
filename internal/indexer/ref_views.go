@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -15,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
@@ -60,12 +63,6 @@ const (
 	// produce. It is not the checkout owner kind: these generations belong to
 	// no checkout, which is the whole point of a ref view.
 	refViewOwnerKind = "ref_view"
-
-	// refViewResolverVersion stamps the resolution contract a ref view's
-	// generations were built under. Raising it makes every stored ref-view
-	// generation miss, which is what a change in what resolution emits
-	// requires — the stored payload is not what this binary would produce.
-	refViewResolverVersion = "1"
 
 	// defaultEnrichmentProfile is the profile a request that names none is
 	// served under. The profile is part of the view's catalog key and part of
@@ -197,10 +194,60 @@ type RefViewManagerConfig struct {
 	// invalidates a view's payload instead of composing two payloads built
 	// under different rules.
 	Config config.IndexConfig
+	// ConfigSections carries the output-affecting configuration domains that
+	// live outside config.IndexConfig — artifacts, semantic, LSP, workspace,
+	// project — exactly as a checkout coordinator carries them. They widen the
+	// generation's config_hash beyond the index configuration and are part of
+	// the dependency cohort.
+	//
+	// A manager handed none still builds: its config digest then covers the
+	// versioned snapshot fingerprint alone (which already carries the whole
+	// index configuration plus the repo/workspace/project envelope), and its
+	// cohort is degraded rather than certified.
+	ConfigSections []DependencyRevisionConfigSection
+	// ConfigSectionsFor is ConfigSections re-read per description instead of
+	// frozen at construction, and it is what a caller holding a live
+	// configuration passes.
+	//
+	// A manager outlives the configuration it was built under: it is cached
+	// per repository for the life of the daemon, while a reload swaps the
+	// repository's whole config.Config underneath it. A frozen section list
+	// therefore keeps keying generations on the artifacts / semantic / LSP /
+	// workspace / project domains as they stood when the first selection
+	// happened to build the manager, and a view built after the reload reuses
+	// a generation produced under rules that no longer apply. Re-reading costs
+	// one config lookup on a memo MISS — the same lookup the fallback derived
+	// from the builder link already made — and is paid only when a description
+	// is being taken anyway.
+	//
+	// nil falls back to ConfigSections, then to the builder link.
+	ConfigSectionsFor func(repoPrefix string) []DependencyRevisionConfigSection
+	// Leases enumerates the repository roster the dependency cohort is
+	// described from. nil leaves every identity on the stable degraded
+	// revision — honest, and outside the certified vocabulary — rather than on
+	// the empty revision, which the reuse guards read as matching anything.
+	Leases *graphview.LeaseManager
 	Logger *zap.Logger
 	// Gate holds a claimed build's pass while the daemon warms up. nil admits
 	// every build at once, which is what a manager outside a warmup has.
 	Gate *ViewBuildGate
+	// RequestBase asks the committed-base publisher for the base of one
+	// repository because a ref view of it now needs one.
+	//
+	// It is the ref view's half of the committed-base consumer gate. The
+	// startup publisher and the live advance trigger both decline a family
+	// with no reader (InitialBasePublisher.publish's "no dependent checkout"
+	// skip), and a ref view IS one of the two readers that gate counts
+	// (CheckoutLifecycle.dedicatedBaseConsumers) — so a view created on a
+	// running daemon whose family has no other consumer finds generation 0 and
+	// nothing would ever publish for it. This is what asks.
+	//
+	// The same shape a checkout coordinator is wired with
+	// (CheckoutCoordinatorConfig.RequestBase): it takes the repository prefix,
+	// must never publish on the caller's goroutine and must never block. nil
+	// asks nothing, which is the manager a test or a non-lifecycle caller
+	// builds, and leaves the view exactly in the legacy regime it had before.
+	RequestBase func(repoPrefix string)
 
 	// buildBarrier is a test seam: it runs between a build pass finishing and
 	// the publish step re-resolving the selector, which is exactly the window
@@ -220,16 +267,58 @@ type RefViewManagerConfig struct {
 // RefViewManager serves ref views of one store's graphs. It holds no
 // per-request state and is safe to use from many goroutines.
 type RefViewManager struct {
-	store   *store_sqlite.Store
-	catalog *store_sqlite.Catalog
-	builder *SparseGenerationBuilder
-	logger  *zap.Logger
-	gate    *ViewBuildGate
+	lifetime refViewLifetime
+	store    *store_sqlite.Store
+	catalog  *store_sqlite.Catalog
+	builder  *SparseGenerationBuilder
+	logger   *zap.Logger
+	gate     *ViewBuildGate
 
-	configHash string
-	extractors string
+	config            config.IndexConfig
+	configSections    []DependencyRevisionConfigSection
+	configSectionsFor func(string) []DependencyRevisionConfigSection
+
+	leases          *graphview.LeaseManager
+	extractors      string
+	resolverVersion string
+
+	// identityMu guards the per-target identity keys below.
+	//
+	// A manager serves one repository, so the target triple every request
+	// carries is the same one every time; the keys are memoized rather than
+	// re-derived per request because describing a cohort takes a roster lease
+	// and a catalog read per in-scope member, and a selection that answers
+	// "already current" must not pay that.
+	identityMu   sync.Mutex
+	identityKeys map[string]refViewIdentityKeys
+	// identityRefused is the degraded identity each target was last SERVED
+	// under, and it is not a memo: it never suppresses a description. A
+	// refusal re-describes on every selection (identityKeysFor says why), and
+	// this only keeps the answer that refusal yields steady while it lasts.
+	// Without it a refusal class that flaps between transient causes — a
+	// roster that moved, a sibling not yet indexed, admissions closing — moves
+	// the degraded revision per selection, which re-keys the view's
+	// fingerprint and starts a build for a cohort that did not change. Dropped
+	// wherever the memo is dropped, and by the first description that
+	// certifies.
+	identityRefused map[string]refViewIdentityKeys
 
 	buildBarrier func()
+
+	// requestBase is RefViewManagerConfig.RequestBase; nil asks nothing.
+	requestBase func(string)
+	// baseDemandMu guards the throttle below. It is its own lock because the
+	// ask happens on a selection's goroutine, before anything else the
+	// selection does, and many selections run at once.
+	baseDemandMu sync.Mutex
+	// lastBaseDemand is when this manager last asked for one repository's
+	// committed base. Keyed by repository prefix rather than held as a single
+	// stamp because base() derives the prefix from the graph row it just read:
+	// a manager is cached per repository today, and a throttle that assumed it
+	// would silently start starving the second repository if that ever stopped
+	// being true. Stamps older than the interval are dropped as they are
+	// passed, so the map holds only what it can still refuse.
+	lastBaseDemand map[string]time.Time
 
 	buildGrace     time.Duration
 	buildHeartbeat time.Duration
@@ -249,19 +338,36 @@ func NewRefViewManager(cfg RefViewManagerConfig) (*RefViewManager, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	if cfg.Leases == nil {
+		// Not a refusal: a ref view with no roster to enumerate still keys its
+		// generations on a STABLE degraded revision, which is strictly better
+		// than the empty legacy value every stored generation matches. But it
+		// is not a certificate either, and a manager that runs this way for
+		// the life of a daemon should say so once rather than per selection.
+		logger.Warn("ref view: no repository roster to describe this manager's input cohort with; " +
+			"every generation it keys will carry a degraded dependency revision")
+	}
 	return &RefViewManager{
-		store:          cfg.Store,
-		catalog:        cfg.Store.Catalog(),
-		builder:        cfg.Builder,
-		logger:         logger,
-		gate:           cfg.Gate,
-		configHash:     indexConfigHash(cfg.Config),
-		extractors:     extractorVersionsFingerprint(),
-		buildBarrier:   cfg.buildBarrier,
-		buildGrace:     refViewWindow(cfg.buildGrace, refViewBuildGrace),
-		buildHeartbeat: refViewWindow(cfg.buildHeartbeat, refViewBuildHeartbeat),
-		buildLiveness:  refViewWindow(cfg.buildLiveness, refViewBuildLiveness),
-		writerBudget:   refViewWindow(cfg.writerBudget, refViewWriterBudget),
+		store:             cfg.Store,
+		catalog:           cfg.Store.Catalog(),
+		builder:           cfg.Builder,
+		logger:            logger,
+		gate:              cfg.Gate,
+		config:            cfg.Config,
+		configSections:    append([]DependencyRevisionConfigSection(nil), cfg.ConfigSections...),
+		configSectionsFor: cfg.ConfigSectionsFor,
+		leases:            cfg.Leases,
+		extractors:        extractorVersionsFingerprint(),
+		resolverVersion:   resolverVersionFingerprint(),
+		identityKeys:      map[string]refViewIdentityKeys{},
+		identityRefused:   map[string]refViewIdentityKeys{},
+		buildBarrier:      cfg.buildBarrier,
+		requestBase:       cfg.RequestBase,
+		lastBaseDemand:    map[string]time.Time{},
+		buildGrace:        refViewWindow(cfg.buildGrace, refViewBuildGrace),
+		buildHeartbeat:    refViewWindow(cfg.buildHeartbeat, refViewBuildHeartbeat),
+		buildLiveness:     refViewWindow(cfg.buildLiveness, refViewBuildLiveness),
+		writerBudget:      refViewWindow(cfg.writerBudget, refViewWriterBudget),
 	}, nil
 }
 
@@ -303,7 +409,12 @@ func (m *RefViewManager) EnsureRefView(ctx context.Context, req RefViewRequest) 
 	if err := m.validate(&req); err != nil {
 		return RefViewResult{}, err
 	}
-	base, err := m.base(ctx, req.GraphID)
+	ctx, release, err := m.lifetime.admit(ctx, false)
+	if err != nil {
+		return RefViewResult{}, err
+	}
+	defer release()
+	base, owedBase, err := m.base(ctx, req.GraphID)
 	if err != nil {
 		return RefViewResult{}, err
 	}
@@ -318,7 +429,37 @@ func (m *RefViewManager) EnsureRefView(ctx context.Context, req RefViewRequest) 
 		return m.failed(ctx, view, err)
 	}
 
-	identity := m.identity(viewID, base, resolved.TreeOID)
+	// The ask for a committed base the family has not published, placed HERE
+	// and not where the absence was noticed (m.base, above).
+	//
+	// AFTER m.row, because the publication it triggers is itself
+	// consumer-gated and THIS view is the consumer: InitialBasePublisher.publish
+	// re-reads the census (CheckoutLifecycle.dedicatedBaseConsumers, whose ref
+	// view arm is ListRefViews(graph) len > 0) on the publisher's own worker.
+	// Asking before the row is written races that worker: it sees zero ref
+	// views, skips with "no dependent checkout", and the ask is SPENT — the
+	// publisher's pending list no longer holds the prefix and the throttle
+	// below refuses the next one for dedicatedBaseDemandInterval. Since
+	// nothing re-selects a ref view on its own, a one-shot client could end
+	// with no base published at all. The row is committed by the time m.row
+	// returns, so a publication demanded from here always finds its consumer.
+	//
+	// AFTER resolution, because a selector naming a ref that does not exist
+	// must not trigger the daemon's single largest write. That selection
+	// returns through m.failed above; the row it leaves behind makes the
+	// family a census consumer, so the base is still owed and the next
+	// publication attempt — a HEAD movement, a daemon start, or the next
+	// selection that actually resolves — will publish it.
+	//
+	// It changes nothing about THIS selection either way: the publication is
+	// queued on the publisher's own list and built off this goroutine, this
+	// view is built over generation 0, and when the base lands the view
+	// re-selects onto it — the build fingerprint carries the base
+	// (refViewBuildFingerprint over identity), so activeIsCurrent says no and
+	// the next selection rebuilds over the published base.
+	m.demandCommittedBase(owedBase)
+
+	identity := m.identity(ctx, req, viewID, base, resolved.TreeOID)
 	fingerprint := refViewBuildFingerprint(identity, req.EnrichmentProfile)
 	current, err := m.activeIsCurrent(ctx, view, fingerprint)
 	if err != nil {
@@ -408,16 +549,87 @@ func (m *RefViewManager) validate(req *RefViewRequest) error {
 	return nil
 }
 
-// base resolves the corpus a view's layer sits on.
-func (m *RefViewManager) base(ctx context.Context, graphID string) (primaryBase, error) {
+// base resolves the corpus a view's layer sits on, and names the repository
+// that is OWED a committed base because the graph has published none.
+//
+// It only names it: base is a read and stays one. The ask itself belongs
+// strictly later in the selection, after the view's catalog row exists — see
+// EnsureRefView's demand paragraph for why the order is load-bearing.
+//
+// A graph whose base is already a published generation returns an empty
+// prefix, which is what "nothing to ask for" is.
+func (m *RefViewManager) base(ctx context.Context, graphID string) (primaryBase, string, error) {
 	dedicated, found, err := m.catalog.GetDedicatedGraph(ctx, graphID)
 	if err != nil {
-		return primaryBase{}, err
+		return primaryBase{}, "", err
 	}
 	if !found {
-		return primaryBase{}, fmt.Errorf("indexer: graph %s has no dedicated-graph row to build over", graphID)
+		return primaryBase{}, "", fmt.Errorf("indexer: graph %s has no dedicated-graph row to build over", graphID)
 	}
-	return graphBase(ctx, m.catalog, dedicated)
+	base, err := graphBase(ctx, m.catalog, dedicated)
+	if err != nil || base.generationID != 0 {
+		return base, "", err
+	}
+	// graphBase's SECOND arm: the graph has published no generation, so this
+	// view composes over the shared indexed corpus — which is rewritten IN
+	// PLACE as the primary moves (pinRoutedBase's LEGACY REGIME paragraph).
+	// That is a supported regime and the selection carries on in it,
+	// truthfully; what it must not be is PERMANENT.
+	//
+	// Since the committed base became consumer-gated, nothing publishes for a
+	// family whose only reader is a ref view unless something asks: a daemon
+	// start and a HEAD movement both decline ("no dependent checkout"), and
+	// dedicatedBaseConsumers counts this view only once a publication is
+	// already being attempted. A view created on a running daemon would
+	// therefore wait for the next HEAD movement or the next daemon start,
+	// unbounded on an idle-HEAD repository.
+	return base, dedicated.RepoPrefix, nil
+}
+
+// demandCommittedBase asks the publisher for one repository's committed base,
+// at most once per dedicatedBaseDemandInterval.
+//
+// The throttle is not a de-duplicator — InitialBasePublisher.RequestBase
+// already coalesces onto a queued request, so a burst costs one queue lookup
+// each. It bounds the case the coalescing cannot: a publication that was
+// ATTEMPTED and failed leaves nothing queued, and selection is the only thing
+// that ever notices a ref moved, so a client polling a building view would
+// otherwise re-enter the whole publication protocol (including the authority
+// claim, which writes) once per poll for as long as the failure lasts.
+//
+// Same interval as the dependent checkout's ask, and for the same reason: the
+// two are one policy about how often a reader may re-ask for a base that is
+// not there.
+func (m *RefViewManager) demandCommittedBase(repoPrefix string) {
+	if m == nil || m.requestBase == nil || repoPrefix == "" {
+		return
+	}
+	now := time.Now()
+	m.baseDemandMu.Lock()
+	if m.lastBaseDemand == nil {
+		// A manager built by struct literal rather than by NewRefViewManager
+		// (no test does today, and the constructor is the only production
+		// door) still throttles instead of panicking on the write below.
+		m.lastBaseDemand = map[string]time.Time{}
+	}
+	// Drop stamps the throttle can no longer act on. An entry older than the
+	// interval refuses nothing, so deleting it changes no decision, and it
+	// keeps a map written on a CLIENT-DRIVEN path from being unbounded: the
+	// map holds at most the repositories asked for within the last interval,
+	// however many prefixes a manager is ever handed. The scan is over that
+	// same tiny set, on a path that runs at most once per selection.
+	for prefix, at := range m.lastBaseDemand {
+		if now.Sub(at) >= dedicatedBaseDemandInterval {
+			delete(m.lastBaseDemand, prefix)
+		}
+	}
+	if last, asked := m.lastBaseDemand[repoPrefix]; asked && now.Sub(last) < dedicatedBaseDemandInterval {
+		m.baseDemandMu.Unlock()
+		return
+	}
+	m.lastBaseDemand[repoPrefix] = now
+	m.baseDemandMu.Unlock()
+	m.requestBase(repoPrefix)
 }
 
 // activeIsCurrent reports whether the generation the view already serves was
@@ -655,8 +867,15 @@ func (m *RefViewManager) runDetached(
 	// Buffered by one: the grace can end the wait first, and the build must
 	// never block on a receiver that has already answered.
 	done := make(chan outcome, 1)
-	buildCtx := context.WithoutCancel(ctx)
+	buildCtx, releaseBuild, admissionErr := m.lifetime.admit(ctx, true)
+	if admissionErr != nil {
+		closingCtx, cancel := context.WithTimeout(context.Background(), m.writerBudget)
+		defer cancel()
+		m.completeBuild(closingCtx, build, store_sqlite.ViewGenerationFailed, 0, admissionErr.Error())
+		return RefViewResult{}, admissionErr
+	}
 	go func() {
+		defer releaseBuild()
 		stop := m.heartbeat(buildCtx, build)
 		defer stop()
 		release, err := m.gate.Acquire(buildCtx, ViewBuildInteractive)
@@ -972,7 +1191,10 @@ func closingContext(ctx context.Context) context.Context {
 // payload, and keying on the commit would rebuild for a rebase that changed
 // nothing a reader can see. Which commit the view is AT lives on the view's
 // row, where it can be re-stamped without touching the payload.
-func (m *RefViewManager) identity(viewID string, base primaryBase, targetTree string) GenerationIdentity {
+func (m *RefViewManager) identity(
+	ctx context.Context, req RefViewRequest, viewID string, base primaryBase, targetTree string,
+) GenerationIdentity {
+	keys := m.identityKeysFor(ctx, req)
 	return GenerationIdentity{
 		OwnerKind:            refViewOwnerKind,
 		GraphID:              base.graphID,
@@ -981,10 +1203,290 @@ func (m *RefViewManager) identity(viewID string, base primaryBase, targetTree st
 		BaseGenerationID:     base.generationID,
 		LowerViewFingerprint: base.treeOID,
 		TreeOID:              targetTree,
-		ConfigHash:           m.configHash,
+		ConfigHash:           keys.configHash,
 		ExtractorVersions:    m.extractors,
-		ResolverVersion:      refViewResolverVersion,
+		ResolverVersion:      m.resolverVersion,
+		DependencyRevision:   keys.dependencyRevision,
 	}
+}
+
+// InvalidateDependencyCohort drops the manager's cached identity keys so the
+// next selection derives them again.
+//
+// The keys are cached for the same reason the coordinator caches its cohort:
+// describing one takes a daemon-wide roster read lease and a catalog read per
+// in-scope member, and a selection that answers "already current" must not pay
+// that. The cache is therefore refreshed on events — a repository registered or
+// closed, a sibling's tree moved, the configuration reloaded — and this is the
+// entry point for them. Without it a certified revision would be frozen for the
+// life of the manager, which is a freshness certificate that stops being true.
+//
+// The checkout lifecycle is the event source in production: it calls this (and
+// the coordinators' counterpart) when a repository owner is registered, when a
+// repository's registry entry is torn down, and when the repository
+// configuration is reloaded. The remaining source — a workspace SIBLING's HEAD
+// or committed tree moving without any lifecycle event — lives in the git
+// watcher and is NOT wired yet; until it is, a certified revision can name a
+// sibling tree OID that has since moved. The window is bounded by the topology
+// token below (membership moves are self-observed) and by the rule that every
+// degraded description is re-derived on the next selection.
+func (m *RefViewManager) InvalidateDependencyCohort(reason string) {
+	if m == nil {
+		return
+	}
+	m.identityMu.Lock()
+	m.identityKeys = map[string]refViewIdentityKeys{}
+	// The held degraded identities go with them: they are steady only for as
+	// long as nothing said the inputs moved, and this is that statement.
+	m.identityRefused = map[string]refViewIdentityKeys{}
+	m.identityMu.Unlock()
+	m.logger.Debug("ref view: dependency cohort invalidated", zap.String("reason", reason))
+}
+
+// InvalidateDependencyCohortFor is InvalidateDependencyCohort narrowed to the
+// targets one repository's move can have reached.
+//
+// A manager serves one repository but is handed its target per request, so its
+// memo can hold entries for more than one workspace — and for the empty
+// workspace, which is what a request that names none carries. An event that
+// moved ONE workspace's inputs must not make every other target pay a fresh
+// description — a roster lease and a catalog read per in-scope member — for an
+// answer that did not move.
+//
+// Two things match, and the second is why the repository is an argument at
+// all. A target in the event's workspace names the moved repository's bytes
+// through the workspace scope. A target whose repository IS the moved one
+// names them whatever workspace it was requested under, INCLUDING the empty
+// one: such an entry is repository-scoped, its topology token is the constant
+// repository-scope string, so nothing else in this manager could ever move it.
+//
+// Both empty drops every entry, which is what a caller that can name neither
+// means.
+func (m *RefViewManager) InvalidateDependencyCohortFor(repoPrefix, workspaceID, reason string) {
+	if m == nil {
+		return
+	}
+	if workspaceID == "" && repoPrefix == "" {
+		m.InvalidateDependencyCohort(reason)
+		return
+	}
+	matches := func(keys refViewIdentityKeys) bool {
+		if workspaceID != "" && keys.workspaceID == workspaceID {
+			return true
+		}
+		return repoPrefix != "" && keys.repoPrefix == repoPrefix
+	}
+	dropped := 0
+	m.identityMu.Lock()
+	for key, keys := range m.identityKeys {
+		if matches(keys) {
+			delete(m.identityKeys, key)
+			dropped++
+		}
+	}
+	for key, keys := range m.identityRefused {
+		if matches(keys) {
+			delete(m.identityRefused, key)
+		}
+	}
+	m.identityMu.Unlock()
+	if dropped == 0 {
+		return
+	}
+	m.logger.Debug("ref view: dependency cohort invalidated",
+		zap.String("repo", repoPrefix), zap.String("workspace", workspaceID),
+		zap.String("reason", reason), zap.Int("targets", dropped))
+}
+
+// refViewIdentityKeys are the two identity columns a ref view derives from its
+// target rather than from its selector: the widened configuration digest and
+// the dependency cohort revision.
+//
+// repoPrefix, workspaceID and topology are not identity columns; they are what
+// decides whether this entry may still be served. The first two are the
+// target's, so a narrowed invalidation can drop exactly the entries one
+// repository's move reached — including a target requested with no workspace
+// at all, which no workspace-keyed event could ever name. topology is the
+// cheap workspace-membership observation the cohort was described under — the
+// same one a coordinator's poll re-checks — so a repository tracked into or
+// out of the workspace re-describes without needing an event to reach the
+// manager.
+type refViewIdentityKeys struct {
+	configHash         string
+	dependencyRevision string
+	repoPrefix         string
+	workspaceID        string
+	topology           string
+}
+
+// identityKeysFor derives — and memoizes — the two target-derived identity
+// columns.
+//
+// They were both wrong before this: the config digest covered
+// config.IndexConfig alone, so a ref view stayed reusable across an artifacts /
+// semantic / LSP / workspace / project change, and the dependency revision was
+// left empty, which generationIdentityKey renders byte-for-byte as the legacy
+// pre-cohort key that every stored generation matches. A ref view composes over
+// the same corpus a checkout layer does and is built by the same builder, so it
+// carries the same two columns, derived the same way.
+//
+// The target triple is the memo key rather than the manager's construction
+// arguments because a manager is built per repository but handed its target by
+// each request (RefViewRequest.RepoPrefix / WorkspaceID / ProjectID).
+//
+// Only a CERTIFIED description is memoized. A refusal is a fact about the
+// moment, not about the cohort — a roster that moved under the lease, a
+// workspace sibling that is tracked but not yet indexed, admissions closing —
+// and every one of them clears on its own. Caching one would pin a degraded
+// revision for the life of the manager, which is the state a ref view never
+// leaves on its own: unlike a coordinator, nothing here re-describes per build.
+func (m *RefViewManager) identityKeysFor(ctx context.Context, req RefViewRequest) refViewIdentityKeys {
+	key := req.RepoPrefix + "\x00" + req.WorkspaceID + "\x00" + req.ProjectID
+	// Sampled BEFORE the description, for the reason the coordinator samples it
+	// there: a membership change that lands while the cohort is being described
+	// leaves the entry recorded under the OLDER token, so the next selection
+	// describes again rather than settling on a token the description never saw.
+	topology := m.cohortTopology(req)
+	m.identityMu.Lock()
+	if cached, found := m.identityKeys[key]; found && cached.topology == topology {
+		m.identityMu.Unlock()
+		return cached
+	}
+	m.identityMu.Unlock()
+
+	sections := m.sectionsFor(req.RepoPrefix)
+
+	cohort := dependencyCohortSource{
+		Target: DependencyRevisionTarget{
+			RepoPrefix:  req.RepoPrefix,
+			WorkspaceID: req.WorkspaceID,
+			ProjectID:   req.ProjectID,
+		},
+		Leases:           m.leases,
+		Catalog:          m.catalog,
+		WorkspaceMembers: builderWorkspaceMembers(m.builder, req.WorkspaceID),
+		Config:           m.config,
+		ConfigSections:   sections,
+		Ownership: []DependencyRevisionOwnership{{
+			RepoPrefix: req.RepoPrefix,
+			Language:   "go",
+			Owner:      goPackageOwnershipTargetEvidence,
+		}},
+		Producers:         cohortProducerPolicy(m.config, m.builder != nil && m.builder.Embedder != nil),
+		Capabilities:      cohortCapabilityVocabulary(),
+		ExtractorVersions: m.extractors,
+		SourceBudget:      dependencyRevisionSourceBudget,
+	}
+
+	keys := refViewIdentityKeys{
+		repoPrefix: req.RepoPrefix, workspaceID: req.WorkspaceID, topology: topology,
+	}
+	_, fingerprint, err := snapshotDedicatedBaseConfig(
+		m.config, req.RepoPrefix, req.WorkspaceID, req.ProjectID)
+	if err != nil {
+		// The same fail-safe indexConfigHash has always used for a
+		// configuration that cannot be encoded: a digest nothing matches, so
+		// such a build is its own identity and reuses nothing.
+		keys.configHash = "unhashable-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		m.logger.Warn("ref view: the index configuration could not be digested; "+
+			"this view's generations reuse nothing",
+			zap.String("repo", req.RepoPrefix), zap.Error(err))
+	} else {
+		keys.configHash = checkoutConfigHash(fingerprint, sections)
+	}
+
+	revision, err := cohort.revision(ctx)
+	if err != nil {
+		revision = cohort.degradedRevision(dependencyCohortRefusalReason(err))
+		m.logger.Debug("ref view: the resolver-visible input cohort could not be described; "+
+			"this view's generations carry a degraded revision",
+			zap.String("repo", req.RepoPrefix), zap.Error(err))
+	}
+	keys.dependencyRevision = revision
+
+	// Only a certificate is memoized. Every refusal — the request's own context
+	// ending, a roster that moved under the lease, admissions stopping, a
+	// workspace sibling that is tracked but not yet indexed — is transient by
+	// construction, and the manager has no build path that would re-describe it
+	// later. Caching one therefore does not save a description, it permanently
+	// replaces every future certificate with the degraded value this one moment
+	// produced. Answer THIS call with it; let the next selection describe again.
+	//
+	// What that costs, stated rather than hidden: while a cohort stays
+	// undescribable every selection pays one description — a roster read lease
+	// and a read per in-scope member — where a memoized refusal would have paid
+	// it once. That is the price of noticing the moment it clears, and it is
+	// strictly less than the builds a frozen false identity would trigger. It
+	// is NOT the coordinator's degraded-poll rule: a poll fires on a timer for
+	// every checkout in the daemon, a selection only when someone asks.
+	//
+	// The one thing that is not left to re-derive is the ANSWER. A refusal's
+	// degraded revision carries the refusal's reason, so a transient whose
+	// class flaps — roster-moved on one selection, raw-pending on the next —
+	// would hand out a different identity each time, and a ref view's
+	// fingerprint moving is a BUILD. So the degraded identity a target was
+	// last served under is held steady for as long as the refusals last: still
+	// re-described every selection, still replaced the moment one certifies,
+	// still dropped by any invalidation that says the inputs moved.
+	if err != nil {
+		m.identityMu.Lock()
+		if held, found := m.identityRefused[key]; found && held.topology == topology {
+			keys.dependencyRevision = held.dependencyRevision
+		} else {
+			m.identityRefused[key] = keys
+		}
+		m.identityMu.Unlock()
+		return keys
+	}
+	m.identityMu.Lock()
+	m.identityKeys[key] = keys
+	delete(m.identityRefused, key)
+	m.identityMu.Unlock()
+	return keys
+}
+
+// sectionsFor is the configuration domains outside config.IndexConfig that
+// this description keys on, in the order of how current each source is.
+//
+// A live source (ConfigSectionsFor, what CheckoutLifecycle.refViewManager
+// passes) is asked first, because a manager outlives the configuration it was
+// built under: it is cached per repository for the life of the daemon, and a
+// reload swaps that repository's config.Config underneath it. Second is the
+// construction-time list, which is what a caller with a fixed configuration
+// has. Last is the builder link — the live Indexer's MultiIndexer and ITS
+// ConfigManager — which answers for a manager nobody handed sections to, and
+// nil for one whose Indexer has no mutation owner. An EMPTY answer is not
+// neutral: it collapses the widened configuration digest back onto
+// config.IndexConfig alone, so a stored generation stays reusable across an
+// artifacts / semantic / LSP / workspace / project change.
+//
+// Called on a memo MISS only, which is the same call that is about to take a
+// roster lease and a catalog read per in-scope member.
+func (m *RefViewManager) sectionsFor(repoPrefix string) []DependencyRevisionConfigSection {
+	if m.configSectionsFor != nil {
+		if live := m.configSectionsFor(repoPrefix); len(live) > 0 {
+			return live
+		}
+	}
+	if len(m.configSections) > 0 {
+		return m.configSections
+	}
+	return builderConfigSections(m.builder, repoPrefix)
+}
+
+// cohortTopology is the cheap workspace-membership observation the memo is
+// keyed on. It reads only the MultiIndexer's repository topology (a map walk
+// under that struct's own read lock) — no roster lease, no catalog read — so a
+// selection that answers "already current" can pay it every time.
+func (m *RefViewManager) cohortTopology(req RefViewRequest) string {
+	return dependencyCohortSource{
+		Target: DependencyRevisionTarget{
+			RepoPrefix:  req.RepoPrefix,
+			WorkspaceID: req.WorkspaceID,
+			ProjectID:   req.ProjectID,
+		},
+		WorkspaceMembers: builderWorkspaceMembers(m.builder, req.WorkspaceID),
+	}.topologyToken()
 }
 
 // refViewLayerID names a ref view's layer. It is derived rather than

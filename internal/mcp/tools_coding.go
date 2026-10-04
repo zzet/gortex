@@ -1518,7 +1518,7 @@ func (s *Server) handleGetTestTargets(ctx context.Context, req mcp.CallToolReque
 
 		// Fallback for graphs that haven't been re-indexed since the
 		// EdgeTests pass shipped, or for indirect coverage (depth > 1).
-		callers := s.engineFor(ctx).GetCallers(id, query.QueryOptions{Depth: depth, Limit: 100, Detail: "brief"})
+		callers := s.engineFor(ctx).GetCallers(id, query.QueryOptions{Depth: depth, Limit: 100, Detail: "brief", Context: ctx})
 		for _, cn := range callers.Nodes {
 			if !isTestFile(cn.FilePath) {
 				continue
@@ -1969,7 +1969,20 @@ func (s *Server) handleGetEditPlan(ctx context.Context, req mcp.CallToolRequest)
 
 // extractPrefix returns the common prefix of a camelCase/PascalCase name.
 // e.g. "handleGetSymbol" -> "handle", "TestNewServer" -> "Test"
-func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest) (toolResult *mcp.CallToolResult, retErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer func() {
+		if err := ctx.Err(); err != nil {
+			toolResult = nil
+			retErr = err
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	task, err := req.RequireString("task")
 	if err != nil {
 		return mcp.NewToolResultError("task is required"), nil
@@ -2026,7 +2039,20 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		if len(kw) < 3 {
 			continue
 		}
-		matches := s.scopedNodeSlice(ctx, s.engineFor(ctx).SearchSymbols(kw, 10))
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		ranked := s.engineFor(ctx).SearchSymbolsRankedContext(ctx, kw, 10, query.QueryOptions{}, nil)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		matches := make([]*graph.Node, 0, len(ranked))
+		for _, candidate := range ranked {
+			if candidate != nil && candidate.Node != nil {
+				matches = append(matches, candidate.Node)
+			}
+		}
+		matches = s.scopedNodeSlice(ctx, matches)
 		for _, m := range matches {
 			if m.Kind == graph.KindFile || m.Kind == graph.KindImport {
 				continue

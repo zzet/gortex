@@ -526,9 +526,9 @@ func (s *Server) respondJSONOrTOON(ctx context.Context, req mcp.CallToolRequest,
 		}
 		var trimmed bool
 		if shape, ok := degradeShapes[req.Params.Name]; ok {
-			payload, trimmed = applyDegradation(payload, shape, budget)
+			payload, trimmed = applyDegradationObserved(payload, shape, budget, symbolBudgetRetainer(ctx, req))
 		} else {
-			payload, trimmed = applyBudget(payload, budget)
+			payload, trimmed = applySymbolObservedBudget(payload, budget, symbolBudgetRetainer(ctx, req))
 		}
 		if trimmed && decorate {
 			payload = decorateTokenBudgetJSON(payload, req)
@@ -1460,7 +1460,7 @@ func (s *Server) handleIndexRepository(ctx context.Context, req mcp.CallToolRequ
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		s.RunAnalysis()
+		s.startBackgroundAnalysis("index")
 		s.recordIndexTelemetry(result.FileCount)
 		return s.respondJSONOrTOON(ctx, req, result)
 	}
@@ -1469,7 +1469,7 @@ func (s *Server) handleIndexRepository(ctx context.Context, req mcp.CallToolRequ
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	s.RunAnalysis()
+	s.startBackgroundAnalysis("index")
 	s.recordIndexTelemetry(result.FileCount)
 	return s.respondJSONOrTOON(ctx, req, result)
 }
@@ -1619,7 +1619,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		s.resolveReindexedPathReceipts(resolved, eligible)
 	}
 
-	s.RunAnalysis()
+	s.startBackgroundAnalysis("reindex")
 
 	scope := "repository"
 	if len(paths) > 0 {
@@ -1736,7 +1736,7 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 	// in this symbol's precise type now — one hover on the lazy-spawned server,
 	// cached in the graph. No-op when it already has a type or no server serves
 	// the language.
-	s.enrichNodeOnDemand(node)
+	s.enrichNodeOnDemand(ctx, node)
 
 	detail := req.GetString("detail", "brief")
 	if detail == "brief" {
@@ -1755,15 +1755,45 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 }
 
 func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if result, err, handled := s.continueSymbolPage(ctx, req); handled {
+		return result, err
+	}
 	q, err := req.RequireString("query")
 	if err != nil {
 		return mcp.NewToolResultError("query is required"), nil
 	}
+	if view := sourceRequestView(ctx); view != nil && view.sourceScope == "declarations" {
+		fq := parseFieldQuery(q)
+		resolved, refusal := s.resolveScope(ctx, requestWithInlineScopeClauses(req, fq), IntentLocate)
+		if refusal != nil {
+			return refusal, nil
+		}
+		return s.handleSourceSearchSymbols(ctx, req, view, fq.Text, fq, resolved)
+	}
 	limit := req.GetInt("limit", 20)
 	offset := decodeCursor(req.GetString("cursor", ""))
 
-	sess := s.sessionFor(ctx)
-	sess.recordSearch(q)
+	sess, _ := ctx.Value(symbolPageOwnerKey{}).(*sessionState)
+	if sess == nil {
+		sess = s.sessionFor(ctx)
+	}
+	if offset == 0 && !isCompact(req) && !s.isGCX(ctx, req) && !s.isTOON(ctx, req) && ctx.Value(symbolPageCallKey{}) == nil {
+		ctx = context.WithValue(ctx, symbolPageOwnerKey{}, sess)
+		cache := s.symbolPages(ctx)
+		owned, call, live := cache.beginCall(ctx)
+		if !live {
+			return symbolPageError("session ended"), nil
+		}
+		if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
+			state.finish = append(state.finish, call.finish)
+		} else {
+			defer call.finish()
+		}
+		ctx = context.WithValue(owned, symbolPageCacheKey{}, cache)
+	}
+	if ctx.Value(symbolPageRefillKey{}) == nil {
+		sess.recordSearch(q)
+	}
 
 	// Field-qualified query syntax: lift `kind:` / `lang:` / `path:` /
 	// `repo:` / `project:` clauses out of the query string. The
@@ -1784,6 +1814,15 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if errResult != nil {
 		return errResult, nil
 	}
+	if offset == 0 && !isCompact(req) && !s.isGCX(ctx, req) && !s.isTOON(ctx, req) {
+		ctx = context.WithValue(ctx, symbolPageOwnerKey{}, sess)
+		ctx = context.WithValue(ctx, symbolPageCacheKey{}, s.symbolPages(ctx))
+		if identity, identityErr := s.symbolPageIdentity(ctx, req, resolved); identityErr == nil {
+			ctx = context.WithValue(ctx, symbolPageIdentityKey{}, identity)
+		} else {
+			return nil, identityErr
+		}
+	}
 	scopeWS, scopeProj := resolved.WorkspaceID, resolved.ProjectID
 	// Per-phase timing for the search hot path. The struct is populated
 	// across the engine boundary (BM25 backend call wall-clock attributes
@@ -1794,6 +1833,17 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	timings := &query.SearchTimings{}
 	phaseStart := time.Now()
 	scope := query.QueryOptions{WorkspaceID: scopeWS, ProjectID: scopeProj, RepoAllow: resolved.RepoAllow, SearchTimings: timings}
+	if offset == 0 && !isCompact(req) && !s.isGCX(ctx, req) && !s.isTOON(ctx, req) {
+		scope.SymbolSearchStats = &query.SymbolSearchStats{}
+	}
+	pathFilter := s.resolvePathFilter(req, fq)
+	if prefixes := normalizePathPrefixes(pathFilter); len(prefixes) > 0 {
+		scope.SearchPathPrefixes = prefixes
+		scope.SymbolSearchStats = &query.SymbolSearchStats{}
+		scope.SearchNodeFilter = func(n *graph.Node) bool {
+			return pathMatchesAnyPrefix(repoRelativePath(n), prefixes)
+		}
+	}
 
 	// Keyword-soup defense: a degenerate boolean / OR-list query
 	// ("A OR B OR 'no access'") defeats ordinary retrieval. Detect it
@@ -1919,6 +1969,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		}
 	}
 
+	if refill, _ := ctx.Value(symbolPageRefillKey{}).(*symbolPageRefill); refill != nil {
+		fetchLimit = refill.horizon
+	}
+
 	// Expansion terms feeding the BM25 OR-merge: LLM-derived synonyms
 	// when assist engaged, or the soup's split disjuncts when this is
 	// a soup query handled in "split" mode. The two are mutually
@@ -1948,7 +2002,11 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// pre-fetch construction the engine's bundle would build a
 	// throwaway cache on each BM25 call and the handler's later
 	// rerank would still fetch every candidate's edges itself.
-	rctx := s.buildRerankContext(ctx, q)
+	loadingClass := queryClass
+	if isSoup {
+		loadingClass = rerank.QueryClassKeywordSoup
+	}
+	rctx := s.buildSymbolRerankContext(ctx, q, loadingClass)
 	scope.RerankContext = rctx
 
 	// Corpus selection: `code` (default) keeps only code symbols,
@@ -1964,12 +2022,15 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	var nodes []*graph.Node
 	var primaryCount int
 	if len(expandedTerms) > 0 {
-		nodes, primaryCount = fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, fetchLimit, scope, timings)
+		nodes, primaryCount = fetchAndMergeBM25TimedContext(ctx, s.engineFor(ctx), q, expandedTerms, fetchLimit, scope, timings)
 	} else {
 		bm25Start := time.Now()
-		nodes = s.engineFor(ctx).SearchSymbolsScoped(q, fetchLimit, scope)
+		nodes = searchSymbolsScopedContext(ctx, s.engineFor(ctx), q, fetchLimit, scope)
 		timings.BM25PrimaryMS += time.Since(bm25Start).Milliseconds()
 		primaryCount = len(nodes)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// Docs retrieval channel: when the corpus admits prose, the single
@@ -1991,8 +2052,13 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if corpus.includesContent() {
 		nodes = s.mergeContentChannel(ctx, q, nodes, fetchLimit)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	candsAfterGather := len(nodes)
+	pageHorizon := fetchLimit
+	pageMore := len(nodes) >= fetchLimit || scope.SymbolSearchStats != nil && scope.SymbolSearchStats.TextSaturated
 	mergedCount := len(nodes) // pre-filter; comparable to primaryCount
 
 	allowed := resolved.RepoAllow
@@ -2023,8 +2089,6 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			}
 		}
 	}
-	pathFilter := s.resolvePathFilter(req, fq)
-
 	// applyAllPostFilters runs the full post-search filter sequence
 	// (repo / kind / lang+path clauses / sub-path scope / corpus) over
 	// a candidate slice in the order the primary path uses it. Lifted
@@ -2064,7 +2128,8 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// Content sections live only in content_fts — this channel cannot
 	// rescue them, so a content-corpus wipeout skips the refetch.
 	fetchEscalated := false
-	if len(nodes) == 0 && candsAfterGather > 0 && q != "" && corpus != corpusContent {
+	pathUnderfilled := len(pathFilter) > 0 && scope.SymbolSearchStats != nil && scope.SymbolSearchStats.TextSaturated && len(nodes) < offset+limit
+	if (len(nodes) == 0 && candsAfterGather > 0 || pathUnderfilled) && q != "" && corpus != corpusContent {
 		// The requested cursor window must be reachable: a shallow
 		// rescue that survives the filters but ends before offset+limit
 		// would slice to an empty later page (with no next cursor) even
@@ -2072,7 +2137,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		// best set so far and keeps escalating until the window is
 		// reachable or the corpus is exhausted.
 		want := offset + limit
-		prevDepth := 0
+		prevDepth := fetchLimit
 		for _, mult := range []int{5, 25} {
 			if ctx.Err() != nil {
 				break
@@ -2086,25 +2151,34 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			// The cap can collapse successive multipliers into the same
 			// effective depth — an identical re-query cannot change the
 			// outcome, so don't pay it twice.
-			if deepLimit == prevDepth {
+			if deepLimit <= prevDepth {
 				break
 			}
 			prevDepth = deepLimit
+			if scope.SymbolSearchStats != nil {
+				scope.SymbolSearchStats.TextSaturated = false
+			}
 			var refetched []*graph.Node
 			if len(expandedTerms) > 0 {
-				refetched, _ = fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, deepLimit, scope, timings)
+				refetched, _ = fetchAndMergeBM25TimedContext(ctx, s.engineFor(ctx), q, expandedTerms, deepLimit, scope, timings)
 			} else {
-				refetched = s.engineFor(ctx).SearchSymbolsScoped(q, deepLimit, scope)
+				refetched = searchSymbolsScopedContext(ctx, s.engineFor(ctx), q, deepLimit, scope)
 			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			pageHorizon = deepLimit
+			pageMore = len(refetched) >= deepLimit || scope.SymbolSearchStats != nil && scope.SymbolSearchStats.TextSaturated
 			kept := applyAllPostFilters(refetched)
-			if len(kept) > 0 {
+			if len(kept) > 0 && len(kept) >= len(nodes) {
 				nodes = kept
 				fetchEscalated = true
 			}
 			// Done when the window is reachable, or the corpus is
 			// exhausted — a short raw page means a deeper fetch cannot
 			// surface anything new.
-			if len(kept) >= want || len(refetched) < deepLimit {
+			textSaturated := scope.SymbolSearchStats != nil && scope.SymbolSearchStats.TextSaturated
+			if len(kept) >= want || len(refetched) < deepLimit && !textSaturated {
 				break
 			}
 		}
@@ -2115,8 +2189,18 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// caller's repo / project scope), so an over-narrow or typo'd
 	// clause degrades to a useful result set instead of an empty one.
 	filtersRelaxed := false
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(nodes) == 0 && q != "" && (kindArg != "" || flavorArg != "" || fq.hasFieldFilters()) {
-		relaxed := filterNodes(s.engineFor(ctx).SearchSymbolsScoped(q, fetchLimit, scope), allowed)
+		relaxedScope := scope
+		relaxedScope.SearchNodeFilter = nil
+		relaxedScope.SearchPathPrefixes = nil
+		relaxedScope.SymbolSearchStats = nil
+		relaxed := filterNodes(searchSymbolsScopedContext(ctx, s.engineFor(ctx), q, fetchLimit, relaxedScope), allowed)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if len(relaxed) > 0 {
 			nodes = relaxed
 			filtersRelaxed = true
@@ -2135,7 +2219,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	decomposed := false
 	if len(nodes) == 0 && queryHasDecomposableSeparator(q) {
 		if leaves := decomposeQueryToLeaves(q); len(leaves) > 0 {
-			rescued, _ := fetchAndMergeBM25Timed(s.engineFor(ctx), "", leaves, fetchLimit, scope, timings)
+			rescued, _ := fetchAndMergeBM25TimedContext(ctx, s.engineFor(ctx), "", leaves, fetchLimit, scope, timings)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			rescued = applyAllPostFilters(rescued)
 			if len(rescued) > 0 {
 				nodes = rescued
@@ -2161,6 +2248,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			nodes, verifyDbg, verifyRan = verifyWithLLM(ctx, s, q, nodes)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Force-inject the implicit-feedback channel: symbols the agent has
 	// reached for on this query before but that BM25 did not surface
@@ -2168,6 +2258,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// signals rank them in context; post-filtered so they honour the
 	// caller's repo / kind / lang / path / corpus scope.
 	nodes = s.forceInjectLearnedCandidates(ctx, q, nodes, applyAllPostFilters)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Rerank: run the I13 11-signal pipeline over the candidate set
 	// with the session-aware Context wired in. Structural signals
@@ -2226,6 +2319,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	var rerankBreakdown []*rerank.Candidate
 	var rerankPrepare, rerankSignals time.Duration
 	nodes, rerankPrepare, rerankSignals = applyRerankBoostsTimed(ctx, s, nodes, q, rctx, &rerankBreakdown)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Post-rerank exact-cosine refinement. The merged rerank above
 	// scores the semantic channel by RRF rank and discards the raw
@@ -2250,6 +2346,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 			nodes = refinedNodes
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Per-file diversification: keep one file's many symbols from
 	// monopolising the head of the result set. Runs after the rerank
@@ -2258,19 +2357,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	nodes, rerankBreakdown = diversifyByFile(nodes, rerankBreakdown, req.GetInt("max_per_file", defaultMaxPerFile))
 	diversifyMS := time.Since(diversifyStart).Milliseconds()
 
-	// Flush the prior search's implicit skip-above negatives before this
-	// search overwrites the attribution state: results that ranked above
-	// the deepest one the agent consumed but were themselves passed over
-	// lose a little of their learned per-keyword boost.
-	if sess != nil && q != "" {
-		if nq, skipped := sess.drainSkippedNegatives(); nq != "" && len(skipped) > 0 {
-			s.combo.RecordNegative(nq, skipped)
-		}
-	}
-
+	// Slice and decorate the final page before publishing session or
+	// localization state. Context-sensitive fallbacks remain format-gated
+	// below, preserving the compact/GCX/TOON execution contract.
 	total := len(nodes)
-	// Slice the (offset, limit) window. nextCursor is empty when the
-	// last row in `nodes` is included.
 	end := offset + limit
 	if end > total {
 		end = total
@@ -2279,26 +2369,42 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		offset = total
 	}
 	page := nodes[offset:end]
-	// Record only the actual post-cursor page. Empty and out-of-range pages
-	// deliberately clear any prior attribution state.
-	recordLastSearchFromNodes(sess, q, page)
-	// Decorate the page with absolute file paths so every output format
-	// below surfaces an openable path alongside the repo-relative one.
 	page = s.withAbsPaths(ctx, page)
-	// Capture the final ranked, scoped page once, before JSON/TOON/GCX encoding.
-	captureLocalizationSearchSymbols(ctx, page)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	nextCursor := ""
 	if end < total {
 		nextCursor = encodeCursor(end)
 	}
-
 	indexWarning := s.indexFileFailureWarning(ctx, resolved, pathFilter)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	publishSearchState := func() {
+		// Flush the prior search's implicit skip-above negatives only when
+		// this request is about to publish its own final page.
+		if sess != nil && q != "" {
+			if nq, skipped := sess.drainSkippedNegatives(); nq != "" && len(skipped) > 0 {
+				s.combo.RecordNegative(nq, skipped)
+			}
+		}
+		recordLastSearchFromNodes(sess, q, page)
+		captureLocalizationSearchSymbols(ctx, page)
+	}
+
 	if isCompact(req) {
+		publishSearchState()
 		return decorateResultWithScope(decorateIndexFileFailureResult(mcp.NewToolResultText(compactNodes(page)), indexWarning), resolved), nil
 	}
 
 	if s.isGCX(ctx, req) {
 		res, err := s.gcxResponseWithBudget(req)(encodeSearchSymbols(page, total, len(page)))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		publishSearchState()
 		return withScopeResult(decorateIndexFileFailureResult(res, indexWarning), err, resolved)
 	}
 
@@ -2310,6 +2416,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		}
 		data, err := toon.Marshal(result)
 		if err == nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			publishSearchState()
 			return decorateResultWithScope(decorateIndexFileFailureResult(mcp.NewToolResultText(string(data)), indexWarning), resolved), nil
 		}
 	}
@@ -2352,16 +2462,15 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 				resp["content_matches"] = section
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
-	// A repo-narrowed zero is indistinguishable from "not indexed" in
-	// clients that never render _meta. Say it in the body — and since the
-	// result is empty anyway, pay one extra BM25 fetch to report whether
-	// widening would actually help.
+	// Make a narrowed zero visible to clients that never render _meta.
+	// Offer widening guidance without running another search or making
+	// claims about matches outside the active scope.
 	if total == 0 && len(resolved.RepoAllow) > 0 {
-		wide := scope
-		wide.RepoAllow = nil
-		wideNodes, _ := fetchAndMergeBM25Timed(s.engineFor(ctx), q, expandedTerms, offset+limit, wide, timings)
-		resp["scope_note"] = scopeZeroNote(resolved, len(wideNodes))
+		resp["scope_note"] = scopeZeroNote(resolved, -1)
 	}
 	if fetchEscalated {
 		resp["fetch_escalated"] = true
@@ -2480,6 +2589,13 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if offset == 0 && !isCompact(req) && !s.isGCX(ctx, req) && !s.isTOON(ctx, req) {
+		return s.publishSymbolPage(ctx, req, resp, nodes, rerankBreakdown, pageHorizon, pageMore, resolved, q)
+	}
+	publishSearchState()
 	return s.respondScopedJSONOrTOON(ctx, req, resp, resolved)
 }
 
@@ -2794,7 +2910,7 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 	// Lazy enrichment: confirm this symbol's callers on demand before
 	// answering, so a graph indexed without the eager LSP sweep still returns
 	// compiler-grade callers. No-op when already confirmed or eager ran.
-	s.confirmSymbolRefsOnDemand(eng.GetSymbol(id))
+	s.confirmSymbolRefsOnDemand(ctx, eng.GetSymbol(id))
 	s.hydrateProxyTargets(ctx, id)
 	sg := eng.GetCallers(id, opts)
 	sg = filterSubGraphByResolvedScope(sg, resolved)
@@ -3073,7 +3189,7 @@ func (s *Server) handleFindUsages(ctx context.Context, req mcp.CallToolRequest) 
 	// before answering, so a graph indexed without the eager LSP sweep still
 	// converges to compiler-grade usages. No-op when already confirmed or eager
 	// ran.
-	s.confirmSymbolRefsOnDemand(node)
+	s.confirmSymbolRefsOnDemand(ctx, node)
 	opts := query.QueryOptions{
 		WorkspaceID:  resolved.WorkspaceID,
 		ProjectID:    resolved.ProjectID,
@@ -3507,14 +3623,42 @@ func (s *Server) handleGetCluster(ctx context.Context, req mcp.CallToolRequest) 
 }
 
 func (s *Server) handleGraphStats(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return s.respondJSONOrTOON(ctx, req, s.buildGraphStatsPayload(ctx))
+	payload, err := s.buildGraphStatsPayloadContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.respondJSONOrTOON(ctx, req, payload)
 }
 
 // buildGraphStatsPayload returns the same data the `graph_stats` tool
 // emits. Shared with the `gortex://stats` resource so both surfaces
 // stay byte-for-byte equal.
 func (s *Server) buildGraphStatsPayload(ctx context.Context) map[string]any {
-	stats := s.engineFor(ctx).Stats()
+	return s.buildGraphStatsPayloadFromStats(ctx, s.engineFor(ctx).Stats())
+}
+
+func (s *Server) buildGraphStatsPayloadContext(ctx context.Context) (map[string]any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stats, err := s.engineFor(ctx).StatsContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	payload := s.buildGraphStatsPayloadFromStats(ctx, stats)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func (s *Server) buildGraphStatsPayloadFromStats(ctx context.Context, stats *graph.GraphStats) map[string]any {
 	result := map[string]any{
 		"total_nodes": stats.TotalNodes,
 		"total_edges": stats.TotalEdges,

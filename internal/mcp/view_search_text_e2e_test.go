@@ -40,6 +40,13 @@ type worktreeSearchStack struct {
 
 func newWorktreeSearchStack(t *testing.T) *worktreeSearchStack {
 	t.Helper()
+	return newWorktreeSearchStackWithConfig(t, "workspace: main-ws\n")
+}
+
+// newWorktreeSearchStackWithConfig is newWorktreeSearchStack with the primary's
+// .gortex.yaml of the caller's choosing.
+func newWorktreeSearchStackWithConfig(t *testing.T, gortexYAML string) *worktreeSearchStack {
+	t.Helper()
 	refIsolateGit(t)
 
 	base := t.TempDir()
@@ -51,7 +58,7 @@ func newWorktreeSearchStack(t *testing.T) *worktreeSearchStack {
 		primary = resolved
 	}
 	refWriteFiles(t, primary, map[string]string{
-		".gortex.yaml": "workspace: main-ws\n",
+		".gortex.yaml": gortexYAML,
 		"keep.go":      "package repo\n\nfunc Keeper() {}\n",
 		"gone.go":      "package repo\n\nfunc Gone() {}\n",
 	})

@@ -26,7 +26,7 @@ func (s *fnValueNameBatchRecordingStore) FindNodesByNames(names []string) map[st
 	return s.Store.FindNodesByNames(names)
 }
 
-func TestResolveFnValueCallbacksLazilyMemoizesGlobalNameLookups(t *testing.T) {
+func TestResolveFnValueCallbacksBatchesOnlyTheCertainGlobalNameLookups(t *testing.T) {
 	base := graph.New()
 	source := &graph.Node{
 		ID: "src.go::register", Kind: graph.KindFunction, Name: "register",
@@ -67,19 +67,19 @@ func TestResolveFnValueCallbacksLazilyMemoizesGlobalNameLookups(t *testing.T) {
 	if got := ResolveFnValueCallbacks(store); got != 3 {
 		t.Fatalf("resolved callbacks = %d, want 3", got)
 	}
-	if store.findByNamesCalls != 0 {
-		t.Fatalf("FindNodesByNames calls = %d, want 0", store.findByNamesCalls)
+	// The names the gate is certain to look up globally are read in one
+	// batch; the ungated candidate that binds in its own file is never read,
+	// and the repeated miss is served by the memo.
+	if store.findByNamesCalls != 1 || store.findByNameCalls != 0 {
+		t.Fatalf("FindNodesByNames calls = %d, FindNodesByName calls = %d; want 1 and 0", store.findByNamesCalls, store.findByNameCalls)
 	}
 	wantNames := []string{"handlerA", "handlerB", "missingHandler"}
-	if store.findByNameCalls != len(wantNames) {
-		t.Fatalf("FindNodesByName calls = %d, want %d (including one memoized miss)", store.findByNameCalls, len(wantNames))
-	}
-	if len(store.exactNames) != len(wantNames) {
-		t.Fatalf("exact names = %v, want %v", store.exactNames, wantNames)
+	if len(store.batchedNames) != len(wantNames) {
+		t.Fatalf("batched names = %v, want %v", store.batchedNames, wantNames)
 	}
 	for i := range wantNames {
-		if store.exactNames[i] != wantNames[i] {
-			t.Fatalf("exact names = %v, want %v", store.exactNames, wantNames)
+		if store.batchedNames[i] != wantNames[i] {
+			t.Fatalf("batched names = %v, want %v", store.batchedNames, wantNames)
 		}
 	}
 	for _, target := range []string{

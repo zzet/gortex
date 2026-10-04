@@ -184,10 +184,12 @@ func (p *Provider) probeGoPackagesLoadable(ctx context.Context, dir string) (loa
 		Context: probeCtx,
 		// NeedName|NeedFiles is a metadata-only enumeration: `go list` with no
 		// -deps/-compiled/-export, so no dependency download or typecheck.
-		Mode:  packages.NeedName | packages.NeedFiles,
-		Dir:   dir,
-		Tests: p.includeTest,
-		Fset:  token.NewFileSet(),
+		Mode:    packages.NeedName | packages.NeedFiles,
+		Dir:     dir,
+		Tests:   p.includeTest,
+		Fset:    token.NewFileSet(),
+		Overlay: committedOverlay(probeCtx),
+		Env:     committedEnv(probeCtx),
 	}
 	// Use the same loader field the heavy load uses (packages.Load in
 	// production; a test double when injected) so the probe is exercised

@@ -35,6 +35,7 @@ import (
 	"github.com/zzet/gortex/internal/modules"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/crashpool"
+	"github.com/zzet/gortex/internal/parser/tsalias"
 	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/progress"
@@ -57,6 +58,13 @@ type IndexResult struct {
 	// `daemon status` shows a stable file count across both full-track
 	// and incremental-reconcile paths.
 	FileCount int `json:"file_count"`
+	// CountsCached reports that NodeCount/EdgeCount are the repository's last
+	// whole-repository count rather than a recount: a scoped incremental pass
+	// does not pay an O(repository) count per save (see scopedPassRepoCounts).
+	CountsCached bool `json:"counts_cached,omitempty"`
+	// capabilityPrior is the capability state this incremental pass read
+	// before evicting its files; only this pass's own derived catch-up uses it.
+	capabilityPrior *capabilityPrior
 	// StaleFileCount is the number of files that were actually
 	// re-indexed in this pass (only populated by IncrementalReindexPaths
 	// — full-index passes treat every file as stale and would
@@ -341,6 +349,28 @@ type Indexer struct {
 	// and every later query would call that healthy tier unbuilt.
 	// Set during the shadow swap, cleared when idx.graph is restored.
 	contractStateSink graph.ContractStateStore
+	// headProvenance, when set, is the HEAD commit and dirty bit the caller
+	// already sampled for rootPath (a working-tree generation build knows
+	// both from its snapshot); the provenance stamps use it instead of
+	// shelling out to git (see headAndDirty).
+	headProvenance *repoHeadProvenance
+
+	// passCorpusFilter is the read-only-context mode. When a caller installs
+	// one, the pass corpus it produces is held in memory for the whole
+	// pipeline — parse, resolve, every subpass — and this hook is handed that
+	// corpus once, immediately before the drain that moves it into the durable
+	// store. Whatever the hook removes is never written: the drain is the only
+	// path from the corpus to disk, and the node, edge, symbol-FTS, file,
+	// clone and constant-value projections all come out of it.
+	//
+	// It exists for the sparse generation builder, which must read a change's
+	// affected closure to resolve that change and must NOT persist what it
+	// read. Installing it is also the explicit opt-in that lets a handle
+	// pinned to a derived payload generation take the in-memory path at all
+	// (see the shadow eligibility decision in indexCtxRaw): without it such a
+	// handle is disqualified, because nothing would then bound what the drain
+	// writes.
+	passCorpusFilter func(*graph.Graph) error
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
@@ -375,6 +405,19 @@ type Indexer struct {
 	// final.
 	npmAliasOnce sync.Once
 	npmAlias     *npmAliasIndex
+
+	// tsAliasMu guards this Indexer's own tsconfig / jsconfig alias scopes.
+	// They are memoised HERE, not in the process-wide tsAliasCache, whenever a
+	// content source is installed: that cache is keyed by repo root, and a
+	// root cannot tell two snapshots of one checkout apart, so a committed
+	// build sharing it would resolve its path aliases through the live
+	// checkout's tsconfig. tsAliasRef is the source ref the scopes were loaded
+	// from, so swapping the installed source reloads them; tsAliasLoaded
+	// distinguishes "scanned, no usable config" from "not yet scanned".
+	tsAliasMu     sync.Mutex
+	tsAliasRef    *contentSourceRef
+	tsAliasColl   *tsalias.Collection
+	tsAliasLoaded bool
 
 	// workspaceMembersOnce builds workspaceMembers lazily on the first
 	// resolve-time package-manager-workspace lookup. Lazy for the same
@@ -473,6 +516,40 @@ type Indexer struct {
 	// two claims distinct. A fresh Indexer per daemon run starts it false.
 	reparsedThisRun atomic.Bool
 
+	// forcedReparse names the files (absolute, cleaned) a per-save batch must
+	// re-derive from source even when their bytes are unchanged: the
+	// surviving importers of a deleted file (deletion_importers.go). Set and
+	// cleared by reindexIncrementalFilesBatched, under the repository lane.
+	forcedReparse map[string]struct{}
+	// cloneRecompute names the graph paths whose clone rows a per-file delta
+	// recomputes rather than carries, and cloneChangedBodies collects the
+	// graph paths holding a changed body (clone_carry.go).
+	cloneRecompute     map[string]struct{}
+	cloneChangedBodies map[string]struct{}
+	// reparseKeepingResolutions names files (absolute, cleaned) re-derived
+	// from source whatever their fingerprints say, whose prior resolutions
+	// nonetheless stay reusable: the per-file delta's own change set (it must
+	// carry each changed file's complete rows even for an inert save, while
+	// nothing changed what the file's references bind to). forcedReparse, by
+	// contrast, also drops the file's reuse snapshot.
+	reparseKeepingResolutions map[string]struct{}
+	// inertReparsed collects the graph paths of the change set whose content
+	// fingerprints call the save inert, re-derived only because the per-file
+	// delta forces its change set: the delta restates their prior rows
+	// (graph.DeltaWriter.RestateBelowRows), as the primary path keeps them.
+	inertReparsed map[string]struct{}
+	// priorFingerprints, when set, supplies the content fingerprints of a
+	// changed file's prior rows when they carry none (a per-file delta over a
+	// stack written before fingerprints were stamped).
+	priorFingerprints func(absPath string, priorNodes []*graph.Node) (fileDeltaFingerprints, derivedFingerprints, bool)
+	// dataflowParams, when set, is the per-stack callee parameter index a
+	// per-file delta reads (edit_delta_param_index.go).
+	dataflowParams *editDeltaParamIndex
+	// deletionReparsePaths names the files (graph paths) the same batch
+	// re-derives from source; the deletion leaves their references to the
+	// reparse instead of parking them.
+	deletionReparsePaths map[string]struct{}
+
 	// deferGlobalPasses, when set, makes IndexCtx and IncrementalReindexPaths
 	// skip the graph-wide derivation passes (InferImplements,
 	// InferOverrides, markTestSymbolsAndEmitEdges). These passes walk the
@@ -482,6 +559,13 @@ type Indexer struct {
 	// the shared global-pass pipeline exactly once at the end. Has no effect on the
 	// deferResolve path (multi-repo IndexCtx already skips those passes).
 	deferGlobalPasses atomic.Bool
+	// lastRepoCounts is the last whole-repository node/edge count; scoped
+	// incremental passes report it instead of recounting.
+	lastRepoCounts atomic.Pointer[repoCountSnapshot]
+	// capabilityPriorPending collects, during one incremental mutation, the
+	// capability state of the files it evicts (see capabilityPrior).
+	capabilityPriorMu      sync.Mutex
+	capabilityPriorPending *capabilityPrior
 
 	// skipResolveInDeferred, when set, makes RunDeferredPasses skip the
 	// per-repo resolver.ResolveAll() call. ResolveAll walks the entire
@@ -524,6 +608,10 @@ type Indexer struct {
 	repositoryMutationMu    sync.Mutex
 	repositoryMutation      *repositoryMutationCoordinator
 	repositoryMutationOwner *MultiIndexer
+	// outputAuthority is the process-wide output-generation authority. It is
+	// read without repositoryMutationMu, so it is an atomic pointer: a lane
+	// resolving its authority must never wait on the mutation mutex.
+	outputAuthority atomic.Pointer[OutputGenerationAuthority]
 
 	// incrementalResolveFilesHook is a focused test seam for proving a
 	// multi-file watcher batch invokes the scoped resolver exactly once. nil in
@@ -533,6 +621,19 @@ type Indexer struct {
 	// It is nil in production and lets focused tests prove a watcher storm runs
 	// each tail once after the bounded mutation batch, never once per chunk.
 	incrementalCatchupHook func(kind string, files []string)
+	// affectedByDeltaHook observes, per changed file, the declaration keys
+	// whose shape the affected-by plan found changed (planAffectedByStages).
+	affectedByDeltaHook func(graphPath string, keys []string)
+	// contractRegistryLoad is the time ensureIncrementalContractRegistry
+	// spent reading the registry from the graph (a per-file delta reports it).
+	contractRegistryLoad time.Duration
+	// applyLaps times one structural graph apply (incremental_apply_laps.go).
+	applyLaps *applyLaps
+	// storeWaits, when set, reads the store's cumulative waits
+	// (store_sqlite.ReaderWaitMark: the read gate and pools, SQLite's own
+	// busy and WAL-retry sleeps, read-transaction time) for the apply steps'
+	// split.
+	storeWaits func() store_sqlite.ReaderWaitMark
 }
 
 // contractCacheEntry is a cached contract-extraction result for one file.
@@ -590,7 +691,92 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 	// Break same-named import collisions in favour of the importer's
 	// own package-manager workspace member. Same lazy-build rationale.
 	idx.resolver.SetWorkspaceMembership(idx.indexerWorkspaceMembership)
+	idx.resolver.SetGoPackageOwnershipFactory(idx.prepareGoPackageOwnership)
+	idx.resolver.SetEvidenceScoping(cfg.ResolverEvidenceScopeEnabled())
 	return idx
+}
+
+// manifestTree returns the tree this Indexer's build-configuration readers —
+// the compile database and the npm/workspace manifests — must consult.
+//
+// With a content source installed that is the source's manifest view: the
+// same snapshot the payload is parsed out of, and never the working copy,
+// even for a path the source cannot answer for. A build that indexes a
+// committed tree would otherwise reconstruct C/C++ include paths and npm
+// aliases from whatever the checkout holds right now, which is the one
+// remaining way for dirty bytes to reach a committed generation. With no
+// source installed the reads go to the checkout, which is exactly the tree
+// the live index describes.
+//
+// The answer is recomputed per call rather than captured, so it follows the
+// installed source the way every other content read does.
+func (idx *Indexer) manifestTree() manifestTree {
+	tree, _ := idx.manifestTreeWithRef()
+	return tree
+}
+
+// manifestTreeWithRef returns the manifest tree together with the content
+// source ref it was derived from (nil for the working copy). A caller that
+// MEMOISES an answer keys it on that ref: the root two snapshots of one
+// checkout share is not an identity, and a swapped source must invalidate.
+func (idx *Indexer) manifestTreeWithRef() (manifestTree, *contentSourceRef) {
+	if ref := idx.contentSrc.Load(); ref != nil {
+		src := ref.manifests
+		if src == nil {
+			src = ref.src
+		}
+		return sourceManifestTree{rootPath: idx.rootPath, src: src}, ref
+	}
+	return newDiskManifestTree(idx.rootPath), nil
+}
+
+// tsAliasCollection returns the tsconfig / jsconfig alias scopes this
+// Indexer's path-alias resolution reads.
+//
+// With no source installed that is the process-wide, root-keyed cache the live
+// index has always used. With a source installed the scopes are loaded out of
+// THAT SNAPSHOT and memoised on this Indexer, keyed on the installed ref: the
+// scan costs one walk of the source, the shared cache cannot tell two
+// snapshots of one root apart, and an alias scope read from the wrong tree
+// produces a wrong import edge rather than a missing one.
+func (idx *Indexer) tsAliasCollection() *tsalias.Collection {
+	tree, ref := idx.manifestTreeWithRef()
+	if ref == nil {
+		return tsAliasCollectionForTree(tree)
+	}
+	idx.tsAliasMu.Lock()
+	defer idx.tsAliasMu.Unlock()
+	if idx.tsAliasLoaded && idx.tsAliasRef == ref {
+		return idx.tsAliasColl
+	}
+	idx.tsAliasColl = tsAliasCollectionForTree(tree)
+	idx.tsAliasRef = ref
+	idx.tsAliasLoaded = true
+	return idx.tsAliasColl
+}
+
+// graphHasCFamilyFiles reports whether this pass's graph carries any C, C++ or
+// Objective-C file. It is the same question the resolver's relative-import
+// pass asks before it walks anything, answered here off the file/language
+// projection so an include-path reconstruction nothing will read is never
+// started.
+func (idx *Indexer) graphHasCFamilyFiles() bool {
+	for file := range graph.FileLanguageNodesSeq(idx.graph) {
+		switch file.Language {
+		case "c", "cpp", "objc":
+			return true
+		}
+	}
+	return false
+}
+
+// newIndexerNpmAliasIndex builds this Indexer's npm-alias index with its
+// manifest reads bound to the tree the Indexer is currently indexing.
+func (idx *Indexer) newIndexerNpmAliasIndex() *npmAliasIndex {
+	return newNpmAliasIndexWithTrees(
+		map[string]string{idx.repoPrefix: idx.rootPath},
+		func(string) manifestTree { return idx.manifestTree() },
+	)
 }
 
 // resolveNpmAliasImport is the resolver.NpmAliasResolver installed on
@@ -600,7 +786,7 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 // alias applies. The backing npmAliasIndex is built once, lazily.
 func (idx *Indexer) resolveNpmAliasImport(callerFile, specifier string) string {
 	idx.npmAliasOnce.Do(func() {
-		idx.npmAlias = newNpmAliasIndex(map[string]string{idx.repoPrefix: idx.rootPath})
+		idx.npmAlias = idx.newIndexerNpmAliasIndex()
 	})
 	return idx.npmAlias.Resolve(callerFile, specifier)
 }
@@ -612,7 +798,7 @@ func (idx *Indexer) resolveNpmAliasImport(callerFile, specifier string) string {
 // backing npmAliasIndex is the one resolveNpmAliasImport builds.
 func (idx *Indexer) declaresExternalNpmDep(callerFile, specifier string) bool {
 	idx.npmAliasOnce.Do(func() {
-		idx.npmAlias = newNpmAliasIndex(map[string]string{idx.repoPrefix: idx.rootPath})
+		idx.npmAlias = idx.newIndexerNpmAliasIndex()
 	})
 	return idx.npmAlias.DeclaresExternalDependency(callerFile, specifier)
 }
@@ -1036,6 +1222,7 @@ func (idx *Indexer) RunDeferredPasses(ctx context.Context) {
 		reporter.Report("resolving references", 0, 0)
 		idx.populateCppIncludeDirs(false)
 		idx.resolver.ResolveAll()
+		idx.materializeDataflowParams()
 	}
 	dResolve = time.Since(tphase)
 	tphase = time.Now()
@@ -1393,11 +1580,35 @@ func (idx *Indexer) storeRootPath(absRoot string) {
 // before the suffix-unique fallback. forceReload drops the cache first, so an
 // incremental reindex picks up an edited compile_commands.json without a
 // daemon restart. Keys/dirs are prefixed in multi-repo mode to match file IDs.
+// installCppIncludeSearchPath hands a reconstructed include search path to the
+// resolver. It is a small indirection — the same shape as readDiskFile — for
+// one reason: the resolver exposes no reader for what it was given, so this is
+// the only place a test can observe the search path a REAL build computed out
+// of its own tree, rather than re-deriving it from a fixture.
+var installCppIncludeSearchPath = func(idx *Indexer, perFile map[string][]string, fallback []string) {
+	idx.resolver.SetCppIncludeDirs(perFile)
+	idx.resolver.SetCppFallbackIncludeDirs(fallback)
+}
+
 func (idx *Indexer) populateCppIncludeDirs(forceReload bool) {
 	if idx.resolver == nil || idx.rootPath == "" {
 		return
 	}
-	if forceReload {
+	tree := idx.manifestTree()
+	if tree.sourced() && !idx.graphHasCFamilyFiles() {
+		// Only C-family include resolution consumes these dirs, and the
+		// resolver's own pass is gated on the same question
+		// (resolveRelativeImports returns immediately for a graph with no
+		// c / cpp / objc). On the working copy the probe is a handful of
+		// stats; through a source it is a snapshot enumeration, so a tree
+		// with no C-family file must not pay for an answer nothing reads.
+		installCppIncludeSearchPath(idx, nil, nil)
+		return
+	}
+	if forceReload && !tree.sourced() {
+		// The cache holds working-copy answers keyed by root. A source-backed
+		// load neither reads nor writes it, so dropping the checkout's entry
+		// on its behalf would only cost the live index a re-read.
 		clearCppIncludeDirCache(idx.rootPath)
 	}
 	prefix := ""
@@ -1414,20 +1625,18 @@ func (idx *Indexer) populateCppIncludeDirs(forceReload bool) {
 		}
 		return pd
 	}
-	tus := loadCompileCommands(idx.rootPath)
+	tus := loadCompileCommands(tree)
 	if len(tus) == 0 {
 		// No compile DB: fall back to the conventional include-root heuristic
 		// so the ordered probe still runs for repos without a compile DB.
-		idx.resolver.SetCppIncludeDirs(nil)
-		idx.resolver.SetCppFallbackIncludeDirs(prefixDirs(heuristicIncludeDirs(idx.rootPath)))
+		installCppIncludeSearchPath(idx, nil, prefixDirs(heuristicIncludeDirs(tree)))
 		return
 	}
 	perFile := make(map[string][]string, len(tus))
 	for f, tu := range tus {
 		perFile[prefix+f] = prefixDirs(tu.includeDirs)
 	}
-	idx.resolver.SetCppIncludeDirs(perFile)
-	idx.resolver.SetCppFallbackIncludeDirs(nil)
+	installCppIncludeSearchPath(idx, perFile, nil)
 }
 
 // ResolveFilePath maps a graph file path (repo-relative in single-repo mode)
@@ -1575,6 +1784,68 @@ func (idx *Indexer) SetResolverLSPHelper(h resolver.LSPHelper) {
 	if idx.resolver != nil {
 		idx.resolver.SetLSPHelper(h)
 	}
+}
+
+// filteredShadowAdmissionWait and interactiveShadowAdmissionWait
+// (shadow_admission.go) bound how long a pass with a corpus filter installed
+// queues for an in-memory slot before running against the store directly.
+// They are latency budgets, not capacity estimates.
+
+// setPassCorpusFilter installs the read-only-context mode described on
+// Indexer.passCorpusFilter. It must be called before IndexCtx: the eligibility
+// decision that routes the pass through an in-memory corpus is taken once, at
+// the top of the pass, and a filter installed afterwards would have nothing to
+// filter.
+//
+// Package-internal on purpose. The hook hands out the live pass corpus, and
+// the only caller that may hold it is the one that also owns the generation
+// the drain writes into.
+func (idx *Indexer) setPassCorpusFilter(fn func(*graph.Graph) error) {
+	idx.passCorpusFilter = fn
+}
+
+// pruneVectorPlanToCorpus drops every prepared embedding whose identity the
+// corpus no longer holds.
+//
+// The plan is prepared from the pass corpus BEFORE the filter runs, because
+// embedding is expensive and the pipeline pays it once. A filter that removes
+// an identity therefore leaves a prepared vector behind, and publishing it
+// would write a vector row for a symbol the generation deliberately does not
+// carry — the orphan the read-only-context mode exists to avoid. Dropping is
+// safe in the other direction too: an identity the corpus still holds keeps
+// its vector, so the change set's search quality is untouched.
+func pruneVectorPlanToCorpus(plan *preparedVectorPlan, corpus *graph.Graph) *preparedVectorPlan {
+	if plan == nil || corpus == nil || len(plan.items) == 0 {
+		return plan
+	}
+	// An item is either a symbol's own vector (ParentID empty, NodeID is the
+	// symbol) or one AST sub-chunk of a symbol (NodeID is synthetic and lives
+	// in no corpus, ParentID is the symbol it belongs to). The identity to ask
+	// the corpus about is therefore the parent when there is one.
+	kept := plan.items[:0]
+	dropped := 0
+	for _, item := range plan.items {
+		owner := item.ParentID
+		if owner == "" {
+			owner = item.NodeID
+		}
+		if owner != "" && corpus.GetNode(owner) == nil {
+			if plan.chunkMap != nil {
+				delete(plan.chunkMap, item.NodeID)
+			}
+			dropped++
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if dropped == 0 {
+		return plan
+	}
+	for i := len(kept); i < len(plan.items); i++ {
+		plan.items[i] = graph.VectorCorpusItem{}
+	}
+	plan.items = kept
+	return plan
 }
 
 // prefixPath prepends the repoPrefix to a relative path when in multi-repo mode.
@@ -2354,7 +2625,7 @@ func clampParseWeight(size, budget int64) int64 {
 // mutation lane with watcher, polling, reconciliation, and MCP edits.
 func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, error) {
 	var result *IndexResult
-	err := idx.coordinateRepositoryMutation(ctx, func() error {
+	err := idx.coordinateRepositoryMutation(ctx, OutputEntryIndexCtx, func() error {
 		current, currentErr := idx.currentRepositoryMutationIndexer()
 		if currentErr != nil {
 			return currentErr
@@ -2433,6 +2704,24 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			successfulFiles.Store(path, struct{}{})
 		}
 	}
+	// The shadow drains in a later defer. Publish its successful provenance
+	// only after that drain, never against rows a canceled replacement retired.
+	var publishShadowBaseline func()
+	var shadowPublicationComplete, shadowReplacementStarted, shadowAttemptCounted bool
+	defer func() {
+		if shadowAttemptCounted && !shadowPublicationComplete {
+			idx.indexCount.Add(-1) // retry the failed staging attempt as a full replacement
+		}
+		if shadowReplacementStarted && !shadowPublicationComplete {
+			if err := os.Remove(merkleTreeFile(idx.rootPath)); err != nil && !os.IsNotExist(err) {
+				idx.logger.Warn("indexer: discard interrupted shadow baseline", zap.Error(err))
+			}
+		}
+		if retErr == nil && shadowPublicationComplete && publishShadowBaseline != nil {
+			publishShadowBaseline()
+			graph.MaybeEnsurePlannerStatsFresh(graph.WithPlannerStatsLoadBoundary(ctx), idx.graph)
+		}
+	}()
 	// Register before panic recovery and shadow restoration: failures remain
 	// durable even when a full pass fails, while recovery is acknowledged only
 	// after its replacement graph has committed to the original store.
@@ -2724,13 +3013,29 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	maxShadowBytes := shadowMaxBytes()
 	belowShadowBytes := totalFileBytes <= maxShadowBytes
 	shadowWeight := shadowAdmissionWeight(len(files), totalFileBytes)
-	// A handle pinned to a derived payload generation is disqualified outright.
-	// The drain evicts the repository's persisted rows before its INSERT-only
-	// bulk load, and that eviction spans every generation — right for a
-	// re-track of the base corpus, and a wipe of the very corpus a sparse
-	// generation exists to leave alone. See derivedGenerationTarget.
+	// A handle pinned to a derived payload generation is disqualified unless
+	// its owner installed a pass-corpus filter.
+	//
+	// The disqualification is about what the drain writes. Without a filter
+	// the drain moves the WHOLE pass corpus into the generation, which is
+	// exactly what the direct path already does, so the in-memory route buys a
+	// sparse build nothing and only adds a second copy of the payload in RAM.
+	// With one, the drain is bounded: the filter empties the read-only half of
+	// the corpus first, and only what survives is ever written. That is the
+	// whole point of the mode — a closure file the pass had to READ to resolve
+	// the change never reaches the store at all, rather than being written and
+	// then withdrawn.
+	//
+	// The eviction the older comment here warned about — "spans every
+	// generation" — reads stale against the code it describes:
+	// evictRepoCurrentGeneration (repo_eviction_scope.go:12) routes to
+	// EvictRepoCurrentGeneration, which is generation-scoped, and the
+	// INSERT-only bulk window is itself gated on a provably empty STORE
+	// (beginBulkLoadLocked / coldGraphStoreEmpty), so a derived generation
+	// over a populated base corpus leaves it a no-op and every row still
+	// lands through the ordinary generation-scoped writer.
 	shadowLocallyEligible := blOK && firstIndex && belowShadowMax && belowShadowBytes &&
-		!derivedGenerationTarget(idx.graph)
+		(!derivedGenerationTarget(idx.graph) || idx.passCorpusFilter != nil)
 
 	// Acquire a queued shadow slot before the shared repository-memory envelope.
 	// Waiting candidates therefore hold no general memory reservation. Every
@@ -2740,12 +3045,39 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	if admission == nil {
 		admission = processShadowAdmission
 	}
+	admissionWait := shadowAdmissionWaitFor(ctx, idx.passCorpusFilter != nil)
 	shadowAdmissionStarted := time.Now()
 	var shadowLease *shadowAdmissionLease
 	if shadowLocallyEligible {
-		shadowLease, err = admission.acquire(ctx, shadowWeight)
+		// For an ordinary cold index the in-memory route is the only
+		// affordable one, so queueing for a slot is right: the alternative is
+		// hours of per-row disk writes.
+		//
+		// For a filtered pass it is an optimisation over a path that already
+		// works, and queueing would be the wrong trade — a layer build is what
+		// a checkout view waits on, and the budget's holder is typically a
+		// whole-repository drain. Bound the wait and fall back to writing the
+		// closure and withdrawing it, which is exactly the behaviour that
+		// shipped before this mode existed.
+		acquireCtx, cancelAcquire := ctx, context.CancelFunc(nil)
+		if admissionWait > 0 {
+			acquireCtx, cancelAcquire = context.WithTimeout(ctx, admissionWait)
+		}
+		shadowLease, err = admission.acquire(acquireCtx, shadowWeight)
+		if cancelAcquire != nil {
+			cancelAcquire()
+		}
 		if err != nil {
-			return nil, err
+			// Only the caller's own cancellation ends the pass. A filtered
+			// pass that merely ran out of patience keeps going without the
+			// slot; the filter is then never called and the build withdraws.
+			if idx.passCorpusFilter == nil || ctx.Err() != nil {
+				return nil, err
+			}
+			idx.logger.Info("indexer: no shadow slot for a filtered pass; writing and withdrawing instead",
+				zap.String("repo", idx.RepoPrefix()),
+				zap.Duration("wait_budget", admissionWait), zap.Error(err))
+			shadowLease = nil
 		}
 	}
 	shadowTaken := shadowLease != nil
@@ -2777,6 +3109,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		zap.Uint64("shadow_admissions", shadowStats.admissions),
 		zap.Uint64("shadow_queued_admissions", shadowStats.queued),
 		zap.Duration("shadow_waited", time.Since(shadowAdmissionStarted)),
+		zap.Duration("shadow_wait_budget", admissionWait),
 		zap.Bool("shadow_budget_granted", shadowTaken),
 		zap.Bool("shadow_taken", shadowTaken),
 	)
@@ -2803,6 +3136,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	var releaseIndexMemoryAdmission func(reason string)
 	if memoryLease != nil {
 		memoryAdmittedAt := time.Now()
+		memoryAtAdmission := sampleProcessMemory()
 		stats := memoryBudget.snapshot()
 		idx.logger.Info("indexer: memory envelope admitted",
 			zap.String("repo", idx.RepoPrefix()),
@@ -2835,7 +3169,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					zap.Int64("used_bytes", after.used),
 					zap.Int("waiters", after.waiters),
 					zap.Int("bounded_bypasses", after.bypasses),
-					zap.Uint64("queued_admissions", after.queued))
+					zap.Uint64("queued_admissions", after.queued),
+					zap.Object("process_memory", memoryAtAdmission.until(sampleProcessMemory())))
 			})
 		}
 		// Registered before the GC restore and shadow drain defers. Reverse
@@ -2865,6 +3200,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// into the durable store, which is far cheaper than writing each node
 		// and edge through as it is parsed.
 		idx.indexCount.Add(1)
+		shadowAttemptCounted = true
 		if err := idx.markSymbolFTSNormalizationPending(idx.graph); err != nil {
 			return nil, err
 		}
@@ -2907,6 +3243,20 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if retErr != nil {
 				return
 			}
+			// The read-only-context mode's one write gate. Everything the
+			// drain below persists — nodes, edges, symbol FTS, the files
+			// inventory, the clone corpus, constant values — is read out of
+			// this corpus, so a path the filter empties here is a path no
+			// durable row is ever written for. It runs before the counts are
+			// taken and before the bulk window opens, so the drain's own
+			// telemetry describes what actually landed.
+			if idx.passCorpusFilter != nil {
+				if err := idx.passCorpusFilter(inMemShadow); err != nil {
+					retErr = fmt.Errorf("indexer: filter pass corpus before persistence: %w", err)
+					return
+				}
+				deferredVectorPlan = pruneVectorPlanToCorpus(deferredVectorPlan, inMemShadow)
+			}
 			reporter.Report("persisting bulk graph", 0, 0)
 			drainStart := time.Now()
 			shadowNodeCount := inMemShadow.NodeCount()
@@ -2916,7 +3266,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				shadowEstimateReady = true
 			}
 			drainPressure := newShadowDrainPressure(shadowEstimate, idx.RepoPrefix(), idx.logger)
+			drainViewGeneration := int64(-1)
+			if sqlite, ok := diskTarget.(*store_sqlite.Store); ok {
+				drainViewGeneration = sqlite.ViewGeneration()
+			}
 			idx.logger.Info("indexer: drain start (shadow → disk)",
+				zap.Int64("view_generation", drainViewGeneration),
 				zap.String("repo", idx.RepoPrefix()),
 				zap.Int("shadow_nodes", shadowNodeCount),
 				zap.Int("shadow_edges", shadowEdgeCount),
@@ -2930,8 +3285,21 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// this handle's generation after the replacement parse succeeds and
 			// before its first disk write. Immutable payload generations sharing
 			// the prefix remain queryable through their catalog pointers.
-			if n, e := evictRepoCurrentGeneration(diskTarget, idx.RepoPrefix()); n > 0 || e > 0 {
+			var evictedNodes, evictedEdges int
+			if sqlite, ok := diskTarget.(*store_sqlite.Store); ok && sqlite.SupportsShadowReplacementRetirement() {
+				var err error
+				shadowReplacementStarted = true
+				evictedNodes, evictedEdges, err = sqlite.EvictRepoForShadowReplacement(ctx, idx.RepoPrefix())
+				if err != nil {
+					retErr = fmt.Errorf("indexer: retire shadow replacement rows: %w", err)
+					return
+				}
+			} else {
+				evictedNodes, evictedEdges = evictRepoCurrentGeneration(diskTarget, idx.RepoPrefix())
+			}
+			if n, e := evictedNodes, evictedEdges; n > 0 || e > 0 {
 				idx.logger.Info("indexer: evicted stale generation rows before shadow drain",
+					zap.Int64("view_generation", drainViewGeneration),
 					zap.String("repo", idx.RepoPrefix()),
 					zap.Int("nodes", n), zap.Int("edges", e))
 			}
@@ -2965,8 +3333,22 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				}
 			}
 
+			// The builtin sentinels the drain is about to move, kept aside for
+			// the re-assert below. See restampedBuiltins.
+			var restampedBuiltins []*graph.Node
 			for nodes := range inMemShadow.DrainNodeBatches(persistChunkRows, persistChunkBytes) {
-				diskTarget.AddBatch(nodes, nil)
+				for _, node := range nodes {
+					if node != nil && graph.IsBuiltinStub(node.ID) {
+						copied := *node
+						restampedBuiltins = append(restampedBuiltins, &copied)
+					}
+				}
+				if err := drainAddBatch(ctx, diskTarget, nodes, nil); err != nil && retErr == nil {
+					retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", err)
+				}
+				if retErr != nil && drainYieldable(ctx) && ctx.Err() != nil {
+					break
+				}
 				if !ftsReady || retErr != nil {
 					nodeRows := len(nodes)
 					nodes = nil
@@ -3016,9 +3398,45 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				drainPressure.afterNodeBatch(nodeRows)
 			}
 			for edges := range inMemShadow.DrainEdgeBatches(persistChunkRows, persistChunkBytes) {
-				diskTarget.AddBatch(nil, edges)
+				if drainYieldable(ctx) && ctx.Err() != nil {
+					if retErr == nil {
+						retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", ctx.Err())
+					}
+					break
+				}
+				if err := drainAddBatch(ctx, diskTarget, nil, edges); err != nil {
+					if retErr == nil {
+						retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", err)
+					}
+					break
+				}
 				edgeRows := len(edges)
 				drainPressure.afterEdgeBatch(edgeRows)
+			}
+			// Re-assert the builtin sentinels the edge drain just overwrote.
+			//
+			// A builtin stub is materialised by whichever write funnel first
+			// sees an edge pointing at it, and the shape it is materialised
+			// with carries no boundary identity. The resolver's attribution
+			// pass materialises the SAME id properly — with the workspace and
+			// project of the symbol that referenced it, deliberately, so a
+			// later file-scoped resolve cannot blank those columns
+			// (resolver/go_builtins_attribution.go) — and the node drain above
+			// has just moved that row onto disk. The edge drain that follows
+			// then hands the durable store a batch full of edges pointing at
+			// those same ids, its own funnel has never seen them, and it
+			// upserts the unattributed shape straight over the good row.
+			//
+			// Every drain re-asserts, the ordinary whole index included. A
+			// builtin is a repository-owned identity: the resolver stamps it
+			// with the boundary of the symbol that referenced it, a sparse
+			// generation carries and claims it with those columns, and an
+			// independent whole index of the same tree has to serve the same
+			// row or no composed view can equal it. The set is one row per
+			// distinct builtin the repository references, so the copy is
+			// bounded by the language's builtin vocabulary, not by corpus size.
+			if len(restampedBuiltins) > 0 {
+				diskTarget.AddBatch(restampedBuiltins, nil)
 			}
 
 			flushStart := time.Now()
@@ -3038,46 +3456,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				zap.Int("fts_items", ftsItemCount),
 			)
 			finishDrainPressure()
+			if retErr == nil && drainYieldable(ctx) && ctx.Err() != nil {
+				// A background build that gave the lane up during the drain's
+				// last chunk skips the post-drain passes as well.
+				retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", ctx.Err())
+			}
 			if retErr == nil {
-				// End of this repository's drain: this block runs on the way
-				// out of IndexCtx, after persistRepoIndexState. It is not the
-				// last thing the pass does — the compact sidecars below it,
-				// the backend symbol index and the FTS normalization all still
-				// follow — but it is the first point at which BOTH halves of
-				// the freshness verdict are current, and nothing earlier on
-				// this path has them: the rows have just landed in the
-				// physical tables, and the counters describing them were
-				// written a moment ago.
-				//
-				// BeginBulkLoad was a no-op if the store was already
-				// populated, so FlushBulk returned without re-analyzing
-				// anything; nothing else has, since the store was a fraction
-				// of this size. Cheap when the statistics are already fresh.
-				//
-				// This runs INSIDE the process-global reach topology writer
-				// gate and the caller's repository mutation lane (see the
-				// BeginTopologyMutation window in IndexRepo). Reach readers
-				// give up rather than wait, so anything blocking here turns
-				// MCP answers empty for its duration.
-				//
-				// What the cooperative shape buys, exactly: the refresh never
-				// QUEUES on the store's write gate underneath these, and never
-				// holds it across more than one bounded index — so other store
-				// writers, and the bounded-gate writers that drop their
-				// batches after 15 s, keep making progress. It also bounds
-				// what THIS boundary pays under the gates above: a pass stops
-				// starting indexes once its budget is spent, so the
-				// gate-holding cost here is that budget plus one index's
-				// ANALYZE plus one bounded sqlite_schema reload. It does not
-				// make the cost zero — the remaining indexes are carried to
-				// the next boundary on a resume cursor, which is where the
-				// mechanism converges.
-				//
-				// Outside that bound, and paid under these same wider gates:
-				// two health probes, the present-index list, and the set of
-				// indexes that already carry a statistics row. All four are
-				// read-pool queries taking no store lock.
-				graph.MaybeEnsurePlannerStatsFresh(ctx, diskTarget)
+				// Success provenance and its planner-statistics boundary run after
+				// this complete drain in the earlier-registered publication defer.
 
 				if serr := persistShadowCompactSidecars(
 					inMemShadow, diskTarget, idx.RepoPrefix(),
@@ -3120,6 +3506,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					deferredVectorPlan = nil
 				}
 			}
+			shadowPublicationComplete = retErr == nil
 		}()
 	} else if diskTarget == nil && idx.graph.NodeCount() == 0 && idx.graph.EdgeCount() == 0 {
 		if _, isBulk := idx.graph.(graph.BulkLoader); isBulk && firstIndex && (!belowShadowMax || !belowShadowBytes || !shadowTaken) {
@@ -3630,6 +4017,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					if !skipped && !omitSecondarySourceScans {
 						idx.applyCoverageDomains(relPath, lang, src, result)
 					}
+					// The file node carries the same extraction fingerprints
+					// a per-save of this file stamps (indexFile), at the
+					// same point of the pipeline: a whole index and an
+					// incremental edit write identical file rows, and the
+					// first save after a whole index can take the
+					// fingerprinted fast paths.
+					if !skipped {
+						stampExtractionGraphFingerprint(result)
+					}
 
 					idx.applyRepoPrefix(result.Nodes, result.Edges)
 
@@ -4001,7 +4397,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		reporter.Report("resolving references", 0, 0)
 		// Resolve cross-file references.
 		idx.populateCppIncludeDirs(true)
-		idx.resolver.ResolveAll()
+		resolveStarted := time.Now()
+		resolveStats := idx.resolver.ResolveAll()
+		idx.logResolvePass(resolveStats, time.Since(resolveStarted))
+		// Lift the dataflow placeholders exactly where the per-save path
+		// does (right after resolution, before the derived passes), so a
+		// whole index and an incremental edit write the same arg_of /
+		// returns_to rows.
+		idx.materializeDataflowParams()
 
 		// Infer structural interface satisfaction + method-level
 		// overrides. Skipped under deferGlobalPasses so a batch caller
@@ -4183,18 +4586,24 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 
 	// Persist the Merkle baseline so the next incremental pass diffs
 	// against content hashes rather than re-indexing the whole repo.
-	workspaceFP := ""
-	if merkleBaseline != nil {
-		paths := make([]string, len(files))
-		for i, wf := range files {
-			paths[i] = wf.path
+	nodes, edges := idx.repoNodeEdgeCount()
+	publishBaseline := func() {
+		workspaceFP := ""
+		if merkleBaseline != nil {
+			paths := make([]string, len(files))
+			for i, wf := range files {
+				paths[i] = wf.path
+			}
+			workspaceFP = idx.saveMerkleBaselineWithKnownFiles(absRoot, paths, merkleBaseline.take())
 		}
-		workspaceFP = idx.saveMerkleBaselineWithKnownFiles(absRoot, paths, merkleBaseline.take())
+		idx.persistRepoIndexState(diskTarget, absRoot, workspaceFP, nodes, edges)
+	}
+	if diskTarget != nil {
+		publishShadowBaseline = publishBaseline
+	} else {
+		publishBaseline()
 	}
 	idx.indexGen.Add(1) // invalidate the trigram search cache
-
-	nodes, edges := idx.repoNodeEdgeCount()
-	idx.persistRepoIndexState(diskTarget, absRoot, workspaceFP, nodes, edges)
 	// The persisted counters are what the planner-statistics freshness check
 	// measures growth with, and on the direct-SQLite path this is the only
 	// point in the pass where they and the corpus are both current — which is
@@ -4272,11 +4681,46 @@ func recoverIndexCtxRawStoragePanic(result **IndexResult, retErr *error) {
 // so callers that stamp RepoMetadata.NodeCount/EdgeCount no longer
 // freeze the workspace-wide total at TrackRepo time.
 func (idx *Indexer) repoNodeEdgeCount() (int, int) {
+	var nodes, edges int
 	if idx.repoPrefix == "" {
-		return idx.graph.NodeCount(), idx.graph.EdgeCount()
+		nodes, edges = idx.graph.NodeCount(), idx.graph.EdgeCount()
+	} else {
+		est := idx.graph.RepoMemoryEstimate(idx.repoPrefix)
+		nodes, edges = est.NodeCount, est.EdgeCount
 	}
-	est := idx.graph.RepoMemoryEstimate(idx.repoPrefix)
-	return est.NodeCount, est.EdgeCount
+	idx.lastRepoCounts.Store(&repoCountSnapshot{nodes: nodes, edges: edges})
+	return nodes, edges
+}
+
+// repoCountSnapshot is the repository's node/edge count as last measured by a
+// whole-repository count (a full index, a full-root reconcile, or the first
+// scoped pass of this Indexer).
+type repoCountSnapshot struct{ nodes, edges int }
+
+// scopedPassRepoCounts returns the counts a scoped (explicit-path) incremental
+// pass reports. Counting is O(repository) — every node of the repository and
+// every edge they source, 0.7-1.2 s per save on a 185k-node / 946k-edge store —
+// while the pass itself is O(changed files), so a scoped pass reuses the last
+// whole-repository count and reports cached=true. The count was never exact
+// for a save anyway: it is taken before the resolver catch-up and the derived
+// passes that follow it. Whole-repository passes and `daemon status --exact`
+// still count. The first scoped pass of an Indexer with no prior count reads
+// the store's persisted per-repository counters, and counts once only when the
+// store has none.
+func (idx *Indexer) scopedPassRepoCounts() (nodes, edges int, cached bool) {
+	if snapshot := idx.lastRepoCounts.Load(); snapshot != nil {
+		return snapshot.nodes, snapshot.edges, true
+	}
+	// No count in this process yet (a warm restart): the counters the store
+	// persisted at the last whole index are the same kind of answer.
+	if idx.repoPrefix != "" && idx.graph != nil {
+		if est, ok := idx.graph.AllRepoMemoryEstimates()[idx.repoPrefix]; ok && (est.NodeCount > 0 || est.EdgeCount > 0) {
+			idx.lastRepoCounts.Store(&repoCountSnapshot{nodes: est.NodeCount, edges: est.EdgeCount})
+			return est.NodeCount, est.EdgeCount, true
+		}
+	}
+	nodes, edges = idx.repoNodeEdgeCount()
+	return nodes, edges, false
 }
 
 // cleanCensusResult publishes the same zero-delta state as the full-root
@@ -4310,7 +4754,9 @@ func (idx *Indexer) cleanCensusResult(ctx context.Context, detected int, started
 		return nil, err
 	}
 
-	nodes, edges := idx.repoNodeEdgeCount()
+	// The tree is proven unchanged: the counts stored at the last index
+	// are reused instead of counted (census_stored_counts.go).
+	nodes, edges := idx.cleanCensusRepoCounts(ctx)
 	fileCount := idx.trackedFileCount()
 	if fileCount == 0 {
 		fileCount = detected
@@ -4352,7 +4798,7 @@ func (idx *Indexer) IndexFile(filePath string) error {
 	if err := validateRepositoryMutationRegularFile(root, canonical); err != nil {
 		return err
 	}
-	return idx.coordinateRepositoryMutation(context.Background(), func() error {
+	return idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 		// The path may be deleted or replaced while this call waits for the
 		// repository lane. Revalidate after admission so IndexFile preserves its
 		// existing-regular-file contract instead of turning a queued update into
@@ -4483,12 +4929,23 @@ func (idx *Indexer) indexFile(
 	// so it must be captured before evictExisting runs.
 	var oldFuncIDs []string
 	evictExisting := func() {
+		var oldFTSNodeIDs []string
 		for _, n := range idx.graph.GetFileNodes(graphPath) {
+			if n == nil {
+				continue
+			}
 			idx.removeFromSearch(n)
+			if n.Kind != graph.KindContract {
+				oldFTSNodeIDs = append(oldFTSNodeIDs, n.ID)
+			}
 			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
 				oldFuncIDs = append(oldFuncIDs, n.ID)
 			}
 		}
+		// The native symbol backend's Remove is a no-op. Match structural
+		// batch replacement by deleting its prior documents explicitly;
+		// canonical contracts follow the store's owner-retention decision.
+		idx.deleteSymbolFTS(oldFTSNodeIDs)
 		idx.restubIncomingRefs(graphPath)
 		idx.graph.EvictFile(graphPath)
 	}
@@ -4635,6 +5092,7 @@ func (idx *Indexer) indexFile(
 	var abSnap *affectedBySnapshot
 	var reuseIdx map[reuseKey]*reuseVal
 	var priorUnresolved []*graph.Edge
+	var priorDeclarations resolver.DeclarationSurface
 	var priorVis csharpVisibilityStamp
 	visCaptured := false
 	deferredResolverCatchup := markerBatch != nil && markerBatch.deferResolverCatchup
@@ -4647,6 +5105,9 @@ func (idx *Indexer) indexFile(
 		// (priorUnresolved). Together this makes a save re-resolve only the
 		// references it actually changed instead of the whole file.
 		reuseIdx, priorUnresolved, priorVis = captureIncrementalState(idx.graph, graphPath)
+		// The declaration surface the incoming leg compares against: which
+		// stub keys this save leaves with identical declarations.
+		priorDeclarations = resolver.DeclarationSurfaceOf(idx.graph.GetFileNodes(graphPath))
 		visCaptured = true
 		snapshotDuration = time.Since(snapshotStarted)
 	}
@@ -4689,7 +5150,7 @@ func (idx *Indexer) indexFile(
 	// captured resolutions and the prior-unresolved skip are stale.
 	freshVis := csharpVisibilityStampForNodes(result.Nodes)
 	if visCaptured && priorVis != freshVis {
-		reuseIdx, priorUnresolved = nil, nil
+		reuseIdx, priorUnresolved, priorDeclarations = nil, nil, nil
 	}
 	if reused := applyResolvedOutEdges(idx.graph, result.Edges, reuseIdx, newNodeIDs); reused > 0 {
 		idx.logger.Debug("indexer: reused prior resolutions",
@@ -4758,10 +5219,14 @@ func (idx *Indexer) indexFile(
 		// incoming pass, so a small edit to a reference-heavy file no longer
 		// re-runs the candidate cascade on thousands of stdlib/external calls.
 		idx.resolver.SetIncrementalSkip(priorUnresolved)
+		if priorDeclarations != nil {
+			idx.resolver.SetPriorDeclarations(map[string]resolver.DeclarationSurface{graphPath: priorDeclarations})
+		}
 		resolveStarted := time.Now()
 		idx.resolver.ResolveFileAndIncoming(graphPath)
 		resolveDuration = time.Since(resolveStarted)
 		idx.resolver.SetIncrementalSkip(nil)
+		idx.resolver.SetPriorDeclarations(nil)
 		// A global-using edit changes every dependent file's visibility
 		// without touching the files themselves — nothing above re-resolves
 		// them.
@@ -5106,7 +5571,7 @@ func (idx *Indexer) EvictFile(filePath string) (int, int) {
 		return 0, 0
 	}
 	var nodesRemoved, edgesRemoved int
-	err = idx.coordinateRepositoryMutation(context.Background(), func() error {
+	err = idx.coordinateRepositoryMutation(context.Background(), OutputEntryEvictFile, func() error {
 		var evictErr error
 		nodesRemoved, edgesRemoved, evictErr = idx.evictPointMutationRaw(canonical)
 		return evictErr
@@ -5154,7 +5619,7 @@ func (idx *Indexer) ReresolveFileScoped(filePath string) error {
 	if err != nil {
 		return err
 	}
-	return idx.coordinateRepositoryMutation(context.Background(), func() error {
+	return idx.coordinateRepositoryMutation(context.Background(), OutputEntryReresolveFileScoped, func() error {
 		current, currentErr := idx.currentRepositoryMutationIndexer()
 		if currentErr != nil {
 			return currentErr
@@ -6120,6 +6585,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 ) (*IndexResult, error) {
 	idx.loadFileIndexFailures()
 	defer idx.flushFileIndexFailures()
+	idx.resetCapabilityPrior()
 	fullRoot := len(paths) == 0
 	if fullRoot {
 		// An empty scope means the repository root. detectDeletions decides
@@ -6475,7 +6941,13 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		idx.indexGen.Add(1) // files changed — invalidate the trigram cache
 	}
 
-	nodes, edges := idx.repoNodeEdgeCount()
+	var nodes, edges int
+	countsCached := false
+	if fullRoot {
+		nodes, edges = idx.repoNodeEdgeCount()
+	} else {
+		nodes, edges, countsCached = idx.scopedPassRepoCounts()
+	}
 	// FileCount must describe the repo, never this pass. diskFiles holds
 	// only the files under the caller's scope, so len(diskFiles) is the
 	// size of the batch — stamping that onto RepoMetadata is what made
@@ -6497,6 +6969,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		FailedFiles:         failedFiles,
 		DurationMs:          time.Since(start).Milliseconds(),
 		DerivedInvalidation: invalidation,
+		CountsCached:        countsCached,
+		capabilityPrior:     idx.takeCapabilityPrior(),
 	}
 	for _, path := range failedFiles {
 		result.Errors = append(result.Errors, IndexError{FilePath: path, Error: idx.fileIndexFailureError(path).Error()})
@@ -6533,7 +7007,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	recoveredFiles = append(recoveredFiles, walkedDirs...)
 	idx.clearRecoveredParseErrors(recoveredFiles, failedFiles, nil)
 	finalizeTiming.complete(nil, zap.Int("failed_files", len(failedFiles)),
-		zap.Int("nodes", result.NodeCount), zap.Int("edges", result.EdgeCount))
+		zap.Int("nodes", result.NodeCount), zap.Int("edges", result.EdgeCount),
+		zap.Bool("counts_cached", countsCached))
 	return result, nil
 }
 
@@ -6852,7 +7327,7 @@ func (idx *Indexer) recordContractStateMarker(count int) {
 	}
 	if err := store.SetContractState(graph.ContractState{
 		RepoPrefix:    idx.repoPrefix,
-		IndexedSHA:    repoHead(idx.rootPath),
+		IndexedSHA:    idx.head(idx.rootPath),
 		CompletedAt:   time.Now().Unix(),
 		ContractCount: count,
 	}); err != nil {

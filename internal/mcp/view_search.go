@@ -136,7 +136,17 @@ func (v *requestView) bindSources(sources []graphview.GenerationSource, base gra
 	// The indexed corpus is the bottom content source and is masked by
 	// every generation above it; it claims nothing itself, so it carries
 	// no layer.
+	//
+	// It is also generation zero — mutable, shared, and the one corpus in this
+	// stack the generation lease was never taken over on the reader's behalf.
+	// Recording that the view reads it is what lets the request pin it for its
+	// own lifetime and state truthfully afterwards whether it moved; see
+	// pinRequestBaseCorpus. The flag is set here, and not at either call site,
+	// because this is the single place the base corpus is joined to a routed
+	// view: both the worktree path and the committed-tree path come through
+	// it.
 	baseContent, _ := base.(contentQuerier)
+	v.readsBaseCorpus = true
 	content := make([]viewContentSource, 0, len(sources)+1)
 	content = append(content, viewContentSource{searcher: baseContent})
 	for _, source := range sources {
@@ -154,6 +164,17 @@ func (v *requestView) bindSources(sources []graphview.GenerationSource, base gra
 	}
 	v.candidates = candidates
 	v.content = &viewContentSearcher{sources: content}
+}
+
+// excludesBaseCorpus reports a routed view whose stack does not compose the
+// indexed corpus (its bottom is a dedicated full root), so symbol candidate
+// enumeration must not consult generation zero. A buffer overlay, a base
+// request and a labelled base selector all keep the base corpus.
+func (v *requestView) excludesBaseCorpus() bool {
+	if v == nil || v.materialized == nil || v.baseNarrowed || len(v.candidates) == 0 {
+		return false
+	}
+	return !v.materialized.ComposesBaseCorpus()
 }
 
 // candidateLayers is the stack the query engine enumerates candidates across,

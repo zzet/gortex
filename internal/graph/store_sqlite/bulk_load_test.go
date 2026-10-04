@@ -48,7 +48,7 @@ func bulkFixture(nNodes, nEdges int) ([]*graph.Node, []*graph.Edge) {
 func openTempStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "bulk.sqlite")
-	s, err := Open(path)
+	s, err := openPristine(t, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

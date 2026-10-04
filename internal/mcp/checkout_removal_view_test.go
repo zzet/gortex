@@ -65,10 +65,22 @@ func TestCheckoutRemovalRunsThroughAnUnbindableCWD(t *testing.T) {
 	nested := filepath.Join(stack.repoRoot, "vendored-theme")
 	require.NoError(t, os.MkdirAll(filepath.Join(nested, ".git"), 0o755))
 
-	// The gate is real and stays real: a graph read through the same cwd is
-	// still refused rather than answered off the parent's corpus.
+	// Give the terminal-refusal control its own fixture. Automatic discovery
+	// may truthfully report pending before it rejects an unknown nested root;
+	// that timing is covered separately by the pending-discovery tests below.
+	// Close the control's observers before removing its optional provider, so
+	// cleanup cannot lose a live lifecycle. The removal fixture above keeps
+	// its live lifecycle throughout all four catalog-only requests.
+	control := newViewStack(t)
+	require.NoError(t, control.srv.lifecycle.Close())
+	control.srv.lifecycle = nil
+	controlNested := filepath.Join(control.repoRoot, "vendored-theme")
+	require.NoError(t, os.MkdirAll(filepath.Join(controlNested, ".git"), 0o755))
+
+	// The graph-read gate still refuses the nested root instead of answering
+	// from its parent's corpus, with a deterministic terminal error.
 	readRan := false
-	res, err := stack.callWithView(t, nested, "get_symbol", nil,
+	res, err := control.callWithView(t, controlNested, "get_symbol", nil,
 		func(context.Context) (*mcplib.CallToolResult, error) {
 			readRan = true
 			return mcplib.NewToolResultText(`{}`), nil

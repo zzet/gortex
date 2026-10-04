@@ -3,12 +3,19 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/savings"
 )
@@ -241,4 +248,208 @@ func TestGainCmd_Registered(t *testing.T) {
 	if !subs["gain"] {
 		t.Errorf("rootCmd missing `gain`; have %v", subs)
 	}
+}
+
+// --- the gain reader must see every live handle's buffered window ----------
+//
+// `gortex gain` opens a SECOND savings.Store on the ledger a writer in the
+// same process is already buffering into. The two handles share one sidecar
+// connection (persistence.OpenSidecar caches by path) but own separate
+// buffers, so a reader that flushed only its own buffer reported a ledger
+// that was still in the writer's memory — and its deferred Close then took
+// the shared connection away, turning the writer's next flush into
+// "database is closed" and DROPPING the window rather than delaying it.
+
+// A whole window of buffered observations must be visible to loadHistory,
+// not just the one the narrower regression tests book.
+func TestLoadHistory_SeesEveryBufferedObservation(t *testing.T) {
+	const observations = 12
+	dir := t.TempDir()
+	writer, err := savings.Open(persistence.DefaultSidecarPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	for i := range observations {
+		writer.AddObservation(savings.Observation{
+			Repo: "/r", Language: "go", Tool: "search_symbols",
+			Returned: 10, Saved: int64(100 + i),
+		})
+	}
+	if got := writer.Pending(); got != observations {
+		t.Fatalf("precondition: want %d observations still buffered, got %d", observations, got)
+	}
+
+	var wantSaved int64
+	for i := range observations {
+		wantSaved += int64(100 + i)
+	}
+
+	h, err := loadHistory(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Calls != observations || h.Saved != wantSaved {
+		t.Errorf("cumulative read must drain the writer's buffer: want Calls=%d Saved=%d, got %+v",
+			observations, wantSaved, h)
+	}
+
+	// The window reader (event scan) must agree with the cumulative one.
+	hw, err := loadHistory(dir, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hw.Calls != observations || hw.Saved != wantSaved {
+		t.Errorf("windowed read must see the same events: want Calls=%d Saved=%d, got %+v",
+			observations, wantSaved, hw)
+	}
+}
+
+// loadHistory's deferred Close must not strand the writer's buffer. The
+// observation booked between the two reads has to survive a reader that
+// releases the shared sidecar handle.
+func TestLoadHistory_CloseDoesNotDropTheWritersWindow(t *testing.T) {
+	dir := t.TempDir()
+	path := persistence.DefaultSidecarPath(dir)
+	writer, err := savings.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+
+	writer.AddObservation(savings.Observation{Repo: "/r", Language: "go", Tool: "read_file", Saved: 7})
+	if _, err := loadHistory(dir, 0); err != nil { // opens + closes its own handle
+		t.Fatal(err)
+	}
+
+	// Re-read through a fresh handle: the first observation must be on disk
+	// and nothing may be counted as dropped.
+	reader, err := savings.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	snap, err := reader.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Totals.CallsCounted != 1 || snap.Totals.TokensSaved != 7 {
+		t.Errorf("the writer's window must be committed, not dropped: got %+v", snap.Totals)
+	}
+	if snap.DroppedObservations != 0 {
+		t.Errorf("no observation may be dropped, got %d", snap.DroppedObservations)
+	}
+}
+
+// --- the one-shot stdio server flushes on every exit path -----------------
+
+// installOneshotSavingsFlush is the seam; runMCP is the production entry
+// point that has to reach it. Parsing the source is the only way to assert
+// the wiring without standing up a full stdio server: the call must be
+// DEFERRED (so it runs on the errCh return, the SIGINT/SIGTERM return and
+// every error return in between) and it must be registered after the stack's
+// own `defer ss.Close()`, so LIFO commits the ledger before teardown.
+func TestRunMCPDefersTheOneshotSavingsFlush(t *testing.T) {
+	// Resolve mcp.go from THIS file's own location rather than the working
+	// directory: other tests in this package chdir, and the assertion must
+	// not depend on who ran last.
+	_, self, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate this test file")
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(self), "mcp.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "runMCP" && fd.Recv == nil {
+			fn = fd
+		}
+	}
+	if fn == nil {
+		t.Fatal("runMCP not found in mcp.go")
+	}
+
+	closeAt, flushAt := -1, -1
+	ast.Inspect(fn, func(n ast.Node) bool {
+		def, ok := n.(*ast.DeferStmt)
+		if !ok {
+			return true
+		}
+		pos := fset.Position(def.Pos()).Line
+		switch inner := def.Call.Fun.(type) {
+		case *ast.SelectorExpr: // defer ss.Close()
+			if id, ok := inner.X.(*ast.Ident); ok && id.Name == "ss" && inner.Sel.Name == "Close" {
+				closeAt = pos
+			}
+		case *ast.CallExpr: // defer installOneshotSavingsFlush(srv)()
+			if id, ok := inner.Fun.(*ast.Ident); ok && id.Name == "installOneshotSavingsFlush" {
+				flushAt = pos
+			}
+		}
+		return true
+	})
+	if flushAt < 0 {
+		t.Fatal("runMCP must defer installOneshotSavingsFlush(srv)() so every exit path commits the savings window")
+	}
+	if closeAt < 0 {
+		t.Fatal("runMCP no longer defers ss.Close(); the ordering assertion below is meaningless")
+	}
+	if flushAt < closeAt {
+		t.Errorf("the savings flush is deferred at line %d, before `defer ss.Close()` at line %d: "+
+			"LIFO would then run it after the stack teardown", flushAt, closeAt)
+	}
+}
+
+// The helper must tighten the window to the one-shot bound and hand back a
+// closure that actually commits. Exercised against a real *gortexmcp.Server
+// with a sidecar-backed ledger: a host that SIGKILLs its stdio server loses
+// only what is still inside that bound.
+func TestInstallOneshotSavingsFlush_BoundsAndCommits(t *testing.T) {
+	srv := gortexmcp.NewServer(nil, nil, nil, nil, zap.NewNop(), nil)
+	path := filepath.Join(t.TempDir(), "sidecar.sqlite")
+	store, err := savings.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	srv.InitSavings(store, "")
+
+	if every, max := store.FlushBounds(); every != savings.DefaultFlushInterval || max != savings.DefaultFlushMax {
+		t.Fatalf("precondition: a fresh store starts on the daemon default, got %v/%d", every, max)
+	}
+
+	flush := installOneshotSavingsFlush(srv)
+
+	every, max := store.FlushBounds()
+	if every != savings.OneshotFlushInterval || max != savings.OneshotFlushMax {
+		t.Errorf("the one-shot entry point must tighten the window to %v/%d, got %v/%d",
+			savings.OneshotFlushInterval, savings.OneshotFlushMax, every, max)
+	}
+	if every >= savings.DefaultFlushInterval {
+		t.Errorf("the one-shot window (%v) must be shorter than the daemon default (%v)",
+			every, savings.DefaultFlushInterval)
+	}
+
+	store.AddObservation(savings.Observation{Repo: "/r", Language: "go", Tool: "search_symbols", Saved: 42})
+	if store.Pending() != 1 {
+		t.Fatalf("precondition: the observation must still be buffered, got %d pending", store.Pending())
+	}
+	flush()
+	if store.Pending() != 0 {
+		t.Errorf("the deferred flush must drain the buffer, %d still pending", store.Pending())
+	}
+	snap, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Totals.CallsCounted != 1 || snap.Totals.TokensSaved != 42 {
+		t.Errorf("the deferred flush must commit the window, got %+v", snap.Totals)
+	}
+
+	// A server with no ledger wired must still be deferrable blind.
+	installOneshotSavingsFlush(gortexmcp.NewServer(nil, nil, nil, nil, zap.NewNop(), nil))()
+	installOneshotSavingsFlush(nil)()
 }

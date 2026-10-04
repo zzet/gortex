@@ -48,8 +48,17 @@ in this order: --backend-path if given, else the store a running daemon
 recorded at startup (so a daemon started with --backend-path is followed
 without repeating the flag here), else ~/.gortex/store/store.sqlite.
 
+Scope: the freshness rows are the BASE corpus only. This command reads
+repo_index_state directly, restricted to the base view generation, and
+never opens the daemon's view catalog. A daemon serving routed worktree
+views holds derived generations beside those rows; none of them is read
+here, so a linked worktree's own freshness is NOT what this reports —
+the row shown for it is its family's base. Ask "gortex repos
+explain-view <path>" for the view that actually serves a working copy.
+
 The default output is a table; --json emits the same data as a JSON
-array suitable for scripting.`,
+array suitable for scripting, with freshness_scope on every entry
+naming the scope above.`,
 	RunE: runRepos,
 }
 
@@ -102,6 +111,33 @@ type repoStatus struct {
 	// go fresh again, so it is reported as its own state rather than
 	// collapsing into "stale" behind an empty HEAD (#312).
 	Missing bool `json:"missing,omitempty"`
+	// FreshnessScope names which generation the Indexed* / Stale fields
+	// describe. It is always reposFreshnessScope ("base"): the door this
+	// command reads through is base-only by construction
+	// (store_sqlite.RepoIndexStateBaseViewGen). It is emitted
+	// unconditionally, and not omitted when it is the default, because a
+	// scripted consumer must be able to tell "base, declared" from "an
+	// older gortex that did not say" — an absent field is the second.
+	FreshnessScope string `json:"freshness_scope"`
+}
+
+// reposFreshnessScope names the generation `gortex repos` reports freshness
+// for. It is derived from the constant the read door's predicate is built
+// with, and it shares the probe surface's vocabulary for the same corpus
+// (daemon.ProbeViewBase), so the two front doors call it the same thing.
+//
+// A non-base generation would need a different reader; this one cannot produce
+// it, which is why the value is a constant rather than a field of the answer.
+var reposFreshnessScope = reposScopeName(store_sqlite.RepoIndexStateBaseViewGen)
+
+func reposScopeName(viewGen int) string {
+	if viewGen == store_sqlite.RepoIndexStateBaseViewGen {
+		return daemon.ProbeViewBase
+	}
+	// Unreachable while the read door is base-only. Spelled rather than
+	// panicked so a future generation-aware reader names it instead of
+	// silently keeping the base label.
+	return fmt.Sprintf("view_gen:%d", viewGen)
 }
 
 func runRepos(cmd *cobra.Command, _ []string) error {
@@ -196,11 +232,12 @@ func describeRepo(indexStates map[string]graph.RepoIndexState, repoCount int, r 
 	branch := gitBranch(r.Path)
 
 	entry := repoStatus{
-		Name:       repoLabel(r),
-		Path:       r.Path,
-		Workspace:  r.Workspace,
-		HeadCommit: head,
-		Branch:     branch,
+		Name:           repoLabel(r),
+		Path:           r.Path,
+		Workspace:      r.Workspace,
+		HeadCommit:     head,
+		Branch:         branch,
+		FreshnessScope: reposFreshnessScope,
 		// Default to stale; cleared below only when a recorded
 		// index is found whose commit matches HEAD.
 		Stale: true,
@@ -258,6 +295,9 @@ func renderReposTable(cmd *cobra.Command, entries []repoStatus) error {
 	if tty {
 		emitReposBanner(stderr)
 	}
+	// Declared before the rows it qualifies, so the scope is read with them
+	// rather than discovered under them.
+	emitReposScopeNote(stderr)
 
 	t := table.NewWriter()
 	t.SetOutputMirror(out)
@@ -320,6 +360,24 @@ func emitReposMissingHint(w interface{ Write([]byte) (int, error) }, entries []r
 	for _, e := range gone {
 		fmt.Fprintf(w, "     gortex untrack %s\n", e.Path)
 	}
+}
+
+// emitReposScopeNote declares what generation the freshness columns describe.
+//
+// On stderr, unconditionally — the same placement and for the same reason as
+// emitReposMissingHint: stdout carries the parseable table, and a scripted
+// `gortex repos | grep stale` must not gain a line. But this is not decoration
+// either, so it is not gated on a TTY: a user reading "fresh" beside a linked
+// worktree's repository is reading a fact about the family's BASE corpus, and
+// the command that produced it never opened the view catalog that would know
+// the worktree's own generation. Saying nothing is what let that read as the
+// checkout's own freshness.
+//
+// Scripted callers read `freshness_scope` from --json instead.
+func emitReposScopeNote(w interface{ Write([]byte) (int, error) }) {
+	fmt.Fprintf(w, "note: freshness below is the %s corpus only (view generation %d) — "+
+		"a routed worktree's own generation is not read here; ask `gortex repos explain-view <path>`\n",
+		reposFreshnessScope, store_sqlite.RepoIndexStateBaseViewGen)
 }
 
 // emitReposBanner prints the gortex mesh banner on stderr above the table.

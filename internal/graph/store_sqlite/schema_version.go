@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 21
+const currentSchemaVersion = 30
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -118,6 +118,323 @@ var schemaMigrations = []schemaMigration{
 	{version: 19, name: "purge legacy slash-spelled coverage artifacts", inPlace: purgeLegacyCoverageSpellings},
 	{version: 20, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
 	{version: 21, name: "persist per-file indexing failures", inPlace: createFileIndexFailuresTable},
+	{version: 22, name: "add dedicated base publication intent", inPlace: createDedicatedBasePublicationsTable},
+	{version: 23, name: "persist derived dependency revision", inPlace: addDependencyRevisionColumns},
+	{version: 24, name: "separate node identity-only ownership masks", inPlace: addNodeIdentityMaskKinds},
+	{version: 25, name: "key analysis generations by view generation", inPlace: addAnalysisViewGenerationKeys},
+	{version: 26, name: "scope hot graph indexes by view generation", inPlace: scopeHotGraphIndexesByViewGeneration},
+	{version: 27, name: "scope kind and fn-value indexes by view generation", inPlace: scopeKindAndFnValueIndexesByViewGeneration},
+	{version: 28, name: "lead edge candidate indexes with view generation", inPlace: scopeEdgeCandidateIndexesByViewGeneration},
+	{version: 29, name: "persist admitted-input manifests per generation", inPlace: createGenerationInputManifestTables},
+	{version: 30, name: "cover scoped supplementary name candidates", inPlace: createNameCandidateIndex},
+}
+
+func createNameCandidateIndex(tx *sql.Tx) error {
+	_, err := tx.Exec(nodesNameCandidatesIndexDDL)
+	return err
+}
+
+// generationFirstEdgeCandidateIndexNames covers precisely the indexes used by
+// endpoint and site candidate reads. The v26 step already rebuilt the endpoint
+// pair with their current registry DDL, so v28 compares every individual
+// column sequence and skips each already-correct index.
+var generationFirstEdgeCandidateIndexNames = [...]string{
+	"edges_by_from",
+	"edges_by_to",
+	"edges_by_from_line",
+	"edges_by_from_line_kind",
+}
+
+func scopeEdgeCandidateIndexesByViewGeneration(tx *sql.Tx) error {
+	indexes := make([]bulkDroppableIndex, 0, len(generationFirstEdgeCandidateIndexNames))
+	registries := [][]bulkDroppableIndex{bulkDroppableIndexes, bulkAlwaysLiveIndexes}
+	for _, name := range generationFirstEdgeCandidateIndexNames {
+		found := false
+		for _, registry := range registries {
+			for _, idx := range registry {
+				if idx.name != name {
+					continue
+				}
+				indexes = append(indexes, idx)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("generation-first edge candidate index %q missing from registry", name)
+		}
+	}
+	mismatched := make([]bulkDroppableIndex, 0, len(indexes))
+	for _, idx := range indexes {
+		matched, err := edgeCandidateIndexMatchesGenerationFirst(tx, idx.name)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			mismatched = append(mismatched, idx)
+		}
+	}
+	for _, idx := range mismatched {
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS ` + idx.name); err != nil {
+			return fmt.Errorf("drop %s: %w", idx.name, err)
+		}
+	}
+	for _, idx := range mismatched {
+		if _, err := tx.Exec(idx.ddl); err != nil {
+			return fmt.Errorf("create %s: %w", idx.name, err)
+		}
+	}
+	return nil
+}
+
+func edgeCandidateIndexMatchesGenerationFirst(tx *sql.Tx, name string) (bool, error) {
+	want := map[string][]string{
+		"edges_by_from":           {"view_gen", "from_id", "kind"},
+		"edges_by_to":             {"view_gen", "to_id", "kind"},
+		"edges_by_from_line":      {"view_gen", "from_id", "line"},
+		"edges_by_from_line_kind": {"view_gen", "from_id", "line", "kind"},
+	}
+	columns, ok := want[name]
+	if !ok {
+		return false, fmt.Errorf("generation-first edge candidate index %q has no expected shape", name)
+	}
+	rows, err := tx.Query(`SELECT name FROM pragma_index_info(?) ORDER BY seqno`, name)
+	if err != nil {
+		return false, fmt.Errorf("read %s shape: %w", name, err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return false, fmt.Errorf("scan %s shape: %w", name, err)
+		}
+		got = append(got, column)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("read %s shape: %w", name, err)
+	}
+	if len(got) != len(columns) {
+		return false, nil
+	}
+	for i := range got {
+		if got[i] != columns[i] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// generationSelectiveGraphIndexNames is the bounded v27 migration whitelist.
+// Resolve both canonical definitions before dropping either index so a registry
+// drift fails without disturbing a warm store's installed legacy shapes.
+var generationSelectiveGraphIndexNames = [...]string{
+	"nodes_by_kind",
+	"edges_fnvalue_prefixed",
+}
+
+func scopeKindAndFnValueIndexesByViewGeneration(tx *sql.Tx) error {
+	indexes := make([]bulkDroppableIndex, 0, len(generationSelectiveGraphIndexNames))
+	registries := [][]bulkDroppableIndex{bulkDroppableIndexes, bulkAlwaysLiveIndexes}
+	for _, name := range generationSelectiveGraphIndexNames {
+		found := false
+		for _, registry := range registries {
+			for _, idx := range registry {
+				if idx.name != name {
+					continue
+				}
+				indexes = append(indexes, idx)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("generation-selective graph index %q missing from registry", name)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS ` + idx.name); err != nil {
+			return fmt.Errorf("drop %s: %w", idx.name, err)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(idx.ddl); err != nil {
+			return fmt.Errorf("create %s: %w", idx.name, err)
+		}
+	}
+	return nil
+}
+
+// generationScopedGraphIndexNames is the bounded v26 migration whitelist.
+// Each name resolves back to the same registry DDL used by fresh stores and
+// bulk-index sealing, so initial creation and migration cannot drift.
+var generationScopedGraphIndexNames = [...]string{
+	"nodes_by_name",
+	"nodes_by_file",
+	"nodes_by_repo",
+	"nodes_by_repo_language_name",
+	"edges_by_from",
+	"edges_by_to",
+	nodesByGenerationIndexName,
+	edgesByGenerationIndexName,
+}
+
+// scopeHotGraphIndexesByViewGeneration replaces the eight legacy lookup shapes
+// transactionally. Resolve every definition before the first DROP: a renamed
+// or removed registry entry fails without disturbing any installed index.
+func scopeHotGraphIndexesByViewGeneration(tx *sql.Tx) error {
+	indexes := make([]bulkDroppableIndex, 0, len(generationScopedGraphIndexNames))
+	registries := [][]bulkDroppableIndex{bulkDroppableIndexes, bulkAlwaysLiveIndexes}
+	for _, name := range generationScopedGraphIndexNames {
+		found := false
+		for _, registry := range registries {
+			for _, idx := range registry {
+				if idx.name != name {
+					continue
+				}
+				indexes = append(indexes, idx)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("generation-scoped graph index %q missing from registry", name)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS ` + idx.name); err != nil {
+			return fmt.Errorf("drop %s: %w", idx.name, err)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(idx.ddl); err != nil {
+			return fmt.Errorf("create %s: %w", idx.name, err)
+		}
+	}
+	return nil
+}
+
+// addAnalysisViewGenerationKeys gives the whole-graph analysis cache a real
+// payload-view-generation axis: analysis_generations gains a view_gen column
+// and analysis_active_generation is re-keyed from one global slot to one slot
+// per view generation.
+//
+// Why a column and not the existing CAS: the build_revision the cache already
+// stores is analysisMutationRevision, an atomic.Uint64 on the storeCore every
+// generation handle shares (store.go), bumped only when a graph mutation
+// commits (analysis_generation_state.go) and reset on reopen. Two analyses
+// computed over two payload generations with no intervening mutation carry the
+// identical revision, so it can never identify which view an analysis belongs
+// to. It stays exactly as it is — the concurrency guard it was written to be.
+//
+// Purely additive for the data: every existing row belongs to the single base
+// corpus, generation 0, which is the column default and the value the pointer
+// copy supplies, so nothing is re-derived and no reindex is needed. The
+// pointer's primary key cannot be altered in place, so that one table is
+// rebuilt from the canonical body; analysis_generations only gains a column
+// and takes a plain ALTER. Both run in the caller's single migration
+// transaction, so a failure anywhere leaves the store exactly as it was.
+//
+// Idempotent: each half probes for its own view_gen column first. schemaSQL
+// runs before the migration steps, so on a fresh store both halves are no-ops.
+func addAnalysisViewGenerationKeys(tx *sql.Tx) error {
+	present, err := analysisTablePresent(tx, "analysis_generations")
+	if err != nil {
+		return err
+	}
+	if !present {
+		// Nothing to migrate: schemaSQL creates both tables in their current
+		// shape, and a store that reaches here without them has no analysis
+		// cache to re-key.
+		return nil
+	}
+	if err := addAnalysisGenerationsViewGenColumn(tx); err != nil {
+		return fmt.Errorf("analysis_generations: %w", err)
+	}
+	return rebuildAnalysisActiveGenerationAtBase(tx)
+}
+
+// analysisTablePresent reports whether an ordinary table exists. The analysis
+// cache arrived in v4 and schemaSQL recreates it on every Open, but the
+// migration registry is also driven directly by tests and by alternate open
+// paths, and an ALTER against a missing table is a migration failure rather
+// than the no-op it should be.
+func analysisTablePresent(tx *sql.Tx, table string) (bool, error) {
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table,
+	).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// addAnalysisGenerationsViewGenColumn appends view_gen to the manifest table.
+// Existing rows take the constant default, generation 0 — the base corpus they
+// already describe. The probe reads pragma_table_xinfo for the same reason
+// addEdgeViewGenerationColumn does: one probe shape that lists every column.
+func addAnalysisGenerationsViewGenColumn(tx *sql.Tx) error {
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_xinfo('analysis_generations') WHERE name = ?`,
+		viewGenColumnName,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err := tx.Exec(`ALTER TABLE analysis_generations ADD COLUMN ` +
+		viewGenColumnName + ` INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
+// rebuildAnalysisActiveGenerationAtBase re-keys the active pointer on
+// (view_gen, slot). A primary key cannot be altered in place, so the table is
+// rebuilt from the canonical body and its single row — if any — is copied at
+// generation 0. The copy names its columns explicitly; the old table's shape
+// is (slot, generation_id) and the new one leads with view_gen, so SELECT *
+// would silently write the slot into the generation column.
+func rebuildAnalysisActiveGenerationAtBase(tx *sql.Tx) error {
+	present, err := analysisTablePresent(tx, "analysis_active_generation")
+	if err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_xinfo('analysis_active_generation') WHERE name = ?`,
+		viewGenColumnName,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	const rebuilt = "analysis_active_generation_view_gen_rebuild"
+	if _, err := tx.Exec(`CREATE TABLE ` + rebuilt + analysisActiveGenerationTableBody); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO ` + rebuilt + `(` + viewGenColumnName + `, slot, generation_id)
+SELECT 0, slot, generation_id FROM analysis_active_generation`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE analysis_active_generation`); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`ALTER TABLE ` + rebuilt + ` RENAME TO analysis_active_generation`)
+	return err
 }
 
 // createGenerationMaskTables is the explicit v18 migration. The mask tables are
@@ -129,6 +446,18 @@ var schemaMigrations = []schemaMigration{
 // unversioned side effect of Open.
 func createGenerationMaskTables(tx *sql.Tx) error {
 	_, err := tx.Exec(generationMaskSchemaSQL)
+	return err
+}
+
+// createGenerationInputManifestTables is the explicit v29 migration. Like the
+// v18 masks the manifest tables are purely additive and re-key nothing, so an
+// older store gains them in place with no reindex and no backfill: a
+// generation published before the upgrade simply has no manifest, which a
+// reader reports as absent rather than empty. schemaSQL creates the same
+// objects first on every Open; this step repeats the idempotent DDL so the
+// addition is part of the versioned contract.
+func createGenerationInputManifestTables(tx *sql.Tx) error {
+	_, err := tx.Exec(generationInputManifestSchemaSQL)
 	return err
 }
 
@@ -828,9 +1157,10 @@ DELETE FROM edges WHERE id IN (SELECT id FROM ph) AND id NOT IN (SELECT id FROM 
 // schemaPlan is the decision planSchemaMigration derives from the stored
 // PRAGMA user_version. It mutates nothing on its own.
 type schemaPlan struct {
-	wipe    bool              // drop the on-disk DB and rebuild from source
+	wipe    bool              // drop an explicitly rebuildable older DB
 	inPlace []schemaMigration // ordered in-place steps to run after schemaSQL
 	stamp   bool              // write currentSchemaVersion once reconciled
+	err     error             // refuse unsupported versions without mutation
 }
 
 // planSchemaMigrationWith decides how to reconcile a store at the stored
@@ -842,9 +1172,9 @@ func planSchemaMigrationWith(stored, current int, migrations []schemaMigration) 
 	case stored == current:
 		return schemaPlan{} // up to date, nothing to do
 	case stored > current:
-		// Written by a newer build than this binary understands; the shape may
-		// have changed under us. For a cache the safe move is to rebuild.
-		return schemaPlan{wipe: true, stamp: true}
+		// A newer shape is not an authorized rebuild target. In particular,
+		// checkout catalog metadata cannot be reconstructed by reindexing.
+		return schemaPlan{err: &SchemaTooNewError{Stored: stored, Supported: current}}
 	case stored == 0:
 		// Fresh DB, or a pre-versioning store of unknown shape. schemaSQL's
 		// idempotent CREATE ... IF NOT EXISTS plus ensureNodeColumns /
@@ -997,7 +1327,9 @@ func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration, observers ...Mi
 // -shm) plus the rollback -journal a non-WAL fallback would use; keep it in
 // sync if the journal_mode in Open's DSN ever changes.
 func removeStoreFiles(path string) error {
-	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+	// The close-checkpoint progress and rate sidecars (close_progress.go)
+	// describe the store being removed and go with it.
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal", ".close-progress", ".close-rate"} {
 		if err := os.Remove(path + suffix); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove %s: %w", path+suffix, err)
 		}

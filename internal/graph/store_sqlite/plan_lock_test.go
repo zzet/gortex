@@ -72,8 +72,11 @@ func TestHotQueryPlansLocked(t *testing.T) {
 			// The unique-key autoindex probes (from_id=? AND to_id=?) —
 			// better than edges_by_from's prefix probe. Lock the property
 			// (an index probe seeded on from_id), not the index name.
-			want:   []string{"SEARCH e USING INDEX", "from_id=?"},
-			forbid: []string{"SCAN e", "USE TEMP B-TREE"},
+			// Production explicitly orders the bounded endpoint matches by kind
+			// and row ID for deterministic first-match accessors. That output
+			// sort is intentional; both endpoint equalities must bound its input.
+			want:   []string{"SEARCH e USING INDEX", "from_id=? AND to_id=?"},
+			forbid: []string{"SCAN e"},
 		},
 		{
 			// Site probes must constrain BOTH from_id and line in the index
@@ -115,8 +118,8 @@ func TestHotQueryPlansLocked(t *testing.T) {
 			query: repoEdgesByKindsQuery(),
 			args:  3,
 			want: []string{
-				"nodes_by_repo_kind (repo_prefix=?)",
-				"SEARCH e USING INDEX edges_by_from (from_id=? AND kind=?)",
+				"nodes_by_repo (repo_prefix=? AND view_gen=?)",
+				"SEARCH e USING INDEX edges_by_from (view_gen=? AND from_id=? AND kind=?)",
 			},
 			forbid: []string{"SCAN n", "SCAN e", "USE TEMP B-TREE"},
 		},
@@ -169,9 +172,14 @@ func newPlanLockFixture(t *testing.T) *Store {
 		for n := 0; n < 30; n++ {
 			kind := kinds[n%len(kinds)]
 			id := fmt.Sprintf("%s::sym%02d", file, n)
+			qualName := ""
+			if f == 0 && n == 7 {
+				qualName = "pkg.Handler"
+			}
 			nodes = append(nodes, &graph.Node{
 				ID:         id,
 				Name:       fmt.Sprintf("sym%02d", n),
+				QualName:   qualName,
 				Kind:       kind,
 				FilePath:   file,
 				Language:   "go",
@@ -190,6 +198,22 @@ func newPlanLockFixture(t *testing.T) *Store {
 			}
 		}
 	}
+	edges = append(edges,
+		&graph.Edge{
+			From:     "pkg/file00.go::sym07",
+			To:       "unresolved::fnvalue::bare",
+			Kind:     graph.EdgeCalls,
+			FilePath: "pkg/file00.go",
+			Line:     74,
+		},
+		&graph.Edge{
+			From:     "pkg/file01.go::sym07",
+			To:       "repo::unresolved::fnvalue::prefixed",
+			Kind:     graph.EdgeCalls,
+			FilePath: "pkg/file01.go",
+			Line:     74,
+		},
+	)
 	s.AddBatch(nodes, edges)
 	s.writeMu.Lock()
 	statsErr := s.refreshPlannerStatsLocked(context.Background())
@@ -197,6 +221,7 @@ func newPlanLockFixture(t *testing.T) *Store {
 	if statsErr != nil {
 		t.Fatalf("refresh planner stats: %v", statsErr)
 	}
+	recycleStatsReadPool(s.db, s.writerDB)
 	return s
 }
 
@@ -209,6 +234,11 @@ func explainQueryPlan(t *testing.T, s *Store, query string, argCount int) []stri
 	for i := range args {
 		args[i] = ""
 	}
+	return explainQueryPlanArgs(t, s, query, args...)
+}
+
+func explainQueryPlanArgs(t *testing.T, s *Store, query string, args ...any) []string {
+	t.Helper()
 	rows, err := s.db.Query("EXPLAIN QUERY PLAN "+query, args...)
 	if err != nil {
 		t.Fatalf("explain: %v", err)

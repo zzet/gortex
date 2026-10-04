@@ -2513,6 +2513,9 @@ func (g *Graph) AddNode(n *Node) {
 // across many node inserts targeting the same shard.
 func (g *Graph) addNodeLocked(s *shard, n *Node) {
 	prev, hadPrev := s.nodes[n.ID]
+	if hadPrev && keepSharedNodeCopy(prev, n) {
+		return
+	}
 	// Subtract the previous size/count before overwriting; the new
 	// node's contribution is re-added after the RepoPrefix-preservation
 	// logic below has settled on the final prefix.
@@ -2572,6 +2575,35 @@ func (g *Graph) addNodeLocked(s *shard, n *Node) {
 		addNodeToBucket(s.byRepo, s.byRepoIdx, n.RepoPrefix, n.ID, n)
 	}
 	s.repoNodeAdd(n)
+}
+
+// keepSharedNodeCopy reports that prev, not n, stays the row of a shared
+// registry node two different files emit: an annotation
+// (`annotation::<lang>::<name>`, Meta["synthetic"]) or a string literal
+// (`string::error_msg::…`, `string::log_message::…`, KindString). A
+// declaration's ID embeds its file, so only such nodes arrive from several
+// files, each copy stamped with its own file and line; parse workers add them
+// in whatever order they finish, so "the last add wins" made the stored copy —
+// and so a whole index — depend on scheduling. The copy from the smallest file
+// path is kept instead, whatever the order. Everything else keeps the
+// last-add-wins upsert: a re-add from the same file (a re-parse), a pathless
+// copy on either side, a copy of another kind (a reconcile pass upgrading a
+// contract to a topic) and any other node.
+func keepSharedNodeCopy(prev, n *Node) bool {
+	if prev == nil || n == nil || prev.FilePath == "" || n.FilePath == "" || prev.FilePath == n.FilePath {
+		return false
+	}
+	if prev.Kind != n.Kind {
+		return false
+	}
+	if n.Kind != KindString {
+		prevSynthetic, _ := prev.Meta["synthetic"].(bool)
+		nSynthetic, _ := n.Meta["synthetic"].(bool)
+		if !prevSynthetic || !nSynthetic {
+			return false
+		}
+	}
+	return prev.FilePath < n.FilePath
 }
 
 // AddBatch inserts a set of nodes and edges in shard-grouped passes,

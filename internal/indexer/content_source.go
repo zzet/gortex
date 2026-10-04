@@ -19,7 +19,10 @@ const maxSourceReadHint = 64 << 20
 // contentSourceRef boxes the installed content source so the swap is one
 // atomic pointer store: reindex paths read the source off the hot path
 // without taking a lock, the same way they read rootPath.
-type contentSourceRef struct{ src source.ContentSource }
+type contentSourceRef struct {
+	src       source.ContentSource
+	manifests source.ContentSource
+}
 
 // SetContentSource routes every content read this Indexer makes through
 // src instead of the os package. Passing nil restores the default, where
@@ -31,11 +34,7 @@ type contentSourceRef struct{ src source.ContentSource }
 // where a walk enumerates from: walkSource does that, and its caller
 // picks it explicitly.
 func (idx *Indexer) SetContentSource(src source.ContentSource) {
-	if src == nil {
-		idx.contentSrc.Store(nil)
-		return
-	}
-	idx.contentSrc.Store(&contentSourceRef{src: src})
+	idx.setContentSourceWithManifests(src, src)
 }
 
 // contentSource returns the installed content source, or nil when reads

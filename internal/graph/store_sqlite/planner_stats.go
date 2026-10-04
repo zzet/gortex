@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,18 +30,47 @@ const plannerStatsAnalysisLimit = 1000
 // Keep this list paired with the EXPLAIN plan locks in
 // planner_stats_checkpoint_test.go. A new index belongs here only when a plan
 // test demonstrates that its statistics change a production query choice.
-const plannerStatsIndexQuery = `
+// plannerStatsIndexQuery lists the planner indexes present in the schema:
+// every index plannerStatsIndexProbes names
+// (TestPlannerStatsCoversEveryIndexOnNodesAndEdges fails when the schema gains
+// an index on nodes or edges that is in neither that map nor
+// plannerStatsIndexesOutside).
+var plannerStatsIndexQuery = buildPlannerStatsIndexQuery()
+
+// plannerStatsIndexesOutside are the indexes on nodes and edges the statistics
+// check leaves out, each with the reason its choice does not rest on a
+// statistics row: no other index shares its leading columns (the planner takes
+// it by shape), or it is partial with a predicate no read that takes a list of
+// keys implies. Every other index is a planner index (plannerStatsIndexProbes):
+// it competes with another on a left prefix, and a missing row there hands the
+// choice to the default cost model.
+var plannerStatsIndexesOutside = map[string]string{
+	"edges_by_file":                 "(file_path, kind): only edges_by_file_generation shares file_path, and the default model prefers the one that keys more of a statement",
+	"edges_by_file_generation":      "(file_path, view_gen): the lazy index, see edges_by_file",
+	"edges_by_from":                 "(view_gen, from_id, kind): its rivals edges_by_from_line and edges_by_from_line_kind carry the rows",
+	"edges_by_to":                   "(view_gen, to_id, kind): no other index leads with to_id",
+	"nodes_by_qual":                 "partial, qual_name <> '': the qualified-name reads only",
+	"nodes_missing_workspace_slugs": "partial, workspace_id = '' OR project_id = '': the slug backfill only",
+	"nodes_repo_files":              "partial, kind = 'file': the repository file listing only",
+	"nodes_name_candidates":         "partial, name <> '': supplementary reads select it explicitly; competing production name-key reads pin the stronger name or repo/language/name indexes",
+	"edges_by_unresolved":           "partial, is_unresolved = 1: the resolver's unresolved scan only",
+	"edges_fnvalue_prefixed":        "partial, to_id LIKE '%::unresolved::fnvalue::%': the fnvalue pass only",
+	"edges_external":                "partial, the external-call target predicate: the external-call synthesizer only",
+}
+
+func buildPlannerStatsIndexQuery() string {
+	names := make([]string, 0, len(plannerStatsIndexProbes))
+	for name := range plannerStatsIndexProbes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	values := make([]string, 0, len(names))
+	for _, name := range names {
+		values = append(values, "('"+name+"')")
+	}
+	return `
 WITH critical(name) AS (VALUES
-  ('edges_by_from_line'),
-  ('edges_by_from_line_kind'),
-  ('edges_by_kind'),
-  ('nodes_by_file'),
-  ('nodes_by_kind'),
-  ('nodes_by_name'),
-  ('nodes_by_repo'),
-  ('nodes_go_receiver_type'),
-  ('nodes_by_repo_kind'),
-  ('nodes_by_repo_language_name')
+  ` + strings.Join(values, ",\n  ") + `
 )
 SELECT schema_index.name
 FROM sqlite_schema AS schema_index
@@ -48,6 +78,7 @@ JOIN critical ON critical.name = schema_index.name
 WHERE schema_index.type = 'index'
   AND schema_index.sql IS NOT NULL
 ORDER BY schema_index.name`
+}
 
 // plannerStatsTableExistsQuery probes the catalog: sqlite_stat1 is created by
 // the first ANALYZE and does not exist before it.
@@ -124,19 +155,17 @@ var plannerStatsIndexProbes = map[string]plannerStatsIndexProbe{
 	// Non-partial edge indexes.
 	"edges_by_from_line":      {table: "edges"},
 	"edges_by_from_line_kind": {table: "edges"},
+	"edges_by_generation":     {table: "edges"},
 	"edges_by_kind":           {table: "edges"},
 	// Non-partial node indexes.
-	"nodes_by_file":      {table: "nodes"},
-	"nodes_by_kind":      {table: "nodes"},
-	"nodes_by_name":      {table: "nodes"},
-	"nodes_by_repo_kind": {table: "nodes"},
+	"nodes_by_file":       {table: "nodes"},
+	"nodes_by_generation": {table: "nodes"},
+	"nodes_by_kind":       {table: "nodes"},
+	"nodes_by_name":       {table: "nodes"},
+	"nodes_by_repo":       {table: "nodes"},
+	"nodes_by_repo_kind":  {table: "nodes"},
 	// Partial node indexes: every question is asked through the index with
 	// its own predicate.
-	"nodes_by_repo": {
-		table:     "nodes",
-		predicate: `repo_prefix <> ''`,
-		partial:   true,
-	},
 	"nodes_by_repo_language_name": {
 		table:     "nodes",
 		predicate: `name <> ''`,
@@ -435,32 +464,41 @@ func plannerStatsRepairReason(ctx context.Context, db *sql.DB) (string, bool) {
 		}
 	}
 
-	// R2: a partial critical index whose stat row believes a handful of
-	// entries while the index holds materially more. The bounded count reads
-	// at most believed*2+1 entries, so the literal zero row costs a single
-	// probe and the largest suspect row costs a couple of hundred.
+	// R2: any critical index whose stat row believes a handful of entries
+	// while the index holds materially more. The bounded count reads at most
+	// believed*2+1 entries, so a literal zero row costs one index entry and the
+	// largest suspect row costs only a couple of hundred. The parser clamps a
+	// missing, malformed, or negative leading token to zero, so LIMIT is always
+	// positive and can never take SQLite's unbounded -1 meaning.
 	for _, name := range indexes {
 		spec, known := plannerStatsIndexProbes[name]
-		if !known || !spec.partial || !statPresent[name] {
+		if !known || !statPresent[name] {
 			continue
 		}
 		believed := plannerStatsBelievedRows(ctx, db, name)
 		if believed > plannerStatsSuspectRows {
 			continue
 		}
-		// R3: the row describes an index that holds nothing. The bounded
-		// count below could not tell this apart from a truthful small row,
-		// because both report actual <= believed*2.
-		var hasRows bool
-		if err := db.QueryRowContext(ctx, spec.existsQuery(name)).Scan(&hasRows); err != nil {
-			return "", false
-		}
-		if !hasRows {
-			return "stale_stat:" + name, true
+		// R3 remains partial-only: absence is preferable to a stat row for
+		// an empty partial index. A dense index can legitimately describe an
+		// empty table, so its zero row must remain stable rather than churn.
+		if spec.partial {
+			var hasRows bool
+			if err := db.QueryRowContext(ctx, spec.existsQuery(name)).Scan(&hasRows); err != nil {
+				return "", false
+			}
+			if !hasRows {
+				return "stale_stat:" + name, true
+			}
 		}
 		limit := believed*2 + 1
+		countQuery := spec.countQuery(name)
+		if !spec.partial {
+			countQuery = `SELECT count(*) FROM (SELECT 1 FROM ` + spec.table +
+				` INDEXED BY ` + quoteSQLiteIdentifier(name) + ` LIMIT ?)`
+		}
 		var actual int64
-		if err := db.QueryRowContext(ctx, spec.countQuery(name), limit).Scan(&actual); err != nil {
+		if err := db.QueryRowContext(ctx, countQuery, limit).Scan(&actual); err != nil {
 			return "", false
 		}
 		if actual > 0 && believed*2 < actual {
