@@ -37,15 +37,31 @@ func (s *Store) LayerContractRepoProjectionContext(ctx context.Context, repo str
 	}
 	// Sparse kind-first ownership projection also retains edge-only physical
 	// generations whose source node is supplied by a lower selected layer.
-	query = `SELECT COALESCE(json_extract(e.meta,'$.contract_owner_repo_prefix'),n.repo_prefix,''), ` + contractProjectionEdgeColumns() + `
+	query = `SELECT COALESCE(n.repo_prefix,''), ` + contractProjectionEdgeColumns() + `
  FROM edges AS e LEFT JOIN nodes AS n ON n.id=e.from_id AND n.view_gen=e.view_gen
  WHERE e.kind IN ` + contractOwnerKindsSQL + ` AND e.view_gen=?
- AND (COALESCE(json_extract(e.meta,'$.contract_owner_repo_prefix'),n.repo_prefix,'')=?
- OR (n.id IS NULL AND json_type(e.meta,'$.contract_owner_repo_prefix') IS NULL)) LIMIT ?`
+ AND (n.repo_prefix=? OR n.id IS NULL) LIMIT ?`
 	p.OwnerRows, err = s.contractProjectionEdges(ctx, tx, query, []any{s.viewGen, repo, budget + 1}, &budget)
 	if err != nil {
 		return graph.ContractFileProjection{}, err
 	}
+	// Meta is persisted using typed binary/legacy codecs, not SQL JSON.
+	// Decode through the ordinary checked scanner before filtering explicit
+	// namespaces of edge-only seeds; inherited-source attribution stays composed.
+	selected := p.OwnerRows[:0]
+	for _, row := range p.OwnerRows {
+		if row.Edge == nil {
+			return graph.ContractFileProjection{}, graph.ErrContractProjectionIncomplete
+		}
+		if explicit, ok := row.Edge.Meta["contract_owner_repo_prefix"].(string); ok {
+			if explicit != repo {
+				continue
+			}
+			row.RepoPrefix = explicit
+		}
+		selected = append(selected, row)
+	}
+	p.OwnerRows = selected
 	if err := tx.Commit(); err != nil {
 		return graph.ContractFileProjection{}, err
 	}
