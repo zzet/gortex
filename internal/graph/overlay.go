@@ -904,9 +904,18 @@ func (v *OverlaidView) GetInEdgesByNodeIDs(ids []string) map[string][]*Edge {
 		}
 	}
 	if v.layer != nil {
-		for _, id := range uniq {
-			if extras := v.layer.InEdges(id); len(extras) > 0 {
-				out[id] = append(out[id], extras...)
+		if batch, ok := v.layer.(OverlayLayerProjectionReader); ok {
+			extras := batch.LayerInEdgesByNodeIDs(uniq)
+			for _, id := range uniq {
+				if len(extras[id]) > 0 {
+					out[id] = append(out[id], extras[id]...)
+				}
+			}
+		} else {
+			for _, id := range uniq {
+				if extras := v.layer.InEdges(id); len(extras) > 0 {
+					out[id] = append(out[id], extras...)
+				}
 			}
 		}
 	}
