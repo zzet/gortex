@@ -1135,6 +1135,13 @@ func (s *Store) runBackgroundCheckpointAttemptWith(policy checkpointCyclePolicy,
 }
 
 func (s *Store) acquireGenerationBulkCheckpointLease() (generationBulkCheckpointLease, error) {
+	return s.acquireGenerationBulkCheckpointLeaseContext(context.Background())
+}
+
+func (s *Store) acquireGenerationBulkCheckpointLeaseContext(ctx context.Context) (generationBulkCheckpointLease, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	coordination := &s.backgroundCheckpoint
 	coordination.mu.Lock()
 	if coordination.generationLease != 0 {
@@ -1162,6 +1169,9 @@ func (s *Store) acquireGenerationBulkCheckpointLease() (generationBulkCheckpoint
 	select {
 	case <-attempt.done:
 		return lease, nil
+	case <-ctx.Done():
+		s.releaseGenerationBulkCheckpointLease(lease)
+		return 0, ctx.Err()
 	case <-timer.C:
 		s.releaseGenerationBulkCheckpointLease(lease)
 		return 0, fmt.Errorf("%w: background PASSIVE did not stop within %s", errGenerationBulkCheckpointCoordination, wait)

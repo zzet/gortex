@@ -527,6 +527,13 @@ var ErrGenerationBulkLoadPopulated = errors.New("store_sqlite: generation alread
 // indexes on the floor. A false return means no window was opened and
 // EndGenerationBulkLoad must not be called for it.
 func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
+	return s.beginGenerationBulkLoad(context.Background(), generationID, false)
+}
+
+func (s *Store) beginGenerationBulkLoad(ctx context.Context, generationID int64, reparse bool) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if s.coreless() {
 		return false, fmt.Errorf("%w: a generation bulk load needs an open store", ErrCatalogInvalidValue)
 	}
@@ -546,20 +553,32 @@ func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
 	// Preserve the legacy false,nil result only for a physical bulk owner that
 	// is already installed. A lease without an installed owner is a competing
 	// Begin and must fail so callers cannot fall back beside a checkpoint.
-	s.writeMu.Lock()
+	if err := s.lockGenerationBulkWriter(ctx, reparse); err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		s.writeMu.Unlock()
+		return false, err
+	}
 	if s.bulkConn != nil || s.coordinatedBulkLoad {
 		s.writeMu.Unlock()
 		return false, nil
 	}
 	s.writeMu.Unlock()
 
-	lease, err := s.acquireGenerationBulkCheckpointLease()
+	lease, err := s.acquireGenerationBulkCheckpointLeaseContext(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
 		return false, fmt.Errorf("%w: %v", ErrGenerationBulkCheckpointBusy, err)
 	}
 	leaseBound := false
 	opened := false
-	s.writeMu.Lock()
+	if err := s.lockGenerationBulkWriter(ctx, reparse); err != nil {
+		s.releaseGenerationBulkCheckpointLease(lease)
+		return false, err
+	}
 	defer func() {
 		release := lease
 		if leaseBound && !opened {
@@ -574,19 +593,28 @@ func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
 		return false, nil
 	}
 
-	ctx := context.Background()
 	conn, err := s.writerDB.Conn(ctx)
 	if err != nil {
 		return false, err
 	}
-	empty, err := generationPayloadEmpty(ctx, conn, generationID)
-	if err != nil {
-		_ = conn.Close()
-		return false, err
-	}
-	if !empty {
-		_ = conn.Close()
-		return false, fmt.Errorf("%w: generation %d", ErrGenerationBulkLoadPopulated, generationID)
+	if reparse {
+		// Recheck through the held writer connection, not a catalog connection
+		// that could wait for this gate. Per-write managed admission remains
+		// authoritative throughout the window.
+		if err := checkDedicatedReparseWindow(ctx, conn, generationID); err != nil {
+			_ = conn.Close()
+			return false, err
+		}
+	} else {
+		empty, err := generationPayloadEmpty(ctx, conn, generationID)
+		if err != nil {
+			_ = conn.Close()
+			return false, err
+		}
+		if !empty {
+			_ = conn.Close()
+			return false, fmt.Errorf("%w: generation %d", ErrGenerationBulkLoadPopulated, generationID)
+		}
 	}
 
 	prevSync, err := pragmaInt(ctx, conn, "synchronous")
@@ -605,11 +633,20 @@ func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
 		return false, err
 	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", bulkCacheSizeKiB)); err != nil {
+		_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
 		_ = conn.Close()
 		return false, err
 	}
 	if _, err := conn.ExecContext(ctx, "PRAGMA wal_autocheckpoint = 0"); err != nil {
-		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
+		_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", prevAutoCheckpoint))
+		_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
+		_ = conn.Close()
+		return false, err
+	}
+
+	if err := ctx.Err(); err != nil {
+		_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", prevAutoCheckpoint))
+		_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
 		_ = conn.Close()
 		return false, err
 	}
@@ -618,8 +655,8 @@ func (s *Store) BeginGenerationBulkLoad(generationID int64) (bool, error) {
 	// physical owner using assignments only, so a losing Begin cannot observe a
 	// lease that has no recoverable owner.
 	if !s.bindGenerationBulkCheckpointLease(lease, generationID) {
-		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", prevAutoCheckpoint))
-		_, _ = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
+		_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", prevAutoCheckpoint))
+		_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
 		_ = conn.Close()
 		return false, fmt.Errorf("%w: lease changed before generation %d became active", ErrGenerationBulkCheckpointBusy, generationID)
 	}

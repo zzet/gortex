@@ -57,9 +57,10 @@ const generationZero int64 = 0
 // generation zero consumes it and every later generation — the committed base
 // included — pays per-row B-tree maintenance and page-cache spill at the
 // pooled cache size instead. The generation-scoped window's precondition is
-// "THIS generation holds no rows", which is true of every reserved candidate
-// this builder is handed. Where the window is opened and closed, and why it
-// now covers both build routes, is documented on generationBulkWindow.
+// "THIS generation holds no rows". A separate optional managed-reparse
+// capability admits initial Building reservations with partial payload; it
+// changes cache shape, not replacement or publication authority. Where the
+// window is opened and closed is documented on generationBulkWindow.
 //
 // What the window takes and what it deliberately leaves is the store's own
 // decision, documented beside BeginGenerationBulkLoad: it takes the page cache
@@ -260,8 +261,19 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 		// over an empty generation.
 		loader = nil
 	}
+	// Only the initial reparse may replace a populated Building reservation.
+	// Bind the production capability to its already-qualified managed handle;
+	// injected loaders keep observing the same open/close bracket.
+	var reparseLoader generationReparseBulkLoader
+	if !resume && !takeCopy {
+		if request.BulkLoad == nil {
+			loader = handle
+		}
+		reparseLoader, _ = loader.(generationReparseBulkLoader)
+	}
 	window := &generationBulkWindow{
 		loader: loader, generationID: claim.GenerationID, logger: b.Logger,
+		reparseLoader:   reparseLoader,
 		wholeGeneration: takeCopy,
 	}
 	defer func() {
@@ -279,7 +291,7 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 		buildErr = closeErr
 	}()
 	prepare := func(ctx context.Context) (source.ContentSource, buildPlan, BuildReport, error) {
-		if err := window.open(); err != nil {
+		if err := window.openContext(ctx); err != nil {
 			return nil, buildPlan{}, BuildReport{}, err
 		}
 		return route(ctx)
@@ -397,6 +409,10 @@ func (b *SparseGenerationBuilder) generationCopier(request ClaimedDedicatedBaseR
 	return copier, true
 }
 
+type generationReparseBulkLoader interface {
+	BeginManagedDedicatedReparseBulkLoad(context.Context, int64) (bool, error)
+}
+
 // generationBulkWindow is one claimed-base build's generation-scoped bulk-load
 // bracket. It exists as a small object rather than a `with...(run func())`
 // wrapper because its two halves belong at two different depths of the build,
@@ -476,9 +492,10 @@ func (b *SparseGenerationBuilder) generationCopier(request ClaimedDedicatedBaseR
 // leader's payload preparation and close runs in the leader's own pre-publish
 // hook or in its deferred build exit, all on one goroutine.
 type generationBulkWindow struct {
-	loader       GenerationBulkLoader
-	generationID int64
-	logger       *zap.Logger
+	reparseLoader generationReparseBulkLoader
+	loader        GenerationBulkLoader
+	generationID  int64
+	logger        *zap.Logger
 
 	// wholeGeneration says this build materialises the destination generation
 	// in one piece, which is what makes a populated destination a contradiction
@@ -496,11 +513,24 @@ type generationBulkCloserByID interface {
 }
 
 func (w *generationBulkWindow) open() error {
+	return w.openContext(context.Background())
+}
+
+func (w *generationBulkWindow) openContext(ctx context.Context) error {
 	if w == nil || w.loader == nil || w.opened {
 		return nil
 	}
-	opened, err := w.loader.BeginGenerationBulkLoad(w.generationID)
+	var opened bool
+	var err error
+	if w.reparseLoader != nil {
+		opened, err = w.reparseLoader.BeginManagedDedicatedReparseBulkLoad(ctx, w.generationID)
+	} else {
+		opened, err = w.loader.BeginGenerationBulkLoad(w.generationID)
+	}
 	if err != nil {
+		if w.reparseLoader != nil {
+			return fmt.Errorf("indexer: managed reparse bulk admission: %w", err)
+		}
 		// A periodic PASSIVE checkpoint that did not yield inside its bound is
 		// not an optional bulk-shape refusal: falling back would run the same
 		// writes beside that checkpoint. Abort this physical attempt so the
