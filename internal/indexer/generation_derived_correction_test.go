@@ -257,7 +257,9 @@ func TestStartupCorrectionMakesAStaleBaseAWholeIndex(t *testing.T) {
 
 	// A save over the corrected layer: a body line in use.go.
 	core, logs := observer.New(zap.InfoLevel)
-	dw := graph.NewDeltaWriter(builderComposed(t, f.store, f.generation), nil)
+	// This is a real IndexFile mutation, not a read-only derived scratch.
+	// Give it an isolated accepted file/constant sidecar like the builder does.
+	dw := graph.NewDeltaWriter(builderComposed(t, f.store, f.generation), graph.New())
 	idx := New(dw, builderRegistry(), config.Default().Index, zap.New(core))
 	defer idx.Close()
 	idx.SetRepoPrefix(builderRepoPrefix)
