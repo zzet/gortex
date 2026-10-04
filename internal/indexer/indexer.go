@@ -7195,6 +7195,20 @@ func (idx *Indexer) runContractExtractorsForFileWithInputs(
 	if len(exts) == 0 {
 		return nil
 	}
+	out := idx.collectContractRecordsForFile(graphPath, src, fileNodes, fileEdges, exts, tree, endpointStore)
+	idx.rememberContractReaderStatus()
+	return out
+}
+
+// collectContractRecordsForFile uses only its explicit accepted inputs. In
+// particular it does not inspect idx.graph, even when extraction emits no rows.
+func (idx *Indexer) collectContractRecordsForFile(
+	graphPath string, src []byte, fileNodes []*graph.Node, fileEdges []*graph.Edge,
+	exts []contracts.Extractor, tree *parser.ParseTree, endpointStore contracts.EndpointConstStore,
+) []contracts.Contract {
+	if len(exts) == 0 {
+		return nil
+	}
 	// Contracts from synthetic test/bench fixtures are kept (so drift
 	// checks can flag a stale test pinned to an obsolete production
 	// contract) but tagged with is_test=true and a test_source
@@ -7238,7 +7252,6 @@ func (idx *Indexer) runContractExtractorsForFileWithInputs(
 		}
 		out = append(out, found...)
 	}
-	idx.rememberContractReaderStatus()
 	return out
 }
 
