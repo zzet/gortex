@@ -260,8 +260,16 @@ func (c *CheckoutCoordinator) compactDirtyChainStepped(
 	report *DirtyChainCompaction, stopYielding, releaseLane func(),
 ) string {
 	k := &c.compaction
+	k.mu.Lock()
+	k.foldOwner = k.running
 	k.stepping.Store(true)
-	defer k.stepping.Store(false)
+	k.mu.Unlock()
+	defer func() {
+		k.mu.Lock()
+		k.foldOwner = nil
+		k.stepping.Store(false)
+		k.mu.Unlock()
+	}()
 	stopYielding()
 	releaseLane()
 	if ctx.Err() != nil {

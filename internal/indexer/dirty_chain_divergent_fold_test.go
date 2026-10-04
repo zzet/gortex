@@ -92,6 +92,22 @@ func TestDivergentSteppedFoldReplacementJoinsBeforeStartingAndPreservesSelectedR
 	newDone := c.compaction.running
 	c.compaction.mu.Unlock()
 	require.NotEqual(t, oldDone, newDone)
+	// A further publication must coalesce into the replacement already
+	// waiting on oldDone. Canceling that queued task would let a second
+	// replacement join its early done channel and bypass old storage cleanup.
+	latest := mcpEdit(t, l, f, func() { foldWiringEdits[5](t, f) })
+	c.compaction.mu.Lock()
+	running, owner := c.compaction.running, c.compaction.foldOwner
+	c.compaction.mu.Unlock()
+	require.Equal(t, newDone, running)
+	require.Equal(t, oldDone, owner)
+	select {
+	case <-newDone:
+		t.Fatal("queued replacement completed before original fold cleanup")
+	case <-newBegun:
+		t.Fatal("further publication bypassed original fold cleanup")
+	default:
+	}
 	close(oldRelease)
 	divergentFoldWait(t, newBegun, "replacement fold after old cleanup")
 	divergentFoldWait(t, oldDone, "old scheduled task completion")
@@ -102,10 +118,13 @@ func TestDivergentSteppedFoldReplacementJoinsBeforeStartingAndPreservesSelectedR
 	close(newRelease)
 	divergentFoldWait(t, newDone, "replacement publication")
 	stats := c.DirtyChainCompactionStats()
+	require.Equal(t, 2, stats.Scheduled, "further publications must coalesce into the queued replacement")
+	require.Equal(t, int32(2), beginnings.Load())
 	require.GreaterOrEqual(t, stats.Canceled, 1)
 	require.GreaterOrEqual(t, stats.Flipped, 1)
 	require.NotEqual(t, trigger.DirtyGenerationID, f.route().DirtyGenerationID)
 	require.NotEqual(t, branch.DirtyGenerationID, f.route().DirtyGenerationID, "replacement must actually compact the accepted branch")
+	require.NotEqual(t, latest.DirtyGenerationID, f.route().DirtyGenerationID, "queued replacement must compact the latest accepted branch")
 	chainAssertFlat(t, f, "divergent-fold-replacement")
 }
 
@@ -177,6 +196,7 @@ func TestDivergentFoldCompletedCopyCannotDeadlockPublicationCycle(t *testing.T) 
 	c.compaction.mu.Lock()
 	c.compaction.closed = false
 	c.compaction.cancel, c.compaction.running = oldCancel, oldDone
+	c.compaction.foldOwner = oldDone
 	c.compaction.foldingChain = folded
 	c.compaction.stepping.Store(true)
 	c.compaction.mu.Unlock()
@@ -187,6 +207,7 @@ func TestDivergentFoldCompletedCopyCannotDeadlockPublicationCycle(t *testing.T) 
 		c.landSteppedFold(context.WithoutCancel(oldCtx), old.CommitGenerationID, folded, built, &foldPublication{})
 		c.compaction.mu.Lock()
 		c.compaction.foldingChain = nil
+		c.compaction.foldOwner = nil
 		c.compaction.stepping.Store(false)
 		if c.compaction.running == oldDone {
 			c.compaction.cancel = nil

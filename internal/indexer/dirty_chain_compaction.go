@@ -167,6 +167,9 @@ type dirtyChainCompactor struct {
 	// stepping is set while a stepped fold runs its steps and lands: the edit
 	// cycle does not cancel it and a new schedule does not replace it.
 	stepping atomic.Bool
+	// foldOwner identifies the scheduled task actually owning the stepped
+	// fold. running may already name its queued replacement during cleanup.
+	foldOwner chan struct{}
 	// foldingChain is the chain (oldest first) the stepped fold is folding.
 	foldingChain []int64
 	// backend is a test seam: the fold backend (nil: the store).
@@ -266,7 +269,8 @@ func (c *CheckoutCoordinator) scheduleDirtyChainCompaction(trigger CheckoutCycle
 		k.mu.Unlock()
 		return false
 	}
-	obsolete := k.stepping.Load() && k.cancel != nil && compactionOwed(k.running) && len(k.foldingChain) > 1 && len(activeChain) > 0 &&
+	obsolete := k.stepping.Load() && k.foldOwner != nil && k.foldOwner == k.running &&
+		k.cancel != nil && compactionOwed(k.running) && len(k.foldingChain) > 1 && len(activeChain) > 0 &&
 		!chainHasFoldPrefix(activeChain, k.foldingChain)
 	if !obsolete && (k.stepping.Load() || (steppedChainFoldEnabled && compactionOwed(k.running))) {
 		// A stepped fold is running, or a compaction is queued: it folds
@@ -327,7 +331,8 @@ func chainHasFoldPrefix(active, folding []int64) bool {
 func (c *CheckoutCoordinator) activeChainForFoldReplacement(ctx context.Context, trigger CheckoutCycle) []int64 {
 	k := &c.compaction
 	k.mu.Lock()
-	needed := steppedChainFoldEnabled && k.stepping.Load() && k.cancel != nil && compactionOwed(k.running) && len(k.foldingChain) > 1 && !k.closed
+	needed := steppedChainFoldEnabled && k.stepping.Load() && k.foldOwner != nil && k.foldOwner == k.running &&
+		k.cancel != nil && compactionOwed(k.running) && len(k.foldingChain) > 1 && !k.closed
 	k.mu.Unlock()
 	if !needed {
 		return nil
