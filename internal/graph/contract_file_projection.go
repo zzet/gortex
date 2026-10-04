@@ -217,13 +217,14 @@ func rawContractProjection(ctx context.Context, r Reader, repo string, paths, id
 		return v.contractProjection(ctx, repo, paths, ids, byFile)
 	case *DeltaWriter:
 		return v.view.contractProjection(ctx, repo, paths, ids, byFile)
-	case Unwrapper:
-		if next := v.Unwrap(); next != nil {
-			return rawContractProjection(ctx, next, repo, paths, ids, byFile)
-		}
 	}
 	reader, ok := r.(OverlayLayerContractProjectionReader)
 	if !ok {
+		if wrapper, yes := r.(Unwrapper); yes {
+			if next := wrapper.Unwrap(); next != nil {
+				return rawContractProjection(ctx, next, repo, paths, ids, byFile)
+			}
+		}
 		return ContractFileProjection{}, ErrContractProjectionUnsupported
 	}
 	if byFile {

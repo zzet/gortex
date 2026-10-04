@@ -46,6 +46,9 @@ func (v *OverlaidView) contractRepoProjection(ctx context.Context, repo string) 
 	var endpointIDs []string
 	for _, rows := range [][]RepoEdgeRow{base.OwnerRows, base.OffFileOwnerRows, base.OutgoingOwnerRows} {
 		for _, row := range rows {
+			if row.Edge == nil {
+				return ContractFileProjection{}, ErrContractProjectionIncomplete
+			}
 			for _, id := range []string{row.Edge.From, row.Edge.To} {
 				if v.overlayOwnsIdentity(id) {
 					endpointIDs = append(endpointIDs, id)
@@ -92,16 +95,18 @@ func rawContractRepoProjection(ctx context.Context, r Reader, repo string) (Cont
 		return v.contractRepoProjection(ctx, repo)
 	case *DeltaWriter:
 		return v.view.contractRepoProjection(ctx, repo)
-	case Unwrapper:
-		if next := v.Unwrap(); next != nil {
+	}
+	// Checked capability comes before unwrapping: a selected materialized layer
+	// may own mask/revision validation that its physical backing reader lacks.
+	if reader, ok := r.(OverlayLayerContractRepoProjectionReader); ok {
+		return reader.LayerContractRepoProjectionContext(ctx, repo)
+	}
+	if wrapper, ok := r.(Unwrapper); ok {
+		if next := wrapper.Unwrap(); next != nil {
 			return rawContractRepoProjection(ctx, next, repo)
 		}
 	}
-	reader, ok := r.(OverlayLayerContractRepoProjectionReader)
-	if !ok {
-		return ContractFileProjection{}, ErrContractProjectionUnsupported
-	}
-	return reader.LayerContractRepoProjectionContext(ctx, repo)
+	return ContractFileProjection{}, ErrContractProjectionUnsupported
 }
 
 // CompleteContractRepoProjection uses indexed repo seeds, then completes only
