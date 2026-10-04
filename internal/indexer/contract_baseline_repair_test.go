@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
@@ -53,7 +55,24 @@ func TestContractBaselineRepairsStaleReceiptsFromAcceptedCore(t *testing.T) {
 			if mode != "unaccepted" {
 				require.NoError(t, store.AcceptContractBoundaryReceiptsContext(ctx, []graph.ContractBoundaryReceipt{bad}))
 			}
-			require.NoError(t, reconcilePrimaryContractBaseline(ctx, options, "fixture"))
+			var admission sync.Mutex
+			var jobs sync.WaitGroup
+			options.BaselineAdmissionMu = &admission
+			options.BaselineJobs = &jobs
+			coordinator, err := NewContractAnalysisCoordinator(ContractAnalysisCoordinatorOptions{Store: store, Leases: leases, Registry: idx.registry, Config: idx.config, Capture: NewContractFollowupCapture(options), ReconcileBaseline: NewContractBaselineReconciler(options), Yield: options.Yield})
+			require.NoError(t, err)
+			defer coordinator.Close()
+			mi.SetContractCoreRuntime(ContractCoreRuntimeHooks{Published: coordinator.Published})
+			pendingInputs, err := materializer.CaptureContractInputs(ctx, nil, "fixture", "")
+			require.NoError(t, err)
+			require.False(t, pendingInputs.State.Accepted)
+			requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			admitted, err := coordinator.Request(requestCtx, nil, pendingInputs, "fixture", "")
+			require.NoError(t, err)
+			require.True(t, admitted)
+			require.NoError(t, coordinator.WaitChange(requestCtx, graph.ContractAttachmentKey{RepoPrefix: "fixture", InputVersion: pendingInputs.State.InputVersion, InputFingerprint: pendingInputs.State.InputFingerprint}))
+			jobs.Wait()
 			state, found, err := store.ContractInputStateContext(ctx, "fixture", "")
 			require.NoError(t, err)
 			require.True(t, found)
