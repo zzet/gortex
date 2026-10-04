@@ -150,6 +150,7 @@ type checkoutHeadIdentity struct {
 	commit string
 }
 type CheckoutLifecycle struct {
+	contractCoreRuntime atomic.Pointer[ContractCoreRuntimeHooks]
 	// routePrewarm is the prewarmer every coordinator calls before a route
 	// flip (SetRoutePrewarmer).
 	routePrewarm routePrewarmerSlot
@@ -2386,6 +2387,7 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		EditCycleActive: l.editCycleHoldsBuildLane,
 		PrewarmDeferred: l.prewarmDeferral.defers,
 	}
+	builder.contractCoreRuntime.Store(l.contractCoreRuntime.Load())
 	coordinator, err := NewCheckoutCoordinator(CheckoutCoordinatorConfig{
 		GitWork:        &l.gitWork,
 		PrewarmRoute:   l.routePrewarm.call,

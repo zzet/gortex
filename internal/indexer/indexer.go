@@ -338,6 +338,7 @@ type Indexer struct {
 	// contractCoreInputs is installed only by the complete asynchronous runtime.
 	// Nil preserves the legacy contract path while that runtime is disabled.
 	contractCoreInputs *contractCoreInputJournal
+	contractCoreRuntime atomic.Pointer[ContractCoreRuntimeHooks]
 
 	// contractRegistry holds detected API contracts (HTTP routes, gRPC, etc.).
 	contractRegistry *contracts.Registry
@@ -1536,7 +1537,7 @@ func (idx *Indexer) MaybeSeedPendingEnrich() bool {
 // binding types are resolved in one batch from SQLite, with the provider's
 // compact string index as the in-memory-store fallback.
 func (idx *Indexer) runDeferredContracts() {
-	if idx.contractCoreInputs != nil {
+	if idx.contractCoreInputs != nil || idx.contractCoreRuntime.Load() != nil {
 		idx.pendingContractReg = nil
 		idx.deferredGoModDone = false
 		return
@@ -2715,9 +2716,6 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 				}
 			}
 			owner.mu.Unlock()
-		}
-		if journal := current.contractCoreInputs; journal != nil {
-			return journal.accept(nil)
 		}
 		return nil
 	})
@@ -4923,9 +4921,6 @@ func (idx *Indexer) IndexFile(filePath string) error {
 		current, currentErr := idx.currentRepositoryMutationIndexer()
 		if currentErr != nil {
 			return currentErr
-		}
-		if journal := current.contractCoreInputs; journal != nil {
-			return journal.accept(nil)
 		}
 		return nil
 	})

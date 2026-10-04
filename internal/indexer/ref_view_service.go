@@ -107,14 +107,14 @@ func (l *CheckoutLifecycle) refViewManager(repoPrefix string, idx *Indexer) (*Re
 	index := repoCfg.Index
 	manager, err := NewRefViewManager(RefViewManagerConfig{
 		Store: l.store,
-		Builder: &SparseGenerationBuilder{
+		Builder: l.installContractCoreBuilder(&SparseGenerationBuilder{
 			Store:      l.store,
 			Registry:   l.mi.registry,
 			Config:     index,
 			Logger:     l.logger,
 			Admissions: idx,
 			Embedder:   l.mi.embedder,
-		},
+		}),
 		Config: index,
 		// The two inputs a ref view's generation identity needs to be a real
 		// claim rather than a degraded one. The lifecycle holds both — it hands

@@ -1827,7 +1827,18 @@ func (idx *Indexer) withOutputGenerationSource(
 	if err != nil {
 		return err
 	}
-	return runUnderOutputReceipt(receipt, func() error {
+	current, err := idx.currentRepositoryMutationIndexer()
+	if err != nil {
+		receipt.Abandon()
+		return err
+	}
+	restore, err := current.beginInstalledContractCoreInputs(ctx)
+	if err != nil {
+		receipt.Abandon()
+		return err
+	}
+	defer restore()
+	err = runUnderOutputReceipt(receipt, func() error {
 		return fn(func(content *OutputSourceContent) {
 			if content != nil && content.Root == "" {
 				content.Root = target.RootPath
@@ -1835,6 +1846,16 @@ func (idx *Indexer) withOutputGenerationSource(
 			receipt.ObserveSourceContent(content)
 		})
 	})
+	if err != nil { return err }
+	// Complete has validated the existing source/output authority. Contract
+	// eligibility cannot be acknowledged by the inner mutation body earlier.
+	if journal := current.contractCoreInputs; journal != nil {
+		if err := journal.accept(nil); err != nil { return err }
+		if hooks := current.contractCoreRuntime.Load(); hooks != nil && hooks.Published != nil {
+			hooks.Published(ctx, current.repoPrefix, "")
+		}
+	}
+	return nil
 }
 
 // runUnderOutputReceipt runs one mutation body under one already-admitted

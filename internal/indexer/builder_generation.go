@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -525,6 +526,7 @@ type BuildReport struct {
 // SparseGenerationBuilder builds sparse payload generations over one store.
 // It holds no per-build state and is safe to reuse.
 type SparseGenerationBuilder struct {
+	contractCoreRuntime atomic.Pointer[ContractCoreRuntimeHooks]
 	// Store is any handle on the database. Generations are begun and published
 	// through it and the pass writes through the handle it hands back, so which
 	// generation this handle is pinned to does not matter.

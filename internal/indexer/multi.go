@@ -79,6 +79,7 @@ type repositoryUntrackState struct {
 // MultiIndexer orchestrates indexing across multiple repositories.
 type MultiIndexer struct {
 	graph     graph.Store
+	contractCoreRuntime atomic.Pointer[ContractCoreRuntimeHooks]
 	registry  *parser.Registry
 	search    search.Backend
 	embedder  embedding.Provider
@@ -361,6 +362,7 @@ func (mi *MultiIndexer) newPerRepoIndexerGuardedWithMode(
 		factory = New
 	}
 	idx := factory(mi.graph, mi.registry, cfg, mi.logger)
+	idx.contractCoreRuntime.Store(mi.contractCoreRuntime.Load())
 	idx.shadowAdmission = mi.shadowAdmission
 	idx.parseAdmission.Store(mi.parseAdmission.Load())
 	idx.nativeParseAdmission.Store(mi.nativeParseAdmission.Load())
@@ -4332,6 +4334,7 @@ func (mi *MultiIndexer) wrapperSourceReader() contracts.SourceReader {
 // via the `contracts check` tool and traversals stop at each service's
 // boundary.
 func (mi *MultiIndexer) ReconcileContractEdges() int {
+	if mi.contractCoreRuntime.Load() != nil { return 0 }
 	// Serialise the whole pass: the evict-then-mint of EdgeMatches, topic
 	// edges, and the bridge subgraph spans many non-atomic store writes,
 	// and several goroutines call this concurrently (see reconcileMu).
