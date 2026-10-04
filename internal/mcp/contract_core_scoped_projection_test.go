@@ -3,12 +3,14 @@ package mcp
 import (
 	"context"
 	"encoding/json"
-	mcplib "github.com/mark3labs/mcp-go/mcp"
-	"github.com/stretchr/testify/require"
-	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"path/filepath"
 	"testing"
+
+	mcplib "github.com/mark3labs/mcp-go/mcp"
+	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 func TestFindFilesRuntimeScopedProjectionPreservesScopeAndOverlay(t *testing.T) {
