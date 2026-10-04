@@ -7,6 +7,9 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -56,7 +59,27 @@ type fileHit struct {
 }
 
 func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	debug := s.logger != nil && s.logger.Core().Enabled(zap.DebugLevel)
+	var start, phase time.Time
+	var scopeMS, preparationMS, streamMS, sortMS, responseMS float64
+	var visited, scoped, pathAccepted, matched int
+	var projectionSupported, projectionUsed bool
+	var readerType, baseType string
+	if debug {
+		start = time.Now()
+		defer func() {
+			s.logger.Debug("find_files phases", zap.String("query", req.GetString("query", "")), zap.String("path", req.GetString("path", "")), zap.String("repo", req.GetString("repo", "")),
+				zap.String("reader_type", readerType), zap.String("base_reader_type", baseType), zap.Bool("node_projection_supported", projectionSupported), zap.Bool("node_projection_used", projectionUsed),
+				zap.Float64("scope_ms", scopeMS), zap.Float64("iterator_preparation_ms", preparationMS), zap.Float64("stream_filter_ms", streamMS), zap.Float64("sort_ms", sortMS), zap.Float64("response_ms", responseMS), zap.Float64("handler_total_ms", float64(time.Since(start))/float64(time.Millisecond)),
+				zap.Int("visited", visited), zap.Int("scoped", scoped), zap.Int("path_accepted", pathAccepted), zap.Int("matched", matched), zap.Error(ctx.Err()))
+		}()
+	}
 	reader := s.readerFor(ctx)
+	if debug {
+		readerType = fmt.Sprintf("%T", reader)
+		baseType = fmt.Sprintf("%T", s.requestBaseReader(ctx))
+		_, projectionSupported = reader.(graph.ScopedNodeProjectionSequencer)
+	}
 	if reader == nil {
 		return mcp.NewToolResultError("find_files: no graph available"), nil
 	}
@@ -78,7 +101,13 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 			len(compiledGlob.pattern), compiledGlob.segmentCount(), maxGlobBytes, maxGlobSegments)), nil
 	}
 	fuzzy := req.GetBool("fuzzy", false)
+	if debug {
+		phase = time.Now()
+	}
 	resolved, errResult := s.resolveScope(ctx, req, IntentLocate)
+	if debug {
+		scopeMS = float64(time.Since(phase)) / float64(time.Millisecond)
+	}
 	if errResult != nil {
 		return errResult, nil
 	}
@@ -96,10 +125,16 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 		RepoAllow:   resolved.RepoAllow,
 	}
 
+	if debug {
+		phase = time.Now()
+	}
 	var files iter.Seq[*graph.Node]
 	if projection, ok := reader.(graph.ScopedNodeProjectionSequencer); ok && len(resolved.RepoAllow) > 0 {
 		// ScopeAllows also admits unowned nodes. Keep one projection so its
 		// ID order matches the original kind traversal for equal-path ties.
+		if debug {
+			projectionUsed = true
+		}
 		repos := []string{""}
 		for repo, allowed := range resolved.RepoAllow {
 			if allowed && repo != "" {
@@ -112,8 +147,15 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 		files = reader.NodesByKind(graph.KindFile)
 	}
 
+	if debug {
+		preparationMS = float64(time.Since(phase)) / float64(time.Millisecond)
+		phase = time.Now()
+	}
 	hits := make([]fileHit, 0, 64)
 	for n := range files {
+		if debug {
+			visited++
+		}
 		if n == nil {
 			continue
 		}
@@ -123,9 +165,15 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 		if !scopeOpts.ScopeAllows(n) {
 			continue
 		}
+		if debug {
+			scoped++
+		}
 		rel := repoRelativePath(n)
 		if len(pathFilter) > 0 && !pathMatchesAnyPrefix(rel, pathFilter) {
 			continue
+		}
+		if debug {
+			pathAccepted++
 		}
 		base := path.Base(rel)
 
@@ -144,6 +192,9 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 			score += sc
 		}
 
+		if debug {
+			matched++
+		}
 		hits = append(hits, fileHit{
 			Path:     rel,
 			Repo:     n.RepoPrefix,
@@ -154,6 +205,10 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 		})
 	}
 
+	if debug {
+		streamMS = float64(time.Since(phase)) / float64(time.Millisecond)
+		phase = time.Now()
+	}
 	// Highest score first; tie-break toward shallower paths, then
 	// lexical — so a top-level match outranks a deeply-nested one and
 	// identical inputs produce identical output across restarts.
@@ -166,18 +221,28 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 		}
 		return hits[i].Path < hits[j].Path
 	})
+	if debug {
+		sortMS = float64(time.Since(phase)) / float64(time.Millisecond)
+	}
 	total := len(hits)
 	if len(hits) > limit {
 		hits = hits[:limit]
 	}
 
-	return s.respondScopedJSONOrTOON(ctx, req, map[string]any{
+	if debug {
+		phase = time.Now()
+	}
+	result, err := s.respondScopedJSONOrTOON(ctx, req, map[string]any{
 		"query":     query,
 		"glob":      glob,
 		"files":     hits,
 		"count":     len(hits),
 		"truncated": total > len(hits),
 	}, resolved)
+	if debug {
+		responseMS = float64(time.Since(phase)) / float64(time.Millisecond)
+	}
+	return result, err
 }
 
 // scoreFilenameMatch ranks how well query matches a file's basename or
