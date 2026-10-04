@@ -41,7 +41,7 @@ func (s *contractCoreLookupSpy) FindNodesByNameContext(ctx context.Context, name
 	if err := s.begin(ctx); err != nil {
 		return nil, err
 	}
-	return s.Reader.FindNodesByName(name), nil
+	return s.FindNodesByName(name), nil
 }
 func (s *contractCoreLookupSpy) FindNodesByNameContainingContext(ctx context.Context, name string, limit int) ([]*graph.Node, error) {
 	if err := s.begin(ctx); err != nil {
@@ -54,13 +54,13 @@ func (s *contractCoreLookupSpy) GetNodeContext(ctx context.Context, id string) (
 	if err := s.begin(ctx); err != nil {
 		return nil, err
 	}
-	return s.Reader.GetNode(id), nil
+	return s.GetNode(id), nil
 }
 func (s *contractCoreLookupSpy) GetNodesByIDsContext(ctx context.Context, ids []string) (map[string]*graph.Node, error) {
 	if err := s.begin(ctx); err != nil {
 		return nil, err
 	}
-	return s.Reader.GetNodesByIDs(ids), nil
+	return s.GetNodesByIDs(ids), nil
 }
 
 func TestContractCoreLookupPreservesBoundedSelectedNameCapability(t *testing.T) {
