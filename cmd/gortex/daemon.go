@@ -317,6 +317,13 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// sweep the coordinators run.
 		controller.viewMaterializer = srv.Materializer()
 	}
+	contractAnalysis, err := installDaemonContractAnalysis(state, logger)
+	if err != nil {
+		if state.shared != nil {
+			_ = state.shared.Close()
+		}
+		return fmt.Errorf("install contract analysis: %w", err)
+	}
 	// Teardown is wired into every exit path, not just the control-socket
 	// one. A SIGINT/SIGTERM is handled inside the daemon server: it calls
 	// Server.Shutdown directly, Serve returns, and the controller's hook is
@@ -348,6 +355,11 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		retirementWorker.Stop()
 	}
 	runTeardown := installDaemonTeardown(controller, stopBackground, func() error {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancelShutdown()
+		if err := contractAnalysis.Close(shutdownCtx); err != nil {
+			return fmt.Errorf("contract analysis still owns selected-source handoffs: %w", err)
+		}
 		// Nothing has to be serialized here: per-file mtimes live in the
 		// FileMtime sidecar table, contract records ride on
 		// KindContract.Meta, and the vector index is persisted by the
