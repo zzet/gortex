@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 
 func TestGrepTextPathsRepeatedScopeDoesNotWarmOrEvictTrigramCache(t *testing.T) {
 	root := t.TempDir()
+	require.NoError(t, os.Mkdir(root+"/scope", 0o755))
 	writeTestFile(t, root+"/outside.txt", "needle outside\n")
 	writeTestFile(t, root+"/scope/a.txt", "needle first\nneedle second\n")
 	writeTestFile(t, root+"/scope/b.txt", "unmatched\nneedle third\n")
