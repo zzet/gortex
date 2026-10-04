@@ -175,7 +175,7 @@ func TestContractBoundaryReceiptAtomicStateAcceptanceAndLimits(t *testing.T) {
 	if err := s.AcceptContractInputMutationWithReceiptsContext(ctx, state, []graph.ContractBoundaryReceipt{bad}); !errors.Is(err, ErrCatalogStaleGuard) {
 		t.Fatalf("wrong source accepted=%v", err)
 	}
-	row, known, err := s.ContractBoundaryReceiptContext(ctx, "repo", "", receipt.FilePath)
+	row, _, err := s.ContractBoundaryReceiptContext(ctx, "repo", "", receipt.FilePath)
 	if err != nil || row.Accepted {
 		t.Fatalf("partial receipt=%#v %v", row, err)
 	}
@@ -213,7 +213,7 @@ func TestContractBoundaryReceiptAtomicStateAcceptanceAndLimits(t *testing.T) {
 	if err := s.SetContractBoundaryReceiptsContext(ctx, []graph.ContractBoundaryReceipt{huge}); !errors.Is(err, ErrContractBoundaryReceiptLimit) {
 		t.Fatalf("encoded scope unbounded=%v", err)
 	}
-	row, known, err = s.ContractBoundaryReceiptContext(ctx, "repo", "", huge.FilePath)
+	row, known, err := s.ContractBoundaryReceiptContext(ctx, "repo", "", huge.FilePath)
 	if err != nil || row != nil || known {
 		t.Fatalf("failed huge receipt partial=%#v %v %v", row, known, err)
 	}
