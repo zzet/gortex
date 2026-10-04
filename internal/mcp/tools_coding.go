@@ -962,18 +962,20 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("symbol not found: " + id), nil
 	}
 	sess := s.sessionFor(ctx)
-	sess.recordSymbol(id)
-	sess.recordFile(node.FilePath)
-	// Credit this consume back to the most recent matching search_symbols,
-	// if any; no-op when the combo tracker isn't initialised or no search
-	// window is active.
-	if q := sess.attributedQuery(id); q != "" {
-		s.combo.Record(q, id)
-	}
-	// Unconditionally record the access for frecency — this is the "symbols
-	// the agent actually reads" signal, useful even when no prior search
-	// sourced it (agents also fetch symbols by ID from recent history).
-	s.frecency.Record(id)
+	afterFreshSymbolAcceptance(ctx, func() {
+		sess.recordSymbol(id)
+		sess.recordFile(node.FilePath)
+		// Credit this consume back to the most recent matching search_symbols,
+		// if any; no-op when the combo tracker isn't initialised or no search
+		// window is active.
+		if q := sess.attributedQuery(id); q != "" {
+			s.combo.Record(q, id)
+		}
+		// Unconditionally record the access for frecency — this is the "symbols
+		// the agent actually reads" signal, useful even when no prior search
+		// sourced it (agents also fetch symbols by ID from recent history).
+		s.frecency.Record(id)
+	})
 
 	if node.StartLine == 0 || node.EndLine == 0 {
 		return mcp.NewToolResultError("symbol has no line range: " + id), nil
@@ -1055,8 +1057,10 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	returned := tokens.CachedCountInt64(source)
 	fullFile := int64(tokens.EstimateFromSample(totalFileChars, source))
 	symStats := s.tokenStatsFor(ctx)
-	symStats.creditFile(absPath)
-	symStats.record(s.savingsAttributionNode(node), "get_symbol_source", returned, fullFile)
+	afterFreshSymbolAcceptance(ctx, func() {
+		symStats.creditFile(absPath)
+		symStats.record(s.savingsAttributionNode(node), "get_symbol_source", returned, fullFile)
+	})
 
 	result := map[string]any{
 		"id":         node.ID,

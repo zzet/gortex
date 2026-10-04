@@ -651,6 +651,13 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			ctx = withLocalizationPermittedEvidenceCapture(ctx, reservation)
 		}
 	}
+	// A finite localization allowance or task boundary is session control, not
+	// replayable answer assembly. It is finalized before the outer exact gate.
+	if transactionalBoundaryFlow || localizationReadReservation != 0 {
+		if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
+			state.replayUnsafe = true
+		}
+	}
 	result, err := s.invokeFacadeSpec(ctx, req, spec)
 	succeeded := err == nil && result != nil && !result.IsError
 	if localizationReadReservation != 0 {

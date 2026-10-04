@@ -1628,7 +1628,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	// the file the agent is reading.
 	var sg *query.SubGraph
 	if sourceRequestView(ctx) == nil {
-		s.creditFileConsumption(ctx, relPath)
+		afterFreshSymbolAcceptance(ctx, func() { s.creditFileConsumption(ctx, relPath) })
 		sg = s.engineFor(ctx).GetFileSymbols(relPath)
 	}
 	if req.GetBool("compress_bodies", false) && language != "" && elide.IsSupported(language) {
@@ -1660,15 +1660,17 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	// credit every defined symbol — keeps the "agent is working in
 	// this area" signal aligned with how the agent burned its
 	// budget.
-	s.sessionFor(ctx).recordFile(relPath)
-	if sg != nil {
-		for _, n := range sg.Nodes {
-			if n == nil || n.Kind == graph.KindFile {
-				continue
+	afterFreshSymbolAcceptance(ctx, func() {
+		s.sessionFor(ctx).recordFile(relPath)
+		if sg != nil {
+			for _, n := range sg.Nodes {
+				if n == nil || n.Kind == graph.KindFile {
+					continue
+				}
+				s.frecency.Record(n.ID)
 			}
-			s.frecency.Record(n.ID)
 		}
-	}
+	})
 
 	// Withhold secret-shaped values from config / data-leaf files unless the
 	// caller explicitly opts out. Keys stay readable; only secret-shaped values
@@ -1836,8 +1838,10 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			fullFile = int64(tokens.EstimateFromSample(originalBytes, contentStr))
 		}
 		stats := s.tokenStatsFor(ctx)
-		stats.creditFile(absPath)
-		stats.record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)
+		afterFreshSymbolAcceptance(ctx, func() {
+			stats.creditFile(absPath)
+			stats.record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)
+		})
 	}
 
 	if sourceRequestView(ctx) == nil {

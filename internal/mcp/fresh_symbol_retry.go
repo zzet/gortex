@@ -11,21 +11,33 @@ import (
 type freshSymbolAttemptKey struct{}
 type freshSymbolDeadlineKey struct{}
 type freshSymbolAttempt struct {
-	withdrawn bool
-	finish    []func()
-	page      *provisionalSymbolPage
-	accepted  []func()
-	decorate  func(*mcplib.CallToolResult) *mcplib.CallToolResult
+	withdrawn    bool
+	replayUnsafe bool
+	finish       []func()
+	page         *provisionalSymbolPage
+	accepted     []func()
+	decorate     func(*mcplib.CallToolResult) *mcplib.CallToolResult
 }
 
-// Only a fresh, exact first-page symbol search can replay answer assembly.
+// Replay only audited logical reads. Traversal renderers have no continuation
+// state; on-demand refs confirmation and proxy hydration fill idempotent derived
+// caches, not user mutations. File-access bookkeeping follows acceptance below.
 // Late-refusal safety alone is not a replay contract for every read tool.
+func freshReadReplayAllowed(legacy string) bool {
+	switch legacy {
+	case "search_symbols", "get_callers", "get_call_chain", "get_dependencies", "get_dependents", "read_file", "get_symbol_source":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) retryFreshSymbolSearch(attempt mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		freshness := takeRequestFreshness(&req)
 		legacy, known := s.legacyToolName(&req)
 		cursor, _ := requestRawArg(&req, "cursor")
-		if !known || legacy != "search_symbols" || !freshness.requireExact || !freshness.requireFresh || freshness.err != nil || (cursor != nil && cursor != "") {
+		if !known || !freshReadReplayAllowed(legacy) || !freshness.requireExact || !freshness.requireFresh || freshness.err != nil || (cursor != nil && cursor != "") {
 			return attempt(ctx, req)
 		}
 		started := time.Now()
@@ -49,7 +61,7 @@ func (s *Server) retryFreshSymbolSearch(attempt mcpserver.ToolHandlerFunc) mcpse
 			copy.Params.Arguments = args
 			state := &freshSymbolAttempt{}
 			result, err := runFreshSymbolAttempt(bounded, copy, state, attempt)
-			if err != nil || !state.withdrawn {
+			if err != nil || !state.withdrawn || state.replayUnsafe {
 				if ctx.Err() != nil {
 					return nil, ctx.Err()
 				}
@@ -141,7 +153,7 @@ func (s *Server) commitFreshSymbolPage(ctx context.Context, result *mcplib.CallT
 	return result, nil
 }
 
-// Session savings and last-search bookkeeping follow accepted answers, not
+// Session savings, file access and last-search bookkeeping follow accepted answers, not
 // discarded assembly attempts. Ordinary unwrapped calls retain their behavior.
 func afterFreshSymbolAcceptance(ctx context.Context, commit func()) {
 	if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
