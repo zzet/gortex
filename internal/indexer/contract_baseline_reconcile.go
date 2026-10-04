@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"sync"
 
 	"github.com/zzet/gortex/internal/contracts"
@@ -142,13 +143,30 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			if err != nil {
 				return err
 			}
+			ids := make([]string, 0, len(evidence.Nodes))
+			for _, node := range evidence.Nodes {
+				if node != nil {
+					ids = append(ids, node.ID)
+				}
+			}
+			values, err := graph.ConstantValuesByNodeIDsContext(ctx, snapshot.Core, ids)
+			if err != nil {
+				return err
+			}
+			sort.Strings(ids)
+			constants := make([]parser.ConstValue, 0, len(values))
+			for _, id := range ids {
+				if value, found := values[id]; found {
+					constants = append(constants, parser.ConstValue{NodeID: id, FilePath: file.Path, Value: value})
+				}
+			}
 			cfg, ok := snapshot.RepoConfigs[repo]
 			if !ok {
 				return fmt.Errorf("contract baseline: accepted configuration unavailable")
 			}
 			idx := &Indexer{config: cfg, registry: options.Registry, repoPrefix: repo, workspaceID: file.WorkspaceID, projectID: file.ProjectID, logger: options.Logger}
 			tree := contracts.ParseTreeForLang(file.Language, accepted.Bytes)
-			receipt, collectErr := idx.collectContractBoundaryReceipt(ctx, file.Path, file.Language, accepted.Bytes, &parser.ExtractionResult{Nodes: evidence.Nodes, Edges: evidence.Edges, Tree: tree})
+			receipt, collectErr := idx.collectContractBoundaryReceipt(ctx, file.Path, file.Language, accepted.Bytes, &parser.ExtractionResult{Nodes: evidence.Nodes, Edges: evidence.Edges, ConstValues: constants, Tree: tree})
 			if tree != nil {
 				tree.Release()
 			}

@@ -20,10 +20,18 @@ func TestContractBaselineRepairsStaleReceiptsFromAcceptedCore(t *testing.T) {
 			idx, store := newSQLiteIndexer(t)
 			idx.SetRepoPrefix("fixture")
 			root := t.TempDir()
-			writeFile(t, filepath.Join(root, "routes.go"), "package fixture\nfunc serve() {}\n")
+			writeFile(t, filepath.Join(root, "routes.go"), "package fixture\nconst route = \"/constant-route\"\nfunc register(router *Router) { router.GET(route, serve) }\nfunc serve() {}\n")
+			backend, err := newPrimaryContractCoreStorageBackend(ctx, store, "fixture")
+			require.NoError(t, err)
+			idx.contractCoreInputs, err = newContractCoreInputJournal(ctx, backend)
+			require.NoError(t, err)
 			result, err := idx.IndexCtx(ctx, root)
 			require.NoError(t, err)
 			require.Empty(t, result.FailedFiles)
+			original, _, err := store.ContractBoundaryReceiptContext(ctx, "fixture", "", "fixture/routes.go")
+			require.NoError(t, err)
+			require.NotNil(t, original)
+			require.True(t, original.Accepted)
 			mi := NewMultiIndexer(store, idx.registry, search.NewNull(), nil, zap.NewNop())
 			mi.repos["fixture"] = &RepoMetadata{RepoPrefix: "fixture", RootPath: root}
 			mi.indexers["fixture"] = idx
@@ -58,6 +66,7 @@ func TestContractBaselineRepairsStaleReceiptsFromAcceptedCore(t *testing.T) {
 			require.NoError(t, err)
 			require.True(t, repaired.Accepted)
 			require.NotEqual(t, bad.SourceFingerprint, repaired.SourceFingerprint)
+			require.JSONEq(t, string(original.Payload), string(repaired.Payload), "baseline must retain real accepted-parser constant route and produced lookup facts")
 			// The same invalid proof remains forbidden on the strict path.
 			require.NoError(t, store.SetContractBoundaryReceiptsContext(ctx, []graph.ContractBoundaryReceipt{bad}))
 			if mode != "unaccepted" {
