@@ -197,7 +197,8 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"resolver.scopedSynthesizer":                  "framework synthesizer contract, asserted on synthesizers",
 
 	"graph.OverlayLayerContractRepoProjectionReader": "checked physical repo contract projection; DeltaWriter exposes the composed LoadContractRepoProjectionContext and applies selected-layer visibility, never physical layer seeds",
-	"graph.Unwrapper": "transparent reader-wrapper capability; DeltaWriter is handled as a concrete composed reader before wrapper unwrapping, so unwrapping it would discard delta ownership",
+	"graph.OverlayLayerNodeKindsByIDsReader":         "checked physical layer node-kind projection; DeltaWriter exposes composed GetNodeKindsByIDsContext with delta visibility, never a physical ancestry layer",
+	"graph.Unwrapper":                                "transparent reader-wrapper capability; DeltaWriter is handled as a concrete composed reader before wrapper unwrapping, so unwrapping it would discard delta ownership",
 }
 
 // editDeltaCapabilityPackages are the engine packages whose assertions the
