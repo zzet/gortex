@@ -218,6 +218,7 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 	metaByPath := make(map[string]graph.FileMetaRow)
 	sources := make(map[string]source.ContentSource)
 	configs := make(map[string]config.IndexConfig)
+	extractionOptions := make(map[string]parser.ExtractionOptions)
 	pathRepos := make(map[string]string)
 	scopes := make(map[string][2]string)
 	for _, repo := range repos {
@@ -232,6 +233,7 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 		}
 		if idx := options.MultiIndexer.indexers[repo]; idx != nil {
 			scopes[repo] = [2]string{idx.workspaceID, idx.projectID}
+			extractionOptions[repo] = parser.NewExtractionOptions(idx.extractionOptionsValue().TemporalEnvHelpers())
 		}
 		options.MultiIndexer.mu.RUnlock()
 		scope := scopes[repo]
@@ -275,6 +277,7 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 
 	}
 	snapshot.RepoConfigs = configs
+	snapshot.RepoExtractionOptions = extractionOptions
 	snapshot.TrackedRepoModules = make(map[string]string)
 	options.MultiIndexer.mu.RLock()
 	for _, idx := range options.MultiIndexer.indexers {

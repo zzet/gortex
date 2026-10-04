@@ -7,13 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"sort"
+	"strings"
 	"sync"
 
-	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
-	"github.com/zzet/gortex/internal/parser"
 	"go.uber.org/zap"
 )
 
@@ -154,37 +152,18 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			if err != nil {
 				return err
 			}
-			evidence, err := snapshot.ReadCoreFile(ctx, file)
-			if err != nil {
-				return err
-			}
-			ids := make([]string, 0, len(evidence.Nodes))
-			for _, node := range evidence.Nodes {
-				if node != nil {
-					ids = append(ids, node.ID)
-				}
-			}
-			values, err := graph.ConstantValuesByNodeIDsContext(ctx, snapshot.Core, ids)
-			if err != nil {
-				return err
-			}
-			sort.Strings(ids)
-			constants := make([]parser.ConstValue, 0, len(values))
-			for _, id := range ids {
-				if value, found := values[id]; found {
-					constants = append(constants, parser.ConstValue{NodeID: id, FilePath: file.Path, Value: value})
-				}
-			}
 			cfg, ok := snapshot.RepoConfigs[repo]
 			if !ok {
 				return fmt.Errorf("contract baseline: accepted configuration unavailable")
 			}
-			idx := &Indexer{config: cfg, registry: options.Registry, repoPrefix: repo, workspaceID: file.WorkspaceID, projectID: file.ProjectID, logger: options.Logger}
-			tree := contracts.ParseTreeForLang(file.Language, accepted.Bytes)
-			receipt, collectErr := idx.collectContractBoundaryReceipt(ctx, file.Path, file.Language, accepted.Bytes, &parser.ExtractionResult{Nodes: evidence.Nodes, Edges: evidence.Edges, ConstValues: constants, Tree: tree})
-			if tree != nil {
-				tree.Release()
+			opts, ok := snapshot.RepoExtractionOptions[repo]
+			if !ok {
+				return fmt.Errorf("contract baseline: accepted parser options unavailable")
 			}
+			idx := &Indexer{config: cfg, registry: options.Registry, repoPrefix: repo, workspaceID: file.WorkspaceID, projectID: file.ProjectID, logger: options.Logger}
+			idx.extractionOptions.Store(&opts)
+			receipt, collectErr := collectContractBaselineAcceptedReceipt(ctx, idx, file, accepted)
+			idx.Close()
 			if collectErr != nil {
 				return collectErr
 			}
@@ -244,4 +223,29 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 		}
 		return store.AcceptContractInputMutationWithBaselineContext(ctx, next, graph.ContractBoundaryReceiptBaseline{RepoPrefix: repo, Version: contractBoundaryReceiptVersion, Fingerprint: hex.EncodeToString(digest.Sum(nil))})
 	})
+}
+
+// Durable core rows include resolver and enrichment output and may be ordered
+// differently from the accepted parser result. Reconstruct parser-owned facts
+// from the already verified extractor bytes, without indexing or resolving.
+func collectContractBaselineAcceptedReceipt(ctx context.Context, idx *Indexer, file ContractFollowupFile, accepted ContractAcceptedSource) (contractBoundaryReceipt, error) {
+	if err := ctx.Err(); err != nil {
+		return contractBoundaryReceipt{}, err
+	}
+	ext, ok := idx.registry.GetByLanguage(file.Language)
+	if !ok || ext == nil {
+		return contractBoundaryReceipt{}, fmt.Errorf("contract baseline: accepted extractor unavailable for %s", file.Language)
+	}
+	rel := strings.TrimPrefix(file.Path, file.RepoPrefix+"/")
+	result, skipped, err := idx.extractFileCtxWithRawLease(ctx, nil, nil, nil, nil, file.Path, rel, file.Language, ext, accepted.Bytes)
+	if result != nil {
+		defer result.ReleaseTree()
+	}
+	if err != nil {
+		return contractBoundaryReceipt{}, err
+	}
+	if skipped || result == nil {
+		return contractBoundaryReceipt{}, fmt.Errorf("contract baseline: accepted extraction incomplete for %s", file.Path)
+	}
+	return idx.collectContractBoundaryReceipt(ctx, file.Path, file.Language, accepted.Bytes, result)
 }

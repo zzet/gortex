@@ -55,6 +55,8 @@ type ContractFollowupSnapshot struct {
 	Files  []ContractFollowupFile
 	// RepoConfigs is captured immutable extractor/transform policy authority.
 	RepoConfigs map[string]config.IndexConfig
+	// RepoExtractionOptions freezes repository parser options for baseline replay.
+	RepoExtractionOptions map[string]parser.ExtractionOptions
 	// TrackedRepoModules freezes accepted companion module identity.
 	TrackedRepoModules map[string]string
 	ReadAccepted       func(context.Context, ContractFollowupFile) (ContractAcceptedSource, error)
