@@ -3,6 +3,7 @@ package graphview
 import (
 	"container/list"
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -23,8 +24,7 @@ const defaultLayerCacheEntries = 96
 const defaultLayerCacheWeight = 2_000_000
 
 // layerCacheKey names one generation's immutable mask set. The catalog row's
-// creation and publication stamps are part of it: a generation's masks never
-// change once it is published, but an id is not a promise across a catalog
+// creation and publication stamps are part of it: an id is not a promise across a catalog
 // that was rebuilt underneath the process, and the stamps make a reused id a
 // different key rather than a stale hit.
 //
@@ -35,19 +35,24 @@ const defaultLayerCacheWeight = 2_000_000
 // from every open after it and is never served again. The epoch is read before
 // the load: a correction that finishes during the load leaves the entry keyed
 // at the older epoch, which the next open no longer asks for.
+// inputRevision also distinguishes committed correction chunks before Finish
+// advances that epoch. It includes only this generation's input clocks and
+// core identity, so unrelated generation writes do not invalidate its masks.
 type layerCacheKey struct {
 	generation      int64
 	createdAt       int64
 	publishedAt     int64
 	correctionEpoch uint64
+	inputRevision   store_sqlite.PayloadInputRevision
 }
 
 // layerCacheKeyFor is the cache key of generation's catalog row at the
-// correction epoch the store reports for it now.
+// correction epoch and exact own-generation input revision reported now.
 func layerCacheKeyFor(store *store_sqlite.Store, generation int64, row store_sqlite.ViewGeneration) layerCacheKey {
 	key := layerCacheKey{generation: generation, createdAt: row.CreatedAt, publishedAt: row.PublishedAt}
 	if store != nil {
 		key.correctionEpoch = store.GenerationCorrectionEpoch(generation)
+		key.inputRevision = store.AtGeneration(generation).PayloadInputRevision()
 	}
 	return key
 }
@@ -96,25 +101,41 @@ func newGenerationLayerCache(maxCount, maxWeight int) *generationLayerCache {
 
 // layerMaskWeight is the retention cost of one mask set, in rows.
 func layerMaskWeight(l *GenerationLayer) int {
-	return len(l.covered) + len(l.contextPaths) + len(l.removed) + len(l.edgeSources) + len(l.detachedNodes) + 1
+	return len(l.covered) + len(l.contextPaths) + len(l.removed) + len(l.edgeSources) + len(l.detachedNodes) + len(l.claimedIDs) + 1
 }
 
 // open returns a fresh layer over handle whose masks come from the cache,
 // loading them with load on a miss. Concurrent misses on one key share a
-// single load.
+// single load. An observed construction/input withdrawal permits at most two
+// physical loads; other errors retain their original authority.
 func (c *generationLayerCache) open(
 	ctx context.Context,
 	key layerCacheKey,
 	handle *store_sqlite.Store,
 	load func(context.Context, *store_sqlite.Store) (*GenerationLayer, error),
 ) (*GenerationLayer, error) {
+	loads, staleHits := 0, 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// Raw own-generation clocks also change for a committed correction chunk
+		// before Finish advances the correction epoch. Never reuse older masks.
+		key.inputRevision = handle.PayloadInputRevision()
 		c.mu.Lock()
 		entry, found := c.entries[key]
 		if found {
 			select {
 			case <-entry.ready:
 				if entry.masks != nil {
+					if entry.masks.inputRevision != handle.PayloadInputRevision() {
+						c.mu.Unlock()
+						staleHits++
+						if staleHits >= 2 {
+							return nil, graph.ErrContractProjectionStale
+						}
+						continue
+					}
 					c.hits++
 					c.lru.MoveToFront(entry.elem)
 					masks := entry.masks
@@ -134,18 +155,32 @@ func (c *generationLayerCache) open(
 				return nil, ctx.Err()
 			}
 		}
+		if loads >= 2 {
+			c.mu.Unlock()
+			return nil, graph.ErrContractProjectionStale
+		}
+		loads++
 		c.misses++
 		entry = &layerCacheEntry{key: key, ready: make(chan struct{})}
 		c.entries[key] = entry
 		c.mu.Unlock()
 
 		layer, err := load(ctx, handle)
+		if err == nil && layer != nil && (layer.inputRevision != key.inputRevision || layer.inputRevision != handle.PayloadInputRevision()) {
+			err = graph.ErrContractProjectionStale
+		}
 
 		c.mu.Lock()
 		if err != nil || layer == nil {
 			delete(c.entries, key)
 			close(entry.ready)
 			c.mu.Unlock()
+			if errors.Is(err, graph.ErrContractProjectionStale) && ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if errors.Is(err, graph.ErrContractProjectionStale) && loads < 2 {
+				continue
+			}
 			return nil, err
 		}
 		entry.masks = layer.masksOnly()
@@ -153,7 +188,9 @@ func (c *generationLayerCache) open(
 		if c.entries[key] == entry {
 			entry.elem = c.lru.PushFront(entry)
 			c.weight += entry.weight
-			c.dropCorrectedLocked(key)
+			if key.inputRevision == handle.PayloadInputRevision() {
+				c.dropCorrectedLocked(key)
+			}
 			c.evictLocked()
 		}
 		close(entry.ready)
@@ -180,7 +217,7 @@ func (c *generationLayerCache) evictLocked() {
 // must not land in them.
 func (c *generationLayerCache) dropCorrectedLocked(key layerCacheKey) {
 	for other, entry := range c.entries {
-		if other.generation != key.generation || other.correctionEpoch >= key.correctionEpoch || entry.elem == nil {
+		if other.generation != key.generation || other.correctionEpoch > key.correctionEpoch || (other.correctionEpoch == key.correctionEpoch && other.inputRevision == key.inputRevision) || entry.elem == nil {
 			continue
 		}
 		c.lru.Remove(entry.elem)
@@ -215,6 +252,7 @@ func (c *generationLayerCache) stats() (hits, misses int64, entries int) {
 func (l *GenerationLayer) masksOnly() *GenerationLayer {
 	return &GenerationLayer{
 		covered:             l.covered,
+		claimedIDs:          l.claimedIDs,
 		paths:               l.paths,
 		contextPaths:        l.contextPaths,
 		contextList:         l.contextList,
@@ -227,6 +265,7 @@ func (l *GenerationLayer) masksOnly() *GenerationLayer {
 		detachedPaths:       l.detachedPaths,
 		detachedRepos:       l.detachedRepos,
 		rowsRef:             l.rowsRef,
+		inputRevision:       l.inputRevision,
 	}
 }
 

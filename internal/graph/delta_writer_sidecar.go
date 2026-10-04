@@ -176,22 +176,6 @@ func (dw *DeltaWriter) LoadRefFactsByTargets(repoPrefix string, targetIDs []stri
 	return out, nil
 }
 
-// BulkSetConstantValues implements ConstantValueWriter on the generation.
-func (dw *DeltaWriter) BulkSetConstantValues(repoPrefix string, rows []ConstantValueRow) error {
-	if w, ok := sidecarAs[ConstantValueWriter](dw); ok {
-		return w.BulkSetConstantValues(repoPrefix, rows)
-	}
-	return nil
-}
-
-// DeleteConstantValuesByFiles implements ConstantValueWriter on the generation.
-func (dw *DeltaWriter) DeleteConstantValuesByFiles(repoPrefix string, files []string) error {
-	if w, ok := sidecarAs[ConstantValueWriter](dw); ok {
-		return w.DeleteConstantValuesByFiles(repoPrefix, files)
-	}
-	return nil
-}
-
 // SetFileMetas implements FileMetaWriter on the generation.
 func (dw *DeltaWriter) SetFileMetas(repoPrefix string, rows []FileMetaRow) error {
 	if w, ok := sidecarAs[FileMetaWriter](dw); ok {

@@ -244,7 +244,14 @@ func (dw *DeltaWriter) Payload(fixedPaths map[string]struct{}) DeltaPayload {
 	for _, p := range covered {
 		nodes := dw.work.GetFileNodes(p)
 		edges := recordedAt[p]
-		if _, fixed := fixedPaths[p]; !fixed && belowRecorded != nil {
+		_, fixed := fixedPaths[p]
+		for key := range dw.constantOwnedFiles {
+			if key.FilePath == p {
+				fixed = true
+				break
+			}
+		}
+		if !fixed && belowRecorded != nil {
 			belowNodes, belowEdges := dw.belowRowsAt([]string{p}, belowRecorded)
 			if deltaNodeSetsEqual(nodes, belowNodes[p]) && deltaEdgeSetsEqual(edges, belowEdges[p]) {
 				out.DroppedPaths++

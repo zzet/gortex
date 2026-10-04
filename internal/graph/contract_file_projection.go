@@ -14,6 +14,7 @@ var (
 	ErrContractProjectionUnsupported = errors.New("complete contract projection unsupported")
 	ErrContractProjectionLimit       = errors.New("contract projection row limit exceeded")
 	ErrContractProjectionIncomplete  = errors.New("contract projection owner source missing")
+	ErrContractProjectionStale       = errors.New("contract layer ownership revision changed")
 )
 
 // ContractFileProjection contains complete selected rows, not a full registry.

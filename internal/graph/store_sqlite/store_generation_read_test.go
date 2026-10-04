@@ -460,6 +460,29 @@ func generationReadProbes() []genProbe {
 		{name: "FindNodesByNames", run: func(t *testing.T, s *Store) []string {
 			return nodeSliceMapTokens(s.FindNodesByNames(genReadProbeNames()))
 		}},
+
+		{name: "ContractFileProjectionContext", run: func(t *testing.T, s *Store) []string {
+			p, err := s.LoadContractFileProjectionContext(context.Background(), genReadRepo, []string{genReadFileA})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var nodes []*graph.Node
+			for _, rows := range p.FileNodes {
+				nodes = append(nodes, rows...)
+			}
+			return nodeTokens(nodes)
+		}},
+		{name: "ConstantValueProjectionContext", run: func(t *testing.T, s *Store) []string {
+			p, err := s.ReadConstantValueProjectionContext(context.Background(), genReadProbeIDs(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out []string
+			for id, path := range p.Nodes {
+				out = append(out, id+" "+path)
+			}
+			return out
+		}},
 		{name: "GetFileNodes", run: func(t *testing.T, s *Store) []string {
 			return nodeTokens(s.GetFileNodes(genReadFileA))
 		}},
@@ -1875,6 +1898,9 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.CloneShingleWriter)(nil), skip: skipSidecar},
 		{iface: (*graph.ConfigNodeBatchEvicter)(nil), skip: skipWrite, writeFence: writerFamilyFence("config_node_evict")},
 		{iface: (*graph.ConstantValueReader)(nil), skip: skipSidecar},
+		{iface: (*graph.ConstantValueContextReader)(nil), skip: skipSidecar},
+		{iface: (*graph.ConstantValueProjectionReader)(nil), probe: "ConstantValueProjectionContext"},
+		{iface: (*graph.ContractFileProjectionReader)(nil), probe: "ContractFileProjectionContext"},
 		{iface: (*graph.ConstantValueRepoReplacer)(nil), skip: skipSidecar},
 		{iface: (*graph.ConstantValueWriter)(nil), skip: skipSidecar},
 		{iface: (*graph.ContentFTSBatchReplacer)(nil), skip: skipWrite, writeFence: writerFamilyFence("content_fts_replace")},

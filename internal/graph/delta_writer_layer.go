@@ -13,7 +13,8 @@ import (
 // delta while it is being written. It is mutable: every answer reads the
 // working graph and the claim sets as they are at the moment of the call.
 type deltaLayer struct {
-	work *Graph
+	owner *DeltaWriter
+	work  *Graph
 
 	mu sync.RWMutex
 	// covered maps a covered graph path to nothing in particular (the value

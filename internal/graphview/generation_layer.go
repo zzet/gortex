@@ -98,6 +98,8 @@ import (
 // A GenerationLayer is safe for concurrent reads from one request.
 type GenerationLayer struct {
 	handle *store_sqlite.Store
+	// Checked projections reject masks materialized before a row correction.
+	inputRevision store_sqlite.PayloadInputRevision
 	// Set by the materializer before publication. A healthy checkout must
 	// not inherit filesystem failures from its designated primary.
 	failureRepoPrefix string
@@ -216,6 +218,7 @@ func NewGenerationLayerContext(ctx context.Context, handle *store_sqlite.Store) 
 		return nil, fmt.Errorf("graphview: generation layer needs a derived generation, got %d", generation)
 	}
 
+	inputRevision := handle.PayloadInputRevision()
 	fileMasks, err := handle.FileMasksContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("graphview: read file masks of generation %d: %w", generation, err)
@@ -247,14 +250,15 @@ func NewGenerationLayerContext(ctx context.Context, handle *store_sqlite.Store) 
 	}
 
 	l := &GenerationLayer{
-		handle:      handle,
-		covered:     make(map[string]store_sqlite.OwnershipMode, len(fileMasks)),
-		removed:     make(map[string]struct{}, len(tombstones)),
-		removedID:   slices.Clone(tombstones),
-		edgeSources: make(map[string]struct{}, len(edgeSources)),
-		nodeByID:    make(map[string]*graph.Node),
-		fileNodes:   make(map[string][]*graph.Node),
-		rowsRef:     &generationRowsRef{},
+		inputRevision: inputRevision,
+		handle:        handle,
+		covered:       make(map[string]store_sqlite.OwnershipMode, len(fileMasks)),
+		removed:       make(map[string]struct{}, len(tombstones)),
+		removedID:     slices.Clone(tombstones),
+		edgeSources:   make(map[string]struct{}, len(edgeSources)),
+		nodeByID:      make(map[string]*graph.Node),
+		fileNodes:     make(map[string][]*graph.Node),
+		rowsRef:       &generationRowsRef{},
 	}
 	for _, mask := range fileMasks {
 		switch mask.Mode {
@@ -311,6 +315,9 @@ func NewGenerationLayerContext(ctx context.Context, handle *store_sqlite.Store) 
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if l.inputRevision != handle.PayloadInputRevision() {
+		return nil, graph.ErrContractProjectionStale
 	}
 	return l, nil
 }

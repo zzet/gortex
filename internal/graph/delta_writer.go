@@ -69,6 +69,10 @@ type DeltaWriter struct {
 	chainRows *ChainLayerRows
 	below     Reader
 	sidecar   any
+	// Constant sidecar ownership is independent of detached node enrichment.
+	// Successful authoritative deletes retain their file claims in Payload.
+	constantOwnedFiles map[ConstantFileKey]bool
+	constantReadErr    error
 	// belowFileRows answers the payload's per-path comparisons against the
 	// view below when installed (SetBelowFileRows).
 	belowFileRows BelowFileRows
@@ -166,6 +170,7 @@ type DeltaWriterStats struct {
 func NewDeltaWriter(below Reader, sidecar any) *DeltaWriter {
 	dw := &DeltaWriter{below: below, sidecar: sidecar, work: New()}
 	dw.layer = &deltaLayer{
+		owner:   dw,
 		work:    dw.work,
 		covered: make(map[string]bool),
 		claimed: make(map[string]struct{}),

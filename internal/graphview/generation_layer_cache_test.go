@@ -220,7 +220,7 @@ func TestGenerationLayerCacheEvictsByCountAndWeight(t *testing.T) {
 	if _, _, entries := cache.stats(); entries != 1 {
 		t.Fatalf("count-bounded cache retains %d entries, want 1", entries)
 	}
-	if _, ok := cache.entries[layerCacheKey{generation: dirty}]; !ok {
+	if _, ok := cache.entries[layerCacheKey{generation: dirty, inputRevision: store.AtGeneration(dirty).PayloadInputRevision()}]; !ok {
 		t.Fatal("the most recently used entry was evicted")
 	}
 	tiny := newGenerationLayerCache(8, 0)
