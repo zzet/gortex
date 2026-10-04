@@ -94,7 +94,7 @@ func (s *Store) publishContractAttachment(ctx context.Context, expected graph.Co
 	}
 	tokens := make([]string, len(work))
 	for i, row := range work {
-		if row.State != graph.ContractWorkPending || row.RepoPrefix != expected.RepoPrefix || row.CheckoutID != expected.CheckoutID {
+		if row.State != graph.ContractWorkPending || row.RepoPrefix != expected.RepoPrefix || (!contractWorkActorSelected(expected, witnesses, row.CheckoutID)) {
 			return fmt.Errorf("%w: attachment work namespace/state", ErrCatalogInvalidValue)
 		}
 		tokens[i] = row.Token
@@ -136,6 +136,11 @@ func (s *Store) publishContractAttachment(ctx context.Context, expected graph.Co
 	if err != nil {
 		return err
 	}
+	if len(witnesses) > 0 {
+		if err := validateSelectedContractWitnessAncestry(chain, expected.RepoPrefix, witnesses); err != nil {
+			return err
+		}
+	}
 	var state string
 	if err := tx.QueryRowContext(ctx, `SELECT state FROM generation_producer_completeness WHERE view_gen=? AND producer='graph.contracts'`, attachment.PayloadGeneration).Scan(&state); err != nil {
 		return err
@@ -166,7 +171,7 @@ func (s *Store) publishContractAttachment(ctx context.Context, expected graph.Co
 		}
 	}
 	for i, row := range work {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO contract_attachment_work(repo_prefix,checkout_id,attachment_version,attachment_fingerprint,token,origin_generation,file_path,input_version,input_fingerprint,scope) VALUES(?,?,?,?,?,?,?,?,?,?)`, row.RepoPrefix, row.CheckoutID, expected.InputVersion, expected.InputFingerprint, row.Token, row.OriginGeneration, row.FilePath, row.InputVersion, row.InputFingerprint, string(encoded[i])); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO contract_attachment_work(repo_prefix,checkout_id,work_checkout_id,attachment_version,attachment_fingerprint,token,origin_generation,file_path,input_version,input_fingerprint,scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, row.RepoPrefix, expected.CheckoutID, row.CheckoutID, expected.InputVersion, expected.InputFingerprint, row.Token, row.OriginGeneration, row.FilePath, row.InputVersion, row.InputFingerprint, string(encoded[i])); err != nil {
 			return err
 		}
 	}
@@ -210,8 +215,12 @@ func contractInputAncestryTx(ctx context.Context, tx *sql.Tx, generation int64, 
 			return chain, nil
 		}
 		var base sql.NullInt64
-		if err := tx.QueryRowContext(ctx, `SELECT base_generation_id FROM view_generations WHERE generation_id=?`, generation).Scan(&base); err != nil {
+		var coreState string
+		if err := tx.QueryRowContext(ctx, `SELECT base_generation_id,state FROM view_generations WHERE generation_id=?`, generation).Scan(&base, &coreState); err != nil {
 			return nil, err
+		}
+		if coreState != string(ViewGenerationReady) && coreState != string(ViewGenerationSuperseded) {
+			return nil, ErrCatalogStaleGuard
 		}
 		if !base.Valid {
 			if !matched {
@@ -254,8 +263,12 @@ func contractGenerationAncestryTx(ctx context.Context, tx *sql.Tx, generation in
 			return chain, nil
 		}
 		var base sql.NullInt64
-		if err := tx.QueryRowContext(ctx, `SELECT base_generation_id FROM view_generations WHERE generation_id=?`, generation).Scan(&base); err != nil {
+		var coreState string
+		if err := tx.QueryRowContext(ctx, `SELECT base_generation_id,state FROM view_generations WHERE generation_id=?`, generation).Scan(&base, &coreState); err != nil {
 			return nil, err
+		}
+		if coreState != string(ViewGenerationReady) && coreState != string(ViewGenerationSuperseded) {
+			return nil, ErrCatalogStaleGuard
 		}
 		if !base.Valid {
 			return chain, nil
@@ -285,7 +298,7 @@ func validateContractInputWitnessesTx(ctx context.Context, tx *sql.Tx, witnesses
 			if err := tx.QueryRowContext(ctx, `SELECT state FROM view_generations WHERE generation_id=?`, w.GenerationID).Scan(&state); err != nil {
 				return err
 			}
-			if state != string(ViewGenerationBuilding) && state != string(ViewGenerationReady) && state != string(ViewGenerationSuperseded) {
+			if state != string(ViewGenerationReady) && state != string(ViewGenerationSuperseded) {
 				return ErrCatalogStaleGuard
 			}
 		}
@@ -337,4 +350,48 @@ func effectiveContractWitnesses(w []graph.ContractInputWitness) map[int]bool {
 		}
 	}
 	return out
+}
+
+func contractWorkActorSelected(expected graph.ContractInputState, witnesses []graph.ContractInputWitness, actor string) bool {
+	if len(witnesses) == 0 {
+		return actor == expected.CheckoutID
+	}
+	for _, w := range witnesses {
+		if w.Found && w.State.RepoPrefix == expected.RepoPrefix && w.State.CheckoutID == actor {
+			return true
+		}
+	}
+	return false
+}
+
+func validateSelectedContractWitnessAncestry(chain []int64, repo string, witnesses []graph.ContractInputWitness) error {
+	ranks := make(map[int64]int)
+	for i, id := range chain {
+		ranks[id] = i
+	}
+	covered := make(map[int64]bool)
+	last := len(chain)
+	for _, w := range witnesses {
+		if w.State.RepoPrefix != repo {
+			if w.GenerationID != 0 {
+				return ErrCatalogStaleGuard
+			}
+			continue
+		}
+		if w.GenerationID == 0 {
+			continue
+		} // actual inherited0 selection is captured by the view caller
+		rank, ok := ranks[w.GenerationID]
+		if !ok || rank > last {
+			return ErrCatalogStaleGuard
+		}
+		last = rank
+		covered[w.GenerationID] = true
+	}
+	for _, id := range chain {
+		if id != 0 && !covered[id] {
+			return ErrCatalogStaleGuard
+		}
+	}
+	return nil
 }

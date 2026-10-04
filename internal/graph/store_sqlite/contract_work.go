@@ -12,6 +12,7 @@ import (
 
 var _ graph.ContractWorkReader = (*Store)(nil)
 var _ graph.PendingContractWorkReader = (*Store)(nil)
+var _ graph.ContractAttachmentWorkReader = (*Store)(nil)
 
 const contractWorkReadLimit = 32768
 
@@ -92,7 +93,7 @@ func (s *Store) readContractWork(ctx context.Context, filter string, args []any)
 	}
 	args = append([]any{s.viewGen}, args...)
 	rows, err := s.db.QueryContext(ctx, `SELECT token, origin_generation, checkout_id, repo_prefix, file_path,
- input_version, input_fingerprint, CASE WHEN `+contractWorkAcknowledgedSQL+` THEN 'complete' ELSE state END, scope FROM generation_contract_work d
+ input_version, input_fingerprint, state, scope FROM generation_contract_work d
  WHERE view_gen = ?`+filter+` ORDER BY token LIMIT 32769`, args...)
 	if err != nil {
 		return nil, err
@@ -176,9 +177,45 @@ func setContractWorkTx(ctx context.Context, tx *sql.Tx, generation int64, work [
 	return nil
 }
 
-// PendingContractWorkForScopeContext reads only unacknowledged debt, so request
-// returned rows are bounded. Primary publication deletes its exact completed
-// batch; positive generations reclaim acknowledged physical rows on fold.
+// PendingContractWorkForScopeContext preserves physical pending debt for
+// historical readers. Only exact selected attachment readers interpret serving
+// completion; background compaction is separate. Returned rows are bounded.
 func (s *Store) PendingContractWorkForScopeContext(ctx context.Context, repo, checkout string) ([]graph.ContractWork, error) {
-	return s.readContractWork(ctx, " AND repo_prefix=? AND checkout_id=? AND state='pending' AND NOT "+contractWorkAcknowledgedSQL, []any{repo, checkout})
+	return s.readContractWork(ctx, " AND repo_prefix=? AND checkout_id=? AND state='pending'", []any{repo, checkout})
+}
+
+// Exact selected attachment completion is an explicit serving input, not a
+// global mutation of historical work. Other views keep the original debt.
+func (s *Store) ContractWorkForAttachmentScopeContext(ctx context.Context, key graph.ContractAttachmentKey, repo, actor string) ([]graph.ContractWork, error) {
+	if repo != key.RepoPrefix {
+		return nil, fmt.Errorf("%w: attachment work repo", ErrCatalogInvalidValue)
+	}
+	rows, err := s.readContractWork(ctx, " AND repo_prefix=? AND checkout_id=?", []any{repo, actor})
+	if err != nil {
+		return nil, err
+	}
+	attachment, err := s.GetContractAttachmentContext(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if attachment == nil {
+		return rows, nil
+	}
+	for i, row := range rows {
+		if row.State != graph.ContractWorkPending {
+			continue
+		}
+		scope, err := json.Marshal(row.Scope)
+		if err != nil {
+			return nil, err
+		}
+		var complete bool
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM contract_attachment_work WHERE repo_prefix=? AND checkout_id=? AND attachment_version=? AND attachment_fingerprint=? AND work_checkout_id=? AND token=? AND origin_generation=? AND file_path=? AND input_version=? AND input_fingerprint=? AND scope=?)`, key.RepoPrefix, key.CheckoutID, key.InputVersion, key.InputFingerprint, row.CheckoutID, row.Token, row.OriginGeneration, row.FilePath, row.InputVersion, row.InputFingerprint, string(scope)).Scan(&complete); err != nil {
+			return nil, err
+		}
+		if complete {
+			rows[i].State = graph.ContractWorkComplete
+		}
+	}
+	return rows, nil
 }

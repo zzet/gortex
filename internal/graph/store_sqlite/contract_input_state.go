@@ -203,3 +203,40 @@ func (s *Store) AcceptContractInputMutationContext(ctx context.Context, expected
 func sameContractInput(a, b graph.ContractInputState) bool {
 	return a.RepoPrefix == b.RepoPrefix && a.CheckoutID == b.CheckoutID && a.InputVersion == b.InputVersion && a.InputFingerprint == b.InputFingerprint
 }
+
+var _ graph.ContractInputStateCohortReader = (*Store)(nil)
+
+func (s *Store) ContractInputStatesForRepoContext(ctx context.Context, repo string) ([]graph.ContractInputState, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.coreless() || s.db == nil {
+		return nil, sql.ErrConnDone
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT checkout_id,input_version,input_fingerprint,accepted,previous_input_version,previous_input_fingerprint FROM generation_contract_input_state WHERE view_gen=? AND repo_prefix=? ORDER BY checkout_id LIMIT 32769`, s.viewGen, repo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []graph.ContractInputState
+	for rows.Next() {
+		row := graph.ContractInputState{RepoPrefix: repo}
+		if err := rows.Scan(&row.CheckoutID, &row.InputVersion, &row.InputFingerprint, &row.Accepted, &row.PreviousInputVersion, &row.PreviousInputFingerprint); err != nil {
+			return nil, err
+		}
+		if err := validateContractInput(row); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+		if len(out) > contractWorkReadLimit {
+			return nil, ErrContractWorkLimit
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}

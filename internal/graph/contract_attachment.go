@@ -15,6 +15,12 @@ type ContractInputState struct {
 	Accepted                 bool
 }
 
+// Cohort reads resolve an explicitly copied generation's carried actor. An
+// ambiguous cohort is unavailable; callers never choose an actor's latest row.
+type ContractInputStateCohortReader interface {
+	ContractInputStatesForRepoContext(context.Context, string) ([]ContractInputState, error)
+}
+
 type ContractInputStateReader interface {
 	ContractInputStateContext(context.Context, string, string) (ContractInputState, bool, error)
 }
@@ -39,7 +45,7 @@ type ContractAttachment struct {
 	CompletedTokens   []string
 }
 
-// Pending readers bound lazy analysis work by active debt. Implementations
+// Pending readers return bounded unacknowledged work. Implementations
 // exclude only exact immutable acknowledgments from available attachments.
 type PendingContractWorkReader interface {
 	PendingContractWorkForScopeContext(context.Context, string, string) ([]ContractWork, error)
@@ -47,4 +53,10 @@ type PendingContractWorkReader interface {
 
 type ContractAttachmentReader interface {
 	GetContractAttachmentContext(context.Context, ContractAttachmentKey) (*ContractAttachment, error)
+}
+
+// Serving completion is bound to an available exact selected attachment; raw
+// debt readers never infer completion from a future or sibling publication.
+type ContractAttachmentWorkReader interface {
+	ContractWorkForAttachmentScopeContext(context.Context, ContractAttachmentKey, string, string) ([]ContractWork, error)
 }

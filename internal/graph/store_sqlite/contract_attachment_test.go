@@ -82,6 +82,7 @@ func TestContractAttachmentAtomicExactWorkAndHistoricalIsolation(t *testing.T) {
 	if err := h.SetContractInputStateWithWorkContext(ctx, nil, old, []graph.ContractWork{w}); err != nil {
 		t.Fatal(err)
 	}
+	publishContractCoreForTest(t, s, core)
 	payload := attachmentPayload(t, s)
 	a := attachmentFor(old, payload, w)
 	wrong := w
@@ -113,12 +114,12 @@ func TestContractAttachmentAtomicExactWorkAndHistoricalIsolation(t *testing.T) {
 	if got, err := h.GetContractAttachmentContext(ctx, wrongKey); err != nil || got != nil {
 		t.Fatalf("latest fallback=%#v %v", got, err)
 	}
-	rows, err = h.PendingContractWorkForScopeContext(ctx, "repo", "wt")
-	if err != nil || len(rows) != 0 {
+	rows, err = h.ContractWorkForAttachmentScopeContext(ctx, attachmentKey(old), "repo", "wt")
+	if err != nil || len(rows) != 1 || rows[0].State != graph.ContractWorkComplete {
 		t.Fatalf("pending ack=%#v %v", rows, err)
 	}
 	all, err := h.ContractWorkContext(ctx)
-	if err != nil || all[0].State != graph.ContractWorkComplete || !all[0].Scope.Deleted {
+	if err != nil || all[0].State != graph.ContractWorkPending || !all[0].Scope.Deleted {
 		t.Fatalf("ack lost old frontier=%#v %v", all, err)
 	}
 	refs, err := s.Catalog().ViewGenerationReferences(ctx, payload)
@@ -142,6 +143,7 @@ func TestContractInputFoldAndPreviousSnapshot(t *testing.T) {
 	if err := s.AtGeneration(bottom).SetContractInputStateWithWorkContext(ctx, nil, old, []graph.ContractWork{w}); err != nil {
 		t.Fatal(err)
 	}
+	publishContractCoreForTest(t, s, bottom)
 	if err := s.AtGeneration(bottom).PublishContractAttachmentContext(ctx, old, attachmentFor(old, attachmentPayload(t, s), w), []graph.ContractWork{w}, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -252,6 +254,7 @@ func TestContractAttachmentEmptyNamespaceCancellationAndSeal(t *testing.T) {
 	if err := h.SetContractInputStateWithWorkContext(ctx, nil, state, nil); err != nil {
 		t.Fatal(err)
 	}
+	publishContractCoreForTest(t, s, core)
 	if _, found, err := h.ContractInputStateContext(ctx, "repo", ""); err != nil || found {
 		t.Fatalf("empty namespace broadened %v %v", found, err)
 	}
@@ -290,6 +293,7 @@ func TestContractAttachmentNonemptyOwnerShapeAndMaskRefusal(t *testing.T) {
 	if err := h.SetContractInputStateWithWorkContext(ctx, nil, state, nil); err != nil {
 		t.Fatal(err)
 	}
+	publishContractCoreForTest(t, s, core)
 	payload := attachmentPayload(t, s)
 	layer, err := s.AtManagedGeneration(payload)
 	if err != nil {
@@ -333,6 +337,7 @@ func TestContractAttachmentNonemptyOwnerShapeAndMaskRefusal(t *testing.T) {
 	if err := s.AtGeneration(other).SetContractInputStateWithWorkContext(ctx, nil, changed, nil); err != nil {
 		t.Fatal(err)
 	}
+	publishContractCoreForTest(t, s, other)
 	if err := s.AtGeneration(other).PublishContractAttachmentContext(ctx, changed, attachmentFor(changed, masked), nil, 1); err == nil {
 		t.Fatal("core file masks accepted")
 	}
@@ -354,6 +359,7 @@ func TestContractAttachmentSelectedVectorCASAbsenceAndUnrelatedPrimary(t *testin
 	if err := s.AtGeneration(core).SetContractInputStateWithWorkContext(ctx, nil, linked, nil); err != nil {
 		t.Fatal(err)
 	}
+	publishContractCoreForTest(t, s, core)
 	zero, _, err := s.ContractInputStateContext(ctx, "repo", "")
 	if err != nil {
 		t.Fatal(err)
@@ -369,7 +375,7 @@ func TestContractAttachmentSelectedVectorCASAbsenceAndUnrelatedPrimary(t *testin
 	}
 	missing := attachmentState("new-negative-input")
 	missing.RepoPrefix = "unresolved"
-	if err := s.AtGeneration(core).SetContractInputStateWithWorkContext(ctx, nil, missing, nil); err != nil {
+	if _, err := s.writerDB.Exec(`INSERT INTO generation_contract_input_state(view_gen,repo_prefix,checkout_id,input_version,input_fingerprint,accepted,previous_input_version,previous_input_fingerprint) VALUES(?,?,?,?,?,1,'','')`, core, missing.RepoPrefix, missing.CheckoutID, missing.InputVersion, missing.InputFingerprint); err != nil {
 		t.Fatal(err)
 	}
 	payload := attachmentPayload(t, s)
@@ -430,13 +436,18 @@ func TestContractAttachmentCumulativePositiveFoldPreservesInheritedIdentity(t *t
 	lower := reservedGeneration(t, s, "cumulative-lower")
 	upper := reservedGeneration(t, s, "cumulative-upper")
 	folded := reservedGeneration(t, s, "cumulative-fold")
+	if _, err := s.writerDB.Exec(`UPDATE view_generations SET base_generation_id=? WHERE generation_id=?`, lower, upper); err != nil {
+		t.Fatal(err)
+	}
 	a, b := attachmentState("positive-a"), attachmentState("positive-b-includes-a")
 	if err := s.AtGeneration(lower).SetContractInputStateWithWorkContext(ctx, nil, a, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AtGeneration(upper).SetContractInputStateWithWorkContext(ctx, nil, b, nil); err != nil {
+	if err := s.AtGeneration(upper).SetContractInputStateWithWorkContext(ctx, &a, b, nil); err != nil {
 		t.Fatal(err)
 	}
+	publishContractCoreForTest(t, s, lower)
+	publishContractCoreForTest(t, s, upper)
 	zero, _, _ := s.ContractInputStateContext(ctx, "repo", "")
 	lo, _, _ := s.AtGeneration(lower).ContractInputStateContext(ctx, "repo", "wt")
 	hi, _, _ := s.AtGeneration(upper).ContractInputStateContext(ctx, "repo", "wt")
@@ -472,5 +483,172 @@ func TestContractAttachmentCumulativePositiveFoldPreservesInheritedIdentity(t *t
 	got, err := s.GetContractAttachmentContext(ctx, attachmentKey(after))
 	if err != nil || got == nil || got.PayloadGeneration != payload {
 		t.Fatalf("historical binding lost %#v %v", got, err)
+	}
+}
+
+func TestContractAttachmentCopiedActorAndInheritedDebt(t *testing.T) {
+	s := openCatalogStore(t)
+	ctx := context.Background()
+	source := reservedGeneration(t, s, "actor-source")
+	a := attachmentState("carried-a")
+	a.CheckoutID = "actor-a"
+	w := contractWorkFixture("inherited-removed-owner")
+	w.CheckoutID = "actor-a"
+	w.OriginGeneration = source
+	if err := s.AtGeneration(source).SetContractInputStateWithWorkContext(ctx, nil, a, []graph.ContractWork{w}); err != nil {
+		t.Fatal(err)
+	}
+	seedFamilyAndCheckout(t, s.Catalog(), "actor-family", "actor-b", "actor-inc")
+	copied, _, err := s.BeginPayloadGeneration(ctx, PayloadGenerationRequest{OwnerKind: "checkout", GraphID: "graph-copy", CheckoutID: "actor-b", LayerID: "actor-copy", GenerationKind: "commit", TreeOID: "actor-tree", CreatedAt: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CopyGenerationPayloadWhole(ctx, source, copied); err != nil {
+		t.Fatal(err)
+	}
+	missing, found, err := s.AtGeneration(copied).ContractInputStateContext(ctx, "repo", "actor-b")
+	if err != nil || found || missing.CheckoutID != "actor-b" {
+		t.Fatalf("preferred actor=%#v %v %v", missing, found, err)
+	}
+	cohort, err := s.AtGeneration(copied).ContractInputStatesForRepoContext(ctx, "repo")
+	if err != nil || len(cohort) != 1 || cohort[0].CheckoutID != "actor-a" {
+		t.Fatalf("carried actor=%#v %v", cohort, err)
+	}
+	witnesses := []graph.ContractInputWitness{{GenerationID: copied, State: missing, Found: false}, {GenerationID: copied, State: cohort[0], Found: true}}
+	logical, err := graph.ComposeContractInputState("repo", "actor-b", witnesses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := attachmentPayload(t, s)
+	sibling := w
+	sibling.Token = "unselected-sibling"
+	sibling.CheckoutID = "actor-sibling"
+	if err := s.AtGeneration(copied).SetContractWork(ctx, []graph.ContractWork{sibling}); err != nil {
+		t.Fatal(err)
+	}
+	publishContractCoreForTest(t, s, copied)
+	if err := s.AtGeneration(copied).PublishContractAttachmentWithInputsContext(ctx, logical, witnesses, attachmentFor(logical, payload, sibling), []graph.ContractWork{sibling}, 1); err == nil {
+		t.Fatal("unselected sibling debt accepted")
+	}
+	if err := s.AtGeneration(copied).PublishContractAttachmentWithInputsContext(ctx, logical, witnesses, attachmentFor(logical, payload, w), []graph.ContractWork{w}, 1); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.AtGeneration(copied).ContractWorkForAttachmentScopeContext(ctx, attachmentKey(logical), "repo", "actor-a")
+	if err != nil || len(pending) != 1 || pending[0].State != graph.ContractWorkComplete {
+		t.Fatalf("origin ack=%#v %v", pending, err)
+	}
+	pending, err = s.AtGeneration(copied).PendingContractWorkForScopeContext(ctx, "repo", "actor-sibling")
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("sibling debt altered=%#v %v", pending, err)
+	}
+	got, err := s.GetContractAttachmentContext(ctx, attachmentKey(logical))
+	if err != nil || got == nil || got.CheckoutID != "actor-b" {
+		t.Fatalf("selected attachment=%#v %v", got, err)
+	}
+}
+
+func publishContractCoreForTest(t *testing.T, s *Store, generation int64) {
+	t.Helper()
+	if err := s.Catalog().PublishViewGeneration(context.Background(), generation, 1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestContractAttachmentRejectsUnselectedSiblingAndBuildingCore(t *testing.T) {
+	s := openCatalogStore(t)
+	ctx := context.Background()
+	selected := reservedGeneration(t, s, "selected-authority")
+	sibling := reservedGeneration(t, s, "sibling-authority")
+	a, b := attachmentState("selected"), attachmentState("sibling")
+	if err := s.AtGeneration(selected).SetContractInputStateWithWorkContext(ctx, nil, a, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AtGeneration(sibling).SetContractInputStateWithWorkContext(ctx, nil, b, nil); err != nil {
+		t.Fatal(err)
+	}
+	// A valid real input row is insufficient before its accepted core publication.
+	payload := attachmentPayload(t, s)
+	if err := s.AtGeneration(selected).PublishContractAttachmentContext(ctx, a, attachmentFor(a, payload), nil, 1); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("building core certified=%v", err)
+	}
+	publishContractCoreForTest(t, s, selected)
+	publishContractCoreForTest(t, s, sibling)
+	witness := []graph.ContractInputWitness{{GenerationID: sibling, State: b, Found: true}}
+	logical, err := graph.ComposeContractInputState("repo", "wt", witness)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AtGeneration(selected).PublishContractAttachmentWithInputsContext(ctx, logical, witness, attachmentFor(logical, payload), nil, 1); !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("real sibling row certified=%v", err)
+	}
+	if got, err := s.GetContractAttachmentContext(ctx, attachmentKey(logical)); err != nil || got != nil {
+		t.Fatalf("rejected sibling partial header=%#v %v", got, err)
+	}
+}
+
+func TestContractAttachmentAcknowledgmentsNeverCertifyAnotherViewOrHistoricalInput(t *testing.T) {
+	s := openCatalogStore(t)
+	ctx := context.Background()
+	old := attachmentState("primary-old")
+	old.CheckoutID = ""
+	w := contractWorkFixture("primary-removed")
+	w.CheckoutID = ""
+	if err := s.BeginContractInputMutationContext(ctx, nil, old, []graph.ContractWork{w}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AcceptContractInputMutationContext(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	copied := reservedGeneration(t, s, "inherited-primary-copy")
+	if _, err := s.CopyPayloadGeneration(ctx, 0, copied, "repo"); err != nil {
+		t.Fatal(err)
+	}
+	publishContractCoreForTest(t, s, copied)
+	carried, _, err := s.AtGeneration(copied).ContractInputStateContext(ctx, "repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	witnesses := []graph.ContractInputWitness{{GenerationID: copied, State: carried, Found: true}}
+	linked, err := graph.ComposeContractInputState("repo", "linked-b", witnesses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AtGeneration(copied).PublishContractAttachmentWithInputsContext(ctx, linked, witnesses, attachmentFor(linked, attachmentPayload(t, s), w), []graph.ContractWork{w}, 1); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := s.PendingContractWorkForScopeContext(ctx, "repo", "")
+	if err != nil || len(raw) != 1 || raw[0].State != graph.ContractWorkPending {
+		t.Fatalf("linked erased primary debt=%#v %v", raw, err)
+	}
+	sibling := linked
+	sibling.CheckoutID = "linked-c"
+	viewed, err := s.AtGeneration(copied).ContractWorkForAttachmentScopeContext(ctx, attachmentKey(sibling), "repo", "")
+	if err != nil || len(viewed) != 1 || viewed[0].State != graph.ContractWorkPending {
+		t.Fatalf("sibling completed byB=%#v %v", viewed, err)
+	}
+	viewed, err = s.AtGeneration(copied).ContractWorkForAttachmentScopeContext(ctx, attachmentKey(linked), "repo", "")
+	if err != nil || len(viewed) != 1 || viewed[0].State != graph.ContractWorkComplete {
+		t.Fatalf("B exact ack unavailable=%#v %v", viewed, err)
+	}
+	// Later same-actor analysis may acknowledge the immutable old token, but
+	// cannot claim a usable old-input attachment or rewrite old physical debt.
+	current := old
+	current.InputFingerprint = "primary-new"
+	if err := s.BeginContractInputMutationContext(ctx, &old, current, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AcceptContractInputMutationContext(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PublishContractAttachmentContext(ctx, current, attachmentFor(current, attachmentPayload(t, s), w), []graph.ContractWork{w}, 1); err != nil {
+		t.Fatal(err)
+	}
+	historical, err := s.AtGeneration(copied).ContractWorkForAttachmentScopeContext(ctx, attachmentKey(old), "repo", "")
+	if err != nil || len(historical) != 1 || historical[0].State != graph.ContractWorkPending {
+		t.Fatalf("future certified historicalN=%#v %v", historical, err)
+	}
+	historical, err = s.AtGeneration(copied).ContractWorkContext(ctx)
+	if err != nil || len(historical) != 1 || historical[0].State != graph.ContractWorkPending {
+		t.Fatalf("future rewrote raw historicalN=%#v %v", historical, err)
 	}
 }
