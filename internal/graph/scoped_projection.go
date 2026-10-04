@@ -14,16 +14,16 @@ type ScopedEdgeRow struct {
 	Target *Node
 }
 
-// ScopedProjectionSequencer streams full rows owned by a repository or file
+// ScopedNodeProjectionSequencer streams nodes owned by a repository or file
 // frontier. When filePaths is non-empty it is the tighter predicate; repository
 // prefixes remain an additional safety filter. Implementations must keep their
 // cursor/page bounded and must not materialise a whole repository.
-// ScopedNodeProjectionSequencer exposes selected node streams without edge traversal.
 type ScopedNodeProjectionSequencer interface {
 	NodesInScopeSeq(repoPrefixes, filePaths []string, kinds ...NodeKind) iter.Seq[*Node]
 	NodesLightInScopeSeq(repoPrefixes, filePaths []string) iter.Seq[*Node]
 }
 
+// ScopedProjectionSequencer additionally exposes the selected edge stream.
 type ScopedProjectionSequencer interface {
 	ScopedNodeProjectionSequencer
 	EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...EdgeKind) iter.Seq[ScopedEdgeRow]

@@ -1,13 +1,13 @@
 package mcp
 
 import (
-	"github.com/zzet/gortex/internal/graph"
 	"iter"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 // Preserve selected node projection without advertising edge traversal.
 type contractCoreScopedProjection struct {
-	core     *contractCoreEdges
 	selected graph.ScopedNodeProjectionSequencer
 }
 
@@ -40,7 +40,7 @@ func preserveContractCoreScopedProjection(wrapped graph.Reader, selected graph.R
 	if !ok {
 		return wrapped
 	}
-	p := &contractCoreScopedProjection{core: core, selected: projection}
+	p := &contractCoreScopedProjection{selected: projection}
 	switch r := wrapped.(type) {
 	case *contractCoreFilteredNamesBoundedFiles:
 		return &contractCoreScopedFilteredBounded{r, p}
