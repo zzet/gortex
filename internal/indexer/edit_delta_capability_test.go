@@ -31,6 +31,8 @@ import (
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
+	"graph.OutgoingMetadataReader":                "checked full-metadata composition dispatches DeltaWriter explicitly and reads its selected view; the physical getter is never forwarded to a base-only store",
+	"graph.OverlayLayerOutgoingMetadataReader":    "checked physical ancestry-layer adjacency, not a composed DeltaWriter; graph.GetOutEdgesByNodeIDsWithMetadataContext composes delta ownership explicitly",
 	"anonymous{Counts}":                           "asserted by the chain fold on the store's stepped fold (its copy counts), never on a store or a delta",
 	"graph.GenerationLayerIdentity":               "a capability of the published chain layers a delta composes over (their generation id keys the kept rows), asserted on those layers, never on the delta",
 	"graph.OverlayDetachedSummaryReader":          "a capability of the immutable overlay layers a delta composes over, asserted on the layers below, never on the delta",

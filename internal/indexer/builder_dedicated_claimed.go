@@ -184,7 +184,7 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 			GraphID: row.GraphID, CheckoutID: row.CheckoutID, TreeOID: row.TreeOID,
 			ProvenanceCommitOID: row.ProvenanceCommitOID, ConfigHash: row.ConfigHash,
 			ExtractorVersions: row.ExtractorVersions, ResolverVersion: row.ResolverVersion, DependencyRevision: row.DependencyRevision, CreatedAt: row.CreatedAt},
-		Base: graph.New(), RootPath: request.RootPath,
+		Base: graph.New(), RootPath: request.RootPath, contractFullCensus: true,
 		RepoPrefix: claim.Desire.Authority.RepoPrefix, WorkspaceID: request.WorkspaceID,
 		ProjectID: request.ProjectID, PrePublish: request.PrePublish,
 	}

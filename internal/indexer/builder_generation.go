@@ -176,6 +176,8 @@ type LayerBase interface {
 
 // BuildRequest is one sparse generation build.
 type BuildRequest struct {
+	// contractFullCensus is set only by the claimed complete-snapshot producer.
+	contractFullCensus bool
 	// importBatch marks the one-file quantum of a large working-tree import.
 	importBatch bool
 	// prePublishBarrier runs before lane reentry and the final freshness fence.

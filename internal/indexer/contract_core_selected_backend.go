@@ -138,10 +138,15 @@ func (b *SparseGenerationBuilder) installSelectedContractCoreInputs(ctx context.
 	if hooks == nil {
 		return nil
 	}
-	backend, e := newSelectedContractCoreStorageBackend(ctx, handle, req.Base, req.RepoPrefix, req.Identity.CheckoutID)
+	var base graph.Reader = req.Base
+	if req.contractFullCensus {
+		base = nil // The claimed source census is a new complete positive root.
+	}
+	backend, e := newSelectedContractCoreStorageBackend(ctx, handle, base, req.RepoPrefix, req.Identity.CheckoutID)
 	if e != nil {
 		return e
 	}
+	backend.fullNamespace = req.contractFullCensus
 	idx.contractCoreInputs, e = newContractCoreInputJournal(ctx, backend)
 	if e != nil {
 		return e

@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
@@ -37,6 +38,8 @@ type contractCoreStorageBackend struct {
 	stateInstalled bool
 	staged         map[string]graph.ContractBoundaryReceipt
 	sources        map[string]graph.ContractBoundaryReceiptSource
+	fullNamespace  bool
+	coldSemantic   map[string]string
 	cold           bool
 	coldRows       []graph.ContractBoundaryReceipt
 	coldSources    []graph.ContractBoundaryReceiptSource
@@ -125,6 +128,22 @@ func (b *contractCoreStorageBackend) BeginBoundaryMutation(ctx context.Context, 
 			if len(b.coldRows) > 0 && (len(b.coldRows) >= 64 || b.coldBytes+len(row.Payload) > contractCoreReceiptPayloadLimit) {
 				if e := b.flushColdRows(ctx); e != nil {
 					return e
+				}
+			}
+			if b.fullNamespace {
+				if b.coldSemantic == nil {
+					b.coldSemantic = make(map[string]string)
+				}
+				if change.Current != nil {
+					semantic := *change.Current
+					semantic.Source = ""
+					encoded, err := json.Marshal(semantic)
+					if err != nil {
+						return err
+					}
+					b.coldSemantic[row.FilePath] = contractInputHash(encoded)
+				} else {
+					b.coldSemantic[row.FilePath] = row.Fingerprint
 				}
 			}
 			b.coldRows = append(b.coldRows, row)
@@ -264,6 +283,28 @@ func (b *contractCoreStorageBackend) AcceptBoundaryMutation(ctx context.Context)
 	if err := b.acceptBoundaryFiles(ctx, paths); err != nil {
 		return err
 	}
+	if b.cold && b.fullNamespace && b.generation > 0 {
+		identity, err := json.Marshal(b.coldSemantic)
+		if err != nil {
+			return err
+		}
+		next := *b.expected
+		next.InputFingerprint = contractInputHash(append([]byte(contractCoreInputVersion+":full:"+b.repo+":"), identity...))
+		next.Accepted = true
+		changes := []contractCoreInputChange{{FilePath: b.repo + "/", Delta: contractBoundaryDelta{Scope: graph.ContractWorkScope{Unknown: true, Causes: []string{"full_core_census_complete"}}}}}
+		work, err := contractCoreWorkForChanges(b.generation, next, changes)
+		if err != nil {
+			return err
+		}
+		if err := b.store.SetContractInputStateWithWorkContext(ctx, b.expected, next, work); err != nil {
+			return err
+		}
+		if err := b.store.SetContractBoundaryReceiptBaselineContext(ctx, graph.ContractBoundaryReceiptBaseline{RepoPrefix: b.repo, CheckoutID: b.checkout, Version: contractBoundaryReceiptVersion, Fingerprint: next.InputFingerprint}); err != nil {
+			return err
+		}
+		b.state, b.expected = &next, &next
+		b.fullNamespace = false
+	}
 	if b.headerPending && !b.recovering {
 		if err := b.store.AcceptContractInputMutationWithReceiptsContext(ctx, *b.expected, nil); err != nil {
 			return err
@@ -338,4 +379,10 @@ func (b *contractCoreStorageBackend) flushColdRows(ctx context.Context) error {
 	b.coldSources = nil
 	b.coldBytes = 0
 	return nil
+}
+
+func (b *contractCoreStorageBackend) hasPendingColdNamespace() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cold
 }

@@ -1292,6 +1292,11 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		fields = append(fields, phaseFields("delta_", out.Phases)...)
 		b.Logger.Info("indexer: working-tree edit delta", fields...)
 	}
+	if journal := idx.contractCoreInputs; journal != nil {
+		if err := journal.accept(nil); err != nil {
+			return out, err
+		}
+	}
 	out.carryRegistry = editDeltaRegistryCarry(idx, req.Base, b.Store, req.RepoPrefix, req.WorkspaceID, req.ProjectID)
 	out.contractInputWitness = idx.contractInputWitness
 	return out, nil

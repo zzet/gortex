@@ -158,7 +158,10 @@ func (j *contractCoreInputJournal) accept(coreErr error) error {
 		return err
 	}
 	if len(j.begun) == 0 {
-		return nil
+		storage, ok := j.backend.(*contractCoreStorageBackend)
+		if !ok || !storage.hasPendingColdNamespace() {
+			return nil
+		}
 	}
 	if err := j.backend.AcceptBoundaryMutation(j.ctx); err != nil {
 		return err
