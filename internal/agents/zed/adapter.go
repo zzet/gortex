@@ -60,6 +60,17 @@ func userSettingsPath(home string) string {
 	}
 }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return filepath.Join(env.Root, ".rules")
+}
+
+
 // Detect checks for the zed CLI on PATH or the platform-specific
 // settings.json directory.
 func (a *Adapter) Detect(env agents.Env) (bool, error) {

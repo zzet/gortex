@@ -59,6 +59,17 @@ var v060AlwaysAllow = []string{
 	"diff_context", "index_health", "get_symbol_history", "scaffold", "batch_edit", "flow_between", "taint_paths", "find_clones",
 }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return filepath.Join(env.Root, ".clinerules", "gortex-communities.md")
+}
+
+
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	if env.Home == "" {
 		return false, nil

@@ -69,6 +69,17 @@ func New() *Adapter                { return &Adapter{} }
 func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return filepath.Join(env.Root, "AGENTS.md")
+}
+
+
 // Detect reports whether Pi is in use: a project-local `.pi/` dir, a
 // user-level `~/.pi/`, or the `pi` CLI on PATH.
 func (a *Adapter) Detect(env agents.Env) (bool, error) {

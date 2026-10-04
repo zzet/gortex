@@ -84,10 +84,25 @@ func New() *Adapter                { return &Adapter{} }
 func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
 
+// WritesSkillFiles reports that this adapter installs the generated
+// community skills as files under .copilot/skills.
+func (a *Adapter) WritesSkillFiles() bool { return true }
+
 // lookCopilotBinary is a seam so the "no Copilot installed" detection
 // test stays hermetic on a developer machine that happens to have the
 // CLI on PATH.
 var lookCopilotBinary = func() (string, error) { return exec.LookPath("copilot") }
+
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return repoInstructionsPath(env.Root)
+}
+
 
 // Detect looks for the `copilot` binary or an existing config home.
 // Deliberately never keys off .vscode — Copilot-in-VS-Code is the

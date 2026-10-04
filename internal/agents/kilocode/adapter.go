@@ -64,6 +64,17 @@ func globalStoragePaths(home string) []string {
 	return paths
 }
 
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return filepath.Join(env.Root, ".kilocoderules")
+}
+
+
 func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	// Project-level hint: .kilocode/ in the repo.
 	if _, err := os.Stat(filepath.Join(env.Root, ".kilocode")); err == nil {

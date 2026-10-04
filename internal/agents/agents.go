@@ -36,6 +36,36 @@ type Adapter interface {
 	Apply(env Env, opts ApplyOpts) (*Result, error)
 }
 
+// SkillFilesWriter is implemented by adapters that deliver the
+// generated community skills as on-disk files (SKILL.md trees). Adapters
+// without a native skills system — Pi, Cursor, aider, … — only merge the
+// communities routing block into their instruction file and must NOT
+// implement it: the init stage summary uses the distinction so it never
+// claims skill files that are never written.
+type SkillFilesWriter interface {
+	WritesSkillFiles() bool
+}
+
+// RoutingBlockWriter is implemented by adapters that merge the
+// communities routing block (env.SkillsRouting) into an instruction
+// file. The four skill-file adapters implement it too — their
+// instruction file carries the block as well — while MCP/KI-only
+// adapters (antigravity, kimi, kiro, …) implement neither, so the init
+// stage summary counts delivery mechanisms from declarations instead of
+// assuming every non-skill-file adapter routes. The path is declared as
+// well: several adapters share one instruction file (four of them
+// upsert into the repo's AGENTS.md, vscode and copilot-cli into
+// .github/copilot-instructions.md), so the summary counts distinct
+// files, not adapters.
+type RoutingBlockWriter interface {
+	WritesCommunitiesRouting() bool
+
+	// CommunitiesRoutingPath reports the instruction file (project
+	// mode) that carries the communities routing block. It must return
+	// the same path the adapter's Plan/Apply write the block to.
+	CommunitiesRoutingPath(env Env) string
+}
+
 // Mode selects between per-repo and user-level installation.
 // `gortex init` runs adapters in ModeProject; `gortex install` runs
 // them in ModeGlobal. Adapters branch on this to choose between
