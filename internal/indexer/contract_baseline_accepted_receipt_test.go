@@ -19,6 +19,10 @@ func TestContractBaselineAcceptedReceiptMatchesRawParserFacts(t *testing.T) {
 	parsed, err := idx.ExtractBuffer(file.Language, "routes.go", src)
 	require.NoError(t, err)
 	defer parsed.ReleaseTree()
+	// Accepted foreground extraction applies this policy after the raw
+	// extractor. Compare the same accepted facts, including constant metadata.
+	stampParseErrors(parsed)
+	normalizeExtractionMetadata(parsed, src)
 	want, err := idx.collectContractBoundaryReceipt(ctx, file.Path, file.Language, src, parsed)
 	require.NoError(t, err)
 	require.NotEmpty(t, want.Groups, "constant-derived endpoint must be reconstructed")
