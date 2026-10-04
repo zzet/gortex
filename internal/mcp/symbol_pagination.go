@@ -157,11 +157,21 @@ func (cache *symbolPageCache) add(entry *symbolPageSequence) bool {
 // retrieval seed. Random IDs remain lifetime-scoped: retirement or expiry
 // never recreates the ownership of an earlier cursor.
 func (cache *symbolPageCache) publishFirst(entry *symbolPageSequence) (*symbolPageSequence, bool) {
+	winner, live, _ := cache.publishFirstValidated(entry, nil)
+	return winner, live
+}
+
+func (cache *symbolPageCache) publishFirstValidated(entry *symbolPageSequence, validate func() *mcplib.CallToolResult) (*symbolPageSequence, bool, *mcplib.CallToolResult) {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	if cache.closed {
 		entry.retire()
-		return nil, false
+		return nil, false, nil
+	}
+	if validate != nil {
+		if refused := validate(); refused != nil {
+			return nil, false, refused
+		}
 	}
 	if entry.firstSeed != "" {
 		for _, id := range append([]string(nil), cache.order...) {
@@ -175,7 +185,7 @@ func (cache *symbolPageCache) publishFirst(entry *symbolPageSequence) (*symbolPa
 				existing.retire()
 				continue
 			}
-			return existing, true
+			return existing, true, nil
 		}
 	}
 	for len(cache.order) >= symbolPageCacheEntries {
@@ -185,7 +195,7 @@ func (cache *symbolPageCache) publishFirst(entry *symbolPageSequence) (*symbolPa
 	}
 	cache.entries[entry.id] = entry
 	cache.order = append(cache.order, entry.id)
-	return entry, true
+	return entry, true, nil
 }
 
 func symbolFirstPageSeed(identity string, template []byte, candidates []symbolPageCandidate, horizon int, more bool) string {
@@ -476,39 +486,80 @@ func (s *Server) publishSymbolPage(ctx context.Context, req mcplib.CallToolReque
 		return result, nil
 	}
 	if refill == nil {
-		winner, live := s.symbolPages(ctx).publishFirst(entry)
-		if !live {
-			return symbolPageError("session ended"), nil
+		cache := s.symbolPages(ctx)
+		if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
+			state.page = &provisionalSymbolPage{ctx: ctx, cache: cache, entry: entry, result: result}
+			published = true // the outer exactness gate now owns this storage
+			return result, nil
 		}
-		if winner != entry {
-			admitted, err := winner.acquire(ctx)
-			if err != nil {
-				return nil, err
-			}
-			if !admitted {
-				return symbolPageError("expired or was evicted"), nil
-			}
-			defer func() {
-				if winner.retired.Load() {
-					winner.storage.close()
-				}
-				winner.token <- struct{}{}
-			}()
-			replay, ok, err := winner.storage.replay(ctx, 0)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				return symbolPageError("first page is unavailable"), nil
-			}
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			return cloneSymbolResult(replay.result), nil
-		}
+		winnerResult, kept, err := publishFirstSymbolPage(ctx, cache, entry, result, nil)
+		published = kept
+		return winnerResult, err
 	}
 	published = true
 	return result, nil
+}
+
+// A strict fresh search keeps new continuation storage private until its outer
+// exactness guard accepts. Aborting it never touches another call's cursor.
+type provisionalSymbolPage struct {
+	ctx    context.Context
+	cache  *symbolPageCache
+	entry  *symbolPageSequence
+	result *mcplib.CallToolResult
+}
+
+func (page *provisionalSymbolPage) publish(ctx context.Context, validate func() *mcplib.CallToolResult) (*mcplib.CallToolResult, error) {
+	result, kept, err := publishFirstSymbolPage(page.ctx, page.cache, page.entry, page.result, validate)
+	if !kept {
+		page.entry.retire()
+	}
+	return result, err
+}
+
+func publishFirstSymbolPage(ctx context.Context, cache *symbolPageCache, entry *symbolPageSequence, result *mcplib.CallToolResult, validate func() *mcplib.CallToolResult) (*mcplib.CallToolResult, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	winner, live, refusal := cache.publishFirstValidated(entry, validate)
+	if refusal != nil {
+		return refusal, false, nil
+	}
+	if !live {
+		return symbolPageError("session ended"), false, nil
+	}
+	if winner == entry {
+		return result, true, nil
+	}
+	admitted, err := winner.acquire(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if !admitted {
+		return symbolPageError("expired or was evicted"), false, nil
+	}
+	defer func() {
+		if winner.retired.Load() {
+			winner.storage.close()
+		}
+		winner.token <- struct{}{}
+	}()
+	replay, ok, err := winner.storage.replay(ctx, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return symbolPageError("first page is unavailable"), false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if validate != nil {
+		if refused := validate(); refused != nil {
+			return refused, false, nil
+		}
+	}
+	return cloneSymbolResult(replay.result), false, nil
 }
 
 func (s *Server) renderSymbolSequence(ctx context.Context, req mcplib.CallToolRequest, entry *symbolPageSequence, stage *symbolPageTransaction, template map[string]any, more bool) (*mcplib.CallToolResult, error) {
@@ -614,11 +665,15 @@ func (s *Server) renderSymbolSequence(ctx context.Context, req mcplib.CallToolRe
 	}
 	entry.pending = remaining
 	entry.nextPage++
-	session := entry.owner
-	if previousQuery, skipped := session.drainSkippedNegatives(); previousQuery != "" && len(skipped) > 0 {
-		s.combo.RecordNegative(previousQuery, skipped)
-	}
-	recordLastSearchFromNodes(session, entry.query, published)
+	afterFreshSymbolAcceptance(ctx, func() {
+		session := entry.owner
+		if previousQuery, skipped := session.drainSkippedNegatives(); previousQuery != "" && len(skipped) > 0 {
+			s.combo.RecordNegative(previousQuery, skipped)
+		}
+		recordLastSearchFromNodes(session, entry.query, published)
+	})
+	// Typed evidence is request-local and must reach facade reservation
+	// completion inside the handler. Durable session state waits for acceptance.
 	captureLocalizationSearchSymbols(ctx, published)
 	return result, nil
 }

@@ -95,7 +95,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 	// of this function) so it bounds the whole middleware chain, not just the
 	// leaf handler — the overlay build, the freshness sweep, and the response
 	// capture below all touch the graph and can block on the same locks.
-	return s.boundToolHandler(func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+	return s.boundToolHandler(s.retryFreshSymbolSearch(func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
 		// The instant the call entered the middleware: the origin a mutation's
 		// or a fresh request's publication phases are measured from.
 		ctx = withToolReceivedAt(ctx, time.Now())
@@ -338,6 +338,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// receive one. See refuseWithdrawnExactness.
 		if hErr == nil {
 			if refused := s.refuseWithdrawnExactness(req.Params.Name, requireExactView, view); refused != nil {
+				noteFreshSymbolWithdrawal(ctx, view, res)
 				// A late refusal is still a call that RAN, unlike every other
 				// refusal in this middleware, so the two ledgers that count
 				// calls rather than answers are booked here before the return.
@@ -354,6 +355,16 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 					s.queryLog.record(s, ctx, req, refused, nil, qStart)
 				}
 				return refused, nil
+			}
+		}
+		if hErr == nil && res != nil && !res.IsError {
+			res, hErr = s.commitFreshSymbolPage(ctx, res, req.Params.Name, view)
+			if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil && state.withdrawn {
+				s.recorder.Record("mcp_tool_call", req.Params.Name)
+				if logQuery {
+					s.queryLog.record(s, ctx, req, res, hErr, qStart)
+				}
+				return res, hErr
 			}
 		}
 		// Book the retrieval half of the savings ledger for a DIRECT legacy
@@ -412,7 +423,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			res = s.maybeAttachMomentumNote(ctx, req.Params.Name, res)
 		}
 		return res, hErr
-	})
+	}))
 }
 
 // refuseWithdrawnExactness is require_exact's post-handler half: it refuses an

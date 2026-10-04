@@ -132,6 +132,13 @@ func (f requestFreshness) requested() bool { return f.requireFresh }
 // answer to get out. The margin is the same one boundToolHandler uses against
 // an inherited transport deadline, and for the same reason.
 func (f requestFreshness) effectiveDeadline(now time.Time, ctx context.Context) time.Time {
+	// A bounded answer-assembly retry shares the outer call's ceiling. Keep it
+	// out of tool arguments, which are also part of continuation identity.
+	if ctx != nil {
+		if deadline, ok := ctx.Value(freshSymbolDeadlineKey{}).(time.Time); ok {
+			return deadline
+		}
+	}
 	deadline := now.Add(freshnessDefaultWait)
 	if f.hasDeadline {
 		deadline = f.deadline

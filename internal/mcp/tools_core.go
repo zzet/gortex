@@ -1784,7 +1784,11 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		if !live {
 			return symbolPageError("session ended"), nil
 		}
-		defer call.finish()
+		if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
+			state.finish = append(state.finish, call.finish)
+		} else {
+			defer call.finish()
+		}
 		ctx = context.WithValue(owned, symbolPageCacheKey{}, cache)
 	}
 	if ctx.Value(symbolPageRefillKey{}) == nil {
