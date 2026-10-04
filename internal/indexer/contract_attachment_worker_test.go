@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/search"
 	"go.uber.org/zap"
 )
 
@@ -545,6 +546,10 @@ func TestContractFollowupRetainsDerivedSpringBeanCallsOnlyInAnalysis(t *testing.
 	for _, edge := range rows[source] {
 		if edge.Kind == graph.EdgeCalls && edge.Meta["via"] == "spring.Bean" {
 			links++
+			endpoints, readErr := req.Payload.GetNodesByIDsContext(context.Background(), []string{edge.From, edge.To})
+			if readErr != nil || endpoints[edge.From] == nil || endpoints[edge.To] == nil {
+				t.Fatalf("derived Spring call endpoint unavailable=%#v %v", endpoints, readErr)
+			}
 			if edge.Meta["bean_of"] != "Clock" {
 				t.Fatalf("wrong accepted bean target=%#v", edge)
 			}
@@ -561,5 +566,56 @@ func TestContractFollowupRetainsDerivedSpringBeanCallsOnlyInAnalysis(t *testing.
 		if edge.Meta["via"] == "spring.Bean" {
 			t.Fatal("worker mutated ordinary core Spring calls")
 		}
+	}
+}
+
+func TestContractFollowupIndexesSyntheticSearchOnlyInPayload(t *testing.T) {
+	f := newContractWorkerFixture(t)
+	req := f.request(t, "repo-a", "fts-analysis")
+	report, err := RunContractFollowup(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Published || report.SymbolDocuments < 2 || report.FTSDuration <= 0 {
+		t.Fatalf("missing actual analysis FTS=%#v", report)
+	}
+	hits, err := req.Payload.SearchSymbolsContext(context.Background(), "items", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint, bridge := false, false
+	for _, hit := range hits {
+		nodes, err := req.Payload.GetNodesByIDsContext(context.Background(), []string{hit.NodeID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		node := nodes[hit.NodeID]
+		if node == nil {
+			t.Fatal("FTS returned absent node")
+		}
+		if node.ID == "http::GET::/v1/items" {
+			endpoint = true
+		}
+		if node.Kind == graph.KindContractBridge {
+			bridge = true
+		}
+		if node.Kind != graph.KindContract && node.Kind != graph.KindContractBridge && node.Kind != graph.KindConfigKey {
+			t.Fatalf("ordinary declaration indexed in isolated FTS=%#v", node)
+		}
+	}
+	if !endpoint || !bridge {
+		t.Fatalf("actual worker canonical/bridge not searchable: %#v", hits)
+	}
+	count, err := req.Payload.SymbolFTSCount()
+	if err != nil || count != report.SymbolDocuments {
+		t.Fatalf("FTS document count mismatch=%d %#v %v", count, report, err)
+	}
+	mode, known, err := req.Payload.GetSymbolFTSNormalization("repo-a")
+	if err != nil || !known || mode != search.FTSNormalizationMode() {
+		t.Fatalf("normalization not certified=%s %v %v", mode, known, err)
+	}
+	ordinaryCount, err := f.store.SymbolFTSCount()
+	if err != nil || ordinaryCount != 0 {
+		t.Fatalf("worker modified core FTS=%d %v", ordinaryCount, err)
 	}
 }

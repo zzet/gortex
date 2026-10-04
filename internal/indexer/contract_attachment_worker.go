@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/search"
 	"go.uber.org/zap"
 )
 
@@ -94,6 +95,8 @@ type ContractFollowupReport struct {
 	ScratchNodes, ScratchEdges                       int
 	ScratchBytes                                     int64
 	PrepareDuration                                  time.Duration
+	SymbolDocuments                                  int
+	FTSDuration                                      time.Duration
 	Published                                        bool
 }
 
@@ -530,6 +533,64 @@ func runContractFollowupPrepared(ctx context.Context, req ContractFollowupReques
 	}
 	report.Nodes = len(nodes)
 	report.Edges = len(edges)
+	ftsStart := time.Now()
+	seenDocuments := make(map[string]bool)
+	documentRepos := map[string]bool{snap.Key.RepoPrefix: true}
+	var documents []graph.SymbolFTSItem
+	flushDocuments := func() error {
+		if len(documents) == 0 {
+			return nil
+		}
+		if err := req.Yield(ctx); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := req.Payload.BatchUpsertSymbolFTS(documents); err != nil {
+			return err
+		}
+		documents = documents[:0]
+		return nil
+	}
+	documentBytes := 0
+	for _, node := range nodes {
+		if node.Kind != graph.KindContract && node.Kind != graph.KindContractBridge && node.Kind != graph.KindConfigKey {
+			continue
+		}
+		if seenDocuments[node.ID] {
+			continue
+		}
+		seenDocuments[node.ID] = true
+		documentRepos[node.RepoPrefix] = true
+		tokens := ftsTokensFor(node, "")
+		documents = append(documents, graph.SymbolFTSItem{NodeID: node.ID, Tokens: tokens})
+		report.SymbolDocuments++
+		documentBytes += len(node.ID) + len(tokens)
+		if len(documents) >= symbolFTSDirectChunkRows || documentBytes >= symbolFTSDirectChunkBytes {
+			if err := flushDocuments(); err != nil {
+				return report, err
+			}
+			documentBytes = 0
+		}
+	}
+	if err := flushDocuments(); err != nil {
+		return report, err
+	}
+	repos := make([]string, 0, len(documentRepos))
+	for repo := range documentRepos {
+		repos = append(repos, repo)
+	}
+	sort.Strings(repos)
+	for _, repo := range repos {
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+		if err := req.Payload.SetSymbolFTSNormalization(repo, search.FTSNormalizationMode()); err != nil {
+			return report, err
+		}
+	}
+	report.FTSDuration = time.Since(ftsStart)
 	if err := req.Payload.SetProducerState(store_sqlite.ProducerCompleteness{Producer: "graph.contracts", State: store_sqlite.ProducerStateComplete}); err != nil {
 		return report, err
 	}
@@ -655,6 +716,8 @@ func (e *contractFollowupEvidence) AddBatch(nodes []*graph.Node, edges []*graph.
 	}
 	for _, edge := range edges {
 		if edge != nil && (edge.Kind == graph.EdgeReadsConfig || (edge.Kind == graph.EdgeCalls && edge.Meta["via"] == "spring.Bean")) {
+			e.outputIDs[edge.From] = true
+			e.outputIDs[edge.To] = true
 			encoded, encodeErr := json.Marshal(edge)
 			if encodeErr != nil {
 				e.fail(encodeErr)
