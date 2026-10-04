@@ -3694,6 +3694,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 
 	_, contractExtractorsByLang := idx.buildPerFileContractExtractors()
 	contractReg := contracts.NewRegistry()
+	var constantContractMu sync.Mutex
+	var constantContractFiles []coldConstantContractInput
 	var contractMu sync.Mutex
 
 	var errMu sync.Mutex
@@ -4093,9 +4095,17 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					if !skipped && !omitSecondarySourceScans && fileGraphPath != "" {
 						exts := contractExtractorsByLang[lang]
 						if len(exts) > 0 {
-							c := idx.runContractExtractorsForFile(
-								fileGraphPath, src, result.Nodes, fileScopeEdges, exts, result.Tree)
+							var constantLookupAttempted bool
+							c := idx.runContractExtractorsForFileObserved(
+								fileGraphPath, src, result.Nodes, fileScopeEdges, exts, result.Tree, &constantLookupAttempted)
 							localContracts = append(localContracts, c...)
+							if constantLookupAttempted {
+								constantContractMu.Lock()
+								constantContractFiles = append(constantContractFiles, coldConstantContractInput{
+									path: fileGraphPath, language: lang, source: append([]byte(nil), src...), mtime: wf.mtimeNano,
+								})
+								constantContractMu.Unlock()
+							}
 
 							// Populate the per-file contract cache so a
 							// later incremental reconciliation can skip this file
@@ -4378,6 +4388,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	idx.parseErrorsMu.Unlock()
 	idx.totalDetected = len(files)
 	idx.lastIndexTime = time.Now()
+	if err := idx.refreshColdConstantContractFiles(ctx, contractReg, constantContractFiles, contractExtractorsByLang); err != nil {
+		return nil, err
+	}
 
 	if coldManifests != nil {
 		coldManifests.registry = contractReg
@@ -7090,6 +7103,18 @@ func (idx *Indexer) runContractExtractorsForFile(
 	exts []contracts.Extractor,
 	tree *parser.ParseTree,
 ) []contracts.Contract {
+	return idx.runContractExtractorsForFileObserved(graphPath, src, fileNodes, fileEdges, exts, tree, nil)
+}
+
+func (idx *Indexer) runContractExtractorsForFileObserved(
+	graphPath string,
+	src []byte,
+	fileNodes []*graph.Node,
+	fileEdges []*graph.Edge,
+	exts []contracts.Extractor,
+	tree *parser.ParseTree,
+	constantLookupAttempted *bool,
+) []contracts.Contract {
 	if len(exts) == 0 {
 		return nil
 	}
@@ -7107,6 +7132,9 @@ func (idx *Indexer) runContractExtractorsForFile(
 	var endpointStore contracts.EndpointConstStore
 	if es, ok := idx.graph.(contracts.EndpointConstStore); ok {
 		endpointStore = es
+		if constantLookupAttempted != nil {
+			endpointStore = observedEndpointConstants{EndpointConstStore: es, attempted: constantLookupAttempted}
+		}
 	}
 	for _, ex := range exts {
 		var found []contracts.Contract
