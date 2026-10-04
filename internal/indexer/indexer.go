@@ -626,7 +626,8 @@ type Indexer struct {
 	affectedByDeltaHook func(graphPath string, keys []string)
 	// contractRegistryLoad is the time ensureIncrementalContractRegistry
 	// spent reading the registry from the graph (a per-file delta reports it).
-	contractRegistryLoad time.Duration
+	contractRegistryLoad       time.Duration
+	contractRegistryLoadPhases *contractRegistryLoadPhases
 	// applyLaps times one structural graph apply (incremental_apply_laps.go).
 	applyLaps *applyLaps
 	// storeWaits, when set, reads the store's cumulative waits

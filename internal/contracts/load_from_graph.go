@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"sort"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -22,21 +23,65 @@ func persistedContractKey(c Contract) persistedContractRecordKey {
 // identities: a canonical node's last-writer scope does not own every record.
 // Empty prefix remains the exact single-repository namespace, not global.
 func LoadRegistryFromGraph(g graph.Store, repoPrefix string) *Registry {
-	return loadRegistryFromGraph(g, repoPrefix, "", "", false)
+	return loadRegistryFromGraph(g, repoPrefix, "", "", false, nil)
 }
 
 // LoadRegistryFromGraphWithScope restores an indexer's legacy scope while
 // preserving explicitly persisted owner scope, including empty strings. The
 // ordinary loader continues to derive its fallback from the canonical node.
 func LoadRegistryFromGraphWithScope(g graph.Store, repoPrefix, workspaceID, projectID string) *Registry {
-	return loadRegistryFromGraph(g, repoPrefix, workspaceID, projectID, true)
+	return loadRegistryFromGraph(g, repoPrefix, workspaceID, projectID, true, nil)
 }
 
-func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID string, useScope bool) *Registry {
+// RegistryLoadStats describes one restoration, without shared counters. Read
+// phases include their projection/filtering work; construction covers decoding,
+// deduplication and registry indexing, excluding the legacy liveness read phase.
+type RegistryLoadStats struct {
+	OwnerEdgesMS          float64 `json:"owner_edges_ms"`
+	ScopedNodesMS         float64 `json:"scoped_nodes_ms"`
+	MissingTargetsMS      float64 `json:"missing_targets_ms"`
+	LegacyLivenessMS      float64 `json:"legacy_liveness_ms"`
+	ConstructionMS        float64 `json:"construction_ms"`
+	OwnerEdgeRows         int     `json:"owner_edge_rows"`
+	ScopedNodeRows        int     `json:"scoped_node_rows"`
+	MissingTargetIDs      int     `json:"missing_target_ids"`
+	MissingTargetBatches  int     `json:"missing_target_batches"`
+	MissingTargetRows     int     `json:"missing_target_rows"`
+	LegacyCandidateIDs    int     `json:"legacy_candidate_ids"`
+	LegacyLivenessBatches int     `json:"legacy_liveness_batches"`
+	RecoveredRecords      int     `json:"recovered_records"`
+}
+
+// LoadRegistryFromGraphWithScopeAndStats is the observed sibling of the scoped
+// loader. Existing entrypoints avoid clock reads and return identical records.
+func LoadRegistryFromGraphWithScopeAndStats(g graph.Store, repoPrefix, workspaceID, projectID string) (*Registry, RegistryLoadStats) {
+	var stats RegistryLoadStats
+	registry := loadRegistryFromGraph(g, repoPrefix, workspaceID, projectID, true, &stats)
+	return registry, stats
+}
+
+func registryLoadStart(stats *RegistryLoadStats) time.Time {
+	if stats == nil {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+func registryLoadMillis(start time.Time) float64 {
+	return float64(time.Since(start).Nanoseconds()) / 1e6
+}
+
+func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID string, useScope bool, stats *RegistryLoadStats) *Registry {
 	if g == nil {
 		return nil
 	}
+	started := registryLoadStart(stats)
 	owners := graph.ReadRepoEdgesByKinds(g, []string{repoPrefix}, []graph.EdgeKind{graph.EdgeProvides, graph.EdgeConsumes})
+	if stats != nil {
+		stats.OwnerEdgesMS = registryLoadMillis(started)
+		stats.OwnerEdgeRows = len(owners)
+	}
+	started = registryLoadStart(stats)
 	nodes := make(map[string]*graph.Node)
 	rememberNode := func(node *graph.Node) {
 		if node != nil && node.ID != "" && node.Kind == graph.KindContract {
@@ -47,12 +92,22 @@ func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID str
 		// Retain the original branch's backend-defined exact empty scope.
 		for _, node := range g.GetRepoNodes("") {
 			rememberNode(node)
+			if stats != nil {
+				stats.ScopedNodeRows++
+			}
 		}
 	} else {
 		for node := range graph.NodesInScopeSeq(g, []string{repoPrefix}, nil, graph.KindContract) {
 			rememberNode(node)
+			if stats != nil {
+				stats.ScopedNodeRows++
+			}
 		}
 	}
+	if stats != nil {
+		stats.ScopedNodesMS = registryLoadMillis(started)
+	}
+	started = registryLoadStart(stats)
 	missing := make(map[string]struct{})
 	for _, row := range owners {
 		if row.Edge != nil && row.Edge.To != "" && nodes[row.Edge.To] == nil {
@@ -64,11 +119,24 @@ func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID str
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	if stats != nil {
+		stats.MissingTargetIDs = len(ids)
+	}
 	for start := 0; start < len(ids); start += 128 {
+		if stats != nil {
+			stats.MissingTargetBatches++
+		}
 		for _, node := range g.GetNodesByIDs(ids[start:min(start+128, len(ids))]) {
 			rememberNode(node)
+			if stats != nil {
+				stats.MissingTargetRows++
+			}
 		}
 	}
+	if stats != nil {
+		stats.MissingTargetsMS = registryLoadMillis(started)
+	}
+	started = registryLoadStart(stats)
 	registry := NewRegistry()
 	seenRecords := make(map[string][]Contract)
 	ownerIdentities := make(map[persistedContractRecordKey]struct{})
@@ -92,6 +160,9 @@ func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID str
 			seenRecords[key] = append(seenRecords[key], c)
 		}
 		registry.Add(c)
+		if stats != nil {
+			stats.RecoveredRecords++
+		}
 	}
 	// A scalar payload for an existing owner identity is stale fallback, not
 	// another owner merely because its confidence/type/metadata differs.
@@ -113,6 +184,10 @@ func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID str
 		}
 		add(c)
 	}
+	if stats != nil {
+		stats.ConstructionMS += registryLoadMillis(started)
+	}
+	started = registryLoadStart(stats)
 	scalarLiveness := false
 	if guarantee, ok := g.(graph.ContractOwnerScalarLiveness); ok {
 		scalarLiveness = guarantee.ContractOwnerScalarLivenessGuaranteed()
@@ -133,7 +208,13 @@ func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID str
 			}
 		}
 		sort.Strings(candidates)
+		if stats != nil {
+			stats.LegacyCandidateIDs = len(candidates)
+		}
 		for start := 0; start < len(candidates); start += 128 {
+			if stats != nil {
+				stats.LegacyLivenessBatches++
+			}
 			for id, incoming := range g.GetInEdgesByNodeIDs(candidates[start:min(start+128, len(candidates))]) {
 				for _, edge := range incoming {
 					if edge != nil && (edge.Kind == graph.EdgeProvides || edge.Kind == graph.EdgeConsumes || edge.Kind == graph.EdgeHandlesRoute) {
@@ -144,6 +225,10 @@ func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID str
 			}
 		}
 	}
+	if stats != nil {
+		stats.LegacyLivenessMS = registryLoadMillis(started)
+	}
+	started = registryLoadStart(stats)
 	var sparseOwnerIdentities map[persistedContractRecordKey]struct{}
 	ids = ids[:0]
 	for id := range nodes {
@@ -186,7 +271,11 @@ func loadRegistryFromGraph(g graph.Store, repoPrefix, workspaceID, projectID str
 			add(c)
 		}
 	}
-	if len(registry.All()) == 0 {
+	empty := len(registry.All()) == 0
+	if stats != nil {
+		stats.ConstructionMS += registryLoadMillis(started)
+	}
+	if empty {
 		return nil
 	}
 	return registry

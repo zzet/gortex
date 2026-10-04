@@ -218,17 +218,29 @@ func (idx *Indexer) refreshIncrementalContractManifests(files []string) (Derived
 	return plan, appendUniqueSorted(nil, failed...)
 }
 
+type contractRegistryLoadPhases struct {
+	contracts.RegistryLoadStats
+	CopyMS        float64 `json:"copy_ms"`
+	CopiedRecords int     `json:"copied_records"`
+}
+
 func (idx *Indexer) ensureIncrementalContractRegistry() *contracts.Registry {
 	if idx.contractRegistry != nil {
 		return idx.contractRegistry
 	}
 	started := time.Now()
 	reg := contracts.NewRegistry()
-	if restored := contracts.LoadRegistryFromGraphWithScope(idx.graph, idx.repoPrefix, idx.workspaceID, idx.projectID); restored != nil {
+	restored, stats := contracts.LoadRegistryFromGraphWithScopeAndStats(idx.graph, idx.repoPrefix, idx.workspaceID, idx.projectID)
+	phases := &contractRegistryLoadPhases{RegistryLoadStats: stats}
+	copyStarted := time.Now()
+	if restored != nil {
 		for _, c := range restored.ByRepo(idx.repoPrefix) {
 			reg.Add(c)
+			phases.CopiedRecords++
 		}
 	}
+	phases.CopyMS = float64(time.Since(copyStarted).Nanoseconds()) / 1e6
+	idx.contractRegistryLoadPhases = phases
 	idx.contractRegistry = reg
 	idx.contractRegistryLoad += time.Since(started)
 	return reg

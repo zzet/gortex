@@ -1202,6 +1202,9 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			// delta's writes and evictions grow with it until a fold.
 			zap.Int("chain_depth", len(dw.StackShape())-1),
 		}
+		if idx.contractRegistryLoadPhases != nil {
+			fields = append(fields, zap.Any("contract_registry_phases", idx.contractRegistryLoadPhases))
+		}
 		fields = append(fields, zap.String("stack_cache_key", editDeltaKeyDigest(out.StackCacheKey)),
 			zap.Int("chain_layers_overlaid", out.ChainLayersOverlaid))
 		if keeper := dw.ChainLayerRowsKeeper(); keeper != nil {

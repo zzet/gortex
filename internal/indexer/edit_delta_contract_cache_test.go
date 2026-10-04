@@ -89,6 +89,9 @@ func TestEditDeltaContractCacheServesTheLoadedRegistry(t *testing.T) {
 	if seedEditDeltaContractRegistry(first, "key") {
 		t.Fatal("the first delta hit an empty cache")
 	}
+	if first.contractRegistryLoadPhases == nil || first.contractRegistryLoadPhases.CopiedRecords == 0 {
+		t.Fatal("registry restoration did not record its load/copy phases")
+	}
 	second := fresh()
 	if !seedEditDeltaContractRegistry(second, "key") {
 		t.Fatal("the second delta over the same stack missed the cache")
@@ -98,6 +101,10 @@ func TestEditDeltaContractCacheServesTheLoadedRegistry(t *testing.T) {
 	}
 	if second.contractRegistryLoad != 0 {
 		t.Errorf("a hit still read the registry from the graph (%s)", second.contractRegistryLoad)
+	}
+
+	if second.contractRegistryLoadPhases != nil {
+		t.Fatal("a cache hit reports phases for a registry load it did not perform")
 	}
 
 	// The second delta's engine edits its copy.
