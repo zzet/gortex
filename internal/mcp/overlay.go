@@ -285,6 +285,16 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		if refused := s.refuseRoutedViewMutation(ctx, req.Params.Name); refused != nil {
 			return refused, nil
 		}
+		if !viewless {
+			var contractRefusal *mcp.CallToolResult
+			ctx, contractRefusal = s.prepareContractConsumer(ctx, req, freshness, capabilities)
+			if contractRefusal != nil {
+				return contractRefusal, nil
+			}
+			if binding := contractAnalysisFromContext(ctx); binding != nil {
+				defer binding.close()
+			}
+		}
 		// What the view can answer, checked against what this operation
 		// needs, before the handler runs — a thin view must refuse rather
 		// than answer thinly and look complete doing it.
@@ -306,6 +316,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 		}
+		if status := contractConsumerStatusFromContext(ctx); status != nil && status.mode == contractConsumerRequired && OverlayViewFromContext(ctx) != nil {
+			return mcp.NewToolResultError(graphview.NewViewError(graphview.CodeRequiredCapabilityIncomplete,
+				"accepted contract analysis does not certify unpublished editor buffers").Error()), nil
+		}
 		// Warmup fast path: when the daemon is still warming up and
 		// this is a graph-querying tool, the handler still runs (so
 		// the caller gets a best-effort partial answer from the part
@@ -326,6 +340,11 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		}
 		indexer.StampPublicationPhase(ctx, indexer.PublicationHandlerStarted)
 		res, hErr := h(ctx, req)
+		if status := contractConsumerStatusFromContext(ctx); status != nil && status.mode == contractConsumerRequired && hErr == nil && res != nil {
+			if err := contractAnalysisFromContext(ctx).validate(ctx); err != nil {
+				res = mcp.NewToolResultError(err.Error())
+			}
+		}
 		if view != nil && view.sourceFallback != nil {
 			view = view.sourceFallback
 			ctx = withRequestView(ctx, view)
@@ -402,6 +421,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			// must say so where the caller already looks for provenance.
 			res = s.attachViewRider(ctx, res)
 			res = s.attachCheckoutControlScope(ctx, res)
+			res = decorateContractConsumerResult(ctx, res)
 		}
 		// The arg guard's warn rider lands here — after the warming and
 		// freshness decorators, both of which rebuild the text result from

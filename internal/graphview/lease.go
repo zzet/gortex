@@ -388,6 +388,17 @@ func (m *LeaseManager) AcquireBaseCorpus(prefix string) *BasePin {
 //     it did not observe, and must not claim exactness it cannot support
 //     either — what it says about an unwitnessed corpus is its own contract.
 func (p *BasePin) ValidateCurrent() error {
+	return p.validateCurrent(false)
+}
+
+// ValidateAcceptedCurrent additionally requires the captured and current raw
+// source to be accepted. Stable observation of an in-progress or interrupted
+// apply is not authority for publishing a background contract baseline.
+func (p *BasePin) ValidateAcceptedCurrent() error {
+	return p.validateCurrent(true)
+}
+
+func (p *BasePin) validateCurrent(requireAccepted bool) error {
 	if p == nil || p.mgr == nil {
 		return ErrBaseCorpusUnwitnessed
 	}
@@ -402,7 +413,7 @@ func (p *BasePin) ValidateCurrent() error {
 	}
 	current := p.mgr.observeRawSource(p.state)
 	if current == p.witness {
-		if !p.witness.present {
+		if !p.witness.present || (requireAccepted && !p.witness.available) {
 			return ErrBaseCorpusUnwitnessed
 		}
 		return nil

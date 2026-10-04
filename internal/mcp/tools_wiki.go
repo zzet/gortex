@@ -98,7 +98,7 @@ func (s *Server) handleGenerateWiki(ctx context.Context, req mcp.CallToolRequest
 	cycles := analysis.DetectCycles(g, communities, "")
 
 	var contractList []contracts.Contract
-	if reg := s.effectiveContractRegistry(); reg != nil {
+	if reg := s.optionalContractRegistryForContext(ctx); reg != nil {
 		contractList = reg.All()
 	}
 

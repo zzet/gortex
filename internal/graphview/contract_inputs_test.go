@@ -164,3 +164,47 @@ func TestSelectedContractInputsComposeCompanionsAndFailClosed(t *testing.T) {
 	require.Error(t, err)
 	require.Nil(t, capture)
 }
+
+func TestSelectedContractCompanionInputsCaptureActualPositiveAbsence(t *testing.T) {
+	store := openTestStore(t)
+	companionNode := &graph.Node{ID: "other/companion.go::Handler", Kind: graph.KindFunction, FilePath: "other/companion.go", RepoPrefix: "other"}
+	store.AddNode(companionNode)
+	store.AddNode(&graph.Node{ID: stackRepo + "/primary.go::Obsolete", Kind: graph.KindFunction, FilePath: stackRepo + "/primary.go", RepoPrefix: stackRepo})
+	acceptPrimaryContractInput(t, store, nil, acceptedContractInput("other", "", "other-primary"))
+	generation := contractInputGeneration(t, store, "dedicated", 0, acceptedContractInput(stackRepo, testCheckoutID, "selected"))
+	m, view := materializeContractInputs(t, store, generation)
+	input, err := m.CaptureContractCompanionInputs(t.Context(), view, "other", testCheckoutID)
+	require.NoError(t, err)
+	require.Equal(t, testCheckoutID, input.State.CheckoutID)
+	require.Len(t, input.Witnesses, 2)
+	require.Zero(t, input.Witnesses[0].GenerationID)
+	require.True(t, input.Witnesses[0].Found)
+	require.Equal(t, generation, input.Witnesses[1].GenerationID)
+	require.False(t, input.Witnesses[1].Found)
+	require.Equal(t, testCheckoutID, input.Witnesses[1].State.CheckoutID)
+	require.NoError(t, input.Validate(t.Context()))
+	selected, err := m.CaptureContractInputs(t.Context(), view, stackRepo, testCheckoutID)
+	require.NoError(t, err)
+	cohort, err := ComposeSelectedContractInputs(stackRepo, testCheckoutID, selected, input)
+	require.NoError(t, err)
+	readers := cohort.SourceReaders()
+	require.Same(t, view.Reader, readers[stackRepo], "dedicated selected repository must never substitute primary source")
+	require.Nil(t, readers[stackRepo].GetNode(stackRepo+"/primary.go::Obsolete"))
+	require.Equal(t, companionNode.ID, readers["other"].GetNode(companionNode.ID).ID, "companion base-zero evidence survives dedicated-root exclusion")
+	delete(readers, "other")
+	require.NotNil(t, cohort.SourceReaders()["other"], "caller changes cannot alter captured source admission")
+	// The physical namespace absence cannot be rewritten by the caller to
+	// publish under a different actor, even if the logical key remains equal.
+	input.Witnesses[1].State.CheckoutID = "another-actor"
+	require.ErrorIs(t, input.Validate(t.Context()), graph.ErrContractProjectionStale)
+	input.Witnesses[1].State.CheckoutID = testCheckoutID
+	// Companion primary changes remain part of the publication fence even
+	// though the selected repo has a dedicated root excluding its own base0.
+	old, found, err := store.ContractInputStateContext(t.Context(), "other", "")
+	require.NoError(t, err)
+	require.True(t, found)
+	next := old
+	next.InputFingerprint = "other-new"
+	acceptPrimaryContractInput(t, store, &old, next)
+	require.ErrorIs(t, input.Validate(t.Context()), graph.ErrContractProjectionStale)
+}

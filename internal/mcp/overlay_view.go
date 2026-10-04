@@ -159,10 +159,22 @@ func OverlayViewFromContext(ctx context.Context) *graph.OverlaidView {
 // the helper is cheap but the indirection still matters at million-
 // edge scales.
 func (s *Server) readerFor(ctx context.Context) graph.Reader {
-	if v := OverlayViewFromContext(ctx); v != nil {
-		return v
+	if status := contractConsumerStatusFromContext(ctx); status != nil && status.navigate {
+		if reader, err := contractAnalysisFromContext(ctx).composedReader(ctx, s.requestBaseReader(ctx)); err == nil {
+			return reader
+		}
+		return graph.NewOverlaidViewWithLayer(nil, nil) // The sticky checked error is refused by middleware.
 	}
-	return s.requestBaseReader(ctx)
+	reader := s.requestBaseReader(ctx)
+	if overlay := OverlayViewFromContext(ctx); overlay != nil {
+		reader = overlay
+	}
+	if s.contractAnalysisRuntime != nil {
+		// Legacy derived rows are not current source/caller facts. The local
+		// adjacency filter needs no registry, input vector or attachment.
+		return &contractCoreEdges{Reader: reader, ctx: ctx}
+	}
+	return reader
 }
 
 // requestBaseReader is what this request reads when no editor buffer is in
@@ -202,6 +214,20 @@ func (s *Server) nodeGetterFor(ctx context.Context) graph.NodeGetter {
 func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	if s == nil || s.engine == nil {
 		return nil
+	}
+	if status := contractConsumerStatusFromContext(ctx); status != nil && status.navigate {
+		binding := contractAnalysisFromContext(ctx)
+		reader := s.readerFor(ctx)
+		view := requestViewFromContext(ctx)
+		layers := append([]query.ViewLayerSource(nil), view.candidateLayers()...)
+		for _, analysis := range binding.views {
+			layers = append(layers, query.ViewLayerSource{Search: analysis.SearchBackend(), Layer: binding.composedLayer})
+		}
+		return s.engine.WithComposedView(reader, layers, ctx, view.excludesBaseCorpus())
+	}
+	if s.contractAnalysisRuntime != nil {
+		view := requestViewFromContext(ctx)
+		return s.engine.WithComposedView(s.readerFor(ctx), view.candidateLayers(), ctx, view.excludesBaseCorpus())
 	}
 	// A routed or overlaid request engine is already a per-request clone, and
 	// it carries the request's lifetime so its long graph walks stop when the

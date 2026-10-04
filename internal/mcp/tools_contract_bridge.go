@@ -80,6 +80,9 @@ func (s *Server) handleContractBridges(ctx context.Context, req mcp.CallToolRequ
 	}
 
 	groups := s.collectBridgeGroups(ctx, allowed)
+	if binding := contractAnalysisFromContext(ctx); binding != nil && binding.readError() != nil {
+		return mcp.NewToolResultError(binding.readError().Error()), nil
+	}
 	if len(groups) == 0 {
 		return mcp.NewToolResultError("no contract bridges materialized — index repositories with matched provider/consumer contracts first"), nil
 	}
@@ -101,8 +104,17 @@ func (s *Server) handleContractBridges(ctx context.Context, req mcp.CallToolRequ
 // rehydrated the registry yet). A non-nil allowed set scopes the
 // result to bridges touching at least one allowed repo.
 func (s *Server) collectBridgeGroups(ctx context.Context, allowed map[string]bool) []*bridgeGroupResult {
-	registry := s.effectiveContractRegistry()
-	g := s.readerFor(ctx)
+	registry, registryErr := s.contractRegistryForContext(ctx)
+	if registryErr != nil {
+		if binding := contractAnalysisFromContext(ctx); binding != nil {
+			binding.recordReadError(registryErr)
+		}
+		return nil
+	}
+	g, graphErr := s.contractReaderForContext(ctx)
+	if graphErr != nil {
+		return nil
+	}
 	var out []*bridgeGroupResult
 	for n := range g.NodesByKind(graph.KindContractBridge) {
 		if n == nil || n.Meta == nil {
@@ -341,10 +353,13 @@ func (s *Server) bridgeImpact(ctx context.Context, req mcp.CallToolRequest, grou
 	if symbolID == "" {
 		return mcp.NewToolResultError("symbol is required for bridge impact mode"), nil
 	}
-	g := s.readerFor(ctx)
-	symNode := g.GetNode(symbolID)
+	symNode := s.readerFor(ctx).GetNode(symbolID)
 	if symNode == nil {
 		return mcp.NewToolResultError("symbol not found: " + symbolID), nil
+	}
+	g, err := s.contractReaderForContext(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 	anchors := s.bridgeAnchorContracts(ctx, symNode)
 	if len(anchors) == 0 {
@@ -416,7 +431,7 @@ func (s *Server) bridgeImpact(ctx context.Context, req mcp.CallToolRequest, grou
 // the symbol can reach without leaving its file.
 func (s *Server) bridgeAnchorContracts(ctx context.Context, symNode *graph.Node) map[string]bool {
 	anchors := make(map[string]bool)
-	registry := s.effectiveContractRegistry()
+	registry := s.optionalContractRegistryForContext(ctx)
 	if registry != nil {
 		for _, c := range registry.BySymbol(symNode.ID) {
 			anchors[c.ID] = true
@@ -429,7 +444,11 @@ func (s *Server) bridgeAnchorContracts(ctx context.Context, symNode *graph.Node)
 	}
 	// Graph fallback: provides/consumes out-edges land on contract
 	// nodes directly.
-	for _, e := range s.readerFor(ctx).GetOutEdges(symNode.ID) {
+	reader, err := s.contractReaderForContext(ctx)
+	if err != nil {
+		return anchors
+	}
+	for _, e := range reader.GetOutEdges(symNode.ID) {
 		if e.Kind == graph.EdgeProvides || e.Kind == graph.EdgeConsumes {
 			anchors[e.To] = true
 		}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/search"
 )
 
 // ContractAnalysisInput is captured from the selected view's accepted contract
@@ -29,6 +30,11 @@ type ContractAnalysisView struct {
 	lease          *Lease
 	inputs         *SelectedContractInputs
 	closeOnce      sync.Once
+}
+
+// SearchBackend reads only this leased analysis payload's native symbol index.
+func (view *ContractAnalysisView) SearchBackend() search.Backend {
+	return search.NewSymbolSearcherBackend(view.Layer.handle)
 }
 
 // OpenSelectedContractAnalysis derives attachment authority from the selected
@@ -70,6 +76,7 @@ func (m *Materializer) OpenContractAnalysisForInputs(ctx context.Context, view *
 		return nil, err
 	}
 	analysis.inputs = inputs
+	analysis.RegistryReader.(*contractRegistryReader).sources = inputs.SourceReaders()
 	return analysis, nil
 }
 
@@ -100,6 +107,68 @@ func (v *ContractAnalysisView) ShapeNode(ctx context.Context, id string) (*graph
 		return nil, err
 	}
 	return p.SourceNodes[id], nil
+}
+
+// NodesByKindsContext and OutEdgesContext read only the independently leased
+// analysis payload. RegistryReader's generic methods deliberately remain core
+// methods and must not be used to traverse contract-derived graph structure.
+func (v *ContractAnalysisView) NodesByKindsContext(ctx context.Context, kinds []graph.NodeKind) ([]*graph.Node, error) {
+	if v == nil || v.Layer == nil {
+		return nil, graph.ErrContractProjectionUnsupported
+	}
+	if err := v.Layer.checkContractInputRevision(ctx); err != nil {
+		return nil, err
+	}
+	nodes, err := v.Layer.handle.NodesByKindsContext(ctx, kinds)
+	if err != nil {
+		return nil, err
+	}
+	if err := v.Layer.checkContractInputRevision(ctx); err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+// NodesContext reads the complete bounded analysis payload, including source
+// endpoints for independently derived configuration and dependency edges.
+func (v *ContractAnalysisView) NodesContext(ctx context.Context, limit int) ([]*graph.Node, error) {
+	if v == nil || v.Layer == nil {
+		return nil, graph.ErrContractProjectionUnsupported
+	}
+	if err := v.Layer.checkContractInputRevision(ctx); err != nil {
+		return nil, err
+	}
+	nodes, truncated, err := v.Layer.handle.ContractAnalysisNodesContext(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	if truncated {
+		return nil, NewViewError(CodeRequiredCapabilityIncomplete, "contract node projection exceeds the requested bound")
+	}
+	if err := v.Layer.checkContractInputRevision(ctx); err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+func (v *ContractAnalysisView) OutEdgesContext(ctx context.Context, ids []string, limit int) (map[string][]*graph.Edge, error) {
+	if v == nil || v.Layer == nil {
+		return nil, graph.ErrContractProjectionUnsupported
+	}
+	if err := v.Layer.checkContractInputRevision(ctx); err != nil {
+		return nil, err
+	}
+	edges, truncated, err := v.Layer.handle.GetOutEdgesByNodeIDsWithMetadataContext(ctx, ids, limit)
+	if err != nil {
+		return nil, err
+	}
+	if truncated {
+		return nil, NewViewError(CodeRequiredCapabilityIncomplete, "contract edge projection exceeds the requested bound")
+	}
+	if err := v.Layer.checkContractInputRevision(ctx); err != nil {
+		return nil, err
+	}
+	return edges, nil
 }
 
 // OpenContractAnalysis pins before rechecking the head. A replaced attachment
@@ -183,7 +252,8 @@ func (m *Materializer) OpenContractAnalysis(ctx context.Context, core graph.Read
 // same-ID canonical ownership and shapes stay in the complete analysis tier.
 type contractRegistryReader struct {
 	graph.Reader
-	layer *GenerationLayer
+	layer   *GenerationLayer
+	sources map[string]graph.Reader
 }
 
 var _ graph.ContractRepoProjectionReader = (*contractRegistryReader)(nil)
@@ -212,16 +282,33 @@ func (r *contractRegistryReader) LayerContractIDProjectionContext(ctx context.Co
 		}
 	}
 	if len(missing) > 0 {
-		core, err := graph.ContractSourceNodesContext(ctx, r.Reader, missing)
-		if err != nil {
-			return graph.ContractFileProjection{}, err
-		}
 		if p.SourceNodes == nil {
 			p.SourceNodes = make(map[string]*graph.Node)
 		}
-		for id, node := range core {
-			if node.Kind != graph.KindContract && node.Kind != graph.KindContractBridge {
-				p.SourceNodes[id] = node
+		if r.sources == nil {
+			core, err := graph.ContractSourceNodesContext(ctx, r.Reader, missing)
+			if err != nil {
+				return graph.ContractFileProjection{}, err
+			}
+			for id, node := range core {
+				if node.Kind != graph.KindContract && node.Kind != graph.KindContractBridge {
+					p.SourceNodes[id] = node
+				}
+			}
+		} else {
+			for repo, reader := range r.sources {
+				core, err := graph.ContractSourceNodesContext(ctx, reader, missing)
+				if err != nil {
+					return graph.ContractFileProjection{}, err
+				}
+				for id, node := range core {
+					if node.RepoPrefix == repo && node.Kind != graph.KindContract && node.Kind != graph.KindContractBridge {
+						if old := p.SourceNodes[id]; old != nil && !reflect.DeepEqual(old, node) {
+							return graph.ContractFileProjection{}, graph.ErrContractProjectionIncomplete
+						}
+						p.SourceNodes[id] = node
+					}
+				}
 			}
 		}
 	}

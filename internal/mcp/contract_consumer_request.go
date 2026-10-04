@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
 )
@@ -36,6 +37,9 @@ func contractConsumerForRequest(req mcp.CallToolRequest, want capabilityRequest)
 			return contractConsumerRequired
 		}
 	}
+	if canonicalContractTarget(req.GetString("id", "")) {
+		return contractConsumerRequired
+	}
 	for _, capability := range want.optional {
 		if capability == graphview.CapContracts {
 			mode = contractConsumerOptional
@@ -45,8 +49,29 @@ func contractConsumerForRequest(req mcp.CallToolRequest, want capabilityRequest)
 	case "contracts", "api_impact":
 		return contractConsumerRequired
 	case "analyze":
-		if req.GetString("kind", "") == "route_frameworks" {
+		switch req.GetString("kind", "") {
+		case "route_frameworks", "routes":
 			return contractConsumerRequired
+		}
+	}
+	if req.Params.Name == "graph_query" {
+		if stages, err := parseGraphQuery(req.GetString("query", "")); err == nil {
+			for _, stage := range stages {
+				for _, filter := range stage.filters {
+					if filter.op == "kind=" {
+						switch graph.NodeKind(filter.value) {
+						case graph.KindContract, graph.KindContractBridge, graph.KindConfigKey:
+							return contractConsumerRequired
+						}
+					}
+				}
+				for _, kind := range stage.edgeKinds {
+					switch kind {
+					case graph.EdgeMatches, graph.EdgeBridges, graph.EdgeHandlesRoute, graph.EdgeReadsConfig:
+						return contractConsumerRequired
+					}
+				}
+			}
 		}
 	}
 	kind := req.GetString("kind", "")
@@ -56,7 +81,7 @@ func contractConsumerForRequest(req mcp.CallToolRequest, want capabilityRequest)
 	for _, kinds := range []string{kind, req.GetString("node_kind", ""), req.GetString("node_kinds", "")} {
 		for _, item := range strings.Split(kinds, ",") {
 			switch graph.NodeKind(strings.ToLower(strings.TrimSpace(item))) {
-			case graph.KindContract, graph.KindContractBridge:
+			case graph.KindContract, graph.KindContractBridge, graph.KindConfigKey:
 				return contractConsumerRequired
 			}
 		}
@@ -64,7 +89,7 @@ func contractConsumerForRequest(req mcp.CallToolRequest, want capabilityRequest)
 	for _, kinds := range []string{req.GetString("edge_kind", ""), req.GetString("edge_kinds", "")} {
 		for _, item := range strings.Split(kinds, ",") {
 			switch graph.EdgeKind(strings.ToLower(strings.TrimSpace(item))) {
-			case graph.EdgeMatches, graph.EdgeBridges, graph.EdgeHandlesRoute:
+			case graph.EdgeMatches, graph.EdgeBridges, graph.EdgeHandlesRoute, graph.EdgeReadsConfig:
 				return contractConsumerRequired
 			case graph.EdgeProvides, graph.EdgeConsumes:
 				// These also carry current core SQL/table dataflow. The contract
@@ -74,8 +99,31 @@ func contractConsumerForRequest(req mcp.CallToolRequest, want capabilityRequest)
 		}
 	}
 	switch req.Params.Name {
-	case "search_symbols", "get_architecture", "generate_wiki", "explain_change_impact", "review", "review_pack", "pr_review_context", "analyze_framework":
+	case "search_symbols", "get_architecture", "generate_wiki", "explain_change_impact", "review", "review_pack", "pr_review_context", "analyze_framework", "change_contract", "graph_query":
 		return contractConsumerOptional
 	}
 	return mode
+}
+
+func canonicalContractTarget(id string) bool {
+	prefix, rest, ok := strings.Cut(id, "::")
+	if !ok || rest == "" {
+		return false
+	}
+	switch contracts.ContractType(prefix) {
+	case contracts.ContractHTTP, contracts.ContractGRPC, contracts.ContractThrift,
+		contracts.ContractGraphQL, contracts.ContractTopic, contracts.ContractWS,
+		contracts.ContractEnv, contracts.ContractOpenAPI, contracts.ContractDependency,
+		contracts.ContractDI, contracts.ContractTRPC:
+		return true
+	}
+	return prefix == "bridge" || prefix == "config"
+}
+
+func contractNavigationRequest(req mcp.CallToolRequest) bool {
+	switch req.Params.Name {
+	case "contracts", "api_impact", "analyze":
+		return false // These handlers select analysis sections explicitly.
+	}
+	return contractConsumerForRequest(req, capabilityRequest{}) == contractConsumerRequired
 }

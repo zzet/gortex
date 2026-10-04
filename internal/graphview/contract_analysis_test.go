@@ -68,6 +68,46 @@ func TestContractAnalysisCheckedShapeRefusesCorrectionAfterSelection(t *testing.
 	require.NoError(t, err)
 }
 
+func TestContractAnalysisCheckedTraversalRefusesCorrectionAfterSelection(t *testing.T) {
+	s := openTestStore(t)
+	handle, source, shape := isolatedContractPayload(t, s, "/selected", true)
+	core := graph.New()
+	core.AddNode(source)
+	m := newTestMaterializer(s)
+	m.contractAttachmentReader = contractAttachmentReadFunc(func(context.Context, graph.ContractAttachmentKey) (*graph.ContractAttachment, error) {
+		return &graph.ContractAttachment{RepoPrefix: "repo", PayloadGeneration: handle.ViewGeneration(), InputVersion: "v", InputFingerprint: "fp"}, nil
+	})
+	v, err := m.OpenContractAnalysis(t.Context(), core, ContractAnalysisInput{RepoPrefix: "repo", InputVersion: "v", InputFingerprint: "fp"})
+	require.NoError(t, err)
+	defer v.Close()
+	nodes, err := v.NodesByKindsContext(t.Context(), []graph.NodeKind{graph.KindContract})
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	edges, err := v.OutEdgesContext(t.Context(), []string{source.ID}, 10)
+	require.NoError(t, err)
+	require.Len(t, edges[source.ID], 1)
+	require.Equal(t, "repo", edges[source.ID][0].Meta["contract_owner_repo_prefix"])
+	all, err := v.NodesContext(t.Context(), graph.ContractProjectionRowLimit)
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+	_, err = v.NodesContext(t.Context(), 1)
+	require.Error(t, err)
+	correction, err := s.BeginDerivedCorrection(t.Context(), store_sqlite.DerivedCorrectionRequest{GenerationID: handle.ViewGeneration(), Pass: "capability", FromVersion: 0, ToVersion: 1, EdgeKinds: []graph.EdgeKind{graph.EdgeAccessesField}})
+	require.NoError(t, err)
+	require.NoError(t, correction.ReplaceSourceEdges(t.Context(), nil, nil, []*graph.Node{{ID: shape.ID, Kind: shape.Kind, FilePath: shape.FilePath, RepoPrefix: "repo", Meta: map[string]any{"shape": &contracts.Shape{Kind: "string"}}}}))
+	nodes, err = v.NodesByKindsContext(t.Context(), []graph.NodeKind{graph.KindContract})
+	require.ErrorIs(t, err, graph.ErrContractProjectionStale)
+	require.Nil(t, nodes)
+	all, err = v.NodesContext(t.Context(), graph.ContractProjectionRowLimit)
+	require.ErrorIs(t, err, graph.ErrContractProjectionStale)
+	require.Nil(t, all)
+	edges, err = v.OutEdgesContext(t.Context(), []string{source.ID}, 10)
+	require.ErrorIs(t, err, graph.ErrContractProjectionStale)
+	require.Nil(t, edges)
+	_, err = correction.Finish(t.Context())
+	require.NoError(t, err)
+}
+
 func isolatedContractPayload(t *testing.T, s *store_sqlite.Store, route string, complete bool) (*store_sqlite.Store, *graph.Node, *graph.Node) {
 	t.Helper()
 	id, handle := beginTestGeneration(t, s, "isolated-contract-analysis")

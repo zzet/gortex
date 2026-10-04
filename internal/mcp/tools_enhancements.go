@@ -4609,7 +4609,10 @@ func (s *Server) handleContracts(ctx context.Context, req mcp.CallToolRequest) (
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleGetContracts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	registry := s.effectiveContractRegistry()
+	registry, registryErr := s.contractRegistryForContext(ctx)
+	if registryErr != nil {
+		return mcp.NewToolResultError(registryErr.Error()), nil
+	}
 	if registry == nil {
 		// A repository indexed with a lost contract tail reaches here too:
 		// nothing ever committed the tier, so no registry was retained. Name
@@ -4857,7 +4860,10 @@ func contractInResolvedScope(c contracts.Contract, resolved ResolvedScope, repoA
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleCheckContracts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	registry := s.effectiveContractRegistry()
+	registry, registryErr := s.contractRegistryForContext(ctx)
+	if registryErr != nil {
+		return mcp.NewToolResultError(registryErr.Error()), nil
+	}
 	if registry == nil {
 		return mcp.NewToolResultError("no contract registry available — index a repository first"), nil
 	}
@@ -4947,7 +4953,10 @@ func (s *Server) handleCheckContracts(ctx context.Context, req mcp.CallToolReque
 // parameters as `check` so callers can limit the diff to one project.
 
 func (s *Server) handleValidateContracts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	registry := s.effectiveContractRegistry()
+	registry, registryErr := s.contractRegistryForContext(ctx)
+	if registryErr != nil {
+		return mcp.NewToolResultError(registryErr.Error()), nil
+	}
 	if registry == nil {
 		return mcp.NewToolResultError("no contract registry available — index a repository first"), nil
 	}
@@ -4965,24 +4974,7 @@ func (s *Server) handleValidateContracts(ctx context.Context, req mcp.CallToolRe
 		}
 	}
 
-	// Shape lookup pulls Shape out of the type node's meta — the
-	// indexer attaches it during commitContracts (see
-	// snapshotContractShapes in internal/indexer/indexer.go).
-	lookup := contracts.ShapeLookup(func(symbolID string) *contracts.Shape {
-		// Base read on purpose: only the indexer stamps the shape meta this
-		// reads, so no other view can carry it.
-		n := s.graph.GetNode(symbolID)
-		if n == nil || n.Meta == nil {
-			return nil
-		}
-		switch v := n.Meta["shape"].(type) {
-		case *contracts.Shape:
-			return v
-		case contracts.Shape:
-			return &v
-		}
-		return nil
-	})
+	lookup := s.contractShapeLookup(ctx)
 
 	issues := contracts.Validate(reg, lookup)
 

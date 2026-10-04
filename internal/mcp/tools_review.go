@@ -1196,7 +1196,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	// Gate: contract-boundary impact.
-	contracts := s.computeContractImpact(ids)
+	contracts := s.computeContractImpactContext(ctx, ids)
 
 	// Gate: guard + architecture rules.
 	var guards []analysis.GuardViolation

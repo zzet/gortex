@@ -17,7 +17,10 @@ type SelectedContractInputs struct {
 	Witnesses      []graph.ContractInputWitness
 	sources        []contractInputSource
 	dependencies   []*SelectedContractInputs
+	selection      *SelectedContractInputs
+	companion      bool
 	store          *store_sqlite.Store
+	core           graph.Reader
 	repo, checkout string
 }
 
@@ -85,7 +88,7 @@ func (m *Materializer) CaptureContractInputs(ctx context.Context, view *RepoView
 	if len(sources) == 0 {
 		return nil, NewViewError(CodeRequiredCapabilityIncomplete, "selected contract baseline is unavailable")
 	}
-	witnesses, baseline, err := readSelectedContractInputs(ctx, sources, repo)
+	witnesses, baseline, err := readSelectedContractInputs(ctx, sources, repo, false)
 	if err != nil {
 		return nil, err
 	}
@@ -96,10 +99,69 @@ func (m *Materializer) CaptureContractInputs(ctx context.Context, view *RepoView
 	if err != nil {
 		return nil, err
 	}
-	return &SelectedContractInputs{State: state, Witnesses: witnesses, sources: sources, store: m.Store, repo: repo, checkout: checkout}, nil
+	var core graph.Reader = m.Store.AtGeneration(BaseCorpusGeneration)
+	if view != nil {
+		core = view.Reader
+	}
+	return &SelectedContractInputs{State: state, Witnesses: witnesses, sources: sources, store: m.Store, core: core, repo: repo, checkout: checkout}, nil
 }
 
-func readSelectedContractInputs(ctx context.Context, sources []contractInputSource, repo string) ([]graph.ContractInputWitness, bool, error) {
+// CaptureContractCompanionInputs includes checked state absence on the selected
+// repo's positive layers. Those layers may not alter an unrelated companion,
+// but their namespace absence still participates in the final publication CAS.
+// The selected repo itself must have certified cumulative input authority;
+// legacy absence cannot become a proof merely by calling this method.
+func (m *Materializer) CaptureContractCompanionInputs(ctx context.Context, view *RepoView, repo, checkout string) (*SelectedContractInputs, error) {
+	if view == nil || view.ID.RepoPrefix == repo {
+		return m.CaptureContractInputs(ctx, view, repo, checkout)
+	}
+	selection, err := m.CaptureContractInputs(ctx, view, view.ID.RepoPrefix, checkout)
+	if err != nil {
+		return nil, err
+	}
+	sources := []contractInputSource{{handle: m.Store.AtGeneration(BaseCorpusGeneration)}}
+	for _, source := range view.sources {
+		sources = append(sources, contractInputSource{handle: source.Handle, actor: source.CheckoutID})
+	}
+	witnesses, baseline, err := readSelectedContractInputs(ctx, sources, repo, true)
+	if err != nil {
+		return nil, err
+	}
+	if !baseline {
+		return nil, NewViewError(CodeRequiredCapabilityIncomplete, "selected companion contract baseline is not yet certified")
+	}
+	state, err := graph.ComposeContractInputState(repo, checkout, witnesses)
+	if err != nil {
+		return nil, err
+	}
+	return &SelectedContractInputs{State: state, Witnesses: witnesses, sources: sources, selection: selection, companion: true, store: m.Store, core: m.Store.AtGeneration(BaseCorpusGeneration), repo: repo, checkout: checkout}, nil
+}
+
+// SourceReaders returns the captured core reader for each admitted repository.
+// The selected repository retains its actual composed view; an unrelated
+// companion retains its captured primary source even when that view excludes
+// generation zero. The returned map is independent, but its readers are borrowed:
+// background work must retain the selected view and lease the witness generations,
+// validate inputs around capture, and use checked reads before publishing.
+func (inputs *SelectedContractInputs) SourceReaders() map[string]graph.Reader {
+	readers := make(map[string]graph.Reader)
+	var visit func(*SelectedContractInputs)
+	visit = func(input *SelectedContractInputs) {
+		if input == nil {
+			return
+		}
+		if input.core != nil {
+			readers[input.repo] = input.core
+		}
+		for _, dependency := range input.dependencies {
+			visit(dependency)
+		}
+	}
+	visit(inputs)
+	return readers
+}
+
+func readSelectedContractInputs(ctx context.Context, sources []contractInputSource, repo string, companion bool) ([]graph.ContractInputWitness, bool, error) {
 	var witnesses []graph.ContractInputWitness
 	baseline := false
 	for index, source := range sources {
@@ -131,6 +193,10 @@ func readSelectedContractInputs(ctx context.Context, sources []contractInputSour
 			return nil, false, err
 		}
 		if len(states) == 0 {
+			if companion {
+				witnesses = append(witnesses, graph.ContractInputWitness{GenerationID: generation, State: preferred})
+				continue
+			}
 			// Before the async protocol, a sealed layer could change contracts
 			// without carrying an input identity. Inherited0 cannot certify it
 			// inert, even when a newer selected layer carries a summary.
@@ -181,6 +247,11 @@ func (inputs *SelectedContractInputs) Validate(ctx context.Context) error {
 	if inputs == nil {
 		return graph.ErrContractInputVector
 	}
+	if inputs.selection != nil {
+		if err := inputs.selection.Validate(ctx); err != nil {
+			return err
+		}
+	}
 	if len(inputs.dependencies) > 0 {
 		var witnesses []graph.ContractInputWitness
 		for _, dependency := range inputs.dependencies {
@@ -198,7 +269,7 @@ func (inputs *SelectedContractInputs) Validate(ctx context.Context) error {
 		}
 		return nil
 	}
-	current, baseline, err := readSelectedContractInputs(ctx, inputs.sources, inputs.repo)
+	current, baseline, err := readSelectedContractInputs(ctx, inputs.sources, inputs.repo, inputs.companion)
 	if err != nil {
 		return err
 	}

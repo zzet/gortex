@@ -137,12 +137,29 @@ type requestView struct {
 	// entirely. Ignored whenever materialized is set — a leased stack states
 	// its own completeness and nothing here may soften it.
 	declared graphview.Completeness
+	// Request-local analysis binding may establish graph.contracts without
+	// changing the selected core stack's producer rows or other capabilities.
+	contractCompleteness *graphview.CapabilityState
 }
 
 // completeness is what the view can answer: the leased stack's own statement
 // when one was materialized, otherwise whatever the reader-less view declared.
 // Nil only for a request that named no view at all.
 func (v *requestView) completeness() graphview.Completeness {
+	if v != nil && v.contractCompleteness != nil {
+		var declared graphview.Completeness
+		if v.materialized != nil {
+			declared = v.materialized.Completeness
+		} else {
+			declared = v.declared
+		}
+		copyDeclared := maps.Clone(declared)
+		if copyDeclared == nil {
+			copyDeclared = make(graphview.Completeness)
+		}
+		copyDeclared[graphview.CapContracts] = *v.contractCompleteness
+		return copyDeclared
+	}
 	switch {
 	case v == nil:
 		return nil

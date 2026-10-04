@@ -630,6 +630,11 @@ type Server struct {
 	// that legacy tool.
 	facades *facadeRegistry
 
+	// Installed only with an independently owned contract producer. Ordinary
+	// source operations do not capture inputs or call this runtime.
+	contractAnalysisRuntime *ContractAnalysisRuntime
+	contractAnalysisWaiters atomic.Int64
+
 	// toolPolicy restricts the published tool surface to a named preset
 	// / allow-deny set (see tool_presets.go). Resolved at construction
 	// from MultiRepoOptions.ToolPolicy (the mcp.tools config block) plus

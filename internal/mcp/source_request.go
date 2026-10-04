@@ -20,6 +20,9 @@ import (
 // relationship publication. Explicit graph capabilities and immutable selectors
 // retain whole-view selection and its freshness contract.
 func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphview.Selector, req *mcp.CallToolRequest, name string, freshness requestFreshness, capabilities capabilityRequest) (*requestView, error) {
+	if s.contractAnalysisRuntime != nil && contractConsumerForRequest(s.contractConsumerRequest(*req), capabilities) == contractConsumerRequired {
+		return nil, nil // Explicit contracts need the selected graph ancestry.
+	}
 	policyReq := *req
 	if isFacadeToolName(req.Params.Name) {
 		spec, ok := s.viewFacadeOperation(req)

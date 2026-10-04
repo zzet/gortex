@@ -651,14 +651,6 @@ type contractImpactNodeContextGetter interface {
 	GetNodeContext(context.Context, string) (*graph.Node, error)
 }
 
-// computeContractImpact keeps non-interactive callers bounded while the MCP
-// impact handler supplies its stricter request-scoped deadline below.
-func (s *Server) computeContractImpact(changedIDs []string) *contractImpact {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	return s.computeContractImpactContext(ctx, changedIDs)
-}
-
 func (s *Server) computeContractImpactContext(ctx context.Context, changedIDs []string) *contractImpact {
 	if ctx == nil {
 		ctx = context.Background()
@@ -666,7 +658,7 @@ func (s *Server) computeContractImpactContext(ctx context.Context, changedIDs []
 	if ctx.Err() != nil {
 		return nil
 	}
-	reg := s.effectiveContractRegistry()
+	reg := s.optionalContractRegistryForContext(ctx)
 	if reg == nil || ctx.Err() != nil {
 		return nil
 	}

@@ -1726,7 +1726,7 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 	if errResult != nil {
 		return errResult, nil
 	}
-	if !resolvedScopeAllowsNode(resolved, node) {
+	if !s.contractScopeAllowsNode(ctx, resolved, node) {
 		return symbolNotFoundGuidance(id), nil
 	}
 
@@ -1842,6 +1842,37 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		scope.SymbolSearchStats = &query.SymbolSearchStats{}
 		scope.SearchNodeFilter = func(n *graph.Node) bool {
 			return pathMatchesAnyPrefix(repoRelativePath(n), prefixes)
+		}
+	}
+	var coreContractFilter func(*graph.Node) bool
+	if status := contractConsumerStatusFromContext(ctx); status != nil && status.mode == contractConsumerOptional {
+		coreContractFilter = func(node *graph.Node) bool {
+			return node != nil && node.Kind != graph.KindContract && node.Kind != graph.KindContractBridge && node.Kind != graph.KindConfigKey
+		}
+		pathAccept := scope.SearchNodeFilter
+		scope.SearchNodeFilter = func(node *graph.Node) bool {
+			return coreContractFilter(node) && (pathAccept == nil || pathAccept(node))
+		}
+	}
+
+	var contractScopeBinding *contractAnalysisContext
+	if status := contractConsumerStatusFromContext(ctx); status != nil && status.mode == contractConsumerRequired {
+		contractScopeBinding = contractAnalysisFromContext(ctx)
+		if contractScopeBinding != nil {
+			pathAccept := scope.SearchNodeFilter
+			ownerScope := queryOptionsForResolvedScope(resolved)
+			// Physical canonical scalars have one deterministic owner; actual
+			// selected owner evidence supplies repository/path membership.
+			scope.RepoAllow = nil
+			scope.SearchPathPrefixes = nil
+			scope.SearchNodeFilter = func(node *graph.Node) bool {
+				for _, evidence := range contractScopeBinding.scopeEvidence(ctx, node) {
+					if ownerScope.ScopeAllows(evidence) && (pathAccept == nil || pathAccept(evidence)) {
+						return true
+					}
+				}
+				return false
+			}
 		}
 	}
 
@@ -2117,6 +2148,18 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		cands = filterNodesByCorpus(cands, corpus)
 		return cands
 	}
+	if contractScopeBinding != nil {
+		ordinaryFilters := applyAllPostFilters
+		applyAllPostFilters = func(candidates []*graph.Node) []*graph.Node {
+			kept := make([]*graph.Node, 0, len(candidates))
+			for _, node := range candidates {
+				if len(ordinaryFilters(contractScopeBinding.scopeEvidence(ctx, node))) != 0 {
+					kept = append(kept, node)
+				}
+			}
+			return kept
+		}
+	}
 	nodes = applyAllPostFilters(nodes)
 
 	// Post-filter wipeout rescue: the fetch found candidates but the
@@ -2194,7 +2237,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 	if len(nodes) == 0 && q != "" && (kindArg != "" || flavorArg != "" || fq.hasFieldFilters()) {
 		relaxedScope := scope
-		relaxedScope.SearchNodeFilter = nil
+		relaxedScope.SearchNodeFilter = coreContractFilter
+		if contractScopeBinding != nil {
+			relaxedScope.SearchNodeFilter = func(node *graph.Node) bool { return s.contractScopeAllowsNode(ctx, resolved, node) }
+		}
 		relaxedScope.SearchPathPrefixes = nil
 		relaxedScope.SymbolSearchStats = nil
 		relaxed := filterNodes(searchSymbolsScopedContext(ctx, s.engineFor(ctx), q, fetchLimit, relaxedScope), allowed)

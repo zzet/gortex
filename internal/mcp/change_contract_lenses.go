@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 // This file carries two change sources/lenses that ride the change_contract
@@ -176,7 +177,13 @@ func (s *Server) apiDriftReasons(ctx context.Context, p *prediction) ([]changeRe
 			continue
 		}
 		ext := externalCallers(reader, n)
-		contracts := contractsTouched(reader, n)
+		var contracts []string
+		if status := contractConsumerStatusFromContext(ctx); status == nil || status.state == graphview.StateComplete {
+			contractReader, err := s.contractReaderForContext(ctx)
+			if err == nil {
+				contracts = contractsTouched(contractReader, n)
+			}
+		}
 		surface = append(surface, apiSurfaceEntry{
 			ID:              n.ID,
 			Name:            n.Name,
