@@ -84,3 +84,14 @@ func (r *contractCoreEdges) GetNodesByIDsContext(ctx context.Context, ids []stri
 	}
 	return nodes, nil
 }
+
+// Preserve compact identity scans through the exact selected reader. The graph
+// helpers retain legacy fallbacks without widening the selected node set, and
+// the scanner owns its borrowed page and callback lock-release contract.
+func (r *contractCoreEdges) ScanNodeSearchKeys(ctx context.Context, pageSize int, yield func([]graph.NodeSearchKey) bool) error {
+	return graph.ScanNodeSearchKeys(ctx, r.Reader, pageSize, yield)
+}
+
+func (r *contractCoreEdges) AllNodesLight() []*graph.Node {
+	return graph.AllNodesLight(r.Reader)
+}
