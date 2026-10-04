@@ -67,6 +67,13 @@ func (s *Store) BeginContractInputMutationContext(ctx context.Context, expected 
 }
 
 func (s *Store) setContractInputStateWithWork(ctx context.Context, expected *graph.ContractInputState, next graph.ContractInputState, work []graph.ContractWork, accepted bool) error {
+	return s.setContractInputStateWithWorkAndReceipts(ctx, expected, next, work, accepted, nil)
+}
+
+func (s *Store) setContractInputStateWithWorkAndReceipts(ctx context.Context, expected *graph.ContractInputState, next graph.ContractInputState, work []graph.ContractWork, accepted bool, receipts []graph.ContractBoundaryReceipt) error {
+	return s.setContractInputStateWithWorkReceiptsAndSources(ctx, expected, next, work, accepted, receipts, nil)
+}
+func (s *Store) setContractInputStateWithWorkReceiptsAndSources(ctx context.Context, expected *graph.ContractInputState, next graph.ContractInputState, work []graph.ContractWork, accepted bool, receipts []graph.ContractBoundaryReceipt, sources []graph.ContractBoundaryReceiptSource) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
 	}
@@ -98,6 +105,22 @@ func (s *Store) setContractInputStateWithWork(ctx context.Context, expected *gra
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	for _, source := range sources {
+		if source.Receipt.RepoPrefix != next.RepoPrefix || source.TargetCheckoutID != next.CheckoutID {
+			return ErrCatalogInvalidValue
+		}
+	}
+	if err := s.carryContractBoundarySourcesTx(ctx, tx, sources); err != nil {
+		return err
+	}
+	for _, row := range receipts {
+		if row.RepoPrefix != next.RepoPrefix || row.CheckoutID != next.CheckoutID || row.Accepted != accepted {
+			return ErrCatalogInvalidValue
+		}
+	}
+	if err := s.setContractBoundaryReceiptsTx(ctx, tx, receipts); err != nil {
+		return err
+	}
 	if err := s.setContractInputStateWithWorkTx(ctx, tx, expected, next, work, encoded, accepted); err != nil {
 		return err
 	}
@@ -239,4 +262,62 @@ func (s *Store) ContractInputStatesForRepoContext(ctx context.Context, repo stri
 		return nil, err
 	}
 	return out, nil
+}
+
+// BeginContractInputMutationWithReceiptsContext stages file-owned parser
+// evidence and immutable debt with the blocked primary identity in one tx.
+func (s *Store) BeginContractInputMutationWithReceiptsContext(ctx context.Context, expected *graph.ContractInputState, next graph.ContractInputState, work []graph.ContractWork, receipts []graph.ContractBoundaryReceipt) error {
+	if s.viewGen != 0 {
+		return ErrCatalogInvalidValue
+	}
+	return s.setContractInputStateWithWorkAndReceipts(ctx, expected, next, work, false, receipts)
+}
+
+func (s *Store) SetContractInputStateWithWorkAndReceiptsContext(ctx context.Context, expected *graph.ContractInputState, next graph.ContractInputState, work []graph.ContractWork, receipts []graph.ContractBoundaryReceipt) error {
+	if s.viewGen == 0 {
+		return ErrCatalogInvalidValue
+	}
+	return s.setContractInputStateWithWorkAndReceipts(ctx, expected, next, work, true, receipts)
+}
+
+// AcceptContractInputMutationWithReceiptsContext applies the caller-proven
+// outer source/apply acceptance to the exact state and staged parser receipts.
+func (s *Store) AcceptContractInputMutationWithReceiptsContext(ctx context.Context, expected graph.ContractInputState, receipts []graph.ContractBoundaryReceipt) error {
+	if s.viewGen != 0 {
+		return ErrCatalogInvalidValue
+	}
+	if err := validateContractInput(expected); err != nil {
+		return err
+	}
+	return s.contractBoundaryTx(ctx, func(tx *sql.Tx) error {
+		for _, row := range receipts {
+			if row.RepoPrefix != expected.RepoPrefix || row.CheckoutID != expected.CheckoutID {
+				return ErrCatalogInvalidValue
+			}
+		}
+		if err := s.acceptContractBoundaryReceiptsTx(ctx, tx, receipts); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE generation_contract_input_state SET accepted=1 WHERE view_gen=0 AND repo_prefix=? AND checkout_id=? AND input_version=? AND input_fingerprint=? AND accepted=0`, expected.RepoPrefix, expected.CheckoutID, expected.InputVersion, expected.InputFingerprint)
+		if err != nil {
+			return err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return ErrCatalogStaleGuard
+		}
+		return nil
+	})
+}
+
+// SetContractInputStateWithWorkReceiptsAndSourcesContext atomically carries
+// checked selected predecessors, stages accepted positive receipts/debt/state.
+func (s *Store) SetContractInputStateWithWorkReceiptsAndSourcesContext(ctx context.Context, expected *graph.ContractInputState, next graph.ContractInputState, work []graph.ContractWork, receipts []graph.ContractBoundaryReceipt, sources []graph.ContractBoundaryReceiptSource) error {
+	if s.viewGen == 0 {
+		return ErrCatalogInvalidValue
+	}
+	return s.setContractInputStateWithWorkReceiptsAndSources(ctx, expected, next, work, true, receipts, sources)
 }

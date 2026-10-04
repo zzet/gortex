@@ -34,7 +34,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 34
+const currentSchemaVersion = 35
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -131,6 +131,7 @@ var schemaMigrations = []schemaMigration{
 	{version: 32, name: "persist exact contract input attachments", inPlace: createContractAttachmentTables},
 	{version: 33, name: "persist selected contract input provenance", inPlace: createContractAttachmentInputsTable},
 	{version: 34, name: "preserve inherited contract work actors", inPlace: addContractAttachmentWorkActor},
+	{version: 35, name: "persist indexed contract boundary receipts", inPlace: createContractBoundaryReceiptTables},
 }
 
 func createNameCandidateIndex(tx *sql.Tx) error {

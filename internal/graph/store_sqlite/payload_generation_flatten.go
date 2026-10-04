@@ -686,6 +686,9 @@ func flattenMasksTx(ctx context.Context, tx *sql.Tx, member, to int64, masks gen
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_input_state(view_gen,repo_prefix,checkout_id,input_version,input_fingerprint,accepted,previous_input_version,previous_input_fingerprint) SELECT ?,repo_prefix,checkout_id,input_version,input_fingerprint,accepted,previous_input_version,previous_input_fingerprint FROM generation_contract_input_state WHERE view_gen=?`, to, member); err != nil {
 		return err
 	}
+	if err := flattenContractBoundaryReceiptsTx(ctx, tx, member, to); err != nil {
+		return err
+	}
 	// Upper acknowledgments win over the matching lower pending token.
 	// Different tokens are retained even for deleted or replaced file paths.
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_work
@@ -812,4 +815,18 @@ func readDocidsTx(ctx context.Context, tx *sql.Tx, query string, args ...any) ([
 		docids = append(docids, docid)
 	}
 	return docids, rows.Err()
+}
+
+func flattenContractBoundaryReceiptsTx(ctx context.Context, tx *sql.Tx, member, to int64) error {
+	// Upper file receipts replace every key membership of that exact owner,
+	// including explicit empty/deleted negative membership. Pending union keys
+	// remain visible until outer acceptance, independent of whole-file masks.
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_boundary_keys(view_gen,key_kind,lookup_key,repo_prefix,checkout_id,file_path) SELECT ?,key_kind,lookup_key,repo_prefix,checkout_id,file_path FROM generation_contract_boundary_keys k WHERE k.view_gen=? AND NOT EXISTS(SELECT 1 FROM generation_contract_boundary_receipt r WHERE r.view_gen=? AND r.repo_prefix=k.repo_prefix AND r.checkout_id=k.checkout_id AND r.file_path=k.file_path)`, to, member, to); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_boundary_receipt(view_gen,repo_prefix,checkout_id,file_path,version,fingerprint,source_fingerprint,accepted,receipt) SELECT ?,repo_prefix,checkout_id,file_path,version,fingerprint,source_fingerprint,accepted,receipt FROM generation_contract_boundary_receipt WHERE view_gen=?`, to, member); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_boundary_baseline(view_gen,repo_prefix,checkout_id,version,fingerprint) SELECT ?,repo_prefix,checkout_id,version,fingerprint FROM generation_contract_boundary_baseline WHERE view_gen=?`, to, member)
+	return err
 }

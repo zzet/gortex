@@ -1919,6 +1919,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.PendingContractWorkReader)(nil), skip: "generation-keyed pending contract debt; bounded exact acknowledgments tested by TestContractAttachmentAtomicExactWorkAndHistoricalIsolation"},
 		{iface: (*graph.ContractWorkReader)(nil), skip: "generation-keyed work sidecar; isolation and fold covered by TestContractWorkFoldPreservesDeletionAndExactAcknowledgments"},
 		{iface: (*graph.ContractInputStateCohortReader)(nil), skip: "checked own-generation actor cohort; copy isolation tested by TestContractAttachmentCopiedActorAndInheritedDebt"},
+		{iface: (*graph.ContractBoundaryReceiptReader)(nil), skip: "checked generation-keyed parser receipts; indexed owner/matcher/negative membership tested by TestContractBoundaryReceiptIndexedNegativeOwnersAndPendingUnion"},
 		{iface: (*graph.ContractInputStateReader)(nil), skip: "generation-keyed input state; exact isolation and fold tested by TestContractInputFoldAndPreviousSnapshot"},
 		{iface: (*graph.ContractAttachmentReader)(nil), skip: "exact historical identity catalog lookup; isolation and lifecycle tested by TestContractAttachmentAtomicExactWorkAndHistoricalIsolation"},
 		{iface: (*graph.ContractRepoProjectionReader)(nil), probe: "ContractRepoProjectionContext"},
