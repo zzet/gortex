@@ -141,3 +141,39 @@ func TestCommitLayerBaseVisitorDrivesClosureEarlyStop(t *testing.T) {
 		t.Fatalf("early stop = value %v, calls %d, visits %d, legacy %d", reader.seen, reader.visitorCalls, reader.visitorVisits, reader.legacyCalls)
 	}
 }
+
+func TestCommitLayerBaseBatchVisitorPreservesComposedMasksAndOrder(t *testing.T) {
+	underlying := &closureExactNamesBase{nodes: []*graph.Node{
+		{ID: "covered.go::old", Name: "Shared", FilePath: "covered.go", Kind: graph.KindFunction},
+		{ID: "visible.go::base", Name: "Other", FilePath: "visible.go", Kind: graph.KindFunction},
+	}}
+	layer := graph.NewOverlayLayer()
+	layer.MarkFile("covered.go", false)
+	layer.AddNode("overlay.go", &graph.Node{ID: "overlay.go::new", Name: "Shared", FilePath: "overlay.go", Kind: graph.KindFunction})
+	view := graph.NewOverlaidView(underlying, layer)
+	base := commitLayerBase{Reader: view}
+	ctx := context.WithValue(context.Background(), commitLayerNameContextKey{}, "composed-batch")
+	names := []string{"Shared", "Other"}
+	collect := func(reader graph.Reader) []string {
+		var got []string
+		err := graph.VisitNodesByNamesContext(ctx, reader, names, func(node *graph.Node) bool {
+			got = append(got, node.ID)
+			return true
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	want := collect(view)
+	got := collect(base)
+	if !reflect.DeepEqual(want, []string{"overlay.go::new", "visible.go::base"}) || !reflect.DeepEqual(got, want) ||
+		underlying.batchCalls != 2 || underlying.singleCalls != 0 || underlying.seenContext != ctx {
+		t.Fatalf("composed batch got=%v want=%v batch=%d single=%d", got, want, underlying.batchCalls, underlying.singleCalls)
+	}
+	before := underlying.batchCalls
+	err := graph.VisitNodesByNamesContext(ctx, base, names, func(*graph.Node) bool { return false })
+	if err != nil || underlying.batchCalls != before {
+		t.Fatalf("overlay batch early stop reached base: err=%v calls=%d -> %d", err, before, underlying.batchCalls)
+	}
+}

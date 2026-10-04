@@ -17,3 +17,9 @@ func (b commitLayerBase) FindNodesByNameContext(ctx context.Context, name string
 func (b commitLayerBase) VisitNodesByNameContext(ctx context.Context, name string, yield func(*graph.Node) bool) error {
 	return graph.VisitNodesByNameContext(ctx, b.Reader, name, yield)
 }
+
+// VisitNodesByNamesContext preserves the optional batched exact-name visitor
+// through the base wrapper used by incremental builds.
+func (b commitLayerBase) VisitNodesByNamesContext(ctx context.Context, names []string, yield func(*graph.Node) bool) error {
+	return graph.VisitNodesByNamesContext(ctx, b.Reader, names, yield)
+}
