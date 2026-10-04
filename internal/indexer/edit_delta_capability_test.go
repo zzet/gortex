@@ -193,6 +193,9 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"resolver.mutationRevisioner":                 "telemetry, cache-liveness or scheduling probe; absent, the metric or the cache shortcut is simply off",
 	"resolver.scopedBackendResolver":              "whole-graph pass (ResolveAll, a cold warm-up, a whole-repository derived rebuild); a delta resolves and re-derives by its receipt frontier",
 	"resolver.scopedSynthesizer":                  "framework synthesizer contract, asserted on synthesizers",
+
+	"graph.OverlayLayerContractRepoProjectionReader": "checked physical repo contract projection; DeltaWriter exposes the composed LoadContractRepoProjectionContext and applies selected-layer visibility, never physical layer seeds",
+	"graph.Unwrapper": "transparent reader-wrapper capability; DeltaWriter is handled as a concrete composed reader before wrapper unwrapping, so unwrapping it would discard delta ownership",
 }
 
 // editDeltaCapabilityPackages are the engine packages whose assertions the
