@@ -93,6 +93,7 @@ func runTrackRepoCtxIsolatedChild(t *testing.T) {
 		"XDG_DATA_HOME="+filepath.Join(isolation, "data"),
 		"XDG_CACHE_HOME="+filepath.Join(isolation, "cache"),
 		"XDG_STATE_HOME="+filepath.Join(isolation, "state"),
+		"GOTMPDIR="+filepath.Join(isolation, "tmp"),
 		"TMPDIR="+filepath.Join(isolation, "tmp"),
 		"TMP="+filepath.Join(isolation, "tmp"),
 		"TEMP="+filepath.Join(isolation, "tmp"),
@@ -171,7 +172,7 @@ func runTrackRepoCtxIsolatedChild(t *testing.T) {
 // be unset, the XDG roots must be the private ones) or leak the developer's
 // state into it. trackRepoCtxOwnedEnvPrefixes are the same thing by family.
 var (
-	trackRepoCtxOwnedEnv         = []string{"HOME", "TMPDIR", "TMP", "TEMP", "APPDATA", "LOCALAPPDATA", "USERPROFILE"}
+	trackRepoCtxOwnedEnv         = []string{"HOME", "GOTMPDIR", "TMPDIR", "TMP", "TEMP", "APPDATA", "LOCALAPPDATA", "USERPROFILE"}
 	trackRepoCtxOwnedEnvPrefixes = []string{"GORTEX_", "XDG_", "GIT_"}
 )
 
@@ -236,7 +237,7 @@ func trackRepoCtxRuntimeFixture(tb testing.TB) (*SharedServer, *store_sqlite.Sto
 	within(cwd)
 	for key, category := range map[string]string{
 		"XDG_CONFIG_HOME": "config", "XDG_DATA_HOME": "data", "XDG_CACHE_HOME": "cache",
-		"XDG_STATE_HOME": "state", "TMPDIR": "tmp",
+		"XDG_STATE_HOME": "state", "GOTMPDIR": "tmp", "TMPDIR": "tmp",
 	} {
 		if got, want := os.Getenv(key), filepath.Join(isolation, category); got != want {
 			tb.Fatalf("%s=%q; want %q before package initialization", key, got, want)
