@@ -28,7 +28,7 @@ func (r *fileLanguagePointSpy) GetNodeContext(ctx context.Context, id string) (*
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return r.Store.GetNode(id), r.err
+	return r.GetNode(id), r.err
 }
 func (r *fileLanguagePointSpy) GetFileNodes(string) []*graph.Node { r.scans++; return nil }
 func (r *fileLanguagePointSpy) AllNodes() []*graph.Node           { r.scans++; return nil }

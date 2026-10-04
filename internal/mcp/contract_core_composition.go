@@ -57,7 +57,7 @@ func (r *contractCoreEdges) filter(rows []*graph.Edge) []*graph.Edge {
 		} else {
 			// Potential writers keep the previous errorless classifier. A late
 			// read refusal must never discard their committed mutation receipt.
-			nodes := r.Reader.GetNodesByIDs(ids)
+			nodes := r.GetNodesByIDs(ids)
 			kinds = make(map[string]graph.NodeKindRow, len(nodes))
 			for id, node := range nodes {
 				if node != nil {

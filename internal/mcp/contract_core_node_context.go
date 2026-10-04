@@ -90,7 +90,7 @@ func (r *contractCoreEdges) GetNodeContext(ctx context.Context, id string) (*gra
 		}
 		return node, nil
 	}
-	node := r.Reader.GetNode(id)
+	node := r.GetNode(id)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -116,7 +116,7 @@ func (r *contractCoreEdges) GetNodesByIDsContext(ctx context.Context, ids []stri
 		}
 		return nodes, nil
 	}
-	nodes := r.Reader.GetNodesByIDs(ids)
+	nodes := r.GetNodesByIDs(ids)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
