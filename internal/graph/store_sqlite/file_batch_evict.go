@@ -79,6 +79,11 @@ func (s *Store) evictByPredicate(predicate string, arg any, scope evictScope) (n
 // the receipt can stay complete instead of forcing the whole-graph fallback
 // resolve.
 func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictScope) (nodesRemoved, edgesRemoved int, retErr error) {
+	// An administrative sweep changes every view, regardless of the calling
+	// handle. Base invalidation advances every view's mutation witness too.
+	if scope == evictAllGenerations && s.viewGen != baseViewGeneration {
+		return s.atBase().evictByPredicateResult(predicate, arg, scope)
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 

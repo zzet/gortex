@@ -74,6 +74,11 @@ func (s *Store) PurgeRepo(prefix string) error {
 	if prefix == "" {
 		return fmt.Errorf("store_sqlite: PurgeRepo refuses empty repo prefix (would delete shared global externals / solo-repo data)")
 	}
+	// The sweep is generation-unscoped; invalidate the base so every view's
+	// analysis and process-local mutation witness observes the removal.
+	if s.viewGen != baseViewGeneration {
+		return s.atBase().PurgeRepo(prefix)
+	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
