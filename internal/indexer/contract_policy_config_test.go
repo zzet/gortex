@@ -17,19 +17,19 @@ func contractPolicyAcceptedRows(t *testing.T, settings config.IndexConfig) (stri
 	idx.config = settings
 	idx.SetRepoPrefix("fixture")
 	t.Cleanup(idx.Close)
-	source := []byte("package fixture\nfunc Call() { apiGet(\"/items\") }\n")
-	parsed, err := languages.NewGoExtractor().Extract("fixture/api.go", source)
+	source := []byte("export async function Call() { await apiGet(\"/items\"); }\n")
+	parsed, err := languages.NewTypeScriptExtractor().Extract("fixture/api.ts", source)
 	require.NoError(t, err)
 	if parsed.Tree != nil {
 		defer parsed.Tree.Release()
 	}
 	stampExtractionGraphFingerprint(parsed)
-	idx.stampContractDependencyInputs("fixture/api.go", "go", source, parsed)
+	idx.stampContractDependencyInputs("fixture/api.ts", "typescript", source, parsed)
 	rows, err := json.Marshal(parsed.Nodes)
 	require.NoError(t, err)
-	receipt, err := idx.collectContractBoundaryReceipt(context.Background(), "fixture/api.go", "go", source, parsed)
+	receipt, err := idx.collectContractBoundaryReceipt(context.Background(), "fixture/api.ts", "typescript", source, parsed)
 	require.NoError(t, err)
-	workerPolicy, err := contractFollowupPolicy(idx, "go")
+	workerPolicy, err := contractFollowupPolicy(idx, "typescript")
 	require.NoError(t, err)
 	require.Equal(t, receipt.Policy, workerPolicy, "accepted collector and detached worker must use the same policy")
 	return string(rows), receipt, workerPolicy
