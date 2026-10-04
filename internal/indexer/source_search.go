@@ -13,6 +13,20 @@ import (
 
 var ErrSourceSearchBudget = errors.New("source search resource budget exceeded")
 
+// DecodeSourceSearchText uses the indexer's built-in encoding policy while
+// preserving binary assets. Text search reads accepted source bytes, so it
+// does not run configured commands or other parser-specific transforms.
+func (idx *Indexer) DecodeSourceSearchText(path string, src []byte) []byte {
+	if idx.transforms != nil {
+		for _, transform := range idx.transforms.transforms {
+			if decoder, ok := transform.(utf16DecodeTransform); ok && decoder.matches(path) {
+				return decodeUTF16Source(src)
+			}
+		}
+	}
+	return src
+}
+
 // CurrentSourceSearchFiles enumerates admitted current sources without a graph
 // route. Config/content/size exclusions are the indexer's, while ignore files
 // are read from this checkout rather than cached from its canonical sibling.

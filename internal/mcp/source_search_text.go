@@ -28,16 +28,21 @@ func (s *Server) handleSourceSearchText(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError("search_text: " + err.Error()), nil
 	}
 	matches := make([]enrichedTextMatch, 0)
+	idx := s.sourceSearchIndexer(view)
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if trigram.IsBinary(file.content) || len(file.content) == 0 || len(file.content) > 64<<20 {
+		if len(file.content) == 0 || len(file.content) > 64<<20 {
+			continue
+		}
+		source := idx.DecodeSourceSearchText(file.abs, file.content)
+		if trigram.IsBinary(source) || len(source) > 64<<20 {
 			continue
 		}
 		path := sourceSearchGraphPath(view, file.path)
-		lang := s.detectLanguageForContent(file.abs, file.content[:min(512, len(file.content))])
-		content, _ := s.maybeRedactConfigLeaf(lang, path, false, string(file.content))
+		lang := s.detectLanguageForContent(file.abs, source[:min(512, len(source))])
+		content, _ := s.maybeRedactConfigLeaf(lang, path, false, string(source))
 		lines := strings.Split(content, "\n")
 		if strings.HasSuffix(content, "\n") {
 			lines = lines[:len(lines)-1]

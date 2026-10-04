@@ -41,6 +41,49 @@ func TestSourceSearchPendingScopePrecedesLimit(t *testing.T) {
 	require.Equal(t, "pending", rider["graph_freshness"])
 }
 
+func TestSourceSearchUTF16UsesDecodedTextAndRawEvidence(t *testing.T) {
+	srv, root := setupTestServer(t)
+	raw := utf16LEWithBOM(t, "package current\r\n// encodingneedle decoded source\r\n")
+	path := filepath.Join(root, "current.go")
+	require.NoError(t, os.WriteFile(path, raw, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "asset.png"), raw, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "binary.go"), append([]byte{'a', 0, 'b', 1}, []byte("encodingneedle")...), 0644))
+	view := &requestView{sourceScope: "text", viewRoot: root}
+	ctx := withRequestView(t.Context(), view)
+	files, err := srv.sourceSearchSnapshot(ctx, view, nil, ResolvedScope{})
+	require.NoError(t, err)
+	var captured []byte
+	for _, file := range files {
+		if file.path == "current.go" {
+			captured = file.content
+		}
+	}
+	require.Equal(t, raw, captured)
+	res, err := srv.handleSearchText(ctx, newSearchTextRequest("encodingneedle"))
+	require.NoError(t, err)
+	require.False(t, res.IsError, viewResultText(t, res))
+	require.Equal(t, []string{"current.go"}, searchTextMatchPaths(t, res))
+	var answer struct {
+		Matches []struct {
+			Line int    `json:"line"`
+			Text string `json:"text"`
+		} `json:"matches"`
+		Evidence struct {
+			Verified bool `json:"verified"`
+			Complete bool `json:"corpus_complete"`
+		} `json:"source_evidence"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(viewResultText(t, res)), &answer))
+	require.Len(t, answer.Matches, 1)
+	require.Equal(t, 2, answer.Matches[0].Line)
+	require.Equal(t, "// encodingneedle decoded source", answer.Matches[0].Text)
+	require.True(t, answer.Evidence.Verified)
+	require.True(t, answer.Evidence.Complete)
+	disk, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, raw, disk)
+}
+
 func TestSourceSearchUsesCurrentDiskAndPinnedOverlayInventory(t *testing.T) {
 	srv, root := setupTestServer(t)
 	// Indexed bytes must not survive a disk deletion or an editor tombstone.
