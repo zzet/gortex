@@ -154,28 +154,49 @@ func TestExportRelistAfterCompilingPassEndsSourceChecks(t *testing.T) {
 		return loader.meta
 	}
 
-	writeFile(t, root, "leaf/leaf.go", broken)
+	// This test specifically exercises content changes under retained metadata.
+	// recordManifest conservatively relists files stamped at/after listing
+	// start, so establish a stable pre-listing fixture instead of depending
+	// on the filesystem clock advancing between WriteFile and packages.Load.
+	fixtureStamp := time.Now().Add(-time.Minute)
+	writeLeaf := func(content string) {
+		t.Helper()
+		writeFile(t, root, "leaf/leaf.go", content)
+		require.NoError(t, os.Chtimes(filepath.Join(root, "leaf/leaf.go"), fixtureStamp, fixtureStamp))
+		fixtureStamp = fixtureStamp.Add(time.Second)
+	}
+	for _, rel := range []string{"mid/mid.go", "top/top.go"} {
+		require.NoError(t, os.Chtimes(filepath.Join(root, rel), fixtureStamp, fixtureStamp))
+	}
+	writeLeaf(broken)
 	c := retentionPass(t, p, root, relistTopHandle, false, "top while leaf is broken")
 	require.Equal(t, 0, c.RelistScheduled, "a tree that does not compile is never relisted")
 	st := retainedState(t, p, root)
-	st.mu.Lock()
-	require.Empty(t, st.meta["example.com/relist/leaf"].ExportFile, "fixture: leaf listed without export data")
-	st.mu.Unlock()
+	func() {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		require.Empty(t, st.meta["example.com/relist/leaf"].ExportFile, "fixture: leaf listed without export data")
+		for _, path := range []string{"example.com/relist/leaf", "example.com/relist/mid", "example.com/relist/top"} {
+			manifest := st.manifests[path]
+			require.NotNil(t, manifest, "retained fixture manifest for %s", path)
+			require.False(t, manifest.stale, "fixture requires stable retained metadata: path=%s listing_start_ns=%d files=%+v", path, st.listedAt[path].UnixNano(), manifest.files)
+		}
+	}()
 
 	// Still broken, now in a declaration: checked from source with hard
 	// errors, so nothing is relisted. (A dependency's function bodies are
 	// stripped when it is checked from source, so a body-only error there
 	// is not seen; the relist then finds it, and the signature bound keeps
 	// it to one listing per file state.)
-	writeFile(t, root, "leaf/leaf.go", strings.Replace(broken, "func New() A", "func New() Missing", 1))
+	writeLeaf(strings.Replace(broken, "func New() A", "func New() Missing", 1))
 	c = retentionPass(t, p, root, relistTopHandle, false, "leaf still broken")
-	require.Equal(t, 2, c.SourceDependencies, "fixture: leaf and mid are checked from source")
-	require.Equal(t, 0, c.RelistScheduled, "a pass with hard errors never relists")
+	require.Equal(t, 2, c.SourceDependencies, "fixture: leaf and mid are checked from source: counters=%+v", *c)
+	require.Equal(t, 0, c.RelistScheduled, "a pass with hard errors never relists: counters=%+v", *c)
 
-	writeFile(t, root, "leaf/leaf.go", leaf)
+	writeLeaf(leaf)
 	c = retentionPass(t, p, root, relistTopHandle, true, "edit undone")
-	require.Equal(t, 2, c.SourceDependencies, "leaf and mid are checked from source")
-	require.Equal(t, 1, c.RelistScheduled, "the pass compiled: one relist")
+	require.Equal(t, 2, c.SourceDependencies, "leaf and mid are checked from source: counters=%+v", *c)
+	require.Equal(t, 1, c.RelistScheduled, "the pass compiled: one relist: counters=%+v", *c)
 	p.waitExportRelists()
 	st.mu.Lock()
 	require.NotEmpty(t, st.meta["example.com/relist/leaf"].ExportFile, "the relist brought leaf's export data back")
