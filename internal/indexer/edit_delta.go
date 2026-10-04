@@ -729,7 +729,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// once before reading those inputs and retain the original through every
 	// engine pass and the guarded final publication.
 	var contractInputWitness *store_sqlite.PayloadInputWitness
-	if generations, complete := editDeltaContractInputGenerations(req.Base, b.Store); complete && b.contractCoreRuntime.Load() == nil {
+	if generations, complete := editDeltaContractInputGenerations(req.Base, b.Store); complete && b.contractCoreRuntime == nil {
 		var err error
 		contractInputWitness, err = b.Store.CapturePayloadInputWitness(ctx, generations)
 		if err != nil {

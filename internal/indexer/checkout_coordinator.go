@@ -813,6 +813,11 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 	case cfg.Builder == nil:
 		return nil, errors.New("indexer: checkout coordinator needs a generation builder")
 	}
+	// Freeze the concrete builder before freezing its producer identity. Live
+	// admission/provider handles remain shared, but later caller installation
+	// cannot retarget this owner's contract runtime.
+	builder := *cfg.Builder
+	cfg.Builder = &builder
 	logger := cfg.Logger
 	if logger == nil {
 		logger = zap.NewNop()

@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -528,7 +527,9 @@ type BuildReport struct {
 // SparseGenerationBuilder builds sparse payload generations over one store.
 // It holds no per-build state and is safe to reuse.
 type SparseGenerationBuilder struct {
-	contractCoreRuntime atomic.Pointer[ContractCoreRuntimeHooks]
+	// Installed before this builder is handed to a build or an owner. The
+	// hooks are immutable; copies retain their own installed configuration.
+	contractCoreRuntime *ContractCoreRuntimeHooks
 	// Store is any handle on the database. Generations are begun and published
 	// through it and the pass writes through the handle it hands back, so which
 	// generation this handle is pinned to does not matter.
@@ -2671,7 +2672,7 @@ func (b *SparseGenerationBuilder) declareProducers(
 			Reason:   "a sparse generation is resolved within one repository",
 		},
 	}
-	if b.contractCoreRuntime.Load() != nil {
+	if b.contractCoreRuntime != nil {
 		rows = append(rows, store_sqlite.ProducerCompleteness{Producer: string(graphview.CapContracts), State: store_sqlite.ProducerStateIncomplete, Reason: graphview.ReasonContractsPending})
 	}
 	if declaresText {

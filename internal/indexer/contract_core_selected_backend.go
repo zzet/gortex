@@ -148,7 +148,7 @@ func newSelectedContractCoreStorageBackend(ctx context.Context, target *store_sq
 	return backend, nil
 }
 func (b *SparseGenerationBuilder) installSelectedContractCoreInputs(ctx context.Context, idx *Indexer, handle *store_sqlite.Store, req BuildRequest) error {
-	hooks := b.contractCoreRuntime.Load()
+	hooks := b.contractCoreRuntime
 	if hooks == nil {
 		return nil
 	}

@@ -908,7 +908,7 @@ func (p *InitialBasePublisher) observe(ctx context.Context, graphID, repoPrefix 
 		Embedder:   l.mi.embedder,
 		Semantic:   l.mi.semanticMgr,
 	}
-	builder.contractCoreRuntime.Store(l.contractCoreRuntime.Load())
+	builder.contractCoreRuntime = l.contractCoreRuntime.Load()
 	cohort := dependencyCohortSource{
 		Target: DependencyRevisionTarget{
 			RepoPrefix: repoPrefix, WorkspaceID: idx.WorkspaceID(), ProjectID: idx.ProjectID(),

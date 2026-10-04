@@ -24,7 +24,7 @@ func contractGenerationProducerVersions(versions map[string]int, installed bool)
 // A generation advertises contract input receipts only when its producer owns
 // the installed runtime. This is independent of daemon process configuration.
 func (b *SparseGenerationBuilder) extractorVersionsFingerprint() string {
-	installed := b != nil && b.contractCoreRuntime.Load() != nil
+	installed := b != nil && b.contractCoreRuntime != nil
 	encoded, err := json.Marshal(contractGenerationProducerVersions(extractorVersionsSnapshot(), installed))
 	if err != nil {
 		return ""

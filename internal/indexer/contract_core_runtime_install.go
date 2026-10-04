@@ -46,7 +46,10 @@ func (idx *Indexer) beginInstalledContractCoreInputs(ctx context.Context) (func(
 }
 
 func (b *SparseGenerationBuilder) SetContractCoreRuntime(hooks ContractCoreRuntimeHooks) {
-	b.contractCoreRuntime.Store(&hooks)
+	// Configure before using this builder. Coordinators and ref managers take
+	// their own builder snapshot, so reinstalling a caller-owned builder does
+	// not change an owner's frozen producer identity or published callback.
+	b.contractCoreRuntime = &hooks
 }
 
 func (idx *Indexer) SetContractCoreRuntime(hooks ContractCoreRuntimeHooks) {
@@ -69,7 +72,7 @@ func (l *CheckoutLifecycle) SetContractCoreRuntime(hooks ContractCoreRuntimeHook
 }
 
 func (l *CheckoutLifecycle) installContractCoreBuilder(builder *SparseGenerationBuilder) *SparseGenerationBuilder {
-	builder.contractCoreRuntime.Store(l.contractCoreRuntime.Load())
+	builder.contractCoreRuntime = l.contractCoreRuntime.Load()
 	return builder
 }
 

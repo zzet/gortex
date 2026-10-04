@@ -334,6 +334,10 @@ func NewRefViewManager(cfg RefViewManagerConfig) (*RefViewManager, error) {
 	case cfg.Builder == nil:
 		return nil, errors.New("indexer: ref view manager needs a generation builder")
 	}
+	// Freeze the concrete builder with its producer identity. The handles and
+	// callback closures it carries remain shared; its installed runtime does not.
+	builder := *cfg.Builder
+	cfg.Builder = &builder
 	logger := cfg.Logger
 	if logger == nil {
 		logger = zap.NewNop()
