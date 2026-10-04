@@ -91,6 +91,7 @@ func oppositeMark(mark string) string {
 // pair, an extra unresolved call site, and a third indexed symbol.
 func genReadNodes(mark string) []*graph.Node {
 	nodes := []*graph.Node{
+		{ID: "env::generation_contract", Kind: graph.KindContract, Name: "Contract" + mark, FilePath: genReadFileA, RepoPrefix: genReadRepo, Meta: map[string]any{"type": "env", "role": "provider", "contract_meta": map[string]any{"marker": mark}}},
 		{ID: genReadFileA, Kind: graph.KindFile, Name: "a.go", FilePath: genReadFileA, RepoPrefix: genReadRepo, Language: "go"},
 		{ID: genImportFile(mark), Kind: graph.KindFile, Name: "b" + mark + ".go", FilePath: genImportFile(mark), RepoPrefix: genReadRepo, Language: "go"},
 		{
@@ -461,6 +462,20 @@ func generationReadProbes() []genProbe {
 			return nodeSliceMapTokens(s.FindNodesByNames(genReadProbeNames()))
 		}},
 
+		{name: "ContractRepoProjectionContext", run: func(t *testing.T, s *Store) []string {
+			p, err := s.LoadContractRepoProjectionContext(context.Background(), genReadRepo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return nodeTokens(p.ScalarNodes)
+		}},
+		{name: "LayerContractRepoProjectionContext", run: func(t *testing.T, s *Store) []string {
+			p, err := s.LayerContractRepoProjectionContext(context.Background(), genReadRepo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return nodeTokens(p.ScalarNodes)
+		}},
 		{name: "ContractFileProjectionContext", run: func(t *testing.T, s *Store) []string {
 			p, err := s.LoadContractFileProjectionContext(context.Background(), genReadRepo, []string{genReadFileA})
 			if err != nil {
@@ -1900,6 +1915,8 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.ConstantValueReader)(nil), skip: skipSidecar},
 		{iface: (*graph.ConstantValueContextReader)(nil), skip: skipSidecar},
 		{iface: (*graph.ConstantValueProjectionReader)(nil), probe: "ConstantValueProjectionContext"},
+		{iface: (*graph.ContractRepoProjectionReader)(nil), probe: "ContractRepoProjectionContext"},
+		{iface: (*graph.OverlayLayerContractRepoProjectionReader)(nil), probe: "LayerContractRepoProjectionContext"},
 		{iface: (*graph.ContractFileProjectionReader)(nil), probe: "ContractFileProjectionContext"},
 		{iface: (*graph.ConstantValueRepoReplacer)(nil), skip: skipSidecar},
 		{iface: (*graph.ConstantValueWriter)(nil), skip: skipSidecar},
