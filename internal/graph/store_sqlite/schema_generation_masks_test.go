@@ -65,19 +65,42 @@ func TestSchemaV17StoreGainsGenerationMaskTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create current store: %v", err)
 	}
+	t.Cleanup(func() {
+		if seed != nil {
+			_ = seed.Close()
+		}
+	})
 	seed.AddBatch([]*graph.Node{{
 		ID: "repo/a.go::Legacy", Kind: graph.KindFunction, Name: "Legacy",
 		FilePath: "repo/a.go", RepoPrefix: maskTestRepo,
 	}}, nil)
 	fresh := generationMaskSchemaObjects(t, seed.writerDB)
-	// Contract debt additionally has an index for repo/checkout-scoped base0
-	// reads. It must migrate with its table, not disappear from this comparison.
-	if len(fresh) != len(generationMaskTables)+1 {
-		t.Fatalf("fresh store has %d mask schema objects, want %d", len(fresh), len(generationMaskTables)+1)
+	// Contract input/debt and file-owned reverse membership indexes must migrate
+	// with their tables, not disappear from the fresh/migrated comparison.
+	indexes := []string{
+		"generation_contract_work_scope",
+		"contract_input_identity",
+		"contract_work_pending_scope",
+		"contract_boundary_keys_file",
+	}
+	if len(fresh) != len(generationMaskTables)+len(indexes) {
+		t.Fatalf("fresh store has %d mask schema objects, want %d", len(fresh), len(generationMaskTables)+len(indexes))
+	}
+	for _, mask := range generationMaskTables {
+		if _, ok := fresh[mask.table]; !ok {
+			t.Fatalf("fresh store is missing mask table %s", mask.table)
+		}
+	}
+	for _, name := range indexes {
+		if _, ok := fresh[name]; !ok {
+			t.Fatalf("fresh store is missing mask index %s", name)
+		}
 	}
 	if err := seed.Close(); err != nil {
 		t.Fatalf("close seed store: %v", err)
 	}
+
+	seed = nil
 
 	// Recreate the exact pre-mask shape: the graph exists, the mask tables do
 	// not, and the file is stamped at the version before they shipped.
