@@ -62,7 +62,12 @@ func TestShadowReplacementAdmitsForegroundWriter(t *testing.T) {
 			_, checkout := beginGenerationEvictionHandle(t, s, 1)
 			entered := make(chan struct{})
 			var once sync.Once
-			shadowDeleteObserver.Store(&shadowDeleteProbe{fire: func(string) { once.Do(func() { close(entered) }); time.Sleep(time.Millisecond) }})
+			var triggerCalls atomic.Int64
+			shadowDeleteObserver.Store(&shadowDeleteProbe{fire: func(string) {
+				triggerCalls.Add(1)
+				once.Do(func() { close(entered) })
+				time.Sleep(time.Millisecond)
+			}})
 			shadowDeleteTrigger(t, s, "nodes", "OLD.id")
 			type result struct {
 				n, e    int
@@ -85,7 +90,8 @@ func TestShadowReplacementAdmitsForegroundWriter(t *testing.T) {
 			t.Cleanup(func() {
 				cancelEviction()
 				select {
-				case <-done:
+				case r := <-done:
+					t.Logf("eviction joined: bounded=%v nodes=%d edges=%d elapsed=%s triggers=%d err=%v", bounded, r.n, r.e, r.elapsed, triggerCalls.Load(), r.err)
 				case <-time.After(5 * time.Second):
 					t.Error("eviction failed to join")
 				}
@@ -97,13 +103,28 @@ func TestShadowReplacementAdmitsForegroundWriter(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 750*time.Millisecond)
 			start := time.Now()
+			phase := "write_gate"
+			phaseStart := start
+			var gateElapsed, beginElapsed, insertElapsed, commitElapsed time.Duration
+			triggersAtStart := triggerCalls.Load()
 			err := s.writeMu.LockContext(ctx)
+			gateElapsed = time.Since(phaseStart)
+			triggersAtAdmission := triggerCalls.Load()
 			if err == nil {
+				phase = "begin_write"
+				phaseStart = time.Now()
 				tx, txErr := checkout.beginWriteContext(ctx)
+				beginElapsed = time.Since(phaseStart)
 				if txErr == nil {
+					phase = "insert"
+					phaseStart = time.Now()
 					_, txErr = tx.ExecContext(ctx, `INSERT INTO nodes(id,view_gen,kind,name,file_path,repo_prefix) VALUES(?,?,?,?,?,?)`, "checkout::write", checkout.viewGen, "function", "Write", "checkout::write.go", "checkout")
+					insertElapsed = time.Since(phaseStart)
 					if txErr == nil {
+						phase = "commit"
+						phaseStart = time.Now()
 						txErr = tx.Commit()
+						commitElapsed = time.Since(phaseStart)
 					} else {
 						_ = tx.Rollback()
 					}
@@ -116,6 +137,7 @@ func TestShadowReplacementAdmitsForegroundWriter(t *testing.T) {
 			}
 			foreground := time.Since(start)
 			cancel()
+			t.Logf("foreground: bounded=%v phase=%s err=%v total=%s gate=%s begin=%s insert=%s commit=%s triggers_start=%d triggers_admission=%d triggers_end=%d", bounded, phase, err, foreground, gateElapsed, beginElapsed, insertElapsed, commitElapsed, triggersAtStart, triggersAtAdmission, triggerCalls.Load())
 			if bounded {
 				require.NoError(t, err)
 				require.NotNil(t, checkout.GetNode("checkout::write"))
