@@ -15,6 +15,16 @@ import (
 	"github.com/zzet/gortex/internal/reach"
 )
 
+func TestBaseContractCapabilityRequiresDurableAuthority(t *testing.T) {
+	c := baseCorpusCompleteness()
+	if got := c.State(graphview.CapContracts); got != graphview.StateUnavailable {
+		t.Fatalf("silent base contract readiness = %s, want unavailable", got)
+	}
+	if err := c.Evaluate([]graphview.CapabilityID{graphview.CapSyntaxGraph, graphview.CapResolutionLocal, graphview.CapIncomingEdges, graphview.CapSourceSnapshot}, nil); err != nil {
+		t.Fatalf("contract authority blocked ordinary reads: %v", err)
+	}
+}
+
 // declareProducer states one producer's contribution for an already published
 // generation.
 //

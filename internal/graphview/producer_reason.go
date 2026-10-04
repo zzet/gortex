@@ -7,3 +7,8 @@ package graphview
 // tell it from a producer that is incomplete for good (a sparse generation's
 // similarity); the writer, the debt's derivation and the rider compare it.
 const ReasonDeferredToFollowup = "deferred_to_followup"
+
+// ReasonContractsPending records external contract work separately from graph
+// publication. Only acknowledgment of its exact work tokens clears the debt;
+// replacing or deleting a file does not establish completion.
+const ReasonContractsPending = "contracts_pending"

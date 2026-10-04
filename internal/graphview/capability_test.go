@@ -21,6 +21,7 @@ func TestKnownCapabilitiesCoverTheVocabulary(t *testing.T) {
 		{CapIncomingEdges, "graph.incoming_edges"},
 		{CapSimilarity, "graph.similarity"},
 		{CapSemantic, "graph.semantic"},
+		{CapContracts, "graph.contracts"},
 		{CapSearchSymbols, "search.symbols"},
 		{CapSearchContent, "search.content"},
 		{CapSearchVector, "search.vector"},

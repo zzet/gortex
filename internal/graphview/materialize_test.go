@@ -494,6 +494,9 @@ func TestMaterializeCheckoutCompletenessTakesTheWorstState(t *testing.T) {
 			}
 			// A capability no generation narrowed still evaluates, so the
 			// union narrows what the stack declared and nothing else.
+			if got := view.Completeness.State(CapContracts); got != StateUnavailable {
+				t.Errorf("silent legacy contract baseline = %q, want unavailable", got)
+			}
 			if err := view.Completeness.Evaluate([]CapabilityID{CapSyntaxGraph}, nil); err != nil {
 				t.Errorf("a capability nothing narrowed did not evaluate: %v", err)
 			}
@@ -525,7 +528,7 @@ func TestMaterializeCheckoutCompletenessRunsBottomUp(t *testing.T) {
 		t.Errorf("%s = %q, want %q", CapSearchText, got, StateUnavailable)
 	}
 	for _, id := range KnownCapabilities() {
-		if id == CapResolutionCrossRepo || id == CapSearchText {
+		if id == CapResolutionCrossRepo || id == CapSearchText || id == CapContracts {
 			continue
 		}
 		if got := view.Completeness.State(id); got != StateComplete {
@@ -1189,10 +1192,13 @@ func TestCompletenessOfAnEmptyStackDeniesTextSearch(t *testing.T) {
 		t.Fatalf("an empty stack reports %s = %q, want %q", CapSearchText, got, StateUnavailable)
 	}
 	// And the denial is scoped to the one capability the rule governs: every
-	// other capability still reads off the seed, which is what keeps a stack
+	// ordinary graph capability still reads off the seed, which keeps a stack
 	// that declares nothing from being refused wholesale.
+	if got := completeness.State(CapContracts); got != StateUnavailable {
+		t.Errorf("an empty stack reports %s = %q, want unavailable", CapContracts, got)
+	}
 	for _, id := range KnownCapabilities() {
-		if id == CapSearchText {
+		if id == CapSearchText || id == CapContracts {
 			continue
 		}
 		if got := completeness.State(id); got != StateComplete {

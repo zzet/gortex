@@ -40,6 +40,10 @@ const (
 	// producer incomplete with ReasonDeferredToFollowup, and the follow-up
 	// generation that enriches the same paths records it complete.
 	CapSemantic CapabilityID = "graph.semantic"
+	// CapContracts reads persisted contract ownership, matching and schema
+	// analysis for the selected view. Its producer can finish independently
+	// of source, syntax and local resolution publication.
+	CapContracts CapabilityID = "graph.contracts"
 	// CapSearchSymbols runs symbol search over the view.
 	CapSearchSymbols CapabilityID = "search.symbols"
 	// CapSearchContent runs content search over the view.
@@ -71,6 +75,7 @@ var knownCapabilities = []CapabilityID{
 	CapIncomingEdges,
 	CapSimilarity,
 	CapSemantic,
+	CapContracts,
 	CapSearchSymbols,
 	CapSearchContent,
 	CapSearchVector,

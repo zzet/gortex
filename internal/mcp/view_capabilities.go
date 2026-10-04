@@ -299,6 +299,9 @@ func baseCorpusCompleteness() graphview.Completeness {
 	for _, id := range graphview.KnownCapabilities() {
 		out[id] = graphview.StateComplete
 	}
+	// Contract readiness requires an explicit durable baseline and exact work
+	// acknowledgments. Legacy corpus silence cannot certify this capability.
+	out[graphview.CapContracts] = graphview.StateUnavailable
 	return out
 }
 

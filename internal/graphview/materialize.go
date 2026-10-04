@@ -156,8 +156,11 @@ type RepoView struct {
 
 	generations []int64
 	sources     []GenerationSource
-	lease       *Lease
-	closeOnce   sync.Once
+	// contractStore is used only by lazy contract consumers, never by ordinary
+	// view materialization. It derives the inherited mutable-corpus handle.
+	contractStore *store_sqlite.Store
+	lease         *Lease
+	closeOnce     sync.Once
 }
 
 // Generations lists every payload generation this view holds a lease on,
@@ -1018,12 +1021,13 @@ func (m *Materializer) assemble(
 		return nil, err
 	}
 	return &RepoView{
-		ID:           id,
-		Reader:       reader,
-		Completeness: completeness,
-		generations:  ancestry,
-		sources:      sources,
-		lease:        lease,
+		ID:            id,
+		Reader:        reader,
+		Completeness:  completeness,
+		generations:   ancestry,
+		sources:       sources,
+		contractStore: m.Store,
+		lease:         lease,
 	}, nil
 }
 
@@ -1160,6 +1164,7 @@ func (m *Materializer) completeness(generations []*store_sqlite.Store) (Complete
 		out[id] = StateComplete
 	}
 	topText := StateUnavailable
+	contractBaselineDeclared := false
 	stack := make([]producerLayer, len(generations))
 	for index, handle := range generations {
 		rows, err := handle.ProducerStates()
@@ -1177,13 +1182,16 @@ func (m *Materializer) completeness(generations []*store_sqlite.Store) (Complete
 			if !id.Valid() || !state.Valid() {
 				continue
 			}
+			if id == CapContracts && index == 0 {
+				contractBaselineDeclared = true
+			}
 			if id == CapSearchText {
 				if top {
 					topText = state
 				}
 				continue
 			}
-			if row.State == store_sqlite.ProducerStateIncomplete && row.Reason == ReasonDeferredToFollowup {
+			if id != CapContracts && row.State == store_sqlite.ProducerStateIncomplete && row.Reason == ReasonDeferredToFollowup {
 				satisfied, err := followupSatisfied(generations, stack, index, id)
 				if err != nil {
 					return nil, WrapViewError(CodeCheckoutInaccessible,
@@ -1204,6 +1212,12 @@ func (m *Materializer) completeness(generations []*store_sqlite.Store) (Complete
 	// generation list before this is reached today, so the invariant costs
 	// nothing; it also stops depending on that distant precondition.
 	out[CapSearchText] = topText
+	// A complete tail does not certify an older baseline whose contract
+	// analysis never declared readiness. Unlike syntax, legacy silence here
+	// can mean the whole contract tail was lost.
+	if !contractBaselineDeclared {
+		out[CapContracts] = StateUnavailable
+	}
 	return out, nil
 }
 
