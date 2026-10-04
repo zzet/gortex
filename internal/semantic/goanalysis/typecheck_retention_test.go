@@ -280,6 +280,9 @@ func TestTypecheckRetentionAtOrAfterListingStampRequiresRelist(t *testing.T) {
 	root := resolvedTempDir(t)
 	writeFile(t, root, "source.go", "package fixture\nfunc F() {}\n")
 	file := filepath.Join(root, "source.go")
+	generatedDir := resolvedTempDir(t)
+	writeFile(t, generatedDir, "generated.go", "package fixture\nfunc F() {}\n")
+	generated := filepath.Join(generatedDir, "generated.go")
 	stamp := time.Now().Add(-time.Minute)
 	require.NoError(t, os.Chtimes(file, stamp, stamp))
 	info, err := os.Stat(file)
@@ -299,12 +302,14 @@ func TestTypecheckRetentionAtOrAfterListingStampRequiresRelist(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			manifest := recordManifest(root, test.listingStart)
 			require.Equal(t, test.stale, manifest.stale)
-			meta := &packages.Package{PkgPath: "example.com/fixture", Dir: root, GoFiles: []string{file}, CompiledGoFiles: []string{file}, Module: &packages.Module{Main: true}}
+			meta := &packages.Package{PkgPath: "example.com/fixture", Dir: root, GoFiles: []string{file}, CompiledGoFiles: []string{generated}, Module: &packages.Module{Main: true}}
 			st := newCheckoutTypecheckState(root, "fixture")
 			st.meta[meta.PkgPath], st.byDir[root], st.manifests[meta.PkgPath] = meta, meta, manifest
 			check := st.checkRoots(map[string]struct{}{root: {}}, &semantic.CompilerCacheStats{})
 			if test.stale {
-				require.Equal(t, "root_files_changed", check.missReason, "fresh metadata remains unusable until a stable relist")
+				// Ordinary roots re-read source; cgo roots must instead regenerate
+				// their compiled files after an uncertain listing.
+				require.Equal(t, "cgo_changed", check.missReason, "fresh cgo metadata remains unusable until a stable relist")
 				require.Empty(t, check.roots)
 				require.Equal(t, dependencyShapeChanged, manifest.dependencyState(root, &semantic.CompilerCacheStats{}))
 			} else {
