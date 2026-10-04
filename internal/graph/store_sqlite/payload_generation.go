@@ -488,20 +488,56 @@ func (s *Store) PublishPayloadGeneration(ctx context.Context, generationID, publ
 // the lane itself, after its flip, so one publish window still produces exactly
 // one lane request rather than two.
 func (s *Store) publishPayloadGeneration(ctx context.Context, generationID, publishedAt int64, scheduleMaintenance bool) error {
-	if ctx == nil {
-		return fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
-	}
-	if generationID <= baseViewGeneration {
-		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
-	}
-	catalog := s.Catalog()
-	row, found, err := catalog.GetViewGeneration(ctx, generationID)
+	publication, err := s.PreparePayloadGenerationPublication(ctx, generationID)
 	if err != nil {
 		return err
-	} else if !found {
-		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
 	}
+	return publication.publish(ctx, publishedAt, scheduleMaintenance)
+}
 
+// PreparedPayloadGenerationPublication contains only the metadata a publication
+// reports. It holds no reader, transaction, lease or admission. Preparing it does
+// not seal a payload or authorize a state transition: Publish still performs all
+// validation and the guarded building-to-ready transition.
+type PreparedPayloadGenerationPublication struct {
+	store        *Store
+	generationID int64
+	ownerKind    string
+}
+
+// PreparePayloadGenerationPublication reads publication metadata before a caller
+// takes its physical build lane. Ordinary PublishPayloadGeneration callers run
+// preparation and publication consecutively.
+func (s *Store) PreparePayloadGenerationPublication(ctx context.Context, generationID int64) (*PreparedPayloadGenerationPublication, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("%w: nil context", ErrCatalogInvalidValue)
+	}
+	if generationID <= baseViewGeneration {
+		return nil, fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
+	}
+	row, found, err := s.Catalog().GetViewGeneration(ctx, generationID)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
+	}
+	return &PreparedPayloadGenerationPublication{store: s, generationID: generationID, ownerKind: row.OwnerKind}, nil
+}
+
+// Publish validates and seals the current payload, then publishes it only if
+// its catalog row is still building. Previously prepared metadata never replaces
+// these checks, and a later route flip retains its own transaction and guards.
+func (p *PreparedPayloadGenerationPublication) Publish(ctx context.Context, publishedAt int64) error {
+	return p.publish(ctx, publishedAt, true)
+}
+
+func (p *PreparedPayloadGenerationPublication) publish(ctx context.Context, publishedAt int64, scheduleMaintenance bool) error {
+	if ctx == nil || p == nil || p.store == nil {
+		return fmt.Errorf("%w: invalid publication", ErrCatalogInvalidValue)
+	}
+	s, generationID := p.store, p.generationID
+	catalog := s.Catalog()
 	var timings publishTimings
 	// The publish window is the closure below, and nothing but the transition
 	// happens inside it. Whole-database maintenance (ANALYZE / VACUUM /
@@ -529,7 +565,7 @@ func (s *Store) publishPayloadGeneration(ctx context.Context, generationID, publ
 		return err
 	}
 	timings.log(generationID)
-	viewmetrics.Count(viewmetrics.GenerationPublishedTotal, generationOwner(row.OwnerKind))
+	viewmetrics.Count(viewmetrics.GenerationPublishedTotal, generationOwner(p.ownerKind))
 	// Asked AFTER the window closed, not inside it: the request itself is two
 	// atomics and at most one goroutine start, but a request made inside the
 	// window would be a publish doing maintenance bookkeeping in its own

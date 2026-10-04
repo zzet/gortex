@@ -179,13 +179,7 @@ func (c *CheckoutCoordinator) flattenDirtyChainChecked(
 		abandon()
 		return dirtyLayerBuild{}, nil, err
 	}
-	if foldPublication != nil {
-		if err := foldPublication.beforePublish(ctx); err != nil {
-			abandon()
-			return dirtyLayerBuild{}, nil, err
-		}
-	}
-	if err := c.store.PublishPayloadGeneration(ctx, generationID, time.Now().Unix()); err != nil {
+	if err := publishCopiedGeneration(ctx, generationID, foldPublication, c.store.PreparePayloadGenerationPublication); err != nil {
 		abandon()
 		return dirtyLayerBuild{}, nil, fmt.Errorf("indexer: publish the folded working-tree generation %d: %w", generationID, err)
 	}
@@ -206,6 +200,24 @@ func (c *CheckoutCoordinator) flattenDirtyChainChecked(
 		zap.Int64("nodes", counts.Nodes), zap.Int64("edges", counts.Edges), zap.Int64("rows", counts.Rows),
 		zap.Duration("elapsed", time.Since(started)))
 	return dirtyLayerBuild{GenerationID: generationID, Key: logicalDirtyKey(row, commit.GenerationID)}, oldestFirst, nil
+}
+
+// publishCopiedGeneration prepares only report metadata outside an import's
+// physical lane. The caller's immutable-ancestry fence and live admission still
+// precede every payload seal, validation and guarded publication.
+func publishCopiedGeneration(ctx context.Context, generationID int64, admission *importFoldPublication,
+	prepare func(context.Context, int64) (*store_sqlite.PreparedPayloadGenerationPublication, error),
+) error {
+	publication, err := prepare(ctx, generationID)
+	if err != nil {
+		return err
+	}
+	if admission != nil {
+		if err := admission.beforePublish(ctx); err != nil {
+			return err
+		}
+	}
+	return publication.Publish(ctx, time.Now().Unix())
 }
 
 // verifyFlattenedChain compares, over everything the chain speaks for, the
