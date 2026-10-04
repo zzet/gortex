@@ -17,7 +17,19 @@ func (r *contractCoreEdges) FindNodesByNameContainingContext(ctx context.Context
 	return graph.FindNodesByNameContainingContext(ctx, r.Reader, substr, limit)
 }
 
-func (r *contractCoreEdges) FindNodesByNameContainingFilteredContext(ctx context.Context, substr string, limit int, filter graph.NameSearchFilter) ([]*graph.Node, error) {
+// Expose compact filtered lookup only when the selected reader has it. An
+// outer overlay otherwise retains its adaptive bounded legacy fetch policy.
+type contractCoreFilteredNames struct{ *contractCoreEdges }
+
+func newContractCoreEdges(reader graph.Reader, ctx context.Context, ids map[string]bool) graph.Reader {
+	core := &contractCoreEdges{Reader: reader, ctx: ctx, contractIDs: ids}
+	if _, ok := reader.(graph.FilteredContainingNameReader); ok {
+		return &contractCoreFilteredNames{core}
+	}
+	return core
+}
+
+func (r *contractCoreFilteredNames) FindNodesByNameContainingFilteredContext(ctx context.Context, substr string, limit int, filter graph.NameSearchFilter) ([]*graph.Node, error) {
 	return graph.FindNodesByNameContainingFilteredContext(ctx, r.Reader, substr, limit, filter)
 }
 

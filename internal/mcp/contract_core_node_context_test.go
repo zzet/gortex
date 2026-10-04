@@ -66,16 +66,16 @@ func (s *contractCoreLookupSpy) GetNodesByIDsContext(ctx context.Context, ids []
 func TestContractCoreLookupPreservesBoundedSelectedNameCapability(t *testing.T) {
 	base := graph.New()
 	base.AddBatch([]*graph.Node{
-		{ID: "old", Name: "Handler", Kind: graph.KindFunction, FilePath: "repo/edit.go", RepoPrefix: "repo"},
+		{ID: "repo/edit.go::Old", Name: "Handler", Kind: graph.KindFunction, FilePath: "repo/edit.go", RepoPrefix: "repo"},
 		{ID: "foreign", Name: "Handler", Kind: graph.KindFunction, FilePath: "other/a.go", RepoPrefix: "other"},
 		{ID: "contract", Name: "Handler", Kind: graph.KindContract, RepoPrefix: "repo"},
 	}, nil)
 	layer := graph.NewOverlayLayer()
-	current := &graph.Node{ID: "new", Name: "Handler", Kind: graph.KindFunction, FilePath: "repo/edit.go", RepoPrefix: "repo"}
+	current := &graph.Node{ID: "repo/edit.go::Current", Name: "Handler", Kind: graph.KindFunction, FilePath: "repo/edit.go", RepoPrefix: "repo"}
 	layer.AddNode(current.FilePath, current)
 	selected := graph.NewOverlaidViewWithLayer(base, layer)
 	spy := &contractCoreLookupSpy{Reader: selected}
-	reader := &contractCoreEdges{Reader: spy}
+	reader := newContractCoreEdges(spy, t.Context(), nil)
 	ctx := t.Context()
 	filter := graph.NameSearchFilter{RepoAllow: map[string]bool{"repo": true}, Accept: func(n *graph.Node) bool { return n.Kind == graph.KindFunction }}
 	rows, err := graph.FindNodesByNameContainingFilteredContext(ctx, reader, "Handler", 1, filter)
@@ -85,20 +85,24 @@ func TestContractCoreLookupPreservesBoundedSelectedNameCapability(t *testing.T) 
 	require.Equal(t, 1, spy.limit, "filter and candidate budget reach the selected compact reader")
 	require.Equal(t, 0, spy.legacyCalls, "wrapper must not trigger the unlimited contextless fallback")
 	require.Equal(t, ctx, spy.seenContext)
-	rows, err = reader.FindNodesByNameContext(ctx, "Handler")
+	rows, err = graph.FindNodesByNameContext(ctx, reader, "Handler")
 	require.NoError(t, err)
 	for _, row := range rows {
-		require.NotEqual(t, "old", row.ID, "selected file replacement is authoritative")
+		require.NotEqual(t, "repo/edit.go::Old", row.ID, "selected file replacement is authoritative")
 	}
-	node, err := reader.GetNodeContext(ctx, "new")
+	checked := reader.(interface {
+		GetNodeContext(context.Context, string) (*graph.Node, error)
+		GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error)
+	})
+	node, err := checked.GetNodeContext(ctx, "repo/edit.go::Current")
 	require.NoError(t, err)
 	require.Same(t, current, node)
-	node, err = reader.GetNodeContext(ctx, "old")
+	node, err = checked.GetNodeContext(ctx, "repo/edit.go::Old")
 	require.NoError(t, err)
 	require.Nil(t, node)
-	nodes, err := reader.GetNodesByIDsContext(ctx, []string{"old", "new"})
+	nodes, err := checked.GetNodesByIDsContext(ctx, []string{"repo/edit.go::Old", "repo/edit.go::Current"})
 	require.NoError(t, err)
-	require.Equal(t, map[string]*graph.Node{"new": current}, nodes)
+	require.Equal(t, map[string]*graph.Node{"repo/edit.go::Current": current}, nodes)
 	_, fastBFS := any(reader).(graph.BFSCapable)
 	_, fastFrontier := any(reader).(graph.FrontierExpander)
 	require.False(t, fastBFS)
@@ -108,32 +112,36 @@ func TestContractCoreLookupPreservesBoundedSelectedNameCapability(t *testing.T) 
 func TestContractCoreLookupCancellationAndCheckedErrors(t *testing.T) {
 	for _, test := range []struct {
 		name string
-		read func(context.Context, *contractCoreEdges) error
+		read func(context.Context, graph.Reader) error
 	}{
-		{"exact", func(ctx context.Context, r *contractCoreEdges) error {
-			_, err := r.FindNodesByNameContext(ctx, "Handler")
+		{"exact", func(ctx context.Context, r graph.Reader) error {
+			_, err := graph.FindNodesByNameContext(ctx, r, "Handler")
 			return err
 		}},
-		{"containing", func(ctx context.Context, r *contractCoreEdges) error {
-			_, err := r.FindNodesByNameContainingContext(ctx, "Handle", 1)
+		{"containing", func(ctx context.Context, r graph.Reader) error {
+			_, err := graph.FindNodesByNameContainingContext(ctx, r, "Handle", 1)
 			return err
 		}},
-		{"filtered", func(ctx context.Context, r *contractCoreEdges) error {
-			_, err := r.FindNodesByNameContainingFilteredContext(ctx, "Handle", 1, graph.NameSearchFilter{})
+		{"filtered", func(ctx context.Context, r graph.Reader) error {
+			_, err := graph.FindNodesByNameContainingFilteredContext(ctx, r, "Handle", 1, graph.NameSearchFilter{})
 			return err
 		}},
-		{"node", func(ctx context.Context, r *contractCoreEdges) error {
-			_, err := r.GetNodeContext(ctx, "handler")
+		{"node", func(ctx context.Context, r graph.Reader) error {
+			_, err := r.(interface {
+				GetNodeContext(context.Context, string) (*graph.Node, error)
+			}).GetNodeContext(ctx, "handler")
 			return err
 		}},
-		{"nodes", func(ctx context.Context, r *contractCoreEdges) error {
-			_, err := r.GetNodesByIDsContext(ctx, []string{"handler"})
+		{"nodes", func(ctx context.Context, r graph.Reader) error {
+			_, err := r.(interface {
+				GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error)
+			}).GetNodesByIDsContext(ctx, []string{"handler"})
 			return err
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			spy := &contractCoreLookupSpy{Reader: graph.New()}
-			reader := &contractCoreEdges{Reader: spy}
+			reader := newContractCoreEdges(spy, t.Context(), nil)
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
 			require.ErrorIs(t, test.read(ctx, reader), context.Canceled)
@@ -147,4 +155,32 @@ func TestContractCoreLookupCancellationAndCheckedErrors(t *testing.T) {
 			require.ErrorIs(t, test.read(ctx, reader), context.Canceled)
 		})
 	}
+}
+
+type contractCoreLegacyNameSpy struct {
+	graph.Reader
+	limits []int
+}
+
+func (s *contractCoreLegacyNameSpy) FindNodesByNameContaining(substr string, limit int) []*graph.Node {
+	s.limits = append(s.limits, limit)
+	return s.Reader.FindNodesByNameContaining(substr, limit)
+}
+
+func TestContractCoreLookupLegacyOverlayKeepsBoundedFetch(t *testing.T) {
+	base := graph.New()
+	for _, id := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
+		base.AddNode(&graph.Node{ID: id, Name: "Handler" + id, Kind: graph.KindFunction, RepoPrefix: "repo"})
+	}
+	spy := &contractCoreLegacyNameSpy{Reader: base}
+	reader := newContractCoreEdges(spy, t.Context(), nil)
+	_, compact := reader.(graph.FilteredContainingNameReader)
+	require.False(t, compact, "a legacy base must retain its outer overlay fetch policy")
+	selected := graph.NewOverlaidViewWithLayer(reader, graph.NewOverlayLayer())
+	rows, err := graph.FindNodesByNameContainingFilteredContext(t.Context(), selected, "Handler", 3, graph.NameSearchFilter{
+		Accept: func(n *graph.Node) bool { return n.Kind == graph.KindFunction },
+	})
+	require.NoError(t, err)
+	require.Len(t, rows, 3)
+	require.Equal(t, []int{6}, spy.limits, "legacy candidates stay bounded rather than fetching every match")
 }

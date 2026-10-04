@@ -151,7 +151,7 @@ func (binding *contractAnalysisContext) composedReader(ctx context.Context, core
 			layer.AddEdge(edge)
 		}
 		binding.composedLayer = layer
-		binding.composed = graph.NewOverlaidViewWithLayer(&contractCoreEdges{Reader: core, ctx: ctx, contractIDs: ids}, layer)
+		binding.composed = graph.NewOverlaidViewWithLayer(newContractCoreEdges(core, ctx, ids), layer)
 	})
 	if binding.composedErr != nil {
 		binding.recordReadError(binding.composedErr)
