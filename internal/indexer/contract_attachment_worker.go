@@ -48,11 +48,13 @@ type ContractFollowupCoreFile struct {
 // extractor bytes with their exact source/policy proof; it never falls back to current
 // filesystem bytes. The runner owns Release on every exit.
 type ContractFollowupSnapshot struct {
-	Key          graph.ContractAttachmentKey
-	Core         graph.Reader
-	Inputs       []graph.ContractInputWitness
-	Work         []graph.ContractWork
-	Files        []ContractFollowupFile
+	Key    graph.ContractAttachmentKey
+	Core   graph.Reader
+	Inputs []graph.ContractInputWitness
+	Work   []graph.ContractWork
+	Files  []ContractFollowupFile
+	// RepoConfigs is captured immutable extractor/transform policy authority.
+	RepoConfigs  map[string]config.IndexConfig
 	ReadAccepted func(context.Context, ContractFollowupFile) (ContractAcceptedSource, error)
 	ReadCoreFile func(context.Context, ContractFollowupFile) (ContractFollowupCoreFile, error)
 	Release      func()
