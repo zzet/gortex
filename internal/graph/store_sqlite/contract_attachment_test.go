@@ -769,6 +769,9 @@ func TestContractAttachmentCompanionPositiveFromSelectedAncestry(t *testing.T) {
 	if err != nil || len(viewed) != 1 || viewed[0].State != graph.ContractWorkPending {
 		t.Fatalf("linked cohort completed sibling=%#v %v", viewed, err)
 	}
+	if err := s.MarkPayloadGenerationSuperseded(ctx, selected); err != nil {
+		t.Fatal(err)
+	}
 	// An accepted companion mutation invalidates the exact captured cohort,
 	// even if this receiver is still an accepted leased historical generation.
 	nextA := baseA
