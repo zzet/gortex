@@ -783,18 +783,53 @@ func (w *closureWalk) collectPlaceholderReferrers(defines map[string]struct{}, o
 		if name == "" {
 			continue
 		}
-		if w.baseDefinesName(name) {
-			continue
-		}
-		if w.err != nil {
-			return
-		}
 		names = append(names, name)
 	}
 	if len(names) == 0 {
 		return
 	}
 	sort.Strings(names)
+	// Stage matches before adjacency: a failed page cannot turn a partial
+	// definition lookup into a set of newly introduced names.
+	if len(names) <= 8 {
+		// Small edits retain per-name early stops for common symbol names.
+		introduced := names[:0]
+		for _, name := range names {
+			defined := w.baseDefinesName(name)
+			if w.err != nil {
+				return
+			}
+			if !defined {
+				introduced = append(introduced, name)
+			}
+		}
+		names = introduced
+		if len(names) == 0 {
+			return
+		}
+	} else {
+		defined := make(map[string]struct{}, len(names))
+		err := graph.VisitNodesByNamesContext(ctx, w.req.Base, names, func(node *graph.Node) bool {
+			if w.isBaseDefinition(node) {
+				defined[node.Name] = struct{}{}
+			}
+			return len(defined) < len(names)
+		})
+		if err != nil {
+			w.err = err
+			return
+		}
+		introduced := names[:0]
+		for _, name := range names {
+			if _, exists := defined[name]; !exists {
+				introduced = append(introduced, name)
+			}
+		}
+		names = introduced
+		if len(names) == 0 {
+			return
+		}
+	}
 
 	keys := make(map[string]struct{})
 	for _, name := range names {
@@ -881,10 +916,7 @@ func (w *closureWalk) baseDefinesName(name string) bool {
 	}
 	found := false
 	err := graph.VisitNodesByNameContext(ctx, w.req.Base, name, func(node *graph.Node) bool {
-		if node == nil || node.FilePath == "" || !graph.IsReferenceableSymbol(node.Kind) {
-			return true
-		}
-		if node.RepoPrefix != "" && node.RepoPrefix != w.req.RepoPrefix {
+		if !w.isBaseDefinition(node) {
 			return true
 		}
 		found = true
@@ -895,6 +927,11 @@ func (w *closureWalk) baseDefinesName(name string) bool {
 		return false
 	}
 	return found
+}
+
+func (w *closureWalk) isBaseDefinition(node *graph.Node) bool {
+	return node != nil && node.FilePath != "" && graph.IsReferenceableSymbol(node.Kind) &&
+		(node.RepoPrefix == "" || node.RepoPrefix == w.req.RepoPrefix)
 }
 
 // findNodesByName carries the build request context through every closure name
