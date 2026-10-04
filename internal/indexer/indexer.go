@@ -3344,9 +3344,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					}
 				}
 				if err := drainAddBatch(ctx, diskTarget, nodes, nil); err != nil && retErr == nil {
-					retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", err)
+					retErr = fmt.Errorf("indexer: cooperative drain stopped: %w", err)
 				}
-				if retErr != nil && drainYieldable(ctx) && ctx.Err() != nil {
+				if retErr != nil && drainChecksCancellation(ctx) && ctx.Err() != nil {
 					break
 				}
 				if !ftsReady || retErr != nil {
@@ -3398,15 +3398,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				drainPressure.afterNodeBatch(nodeRows)
 			}
 			for edges := range inMemShadow.DrainEdgeBatches(persistChunkRows, persistChunkBytes) {
-				if drainYieldable(ctx) && ctx.Err() != nil {
+				if drainChecksCancellation(ctx) && ctx.Err() != nil {
 					if retErr == nil {
-						retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", ctx.Err())
+						retErr = fmt.Errorf("indexer: cooperative drain stopped: %w", ctx.Err())
 					}
 					break
 				}
 				if err := drainAddBatch(ctx, diskTarget, nil, edges); err != nil {
 					if retErr == nil {
-						retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", err)
+						retErr = fmt.Errorf("indexer: cooperative drain stopped: %w", err)
 					}
 					break
 				}
@@ -3456,10 +3456,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				zap.Int("fts_items", ftsItemCount),
 			)
 			finishDrainPressure()
-			if retErr == nil && drainYieldable(ctx) && ctx.Err() != nil {
-				// A background build that gave the lane up during the drain's
-				// last chunk skips the post-drain passes as well.
-				retErr = fmt.Errorf("indexer: drain stopped for the build lane: %w", ctx.Err())
+			if retErr == nil && drainChecksCancellation(ctx) && ctx.Err() != nil {
+				// Cancellation during the last slice also skips success provenance
+				// and post-drain passes, for either cooperative drain policy.
+				retErr = fmt.Errorf("indexer: cooperative drain stopped: %w", ctx.Err())
 			}
 			if retErr == nil {
 				// Success provenance and its planner-statistics boundary run after

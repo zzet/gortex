@@ -252,6 +252,7 @@ func (b *SparseGenerationBuilder) BuildClaimedDedicatedBase(ctx context.Context,
 	// A shutdown inside this build keeps the reservation for the next start
 	// (builder_dedicated_claimed_resume.go).
 	ctx = withKeepReservationOnCancel(ctx)
+	ctx = withInitialDrainCooperation(ctx, b.Store.WriteWanted)
 
 	// One bracket, both routes. See generationBulkWindow for why it is opened
 	// from inside the payload preparation and closed from out here.
