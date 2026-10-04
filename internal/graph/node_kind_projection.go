@@ -2,7 +2,6 @@ package graph
 
 import (
 	"context"
-	"errors"
 )
 
 // NodeKindRow is a read-only structural projection. Location/namespace are
@@ -21,10 +20,8 @@ type OverlayLayerNodeKindsByIDsReader interface {
 	LayerNodeKindsByIDsContext(context.Context, []string) (map[string]NodeKindRow, error)
 }
 
-var ErrNodeKindProjectionUnsupported = errors.New("checked layer node-kind projection unsupported")
-
 // GetNodeKindsByIDsContext reads only requested identities. Checked selected
-// capabilities take precedence over Unwrapper; legacy readers retain bounded
+// capabilities preserve their selected reader; legacy readers retain bounded
 // point-read compatibility, with cancellation checks and no whole-store scan.
 func GetNodeKindsByIDsContext(ctx context.Context, reader Reader, ids []string) (map[string]NodeKindRow, error) {
 	if ctx == nil {
@@ -46,9 +43,6 @@ func GetNodeKindsByIDsContext(ctx context.Context, reader Reader, ids []string) 
 			return nil, err
 		}
 		return rows, nil
-	}
-	if wrapped, ok := reader.(Unwrapper); ok && wrapped.Unwrap() != nil {
-		return GetNodeKindsByIDsContext(ctx, wrapped.Unwrap(), ids)
 	}
 	var nodes map[string]*Node
 	if checked, ok := reader.(contextNodesByIDsReader); ok {
@@ -118,13 +112,9 @@ func (v *OverlaidView) GetNodeKindsByIDsContext(ctx context.Context, ids []strin
 	}
 	own := make(map[string]NodeKindRow)
 	if v.layer != nil {
-		checked, ok := v.layer.(OverlayLayerNodeKindsByIDsReader)
-		if !ok {
-			return nil, ErrNodeKindProjectionUnsupported
-		}
 		var err error
-		// Even an empty partition validates cached physical ownership.
-		own, err = checked.LayerNodeKindsByIDsContext(ctx, ownIDs)
+		// Even an empty partition validates checked physical ownership.
+		own, err = layerNodeKinds(ctx, v.layer, ownIDs)
 		if err != nil {
 			return nil, err
 		}
@@ -134,7 +124,7 @@ func (v *OverlaidView) GetNodeKindsByIDsContext(ctx context.Context, ids []strin
 		return nil, err
 	}
 	if v.layer != nil {
-		if _, err := v.layer.(OverlayLayerNodeKindsByIDsReader).LayerNodeKindsByIDsContext(ctx, nil); err != nil {
+		if _, err := layerNodeKinds(ctx, v.layer, nil); err != nil {
 			return nil, err
 		}
 	}
@@ -152,6 +142,16 @@ func (v *OverlaidView) GetNodeKindsByIDsContext(ctx context.Context, ids []strin
 
 func (dw *DeltaWriter) GetNodeKindsByIDsContext(ctx context.Context, ids []string) (map[string]NodeKindRow, error) {
 	return dw.view.GetNodeKindsByIDsContext(ctx, ids)
+}
+
+// layerNodeKinds keeps legacy layer point-read semantics without pretending it
+// has checked physical provenance. GenerationLayer supplies the checked trait;
+// existing memory/test layers remain bounded and cancellation-aware.
+func layerNodeKinds(ctx context.Context, layer OverlayLayerReader, ids []string) (map[string]NodeKindRow, error) {
+	if checked, ok := layer.(OverlayLayerNodeKindsByIDsReader); ok {
+		return checked.LayerNodeKindsByIDsContext(ctx, ids)
+	}
+	return memoryLayerNodeKinds(ctx, layer, ids)
 }
 
 func memoryLayerNodeKinds(ctx context.Context, layer OverlayLayerReader, ids []string) (map[string]NodeKindRow, error) {
