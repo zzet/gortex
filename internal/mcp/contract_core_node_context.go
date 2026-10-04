@@ -21,12 +21,50 @@ func (r *contractCoreEdges) FindNodesByNameContainingContext(ctx context.Context
 // outer overlay otherwise retains its adaptive bounded legacy fetch policy.
 type contractCoreFilteredNames struct{ *contractCoreEdges }
 
+type contractCoreBoundedFiles struct {
+	*contractCoreEdges
+	files graph.BoundedFileNodeReader
+}
+
+type contractCoreFilteredNamesBoundedFiles struct{ *contractCoreBoundedFiles }
+
 func newContractCoreEdges(reader graph.Reader, ctx context.Context, ids map[string]bool) graph.Reader {
 	core := &contractCoreEdges{Reader: reader, ctx: ctx, contractIDs: ids}
-	if _, ok := reader.(graph.FilteredContainingNameReader); ok {
+	_, filtered := reader.(graph.FilteredContainingNameReader)
+	if files, ok := reader.(graph.BoundedFileNodeReader); ok {
+		bounded := &contractCoreBoundedFiles{contractCoreEdges: core, files: files}
+		if filtered {
+			return &contractCoreFilteredNamesBoundedFiles{bounded}
+		}
+		return bounded
+	}
+	if filtered {
 		return &contractCoreFilteredNames{core}
 	}
 	return core
+}
+
+func (r *contractCoreFilteredNamesBoundedFiles) FindNodesByNameContainingFilteredContext(ctx context.Context, substr string, limit int, filter graph.NameSearchFilter) ([]*graph.Node, error) {
+	return graph.FindNodesByNameContainingFilteredContext(ctx, r.Reader, substr, limit, filter)
+}
+
+// Keep localization optional and bounded: a selected reader without this
+// capability must still fail closed instead of hydrating legacy file rows.
+func (r *contractCoreBoundedFiles) FindFileNodesBounded(ctx context.Context, path string, scope graph.LocalizationNodeScope, limit int) (graph.BoundedNodeProjection, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return graph.BoundedNodeProjection{}, err
+	}
+	page, err := r.files.FindFileNodesBounded(ctx, path, scope, limit)
+	if err != nil {
+		return graph.BoundedNodeProjection{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return graph.BoundedNodeProjection{}, err
+	}
+	return page, nil
 }
 
 func (r *contractCoreFilteredNames) FindNodesByNameContainingFilteredContext(ctx context.Context, substr string, limit int, filter graph.NameSearchFilter) ([]*graph.Node, error) {
