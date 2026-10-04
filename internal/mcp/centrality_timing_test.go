@@ -13,7 +13,7 @@ import (
 type centralityTimingReadCounts struct{ nodes, edges, nodeIDs, edgeIDs int }
 
 type centralityTimingReader struct {
-	graph.Reader
+	graph.Store
 	counts centralityTimingReadCounts
 	cancel context.CancelFunc
 }
@@ -32,7 +32,7 @@ func (r *centralityTimingReader) GetNodesByIDsContext(ctx context.Context, ids [
 	}
 	r.counts.nodes++
 	r.counts.nodeIDs += len(ids)
-	return r.Reader.GetNodesByIDs(ids), nil
+	return r.Store.GetNodesByIDs(ids), nil
 }
 func (r *centralityTimingReader) GetOutEdgesByNodeIDsContext(ctx context.Context, ids []string, _ int) (map[string][]*graph.Edge, bool, error) {
 	if err := ctx.Err(); err != nil {
@@ -40,7 +40,7 @@ func (r *centralityTimingReader) GetOutEdgesByNodeIDsContext(ctx context.Context
 	}
 	r.counts.edges++
 	r.counts.edgeIDs += len(ids)
-	rows := r.Reader.GetOutEdgesByNodeIDs(ids)
+	rows := r.Store.GetOutEdgesByNodeIDs(ids)
 	if r.cancel != nil {
 		r.cancel()
 	}
@@ -57,7 +57,7 @@ func TestCentralityTimingPreservesCheckedReadsScoresAndCache(t *testing.T) {
 			run := func(observed bool) ([]rerank.CentralityResult, centralityTimingReadCounts, []rerank.CentralityTiming, int64, int64, int) {
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
-				reader := &centralityTimingReader{Reader: walkTestGraph(t)}
+				reader := &centralityTimingReader{Store: walkTestGraph(t)}
 				if canceled {
 					reader.cancel = cancel
 				}
