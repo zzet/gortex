@@ -89,15 +89,16 @@ func TestContractCoreStorageInterruptedPrimaryDoesNotBlockCoreOrCertifyNamespace
 }
 
 func TestContractCoreStorageLegacyMissingStateCannotBeCertifiedByPointEdit(t *testing.T) {
- ctx:=context.Background()
- _,store:=newSQLiteIndexer(t)
- backend,err:=newPrimaryContractCoreStorageBackend(ctx,store,"fixture")
- require.NoError(t,err)
- change:=contractCoreInputChange{FilePath:"fixture/ordinary.go",SourceFingerprint:"accepted",
-  Current:&contractBoundaryReceipt{Version:contractBoundaryReceiptVersion,FilePath:"fixture/ordinary.go",Source:"accepted",Policy:"policy"}}
- require.NoError(t,backend.BeginBoundaryMutation(ctx,[]contractCoreInputChange{change}))
- require.NoError(t,backend.AcceptBoundaryMutation(ctx))
- state,found,err:=store.ContractInputStateContext(ctx,"fixture","")
- require.NoError(t,err);require.True(t,found)
- require.False(t,state.Accepted,"point acceptance cannot certify an unknown historical namespace")
+	ctx := context.Background()
+	_, store := newSQLiteIndexer(t)
+	backend, err := newPrimaryContractCoreStorageBackend(ctx, store, "fixture")
+	require.NoError(t, err)
+	change := contractCoreInputChange{FilePath: "fixture/ordinary.go", SourceFingerprint: "accepted",
+		Current: &contractBoundaryReceipt{Version: contractBoundaryReceiptVersion, FilePath: "fixture/ordinary.go", Source: "accepted", Policy: "policy"}}
+	require.NoError(t, backend.BeginBoundaryMutation(ctx, []contractCoreInputChange{change}))
+	require.NoError(t, backend.AcceptBoundaryMutation(ctx))
+	state, found, err := store.ContractInputStateContext(ctx, "fixture", "")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.False(t, state.Accepted, "point acceptance cannot certify an unknown historical namespace")
 }

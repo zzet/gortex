@@ -502,7 +502,19 @@ func (mi *MultiIndexer) withRepositoryOutputGenerationSource(
 	if err != nil {
 		return err
 	}
-	return runUnderOutputReceipt(receipt, func() error {
+	mi.mu.RLock()
+	idx := mi.indexers[repoPrefix]
+	mi.mu.RUnlock()
+	var restore func()
+	if idx != nil {
+		restore, err = idx.beginInstalledContractCoreInputs(ctx)
+		if err != nil {
+			receipt.Abandon()
+			return err
+		}
+		defer restore()
+	}
+	err = runUnderOutputReceipt(receipt, func() error {
 		return fn(func(content *OutputSourceContent) {
 			if content != nil && content.Root == "" {
 				content.Root = target.RootPath
@@ -510,6 +522,10 @@ func (mi *MultiIndexer) withRepositoryOutputGenerationSource(
 			receipt.ObserveSourceContent(content)
 		})
 	})
+	if err != nil {
+		return err
+	}
+	return mi.acceptInstalledContractCoreInputs(ctx, repoPrefix)
 }
 
 // withRepositoryMutationLanes acquires a deterministic set of stable lanes.
@@ -1846,11 +1862,15 @@ func (idx *Indexer) withOutputGenerationSource(
 			receipt.ObserveSourceContent(content)
 		})
 	})
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	// Complete has validated the existing source/output authority. Contract
 	// eligibility cannot be acknowledged by the inner mutation body earlier.
 	if journal := current.contractCoreInputs; journal != nil {
-		if err := journal.accept(nil); err != nil { return err }
+		if err := journal.accept(nil); err != nil {
+			return err
+		}
 		if hooks := current.contractCoreRuntime.Load(); hooks != nil && hooks.Published != nil {
 			hooks.Published(ctx, current.repoPrefix, "")
 		}

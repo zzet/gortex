@@ -729,7 +729,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// once before reading those inputs and retain the original through every
 	// engine pass and the guarded final publication.
 	var contractInputWitness *store_sqlite.PayloadInputWitness
-	if generations, complete := editDeltaContractInputGenerations(req.Base, b.Store); complete {
+	if generations, complete := editDeltaContractInputGenerations(req.Base, b.Store); complete && b.contractCoreRuntime.Load() == nil {
 		var err error
 		contractInputWitness, err = b.Store.CapturePayloadInputWitness(ctx, generations)
 		if err != nil {
@@ -777,6 +777,10 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	idx.contractProjectionContext = ctx
 	idx.contractProjectionNeedsWitness = true
 	idx.contractInputWitness = contractInputWitness
+	if err := b.installSelectedContractCoreInputs(ctx, idx, handle, req); err != nil {
+		idx.Close()
+		return out, err
+	}
 	idx.cloneRecompute = cloneRecomputePaths(req.RepoPrefix, req.RecomputeDerivedPaths)
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
@@ -810,12 +814,12 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// across deltas over the same immutable stack (edit_delta_contract_cache.go).
 	// The registry is kept for the whole stack below the delta, the chain
 	// included: it is not composed per read (edit_delta_contract_cache.go).
-	if key, ok := editDeltaRegistryKey(keyBase, b.Store, req.RepoPrefix, req.WorkspaceID, req.ProjectID); ok {
+	if key, ok := editDeltaRegistryKey(keyBase, b.Store, req.RepoPrefix, req.WorkspaceID, req.ProjectID); ok && idx.contractCoreInputs == nil {
 		idx.contractRegistrySeed = func() {
 			out.ContractRegistryCached = seedEditDeltaContractRegistry(idx, key)
 		}
 	}
-	if req.headProvenance != nil {
+	if req.headProvenance != nil && idx.contractCoreInputs == nil {
 		idx.priorContractInputs = idx.verifiedHeadContractInputs(req.RootPath, req.headProvenance.sha)
 	}
 	// Prior rows without fingerprints are given their HEAD content's

@@ -337,7 +337,7 @@ type Indexer struct {
 
 	// contractCoreInputs is installed only by the complete asynchronous runtime.
 	// Nil preserves the legacy contract path while that runtime is disabled.
-	contractCoreInputs *contractCoreInputJournal
+	contractCoreInputs  *contractCoreInputJournal
 	contractCoreRuntime atomic.Pointer[ContractCoreRuntimeHooks]
 
 	// contractRegistry holds detected API contracts (HTTP routes, gRPC, etc.).
@@ -2725,6 +2725,19 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 // indexCtxRaw performs full-tree indexing while the caller holds the
 // repository mutation lane.
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
+	if idx.contractCoreRuntime.Load() != nil && idx.contractCoreInputs == nil {
+		// Raw MI doors retain this journal until their OUTER source receipt settles.
+		if _, err := idx.beginInstalledContractCoreInputs(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if journal := idx.contractCoreInputs; journal != nil {
+		if backend, ok := journal.backend.(*contractCoreStorageBackend); ok {
+			if err := backend.beginFullCoreNamespace(ctx); err != nil {
+				return nil, err
+			}
+		}
+	}
 	priorContractContext := idx.contractProjectionContext
 	idx.contractProjectionContext = ctx
 	idx.clearContractInputError()

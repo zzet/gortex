@@ -1067,6 +1067,10 @@ func (b *SparseGenerationBuilder) runPass(
 	report *BuildReport,
 ) (contextSeparation, error) {
 	idx := New(handle, b.Registry, b.Config, b.Logger)
+	if err := b.installSelectedContractCoreInputs(ctx, idx, handle, req); err != nil {
+		idx.Close()
+		return contextSeparation{}, err
+	}
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
 
@@ -2664,6 +2668,9 @@ func (b *SparseGenerationBuilder) declareProducers(
 			State:    store_sqlite.ProducerStateIncomplete,
 			Reason:   "a sparse generation is resolved within one repository",
 		},
+	}
+	if b.contractCoreRuntime.Load() != nil {
+		rows = append(rows, store_sqlite.ProducerCompleteness{Producer: string(graphview.CapContracts), State: store_sqlite.ProducerStateIncomplete, Reason: graphview.ReasonContractsPending})
 	}
 	if declaresText {
 		rows = append(rows, text)

@@ -78,15 +78,15 @@ type repositoryUntrackState struct {
 
 // MultiIndexer orchestrates indexing across multiple repositories.
 type MultiIndexer struct {
-	graph     graph.Store
+	graph               graph.Store
 	contractCoreRuntime atomic.Pointer[ContractCoreRuntimeHooks]
-	registry  *parser.Registry
-	search    search.Backend
-	embedder  embedding.Provider
-	repos     map[string]*RepoMetadata // repoPrefix → metadata
-	indexers  map[string]*Indexer      // repoPrefix → per-repo indexer
-	configMgr *config.ConfigManager
-	logger    *zap.Logger
+	registry            *parser.Registry
+	search              search.Backend
+	embedder            embedding.Provider
+	repos               map[string]*RepoMetadata // repoPrefix → metadata
+	indexers            map[string]*Indexer      // repoPrefix → per-repo indexer
+	configMgr           *config.ConfigManager
+	logger              *zap.Logger
 	// newIndexer is instance-local so lifecycle tests can observe a constructor
 	// failure without publishing the candidate Indexer. Production instances set
 	// it to New; every per-repository construction flows through this factory.
@@ -2423,7 +2423,17 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 		// Fulfilment is refused when a newer mutation took over any of these
 		// owners while the batch ran; the batch then reports that refusal
 		// instead of announcing a completed cold index.
-		return receipts.Complete()
+		if err := receipts.Complete(); err != nil {
+			return err
+		}
+		for prefix, result := range finalResults {
+			if result != nil && len(result.FailedFiles) == 0 {
+				if err := mi.acceptInstalledContractCoreInputs(context.Background(), prefix); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	})
 	return finalResults, laneErr
 }
@@ -2488,7 +2498,6 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 	// Replace only the base handle's generation before re-indexing. A lone repo
 	// is stored prefixed from its first index, but immutable commit/dirty/ref
 	// payload generations may carry the same prefix and must remain intact.
-	evictRepoCurrentGeneration(mi.graph, repoPrefix)
 
 	mi.configMgr.LoadWorkspaceConfig(repoPrefix, meta.RootPath)
 	cfg := mi.configMgr.GetRepoConfig(repoPrefix)
@@ -2512,6 +2521,17 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 	idx.SetWorkspaceID(resolveWorkspaceID(entry, cfg, repoPrefix))
 	idx.SetProjectID(resolveProjectID(entry, cfg, repoPrefix))
 
+	if _, err := idx.beginInstalledContractCoreInputs(context.Background()); err != nil {
+		return nil, err
+	}
+	if journal := idx.contractCoreInputs; journal != nil {
+		if backend, ok := journal.backend.(*contractCoreStorageBackend); ok {
+			if err := backend.beginFullCoreNamespace(context.Background()); err != nil {
+				return nil, err
+			}
+		}
+	}
+	evictRepoCurrentGeneration(mi.graph, repoPrefix)
 	result, err := idx.indexCtxRaw(context.Background(), meta.RootPath)
 	if err != nil {
 		return nil, fmt.Errorf("indexing %s: %w", meta.RootPath, err)
@@ -4334,7 +4354,9 @@ func (mi *MultiIndexer) wrapperSourceReader() contracts.SourceReader {
 // via the `contracts check` tool and traversals stop at each service's
 // boundary.
 func (mi *MultiIndexer) ReconcileContractEdges() int {
-	if mi.contractCoreRuntime.Load() != nil { return 0 }
+	if mi.contractCoreRuntime.Load() != nil {
+		return 0
+	}
 	// Serialise the whole pass: the evict-then-mint of EdgeMatches, topic
 	// edges, and the bridge subgraph spans many non-atomic store writes,
 	// and several goroutines call this concurrently (see reconcileMu).

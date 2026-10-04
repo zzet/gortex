@@ -57,7 +57,7 @@ func contractCoreStoredReceipt(repo, checkout string, change contractCoreInputCh
 		var err error
 		row.Payload, err = json.Marshal(struct {
 			Version, FilePath, Uncertainty string
-			Deleted bool
+			Deleted                        bool
 		}{contractBoundaryReceiptVersion, row.FilePath, reason, row.Deleted})
 		if err != nil {
 			return row, err
