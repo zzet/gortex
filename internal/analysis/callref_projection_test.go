@@ -214,18 +214,23 @@ func TestCallRefProjectionKeepsNoPartialRecord(t *testing.T) {
 // parkLatency runs analyze over a slowed store at GOMAXPROCS=1, raises the
 // yield predicate once the scan is under way, and returns how long the pass
 // took to park, and how many rows it read while it should have been parked.
-func parkLatency(t *testing.T, analyze func(graph.Store, *Pace)) (time.Duration, int64) {
+func parkLatency(t *testing.T, analyze func(graph.Store, *Pace)) (time.Duration, int64, int64, int64) {
 	t.Helper()
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
 	store := projectionFixture(3000)
 	store.perRow = 20 * time.Microsecond
 	var editing atomic.Bool
-	pace := NewPace(editing.Load)
-	parked := make(chan time.Time, 1)
+	var predicateChecks atomic.Int64
+	pace := NewPace(func() bool { predicateChecks.Add(1); return editing.Load() })
+	type parkWitness struct {
+		at           time.Time
+		rows, checks int64
+	}
+	parked := make(chan parkWitness, 1)
 	pace.onPark = func() {
 		select {
-		case parked <- time.Now():
+		case parked <- parkWitness{at: time.Now(), rows: store.rows.Load(), checks: predicateChecks.Load()}:
 		default:
 		}
 	}
@@ -237,9 +242,10 @@ func parkLatency(t *testing.T, analyze func(graph.Store, *Pace)) (time.Duration,
 	for store.rows.Load() < 3600 { // past the node scan: mid edge scan
 		time.Sleep(time.Millisecond)
 	}
+	rowsAtRaise, checksAtRaise := store.rows.Load(), predicateChecks.Load()
 	raised := time.Now()
 	editing.Store(true)
-	var at time.Time
+	var at parkWitness
 	select {
 	case at = <-parked:
 	case <-time.After(5 * time.Second):
@@ -248,7 +254,7 @@ func parkLatency(t *testing.T, analyze func(graph.Store, *Pace)) (time.Duration,
 		t.Fatal("the pass never parked")
 	}
 	// While parked the pass reads nothing.
-	rowsAtPark := store.rows.Load()
+	rowsAtPark := at.rows
 	time.Sleep(200 * time.Millisecond)
 	moved := store.rows.Load() - rowsAtPark
 	editing.Store(false)
@@ -257,7 +263,7 @@ func parkLatency(t *testing.T, analyze func(graph.Store, *Pace)) (time.Duration,
 	case <-time.After(60 * time.Second):
 		t.Fatal("the pass never finished after the edit")
 	}
-	return at.Sub(raised), moved
+	return at.at.Sub(raised), moved, at.rows - rowsAtRaise, at.checks - checksAtRaise
 }
 
 // A background pass gives the core back within 100 ms of an edit cycle (or a
@@ -277,9 +283,9 @@ func TestPacedAnalysisParksMidScanWithinTheBound(t *testing.T) {
 	}
 	for name, analyze := range cases {
 		t.Run(name, func(t *testing.T) {
-			latency, moved := parkLatency(t, analyze)
+			latency, moved, rowsBeforePark, predicateChecks := parkLatency(t, analyze)
 			if latency > 100*time.Millisecond {
-				t.Fatalf("the pass parked %v after the edit began, want at most 100ms", latency)
+				t.Fatalf("the pass parked %v after the edit began, want at most 100ms (rows advanced=%d predicate checks=%d)", latency, rowsBeforePark, predicateChecks)
 			}
 			if moved != 0 {
 				t.Fatalf("the pass read %d rows while it should have been parked", moved)
