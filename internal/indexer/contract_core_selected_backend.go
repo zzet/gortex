@@ -130,7 +130,9 @@ func newSelectedContractCoreStorageBackend(ctx context.Context, target *store_sq
 	var inherited *graph.ContractInputState
 	if cumulativeGeneration > 0 && cumulative.CheckoutID == checkout {
 		row, found, err := target.Catalog().GetViewGeneration(ctx, target.ViewGeneration())
-		if err != nil { return nil, err }
+		if err != nil {
+			return nil, err
+		}
 		if found && row.BaseGenerationID == cumulativeGeneration {
 			// The storage CAS deliberately follows explicit catalog ancestry.
 			// It must see the same original selected parent, not expect absence.
