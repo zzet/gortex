@@ -34,14 +34,14 @@ func newContractCoreEdges(reader graph.Reader, ctx context.Context, ids map[stri
 	if files, ok := reader.(graph.BoundedFileNodeReader); ok {
 		bounded := &contractCoreBoundedFiles{contractCoreEdges: core, files: files}
 		if filtered {
-			return &contractCoreFilteredNamesBoundedFiles{bounded}
+			return preserveContractCoreScopedProjection(&contractCoreFilteredNamesBoundedFiles{bounded}, reader, core)
 		}
-		return bounded
+		return preserveContractCoreScopedProjection(bounded, reader, core)
 	}
 	if filtered {
-		return &contractCoreFilteredNames{core}
+		return preserveContractCoreScopedProjection(&contractCoreFilteredNames{core}, reader, core)
 	}
-	return core
+	return preserveContractCoreScopedProjection(core, reader, core)
 }
 
 func (r *contractCoreFilteredNamesBoundedFiles) FindNodesByNameContainingFilteredContext(ctx context.Context, substr string, limit int, filter graph.NameSearchFilter) ([]*graph.Node, error) {
