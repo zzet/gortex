@@ -108,21 +108,7 @@ func (c *ContractAnalysisCoordinator) Request(ctx context.Context, view *graphvi
 			return false, nil
 		}
 		key := graph.ContractAttachmentKey{RepoPrefix: repo, CheckoutID: checkout}
-		waiter := contractBaselineWaiter{key: key, done: ctx.Done()}
-		c.mu.Lock()
-		observation := &contractBaselineObservation{changed: c.changed}
-		if old := c.baselines[waiter]; old != nil && old.stop != nil {
-			old.stop()
-		}
-		c.baselines[waiter] = observation
-		observation.stop = context.AfterFunc(ctx, func() {
-			c.mu.Lock()
-			if c.baselines[waiter] == observation {
-				delete(c.baselines, waiter)
-			}
-			c.mu.Unlock()
-		})
-		c.mu.Unlock()
+		waiter, observation := c.observeProgress(ctx, key)
 		admitted, err := c.options.ReconcileBaseline(ctx, view, repo, checkout)
 		if !admitted || err != nil {
 			c.mu.Lock()
@@ -136,6 +122,10 @@ func (c *ContractAnalysisCoordinator) Request(ctx context.Context, view *graphvi
 		return admitted, err
 	}
 	key := graph.ContractAttachmentKey{RepoPrefix: repo, CheckoutID: checkout, InputVersion: inputs.State.InputVersion, InputFingerprint: inputs.State.InputFingerprint}
+	if !inputs.State.Accepted {
+		c.observeProgress(ctx, key)
+		return true, nil // Core acceptance/supersession owns eligibility, not this job.
+	}
 	if key.InputVersion != "" && key.InputFingerprint != "" {
 		header, err := c.options.Store.GetContractAttachmentContext(ctx, key)
 		if err != nil {
@@ -251,6 +241,27 @@ func (c *ContractAnalysisCoordinator) Request(ctx context.Context, view *graphvi
 	return true, nil
 }
 
+// observeProgress records a request-local acceptance observation before an
+// admission callback can publish. A later episode never inherits a closed one.
+func (c *ContractAnalysisCoordinator) observeProgress(ctx context.Context, key graph.ContractAttachmentKey) (contractBaselineWaiter, *contractBaselineObservation) {
+	waiter := contractBaselineWaiter{key: key, done: ctx.Done()}
+	c.mu.Lock()
+	observation := &contractBaselineObservation{changed: c.changed}
+	if old := c.baselines[waiter]; old != nil && old.stop != nil {
+		old.stop()
+	}
+	c.baselines[waiter] = observation
+	observation.stop = context.AfterFunc(ctx, func() {
+		c.mu.Lock()
+		if c.baselines[waiter] == observation {
+			delete(c.baselines, waiter)
+		}
+		c.mu.Unlock()
+	})
+	c.mu.Unlock()
+	return waiter, observation
+}
+
 func contractAnalysisCohortID(snapshot ContractFollowupSnapshot, cfg config.IndexConfig) (string, error) {
 	// Exact physical witnesses preserve source actor, order, Found and Accepted.
 	// No source clock or latest attachment substitutes for immutable authority.
@@ -273,9 +284,11 @@ func contractAnalysisCohortID(snapshot ContractFollowupSnapshot, cfg config.Inde
 // its original RPC deadline; they are never represented as fresh analysis.
 func (c *ContractAnalysisCoordinator) WaitChange(ctx context.Context, key graph.ContractAttachmentKey) error {
 	c.mu.Lock()
-	changed := c.changed
+	var changed <-chan struct{} = c.changed
 	waiter := contractBaselineWaiter{key: key, done: ctx.Done()}
+	progressOnly := false
 	if baseline := c.baselines[waiter]; baseline != nil {
+		progressOnly = true
 		changed = baseline.changed
 		delete(c.baselines, waiter)
 		if baseline.stop != nil {
@@ -288,7 +301,7 @@ func (c *ContractAnalysisCoordinator) WaitChange(ctx context.Context, key graph.
 	if closed {
 		return context.Canceled
 	}
-	if key.InputVersion == "" || key.InputFingerprint == "" {
+	if progressOnly || key.InputVersion == "" || key.InputFingerprint == "" {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -456,4 +469,33 @@ func (c *ContractAnalysisCoordinator) CloseContext(ctx context.Context) error {
 		return ctx.Err()
 	}
 	return nil
+}
+
+// ContractAnalysisYield gives foreground demand priority between bounded worker
+// units without letting one pause consume a strict RPC's entire budget. After
+// 25ms of sustained demand the background lane gets one progress opportunity;
+// it holds no core publication lane and yields again at its next checkpoint.
+func ContractAnalysisYield(shouldYield func() bool) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if shouldYield == nil || !shouldYield() {
+			return nil
+		}
+		capTimer := time.NewTimer(25 * time.Millisecond)
+		defer capTimer.Stop()
+		poll := time.NewTicker(5 * time.Millisecond)
+		defer poll.Stop()
+		for shouldYield() {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-capTimer.C:
+				return ctx.Err()
+			case <-poll.C:
+			}
+		}
+		return ctx.Err()
+	}
 }

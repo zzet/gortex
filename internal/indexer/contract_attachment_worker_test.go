@@ -657,7 +657,25 @@ func TestContractFollowupManifestUsesRealCoreOwnerAndTrackedModuleIdentity(t *te
 	if _, err := RunContractFollowup(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
-	registry, err := contracts.LoadRegistryFromGraphChecked(context.Background(), req.Payload, contracts.RegistryLoadOptions{RepoPrefix: "repo-a"})
+	materializer := &graphview.Materializer{Store: f.store, Catalog: f.store.Catalog(), Leases: f.leases}
+	inputA, err := materializer.CaptureContractInputs(context.Background(), nil, "repo-a", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputB, err := materializer.CaptureContractInputs(context.Background(), nil, "repo-b", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, err := graphview.ComposeSelectedContractInputs("repo-a", "", inputA, inputB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	analysis, err := materializer.OpenContractAnalysisForInputs(context.Background(), nil, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer analysis.Close()
+	registry, err := contracts.LoadRegistryFromGraphChecked(context.Background(), analysis.RegistryReader, contracts.RegistryLoadOptions{RepoPrefix: "repo-a"})
 	if err != nil {
 		t.Fatal(err)
 	}

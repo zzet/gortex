@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,14 +18,24 @@ func TestContractAnalysisCoordinatorCoalescesOwnedCohortAndPublishesBothTargets(
 	b := f.request(t, "repo-b", "unused-coordinator-b")
 	var released atomic.Int64
 	var reads atomic.Int64
+	var coreReads atomic.Int64
+	var readMu sync.Mutex
+	uniqueReads := make(map[string]bool)
 	started := make(chan struct{})
 	resume := make(chan struct{})
 	var entered atomic.Bool
 	capture := func(ctx context.Context, _ *graphview.RepoView, _ *graphview.SelectedContractInputs, _, _ string) (ContractFollowupSnapshot, []ContractFollowupTarget, error) {
 		snapshot := a.Snapshot
 		snapshot.Release = func() { released.Add(1) }
+		snapshot.ReadCoreFile = func(ctx context.Context, file ContractFollowupFile) (ContractFollowupCoreFile, error) {
+			coreReads.Add(1)
+			return a.Snapshot.ReadCoreFile(ctx, file)
+		}
 		snapshot.ReadAccepted = func(ctx context.Context, file ContractFollowupFile) (ContractAcceptedSource, error) {
 			reads.Add(1)
+			readMu.Lock()
+			uniqueReads[file.Path] = true
+			readMu.Unlock()
 			if entered.CompareAndSwap(false, true) {
 				close(started)
 				select {
@@ -37,12 +48,12 @@ func TestContractAnalysisCoordinatorCoalescesOwnedCohortAndPublishesBothTargets(
 		}
 		return snapshot, []ContractFollowupTarget{{Key: a.Snapshot.Key, Work: a.Snapshot.Work, Catalog: f.store}, {Key: b.Snapshot.Key, Work: b.Snapshot.Work, Catalog: f.store}}, nil
 	}
-	c, err := NewContractAnalysisCoordinator(ContractAnalysisCoordinatorOptions{Store: f.store, Leases: f.leases, Registry: f.registry, Config: f.cfg, Capture: capture, Yield: func(ctx context.Context) error { return ctx.Err() }})
+	c, err := NewContractAnalysisCoordinator(ContractAnalysisCoordinatorOptions{Store: f.store, Leases: f.leases, Registry: f.registry, Config: f.cfg, Capture: capture, Yield: ContractAnalysisYield(func() bool { return true })})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
-	inputs := &graphview.SelectedContractInputs{}
+	inputs := &graphview.SelectedContractInputs{State: graph.ContractInputState{Accepted: true}}
 	admitted, err := c.Request(context.Background(), nil, inputs, "repo-a", "")
 	if err != nil || !admitted {
 		t.Fatalf("admit=%v err=%v", admitted, err)
@@ -79,10 +90,16 @@ func TestContractAnalysisCoordinatorCoalescesOwnedCohortAndPublishesBothTargets(
 	if err := c.CloseContext(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if reads.Load() != int64(len(f.files)) || released.Load() != 2 || f.leases.Held() != 0 {
-		t.Fatalf("shared source reads=%d releases=%d leases=%d", reads.Load(), released.Load(), f.leases.Held())
+	readMu.Lock()
+	uniqueCount := len(uniqueReads)
+	readMu.Unlock()
+	// Lazy body/signature enrichment may legitimately reread an accepted file;
+	// complete core census admission must occur exactly once for the cohort.
+	if uniqueCount != len(f.files) || coreReads.Load() != int64(len(f.files)) || reads.Load() < int64(uniqueCount) || released.Load() != 2 || f.leases.Held() != 0 {
+		t.Fatalf("shared sources raw=%d unique=%d core census=%d releases=%d leases=%d", reads.Load(), uniqueCount, coreReads.Load(), released.Load(), f.leases.Held())
 	}
-	// Exact retained headers satisfy a racing waiter without starting a new job.
+	// Sustained foreground demand stayed true for every scheduling checkpoint,
+	// yet the real shared worker published both targets under this same deadline.
 }
 
 func TestContractAnalysisCoordinatorBaselineRaceAndCancellation(t *testing.T) {
@@ -141,7 +158,7 @@ func TestContractAnalysisCoordinatorCloseJoinsAdmissionRelease(t *testing.T) {
 	}
 	requestDone := make(chan error, 1)
 	go func() {
-		_, err := c.Request(context.Background(), nil, &graphview.SelectedContractInputs{}, "repo-a", "")
+		_, err := c.Request(context.Background(), nil, &graphview.SelectedContractInputs{State: graph.ContractInputState{Accepted: true}}, "repo-a", "")
 		requestDone <- err
 	}()
 	select {
@@ -159,6 +176,28 @@ func TestContractAnalysisCoordinatorCloseJoinsAdmissionRelease(t *testing.T) {
 		t.Fatal("incomplete handoff accepted")
 	}
 	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestContractAnalysisCoordinatorPendingAcceptanceWaitsWithoutCapture(t *testing.T) {
+	f := newContractWorkerFixture(t)
+	c, err := NewContractAnalysisCoordinator(ContractAnalysisCoordinatorOptions{Store: f.store, Leases: f.leases, Registry: f.registry, Config: f.cfg, Capture: func(context.Context, *graphview.RepoView, *graphview.SelectedContractInputs, string, string) (ContractFollowupSnapshot, []ContractFollowupTarget, error) {
+		t.Error("pending input was captured for analysis")
+		return ContractFollowupSnapshot{}, nil, errors.New("pending")
+	}, Yield: ContractAnalysisYield(nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	inputs := &graphview.SelectedContractInputs{State: graph.ContractInputState{RepoPrefix: "repo-a", InputVersion: "pending-v", InputFingerprint: "pending-f"}}
+	if admitted, err := c.Request(ctx, nil, inputs, "repo-a", ""); err != nil || !admitted {
+		t.Fatalf("pending observation=%v %v", admitted, err)
+	}
+	c.Published(ctx, "repo-a", "") // Acceptance races Wait registration.
+	if err := c.WaitChange(ctx, graph.ContractAttachmentKey{RepoPrefix: "repo-a", InputVersion: "pending-v", InputFingerprint: "pending-f"}); err != nil {
 		t.Fatal(err)
 	}
 }
