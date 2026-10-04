@@ -345,7 +345,6 @@ type Indexer struct {
 	contractGenerationID           int64
 	contractInputErrMu             sync.Mutex
 	contractInputErr               error
-	contractInputWitnessSeed       func() (*store_sqlite.PayloadInputWitness, error)
 	priorContractInputs            func(*incrementalBatchStage) (contractDependencyInputs, bool)
 
 	// trackedRepoModules maps repo names to Go module paths for cross-repo dependency detection.
@@ -6640,7 +6639,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	idx.contractRegistryLoads = 0
 	idx.contractRegistrySeedCalls = 0
 	idx.contractUnchangedFiles = 0
-	if !idx.contractProjectionNeedsWitness || !idx.contractProofUsed {
+	if !idx.contractProjectionNeedsWitness {
 		idx.contractInputWitness = nil
 		idx.contractProofUsed = false
 	}

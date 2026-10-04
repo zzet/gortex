@@ -34,15 +34,7 @@ func (idx *Indexer) stageUnchangedContracts(stage *incrementalBatchStage) bool {
 		return fallback("incomplete_extraction")
 	}
 	if idx.contractProjectionNeedsWitness && idx.contractInputWitness == nil {
-		if idx.contractInputWitnessSeed == nil {
-			return fallback("input_ancestry_unavailable")
-		}
-		witness, err := idx.contractInputWitnessSeed()
-		if err != nil {
-			idx.rememberContractInputError(err)
-			return fallback("input_witness_capture_failed")
-		}
-		idx.contractInputWitness = witness
+		return fallback("input_ancestry_unavailable")
 	}
 	priorNodes := stage.priorNodes
 	var reconstructed *contractDependencyInputs
@@ -61,6 +53,10 @@ func (idx *Indexer) stageUnchangedContracts(stage *incrementalBatchStage) bool {
 			// constants to remove. Existing contract-file refresh is sufficient;
 			// retain any shared-input change established by another staged file.
 			idx.contractSharedInputsChanged = priorSharedChanged
+			// Absence narrows the dependency frontier even though this file
+			// still takes normal extraction. Carry its captured input witness
+			// through final publication just like unchanged-record proofs.
+			idx.contractProofUsed = true
 			return fallback("new_file_without_shared_inputs")
 		}
 		old, oldComplete := storedContractDependencyInputs(priorNodes)

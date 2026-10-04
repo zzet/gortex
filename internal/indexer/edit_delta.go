@@ -724,6 +724,27 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		}
 		walLast, txLast = walNow, txNow
 	}
+	// Every dependency-frontier decision, including inert/metadata reuse and
+	// changed-record fallback, can consume accepted ancestor inputs. Capture
+	// once before reading those inputs and retain the original through every
+	// engine pass and the guarded final publication.
+	var contractInputWitness *store_sqlite.PayloadInputWitness
+	if generations, complete := editDeltaContractInputGenerations(req.Base, b.Store); complete {
+		var err error
+		contractInputWitness, err = b.Store.CapturePayloadInputWitness(ctx, generations)
+		if err != nil {
+			return out, fmt.Errorf("indexer: capture contract inputs: %w", err)
+		}
+		// A materialized reader can predate capture. An empty checked read
+		// validates every layer's original construction revision without
+		// selecting rows; publication then guards movement after capture.
+		if _, err := graph.ConstantValuesByNodeIDsContext(ctx, req.Base, nil); err != nil {
+			if errors.Is(err, graph.ErrConstantProjectionStale) || errors.Is(err, graph.ErrContractProjectionStale) {
+				return out, fmt.Errorf("%w: %w: %w", ErrDirtySnapshotChanged, errContractInputsChanged, err)
+			}
+			return out, fmt.Errorf("indexer: validate contract input reader: %w", err)
+		}
+	}
 	dw := graph.NewDeltaWriter(req.Base, handle)
 	layerRowsOf = func() int { return dw.DeltaStats().LayerRowsRead }
 	// The per-stack caches (edit_delta_contract_cache.go). Over a dirty chain
@@ -755,11 +776,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	idx.contractGenerationID = handle.ViewGeneration()
 	idx.contractProjectionContext = ctx
 	idx.contractProjectionNeedsWitness = true
-	if generations, complete := editDeltaContractInputGenerations(req.Base, b.Store); complete {
-		idx.contractInputWitnessSeed = func() (*store_sqlite.PayloadInputWitness, error) {
-			return b.Store.CapturePayloadInputWitness(ctx, generations)
-		}
-	}
+	idx.contractInputWitness = contractInputWitness
 	idx.cloneRecompute = cloneRecomputePaths(req.RepoPrefix, req.RecomputeDerivedPaths)
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
@@ -1272,9 +1289,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		b.Logger.Info("indexer: working-tree edit delta", fields...)
 	}
 	out.carryRegistry = editDeltaRegistryCarry(idx, req.Base, b.Store, req.RepoPrefix, req.WorkspaceID, req.ProjectID)
-	if idx.contractProofUsed {
-		out.contractInputWitness = idx.contractInputWitness
-	}
+	out.contractInputWitness = idx.contractInputWitness
 	return out, nil
 }
 
