@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -161,23 +162,7 @@ func (s *Store) DeleteFileMetasByFiles(repoPrefix string, files []string) error 
 // FileMetasForRepo returns every recorded file row for the repo prefix.
 // Always non-nil.
 func (s *Store) FileMetasForRepo(repoPrefix string) ([]graph.FileMetaRow, error) {
-	rows, err := s.db.Query(
-		`SELECT file_path, content_hash, size, node_count, errors FROM files WHERE view_gen = ? AND repo_prefix = ? ORDER BY file_path`,
-		s.viewGen, repoPrefix,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []graph.FileMetaRow{}
-	for rows.Next() {
-		var r graph.FileMetaRow
-		if err := rows.Scan(&r.FilePath, &r.ContentHash, &r.Size, &r.NodeCount, &r.Errors); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return s.FileMetasForRepoContext(context.Background(), repoPrefix)
 }
 
 // FileMetasByPaths reads a bounded set of rows through the
