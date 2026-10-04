@@ -43,6 +43,11 @@ func TestContractBaselineRepairsStaleReceiptsFromAcceptedCore(t *testing.T) {
 			require.NoError(t, err)
 			_, err = leases.CaptureInitialRawRepositorySource(ctx, registration, "accepted-core-source")
 			require.NoError(t, err)
+			authority := NewOutputGenerationAuthority(leases)
+			mi.SetOutputGenerationAuthority(authority)
+			acceptedPin := leases.AcquireBaseCorpus("fixture")
+			defer acceptedPin.Release()
+			require.NoError(t, acceptedPin.ValidateAcceptedCurrent())
 			materializer := &graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: leases}
 			options := ContractFollowupCaptureOptions{Context: ctx, Store: store, Materializer: materializer, MultiIndexer: mi, Registry: idx.registry, Config: idx.config, Logger: zaptest.NewLogger(t), Yield: func(ctx context.Context) error { return ctx.Err() }}
 			prior := contractBoundaryReceipt{Version: contractBoundaryReceiptVersion, FilePath: "fixture/routes.go", Source: "old-source", Policy: "old-policy"}
@@ -74,6 +79,12 @@ func TestContractBaselineRepairsStaleReceiptsFromAcceptedCore(t *testing.T) {
 			require.True(t, admitted)
 			require.NoError(t, coordinator.WaitChange(requestCtx, graph.ContractAttachmentKey{RepoPrefix: "fixture", InputVersion: pendingInputs.State.InputVersion, InputFingerprint: pendingInputs.State.InputFingerprint}))
 			jobs.Wait()
+			stats := authority.Stats()
+			require.Equal(t, uint64(3), stats.Entries[OutputEntryContractBaseline], "begin, receipt chunk, and final acceptance each name their real output")
+			require.Equal(t, stats.Issued, stats.Settled)
+			require.Zero(t, stats.Witnessed, "contract-only metadata does not reopen core source mutation")
+			require.Zero(t, stats.LiveOwners)
+			require.NoError(t, acceptedPin.ValidateAcceptedCurrent(), "the original accepted core source remains usable")
 			state, found, err := store.ContractInputStateContext(ctx, "fixture", "")
 			require.NoError(t, err)
 			require.True(t, found)

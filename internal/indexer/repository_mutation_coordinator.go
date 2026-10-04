@@ -958,6 +958,9 @@ const (
 	// The call sites are internal/mcp (the tool surface) and cmd/gortex (the
 	// control socket), so no mutation door in this package names it.
 	OutputEntryEnrichmentCorpus OutputMutationEntry = "gortex.enrichment.corpus"
+	// Baseline reconstruction writes contract input/receipt sidecars only. It
+	// leaves the accepted core source and graph unchanged.
+	OutputEntryContractBaseline OutputMutationEntry = "indexer.reconcilePrimaryContractBaseline"
 )
 
 // outputMutationEntryKinds is the registry. An entry that is absent here cannot
@@ -981,6 +984,7 @@ var outputMutationEntryKinds = map[OutputMutationEntry]OutputGenerationKind{
 	OutputEntryCheckoutSourceMutation:  OutputGenerationCheckout,
 	OutputEntryRepositoryReconcileLane: OutputGenerationLegacy,
 	OutputEntryEnrichmentCorpus:        OutputGenerationLegacy,
+	OutputEntryContractBaseline:        OutputGenerationLegacy,
 }
 
 // OutputMutationTarget is the one output generation and owner a mutation
@@ -1300,6 +1304,12 @@ func (a *OutputGenerationAuthority) BeginAll(
 // nobody is registered for. A mutation is still never REFUSED because its
 // corpus has no live reader authority to notify.
 func (a *OutputGenerationAuthority) openSourceWitness(ctx context.Context, receipt *OutputMutationReceipt) error {
+	// Contract baseline sidecars do not mutate raw source/core graph. Opening
+	// its source witness here would invalidate the accepted snapshot this
+	// reconstruction must validate inside each already-held repository lane.
+	if receipt.entry == OutputEntryContractBaseline {
+		return nil
+	}
 	if a.leases == nil || receipt.target.Kind != OutputGenerationLegacy {
 		return nil
 	}

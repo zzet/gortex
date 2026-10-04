@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"go.uber.org/zap"
 )
@@ -95,34 +96,36 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 	store := options.Store.AtGeneration(0)
 	var pending graph.ContractInputState
 	err = options.MultiIndexer.withRepositoryMutationLanes(ctx, []string{repo}, func() error {
-		if err := snapshot.ValidateAccepted(ctx); err != nil {
-			return err
-		}
-		current, found, err := store.ContractInputStateContext(ctx, repo, "")
-		if err != nil {
-			return err
-		}
-		baseline, err := store.ContractBoundaryReceiptBaselineContext(ctx, repo, "")
-		if err != nil {
-			return err
-		}
-		if found && current.Accepted && baseline != nil && baseline.Version == contractBoundaryReceiptVersion {
-			return nil
-		}
-		var previous *graph.ContractInputState
-		if found {
-			previous = &current
-		}
-		changes := []contractCoreInputChange{{FilePath: repo + "/", Delta: contractBoundaryDelta{Scope: graph.ContractWorkScope{Unknown: true, Causes: []string{"namespace_baseline_reconciliation"}}}}}
-		pending, _, err = nextContractCoreInputState(previous, repo, "", changes)
-		if err != nil {
-			return err
-		}
-		work, err := contractCoreWorkForChanges(0, pending, changes)
-		if err != nil {
-			return err
-		}
-		return store.BeginContractInputMutationContext(ctx, previous, pending, work)
+		return options.MultiIndexer.withContractBaselineOutput(ctx, options.Store, repo, OutputEntryContractBaseline, func() error {
+			if err := snapshot.ValidateAccepted(ctx); err != nil {
+				return err
+			}
+			current, found, err := store.ContractInputStateContext(ctx, repo, "")
+			if err != nil {
+				return err
+			}
+			baseline, err := store.ContractBoundaryReceiptBaselineContext(ctx, repo, "")
+			if err != nil {
+				return err
+			}
+			if found && current.Accepted && baseline != nil && baseline.Version == contractBoundaryReceiptVersion {
+				return nil
+			}
+			var previous *graph.ContractInputState
+			if found {
+				previous = &current
+			}
+			changes := []contractCoreInputChange{{FilePath: repo + "/", Delta: contractBoundaryDelta{Scope: graph.ContractWorkScope{Unknown: true, Causes: []string{"namespace_baseline_reconciliation"}}}}}
+			pending, _, err = nextContractCoreInputState(previous, repo, "", changes)
+			if err != nil {
+				return err
+			}
+			work, err := contractCoreWorkForChanges(0, pending, changes)
+			if err != nil {
+				return err
+			}
+			return store.BeginContractInputMutationContext(ctx, previous, pending, work)
+		})
 	})
 	if err != nil {
 		return err
@@ -184,44 +187,48 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			_, _ = digest.Write([]byte{0})
 		}
 		err = options.MultiIndexer.withRepositoryMutationLanes(ctx, []string{repo}, func() error {
-			current, found, err := store.ContractInputStateContext(ctx, repo, "")
-			if err != nil {
-				return err
-			}
-			if !found || !reflect.DeepEqual(current, pending) {
-				return graph.ErrContractProjectionStale
-			}
-			actual, err := store.ContractBoundaryReceiptsForPathsContext(ctx, repo, "", paths)
-			if err != nil {
-				return err
-			}
-			if !reflect.DeepEqual(actual, prior) {
-				return graph.ErrContractProjectionStale
-			}
-			if err := store.SetContractBoundaryReceiptsContext(ctx, rows); err != nil {
-				return err
-			}
-			return store.AcceptContractBoundaryReceiptsContext(ctx, rows)
+			return options.MultiIndexer.withContractBaselineOutput(ctx, options.Store, repo, OutputEntryContractBaseline, func() error {
+				current, found, err := store.ContractInputStateContext(ctx, repo, "")
+				if err != nil {
+					return err
+				}
+				if !found || !reflect.DeepEqual(current, pending) {
+					return graph.ErrContractProjectionStale
+				}
+				actual, err := store.ContractBoundaryReceiptsForPathsContext(ctx, repo, "", paths)
+				if err != nil {
+					return err
+				}
+				if !reflect.DeepEqual(actual, prior) {
+					return graph.ErrContractProjectionStale
+				}
+				if err := store.SetContractBoundaryReceiptsContext(ctx, rows); err != nil {
+					return err
+				}
+				return store.AcceptContractBoundaryReceiptsContext(ctx, rows)
+			})
 		})
 		if err != nil {
 			return err
 		}
 	}
 	return options.MultiIndexer.withRepositoryMutationLanes(ctx, []string{repo}, func() error {
-		if err := snapshot.ValidateAccepted(ctx); err != nil {
-			return err
-		}
-		next := pending
-		next.InputFingerprint = contractInputHash([]byte(pending.InputFingerprint + ":" + hex.EncodeToString(digest.Sum(nil))))
-		changes := []contractCoreInputChange{{FilePath: repo + "/", Delta: contractBoundaryDelta{Scope: graph.ContractWorkScope{Unknown: true, Causes: []string{"namespace_baseline_complete"}}}}}
-		work, err := contractCoreWorkForChanges(0, next, changes)
-		if err != nil {
-			return err
-		}
-		if err := store.BeginContractInputMutationContext(ctx, &pending, next, work); err != nil {
-			return err
-		}
-		return store.AcceptContractInputMutationWithBaselineContext(ctx, next, graph.ContractBoundaryReceiptBaseline{RepoPrefix: repo, Version: contractBoundaryReceiptVersion, Fingerprint: hex.EncodeToString(digest.Sum(nil))})
+		return options.MultiIndexer.withContractBaselineOutput(ctx, options.Store, repo, OutputEntryContractBaseline, func() error {
+			if err := snapshot.ValidateAccepted(ctx); err != nil {
+				return err
+			}
+			next := pending
+			next.InputFingerprint = contractInputHash([]byte(pending.InputFingerprint + ":" + hex.EncodeToString(digest.Sum(nil))))
+			changes := []contractCoreInputChange{{FilePath: repo + "/", Delta: contractBoundaryDelta{Scope: graph.ContractWorkScope{Unknown: true, Causes: []string{"namespace_baseline_complete"}}}}}
+			work, err := contractCoreWorkForChanges(0, next, changes)
+			if err != nil {
+				return err
+			}
+			if err := store.BeginContractInputMutationContext(ctx, &pending, next, work); err != nil {
+				return err
+			}
+			return store.AcceptContractInputMutationWithBaselineContext(ctx, next, graph.ContractBoundaryReceiptBaseline{RepoPrefix: repo, Version: contractBoundaryReceiptVersion, Fingerprint: hex.EncodeToString(digest.Sum(nil))})
+		})
 	})
 }
 
@@ -248,4 +255,30 @@ func collectContractBaselineAcceptedReceipt(ctx context.Context, idx *Indexer, f
 		return contractBoundaryReceipt{}, fmt.Errorf("contract baseline: accepted extraction incomplete for %s", file.Path)
 	}
 	return idx.collectContractBoundaryReceipt(ctx, file.Path, file.Language, accepted.Bytes, result)
+}
+
+// withContractBaselineOutput names the contract-only output after its repository
+// lane is held. It deliberately avoids core-input journal/source mutation entry:
+// the reconstruction's own accepted-source and sidecar CAS fences remain in fn.
+func (mi *MultiIndexer) withContractBaselineOutput(ctx context.Context, output *store_sqlite.Store, repo string, entry OutputMutationEntry, fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if mi == nil || output == nil || output.SymbolSearchViewGeneration() != 0 || repo == "" || mi.repoRootPath(repo) == "" {
+		return fmt.Errorf("%w: contract baseline requires its generation-zero store and repository root", ErrOutputMutationTargetInvalid)
+	}
+	if entry != OutputEntryContractBaseline {
+		return fmt.Errorf("%w: contract baseline entry %q", ErrOutputMutationEntryUnregistered, entry)
+	}
+	target := legacyOutputTargetFor(outputStoreIdentity(output), repo, mi.repoRootPath(repo), "")
+	target.OwnerKey += "|producer:contract-baseline"
+	receipt, err := mi.outputGenerationAuthority().Begin(ctx, entry, target)
+	if err != nil {
+		return err
+	}
+	defer receipt.Abandon() // Also settles a panic; idempotent after Complete.
+	return runUnderOutputReceipt(receipt, fn)
 }
