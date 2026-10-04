@@ -338,8 +338,16 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx, _ = withResultCount(ctx)
 			qStart = time.Now()
 		}
+		if s.contractAnalysisRuntime != nil && lateExactnessRefusalIsSafe(req.Params.Name) {
+			ctx = withContractCoreReadErrors(ctx)
+		}
 		indexer.StampPublicationPhase(ctx, indexer.PublicationHandlerStarted)
 		res, hErr := h(ctx, req)
+		if hErr == nil && res != nil && !res.IsError && lateExactnessRefusalIsSafe(req.Params.Name) {
+			if err := contractCoreReadError(ctx); err != nil {
+				res = mcp.NewToolResultError(err.Error())
+			}
+		}
 		if status := contractConsumerStatusFromContext(ctx); status != nil && status.mode == contractConsumerRequired && hErr == nil && res != nil {
 			if err := contractAnalysisFromContext(ctx).validate(ctx); err != nil {
 				res = mcp.NewToolResultError(err.Error())

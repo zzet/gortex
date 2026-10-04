@@ -95,3 +95,20 @@ func (r *contractCoreEdges) ScanNodeSearchKeys(ctx context.Context, pageSize int
 func (r *contractCoreEdges) AllNodesLight() []*graph.Node {
 	return graph.AllNodesLight(r.Reader)
 }
+
+func (r *contractCoreEdges) GetNodeKindsByIDsContext(ctx context.Context, ids []string) (map[string]graph.NodeKindRow, error) {
+	return graph.GetNodeKindsByIDsContext(ctx, r.Reader, ids)
+}
+
+func (r *baseGraphReader) GetNodeKindsByIDsContext(ctx context.Context, ids []string) (map[string]graph.NodeKindRow, error) {
+	rows, err := graph.GetNodeKindsByIDsContext(ctx, r.base, ids)
+	if err != nil {
+		return nil, err
+	}
+	for id, row := range rows {
+		if !r.inScope(&graph.Node{Kind: row.Kind, FilePath: row.FilePath, RepoPrefix: row.RepoPrefix}) {
+			delete(rows, id)
+		}
+	}
+	return rows, nil
+}

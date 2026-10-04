@@ -45,13 +45,30 @@ func (r *contractCoreEdges) filter(rows []*graph.Edge) []*graph.Edge {
 			ids = append(ids, edge.From, edge.To)
 		}
 	}
-	var nodes map[string]*graph.Node
-	if r.contractIDs == nil {
-		nodes = r.GetNodesByIDs(ids)
+	var kinds map[string]graph.NodeKindRow
+	if r.contractIDs == nil && len(ids) > 0 {
+		if hasContractCoreReadErrors(r.ctx) {
+			var err error
+			kinds, err = graph.GetNodeKindsByIDsContext(r.ctx, r.Reader, ids)
+			if err != nil {
+				recordContractCoreReadError(r.ctx, err)
+				return nil
+			}
+		} else {
+			// Potential writers keep the previous errorless classifier. A late
+			// read refusal must never discard their committed mutation receipt.
+			nodes := r.Reader.GetNodesByIDs(ids)
+			kinds = make(map[string]graph.NodeKindRow, len(nodes))
+			for id, node := range nodes {
+				if node != nil {
+					kinds[id] = graph.NodeKindRow{Kind: node.Kind}
+				}
+			}
+		}
 	}
 	owned := func(id string) bool {
-		node := nodes[id]
-		return node != nil && (node.Kind == graph.KindContract || node.Kind == graph.KindContractBridge || node.Kind == graph.KindConfigKey)
+		row, found := kinds[id]
+		return found && (row.Kind == graph.KindContract || row.Kind == graph.KindContractBridge || row.Kind == graph.KindConfigKey)
 	}
 	result := make([]*graph.Edge, 0, len(rows))
 	for _, edge := range rows {
