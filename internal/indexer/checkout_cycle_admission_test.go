@@ -112,6 +112,8 @@ func TestCycleReportsTheLaneHolderItWaitedFor(t *testing.T) {
 		t.Fatal(err)
 	}
 	withdraw := c.gate.NoteHolder(ViewBuildLaneHolder{Kind: "ref_view_build", CheckoutID: "elsewhere", Generation: 42})
+	defer release()
+	defer withdraw()
 	if holder := c.gate.Stats().Holder; holder == nil || holder.Kind != "ref_view_build" || holder.Since.IsZero() {
 		t.Fatalf("gate stats holder = %+v", holder)
 	}
@@ -130,6 +132,8 @@ func TestCycleReportsTheLaneHolderItWaitedFor(t *testing.T) {
 			t.Error("the cycle did not return after cancellation")
 		}
 	}()
+	// Preflight runs before lane admission; time only the positively queued wait.
+	awaitCheckoutSelectionQueues(t, c.gate, 0, 1)
 	const held = 150 * time.Millisecond
 	time.Sleep(held)
 	withdraw()
