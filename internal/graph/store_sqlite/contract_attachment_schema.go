@@ -68,4 +68,8 @@ const contractAttachmentInputsSchemaSQL = `CREATE TABLE IF NOT EXISTS contract_a
  PRIMARY KEY(repo_prefix,checkout_id,input_version,input_fingerprint,source_generation,source_repo,source_checkout)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS contract_attachment_input_source ON contract_attachment_inputs(source_repo,source_version,source_fingerprint,source_found,source_effective);`
-func createContractAttachmentInputsTable(tx *sql.Tx)error{_,err:=tx.Exec(contractAttachmentInputsSchemaSQL);return err}
+
+func createContractAttachmentInputsTable(tx *sql.Tx) error {
+	_, err := tx.Exec(contractAttachmentInputsSchemaSQL)
+	return err
+}
