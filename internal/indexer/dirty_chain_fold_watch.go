@@ -130,6 +130,17 @@ func (w *foldStepWatch) refused(err error) error {
 	return nil
 }
 
+// Import slices yield immediately to arriving writers. Retry soon enough to
+// use the gaps between their writes rather than adding a full 50 ms pause to
+// each interrupted 10 ms slice. WAL pressure and other folds retain the
+// longer backoff; store admission and transaction interruption are unchanged.
+func foldStepRetryDelay(ctx context.Context, err error) time.Duration {
+	if fold, _ := ctx.Value(importFoldPublicationKey{}).(*importFoldPublication); fold != nil && errors.Is(err, store_sqlite.ErrChainFoldYielded) {
+		return dirtyChainCompactionYieldPoll
+	}
+	return foldStepRetryPoll
+}
+
 // runChainFoldStepsWatched is runChainFoldSteps with the watch told of every
 // step and every refusal; the watch may give the fold up.
 func runChainFoldStepsWatched(ctx context.Context, fold chainFoldSteps, retryable func(error) bool, afterStep func(step int), watch *foldStepWatch) (steps, retries int, err error) {
@@ -141,7 +152,7 @@ func runChainFoldStepsWatched(ctx context.Context, fold chainFoldSteps, retryabl
 				if starved := watch.refused(err); starved != nil {
 					return steps, retries, starved
 				}
-				timer := time.NewTimer(foldStepRetryPoll)
+				timer := time.NewTimer(foldStepRetryDelay(ctx, err))
 				select {
 				case <-ctx.Done():
 					timer.Stop()
@@ -185,7 +196,7 @@ func beginChainFoldWatched(ctx context.Context, backend chainFoldBackend, chain 
 		if err := watch.refused(err); err != nil {
 			return nil, retries, err
 		}
-		timer := time.NewTimer(foldStepRetryPoll)
+		timer := time.NewTimer(foldStepRetryDelay(ctx, err))
 		select {
 		case <-ctx.Done():
 			timer.Stop()

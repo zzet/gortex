@@ -40,7 +40,8 @@ import (
 
 // foldStepRetryPoll is how long the driver waits before it asks for the next
 // step after the store gave a step back to an edit or refused one on a WAL
-// mark. The store sizes each step itself (about 50 ms of the write gate).
+// mark. Imports use a shorter writer-yield retry via foldStepRetryDelay.
+// The store sizes each step itself (50 ms normally, 10 ms for an import).
 const foldStepRetryPoll = 50 * time.Millisecond
 
 // maxPhysicalChainDepth bounds the layers a view composes while a fold runs:
@@ -77,7 +78,7 @@ type chainFoldBackend interface {
 // runChainFoldSteps runs a fold to its last step. Nothing it observes cancels
 // it but ctx (shutdown, the checkout's retirement): an edit publishes above
 // the chain meanwhile, and a step the store gives back to an edit's write or
-// refuses on a WAL mark is asked for again after foldStepRetryPoll. A ctx that
+// refuses on a WAL mark is asked for again after its retry delay. A ctx that
 // ends leaves the fold resumable within the process (Release it, or keep it).
 func runChainFoldSteps(ctx context.Context, fold chainFoldSteps, retryable func(error) bool, afterStep func(step int)) (steps, retries int, err error) {
 	return runChainFoldStepsWatched(ctx, fold, retryable, afterStep, nil)
