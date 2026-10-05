@@ -1429,8 +1429,8 @@ func (s *Server) registerCoreTools() {
 
 	s.addTool(
 		mcp.NewTool("graph_stats",
-			mcp.WithDescription("Returns a compact summary of the indexed codebase: node/edge counts by kind and language. Cached per-repository counts are labeled as unverified estimates in per_repo_counts, with counted_at unknown. Call at session start to orient Claude in an unfamiliar repo."),
-			mcp.WithString("format", mcp.Description("Output format: json (default) or toon. gcx is accepted but honoured as toon — graph_stats is a status-shape payload with no row-shape gain from a hand-tuned GCX encoder.")),
+			mcp.WithDescription("Use at session start for node/edge counts by kind and language. per_repo_counts labels cached repository counts as unverified estimates; counted_at is unknown."),
+			mcp.WithString("format", mcp.Description("Output: json (default) or toon. gcx uses toon for this status payload.")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation metadata rides on the response.")),
 		),
 		s.handleGraphStats,
