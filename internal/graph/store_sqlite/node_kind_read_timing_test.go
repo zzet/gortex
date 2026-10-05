@@ -27,7 +27,7 @@ func TestNodeKindReadTimingParityAndConnectionReturn(t *testing.T) {
 	require.Equal(t, 2, timing.InputIDs)
 	require.Equal(t, 1, timing.Rows)
 	require.GreaterOrEqual(t, timing.QueryStart, timing.Gate)
-	require.GreaterOrEqual(t, timing.Total, timing.Pool+timing.QueryStart+timing.Drain)
+	require.GreaterOrEqual(t, timing.Total, timing.QueryStart+timing.Drain)
 	require.Zero(t, s.db.Stats().InUse)
 	require.NoError(t, s.Close())
 	got, err = s.GetNodeKindsByIDsContext(ctx, ids)
@@ -50,8 +50,8 @@ func TestNodeKindReadTimingPoolCancellationReturnsNoPartialRows(t *testing.T) {
 	rows, err := s.GetNodeKindsByIDsContext(ctx, []string{"missing"})
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Nil(t, rows)
-	require.Positive(t, timing.Pool)
-	require.Zero(t, timing.QueryStart)
+	require.Positive(t, timing.PreDriver)
+	require.Equal(t, timing.QueryStart, timing.PreDriver)
 	require.Equal(t, 1, timing.Errors)
 	require.NoError(t, held.Close())
 	require.Zero(t, s.db.Stats().InUse)
@@ -63,17 +63,17 @@ func TestNodeKindReadTimingGateCancellationIsRequestLocal(t *testing.T) {
 	gate := &sqliteReadGate{reopen: make(chan struct{})}
 	gate.closed.Store(true)
 	conn := &gatedConn{gate: gate}
-	var measured time.Duration
+	var measured nodeKindDriverTiming
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
 	ctx = context.WithValue(ctx, nodeKindGateTimingKey{}, &measured)
 	require.ErrorIs(t, conn.enter(ctx), context.DeadlineExceeded)
-	require.Positive(t, measured)
+	require.Positive(t, measured.gate)
 	require.False(t, conn.entered.Load())
 	// A request without the hook must not add to this request's counter.
-	before := measured
+	before := measured.gate
 	other, stop := context.WithCancel(t.Context())
 	stop()
 	require.ErrorIs(t, conn.enter(other), context.Canceled)
-	require.Equal(t, before, measured)
+	require.Equal(t, before, measured.gate)
 }

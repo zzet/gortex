@@ -439,9 +439,13 @@ var (
 
 func (c *gatedConn) enter(ctx context.Context) error {
 	if ctx != nil {
-		if timing, _ := ctx.Value(nodeKindGateTimingKey{}).(*time.Duration); timing != nil {
+		if timing, _ := ctx.Value(nodeKindGateTimingKey{}).(*nodeKindDriverTiming); timing != nil {
 			started := time.Now()
-			defer func() { *timing += time.Since(started) }()
+			if timing.firstEntry.IsZero() {
+				timing.firstEntry = started
+			}
+			timing.entries++
+			defer func() { timing.gate += time.Since(started) }()
 		}
 	}
 	if c.entered.Load() {

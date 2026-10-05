@@ -9,10 +9,15 @@ import (
 )
 
 type nodeKindGateTimingKey struct{}
+type nodeKindDriverTiming struct {
+	firstEntry time.Time
+	gate       time.Duration
+	entries    int
+}
 
-// observedNodeKindsBatch changes only debug-observed connection acquisition.
-// The explicit connection owns exactly one rows cursor, as QueryContext does;
-// rows and connection close on every return, including scan/cancel failures.
+// observedNodeKindsBatch keeps database/sql QueryContext acquisition and
+// ErrBadConn retry semantics unchanged. The context hook observes first driver
+// entry and gate admission; it never owns a connection or alters retries.
 func (s *Store) observedNodeKindsBatch(ctx context.Context, ids []string, observer func(graph.NodeKindReadTiming)) (out map[string]graph.NodeKindRow, err error) {
 	timing := graph.NodeKindReadTiming{Batches: 1, InputIDs: len(ids)}
 	started := time.Now()
@@ -23,24 +28,18 @@ func (s *Store) observedNodeKindsBatch(ctx context.Context, ids []string, observ
 		}
 		observer(timing)
 	}()
-	poolStart := time.Now()
-	conn, err := s.db.Conn(ctx)
-	timing.Pool = time.Since(poolStart)
-	if err != nil {
-		return nil, fmt.Errorf("node kinds connection: %w", err)
-	}
-	defer func() {
-		closeErr := conn.Close()
-		if err == nil && closeErr != nil {
-			out = nil
-			err = closeErr
-		}
-	}()
 	query := `SELECT id, kind, file_path, repo_prefix FROM nodes WHERE id IN (` + inPlaceholders(len(ids)) + `) AND view_gen = ?`
-	queryCtx := context.WithValue(ctx, nodeKindGateTimingKey{}, &timing.Gate)
+	driverTiming := nodeKindDriverTiming{}
+	queryCtx := context.WithValue(ctx, nodeKindGateTimingKey{}, &driverTiming)
 	queryStart := time.Now()
-	rows, err := conn.QueryContext(queryCtx, query, append(toAnyArgs(ids), s.viewGen)...)
+	rows, err := s.db.QueryContext(queryCtx, query, append(toAnyArgs(ids), s.viewGen)...)
 	timing.QueryStart = time.Since(queryStart)
+	timing.PreDriver = timing.QueryStart
+	if !driverTiming.firstEntry.IsZero() {
+		timing.PreDriver = driverTiming.firstEntry.Sub(queryStart)
+	}
+	timing.Gate = driverTiming.gate
+	timing.DriverEntries = driverTiming.entries
 	if err != nil {
 		return nil, fmt.Errorf("get node kinds by ids: %w", err)
 	}

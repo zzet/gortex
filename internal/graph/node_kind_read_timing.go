@@ -6,15 +6,17 @@ import (
 )
 
 // NodeKindReadTiming observes one physical lookup batch. Gate is nested inside
-// QueryStart; Total also includes construction and connection return. No SQL or
+// QueryStart; PreDriver includes pool/acquisition/setup before first driver
+// entry, not pure pool wait. Later retries remain inside QueryStart. Total also
+// includes construction and cursor closure. No SQL or
 // identities are retained. Observers are synchronous and request-local.
 type NodeKindReadTiming struct {
-	Pool, Gate, QueryStart, Drain, Total time.Duration
-	Batches, InputIDs, Rows, Errors      int
+	PreDriver, Gate, QueryStart, Drain, Total      time.Duration
+	Batches, InputIDs, Rows, Errors, DriverEntries int
 }
 
 func (t *NodeKindReadTiming) Add(o NodeKindReadTiming) {
-	t.Pool += o.Pool
+	t.PreDriver += o.PreDriver
 	t.Gate += o.Gate
 	t.QueryStart += o.QueryStart
 	t.Drain += o.Drain
@@ -23,6 +25,7 @@ func (t *NodeKindReadTiming) Add(o NodeKindReadTiming) {
 	t.InputIDs += o.InputIDs
 	t.Rows += o.Rows
 	t.Errors += o.Errors
+	t.DriverEntries += o.DriverEntries
 }
 
 type nodeKindReadObserverKey struct{}
