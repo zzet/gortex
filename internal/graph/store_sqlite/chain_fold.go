@@ -132,6 +132,11 @@ type ChainFold struct {
 	yields     int
 	released   bool
 	stepTarget time.Duration
+	// interruptedPageRows bounds only retries of a page rolled back for a
+	// queued writer. A committed step returns to measured time-based sizing.
+	interruptedPageRows int
+	interruptedPages    int
+	pageBackoffs        int
 }
 
 // chainFoldHeld is the store's one fold and the members it holds.
@@ -433,11 +438,18 @@ func (f *ChainFold) targetDuration() time.Duration {
 
 // stepRows is the row budget of the next step.
 func (f *ChainFold) stepRows() int {
+	rows := chainFoldFirstRows
 	if f.usPerRow <= 0 {
-		return chainFoldFirstRows
+		if f.interruptedPageRows > 0 {
+			return min(rows, f.interruptedPageRows)
+		}
+		return rows
 	}
-	rows := int(float64(f.targetDuration().Microseconds()) / f.usPerRow)
-	return min(max(rows, chainFoldMinRows), chainFoldMaxRows)
+	rows = min(max(int(float64(f.targetDuration().Microseconds())/f.usPerRow), chainFoldMinRows), chainFoldMaxRows)
+	if f.interruptedPageRows > 0 {
+		rows = min(rows, f.interruptedPageRows)
+	}
+	return rows
 }
 
 // Step runs one step: at most one write transaction of about
@@ -468,7 +480,9 @@ func (f *ChainFold) Step(ctx context.Context) (done bool, err error) {
 	var moved int64
 	var deferred func() // mask progress and member exclusion: committed only
 	snapshot := f.cursor()
+	transactionStarted := false
 	err = s.withFoldTx(ctx, f.to, func(ctx context.Context, tx *sql.Tx) error {
+		transactionStarted = true
 		// Phases run back to back in the one transaction until the row
 		// budget or the target hold is spent: an empty table costs a
 		// statement, not a step. Each mask operation/page closes the step,
@@ -499,9 +513,20 @@ func (f *ChainFold) Step(ctx context.Context) (done bool, err error) {
 		f.restore(snapshot)
 		if errors.Is(err, ErrChainFoldYielded) {
 			f.yields++
+			if transactionStarted {
+				// Replaying the same oversized page requires the same quiet
+				// window. Shorten only an interrupted transaction's retry;
+				// refusal before admission gives no sizing evidence.
+				f.interruptedPageRows = max(budget/2, chainFoldMinRows)
+				f.interruptedPages++
+				if f.interruptedPageRows < budget {
+					f.pageBackoffs++
+				}
+			}
 		}
 		return false, err
 	}
+	f.interruptedPageRows = 0
 	if deferred != nil {
 		deferred()
 	}
@@ -734,6 +759,12 @@ func unionKeys(a, b map[string]struct{}) map[string]struct{} {
 // Counts reports what the fold wrote so far, and its steps and yields.
 func (f *ChainFold) Counts() (counts GenerationCopyCounts, steps, yields int) {
 	return f.counts, f.steps, f.yields
+}
+
+// InterruptionCounts distinguishes rolled-back transactions from admission
+// refusals, and reports how many of those interruptions shortened the retry.
+func (f *ChainFold) InterruptionCounts() (transactions, budgetReductions int) {
+	return f.interruptedPages, f.pageBackoffs
 }
 
 // Release ends the fold: the members are no longer held and `to` loses its

@@ -132,9 +132,14 @@ func (c *CheckoutCoordinator) copyChainInSteps(ctx context.Context, oldestFirst 
 	}); ok {
 		counts, _, _ = stepped.Counts()
 	}
+	var interrupted, backoffs int
+	if observed, ok := fold.(interface{ InterruptionCounts() (int, int) }); ok {
+		interrupted, backoffs = observed.InterruptionCounts()
+	}
 	c.logger.Info("checkout coordinator: chain fold stepped",
 		zap.String("checkout", c.checkoutID), zap.Int64s("chain", oldestFirst), zap.Int64("folded_generation", to),
 		zap.Int("steps", steps), zap.Int("retries", retries), zap.Duration("elapsed", time.Since(started)),
+		zap.Int("interrupted_transactions", interrupted), zap.Int("page_budget_reductions", backoffs),
 		zap.Int64("rows", counts.Rows), zap.Int64("nodes", counts.Nodes), zap.Int64("edges", counts.Edges), zap.Error(err))
 	if err == nil {
 		err = c.afterFoldCopy(ctx, to)
