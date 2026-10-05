@@ -61,12 +61,29 @@ func TestShadowReplacementAdmitsForegroundWriter(t *testing.T) {
 			s, nodes := shadowEvictionFixture(t, 1024)
 			_, checkout := beginGenerationEvictionHandle(t, s, 1)
 			entered := make(chan struct{})
-			var once sync.Once
+			releaseFirst := make(chan struct{})
+			foregroundDone := make(chan struct{})
+			var releaseOnce sync.Once
+			unpark := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+			evictCtx, cancelEviction := context.WithTimeout(t.Context(), 5*time.Second)
 			var triggerCalls atomic.Int64
 			shadowDeleteObserver.Store(&shadowDeleteProbe{fire: func(string) {
-				triggerCalls.Add(1)
-				once.Do(func() { close(entered) })
-				time.Sleep(time.Millisecond)
+				switch triggerCalls.Add(1) {
+				case 1:
+					close(entered)
+					select {
+					case <-releaseFirst:
+					case <-evictCtx.Done():
+					}
+				case shadowEvictBatchRows + 1:
+					// A bounded delete has released the writer gate before
+					// this row. An unbounded delete still holds it: retain
+					// that hold until the foreground attempt has returned.
+					select {
+					case <-foregroundDone:
+					case <-evictCtx.Done():
+					}
+				}
 			}})
 			shadowDeleteTrigger(t, s, "nodes", "OLD.id")
 			type result struct {
@@ -74,9 +91,12 @@ func TestShadowReplacementAdmitsForegroundWriter(t *testing.T) {
 				err     error
 				elapsed time.Duration
 			}
-			done := make(chan result, 1)
-			evictCtx, cancelEviction := context.WithTimeout(t.Context(), 5*time.Second)
+			done := make(chan struct{})
+			var eviction result
+			var foregroundStarted bool
+			var cancelForeground context.CancelFunc
 			go func() {
+				defer close(done)
 				start := time.Now()
 				var n, e int
 				var err error
@@ -85,12 +105,24 @@ func TestShadowReplacementAdmitsForegroundWriter(t *testing.T) {
 				} else {
 					n, e, err = s.evictByPredicateResult(evictRepoPredicate, "shadow", evictThisGeneration)
 				}
-				done <- result{n, e, err, time.Since(start)}
+				eviction = result{n, e, err, time.Since(start)}
 			}()
 			t.Cleanup(func() {
+				if cancelForeground != nil {
+					cancelForeground()
+				}
 				cancelEviction()
+				unpark()
+				if foregroundStarted {
+					select {
+					case <-foregroundDone:
+					case <-time.After(5 * time.Second):
+						t.Error("foreground writer failed to join")
+					}
+				}
 				select {
-				case r := <-done:
+				case <-done:
+					r := eviction
 					t.Logf("eviction joined: bounded=%v nodes=%d edges=%d elapsed=%s triggers=%d err=%v", bounded, r.n, r.e, r.elapsed, triggerCalls.Load(), r.err)
 				case <-time.After(5 * time.Second):
 					t.Error("eviction failed to join")
@@ -102,41 +134,61 @@ func TestShadowReplacementAdmitsForegroundWriter(t *testing.T) {
 				t.Fatal("eviction never entered real SQL delete")
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 750*time.Millisecond)
+			cancelForeground = cancel
 			start := time.Now()
 			phase := "write_gate"
 			phaseStart := start
 			var gateElapsed, beginElapsed, insertElapsed, commitElapsed time.Duration
 			triggersAtStart := triggerCalls.Load()
-			err := s.writeMu.LockContext(ctx)
-			gateElapsed = time.Since(phaseStart)
-			triggersAtAdmission := triggerCalls.Load()
-			if err == nil {
-				phase = "begin_write"
-				phaseStart = time.Now()
-				tx, txErr := checkout.beginWriteContext(ctx)
-				beginElapsed = time.Since(phaseStart)
-				if txErr == nil {
-					phase = "insert"
+			var err error
+			var foreground time.Duration
+			var triggersAtAdmission int64
+			foregroundStarted = true
+			go func() {
+				defer close(foregroundDone)
+				err = s.writeMu.LockContext(ctx)
+				gateElapsed = time.Since(phaseStart)
+				triggersAtAdmission = triggerCalls.Load()
+				if err == nil {
+					phase = "begin_write"
 					phaseStart = time.Now()
-					_, txErr = tx.ExecContext(ctx, `INSERT INTO nodes(id,view_gen,kind,name,file_path,repo_prefix) VALUES(?,?,?,?,?,?)`, "checkout::write", checkout.viewGen, "function", "Write", "checkout::write.go", "checkout")
-					insertElapsed = time.Since(phaseStart)
+					tx, txErr := checkout.beginWriteContext(ctx)
+					beginElapsed = time.Since(phaseStart)
 					if txErr == nil {
-						phase = "commit"
+						phase = "insert"
 						phaseStart = time.Now()
-						txErr = tx.Commit()
-						commitElapsed = time.Since(phaseStart)
-					} else {
-						_ = tx.Rollback()
+						_, txErr = tx.ExecContext(ctx, `INSERT INTO nodes(id,view_gen,kind,name,file_path,repo_prefix) VALUES(?,?,?,?,?,?)`, "checkout::write", checkout.viewGen, "function", "Write", "checkout::write.go", "checkout")
+						insertElapsed = time.Since(phaseStart)
+						if txErr == nil {
+							phase = "commit"
+							phaseStart = time.Now()
+							txErr = tx.Commit()
+							commitElapsed = time.Since(phaseStart)
+						} else {
+							_ = tx.Rollback()
+						}
 					}
+					if txErr == nil {
+						checkout.finishAnalysisMutationLocked(true)
+					}
+					s.writeMu.Unlock()
+					err = txErr
 				}
-				if txErr == nil {
-					checkout.finishAnalysisMutationLocked(true)
-				}
-				s.writeMu.Unlock()
-				err = txErr
+				foreground = time.Since(start)
+				cancel()
+			}()
+			// The first SQL row remains parked until this fixture's only
+			// foreground writer is positively witnessed in the gate queue.
+			for s.writeMu.waiting() == 0 && ctx.Err() == nil {
+				time.Sleep(time.Millisecond)
 			}
-			foreground := time.Since(start)
-			cancel()
+			require.Positive(t, s.writeMu.waiting(), "foreground writer never queued behind the first delete")
+			unpark()
+			select {
+			case <-foregroundDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("foreground writer did not finish")
+			}
 			t.Logf("foreground: bounded=%v phase=%s err=%v total=%s gate=%s begin=%s insert=%s commit=%s triggers_start=%d triggers_admission=%d triggers_end=%d", bounded, phase, err, foreground, gateElapsed, beginElapsed, insertElapsed, commitElapsed, triggersAtStart, triggersAtAdmission, triggerCalls.Load())
 			if bounded {
 				require.NoError(t, err)
@@ -144,8 +196,12 @@ func TestShadowReplacementAdmitsForegroundWriter(t *testing.T) {
 			} else {
 				require.ErrorIs(t, err, context.DeadlineExceeded)
 			}
-			r := <-done
-			done <- r
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("eviction did not finish")
+			}
+			r := eviction
 			require.NoError(t, r.err)
 			require.Equal(t, len(nodes), r.n)
 			require.Zero(t, r.e)
