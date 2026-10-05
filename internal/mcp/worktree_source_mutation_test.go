@@ -312,7 +312,7 @@ func newRealCheckoutMutationFixtureWithRegistry(t testing.TB, configure func(*pa
 	return newRealCheckoutMutationFixtureWithSetup(t, configure, nil)
 }
 
-func newRealCheckoutMutationFixtureWithSetup(t testing.TB, configure func(*parser.Registry), beforeRegister func(*indexer.CheckoutLifecycle)) *realCheckoutMutationFixture {
+func newRealCheckoutMutationFixtureWithSetup(t testing.TB, configure func(*parser.Registry), beforeRegister func(*indexer.CheckoutLifecycle, string)) *realCheckoutMutationFixture {
 	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)
@@ -351,7 +351,7 @@ func newRealCheckoutMutationFixtureWithSetup(t testing.TB, configure func(*parse
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = lifecycle.Close() })
 	if beforeRegister != nil {
-		beforeRegister(lifecycle)
+		beforeRegister(lifecycle, worktree)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

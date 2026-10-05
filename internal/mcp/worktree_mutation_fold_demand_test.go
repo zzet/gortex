@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,7 +121,16 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 	t.Setenv("GORTEX_TOOLS", "facade-v1")
 	gate := indexer.NewViewBuildGate()
 	gate.Open()
-	f := newRealCheckoutMutationFixtureWithSetup(t, nil, func(l *indexer.CheckoutLifecycle) { l.SetBuildGate(gate) })
+	f := newRealCheckoutMutationFixtureWithSetup(t, nil, func(l *indexer.CheckoutLifecycle, worktree string) {
+		// These real files enter the initial accepted dirty census. Later
+		// one-file edits leave them unchanged; no catalog/manifest is seeded.
+		for i := 1; i <= 2; i++ {
+			path := filepath.Join(worktree, fmt.Sprintf("stable%d.go", i))
+			src := fmt.Sprintf("package repo\n\nfunc Stable%d() {}\n", i)
+			require.NoError(t, os.WriteFile(path, []byte(src), 0o644))
+		}
+		l.SetBuildGate(gate)
+	})
 	f.srv.mutationReindexWait = 20 * time.Millisecond
 	primaryBefore, err := os.ReadFile(filepath.Join(f.primary, "edit.go"))
 	require.NoError(t, err)
@@ -182,11 +192,13 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 	require.Eventually(t, func() bool { return gate.Stats().InteractiveQueued >= 3 }, time.Second, time.Millisecond,
 		"first refresh must queue behind the held lane and two setup waiters")
 	entered, resume := make(chan struct{}), make(chan struct{})
-	var resumeOnce sync.Once
+	var resumeOnce, enteredOnce sync.Once
+	var waitEntries atomic.Int32
 	unblock := func() { resumeOnce.Do(func() { close(resume) }) }
 	t.Cleanup(unblock)
 	f.srv.mutationRouteWaitEntered = func(requestCtx context.Context) {
-		close(entered)
+		waitEntries.Add(1)
+		enteredOnce.Do(func() { close(entered) })
 		select {
 		case <-resume:
 		case <-requestCtx.Done():
@@ -224,6 +236,7 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 	case <-secondCtx.Done():
 		t.Fatal("second default linked-CWD mutation did not enter the actual route wait")
 	}
+	require.Equal(t, int32(1), waitEntries.Load(), "the witnessed entry belongs to the second request")
 	pending := route()
 	require.Equal(t, store_sqlite.RoutePending, pending.State)
 	require.Equal(t, capped.CommitGenerationID, pending.CommitGenerationID)
@@ -253,6 +266,9 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 	foldStore := f.store.AtGeneration(folded.GenerationID)
 	require.NotNil(t, foldStore.GetNode("repo/edit.go::"+oldName), "fold must retain the real cap input, before either overlap edit")
 	require.Nil(t, foldStore.GetNode("repo/edit.go::FoldFirst"))
+	for i := 1; i <= 2; i++ {
+		require.NotNil(t, foldStore.GetNode(fmt.Sprintf("repo/stable%d.go::Stable%d", i, i)), "verified fold retains accepted stable dirty declarations")
+	}
 	selected := f.store.AtGeneration(firstRoute.DirtyGenerationID)
 	require.NotNil(t, selected.GetNode("repo/edit.go::FoldFirst"))
 	unblock()
@@ -262,6 +278,15 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 		f.awaitMutation(t, f.worktree, second)
 	case <-secondCtx.Done():
 		t.Fatal("second default mutation did not finish inside its original deadline")
+	}
+	require.Equal(t, int32(1), waitEntries.Load(), "the second request completed one pending-route selection")
+	for i := 1; i <= 2; i++ {
+		stable, readErr := os.ReadFile(filepath.Join(f.worktree, fmt.Sprintf("stable%d.go", i)))
+		require.NoError(t, readErr)
+		require.Equal(t, fmt.Sprintf("package repo\n\nfunc Stable%d() {}\n", i), string(stable))
+		_, primaryErr := os.Stat(filepath.Join(f.primary, fmt.Sprintf("stable%d.go", i)))
+		require.True(t, os.IsNotExist(primaryErr), "worktree-only dirty file must not appear in primary")
+		require.Nil(t, f.store.GetNode(fmt.Sprintf("repo/stable%d.go::Stable%d", i, i)))
 	}
 	finalBytes, err := os.ReadFile(filepath.Join(f.worktree, "edit.go"))
 	require.NoError(t, err)
