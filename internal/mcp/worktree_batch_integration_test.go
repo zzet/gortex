@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -94,6 +95,11 @@ func requireWorktreeBatchFile(t *testing.T, root, name, content string, mode os.
 	require.Equal(t, content, string(got))
 	info, err := os.Stat(path)
 	require.NoError(t, err)
+	if runtime.GOOS == "windows" {
+		// Windows chmod preserves only the writable/read-only distinction.
+		require.Equal(t, mode&0o200, info.Mode().Perm()&0o200)
+		return
+	}
 	require.Equal(t, mode, info.Mode().Perm())
 }
 
