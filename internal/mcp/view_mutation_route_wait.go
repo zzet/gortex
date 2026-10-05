@@ -88,15 +88,3 @@ func (s *Server) withMutationPublicationStamps(ctx context.Context, tool string)
 	}
 	return indexer.WithPublicationStamps(ctx)
 }
-
-// announceSourceMutation tells the store a mutation is about to need its
-// writer, before selection or mutation lane/cycle admission, so background
-// writer holders (the WAL reclaim) yield to it. The release runs when the
-// request ends — the mutation has then been committed or refused.
-func (s *Server) announceSourceMutation(tool string) func() {
-	if s == nil || s.facades == nil || !s.facades.mutatesSource(tool) ||
-		s.materializer == nil || s.materializer.Store == nil {
-		return func() {}
-	}
-	return s.materializer.Store.AnnounceWrite()
-}
