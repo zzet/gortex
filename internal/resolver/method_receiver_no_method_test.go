@@ -78,9 +78,12 @@ func TestRebindGoMethodReceiversForFileSkipsNoMethodFallbackReads(t *testing.T) 
 			r.buildDirIndexes()
 			defer r.clearDirIndexes()
 			if test.cached {
-				// Include nil to prove the guard consumes only actual method
-				// facts and honors an explicitly cached empty bucket.
-				r.incrementalNodesByFile = map[string][]*graph.Node{file: append(g.GetFileNodes(file), nil)}
+				facts := g.GetFileNodes(file)
+				if !test.empty {
+					// Only nonnil full-file method facts count.
+					facts = append(facts, nil)
+				}
+				r.incrementalNodesByFile = map[string][]*graph.Node{file: facts}
 			}
 			before := g.GetOutEdges(file + "::Edited")
 			store.reset()
@@ -100,8 +103,16 @@ func TestRebindGoMethodReceiversForFileSkipsNoMethodFallbackReads(t *testing.T) 
 }
 
 func TestRebindGoMethodReceiversForFileUsesSelectedFullDeltaFacts(t *testing.T) {
-	for _, hasMethod := range []bool{false, true} {
-		t.Run(map[bool]string{false: "selected-function-hides-old-method", true: "carried-method-among-mixed-nodes"}[hasMethod], func(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		hasMethod bool
+		deleted   bool
+	}{
+		{name: "selected-function-hides-old-method"},
+		{name: "carried-method-among-mixed-nodes", hasMethod: true},
+		{name: "deleted-file", deleted: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			const file = "repo/pkg/edited.go"
 			const methodID = file + "::T.Method"
 			const canonical = "repo/pkg/types.go::T"
@@ -117,7 +128,7 @@ func TestRebindGoMethodReceiversForFileUsesSelectedFullDeltaFacts(t *testing.T) 
 			layer.AddNode(file, &graph.Node{ID: file, Kind: graph.KindFile, FilePath: file, RepoPrefix: "repo", Language: "go"})
 			free := &graph.Node{ID: file + "::Free", Kind: graph.KindFunction, FilePath: file, RepoPrefix: "repo", Language: "go"}
 			layer.AddNode(file, free)
-			if hasMethod {
+			if test.hasMethod {
 				layer.AddNode(file, &graph.Node{ID: methodID, Kind: graph.KindMethod, FilePath: file, RepoPrefix: "repo", Language: "go", Meta: map[string]any{"signature": "func (*T) Method()"}})
 				layer.AddEdge(file, &graph.Edge{From: methodID, To: file + "::T", Kind: graph.EdgeMemberOf, FilePath: file})
 				for _, n := range []*graph.Node{
@@ -134,7 +145,13 @@ func TestRebindGoMethodReceiversForFileUsesSelectedFullDeltaFacts(t *testing.T) 
 			// A real edit touches only the free function. The delta carries
 			// the entire selected file, including any unchanged Go method.
 			delta.AddNode(free)
+			if test.deleted {
+				delta.EvictFile(file)
+			}
 			facts := delta.GetFileNodes(file)
+			if test.deleted {
+				require.Empty(t, facts, "a real selected file deletion has no surviving facts")
+			}
 			store := &receiverFallbackReadCounter{Store: delta}
 			r := New(store)
 			r.buildDirIndexes()
@@ -143,7 +160,7 @@ func TestRebindGoMethodReceiversForFileUsesSelectedFullDeltaFacts(t *testing.T) 
 			store.reset()
 			r.rebindGoMethodReceiversForFile(file)
 			require.Zero(t, store.fileReads, "use the exact selected full-file cache")
-			if hasMethod {
+			if test.hasMethod {
 				require.Equal(t, 1, store.packageReads)
 				require.Equal(t, 1, store.edgeReads)
 				require.True(t, hasEdgeKind(delta, methodID, canonical, graph.EdgeMemberOf))
