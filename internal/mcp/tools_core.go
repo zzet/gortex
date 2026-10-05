@@ -3814,20 +3814,30 @@ type repoTotal struct {
 // a composed overlay view — falls back to RepoStats, whose per-repo totals
 // are already correct under composition.
 func perRepoTotals(r graph.Reader) map[string]repoTotal {
+	if core, ok := r.(interface {
+		contractCoreRepoMemoryEstimates() (map[string]graph.RepoMemoryEstimate, bool)
+	}); ok {
+		if estimates, supported := core.contractCoreRepoMemoryEstimates(); supported {
+			return repoTotalsFromMemoryEstimates(estimates)
+		}
+	}
 	if c, ok := r.(interface {
 		AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate
 	}); ok {
-		est := c.AllRepoMemoryEstimates()
-		out := make(map[string]repoTotal, len(est))
-		for repo, e := range est {
-			out[repo] = repoTotal{nodes: e.NodeCount, edges: e.EdgeCount}
-		}
-		return out
+		return repoTotalsFromMemoryEstimates(c.AllRepoMemoryEstimates())
 	}
 	rs := r.RepoStats()
 	out := make(map[string]repoTotal, len(rs))
 	for repo, st := range rs {
 		out[repo] = repoTotal{nodes: st.TotalNodes, edges: st.TotalEdges}
+	}
+	return out
+}
+
+func repoTotalsFromMemoryEstimates(estimates map[string]graph.RepoMemoryEstimate) map[string]repoTotal {
+	out := make(map[string]repoTotal, len(estimates))
+	for repo, e := range estimates {
+		out[repo] = repoTotal{nodes: e.NodeCount, edges: e.EdgeCount}
 	}
 	return out
 }
