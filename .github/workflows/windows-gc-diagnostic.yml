@@ -1,0 +1,118 @@
+name: Windows GC diagnostic (isolated)
+
+on:
+  push:
+    branches: [diag/windows-gc-7dcd]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-gc:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.0' # Match the retained fatal, not a patch-version experiment.
+          cache: false
+      - name: Record host and tool provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path gc-diagnostic | Out-Null
+          git rev-parse HEAD | Set-Content gc-diagnostic/head.txt
+          go version | Set-Content gc-diagnostic/go-version.txt
+          go env -json | Set-Content gc-diagnostic/go-env.json
+          Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, ProcessorId, Architecture, NumberOfCores, NumberOfLogicalProcessors | ConvertTo-Json | Set-Content gc-diagnostic/cpu.json
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber | ConvertTo-Json | Set-Content gc-diagnostic/windows.json
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class XStateEvidence {
+            [DllImport("kernel32.dll", SetLastError=true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            public static extern bool InitializeContext(IntPtr buffer, uint flags, out IntPtr context, ref uint length);
+            [DllImport("kernel32.dll")]
+            public static extern ulong GetEnabledXStateFeatures();
+          }
+          '@
+          $rows = foreach ($flags in @(0x0010001f, 0x0010005f)) {
+            [uint32]$length = 0
+            [IntPtr]$context = [IntPtr]::Zero
+            $ok = [XStateEvidence]::InitializeContext([IntPtr]::Zero, $flags, [ref]$context, [ref]$length)
+            [pscustomobject]@{ flags=$flags; return_value=$ok; last_error=[Runtime.InteropServices.Marshal]::GetLastWin32Error(); required_bytes=$length }
+          }
+          [pscustomobject]@{ enabled_xstate_features=[XStateEvidence]::GetEnabledXStateFeatures(); initialize_context=$rows; note='Required buffer size, not an observed hardware exception frame.' } | ConvertTo-Json -Depth 4 | Set-Content gc-diagnostic/xstate.json
+      - name: Official issue 81238 panic and hardware-fault controls (separate processes)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib,json,os,re,subprocess,urllib.request
+          from pathlib import Path
+          out=Path('gc-diagnostic')
+          src=Path(os.environ['RUNNER_TEMP'])/'gortex-go-81238-control'
+          src.mkdir(exist_ok=False)
+          commit='72cb4a8a27ef8c86347f8eee237c23e7b6681e85'
+          pins={'main_windows.go':'217532642fa2b3cfaf71a0aad445c9dee9e1ff29768bc52665cd509f78362287','go.mod':'016b18a2f517186b85b24e1025c2d9d084d765afd36f37a7513a81d8352d68e7'}
+          for name,expected in pins.items():
+              data=urllib.request.urlopen('https://raw.githubusercontent.com/denisvmedia/ptah-2365-repro/'+commit+'/'+name,timeout=30).read()
+              assert hashlib.sha256(data).hexdigest()==expected,name
+              (src/name).write_bytes(data)
+              (out/('control-'+name)).write_bytes(data)
+          env=dict(os.environ,CGO_ENABLED='0',GOAMD64='v1',GOENV='off',GOEXPERIMENT='',GOFLAGS='',GOTOOLCHAIN='local',GOWORK='off',GODEBUG='adaptivestackstart=0,gctrace=1',GOGC='off',GOMEMLIMIT='off',GOTRACEBACK='system')
+          with (out/'control-build.log').open('wb') as log:
+              subprocess.run(['go','build','-trimpath','-buildvcs=false','-o','repro.exe','.'],cwd=src,env=env,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=120)
+          rows=[]
+          for mode in ('panic','fault'):
+              timeout=False
+              with (out/(mode+'.log')).open('wb') as log:
+                  try:
+                      p=subprocess.run([str(src/'repro.exe'),mode],cwd=src,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=30)
+                      code=p.returncode
+                  except subprocess.TimeoutExpired:
+                      code=None
+                      timeout=True
+              text=(out/(mode+'.log')).read_text(errors='replace')
+              tail=re.search(r'REPRO_TAIL before=([0-9a-f]{64}) after=([0-9a-f]{64})',text)
+              clean=code==0 and 'REPRO_RESULT clean' in text and tail is not None and tail[1]==tail[2]
+              rows.append(dict(mode=mode,exit_code=code,timeout=timeout,clean=clean,adjacent_bytes_changed=tail is not None and tail[1]!=tail[2],marked_free_object='fatal error: found pointer to free object' in text))
+          (out/'controls.json').write_text(json.dumps(dict(upstream_commit=commit,pins=pins,observations=rows,interpretation='A clean control is not proof the retained application fatal is fixed or explained. The upstream calibrated layout intentionally uses unsafe; checkptr is applied only to the application shard.'),indent=2)+'\n')
+          print(json.dumps(rows,indent=2))
+          if not all(row['clean'] for row in rows):
+              raise SystemExit(1)
+          PY
+      - name: Exact original indexer-2 shard with checkptr and GC tracing
+        if: always()
+        shell: bash
+        env:
+          TEST_PARTITION: indexer-2
+          TEST_WINDOWS: 'true'
+          GOFLAGS: '-gcflags=all=-d=checkptr=2'
+          GOEXPERIMENT: ''
+          GOTOOLCHAIN: local
+          GODEBUG: gctrace=1
+          GOTRACEBACK: system
+        run: |
+          python - <<'PY'
+          import os,subprocess,sys
+          from pathlib import Path
+          scratch=Path(os.environ['RUNNER_TEMP'])/'gortex-storage-tests'
+          scratch.mkdir(exist_ok=True)
+          os.environ['GOTMPDIR']=str(scratch)
+          out=Path('gc-diagnostic')
+          out.mkdir(exist_ok=True)
+          with (out/'indexer-2-checkptr.log').open('wb') as log:
+              result=subprocess.run([sys.executable,'scripts/ci-test-partition.py','--manifest',str(out/'test-selection.json')],stdout=log,stderr=subprocess.STDOUT)
+          print('Exact shard exit:',result.returncode)
+          raise SystemExit(result.returncode)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: windows-gc-diagnostic-${{ github.run_id }}
+          path: gc-diagnostic/
+          if-no-files-found: error
