@@ -72,7 +72,9 @@ func TestGenerationCopyCancellationWhileWriterHeld(t *testing.T) {
 				rollbackErr := tx.Rollback()
 				require.NoError(t, emptyErr)
 				require.NoError(t, rollbackErr)
-				require.True(t, empty, "every destination payload family must remain empty")
+				require.True(t, empty, "destination nodes and edges must remain empty")
+				require.Empty(t, renderFoldMasks(t, s, target))
+				require.Empty(t, renderFoldFTS(t, s, target))
 				s.writeMu.Unlock()
 				held = false
 				got, err := copyPayload(t.Context(), target)
