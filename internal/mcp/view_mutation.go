@@ -126,6 +126,8 @@ func (s *Server) awaitRouteRecomposition(ctx context.Context, view *requestView)
 	if s == nil || s.lifecycle == nil || view == nil || view.rider == nil {
 		return false
 	}
+	resumeIntent := suspendSourceMutationWriteIntent(ctx)
+	defer resumeIntent()
 	ticket, err := s.lifecycle.RequestCheckoutRefresh(ctx, view.rider.CheckoutID, view.viewRoot)
 	if err != nil || ticket == nil || ticket.Ticket == nil {
 		return false

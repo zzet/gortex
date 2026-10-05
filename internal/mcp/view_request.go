@@ -746,6 +746,11 @@ func (s *Server) settleRequestFreshness(
 		return annotateRequestFreshness(s.freshnessCarrier(selector, view), outcome, started), nil
 	}
 
+	// A source edit waiting for a previous publication must not preempt the
+	// fold that publication needs. Restore intent before mutation admission.
+	resumeIntent := suspendSourceMutationWriteIntent(ctx)
+	defer resumeIntent()
+
 	// Release the stale lease before blocking. From here on the pre-wait view
 	// is gone and every return path answers out of a freshly selected one.
 	view.close()

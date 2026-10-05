@@ -56,6 +56,8 @@ func (s *Server) awaitMutationRoute(
 			deadline = bounded
 		}
 	}
+	resumeIntent := suspendSourceMutationWriteIntent(ctx)
+	defer resumeIntent()
 	if s.mutationRouteWaitEntered != nil {
 		s.mutationRouteWaitEntered(ctx)
 	}
@@ -88,7 +90,7 @@ func (s *Server) withMutationPublicationStamps(ctx context.Context, tool string)
 }
 
 // announceSourceMutation tells the store a mutation is about to need its
-// writer, before the request waits on any route, lane or cycle, so background
+// writer, before selection or mutation lane/cycle admission, so background
 // writer holders (the WAL reclaim) yield to it. The release runs when the
 // request ends — the mutation has then been committed or refused.
 func (s *Server) announceSourceMutation(tool string) func() {

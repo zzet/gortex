@@ -224,9 +224,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// read that must stay reachable while publication is pending, and the
 		// tools that must not be hostage to the binding they exist to fix.
 		viewless := catalogOnlyCheckoutControl(controlOperation) || viewlessCatalogTool(legacyName)
-		// A source mutation announces itself to the store before it waits on
-		// the route, the lane or the cycle; released when the request ends.
-		releaseWriteIntent := s.announceSourceMutation(req.Params.Name)
+		// A source mutation preempts background writers while it selects and
+		// enters its mutation lane. Publication waits temporarily release that
+		// intent so the previous edit can finish the route this one needs.
+		ctx, releaseWriteIntent := s.withSourceMutationWriteIntent(ctx, req.Params.Name)
 		defer releaseWriteIntent()
 		ctx = s.withMutationPublicationStamps(ctx, req.Params.Name)
 		var view *requestView
