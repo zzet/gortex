@@ -31,7 +31,7 @@ func (s *Store) GetCallReferenceOutEdgesContext(ctx context.Context, ids []strin
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var indexed bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='edges_by_from_line_kind')`).Scan(&indexed); err != nil {
 		return nil, err

@@ -80,7 +80,7 @@ func TestCallReferenceOutgoingCancellationAndFailureHaveNoPartialRows(t *testing
 	got, err := s.GetCallReferenceOutEdgesContext(ctx, []string{"a"})
 	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, got)
-	got, err = s.GetCallReferenceOutEdgesContext(nil, []string{"a"})
+	got, err = s.GetCallReferenceOutEdgesContext(nil, []string{"a"}) //nolint:staticcheck // SA1012: Verify explicit nil-context rejection.
 	require.Error(t, err)
 	require.Nil(t, got)
 	// The second selected row fails after a valid row has been decoded.
