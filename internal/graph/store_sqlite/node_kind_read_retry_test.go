@@ -59,7 +59,7 @@ func TestNodeKindReadTimingRetainsDatabaseSQLBadConnectionRetries(t *testing.T) 
 		connector := &nodeKindRetryConnector{}
 		db := sql.OpenDB(gatedConnector{inner: connector, gate: newSQLiteReadGate()})
 		defer db.Close()
-		s := &Store{db: db}
+		s := &Store{storeCore: &storeCore{db: db}}
 		var timing graph.NodeKindReadTiming
 		ctx := t.Context()
 		if observed {
