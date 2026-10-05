@@ -711,6 +711,13 @@ func generationReadProbes() []genProbe {
 		{name: "GetOutEdgesByNodeIDs", run: func(t *testing.T, s *Store) []string {
 			return edgeSliceMapTokens(s.GetOutEdgesByNodeIDs(genReadProbeIDs()))
 		}},
+		{name: "GetCallReferenceOutEdgesContext", run: func(t *testing.T, s *Store) []string {
+			m, err := s.GetCallReferenceOutEdgesContext(context.Background(), genReadProbeIDs())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return edgeSliceMapTokens(m)
+		}},
 		{name: "GetInEdgesByNodeIDs", run: func(t *testing.T, s *Store) []string {
 			return edgeSliceMapTokens(s.GetInEdgesByNodeIDs(genReadProbeIDs()))
 		}},
@@ -1923,6 +1930,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.BulkLoader)(nil), skip: "the cold-load bracket engages only on a provably empty store; its generation-0 emptiness gate is asserted by TestColdGraphStoreEmptyIgnoresDerivedGenerations"},
 		{iface: (*graph.BundleFingerprintSink)(nil), skip: skipInMemory},
 		{iface: (*graph.CallableBindingNodeSequencer)(nil), probe: "NodesInScopeSeq"},
+		{iface: (*graph.CallReferenceOutgoingReader)(nil), probe: "GetCallReferenceOutEdgesContext"},
 		{iface: (*graph.ChurnEnrichmentReader)(nil), skip: skipSidecar},
 		{iface: (*graph.ChurnEnrichmentWriter)(nil), skip: skipSidecar},
 		{iface: (*graph.ClassHierarchyTraverser)(nil), probe: "ClassHierarchyTraverse"},
