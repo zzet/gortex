@@ -1312,6 +1312,13 @@ func generationReadProbes() []genProbe {
 			}
 			return nodeTokens(out)
 		}},
+		{name: "NodesLightByKindsInScopeSeq", run: func(t *testing.T, s *Store) []string {
+			var out []*graph.Node
+			for n := range s.NodesLightByKindsInScopeSeq([]string{genReadRepo}, nil, graph.KindFunction) {
+				out = append(out, n)
+			}
+			return nodeTokens(out)
+		}},
 		{name: "EdgesInScopeSeq", run: func(t *testing.T, s *Store) []string {
 			var out []string
 			for row := range s.EdgesInScopeSeq([]string{genReadRepo}, nil, graph.EdgeCalls) {
@@ -1931,6 +1938,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.BundleFingerprintSink)(nil), skip: skipInMemory},
 		{iface: (*graph.CallableBindingNodeSequencer)(nil), probe: "NodesInScopeSeq"},
 		{iface: (*graph.CallReferenceOutgoingReader)(nil), probe: "GetCallReferenceOutEdgesContext"},
+		{iface: (*graph.ScopedKindSummarySequencer)(nil), probe: "NodesLightByKindsInScopeSeq"},
 		{iface: (*graph.ChurnEnrichmentReader)(nil), skip: skipSidecar},
 		{iface: (*graph.ChurnEnrichmentWriter)(nil), skip: skipSidecar},
 		{iface: (*graph.ClassHierarchyTraverser)(nil), probe: "ClassHierarchyTraverse"},

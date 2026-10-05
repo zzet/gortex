@@ -35,20 +35,65 @@ type contractCoreScopedFilteredBounded struct {
 	*contractCoreScopedProjection
 }
 
+type contractCoreKindSummaryProjection struct {
+	selected graph.ScopedKindSummarySequencer
+}
+
+func (p *contractCoreKindSummaryProjection) NodesLightByKindsInScopeSeq(repos, files []string, kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
+	return p.selected.NodesLightByKindsInScopeSeq(repos, files, kinds...)
+}
+
+type contractCoreScopedSummary struct {
+	*contractCoreScoped
+	*contractCoreKindSummaryProjection
+}
+type contractCoreScopedFilteredSummary struct {
+	*contractCoreScopedFiltered
+	*contractCoreKindSummaryProjection
+}
+type contractCoreScopedBoundedSummary struct {
+	*contractCoreScopedBounded
+	*contractCoreKindSummaryProjection
+}
+type contractCoreScopedFilteredBoundedSummary struct {
+	*contractCoreScopedFilteredBounded
+	*contractCoreKindSummaryProjection
+}
+
 func preserveContractCoreScopedProjection(wrapped graph.Reader, selected graph.Reader, core *contractCoreEdges) graph.Reader {
 	projection, ok := selected.(graph.ScopedNodeProjectionSequencer)
 	if !ok {
 		return wrapped
 	}
 	p := &contractCoreScopedProjection{selected: projection}
+	var scoped graph.Reader
 	switch r := wrapped.(type) {
 	case *contractCoreFilteredNamesBoundedFiles:
-		return &contractCoreScopedFilteredBounded{r, p}
+		scoped = &contractCoreScopedFilteredBounded{r, p}
 	case *contractCoreBoundedFiles:
-		return &contractCoreScopedBounded{r, p}
+		scoped = &contractCoreScopedBounded{r, p}
 	case *contractCoreFilteredNames:
-		return &contractCoreScopedFiltered{r, p}
+		scoped = &contractCoreScopedFiltered{r, p}
 	default:
-		return &contractCoreScoped{core, p}
+		scoped = &contractCoreScoped{core, p}
+	}
+	// Keep this capability conditional on the exact selected reader. In
+	// particular, an overlay without summary composition uses its full rows.
+	summary, ok := selected.(graph.ScopedKindSummarySequencer)
+	if !ok {
+		return scoped
+	}
+	light := &contractCoreKindSummaryProjection{selected: summary}
+	switch r := scoped.(type) {
+	case *contractCoreScopedFilteredBounded:
+		return &contractCoreScopedFilteredBoundedSummary{r, light}
+	case *contractCoreScopedBounded:
+		return &contractCoreScopedBoundedSummary{r, light}
+	case *contractCoreScopedFiltered:
+		return &contractCoreScopedFilteredSummary{r, light}
+	case *contractCoreScoped:
+		return &contractCoreScopedSummary{r, light}
+	default:
+		return scoped
 	}
 }

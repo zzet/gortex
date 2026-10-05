@@ -84,6 +84,23 @@ func (s *Store) NodesLightInScopeSeq(repoPrefixes, filePaths []string) iter.Seq[
 	}
 }
 
+// NodesLightByKindsInScopeSeq preserves the full scoped cursor's kind and
+// placement predicates while excluding retrieval payloads from each row.
+func (s *Store) NodesLightByKindsInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
+	kindValues, ok := scopedKindValues(kinds)
+	if !ok {
+		return func(func(*graph.Node) bool) {}
+	}
+	return func(yield func(*graph.Node) bool) {
+		for _, kind := range kindValues {
+			query, args, ok := scopedNodeProjectionQuery(repoPrefixes, filePaths, kind, lookupNodeSummaryCols, s.viewGen)
+			if !ok || !s.streamScopedNodes(query, args, true, yield) {
+				return
+			}
+		}
+	}
+}
+
 // streamScopedNodes drains one node cursor page by page. It reports false when
 // the consumer stopped the sequence, true when the cursor is exhausted.
 func (s *Store) streamScopedNodes(query string, args []any, summary bool, yield func(*graph.Node) bool) bool {

@@ -63,12 +63,13 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 	var scopeMS, preparationMS, streamMS, sortMS, responseMS float64
 	var visited, scoped, pathAccepted, matched int
 	var projectionSupported, projectionUsed bool
+	var summaryProjectionUsed bool
 	var readerType, baseType string
 	if debug {
 		start = time.Now()
 		defer func() {
 			s.logger.Debug("find_files phases", zap.String("query", req.GetString("query", "")), zap.String("path", req.GetString("path", "")), zap.String("repo", req.GetString("repo", "")),
-				zap.String("reader_type", readerType), zap.String("base_reader_type", baseType), zap.Bool("node_projection_supported", projectionSupported), zap.Bool("node_projection_used", projectionUsed),
+				zap.String("reader_type", readerType), zap.String("base_reader_type", baseType), zap.Bool("node_projection_supported", projectionSupported), zap.Bool("node_projection_used", projectionUsed), zap.Bool("summary_projection_used", summaryProjectionUsed),
 				zap.Float64("scope_ms", scopeMS), zap.Float64("iterator_preparation_ms", preparationMS), zap.Float64("stream_filter_ms", streamMS), zap.Float64("sort_ms", sortMS), zap.Float64("response_ms", responseMS), zap.Float64("handler_total_ms", float64(time.Since(start))/float64(time.Millisecond)),
 				zap.Int("visited", visited), zap.Int("scoped", scoped), zap.Int("path_accepted", pathAccepted), zap.Int("matched", matched), zap.Error(ctx.Err()))
 		}()
@@ -141,7 +142,14 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 			}
 		}
 		sort.Strings(repos)
-		files = projection.NodesInScopeSeq(repos, nil, graph.KindFile)
+		if summary, ok := reader.(graph.ScopedKindSummarySequencer); ok {
+			if debug {
+				summaryProjectionUsed = true
+			}
+			files = summary.NodesLightByKindsInScopeSeq(repos, nil, graph.KindFile)
+		} else {
+			files = projection.NodesInScopeSeq(repos, nil, graph.KindFile)
+		}
 	} else {
 		files = reader.NodesByKind(graph.KindFile)
 	}

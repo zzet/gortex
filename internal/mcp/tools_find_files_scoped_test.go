@@ -18,6 +18,8 @@ type findFilesProjectionStore struct {
 	*store_sqlite.Store
 	globalReads    int
 	projectedRepos []string
+	fullReads      int
+	summaryReads   int
 }
 
 func (s *findFilesProjectionStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
@@ -28,8 +30,15 @@ func (s *findFilesProjectionStore) NodesByKind(kind graph.NodeKind) iter.Seq[*gr
 }
 
 func (s *findFilesProjectionStore) NodesInScopeSeq(repos, files []string, kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
+	s.fullReads++
 	s.projectedRepos = append(s.projectedRepos, repos...)
 	return s.Store.NodesInScopeSeq(repos, files, kinds...)
+}
+
+func (s *findFilesProjectionStore) NodesLightByKindsInScopeSeq(repos, files []string, kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
+	s.summaryReads++
+	s.projectedRepos = append(s.projectedRepos, repos...)
+	return s.Store.NodesLightByKindsInScopeSeq(repos, files, kinds...)
 }
 
 func TestFindFilesScopedProjectionPreservesScopeAndOverlay(t *testing.T) {

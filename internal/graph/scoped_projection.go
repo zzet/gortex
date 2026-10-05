@@ -23,6 +23,14 @@ type ScopedNodeProjectionSequencer interface {
 	NodesLightInScopeSeq(repoPrefixes, filePaths []string) iter.Seq[*Node]
 }
 
+// ScopedKindSummarySequencer is an optional kind-filtered identity/location
+// projection. Rows retain ID, kind, name, qualified name, file/location,
+// language, repository, workspace and project, but no retrieval payload or
+// metadata. Scope, kind ordering and bounded paging match NodesInScopeSeq.
+type ScopedKindSummarySequencer interface {
+	NodesLightByKindsInScopeSeq(repoPrefixes, filePaths []string, kinds ...NodeKind) iter.Seq[*Node]
+}
+
 // ScopedProjectionSequencer additionally exposes the selected edge stream.
 type ScopedProjectionSequencer interface {
 	ScopedNodeProjectionSequencer
