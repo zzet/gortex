@@ -64,7 +64,7 @@ func TestSymbolRepoRangeMatchesSharedScoresTiesAndLimits(t *testing.T) {
 	}
 }
 
-func TestSymbolRepoRangeEmptyOverflowAndSparsePlans(t *testing.T) {
+func TestSymbolRepoRangeEmptyLargeDenseAndSparsePlans(t *testing.T) {
 	t.Run("empty", func(t *testing.T) {
 		s := viewBatchTestStore(t)
 		got, handled, err := s.searchSymbolRepoSpanPlan(t.Context(), s.buildFTSMatch("needle", true), "missing", 10)
@@ -72,17 +72,27 @@ func TestSymbolRepoRangeEmptyOverflowAndSparsePlans(t *testing.T) {
 			t.Fatalf("got=%v handled=%v err=%v", got, handled, err)
 		}
 	})
-	t.Run("overflow", func(t *testing.T) {
+	t.Run("large-dense", func(t *testing.T) {
 		s := viewBatchTestStore(t)
-		seedRepoRange(t, s, "repo", "overflow", symbolRepoSpanRows+1)
+		seedRepoRange(t, s, "repo", "overflow", 2049)
 		got, handled, err := s.searchSymbolRepoSpanPlan(t.Context(), s.buildFTSMatch("needle", true), "repo", 10)
-		if err != nil || handled || got != nil {
+		if err != nil || !handled || len(got) != 10 {
 			t.Fatalf("got=%v handled=%v err=%v", got, handled, err)
 		}
 		want := unboundedSingleGeneration(t, s, 0, "needle", []string{"repo"}, 10)
 		public, err := s.SearchSymbolsRepoScopedContext(t.Context(), "needle", []string{"repo"}, 10)
-		if err != nil || !reflect.DeepEqual(public, want) {
-			t.Fatalf("fallback err=%v got=%v want=%v", err, public, want)
+		if err != nil || !reflect.DeepEqual(public, want) || !reflect.DeepEqual(got, want) {
+			t.Fatalf("public err=%v got=%v want=%v", err, public, want)
+		}
+	})
+	t.Run("missing-repo-retains-unowned", func(t *testing.T) {
+		s := viewBatchTestStore(t)
+		seedRepoRange(t, s, "", "unowned-only", 3)
+		seedRepoRange(t, s, "foreign", "excluded", 2)
+		want := unboundedSingleGeneration(t, s, 0, "needle", []string{"missing"}, 10)
+		got, handled, err := s.searchSymbolRepoSpanPlan(t.Context(), s.buildFTSMatch("needle", true), "missing", 10)
+		if err != nil || !handled || len(got) != 3 || !reflect.DeepEqual(got, want) {
+			t.Fatalf("got=%v want=%v handled=%v err=%v", got, want, handled, err)
 		}
 	})
 	t.Run("sparse", func(t *testing.T) {
