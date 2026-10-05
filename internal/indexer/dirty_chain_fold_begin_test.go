@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -45,13 +46,17 @@ func TestChainFoldBeginRetriesWriterYieldBeforeCopying(t *testing.T) {
 
 func TestChainFoldBeginRetryStopsAtCancellationAndStarvation(t *testing.T) {
 	t.Run("cancel", func(t *testing.T) {
-		backend := &yieldingBeginBackend{failures: -1, failure: store_sqlite.ErrChainFoldYielded}
-		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
-		defer cancel()
-		fold, _, err := beginChainFoldWatched(ctx, backend, []int64{1}, 2, "test", nil)
-		if fold != nil || !errors.Is(err, context.DeadlineExceeded) || backend.calls != 1 {
-			t.Fatalf("cancelled begin: fold=%v calls=%d err=%v", fold, backend.calls, err)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			backend := &yieldingBeginBackend{failures: -1, failure: store_sqlite.ErrChainFoldYielded}
+			// End between retry ticks in virtual time: cancellation still
+			// stops a refused begin promptly, after the earlier retry.
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Millisecond)
+			defer cancel()
+			fold, _, err := beginChainFoldWatched(ctx, backend, []int64{1}, 2, "test", nil)
+			if fold != nil || !errors.Is(err, context.DeadlineExceeded) || backend.calls != 2 {
+				t.Fatalf("cancelled begin: fold=%v calls=%d err=%v", fold, backend.calls, err)
+			}
+		})
 	})
 	t.Run("starve", func(t *testing.T) {
 		backend := &yieldingBeginBackend{failures: -1, failure: store_sqlite.ErrChainFoldWALMark}

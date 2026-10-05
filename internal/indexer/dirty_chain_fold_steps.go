@@ -40,7 +40,7 @@ import (
 
 // foldStepRetryPoll is how long the driver waits before it asks for the next
 // step after the store gave a step back to an edit or refused one on a WAL
-// mark. Imports use a shorter writer-yield retry via foldStepRetryDelay.
+// mark. Writer yields use a shorter retry via foldStepRetryDelay.
 // The store sizes each step itself (50 ms normally, 10 ms for an import).
 const foldStepRetryPoll = 50 * time.Millisecond
 
