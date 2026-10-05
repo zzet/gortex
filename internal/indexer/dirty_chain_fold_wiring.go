@@ -286,7 +286,9 @@ func (c *CheckoutCoordinator) compactDirtyChainStepped(
 	started := time.Now()
 	built, err := c.flattenDirtyChainOver(ctx, commit, commit, route.DirtyGenerationID, copier)
 	report.BuildDuration = time.Since(started)
-	if err != nil {
+	if err != nil || route.State == store_sqlite.RoutePending {
+		// Pending-source folds are offered only through the guarded parent
+		// handoff below, never through an edit's route-landing publication.
 		c.settleFoldPublication(pub, dirtyLayerBuild{}, nil)
 	} else {
 		c.settleFoldPublication(pub, built, folded)
@@ -294,6 +296,25 @@ func (c *CheckoutCoordinator) compactDirtyChainStepped(
 	switch {
 	case err == nil:
 		report.GenerationID = built.GenerationID
+		if route.State == store_sqlite.RoutePending {
+			if c.leases != nil {
+				pin := c.leases.Acquire(built.GenerationID)
+				defer pin.Release()
+			}
+			// The source lease may still own cycleMu. Offer only the exact,
+			// verified copy as its next parent, without restoring its route.
+			if c.offerWithdrawnCompactionParent(ctx, route, built) {
+				report.Outcome = dirtyChainCompactionPreferred
+			} else {
+				c.deferRetire(built.GenerationID, "withdrawn compaction parent superseded")
+				if ctx.Err() != nil {
+					report.Outcome, report.Canceled = dirtyChainCompactionCanceled, true
+				} else {
+					report.Outcome = dirtyChainCompactionNotNeeded
+				}
+			}
+			return ""
+		}
 		landing, entered := c.landSteppedFold(context.WithoutCancel(ctx), trigger.CommitGenerationID, folded, built, pub)
 		report.Landing = landing.kind
 		if entered {

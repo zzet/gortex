@@ -298,6 +298,15 @@ func (c *CheckoutCoordinator) scheduleDirtyChainCompaction(trigger CheckoutCycle
 	k.stats.Scheduled++
 	k.wg.Add(1)
 	k.mu.Unlock()
+	// Registration still owns cycleMu: pin its accepted ancestry before the
+	// worker queues behind a previous fold or the shared lane. Validation
+	// after admission remains mandatory even while these rows are retained.
+	releaseTrigger := func() {}
+	if c.leases != nil && steppedChainFoldEnabled {
+		members := append(c.dirtyChainMembers(lifetime, trigger.DirtyGenerationID), trigger.CommitGenerationID)
+		pin := c.leases.Acquire(members...)
+		releaseTrigger = pin.Release
+	}
 	if len(replaced) > 0 {
 		c.logger.Debug("checkout coordinator: replacing an obsolete divergent chain fold",
 			zap.String("checkout", c.checkoutID), zap.Int64s("folding", replaced), zap.Int64s("active_chain", activeChain))
@@ -305,6 +314,7 @@ func (c *CheckoutCoordinator) scheduleDirtyChainCompaction(trigger CheckoutCycle
 	go func() {
 		defer k.wg.Done()
 		defer close(done)
+		defer releaseTrigger()
 		defer cancel()
 		if previous != nil {
 			select {
@@ -671,6 +681,13 @@ func (c *CheckoutCoordinator) compactDirtyChain(ctx context.Context, trigger Che
 	report = DirtyChainCompaction{
 		Top: trigger.DirtyGenerationID, Commit: trigger.CommitGenerationID, ChainDepthBefore: trigger.DirtyChainDepth,
 	}
+	// Keep the accepted trigger alive while this worker waits for quiet and
+	// the shared lane. A mutation may withdraw it before admission.
+	if c.leases != nil && steppedChainFoldEnabled {
+		members := append(c.dirtyChainMembers(ctx, trigger.DirtyGenerationID), trigger.CommitGenerationID)
+		pin := c.leases.Acquire(members...)
+		defer pin.Release()
+	}
 	started := time.Now()
 	record := DefaultPublicationPhases().BeginBackgroundCompaction(c.checkoutID, started)
 	ctx = withPhaseRecord(ctx, record)
@@ -785,10 +802,20 @@ func (c *CheckoutCoordinator) compactDirtyChainOnce(parent context.Context, trig
 		report.Outcome, report.Err = dirtyChainCompactionFailed, err
 		return ""
 	}
-	if !found || route.State != store_sqlite.RouteActive || route.CommitGenerationID != trigger.CommitGenerationID ||
-		route.DirtyGenerationID <= 0 {
+	if !found || route.CommitGenerationID != trigger.CommitGenerationID {
 		report.Outcome = dirtyChainCompactionNotNeeded
 		return ""
+	}
+	if route.State != store_sqlite.RouteActive || route.DirtyGenerationID <= 0 {
+		parent, releaseParent := c.withdrawnCompactionParent(ctx, route, trigger)
+		defer releaseParent()
+		if parent == 0 {
+			report.Outcome = dirtyChainCompactionNotNeeded
+			return ""
+		}
+		// This is only an immutable copy source. Its route stays pending;
+		// a verified copy can be offered as a parent, never as a route.
+		route.DirtyGenerationID = parent
 	}
 	depth := len(c.dirtyChainMembers(ctx, route.DirtyGenerationID))
 	foldable := depth > 1 && c.chainCoveredPaths(ctx, route.DirtyGenerationID) > dirtyChainFoldPaths
