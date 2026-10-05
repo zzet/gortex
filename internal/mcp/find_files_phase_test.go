@@ -47,4 +47,17 @@ func TestFindFilesAutoPrimaryUsesSelectedProjectionAndDebugPhases(t *testing.T) 
 	require.NoError(t, err)
 	require.Equal(t, res, again, "debug phases must not change output")
 	require.Equal(t, before, tracked.globalReads)
+
+	// An exact selected reader without the optional summary capability keeps
+	// the full scoped fallback and reports that distinction in debug phases.
+	v.srv.graph = findFilesFullProjectionStore{Store: v.store, selected: v.store}
+	v.srv.logger = zap.New(logs)
+	fallback, err := v.srv.handleFindFiles(ctx, makeReq("find_files", map[string]any{"query": "edit.go", "repo": "repo", "path": "edit.go"}))
+	require.NoError(t, err)
+	require.Equal(t, res, fallback)
+	phases = observed.FilterMessage("find_files phases").All()
+	require.Len(t, phases, 2)
+	fields = phases[1].ContextMap()
+	require.Equal(t, true, fields["node_projection_used"])
+	require.Equal(t, false, fields["summary_projection_used"])
 }

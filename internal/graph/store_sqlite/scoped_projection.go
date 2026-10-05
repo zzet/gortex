@@ -487,3 +487,4 @@ func (s *Store) scopedEdgeFileProvenanceCanonical(
 }
 
 var _ graph.ScopedProjectionSequencer = (*Store)(nil)
+var _ graph.ScopedKindSummarySequencer = (*Store)(nil)
