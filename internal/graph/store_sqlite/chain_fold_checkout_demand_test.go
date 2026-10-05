@@ -15,6 +15,8 @@ func TestCheckoutDemandPermitsFoldWithoutReleasingGlobalDemand(t *testing.T) {
 	store, _ := openWALReclaimStore(t)
 	t.Cleanup(func() { _ = store.Close() })
 	store.stopCheckpointLoop()
+	lane := &fakeBuildLane{} // daemon cooperation requires an installed lane predicate
+	lane.install(store)
 	chain := foldChain(t, store, 400)
 	to := reservedGeneration(t, store, "checkout-demand-fold")
 	reference := reservedGeneration(t, store, "checkout-demand-reference")
