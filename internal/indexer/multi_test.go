@@ -77,6 +77,15 @@ func TestReconcilePhaseTimingOutcomes(t *testing.T) {
 	}
 }
 
+type reconcileCensusPanicStore struct {
+	graph.Store
+	panicValue string
+}
+
+func (s *reconcileCensusPanicStore) RepoNodesByKindsWithMetaKey(string, string, []graph.NodeKind, string) []*graph.Node {
+	panic(s.panicValue)
+}
+
 func TestReconcileCensusTiming(t *testing.T) {
 	for _, mode := range []string{"clean", "changed", "missing", "panic"} {
 		t.Run(mode, func(t *testing.T) {
@@ -96,12 +105,15 @@ func TestReconcileCensusTiming(t *testing.T) {
 				dir = filepath.Join(dir, "missing")
 			}
 			if mode == "panic" {
-				// Inject a parser lookup panic; the telemetry must not claim a
-				// successful no-op merely because the named error is still nil.
-				registry := idx.registry
-				idx.registry = nil
-				defer func() { idx.registry = registry }()
-				require.Panics(t, func() { _, _, _, _ = idx.changedSinceMtimesCensus(dir) })
+				// Inject an explicit Go panic after the census timing defer;
+				// no hardware exception is needed to test aborted telemetry.
+				// The telemetry must not claim a successful no-op merely
+				// because the named error is still nil.
+				const panicValue = "injected census projection panic"
+				store := idx.graph
+				idx.graph = &reconcileCensusPanicStore{Store: store, panicValue: panicValue}
+				defer func() { idx.graph = store }()
+				require.PanicsWithValue(t, panicValue, func() { _, _, _, _ = idx.changedSinceMtimesCensus(dir) })
 				entries := logs.FilterMessage("indexer: reconcile phase complete").All()
 				require.Len(t, entries, 1)
 				fields := entries[0].ContextMap()
