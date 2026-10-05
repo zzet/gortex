@@ -3591,6 +3591,13 @@ func (c *CheckoutCoordinator) flip(
 	slot store_sqlite.RouteSlot,
 	generationID int64,
 ) error {
+	// Warming an already sealed generation is read-only and may outlast an
+	// interactive request. An import retains its checkout/preparation ownership
+	// but gives back the physical lane until the guarded route mutation below.
+	if lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane); lane != nil {
+		lane.leave()
+	}
+	c.prewarmRoute(ctx, route, slot, generationID)
 	var admissionErr error
 	ctx, admissionErr = resumeImportBuildLane(ctx, false)
 	if admissionErr != nil {
@@ -3600,7 +3607,6 @@ func (c *CheckoutCoordinator) flip(
 	// already ready and PublishAndRoute — which publishes and then flips —
 	// would refuse it for not being in the building state. The flip alone is
 	// what is left of that pair for a caller holding a published generation.
-	c.prewarmRoute(ctx, route, slot, generationID)
 	err := c.catalog.FlipCheckoutRouteSlot(ctx, store_sqlite.FlipCheckoutRouteSlotRequest{
 		CheckoutID:         c.checkoutID,
 		Slot:               slot,

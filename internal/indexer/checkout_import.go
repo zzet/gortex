@@ -100,6 +100,10 @@ func (c *CheckoutCoordinator) foldImportChain(
 					}
 					return c.builder.checkImportPreparationEpochs(epochs)
 				},
+				// The sealed payload is immutable; its catalog readback and
+				// copy-owner cleanup do not need the physical build lane. The
+				// ancestry/preparation pins remain held until the guarded flip.
+				afterPublish: lane.leave,
 			})
 			copier = c.copyChainInSteps
 		} else {

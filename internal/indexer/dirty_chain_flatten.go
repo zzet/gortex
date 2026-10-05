@@ -225,7 +225,13 @@ func publishCopiedGeneration(ctx context.Context, generationID int64, admission 
 			return err
 		}
 	}
-	return publication.Publish(ctx, time.Now().Unix())
+	if err := publication.Publish(ctx, time.Now().Unix()); err != nil {
+		return err
+	}
+	if admission != nil && admission.afterPublish != nil {
+		admission.afterPublish()
+	}
+	return nil
 }
 
 // verifyFlattenedChain compares, over everything the chain speaks for, the

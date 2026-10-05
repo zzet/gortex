@@ -15,7 +15,10 @@ type importBuildLaneKey struct{}
 
 // Private stepped folds reenter immediately before publishing their payload.
 type importFoldPublicationKey struct{}
-type importFoldPublication struct{ beforePublish func(context.Context) error }
+type importFoldPublication struct {
+	beforePublish func(context.Context) error
+	afterPublish  func()
+}
 
 // A stale detached import starts a new admission cycle rather than retrying
 // beneath the context whose interactive yield was already withdrawn.
