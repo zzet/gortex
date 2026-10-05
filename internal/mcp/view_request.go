@@ -2482,8 +2482,8 @@ func (s *Server) refuseRoutedViewMutation(ctx context.Context, tool string) *mcp
 	}
 	return mcp.NewToolResultError(fmt.Sprintf(
 		"%s: %s has no approved write path for this view. "+
-			"Only file edits, file writes, and symbol edits are supported on an exact live worktree with an active checkout coordinator. "+
-			"Batch operations, refactors, and immutable ref views remain read-only through routed views.",
+			"Only file edits, file writes, symbol edits, and atomic batches are supported on an exact live worktree with an active checkout coordinator. "+
+			"Refactors and immutable ref views remain read-only through routed views.",
 		graphview.CodeViewReadOnly, tool))
 }
 

@@ -213,6 +213,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// gates below read that name rather than resolving it twice.
 		legacyName, _ := s.legacyToolName(&req)
 		controlOperation := checkoutControlOperationName(legacyName)
+		batchContinuation := s.isBatchContinuation(legacyName, &req)
+		if batchContinuation {
+			controlOperation = "mutation_status"
+		}
 		if controlOperation != "" {
 			control, controlErr := s.resolveCheckoutControlScope(ctx, selector, &req)
 			if controlErr != nil {

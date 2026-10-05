@@ -64,19 +64,27 @@ type batchTransactionFile struct {
 }
 
 type batchTransactionReceipt struct {
-	Version       int                    `json:"version"`
-	TransactionID string                 `json:"transaction_id"`
-	Fingerprint   string                 `json:"fingerprint"`
-	Status        string                 `json:"status"`
-	DiskStatus    string                 `json:"disk_status"`
-	GraphStatus   string                 `json:"graph_status"`
-	Error         string                 `json:"error,omitempty"`
-	Results       []batchEditResult      `json:"results,omitempty"`
-	Summary       map[string]int         `json:"summary,omitempty"`
-	Files         []batchTransactionFile `json:"files,omitempty"`
-	StartedAt     time.Time              `json:"started_at"`
-	CompletedAt   *time.Time             `json:"completed_at,omitempty"`
-	Recovered     bool                   `json:"recovered,omitempty"`
+	Version            int                    `json:"version"`
+	CheckoutGeneration int64                  `json:"checkout_generation,omitempty"`
+	HeadRef            string                 `json:"checkout_head_ref,omitempty"`
+	HeadCommit         string                 `json:"checkout_head_commit,omitempty"`
+	HeadTree           string                 `json:"checkout_head_tree,omitempty"`
+	CheckoutID         string                 `json:"checkout_id,omitempty"`
+	Incarnation        string                 `json:"checkout_incarnation,omitempty"`
+	CheckoutRoot       string                 `json:"checkout_root,omitempty"`
+	RootIdentity       string                 `json:"checkout_root_identity,omitempty"`
+	TransactionID      string                 `json:"transaction_id"`
+	Fingerprint        string                 `json:"fingerprint"`
+	Status             string                 `json:"status"`
+	DiskStatus         string                 `json:"disk_status"`
+	GraphStatus        string                 `json:"graph_status"`
+	Error              string                 `json:"error,omitempty"`
+	Results            []batchEditResult      `json:"results,omitempty"`
+	Summary            map[string]int         `json:"summary,omitempty"`
+	Files              []batchTransactionFile `json:"files,omitempty"`
+	StartedAt          time.Time              `json:"started_at"`
+	CompletedAt        *time.Time             `json:"completed_at,omitempty"`
+	Recovered          bool                   `json:"recovered,omitempty"`
 }
 
 type batchTransactionState struct {
@@ -84,6 +92,7 @@ type batchTransactionState struct {
 	done        chan struct{}
 	doneOnce    sync.Once
 	graphMu     sync.Mutex
+	recoveryMu  sync.Mutex
 	mu          sync.RWMutex
 	receipt     batchTransactionReceipt
 }
@@ -302,6 +311,16 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 			}
 		default:
 			plan.err = fmt.Sprintf("unsupported batch edit op %q", plan.op)
+		}
+		if plan.err == "" {
+			for _, path := range []string{plan.absPath, plan.destinationPath} {
+				if path != "" {
+					if err := guardCheckoutMutationPath(ctx, path); err != nil {
+						plan.err = err.Error()
+						break
+					}
+				}
+			}
 		}
 		plans = append(plans, plan)
 	}
@@ -615,6 +634,9 @@ func (s *Server) readBatchBuffers(ctx context.Context, plans []plannedBatchEdit)
 	add := func(path, relPath string) error {
 		if _, exists := buffers[path]; exists {
 			return nil
+		}
+		if err := guardCheckoutMutationPath(ctx, path); err != nil {
+			return err
 		}
 		buffer := &batchFileBuffer{absPath: path, relPath: relPath, mode: 0o644, existenceSet: true}
 		info, content, err := batchPathBytes(path, relPath)
@@ -1001,7 +1023,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 	if err != nil {
 		return batchTransactionReceipt{}, err
 	}
-	state, action, err := s.loadOrCreateBatchTransaction(transactionID, fingerprint)
+	state, action, err := s.loadOrCreateBatchTransaction(ctx, transactionID, fingerprint)
 	if err != nil {
 		return batchTransactionReceipt{}, err
 	}
@@ -1012,7 +1034,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		s.recoverBatchTransaction(ctx, state)
 		return state.snapshot(), nil
 	case "refresh_graph":
-		s.refreshBatchGraph(state)
+		s.refreshBatchGraph(ctx, state)
 		return state.snapshot(), nil
 	}
 
@@ -1066,6 +1088,22 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", "edit cancelled before commit: "+err.Error()), nil
 	}
 
+	if mutation := checkoutMutationFromContext(ctx); mutation != nil {
+		if err := mutation.mutation.Prepare(ctx); err != nil {
+			return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", err.Error()), nil
+		}
+	}
+
+	if mutation := checkoutMutationFromContext(ctx); mutation != nil {
+		if authority, ok := mutation.mutation.(checkoutBatchAuthority); ok {
+			receipt.CheckoutGeneration, receipt.HeadRef, receipt.HeadCommit, receipt.HeadTree = authority.BatchAuthority()
+		}
+		if err := s.persistBatchManifest(receipt); err != nil {
+			return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", err.Error()), nil
+		}
+		state.publish(receipt, false)
+	}
+
 	// Commit is deliberately non-cancellable. Once the first rename succeeds,
 	// every remaining write or rollback must run to a terminal disk state.
 	writer := s.batchDurability().writeFile
@@ -1079,7 +1117,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		remover = s.batchRemoveOverride
 	}
 	finishCommitFailure := func(failedPath, message string) batchTransactionReceipt {
-		status, rollbackErr := s.rollbackBatchReceipt(receipt)
+		status, rollbackErr := s.rollbackBatchReceipt(receipt, ctx)
 		if rollbackErr != nil {
 			message += "; " + rollbackErr.Error()
 		}
@@ -1100,6 +1138,9 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 			continue
 		}
 		var commitErr error
+		if err := guardCheckoutMutationPath(ctx, path); err != nil {
+			return finishCommitFailure(buffer.relPath, err.Error()), nil
+		}
 		if !buffer.existsBefore {
 			if targetErr := s.validateBatchCreateTarget(ctx, path, buffer.relPath); targetErr != nil {
 				commitErr = targetErr
@@ -1118,6 +1159,9 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		buffer := buffers[path]
 		if buffer.existsAfter {
 			continue
+		}
+		if err := guardCheckoutMutationPath(ctx, path); err != nil {
+			return finishCommitFailure(buffer.relPath, err.Error()), nil
 		}
 		if commitErr := remover(path); commitErr != nil {
 			message := fmt.Sprintf("could not commit %s: %v", buffer.relPath, commitErr)
@@ -1151,7 +1195,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 			session.recordSymbol(plan.edit.SymbolID)
 		}
 	}
-	s.refreshBatchGraph(state)
+	s.refreshBatchGraph(ctx, state)
 	return state.snapshot(), nil
 }
 
@@ -1178,12 +1222,15 @@ func (s *Server) batchTransactionStatus(ctx context.Context, transactionID strin
 		if !valid {
 			return batchTransactionReceipt{}, fmt.Errorf("invalid transaction state for %q", id)
 		}
+		if err := s.validateBatchCheckout(ctx, state.snapshot()); err != nil {
+			return batchTransactionReceipt{}, err
+		}
 		if existingBatchTransactionAction(state) == "refresh_graph" {
-			s.refreshBatchGraph(state)
+			s.refreshBatchGraph(ctx, state)
 		}
 		return state.snapshot(), nil
 	}
-	state, action, err := s.loadOrCreateBatchTransaction(id, "")
+	state, action, err := s.loadOrCreateBatchTransaction(ctx, id, "")
 	if err != nil {
 		return batchTransactionReceipt{}, err
 	}
@@ -1191,7 +1238,7 @@ func (s *Server) batchTransactionStatus(ctx context.Context, transactionID strin
 	case "recover":
 		s.recoverBatchTransaction(ctx, state)
 	case "refresh_graph":
-		s.refreshBatchGraph(state)
+		s.refreshBatchGraph(ctx, state)
 	}
 	return state.snapshot(), nil
 }
@@ -1250,7 +1297,7 @@ func (s *Server) waitBatchGraphReceipts(files []batchTransactionFile) {
 	}
 }
 
-func (s *Server) refreshBatchGraph(state *batchTransactionState) {
+func (s *Server) refreshBatchGraph(ctx context.Context, state *batchTransactionState) {
 	state.graphMu.Lock()
 	defer state.graphMu.Unlock()
 
@@ -1264,6 +1311,10 @@ func (s *Server) refreshBatchGraph(state *batchTransactionState) {
 		return
 	}
 
+	if receipt.CheckoutID != "" {
+		s.refreshCheckoutBatchGraph(ctx, state, receipt)
+		return
+	}
 	outcomes := make(map[string]mutationReindexOutcome, len(receipt.Files))
 	for i := range receipt.Files {
 		file := &receipt.Files[i]

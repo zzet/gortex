@@ -76,6 +76,7 @@ type checkoutRefreshRequest struct {
 	// or after it.
 	freshAfter  time.Time
 	contentHash string
+	batchFiles  []CheckoutBatchFile
 	// record is the caller's publication record (WithPublicationRecord),
 	// bound to the ticket at admission, before the coordinator is woken.
 	record *PublicationPhaseRecord
@@ -611,6 +612,10 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 				c.finishCheckoutRefresh(request, 0, ErrCheckoutRefreshSuperseded)
 				continue
 			}
+		}
+		if err := validateCheckoutBatchFiles(ctx, current.RootPath, rootInfo, request.batchFiles); err != nil {
+			c.finishCheckoutRefresh(request, 0, err)
+			continue
 		}
 		c.finishCheckoutRefresh(request, uint64(out.DirtyGenerationID), nil)
 	}

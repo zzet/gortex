@@ -49,6 +49,7 @@ type CheckoutMutation struct {
 	checkout        store_sqlite.Checkout
 	rootInfo        os.FileInfo
 	route           store_sqlite.CheckoutRoute
+	recovery        bool
 	prepared        bool
 	fresh           bool
 	closed          bool

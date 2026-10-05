@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/gitstate"
 )
 
 const batchTransactionDirEnv = "GORTEX_BATCH_TRANSACTION_DIR"
@@ -87,7 +88,7 @@ func existingBatchTransactionAction(state *batchTransactionState) string {
 	return "existing"
 }
 
-func (s *Server) loadOrCreateBatchTransaction(transactionID, fingerprint string) (*batchTransactionState, string, error) {
+func (s *Server) loadOrCreateBatchTransaction(ctx context.Context, transactionID, fingerprint string) (*batchTransactionState, string, error) {
 	if value, ok := s.batchTransactions.Load(transactionID); ok {
 		state, valid := value.(*batchTransactionState)
 		if !valid {
@@ -95,6 +96,9 @@ func (s *Server) loadOrCreateBatchTransaction(transactionID, fingerprint string)
 		}
 		if fingerprint != "" && state.fingerprint != fingerprint {
 			return nil, "", fmt.Errorf("transaction_id %q is already bound to a different edit payload", transactionID)
+		}
+		if err := s.validateBatchCheckout(ctx, state.snapshot()); err != nil {
+			return nil, "", err
 		}
 		return state, existingBatchTransactionAction(state), nil
 	}
@@ -104,6 +108,9 @@ func (s *Server) loadOrCreateBatchTransaction(transactionID, fingerprint string)
 		return nil, "", err
 	}
 	if found {
+		if err := s.validateBatchCheckout(ctx, persisted); err != nil {
+			return nil, "", err
+		}
 		if fingerprint != "" && persisted.Fingerprint != fingerprint {
 			return nil, "", fmt.Errorf("transaction_id %q is already bound to a different edit payload", transactionID)
 		}
@@ -122,6 +129,9 @@ func (s *Server) loadOrCreateBatchTransaction(transactionID, fingerprint string)
 			if fingerprint != "" && existing.fingerprint != fingerprint {
 				return nil, "", fmt.Errorf("transaction_id %q is already bound to a different edit payload", transactionID)
 			}
+			if err := s.validateBatchCheckout(ctx, existing.snapshot()); err != nil {
+				return nil, "", err
+			}
 			return existing, existingBatchTransactionAction(existing), nil
 		}
 		if persisted.Status == "prepared" {
@@ -139,12 +149,22 @@ func (s *Server) loadOrCreateBatchTransaction(transactionID, fingerprint string)
 		Version: batchTransactionVersion, TransactionID: transactionID, Fingerprint: fingerprint,
 		Status: "preparing", DiskStatus: "unchanged", GraphStatus: "not_started", StartedAt: time.Now().UTC(),
 	}
+	if mutation := checkoutMutationFromContext(ctx); mutation != nil {
+		receipt.CheckoutID, receipt.Incarnation, receipt.CheckoutRoot = mutation.checkoutID, mutation.incarnation, mutation.root
+		receipt.RootIdentity = gitstate.SamplePathEvidence(mutation.root).RootIdentity
+		if authority, ok := mutation.mutation.(checkoutBatchAuthority); ok {
+			receipt.CheckoutGeneration, receipt.HeadRef, receipt.HeadCommit, receipt.HeadTree = authority.BatchAuthority()
+		}
+	}
 	state := &batchTransactionState{fingerprint: fingerprint, done: make(chan struct{}), receipt: receipt}
 	actual, loaded := s.batchTransactions.LoadOrStore(transactionID, state)
 	if loaded {
 		existing := actual.(*batchTransactionState)
 		if existing.fingerprint != fingerprint {
 			return nil, "", fmt.Errorf("transaction_id %q is already bound to a different edit payload", transactionID)
+		}
+		if err := s.validateBatchCheckout(ctx, existing.snapshot()); err != nil {
+			return nil, "", err
 		}
 		return existing, existingBatchTransactionAction(existing), nil
 	}
@@ -246,7 +266,14 @@ func classifyBatchFiles(files []batchTransactionFile) (before, after, unknown []
 	return before, after, unknown, err
 }
 
-func (s *Server) rollbackBatchReceipt(receipt batchTransactionReceipt) (string, error) {
+func (s *Server) rollbackBatchReceipt(receipt batchTransactionReceipt, contexts ...context.Context) (string, error) {
+	for _, ctx := range contexts {
+		for _, file := range receipt.Files {
+			if err := guardCheckoutMutationPath(ctx, file.Path); err != nil {
+				return "recovery_conflict", err
+			}
+		}
+	}
 	_, after, unknown, classifyErr := classifyBatchFiles(receipt.Files)
 	if len(unknown) > 0 {
 		return "recovery_conflict", fmt.Errorf("rollback refused unknown disk state: %w", classifyErr)
@@ -283,7 +310,23 @@ func (s *Server) rollbackBatchReceipt(receipt batchTransactionReceipt) (string, 
 }
 
 func (s *Server) recoverBatchTransaction(ctx context.Context, state *batchTransactionState) {
+	state.recoveryMu.Lock()
+	defer state.recoveryMu.Unlock()
 	receipt := state.snapshot()
+	if receipt.Status != "prepared" {
+		return
+	}
+	if receipt.CheckoutID != "" {
+		var release func()
+		var err error
+		ctx, release, err = s.acquireBatchRecovery(ctx, receipt)
+		if err != nil {
+			receipt.Error = err.Error()
+			state.publish(receipt, true)
+			return
+		}
+		defer release()
+	}
 	paths := make([]string, 0, len(receipt.Files))
 	for _, file := range receipt.Files {
 		paths = append(paths, file.Path)
@@ -298,6 +341,10 @@ func (s *Server) recoverBatchTransaction(ctx context.Context, state *batchTransa
 	defer release()
 
 	before, after, unknown, classifyErr := classifyBatchFiles(receipt.Files)
+	if receipt.CheckoutID != "" && receipt.HeadCommit == "" && len(before) != len(receipt.Files) {
+		s.finishBatchTransaction(state, receipt, "recovery_conflict", "conflict", "not_started", "prepared checkout journal has no pre-write HEAD authority and disk is not unchanged")
+		return
+	}
 	switch {
 	case len(unknown) > 0:
 		receipt.Recovered = true
@@ -315,12 +362,17 @@ func (s *Server) recoverBatchTransaction(ctx context.Context, state *batchTransa
 		receipt.Status, receipt.DiskStatus, receipt.GraphStatus = "committed", "committed", "pending"
 		receipt.Error = ""
 		state.publish(receipt, false)
-		s.refreshBatchGraph(state)
+		s.refreshBatchGraph(ctx, state)
 	case len(before) == len(receipt.Files):
 		receipt.Recovered = true
 		s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", "recovered prepared transaction before commit")
 	default:
-		status, rollbackErr := s.rollbackBatchReceipt(receipt)
+		if err := prepareBatchRecovery(ctx); err != nil {
+			receipt.Error = err.Error()
+			state.publish(receipt, true)
+			return
+		}
+		status, rollbackErr := s.rollbackBatchReceipt(receipt, ctx)
 		receipt.Recovered = true
 		message := "recovered interrupted mixed commit by restoring original bytes"
 		if rollbackErr != nil {
