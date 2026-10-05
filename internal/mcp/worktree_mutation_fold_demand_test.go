@@ -120,14 +120,19 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 	require.NoError(t, err)
 	releaseLane = sync.OnceFunc(releaseLane)
 	t.Cleanup(releaseLane)
+	// Closing the old runtime permanently stops its repository admissions.
+	// A fresh runtime registers the same catalog owner with a fresh lease manager.
+	leases := graphview.NewLeaseManager()
+	f.srv.materializer.Leases = leases
 	fresh, err := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{
 		MultiIndexer: f.srv.multiIndexer, ConfigManager: f.srv.configManager,
-		Graph: f.store, Logger: f.srv.logger, ViewLeases: f.srv.materializer.Leases,
+		Graph: f.store, Logger: f.srv.logger, ViewLeases: leases,
 	})
 	require.NoError(t, err)
 	fresh.SetBuildGate(gate)
 	t.Cleanup(func() { _ = fresh.Close() })
 	f.srv.lifecycle = fresh
+	require.NoError(t, fresh.RegisterRepositoryOwner(context.Background(), capped.GraphID))
 	require.True(t, fresh.ActivateCheckout(f.checkoutID, "static-fold-cap-regression"))
 	checkout, found, err := f.store.Catalog().GetCheckout(context.Background(), f.checkoutID)
 	require.NoError(t, err)
