@@ -59,7 +59,18 @@ func TestReclaimFinalBackfillBoundsWriterCredit(t *testing.T) {
 			}
 			done := make(chan error, 1)
 			res := &walReclaimResult{}
-			go func() { done <- runFinalReclaimStep(t.Context(), kind, s, db, res) }()
+			go func() {
+				if kind == "short" {
+					// This assertion concerns one parked copy admission. The urgent
+					// policy may safely copy a new foreground tail in a second
+					// adaptive slice; exercise that full policy again below.
+					res.urgent = true
+					_, err := s.reclaimWALResetHoldOnce(t.Context(), walReclaimConfig{}, db, res, true, false, walReclaimResetHold)
+					done <- err
+					return
+				}
+				done <- runFinalReclaimStep(t.Context(), kind, s, db, res)
+			}()
 			select {
 			case <-entered:
 			case <-time.After(5 * time.Second):
