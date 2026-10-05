@@ -112,9 +112,10 @@ func (b *mutationFoldGateBaton) close() {
 // The second default edit waits on the first edit's real withdrawn route.
 // That publication must copy/verify the actual chain at the physical cap, not
 // succeed by timing out its fold and rebuilding direct. On the original
-// wrapper, the second edit's ordinary announcement prevents that inline Begin
-// until its unchanged three-second budget expires; the folded-parent oracle
-// fails even if both tools eventually report successful disk commits.
+// wrapper, the second edit's ordinary announcement refuses that inline Begin.
+// The inline copier returns that error without retrying Begin; its direct
+// fallback fails the folded-parent oracle even if both disk commits succeed.
+// The production three-second fold budget is unchanged.
 func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testing.T) {
 	t.Setenv("GORTEX_TOOLS", "facade-v1")
 	gate := indexer.NewViewBuildGate()
