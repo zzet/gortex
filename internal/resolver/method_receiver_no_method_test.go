@@ -159,6 +159,8 @@ func TestRebindGoMethodReceiversForFileUsesSelectedFullDeltaFacts(t *testing.T) 
 			r.incrementalNodesByFile = map[string][]*graph.Node{file: facts}
 			store.reset()
 			r.rebindGoMethodReceiversForFile(file)
+			// The real incremental tail flushes deferred retargets before returning.
+			r.flushIncrementalAttributionReindexes()
 			require.Zero(t, store.fileReads, "use the exact selected full-file cache")
 			if test.hasMethod {
 				require.Equal(t, 1, store.packageReads)
