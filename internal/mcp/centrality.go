@@ -258,12 +258,16 @@ func (s *Server) boundedCentralityForRequestObserved(ctx context.Context, seeds,
 	// new generation, and a repeated search reads nothing.
 	reader := s.stackedAdjacencyReader(ctx)
 	var presence *centralityPresenceReader
+	var callReferences *centralityCallReferenceReader
 	if reader == nil {
 		if timing != nil {
 			// Install before readerFor constructs the request's core wrapper.
 			ctx = withCoreEdgeTiming(ctx, &timing.CoreEdges)
 		}
 		reader = s.readerFor(ctx)
+		if read := centralityCheckedCallReferences(ctx, reader); read != nil {
+			callReferences = &centralityCallReferenceReader{ctx: ctx, read: read}
+		}
 		if checked, ok := centralityCheckedPresence(reader); ok {
 			presence = &centralityPresenceReader{ctx: ctx, checked: checked}
 		}
@@ -271,6 +275,10 @@ func (s *Server) boundedCentralityForRequestObserved(ctx context.Context, seeds,
 		timing.MemoCalls++
 	}
 	reader = requestBoundReader(ctx, reader)
+	if callReferences != nil {
+		callReferences.Reader = reader
+		reader = callReferences
+	}
 	if presence != nil {
 		presence.Reader = reader
 		reader = presence
@@ -291,6 +299,10 @@ func (s *Server) boundedCentralityForRequestObserved(ctx context.Context, seeds,
 		if stats.Truncated {
 			timing.Truncated++
 		}
+	}
+	if callReferences != nil && callReferences.err != nil {
+		recordContractCoreReadError(ctx, callReferences.err)
+		return rerank.CentralityResult{}
 	}
 	if presence != nil && presence.err != nil {
 		recordContractCoreReadError(ctx, presence.err)
