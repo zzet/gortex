@@ -832,6 +832,23 @@ func generationReadProbes() []genProbe {
 			}
 			return out
 		}},
+		// The analysis binding borrows the selected generation. Exercise both
+		// paged projections against the fence's distinct node/edge fixtures.
+		{name: "BindAnalysisPages", run: func(t *testing.T, s *Store) []string {
+			bound, ok := s.BindAnalysisPages().(*Store)
+			if !ok || bound.ViewGeneration() != s.ViewGeneration() {
+				t.Fatalf("BindAnalysisPages left generation %d", s.ViewGeneration())
+			}
+			var nodes []*graph.Node
+			for n := range bound.NodesLightSeq() {
+				nodes = append(nodes, n)
+			}
+			var edges []*graph.Edge
+			for e := range bound.EdgesLightSeq(graph.EdgeCalls, graph.EdgeReferences) {
+				edges = append(edges, e)
+			}
+			return append(nodeTokens(nodes), edgeTokens(edges)...)
+		}},
 		// A handle bound to a request context reads its own generation:
 		// binding changes only when a paged read stops, never what it serves.
 		{name: "BindReadContext", run: func(t *testing.T, s *Store) []string {
@@ -1932,6 +1949,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.AllGenerationsRepoEvicter)(nil), skip: skipAdmin},
 		{iface: (*graph.CheckedAllGenerationsRepoEvicter)(nil), skip: skipAdmin},
 		{iface: (*graph.AnalysisGenerationStore)(nil), skip: skipSidecar},
+		{iface: (*graph.AnalysisPageBinder)(nil), probe: "BindAnalysisPages"},
 		{iface: (*graph.AnalysisQueryStore)(nil), skip: skipSidecar},
 		{iface: (*graph.AtomicVectorCorpusInstaller)(nil), skip: skipSidecar},
 		{iface: (*graph.BFSCapable)(nil), probe: "BFS"},
