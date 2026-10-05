@@ -3212,39 +3212,22 @@ func (s *Store) EdgeCount() int {
 	return n
 }
 
-// countsFromIndexState returns the whole-graph node and edge totals for
-// this view from the persisted per-repo counters in repo_index_state --
-// one indexed row per tracked repo, with no scan of the nodes or edges
-// tables. ok is false when the view has no counter rows (a never-indexed
-// or pre-counter store) so the caller falls back to the exact scan rather
-// than reporting a counter-absent zero as a real total.
-func (s *Store) countsFromIndexState() (nodes, edges int, ok bool) {
-	var rows int
-	if err := s.stmtIndexStateTotals.QueryRow(s.viewGen).Scan(&rows, &nodes, &edges); err != nil {
-		panicOnFatal(err)
-		return 0, 0, false
-	}
-	if rows == 0 {
-		return 0, 0, false
-	}
-	return nodes, edges, true
-}
-
 func (s *Store) Stats() graph.GraphStats {
 	st := graph.GraphStats{
 		ByKind:     map[string]int{},
 		ByLanguage: map[string]int{},
 	}
-	// Totals come from the persisted per-repo counters when present so a
-	// base (view_gen 0) read stays O(repos); the exact scan is the
-	// fallback for a store that has no counter rows yet.
-	if nodes, edges, ok := s.countsFromIndexState(); ok {
-		st.TotalNodes = nodes
-		st.TotalEdges = edges
-	} else {
-		st.TotalNodes = s.NodeCount()
-		st.TotalEdges = s.EdgeCount()
+	// The transaction-maintained physical row counters include derived writes
+	// and unowned nodes. Repo index-state counts describe an earlier index pass.
+	nodes, edges, ok, err := s.countsFromRowCountersContext(context.Background())
+	if err != nil {
+		panicOnFatal(err)
+		return st
 	}
+	if !ok {
+		nodes, edges = s.NodeCount(), s.EdgeCount()
+	}
+	st.TotalNodes, st.TotalEdges = nodes, edges
 
 	rows, err := s.stmtStatsByKind.Query(s.viewGen)
 	if err != nil {

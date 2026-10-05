@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -43,18 +44,28 @@ func (s *Store) edgeCountContext(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-func (s *Store) countsFromIndexStateContext(ctx context.Context) (nodes, edges int, ok bool, err error) {
-	var rows int
-	if err := s.stmtIndexStateTotals.QueryRowContext(ctx, s.viewGen).Scan(&rows, &nodes, &edges); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return 0, 0, false, ctxErr
-		}
+// countsFromRowCountersContext reads both totals at the exact physical handle
+// generation. Installation/seeding remains background work; unavailable
+// counters use the original exact queries rather than stale index-state sums.
+func (s *Store) countsFromRowCountersContext(ctx context.Context) (nodes, edges int, ok bool, err error) {
+	if !s.rowCountersReady.Load() {
+		return 0, 0, false, nil
+	}
+	err = s.db.QueryRowContext(ctx, `SELECT nodes, edges FROM `+rowCountsTable+` WHERE view_gen = ?`, s.viewGen).Scan(&nodes, &edges)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return 0, 0, false, ctxErr
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, true, nil
+	}
+	if isNoSuchTableErr(err) {
+		s.rowCountersReady.Store(false)
+		return 0, 0, false, nil
+	}
+	if err != nil {
 		return 0, 0, false, err
 	}
-	if err := ctx.Err(); err != nil {
-		return 0, 0, false, err
-	}
-	return nodes, edges, rows != 0, nil
+	return nodes, edges, true, nil
 }
 
 func (s *Store) scanStatsRowsContext(ctx context.Context, stmt *sql.Stmt, put func(string, int)) error {
@@ -100,7 +111,7 @@ func (s *Store) StatsContext(ctx context.Context) (graph.GraphStats, error) {
 		return graph.GraphStats{}, err
 	}
 	st := graph.GraphStats{ByKind: map[string]int{}, ByLanguage: map[string]int{}}
-	nodes, edges, ok, err := s.countsFromIndexStateContext(ctx)
+	nodes, edges, ok, err := s.countsFromRowCountersContext(ctx)
 	if err != nil {
 		return graph.GraphStats{}, err
 	}
