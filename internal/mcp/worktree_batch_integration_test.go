@@ -316,9 +316,10 @@ func TestWorktreeBatchFacadeRejectsForeignAndSymlinkPaths(t *testing.T) {
 			sibling := filepath.Join(filepath.Dir(f.primary), "sibling")
 			checkoutMutationGit(t, f.primary, "worktree", "add", "-b", "sibling", sibling)
 			path := filepath.Join(f.primary, "edit.go")
-			if target == "absolute_sibling" {
+			switch target {
+			case "absolute_sibling":
 				path = filepath.Join(sibling, "edit.go")
-			} else if target == "nested_symlink" {
+			case "nested_symlink":
 				require.NoError(t, os.Mkdir(filepath.Join(f.worktree, "nested"), 0o755))
 				link := filepath.Join(f.worktree, "nested", "outside")
 				if err := os.Symlink(f.primary, link); err != nil {
