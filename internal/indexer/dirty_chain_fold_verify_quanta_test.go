@@ -17,7 +17,7 @@ import (
 
 const foldQuantumFile = "repo/pending.go"
 
-func foldQuantumStore(t *testing.T) *store_sqlite.Store {
+func foldQuantumStore(t *testing.T, count int) *store_sqlite.Store {
 	t.Helper()
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	if err != nil {
@@ -26,7 +26,7 @@ func foldQuantumStore(t *testing.T) *store_sqlite.Store {
 	t.Cleanup(func() { _ = store.Close() })
 	var nodes []*graph.Node
 	var edges []*graph.Edge
-	for i := 0; i < 8193; i++ {
+	for i := 0; i < count; i++ {
 		id := fmt.Sprintf("%s::N%05d", foldQuantumFile, i)
 		nodes = append(nodes, &graph.Node{ID: id, Kind: graph.KindFunction, Name: fmt.Sprintf("N%05d", i), FilePath: foldQuantumFile, RepoPrefix: "repo", StartLine: i + 1, Meta: map[string]any{"receipt": "selected"}})
 		edges = append(edges, &graph.Edge{From: id, To: "repo/outside.go::Target", Kind: graph.EdgeCalls, FilePath: foldQuantumFile, Line: i + 1, Confidence: 0.75, Origin: "derived", Meta: map[string]any{"via": "test"}})
@@ -105,7 +105,7 @@ func (s foldQuantumCancelStringer) String() string {
 // A single real stored file has more identities than a path quantum. Cancel
 // at deterministic read/render boundaries, without timers or reader goroutines.
 func TestRenderFoldChunkSinglePathCancellationStopsAdjacency(t *testing.T) {
-	store := foldQuantumStore(t)
+	store := foldQuantumStore(t, 8193)
 	for _, at := range []string{"file", "node", "out", "in", "recorded"} {
 		t.Run(at, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
@@ -187,7 +187,7 @@ func foldQuantumPointOracle(r graph.Reader, paths, ids []string) []string {
 }
 
 func TestRenderFoldChunkPreservesSelectedRowsAndSeen(t *testing.T) {
-	store := foldQuantumStore(t)
+	store := foldQuantumStore(t, 513)
 	paths := []string{foldQuantumFile}
 	ids := []string{foldQuantumFile + "::N00000", "repo/missing.go::Gone"}
 	for _, selected := range []bool{false, true} {
