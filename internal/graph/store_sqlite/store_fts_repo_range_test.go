@@ -115,12 +115,12 @@ func TestSymbolRepoRangeEmptyLargeDenseAndSparsePlans(t *testing.T) {
 			t.Fatal(err)
 		}
 		got, handled, err := s.searchSymbolRepoSpanPlan(t.Context(), s.buildFTSMatch("needle", true), "repo", 10)
-		if err != nil || handled || got != nil {
+		if err != nil || !handled || len(got) != 2 {
 			t.Fatalf("got=%v handled=%v err=%v", got, handled, err)
 		}
 		want := unboundedSingleGeneration(t, s, 0, "needle", []string{"repo"}, 10)
 		public, err := s.SearchSymbolsRepoScopedContext(t.Context(), "needle", []string{"repo"}, 10)
-		if err != nil || !reflect.DeepEqual(public, want) {
+		if err != nil || !reflect.DeepEqual(public, want) || !reflect.DeepEqual(got, want) {
 			t.Fatalf("fallback err=%v got=%v want=%v", err, public, want)
 		}
 	})

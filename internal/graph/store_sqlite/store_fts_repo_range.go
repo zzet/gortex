@@ -52,17 +52,40 @@ WHERE view_gen = ? AND repo_prefix = ? ORDER BY fts_rowid `+order+` LIMIT 1`, s.
 	if err = tx.QueryRowContext(ctx, `SELECT fts_rowid FROM symbol_fts_rowid ORDER BY fts_rowid DESC LIMIT 1`).Scan(&span.tableMax); err != nil {
 		return nil, true, err
 	}
+	query := symbolFTSSpanQuery(1, true)
+	args := []any{match, span.lo, span.hi, span.generation, repo, limit}
 	if !span.dense() {
-		return nil, false, nil
+		// Only the base single-repository door uses this plan. A complete
+		// small ownership set can filter one MATCH cursor before it reads
+		// foreign content; it must not become repeated rowid point queries.
+		if s.viewGen != baseViewGeneration {
+			return nil, false, nil
+		}
+		ids, complete, readErr := symbolRepoMembershipIDs(ctx, tx, s.viewGen, repo)
+		if readErr != nil {
+			return nil, true, readErr
+		}
+		if !complete {
+			return nil, false, nil
+		}
+		if len(ids) == 0 {
+			return nil, true, ctx.Err()
+		}
+		query = symbolRepoMembershipQuery(len(ids))
+		args = []any{s.viewGen, match}
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		args = append(args, repo, limit)
 	}
 	if afterProbe != nil {
 		if err = afterProbe(tx); err != nil {
 			return nil, true, err
 		}
 	}
-	// The range only bounds the cursor. Generation/repository ownership still
-	// decides membership, and BM25 continues to use the complete shared table.
-	rows, err := tx.QueryContext(ctx, symbolFTSSpanQuery(1, true), match, span.lo, span.hi, span.generation, repo, limit)
+	// Generation/repository ownership still decides membership in both plans,
+	// and BM25 continues to use the complete shared table.
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, true, err
 	}
@@ -81,5 +104,8 @@ WHERE view_gen = ? AND repo_prefix = ? ORDER BY fts_rowid `+order+` LIMIT 1`, s.
 	if err = rows.Err(); err != nil {
 		return nil, true, err
 	}
-	return hits, true, ctx.Err()
+	if err = ctx.Err(); err != nil {
+		return nil, true, err
+	}
+	return hits, true, nil
 }
