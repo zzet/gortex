@@ -113,8 +113,11 @@ func TestCentralityIDPresenceAutoPrimaryAndSelectedFallbacks(t *testing.T) {
 	composed := graph.NewOverlaidView(spy, layer)
 	ids := []string{"repo/deleted.go::Deleted", "repo/replaced.go::Same", "repo/new.go::New", "other/foreign.go::Foreign", "missing"}
 	before := spy.presenceReads
-	for _, raw := range []graph.Reader{composed, newBaseGraphReader(composed, "repo")} {
-		core := newContractCoreEdges(raw, ctx, nil)
+	for _, scope := range []struct {
+		reader  graph.Reader
+		foreign bool
+	}{{composed, true}, {newBaseGraphReader(composed, "repo"), false}} {
+		core := newContractCoreEdges(scope.reader, ctx, nil)
 		require.Nil(t, centralityCheckedIDPresence(core), "never bypass selected masks or repo ownership with underlying Store presence")
 		checked, ok := centralityCheckedPresence(core)
 		require.True(t, ok)
@@ -125,10 +128,10 @@ func TestCentralityIDPresenceAutoPrimaryAndSelectedFallbacks(t *testing.T) {
 		require.Contains(t, rows, ids[1], "same-ID empty-kind replacement remains present")
 		require.Contains(t, rows, ids[2])
 		require.NotContains(t, rows, "missing")
-		if _, scoped := raw.(*baseGraphReader); scoped {
-			require.NotContains(t, rows, ids[3])
-		} else {
+		if scope.foreign {
 			require.Contains(t, rows, ids[3])
+		} else {
+			require.NotContains(t, rows, ids[3])
 		}
 	}
 	require.Equal(t, before, spy.presenceReads, "fallbacks must not invoke the underlying physical ID getter")
