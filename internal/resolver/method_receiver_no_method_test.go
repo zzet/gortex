@@ -130,14 +130,14 @@ func TestRebindGoMethodReceiversForFileUsesSelectedFullDeltaFacts(t *testing.T) 
 			layer.AddNode(file, free)
 			if test.hasMethod {
 				layer.AddNode(file, &graph.Node{ID: methodID, Kind: graph.KindMethod, FilePath: file, RepoPrefix: "repo", Language: "go", Meta: map[string]any{"signature": "func (*T) Method()"}})
-				layer.AddEdge(file, &graph.Edge{From: methodID, To: file + "::T", Kind: graph.EdgeMemberOf, FilePath: file})
+				layer.AddEdge(&graph.Edge{From: methodID, To: file + "::T", Kind: graph.EdgeMemberOf, FilePath: file})
 				for _, n := range []*graph.Node{
 					{ID: file + "::Unknown", Kind: "future-kind", Language: "go"},
 					{ID: file + "::ForeignLanguage", Kind: graph.KindMethod, Language: "typescript"},
 				} {
 					n.FilePath, n.RepoPrefix = file, "repo"
 					layer.AddNode(file, n)
-					layer.AddEdge(file, &graph.Edge{From: n.ID, To: file + "::T", Kind: graph.EdgeMemberOf, FilePath: file})
+					layer.AddEdge(&graph.Edge{From: n.ID, To: file + "::T", Kind: graph.EdgeMemberOf, FilePath: file})
 				}
 			}
 			below := graph.NewOverlaidView(g, layer)
