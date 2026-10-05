@@ -26,6 +26,11 @@ func (s *Server) isBatchContinuation(legacy string, req *mcp.CallToolRequest) bo
 			args = normalizeFacadeArguments(spec, args)
 		}
 	}
+	// A preview still needs the selected graph and path authority, even when
+	// its caller happens to reuse an existing transaction identifier.
+	if dryRun, _ := args["dry_run"].(bool); dryRun {
+		return false
+	}
 	id, _ := args["transaction_id"].(string)
 	if id == "" {
 		return false
@@ -74,6 +79,9 @@ func (s *Server) acquireBatchRecovery(ctx context.Context, receipt batchTransact
 	if s.lifecycle == nil {
 		return ctx, func() {}, fmt.Errorf("checkout batch recovery requires its checkout coordinator")
 	}
+	if batchRecoveryBeforeAdmission != nil {
+		batchRecoveryBeforeAdmission(ctx)
+	}
 	mutation, err := s.lifecycle.BeginCheckoutRecovery(context.WithoutCancel(ctx), receipt.CheckoutID, receipt.Incarnation, receipt.CheckoutRoot, receipt.RootIdentity, receipt.CheckoutGeneration, receipt.HeadRef, receipt.HeadCommit, receipt.HeadTree)
 	if err != nil {
 		return ctx, func() {}, err
@@ -119,10 +127,12 @@ type checkoutBatchScheduler interface {
 	EnqueueBatchRefresh(context.Context, []indexer.CheckoutBatchFile) (*indexer.CheckoutRefreshTicket, error)
 }
 
-func (s *Server) refreshCheckoutBatchGraph(ctx context.Context, state *batchTransactionState, receipt batchTransactionReceipt) {
+func (s *Server) refreshCheckoutBatchGraph(ctx context.Context, state *batchTransactionState, receipt batchTransactionReceipt, admissionErr error) {
 	outcome := mutationReindexOutcome{checkoutScoped: true}
 	var err error
-	if err = s.validateBatchCheckout(ctx, receipt); err != nil {
+	if admissionErr != nil {
+		outcome.Err = admissionErr
+	} else if err = s.validateBatchCheckout(ctx, receipt); err != nil {
 		outcome.Err = err
 	} else {
 		// All paths share one completion signal. Reuse a live receipt without
@@ -137,10 +147,7 @@ func (s *Server) refreshCheckoutBatchGraph(ctx context.Context, state *batchTran
 			}
 		}
 		if outcome.Receipt == "" {
-			var release func()
-			ctx, release, err = s.acquireBatchRecovery(ctx, receipt)
-			if err == nil {
-				defer release()
+			if checkoutMutationFromContext(ctx) != nil {
 				err = verifyBatchAfterImages(ctx, receipt)
 				if err == nil {
 					err = prepareBatchRecovery(ctx)
@@ -166,6 +173,9 @@ func (s *Server) refreshCheckoutBatchGraph(ctx context.Context, state *batchTran
 						}
 					}
 				}
+			}
+			if checkoutMutationFromContext(ctx) == nil && err == nil {
+				err = fmt.Errorf("checkout publication has no admitted recovery authority")
 			}
 			if err != nil {
 				outcome.Err = err
@@ -225,3 +235,6 @@ func prepareBatchRecovery(ctx context.Context) error {
 	}
 	return nil
 }
+
+// batchRecoveryBeforeAdmission is a test seam for the cycle/transaction lock order.
+var batchRecoveryBeforeAdmission func(context.Context)

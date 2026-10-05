@@ -82,6 +82,13 @@ func readBatchManifest(transactionID string) (batchTransactionReceipt, bool, err
 
 func existingBatchTransactionAction(state *batchTransactionState) string {
 	receipt := state.snapshot()
+	if receipt.Status == "prepared" {
+		select {
+		case <-state.done:
+			return "recover"
+		default:
+		}
+	}
 	if receipt.Status == "committed" && receipt.GraphStatus != "fresh" {
 		return "refresh_graph"
 	}

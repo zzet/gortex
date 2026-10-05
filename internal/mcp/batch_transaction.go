@@ -1225,8 +1225,11 @@ func (s *Server) batchTransactionStatus(ctx context.Context, transactionID strin
 		if err := s.validateBatchCheckout(ctx, state.snapshot()); err != nil {
 			return batchTransactionReceipt{}, err
 		}
-		if existingBatchTransactionAction(state) == "refresh_graph" {
+		switch existingBatchTransactionAction(state) {
+		case "refresh_graph":
 			s.refreshBatchGraph(ctx, state)
+		case "recover":
+			s.recoverBatchTransaction(ctx, state)
 		}
 		return state.snapshot(), nil
 	}
@@ -1298,6 +1301,22 @@ func (s *Server) waitBatchGraphReceipts(files []batchTransactionFile) {
 }
 
 func (s *Server) refreshBatchGraph(ctx context.Context, state *batchTransactionState) {
+	// Acquire checkout authority before graphMu, matching the initial commit
+	// and prepared recovery. Waiting for a lease while holding graphMu would
+	// deadlock a committer that owns that lease and is admitting its ticket.
+	var admissionErr error
+	initial := state.snapshot()
+	if initial.CheckoutID != "" && initial.Status == "committed" && initial.GraphStatus != "fresh" {
+		live := false
+		if len(initial.Files) > 0 && initial.Files[0].ReindexReceipt != "" {
+			_, live = s.mutationReceiptState(initial.Files[0].ReindexReceipt)
+		}
+		if !live {
+			var release func()
+			ctx, release, admissionErr = s.acquireBatchRecovery(ctx, initial)
+			defer release()
+		}
+	}
 	state.graphMu.Lock()
 	defer state.graphMu.Unlock()
 
@@ -1312,7 +1331,7 @@ func (s *Server) refreshBatchGraph(ctx context.Context, state *batchTransactionS
 	}
 
 	if receipt.CheckoutID != "" {
-		s.refreshCheckoutBatchGraph(ctx, state, receipt)
+		s.refreshCheckoutBatchGraph(ctx, state, receipt, admissionErr)
 		return
 	}
 	outcomes := make(map[string]mutationReindexOutcome, len(receipt.Files))

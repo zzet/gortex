@@ -3,12 +3,12 @@ package indexer
 import (
 	"context"
 	"fmt"
-	"github.com/zzet/gortex/internal/pathkey"
 	"os"
 	"time"
 
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // CheckoutBatchFile binds every written or removed entry to one publication.
@@ -103,11 +103,23 @@ func (l *CheckoutLifecycle) BeginCheckoutRecovery(ctx context.Context, id, incar
 	if !c.admitSourceMutation() {
 		return nil, ErrCheckoutRefreshStopped
 	}
+	admitted := true
+	defer func() {
+		if admitted {
+			c.releaseSourceMutation()
+		}
+	}()
 	if err := acquireCycleLock(ctx, c); err != nil {
-		c.releaseSourceMutation()
 		return nil, err
 	}
+	cycleOwned := true
+	defer func() {
+		if cycleOwned {
+			c.cycleMu.Unlock()
+		}
+	}()
 	m := &CheckoutMutation{coordinator: c, checkout: checkout, rootInfo: rootInfo}
+	admitted, cycleOwned = false, false // m.Close owns both resources from here.
 	owned := true
 	defer func() {
 		if owned {
@@ -184,6 +196,9 @@ func (m *CheckoutMutation) PrepareRecovery(ctx context.Context) error {
 	}
 	if sample.HeadRef != m.headRef || sample.HeadCommit != m.headCommit || sample.HeadTree != m.headTree {
 		return ErrCheckoutMutationStale
+	}
+	if err := m.receiptStillCurrent(); err != nil {
+		return err
 	}
 	c := m.coordinator
 	if err := c.reserveCheckoutRefresh(); err != nil {
