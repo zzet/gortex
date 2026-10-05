@@ -16,7 +16,8 @@ func maskQuantumBudget(t *testing.T) {
 	t.Helper()
 	first, minimum, maximum, target := chainFoldFirstRows, chainFoldMinRows, chainFoldMaxRows, chainFoldStepTarget
 	chainFoldFirstRows, chainFoldMinRows, chainFoldMaxRows = 64, 64, 64
-	// A phase boundary is observed without a wall-clock scheduling assumption.
+	// A tiny target encourages separate phases. A phase transition may still
+	// enter the first mask operation before the clock advances.
 	chainFoldStepTarget = time.Nanosecond
 	t.Cleanup(func() {
 		chainFoldFirstRows, chainFoldMinRows, chainFoldMaxRows, chainFoldStepTarget = first, minimum, maximum, target
@@ -53,14 +54,33 @@ func TestChainFoldMaskStepsBoundEmptyOperationsAndContextIDs(t *testing.T) {
 	fold, err := store.BeginChainFold(ctx, ChainFoldRequest{Chain: []int64{member}, To: to, Owner: "test"})
 	require.NoError(t, err)
 	defer func() { _ = fold.Release(ctx) }()
+	var operations []string
+	previousHook := chainFoldMaskStepHook
+	chainFoldMaskStepHook = func(_ context.Context, table string) error {
+		operations = append(operations, table)
+		return nil
+	}
+	t.Cleanup(func() { chainFoldMaskStepHook = previousHook })
 	reachFoldMasks(t, fold, ctx)
-	for operation := 0; operation < 9; operation++ {
+	// The final FTS step may also commit the first mask operation. It must
+	// stop there, and every remaining empty operation gets its own step.
+	require.LessOrEqual(t, fold.table, 1)
+	require.Len(t, operations, fold.table)
+	require.Empty(t, fold.hiddenIDs)
+	for operation := fold.table; operation < 9; operation++ {
+		before := len(operations)
 		_, err = fold.Step(ctx)
 		require.NoError(t, err)
 		require.Equal(t, foldPhaseMasks, fold.phase, "one Step must not consume every empty operation and the full ID census")
 		require.Equal(t, operation+1, fold.table)
+		require.Len(t, operations, before+1, "one Step commits exactly one mask operation")
 		require.Empty(t, fold.hiddenIDs)
 	}
+	var expectedOperations []string
+	for _, operation := range foldMaskOperations {
+		expectedOperations = append(expectedOperations, operation.table)
+	}
+	require.Equal(t, expectedOperations, operations, "all nine operations, including any committed on phase entry, retain their order")
 	for page := 0; page < 2; page++ {
 		_, err = fold.Step(ctx)
 		require.NoError(t, err)
