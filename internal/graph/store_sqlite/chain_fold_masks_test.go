@@ -198,9 +198,10 @@ func TestChainFoldMaskWriterInterruptionRetainsCommittedPagesAndPrecedence(t *te
 		writerDone <- writerErr
 	}()
 	_, err = fold.Step(ctx)
-	require.ErrorIs(t, err, ErrChainFoldYielded)
-	require.NoError(t, <-writerDone)
+	writerErr := <-writerDone // Join ownership before any fatal assertion.
 	chainFoldMaskStepHook = nil
+	require.ErrorIs(t, err, ErrChainFoldYielded)
+	require.NoError(t, writerErr)
 	limit := 20 * time.Millisecond
 	if raceDetectorOn {
 		limit = 100 * time.Millisecond
