@@ -200,14 +200,15 @@ func TestImportRoutePrewarmAdmitsForegroundAndRetainsGuards(t *testing.T) {
 			if got := f.route(); got != before {
 				t.Fatalf("private prewarm changed route: %+v", got)
 			}
-			if mode == "stale_route" {
+			switch mode {
+			case "stale_route":
 				err := f.catalog.FlipCheckoutRouteSlot(t.Context(), store_sqlite.FlipCheckoutRouteSlotRequest{CheckoutID: f.checkoutID,
 					Slot: store_sqlite.RouteSlotDirty, GenerationID: before.DirtyGenerationID,
 					ExpectedRouteEpoch: before.RouteEpoch, State: store_sqlite.RouteActive})
 				if err != nil {
 					t.Fatal(err)
 				}
-			} else if mode == "cancelled" {
+			case "cancelled":
 				cancel()
 			}
 			unblock.Do(func() { close(resume) })
