@@ -411,8 +411,16 @@ func TestChainFoldFailedStepPutsTheCursorBack(t *testing.T) {
 	fold, err := store.BeginChainFold(ctx, ChainFoldRequest{Chain: chain, To: to, Owner: "test"})
 	require.NoError(t, err)
 	for step := 0; step < 100000; step++ {
+		before := fold.cursor()
 		done, err := fold.Step(ctx)
-		if errors.Is(err, injected) {
+		if errors.Is(err, injected) || errors.Is(err, ErrChainFoldYielded) {
+			require.Equal(t, before, fold.cursor(), "both injected failure and real writer interruption roll back progress")
+			if errors.Is(err, ErrChainFoldYielded) {
+				// Store maintenance is an actual writer too. Retry its legal admission
+				// interruption just as runFold does; the twenty injected failures and
+				// final reference parity remain mandatory.
+				time.Sleep(time.Millisecond)
+			}
 			continue
 		}
 		require.NoError(t, err)
