@@ -123,6 +123,7 @@ type ChainFold struct {
 	hiddenPaths, hiddenIDs, hiddenSources map[string]struct{}
 	speakers                              []flattenSpeaker
 	masks                                 generationMaskSet
+	memberIDs                             map[string]struct{}
 	exclude                               *flattenExclusion
 
 	usPerRow   float64
@@ -465,13 +466,13 @@ func (f *ChainFold) Step(ctx context.Context) (done bool, err error) {
 	budget := f.stepRows()
 	started := time.Now()
 	var moved int64
-	var deferred func() // a member's end: applied only after the commit
+	var deferred func() // mask progress and member exclusion: committed only
 	snapshot := f.cursor()
 	err = s.withFoldTx(ctx, f.to, func(ctx context.Context, tx *sql.Tx) error {
 		// Phases run back to back in the one transaction until the row
 		// budget or the target hold is spent: an empty table costs a
-		// statement, not a step. A member's end (its masks, and the
-		// exclusion of everything below it) closes the step.
+		// statement, not a step. Each mask operation/page closes the step,
+		// even when empty; earlier committed mask work is not replayed.
 		for phases := 0; ; phases++ {
 			if inject := chainFoldInjectFailure; inject != nil {
 				if err := inject(phases); err != nil {
@@ -634,38 +635,68 @@ DELETE FROM generation_node_tombstones
 			}
 		}, nil
 	case foldPhaseMasks:
-		if err := flattenMasksTx(ctx, tx, member, f.to, f.masks); err != nil {
-			return 0, nil, err
+		if f.table < len(foldMaskOperations) {
+			op := foldMaskOperations[f.table]
+			last, finished, err := foldMaskPageTx(ctx, tx, op, member, f.to, f.after, budget)
+			if err != nil {
+				return 0, nil, err
+			}
+			if hook := chainFoldMaskStepHook; hook != nil {
+				if err := hook(ctx, op.table); err != nil {
+					return 0, nil, err
+				}
+			}
+			return 0, func() {
+				f.after = last
+				if finished {
+					f.table++
+					f.after = nil
+				}
+			}, nil
 		}
-		memberIDs, err := generationNodeIDsTx(ctx, tx, member, f.masks.context)
+		ids, last, finished, err := foldMemberIDsPageTx(ctx, tx, member, f.after, f.masks.context, budget)
 		if err != nil {
 			return 0, nil, err
 		}
-		masks := f.masks
+		if hook := chainFoldMaskStepHook; hook != nil {
+			if err := hook(ctx, "member_ids"); err != nil {
+				return 0, nil, err
+			}
+		}
 		return 0, func() {
-			for p := range masks.covered {
+			if f.memberIDs == nil {
+				f.memberIDs = map[string]struct{}{}
+			}
+			for id := range ids {
+				f.memberIDs[id] = struct{}{}
+			}
+			f.after = last
+			if !finished {
+				return
+			}
+			for p := range f.masks.covered {
 				f.hiddenPaths[p] = struct{}{}
 			}
-			for id := range masks.identity {
+			for id := range f.masks.identity {
 				f.hiddenIDs[id] = struct{}{}
 			}
-			for id := range memberIDs {
+			for id := range f.memberIDs {
 				f.hiddenIDs[id] = struct{}{}
 			}
-			f.speakers = append(f.speakers, flattenSpeaker{covered: masks.covered, identity: masks.identity, carried: memberIDs})
-			for id := range masks.sources {
-				if !idInPaths(id, masks.covered) {
+			f.speakers = append(f.speakers, flattenSpeaker{covered: f.masks.covered, identity: f.masks.identity, carried: f.memberIDs})
+			for id := range f.masks.sources {
+				if !idInPaths(id, f.masks.covered) {
 					f.hiddenSources[id] = struct{}{}
 				}
 			}
-			for id, kind := range masks.identity {
-				if kind == string(NodeIdentityMaskLegacy) && !idInPaths(id, masks.covered) {
+			for id, kind := range f.masks.identity {
+				if kind == string(NodeIdentityMaskLegacy) && !idInPaths(id, f.masks.covered) {
 					f.hiddenSources[id] = struct{}{}
 				}
 			}
-			f.exclude = nil
+			f.exclude, f.memberIDs = nil, nil
 			f.member--
-			f.phase = foldPhasePrepare
+			f.phase, f.table, f.after = foldPhasePrepare, 0, nil
 			if f.member < 0 {
 				f.phase = foldPhaseSettle
 			}

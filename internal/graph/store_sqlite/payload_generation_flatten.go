@@ -682,54 +682,11 @@ SELECT `+strings.Join(projection, ", ")+` FROM `+table+` WHERE `+viewGenColumnNa
 // flattenMasksTx carries one member's masks into the flattened generation,
 // the member above (already carried) winning every key both hold. Context
 // marks are not carried: they claim nothing.
-func flattenMasksTx(ctx context.Context, tx *sql.Tx, member, to int64, masks generationMaskSet) error {
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_input_state(view_gen,repo_prefix,checkout_id,input_version,input_fingerprint,accepted,previous_input_version,previous_input_fingerprint) SELECT ?,repo_prefix,checkout_id,input_version,input_fingerprint,accepted,previous_input_version,previous_input_fingerprint FROM generation_contract_input_state WHERE view_gen=?`, to, member); err != nil {
-		return err
-	}
-	if err := flattenContractBoundaryReceiptsTx(ctx, tx, member, to); err != nil {
-		return err
-	}
-	// Upper acknowledgments win over the matching lower pending token.
-	// Different tokens are retained even for deleted or replaced file paths.
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_work
- (view_gen, token, origin_generation, checkout_id, repo_prefix, file_path, input_version, input_fingerprint, state, scope)
- SELECT ?, token, origin_generation, checkout_id, repo_prefix, file_path, input_version, input_fingerprint, state, scope
- FROM generation_contract_work d WHERE view_gen = ? AND NOT `+contractWorkAcknowledgedSQL, to, member); err != nil {
-		return fmt.Errorf("store_sqlite: flatten contract work of generation %d: %w", member, err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT OR IGNORE INTO generation_file_masks (view_gen, repo_prefix, file_path, ownership_mode)
-SELECT ?, repo_prefix, file_path, ownership_mode FROM generation_file_masks
- WHERE view_gen = ? AND ownership_mode <> ?`, to, member, string(OwnershipContext)); err != nil {
-		return fmt.Errorf("store_sqlite: flatten file masks of generation %d: %w", member, err)
-	}
-	// An identity mask of a lower member for an identity a member above
-	// already claimed (by its own row or mask) is superseded by that claim;
-	// INSERT OR IGNORE keeps the upper one. A lower mask for an identity whose
-	// file a member above claims is dropped: the claim hides that file whole.
-	if _, err := tx.ExecContext(ctx, `
-INSERT OR IGNORE INTO generation_node_tombstones (view_gen, node_id, claim_kind)
-SELECT ?, node_id, claim_kind FROM generation_node_tombstones
- WHERE view_gen = ?`, to, member); err != nil {
-		return fmt.Errorf("store_sqlite: flatten identity masks of generation %d: %w", member, err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT OR IGNORE INTO generation_edge_sources (view_gen, source_id, ownership_mode)
-SELECT ?, source_id, ownership_mode FROM generation_edge_sources
- WHERE view_gen = ?`, to, member); err != nil {
-		return fmt.Errorf("store_sqlite: flatten edge-source marks of generation %d: %w", member, err)
-	}
-	// Producer completeness: a producer incomplete anywhere in the chain is
-	// incomplete in its fold, since rows it contributed are in the fold.
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO generation_producer_completeness (view_gen, producer, state, reason)
-SELECT ?, producer, state, reason FROM generation_producer_completeness WHERE view_gen = ?
-ON CONFLICT(view_gen, producer) DO UPDATE SET
-  state  = CASE WHEN excluded.state <> 'complete' AND generation_producer_completeness.state = 'complete'
-                THEN excluded.state ELSE generation_producer_completeness.state END,
-  reason = CASE WHEN excluded.state <> 'complete' AND generation_producer_completeness.state = 'complete'
-                THEN excluded.reason ELSE generation_producer_completeness.reason END`, to, member); err != nil {
-		return fmt.Errorf("store_sqlite: flatten producer states of generation %d: %w", member, err)
+func flattenMasksTx(ctx context.Context, tx *sql.Tx, member, to int64, _ generationMaskSet) error {
+	for _, op := range foldMaskOperations {
+		if _, err := tx.ExecContext(ctx, op.query, op.args(member, to)...); err != nil {
+			return fmt.Errorf("store_sqlite: flatten %s of generation %d: %w", op.table, member, err)
+		}
 	}
 	return nil
 }
