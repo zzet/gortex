@@ -25,7 +25,7 @@ import (
 //   - A step is one write transaction. What it commits is the progress: the
 //     cursor (member, phase, last key) lives in the ChainFold and moves only
 //     after the commit.
-//   - A step gives way to an edit: when a write is announced or a writer is
+//   - A step gives way to an edit: when an ordinary write is announced or a writer is
 //     parked on the gate, the step in flight is interrupted and rolled back
 //     (ErrChainFoldYielded, cursor unchanged) and the caller steps again later.
 //   - A step does not start while the log is over its mark
@@ -318,8 +318,14 @@ func chainFoldKeys(ctx context.Context, tx *sql.Tx, table string) ([]string, err
 	return keys, nil
 }
 
+// foldWriteWanted keeps actual writer admission and ordinary mutation priority.
+// A checkout ticket alone must not prevent its own fold from making progress.
+func (s *Store) foldWriteWanted() bool {
+	return s.writeMu.waiting() > 0 || s.foldWriteIntents.Load() > 0
+}
+
 // withFoldTx runs fn in one write transaction of the destination handle,
-// under the write gate. A write announced or parked on the gate meanwhile
+// under the write gate. An ordinary write announced or parked on the gate meanwhile
 // interrupts the transaction (ErrChainFoldYielded) and rolls it back.
 func (s *Store) withFoldTx(ctx context.Context, to int64, fn func(ctx context.Context, tx *sql.Tx) error) error {
 	destination, err := s.AtManagedGeneration(to)
@@ -329,10 +335,16 @@ func (s *Store) withFoldTx(ctx context.Context, to int64, fn func(ctx context.Co
 	if err := destination.refuseSealedPayloadWrite(); err != nil {
 		return err
 	}
+	if s.foldWriteWanted() {
+		return ErrChainFoldYielded
+	}
 	if err := s.writeMu.LockContext(ctx); err != nil {
 		return err
 	}
 	defer s.writeMu.Unlock()
+	if s.foldWriteWanted() {
+		return ErrChainFoldYielded
+	}
 	if err := destination.refuseSealedPayloadWrite(); err != nil {
 		return err
 	}
@@ -349,7 +361,7 @@ func (s *Store) withFoldTx(ctx context.Context, to int64, fn func(ctx context.Co
 			case <-stepCtx.Done():
 				return
 			case <-ticker.C:
-				if s.writeWanted() {
+				if s.foldWriteWanted() {
 					cancel(ErrChainFoldYielded)
 					return
 				}
@@ -440,7 +452,7 @@ func (f *ChainFold) Step(ctx context.Context) (done bool, err error) {
 		s.RequestWALReclaim()
 		return false, ErrChainFoldWALMark
 	}
-	if s.writeWanted() {
+	if s.foldWriteWanted() {
 		f.yields++
 		return false, ErrChainFoldYielded
 	}

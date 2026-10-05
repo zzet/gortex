@@ -1219,8 +1219,24 @@ func (s *Store) writeWanted() bool {
 // mutation queued behind them upstream of the write gate is not held by them
 // either. The release is idempotent.
 func (s *Store) AnnounceWrite() (release func()) {
+	return s.announceWrite(true)
+}
+
+// AnnounceCheckoutRefresh retains global mutation demand while a checkout
+// ticket waits and builds. Unlike AnnounceWrite it permits chain folds during
+// CPU work and upstream waits, including the ticket's own inline fold. Actual
+// writes still park on writeMu and interrupt an in-flight fold. Only checkout
+// refresh ticket admission uses this long-lived demand.
+func (s *Store) AnnounceCheckoutRefresh() (release func()) {
+	return s.announceWrite(false)
+}
+
+func (s *Store) announceWrite(blocksFold bool) (release func()) {
 	if s.coreless() {
 		return func() {}
+	}
+	if blocksFold {
+		s.foldWriteIntents.Add(1)
 	}
 	s.walCopy.sawBusy(time.Now())
 	if s.writeIntents.Add(1) == 1 {
@@ -1232,6 +1248,9 @@ func (s *Store) AnnounceWrite() (release func()) {
 		once.Do(func() {
 			if s.writeIntents.Add(-1) == 0 {
 				s.intentsSince.Store(0)
+			}
+			if blocksFold {
+				s.foldWriteIntents.Add(-1)
 			}
 		})
 	}

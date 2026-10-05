@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -300,28 +301,38 @@ func minTime(a, b time.Time) time.Time {
 // a build) still stands background work down from its announcement to its
 // release; a leaked announcement stops doing so after the bound.
 func TestAnnouncedMutationStandsBackgroundWorkDown(t *testing.T) {
-	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
-	s, path := openWALReclaimStore(t)
-	defer func() { _ = s.Close() }()
-	seedWALChurnTable(t, s)
-	growWAL(t, s, 8)
-	lane := &fakeBuildLane{} // installed, never held
-	lane.install(s)
-	ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ckpt.Close()
-	cfg := walReclaimConfig{thresholdBytes: 1 << 20, drainDeadline: defaultWALReclaimDrainDeadline, truncateBudget: walReclaimTruncateBudget, readerWait: defaultWALReclaimReaderWait}
+	for _, checkout := range []bool{false, true} {
+		t.Run(fmt.Sprintf("checkout=%t", checkout), func(t *testing.T) {
+			t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
+			s, path := openWALReclaimStore(t)
+			defer func() { _ = s.Close() }()
+			seedWALChurnTable(t, s)
+			growWAL(t, s, 8)
+			lane := &fakeBuildLane{} // installed, never held
+			lane.install(s)
+			ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ckpt.Close()
+			cfg := walReclaimConfig{thresholdBytes: 1 << 20, drainDeadline: defaultWALReclaimDrainDeadline, truncateBudget: walReclaimTruncateBudget, readerWait: defaultWALReclaimReaderWait}
 
-	release := s.AnnounceWrite()
-	res := s.reclaimWALOnce(cfg, ckpt, path+"-wal")
-	if res.outcome != walReclaimSkipped || res.reason != "build_lane_busy" {
-		t.Fatalf("reclaim during an announced undo: outcome=%s reason=%q, want skipped build_lane_busy", res.outcome, res.reason)
-	}
-	release()
-	if res := s.reclaimWALOnce(cfg, ckpt, path+"-wal"); res.outcome != walReclaimReset {
-		t.Fatalf("reclaim after the release: outcome=%s reason=%q, want reset", res.outcome, res.reason)
+			announce := s.AnnounceWrite
+			if checkout {
+				announce = s.AnnounceCheckoutRefresh
+			}
+			release := announce()
+			defer release()
+			res := s.reclaimWALOnce(cfg, ckpt, path+"-wal")
+			if res.outcome != walReclaimSkipped || res.reason != "build_lane_busy" {
+				t.Fatalf("reclaim during an announced undo: outcome=%s reason=%q, want skipped build_lane_busy", res.outcome, res.reason)
+			}
+			release()
+			if res := s.reclaimWALOnce(cfg, ckpt, path+"-wal"); res.outcome != walReclaimReset {
+				t.Fatalf("reclaim after the release: outcome=%s reason=%q, want reset", res.outcome, res.reason)
+			}
+
+		})
 	}
 }
 

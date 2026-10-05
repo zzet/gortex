@@ -881,7 +881,8 @@ func nextSweepBatch(limit int, removed int64, elapsed time.Duration) int {
 }
 
 // WriteWanted reports whether a write wants the store's writer: a caller
-// parked on the write gate or an announced mutation (AnnounceWrite).
+// parked on the write gate or an announced mutation (AnnounceWrite or
+// AnnounceCheckoutRefresh).
 func (s *Store) WriteWanted() bool {
 	return !s.coreless() && s.writeWanted()
 }

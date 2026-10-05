@@ -156,8 +156,13 @@ type storeCore struct {
 	// walReclaimWake wakes the reclaim loop at a request (RequestWALReclaim)
 	// instead of at its next poll; nil while no loop runs.
 	walReclaimWake atomic.Pointer[chan struct{}]
-	// writeIntents counts mutations announced through AnnounceWrite.
+	// writeIntents counts all announced mutations, including checkout refresh
+	// tickets. WAL cooperation and retirement use this full demand.
 	writeIntents atomic.Int32
+	// foldWriteIntents counts ordinary AnnounceWrite demand. Checkout tickets
+	// may perform CPU work or fold their own chain before needing the writer;
+	// their actual gate waiters, rather than the whole ticket, preempt folds.
+	foldWriteIntents atomic.Int32
 	// intentsSince is when writeIntents last rose from zero (unix nanos, 0
 	// while none); intentLeakLogged marks the episode's leak line.
 	intentsSince     atomic.Int64
