@@ -17,7 +17,7 @@ type importBuildLaneKey struct{}
 type importFoldPublicationKey struct{}
 type importFoldPublication struct {
 	beforePublish func(context.Context) error
-	afterPublish  func()
+	afterPublish  func(int64)
 }
 
 // A stale detached import starts a new admission cycle rather than retrying

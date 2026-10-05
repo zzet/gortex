@@ -57,7 +57,10 @@ func TestImportFoldPublishedReadbackDoesNotHoldLane(t *testing.T) {
 		}()
 		admission := &importFoldPublication{
 			beforePublish: func(ctx context.Context) error { _, err := lane.reenter(ctx, false); return err },
-			afterPublish: func() {
+			afterPublish: func(published int64) {
+				if published != id {
+					t.Errorf("published generation=%d, want %d", published, id)
+				}
 				lane.leave()
 				close(entered)
 				select {
@@ -155,6 +158,9 @@ func TestImportRoutePrewarmAdmitsForegroundAndRetainsGuards(t *testing.T) {
 			}
 			ctx = context.WithValue(ctx, importBuildLaneKey{}, lane)
 			c.prewarm = func(ctx context.Context, ids []int64) {
+				if !c.leases.InUse(id) {
+					t.Error("unrouted prewarm candidate is not pinned")
+				}
 				if len(ids) != 2 || ids[0] != route.CommitGenerationID || ids[1] != id {
 					t.Errorf("prewarm scope: %v", ids)
 				}
@@ -207,6 +213,9 @@ func TestImportRoutePrewarmAdmitsForegroundAndRetainsGuards(t *testing.T) {
 			unblock.Do(func() { close(resume) })
 			select {
 			case err := <-done:
+				if c.leases.InUse(id) {
+					t.Error("prewarm flip leaked its candidate pin")
+				}
 				switch mode {
 				case "success":
 					if err != nil || f.route().DirtyGenerationID != id || !gate.Stats().Active {

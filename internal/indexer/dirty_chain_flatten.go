@@ -229,7 +229,7 @@ func publishCopiedGeneration(ctx context.Context, generationID int64, admission 
 		return err
 	}
 	if admission != nil && admission.afterPublish != nil {
-		admission.afterPublish()
+		admission.afterPublish(generationID)
 	}
 	return nil
 }

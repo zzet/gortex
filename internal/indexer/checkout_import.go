@@ -46,6 +46,12 @@ func (c *CheckoutCoordinator) foldImportChain(
 	}
 	lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane)
 	var releasePreparation, closeBase func()
+	var releasePublished func()
+	defer func() {
+		if releasePublished != nil {
+			releasePublished()
+		}
+	}()
 	if lane != nil && lane.gate != nil && c.builder != nil && commitGeneration > 0 {
 		// Catalog traversal and ancestry materialization can outlast a
 		// foreground request too. Release the physical lane before this
@@ -103,7 +109,12 @@ func (c *CheckoutCoordinator) foldImportChain(
 				// The sealed payload is immutable; its catalog readback and
 				// copy-owner cleanup do not need the physical build lane. The
 				// ancestry/preparation pins remain held until the guarded flip.
-				afterPublish: lane.leave,
+				afterPublish: func(generationID int64) {
+					if c.leases != nil {
+						releasePublished = c.leases.Acquire(generationID).Release
+					}
+					lane.leave()
+				},
 			})
 			copier = c.copyChainInSteps
 		} else {

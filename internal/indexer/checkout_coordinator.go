@@ -3595,6 +3595,10 @@ func (c *CheckoutCoordinator) flip(
 	// interactive request. An import retains its checkout/preparation ownership
 	// but gives back the physical lane until the guarded route mutation below.
 	if lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane); lane != nil {
+		if c.leases != nil {
+			pin := c.leases.Acquire(generationID)
+			defer pin.Release()
+		}
 		lane.leave()
 	}
 	c.prewarmRoute(ctx, route, slot, generationID)
