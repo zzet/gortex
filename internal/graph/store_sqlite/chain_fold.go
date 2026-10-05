@@ -335,6 +335,9 @@ func (s *Store) withFoldTx(ctx context.Context, to int64, fn func(ctx context.Co
 	if err := destination.refuseSealedPayloadWrite(); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.foldWriteWanted() {
 		return ErrChainFoldYielded
 	}
@@ -342,6 +345,9 @@ func (s *Store) withFoldTx(ctx context.Context, to int64, fn func(ctx context.Co
 		return err
 	}
 	defer s.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.foldWriteWanted() {
 		return ErrChainFoldYielded
 	}

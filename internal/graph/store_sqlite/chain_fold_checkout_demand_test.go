@@ -1,6 +1,8 @@
 package store_sqlite
 
 import (
+	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -65,4 +67,23 @@ func TestCheckoutDemandPermitsFoldWithoutReleasingGlobalDemand(t *testing.T) {
 	require.False(t, store.WriteWanted())
 	require.False(t, store.editIntentActive())
 	require.False(t, store.foldWriteWanted())
+}
+
+// A queued mutation does not turn already-canceled fold admission into a
+// retryable yield. Neither admission nor the payload callback may proceed.
+func TestFoldDemandDoesNotMaskCanceledAdmission(t *testing.T) {
+	store := openCatalogStore(t)
+	to := reservedGeneration(t, store, "canceled-fold-demand")
+	release := store.AnnounceWrite()
+	defer release()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	called := false
+	err := store.withFoldTx(ctx, to, func(context.Context, *sql.Tx) error {
+		called = true
+		return nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, called)
+	require.True(t, store.WriteWanted(), "canceled fold must not consume ordinary demand")
 }
