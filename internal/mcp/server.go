@@ -402,6 +402,9 @@ type Server struct {
 	mutationReceipts    sync.Map
 	mutationReindexWait time.Duration
 	mutationSafetyWait  time.Duration
+	// mutationRouteWaitEntered observes a real pending source-mutation route
+	// after selection and before polling. Nil outside deterministic tests.
+	mutationRouteWaitEntered func(context.Context)
 
 	// mutationCommits is the durable disk-commit ledger for the single-file
 	// mutating tools (mutation_commit.go). It answers the question the

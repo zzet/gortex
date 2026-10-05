@@ -56,6 +56,9 @@ func (s *Server) awaitMutationRoute(
 			deadline = bounded
 		}
 	}
+	if s.mutationRouteWaitEntered != nil {
+		s.mutationRouteWaitEntered(ctx)
+	}
 	for time.Now().Before(deadline) {
 		timer := time.NewTimer(mutationRouteWaitPoll)
 		select {

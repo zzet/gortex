@@ -309,6 +309,11 @@ func newRealCheckoutMutationFixture(t testing.TB) *realCheckoutMutationFixture {
 
 func newRealCheckoutMutationFixtureWithRegistry(t testing.TB, configure func(*parser.Registry)) *realCheckoutMutationFixture {
 	t.Helper()
+	return newRealCheckoutMutationFixtureWithSetup(t, configure, nil)
+}
+
+func newRealCheckoutMutationFixtureWithSetup(t testing.TB, configure func(*parser.Registry), beforeRegister func(*indexer.CheckoutLifecycle)) *realCheckoutMutationFixture {
+	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)
 	primary := filepath.Join(base, "repo")
@@ -345,6 +350,9 @@ func newRealCheckoutMutationFixtureWithRegistry(t testing.TB, configure func(*pa
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = lifecycle.Close() })
+	if beforeRegister != nil {
+		beforeRegister(lifecycle)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	registered, err := lifecycle.Register(ctx, config.RepoEntry{Path: primary, Name: "repo"}, indexer.TrackSourceCLI)
