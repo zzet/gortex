@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -37,9 +38,11 @@ func TestNodeKindReadTimingParityAndConnectionReturn(t *testing.T) {
 }
 
 func TestNodeKindReadTimingPoolCancellationReturnsNoPartialRows(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "pool.sqlite"))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	connector := &nodeKindRetryConnector{}
+	connector.calls.Store(1) // This control does not inject a retry.
+	db := sql.OpenDB(gatedConnector{inner: connector, gate: newSQLiteReadGate()})
+	t.Cleanup(func() { _ = db.Close() })
+	s := &Store{storeCore: &storeCore{db: db}}
 	s.db.SetMaxOpenConns(1)
 	held, err := s.db.Conn(t.Context())
 	require.NoError(t, err)
