@@ -25,7 +25,7 @@ func (r *contractCoreEdges) StatsContext(ctx context.Context) (graph.GraphStats,
 			return graph.GraphStats{}, err
 		}
 	} else {
-		stats = r.Reader.Stats()
+		stats = r.Stats()
 	}
 	if err := ctx.Err(); err != nil {
 		return graph.GraphStats{}, err
