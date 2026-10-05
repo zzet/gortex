@@ -100,7 +100,12 @@ const (
 	edgesByFromLineKindIndexDDL = `CREATE INDEX IF NOT EXISTS edges_by_from_line_kind ON edges(view_gen, from_id, line, kind)`
 )
 
+const nodesStatsHistogramIndexDDL = `CREATE INDEX IF NOT EXISTS nodes_stats_histogram ON nodes(view_gen, kind, language)`
+
 var bulkDroppableIndexes = []bulkDroppableIndex{
+	// Exact global histograms read one selected generation without loading wide
+	// node payloads. Keep this droppable during cold bulk writes like other read indexes.
+	{"nodes_stats_histogram", nodesStatsHistogramIndexDDL},
 	{"nodes_by_name", `CREATE INDEX IF NOT EXISTS nodes_by_name ON nodes(name, view_gen)`},
 	{"nodes_by_kind", `CREATE INDEX IF NOT EXISTS nodes_by_kind ON nodes(kind, view_gen)`},
 	{"nodes_by_file", `CREATE INDEX IF NOT EXISTS nodes_by_file ON nodes(file_path, view_gen)`},
