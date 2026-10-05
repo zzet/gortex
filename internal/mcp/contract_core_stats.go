@@ -36,12 +36,15 @@ func (r *contractCoreEdges) StatsContext(ctx context.Context) (graph.GraphStats,
 // This private stats-only hook preserves conditional counter support through
 // the core's existing capability wrappers. A composed or scoped reader without
 // counters must still use its own RepoStats, never an underlying store's totals.
-func (r *contractCoreEdges) contractCoreRepoMemoryEstimates() (map[string]graph.RepoMemoryEstimate, bool) {
+// The final boolean describes cached/auditable index counts on that selected
+// reader; it does not inherit provenance from an underlying physical store.
+func (r *contractCoreEdges) contractCoreRepoMemoryEstimates() (map[string]graph.RepoMemoryEstimate, bool, bool) {
 	selected, ok := r.Reader.(interface {
 		AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate
 	})
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
-	return selected.AllRepoMemoryEstimates(), true
+	_, cached := r.Reader.(graph.RepoMemoryEstimateScanner)
+	return selected.AllRepoMemoryEstimates(), true, cached
 }

@@ -1429,7 +1429,7 @@ func (s *Server) registerCoreTools() {
 
 	s.addTool(
 		mcp.NewTool("graph_stats",
-			mcp.WithDescription("Returns a compact summary of the indexed codebase: node/edge counts by kind and language. Call at session start to orient Claude in an unfamiliar repo."),
+			mcp.WithDescription("Returns a compact summary of the indexed codebase: node/edge counts by kind and language. Cached per-repository counts are labeled as unverified estimates in per_repo_counts, with counted_at unknown. Call at session start to orient Claude in an unfamiliar repo."),
 			mcp.WithString("format", mcp.Description("Output format: json (default) or toon. gcx is accepted but honoured as toon — graph_stats is a status-shape payload with no row-shape gain from a hand-tuned GCX encoder.")),
 			mcp.WithNumber("max_bytes", mcp.Description("Cap the marshaled response at this many bytes; truncation metadata rides on the response.")),
 		),
@@ -3751,9 +3751,18 @@ func (s *Server) buildGraphStatsPayloadFromStats(ctx context.Context, stats *gra
 		// on connect, and on a monorepo that decomposes into hundreds of
 		// sub-repos an unbounded full-GraphStats dump overflowed the agent's
 		// context window before any user turn (small repos:
-		// IsMultiRepo()==false → no dump). Per-repo detail for one repo stays
-		// available via graph_stats repo=<prefix>.
-		result["per_repo"] = cappedRepoTotals(perRepoTotals(s.readerFor(ctx)), graphStatsPerRepoCap)
+		// IsMultiRepo()==false → no dump). Cached SQLite index snapshots
+		// describe the last recorded counts, not a current corpus recount.
+		totals, cached := perRepoTotalsWithCacheProvenance(s.readerFor(ctx))
+		result["per_repo"] = cappedRepoTotals(totals, graphStatsPerRepoCap)
+		if cached {
+			result["per_repo_counts"] = map[string]any{
+				"accuracy":   "cached_estimate",
+				"source":     "index_snapshot",
+				"freshness":  "unverified",
+				"counted_at": nil,
+			}
+		}
 	}
 
 	result["token_savings"] = s.tokenStatsFor(ctx).snapshot()
@@ -3801,8 +3810,8 @@ const graphStatsPerRepoCap = 25
 
 // repoTotal is one repository's whole-graph contribution by count. The
 // stats dump reports these instead of a full per-repo GraphStats so the
-// multi-repo payload stays counter-cheap: the persisted counters already
-// hold the totals, so no per-repo node histogram or edge join is run.
+// multi-repo payload stays counter-cheap: persisted index-snapshot counts
+// avoid a per-repo node histogram or edge join, but may have drifted.
 type repoTotal struct {
 	nodes int
 	edges int
@@ -3814,24 +3823,33 @@ type repoTotal struct {
 // a composed overlay view — falls back to RepoStats, whose per-repo totals
 // are already correct under composition.
 func perRepoTotals(r graph.Reader) map[string]repoTotal {
+	totals, _ := perRepoTotalsWithCacheProvenance(r)
+	return totals
+}
+
+// The existing scanner capability identifies counters that can drift and need
+// an explicit audit. Classification never invokes the scanner or unwraps a
+// selected/composed reader to a physical base store.
+func perRepoTotalsWithCacheProvenance(r graph.Reader) (map[string]repoTotal, bool) {
 	if core, ok := r.(interface {
-		contractCoreRepoMemoryEstimates() (map[string]graph.RepoMemoryEstimate, bool)
+		contractCoreRepoMemoryEstimates() (map[string]graph.RepoMemoryEstimate, bool, bool)
 	}); ok {
-		if estimates, supported := core.contractCoreRepoMemoryEstimates(); supported {
-			return repoTotalsFromMemoryEstimates(estimates)
+		if estimates, supported, cached := core.contractCoreRepoMemoryEstimates(); supported {
+			return repoTotalsFromMemoryEstimates(estimates), cached
 		}
 	}
 	if c, ok := r.(interface {
 		AllRepoMemoryEstimates() map[string]graph.RepoMemoryEstimate
 	}); ok {
-		return repoTotalsFromMemoryEstimates(c.AllRepoMemoryEstimates())
+		_, cached := r.(graph.RepoMemoryEstimateScanner)
+		return repoTotalsFromMemoryEstimates(c.AllRepoMemoryEstimates()), cached
 	}
 	rs := r.RepoStats()
 	out := make(map[string]repoTotal, len(rs))
 	for repo, st := range rs {
 		out[repo] = repoTotal{nodes: st.TotalNodes, edges: st.TotalEdges}
 	}
-	return out
+	return out, false
 }
 
 func repoTotalsFromMemoryEstimates(estimates map[string]graph.RepoMemoryEstimate) map[string]repoTotal {
@@ -3844,8 +3862,8 @@ func repoTotalsFromMemoryEstimates(estimates map[string]graph.RepoMemoryEstimate
 
 // cappedRepoTotals renders per-repo totals into the stats payload:
 // verbatim when the repo count is within the cap, otherwise the top-`limit`
-// repos by node count plus a `_truncated` marker pointing at graph_stats
-// repo=<prefix> for the rest. Keeps the payload bounded regardless of how
+// repos by reported node count plus a `_truncated` marker. Omitted entries
+// are not evidence of an empty repo. Keeps the payload bounded regardless of how
 // many repos are tracked.
 func cappedRepoTotals(totals map[string]repoTotal, limit int) map[string]any {
 	entry := func(t repoTotal) map[string]any {
@@ -3873,8 +3891,8 @@ func cappedRepoTotals(totals map[string]repoTotal, limit int) map[string]any {
 	out["_truncated"] = map[string]any{
 		"shown":       limit,
 		"total_repos": len(totals),
-		"note": fmt.Sprintf("per_repo capped to the top %d of %d tracked repos by node count "+
-			"(context-frugal on monorepos); call graph_stats with repo=<prefix> for a specific repo.",
+		"note": fmt.Sprintf("per_repo capped to the top %d of %d tracked repos by reported node count "+
+			"(context-frugal on monorepos); omitted entries are not evidence of an empty repository.",
 			limit, len(totals)),
 	}
 	return out

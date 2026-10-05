@@ -176,10 +176,11 @@ func TestContractCoreStatsSelectedOverlayRetainsFallback(t *testing.T) {
 	selected := graph.NewOverlaidView(base, layer)
 	reader := newContractCoreEdges(selected, t.Context(), nil)
 	hook := reader.(interface {
-		contractCoreRepoMemoryEstimates() (map[string]graph.RepoMemoryEstimate, bool)
+		contractCoreRepoMemoryEstimates() (map[string]graph.RepoMemoryEstimate, bool, bool)
 	})
-	_, supported := hook.contractCoreRepoMemoryEstimates()
+	_, supported, cached := hook.contractCoreRepoMemoryEstimates()
 	require.False(t, supported, "composed readers must not inherit underlying counters")
+	require.False(t, cached, "composed readers must not inherit underlying cache provenance")
 	require.Equal(t, perRepoTotals(selected), perRepoTotals(reader))
 	require.Equal(t, map[string]repoTotal{"repo": {nodes: 1}, "foreign": {nodes: 1}}, perRepoTotals(reader))
 	want, err := selected.StatsContext(t.Context())
