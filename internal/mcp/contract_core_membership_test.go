@@ -81,7 +81,7 @@ func TestContractCoreMembershipStoreParityScoresAndWriter(t *testing.T) {
 
 func TestContractCoreMembershipFailureCancellationAndSelectedFallback(t *testing.T) {
 	base := graph.New()
-	base.AddBatch([]*graph.Node{{ID: "a", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/f.go"}, {ID: "same", Kind: graph.KindContract, RepoPrefix: "a", FilePath: "a/f.go"}, {ID: "deleted", Kind: graph.KindConfigKey, FilePath: "a/d.go"}, {ID: "foreign", Kind: graph.KindContract, RepoPrefix: "b", FilePath: "b/f.go"}}, []*graph.Edge{{From: "a", To: "same", Kind: graph.EdgeCalls}, {From: "a", To: "deleted", Kind: graph.EdgeCalls}, {From: "a", To: "foreign", Kind: graph.EdgeCalls}})
+	base.AddBatch([]*graph.Node{{ID: "a/f.go::A", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/f.go"}, {ID: "a/f.go::Same", Kind: graph.KindContract, RepoPrefix: "a", FilePath: "a/f.go"}, {ID: "a/d.go::Deleted", Kind: graph.KindConfigKey, FilePath: "a/d.go"}, {ID: "b/f.go::Foreign", Kind: graph.KindContract, RepoPrefix: "b", FilePath: "b/f.go"}}, []*graph.Edge{{From: "a/f.go::A", To: "a/f.go::Same", Kind: graph.EdgeCalls}, {From: "a/f.go::A", To: "a/d.go::Deleted", Kind: graph.EdgeCalls}, {From: "a/f.go::A", To: "b/f.go::Foreign", Kind: graph.EdgeCalls}})
 	sentinel := errors.New("positive membership unavailable")
 	for _, cancelled := range []bool{false, true} {
 		ctx, cancel := context.WithCancel(t.Context())
@@ -94,20 +94,20 @@ func TestContractCoreMembershipFailureCancellationAndSelectedFallback(t *testing
 			spy.cancel = cancel
 			want = context.Canceled
 		}
-		require.Empty(t, newContractCoreEdges(spy, ctx, nil).GetOutEdges("a"))
+		require.Empty(t, newContractCoreEdges(spy, ctx, nil).GetOutEdges("a/f.go::A"))
 		require.ErrorIs(t, contractCoreReadError(ctx), want)
 		require.Equal(t, 1, spy.membership)
 	}
 	layer := graph.NewOverlayLayer()
-	layer.AddNode("a/f.go", &graph.Node{ID: "a", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/f.go"})
-	layer.AddNode("a/f.go", &graph.Node{ID: "same", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/f.go"})
+	layer.AddNode("a/f.go", &graph.Node{ID: "a/f.go::A", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/f.go"})
+	layer.AddNode("a/f.go", &graph.Node{ID: "a/f.go::Same", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/f.go"})
 	layer.MarkFile("a/d.go", true)
 	selected := graph.NewOverlaidViewWithLayer(base, layer)
-	rows, err := graph.GetNodeIDsByKindsContext(t.Context(), selected, []string{"same", "deleted", "foreign"}, []graph.NodeKind{graph.KindContract, graph.KindConfigKey})
+	rows, err := graph.GetNodeIDsByKindsContext(t.Context(), selected, []string{"a/f.go::Same", "a/d.go::Deleted", "b/f.go::Foreign"}, []graph.NodeKind{graph.KindContract, graph.KindConfigKey})
 	require.NoError(t, err)
-	require.Equal(t, map[string]struct{}{"foreign": {}}, rows)
+	require.Equal(t, map[string]struct{}{"b/f.go::Foreign": {}}, rows)
 	scoped := newBaseGraphReader(selected, "a")
-	rows, err = graph.GetNodeIDsByKindsContext(t.Context(), scoped, []string{"same", "deleted", "foreign"}, []graph.NodeKind{graph.KindContract, graph.KindConfigKey})
+	rows, err = graph.GetNodeIDsByKindsContext(t.Context(), scoped, []string{"a/f.go::Same", "a/d.go::Deleted", "b/f.go::Foreign"}, []graph.NodeKind{graph.KindContract, graph.KindConfigKey})
 	require.NoError(t, err)
 	require.Empty(t, rows, "foreign ownership must not leak through an unwrapped accelerator")
 }

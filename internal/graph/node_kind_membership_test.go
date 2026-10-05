@@ -10,22 +10,22 @@ import (
 
 func TestNodeKindMembershipSelectedReplacementDeletionAndScope(t *testing.T) {
 	base := New()
-	base.AddBatch([]*Node{{ID: "same", Kind: KindContract, FilePath: "a/file.go"}, {ID: "deleted", Kind: KindConfigKey, FilePath: "a/delete.go"}, {ID: "keep", Kind: KindContractBridge, FilePath: "a/keep.go"}}, nil)
+	base.AddBatch([]*Node{{ID: "a/file.go::Same", Kind: KindContract, FilePath: "a/file.go"}, {ID: "a/delete.go::Deleted", Kind: KindConfigKey, FilePath: "a/delete.go"}, {ID: "a/keep.go::Keep", Kind: KindContractBridge, FilePath: "a/keep.go"}}, nil)
 	layer := NewOverlayLayer()
-	layer.AddNode("a/file.go", &Node{ID: "same", Kind: KindFunction, FilePath: "a/file.go"})
+	layer.AddNode("a/file.go", &Node{ID: "a/file.go::Same", Kind: KindFunction, FilePath: "a/file.go"})
 	layer.MarkFile("a/delete.go", true)
 	selected := NewOverlaidViewWithLayer(base, layer)
-	ids := []string{"same", "deleted", "keep", "missing", "keep", ""}
+	ids := []string{"a/file.go::Same", "a/delete.go::Deleted", "a/keep.go::Keep", "missing", "a/keep.go::Keep", ""}
 	owned := []NodeKind{KindContract, KindContractBridge, KindConfigKey}
 	rows, err := GetNodeIDsByKindsContext(t.Context(), selected, ids, owned)
 	require.NoError(t, err)
-	require.Equal(t, map[string]struct{}{"keep": {}}, rows)
+	require.Equal(t, map[string]struct{}{"a/keep.go::Keep": {}}, rows)
 	dw := NewDeltaWriter(selected, New())
-	dw.AddNode(&Node{ID: "same", Kind: KindConfigKey, FilePath: "a/file.go"})
+	dw.AddNode(&Node{ID: "a/file.go::Same", Kind: KindConfigKey, FilePath: "a/file.go"})
 	rows, err = GetNodeIDsByKindsContext(t.Context(), dw, ids, owned)
 	require.NoError(t, err)
-	require.Equal(t, map[string]struct{}{"same": {}, "keep": {}}, rows)
-	wrapper := &selectedLegacyKindWrapper{Reader: base, selected: map[string]*Node{"same": {ID: "same", Kind: KindFunction}}}
+	require.Equal(t, map[string]struct{}{"a/file.go::Same": {}, "a/keep.go::Keep": {}}, rows)
+	wrapper := &selectedLegacyKindWrapper{Reader: base, selected: map[string]*Node{"a/file.go::Same": {ID: "a/file.go::Same", Kind: KindFunction}}}
 	rows, err = GetNodeIDsByKindsContext(t.Context(), wrapper, ids, owned)
 	require.NoError(t, err)
 	require.Empty(t, rows, "an Unwrap method must not widen the selected scope")
