@@ -1335,8 +1335,52 @@ func (s *Server) refreshBatchGraph(ctx context.Context, state *batchTransactionS
 		return
 	}
 	outcomes := make(map[string]mutationReindexOutcome, len(receipt.Files))
+	// A durable transaction readmits its complete frontier after any receipt loss.
+	// Live receipt sets retain their original status and generation identities.
+	needsAdmission := false
+	for _, file := range receipt.Files {
+		if _, live := s.mutationReceiptState(file.ReindexReceipt); file.ReindexReceipt == "" || !live {
+			needsAdmission = true
+			break
+		}
+	}
+	if needsAdmission && len(receipt.Files) > 1 {
+		if scheduler, ok := s.currentWatcher().(mutationSetScheduler); ok {
+			paths := make([]string, 0, len(receipt.Files))
+			for _, file := range receipt.Files {
+				paths = append(paths, file.Path)
+			}
+			tickets, err := scheduler.EnqueueFileMutations(context.Background(), paths)
+			if err != nil {
+				for _, path := range paths {
+					outcomes[path] = mutationReindexOutcome{Err: err}
+				}
+			} else if tickets != nil {
+				// Validate the returned coverage before attaching receipt identities.
+				for _, path := range paths {
+					if tickets[filepath.Clean(path)] == nil {
+						err = errors.New("mutation set scheduler returned incomplete coverage")
+						break
+					}
+				}
+				for _, path := range paths {
+					if err != nil {
+						outcomes[path] = mutationReindexOutcome{Err: err}
+						continue
+					}
+					tracked := s.trackMutationTicket(tickets[filepath.Clean(path)])
+					outcomes[path] = tracked.outcome(true)
+				}
+			}
+		}
+	}
 	for i := range receipt.Files {
 		file := &receipt.Files[i]
+		if outcome, admitted := outcomes[file.Path]; admitted {
+			file.ReindexReceipt = outcome.Receipt
+			file.ReindexGeneration = outcome.Generation
+			continue
+		}
 		if file.ReindexReceipt != "" {
 			if outcome, ok := s.mutationReceiptState(file.ReindexReceipt); ok {
 				outcomes[file.Path] = outcome

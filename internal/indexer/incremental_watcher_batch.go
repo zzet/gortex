@@ -459,6 +459,38 @@ func vanishedReceiptNames(g graph.Store, receipt *graph.MutationReceipt) []strin
 	return out
 }
 
+// reindexExplicitMutationPaths preserves forced point-read semantics for the
+// complete admitted set, with one lane-owned resolver/derived tail.
+func (w *Watcher) reindexExplicitMutationPaths(paths []string) (*IndexResult, DerivedFanoutCompleteness, error) {
+	var result *IndexResult
+	var fanout DerivedFanoutCompleteness
+	ctx, cancel := w.mutationLaneContext()
+	defer cancel()
+	err := w.indexer.coordinateRepositoryMutation(ctx, OutputEntryWatcherPatchGraph, func() error {
+		idx := w.currentMutationIndexer()
+		if idx == nil {
+			return errWatcherIndexerMissing
+		}
+		observation := beginDerivedFanoutObservation(idx)
+		defer observation.close()
+		mode := incrementalPathMode{detectDeletions: true, forceExplicitFiles: true}
+		var err error
+		if w.explicitReindexRaw != nil {
+			result, err = w.explicitReindexRaw(paths)
+		} else if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
+			result, err = owner.incrementalReindexRepoRawMode(idx.repoPrefix, paths, mode)
+		} else {
+			result, err = idx.incrementalWatcherPaths(idx.rootPath, paths, mode)
+		}
+		measured := observation.close()
+		if err == nil {
+			fanout = measured
+		}
+		return err
+	})
+	return result, fanout, err
+}
+
 func (w *Watcher) reindexStormPaths(paths []string) (*IndexResult, error) {
 	if w.batchReindex != nil {
 		return w.batchReindex(paths)

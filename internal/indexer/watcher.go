@@ -220,19 +220,21 @@ type Watcher struct {
 
 	// Storm-mode state. Guarded by stormMu so the hot per-file
 	// debounce path (mu) doesn't contend with rate-tracking.
-	stormMu           sync.Mutex
-	eventTimes        []time.Time           // sliding window of recent event timestamps
-	stormBatch        map[string]ChangeKind // dirty set during an event storm
-	stormGenerations  map[string]uint64     // newest debounced generation adopted per path
-	stormTimer        *time.Timer           // fires after the quiet period
-	stormActive       bool                  // true while waiting to drain
-	stormStopped      bool                  // Stop has closed storm admission
-	stormRetryAttempt int                   // retry ordinal for the published storm timer
-	stormWork         sync.WaitGroup        // scheduled/running timer callbacks
-	stormDrained      func(int)             // test hook: batch drained; batch size arg
-	stormBeforeLock   func()                // test hook: immediately before repository-lane admission
-	batchReindex      watcherBatchReindex   // one bounded batch; MultiWatcher installs shared catch-up
-	discoverReindex   watcherBatchReindex   // additive directory discovery with the same complete tail
+	stormMu            sync.Mutex
+	eventTimes         []time.Time           // sliding window of recent event timestamps
+	stormBatch         map[string]ChangeKind // dirty set during an event storm
+	stormGenerations   map[string]uint64     // newest debounced generation adopted per path
+	stormTimer         *time.Timer           // fires after the quiet period
+	stormActive        bool                  // true while waiting to drain
+	stormExplicit      bool                  // admitted complete explicit frontier requires forced reads
+	stormStopped       bool                  // Stop has closed storm admission
+	stormRetryAttempt  int                   // retry ordinal for the published storm timer
+	stormWork          sync.WaitGroup        // scheduled/running timer callbacks
+	stormDrained       func(int)             // test hook: batch drained; batch size arg
+	stormBeforeLock    func()                // test hook: immediately before repository-lane admission
+	explicitReindexRaw watcherBatchReindex   // complete forced frontier; caller already holds repository lane
+	batchReindex       watcherBatchReindex   // one bounded batch; MultiWatcher installs shared catch-up
+	discoverReindex    watcherBatchReindex   // additive directory discovery with the same complete tail
 	// pointReindexRaw runs the complete exact-path pipeline after the watcher
 	// already owns the repository lane. MultiWatcher installs its raw tail here.
 	pointReindexRaw func(string) (*IndexResult, error)
@@ -1799,6 +1801,103 @@ func (w *Watcher) EnqueueFileMutation(ctx context.Context, filePath string) (*Mu
 	return ticket, nil
 }
 
+// EnqueueFileMutations admits one committed frontier before any drain can run.
+// A nil map means the owner cannot schedule this set; no member was admitted.
+func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map[string]*MutationTicket, error) {
+	if len(files) == 1 {
+		ticket, err := w.EnqueueFileMutation(ctx, files[0])
+		if ticket == nil {
+			return nil, err
+		}
+		return map[string]*MutationTicket{ticket.Path: ticket}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	paths := make(map[string]struct{}, len(files))
+	root := w.indexer.RootPath()
+	if root == "" {
+		return nil, nil
+	}
+	for _, file := range files {
+		path, err := filepath.Abs(file)
+		if err != nil {
+			return nil, err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || w.isExcluded(path) {
+			return nil, nil
+		}
+		if _, ok := w.indexer.effectiveLanguage(path, nil); !ok {
+			return nil, nil
+		}
+		paths[path] = struct{}{}
+	}
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	if len(paths) == 1 {
+		for path := range paths {
+			ticket, err := w.EnqueueFileMutation(ctx, path)
+			if ticket == nil {
+				return nil, err
+			}
+			return map[string]*MutationTicket{path: ticket}, err
+		}
+	}
+	if w.mutationBeforeAdmission != nil {
+		w.mutationBeforeAdmission()
+	}
+	w.stormMu.Lock()
+	defer w.stormMu.Unlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if w.stormStopped || w.stopping {
+		return nil, errWatcherStopped
+	}
+	if w.stormBatch == nil {
+		w.stormBatch = make(map[string]ChangeKind)
+	}
+	if w.stormGenerations == nil {
+		w.stormGenerations = make(map[string]uint64)
+	}
+	if w.pendingGeneration == nil {
+		w.pendingGeneration = make(map[string]uint64)
+	}
+	if w.mutationWaiters == nil {
+		w.mutationWaiters = make(map[string]map[uint64]chan MutationResult)
+	}
+	tickets := make(map[string]*MutationTicket, len(paths))
+	for path := range paths {
+		if timer, ok := w.pending[path]; ok {
+			if timer.Stop() {
+				w.asyncWork.Done()
+			}
+			delete(w.pending, path)
+		}
+		w.nextGeneration++
+		generation := w.nextGeneration
+		if w.mutationWaiters[path] == nil {
+			w.mutationWaiters[path] = make(map[uint64]chan MutationResult)
+		}
+		done := make(chan MutationResult, 1)
+		w.mutationWaiters[path][generation] = done
+		w.pendingGeneration[path] = generation
+		w.stormGenerations[path] = generation
+		w.stormBatch[path] = ChangeModified
+		tickets[path] = &MutationTicket{Path: path, Generation: generation, Done: done}
+	}
+	w.stormActive = true
+	w.stormExplicit = true
+	w.stormRetryAttempt = 0
+	w.stopStormTimerLocked()
+	w.armStormTimerLocked(0)
+	return tickets, nil
+}
+
 // scheduleFileMutation is the single admission point for native events and
 // direct daemon mutations. A later admission supersedes every queued callback
 // for the same path; every earlier ticket stays attached until the newest patch
@@ -2187,6 +2286,8 @@ func (w *Watcher) drainStorm() {
 	stopped := w.stormStopped
 	batch := w.stormBatch
 	generations = w.stormGenerations
+	explicit := w.stormExplicit
+	w.stormExplicit = false
 	retryAttempt := w.stormRetryAttempt
 	w.stormBatch = make(map[string]ChangeKind)
 	w.stormGenerations = make(map[string]uint64)
@@ -2222,7 +2323,14 @@ func (w *Watcher) drainStorm() {
 
 	// reindexStormPaths enters the repository coordinator; its raw executor
 	// acquires the topology gate only after the repository lane is held.
-	result, err := w.reindexStormPaths(paths)
+	var result *IndexResult
+	var err error
+	var fanout DerivedFanoutCompleteness
+	if explicit {
+		result, fanout, err = w.reindexExplicitMutationPaths(paths)
+	} else {
+		result, err = w.reindexStormPaths(paths)
+	}
 
 	reindexed, deleted, failed := 0, 0, 0
 	if result != nil {
@@ -2244,15 +2352,15 @@ func (w *Watcher) drainStorm() {
 		drained(len(batch))
 	}
 	if retryableMutationError(err) {
-		if w.scheduleStormMutationRetry(batch, generations, retryAttempt+1) {
+		if w.scheduleStormMutationRetry(batch, generations, retryAttempt+1, explicit) {
 			return
 		}
 		err = errWatcherStopped
 	}
-	w.completeStormMutationWaiters(generations, result, err)
+	w.completeStormMutationWaiters(generations, result, err, fanout)
 }
 
-func (w *Watcher) scheduleStormMutationRetry(batch map[string]ChangeKind, generations map[string]uint64, attempt int) bool {
+func (w *Watcher) scheduleStormMutationRetry(batch map[string]ChangeKind, generations map[string]uint64, attempt int, explicit bool) bool {
 	w.stormMu.Lock()
 	defer w.stormMu.Unlock()
 	if w.stormStopped {
@@ -2275,6 +2383,7 @@ func (w *Watcher) scheduleStormMutationRetry(batch map[string]ChangeKind, genera
 			w.stormGenerations[path] = generation
 		}
 	}
+	w.stormExplicit = w.stormExplicit || explicit
 	w.stormActive = len(w.stormBatch) != 0
 	if attempt > w.stormRetryAttempt {
 		w.stormRetryAttempt = attempt
@@ -2293,9 +2402,14 @@ func (w *Watcher) completeStormMutationWaiters(
 	generations map[string]uint64,
 	result *IndexResult,
 	batchErr error,
+	observed ...DerivedFanoutCompleteness,
 ) {
 	if len(generations) == 0 {
 		return
+	}
+	var fanout DerivedFanoutCompleteness
+	if batchErr == nil && len(observed) > 0 {
+		fanout = observed[0]
 	}
 	failed := make(map[string]struct{})
 	if result != nil {
@@ -2331,6 +2445,10 @@ func (w *Watcher) completeStormMutationWaiters(
 		if w.pendingGeneration[path] == appliedGeneration {
 			delete(w.pendingGeneration, path)
 		}
+		pathFanout := fanout
+		if pathErr != nil {
+			pathFanout = DerivedFanoutCompleteness{}
+		}
 		for requestedGeneration, done := range w.mutationWaiters[path] {
 			if requestedGeneration > appliedGeneration {
 				continue
@@ -2341,6 +2459,7 @@ func (w *Watcher) completeStormMutationWaiters(
 					RequestedGeneration: requestedGeneration,
 					AppliedGeneration:   appliedGeneration,
 					Reindexed:           pathErr == nil,
+					DerivedFanout:       pathFanout,
 					Err:                 pathErr,
 				},
 			})

@@ -122,6 +122,12 @@ type mutationScheduler interface {
 	EnqueueFileMutation(context.Context, string) (*indexer.MutationTicket, error)
 }
 
+// mutationSetScheduler optionally admits a complete primary file frontier.
+// Nil tickets mean unsupported scope with no admission, preserving point fallback.
+type mutationSetScheduler interface {
+	EnqueueFileMutations(context.Context, []string) (map[string]*indexer.MutationTicket, error)
+}
+
 // acquireMutationPath waits for exclusive mutation access to path. Waiting is
 // context-aware: a cancelled MCP request leaves the queue immediately, which
 // lets its dispatcher goroutine finish and release admission capacity.

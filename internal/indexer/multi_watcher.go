@@ -209,6 +209,9 @@ func (mw *MultiWatcher) createWatcher(prefix string, cfg config.WatchConfig) err
 	w.discoverReindex = func(paths []string) (*IndexResult, error) {
 		return mw.multi.incrementalDiscoverRepo(prefix, paths)
 	}
+	w.explicitReindexRaw = func(paths []string) (*IndexResult, error) {
+		return mw.multi.incrementalReindexRepoRawMode(prefix, paths, incrementalPathMode{detectDeletions: true, forceExplicitFiles: true})
+	}
 	w.pointReindexRaw = func(filePath string) (*IndexResult, error) {
 		return mw.multi.incrementalPointRepoRaw(prefix, filePath)
 	}
@@ -1091,6 +1094,47 @@ func (mw *MultiWatcher) EnqueueFileMutation(ctx context.Context, filePath string
 		return nil, nil
 	}
 	return w.EnqueueFileMutation(ctx, filePath)
+}
+
+// EnqueueFileMutations keeps a single owner's complete frontier together.
+// Mixed owners retain the existing point admission path in the caller.
+func (mw *MultiWatcher) EnqueueFileMutations(ctx context.Context, paths []string) (map[string]*MutationTicket, error) {
+	if len(paths) == 1 {
+		ticket, err := mw.EnqueueFileMutation(ctx, paths[0])
+		if ticket == nil {
+			return nil, err
+		}
+		return map[string]*MutationTicket{ticket.Path: ticket}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var owner *Watcher
+	prefixes := make([]string, len(paths))
+	for i, path := range paths {
+		prefixes[i] = mw.multi.RepoForFile(path)
+	}
+	mw.mu.Lock()
+	for _, prefix := range prefixes {
+		candidate := mw.watchers[prefix]
+		started := mw.started[prefix]
+		if candidate == nil && prefix == "" && len(mw.watchers) == 1 {
+			for key, value := range mw.watchers {
+				candidate = value
+				started = mw.started[key]
+			}
+		}
+		if candidate == nil || !started || (owner != nil && owner != candidate) {
+			mw.mu.Unlock()
+			return nil, nil
+		}
+		owner = candidate
+	}
+	mw.mu.Unlock()
+	if owner == nil {
+		return nil, nil
+	}
+	return owner.EnqueueFileMutations(ctx, paths)
 }
 
 // DegradedReason returns the first non-empty per-repo degraded reason, prefixed
