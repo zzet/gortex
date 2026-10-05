@@ -339,7 +339,13 @@ func TestCheckoutRefreshQueueReservationPrecedesDiskCommit(t *testing.T) {
 func TestCheckoutRefreshShutdownCompletesWaiters(t *testing.T) {
 	f, c, l := newCheckoutMutationFixture(t)
 	ticket := queueCheckoutSourceEdit(t, f, l, "package fixture\nfunc StoppedHelper() {}\n")
+	if !f.store.WriteWanted() {
+		t.Fatal("admitted ticket did not retain global write demand")
+	}
 	_ = c.Close()
+	if f.store.WriteWanted() {
+		t.Fatal("shutdown retained ticket write demand")
+	}
 	if result := awaitCheckoutRefresh(t, ticket); !errors.Is(result.Err, ErrCheckoutRefreshStopped) || result.Reindexed {
 		t.Fatalf("stopped ticket: %+v", result)
 	}

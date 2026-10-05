@@ -80,10 +80,10 @@ type checkoutRefreshRequest struct {
 	// bound to the ticket at admission, before the coordinator is woken.
 	record *PublicationPhaseRecord
 	// releaseWrite ends the store write announcement the ticket holds from
-	// its admission until it completes or fails (store_sqlite AnnounceWrite):
-	// while a ticket waits, background holders of the store's writer (the
-	// WAL reclaim) give it up at once instead of making the edit's build wait
-	// behind them.
+	// its admission until it completes or fails (AnnounceCheckoutRefresh):
+	// WAL reclaim still yields while a ticket waits. Chain folds instead yield
+	// to ordinary announcements and actual writer-gate waiters, so a ticket
+	// does not block its own inline fold or background copy during CPU work.
 	releaseWrite func()
 }
 
@@ -771,5 +771,5 @@ func (c *CheckoutCoordinator) announceTicketWrite() func() {
 	if c.store == nil {
 		return nil
 	}
-	return c.store.AnnounceWrite()
+	return c.store.AnnounceCheckoutRefresh()
 }
