@@ -267,24 +267,35 @@ func (c *CheckoutCoordinator) verifyFlattenedChainInSteps(ctx context.Context, c
 			return err
 		}
 		end := min(start+verifyFoldChunk, len(pathList)+len(idList))
-		want := renderFoldChunk(chainView, pathList, idList, start, end, wantSeen)
-		got := renderFoldChunk(foldedView, pathList, idList, start, end, gotSeen)
+		want, err := renderFoldChunk(ctx, chainView, pathList, idList, start, end, wantSeen)
+		if err != nil {
+			return err
+		}
+		got, err := renderFoldChunk(ctx, foldedView, pathList, idList, start, end, gotSeen)
+		if err != nil {
+			return err
+		}
 		if !foldEqualStrings(got, want) {
 			return fmt.Errorf("the fold serves %d rows where the chain serves %d in step %d (first difference: %s)",
 				len(got), len(want), start/verifyFoldChunk, foldFirstDifference(got, want))
 		}
 		runtime.Gosched()
 	}
-	return nil
+	return ctx.Err()
 }
 
 // renderFoldChunk renders, through r, the claimed paths and identities at
 // positions [start, end) of paths followed by ids: every node at a path and
 // every edge recorded there, every identity (or its absence), and the out-
-// and in-edges of all of them. Reads are batched per chunk (one read per
-// layer for the chunk's identities, not one per identity). seen carries the
+// and in-edges of all of them. Adjacency reads are batched in groups of at
+// most verifyFoldChunk identities, including nodes from a single large file.
+// Legacy in-flight reads cannot be forcibly interrupted; cancellation is
+// checked before and after each read and while rendering. seen carries the
 // identities already rendered by an earlier chunk of the same view.
-func renderFoldChunk(r graph.Reader, paths, ids []string, start, end int, seen map[string]struct{}) []string {
+func renderFoldChunk(ctx context.Context, r graph.Reader, paths, ids []string, start, end int, seen map[string]struct{}) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var out []string
 	var chunkPaths, chunkIDs []string
 	for i := start; i < end; i++ {
@@ -295,37 +306,67 @@ func renderFoldChunk(r graph.Reader, paths, ids []string, start, end int, seen m
 		}
 	}
 	var visited, absent []string
-	visit := func(n *graph.Node) {
+	visit := func(n *graph.Node) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if n == nil {
-			return
+			return nil
 		}
 		if _, dup := seen[n.ID]; dup {
-			return
+			return nil
 		}
 		seen[n.ID] = struct{}{}
 		out = append(out, renderFoldNode(n))
 		visited = append(visited, n.ID)
+		return nil
 	}
 	for _, p := range chunkPaths {
-		for _, n := range r.GetFileNodes(p) {
-			visit(n)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		nodes := r.GetFileNodes(p)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for _, n := range nodes {
+			if err := visit(n); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if batch, ok := r.(interface {
 		GetNodesByIDs(ids []string) map[string]*graph.Node
 	}); ok && len(chunkIDs) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		found := batch.GetNodesByIDs(chunkIDs)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		for _, id := range chunkIDs {
 			if n := found[id]; n != nil {
-				visit(n)
+				if err := visit(n); err != nil {
+					return nil, err
+				}
 			} else {
 				absent = append(absent, id)
 			}
 		}
 	} else {
 		for _, id := range chunkIDs {
-			if n := r.GetNode(id); n != nil {
-				visit(n)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			n := r.GetNode(id)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if n != nil {
+				if err := visit(n); err != nil {
+					return nil, err
+				}
 			} else {
 				absent = append(absent, id)
 			}
@@ -334,45 +375,100 @@ func renderFoldChunk(r graph.Reader, paths, ids []string, start, end int, seen m
 	for _, id := range absent {
 		out = append(out, "absent "+id)
 	}
-	outIDs := append(slices.Clone(visited), absent...)
-	if batch, ok := r.(interface {
-		GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge
-	}); ok {
-		for _, edges := range batch.GetOutEdgesByNodeIDs(outIDs) {
-			for _, e := range edges {
-				out = append(out, renderFoldEdge(e))
+	appendEdges := func(edges []*graph.Edge, prefix string) error {
+		for _, e := range edges {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
+			out = append(out, prefix+renderFoldEdge(e))
 		}
-	} else {
-		for _, id := range outIDs {
-			for _, e := range r.GetOutEdges(id) {
-				out = append(out, renderFoldEdge(e))
+		return nil
+	}
+	outIDs := append(slices.Clone(visited), absent...)
+	// A single claimed path can contain thousands of identities. Keep its
+	// adjacency reads in the same identity quanta as point verification.
+	for first := 0; first < len(outIDs); first += verifyFoldChunk {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		group := outIDs[first:min(first+verifyFoldChunk, len(outIDs))]
+		if batch, ok := r.(interface {
+			GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge
+		}); ok {
+			rows := batch.GetOutEdgesByNodeIDs(group)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			for _, edges := range rows {
+				if err := appendEdges(edges, ""); err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			for _, id := range group {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				edges := r.GetOutEdges(id)
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if err := appendEdges(edges, ""); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
 	// In-edges too: an edge recorded at a claimed path that names an
 	// identity the chain removed is visible only from its target's side.
-	if batch, ok := r.(interface {
-		GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge
-	}); ok {
-		for _, edges := range batch.GetInEdgesByNodeIDs(visited) {
-			for _, e := range edges {
-				out = append(out, "in "+renderFoldEdge(e))
-			}
+	for first := 0; first < len(visited); first += verifyFoldChunk {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-	} else {
-		for _, id := range visited {
-			for _, e := range r.GetInEdges(id) {
-				out = append(out, "in "+renderFoldEdge(e))
+		group := visited[first:min(first+verifyFoldChunk, len(visited))]
+		if batch, ok := r.(interface {
+			GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge
+		}); ok {
+			rows := batch.GetInEdgesByNodeIDs(group)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			for _, edges := range rows {
+				if err := appendEdges(edges, "in "); err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			for _, id := range group {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				edges := r.GetInEdges(id)
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if err := appendEdges(edges, "in "); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
 	// Every edge recorded at a claimed path, whichever its endpoints.
 	if recorded, ok := graph.RecordedEdgesOf(r); ok && len(chunkPaths) > 0 {
-		for _, e := range recorded.RecordedEdgesAt(chunkPaths) {
-			out = append(out, "at "+renderFoldEdge(e))
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		edges := recorded.RecordedEdgesAt(chunkPaths)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := appendEdges(edges, "at "); err != nil {
+			return nil, err
 		}
 	}
 	sort.Strings(out)
-	return out
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
