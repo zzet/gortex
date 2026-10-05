@@ -86,9 +86,10 @@ func TestImportFoldPlanningRestoresFallbackAndDeclineOwnership(t *testing.T) {
 			}
 			wantResumed := 1
 			if mode == "mutable_ancestry" {
-				// The fallback reacquires before payload mutation, releases its
-				// retained publication tail, then restores caller ownership.
-				wantResumed = 2
+				// The fallback reacquires for payload mutation, again after
+				// off-lane prewarm, then restores caller ownership after the
+				// retained publication tail is released.
+				wantResumed = 3
 			}
 			if mode == "cancelled" || mode == "reentry_failure" {
 				wantResumed = 0
