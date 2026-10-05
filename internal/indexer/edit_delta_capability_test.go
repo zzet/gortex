@@ -31,6 +31,7 @@ import (
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
+	"graph.NodeKindMembershipReader":              "optional positive-kind accelerator; checked helper uses the exact composed GetNodeKindsByIDsContext rather than forwarding a physical base membership set",
 	"graph.OutgoingMetadataReader":                "checked full-metadata composition dispatches DeltaWriter explicitly and reads its selected view; the physical getter is never forwarded to a base-only store",
 	"graph.OverlayLayerOutgoingMetadataReader":    "checked physical ancestry-layer adjacency, not a composed DeltaWriter; graph.GetOutEdgesByNodeIDsWithMetadataContext composes delta ownership explicitly",
 	"anonymous{Counts}":                           "asserted by the chain fold on the store's stepped fold (its copy counts), never on a store or a delta",

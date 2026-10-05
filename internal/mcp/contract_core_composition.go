@@ -50,6 +50,7 @@ func (r *contractCoreEdges) filter(rows []*graph.Edge) []*graph.Edge {
 		}
 	}
 	var kinds map[string]graph.NodeKindRow
+	var excluded map[string]struct{}
 	if r.contractIDs == nil && len(ids) > 0 {
 		var started time.Time
 		if t := r.edgeTiming; t != nil {
@@ -69,7 +70,7 @@ func (r *contractCoreEdges) filter(rows []*graph.Edge) []*graph.Edge {
 				started = time.Now()
 			}
 			var err error
-			kinds, err = graph.GetNodeKindsByIDsContext(r.ctx, r.Reader, ids)
+			excluded, err = graph.GetNodeIDsByKindsContext(r.ctx, r.Reader, ids, []graph.NodeKind{graph.KindContract, graph.KindContractBridge, graph.KindConfigKey})
 			if r.edgeTiming != nil {
 				r.edgeTiming.EndpointLookup += time.Since(started)
 			}
@@ -97,6 +98,10 @@ func (r *contractCoreEdges) filter(rows []*graph.Edge) []*graph.Edge {
 		}
 	}
 	owned := func(id string) bool {
+		if excluded != nil {
+			_, found := excluded[id]
+			return found
+		}
 		row, found := kinds[id]
 		return found && (row.Kind == graph.KindContract || row.Kind == graph.KindContractBridge || row.Kind == graph.KindConfigKey)
 	}

@@ -565,6 +565,17 @@ func generationReadProbes() []genProbe {
 			}
 			return out
 		}},
+		{name: "GetNodeIDsByKindsContext", run: func(t *testing.T, s *Store) []string {
+			rows, err := s.GetNodeIDsByKindsContext(context.Background(), genReadProbeIDs(), []graph.NodeKind{graph.KindFunction, graph.KindMethod, graph.KindType})
+			if err != nil {
+				t.Fatalf("GetNodeIDsByKindsContext: %v", err)
+			}
+			out := make([]string, 0, len(rows))
+			for id := range rows {
+				out = append(out, "id "+id)
+			}
+			return out
+		}},
 		{name: "ExistingNodeIDs", run: func(t *testing.T, s *Store) []string {
 			out := make([]string, 0)
 			for id := range s.ExistingNodeIDs(genReadProbeIDs()) {
@@ -1937,6 +1948,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.OverlayLayerContractRepoProjectionReader)(nil), probe: "LayerContractRepoProjectionContext"},
 		{iface: (*graph.ContractFileProjectionReader)(nil), probe: "ContractFileProjectionContext"},
 		{iface: (*graph.NodeKindsByIDsReader)(nil), probe: "GetNodeKindsByIDsContext"},
+		{iface: (*graph.NodeKindMembershipReader)(nil), probe: "GetNodeIDsByKindsContext"},
 		{iface: (*graph.ConstantValueRepoReplacer)(nil), skip: skipSidecar},
 		{iface: (*graph.ConstantValueWriter)(nil), skip: skipSidecar},
 		{iface: (*graph.ContentFTSBatchReplacer)(nil), skip: skipWrite, writeFence: writerFamilyFence("content_fts_replace")},
