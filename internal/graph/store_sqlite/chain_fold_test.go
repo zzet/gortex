@@ -410,15 +410,16 @@ func TestChainFoldFailedStepPutsTheCursorBack(t *testing.T) {
 	to := reservedGeneration(t, store, "folded")
 	fold, err := store.BeginChainFold(ctx, ChainFoldRequest{Chain: chain, To: to, Owner: "test"})
 	require.NoError(t, err)
+	defer func() { _ = fold.Release(ctx) }()
 	for step := 0; step < 100000; step++ {
 		before := fold.cursor()
 		done, err := fold.Step(ctx)
-		if errors.Is(err, injected) || errors.Is(err, ErrChainFoldYielded) {
-			require.Equal(t, before, fold.cursor(), "both injected failure and real writer interruption roll back progress")
-			if errors.Is(err, ErrChainFoldYielded) {
-				// Store maintenance is an actual writer too. Retry its legal admission
-				// interruption just as runFold does; the twenty injected failures and
-				// final reference parity remain mandatory.
+		if errors.Is(err, injected) || errors.Is(err, ErrChainFoldYielded) || errors.Is(err, ErrChainFoldWALMark) {
+			require.Equal(t, before, fold.cursor(), "failed or deferred steps cannot advance their cursor")
+			if !errors.Is(err, injected) {
+				// Retry the API's writer/WAL deferrals just as runFold does.
+				// The twenty injected failures and final reference parity
+				// remain mandatory; unexpected errors still fail below.
 				time.Sleep(time.Millisecond)
 			}
 			continue
