@@ -194,11 +194,11 @@ func (s *Server) populateAnalysis(takeLock, background bool) analysisRunMetrics 
 			continue
 		}
 
-		// Each analyzer now consumes a cursor-backed, predicate-scoped projection
-		// directly from the store. Do not retain a second complete node+edge
-		// corpus in Go: SQLite is the snapshot and its generation/revision gate
-		// below still provides the same atomic publication semantics.
-		analysisGraph := s.graph
+		// Light node/edge scans consume bounded, predicate-scoped pages directly
+		// from the store, without retaining a second complete node+edge corpus.
+		// Pages may observe different revisions; the generation/revision gate
+		// below rejects superseded results before atomic publication.
+		analysisGraph := graph.BindAnalysisPages(s.graph)
 		candidate := persistedAnalysis{}
 		attempts++
 		control := &analysisPassControl{s: s, writer: generationWriter, expected: expectedRevision, background: background, metrics: &metrics}

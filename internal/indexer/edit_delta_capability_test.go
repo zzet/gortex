@@ -31,6 +31,7 @@ import (
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
+	"graph.AnalysisPageBinder":                    "whole-graph analysis opts into bounded snapshots under its revision publication fence; file-delta resolver reads retain their composed snapshot semantics",
 	"graph.NodeKindMembershipReader":              "optional positive-kind accelerator; checked helper uses the exact composed GetNodeKindsByIDsContext rather than forwarding a physical base membership set",
 	"graph.OutgoingMetadataReader":                "checked full-metadata composition dispatches DeltaWriter explicitly and reads its selected view; the physical getter is never forwarded to a base-only store",
 	"graph.OverlayLayerOutgoingMetadataReader":    "checked physical ancestry-layer adjacency, not a composed DeltaWriter; graph.GetOutEdgesByNodeIDsWithMetadataContext composes delta ownership explicitly",
