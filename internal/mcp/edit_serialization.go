@@ -516,6 +516,11 @@ func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutat
 			if ticket != nil {
 				receipt := s.trackMutationTicket(ticket)
 				receipt.pinView(pin)
+				// The disk write and ticket admission are complete. This wait
+				// must not announce another ordinary writer while the watcher
+				// publishes; actual queued writes still preempt chain folds.
+				resumeIntent := suspendSourceMutationWriteIntent(ctx)
+				defer resumeIntent()
 				timer := time.NewTimer(s.mutationWaitDuration())
 				defer timer.Stop()
 				select {

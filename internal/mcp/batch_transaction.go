@@ -1263,8 +1263,9 @@ func (s *Server) beginBatchGraphRefresh(absPath string) mutationReindexOutcome {
 	return mutationReindexOutcome{Reindexed: s.reindexFile(absPath)}
 }
 
-func (s *Server) waitBatchGraphReceipts(files []batchTransactionFile) {
+func (s *Server) waitBatchGraphReceipts(ctx context.Context, files []batchTransactionFile) {
 	deadline := time.Now().Add(s.mutationWaitDuration())
+	var resumeIntent func()
 	for _, file := range files {
 		if file.ReindexReceipt == "" {
 			continue
@@ -1284,6 +1285,13 @@ func (s *Server) waitBatchGraphReceipts(files []batchTransactionFile) {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return
+		}
+		if resumeIntent == nil {
+			// All disk writes and admissions (including synchronous fallback)
+			// finished before this passive wait. Restore ordinary priority
+			// before the caller persists the durable receipt.
+			resumeIntent = suspendSourceMutationWriteIntent(ctx)
+			defer resumeIntent()
 		}
 		timer := time.NewTimer(remaining)
 		select {
@@ -1399,7 +1407,7 @@ func (s *Server) refreshBatchGraph(ctx context.Context, state *batchTransactionS
 
 	// Admit the entire file set before waiting. The bounded wait is shared by
 	// the batch, rather than multiplied by the number of files.
-	s.waitBatchGraphReceipts(receipt.Files)
+	s.waitBatchGraphReceipts(ctx, receipt.Files)
 	graphStatus := "fresh"
 	for i := range receipt.Files {
 		file := &receipt.Files[i]
