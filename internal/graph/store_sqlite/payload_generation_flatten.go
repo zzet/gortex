@@ -773,17 +773,3 @@ func readDocidsTx(ctx context.Context, tx *sql.Tx, query string, args ...any) ([
 	}
 	return docids, rows.Err()
 }
-
-func flattenContractBoundaryReceiptsTx(ctx context.Context, tx *sql.Tx, member, to int64) error {
-	// Upper file receipts replace every key membership of that exact owner,
-	// including explicit empty/deleted negative membership. Pending union keys
-	// remain visible until outer acceptance, independent of whole-file masks.
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_boundary_keys(view_gen,key_kind,lookup_key,repo_prefix,checkout_id,file_path) SELECT ?,key_kind,lookup_key,repo_prefix,checkout_id,file_path FROM generation_contract_boundary_keys k WHERE k.view_gen=? AND NOT EXISTS(SELECT 1 FROM generation_contract_boundary_receipt r WHERE r.view_gen=? AND r.repo_prefix=k.repo_prefix AND r.checkout_id=k.checkout_id AND r.file_path=k.file_path)`, to, member, to); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_boundary_receipt(view_gen,repo_prefix,checkout_id,file_path,version,fingerprint,source_fingerprint,accepted,receipt) SELECT ?,repo_prefix,checkout_id,file_path,version,fingerprint,source_fingerprint,accepted,receipt FROM generation_contract_boundary_receipt WHERE view_gen=?`, to, member); err != nil {
-		return err
-	}
-	_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO generation_contract_boundary_baseline(view_gen,repo_prefix,checkout_id,version,fingerprint) SELECT ?,repo_prefix,checkout_id,version,fingerprint FROM generation_contract_boundary_baseline WHERE view_gen=?`, to, member)
-	return err
-}
