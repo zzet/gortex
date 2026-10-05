@@ -8,7 +8,7 @@ Gortex exposes three transports — stdio MCP (the default `gortex mcp`), a Unix
 
 ## Server mode (`/v1/*` JSON API)
 
-The daemon exposes all MCP tools as an HTTP/JSON API under versioned `/v1/*` routes once you give it an HTTP address with `--http-addr`. The daemon serves the repos you track, so add the repo first, then bring the HTTP surface up:
+The daemon exposes all MCP tools as an HTTP/JSON API under versioned `/v1/*` routes once you give it an HTTP address: the `--http-addr` flag, the `GORTEX_DAEMON_HTTP_ADDR` env var, or `daemon.http_addr` in the global config (`~/.gortex/config.yaml`, or `$XDG_CONFIG_HOME/gortex/config.yaml` when `XDG_CONFIG_HOME` is an absolute path), in that order of precedence. The address is read at startup. A daemon run by `gortex daemon install-service` starts without flags, so use the config key there. The daemon serves the repos you track, so add the repo first, then bring the HTTP surface up:
 
 ```bash
 # Track the repo (or run from inside it — the cwd's repo auto-tracks), then start the HTTP backend
@@ -17,6 +17,11 @@ gortex daemon start --http-addr 127.0.0.1:7411
 
 # Non-localhost bind requires an auth token
 gortex daemon start --http-addr 0.0.0.0:7411 --http-auth-token "$(openssl rand -hex 32)"
+
+# Or keep the address in config, e.g. for the install-service daemon:
+#   ~/.gortex/config.yaml (or $XDG_CONFIG_HOME/gortex/config.yaml)
+#   daemon:
+#     http_addr: 127.0.0.1:7411
 
 # Optional one-shot HTTP API alongside MCP stdio; first enable
 # mcp.allow_embedded in the user-level config.

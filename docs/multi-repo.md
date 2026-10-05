@@ -42,6 +42,9 @@ active_project: my-saas
 mcp:
   allow_embedded: false               # Require the shared daemon (default)
 
+# daemon:
+#   http_addr: 127.0.0.1:7411         # Opt in to /mcp + /v1 over HTTP (unset: socket only)
+
 exclude:                            # Applies to every tracked repo
   - "**/*.generated.*"
   - "node_modules/"                 # Already in the builtin baseline

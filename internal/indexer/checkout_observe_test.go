@@ -469,7 +469,9 @@ func TestObserveCheckoutPathRejectsInventoryWithReboundGitMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var inventories atomic.Int32
 	lc.observationInventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
+		inventories.Add(1)
 		inv, err := gitstate.Inventory(ctx, path)
 		if err != nil {
 			return nil, err
@@ -480,13 +482,23 @@ func TestObserveCheckoutPathRejectsInventoryWithReboundGitMarker(t *testing.T) {
 		}
 		return inv, nil
 	}
-	authorized := false
-	_, found, err := observeCheckoutUntilSettled(t, lc, worktree, func(string) error {
-		authorized = true
-		return nil
-	})
-	if found || !errors.Is(err, ErrCheckoutMutationStale) || authorized {
-		t.Fatalf("old inventory acquired new binding authority: found=%v err=%v authorized=%v", found, err, authorized)
+	// Judge the job that received the pre-rebind inventory, not a request retry
+	// loop. Slow Git can outlast the request wait, the refused job is then
+	// forgotten, and a retry's fresh inventory legitimately sees the new binding.
+	job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(worktree))
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-job.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("checkout observation did not finish")
+	}
+	if job.proof != nil || job.found || !errors.Is(job.proofErr, ErrCheckoutMutationStale) {
+		t.Fatalf("old inventory acquired new binding authority: proof=%v found=%v err=%v", job.proof != nil, job.found, job.proofErr)
+	}
+	if n := inventories.Load(); n != 1 {
+		t.Fatalf("observation took %d inventories, want only the pre-rebind one", n)
 	}
 	rows, err := catalog.ListCheckouts(t.Context(), familyID)
 	if err != nil || len(rows) != 1 {

@@ -6,7 +6,7 @@ gortex init [path]           Per-repo setup (.mcp.json, hooks, community routing
 gortex init --dry-run-intake Emit a privacy-safe intake manifest and exit before parsing/writes
 gortex doctor                Zero-op state report: adapter drift, hook activity, adoption, savings (human or --json)
 gortex mcp [flags]           Start the MCP stdio proxy (connects to or auto-starts the daemon; embedded fallback requires config opt-in; --server adds HTTP API)
-gortex daemon start [flags]  Start the daemon; --http-addr <addr> serves the HTTP/JSON API under /v1/* plus the MCP /mcp transport (--http-auth-token, --cors-origin)
+gortex daemon start [flags]  Start the daemon; --http-addr <addr> (or daemon.http_addr in config) serves the HTTP/JSON API under /v1/* plus the MCP /mcp transport (--http-auth-token, --cors-origin)
 gortex daemon <sub>          start / stop / restart / reload / status / logs / install-service / service-status / uninstall-service / server (multi-server roster)
 gortex eval <sub>            Retrieval + coverage benchmarks — recall / embedders / pack / swebench / stdbench / tokens / baselines / quality / parity (substrate; prefer `gortex bench` for the user-facing surface). `parity` measures per-language cross-file coverage against the committed baseline
 gortex eval-server [flags]   HTTP server used by the swebench harness

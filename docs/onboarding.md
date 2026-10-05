@@ -238,6 +238,8 @@ On macOS the unit lands at `~/Library/LaunchAgents/com.zzet.gortex.plist`; on Li
 
 If you run an XDG layout (any absolute `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME`), `install-service` captures those values into the unit so the supervised daemon resolves the same paths as your shell — service supervisors otherwise start with a near-empty environment and the daemon would fall back to `~/.gortex`. Re-run `install-service` if you later change where those variables point.
 
+`install-service` also captures the installing shell's `PATH` (absolute entries only), so the supervised daemon finds language servers installed outside the system directories, such as `~/go/bin` or `~/.cargo/bin`. Run it from the shell whose `PATH` you want the daemon to use, and re-run it after that `PATH` changes. The unit always runs a bare `gortex daemon start`, so set daemon options in config rather than as flags: for the HTTP surface, put `daemon.http_addr` in the global config, `~/.gortex/config.yaml` or its XDG location (see [server.md](server.md)).
+
 ### How it works
 
 - `gortex mcp` (what Claude Code spawns via `.mcp.json`) connects to and may auto-start the daemon, then acts as a thin stdio ↔ socket proxy (~5 MB per client). If no compatible daemon can be reached, it exits by default with instructions to start one or enable `mcp.allow_embedded` in the user-level config.
