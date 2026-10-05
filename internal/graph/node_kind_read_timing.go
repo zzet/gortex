@@ -5,7 +5,8 @@ import (
 	"time"
 )
 
-// NodeKindReadTiming observes one physical lookup batch. Gate is nested inside
+// NodeKindReadTiming observes one physical kind or ID-presence lookup batch.
+// Gate is nested inside
 // QueryStart; PreDriver includes pool/acquisition/setup before first driver
 // entry, not pure pool wait. Later retries remain inside QueryStart. Total also
 // includes construction and cursor closure. No SQL or

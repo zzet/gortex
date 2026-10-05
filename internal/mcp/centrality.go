@@ -268,11 +268,13 @@ func (s *Server) boundedCentralityForRequestObserved(ctx context.Context, seeds,
 		if read := centralityCheckedCallReferences(ctx, reader); read != nil {
 			callReferences = &centralityCallReferenceReader{ctx: ctx, read: read}
 		}
-		if checked, ok := centralityCheckedPresence(reader); ok {
+		if ids := centralityCheckedIDPresence(reader); ids != nil {
+			presence = &centralityPresenceReader{ctx: ctx, ids: ids}
+		} else if checked, ok := centralityCheckedPresence(reader); ok {
 			presence = &centralityPresenceReader{ctx: ctx, checked: checked}
-			if timing != nil {
-				presence.observer = timing.NodePresence.Add
-			}
+		}
+		if presence != nil && timing != nil {
+			presence.observer = timing.NodePresence.Add
 		}
 	} else if timing != nil {
 		timing.MemoCalls++
