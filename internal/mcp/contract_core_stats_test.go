@@ -184,14 +184,14 @@ func TestContractCoreStatsSelectedOverlayRetainsFallback(t *testing.T) {
 	require.Equal(t, map[string]repoTotal{"repo": {nodes: 1}, "foreign": {nodes: 1}}, perRepoTotals(reader))
 	want, err := selected.StatsContext(t.Context())
 	require.NoError(t, err)
-	got, err := query.NewEngine(reader).StatsContext(t.Context())
+	got, err := query.NewEngine(base).WithReader(reader).StatsContext(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, want, *got)
 	// Hiding optional capabilities on the selected reader keeps the same
 	// legacy fallback instead of unwrapping its overlay to the base graph.
 	hidden := struct{ graph.Reader }{selected}
 	require.Equal(t, perRepoTotals(selected), perRepoTotals(newContractCoreEdges(hidden, t.Context(), nil)))
-	stats, err := query.NewEngine(newContractCoreEdges(hidden, t.Context(), nil)).StatsContext(t.Context())
+	stats, err := query.NewEngine(base).WithReader(newContractCoreEdges(hidden, t.Context(), nil)).StatsContext(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, selected.Stats(), *stats)
 }
