@@ -277,7 +277,7 @@ func TestRefFactRefreshEmbeddedQueryPlanUsesIndexedFrontier(t *testing.T) {
 		sql  string
 		args []any
 	}{
-		{"obsolete", refFactDeleteObsolete, []any{filesJSON, "repo", store.viewGen, store.viewGen, store.viewGen, "repo", filesJSON}},
+		{"obsolete", refFactDeleteObsoleteSQL(true), []any{filesJSON, "repo", store.viewGen, store.viewGen, store.viewGen, "repo", filesJSON}},
 		{"changed", refFactUpsertChanged, []any{filesJSON, "repo", store.viewGen, store.viewGen}},
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -333,5 +333,101 @@ func BenchmarkRefFactRefreshWrites(b *testing.B) {
 			require.NoError(b, err)
 			b.ReportMetric(float64(wal.Size())/float64(b.N), "wal-B/op")
 		})
+	}
+}
+
+func TestRefFactRefreshWithoutFileIndex(t *testing.T) {
+	store := openRefFactRebuildStore(t)
+	seedRefFactWriteFixture(t, store, 2, 0)
+	require.NoError(t, store.BulkSetRefFacts("other", []graph.RefFact{
+		{FromID: "other::Caller", ToID: "other::Target", Kind: "calls", FilePath: "repo/changed.go"},
+	}))
+	_, err := store.writerDB.Exec(`DROP INDEX ref_facts_by_file`)
+	require.NoError(t, err)
+	_, err = store.writerDB.Exec(`DELETE FROM edges WHERE view_gen = 0 AND from_id = 'repo::Caller0'`)
+	require.NoError(t, err)
+	require.NoError(t, store.ReplaceRefFactsForFiles("repo", []string{"repo/changed.go"}))
+	facts, err := store.LoadRefFactsByFiles("repo", nil)
+	require.NoError(t, err)
+	require.Len(t, facts, 1)
+	require.Equal(t, "repo::Caller1", facts[0].FromID)
+	other, err := store.LoadRefFactsByFiles("other", nil)
+	require.NoError(t, err)
+	require.Len(t, other, 1, "optional-index fallback must retain foreign facts at the same path")
+}
+
+// The controls execute the same atomic no-op replacement; only the outer
+// obsolete-delete plan differs. Unrelated facts share the selected repository.
+func BenchmarkRefFactReplacementFileSeek(b *testing.B) {
+	for _, unrelated := range []int{1000, 100000} {
+		for _, indexed := range []bool{false, true} {
+			b.Run(fmt.Sprintf("unrelated=%d/indexed=%t", unrelated, indexed), func(b *testing.B) {
+				store, err := Open(filepath.Join(b.TempDir(), "facts.sqlite"))
+				require.NoError(b, err)
+				b.Cleanup(func() { require.NoError(b, store.Close()) })
+				seedRefFactWriteFixture(b, store, 1, 0)
+				facts := make([]graph.RefFact, unrelated)
+				for i := range facts {
+					facts[i] = graph.RefFact{FromID: fmt.Sprintf("repo::Other%d", i), ToID: "repo::OtherTarget",
+						Kind: "calls", FilePath: fmt.Sprintf("repo/other%d.go", i), RefName: "OtherTarget", Origin: "ast_resolved", Tier: "ast"}
+				}
+				require.NoError(b, store.BulkSetRefFacts("repo", facts))
+				// Match the live sparse-statistics regime that selected a
+				// primary-key repository scan in the unpinned statement.
+				_, err = store.writerDB.Exec(`ANALYZE; DELETE FROM sqlite_stat1`)
+				require.NoError(b, err)
+				var hasStat4 bool
+				require.NoError(b, store.writerDB.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_stat4')`).Scan(&hasStat4))
+				if hasStat4 {
+					_, err = store.writerDB.Exec(`DELETE FROM sqlite_stat4`)
+					require.NoError(b, err)
+				}
+				b.Logf("cleared histogram statistics: %t", hasStat4)
+				for _, row := range receiverMutationCallStatRows {
+					_, err = store.writerDB.Exec(`INSERT INTO sqlite_stat1(tbl,idx,stat) VALUES (?,?,?)`, row[0], row[1], row[2])
+					require.NoError(b, err)
+				}
+				_, err = store.writerDB.Exec(`ANALYZE sqlite_schema; PRAGMA wal_checkpoint(TRUNCATE)`)
+				require.NoError(b, err)
+				before := refFactTotalChanges(b, store)
+				const files = `["repo/changed.go"]`
+				var stored int
+				require.NoError(b, store.writerDB.QueryRow(`SELECT COUNT(*) FROM ref_facts WHERE view_gen = 0 AND repo_prefix = 'repo'`).Scan(&stored))
+				require.Equal(b, unrelated+1, stored)
+				rows, err := store.writerDB.Query("EXPLAIN QUERY PLAN "+refFactDeleteObsoleteSQL(indexed), files, "repo", store.viewGen, store.viewGen, store.viewGen, "repo", files)
+				require.NoError(b, err)
+				for rows.Next() {
+					var id, parent, unused int
+					var detail string
+					if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+						_ = rows.Close()
+						b.Fatal(err)
+					}
+					if parent == 0 {
+						b.Logf("obsolete outer plan: %s", detail)
+					}
+				}
+				require.NoError(b, rows.Err())
+				require.NoError(b, rows.Close())
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					func() {
+						store.writeMu.Lock()
+						defer store.writeMu.Unlock()
+						tx, err := store.beginWrite()
+						require.NoError(b, err)
+						defer tx.Rollback() //nolint:errcheck // no-op after Commit
+						_, err = tx.Exec(refFactDeleteObsoleteSQL(indexed), files, "repo", store.viewGen, store.viewGen, store.viewGen, "repo", files)
+						require.NoError(b, err)
+						_, err = tx.Exec(refFactUpsertChanged, files, "repo", store.viewGen, store.viewGen)
+						require.NoError(b, err)
+						require.NoError(b, tx.Commit())
+					}()
+				}
+				b.StopTimer()
+				require.Equal(b, before, refFactTotalChanges(b, store), "both controls must preserve the no-write contract")
+				b.ReportMetric(float64(unrelated), "unrelated-facts")
+			})
+		}
 	}
 }

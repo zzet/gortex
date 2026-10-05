@@ -175,8 +175,7 @@ const refFactFileProjection = `WITH selected AS (
 )
 `
 
-const refFactDeleteObsolete = refFactFileProjection + `DELETE FROM ref_facts
-WHERE view_gen = ? AND repo_prefix = ?
+const refFactDeleteObsoleteSuffix = `WHERE view_gen = ? AND repo_prefix = ?
   AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
   AND NOT EXISTS (
       SELECT 1 FROM desired AS d
@@ -184,6 +183,17 @@ WHERE view_gen = ? AND repo_prefix = ?
         AND d.from_id = ref_facts.from_id AND d.to_id = ref_facts.to_id
         AND d.kind = ref_facts.kind AND d.line = ref_facts.line
   )`
+
+const refFactDeleteObsolete = refFactFileProjection + "DELETE FROM ref_facts\n" + refFactDeleteObsoleteSuffix
+
+// The outer delete must seek the requested files just like DeleteRefFactsByFiles.
+// Without a pin, sparse statistics select the repository-wide primary-key prefix.
+func refFactDeleteObsoleteSQL(indexed bool) string {
+	if indexed {
+		return refFactFileProjection + "DELETE FROM ref_facts INDEXED BY " + refFactsByFileIndexName + "\n" + refFactDeleteObsoleteSuffix
+	}
+	return refFactDeleteObsolete
+}
 
 const refFactUpsertChanged = refFactFileProjection + `INSERT INTO ref_facts (` + refFactColumns + `)
 SELECT ` + refFactColumns + ` FROM desired WHERE true
@@ -224,7 +234,12 @@ func (s *Store) replaceRefFactsForFiles(repoPrefix string, files []string) (stat
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 
-	if _, err := tx.Exec(refFactDeleteObsolete,
+	byFile := false
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?)`,
+		refFactsByFileIndexName).Scan(&byFile); err != nil {
+		byFile = false
+	}
+	if _, err := tx.Exec(refFactDeleteObsoleteSQL(byFile),
 		string(filesJSON), repoPrefix, s.viewGen, s.viewGen,
 		s.viewGen, repoPrefix, string(filesJSON)); err != nil {
 		return statements, err

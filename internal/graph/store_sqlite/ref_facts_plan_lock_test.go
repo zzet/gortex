@@ -176,6 +176,11 @@ func TestRefFactPlansLockedAcrossStatisticsRegimes(t *testing.T) {
 			if !strings.Contains(plan, "INDEX ref_facts_by_file (view_gen=? AND repo_prefix=? AND file_path=?)") || strings.Contains(plan, badPrefix) {
 				t.Errorf("generation %d: delete plan is not a per-file seek:\n%s", generation, plan)
 			}
+			plan = strings.Join(explainOnConn(t, ctx, conn, refFactDeleteObsoleteSQL(true),
+				files, "repo", generation, generation, generation, "repo", files), "\n")
+			if !strings.Contains(plan, "INDEX ref_facts_by_file (view_gen=? AND repo_prefix=? AND file_path=?)") || strings.Contains(plan, "SEARCH ref_facts USING PRIMARY KEY (view_gen=? AND repo_prefix=?)") {
+				t.Errorf("generation %d: replacement obsolete-delete must seek only requested files:\n%s", generation, plan)
+			}
 		}
 	}
 	t.Run("no_stats", func(t *testing.T) {
