@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-SHARDS = {"store": 3, "indexer": 6}
+SHARDS = {"store": 6, "indexer": 6}
 NAME_BUNDLE = 32
 WINDOWS_COMMAND_BUDGET = 30000
 TEST_EXECUTION_BUDGET_SECONDS = 45 * 60

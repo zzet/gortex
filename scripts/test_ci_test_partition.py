@@ -61,7 +61,7 @@ class PartitionTests(unittest.TestCase):
     def test_family_counts_preserve_exhaustive_windows_and_race_plans(self):
         names = self.names(91) + ["ExampleFamily", "FuzzFamily"]
         names.sort()
-        self.assertEqual(planner.SHARDS, {"store": 3, "indexer": 6})
+        self.assertEqual(planner.SHARDS, {"store": 6, "indexer": 6})
         for family, count in planner.SHARDS.items():
             for windows in (False, True):
                 with self.subTest(family=family, windows=windows):
