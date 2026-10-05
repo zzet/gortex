@@ -37,6 +37,13 @@ func TestCallReferenceOutgoingFullParityChunksAndGeneration(t *testing.T) {
 			edges = append(edges, &graph.Edge{From: id, To: fmt.Sprintf("repo/g.go::T%d", line), Kind: kind, FilePath: "repo/f.go", Line: line + 1, Confidence: .8123456789, ConfidenceLabel: "high", Origin: graph.OriginASTResolved, Tier: "ast", CrossRepo: true, Meta: map[string]any{"via": "test", "evidence": "full metadata", "resolve_terminal": true, "resolve_terminal_reason": "accepted", "semantic_source": "test-provider"}})
 		}
 	}
+	// Same-line ties preserve kind and row identity order, including two
+	// same-kind destinations inserted in reverse lexical order.
+	edges = append(edges,
+		&graph.Edge{From: ids[0], To: "repo/g.go::TieCall", Kind: graph.EdgeCalls, FilePath: "repo/f.go", Line: 1, Meta: map[string]any{"via": "tie"}},
+		&graph.Edge{From: ids[0], To: "repo/g.go::TieZ", Kind: graph.EdgeReferences, FilePath: "repo/f.go", Line: 1, Meta: map[string]any{"via": "tie-z"}},
+		&graph.Edge{From: ids[0], To: "repo/g.go::TieA", Kind: graph.EdgeReferences, FilePath: "repo/f.go", Line: 1, Meta: map[string]any{"via": "tie-a"}},
+	)
 	require.NoError(t, s.AddBatchChecked(nil, edges))
 	positive := s.AtGeneration(7)
 	other := *edges[0]
@@ -46,7 +53,7 @@ func TestCallReferenceOutgoingFullParityChunksAndGeneration(t *testing.T) {
 	for _, selected := range []*Store{s, positive} {
 		want := callReferenceRows(selected.GetOutEdgesByNodeIDs(ids))
 		if selected == s {
-			require.Len(t, want[ids[0]], 3)
+			require.Len(t, want[ids[0]], 6)
 		} else {
 			require.Len(t, want[ids[0]], 1)
 		}
