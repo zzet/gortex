@@ -433,9 +433,9 @@ type CheckoutCycle struct {
 	// stage, and what held the build lane when it queued for it. Zero for a
 	// cycle that never queued (a settled one) or was driven by hand.
 	Admission cycleAdmission
-	// cycleStarted is when the cycle began: every refresh ticket it serves
-	// was admitted before it, so a working-copy sample taken after it is
-	// taken after each ticket arrived. Zero outside a loop cycle.
+	// cycleStarted is when the cycle began: its high-water tickets arrived
+	// before it. Later riders must also pass their own post-arrival sample
+	// fence at completion. Zero outside a loop cycle.
 	cycleStarted time.Time
 	// Err is what stopped the cycle, nil when it settled both slots.
 	Err error
@@ -1213,6 +1213,9 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	// Taken after through: every ticket at or below it was admitted before
 	// this instant, which is what lets the cycle's steps share one sample.
 	cycleStarted := time.Now()
+	// Each cycle owns its event history; a successful late rider may absorb
+	// these actual instants after its exact completion checks pass.
+	ctx = context.WithValue(ctx, publicationStampsKey{}, &PublicationStamps{})
 	ctx = withCycleStart(ctx, cycleStarted)
 	ctx = withPublicationTarget(ctx, c.checkoutID, through)
 	markPublicationPhase(ctx, PublicationCycleStarted)

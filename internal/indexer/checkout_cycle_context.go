@@ -105,19 +105,22 @@ func withPublicationTarget(ctx context.Context, checkoutID string, through uint6
 // markPublicationPhase marks phase on the publication records of the tickets
 // the context's cycle serves, and on the record the context carries for work
 // no ticket names (withPhaseRecord: an observed filesystem change, a
-// background compaction). It is a no-op when the context carries neither.
+// background compaction). A cycle also collects the same event instants for
+// tickets that may later prove they rode its publication.
 func markPublicationPhase(ctx context.Context, phase PublicationPhase) {
 	if ctx == nil {
 		return
 	}
+	at := time.Now()
+	PublicationStampsFrom(ctx).markAt(phase, at)
 	if record := phaseRecordFrom(ctx); record != nil {
-		record.Mark(phase)
+		record.MarkAt(phase, at)
 	}
 	target, ok := ctx.Value(publicationTargetKey{}).(publicationTarget)
 	if !ok {
 		return
 	}
-	DefaultPublicationPhases().MarkCheckoutThrough(target.checkoutID, target.through, phase)
+	DefaultPublicationPhases().markCheckoutThroughAt(target.checkoutID, target.through, phase, at)
 }
 
 type phaseRecordKey struct{}

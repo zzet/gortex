@@ -206,12 +206,19 @@ func TestCheckoutRefreshOldCycleCannotFailNewAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	through := c.checkoutRefreshHighWater()
-	second, err := l.RequestCheckoutRefresh(t.Context(), f.checkoutID, f.worktree)
+	origin := time.Now()
+	riderRecord := DefaultPublicationPhases().Begin(f.checkoutID, fmt.Sprintf("failed-cycle-rider-%d", origin.UnixNano()), "fresh_request", origin)
+	second, err := l.RequestCheckoutRefresh(WithPublicationRecord(t.Context(), riderRecord), f.checkoutID, f.worktree)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := errors.New("old physical build failed")
-	c.completeCheckoutRefreshTickets(t.Context(), through, CheckoutCycle{Err: want})
+	cycleCtx := WithPublicationStamps(t.Context())
+	markPublicationPhase(cycleCtx, PublicationPublished)
+	c.completeCheckoutRefreshTickets(cycleCtx, through, CheckoutCycle{Err: want})
+	if _, found := phaseOffsets(riderRecord.Snapshot())[PublicationPublished]; found {
+		t.Fatal("a rider inherited an unverified failed cycle's publication")
+	}
 	if result := awaitCheckoutRefresh(t, first); !errors.Is(result.Err, want) || result.Reindexed {
 		t.Fatalf("first: %+v", result)
 	}

@@ -278,16 +278,19 @@ func PublicationRecordFromContext(ctx context.Context) *PublicationPhaseRecord {
 // serves no record. It is the one call the coordinator and builder need at
 // each phase boundary.
 func (r *PublicationPhaseRecorder) MarkCheckoutThrough(checkoutID string, through uint64, phase PublicationPhase) int {
+	return r.markCheckoutThroughAt(checkoutID, through, phase, time.Now())
+}
+
+func (r *PublicationPhaseRecorder) markCheckoutThroughAt(checkoutID string, through uint64, phase PublicationPhase, at time.Time) int {
 	if r == nil || through == 0 {
 		return 0
 	}
-	now := time.Now()
 	r.mu.Lock()
 	records := append([]*PublicationPhaseRecord(nil), r.byCheckout[checkoutID]...)
 	r.mu.Unlock()
 	marked := 0
 	for _, record := range records {
-		if record.markIfServed(through, phase, now) {
+		if record.markIfServed(through, phase, at) {
 			marked++
 		}
 	}
@@ -468,11 +471,11 @@ func (p *PublicationPhaseRecord) FinishBackgroundWork(completed bool) {
 	p.Mark(PublicationTicketFailed)
 }
 
-// PublicationStamps collects publication phases a request reaches before the
-// record that will carry them exists: an MCP edit's record is opened only
-// after its disk commit, but what came before the commit (view selection,
-// admission, the parse gate, the write's own checks) is exactly where a slow
-// commit's time goes. The record absorbs them when it opens.
+// PublicationStamps collects publication phases before the records that will
+// carry them are known, including successful tickets riding an in-flight cycle.
+// An MCP edit's record opens after its disk commit, but what came before it
+// (view selection, admission, the parse gate, the write's own checks) is
+// exactly where a slow commit's time goes. The record absorbs them when it opens.
 type PublicationStamps struct {
 	mu    sync.Mutex
 	marks []publicationMark
@@ -515,11 +518,17 @@ func StampPublicationPhase(ctx context.Context, phase PublicationPhase) {
 	if stamps == nil {
 		return
 	}
+	stamps.markAt(phase, time.Now())
+}
+
+func (s *PublicationStamps) markAt(phase PublicationPhase, at time.Time) {
+	if s == nil {
+		return
+	}
 	// Repeats are kept; the record keeps the first when it absorbs them.
-	now := time.Now()
-	stamps.mu.Lock()
-	stamps.marks = append(stamps.marks, publicationMark{phase: phase, at: now})
-	stamps.mu.Unlock()
+	s.mu.Lock()
+	s.marks = append(s.marks, publicationMark{phase: phase, at: at})
+	s.mu.Unlock()
 }
 
 // Absorb marks every collected stamp on the record at its own instant.

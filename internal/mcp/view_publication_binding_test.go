@@ -59,7 +59,7 @@ func (m *wakingCheckoutMutation) EnqueueRefresh(ctx context.Context, path string
 
 func TestMutationPublicationRecordIsBoundBeforeAdmissionReturns(t *testing.T) {
 	inner, done, path := newReceiptCheckoutMutation(t)
-	inner.ticket.CheckoutID = "checkout-bind-before-wake"
+	inner.ticket.CheckoutID = "checkout-bind-before-wake:" + path
 	mutation := &wakingCheckoutMutation{receiptCheckoutMutation: inner}
 	s := &Server{mutationReindexWait: time.Nanosecond}
 	ctx := withToolReceivedAt(context.Background(), time.Now())
@@ -103,7 +103,7 @@ func TestMutationPublicationRecordIsBoundBeforeAdmissionReturns(t *testing.T) {
 // under an interim key.
 func TestMutationPublicationRecordFailsWhenAdmissionIsRefused(t *testing.T) {
 	inner, _, path := newReceiptCheckoutMutation(t)
-	inner.ticket.CheckoutID = "checkout-refused-admission"
+	inner.ticket.CheckoutID = "checkout-refused-admission:" + path
 	inner.enqueueErr = indexer.ErrCheckoutRefreshQueueFull
 	s := &Server{mutationReindexWait: time.Nanosecond}
 	ctx := withCheckoutMutation(context.Background(), inner, filepath.Dir(path))
@@ -194,10 +194,10 @@ func TestRequireFreshAdmitsTheFallbackTicketAfterTheProofWithABoundRecord(t *tes
 	require.True(t, snapshot.Terminal)
 }
 
-// Against a real lifecycle whose coordinator loop is running, an MCP edit's
-// ticket wakes its cycle by demand; the record the edit opened before
-// admission carries that cycle's marks, in order, under the receipt id.
-func TestWorktreeEditPublicationRecordCarriesTheDemandWokenCycle(t *testing.T) {
+// Against a real running lifecycle, an MCP edit's ticket may wake a cycle or
+// ride one already in flight. Its receipt record carries the serving cycle's
+// actual publication event after exact success checks, without invented phases.
+func TestWorktreeEditPublicationRecordCarriesTheServingCycle(t *testing.T) {
 	fixture := newRealCheckoutMutationFixture(t)
 	cwd := fixture.worktree
 	written := fixture.edit(t, cwd, map[string]any{
@@ -227,7 +227,6 @@ func TestWorktreeEditPublicationRecordCarriesTheDemandWokenCycle(t *testing.T) {
 	offsets := publicationOffsets(snapshot)
 	order := []indexer.PublicationPhase{
 		indexer.PublicationReceived, indexer.PublicationReceiptCommitted, indexer.PublicationTicketEnqueued,
-		indexer.PublicationCycleStarted, indexer.PublicationAdmitted, indexer.PublicationPublished,
 		indexer.PublicationTicketCompleted,
 	}
 	previous := int64(-1)
@@ -236,6 +235,21 @@ func TestWorktreeEditPublicationRecordCarriesTheDemandWokenCycle(t *testing.T) {
 		require.True(t, ok, "the edit's record lacks %s: %+v", phase, snapshot.Phases)
 		require.GreaterOrEqual(t, offset, previous, "%s precedes the phase before it: %+v", phase, snapshot.Phases)
 		previous = offset
+	}
+	published, ok := offsets[indexer.PublicationPublished]
+	require.True(t, ok, "the edit's record lacks actual publication: %+v", snapshot.Phases)
+	require.GreaterOrEqual(t, published, offsets[indexer.PublicationReceived])
+	require.LessOrEqual(t, published, offsets[indexer.PublicationTicketCompleted])
+	// A ticket can ride a cycle already admitted, even enqueue after its
+	// publication. Retain actual events, omit those before the record origin,
+	// and validate their own ordering rather than inventing enqueue-time phases.
+	if started, ok := offsets[indexer.PublicationCycleStarted]; ok {
+		admitted, found := offsets[indexer.PublicationAdmitted]
+		require.True(t, found, "cycle start lacks actual admission: %+v", snapshot.Phases)
+		require.LessOrEqual(t, started, admitted)
+	}
+	if admitted, ok := offsets[indexer.PublicationAdmitted]; ok {
+		require.LessOrEqual(t, admitted, published)
 	}
 }
 

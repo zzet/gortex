@@ -112,6 +112,8 @@ func TestCheckoutMutationEditSamplesTheWorkingCopyOnceAfterTheWrite(t *testing.T
 func TestFreshRequestsDuringAnEditBuildRideItsPublication(t *testing.T) {
 	f, c, l := newCheckoutMutationFixture(t)
 	ctx := t.Context()
+	editOrigin := time.Now()
+	editRecord := DefaultPublicationPhases().Begin(f.checkoutID, fmt.Sprintf("rider-edit-%d", editOrigin.UnixNano()), PublicationSourceMCPEdit, editOrigin)
 	m, err := l.BeginCheckoutMutation(ctx, f.checkoutID, f.worktree, f.route().RouteEpoch)
 	if err != nil {
 		t.Fatal(err)
@@ -121,7 +123,7 @@ func TestFreshRequestsDuringAnEditBuildRideItsPublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	builderWriteFile(t, f.worktree, "helper.go", chainHelperEdit)
-	edit, err := m.EnqueueRefresh(ctx, filepath.Join(f.worktree, "helper.go"))
+	edit, err := m.EnqueueRefresh(WithPublicationRecord(ctx, editRecord), filepath.Join(f.worktree, "helper.go"))
 	m.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -236,15 +238,38 @@ func TestFreshRequestsDuringAnEditBuildRideItsPublication(t *testing.T) {
 	if samples != 1 {
 		t.Fatalf("the requests cost %d samples beyond the build, want only the build's own pre-publish fence (1)", samples)
 	}
-	// Each rider's record reads: enqueued, admitted (it joined a build past
-	// its lane admission, so no wait of its own), completed — in that order.
+	// The admitted edit and every exact-success rider name the same actual
+	// publication event. Cycle start/admission happened before each rider's
+	// origin, so those events must be absent rather than fabricated at enqueue.
+	instant := func(record *PublicationPhaseRecord, phase PublicationPhase) (time.Time, bool) {
+		record.mu.Lock()
+		defer record.mu.Unlock()
+		for _, mark := range record.marks {
+			if mark.phase == phase {
+				return mark.at, true
+			}
+		}
+		return time.Time{}, false
+	}
+	published, found := instant(editRecord, PublicationPublished)
+	if !found {
+		t.Fatalf("edit record lacks the cycle's publication: %+v", editRecord.Snapshot().Phases)
+	}
 	for i, record := range records {
 		offsets := phaseOffsets(record.Snapshot())
 		enqueued, okE := offsets[PublicationTicketEnqueued]
-		admitted, okA := offsets[PublicationAdmitted]
 		completed, okC := offsets[PublicationTicketCompleted]
-		if !okE || !okA || !okC || admitted < enqueued || completed < admitted {
-			t.Fatalf("rider %d record phases = %+v, want ticket_enqueued <= admitted <= ticket_completed", i, record.Snapshot().Phases)
+		at, okP := instant(record, PublicationPublished)
+		if !okE || !okC || !okP || completed < enqueued || !at.Equal(published) {
+			t.Fatalf("rider %d lacks the actual publication %v: %+v", i, published, record.Snapshot().Phases)
+		}
+		if at.Before(arrival) || offsets[PublicationPublished] > completed {
+			t.Fatalf("rider %d publication falls outside its lifetime: %+v", i, record.Snapshot().Phases)
+		}
+		for _, phase := range []PublicationPhase{PublicationCycleStarted, PublicationAdmitted} {
+			if _, found := offsets[phase]; found {
+				t.Fatalf("rider %d fabricated pre-origin %s: %+v", i, phase, record.Snapshot().Phases)
+			}
 		}
 	}
 }

@@ -58,3 +58,26 @@ func TestPublicationStampLandsOnABoundRecord(t *testing.T) {
 	}
 	StampPublicationPhase(context.Background(), PublicationTicketCaptured) // no collector, no record: no panic
 }
+
+// A request received before publication may enqueue afterward. Associating
+// its successful ticket must preserve that event, never clamp it to enqueue.
+func TestCyclePublicationStampsKeepTheActualPreEnqueueInstant(t *testing.T) {
+	origin := time.Now()
+	key := "cycle-stamps-" + origin.Format("150405.000000000")
+	owed := DefaultPublicationPhases().Begin(key, key+"-owed", "fresh_request", origin)
+	owed.BindTicket(1)
+	ctx := withPublicationTarget(WithPublicationStamps(context.Background()), key, 1)
+	markPublicationPhase(ctx, PublicationPublished)
+	late := DefaultPublicationPhases().Begin(key, key+"-late", "fresh_request", origin)
+	late.BindTicket(2)
+	late.Mark(PublicationTicketEnqueued)
+	late.Absorb(PublicationStampsFrom(ctx))
+	owedOffsets, lateOffsets := phaseOffsets(owed.Snapshot()), phaseOffsets(late.Snapshot())
+	at, found := lateOffsets[PublicationPublished]
+	if !found || at != owedOffsets[PublicationPublished] {
+		t.Fatalf("late ticket lost the actual cycle event: owed %+v late %+v", owed.Snapshot().Phases, late.Snapshot().Phases)
+	}
+	if at >= lateOffsets[PublicationTicketEnqueued] {
+		t.Fatalf("publication was moved to enqueue: %+v", late.Snapshot().Phases)
+	}
+}

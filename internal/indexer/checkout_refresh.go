@@ -547,17 +547,6 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 	if len(requests) == 0 {
 		return
 	}
-	// A ticket that rode this cycle joined a build already past its lane
-	// admission: on its record the cycle and the lane are reached the
-	// instant it was admitted (no wait of its own), so its phases stay
-	// ordered and attribute no lane wait to it. First-wins marks leave any
-	// phase the cycle already marked alone.
-	for _, request := range requests[len(owed):] {
-		if request.record != nil {
-			request.record.MarkAt(PublicationCycleStarted, request.admittedAt)
-			request.record.MarkAt(PublicationAdmitted, request.admittedAt)
-		}
-	}
 	if sample.Fingerprint != dirty.LowerViewFingerprint {
 		return
 	}
@@ -616,6 +605,12 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 		if err := validateCheckoutBatchFiles(ctx, current.RootPath, rootInfo, request.batchFiles); err != nil {
 			c.finishCheckoutRefresh(request, 0, err)
 			continue
+		}
+		if request.record != nil && request.ticket.Ticket.Generation > through {
+			// Association follows verification, not admission. Keep the real
+			// cycle timestamps even when publication preceded ticket enqueue;
+			// events before this request's origin are naturally omitted.
+			request.record.Absorb(PublicationStampsFrom(ctx))
 		}
 		c.finishCheckoutRefresh(request, uint64(out.DirtyGenerationID), nil)
 	}
