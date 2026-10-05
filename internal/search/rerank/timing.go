@@ -1,6 +1,10 @@
 package rerank
 
-import "time"
+import (
+	"time"
+
+	"github.com/zzet/gortex/internal/graph"
+)
 
 // TimingStage separates an engine ranking pass from the final handler pass.
 type TimingStage uint8
@@ -76,6 +80,7 @@ func (t *prepareTiming) finish(observer func(Timing)) {
 // Cache lookup/store durations include mutex waiting and the cache operation.
 type CentralityTiming struct {
 	CoreEdges                                                          CoreEdgeTiming
+	NodePresence                                                       graph.NodeKindReadTiming
 	Total, ReaderSetup, Snapshot, NodeRead, EdgeRead, SnapshotCompute  time.Duration
 	ScopeKey, CacheLookup, Walk, CacheStore, Bookkeeping               time.Duration
 	Calls, NodeReads, EdgeReads, NodeIDs, EdgeIDs, NodeRows, EdgeRows  int
@@ -85,6 +90,7 @@ type CentralityTiming struct {
 
 func (t *CentralityTiming) Add(o CentralityTiming) {
 	t.CoreEdges.Add(o.CoreEdges)
+	t.NodePresence.Add(o.NodePresence)
 	t.Total += o.Total
 	t.ReaderSetup += o.ReaderSetup
 	t.Snapshot += o.Snapshot

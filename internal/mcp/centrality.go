@@ -270,6 +270,9 @@ func (s *Server) boundedCentralityForRequestObserved(ctx context.Context, seeds,
 		}
 		if checked, ok := centralityCheckedPresence(reader); ok {
 			presence = &centralityPresenceReader{ctx: ctx, checked: checked}
+			if timing != nil {
+				presence.observer = timing.NodePresence.Add
+			}
 		}
 	} else if timing != nil {
 		timing.MemoCalls++

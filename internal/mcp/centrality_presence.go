@@ -10,9 +10,10 @@ import (
 // request-bound full-row path; node rows answer existence, regardless of Kind.
 type centralityPresenceReader struct {
 	graph.Reader
-	ctx     context.Context
-	checked graph.NodeKindsByIDsReader
-	err     error
+	ctx      context.Context
+	checked  graph.NodeKindsByIDsReader
+	err      error
+	observer func(graph.NodeKindReadTiming)
 }
 
 func (r *centralityPresenceReader) GetNodesByIDs(ids []string) map[string]*graph.Node {
@@ -27,6 +28,7 @@ func (r *centralityPresenceReader) GetNodesByIDs(ids []string) map[string]*graph
 		r.err = err
 		return nil
 	}
+	ctx = graph.WithNodeKindReadObserver(ctx, r.observer)
 	rows, err := r.checked.GetNodeKindsByIDsContext(ctx, ids)
 	if err == nil {
 		err = ctx.Err()

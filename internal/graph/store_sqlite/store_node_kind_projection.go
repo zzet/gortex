@@ -26,6 +26,16 @@ func (s *Store) GetNodeKindsByIDsContext(ctx context.Context, ids []string) (map
 			return nil, err
 		}
 		chunk := ids[start:min(start+lookupChunkSize, len(ids))]
+		if observer := graph.NodeKindReadObserver(ctx); observer != nil {
+			batch, err := s.observedNodeKindsBatch(ctx, chunk, observer)
+			if err != nil {
+				return nil, err
+			}
+			for id, row := range batch {
+				out[id] = row
+			}
+			continue
+		}
 		q := `SELECT id, kind, file_path, repo_prefix FROM nodes WHERE id IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ?`
 		rows, err := s.db.QueryContext(ctx, q, append(toAnyArgs(chunk), s.viewGen)...)
 		if err != nil {
