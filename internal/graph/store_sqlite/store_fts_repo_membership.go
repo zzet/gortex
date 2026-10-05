@@ -54,8 +54,10 @@ func symbolRepoMembershipQuery(ids int) string {
 	// sorter; rowid preserves the original rank stream's tie order.
 	return `SELECT symbol_fts.node_id, bm25(symbol_fts)
 FROM symbol_fts
-JOIN symbol_fts_rowid ON symbol_fts_rowid.fts_rowid = symbol_fts.rowid AND symbol_fts_rowid.view_gen = ?
-WHERE symbol_fts MATCH ?
+CROSS JOIN symbol_fts_rowid
+WHERE symbol_fts_rowid.fts_rowid = symbol_fts.rowid
+ AND symbol_fts_rowid.view_gen = ?
+ AND symbol_fts MATCH ?
  AND CASE WHEN symbol_fts.rowid IN (?` + strings.Repeat(`,?`, ids-1) + `) THEN 1 ELSE 0 END = 1
  AND symbol_fts.repo_prefix IN ('',?)
  AND symbol_fts.rank MATCH 'bm25()'
