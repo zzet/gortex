@@ -100,6 +100,7 @@ func TestCentralityCallReferenceSelectedAndLegacyFallback(t *testing.T) {
 	layer.MarkFile("repo/f.go", true)
 	selected := graph.NewOverlaidViewWithLayer(s, layer)
 	ctx := withContractCoreReadErrors(t.Context())
+	require.Nil(t, centralityCheckedCallReferences(ctx, s), "raw opt-out legacy readers keep their existing projection")
 	for _, reader := range []graph.Reader{selected, newBaseGraphReader(s, "repo"), struct{ graph.Reader }{s}} {
 		core := newContractCoreEdges(reader, ctx, nil)
 		require.Nil(t, centralityCheckedCallReferences(ctx, core), "unsupported selected wrappers must not be unwrapped")

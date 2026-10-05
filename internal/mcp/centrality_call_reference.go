@@ -89,8 +89,6 @@ func centralityCheckedCallReferences(ctx context.Context, reader graph.Reader) c
 	}); ok {
 		return core.centralityCallReferenceRead()
 	}
-	if checked, ok := reader.(graph.CallReferenceOutgoingReader); ok {
-		return checked.GetCallReferenceOutEdgesContext
-	}
+	// Legacy opt-out readers keep the existing request-bound projection.
 	return nil
 }
