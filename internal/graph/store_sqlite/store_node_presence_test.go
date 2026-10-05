@@ -22,9 +22,10 @@ func TestNodePresenceSQLChunksGenerationAndNoMetadataDecode(t *testing.T) {
 	for i := 0; i < lookupChunkSize+3; i++ {
 		id := fmt.Sprintf("repo/file.go::N%d", i)
 		kind := graph.KindFunction
-		if i == 0 {
+		switch i {
+		case 0:
 			kind = ""
-		} else if i == 1 {
+		case 1:
 			kind = "future-kind"
 		}
 		nodes = append(nodes, &graph.Node{ID: id, Kind: kind, FilePath: "repo/file.go", RepoPrefix: "repo"})
