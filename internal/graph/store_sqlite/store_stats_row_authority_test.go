@@ -89,7 +89,10 @@ func TestGlobalStatsRowAuthorityPreservesSelectedGenerationAndFallback(t *testin
 			if !installed {
 				t.Setenv("GORTEX_SQLITE_ROW_COUNTERS", "0")
 			}
-			s, generation, handle := beginManifestGeneration(t)
+			s := openPayloadStore(t)
+			seedPayloadControlPlane(t, s)
+			generation, handle, err := s.BeginPayloadGeneration(t.Context(), payloadRequest())
+			require.NoError(t, err)
 			baseNodes, baseEdges := rowCounterFixture("repo/shared.go", 3)
 			layerNodes, layerEdges := rowCounterFixture("repo/shared.go", 2)
 			s.AddBatch(baseNodes, baseEdges)
