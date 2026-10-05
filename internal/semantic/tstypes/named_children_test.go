@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/zzet/gortex/internal/parser"
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
@@ -27,8 +26,8 @@ func parseTS(t testing.TB, src string) (*sitter.Tree, *sitter.Node) {
 	return tree, root
 }
 
-// indexNamedChildren enumerates a node's named children the O(N^2) index
-// way — the exact behavior NamedChildren() must reproduce.
+// indexNamedChildren enumerates a node's named children by index — the
+// exact sequence NamedChildren() must reproduce.
 func indexNamedChildren(n *sitter.Node) []*sitter.Node {
 	out := make([]*sitter.Node, 0, n.NamedChildCount())
 	for i := 0; i < int(n.NamedChildCount()); i++ {
@@ -61,7 +60,7 @@ func sameNode(a, b *sitter.Node) bool {
 // bodies with braces, parameter lists with parens/commas, import clauses)
 // — and asserts the cursor iterator visits exactly the same named-child
 // sequence, in the same order, as the NamedChild(i) index form. This is
-// the correctness guard for the O(N) helper: identical visited set =>
+// the correctness guard for the cursor helper: identical visited set =>
 // identical resolution behavior.
 func TestNamedChildrenMatchesIndex(t *testing.T) {
 	const src = `import { A, B as C } from "mod";
@@ -126,8 +125,7 @@ function g(p, q) {
 	t.Logf("equivalence verified over %d nodes (%d named-child comparisons)", nodesChecked, namedSeen)
 }
 
-// TestNamedChildrenEmptyAndSingle covers the boundary shapes: a node with
-// no children and a node whose only child is anonymous.
+// TestNamedChildrenEmptyAndSingle covers a leaf with no children.
 func TestNamedChildrenEmptyAndSingle(t *testing.T) {
 	tree, root := parseTS(t, "let x = 1;\n")
 	defer tree.Close()
@@ -167,28 +165,83 @@ func wideProgram(n int) string {
 	return sb.String()
 }
 
-// timePerRun returns the average wall time of one full enumeration of
-// root's named children using walk, averaged over repeats to damp
-// scheduler noise. It also asserts every pass visits want children.
-func timePerRun(t *testing.T, root *sitter.Node, want, repeats int, walk func(*sitter.Node) int) time.Duration {
-	t.Helper()
-	// One warmup pass (touch caches, fault in pages) before timing.
-	root.WithScratch(func() {
-		if got := walk(root); got != want {
-			t.Fatalf("warmup visited %d, want %d", got, want)
+// TestNamedChildrenWideTraversal checks both widths formerly used by the
+// wall-time ratio gate. Exact count, source spans, and order are deterministic;
+// a ratio of timings across different working-set sizes is not a complexity
+// proof. Scaling measurements belong in BenchmarkNamedChildren.
+func TestNamedChildrenWideTraversal(t *testing.T) {
+	for _, width := range []int{10_000, 100_000} {
+		t.Run(fmt.Sprintf("N=%d", width), func(t *testing.T) {
+			src := wideProgram(width)
+			source := []byte(src)
+			tree, root := parseTS(t, src)
+			defer tree.Close()
+			if got := int(root.NamedChildCount()); got != width {
+				t.Fatalf("root has %d named children, want %d", got, width)
+			}
+			root.WithScratch(func() {
+				count, offset := 0, 0
+				for child := range root.NamedChildren() {
+					want := fmt.Sprintf("const x%d = %d;", count, count)
+					if child == nil || child.Type() != "lexical_declaration" ||
+						int(child.StartByte()) != offset || int(child.EndByte()) != offset+len(want) ||
+						child.Content(source) != want {
+						t.Fatalf("child %d differs from declaration at bytes %d..%d", count, offset, offset+len(want))
+					}
+					count++
+					offset += len(want) + 1
+				}
+				if count != width || offset != len(src) {
+					t.Fatalf("visited %d declarations covering %d bytes, want %d/%d", count, offset, width, len(src))
+				}
+			})
+		})
+	}
+}
+
+func TestNamedChildrenStopsAndRestartsWithAnonymousChildren(t *testing.T) {
+	tree, root := parseTS(t, "function f(a, b, c) { return a; }\n")
+	defer tree.Close()
+	var parameters *sitter.Node
+	var find func(*sitter.Node)
+	find = func(n *sitter.Node) {
+		if n == nil || parameters != nil {
+			return
 		}
-	})
-	start := time.Now()
-	for r := 0; r < repeats; r++ {
-		// Both walkers return only counts. No child wrapper escapes this
-		// pass, so subsequent repeats reuse one traversal's arena capacity.
-		root.WithScratch(func() {
-			if got := walk(root); got != want {
-				t.Fatalf("visited %d on repeat %d, want %d", got, r, want)
+		if n.Type() == "formal_parameters" {
+			parameters = n
+			return
+		}
+		for child := range n.NamedChildren() {
+			find(child)
+		}
+	}
+	find(root)
+	if parameters == nil || parameters.NamedChildCount() != 3 || parameters.ChildCount() <= parameters.NamedChildCount() {
+		t.Fatal("fixture must have three named parameters interleaved with anonymous punctuation")
+	}
+	want := indexNamedChildren(parameters)
+	seq := parameters.NamedChildren()
+	for _, stop := range []int{1, 2, 3} {
+		parameters.WithScratch(func() {
+			count := 0
+			for child := range seq {
+				if count >= len(want) || !sameNode(child, want[count]) {
+					t.Fatalf("restart after stop %d yielded a different child at %d", stop, count)
+				}
+				count++
+				if count == stop {
+					break
+				}
+			}
+			if count != stop {
+				t.Fatalf("stop %d yielded %d children", stop, count)
 			}
 		})
 	}
-	return time.Since(start) / time.Duration(repeats)
+	if got := iterNamedChildren(parameters); len(got) != len(want) {
+		t.Fatalf("full traversal after early stops yielded %d children, want %d", len(got), len(want))
+	}
 }
 
 func walkIter(n *sitter.Node) int {
@@ -209,93 +262,38 @@ func walkIndex(n *sitter.Node) int {
 	return cnt
 }
 
-// TestNamedChildrenLinearScaling proves the cursor iterator walks a wide
-// node in O(N), not O(N^2), by measuring it at two widths a 10x factor
-// apart. A linear walk costs ~10x more at 10x the width; a quadratic walk
-// costs ~100x more. The assertion is a loose growth-ratio bound (< 20x):
-// machine-speed-independent (it is a ratio of two times on the same
-// machine), never flaky for a genuinely linear walk, and decisive against
-// a regression that reintroduces NamedChild(i) indexing inside the helper
-// — which, at this width, re-walks the sibling chain per step and pushes
-// the growth ratio far past the bound.
-//
-// The naive NamedChild(i) walk is timed alongside purely as logged
-// evidence of the quadratic baseline this helper replaces (its per-step
-// re-walk makes its growth ratio climb above the iterator's). It is not
-// asserted on, because the width at which its quadratic term overtakes
-// per-call CGO overhead is machine-dependent.
-func TestNamedChildrenLinearScaling(t *testing.T) {
-	const small, large = 10000, 100000
-
-	treeS, rootS := parseTS(t, wideProgram(small))
-	defer treeS.Close()
-	treeL, rootL := parseTS(t, wideProgram(large))
-	defer treeL.Close()
-
-	if got := int(rootS.NamedChildCount()); got != small {
-		t.Fatalf("small root has %d named children, want %d", got, small)
-	}
-	if got := int(rootL.NamedChildCount()); got != large {
-		t.Fatalf("large root has %d named children, want %d", got, large)
-	}
-
-	iterSmall := timePerRun(t, rootS, small, 50, walkIter)
-	iterLarge := timePerRun(t, rootL, large, 15, walkIter)
-	naiveSmall := timePerRun(t, rootS, small, 50, walkIndex)
-	naiveLarge := timePerRun(t, rootL, large, 5, walkIndex)
-
-	iterRatio := float64(iterLarge) / float64(iterSmall)
-	naiveRatio := float64(naiveLarge) / float64(naiveSmall)
-
-	t.Logf("width %d->%d (10x):", small, large)
-	t.Logf("  iterator: %v -> %v  (%.1fx growth — O(N) ~10x)", iterSmall, iterLarge, iterRatio)
-	t.Logf("  naive   : %v -> %v  (%.1fx growth)", naiveSmall, naiveLarge, naiveRatio)
-
-	// No-hang guard: extremely generous so it never false-fails on a slow
-	// machine, yet still trips on a true O(N^2) blowup at this width.
-	if iterLarge > 3*time.Second {
-		t.Fatalf("iterator pass took %v for N=%d — not linear", iterLarge, large)
-	}
-	// Linear proof: a 10x width increase costs an O(N) walk ~10x; an
-	// O(N^2) walk would cost ~100x. The 20x bound passes comfortably for
-	// linear and fails decisively for any quadratic regression.
-	if iterRatio >= 20 {
-		t.Fatalf("iterator growth %.1fx over a 10x width increase — not linear (want < 20x)", iterRatio)
-	}
-}
-
-// BenchmarkNamedChildren measures the cursor iterator against the naive
-// index loop at two widths; the index loop's per-op cost grows with N
-// (O(N^2)) while the iterator's stays flat (O(N)).
+// BenchmarkNamedChildren reports traversal and per-child costs without turning
+// machine-dependent wall-time ratios into correctness assertions. Indexed
+// navigation can skip hidden subtrees, so its scaling depends on tree shape.
 func BenchmarkNamedChildren(b *testing.B) {
-	for _, n := range []int{1000, 10000} {
+	for _, n := range []int{1000, 10000, 100000} {
 		tree, root := parseTS(b, wideProgram(n))
-
-		b.Run(fmt.Sprintf("iter/N=%d", n), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				cnt := 0
-				for range root.NamedChildren() {
-					cnt++
-				}
-				if cnt != n {
-					b.Fatalf("visited %d, want %d", cnt, n)
-				}
-			}
-		})
-		b.Run(fmt.Sprintf("index/N=%d", n), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				cnt := 0
-				for j := 0; j < int(root.NamedChildCount()); j++ {
-					if root.NamedChild(j) != nil {
-						cnt++
+		for _, walker := range []struct {
+			name string
+			walk func(*sitter.Node) int
+		}{{"iter", walkIter}, {"index", walkIndex}} {
+			b.Run(fmt.Sprintf("%s/N=%d", walker.name, n), func(b *testing.B) {
+				// Reuse one pass's arena capacity; no wrapper escapes a count-only
+				// walk. This measures navigation rather than accumulating arenas.
+				root.WithScratch(func() {
+					if got := walker.walk(root); got != n {
+						b.Fatalf("warmup visited %d, want %d", got, n)
 					}
+				})
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					root.WithScratch(func() {
+						if got := walker.walk(root); got != n {
+							b.Fatalf("visited %d, want %d", got, n)
+						}
+					})
 				}
-				if cnt != n {
-					b.Fatalf("visited %d, want %d", cnt, n)
-				}
-			}
-		})
-
+				b.StopTimer()
+				b.ReportMetric(float64(n), "children/op")
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/child")
+			})
+		}
 		tree.Close()
 	}
 }
