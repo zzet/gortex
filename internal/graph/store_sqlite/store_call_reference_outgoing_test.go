@@ -45,6 +45,11 @@ func TestCallReferenceOutgoingFullParityChunksAndGeneration(t *testing.T) {
 	ids = append(ids, "", ids[0], ids[0], "missing")
 	for _, selected := range []*Store{s, positive} {
 		want := callReferenceRows(selected.GetOutEdgesByNodeIDs(ids))
+		if selected == s {
+			require.Len(t, want[ids[0]], 3)
+		} else {
+			require.Len(t, want[ids[0]], 1)
+		}
 		got, err := selected.GetCallReferenceOutEdgesContext(t.Context(), ids)
 		require.NoError(t, err)
 		require.Equal(t, want, got, "all fields, promoted metadata, duplicate suppression and per-anchor order must match")
