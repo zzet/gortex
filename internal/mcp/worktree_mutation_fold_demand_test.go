@@ -48,7 +48,10 @@ func seedMutationFoldCap(t *testing.T, f *realCheckoutMutationFixture) store_sql
 		if entry.State == store_sqlite.InputManifestPresent && entry.Admission == store_sqlite.InputManifestAdmitted {
 			bytes, readErr := os.ReadFile(filepath.Join(f.worktree, filepath.FromSlash(entry.FilePath)))
 			require.NoError(t, readErr)
-			require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(bytes)), entry.ContentSHA256)
+			// DirtyContent/InputManifest hashes use the Git blob framing of the
+			// actual raw bytes, not a bare content SHA256 (gitstate.hashDirtyReader).
+			blob := append([]byte(fmt.Sprintf("blob %d\x00", len(bytes))), bytes...)
+			require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(blob)), entry.ContentSHA256)
 		}
 	}
 	// The old owner is fully joined before any fixture payload or route write.
