@@ -37,7 +37,9 @@ func (r *coreEdgeTimingReader) GetNodesByIDsContext(ctx context.Context, ids []s
 }
 func (r *coreEdgeTimingReader) GetNodeKindsByIDsContext(ctx context.Context, ids []string) (map[string]graph.NodeKindRow, error) {
 	r.reads.kinds++
-	if r.err != nil {
+	// Isolate the edge-endpoint failure after an actual outgoing read. CSR
+	// presence failures have separate controls and must not hide this phase.
+	if r.err != nil && r.reads.raw > 0 {
 		return nil, r.err
 	}
 	return graph.GetNodeKindsByIDsContext(ctx, r.Store, ids)
@@ -96,7 +98,8 @@ func TestCoreEdgeTimingPreservesScoresReadsFilteringAndErrors(t *testing.T) {
 			if mode == "legacy" {
 				require.Positive(t, timing.CoreEdges.LegacyClassifiers)
 				require.Zero(t, timing.CoreEdges.CheckedClassifiers)
-				require.Zero(t, gotReads.kinds)
+				require.Positive(t, gotReads.kinds, "CSR presence uses checked kinds independently of the legacy edge classifier")
+				require.Positive(t, gotReads.full, "legacy edge classification still uses full-node reads")
 			} else {
 				require.Positive(t, timing.CoreEdges.CheckedClassifiers)
 				require.Zero(t, timing.CoreEdges.LegacyClassifiers)
