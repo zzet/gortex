@@ -112,7 +112,9 @@ func (s *Store) beginGenerationCopy(ctx context.Context, to int64) (*sql.Tx, fun
 	if err := destination.refuseSealedPayloadWrite(); err != nil {
 		return nil, nil, err
 	}
-	s.writeMu.Lock()
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return nil, nil, err
+	}
 	tx, err := destination.beginWriteContext(ctx)
 	if err != nil {
 		s.writeMu.Unlock()
