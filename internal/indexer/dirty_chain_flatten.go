@@ -75,12 +75,12 @@ func (c *CheckoutCoordinator) flattenDirtyChainOver(
 type foldVerifier func(ctx context.Context, root int64, oldestFirst []int64, folded int64) error
 
 // flattenDirtyChainChecked is flattenDirtyChainOver with the verifier named:
-// nil publishes the fold unverified (the inline fold at the cap, verified
-// afterwards in the background). It also returns the folded members, oldest
-// first.
+// nil deliberately skips validation; production inline folds supply the exact
+// verifier. It also returns the folded members, oldest first.
 func (c *CheckoutCoordinator) flattenDirtyChainChecked(
 	ctx context.Context, commit, root store_sqlite.ViewGeneration, top int64, copy chainCopier, verify foldVerifier,
 ) (dirtyLayerBuild, []int64, error) {
+	phases := inlineFoldPhasesFrom(ctx)
 	// A planning fold must reenter with ordinary interactive cancellation.
 	// A fold following a committed import already owns its protected publication
 	// lane; rearming it here could prevent compaction under sustained demand.
@@ -125,11 +125,13 @@ func (c *CheckoutCoordinator) flattenDirtyChainChecked(
 	for i, row := range whole {
 		wholeOldestFirst[len(whole)-1-i] = row.GenerationID
 	}
+	phases.next("manifest_read")
 	manifest, why := loadDirtyChainManifest(ctx, c.store, wholeOldestFirst)
 	if why != "" {
 		return dirtyLayerBuild{}, nil, fmt.Errorf("%w: %s", errFlattenRefused, why)
 	}
 
+	phases.next("reservation")
 	generationID, handle, adopted, err := c.store.BeginPayloadGenerationWithStatus(ctx, store_sqlite.PayloadGenerationRequest{
 		OwnerKind: head.OwnerKind, GraphID: head.GraphID, LayerID: head.LayerID,
 		CheckoutID: head.CheckoutID, GenerationKind: head.GenerationKind,
@@ -145,8 +147,10 @@ func (c *CheckoutCoordinator) flattenDirtyChainChecked(
 	if adopted {
 		return dirtyLayerBuild{}, nil, fmt.Errorf("%w: generation %d is being built by another writer", errFlattenRefused, generationID)
 	}
+	phases.next("copy")
 	counts, finish, err := copy(ctx, oldestFirst, generationID)
 	abandon := func() {
+		phases.fail()
 		if finish != nil {
 			finish(context.WithoutCancel(ctx), false)
 		}
@@ -156,6 +160,7 @@ func (c *CheckoutCoordinator) flattenDirtyChainChecked(
 		abandon()
 		return dirtyLayerBuild{}, nil, fmt.Errorf("indexer: fold working-tree chain %v: %w", oldestFirst, err)
 	}
+	phases.next("manifest_write")
 	entries := make([]store_sqlite.InputManifestEntry, 0, len(manifest.entries))
 	for _, e := range manifest.entries {
 		entries = append(entries, e)
@@ -171,14 +176,17 @@ func (c *CheckoutCoordinator) flattenDirtyChainChecked(
 		abandon()
 		return dirtyLayerBuild{}, nil, fmt.Errorf("indexer: write the folded manifest: %w", err)
 	}
+	phases.next("exact_validation")
 	if err := verifyFold(ctx, verify, root.GenerationID, oldestFirst, generationID); err != nil {
 		abandon()
 		return dirtyLayerBuild{}, nil, fmt.Errorf("%w: %v", errFlattenRefused, err)
 	}
+	phases.next("derivation_stamps")
 	if err := stampFoldedGeneration(ctx, c.store, oldestFirst, handle); err != nil {
 		abandon()
 		return dirtyLayerBuild{}, nil, err
 	}
+	phases.next("publish_finish")
 	if err := publishCopiedGeneration(ctx, generationID, foldPublication, c.store.PreparePayloadGenerationPublication); err != nil {
 		abandon()
 		return dirtyLayerBuild{}, nil, fmt.Errorf("indexer: publish the folded working-tree generation %d: %w", generationID, err)

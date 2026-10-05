@@ -131,9 +131,16 @@ func (c *CheckoutCoordinator) foldInlineAtCap(ctx context.Context, commit, root 
 		held = c.leases.Acquire(members...)
 	}
 	bounded, cancel := context.WithTimeout(ctx, budget)
+	var phases *inlineFoldPhases
+	if c.logger != nil && c.logger.Core().Enabled(zap.DebugLevel) {
+		phases = &inlineFoldPhases{stage: "planning"}
+		phases.clock = newPhaseClock(&phases.phases)
+		bounded = context.WithValue(bounded, inlineFoldPhasesKey{}, phases)
+	}
 	built, oldestFirst, err := c.flattenDirtyChainChecked(bounded, commit, root, top, c.copyChainInline(), c.verifyFlattenedChain)
 	cancel()
 	elapsed := time.Since(started)
+	phases.log(c.logger, c.checkoutID, top, err)
 	if err != nil {
 		if held != nil {
 			held.Release()
