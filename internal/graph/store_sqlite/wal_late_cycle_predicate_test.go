@@ -135,3 +135,32 @@ func TestOpenGateRoundRefusesActualCopyInsideLiveCycle(t *testing.T) {
 		})
 	}
 }
+
+// An admitted watcher owns its original shutdown channel even if it receives
+// CPU time after that lifecycle has ended and a new manual one has begun.
+func TestCheckpointAttemptShutdownUsesAdmittedChannel(t *testing.T) {
+	for _, kind := range []string{"yielding", "forced"} {
+		t.Run(kind, func(t *testing.T) {
+			initialStop := make(chan struct{})
+			// No database worker shares this isolated attempt coordinator.
+			s := &Store{storeCore: &storeCore{stopCheckpoint: initialStop}}
+			policy := checkpointYieldsToCycle
+			if kind == "forced" {
+				policy = checkpointIgnoresCycle
+			}
+			attempt, err := s.beginBackgroundCheckpointAttempt(policy)
+			require.NoError(t, err)
+			defer s.finishBackgroundCheckpointAttempt(attempt)
+			replacementStop := make(chan struct{})
+			defer close(replacementStop)
+			s.stopCheckpoint = replacementStop
+			close(initialStop)
+			select {
+			case <-attempt.ctx.Done():
+				require.ErrorIs(t, context.Cause(attempt.ctx), context.Canceled)
+			case <-time.After(5 * time.Second):
+				t.Fatal("admitted watcher switched to the replacement shutdown channel")
+			}
+		})
+	}
+}

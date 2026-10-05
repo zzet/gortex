@@ -1091,15 +1091,18 @@ func (s *Store) beginBackgroundCheckpointAttempt(policy checkpointCyclePolicy) (
 	coordination.active = attempt
 	coordination.mu.Unlock()
 
+	// Capture lifecycle ownership before launching either watcher. A late
+	// watcher belongs to this admitted shutdown channel, not a later one.
+	stop := s.stopCheckpoint
 	// The daemon may install its predicate after this attempt starts. Select
 	// the watcher by policy; it checks current enablement on every poll.
 	if yieldPolicy {
-		go s.watchBuildLane(attempt)
+		go s.watchBuildLane(attempt, stop)
 		return attempt, nil
 	}
 	go func() {
 		select {
-		case <-s.stopCheckpoint:
+		case <-stop:
 			cancel(context.Canceled)
 		case <-attempt.done:
 		}

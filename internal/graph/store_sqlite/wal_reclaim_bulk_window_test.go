@@ -174,8 +174,19 @@ activationLoop:
 // up (live: "next_attempt_in=5m0s" at 11–17 GB).
 func TestWALReclaimResetsANearlyBackfilledLogWithAShortHold(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
+	// This WAL fixture does not exercise the unrelated lazy index worker.
+	t.Setenv("GORTEX_SQLITE_LAZY_INDEXES", "off")
 	s, path := openWALReclaimStore(t)
 	defer func() { _ = s.Close() }()
+	// Own the checkpoint frontier throughout setup and the measured attempts.
+	// A periodic PASSIVE could otherwise copy the pending prefix after late
+	// rolls back but before reclaim captures its entry snapshot, making this
+	// attempt correctly report no progress. Joining the loop closes its stop
+	// channel; manual reclaim watchers need a live, fixture-owned one.
+	s.stopCheckpointLoop()
+	manualStop := make(chan struct{})
+	s.stopCheckpoint = manualStop
+	defer close(manualStop)
 	seedWALChurnTable(t, s)
 	ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
 	require.NoError(t, err)
@@ -193,8 +204,7 @@ func TestWALReclaimResetsANearlyBackfilledLogWithAShortHold(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, late.QueryRow(`SELECT count(*) FROM wal_churn`).Scan(&n))
 	growWAL(t, s, 2)
-	// The store's own background PASSIVE can hold the checkpointer lock at
-	// this moment (a busy pass copies nothing), so repeat until a pass ran.
+	// Keep setup bounded and verify the actual backfill frontier.
 	var snap walIndexSnapshot
 	var ok bool
 	for i := 0; i < 50; i++ {

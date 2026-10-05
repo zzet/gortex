@@ -172,12 +172,12 @@ func (s *Store) cycleYieldEnabled() bool {
 // watchBuildLane cancels a yielding attempt once a cycle holds the lane. It
 // runs on the attempt's own watcher goroutine (beginBackgroundCheckpointAttempt)
 // and returns when the attempt ends, shutdown begins, or it cancelled.
-func (s *Store) watchBuildLane(attempt *backgroundCheckpointAttempt) {
+func (s *Store) watchBuildLane(attempt *backgroundCheckpointAttempt, stop <-chan struct{}) {
 	ticker := time.NewTicker(walCheckpointCycleYieldPoll)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-s.stopCheckpoint:
+		case <-stop:
 			attempt.cancel(context.Canceled)
 			return
 		case <-attempt.done:
