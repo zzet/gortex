@@ -26,6 +26,8 @@ var _ graph.AnalysisPageBinder = (*Store)(nil)
 // lifetime of each SQLite snapshot. No cursor survives a consumer callback.
 var analysisProjectionPageSize = 4096
 
+var nodesLightOrderedSQL = `SELECT ` + lookupNodeSummaryCols + ` FROM nodes INDEXED BY nodes_by_generation WHERE view_gen = ? ORDER BY id`
+
 // NodesLightSeq retains its single-statement identity/location snapshot unless
 // a revision-validated analysis explicitly binds bounded page reads.
 func (s *Store) NodesLightSeq() iter.Seq[*graph.Node] {
@@ -33,7 +35,7 @@ func (s *Store) NodesLightSeq() iter.Seq[*graph.Node] {
 		return s.nodesLightSeqPages()
 	}
 	return func(yield func(*graph.Node) bool) {
-		rows, err := s.db.Query(`SELECT `+lookupNodeSummaryCols+` FROM nodes WHERE view_gen = ? ORDER BY id`, s.viewGen)
+		rows, err := s.db.Query(nodesLightOrderedSQL, s.viewGen)
 		if err != nil {
 			panicOnFatal(err)
 			return

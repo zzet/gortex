@@ -114,3 +114,72 @@ func TestStatsHistogramCoveringColdBulkLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, before, after)
 }
+
+// The histogram index must not redirect full ordered reads through a sort.
+func TestStatsHistogramOrderedReadProtection(t *testing.T) {
+	s := openPayloadStore(t)
+	seedPayloadControlPlane(t, s)
+	generation, selected, err := s.BeginPayloadGeneration(t.Context(), payloadRequest())
+	require.NoError(t, err)
+	nodes := []*graph.Node{
+		{ID: "z", Kind: graph.NodeKind("unknown"), Language: ""},
+		{ID: "a", Kind: graph.KindFunction, Language: "go"},
+	}
+	require.NoError(t, s.AddBatchChecked(nodes, nil))
+	require.NoError(t, selected.AddBatchChecked(nodes[:1], nil))
+	check := func() {
+		for _, handle := range []*Store{s, selected, s.AtGeneration(generation + 1)} {
+			all := handle.AllNodes()
+			bounded, truncated, err := handle.ContractAnalysisNodesContext(t.Context(), 16)
+			require.NoError(t, err)
+			require.False(t, truncated)
+			if len(all) == 0 {
+				require.Empty(t, bounded)
+			} else {
+				require.Equal(t, all, bounded)
+			}
+			var fullIDs, lightIDs []string
+			for _, n := range all {
+				fullIDs = append(fullIDs, n.ID)
+			}
+			for n := range handle.NodesLightSeq() {
+				lightIDs = append(lightIDs, n.ID)
+			}
+			require.Equal(t, fullIDs, lightIDs)
+			expected := []string(nil)
+			switch handle.viewGen {
+			case 0:
+				expected = []string{"a", "z"}
+			case generation:
+				expected = []string{"z"}
+			}
+			require.Equal(t, expected, fullIDs)
+			for _, query := range []string{baseAllNodesSQL, generationAllNodesSQL, nodesLightOrderedSQL, contractAnalysisNodesSQL} {
+				args := []any{handle.viewGen}
+				if query == contractAnalysisNodesSQL {
+					args = append(args, 17) // The production limit+1 truncation probe.
+				}
+				rows, err := s.db.Query("EXPLAIN QUERY PLAN "+query, args...)
+				require.NoError(t, err)
+				var plan []string
+				for rows.Next() {
+					var id, parent, unused int
+					var detail string
+					require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+					plan = append(plan, detail)
+				}
+				require.NoError(t, rows.Err())
+				require.NoError(t, rows.Close())
+				require.Contains(t, strings.Join(plan, "\n"), "nodes_by_generation")
+				require.NotContains(t, strings.Join(plan, "\n"), "TEMP B-TREE")
+			}
+		}
+	}
+	check()
+	_, err = s.writerDB.Exec("DROP INDEX nodes_stats_histogram")
+	require.NoError(t, err)
+	check()
+	_, err = s.writerDB.Exec(nodesStatsHistogramIndexDDL)
+	require.NoError(t, err)
+	check()
+}

@@ -7,6 +7,8 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+const contractAnalysisNodesSQL = `SELECT ` + lookupNodeCols + ` FROM nodes INDEXED BY nodes_by_generation WHERE view_gen = ? ORDER BY id LIMIT ?`
+
 // ContractAnalysisNodesContext reads bounded full node evidence from this
 // physical analysis payload only. It does not compose or inspect core layers.
 // Callers must refuse truncation; errors never return partial usable evidence.
@@ -20,7 +22,7 @@ func (s *Store) ContractAnalysisNodesContext(ctx context.Context, limit int) ([]
 	if limit <= 0 || limit > 65536 {
 		return nil, false, fmt.Errorf("contract analysis nodes: invalid limit %d", limit)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+lookupNodeCols+` FROM nodes WHERE view_gen = ? ORDER BY id LIMIT ?`, s.viewGen, limit+1)
+	rows, err := s.db.QueryContext(ctx, contractAnalysisNodesSQL, s.viewGen, limit+1)
 	if err != nil {
 		return nil, false, err
 	}

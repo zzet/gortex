@@ -1855,6 +1855,7 @@ func (s *Store) Close() error {
 }
 
 const (
+	baseAllNodesSQL = `SELECT ` + lookupNodeCols + ` FROM nodes INDEXED BY nodes_by_generation WHERE view_gen = ? ORDER BY id`
 	baseAllEdgesSQL = `SELECT ` + lookupEdgeCols + `
 FROM edges INDEXED BY edges_by_generation
 WHERE view_gen = ?
@@ -1959,12 +1960,10 @@ func (s *Store) prepare() error {
 		`SELECT `+nodeCols+` FROM nodes WHERE file_path = ? AND view_gen = ?`)
 	prep(&s.stmtRepoNodes,
 		`SELECT `+nodeCols+` FROM nodes WHERE repo_prefix = ? AND view_gen = ?`)
-	// ORDER BY id: nodes is WITHOUT ROWID keyed on (id, view_gen), so the scan
-	// already walks primary-key order and the clause costs nothing (no temp
-	// b-tree in the query plan). Stating it makes whole-graph enumeration
-	// reproducible instead of merely happening to be stable.
-	prep(&s.stmtAllNodes,
-		`SELECT `+nodeCols+` FROM nodes WHERE view_gen = ? ORDER BY id`)
+	// The always-live generation index supplies id order within the selected
+	// generation and prevents histogram indexes from introducing a payload
+	// scan followed by a temporary sort.
+	prep(&s.stmtAllNodes, baseAllNodesSQL)
 	prep(&s.stmtGenerationAllNodes, generationAllNodesSQL)
 	prep(&s.stmtNodeCount,
 		`SELECT COUNT(*) FROM nodes WHERE view_gen = ?`)
