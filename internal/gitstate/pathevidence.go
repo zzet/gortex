@@ -6,10 +6,10 @@ import (
 )
 
 // pathIdentity is the per-platform seam, implemented once per build
-// constraint (pathevidence_unix.go and pathevidence_other.go today). It
+// constraint (Unix, Windows, and the unsupported fallback). It
 // takes the path alongside the FileInfo because not every platform can
 // answer from a stat alone: Windows keeps the volume serial number and
-// file index behind GetFileInformationByHandle, which needs the path
+// file identifier behind GetFileInformationByHandleEx, which needs the path
 // reopened as a handle (with FILE_FLAG_BACKUP_SEMANTICS for a
 // directory).
 //
@@ -24,6 +24,9 @@ const (
 	// Two paths with the same token live on the same mounted
 	// filesystem.
 	VolumeKindUnixDev = "unix-dev"
+	// VolumeKindWindowsFileID means the volume token is FILE_ID_INFO's
+	// 64-bit volume serial number, paired with its 128-bit file identifier.
+	VolumeKindWindowsFileID = "windows-file-id"
 	// VolumeKindUnsupported means the platform exposes no volume
 	// identity this package knows how to read; the tokens are empty and
 	// carry no meaning.
