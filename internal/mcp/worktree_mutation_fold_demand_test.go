@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,96 +19,72 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 )
 
-type mutationFoldGateGrant struct {
-	release func()
-	err     error
-}
-
-// Keep interactive waiters queued while real refreshes construct the chain.
-// awaitForegroundQuiet observes this queue, so no background compactor can
-// begin/reserve the Store fold. Each handoff is observed; no quiet-window sleep
-// or assumption about cancellation of a queued stepped compactor is needed.
-type mutationFoldGateBaton struct {
-	gate    *indexer.ViewBuildGate
-	ctx     context.Context
-	cancel  context.CancelFunc
-	workers sync.WaitGroup
-	ready   chan mutationFoldGateGrant
-	held    func()
-}
-
-func newMutationFoldGateBaton(t *testing.T, gate *indexer.ViewBuildGate) *mutationFoldGateBaton {
+// Seed a static ready chain from a REAL accepted payload, while no lifecycle
+// owns a coordinator. CopyPayloadGeneration carries the accepted nodes/edges,
+// masks, source metadata and complete input manifest; Publish seals/validates
+// each member. Every layer replaces the same accepted bytes, so the composed
+// state is exact. This is fixture setup, never completion of a pending ticket.
+func seedMutationFoldCap(t *testing.T, f *realCheckoutMutationFixture) store_sqlite.CheckoutRoute {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	b := &mutationFoldGateBaton{gate: gate, ctx: ctx, cancel: cancel, ready: make(chan mutationFoldGateGrant, 64)}
-	var err error
-	b.held, err = gate.Acquire(ctx, indexer.ViewBuildInteractive)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	catalog := f.store.Catalog()
+	route, found, err := catalog.GetCheckoutRoute(ctx, f.checkoutID)
 	require.NoError(t, err)
-	t.Cleanup(b.close)
-	b.queue(t)
-	b.queue(t)
-	return b
-}
-
-func (b *mutationFoldGateBaton) queue(t *testing.T) {
-	t.Helper()
-	before := b.gate.Stats().InteractiveQueued
-	b.workers.Add(1)
-	go func() {
-		defer b.workers.Done()
-		release, err := b.gate.Acquire(b.ctx, indexer.ViewBuildInteractive)
-		b.ready <- mutationFoldGateGrant{release: release, err: err}
-	}()
-	require.Eventually(t, func() bool { return b.gate.Stats().InteractiveQueued > before }, time.Second, time.Millisecond,
-		"test waiter must be observed queued before handing off the lane")
-}
-
-func (b *mutationFoldGateBaton) release() {
-	if b.held != nil {
-		b.held()
-		b.held = nil
-	}
-}
-
-func (b *mutationFoldGateBaton) advance(t *testing.T, published func() bool) {
-	t.Helper()
-	for {
-		require.GreaterOrEqual(t, b.gate.Stats().InteractiveQueued, 2)
-		b.release()
-		select {
-		case grant := <-b.ready:
-			require.NoError(t, grant.err)
-			b.held = grant.release
-		case <-b.ctx.Done():
-			t.Fatal("real refresh did not hand the lane back: ", b.ctx.Err())
-		}
-		// One other waiter remained queued while this one was granted. Restore
-		// the second before another handoff, including while a refresh owns it.
-		b.queue(t)
-		if published() {
-			return
+	require.True(t, found)
+	require.Equal(t, store_sqlite.RouteActive, route.State)
+	source, found, err := catalog.GetViewGeneration(ctx, route.DirtyGenerationID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, route.CommitGenerationID, source.BaseGenerationID)
+	require.Equal(t, f.checkoutID, source.CheckoutID)
+	accepted := f.store.AtGeneration(source.GenerationID)
+	meta, entries, found, err := accepted.InputManifest(ctx)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, meta.IsFull)
+	require.GreaterOrEqual(t, len(entries), 3)
+	for _, entry := range entries {
+		if entry.State == store_sqlite.InputManifestPresent && entry.Admission == store_sqlite.InputManifestAdmitted {
+			bytes, readErr := os.ReadFile(filepath.Join(f.worktree, filepath.FromSlash(entry.FilePath)))
+			require.NoError(t, readErr)
+			require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(bytes)), entry.ContentSHA256)
 		}
 	}
-}
-
-func (b *mutationFoldGateBaton) stopWaiters() {
-	b.cancel()
-	b.workers.Wait()
-	for {
-		select {
-		case grant := <-b.ready:
-			if grant.release != nil {
-				grant.release()
-			}
-		default:
-			return
+	// The old owner is fully joined before any fixture payload or route write.
+	// No background reservation can survive that join.
+	require.NoError(t, f.srv.lifecycle.Close())
+	parent := source.GenerationID
+	for depth := 2; depth <= graphview.MaxDirtyChainDepth; depth++ {
+		id, handle, beginErr := f.store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{
+			OwnerKind: source.OwnerKind, GraphID: source.GraphID, LayerID: source.LayerID,
+			CheckoutID: source.CheckoutID, GenerationKind: source.GenerationKind,
+			BaseGenerationID: parent, LowerViewFingerprint: source.LowerViewFingerprint,
+			TreeOID: source.TreeOID, ProvenanceCommitOID: source.ProvenanceCommitOID,
+			ConfigHash: source.ConfigHash, ExtractorVersions: source.ExtractorVersions,
+			ResolverVersion: source.ResolverVersion, DependencyRevision: source.DependencyRevision,
+			CreatedAt: time.Now().Unix(),
+		})
+		require.NoError(t, beginErr)
+		counts, copyErr := f.store.CopyPayloadGeneration(ctx, source.GenerationID, id, "repo")
+		require.NoError(t, copyErr)
+		require.Positive(t, counts.Nodes)
+		copiedMeta, copiedEntries, copied, readErr := handle.InputManifest(ctx)
+		require.NoError(t, readErr)
+		require.True(t, copied)
+		require.Equal(t, meta, copiedMeta)
+		require.Equal(t, entries, copiedEntries)
+		for _, symbol := range []string{"repo/edit.go::New", "repo/stable1.go::Stable1", "repo/stable2.go::Stable2"} {
+			require.NotNil(t, accepted.GetNode(symbol))
+			require.Equal(t, accepted.GetNode(symbol), handle.GetNode(symbol))
 		}
+		require.NoError(t, f.store.PublishPayloadGeneration(ctx, id, time.Now().Unix()))
+		parent = id
 	}
-}
-
-func (b *mutationFoldGateBaton) close() {
-	b.stopWaiters()
-	b.release()
+	route.DirtyGenerationID = parent
+	route.RouteEpoch++
+	require.NoError(t, catalog.UpsertCheckoutRoute(ctx, route))
+	return route
 }
 
 // The second default edit waits on the first edit's real withdrawn route.
@@ -119,9 +96,7 @@ func (b *mutationFoldGateBaton) close() {
 // The production three-second fold budget is unchanged.
 func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testing.T) {
 	t.Setenv("GORTEX_TOOLS", "facade-v1")
-	gate := indexer.NewViewBuildGate()
-	gate.Open()
-	f := newRealCheckoutMutationFixtureWithSetup(t, nil, func(l *indexer.CheckoutLifecycle, worktree string) {
+	f := newRealCheckoutMutationFixtureWithSetup(t, nil, func(_ *indexer.CheckoutLifecycle, worktree string) {
 		// These real files enter the initial accepted dirty census. Later
 		// one-file edits leave them unchanged; no catalog/manifest is seeded.
 		for i := 1; i <= 2; i++ {
@@ -129,13 +104,33 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 			src := fmt.Sprintf("package repo\n\nfunc Stable%d() {}\n", i)
 			require.NoError(t, os.WriteFile(path, []byte(src), 0o644))
 		}
-		l.SetBuildGate(gate)
 	})
 	f.srv.mutationReindexWait = 20 * time.Millisecond
 	primaryBefore, err := os.ReadFile(filepath.Join(f.primary, "edit.go"))
 	require.NoError(t, err)
-	baton := newMutationFoldGateBaton(t, gate)
-	backgroundBefore := gate.Stats().AdmittedBackground
+	capped := seedMutationFoldCap(t, f)
+	gate := indexer.NewViewBuildGate()
+	gate.Open()
+	gateCtx, cancelGate := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancelGate)
+	releaseLane, err := gate.Acquire(gateCtx, indexer.ViewBuildInteractive)
+	require.NoError(t, err)
+	releaseLane = sync.OnceFunc(releaseLane)
+	t.Cleanup(releaseLane)
+	fresh, err := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{
+		MultiIndexer: f.srv.multiIndexer, ConfigManager: f.srv.configManager,
+		Graph: f.store, Logger: f.srv.logger, ViewLeases: f.srv.materializer.Leases,
+	})
+	require.NoError(t, err)
+	fresh.SetBuildGate(gate)
+	t.Cleanup(func() { _ = fresh.Close() })
+	f.srv.lifecycle = fresh
+	require.True(t, fresh.ActivateCheckout(f.checkoutID, "static-fold-cap-regression"))
+	checkout, found, err := f.store.Catalog().GetCheckout(context.Background(), f.checkoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Eventually(t, func() bool { return fresh.LiveCoordinators(checkout.FamilyID) > 0 }, 20*time.Second, time.Millisecond,
+		"the fresh lifecycle must own the persisted accepted route")
 	ctx := context.Background()
 	catalog := f.store.Catalog()
 	route := func() store_sqlite.CheckoutRoute {
@@ -144,30 +139,8 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 		require.True(t, found)
 		return row
 	}
-	oldTop := route().DirtyGenerationID
+	require.Equal(t, capped, route(), "fresh activation must preserve the exact ready static chain")
 	oldName := "New"
-	for depth := 2; depth <= graphview.MaxDirtyChainDepth; depth++ {
-		name := fmt.Sprintf("FoldSetup%d", depth)
-		result := f.facade(t, f.worktree, "edit", map[string]any{
-			"operation": "file", "target": map[string]any{"file": "repo/edit.go"},
-			"match": "func " + oldName + "() {}", "replacement": "func " + name + "() {}",
-		})
-		lifecycleResultPayload(t, result)
-		previous := oldTop
-		baton.advance(t, func() bool {
-			r := route()
-			return r.State == store_sqlite.RouteActive && r.DirtyGenerationID > 0 && r.DirtyGenerationID != previous
-		})
-		f.awaitMutation(t, f.worktree, result)
-		r := route()
-		row, found, readErr := catalog.GetViewGeneration(ctx, r.DirtyGenerationID)
-		require.NoError(t, readErr)
-		require.True(t, found)
-		require.Equal(t, previous, row.BaseGenerationID, "setup must really chain, never fabricate or rebuild direct")
-		require.Equal(t, f.checkoutID, row.CheckoutID)
-		oldTop, oldName = r.DirtyGenerationID, name
-	}
-	capped := route()
 	chain := make([]int64, 0, graphview.MaxDirtyChainDepth)
 	for id := capped.DirtyGenerationID; id != capped.CommitGenerationID; {
 		row, found, readErr := catalog.GetViewGeneration(ctx, id)
@@ -181,7 +154,7 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 		id = row.BaseGenerationID
 	}
 	require.Len(t, chain, graphview.MaxDirtyChainDepth)
-	require.Equal(t, backgroundBefore, gate.Stats().AdmittedBackground, "no background lane admission means no background Store fold reservation")
+	require.Zero(t, gate.Stats().AdmittedBackground, "a settled persisted route owes no background build or fold reservation")
 
 	first := f.facade(t, f.worktree, "edit", map[string]any{
 		"operation": "file", "target": map[string]any{"file": "repo/edit.go"},
@@ -189,8 +162,8 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 	})
 	firstPayload := lifecycleResultPayload(t, first)
 	require.Equal(t, "pending", firstPayload["graph_status"])
-	require.Eventually(t, func() bool { return gate.Stats().InteractiveQueued >= 3 }, time.Second, time.Millisecond,
-		"first refresh must queue behind the held lane and two setup waiters")
+	require.Eventually(t, func() bool { return gate.Stats().InteractiveQueued >= 1 }, time.Second, time.Millisecond,
+		"first refresh must queue behind the held lane")
 	entered, resume := make(chan struct{}), make(chan struct{})
 	var resumeOnce, enteredOnce sync.Once
 	var waitEntries atomic.Int32
@@ -245,10 +218,10 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 	require.NoError(t, err)
 	require.Contains(t, string(bytesBeforeSecond), "func FoldFirst() {}")
 	require.NotContains(t, string(bytesBeforeSecond), "FoldSecond")
-	require.Equal(t, backgroundBefore, gate.Stats().AdmittedBackground)
-	baton.stopWaiters()
-	require.GreaterOrEqual(t, gate.Stats().InteractiveQueued, 1, "only the real first refresh still needs the lane")
-	baton.release()
+	require.Zero(t, gate.Stats().AdmittedBackground)
+	require.Zero(t, gate.Stats().BackgroundQueued, "no background compactor may race inline Begin")
+	require.GreaterOrEqual(t, gate.Stats().InteractiveQueued, 1, "the real first refresh still needs the lane")
+	releaseLane()
 	f.awaitMutation(t, f.worktree, first)
 	firstRoute := route()
 	firstRow, found, err := catalog.GetViewGeneration(ctx, firstRoute.DirtyGenerationID)
@@ -258,7 +231,7 @@ func TestDefaultWorktreeMutationWaitingForRouteDoesNotBlockRequiredFold(t *testi
 	require.NoError(t, err)
 	require.True(t, found)
 	require.NotEqual(t, capped.CommitGenerationID, firstRow.BaseGenerationID,
-		"a successful direct fallback after the three-second fold budget does not satisfy progress")
+		"a successful direct fallback after inline Begin refusal does not satisfy progress")
 	require.NotContains(t, chain, folded.GenerationID)
 	require.Equal(t, indexer.DirtyLayerGenerationKind, folded.GenerationKind)
 	require.Equal(t, f.checkoutID, folded.CheckoutID)
