@@ -45,6 +45,17 @@ func newRetentionFixture(t *testing.T) retentionFixture {
 	writeFile(t, root, "native/value.go", "package native\n\nimport \"example.com/retain/leaf\"\n\n// Value's type is leaf.New's result.\nvar Value = leaf.New()\n")
 	writeFile(t, root, "top/top.go", "package top\n\nimport \"example.com/retain/native\"\n\n// Use binds native.Value.\nfunc Use() int {\n\tv := native.Value\n\treturn v.N + native.Abs()\n}\n")
 	writeFile(t, root, "side/side.go", "package side\n\nimport \"example.com/retain/native\"\n\n// Side is another root over native.\nfunc Side() int {\n\tw := native.Value\n\treturn w.N\n}\n")
+	// These initial writes completed before the cold listing; they are not
+	// edits racing go list. Avoid relying on filesystem and Go clocks agreeing.
+	// Later warm-up edits keep their actual write times and strict >= guard.
+	stamp := time.Now().Add(-time.Minute)
+	for _, rel := range []string{"leaf/leaf.go", "native/native.go", "native/value.go", "top/top.go", "side/side.go"} {
+		path := filepath.Join(root, rel)
+		require.NoError(t, os.Chtimes(path, stamp, stamp))
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		require.True(t, info.ModTime().Before(time.Now()), "initial fixture timestamp must precede listing: %s", rel)
+	}
 	return retentionFixture{root: root, leaf: leaf, broken: strings.Replace(leaf, "func build() A", "func buildRen0() A", 1)}
 }
 
@@ -99,7 +110,7 @@ func retainedState(t *testing.T, p *Provider, root string) *checkoutTypecheckSta
 func requireRepeatHit(t *testing.T, c *semantic.CompilerCacheStats, lists func() int, before int, step string) {
 	t.Helper()
 	require.Empty(t, c.Bypass, step)
-	require.Equal(t, 1, c.ClosureHits, step)
+	require.Equal(t, 1, c.ClosureHits, "%s: counters=%+v miss=%q package=%q", step, c, c.MissReason, c.MissPackage)
 	require.Equal(t, 0, c.ClosureMisses, "%s: miss %q (%s)", step, c.MissReason, c.MissPackage)
 	require.Equal(t, before, lists(), "%s: no go list", step)
 	require.Equal(t, 0, c.ExportReads, "%s: every import is served from the retained types", step)
