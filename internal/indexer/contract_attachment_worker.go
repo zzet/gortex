@@ -311,6 +311,8 @@ func runContractFollowupPrepared(ctx context.Context, req ContractFollowupReques
 				cfg = override
 			}
 			idx := &Indexer{graph: evidence, rootPath: filepath.Join(string(filepath.Separator), "contract-followup", file.RepoPrefix), repoPrefix: file.RepoPrefix, workspaceID: file.WorkspaceID, projectID: file.ProjectID, config: cfg, logger: logger, registry: req.Registry}
+			opts := snap.RepoExtractionOptions[file.RepoPrefix]
+			idx.extractionOptions.Store(&opts)
 			idx.contractAnalysisOnly = true
 			idx.contractAcceptedFileSource = readSource
 			if reader, ok := snap.Core.(graph.SemanticBindingTypeReader); ok {
@@ -321,6 +323,8 @@ func runContractFollowupPrepared(ctx context.Context, req ContractFollowupReques
 		// A certified empty own namespace still receives a complete empty snapshot.
 		if indexers[snap.Key.RepoPrefix] == nil {
 			idx := &Indexer{graph: evidence, rootPath: "/contract-followup", repoPrefix: snap.Key.RepoPrefix, workspaceID: req.WorkspaceID, projectID: req.ProjectID, config: req.Config, logger: logger, registry: req.Registry}
+			opts := snap.RepoExtractionOptions[snap.Key.RepoPrefix]
+			idx.extractionOptions.Store(&opts)
 			idx.contractAnalysisOnly = true
 			idx.contractAcceptedFileSource = readSource
 			indexers[snap.Key.RepoPrefix] = idx

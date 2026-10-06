@@ -17,15 +17,16 @@ import (
 const contractBoundaryReceiptVersion = "contract-boundary-v1"
 
 // Both receipt producers and consumers use the same accepted policy identity.
-// Omitting the projection field preserves the ordinary full-parser identity.
+// Omitting default projection and parser options preserves the ordinary identity.
 func contractBoundaryPolicy(idx *Indexer, language string, projectionPolicy int) (string, error) {
 	encoded, err := json.Marshal(struct {
 		Config                                    any
 		EventBus                                  any
 		Parser, PostExtraction                    int
 		ContractPolicy, RecordPolicy, MatchPolicy string
-		GeneratedProjectionPolicy                 int `json:",omitempty"`
-	}{contractExtractionSettings(idx.config), idx.eventBusBoundaries(), extractorVersionForLang(language), postExtractionPolicyVersion, contractExtractionPolicyVersion, contracts.RecordFingerprintVersion, contracts.MatchDependencyKeyVersion, projectionPolicy})
+		GeneratedProjectionPolicy                 int      `json:",omitempty"`
+		TemporalEnvHelpers                        []string `json:",omitempty"`
+	}{contractExtractionSettings(idx.config), idx.eventBusBoundaries(), extractorVersionForLang(language), postExtractionPolicyVersion, contractExtractionPolicyVersion, contracts.RecordFingerprintVersion, contracts.MatchDependencyKeyVersion, projectionPolicy, idx.extractionOptionsValue().TemporalEnvHelpers()})
 	if err != nil {
 		return "", err
 	}

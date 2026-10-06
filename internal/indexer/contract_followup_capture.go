@@ -341,6 +341,8 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 			}
 		}
 		idx := &Indexer{config: configs[repo], repoPrefix: repo, registry: options.Registry, logger: options.Logger}
+		opts := extractionOptions[repo]
+		idx.extractionOptions.Store(&opts)
 		policy, e := contractFollowupPolicy(idx, language)
 		if e != nil {
 			return ContractFollowupSnapshot{}, e

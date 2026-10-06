@@ -172,7 +172,11 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			}
 			idx := &Indexer{config: cfg, registry: options.Registry, repoPrefix: repo, workspaceID: file.WorkspaceID, projectID: file.ProjectID, logger: options.Logger}
 			idx.extractionOptions.Store(&opts)
-			receipt, collectErr := collectContractBaselineAcceptedReceipt(ctx, idx, file, accepted)
+			receipt, reused := reuseContractBaselineCurrentReceipt(idx, file, accepted, prior[file.Path])
+			var collectErr error
+			if !reused {
+				receipt, collectErr = collectContractBaselineAcceptedReceipt(ctx, idx, file, accepted)
+			}
 			idx.Close()
 			if collectErr != nil {
 				return collectErr
