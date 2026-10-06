@@ -79,7 +79,7 @@ func (c *contractCapturedCore) VisitNodesByNamesContext(ctx context.Context, nam
 	sort.Strings(repos)
 	stopped := false
 	for _, repo := range repos {
-		if err := graph.VisitNodesByNamesContext(ctx, c.readers[repo], names, func(node *graph.Node) bool {
+		if err := graph.VisitNodesByNamesInRepoContext(ctx, c.readers[repo], names, repo, func(node *graph.Node) bool {
 			if node == nil || node.RepoPrefix != repo {
 				return true
 			}

@@ -76,7 +76,11 @@ func (s *Store) VisitNodesByNamesContext(ctx context.Context, names []string, yi
 }
 
 func (s *Store) visitExactNamesPage(ctx context.Context, payload string, yield func(*graph.Node) bool) (stopped bool, err error) {
-	rows, err := s.db.QueryContext(ctx, exactNamesSeekSQL, payload, s.viewGen)
+	return s.visitExactNamesQuery(ctx, exactNamesSeekSQL, []any{payload, s.viewGen}, yield)
+}
+
+func (s *Store) visitExactNamesQuery(ctx context.Context, query string, args []any, yield func(*graph.Node) bool) (stopped bool, err error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return false, err
 	}
