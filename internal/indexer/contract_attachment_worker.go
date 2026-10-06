@@ -340,11 +340,9 @@ func runContractFollowupPrepared(ctx context.Context, req ContractFollowupReques
 				return report, err
 			}
 			idx := indexers[file.RepoPrefix]
-			if policy, err := contractFollowupPolicy(idx, file.Language); err != nil || policy != file.Policy {
-				if err != nil {
-					return report, err
-				}
-				return report, fmt.Errorf("contract followup: accepted policy mismatch %s", file.Path)
+			projected, err := idx.contractFollowupPolicyMode(file.Language, file.Policy)
+			if err != nil {
+				return report, err
 			}
 			nodes, edges, err := evidence.loadFile(file.Path)
 			if err != nil {
@@ -355,7 +353,14 @@ func runContractFollowupPrepared(ctx context.Context, req ContractFollowupReques
 				return report, err
 			}
 			_, byLanguage := idx.buildPerFileContractExtractors()
-			tree := contracts.ParseTreeForLang(file.Language, src)
+			var tree *parser.ParseTree
+			if projected {
+				if !idx.contractGeneratedCoreProof(file, src, nodes, edges, snap.Core) {
+					return report, fmt.Errorf("contract followup: unproved accepted projection %s", file.Path)
+				}
+			} else {
+				tree = contracts.ParseTreeForLang(file.Language, src)
+			}
 			found := idx.collectContractRecordsForFile(file.Path, src, nodes, edges, byLanguage[file.Language], tree, evidence)
 			if tree != nil {
 				tree.Release()
@@ -629,16 +634,7 @@ func contractFollowupOtherOwners(rows []contracts.Contract, repo string) []contr
 	return out
 }
 func contractFollowupPolicy(idx *Indexer, language string) (string, error) {
-	encoded, err := json.Marshal(struct {
-		Config                                    any
-		EventBus                                  any
-		Parser, PostExtraction                    int
-		ContractPolicy, RecordPolicy, MatchPolicy string
-	}{contractExtractionSettings(idx.config), idx.eventBusBoundaries(), extractorVersionForLang(language), postExtractionPolicyVersion, contractExtractionPolicyVersion, contracts.RecordFingerprintVersion, contracts.MatchDependencyKeyVersion})
-	if err != nil {
-		return "", err
-	}
-	return contractInputHash(encoded), nil
+	return contractBoundaryPolicy(idx, language, 0)
 }
 
 const contractFollowupCompactLimit = 128 << 20

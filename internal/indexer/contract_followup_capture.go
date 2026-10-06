@@ -382,7 +382,14 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 						return ContractFollowupSnapshot{}, graph.ErrContractProjectionIncomplete
 					}
 					if prior.Policy != file.Policy {
-						return ContractFollowupSnapshot{}, graph.ErrContractProjectionStale
+						projected, policyErr := idx.contractFollowupPolicyMode(language, prior.Policy)
+						if policyErr != nil || !projected || !contractGeneratedFileHint(readers[repo].GetNode(path), path) {
+							return ContractFollowupSnapshot{}, graph.ErrContractProjectionStale
+						}
+						// This is an admission hint from the exact accepted receipt
+						// and selected file. The worker revalidates accepted bytes
+						// and every public projection fact before omitting C parsing.
+						file.Policy = prior.Policy
 					}
 					file.SourceFingerprint = row.SourceFingerprint
 					break

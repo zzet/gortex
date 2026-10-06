@@ -16,6 +16,22 @@ import (
 
 const contractBoundaryReceiptVersion = "contract-boundary-v1"
 
+// Both receipt producers and consumers use the same accepted policy identity.
+// Omitting the projection field preserves the ordinary full-parser identity.
+func contractBoundaryPolicy(idx *Indexer, language string, projectionPolicy int) (string, error) {
+	encoded, err := json.Marshal(struct {
+		Config                                    any
+		EventBus                                  any
+		Parser, PostExtraction                    int
+		ContractPolicy, RecordPolicy, MatchPolicy string
+		GeneratedProjectionPolicy                 int `json:",omitempty"`
+	}{contractExtractionSettings(idx.config), idx.eventBusBoundaries(), extractorVersionForLang(language), postExtractionPolicyVersion, contractExtractionPolicyVersion, contracts.RecordFingerprintVersion, contracts.MatchDependencyKeyVersion, projectionPolicy})
+	if err != nil {
+		return "", err
+	}
+	return contractInputHash(encoded), nil
+}
+
 // This receipt records local accepted syntax, not completed contract analysis.
 // Lookup attempts remain inputs even when a local lookup has no result: a later
 // declaration can turn an unresolved endpoint into a real contract.
@@ -99,17 +115,11 @@ func (idx *Indexer) collectContractBoundaryReceipt(ctx context.Context, path, la
 	if err != nil {
 		return contractBoundaryReceipt{}, err
 	}
-	policy, err := json.Marshal(struct {
-		Config                                    any
-		EventBus                                  any
-		Parser, PostExtraction                    int
-		ContractPolicy, RecordPolicy, MatchPolicy string
-		GeneratedProjectionPolicy                 int `json:",omitempty"`
-	}{contractExtractionSettings(idx.config), idx.eventBusBoundaries(), extractorVersionForLang(language), postExtractionPolicyVersion, contractExtractionPolicyVersion, contracts.RecordFingerprintVersion, contracts.MatchDependencyKeyVersion, projectionPolicy})
+	policy, err := contractBoundaryPolicy(idx, language, projectionPolicy)
 	if err != nil {
 		return contractBoundaryReceipt{}, err
 	}
-	receipt := contractBoundaryReceipt{Version: contractBoundaryReceiptVersion, FilePath: path, Language: language, Source: contractInputHash(src), Policy: contractInputHash(policy), Records: fingerprints, HandlerInputs: make(map[string]string), ProducedInputs: make(map[string]string), MatcherInputs: make(map[string]string)}
+	receipt := contractBoundaryReceipt{Version: contractBoundaryReceiptVersion, FilePath: path, Language: language, Source: contractInputHash(src), Policy: policy, Records: fingerprints, HandlerInputs: make(map[string]string), ProducedInputs: make(map[string]string), MatcherInputs: make(map[string]string)}
 	var bodyFacts map[string]contracts.BodyFacts
 	if language == "go" {
 		bodyFacts, err = contracts.GoBodyFactsForFile(ctx, result.Tree, result.Nodes)
