@@ -65,6 +65,12 @@ func (c *contractCapturedCore) LayerContractFileProjectionContext(ctx context.Co
 	}
 	return graph.CompleteContractFileProjection(ctx, reader, repo, files)
 }
+
+// Keep the singleton visitor on the same admitted source dispatcher. The graph
+// helper selects this capability before considering the plural visitor.
+func (c *contractCapturedCore) VisitNodesByNameContext(ctx context.Context, name string, yield func(*graph.Node) bool) error {
+	return c.VisitNodesByNamesContext(ctx, []string{name}, yield)
+}
 func (c *contractCapturedCore) VisitNodesByNamesContext(ctx context.Context, names []string, yield func(*graph.Node) bool) error {
 	repos := make([]string, 0, len(c.readers))
 	for repo := range c.readers {

@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -46,7 +47,7 @@ func contractGeneratedFileHint(node *graph.Node, path string) bool {
 // Selected core rows keep resolver/enrichment metadata and decoded numeric
 // representations. Verify every projection-owned fact without discarding that
 // selected evidence or comparing resolver-added fields with raw extraction.
-func (idx *Indexer) contractGeneratedCoreProof(file ContractFollowupFile, src []byte, nodes []*graph.Node, edges []*graph.Edge, core graph.Reader) bool {
+func (idx *Indexer) contractGeneratedCoreProof(ctx context.Context, file ContractFollowupFile, src []byte, nodes []*graph.Node, edges []*graph.Edge, core graph.Reader) bool {
 	if !idx.contractGeneratedProjectionEligible(file.Language) {
 		return false
 	}
@@ -100,8 +101,9 @@ func (idx *Indexer) contractGeneratedCoreProof(file ContractFollowupFile, src []
 				// quoted include to its selected header file.
 				targetMatches = got.To == "external::tree_sitter/parser.h"
 				if !targetMatches && core != nil {
-					header := core.GetNode(got.To)
-					targetMatches = header != nil && header.Kind == graph.KindFile && header.ID == header.FilePath && strings.HasSuffix(header.FilePath, "/tree_sitter/parser.h")
+					headers, err := graph.ContractSourceNodesContext(ctx, core, []string{got.To})
+					header := headers[got.To]
+					targetMatches = err == nil && header != nil && header.Kind == graph.KindFile && header.ID == header.FilePath && strings.HasSuffix(header.FilePath, "/tree_sitter/parser.h")
 				}
 			}
 			if targetMatches {

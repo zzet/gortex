@@ -360,7 +360,7 @@ func runContractFollowupPrepared(ctx context.Context, req ContractFollowupReques
 			_, byLanguage := idx.buildPerFileContractExtractors()
 			var tree *parser.ParseTree
 			if projected {
-				if !idx.contractGeneratedCoreProof(file, src, nodes, edges, snap.Core) {
+				if !idx.contractGeneratedCoreProof(ctx, file, src, nodes, edges, snap.Core) {
 					return report, fmt.Errorf("contract followup: unproved accepted projection %s", file.Path)
 				}
 			} else {

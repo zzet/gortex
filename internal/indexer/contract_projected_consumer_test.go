@@ -129,7 +129,7 @@ func TestContractProjectedConsumerProofPreservesSelectedEvidence(t *testing.T) {
 	for _, id := range ids {
 		edges = append(edges, outgoing[id]...)
 	}
-	require.True(t, idx.contractGeneratedCoreProof(file, src, nodes, edges, store))
+	require.True(t, idx.contractGeneratedCoreProof(t.Context(), file, src, nodes, edges, store))
 	for _, node := range nodes {
 		if node.Kind == graph.KindFunction {
 			require.Equal(t, "preserved", node.Meta["selected_enrichment"])
@@ -214,7 +214,7 @@ func TestContractProjectedConsumerProofPreservesSelectedEvidence(t *testing.T) {
 				idx.config.IndexGeneratedParsers = true
 				defer func() { idx.config.IndexGeneratedParsers = false }()
 			}
-			require.False(t, idx.contractGeneratedCoreProof(file, candidateSource, selected, selectedEdges, store), "unproved selected evidence cannot certify a projection")
+			require.False(t, idx.contractGeneratedCoreProof(t.Context(), file, candidateSource, selected, selectedEdges, store), "unproved selected evidence cannot certify a projection")
 		})
 	}
 }
