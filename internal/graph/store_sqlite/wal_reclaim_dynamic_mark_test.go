@@ -38,7 +38,27 @@ func TestWALAttemptPromotesWhenItsLogCrossesLastResortMark(t *testing.T) {
 		}}, cleanup
 	}
 	t.Cleanup(func() { walReclaimCreditPassiveQueryerObserver = previousQueryer })
-	s, db := finalBackfillFixture(t)
+	// This test owns one manual attempt. The pressure-triggered periodic
+	// PASSIVE uses the same admission slot even when the reclaim poller is off.
+	// Isolate it before seeding, as in the nearly-backfilled WAL fixture.
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
+	t.Setenv("GORTEX_SQLITE_LAZY_INDEXES", "off")
+	s, _ := openWALReclaimStore(t)
+	t.Cleanup(func() { _ = s.Close() })
+	s.stopCheckpointLoop()
+	manualStop := make(chan struct{})
+	s.stopCheckpoint = manualStop
+	defer close(manualStop)
+	seedWALChurnTable(t, s)
+	db, err := openWALReclaimCheckpointDB(s.dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	_, err = checkpointWALOnceOn(t.Context(), db, "PASSIVE")
+	require.NoError(t, err)
+	s.writeMu.Lock()
+	_, err = s.writerDB.Exec(`UPDATE wal_churn SET payload = 'before' WHERE id = 1`)
+	s.writeMu.Unlock()
+	require.NoError(t, err)
 	target.Store(s)
 	// Seed close to the mark before the bounded attempt starts. Only a few
 	// checked commits after its reader wait are needed to cross it.
@@ -85,7 +105,15 @@ func TestWALAttemptPromotesWhenItsLogCrossesLastResortMark(t *testing.T) {
 	go func() { done <- s.reclaimWALAttempt(cfg, db, path) }()
 	select {
 	case <-waiting:
+	case result := <-done:
+		joined = true
+		t.Fatalf("attempt ended before its pinned reader round: outcome=%s reason=%s%s", result.outcome.String(), result.reason, result.stampSuffix())
 	case <-time.After(5 * time.Second):
+		// Capture the isolated manual owner even when it has not emitted
+		// the expected round yet, so deferred cleanup cancels before joining.
+		s.backgroundCheckpoint.mu.Lock()
+		owned = s.backgroundCheckpoint.active
+		s.backgroundCheckpoint.mu.Unlock()
 		t.Fatal("first attempt never reached its pinned reader round")
 	}
 	s.backgroundCheckpoint.mu.Lock()
