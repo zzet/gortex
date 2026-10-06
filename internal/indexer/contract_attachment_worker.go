@@ -665,6 +665,68 @@ func contractFollowupScratchBytes(dir string) int64 {
 	}
 	return total
 }
+
+// Name imports use a synchronous, read-only selected visitor and private,
+// single-worker evidence; they do not support reentrant scratch mutations.
+// A page preserves the first
+// missing ID and existing scratch precedence, while avoiding one commit per row.
+// Completion markers are installed only after every page and live lookup succeed.
+type contractNameImportPage struct {
+	evidence     *contractFollowupEvidence
+	nodes        []*graph.Node
+	ids          map[string]bool
+	encodedBytes int
+	byteLimit    int
+}
+
+const contractNameImportEnvelopeBytes = len(`{"Nodes":[],"Edges":null}`)
+
+func (p *contractNameImportPage) flush() bool {
+	if len(p.nodes) == 0 {
+		return p.evidence.err == nil
+	}
+	p.evidence.AddBatch(p.nodes, nil)
+	if p.evidence.err != nil {
+		return false
+	}
+	p.nodes = nil
+	p.ids = nil
+	p.encodedBytes = 0
+	return true
+}
+
+func (p *contractNameImportPage) add(node *graph.Node) bool {
+	if p.ids[node.ID] {
+		return true
+	}
+	encoded, err := json.Marshal(node)
+	if err != nil {
+		p.evidence.fail(err)
+		return false
+	}
+	if len(encoded) > p.byteLimit-contractNameImportEnvelopeBytes {
+		p.evidence.fail(graph.ErrContractProjectionLimit)
+		return false
+	}
+	additional := len(encoded)
+	if len(p.nodes) != 0 {
+		additional++ // JSON array separator.
+	}
+	if contractNameImportEnvelopeBytes+p.encodedBytes+additional > p.byteLimit {
+		if !p.flush() {
+			return false
+		}
+		additional = len(encoded)
+	}
+	if p.ids == nil {
+		p.ids = make(map[string]bool)
+	}
+	p.ids[node.ID] = true
+	p.nodes = append(p.nodes, node)
+	p.encodedBytes += additional
+	return len(p.nodes) < contractFrontierReadBatchSize || p.flush()
+}
+
 func (e *contractFollowupEvidence) AddNode(node *graph.Node) { e.AddBatch([]*graph.Node{node}, nil) }
 func (e *contractFollowupEvidence) AddEdge(edge *graph.Edge) { e.AddBatch(nil, []*graph.Edge{edge}) }
 func (e *contractFollowupEvidence) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
@@ -1101,6 +1163,7 @@ func (e *contractFollowupEvidence) FindNodesByNames(names []string) map[string][
 		return nil
 	}
 	count := 0
+	page := contractNameImportPage{evidence: e, byteLimit: contractFollowupCompactLimit}
 	pending := names
 	newCounts := make(map[string]int, len(names))
 	cacheable := e.core != nil
@@ -1155,14 +1218,14 @@ func (e *contractFollowupEvidence) FindNodesByNames(names []string) map[string][
 			return false
 		}
 		if prior[copyNode.ID] == nil {
-			e.AddNode(copyNode)
+			return page.add(copyNode)
 		}
 		return true
 	})
 	if err != nil {
 		e.fail(err)
 	}
-	if e.err != nil {
+	if e.err != nil || !page.flush() {
 		return nil
 	}
 	out := make(map[string][]*graph.Node)
