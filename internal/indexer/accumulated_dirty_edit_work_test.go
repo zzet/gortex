@@ -2,11 +2,9 @@ package indexer
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,35 +13,8 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
-// These tests characterise how much physical work ONE independent edit costs
-// when N other files already differ from the committed base, with the dirty
-// state reached exactly as the daemon reaches it: one working-tree layer build
-// (BuildDirtyLayer over the committed corpus) after every edit, generation
-// after generation.
-//
-// They record, per (layout, case, N): the plan sizes, the extraction parser
-// inputs, admission reads, compiler context, reuse, the store writer's own
-// row accounting and the new generation's physical row census, per-phase wall
-// time, and clean-index parity. They PASS on today's behaviour.
-//
-// The decisive per-edit bounds are asserted only under GX_SUBSECOND_ACCEPT=1,
-// so the red-to-green transition of the true-delta work is an explicit switch:
-//
-//   - extraction parser inputs are 1 + declared context and do not grow with N;
-//   - the new generation's node / edge / symbol-FTS rows are bounded by the
-//     edited file plus the explicitly invalidated closure, independent of N;
-//   - accumulated dirty files are reported reused and are not parser inputs.
-//
-// Optional knobs: GX_SUBSECOND_SIZES (comma list, default "1,25,200"),
-// GX_SUBSECOND_EVERY_EDIT=1 (one intermediate generation per edit at every
-// size; see accumulatedGenerationStride), GX_SUBSECOND_COUNTERS_OUT (a
-// directory the JSON artifact is also copied to) and GX_SUBSECOND_DIRECT=1.
-//
-// The builds run with index.dirty_chain.enabled on: each working-tree build
-// stands on the previous published one when the builder accepts the delta
-// (dirtyChainBuilder), the way the coordinator builds with the switch on.
-// GX_SUBSECOND_DIRECT=1 turns the switch off and measures the direct build,
-// every generation over the committed corpus.
+// Strict clean-index parity for body and comment edits after accumulated changes.
+// The shared records also support the coordinator's deterministic work bounds.
 
 type accumulatedEditCase string
 
@@ -135,14 +106,6 @@ func accumulatedEditSizes(t *testing.T) []int {
 	return sizes
 }
 
-func TestAccumulatedDirtyEditWorkIndependentPackages(t *testing.T) {
-	runAccumulatedDirtyEditWork(t, accumulatedDirtyIndependent)
-}
-
-func TestAccumulatedDirtyEditWorkSamePackage(t *testing.T) {
-	runAccumulatedDirtyEditWork(t, accumulatedDirtySamePackage)
-}
-
 // The clean-parity oracle, asserted. Each case composes its latest-edit
 // generation over the committed corpus and compares it with an independent
 // clean index of the same checkout, surface by surface (see
@@ -155,45 +118,6 @@ func TestAccumulatedDirtyEditCleanParityIndependentPackages(t *testing.T) {
 
 func TestAccumulatedDirtyEditCleanParitySamePackage(t *testing.T) {
 	accumulatedDirtyEditAtSize(t, accumulatedDirtySamePackage, 25, true)
-}
-
-func runAccumulatedDirtyEditWork(t *testing.T, layout accumulatedDirtyLayout) {
-	var records []accumulatedEditRecord
-	for _, n := range accumulatedEditSizes(t) {
-		records = append(records, accumulatedDirtyEditAtSize(t, layout, n, false)...)
-	}
-	for _, r := range records {
-		w := r.Work
-		t.Logf("chain layout=%s case=%s N=%d chained=%t parent=%d depth=%d fallback=%q manifest_rows=%d chain=%v compactions=%d fallbacks=%v",
-			r.Layout, r.Case, r.Accumulated, r.Chained, w.ParentGenerationID, w.ChainDepth, w.ChainFallbackReason,
-			w.ManifestEntriesWritten, r.Chain, r.Compactions, r.Fallbacks)
-		t.Logf("counters layout=%s case=%s N=%d gen=%d plan{indexed=%d context=%d closure=%d deleted=%d output=%d} "+
-			"parser{inputs=%d opens=%d bytes=%d accumulated_parsed=%d} admission{stats=%d opens=%d bytes=%d} "+
-			"compiler{requested=%t measured=%t pkgs=%d files=%d} reuse{reused=%d rebuilt=%d} "+
-			"store{window=%t stmt_rows=%d bulk_nodes=%d bulk_edges=%d batches=%d} "+
-			"census{nodes=%d edges=%d symbol_fts=%d files=%d file_masks=%d node_files=%d total=%d} "+
-			"elapsed_ms=%.1f parity=%t",
-			r.Layout, r.Case, r.Accumulated, r.GenerationID,
-			w.PlanIndexed, w.PlanContext, w.PlanClosure, w.PlanDeleted, w.PlanOutput,
-			w.ParserInputs, w.ParserInputOpens, w.ParserInputBytes, r.AccumulatedRead,
-			w.AdmissionStats, w.AdmissionOpens, w.AdmissionOpenBytes,
-			w.CompilerContext.Requested, w.CompilerContext.Measured, w.CompilerContext.Packages, w.CompilerContext.Files,
-			w.ReusedPriorPayloadFiles, w.RebuiltFiles,
-			w.StoreMeasured, w.Store.StatementRowChanges, w.Store.BulkNodeRows, w.Store.BulkEdgeRows, w.Store.Batches,
-			r.Census.Tables["nodes"], r.Census.Tables["edges"], r.Census.Tables["symbol_fts_rowid"],
-			r.Census.Tables["files"], r.Census.Tables["generation_file_masks"], r.Census.NodeFiles, r.CensusTotal,
-			r.ElapsedMS, r.Parity.ok())
-		var phases []string
-		for _, p := range w.Phases {
-			phases = append(phases, fmt.Sprintf("%s=%.1fms", p.Name, ms(p.Duration)))
-		}
-		t.Logf("phases layout=%s case=%s N=%d %s", r.Layout, r.Case, r.Accumulated, strings.Join(phases, " "))
-	}
-	writeAccumulatedEditArtifact(t, layout, records)
-
-	if os.Getenv("GX_SUBSECOND_ACCEPT") == "1" {
-		assertAccumulatedEditBounds(t, records)
-	}
 }
 
 // accumulatedDirtyEditAtSize builds the base, accumulates n dirty body edits
@@ -314,78 +238,4 @@ func accumulatedGenerationStride(n int) int {
 		return 1
 	}
 	return max(1, n/25)
-}
-
-func writeAccumulatedEditArtifact(t *testing.T, layout accumulatedDirtyLayout, records []accumulatedEditRecord) {
-	t.Helper()
-	data, err := json.MarshalIndent(struct {
-		Layout  accumulatedDirtyLayout  `json:"layout"`
-		Records []accumulatedEditRecord `json:"records"`
-	}{layout, records}, "", "  ")
-	if err != nil {
-		t.Fatalf("marshal counters: %v", err)
-	}
-	name := "accumulated-dirty-edit-work-" + string(layout) + ".json"
-	path := filepath.Join(t.TempDir(), name)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
-	t.Logf("counters artifact: %s", path)
-	if dir := os.Getenv("GX_SUBSECOND_COUNTERS_OUT"); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatalf("mkdir %s: %v", dir, err)
-		}
-		out := filepath.Join(dir, name)
-		if err := os.WriteFile(out, data, 0o644); err != nil {
-			t.Fatalf("write %s: %v", out, err)
-		}
-		t.Logf("counters artifact copied: %s", out)
-	}
-}
-
-// assertAccumulatedEditBounds holds the true per-edit bounds. It is expected
-// to fail until the builder plans against the previous published dirty state
-// and physically reuses unchanged payload.
-func assertAccumulatedEditBounds(t *testing.T, records []accumulatedEditRecord) {
-	t.Helper()
-	smallest := map[string]accumulatedEditRecord{}
-	for _, r := range records {
-		key := string(r.Layout) + "/" + string(r.Case)
-		if prev, ok := smallest[key]; !ok || r.Accumulated < prev.Accumulated {
-			smallest[key] = r
-		}
-	}
-	for _, r := range records {
-		w := r.Work
-		if w.ParserInputs > 1+w.PlanContext {
-			t.Errorf("%s/%s N=%d: %d parser inputs, want at most 1 + %d declared context",
-				r.Layout, r.Case, r.Accumulated, w.ParserInputs, w.PlanContext)
-		}
-		if r.AccumulatedRead != 0 {
-			t.Errorf("%s/%s N=%d: %d accumulated dirty files were parser inputs, want 0",
-				r.Layout, r.Case, r.Accumulated, r.AccumulatedRead)
-		}
-		if w.ReusedPriorPayloadFiles < r.Accumulated {
-			t.Errorf("%s/%s N=%d: %d files reported reused, want at least the %d accumulated dirty files",
-				r.Layout, r.Case, r.Accumulated, w.ReusedPriorPayloadFiles, r.Accumulated)
-		}
-		base := smallest[string(r.Layout)+"/"+string(r.Case)]
-		if r.Accumulated == base.Accumulated {
-			continue
-		}
-		if w.ParserInputs != base.Work.ParserInputs {
-			t.Errorf("%s/%s: parser inputs %d at N=%d vs %d at N=%d, want independent of N",
-				r.Layout, r.Case, w.ParserInputs, r.Accumulated, base.Work.ParserInputs, base.Accumulated)
-		}
-		for _, table := range []string{"nodes", "edges", "symbol_fts_rowid"} {
-			if got, want := r.Census.Tables[table], base.Census.Tables[table]; got != want {
-				t.Errorf("%s/%s: %s rows %d at N=%d vs %d at N=%d, want independent of N",
-					r.Layout, r.Case, table, got, r.Accumulated, want, base.Accumulated)
-			}
-		}
-		if got, limit := r.Census.NodeFiles, int64(1+w.PlanContext); got > limit {
-			t.Errorf("%s/%s N=%d: node rows at %d files, want at most the edited file plus %d context",
-				r.Layout, r.Case, r.Accumulated, got, w.PlanContext)
-		}
-	}
 }

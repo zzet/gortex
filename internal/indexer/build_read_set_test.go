@@ -5,8 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 	"testing"
 	"time"
 
@@ -199,73 +197,4 @@ func TestWithBuildReadSetCoversPackagesAndAncestorManifests(t *testing.T) {
 	if _, ok := buildReadSetFrom(context.Background()); ok {
 		t.Fatal("a context without a read set reported one")
 	}
-}
-
-// TestPrepublishReadSetCostOnARealCheckout compares the two prepublish fences
-// on a real checkout: the full re-sample (git status over the whole working
-// tree, plus the dirty-content fingerprint) against the read-set
-// confirmation of one build's read set. Opt-in:
-//
-//	GORTEX_TEST_READ_SET_ROOT   a git checkout with a working-tree edit
-//	GORTEX_TEST_READ_SET_PATHS  a file listing the build's indexed paths
-//	GORTEX_TEST_READ_SET_CHANGED the changed one of them (the rest are context)
-func TestPrepublishReadSetCostOnARealCheckout(t *testing.T) {
-	root, list := os.Getenv("GORTEX_TEST_READ_SET_ROOT"), os.Getenv("GORTEX_TEST_READ_SET_PATHS")
-	if root == "" || list == "" {
-		t.Skip("set GORTEX_TEST_READ_SET_ROOT and GORTEX_TEST_READ_SET_PATHS")
-	}
-	raw, err := os.ReadFile(list)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var indexed []string
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			indexed = append(indexed, line)
-		}
-	}
-	sampler, err := gitstate.NewDirtySampler(root, "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	before, err := sampler.Sample(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	changed := os.Getenv("GORTEX_TEST_READ_SET_CHANGED")
-	var contextPaths []string
-	for _, p := range indexed {
-		if p != changed {
-			contextPaths = append(contextPaths, p)
-		}
-	}
-	set, _ := buildReadSetFrom(withBuildReadSet(ctx, indexed, contextPaths, nil))
-	const rounds = 15
-	var full, read []time.Duration
-	var last gitstate.ReadSetConfirmation
-	for i := 0; i < rounds; i++ {
-		started := time.Now()
-		after, err := sampler.Sample(ctx)
-		full = append(full, time.Since(started))
-		if err != nil || after.Fingerprint != before.Fingerprint {
-			t.Fatalf("the checkout moved during the probe: %v", err)
-		}
-		started = time.Now()
-		last, err = sampler.ConfirmReadSet(ctx, before, set.files, set.dirs)
-		read = append(read, time.Since(started))
-		if err != nil || !last.Confirmed {
-			t.Fatalf("read set not confirmed: %+v %v", last, err)
-		}
-	}
-	median := func(d []time.Duration) (time.Duration, time.Duration, time.Duration) {
-		s := append([]time.Duration(nil), d...)
-		sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
-		return s[0], s[len(s)/2], s[len(s)-1]
-	}
-	fMin, fMed, fMax := median(full)
-	rMin, rMed, rMax := median(read)
-	t.Logf("indexed=%d read_files=%d read_dirs=%d checked_files=%d dirty=%d", len(indexed), len(set.files), len(set.dirs), last.Files, len(before.Contents))
-	t.Logf("full re-sample:        min %v  median %v  max %v", fMin, fMed, fMax)
-	t.Logf("read-set confirmation: min %v  median %v  max %v", rMin, rMed, rMax)
 }

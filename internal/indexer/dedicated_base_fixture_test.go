@@ -2,7 +2,6 @@ package indexer
 
 import (
 	"context"
-	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
-	"github.com/zzet/gortex/internal/graphview"
 )
 
 // The real-repository harness in the production shape: the corpus is a
@@ -103,56 +101,4 @@ func editDeltaRealDedicatedBase(t *testing.T, tree, storePath string, cfg config
 	}
 	t.Logf("dedicated base %d of %s: %s", id, tree, time.Since(started))
 	return id
-}
-
-// useDedicatedBase makes every build of h stand on a materialized view of
-// the dedicated base generation (a direct build) or of the chain's top (a
-// chained one), opened the way the coordinator opens it (ancestryLayerBase).
-func (h *dirtyChainBuilder) useDedicatedBase(base int64) {
-	materializer := &graphview.Materializer{Store: h.store, Catalog: h.store.Catalog(), Leases: graphview.NewLeaseManager(), Logger: zap.NewNop()}
-	opener := &CheckoutCoordinator{store: h.store}
-	h.rootGeneration = base
-	h.open = func(ctx context.Context, generationID int64) (LayerBase, func(), error) {
-		view, err := materializer.MaterializeRefView(ctx, editDeltaRealDedicatedGraph, generationID)
-		if err != nil {
-			return nil, nil, err
-		}
-		return opener.ancestryLayerBase(view), view.Close, nil
-	}
-}
-
-// editDeltaRealCheckStackKey confirms, for one edit in the dedicated-base
-// shape, that the per-stack caches were on and the chain was applied over
-// them: the delta has a key, a chained edit keeps the key of the edit before
-// it, and it composed every layer of its parent chain. It logs the key (as a
-// short digest), the layers overlaid and the contract registry's load, which
-// stays keyed by the whole stack and so reloads on every chained edit. It
-// returns the key for the next edit.
-func editDeltaRealCheckStackKey(t *testing.T, rel string, edit int, delta *EditDeltaReport, chain []int64, prevKey string) string {
-	t.Helper()
-	if delta == nil {
-		t.Errorf("%s edit %d: no edit delta", rel, edit)
-		return prevKey
-	}
-	var registry time.Duration
-	for _, phase := range delta.Phases {
-		if phase.Name == "contract_registry" {
-			registry += phase.Duration
-		}
-	}
-	digest := fnv.New64a()
-	_, _ = digest.Write([]byte(delta.StackCacheKey))
-	t.Logf("%s edit %d: stack key %016x (%d bytes) overlaid=%d chain=%d contract_registry=%.1fms cached=%t",
-		rel, edit, digest.Sum64(), len(delta.StackCacheKey), delta.ChainLayersOverlaid, len(chain),
-		float64(registry.Microseconds())/1000, delta.ContractRegistryCached)
-	if delta.StackCacheKey == "" {
-		t.Errorf("%s edit %d: the delta had no per-stack key: the caches were off", rel, edit)
-	}
-	if want := len(chain) - 1; delta.ChainLayersOverlaid != want {
-		t.Errorf("%s edit %d: overlaid %d chain layers, want %d", rel, edit, delta.ChainLayersOverlaid, want)
-	}
-	if len(chain) > 1 && prevKey != "" && delta.StackCacheKey != prevKey {
-		t.Errorf("%s edit %d: a chained edit moved the per-stack key", rel, edit)
-	}
-	return delta.StackCacheKey
 }

@@ -1,3 +1,5 @@
+//go:build performance
+
 package indexer_test
 
 import (
@@ -23,7 +25,7 @@ import (
 	"github.com/zzet/gortex/internal/parser/languages"
 )
 
-// TestBackendBench cold-indexes GORTEX_BENCH_ROOT through the full indexer
+// TestPerformanceBackendBench cold-indexes GORTEX_BENCH_ROOT through the full indexer
 // pipeline into the sink named by GORTEX_BENCH_BACKEND, then runs a fixed
 // query workload. Reports cold-index time, graph size, process RSS, and query
 // throughput. "sqlite" is the shipping store; "memory" is not a backend any
@@ -32,8 +34,8 @@ import (
 //
 //	GORTEX_BENCH_ROOT=/path/to/gortex \
 //	GORTEX_BENCH_BACKEND=sqlite \
-//	  go test ./internal/indexer/ -run TestBackendBench -timeout 40m -v
-func TestBackendBench(t *testing.T) {
+//	  go test -tags performance ./internal/indexer/ -run TestPerformanceBackendBench -timeout 40m -v
+func TestPerformanceBackendBench(t *testing.T) {
 	root := os.Getenv("GORTEX_BENCH_ROOT")
 	if root == "" {
 		t.Skip("bench harness; set GORTEX_BENCH_ROOT=<repo> and GORTEX_BENCH_BACKEND=memory|sqlite")

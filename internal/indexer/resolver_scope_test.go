@@ -1,6 +1,9 @@
 package indexer
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -235,4 +238,52 @@ func TestResolverEvidenceScopeSwitchIsHashExempt(t *testing.T) {
 		assert.Equal(t, unset, fingerprint, "resolver_evidence_scope=%v changed the config fingerprint", value)
 		assert.Equal(t, value, owned.ResolverEvidenceScopeEnabled(), "the frozen snapshot lost the switch (%v)", value)
 	}
+}
+
+func realRepoDurableDigest(t *testing.T, store *store_sqlite.Store) map[string]string {
+	t.Helper()
+	db := parityOpenRaw(t, store)
+	queries := map[string]string{
+		"edges": `SELECT from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier,
+			cross_repo, view_gen, hex(meta), resolve_terminal, resolve_terminal_reason, semantic_source
+			FROM edges ORDER BY from_id, to_id, kind, file_path, line, view_gen`,
+		"nodes": `SELECT id, view_gen, kind, name, qual_name, file_path, start_line, end_line, start_column, end_column,
+			language, repo_prefix, workspace_id, project_id, signature, visibility, doc, external, return_type,
+			is_async, is_static, is_abstract, is_exported, data_class, clone_sig, hex(meta), semantic_type,
+			semantic_source, entry_point, entry_point_kind
+			FROM nodes ORDER BY id, view_gen`,
+		"ref_facts": `SELECT * FROM ref_facts ORDER BY view_gen, repo_prefix, from_id, to_id, kind, line, file_path`,
+	}
+	out := make(map[string]string, len(queries)*2)
+	for name, query := range queries {
+		rows, err := db.Query(query)
+		if err != nil {
+			t.Fatalf("digest %s: %v", name, err)
+		}
+		cols, _ := rows.Columns()
+		values := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		h := sha256.New()
+		count := 0
+		for rows.Next() {
+			if err := rows.Scan(ptrs...); err != nil {
+				t.Fatalf("digest %s scan: %v", name, err)
+			}
+			for _, v := range values {
+				fmt.Fprintf(h, "%v\x1f", v)
+			}
+			h.Write([]byte{'\n'})
+			count++
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("digest %s rows: %v", name, err)
+		}
+		_ = rows.Close()
+		out[name] = hex.EncodeToString(h.Sum(nil))
+		out[name+"_rows"] = fmt.Sprint(count)
+	}
+	return out
 }
