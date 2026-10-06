@@ -157,7 +157,13 @@ func (c *CheckoutCoordinator) flattenDirtyChainChecked(
 		c.abandonCopiedGeneration(context.WithoutCancel(ctx), generationID)
 	}
 	if err != nil {
-		abandon()
+		if errors.Is(err, errFoldDestinationNotOwned) {
+			// A concurrent physical owner, or its already-ready result, was
+			// never ours to fail or retire. Only this attempt is refused.
+			phases.fail()
+		} else {
+			abandon()
+		}
 		return dirtyLayerBuild{}, nil, fmt.Errorf("indexer: fold working-tree chain %v: %w", oldestFirst, err)
 	}
 	phases.next("manifest_write")

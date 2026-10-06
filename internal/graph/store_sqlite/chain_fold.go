@@ -88,6 +88,10 @@ type ChainFoldRequest struct {
 	// StepTarget may request smaller transactions for a fold sharing the writer
 	// with frequent interactive edits. Zero retains the default target.
 	StepTarget time.Duration
+	// BuildFlight optionally borrows the caller's live destination leader.
+	// The caller retains it across Begin retries and through publication/landing;
+	// neither a refused Begin nor Release completes borrowed ownership.
+	BuildFlight *PayloadBuildFlight
 }
 
 // chainFoldPhase is where in a member the fold is.
@@ -105,13 +109,14 @@ const (
 // ChainFold is one fold in progress. Its methods are not safe for concurrent
 // use; one caller drives it.
 type ChainFold struct {
-	s      *Store
-	chain  []int64
-	to     int64
-	owner  string
-	flight *PayloadBuildFlight
-	shapes []payloadTableShape
-	keys   [][]string // per shape: the page key columns
+	s              *Store
+	chain          []int64
+	to             int64
+	owner          string
+	flight         *PayloadBuildFlight
+	borrowedFlight bool
+	shapes         []payloadTableShape
+	keys           [][]string // per shape: the page key columns
 
 	member int // index into chain, from the top down
 	phase  chainFoldPhase
@@ -206,15 +211,30 @@ func (s *Store) BeginChainFold(ctx context.Context, req ChainFoldRequest) (*Chai
 			return fail(fmt.Errorf("%w: member %d is not ready", ErrChainFoldStale, id))
 		}
 	}
-	flight, leader, _, err := s.JoinPayloadBuildFlight(ctx, req.To, false)
-	if err != nil {
-		return fail(fmt.Errorf("%w: %v", ErrChainFoldStale, err))
+	flight := req.BuildFlight
+	borrowed := flight != nil
+	if borrowed {
+		if err := s.validatePayloadBuildFlight(flight, req.To); err != nil {
+			return fail(err)
+		}
+	} else {
+		var leader bool
+		var err error
+		flight, leader, _, err = s.JoinPayloadBuildFlight(ctx, req.To, false)
+		if err != nil {
+			return fail(fmt.Errorf("%w: %v", ErrChainFoldStale, err))
+		}
+		if !leader {
+			return fail(fmt.Errorf("%w: generation %d has another writer", ErrChainFoldBusy, req.To))
+		}
 	}
-	if !leader {
-		return fail(fmt.Errorf("%w: generation %d has another writer", ErrChainFoldBusy, req.To))
+	complete := func(err error) {
+		if !borrowed {
+			flight.Complete(err)
+		}
 	}
 	f := &ChainFold{
-		s: s, chain: append([]int64(nil), req.Chain...), to: req.To, owner: req.Owner, flight: flight, stepTarget: req.StepTarget,
+		s: s, chain: append([]int64(nil), req.Chain...), to: req.To, owner: req.Owner, flight: flight, borrowedFlight: borrowed, stepTarget: req.StepTarget,
 		member: len(req.Chain) - 1, phase: foldPhasePrepare,
 		hiddenPaths: map[string]struct{}{}, hiddenIDs: map[string]struct{}{}, hiddenSources: map[string]struct{}{},
 	}
@@ -224,7 +244,7 @@ func (s *Store) BeginChainFold(ctx context.Context, req ChainFoldRequest) (*Chai
 	// foreground writes before the first fold step can begin.
 	metadata, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		flight.Complete(err)
+		complete(err)
 		return fail(err)
 	}
 	prepare := func() error {
@@ -282,7 +302,7 @@ func (s *Store) BeginChainFold(ctx context.Context, req ChainFoldRequest) (*Chai
 		})
 	}
 	if err := prepare(); err != nil {
-		flight.Complete(err)
+		complete(err)
 		return fail(err)
 	}
 	return f, nil
@@ -767,14 +787,17 @@ func (f *ChainFold) InterruptionCounts() (transactions, budgetReductions int) {
 	return f.interruptedPages, f.pageBackoffs
 }
 
-// Release ends the fold: the members are no longer held and `to` loses its
-// writer (the caller publishes it first, or abandons it).
+// Release ends the fold: the members are no longer held and its own writer
+// completes (the caller publishes it first, or abandons it). A borrowed writer
+// remains the caller's until the result is installed or abandoned.
 func (f *ChainFold) Release(ctx context.Context) error {
 	if f.released {
 		return nil
 	}
 	f.released = true
-	f.flight.Complete(nil)
+	if !f.borrowedFlight {
+		f.flight.Complete(nil)
+	}
 	s := f.s
 	s.chainFold.mu.Lock()
 	s.chainFold.members = nil

@@ -29,6 +29,25 @@ type PayloadBuildFlight struct {
 	leader       bool
 }
 
+// validatePayloadBuildFlight refuses borrowing stale, foreign, or follower
+// ownership. The caller must keep the leader live until the borrower releases
+// its operation and the caller has installed the resulting generation.
+func (s *Store) validatePayloadBuildFlight(f *PayloadBuildFlight, generationID int64) error {
+	if f == nil || f.core != s.storeCore || f.generationID != generationID || !f.leader || f.state == nil {
+		return fmt.Errorf("%w: invalid borrowed payload build flight", ErrCatalogInvalidValue)
+	}
+	current, ok := s.payloadBuildFlights.Load(generationID)
+	if !ok || current != f.state {
+		return fmt.Errorf("%w: borrowed payload build flight is no longer active", ErrCatalogInvalidValue)
+	}
+	select {
+	case <-f.state.done:
+		return fmt.Errorf("%w: borrowed payload build flight has completed", ErrCatalogInvalidValue)
+	default:
+	}
+	return nil
+}
+
 // JoinPayloadBuildFlight coalesces physical payload construction by catalog
 // generation ID. The returned booleans are mutually exclusive:
 //

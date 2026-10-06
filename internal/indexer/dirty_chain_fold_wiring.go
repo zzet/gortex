@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -53,12 +54,27 @@ const compactionYieldCheckoutMutation = "synchronous checkout mutation"
 // storeChainFoldBackend is chainFoldBackend over the store.
 type storeChainFoldBackend struct{ store *store_sqlite.Store }
 
+// foldDestinationOwnership belongs to one compaction attempt, rather than
+// one Begin call. Its Store flight protects the output even with no reader
+// lease manager, across retry gaps and publication-to-landing handoff.
+type foldDestinationOwnership struct {
+	flight *store_sqlite.PayloadBuildFlight
+}
+
+type foldDestinationOwnershipKey struct{}
+
+var errFoldDestinationNotOwned = errors.New("indexer: folded destination has another owner or is already ready")
+
 func (b storeChainFoldBackend) BeginChainFold(ctx context.Context, chain []int64, to int64, owner string) (chainFoldSteps, error) {
 	target := time.Duration(0)
 	if fold, _ := ctx.Value(importFoldPublicationKey{}).(*importFoldPublication); fold != nil {
 		target = 10 * time.Millisecond
 	}
-	fold, err := b.store.BeginChainFold(ctx, store_sqlite.ChainFoldRequest{Chain: chain, To: to, Owner: owner, StepTarget: target})
+	var flight *store_sqlite.PayloadBuildFlight
+	if destination, _ := ctx.Value(foldDestinationOwnershipKey{}).(*foldDestinationOwnership); destination != nil {
+		flight = destination.flight
+	}
+	fold, err := b.store.BeginChainFold(ctx, store_sqlite.ChainFoldRequest{Chain: chain, To: to, Owner: owner, StepTarget: target, BuildFlight: flight})
 	if err != nil {
 		return nil, err
 	}
@@ -98,6 +114,16 @@ func (c *CheckoutCoordinator) foldingChain() []int64 {
 // copyChainInSteps is the stepped copier: the store's ChainFold, stepped to
 // its end. While it runs the chain is published as the folding chain.
 func (c *CheckoutCoordinator) copyChainInSteps(ctx context.Context, oldestFirst []int64, to int64) (store_sqlite.GenerationCopyCounts, func(context.Context, bool), error) {
+	if destination, _ := ctx.Value(foldDestinationOwnershipKey{}).(*foldDestinationOwnership); destination != nil {
+		flight, leader, ready, err := c.store.JoinPayloadBuildFlight(ctx, to, false)
+		if err != nil {
+			return store_sqlite.GenerationCopyCounts{}, nil, err
+		}
+		if !leader || ready {
+			return store_sqlite.GenerationCopyCounts{}, nil, fmt.Errorf("%w: generation %d", errFoldDestinationNotOwned, to)
+		}
+		destination.flight = flight
+	}
 	backend := c.foldBackend()
 	watch := c.newFoldStepWatch(to)
 	fold, beginRetries, err := beginChainFoldWatched(ctx, backend, oldestFirst, to, c.checkoutID, watch)
@@ -264,6 +290,18 @@ func (c *CheckoutCoordinator) compactDirtyChainStepped(
 	ctx context.Context, trigger CheckoutCycle, commit store_sqlite.ViewGeneration, route store_sqlite.CheckoutRoute,
 	report *DirtyChainCompaction, stopYielding, releaseLane func(),
 ) string {
+	destination := &foldDestinationOwnership{}
+	ctx = context.WithValue(ctx, foldDestinationOwnershipKey{}, destination)
+	defer func() {
+		// A published result is now routed, preferred, or retained; an
+		// abandoned result has already been failed and offered to retirement.
+		// Only this final handoff releases the destination's physical owner.
+		err := report.Err
+		if report.Canceled && err == nil {
+			err = ctx.Err()
+		}
+		destination.flight.Complete(err)
+	}()
 	k := &c.compaction
 	k.mu.Lock()
 	k.foldOwner = k.running
@@ -330,7 +368,7 @@ func (c *CheckoutCoordinator) compactDirtyChainStepped(
 	case ctx.Err() != nil:
 		report.Outcome, report.Canceled = dirtyChainCompactionCanceled, true
 	case errors.Is(err, errFlattenRefused), errors.Is(err, store_sqlite.ErrChainFoldBusy), errors.Is(err, store_sqlite.ErrChainFoldStale),
-		errors.Is(err, errChainFoldStarved):
+		errors.Is(err, errChainFoldStarved), errors.Is(err, errFoldDestinationNotOwned):
 		c.logger.Debug("checkout coordinator: stepped chain fold refused; the chain stays routed",
 			zap.String("checkout", c.checkoutID), zap.Error(err))
 		report.Outcome, report.Err = dirtyChainCompactionFoldRefused, err
