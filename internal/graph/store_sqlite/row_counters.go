@@ -151,6 +151,21 @@ func (s *Store) EnsureRowCounters(ctx context.Context) error {
 	}
 	s.rowCountersInstall.Lock()
 	defer s.rowCountersInstall.Unlock()
+	// Adopting an already seeded installation reads only its state and trigger
+	// metadata. Edit-lane yielding applies to the expensive seed below, not to
+	// recognizing counters that persisted safely across a reopen.
+	ok, err := s.rowCountersInstalled(ctx)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ok {
+		s.rowCountersReady.Store(true)
+		return nil
+	}
+	s.rowCountersReady.Store(false)
 	// Background work: it never starts while an edit cycle holds the build
 	// lane, and its seed count (seconds of reads on a large store) is
 	// cancelled when one starts; the lazy loop retries at its next poll.
@@ -166,15 +181,6 @@ func (s *Store) EnsureRowCounters(ctx context.Context) error {
 			s.walReclaim.cycle.yields.Add(1)
 		}
 	}()
-	ok, err := s.rowCountersInstalled(ctx)
-	if err != nil {
-		return err
-	}
-	if ok {
-		s.rowCountersReady.Store(true)
-		return nil
-	}
-	s.rowCountersReady.Store(false)
 	started := time.Now()
 	// Reserve the read connection before taking the writer. Acquiring it
 	// while holding the gate would wait behind long pool readers and stall
