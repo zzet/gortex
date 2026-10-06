@@ -56,8 +56,10 @@ type viewBuildWaiter struct {
 	ready      chan struct{}
 	priority   ViewBuildPriority
 	enqueuedAt time.Time
-	granted    bool
-	canceled   bool
+	// backgroundAgeCredit affects scheduling only; wait metrics use enqueuedAt.
+	backgroundAgeCredit time.Duration
+	granted             bool
+	canceled            bool
 	// demand and promotionRequested are guarded by the gate mutex.
 	demand             <-chan struct{}
 	promotionRequested bool
@@ -280,6 +282,16 @@ func (g *ViewBuildGate) AcquirePromotable(ctx context.Context, priority ViewBuil
 // order is arrival. rank must not block or take a lock that is held while
 // calling into the gate.
 func (g *ViewBuildGate) AcquireRanked(ctx context.Context, priority ViewBuildPriority, demand <-chan struct{}, rank func() int64) (func(), error) {
+	return g.acquireRanked(ctx, priority, demand, rank, 0)
+}
+
+// acquireRetirement carries offered-debt age across bounded service turns.
+// It changes neither background FIFO nor the foreground burst guarantee.
+func (g *ViewBuildGate) acquireRetirement(ctx context.Context, debtAge time.Duration) (func(), error) {
+	return g.acquireRanked(ctx, ViewBuildBackground, nil, nil, debtAge)
+}
+
+func (g *ViewBuildGate) acquireRanked(ctx context.Context, priority ViewBuildPriority, demand <-chan struct{}, rank func() int64, backgroundAgeCredit time.Duration) (func(), error) {
 	if g == nil {
 		return func() {}, nil
 	}
@@ -293,6 +305,12 @@ func (g *ViewBuildGate) AcquireRanked(ctx context.Context, priority ViewBuildPri
 	promotionRequested := false
 
 	g.mu.Lock()
+	if priority != ViewBuildBackground || backgroundAgeCredit < 0 {
+		backgroundAgeCredit = 0
+	}
+	if backgroundAgeCredit > g.backgroundStarvation {
+		backgroundAgeCredit = g.backgroundStarvation
+	}
 	// Restore the invariant before evaluating the immediate path. Normally all
 	// state transitions already call grantNextLocked.
 	g.grantNextLocked()
@@ -347,12 +365,13 @@ func (g *ViewBuildGate) AcquireRanked(ctx context.Context, priority ViewBuildPri
 	}
 
 	waiter := &viewBuildWaiter{
-		ready:              make(chan struct{}),
-		priority:           priority,
-		enqueuedAt:         time.Now(),
-		demand:             demand,
-		promotionRequested: promotionRequested,
-		rank:               rank,
+		ready:               make(chan struct{}),
+		priority:            priority,
+		enqueuedAt:          time.Now(),
+		backgroundAgeCredit: backgroundAgeCredit,
+		demand:              demand,
+		promotionRequested:  promotionRequested,
+		rank:                rank,
 	}
 	if priority == ViewBuildInteractive {
 		g.interactive = append(g.interactive, waiter)
@@ -508,7 +527,7 @@ func (g *ViewBuildGate) grantNextLocked() {
 		var waiter *viewBuildWaiter
 		switch {
 		case len(g.interactive) > 0 && (len(g.background) == 0 || g.interactiveBurst < maxInteractiveBuildBurst ||
-			now.Sub(g.background[0].enqueuedAt) < g.backgroundStarvation):
+			now.Sub(g.background[0].enqueuedAt)+g.background[0].backgroundAgeCredit < g.backgroundStarvation):
 			// Interactive first. Queued background work overtakes only once
 			// a burst of interactive grants has passed AND it has waited
 			// past the starvation bound.

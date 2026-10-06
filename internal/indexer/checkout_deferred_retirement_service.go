@@ -45,7 +45,11 @@ func (l *CheckoutLifecycle) serveDeferredRetirementBurst(
 	owners map[int64]*CheckoutCoordinator, discoveryErr error,
 ) (retired int, pending bool, err error) {
 	queuedAt := time.Now()
-	release, err := gate.Acquire(ctx, ViewBuildBackground)
+	debtAge := time.Duration(0)
+	if since := l.deferredRetirementEligibleSince.Load(); since != 0 {
+		debtAge = queuedAt.Sub(time.Unix(0, since))
+	}
+	release, err := gate.acquireRetirement(ctx, debtAge)
 	if err != nil {
 		return 0, true, errors.Join(discoveryErr, err)
 	}
