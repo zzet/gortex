@@ -29,6 +29,8 @@ type sourceSearchFile struct {
 	overlay  bool
 }
 
+type sourceSearchRead func(string, int64) ([]byte, physicalReadEvidence, error)
+
 func (s *Server) sourceSearchIndexer(view *requestView) *indexer.Indexer {
 	if s.multiIndexer != nil {
 		return s.multiIndexer.GetIndexer(view.sourceRepoPrefix)
@@ -62,6 +64,10 @@ func (s *Server) validateSourceCheckoutIdentity(ctx context.Context, view *reque
 // list of returned hits as a completeness proof. A moving scope retries inside
 // the original absolute budget; resource/read errors make no complete claim.
 func (s *Server) sourceSearchSnapshot(ctx context.Context, view *requestView, pathFilters []string, resolved ResolvedScope) ([]sourceSearchFile, error) {
+	return s.sourceSearchSnapshotWithReader(ctx, view, pathFilters, resolved, readPhysicalFileEvidenceBounded)
+}
+
+func (s *Server) sourceSearchSnapshotWithReader(ctx context.Context, view *requestView, pathFilters []string, resolved ResolvedScope, read sourceSearchRead) ([]sourceSearchFile, error) {
 	idx := s.sourceSearchIndexer(view)
 	if idx == nil {
 		return nil, fmt.Errorf("source search has no owning indexer")
@@ -102,7 +108,7 @@ func (s *Server) sourceSearchSnapshot(ctx context.Context, view *requestView, pa
 	scanCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	for {
-		files, err := s.sampleSourceSearchSnapshot(scanCtx, view, idx, allow, allowDir)
+		files, err := s.sampleSourceSearchSnapshot(scanCtx, view, idx, allow, allowDir, read)
 		if !errors.Is(err, errSourceSnapshotMoved) {
 			return files, err
 		}
@@ -179,7 +185,7 @@ func (s *Server) sourceSearchInventory(ctx context.Context, view *requestView, i
 	return paths, overlays, nil
 }
 
-func (s *Server) sampleSourceSearchSnapshot(ctx context.Context, view *requestView, idx *indexer.Indexer, allow, allowDir func(string) bool) ([]sourceSearchFile, error) {
+func (s *Server) sampleSourceSearchSnapshot(ctx context.Context, view *requestView, idx *indexer.Indexer, allow, allowDir func(string) bool, read sourceSearchRead) ([]sourceSearchFile, error) {
 	paths, overlays, err := s.sourceSearchInventory(ctx, view, idx, allow, allowDir)
 	if err != nil {
 		return nil, err
@@ -206,9 +212,9 @@ func (s *Server) sampleSourceSearchSnapshot(ctx context.Context, view *requestVi
 			if info.Size() > sourceSearchMaxBytes-int64(total) {
 				return nil, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
 			}
-			content, evidence, err := readPhysicalFileEvidenceBounded(abs, int64(sourceSearchMaxBytes-total))
+			content, evidence, err := read(abs, int64(sourceSearchMaxBytes-total))
 			if err != nil {
-				if errors.Is(err, errPhysicalFileMoved) || os.IsNotExist(err) {
+				if errors.Is(err, errPhysicalFileMoved) || errors.Is(err, os.ErrNotExist) {
 					return nil, errSourceSnapshotMoved
 				}
 				return nil, fmt.Errorf("source search verification: %w", err)
@@ -238,9 +244,9 @@ func (s *Server) sampleSourceSearchSnapshot(ctx context.Context, view *requestVi
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		_, evidence, err := readPhysicalFileEvidenceBounded(file.abs, sourceSearchMaxBytes)
+		_, evidence, err := read(file.abs, sourceSearchMaxBytes)
 		if err != nil {
-			if errors.Is(err, errPhysicalFileMoved) || os.IsNotExist(err) {
+			if errors.Is(err, errPhysicalFileMoved) || errors.Is(err, os.ErrNotExist) {
 				return nil, errSourceSnapshotMoved
 			}
 			return nil, err
