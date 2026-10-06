@@ -988,6 +988,21 @@ func (s *Store) retirePayloadGeneration(
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)
 		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
 	}
+	// A resuming retiree is not a foreground writer. Serialize its reference
+	// fence as well as the payload drain, so it cannot preempt another quantum
+	// for the same generation merely by queuing its catalog transaction.
+	seal := s.payloadSealFor(generationID)
+	if err := seal.sweep.retirementGate.LockContext(ctx); err != nil {
+		return err
+	}
+	defer seal.sweep.retirementGate.Unlock()
+	// Another retiree may have removed the catalog row while this call waited.
+	if _, found, err := catalog.GetViewGeneration(ctx, generationID); err != nil {
+		return err
+	} else if !found {
+		s.payloadSeals.CompareAndDelete(generationID, seal)
+		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
+	}
 	if err := catalog.BeginViewGenerationRetirement(ctx, generationID); err != nil {
 		reason := viewmetrics.RefusedError
 		if errors.Is(err, ErrCatalogGenerationReferenced) {
@@ -1009,21 +1024,7 @@ func (s *Store) retirePayloadGeneration(
 	// them identically, but the analysis cache — whose transactions run on the
 	// base handle and so never reach that gate — has to keep admitting writes
 	// through a published generation while refusing them here.
-	seal := s.payloadSealFor(generationID)
 	seal.state.Store(payloadSealRetired)
-	// All retirement modes share this generation's resume state until final
-	// removal. A caller may have committed its fence before another retirement
-	// removed the catalog row and seal; recheck after acquiring the exact gate.
-	if err := seal.sweep.retirementGate.LockContext(ctx); err != nil {
-		return err
-	}
-	defer seal.sweep.retirementGate.Unlock()
-	if _, found, err := catalog.GetViewGeneration(ctx, generationID); err != nil {
-		return err
-	} else if !found {
-		s.payloadSeals.CompareAndDelete(generationID, seal)
-		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
-	}
 	if inUseNow() {
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)
 		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
