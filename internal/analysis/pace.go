@@ -35,6 +35,8 @@ type Pace struct {
 
 	// onPark, when set, runs as a park begins. Tests only.
 	onPark func()
+	// clock, when set, controls elapsed time in deterministic pacing tests.
+	clock func() time.Time
 
 	parks  int
 	parked time.Duration
@@ -43,7 +45,7 @@ type Pace struct {
 // Default pacing: a predicate check at most every 10 ms, a 5 ms poll while
 // parked, and parks of at most 30 s.
 const (
-	defaultPaceCheckEvery    = 64
+	defaultPaceCheckEvery    = 16
 	defaultPaceCheckInterval = 10 * time.Millisecond
 	defaultPacePollInterval  = 5 * time.Millisecond
 	defaultPaceParkCap       = 30 * time.Second
@@ -74,7 +76,7 @@ func (p *Pace) Tick() {
 		return
 	}
 	p.ticks = 0
-	now := time.Now()
+	now := p.now()
 	if now.Sub(p.lastCheck) < p.checkInterval || now.Sub(p.lastUnpark) < p.checkInterval {
 		return
 	}
@@ -90,11 +92,18 @@ func (p *Pace) park(started time.Time) {
 	if p.onPark != nil {
 		p.onPark()
 	}
-	for p.shouldYield() && time.Since(started) < p.parkCap {
+	for p.shouldYield() && p.now().Sub(started) < p.parkCap {
 		time.Sleep(p.pollInterval)
 	}
-	p.lastUnpark = time.Now()
+	p.lastUnpark = p.now()
 	p.parked += p.lastUnpark.Sub(started)
+}
+
+func (p *Pace) now() time.Time {
+	if p.clock != nil {
+		return p.clock()
+	}
+	return time.Now()
 }
 
 // Stats reports how often and for how long the pass parked.
