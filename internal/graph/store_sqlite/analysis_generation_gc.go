@@ -294,13 +294,17 @@ func deleteAnalysisPointerChunk(viewGen int64) payloadSweepChunk {
 // their own LIMIT — only the eligibility rule differs, and here eligibility is
 // the payload generation's retiring state, which the chunk runner rechecks.
 func deleteAnalysisChildChunk(table analysisGenerationGCTable, analysisGenerationID int64) payloadSweepChunk {
+	return deleteAnalysisChildChunkWithLimit(table, analysisGenerationID, analysisGenerationGCDefaultBatch)
+}
+
+func deleteAnalysisChildChunkWithLimit(table analysisGenerationGCTable, analysisGenerationID int64, limit int) payloadSweepChunk {
 	return func(ctx context.Context, tx *sql.Tx) (int64, error) {
 		var result sql.Result
 		var err error
 		if table.name == "nodes" {
-			result, err = tx.ExecContext(ctx, table.delete, analysisGenerationID, analysisGenerationGCDefaultBatch)
+			result, err = tx.ExecContext(ctx, table.delete, analysisGenerationID, limit)
 		} else {
-			result, err = tx.ExecContext(ctx, table.delete, analysisGenerationID, analysisGenerationID, analysisGenerationGCDefaultBatch)
+			result, err = tx.ExecContext(ctx, table.delete, analysisGenerationID, analysisGenerationID, limit)
 		}
 		if err != nil {
 			return 0, err

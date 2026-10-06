@@ -1009,7 +1009,25 @@ func (s *Store) retirePayloadGeneration(
 	// them identically, but the analysis cache — whose transactions run on the
 	// base handle and so never reach that gate — has to keep admitting writes
 	// through a published generation while refusing them here.
-	s.setPayloadSeal(generationID, payloadSealRetired)
+	seal := s.payloadSealFor(generationID)
+	seal.state.Store(payloadSealRetired)
+	// All retirement modes share this generation's resume state until final
+	// removal. A caller may have committed its fence before another retirement
+	// removed the catalog row and seal; recheck after acquiring the exact gate.
+	if err := seal.sweep.retirementGate.LockContext(ctx); err != nil {
+		return err
+	}
+	defer seal.sweep.retirementGate.Unlock()
+	if _, found, err := catalog.GetViewGeneration(ctx, generationID); err != nil {
+		return err
+	} else if !found {
+		s.payloadSeals.CompareAndDelete(generationID, seal)
+		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
+	}
+	if inUseNow() {
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)
+		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
+	}
 	// A write admitted before the seal closed would otherwise commit rows into
 	// a generation the sweep has already walked past.
 	//
@@ -1030,7 +1048,9 @@ func (s *Store) retirePayloadGeneration(
 	// leave and the state the next pass resumes from. Nothing between here and
 	// DeleteViewGeneration makes a half-swept generation visible as anything
 	// other than retiring.
-	if err := s.sweepPayloadGeneration(ctx, generationID, budget.begin()); err != nil {
+	pass := budget.begin()
+	pass.state = &seal.sweep
+	if err := s.sweepPayloadGeneration(ctx, generationID, pass); err != nil {
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
 		return s.noteRetirementFailure(generationID, err)
 	}
@@ -1038,11 +1058,14 @@ func (s *Store) retirePayloadGeneration(
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
 		return s.noteRetirementFailure(generationID, err)
 	}
-	s.payloadSeals.Delete(generationID)
+	s.payloadSeals.CompareAndDelete(generationID, seal)
 	// Generation ids are never reused, so a handle still holding the lane
 	// keeps a mutex nothing new can join rather than sharing one with a later
 	// generation.
 	s.resolveLanes.Delete(generationID)
+	if budget.quantum != nil {
+		budget.quantum.CatalogRemoved = true
+	}
 	viewmetrics.Count(viewmetrics.GenerationRetiredTotal, owner)
 	return nil
 }
@@ -1220,10 +1243,12 @@ func (s *Store) deletePayloadChunks(
 		}
 		// Over the WAL ceiling, give the reclaim a writer-idle window
 		// first (bounded; the chunk runs afterwards regardless).
-		s.awaitWALUnderCeiling(ctx, generationID, &walEpisode)
-		// An edit's writes go first: the chunk waits (bounded) while an
-		// edit-path mutation is announced or a writer is parked on the gate.
-		s.yieldToEditWriters(ctx)
+		if pass == nil || pass.budget.quantum == nil {
+			s.awaitWALUnderCeiling(ctx, generationID, &walEpisode)
+			// An edit's writes go first: the chunk waits (bounded) while an
+			// edit-path mutation is announced or a writer is parked on the gate.
+			s.yieldToEditWriters(ctx)
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -1231,18 +1256,24 @@ func (s *Store) deletePayloadChunks(
 		if limit <= 0 {
 			limit = payloadSweepInitialBatch
 		}
+		quantum := pass != nil && pass.budget.quantum != nil
+		if quantum {
+			limit = payloadSweepMinBatch
+		}
 		chunkStart := time.Now()
 		markBefore := readWALWriteMark(s.dbPath)
-		removed, retiring, err := s.deletePayloadChunk(context.WithValue(ctx, sweepBatchKey{}, limit), generationID, chunk)
+		removed, retiring, err := s.deletePayloadChunkMode(context.WithValue(ctx, sweepBatchKey{}, limit), generationID, chunk, quantum)
 		if d := WALWrittenBetween(markBefore, readWALWriteMark(s.dbPath)); d.Valid && !d.Reset {
 			sweptWAL += d.Bytes
 		}
 		swept += removed
-		next := nextSweepBatch(limit, removed, time.Since(chunkStart))
-		if byWAL := s.learnSweepWALPerRow(markBefore, readWALWriteMark(s.dbPath), removed); byWAL > 0 {
-			next = min(next, byWAL)
+		if !quantum {
+			next := nextSweepBatch(limit, removed, time.Since(chunkStart))
+			if byWAL := s.learnSweepWALPerRow(markBefore, readWALWriteMark(s.dbPath), removed); byWAL > 0 {
+				next = min(next, byWAL)
+			}
+			s.sweepBatch.Store(int64(next))
 		}
-		s.sweepBatch.Store(int64(next))
 		if err != nil {
 			return fmt.Errorf("payload generation gc: generation %d: %w", generationID, err)
 		}
@@ -1260,9 +1291,28 @@ func (s *Store) deletePayloadChunks(
 	}
 }
 
-func (s *Store) deletePayloadChunk(ctx context.Context, generationID int64, chunk payloadSweepChunk) (int64, bool, error) {
-	s.writeMu.Lock()
+func (s *Store) deletePayloadChunkMode(ctx context.Context, generationID int64, chunk payloadSweepChunk, quantum bool) (removed int64, retiring bool, err error) {
+	if quantum {
+		if err := s.writeMu.LockContext(ctx); err != nil {
+			return 0, false, err
+		}
+	} else {
+		s.writeMu.Lock()
+	}
 	defer s.writeMu.Unlock()
+	if quantum {
+		if err := s.retirementQuantumAdmission(ctx); err != nil {
+			return 0, false, err
+		}
+		var stop func()
+		ctx, stop = s.preemptRetirementQuantum(ctx)
+		defer stop()
+		defer func() {
+			if err != nil && errors.Is(context.Cause(ctx), ErrPayloadRetirementWriteWanted) {
+				err = ErrPayloadRetirementWriteWanted
+			}
+		}()
+	}
 	tx, err := s.beginWriteContext(ctx)
 	if err != nil {
 		return 0, false, err
@@ -1273,11 +1323,11 @@ func (s *Store) deletePayloadChunk(ctx context.Context, generationID int64, chun
 			_ = tx.Rollback()
 		}
 	}()
-	retiring, err := payloadGenerationRetiringTx(ctx, tx, generationID)
+	retiring, err = payloadGenerationRetiringTx(ctx, tx, generationID)
 	if err != nil || !retiring {
 		return 0, retiring, err
 	}
-	removed, err := chunk(ctx, tx)
+	removed, err = chunk(ctx, tx)
 	if err != nil {
 		return 0, false, err
 	}

@@ -97,6 +97,7 @@ type payloadSweepBudget struct {
 	maxChunks  int64
 	maxElapsed time.Duration
 	now        func() time.Time
+	quantum    *PayloadRetirementProgress
 }
 
 // defaultPayloadSweepBudget is what production retirement runs under.
@@ -114,6 +115,7 @@ type payloadSweepPass struct {
 	started time.Time
 	rows    int64
 	chunks  int64
+	state   *payloadSweepState
 }
 
 // begin opens a pass. The clock is read once here so that every later
@@ -169,6 +171,10 @@ func (p *payloadSweepPass) spend(rows int64) {
 	}
 	p.chunks++
 	p.rows += rows
+	if p.budget.quantum != nil {
+		p.budget.quantum.ChunksCommitted++
+		p.budget.quantum.RowsDeleted += rows
+	}
 }
 
 // payloadSweepState is the per-generation retirement state a sweep carries
@@ -183,9 +189,13 @@ func (p *payloadSweepPass) spend(rows int64) {
 // evicted by a failed resolve — costs one cheap re-walk of the already-empty
 // tables and an unexplained absence on the census, never a wrong deletion.
 type payloadSweepState struct {
-	mu     sync.Mutex
-	step   int
-	reason string
+	mu                  sync.Mutex
+	step                int
+	reason              string
+	retirementGate      sqliteWriteGate
+	analysisPointerDone bool
+	analysisID          int64
+	analysisPhase       int
 }
 
 func (p *payloadSweepState) cursor() int {
@@ -197,15 +207,17 @@ func (p *payloadSweepState) cursor() int {
 	return p.step
 }
 
-func (p *payloadSweepState) advance(step int) {
+func (p *payloadSweepState) advance(step int) bool {
 	if p == nil {
-		return
+		return false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if step > p.step {
 		p.step = step
+		return true
 	}
+	return false
 }
 
 func (p *payloadSweepState) setReason(reason string) {
@@ -414,6 +426,9 @@ func (s *Store) payloadSweepSteps(generationID int64) []payloadSweepStep {
 func (s *Store) sweepPayloadGeneration(ctx context.Context, generationID int64, pass *payloadSweepPass) error {
 	steps := s.payloadSweepSteps(generationID)
 	state := s.payloadSweepStateFor(generationID)
+	if pass != nil && pass.state != nil {
+		state = pass.state
+	}
 	// The last attempt's reason was already retracted by the attempt that
 	// called this — see RetirePayloadGeneration, which does it for the
 	// refusals as well, so the retraction rule is "per attempt" everywhere
@@ -426,7 +441,9 @@ func (s *Store) sweepPayloadGeneration(ctx context.Context, generationID int64, 
 		if err := steps[i].run(ctx, pass); err != nil {
 			return err
 		}
-		state.advance(i + 1)
+		if state.advance(i+1) && pass != nil && pass.budget.quantum != nil {
+			pass.budget.quantum.StepsAdvanced++
+		}
 	}
 	return nil
 }
@@ -459,6 +476,9 @@ func (s *Store) payloadSweepStateFor(generationID int64) *payloadSweepState {
 // gate, re-checks that the generation is still retiring, and spends the pass's
 // budget like any other chunk.
 func (s *Store) sweepAnalysisGenerations(ctx context.Context, generationID int64, pass *payloadSweepPass) error {
+	if pass != nil && pass.budget.quantum != nil {
+		return s.sweepAnalysisGenerationQuantum(ctx, generationID, pass)
+	}
 	analysisIDs, err := s.analysisGenerationIDsForView(ctx, generationID)
 	if err != nil {
 		return fmt.Errorf("payload generation gc: analysis generations: %w", err)
