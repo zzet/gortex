@@ -175,6 +175,7 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"graph.exactNameContextReader":                "read accelerator: without it the caller takes the Store/Reader form, which DeltaWriter answers through the composed view (a cost, not a different answer)",
 	"graph.exactNameContextVisitor":               "read accelerator: without it the caller takes the Store/Reader form, which DeltaWriter answers through the composed view (a cost, not a different answer)",
 	"graph.exactNamesContextVisitor":              "optional exact-name read accelerator; absent, checked single-name visits read DeltaWriter.FindNodesByName through its composed view, preserving additions and shadows rather than forwarding a base-only batch",
+	"graph.repoExactNamesContextVisitor":          "optional repo-qualified exact-name read accelerator; absent, checked composed-view name visits preserve DeltaWriter additions, shadows and tombstones before filtering repository ownership",
 	"graph.layerExactNameContextReader":           "composition contract of an overlay layer, a composed view or a reader wrapper; asserted on those objects, never on the store the engine writes",
 	"graph.layerExactNameContextVisitor":          "composition contract of an overlay layer, a composed view or a reader wrapper; asserted on those objects, never on the store the engine writes",
 	"graph.overlayStatsContextReader":             "composition contract of an overlay layer, a composed view or a reader wrapper; asserted on those objects, never on the store the engine writes",
