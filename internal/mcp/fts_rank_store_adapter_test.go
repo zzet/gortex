@@ -284,3 +284,29 @@ func TestFirstSearchAfterAnEditReadsNoGenerationWhole(t *testing.T) {
 	restore()
 	require.Equal(t, viaFTS5, inMemory)
 }
+
+// The real Store adapter must expose one coherent snapshot, not detached
+// before/count/after reads. Returned weights/counts include the global corpus.
+func TestStoreAdapterForwardsCoherentFTSScoringSnapshot(t *testing.T) {
+	f, _ := newAdjacencyMemoFixture(t)
+	require.NoError(t, f.srv.lifecycle.Close()) // join background publishers before comparing independent snapshots
+	source, ok := adaptStoreFTSRankSource(f.store)
+	require.True(t, ok)
+	snapshot, ok := source.(search.FTSScoringSnapshotSource)
+	require.True(t, ok)
+	stats, hits, err := snapshot.SymbolFTSScoringSnapshot(context.Background(), []string{"widget", "render", ""})
+	require.NoError(t, err)
+	expected, expectedHits, err := f.store.SymbolFTSScoringSnapshot(context.Background(), []string{"widget", "render", ""})
+	require.NoError(t, err)
+	require.Equal(t, expected.Rows, stats.Rows)
+	require.Equal(t, expected.Tokens, stats.Tokens)
+	require.Equal(t, expected.Stamp, stats.Stamp)
+	require.Equal(t, expectedHits, hits)
+	require.Positive(t, hits["widget"])
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stats, hits, err = snapshot.SymbolFTSScoringSnapshot(ctx, []string{"widget"})
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, stats)
+	require.Nil(t, hits)
+}

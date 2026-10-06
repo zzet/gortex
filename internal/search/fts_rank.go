@@ -88,6 +88,14 @@ type FTSRankSource interface {
 	SymbolFTSGenerationRows(ctx context.Context, generation int64, match string, repoAllow []string) ([]FTSRankRow, error)
 }
 
+// FTSScoringSnapshotSource supplies all global BM25 weights from one read
+// snapshot. It is optional: legacy sources keep their stamp-checked reads.
+// Only immutable positive-generation searches use it; mutable generation zero
+// keeps its existing reads and freshness witnesses.
+type FTSScoringSnapshotSource interface {
+	SymbolFTSScoringSnapshot(ctx context.Context, terms []string) (FTSRankStats, map[string]int64, error)
+}
+
 // FTSRankTerms returns the prefix terms of the MATCH the store builds for query
 // (buildFTSMatch with normalization), and whether each is one FTS5 token this
 // package can match exactly: ASCII letters and digits only.
@@ -833,13 +841,14 @@ func (r *FTSRanker) Rank(ctx context.Context, generation int64, immutable bool, 
 // idf reads the table statistics and each phrase's IDF, retrying once when
 // the two reads describe different table states.
 func (r *FTSRanker) idf(ctx context.Context, terms []string) (FTSRankStats, []float64, bool, error) {
-	stats, idf, _, ok, err := r.idfHits(ctx, terms)
+	stats, idf, _, ok, err := r.idfHits(ctx, terms, false)
 	return stats, idf, ok, err
 }
 
 // idfHits is idf with each phrase's matching-document count over the whole
-// table.
-func (r *FTSRanker) idfHits(ctx context.Context, terms []string) (FTSRankStats, []float64, map[string]int64, bool, error) {
+// table. Allowed immutable scopes use a coherent snapshot when supplied;
+// other sources keep the existing bounded stamp comparison.
+func (r *FTSRanker) idfHits(ctx context.Context, terms []string, allowSnapshot bool) (FTSRankStats, []float64, map[string]int64, bool, error) {
 	unique := make([]string, 0, len(terms))
 	seen := make(map[string]struct{}, len(terms))
 	for _, t := range terms {
@@ -848,19 +857,36 @@ func (r *FTSRanker) idfHits(ctx context.Context, terms []string) (FTSRankStats, 
 			unique = append(unique, t)
 		}
 	}
+	snapshot, coherent := r.src.(FTSScoringSnapshotSource)
+	coherent = coherent && allowSnapshot
 	for attempt := 0; attempt < 2; attempt++ {
-		ftsStoreReads.Add(1)
-		stats, err := r.src.SymbolFTSStats(ctx)
-		if err != nil {
-			return FTSRankStats{}, nil, nil, false, err
-		}
-		ftsStoreReads.Add(1)
-		hits, stamp, err := r.src.SymbolFTSPrefixHits(ctx, unique)
-		if err != nil {
-			return FTSRankStats{}, nil, nil, false, err
-		}
-		if stamp != stats.Stamp || stats.Rows <= 0 {
-			continue
+		var stats FTSRankStats
+		var hits map[string]int64
+		var err error
+		if coherent {
+			ftsStoreReads.Add(1)
+			stats, hits, err = snapshot.SymbolFTSScoringSnapshot(ctx, unique)
+			if err != nil {
+				return FTSRankStats{}, nil, nil, false, err
+			}
+			if stats.Rows <= 0 || stats.Stamp == "" {
+				return FTSRankStats{}, nil, nil, false, nil
+			}
+		} else {
+			ftsStoreReads.Add(1)
+			stats, err = r.src.SymbolFTSStats(ctx)
+			if err != nil {
+				return FTSRankStats{}, nil, nil, false, err
+			}
+			ftsStoreReads.Add(1)
+			var stamp string
+			hits, stamp, err = r.src.SymbolFTSPrefixHits(ctx, unique)
+			if err != nil {
+				return FTSRankStats{}, nil, nil, false, err
+			}
+			if stamp != stats.Stamp || stats.Rows <= 0 {
+				continue
+			}
 		}
 		idf := make([]float64, len(terms))
 		for i, t := range terms {
@@ -1053,7 +1079,14 @@ func (r *FTSRanker) RankGenerations(ctx context.Context, generations []int64, qu
 	// The table statistics and each phrase's whole-table count: read once per
 	// query for the ranking below, and read here, before the MATCH reads, so
 	// the one-MATCH decision uses them without a read of its own.
-	stats, idf, hits, ok, err := r.idfHits(ctx, terms)
+	allowSnapshot := len(generations) > 0
+	for _, generation := range generations {
+		if generation <= 0 {
+			allowSnapshot = false
+			break
+		}
+	}
+	stats, idf, hits, ok, err := r.idfHits(ctx, terms, allowSnapshot)
 	if err != nil {
 		return nil, nil, err
 	}

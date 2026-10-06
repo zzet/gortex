@@ -341,7 +341,7 @@ type symbolFTSPrefixBaseline struct {
 }
 
 type symbolFTSPrefixState struct {
-	mu    sync.Mutex
+	mu    sqliteWriteGate
 	terms map[string]*symbolFTSPrefixBaseline
 }
 
@@ -365,43 +365,71 @@ const symbolFTSSmallGeneration = 5000
 // A new top generation therefore costs its own rows, never a walk of the
 // table. Every count is taken inside the snapshot the revisions were read in.
 func (s *Store) symbolFTSPrefixHitsIncremental(ctx context.Context, prefixes []string) (map[string]int64, error) {
-	v, _ := symbolFTSPrefixStates.LoadOrStore(s.storeCore, &symbolFTSPrefixState{terms: map[string]*symbolFTSPrefixBaseline{}})
-	state := v.(*symbolFTSPrefixState)
-	state.mu.Lock()
-	defer state.mu.Unlock()
+	_, hits, err := s.symbolFTSScoringSnapshot(ctx, prefixes, true)
+	return hits, err
+}
+
+// symbolFTSScoringSnapshot reuses the existing revision-qualified prefix
+// baselines, but also returns the exact statistics of their read snapshot.
+func (s *Store) symbolFTSScoringSnapshot(ctx context.Context, prefixes []string, incremental bool) (SymbolFTSStats, map[string]int64, error) {
+	var state *symbolFTSPrefixState
+	if incremental {
+		v, _ := symbolFTSPrefixStates.LoadOrStore(s.storeCore, &symbolFTSPrefixState{terms: map[string]*symbolFTSPrefixBaseline{}})
+		state = v.(*symbolFTSPrefixState)
+		if err := state.mu.LockContext(ctx); err != nil {
+			return SymbolFTSStats{}, nil, err
+		}
+		defer state.mu.Unlock()
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, err
+		return SymbolFTSStats{}, nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck // read-only snapshot
-	revs := map[int64]int64{}
-	rrows, err := tx.QueryContext(ctx, `SELECT view_gen, rev FROM `+symbolFTSRevisionsTable)
+	stats, err := symbolFTSStatsTx(ctx, tx)
 	if err != nil {
-		return nil, err
+		return SymbolFTSStats{}, nil, err
 	}
-	for rrows.Next() {
-		var g, r int64
-		if err := rrows.Scan(&g, &r); err != nil {
-			_ = rrows.Close()
-			return nil, err
+	if !incremental {
+		// Counter-unready/cold bulk states still count inside this transaction.
+		out := make(map[string]int64, len(prefixes))
+		for _, prefix := range prefixes {
+			term := ftsPrefixTerm(prefix)
+			if term == "" {
+				out[prefix] = 0
+				continue
+			}
+			var count int64
+			noteSymbolFTSPrefixWalk()
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM symbol_fts WHERE symbol_fts MATCH ?`, term).Scan(&count); err != nil {
+				return SymbolFTSStats{}, nil, err
+			}
+			out[prefix] = count
 		}
-		revs[g] = r
-	}
-	if err := rrows.Err(); err != nil {
-		_ = rrows.Close()
-		return nil, err
-	}
-	if err := rrows.Close(); err != nil {
-		return nil, err
-	}
-	var nRow int64
-	var block []byte
-	if err := tx.QueryRowContext(ctx, `SELECT block FROM symbol_fts_data WHERE id = 1`).Scan(&block); err == nil {
-		if vals := sqliteVarints(block); len(vals) > 0 {
-			nRow = int64(vals[0])
+		if err := ctx.Err(); err != nil {
+			return SymbolFTSStats{}, nil, err
 		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
+		return stats, out, nil
+	}
+	revs := map[int64]int64{}
+	rows, err := tx.QueryContext(ctx, `SELECT view_gen, rev FROM `+symbolFTSRevisionsTable)
+	if err != nil {
+		return SymbolFTSStats{}, nil, err
+	}
+	for rows.Next() {
+		var generation, revision int64
+		if err := rows.Scan(&generation, &revision); err != nil {
+			_ = rows.Close()
+			return SymbolFTSStats{}, nil, err
+		}
+		revs[generation] = revision
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return SymbolFTSStats{}, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return SymbolFTSStats{}, nil, err
 	}
 	// The added generations' rows, read once for every term.
 	addedRows := map[int64][]SymbolFTSRow{}
@@ -436,13 +464,13 @@ func (s *Store) symbolFTSPrefixHitsIncremental(ctx context.Context, prefixes []s
 				n, ok := addedCounted[g]
 				if !ok {
 					if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM symbol_fts_rowid WHERE view_gen = ?`, g).Scan(&n); err != nil {
-						return nil, err
+						return SymbolFTSStats{}, nil, err
 					}
 					addedCounted[g] = n
 				}
 				addedDocs += n
 			}
-			if base.rows+addedDocs != nRow {
+			if base.rows+addedDocs != stats.Rows {
 				fresh = true
 			}
 		}
@@ -450,9 +478,9 @@ func (s *Store) symbolFTSPrefixHitsIncremental(ctx context.Context, prefixes []s
 			var n int64
 			noteSymbolFTSPrefixWalk()
 			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM symbol_fts WHERE symbol_fts MATCH ?`, term).Scan(&n); err != nil {
-				return nil, err
+				return SymbolFTSStats{}, nil, err
 			}
-			state.terms[folded] = &symbolFTSPrefixBaseline{count: n, rows: nRow, revs: cloneRevs(revs)}
+			state.terms[folded] = &symbolFTSPrefixBaseline{count: n, rows: stats.Rows, revs: cloneRevs(revs)}
 			out[prefix] = n
 			continue
 		}
@@ -460,14 +488,17 @@ func (s *Store) symbolFTSPrefixHitsIncremental(ctx context.Context, prefixes []s
 		for _, g := range added {
 			n, err := s.generationPrefixCountTx(ctx, tx, g, folded, term, addedRows)
 			if err != nil {
-				return nil, err
+				return SymbolFTSStats{}, nil, err
 			}
 			count += n
 		}
-		state.terms[folded] = &symbolFTSPrefixBaseline{count: count, rows: nRow, revs: cloneRevs(revs)}
+		state.terms[folded] = &symbolFTSPrefixBaseline{count: count, rows: stats.Rows, revs: cloneRevs(revs)}
 		out[prefix] = count
 	}
-	return out, nil
+	if err := ctx.Err(); err != nil {
+		return SymbolFTSStats{}, nil, err
+	}
+	return stats, out, nil
 }
 
 // generationPrefixCountTx counts one generation's documents with a token

@@ -114,6 +114,16 @@ func (a *storeFTSRankSource) SymbolFTSStats(ctx context.Context) (search.FTSRank
 	return search.FTSRankStats{Rows: st.Rows, Tokens: st.Tokens, Stamp: st.Stamp}, nil
 }
 
+// SymbolFTSScoringSnapshot forwards one global scoring snapshot directly;
+// the ranker must not bracket it with detached statistics reads.
+func (a *storeFTSRankSource) SymbolFTSScoringSnapshot(ctx context.Context, terms []string) (search.FTSRankStats, map[string]int64, error) {
+	st, hits, err := a.s.SymbolFTSScoringSnapshot(ctx, terms)
+	if err != nil {
+		return search.FTSRankStats{}, nil, err
+	}
+	return search.FTSRankStats{Rows: st.Rows, Tokens: st.Tokens, Stamp: st.Stamp}, hits, nil
+}
+
 func (a *storeFTSRankSource) SymbolFTSPrefixHits(ctx context.Context, terms []string) (map[string]int64, string, error) {
 	before, err := a.s.SymbolFTSStats(ctx)
 	if err != nil {
