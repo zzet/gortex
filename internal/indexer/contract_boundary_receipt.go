@@ -44,8 +44,17 @@ func (idx *Indexer) collectContractBoundaryReceipt(ctx context.Context, path, la
 	if err := ctx.Err(); err != nil {
 		return contractBoundaryReceipt{}, err
 	}
-	if result == nil || extractionDispositionFor(result).omitSecondarySourceScans() {
+	if result == nil {
 		return contractBoundaryReceipt{}, fmt.Errorf("contract boundary receipt: incomplete accepted extraction")
+	}
+	_, byLanguage := idx.buildPerFileContractExtractors()
+	projectionPolicy := 0
+	if extractionDispositionFor(result).omitSecondarySourceScans() {
+		var verified bool
+		projectionPolicy, verified = idx.contractGeneratedProjectionPolicy(path, language, src, result, len(byLanguage[language]))
+		if !verified {
+			return contractBoundaryReceipt{}, fmt.Errorf("contract boundary receipt: incomplete accepted extraction")
+		}
 	}
 	if result.Tree != nil && !bytes.Equal(result.Tree.Source(), src) {
 		return contractBoundaryReceipt{}, fmt.Errorf("contract boundary receipt: source differs from accepted tree")
@@ -72,7 +81,6 @@ func (idx *Indexer) collectContractBoundaryReceipt(ctx context.Context, path, la
 		idx.applyRepoPrefix(detached.Nodes, detached.Edges)
 		result = &detached
 	}
-	_, byLanguage := idx.buildPerFileContractExtractors()
 	local := &localContractBoundaryInputs{nodes: make(map[string][]*graph.Node), values: make(map[string]string), lookups: make(map[string]struct{}), scope: idx.repoPrefix}
 	for _, node := range result.Nodes {
 		if node != nil {
@@ -96,7 +104,8 @@ func (idx *Indexer) collectContractBoundaryReceipt(ctx context.Context, path, la
 		EventBus                                  any
 		Parser, PostExtraction                    int
 		ContractPolicy, RecordPolicy, MatchPolicy string
-	}{contractExtractionSettings(idx.config), idx.eventBusBoundaries(), extractorVersionForLang(language), postExtractionPolicyVersion, contractExtractionPolicyVersion, contracts.RecordFingerprintVersion, contracts.MatchDependencyKeyVersion})
+		GeneratedProjectionPolicy                 int `json:",omitempty"`
+	}{contractExtractionSettings(idx.config), idx.eventBusBoundaries(), extractorVersionForLang(language), postExtractionPolicyVersion, contractExtractionPolicyVersion, contracts.RecordFingerprintVersion, contracts.MatchDependencyKeyVersion, projectionPolicy})
 	if err != nil {
 		return contractBoundaryReceipt{}, err
 	}
