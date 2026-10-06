@@ -1,13 +1,24 @@
-name: ARM Benchmarks
+name: Explicit Performance and Acceptance
 
 on:
   workflow_dispatch:
+    inputs:
+      suite:
+        description: Explicit flow to run (native acceptance starts private daemons)
+        type: choice
+        default: benchmarks
+        options:
+          - benchmarks
+          - performance
+          - acceptance-helpers
+          - acceptance-native
 
 permissions:
   contents: read
 
 jobs:
   bench-arm64:
+    if: inputs.suite == 'benchmarks'
     name: Benchmark (ARM64)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
@@ -21,6 +32,7 @@ jobs:
 
       - name: Run benchmarks
         run: |
+          set -euo pipefail
           go test -bench=. -benchmem -count=3 -benchtime=2s -timeout=20m \
             -run='^$' \
             ./internal/graph/ \
@@ -47,6 +59,7 @@ jobs:
           echo "Benchmark results uploaded. Compare manually with benchstat."
 
   bench-amd64:
+    if: inputs.suite == 'benchmarks'
     name: Benchmark (AMD64 baseline)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -60,6 +73,7 @@ jobs:
 
       - name: Run benchmarks
         run: |
+          set -euo pipefail
           go test -bench=. -benchmem -count=3 -benchtime=2s -timeout=20m \
             -run='^$' \
             ./internal/graph/ \
@@ -77,3 +91,54 @@ jobs:
           name: bench-amd64-${{ github.sha }}
           path: bench-amd64.txt
           retention-days: 90
+
+  performance:
+    if: inputs.suite == 'performance'
+    name: Tagged performance measurements
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run explicit measurements (external-corpus flows remain opt-in)
+        run: go test -tags performance -run '^TestPerformance' -count=1 -timeout=50m -v ./...
+
+  acceptance-helpers:
+    if: inputs.suite == 'acceptance-helpers'
+    name: Acceptance harness self-tests (no native acceptance claim)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check helpers with native driver gates unset
+        run: go test -tags acceptance -run '^Test(SustainedIO|E2EMatrix|Issue767)' -count=1 -timeout=20m -v ./cmd/gortex
+
+  acceptance-native:
+    if: inputs.suite == 'acceptance-native'
+    name: Native acceptance on owned temporary fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build candidate daemon
+        run: go build -o "$RUNNER_TEMP/gortex-acceptance" ./cmd/gortex
+      - name: Run native drivers with explicit binary gates
+        env:
+          GX_E2E_MATRIX_BINARY: ${{ runner.temp }}/gortex-acceptance
+          GX_SUSTAINED_IO_TEST_BINARY: ${{ runner.temp }}/gortex-acceptance
+          GORTEX_ISSUE767_TEST_BINARY: ${{ runner.temp }}/gortex-acceptance
+          GORTEX_ISSUE767_READINESS_BINARY: ${{ runner.temp }}/gortex-acceptance
+        run: >-
+          go test -tags acceptance -count=1 -timeout=170m -v ./cmd/gortex
+          -run '^Test(E2EMatrixNoopFamily|E2EMatrixEditTaxonomy|E2EMatrixResolutionProvenanceManifests|E2EMatrix4ViewLifecycle|E2EMatrix5MainAdvanceWithTenDependents|E2EMatrix6Lifecycle|E2EMatrix7Adversarial|SustainedIOSustainedWriteAmplification|Issue767IdleIOIntegration|Issue767WorktreeReadinessIntegration)$'
