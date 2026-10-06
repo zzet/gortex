@@ -122,9 +122,10 @@ func TestSteppedFoldLandsUnderEditsAndRebasesTheLayerAbove(t *testing.T) {
 }
 
 // 2. A burst of 12 edits at a 5 s pace, a search after each, with the fold
-// running in the background: no edit meets the chain bound, and a writer that
-// arrives while a step holds the write gate waits no longer than a step's
-// yield (measured 1.2-1.3 ms; the bound asserted is the store test's limit).
+// running in the background: no edit meets the chain bound, and writer
+// probes during steps complete within the Store tests' timing policy. The
+// probe measures the whole analysis-header call, including SQL, rather than
+// isolated write-gate wait; race builds use the existing Store race slack.
 func TestSteppedFoldBurstNeverExhaustsTheChainAndNoEditWaitsOnAStep(t *testing.T) {
 	pace := 5 * time.Second
 	if testing.Short() {
@@ -133,6 +134,25 @@ func TestSteppedFoldBurstNeverExhaustsTheChainAndNoEditWaitsOnAStep(t *testing.T
 	f, c, l := mcpChainFixture(t, builderTreeA(), true)
 	var probeMu sync.Mutex
 	var probes []time.Duration
+	var probeErrors []error
+	var probeWG sync.WaitGroup
+	probeCtx, cancelProbes := context.WithCancel(t.Context())
+	probeAdmissionClosed := false
+	joinProbes := func() {
+		probeMu.Lock()
+		probeAdmissionClosed = true
+		probeMu.Unlock()
+		cancelProbes()
+		done := make(chan struct{})
+		go func() { probeWG.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("analysis-header probes did not join")
+		}
+	}
+	// Registered after the fixture: stop admission before Wait on every exit.
+	t.Cleanup(joinProbes)
 	c.compaction.mu.Lock()
 	c.compaction.stepHook = func(ctx context.Context, step int) {
 		if step == 0 {
@@ -144,13 +164,28 @@ func TestSteppedFoldBurstNeverExhaustsTheChainAndNoEditWaitsOnAStep(t *testing.T
 			case <-ctx.Done():
 			}
 		}
-		// A writer that arrives right as the next step begins.
+		probeMu.Lock()
+		if probeAdmissionClosed {
+			probeMu.Unlock()
+			return
+		}
+		probeWG.Add(1)
+		probeMu.Unlock()
 		go func() {
-			time.Sleep(time.Millisecond)
+			defer probeWG.Done()
+			select {
+			case <-time.After(time.Millisecond):
+			case <-probeCtx.Done():
+				return
+			}
 			started := time.Now()
-			_, _, _ = f.store.LoadActiveAnalysisHeader(0)
+			// This API has no context variant; own and join its completion.
+			_, _, err := f.store.LoadActiveAnalysisHeader(0)
 			probeMu.Lock()
 			probes = append(probes, time.Since(started))
+			if err != nil {
+				probeErrors = append(probeErrors, err)
+			}
 			probeMu.Unlock()
 		}()
 	}
@@ -173,6 +208,7 @@ func TestSteppedFoldBurstNeverExhaustsTheChainAndNoEditWaitsOnAStep(t *testing.T
 	if err := c.waitDirtyChainCompactions(ctx); err != nil {
 		t.Fatal(err)
 	}
+	joinProbes()
 	stats := c.DirtyChainCompactionStats()
 	if stats.Flipped == 0 {
 		t.Fatalf("no stepped fold landed during the burst: %+v", stats)
@@ -180,15 +216,23 @@ func TestSteppedFoldBurstNeverExhaustsTheChainAndNoEditWaitsOnAStep(t *testing.T
 	if above == 0 {
 		t.Fatal("no edit published above a running fold")
 	}
-	probeMu.Lock()
-	defer probeMu.Unlock()
+	if len(probeErrors) != 0 {
+		t.Fatalf("analysis-header probes failed: %v", probeErrors)
+	}
+	if len(probes) == 0 {
+		t.Fatal("no analysis-header probe completed")
+	}
 	worst := time.Duration(0)
 	for _, p := range probes {
 		worst = max(worst, p)
 	}
-	t.Logf("burst: %d folds landed, %d edits above a running fold, %d gate probes during steps, worst wait %s", stats.Flipped, above, len(probes), worst)
-	if worst > 20*time.Millisecond {
-		t.Fatalf("a writer waited %s for the gate while the fold stepped", worst)
+	t.Logf("burst: %d folds landed, %d edits above a running fold, %d analysis-header probes during steps, worst total probe latency %s", stats.Flipped, above, len(probes), worst)
+	limit := 20 * time.Millisecond
+	if indexerRaceDetectorOn {
+		limit = 100 * time.Millisecond
+	}
+	if worst > limit {
+		t.Fatalf("analysis-header total probe latency %s exceeded %s while the fold stepped", worst, limit)
 	}
 }
 
