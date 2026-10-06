@@ -761,7 +761,12 @@ type contractFollowupEvidence struct {
 	readCore                   func(context.Context, ContractFollowupFile) (ContractFollowupCoreFile, error)
 	allowedRepos               map[string]bool
 	loaded                     map[string]bool
-	err                        error
+	// Completed names belong to this private, single-worker captured evidence.
+	// Keep raw row counts so cached names still consume the request's budget;
+	// scratch results and final accepted-source fences remain live.
+	completedCoreNames     map[string]int
+	completedCoreNameBytes int
+	err                    error
 }
 
 // RepoFilePaths serves the complete accepted census directly; no errorless
@@ -1088,15 +1093,54 @@ func (e *contractFollowupEvidence) GetNode(id string) *graph.Node {
 	return e.GetNodesByIDs([]string{id})[id]
 }
 func (e *contractFollowupEvidence) FindNodesByNames(names []string) map[string][]*graph.Node {
+	if e.err != nil {
+		return nil
+	}
+	if e.ctx != nil && e.ctx.Err() != nil {
+		e.fail(e.ctx.Err())
+		return nil
+	}
 	count := 0
-	err := graph.VisitNodesByNamesContext(e.ctx, e.core, names, func(node *graph.Node) bool {
+	pending := names
+	newCounts := make(map[string]int, len(names))
+	cacheable := e.core != nil
+	for _, name := range names {
+		if _, duplicate := newCounts[name]; duplicate {
+			// Optional fallback readers may visit duplicate names repeatedly.
+			// Preserve that exact legacy visit and its row budget, without memo.
+			cacheable = false
+		}
+		newCounts[name] = 0
+	}
+	if cacheable {
+		pending = make([]string, 0, len(names))
+		for _, name := range names {
+			if rows, done := e.completedCoreNames[name]; done {
+				count += rows
+				delete(newCounts, name)
+				if count > graph.ContractProjectionRowLimit {
+					e.fail(graph.ErrContractProjectionLimit)
+					return nil
+				}
+			} else {
+				pending = append(pending, name)
+			}
+		}
+	}
+	err := graph.VisitNodesByNamesContext(e.ctx, e.core, pending, func(node *graph.Node) bool {
 		count++
 		if count > graph.ContractProjectionRowLimit {
 			e.fail(graph.ErrContractProjectionLimit)
 			return false
 		}
 		if node == nil {
+			cacheable = false
 			return true
+		}
+		if _, exact := newCounts[node.Name]; exact {
+			newCounts[node.Name]++
+		} else {
+			cacheable = false
 		}
 		if node.Kind == graph.KindContract || node.Kind == graph.KindContractBridge {
 			return true
@@ -1126,6 +1170,18 @@ func (e *contractFollowupEvidence) FindNodesByNames(names []string) map[string][
 	if err != nil {
 		e.fail(err)
 		return nil
+	}
+	if cacheable {
+		if e.completedCoreNames == nil {
+			e.completedCoreNames = make(map[string]int)
+		}
+		for _, name := range pending {
+			if len(e.completedCoreNames) >= graph.ContractProjectionRowLimit || len(name) > contractCoreReceiptPayloadLimit-e.completedCoreNameBytes {
+				continue
+			}
+			e.completedCoreNames[name] = newCounts[name]
+			e.completedCoreNameBytes += len(name)
+		}
 	}
 	return out
 }
