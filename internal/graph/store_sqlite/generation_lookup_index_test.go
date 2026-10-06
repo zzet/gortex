@@ -47,7 +47,9 @@ var generationLookupNamePlanQuery = `SELECT ` + lookupNodeCols + ` FROM nodes WH
 var generationLookupFilePlanQuery = `SELECT ` + lookupNodeCols + ` FROM nodes WHERE file_path = ? AND view_gen = ? ORDER BY id`
 var generationLookupRepoPlanQuery = `SELECT ` + lookupNodeCols + ` FROM nodes WHERE repo_prefix = ? AND view_gen = ? ORDER BY id`
 var generationLookupRepoLanguageNamePlanQuery = `SELECT ` + lookupNodeCols + ` FROM nodes WHERE repo_prefix = ? AND language = ? AND name = ? AND name <> '' AND view_gen = ? ORDER BY id`
-var generationLookupNodeGenerationPlanQuery = `SELECT ` + lookupNodeCols + ` FROM nodes WHERE view_gen = ? ORDER BY id`
+
+// Explain the actual ordered read, including its generation index fence.
+var generationLookupNodeGenerationPlanQuery = baseAllNodesSQL
 var generationLookupIncomingPlanQuery = `SELECT ` + lookupEdgeCols + ` FROM edges WHERE to_id = ? AND view_gen = ? ORDER BY kind, id`
 var generationLookupOutgoingPlanQuery = `SELECT ` + lookupEdgeCols + ` FROM edges WHERE from_id = ? AND view_gen = ?`
 

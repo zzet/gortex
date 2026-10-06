@@ -84,6 +84,7 @@ FROM seq`)
 		"nodes_by_repo_kind",
 		"nodes_by_repo_language_name",
 		"nodes_go_receiver_type",
+		"nodes_stats_histogram",
 	}
 	if !reflect.DeepEqual(gotIndexes, wantIndexes) {
 		t.Fatalf("synchronous graph stats = %v, want %v", gotIndexes, wantIndexes)

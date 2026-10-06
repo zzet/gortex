@@ -218,12 +218,12 @@ WITH requested_repos(repo_prefix) AS (
 SELECT n.id
 FROM requested_repos AS r
 CROSS JOIN requested_kinds AS k
-CROSS JOIN nodes AS n ON n.repo_prefix = r.repo_prefix AND n.kind = k.kind AND n.view_gen = ?`
-	// CROSS JOIN (not INDEXED BY): SQLite never reorders CROSS JOIN, which is
-	// the whole fix — n can only be the probed side. INDEXED BY would be a
-	// hard runtime error whenever the partial index cannot serve the query
-	// (solo-repo '' prefixes; bulk-load windows with droppable indexes off),
-	// and this path panics on query errors.
+CROSS JOIN nodes AS n INDEXED BY nodes_by_repo_kind
+    ON n.repo_prefix = r.repo_prefix AND n.kind = k.kind AND n.view_gen = ?`
+	// CROSS JOIN fixes the driving inputs; the index fence prevents a
+	// histogram kind seek from discarding rows of unrelated repositories.
+	// nodes_by_repo_kind is dense and always live, including empty prefixes
+	// and bulk-load windows.
 }
 
 // RepoFilePaths projects only paths for file nodes in one repository/workspace.

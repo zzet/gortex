@@ -176,6 +176,8 @@ var plannerStatsIndexProbes = map[string]plannerStatsIndexProbe{
 		predicate: nodesGoReceiverTypePredicate,
 		partial:   true,
 	},
+	// The covering histogram index also competes with generation/kind reads.
+	"nodes_stats_histogram": {table: "nodes"},
 }
 
 // refreshPlannerStatsLocked recomputes sqlite_stat1 for the named graph

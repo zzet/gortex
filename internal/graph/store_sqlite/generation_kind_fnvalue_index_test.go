@@ -35,7 +35,7 @@ var generationSelectiveIndexDefinitions = []generationSelectiveIndexDefinition{
 	},
 }
 
-var generationSelectiveKindPlanQuery = `SELECT ` + lookupNodeCols + ` FROM nodes WHERE kind = ? AND view_gen = ?`
+var generationSelectiveKindPlanQuery = nodesByKindSQL
 var generationSelectiveFnvaluePlanQuery = `SELECT ` + lookupEdgeCols + ` FROM edges WHERE to_id LIKE '%::unresolved::fnvalue::%' AND view_gen = ?`
 
 const generationSelectiveKindResultQuery = `SELECT id, meta FROM nodes WHERE kind = ? AND view_gen = ? ORDER BY id`
@@ -214,8 +214,20 @@ func generationSelectiveSnapshot(t testing.TB, db *sql.DB) map[string]generation
 func requireGenerationSelectivePlans(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, generation := range []int{0, 3} {
-		requireGenerationLookupPlan(t, db, generationSelectiveKindPlanQuery, "nodes_by_kind", false,
-			[]any{"file", generation}, "kind=?", "view_gen=?")
+		plan := generationLookupPlan(t, db, generationSelectiveKindPlanQuery, "file", generation)
+		// Both dense indexes seek exactly the requested kind and generation.
+		// This unordered API does not require either equality's key order.
+		selective := false
+		for _, line := range strings.Split(plan, "\n") {
+			if (strings.Contains(line, "SEARCH nodes USING INDEX nodes_by_kind (") ||
+				strings.Contains(line, "SEARCH nodes USING INDEX nodes_stats_histogram (")) &&
+				strings.Contains(line, "kind=?") && strings.Contains(line, "view_gen=?") {
+				selective = true
+			}
+		}
+		if !selective || strings.Contains(plan, "SCAN nodes") || strings.Contains(plan, "TEMP B-TREE") {
+			t.Fatalf("kind read lost its exact kind/generation seek:\n%s", plan)
+		}
 		requireGenerationLookupPlan(t, db, generationSelectiveFnvaluePlanQuery, "edges_fnvalue_prefixed", false,
 			[]any{generation}, "view_gen=?")
 	}

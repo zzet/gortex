@@ -1855,6 +1855,7 @@ func (s *Store) Close() error {
 }
 
 const (
+	nodesByKindSQL  = `SELECT ` + lookupNodeCols + ` FROM nodes WHERE kind = ? AND view_gen = ?`
 	baseAllNodesSQL = `SELECT ` + lookupNodeCols + ` FROM nodes INDEXED BY nodes_by_generation WHERE view_gen = ? ORDER BY id`
 	baseAllEdgesSQL = `SELECT ` + lookupEdgeCols + `
 FROM edges INDEXED BY edges_by_generation
@@ -3691,8 +3692,7 @@ func (s *Store) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
 // EdgesByKind; derived generations are intentionally sparse.
 func (s *Store) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
 	return func(yield func(*graph.Node) bool) {
-		query := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE kind = ? AND view_gen = ?`
-		out := s.queryNodesSQL(query, string(kind), s.viewGen)
+		out := s.queryNodesSQL(nodesByKindSQL, string(kind), s.viewGen)
 		for _, n := range out {
 			if !yield(n) {
 				return
