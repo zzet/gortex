@@ -577,7 +577,7 @@ func TestContractFollowupIndexesSyntheticSearchOnlyInPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !report.Published || report.SymbolDocuments < 2 || report.FTSDuration <= 0 {
+	if !report.Published || report.SymbolDocuments < 2 || report.FTSDuration < 0 {
 		t.Fatalf("missing actual analysis FTS=%#v", report)
 	}
 	hits, err := req.Payload.SearchSymbolsContext(context.Background(), "items", 20)

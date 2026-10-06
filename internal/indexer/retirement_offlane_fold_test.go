@@ -112,8 +112,13 @@ func TestAgedRetirementDrainsUnrelatedGenerationDuringAPausedOffLaneFold(t *test
 	l.foregroundWork = func() (string, time.Time) { return "refresh_ticket", time.Now() }
 	l.interactiveDemand = func() bool { return true }
 	l.deferredRetirementEligibleSince.Store(time.Now().Add(-3 * time.Minute).UnixNano())
-	for i := 0; i < 20; i++ {
+	// A turn is bounded to50ms, not a fixed amount of nested cursor work.
+	// Resume under the existing30s parent; twenty turns is no API guarantee.
+	for ctx.Err() == nil {
 		_, _, err := l.SweepDeferredRetirements(ctx)
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			continue
+		}
 		require.NoError(t, err)
 		_, found, err := f.catalog.GetViewGeneration(ctx, obsolete)
 		require.NoError(t, err)
@@ -121,6 +126,7 @@ func TestAgedRetirementDrainsUnrelatedGenerationDuringAPausedOffLaneFold(t *test
 			break
 		}
 	}
+	require.NoError(t, ctx.Err(), "unrelated retirement exceeded the existing parent budget")
 	_, survives, err := f.catalog.GetViewGeneration(ctx, obsolete)
 	require.NoError(t, err)
 	require.False(t, survives, "an off-lane fold must not prevent unrelated retirement")
