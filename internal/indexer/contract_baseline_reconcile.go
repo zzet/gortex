@@ -37,9 +37,10 @@ func NewContractBaselineReconciler(options ContractFollowupCaptureOptions) func(
 		fenceErr := pin.ValidateAcceptedCurrent()
 		pin.Release()
 		if fenceErr != nil {
-			// Core is still applying or has no accepted source authority. Its
-			// outer publication will wake the already registered observation.
-			return false, nil
+			// Applying and interrupted raw authority share this refusal. Do not
+			// claim a producer exists: the consumer must recapture under its
+			// original deadline until accepted source authority is available.
+			return false, graph.ErrContractProjectionStale
 		}
 		baseline, err := options.Store.AtGeneration(0).ContractBoundaryReceiptBaselineContext(ctx, repo, "")
 		if err != nil {
@@ -62,7 +63,9 @@ func NewContractBaselineReconciler(options ContractFollowupCaptureOptions) func(
 		case slots <- struct{}{}:
 		default:
 			jobsMu.Unlock()
-			return false, nil
+			// The occupied slots have independently owned jobs that publish a
+			// global change after releasing admission capacity.
+			return true, nil
 		}
 		jobs[repo] = true
 		jobsMu.Unlock()
@@ -70,14 +73,18 @@ func NewContractBaselineReconciler(options ContractFollowupCaptureOptions) func(
 		options.BaselineJobs.Add(1)
 		go func() {
 			defer options.BaselineJobs.Done()
+			// Admission capacity must be available before waking a consumer
+			// that may need to repair another namespace in the same cohort.
+			defer func() {
+				if hooks := options.MultiIndexer.contractCoreRuntime.Load(); hooks != nil && hooks.Published != nil {
+					hooks.Published(options.Context, repo, "")
+				}
+			}()
 			defer lease.Release()
 			defer func() { <-slots; jobsMu.Lock(); delete(jobs, repo); jobsMu.Unlock() }()
 			err := reconcilePrimaryContractBaseline(options.Context, options, repo)
 			if err != nil && options.Context.Err() == nil && options.Logger != nil {
 				options.Logger.Warn("contract baseline reconstruction refused", zap.String("repo", repo), zap.Error(err))
-			}
-			if hooks := options.MultiIndexer.contractCoreRuntime.Load(); hooks != nil && hooks.Published != nil {
-				hooks.Published(options.Context, repo, "")
 			}
 		}()
 		return true, nil

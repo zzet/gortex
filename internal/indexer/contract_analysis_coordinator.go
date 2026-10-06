@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -123,12 +124,50 @@ func (c *ContractAnalysisCoordinator) Request(ctx context.Context, view *graphvi
 	}
 	key := graph.ContractAttachmentKey{RepoPrefix: repo, CheckoutID: checkout, InputVersion: inputs.State.InputVersion, InputFingerprint: inputs.State.InputFingerprint}
 	if !inputs.State.Accepted {
-		c.observeProgress(ctx, key)
+		waiter, observation := c.observeProgress(ctx, key)
 		if c.options.ReconcileBaseline != nil {
-			// The callback admits repair only when accepted core authority exists
-			// and its baseline is missing. Active core application stays waitable.
-			if _, err := c.options.ReconcileBaseline(ctx, view, repo, checkout); err != nil {
+			// A composed output can be pending because a different physical
+			// namespace lacks its baseline. Repair only captured primary inputs;
+			// immutable positive inputs remain owned by their core producer.
+			if err := inputs.Validate(ctx); err != nil {
+				c.forgetProgress(waiter, observation)
 				return false, err
+			}
+			pendingPrimary := make(map[string]bool)
+			pendingPositive := false
+			for _, witness := range inputs.Witnesses {
+				if !witness.Found || witness.State.Accepted {
+					continue
+				}
+				if witness.GenerationID == 0 && witness.State.CheckoutID == "" {
+					pendingPrimary[witness.State.RepoPrefix] = true
+				} else if witness.GenerationID > 0 {
+					pendingPositive = true
+				}
+			}
+			admitted := false
+			namespaces := make([]string, 0, len(pendingPrimary))
+			for namespace := range pendingPrimary {
+				namespaces = append(namespaces, namespace)
+			}
+			sort.Strings(namespaces)
+			for _, namespace := range namespaces {
+				started, err := c.options.ReconcileBaseline(ctx, nil, namespace, "")
+				if err != nil {
+					c.forgetProgress(waiter, observation)
+					return false, err
+				}
+				admitted = admitted || started
+			}
+			if !admitted && !pendingPositive {
+				c.forgetProgress(waiter, observation)
+				// A repair may have completed between validation and admission.
+				// Let the consumer recapture that change, rather than wait with
+				// no producer or label the superseded inputs unsupported.
+				if err := inputs.Validate(ctx); err != nil {
+					return false, err
+				}
+				return false, nil
 			}
 		}
 		return true, nil // Core acceptance/supersession owns eligibility, not this job.
@@ -246,6 +285,15 @@ func (c *ContractAnalysisCoordinator) Request(ctx context.Context, view *graphvi
 	default:
 	}
 	return true, nil
+}
+
+func (c *ContractAnalysisCoordinator) forgetProgress(waiter contractBaselineWaiter, observation *contractBaselineObservation) {
+	c.mu.Lock()
+	if c.baselines[waiter] == observation {
+		delete(c.baselines, waiter)
+	}
+	c.mu.Unlock()
+	observation.stop()
 }
 
 // observeProgress records a request-local acceptance observation before an
