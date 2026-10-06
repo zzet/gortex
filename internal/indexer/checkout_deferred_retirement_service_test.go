@@ -66,7 +66,7 @@ func TestDeferredRetirementDiscoversAndAgesDebtDuringPendingRequests(t *testing.
 	require.Greater(t, chunks, int64(1), "service must advance more than one quantum per quiet permit")
 }
 
-func TestAgedRetirementServesACommittedChunkBeforeQueuedEditGetsTheLane(t *testing.T) {
+func TestAgedRetirementUsesBoundedBudgetBeforeQueuedEditGetsTheLane(t *testing.T) {
 	l, gate, id := agedRetirementFixture(t)
 	// Keep a permanent interactive waiter while an aged background request
 	// qualifies through the existing fairness rule; no new scheduler path.
@@ -102,8 +102,12 @@ func TestAgedRetirementServesACommittedChunkBeforeQueuedEditGetsTheLane(t *testi
 	}()
 	var committed store_sqlite.PayloadRetirementProgress
 	l.retireQuantum = func(ctx context.Context, generationID int64, inUse func(int64) bool) (store_sqlite.PayloadRetirementProgress, error) {
+		if generationID != id {
+			return store_sqlite.PayloadRetirementProgress{}, fmt.Errorf("wrong retirement generation: %d", generationID)
+		}
 		progress, err := l.store.RetirePayloadGenerationQuantum(ctx, generationID, inUse)
-		committed = progress
+		committed.ChunksCommitted += progress.ChunksCommitted
+		committed.RowsDeleted += progress.RowsDeleted
 		return progress, err
 	}
 	go func() { _, _, err := l.SweepDeferredRetirements(ctx); sweepDone <- err }()
@@ -135,10 +139,12 @@ func TestAgedRetirementServesACommittedChunkBeforeQueuedEditGetsTheLane(t *testi
 	case <-time.After(5 * time.Second):
 		t.Fatal("bounded service did not finish")
 	}
-	require.EqualValues(t, 1, committed.ChunksCommitted)
-	require.LessOrEqual(t, committed.RowsDeleted, int64(16))
-	require.True(t, l.retirementDebtAged(time.Now()), "one committed quantum cannot make existing debt young")
-	requireGenerationStateWithPayload(t, l.store, id, store_sqlite.ViewGenerationRetiring)
+	require.Positive(t, committed.ChunksCommitted)
+	require.LessOrEqual(t, committed.RowsDeleted, int64(64))
+	// Completion may clear debt; partial work must keep its original age.
+	if l.hasDeferredRetirementWork() {
+		require.True(t, l.retirementDebtAged(time.Now()))
+	}
 }
 
 func TestAgedRetirementCannotEnterAnActualHeldEditCycle(t *testing.T) {
@@ -367,5 +373,84 @@ func TestRetirementBurstDistinguishesAutomaticRollbackFromLiveSQLFailure(t *test
 			requireGenerationStateWithPayload(t, l.store, id, store_sqlite.ViewGenerationRetiring)
 			require.False(t, gate.Stats().Active)
 		})
+	}
+}
+
+func TestQueuedRetirementContinuesToActualWriterRefusal(t *testing.T) {
+	l, gate, id := agedRetirementFixture(t)
+	// Keep a permanent interactive waiter while an aged background request
+	// qualifies through the existing fairness rule; no new scheduler path.
+	gate.backgroundStarvation = 0
+	hold, err := gate.Acquire(t.Context(), ViewBuildInteractive)
+	require.NoError(t, err)
+	gate.mu.Lock()
+	gate.interactiveBurst = maxInteractiveBuildBurst
+	gate.mu.Unlock()
+	var release sync.Once
+	unpark := func() { release.Do(hold) }
+	ctx, cancel := context.WithCancel(t.Context())
+	sweepDone := make(chan error, 1)
+	editDone := make(chan time.Time, 1)
+	sweepJoined, editJoined := false, false
+	defer func() {
+		cancel()
+		unpark()
+		if !sweepJoined {
+			select {
+			case <-sweepDone:
+			case <-time.After(5 * time.Second):
+				t.Error("retirement did not join")
+			}
+		}
+		if !editJoined {
+			select {
+			case <-editDone:
+			case <-time.After(5 * time.Second):
+				t.Error("edit admission did not join")
+			}
+		}
+	}()
+	calls := 0
+	l.owed[id] = struct{}{}
+	l.retireQuantum = func(ctx context.Context, generationID int64, inUse func(int64) bool) (store_sqlite.PayloadRetirementProgress, error) {
+		calls++
+		if calls == 1 {
+			return store_sqlite.PayloadRetirementProgress{ChunksCommitted: 1, RowsDeleted: 16}, nil
+		}
+		return store_sqlite.PayloadRetirementProgress{}, store_sqlite.ErrPayloadRetirementWriteWanted
+	}
+	go func() { _, _, err := l.SweepDeferredRetirements(ctx); sweepDone <- err }()
+	require.Eventually(t, func() bool { return gate.Stats().BackgroundQueued == 1 }, 5*time.Second, time.Millisecond)
+	go func() {
+		permit, err := gate.Acquire(ctx, ViewBuildInteractive)
+		if err == nil {
+			editDone <- time.Now()
+			permit()
+		} else {
+			editDone <- time.Time{}
+		}
+	}()
+	require.Eventually(t, func() bool { return gate.Stats().InteractiveQueued == 1 }, 5*time.Second, time.Millisecond)
+	from := time.Now()
+	unpark()
+	select {
+	case at := <-editDone:
+		editJoined = true
+		require.False(t, at.IsZero())
+		require.LessOrEqual(t, at.Sub(from), 100*time.Millisecond)
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued edit did not acquire after bounded service")
+	}
+	select {
+	case err := <-sweepDone:
+		sweepJoined = true
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("bounded service did not finish")
+	}
+	require.Equal(t, 2, calls, "queued demand permits the next quantum; actual writer refusal stops it")
+	// Completion may clear debt; partial work must keep its original age.
+	if l.hasDeferredRetirementWork() {
+		require.True(t, l.retirementDebtAged(time.Now()))
 	}
 }

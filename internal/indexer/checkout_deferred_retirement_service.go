@@ -37,8 +37,9 @@ func (l *CheckoutLifecycle) retirementDebtAged(now time.Time) bool {
 // serveDeferredRetirementBurst is the permit-backed daemon path. Waiting for
 // the fair background lane consumes no cycle lock or writer; the one shared
 // active deadline bounds every quantum, catalog fence and cursor advance.
-// Queued edits get the lane back after one committed chunk, not the whole
-// burst. An actual writer can also interrupt a transaction through the Store.
+// Queued edits get the lane back within the existing bounded burst. Queue
+// presence alone does not discard its budget; an actual writer can still
+// interrupt a transaction through the Store.
 func (l *CheckoutLifecycle) serveDeferredRetirementBurst(
 	ctx context.Context, gate *ViewBuildGate, ordered []int64,
 	owners map[int64]*CheckoutCoordinator, discoveryErr error,
@@ -147,9 +148,6 @@ func (l *CheckoutLifecycle) serveDeferredRetirementBurst(
 		if errors.Is(retireErr, store_sqlite.ErrPayloadSweepBudgetExhausted) && progress.ChunksCommitted == 0 {
 			// The Store's own WAL observation refused admission. This is
 			// neither an empty-source proof nor a reason to churn siblings.
-			break
-		}
-		if committed.ChunksCommitted > 0 && gate.Stats().InteractiveQueued > 0 {
 			break
 		}
 		if progress.CatalogRemoved || progress.ChunksCommitted == 0 {
