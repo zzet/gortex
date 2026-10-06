@@ -1,3 +1,5 @@
+//go:build acceptance
+
 package main
 
 import (
@@ -26,6 +28,24 @@ import (
 	"github.com/zzet/gortex/internal/testdsn"
 )
 
+// sustainedIOJudgedWindows maps a frozen phase name onto the sub-window that reproduces
+// the measurement its ceiling was frozen from.
+//
+// The frozen P1/P8 ceilings were measured over one 60 s window that polled a
+// read-only search every 5 s. The workload now measures idle twice — a quiet
+// arm and a polling arm, each holding the same 60 s — so the PHASE spans twice
+// the frozen duration and its total is the sum of two different questions.
+// Judging that sum against the frozen number would inflate every post-fix
+// P1/P8 row by construction. The polling arm is the frozen measurement,
+// unchanged in duration and period, so the frozen phase name is judged on it
+// and the quiet arm stays an un-budgeted row of its own. An arm that carries no
+// such window — every artifact measured before the split, the frozen baseline
+// included — is judged on the phase, exactly as before.
+var sustainedIOJudgedWindows = map[string]string{
+	"P1_idle_cold": sustainedIOWindowIdleColdPolling,
+	"P8_idle_warm": sustainedIOWindowIdleWarmPolling,
+}
+
 // The sustained-workload I/O harness.
 //
 // issue767_idle_io_integration_test.go measures an idle daemon; this measures a
@@ -37,7 +57,8 @@ import (
 // own viewmetrics counters and a destination census of every byte under the
 // private root.
 //
-// It is opt-in (GX_SUSTAINED_IO_TEST_BINARY) and never runs in a default `go test ./...`.
+// Build with -tags acceptance and set GX_SUSTAINED_IO_TEST_BINARY to run the native workload.
+// The harness and its self-tests are excluded from default `go test ./...`.
 // The instrument itself — generator, sampler, checkpoint counter, manifest,
 // attribution, phase plan, timeout arithmetic — is unit-tested in
 // sustained_io_fixture_generator_test.go, sustained_io_sampler_test.go and at the bottom of this
