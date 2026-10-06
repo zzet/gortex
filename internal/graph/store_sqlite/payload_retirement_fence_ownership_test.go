@@ -32,6 +32,11 @@ func TestRetirementSuccessorWaitsOutsideWriterGate(t *testing.T) {
 	for _, mode := range []string{"quantum", "slice", "full", "cancel"} {
 		t.Run(mode, func(t *testing.T) {
 			s := openPayloadStore(t)
+			// Twice the production quantum: the first quantum is parked inside
+			// its DELETE until the successor queues, and that wait counts
+			// against its real-time budget. If its budget runs out it rolls the
+			// DELETE back. Missing even double the budget means a real slowdown.
+			s.retirementQuantumOverride = 2 * payloadRetirementQuantumDuration
 			seedPayloadBase(t, s)
 			seedPayloadControlPlane(t, s)
 			id, _, err := s.BeginPayloadGeneration(t.Context(), payloadRequest())
@@ -56,9 +61,12 @@ func TestRetirementSuccessorWaitsOutsideWriterGate(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			entered, releaseSQL := make(chan struct{}), make(chan struct{})
-			var unblock sync.Once
+			var unblock, enterOnce sync.Once
 			retirementFenceObserver.Store(&retirementFenceProbe{enter: func() {
-				close(entered)
+				// The trigger fires again if the first quantum's DELETE rolls
+				// back and the successor deletes the row. That must fail the
+				// assertions below, not panic and take the package run down.
+				enterOnce.Do(func() { close(entered) })
 				select {
 				case <-releaseSQL:
 				case <-ctx.Done():
