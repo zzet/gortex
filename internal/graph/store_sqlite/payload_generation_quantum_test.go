@@ -232,7 +232,9 @@ func TestPayloadRetirementQuantumSerializesConcurrentResumeHints(t *testing.T) {
 					done <- result{}
 					return
 				}
-				if !errors.Is(err, ErrPayloadSweepBudgetExhausted) && !errors.Is(err, ErrPayloadRetirementWriteWanted) {
+				// The quantum owns a shorter internal deadline than this bounded
+				// concurrent driver. Resume that yield only while its parent is live.
+				if !resumeConcurrentRetirementQuantum(ctx, err) {
 					done <- result{err: err}
 					return
 				}

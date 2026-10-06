@@ -45,13 +45,22 @@ func TestDeferredRetirementDiscoversAndAgesDebtDuringPendingRequests(t *testing.
 	l.deferredRetirementEligibleSince.Store(time.Now().Add(-3 * time.Minute).UnixNano())
 	core, logs := observer.New(zap.InfoLevel)
 	l.logger = zap.New(core)
-	for attempt := 0; attempt < 20; attempt++ {
-		_, pending, err = l.SweepDeferredRetirements(t.Context())
+	// Each sweep may spend its 50ms budget proving empty nested tables.
+	// Twenty calls is not an API convergence guarantee. Keep an explicit
+	// bounded driver, matching the concurrent Store retirement control.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	for attempt := 0; attempt < 512 && ctx.Err() == nil; attempt++ {
+		_, pending, err = l.SweepDeferredRetirements(ctx)
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			continue // only a shorter internal budget may be resumed
+		}
 		require.NoError(t, err)
 		if !pending {
 			break
 		}
 	}
+	require.NoError(t, ctx.Err(), "retirement exceeded its bounded convergence control")
 	require.False(t, pending)
 	requireGenerationRetired(t, l.store, id)
 	require.Zero(t, l.deferredRetirementEligibleSince.Load())
