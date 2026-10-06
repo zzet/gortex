@@ -63,14 +63,17 @@ func TestPublicationStampLandsOnABoundRecord(t *testing.T) {
 // its successful ticket must preserve that event, never clamp it to enqueue.
 func TestCyclePublicationStampsKeepTheActualPreEnqueueInstant(t *testing.T) {
 	origin := time.Now()
-	key := "cycle-stamps-" + origin.Format("150405.000000000")
+	key := t.TempDir()
 	owed := DefaultPublicationPhases().Begin(key, key+"-owed", "fresh_request", origin)
 	owed.BindTicket(1)
 	ctx := withPublicationTarget(WithPublicationStamps(context.Background()), key, 1)
 	markPublicationPhase(ctx, PublicationPublished)
+	publishedAt := PublicationStampsFrom(ctx).marks[0].at
 	late := DefaultPublicationPhases().Begin(key, key+"-late", "fresh_request", origin)
 	late.BindTicket(2)
-	late.Mark(PublicationTicketEnqueued)
+	// Consecutive clock reads can be equal; derive a strictly later fixture
+	// enqueue from the event captured by the real cycle fanout.
+	late.MarkAt(PublicationTicketEnqueued, publishedAt.Add(time.Millisecond))
 	late.Absorb(PublicationStampsFrom(ctx))
 	owedOffsets, lateOffsets := phaseOffsets(owed.Snapshot()), phaseOffsets(late.Snapshot())
 	at, found := lateOffsets[PublicationPublished]
