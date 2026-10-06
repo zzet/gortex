@@ -190,9 +190,21 @@ func TestPressureReaderDrainReopensForCancellationAndForegroundWrite(t *testing.
 			defer ckpt.Close()
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
+			// This control tests cancellation after a witnessed Busy reset. An
+			// expired initial 50 ms writer credit correctly refuses before drain;
+			// requiring Busy inside that credit would make fixture setup depend
+			// on scheduling. Keep the same pinned reader and actual writer, and
+			// establish the Busy precondition within the existing fixture budget.
+			require.NoError(t, s.writeMu.LockContext(ctx))
+			busyResult, busyErr := s.resetWALForReclaim(ctx)
+			s.writeMu.Unlock()
+			require.ErrorIs(t, busyErr, errSQLiteCheckpointIncomplete)
+			require.Positive(t, busyResult.Busy)
 			done := make(chan error, 1)
-			var res walReclaimResult
-			go func() { done <- s.reclaimWALPressureReset(ctx, ckpt, &res) }()
+			res := walReclaimResult{pressureResetBusy: true}
+			go func() {
+				done <- s.reclaimWALPressureResetAfterReaderDrain(ctx, ckpt, &res, defaultWALReclaimDrainDeadline)
+			}()
 			joined := false
 			t.Cleanup(func() {
 				cancel()
