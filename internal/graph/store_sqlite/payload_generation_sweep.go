@@ -424,6 +424,9 @@ func (s *Store) payloadSweepSteps(generationID int64) []payloadSweepStep {
 // re-populate a table an earlier step emptied. A lost cursor costs one empty
 // chunk per completed step and nothing else.
 func (s *Store) sweepPayloadGeneration(ctx context.Context, generationID int64, pass *payloadSweepPass) error {
+	if pass != nil && pass.budget.quantum != nil {
+		return s.sweepPayloadQuantumTransaction(ctx, generationID, pass)
+	}
 	steps := s.payloadSweepSteps(generationID)
 	state := s.payloadSweepStateFor(generationID)
 	if pass != nil && pass.state != nil {

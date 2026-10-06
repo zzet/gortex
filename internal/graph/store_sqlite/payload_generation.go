@@ -1169,12 +1169,21 @@ func deleteGenerationRowsChunk(query string, generationID int64) payloadSweepChu
 // the virtual table does and the next chunk sees the batch after it.
 func deleteFTSDocidChunk(docidMap ftsDocidMap, generationID int64) payloadSweepChunk {
 	return func(ctx context.Context, tx *sql.Tx) (int64, error) {
+		if err := payloadQuantumStatementGuard(ctx); err != nil {
+			return 0, err
+		}
 		docids, err := generationFTSDocids(ctx, tx, docidMap.ids, generationID)
 		if err != nil || len(docids) == 0 {
 			return 0, err
 		}
 		list := sqlInt64List(docids)
+		if err := payloadQuantumStatementGuard(ctx); err != nil {
+			return 0, err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM `+docidMap.fts+` WHERE rowid IN (`+list+`)`); err != nil {
+			return 0, err
+		}
+		if err := payloadQuantumStatementGuard(ctx); err != nil {
 			return 0, err
 		}
 		if _, err := tx.ExecContext(ctx,
