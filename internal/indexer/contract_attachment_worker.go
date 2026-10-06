@@ -15,6 +15,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
+	"github.com/zzet/gortex/internal/fixtures"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
@@ -1000,7 +1001,7 @@ func (e *contractFollowupEvidence) loadFile(path string) ([]*graph.Node, []*grap
 			return nil, nil, e.err
 		}
 		nodes = append(nodes, copyNode)
-		if node.Kind == graph.KindFile {
+		if node.Kind == graph.KindFile || (node.Kind == graph.KindFixture && node.ID == path && fixtures.IsFixturePath(path) && node.Meta["fixture"] == true) {
 			fileFound = true
 		}
 	}
