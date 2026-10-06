@@ -3,14 +3,10 @@ package store_sqlite
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/zzet/gortex/internal/graph"
 )
 
 func readGenerationRows(t *testing.T, s *Store, generation int64) []SymbolFTSRow {
@@ -119,46 +115,6 @@ func TestFreshSymbolFTSRowsBounds(t *testing.T) {
 		require.True(t, complete)
 		require.Len(t, rows, 1)
 	})
-}
-
-// Rows written per second through the batch path with and without the
-// fresh-rows buffer. Set GORTEX_FTS_FRESH_RATE=1 to run it (it is a
-// measurement, not a check): edit-sized batches of 400 documents, 20 per
-// round, alternating the buffer off and on for 10 rounds on one store.
-func TestFreshSymbolFTSRowsWriteRate(t *testing.T) {
-	if os.Getenv("GORTEX_FTS_FRESH_RATE") != "1" {
-		t.Skip("set GORTEX_FTS_FRESH_RATE=1")
-	}
-	store, generationID, handle := beginManifestGeneration(t)
-	_ = store
-	const batch, batches, rounds = 400, 20, 10
-	var off, on []float64
-	seq := 0
-	run := func(buffered bool) float64 {
-		freshFTSOff.Store(!buffered)
-		started := time.Now()
-		for i := 0; i < batches; i++ {
-			items := make([]graph.SymbolFTSItem, batch)
-			for j := range items {
-				seq++
-				items[j] = graph.SymbolFTSItem{NodeID: fmt.Sprintf("%s/rate%07d.go::R%07d", payloadRepo, seq, seq), Tokens: fmt.Sprintf("rate%d handler checkout coordinator route flip", seq)}
-			}
-			require.NoError(t, handle.BatchUpsertSymbolFTS(items))
-		}
-		elapsed := time.Since(started)
-		// Keep the buffer from reaching its bound across rounds.
-		store.TakeFreshSymbolFTSRows(generationID)
-		return float64(batch*batches) / elapsed.Seconds()
-	}
-	t.Cleanup(func() { freshFTSOff.Store(false) })
-	for r := 0; r < rounds; r++ {
-		off = append(off, run(false))
-		on = append(on, run(true))
-	}
-	sort.Float64s(off)
-	sort.Float64s(on)
-	t.Logf("rows/s, median of %d rounds of %d x %d: without buffer %.0f (min %.0f max %.0f), with buffer %.0f (min %.0f max %.0f), ratio %.3f",
-		rounds, batches, batch, off[rounds/2], off[0], off[rounds-1], on[rounds/2], on[0], on[rounds-1], on[rounds/2]/off[rounds/2])
 }
 
 // Closing a store drops its fresh-rows buffers.

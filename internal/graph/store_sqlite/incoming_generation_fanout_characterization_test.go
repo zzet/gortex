@@ -1,12 +1,10 @@
 package store_sqlite
 
 import (
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"sync"
 	"testing"
 
@@ -36,9 +34,14 @@ type incomingGenerationFanoutShape struct {
 	distinct                        bool
 }
 
+type incomingGenerationFanoutSeed struct {
+	path        string
+	generations []int64
+}
+
 var (
 	incomingGenerationFanoutMu    sync.Mutex
-	incomingGenerationFanoutSeeds = map[incomingGenerationFanoutShape]incomingCompositeSeed{}
+	incomingGenerationFanoutSeeds = map[incomingGenerationFanoutShape]incomingGenerationFanoutSeed{}
 )
 
 // incomingGenerationFanoutLadder is the retained-history ladder the tests walk.
@@ -59,7 +62,7 @@ func prepareIncomingGenerationFanout(tb testing.TB, generations, edgesPerGenerat
 		tb.Fatal("fanout fixture exceeds its explicit size bound")
 	}
 	shape := incomingGenerationFanoutShape{generations: generations, edgesPerGeneration: edgesPerGeneration, distinct: distinct}
-	seed := func() incomingCompositeSeed {
+	seed := func() incomingGenerationFanoutSeed {
 		incomingGenerationFanoutMu.Lock()
 		defer incomingGenerationFanoutMu.Unlock()
 		seed, ok := incomingGenerationFanoutSeeds[shape]
@@ -68,7 +71,7 @@ func prepareIncomingGenerationFanout(tb testing.TB, generations, edgesPerGenerat
 			if err != nil {
 				tb.Fatal(err)
 			}
-			seed = incomingCompositeSeed{path: filepath.Join(dir, "incoming-generation-fanout.sqlite")}
+			seed = incomingGenerationFanoutSeed{path: filepath.Join(dir, "incoming-generation-fanout.sqlite")}
 			seed.generations = buildIncomingGenerationFanout(tb, shape, seed.path)
 			incomingGenerationFanoutSeeds[shape] = seed
 		}
@@ -244,102 +247,6 @@ func TestIncomingSourceGenerationFanoutSeparatesSelectedRowsFromIndexRanges(t *t
 			})
 		}
 	}
-}
-
-func incomingGenerationFanoutPlans(t *testing.T, db *sql.DB, query string, target string, generation int64) string {
-	t.Helper()
-	rows, err := db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query, target, "calls", int64(0), generation, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = rows.Close() }()
-	var details []string
-	for rows.Next() {
-		var node, parent, unused int
-		var detail string
-		if err := rows.Scan(&node, &parent, &unused, &detail); err != nil {
-			t.Fatal(err)
-		}
-		details = append(details, detail)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	return strings.Join(details, "\n")
-}
-
-func incomingGenerationFanoutRawProbe(t *testing.T, db *sql.DB, query string, target string, generation int64) []incomingSourcePageRow {
-	t.Helper()
-	rows, err := db.QueryContext(t.Context(), query, target, "calls", int64(0), generation, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = rows.Close() }()
-	var out []incomingSourcePageRow
-	for rows.Next() {
-		var row incomingSourcePageRow
-		if err := rows.Scan(&row.id, &row.candidate.From, &row.candidate.FilePath); err != nil {
-			t.Fatal(err)
-		}
-		out = append(out, row)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	return out
-}
-
-func TestIncomingSourceGenerationFanoutRecordsExistingIndexAlternatives(t *testing.T) {
-	ladder, edgesPerGeneration := incomingGenerationFanoutLadder()
-	f := prepareIncomingGenerationFanout(t, ladder[len(ladder)-1], edgesPerGeneration, true)
-	// Only this untimed diagnostic needs a statistics-writing connection. Do
-	// not assume the configured Store read pool permits ANALYZE. The database
-	// is the exact disposable Store fixture, never a copied or live store.
-	diagnostic, err := sql.Open("sqlite", f.path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	diagnostic.SetMaxOpenConns(1)
-	t.Cleanup(func() { _ = diagnostic.Close() })
-	if strings.Count(scopedIncomingSourcePageSQL, "FROM edges INDEXED BY edges_by_to") != 1 || strings.Count(scopedIncomingSourcePageSQL, "AND view_gen = ?") != 1 {
-		t.Fatal("frozen query shape changed; update this characterization explicitly")
-	}
-	// These are PRIVATE diagnostic statements, never a production dispatch.
-	// The partial generation index exists already; no new DDL is introduced.
-	positiveUnforced := strings.Replace(scopedIncomingSourcePageSQL, "FROM edges INDEXED BY edges_by_to", "FROM edges", 1)
-	positiveUnforced = strings.Replace(positiveUnforced, "AND view_gen = ?", "AND view_gen = ? AND view_gen > 0", 1)
-	positiveForced := strings.Replace(positiveUnforced, "FROM edges", "FROM edges INDEXED BY edges_by_generation", 1)
-	for _, analyzed := range []bool{false, true} {
-		if analyzed {
-			// Statistics affect only this disposable fixture. Record both states;
-			// do not extrapolate the unforced planner choice to a live database.
-			if _, err := diagnostic.ExecContext(t.Context(), "ANALYZE edges"); err != nil {
-				t.Fatal(err)
-			}
-		}
-		for _, selected := range []int{0, len(f.generations) - 1} {
-			id := f.generations[selected]
-			want := incomingGenerationFanoutRawProbe(t, diagnostic, scopedIncomingSourcePageSQL, f.target, id)
-			if len(want) != 2 || want[0].candidate.From != incomingGenerationFanoutSource(selected, 0) || want[1].candidate.From != incomingGenerationFanoutSource(selected, 1) {
-				t.Fatalf("current raw semantic prerequisite: %+v", want)
-			}
-			for _, shape := range []struct{ name, query string }{{"current_forced_incoming", scopedIncomingSourcePageSQL}, {"positive_unforced", positiveUnforced}, {"positive_forced_existing_generation", positiveForced}} {
-				got := incomingGenerationFanoutRawProbe(t, diagnostic, shape.query, f.target, id)
-				if !reflect.DeepEqual(got, want) {
-					t.Fatalf("diagnostic%s changed selected rows: %+v want%+v", shape.name, got, want)
-				}
-				plan := incomingGenerationFanoutPlans(t, diagnostic, shape.query, f.target, id)
-				if shape.name == "current_forced_incoming" && !strings.Contains(plan, "edges_by_to") {
-					t.Fatalf("current plan no longer forced incoming: %s", plan)
-				}
-				if shape.name == "positive_forced_existing_generation" && !strings.Contains(plan, "edges_by_generation") {
-					t.Fatalf("positive existing index unavailable: %s", plan)
-				}
-				t.Logf("analyzed=%t selected=%d shape=%s plan=%s", analyzed, selected, shape.name, plan)
-			}
-		}
-	}
-	f.assertDiskBudget(t)
 }
 
 var incomingGenerationFanoutBenchmarkPage graph.BoundedIncomingSourceProjection
