@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -130,20 +131,30 @@ var errWALPressureHold = errors.New("store_sqlite: wal reclaim: the reset did no
 // urgent slow-copy tail gets one longer slice under the aggregate two-second
 // allowance, rather than repeatedly letting writes overtake the final sync.
 func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult) error {
+	return s.reclaimWALPressureResetWithDrain(ctx, ckptDB, res, defaultWALReclaimDrainDeadline)
+}
+
+func (s *Store) reclaimWALPressureResetWithDrain(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult, drainAllowance time.Duration) error {
 	operationCtx, cancel := context.WithTimeout(ctx, walReclaimLaneBudget)
 	defer cancel()
-	err := s.reclaimWALPressureResetOnce(operationCtx, ckptDB, res, walReclaimPressureHold)
+	err := s.reclaimWALPressureResetOnce(operationCtx, ckptDB, res, walReclaimPressureHold, false)
 	if err == nil || operationCtx.Err() != nil {
 		return err
 	}
-	if budget := res.takeAdaptiveWriterBudget(); budget > 0 {
-		res.reason = ""
-		return s.reclaimWALPressureResetOnce(operationCtx, ckptDB, res, budget)
+	if !res.pressureResetBusy {
+		if budget := res.takeAdaptiveWriterBudget(); budget > 0 {
+			res.reason = ""
+			err = s.reclaimWALPressureResetOnce(operationCtx, ckptDB, res, budget, false)
+		}
+	}
+	if err != nil && operationCtx.Err() == nil && res.pressureResetBusy && s.readGate != nil && !walReclaimSkipQuiescence && drainAllowance > 0 && res.writerSpent < walReclaimMaxWriterHold {
+		return s.reclaimWALPressureResetAfterReaderDrain(operationCtx, ckptDB, res, drainAllowance)
 	}
 	return err
 }
 
-func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult, budget time.Duration) error {
+func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult, budget time.Duration, preemptible bool) error {
+	res.pressureResetBusy = false
 	// What the hold may still copy: half the cap at the rate the convergence
 	// measured, and never less than walReclaimPressureSmallFrames.
 	allowed := walReclaimPressureSmallFrames
@@ -169,6 +180,12 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 		writer.release()
 		res.recordWriterCredit(writer, adaptiveCopy)
 	}()
+	if preemptible {
+		if s.writeWanted() {
+			res.reason = "pressure_foreground_writer"
+			return errWALReclaimWriterWaiting
+		}
+	}
 	if s.bulkConn != nil && !res.leaseOverride {
 		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
 		return errWALCheckpointDeferredBulk
@@ -217,7 +234,25 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 		s.walCopy.pressureGiveUps.Add(1)
 		return errWALPressureHold
 	}
-	result, err := s.resetWALForReclaim(writer.resetContext(hctx))
+	// Any slow-copy readmission has finished; no own waiter is visible here.
+	if preemptible && s.writeWanted() {
+		res.reason = "pressure_foreground_writer"
+		return errWALReclaimWriterWaiting
+	}
+	resetCtx := writer.resetContext(hctx)
+	if preemptible {
+		// Poll only the held reset, after any passive readmission completed.
+		// The copy keeps its original timed writer credit; no watcher sees
+		// this background operation's own acquisition as a foreground waiter.
+		var stopYield func()
+		resetCtx, stopYield = s.yieldToWriters(resetCtx)
+		defer stopYield()
+	}
+	result, err := s.resetWALForReclaim(resetCtx)
+	if preemptible && err != nil && errors.Is(context.Cause(resetCtx), errWALReclaimWriterWaiting) {
+		err = errWALReclaimWriterWaiting
+	}
+	res.pressureResetBusy = result.Busy > 0 && errors.Is(err, errSQLiteCheckpointIncomplete)
 	if err != nil {
 		res.reason = fmt.Sprintf("pressure_reset busy=%d wal_frames=%d checkpointed=%d error=%v", result.Busy, result.WALFrames, result.CheckpointedFrames, err)
 		s.walCopy.pressureGiveUps.Add(1)
@@ -227,4 +262,69 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	s.walCopy.pressureLaneResets.Add(1)
 	log.Printf("store_sqlite: wal reclaim reset inside a busy lane writer_hold=%s", time.Since(held).Round(time.Microsecond))
 	return nil
+}
+
+// A witnessed busy reset may close admission briefly, without holding the
+// writer while existing readers drain. Drain, writer admission and reset all
+// share the configured drain allowance; the writer still gets at most its
+// existing short credit and remaining aggregate allowance.
+func (s *Store) reclaimWALPressureResetAfterReaderDrain(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult, allowance time.Duration) error {
+	if s.writeWanted() {
+		res.reason = "pressure_foreground_writer"
+		return errWALReclaimWriterWaiting
+	}
+	started := time.Now()
+	pauseCtx, cancel := context.WithDeadline(ctx, started.Add(allowance))
+	defer cancel()
+	yieldCtx, stopYield := s.yieldToWriters(pauseCtx)
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(stopYield) }
+	defer stop()
+	reopen, inFlight, err := s.readGate.quiesce(yieldCtx, started.Add(allowance))
+	if err != nil {
+		if !errors.Is(err, errReadGateBusy) {
+			res.pause += time.Since(started)
+			res.pauseClosed = true
+		}
+		if errors.Is(context.Cause(yieldCtx), errWALReclaimWriterWaiting) {
+			err = errWALReclaimWriterWaiting
+		}
+		res.reason = fmt.Sprintf("pressure_reader_drain readers=%d error=%v", inFlight, err)
+		return err
+	}
+	// A slow uninterruptible checkpoint must not extend closed admission.
+	var resumeOnce sync.Once
+	released := make(chan time.Time, 1)
+	resume := func() { resumeOnce.Do(func() { reopen(); released <- time.Now() }) }
+	timerJoined := make(chan struct{})
+	stopReopen := context.AfterFunc(pauseCtx, func() { resume(); close(timerJoined) })
+	defer func() {
+		stopped := stopReopen()
+		resume()
+		if !stopped {
+			<-timerJoined
+		}
+		res.pause += (<-released).Sub(started)
+		res.pauseClosed = true
+	}()
+	if err := yieldCtx.Err(); err != nil {
+		if errors.Is(context.Cause(yieldCtx), errWALReclaimWriterWaiting) {
+			err = errWALReclaimWriterWaiting
+		}
+		res.reason = fmt.Sprintf("pressure_reader_drain error=%v", err)
+		return err
+	}
+	if s.writeWanted() {
+		res.reason = "pressure_foreground_writer"
+		return errWALReclaimWriterWaiting
+	}
+	credit := min(walReclaimPressureHold, walReclaimMaxWriterHold-res.writerSpent, time.Until(started.Add(allowance)))
+	if credit <= 0 {
+		res.reason = "pressure_reader_pause_credit_exhausted"
+		return context.DeadlineExceeded
+	}
+	// Never count our own pending writer admission as a foreground waiter.
+	stop()
+	res.reason = ""
+	return s.reclaimWALPressureResetOnce(pauseCtx, ckptDB, res, credit, true)
 }

@@ -420,6 +420,8 @@ type walReclaimResult struct {
 	// member to retire, then ask SQLite again without waiting for harmless
 	// database-only readers. Each reset hold clears this transient witness.
 	resetReaders *walReclaimResetReaders
+	// A positive SQLite Busy result from the most recent pressure reset.
+	pressureResetBusy bool
 	// converged: step 2 backfilled the whole log (convergedFrames frames)
 	// and every reader admitted before that point has left, so any reader
 	// still in flight took read mark 0 unless the log grew since.
@@ -855,7 +857,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	}
 	if pressure && s.buildLaneBusy() {
 		// Inside the busy lane: the reset alone, under its own short cap.
-		err := s.reclaimWALPressureReset(attempt.ctx, ckptDB, &res)
+		err := s.reclaimWALPressureResetWithDrain(attempt.ctx, ckptDB, &res, cfg.drainDeadline)
 		res.bytesAfter = walFileSize(walPath)
 		if err == nil {
 			res.outcome = walReclaimReset
