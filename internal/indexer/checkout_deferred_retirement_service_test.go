@@ -185,7 +185,7 @@ func TestAgedRetirementCannotEnterAnActualHeldEditCycle(t *testing.T) {
 }
 
 func TestAgedRetirementRefusalsDoNotInventProgressOrRefreshDebtAge(t *testing.T) {
-	for _, kind := range []string{"lease", "wal", "fold", "sweep_mutex"} {
+	for _, kind := range []string{"lease", "wal", "build_flight", "sweep_mutex"} {
 		t.Run(kind, func(t *testing.T) {
 			l, gate, id := agedRetirementFixture(t)
 			l.owed[id] = struct{}{}
@@ -197,8 +197,15 @@ func TestAgedRetirementRefusalsDoNotInventProgressOrRefreshDebtAge(t *testing.T)
 				defer lease.Release()
 			case "wal":
 				l.walBytes = func() int64 { return deferredRetirementWALPause + 1 }
-			case "fold":
-				l.foldInFlight = func() bool { return true }
+			case "build_flight":
+				// Admit the physical owner before failing its output, as in
+				// the abandonment handoff that retirement must not interrupt.
+				require.NoError(t, l.store.Catalog().SetViewGenerationState(t.Context(), id, store_sqlite.ViewGenerationBuilding, store_sqlite.ViewGenerationFailed))
+				flight, leader, _, err := l.store.JoinPayloadBuildFlight(t.Context(), id, false)
+				require.NoError(t, err)
+				require.True(t, leader)
+				defer flight.Complete(nil)
+				require.NoError(t, l.store.Catalog().SetViewGenerationState(t.Context(), id, store_sqlite.ViewGenerationFailed, store_sqlite.ViewGenerationBuilding))
 			case "sweep_mutex":
 				l.retirementSweepMu.Lock()
 				defer l.retirementSweepMu.Unlock()

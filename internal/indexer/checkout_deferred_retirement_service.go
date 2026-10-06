@@ -61,9 +61,10 @@ func (l *CheckoutLifecycle) serveDeferredRetirementBurst(
 		return 0, true, discoveryErr
 	}
 	defer l.retirementSweepMu.Unlock()
-	// A planned fold can retain sources and do work outside the lane. Do not
-	// overlap it, or an actual cycle/transition reported by the lifecycle.
-	if l.editCycleHoldsBuildLane() || l.chainFoldInFlight() {
+	// The permit excludes active checkout work. Off-lane folds retain exact
+	// sources and continuously own their destination through landing; the
+	// per-generation Store fences below protect those without blocking siblings.
+	if l.editCycleHoldsBuildLane() {
 		deferredRetirementPreemptions.Add(1)
 		return 0, true, discoveryErr
 	}
@@ -100,7 +101,7 @@ func (l *CheckoutLifecycle) serveDeferredRetirementBurst(
 		if burstCtx.Err() != nil {
 			break
 		}
-		if l.editCycleHoldsBuildLane() || l.chainFoldInFlight() || l.walSinceReset() > deferredRetirementWALPause {
+		if l.editCycleHoldsBuildLane() || l.walSinceReset() > deferredRetirementWALPause {
 			break
 		}
 		inUse := l.deferredRetirementInUse
