@@ -53,13 +53,21 @@ func adjacencyMemoRepoFiles() map[string]string {
 // with a call graph: a primary with its commit, a linked worktree routed
 // through the lifecycle, and a server whose materializer composes the stack.
 func newAdjacencyMemoFixture(t *testing.T) (*realCheckoutMutationFixture, string) {
+	return newAdjacencyMemoFixtureWithFiles(t, nil)
+}
+
+func newAdjacencyMemoFixtureWithFiles(t *testing.T, extra map[string]string) (*realCheckoutMutationFixture, string) {
 	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)
 	primary := filepath.Join(base, "repo")
 	worktree := filepath.Join(base, "wt")
 	require.NoError(t, os.Mkdir(primary, 0o755))
-	for name, content := range adjacencyMemoRepoFiles() {
+	files := adjacencyMemoRepoFiles()
+	for name, content := range extra {
+		files[name] = content
+	}
+	for name, content := range files {
 		require.NoError(t, os.WriteFile(filepath.Join(primary, name), []byte(content), 0o644))
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(primary, ".gortex.yaml"), []byte("workspace: adjacency-memo\n"), 0o644))
