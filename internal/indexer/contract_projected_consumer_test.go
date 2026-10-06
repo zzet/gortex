@@ -3,23 +3,24 @@ package indexer
 import (
 	"context"
 	"encoding/json"
-	"github.com/stretchr/testify/require"
-	"github.com/zzet/gortex/internal/contracts"
-	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/graphview"
-	"github.com/zzet/gortex/internal/search"
-	"go.uber.org/zap"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/contracts"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/search"
+	"go.uber.org/zap"
 )
 
 func TestContractProjectedConsumerPublishesTheMixedAcceptedAttachment(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
+	setupCtx, cancelSetup := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelSetup()
 	idx, store := newSQLiteIndexer(t)
 	idx.SetRepoPrefix("fixture")
 	root := t.TempDir()
@@ -27,11 +28,11 @@ func TestContractProjectedConsumerPublishesTheMixedAcceptedAttachment(t *testing
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "src"), 0o755))
 	writeFile(t, filepath.Join(root, "src", "parser.c"), string(src))
 	writeFile(t, filepath.Join(root, "routes.go"), "package fixture\nfunc register(router *Router) { router.GET(\"/with-generated-parser\", serve) }\nfunc serve() {}\n")
-	backend, err := newPrimaryContractCoreStorageBackend(ctx, store, "fixture")
+	backend, err := newPrimaryContractCoreStorageBackend(setupCtx, store, "fixture")
 	require.NoError(t, err)
-	idx.contractCoreInputs, err = newContractCoreInputJournal(ctx, backend)
+	idx.contractCoreInputs, err = newContractCoreInputJournal(setupCtx, backend)
 	require.NoError(t, err)
-	result, err := idx.IndexCtx(ctx, root)
+	result, err := idx.IndexCtx(setupCtx, root)
 	require.NoError(t, err)
 	require.Empty(t, result.FailedFiles)
 	file := store.GetNode("fixture/src/parser.c")
@@ -43,10 +44,16 @@ func TestContractProjectedConsumerPublishesTheMixedAcceptedAttachment(t *testing
 	leases := graphview.NewLeaseManager()
 	registration, err := leases.RegisterRawRepositoryOwnerPrepared(graphview.RawRepositoryOwner{RepoPrefix: "fixture", RootIdentity: root, Incarnation: t.Name()}, nil)
 	require.NoError(t, err)
-	_, err = leases.CaptureInitialRawRepositorySource(ctx, registration, "accepted-projected-core")
+	_, err = leases.CaptureInitialRawRepositorySource(setupCtx, registration, "accepted-projected-core")
 	require.NoError(t, err)
 	mi.SetOutputGenerationAuthority(NewOutputGenerationAuthority(leases))
 	materializer := &graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: leases}
+	// Setup/indexing is separate from the bounded consumer operation. A
+	// coordinator completion notification also joins scratch-store cleanup.
+	// Keep its original five-second budget intact after the fixture is ready.
+	cancelSetup()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
 	var admission sync.Mutex
 	var jobs sync.WaitGroup
 	options := ContractFollowupCaptureOptions{Context: ctx, Store: store, Materializer: materializer, MultiIndexer: mi, Registry: idx.registry, Config: idx.config, Logger: zap.NewNop(), Yield: func(ctx context.Context) error { return ctx.Err() }, BaselineAdmissionMu: &admission, BaselineJobs: &jobs}
