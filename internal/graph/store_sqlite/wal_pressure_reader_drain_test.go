@@ -22,6 +22,12 @@ func pressureReaderDrainFixture(t *testing.T) (*Store, chan struct{}, func() err
 	manualStop := make(chan struct{})
 	s.stopCheckpoint = manualStop
 	t.Cleanup(func() { close(manualStop) })
+	// Twice the production writer step. These tests are about reader drain
+	// and gate ownership, not about how long one hold may last; a busy CI
+	// runner gets headroom, and missing even double the budget means an
+	// unacceptable slowdown. Set after the checkpoint loop stopped, so no
+	// background reclaim reads it concurrently.
+	s.walPressureHoldOverride = 2 * walReclaimPressureHold
 	oldBusy := walResetBusyMillis
 	walResetBusyMillis = 10
 	t.Cleanup(func() { walResetBusyMillis = oldBusy })

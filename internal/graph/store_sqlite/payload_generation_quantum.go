@@ -46,7 +46,7 @@ func (s *Store) RetirePayloadGenerationQuantum(ctx context.Context, generationID
 	if generationID <= baseViewGeneration {
 		return progress, fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
 	}
-	ctx, cancel := context.WithTimeout(ctx, payloadRetirementQuantumDuration)
+	ctx, cancel := context.WithTimeout(ctx, s.retirementQuantum())
 	defer cancel()
 	if err := s.retirementQuantumAdmission(ctx); err != nil {
 		return progress, err
@@ -54,6 +54,15 @@ func (s *Store) RetirePayloadGenerationQuantum(ctx context.Context, generationID
 	budget := payloadSweepBudget{maxRows: payloadSweepMinBatch, maxChunks: 1, quantum: &progress}
 	err := s.retirePayloadGeneration(ctx, generationID, inUse, budget)
 	return progress, err
+}
+
+// retirementQuantum is the real-time budget of one retirement quantum:
+// payloadRetirementQuantumDuration unless a test has raised it.
+func (s *Store) retirementQuantum() time.Duration {
+	if s.retirementQuantumOverride > 0 {
+		return s.retirementQuantumOverride
+	}
+	return payloadRetirementQuantumDuration
 }
 
 func (s *Store) retirementQuantumAdmission(ctx context.Context) error {

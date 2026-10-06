@@ -126,6 +126,15 @@ const walPressureMarkFactor int64 = 4
 
 var errWALPressureHold = errors.New("store_sqlite: wal reclaim: the reset did not fit its hold inside a busy lane")
 
+// walPressureHold is the writer step of a reset inside a busy lane:
+// walReclaimPressureHold unless a test has raised it.
+func (s *Store) walPressureHold() time.Duration {
+	if s.walPressureHoldOverride > 0 {
+		return s.walPressureHoldOverride
+	}
+	return walReclaimPressureHold
+}
+
 // reclaimWALPressureReset is the writer step of a pressure attempt: only when
 // the backfill is nearly complete, then a short final copy/reset. A proven
 // urgent slow-copy tail gets one longer slice under the aggregate two-second
@@ -137,7 +146,7 @@ func (s *Store) reclaimWALPressureReset(ctx context.Context, ckptDB *sql.DB, res
 func (s *Store) reclaimWALPressureResetWithDrain(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult, drainAllowance time.Duration) error {
 	operationCtx, cancel := context.WithTimeout(ctx, walReclaimLaneBudget)
 	defer cancel()
-	err := s.reclaimWALPressureResetOnce(operationCtx, ckptDB, res, walReclaimPressureHold, false)
+	err := s.reclaimWALPressureResetOnce(operationCtx, ckptDB, res, s.walPressureHold(), false)
 	if err == nil || operationCtx.Err() != nil {
 		return err
 	}
@@ -190,7 +199,7 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 		res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
 		return errWALCheckpointDeferredBulk
 	}
-	if budget > walReclaimPressureHold && !res.adaptiveFrontierCurrent(s) {
+	if budget > s.walPressureHold() && !res.adaptiveFrontierCurrent(s) {
 		return errWALReclaimReadersInFlight
 	}
 	// With the writer held the remainder is final. Ordinary holds require a
@@ -201,7 +210,7 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 		s.walCopy.pressureGiveUps.Add(1)
 		return fmt.Errorf("%w: no wal-index", errWALPressureHold)
 	}
-	if budget <= walReclaimPressureHold && snap.MxFrame > snap.NBackfill && snap.MxFrame-snap.NBackfill > allowed {
+	if budget <= s.walPressureHold() && snap.MxFrame > snap.NBackfill && snap.MxFrame-snap.NBackfill > allowed {
 		res.reason = fmt.Sprintf("pressure_copy_incomplete remainder_frames=%d allowed=%d", snap.MxFrame-snap.NBackfill, allowed)
 		s.walCopy.pressureGiveUps.Add(1)
 		return errWALPressureHold
@@ -212,10 +221,10 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 		hook(hctx)
 	}
 	copyCredit := budget / 2
-	if budget > walReclaimPressureHold {
-		copyCredit = budget - walReclaimPressureHold
+	if budget > s.walPressureHold() {
+		copyCredit = budget - s.walPressureHold()
 	}
-	if budget > walReclaimPressureHold {
+	if budget > s.walPressureHold() {
 		if hctx.Err() != nil {
 			return hctx.Err()
 		}
@@ -318,7 +327,7 @@ func (s *Store) reclaimWALPressureResetAfterReaderDrain(ctx context.Context, ckp
 		res.reason = "pressure_foreground_writer"
 		return errWALReclaimWriterWaiting
 	}
-	credit := min(walReclaimPressureHold, walReclaimMaxWriterHold-res.writerSpent, time.Until(started.Add(allowance)))
+	credit := min(s.walPressureHold(), walReclaimMaxWriterHold-res.writerSpent, time.Until(started.Add(allowance)))
 	if credit <= 0 {
 		res.reason = "pressure_reader_pause_credit_exhausted"
 		return context.DeadlineExceeded

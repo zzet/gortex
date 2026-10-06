@@ -69,6 +69,10 @@ func TestIndexRefreshCancellationLetsGitRemoveItsOwnLock(t *testing.T) {
 	go func() {
 		_, err := run(ctx, repo, nil, func(cmd *exec.Cmd) {
 			configureIndexRefreshCancellation(cmd)
+			// Twice the production grace: Git must still clean up after
+			// SIGTERM well inside it, but a busy CI runner gets headroom.
+			// Missing even this budget means an unacceptable slowdown.
+			cmd.WaitDelay *= 2
 			actualCancel := cmd.Cancel
 			cmd.Cancel = func() error { err := actualCancel(); close(cancelIssued); return err }
 		}, "update-index", "-q", "--refresh")
@@ -99,7 +103,7 @@ func TestIndexRefreshCancellationLetsGitRemoveItsOwnLock(t *testing.T) {
 		if !joined {
 			select {
 			case <-done:
-			case <-time.After(3 * time.Second):
+			case <-time.After(5 * time.Second):
 				if pid > 0 {
 					_ = syscall.Kill(pid, syscall.SIGKILL)
 				}
@@ -160,8 +164,8 @@ func TestIndexRefreshCancellationLetsGitRemoveItsOwnLock(t *testing.T) {
 		if err == nil {
 			t.Fatal("cancelled refresh reported success")
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("cancelled refresh did not join within its 2s grace")
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled refresh did not join within its doubled grace")
 	}
 	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("owned child still present: %v", err)

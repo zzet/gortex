@@ -26,7 +26,7 @@ func TestConcurrentRetirementDriverResumesOnlyInternalDeadline(t *testing.T) {
 	progress, err := s.RetirePayloadGenerationQuantum(parent, id, nil)
 	s.writeMu.Unlock()
 	require.ErrorIs(t, err, context.DeadlineExceeded)
-	require.NoError(t, parent.Err(), "only the internal250ms quantum expired")
+	require.NoError(t, parent.Err(), "only the internal quantum expired")
 	require.Equal(t, PayloadRetirementProgress{}, progress)
 	require.True(t, resumeConcurrentRetirementQuantum(parent, err))
 	require.Equal(t, before, countAtGeneration(t, s, "nodes", id))

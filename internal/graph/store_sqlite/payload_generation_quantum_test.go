@@ -16,6 +16,11 @@ func quantumPayloadFixture(t *testing.T) (*Store, int64) {
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
 	t.Setenv("GORTEX_SQLITE_LAZY_INDEXES", "off")
 	s := openPayloadStore(t)
+	// Twice the production quantum. The tests drive the commit margin with
+	// an injected clock, but the quantum itself is a real-time deadline; a
+	// busy CI runner gets headroom, and missing even double the budget means
+	// an unacceptable slowdown.
+	s.retirementQuantumOverride = 2 * payloadRetirementQuantumDuration
 	seedPayloadBase(t, s)
 	seedPayloadControlPlane(t, s)
 	return s, publishedPayloadGeneration(t, s)

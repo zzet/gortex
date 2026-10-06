@@ -248,6 +248,9 @@ func TestPayloadQuantumPreemptionAfterEmptyProofsRollsBackHints(t *testing.T) {
 
 func TestPayloadQuantumSlowEmptyProofCommitsPartialHints(t *testing.T) {
 	s, id := emptyQuantumWalkFixture(t)
+	// This test is about the budget itself: the modeled 200 ms proof exhausts
+	// the production quantum's commit margin, so it runs on the real value.
+	s.retirementQuantumOverride = 0
 	_, err := s.writerDB.ExecContext(t.Context(), `INSERT INTO nodes(view_gen,id,kind,name,file_path) VALUES (?,'margin-live','Function','live','live.go')`, id)
 	require.NoError(t, err)
 	started := time.Now()
