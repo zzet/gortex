@@ -31,7 +31,12 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 	if err := l.lockRetirementSweep(ctx); err != nil {
 		return 0, true, err
 	}
-	defer l.retirementSweepMu.Unlock()
+	sweepLocked := true
+	defer func() {
+		if sweepLocked {
+			l.retirementSweepMu.Unlock()
+		}
+	}()
 
 	l.coordMu.Lock()
 	served := make(map[string]struct{}, len(l.coordinators))
@@ -52,8 +57,12 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 	// (checkout_deferred_retirement_preempt.go), unless the sweep has been
 	// starved for too long to keep yielding.
 	started := time.Now()
-	armed := l.retirementPreemptionArmed(started)
-	if l.retirementShouldStandDown(armed, coordinators) {
+	gate := l.buildGate()
+	armed := true
+	if gate == nil {
+		armed = l.retirementPreemptionArmed(started)
+	}
+	if gate == nil && l.retirementShouldStandDown(armed, coordinators) {
 		deferredRetirementPreemptions.Add(1)
 		return 0, true, nil
 	}
@@ -107,6 +116,21 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 		}
 	}
 	ordered = offered
+	if gate != nil {
+		l.noteEligibleRetirementDebt(started, len(ordered) > 0, discoveryErr == nil)
+		if len(ordered) == 0 {
+			return 0, discoveryErr != nil, discoveryErr
+		}
+		if !l.retirementDebtAged(started) && l.retirementShouldStandDown(true, coordinators) {
+			deferredRetirementPreemptions.Add(1)
+			return 0, true, discoveryErr
+		}
+		// An explicit cleanup may own the build lane and need this mutex.
+		// Never hold it while waiting for background lane admission.
+		sweepLocked = false
+		l.retirementSweepMu.Unlock()
+		return l.serveDeferredRetirementBurst(ctx, gate, ordered, owners, discoveryErr)
+	}
 	// While a checkout is being edited: smallest first, large ones held for a
 	// longer idle, shorter slices (checkout_deferred_retirement_pacing.go).
 	pace := l.retirementPaceNow(started, !armed)
@@ -139,9 +163,9 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 			pending, err = true, discoveryErr
 			return
 		}
-		// A slice that ran its chunks (to the end, to its budget, or to a
-		// lease refusal) was not starved; only preemption stops the clock.
-		if err == nil || retired > 0 {
+		// The legacy API does not report partial committed rows. A refused
+		// or budget-limited attempt cannot reset the clock as if it completed.
+		if retired > 0 {
 			l.noteRetirementProgress(time.Now())
 		}
 	}()

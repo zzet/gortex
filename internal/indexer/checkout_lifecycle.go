@@ -276,11 +276,16 @@ type CheckoutLifecycle struct {
 	// (checkout_deferred_retirement_preempt.go). A negative limit disables
 	// preemption; zero takes the default.
 	deferredRetirementProgress atomic.Int64
-	retirementStarvationLimit  time.Duration
+	// Eligible debt keeps its age while bounded commits drain it. Request
+	// traffic and lease refusals are not evidence that the debt was serviced.
+	deferredRetirementEligibleSince atomic.Int64
+	retirementStarvationLimit       time.Duration
 	// interactiveDemand and retireOwedSlice are test seams: the interactive
 	// write predicate and the owed-generation slice runner.
 	interactiveDemand func() bool
 	retireOwedSlice   func(ctx context.Context, generationID int64) error
+	// retireQuantum is a per-lifecycle test seam around the real quantum call.
+	retireQuantum func(context.Context, int64, func(int64) bool) (store_sqlite.PayloadRetirementProgress, error)
 	// derivationEnvHook replaces derivationEnvFor (tests): the environment
 	// the startup correction re-derives a generation in.
 	derivationEnvHook func(row store_sqlite.ViewGeneration) (derivationEnv, bool)

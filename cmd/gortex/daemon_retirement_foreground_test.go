@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"sync"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,116 +12,29 @@ import (
 	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
-func TestDeferredRetirementWorkerSkipsSweepWhileTrackedActivityAndStops(t *testing.T) {
-	checked := make(chan struct{})
-	var checkedOnce sync.Once
-	var sweeps atomic.Int64
-	worker := startDeferredRetirementWorkerWithActivity(
-		func(context.Context) (int, bool, error) {
-			sweeps.Add(1)
-			return 0, false, nil
-		},
-		func() bool {
-			checkedOnce.Do(func() { close(checked) })
-			return true
-		},
-		zap.NewNop(),
-	)
-	worker.MarkReady()
-	awaitRetirementSignal(t, checked)
-	worker.Stop()
-	if got := sweeps.Load(); got != 0 {
-		t.Fatalf("sweep calls while foreground active = %d, want 0", got)
-	}
-}
-
-func TestDeferredRetirementWorkerDefersForTrackedNonMCPWorkThenResumes(t *testing.T) {
-	runtimeactivity.Begin("sparse_generation_build")
-	activityEnded := false
-	defer func() {
-		if !activityEnded {
-			runtimeactivity.End("sparse_generation_build")
+// Request activity must not prevent the lifecycle from discovering and aging
+// debt. Actual edit/build exclusion is enforced by its shared permit, not this
+// outer worker's broad process activity counter.
+func TestDeferredRetirementWorkerDiscoversDebtDuringTrackedRequests(t *testing.T) {
+	runtimeactivity.Begin("mcp_request")
+	defer runtimeactivity.End("mcp_request")
+	called := make(chan struct{})
+	worker := startDeferredRetirementWorker(func(ctx context.Context) (int, bool, error) {
+		if runtimeactivity.Current().Active == 0 {
+			return 0, false, errors.New("tracked request ended before debt discovery")
 		}
-	}()
-
-	ready := make(chan struct{})
-	close(ready)
-	done := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	checked := make(chan struct{})
-	var checkedOnce sync.Once
-	swept := make(chan struct{})
-	var sweeps atomic.Int64
-	worker := &deferredRetirementWorker{
-		ready:     ready,
-		done:      done,
-		idlePause: time.Hour,
-		trackedActivityActive: func() bool {
-			checkedOnce.Do(func() { close(checked) })
-			return trackedWorkActive()
-		},
-	}
-	go worker.run(
-		ctx,
-		func(context.Context) (int, bool, error) {
-			sweeps.Add(1)
-			close(swept)
-			return 0, false, nil
-		},
-		zap.NewNop(),
-		time.Nanosecond,
-		time.Nanosecond,
-	)
-	awaitRetirementSignal(t, checked)
-	if got := sweeps.Load(); got != 0 {
-		t.Fatalf("sweep calls while sparse generation build active = %d, want 0", got)
-	}
-	runtimeactivity.End("sparse_generation_build")
-	activityEnded = true
-	awaitRetirementSignal(t, swept)
-	cancel()
-	awaitRetirementSignal(t, done)
-	if got := sweeps.Load(); got != 1 {
-		t.Fatalf("sweep calls after tracked work ended = %d, want 1", got)
-	}
-}
-
-func TestDeferredRetirementWorkerResumesAfterTrackedActivityClears(t *testing.T) {
-	ready := make(chan struct{})
-	close(ready)
-	done := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	var activityChecks atomic.Int64
-	var sweeps atomic.Int64
-	worker := &deferredRetirementWorker{
-		ready:     ready,
-		done:      done,
-		idlePause: time.Hour,
-		trackedActivityActive: func() bool {
-			return activityChecks.Add(1) == 1
-		},
-	}
-	swept := make(chan struct{})
-	go worker.run(
-		ctx,
-		func(context.Context) (int, bool, error) {
-			sweeps.Add(1)
-			close(swept)
-			return 0, false, nil
-		},
-		zap.NewNop(),
-		time.Nanosecond,
-		time.Nanosecond,
-	)
-	awaitRetirementSignal(t, swept)
-	cancel()
-	awaitRetirementSignal(t, done)
-	if got := sweeps.Load(); got != 1 {
-		t.Fatalf("sweep calls after foreground cleared = %d, want 1", got)
-	}
-	if got := activityChecks.Load(); got < 2 {
-		t.Fatalf("tracked-activity checks = %d, want at least 2", got)
+		close(called)
+		<-ctx.Done()
+		return 0, true, ctx.Err()
+	}, zap.NewNop())
+	t.Cleanup(worker.Stop)
+	worker.MarkReady()
+	awaitRetirementSignal(t, called)
+	worker.Stop()
+	select {
+	case <-worker.done:
+	default:
+		t.Fatal("worker did not join while traffic remained active")
 	}
 }
 
@@ -167,7 +80,7 @@ func TestDeferredRetirementWorkerServicesWorkAfterEmptyPass(t *testing.T) {
 	}
 }
 
-func TestDeferredRetirementWorkerNilActivityPreservesSweep(t *testing.T) {
+func TestDeferredRetirementWorkerServicesWithoutAnActivityGuard(t *testing.T) {
 	ready := make(chan struct{})
 	close(ready)
 	done := make(chan struct{})
@@ -194,7 +107,7 @@ func TestDeferredRetirementWorkerNilActivityPreservesSweep(t *testing.T) {
 	cancel()
 	awaitRetirementSignal(t, done)
 	if got := sweeps.Load(); got != 1 {
-		t.Fatalf("sweep calls with nil activity predicate = %d, want 1", got)
+		t.Fatalf("sweep calls without an activity guard = %d, want 1", got)
 	}
 }
 

@@ -8,7 +8,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/indexer"
-	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
 const (
@@ -20,13 +19,12 @@ const (
 type deferredRetirementSweep func(context.Context) (retired int, pending bool, err error)
 
 type deferredRetirementWorker struct {
-	ready                 chan struct{}
-	readyOnce             sync.Once
-	cancel                context.CancelFunc
-	stopOnce              sync.Once
-	done                  chan struct{}
-	trackedActivityActive func() bool
-	idlePause             time.Duration
+	ready     chan struct{}
+	readyOnce sync.Once
+	cancel    context.CancelFunc
+	stopOnce  sync.Once
+	done      chan struct{}
+	idlePause time.Duration
 	// afterReady runs once, on the worker's goroutine, when the daemon is
 	// ready and before the first sweep: the one-time correction of
 	// generations an older derivation wrote (SetAfterReady).
@@ -43,28 +41,15 @@ func (w *deferredRetirementWorker) SetAfterReady(fn func(context.Context)) {
 }
 
 func startDeferredRetirementWorker(sweep deferredRetirementSweep, logger *zap.Logger) *deferredRetirementWorker {
-	return startDeferredRetirementWorkerWithActivity(
-		sweep,
-		trackedWorkActive,
-		logger,
-	)
-}
-
-func startDeferredRetirementWorkerWithActivity(
-	sweep deferredRetirementSweep,
-	trackedActivityActive func() bool,
-	logger *zap.Logger,
-) *deferredRetirementWorker {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	worker := &deferredRetirementWorker{
-		ready:                 make(chan struct{}),
-		cancel:                cancel,
-		done:                  make(chan struct{}),
-		trackedActivityActive: trackedActivityActive,
-		idlePause:             deferredRetirementIdlePause,
+		ready:     make(chan struct{}),
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		idlePause: deferredRetirementIdlePause,
 	}
 	go worker.run(ctx, sweep, logger, deferredRetirementRetryBase, deferredRetirementRetryMax)
 	return worker
@@ -106,13 +91,8 @@ func (w *deferredRetirementWorker) run(ctx context.Context, sweep deferredRetire
 	idlePause := w.idlePause
 	errorBackoff := basePause
 	for {
-		if w.trackedActivityActive != nil && w.trackedActivityActive() {
-			if !waitDeferredRetirementPause(ctx, basePause) {
-				return
-			}
-			continue
-		}
-
+		// The lifecycle discovers and ages debt even during ordinary request
+		// traffic. Its shared build permit and Store quantum guard actual work.
 		retired, pending, err := sweep(ctx)
 		if retired > 0 {
 			logger.Info("daemon: deferred startup retirement progress", zap.Int("retired_generations", retired), zap.Bool("pending", pending),
@@ -149,10 +129,6 @@ func (w *deferredRetirementWorker) run(ctx context.Context, sweep deferredRetire
 			return
 		}
 	}
-}
-
-func trackedWorkActive() bool {
-	return runtimeactivity.Current().Active > 0
 }
 
 func waitDeferredRetirementPause(ctx context.Context, pause time.Duration) bool {
