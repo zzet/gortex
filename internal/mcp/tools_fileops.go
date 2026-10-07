@@ -106,7 +106,20 @@ func (s *Server) resolveFilePath(ctx context.Context, rawPath string) (absPath, 
 		// create.
 		prefix := matchedRepoPrefix(s.multiIndexer, rawPath)
 		if prefix == "" {
-			if soleRepo, root, ok := soleTrackedRepo(s.multiIndexer); ok {
+			// Infer bare paths only within the session's workspace. Keep
+			// checkout-family lookups intact so their ambiguity guards still
+			// apply; unbound control clients retain the global lookup.
+			var inferredRepos multiRepoLookup = s.multiIndexer
+			if allowed, bound := s.sessionWorkspaceRepoSet(ctx); bound {
+				prefixes := make([]string, 0, len(allowed))
+				for _, candidate := range s.multiIndexer.RepoPrefixes() {
+					if allowed[candidate] {
+						prefixes = append(prefixes, candidate)
+					}
+				}
+				inferredRepos = filePathRepoScope{s.multiIndexer, prefixes}
+			}
+			if soleRepo, root, ok := soleTrackedRepo(inferredRepos); ok {
 				abs := filepath.Clean(filepath.Join(root, rawPath))
 				if !pathContainedIn(abs, root) {
 					return "", "", fmt.Errorf("%w: %q resolves to %q, outside repo root %q", errPathEscape, rawPath, abs, root)
@@ -137,7 +150,7 @@ func (s *Server) resolveFilePath(ctx context.Context, rawPath string) (absPath, 
 			// learning the prefix. A brand-new file (matches == 0) still
 			// requires an explicit prefix; a path present in several
 			// repos (matches > 1) is reported as such.
-			abs, rel, matches, anchorErr := anchorUnprefixedExisting(s.multiIndexer, requestViewPathRoot(ctx), rawPath)
+			abs, rel, matches, anchorErr := anchorUnprefixedExisting(inferredRepos, requestViewPathRoot(ctx), rawPath)
 			if anchorErr != nil {
 				return "", "", anchorErr
 			}
@@ -145,9 +158,9 @@ func (s *Server) resolveFilePath(ctx context.Context, rawPath string) (absPath, 
 				return abs, rel, nil
 			} else if matches > 1 {
 				return "", "", fmt.Errorf("%w: path %q names a file in multiple tracked repos; prefix it with one of: %s/",
-					errPathUnresolved, rawPath, strings.Join(s.multiIndexer.RepoPrefixes(), "/, "))
+					errPathUnresolved, rawPath, strings.Join(inferredRepos.RepoPrefixes(), "/, "))
 			}
-			prefixes := s.multiIndexer.RepoPrefixes()
+			prefixes := inferredRepos.RepoPrefixes()
 			return "", "", fmt.Errorf("%w: path %q does not start with a known repo prefix; expected one of: %s/, or an absolute path",
 				errPathUnresolved, rawPath, strings.Join(prefixes, "/, "))
 		}
@@ -254,6 +267,15 @@ type multiRepoLookup interface {
 	// checkout at the given path.
 	LinkedWorktreeRoots(mainRepoPath string) []string
 }
+
+// filePathRepoScope limits inferred anchors without changing checkout-family
+// resolution or explicit repository selection.
+type filePathRepoScope struct {
+	multiRepoLookup
+	prefixes []string
+}
+
+func (scope filePathRepoScope) RepoPrefixes() []string { return scope.prefixes }
 
 // worktreeRootedPath re-roots an edit target into the linked git
 // worktree the file actually belongs to. All worktrees of one repo
