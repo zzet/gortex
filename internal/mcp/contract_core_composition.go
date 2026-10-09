@@ -29,6 +29,26 @@ type contractCoreEdges struct {
 	edgeTiming  *rerank.CoreEdgeTiming
 }
 
+// SearchMutationRevision forwards the selected reader's invalidation token.
+// Filtering adjacency changes no node identity, so the inner revision stays
+// authoritative; a reader without one stays unknown.
+func (r *contractCoreEdges) SearchMutationRevision() (uint64, bool) {
+	return readerSearchMutationRevision(r.Reader)
+}
+
+// readerSearchMutationRevision reports reader's optional mutation revision
+// without inventing one: a wrapper must not claim a revision its inner reader
+// lacks, or a cursor would continue across an unobserved mutation.
+func readerSearchMutationRevision(reader graph.Reader) (uint64, bool) {
+	if revisioned, ok := reader.(interface{ SearchMutationRevision() (uint64, bool) }); ok {
+		return revisioned.SearchMutationRevision()
+	}
+	if revisioned, ok := reader.(interface{ MutationRevision() uint64 }); ok {
+		return revisioned.MutationRevision(), true
+	}
+	return 0, false
+}
+
 func (r *contractCoreEdges) visible(edge *graph.Edge) bool {
 	if edge == nil || r.contractIDs[edge.From] || r.contractIDs[edge.To] {
 		return false

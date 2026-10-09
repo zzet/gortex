@@ -2097,6 +2097,12 @@ func (r *baseGraphReader) EdgeCount() int { return r.Stats().TotalEdges }
 
 func (r *baseGraphReader) EdgeIdentityRevisions() int { return r.base.EdgeIdentityRevisions() }
 
+// SearchMutationRevision forwards the corpus revision: any corpus write may
+// change what this narrowing holds, so the corpus token is authoritative.
+func (r *baseGraphReader) SearchMutationRevision() (uint64, bool) {
+	return readerSearchMutationRevision(r.base)
+}
+
 // Stats reports this repository's counters.
 //
 // The per-repo rollup answers it whenever the backend keeps one. When it does
