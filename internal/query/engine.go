@@ -763,9 +763,22 @@ func (e *Engine) RefineByCosine(query string, cands []*rerank.Candidate, topN in
 	}
 	vectors, ok := e.g.(graph.VectorSearcher)
 	if !ok {
+		if selected, isSelected := e.g.(selectedVectorReader); isSelected {
+			vectors = selected.SelectedVectorSearcher()
+			ok = vectors != nil
+		}
+	}
+	if !ok {
 		return cands
 	}
 	return refineByCosine(query, cands, embedder, vectors, topN)
+}
+
+// selectedVectorReader is a reader that filters adjacency in front of another
+// reader. Stored vectors are keyed by node id and read no edges, so it names
+// the vectors of the reader it selected, or nil when that reader has none.
+type selectedVectorReader interface {
+	SelectedVectorSearcher() graph.VectorSearcher
 }
 
 // SearchSymbolsScoped is SearchSymbols with the optional

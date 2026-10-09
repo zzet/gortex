@@ -414,7 +414,7 @@ func fetchAndMergeBM25Timed(eng *query.Engine, original string, expanded []strin
 }
 
 // graphReaderFromEngine returns the engine's underlying graph reader
-// if it also exposes the batched FindNodesByNames method (every
+// (the one a contract-core wrapper selected) if it also exposes the batched FindNodesByNames method (every
 // production backend does — in-memory, the on-disk backend, and OverlaidView via
 // the layered base). Falls back to (nil, false) when an embedded
 // test engine wires a stripped-down reader — the rescue step is then
@@ -428,7 +428,7 @@ func graphReaderFromEngine(eng *query.Engine) (namesReader, bool) {
 	if eng == nil {
 		return nil, false
 	}
-	r, ok := eng.Reader().(namesReader)
+	r, ok := contractCoreSelectedReader(eng.Reader()).(namesReader)
 	return r, ok
 }
 

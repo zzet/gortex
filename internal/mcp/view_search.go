@@ -190,7 +190,7 @@ func (v *requestView) candidateLayers() []query.ViewLayerSource {
 // the lane merges nothing, rather than authenticating candidates from durable
 // rows the editor buffer has already changed.
 func (s *Server) contentSearcherFor(ctx context.Context) (contentQuerier, bool) {
-	if cs, ok := s.readerFor(ctx).(graph.ContentSearcher); ok {
+	if cs, ok := contractCoreSelectedReader(s.readerFor(ctx)).(graph.ContentSearcher); ok {
 		return cs, true
 	}
 	if OverlayViewFromContext(ctx) != nil {

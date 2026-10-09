@@ -5451,7 +5451,7 @@ func (s *Server) coverageByID() map[string]graph.CoverageEnrichment {
 // and each row falls back to the node's own meta — the buffer's symbols
 // simply carry no coverage rather than borrowing the indexed numbers.
 func coverageRowsByID(g graph.Reader) map[string]graph.CoverageEnrichment {
-	r, ok := g.(graph.CoverageEnrichmentReader)
+	r, ok := contractCoreSelectedReader(g).(graph.CoverageEnrichmentReader)
 	if !ok {
 		return nil
 	}
@@ -5480,7 +5480,7 @@ func coveragePctFrom(cov map[string]graph.CoverageEnrichment, n *graph.Node) (fl
 // view has none, so an overlay-active request falls back to each
 // node's meta.
 func releaseRowsByID(g graph.Reader) map[string]string {
-	r, ok := g.(graph.ReleaseEnrichmentReader)
+	r, ok := contractCoreSelectedReader(g).(graph.ReleaseEnrichmentReader)
 	if !ok {
 		return nil
 	}
@@ -5509,7 +5509,7 @@ func addedInFrom(rel map[string]string, n *graph.Node) (string, bool) {
 // blameRowsByID batch-loads the blame sidecar (change A) into an
 // id->row map; nil when the backend lacks the capability.
 func blameRowsByID(g graph.Reader) map[string]graph.BlameEnrichment {
-	r, ok := g.(graph.BlameEnrichmentReader)
+	r, ok := contractCoreSelectedReader(g).(graph.BlameEnrichmentReader)
 	if !ok {
 		return nil
 	}

@@ -29,7 +29,12 @@ type contractCoreBoundedFiles struct {
 type contractCoreFilteredNamesBoundedFiles struct{ *contractCoreBoundedFiles }
 
 func newContractCoreEdges(reader graph.Reader, ctx context.Context, ids map[string]bool) graph.Reader {
-	core := &contractCoreEdges{Reader: reader, ctx: ctx, contractIDs: ids, edgeTiming: coreEdgeTimingFromContext(ctx)}
+	return wrapContractCoreEdges(&contractCoreEdges{Reader: reader, ctx: ctx, contractIDs: ids, edgeTiming: coreEdgeTimingFromContext(ctx)})
+}
+
+// wrapContractCoreEdges selects the capability variant for core's reader.
+func wrapContractCoreEdges(core *contractCoreEdges) graph.Reader {
+	reader := core.Reader
 	_, filtered := reader.(graph.FilteredContainingNameReader)
 	if files, ok := reader.(graph.BoundedFileNodeReader); ok {
 		bounded := &contractCoreBoundedFiles{contractCoreEdges: core, files: files}
@@ -97,6 +102,22 @@ func (r *contractCoreEdges) GetNodeContext(ctx context.Context, id string) (*gra
 	return node, nil
 }
 
+// GetFileNodesContext keeps the selected reader's deadline-aware file lookup
+// for diff joins in internal/analysis, which cannot reach the accessor. File
+// nodes read no edges, and a selected reader without the lookup answers as
+// those callers fall back: GetFileNodes.
+func (r *contractCoreEdges) GetFileNodesContext(ctx context.Context, path string) []*graph.Node {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if contextual, ok := r.Reader.(interface {
+		GetFileNodesContext(context.Context, string) []*graph.Node
+	}); ok {
+		return contextual.GetFileNodesContext(ctx, path)
+	}
+	return r.GetFileNodes(path)
+}
+
 func (r *contractCoreEdges) GetNodesByIDsContext(ctx context.Context, ids []string) (map[string]*graph.Node, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -136,6 +157,29 @@ func (r *contractCoreEdges) AllNodesLight() []*graph.Node {
 
 func (r *contractCoreEdges) GetNodeKindsByIDsContext(ctx context.Context, ids []string) (map[string]graph.NodeKindRow, error) {
 	return graph.GetNodeKindsByIDsContext(ctx, r.Reader, ids)
+}
+
+// NodeIDsByKinds keeps ID-only kind scans (betweenness, hotspot candidates)
+// off AllNodes. It reads no edges, and a selected reader without the
+// projection answers from its own kind iterators, so every shape honours it.
+func (r *contractCoreEdges) NodeIDsByKinds(kinds []graph.NodeKind) []string {
+	if scan, ok := r.Reader.(graph.NodeIDsByKinds); ok {
+		return scan.NodeIDsByKinds(kinds)
+	}
+	seen := make(map[graph.NodeKind]bool, len(kinds))
+	var ids []string
+	for _, kind := range kinds {
+		if kind == "" || seen[kind] {
+			continue
+		}
+		seen[kind] = true
+		for node := range r.NodesByKind(kind) {
+			if node != nil && node.ID != "" {
+				ids = append(ids, node.ID)
+			}
+		}
+	}
+	return ids
 }
 
 func (r *baseGraphReader) GetNodeKindsByIDsContext(ctx context.Context, ids []string) (map[string]graph.NodeKindRow, error) {
