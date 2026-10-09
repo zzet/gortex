@@ -841,7 +841,8 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// The stack's dependency-module contracts, kept the same way
 	// (edit_delta_dep_contracts.go).
 	if key, ok := editDeltaBaseCacheKey(keyBase, b.Store); ok {
-		installEditDeltaDeps(idx, key, append(append([]string(nil), plan.indexed...), plan.deleted...), chainTouched)
+		releaseDeps := installEditDeltaDeps(idx, key, append(append([]string(nil), plan.indexed...), plan.deleted...), chainTouched)
+		defer releaseDeps()
 	}
 	// The stack's callee parameter index (the dataflow pass), kept the same
 	// way (edit_delta_param_index.go); a path the chain speaks for is read

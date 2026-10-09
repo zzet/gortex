@@ -82,14 +82,16 @@ func changeSetHasManifest(changedRel []string) bool {
 // resolver; a change set holding a manifest installs nothing, and neither
 // does a dirty chain below the delta that speaks for a manifest or a dep::
 // identity (chainTouched, graph paths): the rows are kept for the stack below
-// the chain.
-func installEditDeltaDeps(idx *Indexer, key string, changedRel []string, chainTouched map[string]struct{}) {
+// the chain. It returns the release of the source's record in
+// editDeltaDepSources, which the delta runs when it ends: the record holds the
+// delta's resolver and view.
+func installEditDeltaDeps(idx *Indexer, key string, changedRel []string, chainTouched map[string]struct{}) func() {
 	if idx == nil || idx.resolver == nil || key == "" || changeSetHasManifest(changedRel) {
-		return
+		return func() {}
 	}
 	for p := range chainTouched {
 		if p == "dep" || changeSetHasManifest([]string{p}) {
-			return
+			return func() {}
 		}
 	}
 	view := idx.graph
@@ -110,8 +112,11 @@ func installEditDeltaDeps(idx *Indexer, key string, changedRel []string, chainTo
 		}
 	}
 	idx.resolver.SetDepContractSource(source)
-	editDeltaDepSources.Store(idx.resolver, source)
+	owner := idx.resolver
+	editDeltaDepSources.Store(owner, source)
+	return func() { editDeltaDepSources.Delete(owner) }
 }
 
-// editDeltaDepSources records, per resolver, the installed source (tests).
+// editDeltaDepSources records, per resolver, the installed source while its
+// delta runs (tests).
 var editDeltaDepSources sync.Map // *resolver.Resolver -> func([]string) iter.Seq[graph.RepoNodeIdentity]

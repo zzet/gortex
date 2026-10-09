@@ -552,7 +552,8 @@ func (r *chainOverlayRun) check(t *testing.T, label string, d chainOverlayDepth,
 	})
 	t.Run(label+"/deps", func(t *testing.T) {
 		idx := &Indexer{repoPrefix: builderRepoPrefix, graph: p.cached, resolver: resolver.New(p.cached)}
-		installEditDeltaDeps(idx, p.key, []string{"core/core.go"}, p.cached.ChainTouchedPaths())
+		release := installEditDeltaDeps(idx, p.key, []string{"core/core.go"}, p.cached.ChainTouchedPaths())
+		defer release()
 		source, ok := editDeltaDepSources.Load(idx.resolver)
 		want := depContractRows(p.plain, builderRepoPrefix)
 		if !ok {
