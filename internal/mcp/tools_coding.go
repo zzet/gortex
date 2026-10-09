@@ -382,7 +382,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	// round-trips instead of the per-symbol GetCallers / GetCallChain
 	// loop. The fallback retains the previous engine-based shape so
 	// the in-memory backend is unaffected.
-	if fc, ok := s.readerFor(ctx).(graph.FileEditingContext); ok {
+	if fc, ok := fileEditingContextFor(s.readerFor(ctx)); ok {
 		bundle := fc.FileEditingContext(fp, []graph.NodeKind{graph.KindFunction, graph.KindMethod})
 		if bundle == nil || (bundle.FileNode == nil && len(bundle.Defines) == 0) {
 			return mcp.NewToolResultError("no symbols found for file: " + fp), nil
