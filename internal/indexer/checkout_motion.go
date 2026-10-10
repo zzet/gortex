@@ -101,7 +101,8 @@ type checkoutMotion struct {
 	// tree moved, for any reason; each one doubles the quiet time and the
 	// coalesce cap the next admission needs (up to 8x), so a tree written
 	// faster than it can be built is attempted less and less often instead
-	// of at every quiet window. A build that runs to its end resets it.
+	// of at every quiet window. A background cycle that ends without an
+	// error resets it (settleTreeMoveAborts); a failed one leaves it.
 	movedAborts int
 }
 
@@ -502,8 +503,9 @@ func commitTreeMoveAbort(ctx context.Context) {
 	}
 }
 
-// settleTreeMoveAborts records an admitted background build that ran to its
-// end: the run of aborts for changes git does not see is over.
+// settleTreeMoveAborts records an admitted background cycle that ended without
+// an error: the run of aborts for changes git does not see is over. A cycle
+// that failed does not call it, so a failure keeps the backoff.
 func (c *CheckoutCoordinator) settleTreeMoveAborts() {
 	m := &c.motion
 	m.mu.Lock()

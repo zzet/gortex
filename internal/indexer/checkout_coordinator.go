@@ -1487,7 +1487,13 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		out = c.treeMovedCycle(out, admission, "sample")
 	case priority == ViewBuildBackground:
 		c.resetBackgroundLaneYields()
-		c.settleTreeMoveAborts()
+		// A failed cycle keeps the motion backoff, or a checkout whose builds
+		// keep failing would retry at the bare quiet window. Every cycle that
+		// ended without an error resets it, including one whose builds the
+		// prepublish fence tore twice (Rescheduled, Err nil).
+		if out.Err == nil {
+			c.settleTreeMoveAborts()
+		}
 	}
 	foreground = foreground || out.DirtyBuilt
 	recordCoordinatorCycle(out)
