@@ -390,6 +390,12 @@ type CheckoutCycle struct {
 	// working tree was still changing (checkout_motion.go): it built nothing,
 	// it is Rescheduled, and the quiet window runs the next one.
 	Held bool
+	// rescheduledBy names what stopped a Rescheduled cycle that published
+	// nothing, for the publication-stall run (checkout_publication_stall.go):
+	// torn_by_motion (the working tree moved under two builds), route_moved
+	// (a lost route flip), base_moved or head_moved. Empty for every other
+	// cycle, including one batch of a large working tree, which is routed.
+	rescheduledBy string
 	// Deferred reports that the cycle never ran. Three causes share the field:
 	// daemon warmup has not opened the build lane, its bounded background queue
 	// was saturated, or the resolver-visible input cohort could not be
@@ -608,6 +614,9 @@ type CheckoutCoordinator struct {
 	retainedDirty []retainedDirtyLayer
 	// backlog holds generations a retire refused. The janitor retries them.
 	backlog map[int64]struct{}
+	// publication is the run of cycles that published nothing
+	// (checkout_publication_stall.go).
+	publication checkoutPublicationStallRun
 	// basePinned is the committed base generation this checkout's ROUTE is
 	// composed over while the family's primary has moved past it — the
 	// dependent pin, as the last cycle resolved it, and 0 when the route is on
@@ -1452,6 +1461,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		case treeMove.Yielded():
 			out = c.treeMovedCycle(out, admission, "watcher")
 		}
+		c.notePublicationOutcome(out, time.Now())
 		recordCoordinatorCycle(out)
 		c.reportCheckoutCycle(ctx, through, out)
 		return
@@ -1496,6 +1506,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		}
 	}
 	foreground = foreground || out.DirtyBuilt
+	c.notePublicationOutcome(out, time.Now())
 	recordCoordinatorCycle(out)
 	c.logSlowAdmission(reason, through, admission)
 	if out.CompactionScheduled {
@@ -1510,7 +1521,10 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	case out.Err != nil && !errors.Is(out.Err, context.Canceled):
 		c.logger.Warn("checkout coordinator: reconcile failed",
 			zap.String("checkout", c.checkoutID), zap.String("root", c.root),
-			zap.String("reason", reason), zap.Error(out.Err))
+			// reason is what admitted the cycle; cause is the class of
+			// what failed it (checkoutCycleFailureClass).
+			zap.String("reason", reason), zap.String("cause", checkoutCycleFailureClass(out.Err)),
+			zap.Error(out.Err))
 	case out.CommitBuilt || out.DirtyBuilt || out.CommitReused || out.DirtyReused || out.Recomposed:
 		// Every arm that moved the route logs, reuse included. A cycle that
 		// adopted a retained working-tree layer has no outcome label of its
@@ -1776,7 +1790,7 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	route, err := c.ensureRoute(ctx, base)
 	if err != nil {
 		if errors.Is(err, errRouteMoved) {
-			out.Rescheduled = true
+			out.Rescheduled, out.rescheduledBy = true, stallReasonRouteMoved
 			c.rescheduleOnLostRoute("route moved under the graph reset")
 			return out
 		}
@@ -1821,7 +1835,7 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	if handled, err := c.recomposeOverAdvancedBase(ctx, base, head, &route, &out); handled || err != nil {
 		if err != nil {
 			if errors.Is(err, errRouteMoved) {
-				out.Rescheduled = true
+				out.Rescheduled, out.rescheduledBy = true, stallReasonRouteMoved
 				c.rescheduleOnLostRoute("route moved under the recomposition")
 				return out
 			}
@@ -1835,7 +1849,7 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	lap("commit_slot")
 	if err != nil {
 		if errors.Is(err, errRouteMoved) {
-			out.Rescheduled = true
+			out.Rescheduled, out.rescheduledBy = true, stallReasonRouteMoved
 			c.rescheduleOnLostRoute("route moved under the commit flip")
 			return out
 		}
@@ -1851,7 +1865,7 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 
 	if err := c.reconcileDirtySlot(ctx, commitGeneration, head.HeadTree, &route, &out); err != nil {
 		if errors.Is(err, errRouteMoved) {
-			out.Rescheduled = true
+			out.Rescheduled, out.rescheduledBy = true, stallReasonRouteMoved
 			c.rescheduleOnLostRoute("route moved under the dirty flip")
 			return out
 		}
@@ -2025,7 +2039,7 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 	c.noteDirtyFingerprint(sample.Fingerprint)
 	if sample.HeadTree != head.HeadTree {
 		c.abandonBuild(ctx, commitGeneration, !reused)
-		out.Rescheduled = true
+		out.Rescheduled, out.rescheduledBy = true, stallReasonHeadMoved
 		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeHeadMoved)
 		c.logger.Debug("checkout coordinator: the checkout committed under the recomposition",
 			zap.String("checkout", c.checkoutID),
@@ -2069,7 +2083,7 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 	}
 	if dirtyGeneration == 0 {
 		c.abandonBuild(ctx, commitGeneration, !reused)
-		out.Rescheduled = true
+		out.Rescheduled, out.rescheduledBy = true, stallReasonTornByMotion
 		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeRescheduled)
 		c.Signal("the working tree moved under two builds")
 		return true, nil
@@ -2228,7 +2242,7 @@ func (c *CheckoutCoordinator) rescheduleOnLostRoute(reason string) {
 // simply moved — the same shape as the working tree moving under two builds,
 // and it is recorded at the same place that one is, beside the decision.
 func (c *CheckoutCoordinator) rescheduleOnMovedBase(base primaryBase, out *CheckoutCycle) {
-	out.Rescheduled = true
+	out.Rescheduled, out.rescheduledBy = true, stallReasonBaseMoved
 	viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeRescheduled)
 	c.logger.Debug("checkout coordinator: the primary base advanced under the cycle",
 		zap.String("checkout", c.checkoutID),
@@ -3149,7 +3163,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	}
 	c.noteDirtyFingerprint(sample.Fingerprint)
 	if sample.HeadTree != targetTree {
-		out.Rescheduled = true
+		out.Rescheduled, out.rescheduledBy = true, stallReasonHeadMoved
 		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeHeadMoved)
 		c.logger.Debug("checkout coordinator: the checkout committed under the cycle",
 			zap.String("checkout", c.checkoutID),
@@ -3258,7 +3272,7 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 	if generationID == 0 {
 		// The route still names the last coherent state, which is the point: a
 		// stale view of a real state beats a torn view of a state that never was.
-		out.Rescheduled = true
+		out.Rescheduled, out.rescheduledBy = true, stallReasonTornByMotion
 		viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeRescheduled)
 		c.Signal("the working tree moved under two builds")
 		return nil

@@ -759,6 +759,10 @@ func (s *Server) settleRequestFreshness(
 	for {
 		fresh, reason := s.awaitCheckoutFreshness(withFreshnessTrace(ctx, outcome.trace), checkout, deadline)
 		outcome.fresh, outcome.reason = fresh, reason
+		outcome.stalled = nil
+		if !fresh {
+			outcome.stalled = s.checkoutPublicationStalled(checkout.CheckoutID)
+		}
 		// Close the phase record on every way the wait ended — a deadline or an
 		// interruption between tickets included — so a record never stays open
 		// for a wait that is over. First terminal mark wins; nothing without a
@@ -2647,6 +2651,13 @@ func viewRiderFields(view *requestView) map[string]any {
 		}
 		if !outcome.fresh && outcome.reason != "" {
 			fields["fresh_reason"] = outcome.reason
+		}
+		if stall := outcome.stalled; !outcome.fresh && stall != nil {
+			fields["publication_stalled"] = map[string]any{
+				"reason": stall.StallReason,
+				"since":  time.Unix(stall.Since, 0).UTC().Format(time.RFC3339),
+				"cycles": stall.ConsecutiveNonpublishingCycles,
+			}
 		}
 		outcome.trace.riderFields(fields)
 	}

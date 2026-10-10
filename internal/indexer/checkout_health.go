@@ -77,6 +77,11 @@ type ViewsHealth struct {
 	// reached the wire by adding a daemon-side mirror plus one projection line
 	// — and both files belong to the daemon lane rather than to this one.
 	StorageFailures []store_sqlite.StorageFailure `json:"storage_failures,omitempty"`
+	// PublicationStalls names the checkouts whose latest cycles published
+	// nothing (CheckoutPublicationStall): consecutive_nonpublishing_cycles,
+	// last_publication_age_s, stall_reason and change_set_size. A checkout
+	// whose route keeps up is absent, so the ordinary answer is empty.
+	PublicationStalls []CheckoutPublicationStall `json:"publication_stalls,omitempty"`
 	// Counters is the view-lifecycle metric registry, flattened: series key to
 	// value, zero-valued series omitted.
 	Counters map[string]int64 `json:"counters,omitempty"`
@@ -108,6 +113,7 @@ func (l *CheckoutLifecycle) ViewsHealth(ctx context.Context) (ViewsHealth, error
 	if l.store != nil {
 		out.StorageFailures = l.store.StorageFailures()
 	}
+	out.PublicationStalls = l.PublicationStalls()
 	out.Leases = l.leases.Held()
 
 	families, err := l.catalog.ListRepositoryFamilies(ctx)

@@ -746,6 +746,12 @@ type ViewsStatus struct {
 	// entry is retracted at the start of the next attempt on that generation —
 	// so the ordinary answer is the absent one.
 	StorageFailures []StorageFailure `json:"storage_failures,omitempty"`
+	// PublicationStalls is the third exception: a checkout whose latest
+	// cycles published nothing — every build torn by an editor saving faster
+	// than it builds, rescheduled by a moving base, HEAD or route, or
+	// failing — serves an older route, and no count here
+	// says so. Bounded by checkouts, present only while a run lasts.
+	PublicationStalls []PublicationStall `json:"publication_stalls,omitempty"`
 	// Counters is the view-lifecycle metric registry flattened to series key
 	// and value, zero-valued series omitted. Every label in a key comes from
 	// a fixed vocabulary, so the map's size is a property of the build rather
@@ -772,6 +778,29 @@ type StorageFailure struct {
 	GenerationID int64 `json:"generation_id"`
 	// Reason is the bounded, path-free sentence the storage layer rendered.
 	Reason string `json:"reason"`
+}
+
+// PublicationStall is one checkout's run of cycles that published nothing. It
+// mirrors indexer.CheckoutPublicationStall on the wire; the controller
+// translates.
+type PublicationStall struct {
+	CheckoutID string `json:"checkout_id"`
+	// ConsecutiveNonpublishingCycles counts the cycles in a row that failed
+	// or were rescheduled without routing anything since the last cycle that
+	// published.
+	ConsecutiveNonpublishingCycles int `json:"consecutive_nonpublishing_cycles"`
+	// Since is when the run's first cycle ended (Unix seconds).
+	Since int64 `json:"since"`
+	// LastPublicationAgeSeconds is how long ago a cycle last published (the
+	// route described the working tree, or one batch of a large working tree
+	// was routed), -1 when none has since the coordinator started.
+	LastPublicationAgeSeconds int64 `json:"last_publication_age_s"`
+	// StallReason is torn_by_motion, route_moved, base_moved, head_moved or
+	// failed:<class>.
+	StallReason string `json:"stall_reason"`
+	// ChangeSetSize is how many paths the latest build planned over the
+	// parent it stood on.
+	ChangeSetSize int `json:"change_set_size"`
 }
 
 // CoordinatorStartFailure is one checkout whose build loop could not be

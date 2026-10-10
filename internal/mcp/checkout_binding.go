@@ -321,6 +321,37 @@ type requestFreshnessOutcome struct {
 	// trace is which path settled the wait and what it saw
 	// (view_freshness_proof.go). Nil for an outcome that never waited.
 	trace *freshnessTrace
+	// stalled is the rider's publication_stalled{reason, since, cycles}: set
+	// on a wait that did not go fresh while the checkout's coordinator had
+	// published nothing for at least three cycles in a row
+	// (indexer.CheckoutLifecycle.CheckoutPublicationStalled). It says why
+	// the route is behind, beside the fresh_reason that says how the wait
+	// ended.
+	stalled *indexer.CheckoutPublicationStall
+}
+
+// checkoutPublicationStallReporter is the stall lookup of the waiter a
+// require_fresh request waited on. The checkout lifecycle implements it; a
+// waiter that does not reports no stall.
+type checkoutPublicationStallReporter interface {
+	CheckoutPublicationStalled(checkoutID string) (indexer.CheckoutPublicationStall, bool)
+}
+
+var _ checkoutPublicationStallReporter = (*indexer.CheckoutLifecycle)(nil)
+
+// checkoutPublicationStalled is the stall the rider reports for checkoutID,
+// nil when its coordinator is keeping up or none is wired. It asks the same
+// waiter the wait used (checkoutFreshness).
+func (s *Server) checkoutPublicationStalled(checkoutID string) *indexer.CheckoutPublicationStall {
+	reporter, ok := s.checkoutFreshness().(checkoutPublicationStallReporter)
+	if !ok {
+		return nil
+	}
+	stall, ok := reporter.CheckoutPublicationStalled(checkoutID)
+	if !ok {
+		return nil
+	}
+	return &stall
 }
 
 // checkoutFreshnessWaiter is the coordinator-backed settle signal require_fresh

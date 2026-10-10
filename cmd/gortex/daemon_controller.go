@@ -1904,9 +1904,30 @@ func viewsStatusFromHealth(health indexer.ViewsHealth) *daemon.ViewsStatus {
 		// Retirement is a background pass with no caller to fail, so — exactly
 		// like the start failures above — the status payload is the only
 		// surface the reason can come out of.
-		StorageFailures: viewsStorageFailures(health.StorageFailures),
-		Counters:        health.Counters,
+		StorageFailures:   viewsStorageFailures(health.StorageFailures),
+		PublicationStalls: viewsPublicationStalls(health.PublicationStalls),
+		Counters:          health.Counters,
 	}
+}
+
+// viewsPublicationStalls translates the coordinators' non-publishing runs onto
+// the wire; a nil list stays nil so a healthy status omits the field.
+func viewsPublicationStalls(stalls []indexer.CheckoutPublicationStall) []daemon.PublicationStall {
+	if len(stalls) == 0 {
+		return nil
+	}
+	out := make([]daemon.PublicationStall, 0, len(stalls))
+	for _, s := range stalls {
+		out = append(out, daemon.PublicationStall{
+			CheckoutID:                     s.CheckoutID,
+			ConsecutiveNonpublishingCycles: s.ConsecutiveNonpublishingCycles,
+			Since:                          s.Since,
+			LastPublicationAgeSeconds:      s.LastPublicationAgeSeconds,
+			StallReason:                    s.StallReason,
+			ChangeSetSize:                  s.ChangeSetSize,
+		})
+	}
+	return out
 }
 
 // viewsStorageFailures translates the store's maintenance-failure register onto
