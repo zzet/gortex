@@ -420,8 +420,14 @@ func TestAnalysisGenerationPruneKeepsActiveAndFallback(t *testing.T) {
 	first := buildMinimalAnalysisGeneration(t, store, "first", 3, true)
 	second := buildMinimalAnalysisGeneration(t, store, "second", 2, true)
 	third := buildMinimalAnalysisGeneration(t, store, "third", 1, true)
-	if err := store.PruneAnalysisGenerations(context.Background(), 1, 1); err != nil {
+	removed, err := store.PruneAnalysisGenerations(context.Background(), 1, 1)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// The first generation has 3 concepts, 1 node, 1 community, 2 blobs,
+	// 6 component seals, and its generation row.
+	if removed != 14 {
+		t.Fatalf("removed=%d want=14", removed)
 	}
 	for generationID, want := range map[int64]int{first: 0, second: 1, third: 1} {
 		var count int
@@ -450,7 +456,8 @@ func TestAnalysisGenerationGCReleasesWriterLockBetweenChunks(t *testing.T) {
 
 	gcDone := make(chan error, 1)
 	go func() {
-		gcDone <- store.PruneAnalysisGenerations(context.Background(), 1, 1)
+		_, err := store.PruneAnalysisGenerations(context.Background(), 1, 1)
+		gcDone <- err
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	observedPartial := false
@@ -606,8 +613,13 @@ func TestAnalysisGenerationQueryPlansUseBoundedIndexes(t *testing.T) {
 	}{
 		"analysis_nodes_by_pagerank":            {`SELECT id FROM analysis_nodes WHERE generation_id = ? ORDER BY pagerank DESC, id ASC LIMIT ?`, []any{1, 10}},
 		"analysis_nodes_by_community":           {`SELECT id FROM analysis_nodes WHERE generation_id = ? AND community_id = ? AND node_id > ? ORDER BY node_id LIMIT ?`, []any{1, "c", "", 10}},
-		"analysis_process_steps_by_node":        {`SELECT process_id FROM analysis_process_steps WHERE generation_id = ? AND node_rowid = ? ORDER BY process_id`, []any{1, 1}},
 		"analysis_concept_relations_by_related": {`SELECT token FROM analysis_concept_relations WHERE generation_id = ? AND related_token = ? ORDER BY rank, token`, []any{1, "x"}},
+
+		// The node_rowid index carries the WITHOUT ROWID primary key, so it
+		// covers this lookup on both columns.
+		"analysis_process_step_node_fk (node_rowid=? AND generation_id=?)": {`SELECT process_id FROM analysis_process_steps WHERE generation_id = ? AND node_rowid = ? ORDER BY process_id`, []any{1, 1}},
+		// The foreign-key lookup SQLite runs for each deleted analysis_nodes row.
+		"analysis_process_step_node_fk (node_rowid=?)": {`SELECT 1 FROM analysis_process_steps WHERE node_rowid = ?`, []any{1}},
 	}
 	for index, fixture := range plans {
 		rows, err := store.db.Query(`EXPLAIN QUERY PLAN `+fixture.query, fixture.args...)
@@ -632,6 +644,36 @@ func TestAnalysisGenerationQueryPlansUseBoundedIndexes(t *testing.T) {
 		plan := strings.Join(details, " | ")
 		if !strings.Contains(plan, index) {
 			t.Fatalf("plan for %s did not use index: %s", index, plan)
+		}
+	}
+}
+
+func TestOpenDropsRedundantAnalysisProcessStepIndex(t *testing.T) {
+	path := filepathForAnalysisTest(t)
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A store opened by an earlier build still has the old index.
+	if _, err := store.writerDB.Exec(`CREATE INDEX analysis_process_steps_by_node ON analysis_process_steps(generation_id, node_rowid, process_id)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for name, want := range map[string]int{"analysis_process_steps_by_node": 0, "analysis_process_step_node_fk": 1} {
+		var got int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = ?`, name).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("index %s: count %d, want %d", name, got, want)
 		}
 	}
 }
