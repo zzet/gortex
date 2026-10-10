@@ -164,7 +164,8 @@ type checkoutFreshnessProofRefresher interface {
 // publication record rides on the context (indexer.WithPublicationRecord), so
 // the coordinator binds the ticket to it before it wakes the cycle that will
 // serve it. The first admission after a refused proof reuses the proof's
-// sample when the waiter can; every later one samples afresh.
+// sample when the waiter can; every other one binds at completion when the
+// waiter can, and samples afresh otherwise.
 func requestFreshnessTicket(
 	ctx context.Context,
 	waiter checkoutFreshnessWaiter,
@@ -176,12 +177,29 @@ func requestFreshnessTicket(
 		if proof, reusable := trace.takeReusableProof(); reusable {
 			// The first admission right after the proof may be admitted
 			// against any sample begun after the request arrived; a
-			// re-admission (the tree moved again) samples afresh.
+			// re-admission (the tree moved again) binds at completion.
 			ctx = indexer.WithFreshRequestArrival(ctx, trace.arrival())
 			return refresher.RequestCheckoutRefreshAfterProof(ctx, checkout.CheckoutID, checkout.RootPath, proof)
 		}
 	}
+	if bound, ok := waiter.(checkoutFreshnessBoundRefresher); ok {
+		// Any other admission binds at completion: the first publication
+		// whose own sample began after it answers the wait, however the
+		// tree moves meanwhile. A ticket pinned to a sample of its own would
+		// be superseded by every publication of another state, which a
+		// working copy saved faster than it builds produces each cycle. Any
+		// sample begun after the request arrived decides it.
+		ctx = indexer.WithFreshRequestArrival(ctx, trace.arrival())
+		return bound.RequestBoundCheckoutRefresh(ctx, checkout.CheckoutID, checkout.RootPath)
+	}
 	return waiter.RequestCheckoutRefresh(ctx, checkout.CheckoutID, checkout.RootPath)
+}
+
+// checkoutFreshnessBoundRefresher is the optional half of the waiter that
+// admits a ticket bound at completion
+// (indexer.CheckoutLifecycle.RequestBoundCheckoutRefresh).
+type checkoutFreshnessBoundRefresher interface {
+	RequestBoundCheckoutRefresh(ctx context.Context, checkoutID, expectedRoot string) (*indexer.CheckoutRefreshTicket, error)
 }
 
 var freshRecordSequence atomic.Uint64

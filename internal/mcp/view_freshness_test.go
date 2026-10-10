@@ -556,6 +556,61 @@ func TestRequireFreshReadmitsASupersededTicket(t *testing.T) {
 	require.True(t, hasNode(reader, "repo/keep.go::AfterTheWait"))
 }
 
+// boundFreshnessWaiter is fakeFreshnessWaiter that also admits tickets bound
+// at completion, as the checkout lifecycle does, recording the request arrival
+// each such admission carried.
+type boundFreshnessWaiter struct {
+	*fakeFreshnessWaiter
+	arrivals []time.Time
+}
+
+func (w *boundFreshnessWaiter) RequestBoundCheckoutRefresh(
+	ctx context.Context,
+	checkoutID, expectedRoot string,
+) (*indexer.CheckoutRefreshTicket, error) {
+	arrived, _ := indexer.FreshRequestArrival(ctx)
+	w.mu.Lock()
+	w.arrivals = append(w.arrivals, arrived)
+	w.mu.Unlock()
+	return w.RequestCheckoutRefresh(ctx, checkoutID, expectedRoot)
+}
+
+// A waiter that can bind a ticket at completion is asked for one on every
+// admission a refused proof lends no sample to — the re-admission after a
+// superseded ticket among them — and each carries the request's arrival: a
+// ticket pinned to a sample of its own would be superseded by every
+// publication of another state, which a working copy saved faster than it
+// builds produces each cycle.
+func TestRequireFreshReadmitsASupersededTicketBoundAtCompletion(t *testing.T) {
+	stack := newViewStack(t)
+	caughtUp := writeCaughtUpDirtyGeneration(t, stack)
+	waiter := &boundFreshnessWaiter{fakeFreshnessWaiter: &fakeFreshnessWaiter{
+		answer: func(call int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
+			if call == 1 {
+				return nil, indexer.ErrCheckoutRefreshSuperseded
+			}
+			routeViewCheckout(t, stack.store, stack.graphID, stack.commit, caughtUp, store_sqlite.RouteActive)
+			return settledTicket(checkoutID, root, uint64(caughtUp)), nil
+		},
+	}}
+	stack.srv.freshnessWaiter = waiter
+
+	var reader graph.Reader
+	res, err := stack.callWithView(t, stack.worktreeRoot, "get_symbol", freshArgs(nil, time.Minute), captureReader(stack.srv, &reader))
+	require.NoError(t, err)
+	require.False(t, res.IsError, viewResultText(t, res))
+	require.Equal(t, true, resultFreshness(t, res)["fresh"])
+	waiter.mu.Lock()
+	arrivals := append([]time.Time(nil), waiter.arrivals...)
+	waiter.mu.Unlock()
+	require.Len(t, waiter.observed(), 2)
+	require.Len(t, arrivals, 2, "an admission was not bound at completion")
+	for _, arrived := range arrivals {
+		require.False(t, arrived.IsZero(), "a bound admission did not carry the request's arrival")
+	}
+	require.Equal(t, arrivals[0], arrivals[1], "the re-admission carried another arrival than the request's")
+}
+
 // A view that reads a committed base has no working-copy route to advance.
 // Advancing a committed base on demand is a later item; until then the answer
 // says so instead of implying a wait that never happened.
