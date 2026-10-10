@@ -207,6 +207,24 @@ func (b *SparseGenerationBuilder) logEditDeltaFallback(req BuildRequest, reason 
 		zap.Int("changes", len(req.Changes)))
 }
 
+// editDeltaVersionRaceTears is a test seam: off, a sample-pinned delta keeps
+// the engine's same-generation retry, which the contract journal's re-stage of
+// an already-staged path must then survive on its own.
+var editDeltaVersionRaceTears = true
+
+// editDeltaReadMoved is the torn build a sample-pinned pass reports when a
+// file it read was saved again before its read receipt was checked
+// (Indexer.versionRaceTearsBuild). The newer bytes are not the sample's, so
+// re-reading them could never pass the prepublish fence: the attempt ends torn
+// (ErrDirtySnapshotChanged, its generation abandoned to failed by the build)
+// and the coordinator resamples, exactly as for a fence refusal.
+func editDeltaReadMoved(result *IndexResult) error {
+	if result == nil || !errors.Is(result.mutationErr, errFileVersionChanged) {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrDirtySnapshotChanged, result.mutationErr)
+}
+
 // editDeltaRefusedError is a delta that could not be expressed. Nothing was
 // published; the caller builds the same state with the sparse builder.
 type editDeltaRefusedError struct{ reason string }
@@ -782,6 +800,7 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		return out, err
 	}
 	idx.cloneRecompute = cloneRecomputePaths(req.RepoPrefix, req.RecomputeDerivedPaths)
+	idx.versionRaceTearsBuild = req.samplePinned && editDeltaVersionRaceTears
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
 	if store := b.Store; store != nil {
@@ -944,6 +963,9 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	if err != nil {
 		return nil, fmt.Errorf("indexer: per-file delta pass: %w", err)
 	}
+	if torn := editDeltaReadMoved(result); torn != nil {
+		return nil, torn
+	}
 	if result != nil && len(result.FailedFiles) > 0 {
 		return nil, &editDeltaRefusedError{reason: "files failed: " + strings.Join(result.FailedFiles, ", ")}
 	}
@@ -970,6 +992,9 @@ func (b *SparseGenerationBuilder) runEditDelta(
 		idx.forcedReparse = nil
 		if err != nil {
 			return fmt.Errorf("indexer: per-file delta %s pass: %w", what, err)
+		}
+		if torn := editDeltaReadMoved(result); torn != nil {
+			return torn
 		}
 		if result != nil && len(result.FailedFiles) > 0 {
 			return &editDeltaRefusedError{reason: "files failed: " + strings.Join(result.FailedFiles, ", ")}

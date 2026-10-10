@@ -366,6 +366,7 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	generationID, report, err := b.buildWorkingTreeLayer(ctx, BuildRequest{
 		Identity:          identity,
 		importBatch:       importBatch,
+		samplePinned:      true,
 		prePublishBarrier: req.buildBarrier,
 		importReadSetReady: func(ctx context.Context) bool {
 			if req.Sampler == nil {

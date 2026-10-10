@@ -85,6 +85,9 @@ type incrementalPriorView struct {
 // reconciliation retries first-pass failures once. A direct IndexFile request
 // can instead stop after a first-pass version race so its historical receipt
 // contract remains observable while watcher storms retain retry behaviour.
+// A sample-pinned working-tree build (Indexer.versionRaceTearsBuild) skips
+// the retry too, for the whole pass, whenever any first-pass path raced a
+// save: the attempt is torn, so retrying its other failures gains nothing.
 func (idx *Indexer) reindexIncrementalFilesBatched(
 	staleFiles, deletedFiles []string,
 	markerBatch *reparsePendingEnrichmentBatch,
@@ -165,10 +168,12 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		}
 		return invalidation, reparsed, nil, nil
 	}
-	if surfaceFirstVersionChange {
+	if surfaceFirstVersionChange || (idx.versionRaceTearsBuild && len(versionChanged) > 0) {
 		// Direct IndexFile is a single accepted-read operation. Do not let a
 		// retry hide any first-pass failure; its caller distinguishes an actual
 		// version race from parse/read failures after the complete mutation tail.
+		// A sample-pinned working-tree build stops on a version race the same
+		// way: the retry would read bytes newer than its sample.
 		if len(reparsed) > 0 || len(invalidation.Files) > 0 {
 			idx.reparsedThisRun.Store(true)
 		}

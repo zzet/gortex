@@ -576,6 +576,13 @@ type Indexer struct {
 	// delta forces its change set: the delta restates their prior rows
 	// (graph.DeltaWriter.RestateBelowRows), as the primary path keeps them.
 	inertReparsed map[string]struct{}
+	// versionRaceTearsBuild is set by the per-file delta of a sample-pinned
+	// working-tree build: a file saved after its read is newer than the
+	// build's sample, which the prepublish fence can never confirm, so the
+	// pass reports the race (IndexResult.mutationErr) instead of retrying the
+	// file with its newer bytes in the same generation. The primary
+	// checkout's per-save engine never sets it and keeps its retry.
+	versionRaceTearsBuild bool
 	// priorFingerprints, when set, supplies the content fingerprints of a
 	// changed file's prior rows when they carry none (a per-file delta over a
 	// stack written before fingerprints were stamped).
@@ -7130,7 +7137,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	for _, path := range failedFiles {
 		result.Errors = append(result.Errors, IndexError{FilePath: path, Error: idx.fileIndexFailureError(path).Error()})
 	}
-	if mode.surfaceFirstVersionChange && len(versionChangedFiles) > 0 {
+	if (mode.surfaceFirstVersionChange || idx.versionRaceTearsBuild) && len(versionChangedFiles) > 0 {
 		result.mutationErr = fmt.Errorf(
 			"%w: %s", errFileVersionChanged, strings.Join(versionChangedFiles, ", "),
 		)

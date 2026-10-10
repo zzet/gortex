@@ -3491,7 +3491,10 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 		if errors.As(err, &torn) {
 			c.deferRetire(torn.GenerationID, "torn working-tree build")
 		}
-		if errors.Is(err, errContractInputsChanged) {
+		// A pass that read a file saved after the sample (editDeltaReadMoved)
+		// or a contract-input correction abandoned its generation to failed
+		// before the fence; it is owed the same retirement as a torn one.
+		if errors.Is(err, errContractInputsChanged) || errors.Is(err, errFileVersionChanged) {
 			c.deferFailedGeneration(ctx, generationID)
 		}
 		if errors.Is(err, errContractInputsChanged) && attempt+1 < 2 {

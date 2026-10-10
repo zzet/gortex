@@ -184,6 +184,10 @@ type BuildRequest struct {
 	// importReadSetReady excludes filesystems without a short reentry proof.
 	importReadSetReady func(context.Context) bool
 	prePublishRecheck  func(context.Context) (bool, error)
+	// samplePinned marks a working-tree build of one checkout sample
+	// (BuildDirtyLayer): a file that moves after the delta read it tears the
+	// build (ErrDirtySnapshotChanged) instead of being re-read in it.
+	samplePinned bool
 
 	// Identity names the generation in the catalog.
 	Identity GenerationIdentity
