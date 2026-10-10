@@ -86,6 +86,8 @@ func (c *bodyFactsCache) readFile(handler *graph.Node) []byte {
 		return nil
 	}
 	data, err := os.ReadFile(disk)
+	// A build that proves its reads records this one too.
+	c.idx.contentProof.recordRead(disk, data, err)
 	if err != nil {
 		return nil
 	}

@@ -247,6 +247,10 @@ func (idx *Indexer) readSniffPrefix(path string) []byte {
 		}
 		return buf[:n]
 	}
+	// A build that proves its reads holds a prefix read as a read of
+	// unknown bytes: the file is then proven by its change stamp, whatever
+	// a whole-file read of it recorded.
+	idx.contentProof.record(path, "")
 	f, err := os.Open(path)
 	if err != nil {
 		return nil

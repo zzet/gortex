@@ -93,11 +93,17 @@ func TestDirtyChildTornBuildPublishesNothing(t *testing.T) {
 	builderWriteFile(t, f.worktree, "helper.go", chainHelperEdit)
 	first := coordinatorReconcile(t, c)
 
+	// Each attempt sees a new file appear in the checkout root. The read set
+	// holds the manifests the root may hold and does not (go.work,
+	// package.json, ...), each confirmed absent by the root's change stamp,
+	// which the new entry moves, so the fence refuses the build. A save of a
+	// file the build did not read, or of one after its parse, would be the
+	// next build's change instead (buildContentProof).
 	var saves atomic.Int32
 	c.dirtyBarrier = func() {
 		n := saves.Add(1)
-		builderWriteFile(t, f.worktree, "island.go",
-			fmt.Sprintf("package fixture\n\nfunc Island() {\n\t// save %d under the build\n}\n", n))
+		builderWriteFile(t, f.worktree, fmt.Sprintf("save%d.go", n),
+			fmt.Sprintf("package fixture\n\nfunc Save%d() {}\n", n))
 	}
 	builderWriteFile(t, f.worktree, "caller.go", chainCallerEdit)
 	out := c.reconcile(context.Background())

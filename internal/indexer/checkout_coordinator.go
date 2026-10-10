@@ -414,6 +414,20 @@ type CheckoutCycle struct {
 	// working tree, not the working tree, so the cycle completes no refresh
 	// ticket and the next batch is scheduled at once (0: whole sample).
 	DirtyBatchRemaining int
+	// DirtyOutpaced reports that the routed working-tree generation describes
+	// the sample its build took, and the prepublish fence saw the working copy
+	// already past it (a parsed file stamped past the sample and confirmed by
+	// its parsed bytes, or a full sample that differs): a publication, and the
+	// next cycle is signalled at once for the newer state. A move only in files
+	// the build never read is not seen by the fence and leaves it false. A
+	// refresh ticket admitted after that sample stays waiting for it.
+	DirtyOutpaced bool
+	// dirtySample is the sample the cycle's own working-tree build described,
+	// held from the build: the refresh tickets its publication answers are
+	// completed against it when a sample of another state has since become
+	// the latest (completeCheckoutRefreshTickets). Zero when the cycle built
+	// nothing.
+	dirtySample gitstate.DirtySnapshot
 	// DirtyParentGenerationID is the physical parent the cycle's working-tree
 	// build actually stood on when it was built over a working-tree parent,
 	// and DirtyChainDepth the published generation's chain depth (1 = built
@@ -682,6 +696,14 @@ type CheckoutCoordinator struct {
 	// background cycle takes before it queues (holdBackgroundCycle); nil
 	// takes cycleSample.
 	holdSample func(context.Context) error
+	// refreshSample is a focused test seam for the working-copy samples refresh
+	// tickets are captured and completed against (refreshSampleSince); nil
+	// takes the sampler's.
+	refreshSample func(context.Context, time.Time) (gitstate.DirtySnapshot, time.Time, error)
+	// cycleSampleHook is a focused test seam for a cycle's shared working-copy
+	// sample (cycleSample): an error it returns is the sample's; nil, or a
+	// nil error, takes the sampler's.
+	cycleSampleHook func(context.Context) error
 
 	// laneYields is how many background cycles in a row gave the build lane
 	// up to an interactive build (ViewBuildGate.NoteYieldable). A cycle that
@@ -1495,13 +1517,17 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	case priority == ViewBuildBackground && workingTreeMovedWhileSampling(out.Err):
 		c.resetBackgroundLaneYields()
 		out = c.treeMovedCycle(out, admission, "sample")
+	case workingTreeMovedWhileSampling(out.Err):
+		out = c.sampleMovedTicketCycle(out, admission)
 	case priority == ViewBuildBackground:
 		c.resetBackgroundLaneYields()
 		// A failed cycle keeps the motion backoff, or a checkout whose builds
-		// keep failing would retry at the bare quiet window. Every cycle that
-		// ended without an error resets it, including one whose builds the
-		// prepublish fence tore twice (Rescheduled, Err nil).
-		if out.Err == nil {
+		// keep failing would retry at the bare quiet window. So does one whose
+		// two builds the prepublish fence tore: the fence confirms a build by
+		// the bytes it parsed, so a torn pair is a working tree moving under
+		// the reads themselves, the very motion the backoff paces. Every other
+		// cycle that ended without an error resets it.
+		if out.Err == nil && out.rescheduledBy != stallReasonTornByMotion {
 			c.settleTreeMoveAborts()
 		}
 	}
@@ -2075,7 +2101,7 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 		return true, err
 	}
 	if !reparented {
-		dirtyGeneration, dirtyKey, err = c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration)
+		dirtyGeneration, dirtyKey, err = c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration, out)
 	}
 	if err != nil && !reparented {
 		c.abandonBuild(ctx, commitGeneration, !reused)
@@ -2141,6 +2167,7 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 	c.retainDirty(ctx, dirtyKey, dirtyGeneration)
 	c.releaseCommit(ctx, previousCommit)
 	c.releaseDirty(ctx, previousDirty)
+	c.signalDirtyOutpaced(*out)
 	return true, nil
 }
 
@@ -2337,7 +2364,7 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 
 	// The transition drops the whole working-tree cache below, sparing only
 	// the layer it routes, so the build's key is not filed here.
-	dirtyGeneration, _, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration)
+	dirtyGeneration, _, err := c.buildDirtyLayerOver(ctx, base.graphID, commitGeneration, &out)
 	if err != nil {
 		c.abandonBuild(ctx, commitGeneration, !reused)
 		return out, err
@@ -2373,6 +2400,7 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 		c.offerRetire(ctx, route.DirtyGenerationID)
 		c.offerRetire(ctx, route.CommitGenerationID)
 	}
+	c.signalDirtyOutpaced(out)
 	return out, nil
 }
 
@@ -3319,8 +3347,30 @@ func (c *CheckoutCoordinator) reconcileDirtySlot(
 		return nil
 	}
 	out.CompactionScheduled = c.dirtyChainCompactionDue(*out) || (out.DirtyBuilt && c.foldDue(ctx, *out))
+	c.signalDirtyOutpaced(*out)
 	return nil
 }
+
+// signalDirtyOutpaced wakes the next cycle after a cycle routed a generation
+// that describes a sample the working copy had already left (out.DirtyOutpaced).
+// The route now names a state the checkout really was in, and the saves since
+// are the next cycle's change set over it. A refresh ticket admitted after
+// this generation's sample cannot complete on it (completeCheckoutRefreshTickets
+// samples after the ticket), so a waiting ticket's cycle runs at once instead
+// of after the window.
+func (c *CheckoutCoordinator) signalDirtyOutpaced(out CheckoutCycle) {
+	if !out.DirtyOutpaced {
+		return
+	}
+	c.Signal(dirtyOutpacedReason)
+	if c.checkoutRefreshHighWater() != 0 {
+		c.SignalDemand(dirtyOutpacedReason)
+	}
+}
+
+// dirtyOutpacedReason is the wake a cycle that published a sample the working
+// copy had already left raises for the newer state.
+const dirtyOutpacedReason = "the working tree moved past the published sample"
 
 // dirtySampleKey renders the reuse key of the working-tree layer a build from
 // one sample would produce, without building it.
@@ -3364,33 +3414,16 @@ func (c *CheckoutCoordinator) dirtySampleKey(
 // between the two samples, and an entry filed under a key its row does not
 // render is an entry no lookup can hit.
 func (c *CheckoutCoordinator) buildDirtyLayerOver(
-	ctx context.Context, graphID string, commitGeneration int64,
+	ctx context.Context, graphID string, commitGeneration int64, out *CheckoutCycle,
 ) (int64, string, error) {
-	generationID, key, _, err := c.buildDirtyLayerOverParent(ctx, graphID, commitGeneration, dirtyParentSelection{}, nil, "")
-	return generationID, key, err
-}
-
-// buildDirtyLayerOverParent is buildDirtyLayerOver with a physical parent: a
-// selection with Parent > 0 builds the working tree as a delta over that
-// published working-tree generation (its composed view is the base reader,
-// leased for the whole build, and it is the new row's BaseGenerationID), and a
-// zero selection builds direct over the commit generation. first, when set, is
-// the cycle's own sample and is the first attempt's change set; a second
-// attempt samples afresh.
-//
-// A chained attempt the builder refuses returns the reason with no error and
-// no generation, before anything was written; the caller then builds direct.
-// fallbackReason is carried into a direct build's report.
-//
-// The key returned is the LOGICAL reuse key (the identity over the commit
-// generation) whatever the physical parent, which is what the undo cache
-// looks states up by.
-func (c *CheckoutCoordinator) buildDirtyLayerOverParent(
-	ctx context.Context, graphID string, commitGeneration int64,
-	parent dirtyParentSelection, first *gitstate.DirtySnapshot, fallbackReason string,
-) (int64, string, string, error) {
-	built, err := c.buildDirtyLayerAttempts(ctx, graphID, commitGeneration, parent, first, fallbackReason)
-	return built.GenerationID, built.Key, built.Reason, err
+	built, err := c.buildDirtyLayerAttempts(ctx, graphID, commitGeneration, dirtyParentSelection{}, nil, "")
+	if err == nil && built.GenerationID > 0 && out != nil {
+		// What a cycle's own build reports (buildDirtyLayerPreferChain):
+		// an outpaced publication wakes the next cycle once it is routed, and
+		// tickets complete against the sample the generation describes.
+		out.DirtyOutpaced, out.dirtySample = built.Outpaced, built.Sample
+	}
+	return built.GenerationID, built.Key, err
 }
 
 // dirtyLayerBuild is what buildDirtyLayerAttempts produced: the published
@@ -3404,12 +3437,31 @@ type dirtyLayerBuild struct {
 	// Remaining is BuildReport.BatchRemaining: > 0 when the build carried one
 	// batch of a larger change set.
 	Remaining int
+	// Outpaced is BuildReport.outpacedSample: the generation describes its
+	// sample, which the working copy had already moved past.
+	Outpaced bool
+	// Sample is the sample the generation describes (BuildReport.dirtySample).
+	Sample gitstate.DirtySnapshot
 }
 
-// buildDirtyLayerAttempts is buildDirtyLayerOverParent reporting the build's
-// work counters as well. A chained parent whose view can no longer be opened
-// (retired or unservable since it was selected) is a no_parent refusal, not a
-// cycle failure: the caller builds direct instead.
+// buildDirtyLayerAttempts is buildDirtyLayerOver with a physical parent: a
+// selection with Parent > 0 builds the working tree as a delta over that
+// published working-tree generation (its composed view is the base reader,
+// leased for the whole build, and it is the new row's BaseGenerationID), and a
+// zero selection builds direct over the commit generation. first, when set, is
+// the cycle's own sample and is the first attempt's change set; a second
+// attempt samples afresh.
+//
+// A chained attempt the builder refuses returns the reason with no error and
+// no generation, before anything was written; the caller then builds direct.
+// fallbackReason is carried into a direct build's report.
+//
+// The key returned is the LOGICAL reuse key (the identity over the commit
+// generation) whatever the physical parent, which is what the undo cache
+// looks states up by. The build's work counters are reported as well. A
+// chained parent whose view can no longer be opened (retired or unservable
+// since it was selected) is a no_parent refusal, not a cycle failure: the
+// caller builds direct instead.
 func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 	ctx context.Context, graphID string, commitGeneration int64,
 	parent dirtyParentSelection, first *gitstate.DirtySnapshot, fallbackReason string,
@@ -3489,7 +3541,13 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 		}
 		if err == nil {
 			stamped.BaseGenerationID = commitGeneration
-			return dirtyLayerBuild{GenerationID: generationID, Key: generationIdentityKey(stamped), Work: work, Remaining: report.BatchRemaining}, nil
+			if report.outpacedSample {
+				c.noteBuildMotion()
+			}
+			return dirtyLayerBuild{
+				GenerationID: generationID, Key: generationIdentityKey(stamped), Work: work,
+				Remaining: report.BatchRemaining, Outpaced: report.outpacedSample, Sample: report.dirtySample,
+			}, nil
 		}
 		var fallback *DirtyChainFallbackError
 		if errors.As(err, &fallback) {
@@ -3510,6 +3568,12 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 		var torn *DirtySnapshotChangedError
 		if errors.As(err, &torn) {
 			c.deferRetire(torn.GenerationID, "torn working-tree build")
+		}
+		// The tree moved under the build (a contract-input correction is not a
+		// move): the checkout's edits defer their enrichment until it settles
+		// (enrichmentDeferredByMotion), so the next attempt is not torn by it.
+		if !errors.Is(err, errContractInputsChanged) {
+			c.noteBuildMotion()
 		}
 		// A pass that read a file saved after the sample (editDeltaReadMoved)
 		// or a contract-input correction abandoned its generation to failed

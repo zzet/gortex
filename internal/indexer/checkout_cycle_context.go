@@ -56,6 +56,11 @@ func cycleStartFrom(ctx context.Context) time.Time {
 // decides: a build still re-samples after its payload is complete
 // (confirmDirtySnapshotWith), and that is what decides whether it publishes.
 func (c *CheckoutCoordinator) cycleSample(ctx context.Context) (gitstate.DirtySnapshot, error) {
+	if c.cycleSampleHook != nil {
+		if err := c.cycleSampleHook(ctx); err != nil {
+			return gitstate.DirtySnapshot{}, err
+		}
+	}
 	started := cycleStartFrom(ctx)
 	if started.IsZero() {
 		return c.sampler.Sample(ctx)

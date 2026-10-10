@@ -406,6 +406,8 @@ func (c *CheckoutCoordinator) buildDirtyLayerForSlot(
 				out.DirtyParentGenerationID = selection.Parent
 				out.DirtyChainDepth = selection.Depth + 1
 				out.DirtyBatchRemaining = built.Remaining
+				out.DirtyOutpaced = built.Outpaced
+				out.dirtySample = built.Sample
 			}
 			return built.GenerationID, built.Key, nil
 		}
@@ -424,6 +426,8 @@ func (c *CheckoutCoordinator) buildDirtyLayerForSlot(
 	if err == nil && built.GenerationID > 0 {
 		out.DirtyChainDepth = 1
 		out.DirtyBatchRemaining = built.Remaining
+		out.DirtyOutpaced = built.Outpaced
+		out.dirtySample = built.Sample
 	}
 	return built.GenerationID, built.Key, err
 }

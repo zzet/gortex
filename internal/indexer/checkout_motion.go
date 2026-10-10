@@ -6,7 +6,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -102,7 +101,8 @@ type checkoutMotion struct {
 	// coalesce cap the next admission needs (up to 8x), so a tree written
 	// faster than it can be built is attempted less and less often instead
 	// of at every quiet window. A background cycle that ends without an
-	// error resets it (settleTreeMoveAborts); a failed one leaves it.
+	// error resets it (settleTreeMoveAborts); a failed one, or one whose two
+	// builds the prepublish fence tore, leaves it.
 	movedAborts int
 }
 
@@ -300,11 +300,7 @@ func (c *CheckoutCoordinator) backgroundAdmissionBounds() (time.Duration, time.D
 // tree moved under (gitstate's sampling fences), as opposed to a checkout
 // that cannot be sampled at all.
 func workingTreeMovedWhileSampling(err error) bool {
-	if err == nil || !errors.Is(err, gitstate.ErrDirtyUnavailable) {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "changed while sampling") || strings.Contains(msg, "appeared while sampling")
+	return err != nil && errors.Is(err, gitstate.ErrDirtyUnavailable) && errors.Is(err, gitstate.ErrDirtyMoved)
 }
 
 // heldBySample is the hold reason when the working-copy sample itself found the
@@ -505,7 +501,8 @@ func commitTreeMoveAbort(ctx context.Context) {
 
 // settleTreeMoveAborts records an admitted background cycle that ended without
 // an error: the run of aborts for changes git does not see is over. A cycle
-// that failed does not call it, so a failure keeps the backoff.
+// that failed, or whose two builds were torn, does not call it, so either
+// keeps the backoff.
 func (c *CheckoutCoordinator) settleTreeMoveAborts() {
 	m := &c.motion
 	m.mu.Lock()
@@ -531,6 +528,9 @@ func (c *CheckoutCoordinator) treeMovedCycle(out CheckoutCycle, admission cycleA
 	m.movedAborts++
 	aborts, moved := m.aborts, m.movedAborts
 	m.mu.Unlock()
+	if detectedBy == "watcher" {
+		c.noteBuildMotion()
+	}
 	cause := out.Err
 	out.Err = nil
 	out.Rescheduled = true
@@ -548,6 +548,34 @@ func (c *CheckoutCoordinator) treeMovedCycle(out CheckoutCycle, admission cycleA
 		zap.Duration("lane_wait", admission.Lane),
 		zap.NamedError("cause", cause))
 	c.signalWindow("background build abandoned: the working tree moved", false)
+	return out
+}
+
+// sampleMovedTicketCycle turns a ticket's cycle whose own working-copy sample
+// the tree moved under (a sample or prepublish fence of the cycle reporting
+// gitstate.ErrDirtyMoved) into a rescheduled one. Such a sample says nothing
+// either way: the cycle published nothing, and failing the tickets it owes
+// would end their waits as a publication error over a save. They keep
+// waiting (completeCheckoutRefreshTickets leaves a rescheduled cycle's
+// tickets), and the next cycle runs at once, without the background backoff
+// — a ticket is a caller waiting. A cycle the lifetime canceled stays an
+// error.
+func (c *CheckoutCoordinator) sampleMovedTicketCycle(out CheckoutCycle, admission cycleAdmission) CheckoutCycle {
+	if c.lifetimeContext().Err() != nil {
+		return out
+	}
+	cause := out.Err
+	out.Err = nil
+	out.Rescheduled = true
+	out.YieldedTo = treeMovedReason
+	out.Admission = admission
+	viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeRescheduled)
+	c.logger.Info("checkout coordinator: build for a refresh ticket abandoned because the working tree moved while it was sampled",
+		zap.String("checkout", c.checkoutID),
+		zap.Bool("dirty_built", out.DirtyBuilt),
+		zap.Bool("commit_built", out.CommitBuilt),
+		zap.NamedError("cause", cause))
+	c.SignalDemand("the working tree moved while a refresh ticket's cycle sampled it")
 	return out
 }
 

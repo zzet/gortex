@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/crashpool"
@@ -42,6 +43,10 @@ type preparedExtraction struct {
 	src         []byte
 	result      *parser.ExtractionResult
 	readVersion fileReadVersion
+	// rawSHA256 is gitstate.BlobSHA256 of the bytes read, before the source
+	// transforms; set only for a build that proves its reads
+	// (Indexer.contentProof).
+	rawSHA256   string
 	parseLease  *parseAdmissionLease
 	releaseOnce sync.Once
 }
@@ -59,6 +64,8 @@ type fileDeltaProbe struct {
 	coverage               time.Duration
 	fingerprintTime        time.Duration
 	readVersion            fileReadVersion
+	// rawSHA256 is preparedExtraction.rawSHA256 of the probe's read.
+	rawSHA256 string
 }
 
 // prepareFileDelta parses the current file once and caches that exact
@@ -121,6 +128,9 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 	if err != nil {
 		probe.readErr = err
 		return probe, false, false
+	}
+	if idx.contentProof.active() {
+		probe.rawSHA256 = gitstate.BlobSHA256(src)
 	}
 	lang, ok := idx.effectiveLanguage(absPath, src)
 	if !ok {
@@ -192,6 +202,7 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 		src:         append([]byte(nil), src...),
 		result:      result,
 		readVersion: readVersion,
+		rawSHA256:   probe.rawSHA256,
 		parseLease:  parseLease,
 	}
 	idx.preparedMu.Unlock()

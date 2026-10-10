@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -119,10 +120,21 @@ func (b *SparseGenerationBuilder) editDeltaSharedEmitters(
 // editDeltaReadSource reads an unchanged file of the checkout from disk, the
 // same bytes the per-save engine parses when it re-derives the file. The
 // build's target source is narrowed to the change set, so it cannot serve it.
+// A build that proves its reads records the read (buildContentProof), so the
+// fence confirms the scanned file too: whether a file emits a row is decided
+// by its bytes as much as a parsed file's rows are.
 func editDeltaReadSource(req BuildRequest, rel string) ([]byte, bool) {
 	if req.RootPath == "" {
 		return nil, false
 	}
-	src, err := os.ReadFile(filepath.Join(req.RootPath, filepath.FromSlash(rel)))
+	abs := filepath.Join(req.RootPath, filepath.FromSlash(rel))
+	src, err := os.ReadFile(abs)
+	if req.contentProof.active() {
+		sum := ""
+		if err == nil {
+			sum = gitstate.BlobSHA256(src)
+		}
+		req.contentProof.record(abs, sum)
+	}
 	return src, err == nil
 }

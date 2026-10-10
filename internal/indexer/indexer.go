@@ -583,6 +583,11 @@ type Indexer struct {
 	// file with its newer bytes in the same generation. The primary
 	// checkout's per-save engine never sets it and keeps its retry.
 	versionRaceTearsBuild bool
+	// contentProof, set by the same delta (buildContentProof), records the
+	// content identity of the bytes each file was parsed from, and keeps a
+	// read receipt a later save made stale when those bytes are the build's
+	// sample. Nil everywhere else, where no read is hashed.
+	contentProof *buildContentProof
 	// priorFingerprints, when set, supplies the content fingerprints of a
 	// changed file's prior rows when they carry none (a per-file delta over a
 	// stack written before fingerprints were stamped).
@@ -772,6 +777,11 @@ func (idx *Indexer) manifestTreeWithRef() (manifestTree, *contentSourceRef) {
 			src = ref.src
 		}
 		return sourceManifestTree{rootPath: idx.rootPath, src: src}, ref
+	}
+	if idx.contentProof.active() {
+		// A build that proves its reads puts every manifest-tree answer in
+		// its proof (provenManifestTree).
+		return provenManifestTree{diskManifestTree: newDiskManifestTree(idx.rootPath), proof: idx.contentProof}, nil
 	}
 	return newDiskManifestTree(idx.rootPath), nil
 }
@@ -1965,7 +1975,14 @@ func (idx *Indexer) todoMaxText() int {
 // missing or malformed.
 func (idx *Indexer) loadCodeownersRules() []codeowners.Rule {
 	idx.codeownersOnce.Do(func() {
-		rules, _, ok := codeowners.LoadFromRepo(idx.rootPath)
+		// A build that proves its reads records every location it tries
+		// (its bytes, or its absence): a CODEOWNERS moved and restored while
+		// the ownership pass read it refutes the build at its fence.
+		rules, _, ok := codeowners.LoadFromRepoWith(idx.rootPath, func(name string) ([]byte, error) {
+			data, err := os.ReadFile(name)
+			idx.contentProof.recordRead(name, data, err)
+			return data, err
+		})
 		if !ok {
 			return
 		}
@@ -6397,6 +6414,12 @@ func (idx *Indexer) shouldPruneDir(path, root string) bool {
 func (idx *Indexer) dirIgnoreMatcher(root string) *excludes.Hierarchical {
 	idx.dirIgnoreOnce.Do(func() {
 		idx.dirIgnore = excludes.NewHierarchical(root, dirIgnoreFiles...)
+		// A build that proves its reads records every ignore file the walk
+		// gate reads (its bytes, or its absence): an ignore file moved and
+		// restored while the gate read it refutes the build at its fence.
+		idx.dirIgnore.ObserveReads(func(path string, data []byte, err error) {
+			idx.contentProof.recordRead(path, data, err)
+		})
 	})
 	return idx.dirIgnore
 }
@@ -6823,6 +6846,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 			// a deleted file the caller still wants evicted. Deletion
 			// detection below handles it via scopeRels.
 			if errors.Is(statErr, os.ErrNotExist) {
+				// A build that proves its reads records the absence: the
+				// path's rows leave the payload on it.
+				idx.contentProof.recordRead(absPath, nil, statErr)
 				if mode.forceExplicitFiles && idx.incrementalPathOwned(absPath) {
 					forcedDeletedFiles = append(forcedDeletedFiles, idx.relKey(absPath))
 				}
@@ -6979,7 +7005,12 @@ func (idx *Indexer) incrementalReindexPathsMode(
 
 		for _, relPath := range candidates {
 			absPath := filepath.Join(absRoot, filepath.FromSlash(relPath))
-			_, statErr := os.Stat(absPath)
+			info, statErr := os.Stat(absPath)
+			// A build that proves its reads records the answer: a candidate
+			// found present again keeps its rows, one found gone loses them.
+			if statErr == nil || errors.Is(statErr, os.ErrNotExist) {
+				idx.contentProof.probe(absPath, statErr == nil && !info.IsDir(), true)
+			}
 			if statErr == nil {
 				// Present-but-excluded must be purged (same as full-tree reconciliation).
 				if idx.shouldExclude(absPath, absRoot, false) {

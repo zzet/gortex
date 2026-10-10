@@ -347,7 +347,13 @@ func (mi *MultiIndexer) tsAliasMapFor(srcFile string) (*tsalias.Map, string) {
 		if coll == nil {
 			return nil, prefix
 		}
-		return coll.FindForFile(path.Dir(rel)), prefix
+		scope := coll.FindForFile(path.Dir(rel))
+		if idx := mi.GetIndexer(prefix); idx != nil {
+			// The repository's own build, when it proves its reads, records
+			// the working-copy probes this map makes (tsAliasProbes).
+			scope = scope.ObservingProbes(idx.tsAliasProbes())
+		}
+		return scope, prefix
 	}
 	return nil, ""
 }
@@ -377,10 +383,19 @@ func (mi *MultiIndexer) tsAliasCollectionFor(prefix, root string) *tsalias.Colle
 // cached process-wide by root. Only an unsourced tree may ask: see the note on
 // tsAliasCache.
 func loadTSAliasCollection(rootPath string) *tsalias.Collection {
+	return loadTSAliasCollectionNoting(rootPath, nil)
+}
+
+// loadTSAliasCollectionNoting is loadTSAliasCollection that calls loading,
+// when set, before it scans the working copy for a root the cache misses.
+func loadTSAliasCollectionNoting(rootPath string, loading func()) *tsalias.Collection {
 	tsAliasCacheMu.Lock()
 	defer tsAliasCacheMu.Unlock()
 	if c, ok := tsAliasCache[rootPath]; ok {
 		return c
+	}
+	if loading != nil {
+		loading()
 	}
 	c := tsalias.Load(rootPath)
 	tsAliasCache[rootPath] = c
@@ -398,6 +413,22 @@ func loadTSAliasCollection(rootPath string) *tsalias.Collection {
 // working copy, and a wrong alias scope is a wrong EDGE, not a missing one.
 func tsAliasCollectionForTree(tree manifestTree) *tsalias.Collection {
 	if !tree.sourced() {
+		if proven, ok := tree.(provenManifestTree); ok {
+			// The scan walks the whole working copy for config files, which
+			// no read set holds: a build that proves its reads and makes it
+			// is fenced by a full sample. A build the cache answers reads no
+			// config itself, but builds on the scopes the configs gave: each
+			// config a cached scope came from is held to its change stamp.
+			scanned := false
+			coll := loadTSAliasCollectionNoting(tree.root(), func() {
+				scanned = true
+				proven.proof.noteUnboundedReader()
+			})
+			if !scanned {
+				proven.proof.holdAliasConfigs(tree.root(), coll)
+			}
+			return coll
+		}
 		return loadTSAliasCollection(tree.root())
 	}
 	if src, ok := tree.(tsalias.Tree); ok {

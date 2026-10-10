@@ -436,7 +436,11 @@ func (w *closureWalk) admit(graphPath string) bool {
 	if _, gone := w.deleted[rel]; gone {
 		return false
 	}
-	if _, err := w.req.Target.Stat(rel); err != nil {
+	_, statErr := w.req.Target.Stat(rel)
+	if proof := w.req.contentProof; proof.active() {
+		proof.probe(proof.abs(rel), statErr == nil, false)
+	}
+	if statErr != nil {
 		// The base layer knows a file the target state does not hold. The
 		// caller's change set did not call it deleted, so this is a diff that
 		// does not describe the content — skip it rather than plan a read that
@@ -516,7 +520,11 @@ func (w *closureWalk) dependentPaths() []string {
 // collectManifests offers every root manifest the target holds.
 func (w *closureWalk) collectManifests(out map[string]struct{}) {
 	for _, manifest := range rootManifests() {
-		if _, err := w.req.Target.Stat(manifest.path); err != nil {
+		_, statErr := w.req.Target.Stat(manifest.path)
+		if proof := w.req.contentProof; proof.active() {
+			proof.probe(proof.abs(manifest.path), statErr == nil, false)
+		}
+		if statErr != nil {
 			continue
 		}
 		out[builderGraphPath(w.req.RepoPrefix, manifest.path)] = struct{}{}
@@ -1164,6 +1172,11 @@ func (w *closureWalk) extractInto(rel string, refs *closureRefs) {
 	}
 	src, err := io.ReadAll(reader)
 	_ = reader.Close()
+	if proof := w.req.contentProof; proof.active() {
+		// A delta that proves its reads records this one too: the dependents
+		// it plans are decided by these bytes.
+		proof.recordRead(proof.abs(rel), src, err)
+	}
 	if err != nil {
 		return
 	}

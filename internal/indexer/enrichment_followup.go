@@ -90,6 +90,10 @@ type enrichmentFollowup struct {
 	again bool
 	wg    sync.WaitGroup
 	stats EnrichmentFollowupStats
+	// motionAt is when a working-tree build last found the tree moving under
+	// it (noteBuildMotion); zero once a follow-up has caught up with every
+	// such build. While it is set, edits defer their enrichment.
+	motionAt time.Time
 
 	// quiet is a test seam: the quiet interval (<0: none, 0: the default).
 	quiet time.Duration
@@ -277,9 +281,78 @@ func (c *CheckoutCoordinator) EnrichmentFollowupStats() EnrichmentFollowupStats 
 }
 
 // defersEnrichment reports whether this checkout's working-tree edits publish
-// without their semantic enrichment.
+// without their semantic enrichment: always with the follow-up switched on,
+// and otherwise while the working tree moves under its builds
+// (enrichmentDeferredByMotion).
 func (c *CheckoutCoordinator) defersEnrichment() bool {
-	return c != nil && c.builder != nil && c.builder.Semantic != nil && enrichmentFollowupEnabled()
+	return c != nil && c.builder != nil && c.builder.Semantic != nil && (enrichmentFollowupEnabled() || c.enrichmentDeferredByMotion())
+}
+
+// Enrichment deferred by motion.
+//
+// The enrichment stage loads the changed files' packages and their imports
+// from the working copy, after the parse and beyond what the build's content
+// proof records, so the prepublish fence confirms an enriched build by change
+// stamps alone (buildContentProof.noteUnscopedReader): a save to any file it
+// may have read, while it runs or before the fence, tears the build. Under a
+// sustained edit stream that is nearly every build, and the route stops
+// advancing. So once a working-tree build of this checkout finds the tree
+// moving under it (torn by the fence or the pass, published as a sample the
+// tree had already left, or abandoned by the watcher), its edits publish
+// without enrichment, marked as owed (graphview.ReasonDeferredToFollowup),
+// exactly as with the follow-up switched on. The follow-up enriches the owed
+// paths once the checkout and its working tree have both been quiet for the
+// follow-up's window; landing with no motion since it began ends the
+// deferral, and the next edit enriches in its own build again.
+
+// noteBuildMotion records that a working-tree build found the tree moving
+// under it. Without a semantic manager there is nothing to defer.
+func (c *CheckoutCoordinator) noteBuildMotion() {
+	if c == nil || c.builder == nil || c.builder.Semantic == nil {
+		return
+	}
+	c.followup.mu.Lock()
+	c.followup.motionAt = time.Now()
+	c.followup.mu.Unlock()
+}
+
+// enrichmentDeferredByMotion reports whether the tree has moved under a build
+// since the last follow-up caught up.
+func (c *CheckoutCoordinator) enrichmentDeferredByMotion() bool {
+	c.followup.mu.Lock()
+	defer c.followup.mu.Unlock()
+	return !c.followup.motionAt.IsZero()
+}
+
+// settleBuildMotion ends the deferral when no build has found the tree moving
+// since began, the start of a follow-up that left nothing owed.
+func (c *CheckoutCoordinator) settleBuildMotion(began time.Time) {
+	c.followup.mu.Lock()
+	if !c.followup.motionAt.After(began) {
+		c.followup.motionAt = time.Time{}
+	}
+	c.followup.mu.Unlock()
+}
+
+// awaitTreeQuiet waits until the checkout's watcher has reported no change
+// for quiet, polling at dirtyChainCompactionYieldPoll. A checkout without a
+// watcher has nothing to wait for.
+func (c *CheckoutCoordinator) awaitTreeQuiet(ctx context.Context, quiet time.Duration) error {
+	ticker := time.NewTicker(dirtyChainCompactionYieldPoll)
+	defer ticker.Stop()
+	for {
+		c.motion.mu.Lock()
+		last := c.motion.lastEvent
+		c.motion.mu.Unlock()
+		if last.IsZero() || time.Since(last) >= quiet {
+			return ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // scheduleEnrichmentFollowup starts the follow-up worker for a cycle that
@@ -375,7 +448,29 @@ func (c *CheckoutCoordinator) runEnrichmentFollowup(ctx context.Context) Enrichm
 	if err := c.awaitForegroundQuiet(ctx, quiet); err != nil {
 		return c.noteFollowup(followupCanceled, 0, 0, time.Time{}, err)
 	}
+	// Deferred because the tree was moving: the follow-up's own enrichment
+	// reads the working copy too, so it waits for the tree to settle as well.
+	if c.enrichmentDeferredByMotion() {
+		if err := c.awaitTreeQuiet(ctx, quiet); err != nil {
+			return c.noteFollowup(followupCanceled, 0, 0, time.Time{}, err)
+		}
+	}
 	started := time.Now()
+	outcome := c.runEnrichmentFollowupBuild(ctx, started)
+	if c.enrichmentDeferredByMotion() && (outcome == followupLanded || outcome == followupNotNeeded) {
+		// The deferral ends only when nothing is owed any more: a debt the
+		// follow-up could not take (a chain at its bound) is still the
+		// next follow-up's, which only a deferring edit schedules.
+		if debt, _, err := c.PendingDerived(ctx); err == nil && len(debt) == 0 {
+			c.settleBuildMotion(started)
+		}
+	}
+	return outcome
+}
+
+// runEnrichmentFollowupBuild is runEnrichmentFollowup once the checkout is
+// quiet: it takes the lane, derives the debt and builds the follow-up.
+func (c *CheckoutCoordinator) runEnrichmentFollowupBuild(ctx context.Context, started time.Time) EnrichmentFollowupOutcome {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	release, err := c.gate.AcquirePromotable(ctx, ViewBuildBackground, nil)

@@ -25,10 +25,16 @@ func TestThreeNonpublishingCyclesReportAPublicationStall(t *testing.T) {
 	c := f.coordinator(t, CheckoutCoordinatorConfig{
 		PollInterval: -1,
 		cycleDone:    func(out CheckoutCycle) { cycles <- out },
-		// Every build attempt sees the tree move under it while moving is set.
+		// Every build attempt sees the tree move under it while moving is set:
+		// a new file in the checkout root. The read set holds the manifests
+		// the root may hold and does not (go.work, package.json, ...), each
+		// confirmed absent by its directory's change stamp, which the new
+		// entry moves, so the fence refuses the build. (A save of a file the
+		// build parsed, after the parse, would be confirmed by the parsed
+		// bytes and published as the sample, buildContentProof.)
 		dirtyBarrier: func() {
 			if moving.Load() {
-				builderWriteFile(t, f.worktree, "churn.go", fmt.Sprintf("package fixture\n\n// edit %d\n", edits.Add(1)))
+				builderWriteFile(t, f.worktree, fmt.Sprintf("churn%d.go", edits.Add(1)), "package fixture\n")
 			}
 		},
 	})

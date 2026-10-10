@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path"
 	"sort"
 	"time"
@@ -210,7 +211,10 @@ func StampDirtyLayerIdentity(identity GenerationIdentity, snap gitstate.DirtySna
 // it is published: if the fingerprints disagree, some part of the payload was
 // read from a state the rest of it does not describe, and publishing it would
 // make a torn read look like a coherent view of the checkout. Such a
-// generation is superseded and the build reports a retryable error.
+// generation is superseded and the build reports a retryable error — unless
+// the bytes the delta parsed prove the payload is the first sample's
+// (buildContentProof): then it is published under that sample, which the
+// checkout really was in, and the report says the working copy has moved on.
 func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	ctx context.Context,
 	req DirtyLayerRequest,
@@ -302,9 +306,24 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	if len(req.followupPaths) > 0 {
 		changes = withFollowupPaths(changes, req.followupPaths, target)
 	}
+	presentClaims := make(map[string]struct{}, len(changes))
+	for _, change := range changes {
+		if change.Kind != LayerPathDeleted {
+			presentClaims[change.Path] = struct{}{}
+		}
+	}
 	changes, err = dirtyLayerDiskTruthContext(ctx, changes, target)
 	if err != nil {
 		return 0, BuildReport{}, err
+	}
+	// A present claim the working copy no longer held when it was checked
+	// above is published as a deletion: a read of the working copy after the
+	// sample, recorded in the proof below.
+	var demoted []string
+	for _, change := range changes {
+		if _, claimed := presentClaims[change.Path]; claimed && change.Kind == LayerPathDeleted {
+			demoted = append(demoted, change.Path)
+		}
 	}
 	clock.lap("prepare_disk_truth")
 	// A change set past the interactive bound is imported: this generation
@@ -363,10 +382,19 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 			BaseCensusFunc: baseCensusFunc,
 		}
 	}
+	// The bytes the delta parses, which the fence confirms the payload by
+	// (buildContentProof); outpaced is set when it published the sample
+	// although the working copy had moved past it.
+	proof := newBuildContentProof(req.CheckoutRoot, before)
+	for _, rel := range demoted {
+		proof.recordRead(proof.abs(rel), nil, fs.ErrNotExist)
+	}
+	outpaced := false
 	generationID, report, err := b.buildWorkingTreeLayer(ctx, BuildRequest{
 		Identity:          identity,
 		importBatch:       importBatch,
 		samplePinned:      true,
+		contentProof:      proof,
 		prePublishBarrier: req.buildBarrier,
 		importReadSetReady: func(ctx context.Context) bool {
 			if req.Sampler == nil {
@@ -401,7 +429,9 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 		ProjectID:   req.ProjectID,
 		Enrich:      enrich,
 		PrePublish: func(ctx context.Context, generationID int64) error {
-			return b.confirmDirtyBuildInputs(ctx, req.Sampler, req.CheckoutRoot, generationID, before)
+			var err error
+			outpaced, err = b.confirmDirtyBuildInputs(ctx, req.Sampler, req.CheckoutRoot, generationID, before, proof)
+			return err
 		},
 		inputManifest: manifest,
 		// The sample this build describes answers HEAD and the dirty bit
@@ -410,6 +440,8 @@ func (b *SparseGenerationBuilder) BuildDirtyLayer(
 	})
 	report.PlanSteps = append(prepare, report.PlanSteps...)
 	report.BatchRemaining = remaining
+	report.outpacedSample = outpaced && err == nil && generationID > 0
+	report.dirtySample = before
 	report.WAL = store_sqlite.WALWrittenBetween(walMark, b.Store.WALWriteMark())
 	b.logWorkingTreeBuild(req, generationID, report, err)
 	report.ChainFallbackReason = req.chainFallbackReason
@@ -608,6 +640,25 @@ func (b *SparseGenerationBuilder) confirmDirtySnapshotWith(
 	generationID int64,
 	before string,
 ) error {
+	after, err := b.sampleDirtyAfterBuild(ctx, sampler, root, generationID, before)
+	if err != nil || after.Fingerprint == before {
+		return err
+	}
+	return b.tearDirtySnapshot(ctx, root, generationID, before, after.Fingerprint)
+}
+
+// sampleDirtyAfterBuild is confirmDirtySnapshotWith's new sample. A sample
+// that cannot be taken tears the generation and is the error. A sample the
+// working tree moved under (gitstate's sampling fences refused it) is proof
+// that the tree has left before: it tears the generation with the retryable
+// DirtySnapshotChangedError, as a sample that differs would, not as a failure.
+func (b *SparseGenerationBuilder) sampleDirtyAfterBuild(
+	ctx context.Context,
+	sampler *gitstate.DirtySampler,
+	root string,
+	generationID int64,
+	before string,
+) (gitstate.DirtySnapshot, error) {
 	var after gitstate.DirtySnapshot
 	var err error
 	if sampler != nil {
@@ -616,19 +667,26 @@ func (b *SparseGenerationBuilder) confirmDirtySnapshotWith(
 		after, err = gitstate.SampleDirty(ctx, root)
 	}
 	if err != nil {
-		if torn := b.tear(ctx, generationID); torn != nil {
-			return fmt.Errorf("indexer: re-sample %s: %w (tear: %v)", root, err, torn)
+		if workingTreeMovedWhileSampling(err) && ctx.Err() == nil {
+			return after, b.tearDirtySnapshot(ctx, root, generationID, before, heldBySample)
 		}
-		return fmt.Errorf("indexer: re-sample %s: %w", root, err)
+		if torn := b.tear(ctx, generationID); torn != nil {
+			return after, fmt.Errorf("indexer: re-sample %s: %w (tear: %v)", root, err, torn)
+		}
+		return after, fmt.Errorf("indexer: re-sample %s: %w", root, err)
 	}
-	if after.Fingerprint == before {
-		return nil
-	}
+	return after, nil
+}
+
+// tearDirtySnapshot refuses the publish of a generation whose sample before
+// the working copy has left for after: it tears the generation and returns
+// the retryable DirtySnapshotChangedError.
+func (b *SparseGenerationBuilder) tearDirtySnapshot(ctx context.Context, root string, generationID int64, before, after string) error {
 	changed := &DirtySnapshotChangedError{
 		CheckoutRoot: root,
 		GenerationID: generationID,
 		Before:       before,
-		After:        after.Fingerprint,
+		After:        after,
 	}
 	if torn := b.tear(ctx, generationID); torn != nil {
 		return fmt.Errorf("%w (tear: %v)", changed, torn)

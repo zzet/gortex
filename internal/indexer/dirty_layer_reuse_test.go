@@ -468,14 +468,6 @@ func TestAncestryRefFactsUnionsWithoutDoublingARow(t *testing.T) {
 
 // --- the inherited layer, and the key a build is filed under -------------
 
-const skewedIsland = `package fixture
-
-func Island() {
-	Helper()
-	Helper()
-}
-`
-
 // TestAnInheritedWorkingTreeLayerIsFiledBeforeItIsReplaced pins the arm that
 // files whatever the route already names.
 //
@@ -556,7 +548,13 @@ func TestTheBuiltWorkingTreeLayerIsFiledUnderTheKeyItStamped(t *testing.T) {
 			return
 		}
 		armed = false
-		if err := os.WriteFile(filepath.Join(f.worktree, "island.go"), []byte(skewedIsland), 0o644); err != nil {
+		// A new file in the checkout root, not a save of island.go: the build
+		// parsed island.go as its sample holds it, so a save of it would be
+		// confirmed by the parsed bytes and published as the cycle's own
+		// sample (buildContentProof). The read set holds the manifests the
+		// root may hold and does not, each confirmed absent by the root's
+		// change stamp, which the new entry moves: the fence refuses.
+		if err := os.WriteFile(filepath.Join(f.worktree, "skewed.go"), []byte("package fixture\n\nfunc Skewed() {\n\tHelper()\n}\n"), 0o644); err != nil {
 			t.Errorf("move the working tree under the build: %v", err)
 			return
 		}

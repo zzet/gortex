@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -123,8 +124,15 @@ func (b *SparseGenerationBuilder) buildWorkingTreeLayer(ctx context.Context, req
 		}
 	}
 
+	// The content proof covers the delta's own reads only: a build through
+	// the sparse closure builder, an import batch and an import-lane build
+	// keep the stamp-only fence.
+	if req.importBatch {
+		req.contentProof.disable()
+	}
 	for _, change := range req.Changes {
 		if dependencyManifestPath(change.Path) {
+			req.contentProof.disable()
 			if req.followup && b.Config.Coverage.IsEnabled("clones") {
 				return 0, BuildReport{}, fmt.Errorf("indexer: clone follow-up cannot use the sparse manifest path: %s", change.Path)
 			}
@@ -165,9 +173,13 @@ func (b *SparseGenerationBuilder) buildWorkingTreeLayer(ctx context.Context, req
 			}
 		}
 	}
+	if reenter != nil {
+		req.contentProof.disable()
+	}
 	generationID, report, err := b.buildEditDelta(ctx, req)
 	var refused *editDeltaRefusedError
 	if err != nil && errors.As(err, &refused) {
+		req.contentProof.disable()
 		if req.followup && b.Config.Coverage.IsEnabled("clones") {
 			return generationID, report, err
 		}
@@ -490,6 +502,13 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// The enrichment stage loads the changed files' packages and their
+		// imports from disk (or hands the checkout to a language server),
+		// after the parse and beyond any read set the fence can confirm: the
+		// fence takes a full sample of this build instead.
+		if report.Enrichment.readWorkingCopy {
+			req.contentProof.noteUnboundedReader()
+		}
 		if len(report.Enrichment.Ran) > 0 {
 			delta.EnrichmentRestated = editDeltaSettleEnrichment(handle, req.Base, delta.ownership)
 			claimed, err := editDeltaClaimEnrichedNodes(handle, req.Base, delta.ownership)
@@ -565,7 +584,7 @@ func (b *SparseGenerationBuilder) buildEditDelta(ctx context.Context, req BuildR
 		report.Work.mark("separate_masks_producers")
 		if req.PrePublish != nil {
 			if err := b.measurePrepublish(&report, func() error {
-				return req.PrePublish(withBuildReadSet(ctx, plan.indexed, nil, plan.deleted), generationID)
+				return req.PrePublish(req.contentProof.readSet(ctx, plan.indexed, plan.deleted), generationID)
 			}); err != nil {
 				return err
 			}
@@ -801,6 +820,18 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	}
 	idx.cloneRecompute = cloneRecomputePaths(req.RepoPrefix, req.RecomputeDerivedPaths)
 	idx.versionRaceTearsBuild = req.samplePinned && editDeltaVersionRaceTears
+	if req.samplePinned && req.contentProof.active() {
+		idx.contentProof = req.contentProof
+		if idx.contractCoreInputs == nil {
+			// Without the contract-core runtime the legacy contract refresh
+			// reads cross-file handler sources from disk (contractFileSrc,
+			// the body-facts cache). The proof records those reads, but the
+			// daemon never builds this way, so the legacy path keeps the
+			// stage-one fence: it refutes but never confirms, and the fence
+			// claims the read files' directories whole, as before the proof.
+			req.contentProof.noteUnscopedReader()
+		}
+	}
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
 	if store := b.Store; store != nil {
@@ -809,7 +840,13 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// The project name shapes every symbol search document (a whole index
 	// detects it from the root it walks); the per-save engine never walks.
 	if absRoot, err := filepath.Abs(req.RootPath); err == nil {
-		idx.projectName = search.DetectProjectName(absRoot)
+		// Read through the build's proof, when it carries one: the root
+		// manifests it takes are working-copy reads like any other.
+		idx.projectName = search.DetectProjectNameWith(absRoot, func(name string) ([]byte, error) {
+			data, err := os.ReadFile(name)
+			idx.contentProof.recordRead(name, data, err)
+			return data, err
+		})
 	}
 	idx.SetRepoPrefix(req.RepoPrefix)
 	// The resolver catch-up logs its own legs (frontier collection, pass

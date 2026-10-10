@@ -182,7 +182,7 @@ func TestABackgroundCycleIsHeldWhenAReportedPathMovedAgain(t *testing.T) {
 // left to the cycle to report as before.
 func TestABackgroundCycleWhoseSampleTheTreeMovedUnderNeverQueues(t *testing.T) {
 	root, sampler := motionRepo(t)
-	moved := fmt.Errorf("gitstate: fingerprint dirty content in %s: %w: git dirty status changed while sampling", root, gitstate.ErrDirtyUnavailable)
+	moved := fmt.Errorf("gitstate: fingerprint dirty content in %s: %w: %w", root, gitstate.ErrDirtyUnavailable, fmt.Errorf("git dirty status changed while sampling: %w", gitstate.ErrDirtyMoved))
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -444,10 +444,16 @@ func motionAtomicWrite(t *testing.T, path, content string) {
 }
 
 // liveMotionCoordinator starts a fixture coordinator with the production quiet
-// window, no poll, and — through the lifecycle's wiring — a file watcher.
-func liveMotionCoordinator(t *testing.T, f *coordinatorFixture, cycles *motionFixtureCycles) *CheckoutCoordinator {
+// window, no poll, and — through the lifecycle's wiring — a file watcher. An
+// optional cfg supplies the builder and the build gate.
+func liveMotionCoordinator(t *testing.T, f *coordinatorFixture, cycles *motionFixtureCycles, cfg ...CheckoutCoordinatorConfig) *CheckoutCoordinator {
 	t.Helper()
-	c := f.coordinator(t, CheckoutCoordinatorConfig{PollInterval: -1, cycleDone: cycles.record})
+	var config CheckoutCoordinatorConfig
+	if len(cfg) > 0 {
+		config = cfg[0]
+	}
+	config.PollInterval, config.cycleDone = -1, cycles.record
+	c := f.coordinator(t, config)
 	c.Signal("initial")
 	cycles.published(t, f, c, time.Time{}, 60*time.Second)
 	(&CheckoutLifecycle{cfgWatchCheckouts: true, logger: zap.NewNop()}).watchCheckout(c, builderRepoPrefix, f.worktree)

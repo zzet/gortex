@@ -48,7 +48,7 @@ func loadCompileCommands(tree manifestTree) map[string]cppTU {
 	cacheable := !tree.sourced()
 	var mtime int64
 	if cacheable {
-		mtime = compileDBMtime(repoRoot)
+		mtime = compileDBMtimeIn(tree)
 		if c, ok := cppIncludeDirCache.get(repoRoot, mtime); ok {
 			return c
 		}
@@ -88,8 +88,15 @@ func loadCompileCommands(tree manifestTree) map[string]cppTU {
 // snapshot has no modtime axis, so a source-backed load neither asks for this
 // nor caches an answer keyed by it.
 func compileDBMtime(repoRoot string) int64 {
+	return compileDBMtimeIn(newDiskManifestTree(repoRoot))
+}
+
+// compileDBMtimeIn is compileDBMtime over a working-copy tree, so a build
+// that proves its reads claims the directories the lookup probes and lists
+// (provenManifestTree).
+func compileDBMtimeIn(tree manifestTree) int64 {
 	var newest int64
-	tree := newDiskManifestTree(repoRoot)
+	repoRoot := tree.root()
 	for _, rel := range compileDBLocations(tree) {
 		fi, err := os.Stat(filepath.Join(repoRoot, filepath.FromSlash(rel)))
 		if err != nil {

@@ -229,6 +229,19 @@ func (l *CheckoutLifecycle) checkoutRefreshTarget(ctx context.Context, checkoutI
 	return bounded, c, checkout, rootInfo, release, nil
 }
 
+// RequestBoundCheckoutRefresh admits a ticket bound at completion
+// (requestBoundCheckoutRefresh) for a caller outside the package: a
+// require_fresh wait re-admitting after its ticket was superseded.
+// A ticket pinned to its capture sample is superseded by every publication of
+// another state, and a working copy saved faster than it builds publishes
+// another state each cycle, so a pinned re-admission can chain until the
+// wait's deadline. A bound ticket completes on the first publication whose
+// own sample began after its admission — at worst the build that starts
+// after it — which is all require_fresh promises.
+func (l *CheckoutLifecycle) RequestBoundCheckoutRefresh(ctx context.Context, checkoutID, expectedRoot string) (*CheckoutRefreshTicket, error) {
+	return l.requestBoundCheckoutRefresh(ctx, checkoutID, expectedRoot)
+}
+
 // requestBoundCheckoutRefresh is RequestCheckoutRefresh admitting the ticket
 // without a working-copy sample (bindAtCompletion, HEAD unbound): the caller's
 // promise — the route describes the working copy at some instant after its
@@ -259,6 +272,12 @@ func (c *CheckoutCoordinator) captureBoundCheckoutRefresh(
 	request := &checkoutRefreshRequest{
 		checkout: checkout, rootInfo: rootInfo, record: publicationRecordFrom(ctx),
 		bindAtCompletion: true, headUnbound: true,
+	}
+	if arrived, ok := FreshRequestArrival(ctx); ok && !arrived.After(time.Now()) {
+		// The request's arrival is the instant its promise is about: any
+		// sample begun at or after it decides the ticket, the one a build
+		// already in flight took among them.
+		request.freshAfter = arrived
 	}
 	identity := &CheckoutMutation{coordinator: c, checkout: checkout, rootInfo: rootInfo}
 	if err := identity.validateCheckout(ctx); err != nil {
@@ -295,7 +314,12 @@ func (c *CheckoutCoordinator) captureCheckoutRefreshFrom(
 		sample = *given
 	} else {
 		var err error
-		if sample, request.freshAfter, err = c.sampler.SampleSinceStarted(ctx, time.Now()); err != nil {
+		if sample, request.freshAfter, err = c.refreshSampleSince(ctx, time.Now()); err != nil {
+			if workingTreeMovedWhileSampling(err) {
+				// The tree moved under the capture: there is no snapshot to
+				// pin, and the caller asks again against the newer tree.
+				return nil, fmt.Errorf("%w: %w", ErrCheckoutRefreshSuperseded, err)
+			}
 			return nil, err
 		}
 	}
@@ -325,6 +349,15 @@ func (c *CheckoutCoordinator) captureCheckoutRefreshFrom(
 		Ticket: &MutationTicket{Path: path, Done: request.done},
 	}
 	return request, nil
+}
+
+// refreshSampleSince is the working-copy sample a refresh ticket is captured
+// or completed against: one begun at or after since (SampleSinceStarted).
+func (c *CheckoutCoordinator) refreshSampleSince(ctx context.Context, since time.Time) (gitstate.DirtySnapshot, time.Time, error) {
+	if c.refreshSample != nil {
+		return c.refreshSample(ctx, since)
+	}
+	return c.sampler.SampleSinceStarted(ctx, since)
 }
 
 func (c *CheckoutCoordinator) reserveCheckoutRefresh() error {
@@ -521,7 +554,14 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 				}
 			}
 		}
-		sample, sampleStarted, err = c.sampler.SampleSinceStarted(ctx, since)
+		sample, sampleStarted, err = c.refreshSampleSince(ctx, since)
+		if workingTreeMovedWhileSampling(err) && c.lifetimeContext().Err() == nil {
+			// The tree moved while the completion sample was taken: no
+			// answer either way. The owed tickets wait for the next cycle,
+			// which the move itself is reason to run now.
+			c.SignalDemand("the working tree moved while refresh tickets were completed")
+			return
+		}
 		if err != nil {
 			c.failCheckoutRefreshRequests(owed, err)
 			return
@@ -544,10 +584,47 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 			requests = append(requests, request)
 		}
 	}
-	if len(requests) == 0 {
-		return
-	}
 	if sample.Fingerprint != dirty.LowerViewFingerprint {
+		// A sample of another state has replaced the one this publication
+		// describes as the latest (a rider's prepublish demand, a freshness
+		// proof, the fence of a build that was outpaced). The publication
+		// still answers every ticket admitted at or before an instant a
+		// sample found the working copy in the published state — the
+		// cycle's own build holds the sample it published, and the
+		// sampler's recent samples stand in when the routed generation is
+		// not the cycle's build — and any other ticket waits for the next
+		// cycle, which an outpaced publication has already signalled.
+		if out.cycleStarted.IsZero() {
+			return
+		}
+		waiting := make([]*checkoutRefreshRequest, 0, len(owed)+len(riders))
+		waiting = append(append(waiting, owed...), riders...)
+		earliest := waiting[0].freshAfter
+		for _, request := range waiting[1:] {
+			if request.freshAfter.Before(earliest) {
+				earliest = request.freshAfter
+			}
+		}
+		published, publishedStarted, ok := out.dirtySample, time.Time{}, false
+		if published.Fingerprint == dirty.LowerViewFingerprint {
+			publishedStarted, ok = published.SampleStarted()
+			ok = ok && !publishedStarted.Before(earliest)
+		}
+		if !ok {
+			published, publishedStarted, ok = c.sampler.LatestSampleOf(dirty.LowerViewFingerprint, earliest)
+		}
+		if !ok {
+			return
+		}
+		sample, sampleStarted = published, publishedStarted
+		requests = nil
+		for _, request := range waiting {
+			if !sampleStarted.Before(request.freshAfter) {
+				requests = append(requests, request)
+			}
+		}
+	}
+	if len(requests) == 0 {
 		return
 	}
 	current, found, err := c.catalog.GetCheckout(ctx, c.checkoutID)

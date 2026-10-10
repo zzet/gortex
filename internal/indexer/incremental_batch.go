@@ -31,6 +31,7 @@ type incrementalBatchStage struct {
 	absPath       string
 	mtimeKey      string
 	readVersion   fileReadVersion
+	rawSHA256     string
 	relPath       string
 	graphPath     string
 	src           []byte
@@ -62,6 +63,9 @@ type fileReadReceipt struct {
 	absPath     string
 	mtimeKey    string
 	readVersion fileReadVersion
+	// rawSHA256 is the content identity of the bytes read, set only for a
+	// build that proves its reads (Indexer.contentProof).
+	rawSHA256 string
 }
 
 type incrementalFallback struct {
@@ -349,6 +353,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 			idx.discardPreparedExtraction(filePath)
 			receipts = append(receipts, fileReadReceipt{
 				absPath: filePath, mtimeKey: idx.relKey(filePath), readVersion: probe.readVersion,
+				rawSHA256: probe.rawSHA256,
 			})
 			plan.InertFiles++
 			continue
@@ -387,6 +392,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 		stage := &incrementalBatchStage{
 			absPath: filePath, mtimeKey: idx.relKey(filePath),
 			readVersion: prepared.readVersion,
+			rawSHA256:   prepared.rawSHA256,
 			relPath:     prepared.relPath, graphPath: graphPath,
 			src: prepared.src, result: prepared.result, prepared: prepared, priorNodes: priorNodes,
 			storedGraph: storedGraph, storedDerived: storedDerived, probe: probe,
@@ -421,6 +427,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 		for _, stage := range stages {
 			receipts = append(receipts, fileReadReceipt{
 				absPath: stage.absPath, mtimeKey: stage.mtimeKey, readVersion: stage.readVersion,
+				rawSHA256: stage.rawSHA256,
 			})
 		}
 		// Commit no longer reads the staged source, result, or tree. Return
@@ -1670,15 +1677,46 @@ func (idx *Indexer) persistIncrementalSidecars(stages []*incrementalBatchStage) 
 // version is still on disk after the graph/sidecar commit. One os.Stat per file
 // is required to close the concurrent-write window; persistence remains one
 // set-oriented SQLite write for the whole bounded chunk.
+//
+// A sample-pinned working-tree build (Indexer.contentProof) keeps a receipt a
+// later save made stale when the bytes it parsed are its sample's content for
+// the file: the payload describes the sample, which is the state the build
+// publishes, so the save is the next build's change rather than a tear of this
+// one. Its own version is still the one stamped. A receipt whose bytes are
+// not the sample's content for a file the sample holds tears the build at
+// once, however settled the file looks: the save landed between the sample
+// and the read, so the payload can never pass the fence.
 func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (fresh, stale []string) {
 	if len(receipts) == 0 {
 		return nil, nil
 	}
 	mtimes := make(map[string]int64, len(receipts))
+	keep := func(receipt fileReadReceipt) {
+		idx.contentProof.record(receipt.absPath, receipt.rawSHA256)
+		if receipt.readVersion.valid {
+			mtimes[receipt.mtimeKey] = receipt.readVersion.mtime
+		}
+		fresh = append(fresh, receipt.absPath)
+		idx.noteFileIndexFailure(receipt.absPath, nil)
+	}
+	// A torn read is recorded unproven, except bytes that contradict the
+	// sample, which stay recorded so the fence refuses them too.
+	tear := func(receipt fileReadReceipt, err error) {
+		sum := ""
+		if idx.contentProof.contradicts(receipt.absPath, receipt.rawSHA256) {
+			sum = receipt.rawSHA256
+		}
+		idx.contentProof.record(receipt.absPath, sum)
+		idx.noteFileIndexFailure(receipt.absPath, err)
+		stale = append(stale, receipt.absPath)
+	}
 	for _, receipt := range receipts {
 		if !receipt.readVersion.valid {
-			idx.noteFileIndexFailure(receipt.absPath, errFileVersionChanged)
-			stale = append(stale, receipt.absPath)
+			if idx.contentProof.holdsSample(receipt.absPath, receipt.rawSHA256) {
+				keep(receipt)
+				continue
+			}
+			tear(receipt, errFileVersionChanged)
 			continue
 		}
 		if receipt.readVersion.snapshot {
@@ -1690,18 +1728,22 @@ func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (f
 		}
 		current, err := os.Stat(receipt.absPath)
 		if err != nil {
-			idx.noteFileIndexFailure(receipt.absPath, err)
-			stale = append(stale, receipt.absPath)
+			tear(receipt, err)
 			continue
 		}
 		if !sameFileVersion(receipt.readVersion.info, current) {
-			idx.noteFileIndexFailure(receipt.absPath, errFileVersionChanged)
-			stale = append(stale, receipt.absPath)
+			if idx.contentProof.holdsSample(receipt.absPath, receipt.rawSHA256) {
+				keep(receipt)
+				continue
+			}
+			tear(receipt, errFileVersionChanged)
 			continue
 		}
-		mtimes[receipt.mtimeKey] = receipt.readVersion.mtime
-		fresh = append(fresh, receipt.absPath)
-		idx.noteFileIndexFailure(receipt.absPath, nil)
+		if idx.contentProof.contradicts(receipt.absPath, receipt.rawSHA256) {
+			tear(receipt, errFileVersionChanged)
+			continue
+		}
+		keep(receipt)
 	}
 	if len(mtimes) == 0 {
 		return fresh, stale

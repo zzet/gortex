@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -1045,18 +1046,23 @@ func Sneaked() {
 func TestCoordinatorKeepsThePreviousRouteWhenEveryBuildIsTorn(t *testing.T) {
 	f := newCoordinatorFixture(t)
 
-	moving := false
-	edits := 0
-	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{
-		dirtyBarrier: func() {
-			if !moving {
-				return
-			}
-			edits++
-			builderWriteFile(t, f.worktree, "churn.go",
-				"package fixture\n\n// edit "+string(rune('a'+edits))+"\n")
-		},
-	})
+	// Every attempt parses churn.go before helper.go, and while moving is set
+	// the parse of churn.go saves helper.go: the bytes the attempt then
+	// parses for helper.go are not its sample's, so the content proof
+	// refutes the payload and the attempt is torn (buildContentProof). A
+	// save of a file after its parse would not do: the parsed bytes prove
+	// the sample, which the fence then publishes.
+	var moving atomic.Bool
+	registry := builderRegistry()
+	goExtractor, ok := registry.GetByLanguage("go")
+	if !ok {
+		t.Fatal("no Go extractor registered")
+	}
+	saver := &savingExtractor{Extractor: goExtractor, path: filepath.Join(f.worktree, "helper.go"), early: "churn.go", earlyEvery: moving.Load}
+	registry.Register(saver)
+	builder := builderNewBuilder(f.store)
+	builder.Registry = registry
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{Builder: builder})
 
 	settled := coordinatorReconcile(t, c)
 	if settled.DirtyGenerationID == 0 {
@@ -1064,15 +1070,17 @@ func TestCoordinatorKeepsThePreviousRouteWhenEveryBuildIsTorn(t *testing.T) {
 	}
 	before := f.route()
 
-	moving = true
+	moving.Store(true)
+	builderWriteFile(t, f.worktree, "churn.go", "package fixture\n\nfunc Churn() {}\n")
 	builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc Helper() {}\n")
 	torn := coordinatorReconcile(t, c)
+	moving.Store(false)
 
 	if !torn.Rescheduled {
 		t.Fatalf("two torn builds did not reschedule: %+v", torn)
 	}
-	if edits != 2 {
-		t.Fatalf("the barrier fired %d times, want exactly two attempts", edits)
+	if edits := saver.earlySaves.Load(); edits != 2 {
+		t.Fatalf("helper.go was saved under %d parses, want exactly two attempts", edits)
 	}
 	after := f.route()
 	if after.DirtyGenerationID != before.DirtyGenerationID {

@@ -81,7 +81,12 @@ func (idx *Indexer) deletionImporterFiles(deleted []string, skip []string) []str
 			if _, covered := skipSet[abs]; covered {
 				continue
 			}
-			if info, err := os.Stat(abs); err != nil || info.IsDir() {
+			info, err := os.Stat(abs)
+			present := err == nil && !info.IsDir()
+			// A build that proves its reads records the answer: an importer
+			// skipped as gone is a payload that holds none of its rows.
+			idx.contentProof.probe(abs, present, true)
+			if !present {
 				continue
 			}
 			out = append(out, abs)

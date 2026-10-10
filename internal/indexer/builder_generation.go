@@ -15,6 +15,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/embedding"
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
@@ -188,6 +189,10 @@ type BuildRequest struct {
 	// (BuildDirtyLayer): a file that moves after the delta read it tears the
 	// build (ErrDirtySnapshotChanged) instead of being re-read in it.
 	samplePinned bool
+	// contentProof, on a sample-pinned build, records the bytes the delta
+	// parsed (buildContentProof); its PrePublish confirms by them. A build
+	// that leaves the delta path disables it.
+	contentProof *buildContentProof
 
 	// Identity names the generation in the catalog.
 	Identity GenerationIdentity
@@ -344,6 +349,10 @@ type EnrichmentOutcome struct {
 	// compiler state after the pass returned (started, running, warm, or
 	// why not); nil when the build did not ask.
 	CompilerWarmup map[string]string
+	// readWorkingCopy reports that a provider was handed the working copy:
+	// it may have read the changed files from disk after the parse
+	// (buildContentProof.noteUnscopedReader).
+	readWorkingCopy bool
 }
 
 // BuildReport is what one build did — and, as importantly, what it could not
@@ -498,6 +507,15 @@ type BuildReport struct {
 	// BatchRemaining is how many changed paths a batched working-tree build
 	// left for the next batch (0: the build describes the whole sample).
 	BatchRemaining int
+	// outpacedSample reports a working-tree build published under its sample
+	// although the working copy had moved past it: the fence confirmed the
+	// payload by the bytes it parsed (buildContentProof), so the newer state
+	// is the next build's.
+	outpacedSample bool
+	// dirtySample is the sample a working-tree build described (its before),
+	// held for the build's lifetime: refresh tickets the publication answers
+	// are completed against it (completeCheckoutRefreshTickets).
+	dirtySample gitstate.DirtySnapshot
 	// PassSteps split the head of the physical pass: opening the generation's
 	// bulk window and the declared-context seed decision (its layer-below
 	// node read), before the extraction itself.
@@ -1220,6 +1238,7 @@ func (b *SparseGenerationBuilder) runEnrichment(
 		}
 	}
 	scope := withCheckoutDeclarations(b.checkoutCompilerScope(req.Changes), req.Base)
+	out.readWorkingCopy = true
 	pass, err := b.Semantic.EnrichCheckoutContext(ctx, handle, semantic.CheckoutEnrichRequest{
 		RepoPrefix:       req.RepoPrefix,
 		CheckoutID:       req.Enrich.CheckoutID,

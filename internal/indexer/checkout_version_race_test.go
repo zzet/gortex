@@ -20,11 +20,24 @@ import (
 // extracts trigger, a file the same chunk parses after path. By then path's
 // bytes were read, parsed and re-confirmed for the chunk, so the save lands
 // between its read and the chunk's read-receipt check: the receipt is stale.
-// Armed once; every other call is the plain extractor.
+// With early set, it first lands another save on path while the pass
+// extracts early, a file the chunk parses before path, so the bytes the pass
+// then reads for path are already newer than the build's sample.
+// Armed once; every other call is the plain extractor. With earlyEvery set,
+// the early save instead lands at every extraction of early while it reports
+// true, and earlySaves counts them.
 type savingExtractor struct {
 	parser.Extractor
 	trigger, path string
 	armed         atomic.Bool
+	early         string
+	earlyArmed    atomic.Bool
+	earlyEvery    func() bool
+	earlySaves    atomic.Int32
+	// line is what the save appends to path ("// moved\n" when empty), and
+	// onSave runs just before it. Both are set before the extractor is armed.
+	line   string
+	onSave func()
 
 	mu      sync.Mutex
 	savedAt time.Time
@@ -39,19 +52,45 @@ func (e *savingExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 		e.reread = append(e.reread, time.Now())
 		e.mu.Unlock()
 	}
-	if filepath.Base(filePath) == e.trigger && e.armed.CompareAndSwap(true, false) {
-		file, err := os.OpenFile(e.path, os.O_APPEND|os.O_WRONLY, 0)
-		if err == nil {
-			_, err = file.WriteString("// moved\n")
-			if closeErr := file.Close(); err == nil {
-				err = closeErr
-			}
+	if e.early != "" && filepath.Base(filePath) == e.early &&
+		(e.earlyArmed.CompareAndSwap(true, false) || (e.earlyEvery != nil && e.earlyEvery())) {
+		e.earlySaves.Add(1)
+		if err := appendToFile(e.path, "// early\n"); err != nil {
+			e.mu.Lock()
+			e.err = err
+			e.mu.Unlock()
 		}
+	}
+	if filepath.Base(filePath) == e.trigger && e.armed.CompareAndSwap(true, false) {
+		if e.onSave != nil {
+			e.onSave()
+		}
+		line := e.line
+		if line == "" {
+			line = "// moved\n"
+		}
+		err := appendToFile(e.path, line)
 		e.mu.Lock()
-		e.savedAt, e.err = time.Now(), err
+		e.savedAt = time.Now()
+		if e.err == nil {
+			e.err = err
+		}
 		e.mu.Unlock()
 	}
 	return e.Extractor.Extract(filePath, src)
+}
+
+// appendToFile is an in-place editor save of path: line appended.
+func appendToFile(path, line string) error {
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	_, err = file.WriteString(line)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 func (e *savingExtractor) saved() (time.Time, error) {
@@ -76,8 +115,12 @@ func (e *savingExtractor) rereadsBefore(at time.Time) int {
 // A save that lands on a file between its read and the chunk's read-receipt
 // check, while a require_fresh ticket's chained working-tree delta is built
 // under the daemon's contract-core runtime and an open build gate, tears that
-// attempt and is rebuilt. It never fails the cycle or the ticket, and the
-// settled tree is published within one more build.
+// attempt and is rebuilt when the bytes the pass read were not the build's
+// sample (an earlier save landed after the sample, before the read). It
+// never fails the cycle or the ticket, and the settled tree is published
+// within one more build. (When the bytes read are the sample's, the attempt
+// is kept and published as the sample:
+// TestASaveAfterTheParseIsPublishedAsTheBuildsSample.)
 func TestASaveDuringAChainedDeltaParseTearsInsteadOfFailing(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -102,7 +145,7 @@ func runSaveDuringChainedDeltaParse(t *testing.T, tears bool) {
 	if !ok {
 		t.Fatal("no Go extractor registered")
 	}
-	saver := &savingExtractor{Extractor: goExtractor, trigger: "island.go", path: filepath.Join(f.worktree, "helper.go")}
+	saver := &savingExtractor{Extractor: goExtractor, trigger: "island.go", early: "core.go", path: filepath.Join(f.worktree, "helper.go")}
 	registry.Register(saver)
 	core, logs := observer.New(zap.InfoLevel)
 	builder := builderNewBuilder(f.store)
@@ -119,9 +162,10 @@ func runSaveDuringChainedDeltaParse(t *testing.T, tears bool) {
 
 	// D1: helper.go's accepted contract receipt lives in a published
 	// working-tree generation, the parent the next delta chains on and
-	// carries the receipt from. core.go keeps the next delta smaller than
+	// carries the receipt from. caller.go keeps the next delta smaller than
 	// the dirty set, so it chains.
 	saved := time.Now()
+	builderWriteFile(t, f.worktree, "caller.go", "package fixture\n\nfunc Run() {\n\tCompute(Options{})\n\t_ = 1\n}\n")
 	builderWriteFile(t, f.worktree, "core.go", "package fixture\n\ntype Options struct{}\n\nfunc Compute(o Options) {\n\tHelper()\n\tIsland()\n}\n")
 	builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc Helper() {\n\t_ = 1\n}\n")
 	builderWriteFile(t, f.worktree, "island.go", "package fixture\n\nfunc Island() {\n\t_ = 1\n}\n")
@@ -136,7 +180,11 @@ func runSaveDuringChainedDeltaParse(t *testing.T, tears bool) {
 	mark := len(cycles.cycles)
 	cycles.mu.Unlock()
 	saver.armed.Store(true)
+	// The pass parses core.go before helper.go: the early save there makes
+	// the bytes it reads for helper.go newer than the build's sample.
+	saver.earlyArmed.Store(true)
 	edited := time.Now()
+	builderWriteFile(t, f.worktree, "core.go", "package fixture\n\ntype Options struct{}\n\nfunc Compute(o Options) {\n\tIsland()\n\tHelper()\n}\n")
 	builderWriteFile(t, f.worktree, "helper.go", "package fixture\n\nfunc Helper() {\n\t_ = 2\n}\n")
 	builderWriteFile(t, f.worktree, "island.go", "package fixture\n\nfunc Island() {\n\t_ = 2\n}\n")
 	// A require_fresh request: the ticket is bound to the first state a sample
