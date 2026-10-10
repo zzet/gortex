@@ -106,7 +106,14 @@ func (b *contractCoreStorageBackend) PriorBoundaryReceipt(ctx context.Context, p
 	}
 	if source != nil {
 		b.mu.Lock()
-		b.sources[path] = *source
+		// The carry seeds an empty target path. A path this build already
+		// staged (a retried or re-derived parse) has its row in the target, so
+		// carrying it again would trip the store's carry guard; its new
+		// receipt simply replaces the staged one. The prior stays the
+		// predecessor's, a superset diff.
+		if _, staged := b.staged[path]; !staged {
+			b.sources[path] = *source
+		}
 		b.mu.Unlock()
 	}
 	return contractCorePriorReceipt(row, known)
@@ -146,11 +153,21 @@ func (b *contractCoreStorageBackend) BeginBoundaryMutation(ctx context.Context, 
 					b.coldSemantic[row.FilePath] = row.Fingerprint
 				}
 			}
+			source, carry := b.sources[change.FilePath]
+			delete(b.sources, change.FilePath)
+			if pending := slices.IndexFunc(b.coldRows, func(r graph.ContractBoundaryReceipt) bool {
+				return r.FilePath == row.FilePath
+			}); pending >= 0 {
+				// A second begin for a path still in the unflushed chunk
+				// replaces its row; the chunk already carries its source once.
+				b.coldBytes += len(row.Payload) - len(b.coldRows[pending].Payload)
+				b.coldRows[pending] = row
+				continue
+			}
 			b.coldRows = append(b.coldRows, row)
 			b.coldBytes += len(row.Payload)
-			if source, ok := b.sources[change.FilePath]; ok {
+			if _, staged := b.staged[change.FilePath]; carry && !staged {
 				b.coldSources = append(b.coldSources, source)
-				delete(b.sources, change.FilePath)
 			}
 		}
 		return nil
