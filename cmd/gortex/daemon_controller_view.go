@@ -33,9 +33,11 @@ type probeView struct {
 	// repoPrefix is the corpus the path's content lives under. It keys the
 	// file lookup and filters the nodes a coverage answer counts.
 	repoPrefix string
-	// searchScope narrows a symbol probe to one repo prefix. It is empty for
-	// a dedicated checkout and for an untracked path, because narrowing them
-	// would change the answer those callers already get.
+	// searchScope narrows a symbol probe to the repo prefix the probed path
+	// belongs to. It is empty only when no corpus claims the path, because
+	// there is then no repo to clamp to. A hook deny must cite evidence the
+	// tools it redirects to could see: an unclamped probe would deny on
+	// sibling-repo symbols that search and relations refuse to answer about.
 	searchScope string
 	// root is the working copy the path is relative to, empty when no
 	// checkout owns it.
@@ -163,11 +165,16 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 	}
 
 	if !binding.Matched || binding.EffectiveMode != string(store_sqlite.CheckoutModeAutomatic) {
-		// A live dedicated checkout, the family primary, and every untracked
-		// path are read from the indexed corpus directly, unscoped, exactly as
-		// they were before routed views existed.
+		// A live dedicated checkout, the family primary, and every tracked
+		// path no checkout owns read the indexed corpus directly, exactly as
+		// they were before routed views existed. The corpus the binding named
+		// is the path's own repo, so a symbol probe is clamped to it: the
+		// coverage and file lookups below already filter by repoPrefix, and
+		// an unclamped probe would cite sibling-repo symbols in a multi-repo
+		// daemon — evidence a deny's own redirect targets cannot answer for.
 		base.answer = exactProbeView(daemon.ProbeViewBase, binding.CheckoutID, binding.RepoPrefix)
 		base.repoPrefix = binding.RepoPrefix
+		base.searchScope = binding.RepoPrefix
 		base.root = binding.RootPath
 		return base
 	}

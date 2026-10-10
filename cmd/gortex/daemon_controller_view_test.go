@@ -422,6 +422,54 @@ func TestProbeOfDedicatedCheckoutReadsTheBaseCorpus(t *testing.T) {
 	assert.Equal(t, []string{"BaseOnly"}, symbolNames(found.Hits))
 }
 
+// TestProbeOfTrackedPathClampsSymbolEvidenceToItsRepo pins the multi-repo
+// scoping rule: a symbol probe whose path sits inside one tracked repo is
+// clamped to that repo's prefix, so a sibling repo sharing the union graph
+// cannot supply deny evidence for it. An unclamped probe made the hook deny
+// on sibling-repo symbols the redirect targets refuse to answer about.
+func TestProbeOfTrackedPathClampsSymbolEvidenceToItsRepo(t *testing.T) {
+	f := newProbeFixture(t)
+	// The sibling repo lives in the same union graph and defines the same
+	// short name under its own prefix — the collision the hook kept citing.
+	f.store.AddBatch([]*graph.Node{{
+		ID:         "sibling/internal/phase/tracker.go::BaseOnly",
+		Kind:       graph.KindFunction,
+		Name:       "BaseOnly",
+		FilePath:   "sibling/internal/phase/tracker.go",
+		RepoPrefix: "sibling",
+		Language:   "go",
+		StartLine:  39,
+		EndLine:    41,
+	}}, nil)
+	ctx := context.Background()
+	probed := filepath.Join(f.primaryRoot, probeFile)
+
+	found, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "BaseOnly", Path: probed,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"BaseOnly"}, symbolNames(found.Hits))
+	assert.Equal(t, probeFileKey, found.Hits[0].FilePath,
+		"the sibling repo's same-named symbol must not surface as deny evidence")
+
+	// The substring fallback is clamped by the same scope: a pattern naming
+	// part of the symbol cannot reach across the prefix either.
+	partial, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "aseOnly", Path: probed,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"BaseOnly"}, symbolNames(partial.Hits))
+	assert.Equal(t, probeFileKey, partial.Hits[0].FilePath)
+
+	// The same query without a path stays unscoped, which is what proves the
+	// clamp comes from the probed path's repo rather than a missing sibling.
+	unscoped, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
+		Query: "BaseOnly",
+	})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"BaseOnly", "BaseOnly"}, symbolNames(unscoped.Hits))
+}
+
 func TestProbeOfDedicatedCheckoutInRemovalGraceIsLabeledFallback(t *testing.T) {
 	f := newProbeFixture(t)
 	ctx := context.Background()
