@@ -32,6 +32,11 @@ type ReadSetConfirmation struct {
 	Files    int
 	Dirs     int
 	Rehashed int
+	// ContentProven is how many read files moved since the sample but were
+	// confirmed by the bytes the build parsed (ConfirmReadSetContent): the
+	// payload describes the sample for them, and the working copy has moved
+	// past it.
+	ContentProven int
 }
 
 // headEvidence is the change identity of the files that decide what HEAD
@@ -168,7 +173,8 @@ func resolveGitDirsFromDotGit(root string) (gitDir, commonDir string) {
 // rename, link and mode change moves and no caller can set:
 //
 //   - the latest sample this sampler took must carry before's fingerprint, and
-//     the realtime clock must not have jumped since it started;
+//     the realtime clock must not have jumped since the build's own sample
+//     (before, when this sampler took it; else that latest sample) started;
 //   - the files that decide HEAD must be exactly as they were when it started;
 //   - every read file, and every listed directory, must carry a change stamp
 //     older than the sample's start (by readSetChangeMargin). A directory's
@@ -180,6 +186,12 @@ func resolveGitDirsFromDotGit(root string) (gitDir, commonDir string) {
 // reason, never an error: the caller falls back to a full sample, which is
 // what decides. err is only the context's.
 func (s *DirtySampler) ConfirmReadSet(ctx context.Context, before DirtySnapshot, files, dirs []string) (ReadSetConfirmation, error) {
+	return s.confirmReadSet(ctx, before, files, dirs, nil)
+}
+
+// confirmReadSet is ConfirmReadSet, and ConfirmReadSetContent when parsed is
+// not nil.
+func (s *DirtySampler) confirmReadSet(ctx context.Context, before DirtySnapshot, files, dirs []string, parsed map[string]string) (ReadSetConfirmation, error) {
 	var out ReadSetConfirmation
 	if err := ctx.Err(); err != nil {
 		return out, err
@@ -191,13 +203,28 @@ func (s *DirtySampler) ConfirmReadSet(ctx context.Context, before DirtySnapshot,
 	s.mu.Lock()
 	last, started, evidence := s.last, s.lastStarted, s.lastHead
 	s.mu.Unlock()
+	own, owned := s.ownOrigin(before)
 	switch {
 	case started.IsZero():
 		out.Reason = "no sample to confirm against"
 		return out, nil
-	case before.Fingerprint == "" || last.Fingerprint != before.Fingerprint:
+	case parsed != nil && !owned:
+		out.Reason = "the build's sample was not taken by this sampler"
+		return out, nil
+	case parsed == nil && (before.Fingerprint == "" || last.Fingerprint != before.Fingerprint):
 		out.Reason = "the latest sample does not carry the build's fingerprint"
 		return out, nil
+	}
+	if owned {
+		// The build's own sample decides, whatever was sampled after it: it
+		// began before every read of the build, so its instant bounds every
+		// change stamp, and its HEAD evidence is what the payload's HEAD
+		// was. A later sample of the same fingerprint must not stand in for
+		// it: a file read while it held other bytes and restored before that
+		// sample began carries a stamp older than it.
+		started, evidence = own.started, own.head
+	}
+	switch {
 	case !dirtyClockContinuous(time.Duration(time.Now().UnixNano()-started.UnixNano()), time.Since(started)):
 		out.Reason = "the realtime clock moved since the sample"
 		return out, nil
@@ -277,6 +304,16 @@ func (s *DirtySampler) ConfirmReadSet(ctx context.Context, before DirtySnapshot,
 		}
 		out.Files++
 		content, dirty := contents[p]
+		// A file the build parsed, which the sample holds as a regular
+		// file's bytes, is judged by those bytes: other bytes are a payload
+		// of another state whatever the stamps say, and the sample's bytes
+		// are this payload's however the file moved since.
+		parsedSum, wasParsed := parsed[p]
+		contentPinned := wasParsed && dirty && content.State == DirtyContentPresent && content.Mode != symlinkMode
+		if contentPinned && parsedSum != content.SHA256 {
+			out.Reason = "a read file was parsed from bytes other than the sample's: " + p
+			return out, nil
+		}
 		info, err := os.Lstat(filepath.Join(s.root, filepath.FromSlash(p)))
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
@@ -310,8 +347,23 @@ func (s *DirtySampler) ConfirmReadSet(ctx context.Context, before DirtySnapshot,
 			}
 			continue
 		}
+		// A parsed file stamped after the sample began has moved past it;
+		// one stamped just before (inside the margin) may be exactly what the
+		// sample hashed, and the re-hash below says which.
+		if contentPinned && !time.Unix(version.changeSec, version.changeNsec).Before(started) {
+			out.ContentProven++
+			continue
+		}
 		if !dirty || content.State != DirtyContentPresent {
 			out.Reason = "a read file changed since the sample: " + p
+			return out, nil
+		}
+		if parsed != nil && !wasParsed {
+			// The build holds no bytes of its own for this path (a gate read
+			// it unrecorded, or it was not read at all): a re-hash equal to
+			// the sample's says the working copy is back, not that a read
+			// made while it moved took the sample's bytes.
+			out.Reason = "a read file the build holds no bytes for changed since the sample: " + p
 			return out, nil
 		}
 		if root == nil {
@@ -326,11 +378,19 @@ func (s *DirtySampler) ConfirmReadSet(ctx context.Context, before DirtySnapshot,
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return out, ctxErr
 			}
+			if contentPinned {
+				out.ContentProven++
+				continue
+			}
 			out.Reason = "a read file changed while it was re-hashed: " + p
 			return out, nil
 		}
 		out.Rehashed++
 		if memo.sha256 != content.SHA256 || memo.mode != content.Mode {
+			if contentPinned {
+				out.ContentProven++
+				continue
+			}
 			out.Reason = "a read file's content changed since the sample: " + p
 			return out, nil
 		}

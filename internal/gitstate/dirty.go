@@ -31,6 +31,24 @@ import (
 // entry list as "the checkout went clean".
 var ErrDirtyUnavailable = errors.New("git dirty state unavailable")
 
+// ErrDirtyMoved is the cause of an ErrDirtyUnavailable sample the working copy
+// moved under: a dirty path changed, appeared or was replaced while it was
+// read or fenced, or the status changed between the fence's two reads. Unlike
+// the other causes it is evidence about the working copy — it has left the
+// state the sample began in — not about whether the checkout can be sampled.
+var ErrDirtyMoved = errors.New("working copy moved while sampled")
+
+// dirtyMovedError keeps a moved-while-sampled message as it reads and makes
+// it an ErrDirtyMoved.
+type dirtyMovedError struct{ msg string }
+
+func (e *dirtyMovedError) Error() string { return e.msg }
+func (e *dirtyMovedError) Unwrap() error { return ErrDirtyMoved }
+
+func dirtyMoved(format string, args ...any) error {
+	return &dirtyMovedError{msg: fmt.Sprintf(format, args...)}
+}
+
 // DirtyKind names what kind of difference one path carries.
 type DirtyKind string
 
@@ -103,6 +121,21 @@ type DirtySnapshot struct {
 	// exposes it, and it is nil for a clean checkout. The entries whose
 	// HeadEqual is false are exactly the Fingerprint's per-path inputs.
 	Contents []DirtyContent
+	// origin is the fenced sample this snapshot is, as its sampler took it:
+	// when its status began and HEAD's identity just before. A build that
+	// holds the snapshot holds its own sample's evidence for as long as it
+	// runs (ConfirmReadSetContent), however many samples are taken meanwhile.
+	// Nil for a snapshot no DirtySampler fenced.
+	origin *sampleOrigin
+}
+
+// SampleStarted reports when the git status of the sample this snapshot is
+// began, and false for a snapshot no DirtySampler took.
+func (snap DirtySnapshot) SampleStarted() (time.Time, bool) {
+	if snap.origin == nil {
+		return time.Time{}, false
+	}
+	return snap.origin.started, true
 }
 
 // DirtyContentState names what the sampler observed at one reported path.
@@ -183,6 +216,11 @@ type DirtySampler struct {
 	// lastHead is the HEAD-deciding files' identity taken just before last's
 	// status command started (ConfirmReadSet).
 	lastHead headEvidence
+	// recent is the latest few fenced samples, oldest first: a cache
+	// LatestSampleOf answers from once a sample of another state has
+	// replaced one as last. Confirmation never depends on it: a snapshot
+	// carries its own sample's evidence (DirtySnapshot.origin).
+	recent []sampleEvidence
 	// gitDir/commonDir resolve the checkout's .git without running git, and
 	// stampsTrusted whether its filesystem's change stamps are trusted; both
 	// are computed once (read_set_confirm.go).
@@ -437,11 +475,13 @@ func (s *DirtySampler) sampleHeldStarted(ctx context.Context) (DirtySnapshot, ti
 	if err != nil {
 		return DirtySnapshot{}, time.Time{}, err
 	}
+	snap.origin = &sampleOrigin{sampler: s, fingerprint: snap.Fingerprint, started: started, head: head}
 	s.mu.Lock()
 	s.taken++
 	if !started.Before(s.lastStarted) {
 		s.last, s.lastStarted, s.lastHead = snap, started, head
 	}
+	s.noteSampleEvidenceLocked(snap, started)
 	s.mu.Unlock()
 	return snap, started, nil
 }
@@ -706,7 +746,7 @@ func (s *DirtySampler) fenceDirtyEvidence(ctx context.Context, root *os.Root, pa
 		return err
 	}
 	if !bytes.Equal(status, after) {
-		return errors.New("git dirty status changed while sampling")
+		return dirtyMoved("git dirty status changed while sampling")
 	}
 	for _, path := range paths {
 		if err := ctx.Err(); err != nil {
@@ -716,12 +756,12 @@ func (s *DirtySampler) fenceDirtyEvidence(ctx context.Context, root *os.Root, pa
 		info, err := root.Lstat(path)
 		if observed.missing {
 			if !os.IsNotExist(err) {
-				return fmt.Errorf("dirty path %q appeared while sampling", path)
+				return dirtyMoved("dirty path %q appeared while sampling", path)
 			}
 			continue
 		}
 		if err != nil || dirtyVersion(info) != dirtyVersion(observed.info) {
-			return fmt.Errorf("dirty path %q changed while sampling", path)
+			return dirtyMoved("dirty path %q changed while sampling", path)
 		}
 		if !observed.opaque && !observed.memo.reusable {
 			// Young, unsupported or incomplete evidence must not certify bytes.
@@ -730,7 +770,7 @@ func (s *DirtySampler) fenceDirtyEvidence(ctx context.Context, root *os.Root, pa
 				return err
 			}
 			if current.mode != observed.memo.mode || current.sha256 != observed.memo.sha256 {
-				return fmt.Errorf("dirty path %q changed while sampling", path)
+				return dirtyMoved("dirty path %q changed while sampling", path)
 			}
 		}
 	}
@@ -851,7 +891,7 @@ func (s *DirtySampler) contentFingerprint(ctx context.Context, tree string, entr
 	currentRootInfo, statErr := currentRoot.Stat()
 	closeErr = currentRoot.Close()
 	if statErr != nil || closeErr != nil || !currentRootInfo.IsDir() || !os.SameFile(rootInfo, currentRootInfo) {
-		return "", nil, errors.New("checkout root changed while sampling dirty content")
+		return "", nil, dirtyMoved("checkout root changed while sampling dirty content")
 	}
 	if err := ctx.Err(); err != nil {
 		return "", nil, err
@@ -900,7 +940,7 @@ func dirtyContentForPath(ctx context.Context, root *os.Root, path string, info o
 		local := statErr == nil && dirtyLocalFilesystem(current)
 		closeErr := current.Close()
 		if statErr != nil || closeErr != nil || !opened.Mode().IsRegular() || dirtyVersion(opened) != version {
-			return dirtyContentMemo{}, false, fmt.Errorf("dirty file %q changed before cache lookup", path)
+			return dirtyContentMemo{}, false, dirtyMoved("dirty file %q changed before cache lookup", path)
 		}
 		if local {
 			return cached, true, nil
@@ -936,7 +976,7 @@ func readDirtyContent(ctx context.Context, root *os.Root, path string, before os
 		defer file.Close()
 		opened, err := file.Stat()
 		if err != nil || !opened.Mode().IsRegular() || dirtyVersion(opened) != memo.version {
-			return memo, fmt.Errorf("dirty file %q changed before reading", path)
+			return memo, dirtyMoved("dirty file %q changed before reading", path)
 		}
 		memo.reusable = memo.version.cacheable && dirtyLocalFilesystem(file) && dirtyStampQuiet(memo.version, memo.hashedAt)
 		memo.mode = "100644"
@@ -954,7 +994,7 @@ func readDirtyContent(ctx context.Context, root *os.Root, path string, before os
 	}
 	after, err := root.Lstat(path)
 	if err != nil || dirtyVersion(after) != memo.version {
-		return memo, fmt.Errorf("dirty file %q changed while reading", path)
+		return memo, dirtyMoved("dirty file %q changed while reading", path)
 	}
 	if file != nil {
 		current, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
@@ -965,7 +1005,7 @@ func readDirtyContent(ctx context.Context, root *os.Root, path string, before os
 		closeErr := current.Close()
 		originalInfo, originalErr := file.Stat()
 		if statErr != nil || closeErr != nil || originalErr != nil || !currentInfo.Mode().IsRegular() || !os.SameFile(originalInfo, currentInfo) || dirtyVersion(currentInfo) != memo.version || dirtyVersion(originalInfo) != memo.version {
-			return memo, fmt.Errorf("dirty file %q was replaced while reading", path)
+			return memo, dirtyMoved("dirty file %q was replaced while reading", path)
 		}
 	}
 	return memo, nil
@@ -990,7 +1030,7 @@ func hashDirtyReader(ctx context.Context, reader io.Reader, size int64) (string,
 		if n > 0 {
 			empty = 0
 			if int64(n) > size-count {
-				return "", "", errors.New("dirty file grew while reading")
+				return "", "", dirtyMoved("dirty file grew while reading")
 			}
 			count += int64(n)
 			_, _ = writer.Write(buffer[:n])
@@ -1008,7 +1048,7 @@ func hashDirtyReader(ctx context.Context, reader io.Reader, size int64) (string,
 		}
 	}
 	if count != size {
-		return "", "", errors.New("dirty file changed length while reading")
+		return "", "", dirtyMoved("dirty file changed length while reading")
 	}
 	if err := ctx.Err(); err != nil {
 		return "", "", err

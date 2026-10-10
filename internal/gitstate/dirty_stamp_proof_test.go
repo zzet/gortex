@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,6 +124,11 @@ func TestDirtyStampProofDetectsAChangeBetweenTheHashAndTheStamp(t *testing.T) {
 			}
 			if err == nil {
 				t.Fatalf("a %s change between the hash and the proof was accepted: fingerprint %s", scenario, snap.Fingerprint)
+			}
+			// A caller tells a tree that moved under the sample from one that
+			// cannot be sampled by the cause.
+			if !errors.Is(err, ErrDirtyUnavailable) || !errors.Is(err, ErrDirtyMoved) {
+				t.Fatalf("a %s change while sampling = %v, want ErrDirtyUnavailable caused by ErrDirtyMoved", scenario, err)
 			}
 			if stamped, fenced := s.DirtyContentProofs(); stamped != 0 || fenced != 1 {
 				t.Fatalf("proofs stamped=%d fenced=%d, want 0/1 (the stamps must not prove a changed %s)", stamped, fenced, scenario)

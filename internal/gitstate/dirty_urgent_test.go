@@ -115,7 +115,7 @@ func TestUrgentSampleOvertakesABackgroundSampleAtItsNextGitBoundary(t *testing.T
 	if s.UrgentYields() == 0 {
 		t.Fatal("the background sample never yielded")
 	}
-	if background.Fingerprint == "" || !reflect.DeepEqual(background, urgent) {
+	if background.Fingerprint == "" || !reflect.DeepEqual(sampleContent(background), sampleContent(urgent)) {
 		t.Fatalf("successful samples disagree: background=%+v urgent=%+v", background, urgent)
 	}
 }

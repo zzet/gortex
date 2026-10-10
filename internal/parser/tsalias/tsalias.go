@@ -123,8 +123,32 @@ func NewCollection(maps []*Map) *Collection {
 	return &Collection{scopes: scopes}
 }
 
-// Maps returns the underlying scope slice. Test-visibility only.
-func (c *Collection) Maps() []*Map { return c.scopes }
+// ObservingProbes returns m with every existence probe Resolve makes on it
+// reported to observe: the repo-relative path probed and whether it held a
+// file. A map with no probe (hand-built), a nil map or a nil observe is
+// returned as is. The copy shares m's entries, which stay read-only.
+func (m *Map) ObservingProbes(observe func(rel string, found bool)) *Map {
+	if m == nil || m.exists == nil || observe == nil {
+		return m
+	}
+	exists := m.exists
+	out := *m
+	out.exists = func(rel string) bool {
+		found := exists(rel)
+		observe(rel, found)
+		return found
+	}
+	return &out
+}
+
+// Maps returns the underlying scope slice, which callers treat as read-only.
+// A nil Collection has none.
+func (c *Collection) Maps() []*Map {
+	if c == nil {
+		return nil
+	}
+	return c.scopes
+}
 
 // FindForFile returns the alias map for the nearest ancestor scope of
 // relPath, or nil when no scope applies.

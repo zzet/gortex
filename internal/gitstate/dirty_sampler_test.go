@@ -230,7 +230,7 @@ func TestDirtySamplerRootAndPublicSubdirectoryCompatibility(t *testing.T) {
 
 	rootSnap := sampleDirtyOK(t, repo)
 	nestedSnap := sampleDirtyOK(t, nested)
-	if !reflect.DeepEqual(rootSnap, nestedSnap) {
+	if !reflect.DeepEqual(sampleContent(rootSnap), sampleContent(nestedSnap)) {
 		t.Fatalf("subdirectory sample differs from root:\nroot=%+v\nsub=%+v", rootSnap, nestedSnap)
 	}
 
@@ -243,7 +243,7 @@ func TestDirtySamplerRootAndPublicSubdirectoryCompatibility(t *testing.T) {
 		t.Fatalf("NewDirtySampler: %v", err)
 	}
 	direct, err := sampler.Sample(context.Background())
-	if err != nil || !reflect.DeepEqual(rootSnap, direct) {
+	if err != nil || !reflect.DeepEqual(sampleContent(rootSnap), sampleContent(direct)) {
 		t.Fatalf("root-known sample = %+v, %v; public = %+v", direct, err, rootSnap)
 	}
 }
@@ -306,4 +306,11 @@ func TestDirtySamplerCancellationAndErrors(t *testing.T) {
 			t.Fatalf("resolution failure was cached: %d commands", got)
 		}
 	})
+}
+
+// sampleContent is what a sample found, without which sample it is: two
+// samples of one state are the same content but not the same sample.
+func sampleContent(snap DirtySnapshot) DirtySnapshot {
+	snap.origin = nil
+	return snap
 }
