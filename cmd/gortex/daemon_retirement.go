@@ -16,7 +16,7 @@ const (
 	deferredRetirementIdlePause = 30 * time.Second
 )
 
-type deferredRetirementSweep func(context.Context) (retired int, pending bool, err error)
+type deferredRetirementSweep = indexer.DeferredRetirementSweep
 
 type deferredRetirementWorker struct {
 	ready     chan struct{}
@@ -25,6 +25,11 @@ type deferredRetirementWorker struct {
 	stopOnce  sync.Once
 	done      chan struct{}
 	idlePause time.Duration
+	// progress and wake are the lifecycle's committed-work count and its
+	// new-work signal (indexer.DeferredRetirementLoop); nil keeps the plain
+	// pause cadence.
+	progress func() int64
+	wake     func() <-chan struct{}
 	// afterReady runs once, on the worker's goroutine, when the daemon is
 	// ready and before the first sweep: the one-time correction of
 	// generations an older derivation wrote (SetAfterReady).
@@ -50,6 +55,8 @@ func startDeferredRetirementWorker(sweep deferredRetirementSweep, logger *zap.Lo
 		cancel:    cancel,
 		done:      make(chan struct{}),
 		idlePause: deferredRetirementIdlePause,
+		progress:  indexer.DeferredRetirementProgress,
+		wake:      indexer.DeferredRetirementWake,
 	}
 	go worker.run(ctx, sweep, logger, deferredRetirementRetryBase, deferredRetirementRetryMax)
 	return worker
@@ -79,67 +86,13 @@ func (w *deferredRetirementWorker) run(ctx context.Context, sweep deferredRetire
 	if w.afterReady != nil {
 		w.afterReady(ctx)
 	}
-	if sweep == nil {
-		return
-	}
-	if basePause <= 0 {
-		basePause = time.Second
-	}
-	if maxBackoff < basePause {
-		maxBackoff = basePause
-	}
-	idlePause := w.idlePause
-	errorBackoff := basePause
-	for {
-		// The lifecycle discovers and ages debt even during ordinary request
-		// traffic. Its shared build permit and Store quantum guard actual work.
-		retired, pending, err := sweep(ctx)
-		if retired > 0 {
-			logger.Info("daemon: deferred startup retirement progress", zap.Int("retired_generations", retired), zap.Bool("pending", pending),
-				zap.Int64("interactive_preemptions", indexer.DeferredRetirementPreemptions()),
-				zap.Int64("parked_generations", indexer.DeferredRetirementParked()))
-		}
-		if err != nil && ctx.Err() == nil {
-			logger.Warn("daemon: deferred startup retirement will retry", zap.Error(err), zap.Duration("retry_after", errorBackoff))
-		}
-		pause := basePause
-		switch {
-		case err != nil:
-			pause = errorBackoff
-			if errorBackoff < maxBackoff {
-				errorBackoff *= 2
-				if errorBackoff > maxBackoff {
-					errorBackoff = maxBackoff
-				}
-			}
-		case pending:
-			errorBackoff = basePause
-		default:
-			errorBackoff = basePause
-			if idlePause <= 0 {
-				// Direct test/embedding workers retain the original one-shot
-				// behavior. The daemon starter sets a bounded lifetime cadence.
-				return
-			}
-			// Runtime coordinators can enqueue retirement after startup has
-			// drained. Stay alive without hot-polling an empty catalog.
-			pause = idlePause
-		}
-		if !waitDeferredRetirementPause(ctx, pause) {
-			return
-		}
-	}
-}
-
-func waitDeferredRetirementPause(ctx context.Context, pause time.Duration) bool {
-	timer := time.NewTimer(pause)
-	select {
-	case <-ctx.Done():
-		if !timer.Stop() {
-			<-timer.C
-		}
-		return false
-	case <-timer.C:
-		return true
-	}
+	indexer.DeferredRetirementLoop{
+		Sweep:      sweep,
+		Logger:     logger,
+		BasePause:  basePause,
+		MaxBackoff: maxBackoff,
+		IdlePause:  w.idlePause,
+		Progress:   w.progress,
+		Wake:       w.wake,
+	}.Run(ctx)
 }

@@ -1906,7 +1906,24 @@ func viewsStatusFromHealth(health indexer.ViewsHealth) *daemon.ViewsStatus {
 		// surface the reason can come out of.
 		StorageFailures:   viewsStorageFailures(health.StorageFailures),
 		PublicationStalls: viewsPublicationStalls(health.PublicationStalls),
+		RetirementBacklog: viewsRetirementBacklog(health.RetirementBacklog),
 		Counters:          health.Counters,
+	}
+}
+
+// viewsRetirementBacklog translates the deferred retirement backlog onto the
+// wire; a nil backlog stays nil so an idle status omits the field.
+func viewsRetirementBacklog(backlog *indexer.RetirementBacklog) *daemon.RetirementBacklog {
+	if backlog == nil {
+		return nil
+	}
+	return &daemon.RetirementBacklog{
+		Generations:    backlog.Generations,
+		Retiring:       backlog.Retiring,
+		Parked:         backlog.Parked,
+		BytesEstimate:  backlog.BytesEstimate,
+		DebtAgeSeconds: backlog.DebtAgeSeconds,
+		LastRemovedAt:  backlog.LastRemovedAt,
 	}
 }
 

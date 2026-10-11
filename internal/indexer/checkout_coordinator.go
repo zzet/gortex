@@ -3135,7 +3135,7 @@ func (c *CheckoutCoordinator) clearDirtySlot(ctx context.Context, route *store_s
 	route.DirtyGenerationID = 0
 	c.rememberRoutedDirty(0)
 	c.releaseDirtyChain(ctx, dropped, 0)
-	noteRetirementReferenceReleased()
+	noteRetirementReferencesReleased(dropped)
 	return nil
 }
 
@@ -3716,13 +3716,17 @@ func (c *CheckoutCoordinator) flip(
 	}
 	route.RouteEpoch++
 	route.State = store_sqlite.RouteActive
-	noteRetirementReferenceReleased()
+	// Only the generation leaving the slot lost a reference.
 	switch slot {
 	case store_sqlite.RouteSlotCommit:
+		noteRetirementReferencesReleased(route.CommitGenerationID)
 		route.CommitGenerationID = generationID
 	case store_sqlite.RouteSlotDirty:
+		noteRetirementReferencesReleased(route.DirtyGenerationID)
 		route.DirtyGenerationID = generationID
 		c.rememberRoutedDirty(generationID)
+	default:
+		noteRetirementReferenceReleased()
 	}
 	return nil
 }
@@ -4082,6 +4086,11 @@ func (c *CheckoutCoordinator) cachedDirty(ctx context.Context, key string) (int6
 	if err != nil || !found || !servableGeneration(row.State) ||
 		row.GenerationKind != DirtyLayerGenerationKind || !c.dirtyRowRendersKey(ctx, row, key) {
 		c.forgetRetainedDirty(generationID)
+		if err != nil || found {
+			// The row is still there (or could not be read): with the cache
+			// no longer holding it, it is owed unless the route names it.
+			c.oweUnroutedDirty(generationID, "dropped from the working-tree reuse cache")
+		}
 		return 0, false
 	}
 	return generationID, true
@@ -4099,8 +4108,20 @@ func (c *CheckoutCoordinator) retainDirty(ctx context.Context, key string, gener
 	c.mu.Lock()
 	retained := c.retainedDirty[:0:0]
 	retained = append(retained, retainedDirtyLayer{key: key, generationID: generationID})
+	// A different generation filed under the same key — the chain top a fold
+	// reproduces, a layer re-filed under its logical key — leaves the cache
+	// here. The cache was its only holder unless the route names it (the
+	// route's own release owes it then), so it is owed like an evicted layer:
+	// dropped silently it was never retired, and pinned its whole chain.
+	var displaced []int64
 	for _, entry := range c.retainedDirty {
-		if entry.key == key || entry.generationID == generationID {
+		if entry.generationID == generationID {
+			continue
+		}
+		if entry.key == key {
+			if entry.generationID != c.routedDirty {
+				displaced = append(displaced, entry.generationID)
+			}
 			continue
 		}
 		retained = append(retained, entry)
@@ -4119,6 +4140,9 @@ func (c *CheckoutCoordinator) retainDirty(ctx context.Context, key string, gener
 	// delete is a background sweep's work, never a foreground cycle's.
 	for _, generation := range evicted {
 		c.deferRetire(generation, "evicted from the working-tree reuse cache")
+	}
+	for _, generation := range displaced {
+		c.deferRetire(generation, "displaced in the working-tree reuse cache")
 	}
 }
 
@@ -4140,6 +4164,17 @@ func (c *CheckoutCoordinator) releaseDirty(ctx context.Context, generationID int
 	c.mu.Unlock()
 	if !held {
 		c.deferRetire(generationID, "released by the working-tree route")
+	}
+}
+
+// oweUnroutedDirty owes a working-tree generation the cache let go of a
+// retirement, unless the route names it (its release owes it then).
+func (c *CheckoutCoordinator) oweUnroutedDirty(generationID int64, why string) {
+	c.mu.Lock()
+	routed := c.routedDirty == generationID
+	c.mu.Unlock()
+	if !routed {
+		c.deferRetire(generationID, why)
 	}
 }
 
@@ -4191,9 +4226,15 @@ func (c *CheckoutCoordinator) offerRetire(ctx context.Context, generationID int6
 			return
 		}
 		c.mu.Lock()
+		_, known := c.backlog[generationID]
 		c.backlog[generationID] = struct{}{}
 		held := len(c.backlog)
 		c.mu.Unlock()
+		if !known {
+			// A refused offer is owed to the background sweep like a deferral.
+			countRetirementOwed(c.store, generationID, viewmetrics.OwedReleased)
+			notifyDeferredRetirementWork()
+		}
 		// The blocking reason and how many generations this coordinator is
 		// now owing a retirement for: together they say whether one holder is
 		// stuck or the backlog is growing.

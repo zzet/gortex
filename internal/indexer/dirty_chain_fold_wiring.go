@@ -82,6 +82,15 @@ func (b storeChainFoldBackend) BeginChainFold(ctx context.Context, chain []int64
 }
 
 func (b storeChainFoldBackend) RebaseViewGeneration(ctx context.Context, generationID, fromBase, toBase int64) error {
+	err := b.rebaseViewGeneration(ctx, generationID, fromBase, toBase)
+	if err == nil {
+		// The layer no longer names fromBase: its "based" reference went.
+		noteRetirementReferencesReleased(fromBase)
+	}
+	return err
+}
+
+func (b storeChainFoldBackend) rebaseViewGeneration(ctx context.Context, generationID, fromBase, toBase int64) error {
 	return b.store.Catalog().RebaseViewGeneration(ctx, store_sqlite.RebaseViewGenerationRequest{
 		GenerationID: generationID, FromBase: fromBase, ToBase: toBase,
 	})

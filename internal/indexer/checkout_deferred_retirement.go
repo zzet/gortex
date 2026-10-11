@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 const (
@@ -26,6 +27,7 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 	if ctx == nil {
 		return 0, true, fmt.Errorf("deferred retirement: nil context")
 	}
+	viewmetrics.Count(viewmetrics.RetirementPassesTotal)
 	// Idle checkouts give their layers to this sweep (at most hourly).
 	_, _ = l.ReleaseIdleCheckouts(ctx)
 	if err := l.lockRetirementSweep(ctx); err != nil {
@@ -54,16 +56,29 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 	// Interactive work that wants the writer goes first — before the
 	// catalog scan for candidates as well as before a slice: nothing of the
 	// sweep runs while an edit cycle holds the lane or a writer waits
-	// (checkout_deferred_retirement_preempt.go), unless the sweep has been
-	// starved for too long to keep yielding.
+	// (checkout_deferred_retirement_preempt.go). Without a build gate that
+	// holds until the sweep has been starved for too long to keep yielding.
+	// With one (the daemon) the pass stands down before the scan only once
+	// debt is already known and has not aged past the starvation limit: the
+	// first sighting of debt needs the scan to start its age, and aged debt
+	// skips the stand-down — except beside a chain fold, where it keeps one
+	// bounded burst per deferredRetirementFoldBurstEvery
+	// (retirementFoldPaced). Released parked work aged on its own clock is
+	// scanned for, and served alone, while young debt stands down.
 	started := time.Now()
 	gate := l.buildGate()
 	armed := true
 	if gate == nil {
 		armed = l.retirementPreemptionArmed(started)
 	}
-	if gate == nil && l.retirementShouldStandDown(armed, coordinators) {
-		deferredRetirementPreemptions.Add(1)
+	debtKnown := l.deferredRetirementEligibleSince.Load() != 0
+	if gate == nil || (debtKnown && !l.retirementDebtAged(started) && !l.retirementAgedReleasePending(started)) {
+		if reason := l.retirementStandDownReason(armed, coordinators); reason != "" {
+			l.standDownRetirementPass(reason)
+			return 0, true, nil
+		}
+	} else if debtKnown && l.retirementFoldPaced(started) {
+		l.standDownRetirementPass("chain_fold")
 		return 0, true, nil
 	}
 
@@ -73,6 +88,11 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 
 	// Record every partial discovery result before observing cancellation. A
 	// later pass can drain it even when this pass's inventory read was cut short.
+	// A generation already counted as owed (by a coordinator, or an earlier
+	// pass) is not counted again.
+	for _, generationID := range discovered {
+		countRetirementOwed(l.store, generationID, viewmetrics.OwedDiscovered)
+	}
 	l.coordMu.Lock()
 	for _, generationID := range discovered {
 		l.owed[generationID] = struct{}{}
@@ -121,9 +141,31 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 		if len(ordered) == 0 {
 			return 0, discoveryErr != nil, discoveryErr
 		}
-		if !l.retirementDebtAged(started) && l.retirementShouldStandDown(true, coordinators) {
-			deferredRetirementPreemptions.Add(1)
+		if !l.retirementDebtAged(started) {
+			if reason := l.retirementStandDownReason(true, coordinators); reason != "" {
+				// Young debt stands down; released parked work aged on its
+				// own clock is served alone, as aged debt is.
+				released := l.agedReleasedRetirements(ordered, started)
+				if len(released) == 0 {
+					if !debtKnown {
+						// The first sighting needed the scan to start the clock.
+						deferredRetirementFirstSightings.Add(1)
+					}
+					l.standDownRetirementPass(reason)
+					return 0, true, discoveryErr
+				}
+				if l.retirementFoldPaced(started) {
+					l.standDownRetirementPass("chain_fold")
+					return 0, true, discoveryErr
+				}
+				ordered = released
+			}
+		} else if l.retirementFoldPaced(started) {
+			l.standDownRetirementPass("chain_fold")
 			return 0, true, discoveryErr
+		}
+		if l.chainFoldInFlight() {
+			l.deferredRetirementFoldBurstAt.Store(started.UnixNano())
 		}
 		// An explicit cleanup may own the build lane and need this mutex.
 		// Never hold it while waiting for background lane admission.
@@ -143,8 +185,8 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 		}
 		return 0, false, nil
 	}
-	if l.retirementShouldStandDown(armed, coordinators) {
-		deferredRetirementPreemptions.Add(1)
+	if reason := l.retirementStandDownReason(armed, coordinators); reason != "" {
+		l.standDownRetirementPass(reason)
 		return 0, true, discoveryErr
 	}
 	parentCtx := ctx
@@ -174,6 +216,9 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 	if !pace.active() {
 		generationID = l.nextDeferredRetirement(ordered)
 	}
+	// The release sequence before the attempt: a release that lands between a
+	// refusal and its park still unparks.
+	releaseSeq := retirementReleaseSeq()
 	if coordinator := owners[generationID]; coordinator != nil {
 		var stillPending bool
 		retiredOne, stillPending, retireErr := coordinator.retirePayloadGenerationSlice(
@@ -184,7 +229,7 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 			l.removeOwedRetirement(generationID)
 		}
 		if retireErr != nil && retirementStillReferenced(retireErr) {
-			l.parkReferencedRetirement(generationID, time.Now())
+			l.parkReferencedRetirement(generationID, time.Now(), releaseSeq, retireErr)
 			retireErr, stillPending = nil, false
 		}
 		pending = stillPending || len(ordered) > 1
@@ -210,7 +255,7 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 			stillPending = true
 			retireErr = nil
 		case retirementStillReferenced(retireErr):
-			l.parkReferencedRetirement(generationID, time.Now())
+			l.parkReferencedRetirement(generationID, time.Now(), releaseSeq, retireErr)
 			retireErr = nil
 		default:
 			stillPending = true
@@ -219,9 +264,14 @@ func (l *CheckoutLifecycle) SweepDeferredRetirements(ctx context.Context) (retir
 		err = retireErr
 	}
 	if retired > 0 {
-		// A retired generation may have been the last one built on another.
+		deferredRetirementCommitted.Add(int64(retired))
+		l.deferredRetirementLastRemoved.Store(time.Now().Unix())
 		l.unparkRetirement(generationID)
-		noteRetirementReferenceReleased()
+		if l.retireOwedSlice != nil {
+			// A test slice removes nothing through the Store, which reports
+			// the base a real removal released.
+			noteRetirementReferenceReleased()
+		}
 	}
 	// Recheck live state after the physical slice. New backlog/owed work may
 	// arrive while the slice commits and must keep the worker on its base pause.
@@ -331,6 +381,11 @@ func (l *CheckoutLifecycle) hasDeferredRetirementWork() bool {
 // deferredRetirementScans counts the catalog scans for retirement
 // candidates (tests and measurement).
 var deferredRetirementScans atomic.Int64
+
+// deferredRetirementFirstSightings counts the gated passes that scanned to
+// start the debt clock and then stood down (tests and measurement): the only
+// stand-downs a scan should precede.
+var deferredRetirementFirstSightings atomic.Int64
 
 type deferredGenerationList func(context.Context, store_sqlite.ViewGenerationFilter) ([]store_sqlite.ViewGeneration, error)
 

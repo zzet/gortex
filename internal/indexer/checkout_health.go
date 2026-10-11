@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/viewmetrics"
@@ -82,6 +83,10 @@ type ViewsHealth struct {
 	// last_publication_age_s, stall_reason and change_set_size. A checkout
 	// whose route keeps up is absent, so the ordinary answer is empty.
 	PublicationStalls []CheckoutPublicationStall `json:"publication_stalls,omitempty"`
+	// RetirementBacklog is the deferred retirement sweep's outstanding work
+	// (checkout_deferred_retirement_backlog.go); nil when nothing is owed,
+	// parked or retiring.
+	RetirementBacklog *RetirementBacklog `json:"retirement_backlog,omitempty"`
 	// Counters is the view-lifecycle metric registry, flattened: series key to
 	// value, zero-valued series omitted.
 	Counters map[string]int64 `json:"counters,omitempty"`
@@ -153,6 +158,9 @@ func (l *CheckoutLifecycle) ViewsHealth(ctx context.Context) (ViewsHealth, error
 	out.Generations = map[string]int{}
 	for _, generation := range generations {
 		out.Generations[string(generation.State)]++
+	}
+	if backlog := l.retirementBacklogFrom(generations, time.Now()); !backlog.Empty() {
+		out.RetirementBacklog = &backlog
 	}
 	return out, nil
 }

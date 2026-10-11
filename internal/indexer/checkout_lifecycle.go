@@ -270,6 +270,16 @@ type CheckoutLifecycle struct {
 	deferSeedRetirements     bool
 	retirementSweepMu        sync.Mutex
 	deferredRetirementCursor int64 // guarded by coordMu
+	// deferredRetirementActive is the generation the last burst left fenced
+	// with progress, since deferredRetirementActiveSince, and
+	// deferredRetirementPicks counts burst choices
+	// (checkout_deferred_retirement_order.go). Guarded by coordMu.
+	deferredRetirementActive      int64
+	deferredRetirementActiveSince time.Time
+	deferredRetirementPicks       int
+	// retirementIdleBurst replaces deferredRetirementIdleBurstDuration when
+	// positive (test seam: a drain of many bursts at fixture scale).
+	retirementIdleBurst time.Duration
 	// deferredRetirementProgress is the last time (unix nanos) a deferred
 	// slice made progress; preemption by interactive writers is suspended
 	// once it is older than retirementStarvationLimit
@@ -300,6 +310,25 @@ type CheckoutLifecycle struct {
 	// referenced, the reference-release hint it was parked at
 	// (checkout_deferred_retirement_parked.go). Guarded by coordMu.
 	retirementParked map[int64]retirementPark
+	// deferredRetirementLastRemoved is when (unix seconds) the deferred sweep
+	// last removed a generation's catalog row, and retirementWALPaused
+	// whether its bursts are currently held by the WAL pause
+	// (checkout_deferred_retirement_backlog.go).
+	deferredRetirementLastRemoved atomic.Int64
+	retirementWALPaused           atomic.Bool
+	// retirementReleasedAged is, per parked generation a release brought
+	// back with the debt age its park kept, that generation's own debt clock
+	// (unix nanos): it, and not the debt beside it, resumes that age instead
+	// of starting a fresh stand-down (checkout_deferred_retirement_parked.go).
+	// Guarded by coordMu.
+	retirementReleasedAged map[int64]int64
+	// retirementSweepWaiting counts synchronous sweeps (sweepRetirements)
+	// waiting for retirementSweepMu; a burst nobody else waits on does not
+	// extend past its bounded budget while one does.
+	retirementSweepWaiting atomic.Int32
+	// deferredRetirementFoldBurstAt is when (unix nanos) an aged burst last
+	// ran beside a chain fold (retirementFoldPaced).
+	deferredRetirementFoldBurstAt atomic.Int64
 	// derivedCorrectionPreempted counts the startup correction's runs given
 	// up to interactive work.
 	derivedCorrectionPreempted atomic.Int64
@@ -2935,17 +2964,29 @@ func (l *CheckoutLifecycle) stopCheckoutWorkspaces(root string) {
 }
 
 // oweRetirement records generations the lifecycle has to collect because no
-// coordinator is left to offer them.
+// coordinator is left to offer them. New debt is counted owed and wakes an
+// idle retirement worker, as a coordinator's deferral does.
 func (l *CheckoutLifecycle) oweRetirement(generations ...int64) {
 	if l == nil || l.store == nil || len(generations) == 0 {
 		return
 	}
+	added := make([]int64, 0, len(generations))
 	l.coordMu.Lock()
-	defer l.coordMu.Unlock()
 	for _, generationID := range generations {
-		if generationID > 0 {
-			l.owed[generationID] = struct{}{}
+		if generationID <= 0 {
+			continue
 		}
+		if _, known := l.owed[generationID]; !known {
+			added = append(added, generationID)
+		}
+		l.owed[generationID] = struct{}{}
+	}
+	l.coordMu.Unlock()
+	for _, generationID := range added {
+		countRetirementOwed(l.store, generationID, viewmetrics.OwedReleased)
+	}
+	if len(added) > 0 {
+		notifyDeferredRetirementWork()
 	}
 }
 
@@ -3147,7 +3188,9 @@ func (l *CheckoutLifecycle) liveCoordinators(familyID string) int {
 // refused while the route still names them and collectable the moment the
 // teardown removes it.
 func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
+	l.retirementSweepWaiting.Add(1)
 	l.retirementSweepMu.Lock()
+	l.retirementSweepWaiting.Add(-1)
 	defer l.retirementSweepMu.Unlock()
 
 	l.coordMu.Lock()

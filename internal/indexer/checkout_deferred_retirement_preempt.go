@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync/atomic"
 	"time"
+
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // A deferred retirement slice gives the store's writer back to interactive
@@ -119,13 +121,47 @@ func (l *CheckoutLifecycle) noteRetirementProgress(now time.Time) {
 // edit cycle holds the build lane; while its preemption is armed (it has not
 // been starved) it also gives way to every other interactive writer.
 func (l *CheckoutLifecycle) retirementShouldStandDown(armed bool, coordinators []*CheckoutCoordinator) bool {
+	return l.retirementStandDownReason(armed, coordinators) != ""
+}
+
+// retirementStandDownReason is retirementShouldStandDown's reason ("" to
+// run): edit_cycle, a paced reason (retirementPacedStandDown), or
+// interactive_write.
+func (l *CheckoutLifecycle) retirementStandDownReason(armed bool, coordinators []*CheckoutCoordinator) string {
 	if l.editCycleHoldsBuildLane() {
-		return true
+		return "edit_cycle"
 	}
-	if l.retirementPacedStandDown(!armed) != "" {
-		return true
+	if reason := l.retirementPacedStandDown(!armed); reason != "" {
+		return reason
 	}
-	return armed && l.interactiveWriteWanted(coordinators)
+	if armed && l.interactiveWriteWanted(coordinators) {
+		return "interactive_write"
+	}
+	return ""
+}
+
+// deferredRetirementPassStandDowns counts the worker passes that stood down
+// before serving a burst (tests and measurement); RetirementStandDownTotal
+// counts those and the bursts held back, by reason.
+var deferredRetirementPassStandDowns atomic.Int64
+
+// noteRetirementStandDown counts one pass or burst held back for reason.
+// deferredRetirementPreemptions keeps its own meaning (slices given back to
+// interactive work), counted where it always was.
+func noteRetirementStandDown(reason string) {
+	viewmetrics.Count(viewmetrics.RetirementStandDownTotal, reason)
+}
+
+// standDownRetirementPass counts a worker pass that stood down for reason. A
+// WAL pause also says so once per pause, as the burst does.
+func (l *CheckoutLifecycle) standDownRetirementPass(reason string) {
+	deferredRetirementPassStandDowns.Add(1)
+	deferredRetirementPreemptions.Add(1)
+	if reason == "wal_pause" {
+		l.noteRetirementWALPause(l.walSinceReset())
+		return
+	}
+	noteRetirementStandDown(reason)
 }
 
 // preemptOnInteractiveWrite returns ctx wrapped so that it is cancelled with

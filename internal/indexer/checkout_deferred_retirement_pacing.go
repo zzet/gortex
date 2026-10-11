@@ -189,3 +189,22 @@ func (l *CheckoutLifecycle) chainFoldInFlight() bool {
 	}
 	return false
 }
+
+// deferredRetirementFoldBurstEvery is the cadence aged retirement keeps beside
+// a chain fold: one bounded burst per base pause, as before the worker
+// re-polled at once after progress.
+const deferredRetirementFoldBurstEvery = time.Second
+
+// retirementFoldPaced reports that a chain fold is in flight and an aged burst
+// already ran beside it within deferredRetirementFoldBurstEvery. Aged debt
+// skips the foreground stand-down, chain_fold included, so unrelated work
+// still drains beside a long fold; but the fold yields its writer to every
+// waiter, and back-to-back bursts would cancel its steps one quantum at a
+// time.
+func (l *CheckoutLifecycle) retirementFoldPaced(now time.Time) bool {
+	if !l.chainFoldInFlight() {
+		return false
+	}
+	last := l.deferredRetirementFoldBurstAt.Load()
+	return last != 0 && now.Sub(time.Unix(0, last)) < deferredRetirementFoldBurstEvery
+}

@@ -752,6 +752,12 @@ type ViewsStatus struct {
 	// failing — serves an older route, and no count here
 	// says so. Bounded by checkouts, present only while a run lasts.
 	PublicationStalls []PublicationStall `json:"publication_stalls,omitempty"`
+	// RetirementBacklog is the deferred retirement sweep's outstanding work:
+	// owed generations, how many are fenced and part-swept, how many wait
+	// parked on a reference, their recorded size, the age of the eligible
+	// debt and when a generation was last removed. Absent when nothing is
+	// owed, parked or retiring.
+	RetirementBacklog *RetirementBacklog `json:"retirement_backlog,omitempty"`
 	// Counters is the view-lifecycle metric registry flattened to series key
 	// and value, zero-valued series omitted. Every label in a key comes from
 	// a fixed vocabulary, so the map's size is a property of the build rather
@@ -778,6 +784,17 @@ type StorageFailure struct {
 	GenerationID int64 `json:"generation_id"`
 	// Reason is the bounded, path-free sentence the storage layer rendered.
 	Reason string `json:"reason"`
+}
+
+// RetirementBacklog mirrors indexer.RetirementBacklog on the wire; the
+// controller translates.
+type RetirementBacklog struct {
+	Generations    int     `json:"generations"`
+	Retiring       int     `json:"retiring"`
+	Parked         int     `json:"parked"`
+	BytesEstimate  int64   `json:"bytes_estimate"`
+	DebtAgeSeconds float64 `json:"debt_age_s"`
+	LastRemovedAt  int64   `json:"last_removed_at"`
 }
 
 // PublicationStall is one checkout's run of cycles that published nothing. It

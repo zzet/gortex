@@ -442,9 +442,15 @@ func (c *CheckoutCoordinator) deferRetire(generationID int64, why string) {
 		return
 	}
 	c.mu.Lock()
+	_, known := c.backlog[generationID]
 	c.backlog[generationID] = struct{}{}
 	held := len(c.backlog)
 	c.mu.Unlock()
+	if !known {
+		countRetirementOwed(c.store, generationID, retireOwedClass(why))
+		// An idle worker need not wait out its pause for new debt.
+		notifyDeferredRetirementWork()
+	}
 	c.logger.Debug("checkout coordinator: generation retirement owed to the background sweep",
 		zap.String("checkout", c.checkoutID),
 		zap.Int64("generation", generationID),
