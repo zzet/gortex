@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -64,10 +65,17 @@ var (
 	sharedCodeMu     sync.Mutex
 	sharedCodeInst   Provider
 	sharedCodeLoaded bool
-	sharedCodeUsedAt time.Time
 	sharedCodeEnable = true
 	sharedCodeReaper bool
+	sharedCodeReady  atomic.Pointer[codeEmbedderReady]
 )
+
+// Each publication is immutable. Refreshing usage replaces the snapshot,
+// allowing idle retirement to lose its CAS to a concurrent active reader.
+type codeEmbedderReady struct {
+	provider Provider
+	usedAt   time.Time
+}
 
 // codeEmbedderIdleTTL is how long the code embedder survives with no
 // rerank traffic. Long enough that a working session never reloads,
@@ -83,6 +91,9 @@ func SetCodeEmbedderEnabled(enabled bool) {
 	defer sharedCodeMu.Unlock()
 	sharedCodeEnable = enabled
 	if !enabled {
+		// Clearing publication is the disable boundary for loaded-only readers.
+		// Already admitted requests retain their provider, as eager readers do.
+		sharedCodeReady.Store(nil)
 		sharedCodeInst = nil
 		sharedCodeLoaded = false
 	}
@@ -100,13 +111,40 @@ func SharedCodeEmbedder() Provider {
 	if !sharedCodeEnable {
 		return nil
 	}
-	sharedCodeUsedAt = time.Now()
 	if !sharedCodeLoaded {
 		sharedCodeInst = buildCodeEmbedder()
 		sharedCodeLoaded = true
+		sharedCodeReady.Store(&codeEmbedderReady{provider: sharedCodeInst, usedAt: time.Now()})
 		startCodeEmbedderReaperLocked()
+	} else {
+		refreshCodeEmbedderReady()
 	}
 	return sharedCodeInst
+}
+
+// LoadedSharedCodeEmbedder returns only an already initialized provider. It
+// never loads a model, downloads files, starts a reaper, or waits for the load
+// mutex, including when another request is cold-loading the eager provider.
+// Warm usage refreshes idle expiry without dropping scoring under contention.
+func LoadedSharedCodeEmbedder() Provider {
+	return refreshCodeEmbedderReady()
+}
+
+func refreshCodeEmbedderReady() Provider {
+	for {
+		ready := sharedCodeReady.Load()
+		if ready == nil {
+			return nil
+		}
+		now := time.Now()
+		if now.Before(ready.usedAt) {
+			now = ready.usedAt
+		}
+		if sharedCodeReady.CompareAndSwap(ready, &codeEmbedderReady{provider: ready.provider, usedAt: now}) {
+			return ready.provider
+		}
+		// A warm refresh retries; disable/retirement leaves nil and exits.
+	}
 }
 
 func buildCodeEmbedder() Provider {
@@ -140,21 +178,28 @@ func startCodeEmbedderReaperLocked() {
 		defer ticker.Stop()
 		for range ticker.C {
 			sharedCodeMu.Lock()
-			idle := sharedCodeLoaded && time.Since(sharedCodeUsedAt) >= codeEmbedderIdleTTL
-			if idle {
-				if c, ok := sharedCodeInst.(interface{ Close() error }); ok {
-					_ = c.Close()
-				}
-				sharedCodeInst = nil
-				sharedCodeLoaded = false
-				sharedCodeReaper = false
-			}
+			idle := retireCodeEmbedderLocked(sharedCodeReady.Load(), time.Now())
 			sharedCodeMu.Unlock()
 			if idle {
 				return
 			}
 		}
 	}()
+}
+
+// retireCodeEmbedderLocked closes only a snapshot that remains idle and
+// unchanged. The caller holds sharedCodeMu to serialize eager load/disable.
+func retireCodeEmbedderLocked(ready *codeEmbedderReady, now time.Time) bool {
+	if ready == nil || now.Sub(ready.usedAt) < codeEmbedderIdleTTL || !sharedCodeReady.CompareAndSwap(ready, nil) {
+		return false
+	}
+	if ready.provider != nil {
+		_ = ready.provider.Close()
+	}
+	sharedCodeInst = nil
+	sharedCodeLoaded = false
+	sharedCodeReaper = false
+	return true
 }
 
 // staticOrNil adapts SharedStatic's concrete return into the Provider

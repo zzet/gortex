@@ -133,12 +133,15 @@ func (v *requestView) bindSources(sources []graphview.GenerationSource, base gra
 		return
 	}
 	candidates := make([]query.ViewLayerSource, 0, len(sources))
-	// The indexed corpus is the bottom content source and is masked by
-	// every generation above it; it claims nothing itself, so it carries
-	// no layer.
-	baseContent, _ := base.(contentQuerier)
+	// Only stacks that compose generation zero read the mutable indexed
+	// corpus. A dedicated full root supplies its own bottom content source
+	// and must not inherit either primary content or its mutation witness.
+	v.readsBaseCorpus = v.materialized == nil || v.materialized.ComposesBaseCorpus()
 	content := make([]viewContentSource, 0, len(sources)+1)
-	content = append(content, viewContentSource{searcher: baseContent})
+	if v.readsBaseCorpus {
+		baseContent, _ := base.(contentQuerier)
+		content = append(content, viewContentSource{searcher: baseContent})
+	}
 	for _, source := range sources {
 		if source.Handle == nil {
 			continue
@@ -154,6 +157,17 @@ func (v *requestView) bindSources(sources []graphview.GenerationSource, base gra
 	}
 	v.candidates = candidates
 	v.content = &viewContentSearcher{sources: content}
+}
+
+// excludesBaseCorpus reports a routed view whose stack does not compose the
+// indexed corpus (its bottom is a dedicated full root), so symbol candidate
+// enumeration must not consult generation zero. A buffer overlay, a base
+// request and a labelled base selector all keep the base corpus.
+func (v *requestView) excludesBaseCorpus() bool {
+	if v == nil || v.materialized == nil || v.baseNarrowed || len(v.candidates) == 0 {
+		return false
+	}
+	return !v.materialized.ComposesBaseCorpus()
 }
 
 // candidateLayers is the stack the query engine enumerates candidates across,
@@ -176,7 +190,7 @@ func (v *requestView) candidateLayers() []query.ViewLayerSource {
 // the lane merges nothing, rather than authenticating candidates from durable
 // rows the editor buffer has already changed.
 func (s *Server) contentSearcherFor(ctx context.Context) (contentQuerier, bool) {
-	if cs, ok := s.readerFor(ctx).(graph.ContentSearcher); ok {
+	if cs, ok := contractCoreSelectedReader(s.readerFor(ctx)).(graph.ContentSearcher); ok {
 		return cs, true
 	}
 	if OverlayViewFromContext(ctx) != nil {

@@ -673,6 +673,22 @@ func containsAnySpelling(spellings []string, root string) bool {
 // worktree gets the answer without waiting an hour for it. Unlike the read
 // model it does probe the filesystem — that is the whole point of asking.
 func (l *CheckoutLifecycle) ReconcileFamily(ctx context.Context, familyID string) (reconcile.FamilyReport, error) {
+	return l.reconcileFamily(ctx, familyID, true)
+}
+
+// ReconcileFamilyDeferredRetirement reconciles and publishes one family's
+// topology while leaving coordinator retirement backlogs for the dedicated
+// bounded-slice worker. It is for asynchronous topology nudges; administrative
+// force-reconcile callers retain ReconcileFamily's synchronous cleanup contract.
+func (l *CheckoutLifecycle) ReconcileFamilyDeferredRetirement(
+	ctx context.Context, familyID string,
+) (reconcile.FamilyReport, error) {
+	return l.reconcileFamily(ctx, familyID, false)
+}
+
+func (l *CheckoutLifecycle) reconcileFamily(
+	ctx context.Context, familyID string, sweepRetirements bool,
+) (reconcile.FamilyReport, error) {
 	if l == nil || l.rec == nil {
 		return reconcile.FamilyReport{}, errNoCatalog
 	}
@@ -680,16 +696,19 @@ func (l *CheckoutLifecycle) ReconcileFamily(ctx context.Context, familyID string
 		return reconcile.FamilyReport{}, fmt.Errorf("%w: no family given", ErrCheckoutNotTracked)
 	}
 	defer l.beginBatch()()
+	baseline := l.repoSetFingerprint()
 	report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, ""))
 	if err != nil {
 		return reconcile.FamilyReport{}, err
 	}
 	l.applyCoordinators(ctx, report)
 	l.scheduleFamilyRetry(report)
-	l.sweepRetirements(ctx)
+	if sweepRetirements {
+		l.sweepRetirements(ctx)
+	}
 	if familyReportRemoved(report) {
 		l.saveConfig("reconcile")
-		l.notifyTrackedSetChanged()
+		l.notifyFamilyChanged(baseline)
 	}
 	return report, nil
 }

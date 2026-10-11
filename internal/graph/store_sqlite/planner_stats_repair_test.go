@@ -119,6 +119,9 @@ func statRowCount(t *testing.T, stat string) int {
 // test that drops an index rebuilds byte-identical DDL.
 func indexDDLByName(t *testing.T, name string) string {
 	t.Helper()
+	if name == edgesByFileGenerationIndexName {
+		return edgesByFileGenerationIndexDDL // the lazy index (lazy_graph_indexes.go)
+	}
 	for _, group := range [][]bulkDroppableIndex{bulkDroppableIndexes, bulkAlwaysLiveIndexes} {
 		for _, idx := range group {
 			if idx.name == name {
@@ -421,9 +424,9 @@ func TestOpenRepairsStaleStatRowOnEmptyPartialIndex(t *testing.T) {
 	}
 }
 
-// The tiny-stat rule is generic over partial critical indexes, not a
-// receiver-index special case: the same degenerate row can be written for
-// nodes_by_repo, and it misplans repository projections the same way.
+// The tiny-stat rule is generic over every critical index. nodes_by_repo is a
+// dense two-column index in v26+, and a degenerate row can misplan repository
+// projections just as badly as one on a partial index.
 func TestOpenRepairsZeroRepoStat(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "stats_zero_repo.sqlite")
 	s := openStatsRepairStore(t, path)
@@ -445,12 +448,11 @@ func TestOpenRepairsZeroRepoStat(t *testing.T) {
 		t.Fatal("fixture never produced a nodes_by_repo stat row")
 	}
 	// sqlite_stat1 has no UNIQUE constraint, so an INSERT OR REPLACE would
-	// append rather than replace. Delete, then insert. nodes_by_repo keys one
-	// column, so its honest row carries two tokens.
+	// append rather than replace. Delete, then insert the v26 two-key shape.
 	if _, err := s.writerDB.Exec(`DELETE FROM sqlite_stat1 WHERE idx = 'nodes_by_repo'`); err != nil {
 		t.Fatalf("clear repo stat row: %v", err)
 	}
-	if _, err := s.writerDB.Exec(`INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('nodes', 'nodes_by_repo', '0 0')`); err != nil {
+	if _, err := s.writerDB.Exec(`INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('nodes', 'nodes_by_repo', '0 0 0')`); err != nil {
 		t.Fatalf("poison repo stat row: %v", err)
 	}
 
@@ -463,6 +465,90 @@ func TestOpenRepairsZeroRepoStat(t *testing.T) {
 		t.Fatalf("nodes_by_repo stat after reopen = %q (count %d), want a repaired count >= %d",
 			stat, got, nodeCount/2)
 	}
+
+	again := reopenAfterStatMutation(t, reopened, path)
+	if reason, needsRepair := plannerStatsRepairReason(context.Background(), again.writerDB); needsRepair {
+		t.Fatalf("second reopen asked to repair the dense repo stat again: reason=%q", reason)
+	}
+	if got, ok := statRowFor(t, again, "nodes_by_repo"); !ok || got != stat {
+		t.Fatalf("second reopen changed the repaired dense repo stat: got %q present=%v, want %q", got, ok, stat)
+	}
+}
+
+func TestDensePlannerStatsTinyBoundaries(t *testing.T) {
+	t.Run("empty_zero_is_stable", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "stats_dense_empty.sqlite")
+		s := openStatsRepairStore(t, path)
+		s.writeMu.Lock()
+		err := s.refreshPlannerStatsLocked(context.Background())
+		s.writeMu.Unlock()
+		if err != nil {
+			t.Fatalf("seed empty planner stats: %v", err)
+		}
+		if _, err := s.writerDB.Exec(`INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('nodes', 'nodes_by_repo', '0 0 0')`); err != nil {
+			t.Fatalf("plant legitimate empty dense stat: %v", err)
+		}
+		if reason, needsRepair := plannerStatsRepairReason(context.Background(), s.writerDB); needsRepair {
+			t.Fatalf("legitimate empty dense stat asked for repair reason=%q", reason)
+		}
+		reopened := reopenAfterStatMutation(t, s, path)
+		if stat, ok := statRowFor(t, reopened, "nodes_by_repo"); !ok || stat != "0 0 0" {
+			t.Fatalf("empty dense stat after reopen = %q present=%v, want stable 0 0 0", stat, ok)
+		}
+	})
+
+	t.Run("small_is_stable", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "stats_dense_small.sqlite")
+		s := openStatsRepairStore(t, path)
+		seedGoReceiverStatsFixture(s, 1)
+		s.writeMu.Lock()
+		err := s.refreshPlannerStatsLocked(context.Background())
+		s.writeMu.Unlock()
+		if err != nil {
+			t.Fatalf("seed small planner stats: %v", err)
+		}
+		stat, ok := statRowFor(t, s, "nodes_by_repo")
+		if !ok {
+			t.Fatal("small dense fixture produced no repo stat")
+		}
+		if got := statRowCount(t, stat); got <= 0 || got > plannerStatsSuspectRows {
+			t.Fatalf("small dense fixture stat = %q (count %d), want 1..%d", stat, got, plannerStatsSuspectRows)
+		}
+		if reason, needsRepair := plannerStatsRepairReason(context.Background(), s.writerDB); needsRepair {
+			t.Fatalf("legitimate small dense stat asked for repair reason=%q", reason)
+		}
+		reopened := reopenAfterStatMutation(t, s, path)
+		if got, ok := statRowFor(t, reopened, "nodes_by_repo"); !ok || got != stat {
+			t.Fatalf("small dense stat after reopen = %q present=%v, want %q", got, ok, stat)
+		}
+	})
+
+	t.Run("negative_is_bounded_and_repaired", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "stats_dense_negative.sqlite")
+		s := openStatsRepairStore(t, path)
+		seedGoReceiverStatsFixture(s, 10)
+		s.writeMu.Lock()
+		err := s.refreshPlannerStatsLocked(context.Background())
+		s.writeMu.Unlock()
+		if err != nil {
+			t.Fatalf("seed negative planner stats fixture: %v", err)
+		}
+		if _, err := s.writerDB.Exec(`UPDATE sqlite_stat1 SET stat = '-1 0 0' WHERE idx = 'nodes_by_repo'`); err != nil {
+			t.Fatalf("plant negative dense stat: %v", err)
+		}
+		reason, needsRepair := plannerStatsRepairReason(context.Background(), s.writerDB)
+		if !needsRepair || !strings.HasPrefix(reason, "tiny_stat:nodes_by_repo") {
+			t.Fatalf("negative dense stat repair = (%q, %v), want bounded tiny_stat repair", reason, needsRepair)
+		}
+		reopened := reopenAfterStatMutation(t, s, path)
+		stat, ok := statRowFor(t, reopened, "nodes_by_repo")
+		if !ok || statRowCount(t, stat) <= 0 {
+			t.Fatalf("negative dense stat after reopen = %q present=%v, want positive repaired stat", stat, ok)
+		}
+		if reason, needsRepair := plannerStatsRepairReason(context.Background(), reopened.writerDB); needsRepair {
+			t.Fatalf("repaired negative dense stat still asks for repair reason=%q", reason)
+		}
+	})
 }
 
 // The counterweight to the repair rules: a store whose statistics are merely

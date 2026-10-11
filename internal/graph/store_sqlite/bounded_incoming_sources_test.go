@@ -175,4 +175,7 @@ func TestFindIncomingSourcesBoundedPlanAvoidsOrderBySorter(t *testing.T) {
 	if !strings.Contains(plan, "EDGES_BY_TO") {
 		t.Fatalf("bounded incoming query did not use target/kind index:\n%s", plan)
 	}
+	if !strings.Contains(plan, "VIEW_GEN=? AND TO_ID=? AND KIND=?") {
+		t.Fatalf("bounded incoming query did not seek its full generation/target/kind prefix:\n%s", plan)
+	}
 }

@@ -370,7 +370,7 @@ func architectureEntryPoints(inScope map[string]bool, g graph.Reader, top int) [
 	// the same subset out of the supplied scope set.
 	var pool []*graph.Node
 	if inScope == nil {
-		if scan, ok := g.(graph.NodesByKindsScanner); ok {
+		if scan, ok := contractCoreSelectedReader(g).(graph.NodesByKindsScanner); ok {
 			pool = scan.NodesByKinds([]graph.NodeKind{graph.KindFunction, graph.KindMethod})
 		} else {
 			all := g.AllNodes()

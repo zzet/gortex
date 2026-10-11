@@ -98,7 +98,7 @@ func (s *Server) handleGraphQuery(ctx context.Context, req mcp.CallToolRequest) 
 	if filterErr != nil {
 		return mcp.NewToolResultError(filterErr.Error()), nil
 	}
-	sg = filterSubGraph(sg, allowed)
+	sg = s.filterContractSubGraph(ctx, sg, allowed)
 	enrichSubGraphEdges(sg)
 	return s.returnSubGraph(ctx, req, sg)
 }

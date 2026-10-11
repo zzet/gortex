@@ -120,6 +120,25 @@ type PlannerStatsFreshener interface {
 	PlannerStatsHealth(ctx context.Context) (PlannerStatsFreshness, error)
 }
 
+type plannerStatsLoadBoundaryKey struct{}
+
+// WithPlannerStatsLoadBoundary marks ctx as the boundary that ends a whole
+// index: its rows have just landed and no edit has been admitted over them
+// yet. There, and only there, a store may run a refresh it owes to the end
+// (statistics absent for an index that holds rows), holding its writer for as
+// long as the ANALYZE takes: nothing waits on the writer yet, and a store
+// without statistics plans its first edits by the default cost model.
+func WithPlannerStatsLoadBoundary(ctx context.Context) context.Context {
+	return context.WithValue(ctx, plannerStatsLoadBoundaryKey{}, true)
+}
+
+// PlannerStatsLoadBoundary reports whether ctx was marked by
+// WithPlannerStatsLoadBoundary.
+func PlannerStatsLoadBoundary(ctx context.Context) bool {
+	v, _ := ctx.Value(plannerStatsLoadBoundaryKey{}).(bool)
+	return v
+}
+
 // MaybeEnsurePlannerStatsFresh gives a store the chance to refresh its planner
 // statistics, and does nothing at all for a backend without the capability.
 //

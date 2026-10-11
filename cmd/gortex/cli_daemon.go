@@ -231,7 +231,9 @@ func daemonOwnsRepo(abs string) bool {
 // This runs ahead of every CLI graph query, which made it the single point
 // where a busy daemon stalled the whole CLI: Status serialises behind the
 // controller mutex that track / reload / enrichment hold for minutes, and the
-// call had no bound on either end.
+// call had no bound on either end. It now reads the tracked roots from
+// ControlProbe (trackedReposOf), which touches no store and no mutex; Status
+// is asked only by a daemon too old to answer probe.
 //
 // It gets a short budget, and when that budget expires it FAILS OPEN — the
 // answer is unknown, not "no". Treating an indeterminate probe as "not ours"
@@ -248,18 +250,14 @@ func probeCWDReach(abs string) cwdVerdict {
 		return cwdVerdict{reach: reachNone}
 	}
 	defer c.Close()
-	resp, err := c.ControlWithTimeout(daemon.ControlStatus, nil, daemonRoutingProbeTimeout)
-	if daemonProbeIndeterminate(err, resp) {
+	st, answer := trackedReposOf(c)
+	switch answer {
+	case trackedReposIndeterminate:
 		fmt.Fprintf(os.Stderr,
 			"[gortex] daemon did not answer within %s (a track / reload / enrichment may be holding it) — asking it anyway\n",
 			daemonRoutingProbeTimeout)
 		return cwdVerdict{reach: reachDaemon}
-	}
-	if err != nil || !resp.OK {
-		return cwdVerdict{reach: reachNone}
-	}
-	var st daemon.StatusResponse
-	if err := json.Unmarshal(resp.Result, &st); err != nil {
+	case trackedReposUnknown:
 		return cwdVerdict{reach: reachNone}
 	}
 	if trackedReposReach(st, abs) {
@@ -311,12 +309,25 @@ func trackedReposReach(st daemon.StatusResponse, p string) bool {
 }
 
 // checkoutBindsCWD asks the daemon whether abs sits inside a registered
-// checkout — a working copy the catalog binds to its family's view.
+// checkout the family's shared automatic lane serves — the only shape of
+// checkout the MCP dispatcher's own gate admits.
 //
 // file_coverage is the control-surface answer to "which graph serves this
-// path", and its view block names the checkout that owns the path. It has to
-// be the control surface: the tool surface is what this pre-flight guards, so
-// asking it here would be circular.
+// path", and its view block names both the checkout that owns the path and the
+// kind of view that answered for it. It has to be the control surface: the tool
+// surface is what this pre-flight guards, so asking it here would be circular.
+//
+// The verdict is probeViewServesAutomaticLane, not "the answer named a
+// checkout". Those two differ for exactly the cases the dispatcher refuses — a
+// live dedicated checkout, the family primary, and any checkout sitting in a
+// grace or transition state — all of which carry a CheckoutID on a
+// ProbeViewBase answer. Admitting them here made this pre-flight looser than
+// the dispatcher's CheckoutServesCWDChecked, which is the divergence
+// trackedReposReach's comment above calls a user-visible defect class. A
+// dedicated checkout and the family primary are tracked repositories, so
+// trackedReposReach has already admitted them before this arm runs; what this
+// narrows is the registered-but-unserved checkout, whose remedy is the family
+// reconcile below.
 //
 // A daemon too old to know the verb reports no checkout, leaving the caller
 // with exactly the verdict it reached before this arm existed. A daemon too
@@ -337,7 +348,7 @@ func checkoutBindsCWD(c *daemon.Client, abs string) bool {
 	if err := json.Unmarshal(resp.Result, &out); err != nil {
 		return false
 	}
-	return out.View != nil && out.View.CheckoutID != ""
+	return probeViewServesAutomaticLane(out.View)
 }
 
 // worktreeFamily identifies the set of working copies a linked git worktree
@@ -418,15 +429,75 @@ func trackedFamilyRepo(fam worktreeFamily) string {
 		return ""
 	}
 	defer c.Close()
-	resp, err := c.ControlWithTimeout(daemon.ControlStatus, nil, daemonRoutingProbeTimeout)
-	if err != nil || !resp.OK {
-		return ""
-	}
-	var st daemon.StatusResponse
-	if err := json.Unmarshal(resp.Result, &st); err != nil {
+	st, answer := trackedReposOf(c)
+	if answer != trackedReposKnown {
 		return ""
 	}
 	return familyRepoIn(st, fam)
+}
+
+// trackedReposAnswer is what the routing pre-flight learned about the tracked
+// repositories.
+type trackedReposAnswer int
+
+const (
+	// trackedReposKnown — the daemon listed its tracked repositories.
+	trackedReposKnown trackedReposAnswer = iota
+	// trackedReposIndeterminate — the daemon is up and did not answer inside
+	// the routing budget.
+	trackedReposIndeterminate
+	// trackedReposUnknown — the daemon answered with an error or an unusable
+	// payload.
+	trackedReposUnknown
+)
+
+// trackedReposOf lists the repositories the daemon tracks, identity only.
+//
+// It asks ControlProbe first. The routing pre-flight runs ahead of every CLI
+// graph query and every hook that shells out to one, and needs nothing but
+// the tracked roots. ControlStatus aggregates per-repo counts, the view
+// census, a stop-the-world MemStats and the controller mutex, so its latency
+// follows whatever the indexer is doing: measured 0.2–2.6 s per call on the
+// live daemon while it published checkout edits, against 0.2 ms for probe.
+// Probe reads the config registry only; the paths it lists are the tracked
+// roots status reconciles against. A daemon too old to know probe answers it
+// with an error, and only then is status asked, so an older daemon keeps the
+// answer it gave before.
+func trackedReposOf(c *daemon.Client) (daemon.StatusResponse, trackedReposAnswer) {
+	resp, err := c.ControlWithTimeout(daemon.ControlProbe, nil, daemonRoutingProbeTimeout)
+	if daemonProbeIndeterminate(err, resp) {
+		return daemon.StatusResponse{}, trackedReposIndeterminate
+	}
+	if err == nil && resp.OK {
+		var probe daemon.ProbeResponse
+		if json.Unmarshal(resp.Result, &probe) != nil {
+			return daemon.StatusResponse{}, trackedReposUnknown
+		}
+		st := daemon.StatusResponse{Version: probe.Version, PID: probe.PID, Ready: probe.Ready}
+		for _, repo := range probe.TrackedRepos {
+			st.TrackedRepos = append(st.TrackedRepos, daemon.TrackedRepoStatus{
+				Prefix: repo.Prefix, Path: repo.Path, Name: repo.Name,
+			})
+		}
+		return st, trackedReposKnown
+	}
+	if err != nil {
+		// The connection failed mid-request; a status on the same connection
+		// would fail the same way.
+		return daemon.StatusResponse{}, trackedReposUnknown
+	}
+	resp, err = c.ControlWithTimeout(daemon.ControlStatus, nil, daemonRoutingProbeTimeout)
+	if daemonProbeIndeterminate(err, resp) {
+		return daemon.StatusResponse{}, trackedReposIndeterminate
+	}
+	if err != nil || !resp.OK {
+		return daemon.StatusResponse{}, trackedReposUnknown
+	}
+	var st daemon.StatusResponse
+	if json.Unmarshal(resp.Result, &st) != nil {
+		return daemon.StatusResponse{}, trackedReposUnknown
+	}
+	return st, trackedReposKnown
 }
 
 // worktreeCWDErr explains a linked git worktree the daemon cannot answer for.

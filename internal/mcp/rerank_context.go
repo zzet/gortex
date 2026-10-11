@@ -19,15 +19,41 @@ import (
 // but should not be cached across requests — the combo boost map is
 // query-specific and the locality fields are session-specific.
 func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.Context {
+	return s.buildRerankContextWithEmbedder(ctx, query, embedding.SharedCodeEmbedder)
+}
+
+// Symbol searches avoid cold semantic initialization for literal query
+// classes while preserving the same cosine provider once it is warm. The
+// loading class does not alter the inner/outer pipeline's ranking-class timing.
+func (s *Server) buildSymbolRerankContext(ctx context.Context, query string, loadingClass rerank.QueryClass) *rerank.Context {
+	getEmbedder := embedding.SharedCodeEmbedder
+	if isIdentifierClass(loadingClass) {
+		getEmbedder = embedding.LoadedSharedCodeEmbedder
+	}
+	return s.buildRerankContextWithEmbedder(ctx, query, getEmbedder)
+}
+
+func (s *Server) buildRerankContextWithEmbedder(ctx context.Context, query string, getEmbedder func() embedding.Provider) *rerank.Context {
 	repo, project := s.sessionLocality(ctx)
 	rctx := &rerank.Context{
 		Graph:             s.readerFor(ctx),
 		RepoPrefix:        repo,
 		ProjectID:         project,
 		AnalysisMetricsOf: s.rerankAnalysisMetrics,
-		BatchedCentrality: func(seeds, candidateIDs []string) rerank.CentralityResult {
-			return s.rerankBoundedCentrality(ctx, seeds, candidateIDs)
-		},
+	}
+	rctx.BatchedCentrality = func(seeds, candidateIDs []string) rerank.CentralityResult {
+		if observer := rctx.ObserveTiming; observer != nil {
+			return s.boundedCentralityForRequestObserved(ctx, seeds, candidateIDs, func(timing rerank.CentralityTiming) {
+				observer(rerank.Timing{CentralityWork: timing})
+			})
+		}
+		return s.rerankBoundedCentrality(ctx, seeds, candidateIDs)
+	}
+	// On a routed stack the candidates' fan-in / fan-out batch reads through
+	// the stacked memo (centrality_stack_memo.go): a candidate's edges are
+	// read once per published generation, not once per search.
+	if edges := s.stackedEdgeBatches(ctx); edges != nil {
+		rctx.EdgeBatches = edges
 	}
 
 	if s.combo != nil {
@@ -91,13 +117,13 @@ func (s *Server) buildRerankContext(ctx context.Context, query string) *rerank.C
 	// Semantic-cosine channel: the in-process static code-embedding
 	// model (with the baked GloVe word vectors as offline fallback)
 	// re-scores the BM25 top-N against the query with no ANN index and
-	// no index-time vector build. Wired unconditionally — the per-class
-	// weight table damps it hard on identifier / path queries so it
-	// earns its keep only on natural-language intent queries, where
-	// BM25 alone cannot bridge "decode bson body" to BindBody. An empty
-	// query vector leaves the signal at 0, so a pure-identifier query
-	// is unaffected even before the class damping.
-	if emb := embedding.SharedCodeEmbedder(); emb != nil {
+	// no index-time vector build. A loaded-only getter keeps cold literal
+	// searches structural; eager callers retain natural-language semantics.
+	// Do not start a provider lookup for an already canceled request.
+	if ctx.Err() != nil {
+		return rctx
+	}
+	if emb := getEmbedder(); emb != nil {
 		rctx.EmbedText = embedding.EmbedTextFunc(emb)
 		if qv, err := emb.Embed(ctx, query); err == nil {
 			rctx.QueryVec = qv

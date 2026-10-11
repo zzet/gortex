@@ -4,12 +4,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"uuid"
 
@@ -102,6 +107,12 @@ type CheckoutLifecycleConfig struct {
 	// it is selected, the same way the startup inventory is always deferred.
 	// The GORTEX_WORKTREE_LAZY_ACTIVATION env var overrides it either way.
 	LazyWorktrees bool
+	// WatchCheckouts gives every automatic checkout's coordinator a file
+	// watcher rooted at its working tree (checkout_watch.go), so a plain save
+	// in a linked worktree wakes its coordinator instead of waiting for the
+	// poll. The daemon's stack turns it on; GORTEX_CHECKOUT_WATCH=off turns it
+	// off again.
+	WatchCheckouts bool
 
 	// indexBarrier is a test seam: it runs inside a promotion, between the
 	// sample the new corpus has to describe and the index that builds it,
@@ -139,18 +150,35 @@ type checkoutHeadIdentity struct {
 	commit string
 }
 type CheckoutLifecycle struct {
-	mi      *MultiIndexer
-	cfgMgr  *config.ConfigManager
-	catalog *store_sqlite.Catalog
-	store   *store_sqlite.Store
-	leases  *graphview.LeaseManager
-	rec     *reconcile.Reconciler
-	logger  *zap.Logger
-	now     func() time.Time
+	contractCoreRuntime atomic.Pointer[ContractCoreRuntimeHooks]
+	// routePrewarm is the prewarmer every coordinator calls before a route
+	// flip (SetRoutePrewarmer).
+	routePrewarm routePrewarmerSlot
+	mi           *MultiIndexer
+	cfgMgr       *config.ConfigManager
+	catalog      *store_sqlite.Catalog
+	store        *store_sqlite.Store
+	leases       *graphview.LeaseManager
+
+	// Owner registration and closure share this lock; serving acquisition is
+	// registry-only and always precedes the reader's catalog snapshot.
+	repositoryAdmissionMu       sync.Mutex
+	repositoryOwners            map[string]graphview.RepositoryOwner
+	repositoryClosing           map[string]*graphview.RepositoryDrain
+	repositoryAdmissionsClosed  bool
+	dedicatedBaseCleanupRuntime DedicatedBaseCleanupRuntime
+	repositoryCleanupMu         sync.Mutex
+	repositoryCleanup           *repositoryCleanupRuntime
+	repositoryCleanupClosed     bool
+	rec                         *reconcile.Reconciler
+	logger                      *zap.Logger
+	now                         func() time.Time
 	// buildingRecoveryCutoff is this lifecycle process's start. A building
 	// generation older than it cannot have been created by this process and is
 	// crash residue unless a process-local payload flight has adopted it.
 	buildingRecoveryCutoff int64
+	// idle records checkout use for the idle release (checkout_idle_release.go).
+	idle idleCheckoutState
 
 	// observationMu bounds and coalesces first-request metadata work. Jobs
 	// belong to this lifecycle, not whichever request first waits for them.
@@ -174,6 +202,10 @@ type CheckoutLifecycle struct {
 	// It is a deterministic shutdown test seam; nil in production.
 	familyRetryBarrier func()
 
+	// prewarmDeferral holds back first pre-warms while the startup
+	// correction is pending (edit_delta_stack_prewarm.go).
+	prewarmDeferral prewarmDeferral
+
 	// coordMu guards the coordinator registry alone. It is separate from mu
 	// because dropping a coordinator waits for its in-flight build, and
 	// holding the collaborator lock across that wait would block every
@@ -190,6 +222,11 @@ type CheckoutLifecycle struct {
 	coordinatorActivating map[string]struct{}
 	coordinatorClosing    bool
 	coordinatorStartWG    sync.WaitGroup
+	// coordinatorLeaseWG counts the waiters that hold one coordinator's
+	// repository-owner admission for the length of its build loop
+	// (holdRepositoryOwnerRead). Close joins them after the admissions have
+	// drained, which is after every one of them has released.
+	coordinatorLeaseWG sync.WaitGroup
 	// started holds every coordinator this process has started and not yet
 	// seen stop, keyed by checkout. The registry is what can be handed a
 	// cycle; this is what is running. They come apart for the length of a
@@ -199,11 +236,109 @@ type CheckoutLifecycle struct {
 	// loops are running one that runs none. Entries are dropped lazily, on the
 	// next read or start for the same checkout.
 	started map[string][]*CheckoutCoordinator
+	// coordinatorStartFailures is why a checkout has no build loop, keyed by
+	// checkout and bounded by the number of checkouts the daemon knows. A
+	// coordinator that cannot be built is not an error any caller receives —
+	// every entry point that starts one is a background reconciliation — so
+	// without this the checkout simply has no view and nothing says why.
+	// Cleared when a coordinator for the same checkout is finally installed.
+	coordinatorStartMu       sync.Mutex
+	coordinatorStartFailures map[string]CoordinatorStartFailure
+	// configSnapshot freezes a coordinator's index configuration. nil takes
+	// snapshotDedicatedBaseConfig, which is what production runs; the seam
+	// exists because no config.IndexConfig value json.Marshal rejects, so the
+	// refusal path has no other way to be exercised.
+	configSnapshot func(config.IndexConfig, string, string, string) (config.IndexConfig, string, error)
+	// cohortGraphSubject reads the dedicated-graph row a teardown names its
+	// cohort subject from. nil takes the catalog, which is what production
+	// runs; the seam exists for the same reason configSnapshot's does — the
+	// read is a single primary-key lookup that a real store does not fail, so
+	// the "the catalog could not be asked" branch has no other way to be
+	// exercised, and that branch is the one that decides whether a teardown's
+	// invalidation happens at all.
+	cohortGraphSubject func(context.Context, string) (store_sqlite.DedicatedGraph, bool, error)
 	// owed holds generations no coordinator is left to retire: the backlog a
 	// dropped one handed over, the commit layers its reuse cache was holding,
 	// and the two slots of a checkout whose route is being withdrawn. The
 	// sweep retries them until the catalog stops refusing.
 	owed map[int64]struct{}
+
+	// deferredRetirementMu guards the daemon-only Seed opt-in. All other
+	// callers retain Seed's synchronous retirement contract. retirementSweepMu
+	// serializes physical retirement passes across explicit and background work.
+	deferredRetirementMu     sync.RWMutex
+	deferSeedRetirements     bool
+	retirementSweepMu        sync.Mutex
+	deferredRetirementCursor int64 // guarded by coordMu
+	// deferredRetirementActive is the generation the last burst left fenced
+	// with progress, since deferredRetirementActiveSince, and
+	// deferredRetirementPicks counts burst choices
+	// (checkout_deferred_retirement_order.go). Guarded by coordMu.
+	deferredRetirementActive      int64
+	deferredRetirementActiveSince time.Time
+	deferredRetirementPicks       int
+	// retirementIdleBurst replaces deferredRetirementIdleBurstDuration when
+	// positive (test seam: a drain of many bursts at fixture scale).
+	retirementIdleBurst time.Duration
+	// deferredRetirementProgress is the last time (unix nanos) a deferred
+	// slice made progress; preemption by interactive writers is suspended
+	// once it is older than retirementStarvationLimit
+	// (checkout_deferred_retirement_preempt.go). A negative limit disables
+	// preemption; zero takes the default.
+	deferredRetirementProgress atomic.Int64
+	// Eligible debt keeps its age while bounded commits drain it. Request
+	// traffic and lease refusals are not evidence that the debt was serviced.
+	deferredRetirementEligibleSince atomic.Int64
+	retirementStarvationLimit       time.Duration
+	// interactiveDemand and retireOwedSlice are test seams: the interactive
+	// write predicate and the owed-generation slice runner.
+	interactiveDemand func() bool
+	retireOwedSlice   func(ctx context.Context, generationID int64) error
+	// retireQuantum is a per-lifecycle test seam around the real quantum call.
+	retireQuantum func(context.Context, int64, func(int64) bool) (store_sqlite.PayloadRetirementProgress, error)
+	// derivationEnvHook replaces derivationEnvFor (tests): the environment
+	// the startup correction re-derives a generation in.
+	derivationEnvHook func(row store_sqlite.ViewGeneration) (derivationEnv, bool)
+	// foregroundWork and walBytes are test seams for the sweep's pacing
+	// (checkout_deferred_retirement_pacing.go): the foreground activity and
+	// the WAL the log holds since its last reset.
+	foregroundWork func() (string, time.Time)
+	walBytes       func() int64
+	// foldInFlight is a test seam for chainFoldInFlight.
+	foldInFlight func() bool
+	// retirementParked holds, per generation a retirement found still
+	// referenced, the reference-release hint it was parked at
+	// (checkout_deferred_retirement_parked.go). Guarded by coordMu.
+	retirementParked map[int64]retirementPark
+	// deferredRetirementLastRemoved is when (unix seconds) the deferred sweep
+	// last removed a generation's catalog row, and retirementWALPaused
+	// whether its bursts are currently held by the WAL pause
+	// (checkout_deferred_retirement_backlog.go).
+	deferredRetirementLastRemoved atomic.Int64
+	retirementWALPaused           atomic.Bool
+	// retirementReleasedAged is, per parked generation a release brought
+	// back with the debt age its park kept, that generation's own debt clock
+	// (unix nanos): it, and not the debt beside it, resumes that age instead
+	// of starting a fresh stand-down (checkout_deferred_retirement_parked.go).
+	// Guarded by coordMu.
+	retirementReleasedAged map[int64]int64
+	// retirementSweepWaiting counts synchronous sweeps (sweepRetirements)
+	// waiting for retirementSweepMu; a burst nobody else waits on does not
+	// extend past its bounded budget while one does.
+	retirementSweepWaiting atomic.Int32
+	// deferredRetirementFoldBurstAt is when (unix nanos) an aged burst last
+	// ran beside a chain fold (retirementFoldPaced).
+	deferredRetirementFoldBurstAt atomic.Int64
+	// derivedCorrectionPreempted counts the startup correction's runs given
+	// up to interactive work.
+	derivedCorrectionPreempted atomic.Int64
+	// supersededChainRetention is how many replaced dedicated base chains this
+	// daemon keeps per graph before the sweep offers them. A small window is
+	// what makes a revert cheap: the reuse lookup accepts a superseded
+	// tree-equal candidate, so the chain a branch just moved off is still there
+	// to be re-adopted instead of rebuilt. Zero takes
+	// defaultSupersededDedicatedChainRetention; negative retains none.
+	supersededChainRetention int
 
 	// admitMu guards initialInventoryTaken alone. It is separate from coordMu
 	// because the admission predicate reads this map and then asks coordMu
@@ -221,11 +356,15 @@ type CheckoutLifecycle struct {
 	// worktree-heavy trees that never want an unselected view built. Off by
 	// default: a runtime `git worktree add` builds eagerly on discovery.
 	cfgLazyWorktrees bool
+	// cfgWatchCheckouts is CheckoutLifecycleConfig.WatchCheckouts.
+	cfgWatchCheckouts bool
 
 	// refViewMu guards the per-repository ref-view manager cache alone. A
 	// manager holds no per-request state, so the lock covers only the map.
-	refViewMu sync.Mutex
-	refViews  map[string]*RefViewManager
+	refViewMu       sync.Mutex
+	refViews        map[string]*RefViewManager
+	closingRefViews map[string]*repositoryRefViewDrain
+	refViewsClosed  bool
 	// refViewRetention bounds how much ref-view payload survives a sweep.
 	refViewRetention RefViewRetention
 	// indexBarrier is the promotion's test seam; nil in production.
@@ -250,6 +389,24 @@ type CheckoutLifecycle struct {
 	// the same answer the last one gives.
 	batchDepth   int
 	batchPending bool
+	// batchRequest is the analysis scope the pending fan-out carries.
+	batchRequest analysisRequest
+	// analysis is the low-priority lane the tracked-set analysis runs on
+	// (checkout_lifecycle_analysis.go); analysisEditCycle replaces its
+	// edit-cycle predicate in tests.
+	analysis          *lifecycleAnalysisLane
+	analysisEditCycle func() bool
+	// gitWork serialises the racily clean index refreshes behind the
+	// lifecycle's own git work (checkout_racy_index.go).
+	gitWork checkoutGitWork
+
+	// baseAdoptionRelease unregisters this lifecycle's committed-base adoption
+	// observer, installed in the constructor and dropped by Close. It is the
+	// reach from a published base to the dependents that compose over it: the
+	// publisher and the coordinator registry share nothing but the store, so
+	// the announcement travels through the catalog. nil when the backend has no
+	// catalog to observe.
+	baseAdoptionRelease func()
 
 	// transitionCtx owns promotion and demotion workers. Durable transition
 	// rows outlive request contexts; this context instead lives for exactly as
@@ -261,6 +418,16 @@ type CheckoutLifecycle struct {
 	transitionRuns    map[string]*modeTransitionRun
 	transitionWG      sync.WaitGroup
 	transitionClosed  bool
+}
+
+// clock is the lifecycle's time: its configured clock, or time.Now for a
+// lifecycle built without one (a struct literal, as tests build it), which
+// must not panic on a nil func.
+func (l *CheckoutLifecycle) clock() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	return time.Now()
 }
 
 // NewCheckoutLifecycle builds the lifecycle. It fails only on a missing
@@ -279,6 +446,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 	}
 	transitionCtx, cancelTransitions := context.WithCancel(context.Background())
 	l := &CheckoutLifecycle{
+		analysis:               newLifecycleAnalysisLane(),
 		mi:                     cfg.MultiIndexer,
 		cfgMgr:                 cfg.ConfigManager,
 		logger:                 logger,
@@ -302,6 +470,7 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 	// worktree-heavy tree can opt every discovered worktree into dormancy — or
 	// out of it — without editing the file the daemon reads.
 	l.cfgLazyWorktrees = cfg.LazyWorktrees
+	l.cfgWatchCheckouts = cfg.WatchCheckouts
 	if value, ok := worktreeLazyActivationEnv(); ok {
 		l.cfgLazyWorktrees = value
 	}
@@ -332,7 +501,125 @@ func NewCheckoutLifecycle(cfg CheckoutLifecycleConfig) (*CheckoutLifecycle, erro
 		return nil, fmt.Errorf("indexer: build checkout reconciler: %w", err)
 	}
 	l.rec = rec
+	// Registered here rather than by whatever builds a publisher: the
+	// coordinator registry is this object's, every publisher in the process
+	// adopts against the same store, and a lifecycle that never publishes
+	// anything itself still serves the dependents a sibling's publication moves.
+	l.baseAdoptionRelease = l.catalog.ObserveDedicatedBaseAdoptions(l.dedicatedBaseAdopted)
 	return l, nil
+}
+
+// dedicatedBaseAdopted wakes the checkouts that compose over a base that has
+// just advanced.
+//
+// A dependent's commit layer is identified by the base it was built over
+// (CheckoutCoordinator.commitIdentity carries the base's committed tree as the
+// layer's lower_view_fingerprint), so an advanced base means every dependent in
+// the family now has a layer whose identity names the previous one. Nothing told
+// them: ensureCoordinator signals on the dependent's OWN head moving, and the
+// base is not that. Without this they would find out on the 15-second poll at
+// best, and in the unpublished regime — where the base identity is the owner
+// checkout's head_tree — not at all until a reconciliation pass rewrote that row.
+//
+// Waking is all it does, and what the woken cycle then does is not the same in
+// the two regimes graphBase serves. Where the primary HAS published a
+// generation the dependent stays on the base it was built against — its routed
+// pair still composes to its own tree exactly, so the cycle settles without
+// building anything (CheckoutCoordinator.pinRoutedBase, the dependent pin) and
+// the wake costs a sample and a few metadata reads. What it buys there is the
+// rest of the cycle: the checkout's own HEAD, its working tree and its
+// configuration are all re-checked, and a base advance is as good a moment as
+// any to do it. Where the primary has NOT published one the base moves without
+// any pointer moving with it, the old delta really does go stale, and the wake
+// is the correctness path: the cycle recomposes over the tree it finds and
+// flips its route only once the replacement is built, so the route keeps
+// serving the pair it already holds until there is something coherent to
+// replace it with. No new base is spliced under an old delta by this signal,
+// and none is by the cycle it starts.
+//
+// The owner is skipped: it is the checkout the base was published FOR, and its
+// own route is not composed over itself. Ref views are not signalled at all,
+// and that is not an omission — RefViewManager resolves the base per selection
+// (EnsureRefView reads it before the identity it keys on, ref_views.go), so it
+// has no cached base to invalidate; what it does cache, the dependency cohort,
+// is invalidated by the observation event that precedes publication.
+func (l *CheckoutLifecycle) dedicatedBaseAdopted(event store_sqlite.DedicatedBaseAdoptionEvent) {
+	if l == nil || !event.Advanced() {
+		return
+	}
+	reason := fmt.Sprintf("committed base of %s advanced to generation %d",
+		event.GraphID, event.Adoption.GenerationID)
+	woken := l.PropagateBaseAdvance(event.FamilyID, event.Owner.CheckoutID,
+		event.Adoption.GenerationID, event.Adoption.TreeOID, reason)
+	l.logger.Debug("checkout lifecycle: committed base advanced",
+		zap.String("graph", event.GraphID), zap.String("family", event.FamilyID),
+		zap.Int64("generation", event.Adoption.GenerationID),
+		zap.Int64("previous_generation", event.Adoption.PreviousGenerationID),
+		zap.String("tree", event.Adoption.TreeOID),
+		zap.Bool("head_advanced", event.Adoption.HeadAdvanced),
+		zap.Int("dependents_signalled", woken))
+}
+
+// PropagateBaseAdvance tells every live coordinator in one family, skipping
+// the named checkout, that the family's base advanced, and reports how many it
+// signalled.
+//
+// The registry snapshot is taken under coordMu and the signals are sent outside
+// it, as every other fan-out here does: Signal is buffered to one and never
+// blocks, but a coordinator's own locks are not this lock's to wait behind. An
+// empty familyID matches nothing — a fan-out that cannot name its family would
+// otherwise wake every checkout in the daemon. A coordinator only NOTES the
+// advance — no cycle, no sample, no build — and applies it on its next use
+// (checkout_propagation.go), so nothing is signalled: the count is 0.
+func (l *CheckoutLifecycle) PropagateBaseAdvance(
+	familyID, skipCheckoutID string, generationID int64, treeOID, reason string,
+) int {
+	if l == nil || familyID == "" {
+		return 0
+	}
+	l.coordMu.Lock()
+	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
+	for checkoutID, coordinator := range l.coordinators {
+		if coordinator == nil || checkoutID == skipCheckoutID || coordinator.familyID != familyID {
+			continue
+		}
+		coordinators = append(coordinators, coordinator)
+	}
+	l.coordMu.Unlock()
+	for _, coordinator := range coordinators {
+		coordinator.NoteBaseAdvance(generationID, treeOID, reason)
+	}
+	return 0
+}
+
+// NoteCheckoutUse tells a live coordinator that a request is reading its
+// checkout, so a base advance left pending for the next use is applied now.
+// It never starts a coordinator (ActivateCheckout does) and costs nothing when
+// nothing is pending.
+func (l *CheckoutLifecycle) NoteCheckoutUse(checkoutID, reason string) {
+	if l == nil || checkoutID == "" {
+		return
+	}
+	l.idle.noteUse(checkoutID, l.clock())
+	l.coordMu.Lock()
+	coordinator := l.coordinators[checkoutID]
+	l.coordMu.Unlock()
+	coordinator.wantRebase(reason, true)
+}
+
+// CheckoutPropagationStats reports one live coordinator's propagation state;
+// found is false when the checkout has no live coordinator.
+func (l *CheckoutLifecycle) CheckoutPropagationStats(checkoutID string) (PropagationStats, bool) {
+	if l == nil || checkoutID == "" {
+		return PropagationStats{}, false
+	}
+	l.coordMu.Lock()
+	coordinator := l.coordinators[checkoutID]
+	l.coordMu.Unlock()
+	if coordinator == nil {
+		return PropagationStats{}, false
+	}
+	return coordinator.PropagationStats(), true
 }
 
 // SetWatcherSource installs the accessor for the live file watcher. The
@@ -542,6 +829,9 @@ func (l *CheckoutLifecycle) recordCheckout(
 	if l.catalog == nil || prefix == "" {
 		return checkoutIdentity{}, nil
 	}
+	if l.RepositoryAdmissionClosed(prefix) {
+		return checkoutIdentity{}, graphview.ErrRepositoryAdmissionClosed
+	}
 	root = pathkey.CanonicalExistingRoot(root)
 	inv, err := gitstate.Inventory(ctx, root)
 	if err != nil {
@@ -556,7 +846,7 @@ func (l *CheckoutLifecycle) recordCheckout(
 			"git does not list %s as a worktree of %s", root, inv.CommonDir)
 	}
 
-	now := l.now()
+	now := l.clock()
 	familyID := FamilyIDFor(inv.CommonDir)
 	if err := l.upsertFamily(ctx, familyID, inv.CommonDir, now.Unix()); err != nil {
 		return checkoutIdentity{}, err
@@ -807,6 +1097,16 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 				store_sqlite.ErrCatalogStaleGuard, checkoutID, existing.GraphID, existing.FamilyID,
 			)
 		}
+		if err := l.RegisterRepositoryOwner(ctx, existing.GraphID); err != nil {
+			return "", true, err
+		}
+		// Inside the closure, so every path that reuses an existing binding
+		// carries it: the ordinary one below, and the two the UpsertDedicatedGraph
+		// error and retry arms take. A registration here is not always a no-op —
+		// a process that restarted over an existing catalog binding registers the
+		// owner for the FIRST time on this path, which is the transition that
+		// turns a member every description refused into a describable one.
+		l.invalidateDependencyCohortsForPrefix(prefix, "repository owner registered")
 		return existing.GraphID, true, nil
 	}
 	if graphID, found, err := reuseOwner(); found || err != nil {
@@ -844,6 +1144,14 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 			return "", retryErr
 		}
 	}
+	if err := l.RegisterRepositoryOwner(ctx, graphID); err != nil {
+		return "", err
+	}
+	// The registration is the moment the cohort changes: a repository that was
+	// tracked but had no registered owner refused every description that named
+	// it, and one that did not exist at all was not an input. Both leave every
+	// in-scope consumer holding an answer that is no longer the current one.
+	l.invalidateDependencyCohortsForPrefix(prefix, "dedicated graph bound and its owner registered")
 	return graphID, nil
 }
 
@@ -1028,7 +1336,7 @@ func (l *CheckoutLifecycle) applyUntrack(
 		}
 		if outcome.err != nil {
 			out.Pending = true
-			return out, outcome.err
+			return repositoryCleanupUntrackResult(out, outcome.err)
 		}
 		out.Demoted = outcome.demoted
 	case UntrackPlanPrimaryClosure:
@@ -1037,7 +1345,7 @@ func (l *CheckoutLifecycle) applyUntrack(
 			checkout.FamilyID, preview.PrimaryEpoch)
 		appendRevoked(revocation)
 		if err != nil {
-			return out, err
+			return repositoryCleanupUntrackResult(out, err)
 		}
 	case UntrackPlanForget:
 		revocation, err := l.rec.ForgetCheckoutExplicit(
@@ -1045,12 +1353,23 @@ func (l *CheckoutLifecycle) applyUntrack(
 			checkout.FamilyID, preview.GraphID)
 		appendRevoked(revocation)
 		if err != nil {
-			return out, err
+			return repositoryCleanupUntrackResult(out, err)
 		}
 	default:
 		return out, fmt.Errorf("indexer: unsupported untrack plan %q", preview.Plan)
 	}
 
+	// Do not let the no-binding fallback bypass a still-owned cleanup lane.
+	// Prefix/owner reuse remains fenced through the enclosing saga journal
+	// and any demotion transition, not merely through graph-row deletion.
+	pending, finalizeErr := l.finalizeRepositoryCleanups(opCtx, preview.Prefix)
+	if finalizeErr != nil {
+		return out, finalizeErr
+	}
+	if pending {
+		out.Pending = true
+		return out, nil
+	}
 	if before != nil {
 		out.NodesRemoved, out.EdgesRemoved = before.NodeCount, before.EdgeCount
 	}
@@ -1085,6 +1404,112 @@ func (l *CheckoutLifecycle) familyGraphsFor(
 		}
 	}
 	return owned, primary, nil
+}
+
+// dedicatedBaseConsumers reports whether anything can read one dedicated
+// graph's committed base yet, and names the census it answered from.
+//
+// A committed base is a full index of a committed tree — the single largest
+// write a warm daemon makes — and the OWNER is not one of its readers. The
+// owning repository's own request route stays on legacy generation 0 (the
+// declared limitation stated on dedicated_base_startup.go's header and on this
+// file's base-advance fan-out), so a published base exists for exactly two
+// consumers, both of which key a layer on an immutable lower snapshot:
+//
+//   - a DEPENDENT checkout — a non-owner checkout in the family served from the
+//     family's primary corpus. applyCoordinators gives a coordinator to exactly
+//     those (EffectiveMode == CheckoutModeAutomatic) and withdraws the route of
+//     every other one, and a coordinator's commit layer is what composes over
+//     the base (CheckoutCoordinator.primaryBase -> graphBase);
+//   - a REF VIEW rooted in this graph. RefViewManager.base resolves its lower
+//     snapshot through the same graphBase, so a named view is a reader of the
+//     base whether or not any checkout is.
+//
+// A non-owner checkout that owns a dedicated graph of its own is deliberately
+// NOT a consumer: it is served from its own corpus, and applyCoordinators
+// withdraws any route it still holds. A row in one of the two terminal states
+// is not one either — it is on its way out of the catalog and nothing will
+// route it again.
+//
+// It is a CENSUS OF CATALOG ROWS, not of live coordinators. A worktree the
+// startup inventory left dormant has a durable row and no coordinator
+// (TestDormancyColdFanoutInstallsNoAutomaticCoordinators); it is woken by a
+// selection, and making that selection pay for a whole committed base first is
+// the latency this census exists to keep off the wake-up path.
+func (l *CheckoutLifecycle) dedicatedBaseConsumers(
+	ctx context.Context, graph store_sqlite.DedicatedGraph,
+) (bool, error) {
+	if l == nil || l.catalog == nil {
+		return false, nil
+	}
+	if graph.FamilyID != "" {
+		checkouts, err := l.catalog.ListCheckouts(ctx, graph.FamilyID)
+		if err != nil {
+			return false, err
+		}
+		for i := range checkouts {
+			if dependentCheckout(checkouts[i], graph.OwnerCheckoutID) {
+				return true, nil
+			}
+		}
+	}
+	if graph.GraphID == "" {
+		return false, nil
+	}
+	views, err := l.catalog.ListRefViews(ctx, graph.GraphID)
+	if err != nil {
+		return false, err
+	}
+	return len(views) > 0, nil
+}
+
+// dependentCheckout decides whether one catalog row is a checkout that composes
+// over the family primary's committed base. See dedicatedBaseConsumers.
+func dependentCheckout(checkout store_sqlite.Checkout, ownerCheckoutID string) bool {
+	switch {
+	case checkout.CheckoutID == "" || checkout.CheckoutID == ownerCheckoutID:
+		return false
+	case checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic:
+		return false
+	case checkout.State == store_sqlite.CheckoutStateForgetting,
+		checkout.State == store_sqlite.CheckoutStatePrimaryClosureRetiring:
+		return false
+	}
+	return true
+}
+
+// requestDedicatedBase asks the committed-base publisher for one repository's
+// base because a consumer now needs one.
+//
+// It is the ON-DEMAND half of the consumer gate. The startup publisher and the
+// live advance trigger both refuse to publish for a family with no reader
+// (InitialBasePublisher.publish's "no dependent checkout" skip), so the
+// publication a dependent needs has to be asked for at the moment the dependent
+// first notices there is none — which is CheckoutCoordinator.primaryBase's
+// unpublished arm, wired here through buildCoordinator.
+//
+// It NEVER publishes on the caller's goroutine: RequestBase appends to the
+// publisher's single pending list, so the one committed-base build at a time
+// invariant holds whichever door asked. It reports whether the request was
+// accepted; a daemon with no publisher installed (a non-sqlite backend, a stack
+// with no lifecycle) accepts nothing, and the dependent stays in the legacy
+// regime, which is exactly where it was before.
+func (l *CheckoutLifecycle) requestDedicatedBase(repoPrefix, reason string) bool {
+	if l == nil || repoPrefix == "" {
+		return false
+	}
+	publisher := dedicatedBaseAdvanceTriggerFor(l.mi).owner()
+	if publisher == nil {
+		return false
+	}
+	if !publisher.RequestBase(repoPrefix) {
+		return false
+	}
+	if l.logger != nil {
+		l.logger.Debug("checkout lifecycle: a dependent asked for the family's committed base",
+			zap.String("repo", repoPrefix), zap.String("reason", reason))
+	}
+	return true
 }
 
 // demotableNow re-asks, at confirm time, the question the demote plan was
@@ -1149,6 +1574,13 @@ func (l *CheckoutLifecycle) ApplyReload(ctx context.Context) (ReloadResult, erro
 	defer l.beginBatch()()
 
 	out := ReloadResult{Refreshed: l.mi.RefreshRepoConfigs()}
+	if out.Refreshed > 0 {
+		// A refreshed repository configuration moves the config sections the
+		// cohort digests (artifacts, semantic/LSP, workspace/project,
+		// source-selection), and which repository's sections moved is not
+		// reported here — so every live consumer re-describes once.
+		l.invalidateAllDependencyCohorts("repository configuration reloaded")
+	}
 
 	// Match configured entries to tracked instances by ROOT PATH. A worktree
 	// tracked as an independent instance registers under a derived prefix, so
@@ -1252,6 +1684,13 @@ type SweepReport struct {
 	// collected. They are counted apart from Retired because nothing else
 	// would ever offer them: a ref view belongs to no checkout.
 	RefViewsRetired int
+	// CoordinatorStartFailures states why the checkouts that have no build
+	// loop have none. The pass itself is what tried to start them
+	// (applyCoordinators below), so the reasons it carries are this pass's,
+	// and a checkout that recovered a loop has dropped out of them. Empty is
+	// the ordinary answer: every checkout that was asked for a coordinator
+	// either got one or is still waiting on its primary.
+	CoordinatorStartFailures []CoordinatorStartFailure
 }
 
 // Sweep resumes unfinished cleanups and reconciles every known family.
@@ -1262,6 +1701,16 @@ type SweepReport struct {
 // evidence and two separate clocks, which is what lets it act on any checkout
 // without risking a corpus over a transient stat failure.
 func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
+	return l.sweep(ctx, true)
+}
+
+// SweepDeferredRetirement performs the janitor's topology and cleanup work but
+// leaves payload retirement to the bounded daemon retirement worker.
+func (l *CheckoutLifecycle) SweepDeferredRetirement(ctx context.Context) (SweepReport, error) {
+	return l.sweep(ctx, false)
+}
+
+func (l *CheckoutLifecycle) sweep(ctx context.Context, retirePayload bool) (SweepReport, error) {
 	var out SweepReport
 	if l == nil || l.rec == nil {
 		return out, nil
@@ -1294,8 +1743,15 @@ func (l *CheckoutLifecycle) Sweep(ctx context.Context) (SweepReport, error) {
 		l.applyCoordinators(ctx, report)
 	}
 	out.Coordinators = l.liveCoordinators("")
-	out.Retired = l.sweepRetirements(ctx)
-	out.RefViewsRetired = l.sweepRefViewRetention(ctx)
+	// Read after applyCoordinators, so the reasons are the ones this pass
+	// either recorded or retracted rather than the ones it inherited.
+	out.CoordinatorStartFailures = l.CoordinatorStartFailures()
+	if retirePayload {
+		out.Retired = l.sweepRetirements(ctx)
+		out.RefViewsRetired = l.sweepRefViewRetention(ctx)
+	} else {
+		l.queueRefViewRetirements(ctx)
+	}
 	recordSweepGauges(out)
 	if out.Removed > 0 {
 		// The cleanup hooks drop the removed repositories from the in-memory
@@ -1362,7 +1818,7 @@ func (l *CheckoutLifecycle) scheduleFamilyRetryAt(familyID string, deadline int6
 	if deadline <= 0 {
 		return
 	}
-	delay := time.Unix(deadline, 0).Sub(l.now())
+	delay := time.Unix(deadline, 0).Sub(l.clock())
 	if delay <= 0 {
 		delay = time.Millisecond
 	}
@@ -1396,7 +1852,7 @@ func (l *CheckoutLifecycle) runFamilyRetry(familyID string, deadline int64) {
 	}
 	l.logger.Warn("checkout lifecycle: scheduled family reconciliation failed",
 		zap.String("family", familyID), zap.Error(err))
-	l.scheduleFamilyRetryAt(familyID, l.now().Add(5*time.Second).Unix())
+	l.scheduleFamilyRetryAt(familyID, l.clock().Add(5*time.Second).Unix())
 }
 
 func familyReportRemoved(report reconcile.FamilyReport) bool {
@@ -1416,6 +1872,7 @@ func (l *CheckoutLifecycle) reconcileFamilyNow(ctx context.Context, familyID, fa
 	if l == nil || l.rec == nil || familyID == "" {
 		return
 	}
+	baseline := l.repoSetFingerprint()
 	report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, fallbackDir))
 	if err != nil {
 		l.logger.Debug("checkout lifecycle: could not reconcile the family",
@@ -1426,7 +1883,7 @@ func (l *CheckoutLifecycle) reconcileFamilyNow(ctx context.Context, familyID, fa
 	l.scheduleFamilyRetry(report)
 	if familyReportRemoved(report) {
 		l.saveConfig("reconcile")
-		l.notifyTrackedSetChanged()
+		l.notifyFamilyChanged(baseline)
 	}
 }
 
@@ -1546,7 +2003,6 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 	if l == nil || l.store == nil || l.catalog == nil {
 		return
 	}
-	routed := l.durableRoutes(ctx, report)
 	for _, entry := range report.Checkouts {
 		if entry.CheckoutID == "" || !entry.Durable {
 			continue
@@ -1566,57 +2022,26 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 			l.withdrawStaleRoute(ctx, entry.CheckoutID)
 			continue
 		}
-		if l.coordinatorAdmitted(checkout, routed[entry.CheckoutID], entry.Action) {
+		if l.coordinatorAdmitted(checkout, entry.Action) {
 			l.ensureCoordinator(ctx, report.PrimaryGraphID, checkout)
 		}
 	}
 	l.markInitialInventory(report)
 }
 
-// durableRoutes reads, in one batched catalog call, which of a family's durable
-// checkouts already hold a route. A routed checkout was built before, so its
-// coordinator is admitted on sight — a restart resumes the view it was serving
-// rather than leaving it dark until something selects it again. A read failure
-// degrades to no routes: the checkout falls to the other admission arms and is
-// re-activated on its next selection.
-func (l *CheckoutLifecycle) durableRoutes(ctx context.Context, report reconcile.FamilyReport) map[string]bool {
-	ids := make([]string, 0, len(report.Checkouts))
-	for _, entry := range report.Checkouts {
-		if entry.CheckoutID == "" || !entry.Durable {
-			continue
-		}
-		ids = append(ids, entry.CheckoutID)
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	routes, err := l.catalog.GetCheckoutRoutes(ctx, ids)
-	if err != nil {
-		l.logger.Debug("checkout lifecycle: could not batch-load routes for admission",
-			zap.String("family", report.FamilyID), zap.Error(err))
-		return nil
-	}
-	routed := make(map[string]bool, len(routes))
-	for id := range routes {
-		routed[id] = true
-	}
-	return routed
-}
-
 // coordinatorAdmitted decides whether one ready, automatic, primary-backed
 // checkout gets a coordinator now, or stays dormant until it is selected. A
-// live coordinator keeps running, a routed checkout resumes across a restart,
-// and a checkout a track or promote is converging keeps building. Everything
-// else is admitted only when it is a genuine runtime addition — minted after
-// its family's initial inventory was taken, and not opted into lazy activation.
+// live coordinator keeps running and a checkout a track or promote is
+// converging keeps building. A routed checkout does not resume across a
+// restart: its route is a durable overlay, so nothing needs rebuilding and a
+// checkout nobody selects costs nothing until it is selected. Everything else
+// is admitted only when it is a genuine runtime addition — minted after its
+// family's initial inventory was taken, and not opted into lazy activation.
 // The startup inventory itself, and anything under the lazy flag, stays dormant.
 func (l *CheckoutLifecycle) coordinatorAdmitted(
-	checkout store_sqlite.Checkout, routed bool, action reconcile.CheckoutAction,
+	checkout store_sqlite.Checkout, action reconcile.CheckoutAction,
 ) bool {
 	if l.hasCoordinator(checkout.CheckoutID) {
-		return true
-	}
-	if routed {
 		return true
 	}
 	if checkout.ActiveIntentTransitionID != "" {
@@ -1671,6 +2096,7 @@ func (l *CheckoutLifecycle) ActivateCheckout(checkoutID, reason string) bool {
 	if l == nil || checkoutID == "" {
 		return false
 	}
+	l.idle.noteUse(checkoutID, l.clock())
 	// Deliberately does NOT signal a coordinator that is already live. The
 	// coordinator's build loop re-arms its quiet window on every signal and
 	// runs a cycle only once that window elapses with no further signals; a
@@ -1826,15 +2252,89 @@ func (l *CheckoutLifecycle) ensureCoordinator(
 		l.logger.Warn("checkout lifecycle: could not start a checkout coordinator",
 			zap.String("checkout", checkout.CheckoutID),
 			zap.String("root", checkout.RootPath), zap.Error(err))
+		// Nobody receives this error: every entry point that reaches here is a
+		// background reconciliation. Recorded so the checkout has a stated
+		// reason for having no view instead of silently having none.
+		l.recordCoordinatorStartFailure(checkout, err)
 		return
 	}
 	if coordinator == nil {
+		// Not a failure: the primary is bound but has not finished indexing,
+		// and the next sweep tries again.
 		return
 	}
 	if !l.installCoordinatorAtHead(checkout, coordinator) {
 		return
 	}
+	l.clearCoordinatorStartFailure(checkout.CheckoutID)
 	coordinator.Signal("checkout registered")
+}
+
+// CoordinatorStartFailure is why one checkout has no build loop.
+//
+// It is a health reason, not an error return: the paths that start a
+// coordinator are background reconciliations with no caller to fail, so a
+// checkout whose coordinator cannot be built would otherwise just have no view
+// and no explanation.
+type CoordinatorStartFailure struct {
+	// CheckoutID and RootPath name the working copy that has no view.
+	CheckoutID string `json:"checkout_id"`
+	RootPath   string `json:"root_path,omitempty"`
+	// Reason is what stopped it, as the failing step stated it.
+	Reason string `json:"reason"`
+	// At is when the attempt failed, on the lifecycle's clock.
+	At int64 `json:"at"`
+}
+
+// CoordinatorStartFailures reports the checkouts whose build loop could not be
+// started, most recent first. An empty result means every checkout that was
+// asked for a coordinator either got one or is still waiting on its primary.
+func (l *CheckoutLifecycle) CoordinatorStartFailures() []CoordinatorStartFailure {
+	if l == nil {
+		return nil
+	}
+	l.coordinatorStartMu.Lock()
+	defer l.coordinatorStartMu.Unlock()
+	out := make([]CoordinatorStartFailure, 0, len(l.coordinatorStartFailures))
+	for _, failure := range l.coordinatorStartFailures {
+		out = append(out, failure)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].At != out[j].At {
+			return out[i].At > out[j].At
+		}
+		return out[i].CheckoutID < out[j].CheckoutID
+	})
+	return out
+}
+
+// recordCoordinatorStartFailure states why one checkout has no build loop.
+func (l *CheckoutLifecycle) recordCoordinatorStartFailure(checkout store_sqlite.Checkout, err error) {
+	if l == nil || err == nil || checkout.CheckoutID == "" {
+		return
+	}
+	l.coordinatorStartMu.Lock()
+	defer l.coordinatorStartMu.Unlock()
+	if l.coordinatorStartFailures == nil {
+		l.coordinatorStartFailures = map[string]CoordinatorStartFailure{}
+	}
+	l.coordinatorStartFailures[checkout.CheckoutID] = CoordinatorStartFailure{
+		CheckoutID: checkout.CheckoutID,
+		RootPath:   checkout.RootPath,
+		Reason:     err.Error(),
+		At:         l.clock().Unix(),
+	}
+}
+
+// clearCoordinatorStartFailure retracts a stated reason once the checkout has a
+// build loop again.
+func (l *CheckoutLifecycle) clearCoordinatorStartFailure(checkoutID string) {
+	if l == nil || checkoutID == "" {
+		return
+	}
+	l.coordinatorStartMu.Lock()
+	defer l.coordinatorStartMu.Unlock()
+	delete(l.coordinatorStartFailures, checkoutID)
 }
 
 // buildCoordinator constructs one checkout's coordinator against a graph,
@@ -1853,6 +2353,15 @@ func (l *CheckoutLifecycle) buildCoordinator(
 	if l.store == nil || l.catalog == nil {
 		return nil, nil
 	}
+	// The construction-time admission. It is handed to the coordinator below
+	// and released here only as the acquirer's own hold, so the repository the
+	// loop reads and writes stays un-finalizable and un-purgeable for as long
+	// as that loop runs — not merely for as long as this constructor does.
+	ownerRead, err := l.AcquireRepositoryRead(primaryGraphID)
+	if err != nil {
+		return nil, err
+	}
+	defer ownerRead.Release()
 	primary, found, err := l.catalog.GetDedicatedGraph(ctx, primaryGraphID)
 	if err != nil {
 		return nil, err
@@ -1865,38 +2374,81 @@ func (l *CheckoutLifecycle) buildCoordinator(
 		return nil, nil
 	}
 
-	index := config.Default().Index
-	watch := config.Default().Watch
+	repoCfg := config.Default()
 	if l.cfgMgr != nil {
-		repoCfg := l.cfgMgr.GetRepoConfig(primary.RepoPrefix)
-		index, watch = repoCfg.Index, repoCfg.Watch
+		repoCfg = l.cfgMgr.GetRepoConfig(primary.RepoPrefix)
 	}
+	index, watch := repoCfg.Index, repoCfg.Watch
+	// GetRepoConfig hands back a SHALLOW result: its nested maps and slices —
+	// FrameworkSynthesizers above all, which is a pointer to a slice — are the
+	// ConfigManager's own values. A builder that kept them would be building
+	// under a configuration the next reload can change underneath it, and the
+	// generation identity it stamped would then name a configuration that is
+	// no longer what the payload was produced from.
+	//
+	// snapshotDedicatedBaseConfig deep-clones the whole struct and re-owns the
+	// synthesizer slice, so what goes into the builder and the coordinator is
+	// this coordinator's for its whole lifetime. Its fingerprint is the same
+	// value the coordinator derives for the identity's config hash.
+	snapshot := l.configSnapshot
+	if snapshot == nil {
+		snapshot = snapshotDedicatedBaseConfig
+	}
+	frozen, _, err := snapshot(index, primary.RepoPrefix, idx.WorkspaceID(), idx.ProjectID())
+	if err != nil {
+		// Refused, not degraded. NewCheckoutCoordinator freezes the same value
+		// and returns an error when it cannot, so continuing here would build a
+		// coordinator config the constructor is about to reject anyway — and
+		// the only way it could NOT reject it is if the two disagreed, which
+		// would mean a builder holding the ConfigManager's own nested values.
+		// That is the one outcome this call exists to prevent.
+		return nil, fmt.Errorf(
+			"indexer: freeze the index configuration for checkout %s: %w", checkout.CheckoutID, err)
+	}
+	index = frozen
+	builder := &SparseGenerationBuilder{
+		Store:      l.store,
+		Registry:   l.mi.registry,
+		Config:     index,
+		Logger:     l.logger,
+		Admissions: idx,
+		Embedder:   l.mi.embedder,
+		// The daemon's one enrichment manager, so every checkout's
+		// language servers are admitted against the same global cap
+		// rather than one cap per coordinator.
+		Semantic: l.mi.semanticMgr,
+		// The stack pre-warm gives way to the whole edit cycle.
+		EditCycleActive: l.editCycleHoldsBuildLane,
+		PrewarmDeferred: l.prewarmDeferral.defers,
+	}
+	builder.contractCoreRuntime = l.contractCoreRuntime.Load()
 	coordinator, err := NewCheckoutCoordinator(CheckoutCoordinatorConfig{
-		CheckoutID:   checkout.CheckoutID,
-		CheckoutRoot: checkout.RootPath,
-		FamilyID:     checkout.FamilyID,
-		HeadCommit:   checkout.HeadCommit,
-		HeadTree:     checkout.HeadTree,
-		RepoPrefix:   primary.RepoPrefix,
-		WorkspaceID:  idx.WorkspaceID(),
-		ProjectID:    idx.ProjectID(),
-		Store:        l.store,
-		Builder: &SparseGenerationBuilder{
-			Store:      l.store,
-			Registry:   l.mi.registry,
-			Config:     index,
-			Logger:     l.logger,
-			Admissions: idx,
-			Embedder:   l.mi.embedder,
-			// The daemon's one enrichment manager, so every checkout's
-			// language servers are admitted against the same global cap
-			// rather than one cap per coordinator.
-			Semantic: l.mi.semanticMgr,
+		GitWork:        &l.gitWork,
+		PrewarmRoute:   l.routePrewarm.call,
+		CheckoutID:     checkout.CheckoutID,
+		CheckoutRoot:   checkout.RootPath,
+		FamilyID:       checkout.FamilyID,
+		HeadCommit:     checkout.HeadCommit,
+		HeadTree:       checkout.HeadTree,
+		RepoPrefix:     primary.RepoPrefix,
+		WorkspaceID:    idx.WorkspaceID(),
+		ProjectID:      idx.ProjectID(),
+		Store:          l.store,
+		Builder:        builder,
+		Leases:         l.leases,
+		Config:         index,
+		ConfigSections: dedicatedBaseConfigSections(repoCfg),
+		Logger:         l.logger,
+		Gate:           l.buildGate(),
+		// The on-demand half of the committed-base consumer gate. This
+		// coordinator IS a consumer — it is built for a ready automatic
+		// checkout, which is what dedicatedBaseConsumers counts — so the
+		// moment its primaryBase finds no published base, the family has a
+		// reader and the publication the startup path deferred is owed.
+		RequestBase: func(prefix string) {
+			l.requestDedicatedBase(prefix,
+				"checkout "+checkout.CheckoutID+" composes over an unpublished primary")
 		},
-		Leases: l.leases,
-		Config: index,
-		Logger: l.logger,
-		Gate:   l.buildGate(),
 		// The watcher's own debounce is the quiet window: both coalesce the
 		// same event storms, and a checkout whose watch configuration says how
 		// long to wait means it for its views too.
@@ -1909,7 +2461,373 @@ func (l *CheckoutLifecycle) buildCoordinator(
 	// when the constructor returns, and the transitions register only once the
 	// rebuild they drive with it has landed.
 	l.trackStarted(checkout.CheckoutID, coordinator)
+	l.holdRepositoryOwnerRead(coordinator, ownerRead.Handoff())
+	// A close that began after this constructor was admitted took its first
+	// actor snapshot (repository_cleanup.go:184) before the line above could
+	// record this one, so the cleanup would wait on a drain this coordinator
+	// now holds open for its whole lifetime and nothing would ever close it.
+	// The constructor therefore re-reads the boundary it was admitted through
+	// and closes what it just started. The two orders are exhaustive: either
+	// the close was recorded before this read, and this arm closes the
+	// coordinator, or it was not, and the snapshot after it saw the actor.
+	if l.RepositoryAdmissionClosed(primary.RepoPrefix) {
+		_ = coordinator.Close()
+		l.oweRetirement(coordinator.DrainRetirements()...)
+		return nil, fmt.Errorf(
+			"indexer: repository %s stopped admitting while checkout %s was starting its coordinator",
+			primary.RepoPrefix, checkout.CheckoutID)
+	}
+	l.watchCheckout(coordinator, primary.RepoPrefix, checkout.RootPath)
+	warmCheckoutCompilerAtReady(l, builder, checkout.RootPath)
 	return coordinator, nil
+}
+
+// watchCheckout starts the checkout's file watcher and hands it to its
+// coordinator, which closes it with itself. It never delays the coordinator:
+// the watcher starts on a goroutine of its own, and a checkout whose watcher
+// cannot start is still refreshed by its poll.
+func (l *CheckoutLifecycle) watchCheckout(coordinator *CheckoutCoordinator, repoPrefix, root string) {
+	if l == nil || coordinator == nil || !l.cfgWatchCheckouts || !checkoutWatchEnabled() {
+		return
+	}
+	var patterns []string
+	if l.cfgMgr != nil {
+		patterns = l.cfgMgr.EffectiveExclude(repoPrefix)
+	}
+	logger := l.logger.With(zap.String("checkout", coordinator.checkoutID))
+	go func() {
+		w, err := startCheckoutWatch(root, patterns, logger, coordinator.noteFilesystemChange)
+		if err != nil {
+			logger.Info("checkout watch: not started; the checkout is refreshed by its poll",
+				zap.String("root", root), zap.Error(err))
+			return
+		}
+		coordinator.attachFilesystemWatch(w)
+	}()
+}
+
+// warmCheckoutCompilerAtReady starts the background warm-up of a ready
+// checkout's compiler state (the whole-module listing its working-tree builds'
+// go/types passes reuse), so the first edit in a package no build has listed
+// yet does not pay the cold listing. Without it a checkout whose tree is clean
+// when it is routed warms only after its first build, and that first edit is
+// the cold one.
+//
+// It never delays readiness: the module probe, the manifest digest and the
+// provider's own bookkeeping run on a goroutine of its own, outside the
+// construction-time admission and every lifecycle lock. The provider's listing
+// is itself asynchronous, yields to every compiler load, and is a no-op while
+// the checkout is already warm for its module manifests; a provider closed
+// first answers without starting anything. Without a semantic manager nothing
+// starts.
+//
+// The provider is handed the lifecycle's foreground-activity view first, so a
+// warm-up asked for here — typically at daemon start, for every automatic
+// checkout of a family at once — lists one checkout at a time, after the
+// daemon has been idle for a while (longer for a checkout nobody has touched
+// since the start), and stops as soon as an edit or a fresh request arrives
+// (lifecycleForegroundActivity).
+func warmCheckoutCompilerAtReady(l *CheckoutLifecycle, builder *SparseGenerationBuilder, root string) {
+	if builder == nil || builder.Semantic == nil || root == "" {
+		return
+	}
+	if l != nil {
+		builder.Semantic.SetForegroundActivity(l.foregroundActivity())
+	}
+	go builder.WarmCheckoutCompiler(root)
+}
+
+// holdRepositoryOwnerRead keeps one coordinator's repository-owner admission
+// for the LIFETIME of its build loop and releases it when that loop ends.
+//
+// The constructor's own admission covers the construction only, and a build
+// loop outlives its constructor by definition: the loop reads the repository's
+// payload and writes generations into it, so an untrack that drained only the
+// constructor would be free to retire those generations and purge the payload
+// while the loop was still running over them. Holding the admission is also
+// what makes the cleanup's own ordering safe to rely on — the owner's drain
+// cannot close while a worker for that repository is still alive.
+//
+// The release is keyed on the loop having ended rather than on any particular
+// close path, because a coordinator is stopped from several of them (the
+// cleanup sweep, dropCoordinator, a lost install race, a failed rehome, this
+// lifecycle's Close) and only some of them live in files that can be taught to
+// release it. The waiter is joined by Close.
+func (l *CheckoutLifecycle) holdRepositoryOwnerRead(
+	coordinator *CheckoutCoordinator, admission *graphview.RepositoryReadHandoff,
+) {
+	if admission == nil {
+		return
+	}
+	if coordinator == nil || coordinator.done == nil {
+		admission.Release()
+		return
+	}
+	l.coordinatorLeaseWG.Add(1)
+	go func() {
+		defer l.coordinatorLeaseWG.Done()
+		<-coordinator.done
+		admission.Release()
+	}()
+}
+
+// closeStartedRepositoryCoordinators stops every build loop this process has
+// started, including the off-route actors a transition drives before anything
+// registers them. It is the shutdown counterpart of the cleanup saga's own
+// actor close, and it must run BEFORE the repository-admission drain is waited
+// on: a started actor holds its repository's owner admission until its loop
+// ends (holdRepositoryOwnerRead), so a drain waited on first would wait on a
+// coordinator this function is the only thing that closes.
+func (l *CheckoutLifecycle) closeStartedRepositoryCoordinators() {
+	l.coordMu.Lock()
+	prefixes := make(map[string]struct{})
+	for _, actors := range l.started {
+		for _, actor := range actors {
+			if actor != nil {
+				prefixes[actor.repoPrefix] = struct{}{}
+			}
+		}
+	}
+	l.coordMu.Unlock()
+	for prefix := range prefixes {
+		l.closeRepositoryCoordinators(prefix)
+	}
+}
+
+// dedicatedBaseConfigSections renders the configuration domains that decide
+// what a payload contains and do NOT live in config.IndexConfig.
+//
+// The index configuration is digested whole by snapshotDedicatedBaseConfig.
+// Everything here is the rest of the output-affecting configuration, named so
+// the dependency cohort and the widened config digest can carry it without
+// this package embedding every configuration struct in the tree:
+//
+//   - artifacts — which non-code files become artifact nodes at all.
+//   - semantic / lsp — which enrichment runs, and how far it sweeps. Split in
+//     two because an LSP-only change and a provider change are different
+//     changes; the two digests overlap, which only ever over-invalidates.
+//   - workspace / project — the namespace every node is stamped with, and the
+//     cross-workspace dependency declarations resolution may follow.
+//   - source-selection — the ignore/include layers and the user rule files
+//     that decide which files are admitted and which detectors run. It is not
+//     one of the five domains the producer requires; the required list is a
+//     floor, and a domain beyond it is digested like any other.
+//
+// The five required domains are always emitted, with the digest of their empty
+// value when a repository configures none: a declared emptiness is a fact
+// about the cohort, and silence is the gap the producer refuses.
+func dedicatedBaseConfigSections(cfg *config.Config) []DependencyRevisionConfigSection {
+	if cfg == nil {
+		cfg = config.Default()
+	}
+	semantic := cfg.Semantic
+	return []DependencyRevisionConfigSection{
+		{Name: DependencyRevisionConfigArtifacts, Digest: configSectionDigest(cfg.Artifacts)},
+		{Name: DependencyRevisionConfigLSP, Digest: configSectionDigest(struct {
+			Sweep                      string   `json:"sweep"`
+			OpenDocs                   string   `json:"open_docs"`
+			MaxParallel                int      `json:"max_parallel"`
+			Eager                      bool     `json:"eager"`
+			AdditionalWorkspaceFolders []string `json:"additional_workspace_folders"`
+		}{
+			Sweep:                      semantic.LSPSweep,
+			OpenDocs:                   semantic.LSPOpenDocs,
+			MaxParallel:                semantic.LSPMaxParallel,
+			Eager:                      semantic.EagerLSP,
+			AdditionalWorkspaceFolders: semantic.AdditionalWorkspaceFolders,
+		})},
+		{Name: DependencyRevisionConfigProject, Digest: configSectionDigest(struct {
+			Project  string               `json:"project"`
+			Projects []config.ProjectGlob `json:"projects"`
+		}{Project: cfg.Project, Projects: cfg.Projects})},
+		{Name: DependencyRevisionConfigSemantic, Digest: configSectionDigest(semantic)},
+		{Name: DependencyRevisionConfigWorkspace, Digest: configSectionDigest(struct {
+			Workspace          string                     `json:"workspace"`
+			CrossWorkspaceDeps []config.CrossWorkspaceDep `json:"cross_workspace_deps"`
+		}{Workspace: cfg.Workspace, CrossWorkspaceDeps: cfg.CrossWorkspaceDeps})},
+		{Name: dedicatedBaseSourceSelectionSection, Digest: configSectionDigest(struct {
+			Exclude          []string `json:"exclude"`
+			Include          []string `json:"include"`
+			RuleFiles        []string `json:"rule_files"`
+			RespectGitignore *bool    `json:"respect_gitignore"`
+		}{
+			Exclude:          cfg.Exclude,
+			Include:          cfg.Include,
+			RuleFiles:        cfg.RuleFiles,
+			RespectGitignore: cfg.RespectGitignore,
+		})},
+	}
+}
+
+// dedicatedBaseSourceSelectionSection names the domain beyond the producer's
+// required five.
+const dedicatedBaseSourceSelectionSection = "source-selection"
+
+// configSectionDigest fingerprints one configuration domain.
+//
+// encoding/json sorts map keys, and every value here is a struct or a slice,
+// so the digest is deterministic. A value that cannot be encoded gets a unique
+// digest rather than a shared one — the same fail-safe direction the index
+// configuration's own digest takes: a domain nobody can compare must not read
+// as "matches everything".
+func configSectionDigest(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "unhashable-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:16])
+}
+
+// --- dependency-cohort invalidation -------------------------------------
+//
+// A checkout coordinator and a ref-view manager both CACHE the description of
+// the resolver-visible input cohort their generations are keyed on. Describing
+// one costs a daemon-wide roster read lease and a catalog read per in-scope
+// member, which is why neither re-describes on a poll — but a cached
+// certificate that nothing ever refreshes is a freshness claim that stops being
+// true, and a cached REFUSAL is a degraded identity that never recovers.
+//
+// The lifecycle is the event source for everything a cohort consumer cannot
+// observe for itself, because the lifecycle is what performs those events:
+//
+//   - a repository owner registered (bindDedicatedGraph) — the cohort gains an
+//     in-scope member, and a dedicated graph becomes readable at the same
+//     moment, which is the transition that turns "tracked but not yet indexed"
+//     (a refusal) into a describable member.
+//   - a repository's registry entry torn down — the cohort loses a member, and
+//     a description taken while the admission was closing was a refusal. Two
+//     paths reach it: cleanupHooks.ReleaseGraph, which is how the forget saga
+//     tears down a repository that HAS a dedicated graph, and evictRepoChecked,
+//     which is how a checkout with no graph binding and the transition worker
+//     drop one. Both mark on the disappearance, not on the attempt — except
+//     when the catalog cannot say WHICH repository a released graph held, in
+//     which case the consumers that moved cannot be named and ReleaseGraph
+//     marks every one of them instead of nothing.
+//   - the repository configuration reloaded (ApplyReload) — the config sections
+//     the cohort digests moved. A ref-view manager also RE-READS those sections
+//     per description (RefViewManagerConfig.ConfigSectionsFor), so the mark is
+//     what makes it derive the reloaded configuration's digest rather than
+//     re-deriving the one it already had.
+//
+// The one source that is NOT here is a workspace sibling's HEAD or committed
+// tree moving with no lifecycle event at all. That observation belongs to the
+// git watcher, which owns the ref-transition signal, and it is not wired yet;
+// until it is, a certified revision can name a sibling tree OID that has since
+// moved. Two things bound that window: a membership change is self-observed
+// (the coordinator's poll and the ref-view memo both re-check the cheap
+// workspace topology token), and every BUILD path in a coordinator describes
+// the cohort afresh, so no checkout layer is ever stamped with a token-aged
+// revision.
+//
+// Nothing here reads anything: invalidation only marks, and the next
+// opportunity that is allowed to describe does the work. A source may
+// therefore call it as often as it likes.
+
+// invalidateDependencyCohorts marks the cohort of every live consumer whose
+// inputs could include one repository.
+//
+// The affected set is exactly what a cohort's scope admits: a consumer whose
+// own repository is the one that moved, plus — when the repository declares a
+// workspace — every consumer scoped to that workspace, since a workspace-scoped
+// cohort names each of its members' bytes. A consumer in an unrelated workspace
+// is deliberately left alone: re-describing it would pay a roster lease and a
+// catalog read per member for an answer that cannot have moved, which is the
+// daemon-wide amplification the scoped cohort exists to remove.
+func (l *CheckoutLifecycle) invalidateDependencyCohorts(repoPrefix, workspaceID, reason string) {
+	if l == nil || (repoPrefix == "" && workspaceID == "") {
+		return
+	}
+	affected := func(prefix, workspace string) bool {
+		if repoPrefix != "" && prefix == repoPrefix {
+			return true
+		}
+		return workspaceID != "" && workspace == workspaceID
+	}
+
+	l.coordMu.Lock()
+	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
+	for _, coordinator := range l.coordinators {
+		// repoPrefix and workspaceID are set once by the constructor and never
+		// move, so reading them outside the coordinator's own locks is safe.
+		if coordinator != nil && affected(coordinator.repoPrefix, coordinator.workspaceID) {
+			coordinators = append(coordinators, coordinator)
+		}
+	}
+	l.coordMu.Unlock()
+	for _, coordinator := range coordinators {
+		coordinator.InvalidateDependencyCohort(reason)
+	}
+
+	// A ref-view manager is cached per repository but handed its target per
+	// request, so which of its memo entries moved is decided inside it.
+	l.refViewMu.Lock()
+	managers := make([]*RefViewManager, 0, len(l.refViews))
+	for prefix, manager := range l.refViews {
+		if manager != nil && (workspaceID != "" || prefix == repoPrefix) {
+			managers = append(managers, manager)
+		}
+	}
+	l.refViewMu.Unlock()
+	for _, manager := range managers {
+		manager.InvalidateDependencyCohortFor(repoPrefix, workspaceID, reason)
+	}
+}
+
+// invalidateDependencyCohortsForPrefix is invalidateDependencyCohorts for a
+// repository whose workspace the caller has not already read.
+//
+// The workspace is resolved from the live registry, so a caller that has
+// already REMOVED the repository must read it first and call the two-argument
+// form: a prefix the registry no longer serves resolves to no workspace, and
+// the siblings that lost a member would then never hear about it.
+func (l *CheckoutLifecycle) invalidateDependencyCohortsForPrefix(repoPrefix, reason string) {
+	l.invalidateDependencyCohorts(repoPrefix, l.workspaceForPrefix(repoPrefix), reason)
+}
+
+// invalidateAllDependencyCohorts marks every live consumer's cohort stale. It
+// is what a change with no single repository behind it means — a configuration
+// reload moves the digested config sections of every repository it refreshed.
+func (l *CheckoutLifecycle) invalidateAllDependencyCohorts(reason string) {
+	if l == nil {
+		return
+	}
+	l.coordMu.Lock()
+	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
+	for _, coordinator := range l.coordinators {
+		if coordinator != nil {
+			coordinators = append(coordinators, coordinator)
+		}
+	}
+	l.coordMu.Unlock()
+	for _, coordinator := range coordinators {
+		coordinator.InvalidateDependencyCohort(reason)
+	}
+
+	l.refViewMu.Lock()
+	managers := make([]*RefViewManager, 0, len(l.refViews))
+	for _, manager := range l.refViews {
+		if manager != nil {
+			managers = append(managers, manager)
+		}
+	}
+	l.refViewMu.Unlock()
+	for _, manager := range managers {
+		manager.InvalidateDependencyCohort(reason)
+	}
+}
+
+// workspaceForPrefix reads one served repository's workspace, empty when the
+// registry does not serve it or it declares none.
+func (l *CheckoutLifecycle) workspaceForPrefix(repoPrefix string) string {
+	if l == nil || l.mi == nil || repoPrefix == "" {
+		return ""
+	}
+	idx := l.mi.GetIndexer(repoPrefix)
+	if idx == nil {
+		return ""
+	}
+	return idx.WorkspaceID()
 }
 
 // trackStarted records a coordinator whose loop is running, and forgets the
@@ -2015,6 +2933,13 @@ func (l *CheckoutLifecycle) dropCoordinator(checkoutID string) {
 	// the registry it counts move together.
 	viewmetrics.SetGauge(viewmetrics.Coordinators, int64(len(l.coordinators)))
 	l.coordMu.Unlock()
+	// A checkout that no longer holds a build loop here is one nobody is
+	// asking about any more — it was forgotten, retired, or is being rebuilt —
+	// so a stated reason for it having none stops being a fact about the
+	// daemon's present. Bounded here rather than only on a successful install,
+	// or an untracked checkout's reason would outlive it for the life of the
+	// process.
+	l.clearCoordinatorStartFailure(checkoutID)
 	if coordinator != nil {
 		_ = coordinator.Close()
 		l.oweRetirement(coordinator.DrainRetirements()...)
@@ -2039,17 +2964,29 @@ func (l *CheckoutLifecycle) stopCheckoutWorkspaces(root string) {
 }
 
 // oweRetirement records generations the lifecycle has to collect because no
-// coordinator is left to offer them.
+// coordinator is left to offer them. New debt is counted owed and wakes an
+// idle retirement worker, as a coordinator's deferral does.
 func (l *CheckoutLifecycle) oweRetirement(generations ...int64) {
 	if l == nil || l.store == nil || len(generations) == 0 {
 		return
 	}
+	added := make([]int64, 0, len(generations))
 	l.coordMu.Lock()
-	defer l.coordMu.Unlock()
 	for _, generationID := range generations {
-		if generationID > 0 {
-			l.owed[generationID] = struct{}{}
+		if generationID <= 0 {
+			continue
 		}
+		if _, known := l.owed[generationID]; !known {
+			added = append(added, generationID)
+		}
+		l.owed[generationID] = struct{}{}
+	}
+	l.coordMu.Unlock()
+	for _, generationID := range added {
+		countRetirementOwed(l.store, generationID, viewmetrics.OwedReleased)
+	}
+	if len(added) > 0 {
+		notifyDeferredRetirementWork()
 	}
 }
 
@@ -2120,14 +3057,24 @@ func (l *CheckoutLifecycle) ViewLeases() *graphview.LeaseManager {
 	return l.leases
 }
 
-// Close stops every coordinator. The lifecycle stays usable afterwards —
-// closing is about the goroutines, not about the catalog — and a later sweep
-// brings the coordinators back up for whatever is still there.
+// Close permanently closes lifecycle admission and joins its producers and
+// cleanup worker before the owning server releases indexers or the Store.
 func (l *CheckoutLifecycle) Close() error {
 	if l == nil {
 		return nil
 	}
+	// Unregistered first: a publication this shutdown is cancelling can still
+	// adopt, and an announcement that reaches a registry being torn down would
+	// signal coordinators this Close is about to join.
+	if l.baseAdoptionRelease != nil {
+		l.baseAdoptionRelease()
+	}
+	l.closeAnalysisLane()
+	readersDrained := l.stopRepositoryAdmissions()
+	publishersDrained := l.stopRepositoryPublishers()
+	l.closeRepositoryCleanup()
 	l.closeCheckoutObservations()
+	l.closeAllRefViews()
 	l.transitionMu.Lock()
 	if !l.transitionClosed {
 		l.transitionClosed = true
@@ -2161,11 +3108,6 @@ func (l *CheckoutLifecycle) Close() error {
 	}
 	l.retryMu.Unlock()
 	l.retryWG.Wait()
-	defer func() {
-		l.retryMu.Lock()
-		l.retryClosing = false
-		l.retryMu.Unlock()
-	}()
 
 	l.coordMu.Lock()
 	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
@@ -2181,6 +3123,20 @@ func (l *CheckoutLifecycle) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	// Before the drain, not after it: every started actor holds its
+	// repository's owner admission until its loop ends, so waiting for the
+	// admissions to drain first would wait on coordinators nothing has closed
+	// yet. Registry actors are closed above; these are the off-route ones a
+	// transition drives before anything registers them.
+	l.closeStartedRepositoryCoordinators()
+	<-readersDrained
+	// Repeated after the drain for the reason it was originally placed there:
+	// a constructor admitted just before shutdown records its actor in started
+	// after the sweep above may have read it, and the drain is the fence that
+	// proves every such constructor has finished.
+	l.closeStartedRepositoryCoordinators()
+	l.coordinatorLeaseWG.Wait()
+	<-publishersDrained
 	return errors.Join(errs...)
 }
 
@@ -2232,6 +3188,11 @@ func (l *CheckoutLifecycle) liveCoordinators(familyID string) int {
 // refused while the route still names them and collectable the moment the
 // teardown removes it.
 func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
+	l.retirementSweepWaiting.Add(1)
+	l.retirementSweepMu.Lock()
+	l.retirementSweepWaiting.Add(-1)
+	defer l.retirementSweepMu.Unlock()
+
 	l.coordMu.Lock()
 	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
 	served := make(map[string]struct{}, len(l.coordinators))
@@ -2271,6 +3232,28 @@ func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
 		l.coordMu.Unlock()
 	}
 	return retired
+}
+
+// EnableDeferredSeedRetirements lets a daemon move physical retirement off
+// its query-readiness path after it has installed a post-ready worker. Calling
+// it repeatedly is safe. Other Seed callers retain synchronous retirement.
+func (l *CheckoutLifecycle) EnableDeferredSeedRetirements() {
+	if l == nil {
+		return
+	}
+	l.deferredRetirementMu.Lock()
+	l.deferSeedRetirements = true
+	l.deferredRetirementMu.Unlock()
+}
+
+func (l *CheckoutLifecycle) deferredSeedRetirementsEnabled() bool {
+	if l == nil {
+		return false
+	}
+	l.deferredRetirementMu.RLock()
+	enabled := l.deferSeedRetirements
+	l.deferredRetirementMu.RUnlock()
+	return enabled
 }
 
 // orphanedGenerations re-derives, from the catalog, the generations no one is
@@ -2319,6 +3302,11 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 		out = append(out, row.GenerationID)
 	}
 
+	// A dedicated base is decided on its chain rather than on a route or a
+	// coordinator, so the two scans below hand it here instead of judging it.
+	// See dedicatedChainRetirementCandidates.
+	var dedicated []store_sqlite.ViewGeneration
+
 	const retirementScanPageSize = 512
 
 	// The states a supersede, a failed publish or an interrupted retire leaves
@@ -2340,6 +3328,10 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 			break
 		}
 		for _, row := range discarded {
+			if dedicatedBaseGenerationRow(row) {
+				dedicated = append(dedicated, row)
+				continue
+			}
 			if _, live := served[row.CheckoutID]; live {
 				continue
 			}
@@ -2357,7 +3349,7 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 	// deliberate: healthy or still-referenced rows must not pin older orphaned
 	// generations behind the catalog listing bound.
 	const abandonedBuildingGrace = time.Minute
-	abandonedBuildingBefore := l.now().Add(-abandonedBuildingGrace).Unix()
+	abandonedBuildingBefore := l.clock().Add(-abandonedBuildingGrace).Unix()
 	scanRetirementState := func(state store_sqlite.ViewGenerationState, label string) {
 		var beforeGenerationID int64
 		for {
@@ -2432,6 +3424,16 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 			l.logger.Debug("checkout lifecycle: could not scan checkout layers", zap.Error(scanErr))
 			break
 		}
+		// A dedicated base carries the same owner kind as a checkout layer, so
+		// this cohort holds both. Take the bases out before the route pass:
+		// routes name commit and dirty generations only, so a route lookup can
+		// say nothing about a base, and the coordinator whose liveness the pass
+		// defers to does not own one either — the publisher does.
+		for _, row := range layers {
+			if dedicatedBaseGenerationRow(row) {
+				dedicated = append(dedicated, row)
+			}
+		}
 		candidates, routeErr := readyLayerRetirementCandidates(
 			ctx, layers, served, routes, l.catalog.GetCheckoutRoutes,
 		)
@@ -2448,6 +3450,10 @@ func (l *CheckoutLifecycle) orphanedGenerations(
 			break
 		}
 		layerBeforeGenerationID = layers[len(layers)-1].GenerationID
+	}
+
+	for _, row := range l.dedicatedChainRetirementCandidates(ctx, dedicated) {
+		collect(row)
 	}
 	return out
 }
@@ -2516,6 +3522,310 @@ func readyLayerRetirementCandidates(
 	return candidates, nil
 }
 
+// DedicatedBaseGenerationKind is the generation kind a dedicated graph's
+// committed base carries. The builders spell it as a literal
+// (builder_dedicated_claimed.go, builder_dedicated_delta.go) and so does the
+// catalog; it is named here because the retirement sweep has to tell a base
+// apart from the commit and dirty layers that share its owner kind —
+// checkoutLayerOwnerKind IS "dedicated_graph", so owner kind alone cannot.
+const DedicatedBaseGenerationKind = "dedicated"
+
+const (
+	// defaultSupersededDedicatedChainRetention is how many replaced chains per
+	// graph survive the sweep when nothing configures a window.
+	defaultSupersededDedicatedChainRetention = 2
+	// maxDedicatedChainAncestry bounds one chain walk. It matches the catalog's
+	// hard ancestry limit, which no published chain can exceed, so reaching it
+	// means the walk is following something the protocol cannot have built.
+	maxDedicatedChainAncestry = 64
+	// maxDedicatedChainRetirementCandidates bounds what one sweep offers. A
+	// database carrying a long-leaked backlog drains over several passes rather
+	// than in one unbounded one; ordering is newest-first, which is the only
+	// order a chain can be collected in anyway.
+	maxDedicatedChainRetirementCandidates = 256
+)
+
+// dedicatedBaseGenerationRow reports a dedicated graph's committed base.
+func dedicatedBaseGenerationRow(row store_sqlite.ViewGeneration) bool {
+	return row.GenerationID > 0 && row.GraphID != "" &&
+		row.OwnerKind == checkoutLayerOwnerKind &&
+		row.GenerationKind == DedicatedBaseGenerationKind
+}
+
+func (l *CheckoutLifecycle) supersededChainRetentionWindow() int {
+	switch {
+	case l.supersededChainRetention > 0:
+		return l.supersededChainRetention
+	case l.supersededChainRetention < 0:
+		return 0
+	default:
+		return defaultSupersededDedicatedChainRetention
+	}
+}
+
+// dedicatedChainRetirementCandidates decides which of a dedicated graph's bases
+// nothing is left to read.
+//
+// A base is not decided the way a checkout layer is. No route names one — a
+// route points at commit and dirty generations — and no coordinator owns one;
+// the publisher does, and the graph's active pointer is what says which base is
+// current. So the two scans that feed this hand their dedicated rows over
+// undecided, and the decision is made on the chain instead: everything the
+// active pointer still composes is retained, a small window of the most
+// recently replaced chains is retained beside it so a revert can re-adopt
+// rather than rebuild, and what is left is offered. A graph whose row has been
+// deleted has no active pointer and nothing left to revert into, so it retains
+// nothing at all.
+//
+// Offered is not collected. Every candidate still goes through
+// RetirePayloadGeneration, so a generation a dependent's layer still names as
+// its base, one a lease is holding open, and one a publication attempt is still
+// bound to are each refused there and re-offered on the next sweep. This pass
+// decides only what is worth asking about, which is what keeps the ancestry of
+// the live chain — always ready, always referenced — out of the sweep entirely
+// instead of being refused on every pass forever.
+//
+// The dependent pin makes that last sentence load-bearing rather than
+// incidental. A dependent in the committed regime STAYS on the base it was
+// built against while the family advances past it
+// (CheckoutCoordinator.pinRoutedBase), so a replaced base outside the
+// retention window is now routinely still referenced — by a live checkout's
+// own delta, deliberately and indefinitely. Offering it every pass would be
+// exactly the "refused on every pass forever" this pass exists to avoid, and
+// it would never collect the payload either. So a pinned base is retained like
+// the live chain, and the pin is asked for back instead: the holders are
+// signalled (RequestBaseRelease), they recompose over the current base in one
+// compare-and-set, and the generation is collectable on a later pass.
+// Recomposition therefore happens only when the base must go, and always
+// BEFORE it goes.
+func (l *CheckoutLifecycle) dedicatedChainRetirementCandidates(
+	ctx context.Context,
+	rows []store_sqlite.ViewGeneration,
+) []store_sqlite.ViewGeneration {
+	if l == nil || l.catalog == nil || len(rows) == 0 {
+		return nil
+	}
+	pins := l.pinnedDedicatedBases()
+	defer pins.requestRelease(l)
+	byID := make(map[int64]store_sqlite.ViewGeneration, len(rows))
+	byGraph := map[string][]store_sqlite.ViewGeneration{}
+	graphs := make([]string, 0, 4)
+	for _, row := range rows {
+		if !dedicatedBaseGenerationRow(row) {
+			continue
+		}
+		if _, duplicate := byID[row.GenerationID]; duplicate {
+			continue
+		}
+		byID[row.GenerationID] = row
+		if _, known := byGraph[row.GraphID]; !known {
+			graphs = append(graphs, row.GraphID)
+		}
+		byGraph[row.GraphID] = append(byGraph[row.GraphID], row)
+	}
+	var out []store_sqlite.ViewGeneration
+	for _, graphID := range graphs {
+		out = append(out, l.dedicatedGraphRetirementCandidates(ctx, graphID, byGraph[graphID], byID, pins)...)
+		if len(out) >= maxDedicatedChainRetirementCandidates {
+			return out[:maxDedicatedChainRetirementCandidates]
+		}
+	}
+	return out
+}
+
+// basePinRegistry is what the live coordinators' routes are holding: which
+// replaced committed bases are still composed under a served checkout, and who
+// to ask when one of them has to go.
+//
+// It is a snapshot, taken once per sweep. Both ways of being out of date are
+// safe — see CheckoutCoordinator.basePinned — because it only ever RETAINS a
+// candidate and asks for it back. Nothing here is delete authorization; the
+// catalog's own reference guard remains the authority.
+type basePinRegistry struct {
+	holders map[int64][]*CheckoutCoordinator
+	release map[int64][]*CheckoutCoordinator
+	reasons map[int64]string
+}
+
+// pinnedDedicatedBases snapshots the base every live coordinator's route is
+// pinned to.
+//
+// The registry snapshot is taken under coordMu and the coordinators are asked
+// outside it, as every other fan-out here does: a coordinator's own lock is not
+// this lock's to wait behind.
+func (l *CheckoutLifecycle) pinnedDedicatedBases() *basePinRegistry {
+	pins := &basePinRegistry{holders: map[int64][]*CheckoutCoordinator{}}
+	if l == nil {
+		return pins
+	}
+	l.coordMu.Lock()
+	coordinators := make([]*CheckoutCoordinator, 0, len(l.coordinators))
+	for _, coordinator := range l.coordinators {
+		if coordinator != nil {
+			coordinators = append(coordinators, coordinator)
+		}
+	}
+	l.coordMu.Unlock()
+	for _, coordinator := range coordinators {
+		if generationID := coordinator.PinnedBaseGeneration(); generationID > 0 {
+			pins.holders[generationID] = append(pins.holders[generationID], coordinator)
+		}
+	}
+	return pins
+}
+
+// pinned reports whether a live route is composed over this generation, and
+// records that the pass wanted to offer it: a base the retention window no
+// longer covers is one the holders have to be asked to release.
+func (p *basePinRegistry) pinned(row store_sqlite.ViewGeneration, reason string) bool {
+	if p == nil {
+		return false
+	}
+	holders := p.holders[row.GenerationID]
+	if len(holders) == 0 {
+		return false
+	}
+	if p.release == nil {
+		p.release = map[int64][]*CheckoutCoordinator{}
+		p.reasons = map[int64]string{}
+	}
+	if _, asked := p.release[row.GenerationID]; !asked {
+		p.release[row.GenerationID] = holders
+		p.reasons[row.GenerationID] = reason
+	}
+	return true
+}
+
+// requestRelease asks every holder of a base this pass would have offered to
+// recompose off it. It runs after the decision, outside coordMu, and it makes
+// no catalog write: the recomposition is the coordinator's own next cycle, and
+// the generation is collected by a later sweep once the pin is gone.
+func (p *basePinRegistry) requestRelease(l *CheckoutLifecycle) {
+	if p == nil || l == nil || len(p.release) == 0 {
+		return
+	}
+	for generationID, holders := range p.release {
+		asked := 0
+		for _, coordinator := range holders {
+			if coordinator.RequestBaseRelease(generationID, p.reasons[generationID]) {
+				asked++
+			}
+		}
+		l.logger.Debug("checkout lifecycle: asked dependents to release a replaced committed base",
+			zap.Int64("generation", generationID),
+			zap.Int("holders", len(holders)), zap.Int("asked", asked))
+	}
+}
+
+// dedicatedGraphRetirementCandidates decides one graph's bases.
+func (l *CheckoutLifecycle) dedicatedGraphRetirementCandidates(
+	ctx context.Context,
+	graphID string,
+	rows []store_sqlite.ViewGeneration,
+	byID map[int64]store_sqlite.ViewGeneration,
+	pins *basePinRegistry,
+) []store_sqlite.ViewGeneration {
+	graph, found, err := l.catalog.GetDedicatedGraph(ctx, graphID)
+	if err != nil {
+		// A failed read is not evidence that the graph has no live chain. Leave
+		// this graph's bases alone; a later sweep can retry it.
+		l.logger.Debug("checkout lifecycle: could not read dedicated graph for retirement",
+			zap.String("graph_id", graphID), zap.Error(err))
+		return nil
+	}
+	retained := make(map[int64]struct{}, len(rows))
+	window := l.supersededChainRetentionWindow()
+	if found {
+		l.walkDedicatedChain(ctx, graph.ActiveGenerationID, byID, retained)
+	} else {
+		// The graph row is gone: there is no active pointer to compose these
+		// bases into anything, and no revert can re-adopt one, so the whole
+		// reason the window exists is void. Retain nothing. The MissingGraph
+		// scan cannot be relied on to have collected them either — it filters
+		// to ready rows, and a superseded base is exactly what this pass
+		// produces — so every one of them reaches retirement only here.
+		// Offering is still not collecting: RetirePayloadGeneration's reference
+		// predicate remains the authority, so a base a lease or a dependent's
+		// route is still holding is refused there and re-offered later.
+		window = 0
+	}
+	// Newest first: the window keeps the most recently replaced heads, and a
+	// chain can only ever be collected child before parent.
+	sort.Slice(rows, func(i, j int) bool { return rows[i].GenerationID > rows[j].GenerationID })
+	kept := 0
+	for _, row := range rows {
+		if kept >= window {
+			break
+		}
+		if row.State != store_sqlite.ViewGenerationSuperseded {
+			continue
+		}
+		if _, live := retained[row.GenerationID]; live {
+			continue
+		}
+		kept++
+		l.walkDedicatedChain(ctx, row.GenerationID, byID, retained)
+	}
+	out := make([]store_sqlite.ViewGeneration, 0, len(rows))
+	for _, row := range rows {
+		if row.State == store_sqlite.ViewGenerationRetiring {
+			// Its fence is already committed, so the decision was taken on an
+			// earlier pass and what is left is to finish it.
+			out = append(out, row)
+			continue
+		}
+		if _, keep := retained[row.GenerationID]; keep {
+			continue
+		}
+		// A base a live checkout's routed delta is still composed over (the
+		// dependent pin) is retained rather than offered, and its holders are
+		// asked to recompose off it. Retaining its chain too: the pinned
+		// generation's own ancestors are what the dependent's view composes,
+		// so offering one of them would be offering a piece of a stack that
+		// is being read right now.
+		if pins.pinned(row, fmt.Sprintf(
+			"the committed base %d this checkout is composed over is past the retention window",
+			row.GenerationID)) {
+			l.walkDedicatedChain(ctx, row.GenerationID, byID, retained)
+			continue
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// walkDedicatedChain adds a generation and everything under it to into.
+//
+// The rows the sweep already listed answer almost every hop, so a chain the
+// active pointer names normally costs no query at all; a hop that is not among
+// them is read once and cached for the rest of the pass. An id is marked before
+// its row is read, so a row that cannot be read is retained rather than
+// offered: failing to prove a generation is unreachable is not evidence that it
+// is.
+func (l *CheckoutLifecycle) walkDedicatedChain(
+	ctx context.Context,
+	id int64,
+	byID map[int64]store_sqlite.ViewGeneration,
+	into map[int64]struct{},
+) {
+	for depth := 0; id > 0 && depth < maxDedicatedChainAncestry; depth++ {
+		if _, walked := into[id]; walked {
+			return
+		}
+		into[id] = struct{}{}
+		row, cached := byID[id]
+		if !cached {
+			fetched, found, err := l.catalog.GetViewGeneration(ctx, id)
+			if err != nil || !found {
+				return
+			}
+			row = fetched
+			byID[id] = row
+		}
+		id = row.BaseGenerationID
+	}
+}
+
 // --- startup ------------------------------------------------------------
 
 // Seed brings the catalog in line with what the daemon already tracks.
@@ -2536,23 +3846,98 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	if l == nil {
 		return nil
 	}
+	logger := l.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	configuredRepos := 0
+	if l.cfgMgr != nil {
+		configuredRepos = len(l.cfgMgr.Global().Repos)
+	}
+	seedStarted := time.Now()
+	logger.Info("checkout lifecycle seed started",
+		zap.Int("configured_repositories", configuredRepos),
+		zap.Int("gomaxprocs", runtime.GOMAXPROCS(0)),
+		zap.Int("num_cpu", runtime.NumCPU()))
+	var seedErr error
+	seededFamilies := 0
+	defer func() {
+		fields := []zap.Field{
+			zap.Duration("elapsed", time.Since(seedStarted)),
+			zap.Int("configured_repositories", configuredRepos),
+			zap.Int("seeded_families", seededFamilies),
+		}
+		if seedErr != nil {
+			fields = append(fields, zap.String("outcome", "error"), zap.Error(seedErr))
+		} else {
+			fields = append(fields, zap.String("outcome", "success"))
+		}
+		logger.Info("checkout lifecycle seed completed", fields...)
+	}()
+	stageStarted := func(stage string, fields ...zap.Field) time.Time {
+		started := time.Now()
+		fields = append(fields, zap.String("stage", stage))
+		logger.Info("checkout lifecycle seed stage started", fields...)
+		return started
+	}
+	stageCompleted := func(stage string, started time.Time, stageErr error, fields ...zap.Field) {
+		outcome := "success"
+		if stageErr != nil {
+			outcome = "error"
+			fields = append(fields, zap.Error(stageErr))
+		}
+		fields = append(fields,
+			zap.String("stage", stage),
+			zap.Duration("elapsed", time.Since(started)),
+			zap.String("outcome", outcome))
+		logger.Info("checkout lifecycle seed stage completed", fields...)
+	}
+
 	if l.rec == nil {
-		l.sweepRetirements(ctx)
+		if l.deferredSeedRetirementsEnabled() {
+			started := stageStarted("defer_retirements")
+			stageCompleted("defer_retirements", started, nil,
+				zap.String("resume", "post_ready_retirement_worker"))
+		} else {
+			started := stageStarted("sweep_retirements")
+			retired := l.sweepRetirements(ctx)
+			stageCompleted("sweep_retirements", started, nil, zap.Int("retired_generations", retired))
+		}
 		return nil
 	}
 	var errs []error
+	started := stageStarted("restore_repository_admissions")
+	if err := l.restoreRepositoryAdmissions(ctx); err != nil {
+		stageCompleted("restore_repository_admissions", started, err)
+		seedErr = fmt.Errorf("restore repository cleanup admissions: %w", err)
+		return seedErr
+	}
+	stageCompleted("restore_repository_admissions", started, nil)
 
 	// Finish cleanup that committed before a crash before reading config. A
 	// demotion may have flipped modes and journalled graph retirement while its
 	// stale config entry was still on disk; seeding that entry first would
 	// recreate the intent and graph the cleanup is about to remove.
+	started = stageStarted("resume_reconciler")
 	if err := l.rec.Resume(ctx); err != nil {
+		stageCompleted("resume_reconciler", started, err)
 		errs = append(errs, err)
+	} else {
+		stageCompleted("resume_reconciler", started, nil)
 	}
 	// A crash can leave a populated generation in building state before any
-	// cleanup journal exists. Drain prior-process residue during boot instead
-	// of leaving it for the hourly janitor.
-	l.sweepRetirements(ctx)
+	// cleanup journal exists. Daemons install a post-ready worker before opting
+	// out of this synchronous pass; every other caller retains the original Seed
+	// contract and leaves no retirement backlog behind.
+	if l.deferredSeedRetirementsEnabled() {
+		started = stageStarted("defer_retirements")
+		stageCompleted("defer_retirements", started, nil,
+			zap.String("resume", "post_ready_retirement_worker"))
+	} else {
+		started = stageStarted("sweep_retirements")
+		retired := l.sweepRetirements(ctx)
+		stageCompleted("sweep_retirements", started, nil, zap.Int("retired_generations", retired))
+	}
 
 	seeded := map[string]string{}
 	if l.cfgMgr != nil {
@@ -2568,7 +3953,15 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 			if prefix == "" {
 				continue
 			}
+			if l.RepositoryAdmissionClosed(prefix) {
+				continue // Durable cleanup owns this stale configuration entry.
+			}
+			started = stageStarted("record_checkout", zap.String("prefix", prefix))
 			identity, err := l.recordCheckout(ctx, prefix, abs, TrackSourceConfig, true)
+			stageCompleted("record_checkout", started, err,
+				zap.String("prefix", prefix),
+				zap.String("family", identity.familyID),
+				zap.String("checkout", identity.checkoutID))
 			if err != nil {
 				errs = append(errs, fmt.Errorf("seed %s: %w", abs, err))
 			}
@@ -2579,18 +3972,49 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 			}
 		}
 	}
+	seededFamilies = len(seeded)
+	started = stageStarted("resume_mode_transitions")
 	if err := l.resumeModeTransitions(ctx); err != nil {
+		stageCompleted("resume_mode_transitions", started, err)
 		errs = append(errs, err)
+	} else {
+		stageCompleted("resume_mode_transitions", started, nil)
 	}
 	// The seeded families are reconciled once here rather than at the janitor's
 	// first tick, so a restart resumes each routed worktree's coordinator within
 	// the boot rather than within the hour. An automatic worktree that was not
 	// being served stays dormant until it is selected again — its route is what
 	// marks it worth resuming across the restart.
-	for familyID, probeDir := range seeded {
-		l.reconcileFamilyNow(ctx, familyID, probeDir)
+	// Once per daemon start, every registered checkout's index is checked for
+	// the racily clean state and healed in the background (dormant checkouts
+	// included; see healFamilyRacyIndexes).
+	for familyID := range seeded {
+		go l.healFamilyRacyIndexes(context.WithoutCancel(ctx), familyID)
 	}
-	return errors.Join(errs...)
+	for familyID, probeDir := range seeded {
+		familyStarted := stageStarted("reconcile_family", zap.String("family", familyID))
+		reconcileStarted := stageStarted("reconcile_family_catalog", zap.String("family", familyID))
+		baseline := l.repoSetFingerprint()
+		report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, probeDir))
+		stageCompleted("reconcile_family_catalog", reconcileStarted, err, zap.String("family", familyID))
+		if err != nil {
+			logger.Debug("checkout lifecycle: could not reconcile the family",
+				zap.String("family", familyID), zap.Error(err))
+			stageCompleted("reconcile_family", familyStarted, err, zap.String("family", familyID))
+			continue
+		}
+		applyStarted := stageStarted("apply_coordinators", zap.String("family", familyID))
+		l.applyCoordinators(ctx, report)
+		stageCompleted("apply_coordinators", applyStarted, nil, zap.String("family", familyID))
+		l.scheduleFamilyRetry(report)
+		if familyReportRemoved(report) {
+			l.saveConfig("reconcile")
+			l.notifyFamilyChanged(baseline)
+		}
+		stageCompleted("reconcile_family", familyStarted, nil, zap.String("family", familyID))
+	}
+	seedErr = errors.Join(errs...)
+	return seedErr
 }
 
 // --- cleanup hooks ------------------------------------------------------
@@ -2625,32 +4049,68 @@ func (h cleanupHooks) PurgeCheckoutLayers(ctx context.Context, checkoutID, _ str
 // that path established: detach the watcher before evicting, so a late
 // filesystem event cannot re-index files whose nodes are already gone.
 func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
-	row, ok, err := h.l.catalog.GetDedicatedGraph(ctx, graphID)
-	if err != nil {
-		return err
+	// Read BEFORE the release: once the registry stops serving the prefix its
+	// workspace is unreadable, and the cohort consumers that just lost a member
+	// would then never be told. Read here rather than inside
+	// releaseRepositoryGraph because the saga's hooks are where this lifecycle
+	// states its side effects; the cleanup step itself stays a pure teardown.
+	prefix, workspaceID, served, subjectErr := h.l.cohortSubjectForGraph(ctx, graphID)
+	err := h.l.releaseRepositoryGraph(ctx, graphID)
+	switch {
+	case subjectErr != nil:
+		// The catalog could not say WHICH repository this graph held, so the
+		// consumers that just lost a member cannot be named. Only two answers
+		// are available, and neither is "do nothing quietly": leave every
+		// cached cohort certifying a repository that has just been released —
+		// a freshness claim that has stopped being true and that nothing else
+		// would ever retract — or make every live consumer describe once more.
+		// The second is a bounded cost on a path a repository takes once, so
+		// it is the one taken, and it is stated rather than swallowed.
+		h.l.logger.Warn("checkout lifecycle: could not read which repository a released "+
+			"graph held; invalidating every cached dependency cohort instead",
+			zap.String("graph", graphID), zap.Error(subjectErr))
+		h.l.invalidateAllDependencyCohorts("repository graph released; its subject could not be read")
+	// Marked on the DISAPPEARANCE, not on every attempt: the saga retries a
+	// release that reported work still pending, and a mark per attempt would
+	// charge every in-scope consumer a fresh description per retry.
+	case served && h.l.mi.GetMetadata(prefix) == nil:
+		h.l.invalidateDependencyCohorts(prefix, workspaceID, "repository graph released")
 	}
-	if !ok {
-		return nil
-	}
-	// The reconciler deletes the graph row after this hook returns. Capture
-	// every generation it owns while that durable ownership is still
-	// queryable; the retirement sweep runs after the graph reference is gone.
-	h.l.oweRetirement(h.l.graphGenerations(ctx, graphID)...)
-	if row.RepoPrefix == "" {
-		return nil
-	}
-	rootPath := ""
-	if row.OwnerCheckoutID != "" {
-		checkout, found, checkoutErr := h.l.catalog.GetCheckout(ctx, row.OwnerCheckoutID)
-		if checkoutErr != nil {
-			return checkoutErr
-		}
-		if found {
-			rootPath = checkout.RootPath
-		}
-	}
-	_, _, err = h.l.evictRepoChecked(ctx, row.RepoPrefix, rootPath)
 	return err
+}
+
+// cohortSubjectForGraph names the repository one dedicated graph holds and the
+// workspace its cohort consumers are scoped by, as the registry serves them
+// now. served is false when the registry does not serve the prefix, which is
+// what makes a later "the metadata is gone" reading a transition rather than a
+// restatement.
+//
+// A catalog failure is returned rather than folded into served: "this graph
+// names no repository the registry serves" and "the catalog could not be
+// asked" are different facts, and the caller acts differently on them. Folding
+// them together is what let a transient read failure suppress a teardown's
+// invalidation with nothing said anywhere.
+func (l *CheckoutLifecycle) cohortSubjectForGraph(
+	ctx context.Context, graphID string,
+) (prefix, workspaceID string, served bool, err error) {
+	if l == nil || l.catalog == nil || graphID == "" {
+		return "", "", false, nil
+	}
+	read := l.catalog.GetDedicatedGraph
+	if l.cohortGraphSubject != nil {
+		read = l.cohortGraphSubject
+	}
+	graph, found, err := read(ctx, graphID)
+	if err != nil {
+		return "", "", false, err
+	}
+	if !found || graph.RepoPrefix == "" {
+		return "", "", false, nil
+	}
+	if l.mi == nil || l.mi.GetMetadata(graph.RepoPrefix) == nil {
+		return graph.RepoPrefix, "", false, nil
+	}
+	return graph.RepoPrefix, l.workspaceForPrefix(graph.RepoPrefix), true, nil
 }
 
 // --- side effects -------------------------------------------------------
@@ -2664,6 +4124,10 @@ func (l *CheckoutLifecycle) evictRepoChecked(
 	if prefix == "" {
 		return 0, 0, nil
 	}
+	// Read BEFORE the purge: once the registry stops serving the prefix its
+	// workspace is unreadable, and the siblings that just lost a cohort member
+	// would then never be told.
+	workspaceID := l.workspaceForPrefix(prefix)
 	l.detachWatcherContext(ctx, prefix)
 	finalize := func(meta *RepoMetadata) error {
 		if l.cfgMgr == nil {
@@ -2689,6 +4153,12 @@ func (l *CheckoutLifecycle) evictRepoChecked(
 		// fails. Invalidate cached scopes now; the closed mutation lane prevents
 		// the retained config intent from retracking in this process.
 		l.notifyTrackedSetChanged()
+		// Same moment, different cache: every in-scope cohort consumer named
+		// this repository's bytes, and the ones scoped to its workspace are
+		// still running. Not coalesced with the batch above — marking costs
+		// nothing and a consumer that describes a cohort mid-batch must see the
+		// removal rather than the roster it had before it.
+		l.invalidateDependencyCohorts(prefix, workspaceID, "repository registry entry torn down")
 	}
 	return nodesRemoved, edgesRemoved, err
 }
@@ -2778,10 +4248,23 @@ func (l *CheckoutLifecycle) saveConfig(reason string) {
 // notifyTrackedSetChanged tells the query surface that the tracked set moved,
 // or records that it will have to be told once the running batch ends.
 func (l *CheckoutLifecycle) notifyTrackedSetChanged() {
+	l.notifyAnalysisScope(analysisRequest{unconditional: true})
+}
+
+// notifyFamilyChanged is notifyTrackedSetChanged for a family reconcile that
+// removed a checkout: the session scopes are invalidated at once, and the
+// graph-wide analysis reruns only if the tracked repository set moved since
+// baseline, the fingerprint taken before the reconcile.
+func (l *CheckoutLifecycle) notifyFamilyChanged(baseline string) {
+	l.notifyAnalysisScope(analysisRequest{baselines: map[string]struct{}{baseline: {}}})
+}
+
+func (l *CheckoutLifecycle) notifyAnalysisScope(req analysisRequest) {
 	l.mu.Lock()
 	notifier := l.notifier
 	if l.batchDepth > 0 {
 		l.batchPending = true
+		l.batchRequest.merge(req)
 		l.mu.Unlock()
 		return
 	}
@@ -2790,7 +4273,7 @@ func (l *CheckoutLifecycle) notifyTrackedSetChanged() {
 		return
 	}
 	notifier.InvalidateSessionScopes()
-	notifier.RunAnalysis()
+	l.requestAnalysis(req)
 }
 
 // beginBatch coalesces every fan-out until the returned function runs.
@@ -2802,12 +4285,14 @@ func (l *CheckoutLifecycle) beginBatch() func() {
 		l.mu.Lock()
 		l.batchDepth--
 		fire := l.batchDepth == 0 && l.batchPending
+		var req analysisRequest
 		if fire {
 			l.batchPending = false
+			req, l.batchRequest = l.batchRequest, analysisRequest{}
 		}
 		l.mu.Unlock()
 		if fire {
-			l.notifyTrackedSetChanged()
+			l.notifyAnalysisScope(req)
 		}
 	}
 }

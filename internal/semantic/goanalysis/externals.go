@@ -1,6 +1,7 @@
 package goanalysis
 
 import (
+	"go/ast"
 	"go/types"
 	"strings"
 
@@ -135,15 +136,20 @@ func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider,
 
 // prefetchExistingNodes collects every external symbol/module ID this repo's
 // Uses can touch and tests their existence in one batched store operation.
-// Only IDs stay resident; decoded nodes are discarded immediately.
-func (e *externalsAttribution) existingNodeIDs(pkgs []*packages.Package, objToNode map[types.Object]string) []string {
+// Only IDs stay resident; decoded nodes are discarded immediately. keep, when
+// non-nil, limits the walk to the uses it accepts (the ones the pass can
+// project).
+func (e *externalsAttribution) existingNodeIDs(pkgs []*packages.Package, objToNode map[types.Object]string, keep func(*ast.Ident) bool) []string {
 	ids := make(map[string]struct{})
 	for _, root := range pkgs {
 		if root == nil || root.TypesInfo == nil {
 			continue
 		}
-		for _, obj := range root.TypesInfo.Uses {
+		for ident, obj := range root.TypesInfo.Uses {
 			if obj == nil || obj.Pkg() == nil {
+				continue
+			}
+			if keep != nil && !keep(ident) {
 				continue
 			}
 			if _, internal := objToNode[obj]; internal {

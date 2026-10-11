@@ -2,9 +2,7 @@ package indexer
 
 import (
 	"encoding/json"
-	"os"
 	"path"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -33,6 +31,12 @@ type npmAliasIndex struct {
 	// roots maps a repo prefix to its on-disk root. Entries with an
 	// empty prefix model single-repo mode (no prefix on graph paths).
 	roots map[string]string
+	// trees answers with the manifestTree a repo root's manifests must be
+	// read out of, so a build indexing a committed snapshot reads that
+	// snapshot's package.json rather than the checkout's. A nil provider —
+	// or a nil answer — reads the working copy, which is what the live
+	// index does.
+	trees func(root string) manifestTree
 
 	mu sync.Mutex
 	// aliasCache memoises one parsed package.json: disk path → the
@@ -68,10 +72,18 @@ type packageExports struct {
 	subpaths map[string]string
 }
 
-// newNpmAliasIndex builds an index over the given repo roots. Returns
-// nil when no usable root is supplied — callers treat a nil resolver
-// as "no alias rewriting", which is the pre-feature behaviour.
+// newNpmAliasIndex builds an index over the given repo roots, reading every
+// manifest from the working copy. Returns nil when no usable root is supplied
+// — callers treat a nil resolver as "no alias rewriting", which is the
+// pre-feature behaviour.
 func newNpmAliasIndex(roots map[string]string) *npmAliasIndex {
+	return newNpmAliasIndexWithTrees(roots, nil)
+}
+
+// newNpmAliasIndexWithTrees builds an index whose manifest reads go through
+// the tree the provider returns for a repo root. A nil provider, or one that
+// answers nil, reads the working copy at that root.
+func newNpmAliasIndexWithTrees(roots map[string]string, trees func(root string) manifestTree) *npmAliasIndex {
 	usable := make(map[string]string, len(roots))
 	for prefix, root := range roots {
 		if root != "" {
@@ -83,10 +95,21 @@ func newNpmAliasIndex(roots map[string]string) *npmAliasIndex {
 	}
 	return &npmAliasIndex{
 		roots:        usable,
+		trees:        trees,
 		aliasCache:   map[string]map[string]string{},
 		depsCache:    map[string]map[string]string{},
 		exportsCache: map[string]*packageExports{},
 	}
+}
+
+// tree returns the manifest tree for one repo root.
+func (x *npmAliasIndex) tree(root string) manifestTree {
+	if x.trees != nil {
+		if t := x.trees(root); t != nil {
+			return t
+		}
+	}
+	return newDiskManifestTree(root)
 }
 
 // Resolve is the resolver.NpmAliasResolver entry point. callerFile is
@@ -128,8 +151,8 @@ func (x *npmAliasIndex) Resolve(callerFile, specifier string) string {
 	// stopping at the first package.json that declares the specifier
 	// — npm resolution honours the nearest manifest.
 	for dir := relDir; ; dir = path.Dir(dir) {
-		manifest := joinPath(root, joinRel(dir, "package.json"))
-		if real, found := x.aliasesFor(manifest)[pkgName]; found {
+		manifest := joinRel(dir, "package.json")
+		if real, found := x.aliasesFor(root, manifest)[pkgName]; found {
 			if subPath == "" {
 				return real
 			}
@@ -140,7 +163,7 @@ func (x *npmAliasIndex) Resolve(callerFile, specifier string) string {
 		// portion), resolve the sub-path through the package's declared
 		// `exports` entry points rather than treating it as a bare
 		// directory import. `pkg/feature` → `pkg/dist/feature.js`.
-		if mapped := x.exportTargetFor(manifest, pkgName, subPath); mapped != "" {
+		if mapped := x.exportTargetFor(root, manifest, pkgName, subPath); mapped != "" {
 			return pkgName + "/" + mapped
 		}
 		if dir == "." || dir == "" || dir == "/" {
@@ -151,14 +174,14 @@ func (x *npmAliasIndex) Resolve(callerFile, specifier string) string {
 
 // exportTargetFor resolves an import of `pkgName` (sub-path `subPath`,
 // "" for the package root) through the `exports` field of the
-// package.json at absPath, but only when that manifest declares
+// package.json at rel under root, but only when that manifest declares
 // `pkgName` as its own `"name"`. It returns the mapped target file
 // relative to the package root with the leading `./` stripped (so the
 // caller can splice it after `pkgName`), or "" when the manifest is a
 // different package, declares no `exports`, or maps no matching
 // sub-path.
-func (x *npmAliasIndex) exportTargetFor(absPath, pkgName, subPath string) string {
-	exp := x.exportsFor(absPath)
+func (x *npmAliasIndex) exportTargetFor(root, rel, pkgName, subPath string) string {
+	exp := x.exportsFor(root, rel)
 	if exp == nil || exp.name != pkgName {
 		return ""
 	}
@@ -197,18 +220,23 @@ func (x *npmAliasIndex) locate(callerFile string) (root, relDir string, ok bool)
 }
 
 // aliasesFor returns the npm-alias map (dependency key → real package
-// name) parsed from the package.json at absPath, reading and caching
+// name) parsed from the package.json at rel under root, reading and caching
 // it on first request. The result is never nil-returned to callers as
 // a map — a missing or alias-free manifest yields an empty map so the
 // caller's lookup is a clean miss.
-func (x *npmAliasIndex) aliasesFor(absPath string) map[string]string {
+//
+// The manifest is read out of the root's tree, so a build indexing a
+// committed snapshot resolves aliases from that snapshot's manifests.
+func (x *npmAliasIndex) aliasesFor(root, rel string) map[string]string {
+	tree := x.tree(root)
+	absPath := joinPath(root, rel)
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	if cached, seen := x.aliasCache[absPath]; seen {
 		return cached
 	}
 	var aliases map[string]string
-	if src, ok := readDiskFile(absPath); ok {
+	if src, ok := tree.readFile(rel); ok {
 		for _, spec := range modules.ParsePackageJSON(src) {
 			if spec.Ecosystem != "npm" || spec.Alias == "" {
 				continue
@@ -253,8 +281,8 @@ func (x *npmAliasIndex) DeclaresExternalDependency(callerFile, specifier string)
 		return false
 	}
 	for dir := relDir; ; dir = path.Dir(dir) {
-		manifest := joinPath(root, joinRel(dir, "package.json"))
-		if version, found := x.dependenciesFor(manifest)[pkgName]; found {
+		manifest := joinRel(dir, "package.json")
+		if version, found := x.dependenciesFor(root, manifest)[pkgName]; found {
 			return !npmSpecResolvesInRepo(version)
 		}
 		if dir == "." || dir == "" || dir == "/" {
@@ -290,7 +318,7 @@ func npmSpecResolvesInRepo(version string) bool {
 }
 
 // dependenciesFor returns the declared-dependency map (package name →
-// verbatim version spec) of the package.json at absPath, reading and
+// verbatim version spec) of the package.json at rel under root, reading and
 // caching it on first request. A nil value records "read, but no
 // dependencies / missing file" so a miss is not re-read per import edge.
 //
@@ -298,14 +326,16 @@ func npmSpecResolvesInRepo(version string) bool {
 // returns every dependencies / devDependencies / peerDependencies /
 // optionalDependencies entry, and aliasesFor discards all but the aliased
 // ones.
-func (x *npmAliasIndex) dependenciesFor(absPath string) map[string]string {
+func (x *npmAliasIndex) dependenciesFor(root, rel string) map[string]string {
+	tree := x.tree(root)
+	absPath := joinPath(root, rel)
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	if cached, seen := x.depsCache[absPath]; seen {
 		return cached
 	}
 	var deps map[string]string
-	if src, ok := readDiskFile(absPath); ok {
+	if src, ok := tree.readFile(rel); ok {
 		for _, spec := range modules.ParsePackageJSON(src) {
 			if spec.Ecosystem != "npm" || spec.Path == "" {
 				continue
@@ -321,17 +351,19 @@ func (x *npmAliasIndex) dependenciesFor(absPath string) map[string]string {
 }
 
 // exportsFor returns the parsed `exports` subpath map of the
-// package.json at absPath, reading and caching it on first request. A
+// package.json at rel under root, reading and caching it on first request. A
 // nil result records "read, but no usable `exports` field / missing
 // file" so a miss is not re-parsed on every import edge.
-func (x *npmAliasIndex) exportsFor(absPath string) *packageExports {
+func (x *npmAliasIndex) exportsFor(root, rel string) *packageExports {
+	tree := x.tree(root)
+	absPath := joinPath(root, rel)
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	if cached, seen := x.exportsCache[absPath]; seen {
 		return cached
 	}
 	var exp *packageExports
-	if src, ok := readDiskFile(absPath); ok {
+	if src, ok := tree.readFile(rel); ok {
 		exp = parsePackageExports(src)
 	}
 	x.exportsCache[absPath] = exp
@@ -563,7 +595,7 @@ func (x *npmAliasIndex) workspaceRewrite(root, relDir, specifier string) string 
 		if sub := strings.Join(segs[n:], "/"); sub != "" {
 			stem = dir + "/" + sub
 		}
-		if !workspaceFileExists(root, stem) {
+		if !x.workspaceFileExists(root, stem) {
 			return ""
 		}
 		return relativeImportSpecifier(relDir, stem)
@@ -572,17 +604,18 @@ func (x *npmAliasIndex) workspaceRewrite(root, relDir, specifier string) string 
 }
 
 // workspaceFileExists reports whether the repo-relative JS/TS module stem
-// resolves to a file on disk under root — either `stem.<ext>` or
-// `stem/index.<ext>`.
-func workspaceFileExists(root, stem string) bool {
-	abs := filepath.Join(root, filepath.FromSlash(stem))
+// resolves to a file in root's tree — either `stem.<ext>` or
+// `stem/index.<ext>`. The probe reads the same snapshot the payload does, so
+// a workspace rewrite a committed build makes is one that tree supports.
+func (x *npmAliasIndex) workspaceFileExists(root, stem string) bool {
+	tree := x.tree(root)
 	for _, ext := range []string{".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"} {
-		if fi, err := os.Stat(abs + ext); err == nil && !fi.IsDir() {
+		if tree.isFile(stem + ext) {
 			return true
 		}
 	}
 	for _, ext := range []string{".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"} {
-		if fi, err := os.Stat(filepath.Join(abs, "index"+ext)); err == nil && !fi.IsDir() {
+		if tree.isFile(joinRel(stem, "index"+ext)) {
 			return true
 		}
 	}
@@ -633,8 +666,9 @@ func (x *npmAliasIndex) workspaceNames() map[string]string {
 	}
 	names := map[string]string{}
 	for prefix, root := range x.roots {
-		for _, pkgDir := range workspacePackageDirs(root) {
-			src, ok := readDiskFile(joinPath(root, joinRel(pkgDir, "package.json")))
+		tree := x.tree(root)
+		for _, pkgDir := range workspacePackageDirs(tree) {
+			src, ok := tree.readFile(joinRel(pkgDir, "package.json"))
 			if !ok {
 				continue
 			}
@@ -658,9 +692,11 @@ func (x *npmAliasIndex) workspaceNames() map[string]string {
 // workspacePackageDirs returns the repo-relative directories of every workspace
 // package declared by the root package.json's `workspaces` field (npm/yarn
 // array form and the yarn `{ "packages": [...] }` object form), expanding each
-// glob against disk.
-func workspacePackageDirs(root string) []string {
-	src, ok := readDiskFile(joinPath(root, "package.json"))
+// glob against tree — the same snapshot the manifest itself was read from, so
+// a committed build never discovers a workspace the checkout grew after the
+// tree it indexes.
+func workspacePackageDirs(tree manifestTree) []string {
+	src, ok := tree.readFile("package.json")
 	if !ok {
 		return nil
 	}
@@ -672,20 +708,7 @@ func workspacePackageDirs(root string) []string {
 	}
 	var dirs []string
 	for _, glob := range parseWorkspacesField(m.Workspaces) {
-		matches, err := filepath.Glob(filepath.Join(root, filepath.FromSlash(glob)))
-		if err != nil {
-			continue
-		}
-		for _, abs := range matches {
-			if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
-				continue
-			}
-			rel, err := filepath.Rel(root, abs)
-			if err != nil {
-				continue
-			}
-			dirs = append(dirs, filepath.ToSlash(rel))
-		}
+		dirs = append(dirs, tree.matchDirs(glob)...)
 	}
 	return dirs
 }

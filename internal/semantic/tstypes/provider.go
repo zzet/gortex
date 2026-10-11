@@ -61,6 +61,12 @@ func (p *Provider) Close() error        { return nil }
 // languages in addition to the arbitration winner.
 func (p *Provider) Supplemental() bool { return true }
 
+// A suppressed fallback does no parsing or graph work, so it needs no
+// shared admission. Active AST passes keep ordinary build-lane admission.
+func (p *Provider) ConcurrentCheckoutPreparation(ctx context.Context, _, _ string, _ semantic.CheckoutCompilerScope, _ []string) bool {
+	return ctx.Err() == nil && p.spec.Suppressed != nil && p.spec.Suppressed()
+}
+
 // Enrich runs the full-repo pass for a single-repo (un-prefixed) graph.
 // It delegates to EnrichRepo with an empty prefix — the in-memory single
 // repo case where every real node carries RepoPrefix "".

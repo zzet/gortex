@@ -7,8 +7,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/parser"
 	"go.uber.org/zap"
 )
 
@@ -200,4 +203,132 @@ func TestAnalysisPersistenceRejectsMutationBeforePublish(t *testing.T) {
 	if server.getPageRank() != nil || server.getCommunities() != nil || server.getAdjacency() != nil {
 		t.Fatal("analysis readers served a snapshot after a later graph mutation")
 	}
+}
+
+// buildAnalysisCacheTestGraphAt seeds the same corpus buildAnalysisCacheTestGraph
+// builds, but into one payload view generation instead of the base corpus, and
+// registers its symbol rows so SearchSymbolBundles has hits at that generation.
+// It returns the owning (base) handle and the handle pinned to viewGen.
+func buildAnalysisCacheTestGraphAt(tb testing.TB, viewGen int64, nodeCount int) (base, pinned *store_sqlite.Store) {
+	tb.Helper()
+	base, err := store_sqlite.Open(tb.TempDir() + "/analysis_generation.sqlite")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	pinned = base.AtGeneration(viewGen)
+	if pinned == nil {
+		tb.Fatalf("AtGeneration(%d) returned nil", viewGen)
+	}
+	nodes := make([]*graph.Node, 0, nodeCount)
+	edges := make([]*graph.Edge, 0, nodeCount*2)
+	items := make([]graph.SymbolFTSItem, 0, nodeCount)
+	for i := 0; i < nodeCount; i++ {
+		id := fmt.Sprintf("repo::pkg%d::HandleRequest%d", i/20, i)
+		nodes = append(nodes, &graph.Node{
+			ID: id, Kind: graph.KindFunction, Name: fmt.Sprintf("HandleRequest%d", i),
+			QualName: fmt.Sprintf("pkg%d.HandleRequest%d", i/20, i),
+			FilePath: fmt.Sprintf("pkg%d/file%d.go", i/20, i%20), StartLine: i + 1, EndLine: i + 4,
+			Language: "go", RepoPrefix: "repo",
+		})
+		items = append(items, graph.SymbolFTSItem{NodeID: id, Tokens: fmt.Sprintf("handlerequest%d handler", i)})
+		if i > 0 {
+			prev := nodes[i-1].ID
+			edges = append(edges, &graph.Edge{From: prev, To: id, Kind: graph.EdgeCalls, FilePath: nodes[i-1].FilePath, Line: i + 2})
+		}
+		if i > 7 {
+			edges = append(edges, &graph.Edge{From: nodes[i-7].ID, To: id, Kind: graph.EdgeReferences, FilePath: nodes[i-7].FilePath, Line: i + 1})
+		}
+	}
+	pinned.AddBatch(nodes, edges)
+	if err := pinned.BatchUpsertSymbolFTS(items); err != nil {
+		tb.Fatalf("seed symbol fts at generation %d: %v", viewGen, err)
+	}
+	return base, pinned
+}
+
+// The analysis passes walk s.graph, so the package fingerprints they derive
+// describe THAT generation. Installing them through backendStore() — the
+// indexer's base handle — stamped the base corpus with another snapshot's
+// fingerprints and left the analysed generation permanently uncacheable, since
+// the bundle cache validates a generation's entries against its own map only.
+//
+// Revert-red: swap analysisGenerationStore() back to backendStore() and the
+// second query below recomputes, surfacing the freshly added edge.
+func TestPopulateAnalysis_InstallsBundleFingerprintsOnTheAnalysedGeneration(t *testing.T) {
+	const viewGen = int64(1)
+	base, pinned := buildAnalysisCacheTestGraphAt(t, viewGen, 80)
+	defer base.Close()
+
+	// The indexer owns the BASE handle; the server reads the routed generation.
+	// This is the divergence analysisGenerationStore() exists to correct.
+	srv := &Server{graph: pinned, indexer: newBaseHandleIndexer(base), logger: zap.NewNop()}
+	if got := srv.backendStore(); got != graph.Store(base) {
+		t.Fatalf("fixture precondition: backendStore must hand back the base handle, got %T", got)
+	}
+	if srv.analysisViewGeneration() != viewGen {
+		t.Fatalf("fixture precondition: analysis reads generation %d, want %d",
+			srv.analysisViewGeneration(), viewGen)
+	}
+
+	srv.analysisMu.Lock()
+	metrics := srv.populateAnalysisLocked()
+	srv.analysisMu.Unlock()
+	if metrics.cacheSaveErr != nil {
+		t.Fatalf("analysis generation save: %v", metrics.cacheSaveErr)
+	}
+
+	const probe = "repo::pkg0::HandleRequest3"
+	first, err := pinned.SearchSymbolBundles("handlerequest3", 4)
+	if err != nil {
+		t.Fatalf("warm bundles at generation %d: %v", viewGen, err)
+	}
+	warm, ok := bundlesByNodeID(first)[probe]
+	if !ok {
+		t.Fatalf("generation %d query returned no bundle for %s", viewGen, probe)
+	}
+	warmEdges := len(warm.OutEdges)
+
+	// Add an out-edge WITHOUT re-running the analysis: a cached bundle still
+	// reports warmEdges, an uncacheable generation recomputes and reports more.
+	// This is the hit probe, not a licence to serve stale bundles — under the
+	// cache's contract a producer that changes a package's content moves that
+	// package's fingerprint, and the probe works precisely because it skips the
+	// analysis pass that would have moved it.
+	const addedID = "repo::pkg0::AddedAfterAnalysis"
+	pinned.AddNode(&graph.Node{
+		ID: addedID, Kind: graph.KindFunction, Name: "AddedAfterAnalysis",
+		FilePath: "pkg0/file3.go", Language: "go", RepoPrefix: "repo",
+	})
+	pinned.AddEdge(&graph.Edge{
+		From: probe, To: addedID, Kind: graph.EdgeCalls, FilePath: "pkg0/file3.go",
+	})
+
+	second, err := pinned.SearchSymbolBundles("handlerequest3", 4)
+	if err != nil {
+		t.Fatalf("second bundles at generation %d: %v", viewGen, err)
+	}
+	got, ok := bundlesByNodeID(second)[probe]
+	if !ok {
+		t.Fatalf("generation %d re-query returned no bundle for %s", viewGen, probe)
+	}
+	if len(got.OutEdges) != warmEdges {
+		t.Fatalf("the analysed generation was never made cacheable — its fingerprints went to another handle: out-edges %d, want the cached %d",
+			len(got.OutEdges), warmEdges)
+	}
+}
+
+func bundlesByNodeID(bundles []graph.SymbolBundle) map[string]graph.SymbolBundle {
+	out := make(map[string]graph.SymbolBundle, len(bundles))
+	for _, b := range bundles {
+		if b.Node != nil {
+			out[b.Node.ID] = b
+		}
+	}
+	return out
+}
+
+// newBaseHandleIndexer builds the minimal indexer the server needs for
+// backendStore() to hand back the base handle rather than s.graph.
+func newBaseHandleIndexer(base *store_sqlite.Store) *indexer.Indexer {
+	return indexer.New(base, parser.NewRegistry(), config.IndexConfig{}, zap.NewNop())
 }

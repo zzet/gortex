@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/savings"
 	"github.com/zzet/gortex/internal/search"
@@ -291,4 +292,146 @@ func TestTokenStatsCreditFile(t *testing.T) {
 		full.creditedFiles[fmt.Sprintf("/f/%d.go", i)] = struct{}{}
 	}
 	require.False(t, full.creditFile("/f/overflow.go"), "a saturated set stops crediting rather than growing")
+}
+
+// The production entrypoint, end to end: a read-only tool call arriving over
+// the MCP surface must not cost a durable sidecar transaction just to book
+// its own accounting. Before this, server.record() -> savings.AddObservation
+// -> SidecarStore.AddSavingsObservation opened, wrote and committed one
+// transaction (~37 KB of sidecar WAL) per call, which made an idle agent
+// session the dominant writer on the machine. The calls must now buffer, and
+// the shutdown path (Server.FlushSavings, registered in the serverstack
+// teardown chain) must be what persists them — in ONE transaction.
+func TestReadOnlyToolCallsCoalesceIntoOneLedgerTransaction(t *testing.T) {
+	srv, _, _ := newRetrievalSavingsServer(t, 4)
+
+	// A sidecar-backed ledger: the in-memory store the fixture wires has no
+	// transactions to count.
+	path := filepath.Join(t.TempDir(), "sidecar.sqlite")
+	store, err := savings.Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	srv.InitSavings(store, "")
+
+	// OpenSidecar returns the process-cached handle for this path, i.e. the
+	// very store the ledger writes through.
+	sc, err := persistence.OpenSidecar(path)
+	require.NoError(t, err)
+	before := sc.SavingsCommitCount()
+
+	const calls = 6
+	for i := range calls {
+		ctx := WithSessionID(context.Background(), fmt.Sprintf("agent-%d", i))
+		res := callToolByName(t, srv, ctx, "search", map[string]any{
+			"operation": "symbols", "query": "Widget",
+		})
+		require.False(t, res.IsError, "search.symbols must succeed: %s", textOfResult(t, res))
+	}
+
+	require.Equal(t, int64(0), sc.SavingsCommitCount()-before,
+		"%d read-only tool calls must open no sidecar transaction", calls)
+	pending := store.Pending()
+	require.GreaterOrEqual(t, pending, calls,
+		"every recorded call must be buffered, not dropped")
+
+	require.NoError(t, srv.FlushSavings())
+	require.Equal(t, int64(1), sc.SavingsCommitCount()-before,
+		"the whole window must commit as exactly one transaction")
+	require.Equal(t, 0, store.Pending())
+
+	snap, err := store.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, int64(pending), snap.Totals.CallsCounted,
+		"the flushed totals must account for every buffered observation")
+	require.Greater(t, ledgerByTool(t, store)["search_symbols"], int64(0),
+		"the per-tool breakdown must survive coalescing")
+}
+
+// Exactness through the reader the dashboard uses: graph_stats renders
+// cumulativeSavingsSnapshot, which reads the ledger through the same store.
+// Buffering must be invisible to it — no flush call in between.
+func TestCumulativeSavingsSnapshotIsExactWithoutAnExplicitFlush(t *testing.T) {
+	srv, _, _ := newRetrievalSavingsServer(t, 3)
+	path := filepath.Join(t.TempDir(), "sidecar.sqlite")
+	store, err := savings.Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	srv.InitSavings(store, "")
+
+	ctx := WithSessionID(context.Background(), "agent-stats")
+	res := callToolByName(t, srv, ctx, "search", map[string]any{"operation": "symbols", "query": "Widget"})
+	require.False(t, res.IsError, "search.symbols must succeed: %s", textOfResult(t, res))
+	require.Greater(t, store.Pending(), 0, "precondition: the observation is still buffered")
+
+	out := srv.cumulativeSavingsSnapshot()
+	require.NotNil(t, out)
+	require.Greater(t, out["calls_counted"].(int64), int64(0),
+		"graph_stats must see buffered observations — a read flushes first")
+	require.Greater(t, out["tokens_saved"].(int64), int64(0))
+}
+
+// --- the flush window is settable from the entry point --------------------
+
+// The daemon's minute-scale coalescing is wrong for the one-shot stdio
+// server, whose host SIGKILLs it. Server.SetSavingsFlushBounds is the seam
+// `gortex mcp` uses to tighten it; it has to reach the ledger, and the
+// tightened count bound has to govern the real recording path, not just the
+// stored field.
+func TestSetSavingsFlushBoundsReachesTheLedgerAndBoundsRealCalls(t *testing.T) {
+	srv, _, _ := newRetrievalSavingsServer(t, 3)
+	path := filepath.Join(t.TempDir(), "sidecar.sqlite")
+	store, err := savings.Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	srv.InitSavings(store, "")
+
+	every, max := store.FlushBounds()
+	require.Equal(t, savings.DefaultFlushInterval, every, "precondition: the daemon default")
+	require.Equal(t, savings.DefaultFlushMax, max)
+
+	srv.SetSavingsFlushBounds(savings.OneshotFlushInterval, 2)
+	every, max = store.FlushBounds()
+	require.Equal(t, savings.OneshotFlushInterval, every,
+		"the entry point's interval must reach the ledger")
+	require.Equal(t, 2, max)
+	require.Less(t, savings.OneshotFlushInterval, savings.DefaultFlushInterval,
+		"the one-shot window must be shorter than the daemon's")
+
+	sc, err := persistence.OpenSidecar(path)
+	require.NoError(t, err)
+	before := sc.SavingsCommitCount()
+
+	for i := range 3 {
+		ctx := WithSessionID(context.Background(), fmt.Sprintf("oneshot-%d", i))
+		res := callToolByName(t, srv, ctx, "search", map[string]any{"operation": "symbols", "query": "Widget"})
+		require.False(t, res.IsError, "search.symbols must succeed: %s", textOfResult(t, res))
+	}
+	require.GreaterOrEqual(t, sc.SavingsCommitCount()-before, int64(1),
+		"the tightened count bound must commit inside the session, not only at shutdown")
+	require.LessOrEqual(t, store.Pending(), 2,
+		"no more than the count bound may stay exposed to a SIGKILL")
+
+	require.NoError(t, srv.FlushSavings())
+	snap, err := store.Snapshot()
+	require.NoError(t, err)
+	require.Equal(t, int64(3), snap.Totals.CallsCounted,
+		"every call must be accounted for across the bounded windows")
+	require.Zero(t, snap.DroppedObservations)
+}
+
+// Deferrable blind: the entry point calls this before it knows whether the
+// stack wired a sidecar-backed ledger at all. An in-memory ledger (the
+// fixture's, and every embedded/eval server's) buffers nothing and has no
+// bounds to set, so both calls must be quiet no-ops rather than panics.
+func TestSetSavingsFlushBoundsOnAnInMemoryLedgerIsANoOp(t *testing.T) {
+	srv, store, _ := newRetrievalSavingsServer(t, 1)
+	every, max := store.FlushBounds()
+	require.Zero(t, every, "precondition: an in-memory ledger has no flush window")
+	require.Zero(t, max)
+
+	srv.SetSavingsFlushBounds(savings.OneshotFlushInterval, savings.OneshotFlushMax)
+	every, max = store.FlushBounds()
+	require.Zero(t, every, "an in-memory ledger must not acquire a window")
+	require.Zero(t, max)
+	require.NoError(t, srv.FlushSavings())
 }

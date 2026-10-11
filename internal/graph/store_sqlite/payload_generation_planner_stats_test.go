@@ -13,11 +13,18 @@ import (
 // step — the lead's store reached 1.69M nodes across 16 generations while its
 // statistics still described the 592k of the cold load that created it.
 //
-// The check runs at the END of PublishAndRoute, after the route flip, and not
+// The boundary is at the END of PublishAndRoute, after the route flip, and not
 // at the publish tail. Between the publish and the flip the generation is
 // ready but unrouted, and a tens-of-seconds ANALYZE holding the write gate
 // inside that window would widen a documented transient state and stall the
 // checkout coordinator waiting behind it.
+//
+// The refresh is SCHEDULED at that boundary, not run there: sqlite_stat1 is one
+// table for one database file, so the maintenance lane owns it and no
+// generation's publish is charged for it. This case therefore settles the lane
+// before reading the health back — that the publish still owes the refresh is
+// the half of the contract it pins, and TestPublishAndRoute_PaysNoMaintenanceInsideItsWindow
+// pins the other half.
 //
 // Completing at all is half the assertion: PublishAndRoute drains the payload
 // writers by taking and releasing the write gate, and the checker takes that
@@ -55,6 +62,7 @@ func TestPublishAndRoute_RefreshesPlannerStats(t *testing.T) {
 		t.Fatalf("PublishAndRoute: %v", err)
 	}
 
+	settleMaintenanceLane(t, store)
 	after := mustHealth(t, store)
 	if after.Refreshes <= before.Refreshes {
 		t.Fatalf("publishing a generation that tripled the store refreshed nothing (%d -> %d refreshes); stale=%v reason=%q",

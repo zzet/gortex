@@ -459,6 +459,7 @@ func TestSampleDirtyFingerprintSensitivity(t *testing.T) {
 	commitAll(t, repo, "add a script")
 
 	seen := map[string]string{}
+	last := ""
 	record := func(label string) {
 		t.Helper()
 		fp := sampleDirtyOK(t, repo).Fingerprint
@@ -466,6 +467,7 @@ func TestSampleDirtyFingerprintSensitivity(t *testing.T) {
 			t.Fatalf("%q fingerprints the same as %q (%s)", label, prev, fp)
 		}
 		seen[fp] = label
+		last = fp
 	}
 
 	record("clean")
@@ -477,12 +479,14 @@ func TestSampleDirtyFingerprintSensitivity(t *testing.T) {
 	record("content edit")
 
 	// Only the modification time moves here: same bytes, same length,
-	// same status. The stat evidence is what makes it visible.
+	// same status. Metadata alone must not invalidate content identity.
 	past := time.Now().Add(-2 * time.Hour)
 	if err := os.Chtimes(note, past, past); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
-	record("mtime bump alone")
+	if got := sampleDirtyOK(t, repo).Fingerprint; got != last {
+		t.Fatal("mtime-only change invalidated content identity")
+	}
 
 	writeIn(t, repo, "seed.txt", "edited\n")
 	record("tracked file edited")
@@ -490,7 +494,9 @@ func TestSampleDirtyFingerprintSensitivity(t *testing.T) {
 	// The file on disk does not move; only which side of the index the
 	// change sits on does.
 	git(t, repo, "add", "--", "seed.txt")
-	record("same edit, now staged")
+	if got := sampleDirtyOK(t, repo).Fingerprint; got != last {
+		t.Fatal("staging unchanged working-copy bytes invalidated content identity")
+	}
 
 	t.Run("mode flip", func(t *testing.T) {
 		requirePOSIXCheckout(t)

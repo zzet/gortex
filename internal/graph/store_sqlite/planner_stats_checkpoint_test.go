@@ -74,14 +74,17 @@ FROM seq`)
 	wantIndexes := []string{
 		"edges_by_from_line",
 		"edges_by_from_line_kind",
+		"edges_by_generation",
 		"edges_by_kind",
 		"nodes_by_file",
+		"nodes_by_generation",
 		"nodes_by_kind",
 		"nodes_by_name",
 		"nodes_by_repo",
 		"nodes_by_repo_kind",
 		"nodes_by_repo_language_name",
 		"nodes_go_receiver_type",
+		"nodes_stats_histogram",
 	}
 	if !reflect.DeepEqual(gotIndexes, wantIndexes) {
 		t.Fatalf("synchronous graph stats = %v, want %v", gotIndexes, wantIndexes)
@@ -98,8 +101,8 @@ FROM seq`)
 	// corpus a stats-blind planner chose that key and reread every edge owned by
 	// a hub source; the line-bearing stat must keep exact-site probes selective.
 	plan = explainPlannerQueryPlan(t, store.db,
-		`SELECT to_id FROM edges WHERE from_id = ? AND line = ? AND kind = ?`,
-		"hub", 1, "calls")
+		`SELECT to_id FROM edges WHERE from_id = ? AND line = ? AND kind = ? AND view_gen = ?`,
+		"hub", 1, "calls", baseViewGeneration)
 	if !strings.Contains(plan, "edges_by_from_line_kind") {
 		t.Fatalf("exact-site query missed edges_by_from_line_kind after stats refresh:\n%s", plan)
 	}
@@ -107,14 +110,14 @@ FROM seq`)
 	// These indexes have no competing left-prefix path. They remain selected
 	// without paying synchronous ANALYZE page counts for them.
 	plan = explainPlannerQueryPlan(t, store.db,
-		`SELECT from_id FROM edges WHERE to_id = ? AND kind = ?`,
-		"node-00001", "calls")
+		`SELECT from_id FROM edges WHERE to_id = ? AND kind = ? AND view_gen = ?`,
+		"node-00001", "calls", baseViewGeneration)
 	if !strings.Contains(plan, "edges_by_to") {
 		t.Fatalf("in-edge query missed edges_by_to without a dedicated stat:\n%s", plan)
 	}
 	plan = explainPlannerQueryPlan(t, store.db,
-		`SELECT from_id FROM edges WHERE file_path = ? AND kind = ?`,
-		"hub.go", "calls")
+		`SELECT from_id FROM edges WHERE file_path = ? AND kind = ? AND view_gen = ?`,
+		"hub.go", "calls", baseViewGeneration)
 	if !strings.Contains(plan, "edges_by_file") {
 		t.Fatalf("file-edge query missed edges_by_file without a dedicated stat:\n%s", plan)
 	}

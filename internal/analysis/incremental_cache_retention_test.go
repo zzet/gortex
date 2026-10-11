@@ -68,6 +68,6 @@ func benchmarkLeidenPartition(nodeCount int) *leidenPartition {
 		)
 	}
 	g.AddBatch(nodes, edges)
-	_, part := detectCommunitiesLeidenRaw(g, defaultLeidenOptions())
+	_, part := detectCommunitiesLeidenRaw(g, defaultLeidenOptions(), nil)
 	return part
 }

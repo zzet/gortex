@@ -183,10 +183,9 @@ func (g *Graph) FindIncomingSourcesBounded(
 	return projection, nil
 }
 
-// FindIncomingSourcesBounded composes a bounded base projection with the
-// request overlay. Base sources from overlay-owned files are hidden; current
-// overlay edges replace them. Shadow compensation is bounded by the same hard
-// detached-identity envelope used by exact-name localization.
+// FindIncomingSourcesBounded applies edge-file and independent outgoing-set
+// ownership to checked raw candidates before deduplicating source identities.
+// Unrelated nodes/masks are never scanned or charged against the query budget.
 func (v *OverlaidView) FindIncomingSourcesBounded(
 	ctx context.Context,
 	targetIDs []string,
@@ -230,134 +229,5 @@ func (v *OverlaidView) FindIncomingSourcesBounded(
 		return bounded.FindIncomingSourcesBounded(ctx, ids, kind, limit)
 	}
 
-	shadowIDs := make(map[string]struct{})
-	standardShadows := 0
-	detachedShadows := 0
-	addShadow := func(id string) error {
-		if id == "" {
-			return nil
-		}
-		if _, duplicate := shadowIDs[id]; duplicate {
-			return nil
-		}
-		shadowIDs[id] = struct{}{}
-		if v.layer.CoversNodeID(id) {
-			standardShadows++
-			if standardShadows > overlayExactNameInspectionLimit {
-				return &BoundedLocalizationLimitError{
-					Resource: "overlay incoming-source standard shadows",
-					Limit:    overlayExactNameInspectionLimit,
-				}
-			}
-			return nil
-		}
-		detachedShadows++
-		if detachedShadows > overlayDetachedShadowLimit {
-			return &BoundedLocalizationLimitError{
-				Resource: "overlay incoming-source detached shadows",
-				Limit:    overlayDetachedShadowLimit,
-			}
-		}
-		return nil
-	}
-	inspectedShadows := 0
-	for id := range v.layer.RemovedIDs() {
-		if inspectedShadows&127 == 0 {
-			if err := ctx.Err(); err != nil {
-				return BoundedIncomingSourceProjection{}, err
-			}
-		}
-		inspectedShadows++
-		if err := addShadow(id); err != nil {
-			return BoundedIncomingSourceProjection{}, err
-		}
-	}
-	for node := range v.layer.Nodes() {
-		if inspectedShadows&127 == 0 {
-			if err := ctx.Err(); err != nil {
-				return BoundedIncomingSourceProjection{}, err
-			}
-		}
-		inspectedShadows++
-		if node == nil {
-			continue
-		}
-		if err := addShadow(node.ID); err != nil {
-			return BoundedIncomingSourceProjection{}, err
-		}
-	}
-
-	baseProjection := BoundedIncomingSourceProjection{
-		Sources:   make(map[string][]string),
-		Truncated: make(map[string]bool),
-	}
-	if v.base != nil {
-		bounded, ok := v.base.(BoundedIncomingSourceReader)
-		if !ok {
-			return BoundedIncomingSourceProjection{}, ErrBoundedLocalizationUnavailable
-		}
-		var err error
-		if limit > maxBoundedIncomingSourceLimit-len(shadowIDs) {
-			return BoundedIncomingSourceProjection{}, &BoundedLocalizationLimitError{
-				Resource: "overlay incoming-source compensation",
-				Limit:    maxBoundedIncomingSourceLimit,
-			}
-		}
-		baseProjection, err = bounded.FindIncomingSourcesBounded(ctx, ids, kind, limit+len(shadowIDs))
-		if err != nil {
-			return BoundedIncomingSourceProjection{}, err
-		}
-	}
-
-	for _, targetID := range ids {
-		if err := ctx.Err(); err != nil {
-			return BoundedIncomingSourceProjection{}, err
-		}
-		targetRemoved := v.layer.IsRemovedID(targetID)
-		if (targetRemoved || v.layer.CoversNodeID(targetID)) && v.layer.NodeByID(targetID) == nil {
-			continue
-		}
-		seen := make(map[string]struct{}, limit+1)
-		for _, sourceID := range baseProjection.Sources[targetID] {
-			if _, shadowed := shadowIDs[sourceID]; shadowed || v.layer.CoversNodeID(sourceID) {
-				continue
-			}
-			seen[sourceID] = struct{}{}
-			if len(seen) > limit {
-				projection.Truncated[targetID] = true
-				break
-			}
-		}
-		if baseProjection.Truncated[targetID] || projection.Truncated[targetID] {
-			projection.Truncated[targetID] = true
-			continue
-		}
-		for index, edge := range v.layer.InEdges(targetID) {
-			if index&127 == 0 {
-				if err := ctx.Err(); err != nil {
-					return BoundedIncomingSourceProjection{}, err
-				}
-			}
-			if edge == nil || edge.Kind != kind || edge.From == "" {
-				continue
-			}
-			seen[edge.From] = struct{}{}
-			if len(seen) > limit {
-				projection.Truncated[targetID] = true
-				break
-			}
-		}
-		if projection.Truncated[targetID] {
-			continue
-		}
-		sources := make([]string, 0, len(seen))
-		for sourceID := range seen {
-			sources = append(sources, sourceID)
-		}
-		sort.Strings(sources)
-		if len(sources) > 0 {
-			projection.Sources[targetID] = sources
-		}
-	}
-	return projection, nil
+	return v.FindIncomingSourcesScoped(ctx, ids, kind, limit, IncomingSourceScope{}, nil)
 }

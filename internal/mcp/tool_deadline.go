@@ -7,13 +7,18 @@ import (
 
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // DefaultToolCallTimeout bounds how long one tool handler may occupy its
@@ -109,7 +114,7 @@ func boundHandler[Req, Res any](
 	kind, name string,
 	h func(context.Context, Req) (Res, error),
 	busy func(stuck int64, timeout time.Duration) (Res, error),
-	expired func(timeout time.Duration, note *mutationCommitNote) (Res, error),
+	expired func(timeout time.Duration, note *mutationCommitNote, retained *requestViewPin) (Res, error),
 	panicked func(recovered any) (Res, error),
 ) func(context.Context, Req) (Res, error) {
 	return func(ctx context.Context, req Req) (Res, error) {
@@ -140,6 +145,11 @@ func boundHandler[Req, Res any](
 		// there, which is the only way this frame can say what landed after it
 		// has stopped waiting for the handler.
 		callCtx, commitNote := withMutationCommitNote(callCtx)
+		// The other half of the same idea: a slot the view middleware
+		// publishes the request's materialized view into, so this frame can
+		// keep it pinned — and say what it is holding — if it ever stops
+		// waiting for the handler that is reading it.
+		callCtx, viewNote := withRetainedViewNote(callCtx)
 
 		type outcome struct {
 			res Res
@@ -183,12 +193,55 @@ func boundHandler[Req, Res any](
 				// The *caller* went away (client cancelled, or the transport's
 				// own request lifetime fired first). Report that, not a
 				// deadline we did not reach.
+				//
+				// This frame returns, but the handler goroutine does not: it
+				// is still running, still reading the view this request
+				// materialized and still inside the repositories it was
+				// admitted to — its own `defer view.close()` and the
+				// middleware's `defer scope.Release()` have not run and will
+				// not until it finally returns. That makes cancellation the
+				// same class of request-outliving work a fired deadline is,
+				// and it was the one such path with no hold and no accounting
+				// at all. Join on the cancelled handler's behalf and release
+				// when it actually exits, counted in the same handoff series
+				// under the same consumer: from the payload's point of view
+				// the two arms are one event — the firewall stopped waiting
+				// for a handler that is still reading.
+				//
+				// Exactly as symmetric with the deadline arm below as that
+				// reading implies: a call that materialized no payload joins
+				// nothing and is recorded as nothing on BOTH arms. Its
+				// repository admission is not lost by that — the middleware
+				// frame holding it is inside the handler goroutine that has
+				// not returned.
+				//
+				// abandonedToolCalls is deliberately NOT incremented here.
+				// That counter gates admission (maxAbandonedToolCalls), and a
+				// client that hangs up must not push the server towards
+				// refusing everyone else's calls; the lifetime hole is the
+				// pin, and the pin is what this fixes.
+				retained := viewNote.retain()
+				if retained != nil {
+					go func() {
+						<-done
+						retained.release()
+					}()
+				}
 				var zero Res
 				return zero, ctx.Err()
 			}
 			stuck := abandonedToolCalls.Add(1)
+			// The handler is still running and is still reading the view this
+			// request materialized — its own `defer view.close()` has not run
+			// and will not until it finally returns. Join that lease on the
+			// abandoned goroutine's behalf before this frame answers, so the
+			// pin covers the whole cancellation tail (the waiter below
+			// releases it when the goroutine actually exits) and so the
+			// answer can name what stays pinned meanwhile.
+			retained := viewNote.retain()
 			go func() {
 				<-done
+				retained.release()
 				abandonedToolCalls.Add(-1)
 			}()
 			if s != nil && s.logger != nil {
@@ -199,8 +252,167 @@ func boundHandler[Req, Res any](
 					zap.Duration("elapsed", time.Since(started)),
 					zap.Int64("abandoned_in_flight", stuck))
 			}
-			return expired(timeout, commitNote)
+			return expired(timeout, commitNote, retained)
 		}
+	}
+}
+
+// retainedViewNoteKey carries the per-call slot below.
+type retainedViewNoteKey struct{}
+
+// retainedViewNote is the channel between the view middleware and the
+// deadline firewall above it.
+//
+// The firewall owns the decision to stop waiting for a handler, but the view
+// that handler reads through is resolved *inside* it — the middleware is the
+// bounded function. Without this slot the frame that abandons a handler
+// cannot tell whether anything is still pinned, so an abandoned call silently
+// held generations nobody could account for. The middleware publishes its
+// view here; the firewall joins the lease only if it actually abandons.
+type retainedViewNote struct {
+	mu   sync.Mutex
+	view *requestView
+	// scope is the request's repository admission. It is published beside the
+	// view rather than inside it because an unrouted call materializes no view
+	// at all and still holds one.
+	scope *graphview.RepositoryReadLease
+}
+
+func withRetainedViewNote(ctx context.Context) (context.Context, *retainedViewNote) {
+	note := &retainedViewNote{}
+	return context.WithValue(ctx, retainedViewNoteKey{}, note), note
+}
+
+func retainedViewNoteFrom(ctx context.Context) *retainedViewNote {
+	if ctx == nil {
+		return nil
+	}
+	note, _ := ctx.Value(retainedViewNoteKey{}).(*retainedViewNote)
+	return note
+}
+
+// noteRetainedRequest publishes what this call is reading — the view that
+// answers it and the repository admission it holds — to the deadline firewall
+// bounding it. A call with no firewall frame above it — an unbounded tool
+// timeout, or a handler invoked directly — carries no note and this is a
+// no-op. Either half may be nil: an unrouted call has no view, and a server
+// with no owner registry has no scope.
+func noteRetainedRequest(ctx context.Context, view *requestView, scope *graphview.RepositoryReadLease) {
+	note := retainedViewNoteFrom(ctx)
+	if note == nil || (view == nil && scope == nil) {
+		return
+	}
+	note.mu.Lock()
+	defer note.mu.Unlock()
+	if view != nil {
+		note.view = view
+	}
+	if scope != nil {
+		note.scope = scope
+	}
+}
+
+// retain joins the still-running handler to the payload it is still reading:
+// the view's generation stack, the base corpus beneath it, and the repository
+// owner that speaks for that stack. It returns nil when this call materialized
+// no payload — the unrouted base-corpus shape, whose repository admission is
+// still held by the middleware frame the handler has not returned from — or
+// when every hold has already been released; the pin's counters separate the
+// two. The returned pin is released by the waiter that observes the handler
+// goroutine exit.
+func (n *retainedViewNote) retain() *requestViewPin {
+	if n == nil {
+		return nil
+	}
+	n.mu.Lock()
+	view, scope := n.view, n.scope
+	n.mu.Unlock()
+	return handoffRequest(view, scope, viewmetrics.HandoffAbandonedHandler)
+}
+
+// retainedLeaseNote states what an abandoned handler is still holding, for
+// the diagnosis the caller gets.
+//
+// "The work may still complete in the background" is only half the truth when
+// the handler also still owns a payload: an operator reading `gortex daemon
+// status` sees a generation retirement refusing, and the abandoned call is
+// the reason. Empty when nothing is retained, so an unrouted call's message
+// is unchanged.
+func retainedLeaseNote(retained *requestViewPin) string {
+	ids := retained.generations()
+	if len(ids) == 0 {
+		return ""
+	}
+	rendered := make([]string, 0, len(ids))
+	for _, id := range ids {
+		rendered = append(rendered, strconv.FormatInt(id, 10))
+	}
+	noun, verb := "generation", "stays"
+	if len(ids) > 1 {
+		noun, verb = "generations", "stay"
+	}
+	return fmt.Sprintf(
+		" It is also still holding the view it read: payload %s %s %s pinned "+
+			"(retirement is refused for them) until that handler exits.",
+		noun, strings.Join(rendered, ", "), verb)
+}
+
+// requestScoped binds one non-tool request — a resources/read or a
+// prompts/get — to the view its session reads through, then prepares the
+// session's editor buffers over it.
+//
+// It is the second half of the same defect overlayPrepared below fixed. The
+// buffer overlay was installed for resources and prompts, but the *view* was
+// not: nothing called resolveRequestView outside the tools/call middleware
+// (overlay.go:202), so s.readerFor(ctx) fell through to s.graph
+// (overlay_view.go:171-176) for every resource and every prompt. A session
+// bound to a worktree therefore got the base corpus out of gortex://stats
+// while the graph_stats *tool* answered from the routed view — two surfaces
+// documented byte-for-byte equal (tools_core.go:3513-3515) disagreeing
+// whenever a view was in play, because both call the same view-aware builder
+// and only one of them ever had a view on its context.
+//
+// The ordering mirrors the tool middleware exactly: resolve the view first so
+// the buffers layer on top of whatever answers, honour the same
+// acceptsBufferOverlay gate a grace fallback sets (overlay.go:253), and
+// release the lease with the request.
+//
+// A view that cannot be resolved is not fatal here. A resource read names no
+// selector — there is nothing the caller asked for that could be refused, and
+// no rider to report a fallback on — so the base corpus answers exactly as it
+// did before, which is the availability posture bootstrap resources are read
+// under. The lease is closed on that path too.
+func requestScoped[Req, Res any](s *Server, h func(context.Context, Req) (Res, error)) func(context.Context, Req) (Res, error) {
+	overlaid := overlayPrepared(s, h)
+	return func(ctx context.Context, req Req) (Res, error) {
+		// A resource read and a prompt fetch are serving requests too, and
+		// they read the same repositories a tool call does — including on the
+		// base-corpus path below, where no view is resolved at all. Admitted
+		// for the request's lifetime on the same terms as the tool middleware.
+		scope := s.acquireServingRepositoryScope()
+		ctx = withRequestRepositoryScope(ctx, scope)
+		defer scope.Release()
+		view, err := s.resolveRequestView(ctx,
+			graphview.Selector{Kind: graphview.SelectorAuto}, requestViewPolicy{})
+		if err != nil {
+			view.close()
+			noteRetainedRequest(ctx, nil, scope)
+			return overlaid(ctx, req)
+		}
+		if view == nil {
+			noteRetainedRequest(ctx, nil, scope)
+			return overlaid(ctx, req)
+		}
+		ctx = withRequestView(ctx, view)
+		// Same reason as the tool path: an abandoned or cancelled handler
+		// keeps reading through this view and inside these repositories, so
+		// the firewall joins both rather than leaving a silent pin.
+		noteRetainedRequest(ctx, view, scope)
+		defer view.close()
+		if !view.acceptsBufferOverlay() {
+			return h(ctx, req)
+		}
+		return overlaid(ctx, req)
 	}
 }
 
@@ -260,14 +472,17 @@ func abandonedMessage(what, name string, timeout time.Duration) string {
 // harmful: a client that reads it as "nothing happened" retries, or falls back
 // to its own editor, and applies the same logical change twice. So the three
 // states are reported separately and the JSON tail is machine-readable.
-func abandonedToolMessage(name string, timeout time.Duration, verdict mutationCommitVerdict) string {
+func abandonedToolMessage(name string, timeout time.Duration, verdict mutationCommitVerdict, retained *requestViewPin) string {
 	base := abandonedMessage("tool", name, timeout)
 	switch verdict.Status {
 	case "":
 		// No mutating handler registered a commit, so nothing was written by
 		// this call. Read tools land here, and so does a write refused during
-		// validation.
-		return base
+		// validation. The retained lease is still worth saying: a read tool
+		// is exactly the kind of handler that gets abandoned mid-scan while
+		// holding a whole generation stack, and the empty verdict carries no
+		// information a JSON tail would add.
+		return base + retainedLeaseNote(retained)
 	case mutationDiskNotApplied:
 		base = fmt.Sprintf(
 			"tool %q exceeded its %s deadline and was abandoned so the session stays responsive. "+
@@ -288,6 +503,10 @@ func abandonedToolMessage(name string, timeout time.Duration, verdict mutationCo
 				"to learn whether the bytes landed.",
 			name, timeout)
 	}
+	// Whatever the disk verdict, the retained lease is a separate fact about
+	// the same abandoned handler, so it is appended after the switch rather
+	// than baked into one of the four wordings above.
+	base += retainedLeaseNote(retained)
 	if encoded, err := json.Marshal(verdict); err == nil {
 		base += "\nmutation_commit=" + string(encoded)
 	}
@@ -301,8 +520,8 @@ func (s *Server) boundToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHan
 			func(stuck int64, timeout time.Duration) (*mcp.CallToolResult, error) {
 				return mcp.NewToolResultError(busyMessage("tool calls", stuck, timeout)), nil
 			},
-			func(timeout time.Duration, note *mutationCommitNote) (*mcp.CallToolResult, error) {
-				return mcp.NewToolResultError(abandonedToolMessage(name, timeout, note.verdict())), nil
+			func(timeout time.Duration, note *mutationCommitNote, retained *requestViewPin) (*mcp.CallToolResult, error) {
+				return mcp.NewToolResultError(abandonedToolMessage(name, timeout, note.verdict(), retained)), nil
 			},
 			func(r any) (*mcp.CallToolResult, error) {
 				return mcp.NewToolResultError(fmt.Sprintf("tool %q internal error: %v", name, r)), nil
@@ -340,12 +559,12 @@ func (s *Server) addPrompt(prompt mcp.Prompt, handler mcpserver.PromptHandlerFun
 }
 
 func (s *Server) boundResourceHandler(uri string, h mcpserver.ResourceHandlerFunc) mcpserver.ResourceHandlerFunc {
-	bounded := boundHandler(s, "resource", uri, overlayPrepared(s, (func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error))(h)),
+	bounded := boundHandler(s, "resource", uri, requestScoped(s, (func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error))(h)),
 		func(stuck int64, timeout time.Duration) ([]mcp.ResourceContents, error) {
 			return nil, errors.New(busyMessage("resource reads", stuck, timeout))
 		},
-		func(timeout time.Duration, _ *mutationCommitNote) ([]mcp.ResourceContents, error) {
-			return nil, errors.New(abandonedMessage("resource", uri, timeout))
+		func(timeout time.Duration, _ *mutationCommitNote, retained *requestViewPin) ([]mcp.ResourceContents, error) {
+			return nil, errors.New(abandonedMessage("resource", uri, timeout) + retainedLeaseNote(retained))
 		},
 		func(r any) ([]mcp.ResourceContents, error) {
 			return nil, fmt.Errorf("resource %s internal error: %v", uri, r)
@@ -371,12 +590,12 @@ func (s *Server) boundResourceHandler(uri string, h mcpserver.ResourceHandlerFun
 }
 
 func (s *Server) boundPromptHandler(name string, h mcpserver.PromptHandlerFunc) mcpserver.PromptHandlerFunc {
-	bounded := boundHandler(s, "prompt", name, overlayPrepared(s, (func(context.Context, mcp.GetPromptRequest) (*mcp.GetPromptResult, error))(h)),
+	bounded := boundHandler(s, "prompt", name, requestScoped(s, (func(context.Context, mcp.GetPromptRequest) (*mcp.GetPromptResult, error))(h)),
 		func(stuck int64, timeout time.Duration) (*mcp.GetPromptResult, error) {
 			return nil, errors.New(busyMessage("prompt requests", stuck, timeout))
 		},
-		func(timeout time.Duration, _ *mutationCommitNote) (*mcp.GetPromptResult, error) {
-			return nil, errors.New(abandonedMessage("prompt", name, timeout))
+		func(timeout time.Duration, _ *mutationCommitNote, retained *requestViewPin) (*mcp.GetPromptResult, error) {
+			return nil, errors.New(abandonedMessage("prompt", name, timeout) + retainedLeaseNote(retained))
 		},
 		func(r any) (*mcp.GetPromptResult, error) {
 			return nil, fmt.Errorf("prompt %s internal error: %v", name, r)

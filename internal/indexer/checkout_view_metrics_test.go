@@ -4,7 +4,9 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -185,12 +187,21 @@ func TestRefViewSelectionOutcomesAreCounted(t *testing.T) {
 	f := newRefViewFixture(t)
 	commitB, _ := f.commitTree(builderTreeB(), "B")
 	f.setRef("refs/heads/feature", commitB)
-	manager := f.manager(t, nil)
+	// This test measures completed selection outcomes, not the production
+	// five-second grace. Give the real detached build its fixture lifecycle
+	// budget; the short-grace control separately pins the building response.
+	manager := f.managerTuned(t, nil, func(cfg *RefViewManagerConfig) {
+		cfg.buildGrace = 30 * time.Second
+	})
 	ctx := context.Background()
 
 	before := viewmetrics.Read()
-	if _, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature")); err != nil {
+	first, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+	if err != nil {
 		t.Fatalf("first selection: %v", err)
+	}
+	if first.State != store_sqlite.RefViewReady || !first.Built || first.GenerationID == 0 {
+		t.Fatalf("first selection = %+v, want a ready view built by this call", first)
 	}
 	built := viewmetrics.Read()
 	if got := counterDelta(before, built, refViewSelectionKey(viewmetrics.RefViewAdopted)); got != 1 {
@@ -200,8 +211,12 @@ func TestRefViewSelectionOutcomesAreCounted(t *testing.T) {
 		t.Fatalf("a selection that built was also counted as already ready (%d)", got)
 	}
 
-	if _, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature")); err != nil {
+	second, err := manager.EnsureRefView(ctx, f.request("refs/heads/feature"))
+	if err != nil {
 		t.Fatalf("second selection: %v", err)
+	}
+	if second.State != store_sqlite.RefViewReady || second.Built || second.GenerationID != first.GenerationID {
+		t.Fatalf("second selection = %+v, want the existing ready generation %d", second, first.GenerationID)
 	}
 	reused := viewmetrics.Read()
 	if got := counterDelta(built, reused, refViewSelectionKey(viewmetrics.RefViewReady)); got != 1 {

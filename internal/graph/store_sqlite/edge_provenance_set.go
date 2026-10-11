@@ -183,7 +183,7 @@ func (s *Store) setEdgeProvenanceBatchSetOriented(batch []graph.EdgeProvenanceUp
 			}
 			analysisInvalidated := s.analysisGenerationPresent
 			if analysisInvalidated {
-				if invalidateErr := invalidateAnalysisGenerationTx(tx); invalidateErr != nil {
+				if invalidateErr := s.invalidateAnalysisViewTx(tx); invalidateErr != nil {
 					err = invalidateErr
 					return
 				}
@@ -200,9 +200,9 @@ func (s *Store) setEdgeProvenanceBatchSetOriented(batch []graph.EdgeProvenanceUp
 			}
 			committed = true
 			if analysisInvalidated {
-				s.analysisGenerationPresent = false
+				s.analysisGenerationPresent = s.analysisLatchRemaining
 			}
-			s.edgeIdentityRevs.Add(int64(chunkChanged))
+			s.noteEdgeIdentityRevisions(int64(chunkChanged))
 			s.finishAnalysisMutationLocked(true)
 			totalChanged += chunkChanged
 		}()

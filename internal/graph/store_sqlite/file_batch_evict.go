@@ -79,6 +79,11 @@ func (s *Store) evictByPredicate(predicate string, arg any, scope evictScope) (n
 // the receipt can stay complete instead of forcing the whole-graph fallback
 // resolve.
 func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictScope) (nodesRemoved, edgesRemoved int, retErr error) {
+	// An administrative sweep changes every view, regardless of the calling
+	// handle. Base invalidation advances every view's mutation witness too.
+	if scope == evictAllGenerations && s.viewGen != baseViewGeneration {
+		return s.atBase().evictByPredicateResult(predicate, arg, scope)
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -230,7 +235,7 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 	changed := nodesRemoved > 0 || edgesRemoved > 0 || scalarChanges > 0
 	invalidatedAnalysis := false
 	if changed && s.analysisGenerationPresent {
-		if err := invalidateAnalysisGenerationTx(tx); err != nil {
+		if err := s.invalidateAnalysisViewTx(tx); err != nil {
 			return 0, 0, err
 		}
 		invalidatedAnalysis = true
@@ -240,9 +245,12 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 	}
 
 	if invalidatedAnalysis {
-		s.analysisGenerationPresent = false
+		s.analysisGenerationPresent = s.analysisLatchRemaining
 	}
 	s.finishAnalysisMutationLocked(changed)
+	if changed && scope == evictAllGenerations {
+		s.payloadInputAdminRevision.Add(1)
+	}
 	if changed {
 		if receiptDelta != nil && scalarChanges == 0 {
 			s.mergeMutationReceiptLocked(receiptDelta)
@@ -314,6 +322,27 @@ type contractFileEvictionPlan struct {
 	scalarUpdates []*graph.Node
 }
 
+// contractFileEvictionFrontierSQL selects the contract records a file eviction
+// endangers: contract nodes of the doomed files, and contract nodes their doomed
+// source nodes own through provides/consumes/handles_route edges. The second
+// arm follows only outgoing owners of doomed source nodes; an owner whose file
+// matches but whose two endpoints both survive was outside EvictFiles' old
+// frontier and remains outside it here.
+//
+// UNION ALL, not UNION: the list only feeds an IN test, so duplicates are
+// irrelevant, and a de-duplicating UNION is planned as a sorted MERGE whose arms
+// the planner drives from the generation indexes (id order for free), a scan of
+// every node and every edge of the generation per save (4.8 s on a 946k-edge
+// store).
+func contractFileEvictionFrontierSQL(scoped string) string {
+	affected := `SELECT id FROM nodes WHERE ` + scoped + `
+UNION ALL
+SELECT to_id FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE ` + scoped + `)
+  AND view_gen = ? AND kind IN (?, ?, ?)`
+	return `SELECT ` + lookupNodeCols + ` FROM nodes
+WHERE view_gen = ? AND kind = ? AND id IN (` + affected + `)`
+}
+
 func (s *Store) planContractFileEvictionTx(tx *sql.Tx, predicate string, arg any, scoped string, scopeArgs []any) (contractFileEvictionPlan, error) {
 	var plan contractFileEvictionPlan
 	if predicate != evictFilePredicate && predicate != evictFilesPredicate {
@@ -337,20 +366,12 @@ func (s *Store) planContractFileEvictionTx(tx *sql.Tx, predicate string, arg any
 	for _, path := range files {
 		fileSet[path] = struct{}{}
 	}
-	// The second arm follows only outgoing owners of doomed source nodes.
-	// An owner whose file matches but whose two endpoints both survive was
-	// outside EvictFiles' old frontier and remains outside it here.
-	affected := `SELECT id FROM nodes WHERE ` + scoped + `
-UNION
-SELECT to_id FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE ` + scoped + `)
-  AND view_gen = ? AND kind IN (?, ?, ?)`
 	args := []any{s.viewGen, string(graph.KindContract)}
 	args = append(args, scopeArgs...)
 	args = append(args, scopeArgs...)
 	args = append(args, s.viewGen, string(graph.EdgeProvides), string(graph.EdgeConsumes), string(graph.EdgeHandlesRoute))
 	//nolint:rowserrcheck // readNodes checks Err and closes every result below.
-	rows, err := tx.Query(`SELECT `+lookupNodeCols+` FROM nodes
-WHERE view_gen = ? AND kind = ? AND id IN (`+affected+`)`, args...)
+	rows, err := tx.Query(contractFileEvictionFrontierSQL(scoped), args...)
 	if err != nil {
 		return plan, err
 	}

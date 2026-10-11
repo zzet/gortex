@@ -12,6 +12,7 @@ package rerank
 import (
 	"maps"
 	"sort"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -101,6 +102,11 @@ func (p *Pipeline) Rerank(query string, cands []*Candidate, ctx *Context) []*Can
 		ctx.prepare(cands)
 	}
 
+	observer := ctx.ObserveTiming
+	var scoringStart time.Time
+	if observer != nil {
+		scoringStart = time.Now()
+	}
 	for _, c := range cands {
 		if c.Signals == nil {
 			c.Signals = make(map[string]float64, len(p.signals))
@@ -172,6 +178,9 @@ func (p *Pipeline) Rerank(query string, cands []*Candidate, ctx *Context) []*Can
 	// implementation file) must keep its literal order.
 	if ctx.QueryClass == QueryClassConcept {
 		applyFileDiversity(cands)
+	}
+	if observer != nil {
+		observer(Timing{Scoring: time.Since(scoringStart), ScoringCalls: 1})
 	}
 	return cands
 }

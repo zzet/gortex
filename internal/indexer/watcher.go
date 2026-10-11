@@ -68,6 +68,64 @@ type MutationResult struct {
 	AppliedGeneration   uint64
 	Reindexed           bool
 	Err                 error
+	// DerivedFanout is the completeness fact for the BOUNDED DERIVED passes
+	// that ran while this mutation was applied. It is strictly additive and
+	// answers a different question from Reindexed: Reindexed says the graph
+	// read these bytes, DerivedFanout says whether the derived work OVER those
+	// bytes — the affected-by re-resolution that rebinds the changed symbol's
+	// dependants — finished. A truncated pass leaves the files it names
+	// holding edges and persisted reference facts derived against the
+	// pre-edit shape, and before this field nothing outside the daemon's own
+	// logs could tell that apart from a complete pass.
+	DerivedFanout DerivedFanoutCompleteness
+}
+
+// DerivedFanoutCompleteness carries one mutation's bounded-derived-pass
+// completeness fact out to the caller that asked for the mutation.
+//
+// Observed is the discriminator and it is NOT redundant with Complete. It is
+// true only when a bounded derived pass APPLIED ITS BOUND while this mutation
+// was being patched (affected_by.go observeDerivedFanoutPass). The zero value
+// therefore means "this mutation did not measure the fan-out" and covers every
+// path that never ran the pass: an admission failure, a FAILED patch, a storm
+// batch, a checkout refresh, a metadata-only commit, and a repository whose
+// global passes are deferred. Reporting any of those as "complete" would be
+// the exact lie the bounded pass's completeness fact exists to prevent, so a
+// consumer renders nothing unless Observed is true.
+type DerivedFanoutCompleteness struct {
+	Observed bool `json:"observed"`
+	// Complete is true when every bounded derived pass that ran inside the
+	// observed window refreshed everything it was supposed to.
+	Complete bool `json:"complete"`
+	// Dropped is the number of DISTINCT files those passes left holding a
+	// stale resolution, unioned across passes
+	// (graph.MutationReceipt.DroppedFanoutFiles).
+	Dropped int `json:"dropped,omitempty"`
+	// Passes names the cut passes, sorted, so a consumer can say WHICH derived
+	// work was bounded rather than only that some was.
+	Passes []string `json:"passes,omitempty"`
+}
+
+// DerivedFanoutFromReceipt lowers the receipt axis a bounded pass writes
+// (graph.MutationReceipt.FanoutTruncations) into the fact a mutation caller
+// reads. A receipt that was genuinely observed and carries no truncation is a
+// complete fan-out, which is a positive answer, not an absent one.
+func DerivedFanoutFromReceipt(receipt graph.MutationReceipt) DerivedFanoutCompleteness {
+	fanout := DerivedFanoutCompleteness{
+		Observed: true,
+		Complete: receipt.DerivedFanoutComplete(),
+	}
+	if fanout.Complete {
+		return fanout
+	}
+	fanout.Dropped = receipt.DroppedFanoutFiles()
+	for _, fact := range receipt.FanoutTruncations {
+		if fact.Pass != "" && fact.Dropped > 0 {
+			fanout.Passes = append(fanout.Passes, fact.Pass)
+		}
+	}
+	sort.Strings(fanout.Passes)
+	return fanout
 }
 
 // SymbolChangeCallback is called when symbols change during file re-indexing.
@@ -162,19 +220,21 @@ type Watcher struct {
 
 	// Storm-mode state. Guarded by stormMu so the hot per-file
 	// debounce path (mu) doesn't contend with rate-tracking.
-	stormMu           sync.Mutex
-	eventTimes        []time.Time           // sliding window of recent event timestamps
-	stormBatch        map[string]ChangeKind // dirty set during an event storm
-	stormGenerations  map[string]uint64     // newest debounced generation adopted per path
-	stormTimer        *time.Timer           // fires after the quiet period
-	stormActive       bool                  // true while waiting to drain
-	stormStopped      bool                  // Stop has closed storm admission
-	stormRetryAttempt int                   // retry ordinal for the published storm timer
-	stormWork         sync.WaitGroup        // scheduled/running timer callbacks
-	stormDrained      func(int)             // test hook: batch drained; batch size arg
-	stormBeforeLock   func()                // test hook: immediately before repository-lane admission
-	batchReindex      watcherBatchReindex   // one bounded batch; MultiWatcher installs shared catch-up
-	discoverReindex   watcherBatchReindex   // additive directory discovery with the same complete tail
+	stormMu            sync.Mutex
+	eventTimes         []time.Time           // sliding window of recent event timestamps
+	stormBatch         map[string]ChangeKind // dirty set during an event storm
+	stormGenerations   map[string]uint64     // newest debounced generation adopted per path
+	stormTimer         *time.Timer           // fires after the quiet period
+	stormActive        bool                  // true while waiting to drain
+	stormExplicit      bool                  // admitted complete explicit frontier requires forced reads
+	stormStopped       bool                  // Stop has closed storm admission
+	stormRetryAttempt  int                   // retry ordinal for the published storm timer
+	stormWork          sync.WaitGroup        // scheduled/running timer callbacks
+	stormDrained       func(int)             // test hook: batch drained; batch size arg
+	stormBeforeLock    func()                // test hook: immediately before repository-lane admission
+	explicitReindexRaw watcherBatchReindex   // complete forced frontier; caller already holds repository lane
+	batchReindex       watcherBatchReindex   // one bounded batch; MultiWatcher installs shared catch-up
+	discoverReindex    watcherBatchReindex   // additive directory discovery with the same complete tail
 	// pointReindexRaw runs the complete exact-path pipeline after the watcher
 	// already owns the repository lane. MultiWatcher installs its raw tail here.
 	pointReindexRaw func(string) (*IndexResult, error)
@@ -1561,7 +1621,7 @@ func (w *Watcher) runDirScan(dirs map[string]struct{}, fn func(map[string]struct
 	if w.discoverReindex != nil {
 		_, err = w.discoverReindex(discoveryPaths)
 	} else {
-		err = w.indexer.coordinateRepositoryMutation(context.Background(), func() error {
+		err = w.indexer.coordinateRepositoryMutation(context.Background(), OutputEntryWatcherDirScan, func() error {
 			_, rawErr := w.indexer.incrementalDiscoverWatcherPaths(w.indexer.rootPath, discoveryPaths)
 			return rawErr
 		})
@@ -1741,6 +1801,103 @@ func (w *Watcher) EnqueueFileMutation(ctx context.Context, filePath string) (*Mu
 	return ticket, nil
 }
 
+// EnqueueFileMutations admits one committed frontier before any drain can run.
+// A nil map means the owner cannot schedule this set; no member was admitted.
+func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map[string]*MutationTicket, error) {
+	if len(files) == 1 {
+		ticket, err := w.EnqueueFileMutation(ctx, files[0])
+		if ticket == nil {
+			return nil, err
+		}
+		return map[string]*MutationTicket{ticket.Path: ticket}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	paths := make(map[string]struct{}, len(files))
+	root := w.indexer.RootPath()
+	if root == "" {
+		return nil, nil
+	}
+	for _, file := range files {
+		path, err := filepath.Abs(file)
+		if err != nil {
+			return nil, err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || w.isExcluded(path) {
+			return nil, nil
+		}
+		if _, ok := w.indexer.effectiveLanguage(path, nil); !ok {
+			return nil, nil
+		}
+		paths[path] = struct{}{}
+	}
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	if len(paths) == 1 {
+		for path := range paths {
+			ticket, err := w.EnqueueFileMutation(ctx, path)
+			if ticket == nil {
+				return nil, err
+			}
+			return map[string]*MutationTicket{path: ticket}, err
+		}
+	}
+	if w.mutationBeforeAdmission != nil {
+		w.mutationBeforeAdmission()
+	}
+	w.stormMu.Lock()
+	defer w.stormMu.Unlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if w.stormStopped || w.stopping {
+		return nil, errWatcherStopped
+	}
+	if w.stormBatch == nil {
+		w.stormBatch = make(map[string]ChangeKind)
+	}
+	if w.stormGenerations == nil {
+		w.stormGenerations = make(map[string]uint64)
+	}
+	if w.pendingGeneration == nil {
+		w.pendingGeneration = make(map[string]uint64)
+	}
+	if w.mutationWaiters == nil {
+		w.mutationWaiters = make(map[string]map[uint64]chan MutationResult)
+	}
+	tickets := make(map[string]*MutationTicket, len(paths))
+	for path := range paths {
+		if timer, ok := w.pending[path]; ok {
+			if timer.Stop() {
+				w.asyncWork.Done()
+			}
+			delete(w.pending, path)
+		}
+		w.nextGeneration++
+		generation := w.nextGeneration
+		if w.mutationWaiters[path] == nil {
+			w.mutationWaiters[path] = make(map[uint64]chan MutationResult)
+		}
+		done := make(chan MutationResult, 1)
+		w.mutationWaiters[path][generation] = done
+		w.pendingGeneration[path] = generation
+		w.stormGenerations[path] = generation
+		w.stormBatch[path] = ChangeModified
+		tickets[path] = &MutationTicket{Path: path, Generation: generation, Done: done}
+	}
+	w.stormActive = true
+	w.stormExplicit = true
+	w.stormRetryAttempt = 0
+	w.stopStormTimerLocked()
+	w.armStormTimerLocked(0)
+	return tickets, nil
+}
+
 // scheduleFileMutation is the single admission point for native events and
 // direct daemon mutations. A later admission supersedes every queued callback
 // for the same path; every earlier ticket stays attached until the newest patch
@@ -1825,6 +1982,11 @@ func (w *Watcher) runPointMutation(path string, kind ChangeKind, generation uint
 	}
 	defer release()
 	complete := true
+	// The completeness fact for the bounded derived passes this patch runs.
+	// Read by the deferred completion below, so it must outlive the patch call
+	// and stay the zero value ("not observed") on every arm that never reaches
+	// the graph.
+	var fanout DerivedFanoutCompleteness
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			panicErr, ok := watcherStoragePanicError("patch "+path, recovered)
@@ -1838,13 +2000,13 @@ func (w *Watcher) runPointMutation(path string, kind ChangeKind, generation uint
 			if w.mutationBeforeComplete != nil {
 				w.mutationBeforeComplete(path, generation)
 			}
-			w.completeMutationWaitersIfCurrent(path, generation, patchErr)
+			w.completeMutationWaitersWithFanout(path, generation, patchErr, fanout)
 		}
 	}()
 	if w.pointMutationPatch != nil {
 		patchErr = w.pointMutationPatch(path, kind, generation)
 	} else {
-		patchErr = w.patchGraph(path, kind, generation)
+		patchErr = w.patchGraphObservingFanout(path, kind, generation, &fanout)
 	}
 	var storageErr *store_sqlite.StorageError
 	if errors.As(patchErr, &storageErr) {
@@ -1898,13 +2060,40 @@ func (w *Watcher) mutationAdmissionStopped() bool {
 }
 
 func (w *Watcher) completeMutationWaitersIfCurrent(path string, appliedGeneration uint64, err error) bool {
-	return w.completeMutationWaitersGuarded(path, appliedGeneration, err, true)
+	return w.completeMutationWaitersGuarded(path, appliedGeneration, err, DerivedFanoutCompleteness{}, true)
 }
 
-func (w *Watcher) completeMutationWaitersGuarded(path string, appliedGeneration uint64, err error, requireCurrent bool) bool {
+// completeMutationWaitersWithFanout is the arm that actually ran the graph
+// patch, so it is the only one that has a derived-fan-out observation to
+// publish. Every other completion arm reports the zero value, which reads as
+// "not observed" rather than as a complete fan-out.
+func (w *Watcher) completeMutationWaitersWithFanout(
+	path string,
+	appliedGeneration uint64,
+	err error,
+	fanout DerivedFanoutCompleteness,
+) bool {
+	return w.completeMutationWaitersGuarded(path, appliedGeneration, err, fanout, true)
+}
+
+func (w *Watcher) completeMutationWaitersGuarded(
+	path string,
+	appliedGeneration uint64,
+	err error,
+	fanout DerivedFanoutCompleteness,
+	requireCurrent bool,
+) bool {
 	type completion struct {
 		requested uint64
 		done      chan MutationResult
+	}
+	// One choke point for every completion arm, present and future: a mutation
+	// that reports an error never publishes a derived-fan-out verdict. Reindexed
+	// below is exactly err == nil, and the fan-out fact must not outlive it —
+	// "the bounded derived work over this edit finished" cannot be true of an
+	// edit the graph did not accept.
+	if err != nil {
+		fanout = DerivedFanoutCompleteness{}
 	}
 	w.mu.Lock()
 	if requireCurrent && w.pendingGeneration[path] > appliedGeneration {
@@ -1932,6 +2121,7 @@ func (w *Watcher) completeMutationWaitersGuarded(path string, appliedGeneration 
 			AppliedGeneration:   appliedGeneration,
 			Reindexed:           err == nil,
 			Err:                 err,
+			DerivedFanout:       fanout,
 		}
 		close(completion.done)
 	}
@@ -2096,6 +2286,8 @@ func (w *Watcher) drainStorm() {
 	stopped := w.stormStopped
 	batch := w.stormBatch
 	generations = w.stormGenerations
+	explicit := w.stormExplicit
+	w.stormExplicit = false
 	retryAttempt := w.stormRetryAttempt
 	w.stormBatch = make(map[string]ChangeKind)
 	w.stormGenerations = make(map[string]uint64)
@@ -2131,7 +2323,14 @@ func (w *Watcher) drainStorm() {
 
 	// reindexStormPaths enters the repository coordinator; its raw executor
 	// acquires the topology gate only after the repository lane is held.
-	result, err := w.reindexStormPaths(paths)
+	var result *IndexResult
+	var err error
+	var fanout DerivedFanoutCompleteness
+	if explicit {
+		result, fanout, err = w.reindexExplicitMutationPaths(paths)
+	} else {
+		result, err = w.reindexStormPaths(paths)
+	}
 
 	reindexed, deleted, failed := 0, 0, 0
 	if result != nil {
@@ -2153,15 +2352,15 @@ func (w *Watcher) drainStorm() {
 		drained(len(batch))
 	}
 	if retryableMutationError(err) {
-		if w.scheduleStormMutationRetry(batch, generations, retryAttempt+1) {
+		if w.scheduleStormMutationRetry(batch, generations, retryAttempt+1, explicit) {
 			return
 		}
 		err = errWatcherStopped
 	}
-	w.completeStormMutationWaiters(generations, result, err)
+	w.completeStormMutationWaiters(generations, result, err, fanout)
 }
 
-func (w *Watcher) scheduleStormMutationRetry(batch map[string]ChangeKind, generations map[string]uint64, attempt int) bool {
+func (w *Watcher) scheduleStormMutationRetry(batch map[string]ChangeKind, generations map[string]uint64, attempt int, explicit bool) bool {
 	w.stormMu.Lock()
 	defer w.stormMu.Unlock()
 	if w.stormStopped {
@@ -2184,6 +2383,7 @@ func (w *Watcher) scheduleStormMutationRetry(batch map[string]ChangeKind, genera
 			w.stormGenerations[path] = generation
 		}
 	}
+	w.stormExplicit = w.stormExplicit || explicit
 	w.stormActive = len(w.stormBatch) != 0
 	if attempt > w.stormRetryAttempt {
 		w.stormRetryAttempt = attempt
@@ -2202,9 +2402,14 @@ func (w *Watcher) completeStormMutationWaiters(
 	generations map[string]uint64,
 	result *IndexResult,
 	batchErr error,
+	observed ...DerivedFanoutCompleteness,
 ) {
 	if len(generations) == 0 {
 		return
+	}
+	var fanout DerivedFanoutCompleteness
+	if batchErr == nil && len(observed) > 0 {
+		fanout = observed[0]
 	}
 	failed := make(map[string]struct{})
 	if result != nil {
@@ -2240,6 +2445,10 @@ func (w *Watcher) completeStormMutationWaiters(
 		if w.pendingGeneration[path] == appliedGeneration {
 			delete(w.pendingGeneration, path)
 		}
+		pathFanout := fanout
+		if pathErr != nil {
+			pathFanout = DerivedFanoutCompleteness{}
+		}
 		for requestedGeneration, done := range w.mutationWaiters[path] {
 			if requestedGeneration > appliedGeneration {
 				continue
@@ -2250,6 +2459,7 @@ func (w *Watcher) completeStormMutationWaiters(
 					RequestedGeneration: requestedGeneration,
 					AppliedGeneration:   appliedGeneration,
 					Reindexed:           pathErr == nil,
+					DerivedFanout:       pathFanout,
 					Err:                 pathErr,
 				},
 			})
@@ -2333,7 +2543,21 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind, generations ...uint64
 	if len(generations) > 0 {
 		generation = generations[0]
 	}
-	return w.patchGraphWithReceiptState(path, kind, generation, false)
+	return w.patchGraphObservingFanout(path, kind, generation, nil)
+}
+
+// patchGraphObservingFanout is patchGraph plus the bounded-derived-pass
+// completeness fact. fanout may be nil for a caller that does not report one,
+// and is stamped only when the patch actually applied: a mutation that failed
+// has no derived-fan-out verdict, and stamping one would certify bounded work
+// over bytes the graph never accepted.
+func (w *Watcher) patchGraphObservingFanout(
+	path string,
+	kind ChangeKind,
+	generation uint64,
+	fanout *DerivedFanoutCompleteness,
+) error {
+	return w.patchGraphWithReceiptState(path, kind, generation, false, fanout)
 }
 
 // patchGraphAfterReceiptCheck is used only by the Darwin startup barrier,
@@ -2341,10 +2565,16 @@ func (w *Watcher) patchGraph(path string, kind ChangeKind, generations ...uint64
 // unchanged replay. It prevents ChangeModified from repeating that SQL lookup
 // one path at a time inside the ordinary point-mutation path.
 func (w *Watcher) patchGraphAfterReceiptCheck(path string, kind ChangeKind) error {
-	return w.patchGraphWithReceiptState(path, kind, 0, true)
+	return w.patchGraphWithReceiptState(path, kind, 0, true, nil)
 }
 
-func (w *Watcher) patchGraphWithReceiptState(path string, kind ChangeKind, generation uint64, receiptChecked bool) error {
+func (w *Watcher) patchGraphWithReceiptState(
+	path string,
+	kind ChangeKind,
+	generation uint64,
+	receiptChecked bool,
+	fanout *DerivedFanoutCompleteness,
+) error {
 	if !w.generationCurrent(path, generation) {
 		return errMutationSuperseded
 	}
@@ -2354,12 +2584,12 @@ func (w *Watcher) patchGraphWithReceiptState(path string, kind ChangeKind, gener
 	// IndexRepo replacement uses the same lane and cannot change underneath
 	// the raw patch.
 	laneCtx, cancelLane := w.mutationLaneContext()
-	err := w.indexer.coordinateRepositoryMutation(laneCtx, func() error {
+	err := w.indexer.coordinateRepositoryMutation(laneCtx, OutputEntryWatcherPatchGraph, func() error {
 		idx := w.currentMutationIndexer()
 		if idx == nil {
 			return errWatcherIndexerMissing
 		}
-		return w.patchGraphWithReceiptStateRawModern(idx, path, kind, generation, receiptChecked, &pending)
+		return w.patchGraphWithReceiptStateRawModern(idx, path, kind, generation, receiptChecked, &pending, fanout)
 	})
 	cancelLane()
 	// User callbacks are deliberately outside the repository lane. Their
@@ -2417,6 +2647,7 @@ func (w *Watcher) patchGraphWithReceiptStateRawModern(
 	generation uint64,
 	receiptChecked bool,
 	pending *symbolChangeNotification,
+	fanout *DerivedFanoutCompleteness,
 ) error {
 	if !w.generationCurrent(path, generation) {
 		return errMutationSuperseded
@@ -2452,9 +2683,44 @@ func (w *Watcher) patchGraphWithReceiptStateRawModern(
 	// Metadata-only refreshes may reuse and mutate the graph-owned node objects.
 	oldSymbols := cloneSymbolChangeNodes(callbackSymbols(priorNodes))
 
+	// Opened immediately around the executor so the window spans every bounded
+	// derived pass this mutation runs — the affected-by re-resolution inside
+	// the parse/evict batch and the deferred resolver catch-up that follows it
+	// — and nothing else's.
+	//
+	// The window is keyed on the Indexer, not on the store: the executor is a
+	// seam the watcher installs but does not own (a standalone Watcher runs
+	// Indexer.incrementalPointWatcherPath, the daemon's MultiWatcher
+	// substitutes MultiIndexer.incrementalPointRepoRaw), and both arms run the
+	// bounded pass on THIS Indexer. A store-wide mutation receipt would observe
+	// the same fact, but it would also charge every concurrent writer on the
+	// store for the whole mutation and let a sibling repository's cut land on
+	// this mutation's verdict — see affected_by.go.
+	//
+	// This window is deliberately WIDER than the receipt's own fan-out axis,
+	// which is bounded to the parse/evict batch because that is the window a
+	// receipt describes (incremental_watcher_batch.go opens its own, nested,
+	// batch-scoped observation for it). The two carriers answer different
+	// questions and must not be collapsed: the receipt says what the BATCH's
+	// bounded passes left stale, this says whether the derived work over the
+	// caller's EDIT finished — and the deferred resolver catch-up, which runs
+	// outside the receipt boundary on purpose, is part of that edit's derived
+	// work. Narrowing this one to the batch would hand a caller a positive
+	// "complete" over a catch-up that was cut.
+	observation := beginDerivedFanoutObservation(idx)
+	defer observation.close()
 	result, err := w.reindexPointPathRaw(idx, path)
+	observed := observation.close()
 	if err != nil {
+		// A failed patch publishes no fan-out verdict. Whatever the bounded
+		// pass did before the failure, the mutation the caller asked for did
+		// not apply, and a positive "complete" here would certify derived work
+		// over bytes the graph never accepted. The completion path enforces the
+		// same rule for every later failure arm (completeMutationWaitersGuarded).
 		return err
+	}
+	if fanout != nil {
+		*fanout = observed
 	}
 	// A newer generation can be scheduled while the reindex runs — FSEvents
 	// reports a single save as several notifications, and the wider the patch
@@ -2765,7 +3031,7 @@ func (w *Watcher) enqueueReresolve(path string) {
 				// Admit on the watcher's stable lane, then resolve the current
 				// registered Indexer. IndexRepo replacement cannot interleave
 				// between that lookup and the scoped re-resolve loop.
-				err := w.indexer.coordinateRepositoryMutation(context.Background(), func() error {
+				err := w.indexer.coordinateRepositoryMutation(context.Background(), OutputEntryWatcherEnqueueReresolve, func() error {
 					idx := w.currentMutationIndexer()
 					if idx == nil {
 						return errWatcherIndexerMissing

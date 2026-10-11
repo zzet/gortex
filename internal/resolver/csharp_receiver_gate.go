@@ -242,7 +242,13 @@ func csharpCallCandidatesForFiles(g graph.Store, scope map[string]bool, filePath
 	}
 
 	methodIDs := make([]string, 0)
-	for node := range graph.NodesInScopeSeq(g, prefixes, filePaths, graph.KindMethod) {
+	// With a file frontier, the same rows and order as graph.NodesInScopeSeq
+	// read through the file index (frameworkFileFrontierNodes).
+	methods := graph.NodesInScopeSeq(g, prefixes, filePaths, graph.KindMethod)
+	if len(filePaths) > 0 {
+		methods = frameworkFileFrontierNodes(g, prefixes, filePaths, graph.KindMethod)
+	}
+	for node := range methods {
 		if node != nil {
 			methodIDs = append(methodIDs, node.ID)
 		}

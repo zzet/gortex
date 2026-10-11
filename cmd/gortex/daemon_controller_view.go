@@ -235,6 +235,49 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 	}
 }
 
+// probeViewServesAutomaticLane is the wire-side spelling of
+// graphview.ServesAutomaticView — the predicate the MCP dispatcher's admission
+// gate answers with (CheckoutServesCWDChecked → scopeForAutomaticCheckoutChecked
+// → graphview.ServesAutomaticView, internal/mcp/scope_checkout.go:37-56).
+//
+// It exists because the CLI pre-flight and the dispatcher ask the same question
+// through different doors: the CLI has only the control surface's ProbeView, the
+// dispatcher has the catalog row. A ProbeView answers it exactly, because
+// selectProbeView above derives its kind from the same two catalog columns
+// ServesAutomaticView reads:
+//
+//   - ProbeViewWorktree and ProbeViewUnrouted are produced only past the two
+//     guards at the top of selectProbeView, i.e. only for a checkout whose state
+//     is CheckoutStateReady AND whose effective mode is CheckoutModeAutomatic —
+//     which is ServesAutomaticView's whole definition.
+//   - ProbeViewBase is produced for everything else: an untracked path, a live
+//     dedicated checkout, the family primary, and every checkout in a grace or
+//     transition state. A dedicated checkout and a primary carry a CheckoutID on
+//     that answer, so "the answer named a checkout" is NOT the same question and
+//     admits paths the dispatcher refuses.
+//
+// The difference is user-visible: a CLI pre-flight that admits a path the
+// dispatcher then refuses spends a full MCP round trip to come back with
+// repo_not_tracked, which query.go re-routes into the worktree remedy anyway.
+// Answering it here gives the same remedy without the round trip.
+//
+// Residual, declared: the dispatcher additionally requires the family primary to
+// be a tracked repository with a resolvable scope
+// (scope_checkout.go:57-69). ProbeView carries no field that reports it, so a
+// checkout whose primary was forgotten is still admitted here and refused there
+// — degrading, as before, to repo_not_tracked → worktreeCWDErr.
+func probeViewServesAutomaticLane(answer *daemon.ProbeView) bool {
+	if answer == nil {
+		return false
+	}
+	switch answer.Kind {
+	case daemon.ProbeViewWorktree, daemon.ProbeViewUnrouted:
+		return true
+	default:
+		return false
+	}
+}
+
 // exactProbeView names a graph that is the path's own.
 func exactProbeView(kind, checkoutID, repoPrefix string) *daemon.ProbeView {
 	return &daemon.ProbeView{
@@ -727,7 +770,7 @@ func (c *realController) reconcileFamilyForProbeContext(ctx context.Context, fam
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if _, err := c.lifecycle.ReconcileFamily(ctx, familyID); err != nil && c.logger != nil {
+	if _, err := c.lifecycle.ReconcileFamilyDeferredRetirement(ctx, familyID); err != nil && c.logger != nil {
 		c.logger.Debug("probe view: reconciling the family failed",
 			zap.String("family", familyID), zap.Error(err))
 	}

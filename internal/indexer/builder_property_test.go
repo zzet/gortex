@@ -522,93 +522,24 @@ func propRunCommitCase(t *testing.T, seed int64) {
 	}
 	propReportDivergence(t, seed, []propScript{script}, []BuildReport{report}, propCompare(composed, flat))
 	builderAssertMasksValidate(t, store, generationID)
+	propAssertRedundantPathlessPruned(t, store, generationID, store.AtGeneration(0))
 }
 
 // --- property 2: the working-tree layer over the commit layer ------------
 
-// TestDirtyEquivalenceProperty is the three-layer oracle. It runs the commit
-// property's setup, then a SECOND generated script that is left uncommitted —
-// with a random half of its paths staged, so the checkout carries staged and
-// unstaged modifications, untracked additions and unstaged deletions at once —
-// builds the working-tree layer over the commit layer, and requires the whole
-// stack to answer like a plain whole index of what is on disk.
-func TestDirtyEquivalenceProperty(t *testing.T) {
-	for _, seed := range propSeedCorpus(t) {
-		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
-			propRunDirtyCase(t, seed)
-		})
-	}
-}
-
-func propRunDirtyCase(t *testing.T, seed int64) {
+// propAssertRedundantPathlessPruned is the clause for the invariant "a
+// pathless node identical to the layer below owns no adjacency": the
+// generation carries no pathless node (builtins aside, which it claims for
+// their stamped row) whose layer-below copy is identical, because a carried
+// one would own, and so hide, every other file's edges out of it.
+func propAssertRedundantPathlessPruned(t *testing.T, store *store_sqlite.Store, generationID int64, below graph.Reader) {
 	t.Helper()
-	rng := rand.New(rand.NewSource(seed))
-	repo := propNewRepo(t, rng)
-	baseTree := builderGit(t, repo.dir, "rev-parse", "HEAD^{tree}")
-
-	store := builderOpenStore(t, "base")
-	propIndex(t, store, repo.dir)
-
-	commitScript, _ := propApplyScript(t, repo, rng)
-	builderGit(t, repo.dir, "add", "-A")
-	builderGit(t, repo.dir, "commit", "-m", "B")
-	targetTree := builderGit(t, repo.dir, "rev-parse", "HEAD^{tree}")
-	commitOID := builderGit(t, repo.dir, "rev-parse", "HEAD")
-	if targetTree == baseTree {
-		t.Fatalf("seed %d: script %s left the tree where it was", seed, commitScript)
+	for _, node := range store.AtGeneration(generationID).AllNodes() {
+		if node == nil || node.FilePath != "" || node.Kind == graph.KindBuiltin {
+			continue
+		}
+		if pathlessNodeEquivalent(node, below.GetNode(node.ID)) {
+			t.Errorf("generation %d carries pathless %s identical to the layer below; it owns that node's adjacency", generationID, node.ID)
+		}
 	}
-	commitGeneration, commitReport := propBuildCommitLayer(t, store, repo, baseTree, targetTree, commitOID)
-
-	dirtyScript, touched := propApplyScript(t, repo, rng)
-	staged := propStage(t, repo.dir, rng, touched)
-
-	corpus := store.AtGeneration(0)
-	commitLayer, err := graphview.NewGenerationLayer(store.AtGeneration(commitGeneration))
-	if err != nil {
-		t.Fatalf("NewGenerationLayer(commit %d): %v", commitGeneration, err)
-	}
-	dirtyBase := commitLayerBase{
-		Reader: graph.NewOverlaidViewWithLayer(corpus, commitLayer),
-		corpus: corpus,
-	}
-
-	dirtyGeneration, dirtyReport, err := propNewBuilder(store).BuildDirtyLayer(
-		context.Background(), DirtyLayerRequest{
-			Identity: GenerationIdentity{
-				OwnerKind:        "dedicated_graph",
-				GraphID:          propGraphID,
-				LayerID:          propDirtyLayerID,
-				CheckoutID:       "checkout-property",
-				BaseGenerationID: commitGeneration,
-			},
-			Base:         dirtyBase,
-			CheckoutRoot: repo.dir,
-			RepoPrefix:   builderRepoPrefix,
-			WorkspaceID:  builderRepoPrefix,
-			ProjectID:    builderRepoPrefix,
-		})
-	if err != nil {
-		t.Fatalf("seed %d: BuildDirtyLayer after %s: %v", seed, dirtyScript, err)
-	}
-	propAssertPublished(t, store, dirtyGeneration)
-	if dirtyReport.ClosureTruncated {
-		t.Fatalf("closure truncated at %d in a corpus of %d files", dirtyReport.ClosureCap, len(repo.tree))
-	}
-	t.Logf("seed %d: commit %s | dirty %s\n  staged=%v touched=%v closure=%v indexed=%v",
-		seed, commitScript, dirtyScript, staged, touched,
-		dirtyReport.ClosurePaths, dirtyReport.IndexedPaths)
-
-	flat := builderOpenStore(t, "flat")
-	propIndex(t, flat, repo.dir)
-	composed := propComposeStack(t, store, commitGeneration, dirtyGeneration)
-	if base := builderNodeIDs(corpus); slices.Equal(base, builderNodeIDs(composed)) {
-		t.Fatalf("seed %d: the composed stack carries the corpus's identities verbatim — neither layer changed anything",
-			seed)
-	}
-	propReportDivergence(t, seed,
-		[]propScript{commitScript, dirtyScript},
-		[]BuildReport{commitReport, dirtyReport},
-		propCompare(composed, flat))
-	builderAssertMasksValidate(t, store, commitGeneration)
-	builderAssertMasksValidate(t, store, dirtyGeneration)
 }

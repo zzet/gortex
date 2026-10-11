@@ -1,12 +1,14 @@
 package query
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/search/rerank"
 )
 
@@ -157,6 +159,18 @@ type QueryOptions struct {
 	// soft breadth control inside any workspace boundary, not a
 	// replacement for caller-side workspace isolation.
 	RepoAllow map[string]bool `json:"repo_allow,omitempty"`
+	// SearchNodeFilter restricts symbol-search candidates before bounded ranking
+	// and supplementary fills. It sees compact scope fields only and must be a
+	// pure predicate. Traversal and by-ID scope policy remain in ScopeAllows.
+	SearchNodeFilter func(*graph.Node) bool `json:"-"`
+	// SearchPathPrefixes are normalized, repo-relative slash-boundary prefixes.
+	// Capable base backends apply them before candidate limits and hydration;
+	// SearchNodeFilter remains the authoritative filter for every channel.
+	SearchPathPrefixes []string `json:"-"`
+	// SymbolSearchStats, used by path-scoped searches, retains raw text-channel
+	// saturation across a fan-out. A filtered short page alone cannot prove
+	// that the backend is exhausted. The caller resets it before a deeper pass.
+	SymbolSearchStats *SymbolSearchStats `json:"-"`
 	// ExcludeTests, when true, drops edges originating in test code —
 	// nodes flagged by the indexer's test-edge pass (Node.Meta["is_test"]
 	// = true) plus unflagged node kinds whose file path matches the
@@ -211,6 +225,12 @@ type QueryOptions struct {
 	// engine-side rerank invocations to zero. The merge-side rerank
 	// is the source of truth either way.
 	SkipInnerRerank bool `json:"-"`
+
+	// Context is the lifetime of the request this walk serves. When it ends,
+	// long graph walks (bfs and the backend BFS capability) stop and answer
+	// nothing rather than running on as abandoned work. nil falls back to the
+	// engine's own request context, if any. Never serialised.
+	Context context.Context `json:"-"`
 
 	// SkipVectorChannel, when true, makes gatherBackendCandidates skip
 	// the vector channel entirely — no embedder call, no ANN search.
@@ -268,6 +288,8 @@ type SearchTimings struct {
 	TextBackendMS  int64 // strictly inside Backend.Search / text channel
 	EmbedMS        int64 // inside embedder.Embed (vector path only)
 	VectorSearchMS int64 // inside vector.Search ANN call (vector path only)
+	RerankInner    rerank.Timing
+	RerankOuter    rerank.Timing
 	EngineRerankMS int64 // inside rerank.Pipeline.Rerank in SearchSymbolsRanked
 	// BundleMS accumulates the wall-clock spent inside
 	// SymbolBundleSearcherBackend.SearchSymbolBundles (one query per
@@ -277,6 +299,8 @@ type SearchTimings struct {
 	// derivation in the handler subtracts BundleMS so the existing
 	// fields stay meaningful.
 	BundleMS int64
+	// BundleLegs accumulates observed SQLite bundle legs across this request.
+	BundleLegs search.SymbolBundleTimings
 	// CacheHitRate is the fraction of post-merge candidates whose
 	// in/out edges were already in the rerank Context cache when the
 	// handler-side prepare() ran. 1.0 means every candidate was
@@ -299,7 +323,12 @@ func (o QueryOptions) ScopeAllows(n *graph.Node) bool {
 	if n == nil {
 		return true
 	}
-	if o.WorkspaceID != "" {
+	// A synthetic global external (the type checker's `ext::go:fmt::Errorf`
+	// at `external::go:fmt`: no repository, no workspace, a path that is no
+	// repository source) is visible from every scope by construction, as the
+	// repo narrow below already treats it. An unowned node at a source path
+	// stays subject to the workspace check.
+	if o.WorkspaceID != "" && !isGlobalExternal(n) {
 		ws := n.WorkspaceID
 		if ws == "" {
 			ws = n.RepoPrefix
@@ -340,6 +369,14 @@ func (o QueryOptions) ScopeAllows(n *graph.Node) bool {
 
 func (o QueryOptions) hasScopeFilter() bool {
 	return o.WorkspaceID != "" || len(o.RepoAllow) > 0
+}
+
+func (o QueryOptions) searchAllows(n *graph.Node) bool {
+	return n != nil && o.ScopeAllows(n) && (o.SearchNodeFilter == nil || o.SearchNodeFilter(n))
+}
+
+type SymbolSearchStats struct {
+	TextSaturated bool
 }
 
 // FilterByMinTier drops edges whose Origin rank is below minTier.
@@ -787,4 +824,11 @@ type WalkOptions struct {
 // same boundary without duplicating the fallback rules.
 func (o WalkOptions) scopeAllows(n *graph.Node) bool {
 	return QueryOptions{WorkspaceID: o.WorkspaceID, ProjectID: o.ProjectID, RepoAllow: o.RepoAllow}.ScopeAllows(n)
+}
+
+// isGlobalExternal reports whether n is a synthetic global external: owned by
+// no repository and no workspace, at a path that names no repository source.
+func isGlobalExternal(n *graph.Node) bool {
+	return n.RepoPrefix == "" && n.WorkspaceID == "" && n.FilePath != "" &&
+		!graph.IsAuditableRepoSourcePath(n.FilePath)
 }

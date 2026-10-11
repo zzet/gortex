@@ -2513,6 +2513,9 @@ func (g *Graph) AddNode(n *Node) {
 // across many node inserts targeting the same shard.
 func (g *Graph) addNodeLocked(s *shard, n *Node) {
 	prev, hadPrev := s.nodes[n.ID]
+	if hadPrev && keepSharedNodeCopy(prev, n) {
+		return
+	}
 	// Subtract the previous size/count before overwriting; the new
 	// node's contribution is re-added after the RepoPrefix-preservation
 	// logic below has settled on the final prefix.
@@ -2572,6 +2575,35 @@ func (g *Graph) addNodeLocked(s *shard, n *Node) {
 		addNodeToBucket(s.byRepo, s.byRepoIdx, n.RepoPrefix, n.ID, n)
 	}
 	s.repoNodeAdd(n)
+}
+
+// keepSharedNodeCopy reports that prev, not n, stays the row of a shared
+// registry node two different files emit: an annotation
+// (`annotation::<lang>::<name>`, Meta["synthetic"]) or a string literal
+// (`string::error_msg::…`, `string::log_message::…`, KindString). A
+// declaration's ID embeds its file, so only such nodes arrive from several
+// files, each copy stamped with its own file and line; parse workers add them
+// in whatever order they finish, so "the last add wins" made the stored copy —
+// and so a whole index — depend on scheduling. The copy from the smallest file
+// path is kept instead, whatever the order. Everything else keeps the
+// last-add-wins upsert: a re-add from the same file (a re-parse), a pathless
+// copy on either side, a copy of another kind (a reconcile pass upgrading a
+// contract to a topic) and any other node.
+func keepSharedNodeCopy(prev, n *Node) bool {
+	if prev == nil || n == nil || prev.FilePath == "" || n.FilePath == "" || prev.FilePath == n.FilePath {
+		return false
+	}
+	if prev.Kind != n.Kind {
+		return false
+	}
+	if n.Kind != KindString {
+		prevSynthetic, _ := prev.Meta["synthetic"].(bool)
+		nSynthetic, _ := n.Meta["synthetic"].(bool)
+		if !prevSynthetic || !nSynthetic {
+			return false
+		}
+	}
+	return prev.FilePath < n.FilePath
 }
 
 // AddBatch inserts a set of nodes and edges in shard-grouped passes,
@@ -4839,99 +4871,7 @@ func (g *Graph) ClassHierarchyTraverse(
 // returns the same projection. The kinds parameter is the set of
 // kinds treated as call targets (function + method).
 func (g *Graph) FileEditingContext(filePath string, kinds []NodeKind) *FileEditingContextResult {
-	if filePath == "" {
-		return nil
-	}
-	nodes := g.GetFileNodes(filePath)
-	if len(nodes) == 0 {
-		return nil
-	}
-	kset := make(map[NodeKind]struct{}, len(kinds))
-	for _, k := range kinds {
-		if k == "" {
-			continue
-		}
-		kset[k] = struct{}{}
-	}
-	res := &FileEditingContextResult{}
-	var fileNodeID string
-	var defNodeIDs []string
-	for _, n := range nodes {
-		if n == nil {
-			continue
-		}
-		if n.Kind == KindFile {
-			res.FileNode = n
-			fileNodeID = n.ID
-			continue
-		}
-		res.Defines = append(res.Defines, n)
-		if _, ok := kset[n.Kind]; ok {
-			defNodeIDs = append(defNodeIDs, n.ID)
-		}
-	}
-	if fileNodeID != "" {
-		for _, e := range g.GetOutEdges(fileNodeID) {
-			if e == nil {
-				continue
-			}
-			if e.Kind == EdgeImports {
-				res.Imports = append(res.Imports, e)
-			}
-		}
-	}
-	if len(defNodeIDs) == 0 {
-		return res
-	}
-	inEdges := g.GetInEdgesByNodeIDs(defNodeIDs)
-	outEdges := g.GetOutEdgesByNodeIDs(defNodeIDs)
-	callerIDSet := make(map[string]struct{})
-	calleeIDSet := make(map[string]struct{})
-	for _, id := range defNodeIDs {
-		for _, e := range inEdges[id] {
-			if e == nil || e.Kind != EdgeCalls {
-				continue
-			}
-			if e.From == "" {
-				continue
-			}
-			callerIDSet[e.From] = struct{}{}
-		}
-		for _, e := range outEdges[id] {
-			if e == nil || e.Kind != EdgeCalls {
-				continue
-			}
-			if e.To == "" {
-				continue
-			}
-			calleeIDSet[e.To] = struct{}{}
-		}
-	}
-	callerIDs := make([]string, 0, len(callerIDSet))
-	for id := range callerIDSet {
-		callerIDs = append(callerIDs, id)
-	}
-	calleeIDs := make([]string, 0, len(calleeIDSet))
-	for id := range calleeIDSet {
-		calleeIDs = append(calleeIDs, id)
-	}
-	callerNodes := g.GetNodesByIDs(callerIDs)
-	calleeNodes := g.GetNodesByIDs(calleeIDs)
-	for _, id := range callerIDs {
-		n := callerNodes[id]
-		if n == nil || n.FilePath == filePath {
-			continue
-		}
-		res.CalledBy = append(res.CalledBy, n)
-	}
-	for _, id := range calleeIDs {
-		n := calleeNodes[id]
-		if n == nil || n.FilePath == filePath {
-			continue
-		}
-		res.Calls = append(res.Calls, n)
-	}
-	return res
+	return FileEditingContextOf(g, filePath, kinds)
 }
 
 // GetFileSubGraph is the in-memory reference implementation of the

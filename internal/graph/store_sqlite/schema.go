@@ -321,6 +321,43 @@ func nonGeneratedColumns(db schemaColumnDB, table string) ([]string, error) {
 	return out, nil
 }
 
+// analysisActiveGenerationTableBody is the canonical body of the analysis
+// cache's active pointer, shared by schemaSQL and by the v25 migration so the
+// fresh-store and migrated shapes cannot drift.
+//
+// The pointer is keyed by PAYLOAD view generation, not by a single global
+// slot. An analysis is computed over one payload view; the mutation revision
+// that used to be its only concurrency key is a process-local counter on the
+// shared storeCore (store.go, analysis_generation_state.go: "intentionally
+// coarse"), so two analyses over two payload generations can carry the
+// identical build_revision and the old single-slot pointer let the second
+// overwrite — and be read back as — the first. slot stays so the CHECK that
+// pins one row per generation is still readable; view_gen leads the key.
+//
+// generation_id stays UNIQUE: an analysis generation is built inside exactly
+// one payload view and must never be published as two views' active analysis.
+const analysisActiveGenerationTableBody = ` (
+    view_gen      INTEGER NOT NULL DEFAULT 0,
+    slot          INTEGER NOT NULL CHECK (slot = 1),
+    generation_id INTEGER NOT NULL UNIQUE
+        REFERENCES analysis_generations(generation_id) ON DELETE RESTRICT,
+    PRIMARY KEY (view_gen, slot)
+);`
+
+// analysis_generations carries no view_gen index on purpose. schemaSQL runs
+// BEFORE the migration steps (store.go: applyInPlaceMigrations) and is a no-op
+// against a legacy table, so an index naming a column the legacy shape lacks
+// would fail every pre-v25 Open; and PruneAnalysisGenerations keeps only its
+// caller's retention window per view (the daemon passes 2) under a hard cap on
+// how many views keep history at all (analysisRetentionViewCap), so the
+// manifest is bounded at 16 collectable rows plus one active per live view and
+// the view_gen predicates are a scan either way. That 16 is pinned absolutely
+// by TestPruneAnalysisGenerationsBoundsRetainedHistoryAcrossViews, so this
+// rationale cannot be invalidated silently by widening the cap.
+// If it ever grows, the index belongs in createSidecarIndexes — which already
+// runs after applyInPlaceMigrations for exactly this reason, and whose comment
+// names the view_gen (v15) columns as the precedent.
+
 // analysisGenerationSchemaSQL is the normalized, generation-addressed
 // whole-graph analysis cache. Node IDs are copied into generation-local rows:
 // they deliberately do not reference live nodes because incremental reindex
@@ -344,16 +381,13 @@ CREATE TABLE IF NOT EXISTS analysis_generations (
     hub_max                     REAL NOT NULL DEFAULT 0,
     modularity                  REAL NOT NULL DEFAULT 0,
     processes_truncated         INTEGER NOT NULL DEFAULT 0 CHECK (processes_truncated IN (0, 1)),
-    processes_truncation_reason TEXT NOT NULL DEFAULT ''
+    processes_truncation_reason TEXT NOT NULL DEFAULT '',
+    view_gen                    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS analysis_generations_by_state
     ON analysis_generations(state, generation_id DESC);
 
-CREATE TABLE IF NOT EXISTS analysis_active_generation (
-    slot          INTEGER PRIMARY KEY CHECK (slot = 1),
-    generation_id INTEGER NOT NULL UNIQUE
-        REFERENCES analysis_generations(generation_id) ON DELETE RESTRICT
-);
+CREATE TABLE IF NOT EXISTS analysis_active_generation` + analysisActiveGenerationTableBody + `
 
 CREATE TABLE IF NOT EXISTS analysis_generation_components (
     generation_id INTEGER NOT NULL
@@ -649,6 +683,7 @@ CREATE TABLE IF NOT EXISTS view_generations (
     config_hash            TEXT NOT NULL DEFAULT '',
     extractor_versions     TEXT NOT NULL DEFAULT '',
     resolver_version       TEXT NOT NULL DEFAULT '',
+    dependency_revision    TEXT NOT NULL DEFAULT '',
     state                  TEXT NOT NULL,
     covered_files          INTEGER NOT NULL DEFAULT 0,
     affected_files         INTEGER NOT NULL DEFAULT 0,
@@ -936,7 +971,9 @@ func createGraphCoreIndexes(db schemaColumnDB) error {
 // created afterwards too (createGraphCoreIndexes), because the v16 step rebuilds
 // both tables and a dropped table takes its indexes with it.
 var schemaSQL = graphSchemaSQL + sidecarSchemaSQL + generationMaskSchemaSQL +
-	analysisGenerationSchemaSQL + checkoutCatalogSchemaSQL
+	generationInputManifestSchemaSQL +
+	analysisGenerationSchemaSQL + checkoutCatalogSchemaSQL + "\n" +
+	dedicatedBasePublicationsSchemaSQL + ";\n"
 
 // graphSchemaSQL is the node/edge core plus the two FTS5 virtual tables — the
 // part of the schema that is not a generation-keyed payload sidecar.
@@ -1445,6 +1482,10 @@ last_author, last_commit_at, head_sha, branch, computed_at`,
     ON symbol_fts_rowid(fts_rowid)`,
 			`CREATE INDEX IF NOT EXISTS symbol_fts_rowid_by_repo
     ON symbol_fts_rowid(view_gen, repo_prefix, fts_rowid)`,
+			// A generation's documents in rowid order, for the no-MATCH read
+			// (store_fts_stats.go SymbolFTSGenerationRows).
+			`CREATE INDEX IF NOT EXISTS symbol_fts_rowid_by_generation
+    ON symbol_fts_rowid(view_gen, fts_rowid)`,
 		},
 	},
 	// content_fts_rowid is the ownership index for content FTS docids. A content
@@ -1551,6 +1592,7 @@ const generationFileMasksTableBody = ` (
 const generationNodeTombstonesTableBody = ` (
     view_gen INTEGER NOT NULL,
     node_id  TEXT NOT NULL,
+    claim_kind TEXT NOT NULL DEFAULT 'legacy_tombstone',
     PRIMARY KEY (view_gen, node_id)
 ) WITHOUT ROWID`
 
@@ -1585,6 +1627,11 @@ var generationMaskTables = []generationMaskTable{
 	{table: "generation_node_tombstones", body: generationNodeTombstonesTableBody},
 	{table: "generation_edge_sources", body: generationEdgeSourcesTableBody},
 	{table: "generation_producer_completeness", body: generationProducerCompletenessTableBody},
+	{table: "generation_contract_work", body: contractWorkTableBody},
+	{table: "generation_contract_input_state", body: contractInputStateTableBody},
+	{table: "generation_contract_boundary_receipt", body: contractBoundaryReceiptTableBody},
+	{table: "generation_contract_boundary_keys", body: contractBoundaryKeysTableBody},
+	{table: "generation_contract_boundary_baseline", body: contractBoundaryBaselineTableBody},
 }
 
 // generationMaskSchemaSQL is the fresh-store CREATE TABLE DDL for every entry
@@ -1599,6 +1646,90 @@ func buildGenerationMaskSchemaSQL() string {
 		b.WriteString("CREATE TABLE IF NOT EXISTS ")
 		b.WriteString(mask.table)
 		b.WriteString(mask.body)
+		b.WriteString(";\n")
+	}
+	b.WriteString(contractWorkScopeIndexDDL)
+	b.WriteString(contractAttachmentSchemaSQL)
+	b.WriteString(contractAttachmentInputsSchemaSQL)
+	b.WriteString(contractBoundaryKeysFileIndexDDL)
+	return b.String()
+}
+
+// The admitted-input manifest.
+//
+// A dirty generation's payload says what the builder derived; nothing in it
+// says which working-tree inputs the builder looked at. The masks cannot say it
+// either: a path the builder excluded, found unreadable, found identical to
+// HEAD, or read only as context leaves no payload row and often no mask row.
+// The manifest is that record — one row per input path the generation's sample
+// named, with the sampler's content identity and the builder's admission
+// verdict — so the next build can diff its own sample against it instead of
+// re-deriving the whole dirty set.
+//
+// A chain root stores the full manifest (is_full = 1); a child built over a
+// parent stores only the paths whose entry differs, and a reader resolves the
+// chain newest-wins. The meta row is what makes the entry set trustworthy: a
+// generation with entries but no meta row, or with fewer entries than
+// entry_count, has no usable manifest.
+//
+// Both tables are keyed by view_gen and sealed with the payload: they are
+// written through the payload write gate before PublishPayloadGeneration and
+// swept on retirement through payloadSweepTables. Like the masks, view_gen
+// carries no DEFAULT — the base corpus has no sample and no manifest — and the
+// write path refuses the base generation (ErrInputManifestAtBaseGeneration).
+// The vocabulary columns are plain TEXT validated in Go, like the masks.
+
+// generation_input_manifest is one admitted-input entry per path. file_path is
+// git-relative and canonical (path.Clean), the spelling the builder's change
+// set uses; mode is the git octal mode and content_sha256 the sampler's
+// content identity, both empty where the state carries none.
+const generationInputManifestTableBody = ` (
+    view_gen       INTEGER NOT NULL,
+    file_path      TEXT NOT NULL,
+    entry_state    TEXT NOT NULL,
+    admission      TEXT NOT NULL,
+    mode           TEXT NOT NULL DEFAULT '',
+    content_sha256 TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (view_gen, file_path)
+) WITHOUT ROWID`
+
+// generation_input_manifest_meta is the one row that declares a generation's
+// manifest complete: its format version, whether it is a full manifest or a
+// delta over the physical parent, how many entry rows it wrote, and the digest
+// of the extraction/dependency/producer policy the entries were admitted under.
+const generationInputManifestMetaTableBody = ` (
+    view_gen         INTEGER PRIMARY KEY,
+    manifest_version INTEGER NOT NULL,
+    is_full          INTEGER NOT NULL,
+    entry_count      INTEGER NOT NULL,
+    policy_digest    TEXT NOT NULL
+)`
+
+// generationInputManifestTables registers the manifest tables. They share the
+// mask registry's {table, body} shape so the fresh-store DDL and the v29
+// migration build the same objects from one string, and payloadSweepTables
+// reads this registry beside the other two.
+var generationInputManifestTables = []generationMaskTable{
+	{table: "generation_input_manifest", body: generationInputManifestTableBody},
+	{table: "generation_input_manifest_meta", body: generationInputManifestMetaTableBody},
+	// The per-pass derivation stamps (derivation_stamps.go) ride this
+	// registry: created by the idempotent DDL on every Open (no version
+	// bump), swept on retirement and carried by a whole-generation copy.
+	{table: "generation_derivation_stamps", body: generationDerivationStampsTableBody},
+}
+
+// generationInputManifestSchemaSQL is the fresh-store CREATE TABLE DDL for the
+// manifest tables. The v29 migration executes the same string, so a migrated
+// store and a fresh one cannot drift.
+var generationInputManifestSchemaSQL = buildGenerationInputManifestSchemaSQL()
+
+func buildGenerationInputManifestSchemaSQL() string {
+	var b strings.Builder
+	b.WriteByte('\n')
+	for _, table := range generationInputManifestTables {
+		b.WriteString("CREATE TABLE IF NOT EXISTS ")
+		b.WriteString(table.table)
+		b.WriteString(table.body)
 		b.WriteString(";\n")
 	}
 	return b.String()

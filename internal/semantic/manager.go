@@ -297,6 +297,26 @@ type EnrichOptions struct {
 	// enrichment pool overlaps the resolve phase so compute proceeds but no
 	// apply can starve the resolver on the shared ResolveMutex.
 	ApplyGate <-chan struct{}
+
+	// CheckoutScope, when non-nil, marks the pass as a checkout pass over a
+	// generation handle and carries its compiler scope to the providers (see
+	// CheckoutCompilerScope). nil is every other caller: providers behave
+	// exactly as before.
+	CheckoutScope *CheckoutCompilerScope
+
+	// CommittedTreeOnly restricts the pass to providers that read a committed
+	// tree through the scope's overlay (CommittedTreeReader). A pass over a
+	// committed tree whose checkout root holds a different working copy sets
+	// it: any other provider reads the working copy, which is not the tree
+	// the generation describes.
+	CommittedTreeOnly bool
+
+	// Context, when non-nil, is the caller's context: its cancellation
+	// reaches every provider pass (each pass context derives from it), so a
+	// caller that abandons the work (a yielding compaction) stops the
+	// provider at its next check instead of waiting for it. nil keeps the
+	// Manager lifecycle as the only parent.
+	Context context.Context
 }
 
 // defaultEnrichmentAdmissionFloor balances two measured failure modes:
@@ -430,6 +450,13 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 			)
 			continue
 		}
+		if opts.CommittedTreeOnly && !readsCommittedTree(provider) {
+			m.logger.Debug("semantic provider skipped, it cannot read a committed tree",
+				zap.String("provider", provider.Name()),
+				zap.String("language", lang),
+			)
+			continue
+		}
 
 		results = m.runEnrichForProvider(g, roots, lang, provider, nodeCounts, opts, results, partial)
 	}
@@ -447,7 +474,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	// Leaving it out of the synchronous pass is what keeps cold/warm start
 	// fast; the router is still wired, so a query can lazy-spawn a server on
 	// demand.
-	if m.config.EagerLSP && m.lspRouter != nil {
+	if m.config.EagerLSP && m.lspRouter != nil && !opts.CommittedTreeOnly {
 		// Pre-pass: pure metadata, no spawn.
 		bestSpec := make(map[string]string) // language → winning spec name
 		bestPrio := make(map[string]int)
@@ -512,7 +539,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 					if len(langs) == 0 {
 						return
 					}
-					results = m.runEnrichOne(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, results, partial)
+					results = m.runEnrichOneScoped(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, opts.CheckoutScope, opts.Context, results, partial)
 				}()
 			}
 		}
@@ -523,6 +550,9 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	// winner can confirm-but-never-downgrade what it stamped.
 	for _, p := range m.providers {
 		if !isSupplemental(p) || !p.Available() || m.providerDisabled(p.Name()) {
+			continue
+		}
+		if opts.CommittedTreeOnly && !readsCommittedTree(p) {
 			continue
 		}
 		langs := p.Languages()
@@ -664,7 +694,7 @@ func (m *Manager) configPriorityFor(name string) (int, bool) {
 // providers.
 func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, opts EnrichOptions, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	for _, repoName := range sortedRootNames(roots, nodeCounts) {
-		results = m.runEnrichOne(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, results, partial)
+		results = m.runEnrichOneScoped(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, opts.CheckoutScope, opts.Context, results, partial)
 	}
 	return results
 }
@@ -1037,6 +1067,13 @@ func shortSHA(sha string) string {
 // failed, or returned a Partial result flips partial[repoName] so the caller
 // knows the repo's enrichment must be retried.
 func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, applyGate <-chan struct{}, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
+	return m.runEnrichOneScoped(g, repoName, repoRoot, lang, provider, nodeCount, rs, applyGate, nil, nil, results, partial)
+}
+
+// runEnrichOneScoped is runEnrichOne for a pass that may carry a checkout
+// compiler scope. A nil scope leaves the pass context exactly as
+// runEnrichOne builds it.
+func (m *Manager) runEnrichOneScoped(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, applyGate <-chan struct{}, checkoutScope *CheckoutCompilerScope, parent context.Context, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	if !m.beginPass() {
 		partial[repoName] = true
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, 0, nil,
@@ -1073,7 +1110,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	// not implement the interface, so gopls / rust-analyzer never wait. Bounded
 	// and best-effort: a probe timeout or error just proceeds.
 	if rp, ok := provider.(ReadinessProber); ok && enrichReadinessBudget > 0 {
-		lifecycleCtx, stopLifecycle := m.passContext(context.Background())
+		lifecycleCtx, stopLifecycle := m.passContext(parent)
 		rctx, rcancel := context.WithTimeout(lifecycleCtx, enrichReadinessBudget)
 		err := rp.WaitReady(rctx, repoRoot)
 		rcancel()
@@ -1144,12 +1181,12 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	// every path below receives from done before returning: a timed-out
 	// in-process writer is never detached and the next provider/repo cannot
 	// overlap it.
-	baseCtx, stopLifecycle := m.passContext(context.Background())
+	baseCtx, stopLifecycle := m.passContext(parent)
 	defer stopLifecycle()
 	if ctxErr := baseCtx.Err(); ctxErr != nil {
 		partial[repoName] = true
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
-			"semantic manager closed before provider dispatch")
+			"semantic manager closed (or the caller cancelled) before provider dispatch")
 		return results
 	}
 	ctx := baseCtx
@@ -1163,6 +1200,9 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	ctx = WithEnrichmentAdmissionNodes(ctx, nodeCount)
 	if applyGate != nil {
 		ctx = WithApplyGate(ctx, applyGate)
+	}
+	if checkoutScope != nil {
+		ctx = WithCheckoutCompilerScope(ctx, *checkoutScope)
 	}
 	defer cancel()
 
@@ -1654,4 +1694,43 @@ func (m *Manager) ProviderForLanguage(lang string) Provider {
 	}
 	candidates := m.selectProviders()
 	return candidates[lang]
+}
+
+// CheckoutPreparationProviders describes every eager provider this checkout
+// language can dispatch, including supplemental passes. A router-only winner
+// is unknown until instantiated and must stay in ordinary lane admission.
+// This metadata query never spawns a language server.
+func (m *Manager) CheckoutPreparationProviders(language string) ([]Provider, bool) {
+	if m == nil || !m.config.Enabled || !m.config.checkoutLSPEnabled() {
+		return nil, true
+	}
+	selected := m.selectProviders()
+	var out []Provider
+	if provider := selected[language]; provider != nil {
+		out = append(out, provider)
+	}
+	for _, provider := range m.providers {
+		if !isSupplemental(provider) || !provider.Available() || m.providerDisabled(provider.Name()) {
+			continue
+		}
+		for _, lang := range provider.Languages() {
+			if lang == language {
+				out = append(out, provider)
+				break
+			}
+		}
+	}
+	if m.config.EagerLSP && m.lspRouter != nil && selected[language] == nil {
+		for _, name := range m.lspRouter.EnabledSpecNames() {
+			if !m.lspRouter.SpecAvailable(name) {
+				continue
+			}
+			for _, lang := range m.lspRouter.SpecLanguages(name) {
+				if lang == language {
+					return nil, false
+				}
+			}
+		}
+	}
+	return out, true
 }

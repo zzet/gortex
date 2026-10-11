@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -123,6 +124,9 @@ func (s *Server) graphRefreshReceiptPayload(ctx context.Context, id string) (map
 	if outcome.Err != nil {
 		payload["error"] = outcome.Err.Error()
 	}
+	if phases := publicationPhasesPayload(receipt.id, time.Time{}); phases != nil {
+		payload["publication_phases"] = phases
+	}
 	return payload, true
 }
 
@@ -188,11 +192,54 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 	}
 	payload["retry_safe"] = snap.DiskStatus == mutationDiskNotApplied || snap.DiskStatus == mutationDiskFailed
 	payload["graph_status_terminal"] = graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded)
+	s.attachRecordDerivedFanout(payload, record, snap)
 	if note := mutationGraphStatusNote(snap.GraphStatus, snap.GraphRecorded, snap.CheckoutID); note != "" {
 		payload["graph_note"] = note
 	}
 	payload["guidance"] = mutationStatusGuidance(snap.DiskStatus)
+	if snap.ReindexReceipt != "" {
+		record.mu.RLock()
+		committedAt := record.committedAt
+		record.mu.RUnlock()
+		if phases := publicationPhasesPayload(snap.ReindexReceipt, committedAt); phases != nil {
+			payload["publication_phases"] = phases
+		}
+	}
 	return payload
+}
+
+// attachRecordDerivedFanout publishes the bounded-derived-pass completeness
+// fact beside graph_status_terminal.
+//
+// It is the answer to the question graph_status cannot answer. A caller whose
+// edit response was lost comes here to learn two things — did the bytes land,
+// and has the graph caught up — and "caught up" has always silently meant "the
+// file was re-parsed", never "its dependants were rebound". When the
+// affected-by bound fires, graph_status reads "fresh" over a graph that is
+// knowingly incoherent for the files the pass dropped, and until now nothing
+// on this payload said so.
+//
+// The fact is read from the freshness receipt rather than from the ledger
+// record: the record keeps the generation the reindex ran under, which is the
+// handle that finds it (see derivedFanoutForMutation). A record whose receipt
+// has aged out, or one from a path the watcher never measured, renders
+// nothing — an absent verdict, never an invented one.
+func (s *Server) attachRecordDerivedFanout(
+	payload map[string]any,
+	record *mutationCommitRecord,
+	snap mutationCommitSnapshot,
+) {
+	if payload == nil || record == nil || !snap.GraphRecorded {
+		return
+	}
+	record.mu.RLock()
+	absPath := record.absPath
+	record.mu.RUnlock()
+	fanout, ok := s.derivedFanoutForMutation(absPath, snap.ReindexGeneration)
+	if !ok {
+		return
+	}
+	attachDerivedFanout(payload, fanout)
 }
 
 func mutationGraphStatusNote(graph string, recorded bool, checkoutID string) string {

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync/atomic"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 // Analysis is a whole-graph pass — six analyzers over the full node and edge
@@ -30,6 +32,7 @@ const (
 // most one and can be told how long it has left.
 type analysisRunState struct {
 	running   atomic.Bool
+	again     atomic.Bool  // another pass was asked for while one ran
 	startedAt atomic.Int64 // unix nanos of the in-flight pass
 	lastTook  atomic.Int64 // nanos the previous pass took, 0 until one completes
 }
@@ -110,7 +113,7 @@ func (s *Server) ensureAnalysis() AnalysisAvailability {
 	// would queue behind it and block the caller for minutes — the exact
 	// failure this path exists to prevent. Failing to take the lock is
 	// itself the answer: a writer holds it, so a pass is in flight.
-	if !s.analysisMu.TryRLock() {
+	if s.analysisPassActive.Load() || !s.analysisMu.TryRLock() {
 		return AnalysisAvailability{Running: true, RetryAfter: s.analysisRun.retryHint()}
 	}
 	ready := s.analysisSnapshotCurrentLocked()
@@ -119,21 +122,49 @@ func (s *Server) ensureAnalysis() AnalysisAvailability {
 		return AnalysisAvailability{Ready: true}
 	}
 
-	// Exactly one caller starts the pass; the rest join the same wait.
-	if s.analysisRun.running.CompareAndSwap(false, true) {
-		s.analysisRun.startedAt.Store(time.Now().UnixNano())
-		go func() {
-			started := time.Now()
-			defer func() {
-				s.analysisRun.lastTook.Store(int64(time.Since(started)))
-				s.analysisRun.startedAt.Store(0)
-				s.analysisRun.running.Store(false)
-			}()
-			if s.logger != nil {
-				s.logger.Info("analysis: starting on-demand pass")
-			}
-			s.RunAnalysis()
-		}()
-	}
+	s.startBackgroundAnalysis("on-demand")
 	return AnalysisAvailability{Running: true, RetryAfter: s.analysisRun.retryHint()}
 }
+
+// startBackgroundAnalysis starts one background analysis pass unless one this
+// path started is still running; concurrent callers join it. A background pass
+// yields to edit cycles and tool calls (analysis_pass.go), so it is how every
+// tool that needs the rollups recomputed asks for them — the on-demand reader,
+// and index_repository / reindex_repository after they change the graph. A
+// pass run inline on the tool call would hold the core from the edits and
+// answers overlapping it for its whole length (minutes), and it could not
+// yield, since the tool call it would yield to is its own.
+func (s *Server) startBackgroundAnalysis(reason string) bool {
+	if !s.analysisRun.running.CompareAndSwap(false, true) {
+		// A pass this path started is in flight. It reads the graph as it
+		// is when it computes, and a write after it pinned its revision
+		// supersedes it; request one more pass for that case.
+		s.analysisRun.again.Store(true)
+		return false
+	}
+	s.analysisRun.startedAt.Store(time.Now().UnixNano())
+	go func() {
+		for {
+			started := time.Now()
+			if s.logger != nil {
+				s.logger.Info("analysis: starting background pass", zap.String("reason", reason))
+			}
+			s.RunAnalysis()
+			s.analysisRun.lastTook.Store(int64(time.Since(started)))
+			if !s.analysisRun.again.Swap(false) {
+				break
+			}
+			reason = "requested again while running"
+		}
+		s.analysisRun.startedAt.Store(0)
+		s.analysisRun.running.Store(false)
+		if hook := backgroundAnalysisDoneHook; hook != nil {
+			hook()
+		}
+	}()
+	return true
+}
+
+// backgroundAnalysisDoneHook, when set, runs when a background pass started by
+// startBackgroundAnalysis finishes. Tests only.
+var backgroundAnalysisDoneHook func()

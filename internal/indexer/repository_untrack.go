@@ -36,6 +36,18 @@ func (mi *MultiIndexer) untrackRepoChecked(
 	force bool,
 	finalize func(*RepoMetadata) error,
 ) (nodesRemoved, edgesRemoved int, err error) {
+	return mi.untrackRepoCheckedRetainingAdmission(ctx, repoPrefix, force, finalize, false)
+}
+
+// untrackRepoCheckedRetainingAdmission is the lifecycle-only continuation path.
+// Legacy callers keep the four-argument wrapper and release admission normally.
+func (mi *MultiIndexer) untrackRepoCheckedRetainingAdmission(
+	ctx context.Context,
+	repoPrefix string,
+	force bool,
+	finalize func(*RepoMetadata) error,
+	retainAdmission bool,
+) (nodesRemoved, edgesRemoved int, err error) {
 	if repoPrefix == "" {
 		return 0, 0, fmt.Errorf("indexer: repository teardown refuses an empty prefix")
 	}
@@ -129,10 +141,24 @@ func (mi *MultiIndexer) untrackRepoChecked(
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	state.retainAdmission = state.retainAdmission || retainAdmission
 	if state.finalize == nil && finalize != nil {
 		state.finalize = finalize
 	}
+	finalizeConfig := func() error {
+		if state.configFinalized || state.finalize == nil {
+			return nil
+		}
+		if err := state.finalize(state.metadata); err != nil {
+			return fmt.Errorf("indexer: finalize repository cleanup for %s: %w", repoPrefix, err)
+		}
+		state.configFinalized = true
+		return nil
+	}
 	if state.completed {
+		if err := mi.finalizeCompletedRepositoryUntrackConfig(repoPrefix, state, coordinator); err != nil {
+			return state.nodesRemoved, state.edgesRemoved, err
+		}
 		return state.nodesRemoved, state.edgesRemoved, nil
 	}
 
@@ -178,28 +204,61 @@ func (mi *MultiIndexer) untrackRepoChecked(
 			fmt.Errorf("indexer: authoritative cleanup for %s: %w", repoPrefix, err)
 	}
 
-	if !state.configFinalized && state.finalize != nil {
-		if err := state.finalize(state.metadata); err != nil {
-			return state.nodesRemoved, state.edgesRemoved,
-				fmt.Errorf("indexer: finalize repository cleanup for %s: %w", repoPrefix, err)
-		}
-		state.configFinalized = true
+	if err := finalizeConfig(); err != nil {
+		return state.nodesRemoved, state.edgesRemoved, err
 	}
 	if !state.contract.Empty() {
 		mi.ReconcileContractEdgesForFrontier(state.contract)
 	}
 
-	// Delete the continuation before opening admission. A caller that already
-	// holds its pointer observes completed=true; a fresh track cannot enter
-	// until the exact closed coordinator is detached immediately afterwards.
+	// A cleanup reservation wins atomically over continuation deletion and
+	// keeps this exact closed lane for lifecycle finalization.
 	state.completed = true
-	mi.mu.Lock()
-	if mi.pendingRepositoryUntracks[repoPrefix] == state {
-		delete(mi.pendingRepositoryUntracks, repoPrefix)
+	if state.retainAdmission {
+		return state.nodesRemoved, state.edgesRemoved, nil
 	}
-	mi.mu.Unlock()
-	mi.detachRepositoryMutationCoordinator(repoPrefix, coordinator)
+	retained, detached := mi.detachRepositoryUntrackContinuation(repoPrefix, state, coordinator, nil)
+	if retained {
+		state.retainAdmission = true
+		return state.nodesRemoved, state.edgesRemoved, nil
+	}
+	if !detached {
+		return state.nodesRemoved, state.edgesRemoved,
+			fmt.Errorf("%w for %s", errRepositoryUntrackContinuationChanged, repoPrefix)
+	}
 	return state.nodesRemoved, state.edgesRemoved, nil
+}
+
+var errRepositoryUntrackContinuationChanged = fmt.Errorf("indexer: repository teardown continuation changed")
+
+// finalizeCompletedRepositoryUntrackConfig runs a callback supplied after the
+// payload phases completed only while the same continuation and mutation lane
+// still own the prefix. The caller owns state.mu through the callback.
+func (mi *MultiIndexer) finalizeCompletedRepositoryUntrackConfig(
+	repoPrefix string,
+	state *repositoryUntrackState,
+	coordinator *repositoryMutationCoordinator,
+) error {
+	if state == nil || coordinator == nil || state.coordinator != coordinator {
+		return fmt.Errorf("%w for %s", errRepositoryUntrackContinuationChanged, repoPrefix)
+	}
+	if state.configFinalized || state.finalize == nil {
+		return nil
+	}
+	mi.mu.RLock()
+	mi.repositoryMutationMu.Lock()
+	current := mi.pendingRepositoryUntracks[repoPrefix] == state &&
+		mi.repositoryMutations[repoPrefix] == coordinator
+	mi.repositoryMutationMu.Unlock()
+	mi.mu.RUnlock()
+	if !current {
+		return fmt.Errorf("%w for %s", errRepositoryUntrackContinuationChanged, repoPrefix)
+	}
+	if err := state.finalize(state.metadata); err != nil {
+		return fmt.Errorf("indexer: finalize repository cleanup for %s: %w", repoPrefix, err)
+	}
+	state.configFinalized = true
+	return nil
 }
 
 func (mi *MultiIndexer) purgeRepositoryPayload(

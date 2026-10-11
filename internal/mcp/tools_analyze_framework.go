@@ -22,8 +22,8 @@ import (
 //   - method: HTTP verb (GET/POST/...) or gRPC method (case-insensitive)
 //   - path:   substring match on the contract's path / topic / channel
 //   - type:   contract type — http / grpc / graphql / topic / ws.
-//             Named `type` (not `kind`) because the analyze dispatcher
-//             reserves `kind` for the analyzer name itself.
+//     Named `type` (not `kind`) because the analyze dispatcher
+//     reserves `kind` for the analyzer name itself.
 func (s *Server) handleAnalyzeRoutes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	methodFilter := strings.ToUpper(strings.TrimSpace(stringArg(args, "method")))
@@ -39,7 +39,10 @@ func (s *Server) handleAnalyzeRoutes(ctx context.Context, req mcp.CallToolReques
 		File    string `json:"file"`
 		Line    int    `json:"line"`
 	}
-	reader := s.readerFor(ctx)
+	reader, readerErr := s.contractReaderForContext(ctx)
+	if readerErr != nil {
+		return mcp.NewToolResultError(readerErr.Error()), nil
+	}
 	var rows []*routeRow
 	for e := range edgesByKinds(reader, graph.EdgeHandlesRoute) {
 		contractNode := reader.GetNode(e.To)
@@ -164,7 +167,11 @@ func (s *Server) handleAnalyzeRouteFrameworks(ctx context.Context, req mcp.CallT
 	// workspace + optional repo allow-set. Unbound sessions count every
 	// contract node, so the gate is a strict no-op there.
 	scoped := s.scopeFiltersActive(ctx)
-	for _, n := range s.readerFor(ctx).AllNodes() {
+	reader, readerErr := s.contractReaderForContext(ctx)
+	if readerErr != nil {
+		return mcp.NewToolResultError(readerErr.Error()), nil
+	}
+	for _, n := range reader.AllNodes() {
 		if n == nil || n.Kind != graph.KindContract || n.Meta == nil {
 			continue
 		}
@@ -525,11 +532,11 @@ func (s *Server) handleAnalyzeComponents(ctx context.Context, req mcp.CallToolRe
 // child to produce a fan-in / fan-out leaderboard.
 func (s *Server) componentsRollup(ctx context.Context, req mcp.CallToolRequest, nameFilter string) (*mcp.CallToolResult, error) {
 	type compRow struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		FanIn   int    `json:"fan_in"`
-		FanOut  int    `json:"fan_out"`
-		File    string `json:"file,omitempty"`
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		FanIn  int    `json:"fan_in"`
+		FanOut int    `json:"fan_out"`
+		File   string `json:"file,omitempty"`
 	}
 	reader := s.readerFor(ctx)
 	stats := map[string]*compRow{}
@@ -712,8 +719,8 @@ func (s *Server) componentsForOne(ctx context.Context, req mcp.CallToolRequest, 
 // Filters:
 //   - framework:     dbt | sqlmesh
 //   - type:          resource type — model / seed / snapshot / source.
-//                    Named `type` (not `kind`) because the analyze
-//                    dispatcher reserves `kind` for the analyzer name.
+//     Named `type` (not `kind`) because the analyze
+//     dispatcher reserves `kind` for the analyzer name.
 //   - materialized:  substring match on the materialization
 //   - name:          substring match on the model / source name
 func (s *Server) handleAnalyzeDbtModels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

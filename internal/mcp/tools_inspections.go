@@ -263,7 +263,7 @@ func runDeadCodeInspection(ctx context.Context, s *Server, scope inspectionScope
 	// another repo still keeps a symbol alive. Only the rows are narrowed,
 	// matching handleFindDeadCode.
 	reader := s.readerFor(ctx)
-	entries := analysis.FindDeadCode(reader, s.getProcesses(), nil)
+	entries := analysis.FindDeadCode(graph.BindReadContext(reader, ctx), s.getProcesses(), nil)
 	scoped := s.scopeFiltersActive(ctx)
 	out := make([]inspectionViolation, 0, len(entries))
 	for _, e := range entries {

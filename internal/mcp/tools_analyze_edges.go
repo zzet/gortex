@@ -30,6 +30,44 @@ import (
 	"github.com/zzet/gortex/internal/graphpath"
 )
 
+// analyzeOwnedEdgeVisible preserves parser-emitted unresolved/external targets
+// only when their reference is owned by a visible symbol and source file.
+// A hydrated target must satisfy the ordinary node ceiling. The request reader
+// remains authoritative; this helper never looks through a routed view.
+func (s *Server) analyzeOwnedEdgeVisible(ctx context.Context, g graph.Reader, e *graph.Edge) bool {
+	if e == nil {
+		return false
+	}
+	if !s.scopeFiltersActive(ctx) {
+		return true
+	}
+	owner := g.GetNode(e.From)
+	if !s.analyzeNodeVisible(ctx, owner) {
+		return false
+	}
+	if e.FilePath != "" && e.FilePath != owner.FilePath {
+		siteVisible := false
+		for _, n := range g.GetFileNodes(e.FilePath) {
+			if s.analyzeNodeVisible(ctx, n) && n.RepoPrefix == owner.RepoPrefix {
+				siteVisible = true
+				break
+			}
+		}
+		if !siteVisible {
+			return false
+		}
+	}
+	target := g.GetNode(e.To)
+	if target != nil {
+		return s.analyzeNodeVisible(ctx, target)
+	}
+	targetID := e.To
+	if owner.RepoPrefix != "" {
+		targetID = strings.TrimPrefix(targetID, owner.RepoPrefix+"/")
+	}
+	return graph.IsUnresolvedTarget(targetID) || strings.HasPrefix(targetID, "external::")
+}
+
 // ---------------------------------------------------------------------------
 // channel_ops — list channels with their senders/receivers.
 // ---------------------------------------------------------------------------
@@ -77,6 +115,9 @@ func (s *Server) handleAnalyzeChannelOps(ctx context.Context, req mcp.CallToolRe
 	// buffers for both the scan and the node lookups below.
 	g := s.readerFor(ctx)
 	for e := range edgesByKinds(g, graph.EdgeSends, graph.EdgeRecvs) {
+		if !s.analyzeOwnedEdgeVisible(ctx, g, e) {
+			continue
+		}
 		if !graphpath.HasPrefix(e.FilePath, pathPrefix) {
 			continue
 		}
@@ -95,34 +136,6 @@ func (s *Server) handleAnalyzeChannelOps(ctx context.Context, req mcp.CallToolRe
 		sort.Strings(r.Senders)
 		sort.Strings(r.Receivers)
 		rows = append(rows, r)
-	}
-	// Scope filter: keep a channel row iff its target node is visible to
-	// the request (session workspace ceiling + optional repo allow-set),
-	// and prune sender/receiver lists to visible nodes only. No-op for an
-	// unbound, un-narrowed request. Sends/Recvs are edge counts, left as-is.
-	if s.scopeFiltersActive(ctx) {
-		kept := make([]*channelRow, 0, len(rows))
-		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, g.GetNode(r.Channel)) {
-				continue
-			}
-			senders := make([]string, 0, len(r.Senders))
-			for _, id := range r.Senders {
-				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
-					senders = append(senders, id)
-				}
-			}
-			r.Senders = senders
-			receivers := make([]string, 0, len(r.Receivers))
-			for _, id := range r.Receivers {
-				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
-					receivers = append(receivers, id)
-				}
-			}
-			r.Receivers = receivers
-			kept = append(kept, r)
-		}
-		rows = kept
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		// Total op count desc; tie-break by channel id for stability.
@@ -1406,7 +1419,7 @@ func (s *Server) handleAnalyzeErrorSurface(ctx context.Context, req mcp.CallTool
 	// not implement the capability, so an overlay-active request falls
 	// through to the edge walk below and reads the pushed buffers.
 	g := s.readerFor(ctx)
-	if surfacer, ok := g.(graph.ThrowerErrorSurfacer); ok {
+	if surfacer, ok := g.(graph.ThrowerErrorSurfacer); ok && !s.scopeFiltersActive(ctx) {
 		// Server-side path: one server-side aggregate for the per-thrower
 		// throws+targets dedup, one for the per-thrower error-msg
 		// attachment. No per-thrower GetOutEdges fanout.
@@ -1426,6 +1439,9 @@ func (s *Server) handleAnalyzeErrorSurface(ctx context.Context, req mcp.CallTool
 	} else {
 		byThrower := map[string]*throwerRow{}
 		for e := range edgesByKinds(g, graph.EdgeThrows) {
+			if !s.analyzeOwnedEdgeVisible(ctx, g, e) {
+				continue
+			}
 			if !graphpath.HasPrefix(e.FilePath, pathPrefix) {
 				continue
 			}
@@ -1454,7 +1470,7 @@ func (s *Server) handleAnalyzeErrorSurface(ctx context.Context, req mcp.CallTool
 		// carries the literal message.
 		for thrower, row := range byThrower {
 			for _, e := range g.GetOutEdges(thrower) {
-				if e == nil || e.Kind != graph.EdgeEmits {
+				if e == nil || e.Kind != graph.EdgeEmits || !s.analyzeOwnedEdgeVisible(ctx, g, e) {
 					continue
 				}
 				n := g.GetNode(e.To)
@@ -1473,28 +1489,6 @@ func (s *Server) handleAnalyzeErrorSurface(ctx context.Context, req mcp.CallTool
 			sort.Strings(r.ErrorMsgs)
 			rows = append(rows, r)
 		}
-	}
-	// Scope filter: keep a thrower row iff the throwing symbol is visible,
-	// and prune the error-target list to visible nodes only. Error message
-	// literals (ErrorMsgs) are string values, not node ids, left intact.
-	// Applies to both the ThrowerErrorSurfacer and fallback build paths.
-	// No-op when unbound.
-	if s.scopeFiltersActive(ctx) {
-		kept := make([]*throwerRow, 0, len(rows))
-		for _, r := range rows {
-			if !s.analyzeNodeVisible(ctx, g.GetNode(r.Symbol)) {
-				continue
-			}
-			errs := make([]string, 0, len(r.Errors))
-			for _, id := range r.Errors {
-				if s.analyzeNodeVisible(ctx, g.GetNode(id)) {
-					errs = append(errs, id)
-				}
-			}
-			r.Errors = errs
-			kept = append(kept, r)
-		}
-		rows = kept
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		// Throwers with the most distinct error targets surface

@@ -1,6 +1,10 @@
 package indexer
 
-import "github.com/zzet/gortex/internal/graph"
+import (
+	"sort"
+
+	"github.com/zzet/gortex/internal/graph"
+)
 
 // indirectMutationEdgesForMethods computes the indirect-mutation slice whose
 // truth can change when seedMethods change. It expands backwards through
@@ -9,6 +13,20 @@ import "github.com/zzet/gortex/internal/graph"
 func indirectMutationEdgesForMethods(
 	g graph.Store,
 	seedMethods []*graph.Node,
+) ([]indirectMutSpec, map[string]*graph.Node) {
+	return indirectMutationEdgesForRoots(g, seedMethods, nil)
+}
+
+// indirectMutationEdgesForRoots is indirectMutationEdgesForMethods with the
+// backward expansion restricted to the roots named in expandFrom (every root
+// when expandFrom is nil). Every root is evaluated and emitted; only callers
+// reachable backwards from an expanding root join them. A root whose mutated
+// field set is unchanged cannot change any caller's summary — callers read a
+// callee only through that set — so it need not expand.
+func indirectMutationEdgesForRoots(
+	g graph.Store,
+	seedMethods []*graph.Node,
+	expandFrom map[string]struct{},
 ) ([]indirectMutSpec, map[string]*graph.Node) {
 	if g == nil || len(seedMethods) == 0 {
 		return nil, nil
@@ -39,6 +57,11 @@ func indirectMutationEdgesForMethods(
 			continue
 		}
 		impacted[method.ID] = method
+		if expandFrom != nil {
+			if _, expand := expandFrom[method.ID]; !expand {
+				continue
+			}
+		}
 		frontier = append(frontier, method.ID)
 	}
 	// Receiver-call dependants are the only unchanged sources whose mutation
@@ -147,28 +170,32 @@ func indirectMutationEdgesForMethods(
 		}
 	}
 	writeTargets := g.GetNodesByIDs(writeTargetIDs)
-	fieldsByName := g.FindNodesByNames(fieldNames)
-	fieldFor := func(method *graph.Node, name string) *graph.Node {
-		receiver := receiverOf(method)
-		var fallback *graph.Node
-		ambiguous := false
-		for _, field := range fieldsByName[name] {
-			if field == nil || field.Kind != graph.KindField || receiverOf(field) != receiver {
-				continue
-			}
-			if field.RepoPrefix == method.RepoPrefix {
-				return field
-			}
-			if fallback == nil {
-				fallback = field
-			} else if fallback.ID != field.ID {
-				ambiguous = true
-			}
+	fieldsByName := receiverFieldsByName(g, analysisMethods, fieldNames)
+	// ownerOf is the receiver type a method or field belongs to, qualified by
+	// its package directory (receiverOwnerKey) exactly as the whole-graph
+	// fixpoint keys it, so a per-save re-derivation binds the field a whole
+	// index binds.
+	ownerOf := func(node *graph.Node) string {
+		if node == nil {
+			return ""
 		}
-		if ambiguous {
+		return receiverOwnerKey(node.ID, receiverOf(node))
+	}
+	fieldFor := func(method *graph.Node, name string) *graph.Node {
+		owner := ownerOf(method)
+		if owner == "" {
 			return nil
 		}
-		return fallback
+		var found *graph.Node
+		for _, field := range fieldsByName[name] {
+			if field == nil || field.Kind != graph.KindField || ownerOf(field) != owner {
+				continue
+			}
+			if found == nil || field.ID < found.ID {
+				found = field
+			}
+		}
+		return found
 	}
 
 	mutators := make(map[string]map[string]bool)
@@ -191,10 +218,7 @@ func indirectMutationEdgesForMethods(
 				continue
 			}
 			field := writeTargets[edge.To]
-			if field == nil || field.Kind != graph.KindField || receiverOf(field) != receiverOf(method) {
-				continue
-			}
-			if field.RepoPrefix != "" && method.RepoPrefix != "" && field.RepoPrefix != method.RepoPrefix {
+			if field == nil || field.Kind != graph.KindField || ownerOf(field) != ownerOf(method) {
 				continue
 			}
 			addMutation(id, field.ID)
@@ -223,6 +247,11 @@ func indirectMutationEdgesForMethods(
 			})
 		}
 	}
+	sort.Slice(calls, func(i, j int) bool {
+		a, b := calls[i], calls[j]
+		return receiverCallLess(a.from, a.file, a.line, a.calleeID, a.recvField, a.recvSelf,
+			b.from, b.file, b.line, b.calleeID, b.recvField, b.recvSelf)
+	})
 	for {
 		changed := false
 		for _, call := range calls {
@@ -238,10 +267,7 @@ func indirectMutationEdgesForMethods(
 			case call.recvSelf:
 				caller := analysisMethods[call.from]
 				callee := analysisMethods[call.calleeID]
-				if !calleeMutates || caller == nil || callee == nil || receiverOf(caller) != receiverOf(callee) {
-					continue
-				}
-				if caller.RepoPrefix != "" && callee.RepoPrefix != "" && caller.RepoPrefix != callee.RepoPrefix {
+				if !calleeMutates || caller == nil || callee == nil || ownerOf(caller) != ownerOf(callee) {
 					continue
 				}
 				for fieldID := range mutators[call.calleeID] {
@@ -273,10 +299,7 @@ func indirectMutationEdgesForMethods(
 		case call.recvSelf:
 			caller := analysisMethods[call.from]
 			callee := analysisMethods[call.calleeID]
-			if !calleeMutates || caller == nil || callee == nil || receiverOf(caller) != receiverOf(callee) {
-				continue
-			}
-			if caller.RepoPrefix != "" && callee.RepoPrefix != "" && caller.RepoPrefix != callee.RepoPrefix {
+			if !calleeMutates || caller == nil || callee == nil || ownerOf(caller) != ownerOf(callee) {
 				continue
 			}
 			for fieldID := range mutators[call.calleeID] {
@@ -295,4 +318,33 @@ func indirectMutationEdgesForMethods(
 		}
 	}
 	return out, impacted
+}
+
+// receiverFieldsByName reads the fields named by receiver calls. A field
+// binds only to a method of the same receiver in the same package directory
+// (receiverOwnerKey), so when every method evaluated lives in one repository
+// the read is scoped to it: on a store of many repositories the global name
+// read of names like store, mu or logger returned thousands of rows (one
+// capability pass measured 4.4 s in that read), and a delta answers the
+// repository-scoped read from its stack's cache.
+func receiverFieldsByName(g graph.Store, methods map[string]*graph.Node, names []string) map[string][]*graph.Node {
+	if len(names) == 0 {
+		return nil
+	}
+	repo, single := "", true
+	for _, method := range methods {
+		if method == nil {
+			continue
+		}
+		if repo == "" {
+			repo = method.RepoPrefix
+		} else if method.RepoPrefix != repo {
+			single = false
+			break
+		}
+	}
+	if finder, ok := g.(graph.RepoNamesNodeFinder); ok && single && repo != "" {
+		return finder.FindNodesByNamesInRepo(names, repo)
+	}
+	return g.FindNodesByNames(names)
 }

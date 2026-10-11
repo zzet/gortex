@@ -40,11 +40,12 @@ const (
 )
 
 type refStack struct {
-	srv     *Server
-	store   *store_sqlite.Store
-	leases  *graphview.LeaseManager
-	repo    string
-	graphID string
+	srv       *Server
+	store     *store_sqlite.Store
+	leases    *graphview.LeaseManager
+	lifecycle *indexer.CheckoutLifecycle
+	repo      string
+	graphID   string
 
 	featureCommit string
 	featureTree   string
@@ -83,10 +84,33 @@ func refWriteFiles(t *testing.T, dir string, files map[string]string) {
 	}
 }
 
-// newRefStack builds the repository, indexes main, writes the catalog identity
-// the reconciler would have written, and wires a server that can serve views
-// of committed state.
+// newRefStack is newUnadmittedRefStack plus the one lifecycle action the
+// reconciler-driven path performs and a hand-written catalog cannot imply:
+// opening the repository's admission.
+//
+// Serving a ref view acquires a repository read on the graph it composes over
+// (indexer.(*CheckoutLifecycle).EnsureRefView, ref_view_service.go:44), and a
+// read may only be admitted against an owner this process registered. In
+// production bindDedicatedGraph registers it while writing the very rows
+// seedRefCatalog writes by hand (checkout_lifecycle.go:826, :866), reached from
+// recordCheckout on both the boot seed and the track path. RegisterRepositoryOwner
+// is that same privileged boundary, and it revalidates the catalog identity
+// rather than trusting the fixture, so the seeded rows still have to be
+// authority-valid for this to succeed.
 func newRefStack(t *testing.T) *refStack {
+	t.Helper()
+	stack := newUnadmittedRefStack(t)
+	if err := stack.lifecycle.RegisterRepositoryOwner(context.Background(), stack.graphID); err != nil {
+		t.Fatalf("register the repository owner: %v", err)
+	}
+	return stack
+}
+
+// newUnadmittedRefStack builds the repository, indexes main, writes the catalog
+// identity the reconciler would have written, and wires a server that can serve
+// views of committed state — but leaves the repository's admission closed, the
+// state a graph is in before its owner is registered.
+func newUnadmittedRefStack(t *testing.T) *refStack {
 	t.Helper()
 	refIsolateGit(t)
 
@@ -173,7 +197,8 @@ func newRefStack(t *testing.T) *refStack {
 	srv.SetMaterializer(&graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: leases})
 
 	return &refStack{
-		srv: srv, store: store, leases: leases, repo: repo, graphID: graphID,
+		srv: srv, store: store, leases: leases, lifecycle: lifecycle,
+		repo: repo, graphID: graphID,
 		featureCommit: featureCommit, featureTree: featureTree,
 	}
 }

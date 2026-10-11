@@ -2708,6 +2708,55 @@ func exploreBodyIdentifierMentions(source, identifier string) int {
 	return mentions
 }
 
+const exploreRetrievalQueryTermCap = 16
+
+// shapeExploreRetrievalQuery bounds candidate-generation work for long inline
+// task prose while leaving the semantic query available to classification,
+// reranking, evidence, and terminality. Existing concept recall extraction
+// preserves distinctive identifiers in first-seen order and deduplicates the
+// generic prose that otherwise becomes repeated FTS5 prefix iterators.
+func shapeExploreRetrievalQuery(task, semanticQuery string) string {
+	trimmed := strings.TrimSpace(task)
+	if trimmed == "" || strings.ContainsAny(trimmed, "\n\r") || len(trimmed) < shapeInlineLongQueryChars {
+		return semanticQuery
+	}
+	anchors := exploreDistinctiveBareTokens(trimmed, "")
+	if len(anchors) > exploreRetrievalQueryTermCap {
+		// Keep both the lead and tail. Long task prose commonly introduces the
+		// subsystem first and names the concrete implementation anchor last.
+		half := exploreRetrievalQueryTermCap / 2
+		bounded := make([]string, 0, exploreRetrievalQueryTermCap)
+		bounded = append(bounded, anchors[:half]...)
+		bounded = append(bounded, anchors[len(anchors)-(exploreRetrievalQueryTermCap-half):]...)
+		anchors = bounded
+	}
+	terms := exploreConceptRecallTerms(semanticQuery)
+	parts := make([]string, 0, len(anchors)+len(terms))
+	seen := make(map[string]struct{}, len(anchors)+len(terms))
+	for _, term := range append(anchors, terms...) {
+		key := strings.ToLower(term)
+		if term == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		parts = append(parts, term)
+		if len(parts) == exploreRetrievalQueryTermCap {
+			break
+		}
+	}
+	if len(parts) == 0 {
+		return semanticQuery
+	}
+	compact := strings.Join(parts, " ")
+	if len(compact) >= len(semanticQuery) {
+		return semanticQuery
+	}
+	return compact
+}
+
 // handleExplore is the one-shot localization verb: free text in, a ranked
 // neighborhood (symbols + source + call paths + file map + completeness
 // cue) out, bounded by a token budget, in a single response.
@@ -2770,6 +2819,10 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	if queryClass == rerank.QueryClassConcept {
 		searchQuery = stripLeadingExploreDirective(searchQuery)
 	}
+	retrievalQuery := searchQuery
+	if queryClass == rerank.QueryClassConcept {
+		retrievalQuery = shapeExploreRetrievalQuery(task, searchQuery)
+	}
 	rctx := s.buildRerankContext(ctx, searchQuery)
 	// Over-fetch, then keep the top maxSymbols that are real localization
 	// targets — params / locals / closures / imports are never a place a
@@ -2786,14 +2839,14 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		// so semantic intent remains useful outside signature-rich languages.
 		primaryOpts := opts
 		primaryOpts.SkipInnerRerank = true
-		ranked = eng.GatherSymbolCandidates(searchQuery, fetch, primaryOpts, rctx)
+		ranked = eng.GatherSymbolCandidatesContext(ctx, retrievalQuery, fetch, primaryOpts, rctx)
 		terms := exploreConceptRecallTerms(searchQuery)
-		if hasExploreExpansionTerms(searchQuery, terms) {
+		if ctx.Err() == nil && retrievalQuery == searchQuery && hasExploreExpansionTerms(retrievalQuery, terms) {
 			expansionOpts := opts
 			expansionOpts.SkipInnerRerank = true
 			expansionOpts.SkipVectorChannel = true
 			expansionOpts.SkipExactNameSplice = true
-			expanded := eng.GatherSymbolCandidates(strings.Join(terms, " "), fetch, expansionOpts, rctx)
+			expanded := eng.GatherSymbolCandidatesContext(ctx, strings.Join(terms, " "), fetch, expansionOpts, rctx)
 			ranked = mergeExploreCandidates(ranked, expanded, fetch)
 		}
 		// Gathering deliberately over-fetches each retrieval channel so scope
@@ -2810,7 +2863,7 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 		ranked = rerankExploreConceptCoverage(searchQuery, ranked)
 	} else {
-		ranked = eng.SearchSymbolsRanked(searchQuery, fetch, opts, rctx)
+		ranked = eng.SearchSymbolsRankedContext(ctx, searchQuery, fetch, opts, rctx)
 		// Quoted source evidence is useful regardless of the query classifier.
 		// Identifier-like issue text (for example, a short locale or protocol
 		// value) previously bypassed this lane entirely even when the ordinary
@@ -2866,21 +2919,35 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	repoAllowed := func(n *graph.Node) bool {
 		return len(resolved.RepoAllow) == 0 || repoNarrowAdmits(resolved.RepoAllow, n.RepoPrefix)
 	}
-	if len(ranked) == 0 {
-		for _, c := range eng.SearchSymbolsRanked(searchQuery, fetch, query.QueryOptions{}, rctx) {
+	if len(ranked) == 0 && ctx.Err() == nil {
+		var unscoped []*rerank.Candidate
+		if queryClass == rerank.QueryClassConcept {
+			unscopedOpts := query.QueryOptions{SkipInnerRerank: true}
+			unscoped = eng.GatherSymbolCandidatesContext(ctx, retrievalQuery, fetch, unscopedOpts, rctx)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if pipeline := eng.Rerank(); pipeline != nil {
+				unscoped = pipeline.Rerank(searchQuery, unscoped, rctx)
+			}
+			unscoped = rerankExploreConceptCoverage(searchQuery, unscoped)
+		} else {
+			unscoped = eng.SearchSymbolsRankedContext(ctx, searchQuery, fetch, query.QueryOptions{}, rctx)
+		}
+		for _, c := range unscoped {
 			if c != nil && c.Node != nil && repoAllowed(c.Node) {
 				ranked = append(ranked, c)
 			}
 		}
 	}
-	if len(ranked) == 0 {
+	if len(ranked) == 0 && ctx.Err() == nil {
 		// Last rung: the per-term OR-merge the ranked search handler itself
 		// falls back on — whole-sentence MATCH semantics differ between the
 		// in-memory and disk-resident search backends, and per-term fetch +
 		// merge works on both.
-		nodes, _ := fetchAndMergeBM25Timed(eng, searchQuery, exploreLexicalTerms(searchQuery), fetch, opts, nil)
-		if len(nodes) == 0 && (opts.WorkspaceID != "" || opts.ProjectID != "" || len(opts.RepoAllow) > 0) {
-			nodes, _ = fetchAndMergeBM25Timed(eng, searchQuery, exploreLexicalTerms(searchQuery), fetch, query.QueryOptions{}, nil)
+		nodes, _ := fetchAndMergeBM25TimedContext(ctx, eng, retrievalQuery, exploreLexicalTerms(retrievalQuery), fetch, opts, nil)
+		if len(nodes) == 0 && ctx.Err() == nil && (opts.WorkspaceID != "" || opts.ProjectID != "" || len(opts.RepoAllow) > 0) {
+			nodes, _ = fetchAndMergeBM25TimedContext(ctx, eng, retrievalQuery, exploreLexicalTerms(retrievalQuery), fetch, query.QueryOptions{}, nil)
 		}
 		for i, n := range nodes {
 			if n != nil && repoAllowed(n) {
@@ -2977,6 +3044,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	protectedFinalCandidateIDs := exploreFinalReservedCandidateIDs(
 		cands, protectedSyntacticAnchors, protectedImplementationID,
 	)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(cands) == 0 && len(artifactLane.targets) == 0 {
 		if localize {
 			return s.completeEmptyLocalization(ctx, task, budget), nil
@@ -3097,6 +3167,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 
 	declarationScope := s.localizationNodeScopeWithTests(ctx, opts, false)
 	if !localize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		outlineProvider := newExploreTaskPageOutlineProvider(
 			ctx, eng.Reader(), task, declarationScope,
 		)
@@ -3177,6 +3250,9 @@ func (s *Server) handleExplore(ctx context.Context, req mcp.CallToolRequest) (*m
 	// exact reads, but let concept tasks choose among the full bounded candidate
 	// window with the explicit declaration as their preferred seed.
 	conceptAnchor := exploreLocalizationUsesConceptRefinement(answerReady, task, exactSymbol, causalExactSymbol)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !answerReady && (exactSymbol == "" || conceptAnchor) {
 		// Uncertain localization is still useful evidence. Returning it as an
 		// MCP error makes hosts discard the ranked candidates and restart broad

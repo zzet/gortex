@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -41,7 +42,18 @@ const dataflowRewriteBatchSize = 2048
 // matches their state are stripped of the dataflow markers so a
 // re-run of this pass becomes a no-op.
 func (idx *Indexer) materializeDataflowParams() {
-	g := idx.graph
+	materializeDataflowParamsInGraph(idx.graph)
+}
+
+// materializeDataflowParamsInGraph is materializeDataflowParams over any
+// store: the whole index (IndexCtx, right after its ResolveAll) and the
+// multi-repository master resolve run it, so a whole index writes the same
+// arg_of / returns_to rows the per-save and delta paths write
+// (materializeDataflowParamsForStages / ForFiles). The rewrite is idempotent.
+func materializeDataflowParamsInGraph(g graph.Store) {
+	if g == nil {
+		return
+	}
 	forEachDataflowEdgeBatch(g, dataflowRewriteBatchSize, func(edges []*graph.Edge) bool {
 		rewriteDataflowBatch(g, edges)
 		return true
@@ -167,6 +179,13 @@ type pendingReturnsTo struct {
 // query, one call-adjacency query, and one ReindexEdges call are made for a
 // batch, regardless of how many arg_of / returns_to edges it contains.
 func rewriteDataflowBatch(g graph.Store, edges []*graph.Edge) int {
+	return rewriteDataflowBatchLegs(g, edges, nil, nil)
+}
+
+// rewriteDataflowBatchLegs is rewriteDataflowBatch timing its legs (the
+// callee parameter index, the caller call index, the reindex) on legs, and
+// reading the callee parameter index through params when set.
+func rewriteDataflowBatchLegs(g graph.Store, edges []*graph.Edge, legs *refFactLegs, params *editDeltaParamIndex) int {
 	if len(edges) == 0 {
 		return 0
 	}
@@ -195,8 +214,16 @@ func rewriteDataflowBatch(g graph.Store, edges []*graph.Edge) int {
 		}
 	}
 
-	paramIdx := buildParamPositionIndex(g, callees)
+	legs.lap("classify")
+	var paramIdx map[string]map[int]string
+	if params != nil {
+		paramIdx = params.index(g, callees)
+	} else {
+		paramIdx = buildParamPositionIndex(g, callees)
+	}
+	legs.lap("param_index")
 	callIdx := buildCallTargetIndex(g, callers)
+	legs.lap("call_index")
 	reindexes := make([]graph.EdgeReindex, 0, len(argEdges)+len(returns))
 	// A bounded input batch can contain duplicate pointers when a synthetic
 	// source is shared. Stage each stored identity once so ordered delete/insert
@@ -238,9 +265,11 @@ func rewriteDataflowBatch(g graph.Store, edges []*graph.Edge) int {
 			RefreshIdentity: true, OldFilePath: oldFilePath, OldLine: oldLine,
 		})
 	}
+	legs.lap("rewrite")
 	if len(reindexes) > 0 {
 		g.ReindexEdges(reindexes)
 	}
+	legs.lap("reindex")
 	return len(reindexes)
 }
 
@@ -348,9 +377,13 @@ func (targets *dataflowCallTargets) resolve(calleeText string) string {
 		return ""
 	}
 	if name := recordedCallTargetName(calleeText); name != "" {
-		if target := targets.byName[name]; target != "" {
-			return target
-		}
+		// The recorded callee names the call the value comes from. Only a
+		// resolved call of that name may take the rewrite: falling back to
+		// whatever else resolved on the line (a type conversion in
+		// `strconv.FormatInt(int64(n), 10)`) would attribute the value to
+		// the wrong callee, and which one it picked depended on the order
+		// the calls were listed in.
+		return targets.byName[name]
 	}
 	return targets.fallback
 }
@@ -379,6 +412,20 @@ func buildCallTargetIndex(g graph.Store, callers map[string]struct{}) dataflowCa
 		outgoing = g.GetOutEdgesByNodeIDs(ids)
 	}
 	for callerID, edges := range outgoing {
+		// The first target recorded per caller and per line is the fallback
+		// a returns_to rewrite takes, so the candidates are visited in a
+		// total order (line, target), never in the store's listing order.
+		edges = append([]*graph.Edge(nil), edges...)
+		sort.SliceStable(edges, func(i, j int) bool {
+			a, b := edges[i], edges[j]
+			if a == nil || b == nil {
+				return b != nil
+			}
+			if a.Line != b.Line {
+				return a.Line < b.Line
+			}
+			return a.To < b.To
+		})
 		for _, edge := range edges {
 			if edge == nil || edge.Kind != graph.EdgeCalls || strings.HasPrefix(edge.To, "unresolved::") {
 				continue

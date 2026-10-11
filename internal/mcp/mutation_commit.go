@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/indexer"
 )
 
 // The commit ledger exists because a tool call has two independent terminal
@@ -92,7 +93,9 @@ var mutationCommitSequence atomic.Uint64
 var errMutationNotApplied = errors.New("mutation not applied")
 
 type mutationCommitRecord struct {
-	mu sync.RWMutex
+	mu                     sync.RWMutex
+	owner                  *Server
+	pendingSourceRecovered bool
 
 	id      string
 	tool    string
@@ -230,7 +233,12 @@ func (r *mutationCommitRecord) recordGraph(outcome mutationReindexOutcome) {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	defer func() {
+		r.mu.Unlock()
+		if r.owner != nil {
+			r.owner.refreshPendingSourceRecord(r)
+		}
+	}()
 	// Concurrent pollers can hold an earlier pending snapshot after another
 	// poller observed completion. Never regress that same ticket to pending.
 	if outcome.Pending && r.graphRecorded && r.graph != mutationGraphPending && r.reindexReceipt != "" && r.reindexReceipt == outcome.Receipt {
@@ -476,6 +484,7 @@ func (n *mutationCommitNote) verdict() mutationCommitVerdict {
 // still reachable.
 func (s *Server) beginMutationCommit(ctx context.Context, tool, mutationID, fingerprint, relPath, absPath string) *mutationCommitRecord {
 	record := &mutationCommitRecord{
+		owner:       s,
 		id:          fmt.Sprintf("commit-%d", mutationCommitSequence.Add(1)),
 		tool:        tool,
 		key:         mutationID,
@@ -492,6 +501,7 @@ func (s *Server) beginMutationCommit(ctx context.Context, tool, mutationID, fing
 		record.checkoutID = state.checkoutID
 		record.checkoutIncarnation = state.incarnation
 	}
+	s.pendingSourceFiles.register(record)
 	s.mutationCommits.put(record)
 	mutationCommitNoteFrom(ctx).observe(record)
 	return record
@@ -538,6 +548,7 @@ func (s *Server) commitFileMutation(
 		record.markNotApplied(err)
 		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
 	}
+	indexer.StampPublicationPhase(ctx, indexer.PublicationDiskWriteStarted)
 	if err := agents.AtomicWriteFile(absPath, data, perm); err != nil {
 		record.markFailed(err)
 		return record, err

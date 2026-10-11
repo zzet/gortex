@@ -307,7 +307,7 @@ func TestAtomicBatchSnapshotIsolatedFromCommitInProgress(t *testing.T) {
 			}
 			// The call path the race detector reported: an idempotent retry
 			// classifies the in-flight transaction by snapshotting its receipt.
-			state, _, err := s.loadOrCreateBatchTransaction("isolated-key", fingerprint)
+			state, _, err := s.loadOrCreateBatchTransaction(context.Background(), "isolated-key", fingerprint)
 			if err != nil {
 				continue
 			}

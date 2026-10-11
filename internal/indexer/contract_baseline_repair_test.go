@@ -1,0 +1,112 @@
+package indexer
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/search"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
+)
+
+func TestContractBaselineRepairsStaleReceiptsFromAcceptedCore(t *testing.T) {
+	for _, mode := range []string{"unknown", "unaccepted", "policy_mismatch"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			idx, store := newSQLiteIndexer(t)
+			idx.SetRepoPrefix("fixture")
+			root := t.TempDir()
+			writeFile(t, filepath.Join(root, "routes.go"), "package fixture\nconst route = \"/constant-route\"\nfunc register(router *Router) { router.GET(route, serve) }\nfunc serve() {}\n")
+			backend, err := newPrimaryContractCoreStorageBackend(ctx, store, "fixture")
+			require.NoError(t, err)
+			idx.contractCoreInputs, err = newContractCoreInputJournal(ctx, backend)
+			require.NoError(t, err)
+			result, err := idx.IndexCtx(ctx, root)
+			require.NoError(t, err)
+			require.Empty(t, result.FailedFiles)
+			original, _, err := store.ContractBoundaryReceiptContext(ctx, "fixture", "", "fixture/routes.go")
+			require.NoError(t, err)
+			require.NotNil(t, original)
+			require.True(t, original.Accepted)
+			mi := NewMultiIndexer(store, idx.registry, search.NewNull(), nil, zap.NewNop())
+			mi.repos["fixture"] = &RepoMetadata{RepoPrefix: "fixture", RootPath: root}
+			mi.indexers["fixture"] = idx
+			leases := graphview.NewLeaseManager()
+			registration, err := leases.RegisterRawRepositoryOwnerPrepared(graphview.RawRepositoryOwner{RepoPrefix: "fixture", RootIdentity: root, Incarnation: mode}, nil)
+			require.NoError(t, err)
+			_, err = leases.CaptureInitialRawRepositorySource(ctx, registration, "accepted-core-source")
+			require.NoError(t, err)
+			authority := NewOutputGenerationAuthority(leases)
+			mi.SetOutputGenerationAuthority(authority)
+			acceptedPin := leases.AcquireBaseCorpus("fixture")
+			defer acceptedPin.Release()
+			require.NoError(t, acceptedPin.ValidateAcceptedCurrent())
+			materializer := &graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: leases}
+			options := ContractFollowupCaptureOptions{Context: ctx, Store: store, Materializer: materializer, MultiIndexer: mi, Registry: idx.registry, Config: idx.config, Logger: zaptest.NewLogger(t), Yield: func(ctx context.Context) error { return ctx.Err() }}
+			prior := contractBoundaryReceipt{Version: contractBoundaryReceiptVersion, FilePath: "fixture/routes.go", Source: "old-source", Policy: "old-policy"}
+			if mode == "unknown" {
+				prior.Version = "unknown-legacy-version"
+			}
+			payload, err := json.Marshal(prior)
+			require.NoError(t, err)
+			bad := graph.ContractBoundaryReceipt{RepoPrefix: "fixture", FilePath: prior.FilePath, Version: contractBoundaryReceiptVersion, Fingerprint: "old-receipt", SourceFingerprint: prior.Source, Payload: payload, Scope: graph.ContractWorkScope{Unknown: true}}
+			require.NoError(t, store.SetContractBoundaryReceiptsContext(ctx, []graph.ContractBoundaryReceipt{bad}))
+			if mode != "unaccepted" {
+				require.NoError(t, store.AcceptContractBoundaryReceiptsContext(ctx, []graph.ContractBoundaryReceipt{bad}))
+			}
+			var admission sync.Mutex
+			var jobs sync.WaitGroup
+			options.BaselineAdmissionMu = &admission
+			options.BaselineJobs = &jobs
+			coordinator, err := NewContractAnalysisCoordinator(ContractAnalysisCoordinatorOptions{Store: store, Leases: leases, Registry: idx.registry, Config: idx.config, Capture: NewContractFollowupCapture(options), ReconcileBaseline: NewContractBaselineReconciler(options), Yield: options.Yield})
+			require.NoError(t, err)
+			defer coordinator.Close()
+			mi.SetContractCoreRuntime(ContractCoreRuntimeHooks{Published: coordinator.Published})
+			pendingInputs, err := materializer.CaptureContractInputs(ctx, nil, "fixture", "")
+			require.NoError(t, err)
+			require.False(t, pendingInputs.State.Accepted)
+			requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			admitted, err := coordinator.Request(requestCtx, nil, pendingInputs, "fixture", "")
+			require.NoError(t, err)
+			require.True(t, admitted)
+			require.NoError(t, coordinator.WaitChange(requestCtx, graph.ContractAttachmentKey{RepoPrefix: "fixture", InputVersion: pendingInputs.State.InputVersion, InputFingerprint: pendingInputs.State.InputFingerprint}))
+			jobs.Wait()
+			stats := authority.Stats()
+			require.Equal(t, uint64(3), stats.Entries[OutputEntryContractBaseline], "begin, receipt chunk, and final acceptance each name their real output")
+			require.Equal(t, stats.Issued, stats.Settled)
+			require.Zero(t, stats.Witnessed, "contract-only metadata does not reopen core source mutation")
+			require.Zero(t, stats.LiveOwners)
+			require.NoError(t, acceptedPin.ValidateAcceptedCurrent(), "the original accepted core source remains usable")
+			state, found, err := store.ContractInputStateContext(ctx, "fixture", "")
+			require.NoError(t, err)
+			require.True(t, found)
+			require.True(t, state.Accepted)
+			baseline, err := store.ContractBoundaryReceiptBaselineContext(ctx, "fixture", "")
+			require.NoError(t, err)
+			require.NotNil(t, baseline)
+			require.Equal(t, contractBoundaryReceiptVersion, baseline.Version)
+			repaired, _, err := store.ContractBoundaryReceiptContext(ctx, "fixture", "", prior.FilePath)
+			require.NoError(t, err)
+			require.True(t, repaired.Accepted)
+			require.NotEqual(t, bad.SourceFingerprint, repaired.SourceFingerprint)
+			require.JSONEq(t, string(original.Payload), string(repaired.Payload), "baseline must retain real accepted-parser constant route and produced lookup facts")
+			// The same invalid proof remains forbidden on the strict path.
+			require.NoError(t, store.SetContractBoundaryReceiptsContext(ctx, []graph.ContractBoundaryReceipt{bad}))
+			if mode != "unaccepted" {
+				require.NoError(t, store.AcceptContractBoundaryReceiptsContext(ctx, []graph.ContractBoundaryReceipt{bad}))
+			}
+			selected, err := materializer.CaptureContractInputs(ctx, nil, "fixture", "")
+			require.NoError(t, err)
+			_, _, err = NewContractFollowupCapture(options)(ctx, nil, selected, "fixture", "")
+			require.Error(t, err)
+		})
+	}
+}

@@ -34,13 +34,13 @@ func TestSamplePathEvidenceExistingRoot(t *testing.T) {
 		}
 		return
 	}
-	if ev.VolumeKind != VolumeKindUnixDev {
-		t.Fatalf("VolumeKind = %q, want %q", ev.VolumeKind, VolumeKindUnixDev)
+	if ev.VolumeKind != VolumeKindUnixDev && ev.VolumeKind != VolumeKindWindowsFileID {
+		t.Fatalf("unexpected supported VolumeKind = %q", ev.VolumeKind)
 	}
 	if ev.VolumeToken == "" || ev.RootIdentity == "" {
 		t.Fatalf("expected non-empty tokens: %+v", ev)
 	}
-	if ev.AncestorVolumeKind != VolumeKindUnixDev || ev.AncestorVolumeToken != ev.VolumeToken {
+	if ev.AncestorVolumeKind != ev.VolumeKind || ev.AncestorVolumeToken != ev.VolumeToken {
 		t.Errorf("ancestor on the same volume should share the token: %+v", ev)
 	}
 

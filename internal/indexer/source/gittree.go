@@ -62,6 +62,12 @@ type GitTreeSource struct {
 	order   []string
 	entries map[string]*treeEntry
 
+	// Non-content metadata belongs only to this source lifetime. It distinguishes
+	// absence from directories/gitlinks without extra Git probes or changing the
+	// blob-only ContentSource namespace.
+	nonContent        map[string]fs.FileMode
+	inventoryComplete bool
+
 	// mu serializes the batch protocol and the lazy symlink-target
 	// cache. The pipe carries one request and one response at a time,
 	// so this lock is also what makes concurrent Open and Stat safe.
@@ -95,7 +101,7 @@ func NewGitTreeSource(ctx context.Context, repoDir, treeOID string) (*GitTreeSou
 		return nil, err
 	}
 
-	listing, err := runGit(ctx, abs, "ls-tree", "-r", "-l", "-z", "--full-tree", resolved)
+	listing, err := runGit(ctx, abs, "ls-tree", "-r", "-t", "-l", "-z", "--full-tree", resolved)
 	if err != nil {
 		missing, probeErr := gitTreeHasMissingObjects(ctx, abs, resolved, true)
 		switch {
@@ -107,11 +113,14 @@ func NewGitTreeSource(ctx context.Context, repoDir, treeOID string) (*GitTreeSou
 			return nil, fmt.Errorf("git tree source: list %s: %w", resolved, err)
 		}
 	}
-	order, entries, err := parseTreeListing(listing)
+	order, entries, nonContent, err := parseTreeInventory(listing, true)
 	if err != nil {
 		return nil, fmt.Errorf("git tree source: list %s: %w", resolved, err)
 	}
-	return &GitTreeSource{repoDir: abs, treeOID: resolved, order: order, entries: entries}, nil
+	return &GitTreeSource{
+		repoDir: abs, treeOID: resolved, order: order, entries: entries,
+		nonContent: nonContent, inventoryComplete: true,
+	}, nil
 }
 
 // VerifyGitTreeObjectsLocal proves that every tree and blob reachable from
@@ -207,7 +216,16 @@ func parseMissingObjectList(out []byte) (bool, error) {
 // a blob whose bytes are gone locally — the last of which is reported
 // as an unknown size rather than a zero one.
 func parseTreeListing(out []byte) ([]string, map[string]*treeEntry, error) {
+	order, entries, _, err := parseTreeInventory(out, false)
+	return order, entries, err
+}
+
+func parseTreeInventory(out []byte, keepNonContent bool) ([]string, map[string]*treeEntry, map[string]fs.FileMode, error) {
 	entries := make(map[string]*treeEntry)
+	var nonContent map[string]fs.FileMode
+	if keepNonContent {
+		nonContent = make(map[string]fs.FileMode)
+	}
 	var order []string
 	for _, rec := range bytes.Split(out, []byte{0}) {
 		if len(rec) == 0 {
@@ -215,30 +233,35 @@ func parseTreeListing(out []byte) ([]string, map[string]*treeEntry, error) {
 		}
 		tab := bytes.IndexByte(rec, '\t')
 		if tab < 0 {
-			return nil, nil, fmt.Errorf("ls-tree record without a path separator: %q", rec)
+			return nil, nil, nil, fmt.Errorf("ls-tree record without a path separator: %q", rec)
 		}
 		fields := strings.Fields(string(rec[:tab]))
 		if len(fields) < 3 {
-			return nil, nil, fmt.Errorf("ls-tree record with %d fields: %q", len(fields), rec)
+			return nil, nil, nil, fmt.Errorf("ls-tree record with %d fields: %q", len(fields), rec)
 		}
 		mode, err := strconv.ParseUint(fields[0], 8, 32)
 		if err != nil {
-			return nil, nil, fmt.Errorf("ls-tree mode %q: %w", fields[0], err)
-		}
-		if mode&modeTypeMask == modeGitlink {
-			// A submodule boundary: the tree records another
-			// repository's commit id, not content this source can read.
-			continue
+			return nil, nil, nil, fmt.Errorf("ls-tree mode %q: %w", fields[0], err)
 		}
 		kind := mode & modeTypeMask
-		if kind != modeRegular && kind != modeSymlink {
-			// Trees, which -r already recursed through, and anything a
-			// future git might add.
+		if kind == modeGitlink || (kind != modeRegular && kind != modeSymlink) {
+			if !keepNonContent {
+				continue
+			}
+			rel, err := normalizePath(string(rec[tab+1:]))
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("ls-tree path %q: %w", rec[tab+1:], err)
+			}
+			entryMode := fs.ModeIrregular
+			if fields[1] == "tree" {
+				entryMode = fs.ModeDir
+			}
+			nonContent[rel] = entryMode
 			continue
 		}
 		oid := fields[2]
 		if !oidPattern.MatchString(oid) {
-			return nil, nil, fmt.Errorf("ls-tree object id %q is not hexadecimal", oid)
+			return nil, nil, nil, fmt.Errorf("ls-tree object id %q is not hexadecimal", oid)
 		}
 		size := int64(-1)
 		if len(fields) >= 4 {
@@ -248,12 +271,11 @@ func parseTreeListing(out []byte) ([]string, map[string]*treeEntry, error) {
 		}
 		rel, err := normalizePath(string(rec[tab+1:]))
 		if err != nil {
-			return nil, nil, fmt.Errorf("ls-tree path %q: %w", rec[tab+1:], err)
+			return nil, nil, nil, fmt.Errorf("ls-tree path %q: %w", rec[tab+1:], err)
 		}
 		meta := FileMeta{Path: rel, Size: size, Mode: fs.FileMode(mode & 0o777)}
 		if kind == modeSymlink {
 			meta.Symlink = true
-			// git records no meaningful permission bits for a link.
 			meta.Mode = fs.ModeSymlink | 0o777
 		}
 		if _, dup := entries[rel]; !dup {
@@ -262,7 +284,7 @@ func parseTreeListing(out []byte) ([]string, map[string]*treeEntry, error) {
 		entries[rel] = &treeEntry{meta: meta, oid: oid}
 	}
 	slices.Sort(order)
-	return order, entries, nil
+	return order, entries, nonContent, nil
 }
 
 // Identity returns a stable description of the source: the repository

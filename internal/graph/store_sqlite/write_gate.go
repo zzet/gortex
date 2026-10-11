@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
 
 // sqliteWriteGate is a zero-value, context-aware binary semaphore. It keeps
@@ -14,7 +15,28 @@ import (
 type sqliteWriteGate struct {
 	once  sync.Once
 	token chan struct{}
+	// waiters counts callers parked in LockContext because the gate was held.
+	// A holder that can give the gate up early (the WAL reclaim's open-gate
+	// stage) watches it and yields as soon as a writer queues.
+	waiters atomic.Int32
+	// holder is the current hold, recorded only while the hold watchdog runs.
+	holder atomic.Pointer[holdRecord]
+	// onRelease runs at every Unlock while the gate is still held (the
+	// writer connection's page-cache counters; writer_cache_counters.go).
+	onRelease atomic.Pointer[func()]
+	// holds counts completed holds (measurement: how often a path takes the
+	// writer).
+	holds atomic.Int64
 }
+
+// held reports whether someone holds the gate right now (a racy snapshot).
+func (g *sqliteWriteGate) held() bool {
+	g.init()
+	return len(g.token) == 0
+}
+
+// waiting reports how many callers are parked waiting for the gate.
+func (g *sqliteWriteGate) waiting() int32 { return g.waiters.Load() }
 
 func (g *sqliteWriteGate) init() {
 	g.once.Do(func() {
@@ -37,6 +59,14 @@ func (g *sqliteWriteGate) LockContext(ctx context.Context) error {
 		return err
 	}
 	select {
+	case <-g.token:
+		g.holder.Store(newHoldRecord())
+		return nil
+	default:
+	}
+	g.waiters.Add(1)
+	defer g.waiters.Add(-1)
+	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-g.token:
@@ -44,6 +74,7 @@ func (g *sqliteWriteGate) LockContext(ctx context.Context) error {
 			g.token <- struct{}{}
 			return err
 		}
+		g.holder.Store(newHoldRecord())
 		return nil
 	}
 }
@@ -52,6 +83,7 @@ func (g *sqliteWriteGate) TryLock() bool {
 	g.init()
 	select {
 	case <-g.token:
+		g.holder.Store(newHoldRecord())
 		return true
 	default:
 		return false
@@ -60,6 +92,11 @@ func (g *sqliteWriteGate) TryLock() bool {
 
 func (g *sqliteWriteGate) Unlock() {
 	g.init()
+	if f := g.onRelease.Load(); f != nil {
+		(*f)()
+	}
+	endHold(g.holder.Swap(nil), "write gate")
+	g.holds.Add(1)
 	select {
 	case g.token <- struct{}{}:
 	default:

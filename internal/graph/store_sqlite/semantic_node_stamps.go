@@ -83,7 +83,7 @@ func (s *Store) persistSemanticNodeStamps(stamps []graph.SemanticNodeStamp) (sem
 
 		invalidatedAnalysis := false
 		if txChanged > 0 && s.analysisGenerationPresent {
-			if err := invalidateAnalysisGenerationTx(tx); err != nil {
+			if err := s.invalidateAnalysisViewTx(tx); err != nil {
 				_ = tx.Rollback()
 				return stats, err
 			}
@@ -95,7 +95,7 @@ func (s *Store) persistSemanticNodeStamps(stamps []graph.SemanticNodeStamp) (sem
 		stats.enriched += txEnriched
 		stats.changedRows += txChanged
 		if invalidatedAnalysis {
-			s.analysisGenerationPresent = false
+			s.analysisGenerationPresent = s.analysisLatchRemaining
 		}
 		s.finishAnalysisMutationLocked(txChanged > 0)
 	}

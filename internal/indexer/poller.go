@@ -509,7 +509,7 @@ func (p *Poller) finalizeGitHead(observation pollGitObservation) error {
 	if p.indexer == nil {
 		return fmt.Errorf("watcher: poller has no stable repository lane")
 	}
-	return p.indexer.coordinateRepositoryMutation(context.Background(), func() error {
+	return p.indexer.coordinateRepositoryMutation(context.Background(), OutputEntryPollerFinalizeGitHead, func() error {
 		idx := p.registeredIndexer()
 		if idx == nil {
 			return fmt.Errorf("watcher: poller repository indexer is no longer registered")

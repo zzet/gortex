@@ -90,12 +90,26 @@ func (r *Resolver) rebindGoMethodReceiversForFile(filePath string) {
 		}
 	}
 
+	fileNodes := r.incrementalFileNodes(filePath)
+	// Only Go methods can be rebound below. The accepted full-file cache
+	// also records empty files, so free-function edits and deletions need no
+	// package type scan or adjacency read on the graph fallback.
+	hasGoMethod := false
+	for _, n := range fileNodes {
+		if n != nil && n.Kind == graph.KindMethod && n.Language == "go" {
+			hasGoMethod = true
+			break
+		}
+	}
+	if !hasGoMethod {
+		return
+	}
+
 	// The package's type index is a pure function of the directory's files and
 	// never mutated by the tail passes, so memoize it: a scoped tail visiting
 	// every file of a D-file package builds it once (O(D)) instead of per file
 	// (O(D^2)). The empty result is cached too so a package with no Go types
 	// isn't re-scanned per file.
-	fileNodes := r.incrementalFileNodes(filePath)
 	repoPrefix := ""
 	for _, n := range fileNodes {
 		if n != nil && n.RepoPrefix != "" {

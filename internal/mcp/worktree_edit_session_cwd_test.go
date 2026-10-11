@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
@@ -41,13 +42,22 @@ func retireRoute(t *testing.T, stack *viewStack) {
 		}))
 }
 
-func editFileViaMiddleware(stack *viewStack, cwd string, args map[string]any) (*mcplib.CallToolResult, error) {
+// routeRefusalContext gives an unavailable-route fixture enough time to
+// exercise admission without spending the normal one-minute tool budget.
+func routeRefusalContext(t *testing.T, cwd, tool string) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(
+		WithSessionCWD(WithSessionID(context.Background(), viewTestSession), cwd),
+		transportDeadlineMargin+mutationRouteWaitMargin+400*time.Millisecond)
+	t.Cleanup(cancel)
+	return WithAuthorizedToolCall(ctx, tool)
+}
+
+func editFileViaMiddleware(t *testing.T, stack *viewStack, cwd string, args map[string]any) (*mcplib.CallToolResult, error) {
 	req := mcplib.CallToolRequest{}
 	req.Params.Name = "edit_file"
 	req.Params.Arguments = args
-	ctx := WithAuthorizedToolCall(
-		WithSessionCWD(WithSessionID(context.Background(), viewTestSession), cwd),
-		"edit_file")
+	ctx := routeRefusalContext(t, cwd, "edit_file")
 	return stack.srv.wrapToolHandler(stack.srv.handleEditFile)(ctx, req)
 }
 
@@ -61,7 +71,7 @@ func TestCWDBindingRouteNotReadyMutationsRefuseLoudly(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(stack.worktreeRoot, "edit.go"),
 		[]byte("package repo\n\n// worktree copy\n"), 0o644))
 
-	result, err := editFileViaMiddleware(stack, stack.worktreeRoot, map[string]any{
+	result, err := editFileViaMiddleware(t, stack, stack.worktreeRoot, map[string]any{
 		"path":       "repo/edit.go",
 		"old_string": "func Old() {}",
 		"new_string": "func Never() {}",
@@ -130,7 +140,7 @@ func TestCWDBindingRouteNotReadySoleRepoMutationRefusesLoudly(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(stack.worktreeRoot, "edit.go"),
 		[]byte("package repo\n\n// worktree copy\n"), 0o644))
 
-	result, err := editFileViaMiddleware(stack, stack.worktreeRoot, map[string]any{
+	result, err := editFileViaMiddleware(t, stack, stack.worktreeRoot, map[string]any{
 		"path":       "edit.go",
 		"old_string": "func Old() {}",
 		"new_string": "func Never() {}",
@@ -153,13 +163,11 @@ func TestCWDBindingRouteNotReadySoleRepoMutationRefusesLoudly(t *testing.T) {
 		"the refused edit still wrote the worktree copy")
 }
 
-func batchEditViaMiddleware(stack *viewStack, cwd string, edits []map[string]any) (*mcplib.CallToolResult, error) {
+func batchEditViaMiddleware(t *testing.T, stack *viewStack, cwd string, edits []map[string]any) (*mcplib.CallToolResult, error) {
 	req := mcplib.CallToolRequest{}
 	req.Params.Name = "batch_edit"
 	req.Params.Arguments = map[string]any{"edits": edits}
-	ctx := WithAuthorizedToolCall(
-		WithSessionCWD(WithSessionID(context.Background(), viewTestSession), cwd),
-		"batch_edit")
+	ctx := routeRefusalContext(t, cwd, "batch_edit")
 	return stack.srv.wrapToolHandler(stack.srv.handleAtomicBatchEdit)(ctx, req)
 }
 
@@ -173,7 +181,7 @@ func TestCWDBindingRouteNotReadyBatchEditRefusesLoudly(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(stack.worktreeRoot, "edit.go"),
 		[]byte("package repo\n\n// worktree copy\n"), 0o644))
 
-	result, err := batchEditViaMiddleware(stack, stack.worktreeRoot, []map[string]any{
+	result, err := batchEditViaMiddleware(t, stack, stack.worktreeRoot, []map[string]any{
 		{"op": "edit_file", "path": "repo/edit.go", "old_string": "func Old() {}", "new_string": "func Never() {}"},
 	})
 	require.NoError(t, err)
@@ -190,23 +198,19 @@ func TestCWDBindingRouteNotReadyBatchEditRefusesLoudly(t *testing.T) {
 		"the refused batch edit still wrote the MAIN copy")
 }
 
-func writeFileViaMiddleware(stack *viewStack, cwd string, args map[string]any) (*mcplib.CallToolResult, error) {
+func writeFileViaMiddleware(t *testing.T, stack *viewStack, cwd string, args map[string]any) (*mcplib.CallToolResult, error) {
 	req := mcplib.CallToolRequest{}
 	req.Params.Name = "write_file"
 	req.Params.Arguments = args
-	ctx := WithAuthorizedToolCall(
-		WithSessionCWD(WithSessionID(context.Background(), viewTestSession), cwd),
-		"write_file")
+	ctx := routeRefusalContext(t, cwd, "write_file")
 	return stack.srv.wrapToolHandler(stack.srv.handleWriteFile)(ctx, req)
 }
 
-func editSymbolViaMiddleware(stack *viewStack, cwd string, args map[string]any) (*mcplib.CallToolResult, error) {
+func editSymbolViaMiddleware(t *testing.T, stack *viewStack, cwd string, args map[string]any) (*mcplib.CallToolResult, error) {
 	req := mcplib.CallToolRequest{}
 	req.Params.Name = "edit_symbol"
 	req.Params.Arguments = args
-	ctx := WithAuthorizedToolCall(
-		WithSessionCWD(WithSessionID(context.Background(), viewTestSession), cwd),
-		"edit_symbol")
+	ctx := routeRefusalContext(t, cwd, "edit_symbol")
 	return stack.srv.wrapToolHandler(stack.srv.handleEditSymbol)(ctx, req)
 }
 
@@ -219,7 +223,7 @@ func TestCWDBindingRouteNotReadyWriteAndEditSymbolRefuseLoudly(t *testing.T) {
 	retireRoute(t, stack)
 
 	t.Run("write_file", func(t *testing.T) {
-		result, err := writeFileViaMiddleware(stack, stack.worktreeRoot, map[string]any{
+		result, err := writeFileViaMiddleware(t, stack, stack.worktreeRoot, map[string]any{
 			"path":    "repo/added.go",
 			"content": "package repo\n\nfunc Never() {}\n",
 		})
@@ -235,7 +239,7 @@ func TestCWDBindingRouteNotReadyWriteAndEditSymbolRefuseLoudly(t *testing.T) {
 	})
 
 	t.Run("edit_symbol", func(t *testing.T) {
-		result, err := editSymbolViaMiddleware(stack, stack.worktreeRoot, map[string]any{
+		result, err := editSymbolViaMiddleware(t, stack, stack.worktreeRoot, map[string]any{
 			"id":         "repo/edit.go::New",
 			"old_source": "func New() {}",
 			"new_source": "func Never() {}",
@@ -288,9 +292,7 @@ func TestCWDBindingRouteNotReadyRefactorFacadeRefusesLoudly(t *testing.T) {
 			req := mcplib.CallToolRequest{}
 			req.Params.Name = tc.tool
 			req.Params.Arguments = tc.args
-			ctx := WithAuthorizedToolCall(
-				WithSessionCWD(WithSessionID(context.Background(), viewTestSession), stack.worktreeRoot),
-				tc.tool)
+			ctx := routeRefusalContext(t, stack.worktreeRoot, tc.tool)
 			result, err := stack.srv.wrapToolHandler(tc.handler)(ctx, req)
 			require.NoError(t, err)
 			require.NotNil(t, result)
@@ -308,14 +310,10 @@ func TestCWDBindingRouteNotReadyRefactorFacadeRefusesLoudly(t *testing.T) {
 		"a refused refactor-facade mutation still wrote the MAIN copy")
 }
 
-// TestCWDBindingRouteNotReadyMissingMarkerFailsOpenToReadOnly pins the
-// fail-open path: without WithAuthorizedToolCall, requestIsMutationFromContext
-// cannot see the tool name, so viewForSessionCWD takes the read posture and
-// soft-falls-back to base with an inexact rider instead of refusing outright.
-// The second gate, refuseRoutedViewMutation, keys off the tool name on the
-// request itself (not the context marker) and still refuses the write —
-// zero bytes must move either way.
-func TestCWDBindingRouteNotReadyMissingMarkerFailsOpenToReadOnly(t *testing.T) {
+// The mutation admission policy reads the request's tool name even without
+// an authorization marker. It waits for the CWD checkout's route, then refuses
+// within the request budget rather than admitting a write on the base corpus.
+func TestCWDBindingRouteNotReadyMissingMarkerWaitsAndRefuses(t *testing.T) {
 	stack := newViewStack(t)
 	retireRoute(t, stack)
 
@@ -329,17 +327,20 @@ func TestCWDBindingRouteNotReadyMissingMarkerFailsOpenToReadOnly(t *testing.T) {
 		"old_string": "func Old() {}",
 		"new_string": "func Never() {}",
 	}
-	ctx := WithSessionCWD(WithSessionID(context.Background(), viewTestSession), stack.worktreeRoot)
+	ctx, cancel := context.WithTimeout(
+		WithSessionCWD(WithSessionID(context.Background(), viewTestSession), stack.worktreeRoot),
+		transportDeadlineMargin+mutationRouteWaitMargin+400*time.Millisecond)
+	defer cancel()
+	started := time.Now()
 	result, err := stack.srv.wrapToolHandler(stack.srv.handleEditFile)(ctx, req)
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	require.True(t, result.IsError,
-		"a marker-less edit on an unrouted checkout must still refuse, via the read-only gate")
+	require.True(t, result.IsError, "a marker-less edit on an unrouted checkout must refuse")
 	text := viewResultText(t, result)
-	require.NotContains(t, text, graphview.CodeViewBuilding,
-		"no authorized-call marker means no top-level view_building refusal, got: %s", text)
-	require.Contains(t, text, graphview.CodeViewReadOnly,
-		"the second gate (refuseRoutedViewMutation) must catch the marker-less mutation: %s", text)
+	require.Contains(t, text, graphview.CodeViewBuilding,
+		"the request's tool name must enforce route admission without an authorization marker: %s", text)
+	require.GreaterOrEqual(t, time.Since(started), 200*time.Millisecond,
+		"the mutation must wait for its own route before refusing")
 
 	mainAfter, readErr := os.ReadFile(filepath.Join(stack.repoRoot, "edit.go"))
 	require.NoError(t, readErr)
@@ -365,4 +366,43 @@ func TestCWDBindingRouteNotReadyReadsFallBackWithRider(t *testing.T) {
 	require.Equal(t, string(graphview.SelectorBase), rider["actual_view"])
 	require.Equal(t, false, rider["exact"], "fallback must not claim exact")
 	require.Equal(t, graphview.CodeViewBuilding, rider["fallback_reason"])
+}
+
+func TestCWDBindingRouteNotReadyRequiredTextCapabilityRefuses(t *testing.T) {
+	stack := newViewStack(t)
+	retireRoute(t, stack)
+
+	called := false
+	res, err := stack.callHandler(t, stack.worktreeRoot, "get_symbol",
+		map[string]any{requiredCapabilitiesArgName: []any{string(graphview.CapSearchText)}},
+		func(context.Context, mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+			called = true
+			return mcplib.NewToolResultText(`{"ok":true}`), nil
+		})
+	require.NoError(t, err)
+	require.True(t, res.IsError, "a checkout fallback cannot promise complete text search")
+	require.Contains(t, viewResultText(t, res), graphview.CodeRequiredCapabilityIncomplete)
+	require.Contains(t, viewResultText(t, res), string(graphview.CapSearchText))
+	require.False(t, called, "capability refusal must precede the graph handler")
+}
+
+func TestCWDBindingRouteNotReadyOptionalTextCapabilityIsIncomplete(t *testing.T) {
+	stack := newViewStack(t)
+	retireRoute(t, stack)
+
+	res, err := stack.callHandler(t, stack.worktreeRoot, "get_symbol",
+		map[string]any{optionalCapabilitiesArgName: []any{string(graphview.CapSearchText)}}, stubLeaf)
+	require.NoError(t, err)
+	require.False(t, res.IsError, "an optional capability permits a labelled fallback")
+	rider := resultFreshness(t, res)
+	require.Equal(t, "worktree:"+viewTestWorktree, rider["requested_view"])
+	require.Equal(t, stack.graphID, rider["graph_id"])
+	require.Equal(t, viewTestWorktree, rider["checkout_id"])
+	require.Equal(t, graphview.CodeViewBuilding, rider["fallback_reason"])
+	rows, ok := rider["degraded_capabilities"].([]any)
+	require.True(t, ok, "the fallback must declare incomplete optional capabilities")
+	require.Contains(t, rows, map[string]any{
+		"capability": string(graphview.CapSearchText),
+		"state":      string(graphview.StateIncomplete),
+	})
 }

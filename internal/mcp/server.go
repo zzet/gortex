@@ -144,8 +144,13 @@ type Server struct {
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
 	// lifecycle is the shared owner of checkout track / forget side effects.
-	lifecycle     *indexer.CheckoutLifecycle
-	activeProject string
+	lifecycle *indexer.CheckoutLifecycle
+	// freshnessWaiter overrides the checkout settle signal a require_fresh
+	// request waits on. Nil in production, where the lifecycle above is the
+	// waiter; a test installs one to drive the wait's outcomes without a live
+	// coordinator. See checkoutFreshnessWaiter.
+	freshnessWaiter checkoutFreshnessWaiter
+	activeProject   string
 	// testIndexProbe caches, per repo prefix, which language families the
 	// graph carries test symbols for (see testLangsIndexed). The answer
 	// changes with a reindex — and with the test-edge pass that stamps those
@@ -248,6 +253,34 @@ type Server struct {
 	backgroundMaintenanceDrained bool
 	analysisMaterializeMu        sync.Mutex
 	analysisMu                   sync.RWMutex
+	// answerAnalysis is the analysis receipt the answer path last observed
+	// with analysisMu free, and answerAnalysisValues the per-generation values
+	// it memoizes; see analysis_answer.go. The answer path never waits for a
+	// running analysis pass.
+	// analysisRunMu serializes analysis passes (and the clusters tool's
+	// recompute, which shares the Leiden cache); analysisPassActive reports a
+	// pass in flight now that a pass no longer holds analysisMu. See
+	// analysis_pass.go.
+	analysisRunMu      sync.Mutex
+	analysisPassActive atomic.Bool
+	analysisPassSkips  atomic.Int64
+	// analysisScopedHandle memoizes the view-scoped analysis handle
+	// (analysis_generation.go).
+	analysisScopedHandle atomic.Pointer[analysisScopedHandleMemo]
+	// analysisYield, when set, reports that an edit cycle holds the build
+	// lane; a background pass waits it out between sub-analyses.
+	analysisYield func() bool
+	// routeFTSWarm is the background warm of routes' base generations for
+	// the full-text ranker (warmRouteFTS): the route pre-warm only queues a
+	// route here, and one worker reads, outside every publication.
+	routeFTSWarm         routeFTSWarmQueue
+	answerAnalysis       atomic.Pointer[answerAnalysisSnapshot]
+	answerAnalysisValues answerAnalysisCache
+	answerToken          atomic.Pointer[answerTokenMemo]
+	// stackAdjacency memoizes the rerank's bounded-centrality reads per
+	// composed level of a routed stack; see centrality_stack_memo.go.
+	stackAdjacency     *stackAdjacencyMemo
+	stackAdjacencyOnce sync.Once
 
 	// cochange caches the git-history co-change graph. cochangeByFile
 	// maps a file path to its co-changing file paths and association
@@ -369,13 +402,17 @@ type Server struct {
 	mutationReceipts    sync.Map
 	mutationReindexWait time.Duration
 	mutationSafetyWait  time.Duration
+	// mutationRouteWaitEntered observes a real pending source-mutation route
+	// after selection and before polling. Nil outside deterministic tests.
+	mutationRouteWaitEntered func(context.Context)
 
 	// mutationCommits is the durable disk-commit ledger for the single-file
 	// mutating tools (mutation_commit.go). It answers the question the
 	// transport cannot: when a tool call is abandoned at its deadline, did the
 	// bytes actually land? The zero value is usable, so directly-constructed
 	// test and embedded servers need no constructor wiring.
-	mutationCommits mutationCommitLedger
+	mutationCommits    mutationCommitLedger
+	pendingSourceFiles pendingSourceRegistry
 
 	// mutationPreCommitHook is a fault-injection seam, nil in production. It
 	// fires between registering a commit and the cancellation gate that guards
@@ -596,6 +633,11 @@ type Server struct {
 	// that legacy tool.
 	facades *facadeRegistry
 
+	// Installed only with an independently owned contract producer. Ordinary
+	// source operations do not capture inputs or call this runtime.
+	contractAnalysisRuntime *ContractAnalysisRuntime
+	contractAnalysisWaiters atomic.Int64
+
 	// toolPolicy restricts the published tool surface to a named preset
 	// / allow-deny set (see tool_presets.go). Resolved at construction
 	// from MultiRepoOptions.ToolPolicy (the mcp.tools config block) plus
@@ -630,6 +672,13 @@ type Server struct {
 // Never returns nil — callers can chain `.recordFile(...)` etc.
 // unconditionally.
 func (s *Server) sessionFor(ctx context.Context) *sessionState {
+	// A cursor call pins its owner before retrieval; release must not let
+	// an active call lazily recreate a disconnected session.
+	if ctx != nil {
+		if owner, ok := ctx.Value(symbolPageOwnerKey{}).(*sessionState); ok {
+			return owner
+		}
+	}
 	id := SessionIDFromContext(ctx)
 	if id == "" || s.sessions == nil {
 		return s.session
@@ -709,7 +758,8 @@ type sessionState struct {
 	// subsequent get_symbol_source / get_editing_context on one of its
 	// results can be attributed back to the query — this is the raw input
 	// to the combo tracker. Reset on every search.
-	lastSearch lastSearchState
+	lastSearch  lastSearchState
+	symbolPages *symbolPageCache
 
 	// Workspace scope for this session, resolved lazily from the
 	// session cwd on first query and cached here. scopeResolved
@@ -815,9 +865,11 @@ type lastSearchState struct {
 }
 
 // tokenStats tracks estimated token savings for the current session. When a
-// savings.Store is attached, each record() call also increments the persistent
-// cumulative totals so "Gortex saved $X this month"-style narratives survive
-// server restarts.
+// savings.Store is attached, each record() call also books the observation
+// into the persistent cumulative totals so "Gortex saved $X this month"-style
+// narratives survive server restarts. That booking is a buffered enqueue, not
+// a database transaction: a read-only tool call must not pay a durable
+// sidecar commit to record its own accounting (see internal/savings).
 //
 // parent, when non-nil, is the process-wide aggregate (s.tokenStats) that
 // every per-session counter feeds. Without the fan-out, a fresh session's
@@ -961,7 +1013,8 @@ func (ts *tokenStats) record(node *graph.Node, tool string, returned, fullFile i
 
 	// Forward to the persistent store outside our lock — its own
 	// synchronization guards concurrent writers, and the ledger write
-	// shouldn't block new record() calls on the hot path.
+	// shouldn't block new record() calls on the hot path. Sidecar-backed
+	// stores buffer here and commit one transaction per flush window.
 	if store != nil {
 		store.AddObservation(savings.Observation{
 			Repo:      repo,
@@ -1817,6 +1870,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 			}
 		}
 		s.lifecycle.SetNotifier(s)
+		s.wireRoutePrewarm()
 	}
 
 	// Proactive-notification broadcasters. Constructed up-front so
@@ -2574,9 +2628,11 @@ func (s *Server) scopedNodesByKinds(ctx context.Context, kinds []graph.NodeKind)
 	if len(kinds) == 0 {
 		return nil
 	}
-	reader := s.readerFor(ctx)
+	// Bound to the request: an abandoned call stops reading within one page
+	// of its deadline instead of pinning the store's WAL snapshot.
+	reader := graph.BindReadContext(s.readerFor(ctx), ctx)
 	var nodes []*graph.Node
-	if scan, ok := reader.(graph.NodesByKindsScanner); ok {
+	if scan, ok := contractCoreSelectedReader(reader).(graph.NodesByKindsScanner); ok {
 		nodes = scan.NodesByKinds(kinds)
 	} else {
 		// Fallback: same behaviour as scopedNodes, kind-filtered Go-side.
@@ -2669,15 +2725,32 @@ func (s *Server) tokenStatsFor(ctx context.Context) *tokenStats {
 	return s.sessions.get(id).tokenStats
 }
 
-// FlushSavings is kept for shutdown-path compatibility. The sidecar-backed
-// ledger commits every observation as it is recorded, so there is nothing
-// buffered to write.
+// FlushSavings commits any buffered savings observations. The sidecar-backed
+// ledger coalesces observations into one transaction per flush window, so
+// this is the shutdown path's job: the daemon's teardown chain calls it
+// (serverstack registers it as a cleanup step) before the sidecar handle is
+// released, and without it the last window of accounting is lost. Reads of
+// the ledger flush on their own, so no reader needs to call this first.
 func (s *Server) FlushSavings() error {
 	store := s.savingsStore()
 	if store == nil {
 		return nil
 	}
 	return store.Flush()
+}
+
+// SetSavingsFlushBounds narrows (or widens) the ledger's coalescing window
+// for this server. The daemon keeps the package default; the one-shot stdio
+// server — which its host SIGKILLs rather than shuts down — tightens it at
+// its entry point so a killed session loses seconds of accounting, not a
+// whole minute. No-op when persistence isn't wired, and an operator's
+// GORTEX_SAVINGS_FLUSH_INTERVAL is never overridden (see savings.Store).
+func (s *Server) SetSavingsFlushBounds(interval time.Duration, max int) {
+	store := s.savingsStore()
+	if store == nil {
+		return
+	}
+	store.SetFlushBounds(interval, max)
 }
 
 // savingsStore extracts the persistent savings store via tokenStats. Returns
@@ -2819,10 +2892,22 @@ func (s *Server) ResolveToolScope(toolName string, repo any) (*ScopedRepos, *mcp
 	return ResolveScopedRepos(scope, repo)
 }
 
-// communityCacheToken is the per-graph identity tuple
-// handleAnalyzeClusters checks before re-running the incremental
-// detector. EdgeIdentity moves on provenance churn; NodeCount and EdgeCount
-// cover additions/removals. analysisRevision closes the remaining same-count
+// communityCacheToken is the identity of the INDEXED CORPUS — s.graph,
+// generation zero — at one moment. It is not the identity of a request's view:
+// every per-server analysis it keys (the Leiden partition and the process
+// discovery beneath it) is computed over the corpus and not over whatever view
+// a request selected, which is why the consumers that serve one under a routed
+// view say base_scoped on the rider rather than pretending the answer describes
+// the view (view_capabilities.go, annotateBaseScoped).
+//
+// Reading it is NOT free and it must never be put on a liveness path: on the
+// SQL backend NodeCount and EdgeCount are whole-generation COUNT(*) scans
+// (store_sqlite/store.go, stmtNodeCount / stmtEdgeCount — the O(repos) counter
+// path countsFromIndexState is reachable only through Stats()). It is read once
+// per analysis run, which is what it is priced for.
+//
+// EdgeIdentity moves on provenance churn; NodeCount and EdgeCount cover
+// additions/removals. analysisRevision closes the remaining same-count
 // mutation gap on durable stores (for example a rebind or source-location
 // shift). A zero token is "never populated".
 type communityCacheToken struct {
@@ -2848,7 +2933,34 @@ func (s *Server) currentCommunityToken() communityCacheToken {
 // the current graph, then pushes a `notifications/resources/updated`
 // for every bootstrap resource so subscribed clients can refresh
 // without polling.
-func (s *Server) RunAnalysis() {
+func (s *Server) RunAnalysis() { s.runAnalysis(true) }
+
+// runAnalysis is RunAnalysis. A background pass (the lifecycle's lane, the
+// on-demand starter) yields between its sub-analyses to edit cycles and to
+// tool calls in flight; a pass a tool call runs itself (index_repository,
+// reindex) does not, since it would only be waiting for itself.
+//
+// The pass never holds analysisMu while it computes: every reader keeps
+// answering from the installed snapshot (or without analysis signals once
+// that snapshot no longer matches the graph) and only the install itself
+// takes the lock. Passes are serialized by analysisRunMu, and a graph whose
+// installed snapshot still matches makes the pass a no-op.
+func (s *Server) runAnalysis(background bool) {
+	s.analysisRunMu.Lock()
+	defer s.analysisRunMu.Unlock()
+	s.analysisPassActive.Store(true)
+	defer s.analysisPassActive.Store(false)
+	if s.analysisSnapshotStillCurrent() {
+		s.analysisPassSkips.Add(1)
+		if s.logger != nil {
+			s.logger.Info("mcp: analysis pass skipped: the installed snapshot matches the graph")
+		}
+		// Subscribers are still told, as after every pass: the call is the
+		// "rollups are settled" signal they wait for. Nothing was rebuilt, so
+		// the graph-invalidated broadcast and the per-graph resets stay out.
+		s.notifyBootstrapResourcesUpdated()
+		return
+	}
 	runtimeactivity.Begin("analysis")
 	analysisStarted := time.Now()
 	var memoryBefore runtime.MemStats
@@ -2861,9 +2973,7 @@ func (s *Server) RunAnalysis() {
 		scheduleOSMemoryReleaseAfterBurst(s.logger, "mcp_analysis")
 	}()
 
-	s.analysisMu.Lock()
-	analysisMetrics := s.populateAnalysisLocked()
-	s.analysisMu.Unlock()
+	analysisMetrics := s.populateAnalysis(true, background)
 
 	// The graph was just rebuilt, so the lazy-enrichment ledger — symbol
 	// IDs whose incoming refs were confirmed against the *previous* graph
@@ -2908,6 +3018,14 @@ func (s *Server) RunAnalysis() {
 			zap.Duration("adjacency", analysisMetrics.adjacency),
 			zap.Duration("auto_concepts", analysisMetrics.autoConcepts),
 			zap.Duration("hits", analysisMetrics.hits),
+			zap.Int("attempts", analysisMetrics.attempts),
+			zap.Int("superseded", analysisMetrics.superseded),
+			zap.String("superseded_at", analysisMetrics.supersededAt),
+			zap.Int("yields", analysisMetrics.yields),
+			zap.Int("pace_parks", analysisMetrics.paceParks),
+			zap.Duration("pace_parked", analysisMetrics.paceParked),
+			zap.Int("projection_edge_scans", analysisMetrics.projectionEdgeScans),
+			zap.Duration("yielded", analysisMetrics.yielded),
 			zap.Duration("total", time.Since(analysisStarted)),
 			zap.Uint64("heap_alloc_before_bytes", memoryBefore.HeapAlloc),
 			zap.Uint64("heap_alloc_after_bytes", memoryAfter.HeapAlloc),
@@ -3005,9 +3123,59 @@ func (s *Server) getCommunities() *analysis.CommunityResult {
 func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats) {
 	_ = s.ensureCommunitiesMaterialized()
 	_ = s.ensureLeidenMaterialized()
+	// The fast path reads under the read lock; the recompute runs outside
+	// analysisMu, serialized with the analysis pass by analysisRunMu, and
+	// only its install takes the lock — a reader never waits for a Leiden
+	// run (analysis_pass.go).
+	if result, stats, ok := s.cachedIncrementalCommunities(); ok {
+		return result, stats
+	}
+	s.analysisRunMu.Lock()
+	defer s.analysisRunMu.Unlock()
+	if result, stats, ok := s.cachedIncrementalCommunities(); ok {
+		return result, stats
+	}
+	s.analysisMu.RLock()
+	cur := s.currentCommunityToken()
+	communitiesNil, cachedToken, leidenInput := s.communities == nil, s.communitiesToken, s.leidenCache
+	s.analysisMu.RUnlock()
+	if s.logger != nil {
+		s.logger.Info("incrementalCommunities cache miss",
+			zap.Bool("communities_nil", communitiesNil),
+			zap.Int("cached_nodes", cachedToken.nodeCount),
+			zap.Int("cur_nodes", cur.nodeCount),
+			zap.Int("cached_edges", cachedToken.edgeCount),
+			zap.Int("cur_edges", cur.edgeCount),
+			zap.Int("cached_edge_rev", cachedToken.edgeIdentity),
+			zap.Int("cur_edge_rev", cur.edgeIdentity))
+	}
+	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, leidenInput)
+	// Capture the token AFTER the algo finishes — if the graph mutated
+	// during the (potentially slow) detector run, the token reflects
+	// the state the result was actually computed against, and the next
+	// call's token comparison stays meaningful.
+	token := s.currentCommunityToken()
 	s.analysisMu.Lock()
 	defer s.analysisMu.Unlock()
+	s.communities = result
+	s.leidenCache = cache
+	s.communitiesToken = token
+	// A cache miss ran a real community recompute. Invalidate the dependent
+	// hotspot ranking and advance its epoch while holding analysisMu: an
+	// in-flight getHotspots build that captured the old communities will see
+	// the epoch change, discard its result, and rebuild before publishing.
+	s.hotspots = nil
+	s.hotspotsReady = false
+	s.analysisEpoch++
+	return result, stats
+}
+
+// cachedIncrementalCommunities is incrementalCommunities' cache hit: the
+// communities installed for the graph as it is now.
+func (s *Server) cachedIncrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats, bool) {
 	cur := s.currentCommunityToken()
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
 	if s.communities != nil && s.communitiesToken == cur {
 		stats := analysis.IncrementalCommunityStats{
 			Incremental: true,
@@ -3021,40 +3189,9 @@ func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.I
 				zap.Int("edges", cur.edgeCount),
 				zap.Int("edge_identity_rev", cur.edgeIdentity))
 		}
-		return s.communities, stats
+		return s.communities, stats, true
 	}
-	if s.logger != nil {
-		// INFO-level on the miss path so a regression that re-introduces
-		// a steady-state cache miss is visible without flipping the
-		// daemon to debug. The full token diff is here precisely to
-		// catch background-mutation regressions (some pass keeps drifting
-		// the edge count under the cache and the Leiden walk runs every
-		// call). A real first-call miss is a single line in the log.
-		s.logger.Info("incrementalCommunities cache miss",
-			zap.Bool("communities_nil", s.communities == nil),
-			zap.Int("cached_nodes", s.communitiesToken.nodeCount),
-			zap.Int("cur_nodes", cur.nodeCount),
-			zap.Int("cached_edges", s.communitiesToken.edgeCount),
-			zap.Int("cur_edges", cur.edgeCount),
-			zap.Int("cached_edge_rev", s.communitiesToken.edgeIdentity),
-			zap.Int("cur_edge_rev", cur.edgeIdentity))
-	}
-	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
-	s.communities = result
-	s.leidenCache = cache
-	// Capture the token AFTER the algo finishes — if the graph mutated
-	// during the (potentially slow) detector run, the token reflects
-	// the state the result was actually computed against, and the next
-	// call's token comparison stays meaningful.
-	s.communitiesToken = s.currentCommunityToken()
-	// A cache miss ran a real community recompute. Invalidate the dependent
-	// hotspot ranking and advance its epoch while holding analysisMu: an
-	// in-flight getHotspots build that captured the old communities will see
-	// the epoch change, discard its result, and rebuild before publishing.
-	s.hotspots = nil
-	s.hotspotsReady = false
-	s.analysisEpoch++
-	return result, stats
+	return nil, analysis.IncrementalCommunityStats{}, false
 }
 
 func (s *Server) getProcesses() *analysis.ProcessResult {
@@ -3207,6 +3344,7 @@ func (s *Server) SetEventRules(rules []config.EventRule) {
 
 // ServeStdio starts the MCP server on stdin/stdout.
 func (s *Server) ServeStdio() error {
+	defer s.retireSymbolPages()
 	return server.ServeStdio(s.mcpServer)
 }
 

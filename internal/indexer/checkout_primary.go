@@ -202,7 +202,7 @@ func (l *CheckoutLifecycle) SetPrimary(ctx context.Context, graphID string) (Set
 		FamilyID:             preview.FamilyID,
 		GraphID:              graphID,
 		ExpectedPrimaryEpoch: preview.PrimaryEpoch,
-		LastSeen:             l.now().Unix(),
+		LastSeen:             l.clock().Unix(),
 	})
 	if err != nil {
 		return out, err

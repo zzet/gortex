@@ -42,12 +42,10 @@ func (idx *Indexer) GrepTextPaths(query string, prefixes []string, limit int) []
 	if len(prefixes) == 0 {
 		return idx.GrepText(query, limit)
 	}
-	if s := idx.warmTrigramSearcher(); s != nil {
-		return s.GrepPaths(query, prefixes, limit)
-	}
-	// Streaming fallback: apply the prefix restriction to the known file
-	// list before the bounded scan, so the cold path keeps the same
-	// pre-truncation semantics as the warm one.
+	// Apply the scope before doing any search work. Warming a repository's
+	// trigram cache reads every known file and can synchronously evict another
+	// repository's cache; neither belongs on a path-scoped request. Streaming
+	// the selected known paths also sees edits without refreshing that cache.
 	matches, _ := trigram.GrepPathsBounded(context.Background(), idx.rootPath,
 		filterKnownPathsByPrefix(idx.knownFilePaths(), prefixes), query, limit, 0)
 	return matches

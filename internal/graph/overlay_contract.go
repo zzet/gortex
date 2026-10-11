@@ -53,12 +53,12 @@ type OverlayLayerReader interface {
 	// answer yes here merely because it covers the node's file.
 	//
 	// What is left for this method is the adjacency no file claim can
-	// reach: an identity the layer removed or re-emitted from outside
-	// the files it covers, and a source whose edge set it replaced
-	// without claiming any file — which is what happens when a rename
-	// in one file retargets the calls made from an untouched one.
-	// Answering yes here says nothing about whether the layer carries
-	// the node — that stays OwnsNodeIdentity's question.
+	// reach: an identity the layer removed, or a source whose edge set
+	// it explicitly replaced without claiming a file. An implementation
+	// may deliberately replace adjacency when re-emitting an uncovered
+	// node, but a metadata-only row replacement MUST answer false unless
+	// it independently claims the source's edges. Answering yes says
+	// nothing about carrying the node: that stays OwnsNodeIdentity's question.
 	OwnsOutEdges(id string) bool
 
 	// IsRemovedID reports whether the layer marked a base ID removed.
