@@ -119,6 +119,14 @@ func (s *Store) publishContractAttachment(ctx context.Context, expected graph.Co
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// The attachment row is a retirement reference to its payload generation
+	// (contractAttachmentReferenceSQL). The guarded building -> ready UPDATE
+	// below already rolls back an attachment to a generation that is no longer
+	// building; this refuses a retiring one up front with the typed admission
+	// error the other reference writers return, before the ancestry work.
+	if err := validateViewGenerationAdmissionTx(ctx, tx, attachment.PayloadGeneration); err != nil {
+		return err
+	}
 	var chain []int64
 	if len(witnesses) == 0 {
 		chain, err = contractInputAncestryTx(ctx, tx, s.viewGen, expected)

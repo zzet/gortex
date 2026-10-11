@@ -1588,8 +1588,12 @@ func (c *Catalog) DeleteDedicatedGraph(ctx context.Context, graphID string) erro
 	if err := requireCatalogID("graph_id", graphID); err != nil {
 		return err
 	}
-	return c.deleteOne(ctx, fmt.Sprintf("dedicated graph %s", graphID),
+	err := c.deleteOne(ctx, fmt.Sprintf("dedicated graph %s", graphID),
 		`DELETE FROM dedicated_graphs WHERE graph_id = ?`, graphID)
+	if err == nil {
+		noteAnyGenerationReferenceReleased()
+	}
+	return err
 }
 
 // SetPrimaryDedicatedGraph moves the family's primary base to one graph. The
@@ -2229,10 +2233,26 @@ SELECT EXISTS(SELECT 1 FROM checkout_routes WHERE commit_generation_id = ? OR di
 // associations — first, so the caller gets one typed refusal instead of a driver
 // constraint string.
 func (c *Catalog) DeleteViewGeneration(ctx context.Context, generationID int64) error {
+	_, err := c.deleteViewGeneration(ctx, generationID)
+	return err
+}
+
+// deleteViewGeneration is DeleteViewGeneration reporting the base the deleted
+// row named when it was deleted (0 for none): the generation whose "based"
+// reference the delete released. It is read in the deleting transaction, so a
+// rebase that moved the row after a caller read it is not missed.
+func (c *Catalog) deleteViewGeneration(ctx context.Context, generationID int64) (base int64, err error) {
 	if generationID <= 0 {
-		return fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
+		return 0, fmt.Errorf("%w: generation_id %d", ErrCatalogInvalidValue, generationID)
 	}
-	return c.withTx(ctx, func(tx *sql.Tx) error {
+	err = c.withTx(ctx, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COALESCE(base_generation_id, 0) FROM view_generations WHERE generation_id = ?`, generationID,
+		).Scan(&base); errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
+		} else if err != nil {
+			return err
+		}
 		var referenced bool
 		if err := tx.QueryRowContext(ctx, viewGenerationReferencedSQL,
 			generationID, generationID, generationID, generationID, generationID, generationID, generationID,
@@ -2264,6 +2284,10 @@ func (c *Catalog) DeleteViewGeneration(ctx context.Context, generationID int64) 
 		}
 		return nil
 	})
+	if err != nil {
+		return 0, err
+	}
+	return base, nil
 }
 
 // --- view layers --------------------------------------------------------
@@ -2318,11 +2342,16 @@ func (c *Catalog) UpsertCheckoutRoute(ctx context.Context, route CheckoutRoute) 
 	if err := route.validate(); err != nil {
 		return err
 	}
-	return c.withTx(ctx, func(tx *sql.Tx) error {
+	var previous []int64
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
 		if err := validateDedicatedGraphAdmissionTx(ctx, tx, route.GraphID); err != nil {
 			return err
 		}
-		_, err := tx.ExecContext(ctx, `
+		var err error
+		if previous, err = routeGenerationsTx(ctx, tx, route.CheckoutID); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `
 INSERT INTO checkout_routes
   (checkout_id, graph_id, commit_generation_id, dirty_generation_id, route_epoch, state)
 VALUES (?, ?, ?, ?, ?, ?)
@@ -2345,6 +2374,14 @@ ON CONFLICT(checkout_id) DO UPDATE SET
 		}
 		return nil
 	})
+	if err == nil {
+		// A route re-installed over an existing row may have let go of what
+		// it named before.
+		if released := releasedRouteGenerations(previous, route.CommitGenerationID, route.DirtyGenerationID); len(released) > 0 {
+			noteGenerationReferencesReleased(GenerationReferenceRelease{Released: released})
+		}
+	}
+	return err
 }
 
 // GetCheckoutRoute returns one checkout's route.
@@ -2464,8 +2501,12 @@ func (c *Catalog) DeleteCheckoutRoute(ctx context.Context, checkoutID string) er
 	if err := requireCatalogID("checkout_id", checkoutID); err != nil {
 		return err
 	}
-	return c.deleteOne(ctx, fmt.Sprintf("route for checkout %s", checkoutID),
+	err := c.deleteOne(ctx, fmt.Sprintf("route for checkout %s", checkoutID),
 		`DELETE FROM checkout_routes WHERE checkout_id = ?`, checkoutID)
+	if err == nil {
+		noteAnyGenerationReferenceReleased()
+	}
+	return err
 }
 
 // FlipCheckoutRoute repoints a route and bumps its epoch in one guarded
@@ -2482,11 +2523,16 @@ func (c *Catalog) FlipCheckoutRoute(ctx context.Context, req FlipCheckoutRouteRe
 	if err := requireCatalogValue("state", req.State, routeStates); err != nil {
 		return err
 	}
-	return c.withTx(ctx, func(tx *sql.Tx) error {
+	var previous []int64
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
 		if err := validateDedicatedGraphAdmissionTx(ctx, tx, req.GraphID); err != nil {
 			return err
 		}
-		err := execGuardedTx(ctx, tx, fmt.Sprintf("route for checkout %s at epoch %d", req.CheckoutID, req.ExpectedRouteEpoch), `
+		var err error
+		if previous, err = routeGenerationsTx(ctx, tx, req.CheckoutID); err != nil {
+			return err
+		}
+		err = execGuardedTx(ctx, tx, fmt.Sprintf("route for checkout %s at epoch %d", req.CheckoutID, req.ExpectedRouteEpoch), `
 UPDATE checkout_routes
    SET graph_id = ?, commit_generation_id = ?, dirty_generation_id = ?,
        route_epoch = route_epoch + 1, state = ?
@@ -2504,6 +2550,14 @@ UPDATE checkout_routes
 		}
 		return nil
 	})
+	if err == nil {
+		// Whatever the route named before and no longer names lost a
+		// reference: a commit layer another checkout's route held, say.
+		if released := releasedRouteGenerations(previous, req.CommitGenerationID, req.DirtyGenerationID); len(released) > 0 {
+			noteGenerationReferencesReleased(GenerationReferenceRelease{Released: released})
+		}
+	}
+	return err
 }
 
 // flipRouteSlotSQL is one guarded statement per slot. Naming a single column
@@ -2723,7 +2777,7 @@ func (c *Catalog) AdoptRefViewGeneration(ctx context.Context, req AdoptRefViewGe
 			return err
 		}
 	}
-	return c.withTx(ctx, func(tx *sql.Tx) error {
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
 		if err := validateRefGraphAdmissionTx(ctx, tx, req.RefViewID); err != nil {
 			return err
 		}
@@ -2757,6 +2811,11 @@ UPDATE ref_views
 		}
 		return validateViewGenerationAdmissionTx(ctx, tx, req.GenerationID)
 	})
+	if err == nil {
+		// The generation the view pointed at before lost that reference.
+		noteAnyGenerationReferenceReleased()
+	}
+	return err
 }
 
 // TouchRefViewSelection re-stamps the ref and commit a selection observed, and
@@ -2852,8 +2911,12 @@ func (c *Catalog) DeleteRefView(ctx context.Context, refViewID string) error {
 	if err := requireCatalogID("ref_view_id", refViewID); err != nil {
 		return err
 	}
-	return c.deleteOne(ctx, fmt.Sprintf("ref view %s", refViewID),
+	err := c.deleteOne(ctx, fmt.Sprintf("ref view %s", refViewID),
 		`DELETE FROM ref_views WHERE ref_view_id = ?`, refViewID)
+	if err == nil {
+		noteAnyGenerationReferenceReleased()
+	}
+	return err
 }
 
 // GetRefView returns one ref view.

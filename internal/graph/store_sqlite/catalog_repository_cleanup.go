@@ -47,6 +47,10 @@ func (c *Catalog) BeginRepositoryCleanup(ctx context.Context, graphID string) (R
 	if err != nil {
 		return RepositoryCleanupIdentity{}, false, err
 	}
+	if found {
+		// Closing the graph cleared its active pointer.
+		noteAnyGenerationReferenceReleased()
+	}
 	return identity, found, nil
 }
 
@@ -209,7 +213,7 @@ SELECT d.graph_id, COALESCE(d.owner_checkout_id, ''), COALESCE(c.incarnation, ''
 // The closing graph and owner stay durable for subsequent retirement retries.
 // It does not delete a generation, relax reference guards, or authorize cleanup.
 func (c *Catalog) ReleaseRepositoryCleanupPublication(ctx context.Context, expected RepositoryCleanupIdentity) error {
-	return c.withTx(ctx, func(tx *sql.Tx) error {
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
 		identity, found, err := repositoryCleanupIdentityTx(ctx, tx, expected.GraphID)
 		if err != nil {
 			return err
@@ -227,4 +231,8 @@ func (c *Catalog) ReleaseRepositoryCleanupPublication(ctx context.Context, expec
 		_, err = tx.ExecContext(ctx, `DELETE FROM dedicated_base_publications WHERE graph_id = ?`, expected.GraphID)
 		return err
 	})
+	if err == nil {
+		noteAnyGenerationReferenceReleased()
+	}
+	return err
 }

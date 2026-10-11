@@ -678,6 +678,9 @@ func (c *Catalog) AdoptDedicatedBaseGeneration(ctx context.Context, req AdoptDed
 	if err != nil {
 		return DedicatedBaseAdoption{}, err
 	}
+	if out.PreviousGenerationID != claim.GenerationID {
+		noteGenerationReferenceReleased(out.PreviousGenerationID)
+	}
 	announceDedicatedBaseAdoption(c.store, DedicatedBaseAdoptionEvent{
 		GraphID:    claim.Desire.Authority.GraphID,
 		FamilyID:   claim.Desire.Authority.FamilyID,
@@ -1048,7 +1051,7 @@ func announceDedicatedBaseAdoption(store *Store, event DedicatedBaseAdoptionEven
 }
 
 func (c *Catalog) FailDedicatedBaseBuild(ctx context.Context, req FailDedicatedBaseBuildRequest) error {
-	return c.withTx(ctx, func(tx *sql.Tx) error {
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
 		claim := req.Claim
 		if _, err := dedicatedBaseOwnerTx(ctx, tx, claim.Desire.Authority.GraphID, claim.Desire.Authority.Owner, claim.Desire.Authority); err != nil {
 			return err
@@ -1070,4 +1073,9 @@ func (c *Catalog) FailDedicatedBaseBuild(ctx context.Context, req FailDedicatedB
 		_, err = tx.ExecContext(ctx, `UPDATE dedicated_base_publications SET attempt_state='failed',error=? WHERE graph_id=?`, detail, claim.Desire.Authority.GraphID)
 		return err
 	})
+	if err == nil {
+		// A failed attempt no longer holds its generation.
+		noteAnyGenerationReferenceReleased()
+	}
+	return err
 }

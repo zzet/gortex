@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 const (
@@ -56,6 +58,69 @@ func (s *Store) RetirePayloadGenerationQuantum(ctx context.Context, generationID
 	return progress, err
 }
 
+// RetirePayloadGenerationQuantumFenced is RetirePayloadGenerationQuantum for a
+// generation the caller's burst already fenced through a full quantum.
+//
+// The full quantum re-ran its whole preamble every time — two catalog reads,
+// the reference check, a fence transaction that re-ran the reference query
+// and committed nothing once the row was retiring, and a writer drain — so a
+// 16-row quantum took the writer three times. Once this process has fenced,
+// sealed and drained a generation, the seal refuses payload writes and the
+// drain has run, and the catalog writes that add a route, ref view, base or
+// dedicated reference refuse a retiring generation. Not every reference can be
+// refused, though: the contract-input term of the reference predicate
+// (contractAttachmentReferenceSQL) can turn true through a row written in
+// another generation, without any write to this one. The per-quantum check
+// never protected the payload from that — the first quantum has already
+// deleted rows — so a continuation checks only the in-memory ownership (build
+// flight, fold hold, inUse) and runs the quantum transaction, which itself
+// rechecks that the row is still retiring; the final catalog delete rechecks
+// every reference and refuses a generation referenced again, which the caller
+// parks like any other refusal. A generation this process has not fenced takes
+// the full quantum.
+func (s *Store) RetirePayloadGenerationQuantumFenced(ctx context.Context, generationID int64, inUse func(int64) bool) (PayloadRetirementProgress, error) {
+	if ctx == nil || s == nil {
+		return s.RetirePayloadGenerationQuantum(ctx, generationID, inUse)
+	}
+	seal := s.payloadSealIfPresent(generationID)
+	if seal == nil || seal.state.Load() != payloadSealRetired {
+		return s.RetirePayloadGenerationQuantum(ctx, generationID, inUse)
+	}
+	row, fenced := seal.sweep.fencedRow()
+	if !fenced {
+		return s.RetirePayloadGenerationQuantum(ctx, generationID, inUse)
+	}
+	var progress PayloadRetirementProgress
+	if err := ctx.Err(); err != nil {
+		return progress, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.retirementQuantum())
+	defer cancel()
+	if err := s.retirementQuantumAdmission(ctx); err != nil {
+		return progress, err
+	}
+	if s.PayloadBuildFlightActive(generationID) || s.chainFoldHolds(generationID) || (inUse != nil && inUse(generationID)) {
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedLeased)
+		return progress, fmt.Errorf("%w: generation %d", ErrPayloadGenerationInUse, generationID)
+	}
+	if err := seal.sweep.retirementGate.LockContext(ctx); err != nil {
+		return progress, err
+	}
+	defer seal.sweep.retirementGate.Unlock()
+	// Another retiree may have removed the generation while this one waited.
+	if current := s.payloadSealIfPresent(generationID); current != seal {
+		return s.RetirePayloadGenerationQuantum(ctx, generationID, inUse)
+	}
+	s.ClearStorageFailure(generationID)
+	budget := payloadSweepBudget{maxRows: payloadSweepMinBatch, maxChunks: 1, quantum: &progress}
+	err := s.sweepFencedPayloadGeneration(ctx, s.Catalog(), row, seal, budget)
+	return progress, err
+}
+
+// RetirementPreambles reports how many full retirement preambles this store
+// has run (measurement).
+func (s *Store) RetirementPreambles() int64 { return s.retirementPreambles.Load() }
+
 // retirementQuantum is the real-time budget of one retirement quantum:
 // payloadRetirementQuantumDuration unless a test has raised it.
 func (s *Store) retirementQuantum() time.Duration {
@@ -66,8 +131,15 @@ func (s *Store) retirementQuantum() time.Duration {
 }
 
 func (s *Store) retirementQuantumAdmission(ctx context.Context) error {
+	if logBytes, ok := ctx.Value(payloadQuantumLogBytesKey{}).(func() int64); ok {
+		return s.retirementQuantumAdmissionAt(ctx, logBytes())
+	}
 	return s.retirementQuantumAdmissionAt(ctx, s.retirementLogBytes())
 }
+
+// payloadQuantumLogBytesKey carries a test's WAL size for a quantum's
+// admission checks: a per-call seam like payloadQuantumClockKey.
+type payloadQuantumLogBytesKey struct{}
 
 func (s *Store) retirementQuantumAdmissionAt(ctx context.Context, walBytes int64) error {
 	if err := ctx.Err(); err != nil {

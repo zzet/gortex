@@ -18,7 +18,9 @@ func (c *Catalog) upsertDedicatedGraphIdentity(ctx context.Context, dedicated De
 	if err := dedicated.validate(); err != nil {
 		return err
 	}
-	return c.withTx(ctx, func(tx *sql.Tx) error {
+	var released int64
+	err := c.withTx(ctx, func(tx *sql.Tx) error {
+		released = 0
 		existing := DedicatedGraph{GraphID: dedicated.GraphID}
 		var owner sql.NullString
 		var active sql.NullInt64
@@ -71,8 +73,14 @@ func (c *Catalog) upsertDedicatedGraphIdentity(ctx context.Context, dedicated De
 			return err
 		}
 		if dedicated.ActiveGenerationID != existing.ActiveGenerationID {
+			released = existing.ActiveGenerationID
 			return validateViewGenerationAdmissionTx(ctx, tx, dedicated.ActiveGenerationID)
 		}
 		return nil
 	})
+	if err == nil {
+		// The active pointer moved off the generation it named.
+		noteGenerationReferenceReleased(released)
+	}
+	return err
 }

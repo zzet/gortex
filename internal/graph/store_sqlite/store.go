@@ -88,6 +88,13 @@ type storeCore struct {
 	sweepBatch atomic.Int64
 	// sweepWALPerRow is the learned WAL bytes per retired row (float64 bits).
 	sweepWALPerRow atomic.Uint64
+	// wideSweepBatch is the chunk size wide retirement quanta learned
+	// (payload_generation_quantum_walk.go).
+	wideSweepBatch atomic.Int64
+	// retirementPreambles counts full retirement preambles (reference check,
+	// fence transaction, seal, writer drain) this store ran; a fenced
+	// continuation skips them (RetirePayloadGenerationQuantumFenced).
+	retirementPreambles atomic.Int64
 	// backgroundCheckpoint coordinates the periodic PASSIVE worker with the
 	// generation-scoped bulk owner before either touches the physical writer.
 	// It lives on the shared core so every AtGeneration handle sees one token.

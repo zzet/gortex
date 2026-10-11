@@ -54,6 +54,9 @@ func (c *Catalog) ReleaseRefViewGeneration(
 		released = true
 		return nil
 	})
+	if released && err == nil {
+		noteGenerationReferenceReleased(generationID)
+	}
 	return released && err == nil, err
 }
 

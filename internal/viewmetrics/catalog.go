@@ -65,6 +65,21 @@ const (
 	// GenerationSweepCollectedTotal counts generations a janitor pass
 	// collected that an earlier offer could not.
 	GenerationSweepCollectedTotal = "views_generation_sweep_collected_total"
+	// RetirementQuantaTotal counts committed retirement quantum transactions,
+	// and RetirementRowsDeletedTotal the payload rows retirement deleted: the
+	// drain's throughput, which the refusal counter above is not.
+	RetirementQuantaTotal      = "views_retirement_quanta_total"
+	RetirementRowsDeletedTotal = "views_retirement_rows_deleted_total"
+	// GenerationRetireOwedTotal counts generations owed to the deferred
+	// retirement sweep, by why they became debt: the production side the
+	// retired counter is read against.
+	GenerationRetireOwedTotal = "views_generation_retire_owed_total"
+	// RetirementPassesTotal counts deferred retirement worker passes, and
+	// RetirementStandDownTotal the passes and bursts that retired nothing
+	// because foreground work, a chain fold or the WAL held them back, by
+	// what held them.
+	RetirementPassesTotal    = "views_retirement_passes_total"
+	RetirementStandDownTotal = "views_retirement_stand_down_total"
 
 	// The committed-base (dedicated-base) publication family.
 	//
@@ -188,6 +203,7 @@ const (
 	LabelExact    = "exact"
 	LabelConsumer = "consumer"
 	LabelShape    = "shape"
+	LabelWhy      = "why"
 )
 
 // Committed-base generation shapes: self-contained, or composed over a parent.
@@ -358,7 +374,34 @@ const (
 	RefusedLeased  = "leased"
 	RefusedMissing = "missing"
 	RefusedError   = "error"
+	// RetireYielded and RetirePreempted label an attempt that stopped with
+	// work left on purpose rather than one that was refused: a bounded pass
+	// that committed and yielded on its budget, and one a waiting writer or
+	// the caller's deadline cut. Neither is an error.
+	RetireYielded   = "yielded"
+	RetirePreempted = "preempted"
 )
+
+// Why a generation became retirement debt: a torn or failed build's output, a
+// layer a route, a reuse cache or a fold released, or one the sweep's catalog
+// scan found with no live owner.
+const (
+	OwedTorn       = "torn"
+	OwedFailed     = "failed"
+	OwedReleased   = "released"
+	OwedDiscovered = "discovered"
+)
+
+// What held a deferred retirement pass or burst back. The foreground reasons
+// name the foreground work in flight; the rest are an edit cycle on the
+// build lane, an interactive writer, too little idle since the last
+// foreground work, a chain fold, and the WAL pause.
+var retirementStandDownReasons = []string{
+	"edit_cycle", "interactive_write", "edit_idle", "chain_fold", "wal_pause",
+	"foreground_interactive_build", "foreground_checkout_cycle",
+	"foreground_checkout_mutation", "foreground_checkout_transition",
+	"foreground_refresh_ticket", "foreground_demand",
+}
 
 // Sweep lanes: whose backlog a collection came off.
 const (
@@ -519,10 +562,20 @@ var catalog = map[string]spec{
 	GenerationRetireRefusedTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelReason, values: []string{
 			RefusedRouted, RefusedBased, RefusedLeased, RefusedMissing, RefusedError,
+			RetireYielded, RetirePreempted,
 		}},
 	}},
 	GenerationSweepCollectedTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelSweep, values: []string{SweepCheckout, SweepRefView}},
+	}},
+	RetirementQuantaTotal:      {kind: kindCounter},
+	RetirementRowsDeletedTotal: {kind: kindCounter},
+	GenerationRetireOwedTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelWhy, values: []string{OwedTorn, OwedFailed, OwedReleased, OwedDiscovered}},
+	}},
+	RetirementPassesTotal: {kind: kindCounter},
+	RetirementStandDownTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelReason, values: retirementStandDownReasons},
 	}},
 
 	DedicatedBasePublishTotal: {kind: kindCounter, labels: []labelSpec{

@@ -24,6 +24,9 @@ type sqliteWriteGate struct {
 	// onRelease runs at every Unlock while the gate is still held (the
 	// writer connection's page-cache counters; writer_cache_counters.go).
 	onRelease atomic.Pointer[func()]
+	// holds counts completed holds (measurement: how often a path takes the
+	// writer).
+	holds atomic.Int64
 }
 
 // held reports whether someone holds the gate right now (a racy snapshot).
@@ -93,6 +96,7 @@ func (g *sqliteWriteGate) Unlock() {
 		(*f)()
 	}
 	endHold(g.holder.Swap(nil), "write gate")
+	g.holds.Add(1)
 	select {
 	case g.token <- struct{}{}:
 	default:

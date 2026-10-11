@@ -7,6 +7,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // The retirement sweep's budget, its resume state, and the reason it stopped.
@@ -171,6 +173,9 @@ func (p *payloadSweepPass) spend(rows int64) {
 	}
 	p.chunks++
 	p.rows += rows
+	if rows > 0 {
+		viewmetrics.Add(viewmetrics.RetirementRowsDeletedTotal, rows)
+	}
 	if p.budget.quantum != nil {
 		p.budget.quantum.ChunksCommitted++
 		p.budget.quantum.RowsDeleted += rows
@@ -196,6 +201,28 @@ type payloadSweepState struct {
 	analysisPointerDone bool
 	analysisID          int64
 	analysisPhase       int
+	// fenced is the catalog row as this process fenced, sealed and drained
+	// it for retirement (nil before): what a fenced continuation
+	// (RetirePayloadGenerationQuantumFenced) needs instead of re-reading it.
+	fenced *ViewGeneration
+}
+
+// noteFenced records that this process holds the generation's retirement
+// fence, seal and writer drain.
+func (p *payloadSweepState) noteFenced(row ViewGeneration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.fenced = &row
+}
+
+// fencedRow is the row noteFenced recorded, if any.
+func (p *payloadSweepState) fencedRow() (ViewGeneration, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.fenced == nil {
+		return ViewGeneration{}, false
+	}
+	return *p.fenced, true
 }
 
 func (p *payloadSweepState) cursor() int {

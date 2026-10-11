@@ -868,14 +868,19 @@ func (s *Store) learnSweepWALPerRow(before, after WALWriteMark, removed int64) i
 
 // nextSweepBatch scales limit toward the target from one chunk's time.
 func nextSweepBatch(limit int, removed int64, elapsed time.Duration) int {
+	return nextSweepBatchToward(limit, removed, elapsed, payloadSweepChunkTarget)
+}
+
+// nextSweepBatchToward is nextSweepBatch toward a named chunk time.
+func nextSweepBatchToward(limit int, removed int64, elapsed, target time.Duration) int {
 	if removed < int64(limit) || elapsed <= 0 {
 		// A short chunk (the table's tail) says nothing about the rate.
-		if elapsed > payloadSweepChunkTarget {
+		if elapsed > target {
 			return max(payloadSweepMinBatch, limit/2)
 		}
 		return limit
 	}
-	next := int(float64(limit) * float64(payloadSweepChunkTarget) / float64(elapsed))
+	next := int(float64(limit) * float64(target) / float64(elapsed))
 	next = min(max(next, limit/4), limit*4)
 	return min(max(next, payloadSweepMinBatch), payloadGenerationSweepBatch)
 }
@@ -969,17 +974,16 @@ func (s *Store) retirePayloadGeneration(
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedMissing)
 		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
 	}
-	owner := generationOwner(row.OwnerKind)
 	// Preserve cheap refusals and their existing metric labels. These observations
 	// are not the retirement authority: the catalog rechecks references atomically.
 	refs, err := catalog.ViewGenerationReferences(ctx, generationID)
 	if err != nil {
-		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, retireStopReason(ctx, err))
 		return err
 	}
 	if refs.Any() {
 		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, refusalReason(refs))
-		return fmt.Errorf("%w: generation %d", ErrCatalogGenerationReferenced, generationID)
+		return &GenerationReferencedError{GenerationID: generationID, Refs: refs}
 	}
 	inUseNow := func() bool {
 		return s.PayloadBuildFlightActive(generationID) || s.chainFoldHolds(generationID) || (inUse != nil && inUse(generationID))
@@ -1004,7 +1008,7 @@ func (s *Store) retirePayloadGeneration(
 		return fmt.Errorf("%w: generation %d", ErrCatalogNotFound, generationID)
 	}
 	if err := catalog.BeginViewGenerationRetirement(ctx, generationID); err != nil {
-		reason := viewmetrics.RefusedError
+		reason := retireStopReason(ctx, err)
 		if errors.Is(err, ErrCatalogGenerationReferenced) {
 			// The transaction reports a reference added after the fast check,
 			// but not its kind. Keep its cause without a second diagnostic query.
@@ -1038,27 +1042,52 @@ func (s *Store) retirePayloadGeneration(
 	// running it through the classifier would leave an arm no failure can ever
 	// reach.
 	if err := s.drainPayloadWriters(ctx); err != nil {
-		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, retireStopReason(ctx, err))
 		return err
 	}
+	s.retirementPreambles.Add(1)
+	seal.sweep.noteFenced(row)
+	return s.sweepFencedPayloadGeneration(ctx, catalog, row, seal, budget)
+}
 
-	// Past this point the generation is fenced, sealed and drained, and every
-	// remaining step is idempotent. A pass that yields on its budget or is
-	// refused by the storage layer therefore stops where it is and returns:
-	// the catalog row stays retiring, which is the state a crash here would
-	// leave and the state the next pass resumes from. Nothing between here and
-	// DeleteViewGeneration makes a half-swept generation visible as anything
-	// other than retiring.
+// sweepFencedPayloadGeneration is retirement past its preamble.
+//
+// Past this point the generation is fenced, sealed and drained, and every
+// remaining step is idempotent. A pass that yields on its budget or is
+// refused by the storage layer therefore stops where it is and returns: the
+// catalog row stays retiring, which is the state a crash here would leave and
+// the state the next pass resumes from. Nothing between here and
+// DeleteViewGeneration makes a half-swept generation visible as anything other
+// than retiring, and DeleteViewGeneration rechecks every reference itself.
+func (s *Store) sweepFencedPayloadGeneration(
+	ctx context.Context, catalog *Catalog, row ViewGeneration, seal *payloadSeal, budget payloadSweepBudget,
+) error {
+	generationID := row.GenerationID
 	pass := budget.begin()
 	pass.state = &seal.sweep
 	if err := s.sweepPayloadGeneration(ctx, generationID, pass); err != nil {
-		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, retireStopReason(ctx, err))
 		return s.noteRetirementFailure(generationID, err)
 	}
-	if err := catalog.DeleteViewGeneration(ctx, generationID); err != nil {
-		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, viewmetrics.RefusedError)
+	// The base comes from the deleting transaction: row was read before the
+	// fence, and a rebase in between moved the "based" reference elsewhere.
+	base, err := catalog.deleteViewGeneration(ctx, generationID)
+	if err != nil {
+		reason := retireStopReason(ctx, err)
+		if errors.Is(err, ErrCatalogGenerationReferenced) {
+			// Swept, but referenced again since the fence: a refusal, not an
+			// error. Name the holder as the fast check would have.
+			reason = viewmetrics.LabelOther
+			if refs, refsErr := catalog.ViewGenerationReferences(ctx, generationID); refsErr == nil && refs.Any() {
+				reason = refusalReason(refs)
+				err = &GenerationReferencedError{GenerationID: generationID, Refs: refs}
+			}
+		}
+		viewmetrics.Count(viewmetrics.GenerationRetireRefusedTotal, reason)
 		return s.noteRetirementFailure(generationID, err)
 	}
+	// The removed row's "based" reference on its base went with it.
+	noteGenerationReferencesReleased(GenerationReferenceRelease{Removed: generationID, Released: positiveIDs(base)})
 	s.payloadSeals.CompareAndDelete(generationID, seal)
 	// Generation ids are never reused, so a handle still holding the lane
 	// keeps a mutex nothing new can join rather than sharing one with a later
@@ -1067,8 +1096,27 @@ func (s *Store) retirePayloadGeneration(
 	if budget.quantum != nil {
 		budget.quantum.CatalogRemoved = true
 	}
-	viewmetrics.Count(viewmetrics.GenerationRetiredTotal, owner)
+	viewmetrics.Count(viewmetrics.GenerationRetiredTotal, generationOwner(row.OwnerKind))
 	return nil
+}
+
+// retireStopReason labels an attempt that stopped before it finished. A
+// bounded pass that committed and yielded on its budget (including the WAL
+// pause's yield) is progress, and a pass a waiting writer or the caller's own
+// deadline cut — whose transaction rolled back, automatically or not — is a
+// preemption; only what is left is an error.
+func retireStopReason(ctx context.Context, err error) string {
+	switch {
+	case errors.Is(err, ErrPayloadSweepBudgetExhausted):
+		return viewmetrics.RetireYielded
+	case errors.Is(err, ErrPayloadRetirementWriteWanted),
+		errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, context.Canceled),
+		ctx.Err() != nil && errors.Is(err, sql.ErrTxDone):
+		return viewmetrics.RetirePreempted
+	default:
+		return viewmetrics.RefusedError
+	}
 }
 
 // refusalReason names the holder a refused retirement lost to. A generation
