@@ -51,7 +51,11 @@ func openBackendWithUpgradeOption(name, path string, logger *zap.Logger, allowRe
 		return nil, nil, err
 	}
 	if logger != nil {
-		logger.Info("opening sqlite backend", zap.String("path", resolved))
+		logger.Info("opening backend", zap.String("backend", name), zap.String("path", resolved))
+	}
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "memory", "mem", "in-memory":
+		return openMemoryBackend(resolved, logger)
 	}
 	if upgradeOption == nil {
 		return openSqliteBackend(resolved, allowRebuild, observers...)
@@ -67,13 +71,15 @@ func checkBackend(name string) error {
 	case "", "sqlite", "sqlite3":
 		return nil
 	case "memory", "mem", "in-memory":
-		// Substituting sqlite here would write a caller who asked for a
-		// throwaway store into the shared database on disk. Name the
-		// replacement and let the caller choose the path instead.
-		return errors.New("the in-memory backend is retired; use --backend sqlite --backend-path <path> " +
-			"(a throwaway path gives the old ephemeral behaviour)")
+		// Re-introduced as the Tier-3 memory-resident backend
+		// (odd/tasks/tier3-memory-store.md, issue davalillo/gortex#19):
+		// graph state in RAM, mutations journaled, sqlite snapshot on close.
+		// NOT the pre-18ca30f9 ephemeral scratch store — this one is durable
+		// through the journal and shares the standard store path under the
+		// same cross-process flock.
+		return nil
 	default:
-		return fmt.Errorf("unknown backend %q (expected: sqlite)", name)
+		return fmt.Errorf("unknown backend %q (expected: sqlite or memory)", name)
 	}
 }
 
