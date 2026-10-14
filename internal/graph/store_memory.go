@@ -254,6 +254,21 @@ func (m *MemoryStore) journaled(op *journalOp, apply func()) {
 	apply()
 }
 
+// journaledEffective is journaled with the issue davalillo/gortex#22 guard:
+// the inert check runs under applyMu BEFORE record, so journal order still
+// equals apply order — the ops that reach record are exactly the ones whose
+// apply changes state. Inert mutations are applied exactly as before, only
+// unjournaled (see store_memory_journal_guard.go for the consistency and
+// concurrency reasoning).
+func (m *MemoryStore) journaledEffective(op *journalOp, apply func(), inert func() bool) {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	if !inert() {
+		m.record(op)
+	}
+	apply()
+}
+
 // record journals one mutation before it is applied. Journal-first: the
 // record describes the intent; the delegate applies it after. Callers hold
 // applyMu, so journal order equals apply order.
@@ -279,7 +294,9 @@ func (m *MemoryStore) record(op *journalOp) {
 // *Graph. Reads are not overridden.
 
 func (m *MemoryStore) AddNode(n *Node) {
-	m.journaled(&journalOp{Op: "add_node", Node: journalNodeOf(n)}, func() { m.Graph.AddNode(n) })
+	m.journaledEffective(&journalOp{Op: "add_node", Node: journalNodeOf(n)},
+		func() { m.Graph.AddNode(n) },
+		func() bool { return nodeInert(m.existingNode(n.ID), n) })
 }
 
 // journalAddBatchChunk bounds one journal line: a whole-repo first index can
@@ -288,35 +305,59 @@ func (m *MemoryStore) AddNode(n *Node) {
 const journalAddBatchChunk = 1000
 
 func (m *MemoryStore) AddBatch(nodes []*Node, edges []*Edge) {
-	m.journaled(&journalOp{Op: "add_batch"}, func() {
-		for start := 0; start < len(nodes); start += journalAddBatchChunk {
-			end := min(start+journalAddBatchChunk, len(nodes))
-			chunk := make([]journalNode, 0, end-start)
-			for _, n := range nodes[start:end] {
-				chunk = append(chunk, *journalNodeOf(n))
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+
+	// Journal only the batch's effective members (issue davalillo/gortex#22):
+	// inert re-adds are applied exactly as before but not journaled. The
+	// old bare "add_batch" marker line carried no data and was silently
+	// ignored by replay — dropped.
+	for start := 0; start < len(nodes); start += journalAddBatchChunk {
+		end := min(start+journalAddBatchChunk, len(nodes))
+		chunk := make([]journalNode, 0, end-start)
+		for _, n := range nodes[start:end] {
+			if n == nil || nodeInert(m.existingNode(n.ID), n) {
+				continue
 			}
+			chunk = append(chunk, *journalNodeOf(n))
+		}
+		if len(chunk) > 0 {
 			m.record(&journalOp{Op: "add_batch_nodes", Nodes: chunk})
 		}
-		for start := 0; start < len(edges); start += journalAddBatchChunk {
-			end := min(start+journalAddBatchChunk, len(edges))
-			chunk := make([]journalEdge, 0, end-start)
-			for _, e := range edges[start:end] {
-				chunk = append(chunk, *journalEdgeOf(e))
+	}
+	for start := 0; start < len(edges); start += journalAddBatchChunk {
+		end := min(start+journalAddBatchChunk, len(edges))
+		chunk := make([]journalEdge, 0, end-start)
+		for _, e := range edges[start:end] {
+			if e == nil || edgeInert(m.existingEdge(e), e) {
+				continue
 			}
+			chunk = append(chunk, *journalEdgeOf(e))
+		}
+		if len(chunk) > 0 {
 			m.record(&journalOp{Op: "add_batch_edges", Edges: chunk})
 		}
-		m.Graph.AddBatch(nodes, edges)
-	})
+	}
+	m.Graph.AddBatch(nodes, edges)
 }
 
 func (m *MemoryStore) AddEdge(e *Edge) {
-	m.journaled(&journalOp{Op: "add_edge", Edge: journalEdgeOf(e)}, func() { m.Graph.AddEdge(e) })
+	m.journaledEffective(&journalOp{Op: "add_edge", Edge: journalEdgeOf(e)},
+		func() { m.Graph.AddEdge(e) },
+		func() bool { return edgeInert(m.existingEdge(e), e) })
 }
 
 func (m *MemoryStore) SetEdgeProvenance(e *Edge, newOrigin string) bool {
 	var changed bool
-	m.journaled(&journalOp{Op: "set_edge_provenance", Edge: journalEdgeOf(e), NewOrigin: newOrigin},
-		func() { changed = m.Graph.SetEdgeProvenance(e, newOrigin) })
+	m.journaledEffective(
+		&journalOp{Op: "set_edge_provenance", Edge: journalEdgeOf(e), NewOrigin: newOrigin},
+		func() { changed = m.Graph.SetEdgeProvenance(e, newOrigin) },
+		func() bool {
+			// SetEdgeProvenance only rewrites the existing edge's Origin;
+			// a missing edge or an unchanged origin cannot change state.
+			old := m.existingEdge(e)
+			return old == nil || old.Origin == newOrigin
+		})
 	return changed
 }
 
@@ -342,19 +383,44 @@ func (m *MemoryStore) ReindexEdges(batch []EdgeReindex) {
 }
 
 func (m *MemoryStore) SetEdgeProvenanceBatch(batch []EdgeProvenanceUpdate) (changed int) {
-	jp := make([]journalProvenance, len(batch))
-	for i, u := range batch {
-		jp[i] = journalProvenance{Edge: journalEdgeOf(u.Edge), NewOrigin: u.NewOrigin}
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	// Journal only the effective updates (issue davalillo/gortex#22); the
+	// full batch still applies unchanged.
+	jp := make([]journalProvenance, 0, len(batch))
+	for _, u := range batch {
+		if u.Edge == nil {
+			continue
+		}
+		old := m.existingEdge(u.Edge)
+		if old == nil || old.Origin == u.NewOrigin {
+			continue
+		}
+		jp = append(jp, journalProvenance{Edge: journalEdgeOf(u.Edge), NewOrigin: u.NewOrigin})
 	}
-	m.journaled(&journalOp{Op: "set_edge_provenance_batch", Provenance: jp},
-		func() { changed = m.Graph.SetEdgeProvenanceBatch(batch) })
+	if len(jp) > 0 {
+		m.record(&journalOp{Op: "set_edge_provenance_batch", Provenance: jp})
+	}
+	changed = m.Graph.SetEdgeProvenanceBatch(batch)
 	return changed
 }
 
 func (m *MemoryStore) RemoveEdge(from, to string, kind EdgeKind) bool {
 	var removed bool
-	m.journaled(&journalOp{Op: "remove_edge", From: from, To: to, Kind: kind},
-		func() { removed = m.Graph.RemoveEdge(from, to, kind) })
+	m.journaledEffective(
+		&journalOp{Op: "remove_edge", From: from, To: to, Kind: kind},
+		func() { removed = m.Graph.RemoveEdge(from, to, kind) },
+		func() bool {
+			// Mirror Graph.RemoveEdge's own match (To == to && Kind == kind,
+			// first encounter in the out-bucket): nothing matching means the
+			// removal cannot change state.
+			for _, e := range m.Graph.GetOutEdges(from) {
+				if e != nil && e.To == to && e.Kind == kind {
+					return false
+				}
+			}
+			return true
+		})
 	return removed
 }
 
