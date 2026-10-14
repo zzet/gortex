@@ -68,6 +68,15 @@ type MemoryStore struct {
 	replayUnknownOps     int
 	replayCorruptMidFile bool
 	replayCorruptLine    int
+	replaySkippedStale   bool
+	replayEpochStale     bool
+
+	// epoch is the snapshot generation this store's state belongs to (issue
+	// davalillo/gortex#23): 0 on a fresh store, set from the epoch sidecar
+	// at load, bumped by every journal reset that follows a successful
+	// snapshot. Journaled via the journal_open header line so replay can
+	// pair the journal with the right snapshot generation.
+	epoch uint64
 }
 
 var _ Store = (*MemoryStore)(nil)
@@ -165,6 +174,7 @@ type journalProvenance struct {
 type journalOp struct {
 	Op         string              `json:"op"`
 	TS         int64               `json:"ts,omitempty"`
+	Epoch      uint64              `json:"epoch,omitempty"`
 	Node       *journalNode        `json:"node,omitempty"`
 	Nodes      []journalNode       `json:"nodes,omitempty"`
 	Edge       *journalEdge        `json:"edge,omitempty"`
@@ -212,6 +222,12 @@ func (m *MemoryStore) OpenJournal(path string) error {
 	m.journalW = bufio.NewWriterSize(m.journalCW, 256*1024)
 	m.journalEnc = json.NewEncoder(m.journalW)
 	m.journalErr = nil
+	// A fresh (or reset) journal file starts with its generation header so
+	// replay can pair it with the right snapshot (issue davalillo/gortex#23).
+	// An append-open onto existing content keeps the header already there.
+	if fi, serr := f.Stat(); serr == nil && fi.Size() == 0 {
+		m.writeJournalHeaderLocked()
+	}
 	return nil
 }
 
@@ -253,6 +269,10 @@ func (m *MemoryStore) ResetJournal() error {
 	m.journalW.Reset(m.journalFile)
 	m.journalCW.n = 0
 	m.journalErr = nil
+	// The reset starts a new journal generation (issue davalillo/gortex#23):
+	// the snapshot just published subsumed everything before it.
+	m.epoch++
+	m.writeJournalHeaderLocked()
 	return nil
 }
 
@@ -501,8 +521,11 @@ func (m *MemoryStore) ReplayJournal(path string) (int, error) {
 	m.replayUnknownOps = 0
 	m.replayCorruptMidFile = false
 	m.replayCorruptLine = 0
+	m.replaySkippedStale = false
+	m.replayEpochStale = false
 	ops := 0
 	lineNo := 0
+	firstRecord := true
 	for sc.Scan() {
 		lineNo++
 		line := sc.Bytes()
@@ -526,6 +549,31 @@ func (m *MemoryStore) ReplayJournal(path string) (int, error) {
 			}
 			return ops, nil
 		}
+		if firstRecord {
+			firstRecord = false
+			if op.Op == "journal_open" {
+				switch {
+				case op.Epoch < m.epoch:
+					// The journal predates the snapshot generation: the
+					// crash landed between the snapshot rename and the
+					// journal reset, and mutations are blocked for the
+					// whole dump — so every journaled op is already
+					// contained in the snapshot. Replaying it would only
+					// redo work (issue davalillo/gortex#23).
+					m.replaySkippedStale = true
+					return 0, nil
+				case op.Epoch > m.epoch:
+					// The epoch sidecar lagged the journal (its write
+					// failed or crashed). Replay is the safe direction:
+					// pre-dump ops re-apply idempotently, post-dump ops
+					// are still needed.
+					m.replayEpochStale = true
+				}
+				continue
+			}
+			// No header on the first record: a legacy journal — replay it
+			// unchanged.
+		}
 		if m.applyOp(&op) {
 			ops++
 		}
@@ -534,11 +582,19 @@ func (m *MemoryStore) ReplayJournal(path string) (int, error) {
 }
 
 // ReplayAnomalies reports what the last ReplayJournal saw beyond ordinary
-// operations: unknown op ids (skipped by applyOp) and whether a corrupt line
-// sat mid-file rather than at the torn tail a crash produces. Zero values
-// mean a clean replay. Read only after ReplayJournal returned.
-func (m *MemoryStore) ReplayAnomalies() (unknownOps int, corruptMidFile bool, corruptLine int) {
-	return m.replayUnknownOps, m.replayCorruptMidFile, m.replayCorruptLine
+// operations: unknown op ids (skipped by applyOp), whether a corrupt line
+// sat mid-file rather than at the torn tail a crash produces, whether the
+// journal was skipped as stale (older generation than the snapshot), and
+// whether the epoch sidecar lagged the journal. Zero values mean a clean
+// replay. Read only after ReplayJournal returned.
+func (m *MemoryStore) ReplayAnomalies() (unknownOps int, corruptMidFile bool, corruptLine int, skippedStaleJournal bool, epochSidecarLagged bool) {
+	return m.replayUnknownOps, m.replayCorruptMidFile, m.replayCorruptLine, m.replaySkippedStale, m.replayEpochStale
+}
+
+// JournalEpoch reports the snapshot generation the store's state belongs to.
+// Read-side pairing value for the journal header (issue davalillo/gortex#23).
+func (m *MemoryStore) JournalEpoch() uint64 {
+	return m.epoch
 }
 
 func (m *MemoryStore) applyOp(op *journalOp) bool {
@@ -601,6 +657,11 @@ func (m *MemoryStore) applyOp(op *journalOp) bool {
 		m.Graph.EvictFile(op.Path)
 	case "evict_repo":
 		m.Graph.EvictRepo(op.RepoPrefix)
+	case "journal_open":
+		// A mid-file generation header (append-open onto existing content
+		// after a crash): no state change. Known, so it counts as applied
+		// and not as an unknown op.
+		return true
 	default:
 		// An op id this build does not know: a journal written by a newer
 		// gortex, or corruption. Apply nothing — replay must never invent a

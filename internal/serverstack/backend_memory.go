@@ -3,6 +3,8 @@ package serverstack
 import (
 	"fmt"
 	"os"
+	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -53,7 +55,12 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 			_ = engine.Close()
 		}
 	}()
-	mstore := graph.NewMemoryStore(graph.WithFTSEngine(engine))
+	// The snapshot generation (issue davalillo/gortex#23) comes from the
+	// epoch sidecar beside the snapshot; 0 on a fresh store or a missing
+	// sidecar. The journal header pairs against it at replay time.
+	epochPath := memoryEpochPath(snapshotPath)
+	loadedEpoch := readJournalEpoch(epochPath)
+	mstore := graph.NewMemoryStore(graph.WithFTSEngine(engine), graph.WithJournalEpoch(loadedEpoch))
 
 	// 1. Cold start from the sqlite snapshot, if one exists. A sqlite file
 	// written by either engine has the same schema, so this is also the
@@ -85,13 +92,15 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 		err = fmt.Errorf("memory backend: replay journal: %w", rerr)
 		return nil, nil, err
 	}
-	unknownOps, corruptMidFile, corruptLine := mstore.ReplayAnomalies()
-	if logger != nil && (ops > 0 || unknownOps > 0 || corruptMidFile) {
+	unknownOps, corruptMidFile, corruptLine, skippedStale, epochLagged := mstore.ReplayAnomalies()
+	if logger != nil && (ops > 0 || unknownOps > 0 || corruptMidFile || skippedStale || epochLagged) {
 		logger.Info("memory backend: journal replayed",
 			zap.Int("ops", ops),
 			zap.Int("unknown_ops", unknownOps),
 			zap.Bool("corrupt_mid_file", corruptMidFile),
-			zap.Int("corrupt_line", corruptLine))
+			zap.Int("corrupt_line", corruptLine),
+			zap.Bool("skipped_stale_journal", skippedStale),
+			zap.Bool("epoch_sidecar_lagged", epochLagged))
 	}
 
 	// 3. Attach the journal for this session.
@@ -99,34 +108,99 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 		err = fmt.Errorf("memory backend: open journal: %w", err)
 		return nil, nil, err
 	}
+	// A replay skipped as stale leaves the old journal attached with a
+	// header from a superseded generation — start it fresh so new mutations
+	// journal under the loaded snapshot's generation (issue
+	// davalillo/gortex#23).
+	if skippedStale {
+		if err := mstore.ResetJournal(); err != nil && logger != nil {
+			logger.Warn("memory backend: stale journal reset failed", zap.Error(err))
+		}
+	}
 	if logger != nil {
 		logger.Info("memory backend: open",
 			zap.String("snapshot", snapshotPath),
-			zap.String("journal", journalPath))
+			zap.String("journal", journalPath),
+			zap.Uint64("epoch", mstore.JournalEpoch()))
 	}
 
-	closeFn = func() error {
-		dumpErr := snapshotMemoryStore(mstore, snapshotPath)
+	// Periodic snapshot triggers (issue davalillo/gortex#23): janitor-style
+	// ticker, never on the mutation hot path. The dump itself pauses
+	// mutation traffic for its duration via the store's write barrier —
+	// that is what keeps "journal ⊆ snapshot" provable for the epoch check.
+	var dumpMu sync.Mutex
+	snapshotAndRotate := func(reason string) {
+		dumpErr := mstore.SnapshotBarrier(func() error {
+			return snapshotMemoryStore(mstore, snapshotPath)
+		})
 		if dumpErr != nil {
 			if logger != nil {
-				logger.Error("memory backend: snapshot dump failed", zap.Error(dumpErr))
+				logger.Error("memory backend: snapshot dump failed",
+					zap.String("reason", reason), zap.Error(dumpErr))
 			}
-		} else if logger != nil {
+			// The journal is the only durable record of mutations the
+			// failed snapshot never captured — it must survive (issue
+			// davalillo/gortex#25). Skip reset AND the epoch sidecar write:
+			// the next boot then replays the journal against the previous
+			// snapshot generation as usual.
+			return
+		}
+		// Reset only after a successful dump (issue davalillo/gortex#25 A6):
+		// its failure must not masquerade as a dump failure.
+		if resetErr := mstore.ResetJournal(); resetErr != nil {
+			if logger != nil {
+				logger.Warn("memory backend: journal reset after snapshot failed",
+					zap.String("reason", reason), zap.Error(resetErr))
+			}
+			return
+		}
+		// Publish the sidecar for the generation the reset just started.
+		// A crash before this write leaves the sidecar one generation
+		// behind: the next boot's replay runs (the safe direction — pre-
+		// dump ops re-apply idempotently, post-dump ops are still needed).
+		if epochErr := writeJournalEpoch(epochPath, mstore.JournalEpoch()); epochErr != nil && logger != nil {
+			logger.Warn("memory backend: epoch sidecar write failed", zap.Error(epochErr))
+		}
+		if logger != nil {
 			logger.Info("memory backend: snapshot dumped",
-				zap.String("snapshot", snapshotPath))
+				zap.String("snapshot", snapshotPath),
+				zap.String("reason", reason),
+				zap.Uint64("epoch", mstore.JournalEpoch()))
 		}
-		// Reset only after a successful dump (issue davalillo/gortex#25 A6,
-		// corrected): the journal is the only durable record of mutations
-		// the failed snapshot never captured — resetting it after a failed
-		// dump would silently drop them on the next boot. The reset is still
-		// its own step with its own log line: a reset failure must not
-		// masquerade as a failed dump.
-		if dumpErr != nil {
-			return nil
+	}
+
+	stopped := make(chan struct{})
+	var stopOnce sync.Once
+	cfg := snapshotTriggerConfig{interval: 30 * time.Second}
+	cfg.loadFromEnv(logger)
+	go func() {
+		ticker := time.NewTicker(cfg.tick)
+		defer ticker.Stop()
+		var lastDump = time.Now() // the loaded snapshot is fresh as of open
+		for {
+			select {
+			case <-stopped:
+				return
+			case <-ticker.C:
+			}
+			reason := cfg.triggerReason(time.Since(lastDump), int64(mstore.JournalBytes()))
+			if reason == "" {
+				continue
+			}
+			// A close in progress owns dumpMu; it dumps anyway.
+			if !dumpMu.TryLock() {
+				continue
+			}
+			lastDump = time.Now()
+			snapshotAndRotate(reason)
+			dumpMu.Unlock()
 		}
-		if resetErr := mstore.ResetJournal(); resetErr != nil && logger != nil {
-			logger.Warn("memory backend: journal reset after snapshot failed", zap.Error(resetErr))
-		}
+	}()
+
+	closeFn = func() error {
+		stopOnce.Do(func() { close(stopped) })
+		dumpMu.Lock()
+		snapshotAndRotate("close")
 		if err := mstore.CloseJournal(); err != nil && logger != nil {
 			logger.Warn("memory backend: journal close", zap.Error(err))
 		}

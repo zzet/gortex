@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -130,4 +131,82 @@ func TestFailedDumpKeepsJournal(t *testing.T) {
 	if got := s3.GetNode("repoB/b.go::g"); got == nil || got.Name != "g" {
 		t.Fatalf("failed dump lost journaled mutations: %+v", got)
 	}
+}
+
+// TestEpochSidecarRoundTrip pins the generation flow (issue
+// davalillo/gortex#23): the sidecar starts absent (epoch 0), every successful
+// dump+reset bumps it, and the reopened store pairs with it.
+func TestEpochSidecarRoundTrip(t *testing.T) {
+	snapPath := filepath.Join(t.TempDir(), "store.sqlite")
+	epochPath := memoryEpochPath(snapPath)
+
+	s1, close1, err := openMemoryBackend(snapPath, nil)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	mem1 := s1.(*graph.MemoryStore)
+	if mem1.JournalEpoch() != 0 {
+		t.Fatalf("initial epoch: want 0, got %d", mem1.JournalEpoch())
+	}
+	close1()
+	if got := readJournalEpoch(epochPath); got != 1 {
+		t.Fatalf("sidecar after first close: want 1, got %d", got)
+	}
+
+	s2, close2, err := openMemoryBackend(snapPath, nil)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	mem2 := s2.(*graph.MemoryStore)
+	if mem2.JournalEpoch() != 1 {
+		t.Fatalf("reopened epoch: want 1, got %d", mem2.JournalEpoch())
+	}
+	// The journal was reset at close, so its header must pair with the
+	// loaded snapshot generation — no stale-skip on reopen.
+	if _, _, _, skipped, lagged := mem2.ReplayAnomalies(); skipped || lagged {
+		t.Fatalf("unexpected replay anomaly: skipped=%v lagged=%v", skipped, lagged)
+	}
+	close2()
+	if got := readJournalEpoch(epochPath); got != 2 {
+		t.Fatalf("sidecar after second close: want 2, got %d", got)
+	}
+}
+
+// TestPeriodicSnapshotJournalSizeTrigger: a journal crossing the byte
+// threshold takes a snapshot off the hot path and rotates the journal.
+func TestPeriodicSnapshotJournalSizeTrigger(t *testing.T) {
+	t.Setenv("GORTEX_SNAPSHOT_JOURNAL_BYTES", "1")
+	t.Setenv("GORTEX_SNAPSHOT_TICK", "20ms")
+	snapPath := filepath.Join(t.TempDir(), "store.sqlite")
+	epochPath := memoryEpochPath(snapPath)
+
+	s, closeFn, err := openMemoryBackend(snapPath, nil)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	mem := s.(*graph.MemoryStore)
+	mem.AddNode(&graph.Node{ID: "repoA/a.go::f", Kind: graph.KindFunction, Name: "f", FilePath: "a.go"})
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if got := readJournalEpoch(epochPath); got == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("periodic trigger never fired; journal bytes=%d", mem.JournalBytes())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if mem.JournalEpoch() != 1 {
+		t.Fatalf("epoch after periodic dump: want 1, got %d", mem.JournalEpoch())
+	}
+	if mem.JournalBytes() == 0 {
+		// The header line post-reset is fine; the point is the rotation.
+		t.Log("journal fully rotated (header-only)")
+	}
+	// The snapshot published by the trigger must contain the mutation.
+	if _, err := os.Stat(snapPath); err != nil {
+		t.Fatalf("snapshot missing: %v", err)
+	}
+	closeFn()
 }

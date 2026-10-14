@@ -50,11 +50,11 @@ func TestReplayJournalCountsUnknownOps(t *testing.T) {
 	if ops != 2 {
 		t.Fatalf("applied ops: want 2 (seed + batch; unknown excluded), got %d", ops)
 	}
-	unknown, corruptMidFile, corruptLine := m.ReplayAnomalies()
+	unknown, corruptMidFile, corruptLine, skippedStale, epochLagged := m.ReplayAnomalies()
 	if unknown != 1 {
 		t.Fatalf("unknown ops: want 1, got %d", unknown)
 	}
-	if corruptMidFile || corruptLine != 0 {
+	if corruptMidFile || corruptLine != 0 || skippedStale || epochLagged {
 		t.Fatalf("unexpected corruption signal: midFile=%v line=%d", corruptMidFile, corruptLine)
 	}
 }
@@ -76,12 +76,12 @@ func TestReplayJournalMidFileCorruptionFlagged(t *testing.T) {
 	if ops != 1 {
 		t.Fatalf("applied ops: want 1, got %d", ops)
 	}
-	_, corruptMidFile, corruptLine := m.ReplayAnomalies()
+	_, corruptMidFile, corruptLine, _, _ := m.ReplayAnomalies()
 	if !corruptMidFile {
 		t.Fatalf("mid-file corruption not flagged")
 	}
-	if corruptLine != 2 {
-		t.Fatalf("corrupt line: want 2, got %d", corruptLine)
+	if corruptLine != 3 {
+		t.Fatalf("corrupt line: want 3 (header + op + appended), got %d", corruptLine)
 	}
 }
 
@@ -100,12 +100,12 @@ func TestReplayJournalTornTailNotFlaggedMidFile(t *testing.T) {
 	if ops != 1 {
 		t.Fatalf("applied ops: want 1, got %d", ops)
 	}
-	_, corruptMidFile, corruptLine := m.ReplayAnomalies()
+	_, corruptMidFile, corruptLine, _, _ := m.ReplayAnomalies()
 	if corruptMidFile {
 		t.Fatalf("torn tail flagged as mid-file corruption")
 	}
-	if corruptLine != 2 {
-		t.Fatalf("corrupt line: want 2, got %d", corruptLine)
+	if corruptLine != 3 {
+		t.Fatalf("corrupt line: want 3 (header + op + appended), got %d", corruptLine)
 	}
 }
 
@@ -128,7 +128,7 @@ func TestReplayJournalEmptyBatchMemberTolerated(t *testing.T) {
 	if n := m.GetNode(""); n != nil {
 		t.Fatalf("zero-value member materialised a node: %+v", n)
 	}
-	if unknown, _, _ := m.ReplayAnomalies(); unknown != 0 {
+	if unknown, _, _, _, _ := m.ReplayAnomalies(); unknown != 0 {
 		t.Fatalf("empty batch member counted as unknown op: %d", unknown)
 	}
 }
@@ -161,5 +161,159 @@ func TestJournalDegradeToInMemory(t *testing.T) {
 	_ = m.CloseJournal()
 	if !strings.Contains(m.JournalErr().Error(), "memory journal") {
 		t.Fatalf("unexpected JournalErr shape: %v", m.JournalErr())
+	}
+}
+
+func TestJournalEpochHeaderWrittenAndBumped(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "journal.jsonl")
+	if NewMemoryStore().JournalEpoch() != 0 {
+		t.Fatalf("fresh store epoch: want 0")
+	}
+	m := seedJournal(t, path) // open + one op + close
+	if m.JournalEpoch() != 0 {
+		t.Fatalf("epoch after open: want 0, got %d", m.JournalEpoch())
+	}
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.HasPrefix(string(first), `{"op":"journal_open","ts":`) ||
+		!strings.Contains(string(first), `"epoch":0`) {
+		t.Fatalf("first journal line is not the epoch-0 header: %q", first)
+	}
+
+	// A reset after a (simulated) snapshot bumps the generation and re-arms
+	// the header.
+	if err := m.OpenJournal(path); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if err := m.ResetJournal(); err != nil {
+		t.Fatalf("ResetJournal: %v", err)
+	}
+	if m.JournalEpoch() != 1 {
+		t.Fatalf("epoch after reset: want 1, got %d", m.JournalEpoch())
+	}
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after reset: %v", err)
+	}
+	if !strings.Contains(string(second), `"epoch":1`) {
+		t.Fatalf("reset did not write the epoch-1 header: %q", second)
+	}
+}
+
+// TestReplaySkipsJournalOlderThanSnapshot pins the epoch pairing: a journal
+// whose header generation is below the loaded snapshot's is fully contained
+// in that snapshot (mutations are blocked for the whole dump), so replay
+// skips it and reports why.
+func TestReplaySkipsJournalOlderThanSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "journal.jsonl")
+	seedJournal(t, path) // header epoch=0, one add_node op
+
+	m := NewMemoryStore(WithJournalEpoch(1)) // snapshot generation 1
+	ops, err := m.ReplayJournal(path)
+	if err != nil {
+		t.Fatalf("ReplayJournal: %v", err)
+	}
+	if ops != 0 {
+		t.Fatalf("stale journal replayed %d ops", ops)
+	}
+	if _, _, _, skipped, lagged := m.ReplayAnomalies(); !skipped || lagged {
+		t.Fatalf("anomalies: want skipped=true lagged=false, got skipped=%v lagged=%v", skipped, lagged)
+	}
+	if n := m.GetNode("repoA/a.go::f"); n != nil {
+		t.Fatalf("skipped journal still applied its op: %+v", n)
+	}
+}
+
+// TestReplayFlagsJournalNewerThanSnapshot covers the lagged-sidecar case:
+// the journal's generation is ahead of the epoch file, so replay runs (the
+// safe direction) and flags the discrepancy.
+func TestReplayFlagsJournalNewerThanSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "journal.jsonl")
+	// A journal written by a generation-1 store (header epoch=1), replayed
+	// against a store whose loaded snapshot generation is 0 — the shape a
+	// crashed epoch-sidecar write produces.
+	m1 := NewMemoryStore(WithJournalEpoch(1))
+	if err := m1.OpenJournal(path); err != nil {
+		t.Fatalf("open gen1 journal: %v", err)
+	}
+	m1.AddNode(&Node{ID: "repoA/z.go::z", Kind: KindFunction, Name: "z", FilePath: "z.go"})
+	if err := m1.CloseJournal(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	m := NewMemoryStore() // epoch 0
+	ops, err := m.ReplayJournal(path)
+	if err != nil {
+		t.Fatalf("ReplayJournal: %v", err)
+	}
+	if ops != 1 {
+		t.Fatalf("lagged-sidecar journal must replay: applied %d ops", ops)
+	}
+	if _, _, _, skipped, lagged := m.ReplayAnomalies(); skipped || !lagged {
+		t.Fatalf("anomalies: want skipped=false lagged=true, got skipped=%v lagged=%v", skipped, lagged)
+	}
+	if n := m.GetNode("repoA/z.go::z"); n == nil {
+		t.Fatalf("lagged-sidecar journal op not applied")
+	}
+}
+
+// TestReplayLegacyHeaderlessJournalUnchanged: journals written before the
+// epoch marker have no header — they replay exactly as before.
+func TestReplayLegacyHeaderlessJournalUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "journal.jsonl")
+	seedJournal(t, path)
+	// Strip the header line, leaving a bare op.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+	if len(lines) != 2 {
+		t.Fatalf("unexpected journal shape: %q", data)
+	}
+	if err := os.WriteFile(path, []byte(lines[1]+"\n"), 0o644); err != nil {
+		t.Fatalf("write legacy journal: %v", err)
+	}
+
+	m := NewMemoryStore(WithJournalEpoch(7))
+	ops, err := m.ReplayJournal(path)
+	if err != nil {
+		t.Fatalf("ReplayJournal: %v", err)
+	}
+	if ops != 1 {
+		t.Fatalf("legacy journal ops: want 1, got %d", ops)
+	}
+	if _, _, _, skipped, lagged := m.ReplayAnomalies(); skipped || lagged {
+		t.Fatalf("legacy journal flagged: skipped=%v lagged=%v", skipped, lagged)
+	}
+	if n := m.GetNode("repoA/a.go::f"); n == nil {
+		t.Fatalf("legacy journal op not applied")
+	}
+}
+
+// TestReplayMidFileHeaderBenign: an append-open after a crash leaves a second
+// header mid-file; replay must treat it as a known no-op.
+func TestReplayMidFileHeaderBenign(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "journal.jsonl")
+	seedJournal(t, path)
+	appendLines(t, path, `{"op":"journal_open","ts":1,"epoch":0}`)
+
+	m := NewMemoryStore()
+	ops, err := m.ReplayJournal(path)
+	if err != nil {
+		t.Fatalf("ReplayJournal: %v", err)
+	}
+	if ops != 2 {
+		t.Fatalf("ops: want 2 (seed op + benign header), got %d", ops)
+	}
+	if unknown, _, _, _, _ := m.ReplayAnomalies(); unknown != 0 {
+		t.Fatalf("mid-file header counted as unknown op: %d", unknown)
 	}
 }
