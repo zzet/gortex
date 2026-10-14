@@ -7,7 +7,15 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
+
+// The memory backend's FTS engine is a full store_sqlite.Store on a
+// ":memory:" DSN (issue davalillo/gortex#21): the engine answers FTS ranking
+// with the sqlite backend's own SQL, so symbol-search parity between the
+// backends is structural, and every FTS byte stays in RAM. The engine only
+// ever holds the FTS sidecars — bundle bodies come from the resident graph.
+var _ graph.FTSEngine = (*store_sqlite.Store)(nil)
 
 // The memory backend (odd/tasks/tier3-memory-store.md, issue
 // davalillo/gortex#19) is a memory-resident graph.Store: primary state lives
@@ -30,7 +38,14 @@ func memoryJournalPath(snapshotPath string) string {
 // sqlite snapshot (if any), replays the journal on top, and returns a store
 // whose close dumps a fresh snapshot and resets the journal.
 func openMemoryBackend(snapshotPath string, logger *zap.Logger) (graph.Store, func() error, error) {
-	store := graph.NewMemoryStore()
+	// 0. The in-RAM FTS engine (issue #21). Derived state: not journaled,
+	// not persisted; rebuilt from resident graph state by the warmup FTS
+	// step and closed with the backend.
+	engine, err := store_sqlite.Open(":memory:")
+	if err != nil {
+		return nil, nil, fmt.Errorf("memory backend: open fts engine: %w", err)
+	}
+	store := graph.NewMemoryStore(graph.WithFTSEngine(engine))
 
 	// 1. Cold start from the sqlite snapshot, if one exists. A sqlite file
 	// written by either engine has the same schema, so this is also the
@@ -75,6 +90,9 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger) (graph.Store, fu
 		}
 		if err := store.CloseJournal(); err != nil && logger != nil {
 			logger.Warn("memory backend: journal close", zap.Error(err))
+		}
+		if err := engine.Close(); err != nil && logger != nil {
+			logger.Warn("memory backend: fts engine close", zap.Error(err))
 		}
 		return nil
 	}

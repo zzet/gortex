@@ -43,14 +43,25 @@ type MemoryStore struct {
 	journalCW   *countWriter
 	journalEnc  *json.Encoder
 	journalErr  error
+
+	// fts is the optional in-RAM FTS engine (issue davalillo/gortex#21):
+	// a store_sqlite.Store on a ":memory:" DSN answering the FTS side of
+	// search with the sqlite backend's own SQL. Derived state — not
+	// journaled, not persisted, rebuilt from resident graph state at boot.
+	// See store_memory_fts.go.
+	fts FTSEngine
 }
 
 var _ Store = (*MemoryStore)(nil)
 
 // NewMemoryStore builds an empty memory-resident store. Call OpenJournal to
 // attach durability and ReplayJournal to restore a prior state.
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{Graph: New()}
+func NewMemoryStore(opts ...MemoryOption) *MemoryStore {
+	m := &MemoryStore{Graph: New()}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }
 
 // journalNode is Node with the JSON-excluded Meta field (marked json:"-" on
