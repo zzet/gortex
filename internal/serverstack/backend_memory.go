@@ -49,13 +49,16 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger) (graph.Store, fu
 
 	// 1. Cold start from the sqlite snapshot, if one exists. A sqlite file
 	// written by either engine has the same schema, so this is also the
-	// engine-switch continuity path.
+	// engine-switch continuity path. The file-mtime sidecar (issue
+	// davalillo/gortex#26) rides along: without it the next warm boot sees
+	// an empty delta frontier and re-reconciles the whole corpus.
 	if _, err := os.Stat(snapshotPath); err == nil {
 		snap, closeSnap, err := openSqliteBackend(snapshotPath, false)
 		if err != nil {
 			return nil, nil, fmt.Errorf("memory backend: open snapshot: %w", err)
 		}
 		store.AddBatch(snap.AllNodes(), snap.AllEdges())
+		restoreFileMtimes(store, snap)
 		closeSnap()
 	}
 
@@ -120,9 +123,49 @@ func snapshotMemoryStore(store *graph.MemoryStore, snapshotPath string) error {
 			return fmt.Errorf("memory backend: snapshot bulk flush: %w", err)
 		}
 	}
+	// Persist the file-mtime sidecar (issue davalillo/gortex#26). The
+	// sqlite snapshot file already carries the file_mtimes table — the
+	// bulk loader just never writes it. ReplaceFileMtimes is the right
+	// primitive: the memory map IS the authoritative set, and its
+	// per-prefix replace prunes rows for files that no longer exist.
+	// Empty input is a no-op inside the replacer, so a repo with no rows
+	// cannot wipe anything.
+	replacer, hasReplace := snap.(graph.FileMtimeReplacer)
+	if hasReplace {
+		for _, prefix := range store.FileMtimePrefixes() {
+			if err := replacer.ReplaceFileMtimes(prefix, store.LoadFileMtimes(prefix)); err != nil {
+				closeSnap()
+				return fmt.Errorf("memory backend: snapshot mtimes for %q: %w", prefix, err)
+			}
+		}
+	}
 	closeSnap()
 	if err := os.Rename(tmp, snapshotPath); err != nil {
 		return fmt.Errorf("memory backend: publish snapshot: %w", err)
 	}
 	return store.ResetJournal()
+}
+
+// restoreFileMtimes copies the snapshot's per-repo file-mtime rows into the
+// memory store (issue davalillo/gortex#26). The snapshot store implements
+// FileMtimeReader and answers its own mtime-holding prefixes via
+// FileMtimePrefixes (sidecar-derived, not node-derived). Best-effort by
+// contract: a partial restore only costs one extra reconcile on the next
+// boot — the same safe-direction degradation as a crash between snapshots.
+func restoreFileMtimes(store *graph.MemoryStore, snap graph.Store) {
+	reader, hasRead := snap.(graph.FileMtimeReader)
+	if !hasRead {
+		return
+	}
+	lister, hasPrefixes := snap.(interface{ FileMtimePrefixes() []string })
+	if !hasPrefixes {
+		return
+	}
+	for _, prefix := range lister.FileMtimePrefixes() {
+		mtimes := reader.LoadFileMtimes(prefix)
+		if len(mtimes) == 0 {
+			continue
+		}
+		_ = store.BulkSetFileMtimes(prefix, mtimes)
+	}
 }

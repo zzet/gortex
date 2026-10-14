@@ -50,6 +50,17 @@ type MemoryStore struct {
 	// journaled, not persisted, rebuilt from resident graph state at boot.
 	// See store_memory_fts.go.
 	fts FTSEngine
+
+	// mtimes is the per-repo file-mtime sidecar (issue davalillo/gortex#26):
+	// the same rows store_sqlite keeps in its file_mtimes table, held in RAM
+	// so the memory backend satisfies the FileMtime* capability family and
+	// warm boots can seed ReconcileRepoCtx from the store. Not journaled —
+	// a crash rolls mtimes back to the last snapshot, which only costs one
+	// extra reconcile (files look changed), never a wrong result. The
+	// snapshot dump persists it and the snapshot load restores it; see
+	// serverstack/backend_memory.go.
+	mtimeMu sync.Mutex
+	mtimes  map[string]map[string]int64
 }
 
 var _ Store = (*MemoryStore)(nil)
@@ -432,7 +443,16 @@ func (m *MemoryStore) EvictFile(filePath string) (nodesRemoved, edgesRemoved int
 
 func (m *MemoryStore) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
 	m.journaled(&journalOp{Op: "evict_repo", RepoPrefix: repoPrefix},
-		func() { nodesRemoved, edgesRemoved = m.Graph.EvictRepo(repoPrefix) })
+		func() {
+			nodesRemoved, edgesRemoved = m.Graph.EvictRepo(repoPrefix)
+			// The sidecar rides the repo, like the sqlite backend's rows
+			// (davalillo/gortex#26). Not journaled: the snapshot dump copies
+			// whatever is live at close time, so clearing here keeps the
+			// next snapshot free of the evicted repo's rows.
+			m.mtimeMu.Lock()
+			delete(m.mtimes, repoPrefix)
+			m.mtimeMu.Unlock()
+		})
 	return nodesRemoved, edgesRemoved
 }
 
