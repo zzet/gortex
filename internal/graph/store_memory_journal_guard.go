@@ -78,10 +78,3 @@ func edgeInert(old, e *Edge) bool {
 	return reflect.DeepEqual(old, e)
 }
 
-// applyOnly runs one mutation under applyMu without journaling. Same mutual
-// exclusion as journaled, so the guard's read-modify ordering holds.
-func (m *MemoryStore) applyOnly(apply func()) {
-	m.applyMu.Lock()
-	defer m.applyMu.Unlock()
-	apply()
-}

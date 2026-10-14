@@ -61,6 +61,13 @@ type MemoryStore struct {
 	// serverstack/backend_memory.go.
 	mtimeMu sync.Mutex
 	mtimes  map[string]map[string]int64
+
+	// Replay diagnostics (issue davalillo/gortex#25 batch A). Written only
+	// by ReplayJournal while it holds applyMu; read afterwards via
+	// ReplayAnomalies. Not journaled, not persisted.
+	replayUnknownOps     int
+	replayCorruptMidFile bool
+	replayCorruptLine    int
 }
 
 var _ Store = (*MemoryStore)(nil)
@@ -73,6 +80,19 @@ func NewMemoryStore(opts ...MemoryOption) *MemoryStore {
 		opt(m)
 	}
 	return m
+}
+
+// ColdLoadBatch applies the snapshot's node/edge bulk to the empty store
+// during backend construction (issue davalillo/gortex#25 A8). It holds
+// applyMu so the cold-load writes run under the same mutual exclusion every
+// other graph write uses; the journal is not attached yet, so nothing is
+// journaled and the inert-guard read-modify dance is unnecessary. Only the
+// construction path (serverstack.openMemoryBackend, single-goroutine) may
+// call this — the store is not published to any reader until it returns.
+func (m *MemoryStore) ColdLoadBatch(nodes []*Node, edges []*Edge) {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	m.Graph.AddBatch(nodes, edges)
 }
 
 // journalNode is Node with the JSON-excluded Meta field (marked json:"-" on
@@ -473,39 +493,74 @@ func (m *MemoryStore) ReplayJournal(path string) (int, error) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
+	// Replay mutates the graph without the journal attached; hold applyMu so
+	// the loop cannot interleave with any writer. Nothing inside calls back
+	// into the journaled wrappers, so the lock is non-reentrant-safe.
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	m.replayUnknownOps = 0
+	m.replayCorruptMidFile = false
+	m.replayCorruptLine = 0
 	ops := 0
+	lineNo := 0
 	for sc.Scan() {
+		lineNo++
 		line := sc.Bytes()
 		if len(line) == 0 {
 			continue
 		}
 		var op journalOp
 		if err := json.Unmarshal(line, &op); err != nil {
-			// Torn tail or corrupt line: keep what applied so far.
+			// Keep what applied so far — derived-cache semantics. But name
+			// the failure shape (issue davalillo/gortex#25 A2): a corrupt
+			// line with more non-empty lines after it is mid-file corruption
+			// (a journal this process cannot have written), not the torn
+			// tail a crash between flushes produces. Look ahead without
+			// applying anything.
+			m.replayCorruptLine = lineNo
+			for sc.Scan() {
+				if len(sc.Bytes()) > 0 {
+					m.replayCorruptMidFile = true
+					break
+				}
+			}
 			return ops, nil
 		}
-		m.applyOp(&op)
-		ops++
+		if m.applyOp(&op) {
+			ops++
+		}
 	}
 	return ops, sc.Err()
 }
 
-func (m *MemoryStore) applyOp(op *journalOp) {
+// ReplayAnomalies reports what the last ReplayJournal saw beyond ordinary
+// operations: unknown op ids (skipped by applyOp) and whether a corrupt line
+// sat mid-file rather than at the torn tail a crash produces. Zero values
+// mean a clean replay. Read only after ReplayJournal returned.
+func (m *MemoryStore) ReplayAnomalies() (unknownOps int, corruptMidFile bool, corruptLine int) {
+	return m.replayUnknownOps, m.replayCorruptMidFile, m.replayCorruptLine
+}
+
+func (m *MemoryStore) applyOp(op *journalOp) bool {
 	switch op.Op {
 	case "add_node":
 		if n := op.Node.toNode(); n != nil {
 			m.Graph.AddNode(n)
 		}
 	case "add_batch_nodes":
-		nodes := make([]*Node, len(op.Nodes))
+		nodes := make([]*Node, 0, len(op.Nodes))
 		for i := range op.Nodes {
-			nodes[i] = op.Nodes[i].toNode()
+			if n := op.Nodes[i].toNode(); n != nil {
+				nodes = append(nodes, n)
+			}
 		}
 		m.Graph.AddBatch(nodes, nil)
 	case "add_batch_edges":
-		edges := make([]*Edge, len(op.Edges))
+		edges := make([]*Edge, 0, len(op.Edges))
 		for i := range op.Edges {
-			edges[i] = op.Edges[i].toEdge()
+			if e := op.Edges[i].toEdge(); e != nil {
+				edges = append(edges, e)
+			}
 		}
 		m.Graph.AddBatch(nil, edges)
 	case "add_edge":
@@ -546,5 +601,14 @@ func (m *MemoryStore) applyOp(op *journalOp) {
 		m.Graph.EvictFile(op.Path)
 	case "evict_repo":
 		m.Graph.EvictRepo(op.RepoPrefix)
+	default:
+		// An op id this build does not know: a journal written by a newer
+		// gortex, or corruption. Apply nothing — replay must never invent a
+		// mutation — but count it so the caller can surface the gap instead
+		// of silently diverging from the journal (issue davalillo/gortex#25
+		// A1).
+		m.replayUnknownOps++
+		return false
 	}
+	return true
 }

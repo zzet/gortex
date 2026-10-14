@@ -37,7 +37,7 @@ func memoryJournalPath(snapshotPath string) string {
 // openMemoryBackend builds the memory-resident backend: cold start loads the
 // sqlite snapshot (if any), replays the journal on top, and returns a store
 // whose close dumps a fresh snapshot and resets the journal.
-func openMemoryBackend(snapshotPath string, logger *zap.Logger) (graph.Store, func() error, error) {
+func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...store_sqlite.MigrationObserver) (store graph.Store, closeFn func() error, err error) {
 	// 0. The in-RAM FTS engine (issue #21). Derived state: not journaled,
 	// not persisted; rebuilt from resident graph state by the warmup FTS
 	// step and closed with the backend.
@@ -45,36 +45,59 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger) (graph.Store, fu
 	if err != nil {
 		return nil, nil, fmt.Errorf("memory backend: open fts engine: %w", err)
 	}
-	store := graph.NewMemoryStore(graph.WithFTSEngine(engine))
+	// Any error return below must not leak the engine (issue
+	// davalillo/gortex#25 A5): the store holds no cleanup chain until the
+	// final return, so the defer owns the engine until then.
+	defer func() {
+		if err != nil {
+			_ = engine.Close()
+		}
+	}()
+	mstore := graph.NewMemoryStore(graph.WithFTSEngine(engine))
 
 	// 1. Cold start from the sqlite snapshot, if one exists. A sqlite file
 	// written by either engine has the same schema, so this is also the
 	// engine-switch continuity path. The file-mtime sidecar (issue
 	// davalillo/gortex#26) rides along: without it the next warm boot sees
-	// an empty delta frontier and re-reconciles the whole corpus.
+	// an empty delta frontier and re-reconciles the whole corpus. The
+	// snapshot open takes the migration observers so schema work on the
+	// shared store file stays observable on the memory path too (issue
+	// davalillo/gortex#25 A7).
 	if _, err := os.Stat(snapshotPath); err == nil {
-		snap, closeSnap, err := openSqliteBackend(snapshotPath, false)
+		var snap graph.Store
+		var closeSnap func() error
+		snap, closeSnap, err = openSqliteBackend(snapshotPath, false, observers...)
 		if err != nil {
-			return nil, nil, fmt.Errorf("memory backend: open snapshot: %w", err)
+			err = fmt.Errorf("memory backend: open snapshot: %w", err)
+			return nil, nil, err
 		}
-		store.AddBatch(snap.AllNodes(), snap.AllEdges())
-		restoreFileMtimes(store, snap)
+		// Construction is single-goroutine by contract, but the cold load
+		// still runs under the store's write lock (issue #25 A8).
+		mstore.ColdLoadBatch(snap.AllNodes(), snap.AllEdges())
+		restoreFileMtimes(mstore, snap)
 		closeSnap()
 	}
 
 	// 2. Replay the journal on top of the snapshot (or onto the empty graph).
 	journalPath := memoryJournalPath(snapshotPath)
-	ops, err := store.ReplayJournal(journalPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("memory backend: replay journal: %w", err)
+	ops, rerr := mstore.ReplayJournal(journalPath)
+	if rerr != nil {
+		err = fmt.Errorf("memory backend: replay journal: %w", rerr)
+		return nil, nil, err
 	}
-	if logger != nil && ops > 0 {
-		logger.Info("memory backend: journal replayed", zap.Int("ops", ops))
+	unknownOps, corruptMidFile, corruptLine := mstore.ReplayAnomalies()
+	if logger != nil && (ops > 0 || unknownOps > 0 || corruptMidFile) {
+		logger.Info("memory backend: journal replayed",
+			zap.Int("ops", ops),
+			zap.Int("unknown_ops", unknownOps),
+			zap.Bool("corrupt_mid_file", corruptMidFile),
+			zap.Int("corrupt_line", corruptLine))
 	}
 
 	// 3. Attach the journal for this session.
-	if err := store.OpenJournal(journalPath); err != nil {
-		return nil, nil, fmt.Errorf("memory backend: open journal: %w", err)
+	if err := mstore.OpenJournal(journalPath); err != nil {
+		err = fmt.Errorf("memory backend: open journal: %w", err)
+		return nil, nil, err
 	}
 	if logger != nil {
 		logger.Info("memory backend: open",
@@ -82,16 +105,23 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger) (graph.Store, fu
 			zap.String("journal", journalPath))
 	}
 
-	closeFn := func() error {
-		if err := snapshotMemoryStore(store, snapshotPath); err != nil {
+	closeFn = func() error {
+		if dumpErr := snapshotMemoryStore(mstore, snapshotPath); dumpErr != nil {
 			if logger != nil {
-				logger.Error("memory backend: snapshot dump failed", zap.Error(err))
+				logger.Error("memory backend: snapshot dump failed", zap.Error(dumpErr))
 			}
 		} else if logger != nil {
 			logger.Info("memory backend: snapshot dumped",
 				zap.String("snapshot", snapshotPath))
 		}
-		if err := store.CloseJournal(); err != nil && logger != nil {
+		// Reset is a separate step with its own error surface (issue
+		// davalillo/gortex#25 A6): the snapshot may be safely published
+		// while the reset failed, and conflating the two mislabels a good
+		// snapshot as a failed dump.
+		if resetErr := mstore.ResetJournal(); resetErr != nil && logger != nil {
+			logger.Warn("memory backend: journal reset after snapshot failed", zap.Error(resetErr))
+		}
+		if err := mstore.CloseJournal(); err != nil && logger != nil {
 			logger.Warn("memory backend: journal close", zap.Error(err))
 		}
 		if err := engine.Close(); err != nil && logger != nil {
@@ -99,15 +129,27 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger) (graph.Store, fu
 		}
 		return nil
 	}
-	return store, closeFn, nil
+	return mstore, closeFn, nil
 }
 
 // snapshotMemoryStore dumps the in-memory graph into a fresh sqlite file and
-// atomically renames it over the snapshot path; on success the journal is
-// reset (the snapshot subsumes every mutation journaled so far).
+// atomically renames it over the snapshot path. The caller owns the journal
+// reset: a successful rename means the snapshot is published even if the
+// follow-up reset fails, and the two failures must not be conflated (issue
+// davalillo/gortex#25 A6).
 func snapshotMemoryStore(store *graph.MemoryStore, snapshotPath string) error {
 	tmp := snapshotPath + ".snapshot.tmp"
 	_ = os.Remove(tmp)
+	published := false
+	// A failed dump must not leave the tmp file behind (issue
+	// davalillo/gortex#25 A4): the next successful dump removes it anyway,
+	// but between the two the stale file is dead weight next to the live
+	// snapshot.
+	defer func() {
+		if !published {
+			_ = os.Remove(tmp)
+		}
+	}()
 	snap, closeSnap, err := openSqliteBackend(tmp, true)
 	if err != nil {
 		return fmt.Errorf("memory backend: open snapshot target: %w", err)
@@ -143,7 +185,8 @@ func snapshotMemoryStore(store *graph.MemoryStore, snapshotPath string) error {
 	if err := os.Rename(tmp, snapshotPath); err != nil {
 		return fmt.Errorf("memory backend: publish snapshot: %w", err)
 	}
-	return store.ResetJournal()
+	published = true
+	return nil
 }
 
 // restoreFileMtimes copies the snapshot's per-repo file-mtime rows into the

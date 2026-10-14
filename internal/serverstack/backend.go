@@ -55,7 +55,7 @@ func openBackendWithUpgradeOption(name, path string, logger *zap.Logger, allowRe
 	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "memory", "mem", "in-memory":
-		return openMemoryBackend(resolved, logger)
+		return openMemoryBackend(resolved, logger, observers...)
 	}
 	if upgradeOption == nil {
 		return openSqliteBackend(resolved, allowRebuild, observers...)
