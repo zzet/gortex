@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -153,6 +154,73 @@ func TestMemoryStoreTornTailReplay(t *testing.T) {
 	}
 	if replayed.GetNode("a") == nil {
 		t.Fatal("complete record lost to torn tail")
+	}
+}
+
+// TestMemoryStoreConcurrentWritesReplayEqually is the issue #20 regression
+// test: with journal-append and apply inside one critical section, any
+// interleaving of concurrent writers must leave the journal order identical
+// to the apply order, so a replay reproduces exactly the live final state.
+func TestMemoryStoreConcurrentWritesReplayEqually(t *testing.T) {
+	path := newJournalPath(t)
+	store := NewMemoryStore()
+	if err := store.OpenJournal(path); err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+
+	const writers = 8
+	const perWriter = 50
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				id := "w" + strconv.Itoa(w) + "-n" + strconv.Itoa(i)
+				store.AddNode(testNode(id))
+				// Conflicting pair: the apply order decides the final state,
+				// so a journal that interleaves differently from apply would
+				// replay to a different graph.
+				store.AddEdge(testEdge(id, "sink"))
+				store.RemoveEdge(id, "sink", EdgeCalls)
+			}
+		}(w)
+	}
+	wg.Wait()
+	if err := store.CloseJournal(); err != nil {
+		t.Fatalf("CloseJournal: %v", err)
+	}
+	if store.JournalErr() != nil {
+		t.Fatalf("journal degraded: %v", store.JournalErr())
+	}
+
+	// Live final state.
+	wantNodes := store.NodeCount()
+	wantEdges := store.EdgeCount()
+	liveNodes := map[string]bool{}
+	for _, n := range store.AllNodes() {
+		liveNodes[n.ID] = true
+	}
+
+	replayed := NewMemoryStore()
+	if _, err := replayed.ReplayJournal(path); err != nil {
+		t.Fatalf("ReplayJournal: %v", err)
+	}
+	if replayed.NodeCount() != wantNodes {
+		t.Errorf("replayed nodes: want %d, got %d", wantNodes, replayed.NodeCount())
+	}
+	if replayed.EdgeCount() != wantEdges {
+		t.Errorf("replayed edges: want %d, got %d", wantEdges, replayed.EdgeCount())
+	}
+	for id := range liveNodes {
+		if replayed.GetNode(id) == nil {
+			t.Errorf("node %s present live but missing after replay", id)
+		}
+	}
+	for _, n := range replayed.AllNodes() {
+		if !liveNodes[n.ID] {
+			t.Errorf("node %s exists after replay but not live", n.ID)
+		}
 	}
 }
 

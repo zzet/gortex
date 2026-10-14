@@ -29,6 +29,13 @@ import (
 type MemoryStore struct {
 	*Graph
 
+	// applyMu serializes journal-append + delegate-apply inside one critical
+	// section per mutation (issue davalillo/gortex#20): without it, two
+	// concurrent writers can interleave as A-journals, B-journals, B-applies,
+	// A-applies and the journal order no longer matches the applied order —
+	// a post-crash replay would diverge from the state that actually existed.
+	applyMu sync.Mutex
+
 	mu          sync.Mutex
 	journalPath string
 	journalFile *os.File
@@ -226,8 +233,19 @@ func (m *MemoryStore) JournalBytes() int64 {
 	return m.journalCW.n
 }
 
+// journaled runs one mutation with journal-append and delegate-apply inside
+// the same critical section: the journal order is, by construction, the
+// apply order (issue davalillo/gortex#20).
+func (m *MemoryStore) journaled(op *journalOp, apply func()) {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	m.record(op)
+	apply()
+}
+
 // record journals one mutation before it is applied. Journal-first: the
-// record describes the intent; the delegate applies it after.
+// record describes the intent; the delegate applies it after. Callers hold
+// applyMu, so journal order equals apply order.
 func (m *MemoryStore) record(op *journalOp) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -250,8 +268,7 @@ func (m *MemoryStore) record(op *journalOp) {
 // *Graph. Reads are not overridden.
 
 func (m *MemoryStore) AddNode(n *Node) {
-	m.record(&journalOp{Op: "add_node", Node: journalNodeOf(n)})
-	m.Graph.AddNode(n)
+	m.journaled(&journalOp{Op: "add_node", Node: journalNodeOf(n)}, func() { m.Graph.AddNode(n) })
 }
 
 // journalAddBatchChunk bounds one journal line: a whole-repo first index can
@@ -260,38 +277,41 @@ func (m *MemoryStore) AddNode(n *Node) {
 const journalAddBatchChunk = 1000
 
 func (m *MemoryStore) AddBatch(nodes []*Node, edges []*Edge) {
-	for start := 0; start < len(nodes); start += journalAddBatchChunk {
-		end := min(start+journalAddBatchChunk, len(nodes))
-		chunk := make([]journalNode, 0, end-start)
-		for _, n := range nodes[start:end] {
-			chunk = append(chunk, *journalNodeOf(n))
+	m.journaled(&journalOp{Op: "add_batch"}, func() {
+		for start := 0; start < len(nodes); start += journalAddBatchChunk {
+			end := min(start+journalAddBatchChunk, len(nodes))
+			chunk := make([]journalNode, 0, end-start)
+			for _, n := range nodes[start:end] {
+				chunk = append(chunk, *journalNodeOf(n))
+			}
+			m.record(&journalOp{Op: "add_batch_nodes", Nodes: chunk})
 		}
-		m.record(&journalOp{Op: "add_batch_nodes", Nodes: chunk})
-	}
-	for start := 0; start < len(edges); start += journalAddBatchChunk {
-		end := min(start+journalAddBatchChunk, len(edges))
-		chunk := make([]journalEdge, 0, end-start)
-		for _, e := range edges[start:end] {
-			chunk = append(chunk, *journalEdgeOf(e))
+		for start := 0; start < len(edges); start += journalAddBatchChunk {
+			end := min(start+journalAddBatchChunk, len(edges))
+			chunk := make([]journalEdge, 0, end-start)
+			for _, e := range edges[start:end] {
+				chunk = append(chunk, *journalEdgeOf(e))
+			}
+			m.record(&journalOp{Op: "add_batch_edges", Edges: chunk})
 		}
-		m.record(&journalOp{Op: "add_batch_edges", Edges: chunk})
-	}
-	m.Graph.AddBatch(nodes, edges)
+		m.Graph.AddBatch(nodes, edges)
+	})
 }
 
 func (m *MemoryStore) AddEdge(e *Edge) {
-	m.record(&journalOp{Op: "add_edge", Edge: journalEdgeOf(e)})
-	m.Graph.AddEdge(e)
+	m.journaled(&journalOp{Op: "add_edge", Edge: journalEdgeOf(e)}, func() { m.Graph.AddEdge(e) })
 }
 
 func (m *MemoryStore) SetEdgeProvenance(e *Edge, newOrigin string) bool {
-	m.record(&journalOp{Op: "set_edge_provenance", Edge: journalEdgeOf(e), NewOrigin: newOrigin})
-	return m.Graph.SetEdgeProvenance(e, newOrigin)
+	var changed bool
+	m.journaled(&journalOp{Op: "set_edge_provenance", Edge: journalEdgeOf(e), NewOrigin: newOrigin},
+		func() { changed = m.Graph.SetEdgeProvenance(e, newOrigin) })
+	return changed
 }
 
 func (m *MemoryStore) ReindexEdge(e *Edge, oldTo string) {
-	m.record(&journalOp{Op: "reindex_edge", Edge: journalEdgeOf(e), OldTo: oldTo})
-	m.Graph.ReindexEdge(e, oldTo)
+	m.journaled(&journalOp{Op: "reindex_edge", Edge: journalEdgeOf(e), OldTo: oldTo},
+		func() { m.Graph.ReindexEdge(e, oldTo) })
 }
 
 func (m *MemoryStore) ReindexEdges(batch []EdgeReindex) {
@@ -307,8 +327,7 @@ func (m *MemoryStore) ReindexEdges(batch []EdgeReindex) {
 			OldLine:         r.OldLine,
 		}
 	}
-	m.record(&journalOp{Op: "reindex_edges", Reindexes: jr})
-	m.Graph.ReindexEdges(batch)
+	m.journaled(&journalOp{Op: "reindex_edges", Reindexes: jr}, func() { m.Graph.ReindexEdges(batch) })
 }
 
 func (m *MemoryStore) SetEdgeProvenanceBatch(batch []EdgeProvenanceUpdate) (changed int) {
@@ -316,23 +335,28 @@ func (m *MemoryStore) SetEdgeProvenanceBatch(batch []EdgeProvenanceUpdate) (chan
 	for i, u := range batch {
 		jp[i] = journalProvenance{Edge: journalEdgeOf(u.Edge), NewOrigin: u.NewOrigin}
 	}
-	m.record(&journalOp{Op: "set_edge_provenance_batch", Provenance: jp})
-	return m.Graph.SetEdgeProvenanceBatch(batch)
+	m.journaled(&journalOp{Op: "set_edge_provenance_batch", Provenance: jp},
+		func() { changed = m.Graph.SetEdgeProvenanceBatch(batch) })
+	return changed
 }
 
 func (m *MemoryStore) RemoveEdge(from, to string, kind EdgeKind) bool {
-	m.record(&journalOp{Op: "remove_edge", From: from, To: to, Kind: kind})
-	return m.Graph.RemoveEdge(from, to, kind)
+	var removed bool
+	m.journaled(&journalOp{Op: "remove_edge", From: from, To: to, Kind: kind},
+		func() { removed = m.Graph.RemoveEdge(from, to, kind) })
+	return removed
 }
 
 func (m *MemoryStore) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
-	m.record(&journalOp{Op: "evict_file", Path: filePath})
-	return m.Graph.EvictFile(filePath)
+	m.journaled(&journalOp{Op: "evict_file", Path: filePath},
+		func() { nodesRemoved, edgesRemoved = m.Graph.EvictFile(filePath) })
+	return nodesRemoved, edgesRemoved
 }
 
 func (m *MemoryStore) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
-	m.record(&journalOp{Op: "evict_repo", RepoPrefix: repoPrefix})
-	return m.Graph.EvictRepo(repoPrefix)
+	m.journaled(&journalOp{Op: "evict_repo", RepoPrefix: repoPrefix},
+		func() { nodesRemoved, edgesRemoved = m.Graph.EvictRepo(repoPrefix) })
+	return nodesRemoved, edgesRemoved
 }
 
 // --- Replay -----------------------------------------------------------------
