@@ -106,7 +106,8 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 	}
 
 	closeFn = func() error {
-		if dumpErr := snapshotMemoryStore(mstore, snapshotPath); dumpErr != nil {
+		dumpErr := snapshotMemoryStore(mstore, snapshotPath)
+		if dumpErr != nil {
 			if logger != nil {
 				logger.Error("memory backend: snapshot dump failed", zap.Error(dumpErr))
 			}
@@ -114,10 +115,15 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 			logger.Info("memory backend: snapshot dumped",
 				zap.String("snapshot", snapshotPath))
 		}
-		// Reset is a separate step with its own error surface (issue
-		// davalillo/gortex#25 A6): the snapshot may be safely published
-		// while the reset failed, and conflating the two mislabels a good
-		// snapshot as a failed dump.
+		// Reset only after a successful dump (issue davalillo/gortex#25 A6,
+		// corrected): the journal is the only durable record of mutations
+		// the failed snapshot never captured — resetting it after a failed
+		// dump would silently drop them on the next boot. The reset is still
+		// its own step with its own log line: a reset failure must not
+		// masquerade as a failed dump.
+		if dumpErr != nil {
+			return nil
+		}
 		if resetErr := mstore.ResetJournal(); resetErr != nil && logger != nil {
 			logger.Warn("memory backend: journal reset after snapshot failed", zap.Error(resetErr))
 		}

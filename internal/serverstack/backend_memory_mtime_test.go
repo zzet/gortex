@@ -1,6 +1,7 @@
 package serverstack
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -87,4 +88,46 @@ func equalMtimes(got, want map[string]int64) bool {
 		}
 	}
 	return true
+}
+
+// TestFailedDumpKeepsJournal pins the review-escalation fix (issue
+// davalillo/gortex#25): the journal reset runs only after a successful
+// snapshot dump. The journal is the only durable record of mutations the
+// failed snapshot never captured — resetting it on a failed dump would
+// silently drop them on the next boot.
+func TestFailedDumpKeepsJournal(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "store.sqlite")
+
+	// Session 1: clean baseline (snapshot published, journal reset).
+	s1, close1, err := openMemoryBackend(snapPath, nil)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	s1.AddNode(&graph.Node{ID: "repoA/a.go::f", Kind: graph.KindFunction, Name: "f", FilePath: "a.go"})
+	close1()
+
+	// Session 2: journal a mutation the snapshot does not contain, then
+	// force the dump to fail — the tmp target is a non-empty directory, so
+	// neither its removal nor its open can succeed.
+	s2, close2, err := openMemoryBackend(snapPath, nil)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	s2.AddNode(&graph.Node{ID: "repoB/b.go::g", Kind: graph.KindFunction, Name: "g", FilePath: "b.go"})
+	tmpDir := snapPath + ".snapshot.tmp"
+	if err := os.MkdirAll(filepath.Join(tmpDir, "blocker"), 0o755); err != nil {
+		t.Fatalf("block tmp: %v", err)
+	}
+	close2() // dump fails; the journal must survive untouched
+
+	// Session 3: the journaled mutation must still replay.
+	s3, close3, err := openMemoryBackend(snapPath, nil)
+	if err != nil {
+		t.Fatalf("third open: %v", err)
+	}
+	defer close3()
+	if got := s3.GetNode("repoB/b.go::g"); got == nil || got.Name != "g" {
+		t.Fatalf("failed dump lost journaled mutations: %+v", got)
+	}
 }
