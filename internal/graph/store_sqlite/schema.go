@@ -441,8 +441,14 @@ CREATE TABLE IF NOT EXISTS analysis_process_steps (
     FOREIGN KEY (generation_id, process_id)
         REFERENCES analysis_processes(generation_id, process_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS analysis_process_steps_by_node
-    ON analysis_process_steps(generation_id, node_rowid, process_id);
+-- Deleting an analysis_nodes row checks node_rowid's foreign key. Without an
+-- index led by node_rowid, each delete scans every generation's steps. The
+-- table is WITHOUT ROWID, so this index also carries the primary key and
+-- covers lookups by (generation_id, node_rowid); it replaces
+-- analysis_process_steps_by_node, which existing stores drop here.
+DROP INDEX IF EXISTS analysis_process_steps_by_node;
+CREATE INDEX IF NOT EXISTS analysis_process_step_node_fk
+    ON analysis_process_steps(node_rowid);
 
 CREATE TABLE IF NOT EXISTS analysis_concepts (
     generation_id INTEGER NOT NULL

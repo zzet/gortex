@@ -168,7 +168,9 @@ type AnalysisGenerationStore interface {
 	SealAnalysisComponent(expectedRevision uint64, generationID int64, component AnalysisComponent, expectedRows int) (accepted bool, err error)
 	ActivateAnalysisGeneration(expectedRevision uint64, generationID int64) (accepted bool, err error)
 	AbortAnalysisGeneration(generationID int64) error
-	PruneAnalysisGenerations(ctx context.Context, keep, batch int) error
+	// PruneAnalysisGenerations returns the number of rows deleted by committed
+	// chunks, including when a later chunk returns an error.
+	PruneAnalysisGenerations(ctx context.Context, keep, batch int) (removed int64, err error)
 }
 
 // AnalysisQueryStore exposes bounded point, batch, top-N, and keyset-paged
