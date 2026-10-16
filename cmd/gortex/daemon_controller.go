@@ -911,6 +911,9 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	// mount can block for seconds, and no status caller should be able to
 	// wedge track / untrack / reload behind a dead NFS handle.
 	configRepos, repoMissing := c.trackedRepoLiveness()
+	// Sample readiness before the aggregate so warmup cannot finish between
+	// its inventory snapshot and this flag, making unloaded rows look final.
+	ready := c.ready.Load()
 
 	// The view census is catalog listings bounded by the number of families,
 	// graphs and generations, so it belongs in the slow half rather than
@@ -950,7 +953,7 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	// The copy keeps the cached slice immutable — it is shared by every
 	// subsequent busy pass.
 	tracked := append([]daemon.TrackedRepoStatus(nil), agg.tracked...)
-	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, agg.tracked)...)
+	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, agg.tracked, ready)...)
 
 	// mem was sampled before the mutex was taken — see the note at the top
 	// of status.
@@ -972,7 +975,7 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 			NumGoroutine: runtime.NumGoroutine(),
 		},
 		PProfAddr:          daemonPProfAddr(),
-		Ready:              c.ready.Load(),
+		Ready:              ready,
 		WarmupSeconds:      c.warmupSeconds.Load(),
 		EnrichmentComplete: enriched,
 		EnrichSeconds:      c.enrichSeconds.Load(),
@@ -1418,7 +1421,7 @@ func lookupRepoMissing(missing map[string]bool, root string) bool {
 // track resolves and persists) and by resolved prefix second, so a repo
 // registered under a derived worktree-instance prefix still matches its
 // config entry.
-func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool, loaded []daemon.TrackedRepoStatus) []daemon.TrackedRepoStatus {
+func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool, loaded []daemon.TrackedRepoStatus, ready bool) []daemon.TrackedRepoStatus {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -1435,6 +1438,7 @@ func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool,
 		if isLoaded {
 			continue
 		}
+		isMissing := lookupRepoMissing(missing, e.Path)
 		out = append(out, daemon.TrackedRepoStatus{
 			Prefix:           prefix,
 			Path:             e.Path,
@@ -1443,7 +1447,8 @@ func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool,
 			WorkspaceProject: prefix,
 			Ref:              e.Ref,
 			Unloaded:         true,
-			Missing:          lookupRepoMissing(missing, e.Path),
+			Missing:          isMissing,
+			Loading:          !ready && !isMissing,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Prefix < out[j].Prefix })

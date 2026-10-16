@@ -884,6 +884,10 @@ type TrackedRepoStatus struct {
 	// and `gortex repos` report the same inventory instead of one view
 	// dropping a repo the other still lists. Counts are zero.
 	Unloaded bool `json:"unloaded,omitempty"`
+	// Loading is true when the repo is configured and its path exists, but
+	// the daemon has not finished warmup, so its index is not loaded yet.
+	// Unloaded remains true so older clients keep their existing behaviour.
+	Loading bool `json:"loading,omitempty"`
 	// File indexing health includes unresolved failures and ledger read errors.
 	IndexHealthError string `json:"index_health_error,omitempty"`
 	FailedFiles      int    `json:"failed_files,omitempty"`

@@ -561,7 +561,11 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// stopped resumes where it was, it does not restart the wait), and
 		// any teardown interrupted by the stop is resumed.
 		if state.lifecycle != nil {
-			if err := state.lifecycle.Seed(context.Background()); err != nil {
+			finishSeed := startWarmupStep(logger, "checkout_catalog_seed",
+				zap.Int("repos", len(state.configManager.Global().Repos)))
+			err := state.lifecycle.Seed(context.Background())
+			finishSeed(zap.Error(err))
+			if err != nil {
 				logger.Warn("daemon: seeding the checkout catalog was incomplete", zap.Error(err))
 			}
 		}
@@ -1599,13 +1603,13 @@ func renderDaemonRepos(w io.Writer, st daemon.StatusResponse) {
 		}
 	}
 
-	// The state column appears only once a repo is in trouble — its
+	// The state column appears only once a repo is in trouble or loading — its
 	// directory is gone, the daemon holds no index for it, or it indexed
 	// nothing at all. On a healthy workspace every row would read "ok",
 	// so it stays hidden.
 	showState := false
 	for _, r := range rows {
-		if r.Missing || r.Unloaded || r.FailedFiles > 0 || r.IndexHealthError != "" || repoIndexIsEmpty(r) {
+		if r.Missing || r.Loading || r.Unloaded || r.FailedFiles > 0 || r.IndexHealthError != "" || repoIndexIsEmpty(r) {
 			showState = true
 			break
 		}
@@ -1687,6 +1691,8 @@ func repoStateLabel(r daemon.TrackedRepoStatus) string {
 	switch {
 	case r.Missing:
 		return "MISSING"
+	case r.Loading:
+		return "loading"
 	case r.Unloaded:
 		return "not indexed"
 	case r.FailedFiles > 0 || r.IndexHealthError != "":
@@ -1705,7 +1711,7 @@ func repoStateLabel(r daemon.TrackedRepoStatus) string {
 // it answered "no callers" with full confidence. A repo still waiting for
 // its first index (LastIndex unset) is not yet empty, only pending.
 func repoIndexIsEmpty(r daemon.TrackedRepoStatus) bool {
-	return !r.Missing && !r.Unloaded && r.Files == 0 && r.LastIndex > 0
+	return !r.Missing && !r.Loading && !r.Unloaded && r.Files == 0 && r.LastIndex > 0
 }
 
 // renderEmptyIndexWarning prints the remediation block for every tracked
