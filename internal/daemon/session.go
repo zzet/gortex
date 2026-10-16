@@ -235,7 +235,7 @@ func parseMCPReplayIdentity(request []byte) (mcpReplayIdentity, bool) {
 		return mcpReplayIdentity{}, false
 	}
 	var method string
-	if raw, ok := envelope["method"]; !ok || json.Unmarshal(raw, &method) != nil || method == "" {
+	if raw, ok := envelope["method"]; !ok || json.Unmarshal(raw, &method) != nil || method == "" || method == "subscriptions/listen" {
 		return mcpReplayIdentity{}, false
 	}
 	rawID, present := envelope["id"]
@@ -272,8 +272,8 @@ func mcpResponseCacheIdentity(request []byte) (string, [sha256.Size]byte, bool) 
 }
 
 // SetClientInfo updates the session's client metadata from the MCP
-// `initialize` frame. Called by the daemon dispatcher when it sees
-// the first `initialize` request on this session. Idempotent — a
+// `initialize` or `server/discover` / `_meta` frame. Called by the daemon
+// dispatcher when it sees the client identity on this session. Idempotent — a
 // second call (e.g. on protocol re-init) just overwrites.
 func (s *Session) SetClientInfo(name, version string) {
 	if s == nil {
@@ -288,6 +288,18 @@ func (s *Session) SetClientInfo(name, version string) {
 		s.ClientVersion = version
 	}
 	s.mu.Unlock()
+}
+
+// HasInitializeClientInfo reports whether client metadata has already been
+// populated from an MCP protocol frame (`initialize`, `server/discover`, or
+// per-request `_meta` in MCP 2026-07-28).
+func (s *Session) HasInitializeClientInfo() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ClientNameSource == "initialize"
 }
 
 // SetRemoteOverride sets a per-session enable/disable override for a

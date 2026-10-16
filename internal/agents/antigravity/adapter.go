@@ -16,9 +16,11 @@ const Name = "antigravity"
 
 // DocsURL is the current public docs entry point for MCP in
 // Antigravity. As of 2026 Antigravity supports both MCP server
-// registration (at ~/.gemini/antigravity/mcp_config.json) and the
-// older Knowledge Item mechanism. We write both today: MCP for
-// runtime tool access, KI for the in-editor instructions panel.
+// registration (at ~/.gemini/antigravity/mcp_config.json for the IDE
+// and ~/.gemini/config/mcp_config.json for the agy CLI / Antigravity 2.0)
+// and the older Knowledge Item mechanism. We write both MCP paths and
+// the KI today: MCP for runtime tool access, KI for the in-editor
+// instructions panel.
 const DocsURL = "https://antigravity.google/docs/mcp"
 
 type Adapter struct{}
@@ -37,17 +39,32 @@ func (a *Adapter) Detect(env agents.Env) (bool, error) {
 	return env.Home != "", nil
 }
 
+func mcpConfigPaths(home string) []string {
+	return []string{
+		filepath.Join(home, ".gemini", "antigravity", "mcp_config.json"),
+		filepath.Join(home, ".gemini", "config", "mcp_config.json"),
+	}
+}
+
 func (a *Adapter) Plan(env agents.Env) (*agents.Plan, error) {
 	if env.Home == "" {
 		return &agents.Plan{}, nil
 	}
 	kiDir := filepath.Join(env.Home, ".gemini", "antigravity", "knowledge", "gortex-workflow")
-	return &agents.Plan{Files: []agents.FileAction{
-		{Path: filepath.Join(env.Home, ".gemini", "antigravity", "mcp_config.json"), Action: agents.ActionWouldMerge, Keys: []string{"mcpServers"}},
-		{Path: filepath.Join(env.Home, ".gemini", "settings.json"), Action: agents.ActionWouldMerge, Keys: []string{"hooks"}},
-		{Path: filepath.Join(kiDir, "metadata.json"), Action: agents.ActionWouldCreate},
-		{Path: filepath.Join(kiDir, "artifacts", "gortex-instructions.md"), Action: agents.ActionWouldCreate},
-	}}, nil
+	files := make([]agents.FileAction, 0, 5)
+	for _, mcpPath := range mcpConfigPaths(env.Home) {
+		files = append(files, agents.FileAction{
+			Path:   mcpPath,
+			Action: agents.ActionWouldMerge,
+			Keys:   []string{"mcpServers"},
+		})
+	}
+	files = append(files,
+		agents.FileAction{Path: filepath.Join(env.Home, ".gemini", "settings.json"), Action: agents.ActionWouldMerge, Keys: []string{"hooks"}},
+		agents.FileAction{Path: filepath.Join(kiDir, "metadata.json"), Action: agents.ActionWouldCreate},
+		agents.FileAction{Path: filepath.Join(kiDir, "artifacts", "gortex-instructions.md"), Action: agents.ActionWouldCreate},
+	)
+	return &agents.Plan{Files: files}, nil
 }
 
 func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, error) {
@@ -62,15 +79,18 @@ func (a *Adapter) Apply(env agents.Env, opts agents.ApplyOpts) (*agents.Result, 
 	}
 	internalutil.Logf(env.Stderr, "[gortex init] setting up Antigravity integration...")
 
-	// 1. Native MCP registration — new in 2026.
-	mcpPath := filepath.Join(env.Home, ".gemini", "antigravity", "mcp_config.json")
-	mcpAction, err := agents.MergeJSON(env.Stderr, mcpPath, func(root map[string]any, _ bool) (bool, error) {
-		return agents.UpsertMCPServer(root, "gortex", agents.DefaultGortexMCPEntry(), opts), nil
-	}, opts)
-	if err != nil {
-		return res, err
+	// 1. Native MCP registration — Antigravity IDE reads
+	//    ~/.gemini/antigravity/mcp_config.json while Antigravity CLI (agy) /
+	//    Antigravity 2.0 reads ~/.gemini/config/mcp_config.json.
+	for _, mcpPath := range mcpConfigPaths(env.Home) {
+		mcpAction, err := agents.MergeJSON(env.Stderr, mcpPath, func(root map[string]any, _ bool) (bool, error) {
+			return agents.UpsertMCPServer(root, "gortex", agents.DefaultGortexMCPEntry(), opts), nil
+		}, opts)
+		if err != nil {
+			return res, err
+		}
+		res.Files = append(res.Files, mcpAction)
 	}
-	res.Files = append(res.Files, mcpAction)
 
 	// 1b. Lifecycle hooks — Antigravity reads Gemini CLI's
 	//     ~/.gemini/settings.json hooks, so install SessionStart +

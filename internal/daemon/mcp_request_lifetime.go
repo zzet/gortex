@@ -73,7 +73,15 @@ func (r *mcpRequestRegistry) begin(parent context.Context, id json.RawMessage, t
 	if !valid {
 		return nil, nil, false
 	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(parent)
+	}
 	entry := &mcpInFlightRequest{key: key, cancel: cancel}
 
 	r.mu.Lock()
@@ -197,6 +205,11 @@ type mcpDispatchAdmission struct {
 type mcpDispatchAdmissionContextKey struct{}
 type mcpDispatchWaitContextKey struct{}
 type mcpDispatchSlotsContextKey struct{}
+type mcpDispatchUnboundedContextKey struct{}
+
+func isLongLivedMCPRequest(method string) bool {
+	return method == "subscriptions/listen"
+}
 
 func newMCPDispatchAdmission() *mcpDispatchAdmission {
 	return &mcpDispatchAdmission{done: make(chan struct{})}
@@ -208,6 +221,15 @@ func withMCPDispatchAdmission(ctx context.Context, admission *mcpDispatchAdmissi
 
 func withMCPDispatchWait(ctx context.Context) context.Context {
 	return context.WithValue(ctx, mcpDispatchWaitContextKey{}, true)
+}
+
+func withMCPDispatchUnbounded(ctx context.Context) context.Context {
+	return context.WithValue(ctx, mcpDispatchUnboundedContextKey{}, true)
+}
+
+func isMCPDispatchUnbounded(ctx context.Context) bool {
+	unbounded, _ := ctx.Value(mcpDispatchUnboundedContextKey{}).(bool)
+	return unbounded
 }
 
 func withMCPDispatchSlots(ctx context.Context, slots chan struct{}) context.Context {
@@ -232,6 +254,10 @@ func signalMCPDispatchAdmission(ctx context.Context) {
 // cancelled caller returns without waiting for an uncooperative dispatcher;
 // the buffered result lets that dispatcher finish without retaining a waiter.
 func dispatchMCPWithContext(ctx context.Context, dispatch func() ([]byte, error)) ([]byte, error) {
+	if isMCPDispatchUnbounded(ctx) {
+		signalMCPDispatchAdmission(ctx)
+		return dispatch()
+	}
 	slots := mcpDispatchSlotsForContext(ctx)
 	if wait, _ := ctx.Value(mcpDispatchWaitContextKey{}).(bool); wait {
 		select {
@@ -341,11 +367,16 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 	}
 
 	launchRequest := func(line []byte, envelope mcpRequestEnvelope, responseID json.RawMessage, tracked bool) {
+		longLived := isLongLivedMCPRequest(envelope.Method)
+		requestTimeout := timeout
+		if longLived {
+			requestTimeout = 0
+		}
 		var requestCtx context.Context
 		var entry *mcpInFlightRequest
 		if tracked {
 			var admitted bool
-			requestCtx, entry, admitted = registry.begin(connectionCtx, responseID, timeout)
+			requestCtx, entry, admitted = registry.begin(connectionCtx, responseID, requestTimeout)
 			if !admitted {
 				write(mcpErrorResponse(responseID, -32600, "duplicate in-flight request id", map[string]any{
 					"outcome":   "duplicate_id",
@@ -355,8 +386,15 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 			}
 		} else {
 			var cancel context.CancelFunc
-			requestCtx, cancel = context.WithTimeout(connectionCtx, timeout)
+			if requestTimeout > 0 {
+				requestCtx, cancel = context.WithTimeout(connectionCtx, requestTimeout)
+			} else {
+				requestCtx, cancel = context.WithCancel(connectionCtx)
+			}
 			entry = &mcpInFlightRequest{cancel: cancel}
+		}
+		if longLived {
+			requestCtx = withMCPDispatchUnbounded(requestCtx)
 		}
 
 		var initialized chan struct{}
@@ -389,7 +427,7 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 			defer finish()
 
 			reply, dispatchErr := dispatch(dispatchCtx, requestLine)
-			if requestErr := requestCtx.Err(); requestErr != nil {
+			if requestErr := requestCtx.Err(); requestErr != nil && (!longLived || dispatchErr != nil || len(reply) == 0) {
 				code := mcpRequestCancelledCode
 				message := "request cancelled"
 				data := map[string]any{"outcome": "cancelled"}

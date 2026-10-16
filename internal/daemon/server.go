@@ -606,7 +606,7 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 	serveMCPConnectionWithHooks(conn, reader, s.mcpToolCallTimeout(), func(ctx context.Context, line []byte) ([]byte, error) {
 		reply, _, err := sess.dispatchMCPOnceContext(ctx, line, func() ([]byte, error) {
 			reply, err := s.MCPDispatcher.Dispatch(ctx, sess, line)
-			if ctxErr := ctx.Err(); ctxErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil && (!isMCPDispatchUnbounded(ctx) || err != nil || len(reply) == 0) {
 				return nil, ctxErr
 			}
 			return reply, err

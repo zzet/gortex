@@ -456,3 +456,48 @@ func startMCPConnectionWithHooksTest(t *testing.T, timeout time.Duration, dispat
 	})
 	return clientConn, bufio.NewReader(clientConn), done
 }
+
+func TestServeMCPSubscriptionsListenStaysOpenWithoutTimeoutOrSlotConsumption(t *testing.T) {
+	listenStarted := make(chan struct{})
+	slots := make(chan struct{}, 1)
+	hooks := &mcpConnectionHooks{dispatchSlots: slots}
+	conn, reader, done := startMCPConnectionWithHooksTest(t, 20*time.Millisecond, func(ctx context.Context, frame []byte) ([]byte, error) {
+		var envelope mcpRequestEnvelope
+		if err := json.Unmarshal(frame, &envelope); err != nil {
+			return nil, err
+		}
+		if envelope.Method == "subscriptions/listen" {
+			if _, hasDeadline := ctx.Deadline(); hasDeadline {
+				return nil, errors.New("subscriptions/listen must not carry the per-request tool-call deadline")
+			}
+			close(listenStarted)
+			<-ctx.Done()
+			return []byte(`{"jsonrpc":"2.0","id":2,"result":{}}`), nil
+		}
+		return []byte(`{"jsonrpc":"2.0","id":3,"result":{"ok":true}}`), nil
+	}, hooks)
+
+	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","id":2,"method":"subscriptions/listen","params":{}}`)
+	awaitMCPTestSignal(t, listenStarted, "subscriptions/listen did not start")
+
+	// Wait longer than the 20ms per-request timeout and confirm the stream does not
+	// time out or occupy the single bounded dispatch slot.
+	time.Sleep(50 * time.Millisecond)
+	if len(slots) != 0 {
+		t.Fatalf("subscriptions/listen occupied %d bounded dispatch slots, want 0", len(slots))
+	}
+
+	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}`)
+	response := readMCPTestResponse(t, conn, reader)
+	if string(response.ID) != "3" || response.Error != nil || response.Result["ok"] != true {
+		t.Fatalf("concurrent request while subscriptions/listen active = %#v", response)
+	}
+
+	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`)
+	cancelResp := readMCPTestResponse(t, conn, reader)
+	if string(cancelResp.ID) != "2" || cancelResp.Error != nil {
+		t.Fatalf("subscriptions/listen cancellation response = %#v", cancelResp)
+	}
+	_ = conn.Close()
+	awaitMCPTestSignal(t, done, "connection did not stop")
+}

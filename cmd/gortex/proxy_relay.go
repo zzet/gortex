@@ -287,7 +287,7 @@ func (s *proxyRelayState) noteProtocolFrame(frame []byte) {
 		return
 	}
 	switch envelope.Method {
-	case "initialize":
+	case "initialize", "server/discover":
 		s.initialize = append(s.initialize[:0], frame...)
 	case "notifications/initialized":
 		s.initialized = append(s.initialized[:0], frame...)
@@ -343,6 +343,9 @@ func (s *proxyRelayState) restoreProtocolState(client *daemon.Client) (err error
 	}
 	initialized := bytes.TrimSpace(s.initialized)
 	if len(initialized) == 0 {
+		if peekFrameMethod(s.initialize) == "server/discover" {
+			return nil
+		}
 		initialized = []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 	}
 	return client.WriteMCPFrame(initialized)
@@ -565,7 +568,7 @@ func retryableProxyRequest(frame []byte) bool {
 		return false
 	}
 	switch envelope.Method {
-	case "initialize", "ping", "tools/list", "resources/list", "resources/templates/list", "prompts/list":
+	case "initialize", "server/discover", "ping", "tools/list", "resources/list", "resources/templates/list", "prompts/list":
 		return true
 	case "tools/call":
 		switch envelope.Params.Name {

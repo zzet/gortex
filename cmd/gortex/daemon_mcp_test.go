@@ -529,6 +529,29 @@ func TestDispatcher_UntrackedHandshake_SurvivesWithInactiveVariant(t *testing.T)
 		assert.False(t, names["graph_stats"], "legacy tools must remain hidden")
 	})
 
+	t.Run("server_discover_flows_through_with_inactive_instructions", func(t *testing.T) {
+		discoverSess := &daemon.Session{ID: "sess_handshake_discover", CWD: untracked}
+		d.SessionStarted(discoverSess, func([]byte) error { return nil })
+		t.Cleanup(func() { d.SessionEnded(discoverSess) })
+		reply, err := d.Dispatch(context.Background(), discoverSess, []byte(`{"jsonrpc":"2.0","id":10,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"antigravity-client","version":"v1.0.0"}}}}`))
+		require.NoError(t, err)
+		require.NotNil(t, reply)
+		var parsed map[string]any
+		require.NoError(t, json.Unmarshal(reply, &parsed))
+
+		_, isErr := parsed["error"]
+		assert.False(t, isErr, "untracked server/discover must not error: %v", parsed)
+
+		result, ok := parsed["result"].(map[string]any)
+		require.True(t, ok, "server/discover must return a result object: %v", parsed)
+
+		instr, ok := result["instructions"].(string)
+		require.True(t, ok, "server/discover result must carry instructions")
+		assert.Contains(t, instr, "INACTIVE", "instructions must flag the inactive state")
+		assert.Contains(t, instr, "gortex track "+untracked,
+			"instructions must carry the cwd-specific track affordance")
+	})
+
 	t.Run("tools_call_still_refused", func(t *testing.T) {
 		parsed := dispatch(t, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"explore","arguments":{"task":"locate startup"}}}`)
 
@@ -539,6 +562,48 @@ func TestDispatcher_UntrackedHandshake_SurvivesWithInactiveVariant(t *testing.T)
 		assert.Equal(t, "repo_not_tracked", data["error_code"])
 		assert.Equal(t, untracked, data["path"])
 	})
+}
+
+func TestDispatcher_ServerDiscover_IdentifiesClientAndSelectsFacadeSurface(t *testing.T) {
+	tracked := t.TempDir()
+	d, _ := trackedPathMCPSetup(t, tracked)
+	sess := &daemon.Session{
+		ID:         "sess_discover_agy",
+		CWD:        tracked,
+		ClientName: "unknown",
+	}
+
+	discoverFrame := []byte(`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"antigravity-client","version":"v1.0.0"}}}}`)
+	discoverReply, err := d.Dispatch(context.Background(), sess, discoverFrame)
+	require.NoError(t, err)
+	require.NotNil(t, discoverReply)
+
+	assert.Equal(t, "antigravity-client", sess.ClientName)
+	assert.Equal(t, "v1.0.0", sess.ClientVersion)
+	assert.True(t, sess.HasInitializeClientInfo())
+
+	toolsListFrame := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"antigravity-client","version":"v1.0.0"},"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`)
+	toolsReply, err := d.Dispatch(context.Background(), sess, toolsListFrame)
+	require.NoError(t, err)
+	require.NotNil(t, toolsReply)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(toolsReply, &parsed))
+	result, ok := parsed["result"].(map[string]any)
+	require.True(t, ok, "tools/list must return a result object: %v", parsed)
+	tools, ok := result["tools"].([]any)
+	require.True(t, ok, "tools/list result must carry a tools array")
+	names := make(map[string]bool, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		require.True(t, ok)
+		name, _ := tool["name"].(string)
+		names[name] = true
+	}
+	assert.True(t, names["explore"], "MCP 2026-07-28 client identified via server/discover _meta must receive facade-v1 surface")
+	assert.True(t, names["search"], "facade-v1 search tool must be exposed")
+	assert.True(t, names["read"], "facade-v1 read tool must be exposed")
+	assert.False(t, names["search_symbols"], "legacy core tools must not be exposed on facade-v1 surface")
 }
 
 // writeFile is a tiny helper to keep test setup readable.

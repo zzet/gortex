@@ -271,7 +271,7 @@ func rewriteUntrackedResponse(method string, out []byte, cwd string, roots []str
 	if !ok {
 		return out // an error response or non-object result — leave it
 	}
-	if method != "initialize" {
+	if method != "initialize" && method != "server/discover" {
 		return out
 	}
 	result["instructions"] = gortexmcp.ServerInstructionsUntracked(cwd, roots...)
@@ -344,7 +344,7 @@ func (d *mcpDispatcher) cwdReachable(ctx context.Context, cwd string) bool {
 // mutations. Keep only the connection and stable capability metadata available.
 func checkoutAdmissionMetadataMethod(method string) bool {
 	switch method {
-	case "initialize", "tools/list", "ping":
+	case "initialize", "server/discover", "subscriptions/listen", "tools/list", "ping":
 		return true
 	default:
 		return strings.HasPrefix(method, "notifications/")
@@ -394,7 +394,7 @@ func checkoutAdmissionError(cwd string, inbound []byte, err error) []byte {
 }
 
 func rewriteCheckoutAdmissionResponse(method string, out []byte, cwd string, err error) []byte {
-	if method != "initialize" {
+	if method != "initialize" && method != "server/discover" {
 		return out
 	}
 	var reply map[string]any
@@ -621,10 +621,11 @@ func (d *mcpDispatcher) tryProxyToolCall(ctx context.Context, sess *daemon.Sessi
 }
 
 // maybeSnoopInitialize parses one inbound JSON-RPC frame and, if
-// it's an MCP `initialize` request carrying `params.clientInfo`,
-// updates the session's ClientName/ClientVersion. Non-initialize
-// frames are ignored. Errors swallowed — this is best-effort
-// metadata enrichment, not a correctness path.
+// it's an MCP `initialize` request carrying `params.clientInfo` OR
+// an MCP 2026-07-28 (SEP-2575) request (`server/discover` or first
+// request) carrying `params._meta["io.modelcontextprotocol/clientInfo"]`,
+// updates the session's ClientName/ClientVersion. Errors swallowed —
+// this is best-effort metadata enrichment, not a correctness path.
 func (d *mcpDispatcher) maybeSnoopInitialize(sess *daemon.Session, frame []byte) {
 	if sess == nil || len(frame) == 0 {
 		return
@@ -636,29 +637,48 @@ func (d *mcpDispatcher) maybeSnoopInitialize(sess *daemon.Session, frame []byte)
 				Name    string `json:"name"`
 				Version string `json:"version"`
 			} `json:"clientInfo"`
+			Meta struct {
+				ClientInfo struct {
+					Name    string `json:"name"`
+					Version string `json:"version"`
+				} `json:"io.modelcontextprotocol/clientInfo"`
+			} `json:"_meta"`
 		} `json:"params"`
 	}
 	if err := json.Unmarshal(frame, &peek); err != nil {
 		return
 	}
-	if peek.Method != "initialize" {
+	name, version := peek.Params.ClientInfo.Name, peek.Params.ClientInfo.Version
+	switch peek.Method {
+	case "initialize":
+		if name == "" && version == "" {
+			name, version = peek.Params.Meta.ClientInfo.Name, peek.Params.Meta.ClientInfo.Version
+		}
+	case "server/discover":
+		if name == "" && version == "" {
+			name, version = peek.Params.Meta.ClientInfo.Name, peek.Params.Meta.ClientInfo.Version
+		}
+	default:
+		if sess.HasInitializeClientInfo() {
+			return
+		}
+		name, version = peek.Params.Meta.ClientInfo.Name, peek.Params.Meta.ClientInfo.Version
+	}
+	if name == "" && version == "" {
 		return
 	}
-	if peek.Params.ClientInfo.Name == "" && peek.Params.ClientInfo.Version == "" {
-		return
-	}
-	sess.SetClientInfo(peek.Params.ClientInfo.Name, peek.Params.ClientInfo.Version)
+	sess.SetClientInfo(name, version)
 	if d.srv != nil {
 		// Propagate the client name into the per-session MCP state so
 		// tool handlers can resolve a default wire format (e.g.
 		// claude-code → gcx) when a request omits the explicit
-		// `format` arg.
-		d.srv.NoteSessionClient(sess.ID, peek.Params.ClientInfo.Name, peek.Params.ClientInfo.Version)
+		// `format` arg, and so clientDefaultPolicy resolves facade-v1.
+		d.srv.NoteSessionClient(sess.ID, name, version)
 	}
 	d.logger.Info("daemon: identified MCP client",
 		zap.String("session_id", sess.ID),
-		zap.String("client", peek.Params.ClientInfo.Name),
-		zap.String("version", peek.Params.ClientInfo.Version))
+		zap.String("client", name),
+		zap.String("version", version))
 }
 
 // notTrackedError builds a JSON-RPC error frame the agent surfaces to

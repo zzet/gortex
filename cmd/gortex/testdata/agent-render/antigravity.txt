@@ -49,6 +49,17 @@ Use `recall` before revisiting prior work and `remember` immediately for durable
     }
   }
 }
+=== project/home/.gemini/config/mcp_config.json ===
+{
+  "mcpServers": {
+    "gortex": {
+      "args": [
+        "mcp"
+      ],
+      "command": "gortex"
+    }
+  }
+}
 === project/home/.gemini/settings.json ===
 {
   "hooks": {
@@ -122,6 +133,17 @@ Use `recall` before revisiting prior work and `remember` immediately for durable
   "references": ["artifacts/gortex-instructions.md"]
 }
 === global/home/.gemini/antigravity/mcp_config.json ===
+{
+  "mcpServers": {
+    "gortex": {
+      "args": [
+        "mcp"
+      ],
+      "command": "gortex"
+    }
+  }
+}
+=== global/home/.gemini/config/mcp_config.json ===
 {
   "mcpServers": {
     "gortex": {
