@@ -87,11 +87,14 @@ func existingBatchTransactionAction(state *batchTransactionState) string {
 	return "existing"
 }
 
-func (s *Server) loadOrCreateBatchTransaction(transactionID, fingerprint string) (*batchTransactionState, string, error) {
+func (s *Server) loadOrCreateBatchTransaction(ctx context.Context, transactionID, fingerprint string) (*batchTransactionState, string, error) {
 	if value, ok := s.batchTransactions.Load(transactionID); ok {
 		state, valid := value.(*batchTransactionState)
 		if !valid {
 			return nil, "", fmt.Errorf("invalid transaction state for %q", transactionID)
+		}
+		if err := guardBatchCheckout(ctx, state.snapshot()); err != nil {
+			return nil, "", err
 		}
 		if fingerprint != "" && state.fingerprint != fingerprint {
 			return nil, "", fmt.Errorf("transaction_id %q is already bound to a different edit payload", transactionID)
@@ -104,6 +107,17 @@ func (s *Server) loadOrCreateBatchTransaction(transactionID, fingerprint string)
 		return nil, "", err
 	}
 	if found {
+		if err := guardBatchCheckout(ctx, persisted); err != nil {
+			return nil, "", err
+		}
+		// Completion handles are daemon-local and may be reused after restart.
+		// A loaded checkout manifest must re-admit publication on its own lease.
+		if persisted.CheckoutID != "" && persisted.GraphStatus != "fresh" {
+			for i := range persisted.Files {
+				persisted.Files[i].ReindexReceipt = ""
+				persisted.Files[i].ReindexGeneration = 0
+			}
+		}
 		if fingerprint != "" && persisted.Fingerprint != fingerprint {
 			return nil, "", fmt.Errorf("transaction_id %q is already bound to a different edit payload", transactionID)
 		}
@@ -138,6 +152,12 @@ func (s *Server) loadOrCreateBatchTransaction(transactionID, fingerprint string)
 	receipt := batchTransactionReceipt{
 		Version: batchTransactionVersion, TransactionID: transactionID, Fingerprint: fingerprint,
 		Status: "preparing", DiskStatus: "unchanged", GraphStatus: "not_started", StartedAt: time.Now().UTC(),
+	}
+	if scope := checkoutMutationFromContext(ctx); scope != nil {
+		if scope.checkoutID == "" || scope.incarnation == "" {
+			return nil, "", fmt.Errorf("checkout batch requires a checkout identity and incarnation")
+		}
+		receipt.CheckoutID, receipt.CheckoutIncarnation, receipt.CheckoutRoot = scope.checkoutID, scope.incarnation, scope.root
 	}
 	state := &batchTransactionState{fingerprint: fingerprint, done: make(chan struct{}), receipt: receipt}
 	actual, loaded := s.batchTransactions.LoadOrStore(transactionID, state)
@@ -284,6 +304,9 @@ func (s *Server) rollbackBatchReceipt(receipt batchTransactionReceipt) (string, 
 
 func (s *Server) recoverBatchTransaction(ctx context.Context, state *batchTransactionState) {
 	receipt := state.snapshot()
+	if err := guardBatchCheckout(ctx, receipt); err != nil {
+		return
+	}
 	paths := make([]string, 0, len(receipt.Files))
 	for _, file := range receipt.Files {
 		paths = append(paths, file.Path)
@@ -315,11 +338,17 @@ func (s *Server) recoverBatchTransaction(ctx context.Context, state *batchTransa
 		receipt.Status, receipt.DiskStatus, receipt.GraphStatus = "committed", "committed", "pending"
 		receipt.Error = ""
 		state.publish(receipt, false)
-		s.refreshBatchGraph(state)
+		s.refreshBatchGraphForContext(ctx, state)
 	case len(before) == len(receipt.Files):
 		receipt.Recovered = true
 		s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", "recovered prepared transaction before commit")
 	default:
+		if len(receipt.Files) > 0 {
+			if err := prepareCheckoutMutation(ctx, receipt.Files[0].Path); err != nil {
+				s.finishBatchTransaction(state, receipt, "recovery_conflict", "conflict", "not_started", err.Error())
+				return
+			}
+		}
 		status, rollbackErr := s.rollbackBatchReceipt(receipt)
 		receipt.Recovered = true
 		message := "recovered interrupted mixed commit by restoring original bytes"
