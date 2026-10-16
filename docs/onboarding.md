@@ -215,7 +215,7 @@ gortex daemon start --detach  # spawn in background
 gortex daemon stop            # graceful shutdown; the graph store is already on disk
 gortex daemon restart         # stop + start
 gortex daemon reload          # re-read config, pick up new/removed repos
-gortex daemon logs -n 50      # tail the log
+gortex daemon logs -n 50      # tail daemon.log (background/service daemon: rotated; crash and raw stderr in daemon.stderr.log)
 ```
 
 `reload` re-reads the global `~/.gortex/config.yaml` *and* every tracked

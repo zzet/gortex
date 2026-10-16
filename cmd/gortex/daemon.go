@@ -34,6 +34,7 @@ import (
 
 var (
 	daemonDetach     bool
+	daemonServiceLog bool
 	daemonTail       int
 	daemonEmbeddings bool
 	// daemonEmbeddingsChanged records whether `--embeddings` was given
@@ -129,6 +130,10 @@ func init() {
 
 	daemonStartCmd.Flags().BoolVar(&daemonDetach, "detach", false,
 		"fork to background after starting (logs to the daemon log file — see `gortex daemon logs`)")
+	// Installed scheduled tasks pass --service-log, so it must stay accepted.
+	daemonStartCmd.Flags().BoolVar(&daemonServiceLog, "service-log", false,
+		"capture Windows scheduled-task output in the daemon log files (no-op on Unix)")
+	_ = daemonStartCmd.Flags().MarkHidden("service-log")
 	daemonStartCmd.Flags().BoolVar(&daemonEmbeddings, "embeddings", false,
 		"load a semantic embedding provider (opt-in — adds ~87 MB model download on first use and ~60 ms/symbol warmup)")
 	daemonStartCmd.Flags().StringVar(&daemonEmbeddingsURL, "embeddings-url", "",
@@ -218,7 +223,16 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	if daemonDetach && os.Getenv("GORTEX_DAEMON_CHILD") != "1" {
 		return spawnDetachedDaemon(detachedDaemonArgs(cmd.Flags(), daemonStartAcceptedFlags()))
 	}
-	logger := newLogger()
+	gc, configErr := config.LoadGlobal()
+	var logPolicy config.DaemonConfig
+	if gc != nil {
+		logPolicy = gc.Daemon
+	}
+	logger, closeLog := configureDaemonLogger(newLogger(), logPolicy, daemon.LogFilePath(), &os.Stderr, &os.Stdout)
+	defer closeLog()
+	if configErr != nil {
+		logger.Warn("daemon: could not read log policy — using defaults", zap.Error(configErr))
+	}
 	startupReporter := newDaemonStartupReporter(logger)
 	defer startupReporter.Stop()
 
@@ -464,7 +478,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// Wire a graph-change event hub so /v1/events streams real events.
 		// The hub is fed from the MultiWatcher once warmup attaches it
 		// below; until then it has no source and /v1/events keepalives.
-		v1EventHub = hub.New()
+		v1EventHub = hub.NewWithLogger(logger)
 		v1.SetEventHub(v1EventHub)
 		// Conversation-log inspector. The /v1/conversations* routes read
 		// the opt-in sink's JSONL (raw LLM I/O), so they carry a
@@ -856,10 +870,10 @@ func spawnDetachedDaemon(childArgs []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve executable: %w", err)
 	}
-	if err := daemon.EnsureParentDir(daemon.LogFilePath()); err != nil {
+	if err := daemon.EnsureParentDir(daemon.StderrLogFilePath()); err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile(daemon.LogFilePath(),
+	logFile, err := os.OpenFile(daemon.StderrLogFilePath(),
 		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("open log file: %w", err)
@@ -910,8 +924,8 @@ func spawnDetachedDaemon(childArgs []string) error {
 				sp.Done()
 				emitDaemonStartSummary(os.Stderr, child.Process.Pid, elapsed)
 			} else {
-				fmt.Fprintf(os.Stderr, "[gortex daemon] detached (pid %d, log: %s)\n",
-					child.Process.Pid, daemon.LogFilePath())
+				fmt.Fprintf(os.Stderr, "[gortex daemon] detached (pid %d, log: %s, stderr: %s)\n",
+					child.Process.Pid, daemon.LogFilePath(), daemon.StderrLogFilePath())
 			}
 			return nil
 		}
@@ -926,8 +940,8 @@ func spawnDetachedDaemon(childArgs []string) error {
 		// waiting for an exited process's heartbeat to expire.
 		select {
 		case werr := <-exited:
-			failMsg := fmt.Errorf("daemon exited during startup (%v); check %s",
-				werr, daemon.LogFilePath())
+			failMsg := fmt.Errorf("daemon exited during startup (%v); check %s and %s",
+				werr, daemon.LogFilePath(), daemon.StderrLogFilePath())
 			if sp != nil {
 				sp.Fail(failMsg)
 			}
@@ -936,7 +950,7 @@ func spawnDetachedDaemon(childArgs []string) error {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	timeoutErr := fmt.Errorf("daemon startup made no progress for 60s; check %s", daemon.LogFilePath())
+	timeoutErr := fmt.Errorf("daemon startup made no progress for 60s; check %s and %s", daemon.LogFilePath(), daemon.StderrLogFilePath())
 	if sp != nil {
 		sp.Fail(timeoutErr)
 	}
@@ -995,6 +1009,7 @@ func emitDaemonStartSummary(w io.Writer, pid int, elapsed time.Duration) {
 	fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
 	fmt.Fprintln(w, "     "+progress.Row("socket", daemon.SocketPath(), 8))
 	fmt.Fprintln(w, "     "+progress.Row("log", daemon.LogFilePath(), 8))
+	fmt.Fprintln(w, "     "+progress.Row("stderr", daemon.StderrLogFilePath(), 8))
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "     "+progress.Heading("next"))
 	fmt.Fprintln(w, "     "+progress.NumberedStep(1, "track a repo:    gortex track <path>"))
@@ -1902,6 +1917,10 @@ func renderDaemonServers(w io.Writer, st daemon.StatusResponse) {
 }
 
 func runDaemonLogs(cmd *cobra.Command, _ []string) error {
+	stderrPath := daemon.StderrLogFilePath()
+	if info, err := os.Stat(stderrPath); err == nil && info.Size() > 0 {
+		fmt.Fprintf(cmd.ErrOrStderr(), "Crash output and raw stderr: %s\n", stderrPath)
+	}
 	path := daemon.LogFilePath()
 	f, err := os.Open(path)
 	if err != nil {

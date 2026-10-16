@@ -1,6 +1,9 @@
 package hub
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -8,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/indexer"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func makeEvent(path string) indexer.GraphChangeEvent {
@@ -125,4 +130,43 @@ func TestHub_StopEndsRun(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Run did not exit after Stop")
 	}
+}
+
+func TestHubEventUsesStderrSummary(t *testing.T) {
+	h := New()
+	require.Same(t, os.Stderr, h.stderr)
+	var output bytes.Buffer
+	h.stderr = &output
+	events := make(chan indexer.GraphChangeEvent, 1)
+	events <- indexer.GraphChangeEvent{
+		Kind: indexer.ChangeModified, FilePath: "changed.go",
+		NodesAdded: 1, EdgesAdded: 2, NodesRemoved: 3, EdgesRemoved: 4, DurationMs: 5,
+	}
+	close(events)
+	h.Run(events)
+	assert.Equal(t, "[gortex watch] modified   changed.go  +1 nodes  +2 edges  -3 nodes  -4 edges  (5ms)\n", output.String())
+}
+
+func TestHubEventUsesLoggerNotStderr(t *testing.T) {
+	capture, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
+	require.NoError(t, err)
+	defer capture.Close()
+	original := os.Stderr
+	os.Stderr = capture // private descriptor, not dup2 on process fd 2
+	defer func() { os.Stderr = original }()
+	core, logs := observer.New(zap.DebugLevel)
+	h := NewWithLogger(zap.New(core))
+	_, subscriber := h.Subscribe()
+	events := make(chan indexer.GraphChangeEvent, 1)
+	events <- makeEvent("changed.go")
+	close(events)
+	h.Run(events)
+	assert.Equal(t, "changed.go", (<-subscriber).FilePath)
+	require.Equal(t, 1, logs.Len())
+	assert.Equal(t, zap.DebugLevel, logs.All()[0].Level)
+	assert.Equal(t, "changed.go", logs.All()[0].ContextMap()["file_path"])
+	assert.Equal(t, int64(1), logs.All()[0].ContextMap()["nodes_added"])
+	info, err := capture.Stat()
+	require.NoError(t, err)
+	assert.Zero(t, info.Size(), "watch events must not write raw stderr")
 }

@@ -60,7 +60,7 @@ gortex daemon status --exact        # recount nodes/edges from the store instead
 gortex daemon stop                  # graceful shutdown; the graph store is already on disk
 gortex daemon restart               # stop + start
 gortex daemon reload                # re-read the global config AND every tracked repo's .gortex.yaml, pick up new/removed repos
-gortex daemon logs -n 50            # tail the log file
+gortex daemon logs -n 50            # tail daemon.log (background/service daemon: rotated; crash and raw stderr in daemon.stderr.log)
 
 # Multi-server roster — let the daemon route to additional Gortex servers (local sockets or remote HTTPS):
 gortex daemon server list                                                  # show ~/.gortex/servers.toml

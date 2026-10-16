@@ -143,7 +143,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&noProgress, "no-progress", false, "disable animated progress output (also honored: NO_COLOR, TERM=dumb, CI, non-TTY stderr)")
 }
 
-func newLogger() *zap.Logger {
+func newLoggerConfig() zap.Config {
 	level := zapcore.InfoLevel
 	switch logLevel {
 	case "debug":
@@ -157,7 +157,11 @@ func newLogger() *zap.Logger {
 	cfg.Level = zap.NewAtomicLevelAt(level)
 	cfg.OutputPaths = []string{"stderr"}
 	cfg.ErrorOutputPaths = []string{"stderr"}
-	logger, err := cfg.Build()
+	return cfg
+}
+
+func newLogger() *zap.Logger {
+	logger, err := newLoggerConfig().Build()
 	if err != nil {
 		// Fallback.
 		logger = zap.NewNop()

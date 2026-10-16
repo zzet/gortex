@@ -738,3 +738,43 @@ func TestPropertyDuplicatePrefixValidation(t *testing.T) {
 		}
 	})
 }
+
+func TestLoadGlobal_DaemonLogLimits(t *testing.T) {
+	missing, err := LoadGlobal(filepath.Join(t.TempDir(), "missing.yaml"))
+	require.NoError(t, err)
+	assert.Nil(t, missing.Daemon.LogMaxSize)
+	assert.Nil(t, missing.Daemon.LogMaxBackups)
+	for _, tt := range []struct {
+		name  string
+		yaml  string
+		size  *int
+		count *int
+	}{
+		{"default", "daemon: {}\n", nil, nil},
+		{"custom", "daemon:\n  log_max_size: 10\n  log_max_backups: 2\n", new(10), new(2)},
+		{"zero", "daemon:\n  log_max_size: 0\n  log_max_backups: 0\n", new(0), new(0)},
+		{"negative", "daemon:\n  log_max_size: -1\n  log_max_backups: -1\n", new(-1), new(-1)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(tt.yaml), 0600))
+			gc, err := LoadGlobal(path)
+			require.NoError(t, err)
+			assert.Equal(t, tt.size, gc.Daemon.LogMaxSize)
+			assert.Equal(t, tt.count, gc.Daemon.LogMaxBackups)
+			assert.Empty(t, UnknownGlobalKeys(path))
+			require.NoError(t, gc.Save())
+			reloaded, err := LoadGlobal(path)
+			require.NoError(t, err)
+			assert.Equal(t, gc.Daemon, reloaded.Daemon)
+		})
+	}
+}
+
+func TestLoadGlobal_DaemonLogLimitsInvalidType(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("daemon:\n  log_max_size: many\n"), 0600))
+	_, err := LoadGlobal(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing global config")
+}

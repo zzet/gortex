@@ -16,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 )
 
@@ -72,6 +73,9 @@ type serviceEnvVar struct{ Key, Value string }
 // xdgServiceEnv captures the XDG base-directory overrides in effect when
 // the service unit is written, so the supervised daemon resolves the
 // same config / data / cache locations as the shell that installed it.
+// It also captures GORTEX_DAEMON_LOGFILE, as the absolute logFile from
+// serviceLogFile, so the daemon's log path matches the stderr path baked
+// into the unit.
 //
 // launchd and systemd --user start the daemon with a near-empty
 // environment — they do NOT inherit the XDG_* variables a user exports
@@ -80,19 +84,34 @@ type serviceEnvVar struct{ Key, Value string }
 // (see internal/platform/xdg.go), silently splitting their state across
 // two trees. Re-run install-service to re-capture changed values.
 //
-// Only absolute values are propagated — the rule platform.unifiedDir
+// Only absolute XDG values are propagated — the rule platform.unifiedDir
 // itself applies when honouring an override (a relative XDG path is
 // ignored per the XDG Base Directory spec). XDG_RUNTIME_DIR is
 // deliberately excluded: the init system sets it per session, so pinning
 // an install-time value would point the daemon socket at a stale dir.
-func xdgServiceEnv() []serviceEnvVar {
+func xdgServiceEnv(logFile string) []serviceEnvVar {
 	var out []serviceEnvVar
 	for _, name := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"} {
 		if v := os.Getenv(name); v != "" && filepath.IsAbs(v) {
 			out = append(out, serviceEnvVar{Key: name, Value: v})
 		}
 	}
+	if os.Getenv("GORTEX_DAEMON_LOGFILE") != "" {
+		out = append(out, serviceEnvVar{Key: "GORTEX_DAEMON_LOGFILE", Value: logFile})
+	}
 	return out
+}
+
+// serviceLogFile returns the daemon log path to bake into a launchd or
+// systemd unit. Neither unit sets a working directory, so a relative
+// GORTEX_DAEMON_LOGFILE is resolved against the installing shell's
+// directory here.
+func serviceLogFile() (string, error) {
+	path, err := filepath.Abs(daemon.LogFilePath())
+	if err != nil {
+		return "", fmt.Errorf("resolve daemon log path: %w", err)
+	}
+	return path, nil
 }
 
 // servicePath captures the installing shell's PATH so supervised language
@@ -183,7 +202,12 @@ func runDaemonInstallService(cmd *cobra.Command, _ []string) error {
 	case "linux":
 		return installSystemd(w, exe)
 	case "windows":
-		return installWindowsTask(w, exe)
+		gc, _ := config.LoadGlobal() // The daemon also uses defaults on config errors.
+		var policy config.DaemonConfig
+		if gc != nil {
+			policy = gc.Daemon
+		}
+		return installWindowsTask(w, exe, policy, runCmd)
 	default:
 		return fmt.Errorf("service install is not supported on %s — run 'gortex daemon start --detach' to keep the daemon running in the background", runtime.GOOS)
 	}
@@ -225,12 +249,12 @@ func runDaemonServiceStatus(cmd *cobra.Command, _ []string) error {
 // explicit `gortex daemon stop` (which exits 0) stays down instead of being
 // resurrected by KeepAlive. RunAtLoad starts on login.
 //
-// StandardOutPath / StandardErrorPath redirect logs into the same file
-// `gortex daemon logs` tails, so users don't need to remember two paths.
+// StandardOutPath / StandardErrorPath capture crashes and stray output in
+// daemon.stderr.log. The daemon owns its separate rotating JSON log.
 //
 // EnvironmentVariables carries the installing shell's PATH with missing
 // Homebrew / system defaults appended, plus any XDG_* overrides in effect at
-// install time — see servicePath and xdgServiceEnv for the capture rules.
+// install time, and GORTEX_DAEMON_LOGFILE — see servicePath and xdgServiceEnv.
 const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -308,7 +332,12 @@ func installLaunchd(w io.Writer, exe string) error {
 		return fmt.Errorf("ensure LaunchAgents dir: %w", err)
 	}
 
-	plist, err := renderLaunchdPlist(daemonServiceName, exe, daemon.LogFilePath(), xdgServiceEnv())
+	logFile, err := serviceLogFile()
+	if err != nil {
+		return err
+	}
+	stderrLog := daemon.StderrLogPath(logFile)
+	plist, err := renderLaunchdPlist(daemonServiceName, exe, stderrLog, xdgServiceEnv(logFile))
 	if err != nil {
 		return fmt.Errorf("render plist: %w", err)
 	}
@@ -321,7 +350,7 @@ func installLaunchd(w io.Writer, exe string) error {
 		return fmt.Errorf("launchctl load: %w", err)
 	}
 	fmt.Fprintf(w, "[gortex daemon] service installed at %s\n", path)
-	fmt.Fprintf(w, "  logs: %s\n", daemon.LogFilePath())
+	fmt.Fprintf(w, "  logs: %s (stderr: %s)\n", logFile, stderrLog)
 	fmt.Fprintf(w, "  check: gortex daemon service-status\n")
 	return nil
 }
@@ -593,7 +622,7 @@ func noteRunningDaemon(w io.Writer, daemonRunning func() bool) {
 // because `gortex daemon start` (without --detach) runs in the
 // foreground; Restart=on-failure covers the crash-restart case without
 // pounding on successful exits. Environment= lines carry a non-empty captured
-// PATH and any XDG_* overrides in effect at install time so the supervised
+// PATH, XDG_* overrides, and GORTEX_DAEMON_LOGFILE at install time so the
 // daemon resolves the same paths as the installing shell — see servicePath
 // and xdgServiceEnv.
 const systemdUnitTemplate = `[Unit]
@@ -625,7 +654,13 @@ func renderSystemdUnit(exe, logPath string, env []serviceEnvVar) (string, error)
 	data := struct {
 		Exe, LogPath string
 		EnvVars      []string
-	}{Exe: exe, LogPath: logPath, EnvVars: make([]string, len(env))}
+	}{
+		Exe: exe,
+		// systemd expands % specifiers in StandardOutput= and StandardError=
+		// paths too, so escape them as systemdEnvValue does.
+		LogPath: strings.ReplaceAll(logPath, "%", "%%"),
+		EnvVars: make([]string, len(env)),
+	}
 	for i, e := range env {
 		data.EnvVars[i] = systemdEnvValue(e.Key + "=" + e.Value)
 	}
@@ -653,7 +688,12 @@ func installSystemd(w io.Writer, exe string) error {
 		return fmt.Errorf("ensure systemd user dir: %w", err)
 	}
 
-	unit, err := renderSystemdUnit(exe, daemon.LogFilePath(), xdgServiceEnv())
+	logFile, err := serviceLogFile()
+	if err != nil {
+		return err
+	}
+	stderrLog := daemon.StderrLogPath(logFile)
+	unit, err := renderSystemdUnit(exe, stderrLog, xdgServiceEnv(logFile))
 	if err != nil {
 		return fmt.Errorf("render unit: %w", err)
 	}
@@ -669,7 +709,7 @@ func installSystemd(w io.Writer, exe string) error {
 		return fmt.Errorf("systemctl enable --now: %w", err)
 	}
 	fmt.Fprintf(w, "[gortex daemon] service installed at %s\n", path)
-	fmt.Fprintf(w, "  logs: %s (or `journalctl --user -u %s -f`)\n", daemon.LogFilePath(), daemonServiceName)
+	fmt.Fprintf(w, "  logs: %s (stderr: %s; or `journalctl --user -u %s -f`)\n", logFile, stderrLog, daemonServiceName)
 	fmt.Fprintf(w, "  check: gortex daemon service-status\n")
 	return nil
 }
@@ -740,28 +780,35 @@ const windowsTaskName = "GortexDaemon"
 
 // windowsTaskCreateArgs builds the schtasks argv that registers the logon
 // autostart task. Split out so the arg vector is unit-testable without a
-// Windows host: the task runs `"<exe>" daemon start` at each logon (ONLOGON)
+// Windows host: the task runs `"<exe>" daemon start --service-log` at logon (ONLOGON)
 // under the current limited user (RL LIMITED), replacing any existing task (F).
+// This command passes no environment overrides; GORTEX_DAEMON_LOGFILE must
+// be set in the task user's environment, not only in the installing shell.
 func windowsTaskCreateArgs(taskName, exe string) []string {
 	return []string{
 		"/Create",
 		"/TN", taskName,
-		"/TR", fmt.Sprintf(`"%s" daemon start`, exe),
+		"/TR", fmt.Sprintf(`"%s" daemon start --service-log`, exe),
 		"/SC", "ONLOGON",
 		"/RL", "LIMITED",
 		"/F",
 	}
 }
 
-func installWindowsTask(w io.Writer, exe string) error {
-	if err := runCmd(w, "schtasks", windowsTaskCreateArgs(windowsTaskName, exe)...); err != nil {
+func installWindowsTask(w io.Writer, exe string, policy config.DaemonConfig, run func(io.Writer, string, ...string) error) error {
+	if err := run(w, "schtasks", windowsTaskCreateArgs(windowsTaskName, exe)...); err != nil {
 		return fmt.Errorf("schtasks create: %w", err)
 	}
 	// Start it now so the user gets a running daemon in one command — the
 	// Windows analogue of systemd `enable --now` / launchd RunAtLoad.
-	_ = runCmd(w, "schtasks", "/Run", "/TN", windowsTaskName)
+	_ = run(w, "schtasks", "/Run", "/TN", windowsTaskName)
 	fmt.Fprintf(w, "[gortex daemon] logon task installed (%s)\n", windowsTaskName)
-	fmt.Fprintf(w, "  logs: %s\n", daemon.LogFilePath())
+	maxSize, _ := resolveDaemonLogLimit(policy.LogMaxSize, 50, 0)
+	if maxSize == 0 {
+		fmt.Fprintf(w, "  logs: %s (JSON and raw output; rotation disabled per current config)\n", daemon.StderrLogFilePath())
+	} else {
+		fmt.Fprintf(w, "  logs: %s (rotating JSON; raw output: %s; per current config)\n", daemon.LogFilePath(), daemon.StderrLogFilePath())
+	}
 	fmt.Fprintf(w, "  check: gortex daemon service-status\n")
 	return nil
 }

@@ -44,6 +44,8 @@ mcp:
 
 # daemon:
 #   http_addr: 127.0.0.1:7411         # Opt in to /mcp + /v1 over HTTP (unset: socket only)
+#   log_max_size: 50                  # Rotate daemon.log at this many MB (0 disables)
+#   log_max_backups: 3                # Number of rotated logs to retain (minimum 1)
 
 exclude:                            # Applies to every tracked repo
   - "**/*.generated.*"
@@ -83,6 +85,35 @@ silently losing framework edges requested by a sibling while allowing a
 workspace where every repository opts out to avoid the scans entirely.
 
 ## Daemon tuning (optional)
+
+The background daemon writes JSON lines to `daemon.log` and rotates it while
+running. In the global config, `daemon.log_max_size` sets the size in MB
+(default `50`, where 1 MB = 1,048,576 bytes). `daemon.log_max_backups` sets the
+number of timestamped backups to retain (default `3`, minimum `1`). Out-of-range
+integers warn and use the default for that setting. A non-integer value such as
+`log_max_size: many` makes the global config fail to load; the daemon warns and
+uses the default log policy. Collectors should follow `daemon.log` by name
+(`tail -F` style), because rotation renames the file. On upgrade, a large legacy
+`daemon.log` becomes the newest backup; it can be deleted by hand.
+
+Launchers capture crashes and other output in `daemon.stderr.log`, in the same
+directory. Existing Unix and Windows installs that inherit `daemon.log` handles
+are redirected there automatically when rotation is enabled; no reinstall is
+needed for those installs.
+New Windows Task Scheduler logon tasks explicitly enable log capture: rotating
+JSON goes to `daemon.log`, and raw stdout/stderr and Go runtime panic output go
+to `daemon.stderr.log`. Reinstall an existing scheduled task with
+`gortex daemon install-service` to capture logs in these files; an old task
+captures no logs. Other Windows starts keep
+their output destinations, including terminals, pipes, shell redirections, CI
+captures, and third-party service wrappers such as NSSM and WinSW.
+
+If inherited descriptors cannot be redirected, the daemon warns and keeps stderr
+logging without rotation. Setting `daemon.log_max_size: 0` also keeps stderr
+logging without rotation and leaves existing descriptors unchanged, so legacy
+installs continue writing to their inherited destination, including `daemon.log`.
+New launchers and new Windows logon tasks capture both JSON and raw output in
+`daemon.stderr.log` when rotation is disabled.
 
 The daemon's defaults handle typical workflows without configuration. These knobs exist for monorepos, branch-heavy workflows, or filesystems without fsnotify support.
 
