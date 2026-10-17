@@ -434,9 +434,9 @@ func TestFindFileNodesBoundedPlanUsesFileIndexWithoutSorter(t *testing.T) {
 		Kinds:        map[graph.NodeKind]bool{graph.KindFunction: true, graph.KindMethod: true},
 		ExcludeKinds: map[graph.NodeKind]bool{graph.KindParam: true, graph.KindLocal: true},
 	})
-	args = append(args, "", 257)
+	args = append(args, store.viewGen, "", 257)
 	rows, err := store.db.Query(
-		`EXPLAIN QUERY PLAN SELECT `+lookupNodeSummaryCols+` FROM nodes WHERE `+predicate+` AND id > ? ORDER BY id LIMIT ?`,
+		`EXPLAIN QUERY PLAN SELECT `+lookupNodeSummaryCols+` FROM nodes INDEXED BY nodes_by_file WHERE `+predicate+` AND view_gen = ? AND id > ? ORDER BY id LIMIT ?`,
 		args...,
 	)
 	if err != nil {

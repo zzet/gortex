@@ -384,15 +384,11 @@ func (n *Node) NamedChild(i int) *Node {
 }
 
 // NamedChildren yields n's named children, in order, walking the sibling
-// chain once with a tree-sitter cursor. Visiting every named child costs
-// O(total children). The index form
-//
-//	for i := 0; i < int(n.NamedChildCount()); i++ { c := n.NamedChild(i); … }
-//
-// is O(N^2): each NamedChild(i) re-walks the child list from the first
-// child to reach position i, so a loop over a very wide node (e.g. a
-// generated file's program root with thousands of top-level siblings)
-// degrades quadratically. This iterator stays linear.
+// chain once with a tree-sitter cursor, retaining its traversal position.
+// Indexed NamedChild lookups restart navigation, although the native library
+// can skip hidden subtrees using cached child counts. Their cost therefore
+// depends on the tree's internal shape; they are not a universal quadratic
+// baseline for this iterator.
 //
 // The visited set and order are identical to the NamedChild index form:
 // anonymous (unnamed) children are skipped and named children are

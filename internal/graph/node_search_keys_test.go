@@ -11,9 +11,9 @@ import (
 func TestScanNodeSearchKeysGraphIsPagedCompleteAndReentrant(t *testing.T) {
 	g := New()
 	want := map[string]NodeSearchKey{
-		"c.go::Gamma": {ID: "c.go::Gamma", Kind: KindFunction, Name: "Gamma"},
-		"a.go::Alpha": {ID: "a.go::Alpha", Kind: KindMethod, Name: "Alpha"},
-		"b.go::Beta":  {ID: "b.go::Beta", Kind: KindFunction, Name: "Beta"},
+		"c.go::Gamma": {ID: "c.go::Gamma", Kind: KindFunction, Name: "Gamma", FilePath: "c.go"},
+		"a.go::Alpha": {ID: "a.go::Alpha", Kind: KindMethod, Name: "Alpha", FilePath: "a.go"},
+		"b.go::Beta":  {ID: "b.go::Beta", Kind: KindFunction, Name: "Beta", FilePath: "b.go"},
 	}
 	for _, key := range want {
 		g.AddNode(&Node{ID: key.ID, Kind: key.Kind, Name: key.Name, FilePath: IDFile(key.ID)})
@@ -104,8 +104,8 @@ func TestOverlaidViewScanNodeSearchKeysAppliesMasksAndProxiesRevision(t *testing
 		t.Fatalf("ScanNodeSearchKeys: %v", err)
 	}
 	want := map[string]NodeSearchKey{
-		"keep.go::Keep":   {ID: "keep.go::Keep", Kind: KindFunction, Name: "Keep"},
-		"replace.go::New": {ID: "replace.go::New", Kind: KindMethod, Name: "New"},
+		"keep.go::Keep":   {ID: "keep.go::Keep", Kind: KindFunction, Name: "Keep", FilePath: "keep.go"},
+		"replace.go::New": {ID: "replace.go::New", Kind: KindMethod, Name: "New", FilePath: "replace.go"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("overlay keys = %#v, want %#v", got, want)

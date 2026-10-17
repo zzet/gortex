@@ -199,7 +199,7 @@ func (s *Server) symbolNamesByFiles(ctx context.Context, paths []string) map[str
 	// so an overlay-active call takes the per-file loop below and reads
 	// the caller's buffers.
 	reader := s.readerFor(ctx)
-	if scanner, ok := reader.(graph.FileSymbolNamesByPaths); ok {
+	if scanner, ok := contractCoreSelectedReader(reader).(graph.FileSymbolNamesByPaths); ok {
 		rows := scanner.FileSymbolNamesByPaths(paths, kinds)
 		seenPerFile := make(map[string]map[string]bool, len(paths))
 		for _, r := range rows {

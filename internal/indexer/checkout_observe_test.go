@@ -385,23 +385,33 @@ func TestObserveCheckoutPathExpiredJobsStayBoundedUntilTheyDrain(t *testing.T) {
 	lc, catalog, primary, familyID, _, _ := newCheckoutObservationFixture(t)
 	release := make(chan struct{})
 	defer close(release)
+	entered := make(chan struct{})
 	var started atomic.Int32
 	lc.observationInventory = func(context.Context, string) (*gitstate.FamilyInventory, error) {
-		started.Add(1)
+		if started.Add(1) == checkoutObservationCapacity {
+			close(entered)
+		}
 		<-release // Deliberately model a dependency that ignores cancellation.
 		return nil, context.Canceled
 	}
 	jobs := make([]*checkoutObservationJob, 0, checkoutObservationCapacity)
 	for i := 0; i < checkoutObservationCapacity; i++ {
-		job, err := lc.checkoutObservation(filepath.Join(primary, fmt.Sprintf("request-%d", i)))
+		path := filepath.Join(primary, fmt.Sprintf("request-%d", i))
+		if err := os.Mkdir(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		job, err := lc.checkoutObservation(path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		jobs = append(jobs, job)
 	}
-	deadline := time.Now().Add(time.Second)
-	for started.Load() != checkoutObservationCapacity && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatalf("workers did not enter inventory: started=%d: %v", started.Load(), ctx.Err())
 	}
 	if got := started.Load(); got != checkoutObservationCapacity {
 		t.Fatalf("workers did not start: %d", got)

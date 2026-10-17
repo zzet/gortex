@@ -382,7 +382,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	// round-trips instead of the per-symbol GetCallers / GetCallChain
 	// loop. The fallback retains the previous engine-based shape so
 	// the in-memory backend is unaffected.
-	if fc, ok := s.readerFor(ctx).(graph.FileEditingContext); ok {
+	if fc, ok := fileEditingContextFor(s.readerFor(ctx)); ok {
 		bundle := fc.FileEditingContext(fp, []graph.NodeKind{graph.KindFunction, graph.KindMethod})
 		if bundle == nil || (bundle.FileNode == nil && len(bundle.Defines) == 0) {
 			return mcp.NewToolResultError("no symbols found for file: " + fp), nil
@@ -963,18 +963,20 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("symbol not found: " + id), nil
 	}
 	sess := s.sessionFor(ctx)
-	sess.recordSymbol(id)
-	sess.recordFile(node.FilePath)
-	// Credit this consume back to the most recent matching search_symbols,
-	// if any; no-op when the combo tracker isn't initialised or no search
-	// window is active.
-	if q := sess.attributedQuery(id); q != "" {
-		s.combo.Record(q, id)
-	}
-	// Unconditionally record the access for frecency — this is the "symbols
-	// the agent actually reads" signal, useful even when no prior search
-	// sourced it (agents also fetch symbols by ID from recent history).
-	s.frecency.Record(id)
+	afterFreshSymbolAcceptance(ctx, func() {
+		sess.recordSymbol(id)
+		sess.recordFile(node.FilePath)
+		// Credit this consume back to the most recent matching search_symbols,
+		// if any; no-op when the combo tracker isn't initialised or no search
+		// window is active.
+		if q := sess.attributedQuery(id); q != "" {
+			s.combo.Record(q, id)
+		}
+		// Unconditionally record the access for frecency — this is the "symbols
+		// the agent actually reads" signal, useful even when no prior search
+		// sourced it (agents also fetch symbols by ID from recent history).
+		s.frecency.Record(id)
+	})
 
 	if node.StartLine == 0 || node.EndLine == 0 {
 		return mcp.NewToolResultError("symbol has no line range: " + id), nil
@@ -1128,7 +1130,9 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}
-	s.recordPendingSavings(ctx, pending)
+	afterFreshSymbolAcceptance(ctx, func() {
+		s.recordPendingSavings(ctx, pending)
+	})
 	result["etag"] = etag
 
 	if s.isGCX(ctx, req) {
@@ -1542,7 +1546,7 @@ func (s *Server) handleGetTestTargets(ctx context.Context, req mcp.CallToolReque
 
 		// Fallback for graphs that haven't been re-indexed since the
 		// EdgeTests pass shipped, or for indirect coverage (depth > 1).
-		callers := s.engineFor(ctx).GetCallers(id, query.QueryOptions{Depth: depth, Limit: 100, Detail: "brief"})
+		callers := s.engineFor(ctx).GetCallers(id, query.QueryOptions{Depth: depth, Limit: 100, Detail: "brief", Context: ctx})
 		for _, cn := range callers.Nodes {
 			if !isTestFile(cn.FilePath) {
 				continue
@@ -1993,7 +1997,20 @@ func (s *Server) handleGetEditPlan(ctx context.Context, req mcp.CallToolRequest)
 
 // extractPrefix returns the common prefix of a camelCase/PascalCase name.
 // e.g. "handleGetSymbol" -> "handle", "TestNewServer" -> "Test"
-func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest) (toolResult *mcp.CallToolResult, retErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer func() {
+		if err := ctx.Err(); err != nil {
+			toolResult = nil
+			retErr = err
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	task, err := req.RequireString("task")
 	if err != nil {
 		return mcp.NewToolResultError("task is required"), nil
@@ -2050,7 +2067,20 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		if len(kw) < 3 {
 			continue
 		}
-		matches := s.scopedNodeSlice(ctx, s.engineFor(ctx).SearchSymbols(kw, 10))
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		ranked := s.engineFor(ctx).SearchSymbolsRankedContext(ctx, kw, 10, query.QueryOptions{}, nil)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		matches := make([]*graph.Node, 0, len(ranked))
+		for _, candidate := range ranked {
+			if candidate != nil && candidate.Node != nil {
+				matches = append(matches, candidate.Node)
+			}
+		}
+		matches = s.scopedNodeSlice(ctx, matches)
 		for _, m := range matches {
 			if m.Kind == graph.KindFile || m.Kind == graph.KindImport {
 				continue

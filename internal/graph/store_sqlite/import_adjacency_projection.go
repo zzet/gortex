@@ -14,6 +14,14 @@ import (
 // matching Store adjacency semantics. The second emits only a sentinel when
 // an import owned by a requested file has blank or mismatched edge provenance;
 // the resolver then falls back to the ordinary node/adjacency path.
+//
+// The sentinel branch pins its join order with CROSS JOIN (an inner join
+// SQLite never reorders): the requested file's nodes drive, and each node's
+// import rows are one edges_by_from probe on (view_gen, from_id, kind).
+// Left to the planner, it drove from edges_by_from on the view_gen prefix
+// alone — every edge of the generation, once per requested file — which on a
+// ~900k-edge repository cost ~0.2–3 s per caller file and made the
+// incremental resolver's reachability preparation take minutes.
 const importAdjacencyProjectionSQL = `
 WITH requested(file_path) AS (
     SELECT CAST(value AS TEXT) FROM json_each(?)
@@ -30,7 +38,7 @@ FROM requested AS r
 WHERE EXISTS (
     SELECT 1
     FROM nodes AS source INDEXED BY nodes_by_file
-    JOIN edges AS e INDEXED BY edges_by_from
+    CROSS JOIN edges AS e INDEXED BY edges_by_from
       ON e.from_id = source.id AND e.view_gen = source.view_gen
     WHERE source.file_path = r.file_path
       AND e.kind = ?

@@ -30,6 +30,7 @@ type frameworkScopeTrapStore struct {
 	scopedNodeScans   int
 	scopedEdgeScans   int
 	scopedLightScan   int
+	fileBatchReads    int
 	pointNodes        int
 	pointInEdges      int
 	pointOutEdges     int
@@ -120,6 +121,11 @@ func (s *frameworkScopeTrapStore) NodesLightInScopeSeq(
 ) iter.Seq[*graph.Node] {
 	s.scopedLightScan++
 	return graph.NodesLightInScopeSeq(s.Store, repos, files)
+}
+
+func (s *frameworkScopeTrapStore) GetFileNodesByPaths(paths []string) map[string][]*graph.Node {
+	s.fileBatchReads++
+	return s.Store.GetFileNodesByPaths(paths)
 }
 
 func (s *frameworkScopeTrapStore) RepoEdgesByKinds(
@@ -253,17 +259,50 @@ func buildMediatRScopedFixture() *graph.Graph {
 	return g
 }
 
+// buildGRPCHandlerSideScopedFixture is a target-side edit: the server file
+// changed so that its handler for Users/Get is userServer.Get, while the
+// client's stub is still bound to oldServer.Get in the same file. Only the
+// stub's incoming row reaches the scoped pass.
+func buildGRPCHandlerSideScopedFixture() *graph.Graph {
+	g := graph.New()
+	for _, repo := range []string{"a", "b"} {
+		server := repo + "/server.go"
+		client := repo + "/client.go"
+		iface := frameworkTestNode(repo, server, repo+"/server.go::UsersServer", graph.KindInterface, "UsersServer", "go", nil)
+		impl := frameworkTestNode(repo, server, repo+"/server.go::userServer", graph.KindType, "userServer", "go", nil)
+		handler := frameworkTestNode(repo, server, repo+"/server.go::userServer.Get", graph.KindMethod, "Get", "go", nil)
+		old := frameworkTestNode(repo, server, repo+"/server.go::oldServer", graph.KindType, "oldServer", "go", nil)
+		stale := frameworkTestNode(repo, server, repo+"/server.go::oldServer.Get", graph.KindMethod, "Get", "go", nil)
+		caller := frameworkTestNode(repo, client, repo+"/client.go::fetch", graph.KindFunction, "fetch", "go", nil)
+		g.AddBatch([]*graph.Node{iface, impl, handler, old, stale, caller}, []*graph.Edge{
+			{From: impl.ID, To: iface.ID, Kind: graph.EdgeImplements, FilePath: server},
+			{From: handler.ID, To: impl.ID, Kind: graph.EdgeMemberOf, FilePath: server},
+			{From: stale.ID, To: old.ID, Kind: graph.EdgeMemberOf, FilePath: server},
+			{From: caller.ID, To: stale.ID, Kind: graph.EdgeCalls, FilePath: client, Line: 4, Meta: map[string]any{
+				"via": "grpc.stub", "grpc_service": "Users", "grpc_method": "Get",
+			}},
+		})
+	}
+	return g
+}
+
 func TestFrameworkScopedLegacyPassesRepresentativeParityAndNoGlobalScans(t *testing.T) {
 	tests := []struct {
 		name        string
+		synth       string
 		changedFile string
-		build       func() *graph.Graph
-		resolve     func(graph.Store) int
+		// edgeScans bounds the scoped edge projections: the pass's own
+		// scans plus, for a pass whose name prefetch reads the changed
+		// file's candidate edges, that read.
+		edgeScans int
+		build     func() *graph.Graph
+		resolve   func(graph.Store) int
 	}{
-		{name: "go gin", changedFile: "a/router.go", build: buildGinScopedFixture, resolve: ResolveGinMiddlewareCalls},
-		{name: "typescript store factory", changedFile: "a/caller.ts", build: buildStoreFactoryScopedFixture, resolve: ResolveStoreFactoryCalls},
-		{name: "python fastapi", changedFile: "a/routers/users.py", build: buildFastAPIScopedFixture, resolve: ResolveFastAPIDeps},
-		{name: "csharp mediatr", changedFile: "a/Controller.cs", build: buildMediatRScopedFixture, resolve: ResolveMediatRCalls},
+		{name: "go gin", synth: SynthGinMiddleware, changedFile: "a/router.go", edgeScans: 4, build: buildGinScopedFixture, resolve: ResolveGinMiddlewareCalls},
+		{name: "typescript store factory", synth: SynthStoreFactory, changedFile: "a/caller.ts", edgeScans: 4, build: buildStoreFactoryScopedFixture, resolve: ResolveStoreFactoryCalls},
+		{name: "python fastapi", synth: SynthFastAPIResolve, changedFile: "a/routers/users.py", edgeScans: 4, build: buildFastAPIScopedFixture, resolve: ResolveFastAPIDeps},
+		{name: "csharp mediatr", synth: SynthMediatR, changedFile: "a/Controller.cs", edgeScans: 4, build: buildMediatRScopedFixture, resolve: ResolveMediatRCalls},
+		{name: "go grpc handler side", synth: SynthGRPCStub, changedFile: "a/server.go", edgeScans: 5, build: buildGRPCHandlerSideScopedFixture, resolve: ResolveGRPCStubCalls},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -272,7 +311,8 @@ func TestFrameworkScopedLegacyPassesRepresentativeParityAndNoGlobalScans(t *test
 
 			scopedGraph := tt.build()
 			trap := &frameworkScopeTrapStore{Store: scopedGraph}
-			view := newFrameworkScopedStore(trap, map[string]bool{"a": true}, []string{tt.changedFile})
+			// The pass reads exactly what its seed declaration names.
+			view := newFrameworkDeclaredSeed(trap, map[string]bool{"a": true}, []string{tt.changedFile}).passStore(tt.synth)
 			require.Positive(t, tt.resolve(view), "scoped pass must process the changed frontier")
 
 			require.Equal(t, frameworkEdgeSnapshot(full, "a"), frameworkEdgeSnapshot(scopedGraph, "a"),
@@ -284,7 +324,7 @@ func TestFrameworkScopedLegacyPassesRepresentativeParityAndNoGlobalScans(t *test
 			require.Zero(t, trap.pointInEdges, "incident reads must be batched")
 			require.Zero(t, trap.pointOutEdges, "incident reads must be batched")
 			require.LessOrEqual(t, trap.scopedNodeScans, 8)
-			require.LessOrEqual(t, trap.scopedEdgeScans, 4)
+			require.LessOrEqual(t, trap.scopedEdgeScans, tt.edgeScans)
 		})
 	}
 }
@@ -302,7 +342,10 @@ func TestRunFrameworkSynthesizersScopedForFilesHasNoLegacyGlobalFallback(t *test
 	)
 
 	requireNoFrameworkGlobalScans(t, trap)
-	require.Equal(t, 1, trap.scopedLightScan, "candidate census must be one scoped stream")
+	// An exact file frontier's census reads those files' rows in one batch
+	// (frameworkFileFrontierNodes), not a keyset projection of the scope.
+	require.Zero(t, trap.scopedLightScan, "candidate census of a file frontier must read the files")
+	require.Positive(t, trap.fileBatchReads, "candidate census must be one bounded file read")
 }
 
 func TestFrameworkFamilyGateForFilesUsesExactFrontier(t *testing.T) {

@@ -302,6 +302,9 @@ func (s *Server) handleAnalyzeUnclosedChannels(ctx context.Context, req mcp.Call
 	// is per-function, not per-channel.
 	closesIn := map[string]bool{}
 	for e := range edgesByKinds(g, graph.EdgeCalls) {
+		if !s.analyzeOwnedEdgeVisible(ctx, g, e) {
+			continue
+		}
 		if callTargetName(e) != "close" {
 			continue
 		}
@@ -320,6 +323,9 @@ func (s *Server) handleAnalyzeUnclosedChannels(ctx context.Context, req mcp.Call
 	}
 	byChannel := map[string]*channelInfo{}
 	for e := range edgesByKinds(g, graph.EdgeSends, graph.EdgeRecvs) {
+		if !s.analyzeOwnedEdgeVisible(ctx, g, e) {
+			continue
+		}
 		info := byChannel[e.To]
 		if info == nil {
 			info = &channelInfo{
@@ -390,20 +396,6 @@ func (s *Server) handleAnalyzeUnclosedChannels(ctx context.Context, req mcp.Call
 			Risk:     risk,
 			Reason:   reason,
 		})
-	}
-
-	// Scope filter: keep only channels whose channel node is visible to
-	// the current request. Senders/Sends/Recvs are counts (not node IDs)
-	// so they need no pruning. total/truncated recompute below. No-op for
-	// an unbound request.
-	if s.scopeFiltersActive(ctx) {
-		kept := make([]unclosedRow, 0, len(rows))
-		for _, r := range rows {
-			if s.analyzeNodeVisible(ctx, g.GetNode(r.Channel)) {
-				kept = append(kept, r)
-			}
-		}
-		rows = kept
 	}
 
 	sort.Slice(rows, func(i, j int) bool {

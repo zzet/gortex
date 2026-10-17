@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"sort"
 	"strings"
 
@@ -29,6 +30,19 @@ var _ graph.BFSCapable = (*Store)(nil)
 // Reads run lock-free, like the store's other read paths (SQLite WAL
 // serves readers concurrently with the single serialized writer).
 func (s *Store) BFS(seeds []string, dir graph.Direction, kinds []graph.EdgeKind, maxDepth, limit int) ([]graph.BFSHop, error) {
+	return s.BFSContext(context.Background(), seeds, dir, kinds, maxDepth, limit)
+}
+
+// BFSContext is BFS bound to a request: the recursive CTE runs under ctx, so
+// SQLite interrupts it when the request ends, and a cancelled walk returns
+// ctx's error instead of a partial hop set.
+func (s *Store) BFSContext(ctx context.Context, seeds []string, dir graph.Direction, kinds []graph.EdgeKind, maxDepth, limit int) ([]graph.BFSHop, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	seen := make(map[string]struct{}, len(seeds))
 	uniqSeeds := make([]string, 0, len(seeds))
 	for _, sd := range seeds {
@@ -78,7 +92,7 @@ func (s *Store) BFS(seeds []string, dir graph.Direction, kinds []graph.EdgeKind,
 		args = append(args, limit)
 	}
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -101,6 +115,9 @@ func (s *Store) BFS(seeds []string, dir graph.Direction, kinds []graph.EdgeKind,
 		})
 	}
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return out, nil

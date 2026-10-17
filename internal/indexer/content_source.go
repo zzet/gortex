@@ -19,7 +19,10 @@ const maxSourceReadHint = 64 << 20
 // contentSourceRef boxes the installed content source so the swap is one
 // atomic pointer store: reindex paths read the source off the hot path
 // without taking a lock, the same way they read rootPath.
-type contentSourceRef struct{ src source.ContentSource }
+type contentSourceRef struct {
+	src       source.ContentSource
+	manifests source.ContentSource
+}
 
 // SetContentSource routes every content read this Indexer makes through
 // src instead of the os package. Passing nil restores the default, where
@@ -31,11 +34,7 @@ type contentSourceRef struct{ src source.ContentSource }
 // where a walk enumerates from: walkSource does that, and its caller
 // picks it explicitly.
 func (idx *Indexer) SetContentSource(src source.ContentSource) {
-	if src == nil {
-		idx.contentSrc.Store(nil)
-		return
-	}
-	idx.contentSrc.Store(&contentSourceRef{src: src})
+	idx.setContentSourceWithManifests(src, src)
 }
 
 // contentSource returns the installed content source, or nil when reads
@@ -82,7 +81,12 @@ func (idx *Indexer) sourceRelPath(absPath string) (string, bool) {
 func (idx *Indexer) readFileWithVersion(absPath string) ([]byte, fileReadVersion, error) {
 	src := idx.contentSource()
 	if src == nil {
-		return readOSFileWithVersion(absPath)
+		// A build that proves its reads records every one of them: the
+		// parse, and the re-reads of a file whose speculative parse went
+		// stale (takePreparedRefresh, the legacy fallback's indexFile).
+		data, version, err := readOSFileWithVersion(absPath)
+		idx.contentProof.recordRead(absPath, data, err)
+		return data, version, err
 	}
 	rel, ok := idx.sourceRelPath(absPath)
 	if !ok {
@@ -97,9 +101,16 @@ func (idx *Indexer) readFileWithVersion(absPath string) ([]byte, fileReadVersion
 // readFileWithVersion for the callers that want bytes and no receipt —
 // the parse pool, whose staleness bookkeeping is settled by the walk that
 // staged the file.
+//
+// A working-copy read of a build that proves its reads is recorded with the
+// content identity of the bytes it took (buildContentProof.recordRead): the
+// root manifests the per-save module relink reads, contract sources and the
+// like are as much the payload's inputs as the parsed files.
 func (idx *Indexer) readFileContent(absPath string) ([]byte, error) {
 	if idx.contentSource() == nil {
-		return os.ReadFile(absPath)
+		data, err := os.ReadFile(absPath)
+		idx.contentProof.recordRead(absPath, data, err)
+		return data, err
 	}
 	src, _, err := idx.readFileWithVersion(absPath)
 	return src, err

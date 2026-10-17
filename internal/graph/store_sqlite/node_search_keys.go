@@ -52,14 +52,14 @@ func (s *Store) ScanNodeSearchKeys(ctx context.Context, pageSize int, yield func
 		var rows *sql.Rows
 		if firstPage {
 			rows, err = s.db.QueryContext(ctx, `
-SELECT id, kind, name
+SELECT id, kind, name, file_path, repo_prefix, workspace_id, project_id
 FROM nodes
 WHERE id <= ? AND view_gen = ?
 ORDER BY id
 LIMIT ?`, highWater, s.viewGen, pageSize)
 		} else {
 			rows, err = s.db.QueryContext(ctx, `
-SELECT id, kind, name
+SELECT id, kind, name, file_path, repo_prefix, workspace_id, project_id
 FROM nodes
 WHERE id > ? AND id <= ? AND view_gen = ?
 ORDER BY id
@@ -76,7 +76,7 @@ LIMIT ?`, after, highWater, s.viewGen, pageSize)
 		page := make([]graph.NodeSearchKey, 0, pageSize)
 		for rows.Next() {
 			var key graph.NodeSearchKey
-			if scanErr := rows.Scan(&key.ID, &key.Kind, &key.Name); scanErr != nil {
+			if scanErr := rows.Scan(&key.ID, &key.Kind, &key.Name, &key.FilePath, &key.RepoPrefix, &key.WorkspaceID, &key.ProjectID); scanErr != nil {
 				_ = rows.Close()
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return ctxErr

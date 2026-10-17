@@ -128,7 +128,7 @@ func TestDirectMutationAPIsUseStableLaneAndCurrentIndexer(t *testing.T) {
 	release := make(chan struct{})
 	blockDone := make(chan error, 1)
 	go func() {
-		blockDone <- stale.coordinateRepositoryMutation(context.Background(), func() error {
+		blockDone <- stale.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 			close(entered)
 			<-release
 			return nil

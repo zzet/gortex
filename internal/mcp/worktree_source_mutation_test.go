@@ -269,12 +269,12 @@ func TestCheckoutSourceFallbackRemainsReadOnly(t *testing.T) {
 	for _, dryRun := range []bool{true, false} {
 		ran := false
 		res, err := stack.callWithView(t, stack.worktreeRoot, "edit_file",
-			map[string]any{"dry_run": dryRun}, func(context.Context) (*mcplib.CallToolResult, error) {
+			map[string]any{"dry_run": dryRun, "wait_deadline": time.Now().Add(100 * time.Millisecond).Format(time.RFC3339Nano)}, func(context.Context) (*mcplib.CallToolResult, error) {
 				ran = true
 				return mcplib.NewToolResultText(`{"ok":true}`), nil
 			})
 		require.NoError(t, err)
-		assertToolError(t, res, graphview.CodeViewReadOnly)
+		assertToolError(t, res, graphview.CodeViewBuilding)
 		require.False(t, ran, "base fallback must not grant permission to edit the primary checkout")
 	}
 }
@@ -308,6 +308,11 @@ func newRealCheckoutMutationFixture(t testing.TB) *realCheckoutMutationFixture {
 }
 
 func newRealCheckoutMutationFixtureWithRegistry(t testing.TB, configure func(*parser.Registry)) *realCheckoutMutationFixture {
+	t.Helper()
+	return newRealCheckoutMutationFixtureWithSetup(t, configure, nil)
+}
+
+func newRealCheckoutMutationFixtureWithSetup(t testing.TB, configure func(*parser.Registry), beforeRegister func(*indexer.CheckoutLifecycle, string)) *realCheckoutMutationFixture {
 	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)
@@ -345,6 +350,9 @@ func newRealCheckoutMutationFixtureWithRegistry(t testing.TB, configure func(*pa
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = lifecycle.Close() })
+	if beforeRegister != nil {
+		beforeRegister(lifecycle, worktree)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	registered, err := lifecycle.Register(ctx, config.RepoEntry{Path: primary, Name: "repo"}, indexer.TrackSourceCLI)

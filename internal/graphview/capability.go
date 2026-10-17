@@ -33,6 +33,17 @@ const (
 	// the pass that writes it ranks every body against every other, so how
 	// much of the repository the producer saw decides what it emits.
 	CapSimilarity CapabilityID = "graph.similarity"
+	// CapSemantic reads the type checker's level of the graph: the go/types
+	// pass's re-pointed calls, implements edges, extra references, external
+	// symbols and node stamps. A working-tree edit may publish before it
+	// (enrichment after publication): its generation then records the
+	// producer incomplete with ReasonDeferredToFollowup, and the follow-up
+	// generation that enriches the same paths records it complete.
+	CapSemantic CapabilityID = "graph.semantic"
+	// CapContracts reads persisted contract ownership, matching and schema
+	// analysis for the selected view. Its producer can finish independently
+	// of source, syntax and local resolution publication.
+	CapContracts CapabilityID = "graph.contracts"
 	// CapSearchSymbols runs symbol search over the view.
 	CapSearchSymbols CapabilityID = "search.symbols"
 	// CapSearchContent runs content search over the view.
@@ -63,6 +74,8 @@ var knownCapabilities = []CapabilityID{
 	CapResolutionCrossRepo,
 	CapIncomingEdges,
 	CapSimilarity,
+	CapSemantic,
+	CapContracts,
 	CapSearchSymbols,
 	CapSearchContent,
 	CapSearchVector,

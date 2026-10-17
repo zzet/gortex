@@ -114,13 +114,20 @@ func MatchFile(path string, rules []Rule) []string {
 // .github/CODEOWNERS, CODEOWNERS, docs/CODEOWNERS — matching
 // GitHub's resolution.
 func LoadFromRepo(repoRoot string) (rules []Rule, sourcePath string, ok bool) {
+	return LoadFromRepoWith(repoRoot, os.ReadFile)
+}
+
+// LoadFromRepoWith is LoadFromRepo reading each candidate location through
+// readFile, which is handed the absolute path of every location tried, in
+// order, until one reads.
+func LoadFromRepoWith(repoRoot string, readFile func(string) ([]byte, error)) (rules []Rule, sourcePath string, ok bool) {
 	for _, rel := range []string{
 		".github/CODEOWNERS",
 		"CODEOWNERS",
 		"docs/CODEOWNERS",
 	} {
 		full := filepath.Join(repoRoot, rel)
-		data, err := os.ReadFile(full)
+		data, err := readFile(full)
 		if err != nil {
 			continue
 		}

@@ -12,6 +12,9 @@ const (
 	frameworkScopeRetainedRowCap  = 4096
 	frameworkScopeRetainedByteCap = 16 << 20
 	frameworkScopeTokenCap        = 2048
+	// frameworkSeedNameChunk is how many name dependencies the changed-file
+	// seed reads per batch before re-checking the row cap.
+	frameworkSeedNameChunk = 128
 )
 
 // frameworkExecutionScope is intentionally richer than the public legacy
@@ -94,6 +97,25 @@ type frameworkScopedSeed struct {
 
 	retainedRows  int
 	retainedBytes int
+
+	// declared is set on a pass's view of a declared seed
+	// (framework_seed_declarations.go): decl is the pass's declaration, and
+	// the view loads its declared parts from declared on first use. A legacy
+	// seed has none and is complete at construction.
+	declared      *frameworkDeclaredSeed
+	decl          frameworkSeedDeclaration
+	nodesReady    bool
+	incidentReady map[graph.EdgeKind]bool
+}
+
+// boundedRows is the seed's share of the retained-row cap: a legacy seed's
+// rows count against it, a declared view's do not (its parts are exactly
+// what its declaration names).
+func (s *frameworkScopedSeed) boundedRows() (rows, bytes int) {
+	if s == nil || s.declared != nil {
+		return 0, 0
+	}
+	return s.retainedRows, s.retainedBytes
 }
 
 type frameworkScopedOutputs struct {
@@ -254,6 +276,7 @@ func (v *frameworkScopedStore) ReindexEdges(batch []graph.EdgeReindex) {
 
 func (v *frameworkScopedStore) RemoveEdge(from, to string, kind graph.EdgeKind) bool {
 	removed := v.Store.RemoveEdge(from, to, kind)
+	v.seed.ensureIncident(kind)
 	if removed && v.seed != nil && v.seed.outputs != nil {
 		v.seed.outputs.removeMatching(from, to, kind, v.seed.incidentByKind[kind])
 	}
@@ -319,7 +342,15 @@ func (v *frameworkScopedStore) AllEdges() []*graph.Edge {
 }
 
 func (v *frameworkScopedStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
-	base := graph.NodesInScopeSeq(v.Store, v.scope.repoPrefixes, v.scope.filePaths, kind)
+	v.seed.ensureNodes()
+	var base iter.Seq[*graph.Node]
+	if len(v.scope.filePaths) > 0 {
+		// Same rows and order as the scoped projection, read by file (see
+		// frameworkFileFrontierNodes): the projection walks the generation.
+		base = frameworkFileFrontierNodes(v.Store, v.scope.repoPrefixes, v.scope.filePaths, kind)
+	} else {
+		base = graph.NodesInScopeSeq(v.Store, v.scope.repoPrefixes, v.scope.filePaths, kind)
+	}
 	return func(yield func(*graph.Node) bool) {
 		for node := range base {
 			v.lastNode = node
@@ -348,6 +379,7 @@ func (v *frameworkScopedStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.
 }
 
 func (v *frameworkScopedStore) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
+	v.seed.ensureIncident(kind)
 	base := graph.EdgesInScopeSeq(v.Store, v.scope.repoPrefixes, v.scope.filePaths, kind)
 	return func(yield func(*graph.Edge) bool) {
 		yielded := make(map[graph.EdgeIdentity]struct{})
@@ -640,12 +672,16 @@ func (v *frameworkScopedStore) rememberEdge(edge *graph.Edge) bool {
 	return true
 }
 
+// seedAtRowCap reports that no further row can be retained whatever its size:
+// canRetain refuses every row once the row count reaches the cap.
+func (v *frameworkScopedStore) seedAtRowCap() bool {
+	seedRows, _ := v.seed.boundedRows()
+	return v.retainedRows+seedRows >= frameworkScopeRetainedRowCap
+}
+
 func (v *frameworkScopedStore) canRetain(size int) bool {
-	rows, bytes := v.retainedRows, v.retainedBytes
-	if v.seed != nil {
-		rows += v.seed.retainedRows
-		bytes += v.seed.retainedBytes
-	}
+	seedRows, seedBytes := v.seed.boundedRows()
+	rows, bytes := v.retainedRows+seedRows, v.retainedBytes+seedBytes
 	return rows < frameworkScopeRetainedRowCap &&
 		bytes+size <= frameworkScopeRetainedByteCap
 }
@@ -724,6 +760,16 @@ func (v *frameworkScopedStore) seedChangedFileFrontier() {
 	outgoing := v.Store.GetOutEdgesByNodeIDs(ids)
 	v.rememberAdjacency(ids, incoming, true)
 	v.rememberAdjacency(ids, outgoing, false)
+	// Every row below is only ever offered to rememberNode, which retains
+	// nothing once the row cap is reached (canRetain). A frontier whose own
+	// rows and adjacency already fill the cap — a large changed file — gains
+	// nothing from reading its endpoints or its name dependencies, and the
+	// name read is the seed's dominant cost (every same-named node of the
+	// repository), so the seed stops here with exactly the retained set it
+	// would have ended with.
+	if v.seedAtRowCap() {
+		return
+	}
 	endpointIDs := make([]string, 0)
 	seenEndpoint := make(map[string]struct{})
 	for _, rows := range []map[string][]*graph.Edge{incoming, outgoing} {
@@ -752,6 +798,9 @@ func (v *frameworkScopedStore) seedChangedFileFrontier() {
 			addFrameworkNodeTokens(tokens, node)
 		}
 	}
+	if v.seedAtRowCap() {
+		return
+	}
 	names := make([]string, 0, len(tokens))
 	for token := range tokens {
 		names = append(names, token)
@@ -760,9 +809,23 @@ func (v *frameworkScopedStore) seedChangedFileFrontier() {
 	if len(names) > frameworkScopeTokenCap {
 		names = names[:frameworkScopeTokenCap]
 	}
-	if len(names) > 0 {
-		for _, matches := range v.Store.FindNodesByNames(names) {
-			for _, node := range matches {
+	// The name dependencies are read in sorted chunks and offered in name,
+	// then identity order, and the read stops once the row cap is reached:
+	// rememberNode retains nothing past it. A large changed file's tokens
+	// match every same-named node of the repository (thousands of rows per
+	// common name), so reading them all to retain the first few hundred is
+	// the seed's dominant cost; the chunked read is bounded by the cap
+	// instead, and the rows the cap keeps no longer depend on map order.
+	for start := 0; start < len(names); start += frameworkSeedNameChunk {
+		if v.seedAtRowCap() {
+			return
+		}
+		chunk := names[start:min(start+frameworkSeedNameChunk, len(names))]
+		matches := v.Store.FindNodesByNames(chunk)
+		for _, name := range chunk {
+			nodes := append([]*graph.Node(nil), matches[name]...)
+			sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+			for _, node := range nodes {
 				v.rememberNode(node)
 			}
 		}

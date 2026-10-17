@@ -29,7 +29,7 @@ A machine-wide §gortex§ MCP server indexes this code. You MUST prefer graph qu
 	}
 	return bt(`## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
-A Gortex daemon is configured machine-wide via the §gortex§ MCP server. Whenever you operate on indexed source (any repo the daemon tracks — check §gortex daemon status§), you MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
+A Gortex daemon is configured machine-wide via the §gortex§ MCP server. On indexed source (any repo it tracks — check §gortex daemon status§), you MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
 
 `)
 }
@@ -48,18 +48,18 @@ var sectionExploreOpener = bt(`For an explicitly named file to read/review/summa
 // can actually call; exact operation schemas remain on demand.
 var sectionCompactWorkflow = bt(`For every coding task:
 
-1. Named-file read/review/summarize: first new-task call §read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})§; do not localize. When the file, symbol, or evidence must be discovered, call §explore(operation:"localize")§ and obey §completion.required_action§; after §answer_ready§, answer from §completion.final_response§ and stop. For diagnosis or modification, call §explore(operation:"task")§.
-2. In a diagnosis/change flow, make at most one follow-up call on one unresolved symbol with §search§, §read§, §relations§, or §trace§, then continue to step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
-3. Before mutation, call §change(operation:"impact")§; for a signature change, also call §change(operation:"verify")§ with the proposed signature. Mutate only with §edit§ or §refactor§. After mutation, call §change(operation:"detect")§, then use its symbol IDs with §change(operation:"tests")§, §change(operation:"guards")§, and §change(operation:"contract")§.
-4. Call §capabilities§ only when you need the exact fields for an operation.
+1. Named-file read/review/summarize: first new-task call §read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})§; do not localize. To discover a file, symbol, or evidence, call §explore(operation:"localize")§ and obey §completion.required_action§; after §answer_ready§, answer from §completion.final_response§ and stop. For diagnosis or modification, call §explore(operation:"task")§.
+2. In a diagnosis/change flow, make at most one follow-up on one unresolved symbol with §search§, §read§, §relations§, or §trace§; then step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
+3. Before mutation, call §change(operation:"impact")§; for a signature change, also §change(operation:"verify")§ with the proposed signature. Mutate only with §edit§ or §refactor§. After mutation, call §change(operation:"detect")§, then its symbol IDs with §change(operation:"tests")§, §change(operation:"guards")§, and §change(operation:"contract")§.
+4. Call §capabilities§ only for an operation's exact fields.
 
 Common calls: §search(operation:"symbols", query:"<name>")§ · §read(target:{symbol:"<id>"})§ · §relations(operation:"usages", target:{symbol:"<id>"})§.
 
-If the Gortex server is configured but these tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or switch to a CLI/shell fallback.
+If the Gortex server is configured but these tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or fall back to a CLI/shell.
 
 `)
 
-var sectionCompactMemory = bt(`Use §recall§ before revisiting prior work. Call §remember§ immediately for a durable decision, invariant, constraint, or gotcha.
+var sectionCompactMemory = bt(`Use §recall§ before revisiting prior work; §remember§ immediately for a durable decision, invariant, constraint, or gotcha.
 
 `)
 
@@ -70,11 +70,26 @@ var sectionCompactMemory = bt(`Use §recall§ before revisiting prior work. Call
 // this constant rather than paraphrase it; routing is safety policy, and two
 // almost-equivalent copies eventually teach agents different destructive
 // actions.
-const WorktreeBranchRoutingPolicy = "- The session/CWD selects the view. An implicit or session-discovered checkout (including a linked worktree) is an automatic overlay; do not explicitly `track` it. Only an explicit user request to track creates a dedicated logical graph.\n" +
-	"- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate logical identity the overlay wins, and deletion/tombstone masks hide the base copy.\n" +
-	"- Freshness `exact:false` means the requested view was not served. Every fallback is read-only. Use `require_exact:true` to refuse substitution, `require_fresh:true` to await filesystem state, and absolute RFC3339 `wait_deadline` to bound it.\n" +
-	"- Select explicitly when CWD is not the target, for example `view:{kind:\"worktree\",checkout_id:\"…\"}` or `view:{kind:\"git_ref\",value:\"refs/heads/release\",graph_id:\"…\"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.\n" +
-	"- Explicitly untracking a non-primary dedicated worktree demotes it to automatic only when another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.\n"
+const WorktreeBranchRoutingPolicy = "- The session/CWD selects the view. A session-discovered checkout (a linked worktree included) is an automatic overlay; do not `track` it. Only an explicit user request to track creates a dedicated logical graph.\n" +
+	"- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate identity the overlay wins, and deletion/tombstone masks hide the base copy.\n" +
+	// The `require_fresh` clause is qualified because the wait only advances a
+	// routed automatic checkout: a shared corpus, a dedicated/primary checkout
+	// and a labelled base/ref/commit view all answer fresh:false with a
+	// fresh_reason rather than waiting (internal/mcp/checkout_binding.go's
+	// freshReasonCommittedBaseAdvance). "absolute" is dropped from the
+	// deadline clause because RFC3339 names an absolute timestamp by
+	// definition; the refusal message and the views guide both still say it in
+	// full.
+	//
+	// Paying for that qualification out of this bullet alone left the core
+	// body 3 bytes under its ceiling, which is a ceiling that cannot absorb
+	// the next correction. The elaboration around every section of the body
+	// was trimmed instead — never a rule, a tool name or a contract — so the
+	// ceilings in profiles_test.go keep real head-room and none of them is
+	// re-based upward.
+	"- Freshness `exact:false` = the requested view was not served. Every fallback is read-only. `require_exact:true` refuses substitution; `require_fresh:true` awaits filesystem state under RFC3339 `wait_deadline`, routed automatic checkouts only; else `fresh:false`.\n" +
+	"- Select explicitly when CWD is not the target: `view:{kind:\"worktree\",checkout_id:\"…\"}` or `view:{kind:\"git_ref\",value:\"refs/heads/release\",graph_id:\"…\"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.\n" +
+	"- Untracking a non-primary dedicated worktree demotes it to automatic only if another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.\n"
 
 // sectionWorktreeViews teaches agents the ownership boundary that keeps
 // ordinary linked-worktree use cheap. It is shared by every profile so a lean
@@ -135,7 +150,7 @@ func switchBullet(active string, lean bool) string {
 		return bt(fmt.Sprintf(`- **Profiles:** active §%s§. Broader guidance: §gortex instructions switch core§ (or §full§; §list§ shows all) — NEW sessions only.
 `, active))
 	}
-	return bt(fmt.Sprintf(`- **Instruction profiles** — this block is the active §%s§ profile. §gortex instructions list§ shows the others (§core§ balanced default · §localization§ lean · §full§ maximum guidance); switch with §gortex instructions switch <name>§ — applies to NEW sessions only (instructions, tools/list, and skills all load at session start).
+	return bt(fmt.Sprintf(`- **Instruction profiles** — this block is the active §%s§ profile. §gortex instructions list§ shows the others (§core§ balanced · §localization§ lean · §full§ maximum); switch with §gortex instructions switch <name>§ — applies to NEW sessions only (instructions, tools/list and skills all load at session start).
 `, active))
 }
 
@@ -144,12 +159,12 @@ func switchBullet(active string, lean bool) string {
 func sectionDiscovery(active, surfaceLine string) string {
 	return bt(`## Reference and discovery
 
-- **§gortex://guide§ resource** (or the §gortex guide [topic]§ CLI) is the full reference: LLM-provider matrix, capabilities catalog, analyze / search_ast catalogs, token-economy detail, MCP resources, session-start checklist. Read it on demand — it is not pre-paid here.
-- `) + surfaceLine + bt(`- MCP startup manages daemon availability. If the configured server or its tools are unavailable, report a Gortex MCP integration failure; do not start a daemon manually. "cwd is not covered by any tracked repo" means graph tools are unavailable there.
+- **§gortex://guide§ resource** (or the §gortex guide [topic]§ CLI) is the full reference: LLM providers, capabilities, analyze / search_ast catalogs, token economy, MCP resources, session-start checklist. Read it on demand.
+- `) + surfaceLine + bt(`- MCP startup manages daemon availability; if the server or its tools are unavailable, report a Gortex MCP integration failure and do not start a daemon manually. "cwd is not covered by any tracked repo" means graph tools are unavailable there.
 `) + switchBullet(active, false)
 }
 
-var compactSurfaceLine = bt(`**§capabilities§** — request an exact operation schema only when the compact tool description is insufficient; ordinary coding requires no tool discovery or promotion.
+var compactSurfaceLine = bt(`**§capabilities§** — request an exact operation schema only when the compact tool description is insufficient; ordinary coding needs no tool discovery.
 `)
 
 var fullSurfaceLine = bt(`**§tools_search§** — under this profile the server publishes the full documented dev-cycle preset (~34 workhorse tools) eagerly; the long tail still loads by keyword via §tools_search§ (every tool stays callable by name).

@@ -651,6 +651,13 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 			ctx = withLocalizationPermittedEvidenceCapture(ctx, reservation)
 		}
 	}
+	// A finite localization allowance or task boundary is session control, not
+	// replayable answer assembly. It is finalized before the outer exact gate.
+	if transactionalBoundaryFlow || localizationReadReservation != 0 {
+		if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
+			state.replayUnsafe = true
+		}
+	}
 	result, err := s.invokeFacadeSpec(ctx, req, spec)
 	succeeded := err == nil && result != nil && !result.IsError
 	if localizationReadReservation != 0 {
@@ -1151,10 +1158,16 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		// name, so a facade call and a direct legacy call land in the same
 		// per-tool bucket. Runs before decoration: the baseline is what the
 		// handler actually retrieved, not the riders bolted on afterwards.
-		s.recordRetrievalSavings(ctx, spec.Legacy, result)
+		raw := result
+		afterFreshSymbolAcceptance(ctx, func() { s.recordRetrievalSavings(ctx, spec.Legacy, raw) })
 		result = s.decorateFacadeFreshness(spec.Legacy, forwarded, result)
 	}
 	result = decorateFacadeResultIdentity(result, spec)
+	if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
+		state.decorate = func(raw *mcpgo.CallToolResult) *mcpgo.CallToolResult {
+			return decorateFacadeResultIdentity(s.decorateFacadeFreshness(spec.Legacy, forwarded, raw), spec)
+		}
+	}
 	return result, err
 }
 
@@ -2670,9 +2683,10 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 				}
 			}
 			required := legacy.tool.InputSchema.Required
+			sessionSubscription := spec.Facade == "session" && (spec.Operation == "subscribe" || spec.Operation == "unsubscribe")
 			if spec.Facade == "analyze" || (spec.Facade == "workspace_admin" && spec.Legacy == "analyze") {
 				inputSchema, properties, required = analyzeFacadeCapabilitySchema(spec, properties, required)
-			} else if spec.Facade == "session" && (spec.Operation == "subscribe" || spec.Operation == "unsubscribe") {
+			} else if sessionSubscription {
 				inputSchema = map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -2685,7 +2699,7 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 				required = []string{"channel"}
 			}
 			requestShape := facadeRequestShape(spec, properties, required)
-			if spec.Facade != "analyze" && spec.Facade != "session" && (spec.Facade != "workspace_admin" || spec.Legacy != "analyze") {
+			if spec.Facade != "analyze" && !sessionSubscription && (spec.Facade != "workspace_admin" || spec.Legacy != "analyze") {
 				inputSchema = facadePublicCapabilitySchema(spec, properties, required, requestShape)
 			}
 			schema, ok := inputSchema.(map[string]any)

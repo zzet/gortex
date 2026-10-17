@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -67,6 +68,27 @@ type Provider struct {
 	// before detached graph apply. Small repos and file-bounded incremental loads do
 	// not take this gate and may use the remaining heavyGate lane.
 	largeGate chan struct{}
+	// committed is the committed-tree passes holding compiler admission, and
+	// interactive counts the loads waiting for it that may overtake them
+	// (see acquireHeavy).
+	committed committedHolders
+
+	// scopeMu guards scopeCache: per module directory, the dependency
+	// metadata index and line-directive set that handle-rooted checkout loads
+	// reuse between passes (see checkoutScopeCache).
+	scopeMu    sync.Mutex
+	scopeCache map[string]*checkoutScopeCache
+
+	// tcMu guards tcStates: per checkout directory, the retained dependency
+	// closure and type-check state of handle-rooted checkout passes (see
+	// checkoutTypecheckState). Each state has its own lock.
+	tcMu     sync.Mutex
+	tcStates map[string]*checkoutTypecheckState
+
+	// warm runs the background whole-module listings that warm checkouts'
+	// retained closures, and preempts them for compiler loads (see
+	// typecheck_warmup.go).
+	warm warmupRegistry
 }
 
 type bindingLookupKey struct {
@@ -150,6 +172,7 @@ func (p *Provider) Languages() []string { return []string{"go"} }
 // Close drops the compact in-memory binding index. Full compiler programs are
 // local to an enrichment call and therefore require no provider-level cleanup.
 func (p *Provider) Close() error {
+	p.stopWarmups()
 	p.stateMu.Lock()
 	p.bindingTypes = nil
 	p.bindingOwners = nil
@@ -202,17 +225,166 @@ func (p *Provider) ReleaseRepoState(repoRoot string) bool {
 	return removed
 }
 
+// committedHolders is the compiler admission's view of committed-tree passes.
+type committedHolders struct {
+	// interactive counts the loads that are waiting for admission and may
+	// preempt a committed pass: every load that is not one.
+	interactive atomic.Int64
+	mu          sync.Mutex
+	seq         uint64
+	preempts    map[uint64]func()
+}
+
+func (c *committedHolders) register(preempt func()) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.preempts == nil {
+		c.preempts = map[uint64]func(){}
+	}
+	c.seq++
+	c.preempts[c.seq] = preempt
+	return c.seq
+}
+
+func (c *committedHolders) unregister(id uint64) {
+	c.mu.Lock()
+	delete(c.preempts, id)
+	c.mu.Unlock()
+}
+
+// preemptAll ends every committed pass holding admission. Each pass releases
+// its admission on its way out.
+func (c *committedHolders) preemptAll() int {
+	c.mu.Lock()
+	preempts := make([]func(), 0, len(c.preempts))
+	for _, preempt := range c.preempts {
+		preempts = append(preempts, preempt)
+	}
+	c.mu.Unlock()
+	for _, preempt := range preempts {
+		preempt()
+	}
+	return len(preempts)
+}
+
+// committedPreempt returns the preemption of a committed-tree pass, nil for
+// every other load.
+func committedPreempt(ctx context.Context) func() {
+	scope, ok := semantic.CheckoutCompilerScopeFrom(ctx)
+	if !ok || !scope.Committed || scope.Preempt == nil {
+		return nil
+	}
+	return scope.Preempt
+}
+
+// committedOverlay is the overlay a committed-tree pass reads its tree
+// through; nil for every other load, which reads the working copy.
+func committedOverlay(ctx context.Context) map[string][]byte {
+	scope, ok := semantic.CheckoutCompilerScopeFrom(ctx)
+	if !ok || !scope.Committed || len(scope.Overlay) == 0 {
+		return nil
+	}
+	return scope.Overlay
+}
+
+// committedEnv is the environment of a committed-tree pass's go command, nil
+// (the process's) for every other load.
+func committedEnv(ctx context.Context) []string {
+	scope, ok := semantic.CheckoutCompilerScopeFrom(ctx)
+	if !ok || !scope.Committed || !scope.GoWorkOff {
+		return nil
+	}
+	return append(os.Environ(), "GOWORK=off")
+}
+
+// ReadsCommittedTree reports that the provider reads a committed tree through
+// a committed pass's overlay (semantic.CommittedTreeReader): every load of the
+// pass hands the overlay to the go command.
+func (p *Provider) ReadsCommittedTree() bool { return true }
+
+// acquireHeavy admits one compiler program.
+//
+// A committed tree's pass (a dedicated base, its advance, a commit layer)
+// yields to every other load: it gives an admission back while another load
+// waits, and a load that finds the admission taken ends the committed passes
+// holding it before it waits. A committed pass that is preempted publishes its generation without
+// the type checker's facts and says so; an edit never waits minutes behind it.
 func (p *Provider) acquireHeavy(ctx context.Context, large bool) (func(), error) {
+	preempt := committedPreempt(ctx)
+	if preempt == nil {
+		p.committed.interactive.Add(1)
+		defer p.committed.interactive.Add(-1)
+		if release, ok := p.tryAcquireHeavy(large); ok {
+			return release, nil
+		}
+		if n := p.committed.preemptAll(); n > 0 && p.logger != nil {
+			p.logger.Info("go-types: a load overtook committed-tree passes",
+				zap.Int("preempted", n), zap.Bool("large", large))
+		}
+		return p.acquireHeavyBlocking(ctx, large)
+	}
+	for {
+		release, err := p.acquireHeavyBlocking(ctx, large)
+		if err != nil {
+			return nil, err
+		}
+		id := p.committed.register(preempt)
+		// A load that is waiting now found nothing to preempt when it began
+		// (this pass was queued, not registered): give the admission back
+		// and queue again behind it. Waiters are admitted in arrival order,
+		// so a pass that arrives while a load waits is admitted after it.
+		if p.committed.interactive.Load() > 0 {
+			p.committed.unregister(id)
+			release()
+			continue
+		}
+		return func() {
+			p.committed.unregister(id)
+			release()
+		}, nil
+	}
+}
+
+// tryAcquireHeavy takes the admission only when it is free now.
+func (p *Provider) tryAcquireHeavy(large bool) (func(), bool) {
+	gate, largeGate := p.admissionGates()
+	if large {
+		select {
+		case largeGate <- struct{}{}:
+		default:
+			return nil, false
+		}
+	}
+	select {
+	case gate <- struct{}{}:
+		return func() {
+			<-gate
+			if large {
+				<-largeGate
+			}
+		}, true
+	default:
+		if large {
+			<-largeGate
+		}
+		return nil, false
+	}
+}
+
+func (p *Provider) admissionGates() (chan struct{}, chan struct{}) {
 	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
 	if p.heavyGate == nil {
 		p.heavyGate = make(chan struct{}, defaultGoTypesConcurrency)
 	}
 	if p.largeGate == nil {
 		p.largeGate = make(chan struct{}, 1)
 	}
-	gate := p.heavyGate
-	largeGate := p.largeGate
-	p.stateMu.Unlock()
+	return p.heavyGate, p.largeGate
+}
+
+func (p *Provider) acquireHeavyBlocking(ctx context.Context, large bool) (func(), error) {
+	gate, largeGate := p.admissionGates()
 
 	largeHeld := false
 	if large {
@@ -475,14 +647,75 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			}, nil
 		}
 	}
+	// A checkout pass enriches a generation handle whose facts are keyed to
+	// the files it carries. Its Go projection is read once, here, before the
+	// admission decision, and reused as the apply-side projection below. With
+	// the handle-rooted load requested, the roots are the packages of those
+	// files; every decision to load the whole module instead is taken now,
+	// before anything is loaded or written.
+	checkoutScope, checkoutPass := semantic.CheckoutCompilerScopeFrom(ctx)
+	if checkoutScope.Committed {
+		// A handle-rooted load keeps per-checkout state keyed by the working
+		// copy's manifests and line directives, which a committed tree does
+		// not share: a committed pass loads the whole module.
+		checkoutScope.HandleRoots = false
+	}
+	compiler := &semantic.CompilerLoadStats{Scope: semantic.CompilerScopeFull}
+	var (
+		handleFiles    map[string]struct{}
+		handleFileList []string
+		earlyNodes     []*graph.Node
+		roots          handleRootPlan
+		manifestDigest string
+	)
+	if checkoutPass {
+		if err := lockResolveContext(ctx, g.ResolveMutex()); err != nil {
+			return nil, err
+		}
+		earlyNodes = detachGoNodeProjection(repoGoNodes(g, repoPrefix))
+		g.ResolveMutex().Unlock()
+		handleFiles = handleGoFiles(earlyNodes)
+		handleFileList = make([]string, 0, len(handleFiles))
+		for file := range handleFiles {
+			handleFileList = append(handleFileList, file)
+		}
+		sort.Strings(handleFileList)
+		if checkoutScope.HandleRoots {
+			roots = planHandleRoots(absRoot, loadDir, repoPrefix, handleFiles, checkoutScope)
+			compiler.ScopeReason = roots.reason
+		} else {
+			compiler.ScopeReason = semantic.CompilerScopeReasonDisabled
+		}
+	}
+	useHandleRoots := checkoutPass && checkoutScope.HandleRoots && !roots.full
+	if useHandleRoots {
+		compiler.Scope = semantic.CompilerScopeHandleRoots
+		manifestDigest = goManifestDigest(loadDir)
+		// A package outside the handle's packages whose source carries a
+		// hand-written line directive may attribute positions to a handle
+		// file; the whole-module load scans it, so it joins the roots.
+		for _, dir := range p.lineDirectiveDirs(loadDir, manifestDigest, roots.handleAbs) {
+			before := len(roots.rootDirs)
+			roots.addDir(loadDir, dir)
+			if len(roots.rootDirs) != before {
+				compiler.ScopeReason = semantic.CompilerScopeReasonLineDirective
+			}
+		}
+		sort.Strings(roots.patterns)
+		if roots.empty() {
+			return p.finishEmptyCheckoutScope(g, absRoot, repoPrefix, handleFileList, compiler, start)
+		}
+	}
+
 	// Metadata-only dependency index for the externals classification, loaded
 	// OFF the heavy gate (it is a `go list` walk, not a typecheck). Only the
 	// export-data mode needs it — the closure mode's Imports walk already
 	// carries every dep. A failed index falls back to nil: resolveSymbol then
 	// skips classification per object (counted as missingPkgInfo) instead of
-	// mislabeling anything.
+	// mislabeling anything. A handle-rooted load obtains its index after the
+	// load instead (scopedDepIndex), from the paths the roots actually use.
 	var depIndex map[string]*packages.Package
-	if !goTypesNeedDepsClosure() {
+	if !goTypesNeedDepsClosure() && !useHandleRoots {
 		depIndexStart := time.Now()
 		var depErr error
 		depIndex, depErr = p.loadDepModuleIndex(ctx, loadDir)
@@ -497,10 +730,13 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				zap.Int("packages", len(depIndex)),
 				zap.Duration("elapsed", time.Since(depIndexStart)))
 		}
+		compiler.IndexMs = time.Since(depIndexStart).Milliseconds()
 	}
 
 	gateWaitStart := time.Now()
-	largeAdmission := largeGoTypesAdmission(ctx, true)
+	// A handle-rooted load is bounded by the edit's packages, not the
+	// repository, so it is not "large" and shares the heavy gate.
+	largeAdmission := largeGoTypesAdmission(ctx, !useHandleRoots)
 	releaseAdmission, err := p.acquireHeavy(ctx, largeAdmission)
 	if err != nil {
 		return nil, err
@@ -516,6 +752,13 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		loadAttempted              bool
 		compilerProjectionComplete bool
 		projectedUseCount          int
+		usePackagesScanned         int
+		usePackagesSkipped         int
+		useIdentsScanned           int
+		useIdentsSkipped           int
+		// releaseCheckoutState unlocks the checkout's retained compiler
+		// state a cached handle-rooted load read from; nil otherwise.
+		releaseCheckoutState func()
 	)
 	var compilerHeapBaseline runtime.MemStats
 	if largeAdmission {
@@ -563,6 +806,10 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			repoNodes = nil
 			nodesByFile = nil
 			funcIndexByFile = nil
+			if releaseCheckoutState != nil {
+				releaseCheckoutState()
+				releaseCheckoutState = nil
+			}
 		}, forceGC, collectCompiler, func() {
 			if forceGC {
 				runtime.ReadMemStats(&heapAfterRelease)
@@ -575,6 +822,10 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				zap.Bool("projection_complete", compilerProjectionComplete),
 				zap.Bool("forced_gc", forceGC),
 				zap.Int("projected_uses", projectedUseCount),
+				zap.Int("use_packages_scanned", usePackagesScanned),
+				zap.Int("use_packages_skipped", usePackagesSkipped),
+				zap.Int("use_idents_scanned", useIdentsScanned),
+				zap.Int("use_idents_skipped", useIdentsSkipped),
 				zap.Uint64("heap_alloc_before_load", compilerHeapBaseline.HeapAlloc),
 				zap.Uint64("heap_alloc_before_release", heapBeforeRelease.HeapAlloc),
 				zap.Uint64("heap_growth", heapGrowth),
@@ -595,41 +846,190 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// The load is minutes-long on a big module; bracket it so the log never
 	// goes silent between the manager's "starting" line and the result.
 	loadStart := time.Now()
+	loadUsage := readProcessUsage()
+	patterns := []string{"./..."}
+	var parseFile func(*token.FileSet, string, []byte) (*ast.File, error)
+	if useHandleRoots {
+		patterns = roots.patterns
+		if checkoutScope.StripSiblingBodies {
+			parseFile = stripSiblingBodiesParser(roots.handleAbs)
+		}
+	}
 	if p.logger != nil {
 		p.logger.Info("go-types: package load starting",
 			zap.String("repo_prefix", repoPrefix),
 			zap.Bool("large_exclusive", largeAdmission),
 			zap.String("root", absRoot),
-			zap.String("module_dir", loadDir))
+			zap.String("module_dir", loadDir),
+			zap.String("scope", compiler.Scope),
+			zap.String("scope_reason", compiler.ScopeReason),
+			zap.Int("root_patterns", len(patterns)))
 	}
 	// absRoot stays the relativization base for every graph path below; only
 	// the directory go/packages runs in follows the module.
 	loadAttempted = true
-	pkgs, fset, err = p.loadPackagesContext(ctx, loadDir, "./...")
+	var (
+		program compilerProgram
+		closure map[string]*packages.Package
+	)
+	if useHandleRoots && checkoutScope.TypecheckCache {
+		// The checkout's retained closure and dependency types. The state
+		// stays locked until the compiler program is released (every exit
+		// path goes through releaseCompiler).
+		cacheStats := &semantic.CompilerCacheStats{}
+		compiler.Cache = cacheStats
+		var cached cachedProgram
+		cached, err = p.loadCheckoutProgramCached(ctx, loadDir, manifestDigest, roots, checkoutScope, cacheStats)
+		releaseCheckoutState = cached.release
+		if err == nil && cached.bypass != "" {
+			releaseCheckoutState()
+			releaseCheckoutState = nil
+			program, err = p.loadCompilerProgram(ctx, loadDir, parseFile, patterns...)
+		} else if err == nil {
+			program, closure = cached.program, cached.closure
+		}
+	} else {
+		program, err = p.loadCompilerProgram(ctx, loadDir, parseFile, patterns...)
+	}
+	compiler.Loads++
+	if useHandleRoots && ctx.Err() == nil {
+		var missing []string
+		if err == nil {
+			missing = missingRootDirs(roots.rootDirs, program.raw)
+		}
+		if err != nil || len(missing) > 0 {
+			// One whole-module retry, before anything is written. Never after
+			// cancellation: a canceled pass returns its context error below.
+			if p.logger != nil {
+				p.logger.Warn("go-types: handle-rooted load incomplete; retrying the whole module",
+					zap.String("repo_prefix", repoPrefix),
+					zap.Strings("missing_roots", missing),
+					zap.Error(err))
+			}
+			clearGoPackageCompilerRoots(program.raw)
+			program = compilerProgram{}
+			closure = nil
+			if releaseCheckoutState != nil {
+				releaseCheckoutState()
+				releaseCheckoutState = nil
+			}
+			useHandleRoots = false
+			compiler.Scope = semantic.CompilerScopeFull
+			compiler.ScopeReason = semantic.CompilerScopeReasonScopedThenFull
+			program, err = p.loadCompilerProgram(ctx, loadDir, nil, "./...")
+			compiler.Loads++
+			if err == nil && !goTypesNeedDepsClosure() {
+				depIndexStart := time.Now()
+				var depErr error
+				depIndex, depErr = p.loadDepModuleIndex(ctx, loadDir)
+				if depErr != nil && p.logger != nil {
+					p.logger.Warn("go-types: dependency metadata index failed; external classification degraded for this pass",
+						zap.String("repo_prefix", repoPrefix),
+						zap.Error(depErr))
+				}
+				compiler.IndexMs += time.Since(depIndexStart).Milliseconds()
+			}
+		}
+	}
+	compiler.LoadMs = time.Since(loadStart).Milliseconds()
 	if err != nil {
 		return nil, fmt.Errorf("load packages: %w", err)
 	}
+	pkgs, fset = program.pkgs, program.fset
+	program.raw = nil
+	compiler.Packages, compiler.Files = program.packages, program.files
+	if useHandleRoots && !goTypesNeedDepsClosure() {
+		var (
+			indexElapsed time.Duration
+			depErr       error
+		)
+		depIndex, compiler.IndexCached, indexElapsed, depErr = p.scopedDepIndex(ctx, loadDir, manifestDigest, pkgs, closure)
+		compiler.IndexMs += indexElapsed.Milliseconds()
+		if depErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if p.logger != nil {
+				p.logger.Warn("go-types: dependency metadata index failed; external classification degraded for this pass",
+					zap.String("repo_prefix", repoPrefix),
+					zap.Error(depErr))
+			}
+		}
+	}
+	loadErrs := classifyLoadErrors(pkgs)
 	if p.logger != nil {
-		p.logger.Info("go-types: package load done",
+		fields := []zap.Field{
 			zap.String("repo_prefix", repoPrefix),
 			zap.Int("packages", len(pkgs)),
-			zap.Duration("elapsed", time.Since(loadStart)))
+			zap.Int("compiled_files", compiler.Files),
+			zap.Int("loads", compiler.Loads),
+			zap.String("scope", compiler.Scope),
+			zap.String("scope_reason", compiler.ScopeReason),
+			zap.Bool("index_cached", compiler.IndexCached),
+			zap.Int64("index_ms", compiler.IndexMs),
+			zap.Int("soft_type_errors", loadErrs.soft),
+			zap.Duration("elapsed", time.Since(loadStart)),
+		}
+		if c := compiler.Cache; c != nil {
+			// The checkout's retained compiler state: whether this load
+			// listed the closure (and why) or served it from memory.
+			fields = append(fields,
+				zap.Int("closure_hits", c.ClosureHits),
+				zap.Int("closure_misses", c.ClosureMisses),
+				zap.String("miss_reason", c.MissReason),
+				zap.String("miss_package", c.MissPackage),
+				zap.String("bypass", c.Bypass),
+				zap.Int64("go_list_ms", c.GoListMs),
+				zap.Int64("validate_ms", c.ValidateMs),
+				zap.Int64("parse_ms", c.ParseMs),
+				zap.Int64("check_ms", c.CheckMs),
+				zap.Int("files_parsed", c.FilesParsed),
+				zap.Int("files_reused", c.FilesReused),
+				zap.Int("export_reads", c.ExportReads),
+				zap.Int("changed_dependencies", c.ChangedDependencies),
+				zap.Int("source_dependencies", c.SourceDependencies),
+				zap.Int("source_dependency_files", c.SourceDependencyFiles),
+				zap.Int64("source_dependency_parse_ms", c.SourceDependencyParseMs),
+				zap.String("source_dependency_fallback", c.SourceDependencyFallback),
+				zap.Int("retained_kept", c.RetainedKept),
+				zap.Bool("warm_served", c.WarmServed),
+				zap.Int("working_set_packages", c.WorkingSetPackages),
+				zap.Int("state_packages", c.StatePackages),
+				zap.Int64("state_bytes", c.StateBytes),
+				zap.Bool("state_evicted", c.StateEvicted),
+				zap.Int("evicted_packages", c.EvictedPackages),
+				zap.Int("evicted_files", c.EvictedFiles),
+				zap.Int("relist_scheduled", c.RelistScheduled),
+				zap.Int64("targeted_wait_ms", c.TargetedWaitMs),
+				zap.String("targeted_wait", c.TargetedWait),
+				zap.String("warmup_state", c.WarmupState))
+		}
+		used := readProcessUsage().since(loadUsage)
+		fields = append(fields, zap.Int64("major_faults", used.majorFaults), zap.Int64("minor_faults", used.minorFaults),
+			zap.Float64("cpu_ms", float64(used.cpu.Microseconds())/1000))
+		p.logger.Info("go-types: package load done", fields...)
 	}
 	// A pass that loads zero (or only broken) packages completes "cleanly"
 	// with zero yield, which is indistinguishable in the result log from a
 	// healthy no-op — surface it so a real repo silently enriching nothing
-	// reads as the load failure it is.
+	// reads as the load failure it is. Soft type errors (an import or a
+	// variable declared and not used) do not degrade a load: stripping
+	// sibling bodies produces them by design, and they change no type.
 	if p.logger != nil {
-		loadErrors := 0
-		for _, pkg := range pkgs {
-			loadErrors += len(pkg.Errors)
-		}
-		if len(pkgs) == 0 || loadErrors > 0 {
+		if len(pkgs) == 0 || loadErrs.hard > 0 {
 			p.logger.Warn("go-types: package load degraded",
 				zap.String("repo_prefix", repoPrefix),
 				zap.String("root", absRoot),
 				zap.Int("packages", len(pkgs)),
-				zap.Int("load_errors", loadErrors))
+				zap.Int("load_errors", loadErrs.hard),
+				zap.Int("soft_type_errors", loadErrs.soft),
+				zap.Any("load_error_kinds", loadErrs.kinds),
+				zap.Strings("load_error_sample", loadErrs.sample))
+		} else if loadErrs.soft > 0 {
+			p.logger.Debug("go-types: package load soft type errors",
+				zap.String("repo_prefix", repoPrefix),
+				zap.Int("soft_type_errors", loadErrs.soft),
+				zap.Strings("load_error_sample", loadErrs.sample))
 		}
 	}
 
@@ -637,6 +1037,12 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// replaces the repo atomically; the provider mirrors it in a small indexed
 	// map for the in-memory backend and compatibility lookup path.
 	bindings := buildSemanticBindingTypes(pkgs, fset, absRoot, repoPrefix)
+	if checkoutPass {
+		// A generation handle's binding rows describe the files it carries.
+		// Every other file's rows compose from the layers beneath, keyed by
+		// file; writing them here too would duplicate them in the view.
+		bindings = filterBindingsToFiles(bindings, handleFiles)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -666,6 +1072,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	result := &semantic.EnrichResult{
 		Provider: p.Name(),
 		Language: "go",
+		Compiler: compiler,
 	}
 
 	// Keep compiler/heavy admission for the complete lifetime of pkgs, but hold
@@ -681,6 +1088,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// aggregate hold time, longest hold, and slice count. refs_walk INCLUDES
 	// its inner write times (add_batch / reindex / confirm).
 	applyStarted := time.Now()
+	applyUsage, applyStore := readProcessUsage(), storeIOMarkOf(g)
 	var applyProjectionDur, applyDefsDur, applyRefsDur time.Duration
 	var applyAddBatchDur, applyReindexDur, applyConfirmDur time.Duration
 	var applyImplementsDur, applyStampsDur time.Duration
@@ -690,7 +1098,11 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// shallow detached so the CPU-only matching walks never retain or observe
 	// mutable backend-owned node objects after the lock slice ends.
 	projectionStart := time.Now()
-	if err := resolveSlices.with(ctx, func() error {
+	if checkoutPass {
+		// Read once before admission; the handle is this pass's own
+		// generation, so nothing else writes it in between.
+		repoNodes = earlyNodes
+	} else if err := resolveSlices.with(ctx, func() error {
 		repoNodes = detachGoNodeProjection(repoGoNodes(g, repoPrefix))
 		return nil
 	}); err != nil {
@@ -719,6 +1131,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 
 	// Phase 1: Map definitions.
 	defsStart := time.Now()
+	passPaths := newGraphPaths(absRoot, repoPrefix)
 	for _, pkg := range pkgs {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -727,20 +1140,26 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			continue
 		}
 
-		definitionContexts := buildGoDefinitionContexts(pkg.Syntax)
+		// Only a file the projection holds nodes for can map a definition;
+		// a checkout pass's root package parses hundreds of sibling files
+		// for their declarations alone, and their syntax contexts and
+		// definitions were walked for nothing.
+		definitionContexts := buildGoDefinitionContexts(graphVisibleSyntax(pkg.Syntax, fset, absRoot, repoPrefix, nodesByFile))
 		for ident, obj := range pkg.TypesInfo.Defs {
 			if obj == nil || ident.Pos() == token.NoPos {
 				continue
 			}
 
 			pos := fset.Position(ident.Pos())
-			relPath := relativePath(pos.Filename, absRoot)
-			if relPath == "" {
+			graphPath := passPaths.of(pos.Filename)
+			if graphPath == "" {
 				continue
 			}
-			graphPath := scopedGraphPath(repoPrefix, relPath)
 
 			fileNodes := nodesByFile[graphPath]
+			if len(fileNodes) == 0 {
+				continue
+			}
 			node := matchRepoDefinitionNode(fileNodes, pos, ident.Name, obj, definitionContexts[ident])
 			if node != nil {
 				objToNode[obj] = node.ID
@@ -786,9 +1205,27 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	missingPairs := missingImplementationPairs(objToNode, nodesByID)
 	implementsPlanDur := time.Since(implementsPlanStart)
 
+	// A checkout pass's handle carries only the files its generation
+	// re-derived. A use in one of them that binds to a declaration in an
+	// unchanged file of the module finds no node on the handle; map it onto
+	// the node the layer below serves there. This runs after the implements
+	// plan on purpose: those declarations only receive the handle's uses,
+	// they are not re-derived here.
+	// The reader is the layer below, not the handle, so no handle lock slice
+	// is taken for it; coverage stays the handle's own.
+	if checkoutPass && checkoutScope.Declarations != nil {
+		mapCheckoutContextDeclarations(pkgs, fset, passPaths, handleFiles, objToNode, checkoutScope.Declarations)
+	}
+
 	refsStart := time.Now()
 	externals = newExternalsAttribution(g, pkgs, p.Name(), repoPrefix, depIndex)
-	externalNodeIDs := externals.existingNodeIDs(pkgs, objToNode)
+	// Prefetch only the externals a projected use can name: resolveGoUse
+	// drops a use outside a function of a file the projection indexes
+	// before it asks the externals attribution for anything.
+	externalNodeIDs := externals.existingNodeIDs(pkgs, objToNode, func(ident *ast.Ident) bool {
+		graphPath := passPaths.of(fset.Position(ident.Pos()).Filename)
+		return graphPath != "" && funcIndexByFile[graphPath] != nil
+	})
 	if err := resolveSlices.with(ctx, func() error {
 		externals.prefetchExistingNodeIDs(externalNodeIDs)
 		return nil
@@ -801,7 +1238,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// external string identities only. Clearing each packages.Package afterwards
 	// breaks AST/types/import closures while preserving Name/PkgPath/Module for
 	// the externals metadata map.
-	usePlan, err := projectGoUsesAndReleaseCompilerState(
+	usePlan, useStats, err := projectGoUsesAndReleaseCompilerStateWithStats(
 		ctx, pkgs, fset, absRoot, repoPrefix, funcIndexByFile, objToNode, externals,
 	)
 	if err != nil {
@@ -809,6 +1246,10 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	}
 	defer usePlan.release()
 	projectedUseCount = usePlan.len()
+	usePackagesScanned = useStats.packagesScanned
+	usePackagesSkipped = useStats.packagesSkipped
+	useIdentsScanned = useStats.identsScanned
+	useIdentsSkipped = useStats.identsSkipped
 	compilerProjectionComplete = true
 	externalNodeIDs = nil
 
@@ -837,7 +1278,11 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		return nil, err
 	}
 	if !persistentBindings {
-		p.replaceBindingIndex(absRoot, nil, bindings)
+		if checkoutPass {
+			p.replaceBindingIndex(absRoot, handleFileList, bindings)
+		} else {
+			p.replaceBindingIndex(absRoot, nil, bindings)
+		}
 	}
 
 	// Projection may discover every external symbol before the first Use page.
@@ -927,7 +1372,23 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			}
 
 			if err := resolveSlices.with(ctx, func() error {
+				lookupStarted := time.Now()
 				candidates := graph.LookupEdgeCandidates(g, endpoints, sites)
+				lookupElapsed := time.Since(lookupStarted)
+				// Slow-page records expose candidate reads that were previously
+				// included only in refs_walk and mutex_held. They deliberately
+				// exclude lock wait and do not claim to measure all lookup time.
+				if p.logger != nil && lookupElapsed >= time.Second {
+					p.logger.Info("go-types: slow candidate lookup",
+						zap.String("repo_prefix", repoPrefix),
+						zap.String("backend", fmt.Sprintf("%T", g)),
+						zap.Int("package_index", pkgIndex),
+						zap.Int("use_offset", chunkStart),
+						zap.Int("uses", len(chunk)),
+						zap.Int("endpoint_requests", len(endpoints)),
+						zap.Int("site_requests", len(sites)),
+						zap.Duration("elapsed", lookupElapsed))
+				}
 				externals.edgeCandidates = &candidates
 				defer func() { externals.edgeCandidates = nil }()
 
@@ -1058,8 +1519,13 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 
 	result.LockWaitMs = resolveSlices.waited.Milliseconds()
 	if p.logger != nil {
+		used := readProcessUsage().since(applyUsage)
+		storeIO := storeIOSince(g, applyStore)
 		p.logger.Info("go-types: apply subphases",
 			zap.String("repo_prefix", repoPrefix),
+			zap.Int64("major_faults", used.majorFaults), zap.Int64("minor_faults", used.minorFaults),
+			zap.Float64("cpu_ms", float64(used.cpu.Microseconds())/1000),
+			zap.Any("store_io", storeIO),
 			zap.Duration("gate_parked", applyGateParked),
 			zap.Duration("apply_wall", time.Since(applyStarted)),
 			zap.Duration("mutex_waited", resolveSlices.waited),
@@ -1567,8 +2033,10 @@ func (p *Provider) loadDepModuleIndex(ctx context.Context, dir string) (map[stri
 			packages.NeedImports |
 			packages.NeedDeps |
 			packages.NeedModule,
-		Dir:   dir,
-		Tests: p.includeTest,
+		Dir:     dir,
+		Tests:   p.includeTest,
+		Overlay: committedOverlay(ctx),
+		Env:     committedEnv(ctx),
 	}
 	load := p.packagesLoad
 	if load == nil {
@@ -1612,6 +2080,35 @@ func goTypesNeedDepsClosure() bool {
 }
 
 func (p *Provider) loadPackagesContext(ctx context.Context, dir string, patterns ...string) ([]*packages.Package, *token.FileSet, error) {
+	program, err := p.loadCompilerProgram(ctx, dir, nil, patterns...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return program.pkgs, program.fset, nil
+}
+
+// compilerProgram is one type-checking load: the packages the pass uses
+// (those with type information), every package the load returned, and the
+// load's compiler-context size.
+type compilerProgram struct {
+	pkgs []*packages.Package
+	raw  []*packages.Package
+	fset *token.FileSet
+	// packages counts pkgs; files sums their compiled Go files.
+	packages int
+	files    int
+}
+
+// loadCompilerProgram is loadPackagesContext with the load's size and the
+// unfiltered package list. parseFile, when non-nil, replaces go/packages'
+// parser for the source-checked packages.
+func (p *Provider) loadCompilerProgram(ctx context.Context, dir string, parseFile func(*token.FileSet, string, []byte) (*ast.File, error), patterns ...string) (compilerProgram, error) {
+	// A compiler load is interactive work: a background warm-up listing
+	// yields to it. A committed tree's load is background work itself: it
+	// neither preempts nor holds back the working copy's warm-up.
+	if committedPreempt(ctx) == nil {
+		defer p.beginCompilerLoad(dir)()
+	}
 	mode := packages.NeedName |
 		packages.NeedFiles |
 		packages.NeedCompiledGoFiles |
@@ -1633,11 +2130,14 @@ func (p *Provider) loadPackagesContext(ctx context.Context, dir string, patterns
 	}
 
 	cfg := &packages.Config{
-		Context: ctx,
-		Mode:    mode,
-		Dir:     dir,
-		Tests:   p.includeTest,
-		Fset:    token.NewFileSet(),
+		Context:   ctx,
+		Mode:      mode,
+		Dir:       dir,
+		Tests:     p.includeTest,
+		Fset:      token.NewFileSet(),
+		ParseFile: parseFile,
+		Overlay:   committedOverlay(ctx),
+		Env:       committedEnv(ctx),
 	}
 
 	load := p.packagesLoad
@@ -1646,7 +2146,7 @@ func (p *Provider) loadPackagesContext(ctx context.Context, dir string, patterns
 	}
 	pkgs, err := load(cfg, patterns...)
 	if err != nil {
-		return nil, nil, err
+		return compilerProgram{}, err
 	}
 
 	// Filter out packages with errors (they may have partial type info).
@@ -1663,7 +2163,11 @@ func (p *Provider) loadPackagesContext(ctx context.Context, dir string, patterns
 		}
 	}
 
-	return valid, cfg.Fset, nil
+	program := compilerProgram{pkgs: valid, raw: pkgs, fset: cfg.Fset, packages: len(valid)}
+	for _, pkg := range valid {
+		program.files += len(pkg.CompiledGoFiles)
+	}
+	return program, nil
 }
 
 // repoGoNodes prefers the backend's repo+language summary projection so SQLite
@@ -1725,6 +2229,10 @@ func buildGoNodeStamps(
 			pos := fset.Position(ident.Pos())
 			rel := relativePath(pos.Filename, absRoot)
 			if rel == "" {
+				continue
+			}
+			// Stamps land on the projection's nodes only.
+			if len(nodesByFile[scopedGraphPath(repoPrefix, rel)]) == 0 {
 				continue
 			}
 			defsByName[rel+"\x00"+ident.Name] = append(defsByName[rel+"\x00"+ident.Name], defEntry{pos.Line, obj})
@@ -1929,6 +2437,13 @@ func reclaimAndReleaseGoCompiler(sever func(), forceGC bool, collect, afterColle
 // ast/types walk. Returning from this helper, in addition to clearing every
 // packages.Package, guarantees range temporaries cannot remain GC roots when
 // the caller performs its one large-program reclamation cycle.
+type goUseProjectionStats struct {
+	packagesScanned int
+	packagesSkipped int
+	identsScanned   int
+	identsSkipped   int
+}
+
 func projectGoUsesAndReleaseCompilerState(
 	ctx context.Context,
 	pkgs []*packages.Package,
@@ -1938,28 +2453,154 @@ func projectGoUsesAndReleaseCompilerState(
 	objToNode map[types.Object]string,
 	externals *externalsAttribution,
 ) (*goUsePlan, error) {
+	plan, _, err := projectGoUsesAndReleaseCompilerStateWithStats(
+		ctx, pkgs, fset, absRoot, repoPrefix, funcIndex, objToNode, externals,
+	)
+	return plan, err
+}
+
+func projectGoUsesAndReleaseCompilerStateWithStats(
+	ctx context.Context,
+	pkgs []*packages.Package,
+	fset *token.FileSet,
+	absRoot, repoPrefix string,
+	funcIndex map[string]*fileFuncIndex,
+	objToNode map[types.Object]string,
+	externals *externalsAttribution,
+) (*goUsePlan, goUseProjectionStats, error) {
 	plan := newGoUsePlan(len(pkgs))
+	var stats goUseProjectionStats
+	paths := newGraphPaths(absRoot, repoPrefix)
 	for pkgIndex, pkg := range pkgs {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, stats, err
 		}
 		if pkg == nil || pkg.TypesInfo == nil {
 			releaseGoPackageCompilerState(pkg)
 			pkgs[pkgIndex] = nil
 			continue
 		}
-		packageUses := make([]resolvedGoUse, 0, len(pkg.TypesInfo.Uses))
+		uses := len(pkg.TypesInfo.Uses)
+		if !packageMayContainGraphVisibleGoCaller(pkg, fset, absRoot, repoPrefix, funcIndex) {
+			stats.packagesSkipped++
+			stats.identsSkipped += uses
+			plan.setPackage(pkgIndex, nil)
+			releaseGoPackageCompilerState(pkg)
+			pkgs[pkgIndex] = nil
+			continue
+		}
+		stats.packagesScanned++
+		stats.identsScanned += uses
+		packageUses := make([]resolvedGoUse, 0, uses)
 		for ident, obj := range pkg.TypesInfo.Uses {
-			use, ok := resolveGoUse(ident, obj, fset, absRoot, repoPrefix, funcIndex, objToNode, externals)
+			use, ok := resolveGoUseWithPaths(ident, obj, fset, paths, funcIndex, objToNode, externals)
 			if ok {
 				packageUses = append(packageUses, use)
 			}
 		}
+		sortResolvedGoUses(packageUses)
 		plan.setPackage(pkgIndex, packageUses)
 		releaseGoPackageCompilerState(pkg)
 		pkgs[pkgIndex] = nil
 	}
-	return plan, nil
+	return plan, stats, nil
+}
+
+// graphVisibleSyntax is the subset of files whose definitions can match a
+// node of the projection: a file the projection holds nodes for, and
+// conservatively any file carrying a line directive (its identifiers may
+// report positions in another file).
+func graphVisibleSyntax(files []*ast.File, fset *token.FileSet, absRoot, repoPrefix string, nodesByFile map[string][]*graph.Node) []*ast.File {
+	out := make([]*ast.File, 0, len(files))
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		if fileHasLineDirective(file) {
+			out = append(out, file)
+			continue
+		}
+		relPath := relativePath(fset.Position(file.Pos()).Filename, absRoot)
+		if relPath != "" && len(nodesByFile[scopedGraphPath(repoPrefix, relPath)]) > 0 {
+			out = append(out, file)
+		}
+	}
+	return out
+}
+
+// fileHasLineDirective reports whether file carries a //line or /*line
+// comment.
+func fileHasLineDirective(file *ast.File) bool {
+	for _, group := range file.Comments {
+		for _, comment := range group.List {
+			if strings.HasPrefix(comment.Text, "//line") || strings.HasPrefix(comment.Text, "/*line") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sortResolvedGoUses puts a package's uses in source order. TypesInfo.Uses
+// is a map, and the apply keeps the first use of a caller/target/kind as the
+// edge (later uses of the same pair confirm it): without an order, which
+// line a new edge carries, and which resolver stub an external use claims,
+// changed from one pass to the next over identical source. The earliest use
+// wins now, in every pass and in a whole index alike.
+func sortResolvedGoUses(uses []resolvedGoUse) {
+	sort.Slice(uses, func(i, j int) bool {
+		a, b := uses[i], uses[j]
+		if a.graphPath != b.graphPath {
+			return a.graphPath < b.graphPath
+		}
+		if a.line != b.line {
+			return a.line < b.line
+		}
+		if a.callerID != b.callerID {
+			return a.callerID < b.callerID
+		}
+		if a.targetNodeID != b.targetNodeID {
+			return a.targetNodeID < b.targetNodeID
+		}
+		return a.kind < b.kind
+	})
+}
+
+// packageMayContainGraphVisibleGoCaller retains packages with a graph-visible
+// caller and conservatively retains //line or /*line-directed syntax.
+// resolveGoUse maps each identifier's final position, which can differ from
+// file.Pos after a directive, so those packages must keep the exact
+// per-identifier walk.
+func packageMayContainGraphVisibleGoCaller(
+	pkg *packages.Package,
+	fset *token.FileSet,
+	absRoot, repoPrefix string,
+	funcIndex map[string]*fileFuncIndex,
+) bool {
+	if len(pkg.Syntax) == 0 {
+		return len(pkg.TypesInfo.Uses) > 0
+	}
+	for _, file := range pkg.Syntax {
+		if file == nil {
+			continue
+		}
+		for _, group := range file.Comments {
+			for _, comment := range group.List {
+				if strings.HasPrefix(comment.Text, "//line") || strings.HasPrefix(comment.Text, "/*line") {
+					return true
+				}
+			}
+		}
+		pos := fset.Position(file.Pos())
+		relPath := relativePath(pos.Filename, absRoot)
+		if relPath == "" {
+			continue
+		}
+		if funcIndex[scopedGraphPath(repoPrefix, relPath)] != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveGoUse is the query-free normalization shared by both package walks
@@ -1974,15 +2615,28 @@ func resolveGoUse(
 	objToNode map[types.Object]string,
 	externals *externalsAttribution,
 ) (resolvedGoUse, bool) {
+	return resolveGoUseWithPaths(ident, obj, fset, newGraphPaths(absRoot, repoPrefix), funcIndex, objToNode, externals)
+}
+
+// resolveGoUseWithPaths is resolveGoUse with the pass's file-name to graph
+// path memo.
+func resolveGoUseWithPaths(
+	ident *ast.Ident,
+	obj types.Object,
+	fset *token.FileSet,
+	paths *graphPaths,
+	funcIndex map[string]*fileFuncIndex,
+	objToNode map[types.Object]string,
+	externals *externalsAttribution,
+) (resolvedGoUse, bool) {
 	if ident == nil || obj == nil || ident.Pos() == token.NoPos {
 		return resolvedGoUse{}, false
 	}
 	pos := fset.Position(ident.Pos())
-	relPath := relativePath(pos.Filename, absRoot)
-	if relPath == "" {
+	graphPath := paths.of(pos.Filename)
+	if graphPath == "" {
 		return resolvedGoUse{}, false
 	}
-	graphPath := scopedGraphPath(repoPrefix, relPath)
 	caller := funcIndex[graphPath].containing(pos.Line)
 	if caller == nil {
 		return resolvedGoUse{}, false
@@ -2291,15 +2945,44 @@ func inferEdgeKindFromObj(obj types.Object) graph.EdgeKind {
 
 // relativePath converts an absolute file path to a repo-relative path.
 func relativePath(absPath, repoRoot string) string {
-	// Skip files outside the repo (stdlib, dependencies).
-	if !strings.HasPrefix(absPath, repoRoot) {
+	if repoRoot == "" || absPath == "" {
 		return ""
 	}
-	rel, err := filepath.Rel(repoRoot, absPath)
-	if err != nil {
+	// Compiler export positions use forward slashes on Windows, whereas
+	// checkout roots use native separators. Rel also respects path boundaries
+	// and platform case rules, unlike a raw string prefix check.
+	rel, err := filepath.Rel(filepath.FromSlash(repoRoot), filepath.FromSlash(absPath))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return ""
 	}
 	return filepath.ToSlash(rel)
+}
+
+// graphPaths memoizes the graph path of a compiler file name for one pass.
+// Every definition and use of a package names one of a few hundred files;
+// deriving the path per identifier (filepath.Rel plus the prefix join)
+// allocated for each of them.
+type graphPaths struct {
+	absRoot, repoPrefix string
+	byFile              map[string]string
+}
+
+func newGraphPaths(absRoot, repoPrefix string) *graphPaths {
+	return &graphPaths{absRoot: absRoot, repoPrefix: repoPrefix, byFile: make(map[string]string)}
+}
+
+// of returns scopedGraphPath(repoPrefix, relativePath(filename, absRoot)),
+// "" for a file outside the repository.
+func (p *graphPaths) of(filename string) string {
+	if graphPath, ok := p.byFile[filename]; ok {
+		return graphPath
+	}
+	graphPath := ""
+	if relPath := relativePath(filename, p.absRoot); relPath != "" {
+		graphPath = scopedGraphPath(p.repoPrefix, relPath)
+	}
+	p.byFile[filename] = graphPath
+	return graphPath
 }
 
 // scopedGraphPath converts a repository-relative source path into the path
@@ -2314,3 +2997,92 @@ func scopedGraphPath(repoPrefix, relPath string) string {
 
 // Ensure ast is used.
 var _ = (*ast.File)(nil)
+
+// loadErrorSummary splits a load's package errors into soft type errors (an
+// import or a variable declared and not used: go/types reports them without
+// changing any type, and a stripped sibling's unused imports are expected)
+// and hard ones, counted by kind, with a short sample.
+type loadErrorSummary struct {
+	soft   int
+	hard   int
+	kinds  map[string]int
+	sample []string
+}
+
+const loadErrorSampleSize = 5
+
+func classifyLoadErrors(pkgs []*packages.Package) loadErrorSummary {
+	out := loadErrorSummary{kinds: map[string]int{}}
+	var softSample []string
+	for _, pkg := range pkgs {
+		if pkg == nil {
+			continue
+		}
+		soft := make(map[string]int, len(pkg.TypeErrors))
+		for _, terr := range pkg.TypeErrors {
+			if terr.Soft && terr.Fset != nil {
+				soft[terr.Fset.Position(terr.Pos).String()+"\x00"+terr.Msg]++
+			}
+		}
+		for _, e := range pkg.Errors {
+			if key := e.Pos + "\x00" + e.Msg; e.Kind == packages.TypeError && soft[key] > 0 {
+				soft[key]--
+				out.soft++
+				if len(softSample) < loadErrorSampleSize {
+					softSample = append(softSample, e.Pos+": "+e.Msg)
+				}
+				continue
+			}
+			out.hard++
+			out.kinds[loadErrorKind(e.Kind)]++
+			if len(out.sample) < loadErrorSampleSize {
+				out.sample = append(out.sample, e.Pos+": "+e.Msg)
+			}
+		}
+	}
+	if out.hard == 0 {
+		out.sample = softSample
+	}
+	return out
+}
+
+func loadErrorKind(kind packages.ErrorKind) string {
+	switch kind {
+	case packages.ListError:
+		return "list"
+	case packages.ParseError:
+		return "parse"
+	case packages.TypeError:
+		return "type"
+	default:
+		return "unknown"
+	}
+}
+
+// ConcurrentCheckoutPreparation reports whether this file-bounded working-copy
+// pass uses shareable compiler admission with a second slot for other roots.
+// It follows the same module and handle-root planning as enrichRepoContext;
+// full/exclusive initial loads and one-slot configurations are declined. A
+// later scoped-load retry retains that same shareable token.
+func (p *Provider) ConcurrentCheckoutPreparation(ctx context.Context, root, repoPrefix string, scope semantic.CheckoutCompilerScope, files []string) bool {
+	if ctx.Err() != nil || root == "" || !scope.HandleRoots || scope.Committed || scope.ManifestChanged || p.includeTest {
+		return false
+	}
+	gate, _ := p.admissionGates()
+	if cap(gate) < 2 {
+		return false
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	loadDir, modules := goLoadDir(absRoot)
+	if modules == 0 {
+		return true
+	} // The provider reports no-module without loading a compiler.
+	handle := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		handle[file] = struct{}{}
+	}
+	return !planHandleRoots(absRoot, loadDir, repoPrefix, handle, scope).full && ctx.Err() == nil
+}

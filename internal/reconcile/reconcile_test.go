@@ -811,11 +811,16 @@ func TestReconcileRecordsHeadAndPathEvidence(t *testing.T) {
 	}
 
 	// A HEAD the sampler cannot read falls back to what the inventory said,
-	// and never invents a tree.
+	// and never invents a tree: the inventory carries ref and commit, so those
+	// are restated, and the tree it does not carry is left at the last one that
+	// was actually observed rather than being blanked. Blanking it was a pass
+	// erasing the base identity every dependent worktree keys on — and, since
+	// the committed-base publisher now writes the same column, erasing a base
+	// that had just been published. See TestReconcileKeepsTheRecordedHeadTree.
 	delete(f.git.heads, "/repo/wt")
 	f.reconcile()
 	row = f.checkout(allocated.CheckoutID)
-	if row.HeadCommit != strings.Repeat("a", 40) || row.HeadTree != "" {
+	if row.HeadCommit != strings.Repeat("a", 40) || row.HeadTree != "t1" {
 		t.Fatalf("head fallback = %q/%q", row.HeadCommit, row.HeadTree)
 	}
 
@@ -938,4 +943,51 @@ func TestRemovalOfThePrimaryOwnerRetiresTheClosure(t *testing.T) {
 			t.Fatalf("hook calls = %v, want %v", got, want)
 		}
 	})
+}
+
+// TestReconcileKeepsTheRecordedHeadTree separates a tree the pass learned is
+// gone from one it simply could not read.
+//
+// checkouts.head_tree is the committed identity a dependent worktree's layers
+// are keyed on, and — since AdoptDedicatedBaseGeneration advances the same
+// column — the identity a just-published committed base wrote there. The tree
+// reaches this pass only through a live `git` sample of the working copy, so a
+// sample that fails says nothing about the checkout's committed state; writing
+// its empty answer back would erase a published base identity for the length of
+// an hourly janitor interval, and leave graphBase's unpublished fallback with
+// no tree to build over at all.
+//
+// The second half is what keeps that from becoming a write-once column: a
+// working copy that ANSWERS with no tree is an unborn branch, which is a fact,
+// and the pass states it.
+func TestReconcileKeepsTheRecordedHeadTree(t *testing.T) {
+	f := newFixture(t, Default())
+	f.seedPrimaryGraph("graph-primary")
+	f.git.setRecords(presentRecord("wt", "/repo/wt"))
+	f.git.samples["/repo/wt"] = gitSampleExisting(volumeA)
+	f.git.heads["/repo/wt"] = gitstate.HEADState{Ref: "refs/heads/wt", CommitOID: "b1", TreeOID: "t1"}
+
+	allocated := f.entry(f.reconcile(), "wt")
+	if row := f.checkout(allocated.CheckoutID); row.HeadTree != "t1" {
+		t.Fatalf("first sighting recorded head_tree %q, want t1", row.HeadTree)
+	}
+
+	// The sampler cannot answer. Ref and commit still come from the inventory;
+	// the tree stays at the last one anybody actually observed.
+	delete(f.git.heads, "/repo/wt")
+	f.reconcile()
+	row := f.checkout(allocated.CheckoutID)
+	if row.HeadTree != "t1" {
+		t.Fatalf("an unsampled pass rewrote head_tree to %q, want t1 preserved", row.HeadTree)
+	}
+	if row.State != store_sqlite.CheckoutStateReady {
+		t.Fatalf("state = %q, want the checkout still ready", row.State)
+	}
+
+	// The sampler answers, and what it says is that there is no tree.
+	f.git.heads["/repo/wt"] = gitstate.HEADState{Ref: "refs/heads/unborn"}
+	f.reconcile()
+	if row := f.checkout(allocated.CheckoutID); row.HeadTree != "" {
+		t.Fatalf("an unborn branch left head_tree at %q, want it stated as empty", row.HeadTree)
+	}
 }

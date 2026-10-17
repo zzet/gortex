@@ -322,6 +322,6 @@ func synthesizeCapabilityEdgesScoped(g graph.Store, changedPrefixes map[string]b
 			FilePath: s.file, Line: s.line, Origin: s.origin, Meta: s.meta,
 		})
 	}
-	g.AddBatch(nodes, edges)
+	g.AddBatch(nodes, collapseCapabilityIdentities(edges))
 	return readsEnv, execProc, fieldAccess
 }

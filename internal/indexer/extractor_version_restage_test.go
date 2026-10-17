@@ -152,6 +152,19 @@ func TestIncrementalReindex_NonMerkleAdmissionPolicyUpgradeRestoresPersistedORMF
 			strippedIDs[node.ID] = struct{}{}
 			continue
 		}
+		if node.Kind == graph.KindFile && node.Meta != nil {
+			// The pre-policy index predates the whole-index fingerprints
+			// too: its file node carries none, so the restage cannot prove
+			// the file inert against the new policy's extraction.
+			copied := *node
+			copied.Meta = make(map[string]any, len(node.Meta))
+			for key, value := range node.Meta {
+				if !isFingerprintMeta(key) {
+					copied.Meta[key] = value
+				}
+			}
+			node = &copied
+		}
 		keptNodes = append(keptNodes, node)
 	}
 	require.NotEmpty(t, strippedIDs)

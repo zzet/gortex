@@ -36,3 +36,9 @@ func checkoutRootFileInfo(root string) (os.FileInfo, error) {
 	}
 	return info, nil
 }
+
+// SourceRootFileInfo captures the same physical root witness for independent
+// source operations as checkout publication uses.
+func SourceRootFileInfo(root string) (os.FileInfo, error) {
+	return checkoutRootFileInfo(root)
+}

@@ -1072,6 +1072,7 @@ type reviewEnvelope struct {
 	FileRisk            []review.FileRisk         `json:"file_risk"`
 	Findings            []inlineComment           `json:"findings"`
 	Contracts           *contractImpact           `json:"contracts,omitempty"`
+	ContractWarning     string                    `json:"contract_warning,omitempty"`
 	Guards              []analysis.GuardViolation `json:"guards"`
 	HighRiskPreviews    []reviewPreview           `json:"high_risk_previews,omitempty"`
 	TestTargets         []string                  `json:"test_targets"`
@@ -1196,7 +1197,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	// Gate: contract-boundary impact.
-	contracts := s.computeContractImpact(ids)
+	contracts := s.computeContractImpactContext(ctx, ids)
 
 	// Gate: guard + architecture rules.
 	var guards []analysis.GuardViolation
@@ -1212,6 +1213,12 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	if (contracts != nil && contracts.Breaking > 0) || len(guards) > 0 {
 		verdict = review.VerdictBlock
 	}
+	contractWarning := optionalContractWarning(contractConsumerStatusFromContext(ctx))
+	summary := report.Summary
+	if contractWarning != "" {
+		summary += "; " + contractWarning
+	}
+	verdict = optionalContractReviewVerdict(verdict, contractConsumerStatusFromContext(ctx))
 
 	// Per-symbol semantic classification, graph-grounded on the diff-hunk text.
 	changedSyms := s.classifyChangedSymbols(ctx, diff, impact)
@@ -1231,11 +1238,12 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 
 	env := reviewEnvelope{
 		Verdict:             string(verdict),
-		Summary:             report.Summary,
+		Summary:             summary,
 		ChangedSymbols:      changedSyms,
 		FileRisk:            report.FileRisk,
 		Findings:            reviewFindingsToComments(report),
 		Contracts:           contracts,
+		ContractWarning:     contractWarning,
 		Guards:              guards,
 		HighRiskPreviews:    previews,
 		TestTargets:         testTargets,
@@ -1590,6 +1598,9 @@ func reviewPackPayload(env reviewEnvelope) map[string]any {
 	}
 	if env.Contracts != nil {
 		payload["contracts"] = env.Contracts
+	}
+	if env.ContractWarning != "" {
+		payload["contract_warning"] = env.ContractWarning
 	}
 	if len(previews) > 0 {
 		payload["high_risk_previews"] = previews

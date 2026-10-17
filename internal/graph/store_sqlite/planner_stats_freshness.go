@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -174,11 +176,15 @@ const plannerStatsBulkWindowReason = "bulk_window_active"
 //	                   another goroutine); defensive, unreachable in practice.
 const (
 	plannerStatsWriterBusyReason = "writer_busy:"
-	plannerStatsRacedReason      = "raced"
-	plannerStatsCanceledReason   = "canceled:"
-	plannerStatsTimeoutReason    = "timeout:"
-	plannerStatsBudgetReason     = "budget:"
-	plannerStatsNoIndexesReason  = "no_indexes"
+	// plannerStatsEditCycleReason: an edit-driven mutation cycle holds the
+	// build lane (SetBuildLaneBusy). No ANALYZE starts inside an edit window,
+	// and one in flight when a cycle takes the lane is interrupted.
+	plannerStatsEditCycleReason = "edit_cycle:"
+	plannerStatsRacedReason     = "raced"
+	plannerStatsCanceledReason  = "canceled:"
+	plannerStatsTimeoutReason   = "timeout:"
+	plannerStatsBudgetReason    = "budget:"
+	plannerStatsNoIndexesReason = "no_indexes"
 )
 
 // plannerStatsPassBudget bounds the wall-clock ONE cooperative pass spends
@@ -729,6 +735,16 @@ func (s *Store) plannerStatsHealth(ctx context.Context, probeReceivers bool) (gr
 		// that inverts the receiver-rebind join order.
 		health.Reason, _ = plannerStatsStaleReason(receiverIndex, health.Receivers, 0, health.Receivers.Actual > 0)
 	}
+	if health.Reason == "" {
+		// The families above are judged by one sentinel row each. A planner
+		// index outside the sentinels can still have no row: the planner then
+		// chooses it by the default cost model (a store fresh from a whole
+		// index had rows for nodes_by_kind and none for nodes_by_name,
+		// nodes_by_repo or nodes_by_repo_language_name, and read fresh). So:
+		// every present planner index that holds rows and has no statistics
+		// row is owed.
+		health.Reason = s.plannerStatsMissingIndex(ctx, present)
+	}
 	health.Stale = health.Reason != ""
 	return health, bases, nil
 }
@@ -919,8 +935,9 @@ func (s *Store) EnsurePlannerStatsFresh(ctx context.Context) (graph.PlannerStats
 	// what the re-probe's own rules measured, so the base recorded here is the
 	// one the verdict was judged against by construction.
 	held := s.plannerStatsUnanchoredVerdictBase(fresh, bases)
+	insist := s.plannerStatsInsist(ctx, fresh.Reason)
 	started := time.Now()
-	analyzed, deferred, refreshErr := s.cooperativePlannerStatsRefresh(ctx, plannerStatsCursorKey(fresh.Reason, work), held, work)
+	analyzed, deferred, refreshErr := s.cooperativePlannerStatsRefresh(ctx, plannerStatsCursorKey(fresh.Reason, work), held, work, insist)
 	elapsed := time.Since(started)
 
 	// A deferred pass is not a failure and not a refresh. It leaves the ledger
@@ -1015,12 +1032,12 @@ func (s *Store) EnsurePlannerStatsFresh(ctx context.Context) (graph.PlannerStats
 	// whenever a pass RESUMED: an earlier boundary already finished the rest,
 	// and logging only the list length would make every resumed pass look like
 	// it re-analyzed the whole family.
-	log.Printf("store_sqlite: planner stats refreshed reason=%s indexes=%d/%d nodes=%d/%d edges=%d/%d receivers=%d/%d elapsed=%s",
+	log.Printf("store_sqlite: planner stats refreshed reason=%s indexes=%d/%d nodes=%d/%d edges=%d/%d receivers=%d/%d elapsed=%s insist=%s",
 		fresh.Reason, analyzed, len(work),
 		fresh.Nodes.Believed, fresh.Nodes.Actual,
 		fresh.Edges.Believed, fresh.Edges.Actual,
 		fresh.Receivers.Believed, fresh.Receivers.Actual,
-		elapsed)
+		elapsed, insist)
 	return fresh, nil
 }
 
@@ -1041,7 +1058,7 @@ func (s *Store) EnsurePlannerStatsFresh(ctx context.Context) (graph.PlannerStats
 // OPENS and left alone on one it resumes. analyzed counts what THIS pass
 // rebuilt, which on a resumed pass is less than the work list — the log line
 // says both.
-func (s *Store) cooperativePlannerStatsRefresh(ctx context.Context, key string, held plannerStatsHeldBase, work []string) (analyzed int, deferred string, err error) {
+func (s *Store) cooperativePlannerStatsRefresh(ctx context.Context, key string, held plannerStatsHeldBase, work []string, insist plannerStatsInsistence) (analyzed int, deferred string, err error) {
 	pending := s.plannerStatsPending(key, held, work)
 	if len(pending) == 0 {
 		// Every index of this list is already done under the current cursor.
@@ -1061,11 +1078,26 @@ func (s *Store) cooperativePlannerStatsRefresh(ctx context.Context, key string, 
 		// that analyzed nothing would leave the cursor exactly where it was and
 		// the mechanism would stop converging. So one ANALYZE may overshoot the
 		// budget, and the boundary's cost is budget + one index.
-		if i > 0 && time.Since(started) >= plannerStatsPassBudget {
-			return analyzed, plannerStatsBudgetReason + name, nil
-		}
-		if !s.writeMu.TryLock() {
-			return analyzed, plannerStatsWriterBusyReason + name, nil
+		if insist == plannerStatsCooperative {
+			if i > 0 && time.Since(started) >= plannerStatsPassBudget {
+				return analyzed, plannerStatsBudgetReason + name, nil
+			}
+			if s.buildLaneBusy() {
+				return analyzed, plannerStatsEditCycleReason + name, nil
+			}
+			if !s.writeMu.TryLock() {
+				return analyzed, plannerStatsWriterBusyReason + name, nil
+			}
+		} else {
+			// Owed at a load boundary (plannerStatsInsist): no budget, no
+			// deferral to an edit cycle, and the gate is waited for.
+			lockErr := s.writeMu.LockContext(ctx)
+			if lockErr != nil {
+				if ctx.Err() != nil {
+					return analyzed, plannerStatsCanceledReason + name, nil
+				}
+				return analyzed, plannerStatsWriterBusyReason + name, nil
+			}
 		}
 		// Counted at the ACQUISITION, not inside the hold: what the wider
 		// gates above depend on is how many times this loop takes the store
@@ -1075,11 +1107,25 @@ func (s *Store) cooperativePlannerStatsRefresh(ctx context.Context, key string, 
 		// One hold can never outlive plannerStatsIndexTimeout, which is
 		// strictly below the 15 s the bounded-gate droppers give this gate
 		// before discarding their batches.
+		// The per-index limit bounds what a cooperative pass costs the
+		// writers beside it; at a load boundary there are none yet, and at
+		// the clone's size one index's ANALYZE takes longer than the limit.
 		indexCtx, cancelIndex := context.WithTimeout(ctx, plannerStatsIndexTimeout)
+		stopYield, yielded := func() {}, new(atomic.Bool)
+		if insist == plannerStatsCooperative {
+			stopYield, yielded = s.cancelOnEditCycle(cancelIndex)
+		} else {
+			cancelIndex()
+			indexCtx, cancelIndex = context.WithCancel(ctx)
+		}
 		removed, bulk, analyzeErr := s.plannerStatsHoldLocked(indexCtx, name)
-		timedOut := analyzeErr != nil && indexCtx.Err() != nil && ctx.Err() == nil
+		stopYield()
+		timedOut := analyzeErr != nil && indexCtx.Err() != nil && ctx.Err() == nil && !yielded.Load()
 		cancelIndex()
 		s.writeMu.Unlock()
+		if analyzeErr != nil && yielded.Load() && ctx.Err() == nil {
+			return analyzed, plannerStatsEditCycleReason + name, nil
+		}
 		if bulk {
 			return analyzed, plannerStatsBulkWindowReason, nil
 		}
@@ -1889,4 +1935,60 @@ func plannerStatsReasonKey(reason string) string {
 		return reason[:i]
 	}
 	return reason
+}
+
+// plannerStatsInsistence is how a refresh pass treats edits.
+type plannerStatsInsistence string
+
+const (
+	// plannerStatsCooperative: the pass defers to an edit cycle, a busy
+	// gate and its budget, and resumes at the next boundary.
+	plannerStatsCooperative plannerStatsInsistence = ""
+	// plannerStatsOwed: a planner index holds rows but has no statistics
+	// (a store fresh from a whole index), at the boundary that ends the index
+	// (graph.WithPlannerStatsLoadBoundary): the pass runs to the end. It
+	// waits for the gate, does not give way to an edit cycle, and has no
+	// per-index limit, since no edit is admitted yet and one index's ANALYZE
+	// holds the writer for up to 17 s at the clone's size (2.2M nodes, 11M
+	// edges). Nowhere else: at runtime a pass stays cooperative, and the
+	// lookups do not depend on the statistics for their index.
+	plannerStatsOwed plannerStatsInsistence = "owed"
+)
+
+// plannerStatsInsist decides how the pass for this verdict treats edits.
+func (s *Store) plannerStatsInsist(ctx context.Context, reason string) plannerStatsInsistence {
+	key := plannerStatsReasonKey(reason)
+	if (key == "no_stats" || strings.HasPrefix(key, "missing:")) && graph.PlannerStatsLoadBoundary(ctx) {
+		return plannerStatsOwed
+	}
+	return plannerStatsCooperative
+}
+
+// plannerStatsMissingIndex names the first present planner index (by name)
+// that holds rows and has no sqlite_stat1 row, as a "missing:" verdict, or ""
+// when there is none. Only indexes without a row are probed, one bounded
+// EXISTS each (through the index, with a partial index's own predicate).
+func (s *Store) plannerStatsMissingIndex(ctx context.Context, present map[string]bool) string {
+	hasStat := s.plannerStatsIndexesWithStats(ctx)
+	names := make([]string, 0, len(present))
+	for name := range present {
+		if !hasStat[name] {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		spec, known := plannerStatsIndexProbes[name]
+		if !known {
+			continue
+		}
+		var hasRows bool
+		if err := s.db.QueryRowContext(ctx, spec.existsQuery(name)).Scan(&hasRows); err != nil {
+			continue
+		}
+		if hasRows {
+			return "missing:" + name
+		}
+	}
+	return ""
 }

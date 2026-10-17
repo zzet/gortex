@@ -22,6 +22,21 @@ type EndpointConstStore interface {
 	ConstantValuesByNodeIDs(nodeIDs []string) (map[string]string, error)
 }
 
+// EndpointConstantCandidate is the declaration identity consumed by endpoint
+// constant resolution. Literal values are read separately by node ID.
+type EndpointConstantCandidate struct {
+	ID       string `json:"id"`
+	FilePath string `json:"file_path"`
+}
+
+// EndpointConstantCandidateStore optionally supplies the exact declaration
+// projection used by ResolveEndpointArg. Implementations must retain all
+// constant candidates accepted by nodeInRepoScope, including candidates with
+// no recorded literal value. Other symbol kinds and metadata are not inputs.
+type EndpointConstantCandidateStore interface {
+	FindEndpointConstantCandidates(name, repoPrefix string) []EndpointConstantCandidate
+}
+
 // endpointCompositeFields are the struct-field names whose value carries the
 // endpoint string inside an options / request composite literal — e.g. the
 // QueueUrl of an &sqs.SendMessageInput{...} or the Path of a request config.
@@ -168,19 +183,13 @@ func resolveConstIdentifier(name, filePath, repoPrefix string, store EndpointCon
 	if name == "" {
 		return "", false
 	}
-	cands := store.FindNodesByNames([]string{name})[name]
+	cands := endpointConstantCandidates(name, repoPrefix, store)
 	if len(cands) == 0 {
 		return "", false
 	}
 	var ids []string
 	sameFileIDs := map[string]bool{}
 	for _, n := range cands {
-		if n == nil || n.Kind != graph.KindConstant {
-			continue
-		}
-		if !nodeInRepoScope(n, repoPrefix) {
-			continue
-		}
 		ids = append(ids, n.ID)
 		if filePath != "" && n.FilePath == filePath {
 			sameFileIDs[n.ID] = true
@@ -199,6 +208,19 @@ func resolveConstIdentifier(name, filePath, repoPrefix string, store EndpointCon
 	}
 	// Otherwise require a repo-wide unique value.
 	return uniqueEndpointValue(vals, nil)
+}
+
+func endpointConstantCandidates(name, repoPrefix string, store EndpointConstStore) []EndpointConstantCandidate {
+	if projected, ok := store.(EndpointConstantCandidateStore); ok {
+		return projected.FindEndpointConstantCandidates(name, repoPrefix)
+	}
+	var out []EndpointConstantCandidate
+	for _, node := range store.FindNodesByNames([]string{name})[name] {
+		if node != nil && node.Kind == graph.KindConstant && nodeInRepoScope(node, repoPrefix) {
+			out = append(out, EndpointConstantCandidate{ID: node.ID, FilePath: node.FilePath})
+		}
+	}
+	return out
 }
 
 // uniqueEndpointValue collapses candidate const values to a single non-empty

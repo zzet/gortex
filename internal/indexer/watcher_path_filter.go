@@ -12,8 +12,10 @@ import (
 //
 // It is an optimisation, not a security barrier: handleEvent still runs
 // the full isExcluded check, which additionally refuses symlinks that
-// escape the repo root. This filter deliberately does no I/O so it stays
-// cheap enough to run on every raw event.
+// escape the repo root. ConfigManager-owned watchers check its cached ignore
+// chain here too, so a removed ignore rule cannot keep hiding future events.
+// Unchanged policy reuses the compiled matcher; only a policy change schedules
+// the existing coalesced reconcile.
 type watcherExcludeFilter struct{ w *Watcher }
 
 // ShouldInclude reports whether the backend should deliver an event for
@@ -29,14 +31,18 @@ func (f *watcherExcludeFilter) ShouldInclude(path string) bool {
 	if isProbeMarkerPath(path) {
 		return true
 	}
-	if f == nil || f.w == nil || f.w.excludes == nil {
+	if f == nil || f.w == nil {
+		return true
+	}
+	m := f.w.currentExcludeMatcher()
+	if m == nil {
 		return true
 	}
 	root := f.w.indexer.rootPath
 	if root == "" {
-		return !f.w.excludes.MatchRel(path)
+		return !m.MatchRel(path)
 	}
-	return !f.w.excludes.MatchAbs(path, root)
+	return !m.MatchAbs(path, root)
 }
 
 // isProbeMarkerPath reports whether path names a watcher handshake probe.

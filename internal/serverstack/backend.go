@@ -32,10 +32,10 @@ import (
 //
 // Returns the store, a cleanup func the caller must defer (it closes the
 // handle on disk), and any open error.
-// allowRebuild permits the backend to drop and recreate a database whose
-// schema version is incompatible. The caller must hold the store lock;
-// NewSharedServer passes true only in the branch where it acquired the
-// exclusive flock.
+// allowRebuild permits rebuilding supported older schemas when necessary;
+// a schema newer than this binary is always refused and retained. The caller
+// must hold the store lock. NewSharedServer passes true only after acquiring
+// the exclusive flock.
 func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func(), error) {
 	if err := checkBackend(name); err != nil {
 		return nil, nil, err
@@ -106,6 +106,10 @@ func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite
 	}
 	s, err := store_sqlite.Open(path, opts...)
 	if err != nil {
+		if errors.Is(err, store_sqlite.ErrSchemaTooNew) {
+			// Restarting another process cannot make this binary compatible.
+			return nil, nil, fmt.Errorf("open sqlite store at %q: %w", path, err)
+		}
 		hint := "if another gortex daemon is using this store, stop it first (`gortex daemon status` / `gortex daemon stop`)"
 		if pid, ok := daemon.RunningPID(); ok {
 			hint = fmt.Sprintf("a gortex daemon is already running (pid %d) — stop it with `gortex daemon stop`, or use `gortex daemon restart`", pid)

@@ -1,6 +1,18 @@
 package main
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"testing"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+)
 
 // TestShouldCompactStore pins the boot-compaction trigger: all three gates
 // (majority-dead file, absolute reclaimable floor, disk headroom for the
@@ -50,6 +62,88 @@ func TestShouldCompactStore(t *testing.T) {
 			if got := shouldCompactStore(tc.free, tc.total, tc.avail); got != tc.want {
 				t.Errorf("shouldCompactStore(free=%d, total=%d, avail=%d) = %v, want %v",
 					tc.free, tc.total, tc.avail, got, tc.want)
+			}
+		})
+	}
+}
+
+// The store the daemon actually runs against must be the thing the boot
+// compaction probes for. This is the wiring link between warmupDaemonState's
+// maybeCompactStore(state.graph, …) call and the maintenance lane: a *Store
+// that stopped satisfying storeCompactor would silently make boot compaction a
+// no-op instead of failing to build.
+var _ storeCompactor = (*store_sqlite.Store)(nil)
+
+// compactStub is a graph.Store whose only real methods are the compaction
+// capability. The embedded nil interface satisfies the rest: maybeCompactStore
+// touches nothing else, and a call that reached through would panic loudly
+// rather than pass silently.
+type compactStub struct {
+	graph.Store
+	free, total int64
+	path        string
+	compactErr  error
+	compacts    int
+}
+
+func (c *compactStub) Path() string                      { return c.path }
+func (c *compactStub) CompactStats() (free, total int64) { return c.free, c.total }
+func (c *compactStub) Compact() error                    { c.compacts++; return c.compactErr }
+
+// A deferral is not a failure. The maintenance lane refuses to rewrite the file
+// underneath a publish or a build, and boot must report that as the routine
+// yield it is — the freelist is still there to reclaim next boot. Logging it at
+// warn is what would make the real warning (a VACUUM that tried and lost)
+// unreadable.
+func TestMaybeCompactStore_DeferralIsNotAFailure(t *testing.T) {
+	dir := t.TempDir()
+	// The smallest shape that clears all three trigger gates: the freelist is
+	// over the 1 GiB floor and the majority of a 2 GiB file, so the headroom
+	// gate asks for 3 GiB of free space rather than a machine-sized figure.
+	const (
+		total = int64(2) << 30
+		free  = int64(1)<<30 + 1
+	)
+
+	cases := []struct {
+		name      string
+		err       error
+		wantLevel zapcore.Level
+		wantMsg   string
+	}{
+		{
+			name:      "lane deferral",
+			err:       fmt.Errorf("%w: vacuum: payload build in flight: generation 7", store_sqlite.ErrMaintenanceBusy),
+			wantLevel: zapcore.InfoLevel,
+			wantMsg:   "daemon: store compaction deferred — the store was busy",
+		},
+		{
+			name:      "real failure",
+			err:       errors.New("disk I/O error"),
+			wantLevel: zapcore.WarnLevel,
+			wantMsg:   "daemon: store compaction failed — continuing boot",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			core, logs := observer.New(zapcore.DebugLevel)
+			stub := &compactStub{
+				free:       free,
+				total:      total,
+				path:       filepath.Join(dir, "graph.sqlite"),
+				compactErr: tc.err,
+			}
+			maybeCompactStore(stub, zap.New(core))
+
+			if stub.compacts != 1 {
+				t.Fatalf("Compact called %d times, want 1: the trigger must have fired", stub.compacts)
+			}
+			entries := logs.FilterMessage(tc.wantMsg).All()
+			if len(entries) != 1 {
+				t.Fatalf("want exactly one %q entry, got %d (all: %v)", tc.wantMsg, len(entries), logs.All())
+			}
+			if entries[0].Level != tc.wantLevel {
+				t.Errorf("%q logged at %v, want %v", tc.wantMsg, entries[0].Level, tc.wantLevel)
 			}
 		})
 	}

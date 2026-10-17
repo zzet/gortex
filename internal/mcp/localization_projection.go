@@ -71,7 +71,7 @@ func boundedLocalizationExactName(
 	scope graph.LocalizationNodeScope,
 	limit int,
 ) (graph.BoundedNodeProjection, bool) {
-	bounded, ok := reader.(graph.BoundedExactNameReader)
+	bounded, ok := contractCoreSelectedReader(reader).(graph.BoundedExactNameReader)
 	if !ok || ctx.Err() != nil {
 		return graph.BoundedNodeProjection{}, false
 	}

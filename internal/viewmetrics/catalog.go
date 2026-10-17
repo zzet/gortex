@@ -65,6 +65,68 @@ const (
 	// GenerationSweepCollectedTotal counts generations a janitor pass
 	// collected that an earlier offer could not.
 	GenerationSweepCollectedTotal = "views_generation_sweep_collected_total"
+	// RetirementQuantaTotal counts committed retirement quantum transactions,
+	// and RetirementRowsDeletedTotal the payload rows retirement deleted: the
+	// drain's throughput, which the refusal counter above is not.
+	RetirementQuantaTotal      = "views_retirement_quanta_total"
+	RetirementRowsDeletedTotal = "views_retirement_rows_deleted_total"
+	// GenerationRetireOwedTotal counts generations owed to the deferred
+	// retirement sweep, by why they became debt: the production side the
+	// retired counter is read against.
+	GenerationRetireOwedTotal = "views_generation_retire_owed_total"
+	// RetirementPassesTotal counts deferred retirement worker passes, and
+	// RetirementStandDownTotal the passes and bursts that retired nothing
+	// because foreground work, a chain fold or the WAL held them back, by
+	// what held them.
+	RetirementPassesTotal    = "views_retirement_passes_total"
+	RetirementStandDownTotal = "views_retirement_stand_down_total"
+
+	// The committed-base (dedicated-base) publication family.
+	//
+	// These six are the measurement evidence for incremental advancement: the
+	// generation lifecycle series above say how much payload exists, and these
+	// say how it came to exist — whether a committed advance paid for a
+	// physical build or re-adopted work that was already there. The ratio
+	// between DedicatedBaseClaimTotal{outcome=built} and its reused/coalesced
+	// siblings is the literal reuse-vs-rebuild figure; before them the only
+	// reuse evidence in the process was CoordinatorCycleTotal{adopted_commit},
+	// which the committed-base path never touches.
+
+	// DedicatedBasePublishTotal counts committed-base generations this
+	// process published and adopted, by the shape of the generation. A root
+	// is self-contained; a delta composes over a parent. A steady state whose
+	// roots keep rising is re-rooting rather than advancing.
+	DedicatedBasePublishTotal = "views_dedicated_base_publish_total"
+	// DedicatedBaseClaimTotal counts committed-base build claims by what the
+	// claim actually cost: a physical build, a coalesced join onto somebody
+	// else's build, or a re-adoption of the generation that was already
+	// active (the zero-catalog-DML replay a warm restart or a same-tree
+	// commit takes).
+	DedicatedBaseClaimTotal = "views_dedicated_base_claim_total"
+	// DedicatedBaseClosureTruncatedTotal counts published committed-base
+	// generations whose affected-by closure hit its cap and was cut. Such a
+	// generation is knowingly incomplete, so this is a correctness level
+	// rather than a cost one: it must stay at zero.
+	DedicatedBaseClosureTruncatedTotal = "views_dedicated_base_closure_truncated_total"
+	// DedicatedBasePublicationTotal counts queued publication outcomes — both
+	// the ones a daemon start scheduled and the ones a live HEAD movement
+	// asked for — by what the publication settled as.
+	DedicatedBasePublicationTotal = "views_dedicated_base_publication_total"
+	// DedicatedBaseAdvanceTotal counts what the live HEAD-movement observer
+	// did with an observation, which is not the same question as what the
+	// publication behind it settled as: a repeat observation of the commit
+	// that already landed never becomes a publication at all.
+	DedicatedBaseAdvanceTotal = "views_dedicated_base_advance_total"
+	// DedicatedBaseDrainTotal counts publisher-admission closures by whether
+	// shutdown had to wait for admitted actors to finish. A waited close is
+	// the shape of a shutdown held open by a running publication.
+	DedicatedBaseDrainTotal = "views_dedicated_base_drain_total"
+
+	// DependentRecompositionTotal counts the cohort-staleness signals a
+	// committed advance raises for the dependents that key their identities
+	// on the moved repository's bytes. It is the fan-out counterpart of
+	// DedicatedBasePublishTotal: one advance, N dependents told to recompose.
+	DependentRecompositionTotal = "views_dependent_recomposition_total"
 
 	// RefViewSelectionTotal counts ref-view selections by what serving the
 	// selector took.
@@ -78,6 +140,19 @@ const (
 	MaterializationTotal = "views_materialization_total"
 	// LeasesHeld is how many payload generations live views currently pin.
 	LeasesHeld = "views_leases_held"
+	// HandoffTotal counts attempts to hand a request's materialized view to
+	// work that outlives that request — a detached worker, an admitted
+	// publication, a handler the deadline firewall abandoned — by which
+	// consumer asked and whether the lease could still be joined.
+	HandoffTotal = "views_handoff_total"
+	// HandoffsOutstanding is how many handed-off view leases are open right
+	// now: detached work still pinning the generations its request read. It
+	// is the level paired with HandoffTotal{outcome=joined}, and it must
+	// return to zero once every detached worker has released. A level that
+	// does not come back down is the observable shape of an unreleased
+	// handoff — retirement will keep refusing a generation with nobody left
+	// to finish releasing it.
+	HandoffsOutstanding = "views_handoffs_outstanding"
 
 	// RequestServedTotal counts requests by the kind of view that answered.
 	RequestServedTotal = "views_request_served_total"
@@ -108,6 +183,46 @@ const (
 	// ProbeAnswerTotal counts path-scoped probe answers by the kind of view
 	// that answered and whether it was the path's own.
 	ProbeAnswerTotal = "views_probe_answer_total"
+
+	// The contract analysis family: the background attachment worker that
+	// turns accepted core inputs into a published contract attachment.
+	//
+	// ContractAnalysisJobsTotal counts attachment jobs by the mode the job ran
+	// in and how it ended. A superseded job names why its inputs moved; a
+	// deferred one never ran a job body (it waits on a baseline or acceptance).
+	ContractAnalysisJobsTotal = "views_contract_analysis_jobs_total"
+	// ContractAnalysisRequestsTotal counts scheduling requests by what the
+	// request did: the answer every strict consumer's wait loop starts from.
+	ContractAnalysisRequestsTotal = "views_contract_analysis_requests_total"
+	// ContractAnalysisCapturesTotal counts the scheduler's census captures of
+	// an actor's inputs by result: a capture refused stale waits for the next
+	// input epoch, never retries at once.
+	ContractAnalysisCapturesTotal = "views_contract_analysis_captures_total"
+	// ContractAnalysisFilesTotal counts per-file extractions a job ran, by why
+	// the file was extracted. Its cold share is the whole-cohort cost.
+	ContractAnalysisFilesTotal = "views_contract_analysis_files_total"
+	// ContractAnalysisJobSeconds is how long one job body took, by mode.
+	ContractAnalysisJobSeconds = "views_contract_analysis_job_seconds"
+	// ContractAnalysisRoundsTotal counts proof rounds and
+	// ContractAnalysisIterationsTotal convergence iterations: a job that keeps
+	// adding iterations is chasing inputs that do not settle.
+	ContractAnalysisRoundsTotal     = "views_contract_analysis_rounds_total"
+	ContractAnalysisIterationsTotal = "views_contract_analysis_iterations_total"
+	// ContractAnalysisRequeuedTotal counts jobs put back on the queue after a
+	// supersession at a key that is still current and unpublished.
+	ContractAnalysisRequeuedTotal = "views_contract_analysis_requeued_total"
+	// ContractAnalysisUnstampedReadsTotal counts evidence reads whose owner
+	// carries no boundary receipt, so no stamp can prove them.
+	ContractAnalysisUnstampedReadsTotal = "views_contract_analysis_unstamped_reads_total"
+	// ContractAnalysisPredecessorRetiredTotal counts stale answers refused
+	// because the attachment they would have served was retired meanwhile.
+	ContractAnalysisPredecessorRetiredTotal = "views_contract_analysis_predecessor_retired_total"
+	// ContractBaselineTotal counts primary contract baseline admissions and
+	// their terminal outcomes.
+	ContractBaselineTotal = "views_contract_baseline_total"
+	// ContractRepairTotal counts idle repairs of contract inputs that no
+	// ordinary save would settle, by what was repaired.
+	ContractRepairTotal = "views_contract_repair_total"
 )
 
 // Label names.
@@ -126,6 +241,169 @@ const (
 	LabelCorpus   = "corpus"
 	LabelEvent    = "event"
 	LabelExact    = "exact"
+	LabelConsumer = "consumer"
+	LabelShape    = "shape"
+	LabelWhy      = "why"
+	LabelMode     = "mode"
+	LabelResult   = "result"
+)
+
+// Contract analysis job modes: a whole-cohort rebuild, a cache fill that
+// publishes nothing, or a rebuild of the changed file set.
+const (
+	ContractModeCold  = "cold"
+	ContractModeFill  = "fill"
+	ContractModeDelta = "delta"
+)
+
+// contractModes is the complete mode vocabulary.
+var contractModes = []string{ContractModeCold, ContractModeFill, ContractModeDelta}
+
+// Contract analysis job outcomes. Exactly one is recorded per job. The
+// superseded outcomes name why the job's inputs moved before it could publish.
+const (
+	ContractJobPublished                = "published"
+	ContractJobFillContinued            = "fill_continued"
+	ContractJobSupersededKeyMoved       = "superseded_key_moved"
+	ContractJobSupersededInputsMoving   = "superseded_inputs_moving"
+	ContractJobSupersededReadUnsettled  = "superseded_read_unsettled"
+	ContractJobSupersededPublishRefused = "superseded_publish_refused"
+	ContractJobPreempted                = "preempted"
+	ContractJobFailed                   = "failed"
+	ContractJobPanic                    = "panic"
+	ContractJobDeferred                 = "deferred"
+)
+
+// Contract analysis request results: what one scheduling request did.
+const (
+	ContractRequestAdmitted         = "admitted"
+	ContractRequestCoalesced        = "coalesced"
+	ContractRequestAttached         = "attached"
+	ContractRequestInputsPending    = "inputs_pending"
+	ContractRequestBaselineAdmitted = "baseline_admitted"
+	ContractRequestRefused          = "refused"
+	ContractRequestQueueFull        = "queue_full"
+	ContractRequestError            = "error"
+)
+
+// Contract analysis capture results.
+const (
+	ContractCaptureOK    = "ok"
+	ContractCaptureStale = "stale"
+	ContractCaptureError = "error"
+)
+
+// Why a job extracted one file.
+const (
+	ContractFilesCold     = "cold"
+	ContractFilesFill     = "fill"
+	ContractFilesDelta    = "delta"
+	ContractFilesRetry    = "retry"
+	ContractFilesStale    = "stale"
+	ContractFilesKeyCheck = "key_check"
+	ContractFilesGoMod    = "go_mod"
+	ContractFilesRouter   = "router_facts"
+)
+
+// Contract baseline outcomes: admission answers and terminal job outcomes.
+const (
+	ContractBaselineAdmitted  = "admitted"
+	ContractBaselineCoalesced = "coalesced"
+	ContractBaselineSaturated = "saturated"
+	ContractBaselineCurrent   = "current"
+	ContractBaselinePublished = "published"
+	ContractBaselineRefused   = "refused"
+	ContractBaselineFailed    = "failed"
+	ContractBaselinePanic     = "panic"
+)
+
+// Contract repair kinds: a pending input-state header no save will accept,
+// a receipt a failed apply left in flight, reindexed, and one whose
+// reindexes kept failing, excluded by a failure envelope.
+const (
+	ContractRepairPendingHeader = "pending_header"
+	ContractRepairStuckReceipt  = "stuck_receipt"
+	ContractRepairStuckEnvelope = "stuck_envelope"
+)
+
+// Committed-base generation shapes: self-contained, or composed over a parent.
+const (
+	DedicatedBaseRoot  = "root"
+	DedicatedBaseDelta = "delta"
+)
+
+// Committed-base claim outcomes — what one claim cost.
+//
+// Built is the only one that represents physical payload work. Coalesced
+// joined a build somebody else was already running (BuildReport.Coalesced).
+// Reused is the catalog's adopted-replay path: the observed identity equalled
+// the active generation's, so adoption re-confirmed it and wrote nothing.
+const (
+	DedicatedBaseBuilt     = "built"
+	DedicatedBaseCoalesced = "coalesced"
+	DedicatedBaseReused    = "reused"
+)
+
+// Publication outcomes, as the publisher's recording point sees them. They are
+// mutually exclusive and one is recorded per settled publication: a failure, a
+// repository nothing was attempted for, a re-adoption, a publication that
+// reused a physical build, or one that paid for it.
+const (
+	PublicationPublished = "published"
+	PublicationCoalesced = "coalesced"
+	PublicationReadopted = "readopted"
+	PublicationSkipped   = "skipped"
+	PublicationFailed    = "failed"
+)
+
+// Live advancement dispatch outcomes: what the HEAD-movement observer did with
+// one observation. Repeat is the accepted-commit memo hit — the commit that
+// already landed, observed again — and Refused is an observation that arrived
+// after advancement stopped.
+const (
+	AdvanceDispatched = "dispatched"
+	AdvanceRepeat     = "repeat"
+	AdvanceRefused    = "refused"
+)
+
+// Publisher-admission drain outcomes: whether closing admission completed on
+// the spot or left shutdown waiting for admitted actors.
+const (
+	DrainImmediate = "immediate"
+	DrainWaited    = "waited"
+)
+
+// Handed-off view consumers: the classes of work a request can leave running
+// behind it while still reading the payload it was served. Each names a call
+// site's role, never a checkout, a path or a generation.
+const (
+	// HandoffCheckoutRefresh is publication admitted on a selected checkout's
+	// coordinator after a source mutation committed to disk.
+	HandoffCheckoutRefresh = "checkout_refresh"
+	// HandoffFileMutation is the watcher-scheduled reindex of one mutated
+	// file.
+	HandoffFileMutation = "file_mutation"
+	// HandoffRepositoryIndex is a first index detached from the request that
+	// asked for it.
+	HandoffRepositoryIndex = "repository_index"
+	// HandoffAbandonedHandler is a handler the deadline firewall stopped
+	// waiting for while it was still reading its view.
+	HandoffAbandonedHandler = "abandoned_handler"
+)
+
+// handoffConsumers is the complete consumer vocabulary.
+var handoffConsumers = []string{
+	HandoffCheckoutRefresh,
+	HandoffFileMutation,
+	HandoffRepositoryIndex,
+	HandoffAbandonedHandler,
+}
+
+// Handoff outcomes: the lease was joined, or every holder had already
+// released and the handle was truthfully refused.
+const (
+	HandoffJoined  = "joined"
+	HandoffRefused = "refused"
 )
 
 // Checkout lifecycle states, as a metric label sees them. They mirror
@@ -216,7 +494,34 @@ const (
 	RefusedLeased  = "leased"
 	RefusedMissing = "missing"
 	RefusedError   = "error"
+	// RetireYielded and RetirePreempted label an attempt that stopped with
+	// work left on purpose rather than one that was refused: a bounded pass
+	// that committed and yielded on its budget, and one a waiting writer or
+	// the caller's deadline cut. Neither is an error.
+	RetireYielded   = "yielded"
+	RetirePreempted = "preempted"
 )
+
+// Why a generation became retirement debt: a torn or failed build's output, a
+// layer a route, a reuse cache or a fold released, or one the sweep's catalog
+// scan found with no live owner.
+const (
+	OwedTorn       = "torn"
+	OwedFailed     = "failed"
+	OwedReleased   = "released"
+	OwedDiscovered = "discovered"
+)
+
+// What held a deferred retirement pass or burst back. The foreground reasons
+// name the foreground work in flight; the rest are an edit cycle on the
+// build lane, an interactive writer, too little idle since the last
+// foreground work, a chain fold, and the WAL pause.
+var retirementStandDownReasons = []string{
+	"edit_cycle", "interactive_write", "edit_idle", "chain_fold", "wal_pause",
+	"foreground_interactive_build", "foreground_checkout_cycle",
+	"foreground_checkout_mutation", "foreground_checkout_transition",
+	"foreground_refresh_ticket", "foreground_demand",
+}
 
 // Sweep lanes: whose backlog a collection came off.
 const (
@@ -377,11 +682,46 @@ var catalog = map[string]spec{
 	GenerationRetireRefusedTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelReason, values: []string{
 			RefusedRouted, RefusedBased, RefusedLeased, RefusedMissing, RefusedError,
+			RetireYielded, RetirePreempted,
 		}},
 	}},
 	GenerationSweepCollectedTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelSweep, values: []string{SweepCheckout, SweepRefView}},
 	}},
+	RetirementQuantaTotal:      {kind: kindCounter},
+	RetirementRowsDeletedTotal: {kind: kindCounter},
+	GenerationRetireOwedTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelWhy, values: []string{OwedTorn, OwedFailed, OwedReleased, OwedDiscovered}},
+	}},
+	RetirementPassesTotal: {kind: kindCounter},
+	RetirementStandDownTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelReason, values: retirementStandDownReasons},
+	}},
+
+	DedicatedBasePublishTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelShape, values: []string{DedicatedBaseRoot, DedicatedBaseDelta}},
+	}},
+	DedicatedBaseClaimTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelOutcome, values: []string{
+			DedicatedBaseBuilt, DedicatedBaseCoalesced, DedicatedBaseReused,
+		}},
+	}},
+	DedicatedBaseClosureTruncatedTotal: {kind: kindCounter},
+	DedicatedBasePublicationTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelOutcome, values: []string{
+			PublicationPublished, PublicationCoalesced, PublicationReadopted,
+			PublicationSkipped, PublicationFailed,
+		}},
+	}},
+	DedicatedBaseAdvanceTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelOutcome, values: []string{
+			AdvanceDispatched, AdvanceRepeat, AdvanceRefused,
+		}},
+	}},
+	DedicatedBaseDrainTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelOutcome, values: []string{DrainImmediate, DrainWaited}},
+	}},
+	DependentRecompositionTotal: {kind: kindCounter},
 
 	RefViewSelectionTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelOutcome, values: []string{
@@ -398,6 +738,13 @@ var catalog = map[string]spec{
 		{name: LabelOutcome, values: []string{OutcomeOK, OutcomeError}},
 	}},
 	LeasesHeld: {kind: kindGauge},
+	HandoffTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelConsumer, values: handoffConsumers},
+		{name: LabelOutcome, values: []string{HandoffJoined, HandoffRefused}},
+	}},
+	HandoffsOutstanding: {kind: kindGauge, labels: []labelSpec{
+		{name: LabelConsumer, values: handoffConsumers},
+	}},
 
 	RequestServedTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelKind, values: []string{ViewBase, ViewWorktree, ViewRef}},
@@ -430,5 +777,49 @@ var catalog = map[string]spec{
 	ProbeAnswerTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelKind, values: []string{ViewBase, ViewWorktree, ViewUnrouted}},
 		{name: LabelExact, values: []string{AnswerExact, AnswerFallback}},
+	}},
+
+	ContractAnalysisJobsTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelMode, values: contractModes},
+		{name: LabelOutcome, values: []string{
+			ContractJobPublished, ContractJobFillContinued, ContractJobSupersededKeyMoved,
+			ContractJobSupersededInputsMoving, ContractJobSupersededReadUnsettled,
+			ContractJobSupersededPublishRefused, ContractJobPreempted,
+			ContractJobFailed, ContractJobPanic, ContractJobDeferred,
+		}},
+	}},
+	ContractAnalysisRequestsTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelResult, values: []string{
+			ContractRequestAdmitted, ContractRequestCoalesced, ContractRequestAttached,
+			ContractRequestInputsPending, ContractRequestBaselineAdmitted,
+			ContractRequestRefused, ContractRequestQueueFull, ContractRequestError,
+		}},
+	}},
+	ContractAnalysisCapturesTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelResult, values: []string{ContractCaptureOK, ContractCaptureStale, ContractCaptureError}},
+	}},
+	ContractAnalysisFilesTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelReason, values: []string{
+			ContractFilesCold, ContractFilesFill, ContractFilesDelta, ContractFilesRetry,
+			ContractFilesStale, ContractFilesKeyCheck, ContractFilesGoMod, ContractFilesRouter,
+		}},
+	}},
+	ContractAnalysisJobSeconds: {kind: kindDuration, labels: []labelSpec{
+		{name: LabelMode, values: contractModes},
+	}},
+	ContractAnalysisRoundsTotal:             {kind: kindCounter},
+	ContractAnalysisIterationsTotal:         {kind: kindCounter},
+	ContractAnalysisRequeuedTotal:           {kind: kindCounter},
+	ContractAnalysisUnstampedReadsTotal:     {kind: kindCounter},
+	ContractAnalysisPredecessorRetiredTotal: {kind: kindCounter},
+	ContractBaselineTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelOutcome, values: []string{
+			ContractBaselineAdmitted, ContractBaselineCoalesced, ContractBaselineSaturated,
+			ContractBaselineCurrent, ContractBaselinePublished, ContractBaselineRefused,
+			ContractBaselineFailed, ContractBaselinePanic,
+		}},
+	}},
+	ContractRepairTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelKind, values: []string{ContractRepairPendingHeader, ContractRepairStuckReceipt, ContractRepairStuckEnvelope}},
 	}},
 }

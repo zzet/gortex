@@ -77,7 +77,10 @@ func (s *Server) handleAPIImpact(ctx context.Context, req mcp.CallToolRequest) (
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	reg := s.effectiveContractRegistry()
+	reg, registryErr := s.contractRegistryForContext(ctx)
+	if registryErr != nil {
+		return mcp.NewToolResultError(registryErr.Error()), nil
+	}
 	if reg == nil {
 		return mcp.NewToolResultError("no contract registry available — index a repo with API routes first"), nil
 	}
@@ -335,6 +338,9 @@ func riskFromRank(n int) analysis.RiskLevel {
 // the graph (the same closure handleValidateContracts / computeContractImpact
 // use).
 func (s *Server) contractShapeLookup(ctx context.Context) contracts.ShapeLookup {
+	if binding := contractAnalysisFromContext(ctx); binding != nil {
+		return binding.shapeLookup(ctx)
+	}
 	g := s.readerFor(ctx)
 	return contracts.ShapeLookup(func(id string) *contracts.Shape {
 		n := g.GetNode(id)

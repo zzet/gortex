@@ -1108,6 +1108,12 @@ func (s *Server) searchExploreSourceLiteral(
 	if maxHits <= 0 || maxHits > exploreSourceLiteralOverlayMaxHits {
 		maxHits = exploreSourceLiteralOverlayMaxHits
 	}
+	// A request routed to a view of its own answers out of that view's bytes
+	// or not at all. The lanes below read the canonical checkout, whose lines
+	// the view may have renamed or deleted (view_source_literal.go).
+	if view := requestViewFromContext(ctx); view.readsOwnCheckout() {
+		return s.searchSourceLiteralInView(ctx, view, term, maxHits)
+	}
 	var scopeOK bool
 	scope, scopeOK = s.effectiveExploreSourceLiteralScope(ctx, scope)
 	if !scopeOK {

@@ -174,12 +174,15 @@ func TestCheckoutSearcherRebuildsWhenTheWorkingTreeMoves(t *testing.T) {
 			t.Fatalf("%d cycles ran, want the edit's own cycle to have run", ran)
 		}
 
+		before := c.textSearchStats()
 		second, err := c.textSearcher(context.Background())
 		if err != nil {
-			t.Fatalf("rebuild the checkout searcher: %v", err)
+			t.Fatalf("bring the checkout searcher up to date: %v", err)
 		}
-		if second == first {
-			t.Fatal("the searcher was not rebuilt after the working tree moved")
+		after := c.textSearchStats()
+		if after.Patches+len(after.Rebuilds) == before.Patches+len(before.Rebuilds) &&
+			after.Rebuilds[after.Last] == before.Rebuilds[after.Last] {
+			t.Fatalf("the searcher was neither patched nor rebuilt after the working tree moved: %+v", after)
 		}
 		if got := second.Grep("marker-two", 0); len(got) != 1 {
 			t.Errorf("the current working tree did not answer: %v", grepPaths(got))

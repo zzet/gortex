@@ -55,6 +55,7 @@ func (s *Store) FindNodesByNameBounded(
 	sentinel := limit + 1
 	nodes := make([]*graph.Node, 0, sentinel)
 	lastID := ""
+	inspected := 0
 	for len(nodes) < sentinel {
 		if err := ctx.Err(); err != nil {
 			return graph.BoundedNodeProjection{}, err
@@ -76,6 +77,11 @@ func (s *Store) FindNodesByNameBounded(
 				return graph.BoundedNodeProjection{}, scanErr
 			}
 			rawRows++
+			inspected++
+			if err := scope.CheckInspection(inspected); err != nil {
+				_ = rows.Close()
+				return graph.BoundedNodeProjection{}, err
+			}
 			lastID = node.ID
 			if !scope.Allows(node) {
 				continue
@@ -147,6 +153,7 @@ func (s *Store) FindFileNodesBounded(
 	sentinel := limit + 1
 	nodes := make([]*graph.Node, 0, sentinel)
 	lastID := ""
+	inspected := 0
 	for len(nodes) < sentinel {
 		if err := ctx.Err(); err != nil {
 			return graph.BoundedNodeProjection{}, err
@@ -154,7 +161,7 @@ func (s *Store) FindFileNodesBounded(
 		pageArgs := append(append([]any(nil), args...), s.viewGen, lastID, rawPageSize)
 		rows, queryErr := tx.QueryContext(
 			ctx,
-			`SELECT `+columns+` FROM nodes WHERE `+predicate+` AND view_gen = ? AND id > ? ORDER BY id LIMIT ?`,
+			`SELECT `+columns+` FROM nodes INDEXED BY nodes_by_file WHERE `+predicate+` AND view_gen = ? AND id > ? ORDER BY id LIMIT ?`,
 			pageArgs...,
 		)
 		if queryErr != nil {
@@ -174,6 +181,11 @@ func (s *Store) FindFileNodesBounded(
 				return graph.BoundedNodeProjection{}, scanErr
 			}
 			rawRows++
+			inspected++
+			if err := scope.CheckInspection(inspected); err != nil {
+				_ = rows.Close()
+				return graph.BoundedNodeProjection{}, err
+			}
 			lastID = node.ID
 			if !scope.Allows(node) {
 				continue

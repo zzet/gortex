@@ -472,7 +472,7 @@ func TestColdDeferredCohortRetainsRegisteredUniverseScope(t *testing.T) {
 	mi.mu.Unlock()
 	// The explicit cold route is valid only while this cohort's lane is
 	// held. The two other registered Indexers are not admitted as work.
-	err := idx.coordinateRepositoryMutation(context.Background(), func() error {
+	err := idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 		run := mi.beginDeferredPasses(context.Background(), nil, []*Indexer{idx}, true)
 		defer run.FinishTailResult()
 		require.Len(t, run.workIndexers, 1)

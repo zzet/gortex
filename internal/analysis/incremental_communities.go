@@ -96,9 +96,10 @@ var leidenEdgeKinds = []graph.EdgeKind{
 	graph.EdgeInstantiates,
 }
 
-func buildLeidenGraph(g graph.Store) *leidenGraph {
+func buildLeidenGraph(g graph.Store, pace *Pace) *leidenGraph {
 	symbolNodes := make(map[string]bool, g.NodeCount())
 	for n := range graph.NodesLightSeq(g) {
+		pace.Tick()
 		if n.Kind != graph.KindFile && n.Kind != graph.KindImport {
 			symbolNodes[n.ID] = true
 		}
@@ -109,6 +110,7 @@ func buildLeidenGraph(g graph.Store) *leidenGraph {
 	// The fixed kind projection mirrors edgeWeight exactly. SQLite can serve it
 	// from edges_by_kind and never transfers unrelated domain edges or Meta.
 	for e := range graph.EdgesLightSeq(g, leidenEdgeKinds...) {
+		pace.Tick()
 		if !symbolNodes[e.From] || !symbolNodes[e.To] {
 			continue
 		}
@@ -122,6 +124,7 @@ func buildLeidenGraph(g graph.Store) *leidenGraph {
 
 	neighbors := make(map[string]map[string]float64)
 	for k, w := range weights {
+		pace.Tick()
 		if neighbors[k.a] == nil {
 			neighbors[k.a] = make(map[string]float64)
 		}
@@ -140,6 +143,7 @@ func buildLeidenGraph(g graph.Store) *leidenGraph {
 
 	degree := make(map[string]float64)
 	for id := range symbolNodes {
+		pace.Tick()
 		for _, w := range neighbors[id] {
 			degree[id] += w
 		}
@@ -250,13 +254,14 @@ func packageKey(filePath string) string {
 // kind change, or edge added/removed/reweighted flips the
 // fingerprint of every package it touches and leaves all others
 // bit-identical.
-func fingerprintPackages(g graph.Store) map[string]uint64 {
+func fingerprintPackages(g graph.Store, pace *Pace) map[string]uint64 {
 	// Symbol-node filter + each node's package, mirroring
 	// buildLeidenGraph so the fingerprint and the partition agree on
 	// what counts.
 	pkgOf := make(map[string]string, g.NodeCount())
 	fp := make(map[string]uint64)
 	for n := range graph.NodesLightSeq(g) {
+		pace.Tick()
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
@@ -272,6 +277,7 @@ func fingerprintPackages(g graph.Store) map[string]uint64 {
 	}
 
 	for e := range graph.EdgesLightSeq(g, leidenEdgeKinds...) {
+		pace.Tick()
 		fromPkg, fromOK := pkgOf[e.From]
 		toPkg, toOK := pkgOf[e.To]
 		if !fromOK || !toOK {
@@ -348,12 +354,23 @@ func DetectCommunitiesLeidenIncremental(
 	g graph.Store,
 	cache *LeidenPartitionCache,
 ) (*CommunityResult, *LeidenPartitionCache, IncrementalCommunityStats) {
-	curFP := fingerprintPackages(g)
+	return DetectCommunitiesLeidenIncrementalPaced(g, cache, nil)
+}
+
+// DetectCommunitiesLeidenIncrementalPaced is DetectCommunitiesLeidenIncremental
+// with a cooperative scheduling point in every hot loop (see Pace). A nil Pace
+// never parks.
+func DetectCommunitiesLeidenIncrementalPaced(
+	g graph.Store,
+	cache *LeidenPartitionCache,
+	pace *Pace,
+) (*CommunityResult, *LeidenPartitionCache, IncrementalCommunityStats) {
+	curFP := fingerprintPackages(g, pace)
 	stats := IncrementalCommunityStats{TotalPackages: len(curFP)}
 	edgeRev := g.EdgeIdentityRevisions()
 
 	fullRecompute := func(reason string) (*CommunityResult, *LeidenPartitionCache, IncrementalCommunityStats) {
-		result, part := detectCommunitiesLeidenRaw(g, defaultLeidenOptions())
+		result, part := detectCommunitiesLeidenRaw(g, defaultLeidenOptions(), pace)
 		stats.Incremental = false
 		stats.FullRecomputeReason = reason
 		newCache := &LeidenPartitionCache{
@@ -398,14 +415,14 @@ func DetectCommunitiesLeidenIncremental(
 	// rebuild the CommunityResult from the cached raw partition so
 	// the caller always gets a freshly-labelled result, but no
 	// re-partitioning happens.
-	lg := buildLeidenGraph(g)
+	lg := buildLeidenGraph(g, pace)
 	if lg == nil {
 		// The graph lost all its clustering edges since the cache
 		// was built — fall back rather than reuse a stale partition.
 		return fullRecompute("graph has no clustering edges")
 	}
 
-	result, newPart := incrementalLeiden(g, lg, cache, changed)
+	result, newPart := incrementalLeiden(g, lg, cache, changed, pace)
 	stats.Incremental = true
 	stats.RepartitionedNodes = newPart.repartitioned
 	newCache := &LeidenPartitionCache{
@@ -436,10 +453,12 @@ func incrementalLeiden(
 	lg *leidenGraph,
 	cache *LeidenPartitionCache,
 	changedPkgs map[string]bool,
+	pace *Pace,
 ) (*CommunityResult, incrementalResult) {
 	// Package of every current symbol node.
 	pkgOf := make(map[string]string, len(lg.symbolNodes))
 	for n := range graph.NodesLightSeq(g) {
+		pace.Tick()
 		if lg.symbolNodes[n.ID] {
 			pkgOf[n.ID] = packageKey(n.FilePath)
 		}
@@ -490,12 +509,12 @@ func incrementalLeiden(
 		finalComm[id] = c
 	}
 	leidenRestrictedLocalMoves(
-		movableIDs, movable, lg.neighbors, lg.degree, lg.totalWeight, finalComm,
+		movableIDs, movable, lg.neighbors, lg.degree, lg.totalWeight, finalComm, pace,
 	)
 
 	// Everything else (unchanged, non-boundary) already carries its
 	// cached community via the seed copy above, untouched.
-	result := buildCommunityResult(g, finalComm, lg.neighbors, lg.totalWeight, lg.degree)
+	result := buildCommunityResult(g, finalComm, lg.neighbors, lg.totalWeight, lg.degree, pace)
 	return result, incrementalResult{
 		partition: &leidenPartition{
 			comm:        finalComm,
@@ -533,6 +552,7 @@ func leidenRestrictedLocalMoves(
 	degree map[string]float64,
 	totalWeight float64,
 	comm map[string]string,
+	pace *Pace,
 ) {
 	if totalWeight == 0 || len(movableIDs) == 0 {
 		return
@@ -553,6 +573,7 @@ func leidenRestrictedLocalMoves(
 	}
 
 	for len(queue) > 0 {
+		pace.Tick()
 		id := queue[0]
 		queue = queue[1:]
 		delete(inQueue, id)

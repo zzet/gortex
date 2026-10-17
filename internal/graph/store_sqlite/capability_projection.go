@@ -6,10 +6,45 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// capabilityProjectionHighWaterQuery keeps the legacy base-corpus access path,
-// but makes the partial (view_gen, id) index eligible for derived generations.
-func capabilityProjectionHighWaterQuery(viewGen int64) string {
-	const query = `SELECT COALESCE(MAX(id), 0) FROM edges WHERE view_gen = ?`
+// edgeGenerationHighWaterSQL is one generation's highest edge id. With the
+// dense edges_by_generation (view_gen, id) index present it is pinned there
+// (INDEXED BY): a single seek to the end of the generation's range. Unpinned,
+// a store whose sqlite_stat1 carries a row for edges_by_generation but none
+// for edges_by_to (what the open-time statistics repair leaves) answers the
+// MAX by a covering scan of edges_by_to's view_gen prefix — every edge of the
+// generation, seconds on a large store, on every scoped edge projection. The
+// index is optional (a store may lack it), so without it the unpinned form
+// keeps working.
+func edgeGenerationHighWaterSQL(indexed bool) string {
+	if indexed {
+		return `SELECT COALESCE(MAX(id), 0) FROM edges INDEXED BY edges_by_generation WHERE view_gen = ?`
+	}
+	return `SELECT COALESCE(MAX(id), 0) FROM edges WHERE view_gen = ?`
+}
+
+// edgeGenerationIndexPresent reports whether edges_by_generation exists. It
+// is probed per call (one catalog lookup) because the index can be dropped
+// and recreated under an open store.
+func (s *Store) edgeGenerationIndexPresent() bool {
+	var present bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?)`,
+		edgesByGenerationIndexName).Scan(&present); err != nil {
+		return false
+	}
+	return present
+}
+
+// edgeGenerationHighWater returns the current generation's highest edge id.
+func (s *Store) edgeGenerationHighWater() (int64, error) {
+	var maxID int64
+	err := s.db.QueryRow(edgeGenerationHighWaterSQL(s.edgeGenerationIndexPresent()), s.viewGen).Scan(&maxID)
+	return maxID, err
+}
+
+// capabilityProjectionHighWaterQuery is edgeGenerationHighWaterSQL; a derived
+// generation adds the historical positive bound.
+func capabilityProjectionHighWaterQuery(viewGen int64, indexed bool) string {
+	query := edgeGenerationHighWaterSQL(indexed)
 	if viewGen > 0 {
 		return query + ` AND view_gen > 0`
 	}
@@ -86,7 +121,7 @@ func (s *Store) ScanRepoCapabilityEdges(
 	}
 
 	var highWater int64
-	if err := s.db.QueryRow(capabilityProjectionHighWaterQuery(s.viewGen), s.viewGen).Scan(&highWater); err != nil {
+	if err := s.db.QueryRow(capabilityProjectionHighWaterQuery(s.viewGen, s.edgeGenerationIndexPresent()), s.viewGen).Scan(&highWater); err != nil {
 		panicOnFatal(err)
 		return
 	}

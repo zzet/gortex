@@ -21,7 +21,7 @@ func (s *Server) registerBootstrapResources() {
 		mcp.NewResource(
 			"gortex://index-health",
 			"Index Health",
-			mcp.WithResourceDescription("Health score, parse failures, stale files, language coverage. Read at session start to confirm the index is current. Same payload as the `index_health` tool."),
+			mcp.WithResourceDescription("Health score, parse failures, stale files, language coverage. Read at session start to confirm the index is current. Same payload as the `index_health` tool. Read from a session bound to a view, the payload names `base_scoped`: this probe describes the indexed corpus, not the selected checkout."),
 			mcp.WithMIMEType("application/json"),
 		),
 		s.handleResourceIndexHealth,

@@ -341,7 +341,7 @@ func facadeFallbackPublicPath(spec facadeOperationSpec, field string) facadePubl
 
 func facadeColdDomain(facade string) bool {
 	switch facade {
-	case "publish_review", "pr", "recall", "remember", "workspace", "workspace_admin", "overlay", "response":
+	case "publish_review", "pr", "recall", "remember", "workspace", "workspace_admin", "overlay", "response", "session":
 		return true
 	default:
 		return false

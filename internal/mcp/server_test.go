@@ -14,6 +14,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/query"
 
 	"os"
@@ -23,6 +24,11 @@ import (
 )
 
 func setupTestServer(t *testing.T) (*Server, string) {
+	t.Helper()
+	return setupTestServerWithRegistry(t, testRegistry())
+}
+
+func setupTestServerWithRegistry(t *testing.T, reg *parser.Registry) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
 	// Fixture deliberately has zero external imports so the
@@ -43,7 +49,6 @@ func helper() {}
 `), 0o644)
 
 	g := graph.New()
-	reg := testRegistry()
 	cfg := config.Default()
 	idx := indexer.New(g, reg, cfg.Index, zap.NewNop())
 	_, err := idx.Index(dir)

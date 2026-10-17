@@ -392,8 +392,11 @@ func TestPlannerStatsHealth_ReportsCardinalities(t *testing.T) {
 		if fallback.Nodes.Believed == 0 {
 			t.Fatalf("nodes believed fell to 0 with nodes_by_kind absent; the nodes_by_file fallback did not answer")
 		}
-		if fallback.Stale {
-			t.Errorf("fallback path reported stale: %q", fallback.Reason)
+		// The cardinality is answered by the fallback; the missing row itself
+		// is owed (any planner index that holds rows and has no statistics
+		// row is), where it once read fresh.
+		if !fallback.Stale || fallback.Reason != "missing:nodes_by_kind" {
+			t.Errorf("fallback path: stale=%v reason=%q, want missing:nodes_by_kind", fallback.Stale, fallback.Reason)
 		}
 	})
 }
@@ -1326,6 +1329,14 @@ func statRowsFor(t *testing.T, s *Store, indexes []string) map[string]string {
 	for _, idx := range indexes {
 		stat, ok := statRowFor(t, s, idx)
 		if !ok {
+			// A partial index that holds nothing legitimately has no row
+			// (ANALYZE writes none for it, and absence beats a zero row).
+			if spec := plannerStatsIndexProbes[idx]; spec.partial {
+				var hasRows bool
+				if err := s.db.QueryRow(spec.existsQuery(idx)).Scan(&hasRows); err == nil && !hasRows {
+					continue
+				}
+			}
 			t.Fatalf("fixture left no stat row for %s", idx)
 		}
 		rows[idx] = stat

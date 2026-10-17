@@ -1,0 +1,524 @@
+package indexer
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"slices"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+)
+
+// Capture callbacks are installed by the selected-view owner, which retains
+// its leases and applies file-mask visibility. The physical storage backend
+// must not guess an ancestry, a carried actor, or a latest sibling checkout.
+type contractCoreStorageCapture struct {
+	Prior      func(context.Context, string) (*graph.ContractBoundaryReceipt, *graph.ContractBoundaryReceiptSource, bool, error)
+	Dependents func(context.Context, []string) ([]contractCoreDependent, error)
+}
+
+// This backend is scoped to an already-serialized core apply interval. Header
+// eligibility and file receipt acceptance are separate: bounded completed
+// chunks may drain their receipts while the primary namespace remains blocked
+// until its outer core/source acceptance fence.
+type contractCoreStorageBackend struct {
+	mu              sync.Mutex
+	store           *store_sqlite.Store
+	repo, checkout  string
+	generation      int64
+	capture         contractCoreStorageCapture
+	state, expected *graph.ContractInputState
+	headerPending   bool
+	// A single later edit cannot certify an interrupted namespace's census.
+	// It may publish core changes while contract reconciliation remains owed.
+	recovering     bool
+	stateInstalled bool
+	staged         map[string]graph.ContractBoundaryReceipt
+	sources        map[string]graph.ContractBoundaryReceiptSource
+	fullNamespace  bool
+	coldSemantic   map[string]string
+	cold           bool
+	coldRows       []graph.ContractBoundaryReceipt
+	coldSources    []graph.ContractBoundaryReceiptSource
+	coldBytes      int
+
+	// stagedSeqs holds the write seq of each primary receipt this mutation
+	// staged and has not accepted.
+	stagedSeqs map[string]uint64
+	// windowGaps holds the quiet gaps the stagings' windows recorded, for the
+	// journal's window lines.
+	windowGaps []store_sqlite.ContractCoreWindowGap
+}
+
+func newContractCoreStorageBackend(store *store_sqlite.Store, repo, checkout string, generation int64, cumulative, expected *graph.ContractInputState, capture contractCoreStorageCapture) (*contractCoreStorageBackend, error) {
+	if store == nil || capture.Prior == nil || capture.Dependents == nil || generation < 0 || store.ViewGeneration() != generation {
+		return nil, fmt.Errorf("contract core storage: incomplete selected capture")
+	}
+	copyState := func(state *graph.ContractInputState) *graph.ContractInputState {
+		if state == nil {
+			return nil
+		}
+		copy := *state
+		return &copy
+	}
+	return &contractCoreStorageBackend{store: store, repo: repo, checkout: checkout, generation: generation,
+		capture: capture, state: copyState(cumulative), expected: copyState(expected), stateInstalled: generation == 0 && expected != nil,
+		recovering: generation == 0 && (expected == nil || !expected.Accepted),
+		staged:     make(map[string]graph.ContractBoundaryReceipt), sources: make(map[string]graph.ContractBoundaryReceiptSource)}, nil
+}
+
+// The primary lane owns exactly physical0. Sparse builders supply their actual
+// selected, leased predecessor callbacks instead of using this constructor.
+func newPrimaryContractCoreStorageBackend(ctx context.Context, store *store_sqlite.Store, repo string) (*contractCoreStorageBackend, error) {
+	if ctx == nil || store == nil || store.ViewGeneration() != 0 {
+		return nil, fmt.Errorf("contract core storage: missing primary context/store")
+	}
+	state, found, err := store.ContractInputStateContext(ctx, repo, "")
+	if err != nil {
+		return nil, err
+	}
+	var expected *graph.ContractInputState
+	if found {
+		expected = &state
+	}
+	capture := contractCoreStorageCapture{
+		Prior: func(ctx context.Context, path string) (*graph.ContractBoundaryReceipt, *graph.ContractBoundaryReceiptSource, bool, error) {
+			row, known, err := store.ContractBoundaryReceiptForVersionContext(ctx, repo, "", path, contractBoundaryReceiptVersion)
+			return row, nil, known, err
+		},
+		Dependents: func(ctx context.Context, keys []string) ([]contractCoreDependent, error) {
+			rows, err := store.ContractBoundaryReceiptsForLookupKeysContext(ctx, keys, 4096)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]contractCoreDependent, 0, len(rows))
+			for _, row := range rows {
+				out = append(out, contractCoreDependent{RepoPrefix: row.RepoPrefix, CheckoutID: row.CheckoutID,
+					FilePath: row.FilePath, ReceiptVersion: row.Version, ReceiptFingerprint: row.Fingerprint,
+					SourceFingerprint: row.SourceFingerprint, Accepted: row.Accepted, Scope: row.Scope})
+			}
+			return out, nil
+		},
+	}
+	return newContractCoreStorageBackend(store, repo, "", 0, expected, expected, capture)
+}
+
+func (b *contractCoreStorageBackend) PriorBoundaryReceipt(ctx context.Context, path string) (*contractBoundaryReceipt, bool, error) {
+	row, source, known, err := b.capture.Prior(ctx, path)
+	if err != nil {
+		return nil, false, err
+	}
+	if source != nil {
+		b.mu.Lock()
+		// The carry seeds an empty target path. A path this build already
+		// staged (a retried or re-derived parse) has its row in the target, so
+		// carrying it again would trip the store's carry guard; its new
+		// receipt simply replaces the staged one. The prior stays the
+		// predecessor's, a superset diff.
+		if _, staged := b.staged[path]; !staged {
+			b.sources[path] = *source
+		}
+		b.mu.Unlock()
+	}
+	return contractCorePriorReceipt(row, known)
+}
+
+func (b *contractCoreStorageBackend) BoundaryDependents(ctx context.Context, keys []string) ([]contractCoreDependent, error) {
+	return b.capture.Dependents(ctx, keys)
+}
+
+// contractCoreBeginFault, when set by a test, refuses the begin of one path the
+// way a failed cold-row flush or a refused receipt write would.
+var contractCoreBeginFault atomic.Pointer[func(path string) error]
+
+// contractCoreAcceptHold, when set by a test, ends a repository's completed
+// mutations the way an overtaken one ends: settled, never accepted, with no
+// Published event. It is a test seam only: production never sets it, and the
+// check on the accept path is one atomic load of a nil pointer.
+var contractCoreAcceptHold atomic.Pointer[func(repo string) bool]
+
+func contractCoreAcceptHeld(repo string) bool {
+	hold := contractCoreAcceptHold.Load()
+	return hold != nil && *hold != nil && (*hold)(repo)
+}
+
+// SettleBoundaryMutation settles the receipts this primary mutation staged
+// and never accepted: the mutation completed every core write, then lost its
+// owner to a newer one. The rows stay unaccepted; until a newer write of a
+// path begins, its core rows are complete.
+func (b *contractCoreStorageBackend) SettleBoundaryMutation() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.generation != 0 || b.cold || len(b.stagedSeqs) == 0 {
+		return
+	}
+	b.store.SettleContractReceiptWrites(b.repo, b.checkout, b.stagedSeqs)
+}
+
+// EndBoundaryCoreWrites closes the core-write windows of the receipts this
+// primary mutation staged: its body ended every core write of their files,
+// whether or not anything accepts them.
+func (b *contractCoreStorageBackend) EndBoundaryCoreWrites() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.generation != 0 || b.cold || len(b.stagedSeqs) == 0 {
+		return
+	}
+	b.store.EndContractCoreWrites(b.repo, b.checkout, b.stagedSeqs)
+}
+
+// OrphanBoundaryCoreWrites marks the core-write windows of the receipts this
+// primary mutation staged and its failed body left open: nothing of this
+// mutation will close them.
+func (b *contractCoreStorageBackend) OrphanBoundaryCoreWrites() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.generation != 0 || b.cold || len(b.stagedSeqs) == 0 {
+		return
+	}
+	b.store.OrphanContractCoreWrites(b.repo, b.checkout, b.stagedSeqs)
+}
+
+// PriorFailureEnvelope reports whether path's selected prior receipt is a
+// failure envelope, which the decoded-receipt API reports only as unknown.
+func (b *contractCoreStorageBackend) PriorFailureEnvelope(ctx context.Context, path string) (bool, error) {
+	row, _, _, err := b.capture.Prior(ctx, path)
+	if err != nil {
+		return false, err
+	}
+	return contractReceiptIsFailureEnvelope(row), nil
+}
+
+// holdNamespacePending keeps a cold namespace's input-state header pending
+// at acceptance: its file receipts are accepted, the header is left for the
+// baseline to certify. A cold door uses it when it could not stage the
+// failure envelopes that exclude its failed files.
+func (b *contractCoreStorageBackend) holdNamespacePending() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.recovering = true
+}
+
+func (b *contractCoreStorageBackend) BeginBoundaryMutation(ctx context.Context, changes []contractCoreInputChange) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if fault := contractCoreBeginFault.Load(); fault != nil {
+		for _, change := range changes {
+			if err := (*fault)(change.FilePath); err != nil {
+				return err
+			}
+		}
+	}
+	if b.cold {
+		for _, change := range changes {
+			row, e := contractCoreStoredReceipt(b.repo, b.checkout, change)
+			if e != nil {
+				return e
+			}
+			if len(b.coldRows) > 0 && (len(b.coldRows) >= 64 || b.coldBytes+len(row.Payload) > contractCoreReceiptPayloadLimit) {
+				if e := b.flushColdRows(ctx); e != nil {
+					return e
+				}
+			}
+			if b.fullNamespace {
+				if b.coldSemantic == nil {
+					b.coldSemantic = make(map[string]string)
+				}
+				if change.Current != nil {
+					semantic := *change.Current
+					semantic.Source = ""
+					encoded, err := json.Marshal(semantic)
+					if err != nil {
+						return err
+					}
+					b.coldSemantic[row.FilePath] = contractInputHash(encoded)
+				} else {
+					b.coldSemantic[row.FilePath] = row.Fingerprint
+				}
+			}
+			source, carry := b.sources[change.FilePath]
+			delete(b.sources, change.FilePath)
+			if pending := slices.IndexFunc(b.coldRows, func(r graph.ContractBoundaryReceipt) bool {
+				return r.FilePath == row.FilePath
+			}); pending >= 0 {
+				// A second begin for a path still in the unflushed chunk
+				// replaces its row; the chunk already carries its source once.
+				b.coldBytes += len(row.Payload) - len(b.coldRows[pending].Payload)
+				b.coldRows[pending] = row
+				continue
+			}
+			b.coldRows = append(b.coldRows, row)
+			b.coldBytes += len(row.Payload)
+			if _, staged := b.staged[change.FilePath]; carry && !staged {
+				b.coldSources = append(b.coldSources, source)
+			}
+		}
+		return nil
+	}
+	rows := make([]graph.ContractBoundaryReceipt, 0, len(changes))
+	bounded := append([]contractCoreInputChange(nil), changes...)
+	var sources []graph.ContractBoundaryReceiptSource
+	for i, change := range changes {
+		row, err := contractCoreStoredReceipt(b.repo, b.checkout, change)
+		if err != nil {
+			return err
+		}
+		if slices.Contains(row.Scope.Causes, "contract_receipt_envelope_exceeded") {
+			bounded[i].Delta.Scope = row.Scope
+			bounded[i].Current = nil
+			bounded[i].Uncertainty = "contract_receipt_envelope_exceeded"
+			bounded[i].Delta.ChangedProducedKeys = nil
+		}
+		rows = append(rows, row)
+		if source, ok := b.sources[change.FilePath]; ok {
+			sources = append(sources, source)
+		}
+	}
+	next, changed, err := nextContractCoreInputState(b.state, b.repo, b.checkout, bounded)
+	if err != nil {
+		return err
+	}
+	var work []graph.ContractWork
+	if changed {
+		work, err = contractCoreWorkForChanges(b.generation, next, bounded)
+		if err != nil {
+			return err
+		}
+		if len(work) == 0 {
+			// A missing cumulative baseline is not a certified zero registry.
+			work, err = contractCoreWorkForChanges(b.generation, next, []contractCoreInputChange{{FilePath: b.repo + "/", Delta: contractBoundaryDelta{Scope: graph.ContractWorkScope{Unknown: true, Causes: []string{"namespace_baseline_unknown"}}}}})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if b.generation == 0 {
+		if changed {
+			err = b.store.BeginContractInputMutationWithReceiptsContext(ctx, b.expected, next, work, rows)
+		} else {
+			err = b.store.SetContractBoundaryReceiptsContext(ctx, rows)
+		}
+	} else {
+		for i := range rows {
+			rows[i].Accepted = true
+		}
+		next.Accepted = true
+		if changed || !b.stateInstalled {
+			err = b.store.SetContractInputStateWithWorkReceiptsAndSourcesContext(ctx, b.expected, next, work, rows, sources)
+		} else {
+			err = b.store.SetContractBoundaryReceiptsWithSourcesContext(ctx, rows, sources)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if changed || !b.stateInstalled {
+		b.state, b.expected = &next, &next
+		b.headerPending = b.generation == 0
+		b.stateInstalled = true
+	}
+	paths := make([]string, 0, len(rows))
+	for _, row := range rows {
+		// Durable rows own payloads, lookup memberships and the old receipt.
+		// The cold foreground retains only a compact acceptance identity.
+		row.Payload, row.LookupKeys, row.ProducedKeys, row.Previous = nil, nil, nil, nil
+		row.Scope = graph.ContractWorkScope{}
+		b.staged[row.FilePath] = row
+		delete(b.sources, row.FilePath)
+		paths = append(paths, row.FilePath)
+	}
+	if b.generation == 0 {
+		// The serialized apply interval admits no other write of these
+		// receipts before this mutation ends, so these are its own seqs.
+		if b.stagedSeqs == nil {
+			b.stagedSeqs = make(map[string]uint64, len(paths))
+		}
+		seqs := b.store.ContractReceiptWriteSeqs(b.repo, b.checkout, paths)
+		maps.Copy(b.stagedSeqs, seqs)
+		// The quiet gaps the windows this staging opened recorded.
+		for _, gap := range b.store.ContractCoreWindowGaps(b.repo, paths, time.Time{}) {
+			if gap.Seq == seqs[gap.Path] {
+				b.windowGaps = append(b.windowGaps, gap)
+			}
+		}
+	}
+	return nil
+}
+
+// takeWindowGaps returns, once, the quiet gaps the windows this mutation's
+// stagings opened recorded, with the repository they belong to.
+func (b *contractCoreStorageBackend) takeWindowGaps() (string, []store_sqlite.ContractCoreWindowGap) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	gaps := b.windowGaps
+	b.windowGaps = nil
+	return b.repo, gaps
+}
+
+// Called only after the corresponding existing core graph/source receipt
+// fence. It bounds retained payload memory without certifying namespace-ready.
+func (b *contractCoreStorageBackend) AcceptBoundaryFiles(ctx context.Context, paths []string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.acceptBoundaryFiles(ctx, paths)
+}
+
+func (b *contractCoreStorageBackend) acceptBoundaryFiles(ctx context.Context, paths []string) error {
+	paths = appendUniqueSorted(nil, paths...)
+	for start := 0; start < len(paths); start += 64 {
+		chunk := paths[start:min(start+64, len(paths))]
+		stored, err := b.store.ContractBoundaryReceiptsForPathsContext(ctx, b.repo, b.checkout, chunk)
+		if err != nil {
+			return err
+		}
+		rows := make([]graph.ContractBoundaryReceipt, 0, len(chunk))
+		for _, path := range chunk {
+			expected, staged := b.staged[path]
+			if !staged {
+				continue
+			}
+			actual := stored[path]
+			if actual == nil || actual.Version != expected.Version || actual.Fingerprint != expected.Fingerprint ||
+				actual.SourceFingerprint != expected.SourceFingerprint || actual.Accepted != expected.Accepted || actual.Deleted != expected.Deleted {
+				return fmt.Errorf("contract core storage: staged receipt changed before acceptance: %s", path)
+			}
+			if !actual.Accepted {
+				rows = append(rows, *actual)
+			}
+		}
+		if err := b.store.AcceptContractBoundaryReceiptsContext(ctx, rows); err != nil {
+			return err
+		}
+		for _, path := range chunk {
+			delete(b.staged, path)
+			delete(b.stagedSeqs, path)
+		}
+	}
+	return nil
+}
+
+func (b *contractCoreStorageBackend) AcceptBoundaryMutation(ctx context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.flushColdRows(ctx); err != nil {
+		return err
+	}
+	paths := make([]string, 0, len(b.staged))
+	for path := range b.staged {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	if err := b.acceptBoundaryFiles(ctx, paths); err != nil {
+		return err
+	}
+	if b.cold && b.fullNamespace && b.generation > 0 {
+		identity, err := json.Marshal(b.coldSemantic)
+		if err != nil {
+			return err
+		}
+		next := *b.expected
+		next.InputFingerprint = contractInputHash(append([]byte(contractCoreInputVersion+":full:"+b.repo+":"), identity...))
+		next.Accepted = true
+		changes := []contractCoreInputChange{{FilePath: b.repo + "/", Delta: contractBoundaryDelta{Scope: graph.ContractWorkScope{Unknown: true, Causes: []string{"full_core_census_complete"}}}}}
+		work, err := contractCoreWorkForChanges(b.generation, next, changes)
+		if err != nil {
+			return err
+		}
+		if err := b.store.SetContractInputStateWithWorkContext(ctx, b.expected, next, work); err != nil {
+			return err
+		}
+		if err := b.store.SetContractBoundaryReceiptBaselineContext(ctx, graph.ContractBoundaryReceiptBaseline{RepoPrefix: b.repo, CheckoutID: b.checkout, Version: contractBoundaryReceiptVersion, Fingerprint: next.InputFingerprint}); err != nil {
+			return err
+		}
+		b.state, b.expected = &next, &next
+		b.fullNamespace = false
+	}
+	if b.headerPending && !b.recovering {
+		if err := b.store.AcceptContractInputMutationWithReceiptsContext(ctx, *b.expected, nil); err != nil {
+			return err
+		}
+		b.expected.Accepted = true
+		b.headerPending = false
+	}
+	return nil
+}
+
+// A full pass blocks the namespace once BEFORE reset/drain/core writes. Its
+// optional receipts then flush in bounded chunks rather than a state transaction
+// per parsed file. The initial unknown scope covers additions and removals even
+// if cancellation prevents the final receipt chunk from being persisted.
+func (b *contractCoreStorageBackend) beginFullCoreNamespace(ctx context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Sparse positive generations already journal their selected per-file
+	// changes. Their narrowed source walk is not a full namespace census.
+	if b.cold || b.generation > 0 && !b.fullNamespace {
+		return nil
+	}
+	changes := []contractCoreInputChange{{FilePath: b.repo + "/", Delta: contractBoundaryDelta{Scope: graph.ContractWorkScope{Unknown: true, Causes: []string{"full_core_census_pending"}}}}}
+	next, _, e := nextContractCoreInputState(b.state, b.repo, b.checkout, changes)
+	if e != nil {
+		return e
+	}
+	work, e := contractCoreWorkForChanges(b.generation, next, changes)
+	if e != nil {
+		return e
+	}
+	if b.generation == 0 {
+		e = b.store.BeginContractInputMutationContext(ctx, b.expected, next, work)
+		b.headerPending = true
+	} else {
+		next.Accepted = true
+		e = b.store.SetContractInputStateWithWorkContext(ctx, b.expected, next, work)
+	}
+	if e != nil {
+		return e
+	}
+	b.state = &next
+	b.expected = &next
+	b.stateInstalled = true
+	b.cold = true
+	return nil
+}
+func (b *contractCoreStorageBackend) flushColdRows(ctx context.Context) error {
+	if len(b.coldRows) == 0 {
+		return nil
+	}
+	rows := b.coldRows
+	var e error
+	if b.generation == 0 {
+		e = b.store.SetContractBoundaryReceiptsContext(ctx, rows)
+	} else {
+		for i := range rows {
+			rows[i].Accepted = true
+		}
+		e = b.store.SetContractBoundaryReceiptsWithSourcesContext(ctx, rows, b.coldSources)
+	}
+	if e != nil {
+		return e
+	}
+	for _, row := range rows {
+		row.Payload = nil
+		row.LookupKeys = nil
+		row.ProducedKeys = nil
+		row.Previous = nil
+		row.Scope = graph.ContractWorkScope{}
+		b.staged[row.FilePath] = row
+	}
+	b.coldRows = nil
+	b.coldSources = nil
+	b.coldBytes = 0
+	return nil
+}
+
+func (b *contractCoreStorageBackend) hasPendingColdNamespace() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cold
+}

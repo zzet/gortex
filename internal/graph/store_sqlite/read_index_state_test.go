@@ -1,6 +1,7 @@
 package store_sqlite_test
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 
@@ -75,4 +76,43 @@ func TestReadRepoIndexStates_ConcurrentWithOpenStore(t *testing.T) {
 	got, err = store_sqlite.ReadRepoIndexStates(path)
 	require.NoError(t, err)
 	require.Equal(t, "feedface", got["live"].IndexedSHA)
+}
+
+// TestReadRepoIndexStates_IsBaseOnly pins the declared scope of this door: it
+// reads the base generation and nothing else.
+//
+// The predicate was a literal `view_gen = 0` in the SQL; it is now bound from
+// RepoIndexStateBaseViewGen, which is the constant `gortex repos` declares its
+// output scope with. A reader that started returning derived rows would make
+// that declaration a lie, and this is the test that notices.
+func TestReadRepoIndexStates_IsBaseOnly(t *testing.T) {
+	require.Equal(t, 0, store_sqlite.RepoIndexStateBaseViewGen,
+		"the base generation is zero everywhere else in the store")
+
+	path := filepath.Join(t.TempDir(), "scoped.sqlite")
+	st, err := store_sqlite.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, st.SetRepoIndexState(graph.RepoIndexState{
+		RepoPrefix: "base-repo",
+		IndexedSHA: "aaaa",
+		IndexedAt:  100,
+	}))
+	require.NoError(t, st.Close())
+
+	// A derived generation's row, written the way a routed worktree's build
+	// stamps one: same table, same shape, a non-base view generation.
+	db, err := sql.Open("sqlite", path)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+INSERT INTO repo_index_state
+  (view_gen, repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp, node_count, edge_count, extractor_versions)
+VALUES (7, 'derived-repo', 'bbbb', 0, 200, '', 0, 0, '')`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	got, err := store_sqlite.ReadRepoIndexStates(path)
+	require.NoError(t, err)
+	require.Contains(t, got, "base-repo", "the base row is what this door serves")
+	require.NotContains(t, got, "derived-repo",
+		"a derived generation's freshness leaked through a door that declares itself base-only")
 }

@@ -13,6 +13,10 @@ const (
 	sourceDerivedImportFingerprintMeta   = "source_derived_import_fingerprint"
 	sourceDerivedRuntimeFingerprintMeta  = "source_derived_runtime_fingerprint"
 	sourceDerivedArtifactFingerprintMeta = "source_derived_artifact_fingerprint"
+	// sourceDerivedHierarchyFingerprintMeta is the part of the declarations
+	// fingerprint the hierarchy passes read: type-like and method nodes and
+	// the declaration edges (derivedFingerprints.hierarchy).
+	sourceDerivedHierarchyFingerprintMeta = "source_derived_hierarchy_fingerprint"
 )
 
 type DerivedInvalidationFlags uint32
@@ -52,6 +56,28 @@ type DerivedInvalidationPlan struct {
 	InertFiles             int                      `json:"inert_files,omitempty"`
 	LegacyFallback         bool                     `json:"legacy_fallback,omitempty"`
 	CSharpHierarchyChanged bool                     `json:"csharp_hierarchy_changed,omitempty"`
+	// HierarchyUnchanged are the files whose hierarchy fingerprint
+	// (derivedFingerprints.hierarchy) the change left as it was: their
+	// inferred implements/overrides rows are the prior ones.
+	HierarchyUnchanged []string `json:"hierarchy_unchanged,omitempty"`
+}
+
+// hierarchyUnchanged reports whether every file of the plan left its
+// hierarchy as it was.
+func (p DerivedInvalidationPlan) hierarchyUnchanged() bool {
+	if len(p.Files) == 0 || len(p.HierarchyUnchanged) < len(p.Files) {
+		return false
+	}
+	unchanged := make(map[string]struct{}, len(p.HierarchyUnchanged))
+	for _, f := range p.HierarchyUnchanged {
+		unchanged[f] = struct{}{}
+	}
+	for _, f := range p.Files {
+		if _, ok := unchanged[f]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (p DerivedInvalidationPlan) Empty() bool {
@@ -73,6 +99,7 @@ func (p *DerivedInvalidationPlan) Merge(other DerivedInvalidationPlan) {
 	p.CSharpHierarchyChanged = p.CSharpHierarchyChanged || other.CSharpHierarchyChanged
 	p.Files = appendUniqueSorted(p.Files, other.Files...)
 	p.TypeIDs = appendUniqueSorted(p.TypeIDs, other.TypeIDs...)
+	p.HierarchyUnchanged = appendUniqueSorted(p.HierarchyUnchanged, other.HierarchyUnchanged...)
 	p.ContractGroups = mergeContractGroups(p.ContractGroups, other.ContractGroups...)
 	p.ContractSymbolIDs = appendUniqueSorted(p.ContractSymbolIDs, other.ContractSymbolIDs...)
 	p.ContractBridgeNodeIDs = appendUniqueSorted(p.ContractBridgeNodeIDs, other.ContractBridgeNodeIDs...)
@@ -125,6 +152,22 @@ type derivedFingerprints struct {
 	imports      string
 	runtime      string
 	artifacts    string
+	// hierarchy is optional (rows stamped before it have none): the
+	// declarations the implements/overrides inference and the entry-point
+	// hierarchy read. A save that leaves it unchanged moves no type's
+	// hierarchy, whatever else it declares.
+	hierarchy string
+}
+
+// isHierarchyNodeKind reports the declaration kinds the hierarchy passes read:
+// types and their methods, not free functions or fields.
+func isHierarchyNodeKind(kind graph.NodeKind) bool {
+	switch strings.ToLower(string(kind)) {
+	case "type", "interface", "class", "trait", "struct", "enum", "method":
+		return true
+	default:
+		return false
+	}
 }
 
 func (f derivedFingerprints) complete() bool {
@@ -184,6 +227,9 @@ func stampDerivedFingerprints(result *parser.ExtractionResult, fingerprints deri
 		node.Meta[sourceDerivedImportFingerprintMeta] = fingerprints.imports
 		node.Meta[sourceDerivedRuntimeFingerprintMeta] = fingerprints.runtime
 		node.Meta[sourceDerivedArtifactFingerprintMeta] = fingerprints.artifacts
+		if fingerprints.hierarchy != "" {
+			node.Meta[sourceDerivedHierarchyFingerprintMeta] = fingerprints.hierarchy
+		}
 		return
 	}
 }
@@ -198,6 +244,7 @@ func storedDerivedFingerprints(nodes []*graph.Node) derivedFingerprints {
 			imports:      stringMeta(node.Meta, sourceDerivedImportFingerprintMeta),
 			runtime:      stringMeta(node.Meta, sourceDerivedRuntimeFingerprintMeta),
 			artifacts:    stringMeta(node.Meta, sourceDerivedArtifactFingerprintMeta),
+			hierarchy:    stringMeta(node.Meta, sourceDerivedHierarchyFingerprintMeta),
 		}
 	}
 	return derivedFingerprints{}
@@ -263,6 +310,11 @@ func derivedPlanForDelta(prior, fresh derivedFingerprints, semanticChanged bool,
 		}
 	}
 	plan.TypeIDs = appendUniqueSorted(nil, plan.TypeIDs...)
+	if prior.complete() && fresh.complete() && prior.hierarchy != "" && prior.hierarchy == fresh.hierarchy {
+		// The declarations moved, but none the implements/overrides
+		// inference reads.
+		plan.HierarchyUnchanged = []string{graphPath}
+	}
 	plan.CSharpHierarchyChanged = plan.Flags.Has(DerivedInvalidatesDeclarations) &&
 		(containsCSharpHierarchyNode(priorNodes) || containsCSharpHierarchyNode(freshNodes))
 	return plan

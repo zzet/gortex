@@ -197,9 +197,9 @@ func TestResolverProjectionYieldCanReenterStore(t *testing.T) {
 
 	assertReentry := func(label string) {
 		t.Helper()
-		if inUse := store.db.Stats().InUse; inUse != 0 {
-			t.Fatalf("%s yield retained %d read connection(s)", label, inUse)
-		}
+		// Background startup probes can own the pool independently of this
+		// iterator. Bounded re-entry on a one-connection pool proves that
+		// the iterator released its rows before invoking the callback.
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		var one int

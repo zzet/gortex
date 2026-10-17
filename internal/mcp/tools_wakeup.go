@@ -196,7 +196,7 @@ func wakeupEntryPoints(g graph.Reader, top int) []*graph.Node {
 	// backends never materialise the whole node table for an entry-
 	// point candidate set that only ranges across function + method.
 	var pool []*graph.Node
-	if scan, ok := g.(graph.NodesByKindsScanner); ok {
+	if scan, ok := contractCoreSelectedReader(g).(graph.NodesByKindsScanner); ok {
 		pool = scan.NodesByKinds([]graph.NodeKind{graph.KindFunction, graph.KindMethod})
 	} else {
 		all := g.AllNodes()

@@ -11,10 +11,7 @@ func (s *Store) GetRepoNodeSummariesByLanguage(repoPrefix, language string) []*g
 	if language == "" {
 		return nil
 	}
-	rows, err := s.db.Query(
-		`SELECT `+lookupNodeSummaryCols+` FROM nodes WHERE repo_prefix = ? AND language = ? AND view_gen = ?`,
-		repoPrefix, language, s.viewGen,
-	)
+	rows, err := s.db.Query(s.repoNodeSummariesByLanguageQuery(), repoPrefix, language, s.viewGen)
 	if err != nil {
 		panicOnFatal(err)
 		return nil
@@ -34,4 +31,15 @@ func (s *Store) GetRepoNodeSummariesByLanguage(repoPrefix, language string) []*g
 		panicOnFatal(err)
 	}
 	return out
+}
+
+func (s *Store) repoNodeSummariesByLanguageQuery() string {
+	query := "SELECT " + lookupNodeSummaryCols + " FROM nodes WHERE repo_prefix = ? AND language = ? AND view_gen = ?"
+	if s.viewGen > 0 {
+		// SQLite cannot infer a partial-index predicate from a bound equality.
+		// Make nodes_by_generation eligible without requiring it: generation zero
+		// and databases temporarily lacking the index retain their normal plans.
+		query += " AND view_gen > 0"
+	}
+	return query
 }

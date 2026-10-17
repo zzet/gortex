@@ -72,12 +72,12 @@ func TestFacadeCapabilitiesPublicSchemasMatchEveryAvailableOperation(t *testing.
 	srv, _ := setupTestServer(t)
 	checked := 0
 	for _, domain := range facadeToolNames() {
-		if domain == "capabilities" || domain == "analyze" || domain == "session" {
+		if domain == "capabilities" || domain == "analyze" {
 			continue
 		}
 		staticSchema := facadeSchemaMapForTest(t, facadeToolDefinition(domain).InputSchema)
-		for _, spec := range srv.facades.operations(domain) {
-			if spec.Hidden {
+		for _, spec := range srv.capabilityOperations(domain) {
+			if spec.Hidden || domain == "session" && (spec.Operation == "subscribe" || spec.Operation == "unsubscribe") {
 				continue
 			}
 			legacy, available := srv.facades.legacy(spec.Legacy)

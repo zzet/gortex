@@ -13,6 +13,7 @@ import (
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"go.uber.org/zap"
 )
@@ -370,4 +371,65 @@ func TestV1EventsEndpoint_NoHub(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
 	assert.Contains(t, rec.Body.String(), "watch mode not active")
+}
+
+// TestToolCallProxiesTheCallersViewIdentityToTheRemote is the production trace
+// for the proxy half of the view seam.
+//
+// A tools/call that the router sends to a remote used to arrive there carrying
+// only Authorization / Content-Type / Accept: no `X-Gortex-Cwd`, no
+// `Mcp-Session-Id`. The remote then resolved its own view from the body's
+// `cwd` argument alone — which a header-carrying client never sent — so the
+// SAME call answered about the caller's checkout when it happened to be served
+// locally and about the remote's base corpus when it was proxied. The handler
+// attaches daemon.ProxyIdentity before the routing decision;
+// ServerClient.ProxyToolCtx turns it back into those two headers.
+func TestToolCallProxiesTheCallersViewIdentityToTheRemote(t *testing.T) {
+	type seen struct {
+		cwd     string
+		session string
+	}
+	got := make(chan seen, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- seen{
+			cwd:     r.Header.Get("X-Gortex-Cwd"),
+			session: r.Header.Get("Mcp-Session-Id"),
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"from the remote"}]}`))
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(t)
+	h.SetRouter(daemon.NewRouter(daemon.RouterConfig{
+		Servers: &daemon.ServersConfig{Server: []daemon.ServerEntry{
+			{Slug: "remote", URL: upstream.URL, Workspaces: []string{"tuck"}},
+			{Slug: daemon.LocalServerSentinel, URL: "unix:///tmp/local.sock", Default: true},
+		}},
+		Rosters:   daemon.NewWorkspaceRosterCache(time.Minute),
+		LocalSlug: daemon.LocalServerSentinel,
+		LocalExecute: func(_ context.Context, _ string, _ []byte) ([]byte, int, error) {
+			t.Fatal("the call should have been proxied, not run locally")
+			return nil, 0, nil
+		},
+		Logger: zap.NewNop(),
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/tools/search_symbols",
+		strings.NewReader(`{"arguments":{"workspace":"tuck","query":"Foo"}}`))
+	req.Header.Set("X-Gortex-Cwd", "/work/checkout")
+	req.Header.Set("Mcp-Session-Id", "session-7")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+
+	select {
+	case s := <-got:
+		assert.Equal(t, "/work/checkout", s.cwd,
+			"the remote could not resolve the caller's view: no X-Gortex-Cwd forwarded")
+		assert.Equal(t, "session-7", s.session,
+			"the remote saw no session identity: no Mcp-Session-Id forwarded")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the upstream was never called")
+	}
 }

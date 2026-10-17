@@ -259,9 +259,9 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 
 	// --- contracts gate (always evaluated for the verdict) ---
 	if len(ids) > 0 {
-		contracts := s.computeContractImpact(ids)
+		contracts := s.computeContractImpactContext(ctx, ids)
 		out.Contracts = contracts
-		out.Gates = append(out.Gates, prReviewContractGate(contracts))
+		out.Gates = append(out.Gates, optionalContractReviewGate(contractConsumerStatusFromContext(ctx), contracts))
 	}
 
 	// --- section: verify_change gate (result computed above) ---

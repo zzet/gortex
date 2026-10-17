@@ -156,6 +156,27 @@ func TestQueryOptions_ScopeAllows(t *testing.T) {
 			node: node("gin", "gin", ""),
 			want: false,
 		},
+		{
+			// A global external (no repository, no workspace) is visible
+			// from every scope: find_usages on ext::go:fmt::Errorf must not
+			// read it as outside the session's workspace.
+			name: "a global external passes a workspace scope",
+			opts: QueryOptions{
+				WorkspaceID: "gin",
+				ProjectID:   "gin",
+				RepoAllow:   map[string]bool{"gin": true},
+			},
+			node: &graph.Node{ID: "ext::go:fmt::Errorf", FilePath: "external::go:fmt"},
+			want: true,
+		},
+		{
+			// Only a synthetic external is global: an unowned node at a
+			// source path is not admitted by the carve-out.
+			name: "an unowned node at a source path is rejected by a workspace scope",
+			opts: QueryOptions{WorkspaceID: "gin"},
+			node: &graph.Node{ID: "svc/unowned.go", FilePath: "svc/unowned.go"},
+			want: false,
+		},
 	}
 
 	for _, tt := range tests {

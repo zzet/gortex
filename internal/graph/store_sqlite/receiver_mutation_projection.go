@@ -228,6 +228,25 @@ LIMIT ?`)
 	}
 }
 
+// receiverMutationCallRowsSQL fetches one page of candidate call edges by id,
+// with their targets. The page's id list drives the join and every edge is a
+// rowid probe: CROSS JOIN pins that loop order. With a plain JOIN the planner
+// may drive from edges_by_generation (view_gen=?) and rescan the json_each
+// list once per edge of the generation — O(edges x candidates) per page, which
+// on a multi-repository store kept one scan running for most of an hour. The
+// order is fixed by the keyword, not by sqlite_stat1, so it holds under any
+// statistics (TestReceiverMutationCallScanPlanLock).
+const receiverMutationCallRowsSQL = `
+WITH requested(id) AS (
+    SELECT CAST(value AS INTEGER) FROM json_each(?)
+)
+SELECT e.id, e.from_id, e.to_id, e.file_path, e.line,
+       target.kind, target.name, target.meta
+FROM requested AS r
+CROSS JOIN edges AS e ON e.id = r.id AND e.view_gen = ?
+LEFT JOIN nodes AS target ON target.id = e.to_id AND target.view_gen = e.view_gen
+ORDER BY e.id`
+
 // ScanReceiverMutationCalls retains only calls stamped as own-receiver field
 // or sibling-method calls. The target join replaces the legacy bulk node
 // refetch; malformed target metadata is treated as a missing target, exactly as
@@ -255,16 +274,7 @@ LIMIT ?`)
 		return
 	}
 	defer candidateStmt.Close()
-	exactStmt, err := s.db.Prepare(`
-WITH requested(id) AS (
-    SELECT CAST(value AS INTEGER) FROM json_each(?)
-)
-SELECT e.id, e.from_id, e.to_id, e.file_path, e.line,
-       target.kind, target.name, target.meta
-FROM requested AS r
-JOIN edges AS e ON e.id = r.id AND e.view_gen = ?
-LEFT JOIN nodes AS target ON target.id = e.to_id AND target.view_gen = e.view_gen
-ORDER BY e.id`)
+	exactStmt, err := s.db.Prepare(receiverMutationCallRowsSQL)
 	if err != nil {
 		panicOnFatal(err)
 		return

@@ -75,7 +75,7 @@ func (s *Server) handleGetChurnRate(ctx context.Context, req mcp.CallToolRequest
 	// the meta scan below and reports churn for the symbols its buffers
 	// still define.
 	reader := s.readerFor(ctx)
-	if sidecar, ok := reader.(graph.ChurnEnrichmentReader); ok {
+	if sidecar, ok := contractCoreSelectedReader(reader).(graph.ChurnEnrichmentReader); ok {
 		// Sidecar fast-path (change A): read the typed churn rows via an
 		// index over the (small) enriched set, then resolve their nodes
 		// in one batch — instead of scanning AllNodes and gob-decoding

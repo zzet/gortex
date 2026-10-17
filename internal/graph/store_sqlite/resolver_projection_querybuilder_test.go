@@ -10,21 +10,25 @@ import (
 func TestResolverScopedProjectionProductionQueriesUseRepoKindIndex(t *testing.T) {
 	store := openResolverProjectionTestStore(t)
 	tests := []struct {
-		name  string
-		query string
-		args  []any
+		name       string
+		query      string
+		args       []any
+		planClause string
 	}{
 		{
-			name: "high water", query: resolverScopedProjectionHighWaterQuery,
-			args: []any{"repo", graph.KindFile, baseViewGeneration},
+			name: "high water", query: resolverScopedProjectionQueryForGeneration(resolverScopedProjectionHighWaterQuery, baseViewGeneration, graph.KindFile),
+			args:       []any{"repo", graph.KindFile, baseViewGeneration},
+			planClause: "nodes_by_repo_kind",
 		},
 		{
-			name: "first page", query: resolverScopedProjectionPageQuery("id, file_path, repo_prefix, workspace_id", false),
-			args: []any{"repo", graph.KindFile, "repo::z", baseViewGeneration, resolverProjectionPageSize},
+			name: "first page", query: resolverScopedProjectionQueryForGeneration(resolverScopedProjectionPageQuery("id, file_path, repo_prefix, workspace_id", false), baseViewGeneration, graph.KindFile),
+			args:       []any{"repo", graph.KindFile, "repo::z", baseViewGeneration, resolverProjectionPageSize},
+			planClause: "SEARCH nodes USING INDEX nodes_by_repo_kind (repo_prefix=? AND kind=? AND id<?)",
 		},
 		{
-			name: "next page", query: resolverScopedProjectionPageQuery("id, file_path, repo_prefix, workspace_id", true),
-			args: []any{"repo", graph.KindFile, "repo::a", "repo::z", baseViewGeneration, resolverProjectionPageSize},
+			name: "next page", query: resolverScopedProjectionQueryForGeneration(resolverScopedProjectionPageQuery("id, file_path, repo_prefix, workspace_id", true), baseViewGeneration, graph.KindFile),
+			args:       []any{"repo", graph.KindFile, "repo::a", "repo::z", baseViewGeneration, resolverProjectionPageSize},
+			planClause: "SEARCH nodes USING INDEX nodes_by_repo_kind (repo_prefix=? AND kind=? AND id>? AND id<?)",
 		},
 	}
 
@@ -52,8 +56,8 @@ func TestResolverScopedProjectionProductionQueriesUseRepoKindIndex(t *testing.T)
 				t.Fatalf("close query plan: %v", err)
 			}
 			plan := strings.Join(details, "\n")
-			if !strings.Contains(plan, "nodes_by_repo_kind") {
-				t.Fatalf("query plan does not use nodes_by_repo_kind:\n%s", plan)
+			if !strings.Contains(plan, tt.planClause) {
+				t.Fatalf("query plan missed bounded clause %q:\n%s", tt.planClause, plan)
 			}
 			if strings.Contains(plan, "USE TEMP B-TREE") || strings.Contains(plan, "SCAN nodes") {
 				t.Fatalf("query plan is not an indexed keyset seek:\n%s", plan)

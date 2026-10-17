@@ -2,6 +2,8 @@ package store_sqlite_test
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -9,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 // TestCompactReclaimsFreelist pins the boot-compaction capability end to end
@@ -18,15 +21,18 @@ import (
 // Fractional assertions only — page size and per-row overhead are backend
 // details this test must not encode.
 func TestCompactReclaimsFreelist(t *testing.T) {
-	s := openTestStore(t)
+	storePath := filepath.Join(t.TempDir(), "test.sqlite")
+	s, err := store_sqlite.Open(storePath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
 
 	// Seed 60 files × 50 nodes with ~2 KiB of meta each (~6 MiB of pages),
 	// then checkpoint so the rows land in the main file rather than the WAL —
 	// CompactStats deliberately measures only the main file.
 	const files, perFile = 60, 50
 	pad := strings.Repeat("x", 2048)
+	nodes := make([]*graph.Node, 0, files*perFile)
 	for f := 0; f < files; f++ {
-		nodes := make([]*graph.Node, 0, perFile)
 		path := fmt.Sprintf("p/f%03d.go", f)
 		for n := 0; n < perFile; n++ {
 			nodes = append(nodes, &graph.Node{
@@ -37,9 +43,19 @@ func TestCompactReclaimsFreelist(t *testing.T) {
 				Meta:     map[string]any{"pad": pad},
 			})
 		}
-		s.AddBatch(nodes, nil)
 	}
+	// One setup transaction keeps all fixture rows while avoiding repeated
+	// versions of the same index pages in the initial WAL. CheckpointWAL
+	// still uses its ordinary production deadline.
+	require.NoError(t, s.AddBatchChecked(nodes, nil))
+	require.Equal(t, files*perFile, s.NodeCount(), "all setup rows must be present")
+	seedWAL, err := os.Stat(storePath + "-wal")
+	require.NoError(t, err)
+	t.Logf("compaction setup: nodes=%d WAL_seed_bytes=%d", files*perFile, seedWAL.Size())
 	require.NoError(t, s.CheckpointWAL())
+	checkpointedWAL, err := os.Stat(storePath + "-wal")
+	require.NoError(t, err)
+	t.Logf("compaction setup: WAL_checkpointed_bytes=%d", checkpointedWAL.Size())
 	_, totalSeeded := s.CompactStats()
 	require.Greater(t, totalSeeded, int64(3<<20), "sanity: seeding must produce a multi-MiB main file")
 

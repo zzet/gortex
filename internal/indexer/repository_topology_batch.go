@@ -95,9 +95,14 @@ func (mi *MultiIndexer) coordinateRepositoryTopologyMutation(
 	fn func() error,
 ) error {
 	if activeRepositoryTopologyBatch(ctx, mi) != nil {
-		return idx.repositoryMutations().runExclusiveLaneOnly(ctx, fn)
+		// The lane-only arm is the second door into the same generation-zero
+		// payload. It names its output generation through the same authority,
+		// inside the lane, exactly as the coordinated arm does.
+		return idx.repositoryMutations().runExclusiveLaneOnly(ctx, func() error {
+			return idx.withOutputGeneration(ctx, OutputEntryRepositoryTopology, fn)
+		})
 	}
-	return idx.coordinateRepositoryMutation(ctx, fn)
+	return idx.coordinateRepositoryMutation(ctx, OutputEntryRepositoryTopology, fn)
 }
 
 func (mi *MultiIndexer) beginRepositoryTopologyMutation(ctx context.Context) func(changed bool) {

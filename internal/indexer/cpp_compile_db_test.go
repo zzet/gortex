@@ -49,7 +49,7 @@ func TestLoadCompileCommands_CommandString(t *testing.T) {
 	  }
 	]`)
 
-	tus := loadCompileCommands(root)
+	tus := loadCompileCommands(newDiskManifestTree(root))
 	tu, ok := tus["src/main.c"]
 	require.True(t, ok, "main.c TU resolved repo-relative from build/ directory")
 	assert.Equal(t, "src/main.c", tu.file)
@@ -69,7 +69,7 @@ func TestLoadCompileCommands_ArgumentsArray(t *testing.T) {
 	  }
 	]`)
 
-	tus := loadCompileCommands(root)
+	tus := loadCompileCommands(newDiskManifestTree(root))
 	tu, ok := tus["src/main.cpp"]
 	require.True(t, ok)
 	assert.Equal(t, []string{"gen/include", "vendor/inc", "local"}, tu.includeDirs)
@@ -87,7 +87,7 @@ func TestLoadCompileCommands_BuildDirGlob(t *testing.T) {
 	  }
 	]`)
 
-	tus := loadCompileCommands(root)
+	tus := loadCompileCommands(newDiskManifestTree(root))
 	tu, ok := tus["src/app.c"]
 	require.True(t, ok, "TU discovered via build*/compile_commands.json glob")
 	assert.Equal(t, []string{"include"}, tu.includeDirs)
@@ -96,7 +96,7 @@ func TestLoadCompileCommands_BuildDirGlob(t *testing.T) {
 func TestLoadCompileCommands_None(t *testing.T) {
 	root := t.TempDir()
 	t.Cleanup(func() { clearCppIncludeDirCache(root) })
-	assert.Empty(t, loadCompileCommands(root), "no compile_commands.json yields empty map")
+	assert.Empty(t, loadCompileCommands(newDiskManifestTree(root)), "no compile_commands.json yields empty map")
 }
 
 // TestHeuristicIncludeDirs pins the no-compile-DB fallback: conventional roots
@@ -121,13 +121,13 @@ func TestHeuristicIncludeDirs(t *testing.T) {
 	mk(".git")
 	wr(".git/x.h", "x") // dotfile dir → skipped
 
-	got := heuristicIncludeDirs(root)
+	got := heuristicIncludeDirs(newDiskManifestTree(root))
 	assert.Equal(t, []string{"include", "src", "thirdparty"}, got)
 }
 
 func TestHeuristicIncludeDirs_Empty(t *testing.T) {
-	assert.Nil(t, heuristicIncludeDirs(""))
-	assert.Empty(t, heuristicIncludeDirs(t.TempDir()), "no conventional roots and no header dirs")
+	assert.Nil(t, heuristicIncludeDirs(newDiskManifestTree("")))
+	assert.Empty(t, heuristicIncludeDirs(newDiskManifestTree(t.TempDir())), "no conventional roots and no header dirs")
 }
 
 // TestLoadCompileCommands_CacheAndClear pins the cache-and-invalidate contract:
@@ -156,17 +156,17 @@ func TestLoadCompileCommands_CacheAndClear(t *testing.T) {
 	}
 
 	write("inc1")
-	require.Equal(t, []string{"inc1"}, loadCompileCommands(root)["src/main.c"].includeDirs)
+	require.Equal(t, []string{"inc1"}, loadCompileCommands(newDiskManifestTree(root))["src/main.c"].includeDirs)
 
 	// Editing the DB on disk (without bumping its modtime) is not observed until
 	// the cache is invalidated.
 	write("inc2")
-	assert.Equal(t, []string{"inc1"}, loadCompileCommands(root)["src/main.c"].includeDirs,
+	assert.Equal(t, []string{"inc1"}, loadCompileCommands(newDiskManifestTree(root))["src/main.c"].includeDirs,
 		"second load returns the cached result")
 
 	// Clearing the cache (the incremental-reindex hook) re-reads the new dir.
 	clearCppIncludeDirCache(root)
-	assert.Equal(t, []string{"inc2"}, loadCompileCommands(root)["src/main.c"].includeDirs,
+	assert.Equal(t, []string{"inc2"}, loadCompileCommands(newDiskManifestTree(root))["src/main.c"].includeDirs,
 		"after clear the edited -I dir is picked up")
 }
 
@@ -188,15 +188,15 @@ func TestLoadCompileCommands_MtimeReload(t *testing.T) {
 
 	t0 := time.Now().Add(-time.Hour)
 	write("inc1", t0)
-	require.Equal(t, []string{"inc1"}, loadCompileCommands(root)["src/main.c"].includeDirs)
+	require.Equal(t, []string{"inc1"}, loadCompileCommands(newDiskManifestTree(root))["src/main.c"].includeDirs)
 
 	// Edit only compile_commands.json, advancing its modtime. No clearCppIncludeDirCache
 	// call — the next load must observe the newer file and re-read it.
 	write("inc2", t0.Add(time.Minute))
-	assert.Equal(t, []string{"inc2"}, loadCompileCommands(root)["src/main.c"].includeDirs,
+	assert.Equal(t, []string{"inc2"}, loadCompileCommands(newDiskManifestTree(root))["src/main.c"].includeDirs,
 		"a newer compile_commands.json is re-read without an explicit cache clear")
 
 	// A subsequent load with no further edit is served from the (now-warm) cache.
-	assert.Equal(t, []string{"inc2"}, loadCompileCommands(root)["src/main.c"].includeDirs,
+	assert.Equal(t, []string{"inc2"}, loadCompileCommands(newDiskManifestTree(root))["src/main.c"].includeDirs,
 		"unchanged compile_commands.json stays cached")
 }

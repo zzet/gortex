@@ -79,7 +79,7 @@ func (b *SparseGenerationBuilder) BuildCommitLayer(
 	identity.GenerationKind = CommitLayerGenerationKind
 	identity.TreeOID = req.TargetTreeOID
 
-	return b.Build(ctx, BuildRequest{
+	build := BuildRequest{
 		Identity:    identity,
 		Base:        req.Base,
 		Target:      target,
@@ -88,7 +88,11 @@ func (b *SparseGenerationBuilder) BuildCommitLayer(
 		RepoPrefix:  req.RepoPrefix,
 		WorkspaceID: req.WorkspaceID,
 		ProjectID:   req.ProjectID,
-	})
+	}
+	if enrichesWorkingCopy(identity) {
+		build.committedTypecheck = &committedTypecheckStage{CheckoutID: identity.CheckoutID}
+	}
+	return b.Build(ctx, build)
 }
 
 func (b *SparseGenerationBuilder) validateCommitLayer(req *CommitLayerRequest) error {

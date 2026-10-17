@@ -142,7 +142,7 @@ func (s *Server) handleFindClones(ctx context.Context, req mcp.CallToolRequest) 
 	// depends on knowing which clone members have zero incoming
 	// calls/references. Computed once and shared across every cluster.
 	deadSet := make(map[string]bool)
-	for _, d := range analysis.FindDeadCode(reader, s.getProcesses(), nil) {
+	for _, d := range analysis.FindDeadCode(graph.BindReadContext(reader, ctx), s.getProcesses(), nil) {
 		deadSet[d.ID] = true
 	}
 

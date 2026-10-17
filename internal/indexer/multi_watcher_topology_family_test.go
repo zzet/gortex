@@ -1624,8 +1624,11 @@ func TestMultiWatcherTopologyForeignTokenDoesNotBypassRetirement(t *testing.T) {
 	second := newTopologyWatchFixture(t, 1)
 	mw := newTopologyRegistry()
 	result := make(chan error, 1)
+	joined := make(chan struct{})
+	var joinedOnce sync.Once
 	mw.OnWorktreeChangeContext(func(ctx context.Context, prefix, _ string) {
 		if prefix == "first" {
+			ctx = &tokenLookupContext{Context: ctx, looked: func() { joinedOnce.Do(func() { close(joined) }) }}
 			result <- mw.AddRepoContext(ctx, "second", config.WatchConfig{Enabled: true})
 		}
 	})
@@ -1673,6 +1676,14 @@ func TestMultiWatcherTopologyForeignTokenDoesNotBypassRetirement(t *testing.T) {
 		dispatch.invoke()
 		close(invoked)
 	}()
+	// AddRepoContext reads its dispatch token under mw.mu just before it
+	// reads the prefix's retirement; release takes mw.mu, so after this the
+	// call has already joined (or wrongly bypassed) the retirement.
+	select {
+	case <-joined:
+	case <-time.After(2 * time.Second):
+		t.Fatal("foreign-family AddRepoContext never consulted its dispatch token")
+	}
 	assertTopologyLifecycleBlocked(t, result, "foreign-family AddRepoContext")
 
 	release()
@@ -1689,6 +1700,19 @@ func TestMultiWatcherTopologyForeignTokenDoesNotBypassRetirement(t *testing.T) {
 	mw.mu.Unlock()
 	removeTopologyWatcher(mw, "first")
 	removeTopologyWatcher(mw, "second")
+}
+
+// tokenLookupContext reports each lookup of the topology dispatch token.
+type tokenLookupContext struct {
+	context.Context
+	looked func()
+}
+
+func (ctx *tokenLookupContext) Value(key any) any {
+	if _, token := key.(topologyDispatchContextKey); token {
+		ctx.looked()
+	}
+	return ctx.Context.Value(key)
 }
 
 func TestMultiWatcherTopologyFamiliesRemainIndependent(t *testing.T) {

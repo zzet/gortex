@@ -11,6 +11,7 @@ import (
 // ReconcileContractEdgesForFrontier is the precise incremental sibling of the
 // existing full cold reconciliation path.
 func (mi *MultiIndexer) ReconcileContractEdgesForFrontier(plan DerivedInvalidationPlan) int {
+	if mi.contractCoreRuntime.Load() != nil { return 0 }
 	if len(plan.ContractGroups) == 0 && len(plan.ContractSymbolIDs) == 0 {
 		return mi.ReconcileContractEdges()
 	}

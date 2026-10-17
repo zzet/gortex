@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -33,21 +34,32 @@ import (
 var (
 	semMu sync.Mutex
 	// sem is the package-global limiter, swapped under semMu by
-	// SetConcurrency. Its default weight is min(GOMAXPROCS, 8).
+	// SetConcurrency. Its default weight is min(NumCPU, 8), or
+	// GORTEX_GIT_CONCURRENCY.
 	sem *semaphore.Weighted = semaphore.NewWeighted(defaultConcurrency())
 )
 
-// defaultConcurrency returns the default semaphore weight:
-// min(runtime.GOMAXPROCS(0), 8).
+// concurrencyEnv overrides the default limiter weight (a positive integer,
+// capped at maxDefaultConcurrency*4).
+const concurrencyEnv = "GORTEX_GIT_CONCURRENCY"
+
+const maxDefaultConcurrency = 8
+
+// defaultConcurrency returns the default semaphore weight: min(NumCPU, 8),
+// unless GORTEX_GIT_CONCURRENCY names another positive weight.
+//
+// It follows the host's CPUs, not GOMAXPROCS: a git child is a separate
+// process the kernel schedules on any CPU, and GOMAXPROCS bounds only this
+// process's Go threads. A daemon run at GOMAXPROCS=1 used to get a weight of
+// 1, so every git call in it — an edit's working-copy sample included —
+// queued behind whichever other git child was running.
 func defaultConcurrency() int64 {
-	n := runtime.GOMAXPROCS(0)
-	if n > 8 {
-		n = 8
+	if raw := strings.TrimSpace(os.Getenv(concurrencyEnv)); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return int64(min(n, maxDefaultConcurrency*4))
+		}
 	}
-	if n < 1 {
-		n = 1
-	}
-	return int64(n)
+	return int64(max(1, min(runtime.NumCPU(), maxDefaultConcurrency)))
 }
 
 // SetConcurrency resizes the global git limiter, called once at
@@ -80,7 +92,14 @@ func currentSem() *semaphore.Weighted {
 // fmt.Errorf("git %s: %w: %s", args[0], err, bytes.TrimSpace(stderr)).
 // The captured stdout is always returned, even on error.
 func Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	return run(ctx, dir, nil, args...)
+	return run(ctx, dir, nil, nil, args...)
+}
+
+// RunIndexRefresh has Run's limiter, environment and output contract. On Unix,
+// cancellation first lets Git remove its own index lock before bounded force
+// termination. Windows retains the existing CommandContext termination policy.
+func RunIndexRefresh(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	return run(ctx, dir, nil, configureIndexRefreshCancellation, args...)
 }
 
 // RunNoLazy has Run's semaphore, context, output, and error contract, but
@@ -88,10 +107,10 @@ func Run(ctx context.Context, dir string, args ...string) ([]byte, error) {
 // immutable object graphs where a promisor lookup must fail locally instead
 // of fetching from a remote.
 func RunNoLazy(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	return run(ctx, dir, noLazyGitEnv(), args...)
+	return run(ctx, dir, noLazyGitEnv(), nil, args...)
 }
 
-func run(ctx context.Context, dir string, env []string, args ...string) ([]byte, error) {
+func run(ctx context.Context, dir string, env []string, configure func(*exec.Cmd), args ...string) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -116,6 +135,9 @@ func run(ctx context.Context, dir string, env []string, args ...string) ([]byte,
 		cmd.Env = env
 	}
 	platform.ConfigureBackgroundCommand(cmd)
+	if configure != nil {
+		configure(cmd)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

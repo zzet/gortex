@@ -126,13 +126,23 @@ func TestAttributeGoBuiltinsBatchesSourceReadsAndNodeWrites(t *testing.T) {
 
 	New(store).attributeGoBuiltins()
 
-	assert.Equal(t, 1, store.getNodesByIDs, "builtin sources must be loaded in one set query")
+	assert.Equal(t, 2, store.getNodesByIDs, "builtin sources and the sentinels already served must each be loaded in one set query")
 	assert.Equal(t, 0, store.addNode, "builtin materialisation must not write one node at a time")
 	assert.Equal(t, 1, store.addBatch, "builtin nodes must be materialised in one batch")
 	for i := 0; i < 100; i++ {
 		owner := fmt.Sprintf("opaque::caller-%03d", i)
 		assert.True(t, hasEdgeKind(base, owner, "repo::builtin::go::len", graph.EdgeCalls))
 	}
+
+	// A later pass whose sentinel the graph already serves writes no node.
+	for i := 100; i < 110; i++ {
+		owner := fmt.Sprintf("opaque::caller-%03d", i)
+		base.AddNode(&graph.Node{ID: owner, Kind: graph.KindFunction, Name: "caller", Language: "go", RepoPrefix: "repo"})
+		base.AddEdge(&graph.Edge{From: owner, To: "unresolved::len", Kind: graph.EdgeCalls, Line: i + 1})
+	}
+	New(store).attributeGoBuiltins()
+	assert.Equal(t, 1, store.addBatch, "a served builtin sentinel must not be written again")
+	assert.True(t, hasEdgeKind(base, "opaque::caller-105", "repo::builtin::go::len", graph.EdgeCalls))
 }
 
 func TestAttributeGoBuiltins_NonGoLeftAlone(t *testing.T) {

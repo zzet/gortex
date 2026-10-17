@@ -815,8 +815,8 @@ func newTwoRepoServer(t *testing.T) (*Server, string) {
 
 	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
 	// Both repos share one declared workspace: repo:"*" widens RepoAllow
-	// but never crosses workspaces, so the "candidates outside the scope"
-	// recheck is only meaningful inside a shared workspace.
+	// but never crosses workspaces, so widening guidance is meaningful
+	// inside this shared workspace.
 	gc := &config.GlobalConfig{
 		Repos: []config.RepoEntry{
 			{Path: alphaDir, Name: "alpha", Workspace: "shared"},
@@ -857,7 +857,7 @@ func newTwoRepoServer(t *testing.T) (*Server, string) {
 // TestScopeNote_SearchSymbols_NarrowedZeroIsBodyVisible: a session bound
 // in repo alpha searches for a symbol that lives only in repo beta. The
 // Locate default narrows to alpha → 0 results — and the response BODY
-// must say so, including that candidates exist outside the scope. The
+// must name the active scope and explain how to widen it. The
 // _meta-only disclosure is invisible in CLI output and most clients.
 func TestScopeNote_SearchSymbols_NarrowedZeroIsBodyVisible(t *testing.T) {
 	srv, alphaDir := newTwoRepoServer(t)
@@ -874,14 +874,15 @@ func TestScopeNote_SearchSymbols_NarrowedZeroIsBodyVisible(t *testing.T) {
 
 	note, _ := resp["scope_note"].(string)
 	require.NotEmpty(t, note, "a scope-narrowed zero must carry a body-visible scope_note")
-	assert.Contains(t, note, "outside", "the recheck must report candidates beyond the scope")
+	assert.Contains(t, note, "active scope (repo:alpha)")
 	assert.Contains(t, note, `repo:"*"`, "the note must teach the widen escape hatch")
+	assert.NotContains(t, note, "outside", "no workspace-wide recheck ran")
+	assert.NotContains(t, note, "recheck")
 }
 
-// TestScopeNote_SearchSymbols_AbsentOnHitsAndOnTrueZero: no note rides a
-// result that has hits, and a query matching nothing anywhere reports the
-// recheck came back empty too.
-func TestScopeNote_SearchSymbols_AbsentOnHitsAndOnTrueZero(t *testing.T) {
+// A hit needs no scope note. Even a query absent from the entire fixture
+// receives only active-scope guidance because no workspace-wide recheck ran.
+func TestScopeNote_SearchSymbols_AbsentOnHitsAndHonestOnTrueZero(t *testing.T) {
 	srv, alphaDir := newTwoRepoServer(t)
 	ctx := sessionCtx("s-note2", alphaDir)
 
@@ -897,10 +898,12 @@ func TestScopeNote_SearchSymbols_AbsentOnHitsAndOnTrueZero(t *testing.T) {
 	require.NoError(t, err)
 	resp = map[string]any{}
 	require.NoError(t, json.Unmarshal([]byte(res.Content[0].(mcplib.TextContent).Text), &resp))
-	if note, ok := resp["scope_note"].(string); ok {
-		assert.Contains(t, note, "also found nothing",
-			"a true zero must say the workspace-wide recheck found nothing")
-	}
+	note, ok := resp["scope_note"].(string)
+	require.True(t, ok)
+	assert.Contains(t, note, "active scope (repo:alpha)")
+	assert.Contains(t, note, `repo:"*"`)
+	assert.NotContains(t, note, "also found nothing")
+	assert.NotContains(t, note, "recheck")
 }
 
 func TestScopeZeroNote_Branches(t *testing.T) {

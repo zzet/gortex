@@ -107,6 +107,10 @@ type CrossRepoResolver struct {
 	// repo sorts first — the name-collision false positives the analyzer
 	// surfaced. Built once per Resolve* pass, torn down after.
 	reachableReposByFile map[string]map[string]struct{}
+	// importedDirsByFile retains the package placement from those same import
+	// rows. A Go call the per-repo package guard refused must not regain a
+	// same-repo name-only binding just because the repository is reachable.
+	importedDirsByFile map[string]map[string]struct{}
 	// depModuleIndex bridges Go imports to dep::<module> contract
 	// nodes from the caller's go.mod. Same shape and rationale as
 	// the field of the same name on Resolver — see resolver.go for
@@ -381,6 +385,9 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	// Fresh placeholder-source set per pass — same rationale as ResolveAll
 	// on the master resolver.
 	cr.placeholderSrcIdx = placeholderSourceIndex{}
+	// Every exit applies the moves the pass deferred (a no-op after the
+	// normal flush below); it runs before the deferred unlock above.
+	defer cr.placeholderSrcIdx.applyDeferred(cr.graph)
 	// Share the master resolver's stable high-water/keyset stream. The cold
 	// residual can exceed 200k edges; retaining it plus the cross-repo name,
 	// raw-name, repo and qualified-name caches was the second whole-corpus heap
@@ -551,7 +558,9 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 					scBatch = cr.filterLiveReindex(scBatch)
 				}
 				cr.graph.ReindexEdges(scBatch)
-				reconcilePlaceholderSources(cr.graph, &cr.placeholderSrcIdx, scBatch)
+				// Moves wait for the last page, as in ResolveAll
+				// (placeholderSourceIndex.deferRepoints).
+				cr.placeholderSrcIdx.deferRepoints(cr.graph, scBatch)
 				reindexTotal += len(scBatch)
 				DetectCrossRepoEdgesForReindexes(cr.graph, scBatch)
 			}
@@ -586,6 +595,7 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 		}
 		pendingLoaded.Add(int64(len(pending)))
 	}
+	cr.placeholderSrcIdx.applyDeferred(cr.graph)
 	stopProgress()
 	cr.logger.Info("cross-repo resolve: compute done",
 		zap.Int64("pending", pendingLoaded.Load()),
@@ -717,6 +727,13 @@ func (cr *CrossRepoResolver) buildDirIndexes() {
 			cr.lastDirIndex[last] = append(cr.lastDirIndex[last], file)
 		}
 	}
+	// Path order, not store order (sortFileIdentities).
+	for _, files := range cr.dirIndex {
+		sortFileIdentities(files)
+	}
+	for _, files := range cr.lastDirIndex {
+		sortFileIdentities(files)
+	}
 }
 
 // buildDepModuleIndex mirrors Resolver.buildDepModuleIndex — see that
@@ -777,6 +794,7 @@ func (cr *CrossRepoResolver) clearDirIndexes() {
 // graph is settled enough to be trustworthy evidence.
 func (cr *CrossRepoResolver) buildReachableReposIndex() {
 	idx := make(map[string]map[string]struct{})
+	dirs := make(map[string]map[string]struct{})
 	// Materialise metadata-free import projections and batch-load only target
 	// placement fields. A per-edge point lookup here is a query round-trip per
 	// import on a disk backend, which under the cross-repo pass's import
@@ -791,6 +809,7 @@ func (cr *CrossRepoResolver) buildReachableReposIndex() {
 	}
 	if len(imports) == 0 {
 		cr.reachableReposByFile = idx
+		cr.importedDirsByFile = dirs
 		return
 	}
 	idList := make([]string, 0, len(ids))
@@ -802,7 +821,17 @@ func (cr *CrossRepoResolver) buildReachableReposIndex() {
 		// Only resolved imports carry evidence — an unresolved import
 		// target tells us nothing about which repo the caller reaches.
 		to, ok := placements[e.To]
-		if !ok || to.RepoPrefix == "" {
+		if !ok {
+			continue
+		}
+		if to.FilePath != "" {
+			dir := filePathDir(to.FilePath)
+			if dirs[e.From] == nil {
+				dirs[e.From] = make(map[string]struct{})
+			}
+			dirs[e.From][dir] = struct{}{}
+		}
+		if to.RepoPrefix == "" {
 			continue
 		}
 		set := idx[e.From]
@@ -813,10 +842,40 @@ func (cr *CrossRepoResolver) buildReachableReposIndex() {
 		set[to.RepoPrefix] = struct{}{}
 	}
 	cr.reachableReposByFile = idx
+	cr.importedDirsByFile = dirs
 }
 
 func (cr *CrossRepoResolver) clearReachableReposIndex() {
 	cr.reachableReposByFile = nil
+	cr.importedDirsByFile = nil
+}
+
+// A package-guard refusal is stronger than the cross-repo pass's same-repo
+// preference. It may choose a different, actually imported Go package, but
+// cannot resurrect an unrelated same-named package the first pass rejected.
+func (cr *CrossRepoResolver) guardedGoPackageChecker(e *graph.Edge) func(*graph.Node) bool {
+	if refused, _ := e.Meta["guard_reverted"].(bool); !refused {
+		return nil
+	}
+	caller := cr.cachedGetNode(e.From)
+	if caller == nil || caller.Language != "go" {
+		return nil
+	}
+	file := cr.callerFileID(e)
+	return func(candidate *graph.Node) bool {
+		if candidate.RepoPrefix != caller.RepoPrefix {
+			return true
+		}
+		if candidate.FilePath == "" || file == "" {
+			return false
+		}
+		dir := filePathDir(candidate.FilePath)
+		if dir == filePathDir(file) {
+			return true
+		}
+		_, imported := cr.importedDirsByFile[file][dir]
+		return imported
+	}
 }
 
 // reachabilityChecker returns a per-edge closure that reports whether the
@@ -1281,11 +1340,12 @@ func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string,
 	callerRepo := cr.callerRepoPrefix(e)
 	callerWS := cr.callerWorkspaceID(e)
 	reachable := cr.reachabilityChecker(e)
+	packageReachable := cr.guardedGoPackageChecker(e)
 
 	// 1. Prefer same-repo match.
 	for _, c := range candidates {
 		if (c.Kind == graph.KindFunction || c.Kind == graph.KindMethod) &&
-			c.RepoPrefix == callerRepo {
+			c.RepoPrefix == callerRepo && (packageReachable == nil || packageReachable(c)) {
 			e.To = c.ID
 			stats.Resolved++
 			return
@@ -1302,6 +1362,9 @@ func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string,
 	//       entry covering the workspace pair.
 	for _, c := range candidates {
 		if c.Kind != graph.KindFunction && c.Kind != graph.KindMethod {
+			continue
+		}
+		if packageReachable != nil && !packageReachable(c) {
 			continue
 		}
 		if !reachable(c.RepoPrefix) {

@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // checkoutMutationLifecycle is the request's already-acquired checkout lease.
@@ -144,28 +146,55 @@ func (s *Server) refreshCheckoutMutation(ctx context.Context, path string, state
 		// Disk has committed, so caller cancellation must not abandon graph
 		// publication. Admission only captures evidence and signals the existing
 		// coordinator: never wait here while the handler still holds its lease.
-		ticket, err := scheduler.EnqueueRefresh(context.WithoutCancel(ctx), path)
+		//
+		// That is also why the admitted work needs a lifetime of its own. It
+		// runs on the coordinator long after this handler returned and released
+		// its view, so join that view's lease on its behalf before admission.
+		// The pin rides on the receipt and is dropped when the ticket reports:
+		// the generations this request read stay pinned for exactly as long as
+		// the detached publication is outstanding, cancellation tail included.
+		pin := handoffRequestView(ctx, viewmetrics.HandoffCheckoutRefresh)
+		record, interimKey := openMutationPhases(ctx, state.checkoutID, path)
+		ticket, err := scheduler.EnqueueRefresh(indexer.WithPublicationRecord(withCommittedWrite(context.WithoutCancel(ctx), state, path), record), path)
 		if err != nil {
+			failMutationPhases(record)
+			pin.release()
 			outcome.Err = fmt.Errorf("checkout graph refresh admission failed after disk commit: %w", err)
 			return outcome
 		}
 		if ticket == nil || ticket.Ticket == nil || ticket.Ticket.Done == nil || ticket.CheckoutID == "" || ticket.Incarnation == "" {
+			// A rejected admission has no completion signal, so nothing would
+			// ever release a pin taken for it. An unreleasable pin blocks
+			// retirement forever, which is strictly worse than the unpinned
+			// window this error already describes, so the handoff is dropped
+			// on every rejection path below.
+			failMutationPhases(record)
+			pin.release()
 			outcome.Err = fmt.Errorf("checkout graph refresh admission returned no scoped completion ticket")
 			return outcome
 		}
 		if state.checkoutID != "" && (ticket.CheckoutID != state.checkoutID || ticket.Incarnation != state.incarnation) {
+			failMutationPhases(record)
+			pin.release()
 			outcome.Err = fmt.Errorf("checkout graph refresh ticket does not belong to the committed checkout incarnation")
 			return outcome
 		}
 		if !pathkey.EqualPaths(ticket.Ticket.Path, path) {
+			failMutationPhases(record)
+			pin.release()
 			outcome.Err = fmt.Errorf("checkout graph refresh ticket does not name the committed file")
 			return outcome
 		}
 		if state.committedHash != "" && (!pathkey.EqualPaths(state.committedPath, path) || ticket.ContentHash != state.committedHash) {
+			failMutationPhases(record)
+			pin.release()
 			outcome.Err = fmt.Errorf("%w: checkout file changed after disk commit before publication admission", indexer.ErrCheckoutRefreshSuperseded)
 			return outcome
 		}
-		return s.trackCheckoutRefreshTicket(ticket).outcome(true)
+		receipt := s.trackCheckoutRefreshTicket(ticket)
+		receipt.pinView(pin)
+		s.beginMutationPhases(record, interimKey, receipt, ticket)
+		return receipt.outcome(true)
 	}
 	// Embedded adapters without queue support retain their synchronous contract.
 	refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.mutationWaitDuration())
@@ -186,4 +215,19 @@ func (s *Server) refreshCheckoutMutation(ctx context.Context, path string, state
 	outcome.Reindexed = true
 	outcome.AppliedGeneration = uint64(cycle.DirtyGenerationID)
 	return outcome
+}
+
+// withCommittedWrite tells the ticket's capture sample which file this request
+// just wrote and the exact bytes it wrote (their SHA-256), so the sample can
+// prove that one young file by content instead of paying the git fence for it
+// (gitstate.WithKnownWrite). Any other young file still takes the fence.
+func withCommittedWrite(ctx context.Context, state *checkoutMutationState, path string) context.Context {
+	if state == nil || state.committedHash == "" || !pathkey.EqualPaths(state.committedPath, path) || state.root == "" {
+		return ctx
+	}
+	rel, err := filepath.Rel(state.root, resolveNearestExistingAncestor(path))
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return ctx
+	}
+	return gitstate.WithKnownWrite(ctx, rel, state.committedHash)
 }

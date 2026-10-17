@@ -367,10 +367,13 @@ func Compute(o Options) Result {
 	builderAssertReadersAgree(t, c.composed, c.flat)
 }
 
-// TestClosureIteratesToFixedPoint pins the hop bound. Only core.go changes;
-// mid.go is one hop out and deep.go is two, so a one-hop closure re-derives
-// mid.go against a world its own call into deep.go cannot bind in.
-func TestClosureIteratesToFixedPoint(t *testing.T) {
+// TestClosureReadsOneHopAndWithholdsDeclaredContext pins the hop bound. Only
+// core.go changes; mid.go is one hop out and deep.go is two. mid.go is read so
+// core.go binds its call, and it is DECLARED context: its bytes did not change
+// and no declaration it reads changed shape, so the layer below keeps serving
+// its payload and nothing it resolves into (deep.go) is read at all. A walk to
+// a fixed point here is what dragged a whole repository behind one edit.
+func TestClosureReadsOneHopAndWithholdsDeclaredContext(t *testing.T) {
 	treeA := map[string]string{
 		"types.go": closureFixtureTypes,
 		"core.go": `package fixture
@@ -410,7 +413,17 @@ func Compute(o Options, again Options) Result {
 `
 
 	c := buildClosureCase(t, treeA, treeB)
-	assertClosureCarries(t, c.report, "mid.go", "deep.go")
+	assertClosureCarries(t, c.report, "mid.go")
+	if slices.Contains(c.report.ClosurePaths, "deep.go") {
+		t.Errorf("the closure reads deep.go, two hops out: %v", c.report.ClosurePaths)
+	}
+	if !slices.Contains(c.report.ClosureDeclaredPaths, "mid.go") {
+		t.Errorf("mid.go is not declared context: declared %v, dependents %v",
+			c.report.ClosureDeclaredPaths, c.report.ClosureDependentPaths)
+	}
+	if len(c.report.ContextRetainedPaths) != 0 {
+		t.Errorf("the generation retained context payload for %v", c.report.ContextRetainedPaths)
+	}
 	builderAssertReadersAgree(t, c.composed, c.flat)
 }
 
@@ -462,14 +475,48 @@ func Compute(o Options, again Options) Result {
 	if len(c.flat.GetOutEdges(builderRepoPrefix+"/mid.go::Mid")) == 0 {
 		t.Fatal("the fixture's two bodies are not clones; the case cannot show anything")
 	}
-	assertClosureCarries(t, c.report, "mid.go", "twin.go")
+	// mid.go is read so core.go binds its call, and withheld whole: the
+	// generation never claims it, so its half of the pair keeps showing through
+	// from below beside twin.go's, and twin.go need not be read.
+	assertClosureCarries(t, c.report, "mid.go")
+	if slices.Contains(c.report.ClosurePaths, "twin.go") {
+		t.Errorf("the closure reads twin.go, the counterpart of a file it only reads: %v", c.report.ClosurePaths)
+	}
 	builderAssertReadersAgree(t, c.composed, c.flat)
-	// The closure reaches a pair the base already records. It cannot reach a
-	// pair the change CREATES between a claimed file and an untouched one, and
-	// it cannot re-derive a corpus statistic from part of a corpus, so the build
-	// says so rather than letting the reader assume the relation is whole.
+	// It cannot reach a pair the change CREATES between a claimed file and an
+	// untouched one, and it cannot re-derive a corpus statistic from part of a
+	// corpus, so the build says so rather than letting the reader assume the
+	// relation is whole.
 	assertProducerState(t, c.report, string(graphview.CapSimilarity),
 		store_sqlite.ProducerStateIncomplete, "corpus")
+}
+
+// TestClosureCarriesTheChangedBodysCloneCounterpart pins the other side of the
+// similarity relation: the CHANGED file is one half of a near-duplicate pair
+// and its body edit breaks the pair. twin.go records the other half in its own
+// file, so it is a dependent of the change — re-derived and claimed — not
+// context the change merely reads.
+func TestClosureCarriesTheChangedBodysCloneCounterpart(t *testing.T) {
+	treeA := map[string]string{
+		"types.go": closureFixtureTypes,
+		"core.go":  "package fixture\n\nfunc Compute(o Options) Result {\n" + closureCloneBody + "}\n",
+		"twin.go":  "package fixture\n\nfunc Twin(o Options) Result {\n" + closureCloneBody + "}\n",
+	}
+	treeB := map[string]string{}
+	for path, body := range treeA {
+		treeB[path] = body
+	}
+	treeB["core.go"] = "package fixture\n\nfunc Compute(o Options) Result {\n\treturn Result{}\n}\n"
+
+	c := buildClosureCase(t, treeA, treeB)
+	if len(c.store.AtGeneration(0).GetOutEdges(builderRepoPrefix+"/core.go::Compute")) == 0 {
+		t.Fatal("the fixture's two bodies are not clones in the base; the case cannot show anything")
+	}
+	if !slices.Contains(c.report.ClosureDependentPaths, "twin.go") {
+		t.Errorf("twin.go is not a dependent of the body edit: declared %v, dependents %v",
+			c.report.ClosureDeclaredPaths, c.report.ClosureDependentPaths)
+	}
+	builderAssertReadersAgree(t, c.composed, c.flat)
 }
 
 // TestSimilarityProducerFollowsTheClonePass pins the other state: with

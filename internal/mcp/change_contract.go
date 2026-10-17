@@ -72,6 +72,7 @@ type changeReason struct {
 	Message    string  `json:"message"`
 	Confidence float64 `json:"confidence"`
 	Symbol     string  `json:"symbol,omitempty"`
+	Stale      bool    `json:"stale,omitempty"`
 }
 
 // changeRisk is the SCORE stage output — PageRank·blast·class folded to 0..100.

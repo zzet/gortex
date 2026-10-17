@@ -169,11 +169,7 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 		}
 	}
 	if len(materialised) > 0 {
-		nodes := make([]*graph.Node, 0, len(materialised))
-		for _, n := range materialised {
-			nodes = append(nodes, n)
-		}
-		r.graph.AddBatch(nodes, nil)
+		r.addMissingBuiltinNodes(materialised)
 	}
 	if len(batch) == 0 {
 		return
@@ -265,11 +261,7 @@ func (r *Resolver) attributeGoBuiltinIdentityCandidates(
 		return false
 	}
 	if len(materialised) > 0 {
-		nodes := make([]*graph.Node, 0, len(materialised))
-		for _, node := range materialised {
-			nodes = append(nodes, node)
-		}
-		r.graph.AddBatch(nodes, nil)
+		r.addMissingBuiltinNodes(materialised)
 	}
 	if len(direct) > 0 {
 		r.noteImportTargetReindexes(direct)
@@ -540,4 +532,44 @@ func sourceIsGo(fromID string, sourceNodes map[string]*graph.Node) bool {
 		return true
 	}
 	return false
+}
+
+// addMissingBuiltinNodes writes the builtin sentinel nodes the graph does not
+// already serve as materialised. A sentinel is the same node on every save of
+// every file that uses it; re-adding it through a per-save delta made the
+// delta speak for it again, a composed write per sentinel on every save.
+func (r *Resolver) addMissingBuiltinNodes(materialised map[string]*graph.Node) {
+	ids := make([]string, 0, len(materialised))
+	for id := range materialised {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	existing := r.graph.GetNodesByIDs(ids)
+	nodes := make([]*graph.Node, 0, len(ids))
+	for _, id := range ids {
+		n := materialised[id]
+		if have := existing[id]; have != nil && sameBuiltinSentinel(have, n) {
+			continue
+		}
+		nodes = append(nodes, n)
+	}
+	if len(nodes) > 0 {
+		r.graph.AddBatch(nodes, nil)
+	}
+}
+
+// sameBuiltinSentinel reports whether a served node is the sentinel a
+// builtin attribution would write.
+func sameBuiltinSentinel(have, want *graph.Node) bool {
+	if have.ID != want.ID || have.Kind != want.Kind || have.Name != want.Name || have.Language != want.Language ||
+		have.RepoPrefix != want.RepoPrefix || have.WorkspaceID != want.WorkspaceID || have.ProjectID != want.ProjectID ||
+		have.FilePath != want.FilePath || len(have.Meta) != len(want.Meta) {
+		return false
+	}
+	for key, value := range want.Meta {
+		if have.Meta[key] != value {
+			return false
+		}
+	}
+	return true
 }

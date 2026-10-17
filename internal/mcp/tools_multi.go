@@ -15,6 +15,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // trackAcceptedHeadroom is how long before the MCP request deadline the
@@ -153,7 +154,14 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		err    error
 	}
 	done := make(chan trackOutcome, 1)
+	// The index below outlives this request by design, so it must not outlive
+	// the payload the request was reading: join the view's lease before the
+	// goroutine starts and release it when the goroutine actually exits,
+	// cancellation tail included. Nil when this request read the base corpus,
+	// which is the common case for a track call — nothing to pin.
+	pin := handoffRequestView(ctx, viewmetrics.HandoffRepositoryIndex)
 	go func() {
+		defer pin.release()
 		defer s.trackInFlight.Delete(absPath)
 		// WithoutCancel keeps the request's values (progress token, session)
 		// while dropping its cancellation, so the daemon's request lifetime

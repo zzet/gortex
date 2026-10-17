@@ -125,18 +125,30 @@ func TestDataflowBatchQueriesUseRowIDAndAdjacencyIndexes(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 
-	pagePlan := queryPlan(t, store, `
-		SELECT id, `+lookupEdgeCols+`
-		FROM edges NOT INDEXED
-		WHERE id > ? AND id <= ? AND kind IN (?, ?)
-		ORDER BY id LIMIT ?`, 0, 100, string(graph.EdgeArgOf), string(graph.EdgeReturnsTo), 20)
-	assert.Contains(t, pagePlan, "INTEGER PRIMARY KEY", "dataflow paging must seek in row-id order")
-	assert.NotContains(t, pagePlan, "SCAN edges")
-	assert.NotContains(t, pagePlan, "TEMP B-TREE", "a per-page residual sort would make pagination quadratic")
-	paramPlan := queryPlan(t, store, `SELECT `+edgeColsLight+`
-		FROM edges WHERE to_id IN (?) AND kind = ? ORDER BY id`, "callee", string(graph.EdgeParamOf))
-	assert.Contains(t, paramPlan, "edges_by_to")
-	callPlan := queryPlan(t, store, `SELECT `+edgeColsLight+`
-		FROM edges WHERE from_id IN (?) AND kind = ? ORDER BY id`, "caller", string(graph.EdgeCalls))
-	assert.Contains(t, callPlan, "edges_by_from")
+	for _, viewGen := range []int64{0, 17} {
+		t.Run(fmt.Sprintf("view-gen-%d", viewGen), func(t *testing.T) {
+			pagePlan := queryPlan(t, store, `
+				SELECT id, `+lookupEdgeCols+`
+				FROM edges NOT INDEXED
+				WHERE view_gen = ? AND id > ? AND id <= ? AND kind IN (?, ?)
+				ORDER BY id LIMIT ?`, viewGen, 0, 100, string(graph.EdgeArgOf), string(graph.EdgeReturnsTo), 20)
+			assert.Contains(t, pagePlan, "INTEGER PRIMARY KEY", "dataflow paging must seek in row-id order")
+			assert.NotContains(t, pagePlan, "SCAN edges")
+			assert.NotContains(t, pagePlan, "TEMP B-TREE", "a per-page residual sort would make pagination quadratic")
+
+			paramPlan := queryPlan(t, store, `SELECT `+edgeColsLight+`
+				FROM edges WHERE to_id IN (?) AND view_gen = ? AND kind = ? ORDER BY id`,
+				"callee", viewGen, string(graph.EdgeParamOf))
+			assert.Contains(t, paramPlan, "edges_by_to")
+			assert.Contains(t, paramPlan, "to_id=?")
+			assert.Contains(t, paramPlan, "view_gen=?")
+
+			callPlan := queryPlan(t, store, `SELECT `+edgeColsLight+`
+				FROM edges WHERE from_id IN (?) AND view_gen = ? AND kind = ? ORDER BY id`,
+				"caller", viewGen, string(graph.EdgeCalls))
+			assert.Contains(t, callPlan, "edges_by_from")
+			assert.Contains(t, callPlan, "from_id=?")
+			assert.Contains(t, callPlan, "view_gen=?")
+		})
+	}
 }

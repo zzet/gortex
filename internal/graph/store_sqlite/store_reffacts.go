@@ -85,6 +85,11 @@ func (s *Store) DeleteRefFactsByFiles(repoPrefix string, files []string) error {
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
+	byFile := false
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?)`,
+		refFactsByFileIndexName).Scan(&byFile); err != nil {
+		byFile = false
+	}
 	for start := 0; start < len(files); start += refFactChunk {
 		end := start + refFactChunk
 		if end > len(files) {
@@ -93,8 +98,8 @@ func (s *Store) DeleteRefFactsByFiles(repoPrefix string, files []string) error {
 		chunk := files[start:end]
 		args := make([]any, 0, len(chunk)+2)
 		args = append(args, s.viewGen, repoPrefix)
-		stmt := make([]byte, 0, 64+len(chunk)*2)
-		stmt = append(stmt, "DELETE FROM ref_facts WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("...)
+		stmt := make([]byte, 0, 96+len(chunk)*2)
+		stmt = append(stmt, refFactsDeleteByFilesPrefix(byFile)...)
 		for i, f := range chunk {
 			if i > 0 {
 				stmt = append(stmt, ',')
@@ -139,29 +144,86 @@ func (s *Store) LoadRefFactsByFiles(repoPrefix string, files []string) ([]graph.
 		}
 		return out, nil
 	}
+	indexed := s.refFactsIndexPresent(refFactsByFileIndexName)
 	for start := 0; start < len(files); start += refFactChunk {
 		end := start + refFactChunk
 		if end > len(files) {
 			end = len(files)
 		}
-		chunk := files[start:end]
-		args := make([]any, 0, len(chunk)+2)
-		args = append(args, s.viewGen, repoPrefix)
-		stmt := make([]byte, 0, 96+len(chunk)*2)
-		stmt = append(stmt, "SELECT "+cols+" FROM ref_facts WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("...)
-		for i, f := range chunk {
-			if i > 0 {
-				stmt = append(stmt, ',')
-			}
-			stmt = append(stmt, '?')
-			args = append(args, f)
+		filesJSON, ok := projectionJSON(files[start:end])
+		if !ok {
+			continue
 		}
-		stmt = append(stmt, ')')
-		if err := scan(string(stmt), args...); err != nil {
+		if err := scan(refFactsByFilesSQL(indexed), filesJSON, s.viewGen, repoPrefix); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
+}
+
+// refFactsByFilesSQL reads one chunk of files' facts. The file list drives
+// (CROSS JOIN: SQLite never reorders its left operand) and, with the index
+// present, the right side is pinned to ref_facts_by_file, so each file is one
+// (view_gen, repo_prefix, file_path) seek; without statistics for ref_facts
+// the planner otherwise still prefers the primary key's prefix. The plain
+// `file_path IN (…)` form let the planner take the WITHOUT ROWID primary
+// key's (view_gen, repo_prefix) prefix instead — every fact of the repository
+// in the generation per chunk (161k rows, 2.1 s cold on the live store against
+// 17 ms for the seek). ORDER BY restores the primary-key order the prefix scan
+// returned, so callers see the same rows in the same order.
+func refFactsByFilesSQL(indexed bool) string {
+	pin := ""
+	if indexed {
+		pin = " INDEXED BY " + refFactsByFileIndexName
+	}
+	return `SELECT r.from_id, r.to_id, r.kind, r.ref_name, r.line, r.origin, r.tier, r.candidates, r.file_path, r.lang
+FROM json_each(?) AS f
+CROSS JOIN ref_facts AS r` + pin + ` ON r.view_gen = ? AND r.repo_prefix = ? AND r.file_path = CAST(f.value AS TEXT)
+ORDER BY r.from_id, r.to_id, r.kind, r.line`
+}
+
+// refFactsByTargetsSQL is refFactsByFilesSQL's reverse lookup: the chunk's
+// target ids drive, each one ref_facts_by_target seek.
+func refFactsByTargetsSQL(indexed bool) string {
+	pin := ""
+	if indexed {
+		pin = " INDEXED BY " + refFactsByTargetIndexName
+	}
+	return `SELECT r.from_id, r.to_id, r.kind, r.ref_name, r.line, r.origin, r.tier, r.candidates, r.file_path, r.lang
+FROM json_each(?) AS t
+CROSS JOIN ref_facts AS r` + pin + ` ON r.view_gen = ? AND r.repo_prefix = ? AND r.to_id = CAST(t.value AS TEXT)
+ORDER BY r.from_id, r.to_id, r.kind, r.line`
+}
+
+// refFactsByTargetIndexName is the (view_gen, repo_prefix, to_id) index the
+// reverse lookup is pinned to.
+const refFactsByTargetIndexName = "ref_facts_by_target"
+
+// refFactsIndexPresent reports whether a ref_facts index exists. It is probed
+// per call (one catalog lookup): the indexes are optional, and an INDEXED BY
+// naming a missing index fails the statement.
+func (s *Store) refFactsIndexPresent(name string) bool {
+	var present bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?)`, name).Scan(&present); err != nil {
+		return false
+	}
+	return present
+}
+
+// refFactsByFileIndexName is the (view_gen, repo_prefix, file_path) index a
+// per-file delete is pinned to.
+const refFactsByFileIndexName = "ref_facts_by_file"
+
+// refFactsDeleteByFilesPrefix is the per-file delete up to its IN list. With
+// ref_facts_by_file present it is pinned there (INDEXED BY): unpinned, the
+// WITHOUT ROWID primary key's (view_gen, repo_prefix) prefix wins and a
+// one-file delete visits every fact of the repository in the generation. The
+// index is optional, so without it the unpinned form keeps working.
+func refFactsDeleteByFilesPrefix(indexed bool) string {
+	if indexed {
+		return "DELETE FROM ref_facts INDEXED BY " + refFactsByFileIndexName + " WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("
+	}
+	return "DELETE FROM ref_facts WHERE view_gen = ? AND repo_prefix = ? AND file_path IN ("
 }
 
 // LoadRefFactsByTargets returns the persisted facts that resolve TO any of
@@ -175,26 +237,17 @@ func (s *Store) LoadRefFactsByTargets(repoPrefix string, targetIDs []string) (ma
 	if len(targetIDs) == 0 {
 		return out, nil
 	}
-	const cols = `from_id, to_id, kind, ref_name, line, origin, tier, candidates, file_path, lang`
+	indexed := s.refFactsIndexPresent(refFactsByTargetIndexName)
 	for start := 0; start < len(targetIDs); start += refFactChunk {
 		end := start + refFactChunk
 		if end > len(targetIDs) {
 			end = len(targetIDs)
 		}
-		chunk := targetIDs[start:end]
-		args := make([]any, 0, len(chunk)+2)
-		args = append(args, s.viewGen, repoPrefix)
-		stmt := make([]byte, 0, 96+len(chunk)*2)
-		stmt = append(stmt, "SELECT "+cols+" FROM ref_facts WHERE view_gen = ? AND repo_prefix = ? AND to_id IN ("...)
-		for i, id := range chunk {
-			if i > 0 {
-				stmt = append(stmt, ',')
-			}
-			stmt = append(stmt, '?')
-			args = append(args, id)
+		targetsJSON, ok := projectionJSON(targetIDs[start:end])
+		if !ok {
+			continue
 		}
-		stmt = append(stmt, ')')
-		rows, err := s.db.Query(string(stmt), args...)
+		rows, err := s.db.Query(refFactsByTargetsSQL(indexed), targetsJSON, s.viewGen, repoPrefix)
 		if err != nil {
 			return nil, err
 		}

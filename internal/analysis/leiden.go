@@ -32,7 +32,7 @@ import (
 // Result has the same shape as DetectCommunities so the call site
 // can swap them out without other changes.
 func DetectCommunitiesLeiden(g graph.Store) *CommunityResult {
-	result, _ := detectCommunitiesLeidenRaw(g, defaultLeidenOptions())
+	result, _ := detectCommunitiesLeidenRaw(g, defaultLeidenOptions(), nil)
 	return result
 }
 
@@ -81,7 +81,7 @@ func (o LeidenOptions) resolution() float64 {
 // options value whose Resolution is 1.0 — yields a partition that is
 // byte-identical to DetectCommunitiesLeiden.
 func DetectCommunitiesLeidenWith(g graph.Store, opts LeidenOptions) *CommunityResult {
-	result, _ := detectCommunitiesLeidenRaw(g, opts)
+	result, _ := detectCommunitiesLeidenRaw(g, opts, nil)
 	return result
 }
 
@@ -94,9 +94,9 @@ func DetectCommunitiesLeidenWith(g graph.Store, opts LeidenOptions) *CommunityRe
 // ids and drops singletons, neither of which can drive a restricted
 // re-optimization. The returned partition is nil when the graph has
 // no clustering-relevant edges (the result is then empty too).
-func detectCommunitiesLeidenRaw(g graph.Store, opts LeidenOptions) (*CommunityResult, *leidenPartition) {
+func detectCommunitiesLeidenRaw(g graph.Store, opts LeidenOptions, pace *Pace) (*CommunityResult, *leidenPartition) {
 	resolution := opts.resolution()
-	lg := buildLeidenGraph(g)
+	lg := buildLeidenGraph(g, pace)
 	if lg == nil {
 		return &CommunityResult{NodeToComm: make(map[string]string)}, nil
 	}
@@ -128,11 +128,11 @@ func detectCommunitiesLeidenRaw(g graph.Store, opts LeidenOptions) (*CommunityRe
 	const maxIters = 12
 	for iter := 0; iter < maxIters; iter++ {
 		// Phase 1: fast local moves.
-		currentComm = leidenFastLocalMoves(currentNodes, currentNbrs, currentDeg, currentTotal, currentComm, resolution)
+		currentComm = leidenFastLocalMoves(currentNodes, currentNbrs, currentDeg, currentTotal, currentComm, resolution, pace)
 
 		// Phase 2: refinement. Each phase-1 community is internally
 		// re-clustered by running local moves on the induced sub-graph.
-		refined := leidenRefine(currentComm, currentNbrs, currentDeg, resolution)
+		refined := leidenRefine(currentComm, currentNbrs, currentDeg, resolution, pace)
 
 		// If refinement didn't merge anything (every refined comm is
 		// a singleton w.r.t. current nodes), no further aggregation
@@ -143,7 +143,7 @@ func detectCommunitiesLeidenRaw(g graph.Store, opts LeidenOptions) (*CommunityRe
 
 		// Phase 3: aggregate the graph based on refined sub-communities.
 		newNodes, newComm, newNbrs, newDeg, newTotal := leidenAggregate(
-			currentNodes, currentComm, refined, currentNbrs,
+			currentNodes, currentComm, refined, currentNbrs, pace,
 		)
 
 		// Propagate origPartition through this aggregation.
@@ -164,7 +164,7 @@ func detectCommunitiesLeidenRaw(g graph.Store, opts LeidenOptions) (*CommunityRe
 	// Renumber, build Community structs, label, disambiguate, group
 	// — same downstream pipeline as Louvain so the result is
 	// indistinguishable in shape.
-	result := buildCommunityResult(g, finalComm, neighbors, totalWeight, degree)
+	result := buildCommunityResult(g, finalComm, neighbors, totalWeight, degree, pace)
 	return result, &leidenPartition{
 		comm:        finalComm,
 		neighbors:   neighbors,
@@ -186,6 +186,7 @@ func leidenFastLocalMoves(
 	totalWeight float64,
 	initial map[string]string,
 	resolution float64,
+	pace *Pace,
 ) map[string]string {
 	comm := make(map[string]string, len(nodeIDs))
 	commMembers := make(map[string]map[string]bool)
@@ -210,6 +211,7 @@ func leidenFastLocalMoves(
 	}
 
 	for len(queue) > 0 {
+		pace.Tick()
 		id := queue[0]
 		queue = queue[1:]
 		delete(inQueue, id)
@@ -293,6 +295,7 @@ func leidenRefine(
 	neighbors map[string]map[string]float64,
 	degree map[string]float64,
 	resolution float64,
+	pace *Pace,
 ) map[string]string {
 	byComm := make(map[string][]string)
 	for id, cid := range comm {
@@ -301,6 +304,7 @@ func leidenRefine(
 
 	refined := make(map[string]string, len(comm))
 	for _, members := range byComm {
+		pace.Tick()
 		if len(members) == 1 {
 			refined[members[0]] = members[0]
 			continue
@@ -345,7 +349,7 @@ func leidenRefine(
 		for _, id := range members {
 			init[id] = id
 		}
-		subComm := leidenFastLocalMoves(members, subNbrs, subDeg, subTotal, init, resolution)
+		subComm := leidenFastLocalMoves(members, subNbrs, subDeg, subTotal, init, resolution, pace)
 		for _, id := range members {
 			refined[id] = subComm[id]
 		}
@@ -384,6 +388,7 @@ func leidenAggregate(
 	comm map[string]string,
 	refined map[string]string,
 	neighbors map[string]map[string]float64,
+	pace *Pace,
 ) (
 	newNodes []string,
 	newComm map[string]string,
@@ -416,6 +421,7 @@ func leidenAggregate(
 	newNbrs = make(map[string]map[string]float64, len(newNodes))
 	newDeg = make(map[string]float64, len(newNodes))
 	for src, srcNbrs := range neighbors {
+		pace.Tick()
 		srcMeta := refined[src]
 		if _, ok := metaSet[srcMeta]; !ok {
 			continue
@@ -447,9 +453,11 @@ func buildCommunityResult(
 	neighbors map[string]map[string]float64,
 	totalWeight float64,
 	degree map[string]float64,
+	pace *Pace,
 ) *CommunityResult {
 	nodeMap := make(map[string]*graph.Node, len(finalComm))
 	for n := range graph.NodesLightSeq(g) {
+		pace.Tick()
 		if _, ok := finalComm[n.ID]; ok {
 			nodeMap[n.ID] = n
 		}

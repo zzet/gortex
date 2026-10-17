@@ -48,6 +48,9 @@ type SpringConfigScope struct {
 	RepoPrefix  string
 	RepoRoot    string
 	WorkspaceID string
+	// ReadSource optionally serves exact accepted graph paths. Snapshot callers
+	// retain read errors independently; nil preserves the legacy disk source.
+	ReadSource func(string) ([]byte, error)
 }
 
 func scopedSpringConfigKeyID(scope SpringConfigScope, key string) string {
@@ -70,6 +73,13 @@ func springConfigSource(scope SpringConfigScope, graphPath string) []byte {
 	path = filepath.Clean(filepath.FromSlash(path))
 	if path == "." || filepath.IsAbs(path) || path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {
 		return nil
+	}
+	if scope.ReadSource != nil {
+		data, err := scope.ReadSource(graphPath)
+		if err != nil {
+			return nil
+		}
+		return data
 	}
 	data, err := os.ReadFile(filepath.Join(scope.RepoRoot, path))
 	if err != nil {

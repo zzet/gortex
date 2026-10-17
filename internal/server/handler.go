@@ -21,6 +21,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/mcp/streamable"
 	"github.com/zzet/gortex/internal/server/hub"
@@ -75,6 +76,12 @@ type Handler struct {
 	convDir     string
 	convAllow   []string
 	convTokenFn func() string
+
+	// baseLeases is how a non-tool read holds the base corpus for the
+	// lifetime of its response. Nil leaves those endpoints reading the
+	// store the way they always did, and makes them say so on the rider
+	// (pinned:false) instead of implying a hold they do not have.
+	baseLeases BaseCorpusLeases
 }
 
 // NewHandler creates an HTTP handler that dispatches to MCP tools.
@@ -258,6 +265,210 @@ func (h *Handler) peekRouteContext(body []byte, r *http.Request) (scope, cwd str
 	return scope, cwd
 }
 
+// requestViewCWD returns the workspace boundary this request names: the
+// `X-Gortex-Cwd` header, or the `?cwd=` query fallback for a browser / curl
+// client that cannot set headers. Trimmed at every read site, exactly as
+// peekRouteContext and the Streamable transport trim it, so a padded value
+// never silently becomes a different workspace boundary.
+func requestViewCWD(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if cwd := strings.TrimSpace(r.Header.Get("X-Gortex-Cwd")); cwd != "" {
+		return cwd
+	}
+	return strings.TrimSpace(r.URL.Query().Get("cwd"))
+}
+
+// requestSessionID returns the caller's real MCP session id for this request:
+// `Mcp-Session-Id` (what an MCP Streamable HTTP client sends) or the
+// `?session_id=` query fallback used by curl / integration tests.
+func requestSessionID(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	return firstNonEmpty(r.Header.Get("Mcp-Session-Id"), r.URL.Query().Get("session_id"))
+}
+
+// requestToolContext attaches the caller's identity to a context that is about
+// to run an MCP tool in-process.
+//
+// This is the same attachment handleToolCall makes, factored out so the
+// tool-backed /v1 endpoints (/v1/processes, /v1/contracts, /v1/communities,
+// /v1/caveats, /v1/dashboard) reach the tool middleware with the caller's
+// session id and workspace boundary instead of a bare r.Context(). Without it
+// those endpoints run the full view seam with nothing to resolve from, so
+// SelectorAuto has no binding and every answer comes from the base corpus no
+// matter which checkout the caller is in.
+func (h *Handler) requestToolContext(r *http.Request) context.Context {
+	if r == nil {
+		return context.Background()
+	}
+	ctx := r.Context()
+	if sid := requestSessionID(r); sid != "" {
+		ctx = gortexmcp.WithSessionID(ctx, sid)
+	}
+	if cohort := r.Header.Get("X-Gortex-Overlay-Session"); cohort != "" {
+		ctx = gortexmcp.WithOverlayCohortID(ctx, cohort)
+	}
+	if cwd := requestViewCWD(r); cwd != "" {
+		ctx = gortexmcp.WithSessionCWD(ctx, cwd)
+	}
+	return ctx
+}
+
+// --- base-corpus binding for the non-tool /v1 reads ---
+
+// BaseCorpusLeases is the seam a non-tool HTTP read holds the base corpus
+// through. *graphview.LeaseManager satisfies it directly, and it must be the
+// lifecycle's own manager — retirement runs with that manager as its in-use
+// predicate, so a reader leasing through any other one is invisible to the
+// sweep and its generation can be deleted mid-read.
+type BaseCorpusLeases interface {
+	AcquireBaseCorpus(prefix string) *graphview.BasePin
+}
+
+// SetBaseCorpusLeases wires the lease manager the /v1 direct-store endpoints
+// pin the base corpus through. Nil (or never calling it) leaves those reads
+// unleased and makes them say so: the rider reports pinned:false rather than
+// claiming a hold the response does not have.
+func (h *Handler) SetBaseCorpusLeases(l BaseCorpusLeases) { h.baseLeases = l }
+
+// BaseScopedRider is what a /v1 endpoint that answers from the base corpus
+// says about its own answer.
+//
+// The vocabulary is the tool surface's rider vocabulary (requested_view /
+// actual_view / exact / fallback_reason / base_scoped / base_changed — see
+// internal/mcp/view_request.go's viewRiderFields), so a client reads one shape
+// across both surfaces. What it must never do is present the base corpus as an
+// exact answer to a caller that named a different view: these endpoints have
+// no view-routed graph read, and saying so is the whole point of the block.
+type BaseScopedRider struct {
+	// RequestedView is the view the caller named, when it named one.
+	RequestedView string `json:"requested_view,omitempty"`
+	// ActualView is always "base" here: these endpoints read the shared
+	// indexed corpus.
+	ActualView string `json:"actual_view"`
+	// Exact reports whether the answer describes the view that was asked
+	// for. False whenever a caller named a checkout, and false when the
+	// corpus moved underneath the read.
+	Exact bool `json:"exact"`
+	// FallbackReason explains an inexact answer; set exactly when Exact is
+	// false.
+	FallbackReason string `json:"fallback_reason,omitempty"`
+	// BaseScoped names the capabilities a base-scoped read answered.
+	BaseScoped []string `json:"base_scoped,omitempty"`
+	// BaseChanged reports that the base corpus moved while this response
+	// was being read, so the answer may mix two generations. Observed, not
+	// prevented: a lease protects lifetime, not bytes.
+	BaseChanged bool `json:"base_changed,omitempty"`
+	// Pinned reports that the base generation was leased for the lifetime
+	// of this response.
+	Pinned bool `json:"pinned"`
+}
+
+// baseRead is one non-tool response's hold on the base corpus.
+//
+// Two things it is: a generation-zero + owner pin that lives exactly as long
+// as the response body is being built (so a retirement sweep waits behind the
+// read instead of through it), and the witness that answers "did the corpus
+// move under me?" when the read finishes. close() is mandatory and idempotent;
+// the rider it returns is nil when there is nothing to say, which is what
+// keeps an ordinary unbound /v1 response byte-identical to what it was.
+type baseRead struct {
+	pin       *graphview.BasePin
+	requested string
+	caps      []graphview.CapabilityID
+	// closed records that close() ran, which is the normal path and the
+	// path that releases the pin. release() reads it to tell "the handler
+	// finished" from "the handler died between acquire and close".
+	closed bool
+}
+
+// beginBaseRead pins the base corpus for the rest of this response.
+//
+// prefix names the repository whose corpus is being read; "" (every
+// whole-store endpoint) still pins generation zero, because the generation is
+// shared and reading it is what needs pinning whether or not an owner is
+// registered to speak for it (graphview.LeaseManager.AcquireBaseCorpus).
+func (h *Handler) beginBaseRead(r *http.Request, prefix string, caps ...graphview.CapabilityID) *baseRead {
+	br := &baseRead{caps: caps}
+	if cwd := requestViewCWD(r); cwd != "" {
+		br.requested = graphview.Selector{Kind: graphview.SelectorWorktree, Path: cwd}.String()
+	}
+	if h.baseLeases != nil {
+		br.pin = h.baseLeases.AcquireBaseCorpus(prefix)
+	}
+	return br
+}
+
+// close releases the pin and returns the truthful rider for the response, or
+// nil when the request named no view and nothing moved — in which case the
+// payload is exactly the one this endpoint has always produced.
+func (b *baseRead) close() *BaseScopedRider {
+	if b == nil {
+		return nil
+	}
+	b.closed = true
+	changed := b.pin.ValidateCurrent() == graphview.ErrBaseCorpusChanged
+	pinned := len(b.pin.Generations()) > 0
+	b.pin.Release()
+	if b.requested == "" && !changed {
+		return nil
+	}
+	rider := &BaseScopedRider{
+		RequestedView: b.requested,
+		ActualView:    string(graphview.SelectorBase),
+		Exact:         b.requested == "" && !changed,
+		BaseScoped:    capabilityNames(b.caps),
+		BaseChanged:   changed,
+		Pinned:        pinned,
+	}
+	if !rider.Exact {
+		switch {
+		case b.requested != "" && changed:
+			rider.FallbackReason = "this endpoint reads the base corpus, which moved while the response was being read"
+		case b.requested != "":
+			rider.FallbackReason = "this endpoint reads the base corpus; /v1 has no view-routed graph read"
+		default:
+			rider.FallbackReason = "the base corpus moved while the response was being read"
+		}
+	}
+	return rider
+}
+
+// release is the panic net every pinning handler defers.
+//
+// It is NOT the normal-path release: close() is, and close() is what renders
+// the rider. release() fires only when close() never ran — a panic between
+// acquiring the pin and finishing the response — because the ServeHTTP
+// recovery middleware above turns the panic into a 500 and runs no
+// release of its own, and graphview.LeaseManager finalises a closing
+// repository owner only once its reader count reaches zero. A leaked reader
+// therefore wedges that owner's closure for the life of the process, silently
+// and once per failed request.
+//
+// Safe on a nil baseRead and on a nil pin, and idempotent (BasePin.Release
+// is), so deferring it costs nothing on the path that already closed.
+func (b *baseRead) release() {
+	if b == nil || b.closed {
+		return
+	}
+	b.pin.Release()
+}
+
+// capabilityNames renders capability ids for the wire, in declaration order.
+func capabilityNames(caps []graphview.CapabilityID) []string {
+	if len(caps) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(caps))
+	for _, c := range caps {
+		out = append(out, string(c))
+	}
+	return out
+}
+
 // --- /health ---
 
 const (
@@ -288,9 +499,17 @@ type HealthResponse struct {
 	ReadOnly       bool                         `json:"read_only"`
 	Capabilities   []string                     `json:"capabilities,omitempty"`
 	GraphIntegrity *daemon.GraphIntegrityStatus `json:"graph_integrity,omitempty"`
+	// View is the base-scoped rider, present when the caller named a view
+	// this endpoint cannot serve, or when the corpus moved under the read.
+	View *BaseScopedRider `json:"view,omitempty"`
 }
 
-func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
+func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
+	// Health counts the whole indexed corpus: pin it so the counters and
+	// the integrity probe describe one generation that stays alive for the
+	// length of the response.
+	read := h.beginBaseRead(r, "", graphview.CapSyntaxGraph)
+	defer read.release()
 	stats := h.graph.Stats()
 	resp := HealthResponse{
 		Status:         "ok",
@@ -305,6 +524,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		Capabilities:   h.advertisedCapabilities(),
 		GraphIntegrity: daemon.GraphIntegrityStatusFor(h.graph),
 	}
+	resp.View = read.close()
 	WriteJSON(w, http.StatusOK, resp)
 }
 
@@ -422,7 +642,7 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	// path evaluating the daemon's default surface instead of the
 	// caller's actual session policy.
 	ctx := r.Context()
-	if sid := firstNonEmpty(r.Header.Get("Mcp-Session-Id"), r.URL.Query().Get("session_id")); sid != "" {
+	if sid := requestSessionID(r); sid != "" {
 		ctx = gortexmcp.WithSessionID(ctx, sid)
 	}
 	if cohort := r.Header.Get("X-Gortex-Overlay-Session"); cohort != "" {
@@ -440,6 +660,18 @@ func (h *Handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	if cwd != "" {
 		ctx = gortexmcp.WithSessionCWD(ctx, cwd)
 	}
+
+	// The same identity, in the one spelling a REMOTE can read. When the
+	// router proxies this call, daemon.ServerClient.ProxyToolCtx turns this
+	// into the `X-Gortex-Cwd` / `Mcp-Session-Id` headers on the outbound
+	// request, so the remote resolves the same view the local dispatch
+	// below would have. Without it a proxied call resolves its view from
+	// the body's `cwd` argument alone — which a header-carrying client
+	// never sent — and answers about the remote's base corpus instead.
+	ctx = daemon.WithProxyIdentity(ctx, daemon.ProxyIdentity{
+		SessionID: requestSessionID(r),
+		CWD:       cwd,
+	})
 
 	// If a Router is wired, let it decide local vs remote using the
 	// scope/cwd peeked above. Local path falls through to the
@@ -579,9 +811,13 @@ type StatsResponse struct {
 	TotalEdges int            `json:"total_edges"`
 	ByKind     map[string]int `json:"by_kind"`
 	ByLanguage map[string]int `json:"by_language"`
+	// View is the base-scoped rider; see HealthResponse.View.
+	View *BaseScopedRider `json:"view,omitempty"`
 }
 
-func (h *Handler) handleStats(w http.ResponseWriter, _ *http.Request) {
+func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
+	read := h.beginBaseRead(r, "", graphview.CapSyntaxGraph)
+	defer read.release()
 	stats := h.graph.Stats()
 	resp := StatsResponse{
 		ServerID:   h.serverID,
@@ -591,6 +827,7 @@ func (h *Handler) handleStats(w http.ResponseWriter, _ *http.Request) {
 		ByKind:     stats.ByKind,
 		ByLanguage: stats.ByLanguage,
 	}
+	resp.View = read.close()
 	WriteJSON(w, http.StatusOK, resp)
 }
 
@@ -719,6 +956,8 @@ type GraphResponse struct {
 	Nodes []*graph.Node    `json:"nodes"`
 	Edges []*graph.Edge    `json:"edges"`
 	Stats graph.GraphStats `json:"stats"`
+	// View is the base-scoped rider; see HealthResponse.View.
+	View *BaseScopedRider `json:"view,omitempty"`
 }
 
 func (h *Handler) handleGetGraph(w http.ResponseWriter, r *http.Request) {
@@ -730,6 +969,17 @@ func (h *Handler) handleGetGraph(w http.ResponseWriter, r *http.Request) {
 		WriteJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	// The widest read on the surface: every node and every edge, then the
+	// corpus-wide stats. Unleased, a retirement sweep could collect the
+	// generation between AllNodes and AllEdges and the response would
+	// splice two of them together. The pin holds generation zero (and the
+	// named repository's registered owner) until the payload is written,
+	// and the witness reports on the way out whether the corpus moved
+	// anyway — a lease protects lifetime, not bytes.
+	read := h.beginBaseRead(r, singleRepoPrefix(allowedPrefixes),
+		graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
+	defer read.release()
 
 	nodes := h.graph.AllNodes()
 	edges := h.graph.AllEdges()
@@ -781,7 +1031,22 @@ func (h *Handler) handleGetGraph(w http.ResponseWriter, r *http.Request) {
 		Nodes: briefNodes,
 		Edges: filteredEdges,
 		Stats: stats,
+		View:  read.close(),
 	})
+}
+
+// singleRepoPrefix names the one repository a filtered read is about, so the
+// pin can hold that repository's registered owner too. A filter naming several
+// repositories (or none) yields "": the read spans owners, and generation zero
+// — which is shared — is what the pin then holds.
+func singleRepoPrefix(allowed map[string]struct{}) string {
+	if len(allowed) != 1 {
+		return ""
+	}
+	for prefix := range allowed {
+		return prefix
+	}
+	return ""
 }
 
 // resolveRepoFilter returns a set of allowed RepoPrefix values based on

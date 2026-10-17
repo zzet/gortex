@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -336,25 +337,62 @@ func TestRepositoryCleanupSagaRetriesConfigWriteWithoutRepeatingPayloadPurge(t *
 	if !graphPresent {
 		t.Fatal("cleanup saga deleted graph row after config finalization failed")
 	}
-	entries, err := f.catalog.ListCleanupEntries(ctx)
-	if err != nil {
-		t.Fatalf("list cleanup journal: %v", err)
-	}
-	failedCleanupID := ""
-	for _, entry := range entries {
-		if entry.Phase == store_sqlite.CleanupPhaseFailed &&
-			strings.Contains(entry.OpaqueTargetIDs, `"phase":"release_graph"`) {
-			failedCleanupID = entry.CleanupID
+	// The child entry owns the release_graph step and parks in `failed` between
+	// attempts. The daemon's cleanup runtime is replaying this journal on its
+	// repair timer, and an in-flight replay flips that entry through `deleting`
+	// before the config write fails it again, so a single sample can catch the
+	// transient. `failed` is the steady state while the config path is broken:
+	// wait for it rather than sampling once, and report the last snapshot if the
+	// entry never parks there.
+	var (
+		failedCleanupID string
+		entries         []store_sqlite.CleanupEntry
+	)
+	journalDeadline := time.Now().Add(10 * time.Second)
+	for {
+		var err error
+		entries, err = f.catalog.ListCleanupEntries(ctx)
+		if err != nil {
+			t.Fatalf("list cleanup journal: %v", err)
+		}
+		for _, entry := range entries {
+			if entry.Phase == store_sqlite.CleanupPhaseFailed &&
+				strings.Contains(entry.OpaqueTargetIDs, `"phase":"release_graph"`) {
+				failedCleanupID = entry.CleanupID
+				break
+			}
+		}
+		if failedCleanupID != "" {
 			break
 		}
-	}
-	if failedCleanupID == "" {
-		t.Fatalf("cleanup journal advanced past failed release_graph phase: %+v", entries)
+		if time.Now().After(journalDeadline) {
+			t.Fatalf("cleanup journal advanced past failed release_graph phase: %+v", entries)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
+	// Repairing the config path unblocks the retry. Two drivers replay this one
+	// journal — the explicit replay below and the daemon's own cleanup runtime
+	// on its repair timer (repository_cleanup.go:339-341, armed because every
+	// attempt so far failed) — and the loser of that race is refused by the
+	// completed-cleanup guard. The contract fixes the outcome, not the driver:
+	// the failed entry retires exactly once, so the wait is on the journal, and
+	// a replay error only matters if the entry is still there when time runs out.
 	f.cm.Global().SetConfigPath(configPath)
-	if err := f.lc.rec.Resume(ctx); err != nil {
-		t.Fatalf("resume cleanup after config path recovery: %v", err)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		resumeErr := f.lc.rec.Resume(ctx)
+		_, present, err := f.catalog.GetCleanupEntry(ctx, failedCleanupID)
+		if err != nil {
+			t.Fatalf("read cleanup journal during config retry: %v", err)
+		}
+		if !present {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("failed cleanup entry %s survived the config retry: %v", failedCleanupID, resumeErr)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if f.configLists(f.main) {
 		t.Fatal("successful config retry retained removed repository intent")
@@ -373,6 +411,30 @@ func TestRepositoryCleanupSagaRetriesConfigWriteWithoutRepeatingPayloadPurge(t *
 		t.Fatalf("read completed config cleanup journal: %v", err)
 	} else if present {
 		t.Fatal("successful config retry retained failed cleanup entry")
+	}
+
+	// Resuming the journal completes the durable half of the saga. The
+	// process-local half — the retained MI continuation and the closed mutation
+	// lane it owns — is released by the finalization step, never by the journal
+	// replay itself: purgeRepoForCleanup deliberately retains the continuation
+	// (repository_cleanup_lane.go:75-80) so nothing can retrack the prefix
+	// between graph deletion and owner finalization. Both production retry
+	// drivers pair the two — the cleanup runtime loop
+	// (repository_cleanup.go:339-341) and public Untrack
+	// (checkout_lifecycle.go:1079) — so the retry modelled here pairs them too.
+	// The background runtime may already have run this pair; finalization is
+	// idempotent and a finished state answers "not pending" either way.
+	pending, err := f.lc.finalizeRepositoryCleanups(ctx, f.mainPrefix)
+	if err != nil {
+		t.Fatalf("finalize repository cleanup after config retry: %v", err)
+	}
+	if pending {
+		t.Fatal("cleanup still pending after the journal completed")
+	}
+	// Finalization releases bookkeeping only: it must not re-run either
+	// destructive phase the first attempt already committed.
+	if purge, vector := counting.calls(); purge != 1 || vector != 1 {
+		t.Fatalf("finalization repeated committed destructive phases: purge:%d vector:%d, want 1/1", purge, vector)
 	}
 	assertCleanupReleased(t, f.mi, f.mainPrefix)
 }

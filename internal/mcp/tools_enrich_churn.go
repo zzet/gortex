@@ -48,15 +48,20 @@ func (s *Server) handleEnrichChurn(ctx context.Context, req mcp.CallToolRequest)
 		root   string
 	}
 	var targets []target
-	if s.multiIndexer != nil {
-		for prefix, meta := range s.multiIndexer.AllMetadata() {
-			if pathArg != "" && pathArg != prefix && pathArg != meta.RootPath {
-				continue
-			}
-			targets = append(targets, target{prefix: prefix, root: meta.RootPath})
+	// A routed request enriches exactly one target — its own checkout — and an
+	// identity with no writable generation enriches none. enrichmentTargets is
+	// the single place that decision is made; the multi-repo sweep below is the
+	// unrouted shape it falls back to.
+	for prefix, root := range s.enrichmentTargets(ctx, "") {
+		if pathArg != "" && pathArg != prefix && pathArg != root {
+			continue
 		}
+		targets = append(targets, target{prefix: prefix, root: root})
 	}
 	if len(targets) == 0 {
+		if requestViewFromContext(ctx).readsOwnCheckout() {
+			return mcp.NewToolResultError(ErrEnrichmentSnapshotNotWritable.Error() + ": churn enrichment"), nil
+		}
 		return mcp.NewToolResultError(fmt.Sprintf("no tracked repo matches %q", pathArg)), nil
 	}
 
@@ -68,9 +73,20 @@ func (s *Server) handleEnrichChurn(ctx context.Context, req mcp.CallToolRequest)
 		Files   int    `json:"files"`
 		Symbols int    `json:"symbols"`
 		Skipped string `json:"skipped,omitempty"`
+		// Superseded reports that a newer churn run for this output took the
+		// authority over while this one ran. The stamps this run wrote are on
+		// the graph — the producer finished before it settled — so the counts
+		// above are real and this is an ordering statement, not a skip.
+		Superseded bool `json:"superseded,omitempty"`
 	}
 	var per []perRepo
 	totalFiles, totalSymbols := 0, 0
+	// One answer-level generation for the whole run: every target a corpus
+	// enrichment admits names generation zero, so it is set from the first
+	// admitted output rather than re-assigned per repository (which would make
+	// the field read "whatever the last repository named").
+	generation := int64(0)
+	generationNamed := false
 	for _, t := range targets {
 		b := branch
 		if b == "" {
@@ -80,14 +96,27 @@ func (s *Server) handleEnrichChurn(ctx context.Context, req mcp.CallToolRequest)
 			per = append(per, perRepo{Prefix: t.prefix, Skipped: "no default branch resolvable"})
 			continue
 		}
-		res, err := churn.EnrichGraph(ctx, s.graph, t.root, churn.Options{Branch: b})
+		out, err := s.beginEnrichmentOutput(ctx, EnrichProducerChurn, t.prefix, t.root)
 		if err != nil {
+			return mcp.NewToolResultError("churn enrichment: " + err.Error()), nil
+		}
+		res, err := churn.EnrichGraph(ctx, out.Store, out.Root, churn.Options{Branch: b})
+		if err != nil {
+			out.Abandon()
 			per = append(per, perRepo{Prefix: t.prefix, Branch: b, Skipped: err.Error()})
 			continue
 		}
+		superseded, serr := out.Settle()
+		if serr != nil {
+			per = append(per, perRepo{Prefix: t.prefix, Branch: b, Skipped: serr.Error()})
+			continue
+		}
+		if !generationNamed {
+			generation, generationNamed = out.Generation, true
+		}
 		per = append(per, perRepo{
 			Prefix: t.prefix, Branch: res.Branch, HeadSHA: res.HeadSHA,
-			Files: res.Files, Symbols: res.Symbols,
+			Files: res.Files, Symbols: res.Symbols, Superseded: superseded,
 		})
 		totalFiles += res.Files
 		totalSymbols += res.Symbols
@@ -97,6 +126,7 @@ func (s *Server) handleEnrichChurn(ctx context.Context, req mcp.CallToolRequest)
 		"repos":       per,
 		"files":       totalFiles,
 		"symbols":     totalSymbols,
+		"generation":  generation,
 		"duration_ms": time.Since(started).Milliseconds(),
 	})
 }

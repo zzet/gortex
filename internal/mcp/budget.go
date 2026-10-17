@@ -506,11 +506,16 @@ func registerDegradeShape(toolName string, shape DegradeShape) {
 // which step. The trim is monotone: every step either fits the cap
 // (return) or progresses to a more aggressive step.
 func applyDegradation(payload any, shape DegradeShape, maxBytes int) (any, bool) {
+	return applyDegradationObserved(payload, shape, maxBytes, nil)
+}
+
+// retain records surviving original row positions without changing the payload.
+func applyDegradationObserved(payload any, shape DegradeShape, maxBytes int, retain func(string, []int)) (any, bool) {
 	if maxBytes <= 0 || payload == nil {
 		return payload, false
 	}
 	if shape.TierFunc == nil && len(shape.MetaStrip) == 0 {
-		return applyBudget(payload, maxBytes)
+		return applySymbolObservedBudget(payload, maxBytes, retain)
 	}
 
 	bytes, err := json.Marshal(payload)
@@ -565,12 +570,19 @@ func applyDegradation(payload any, shape DegradeShape, maxBytes int) (any, bool)
 					continue
 				}
 				kept := make([]any, 0, len(arr))
+				var keptPositions []int
+				if retain != nil {
+					keptPositions = make([]int, 0, len(arr))
+				}
 				originalLen := len(arr)
 				droppedCount := 0
-				for _, row := range arr {
+				for position, row := range arr {
 					rowMap, ok := row.(map[string]any)
 					if !ok {
 						kept = append(kept, row)
+						if retain != nil {
+							keptPositions = append(keptPositions, position)
+						}
 						continue
 					}
 					if shape.TierFunc(rowMap) >= tier {
@@ -578,9 +590,15 @@ func applyDegradation(payload any, shape DegradeShape, maxBytes int) (any, bool)
 						continue
 					}
 					kept = append(kept, row)
+					if retain != nil {
+						keptPositions = append(keptPositions, position)
+					}
 				}
 				if droppedCount > 0 {
 					generic[k] = kept
+					if retain != nil {
+						retain(k, keptPositions)
+					}
 					generic[fmt.Sprintf("_dropped_tier_%d_%s", tier, k)] = droppedCount
 					generic[fmt.Sprintf("_original_count_%s", k)] = originalLen
 					anyDropped = true
@@ -595,7 +613,7 @@ func applyDegradation(payload any, shape DegradeShape, maxBytes int) (any, bool)
 	}
 
 	// Step 3: last-resort tail-trim of the longest remaining list.
-	return applyBudget(generic, maxBytes)
+	return applySymbolObservedBudget(generic, maxBytes, retain)
 }
 
 // encodeCursor packs an opaque cursor value (currently {offset:N}) as

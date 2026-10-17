@@ -69,7 +69,7 @@ func (v *OverlaidView) ScanNodeSearchKeys(ctx context.Context, pageSize int, yie
 			if node == nil {
 				continue
 			}
-			if !emit(NodeSearchKey{ID: node.ID, Kind: node.Kind, Name: node.Name}) {
+			if !emit(nodeSearchKey(node)) {
 				return nil
 			}
 		}

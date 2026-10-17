@@ -29,25 +29,36 @@ func (s *Store) FindNodesByNamesInRepo(names []string, repoPrefix string) map[st
 		return nil
 	}
 	out := make(map[string][]*graph.Node, len(uniq))
-	for start := 0; start < len(uniq); start += lookupChunkSize - 2 {
-		end := minInt(start+lookupChunkSize-2, len(uniq))
-		chunk := uniq[start:end]
-		query := `SELECT ` + lookupNodeCols + ` FROM nodes
-WHERE repo_prefix = ? AND name IN (` + strings.Repeat(",?", len(chunk))[1:] + `) AND view_gen = ?`
-		args := make([]any, 0, len(chunk)+2)
-		args = append(args, repoPrefix)
-		for _, name := range chunk {
-			args = append(args, name)
-		}
-		args = append(args, s.viewGen)
-		for _, node := range s.queryNodesSQL(query, args...) {
-			if node != nil {
-				out[node.Name] = append(out[node.Name], node)
-			}
+	namesJSON, ok := projectionJSON(uniq)
+	if !ok {
+		return out
+	}
+	if observe := nameLookupSQLObserver; observe != nil {
+		observe(repoNamesSeekSQL)
+	}
+	for _, node := range s.queryNodesSQL(repoNamesSeekSQL, namesJSON, s.viewGen, repoPrefix) {
+		if node != nil {
+			out[node.Name] = append(out[node.Name], node)
 		}
 	}
 	return out
 }
+
+// repoNamesSeekSQL reads a repository's nodes of the given names in one
+// generation, one nodes_by_name (name, view_gen) seek per name. The IN-list
+// form flipped, from about two hundred names, to a scan of the repository's
+// whole generation (nodes_by_repo (repo_prefix, view_gen)): 600k rows for the
+// base generation. The json_each form fixed the order but left the index to
+// the statistics: with none (a store fresh from a load) nodes_by_repo and
+// nodes_by_name both key two equalities, and the planner took nodes_by_repo,
+// a scan of the repository's generation per name (60 s an edit). The unary +
+// keeps repo_prefix out of every index key, so nodes_by_name is the only
+// two-column seek whatever the statistics say; the repository is checked on
+// the rows the seek returns.
+var repoNamesSeekSQL = `SELECT ` + qualifiedNodeColumns("n", lookupNodeCols) + `
+  FROM json_each(?) AS w
+  CROSS JOIN nodes AS n
+ WHERE n.name = w.value AND n.view_gen = ? AND +n.repo_prefix = ?`
 
 func (s *Store) CountRepoLanguageSymbols(repoPrefix string, languages []string) int {
 	seen := make(map[string]struct{}, len(languages))
@@ -81,3 +92,8 @@ WHERE repo_prefix = ? AND language IN (` + strings.Repeat(",?", len(uniq))[1:] +
 	}
 	return count
 }
+
+// nameLookupSQLObserver, when a test sets it, is told the statement each
+// repository name read runs, so the plan the test checks is the one the read
+// uses. nil in production.
+var nameLookupSQLObserver func(query string)

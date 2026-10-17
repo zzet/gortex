@@ -33,7 +33,7 @@ var catalogTables = []string{
 
 func openCatalogStore(t testing.TB) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "catalog.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -179,7 +179,11 @@ func seedBuildingGeneration(t *testing.T, catalog *Catalog, graphID string) int6
 // preserves every column — including the nullable ones whose empty Go value
 // must come back as an empty value rather than a scan error.
 func TestCatalogSchemaAppliesOnFreshStore(t *testing.T) {
-	store := openCatalogStore(t)
+	store, err := Open(filepath.Join(t.TempDir(), "catalog.sqlite"))
+	if err != nil {
+		t.Fatalf("Open fresh store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 	for _, name := range catalogTables {
 		if !hasTable(t, store.writerDB, name) {
 			t.Fatalf("fresh store is missing catalog table %s", name)
@@ -1974,8 +1978,13 @@ func TestCatalogObservationWriteMovesBothClocks(t *testing.T) {
 		RemovalDetectedAt:    40,
 		RemovalDeadline:      50,
 		RemovalEvidence:      "evidence_prunable_confirmed",
-		LastSeen:             60,
-		LastError:            "volume detached",
+		// Later than the seeded row's clock (101): the observation write is
+		// fenced on last_seen, so a pass whose clock predates the one already
+		// stored is refused rather than applied. The other clock axes are
+		// deliberately left at their small arbitrary values — they are the
+		// columns under test here, and none of them fences anything.
+		LastSeen:  160,
+		LastError: "volume detached",
 	}
 	if err := catalog.UpdateCheckoutObservation(ctx, req); err != nil {
 		t.Fatalf("UpdateCheckoutObservation: %v", err)
@@ -2558,5 +2567,751 @@ func TestCatalogWithdrawProducer(t *testing.T) {
 	}
 	if err := catalog.WithdrawProducer(ctx, 0, "source.snapshot", ""); !errors.Is(err, ErrCatalogInvalidValue) {
 		t.Errorf("withdrawing on generation 0 = %v, want %v", err, ErrCatalogInvalidValue)
+	}
+}
+
+// TestCatalogObservationFenceOrdersTheWriters pins the monotonic fence on the
+// observation write.
+//
+// Three writers move these columns — the reconciliation pass, an explicit
+// track through CheckoutLifecycle.confirmPresent, and the committed-base
+// publisher through AdoptDedicatedBaseGeneration — and the incarnation guard
+// orders none of them: it says the row is still the same working copy, not
+// that the facts being written are the newest anybody sampled. Without the
+// fence a pass that started before a newer one could land after it and restore
+// the head_tree the family had already moved past, which is the column every
+// dependent worktree's layer identity is keyed on.
+func TestCatalogObservationFenceOrdersTheWriters(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	observation := func(clock int64, tree string) UpdateCheckoutObservationRequest {
+		return UpdateCheckoutObservationRequest{
+			CheckoutID: "wt", Incarnation: "inc-1", State: CheckoutStateReady,
+			RootPath: "/tmp/wt", GitDir: "/tmp/wt/.git",
+			HeadRef: "refs/heads/main", HeadCommit: "commit-" + tree, HeadTree: tree,
+			LastAccessible: clock, LastSeen: clock,
+		}
+	}
+	headTree := func() string {
+		t.Helper()
+		return storedCheckout(t, catalog, "wt").HeadTree
+	}
+
+	newest, err := catalog.UpdateCheckoutObservationWithReport(ctx, observation(200, "tree-newest"))
+	if err != nil {
+		t.Fatalf("the newest observation was refused: %v", err)
+	}
+	if newest.Verdict != CheckoutObservationApplied || newest.Position == 0 {
+		t.Fatalf("report = %+v, want an applied write holding a position", newest)
+	}
+	if got := headTree(); got != "tree-newest" {
+		t.Fatalf("head_tree = %q, want tree-newest", got)
+	}
+
+	// The pass that sampled first, and arrived second. It is refused — and the
+	// refusal is reported as such, not as a stale guard, which is what a
+	// re-keyed row means and would tell the caller to abandon its own pass.
+	fenced, err := catalog.UpdateCheckoutObservationWithReport(ctx, observation(150, "tree-older"))
+	if !errors.Is(err, ErrCatalogObservationFenced) {
+		t.Fatalf("an older observation = %v, want ErrCatalogObservationFenced", err)
+	}
+	// The refusal is also a stale guard, which is what it is to a caller that
+	// does not distinguish: the write did not apply because the row moved on.
+	// Both production observers key their handling on that, and it is what
+	// keeps a superseded pass from recording a transition it did not make.
+	if !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("the refusal = %v, want it to read as a stale guard too", err)
+	}
+	if !fenced.Fenced() || fenced.Verdict != CheckoutObservationFenced {
+		t.Fatalf("report = %+v, want the older pass fenced", fenced)
+	}
+	if fenced.FencedBy != newest.Position || fenced.FencingObservation != 200 {
+		t.Fatalf("report = %+v, want it fenced by position %d at clock 200",
+			fenced, newest.Position)
+	}
+	if fenced.Position != newest.Position {
+		t.Fatalf("the row stands at position %d, want the newer observation's %d",
+			fenced.Position, newest.Position)
+	}
+	if got := headTree(); got != "tree-newest" {
+		t.Fatalf("an older observation rewrote head_tree to %q", got)
+	}
+	if fenced.HeadTree != "tree-newest" {
+		t.Fatalf("the report names head_tree %q, want the kept tree-newest", fenced.HeadTree)
+	}
+	// A refused pass writes nothing at all, so no clock moves — least of all
+	// backwards. The stored clock is the ordering evidence the NEXT writer is
+	// compared against (and the one advanceDedicatedBaseOwnerHeadTx's
+	// `last_seen <= ?` guard reads); regressing it here would hand the row to
+	// whichever stale pass arrived next.
+	if got := storedCheckout(t, catalog, "wt").LastSeen; got != 200 {
+		t.Fatalf("last_seen = %d after a fenced write, want the stored 200 untouched", got)
+	}
+
+	// A tie is not a reordering: two passes inside one clock tick still write.
+	tie, err := catalog.UpdateCheckoutObservationWithReport(ctx, observation(200, "tree-same-tick"))
+	if err != nil {
+		t.Fatalf("an observation on the stored clock was refused: %v", err)
+	}
+	if tie.Verdict != CheckoutObservationApplied || tie.Position <= newest.Position {
+		t.Fatalf("report = %+v, want an applied write past position %d", tie, newest.Position)
+	}
+	if got := headTree(); got != "tree-same-tick" {
+		t.Fatalf("head_tree = %q, want tree-same-tick", got)
+	}
+
+	// An unclocked writer states no position in the sequence and is not fenced
+	// against one. Both production observers stamp their pass clock.
+	unclocked, err := catalog.UpdateCheckoutObservationWithReport(ctx, observation(0, "tree-unclocked"))
+	if err != nil {
+		t.Fatalf("an unclocked observation was refused: %v", err)
+	}
+	if unclocked.Verdict != CheckoutObservationApplied {
+		t.Fatalf("report = %+v, want the unclocked write applied", unclocked)
+	}
+	if got := headTree(); got != "tree-unclocked" {
+		t.Fatalf("head_tree = %q, want tree-unclocked", got)
+	}
+	// And it did not pull the stored clock down to its own nothing.
+	if got := storedCheckout(t, catalog, "wt").LastSeen; got != 200 {
+		t.Fatalf("last_seen = %d after an unclocked write, want 200", got)
+	}
+}
+
+// storedCheckout reads one checkout row, failing the test when it is gone.
+func storedCheckout(t testing.TB, catalog *Catalog, checkoutID string) Checkout {
+	t.Helper()
+	row, found, err := catalog.GetCheckout(context.Background(), checkoutID)
+	if err != nil || !found {
+		t.Fatalf("GetCheckout(%s) = found %v, err %v", checkoutID, found, err)
+	}
+	return row
+}
+
+// TestCatalogObservationFenceRefusesEveryAxis is the ordering half of the
+// fence: a stale observer overwrites nothing, on any axis.
+//
+// Two independent production observers write the state axis, both grace
+// clocks, the removal evidence and last_error from separately taken samples:
+// the reconciliation pass (internal/reconcile: applyPresent zeroes both grace
+// clocks and the removal evidence, then writes CheckoutStateReady) and an
+// explicit track (internal/indexer: CheckoutLifecycle.confirmPresent, which
+// writes CheckoutStateReady from its own sample). The incarnation guard does
+// not order them. If the fence covered only the head facts, an earlier-sampled
+// pass landing second would still win those columns outright — resetting the
+// state to ready and zeroing a newer pass's removal grace, restarting the
+// grace interval — and the row would end up half-way between two samples,
+// describing a working copy that never looked like that.
+func TestCatalogObservationFenceRefusesEveryAxis(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	// The newer pass: the working copy is gone and its removal grace is open.
+	newer := UpdateCheckoutObservationRequest{
+		CheckoutID: "wt", Incarnation: "inc-1", State: CheckoutStateRemovalGrace,
+		RootPath: "/tmp/wt", GitDir: "/tmp/wt/.git",
+		HeadRef: "refs/heads/main", HeadCommit: "commit-new", HeadTree: "tree-new",
+		LastAccessible:    3000,
+		RemovalDetectedAt: 3000, RemovalDeadline: 3600,
+		RemovalEvidence: "authoritative_omission",
+		LastSeen:        3000, LastError: "gone",
+	}
+	if err := catalog.UpdateCheckoutObservation(ctx, newer); err != nil {
+		t.Fatalf("the newer observation was refused: %v", err)
+	}
+
+	// The earlier pass, landing second: it sampled the working copy while it
+	// was still present, so it carries the present disposition's zeroed clocks
+	// and a ready state.
+	earlier := UpdateCheckoutObservationRequest{
+		CheckoutID: "wt", Incarnation: "inc-1", State: CheckoutStateReady,
+		RootPath: "/moved/wt", GitDir: "/moved/wt/.git", Locked: true, Prunable: true,
+		HeadRef: "refs/heads/other", HeadCommit: "commit-old", HeadTree: "tree-old",
+		LastAccessible: 2900,
+		LastSeen:       2900,
+	}
+	report, err := catalog.UpdateCheckoutObservationWithReport(ctx, earlier)
+	if !errors.Is(err, ErrCatalogObservationFenced) {
+		t.Fatalf("the earlier observation = %v, want ErrCatalogObservationFenced", err)
+	}
+	if !report.Fenced() {
+		t.Fatalf("the earlier pass was not fenced: %+v", report)
+	}
+
+	row := storedCheckout(t, catalog, "wt")
+	if row.HeadTree != "tree-new" || row.HeadCommit != "commit-new" || row.HeadRef != "refs/heads/main" {
+		t.Errorf("head = (%q, %q, %q); the fence did not hold the head facts",
+			row.HeadRef, row.HeadCommit, row.HeadTree)
+	}
+	if row.State != CheckoutStateRemovalGrace {
+		t.Errorf("state = %q; a stale sample reset the state axis", row.State)
+	}
+	if row.RemovalDetectedAt != 3000 || row.RemovalDeadline != 3600 {
+		t.Errorf("removal clock = (%d, %d), want (3000, 3600); a stale sample restarted the grace",
+			row.RemovalDetectedAt, row.RemovalDeadline)
+	}
+	if row.RemovalEvidence != "authoritative_omission" || row.LastError != "gone" {
+		t.Errorf("evidence = %q / error = %q; a stale sample overwrote the diagnosis",
+			row.RemovalEvidence, row.LastError)
+	}
+	if row.LastAccessible != 3000 || row.LastSeen != 3000 {
+		t.Errorf("clocks = (%d, %d), want (3000, 3000); a stale sample moved a clock",
+			row.LastAccessible, row.LastSeen)
+	}
+	if row.RootPath != "/tmp/wt" || row.Locked || row.Prunable {
+		t.Errorf("observed facts = (%q, %v, %v); a stale sample wrote its own",
+			row.RootPath, row.Locked, row.Prunable)
+	}
+
+	// The observer is not stuck: its next pass re-samples, and a pass at or
+	// past the row's clock lands whole.
+	next := earlier
+	next.LastSeen, next.LastAccessible = 3001, 3001
+	next.HeadCommit, next.HeadTree = "commit-back", "tree-back"
+	after, err := catalog.UpdateCheckoutObservationWithReport(ctx, next)
+	if err != nil {
+		t.Fatalf("the re-sampled pass = %v", err)
+	}
+	if after.Verdict != CheckoutObservationApplied {
+		t.Fatalf("the re-sampled pass = %+v, want it applied", after)
+	}
+	row = storedCheckout(t, catalog, "wt")
+	if row.State != CheckoutStateReady || row.HeadTree != "tree-back" || row.RemovalDeadline != 0 {
+		t.Fatalf("the re-sampled pass did not land: state %q head %q removal deadline %d",
+			row.State, row.HeadTree, row.RemovalDeadline)
+	}
+}
+
+// TestCatalogObservationRefusalNeverAdoptsTheFirstStaleClock is the
+// three-writer case, and the reason the fence does not simply re-base on the
+// first pass it refuses.
+//
+// An adoption (or any newer pass) sets the row's clock; then two passes that
+// both sampled before it land, one after the other. A fence that treated the
+// first refusal as evidence of a clock that had moved would hand the row to
+// the second stale pass — which is the same defect as writing the refused
+// pass's clock into the row: either way the ordering evidence the next writer
+// is compared against is gone, and the oldest sample wins.
+func TestCatalogObservationRefusalNeverAdoptsTheFirstStaleClock(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	observation := func(clock int64, tree string) UpdateCheckoutObservationRequest {
+		return UpdateCheckoutObservationRequest{
+			CheckoutID: "wt", Incarnation: "inc-1", State: CheckoutStateReady,
+			RootPath: "/tmp/wt", GitDir: "/tmp/wt/.git",
+			HeadRef: "refs/heads/main", HeadCommit: "commit-" + tree, HeadTree: tree,
+			LastAccessible: clock, LastSeen: clock,
+		}
+	}
+	if err := catalog.UpdateCheckoutObservation(ctx, observation(200, "tree-NEW")); err != nil {
+		t.Fatalf("the newest observation was refused: %v", err)
+	}
+
+	first, err := catalog.UpdateCheckoutObservationWithReport(ctx, observation(150, "tree-OLD"))
+	if !errors.Is(err, ErrCatalogObservationFenced) {
+		t.Fatalf("the first stale pass = %v, want ErrCatalogObservationFenced", err)
+	}
+	if !first.Fenced() {
+		t.Fatalf("the first stale pass was not fenced: %+v", first)
+	}
+	second, err := catalog.UpdateCheckoutObservationWithReport(ctx, observation(160, "tree-OLDER-SAMPLE"))
+	if !errors.Is(err, ErrCatalogObservationFenced) {
+		t.Fatalf("the second stale pass = %v, want it refused too", err)
+	}
+	if !second.Fenced() {
+		t.Fatalf("the second stale pass was admitted: %+v", second)
+	}
+	if second.FencingObservation != 200 {
+		t.Fatalf("the second stale pass was fenced against clock %d, want the stored 200 — "+
+			"the first refusal pulled the ordering evidence down", second.FencingObservation)
+	}
+	row := storedCheckout(t, catalog, "wt")
+	if row.HeadTree != "tree-NEW" {
+		t.Fatalf("head_tree = %q, want tree-NEW held against both stale passes", row.HeadTree)
+	}
+	if row.LastSeen != 200 {
+		t.Fatalf("last_seen = %d, want 200: a refused pass moved the clock backwards", row.LastSeen)
+	}
+}
+
+// TestCatalogObservationClockStepBackDoesNotWedge is the other half of the
+// same decision: the fence must not turn a host clock that moved into a row
+// nothing can write to again.
+//
+// A whole-row fence that refuses everything behind the stored clock, and
+// refuses it as an error, is a wedge: both production callers read
+// ErrCatalogStaleGuard as "another actor owns this row" and return, so after an
+// NTP correction or a VM resume nothing pulls the row forward — a checkout that
+// cannot leave its removal grace and a state axis frozen for as long as the
+// skew lasts. Each production observer holds at most one sample in flight, so a
+// third consecutive pass from behind the floor is the clock and not a late
+// observer, and the row moves to the new clock domain.
+func TestCatalogObservationClockStepBackDoesNotWedge(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	pass := func(clock int64, tree string) UpdateCheckoutObservationRequest {
+		return UpdateCheckoutObservationRequest{
+			CheckoutID: "wt", Incarnation: "inc-1", State: CheckoutStateRemovalGrace,
+			RootPath: "/tmp/wt", GitDir: "/tmp/wt/.git",
+			HeadRef: "refs/heads/main", HeadCommit: "commit-" + tree, HeadTree: tree,
+			LastAccessible: clock, RemovalDetectedAt: clock, RemovalDeadline: clock + 300,
+			RemovalEvidence: "authoritative_omission",
+			LastSeen:        clock, LastError: "gone",
+		}
+	}
+	if err := catalog.UpdateCheckoutObservation(ctx, pass(5000, "tree-new")); err != nil {
+		t.Fatalf("the first observation was refused: %v", err)
+	}
+
+	// The clock steps back an hour. The observer keeps sampling on its own
+	// cadence; every pass now looks older than the row.
+	for _, clock := range []int64{1400, 1401} {
+		report, err := catalog.UpdateCheckoutObservationWithReport(ctx, pass(clock, "tree-skew"))
+		if !errors.Is(err, ErrCatalogObservationFenced) {
+			t.Fatalf("the pass at %d = %v, want ErrCatalogObservationFenced", clock, err)
+		}
+		if !report.Fenced() {
+			t.Fatalf("the pass at %d = %+v, want it fenced while the skew is still ambiguous",
+				clock, report)
+		}
+	}
+
+	rebased, err := catalog.UpdateCheckoutObservationWithReport(ctx, pass(1402, "tree-after-skew"))
+	if err != nil {
+		t.Fatalf("the pass after the skew = %v", err)
+	}
+	if rebased.Verdict != CheckoutObservationRebased {
+		t.Fatalf("the third pass behind the clock = %+v, want it rebased rather than refused forever",
+			rebased)
+	}
+	row := storedCheckout(t, catalog, "wt")
+	if row.HeadTree != "tree-after-skew" || row.State != CheckoutStateRemovalGrace {
+		t.Fatalf("the row did not move with the clock: head %q state %q", row.HeadTree, row.State)
+	}
+	if row.RemovalDeadline != 1702 {
+		t.Fatalf("removal deadline = %d, want 1702; the grace stopped advancing", row.RemovalDeadline)
+	}
+	// Adopting the new clock domain is not the same as regressing the stored
+	// clock: last_seen is MAX(stored, observed), which is the invariant
+	// advanceDedicatedBaseOwnerHeadTx's guard reads.
+	if row.LastSeen != 5000 {
+		t.Fatalf("last_seen = %d, want the stored 5000 kept", row.LastSeen)
+	}
+
+	// And the row is no longer fenced at all: the skew is the new normal.
+	steady, err := catalog.UpdateCheckoutObservationWithReport(ctx, pass(1403, "tree-steady"))
+	if err != nil {
+		t.Fatalf("the pass after the rebase = %v", err)
+	}
+	if steady.Verdict != CheckoutObservationApplied {
+		t.Fatalf("the pass after the rebase = %+v, want an ordinary applied write", steady)
+	}
+	if got := storedCheckout(t, catalog, "wt").HeadTree; got != "tree-steady" {
+		t.Fatalf("head_tree = %q after the skew cleared, want tree-steady", got)
+	}
+}
+
+// TestCatalogObservationFenceIsPerRowAndSeededFromTheRow pins the two things
+// that keep the fence from being either too wide or too narrow: it orders one
+// working copy's observations and nothing else's, and a process that has never
+// seen a row takes the row's own clock as its floor.
+func TestCatalogObservationFenceIsPerRowAndSeededFromTheRow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fence.sqlite")
+	store, err := openPristine(t, path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+	seedFamilyAndCheckout(t, catalog, "fam", "other", "inc-1")
+
+	observation := func(checkoutID, incarnation string, clock int64, tree string) UpdateCheckoutObservationRequest {
+		return UpdateCheckoutObservationRequest{
+			CheckoutID: checkoutID, Incarnation: incarnation, State: CheckoutStateReady,
+			RootPath: "/tmp/" + checkoutID, GitDir: "/tmp/" + checkoutID + "/.git",
+			HeadRef: "refs/heads/main", HeadCommit: "commit-" + tree, HeadTree: tree,
+			LastAccessible: clock, LastSeen: clock,
+		}
+	}
+
+	if err := catalog.UpdateCheckoutObservation(ctx, observation("wt", "inc-1", 900, "tree-wt")); err != nil {
+		t.Fatalf("the first checkout's observation was refused: %v", err)
+	}
+	// A different working copy has its own sequence: one checkout's clock
+	// cannot fence another's.
+	report, err := catalog.UpdateCheckoutObservationWithReport(ctx, observation("other", "inc-1", 300, "tree-other"))
+	if err != nil || report.Fenced() {
+		t.Fatalf("a second checkout at an earlier clock = %+v / %v, want it applied", report, err)
+	}
+	if got := storedCheckout(t, catalog, "other").HeadTree; got != "tree-other" {
+		t.Fatalf("the second checkout's head_tree = %q, want tree-other", got)
+	}
+
+	// A re-keyed row is a different working copy, and its observations start
+	// their own sequence rather than inheriting the old incarnation's floor.
+	if err := catalog.UpsertCheckout(ctx, Checkout{
+		CheckoutID: "wt", Incarnation: "inc-2", FamilyID: "fam",
+		RootPath: "/tmp/wt", GitDir: "/tmp/wt/.git", AdminName: "wt",
+		State: CheckoutStateReady, DesiredMode: CheckoutModeAutomatic,
+		EffectiveMode: CheckoutModeAutomatic, HeadTree: "7ee7", LastSeen: 0,
+	}); err != nil {
+		t.Fatalf("re-keying the checkout: %v", err)
+	}
+	report, err = catalog.UpdateCheckoutObservationWithReport(ctx, observation("wt", "inc-2", 400, "tree-reborn"))
+	if err != nil || report.Fenced() {
+		t.Fatalf("the re-keyed row's first observation = %+v / %v, want it applied", report, err)
+	}
+
+	// A restart drops the process-local sequence, and the durable half takes
+	// over: the row's own last_seen is the floor a fresh ledger seeds from, so
+	// a pass that sampled before the last observation is still refused.
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	restarted, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	catalog = restarted.Catalog()
+	report, err = catalog.UpdateCheckoutObservationWithReport(ctx, observation("wt", "inc-2", 350, "tree-stale-after-restart"))
+	if !errors.Is(err, ErrCatalogObservationFenced) {
+		t.Fatalf("the pass after the restart = %v, want ErrCatalogObservationFenced", err)
+	}
+	if !report.Fenced() || report.FencingObservation != 400 {
+		t.Fatalf("the pass after the restart = %+v, want it fenced against the stored clock 400", report)
+	}
+	if got := storedCheckout(t, catalog, "wt").HeadTree; got != "tree-reborn" {
+		t.Fatalf("head_tree = %q after the restart, want tree-reborn held", got)
+	}
+}
+
+// TestCatalogObservationFenceFollowsAClockItDidNotAllocate pins the durable
+// half of the floor.
+//
+// Writers with no sample of their own move this row's clock too: a mode
+// transition (UpdateCheckoutState) and the committed-base publisher
+// (advanceDedicatedBaseOwnerHeadTx, which pushes last_seen to the adopted
+// generation's created_at precisely so that "a reconciliation pass sampled
+// before this base was observed can no longer overwrite the head this adoption
+// just published"). Neither takes an observation position, so the fence has to
+// read the row's own clock and raise the floor to it — otherwise a pass that
+// predates the adoption walks straight past a fence that is only watching its
+// own sequence.
+func TestCatalogObservationFenceFollowsAClockItDidNotAllocate(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	observation := func(clock int64, tree string) UpdateCheckoutObservationRequest {
+		return UpdateCheckoutObservationRequest{
+			CheckoutID: "wt", Incarnation: "inc-1", State: CheckoutStateReady,
+			RootPath: "/tmp/wt", GitDir: "/tmp/wt/.git",
+			HeadRef: "refs/heads/main", HeadCommit: "commit-" + tree, HeadTree: tree,
+			LastAccessible: clock, LastSeen: clock,
+		}
+	}
+	if err := catalog.UpdateCheckoutObservation(ctx, observation(200, "tree-observed")); err != nil {
+		t.Fatalf("the first observation was refused: %v", err)
+	}
+
+	// A writer with no position of its own pushes the row's clock past every
+	// observation this process has admitted.
+	if err := catalog.UpdateCheckoutState(ctx, UpdateCheckoutStateRequest{
+		CheckoutID: "wt", Incarnation: "inc-1", State: CheckoutStateReconciling,
+		DesiredMode: CheckoutModeAutomatic, EffectiveMode: CheckoutModeAutomatic,
+		LastSeen: 900,
+	}); err != nil {
+		t.Fatalf("UpdateCheckoutState: %v", err)
+	}
+
+	report, err := catalog.UpdateCheckoutObservationWithReport(ctx, observation(500, "tree-predates"))
+	if !errors.Is(err, ErrCatalogObservationFenced) {
+		t.Fatalf("a pass behind the row's clock = %v, want ErrCatalogObservationFenced", err)
+	}
+	if !report.Fenced() || report.FencingObservation != 900 {
+		t.Fatalf("report = %+v, want it fenced against the row's own clock 900", report)
+	}
+	if got := storedCheckout(t, catalog, "wt").HeadTree; got != "tree-observed" {
+		t.Fatalf("head_tree = %q; a pass that predates the clock push overwrote it", got)
+	}
+
+	// A pass sampled after it lands, and the row is not stuck behind a clock
+	// nobody will reach again.
+	if err := catalog.UpdateCheckoutObservation(ctx, observation(901, "tree-after")); err != nil {
+		t.Fatalf("the pass after the clock push = %v", err)
+	}
+	if got := storedCheckout(t, catalog, "wt").HeadTree; got != "tree-after" {
+		t.Fatalf("head_tree = %q, want tree-after", got)
+	}
+}
+
+// TestCatalogObservationStillRefusesAReKeyedRow keeps the guard the fence is
+// not: an observation aimed at an incarnation the row no longer carries changes
+// nothing and says so, the outcome every caller reads as "another actor owns
+// this working copy now".
+func TestCatalogObservationStillRefusesAReKeyedRow(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+	seedFamilyAndCheckout(t, catalog, "fam", "wt", "inc-1")
+
+	_, err := catalog.UpdateCheckoutObservationWithReport(ctx, UpdateCheckoutObservationRequest{
+		CheckoutID: "wt", Incarnation: "inc-2", State: CheckoutStateUnavailable,
+		RootPath: "/tmp/wt", GitDir: "/tmp/wt/.git",
+		HeadRef: "refs/heads/main", HeadCommit: "commit-x", HeadTree: "tree-x",
+		LastAccessible: 900, LastSeen: 900,
+	})
+	if !errors.Is(err, ErrCatalogStaleGuard) {
+		t.Fatalf("an observation on a re-keyed row = %v, want ErrCatalogStaleGuard", err)
+	}
+	row := storedCheckout(t, catalog, "wt")
+	if row.State != CheckoutStateReady || row.HeadTree != "7ee7" {
+		t.Fatalf("a refused observation wrote the row: state %q head_tree %q", row.State, row.HeadTree)
+	}
+}
+
+// TestReusableViewGenerationLookupRidesTheIndexOrdering pins the query plan,
+// not just the answer.
+//
+// The reuse lookup runs on a cache miss, on the coordinator's cycle path, in an
+// item whose entire purpose is to do less work — so a plan that materialises
+// and sorts every servable generation of the graph before LIMIT applies would
+// give back some of what the reuse saves, growing with the store's age.
+// view_generations_by_graph_state is (graph_id, state, generation_id DESC), and
+// a single-state predicate is what lets it supply the ORDER BY as well as the
+// seek. Folding the two servable states into `state IN (?, ?)` spans two
+// disjoint index ranges and costs a temp b-tree, which is why
+// FindReusableViewGenerations asks once per state and merges.
+func TestReusableViewGenerationLookupRidesTheIndexOrdering(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+
+	rows, err := store.db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+reusableViewGenerationMatchSQL,
+		string(ViewGenerationReady),
+		"graph-1", "dedicated_graph", "commit",
+		"commit-wt", "wt", int64(0),
+		"base-tree", "tree-a", "",
+		"cfg", "ex", "rv", "dep", 16)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, notUsed int64
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatalf("scan the plan: %v", err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read the plan: %v", err)
+	}
+	if len(plan) == 0 {
+		t.Fatal("the planner returned no rows for the reuse lookup")
+	}
+	seek := false
+	for _, step := range plan {
+		if strings.Contains(step, "TEMP B-TREE") {
+			t.Fatalf("the reuse lookup sorts the graph's servable generations: %v", plan)
+		}
+		if strings.Contains(step, "view_generations_by_graph_state") &&
+			strings.HasPrefix(step, "SEARCH") {
+			seek = true
+		}
+	}
+	if !seek {
+		t.Fatalf("the reuse lookup does not seek view_generations_by_graph_state: %v", plan)
+	}
+}
+
+// TestFindReusableViewGenerationsMatchesTheWholeIdentity is the durable half of
+// layer reuse: a payload already in the database is addressable by the identity
+// that produced it, so a coordinator that lost its process-local cache — a
+// restart, a branch outside the cache's width — can route it instead of
+// re-indexing the same tree.
+//
+// The lookup must agree with AdoptOrCreateViewGeneration about what "the same
+// build" is: every identity column, or a reuse would hand out a payload the
+// coalescing rule would not have shared.
+func TestFindReusableViewGenerationsMatchesTheWholeIdentity(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+
+	identity := ViewGeneration{
+		OwnerKind: "dedicated_graph", GraphID: "graph-1", LayerID: "commit-wt",
+		CheckoutID: "wt", GenerationKind: "commit", BaseGenerationID: 0,
+		LowerViewFingerprint: "base-tree", TreeOID: "tree-a",
+		ConfigHash: "cfg", ExtractorVersions: "ex", ResolverVersion: "rv",
+		DependencyRevision: "dep", CreatedAt: 100,
+	}
+	create := func(t *testing.T, mutate func(*ViewGeneration)) int64 {
+		t.Helper()
+		row := identity
+		row.State = ViewGenerationBuilding
+		if mutate != nil {
+			mutate(&row)
+		}
+		id, err := catalog.CreateViewGeneration(ctx, row)
+		if err != nil {
+			t.Fatalf("CreateViewGeneration: %v", err)
+		}
+		return id
+	}
+	ready := func(t *testing.T, id int64) int64 {
+		t.Helper()
+		if err := catalog.PublishViewGeneration(ctx, id, 900); err != nil {
+			t.Fatalf("PublishViewGeneration(%d): %v", id, err)
+		}
+		return id
+	}
+	ids := func(t *testing.T, rows []ViewGeneration) []int64 {
+		t.Helper()
+		out := make([]int64, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, row.GenerationID)
+		}
+		return out
+	}
+
+	// Still building: coalescing's business, never reuse's.
+	building := create(t, nil)
+	first := ready(t, create(t, nil))
+	second := ready(t, create(t, nil))
+	if err := catalog.SetViewGenerationState(ctx, second, ViewGenerationSuperseded); err != nil {
+		t.Fatalf("supersede %d: %v", second, err)
+	}
+	// Each of these differs from the identity in exactly one column.
+	ready(t, create(t, func(row *ViewGeneration) { row.TreeOID = "tree-b" }))
+	ready(t, create(t, func(row *ViewGeneration) { row.LowerViewFingerprint = "other-base" }))
+	ready(t, create(t, func(row *ViewGeneration) { row.ConfigHash = "cfg-2" }))
+	ready(t, create(t, func(row *ViewGeneration) { row.ExtractorVersions = "ex-2" }))
+	ready(t, create(t, func(row *ViewGeneration) { row.ResolverVersion = "rv-2" }))
+	ready(t, create(t, func(row *ViewGeneration) { row.DependencyRevision = "dep-2" }))
+	ready(t, create(t, func(row *ViewGeneration) { row.CheckoutID = "wt-2" }))
+	ready(t, create(t, func(row *ViewGeneration) { row.LayerID = "commit-wt-2" }))
+	ready(t, create(t, func(row *ViewGeneration) { row.GraphID = "graph-2" }))
+	ready(t, create(t, func(row *ViewGeneration) { row.ProvenanceCommitOID = "commit-oid" }))
+	// The three the identity carries that nothing else in this file varies:
+	// a layer built for another owner, another kind of layer, and the same
+	// layer built over a different base. Each is a different build, and each
+	// has to be discriminated on its own — a row that varies two columns at
+	// once proves neither.
+	ready(t, create(t, func(row *ViewGeneration) { row.OwnerKind = "ref_view" }))
+	ready(t, create(t, func(row *ViewGeneration) { row.GenerationKind = "dirty" }))
+	ready(t, create(t, func(row *ViewGeneration) { row.BaseGenerationID = first }))
+
+	rows, err := catalog.FindReusableViewGenerations(ctx, identity, 0)
+	if err != nil {
+		t.Fatalf("FindReusableViewGenerations: %v", err)
+	}
+	// Newest first, and only the two that carry this exact identity.
+	if got := ids(t, rows); len(got) != 2 || got[0] != second || got[1] != first {
+		t.Fatalf("reusable generations = %v, want [%d %d]", got, second, first)
+	}
+	for _, row := range rows {
+		if row.GenerationID == building {
+			t.Fatal("a building generation was offered for reuse")
+		}
+		if row.TreeOID != "tree-a" || row.ConfigHash != "cfg" {
+			t.Fatalf("a row with another identity was offered: %+v", row)
+		}
+	}
+
+	// A retired candidate stops being servable.
+	if err := catalog.SetViewGenerationState(ctx, second, ViewGenerationRetiring); err != nil {
+		t.Fatalf("retire %d: %v", second, err)
+	}
+	rows, err = catalog.FindReusableViewGenerations(ctx, identity, 0)
+	if err != nil {
+		t.Fatalf("FindReusableViewGenerations after retirement: %v", err)
+	}
+	if got := ids(t, rows); len(got) != 1 || got[0] != first {
+		t.Fatalf("reusable generations = %v, want only the ready %d", got, first)
+	}
+
+	// The bound is honoured, and an unnamed layer is refused rather than
+	// matched — an unnamed build is nobody's layer to hand to a second owner.
+	ready(t, create(t, nil))
+	rows, err = catalog.FindReusableViewGenerations(ctx, identity, 1)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("bounded lookup = %d rows, err %v", len(rows), err)
+	}
+	unnamed := identity
+	unnamed.LayerID = ""
+	if _, err := catalog.FindReusableViewGenerations(ctx, unnamed, 0); !errors.Is(err, ErrCatalogInvalidValue) {
+		t.Fatalf("lookup without a layer id = %v, want ErrCatalogInvalidValue", err)
+	}
+	if _, err := catalog.FindReusableViewGenerations(ctx, identity, -1); !errors.Is(err, ErrCatalogInvalidValue) {
+		t.Fatalf("lookup with a negative bound = %v, want ErrCatalogInvalidValue", err)
+	}
+}
+
+// TestFindReusableViewGenerationsBoundsAndPrefersTheNewest pins the two
+// properties the lookup's comment claims and the identity test cannot reach:
+// the read is bounded, and what the bound keeps is the NEWEST candidates.
+//
+// Both matter for the same reason. A pathological store can hold an identity
+// built many times over; the bound is what keeps one cache miss on the
+// coordinator's cycle path from turning into an unbounded read. And of the rows
+// it keeps, the newest are the ones least likely to be retired under the caller
+// — a bound that kept the oldest would hand back exactly the candidates about
+// to go away, while doing the same amount of work.
+func TestFindReusableViewGenerationsBoundsAndPrefersTheNewest(t *testing.T) {
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	catalog := store.Catalog()
+
+	identity := ViewGeneration{
+		OwnerKind: "dedicated_graph", GraphID: "graph-1", LayerID: "commit-wt",
+		CheckoutID: "wt", GenerationKind: "commit",
+		LowerViewFingerprint: "base-tree", TreeOID: "tree-a",
+		ConfigHash: "cfg", ExtractorVersions: "ex", ResolverVersion: "rv",
+		DependencyRevision: "dep", CreatedAt: 100,
+	}
+	built := make([]int64, 0, maxReusableViewGenerationCandidates+1)
+	for range maxReusableViewGenerationCandidates + 1 {
+		row := identity
+		row.State = ViewGenerationBuilding
+		id, err := catalog.CreateViewGeneration(ctx, row)
+		if err != nil {
+			t.Fatalf("CreateViewGeneration: %v", err)
+		}
+		if err := catalog.PublishViewGeneration(ctx, id, 900); err != nil {
+			t.Fatalf("PublishViewGeneration(%d): %v", id, err)
+		}
+		built = append(built, id)
+	}
+
+	rows, err := catalog.FindReusableViewGenerations(ctx, identity, 0)
+	if err != nil {
+		t.Fatalf("FindReusableViewGenerations: %v", err)
+	}
+	if len(rows) != maxReusableViewGenerationCandidates {
+		t.Fatalf("an unbounded caller read %d rows, want the cap of %d",
+			len(rows), maxReusableViewGenerationCandidates)
+	}
+	for i, row := range rows {
+		want := built[len(built)-1-i]
+		if row.GenerationID != want {
+			t.Fatalf("candidate %d = %d, want %d: the bound must keep the newest, newest first",
+				i, row.GenerationID, want)
+		}
 	}
 }

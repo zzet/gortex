@@ -2,6 +2,38 @@ package store_sqlite
 
 import "github.com/zzet/gortex/internal/graph"
 
+const (
+	edgesByKindsDeleteQuery = `
+DELETE FROM edges
+WHERE kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+  AND view_gen = ?`
+	edgesBySparseKindsDeleteQuery = `
+DELETE FROM edges
+WHERE kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+  AND +view_gen = ?`
+)
+
+func edgesByKindsUseKindFirstDelete(kinds []graph.EdgeKind) bool {
+	if len(kinds) == 0 {
+		return false
+	}
+	for _, kind := range kinds {
+		switch kind {
+		case graph.EdgeMatches, graph.EdgeProducesTopic, graph.EdgeConsumesTopic:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func edgesByKindsDeleteStatement(kinds []graph.EdgeKind) string {
+	if edgesByKindsUseKindFirstDelete(kinds) {
+		return edgesBySparseKindsDeleteQuery
+	}
+	return edgesByKindsDeleteQuery
+}
+
 // EvictEdgesByKinds removes a derived edge generation with one SQLite DELETE.
 // Reconciliation uses this before publishing a replacement batch, replacing
 // thousands of individual transactions and analysis-generation invalidations.
@@ -32,10 +64,7 @@ func (s *Store) EvictEdgesByKinds(kinds []graph.EdgeKind) int {
 		panicOnFatal(err)
 		return 0
 	}
-	res, err := tx.Exec(`
-DELETE FROM edges
-WHERE kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-  AND view_gen = ?`, kindsJSON, s.viewGen)
+	res, err := tx.Exec(edgesByKindsDeleteStatement(kinds), kindsJSON, s.viewGen)
 	if err != nil {
 		_ = tx.Rollback()
 		panicOnFatal(err)

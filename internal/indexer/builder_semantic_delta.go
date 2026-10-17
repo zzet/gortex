@@ -3,6 +3,9 @@ package indexer
 import (
 	"context"
 	"sort"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
@@ -34,11 +37,59 @@ func (t *builderSemanticTarget) record(rel string, result *parser.ExtractionResu
 	if t == nil || result == nil {
 		return
 	}
-	adj := symbolShapeAdjacencyFromExtraction(result.Nodes, result.Edges)
+	nodes, edges := storedExtractionIdentities(result.Nodes, result.Edges)
+	adj := symbolShapeAdjacencyFromExtraction(nodes, edges)
 	t.files[rel] = builderSemanticFile{
-		shapes:   semanticShapeSet(result.Nodes, adj),
+		shapes:   semanticShapeSet(nodes, adj),
 		complete: true,
 	}
+}
+
+// storedExtractionIdentities is an extraction as a graph store holds it: one
+// node per id and one edge per logical edge identity (from, to, kind, file,
+// line), the later write replacing the earlier one, which is what both the
+// SQLite store and the in-memory graph do on a re-add. The target-side shapes
+// must be computed from that, because the layer-below shapes they are compared
+// with were: an extraction that emits two edges with one identity — the two
+// `returns string` edges of `(ref, commit string, err error)`, both on the
+// signature's line — or two nodes with one id would otherwise differ from the
+// stored shape of an unchanged declaration, and every referrer of it would be
+// re-derived as a dependent.
+func storedExtractionIdentities(nodes []*graph.Node, edges []*graph.Edge) ([]*graph.Node, []*graph.Edge) {
+	nodeAt := make(map[string]int, len(nodes))
+	outNodes := make([]*graph.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if node == nil || node.ID == "" {
+			continue
+		}
+		if i, seen := nodeAt[node.ID]; seen {
+			outNodes[i] = node
+			continue
+		}
+		nodeAt[node.ID] = len(outNodes)
+		outNodes = append(outNodes, node)
+	}
+	type edgeIdentity struct {
+		from, to string
+		kind     graph.EdgeKind
+		file     string
+		line     int
+	}
+	edgeAt := make(map[edgeIdentity]int, len(edges))
+	outEdges := make([]*graph.Edge, 0, len(edges))
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+		key := edgeIdentity{from: edge.From, to: edge.To, kind: edge.Kind, file: edge.FilePath, line: edge.Line}
+		if i, seen := edgeAt[key]; seen {
+			outEdges[i] = edge
+			continue
+		}
+		edgeAt[key] = len(outEdges)
+		outEdges = append(outEdges, edge)
+	}
+	return outNodes, outEdges
 }
 
 // symbolShapeAdjacencyFromExtraction constructs the same bounded shape input
@@ -138,15 +189,28 @@ func builderSemanticSeedNodeIDs(
 		conservative := !owned || removed || !hasEvidence || !fileEvidence.complete
 
 		changed := make(map[string]struct{})
+		importersUnmoved := false
 		if !conservative {
-			for _, key := range semanticShapeDelta(
-				semanticShapeSet(byPath[graphPath], adj), fileEvidence.shapes,
-			) {
+			before := semanticShapeSet(byPath[graphPath], adj)
+			for _, key := range semanticShapeDelta(before, fileEvidence.shapes) {
 				changed[key] = struct{}{}
 			}
+			importersUnmoved = introducesNothingImportable(rel, before, fileEvidence.shapes)
 		}
 		for _, node := range byPath[graphPath] {
 			all = append(all, node.ID)
+			if importersUnmoved && node.Kind == graph.KindFile {
+				// A file node is bound by path: an import, include or
+				// relative reference resolves to it through the file's
+				// place in the tree, never its content, and a modified
+				// file keeps its place (a deleted one is conservative).
+				// What an importer can newly bind through it is a name the
+				// change introduces; when there is none an importer can
+				// reach, the importers of the package whose anchor file
+				// this is are not moved by the edit (a removed or reshaped
+				// declaration reaches its referrers through its own node).
+				continue
+			}
 			if conservative || node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
 				reverse = append(reverse, node.ID)
 				continue
@@ -225,4 +289,35 @@ func builderLoadSymbolShapeAdjacency(
 		}
 	}
 	return adj, nil
+}
+
+// introducesNothingImportable reports whether a modified file's new shape set
+// adds no declaration another package could bind to through an import of it:
+// every key it adds is, for a Go file, an unexported name (reachable only from
+// inside its own package, whose files do not import it). For any other
+// language every added declaration counts, so only a change that adds nothing
+// qualifies. An importer that already names what the change adds — a call
+// `b.New()` parked on an external-call placeholder until b defines New — is
+// re-derived through the file node when this reports false.
+func introducesNothingImportable(rel string, before, after map[string]symbolShape) bool {
+	goFile := strings.HasSuffix(rel, ".go")
+	for key := range after {
+		if _, existed := before[key]; existed {
+			continue
+		}
+		if !goFile {
+			return false
+		}
+		name := stableSymbolKeyName(key)
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			name = name[i+1:]
+		}
+		if name == "" {
+			continue
+		}
+		if r, _ := utf8.DecodeRuneInString(name); unicode.IsUpper(r) {
+			return false
+		}
+	}
+	return true
 }

@@ -45,18 +45,22 @@ func (s *Server) handleEnrichReleases(ctx context.Context, req mcp.CallToolReque
 		root   string
 	}
 	var targets []target
-	if s.multiIndexer != nil {
-		for prefix, meta := range s.multiIndexer.AllMetadata() {
-			if pathArg != "" && pathArg != prefix && pathArg != meta.RootPath {
-				continue
-			}
-			targets = append(targets, target{prefix: prefix, root: meta.RootPath})
+	// A request that reads a checkout of its own covers NO targets: its
+	// generation is published and has no writable output, so it is refused
+	// below rather than sweeping the tracked repositories on its behalf. Every
+	// other request covers the corpus. See enrichmentTargets.
+	for prefix, root := range s.enrichmentTargets(ctx, "") {
+		if pathArg != "" && pathArg != prefix && pathArg != root {
+			continue
 		}
+		targets = append(targets, target{prefix: prefix, root: root})
 	}
 	if len(targets) == 0 {
+		if requestViewFromContext(ctx).readsOwnCheckout() {
+			return mcp.NewToolResultError(ErrEnrichmentSnapshotNotWritable.Error() + ": release enrichment"), nil
+		}
 		return mcp.NewToolResultError(fmt.Sprintf("no tracked repo matches %q", pathArg)), nil
 	}
-	_ = ctx
 
 	started := time.Now()
 	type perRepo struct {
@@ -64,9 +68,19 @@ func (s *Server) handleEnrichReleases(ctx context.Context, req mcp.CallToolReque
 		Branch  string `json:"branch,omitempty"`
 		Files   int    `json:"files"`
 		Skipped string `json:"skipped,omitempty"`
+		// Superseded: a newer release run took the authority over while this
+		// one ran. Its stamps are already on the graph, so Files above is real
+		// — this is an ordering statement, not a skip.
+		Superseded bool `json:"superseded,omitempty"`
 	}
 	var per []perRepo
 	totalFiles := 0
+	// One answer-level generation for the whole run: every target a corpus
+	// enrichment admits names generation zero, so it is set from the first
+	// admitted output rather than re-assigned per repository (which would make
+	// the field read "whatever the last repository named").
+	generation := int64(0)
+	generationNamed := false
 	for _, t := range targets {
 		b := branchArg
 		if b == "" {
@@ -75,18 +89,32 @@ func (s *Server) handleEnrichReleases(ctx context.Context, req mcp.CallToolReque
 			// that as "every tag", the right fallback when no default
 			// branch resolves.
 		}
-		count, err := releases.EnrichGraphForBranch(s.graph, t.root, t.prefix, b)
+		out, err := s.beginEnrichmentOutput(ctx, EnrichProducerReleases, t.prefix, t.root)
 		if err != nil {
+			return mcp.NewToolResultError("release enrichment: " + err.Error()), nil
+		}
+		count, err := releases.EnrichGraphForBranch(out.Store, out.Root, t.prefix, b)
+		if err != nil {
+			out.Abandon()
 			per = append(per, perRepo{Prefix: t.prefix, Branch: b, Skipped: err.Error()})
 			continue
 		}
-		per = append(per, perRepo{Prefix: t.prefix, Branch: b, Files: count})
+		superseded, serr := out.Settle()
+		if serr != nil {
+			per = append(per, perRepo{Prefix: t.prefix, Branch: b, Skipped: serr.Error()})
+			continue
+		}
+		if !generationNamed {
+			generation, generationNamed = out.Generation, true
+		}
+		per = append(per, perRepo{Prefix: t.prefix, Branch: b, Files: count, Superseded: superseded})
 		totalFiles += count
 	}
 
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
 		"repos":       per,
 		"files":       totalFiles,
+		"generation":  generation,
 		"duration_ms": time.Since(started).Milliseconds(),
 	})
 }

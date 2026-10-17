@@ -158,7 +158,9 @@ func TestWarmLookupCachePushesRepoAndCompatibleLanguageWithoutNPlusOne(t *testin
 		})
 	}
 
-	resolver.warmLookupCache(edges)
+	if err := resolver.warmLookupCache(edges); err != nil {
+		t.Fatal(err)
+	}
 	if got := resolver.cachedFindNodesByNameInRepoForEdge("PyOnly", "mono", edges[0]); len(got) != 0 {
 		t.Fatalf("Go scope examined Python same-name candidate: %+v", got)
 	}
@@ -238,7 +240,9 @@ func TestWarmLookupCacheKeepsExternLanguageFamiliesIsolated(t *testing.T) {
 	goEdge := &graph.Edge{From: "app::go::caller", To: "unresolved::extern::example.com/depgo/pkg::Shared", Kind: graph.EdgeCalls, FilePath: "app/main.go"}
 	pythonEdge := &graph.Edge{From: "app::python::caller", To: "unresolved::extern::py.acme/acme/pkg::Shared", Kind: graph.EdgeCalls, FilePath: "app/main.py"}
 	neutralEdge := &graph.Edge{From: "app::go::caller", To: "unresolved::extern::example.com/neutral/pkg::Neutral", Kind: graph.EdgeCalls, FilePath: "app/main.go"}
-	resolver.warmLookupCache([]*graph.Edge{goEdge, pythonEdge, neutralEdge})
+	if err := resolver.warmLookupCache([]*graph.Edge{goEdge, pythonEdge, neutralEdge}); err != nil {
+		t.Fatal(err)
+	}
 
 	goCandidates, err := resolver.cachedFindExternNodesByName("Shared", goEdge)
 	if err != nil {
@@ -312,7 +316,9 @@ func TestExternLookupErrorIsNotAuthoritativeNegative(t *testing.T) {
 	store := &resolverNameScopeErrorStore{Store: base, err: errors.New("injected resolver lookup failure")}
 	resolver := New(store)
 	edge := &graph.Edge{From: "app::caller", To: "unresolved::extern::example.com/dep/pkg::Shared", Kind: graph.EdgeCalls, FilePath: "app/main.go"}
-	resolver.warmLookupCache([]*graph.Edge{edge})
+	if err := resolver.warmLookupCache([]*graph.Edge{edge}); err != nil {
+		t.Fatal(err)
+	}
 	if resolver.nodesByExternLanguageName != nil {
 		t.Fatal("failed extern warm installed an authoritative cache")
 	}

@@ -1267,3 +1267,60 @@ func TestContractOwnerLegacyAdaptersPreserveUntouchedScalarFrontier(t *testing.T
 		})
 	}
 }
+
+// The observed entrypoint must retain complete owner/scalar content across
+// bounded refetch/liveness batches, and each call must report its own counts.
+func TestLoadRegistryWithStatsPreservesRecordsAndBounds(t *testing.T) {
+	for backend, factory := range ownerLoaderFactories() {
+		t.Run(backend, func(t *testing.T) {
+			base := factory(t)
+			const records = 129
+			for i := range records {
+				owner := ownerLoaderRecord("repo", "workspace", "provider", fmt.Sprintf("repo/%d.go", i), fmt.Sprintf("repo::symbol-%d", i))
+				owner.ID = fmt.Sprintf("env::OWNER_%d", i)
+				source, edge := ownerLoaderSourceAndEdge(owner, true)
+				canonical := ownerLoaderNode(owner, "contract_owner_record")
+				canonical.RepoPrefix = "other" // Owner targets require exact refetch.
+				scalar := ownerLoaderRecord("repo", "workspace", "consumer", fmt.Sprintf("repo/%d.env", i), "")
+				scalar.ID = fmt.Sprintf("env::SCALAR_%d", i)
+				base.AddBatch([]*graph.Node{source, canonical, ownerLoaderNode(scalar, "")}, []*graph.Edge{edge})
+			}
+			for _, opaque := range []bool{false, true} {
+				store := base
+				if opaque {
+					store = opaqueOwnerLoaderStore{base}
+				}
+				want := contracts.LoadRegistryFromGraphWithScope(store, "repo", "workspace", "project")
+				got, stats := contracts.LoadRegistryFromGraphWithScopeAndStats(store, "repo", "workspace", "project")
+				require.NotNil(t, want)
+				require.NotNil(t, got)
+				assert.Equal(t, ownerLoaderRecords(t, want.ByRepo("repo")), ownerLoaderRecords(t, got.ByRepo("repo")))
+				assert.Equal(t, records, stats.OwnerEdgeRows)
+				assert.Equal(t, records, stats.ScopedNodeRows)
+				assert.Equal(t, records, stats.MissingTargetIDs)
+				assert.Equal(t, 2, stats.MissingTargetBatches)
+				assert.Equal(t, records, stats.MissingTargetRows)
+				assert.Equal(t, 2*records, stats.RecoveredRecords)
+				if opaque {
+					assert.Equal(t, records, stats.LegacyCandidateIDs)
+					assert.Equal(t, 2, stats.LegacyLivenessBatches)
+				} else {
+					assert.Zero(t, stats.LegacyCandidateIDs)
+					assert.Zero(t, stats.LegacyLivenessBatches)
+				}
+				for _, ms := range []float64{stats.OwnerEdgesMS, stats.ScopedNodesMS, stats.MissingTargetsMS, stats.LegacyLivenessMS, stats.ConstructionMS} {
+					assert.GreaterOrEqual(t, ms, float64(0))
+				}
+				_, empty := contracts.LoadRegistryFromGraphWithScopeAndStats(store, "absent", "workspace", "project")
+				assert.Zero(t, empty.OwnerEdgeRows)
+				assert.Zero(t, empty.ScopedNodeRows)
+				assert.Zero(t, empty.MissingTargetBatches)
+				assert.Zero(t, empty.LegacyLivenessBatches)
+				assert.Zero(t, empty.RecoveredRecords)
+			}
+		})
+	}
+	registry, stats := contracts.LoadRegistryFromGraphWithScopeAndStats(nil, "repo", "workspace", "project")
+	assert.Nil(t, registry)
+	assert.Equal(t, contracts.RegistryLoadStats{}, stats)
+}

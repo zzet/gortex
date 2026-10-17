@@ -222,6 +222,24 @@ func (l *CheckoutLifecycle) closeCheckoutObservations() {
 }
 
 func (l *CheckoutLifecycle) prepareCheckoutObservation(ctx context.Context, path string) (*checkoutObservationProof, error) {
+	gitDir, commonDir, err := gitstate.ResolveFamilyDirs(ctx, path)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, errors.Join(ctx.Err(), err)
+		}
+		return nil, nil // Not a Git checkout; ordinary scope resolution may continue.
+	}
+	// Unknown families cannot grant an automatic checkout identity. Avoid
+	// inventorying their unrelated worktrees, and resolve again on every new
+	// observation so a newly created known-family checkout is still discovered.
+	familyID := FamilyIDFor(commonDir)
+	family, known, err := l.catalog.GetRepositoryFamily(ctx, familyID)
+	if err != nil || !known {
+		return nil, err
+	}
+	if !sameMutationRoot(family.CommonDirIdentity, commonDir) {
+		return nil, ErrCheckoutMutationStale
+	}
 	inventory := gitstate.Inventory
 	if l.observationInventory != nil {
 		inventory = l.observationInventory
@@ -233,12 +251,7 @@ func (l *CheckoutLifecycle) prepareCheckoutObservation(ctx context.Context, path
 		}
 		return nil, nil // Not a Git checkout; ordinary scope resolution may continue.
 	}
-	familyID := FamilyIDFor(inv.CommonDir)
-	family, known, err := l.catalog.GetRepositoryFamily(ctx, familyID)
-	if err != nil || !known {
-		return nil, err
-	}
-	if !sameMutationRoot(family.CommonDirIdentity, inv.CommonDir) {
+	if !sameMutationRoot(gitDir, inv.GitDir) || !sameMutationRoot(commonDir, inv.CommonDir) {
 		return nil, ErrCheckoutMutationStale
 	}
 	var selected *gitstate.WorktreeRecord
@@ -285,7 +298,7 @@ func (l *CheckoutLifecycle) prepareCheckoutObservation(ctx context.Context, path
 	// inventory's Git family before accepting them as a cached proof; otherwise
 	// a replaced .git marker could pair new physical identity with old scope.
 	// This resolves directories only, without another worktree-list inventory.
-	gitDir, commonDir, err := gitstate.ResolveFamilyDirs(ctx, path)
+	gitDir, commonDir, err = gitstate.ResolveFamilyDirs(ctx, path)
 	if err != nil {
 		return nil, err
 	}

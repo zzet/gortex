@@ -96,7 +96,7 @@ func (s *Server) handleFindDeclaration(ctx context.Context, req mcp.CallToolRequ
 	// reader implements it; buildDeclFileIndex falls back to AllNodes()
 	// when finder is nil (e.g. behind an overlay view that doesn't
 	// expose the capability), and that walk reads the overlay too.
-	finder, _ := s.readerFor(ctx).(graph.NodesInFilesByKindFinder)
+	finder, _ := contractCoreSelectedReader(s.readerFor(ctx)).(graph.NodesInFilesByKindFinder)
 	fileIdx := buildDeclFileIndex(eng, finder, matches)
 
 	groups := make(map[string]*declGroup)

@@ -15,22 +15,23 @@ func TestSweepPlanLocks(t *testing.T) {
 	s := newPlanLockFixture(t)
 
 	cases := []struct {
-		name   string
-		query  string
-		args   int
-		want   []string
-		forbid []string
+		name     string
+		query    string
+		args     int
+		planArgs []any
+		want     []string
+		forbid   []string
 	}{
 		{
 			// store.go stmtGetNodeByQual: the literal qual_name <> ''
 			// conjunct is what admits the partial nodes_by_qual index; a
 			// bound parameter alone cannot be proven non-empty and the
 			// statement scans all nodes (measured on a production store).
-			name:   "get_node_by_qual",
-			query:  `SELECT ` + lookupNodeCols + ` FROM nodes WHERE qual_name = ? AND qual_name <> '' AND view_gen = ? ORDER BY id LIMIT 1`,
-			args:   2,
-			want:   []string{"nodes_by_qual (qual_name=?)"},
-			forbid: []string{"SCAN nodes"},
+			name:     "get_node_by_qual",
+			query:    `SELECT ` + lookupNodeCols + ` FROM nodes WHERE qual_name = ? AND qual_name <> '' AND view_gen = ? ORDER BY id LIMIT 1`,
+			planArgs: []any{"pkg.Handler", baseViewGeneration},
+			want:     []string{"nodes_by_qual (qual_name=?)"},
+			forbid:   []string{"SCAN nodes"},
 		},
 		{
 			// edgeExactDeleteByIdentitySQL: the IN-over-JOIN shape drives
@@ -67,7 +68,7 @@ WHERE n.file_path = f.file_path
   AND n.view_gen = ?
 ORDER BY n.file_path, n.id`,
 			args:   6,
-			want:   []string{"SEARCH n USING INDEX nodes_by_file (file_path=?)"},
+			want:   []string{"SEARCH n USING INDEX nodes_by_file (file_path=? AND view_gen=?)"},
 			forbid: []string{"nodes_by_repo", "SCAN n"},
 		},
 		{
@@ -93,8 +94,8 @@ WHERE n.file_path = f.file_path
 ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`,
 			args: 10,
 			want: []string{
-				"SEARCH n USING INDEX nodes_by_file (file_path=?)",
-				"SEARCH e USING INDEX edges_by_from", "(from_id=?",
+				"SEARCH n USING INDEX nodes_by_file (file_path=? AND view_gen=?)",
+				"SEARCH e USING INDEX edges_by_from", "(view_gen=? AND from_id=?",
 			},
 			forbid: []string{"nodes_by_repo", "SCAN n", "SCAN e"},
 		},
@@ -121,8 +122,8 @@ WHERE n.file_path = f.file_path
 ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`,
 			args: 5,
 			want: []string{
-				"SEARCH n USING INDEX nodes_by_file (file_path=?)",
-				"SEARCH e USING INDEX edges_by_from", "(from_id=?",
+				"SEARCH n USING INDEX nodes_by_file (file_path=? AND view_gen=?)",
+				"SEARCH e USING INDEX edges_by_from", "(view_gen=? AND from_id=?",
 			},
 			forbid: []string{"nodes_by_repo", "SCAN n", "SCAN e"},
 		},
@@ -136,23 +137,29 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`,
 			name:   "out_edges_ordered",
 			query:  `SELECT ` + lookupEdgeCols + ` FROM edges WHERE from_id = ? AND view_gen = ? ORDER BY line, id`,
 			args:   2,
-			want:   []string{"SEARCH edges USING INDEX edges_by_from_line (from_id=?)"},
+			want:   []string{"SEARCH edges USING INDEX edges_by_from_line (view_gen=? AND from_id=?)"},
 			forbid: []string{"SCAN edges", "TEMP B-TREE"},
 		},
 		{
 			// store.go stmtInEdges: same contract on the reverse adjacency,
-			// riding edges_by_to's (to_id, kind) prefix plus the rowid.
+			// riding edges_by_to's (view_gen, to_id, kind) prefix plus the
+			// rowid.
 			name:   "in_edges_ordered",
 			query:  `SELECT ` + lookupEdgeCols + ` FROM edges WHERE to_id = ? AND view_gen = ? ORDER BY kind, id`,
 			args:   2,
-			want:   []string{"SEARCH edges USING INDEX edges_by_to (to_id=?)"},
+			want:   []string{"SEARCH edges USING INDEX edges_by_to (view_gen=? AND to_id=?)"},
 			forbid: []string{"SCAN edges", "TEMP B-TREE"},
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan := explainQueryPlan(t, s, tc.query, tc.args)
+			var plan []string
+			if tc.planArgs != nil {
+				plan = explainQueryPlanArgs(t, s, tc.query, tc.planArgs...)
+			} else {
+				plan = explainQueryPlan(t, s, tc.query, tc.args)
+			}
 			joined := strings.Join(plan, "\n")
 			for _, want := range tc.want {
 				if !strings.Contains(joined, want) {
@@ -174,7 +181,7 @@ ORDER BY e.from_id, e.to_id, e.kind, e.file_path, e.line`,
 // the two the ordered locks above depend on — and rebuilds them at FlushBulk.
 // A read served inside that window therefore cannot get its ORDER BY for free:
 // the out-edge lookup falls back to the edges UNIQUE key and the in-edge lookup
-// to a full table scan, and both pay a per-call TEMP B-TREE sort.
+// to the always-live generation index, and both pay a per-call TEMP B-TREE sort.
 //
 // That is the accepted trade-off, not a regression: the window is a cold load
 // with no interactive readers, and per-row index maintenance across a
@@ -203,10 +210,12 @@ func TestAdjacencyPlanLocksDuringBulkLoad(t *testing.T) {
 		},
 		{
 			// stmtInEdges: nothing left indexes to_id, so the reverse
-			// adjacency degrades all the way to a table scan plus a sort.
-			name:  "in_edges_ordered_bulk_load",
-			query: `SELECT ` + lookupEdgeCols + ` FROM edges WHERE to_id = ? AND view_gen = ? ORDER BY kind, id`,
-			want:  []string{"SCAN edges", "USE TEMP B-TREE FOR ORDER BY"},
+			// adjacency falls back to the always-live generation index plus
+			// a sort.
+			name:   "in_edges_ordered_bulk_load",
+			query:  `SELECT ` + lookupEdgeCols + ` FROM edges WHERE to_id = ? AND view_gen = ? ORDER BY kind, id`,
+			want:   []string{"SEARCH edges USING INDEX edges_by_generation (view_gen=?)", "USE TEMP B-TREE FOR ORDER BY"},
+			forbid: []string{"SCAN edges"},
 		},
 	}
 
@@ -272,6 +281,11 @@ func explainPlanTolerant(t *testing.T, s *Store, query string) []string {
 	for i := range args {
 		args[i] = ""
 	}
+	return explainPlanTolerantArgs(t, s, query, args...)
+}
+
+func explainPlanTolerantArgs(t *testing.T, s *Store, query string, args ...any) []string {
+	t.Helper()
 	rows, err := s.db.Query("EXPLAIN QUERY PLAN "+query, args...)
 	if err != nil {
 		t.Fatalf("explain %.60s: %v", query, err)
@@ -327,7 +341,7 @@ func TestSweepPlanLockReceiverRebindBatch(t *testing.T) {
 	if !strings.Contains(joined, "SCAN f") && !strings.Contains(joined, "go_receiver_rebind_files") {
 		t.Fatalf("plan must drive from the temp file table:\n%s", joined)
 	}
-	if !strings.Contains(joined, "nodes_by_file (file_path=?)") {
+	if !strings.Contains(joined, "nodes_by_file (file_path=? AND view_gen=?)") {
 		t.Fatalf("plan must probe nodes_by_file per requested file:\n%s", joined)
 	}
 }
@@ -392,7 +406,7 @@ func TestPreparedStatementPlansNeverScanBigTables(t *testing.T) {
 		// `WHERE view_gen = ?` form is the same export narrowed to the
 		// handle's payload view generation: still every row the walk can
 		// legally return, still no sorter.
-		wholeTable := false
+		wholeTable := query == baseAllEdgesSQL || query == generationAllEdgesSQL
 		for _, table := range []string{"nodes", "edges"} {
 			for _, tail := range []string{
 				"FROM " + table,
@@ -432,37 +446,37 @@ func TestPreparedStatementPlansNeverScanBigTables(t *testing.T) {
 func TestSweepWarnPlanLocks(t *testing.T) {
 	s := newPlanLockFixture(t)
 	cases := []struct {
-		name   string
-		query  string
-		args   int
-		want   []string
-		forbid []string
+		name     string
+		query    string
+		planArgs []any
+		want     []string
+		forbid   []string
 	}{
 		{
-			name:   "blame_enrichment_by_repo",
-			query:  "SELECT node_id FROM blame_enrichment WHERE view_gen = ? AND repo_prefix = ? AND repo_prefix <> \x27\x27",
-			args:   2,
-			want:   []string{"blame_by_repo (view_gen=? AND repo_prefix=?)"},
-			forbid: []string{"SCAN blame_enrichment"},
+			name:     "blame_enrichment_by_repo",
+			query:    "SELECT node_id FROM blame_enrichment WHERE view_gen = ? AND repo_prefix = ? AND repo_prefix <> ''",
+			planArgs: []any{baseViewGeneration, "repo0"},
+			want:     []string{"blame_by_repo (view_gen=? AND repo_prefix=?)"},
+			forbid:   []string{"SCAN blame_enrichment"},
 		},
 		{
-			name:   "fnvalue_bare_range",
-			query:  "SELECT id FROM edges WHERE to_id >= \x27unresolved::fnvalue::\x27 AND to_id < \x27unresolved::fnvalue:;\x27 AND view_gen = ?",
-			args:   1,
-			want:   []string{"edges_by_to (to_id>? AND to_id<?)"},
-			forbid: []string{"SCAN edges USING COVERING INDEX edges_by_unresolved"},
+			name:     "fnvalue_bare_range",
+			query:    "SELECT id FROM edges WHERE to_id >= 'unresolved::fnvalue::' AND to_id < 'unresolved::fnvalue:;' AND view_gen = ?",
+			planArgs: []any{baseViewGeneration},
+			want:     []string{"edges_by_to (view_gen=? AND to_id>? AND to_id<?)"},
+			forbid:   []string{"SCAN edges USING COVERING INDEX edges_by_unresolved"},
 		},
 		{
-			name:   "fnvalue_prefixed_partial",
-			query:  "SELECT id FROM edges WHERE to_id LIKE \x27%::unresolved::fnvalue::%\x27 AND view_gen = ?",
-			args:   1,
-			want:   []string{"edges_fnvalue_prefixed"},
-			forbid: []string{"edges_by_unresolved"},
+			name:     "fnvalue_prefixed_partial",
+			query:    "SELECT id FROM edges WHERE to_id LIKE '%::unresolved::fnvalue::%' AND view_gen = ?",
+			planArgs: []any{baseViewGeneration},
+			want:     []string{"edges_fnvalue_prefixed"},
+			forbid:   []string{"edges_by_unresolved"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan := explainPlanTolerant(t, s, tc.query)
+			plan := explainPlanTolerantArgs(t, s, tc.query, tc.planArgs...)
 			joined := strings.Join(plan, "\n")
 			for _, want := range tc.want {
 				if !strings.Contains(joined, want) {

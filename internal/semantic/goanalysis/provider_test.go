@@ -190,6 +190,8 @@ func TestGoAnalysis_RelativePath(t *testing.T) {
 		{"inside root", "/repo/pkg/a/a.go", "/repo", "pkg/a/a.go"},
 		{"at root", "/repo/main.go", "/repo", "main.go"},
 		{"outside root returns empty", "/elsewhere/foo.go", "/repo", ""},
+		{"sibling sharing root prefix returns empty", "/repo-other/main.go", "/repo", ""},
+		{"parent traversal returns empty", "/repo/../outside/main.go", "/repo", ""},
 		{"empty repo", "/repo/main.go", "", ""},
 	}
 	for _, tt := range tests {

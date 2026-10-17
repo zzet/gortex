@@ -180,7 +180,7 @@ func (s *Store) RebindGoMethodReceivers(filePath string) (changed int, err error
 	// hanging when the SQLite pool is intentionally limited to one connection.
 	analysisInvalidated := s.analysisGenerationPresent
 	if analysisInvalidated {
-		if err = invalidateAnalysisGenerationTx(tx); err != nil {
+		if err = s.invalidateAnalysisViewTx(tx); err != nil {
 			return 0, fmt.Errorf("sqlite receiver rebind invalidate analysis: %w", err)
 		}
 	}
@@ -245,9 +245,10 @@ WHERE id IN (SELECT edge_id FROM temp.go_receiver_rebind_candidates)`); err != n
 	}
 	committed = true
 	if analysisInvalidated {
-		s.analysisGenerationPresent = false
+		s.analysisGenerationPresent = s.analysisLatchRemaining
 	}
 
 	s.finishAnalysisMutationLocked(true)
+	s.noteEdgeEndpointRewriteLocked(true)
 	return int(candidates), nil
 }

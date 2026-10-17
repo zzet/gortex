@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 )
 
 const (
@@ -25,6 +26,22 @@ const (
 	shadowInputExpansion        int64 = 2
 	shadowEstimatedBytesPerFile int64 = 128 << 10
 	shadowMinimumChargeBytes    int64 = 32 << 20
+)
+
+// Wait budgets for a filtered pass's shadow admission. A pass without a
+// corpus filter (a cold or whole-repository index) waits for as long as its
+// context allows: the in-memory route is the only affordable one for it. A
+// filtered pass is an optimisation over a path that already works, so its wait
+// is bounded — and an edit's own build, which a caller is timing, is bounded
+// far tighter than background reconciliation.
+const (
+	// filteredShadowAdmissionWait bounds how long a background filtered pass
+	// (warm-up, compaction, base publication) queues before running
+	// store-direct.
+	filteredShadowAdmissionWait = 2 * time.Second
+	// interactiveShadowAdmissionWait bounds the same wait for the build an
+	// edit's publication waits on.
+	interactiveShadowAdmissionWait = 100 * time.Millisecond
 )
 
 // shadowAdmissionBudget is a context-aware FIFO process admission gate. Local
@@ -71,6 +88,56 @@ var processShadowAdmission = newShadowAdmissionBudget(
 	shadowProcessBudgetBytes(),
 	shadowMaxConcurrent(),
 )
+
+// shadowAdmissionWaitFor is how long a pass queues for a shadow slot. Zero
+// means no bound beyond ctx (a pass without a corpus filter).
+func shadowAdmissionWaitFor(ctx context.Context, filtered bool) time.Duration {
+	if !filtered {
+		return 0
+	}
+	if interactiveBuildContext(ctx) {
+		return interactiveShadowAdmissionWait
+	}
+	return filteredShadowAdmissionWait
+}
+
+type interactiveBuildKey struct{}
+
+// withInteractiveBuild marks ctx as carrying the build an edit's publication
+// waits on, for callers that serve an edit without a refresh ticket (a
+// synchronous checkout mutation's republish, say).
+func withInteractiveBuild(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, interactiveBuildKey{}, true)
+}
+
+// interactiveBuildContext reports whether ctx carries a build an edit's
+// publication is waiting on: one marked withInteractiveBuild, a coordinator
+// cycle serving refresh tickets (the cycles that take the lane at interactive
+// priority), a cycle that observed a filesystem change and times its
+// publication, or a request that brought its own publication record. A
+// background chain compaction carries a phase record too, but of its own
+// source, and does not count.
+func interactiveBuildContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	if marked, _ := ctx.Value(interactiveBuildKey{}).(bool); marked {
+		return true
+	}
+	if _, ok := ctx.Value(publicationTargetKey{}).(publicationTarget); ok {
+		return true
+	}
+	if publicationRecordFrom(ctx) != nil {
+		return true
+	}
+	if record := phaseRecordFrom(ctx); record != nil && record.source == publicationSourceObservedChange {
+		return true
+	}
+	return false
+}
 
 func newShadowAdmissionBudget(capacity int64, maxConcurrent int) *shadowAdmissionBudget {
 	if capacity < 0 {

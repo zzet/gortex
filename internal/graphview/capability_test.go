@@ -20,6 +20,8 @@ func TestKnownCapabilitiesCoverTheVocabulary(t *testing.T) {
 		{CapResolutionCrossRepo, "graph.resolution.cross_repo"},
 		{CapIncomingEdges, "graph.incoming_edges"},
 		{CapSimilarity, "graph.similarity"},
+		{CapSemantic, "graph.semantic"},
+		{CapContracts, "graph.contracts"},
 		{CapSearchSymbols, "search.symbols"},
 		{CapSearchContent, "search.content"},
 		{CapSearchVector, "search.vector"},

@@ -117,7 +117,9 @@ func (r *Resolver) classifyTerminal(e *graph.Edge) (reason string, terminal bool
 		fromLang = n.Language
 	}
 	var realSameLang, realOtherLang, stubs int
-	for _, n := range r.cachedFindNodesByName(name) {
+	// The stub-inclusive lookup: this classifies, it never binds, and
+	// "matches only a stub" is its own outcome (stub_only).
+	for _, n := range r.cachedFindNodesByNameWithStubs(name) {
 		if n == nil {
 			continue
 		}

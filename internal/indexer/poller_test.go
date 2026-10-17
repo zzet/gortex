@@ -650,7 +650,7 @@ func TestPoller_GitFinalizationWaitsForLaneAndUsesReplacementIndexer(t *testing.
 	defer release()
 	holderDone := make(chan error, 1)
 	go func() {
-		holderDone <- oldIndexer.coordinateRepositoryMutation(testCtx(), func() error {
+		holderDone <- oldIndexer.coordinateRepositoryMutation(testCtx(), OutputEntryPollerFinalizeGitHead, func() error {
 			close(laneEntered)
 			<-releaseLane
 			return nil

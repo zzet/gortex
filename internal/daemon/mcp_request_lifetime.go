@@ -252,9 +252,12 @@ func dispatchMCPWithContext(ctx context.Context, dispatch func() ([]byte, error)
 	result := make(chan mcpDispatchResult, 1)
 	started := make(chan struct{})
 	go func() {
-		defer func() { <-slots }()
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { <-slots }) }
+		defer release() // Retain the slot until an uncooperative handler returns, including panic unwinding.
 		close(started)
 		reply, err := dispatch()
+		release() // A terminal response must not overtake its dispatch capacity release.
 		result <- mcpDispatchResult{reply: reply, err: err}
 	}()
 	<-started
@@ -305,6 +308,10 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 	}
 	var requests sync.WaitGroup
 	var initializeDone <-chan struct{}
+	var initializedDone <-chan struct{}
+	// At most one request per connection waits for the initialized notification.
+	// Keep the reader free for cancellation without an unbounded pending queue.
+	initializedWaiter := make(chan struct{}, 1)
 	defer func() {
 		connectionCancel()
 		registry.cancelAll()
@@ -321,10 +328,12 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 		return true
 	}
 
-	launchNotification := func(line []byte, waitFor <-chan struct{}) {
+	launchNotification := func(line []byte, waitFor <-chan struct{}) <-chan struct{} {
+		done := make(chan struct{})
 		requests.Add(1)
 		go func() {
 			defer requests.Done()
+			defer close(done)
 			if waitFor != nil {
 				select {
 				case <-waitFor:
@@ -338,6 +347,7 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 			notificationCtx := withMCPDispatchWait(connectionCtx)
 			_, _ = dispatch(notificationCtx, line)
 		}()
+		return done
 	}
 
 	launchRequest := func(line []byte, envelope mcpRequestEnvelope, responseID json.RawMessage, tracked bool) {
@@ -364,6 +374,20 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 			initialized = make(chan struct{})
 			initializeDone = initialized
 		}
+		var waitForInitialized <-chan struct{}
+		var admissionErr error
+		if initializedDone != nil {
+			select {
+			case <-initializedDone:
+			default:
+				select {
+				case initializedWaiter <- struct{}{}:
+					waitForInitialized = initializedDone
+				default:
+					admissionErr = errMCPDispatchSaturated
+				}
+			}
+		}
 		requestLine := append([]byte(nil), line...)
 		requestID := append(json.RawMessage(nil), responseID...)
 		admission := newMCPDispatchAdmission()
@@ -388,7 +412,29 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 			}
 			defer finish()
 
-			reply, dispatchErr := dispatch(dispatchCtx, requestLine)
+			if waitForInitialized != nil {
+				// The request is registered but has not entered the dispatcher.
+				// Let the reader process cancellation while this bounded waiter
+				// preserves notification-before-tool protocol order.
+				signalMCPDispatchAdmission(dispatchCtx)
+				select {
+				case <-waitForInitialized:
+				case <-requestCtx.Done():
+				}
+				<-initializedWaiter
+			}
+			var reply []byte
+			dispatchErr := admissionErr
+			dispatchInvoked := false
+			if requestErr := requestCtx.Err(); requestErr != nil {
+				dispatchErr = requestErr
+				signalMCPDispatchAdmission(dispatchCtx)
+			} else if dispatchErr != nil {
+				signalMCPDispatchAdmission(dispatchCtx)
+			} else {
+				dispatchInvoked = true
+				reply, dispatchErr = dispatch(dispatchCtx, requestLine)
+			}
 			if requestErr := requestCtx.Err(); requestErr != nil {
 				code := mcpRequestCancelledCode
 				message := "request cancelled"
@@ -402,7 +448,7 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 					}
 				}
 				if envelope.Method == "tools/call" {
-					data["delivery_unknown"] = true
+					data["delivery_unknown"] = dispatchInvoked
 					data["retryable"] = false
 				}
 				reply = mcpErrorResponse(requestID, code, message, data)
@@ -479,7 +525,10 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 			if envelope.Method == "notifications/initialized" {
 				waitFor = initializeDone
 			}
-			launchNotification(append([]byte(nil), line...), waitFor)
+			done := launchNotification(append([]byte(nil), line...), waitFor)
+			if envelope.Method == "notifications/initialized" {
+				initializedDone = done
+			}
 			continue
 		}
 		if _, valid := canonicalMCPRequestID(envelope.ID); !valid {
