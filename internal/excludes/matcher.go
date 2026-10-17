@@ -18,6 +18,9 @@ type Matcher struct {
 	// patterns with uncertain syntax retain their original compiled matcher.
 	requiredLiterals []string
 	unfiltered       *ignore.GitIgnore
+	// Positive patterns proven to cover a matched directory and all its children.
+	// Blank entries preserve line numbers in patterns.
+	subtreeExcludes *ignore.GitIgnore
 }
 
 // New compiles the given patterns into a Matcher. A nil/empty list is
@@ -52,10 +55,14 @@ func New(patterns []string) *Matcher {
 		patterns: cleaned,
 	}
 	var unfiltered []string
+	subtreePatterns := make([]string, len(compiled))
 	seen := make(map[string]bool)
 	for i, p := range cleaned {
 		if strings.HasPrefix(p, "!") {
 			continue
+		}
+		if coversSubtree(p) {
+			subtreePatterns[i] = compiled[i]
 		}
 		literal := requiredLiteral(p)
 		if literal == "" {
@@ -65,10 +72,29 @@ func New(patterns []string) *Matcher {
 			m.requiredLiterals = append(m.requiredLiterals, literal)
 		}
 	}
+	m.subtreeExcludes = ignore.CompileIgnoreLines(subtreePatterns...)
 	if len(m.requiredLiterals) > 0 && len(unfiltered) > 0 {
 		m.unfiltered = ignore.CompileIgnoreLines(unfiltered...)
 	}
 	return m
+}
+
+// coversSubtree identifies positive patterns whose directory matches extend
+// to every child. Directory patterns retain the compiler's trailing /.*;
+// ordinary globs retain its /.* suffix or a final star that consumes children.
+// A terminal **/ loses its slash during compilation; /** can match only the
+// directory slash (unless preceded by a literal path). Backslash escapes and
+// non-directory classes can also match that slash alone. Keep those uncertain
+// shapes conservative rather than treating every directory match as coverage.
+func coversSubtree(pattern string) bool {
+	if strings.Contains(pattern, `\`) || strings.Contains(pattern, "//") || strings.HasSuffix(pattern, "**/") {
+		return false
+	}
+	if strings.HasSuffix(pattern, "/**") {
+		prefix := strings.TrimSuffix(pattern, "/**")
+		return prefix != "" && !strings.ContainsAny(prefix, "*?[")
+	}
+	return strings.HasSuffix(pattern, "/") || !strings.Contains(pattern, "[")
 }
 
 // requiredLiteral returns a substring every match of a simple glob must
@@ -202,7 +228,8 @@ func (m *Matcher) ExplainAbsDir(absPath, root string, isDir bool) (bool, string)
 }
 
 // HasNegatedDescendant reports whether any re-include ("!") pattern in
-// the matcher could match a path strictly beneath relDir.
+// the matcher could re-include a path strictly beneath relDir. Negations
+// overridden by a later exclusion covering the whole subtree do not count.
 //
 // The index walk prunes an excluded directory with filepath.SkipDir so
 // it never descends a subtree it would only throw away. But go-gitignore
@@ -228,20 +255,37 @@ func (m *Matcher) HasNegatedDescendant(relDir string) bool {
 	if relDir == "." {
 		relDir = ""
 	}
-	for _, p := range m.patterns {
+	patterns := m.patterns
+	if relDir != "" && m.subtreeExcludes != nil {
+		// Only negations after the last covering exclude can resurrect a
+		// descendant. Other positive patterns cannot prove subtree coverage.
+		if matched, p := m.subtreeExcludes.MatchesPathHow(relDir + "/"); matched {
+			patterns = patterns[p.LineNo:]
+		}
+	}
+	for _, p := range patterns {
 		if !strings.HasPrefix(p, "!") {
 			continue
 		}
 		np := strings.TrimSpace(p[1:])
+		rooted := strings.HasPrefix(np, "/")
 		np = strings.TrimPrefix(np, "/")
 		np = strings.TrimSuffix(np, "/")
 		if np == "" {
 			continue
 		}
-		// A negation with no internal slash is unanchored: gitignore
-		// matches it at any depth, so it can re-include something under
-		// any directory. Keep descending.
 		if !strings.Contains(np, "/") {
+			// A leading slash anchors the negation at the root, so it can
+			// only re-include a root entry and what lies under it.
+			if rooted && !strings.ContainsAny(np, "*?[") {
+				if relDir == "" || relDir == np || strings.HasPrefix(relDir, np+"/") {
+					return true
+				}
+				continue
+			}
+			// A negation with no internal slash is unanchored: gitignore
+			// matches it at any depth, so it can re-include something under
+			// any directory. Keep descending.
 			return true
 		}
 		anchor := literalAnchor(np)

@@ -113,6 +113,30 @@ func TestMatcher_HasNegatedDescendant(t *testing.T) {
 			want:     false,
 		},
 		{
+			name:     "root-anchored file negation prunes other dirs",
+			patterns: []string{"/*", "!/AGENTS.md", ".worktrees/"},
+			relDir:   ".worktrees",
+			want:     false,
+		},
+		{
+			name:     "root-anchored file negation keeps the root",
+			patterns: []string{"/*", "!/AGENTS.md"},
+			relDir:   "",
+			want:     true,
+		},
+		{
+			name:     "root-anchored dir negation keeps its subtree",
+			patterns: []string{"/*", "!/agent/"},
+			relDir:   "agent/skills",
+			want:     true,
+		},
+		{
+			name:     "root-anchored wildcard negation stays conservative",
+			patterns: []string{"/*", "!/*.md"},
+			relDir:   ".worktrees",
+			want:     true,
+		},
+		{
 			name:     "trailing-slash relDir is tolerated",
 			patterns: []string{"a/*", "!a/b/c/"},
 			relDir:   "a/b/",
