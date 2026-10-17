@@ -118,13 +118,13 @@ func waitModeTransition(ctx context.Context, run *modeTransitionRun) (modeTransi
 // resumeModeTransitions schedules every transition this build knows how to
 // execute. Unknown causes are deliberately left standing: they may belong to a
 // newer binary, and guessing at a destructive mode change is never recovery.
-func (l *CheckoutLifecycle) resumeModeTransitions(ctx context.Context) error {
+func (l *CheckoutLifecycle) resumeModeTransitions(ctx context.Context) (int, error) {
 	if l == nil || l.catalog == nil {
-		return nil
+		return 0, nil
 	}
 	transitions, err := l.catalog.ListIntentTransitions(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	standing := make(map[string]struct{}, len(transitions))
 	for _, transition := range transitions {
@@ -147,13 +147,15 @@ func (l *CheckoutLifecycle) resumeModeTransitions(ctx context.Context) error {
 	}
 	l.transitionMu.Unlock()
 
+	resumed := 0
 	for _, transition := range transitions {
 		switch transition.Cause {
 		case promotionTransitionCause, demotionTransitionCause:
 			l.scheduleModeTransition(transition)
+			resumed++
 		}
 	}
-	return nil
+	return resumed, nil
 }
 
 // executeDemotionTransition reconstructs the authorization entirely from its

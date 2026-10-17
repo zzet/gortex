@@ -529,7 +529,7 @@ func (s *Server) resolveRepoPrefixOrReconcile(ctx context.Context, pathOrPrefix 
 			config.ResolvePrefix(entry) != pathOrPrefix {
 			continue
 		}
-		if _, err := s.multiIndexer.TrackRepoCtx(ctx, entry); err != nil {
+		if _, err := s.multiIndexer.TrackRepoCtx(indexer.WithIndexOrigin(ctx, "mcp_auto_track"), entry); err != nil {
 			s.logger.Warn("auto-track from config failed",
 				zap.String("path", entry.Path), zap.Error(err))
 			return ""

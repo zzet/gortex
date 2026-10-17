@@ -146,3 +146,30 @@ func TestWarmupDaemonState_TimingsAggregation(t *testing.T) {
 	assert.Equal(t, 0, timings.enrichScheduled, "no semantic providers configured")
 	assert.GreaterOrEqual(t, timings.parse.Nanoseconds(), int64(0))
 }
+
+func TestWarmupDaemonStateLogsFullIndexOrigin(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "warmup-origin")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644))
+	cm, err := config.NewConfigManager(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	require.NoError(t, cm.Global().AddRepo(config.RepoEntry{Path: repo, Name: "warmup-origin"}))
+	core, logs := observer.New(zap.InfoLevel)
+	logger := zap.New(core)
+	g := graph.New()
+	reg := parser.NewRegistry()
+	reg.Register(languages.NewGoExtractor())
+	idx := indexer.New(g, reg, config.Default().Index, logger)
+	mi := indexer.NewMultiIndexer(g, reg, idx.Search(), cm, logger)
+	state := &daemonState{graph: g, indexer: idx, multiIndexer: mi, configManager: cm}
+
+	_, _ = warmupDaemonState(state, logger, func() {})
+	entries := logs.FilterMessage("indexer: full index started").All()
+	require.Len(t, entries, 1)
+	fields := entries[0].ContextMap()
+	assert.Equal(t, "warmup-origin", fields["repo"])
+	assert.Equal(t, "daemon_warmup", fields["origin"])
+	assert.Equal(t, true, fields["first_index"])
+	assert.Equal(t, false, fields["shadow"])
+}

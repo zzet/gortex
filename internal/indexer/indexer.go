@@ -2806,6 +2806,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	if err != nil {
 		return nil, err
 	}
+	// Logged after both admissions so a request cancelled while it waits
+	// is not reported as a started index.
+	idx.logger.Info("indexer: full index started",
+		zap.String("repo", idx.RepoPrefix()),
+		zap.Bool("first_index", firstIndex),
+		zap.Bool("shadow", shadowTaken),
+		zap.String("origin", indexOrigin(ctx)))
 	var releaseIndexMemoryAdmission func(reason string)
 	if memoryLease != nil {
 		memoryAdmittedAt := time.Now()

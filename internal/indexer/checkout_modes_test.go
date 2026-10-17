@@ -15,6 +15,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
@@ -581,7 +583,8 @@ func TestPromotionWorkerCoalescesOneDurableTransition(t *testing.T) {
 	require.NoError(t, outcome.err)
 	assert.Equal(t, first.TransitionID, outcome.promotion.TransitionID)
 
-	require.NoError(t, f.lc.resumeModeTransitions(context.Background()))
+	_, err = f.lc.resumeModeTransitions(context.Background())
+	require.NoError(t, err)
 	f.lc.transitionMu.Lock()
 	_, retained := f.lc.transitionRuns[first.TransitionID]
 	f.lc.transitionMu.Unlock()
@@ -601,7 +604,12 @@ func TestSeedResumesDurablePromotion(t *testing.T) {
 		})
 	require.NoError(t, err)
 	f.restart()
+	core, logs := observer.New(zap.InfoLevel)
+	f.lc.logger = zap.New(core)
 	require.NoError(t, f.lc.Seed(ctx))
+	stages := logs.FilterMessage("checkout lifecycle seed stage completed").FilterField(zap.String("stage", "resume_mode_transitions")).All()
+	require.Len(t, stages, 1)
+	assert.Equal(t, int64(1), stages[0].ContextMap()["resumed_transitions"])
 
 	outcome := awaitModeTransition(t, f.lc, transition.TransitionID)
 	require.NoError(t, outcome.err)

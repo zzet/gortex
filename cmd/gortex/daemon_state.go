@@ -433,7 +433,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	}
 
 	finishPrelude := startWarmupStep(logger, "prelude")
-	ctx := progress.WithReporter(context.Background(), progress.Nop{})
+	ctx := progress.WithReporter(indexer.WithIndexOrigin(context.Background(), "daemon_warmup"), progress.Nop{})
 	// BeginParallelBatch / EndBatch tells every per-repo Indexer
 	// constructed inside the loop to skip both the graph-wide
 	// derivation passes (InferImplements / InferOverrides /
