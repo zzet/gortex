@@ -28,7 +28,7 @@ func (m *MemoryStore) existingNode(id string) *Node {
 	if id == "" {
 		return nil
 	}
-	return m.Graph.GetNode(id)
+	return m.GetNode(id)
 }
 
 // existingEdge returns the currently stored edge with e's logical identity,
@@ -39,7 +39,7 @@ func (m *MemoryStore) existingEdge(e *Edge) *Edge {
 	if e == nil || e.From == "" || e.To == "" {
 		return nil
 	}
-	sFrom := m.Graph.shardFor(e.From)
+	sFrom := m.shardFor(e.From)
 	if positions := sFrom.outEdgeIdx[e.From]; positions != nil {
 		h := hashEdgeKey(keyOf(e))
 		if pos, ok := positions[h]; ok && pos < len(sFrom.outEdges[e.From]) {
@@ -77,4 +77,3 @@ func edgeInert(old, e *Edge) bool {
 	}
 	return reflect.DeepEqual(old, e)
 }
-

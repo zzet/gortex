@@ -133,7 +133,7 @@ func (m *MemoryStore) ReplaceSymbolFTS(repoPrefix string, produce func(emit func
 // ensureFTSEngineNodes mirrors the documents' node rows into the engine
 // before an incremental FTS upsert: upsertSymbolFTSChunkTx derives the owning
 // repo prefix by joining the engine's OWN nodes table (LEFT JOIN nodes ... →
-// COALESCE(repo_prefix, '')), and a missing row would file the document under
+// COALESCE(repo_prefix, ”)), and a missing row would file the document under
 // the unowned empty prefix, which every repo-scope filter lets through.
 // Copies are upsert-by-ID, in RAM only, and bounded by the FTS-admitted node
 // set — never the whole graph.
@@ -157,7 +157,7 @@ func (m *MemoryStore) ensureFTSEngineNodes(items []SymbolFTSItem) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	nodes := m.Graph.GetNodesByIDs(ids)
+	nodes := m.GetNodesByIDs(ids)
 	stubs := make([]*Node, 0, len(ids))
 	for _, id := range ids {
 		if n := nodes[id]; n != nil {
@@ -261,9 +261,9 @@ func (m *MemoryStore) searchSymbolBundlesScoped(query string, repoAllow []string
 		return nil, nil
 	}
 
-	nodes := m.Graph.GetNodesByIDs(ids)
-	out := m.Graph.GetOutEdgesByNodeIDs(ids)
-	in := m.Graph.GetInEdgesByNodeIDs(ids)
+	nodes := m.GetNodesByIDs(ids)
+	out := m.GetOutEdgesByNodeIDs(ids)
+	in := m.GetInEdgesByNodeIDs(ids)
 
 	bundles := make([]SymbolBundle, 0, len(ids))
 	for _, id := range ids {

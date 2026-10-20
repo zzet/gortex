@@ -120,25 +120,3 @@ func (m *MemoryStore) DeleteFileMtimes(repoPrefix string, paths []string) error 
 	return nil
 }
 
-// snapshotFileMtimes returns an owned copy of the whole sidecar for the
-// snapshot dump. Serverstack-internal helper surface; not part of the Store
-// capability family.
-func (m *MemoryStore) snapshotFileMtimes() map[string]map[string]int64 {
-	m.mtimeMu.Lock()
-	defer m.mtimeMu.Unlock()
-	if len(m.mtimes) == 0 {
-		return nil
-	}
-	out := make(map[string]map[string]int64, len(m.mtimes))
-	for prefix, rows := range m.mtimes {
-		if len(rows) == 0 {
-			continue
-		}
-		copyRows := make(map[string]int64, len(rows))
-		for path, mtime := range rows {
-			copyRows[path] = mtime
-		}
-		out[prefix] = copyRows
-	}
-	return out
-}

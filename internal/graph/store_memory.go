@@ -465,7 +465,7 @@ func (m *MemoryStore) RemoveEdge(from, to string, kind EdgeKind) bool {
 			// Mirror Graph.RemoveEdge's own match (To == to && Kind == kind,
 			// first encounter in the out-bucket): nothing matching means the
 			// removal cannot change state.
-			for _, e := range m.Graph.GetOutEdges(from) {
+			for _, e := range m.GetOutEdges(from) {
 				if e != nil && e.To == to && e.Kind == kind {
 					return false
 				}
