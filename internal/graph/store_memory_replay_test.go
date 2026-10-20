@@ -15,6 +15,7 @@ func seedJournal(t *testing.T, path string) *MemoryStore {
 	if err := m.OpenJournal(path); err != nil {
 		t.Fatalf("OpenJournal: %v", err)
 	}
+	t.Cleanup(func() { _ = m.CloseJournal() }) // release the handle: Windows TempDir cleanup cannot unlink a pinned file
 	m.AddNode(&Node{ID: "repoA/a.go::f", Kind: KindFunction, Name: "f", FilePath: "a.go"})
 	if err := m.CloseJournal(); err != nil {
 		t.Fatalf("CloseJournal: %v", err)

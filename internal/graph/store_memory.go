@@ -260,19 +260,40 @@ func (m *MemoryStore) ResetJournal() error {
 	if err := m.journalW.Flush(); err != nil {
 		return fmt.Errorf("memory journal: flush before reset: %w", err)
 	}
-	if err := m.journalFile.Truncate(0); err != nil {
-		return fmt.Errorf("memory journal: truncate: %w", err)
+	// Reopen with O_TRUNC instead of truncating the live handle. An
+	// O_APPEND handle on Windows opens the file with FILE_APPEND_DATA
+	// (without FILE_WRITE_DATA), so SetEndOfFile on it fails with access
+	// denied — the truncate worked only on POSIX. Closing releases the
+	// handle (Windows also refuses to resize or unlink a pinned file) and
+	// O_TRUNC performs the resize at open time, portably.
+	path := m.journalPath
+	if err := m.journalFile.Close(); err != nil {
+		return fmt.Errorf("memory journal: close before reset: %w", err)
 	}
-	if _, err := m.journalFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("memory journal: seek: %w", err)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		// The journal degrades closed (derived-cache semantics: the store
+		// keeps serving in-memory; the next snapshot re-anchors it).
+		m.journalFile = nil
+		m.journalW = nil
+		m.journalEnc = nil
+		m.journalErr = fmt.Errorf("memory journal: reopen after reset: %w", err)
+		return m.journalErr
 	}
-	m.journalW.Reset(m.journalFile)
-	m.journalCW.n = 0
+	m.journalFile = f
+	m.journalCW = &countWriter{w: f}
+	m.journalW = bufio.NewWriterSize(m.journalCW, 256*1024)
+	m.journalEnc = json.NewEncoder(m.journalW)
 	m.journalErr = nil
 	// The reset starts a new journal generation (issue davalillo/gortex#23):
 	// the snapshot just published subsumed everything before it.
 	m.epoch++
 	m.writeJournalHeaderLocked()
+	// The header is bookkeeping, not mutation payload: zero the counter
+	// after it lands so JournalBytes keeps meaning "mutation bytes since
+	// the last reset" (the rotation-trigger input; the old truncate path
+	// excluded the header the same way).
+	m.journalCW.n = 0
 	return nil
 }
 

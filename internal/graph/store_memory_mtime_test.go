@@ -103,6 +103,7 @@ func TestMemoryStoreFileMtimesNotJournaled(t *testing.T) {
 	if err := m.OpenJournal(dir + "/journal.jsonl"); err != nil {
 		t.Fatalf("OpenJournal: %v", err)
 	}
+	t.Cleanup(func() { _ = m.CloseJournal() }) // release the handle: Windows TempDir cleanup cannot unlink a pinned file
 	before := m.JournalBytes()
 	if err := m.BulkSetFileMtimes("repoA", map[string]int64{"a.go": 100}); err != nil {
 		t.Fatalf("BulkSetFileMtimes: %v", err)

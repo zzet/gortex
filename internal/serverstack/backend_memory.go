@@ -171,6 +171,7 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 
 	stopped := make(chan struct{})
 	var stopOnce sync.Once
+	var closeOnce sync.Once
 	cfg := snapshotTriggerConfig{interval: 30 * time.Second}
 	cfg.loadFromEnv(logger)
 	go func() {
@@ -198,15 +199,21 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 	}()
 
 	closeFn = func() error {
-		stopOnce.Do(func() { close(stopped) })
-		dumpMu.Lock()
-		snapshotAndRotate("close")
-		if err := mstore.CloseJournal(); err != nil && logger != nil {
-			logger.Warn("memory backend: journal close", zap.Error(err))
-		}
-		if err := engine.Close(); err != nil && logger != nil {
-			logger.Warn("memory backend: fts engine close", zap.Error(err))
-		}
+		// Idempotent close (io.Closer convention): tests register closeFn
+		// both explicitly and via t.Cleanup, and a second close must be a
+		// no-op — dumpMu is never re-released after the close-path dump, so
+		// a second entry would deadlock on it.
+		closeOnce.Do(func() {
+			stopOnce.Do(func() { close(stopped) })
+			dumpMu.Lock()
+			snapshotAndRotate("close")
+			if err := mstore.CloseJournal(); err != nil && logger != nil {
+				logger.Warn("memory backend: journal close", zap.Error(err))
+			}
+			if err := engine.Close(); err != nil && logger != nil {
+				logger.Warn("memory backend: fts engine close", zap.Error(err))
+			}
+		})
 		return nil
 	}
 	return mstore, closeFn, nil

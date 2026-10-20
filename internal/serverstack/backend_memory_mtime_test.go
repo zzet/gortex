@@ -184,6 +184,7 @@ func TestPeriodicSnapshotJournalSizeTrigger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	t.Cleanup(closeFn) // every exit path must release the journal handle: Windows cannot unlink a pinned file
 	mem := s.(*graph.MemoryStore)
 	mem.AddNode(&graph.Node{ID: "repoA/a.go::f", Kind: graph.KindFunction, Name: "f", FilePath: "a.go"})
 
