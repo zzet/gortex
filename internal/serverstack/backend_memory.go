@@ -130,36 +130,55 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 	// that is what keeps "journal ⊆ snapshot" provable for the epoch check.
 	var dumpMu sync.Mutex
 	snapshotAndRotate := func(reason string) {
-		dumpErr := mstore.SnapshotBarrier(func() error {
-			return snapshotMemoryStore(mstore, snapshotPath)
+		// Dump and reset run inside ONE barrier: mutations stay blocked from
+		// before the snapshot rename until after the journal reset. Resetting
+		// outside the barrier would let a concurrent writer append its op to
+		// the journal between the rename and the truncation — a successfully
+		// journaled mutation that neither the published snapshot nor the
+		// replayed journal would contain after a crash, silently breaking the
+		// epoch design's dump+reset atomicity (review
+		// R3-journal-reset-outside-barrier). The epoch sidecar write stays
+		// inside too: it publishes the generation the reset just started, and
+		// a crash before it leaves the sidecar one generation behind — the
+		// safe replay direction (pre-dump ops re-apply idempotently).
+		dumped := false
+		var resetErr error
+		barrierErr := mstore.SnapshotBarrier(func() error {
+			if err := snapshotMemoryStore(mstore, snapshotPath); err != nil {
+				return err
+			}
+			dumped = true
+			if err := mstore.ResetJournal(); err != nil {
+				resetErr = err
+				return err
+			}
+			if epochErr := writeJournalEpoch(epochPath, mstore.JournalEpoch()); epochErr != nil && logger != nil {
+				logger.Warn("memory backend: epoch sidecar write failed", zap.Error(epochErr))
+			}
+			return nil
 		})
-		if dumpErr != nil {
+		if barrierErr != nil && !dumped {
+			// The rename never happened: the journal is the only durable
+			// record of mutations the failed snapshot never captured — it
+			// must survive untouched (issue davalillo/gortex#25), and the
+			// next boot replays it against the previous snapshot generation
+			// as usual.
 			if logger != nil {
 				logger.Error("memory backend: snapshot dump failed",
-					zap.String("reason", reason), zap.Error(dumpErr))
+					zap.String("reason", reason), zap.Error(barrierErr))
 			}
-			// The journal is the only durable record of mutations the
-			// failed snapshot never captured — it must survive (issue
-			// davalillo/gortex#25). Skip reset AND the epoch sidecar write:
-			// the next boot then replays the journal against the previous
-			// snapshot generation as usual.
 			return
 		}
-		// Reset only after a successful dump (issue davalillo/gortex#25 A6):
-		// its failure must not masquerade as a dump failure.
-		if resetErr := mstore.ResetJournal(); resetErr != nil {
+		if resetErr != nil {
+			// The rename succeeded, so the snapshot is published even though
+			// the reset failed — the two failures stay unconflated (issue
+			// davalillo/gortex#25 A6): the journal was left un-truncated and
+			// the next boot replays it idempotently (the safe direction).
 			if logger != nil {
 				logger.Warn("memory backend: journal reset after snapshot failed",
 					zap.String("reason", reason), zap.Error(resetErr))
 			}
 			return
-		}
-		// Publish the sidecar for the generation the reset just started.
-		// A crash before this write leaves the sidecar one generation
-		// behind: the next boot's replay runs (the safe direction — pre-
-		// dump ops re-apply idempotently, post-dump ops are still needed).
-		if epochErr := writeJournalEpoch(epochPath, mstore.JournalEpoch()); epochErr != nil && logger != nil {
-			logger.Warn("memory backend: epoch sidecar write failed", zap.Error(epochErr))
 		}
 		if logger != nil {
 			logger.Info("memory backend: snapshot dumped",
@@ -220,10 +239,11 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 }
 
 // snapshotMemoryStore dumps the in-memory graph into a fresh sqlite file and
-// atomically renames it over the snapshot path. The caller owns the journal
-// reset: a successful rename means the snapshot is published even if the
-// follow-up reset fails, and the two failures must not be conflated (issue
-// davalillo/gortex#25 A6).
+// atomically renames it over the snapshot path. The caller pairs it with the
+// journal reset inside ONE SnapshotBarrier — dump and reset must be atomic
+// against concurrent writers (review R3-journal-reset-outside-barrier) — and
+// keeps the two failures unconflated: a successful rename publishes the
+// snapshot even if the follow-up reset fails (issue davalillo/gortex#25 A6).
 func snapshotMemoryStore(store *graph.MemoryStore, snapshotPath string) error {
 	tmp := snapshotPath + ".snapshot.tmp"
 	_ = os.Remove(tmp)
