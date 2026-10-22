@@ -31,7 +31,7 @@ func (s *Server) prepareRoutedViewMutation(ctx context.Context, req *mcp.CallToo
 		legacy = spec.Legacy
 	}
 	switch legacy {
-	case "edit_file", "write_file", "edit_symbol":
+	case "edit_file", "write_file", "edit_symbol", "batch_edit":
 	default:
 		return ctx, noop, nil
 	}
