@@ -463,11 +463,17 @@ func TestProbeOfTrackedPathClampsSymbolEvidenceToItsRepo(t *testing.T) {
 
 	// The same query without a path stays unscoped, which is what proves the
 	// clamp comes from the probed path's repo rather than a missing sibling.
+	// Asserted on file paths: ElementsMatch over identical names is a
+	// len()==2 in disguise and checks names only, not provenance (issue #18).
 	unscoped, err := f.controller.SearchSymbols(ctx, daemon.SearchSymbolsParams{
 		Query: "BaseOnly",
 	})
 	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{"BaseOnly", "BaseOnly"}, symbolNames(unscoped.Hits))
+	paths := make([]string, 0, len(unscoped.Hits))
+	for _, h := range unscoped.Hits {
+		paths = append(paths, h.FilePath)
+	}
+	assert.ElementsMatch(t, []string{probeFileKey, "sibling/internal/phase/tracker.go"}, paths)
 }
 
 func TestProbeOfDedicatedCheckoutInRemovalGraceIsLabeledFallback(t *testing.T) {
@@ -490,10 +496,13 @@ func TestProbeOfDedicatedCheckoutInRemovalGraceIsLabeledFallback(t *testing.T) {
 	assert.Equal(t, string(store_sqlite.CheckoutStateRemovalGrace), result.View.FallbackReason)
 }
 
-// TestProbeOfUntrackedPathIsUnchanged pins that a path no checkout owns still
-// reads the base corpus. It is the ordinary case for every directory nobody
-// has tracked, and nothing about routed views may change it.
-func TestProbeOfUntrackedPathIsUnchanged(t *testing.T) {
+// TestProbeOfUntrackedPathAnswersNoEvidence re-pins the untracked contract
+// (issue #18): a path no corpus claims is answered with NO evidence.
+// Union-graph symbols would hand the hook deny evidence from repos the
+// deny's own redirect targets cannot answer about — the untracked variant
+// of the false-deny shape #15 clamped for tracked paths. The base view
+// still names what answered; the empty hit list is the point.
+func TestProbeOfUntrackedPathAnswersNoEvidence(t *testing.T) {
 	f := newProbeFixture(t)
 	ctx := context.Background()
 
@@ -501,10 +510,10 @@ func TestProbeOfUntrackedPathIsUnchanged(t *testing.T) {
 		Query: "BaseOnly", Path: filepath.Join(t.TempDir(), "elsewhere.go"),
 	})
 	require.NoError(t, err)
-	assert.Equal(t, []string{"BaseOnly"}, symbolNames(found.Hits))
+	assert.Empty(t, found.Hits,
+		"the path is outside every tracked corpus, so no symbol is evidence for it")
 	require.NotNil(t, found.View)
 	assert.Equal(t, daemon.ProbeViewBase, found.View.Kind)
-	assert.True(t, found.View.Exact)
 }
 
 // TestSearchSymbolsWithoutAPathKeepsTheLegacyWireShape is the compatibility

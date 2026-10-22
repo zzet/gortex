@@ -637,6 +637,9 @@ type SearchSymbolsResult struct {
 const (
 	// ProbeViewBase is the indexed corpus: the answer for a dedicated
 	// checkout, for the family primary, and for any path no checkout owns.
+	// An exact base answer for a dedicated checkout reads the family
+	// primary's snapshot under the shared repo prefix — corpus ownership,
+	// not the checkout's own working-copy state (see ProbeView.Exact).
 	ProbeViewBase = "base"
 	// ProbeViewWorktree is an automatic checkout's composed view — the
 	// primary's corpus with that working copy's routed generations on top.
@@ -662,6 +665,15 @@ const (
 // Exact is the honesty bit: false says the answer came from somewhere other
 // than the path's own view, and FallbackReason says why. A consumer must
 // never present a fallback answer as if the path's own graph produced it.
+//
+// Exact=true attests corpus ownership, not working-copy freshness: the
+// answer came from the indexed corpus that owns the path's repo prefix. For
+// a dedicated checkout that corpus is the family primary's snapshot under
+// the shared prefix — the checkout's working copy may hold uncommitted or
+// not-yet-indexed edits the answer does not reflect. The #15 clamp narrows
+// the cross-repo dimension only; it does not make a base answer read the
+// checkout's own live tree. A consumer citing probe evidence for a
+// dedicated checkout cites that snapshot, not the working copy.
 type ProbeView struct {
 	Kind       string `json:"kind"`
 	CheckoutID string `json:"checkout_id,omitempty"`
