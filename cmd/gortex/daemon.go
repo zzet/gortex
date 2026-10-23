@@ -150,8 +150,14 @@ func init() {
 		"CORS response origin for /mcp and /v1 (default: disabled); browser access also requires --http-allowed-origin, even with '*'")
 	daemonStartCmd.Flags().StringSliceVar(&daemonHTTPConversationAllow, "conversation-host", nil,
 		"extra Host values (beyond loopback) the conversation-log inspector accepts without a token; repeatable")
-	daemonStartCmd.Flags().StringVar(&daemonBackend, "backend", "sqlite",
-		"storage backend: sqlite (pure-Go embedded SQL, persists to --backend-path so warm restarts skip re-indexing). It is the only backend; point --backend-path at a throwaway file for a store that does not outlive the run")
+	// The empty default is deliberate (issue #36,
+	// R3-default-flag-empty-readers): "" means "not set", and every reader
+	// must route the variable through resolveDaemonBackend, which maps ""
+	// to sqlite. Sole reader: buildDaemonState (daemon_state.go) — reading
+	// the variable anywhere else extends that single-reader contract and
+	// must re-audit the empty-default handling first.
+	daemonStartCmd.Flags().StringVar(&daemonBackend, "backend", "",
+		"storage backend: sqlite (pure-Go embedded SQL, persists to --backend-path so warm restarts skip re-indexing) or memory (Tier-3 memory-resident store, journaled + snapshotted). Empty selects sqlite; $GORTEX_STORE overrides the daemon.backend config value and a non-empty --backend flag overrides both")
 	daemonStartCmd.Flags().StringVar(&daemonBackendPath, "backend-path", "",
 		"path to the store file (its parent directory is created if absent). Defaults to ~/.gortex/store/store.sqlite")
 	daemonStartCmd.Flags().Uint64Var(&daemonBackendBufferPoolMBIgnored, "backend-buffer-pool-mb", 0,
@@ -192,6 +198,24 @@ func resolveDaemonHTTPAddr(flag, env string, gc *config.GlobalConfig) string {
 		return gc.Daemon.HTTPAddr
 	}
 	return ""
+}
+
+// resolveDaemonBackend selects the graph store backend the daemon opens:
+// flag, then $GORTEX_STORE, then the daemon.backend config value, else
+// sqlite. An empty result is fine — OpenBackend treats an empty name as
+// sqlite — but returning the explicit default here keeps every caller and
+// log line naming the same backend.
+func resolveDaemonBackend(flag, env string, gc *config.GlobalConfig) string {
+	if flag != "" {
+		return flag
+	}
+	if strings.TrimSpace(env) != "" {
+		return strings.TrimSpace(env)
+	}
+	if gc != nil && strings.TrimSpace(gc.Daemon.Backend) != "" {
+		return strings.TrimSpace(gc.Daemon.Backend)
+	}
+	return "sqlite"
 }
 
 // runDaemonStart starts the daemon in foreground (default) or detached

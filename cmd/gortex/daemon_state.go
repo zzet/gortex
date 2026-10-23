@@ -98,7 +98,7 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 	}
 	ss, err := serverstack.NewSharedServer(serverstack.SharedServerConfig{
 		Lifecycle:         serverstack.LifecycleDaemon,
-		Backend:           daemonBackend,
+		Backend:           resolveDaemonBackend(daemonBackend, os.Getenv("GORTEX_STORE"), gc),
 		BackendPath:       daemonBackendPath,
 		Config:            cfg,
 		Global:            gc,
@@ -277,6 +277,10 @@ type warmupTimings struct {
 	globalResolve     time.Duration
 	endBatch          time.Duration
 	analysis          time.Duration
+	// symbolFTSRebuild is the memory backend's boot-time symbol FTS rebuild
+	// (issue davalillo/gortex#21). Zero on the sqlite backend, where the FTS
+	// corpus is persisted store state.
+	symbolFTSRebuild time.Duration
 	// reposChanged is the number of tracked repos whose reindex actually did
 	// work this warmup (cold track, or a reconcile with stale/deleted files).
 	reposChanged int
@@ -1179,6 +1183,28 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	publishReadinessPhase(state, "end_batch_done", true, map[string]any{
 		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
 	})
+
+	// Rebuild the symbol FTS corpus when the store is the memory backend
+	// (issue davalillo/gortex#21). The engine is derived in-RAM state — never
+	// journaled, never snapshotted — so every memory-backend boot starts with
+	// an empty corpus, and the indexer's populateSymbolFTS cannot fill it:
+	// the memory store does not implement the streaming
+	// ScopedProjectionSequencer that path requires, so it silently no-ops
+	// there. The rebuild walks the same admission + tokenization through the
+	// set-oriented scope adapter instead. Runs after the indexing phases
+	// (a cold boot's graph is only complete once end_batch has drained),
+	// before the watcher starts — at the earlier parallel-parse mark the
+	// resident graph is still empty on a cold boot (fts_items=0, measured).
+	// On the sqlite backend this is skipped: FTS is persisted store state the
+	// indexer's own paths maintain.
+	if _, isMemory := state.graph.(*graph.MemoryStore); isMemory {
+		finishFTS := startWarmupStep(logger, "symbol_fts_rebuild")
+		if ftsErr := state.multiIndexer.RebuildSymbolFTS(progress.Nop{}); ftsErr != nil {
+			logger.Warn("daemon: symbol FTS rebuild failed; text search degrades until the next boot",
+				zap.Error(ftsErr))
+		}
+		timings.symbolFTSRebuild = finishFTS()
+	}
 
 	finishWatchers := startWarmupStep(logger, "watcher_start")
 	watchCfgs := make(map[string]config.WatchConfig)
