@@ -172,6 +172,9 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 		// coverage and file lookups below already filter by repoPrefix, and
 		// an unclamped probe would cite sibling-repo symbols in a multi-repo
 		// daemon — evidence a deny's own redirect targets cannot answer for.
+		// For a dedicated checkout the exact label names that shared-prefix
+		// snapshot, not the working copy's own uncommitted content — see
+		// daemon.ProbeView for the ownership-vs-freshness distinction.
 		base.answer = exactProbeView(daemon.ProbeViewBase, binding.CheckoutID, binding.RepoPrefix)
 		base.repoPrefix = binding.RepoPrefix
 		base.searchScope = binding.RepoPrefix
@@ -235,7 +238,10 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 	}
 }
 
-// exactProbeView names a graph that is the path's own.
+// exactProbeView names a graph that is the path's own. For Kind=base that
+// graph is the family primary's snapshot under the path's repo prefix — the
+// corpus the binding named — not necessarily a dedicated checkout's live
+// working-copy content (see daemon.ProbeView.Exact).
 func exactProbeView(kind, checkoutID, repoPrefix string) *daemon.ProbeView {
 	return &daemon.ProbeView{
 		Kind:       kind,

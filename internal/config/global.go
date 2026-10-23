@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/google/renameio"
 	"github.com/go-viper/mapstructure/v2"
+	"github.com/google/renameio"
 	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/llm"
@@ -119,6 +119,12 @@ type DaemonConfig struct {
 	// overrides both. Non-loopback binds require an auth token.
 	HTTPAddr string `mapstructure:"http_addr" yaml:"http_addr,omitempty"`
 
+	// Backend selects the graph store backend the daemon opens at boot
+	// ("sqlite" — the default — or "memory", the Tier-3 memory-resident
+	// backend). Empty selects sqlite. The GORTEX_STORE environment
+	// variable overrides this, and a non-empty --backend flag overrides
+	// both (flag > env > config, resolved once at startup).
+	Backend string `mapstructure:"backend" yaml:"backend,omitempty"`
 	// LogMaxSize is the daemon log rotation threshold in MB (default 50).
 	// Zero disables rotation and keeps logging to stderr. Pointers distinguish
 	// an omitted value from an explicit zero.

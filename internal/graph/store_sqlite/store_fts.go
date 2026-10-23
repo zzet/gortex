@@ -711,10 +711,16 @@ JOIN symbol_fts_rowid
 WHERE symbol_fts MATCH ?`
 	args := []any{s.viewGen, match}
 	if len(repoAllow) > 0 {
-		// The empty prefix always passes: unowned rows (synthetic
-		// externals) are admitted by every repo-narrow predicate — see
-		// QueryOptions.ScopeAllows for the invariant.
-		q += ` AND symbol_fts.repo_prefix IN ('', ?` + strings.Repeat(`,?`, len(repoAllow)-1) + `)`
+		// The empty prefix passes only while the document's node row is
+		// alive: ''-prefix docs with a live node row are the deliberate
+		// unowned globals (dep:: synthetic externals) every repo narrow
+		// admits — see QueryOptions.ScopeAllows. An FTS doc whose node row
+		// is gone (eviction leaked the doc) is an orphan: it would file
+		// under COALESCE(repo_prefix,'') and silently ride every scope, so
+		// scoped searches exclude it. Unscoped search is unchanged; the
+		// discriminator is node-row existence, not the prefix itself.
+		q += ` AND (symbol_fts.repo_prefix IN (?` + strings.Repeat(`,?`, len(repoAllow)-1) + `)
+ OR (symbol_fts.repo_prefix = '' AND EXISTS (SELECT 1 FROM nodes WHERE nodes.id = symbol_fts.node_id)))`
 		for _, r := range repoAllow {
 			args = append(args, r)
 		}

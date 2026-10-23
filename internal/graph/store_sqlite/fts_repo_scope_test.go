@@ -225,6 +225,74 @@ func TestSearchSymbolsRepoScoped_MultipleRepos(t *testing.T) {
 	}
 }
 
+// TestSearchSymbolsRepoScoped_ExcludesOrphanDocs: a scoped search must
+// drop orphan FTS docs — documents whose node row no longer exists
+// (eviction leaked the doc) — while keeping deliberate unowned globals
+// (dep:: externals, empty prefix WITH a live node row). The two are
+// indistinguishable by prefix alone; the node-row existence is the
+// discriminator. Unscoped search keeps both: orphans are excluded from
+// scopes only, cleaning them up is a maintenance concern, not a search
+// semantics change.
+func TestSearchSymbolsRepoScoped_ExcludesOrphanDocs(t *testing.T) {
+	s := floodedScopeStore(t, 3)
+
+	// Deliberate unowned global: node row EXISTS, prefix empty.
+	extID := "dep::widgets/WidgetExtensions"
+	s.AddNode(&graph.Node{ID: extID, Kind: graph.KindType, Name: "WidgetExtensions", Language: "go"})
+	if err := s.UpsertSymbolFTS(extID, "widget extensions external"); err != nil {
+		t.Fatalf("UpsertSymbolFTS(ext): %v", err)
+	}
+
+	// Orphan: FTS doc without any node row (the eviction-leak shape).
+	if err := s.UpsertSymbolFTS("orphan::ghost::Ghost", "ghost widget extensions"); err != nil {
+		t.Fatalf("UpsertSymbolFTS(orphan): %v", err)
+	}
+
+	hits, err := s.SearchSymbolsRepoScoped("widget", []string{"app"}, 20)
+	if err != nil {
+		t.Fatalf("SearchSymbolsRepoScoped: %v", err)
+	}
+	found := map[string]bool{}
+	for _, h := range hits {
+		found[h.NodeID] = true
+	}
+	if !found["app/widget.go::WidgetExtensions"] {
+		t.Fatalf("scoped search lost the in-scope symbol: %+v", hits)
+	}
+	if !found[extID] {
+		t.Fatalf("scoped search lost the deliberate unowned external: %+v", hits)
+	}
+	if found["orphan::ghost::Ghost"] {
+		t.Fatalf("scoped search leaked the orphan doc: %+v", hits)
+	}
+
+	// The bundle variant composes the same scoped hit query.
+	bundles, err := s.SearchSymbolBundlesRepoScoped("widget", []string{"app"}, 20)
+	if err != nil {
+		t.Fatalf("SearchSymbolBundlesRepoScoped: %v", err)
+	}
+	for _, b := range bundles {
+		if b.Node != nil && b.Node.ID == "orphan::ghost::Ghost" {
+			t.Fatalf("scoped bundles leaked the orphan doc: %+v", bundles)
+		}
+	}
+
+	// Unscoped search is unchanged: the orphan stays visible.
+	unscoped, err := s.SearchSymbols("widget", 50)
+	if err != nil {
+		t.Fatalf("SearchSymbols: %v", err)
+	}
+	unscopedFound := false
+	for _, h := range unscoped {
+		if h.NodeID == "orphan::ghost::Ghost" {
+			unscopedFound = true
+		}
+	}
+	if !unscopedFound {
+		t.Fatalf("unscoped search must keep the orphan (scope-only exclusion); hits=%+v", unscoped)
+	}
+}
+
 // TestSearchSymbolBundlesRepoScoped_FiltersInQuery: the bundle variant
 // inherits the scoped hit query and returns only in-scope bundles.
 func TestSearchSymbolBundlesRepoScoped_FiltersInQuery(t *testing.T) {

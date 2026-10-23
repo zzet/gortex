@@ -61,6 +61,14 @@ type storeCore struct {
 	// the writer-pool deadline deterministically.
 	passiveCheckpointTimeout time.Duration
 
+	// passiveWindow is the adaptive execution window for the periodic
+	// PASSIVE checkpoint (issue #843): a checkpoint that times out mid-PRAGMA
+	// doubles its next window toward the retry cap instead of re-running the
+	// same one-second lottery. Mutated only by the checkpoint loop goroutine;
+	// the zero value is safe for direct storeCore construction in tests
+	// (window() resolves defensively to the base).
+	passiveWindow passiveCheckpointWindowPolicy
+
 	// dbPath is the on-disk SQLite file path, retained for size
 	// telemetry — the WAL high-water mark surfaces in daemon_health so a
 	// runaway -wal is observable rather than silently filling the disk.
@@ -717,6 +725,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	if !strings.Contains(path, ":memory:") {
 		s.stopCheckpoint = make(chan struct{})
 		s.checkpointDone = make(chan struct{})
+		s.passiveWindow = newPassiveCheckpointWindowPolicy(s.passiveCheckpointWindow(), walCheckpointRetryMax)
 		go s.runCheckpointLoop(walCheckpointInterval)
 	}
 	return s, nil
@@ -739,7 +748,11 @@ const (
 	walCheckpointTimeout = 10 * time.Second
 	// The periodic path is best-effort and one-shot. Its gate acquisition is a
 	// non-blocking TryLock; this context only protects an unexpected writer-pool
-	// wait or a slow driver call.
+	// wait or a slow driver call. The window is the ADAPTIVE BASE (issue #843):
+	// a passiveCheckpointTimeout test override wins, then
+	// GORTEX_WAL_CHECKPOINT_WINDOW_MS, then this default — and the checkpoint
+	// loop grows the effective window after execute-phase deadlines, capped at
+	// walCheckpointRetryMax, instead of re-running every attempt at one second.
 	walPassiveCheckpointTimeout = 1 * time.Second
 	// A deferred periodic checkpoint must not disappear for another five-minute
 	// interval. Retry promptly, then exponentially cap contention traffic so a
@@ -825,7 +838,7 @@ func (s *Store) passiveCheckpointWindow() time.Duration {
 	if s.passiveCheckpointTimeout > 0 {
 		return s.passiveCheckpointTimeout
 	}
-	return walPassiveCheckpointTimeout
+	return walCheckpointWindowFromEnv()
 }
 
 // checkpointWALPassive returns true only when the next periodic attempt should
@@ -834,16 +847,18 @@ func (s *Store) passiveCheckpointWindow() time.Duration {
 // not silently wait five minutes.
 func (s *Store) checkpointWALPassive() bool {
 	if !s.writeMu.TryLock() {
+		s.passiveWindow.observeReset()
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_gate")
 		return true
 	}
 	defer s.writeMu.Unlock()
 	if s.bulkConn != nil {
+		s.passiveWindow.observeReset()
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=bulk_writer")
 		return true
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.passiveCheckpointWindow())
+	ctx, cancel := context.WithTimeout(context.Background(), s.passiveWindow.window())
 	defer cancel()
 
 	// Acquire the writer connection separately from running the PRAGMA. A
@@ -853,6 +868,9 @@ func (s *Store) checkpointWALPassive() bool {
 	// that is the case worth reporting as a deferral rather than a result.
 	conn, err := s.writerDB.Conn(ctx)
 	if err != nil {
+		// The checkpoint never started executing, so the window is not what
+		// failed: restore the base instead of preserving a grown budget.
+		s.passiveWindow.observeReset()
 		log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=writer_busy error=%q", err)
 		return shouldRetryPassiveCheckpoint(err, ctx.Err())
 	}
@@ -860,10 +878,25 @@ func (s *Store) checkpointWALPassive() bool {
 
 	result, err := checkpointWALOnceOn(ctx, conn, "PASSIVE")
 	if err == nil {
+		s.passiveWindow.observeReset()
 		return false
 	}
+	s.observePassiveCheckpointOutcome(err, ctx.Err())
 	log.Print(passiveCheckpointReport(result, err, ctx.Err()))
 	return shouldRetryPassiveCheckpoint(err, ctx.Err())
+}
+
+// observePassiveCheckpointOutcome feeds one finished (or expired) checkpoint
+// attempt into the adaptive window (issue #843). Only an execute-phase
+// deadline implicates the window — the PRAGMA demonstrably needed more than
+// the current budget — so it alone grows the next attempt; every other
+// outcome restores the base so one slow fold cannot widen the window forever.
+func (s *Store) observePassiveCheckpointOutcome(err, ctxErr error) {
+	if errors.Is(err, context.DeadlineExceeded) || ctxErr != nil {
+		s.passiveWindow.observeTimeout()
+		return
+	}
+	s.passiveWindow.observeReset()
 }
 
 func shouldRetryPassiveCheckpoint(err, ctxErr error) bool {

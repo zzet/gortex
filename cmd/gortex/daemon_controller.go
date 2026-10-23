@@ -1677,6 +1677,17 @@ func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbo
 	if p.Repo == "" {
 		p.Repo = view.searchScope
 	}
+	if p.Repo == "" && p.Path != "" {
+		// The path belongs to no tracked corpus: selectProbeView leaves the
+		// scope empty for it, and this probe is the evidence half of the hook
+		// front door. Reporting union-graph symbols would hand the hook deny
+		// evidence from repos the deny's own redirect targets cannot answer
+		// about — the same false-deny shape #15 clamped for tracked paths,
+		// in its untracked variant (issue #18). Empty evidence is the honest
+		// answer: the scope half (FileCoverage) already reports the path
+		// untracked, and an advisory with no cited symbols cannot deny.
+		return daemon.SearchSymbolsResult{Hits: []daemon.SymbolHit{}, View: view.answer}, nil
+	}
 
 	limit := p.Limit
 	if limit <= 0 || limit > 50 {
