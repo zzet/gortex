@@ -1476,6 +1476,13 @@ func enrichBashWithProbe(toolInput map[string]any, cwd string, probe fileScopePr
 	if outsideGraph(c) {
 		c = classifyBashReadCommandSkipping(cmd, outsideGraph)
 	}
+	// An inline Python one-liner or heredoc that opens indexed source
+	// is the read door agents take once cat and grep are redirected.
+	if c.Action == BashActionPassthrough {
+		if result, answered := enrichBashScriptRead(cmd, cwd, probe); answered {
+			return result
+		}
+	}
 	switch c.Action {
 	case BashActionGrepLike:
 		return probeSymbolPattern("Bash", c.Pattern, cwd, defaultGrepGuidance())
