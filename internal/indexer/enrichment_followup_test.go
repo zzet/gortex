@@ -55,8 +55,19 @@ func TestEnrichmentFollowupParityBeforeAndAfter(t *testing.T) {
 		if len(pending.Paths) > 0 && view.Completeness.State(graphview.CapSemantic) == graphview.StateComplete {
 			t.Errorf("%s: graph.semantic reads complete while %v is owed", label, pending.Paths)
 		}
-		followupMarkerParity(t, label+" before the follow-up", f.worktree, view.Reader, primary.store, builderIndexSemantic(mgr), pending.Paths)
+		before := collectKindParityRows(view.Reader)
 		view.Close()
+		// The view before the follow-up is compared with the same clean
+		// semantic index of this working tree as the view after it (the
+		// follow-up writes generations, never the tree), so the index is built
+		// once: by the after-check when there is one, here otherwise.
+		var clean *store_sqlite.Store
+		checkBefore := func() {
+			if clean == nil {
+				clean = followupCleanIndex(t, label, f.worktree, builderIndexSemantic(mgr))
+			}
+			followupMarkerParity(t, label+" before the follow-up", before, clean, primary.store, pending.Paths)
+		}
 
 		switch outcome := c.runEnrichmentFollowup(ctx); outcome {
 		case followupLanded:
@@ -65,6 +76,7 @@ func TestEnrichmentFollowupParityBeforeAndAfter(t *testing.T) {
 			if len(pending.Paths) > 0 {
 				// Only at the chain bound: the next edit builds direct.
 				t.Logf("%s: follow-up not needed at depth %d with %d owed", label, out.DirtyChainDepth, len(pending.Paths))
+				checkBefore()
 				continue
 			}
 		default:
@@ -87,8 +99,9 @@ func TestEnrichmentFollowupParityBeforeAndAfter(t *testing.T) {
 			t.Errorf("%s: graph.semantic reads %s after the follow-up, want %s", label, s, graphview.StateComplete)
 		}
 		kindParityCheckIndexed(t, label+" after the follow-up", f.worktree, view.Reader, nil,
-			func() graph.Reader { return primary.store }, builderIndexSemantic(mgr))
+			func() graph.Reader { return primary.store }, followupCapturingIndex(builderIndexSemantic(mgr), &clean))
 		view.Close()
+		checkBefore()
 	}
 	if landed == 0 {
 		t.Fatal("no follow-up landed")
@@ -96,16 +109,34 @@ func TestEnrichmentFollowupParityBeforeAndAfter(t *testing.T) {
 	t.Logf("follow-ups landed: %d; stats %+v", landed, c.EnrichmentFollowupStats())
 }
 
-// followupMarkerParity compares the view with a clean semantic index before a
-// follow-up lands. A difference is excused as an engine residual when the
-// primary per-save path holds the view's side of it, and as owed when the
-// marker names it: the row is recorded at an owed path, or it is an external
-// symbol or module row (the go/types pass derives those for the owed paths).
-// Anything else fails.
-func followupMarkerParity(t *testing.T, label, repoDir string, view graph.Reader, primary graph.Reader, index func(testing.TB, *store_sqlite.Store, string), owed []string) {
+// followupCleanIndex is a clean index of repoDir, built by index into a store
+// of its own.
+func followupCleanIndex(t *testing.T, label, repoDir string, index func(testing.TB, *store_sqlite.Store, string)) *store_sqlite.Store {
 	t.Helper()
 	clean := builderOpenStore(t, "followup-marker-clean-"+strings.NewReplacer("/", "-", " ", "-").Replace(label))
 	index(t, clean, repoDir)
+	return clean
+}
+
+// followupCapturingIndex is index, also handing back the store it filled, so
+// a clean index kindParityCheckIndexed builds can serve another comparison of
+// the same working tree.
+func followupCapturingIndex(index func(testing.TB, *store_sqlite.Store, string), into **store_sqlite.Store) func(testing.TB, *store_sqlite.Store, string) {
+	return func(t testing.TB, store *store_sqlite.Store, dir string) {
+		t.Helper()
+		index(t, store, dir)
+		*into = store
+	}
+}
+
+// followupMarkerParity compares the view's rows, taken before a follow-up
+// lands, with a clean semantic index of the same working tree. A difference
+// is excused as an engine residual when the primary per-save path holds the
+// view's side of it, and as owed when the marker names it: the row is
+// recorded at an owed path, or it is an external symbol or module row (the
+// go/types pass derives those for the owed paths). Anything else fails.
+func followupMarkerParity(t *testing.T, label string, view kindParityRows, clean graph.Reader, primary graph.Reader, owed []string) {
+	t.Helper()
 	owedSet := make(map[string]struct{}, len(owed))
 	for _, p := range owed {
 		owedSet[p] = struct{}{}
@@ -124,7 +155,7 @@ func followupMarkerParity(t *testing.T, label, repoDir string, view graph.Reader
 	primaryRows := collectKindParityRows(primary)
 	var failing []string
 	excused := 0
-	for _, l := range compareKindParity(collectKindParityRows(view), collectKindParityRows(clean)) {
+	for _, l := range compareKindParity(view, collectKindParityRows(clean)) {
 		rows := primaryRows.nodes[l.kind]
 		if l.class == "edge" {
 			rows = primaryRows.edges[l.kind]
@@ -286,7 +317,9 @@ func TestEnrichmentFollowupAfterABurst(t *testing.T) {
 			}
 		}
 		view := chainMaterialize(t, f)
-		followupMarkerParity(t, fmt.Sprintf("burst depth %d/%s", depth, edit.name), f.worktree, view.Reader, primary.store, builderIndexSemantic(mgr), pending.Paths)
+		label := fmt.Sprintf("burst depth %d/%s", depth, edit.name)
+		followupMarkerParity(t, label, collectKindParityRows(view.Reader),
+			followupCleanIndex(t, label, f.worktree, builderIndexSemantic(mgr)), primary.store, pending.Paths)
 		view.Close()
 	}
 	if outcome := c.runEnrichmentFollowup(ctx); outcome != followupLanded {

@@ -17,7 +17,28 @@ import (
 // after waiting out the change-stamp margin, so the setup reads as settled.
 func readSetRepo(t *testing.T, linked bool) string {
 	t.Helper()
-	repo := initRepo(t, filepath.Join(tempRoot(t), "repo"))
+	return readSetRepos(t, linked)[0]
+}
+
+// readSetRepos builds one readSetRepo per entry of linked, each in its own
+// directory, and waits out the change-stamp margin once for all of them: a
+// table test builds every case's repository before its first case runs.
+func readSetRepos(t *testing.T, linked ...bool) []string {
+	t.Helper()
+	roots := make([]string, len(linked))
+	for i, l := range linked {
+		roots[i] = buildReadSetRepo(t, l)
+	}
+	time.Sleep(readSetChangeMargin + 20*time.Millisecond)
+	return roots
+}
+
+// buildReadSetRepo is readSetRepo without the wait. The files land in the
+// repository's only commit: every case builds its own repository, so a git
+// process saved here is saved once per case.
+func buildReadSetRepo(t *testing.T, linked bool) string {
+	t.Helper()
+	repo := initBareRepo(t, filepath.Join(tempRoot(t), "repo"), false)
 	write := func(root, name, body string) {
 		t.Helper()
 		if err := os.MkdirAll(filepath.Join(root, filepath.Dir(name)), 0o755); err != nil {
@@ -38,7 +59,6 @@ func readSetRepo(t *testing.T, linked bool) string {
 	}
 	write(root, "pkg/a.txt", "a edited\n")
 	write(root, "pkg/u.txt", "untracked\n")
-	time.Sleep(readSetChangeMargin + 20*time.Millisecond)
 	return root
 }
 
@@ -59,7 +79,7 @@ func sampleForReadSet(t *testing.T, root string) (*DirtySampler, DirtySnapshot) 
 }
 
 func TestConfirmReadSet(t *testing.T) {
-	for _, tc := range []struct {
+	cases := []struct {
 		name      string
 		linked    bool
 		change    func(t *testing.T, root string, s *DirtySampler)
@@ -129,9 +149,15 @@ func TestConfirmReadSet(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-	} {
+	}
+	linked := make([]bool, len(cases))
+	for i, tc := range cases {
+		linked[i] = tc.linked
+	}
+	roots := readSetRepos(t, linked...)
+	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			root := readSetRepo(t, tc.linked)
+			root := roots[i]
 			s, before := sampleForReadSet(t, root)
 			if len(before.Contents) == 0 {
 				t.Fatal("fixture sampled clean")
@@ -246,7 +272,7 @@ func writeReadSetFile(t *testing.T, root, name, body string) {
 // directories it read and HEAD stay confirmed by their stamps.
 func TestConfirmReadSetContent(t *testing.T) {
 	sampled := BlobSHA256([]byte("a edited\n"))
-	for _, tc := range []struct {
+	cases := []struct {
 		name      string
 		parsed    map[string]string
 		change    func(t *testing.T, root string, s *DirtySampler)
@@ -302,9 +328,15 @@ func TestConfirmReadSetContent(t *testing.T) {
 			change: func(t *testing.T, root string, _ *DirtySampler) {
 				git(t, root, "commit", "-q", "--allow-empty", "-m", "moved")
 			}},
-	} {
+	}
+	linked := make([]bool, len(cases))
+	for i := range linked {
+		linked[i] = true
+	}
+	roots := readSetRepos(t, linked...)
+	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			root := readSetRepo(t, true)
+			root := roots[i]
 			s, before := sampleForReadSet(t, root)
 			var held bool
 			for _, content := range before.Contents {
@@ -436,7 +468,7 @@ func TestConfirmReadSetRefusesAFileRestoredBeforeALaterSampleOfTheSameState(t *t
 // directory and removed), while judged paths, paths outside the read set and
 // — unless entries is set — an unread entry of a read directory are not.
 func TestConfirmReadSetSettled(t *testing.T) {
-	for _, tc := range []struct {
+	cases := []struct {
 		name    string
 		judged  map[string]bool
 		entries bool
@@ -476,9 +508,12 @@ func TestConfirmReadSetSettled(t *testing.T) {
 		{name: "unread_entry_of_a_read_directory_rewritten_entries", entries: true, moved: "pkg/s.txt", change: func(t *testing.T, root string) {
 			writeReadSetFile(t, root, "pkg/s.txt", "s\n")
 		}},
-	} {
+	}
+	// One more repository for the no_evidence case below.
+	roots := readSetRepos(t, make([]bool, len(cases)+1)...)
+	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			root := readSetRepo(t, false)
+			root := roots[i]
 			s, before := sampleForReadSet(t, root)
 			if tc.change != nil {
 				tc.change(t, root)
@@ -499,7 +534,7 @@ func TestConfirmReadSetSettled(t *testing.T) {
 		})
 	}
 	t.Run("no_evidence", func(t *testing.T) {
-		root := readSetRepo(t, false)
+		root := roots[len(cases)]
 		s, before := sampleForReadSet(t, root)
 		other := before
 		other.Fingerprint = "not-the-sample"

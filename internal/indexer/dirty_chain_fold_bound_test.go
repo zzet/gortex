@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -12,6 +13,8 @@ import (
 type stalledFoldBackend struct {
 	inner     chainFoldBackend
 	stepDelay time.Duration
+	// steps, when set, counts the steps started.
+	steps *atomic.Int64
 }
 
 func (b stalledFoldBackend) BeginChainFold(ctx context.Context, chain []int64, to int64, owner string) (chainFoldSteps, error) {
@@ -19,7 +22,7 @@ func (b stalledFoldBackend) BeginChainFold(ctx context.Context, chain []int64, t
 	if err != nil {
 		return nil, err
 	}
-	return stalledFold{chainFoldSteps: fold, delay: b.stepDelay}, nil
+	return stalledFold{chainFoldSteps: fold, delay: b.stepDelay, steps: b.steps}, nil
 }
 
 func (b stalledFoldBackend) RebaseViewGeneration(ctx context.Context, generationID, fromBase, toBase int64) error {
@@ -31,9 +34,13 @@ func (b stalledFoldBackend) StepRetryable(err error) bool { return b.inner.StepR
 type stalledFold struct {
 	chainFoldSteps
 	delay time.Duration
+	steps *atomic.Int64
 }
 
 func (f stalledFold) Step(ctx context.Context) (bool, error) {
+	if f.steps != nil {
+		f.steps.Add(1)
+	}
 	select {
 	case <-ctx.Done():
 		return false, ctx.Err()
@@ -58,13 +65,22 @@ func mcpChainAtTheCap(t *testing.T, f *coordinatorFixture, l *CheckoutLifecycle)
 // budget: a copy that does not finish in it is abandoned and the edit builds
 // direct. Overrides, named: background compactions closed (no fold runs, so
 // the edit meets the cap); the fold backend stalls (every step takes 200 ms
-// and never ends the copy).
+// and never ends the copy); the inline budget is 500 ms through its seam
+// rather than the default dirtyChainInlineFoldBudget. The test first checks
+// that the default coordinator applies dirtyChainInlineFoldBudget, so the
+// seam only shortens the wait, not what the default is.
 func TestInlineFoldAtTheCapIsBoundedInTime(t *testing.T) {
 	f, c, l := mcpChainFixture(t, builderTreeA(), false)
 	mcpChainAtTheCap(t, f, l)
+	if got := c.inlineFoldBudget(); got != dirtyChainInlineFoldBudget {
+		t.Fatalf("the default inline fold budget is %v, want %v", got, dirtyChainInlineFoldBudget)
+	}
+	var steps atomic.Int64
 	c.compaction.mu.Lock()
-	c.compaction.backend = stalledFoldBackend{inner: storeChainFoldBackend{store: f.store}, stepDelay: 200 * time.Millisecond}
+	c.compaction.backend = stalledFoldBackend{inner: storeChainFoldBackend{store: f.store}, stepDelay: 200 * time.Millisecond, steps: &steps}
+	c.compaction.inlineBudget = 500 * time.Millisecond
 	c.compaction.mu.Unlock()
+	budget := c.inlineFoldBudget()
 
 	done := make(chan CheckoutCycle, 1)
 	started := time.Now()
@@ -72,17 +88,20 @@ func TestInlineFoldAtTheCapIsBoundedInTime(t *testing.T) {
 	var at CheckoutCycle
 	select {
 	case at = <-done:
-	case <-time.After(dirtyChainInlineFoldBudget + 10*time.Second):
-		t.Fatalf("the edit at the cap waited more than %v", dirtyChainInlineFoldBudget+10*time.Second)
+	case <-time.After(budget + 10*time.Second):
+		t.Fatalf("the edit at the cap waited more than %v", budget+10*time.Second)
 	}
 	waited := time.Since(started)
-	t.Logf("the edit at the cap: %v (budget %v), parent %d, depth %d, reason %q",
-		waited.Round(time.Millisecond), dirtyChainInlineFoldBudget, at.DirtyParentGenerationID, at.DirtyChainDepth, at.DirtyChainReason)
-	if waited < dirtyChainInlineFoldBudget {
+	t.Logf("the edit at the cap: %v (budget %v), %d stalled steps, parent %d, depth %d, reason %q",
+		waited.Round(time.Millisecond), budget, steps.Load(), at.DirtyParentGenerationID, at.DirtyChainDepth, at.DirtyChainReason)
+	if steps.Load() == 0 {
+		t.Fatal("the edit at the cap never stepped the stalled fold: the fold was not attempted")
+	}
+	if waited < budget {
 		t.Fatalf("the edit returned in %v, before the budget: the stalled fold was not attempted", waited)
 	}
-	if waited > dirtyChainInlineFoldBudget+2*time.Second {
-		t.Fatalf("the edit at the cap waited %v, more than the budget %v and its own build", waited, dirtyChainInlineFoldBudget)
+	if waited > budget+2*time.Second {
+		t.Fatalf("the edit at the cap waited %v, more than the budget %v and its own build", waited, budget)
 	}
 	if at.DirtyParentGenerationID != 0 {
 		t.Fatalf("the edit stands on %d after an abandoned fold, want a direct build", at.DirtyParentGenerationID)

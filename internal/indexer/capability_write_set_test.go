@@ -104,9 +104,9 @@ func TestPerSaveCapabilityWriteSetMatchesTheWholeIndex(t *testing.T) {
 			dir := builderTempDir(t, "capws-"+fixtureName)
 			builderWriteTree(t, dir, capabilityWriteSetTree())
 			store := builderOpenStore(t, "capws-"+fixtureName)
-			builderIndex(t, store, dir)
+			goIndex(t, store, dir)
 			core, logs := observer.New(zap.InfoLevel)
-			idx := New(store, builderRegistry(), config.Default().Index, zap.New(core))
+			idx := New(store, builderGoRegistry(), config.Default().Index, zap.New(core))
 			defer idx.Close()
 			idx.SetRepoPrefix(builderRepoPrefix)
 			idx.SetWorkspaceID(builderRepoPrefix)
@@ -182,7 +182,7 @@ func TestPerSaveCapabilityWriteSetMatchesTheWholeIndex(t *testing.T) {
 			tree["pkg/"+file] = edited
 			builderWriteTree(t, cleanDir, tree)
 			clean := builderOpenStore(t, "capws-clean-"+fixtureName)
-			builderIndex(t, clean, cleanDir)
+			goIndex(t, clean, cleanDir)
 			whole := capabilityRows(t, clean)
 			onlyPerSave, onlyWhole := diffRows(perSave, whole)
 			if len(onlyPerSave) > 0 || len(onlyWhole) > 0 {
@@ -249,7 +249,7 @@ func TestCapabilityPassReadsOnlyTheChangedSourcesInputs(t *testing.T) {
 	dir := builderTempDir(t, "capws-inputs")
 	builderWriteTree(t, dir, capabilityWriteSetTree())
 	store := builderOpenStore(t, "capws-inputs")
-	builderIndex(t, store, dir)
+	goIndex(t, store, dir)
 	const file = "repo/pkg/state.go"
 	prior := newCapabilityPrior()
 	prior.files[file] = struct{}{}
@@ -289,13 +289,13 @@ func TestPerSaveCapabilityIgnoresRowsAnOlderDerivationWrote(t *testing.T) {
 	dir := builderTempDir(t, "capws-stale")
 	builderWriteTree(t, dir, capabilityWriteSetTree())
 	store := builderOpenStore(t, "capws-stale")
-	builderIndex(t, store, dir)
+	goIndex(t, store, dir)
 	stale := &graph.Edge{From: "repo/pkg/state.go::Store.Bump", To: "repo/pkg/state.go::Store.mu",
 		Kind: graph.EdgeAccessesField, FilePath: "repo/pkg/state.go", Line: 6, Origin: graph.OriginASTInferred,
 		Meta: map[string]any{"access": "write", "indirect": true, "via": "Lock"}}
 	store.AddEdge(stale)
 	core, logs := observer.New(zap.InfoLevel)
-	idx := New(store, builderRegistry(), config.Default().Index, zap.New(core))
+	idx := New(store, builderGoRegistry(), config.Default().Index, zap.New(core))
 	defer idx.Close()
 	idx.SetRepoPrefix(builderRepoPrefix)
 	idx.SetWorkspaceID(builderRepoPrefix)

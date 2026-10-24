@@ -19,18 +19,20 @@ func newBaseFixture(t *testing.T) *ownedFTSTable {
 	rows := fixtureRows("row", 7000, 5)
 	next := 0
 	take := func() [3]string { r := rows[next%len(rows)]; next++; r[0] = fmt.Sprintf("b%d", next); return r }
-	for i := 0; i < 40; i++ {
-		o.insert(t, 30, take())
-		for j := 0; j < 150; j++ {
-			o.insert(t, 31, take())
+	o.load(t, func(add func(int64, [3]string)) {
+		for i := 0; i < 40; i++ {
+			add(30, take())
+			for j := 0; j < 150; j++ {
+				add(31, take())
+			}
 		}
-	}
-	for i := 0; i < 50; i++ {
-		o.insert(t, 33, take())
-	}
-	for i := 0; i < 20; i++ {
-		o.insert(t, 35, take())
-	}
+		for i := 0; i < 50; i++ {
+			add(33, take())
+		}
+		for i := 0; i < 20; i++ {
+			add(35, take())
+		}
+	})
 	return o
 }
 

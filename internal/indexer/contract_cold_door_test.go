@@ -62,7 +62,11 @@ func (f *contractColdDoorFixture) hooks() ContractCoreRuntimeHooks {
 func newContractColdDoorFixture(t *testing.T) *contractColdDoorFixture {
 	t.Helper()
 	ctx := t.Context()
-	_, store := newSQLiteIndexer(t)
+	// The store alone: an Indexer with every language registered would be
+	// built and dropped here, its query compilation most of the fixture's cost.
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "g.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
 	f := &contractColdDoorFixture{store: store, root: t.TempDir(), published: make(map[string]*atomic.Int64)}
 	writeFile(t, filepath.Join(f.root, "routes.go"), coldDoorRoutes)
 	writeFile(t, filepath.Join(f.root, "failing.go"), coldDoorFailing)
@@ -159,6 +163,13 @@ var coldDoors = []struct {
 // accepted holds its core-write window open: the job waits for it and the
 // publish equals a cold build.
 func TestContractCoreColdDoorMatrix(t *testing.T) {
+	// A row's oracle is a cold build of files, never of a door: the matrix
+	// builds each distinct file set once.
+	oracles := contractColdOracles{}
+	coldIDs := func(t *testing.T, files map[string]string) []string {
+		t.Helper()
+		return contractIDs(oracles.contracts(t, files))
+	}
 	for _, door := range coldDoors {
 		for _, fault := range []string{"none", "failed_file", "envelope_refused", "in_flight"} {
 			t.Run(door.name+"/"+fault, func(t *testing.T) {
@@ -224,7 +235,7 @@ func TestContractCoreColdDoorMatrix(t *testing.T) {
 					// door resets it before its pass.
 					inPlace := door.name == "index_ctx"
 					require.Equal(t, inPlace, cold["failing.go"] != "", "%s: whether the core still holds the failed file", door.name)
-					require.Equal(t, contractIDs(coldContracts(t, cold)), contractIDs(publishedFixtureContracts(t, options)))
+					require.Equal(t, coldIDs(t, cold), contractIDs(publishedFixtureContracts(t, options)))
 					return
 				default:
 					require.True(t, after.Accepted, "the cold door accepts its namespace")
@@ -254,7 +265,7 @@ func TestContractCoreColdDoorMatrix(t *testing.T) {
 					report, err := runFixtureContractJob(t, options, contractFixtureJob{layer: 1})
 					require.NoError(t, err)
 					require.True(t, report.Published)
-					require.Equal(t, contractIDs(coldContracts(t, map[string]string{"routes.go": coldDoorRoutes})), contractIDs(publishedFixtureContracts(t, options)))
+					require.Equal(t, coldIDs(t, map[string]string{"routes.go": coldDoorRoutes}), contractIDs(publishedFixtureContracts(t, options)))
 				} else {
 					require.False(t, contractReceiptIsFailureEnvelope(envelope))
 				}
@@ -272,7 +283,7 @@ func TestContractCoreColdDoorMatrix(t *testing.T) {
 					require.NoError(t, err)
 					require.True(t, report.Published)
 					require.True(t, closed, "the job waited for the in-flight window")
-					require.Equal(t, contractIDs(coldContracts(t, map[string]string{"routes.go": coldDoorRoutes, "failing.go": coldDoorFailing})), contractIDs(publishedFixtureContracts(t, options)))
+					require.Equal(t, coldIDs(t, map[string]string{"routes.go": coldDoorRoutes, "failing.go": coldDoorFailing}), contractIDs(publishedFixtureContracts(t, options)))
 					return
 				}
 				// The accepted namespace still journals: a route edit moves the key.

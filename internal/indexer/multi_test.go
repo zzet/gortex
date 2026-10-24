@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
-	"pgregory.net/rapid"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
@@ -736,27 +735,135 @@ func TestMultiIndexer_IndexAll_EmptyRepos(t *testing.T) {
 // with an empty RepoPrefix — which meant one graph could carry two ID
 // schemes depending on how many repos happened to be tracked. Repo COUNT
 // still decides IsMultiRepo(), but it no longer decides ID SHAPE.
+//
+// A workspace's size is the property's only structural input — the function
+// names a generator would draw do not change an ID's shape — so the cases
+// enumerate it: one repo, two repos, and two repos that declare the same
+// symbol, where only the prefix tells the two IDs apart. The last case uses
+// sharedSymbol, so its two declarations also share a graph shard.
 func TestPropertyNodeIDFormat(t *testing.T) {
-	rapid.Check(t, func(rt *rapid.T) {
-		// Generate random function names for uniqueness per iteration.
-		funcNameA := "Func" + rapid.StringMatching(`[A-Z][a-z]{2,6}`).Draw(rt, "funcNameA")
-		funcNameB := "Func" + rapid.StringMatching(`[A-Z][a-z]{2,6}`).Draw(rt, "funcNameB")
+	type decl struct{ repo, file, fn string } // a repo and the function its one file declares
+	for _, tc := range []struct {
+		name  string
+		repos []decl
+	}{
+		{"one repo", []decl{{"solo-repo", "main.go", "FuncSolo"}}},
+		{"two repos", []decl{{"repo-a", "main.go", "FuncAlpha"}, {"repo-b", "main.go", "FuncBeta"}}},
+		{"two repos declaring the same symbol", []decl{{"repo-a", sharedSymbolFileA, sharedSymbol}, {"repo-b", sharedSymbolFileB, sharedSymbol}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpBase := t.TempDir()
 
-		// The number of tracked repos must not change the ID shape.
-		multiRepo := rapid.Bool().Draw(rt, "multiRepo")
+			var entries []config.RepoEntry
+			for _, d := range tc.repos {
+				dir := filepath.Join(tmpBase, d.repo)
+				require.NoError(t, os.MkdirAll(dir, 0o755))
+				writeFile(t, filepath.Join(dir, d.file),
+					fmt.Sprintf("package main\n\nfunc %s() {}\n", d.fn))
+				entries = append(entries, config.RepoEntry{Path: dir, Name: d.repo})
+			}
 
-		tmpBase := t.TempDir()
+			tmpCfg := filepath.Join(tmpBase, "config.yaml")
+			gc := &config.GlobalConfig{Repos: entries}
+			gc.SetConfigPath(tmpCfg)
+			require.NoError(t, gc.Save())
 
-		if multiRepo {
-			// --- Multi-repo mode: 2 repos ---
+			cm, err := config.NewConfigManager(tmpCfg)
+			require.NoError(t, err)
+
+			g := graph.New()
+			mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
+
+			results, err := mi.IndexAll()
+			require.NoError(t, err)
+			require.Len(t, results, len(tc.repos))
+
+			// Repo count decides IsMultiRepo(); it does not decide the IDs.
+			if got, want := mi.IsMultiRepo(), len(tc.repos) > 1; got != want {
+				t.Errorf("IsMultiRepo() = %v for %d repos, want %v", got, len(tc.repos), want)
+			}
+
+			assertNodesArePrefixed(t, g, tc.name)
+		})
+	}
+}
+
+// sharedSymbol is one function both repos of a two-repo workspace declare,
+// placed so that both declarations, and repo-a's file node, land in one graph
+// shard at every shard count. The graph places an ID by the low bits of its
+// FNV-1a hash and a shard count is a power of two no larger than 512, so IDs
+// whose hashes agree in the low nine bits share a shard at every count. Two
+// IDs that differ only in the repo name never do: a difference in those bits
+// of the hash state survives every later byte. So each repo declares the
+// symbol in its own file, the two names chosen so the hash states agree again
+// at the "::" separator, and the symbol's name puts repo-a's file node in the
+// same shard. (Each was found by hashing candidates; another file name or
+// symbol almost certainly lands elsewhere.)
+//
+// In that shard the symbol's name bucket holds both repos' declarations, and
+// repo-a's repo and file buckets hold two of its nodes. Indexing therefore adds
+// to occupied buckets, and re-indexing repo-a swap-removes its nodes from
+// buckets that keep an entry: in the name bucket, repo-b's declaration.
+// Generated names reached those paths only through chance placement.
+const (
+	sharedSymbolFileA = "decl.go"
+	sharedSymbolFileB = "dup.go"
+	sharedSymbol      = "FuncShared353"
+)
+
+// assertNodesArePrefixed is the single ID-shape invariant, applied to
+// workspaces of every size: every node carries a repo prefix, its ID starts
+// with that prefix, and symbol nodes keep the "::" path/symbol separator.
+func assertNodesArePrefixed(t testing.TB, g *graph.Graph, workspace string) {
+	t.Helper()
+	for _, n := range g.AllNodes() {
+		if n.RepoPrefix == "" {
+			t.Errorf("%s: node %q has empty RepoPrefix", workspace, n.ID)
+			continue
+		}
+		prefix := n.RepoPrefix + "/"
+		if !strings.HasPrefix(n.ID, prefix) {
+			t.Errorf("%s: node ID %q does not start with prefix %q", workspace, n.ID, prefix)
+		}
+		if n.Kind != graph.KindFile && n.Kind != graph.KindPackage && n.Kind != graph.KindImport {
+			if !strings.Contains(n.ID, "::") {
+				t.Errorf("%s: node ID %q missing '::' separator", workspace, n.ID)
+			}
+		}
+	}
+}
+
+// Feature: multi-repo-support, Property 9: Re-index isolation
+//
+// TestPropertyReindexIsolation verifies that re-indexing repo A does not
+// modify, remove, or add any nodes or edges belonging to repo B.
+// The node count and edge count for repo B before and after re-indexing A
+// are identical.
+//
+// The cases are two repos declaring different symbols and two declaring the
+// same one, where repo A's re-index could reach repo B's node through the
+// symbol's unprefixed name. The names are otherwise not an input to the
+// property, so they are fixed rather than generated; the shared one is
+// sharedSymbol, so repo A's re-index removes its declaration from a shard
+// bucket that repo B's declaration still occupies.
+func TestPropertyReindexIsolation(t *testing.T) {
+	for _, tc := range []struct{ name, fileA, funcNameA, fileB, funcNameB string }{
+		{"distinct symbols", "main.go", "FuncAlpha", "main.go", "FuncBeta"},
+		{"the same symbol in both repos", sharedSymbolFileA, sharedSymbol, sharedSymbolFileB, sharedSymbol},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			funcNameA, funcNameB := tc.funcNameA, tc.funcNameB
+
+			tmpBase := t.TempDir()
+
 			repoA := filepath.Join(tmpBase, "repo-a")
 			repoB := filepath.Join(tmpBase, "repo-b")
 			require.NoError(t, os.MkdirAll(repoA, 0o755))
 			require.NoError(t, os.MkdirAll(repoB, 0o755))
 
-			writeFile(t, filepath.Join(repoA, "main.go"),
+			writeFile(t, filepath.Join(repoA, tc.fileA),
 				fmt.Sprintf("package main\n\nfunc %s() {}\n", funcNameA))
-			writeFile(t, filepath.Join(repoB, "main.go"),
+			writeFile(t, filepath.Join(repoB, tc.fileB),
 				fmt.Sprintf("package main\n\nfunc %s() {}\n", funcNameB))
 
 			tmpCfg := filepath.Join(tmpBase, "config.yaml")
@@ -775,158 +882,51 @@ func TestPropertyNodeIDFormat(t *testing.T) {
 			g := graph.New()
 			mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 
-			results, err := mi.IndexAll()
-			require.NoError(t, err)
-			require.Len(t, results, 2)
-
-			// Must be multi-repo mode.
-			if !mi.IsMultiRepo() {
-				rt.Error("expected IsMultiRepo() == true for 2 repos")
-			}
-
-			assertNodesArePrefixed(rt, g, "two repos")
-		} else {
-			// --- One repo: same ID shape, IsMultiRepo() is false ---
-			repoDir := filepath.Join(tmpBase, "solo-repo")
-			require.NoError(t, os.MkdirAll(repoDir, 0o755))
-
-			writeFile(t, filepath.Join(repoDir, "main.go"),
-				fmt.Sprintf("package main\n\nfunc %s() {}\n", funcNameA))
-
-			tmpCfg := filepath.Join(tmpBase, "config.yaml")
-			gc := &config.GlobalConfig{
-				Repos: []config.RepoEntry{
-					{Path: repoDir, Name: "solo-repo"},
-				},
-			}
-			gc.SetConfigPath(tmpCfg)
-			require.NoError(t, gc.Save())
-
-			cm, err := config.NewConfigManager(tmpCfg)
+			_, err = mi.IndexAll()
 			require.NoError(t, err)
 
-			g := graph.New()
-			mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
+			// Record repo B's state before re-indexing A.
+			repoBNodesBefore := len(g.GetRepoNodes("repo-b"))
+			repoBEdgesBefore := countRepoEdges(g, "repo-b")
+			// Capture repo B node IDs for identity check.
+			repoBNodeIDsBefore := make(map[string]bool)
+			for _, n := range g.GetRepoNodes("repo-b") {
+				repoBNodeIDsBefore[n.ID] = true
+			}
 
-			results, err := mi.IndexAll()
+			// Re-index repo A.
+			_, err = mi.IndexRepo("repo-a")
 			require.NoError(t, err)
-			require.Len(t, results, 1)
 
-			// One repo: not multi-repo, but the IDs look identical.
-			if mi.IsMultiRepo() {
-				rt.Error("expected IsMultiRepo() == false for 1 repo")
+			// Verify repo B node count unchanged.
+			repoBNodesAfter := len(g.GetRepoNodes("repo-b"))
+			if repoBNodesBefore != repoBNodesAfter {
+				t.Errorf("repo-b node count changed: before=%d after=%d", repoBNodesBefore, repoBNodesAfter)
 			}
 
-			assertNodesArePrefixed(rt, g, "one repo")
-		}
-	})
-}
-
-// assertNodesArePrefixed is the single ID-shape invariant, applied to
-// workspaces of every size: every node carries a repo prefix, its ID starts
-// with that prefix, and symbol nodes keep the "::" path/symbol separator.
-func assertNodesArePrefixed(rt *rapid.T, g *graph.Graph, workspace string) {
-	for _, n := range g.AllNodes() {
-		if n.RepoPrefix == "" {
-			rt.Errorf("%s: node %q has empty RepoPrefix", workspace, n.ID)
-			continue
-		}
-		prefix := n.RepoPrefix + "/"
-		if !strings.HasPrefix(n.ID, prefix) {
-			rt.Errorf("%s: node ID %q does not start with prefix %q", workspace, n.ID, prefix)
-		}
-		if n.Kind != graph.KindFile && n.Kind != graph.KindPackage && n.Kind != graph.KindImport {
-			if !strings.Contains(n.ID, "::") {
-				rt.Errorf("%s: node ID %q missing '::' separator", workspace, n.ID)
+			// Verify repo B edge count unchanged.
+			repoBEdgesAfter := countRepoEdges(g, "repo-b")
+			if repoBEdgesBefore != repoBEdgesAfter {
+				t.Errorf("repo-b edge count changed: before=%d after=%d", repoBEdgesBefore, repoBEdgesAfter)
 			}
-		}
+
+			// Verify repo B node IDs are exactly the same.
+			repoBNodeIDsAfter := make(map[string]bool)
+			for _, n := range g.GetRepoNodes("repo-b") {
+				repoBNodeIDsAfter[n.ID] = true
+			}
+			for id := range repoBNodeIDsBefore {
+				if !repoBNodeIDsAfter[id] {
+					t.Errorf("repo-b node %q disappeared after re-indexing repo-a", id)
+				}
+			}
+			for id := range repoBNodeIDsAfter {
+				if !repoBNodeIDsBefore[id] {
+					t.Errorf("repo-b node %q appeared after re-indexing repo-a", id)
+				}
+			}
+		})
 	}
-}
-
-// Feature: multi-repo-support, Property 9: Re-index isolation
-//
-// TestPropertyReindexIsolation verifies that re-indexing repo A does not
-// modify, remove, or add any nodes or edges belonging to repo B.
-// The node count and edge count for repo B before and after re-indexing A
-// are identical.
-func TestPropertyReindexIsolation(t *testing.T) {
-	rapid.Check(t, func(rt *rapid.T) {
-		// Generate random function names for uniqueness per iteration.
-		funcNameA := "Func" + rapid.StringMatching(`[A-Z][a-z]{2,6}`).Draw(rt, "funcNameA")
-		funcNameB := "Func" + rapid.StringMatching(`[A-Z][a-z]{2,6}`).Draw(rt, "funcNameB")
-
-		tmpBase := t.TempDir()
-
-		repoA := filepath.Join(tmpBase, "repo-a")
-		repoB := filepath.Join(tmpBase, "repo-b")
-		require.NoError(t, os.MkdirAll(repoA, 0o755))
-		require.NoError(t, os.MkdirAll(repoB, 0o755))
-
-		writeFile(t, filepath.Join(repoA, "main.go"),
-			fmt.Sprintf("package main\n\nfunc %s() {}\n", funcNameA))
-		writeFile(t, filepath.Join(repoB, "main.go"),
-			fmt.Sprintf("package main\n\nfunc %s() {}\n", funcNameB))
-
-		tmpCfg := filepath.Join(tmpBase, "config.yaml")
-		gc := &config.GlobalConfig{
-			Repos: []config.RepoEntry{
-				{Path: repoA, Name: "repo-a"},
-				{Path: repoB, Name: "repo-b"},
-			},
-		}
-		gc.SetConfigPath(tmpCfg)
-		require.NoError(t, gc.Save())
-
-		cm, err := config.NewConfigManager(tmpCfg)
-		require.NoError(t, err)
-
-		g := graph.New()
-		mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
-
-		_, err = mi.IndexAll()
-		require.NoError(t, err)
-
-		// Record repo B's state before re-indexing A.
-		repoBNodesBefore := len(g.GetRepoNodes("repo-b"))
-		repoBEdgesBefore := countRepoEdges(g, "repo-b")
-		// Capture repo B node IDs for identity check.
-		repoBNodeIDsBefore := make(map[string]bool)
-		for _, n := range g.GetRepoNodes("repo-b") {
-			repoBNodeIDsBefore[n.ID] = true
-		}
-
-		// Re-index repo A.
-		_, err = mi.IndexRepo("repo-a")
-		require.NoError(t, err)
-
-		// Verify repo B node count unchanged.
-		repoBNodesAfter := len(g.GetRepoNodes("repo-b"))
-		if repoBNodesBefore != repoBNodesAfter {
-			rt.Errorf("repo-b node count changed: before=%d after=%d", repoBNodesBefore, repoBNodesAfter)
-		}
-
-		// Verify repo B edge count unchanged.
-		repoBEdgesAfter := countRepoEdges(g, "repo-b")
-		if repoBEdgesBefore != repoBEdgesAfter {
-			rt.Errorf("repo-b edge count changed: before=%d after=%d", repoBEdgesBefore, repoBEdgesAfter)
-		}
-
-		// Verify repo B node IDs are exactly the same.
-		repoBNodeIDsAfter := make(map[string]bool)
-		for _, n := range g.GetRepoNodes("repo-b") {
-			repoBNodeIDsAfter[n.ID] = true
-		}
-		for id := range repoBNodeIDsBefore {
-			if !repoBNodeIDsAfter[id] {
-				rt.Errorf("repo-b node %q disappeared after re-indexing repo-a", id)
-			}
-		}
-		for id := range repoBNodeIDsAfter {
-			if !repoBNodeIDsBefore[id] {
-				rt.Errorf("repo-b node %q appeared after re-indexing repo-a", id)
-			}
-		}
-	})
 }
 
 // countRepoEdges counts edges where at least one endpoint belongs to the given repo prefix.

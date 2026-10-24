@@ -121,16 +121,19 @@ func TestSteppedFoldLandsUnderEditsAndRebasesTheLayerAbove(t *testing.T) {
 	chainAssertFlat(t, f, "stepped-fold-after")
 }
 
-// 2. A burst of 12 edits at a 5 s pace, a search after each, with the fold
-// running in the background: no edit meets the chain bound, and writer
-// probes during steps complete within the Store tests' timing policy. The
-// probe measures the whole analysis-header call, including SQL, rather than
-// isolated write-gate wait; race builds use the existing Store race slack.
+// 2. A burst of 12 edits, a search after each, with the fold running in the
+// background: no edit meets the chain bound, and writer probes during steps
+// complete within the Store tests' timing policy. The probe measures the whole
+// analysis-header call, including SQL, rather than isolated write-gate wait;
+// race builds use the existing Store race slack.
+//
+// The burst's interleaving is driven by events, not by a wall-clock pace:
+// every fold an edit schedules is held before its first step until the next
+// edit has published above it, then steps, probes and lands before the edit
+// after that. (On this small fixture the steps take milliseconds, so this is
+// the order a 5 s pace with the fold held for 7.5 s produced: three folds,
+// each with one edit published above it.)
 func TestSteppedFoldBurstNeverExhaustsTheChainAndNoEditWaitsOnAStep(t *testing.T) {
-	pace := 5 * time.Second
-	if testing.Short() {
-		pace = 200 * time.Millisecond
-	}
 	f, c, l := mcpChainFixture(t, builderTreeA(), true)
 	var probeMu sync.Mutex
 	var probes []time.Duration
@@ -153,14 +156,23 @@ func TestSteppedFoldBurstNeverExhaustsTheChainAndNoEditWaitsOnAStep(t *testing.T
 	}
 	// Registered after the fixture: stop admission before Wait on every exit.
 	t.Cleanup(joinProbes)
+	// held receives each fold's release gate once the fold has begun (it is
+	// published as folding) and waits before its first step.
+	held := make(chan chan struct{}, 1)
 	c.compaction.mu.Lock()
 	c.compaction.stepHook = func(ctx context.Context, step int) {
 		if step == 0 {
-			// Hold the fold open across the next edits, so they publish above
+			// Hold the fold open across the next edit, so it publishes above
 			// a running fold (on this small fixture the steps themselves take
 			// milliseconds).
+			gate := make(chan struct{})
 			select {
-			case <-time.After(pace * 3 / 2):
+			case held <- gate:
+			case <-ctx.Done():
+				return
+			}
+			select {
+			case <-gate:
 			case <-ctx.Done():
 			}
 		}
@@ -192,7 +204,9 @@ func TestSteppedFoldBurstNeverExhaustsTheChainAndNoEditWaitsOnAStep(t *testing.T
 	c.compaction.mu.Unlock()
 	above := 0
 	ctx := context.Background()
+	var release chan struct{} // the held fold's gate; nil when none is held
 	for i := 0; i < 12; i++ {
+		scheduled := c.DirtyChainCompactionStats().Scheduled
 		out := mcpEdit(t, l, f, func() { chainBurstEdit(t, f, i) })
 		if out.DirtyChainReason == dirtyChainFallbackChainDepthExhausted {
 			t.Fatalf("edit %d met the chain bound (depth %d)", i+1, out.DirtyChainDepth)
@@ -203,7 +217,28 @@ func TestSteppedFoldBurstNeverExhaustsTheChainAndNoEditWaitsOnAStep(t *testing.T
 		view := chainMaterialize(t, f) // the search
 		_ = view.Reader.FindNodesByName("Helper")
 		view.Close()
-		time.Sleep(pace)
+		if release != nil {
+			// An edit has published above the held fold: let it step and
+			// land before the next edit.
+			close(release)
+			release = nil
+			if err := c.waitDirtyChainCompactions(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if c.DirtyChainCompactionStats().Scheduled > scheduled {
+			// The edit started a fold (one that was due while another
+			// stepped was refused): wait until it is held before its first
+			// step.
+			select {
+			case release = <-held:
+			case <-time.After(30 * time.Second):
+				t.Fatalf("the fold edit %d scheduled did not begin", i+1)
+			}
+		}
+	}
+	if release != nil {
+		close(release)
 	}
 	if err := c.waitDirtyChainCompactions(ctx); err != nil {
 		t.Fatal(err)

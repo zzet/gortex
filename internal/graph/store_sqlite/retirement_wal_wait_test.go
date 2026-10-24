@@ -106,12 +106,14 @@ func TestRetirementWaitsForTheReclaimOverTheWALCeiling(t *testing.T) {
 		}
 	}()
 
-	// A chunk rewrites a quarter of the churn table (about 0.5 MiB of WAL)
-	// and "removes" one row until 120 chunks have run: 60 MiB of log with
-	// no reset in between if nothing pauses the sweep.
+	// A chunk rewrites a quarter of the churn table (about 2 MiB of WAL)
+	// and "removes" one row until 24 chunks have run: ~50 MiB of log, three
+	// times the bound below, with no reset in between if nothing pauses the
+	// sweep. Each pause costs a quiet window, so more chunks only add waits.
+	const total = 24
 	chunks := 0
 	chunk := func(ctx context.Context, tx *sql.Tx) (int64, error) {
-		if chunks >= 120 {
+		if chunks >= total {
 			return 0, nil
 		}
 		chunks++
@@ -129,7 +131,7 @@ func TestRetirementWaitsForTheReclaimOverTheWALCeiling(t *testing.T) {
 	out := logs.String()
 	t.Logf("retirement: chunks=%d elapsed=%s wal_max=%.1fMiB ceiling=%dMiB reclaimer_resets=%d waits=%d timeouts=%d",
 		chunks, elapsed.Round(time.Millisecond), float64(maxWAL.Load())/(1<<20), ceiling>>20, resets.Load(), st.RetirementWaits, st.RetirementWaitTimeouts)
-	require.Equal(t, 120, chunks, "retirement must always finish")
+	require.Equal(t, total, chunks, "retirement must always finish")
 	require.Positive(t, st.RetirementWaits)
 	require.Positive(t, resets.Load(), "the waits must give the reclaim its window")
 	require.LessOrEqual(t, maxWAL.Load(), int64(ceiling+4<<20), "the WAL passed the ceiling under retirement")
@@ -201,8 +203,9 @@ func TestRetirementWaitsAtTheReclaimThreshold(t *testing.T) {
 // running when the log passes 256 MiB stops at its next chunk, so the log it
 // leaves is the mark plus at most one chunk; the sweep then waits and still
 // finishes. The reclaim loop is off (named override), so nothing resets the
-// log underneath, and the wait is shortened (named override: 100 ms, 30 s in
-// production) so the test does not sit in it.
+// log underneath, and the wait is shortened (named override: 20 ms, 30 s in
+// production) so the test does not sit in it: every chunk after the mark
+// waits it out.
 func TestARunningRetirementStopsAtTheMarkWithTheDaemonDefaults(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
 	logs := captureReclaimLog(t)
@@ -224,7 +227,7 @@ func TestARunningRetirementStopsAtTheMarkWithTheDaemonDefaults(t *testing.T) {
 	mark := retirementWALMark(cfg.thresholdBytes, cfg.ceilingBytes)
 	require.Equal(t, int64(256<<20), mark)
 	prevMax := retirementWALWaitMax
-	retirementWALWaitMax = 100 * time.Millisecond
+	retirementWALWaitMax = 20 * time.Millisecond
 	t.Cleanup(func() { retirementWALWaitMax = prevMax })
 
 	// The log to just under the mark, then a sweep whose chunks each add

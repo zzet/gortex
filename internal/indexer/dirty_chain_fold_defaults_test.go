@@ -28,15 +28,37 @@ func mcpChainFixtureDefaults(t *testing.T, tree map[string]string) (*coordinator
 	return f, c, l
 }
 
-// A burst of 12 MCP edits 1.5 s apart with the daemon's defaults: a fold
-// starts once the chain is 4 deep, steps between the edits, and lands; no
-// schedule cancels a queued compaction, and no edit meets the bound.
+// awaitCompactorIdle waits until no compaction of c is queued or running, or
+// until limit has passed, whichever comes first.
+func awaitCompactorIdle(c *CheckoutCoordinator, limit time.Duration) {
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	for {
+		c.compaction.mu.Lock()
+		running := c.compaction.running
+		c.compaction.mu.Unlock()
+		if !compactionOwed(running) {
+			return
+		}
+		select {
+		case <-running:
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+// A burst of 12 MCP edits at most 1.5 s apart with the daemon's defaults: a
+// fold starts once the chain is 4 deep, steps between the edits, and lands;
+// no schedule cancels a queued compaction, and no edit meets the bound. The
+// pause after an edit ends early once no compaction is queued or running:
+// the rest of a 1.5 s pause is idle time (nothing else of the checkout runs
+// between edits here: the loop is parked and the fixture's builder defers no
+// enrichment), so the edits meet the folds as they would at that pace, and a
+// fold slower than the pause still meets the next edit.
 func TestSteppedFoldRunsDuringABurstWithTheDaemonsDefaults(t *testing.T) {
 	f, c, l := mcpChainFixtureDefaults(t, builderTreeA())
-	pace := 1500 * time.Millisecond
-	if testing.Short() {
-		pace = 300 * time.Millisecond
-	}
+	const pace = 1500 * time.Millisecond
 	edits, above := 12, 0
 	for i := 0; i < edits; i++ {
 		out := mcpEdit(t, l, f, func() { chainBurstEdit(t, f, i) })
@@ -46,7 +68,7 @@ func TestSteppedFoldRunsDuringABurstWithTheDaemonsDefaults(t *testing.T) {
 		if len(c.foldingChain()) > 0 {
 			above++
 		}
-		time.Sleep(pace)
+		awaitCompactorIdle(c, pace)
 	}
 	if err := c.waitDirtyChainCompactions(context.Background()); err != nil {
 		t.Fatal(err)

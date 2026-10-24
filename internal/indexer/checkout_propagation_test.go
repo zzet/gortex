@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 )
@@ -773,8 +775,11 @@ func TestALargeWorkingTreeChangeIsImportedFileByFileAndYieldsToAnInteractiveBuil
 	atPayload := make(chan context.Context, 1)
 	var cycleContext context.Context // used only by the coordinator's cycle goroutine
 	// The coordinator's own loop drives the import, exactly as in the daemon:
-	// each file's cycle signals the next one through the quiet window.
+	// each file's cycle signals the next one through the quiet window. The
+	// window is shortened from the daemon's 300 ms: every link waits it out,
+	// and nothing below depends on its length, only on the cycles it paces.
 	c := f.coordinator(t, CheckoutCoordinatorConfig{
+		Debounce:  10 * time.Millisecond,
 		Gate:      gate,
 		cycleDone: func(out CheckoutCycle) { outcomes <- out },
 		dirtyBarrier: func() {
@@ -1037,6 +1042,9 @@ func TestCommittedBaseAdvancePropagatesLazilyAndReleasesByCopy(t *testing.T) {
 	ctx := context.Background()
 	c, root := f.pinDependent(t, "alpha")
 	c.compaction.quiet = -1
+	// Only the primary moves below; the dependent's tree, once edited, stays
+	// put, so every check of its view reads one whole index of it.
+	oracle := &treeOracle{}
 
 	if first := c.reconcile(ctx); first.Err != nil || !first.CommitBuilt {
 		t.Fatalf("the first cycle did not build the stack: %+v", first)
@@ -1062,7 +1070,7 @@ func TestCommittedBaseAdvancePropagatesLazilyAndReleasesByCopy(t *testing.T) {
 	if now := f.routeOf(t, c.checkoutID); now != before {
 		t.Fatalf("a primary per-save moved the dependent's route: %+v -> %+v", before, now)
 	}
-	assertNeutralViewIsItsOwnTree(t, f, c.checkoutID, root)
+	assertNeutralViewIsItsOwnTree(t, f, c.checkoutID, root, oracle)
 
 	// The primary commits the body edit and publishes it as the new base.
 	builderGit(t, f.primary, "add", "-A")
@@ -1081,7 +1089,7 @@ func TestCommittedBaseAdvancePropagatesLazilyAndReleasesByCopy(t *testing.T) {
 	if n := viewGenerationCount(t, f.store); n != written {
 		t.Fatalf("the pinned cycle wrote %d generations", n-written)
 	}
-	assertNeutralViewIsItsOwnTree(t, f, c.checkoutID, root)
+	assertNeutralViewIsItsOwnTree(t, f, c.checkoutID, root, oracle)
 
 	// The sweep asks for the old base back: the recomposition carries the
 	// chain over by copy.
@@ -1103,7 +1111,7 @@ func TestCommittedBaseAdvancePropagatesLazilyAndReleasesByCopy(t *testing.T) {
 	if claimed := claimedPaths(t, f.store, after.CommitGenerationID); !slices.Contains(claimed, builderRepoPrefix+"/core.go") {
 		t.Errorf("the recomposed commit layer does not re-assert core.go: %v", claimed)
 	}
-	assertNeutralViewIsItsOwnTree(t, f, c.checkoutID, root)
+	assertNeutralViewIsItsOwnTree(t, f, c.checkoutID, root, oracle)
 	if stats := c.PropagationStats(); stats.Pending || stats.Applied != 1 {
 		t.Errorf("the applied rebase is still pending or uncounted: %+v", stats)
 	}
@@ -1130,8 +1138,9 @@ func TestConsecutiveBodyEditsOfOneFileAreChainedDeltas(t *testing.T) {
 	if !previous.DirtyBuilt {
 		t.Fatalf("the working tree's first edit was not built: %+v", previous)
 	}
+	const edits = 10
 	folds := 0
-	for k := 1; k <= 10; k++ {
+	for k := 1; k <= edits; k++ {
 		builderWriteFile(t, f.worktree, "island.go",
 			fmt.Sprintf("package fixture\n\nfunc Island() int {\n\treturn %d\n}\n", k))
 		out := coordinatorReconcile(t, c)
@@ -1159,7 +1168,10 @@ func TestConsecutiveBodyEditsOfOneFileAreChainedDeltas(t *testing.T) {
 		}
 		previous = out
 	}
-	t.Logf("10 edits: 10 chained deltas, %d folds", folds)
+	if folds < 2 {
+		t.Fatalf("%d edits folded the chain %d times, want a fold over a folded chain too", edits, folds)
+	}
+	t.Logf("%d edits: %d chained deltas, %d folds", edits, edits, folds)
 }
 
 // assertPropagationParity is the clean-index oracle for these tests. The
@@ -1197,7 +1209,7 @@ func assertPropagationParity(t *testing.T, store *store_sqlite.Store, chain []in
 // assertNeutralViewIsItsOwnTree is assertViewIsItsOwnTree through the
 // fingerprint-neutral reader: the working-tree builds
 // stamp extraction fingerprints on file nodes that a whole index never writes.
-func assertNeutralViewIsItsOwnTree(t *testing.T, f *committedBaseFixture, checkoutID, root string) {
+func assertNeutralViewIsItsOwnTree(t *testing.T, f *committedBaseFixture, checkoutID, root string, oracle *treeOracle) {
 	t.Helper()
 	materializer := &graphview.Materializer{Store: f.store, Catalog: f.catalog, Leases: f.leases}
 	view, err := materializer.MaterializeCheckout(context.Background(), checkoutID)
@@ -1205,7 +1217,23 @@ func assertNeutralViewIsItsOwnTree(t *testing.T, f *committedBaseFixture, checko
 		t.Fatalf("MaterializeCheckout(%s): %v", checkoutID, err)
 	}
 	defer view.Close()
-	flatStore := builderOpenStore(t, "neutral-oracle-"+filepath.Base(root))
-	builderIndex(t, flatStore, root)
-	builderAssertReadersAgree(t, fingerprintNeutralReader{view.Reader}, fingerprintNeutralReader{flatStore.AtGeneration(0)})
+	builderAssertReadersAgree(t, fingerprintNeutralReader{view.Reader}, fingerprintNeutralReader{oracle.of(t, root)})
+}
+
+// treeOracle is a whole index of one checkout's working tree, reused for as
+// long as the tree holds the content it was indexed from (replayTreeDigest)
+// and rebuilt the moment it does not.
+type treeOracle struct {
+	digest [sha256.Size]byte
+	store  *store_sqlite.Store
+}
+
+func (o *treeOracle) of(t *testing.T, root string) graph.Reader {
+	t.Helper()
+	if digest := replayTreeDigest(t, root); o.store == nil || digest != o.digest {
+		o.store = builderOpenStore(t, "neutral-oracle-"+filepath.Base(root))
+		builderIndex(t, o.store, root)
+		o.digest = digest
+	}
+	return o.store.AtGeneration(0)
 }

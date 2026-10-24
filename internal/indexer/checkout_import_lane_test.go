@@ -160,6 +160,7 @@ func TestRefusedImportReentersAndKeepsSparseFallbackInTheLane(t *testing.T) {
 }
 
 func TestDetachedImportRejectsMovedInputsAndReleasesOnStop(t *testing.T) {
+	requireTrustedChangeStampsUpFront(t)
 	oldPaths := importInteractivePaths
 	importInteractivePaths = 2
 	t.Cleanup(func() { importInteractivePaths = oldPaths })

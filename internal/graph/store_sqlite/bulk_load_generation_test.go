@@ -701,6 +701,13 @@ func TestScheduledWALDrainDefersRatherThanWaitingForever(t *testing.T) {
 
 func TestMaintenanceCheckpointAndBulkWindowsRaceSelection(t *testing.T) {
 	t.Setenv("GORTEX_SQLITE_WAL_AUTOCHECKPOINT_PAGES", "64")
+	// No build publishes here, so when the last window ends owing a drain
+	// (whether it does depends on the interleaving) the lane settles only at
+	// the delayed wake (TestGenerationWindowOwedDrainWakesWithoutAPublication):
+	// 30 s by default. Restored after Close.
+	previousDelay := generationDrainWakeDelay
+	generationDrainWakeDelay = 100 * time.Millisecond
+	t.Cleanup(func() { generationDrainWakeDelay = previousDelay })
 	store, _ := openTempStore(t)
 	nodes, edges := bulkFixture(512, 512)
 	store.AddBatch(nodes, edges)

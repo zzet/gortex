@@ -14,6 +14,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/semantic/goanalysis"
 )
@@ -38,9 +39,26 @@ func goTypesManager(t testing.TB) *semantic.Manager {
 
 // builderIndexSemantic is builderIndex with the go/types pass enabled.
 func builderIndexSemantic(mgr *semantic.Manager) func(testing.TB, *store_sqlite.Store, string) {
+	return semanticIndexOver(mgr, builderRegistry)
+}
+
+// builderNewBuilderOver is builderNewBuilder with the parser registry built by
+// registry.
+func builderNewBuilderOver(store *store_sqlite.Store, registry func() *parser.Registry) *SparseGenerationBuilder {
+	return &SparseGenerationBuilder{
+		Store:    store,
+		Registry: registry(),
+		Config:   config.Default().Index,
+		Logger:   zap.NewNop(),
+	}
+}
+
+// semanticIndexOver is builderIndexSemantic with the parser registry built by
+// registry; a nil mgr makes it builderIndex over that registry.
+func semanticIndexOver(mgr *semantic.Manager, registry func() *parser.Registry) func(testing.TB, *store_sqlite.Store, string) {
 	return func(t testing.TB, store *store_sqlite.Store, dir string) {
 		t.Helper()
-		idx := New(store, builderRegistry(), config.Default().Index, zap.NewNop())
+		idx := New(store, registry(), config.Default().Index, zap.NewNop())
 		defer idx.Close()
 		idx.SetRepoPrefix(builderRepoPrefix)
 		idx.SetWorkspaceID(builderRepoPrefix)
@@ -67,10 +85,29 @@ func semanticChainFixture(t *testing.T, tree map[string]string) (*coordinatorFix
 // reference load (SparseGenerationBuilder.wholeModuleCompilerLoad).
 func semanticChainFixtureWith(t *testing.T, tree map[string]string, handleRoots bool) (*coordinatorFixture, *CheckoutCoordinator, *semantic.Manager) {
 	t.Helper()
+	return semanticChainFixtureOver(t, tree, handleRoots, builderRegistry)
+}
+
+// semanticGoChainFixture is semanticChainFixtureWith with a Go-only parser
+// registry for the base corpus and the builder; pair it with
+// assertGoSemanticParity, whose clean index uses the same registry. Every tree
+// these tests build is Go source plus go.mod, which the indexer reads without
+// a registry extractor, so both registries index it to the same graph — and
+// the Go-only one skips compiling every other language's queries, about a
+// third of a second per registry.
+func semanticGoChainFixture(t *testing.T, tree map[string]string, handleRoots bool) (*coordinatorFixture, *CheckoutCoordinator, *semantic.Manager) {
+	t.Helper()
+	return semanticChainFixtureOver(t, tree, handleRoots, builderGoRegistry)
+}
+
+// semanticChainFixtureOver is semanticChainFixtureWith with the parser
+// registry the base index and the builder use built by registry.
+func semanticChainFixtureOver(t *testing.T, tree map[string]string, handleRoots bool, registry func() *parser.Registry) (*coordinatorFixture, *CheckoutCoordinator, *semantic.Manager) {
+	t.Helper()
 	t.Setenv("GORTEX_ENRICH_MIN_NODES", "16")
 	mgr := goTypesManager(t)
-	f := newCoordinatorFixtureIndexedBy(t, tree, builderIndexSemantic(mgr))
-	builder := builderNewBuilder(f.store)
+	f := newCoordinatorFixtureIndexedBy(t, tree, semanticIndexOver(mgr, registry))
+	builder := builderNewBuilderOver(f.store, registry)
 	builder.Semantic = mgr
 	builder.wholeModuleCompilerLoad = !handleRoots
 	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{Builder: builder})
@@ -206,14 +243,47 @@ func assertSemanticParity(t *testing.T, f *coordinatorFixture, mgr *semantic.Man
 	}
 }
 
+// assertGoSemanticParity is assertSemanticParity for a semanticGoChainFixture:
+// the clean index uses the same Go-only registry.
+func assertGoSemanticParity(t *testing.T, f *coordinatorFixture, mgr *semantic.Manager, label string) {
+	t.Helper()
+	for _, diff := range semanticParityDiffsAgainst(t, f, semanticOracleOf(t, f, mgr, label, builderGoRegistry), label) {
+		t.Error(diff)
+	}
+}
+
 // semanticParityDiffs is assertSemanticParity returning the differences
 // instead of failing, for tests that document a known gap.
 func semanticParityDiffs(t *testing.T, f *coordinatorFixture, mgr *semantic.Manager, label string) []string {
 	t.Helper()
+	return semanticParityDiffsAgainst(t, f, semanticOracleOf(t, f, mgr, label, builderRegistry), label)
+}
+
+// semanticOracle is what a served view is held against: a clean semantic
+// index of a worktree and a direct whole-module compiler pass's binding rows
+// for it. It depends only on the worktree's content, so two fixtures whose
+// worktrees hold the same tree can share one.
+type semanticOracle struct {
+	clean    *store_sqlite.Store
+	bindings []string
+}
+
+// semanticOracleOf builds the oracle for f's worktree as it is now, indexing
+// with the parser registry built by registry.
+func semanticOracleOf(t *testing.T, f *coordinatorFixture, mgr *semantic.Manager, label string, registry func() *parser.Registry) semanticOracle {
+	t.Helper()
+	clean := builderOpenStore(t, "semantic-clean-"+label)
+	semanticIndexOver(mgr, registry)(t, clean, f.worktree)
+	return semanticOracle{clean: clean, bindings: semanticReferenceBindingRows(t, f, label)}
+}
+
+// semanticParityDiffsAgainst is semanticParityDiffs against an oracle already
+// built for a worktree holding the same tree as f's.
+func semanticParityDiffsAgainst(t *testing.T, f *coordinatorFixture, oracle semanticOracle, label string) []string {
+	t.Helper()
 	view := chainMaterialize(t, f)
 	defer view.Close()
-	clean := builderOpenStore(t, "semantic-clean-"+label)
-	builderIndexSemantic(mgr)(t, clean, f.worktree)
+	clean := oracle.clean
 
 	var diffs []string
 	add := func(diff string) {
@@ -253,7 +323,7 @@ func semanticParityDiffs(t *testing.T, f *coordinatorFixture, mgr *semantic.Mana
 		composed = append(kept, parityRows(t, db, bindings, generationID)...)
 	}
 	slices.Sort(composed)
-	reference := semanticReferenceBindingRows(t, f, label)
+	reference := oracle.bindings
 	var want []string
 	claimedWithRows := 0
 	for _, row := range reference {
@@ -327,7 +397,7 @@ func TestDirtyChainChildRunsSemanticEnrichment(t *testing.T) {
 	// compares real rows: a generation that writes the whole repository's
 	// rows instead of its own files' duplicates every unmasked file's rows in
 	// the file-keyed composition.
-	f, c, mgr := semanticChainFixtureWith(t, semanticBindingTree(), false)
+	f, c, mgr := semanticGoChainFixture(t, semanticBindingTree(), false)
 	coordinatorReconcile(t, c)
 
 	// The whole-module load of this checkout: 20 one-file packages and one
@@ -354,7 +424,7 @@ func TestDirtyChainChildRunsSemanticEnrichment(t *testing.T) {
 			root, root.DirtyWork.CompilerContext)
 	}
 	assertCounter("root", root.DirtyWork)
-	assertSemanticParity(t, f, mgr, "root")
+	assertGoSemanticParity(t, f, mgr, "root")
 
 	// Chained single-file edits: each child is a handful of nodes, and still
 	// runs the pass, because the working-tree state it describes clears the
@@ -381,6 +451,6 @@ func TestDirtyChainChildRunsSemanticEnrichment(t *testing.T) {
 		if n := semanticGenerationBindingRows(t, f, out.DirtyGenerationID); n == 0 {
 			t.Errorf("chained edit %d: the generation wrote no binding rows; the oracle's binding half is vacuous", k)
 		}
-		assertSemanticParity(t, f, mgr, fmt.Sprintf("chained-%d", k))
+		assertGoSemanticParity(t, f, mgr, fmt.Sprintf("chained-%d", k))
 	}
 }

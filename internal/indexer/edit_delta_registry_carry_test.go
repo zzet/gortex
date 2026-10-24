@@ -29,8 +29,10 @@ func TestEditDeltaRegistryIsCarriedForwardExactly(t *testing.T) {
 	builderWriteTree(t, repoDir, chainOverlayTree())
 	builderGit(t, repoDir, "add", "-A")
 	builderGit(t, repoDir, "commit", "-q", "-m", "base")
-	builderIndex(t, store, repoDir)
-	builder := builderNewBuilder(store)
+	// The tree is Go and TypeScript only: the base, the builder and every
+	// clean index go through goTSRegistry (see indexWithRegistry).
+	indexWithRegistry(t, store, repoDir, goTSRegistry())
+	builder := builderWithRegistry(store, goTSRegistry())
 	h := newDirtyChainBuilder(t, builder, store, repoDir, true)
 	h.compact = false
 	const commit = int64(1) << 40
@@ -124,7 +126,7 @@ func TestEditDeltaRegistryIsCarriedForwardExactly(t *testing.T) {
 		// published view (what an uncached delta reads) must hold the same
 		// records.
 		clean := builderOpenStore(t, "registry-clean-"+edit.name)
-		builderIndex(t, clean, repoDir)
+		indexWithRegistry(t, clean, repoDir, goTSRegistry())
 		var want []contracts.Contract
 		if reg := contracts.LoadRegistryFromGraphWithScope(clean, builderRepoPrefix, builderRepoPrefix, builderRepoPrefix); reg != nil {
 			want = reg.ByRepo(builderRepoPrefix)

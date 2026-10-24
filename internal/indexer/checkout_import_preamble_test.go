@@ -64,6 +64,7 @@ func TestImportPreambleKeepsLegacyAndUnsupportedEvidenceInTheLane(t *testing.T) 
 }
 
 func TestImportPreambleRetainsAncestryAndRefusesMovedInputs(t *testing.T) {
+	requireTrustedChangeStampsUpFront(t)
 	oldPaths := importInteractivePaths
 	importInteractivePaths = 2
 	t.Cleanup(func() { importInteractivePaths = oldPaths })

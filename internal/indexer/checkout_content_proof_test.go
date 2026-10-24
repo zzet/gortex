@@ -124,6 +124,27 @@ func requireTrustedChangeStamps(t *testing.T, sampler *gitstate.DirtySampler) {
 	}
 }
 
+// requireTrustedChangeStampsUpFront is requireTrustedChangeStamps asked before
+// a test builds its fixture, so a platform without trusted change stamps
+// (Windows among them) skips without first paying for a family, a corpus index
+// and the coordinator's cycles. The verdict is the filesystem's
+// (changeStampsTrusted asks the checkout root's filesystem type), so a probe
+// checkout under the same temporary root gets the fixture's own; the test
+// still asks again on its fixture's sampler, which is then the check that
+// counts.
+func requireTrustedChangeStampsUpFront(t *testing.T) {
+	t.Helper()
+	builderIsolateGit(t)
+	dir := builderTempDir(t, "change-stamp-probe")
+	builderGit(t, dir, "init", "--initial-branch=main")
+	builderGit(t, dir, "commit", "--allow-empty", "-m", "probe")
+	sampler, err := gitstate.NewDirtySampler(dir, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireTrustedChangeStamps(t, sampler)
+}
+
 // trustedChangeStamps reports whether the checkout's filesystem gives change
 // stamps the sampler trusts; any unconfirmed verdict other than the
 // platform's fails the test.
@@ -201,6 +222,7 @@ func (x *contentProofFixture) node(generation int64, id string) bool {
 // helper.go as sampled — and the publication signals the next cycle itself,
 // which publishes the saved state.
 func TestASaveAfterTheParseIsPublishedAsTheBuildsSample(t *testing.T) {
+	requireTrustedChangeStampsUpFront(t)
 	var (
 		mu       sync.Mutex
 		before   gitstate.DirtySnapshot
@@ -380,6 +402,7 @@ func TestASaveAfterTheParseWithoutChangeStampsTearsAndPublishesTheSave(t *testin
 // bytes and publishes its sample, and the ticket admitted before that sample
 // is answered by that publication, not left for the next cycle.
 func TestTwentyProofsDuringABuildDoNotTearItOrStrandItsTicket(t *testing.T) {
+	requireTrustedChangeStampsUpFront(t)
 	var (
 		x      *contentProofFixture
 		proofs atomic.Int32
@@ -492,6 +515,7 @@ func TestASaveBeforeTheParseTearsTheBuild(t *testing.T) {
 // answered by the sample's publication, although the late ticket's fence
 // sampled the newer state after it.
 func TestATicketAdmittedAfterTheSampleWaitsForTheNextPublication(t *testing.T) {
+	requireTrustedChangeStampsUpFront(t)
 	var (
 		x       *contentProofFixture
 		late    atomic.Pointer[CheckoutRefreshTicket]

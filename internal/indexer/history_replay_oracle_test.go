@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -306,6 +307,46 @@ func replayUndoAll(o *replayOriginals) replayStep {
 	}}
 }
 
+// replayTreeDigest identifies root's working tree by content: every path
+// under it but git's own metadata, with its bytes. Two roots with one digest
+// hold the same tree, so one whole index answers for both.
+func replayTreeDigest(t testing.TB, root string) [sha256.Size]byte {
+	t.Helper()
+	h := sha256.New()
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Name() == ".git" {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			fmt.Fprintf(h, "dir %s\x00", filepath.ToSlash(rel))
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(h, "file %s %d\x00", filepath.ToSlash(rel), len(data))
+		h.Write(data)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("digest the working tree at %s: %v", root, err)
+	}
+	var key [sha256.Size]byte
+	copy(key[:], h.Sum(nil))
+	return key
+}
+
 // --- the comparison ------------------------------------------------------
 
 type replayRowKey [16]byte
@@ -599,7 +640,15 @@ func E() string {
 // oracle: every step through the coordinator, in three arms — chained deltas
 // compacted at the depth bound, a chain folded by copy after every edit, and
 // every multi-file change imported file by file.
+//
+// The three arms walk the same steps over the same tree, so each step's
+// working tree is byte-identical in all of them, and a whole index of a tree
+// is row-for-row reproducible wherever the tree sits on disk. The whole index
+// of each distinct working tree is therefore built once and compared against
+// every arm that reaches it, rather than rebuilt per arm.
 func TestHistoryReplayMatchesAWholeIndexAfterEveryStep(t *testing.T) {
+	cleanByTree := map[[sha256.Size]byte]graph.Reader{}
+	parent := t
 	arms := []struct {
 		name        string
 		foldPaths   int
@@ -622,8 +671,14 @@ func TestHistoryReplayMatchesAWholeIndexAfterEveryStep(t *testing.T) {
 			c.compaction.quiet = -1
 			coordinatorReconcile(t, c)
 			h := &replayHarness{f: f, c: c, sampleLimit: 40, clean: func(t *testing.T, label string) (graph.Reader, func()) {
-				store := builderOpenStore(t, label)
+				key := replayTreeDigest(t, f.worktree)
+				if clean, ok := cleanByTree[key]; ok {
+					return clean, nil
+				}
+				// Opened on the parent, so later arms can still read it.
+				store := builderOpenStore(parent, label)
 				builderIndex(t, store, f.worktree)
+				cleanByTree[key] = store
 				return store, nil
 			}}
 			records := h.run(t, replayFixtureSteps(newReplayOriginals(f.worktree)))

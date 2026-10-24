@@ -170,7 +170,12 @@ func TestReadFamilyBaselineBlocksLaterRetrievalCredit(t *testing.T) {
 // repo have each genuinely avoided their own reads, so the second session must
 // be credited even though the first already surfaced the same files.
 func TestRetrievalSavingsCreditIsPerSession(t *testing.T) {
-	srv, store, _ := newRetrievalSavingsServer(t, 2)
+	// Three files, not two. The page ships 20 JSON hits, each carrying the
+	// fixture's absolute temp path, so a two-file repo leaves a page nearly as
+	// large as the two whole files it stands in for: about 1% headroom, which a
+	// longer temp directory or MkdirTemp suffix wipes out, and the credit
+	// clamps to zero. Three cited files leave a whole file's worth of headroom.
+	srv, store, _ := newRetrievalSavingsServer(t, 3)
 	args := map[string]any{"operation": "symbols", "query": "Widget"}
 
 	first := callToolByName(t, srv, WithSessionID(context.Background(), "A"), "search", args)

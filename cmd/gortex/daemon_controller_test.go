@@ -211,51 +211,9 @@ func (s *supersedingCounterStore) ReconcileRepoCounters(scanned map[string]graph
 	}).ReconcileRepoCounters(scanned)
 }
 
-// TestControllerEnrichReportsASupersededRunAsLanded is the CLI door's half of
-// the settlement contract, and it closes the failure mode this door invented.
-//
-// Both doors — `gortex enrich blame` here and `analyze kind=blame` on the tool
-// surface — admit through ONE authority with ONE owner key per (producer,
-// corpus), deliberately: that is why the producer names are shared exported
-// constants. So an agent's blame run concurrent with a git hook's
-// `gortex enrich blame` supersedes one of the two every time. The producer
-// stamps as it goes and has written everything it is going to write before it
-// settles, so that is an ordering statement — the same one the tool surface
-// reports as `superseded: true` beside its counts.
-//
-// This door used to turn it into `enrich <prefix>: … superseded` AND discard
-// `combined` for every repository it had already enriched. Pre-item the error
-// could not occur at all, so it was a failure mode introduced by naming the
-// output.
-//
-// Revert-red: with `if err := out.Complete(); err != nil { return
-// daemon.EnrichBlameResult{}, … }` back, EnrichBlame returns an error and both
-// assertions below fail.
-func TestControllerEnrichReportsASupersededRunAsLanded(t *testing.T) {
-	ctx := context.Background()
-	c, mi, _, dir := buildCatalogController(t)
-	prefix, root := trackEnrichRepo(t, c, dir, "superseded-blame")
-
-	authority := mi.ResolvedOutputGenerationAuthority()
-	require.NotNil(t, authority)
-	rival := &supersedingEnrichStore{
-		Store:     c.graph,
-		authority: authority,
-		producer:  gortexmcp.EnrichProducerBlame,
-		targets:   []enrichTarget{{prefix: prefix, root: root}},
-	}
-	c.graph = rival
-
-	res, err := c.EnrichBlame(ctx, daemon.EnrichBlameParams{Path: prefix})
-	require.NoError(t, err,
-		"a superseded enrichment was reported as a failed one; its stamps are already on the graph")
-	require.True(t, rival.fired.Load(), "the rival never ran; the producer did not read the store")
-	require.True(t, res.Superseded,
-		"the result does not say a newer run took the output over")
-}
-
 // TestControllerEnrichKeepsTheRepositoriesItAlreadyEnriched is the second half
-// of the same defect: the hard return sat INSIDE the per-repository loop, so a
+// of the defect TestEveryControllerEnrichDoorReportsASupersededRunAsLanded
+// pins door by door: the hard return sat INSIDE the per-repository loop, so a
 // supersession on the first repository threw away the counts of every
 // repository the run had already finished — and skipped the ones after it.
 //
@@ -622,7 +580,19 @@ func trackCoupledEnrichRepo(t *testing.T, c *realController, dir, name string) (
 }
 
 // TestEveryControllerEnrichDoorReportsASupersededRunAsLanded is the
-// door-by-door pin behind the one settlement rule the enrich doors share.
+// door-by-door pin behind the one settlement rule the enrich doors share, the
+// CLI half of the settlement contract.
+//
+// Both doors of a producer — `gortex enrich blame` here and `analyze
+// kind=blame` on the tool surface — admit through ONE authority with ONE owner
+// key per (producer, corpus), deliberately: that is why the producer names are
+// shared exported constants. So an agent's blame run concurrent with a git
+// hook's `gortex enrich blame` supersedes one of the two every time. The
+// producer stamps as it goes and has written everything it is going to write
+// before it settles, so that is an ordering statement — the same one the tool
+// surface reports as `superseded: true` beside its counts. Before the output
+// was named the error could not occur at all, so it was a failure mode
+// introduced by naming the output.
 //
 // The five doors are textually identical and each one was independently
 // capable of the defect: `if err := out.Complete(); err != nil { return

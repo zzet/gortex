@@ -20,15 +20,32 @@ type orderedStore struct {
 	graph.Store
 	nodeScans, edgeScans atomic.Int64
 	rows                 atomic.Int64
-	perRow               time.Duration
+	perRow               atomic.Int64 // time.Duration a row costs; 0 = full speed
 }
 
-func (o *orderedStore) spin() {
+// rowSchedule paces one scan's rows to perRow each on average. A row waits
+// for its slot on the scan's schedule rather than for perRow after the row
+// before it: the monotonic clock is coarse on some platforms (Windows reads
+// it once per timer interrupt, every 0.5 to 15.6 ms), where a per-row wait
+// lasts a whole tick instead of perRow. A row more than rowScheduleSlack
+// behind its slot (the scan was descheduled or parked) restarts the schedule
+// rather than bursting through the rows it is owed.
+type rowSchedule struct{ due time.Time }
+
+const rowScheduleSlack = 50 * time.Millisecond
+
+func (o *orderedStore) spin(s *rowSchedule) {
 	o.rows.Add(1)
-	if o.perRow <= 0 {
+	perRow := time.Duration(o.perRow.Load())
+	if perRow <= 0 {
 		return
 	}
-	for start := time.Now(); time.Since(start) < o.perRow; {
+	now := time.Now()
+	if s.due.IsZero() || now.Sub(s.due) > rowScheduleSlack {
+		s.due = now
+	}
+	s.due = s.due.Add(perRow)
+	for time.Now().Before(s.due) {
 	}
 }
 
@@ -40,8 +57,9 @@ func (o *orderedStore) NodesLightSeq() iter.Seq[*graph.Node] {
 			nodes = append(nodes, n)
 		}
 		sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+		var schedule rowSchedule
 		for _, n := range nodes {
-			o.spin()
+			o.spin(&schedule)
 			if !yield(n) {
 				return
 			}
@@ -69,8 +87,9 @@ func (o *orderedStore) EdgesLightSeq(kinds ...graph.EdgeKind) iter.Seq[*graph.Ed
 			}
 			return a.Line < b.Line
 		})
+		var schedule rowSchedule
 		for _, e := range edges {
-			o.spin()
+			o.spin(&schedule)
 			if !yield(e) {
 				return
 			}
@@ -214,12 +233,14 @@ func TestCallRefProjectionKeepsNoPartialRecord(t *testing.T) {
 // parkLatency runs analyze over a slowed store at GOMAXPROCS=1, raises the
 // yield predicate once the scan is under way, and returns how long the pass
 // took to park, and how many rows it read while it should have been parked.
+// Once the parked window is measured the store runs at full speed: the rest
+// of the pass is not observed.
 func parkLatency(t *testing.T, analyze func(graph.Store, *Pace)) (time.Duration, int64, int64, int64) {
 	t.Helper()
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
 	store := projectionFixture(3000)
-	store.perRow = 20 * time.Microsecond
+	store.perRow.Store(int64(20 * time.Microsecond))
 	var editing atomic.Bool
 	var predicateChecks atomic.Int64
 	pace := NewPace(func() bool { predicateChecks.Add(1); return editing.Load() })
@@ -257,6 +278,7 @@ func parkLatency(t *testing.T, analyze func(graph.Store, *Pace)) (time.Duration,
 	rowsAtPark := at.rows
 	time.Sleep(200 * time.Millisecond)
 	moved := store.rows.Load() - rowsAtPark
+	store.perRow.Store(0)
 	editing.Store(false)
 	select {
 	case <-done:

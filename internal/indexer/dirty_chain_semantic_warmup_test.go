@@ -13,7 +13,7 @@ import (
 // listed is then a closure hit (no go command) with parity against a clean
 // semantic index.
 func TestDirtyChainSemanticTypecheckCacheWarmupServesFirstEdit(t *testing.T) {
-	f, c, mgr := semanticChainFixtureWith(t, semanticBindingTree(), true)
+	f, c, mgr := semanticGoChainFixture(t, semanticBindingTree(), true)
 	coordinatorReconcile(t, c)
 	for i := 0; i < 8; i++ {
 		semanticWriteUnit(t, f.worktree, accumulatedDirtyIndependent, i, true)
@@ -22,7 +22,9 @@ func TestDirtyChainSemanticTypecheckCacheWarmupServesFirstEdit(t *testing.T) {
 	if root.DirtyParentGenerationID != 0 {
 		t.Fatalf("the chain root = %+v, want a direct build", root)
 	}
-	assertSemanticParity(t, f, mgr, "warmup-root")
+	// This root (fixture, load and dirty units) is the one
+	// TestDirtyChainSemanticTypecheckCacheParity holds against a clean index
+	// (cached-root); what is new here is the edit after the warm-up.
 
 	var provider *goanalysis.Provider
 	for _, p := range mgr.AllProviders() {
@@ -70,5 +72,5 @@ func TestDirtyChainSemanticTypecheckCacheWarmupServesFirstEdit(t *testing.T) {
 	if n := semanticGenerationBindingRows(t, f, out.DirtyGenerationID); n == 0 {
 		t.Error("the generation wrote no binding rows; the binding oracle is vacuous")
 	}
-	assertSemanticParity(t, f, mgr, "warmup-first-edit")
+	assertGoSemanticParity(t, f, mgr, "warmup-first-edit")
 }

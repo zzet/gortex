@@ -88,58 +88,68 @@ func callCheckoutPrimitive(
 func TestCheckoutSourcePrimitivesHonorDryRunAndIsolateDiskWrites(t *testing.T) {
 	for _, tool := range []string{"edit_file", "write_file"} {
 		for _, selection := range []string{"cwd", "explicit"} {
-			for _, dryRun := range []bool{true, false} {
-				name := tool + "/" + selection + "/write"
-				if dryRun {
-					name = tool + "/" + selection + "/dry_run"
-				}
-				t.Run(name, func(t *testing.T) {
-					stack := newViewStack(t)
-					primaryFile := filepath.Join(stack.repoRoot, "edit.go")
-					primaryBefore, err := os.ReadFile(primaryFile)
-					require.NoError(t, err)
-					worktreeFile := filepath.Join(stack.worktreeRoot, "edit.go")
-					require.NoError(t, os.WriteFile(worktreeFile, []byte(primitiveWorktreeSource), 0o644))
-					mutation := &primitiveCheckoutMutation{cycle: indexer.CheckoutCycle{
-						CommitGenerationID: stack.commit,
-						DirtyGenerationID:  stack.dirty,
-					}}
-					cwd := stack.worktreeRoot
-					var viewArgs map[string]any
-					if selection == "explicit" {
-						cwd = stack.repoRoot
-						viewArgs = worktreeViewArgs()
-					}
-					const changed = "package repo\n\nfunc AfterCheckoutEdit() {}\n"
-					args := map[string]any{"path": "repo/edit.go", "dry_run": dryRun}
-					if tool == "edit_file" {
-						args["old_string"] = "func New() {}"
-						args["new_string"] = "func AfterCheckoutEdit() {}"
-					} else {
-						args["content"] = changed
-					}
-					res := callCheckoutPrimitive(t, stack, cwd, viewArgs, tool, args, mutation)
-					require.False(t, res.IsError, viewResultText(t, res))
-					payload := decodeFileOpsResult(t, res)
-					gotPrimary, err := os.ReadFile(primaryFile)
-					require.NoError(t, err)
-					require.Equal(t, primaryBefore, gotPrimary, "the canonical checkout must not be edited")
-					gotWorktree, err := os.ReadFile(worktreeFile)
-					require.NoError(t, err)
+			// The preview runs first and must leave the fixture exactly as it
+			// found it (asserted below), so the real write that follows reuses
+			// the same stack instead of indexing a second one.
+			t.Run(tool+"/"+selection, func(t *testing.T) {
+				stack := newViewStack(t)
+				primaryFile := filepath.Join(stack.repoRoot, "edit.go")
+				primaryBefore, err := os.ReadFile(primaryFile)
+				require.NoError(t, err)
+				worktreeFile := filepath.Join(stack.worktreeRoot, "edit.go")
+				require.NoError(t, os.WriteFile(worktreeFile, []byte(primitiveWorktreeSource), 0o644))
+				const changed = "package repo\n\nfunc AfterCheckoutEdit() {}\n"
+				for _, dryRun := range []bool{true, false} {
+					name := "write"
 					if dryRun {
-						require.Equal(t, primitiveWorktreeSource, string(gotWorktree))
-						require.Zero(t, mutation.prepared, "preview must not invalidate the checkout route")
-						require.Zero(t, mutation.refreshed, "preview must not rebuild the checkout")
-						require.Equal(t, true, payload["dry_run"])
-						require.Equal(t, false, payload["reindexed"])
-					} else {
-						require.Equal(t, changed, string(gotWorktree))
-						require.Equal(t, 1, mutation.prepared)
-						require.Equal(t, 1, mutation.refreshed)
-						require.Equal(t, true, payload["reindexed"])
+						name = "dry_run"
 					}
-				})
-			}
+					t.Run(name, func(t *testing.T) {
+						// Fresh per request: the middleware consumes the view
+						// selector out of the arguments it is handed.
+						cwd := stack.worktreeRoot
+						var viewArgs map[string]any
+						if selection == "explicit" {
+							cwd = stack.repoRoot
+							viewArgs = worktreeViewArgs()
+						}
+						gotWorktree, err := os.ReadFile(worktreeFile)
+						require.NoError(t, err)
+						require.Equal(t, primitiveWorktreeSource, string(gotWorktree), "precondition: the worktree file is unedited")
+						mutation := &primitiveCheckoutMutation{cycle: indexer.CheckoutCycle{
+							CommitGenerationID: stack.commit,
+							DirtyGenerationID:  stack.dirty,
+						}}
+						args := map[string]any{"path": "repo/edit.go", "dry_run": dryRun}
+						if tool == "edit_file" {
+							args["old_string"] = "func New() {}"
+							args["new_string"] = "func AfterCheckoutEdit() {}"
+						} else {
+							args["content"] = changed
+						}
+						res := callCheckoutPrimitive(t, stack, cwd, viewArgs, tool, args, mutation)
+						require.False(t, res.IsError, viewResultText(t, res))
+						payload := decodeFileOpsResult(t, res)
+						gotPrimary, err := os.ReadFile(primaryFile)
+						require.NoError(t, err)
+						require.Equal(t, primaryBefore, gotPrimary, "the canonical checkout must not be edited")
+						gotWorktree, err = os.ReadFile(worktreeFile)
+						require.NoError(t, err)
+						if dryRun {
+							require.Equal(t, primitiveWorktreeSource, string(gotWorktree))
+							require.Zero(t, mutation.prepared, "preview must not invalidate the checkout route")
+							require.Zero(t, mutation.refreshed, "preview must not rebuild the checkout")
+							require.Equal(t, true, payload["dry_run"])
+							require.Equal(t, false, payload["reindexed"])
+						} else {
+							require.Equal(t, changed, string(gotWorktree))
+							require.Equal(t, 1, mutation.prepared)
+							require.Equal(t, 1, mutation.refreshed)
+							require.Equal(t, true, payload["reindexed"])
+						}
+					})
+				}
+			})
 		}
 	}
 }

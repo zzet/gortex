@@ -95,16 +95,28 @@ func assertNeverServed(t *testing.T, f *coordinatorFixture, damaged []int64) {
 // No reader is served a fold that has not passed the exact check: at the
 // cap, a copy damaged in each of four ways is refused before publication and
 // the edit builds direct. Override, named: background compactions closed (no
-// fold runs, so the edit meets the cap); the copy seam damages the fold.
+// fold runs, so the edit meets the cap); the copy seam damages the fold. The
+// four cases share one checkout: each drives the chain to the cap again from
+// the direct build the case before it left, and asserts it got there.
 func TestInlineFoldAtTheCapIsNeverServedUnchecked(t *testing.T) {
+	f, c, l := mcpChainFixture(t, builderTreeA(), false)
+	next, depth := 0, 0 // the next burst edit; the routed chain's depth
 	for _, damage := range foldCorruptions() {
 		t.Run(damage.name, func(t *testing.T) {
-			f, c, l := mcpChainFixture(t, builderTreeA(), false)
-			mcpChainAtTheCap(t, f, l)
+			for depth < maxChainWalkDepth {
+				out := mcpEdit(t, l, f, func() { chainBurstEdit(t, f, next) })
+				next++
+				if out.DirtyChainDepth != depth+1 {
+					t.Fatalf("the edit at depth %d built at depth %d (%s), want a child of the chain", depth, out.DirtyChainDepth, out.DirtyChainReason)
+				}
+				depth = out.DirtyChainDepth
+			}
 			damaged := corruptEveryFold(t, f, c, damage.damage)
-			at := mcpEdit(t, l, f, func() { chainBurstEdit(t, f, maxChainWalkDepth) })
-			if at.DirtyParentGenerationID != 0 {
-				t.Fatalf("the edit stands on %d after a damaged fold, want a direct build (%s)", at.DirtyParentGenerationID, at.DirtyChainReason)
+			at := mcpEdit(t, l, f, func() { chainBurstEdit(t, f, next) })
+			next++
+			depth = at.DirtyChainDepth
+			if at.DirtyParentGenerationID != 0 || at.DirtyChainDepth != 1 {
+				t.Fatalf("the edit stands on %d at depth %d after a damaged fold, want a direct build (%s)", at.DirtyParentGenerationID, at.DirtyChainDepth, at.DirtyChainReason)
 			}
 			if err := c.waitDirtyChainCompactions(context.Background()); err != nil {
 				t.Fatal(err)
@@ -117,14 +129,19 @@ func TestInlineFoldAtTheCapIsNeverServedUnchecked(t *testing.T) {
 // The background fold is published and routed only after its check has
 // passed: a copy damaged in each of four ways is refused, and the chain
 // stays routed. Override, named: background compactions closed (the fold is
-// run by hand); the copy seam damages the fold.
+// run by hand); the copy seam damages the fold. The four cases fold the same
+// chain one after another: a refused fold leaves the route on that chain,
+// which each case asserts before and after its fold.
 func TestSteppedFoldIsNeverServedUnchecked(t *testing.T) {
+	f, c, l := mcpChainFixture(t, builderTreeA(), false)
+	var trigger CheckoutCycle
+	for i := 0; i < dirtyChainCompactionDepth; i++ {
+		trigger = mcpEdit(t, l, f, func() { chainBurstEdit(t, f, i) })
+	}
 	for _, damage := range foldCorruptions() {
 		t.Run(damage.name, func(t *testing.T) {
-			f, c, l := mcpChainFixture(t, builderTreeA(), false)
-			var trigger CheckoutCycle
-			for i := 0; i < dirtyChainCompactionDepth; i++ {
-				trigger = mcpEdit(t, l, f, func() { chainBurstEdit(t, f, i) })
+			if f.route().DirtyGenerationID != trigger.DirtyGenerationID {
+				t.Fatalf("the route is on %d before the fold, want the chain topped by %d", f.route().DirtyGenerationID, trigger.DirtyGenerationID)
 			}
 			damaged := corruptEveryFold(t, f, c, damage.damage)
 			report := c.compactDirtyChain(context.Background(), trigger)

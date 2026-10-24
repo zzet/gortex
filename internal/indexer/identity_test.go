@@ -341,60 +341,61 @@ func TestPropertyRepoPrefixDerivation(t *testing.T) {
 // Feature: multi-repo-support, Property 12: Duplicate identity detection (last-wins)
 // TestPropertyDuplicateIdentityDetection verifies that DeduplicateRepos keeps
 // the last occurrence when duplicate paths exist and emits warnings.
+//
+// The property's only structural input is how many unique entries sit between
+// the two occurrences of the duplicated path, zero to three, so the cases
+// enumerate that range instead of sampling it. DeduplicateRepos runs one git
+// process per entry, and a hundred random draws over those four shapes paid for
+// each of them about twenty-five times.
 func TestPropertyDuplicateIdentityDetection(t *testing.T) {
-	tmpDir := t.TempDir()
-	rapid.Check(t, func(rt *rapid.T) {
-		// Use a per-iteration subdirectory so iterations don't collide.
-		iterDir := filepath.Join(tmpDir, fmt.Sprintf("iter%d", rapid.IntRange(0, 999999).Draw(rt, "iter")))
-		require.NoError(rt, os.MkdirAll(iterDir, 0755))
+	for numUnique := 0; numUnique <= 3; numUnique++ {
+		t.Run(fmt.Sprintf("%d unique entries between", numUnique), func(t *testing.T) {
+			iterDir := t.TempDir()
 
-		// Generate a unique repo directory that will be duplicated.
-		dupName := genAlphaNum(3, 10).Draw(rt, "dupName")
-		dupPath := filepath.Join(iterDir, dupName)
-		require.NoError(rt, os.MkdirAll(dupPath, 0755))
+			// The directory that will be duplicated.
+			dupName := "dup"
+			dupPath := filepath.Join(iterDir, dupName)
+			require.NoError(t, os.MkdirAll(dupPath, 0755))
 
-		// Generate some unique (non-duplicate) entries.
-		numUnique := rapid.IntRange(0, 3).Draw(rt, "numUnique")
-		var entries []config.RepoEntry
-		uniquePaths := make(map[string]bool)
-
-		for i := 0; i < numUnique; i++ {
-			name := fmt.Sprintf("unique%d", i)
-			uPath := filepath.Join(iterDir, name)
-			require.NoError(rt, os.MkdirAll(uPath, 0755))
-			entries = append(entries, config.RepoEntry{Path: uPath, Name: name})
-			uniquePaths[uPath] = true
-		}
-
-		// Insert the duplicate path at two positions: early and late.
-		firstName := "first-" + dupName
-		lastName := "last-" + dupName
-		earlyEntry := config.RepoEntry{Path: dupPath, Name: firstName}
-		lateEntry := config.RepoEntry{Path: dupPath, Name: lastName}
-
-		// Insert early entry at the beginning, late entry at the end.
-		entries = append([]config.RepoEntry{earlyEntry}, entries...)
-		entries = append(entries, lateEntry)
-
-		result, warnings := DeduplicateRepos(entries)
-
-		// Should have warnings about the duplicate.
-		assert.NotEmpty(rt, warnings, "should emit warnings for duplicate paths")
-
-		// The result should contain numUnique + 1 entries (one for the dup path).
-		assert.Len(rt, result, numUnique+1,
-			"should have %d unique + 1 deduped = %d entries", numUnique, numUnique+1)
-
-		// The kept entry for the dup path should be the last one (lastName).
-		for _, r := range result {
-			absR, _ := filepath.Abs(r.Path)
-			absDup, _ := filepath.Abs(dupPath)
-			if absR == absDup {
-				assert.Equal(rt, lastName, r.Name,
-					"last occurrence should win: expected %q, got %q", lastName, r.Name)
+			// The unique (non-duplicate) entries.
+			var entries []config.RepoEntry
+			for i := 0; i < numUnique; i++ {
+				name := fmt.Sprintf("unique%d", i)
+				uPath := filepath.Join(iterDir, name)
+				require.NoError(t, os.MkdirAll(uPath, 0755))
+				entries = append(entries, config.RepoEntry{Path: uPath, Name: name})
 			}
-		}
-	})
+
+			// Insert the duplicate path at two positions: early and late.
+			firstName := "first-" + dupName
+			lastName := "last-" + dupName
+			earlyEntry := config.RepoEntry{Path: dupPath, Name: firstName}
+			lateEntry := config.RepoEntry{Path: dupPath, Name: lastName}
+
+			// Insert early entry at the beginning, late entry at the end.
+			entries = append([]config.RepoEntry{earlyEntry}, entries...)
+			entries = append(entries, lateEntry)
+
+			result, warnings := DeduplicateRepos(entries)
+
+			// One warning, for the superseded early entry.
+			assert.Len(t, warnings, 1, "should emit one warning for the duplicate path")
+
+			// The result should contain numUnique + 1 entries (one for the dup path).
+			assert.Len(t, result, numUnique+1,
+				"should have %d unique + 1 deduped = %d entries", numUnique, numUnique+1)
+
+			// The kept entry for the dup path should be the last one (lastName).
+			for _, r := range result {
+				absR, _ := filepath.Abs(r.Path)
+				absDup, _ := filepath.Abs(dupPath)
+				if absR == absDup {
+					assert.Equal(t, lastName, r.Name,
+						"last occurrence should win: expected %q, got %q", lastName, r.Name)
+				}
+			}
+		})
+	}
 }
 
 // Feature: multi-repo-support, Property 4: Path resolution to absolute
@@ -435,56 +436,71 @@ func TestPropertyPathResolutionToAbsolute(t *testing.T) {
 // Feature: multi-repo-support, Property 5: Repo entry deduplication
 // TestPropertyRepoEntryDeduplication verifies that DeduplicateRepos retains
 // only one entry per unique absolute path.
+//
+// Each case lists how many times each of its paths repeats, consecutively. The
+// cases span the shapes a generator over two to six paths repeated one to
+// three times draws — the smallest set with no duplicate, one path at the
+// repeat bound, every path duplicated, and six paths at mixed repeat counts —
+// without paying a git process per entry for a hundred random draws of them.
 func TestPropertyRepoEntryDeduplication(t *testing.T) {
-	tmpDir := t.TempDir()
-	rapid.Check(t, func(rt *rapid.T) {
-		iterDir := filepath.Join(tmpDir, fmt.Sprintf("iter%d", rapid.IntRange(0, 999999).Draw(rt, "iter")))
-		require.NoError(rt, os.MkdirAll(iterDir, 0755))
+	for _, repeatsPerPath := range [][]int{
+		{1, 1},
+		{3, 1},
+		{2, 2, 2},
+		{1, 2, 3, 1, 2, 3},
+	} {
+		t.Run(fmt.Sprint(repeatsPerPath), func(t *testing.T) {
+			iterDir := t.TempDir()
 
-		// Generate between 2 and 6 unique paths.
-		numPaths := rapid.IntRange(2, 6).Draw(rt, "numPaths")
-		uniquePaths := make([]string, numPaths)
-		for i := range uniquePaths {
-			name := fmt.Sprintf("repo%d", i)
-			p := filepath.Join(iterDir, name)
-			require.NoError(rt, os.MkdirAll(p, 0755))
-			uniquePaths[i] = p
-		}
-
-		// Build entries with some duplicates: each path appears 1-3 times.
-		var entries []config.RepoEntry
-		expectedLastName := make(map[string]string) // absPath → last name seen
-
-		for _, p := range uniquePaths {
-			repeats := rapid.IntRange(1, 3).Draw(rt, "repeats")
-			for j := 0; j < repeats; j++ {
-				name := fmt.Sprintf("%s-v%d", filepath.Base(p), j)
-				entries = append(entries, config.RepoEntry{Path: p, Name: name})
-				absP, _ := filepath.Abs(p)
-				expectedLastName[absP] = name
+			numPaths := len(repeatsPerPath)
+			uniquePaths := make([]string, numPaths)
+			for i := range uniquePaths {
+				name := fmt.Sprintf("repo%d", i)
+				p := filepath.Join(iterDir, name)
+				require.NoError(t, os.MkdirAll(p, 0755))
+				uniquePaths[i] = p
 			}
-		}
 
-		result, _ := DeduplicateRepos(entries)
+			// Build entries with duplicates: each path appears repeats times.
+			var entries []config.RepoEntry
+			expectedLastName := make(map[string]string) // absPath → last name seen
+			superseded := 0
 
-		// Verify: exactly one entry per unique absolute path.
-		seenPaths := make(map[string]bool)
-		for _, r := range result {
-			absR, _ := filepath.Abs(r.Path)
-			assert.False(rt, seenPaths[absR],
-				"path %q should appear only once in deduplicated result", absR)
-			seenPaths[absR] = true
-		}
+			for i, p := range uniquePaths {
+				repeats := repeatsPerPath[i]
+				superseded += repeats - 1
+				for j := 0; j < repeats; j++ {
+					name := fmt.Sprintf("%s-v%d", filepath.Base(p), j)
+					entries = append(entries, config.RepoEntry{Path: p, Name: name})
+					absP, _ := filepath.Abs(p)
+					expectedLastName[absP] = name
+				}
+			}
 
-		// Verify all unique paths are represented.
-		assert.Len(rt, result, numPaths,
-			"should have exactly %d entries (one per unique path)", numPaths)
+			result, warnings := DeduplicateRepos(entries)
 
-		// Verify last-wins semantics.
-		for _, r := range result {
-			absR, _ := filepath.Abs(r.Path)
-			assert.Equal(rt, expectedLastName[absR], r.Name,
-				"entry for %q should be the last occurrence", absR)
-		}
-	})
+			// Verify: exactly one entry per unique absolute path.
+			seenPaths := make(map[string]bool)
+			for _, r := range result {
+				absR, _ := filepath.Abs(r.Path)
+				assert.False(t, seenPaths[absR],
+					"path %q should appear only once in deduplicated result", absR)
+				seenPaths[absR] = true
+			}
+
+			// Verify all unique paths are represented.
+			assert.Len(t, result, numPaths,
+				"should have exactly %d entries (one per unique path)", numPaths)
+
+			// One warning per superseded entry.
+			assert.Len(t, warnings, superseded, "should warn once per superseded entry")
+
+			// Verify last-wins semantics.
+			for _, r := range result {
+				absR, _ := filepath.Abs(r.Path)
+				assert.Equal(t, expectedLastName[absR], r.Name,
+					"entry for %q should be the last occurrence", absR)
+			}
+		})
+	}
 }

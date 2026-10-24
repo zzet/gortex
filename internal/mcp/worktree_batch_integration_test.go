@@ -177,11 +177,36 @@ func TestWorktreeBatchFacadeGuardedTwoFileEdit(t *testing.T) {
 	}
 }
 
+// requireWorktreeBatchStillCommits is the positive control for a test that runs
+// several refused or rolled-back batches against one fixture: a valid batch in
+// each named checkout still commits and publishes, so no refusal the cases
+// asserted was caused by state an earlier case left behind.
+func requireWorktreeBatchStillCommits(t *testing.T, f *realCheckoutMutationFixture, transaction string, roots ...string) {
+	t.Helper()
+	f.srv.batchWriteOverride = nil
+	for _, root := range roots {
+		name := "New"
+		if root == f.primary {
+			name = "Old"
+		}
+		// A transaction ID is bound to its checkout, so each gets its own.
+		written := f.facade(t, root, "edit", worktreeBatchArgs(worktreeBatchChanges(name), transaction+"-"+name))
+		require.Equal(t, "committed", lifecycleResultPayload(t, written)["status"], "a valid batch in %s was refused", root)
+		requireWorktreeBatchFile(t, root, "edit.go", "package repo\n\nfunc BatchChanged() {}\n", 0o600)
+		requireWorktreeBatchFile(t, root, "caller.go", "package repo\n\nfunc BatchCaller() { BatchChanged() }\n", 0o640)
+		awaitWorktreeBatch(t, f, root, root, written)
+	}
+}
+
 func TestWorktreeBatchFacadeFailurePreservesBothFiles(t *testing.T) {
+	// Every case aborts and is asserted to leave both checkouts byte- and
+	// mode-identical, so all of them share one fixture; each uses its own
+	// transaction ID, and the control at the end proves the fixture still
+	// commits a valid batch in both checkouts.
+	f := newWorktreeBatchFixture(t)
 	for _, checkout := range []string{"primary", "worktree"} {
 		for _, failure := range []string{"second_guard", "second_commit", "second_post_write"} {
 			t.Run(checkout+"/"+failure, func(t *testing.T) {
-				f := newWorktreeBatchFixture(t)
 				root, name := f.worktree, "New"
 				if checkout == "primary" {
 					root, name = f.primary, "Old"
@@ -204,7 +229,7 @@ func TestWorktreeBatchFacadeFailurePreservesBothFiles(t *testing.T) {
 					}
 					return nil
 				}
-				result := f.facade(t, root, "edit", worktreeBatchArgs(changes, "failure-"+failure))
+				result := f.facade(t, root, "edit", worktreeBatchArgs(changes, "failure-"+checkout+"-"+failure))
 				payload := lifecycleResultPayload(t, result)
 				require.Equal(t, "aborted", payload["status"])
 				if failure == "second_guard" {
@@ -222,6 +247,7 @@ func TestWorktreeBatchFacadeFailurePreservesBothFiles(t *testing.T) {
 			})
 		}
 	}
+	requireWorktreeBatchStillCommits(t, f, "failure-control", f.primary, f.worktree)
 }
 
 func TestWorktreeBatchFacadeMoveAndDelete(t *testing.T) {
@@ -286,9 +312,11 @@ func TestWorktreeBatchFacadeMixedSymbolAndFileEdit(t *testing.T) {
 }
 
 func TestWorktreeBatchFacadeDryRunKeepsRouteAndFiles(t *testing.T) {
+	// A preview is asserted to leave the route and both checkouts untouched,
+	// so the two previews share one fixture, each under its own transaction ID.
+	f := newWorktreeBatchFixture(t)
 	for _, checkout := range []string{"primary", "worktree"} {
 		t.Run(checkout, func(t *testing.T) {
-			f := newWorktreeBatchFixture(t)
 			root, name := f.worktree, "New"
 			if checkout == "primary" {
 				root, name = f.primary, "Old"
@@ -296,7 +324,7 @@ func TestWorktreeBatchFacadeDryRunKeepsRouteAndFiles(t *testing.T) {
 			before, found, err := f.store.Catalog().GetCheckoutRoute(t.Context(), f.checkoutID)
 			require.NoError(t, err)
 			require.True(t, found)
-			args := worktreeBatchArgs(worktreeBatchChanges(name), "dry-run-only")
+			args := worktreeBatchArgs(worktreeBatchChanges(name), "dry-run-only-"+checkout)
 			args["dry_run"] = true
 			preview := f.facade(t, root, "edit", args)
 			payload := lifecycleResultPayload(t, preview)
@@ -316,18 +344,24 @@ func TestWorktreeBatchFacadeDryRunKeepsRouteAndFiles(t *testing.T) {
 }
 
 func TestWorktreeBatchFacadeRejectsForeignAndSymlinkPaths(t *testing.T) {
+	// Every case is a refused batch asserted to leave all three checkouts
+	// unchanged, so they share one fixture and one sibling; each uses its own
+	// transaction ID, and the control at the end proves the worktree still
+	// commits a valid batch.
+	f := newWorktreeBatchFixture(t)
+	sibling := filepath.Join(filepath.Dir(f.primary), "sibling")
+	checkoutMutationGit(t, f.primary, "worktree", "add", "-b", "sibling", sibling)
 	for _, target := range []string{"absolute_primary", "absolute_sibling", "nested_symlink"} {
 		t.Run(target, func(t *testing.T) {
-			f := newWorktreeBatchFixture(t)
-			sibling := filepath.Join(filepath.Dir(f.primary), "sibling")
-			checkoutMutationGit(t, f.primary, "worktree", "add", "-b", "sibling", sibling)
 			path := filepath.Join(f.primary, "edit.go")
 			switch target {
 			case "absolute_sibling":
 				path = filepath.Join(sibling, "edit.go")
 			case "nested_symlink":
-				require.NoError(t, os.Mkdir(filepath.Join(f.worktree, "nested"), 0o755))
-				link := filepath.Join(f.worktree, "nested", "outside")
+				nested := filepath.Join(f.worktree, "nested")
+				require.NoError(t, os.Mkdir(nested, 0o755))
+				t.Cleanup(func() { require.NoError(t, os.RemoveAll(nested)) })
+				link := filepath.Join(nested, "outside")
 				if err := os.Symlink(f.primary, link); err != nil {
 					t.Skipf("symlink unavailable: %v", err)
 				}
@@ -339,7 +373,7 @@ func TestWorktreeBatchFacadeRejectsForeignAndSymlinkPaths(t *testing.T) {
 			require.NoError(t, err)
 			changes := worktreeBatchChanges("New")
 			changes[1] = map[string]any{"op": "edit_file", "path": path, "old_string": "Old", "new_string": "MustNotLand"}
-			result := f.facade(t, f.worktree, "edit", worktreeBatchArgs(changes, "foreign-path"))
+			result := f.facade(t, f.worktree, "edit", worktreeBatchArgs(changes, "foreign-path-"+target))
 			if !result.IsError {
 				payload := lifecycleResultPayload(t, result)
 				require.Equal(t, "aborted", payload["status"])
@@ -355,6 +389,7 @@ func TestWorktreeBatchFacadeRejectsForeignAndSymlinkPaths(t *testing.T) {
 			require.Equal(t, siblingBefore, siblingAfter)
 		})
 	}
+	requireWorktreeBatchStillCommits(t, f, "foreign-path-control", f.worktree)
 }
 
 func TestWorktreeBatchFacadeTransactionCannotCrossCheckout(t *testing.T) {

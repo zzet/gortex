@@ -239,10 +239,31 @@ func TestAgedRetirementCannotEnterAnActualHeldEditCycle(t *testing.T) {
 	}
 }
 
+// agedRetirementLifecycle is agedRetirementFixture's lifecycle over a failed
+// generation the caller already built, so cases that leave the generation as
+// they found it can share one.
+func agedRetirementLifecycle(store *store_sqlite.Store, started time.Time) (*CheckoutLifecycle, *ViewBuildGate) {
+	l := newGenerationRetirementLifecycle(store, started)
+	gate := NewViewBuildGate()
+	gate.Open()
+	l.SetBuildGate(gate)
+	l.foregroundWork = func() (string, time.Time) { return "refresh_ticket", time.Now() }
+	l.interactiveDemand = func() bool { return true }
+	l.deferredRetirementEligibleSince.Store(time.Now().Add(-3 * time.Minute).UnixNano())
+	return l, gate
+}
+
 func TestAgedRetirementRefusalsDoNotInventProgressOrRefreshDebtAge(t *testing.T) {
-	for _, kind := range []string{"lease", "wal", "build_flight", "sweep_mutex"} {
+	// Every case is a refusal, which must leave the failed generation exactly
+	// as it found it — each case asserts that before the next one runs — so
+	// the cases share one built generation and each gets a fresh lifecycle.
+	// build_flight runs last: it is the one case that moves the generation's
+	// catalog state (and back) to admit a physical owner.
+	store, id, started := failedRetirementFixture(t)
+	for _, kind := range []string{"lease", "wal", "sweep_mutex", "build_flight"} {
 		t.Run(kind, func(t *testing.T) {
-			l, gate, id := agedRetirementFixture(t)
+			l, gate := agedRetirementLifecycle(store, started)
+			requireGenerationStateWithPayload(t, l.store, id, store_sqlite.ViewGenerationFailed)
 			l.owed[id] = struct{}{}
 			since := l.deferredRetirementEligibleSince.Load()
 			before := l.deferredRetirementProgress.Load()

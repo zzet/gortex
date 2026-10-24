@@ -67,8 +67,8 @@ func TestLargeWorkingTreeIsImportedFileByFileAndReachesTheWorkingTree(t *testing
 	if last.DirtyBatchRemaining != 0 {
 		t.Fatalf("the import did not reach the working tree: %+v", last)
 	}
-	if folds == 0 {
-		t.Fatal("the import never folded its chain")
+	if folds < 2 {
+		t.Fatalf("the import folded its chain %d times, want a fold over a folded chain too", folds)
 	}
 	members := c.dirtyChainMembers(context.Background(), last.DirtyGenerationID)
 	slices.Reverse(members)

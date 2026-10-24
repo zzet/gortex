@@ -46,6 +46,34 @@ func (o *ownedFTSTable) insert(t *testing.T, generation int64, row [3]string) {
 	o.owner[id] = generation
 }
 
+// load runs build, whose add inserts a row as insert does, with every row in
+// one transaction: committed one by one, a fixture of thousands of rows pays
+// a durable commit per row, which is all its cost.
+func (o *ownedFTSTable) load(t *testing.T, build func(add func(generation int64, row [3]string))) {
+	t.Helper()
+	tx, err := o.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }() // a no-op once committed
+	stmt, err := tx.Prepare(`INSERT INTO symbol_fts(node_id, repo_prefix, tokens) VALUES (?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stmt.Close() }()
+	build(func(generation int64, row [3]string) {
+		res, err := stmt.Exec(row[0], row[1], row[2])
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, _ := res.LastInsertId()
+		o.owner[id] = generation
+	})
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (o *ownedFTSTable) run(generation int64) (docs, lo, hi int64) {
 	lo, hi = -1, -1
 	for rowid, g := range o.owner {
@@ -146,6 +174,48 @@ func (o *ownedFTSTable) storeRankOwned(t *testing.T, generation int64, query str
 	return hits
 }
 
+// storeRankOwnedLarge is storeRankOwned for a generation of thousands of
+// documents: the same FTS5 bm25 ranking over the whole table, with the
+// generation's rowids kept from FTS5's order instead of handed to FTS5. A
+// rowid IN list on the virtual table runs one FTS5 query per listed rowid,
+// each walking the MATCH's doclists and the bm25 statistics over the whole
+// table — seconds per query for a few thousand rowids. The unary + keeps the
+// list out of FTS5: one MATCH ranks the table and SQLite filters its rows in
+// that order, LIMIT counting only the generation's.
+func (o *ownedFTSTable) storeRankOwnedLarge(t *testing.T, generation int64, query string, limit int) []graph.SymbolHit {
+	t.Helper()
+	terms, ok := search.FTSRankTerms(query)
+	if !ok {
+		t.Fatalf("query %q has no exact terms", query)
+	}
+	var ids []string
+	for rowid, g := range o.owner {
+		if g == generation {
+			ids = append(ids, fmt.Sprint(rowid))
+		}
+	}
+	sort.Strings(ids)
+	rows, err := o.db.Query(`SELECT node_id, bm25(symbol_fts) FROM symbol_fts WHERE symbol_fts MATCH ? AND +rowid IN (`+strings.Join(ids, ",")+`)
+ AND symbol_fts.rank MATCH 'bm25()' ORDER BY symbol_fts.rank LIMIT ?`, search.FTSRankMatch(terms), limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var hits []graph.SymbolHit
+	for rows.Next() {
+		var id string
+		var score float64
+		if err := rows.Scan(&id, &score); err != nil {
+			t.Fatal(err)
+		}
+		hits = append(hits, graph.SymbolHit{NodeID: id, Score: -score})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return hits
+}
+
 // Every generation of known size is read whole once, whatever its rowid run —
 // interleaved with another generation's rows, spread over a run far wider than
 // its documents, dense, or large — and the read costs its own documents (the
@@ -157,30 +227,32 @@ func TestEveryGenerationIsReadWholeOnceAtItsOwnCost(t *testing.T) {
 	rows := fixtureRows("row", 6200, 3)
 	next := 0
 	take := func() [3]string { r := rows[next%len(rows)]; next++; r[0] = fmt.Sprintf("n%d", next); return r }
-	// 30: 40 documents interleaved with 150 rows of 31 each.
-	for i := 0; i < 40; i++ {
-		o.insert(t, 30, take())
-		for j := 0; j < 150; j++ {
-			o.insert(t, 31, take())
+	o.load(t, func(add func(int64, [3]string)) {
+		// 30: 40 documents interleaved with 150 rows of 31 each.
+		for i := 0; i < 40; i++ {
+			add(30, take())
+			for j := 0; j < 150; j++ {
+				add(31, take())
+			}
 		}
-	}
-	// 32: 10 documents over a run of about 3,000 rowids.
-	for i := 0; i < 10; i++ {
-		o.insert(t, 32, take())
-		for j := 0; j < 300; j++ {
-			o.insert(t, 31, take())
+		// 32: 10 documents over a run of about 3,000 rowids.
+		for i := 0; i < 10; i++ {
+			add(32, take())
+			for j := 0; j < 300; j++ {
+				add(31, take())
+			}
 		}
-	}
-	// 33: 50 documents in one run; 34: 3,000 documents over about 7,000.
-	for i := 0; i < 50; i++ {
-		o.insert(t, 33, take())
-	}
-	for i := 0; i < 3000; i++ {
-		o.insert(t, 34, take())
-		if i%3 == 0 {
-			o.insert(t, 31, take())
+		// 33: 50 documents in one run; 34: 3,000 documents over about 7,000.
+		for i := 0; i < 50; i++ {
+			add(33, take())
 		}
-	}
+		for i := 0; i < 3000; i++ {
+			add(34, take())
+			if i%3 == 0 {
+				add(31, take())
+			}
+		}
+	})
 	ranker := search.NewFTSRanker(o)
 	for _, q := range []string{"config", "checkout route", "flip coordinator", "dirty sampler refresh", "newDirtySamplerRen9"} {
 		for _, generation := range []int64{30, 32, 33, 34} {
@@ -188,7 +260,11 @@ func TestEveryGenerationIsReadWholeOnceAtItsOwnCost(t *testing.T) {
 			if err != nil || !ok {
 				t.Fatalf("gen %d %q: ok=%v err=%v", generation, q, ok, err)
 			}
-			if want := o.storeRankOwned(t, generation, q, 20); renderHits(got) != renderHits(want) {
+			oracle := o.storeRankOwned
+			if generation == 34 {
+				oracle = o.storeRankOwnedLarge
+			}
+			if want := oracle(t, generation, q, 20); renderHits(got) != renderHits(want) {
 				t.Fatalf("gen %d %q:\n memory %s\n fts5   %s", generation, q, renderHits(got), renderHits(want))
 			}
 		}

@@ -113,6 +113,10 @@ func TestWriterTransactionsBeginImmediate(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, store.Close()) }()
 	setWriterBusyTimeout(t, store, 0)
+	// The outcome, not the 15 s retry window: BEGIN IMMEDIATE meets the held
+	// lock on every retry, while a DEFERRED BEGIN would succeed on the first.
+	// 400 ms still lets the retry backoff reach its 250 ms cap.
+	store.busyRetryTimeout = 400 * time.Millisecond
 	locker, lockTx := holdExternalWriter(t, path)
 
 	store.writeMu.Lock()

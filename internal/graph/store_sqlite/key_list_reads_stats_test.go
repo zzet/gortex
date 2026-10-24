@@ -99,24 +99,19 @@ func keyListKeys(files, offset int) (ids, names, paths []string) {
 	return ids, names, paths
 }
 
-// The name lookups' plans do not depend on the statistics: under each of the
-// three states they seek by name (the repository form) and by repository,
-// language and name (the language form), never ranging over a repository's
-// generation.
-func TestNameLookupPlansUnderEveryStatisticsState(t *testing.T) {
-	s := openPayloadStore(t)
-	small := smallStoreStats(t, s)
-	_, names, _ := keyListGraph(t, s, 2000)
+// requireNameLookupPlansSeek checks the name lookups' plans under the
+// statistics in force: they seek by name (the repository form) and by
+// repository, language and name (the language form), never ranging over a
+// repository's generation.
+func requireNameLookupPlansSeek(t *testing.T, s *Store, state string, names []string) {
+	t.Helper()
 	namesJSON, _ := json.Marshal(names)
 	langsJSON, _ := json.Marshal([]string{"go", "python"})
-	for _, state := range keyListStatsStates(small) {
-		state.apply(t, s)
-		repoPlan := planOf(t, s, repoNamesSeekSQL, string(namesJSON), s.viewGen, "repo")
-		langPlan := planOf(t, s, repoLanguageNamesSeekSQL, string(langsJSON), string(namesJSON), "repo", s.viewGen)
-		t.Logf("%s:\n repo_names: %s\n repo_language_names: %s", state.name, repoPlan, langPlan)
-		require.Contains(t, repoPlan, "nodes_by_name (name=? AND view_gen=?)", state.name)
-		require.Contains(t, langPlan, "nodes_by_repo_language_name (repo_prefix=? AND language=? AND name=?)", state.name)
-	}
+	repoPlan := planOf(t, s, repoNamesSeekSQL, string(namesJSON), s.viewGen, "repo")
+	langPlan := planOf(t, s, repoLanguageNamesSeekSQL, string(langsJSON), string(namesJSON), "repo", s.viewGen)
+	t.Logf("%s:\n repo_names: %s\n repo_language_names: %s", state, repoPlan, langPlan)
+	require.Contains(t, repoPlan, "nodes_by_name (name=? AND view_gen=?)", state)
+	require.Contains(t, langPlan, "nodes_by_repo_language_name (repo_prefix=? AND language=? AND name=?)", state)
 }
 
 // smallStoreStats writes 4 files of the graph, runs the store's own refresh
@@ -150,11 +145,14 @@ func smallStoreStats(t *testing.T, s *Store) func(t *testing.T, s *Store) {
 }
 
 // The reads that take a list of keys and a generation, under the three
-// statistics states: every statement they run seeks by its keys.
-func TestKeyListReadsSeekUnderEveryStatisticsState(t *testing.T) {
+// statistics states: every statement they run seeks by its keys. The name
+// lookups' plans do not depend on the statistics either. One graph serves
+// both: building it is the case's cost, and each state replaces the
+// statistics whole.
+func TestKeyListReadsAndNameLookupsSeekUnderEveryStatisticsState(t *testing.T) {
 	s := openPayloadStore(t)
 	small := smallStoreStats(t, s)
-	_, _, _ = keyListGraph(t, s, 2000)
+	_, names, _ := keyListGraph(t, s, 2000)
 	type read struct {
 		name string
 		call func()
@@ -194,6 +192,7 @@ func TestKeyListReadsSeekUnderEveryStatisticsState(t *testing.T) {
 	}
 	for si, state := range keyListStatsStates(small) {
 		state.apply(t, s)
+		requireNameLookupPlansSeek(t, s, state.name, names)
 		for _, r := range readsFor(keyListKeys(2000, si+1)) {
 			mu.Lock()
 			seen = seen[:0]

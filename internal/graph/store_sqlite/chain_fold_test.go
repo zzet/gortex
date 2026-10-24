@@ -175,38 +175,59 @@ func TestChainFoldInStepsEqualsTheOneShotFlatten(t *testing.T) {
 	require.NotEmpty(t, renderFoldFTS(t, store, stepped))
 }
 
-// A step gives way to an edit: an announced write interrupts the step in
-// flight, the gate is free within milliseconds, the step is rolled back, and
-// the fold continues to the same result.
+// A step gives way to an edit, announced or only parked on the gate: the edit
+// interrupts the step in flight instead of waiting for it, the step is rolled
+// back, and the fold continues to the same result.
 func TestChainFoldStepGivesWayToAnEdit(t *testing.T) {
+	runChainFoldStepGivesWayToAnEdit(t, false)
+}
+
+// runChainFoldStepGivesWayToAnEdit interrupts the same long step once per
+// kind of edit on one fold, then finishes the fold and compares it with the
+// one-shot flatten. Ordinary runs bound the edit's wait by the step it
+// interrupted (measured from the fold's own row rate); checkLatency adds the
+// absolute wall-clock envelope, kept for the performance flow.
+func runChainFoldStepGivesWayToAnEdit(t *testing.T, checkLatency bool) {
+	t.Helper()
+	store := openCatalogStore(t)
+	ctx := context.Background()
+	chain := foldChain(t, store, 20000)
+	prevFirst, prevMax := chainFoldFirstRows, chainFoldMaxRows
+	chainFoldFirstRows, chainFoldMaxRows = 20000, 20000 // one long step
+	t.Cleanup(func() { chainFoldFirstRows, chainFoldMaxRows = prevFirst, prevMax })
+	to := reservedGeneration(t, store, "folded")
+	fold, err := store.BeginChainFold(ctx, ChainFoldRequest{Chain: chain, To: to, Owner: "test"})
+	require.NoError(t, err)
+	// Step up to the bottom member's rows: the long part.
+	for fold.member != 0 || fold.phase != foldPhaseRows {
+		_, err = fold.Step(ctx)
+		if errors.Is(err, ErrChainFoldYielded) { // a background writer (index build, counters)
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		require.NoError(t, err)
+	}
+	// The steps so far measured the fold's row rate; the long step's length
+	// follows from it, under the same load as the interruptions below.
+	rate := fold.usPerRow
+	require.Positive(t, rate, "precondition: the steps so far measured a row rate")
+	prevTarget := chainFoldStepTarget
+	t.Cleanup(func() { chainFoldStepTarget = prevTarget })
+	// A checkout refresh announced throughout does not stop the fold; only
+	// the edits below do.
+	checkout := store.AnnounceCheckoutRefresh()
+	defer checkout()
+
 	for _, announced := range []bool{true, false} {
 		t.Run(fmt.Sprintf("announced=%t", announced), func(t *testing.T) {
-			store := openCatalogStore(t)
-			ctx := context.Background()
-			chain := foldChain(t, store, 20000)
-			prevFirst, prevMax := chainFoldFirstRows, chainFoldMaxRows
-			chainFoldFirstRows, chainFoldMaxRows = 20000, 20000 // one long step
-			t.Cleanup(func() { chainFoldFirstRows, chainFoldMaxRows = prevFirst, prevMax })
-			to := reservedGeneration(t, store, "folded")
-			fold, err := store.BeginChainFold(ctx, ChainFoldRequest{Chain: chain, To: to, Owner: "test"})
-			require.NoError(t, err)
-			// Step up to the bottom member's rows: the long part.
-			for fold.member != 0 || fold.phase != foldPhaseRows {
-				_, err = fold.Step(ctx)
-				if errors.Is(err, ErrChainFoldYielded) { // a background writer (index build, counters)
-					time.Sleep(time.Millisecond)
-					continue
-				}
-				require.NoError(t, err)
-			}
-			checkout := store.AnnounceCheckoutRefresh()
-			defer checkout()
 			before := renderGenerationNodes(t, store, to)
 			cursor := fold.cursor()
-			// The next step is long: 20,000 rows with no time target to stop it.
-			prevTarget, prevRate := chainFoldStepTarget, fold.usPerRow
-			chainFoldStepTarget, fold.usPerRow = 10*time.Second, 0
-			t.Cleanup(func() { chainFoldStepTarget = prevTarget })
+			// The next step is long: 20,000 rows with no time target to stop
+			// it, again after an earlier variant's interruption halved the page.
+			prevRate := fold.usPerRow
+			chainFoldStepTarget, fold.usPerRow, fold.interruptedPageRows = 10*time.Second, 0, 0
+			rows := fold.stepRows()
+			fullStep := time.Duration(float64(rows) * rate * float64(time.Microsecond))
 
 			var wait time.Duration
 			var wg sync.WaitGroup
@@ -224,30 +245,35 @@ func TestChainFoldStepGivesWayToAnEdit(t *testing.T) {
 				store.writeMu.Unlock()
 			}()
 			started := time.Now()
-			_, err = fold.Step(ctx)
+			_, err := fold.Step(ctx)
 			stepTook := time.Since(started)
 			wg.Wait()
-			t.Logf("interrupted step: err=%v after %s; the edit waited %s for the gate", err, stepTook.Round(time.Millisecond), wait.Round(time.Microsecond))
+			t.Logf("interrupted step: err=%v after %s; the edit waited %s for the gate; the whole step: %d rows ≈ %s",
+				err, stepTook.Round(time.Millisecond), wait.Round(time.Microsecond), rows, fullStep.Round(time.Millisecond))
 			require.ErrorIs(t, err, ErrChainFoldYielded)
 			require.Equal(t, cursor, fold.cursor(), "an interrupted step must not advance its cursor")
-			limit := 20 * time.Millisecond
-			if raceDetectorOn {
-				limit = 100 * time.Millisecond
+			// Waiting for the step would take the rest of it: the whole step
+			// less the 30 ms before the edit arrived.
+			require.Less(t, wait, fullStep/4, "the edit waited for the fold's step")
+			if checkLatency {
+				limit := 20 * time.Millisecond
+				if raceDetectorOn {
+					limit = 100 * time.Millisecond
+				}
+				require.Less(t, wait, limit, "the edit was not given the gate within milliseconds")
 			}
-			require.Less(t, wait, limit, "the edit waited for the fold's step")
 			require.Equal(t, before, renderGenerationNodes(t, store, to), "the interrupted step's rows were not rolled back")
 			chainFoldStepTarget, fold.usPerRow = prevTarget, prevRate
-
-			runFold(t, fold, nil)
-			require.NoError(t, fold.Release(ctx))
-			oneShot := reservedGeneration(t, store, "one-shot")
-			_, err = store.FlattenGenerationChain(ctx, chain, oneShot)
-			require.NoError(t, err)
-			require.Equal(t, renderGenerationNodes(t, store, oneShot), renderGenerationNodes(t, store, to))
-			require.Equal(t, renderGenerationEdges(t, store, oneShot), renderGenerationEdges(t, store, to))
-
 		})
 	}
+
+	runFold(t, fold, nil)
+	require.NoError(t, fold.Release(ctx))
+	oneShot := reservedGeneration(t, store, "one-shot")
+	_, err = store.FlattenGenerationChain(ctx, chain, oneShot)
+	require.NoError(t, err)
+	require.Equal(t, renderGenerationNodes(t, store, oneShot), renderGenerationNodes(t, store, to))
+	require.Equal(t, renderGenerationEdges(t, store, oneShot), renderGenerationEdges(t, store, to))
 }
 
 // Steps are sized by time: after the first, a step holds the gate for about

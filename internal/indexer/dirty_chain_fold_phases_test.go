@@ -11,7 +11,23 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
+// The three cases share one checkout, its logger's level switched per case
+// (the observer is installed before the coordinator loop is constructed):
+// each drives the chain to the cap again from where the case before it left
+// it, and asserts it got there.
 func TestInlineFoldPhaseTimingPreservesPublicationAndFailure(t *testing.T) {
+	level := zap.NewAtomicLevelAt(zap.DebugLevel)
+	core, logs := observer.New(level)
+	f := newCoordinatorFixtureWithTree(t, builderTreeA())
+	gate := NewViewBuildGate()
+	gate.Open()
+	c := f.coordinatorWithLogger(t, CheckoutCoordinatorConfig{Gate: gate, Debounce: time.Hour, debounceDemand: true}, zap.New(core))
+	c.compaction.mu.Lock()
+	c.compaction.closed = true
+	c.compaction.mu.Unlock()
+	require.NoError(t, c.reconcile(context.Background()).Err)
+	l := &CheckoutLifecycle{catalog: f.catalog, store: f.store, coordinators: map[string]*CheckoutCoordinator{f.checkoutID: c}}
+	next, depth := 0, 0 // the next burst edit; the routed chain's depth
 	for _, test := range []struct {
 		name    string
 		debug   bool
@@ -22,31 +38,29 @@ func TestInlineFoldPhaseTimingPreservesPublicationAndFailure(t *testing.T) {
 		{name: "disabled"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			level := zap.InfoLevel
 			if test.debug {
-				level = zap.DebugLevel
+				level.SetLevel(zap.DebugLevel)
+			} else {
+				level.SetLevel(zap.InfoLevel)
 			}
-			core, logs := observer.New(level)
-			// Install the observer before the coordinator loop is constructed.
-			f := newCoordinatorFixtureWithTree(t, builderTreeA())
-			gate := NewViewBuildGate()
-			gate.Open()
-			c := f.coordinatorWithLogger(t, CheckoutCoordinatorConfig{Gate: gate, Debounce: time.Hour, debounceDemand: true}, zap.New(core))
-			c.compaction.mu.Lock()
-			c.compaction.closed = true
-			c.compaction.mu.Unlock()
-			require.NoError(t, c.reconcile(context.Background()).Err)
-			l := &CheckoutLifecycle{catalog: f.catalog, store: f.store, coordinators: map[string]*CheckoutCoordinator{f.checkoutID: c}}
-			mcpChainAtTheCap(t, f, l)
+			for depth < maxChainWalkDepth {
+				out := mcpEdit(t, l, f, func() { chainBurstEdit(t, f, next) })
+				next++
+				require.Equal(t, depth+1, out.DirtyChainDepth, "the edit before the cap chains (%s)", out.DirtyChainReason)
+				depth = out.DirtyChainDepth
+			}
 			logs.TakeAll()
+			c.compaction.mu.Lock()
+			c.compaction.copyHook = nil
 			if test.copyErr {
-				c.compaction.mu.Lock()
 				c.compaction.copyHook = func(context.Context, int64) error {
 					return errors.New("phase-test copy refused")
 				}
-				c.compaction.mu.Unlock()
 			}
-			at := mcpEdit(t, l, f, func() { chainBurstEdit(t, f, maxChainWalkDepth) })
+			c.compaction.mu.Unlock()
+			at := mcpEdit(t, l, f, func() { chainBurstEdit(t, f, next) })
+			next++
+			depth = at.DirtyChainDepth
 			require.NoError(t, c.waitDirtyChainCompactions(context.Background()))
 			if test.copyErr {
 				require.Zero(t, at.DirtyParentGenerationID, "a refused copy still builds direct")

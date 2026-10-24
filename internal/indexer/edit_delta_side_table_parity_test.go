@@ -1,7 +1,6 @@
 package indexer
 
 import (
-	"context"
 	"fmt"
 	"slices"
 	"sort"
@@ -31,7 +30,14 @@ import (
 //     on, and a fact a clean index holds that the union lacks is a loss.
 //
 // The rules are applied per node the view and the clean index both hold (node
-// parity itself is the kind-parity tests' job).
+// parity itself is the kind-parity tests' job). The kind-parity fixture's
+// states (each sibling edit on a clean checkout, the chain to depth 8, and the
+// MCP edits before, over and after a stepped fold) get their side-table
+// comparison from the kind-parity tests that build them
+// (TestKindParityCleanCheckout, TestKindParityChain,
+// TestKindParityFoldAndRebase), against the same clean index as their kind
+// comparison (kindAndSideTableCheck); TestSideTableParityContent below adds
+// content sections over a chain.
 
 // sideSource is one corpus of a composed view's stack, bottom first: the
 // indexed corpus (no layer) and one generation per entry above it.
@@ -216,6 +222,14 @@ func sideTableCheck(t *testing.T, label, repoDir string, view graph.Reader, sour
 	t.Helper()
 	clean := builderOpenStore(t, "side-clean-"+strings.NewReplacer("/", "-", " ", "-").Replace(label))
 	builderIndex(t, clean, repoDir)
+	sideTableCheckAgainst(t, label, view, sources, clean, primary)
+}
+
+// sideTableCheckAgainst is sideTableCheck with the clean index given, so one
+// clean index of a state serves this comparison and the kind comparison
+// (kindAndSideTableCheck).
+func sideTableCheckAgainst(t *testing.T, label string, view graph.Reader, sources []sideSource, clean, primary *store_sqlite.Store) {
+	t.Helper()
 	nodes := sideCommonNodes(view, clean)
 	got := collectSideTables(nodes, sources)
 	want := collectSideTables(nodes, []sideSource{{handle: clean}})
@@ -285,81 +299,6 @@ func sideTableCheck(t *testing.T, label, repoDir string, view graph.Reader, sour
 	}
 	if len(failing) > 0 {
 		t.Errorf("%s: the stack serves side-table rows other than a clean index's where the primary per-save path does not:\n%s", label, strings.Join(failing, "\n"))
-	}
-}
-
-// Each sibling edit alone on a clean checkout (depth 1).
-func TestSideTableParityCleanCheckout(t *testing.T) {
-	for _, edit := range kindParityEdits()[:4] {
-		t.Run(edit.name, func(t *testing.T) {
-			repoDir, store := kindParityRepo(t, "side-clean-"+edit.name)
-			builder := builderNewBuilder(store)
-			h := newDirtyChainBuilder(t, builder, store, repoDir, false)
-			primary := newKindParityPrimary(t, repoDir)
-			applyKindParityEdit(t, repoDir, edit)
-			primary.save(edit.paths())
-			id, _, err := builder.BuildDirtyLayer(context.Background(), h.request())
-			if err != nil {
-				t.Fatal(err)
-			}
-			chain := []int64{id}
-			sideTableCheck(t, "clean/"+edit.name, repoDir, dirtyChainComposed(t, store, chain), sideSourcesOfChain(t, store, chain), primary.store)
-		})
-	}
-}
-
-// The sibling edits as a chain, to depth 8.
-func TestSideTableParityChain(t *testing.T) {
-	repoDir, store := kindParityRepo(t, "side-chain")
-	builder := builderNewBuilder(store)
-	h := newDirtyChainBuilder(t, builder, store, repoDir, true)
-	h.compact = false
-	primary := newKindParityPrimary(t, repoDir)
-	for _, edit := range kindParityEdits() {
-		applyKindParityEdit(t, repoDir, edit)
-		primary.save(edit.paths())
-		_, _, chain := h.build()
-		sideTableCheck(t, fmt.Sprintf("depth %d/%s", len(chain), edit.name), repoDir, dirtyChainComposed(t, store, chain), sideSourcesOfChain(t, store, chain), primary.store)
-	}
-}
-
-// Through the checkout's MCP edits with the stepped fold, as
-// TestKindParityFoldAndRebase: before, over and after the fold's landing.
-func TestSideTableParityFold(t *testing.T) {
-	f, c, l := mcpChainFixture(t, kindParityTree(), false)
-	edits := kindParityEdits()
-	primary := newKindParityPrimary(t, f.worktree)
-	check := func(label string) {
-		t.Helper()
-		view := chainMaterialize(t, f)
-		defer view.Close()
-		sideTableCheck(t, label, f.worktree, view.Reader, sideSourcesOfView(f.store, view), primary.store)
-	}
-	var trigger CheckoutCycle
-	for i := 0; i < 4; i++ {
-		trigger = mcpEdit(t, l, f, func() { applyKindParityEdit(t, f.worktree, edits[i]) })
-		primary.save(edits[i].paths())
-		check(fmt.Sprintf("mcp depth %d/%s", trigger.DirtyChainDepth, edits[i].name))
-	}
-	if !trigger.CompactionScheduled {
-		t.Fatalf("the fourth edit scheduled no fold (depth %d)", trigger.DirtyChainDepth)
-	}
-	proceed, result := startSteppedFold(t, c, trigger)
-	for i := 4; i < 6; i++ {
-		out := mcpEdit(t, l, f, func() { applyKindParityEdit(t, f.worktree, edits[i]) })
-		primary.save(edits[i].paths())
-		check(fmt.Sprintf("mcp over the running fold depth %d/%s", out.DirtyChainDepth, edits[i].name))
-	}
-	proceed()
-	report := <-result
-	if report.Outcome != dirtyChainCompactionFlipped {
-		t.Fatalf("the fold did not land: %s (%v)", report.Outcome, report.Err)
-	}
-	check("after the landing (" + report.Landing + ")")
-	for i := 6; i < 8; i++ {
-		out := mcpEdit(t, l, f, func() { applyKindParityEdit(t, f.worktree, edits[i]) })
-		primary.save(edits[i].paths())
-		check(fmt.Sprintf("mcp after the landing depth %d/%s", out.DirtyChainDepth, edits[i].name))
 	}
 }
 

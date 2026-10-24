@@ -128,7 +128,9 @@ func accumulatedDirtyEditAtSize(t *testing.T, layout accumulatedDirtyLayout, n i
 	ctx := context.Background()
 	store := builderOpenStore(t, fmt.Sprintf("base-%s-%d", layout, n))
 	repoDir := accumulatedDirtyRepo(t, layout, store)
-	builder := builderNewBuilder(store)
+	// The module is Go only: a Go registry builds exactly what the full one
+	// does (see indexWithRegistry), without compiling every other language.
+	builder := builderWithRegistry(store, builderGoRegistry())
 	chains := newDirtyChainBuilder(t, builder, store, repoDir, os.Getenv("GX_SUBSECOND_DIRECT") != "1")
 	var lastChain []int64
 

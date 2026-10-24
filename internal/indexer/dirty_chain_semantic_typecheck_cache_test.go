@@ -10,11 +10,13 @@ import (
 )
 
 // TestDirtyChainSemanticTypecheckCacheParity: with the per-checkout closure
-// and type-check state (and sibling-body stripping) on, chained edits keep
-// parity with a clean semantic index, binding rows included, and a repeated
-// edit in a package whose closure the state already holds runs no `go list`.
+// and type-check state (and sibling-body stripping) on, chained single-file
+// edits in the independent and the same-package layouts each make one
+// handle-rooted load of exactly the edited package and keep parity with a
+// clean semantic index, binding rows included, and a repeated edit in a
+// package whose closure the state already holds runs no `go list`.
 func TestDirtyChainSemanticTypecheckCacheParity(t *testing.T) {
-	f, c, mgr := semanticChainFixtureWith(t, semanticBindingTree(), true)
+	f, c, mgr := semanticGoChainFixture(t, semanticBindingTree(), true)
 	coordinatorReconcile(t, c)
 
 	for i := 0; i < 8; i++ {
@@ -25,7 +27,7 @@ func TestDirtyChainSemanticTypecheckCacheParity(t *testing.T) {
 		t.Fatalf("the chain root = %+v, want a direct build", root)
 	}
 	scopeAssertCounter(t, f, "cached-root", root)
-	assertSemanticParity(t, f, mgr, "cached-root")
+	assertGoSemanticParity(t, f, mgr, "cached-root")
 
 	hits := 0
 	for k, edit := range []struct {
@@ -39,6 +41,9 @@ func TestDirtyChainSemanticTypecheckCacheParity(t *testing.T) {
 		{accumulatedDirtyIndependent, 9, 1, builderRepoPrefix + "/ind/p009", true},
 		{accumulatedDirtySamePackage, 3, retentionUnits, builderRepoPrefix + "/same", false},
 		{accumulatedDirtySamePackage, 4, retentionUnits, builderRepoPrefix + "/same", true},
+		// A package neither the root nor an earlier edit dirtied, after the
+		// same-package edits.
+		{accumulatedDirtyIndependent, 12, 1, builderRepoPrefix + "/ind/p012", false},
 		{accumulatedDirtyIndependent, 2, 1, builderRepoPrefix + "/ind/p002", true},
 	} {
 		semanticWriteUnitRevision(t, f.worktree, edit.layout, edit.unit, k)
@@ -71,7 +76,7 @@ func TestDirtyChainSemanticTypecheckCacheParity(t *testing.T) {
 		if n := semanticGenerationBindingRows(t, f, out.DirtyGenerationID); n == 0 {
 			t.Errorf("%s: the generation wrote no binding rows; the binding oracle is vacuous", label)
 		}
-		assertSemanticParity(t, f, mgr, label)
+		assertGoSemanticParity(t, f, mgr, label)
 	}
 	if hits == 0 {
 		t.Fatal("no closure hit was exercised")

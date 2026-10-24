@@ -322,7 +322,7 @@ func kindParityHead(rows []string) []string {
 // kindParityCheck compares a chain's composed view with a clean index of the
 // working tree by kind. A row the view and the clean index disagree on is
 // judged against the primary per-save path over the same changed paths (the
-// triangulation TestEditDeltaAccumulatedCleanParity uses): where the primary
+// triangulation TestEditDeltaInvalidationClasses uses): where the primary
 // per-save path produces the same difference, it is the incremental engine's
 // own residual, reported but not failed on; every other difference is the
 // delta's, and fails.
@@ -347,8 +347,22 @@ func kindParityCheckWith(t *testing.T, label, repoDir string, view graph.Reader,
 // indexer given (the go/types pass on or off, as the view's builds run it).
 func kindParityCheckIndexed(t *testing.T, label, repoDir string, view graph.Reader, covered []string, primaryOf func() graph.Reader, index func(testing.TB, *store_sqlite.Store, string)) {
 	t.Helper()
+	kindParityCheckAgainst(t, label, view, kindParityClean(t, label, repoDir, index), covered, primaryOf)
+}
+
+// kindParityClean is a clean whole index of the working tree at repoDir, by
+// index, in a store named for label.
+func kindParityClean(t *testing.T, label, repoDir string, index func(testing.TB, *store_sqlite.Store, string)) *store_sqlite.Store {
+	t.Helper()
 	clean := builderOpenStore(t, "kind-parity-clean-"+strings.NewReplacer("/", "-", " ", "-").Replace(label))
 	index(t, clean, repoDir)
+	return clean
+}
+
+// kindParityCheckAgainst is kindParityCheckIndexed with the clean index
+// given, so one clean index of a state can serve every comparison of it.
+func kindParityCheckAgainst(t *testing.T, label string, view, clean graph.Reader, covered []string, primaryOf func() graph.Reader) {
+	t.Helper()
 	lines := compareKindParity(collectKindParityRows(view), collectKindParityRows(clean))
 	differs := false
 	for _, l := range lines {
@@ -424,24 +438,76 @@ func generationCovered(t *testing.T, store *store_sqlite.Store, generation int64
 	return layer.FilePaths()
 }
 
-// Each sibling edit, alone on a clean checkout.
+// Each sibling edit, and a direct edit of the producers' own file, alone on a
+// clean checkout. Every case is one build, one clean index and one primary
+// per-save store, and the view is compared by kind; the sibling edits also by
+// side table (edit_delta_side_table_parity_test.go); and the edits that shift
+// lines also by the older oracle (TestEditDeltaMatchesPrimaryPerSave's
+// triangulation over whole rendered rows: a row may differ from the primary
+// per-save path only where it matches a whole index), over this fixture,
+// whose function values, interface and clone pair the seeded repositories of
+// that property do not carry.
+//
+// A same-line body edit of the producers' own file is inert to the primary
+// per-save path, which then keeps its prior rows and no longer tells an engine
+// residual from a delta defect; only the line-shifting edit of that file, which
+// the primary path re-derives as the delta does, is held to the whole-row
+// oracle.
 func TestKindParityCleanCheckout(t *testing.T) {
-	for _, edit := range kindParityEdits()[:4] {
-		t.Run(edit.name, func(t *testing.T) {
-			repoDir, store := kindParityRepo(t, "kind-parity-clean-"+edit.name)
+	src := kindParityTree()["prod/producers.go"]
+	ownFile := func(name, from, to string) kindParityEdit {
+		return kindParityEdit{name: name, write: map[string]string{"prod/producers.go": strings.Replace(src, from, to, 1)}}
+	}
+	edits := kindParityEdits()
+	cases := []struct {
+		edit kindParityEdit
+		// sideTables adds the side-table comparison, wholeRows the
+		// triangulation of whole rendered rows.
+		sideTables, wholeRows bool
+	}{
+		{edits[0], true, false},
+		{edits[1], true, true},
+		{edits[2], true, true},
+		{edits[3], true, true},
+		{ownFile("own_file_same_line", "func Env() string { return", "func Env() string { _ = 1; return"), false, false},
+		{ownFile("own_file_line_shift", "func Env() string { return", "func Env() string {\n\t_ = 1\n\treturn"), false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.edit.name, func(t *testing.T) {
+			repoDir, store := kindParityRepo(t, "kind-parity-clean-"+c.edit.name)
 			builder := builderNewBuilder(store)
 			h := newDirtyChainBuilder(t, builder, store, repoDir, false)
-			applyKindParityEdit(t, repoDir, edit)
+			applyKindParityEdit(t, repoDir, c.edit)
 			id, _, err := builder.BuildDirtyLayer(context.Background(), h.request())
 			if err != nil {
 				t.Fatal(err)
 			}
-			kindParityCheck(t, "clean/"+edit.name, repoDir, dirtyChainComposed(t, store, []int64{id}), generationCovered(t, store, id), edit.paths())
+			chain := []int64{id}
+			view := dirtyChainComposed(t, store, chain)
+			label := "clean/" + c.edit.name
+			clean := kindParityClean(t, label, repoDir, builderIndex)
+			var primary *store_sqlite.Store
+			primaryOf := func() *store_sqlite.Store {
+				if primary == nil {
+					primary = primaryPerSaveOf(t, repoDir, c.edit.paths(), config.Default().Index)
+				}
+				return primary
+			}
+			kindParityCheckAgainst(t, label, view, clean, generationCovered(t, store, id), func() graph.Reader { return primaryOf() })
+			if c.sideTables {
+				sideTableCheckAgainst(t, label, view, sideSourcesOfChain(t, store, chain), clean, primaryOf())
+			}
+			if c.wholeRows {
+				if bad := editDeltaTriangulate(fingerprintNeutralReader{view}, fingerprintNeutralReader{primaryOf()}, fingerprintNeutralReader{clean}); len(bad) > 0 {
+					t.Errorf("%s: rows where the delta differs from the primary AND from a whole index:\n  %s", c.edit.name, strings.Join(bad, "\n  "))
+				}
+			}
 		})
 	}
 }
 
-// The sibling edits one after another as a chain, to the depth bound.
+// The sibling edits one after another as a chain, to the depth bound, each
+// state compared by kind and by side table against one clean index.
 func TestKindParityChain(t *testing.T) {
 	repoDir, store := kindParityRepo(t, "kind-parity-chain")
 	builder := builderNewBuilder(store)
@@ -455,14 +521,27 @@ func TestKindParityChain(t *testing.T) {
 		if i > 0 && report.ParentGenerationID == 0 {
 			t.Fatalf("%s: built direct (%q), want chained", edit.name, report.ChainFallbackReason)
 		}
-		kindParityCheckWith(t, fmt.Sprintf("depth %d/%s", len(chain), edit.name), repoDir, dirtyChainComposed(t, store, chain), generationCovered(t, store, id), func() graph.Reader { return primary.store })
+		kindAndSideTableCheck(t, fmt.Sprintf("depth %d/%s", len(chain), edit.name), repoDir, dirtyChainComposed(t, store, chain),
+			sideSourcesOfChain(t, store, chain), generationCovered(t, store, id), primary.store)
 	}
+}
+
+// kindAndSideTableCheck compares view with ONE clean index of the working
+// tree at repoDir, by kind (kindParityCheckAgainst) and by side table
+// (sideTableCheckAgainst), both triangulated against the primary per-save
+// store.
+func kindAndSideTableCheck(t *testing.T, label, repoDir string, view graph.Reader, sources []sideSource, covered []string, primary *store_sqlite.Store) {
+	t.Helper()
+	clean := kindParityClean(t, label, repoDir, builderIndex)
+	kindParityCheckAgainst(t, label, view, clean, covered, func() graph.Reader { return primary })
+	sideTableCheckAgainst(t, label, view, sources, clean, primary)
 }
 
 // The same fixture through the checkout's MCP edits, with the stepped fold:
 // four edits, a fold of them held before its first step, two edits above it,
 // the landing (a re-base of the lowest layer above), and two edits after it.
-// The served view is compared by kind after every edit and after the landing.
+// The served view is compared by kind and by side table after every edit and
+// after the landing.
 func TestKindParityFoldAndRebase(t *testing.T) {
 	f, c, l := mcpChainFixture(t, kindParityTree(), false)
 	edits := kindParityEdits()
@@ -471,7 +550,7 @@ func TestKindParityFoldAndRebase(t *testing.T) {
 		t.Helper()
 		view := chainMaterialize(t, f)
 		defer view.Close()
-		kindParityCheckWith(t, label, f.worktree, view.Reader, nil, func() graph.Reader { return primary.store })
+		kindAndSideTableCheck(t, label, f.worktree, view.Reader, sideSourcesOfView(f.store, view), nil, primary.store)
 	}
 	var trigger CheckoutCycle
 	for i := 0; i < 4; i++ {
@@ -581,67 +660,6 @@ func (e kindParityEdit) paths() []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// A direct edit of the producers' own file, on a clean checkout. The edit
-// shifts lines, so the primary per-save path re-derives the file as the delta
-// does: a same-line body edit is inert to the primary path, which then keeps
-// its prior rows and no longer tells an engine residual from a delta defect.
-func TestKindParityOwnFileEdit(t *testing.T) {
-	t.Run("same_line", func(t *testing.T) {
-		kindParityOwnFile(t, "func Env() string { return", "func Env() string { _ = 1; return")
-	})
-	t.Run("line_shift", func(t *testing.T) {
-		kindParityOwnFile(t, "func Env() string { return", "func Env() string {\n\t_ = 1\n\treturn")
-	})
-}
-
-func kindParityOwnFile(t *testing.T, from, to string) {
-	repoDir, store := kindParityRepo(t, "kind-parity-own-"+strings.ReplaceAll(t.Name(), "/", "-"))
-	builder := builderNewBuilder(store)
-	h := newDirtyChainBuilder(t, builder, store, repoDir, false)
-	src := kindParityTree()["prod/producers.go"]
-	builderWriteFile(t, repoDir, "prod/producers.go", strings.Replace(src, from, to, 1))
-	id, _, err := builder.BuildDirtyLayer(context.Background(), h.request())
-	if err != nil {
-		t.Fatal(err)
-	}
-	kindParityCheck(t, "own-file/"+t.Name(), repoDir, dirtyChainComposed(t, store, []int64{id}), generationCovered(t, store, id), []string{"prod/producers.go"})
-}
-
-// The older oracle (TestEditDeltaMatchesPrimaryPerSave's triangulation: a row
-// may differ from the primary per-save path only where it matches a whole
-// index) over the producers fixture, whose function values, interface and
-// clone pair its seeded repositories do not carry. The edits shift lines, so
-// the primary path re-derives the file as the delta does.
-func TestEditDeltaMatchesPrimaryPerSaveProducers(t *testing.T) {
-	src := kindParityTree()["prod/producers.go"]
-	cases := map[string]kindParityEdit{
-		"own_file":  {name: "own_file", write: map[string]string{"prod/producers.go": strings.Replace(src, "func Env() string { return", "func Env() string {\n\t_ = 1\n\treturn", 1)}},
-		"signature": kindParityEdits()[1],
-		"rename":    kindParityEdits()[2],
-		"delete":    kindParityEdits()[3],
-	}
-	for name, edit := range cases {
-		t.Run(name, func(t *testing.T) {
-			repoDir, store := kindParityRepo(t, "delta-vs-primary-"+name)
-			builder := builderNewBuilder(store)
-			h := newDirtyChainBuilder(t, builder, store, repoDir, false)
-			applyKindParityEdit(t, repoDir, edit)
-			id, _, err := builder.BuildDirtyLayer(context.Background(), h.request())
-			if err != nil {
-				t.Fatal(err)
-			}
-			primary := primaryPerSaveOf(t, repoDir, edit.paths(), config.Default().Index)
-			flat := builderOpenStore(t, "delta-vs-primary-flat-"+name)
-			builderIndex(t, flat, repoDir)
-			composed := dirtyChainComposed(t, store, []int64{id})
-			bad := editDeltaTriangulate(fingerprintNeutralReader{composed}, fingerprintNeutralReader{primary}, fingerprintNeutralReader{flat})
-			if len(bad) > 0 {
-				t.Errorf("%s: rows where the delta differs from the primary AND from a whole index:\n  %s", name, strings.Join(bad, "\n  "))
-			}
-		})
-	}
 }
 
 // kindParityPrimary is the primary checkout's per-save path over the same

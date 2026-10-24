@@ -113,14 +113,15 @@ func resolverScopeArm(t *testing.T, edit string, scoped bool) (map[string]string
 	dir := builderTempDir(t, "scope-"+edit)
 	builderWriteTree(t, dir, resolverScopeTree())
 	store := builderOpenStore(t, "scope-"+edit)
-	builderIndex(t, store, dir)
+	// The tree is Go and TypeScript only (see indexWithRegistry).
+	indexWithRegistry(t, store, dir, goTSRegistry())
 
 	if err := os.WriteFile(filepath.Join(dir, "pkg", "a.go"), []byte(resolverScopeEdits[edit]), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	core, logs := observer.New(zap.InfoLevel)
 	logger := zap.New(core)
-	idx := New(store, builderRegistry(), indexCfg, logger)
+	idx := New(store, goTSRegistry(), indexCfg, logger)
 	defer idx.Close()
 	idx.resolver.SetLogger(logger)
 	idx.SetRepoPrefix(builderRepoPrefix)

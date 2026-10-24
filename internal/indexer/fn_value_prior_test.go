@@ -68,8 +68,10 @@ func TestEditDeltaFnValueResolvesOnlyWhatTheSaveMoved(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newCoordinatorFixtureWithTree(t, fnValueTree(fnValueHandlers))
-			c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+			// The tree is Go only: the base, the builder and the clean index
+			// all go through a Go registry (see indexWithRegistry).
+			f := newCoordinatorFixtureIndexedBy(t, fnValueTree(fnValueHandlers), goIndex)
+			c := f.inertCoordinator(t, CheckoutCoordinatorConfig{Builder: builderWithRegistry(f.store, builderGoRegistry())})
 			c.compaction.quiet = -1
 			coordinatorReconcile(t, c)
 			path := filepath.Join(f.worktree, "pkg", "reg.go")
@@ -93,7 +95,7 @@ func TestEditDeltaFnValueResolvesOnlyWhatTheSaveMoved(t *testing.T) {
 			view := chainMaterialize(t, f)
 			defer view.Close()
 			clean := builderOpenStore(t, "fv-clean-"+tc.name)
-			builderIndex(t, clean, f.worktree)
+			goIndex(t, clean, f.worktree)
 			served, want := fnValueRegistrations(t, view.Reader), fnValueRegistrations(t, clean)
 			if len(want) < 2 {
 				t.Fatalf("the fixture registers too little: %v", want)

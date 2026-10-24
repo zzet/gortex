@@ -1217,12 +1217,20 @@ func TestAnUnresolvableWaitTargetIsNotReportedAsACommittedBase(t *testing.T) {
 // can fail — an expired deadline — and answer out of the stale route for the
 // other five. A caller that set both knobs and got coordinator_unavailable read
 // a stale route it had explicitly refused, with no error to branch on.
+//
+// One more outcome — a publication another view answered, after which the
+// caller's own bound expires — is pinned with the same control/refusal pair by
+// TestAFreshWaitAnsweredByABaseFallbackIsNotReportedFresh and
+// TestAFreshWaitAnsweredByABaseFallbackRefusesUnderRequireExact. Each has to
+// wait a real wait_deadline out, so the table does not repeat them.
 func TestRequireExactRefusesEveryUnfreshOutcome(t *testing.T) {
 	type unfreshCase struct {
 		// arrange installs the failure and returns the request arguments.
 		arrange func(stack *viewStack) map[string]any
-		verify  func(t *testing.T, stack *viewStack)
 		reason  string
+		// consumesRoute marks an arrangement that deletes the fixture's
+		// route, so the strict half cannot reuse the control's stack.
+		consumesRoute bool
 	}
 	cases := map[string]unfreshCase{
 		"an unavailable coordinator": {
@@ -1272,15 +1280,8 @@ func TestRequireExactRefusesEveryUnfreshOutcome(t *testing.T) {
 				}
 				return freshArgs(nil, time.Minute)
 			},
-			reason: freshReasonWaitTargetUnavailable,
-		},
-		"a publication another view answered": {
-			arrange: func(stack *viewStack) map[string]any {
-				stack.srv.freshnessWaiter = withdrawnPublicationFreshnessWaiter(t, stack)
-				return freshArgs(nil, 2*time.Second)
-			},
-			verify: assertWithdrawnPublicationWaited,
-			reason: freshReasonDeadlineExceeded,
+			reason:        freshReasonWaitTargetUnavailable,
+			consumesRoute: true,
 		},
 		"a failed publication": {
 			arrange: func(stack *viewStack) map[string]any {
@@ -1313,14 +1314,18 @@ func TestRequireExactRefusesEveryUnfreshOutcome(t *testing.T) {
 				tc.arrange(lenient), captureReader(lenient.srv, new(graph.Reader)))
 			require.NoError(t, err)
 			require.False(t, res.IsError, "without require_exact this outcome must still answer: %s", viewResultText(t, res))
-			if tc.verify != nil {
-				tc.verify(t, lenient)
-			}
 			rider := resultFreshness(t, res)
 			require.Equal(t, false, rider["fresh"], "rider = %v", rider)
 			require.Equal(t, tc.reason, rider["fresh_reason"], "rider = %v", rider)
+			controlWaits := len(lenient.srv.freshnessWaiter.(*fakeFreshnessWaiter).observed())
 
-			strict := newViewStack(t)
+			// The control only reads, so the strict request runs against the
+			// very fixture the control answered from — unless the arrangement
+			// itself deleted the route.
+			strict := lenient
+			if tc.consumesRoute {
+				strict = newViewStack(t)
+			}
 			args := tc.arrange(strict)
 			args[requireExactArgName] = true
 			var served graph.Reader
@@ -1328,15 +1333,10 @@ func TestRequireExactRefusesEveryUnfreshOutcome(t *testing.T) {
 			require.NoError(t, err)
 			assertToolError(t, res, graphview.CodeViewBuilding)
 			require.Nil(t, served, "require_exact must refuse before the handler reads a fallback")
-			if tc.verify != nil {
-				tc.verify(t, strict)
-			}
+			require.Len(t, strict.srv.freshnessWaiter.(*fakeFreshnessWaiter).observed(), controlWaits,
+				"the strict request must wait exactly as the control did, not short-cut on state the control left")
 			text := viewResultText(t, res)
-			reason := tc.reason
-			if reason == freshReasonDeadlineExceeded {
-				reason = "wait_deadline"
-			}
-			require.Contains(t, text, reason,
+			require.Contains(t, text, tc.reason,
 				"the refusal must name the outcome the caller has to act on: %s", text)
 			require.Contains(t, text, requireExactArgName, "refusal = %s", text)
 		})
@@ -1620,7 +1620,9 @@ func TestAFreshWaitAnsweredByABaseFallbackRefusesUnderRequireExact(t *testing.T)
 	assertWithdrawnPublicationWaited(t, stack)
 	assertToolError(t, res, graphview.CodeViewBuilding)
 	require.Nil(t, served, "require_exact must refuse before the handler reads a fallback")
-	require.Contains(t, viewResultText(t, res), "wait_deadline")
+	text := viewResultText(t, res)
+	require.Contains(t, text, "wait_deadline", "the refusal must name the outcome the caller has to act on: %s", text)
+	require.Contains(t, text, requireExactArgName, "refusal = %s", text)
 }
 
 // The positive control for both tests above, and the thing that keeps them

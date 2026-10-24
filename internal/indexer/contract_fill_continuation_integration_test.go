@@ -70,16 +70,21 @@ func TestContractFillColdWorkMakesBoundedProgressAcrossActors(t *testing.T) {
 		}
 	}
 	require.Equal(t, []bool{true, true}, complete, "both cold-work actors complete in bounded alternating slices")
+	// Both actors index the same files: one cold build is the oracle of both.
+	want := contractMeta(coldContracts(t, files))
 	for actor, f := range actors {
 		require.Len(t, seen[actor], len(files), "completed cold fill extracted the entire census")
 		for name := range files {
 			require.Contains(t, seen[actor], "fixture/"+name)
 		}
-		require.Equal(t, contractMeta(coldContracts(t, files)), contractMeta(f.contracts()))
+		require.Equal(t, want, contractMeta(f.contracts()))
 	}
 }
 
 func TestContractFillContinuationMembershipChangesAndEvictionFinish(t *testing.T) {
+	// Every row but add_remove ends on its initial files: they share one
+	// cold build.
+	oracles := contractColdOracles{}
 	for _, change := range []string{"add_remove", "same_path_new_work", "evict", "cancel", "key_move"} {
 		t.Run(change, func(t *testing.T) {
 			files := map[string]string{"routes.go": jobRoutes, "consts.go": jobConsts}
@@ -132,7 +137,7 @@ func TestContractFillContinuationMembershipChangesAndEvictionFinish(t *testing.T
 			if change == "same_path_new_work" {
 				require.Equal(t, 2, extracted["fixture/helper00.go"], "new same-fingerprint debt forces an actual new own extraction")
 			}
-			require.Equal(t, contractMeta(coldContracts(t, files)), contractMeta(f.contracts()))
+			require.Equal(t, contractMeta(oracles.contracts(t, files)), contractMeta(f.contracts()))
 		})
 	}
 }

@@ -10,15 +10,24 @@ import (
 )
 
 func TestImportFoldPlanningRestoresFallbackAndDeclineOwnership(t *testing.T) {
-	for _, mode := range []string{"mutable_ancestry", "missing_generation", "cancelled", "reentry_failure"} {
+	// The modes share one chain at the compaction depth. The three declines
+	// are read-only — each asserts the routed chain, the leases, the
+	// preparation slot and the catalog are as it found them — so they run
+	// first; mutable_ancestry, the one mode that publishes and routes a fold,
+	// runs last.
+	f, c, lifecycle := mcpChainFixture(t, builderTreeA(), false)
+	var chained CheckoutCycle
+	for i := 0; i < dirtyChainCompactionDepth; i++ {
+		chained = mcpEdit(t, lifecycle, f, func() { foldWiringEdits[i](t, f) })
+	}
+	if chained.DirtyChainDepth != dirtyChainCompactionDepth {
+		t.Fatalf("chain depth=%d, want %d", chained.DirtyChainDepth, dirtyChainCompactionDepth)
+	}
+	for _, mode := range []string{"missing_generation", "cancelled", "reentry_failure", "mutable_ancestry"} {
 		t.Run(mode, func(t *testing.T) {
-			f, c, lifecycle := mcpChainFixture(t, builderTreeA(), false)
-			var out CheckoutCycle
-			for i := 0; i < dirtyChainCompactionDepth; i++ {
-				out = mcpEdit(t, lifecycle, f, func() { foldWiringEdits[i](t, f) })
-			}
-			if out.DirtyChainDepth != dirtyChainCompactionDepth {
-				t.Fatalf("chain depth=%d, want %d", out.DirtyChainDepth, dirtyChainCompactionDepth)
+			out := chained
+			if route := f.route(); route.DirtyGenerationID != out.DirtyGenerationID {
+				t.Fatalf("an earlier mode moved the routed chain: route %d, chain top %d", route.DirtyGenerationID, out.DirtyGenerationID)
 			}
 			base, closeBase, err := c.generationLayerReader(t.Context(), out.DirtyGenerationID)
 			if err != nil {

@@ -37,11 +37,19 @@ func editDeltaBuilder(t *testing.T, b *SparseGenerationBuilder) *SparseGeneratio
 // the per-file delta path, and requires the whole stack to answer every read
 // like a plain whole index of what is on disk, except rows the primary
 // per-save engine produces identically (the engine's own residual classes).
+// Every delta's dependents plan is held to the closure walk's as it builds
+// (editDeltaCompareDependentsWithTheWalk).
 func TestEditDeltaDirtyEquivalenceProperty(t *testing.T) {
-	for _, seed := range propSeedCorpus(t) {
+	compared := editDeltaCompareDependentsWithTheWalk(t)
+	seeds, ran := propSeedCorpus(t), 0
+	for _, seed := range seeds {
 		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
+			ran++
 			propRunDirtyDeltaCase(t, seed)
 		})
+	}
+	if ran == len(seeds) {
+		compared.requireCompared(t)
 	}
 }
 
@@ -309,78 +317,54 @@ func primaryPerSaveOf(t *testing.T, repoDir string, paths []string, cfg config.I
 	return store
 }
 
-// The accumulated-edit clean-parity oracle, with the working-tree generations
-// built by the delta path (both layouts): every sidecar (files inventory,
-// symbol full-text documents and search probes, semantic binding types,
-// constant values) and the masks must match a clean index strictly; nodes and
-// edges must match it everywhere except rows the primary per-save path
-// produces identically (the engine's own residual classes).
-func TestEditDeltaAccumulatedCleanParityIndependentPackages(t *testing.T) {
-	editDeltaAccumulatedParity(t, accumulatedDirtyIndependent, 25)
+// The accumulated-edit sequence (25 body edits, one generation each, chained
+// and folded at the harness's compaction depth; then a body edit of a fresh
+// unit, its partial undo and a comment edit), with every working-tree
+// generation required to be built by the delta path, in both layouts.
+//
+// The clean-index parity of this exact sequence is asserted, strictly, by
+// TestAccumulatedDirtyEditCleanParityIndependentPackages and
+// TestAccumulatedDirtyEditCleanParitySamePackage: they run the same builder
+// over the same edits and check the body and comment states with an oracle
+// (every node, edge, sidecar, mask and reader probe equal to a clean index)
+// stronger than the triangulated one (TestEditDeltaInvalidationClasses), so
+// this test does not repeat it. What it adds is that none of the builds fell
+// back to the sparse builder.
+func TestEditDeltaAccumulatedEditsAreDeltasIndependentPackages(t *testing.T) {
+	editDeltaAccumulatedEdits(t, accumulatedDirtyIndependent, 25)
 }
 
-func TestEditDeltaAccumulatedCleanParitySamePackage(t *testing.T) {
-	editDeltaAccumulatedParity(t, accumulatedDirtySamePackage, 25)
+func TestEditDeltaAccumulatedEditsAreDeltasSamePackage(t *testing.T) {
+	editDeltaAccumulatedEdits(t, accumulatedDirtySamePackage, 25)
 }
 
-func editDeltaAccumulatedParity(t *testing.T, layout accumulatedDirtyLayout, n int) {
+func editDeltaAccumulatedEdits(t *testing.T, layout accumulatedDirtyLayout, n int) {
 	t.Helper()
 	store := builderOpenStore(t, fmt.Sprintf("delta-%s-%d", layout, n))
 	repoDir := accumulatedDirtyRepo(t, layout, store)
 	builder := builderNewBuilder(store)
 	chains := newDirtyChainBuilder(t, builder, store, repoDir, true)
-	var chain []int64
-	var dirty []string
-	build := func() {
+	build := func(label string) {
 		t.Helper()
 		recordLastEditDelta(nil)
-		_, _, chain = chains.build()
+		chains.build()
 		if LastEditDeltaReport() == nil {
-			t.Fatalf("%s: the working-tree generation was not built by the delta path", layout)
+			t.Fatalf("%s %s: the working-tree generation was not built by the delta path", layout, label)
 		}
 		chains.settle()
 	}
-	check := func(label string) {
-		t.Helper()
-		result := assertCleanIndexParityChain(t, store, chain, repoDir, label, false)
-		sidecars := result.FilesEqual && result.SymbolFTSEqual && result.SearchProbesEqual &&
-			result.SemanticEqual && result.ConstantsEqual && result.MasksValid
-		if !sidecars {
-			t.Errorf("%s: sidecars differ from the clean index: %+v", label, result)
-		}
-		if result.NodesEqual && result.EdgesEqual {
-			return
-		}
-		primary := primaryPerSaveOf(t, repoDir, dirty, config.Default().Index)
-		clean := builderOpenStore(t, "clean-tri-"+label)
-		builderIndex(t, clean, repoDir)
-		composed := dirtyChainComposed(t, store, chain)
-		if bad := editDeltaTriangulate(composed, primary, clean); len(bad) > 0 {
-			t.Errorf("%s: rows where the delta differs from both the clean index and the primary per-save path:\n  %s",
-				label, strings.Join(bad, "\n  "))
-			return
-		}
-		t.Logf("%s: nodes equal=%t edges equal=%t; every differing row is the primary per-save engine's own",
-			label, result.NodesEqual, result.EdgesEqual)
-	}
 	for i := 0; i < n; i++ {
 		accumulatedDirtyWriteUnit(t, repoDir, layout, i, true, false)
-		dirty = append(dirty, accumulatedDirtyUnitPath(layout, i))
-		build()
+		build(fmt.Sprintf("accumulated %d", i))
 	}
-	body := accumulatedDirtyUnitPath(layout, accumulatedDirtyBodyTarget)
 	accumulatedDirtyWriteUnit(t, repoDir, layout, accumulatedDirtyBodyTarget, true, false)
-	build()
-	dirty = append(dirty, body)
-	check(fmt.Sprintf("%s-body-%d", layout, n))
+	build("body")
 	// Undo the body edit (a partial undo: the path returns to its committed
 	// bytes), then a comment edit in a fresh unit.
 	accumulatedDirtyWriteUnit(t, repoDir, layout, accumulatedDirtyBodyTarget, false, false)
-	build()
+	build("undo")
 	accumulatedDirtyWriteUnit(t, repoDir, layout, accumulatedDirtyCommentTarget, false, true)
-	dirty = append(dirty, accumulatedDirtyUnitPath(layout, accumulatedDirtyCommentTarget))
-	build()
-	check(fmt.Sprintf("%s-comment-%d", layout, n))
+	build("comment")
 }
 
 // The five invalidation classes (invalidation_classes_test.go) with the
@@ -390,8 +374,10 @@ func editDeltaAccumulatedParity(t *testing.T, layout accumulatedDirtyLayout, n i
 // triangulated oracle instead — the composed view must match a clean index of
 // the checkout on every node and edge row, except rows the primary checkout's
 // per-save path produces identically — plus mask validity and the files
-// inventory against the clean index.
+// inventory against the clean index. Every delta's dependents plan is held to
+// the closure walk's as it builds (editDeltaCompareDependentsWithTheWalk).
 func TestEditDeltaInvalidationClasses(t *testing.T) {
+	compared := editDeltaCompareDependentsWithTheWalk(t)
 	mod := accumulatedDirtyModule
 	cases := []struct {
 		name  string
@@ -428,8 +414,10 @@ func TestEditDeltaInvalidationClasses(t *testing.T) {
 		}},
 	}
 	const accumulated = 5
+	ran := 0
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			ran++
 			r := newInvalidationRun(t, "delta-"+c.name, accumulated)
 			c.edit(r)
 			id := r.chains.chain[len(r.chains.chain)-1]
@@ -458,5 +446,8 @@ func TestEditDeltaInvalidationClasses(t *testing.T) {
 					c.name, strings.Join(bad, "\n  "))
 			}
 		})
+	}
+	if ran == len(cases) {
+		compared.requireCompared(t)
 	}
 }

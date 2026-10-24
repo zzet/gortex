@@ -475,6 +475,94 @@ func TestACodeownersMovedAndRestoredTearsTheBuild(t *testing.T) {
 	}
 }
 
+// sideInputBase is sideInputCheckout's base corpus indexed once, kept as the
+// database's bytes, so a test that needs many identical checkouts opens a
+// private copy for each rather than indexing the same files again.
+//
+// A copy holds exactly the rows a fresh index of its checkout would write,
+// because every checkout is made the same way: each file is written with the
+// same modification time (the index records it), and the commit is made with
+// the same dates, so it has the same id (the index records the commit it
+// indexed). What differs is only the wall-clock second the index ran at.
+//
+// The index also leaves one thing behind outside the store: the process-wide
+// alias-scope cache entry for the checkout's root (tsAliasCache, never
+// invalidated), which a later build resolves through instead of scanning the
+// working copy — a different proof path. checkout loads that entry at the
+// same point the index would have, so the builds take the same path.
+type sideInputBase struct {
+	db    []byte
+	mtime time.Time
+}
+
+func newSideInputBase(t *testing.T) *sideInputBase {
+	t.Helper()
+	builderIsolateGit(t)
+	mtime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	stamp := mtime.Format(time.RFC3339)
+	t.Setenv("GIT_AUTHOR_DATE", stamp)
+	t.Setenv("GIT_COMMITTER_DATE", stamp)
+	base := &sideInputBase{mtime: mtime}
+	repoDir := base.commit(t)
+	path := filepath.Join(t.TempDir(), "base.sqlite")
+	store := builderOpenStoreAt(t, path)
+	builderIndex(t, store, repoDir)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close the base store: %v", err)
+	}
+	// A close that left a write-ahead log behind would make the bytes an
+	// incomplete database.
+	for _, sidecar := range []string{path + "-wal", path + "-shm"} {
+		if info, err := os.Stat(sidecar); err == nil && info.Size() > 0 {
+			t.Fatalf("the base store left %s behind", filepath.Base(sidecar))
+		}
+	}
+	db, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.db = db
+	return base
+}
+
+// commit writes sideInputFiles into a new repository at the base's
+// modification time and commits them.
+func (b *sideInputBase) commit(t *testing.T) string {
+	t.Helper()
+	repoDir := builderTempDir(t, "checkout")
+	builderGit(t, repoDir, "init", "--initial-branch=main")
+	for name, body := range sideInputFiles {
+		if err := os.MkdirAll(filepath.Join(repoDir, filepath.Dir(name)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		builderWriteFile(t, repoDir, name, body)
+		if err := os.Chtimes(filepath.Join(repoDir, filepath.FromSlash(name)), b.mtime, b.mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	builderGit(t, repoDir, "add", "-A")
+	builderGit(t, repoDir, "commit", "-m", "A")
+	return repoDir
+}
+
+// checkout is sideInputCheckout over a private copy of the base: a committed
+// checkout, its store, and the same two working-tree edits.
+func (b *sideInputBase) checkout(t *testing.T, name string) (*store_sqlite.Store, string) {
+	t.Helper()
+	repoDir := b.commit(t)
+	path := filepath.Join(t.TempDir(), name+".sqlite")
+	if err := os.WriteFile(path, b.db, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := builderOpenStoreAt(t, path)
+	t.Cleanup(func() { _ = store.Close() })
+	loadTSAliasCollection(repoDir) // what the index of the committed tree caches
+	builderWriteFile(t, repoDir, "pkg/a.go", sideInputEdit)
+	builderWriteFile(t, repoDir, "web/app.js", sideInputScriptEdit)
+	time.Sleep(2 * time.Second / 20) // past gitstate's change-stamp margin
+	return store, repoDir
+}
+
 // sampleStampsTrusted reports whether the checkout's filesystem gives the
 // change stamps the fence proves unrecorded reads by.
 func sampleStampsTrusted(t *testing.T, sampler *gitstate.DirtySampler, before gitstate.DirtySnapshot) bool {
@@ -496,9 +584,13 @@ func sampleStampsTrusted(t *testing.T, sampler *gitstate.DirtySampler, before gi
 // existed: it must be torn (or fail), or publish exactly what a build of the
 // unmoved checkout publishes. A reader that slips past the proof shows here
 // as a published payload that differs.
+//
+// Every build here, the reference included, stands on a private copy of one
+// indexed base (sideInputBase): the checkouts are byte-identical, so a
+// separate whole index per move would write the same rows again.
 func TestASampledBuildPublishesNoStateAMovedAndRestoredPathShowedIt(t *testing.T) {
-	reference := builderOpenStore(t, "reference")
-	referenceDir := sideInputCheckout(t, reference)
+	base := newSideInputBase(t)
+	reference, referenceDir := base.checkout(t, "reference")
 	sampler, before := sampleOf(t, referenceDir)
 	if !sampleStampsTrusted(t, sampler, before) {
 		t.Skip("the checkout's filesystem gives no change stamps")
@@ -585,8 +677,7 @@ func TestASampledBuildPublishesNoStateAMovedAndRestoredPathShowedIt(t *testing.T
 	published, torn := 0, 0
 	for _, mv := range moves {
 		t.Run(mv.name, func(t *testing.T) {
-			store := builderOpenStore(t, "moved")
-			repoDir := sideInputCheckout(t, store)
+			store, repoDir := base.checkout(t, "moved")
 			abs := filepath.Join(repoDir, filepath.FromSlash(mv.path))
 			original, readErr := os.ReadFile(abs)
 			existed := readErr == nil

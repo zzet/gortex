@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
@@ -234,6 +235,11 @@ func TestContractFollowupSourceFailureCancellationAndInputCAS(t *testing.T) {
 					src.Bytes = append(src.Bytes, '!')
 					return src, err
 				}
+				// Bytes that never match their stamp are a read that never
+				// settles. The request has no Published source, so every
+				// retry waits its round wait out and the job ends after
+				// contractIdleRounds of them: wait 50ms, not the 3s default.
+				req.convergenceHooks = &contractConvergenceHooks{roundWait: 50 * time.Millisecond}
 			case "unavailable":
 				req.Snapshot.ReadAccepted = func(context.Context, ContractFollowupFile) (ContractAcceptedSource, error) {
 					return ContractAcceptedSource{}, errors.New("accepted historical bytes unavailable")
@@ -258,6 +264,9 @@ func TestContractFollowupSourceFailureCancellationAndInputCAS(t *testing.T) {
 			report, err := RunContractFollowup(ctx, req)
 			if err == nil || report.Published {
 				t.Fatalf("failed proof certified=%#v %v", report, err)
+			}
+			if mode == "wrong-bytes" && !errors.Is(err, errContractJobReadUnsettled) {
+				t.Fatalf("wrong accepted bytes must end the job with unsettled reads, got %v", err)
 			}
 			if f.releases != 1 || f.leases.InUse(req.Payload.ViewGeneration()) {
 				t.Fatal("failure leaked handoff/payload lease")

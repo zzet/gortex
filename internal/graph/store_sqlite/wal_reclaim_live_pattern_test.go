@@ -36,6 +36,17 @@ func captureReclaimLog(t *testing.T) *syncBuffer {
 	return buf
 }
 
+// shortenWALReclaimLaneReaderWait bounds the in-lane wait for old readers
+// (walReclaimLaneReaderWait, 5 s) for a case whose reader never leaves: the
+// attempt ends the same way, only sooner. The case keeps the reclaim loop off
+// (GORTEX_SQLITE_WAL_RECLAIM_MB=0), so only its own attempts read the wait.
+func shortenWALReclaimLaneReaderWait(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := walReclaimLaneReaderWait
+	walReclaimLaneReaderWait = d
+	t.Cleanup(func() { walReclaimLaneReaderWait = prev })
+}
+
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -311,7 +322,10 @@ func TestWALReclaimDelaysAMutationAtMostTheWriterHoldCap(t *testing.T) {
 			ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
 			require.NoError(t, err)
 			defer ckpt.Close()
-			cfg := walReclaimConfig{thresholdBytes: tc.threshold, drainDeadline: 250 * time.Millisecond, truncateBudget: walReclaimTruncateBudget, readerWait: 3 * time.Second}
+			// The pinned reader outlasts both waits (writer-free, then in the
+			// lane); 3 s of attempt keeps well over ten paced mutations in it.
+			cfg := walReclaimConfig{thresholdBytes: tc.threshold, drainDeadline: 250 * time.Millisecond, truncateBudget: walReclaimTruncateBudget, readerWait: time.Second}
+			shortenWALReclaimLaneReaderWait(t, 2*time.Second)
 
 			stop := make(chan struct{})
 			var maxWait, maxTotal atomic.Int64
@@ -583,6 +597,9 @@ func TestAReclaimHoldHandsTheWriterBackWhenTheLogIsNotReady(t *testing.T) {
 	// Urgent (no yield to queued writes) and a short writer-free wait, so
 	// the attempt reaches its in-lane holds while the reader still pins.
 	cfg := walReclaimConfig{thresholdBytes: 1, drainDeadline: 250 * time.Millisecond, truncateBudget: walReclaimTruncateBudget, readerWait: 200 * time.Millisecond}
+	// The in-lane holds come first; the lane's wait for the pinned reader then
+	// runs out, and 1.5 s of it keeps well over twenty paced writes in flight.
+	shortenWALReclaimLaneReaderWait(t, 1500*time.Millisecond)
 	res := s.reclaimWALOnce(cfg, ckpt, path+"-wal")
 	close(stop)
 	wg.Wait()

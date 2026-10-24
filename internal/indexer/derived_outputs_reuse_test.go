@@ -252,6 +252,10 @@ func measureDatabaseFootprint(t *testing.T, store *store_sqlite.Store) databaseF
 // It drives BuildCommitLayer, not the primitive: the point of the item is that
 // the SPARSE BUILD stops writing what it reads, and a test that called the
 // separation directly would prove only that the separation works.
+//
+// Its subtest is the safety half (contextWithdrawalFallbackProducesTheSameGeneration):
+// the fallback build, compared with the very generation and fresh-index oracle
+// this test checks.
 func TestReadOnlyContextIsHeldInMemoryAndNeverWritten(t *testing.T) {
 	store := builderOpenStore(t, "in-memory-context")
 	_, generationID, report := builderContextGeneration(
@@ -299,9 +303,13 @@ func TestReadOnlyContextIsHeldInMemoryAndNeverWritten(t *testing.T) {
 	composed := builderComposed(t, store, generationID)
 	builderAssertReadersAgree(t, composed, flat)
 	builderAssertMasksValidate(t, store, generationID)
+
+	t.Run("withdrawal fallback produces the same generation", func(t *testing.T) {
+		contextWithdrawalFallbackProducesTheSameGeneration(t, store, generationID, report, flat)
+	})
 }
 
-// TestContextWithdrawalFallbackProducesTheSameGeneration is the safety half.
+// contextWithdrawalFallbackProducesTheSameGeneration is the safety half.
 // The in-memory route is an optimisation the pass may not always be able to
 // take — an oversized closure, a refused admission, a backend without the bulk
 // path — and when it cannot, the build must still publish exactly the same
@@ -309,11 +317,13 @@ func TestReadOnlyContextIsHeldInMemoryAndNeverWritten(t *testing.T) {
 //
 // The two halves are compared table by table, mask by mask, and against the
 // same fresh-index oracle, so "the same generation" is a measured claim rather
-// than an assertion about the code path.
-func TestContextWithdrawalFallbackProducesTheSameGeneration(t *testing.T) {
-	held := builderOpenStore(t, "held")
-	_, heldGen, heldReport := builderContextGeneration(
-		t, held, builderContextTreeA(), builderContextTreeBodyEdit())
+// than an assertion about the code path. held is the in-memory build of
+// builderContextTreeA -> builderContextTreeBodyEdit, and flat the fresh index
+// of the edited tree that the caller has already compared it with.
+func contextWithdrawalFallbackProducesTheSameGeneration(
+	t *testing.T, held *store_sqlite.Store, heldGen int64, heldReport BuildReport, flat graph.Reader,
+) {
+	t.Helper()
 	if !heldReport.ContextHeldInMemory {
 		t.Fatal("the unconstrained build did not take the in-memory route")
 	}
@@ -363,12 +373,7 @@ func TestContextWithdrawalFallbackProducesTheSameGeneration(t *testing.T) {
 		t.Errorf("masks differ between the two modes")
 	}
 
-	// And the oracle, for both.
-	flat := builderOpenStore(t, "fallback-flat")
-	dirB := builderTempDir(t, "checkout-b")
-	builderWriteTree(t, dirB, builderContextTreeBodyEdit())
-	builderIndex(t, flat, dirB)
-	builderAssertReadersAgree(t, builderComposed(t, held, heldGen), flat)
+	// And the oracle the held generation was already compared with.
 	builderAssertReadersAgree(t, builderComposed(t, withdrawn, withdrawnGen), flat)
 }
 

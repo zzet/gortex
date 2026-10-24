@@ -37,52 +37,10 @@ func scopeAssertCounter(t *testing.T, f *coordinatorFixture, label string, out C
 	return packages
 }
 
-// TestDirtyChainSemanticHandleRootsParity: chained single-file edits in the
-// independent and the same-package layouts load one package each and keep
-// parity with a clean semantic index, binding rows included.
-func TestDirtyChainSemanticHandleRootsParity(t *testing.T) {
-	f, c, mgr := semanticChainFixtureWith(t, semanticBindingTree(), true)
-	coordinatorReconcile(t, c)
-
-	for i := 0; i < 8; i++ {
-		semanticWriteUnit(t, f.worktree, accumulatedDirtyIndependent, i, true)
-	}
-	root := coordinatorReconcile(t, c)
-	if root.DirtyParentGenerationID != 0 {
-		t.Fatalf("the chain root = %+v, want a direct build", root)
-	}
-	scopeAssertCounter(t, f, "root", root)
-	assertSemanticParity(t, f, mgr, "scoped-root")
-
-	for k, edit := range []struct {
-		layout accumulatedDirtyLayout
-		unit   int
-		files  int
-		pkg    string
-	}{
-		{accumulatedDirtyIndependent, 9, 1, builderRepoPrefix + "/ind/p009"},
-		{accumulatedDirtySamePackage, 3, retentionUnits, builderRepoPrefix + "/same"},
-		{accumulatedDirtyIndependent, 12, 1, builderRepoPrefix + "/ind/p012"},
-	} {
-		semanticWriteUnit(t, f.worktree, edit.layout, edit.unit, true)
-		out := coordinatorReconcile(t, c)
-		label := fmt.Sprintf("scoped-chained-%d", k)
-		if out.DirtyParentGenerationID == 0 {
-			t.Fatalf("%s = %+v, want a chained build", label, out)
-		}
-		packages := scopeAssertCounter(t, f, label, out)
-		if !slices.Equal(packages, []string{edit.pkg}) {
-			t.Errorf("%s: packages(handle) = %v, want only %s", label, packages, edit.pkg)
-		}
-		if got := out.DirtyWork.CompilerContext.Files; got != edit.files {
-			t.Errorf("%s: %d compiled files loaded, want %d", label, got, edit.files)
-		}
-		if n := semanticGenerationBindingRows(t, f, out.DirtyGenerationID); n == 0 {
-			t.Errorf("%s: the generation wrote no binding rows; the binding oracle is vacuous", label)
-		}
-		assertSemanticParity(t, f, mgr, label)
-	}
-}
+// The chained single-file edits in the independent and the same-package
+// layouts (one package loaded each, parity with a clean semantic index,
+// binding rows included) are TestDirtyChainSemanticTypecheckCacheParity: the
+// same fixture, root and per-edit assertions, with the cache counters on top.
 
 // semanticScopeChainTree is the binding tree plus a dependency chain
 // a -> b -> c -> d. a's package variable takes its type from b.B, so a type
@@ -155,7 +113,7 @@ func scopeChainFixture(t *testing.T, handleRoots bool, extra map[string]string) 
 	for p, body := range extra {
 		tree[p] = body
 	}
-	f, c, mgr := semanticChainFixtureWith(t, tree, handleRoots)
+	f, c, mgr := semanticGoChainFixture(t, tree, handleRoots)
 	coordinatorReconcile(t, c)
 	semanticWriteUnit(t, f.worktree, accumulatedDirtyIndependent, 0, true)
 	if root := coordinatorReconcile(t, c); root.DirtyGenerationID == 0 || !goTypesRan(root.DirtyWork) {
@@ -214,7 +172,7 @@ func A() int {
 		if !scopeHasSemanticEdge(t, f, "chain/a/a.go::A", "chain/b/b.go::B") {
 			t.Error("the served view lost the type-resolved call A -> b.B")
 		}
-		assertSemanticParity(t, f, mgr, "cross-package")
+		assertGoSemanticParity(t, f, mgr, "cross-package")
 	})
 	t.Run("import_change", func(t *testing.T) {
 		f, c, mgr := scopeChainFixture(t, true, nil)
@@ -230,7 +188,7 @@ func A() int {
 		if !scopeHasSemanticEdge(t, f, "chain/b/b.go::B", "chain/d/d.go::D") {
 			t.Error("the served view lacks the type-resolved call B -> d.D the import made possible")
 		}
-		assertSemanticParity(t, f, mgr, "import-change")
+		assertGoSemanticParity(t, f, mgr, "import-change")
 	})
 	t.Run("name_becomes_resolvable", func(t *testing.T) {
 		waiting := map[string]string{"chain/e/e.go": `package e
@@ -282,7 +240,7 @@ func TestDirtyChainSemanticHandleRootsManifestFallback(t *testing.T) {
 	if !cc.Measured || cc.Scope != semantic.CompilerScopeFull || cc.ScopeReason != semantic.CompilerScopeReasonManifestChanged {
 		t.Errorf("compiler context %+v, want a whole-module load with reason %s", cc, semantic.CompilerScopeReasonManifestChanged)
 	}
-	assertSemanticParity(t, f, mgr, "go-mod")
+	assertGoSemanticParity(t, f, mgr, "go-mod")
 }
 
 // scopeHole runs one invalidation-hole scenario in both load modes and
@@ -292,6 +250,10 @@ func scopeHole(t *testing.T, name string, extra map[string]string, edit func(t *
 	t.Helper()
 	diffs := map[bool][]string{}
 	counters := map[bool]string{}
+	// Both modes build the same tree and apply the same edit, so their
+	// worktrees hold the same content after it: the oracle built for the
+	// first serves the second.
+	var oracle *semanticOracle
 	for _, handleRoots := range []bool{false, true} {
 		f, c, mgr := scopeChainFixture(t, handleRoots, extra)
 		edit(t, f.worktree)
@@ -306,7 +268,11 @@ func scopeHole(t *testing.T, name string, extra map[string]string, edit func(t *
 		counters[handleRoots] = fmt.Sprintf("parent=%d chain_reason=%q withheld=%d retained=%d scope=%s packages=%d",
 			out.DirtyParentGenerationID, out.DirtyChainReason, w.ContextWithheldFiles, w.ContextRetainedFiles,
 			w.CompilerContext.Scope, w.CompilerContext.Packages)
-		diffs[handleRoots] = semanticParityDiffs(t, f, mgr, fmt.Sprintf("%s-%v", name, handleRoots))
+		if oracle == nil {
+			built := semanticOracleOf(t, f, mgr, name, builderGoRegistry)
+			oracle = &built
+		}
+		diffs[handleRoots] = semanticParityDiffsAgainst(t, f, *oracle, fmt.Sprintf("%s-%v", name, handleRoots))
 		t.Logf("%s handle_roots=%v: %s; %d parity differences", name, handleRoots, counters[handleRoots], len(diffs[handleRoots]))
 	}
 	normalize := func(in []string) []string {

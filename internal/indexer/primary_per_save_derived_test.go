@@ -15,6 +15,8 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
 )
 
 // The primary checkout's per-save path re-derives capability edges only for the
@@ -23,6 +25,45 @@ import (
 // that bound to its oracle: after each edit, every capability row
 // (accesses_field, reads_env, executes_process) equals the row a whole index of
 // the edited tree writes.
+
+// The per-save parity fixtures hold only Go sources, or Go and TypeScript
+// ones. A whole index of each through builderGoRegistry (or goTSRegistry)
+// writes exactly the rows a builderRegistry index writes — every table, the
+// index timestamps aside — while builderRegistry first compiles every other
+// language's queries, which was most of these tests' time. Every call still
+// builds a fresh registry: no extractor is shared.
+
+// indexWithRegistry is builderIndex through reg.
+func indexWithRegistry(t testing.TB, store *store_sqlite.Store, dir string, reg *parser.Registry) {
+	t.Helper()
+	idx := New(store, reg, config.Default().Index, zap.NewNop())
+	defer idx.Close()
+	idx.SetRepoPrefix(builderRepoPrefix)
+	idx.SetWorkspaceID(builderRepoPrefix)
+	idx.SetProjectID(builderRepoPrefix)
+	if _, err := idx.Index(dir); err != nil {
+		t.Fatalf("index %s: %v", dir, err)
+	}
+}
+
+// goIndex is builderIndex for a fixture whose whole source inventory is Go.
+func goIndex(t testing.TB, store *store_sqlite.Store, dir string) {
+	t.Helper()
+	indexWithRegistry(t, store, dir, builderGoRegistry())
+}
+
+// goTSRegistry is builderGoRegistry plus a fresh TypeScript extractor, for
+// fixtures whose source inventory is Go and TypeScript.
+func goTSRegistry() *parser.Registry {
+	reg := builderGoRegistry()
+	reg.Register(languages.NewTypeScriptExtractor())
+	return reg
+}
+
+// builderWithRegistry is builderNewBuilder through reg.
+func builderWithRegistry(store *store_sqlite.Store, reg *parser.Registry) *SparseGenerationBuilder {
+	return &SparseGenerationBuilder{Store: store, Registry: reg, Config: config.Default().Index, Logger: zap.NewNop()}
+}
 
 func perSaveCapabilityTree() map[string]string {
 	return map[string]string{
@@ -268,9 +309,9 @@ func TestPerSaveCapabilityMatchesAWholeIndex(t *testing.T) {
 			dir := builderTempDir(t, "cap-"+name)
 			builderWriteTree(t, dir, perSaveCapabilityTree())
 			store := builderOpenStore(t, "cap-"+name)
-			builderIndex(t, store, dir)
+			goIndex(t, store, dir)
 			core, logs := observer.New(zap.InfoLevel)
-			idx := New(store, builderRegistry(), config.Default().Index, zap.New(core))
+			idx := New(store, builderGoRegistry(), config.Default().Index, zap.New(core))
 			defer idx.Close()
 			idx.SetRepoPrefix(builderRepoPrefix)
 			idx.SetWorkspaceID(builderRepoPrefix)
@@ -323,7 +364,7 @@ func TestPerSaveCapabilityMatchesAWholeIndex(t *testing.T) {
 			tree["pkg/state.go"] = edited
 			builderWriteTree(t, cleanDir, tree)
 			clean := builderOpenStore(t, "cap-clean-"+name)
-			builderIndex(t, clean, cleanDir)
+			goIndex(t, clean, cleanDir)
 			whole := capabilityRows(t, clean)
 			// The whole index ran from another directory: compare
 			// repository-relative rows (both stores use the same prefix).
@@ -371,7 +412,7 @@ func TestScopedIncrementalPassReusesTheRepositoryCount(t *testing.T) {
 	dir := builderTempDir(t, "counts")
 	builderWriteTree(t, dir, perSaveCapabilityTree())
 	store := builderOpenStore(t, "counts")
-	idx := New(store, builderRegistry(), config.Default().Index, zap.NewNop())
+	idx := New(store, builderGoRegistry(), config.Default().Index, zap.NewNop())
 	defer idx.Close()
 	idx.SetRepoPrefix(builderRepoPrefix)
 	idx.SetWorkspaceID(builderRepoPrefix)
@@ -411,7 +452,7 @@ func TestCapabilityPriorRestoresDeletedIncomingAccesses(t *testing.T) {
 	dir := builderTempDir(t, "cap-restore")
 	builderWriteTree(t, dir, perSaveCapabilityTree())
 	store := builderOpenStore(t, "cap-restore")
-	builderIndex(t, store, dir)
+	goIndex(t, store, dir)
 	const source = "repo/pkg/use.go::Server.Count"
 	var deleted []*graph.Edge
 	for _, edge := range store.GetOutEdges(source) {

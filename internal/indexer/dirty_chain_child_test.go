@@ -35,9 +35,30 @@ type chainChildRun struct {
 // child over.
 func newChainChildRun(t *testing.T, name string, layout accumulatedDirtyLayout, dirty int) *chainChildRun {
 	t.Helper()
+	return newChainChildRunWith(t, name, layout, dirty, nil)
+}
+
+// newChainChildRunWith is newChainChildRun with an extra working-tree change
+// (when extra is not nil) applied before the root is published.
+//
+// The base corpus and the builder parse with a Go-only registry: the module is
+// Go source plus go.mod, which the indexer reads without a registry extractor,
+// so the graph is the one the full registry builds (the clean index the parity
+// oracle compares with still uses the full one) without compiling every other
+// language's queries, about a third of a second per registry.
+func newChainChildRunWith(t *testing.T, name string, layout accumulatedDirtyLayout, dirty int, extra func(*chainChildRun)) *chainChildRun {
+	t.Helper()
 	store := builderOpenStore(t, "chain-child-"+name)
-	repoDir := accumulatedDirtyRepo(t, layout, store)
-	builder := builderNewBuilder(store)
+	// accumulatedDirtyRepo, indexed over the Go-only registry.
+	builderIsolateGit(t)
+	repoDir := builderTempDir(t, "checkout-"+string(layout))
+	builderGit(t, repoDir, "init", "--initial-branch=main")
+	builderWriteTree(t, repoDir, accumulatedDirtyTree(layout))
+	builderGit(t, repoDir, "add", "-A")
+	builderGit(t, repoDir, "commit", "-q", "-m", "base")
+	semanticIndexOver(nil, builderGoRegistry)(t, store, repoDir)
+
+	builder := builderNewBuilderOver(store, builderGoRegistry)
 	r := &chainChildRun{
 		t: t, store: store, repoDir: repoDir, layout: layout,
 		chains: newDirtyChainBuilder(t, builder, store, repoDir, true),
@@ -47,6 +68,9 @@ func newChainChildRun(t *testing.T, name string, layout accumulatedDirtyLayout, 
 	for i := 0; i < dirty; i++ {
 		accumulatedDirtyWriteUnit(t, repoDir, layout, i, true, false)
 		r.dirty[accumulatedDirtyUnitPath(layout, i)] = struct{}{}
+	}
+	if extra != nil {
+		extra(r)
 	}
 	root, report, _ := r.chains.build()
 	if report.ParentGenerationID != 0 || report.ChainDepth != 1 {
@@ -231,7 +255,7 @@ func TestDirtyChildPartialUndoReemitsCommittedFile(t *testing.T) {
 func TestDirtyChildUndoOfAddedFileDeletes(t *testing.T) {
 	const added = "extra/extra.go"
 	store := "package extra\n\n// Extra exists only in the working tree.\nfunc Extra() int {\n\treturn 7\n}\n"
-	r := newChainChildRunWith(t, "undo-add", 3, func(r *chainChildRun) { r.write(added, store) })
+	r := newChainChildRunWith(t, "undo-add", accumulatedDirtyIndependent, 3, func(r *chainChildRun) { r.write(added, store) })
 	r.remove(added)
 
 	id, report, chain := r.child(r.root)
@@ -249,32 +273,6 @@ func TestDirtyChildUndoOfAddedFileDeletes(t *testing.T) {
 		t.Errorf("FindNodesByName(Extra) still answers %d nodes", len(got))
 	}
 	r.parity(chain, "undo-add")
-}
-
-// newChainChildRunWith is newChainChildRun with an extra working-tree change
-// applied before the root is published.
-func newChainChildRunWith(t *testing.T, name string, dirty int, extra func(*chainChildRun)) *chainChildRun {
-	t.Helper()
-	store := builderOpenStore(t, "chain-child-"+name)
-	repoDir := accumulatedDirtyRepo(t, accumulatedDirtyIndependent, store)
-	builder := builderNewBuilder(store)
-	r := &chainChildRun{
-		t: t, store: store, repoDir: repoDir, layout: accumulatedDirtyIndependent,
-		chains: newDirtyChainBuilder(t, builder, store, repoDir, true),
-		dirty:  map[string]struct{}{},
-	}
-	r.chains.compact = false
-	for i := 0; i < dirty; i++ {
-		accumulatedDirtyWriteUnit(t, repoDir, accumulatedDirtyIndependent, i, true, false)
-		r.dirty[accumulatedDirtyUnitPath(accumulatedDirtyIndependent, i)] = struct{}{}
-	}
-	extra(r)
-	root, report, _ := r.chains.build()
-	if report.ParentGenerationID != 0 {
-		t.Fatalf("the chain root was built over %d, want direct", report.ParentGenerationID)
-	}
-	r.root = root
-	return r
 }
 
 func TestDirtyChildRenameDeletesOldPath(t *testing.T) {

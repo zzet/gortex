@@ -35,13 +35,15 @@ func TestWALReclaimResetsANearlyBackfilledLogWithAShortHold(t *testing.T) {
 	require.NoError(t, err)
 	defer ckpt.Close()
 
-	// A big log, then a reader pinned near its end, a few more frames, and a
-	// PASSIVE that backfills everything up to the reader's mark.
+	// A big log (~150 MiB, ten times the threshold below), then a reader
+	// pinned near its end, a few more frames (~500 of ~39k: under the fiftieth
+	// the precondition asks), and a PASSIVE that backfills everything up to
+	// the reader's mark.
 	early, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
 	require.NoError(t, err)
 	var n int
 	require.NoError(t, early.QueryRow(`SELECT count(*) FROM wal_churn`).Scan(&n))
-	growWAL(t, s, 300)
+	growWAL(t, s, 150)
 	require.NoError(t, early.Rollback())
 	late, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
 	require.NoError(t, err)
@@ -78,7 +80,12 @@ func TestWALReclaimResetsANearlyBackfilledLogWithAShortHold(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		sched.observeProgress(time.Now(), walReclaimDeferred, false)
 	}
-	failed := s.reclaimWALOnce(cfg, ckpt, path+"-wal")
+	// The blocker outlives every wait of the attempt (30 s writer-free, 5 s
+	// in the lane by default); shorter waits end it the same way, sooner.
+	blockedCfg := cfg
+	blockedCfg.readerWait = 500 * time.Millisecond
+	shortenWALReclaimLaneReaderWait(t, 500*time.Millisecond)
+	failed := s.reclaimWALOnce(blockedCfg, ckpt, path+"-wal")
 	now := time.Now()
 	sched.observeProgress(now, failed.outcome, failed.progressed)
 	t.Logf("blocked attempt: outcome=%s reason=%q progressed=%t writer_hold=%s next_attempt_in=%s",

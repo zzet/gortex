@@ -404,6 +404,22 @@ func coldContracts(t *testing.T, files map[string]string) map[string]*graph.Node
 	return cold.contracts()
 }
 
+// contractColdOracles memoizes coldContracts by file set across one test's
+// rows: a cold build depends on nothing but its files, so rows that end on
+// the same files compare against one build. Callers only read the result.
+type contractColdOracles map[string]map[string]*graph.Node
+
+func (o contractColdOracles) contracts(t *testing.T, files map[string]string) map[string]*graph.Node {
+	t.Helper()
+	key := fmt.Sprint(files) // map keys print sorted
+	if nodes, ok := o[key]; ok {
+		return nodes
+	}
+	nodes := coldContracts(t, files)
+	o[key] = nodes
+	return nodes
+}
+
 func contractMeta(nodes map[string]*graph.Node) map[string]any {
 	out := make(map[string]any, len(nodes))
 	for id, node := range nodes {
@@ -494,6 +510,7 @@ func TestContractJobOwnerMoveAfterProofIsReextracted(t *testing.T) {
 		{"rename_before_fence", "package fixture\nconst RoutePath2 = \"/after\"\n", "fence"},
 		{"value_edit_between_lookup_and_point_scan", "package fixture\nconst RoutePath = \"/after\"\n", "extract"},
 	}
+	oracles := contractColdOracles{}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
 			f := newRouteConstantFixture(t)
@@ -516,7 +533,7 @@ func TestContractJobOwnerMoveAfterProofIsReextracted(t *testing.T) {
 			require.True(t, done)
 			require.NoError(t, err)
 			require.True(t, report.Published)
-			want := coldContracts(t, map[string]string{"routes.go": jobRoutes, "consts.go": row.consts, "helper.go": jobHelper})
+			want := oracles.contracts(t, map[string]string{"routes.go": jobRoutes, "consts.go": row.consts, "helper.go": jobHelper})
 			require.Equal(t, contractIDs(want), contractIDs(f.contracts()), "the published attachment equals a cold build of the final state")
 		})
 	}
@@ -1214,6 +1231,13 @@ func TestContractFenceMutationPathMatrix(t *testing.T) {
 					row.apply(f)
 				}
 			}}
+			if row.outcome == viewmetrics.ContractJobSupersededReadUnsettled {
+				// The held receipt is never released and nothing announces,
+				// so every round waits its full wait out: the outcome is
+				// counted in rounds, not time. Wait 200ms, not the 3s
+				// production default, for each of the contractIdleRounds.
+				hooks.roundWait = 200 * time.Millisecond
+			}
 			report, err := f.job(hooks, nil)
 			require.True(t, applied)
 			require.Equal(t, row.outcome, contractJobOutcomeOf(err), "job error: %v", err)
@@ -1237,6 +1261,8 @@ func TestContractFenceMutationPathMatrix(t *testing.T) {
 // holds the file before the round's R0: its stamp does not move between R0
 // and the failed read, but it was unaccepted at R0.
 func TestContractJobEnrichmentReadTornByAnApplyIsRetried(t *testing.T) {
+	// Every row publishes the unchanged fixture: one cold build is the oracle.
+	oracles := contractColdOracles{}
 	for _, row := range []struct {
 		name, held         string
 		composed, beforeR0 bool
@@ -1256,15 +1282,18 @@ func TestContractJobEnrichmentReadTornByAnApplyIsRetried(t *testing.T) {
 				}
 			}
 			armed, held := false, false
-			released := make(chan struct{})
+			var release func()
 			hold := func() {
 				held = true
-				release := f.beginHeld(row.held)
-				go func() {
-					defer close(released)
-					time.Sleep(300 * time.Millisecond)
+				release = f.beginHeld(row.held)
+			}
+			// The held apply settles and announces as soon as the job waits
+			// on its torn read, rather than after a fixed delay.
+			f.onWait = func() {
+				if release != nil {
 					release()
-				}()
+					release = nil
+				}
 			}
 			hooks := &contractConvergenceHooks{
 				beforeR1: func([]string) { armed = true },
@@ -1282,11 +1311,12 @@ func TestContractJobEnrichmentReadTornByAnApplyIsRetried(t *testing.T) {
 				},
 			}
 			report, err := f.job(hooks, nil)
+			f.onWait = nil
 			require.True(t, held)
-			<-released
+			require.Nil(t, release, "the job waited on the torn read; the apply settled during that wait")
 			require.NoError(t, err, "a torn enrichment read is a move, not a job failure")
 			require.True(t, report.Published)
-			require.Equal(t, contractIDs(coldContracts(t, map[string]string{"routes.go": jobRoutes, "consts.go": jobConsts, "helper.go": jobHelper})), contractIDs(f.contracts()))
+			require.Equal(t, contractIDs(oracles.contracts(t, map[string]string{"routes.go": jobRoutes, "consts.go": jobConsts, "helper.go": jobHelper})), contractIDs(f.contracts()))
 		})
 	}
 }
@@ -1311,8 +1341,11 @@ func TestContractJobProvesRetriedUnitsOneByOneUnderAWriter(t *testing.T) {
 			files := map[string]string{"routes.go": jobRoutes, "routes2.go": routes2, "consts.go": jobConsts, "helper.go": jobHelper}
 			f := newContractJobFixture(t, files)
 			writing, first, woke, saves := true, true, false, 0
+			slowPasses := 0
 			consts := func(n int) string { return fmt.Sprintf("package fixture\nconst RoutePath = \"/tick-%d\"\n", n) }
-			const slowRound, wait = 4 * time.Second, time.Second
+			// Only the ratio matters: a slow round longer than
+			// contractIdleRounds waits (4 waits against 3).
+			const slowRound, wait = time.Second, 250 * time.Millisecond
 			hooks := &contractConvergenceHooks{
 				woke: func() { first, woke = true, true },
 				// Each retry pass opens its evidence once before it proves
@@ -1321,6 +1354,7 @@ func TestContractJobProvesRetriedUnitsOneByOneUnderAWriter(t *testing.T) {
 				openedEvidence: func(*store_sqlite.Store) {
 					if slow && writing && woke {
 						woke = false
+						slowPasses++
 						time.Sleep(slowRound)
 					}
 				},
@@ -1348,6 +1382,8 @@ func TestContractJobProvesRetriedUnitsOneByOneUnderAWriter(t *testing.T) {
 			require.Greater(t, saves, 2)
 			t.Logf("saves=%d rounds=%d iterations=%d elapsed=%s", saves, report.Rounds, report.Iterations, time.Since(start))
 			if slow {
+				require.Positive(t, slowPasses, "a retry pass woken by an event ran slow")
+				require.Greater(t, slowRound, contractIdleRounds*wait, "a slow pass outlasts the idle rounds' waits")
 				require.Greater(t, time.Since(start), contractIdleRounds*wait, "the retry passes outlasted the idle rounds' waits")
 			}
 			want := coldContracts(t, map[string]string{"routes.go": jobRoutes, "routes2.go": routes2, "consts.go": consts(saves), "helper.go": jobHelper})
@@ -2426,6 +2462,8 @@ func TestContractJobFenceDefersAMoveAfterItsLastRead(t *testing.T) {
 	routesMore := "package fixture\nfunc register(r Router) { r.GET(RoutePath, users); r.POST(\"/more\", users) }\nfunc users() {}\n"
 	// The settled row's first save is never accepted: the stamp the quiet
 	// scan observes is settled, and the save after it is deferred all the same.
+	// Both after_the_last_read rows end on the same files.
+	oracles := contractColdOracles{}
 	for _, name := range []string{"after_the_last_read", "after_the_last_read_settled", "during_the_enrichment_round"} {
 		row, settled := name, name == "after_the_last_read_settled"
 		if settled {
@@ -2489,7 +2527,7 @@ func TestContractJobFenceDefersAMoveAfterItsLastRead(t *testing.T) {
 				require.Zero(t, report.EnrichReruns)
 				seen := maps.Clone(files)
 				seen["consts.go"] = consts("/before", "2")
-				require.Equal(t, contractIDs(coldContracts(t, seen)), got, "the publish is the state the last point round saw")
+				require.Equal(t, contractIDs(oracles.contracts(t, seen)), got, "the publish is the state the last point round saw")
 				require.Contains(t, got, "http::GET::/before")
 				// The deferred save kept the key, so the publish stays current
 				// for it; the next save that moves the key starts the next job,
@@ -2503,7 +2541,7 @@ func TestContractJobFenceDefersAMoveAfterItsLastRead(t *testing.T) {
 				final["consts.go"], final["routes.go"] = consts("/after", "2"), routes
 				after := contractIDs(f.contracts())
 				require.Contains(t, after, "http::GET::/after")
-				require.Equal(t, contractIDs(coldContracts(t, final)), after)
+				require.Equal(t, contractIDs(oracles.contracts(t, final)), after)
 				return
 			}
 			require.Equal(t, 3, stage)
@@ -2532,13 +2570,23 @@ func TestContractJobHasNoFixedIterationBound(t *testing.T) {
 	const writes = 12
 	saves := 0
 	final := maps.Clone(files)
+	var start time.Time
+	// Each later iteration is slowed by the first iteration's own length
+	// (the first fence ends it), capped at 300ms: the writer's run outlasts
+	// the first iteration more than writes times over on any host, without
+	// a fixed sleep longer than the iteration it stands for.
+	var first, pause time.Duration
 	hooks := &contractConvergenceHooks{
 		beforeFence: func(int) {
 			if saves >= writes {
 				return
 			}
+			if saves == 0 {
+				first = time.Since(start)
+				pause = min(first, 300*time.Millisecond)
+			}
 			saves++
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(pause)
 			if saves%2 == 1 {
 				final["helper.go"] = helper("Helper", saves)
 				f.save("helper.go", final["helper.go"])
@@ -2548,13 +2596,15 @@ func TestContractJobHasNoFixedIterationBound(t *testing.T) {
 			}
 		},
 	}
-	start := time.Now()
+	start = time.Now()
 	report, err := f.job(hooks, nil)
+	elapsed := time.Since(start)
 	require.NoError(t, err, "a job making progress is never superseded")
 	require.True(t, report.Published)
 	require.Equal(t, writes, saves)
 	require.Equal(t, writes+1, report.Iterations, "every save before a fence cost one iteration")
-	t.Logf("iterations=%d elapsed=%s", report.Iterations, time.Since(start))
+	t.Logf("iterations=%d first=%s pause=%s elapsed=%s", report.Iterations, first, pause, elapsed)
+	require.Greater(t, elapsed, first+writes*pause, "the writer's run outlasted the first iteration many times over")
 	require.Equal(t, contractIDs(coldContracts(t, final)), contractIDs(f.contracts()))
 }
 

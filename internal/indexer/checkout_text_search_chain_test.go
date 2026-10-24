@@ -234,6 +234,10 @@ func textSteps() []textStep {
 // searcher was patched rather than rebuilt and that the patched searcher
 // answers a fixed query set exactly as a rebuild over the same corpus and a
 // clean index of the worktree do.
+//
+// It ends with the mutation check for that equality: a patch that leaves out
+// the one path an edit changed must be caught. The check runs last because it
+// leaves the searcher deliberately stale.
 func TestCheckoutSearcherPatchEqualsRebuild(t *testing.T) {
 	f, c := chainCoordinator(t, CheckoutCoordinatorConfig{})
 	for i, step := range textSteps() {
@@ -260,29 +264,23 @@ func TestCheckoutSearcherPatchEqualsRebuild(t *testing.T) {
 	if stats.Rebuilds[textRebuildFirstUse] != 1 || len(stats.Rebuilds) != 1 {
 		t.Errorf("rebuilds %v, want exactly the first use", stats.Rebuilds)
 	}
-}
 
-// TestCheckoutSearcherPatchCheckFailsWhenAPathIsSkipped is the mutation check
-// for the equality test: a patch that leaves out the one path an edit changed
-// must be caught.
-func TestCheckoutSearcherPatchCheckFailsWhenAPathIsSkipped(t *testing.T) {
-	f, c := chainCoordinator(t, CheckoutCoordinatorConfig{})
-	steps := textSteps()
-	for _, step := range steps[:2] {
-		step.edit(t, f)
-		coordinatorReconcile(t, c)
-		if equal, _ := textAssertPatchEqualsRebuild(t, f, c, step.name); !equal {
-			t.Fatalf("%s: the unmutated patch already differs", step.name)
-		}
-	}
+	// The mutation check. The edit adds a literal of the query set ("Island")
+	// that the file's previous bytes do not hold, so a searcher that kept those
+	// bytes cannot find it.
 	c.textMu.Lock()
-	c.textState.skipPatch = func(rel string) bool { return rel == "aardvark.go" }
+	c.textState.skipPatch = func(rel string) bool { return rel == "core.go" }
 	c.textMu.Unlock()
-	steps[2].edit(t, f) // modify aardvark.go
-	coordinatorReconcile(t, c)
+	worktreeWrite(t, f.worktree, "core.go", "package fixture\n\ntype Options struct{}\n\nfunc Compute(o Options) {\n\tHelper()\n\tIsland()\n}\n")
+	if cycle := coordinatorReconcile(t, c); !cycle.DirtyBuilt {
+		t.Fatalf("mutation: the cycle built nothing: %+v", cycle)
+	}
 	patched, err := c.textSearcher(context.Background())
 	if err != nil {
 		t.Fatalf("bring the checkout searcher up to date: %v", err)
+	}
+	if stats := c.textSearchStats(); stats.Last != "patch" {
+		t.Fatalf("mutation: the searcher's last update was %q, want a patch to skip a path of", stats.Last)
 	}
 	c.textMu.Lock()
 	rebuilt := trigram.Build(f.worktree, c.textState.corpus.paths())

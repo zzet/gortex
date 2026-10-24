@@ -160,6 +160,10 @@ type fakeRemoteOpts struct {
 
 func fakeRemote(t *testing.T, o fakeRemoteOpts) *httptest.Server {
 	t.Helper()
+	// Closed as the test ends, before srv.Close (cleanups run last-in
+	// first-out): Close waits for every handler, and a sleeping one would hold
+	// the test for its whole toolSleep after the caller gave up on it.
+	stop := make(chan struct{})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		if o.healthErr {
@@ -178,12 +182,17 @@ func fakeRemote(t *testing.T, o fakeRemoteOpts) *httptest.Server {
 	})
 	mux.HandleFunc("/v1/tools/", func(w http.ResponseWriter, r *http.Request) {
 		if o.toolSleep > 0 {
-			time.Sleep(o.toolSleep)
+			select {
+			case <-time.After(o.toolSleep):
+			case <-stop:
+				return
+			}
 		}
 		_, _ = w.Write(envelope(o.toolJSON))
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(stop) })
 	return srv
 }
 

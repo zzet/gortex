@@ -42,8 +42,18 @@ import (
 // are excluded from it by construction, and a build that re-derives them is
 // judged by the separate accumulated-edit work bounds instead.
 //
-// GX_INVALIDATION_ACCUMULATED sets N (default 25, 1..accumulatedDirtyUnits);
+// GX_INVALIDATION_ACCUMULATED sets N (default 7, 1..accumulatedDirtyUnits);
 // GX_INVALIDATION_COUNTERS_OUT copies each case's JSON record to a directory.
+//
+// The default is the smallest N whose accumulation ends the way N=25's does:
+// the chain is compacted at its soft depth (dirtyChainCompactionDepth) after
+// the 4th edit and then every 3rd, so N=7 compacts twice — the second time
+// over a chain rooted on the first compaction — and the last accumulated edit
+// leaves a compacted parent, as N=25 does. Every case then builds over the
+// same chain shape as at N=25 and names the same frontier, masks, plan and
+// row census; only the count of carried accumulated files differs. Each
+// further edit only adds builds of unrelated units; the N=25 scale case is
+// TestAccumulatedDirtyEditCleanParity*.
 //
 // Builds are chained (dirtyChainBuilder): each one
 // stands on the previous published generation when the builder accepts the
@@ -57,7 +67,7 @@ func invalidationAccumulated(t *testing.T) int {
 	t.Helper()
 	raw := os.Getenv("GX_INVALIDATION_ACCUMULATED")
 	if raw == "" {
-		return 25
+		return 7
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil || n < 1 || n > accumulatedDirtyUnits {
