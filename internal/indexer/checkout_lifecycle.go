@@ -1118,6 +1118,7 @@ func (l *CheckoutLifecycle) bindDedicatedGraph(
 	}
 
 	graphID := GraphIDFor(prefix)
+
 	graphs, err := l.catalog.ListDedicatedGraphs(ctx, familyID)
 	if err != nil {
 		return "", err
@@ -1940,14 +1941,14 @@ func (l *CheckoutLifecycle) knownFamilies(ctx context.Context) []familyProbe {
 	if l.cfgMgr == nil {
 		return out
 	}
-	for _, entry := range l.cfgMgr.Global().Repos {
+	for _, entry := range l.mi.ResolveConfiguredRepos(ctx, l.cfgMgr.Global().Repos) {
 		abs, err := filepath.Abs(entry.Path)
 		if err != nil {
 			abs = entry.Path
 		}
-		prefix := l.ResolvePrefix(abs)
+		prefix := entry.Name
 		if prefix == "" {
-			prefix = EffectiveRepoPrefix(l.cfgMgr, entry)
+			continue
 		}
 		add(l.familyForPrefix(ctx, prefix), abs)
 	}
@@ -3974,15 +3975,12 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 	var recordErrs []error
 	seeded := map[string]string{}
 	if l.cfgMgr != nil {
-		for _, entry := range l.cfgMgr.Global().Repos {
+		for _, entry := range l.mi.ResolveConfiguredRepos(ctx, l.cfgMgr.Global().Repos) {
 			abs, err := filepath.Abs(entry.Path)
 			if err != nil {
 				abs = entry.Path
 			}
-			prefix := l.ResolvePrefix(abs)
-			if prefix == "" {
-				prefix = EffectiveRepoPrefix(l.cfgMgr, entry)
-			}
+			prefix := entry.Name
 			if prefix == "" {
 				continue
 			}

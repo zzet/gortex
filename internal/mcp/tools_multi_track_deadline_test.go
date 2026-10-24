@@ -11,6 +11,7 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/config"
 )
 
 // TestTrackRepositoryDetachesFirstIndexFromRequestLifetime pins #326.
@@ -119,4 +120,30 @@ func TestTrackRepositoryAnswersBeforeTheRequestDeadline(t *testing.T) {
 	}, 30*time.Second, 25*time.Millisecond,
 		"the detached first index must register the repo and finish cleanly")
 	require.Len(t, mi.AllMetadata(), 1)
+}
+
+func TestTrackRepositoryPrefixCollisionNamesMCPParameter(t *testing.T) {
+	srv, mi := newWorktreeMCPServer(t)
+	first, second := filepath.Join(t.TempDir(), "src"), filepath.Join(t.TempDir(), "src")
+	for _, path := range []string{first, second} {
+		require.NoError(t, os.MkdirAll(path, 0o755))
+	}
+	_, err := mi.TrackRepoCtx(t.Context(), config.RepoEntry{Path: first})
+	require.NoError(t, err)
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"path": second}
+	res, err := srv.handleTrackRepository(t.Context(), req)
+	require.NoError(t, err)
+	require.True(t, res.IsError)
+	text := extractTextFromContent(t, res.Content)
+	require.Contains(t, text, "name parameter")
+	require.NotContains(t, text, "gortex track --name")
+	require.Contains(t, text, first)
+	require.NoError(t, os.RemoveAll(first))
+	res, err = srv.handleTrackRepository(t.Context(), req)
+	require.NoError(t, err)
+	require.True(t, res.IsError)
+	text = extractTextFromContent(t, res.Content)
+	require.Contains(t, text, "no longer exists")
+	require.Contains(t, text, "untrack_repository")
 }

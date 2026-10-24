@@ -24,6 +24,29 @@ Such a session has no single workspace slug, so `_meta.scope_applied` reports `r
 
 A directory that neither lies inside nor contains a tracked repo still fails closed with the structured `repo_not_tracked` error — tracking the parent of your repos is not required, and doing so would index every child a second time. Over the HTTP surface (`gortex daemon start --http-addr ...`) the `/v1/graph` route accepts `?project=` and `?repo=` to narrow the dump, so a typo'd value returns an empty result for that request instead of bringing the whole index up empty.
 
+## Repository prefixes
+
+Each indexed root needs a unique repository prefix. The default is its directory
+basename, so two unrelated directories named `src` cannot both use `src`.
+Use `gortex track --name other-src /path/to/other/src` for the second root.
+The MCP `track_repository` tool accepts the equivalent `name` parameter.
+Re-tracking the same root does not create another corpus.
+
+The CLI rejects configured collisions before writing a new entry, including
+when the daemon is unavailable. The daemon also checks live ownership, including
+requests that race for one prefix. Worktree instance naming still applies before
+this check. A plain linked worktree whose main checkout is configured uses
+`<base>@<admin>`, where `admin` is Git's stable worktree administration name.
+For example, a linked checkout also named `src` uses `src@src`, not `src`.
+
+For a collision already stored in config, startup prefers the root bound in the
+live metadata. A checkout catalog binding wins only while its root is still
+configured under that prefix. Otherwise the first config entry wins.
+The skipped entry does not replace the owner's workspace, excludes, gitignore
+root, or catalog graph. Give the skipped entry a unique `name` in the global
+config rather than untracking the live owner. If the old owner's path is gone,
+inspect the untrack preview before confirming removal.
+
 ## Configuration
 
 Two-tier config hierarchy:

@@ -800,3 +800,25 @@ func TestWorkspaceParseAgreementWithSurfaces(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepareWorkspaceConfigKeepsIndependentSnapshot(t *testing.T) {
+	cm, err := NewConfigManager(filepath.Join(t.TempDir(), "config.yaml"))
+	require.NoError(t, err)
+	owner, other := t.TempDir(), t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(owner, ".gortex.yaml"), []byte("workspace: owner\nexclude:\n  - owner-only\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(other, ".gortex.yaml"), []byte("workspace: other\n"), 0o644))
+	cm.LoadWorkspaceConfig("src", owner)
+	before, revision := cm.GetRepoConfig("src"), cm.Revision()
+	prepared, publish := cm.PrepareWorkspaceConfig("src", other, nil)
+	assert.Equal(t, "other", prepared.Workspace)
+	assert.Equal(t, before, cm.GetRepoConfig("src"))
+	assert.Equal(t, revision, cm.Revision(), "preparation must not publish a prefix binding")
+	// Publishing uses the prepared parse rather than rereading the changed file.
+	require.NoError(t, os.WriteFile(filepath.Join(other, ".gortex.yaml"), []byte("workspace: changed\n"), 0o644))
+	publish("src")
+	assert.Equal(t, "other", cm.GetRepoConfig("src").Workspace)
+	assert.Equal(t, "other", prepared.Workspace)
+	cm.LoadWorkspaceConfig("src", owner)
+	assert.Equal(t, "owner", cm.GetRepoConfig("src").Workspace)
+	assert.Equal(t, "other", prepared.Workspace, "another publisher must not change the caller's config")
+}

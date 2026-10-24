@@ -2140,6 +2140,10 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 		absPath  string
 		identity *RepoIdentity
 	}
+	var configLookup config.RepoPathLookup
+	if mi.configMgr != nil {
+		configLookup = mi.configMgr.Global().SnapshotRepoPaths()
+	}
 	trackedModules := make(map[string]string)
 	resolved := make([]resolvedRepo, 0, len(repos))
 	seenPrefix := make(map[string]string, len(repos)) // prefix → absPath
@@ -2161,7 +2165,7 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 		}
 		identity, _ := DetectIdentity(absPath)
 		e := entry
-		prefix, cfg := mi.resolveTrackPrefix(&e, absPath, identity)
+		prefix, cfg := mi.resolveTrackPrefix(&e, absPath, identity, configLookup)
 		// Two distinct checkouts can still land on the same derived prefix
 		// (e.g. two worktrees declaring the same workspace). resolveTrackPrefix
 		// only sees already-tracked repos, so guard against collisions within
@@ -2535,7 +2539,7 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 	// split: a repo is prefixed from its first index, and adding another is
 	// purely additive.
 	idx.SetRepoPrefix(repoPrefix)
-	entry := mi.configMgr.Global().FindRepoByPrefix(repoPrefix)
+	entry := mi.configMgr.Global().FindRepoByPath(meta.RootPath)
 	idx.SetWorkspaceID(resolveWorkspaceID(entry, cfg, repoPrefix))
 	idx.SetProjectID(resolveProjectID(entry, cfg, repoPrefix))
 
@@ -2851,6 +2855,55 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	return result, nil
 }
 
+// PrefixCollisionError reports a prefix already owned by another repository.
+type PrefixCollisionError struct {
+	Prefix       string
+	ExistingPath string
+	Path         string
+}
+
+func (e *PrefixCollisionError) Error() string {
+	if _, err := os.Stat(e.ExistingPath); os.IsNotExist(err) {
+		return fmt.Sprintf("repository prefix %q is already used by %s, which no longer exists; inspect `gortex untrack %s` before tracking %s again",
+			e.Prefix, e.ExistingPath, e.ExistingPath, e.Path)
+	}
+	return fmt.Sprintf("repository prefix %q is already used by %s; use `gortex track --name <other> %s`", e.Prefix, e.ExistingPath, e.Path)
+}
+
+// trackedLocked reports whether path is already tracked under any prefix,
+// or returns a PrefixCollisionError when prefix belongs to another
+// repository. The same-path scan runs first, so a repository tracked under
+// another name (for example after `track --name`) stays a no-op.
+// Callers hold mi.mu.
+func (mi *MultiIndexer) trackedLocked(prefix, path string) (bool, error) {
+	for _, meta := range mi.repos {
+		if meta != nil && pathkey.SamePathIdentity(meta.RootPath, path) {
+			return true, nil
+		}
+	}
+	existing, ok := mi.repos[prefix]
+	if ok && existing != nil && !sameDirectory(existing.RootPath, path) {
+		return true, &PrefixCollisionError{Prefix: prefix, ExistingPath: existing.RootPath, Path: path}
+	}
+	return ok, nil
+}
+
+// logCollision warns about a configured repository that is not loaded
+// because another repository owns its prefix.
+func (mi *MultiIndexer) logCollision(err error) {
+	if err != nil {
+		mi.logger.Warn("repository not loaded", zap.Error(err))
+	}
+}
+
+// sameDirectory reports whether two existing paths are the same directory,
+// for example a symlinked spelling. It stats only the one prefix owner.
+func sameDirectory(a, b string) bool {
+	ai, aerr := os.Stat(a)
+	bi, berr := os.Stat(b)
+	return aerr == nil && berr == nil && os.SameFile(ai, bi)
+}
+
 // TrackRepo validates the path, detects identity, indexes, and adds to config.
 func (mi *MultiIndexer) TrackRepo(entry config.RepoEntry) (*IndexResult, error) {
 	return mi.TrackRepoCtx(context.Background(), entry)
@@ -2870,7 +2923,7 @@ func (mi *MultiIndexer) TrackRepo(entry config.RepoEntry) (*IndexResult, error) 
 // reproduced deterministically on the next daemon warmup. entry is
 // mutated in place; callers pass a pointer to the value they will add to
 // the global config.
-func (mi *MultiIndexer) resolveTrackPrefix(entry *config.RepoEntry, absPath string, identity *RepoIdentity) (string, *config.Config) {
+func (mi *MultiIndexer) resolveTrackPrefix(entry *config.RepoEntry, absPath string, identity *RepoIdentity, lookup config.RepoPathLookup) (string, *config.Config) {
 	base := config.ResolvePrefix(*entry)
 	if base == "" || base == "." {
 		if identity != nil {
@@ -2881,43 +2934,45 @@ func (mi *MultiIndexer) resolveTrackPrefix(entry *config.RepoEntry, absPath stri
 		return base, config.Default()
 	}
 
-	// Load the repo's `.gortex.yaml` under the base prefix first so we can
-	// read its declared workspace before deciding the final prefix.
-	mi.configMgr.LoadWorkspaceConfig(base, absPath)
-	cfg := mi.configMgr.GetRepoConfig(base)
-
-	// An explicit Name already pins the prefix — honour it verbatim. This
-	// is also the warm-restart fast path: once a worktree instance has
-	// been persisted with its derived Name, every later load short-circuits
-	// here without re-deriving.
-	if entry.Name != "" {
-		return base, cfg
-	}
-
+	// Read the workspace once, before acquiring the registry lock. The same
+	// snapshot supplies both membership and the eventual config publication.
+	cfg, publish := mi.configMgr.PrepareWorkspaceConfig(base, absPath, lookup)
 	declaredWS := entry.Workspace
-	if declaredWS == "" && cfg != nil {
+	if declaredWS == "" {
 		declaredWS = cfg.Workspace
 	}
 
-	name, separate := WorktreeInstanceName(absPath, base, declaredWS, entry.AsWorktree)
-	if !separate {
-		return base, cfg
+	prefix := base
+	if entry.Name == "" {
+		if name, separate := WorktreeInstanceName(absPath, base, declaredWS, entry.AsWorktree); separate {
+			prefix = name
+			mi.mu.RLock()
+			existing, ok := mi.repos[prefix]
+			mi.mu.RUnlock()
+			if ok && existing != nil && !pathkey.SamePathIdentity(existing.RootPath, absPath) {
+				prefix = WorktreeInstanceCollisionName(name, absPath)
+			}
+			entry.Name = prefix // persist the decision so warmup reproduces it
+		}
 	}
 
-	// Guard against two different checkouts colliding on the same derived
-	// name (e.g. two worktrees that both declare workspace `x`): keep the
-	// first, suffix the rest with a path hash.
-	prefix := name
-	mi.mu.RLock()
-	existing, ok := mi.repos[prefix]
-	mi.mu.RUnlock()
-	if ok && existing != nil && !pathkey.SamePathIdentity(existing.RootPath, absPath) {
-		prefix = name + "-" + shortPathHash(absPath)
+	// Re-check ownership before publishing the prepared snapshot.
+	mi.mu.Lock()
+	tracked, collision := mi.trackedLocked(prefix, absPath)
+	if collision != nil || tracked && !mi.ownsPrefixLocked(prefix, absPath) {
+		mi.mu.Unlock()
+		return prefix, mi.configMgr.GetRepoConfig(prefix)
 	}
+	publish(prefix)
+	mi.mu.Unlock()
+	return prefix, cfg
+}
 
-	entry.Name = prefix // persist the decision so warmup reproduces it
-	mi.configMgr.LoadWorkspaceConfig(prefix, absPath)
-	return prefix, mi.configMgr.GetRepoConfig(prefix)
+// ownsPrefixLocked reports whether path is the repository registered under
+// prefix. Callers hold mi.mu.
+func (mi *MultiIndexer) ownsPrefixLocked(prefix, path string) bool {
+	existing := mi.repos[prefix]
+	return existing != nil && (pathkey.SamePathIdentity(existing.RootPath, path) || sameDirectory(existing.RootPath, path))
 }
 
 // EffectiveRepoPrefix returns the prefix a repo entry is tracked under,
@@ -2941,9 +2996,14 @@ func EffectiveRepoPrefix(cm *config.ConfigManager, entry config.RepoEntry) strin
 	}
 	declaredWS := entry.Workspace
 	if declaredWS == "" && cm != nil {
-		cm.LoadWorkspaceConfig(base, absPath)
-		if cfg := cm.GetRepoConfig(base); cfg != nil {
+		// Read only the workspace name, as main does. On a malformed or
+		// unreadable file, use the last good parse for this root.
+		if cfg, err := config.ParseWorkspaceFile(filepath.Join(absPath, ".gortex.yaml")); err == nil {
 			declaredWS = cfg.Workspace
+		} else if !os.IsNotExist(err) {
+			if ws := cm.LastGoodWorkspace(base, absPath); ws != nil {
+				declaredWS = ws.Workspace
+			}
 		}
 	}
 	name, _ := WorktreeInstanceName(absPath, base, declaredWS, entry.AsWorktree)
@@ -3021,7 +3081,7 @@ func (mi *MultiIndexer) prepareTrackRepo(entry config.RepoEntry) (*preparedTrack
 	// slugs declared inside the repo (without it every repo would fall
 	// back to `workspace = repoPrefix`, making shared-workspace cross-repo
 	// matching impossible to express).
-	prefix, cfg := mi.resolveTrackPrefix(&entry, absPath, identity)
+	prefix, cfg := mi.resolveTrackPrefix(&entry, absPath, identity, nil)
 
 	// Check if already tracked. The prefix-keyed check catches the common
 	// case; the path scan additionally catches a case-only or Unicode
@@ -3030,15 +3090,9 @@ func (mi *MultiIndexer) prepareTrackRepo(entry config.RepoEntry) (*preparedTrack
 	// prefix and would otherwise be minted as a bogus second instance —
 	// the very thing that flips the daemon into multi-repo mode, #270).
 	mi.mu.RLock()
-	if _, exists := mi.repos[prefix]; exists {
+	if tracked, err := mi.trackedLocked(prefix, absPath); tracked {
 		mi.mu.RUnlock()
-		return nil, nil // already tracked
-	}
-	for _, meta := range mi.repos {
-		if meta != nil && pathkey.SamePathIdentity(meta.RootPath, absPath) {
-			mi.mu.RUnlock()
-			return nil, nil // same directory, different path spelling
-		}
+		return nil, err // nil when this directory is already tracked
 	}
 	hook := mi.onRepoTracked
 	mi.mu.RUnlock()
@@ -3103,18 +3157,10 @@ func (mi *MultiIndexer) trackPreparedRepoSourceCtx(
 		// directory through a case/Unicode spelling that resolved to another
 		// prefix lane — may have completed while this caller waited.
 		mi.mu.RLock()
-		_, exists := mi.repos[prefix]
-		if !exists {
-			for _, meta := range mi.repos {
-				if meta != nil && pathkey.SamePathIdentity(meta.RootPath, absPath) {
-					exists = true
-					break
-				}
-			}
-		}
+		exists, collisionErr := mi.trackedLocked(prefix, absPath)
 		mi.mu.RUnlock()
 		if exists {
-			return nil
+			return collisionErr
 		}
 		topologyChanged = true
 
@@ -3129,7 +3175,11 @@ func (mi *MultiIndexer) trackPreparedRepoSourceCtx(
 		result.RepoPrefix = prefix
 
 		fileMtimes := idx.publishFileMtimes()
+		// Restore the winner's config after any competing prefix resolution.
+		_, publish := mi.configMgr.PrepareWorkspaceConfig(prefix, absPath, nil)
+		isWorktree := ResolveWorktree(absPath).IsWorktree
 		mi.mu.Lock()
+		publish(prefix)
 		mi.repos[prefix] = &RepoMetadata{
 			RepoPrefix:    prefix,
 			RootPath:      absPath,
@@ -3141,7 +3191,7 @@ func (mi *MultiIndexer) trackPreparedRepoSourceCtx(
 			ParseErrors:   result.Errors,
 			FileMtimes:    fileMtimes,
 
-			IsWorktree: ResolveWorktree(absPath).IsWorktree,
+			IsWorktree: isWorktree,
 		}
 		mi.indexers[prefix] = idx
 		mi.mu.Unlock()
@@ -3212,15 +3262,18 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	// TrackRepoCtx so a worktree instance keeps its derived prefix on the
 	// reconcile path too; config can change between sessions and warmup-
 	// time reconcile runs after a daemon restart.
-	prefix, cfg := mi.resolveTrackPrefix(&entry, absPath, identity)
+	prefix, cfg := mi.resolveTrackPrefix(&entry, absPath, identity, nil)
 	setupTiming.complete(nil, zap.String("prefix", prefix))
 
 	// Already tracked — nothing to do.
 	mi.mu.RLock()
-	_, exists := mi.repos[prefix]
-
+	exists, collisionErr := mi.trackedLocked(prefix, absPath)
 	mi.mu.RUnlock()
 	if exists {
+		// Startup keeps the base outcome for a config entry whose prefix
+		// another repository owns: it is not indexed. Say why instead of
+		// failing warmup on every restart.
+		mi.logCollision(collisionErr)
 		return nil, nil
 	}
 
@@ -3265,17 +3318,10 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		// the same directory through a case/Unicode spelling on another lane.
 		// Recheck both identities only after owning the stable lane.
 		mi.mu.RLock()
-		_, exists := mi.repos[prefix]
-		if !exists {
-			for _, meta := range mi.repos {
-				if meta != nil && pathkey.SamePathIdentity(meta.RootPath, absPath) {
-					exists = true
-					break
-				}
-			}
-		}
+		exists, collisionErr := mi.trackedLocked(prefix, absPath)
 		mi.mu.RUnlock()
 		if exists {
+			mi.logCollision(collisionErr)
 			return nil
 		}
 		topologyChanged = true
@@ -3383,7 +3429,11 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		result.RepoPrefix = prefix
 
 		fileMtimes := idx.publishFileMtimes()
+		// Restore the winner's config after any competing prefix resolution.
+		_, publish := mi.configMgr.PrepareWorkspaceConfig(prefix, absPath, nil)
+		isWorktree := ResolveWorktree(absPath).IsWorktree
 		mi.mu.Lock()
+		publish(prefix)
 		mi.repos[prefix] = &RepoMetadata{
 			RepoPrefix:    prefix,
 			RootPath:      absPath,
@@ -3395,7 +3445,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			ParseErrors:   result.Errors,
 			FileMtimes:    fileMtimes,
 
-			IsWorktree: ResolveWorktree(absPath).IsWorktree,
+			IsWorktree: isWorktree,
 		}
 		mi.indexers[prefix] = idx
 		mi.mu.Unlock()

@@ -68,7 +68,7 @@ func TestNotifyDaemonTrackUsesRemainingDeadline(t *testing.T) {
 	}()
 
 	started := time.Now()
-	err = notifyDaemonTrack(t.TempDir(), time.Now().Add(40*time.Millisecond))
+	err = notifyDaemonTrack(t.TempDir(), "", time.Now().Add(40*time.Millisecond))
 	if !errors.Is(err, daemon.ErrDaemonUnresponsive) {
 		t.Fatalf("notifyDaemonTrack error = %v, want ErrDaemonUnresponsive", err)
 	}
@@ -92,7 +92,7 @@ func TestRunTrackWaitTimeoutIncludesControlTrackAndKeepsConfig(t *testing.T) {
 	trackName = ""
 	trackAsWorktree = false
 	trackEnsureDaemonReadyFn = func(bool) daemonDecision { return daemonReady }
-	trackNotifyDaemonTrackFn = func(string, time.Time) error {
+	trackNotifyDaemonTrackFn = func(string, string, time.Time) error {
 		notifyStarted <- time.Now()
 		<-release
 		return nil

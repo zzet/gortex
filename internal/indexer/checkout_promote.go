@@ -205,7 +205,10 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 	index, resampled, err := l.indexPromotedCorpus(ctx, checkout, out.Prefix)
 	out.Index, out.Resampled = index, resampled
 	if err != nil {
-		l.rollbackPromotionOrLog(ctx, out.Prefix, "")
+		var collision *PrefixCollisionError
+		if !errors.As(err, &collision) {
+			l.rollbackPromotionOrLog(ctx, out.Prefix, "")
+		}
 		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
 

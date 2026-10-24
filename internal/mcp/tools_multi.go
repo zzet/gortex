@@ -195,6 +195,17 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 	select {
 	case out := <-done:
 		if out.err != nil {
+			var collision *indexer.PrefixCollisionError
+			if errors.As(out.err, &collision) {
+				if _, err := os.Stat(collision.ExistingPath); os.IsNotExist(err) {
+					return mcp.NewToolResultError(fmt.Sprintf(
+						"repository prefix %q is already used by %s, which no longer exists; inspect untrack_repository for that path before tracking %s again",
+						collision.Prefix, collision.ExistingPath, collision.Path)), nil
+				}
+				return mcp.NewToolResultError(fmt.Sprintf(
+					"repository prefix %q is already used by %s; set the name parameter to a different prefix for %s",
+					collision.Prefix, collision.ExistingPath, collision.Path)), nil
+			}
 			return mcp.NewToolResultError(out.err.Error()), nil
 		}
 		// Already tracked — the corpus held the repo, so only its identity

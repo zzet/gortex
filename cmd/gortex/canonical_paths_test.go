@@ -66,7 +66,7 @@ func TestRunTrackCanonicalizesAliasBeforePersistenceAndRegistration(t *testing.T
 		return []reflect.Value{reflect.ValueOf(daemonReady)}
 	}))
 	var registered []string
-	trackNotifyDaemonTrackFn = func(path string, _ time.Time) error {
+	trackNotifyDaemonTrackFn = func(path, _ string, _ time.Time) error {
 		registered = append(registered, path)
 		return nil
 	}

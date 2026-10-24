@@ -92,6 +92,7 @@ const (
 	ErrProtocolMismatch = "protocol_mismatch"
 	ErrUnsupportedMode  = "unsupported_mode"
 	ErrRepoNotTracked   = "repo_not_tracked"
+	ErrPrefixCollision  = "prefix_collision"
 	ErrInternal         = "internal"
 	// ErrTimeout means the daemon accepted the control request but did not
 	// finish it inside the kind's budget — almost always because a

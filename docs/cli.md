@@ -80,6 +80,32 @@ gortex untrack backend
 gortex status
 ```
 
+## Repository prefix collisions
+
+A repository prefix identifies one indexed root. By default, it is the directory
+basename. Tracking a different root with a prefix taken by another top-level
+entry fails, even without a daemon. Tracking the same top-level root again is a no-op.
+
+Give same-named directories distinct prefixes:
+
+```bash
+gortex track ~/projects/one/src
+gortex track --name other-src ~/projects/two/src
+```
+
+The CLI checks top-level configured prefixes before saving a new entry.
+Project-scoped entries are not checked before this save. The daemon checks the
+live registry, which remains authoritative. A live rejection removes
+only the entry the CLI just added. Other daemon failures can leave a config-only
+entry for a later restart.
+
+Older configs can already contain collisions. At startup, Gortex keeps the
+existing corpus or catalog owner; without an owner, config order decides. It
+warns and skips the other entry without replacing the owner's config or corpus.
+Give the skipped entry a unique `name` in the global config. Do not untrack the
+live owner just to resolve a duplicate name. If the owner's path no longer
+exists, inspect the untrack preview before confirming removal of its corpus.
+
 ## Per-repo setup
 
 ```bash

@@ -377,12 +377,8 @@ func (mi *MultiIndexer) backfillWorkspaceSlugsWithImpact() (nodesStamped, contra
 	// reason the crossWorkspaceLookup path below takes it: the deferred
 	// receipt tail reaches this backfill through RunPreEnrichResolve while
 	// UntrackRepo and TrackRepoCtx edit the live Repos slice in place.
-	for _, e := range mi.configMgr.Global().ReposSnapshot() {
-		p := config.ResolvePrefix(e)
-		if p == "" || p == "." {
-			continue
-		}
-		entryByPrefix[p] = e
+	for _, e := range mi.ResolveConfiguredRepos(context.Background(), mi.configMgr.Global().ReposSnapshot()) {
+		entryByPrefix[e.Name] = e
 	}
 	for prefix, root := range repoMeta {
 		// Make sure the per-repo `.gortex.yaml` is loaded — at warmup
@@ -613,12 +609,8 @@ func (mi *MultiIndexer) collectCrossWorkspaceRules() (map[string][]resolver.Cros
 	// deferred receipt tail runs this concurrently with UntrackRepo, which
 	// edits the live Repos slice in place.
 	entryByPrefix := make(map[string]config.RepoEntry)
-	for _, e := range mi.configMgr.Global().ReposSnapshot() {
-		p := config.ResolvePrefix(e)
-		if p == "" || p == "." {
-			continue
-		}
-		entryByPrefix[p] = e
+	for _, e := range mi.ResolveConfiguredRepos(context.Background(), mi.configMgr.Global().ReposSnapshot()) {
+		entryByPrefix[e.Name] = e
 	}
 	for _, prefix := range repoPrefixes {
 		cfg := mi.configMgr.GetRepoConfig(prefix)

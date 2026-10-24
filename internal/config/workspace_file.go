@@ -40,6 +40,10 @@ func ParseWorkspaceFileInto(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	return parseWorkspaceInto(data, cfg)
+}
+
+func parseWorkspaceInto(data []byte, cfg *Config) error {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return &workspaceParseError{err: err}
 	}

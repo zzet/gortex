@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/google/renameio"
 	"github.com/go-viper/mapstructure/v2"
+	"github.com/google/renameio"
 	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/llm"
@@ -231,6 +231,10 @@ func UnknownWorkspaceKeys(path string) []string {
 	if err != nil {
 		return nil
 	}
+	return unknownWorkspaceKeys(data)
+}
+
+func unknownWorkspaceKeys(data []byte) []string {
 	var raw map[string]any
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil
@@ -464,6 +468,89 @@ func (gc *GlobalConfig) FindRepoByPrefix(prefix string) *RepoEntry {
 		}
 	}
 	return nil
+}
+
+// FindRepoByPath searches top-level Repos and all Projects for the given root.
+// Callers that know the loaded root must not take settings from a prefix collision.
+func (gc *GlobalConfig) FindRepoByPath(root string) *RepoEntry {
+	if gc == nil || root == "" {
+		return nil
+	}
+	root = pathkey.CanonicalPath(root)
+	for i := range gc.Repos {
+		if pathkey.SamePathIdentity(pathkey.CanonicalPath(gc.Repos[i].Path), root) {
+			return &gc.Repos[i]
+		}
+	}
+	for _, proj := range gc.Projects {
+		for i := range proj.Repos {
+			if pathkey.SamePathIdentity(pathkey.CanonicalPath(proj.Repos[i].Path), root) {
+				return &proj.Repos[i]
+			}
+		}
+	}
+	return nil
+}
+
+// RepoPathLookup reads repository overrides from a fixed configuration snapshot.
+type RepoPathLookup func(root string) *RepoEntry
+
+// SnapshotRepoPaths canonicalizes configured roots once for a multi-repository pass.
+func (gc *GlobalConfig) SnapshotRepoPaths() RepoPathLookup {
+	return gc.snapshotRepoPaths(pathkey.CanonicalPath)
+}
+
+func (gc *GlobalConfig) snapshotRepoPaths(canonicalize func(string) string) RepoPathLookup {
+	type repoRoot struct {
+		path  string
+		entry RepoEntry
+	}
+	// CanonicalPath has already cleaned paths and normalized volumes. Fold
+	// Unicode and case for bucketing, then retain SamePathIdentity's file
+	// check within each bucket for case-sensitive mounts.
+	lookupKey := func(root string) string {
+		root = pathkey.Normalize(root)
+		if pathkey.CaseInsensitivePaths {
+			root = strings.ToLower(root)
+		}
+		return root
+	}
+	roots := make(map[string][]repoRoot)
+	canonicalRoots := make(map[string]string)
+	if gc != nil {
+		globalConfigMu.Lock()
+		entries := append([]RepoEntry(nil), gc.Repos...)
+		for _, project := range gc.Projects {
+			entries = append(entries, project.Repos...)
+		}
+		globalConfigMu.Unlock()
+		for _, entry := range entries {
+			root := canonicalize(entry.Path)
+			canonicalRoots[entry.Path] = root
+			key := lookupKey(root)
+			roots[key] = append(roots[key], repoRoot{root, entry})
+		}
+	}
+	return func(root string) *RepoEntry {
+		if canonical, ok := canonicalRoots[root]; ok {
+			root = canonical
+		} else {
+			root = pathkey.CanonicalPath(root)
+		}
+		candidates := roots[lookupKey(root)]
+		for i := range candidates {
+			if pathkey.SamePathIdentity(candidates[i].path, root) {
+				return &candidates[i].entry
+			}
+		}
+		globalConfigMu.Lock()
+		defer globalConfigMu.Unlock()
+		if entry := gc.FindRepoByPath(root); entry != nil {
+			copy := *entry
+			return &copy
+		}
+		return nil
+	}
 }
 
 // checkDuplicatePrefixes returns errors for any duplicate Repo_Prefix values.

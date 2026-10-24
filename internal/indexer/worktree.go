@@ -172,6 +172,12 @@ func sanitizeInstanceTag(s string) string {
 	return strings.Trim(b.String(), "-")
 }
 
+// WorktreeInstanceCollisionName disambiguates two worktree instances that
+// derive the same name, using the same stable suffix as live registration.
+func WorktreeInstanceCollisionName(name, absPath string) string {
+	return name + "-" + shortPathHash(absPath)
+}
+
 // shortPathHash returns a short, stable hash of a filesystem path. It is
 // the last-resort disambiguator when a forced worktree instance has
 // neither a declared workspace nor a resolvable branch — two different

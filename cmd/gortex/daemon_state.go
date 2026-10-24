@@ -479,7 +479,7 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	removedDuplicates := healDuplicateRepos(state.configManager.Global(), logger)
 	finishHeal(zap.Int("removed", removedDuplicates))
 
-	repos := state.configManager.Global().Repos
+	repos := state.multiIndexer.ResolveConfiguredRepos(ctx, state.configManager.Global().Repos)
 
 	// Purge orphaned repo prefixes BEFORE the warmup loop re-registers the
 	// tracked repos, while the store still reflects the prior run's state. A
@@ -502,8 +502,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		if purger, ok := state.graph.(interface{ PurgeRepo(string) error }); ok {
 			orphanSupported = true
 			finishScan := startWarmupStep(logger, "orphan_prefix_scan", zap.Int("repos", len(repos)))
-			known := make([]string, 0, len(repos))
-			for _, entry := range repos {
+			// A rejected collision still names a configured prefix, not an orphan.
+			knownRepos := append([]config.RepoEntry(nil), state.configManager.Global().Repos...)
+			knownRepos = append(knownRepos, repos...)
+			known := make([]string, 0, len(knownRepos))
+			for _, entry := range knownRepos {
 				p := strings.TrimPrefix(indexer.EffectiveRepoPrefix(state.configManager, entry), "/")
 				if p != "" {
 					known = append(known, p)

@@ -19,6 +19,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/platform"
 )
 
@@ -722,6 +723,10 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		}
 		result, err := s.Controller.Track(ctx, p)
 		if err != nil {
+			var collision *indexer.PrefixCollisionError
+			if errors.As(err, &collision) {
+				return controlErr(ErrPrefixCollision, err.Error())
+			}
 			return controlErr(ErrInternal, err.Error())
 		}
 		return ControlResponse{OK: true, Result: result}

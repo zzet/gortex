@@ -286,7 +286,7 @@ func runConfigExcludeList(cmd *cobra.Command, _ []string) error {
 	if wsErr == nil && wsRoot != "" {
 		wsPrefix := filepath.Base(wsRoot)
 		if gc != nil {
-			if entry := gc.FindRepoByPrefix(wsPrefix); entry != nil {
+			if entry := gc.FindRepoByPath(wsRoot); entry != nil {
 				for _, p := range entry.Exclude {
 					rows = append(rows, [2]string{"repo:" + wsPrefix, p})
 				}
