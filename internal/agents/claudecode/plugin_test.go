@@ -407,14 +407,51 @@ func TestEmitPluginBundle_SubAgentBodiesMatchSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for name, want := range SubAgents {
+	for name, source := range SubAgents {
 		got, err := os.ReadFile(filepath.Join(dir, "agents", name))
 		if err != nil {
 			t.Errorf("read sub-agent %s: %v", name, err)
 			continue
 		}
+		want := pluginSubAgentBody(source)
 		if string(got) != want {
-			t.Errorf("sub-agent %s body drift: bytes do not match SubAgents[%q]", name, name)
+			t.Errorf("sub-agent %s body drift: bytes do not match the plugin-transformed SubAgents[%q]", name, name)
+		}
+	}
+}
+
+func TestEmitPluginBundle_SubAgentToolNamespaces(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := EmitPluginBundle(PluginBundleSpec{TargetDir: dir, Version: "0.18.2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, source := range SubAgents {
+		userTools := SubAgentTools(source)
+		if len(userTools) == 0 {
+			t.Fatalf("user sub-agent %s has no tools", name)
+		}
+		for _, tool := range userTools {
+			if !strings.HasPrefix(tool, userMCPToolPrefix) {
+				t.Errorf("user sub-agent %s tool %q does not use %q", name, tool, userMCPToolPrefix)
+			}
+		}
+
+		body, err := os.ReadFile(filepath.Join(dir, "agents", name))
+		if err != nil {
+			t.Fatalf("read plugin sub-agent %s: %v", name, err)
+		}
+		pluginTools := SubAgentTools(string(body))
+		if len(pluginTools) != len(userTools) {
+			t.Errorf("plugin sub-agent %s tool count = %d, want %d", name, len(pluginTools), len(userTools))
+		}
+		for _, tool := range pluginTools {
+			if !strings.HasPrefix(tool, pluginMCPToolPrefix) {
+				t.Errorf("plugin sub-agent %s tool %q does not use %q", name, tool, pluginMCPToolPrefix)
+			}
+			if strings.HasPrefix(tool, userMCPToolPrefix) {
+				t.Errorf("plugin sub-agent %s still contains user-level tool %q", name, tool)
+			}
 		}
 	}
 }

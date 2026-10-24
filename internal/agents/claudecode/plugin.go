@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // PluginBundleSpec describes one generation of the marketplace
@@ -343,7 +344,7 @@ func EmitPluginBundle(spec PluginBundleSpec) ([]string, error) {
 	// deterministic output. Mirrors the on-disk path Claude Code
 	// expects under .claude/agents/ when the plugin is installed.
 	for _, name := range sortedKeys(SubAgents) {
-		body := SubAgents[name]
+		body := pluginSubAgentBody(SubAgents[name])
 		if err := write(filepath.Join("agents", name), []byte(body), 0o644); err != nil {
 			return nil, err
 		}
@@ -362,6 +363,34 @@ func EmitPluginBundle(spec PluginBundleSpec) ([]string, error) {
 	}
 
 	return written, nil
+}
+
+const (
+	userMCPToolPrefix   = "mcp__gortex__"
+	pluginMCPToolPrefix = "mcp__plugin_gortex_gortex__"
+)
+
+// pluginSubAgentBody adapts only the frontmatter tool allowlist for the
+// plugin's MCP server namespace. The same SubAgents source remains unchanged
+// for user-level installs.
+func pluginSubAgentBody(body string) string {
+	lines := strings.SplitAfter(body, "\n")
+	inFrontmatter := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "---" {
+			inFrontmatter = !inFrontmatter
+			continue
+		}
+		if !inFrontmatter || !strings.HasPrefix(trimmed, "tools:") {
+			continue
+		}
+		marker := strings.Index(line, "tools:")
+		end := marker + len("tools:")
+		lines[i] = line[:end] + strings.ReplaceAll(line[end:], userMCPToolPrefix, pluginMCPToolPrefix)
+		break
+	}
+	return strings.Join(lines, "")
 }
 
 // marshalJSONStable returns indented JSON with sorted keys at every
