@@ -1092,7 +1092,10 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		markerBatch.recordDeferredPriorBindings(stagePriorBindings(idx.graph, stages, view))
 	}
 	idx.applyLap("prior_bindings")
-	carried := restubIncomingRefsFromView(idx.graph, stages, view)
+	carried, npmConsumers := restubIncomingRefsFromView(idx.graph, stages, view)
+	if markerBatch != nil {
+		markerBatch.npmConsumerFiles = appendUniqueSorted(markerBatch.npmConsumerFiles, npmConsumers...)
+	}
 	idx.applyLap("restub")
 	// The capability state of the files, read before the eviction below
 	// deletes it; the carried set says which incoming accesses_field rows
@@ -1349,9 +1352,10 @@ func restubIncomingRefsFromView(
 	g graph.Store,
 	stages []*incrementalBatchStage,
 	view incrementalPriorView,
-) []*graph.Edge {
+) ([]*graph.Edge, []string) {
 	evicted := structuralPriorIDs(stages)
 	reparsed := reparsedPaths(stages)
+	npmConsumers := restubTrackedNpmImportsFromView(g, evicted, view.inByNode)
 	var reindexes []graph.EdgeReindex
 	var carried []*graph.Edge
 	carriedSeen := make(map[*graph.Edge]struct{})
@@ -1497,7 +1501,10 @@ func restubIncomingRefsFromView(
 				}
 				oldTo := edge.To
 				graph.StashRestubProvenance(edge)
-				edge.To = stub
+				edge.To = goModuleRestubTarget(edge, stub)
+				if edge.To != stub {
+					edge.CrossRepo, edge.ConfidenceLabel = false, ""
+				}
 				reindexes = append(reindexes, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
 			}
 		}
@@ -1505,7 +1512,7 @@ func restubIncomingRefsFromView(
 	if len(reindexes) > 0 {
 		g.ReindexEdges(reindexes)
 	}
-	return carried
+	return carried, npmConsumers
 }
 
 // dataflowSourceSite is a reference's site: the file that records it and its
@@ -2483,7 +2490,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		// carry therefore means a deletion stage stopped being conservative,
 		// which would destroy those edges with no compile error to show for
 		// it — so the assumption is checked, not just documented.
-		if carried := restubIncomingRefsFromView(idx.graph, stages, view); len(carried) > 0 {
+		if carried, _ := restubIncomingRefsFromView(idx.graph, stages, view); len(carried) > 0 {
 			idx.logger.Error("indexer: deletion restub carried in-edges with no re-state path",
 				zap.String("repo", idx.repoPrefix),
 				zap.Int("carried", len(carried)),

@@ -316,15 +316,17 @@ type warmupTimings struct {
 // parallel reconcile pool. Any incomplete result fails closed to the existing
 // repo/global pipeline; an ordinary warm delta stays file-scoped end to end.
 type warmupDeltaFrontier struct {
-	mu    sync.Mutex
-	exact bool
-	plans map[string]indexer.DerivedInvalidationPlan
+	mu             sync.Mutex
+	exact          bool
+	plans          map[string]indexer.DerivedInvalidationPlan
+	crossRepoFiles map[string]struct{}
 }
 
 func newWarmupDeltaFrontier() *warmupDeltaFrontier {
 	return &warmupDeltaFrontier{
-		exact: true,
-		plans: make(map[string]indexer.DerivedInvalidationPlan),
+		exact:          true,
+		plans:          make(map[string]indexer.DerivedInvalidationPlan),
+		crossRepoFiles: make(map[string]struct{}),
 	}
 }
 
@@ -344,13 +346,21 @@ func (frontier *warmupDeltaFrontier) record(result *indexer.IndexResult) {
 	plan := frontier.plans[result.RepoPrefix]
 	plan.Merge(result.DerivedInvalidation)
 	frontier.plans[result.RepoPrefix] = plan
+	for _, file := range result.CrossRepoResolveFiles {
+		if file != "" {
+			frontier.crossRepoFiles[file] = struct{}{}
+		}
+	}
 }
 
 func (frontier *warmupDeltaFrontier) snapshot(changedRepos int, scopeUnknown bool) (map[string]indexer.DerivedInvalidationPlan, []string, bool) {
 	frontier.mu.Lock()
 	defer frontier.mu.Unlock()
 	plans := make(map[string]indexer.DerivedInvalidationPlan, len(frontier.plans))
-	fileSet := make(map[string]struct{})
+	fileSet := make(map[string]struct{}, len(frontier.crossRepoFiles))
+	for file := range frontier.crossRepoFiles {
+		fileSet[file] = struct{}{}
+	}
 	for prefix, plan := range frontier.plans {
 		plans[prefix] = plan
 		for _, file := range plan.Files {

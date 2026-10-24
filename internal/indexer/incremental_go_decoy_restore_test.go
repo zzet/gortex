@@ -186,7 +186,7 @@ func TestIncrementalGoDuplicateModuleAndForeignImportStayColdEquivalent(t *testi
 			if tc.wantRepo == "otherrepo" {
 				require.Equal(t, before, project(store), "withdrawing another repository must not retarget a local imported call")
 			} else {
-				require.True(t, graph.IsUnresolvedTarget(callTargetFrom(t, store, caller)))
+				require.Equal(t, "external-call::dep::example.invalid/issue767/producer", callTargetFrom(t, store, caller))
 				for _, edge := range store.GetInEdges(caller) {
 					if edge.Kind == graph.EdgeValueFlow {
 						require.NotEqual(t, "issue767/producer/producer.go::Produce", edge.From)

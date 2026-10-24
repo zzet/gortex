@@ -31,6 +31,9 @@ import (
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
+	"graph.ExternalCallCandidateIterator": "read accelerator: external-call candidates fall back to the composed edge-kind scan, preserving delta masks",
+	"anonymous{ReindexEdgesApplied}":      "batch-drop receipt for persistent stores; DeltaWriter applies its reindexes locally and unconditionally through ReindexEdges",
+
 	"graph.ContractExtractionEdgeReader":                   "physical checked extraction adjacency; outgoingMetadataContext dispatches the composed DeltaWriter through its selected view rather than forwarding base-only rows",
 	"graph.OverlayLayerContractExtractionEdgeReader":       "physical ancestry-layer projection, not the composed delta; outgoingMetadataContext applies each selected layer and its masks explicitly",
 	"graph.AnalysisPageBinder":                             "whole-graph analysis opts into bounded snapshots under its revision publication fence; file-delta resolver reads retain their composed snapshot semantics",

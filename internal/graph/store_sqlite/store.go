@@ -2761,6 +2761,12 @@ var errReindexWriterGateContended = errors.New("store_sqlite: reindex writer gat
 // variable-safe VALUES relations, simulates the prior ordered DELETE + INSERT
 // OR IGNORE semantics, and persists only the net final-state differences.
 func (s *Store) ReindexEdges(batch []graph.EdgeReindex) {
+	s.ReindexEdgesApplied(batch)
+}
+
+// ReindexEdgesApplied reports a dropped writer-gate batch to retry-aware callers.
+// Fatal store failures retain ReindexEdges' existing panic contract.
+func (s *Store) ReindexEdgesApplied(batch []graph.EdgeReindex) bool {
 	for _, r := range batch {
 		if r.Edge != nil && graph.IsUnresolvedTarget(r.Edge.To) {
 			s.unresolvedInserts.Add(1)
@@ -2769,10 +2775,12 @@ func (s *Store) ReindexEdges(batch []graph.EdgeReindex) {
 	if _, err := s.reindexEdgesSetOriented(batch); err != nil {
 		if errors.Is(err, errReindexWriterGateContended) {
 			log.Printf("store_sqlite: reindex writer gate contended, dropping %d rebind(s) — a later resolve pass rebinds them: %v", len(batch), err)
-			return
+			return false
 		}
 		panicOnFatal(err)
+		return false
 	}
+	return true
 }
 
 // SetEdgeProvenanceBatch applies origin promotions through bounded VALUES

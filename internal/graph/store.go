@@ -2033,6 +2033,12 @@ type ExternalCallCandidates interface {
 	ExternalCallCandidateEdges() []*Edge
 }
 
+// ExternalCallCandidateIterator is the bounded, early-stoppable form of
+// ExternalCallCandidates. Callbacks may mutate the store between pages.
+type ExternalCallCandidateIterator interface {
+	ExternalCallCandidateEdgesSeq() iter.Seq[*Edge]
+}
+
 // CommunityCrossingsByKind is an optional capability backends MAY
 // implement to return per-source crossing counts for edges whose
 // Kind is in the supplied set, given a node→community membership

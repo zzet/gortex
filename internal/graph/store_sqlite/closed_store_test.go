@@ -67,3 +67,12 @@ func TestClosedStoreAggregatorsDoNotPanic(t *testing.T) {
 		assert.Zero(t, n)
 	}, "aggregator reads after Close must degrade to empty, not panic")
 }
+
+func TestReindexEdgesAppliedClosedStore(t *testing.T) {
+	s := openTestStore(t)
+	require.NoError(t, s.Close())
+	assert.False(t, s.ReindexEdgesApplied([]graph.EdgeReindex{{
+		Edge:  &graph.Edge{From: "caller", To: "target", Kind: graph.EdgeCalls, FilePath: "a.go"},
+		OldTo: "dep::example.org/lib::Fn",
+	}}), "a teardown failure must not report an applied batch")
+}

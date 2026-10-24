@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -111,6 +112,7 @@ type CrossRepoResolver struct {
 	// rows. A Go call the per-repo package guard refused must not regain a
 	// same-repo name-only binding just because the repository is reachable.
 	importedDirsByFile map[string]map[string]struct{}
+	jsTSBindingsByFile map[string]map[string]string
 	// depModuleIndex bridges Go imports to dep::<module> contract
 	// nodes from the caller's go.mod. Same shape and rationale as
 	// the field of the same name on Resolver — see resolver.go for
@@ -131,6 +133,13 @@ type CrossRepoResolver struct {
 	// candidate is live by construction.
 	validateLiveness     bool
 	crossWorkspaceLookup CrossWorkspaceDepLookup
+	goModules            map[string]string
+	goModulePaths        goModulePathIndex
+	goModuleReplacements map[string][]GoModuleReplacement
+	goModuleRetry        *GoModuleDepRetry
+	goModuleRevision     uint64
+	goModuleDemotedMu    sync.Mutex
+	goModuleDemotedFiles map[string]struct{}
 	// npmAlias rewrites a JS/TS import specifier that matches an
 	// npm-alias dependency key in the importing file's nearest-
 	// ancestor package.json. Same contract as the field of the
@@ -140,7 +149,8 @@ type CrossRepoResolver struct {
 	// importer as a dependency resolving outside the repository. Same
 	// contract as the field of the same name on Resolver — see
 	// npm_dependency.go.
-	npmDep NpmDependencyLookup
+	npmDep      NpmDependencyLookup
+	npmPackages NpmPackageLookup
 	// pathAlias expands a JS/TS tsconfig/jsconfig path-alias / baseUrl
 	// import specifier to the repo-prefixed file stem it targets. Same
 	// contract as the field of the same name on Resolver — see
@@ -269,14 +279,18 @@ func fileCandidateWorkspaceID(file graph.FileNodeIdentity) string {
 // (function/method calls — they don't carry an import path so the
 // only check is workspace-pair declaration).
 func (cr *CrossRepoResolver) crossWorkspaceEligible(sourceWS, targetWS, importPath string) bool {
+	return crossWorkspaceEligible(cr.crossWorkspaceLookup, sourceWS, targetWS, importPath)
+}
+
+func crossWorkspaceEligible(lookup CrossWorkspaceDepLookup, sourceWS, targetWS, importPath string) bool {
 	if sourceWS == targetWS {
 		return true
 	}
-	if cr.crossWorkspaceLookup == nil {
+	if lookup == nil {
 		// Legacy / unwired callers: no boundary enforcement.
 		return true
 	}
-	rules := cr.crossWorkspaceLookup(sourceWS)
+	rules := lookup(sourceWS)
 	for _, rule := range rules {
 		if rule.Workspace != targetWS {
 			continue
@@ -382,12 +396,18 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
+	if err := cr.retryGoModuleDeps(ctx, stats); err != nil {
+		return stats, err
+	}
 	// Fresh placeholder-source set per pass — same rationale as ResolveAll
 	// on the master resolver.
 	cr.placeholderSrcIdx = placeholderSourceIndex{}
 	// Every exit applies the moves the pass deferred (a no-op after the
 	// normal flush below); it runs before the deferred unlock above.
 	defer cr.placeholderSrcIdx.applyDeferred(cr.graph)
+	if err := cr.resolveTrackedNpmImports(ctx, graph.EdgesLightSeq(cr.graph, graph.EdgeImports), stats); err != nil {
+		return stats, err
+	}
 	// Share the master resolver's stable high-water/keyset stream. The cold
 	// residual can exceed 200k edges; retaining it plus the cross-repo name,
 	// raw-name, repo and qualified-name caches was the second whole-corpus heap
@@ -672,6 +692,7 @@ func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRe
 // scopes. Caller holds cr.mu.
 func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepoStats {
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
+	_ = cr.resolveTrackedNpmImports(context.Background(), slices.Values(edges), stats)
 	pending := make([]*graph.Edge, 0, len(edges))
 	for _, edge := range edges {
 		if edge != nil && graph.IsUnresolvedTarget(edge.To) {
@@ -795,6 +816,7 @@ func (cr *CrossRepoResolver) clearDirIndexes() {
 func (cr *CrossRepoResolver) buildReachableReposIndex() {
 	idx := make(map[string]map[string]struct{})
 	dirs := make(map[string]map[string]struct{})
+	cr.jsTSBindingsByFile = make(map[string]map[string]string)
 	// Materialise metadata-free import projections and batch-load only target
 	// placement fields. A per-edge point lookup here is a query round-trip per
 	// import on a disk backend, which under the cross-repo pass's import
@@ -817,29 +839,74 @@ func (cr *CrossRepoResolver) buildReachableReposIndex() {
 		idList = append(idList, id)
 	}
 	placements := graph.NodePlacementsByIDs(cr.graph, idList)
-	for _, e := range imports {
-		// Only resolved imports carry evidence — an unresolved import
-		// target tells us nothing about which repo the caller reaches.
-		to, ok := placements[e.To]
-		if !ok {
-			continue
-		}
-		if to.FilePath != "" {
-			dir := filePathDir(to.FilePath)
-			if dirs[e.From] == nil {
-				dirs[e.From] = make(map[string]struct{})
+	for start := 0; start < len(imports); start += resolvePendingPageRows {
+		page := imports[start:min(start+resolvePendingPageRows, len(imports))]
+		var sites []graph.EdgeSite
+		for _, e := range page {
+			if e.CrossRepo && isJSTSPath(e.From) {
+				sites = append(sites, graph.EdgeSite{From: e.From, Line: e.Line, Kind: graph.EdgeImports})
 			}
-			dirs[e.From][dir] = struct{}{}
 		}
-		if to.RepoPrefix == "" {
-			continue
+		// Markers belong to the persisted import, including imports outside a
+		// scoped resolution frontier. Hydrate only cross-repo JS/TS imports.
+		full := cr.graph.GetEdgeCandidates(nil, sites)
+		for _, e := range page {
+			for _, candidate := range full.Site(e.From, e.Line, graph.EdgeImports) {
+				if candidate.To == e.To && candidate.FilePath == e.FilePath {
+					e = candidate
+					break
+				}
+			}
+			// Only resolved imports carry evidence — an unresolved import
+			// target tells us nothing about which repo the caller reaches.
+			to, ok := placements[e.To]
+			if !ok {
+				continue
+			}
+			if to.FilePath != "" {
+				dir := filePathDir(to.FilePath)
+				if dirs[e.From] == nil {
+					dirs[e.From] = make(map[string]struct{})
+				}
+				dirs[e.From][dir] = struct{}{}
+			}
+			if to.RepoPrefix == "" {
+				continue
+			}
+			marked, _ := e.Meta[NpmImportSpecifierMeta].(string)
+			npmLinked := marked != "" && e.CrossRepo
+			alias, _ := e.Meta["import_alias"].(string)
+			if alias == "" {
+				alias = e.Alias
+			}
+			if e.CrossRepo && isJSTSPath(e.From) {
+				// JS/TS imports name bindings, not every symbol in the provider.
+				if _, name, ok := strings.Cut(e.To, "::"); ok {
+					if alias != "" {
+						name = alias
+					}
+					bindings := cr.jsTSBindingsByFile[e.From]
+					if bindings == nil {
+						bindings = make(map[string]string)
+						cr.jsTSBindingsByFile[e.From] = bindings
+					}
+					if prior, exists := bindings[name]; !exists || prior == e.To {
+						bindings[name] = e.To
+					} else {
+						bindings[name] = "" // Conflicting bindings must not pick a winner.
+					}
+				}
+			}
+			if npmLinked {
+				continue
+			}
+			set := idx[e.From]
+			if set == nil {
+				set = make(map[string]struct{})
+				idx[e.From] = set
+			}
+			set[to.RepoPrefix] = struct{}{}
 		}
-		set := idx[e.From]
-		if set == nil {
-			set = make(map[string]struct{})
-			idx[e.From] = set
-		}
-		set[to.RepoPrefix] = struct{}{}
 	}
 	cr.reachableReposByFile = idx
 	cr.importedDirsByFile = dirs
@@ -848,6 +915,7 @@ func (cr *CrossRepoResolver) buildReachableReposIndex() {
 func (cr *CrossRepoResolver) clearReachableReposIndex() {
 	cr.reachableReposByFile = nil
 	cr.importedDirsByFile = nil
+	cr.jsTSBindingsByFile = nil
 }
 
 // A package-guard refusal is stronger than the cross-repo pass's same-repo
@@ -1164,6 +1232,8 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 	}
 
 	switch {
+	case strings.HasSuffix(e.FilePath, ".go") && strings.HasPrefix(target, "extern::"):
+		cr.resolveGoExtern(e, strings.TrimPrefix(target, "extern::"), stats)
 	case strings.HasPrefix(target, "import::"):
 		cr.resolveImport(e, strings.TrimPrefix(target, "import::"), stats)
 	case strings.HasPrefix(target, "*."):
@@ -1245,7 +1315,8 @@ func (cr *CrossRepoResolver) filterLiveReindex(batch []graph.EdgeReindex) []grap
 // placeholder rather than a concrete graph node (so the chunked path's
 // target-liveness guard must not treat its absence as an evicted candidate).
 func isSyntheticResolveTarget(to string) bool {
-	return strings.HasPrefix(to, "external::") || strings.HasPrefix(to, "extern::")
+	return strings.HasPrefix(to, "external::") || strings.HasPrefix(to, "extern::") ||
+		strings.HasPrefix(to, "dep::") || graph.IsStdlibStub(to)
 }
 
 // resolveChunkEnabled reports whether the global resolve passes process their
@@ -1315,6 +1386,19 @@ func (cr *CrossRepoResolver) csharpVerdictCaller(e *graph.Edge) bool {
 }
 
 func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *CrossRepoStats) {
+	file := cr.callerFileID(e)
+	if target := cr.jsTSBindingsByFile[file][funcName]; target != "" {
+		if imported := cr.cachedGetNode(target); imported != nil && (imported.Kind == graph.KindFunction || imported.Kind == graph.KindMethod) {
+			e.To = imported.ID
+			stats.Resolved++
+			if isCrossRepoHop(cr.callerRepoPrefix(e), imported.RepoPrefix) {
+				e.CrossRepo = true
+				stats.CrossRepoEdges++
+				stats.ByRepo[imported.RepoPrefix]++
+			}
+			return
+		}
+	}
 	candidates := cr.scopedCandidates(e, funcName)
 	if len(candidates) == 0 {
 		stats.Unresolved++

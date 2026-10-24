@@ -537,6 +537,9 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		batch.dropDeferredPriorBindings()
 	}
 	crossRepoFiles := appendUniqueSorted(nil, files...)
+	if batch != nil {
+		crossRepoFiles = appendUniqueSorted(crossRepoFiles, batch.npmConsumerFiles...)
+	}
 	if result != nil {
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, result.DerivedInvalidation.Files...)
 	}
@@ -585,7 +588,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		}
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, semanticFiles...)
 	}
-	if needed || len(semanticFiles) > 0 {
+	if needed || len(semanticFiles) > 0 || batch != nil && len(batch.npmConsumerFiles) > 0 {
 		if idx != nil {
 			idx.observeIncrementalCatchup("cross_repo", crossRepoFiles)
 		}

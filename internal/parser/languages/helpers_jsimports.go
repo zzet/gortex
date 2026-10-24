@@ -86,6 +86,7 @@ func emitJSPerBindingImports(importNode *sitter.Node, importPath, fileID, filePa
 		}
 		if alias != "" && alias != orig {
 			edge.Alias = alias
+			edge.Meta = map[string]any{"import_alias": alias}
 		}
 		result.Edges = append(result.Edges, edge)
 	}

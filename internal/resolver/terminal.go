@@ -91,6 +91,9 @@ func (r *Resolver) classifyTerminal(e *graph.Edge) (reason string, terminal bool
 		return "", false
 	}
 	target := graph.UnresolvedName(e.To)
+	if r.pendingGoModuleExtern(e) {
+		return "", false
+	}
 
 	// C/C++/ObjC standard-library angle-include (<stdio.h>, <vector>, …):
 	// external by construction, deliberately never bound to an in-tree file of
@@ -312,7 +315,7 @@ func (r *Resolver) reconcileTerminalStampsExcluding(excluded map[deferredLSPWork
 func (r *Resolver) classifyTerminalBulk(pending []*graph.Edge, counter graph.NodeNameClassCounter) (reasons []string, terminals []bool) {
 	names := make(map[string]struct{})
 	for _, e := range pending {
-		if e.Kind == graph.EdgeImports {
+		if e.Kind == graph.EdgeImports || r.pendingGoModuleExtern(e) {
 			continue
 		}
 		if name := identifierFromTarget(graph.UnresolvedName(e.To)); name != "" {
@@ -328,8 +331,10 @@ func (r *Resolver) classifyTerminalBulk(pending []*graph.Edge, counter graph.Nod
 	reasons = make([]string, len(pending))
 	terminals = make([]bool, len(pending))
 	for i, e := range pending {
-		switch e.Kind {
-		case graph.EdgeImports:
+		switch {
+		case r.pendingGoModuleExtern(e):
+			continue
+		case e.Kind == graph.EdgeImports:
 			reasons[i], terminals[i] = r.classifyTerminal(e)
 		default:
 			name := identifierFromTarget(graph.UnresolvedName(e.To))

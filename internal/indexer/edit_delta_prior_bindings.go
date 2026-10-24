@@ -259,28 +259,37 @@ func pruneBuiltinReuse(reuse map[reuseKey]*reuseVal) {
 // edge (semantic.ConfirmEdge).
 var reuseSemanticMetaKeys = []string{"confirmed_from_origin", "semantic_source"}
 
-// reuseSemanticMeta is the confirmation provenance of a captured bind, nil when
-// it carries none. A confirmed bind's origin is LSP-grade, and a later
-// confirmation of an edge that already carries an LSP-grade origin leaves it
-// as it is, so a reuse that restored the origin without this provenance would
-// leave the edge different from the one a whole index confirms.
+// reuseCarriedMetaKeys are importer-owned binding markers a reused bind keeps
+// verbatim, even when its confirmation provenance is dropped. go_import lets a
+// parked cross-module Go call relink when its provider returns.
+var reuseCarriedMetaKeys = []string{"go_import"}
+
+// reuseSemanticMeta is the confirmation provenance and binding markers of a
+// captured bind, nil when it carries neither. A confirmed bind's origin is
+// LSP-grade, and a later confirmation of an edge that already carries an
+// LSP-grade origin leaves it as it is, so a reuse that restored the origin
+// without this provenance would leave the edge different from the one a whole
+// index confirms.
 func reuseSemanticMeta(edge *graph.Edge) map[string]any {
 	if edge == nil || len(edge.Meta) == 0 {
 		return nil
 	}
 	var out map[string]any
-	for _, key := range reuseSemanticMetaKeys {
-		if value, ok := edge.Meta[key]; ok {
-			if out == nil {
-				out = make(map[string]any, len(reuseSemanticMetaKeys))
+	for _, keys := range [][]string{reuseSemanticMetaKeys, reuseCarriedMetaKeys} {
+		for _, key := range keys {
+			if value, ok := edge.Meta[key]; ok {
+				if out == nil {
+					out = make(map[string]any)
+				}
+				out[key] = value
 			}
-			out[key] = value
 		}
 	}
 	return out
 }
 
-// applyReuseSemanticMeta restores a reused bind's confirmation provenance.
+// applyReuseSemanticMeta restores a reused bind's confirmation provenance and
+// carried binding markers.
 func applyReuseSemanticMeta(edge *graph.Edge, meta map[string]any) {
 	if len(meta) == 0 {
 		return
@@ -298,7 +307,9 @@ func applyReuseSemanticMeta(edge *graph.Edge, meta map[string]any) {
 func stripReuseSemanticMeta(reuse map[reuseKey]*reuseVal) {
 	for _, val := range reuse {
 		if val != nil {
-			val.semanticMeta = nil
+			for _, key := range reuseSemanticMetaKeys {
+				delete(val.semanticMeta, key)
+			}
 		}
 	}
 }

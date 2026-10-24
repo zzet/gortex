@@ -49,9 +49,10 @@ type reuseVal struct {
 	// fresh resolve, as before.
 	resolution string
 	// semanticMeta is the provenance a semantic confirmation stamped on the
-	// captured bind (confirmed_from_origin, semantic_source). Only a per-file
-	// delta's change set keeps it (pruneBuiltinReuse); every other caller
-	// strips it and keeps the established reuse.
+	// captured bind (confirmed_from_origin, semantic_source) plus the
+	// importer-owned markers in reuseCarriedMetaKeys (go_import). Only a
+	// per-file delta's change set keeps the provenance (pruneBuiltinReuse);
+	// every other caller strips it and keeps the markers.
 	semanticMeta map[string]any
 }
 

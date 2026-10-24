@@ -536,6 +536,68 @@ func (s *Store) ExternalCallCandidateEdges() []*graph.Edge {
 	return s.queryEdgesSQL(q, s.viewGen)
 }
 
+// ExternalCallCandidateEdgesSeq uses the same partial-index predicate as the
+// slice projection, with a stable rowid window and bounded decoded pages.
+func (s *Store) ExternalCallCandidateEdgesSeq() iter.Seq[*graph.Edge] {
+	return func(yield func(*graph.Edge) bool) {
+		var highWater int64
+		if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM edges`).Scan(&highWater); err != nil {
+			panicOnFatal(err)
+			return
+		}
+		// A single kind lets the partial index stream rowids without sorting
+		// the remaining range on every page. Keep one window across both kinds
+		// so callback mutations cannot enter the second stream.
+		for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
+			var after int64
+			for after < highWater {
+				page, err := s.externalCallCandidatePage(kind, after, highWater)
+				if err != nil {
+					panicOnFatal(err)
+					return
+				}
+				if len(page.Edges) == 0 {
+					break
+				}
+				for _, edge := range page.Edges {
+					if !yield(edge) {
+						return
+					}
+				}
+				after = page.NextID
+			}
+		}
+	}
+}
+
+func (s *Store) externalCallCandidatePage(kind graph.EdgeKind, after, highWater int64) (graph.UnresolvedEdgePage, error) {
+	page := graph.UnresolvedEdgePage{NextID: after}
+	// With LIMIT, SQLite can prefer the full rowid range even after ANALYZE.
+	// Pin the existing partial index so sparse external terminals stay cheap.
+	rows, err := s.db.Query(`SELECT id, `+lookupEdgeCols+` FROM edges INDEXED BY edges_external
+		WHERE view_gen = ? AND id > ? AND id <= ?
+		AND kind = ? AND `+externalCallTargetPredicate+`
+		ORDER BY id LIMIT 512`, s.viewGen, after, highWater, kind)
+	if err != nil {
+		return page, err
+	}
+	defer rows.Close()
+	bytesUsed := 0
+	for rows.Next() {
+		id, edge, size, err := scanUnresolvedEdge(rows)
+		if err != nil {
+			return page, err
+		}
+		page.NextID = id
+		page.Edges = append(page.Edges, edge)
+		bytesUsed += size
+		if bytesUsed >= 4<<20 {
+			break
+		}
+	}
+	return page, rows.Err()
+}
+
 // DistinctExternalTargets performs the Go external-attribution discovery as
 // one SQLite aggregate. Only distinct destination IDs cross the driver; full
 // edge payloads (especially Meta) stay disk-resident.

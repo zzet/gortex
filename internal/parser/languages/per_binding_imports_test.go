@@ -43,6 +43,12 @@ func assertPerBindingImports(t *testing.T, res *parser.ExtractionResult) {
 	if bar.Alias != "baz" {
 		t.Errorf("bar import alias = %q, want baz", bar.Alias)
 	}
+	if bar.Meta["import_alias"] != "baz" {
+		t.Errorf("persisted bar import alias = %v, want baz", bar.Meta["import_alias"])
+	}
+	if _, present := foo.Meta["import_alias"]; present {
+		t.Error("an unrenamed import must not carry import_alias")
+	}
 
 	// Named re-export edges: a (no rename) and b→c (renamed exported name).
 	a := importEdge(res, graph.EdgeReExports, "unresolved::import::up::a")

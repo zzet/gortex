@@ -11,8 +11,10 @@ import (
 	"strings"
 
 	"go.uber.org/zap"
+	"golang.org/x/mod/modfile"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/resolver"
 )
@@ -666,6 +668,15 @@ func (w *closureWalk) placeQualified(
 	accounted map[string]struct{},
 	out map[string]struct{},
 ) {
+	var module string
+	if len(qualified) > 0 && w.req.Target != nil {
+		data, _, err := readSourceFile(w.req.Target, "go.mod")
+		if err != nil && !errors.Is(err, source.ErrNotInSource) {
+			w.err = err
+			return
+		}
+		module = modfile.ModulePath(data)
+	}
 	specs := make([]string, 0, len(qualified))
 	for spec := range qualified {
 		specs = append(specs, spec)
@@ -690,7 +701,7 @@ func (w *closureWalk) placeQualified(
 					continue
 				}
 				if _, owned := builderRelPath(w.req.RepoPrefix, node.FilePath); !owned ||
-					!closureDirNamedBySpec(path.Dir(node.FilePath), spec) {
+					!closureDirNamedBySpec(path.Dir(node.FilePath), spec, w.req.RepoPrefix, module) {
 					continue
 				}
 				out[node.FilePath] = struct{}{}
@@ -701,8 +712,11 @@ func (w *closureWalk) placeQualified(
 
 // closureDirNamedBySpec mirrors resolveExtern's same-repository directory
 // test on a graph-path directory: the directory ends with the specifier's last
-// path segment, is the specifier, or ends with it.
-func closureDirNamedBySpec(dir, spec string) bool {
+// path segment, is the specifier, ends with it, or names the own-module root.
+func closureDirNamedBySpec(dir, spec, repo, module string) bool {
+	if module != "" && (spec == module || strings.HasPrefix(spec, module+"/")) && dir == repo+strings.TrimPrefix(spec, module) {
+		return true
+	}
 	if dir == "" || dir == "." || spec == "" {
 		return false
 	}

@@ -44,6 +44,7 @@ func (r *Resolver) ResolveFilesOutgoing(filePaths []string) *ResolveStats {
 	}()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.refreshGoModules()
 	r.scopedCSharpVisibilityInvalidate(filePaths)
 	frontier = collectOutgoingFileFrontier(r.graph, filePaths, r.incrementalSkipped)
 	if len(frontier.pending) == 0 {

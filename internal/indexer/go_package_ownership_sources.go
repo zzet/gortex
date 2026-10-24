@@ -5,6 +5,8 @@ import (
 	"iter"
 	"path"
 
+	"golang.org/x/mod/modfile"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/resolver"
@@ -36,6 +38,11 @@ func (idx *Indexer) prepareGoPackageOwnership(ctx context.Context, prefixes []st
 	for _, prefix := range prefixes {
 		if prefix == idx.repoPrefix {
 			targets[prefix] = goPackageSource{ref: idx.contentSrc.Load(), root: idx.rootPath}
+		} else if mi := idx.repositoryMutationOwner; mi != nil {
+			// A provider save also resolves surviving callers in other repos.
+			if caller := mi.GetIndexer(prefix); caller != nil {
+				targets[prefix] = goPackageSource{ref: caller.contentSrc.Load(), root: caller.rootPath}
+			}
 		}
 	}
 	return prepareGoPackageSources(ctx, targets, files)
@@ -123,4 +130,21 @@ func (target goPackageSource) prepare(ctx context.Context, prefix string, goFile
 	}
 	defer fs.Close()
 	return goPackageOwnershipFromFiles(ctx, fs, prefix, goFiles)
+}
+
+// Standalone builders have no MultiIndexer, but still own their root module.
+// Read its identity from the same full manifest source as package ownership.
+func (idx *Indexer) ownGoModules() map[string]string {
+	if idx.rootPath == "" {
+		return nil
+	}
+	data, ok := idx.manifestTree().readFile("go.mod")
+	if !ok {
+		return nil
+	}
+	module := modfile.ModulePath(data)
+	if module == "" {
+		return nil
+	}
+	return map[string]string{idx.repoPrefix: module}
 }
