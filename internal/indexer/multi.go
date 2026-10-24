@@ -2631,7 +2631,7 @@ func (mi *MultiIndexer) RefreshRepoConfigs() int {
 		idx := mi.indexers[prefix]
 		mi.mu.RUnlock()
 		if idx != nil {
-			idx.SetExcludePatterns(cfg.Index.Exclude)
+			idx.SetIgnorePatterns(cfg.Index.Exclude, cfg.Index.Include)
 		}
 	}
 	return len(roots)
@@ -2803,7 +2803,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	// admission refresh alone would still leave unignored source excluded by
 	// the long-lived Indexer's construction-time matcher.
 	if mi.configManagedExcludes.Load() {
-		idx.refreshEffectiveExcludePatterns(mi.configMgr.EffectiveExclude(repoPrefix))
+		idx.refreshEffectiveExcludePatterns(mi.configMgr.EffectiveExclude(repoPrefix), mi.configMgr.EffectiveInclude(repoPrefix))
 	}
 
 	// The stable per-repository lane is held before this executor runs. Take

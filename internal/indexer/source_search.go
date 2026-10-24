@@ -32,11 +32,10 @@ func (idx *Indexer) DecodeSourceSearchText(path string, src []byte) []byte {
 // are read from this checkout rather than cached from its canonical sibling.
 // Scope is applied before reading sources and before any result limit.
 func (idx *Indexer) CurrentSourceSearchFiles(ctx context.Context, root string, allow, allowDir func(string) bool, maxFiles int, patterns []string) ([]string, error) {
-	ignores := excludes.NewHierarchical(root, dirIgnoreFiles...)
-	matcher := idx.excludeMatcher()
-	if patterns != nil {
-		matcher = excludes.New(effectiveExcludePatterns(patterns))
-	}
+	ignores := excludes.NewHierarchicalWithDiagnostics(root, dirIgnoreFiles, func(dir string, m *excludes.Matcher) {
+		idx.warnExcludedNegationsAt(m, dir)
+	})
+	matcher := idx.sourceSearchMatcher(patterns)
 	content := idx.newContentAdmissionGate()
 	untracked := idx.newUntrackedAssetGate(ctx, root)
 	var files []string
@@ -58,15 +57,15 @@ func (idx *Indexer) CurrentSourceSearchFiles(ctx context.Context, root string, a
 			return filepath.SkipDir
 		}
 		if entry.IsDir() {
-			// The index walk's pruning rule: .git and agent-state folders
-			// close, and an excluded folder stays open only while a
-			// re-include might reach into it.
-			if shouldPruneDir(path, root, matcher, ignores, false) {
+			// An excluded folder stays open only when an include reopens it
+			// or it is an ancestor of an anchored literal include.
+			// Git metadata and agent state remain closed.
+			if shouldPruneDir(path, root, matcher, ignores) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if sourceSearchExcluded(matcher, ignores, root, path, false) || (allow != nil && !allow(filepath.ToSlash(rel))) {
+		if (pathExclusionRules{flat: matcher, perFolder: ignores, parentsOpen: true}).match(path, root, false) || (allow != nil && !allow(filepath.ToSlash(rel))) {
 			return nil
 		}
 		if pathguard.SymlinkEscapes(path, root) {
@@ -110,11 +109,10 @@ func sourceSearchExcluded(matcher *excludes.Matcher, ignores *excludes.Hierarchi
 
 // AdmitSourceSearchBuffer applies the same corpus policy to overlay-only files.
 func (idx *Indexer) AdmitSourceSearchBuffer(ctx context.Context, root, path string, content []byte, patterns []string) bool {
-	matcher := idx.excludeMatcher()
-	if patterns != nil {
-		matcher = excludes.New(effectiveExcludePatterns(patterns))
-	}
-	if sourceSearchExcluded(matcher, excludes.NewHierarchical(root, dirIgnoreFiles...), root, path, false) {
+	matcher := idx.sourceSearchMatcher(patterns)
+	if sourceSearchExcluded(matcher, excludes.NewHierarchicalWithDiagnostics(root, dirIgnoreFiles, func(dir string, m *excludes.Matcher) {
+		idx.warnExcludedNegationsAt(m, dir)
+	}), root, path, false) {
 		return false
 	}
 	lang, ok := idx.effectiveLanguage(path, content)
@@ -128,4 +126,20 @@ func (idx *Indexer) AdmitSourceSearchBuffer(ctx context.Context, root, path stri
 		return false
 	}
 	return true
+}
+
+func (idx *Indexer) sourceSearchMatcher(patterns []string) *excludes.Matcher {
+	if patterns == nil {
+		return idx.excludeMatcher()
+	}
+	idx.excludeMu.Lock()
+	defer idx.excludeMu.Unlock()
+	if idx.sourceSearchCompiled == nil ||
+		!sameImmutableExcludeSnapshot(idx.sourceSearchPatterns, patterns) ||
+		!sameImmutableExcludeSnapshot(idx.sourceSearchIncludes, idx.config.Include) {
+		idx.sourceSearchPatterns = patterns
+		idx.sourceSearchIncludes = idx.config.Include
+		idx.sourceSearchCompiled = idx.newExcludeMatcher(patterns)
+	}
+	return idx.sourceSearchCompiled
 }

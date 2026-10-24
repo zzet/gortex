@@ -48,7 +48,8 @@ func TestWalkRulesFixture(t *testing.T) {
 	}
 
 	// These paths come from the fixture rules, not from any walk's output.
-	want := []string{"build/keep.go", "docs/ok.go", "src/a.go", "tool.unknownext"}
+	// build/keep.go stays excluded: build/ itself was never re-included.
+	want := []string{"docs/ok.go", "src/a.go", "tool.unknownext"}
 
 	t.Run("bulk", func(t *testing.T) {
 		idx := newIndexer()

@@ -79,7 +79,7 @@ func (f *checkoutWatchFilter) ShouldInclude(path string) bool {
 		if rel == "." {
 			return true
 		}
-		return !f.excludes.MatchRel(rel)
+		return !f.excludes.MatchRelEither(rel)
 	}
 	return true
 }
@@ -100,9 +100,9 @@ func checkoutRelPath(root, path string) (string, bool) {
 // startCheckoutWatch watches root recursively and calls onChange with the
 // changed paths (absolute, as the backend reports them) of each batch of
 // events. A nil slice means changes were lost (a queue overflow or a dropped
-// event) and the paths are unknown. patterns are the repository's exclude
-// patterns; nil takes the built-in list.
-func startCheckoutWatch(root string, patterns []string, logger *zap.Logger, onChange func([]string)) (*checkoutWatch, error) {
+// event) and the paths are unknown. matcher carries the repository's exclude
+// and include rules; nil takes the built-in list.
+func startCheckoutWatch(root string, matcher *excludes.Matcher, logger *zap.Logger, onChange func([]string)) (*checkoutWatch, error) {
 	if root == "" || onChange == nil {
 		return nil, errors.New("indexer: checkout watch needs a root and a consumer")
 	}
@@ -116,15 +116,15 @@ func startCheckoutWatch(root string, patterns []string, logger *zap.Logger, onCh
 	if slowWatchMount(abs) {
 		return nil, errors.New("indexer: checkout is on a mount native file events do not reach")
 	}
-	if len(patterns) == 0 {
-		patterns = excludes.Builtin
+	if matcher == nil {
+		matcher = excludes.New(excludes.Builtin)
 	}
 	registered := backendWatchPath(abs)
 	roots := []string{registered}
 	if registered != abs {
 		roots = append(roots, abs)
 	}
-	filter := &checkoutWatchFilter{excludes: excludes.New(patterns), roots: roots}
+	filter := &checkoutWatchFilter{excludes: matcher, roots: roots}
 
 	ready := make(chan struct{})
 	// Our own channels, for the reason Watcher.Start owns its: the library

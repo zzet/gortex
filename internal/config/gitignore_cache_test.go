@@ -3,7 +3,6 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -199,18 +198,6 @@ func uncachedEffectiveExclude(gc *GlobalConfig, ws *Config, repoPrefix, repoPath
 		if len(ws.Exclude) == 0 {
 			out = append(out, ws.Index.Exclude...)
 			out = append(out, ws.Watch.Exclude...)
-		}
-	}
-	if ws != nil {
-		for _, inc := range ws.Include {
-			inc = strings.TrimSpace(inc)
-			if inc == "" {
-				continue
-			}
-			if !strings.HasPrefix(inc, "!") {
-				inc = "!" + inc
-			}
-			out = append(out, inc)
 		}
 	}
 	return out

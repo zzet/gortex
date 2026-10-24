@@ -2,6 +2,8 @@ package indexer
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -372,5 +374,40 @@ func BenchmarkDedicatedBaseConfigSnapshot(b *testing.B) {
 			b.StopTimer()
 			b.ReportMetric(float64(configBytes), "config-bytes")
 		})
+	}
+}
+
+// The explicit version must re-key old generations even when optional JSON
+// fields are later omitted. Include must also survive the frozen snapshot.
+func TestDedicatedBaseConfigExclusionSemanticsVersion(t *testing.T) {
+	cfg := config.IndexConfig{Exclude: []string{"node_modules/", "!*.proto"}, Include: []string{"vendor/acme/"}}
+	owned, _, err := snapshotDedicatedBaseConfig(cfg, "repo", "workspace", "project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(owned.Include, cfg.Include) {
+		t.Fatalf("snapshot lost includes: %v", owned.Include)
+	}
+	for _, include := range [][]string{cfg.Include, nil} {
+		cfg.Include = include
+		_, got, err := snapshotDedicatedBaseConfig(cfg, "repo", "workspace", "project")
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(struct {
+			Domain      string             `json:"domain"`
+			Version     int                `json:"version"`
+			RepoPrefix  string             `json:"repo_prefix"`
+			WorkspaceID string             `json:"workspace_id"`
+			ProjectID   string             `json:"project_id"`
+			Index       config.IndexConfig `json:"index"`
+		}{"gortex.dedicated-base.config", 2, "repo", "workspace", "project", cfg})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(encoded)
+		if want := hex.EncodeToString(sum[:]); got != want {
+			t.Fatalf("exclusion semantics identity must use version 2: got %s, want %s", got, want)
+		}
 	}
 }

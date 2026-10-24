@@ -111,7 +111,7 @@ func (idx *Indexer) ScopeIndexability(relDir string, budget time.Duration) (inde
 		if !d.Type().IsRegular() {
 			return nil
 		}
-		if !idx.admitWalkFileKnownType(root, path, -1, d.Type()).admit {
+		if !idx.admitFileInOpenDir(root, path, -1, d.Type()).admit {
 			return nil
 		}
 		indexable = true

@@ -162,6 +162,8 @@ type Watcher struct {
 	// currentExcludePatterns is installed by MultiWatcher for its configured
 	// repository. ConfigManager returns immutable, shared policy snapshots.
 	currentExcludePatterns func() []string
+	currentIncludePatterns func() []string
+	excludePolicyIncludes  []string
 	excludePolicyMu        sync.Mutex
 	excludePolicyPatterns  []string
 	excludePolicyMatcher   *excludes.Matcher
@@ -404,7 +406,7 @@ func NewWatcher(idx *Indexer, cfg config.WatchConfig, logger *zap.Logger) (*Watc
 	return &Watcher{
 		indexer:           idx,
 		config:            cfg,
-		excludes:          excludes.New(patterns),
+		excludes:          excludes.NewWithIncludes(patterns, cfg.Include),
 		events:            make(chan GraphChangeEvent, 64),
 		pending:           make(map[string]*time.Timer),
 		pendingGeneration: make(map[string]uint64),
@@ -3244,7 +3246,7 @@ func (w *Watcher) isExcluded(path string) bool {
 	// condition.
 	perFolder := w.perFolderIgnores()
 	if err == nil && info.IsDir() {
-		return shouldPruneDir(path, root, m, perFolder, true)
+		return shouldPruneDir(path, root, m, perFolder)
 	}
 	return shouldExcludeRules(path, root, false, m, perFolder)
 }
@@ -3277,10 +3279,12 @@ func (w *Watcher) currentExcludeMatcher() *excludes.Matcher {
 	}
 	w.excludePolicyMu.Lock()
 	patterns := w.currentExcludePatterns()
-	changed := !sameImmutableExcludeSnapshot(w.excludePolicyPatterns, patterns)
+	includes := w.currentIncludePatterns()
+	changed := !sameImmutableExcludeSnapshot(w.excludePolicyPatterns, patterns) || !sameImmutableExcludeSnapshot(w.excludePolicyIncludes, includes)
 	if changed {
 		w.excludePolicyPatterns = patterns
-		w.excludePolicyMatcher = excludes.New(effectiveExcludePatterns(patterns))
+		w.excludePolicyIncludes = includes
+		w.excludePolicyMatcher = excludes.NewWithIncludes(effectiveExcludePatterns(patterns), includes)
 	}
 	m := w.excludePolicyMatcher
 	w.excludePolicyMu.Unlock()

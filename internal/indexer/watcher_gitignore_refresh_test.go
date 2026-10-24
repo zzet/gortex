@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/zzet/gortex/internal/thirdparty/fswatcher"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
@@ -161,4 +165,56 @@ func TestMultiWatcherPreservesCallerSuppliedExcludePolicy(t *testing.T) {
 	require.True(t, filter.ShouldInclude(ordinary), "this caller did not opt into ConfigManager's live policy")
 	require.True(t, w.isExcluded(custom))
 	require.False(t, w.isExcluded(ordinary))
+}
+
+// Refresh must preserve the include override while applying the parent rule,
+// and an unchanged ConfigManager snapshot must retain the compiled matcher.
+func TestMultiWatcherRefreshPreservesNegationIncludesAndWarnings(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, ".git"), 0o755))
+	writeFile(t, filepath.Join(root, ".gortex.yaml"), "include:\n  - vendor/keep.go\n")
+	writeExcludeFixture(t, filepath.Join(root, "vendor/keep.go"), "package app\nfunc Included() {}\n")
+	writeExcludeFixture(t, filepath.Join(root, "dir/keep.go"), "package app\nfunc Negated() {}\n")
+	mi, w, reconciled := newGitignoreRefreshWatcher(t, root, root, "# initially open\n")
+	idx := mi.GetIndexer("app")
+	core, logs := observer.New(zap.WarnLevel)
+	idx.logger = zap.New(core)
+	filter := &watcherExcludeFilter{w: w}
+	included := filepath.Join(root, "vendor/keep.go")
+	negated := filepath.Join(root, "dir/keep.go")
+	require.True(t, filter.ShouldInclude(included))
+	require.NotEmpty(t, mi.graph.FindNodesByName("Included"))
+	require.NotEmpty(t, mi.graph.FindNodesByName("Negated"))
+
+	for _, rules := range []string{"dir/\n!/dir/keep.go\n", "dir/\n!/dir/keep.go\n# second refresh\n"} {
+		require.NoError(t, os.WriteFile(filepath.Join(root, ".gitignore"), []byte(rules), 0o644))
+		t.Run(fmt.Sprintf("refresh_%d", len(rules)), func(t *testing.T) {
+			require.False(t, filter.ShouldInclude(negated), "negation cannot reopen an excluded parent")
+			require.True(t, filter.ShouldInclude(included), "refresh must rebuild includes too")
+			require.False(t, w.isExcluded(included))
+			awaitGitignoreReconcile(t, reconciled)
+			require.NotEmpty(t, mi.graph.FindNodesByName("Included"))
+			require.Empty(t, mi.graph.FindNodesByName("Negated"))
+			require.True(t, idx.excludeMatcher().IncludesRel("vendor/keep.go"))
+		})
+	}
+	require.Len(t, logs.FilterMessage("indexer: re-include is blocked by an excluded parent; reopen each parent folder (for example: !/agent/, /agent/*, !/agent/skills/)").All(), 1,
+		"warning must be keyed by repo and pattern across refreshes")
+	matcher := w.currentExcludeMatcher()
+	indexMatcher := idx.excludeMatcher()
+	require.Same(t, matcher, w.currentExcludeMatcher(), "no-change snapshot must reuse the matcher")
+	_, err := mi.IncrementalReindexRepo("app", nil)
+	require.NoError(t, err)
+	require.Same(t, indexMatcher, idx.excludeMatcher())
+	select {
+	case err := <-reconciled:
+		t.Fatalf("unchanged policy scheduled another reconcile: %v", err)
+	default:
+	}
+
+	// Includes override only the flat list, never a per-folder ignore file.
+	writeFile(t, filepath.Join(root, "vendor/.gortexignore"), "keep.go\n")
+	w.forgetDirIgnores(filepath.Join(root, "vendor/.gortexignore"), []fswatcher.EventType{fswatcher.EventMod})
+	require.True(t, filter.ShouldInclude(included), "backend defers per-folder rules")
+	require.True(t, w.isExcluded(included))
 }

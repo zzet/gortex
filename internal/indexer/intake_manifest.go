@@ -125,7 +125,7 @@ func (idx *Indexer) dryRunIntake(ctx context.Context, root string) (*IntakeManif
 		manifest.BytesSeen += size
 
 		reason := ""
-		adm := idx.admitWalkFileKnownType(absRoot, path, size, info.Mode())
+		adm := idx.admitFileInOpenDir(absRoot, path, size, info.Mode())
 		if adm.excluded {
 			reason = "excluded"
 		} else if adm.lang == "" {

@@ -21,6 +21,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/excludes"
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -2588,13 +2589,21 @@ func (l *CheckoutLifecycle) watchCheckout(coordinator *CheckoutCoordinator, repo
 	if l == nil || coordinator == nil || !l.cfgWatchCheckouts || !checkoutWatchEnabled() {
 		return
 	}
-	var patterns []string
-	if l.cfgMgr != nil {
-		patterns = l.cfgMgr.EffectiveExclude(repoPrefix)
-	}
 	logger := l.logger.With(zap.String("checkout", coordinator.checkoutID))
+	var matcher *excludes.Matcher
+	if l.cfgMgr != nil {
+		cfg := l.cfgMgr.GetRepoConfig(repoPrefix).Index
+		cfg.Exclude = l.cfgMgr.EffectiveExcludeForRoot(repoPrefix, root)
+		policy := &Indexer{rootPath: root, repoPrefix: repoPrefix, config: cfg, logger: logger}
+		if l.mi != nil {
+			if owner := l.mi.GetIndexer(repoPrefix); owner != nil {
+				policy.warningRoot = owner.rootPath
+			}
+		}
+		matcher = policy.newExcludeMatcher(cfg.Exclude)
+	}
 	go func() {
-		w, err := startCheckoutWatch(root, patterns, logger, coordinator.noteFilesystemChange)
+		w, err := startCheckoutWatch(root, matcher, logger, coordinator.noteFilesystemChange)
 		if err != nil {
 			logger.Info("checkout watch: not started; the checkout is refreshed by its poll",
 				zap.String("root", root), zap.Error(err))

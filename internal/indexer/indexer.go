@@ -259,11 +259,16 @@ type Indexer struct {
 	// exclude list the Indexer was constructed with. excludeMu guards the
 	// build and the swap (and the config.Exclude read/write that goes with
 	// them); readers pay only the atomic load.
-	excludes      atomic.Pointer[excludes.Matcher]
-	excludeMu     sync.Mutex
-	dirIgnore     *excludes.Hierarchical
-	dirIgnoreOnce sync.Once
-	rootPath      string
+	excludes  atomic.Pointer[excludes.Matcher]
+	excludeMu sync.Mutex
+	// Source search may use a checkout-specific immutable exclude snapshot.
+	sourceSearchPatterns []string
+	sourceSearchIncludes []string
+	sourceSearchCompiled *excludes.Matcher
+	dirIgnore            *excludes.Hierarchical
+	dirIgnoreOnce        sync.Once
+	rootPath             string
+	warningRoot          string // Canonical owner for linked-checkout diagnostics.
 	// contentSrc is the optional immutable snapshot every content read
 	// goes through; nil reads the working tree with the os package. Held
 	// in an atomic pointer because reindex paths read it without a lock,
@@ -3012,7 +3017,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				}
 				return nil
 			}
-			adm := idx.admitWalkFileKnownType(absRoot, path, info.Size(), info.Mode())
+			adm := idx.admitFileInOpenDir(absRoot, path, info.Size(), info.Mode())
 			if adm.oversize {
 				skippedLarge++
 				skippedBytes += info.Size()
@@ -6338,9 +6343,22 @@ func (idx *Indexer) perFolderIgnores(root string) *excludes.Hierarchical {
 }
 
 func shouldExcludeRules(path, root string, isDir bool, flat *excludes.Matcher, perFolder *excludes.Hierarchical) bool {
+	return (pathExclusionRules{flat: flat, perFolder: perFolder}).match(path, root, isDir)
+}
+
+// parentsOpen is valid only inside a disk walk after directory pruning.
+// The watcher, explicit paths and content sources use the full checks.
+type pathExclusionRules struct {
+	flat        *excludes.Matcher
+	perFolder   *excludes.Hierarchical
+	parentsOpen bool
+}
+
+func (rules pathExclusionRules) match(path, root string, isDir bool) bool {
+	flat, perFolder := rules.flat, rules.perFolder
 	rel, relErr := filepath.Rel(root, path)
 	// Git's own data is never source, whatever the ignore rules say: no
-	// re-include reaches into a .git folder. See warnGitNegations.
+	// re-include reaches into a .git folder. See warnExcludedNegations.
 	if relErr == nil && inGitDir(rel) {
 		return true
 	}
@@ -6364,6 +6382,10 @@ func shouldExcludeRules(path, root string, isDir bool, flat *excludes.Matcher, p
 			return true
 		}
 		return perFolder.Match(path, isDir)
+	}
+	if rules.parentsOpen {
+		matched, _ := flat.ExplainAbsDirInOpenDir(path, root, isDir)
+		return matched || perFolder.MatchInOpenDir(path, isDir)
 	}
 	if flat != nil && flat.MatchAbsDir(path, root, isDir) {
 		return true
@@ -6480,50 +6502,15 @@ func (idx *Indexer) warnIfWalkAdmittedNothing(absRoot string, admitted int) {
 		zap.String("pattern", cause.Pattern))
 }
 
-// shouldPruneDir reports whether the index walk may skip a directory
-// subtree wholesale (filepath.SkipDir) instead of descending it. A
-// directory is prunable only when it is excluded AND no re-include ("!")
-// pattern targets anything beneath it. go-gitignore's "*" matches across
-// "/", so a blanket like "wp-content/plugins/*" reports the parent
-// directory "wp-content/plugins" itself as excluded; pruning it would
-// skip a later "!wp-content/plugins/foo/" re-include before the walk ever
-// reaches the child. Mirroring git, we keep descending such a directory
-// and let the per-file shouldExclude check filter its contents.
+// shouldPruneDir reports whether an excluded directory and its entire
+// subtree can be skipped. The shared matcher enforces Git's rule that
+// negations cannot re-include descendants of an excluded directory.
 func (idx *Indexer) shouldPruneDir(path, root string) bool {
-	return shouldPruneDir(path, root, idx.excludeMatcher(), idx.perFolderIgnores(root), false)
+	return shouldPruneDir(path, root, idx.excludeMatcher(), idx.perFolderIgnores(root))
 }
 
-func shouldPruneDir(path, root string, flat *excludes.Matcher, perFolder *excludes.Hierarchical, anchoredOnly bool) bool {
-	// Checked before the negation checks below, which keep an excluded
-	// folder open whenever a re-include might reach into it.
-	if rel, err := filepath.Rel(root, path); err == nil && inGitDir(rel) {
-		return true
-	}
-	if !shouldExcludeRules(path, root, true, flat, perFolder) {
-		return false
-	}
-	// No re-include reaches a file under a closed agent-config folder (see
-	// shouldExcludeRules), so the negation checks below do not apply.
-	if rel, err := filepath.Rel(root, path); err == nil && excludes.InAgentConfigDir(rel) && !excludes.IsAgentConfigMCPDir(rel) {
-		return true
-	}
-	if flat != nil {
-		hasNegatedDescendant := flat.HasNegatedDescendant
-		if anchoredOnly {
-			hasNegatedDescendant = flat.HasAnchoredNegatedDescendant
-		}
-		if rel, err := filepath.Rel(root, path); err == nil && hasNegatedDescendant(filepath.ToSlash(rel)) {
-			return false
-		}
-	}
-	hasNegatedDescendant := perFolder.HasNegatedDescendant
-	if anchoredOnly {
-		hasNegatedDescendant = perFolder.HasAnchoredNegatedDescendant
-	}
-	if hasNegatedDescendant(path) {
-		return false
-	}
-	return true
+func shouldPruneDir(path, root string, flat *excludes.Matcher, perFolder *excludes.Hierarchical) bool {
+	return shouldExcludeRules(path, root, true, flat, perFolder)
 }
 
 // inGitDir reports whether a root-relative path names a .git folder or
@@ -6545,7 +6532,9 @@ func inGitDir(rel string) bool {
 // against the repo root the index walk is anchored at.
 func (idx *Indexer) dirIgnoreMatcher(root string) *excludes.Hierarchical {
 	idx.dirIgnoreOnce.Do(func() {
-		idx.dirIgnore = excludes.NewHierarchical(root, dirIgnoreFiles...)
+		idx.dirIgnore = excludes.NewHierarchicalWithDiagnostics(root, dirIgnoreFiles, func(dir string, m *excludes.Matcher) {
+			idx.warnExcludedNegationsAt(m, dir)
+		})
 		// A build that proves its reads records every ignore file the walk
 		// gate reads (its bytes, or its absence): an ignore file moved and
 		// restored while the gate read it refutes the build at its fence.
@@ -6571,28 +6560,166 @@ func (idx *Indexer) excludeMatcher() *excludes.Matcher {
 }
 
 // newExcludeMatcher compiles the effective ignore list and warns about
-// re-includes the hard .git rule in shouldExcludeRules overrides.
+// re-includes blocked by a parent exclusion or the hard .git rule.
 func (idx *Indexer) newExcludeMatcher(patterns []string) *excludes.Matcher {
-	patterns = effectiveExcludePatterns(patterns)
-	idx.warnGitNegations(patterns)
-	return excludes.New(patterns)
+	m := excludes.NewWithIncludes(effectiveExcludePatterns(patterns), idx.config.Include)
+	idx.warnExcludedNegations(m)
+	idx.warnIncludes(m)
+	return m
 }
 
-// warnGitNegations logs each re-include ("!") pattern that names a .git
-// folder. Such a pattern once indexed files under .git; the walks now skip
-// every .git folder, so its files would leave the graph without notice.
-func (idx *Indexer) warnGitNegations(patterns []string) {
+const maxReincludeWarnings = 1024
+
+type reincludeWarningKey struct {
+	repo, dir, kind, pattern string
+}
+
+// Bound daemon-lifetime deduplication across reloads and indexer rebuilds.
+// Once evicted, an old diagnostic may be logged again.
+type reincludeWarningCache struct {
+	mu    sync.Mutex
+	seen  map[reincludeWarningKey]struct{}
+	order []reincludeWarningKey
+	next  int
+}
+
+func (c *reincludeWarningCache) first(key reincludeWarningKey) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.seen[key]; exists {
+		return false
+	}
+	if c.seen == nil {
+		c.seen = make(map[reincludeWarningKey]struct{})
+	}
+	if len(c.order) < maxReincludeWarnings {
+		c.order = append(c.order, key)
+	} else {
+		delete(c.seen, c.order[c.next])
+		c.order[c.next] = key
+		c.next = (c.next + 1) % maxReincludeWarnings
+	}
+	c.seen[key] = struct{}{}
+	return true
+}
+
+var parentLimitedReincludeWarnings reincludeWarningCache
+
+func (idx *Indexer) firstReincludeWarning(dir, kind, pattern string) bool {
+	repo := idx.warningRoot
+	if repo == "" {
+		repo = idx.rootPath
+	}
+	if repo == "" {
+		repo = idx.repoPrefix
+	}
+	if filepath.IsAbs(dir) {
+		if rel, err := filepath.Rel(idx.rootPath, dir); err == nil {
+			dir = filepath.ToSlash(rel)
+		}
+	}
+	return parentLimitedReincludeWarnings.first(reincludeWarningKey{repo, dir, kind, pattern})
+}
+
+func (idx *Indexer) warnParentLimitedReincludes(logger *zap.Logger, m *excludes.Matcher, dir, pattern string) {
+	body := strings.TrimSuffix(strings.TrimPrefix(pattern, "!"), "/")
+	// An inner slash anchors a negation just like a leading slash.
+	if strings.Contains(body, "/") {
+		body = strings.TrimPrefix(body, "/")
+		if !strings.Contains(body, "/") {
+			return // Root-level targets have no parent that can block them.
+		}
+		parent := body[:strings.LastIndexByte(body, '/')]
+		if !strings.ContainsAny(parent, `*?[\`) {
+			open := true
+			for i := range parent {
+				if parent[i] == '/' && m.MatchRel(parent[:i]+"/") {
+					open = false
+					break
+				}
+			}
+			if open && !m.MatchRel(parent+"/") {
+				return
+			}
+		}
+	}
+	repo := idx.rootPath
+	if repo == "" {
+		repo = idx.repoPrefix
+	}
+	if !idx.firstReincludeWarning(dir, "negation", pattern) {
+		return
+	}
+	logger.Warn("indexer: negations no longer reach inside excluded folders; wildcard and unanchored includes also need open parents; use an anchored literal include to keep its ancestors open",
+		zap.String("repo", repo), zap.String("pattern", pattern))
+}
+
+// warnExcludedNegations runs once per effective-list build or reload,
+// never on the per-path matching hot path.
+func (idx *Indexer) warnExcludedNegations(m *excludes.Matcher) {
+	idx.warnExcludedNegationsAt(m, "")
+}
+
+func (idx *Indexer) warnExcludedNegationsAt(m *excludes.Matcher, dir string) {
 	if idx.logger == nil {
 		return
 	}
-	for _, p := range patterns {
-		p = strings.TrimSpace(p)
-		if !strings.HasPrefix(p, "!") || !inGitDir(strings.Trim(p[1:], "/")) {
+	logger := idx.logger.With(zap.String("ignore_dir", dir))
+	seen := make(map[string]bool)
+	hasExclusion := false
+	for _, p := range m.Patterns() {
+		if !strings.HasPrefix(p, "!") {
+			hasExclusion = true
+			break
+		}
+	}
+	for _, p := range m.Patterns() {
+		if !strings.HasPrefix(p, "!") || seen[p] {
 			continue
 		}
-		idx.logger.Warn("indexer: ignoring a re-include under .git; Git's own data is never indexed",
-			zap.String("repo", idx.repoPrefix),
-			zap.String("pattern", p))
+		seen[p] = true
+		if inGitDir(strings.Trim(p[1:], "/")) {
+			if !idx.firstReincludeWarning(dir, "negation", p) {
+				continue
+			}
+			logger.Warn("indexer: ignoring a re-include under .git; Git's own data is never indexed",
+				zap.String("repo", idx.repoPrefix),
+				zap.String("pattern", p))
+			continue
+		}
+		body := strings.Trim(p[1:], "/")
+		if dir != "" {
+			if rel, err := filepath.Rel(idx.rootPath, dir); err == nil && rel != "." {
+				body = filepath.ToSlash(filepath.Join(rel, body))
+			}
+		}
+		if excludes.InAgentConfigDir(body) && !excludes.IsAgentConfigMCPDir(body) && !excludes.IsAgentConfigMCPFile(body) {
+			if !idx.firstReincludeWarning(dir, "negation", p) {
+				continue
+			}
+			logger.Warn("indexer: ignoring a re-include under an agent-config folder; non-MCP agent state is never indexed",
+				zap.String("repo", idx.repoPrefix), zap.String("pattern", p))
+			continue
+		}
+		if parent, rule := m.ExcludedNegationParent(p); parent != "" {
+			if !idx.firstReincludeWarning(dir, "negation", p) {
+				continue
+			}
+			logger.Warn("indexer: re-include is blocked by an excluded parent; reopen each parent folder (for example: !/agent/, /agent/*, !/agent/skills/)",
+				zap.String("repo", idx.repoPrefix),
+				zap.String("pattern", p),
+				zap.String("parent", parent),
+				zap.String("excluded_by", rule))
+			continue
+		}
+		body = strings.TrimSuffix(p[1:], "/")
+		if strings.HasPrefix(body, "/") && !strings.Contains(body[1:], "/") {
+			continue // A root-level target has no parent that can block it.
+		}
+		basename := !strings.Contains(body, "/") && !strings.HasSuffix(p, "/")
+		if hasExclusion && (basename || strings.Contains(body, "/") || strings.ContainsAny(body, `*?[\`)) {
+			idx.warnParentLimitedReincludes(logger, m, dir, p)
+		}
 	}
 }
 
@@ -6617,14 +6744,24 @@ func sameImmutableExcludeSnapshot(a, b []string) bool {
 
 // refreshEffectiveExcludePatterns consumes ConfigManager's immutable snapshot
 // after repository mutation admission. Steady-state passes retain their matcher.
-func (idx *Indexer) refreshEffectiveExcludePatterns(patterns []string) {
+func (idx *Indexer) refreshEffectiveExcludePatterns(patterns, includes []string) {
 	idx.excludeMu.Lock()
 	defer idx.excludeMu.Unlock()
-	if sameImmutableExcludeSnapshot(idx.config.Exclude, patterns) {
+	if sameImmutableExcludeSnapshot(idx.config.Exclude, patterns) && sameImmutableExcludeSnapshot(idx.config.Include, includes) {
 		return
 	}
 	idx.config.Exclude = patterns
-	idx.excludes.Store(excludes.New(effectiveExcludePatterns(patterns)))
+	idx.config.Include = includes
+	idx.excludes.Store(idx.newExcludeMatcher(patterns))
+}
+
+// SetIgnorePatterns reloads excludes and force-includes together.
+func (idx *Indexer) SetIgnorePatterns(patterns, includes []string) {
+	idx.excludeMu.Lock()
+	defer idx.excludeMu.Unlock()
+	idx.config.Exclude = patterns
+	idx.config.Include = includes
+	idx.excludes.Store(idx.newExcludeMatcher(patterns))
 }
 
 // effectiveExcludePatterns falls back to the builtin baseline when the
@@ -7048,7 +7185,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 					walkedDirs = append(walkedDirs, path)
 					return nil
 				}
-				if !idx.admitScopedWalkFile(absRoot, path) {
+				adm := idx.admitFileInOpenDir(absRoot, path, -1, d.Type())
+				if !adm.admit && !adm.manifest {
 					return nil
 				}
 				// relKey (slash + NFC) keeps the disk set keyed
@@ -9979,7 +10117,7 @@ func (idx *Indexer) HasChangesSinceMtimes(root string) bool {
 			return nil
 		}
 		// Same file set as the census, root go.mod and go.work included.
-		adm := idx.admitWalkFileKnownType(absRoot, path, -1, d.Type())
+		adm := idx.admitFileInOpenDir(absRoot, path, -1, d.Type())
 		if !adm.admit && !adm.manifest {
 			return nil
 		}
@@ -10122,7 +10260,7 @@ func (idx *Indexer) changedSinceMtimesCensus(root string) (
 		if d.IsDir() {
 			return nil
 		}
-		adm := idx.admitWalkFileKnownType(absRoot, path, -1, d.Type())
+		adm := idx.admitFileInOpenDir(absRoot, path, -1, d.Type())
 		if !adm.admit && !adm.manifest {
 			return nil
 		}

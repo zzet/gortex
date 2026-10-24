@@ -433,13 +433,15 @@ type Config struct {
 	// re-include something an outer layer excluded.
 	Exclude []string `mapstructure:"exclude" yaml:"exclude,omitempty"`
 
-	// Include force-indexes paths an outer layer (notably the repo
-	// .gitignore) excludes — the dedicated, readable counterpart to
-	// hand-writing `!pattern` negations in Exclude. Each entry is appended
-	// last as a gitignore `!pattern` re-include, so it wins over the
-	// builtin / .gitignore / global / repo exclude layers. Use it for a
-	// vendored or generated tree you nonetheless want in the graph
-	// (e.g. Pods/, a per-customer customer/ directory).
+	// Include force-indexes paths over the builtin / .gitignore / global /
+	// repo exclude layers. A leading or inner slash anchors at the repo root;
+	// other entries match at any depth. Anchored literal paths also keep
+	// their parents open, for example vendor/acme/lib/. Wildcard and
+	// unanchored literals reopen their target only when its parents are open.
+	// Wildcards can reopen a matching folder, but not its excluded parents.
+	// A contents glob (vendor/**) does not reopen vendor/ itself.
+	// Per-directory ignore files still apply. Git metadata, non-MCP agent
+	// state and escaping symlinks remain excluded.
 	Include []string `mapstructure:"include" yaml:"include,omitempty"`
 
 	// RuleFiles are paths (or globs) to TOML files of user-defined
@@ -674,6 +676,8 @@ type IndexConfig struct {
 	// Still read for one release so existing .gortex.yaml files don't
 	// silently stop working; merged into the unified list by ConfigManager.
 	Exclude []string `mapstructure:"exclude" yaml:"exclude,omitempty"`
+	// Include carries top-level force-includes, separate from gitignore rules.
+	Include []string `mapstructure:"-" yaml:"-"`
 	Workers int      `mapstructure:"workers" yaml:"workers,omitempty"`
 	// SkipEmbed is the effective skip-embedding rules resolved from
 	// Semantic.SkipEmbed. Not part of the on-disk YAML schema — it's
@@ -1382,6 +1386,8 @@ type WatchConfig struct {
 	// Exclude is deprecated — use top-level Config.Exclude instead.
 	// Kept for one release as a fallback merged into the unified list.
 	Exclude []string `mapstructure:"exclude" yaml:"exclude,omitempty"`
+	// Include carries top-level force-includes, separate from gitignore rules.
+	Include []string `mapstructure:"-" yaml:"-"`
 
 	// StormThreshold — when more than this many events arrive within
 	// StormWindowMs, the watcher switches from per-file debounced

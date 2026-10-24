@@ -9,8 +9,10 @@ package excludes
 // excludes, regardless of user config. It merges what the indexer and
 // watcher used to maintain as two divergent hardcoded lists.
 //
-// Users can re-include an entry by listing "!pattern" in global,
-// RepoEntry, or workspace config.
+// Negations in global, RepoEntry or workspace excludes can reopen a folder,
+// but cannot reach through an excluded parent. Workspace include: literal
+// paths override these layers and keep their ancestors open. Git metadata
+// and non-MCP state under .claude/ and .kiro/ remain hard-excluded.
 var Builtin = []string{
 	// Version-control metadata can contain huge object stores and working-copy
 	// state. Prune all common VCS directories before the walker descends.

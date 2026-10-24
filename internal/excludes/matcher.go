@@ -14,21 +14,25 @@ import (
 // Matcher tests whether a path should be excluded from indexing/watching.
 // It is safe for concurrent reads after construction.
 type Matcher struct {
-	ign      *ignore.GitIgnore
-	patterns []string
+	includes        *Matcher
+	literalIncludes []string
+	ign             *ignore.GitIgnore
+	patterns        []string
 	// Required literals cheaply rule out simple positive patterns. Positive
 	// patterns with uncertain syntax retain their original compiled matcher.
 	requiredLiterals []string
 	unfiltered       *ignore.GitIgnore
-	// Positive patterns proven to cover a matched directory and all its
-	// children, from the lines after the first usable negation; earlier
-	// excludes cannot override it. Blank entries preserve line numbers in
-	// patterns. Nil when no such exclude exists.
-	subtreeExcludes *ignore.GitIgnore
-	negations       []parsedNegation
-	// Whether any anchored negation exists, so the watcher check can return
-	// before matching when none can apply.
-	hasAnchoredNegation bool
+	// Directories are matched without a trailing slash, against patterns
+	// with their directory-only marker removed. This prevents child globs
+	// such as a/b/* from matching the parent a/b/ with an empty child name.
+	dirs        *ignore.GitIgnore
+	hasNegation bool
+	// A non-empty list rules out negations missing all required literals.
+	// Any uncertain negation keeps the parent check unfiltered.
+	negationLiterals []string
+	// Some dependency regexps do not propagate an ancestor match to a
+	// full file path. Those lists cannot skip unmatched parent queries.
+	checkUnmatchedParents bool
 
 	// The same list without Builtin's agent-config root lines, compiled on
 	// first use; see withoutBuiltinAgentRoots.
@@ -63,26 +67,44 @@ func New(patterns []string) *Matcher {
 		cleaned = append(cleaned, p)
 		compiled = append(compiled, literalizePattern(p))
 	}
+	directories := make([]string, len(cleaned))
+	for i, p := range cleaned {
+		// The dependency's terminal /** also matches the parent. For
+		// directory queries, /* has the same descendant coverage without
+		// matching the parent itself. File queries keep their old behavior.
+		dirPattern := strings.TrimSuffix(p, "/")
+		// Repeated trailing slashes must stay non-matching, as in the file form.
+		if strings.HasSuffix(dirPattern, "/") {
+			dirPattern = p
+		}
+		if strings.HasSuffix(dirPattern, "/**") {
+			dirPattern = strings.TrimSuffix(dirPattern, "**") + "*"
+		}
+		directories[i] = literalizePattern(dirPattern)
+	}
 	m := &Matcher{
 		ign:      ignore.CompileIgnoreLines(compiled...),
+		dirs:     ignore.CompileIgnoreLines(directories...),
 		patterns: cleaned,
 	}
 	var unfiltered []string
-	subtreePatterns := make([]string, len(compiled))
-	hasSubtreeExclude := false
+	var unfilteredNegation bool
 	seen := make(map[string]bool)
 	for i, p := range cleaned {
 		if strings.HasPrefix(p, "!") {
-			if negation, ok := parseNegation(p, i+1); ok {
-				m.negations = append(m.negations, negation)
-				m.hasAnchoredNegation = m.hasAnchoredNegation || negation.anchored
+			m.hasNegation = true
+			// After the negation "!", the compiler strips one more leading
+			// "!" or "#", so "!!x" and "!#x" both negate "x". Their match
+			// does not need that character, so they get no prefilter literal.
+			if literal := requiredLiteral(p[1:]); literal != "" && !strings.HasPrefix(p[1:], "!") && !strings.HasPrefix(p[1:], "#") {
+				m.negationLiterals = append(m.negationLiterals, literal)
+			} else {
+				unfilteredNegation = true
 			}
 			continue
 		}
-		// An exclude can only override negations that precede it.
-		if len(m.negations) > 0 && coversSubtree(p) {
-			subtreePatterns[i] = compiled[i]
-			hasSubtreeExclude = true
+		if p == "/**" || strings.HasSuffix(p, "**/") || strings.Contains(p, `\`) {
+			m.checkUnmatchedParents = true
 		}
 		literal := requiredLiteral(p)
 		if literal == "" {
@@ -92,8 +114,8 @@ func New(patterns []string) *Matcher {
 			m.requiredLiterals = append(m.requiredLiterals, literal)
 		}
 	}
-	if hasSubtreeExclude {
-		m.subtreeExcludes = ignore.CompileIgnoreLines(subtreePatterns...)
+	if unfilteredNegation {
+		m.negationLiterals = nil
 	}
 	if len(m.requiredLiterals) > 0 && len(unfiltered) > 0 {
 		m.unfiltered = ignore.CompileIgnoreLines(unfiltered...)
@@ -101,27 +123,9 @@ func New(patterns []string) *Matcher {
 	return m
 }
 
-// coversSubtree identifies positive patterns whose directory matches extend
-// to every child. Directory patterns retain the compiler's trailing /.*;
-// ordinary globs retain its /.* suffix or a final star that consumes children.
-// A terminal **/ loses its slash during compilation; /** can match only the
-// directory slash (unless preceded by a literal path). Backslash escapes and
-// non-directory classes can also match that slash alone. Keep those uncertain
-// shapes conservative rather than treating every directory match as coverage.
-func coversSubtree(pattern string) bool {
-	if strings.Contains(pattern, `\`) || strings.Contains(pattern, "//") || strings.HasSuffix(pattern, "**/") {
-		return false
-	}
-	if strings.HasSuffix(pattern, "/**") {
-		prefix := strings.TrimSuffix(pattern, "/**")
-		return prefix != "" && !strings.ContainsAny(prefix, "*?[")
-	}
-	return strings.HasSuffix(pattern, "/") || !strings.Contains(pattern, "[")
-}
-
 // requiredLiteral returns a substring every match of a simple glob must
-// contain. Split at slashes too: a/b/* can match the directory a/b itself,
-// and ** can consume zero path segments. Uncertain syntax stays unfiltered.
+// contain. Split at slashes too, since ** can consume zero path segments.
+// Uncertain syntax stays unfiltered.
 func requiredLiteral(pattern string) string {
 	if strings.ContainsAny(pattern, "\\?[]") {
 		return ""
@@ -147,6 +151,20 @@ func (m *Matcher) couldMatch(rel string) bool {
 	return m.unfiltered != nil && m.unfiltered.MatchesPath(rel)
 }
 
+// couldNegate is conservative: folder negations can match descendants too,
+// so test the whole path rather than only its final basename.
+func (m *Matcher) couldNegate(rel string) bool {
+	if len(m.negationLiterals) == 0 {
+		return true
+	}
+	for _, literal := range m.negationLiterals {
+		if strings.Contains(rel, literal) {
+			return true
+		}
+	}
+	return false
+}
+
 // Patterns returns the cleaned pattern list (empties and comments removed).
 func (m *Matcher) Patterns() []string {
 	if m == nil {
@@ -155,6 +173,49 @@ func (m *Matcher) Patterns() []string {
 	out := make([]string, len(m.patterns))
 	copy(out, m.patterns)
 	return out
+}
+
+// ExcludedNegationParent returns the first excluded literal parent of a
+// negation and the rule that excludes it. It is a compile-time diagnostic,
+// not a matching decision. Basename and wildcard-leading negations have no
+// fixed parent. Stop at wildcard or escape syntax rather than guessing a
+// parent; those patterns can still apply elsewhere.
+func (m *Matcher) ExcludedNegationParent(pattern string) (string, string) {
+	if m == nil || m.dirs == nil || !strings.HasPrefix(pattern, "!") {
+		return "", ""
+	}
+	rooted := strings.HasPrefix(pattern[1:], "/")
+	body := strings.TrimSuffix(strings.TrimPrefix(pattern[1:], "/"), "/")
+	// These exact MCP paths have an explicit Builtin exception in the
+	// indexer. Do not diagnose the lifted Builtin root as a blocked parent;
+	// a user's own copy of that exclusion still applies.
+	if IsAgentConfigMCPDir(body) || IsAgentConfigMCPFile(body) {
+		m = m.withoutBuiltinAgentRoots()
+	}
+	parent := ""
+	for {
+		segment, rest, slash := strings.Cut(body, "/")
+		// The final component is the target, not one of its parents:
+		// build/ then !build/ must not warn about build itself.
+		if !slash || segment == "" || segment == "." || segment == ".." || strings.ContainsAny(segment, `*?[\`) {
+			return "", ""
+		}
+		if parent != "" {
+			parent += "/"
+		}
+		parent += segment
+		if excluded, ip := m.dirs.MatchesPathHow(pathkey.Normalize(parent)); excluded && ip != nil {
+			// The dependency can match an unrooted negation at other
+			// depths. A root-only exclude cannot prove all those matches
+			// blocked. Its generated regexp uses ^(|/) for rooted rules
+			// and ^(|.*/) for unrooted rules; require the latter here.
+			if rooted || strings.HasPrefix(ip.Pattern.String(), "^(|.*/)") {
+				_, rule := m.explainPattern(excluded, ip)
+				return parent, rule
+			}
+		}
+		body = rest
+	}
 }
 
 // cleanedBuiltin is Builtin as New cleans it.
@@ -179,6 +240,8 @@ func (m *Matcher) withoutBuiltinAgentRoots() *Matcher {
 			patterns = append(patterns, p)
 		}
 		m.agentRootsLifted = New(patterns)
+		m.agentRootsLifted.includes = m.includes
+		m.agentRootsLifted.literalIncludes = m.literalIncludes
 	})
 	return m.agentRootsLifted
 }
@@ -198,10 +261,49 @@ func (m *Matcher) MatchRel(relPath string) bool {
 	if rel == "" || rel == "." {
 		return false
 	}
-	if !m.couldMatch(rel) {
+	if (!m.hasNegation || !m.checkUnmatchedParents) && !m.couldMatch(rel) {
 		return false
 	}
-	return m.ign.MatchesPath(rel)
+	matched, _ := m.explainRel(rel, false)
+	return matched
+}
+
+// MatchRelEither reports exclusion for both a file and a directory query.
+// Watcher backends do not know the entry type. Check parents once, then
+// evaluate the final segment against each pattern form.
+func (m *Matcher) MatchRelEither(relPath string) bool {
+	if m == nil || m.ign == nil {
+		return false
+	}
+	rel := strings.TrimPrefix(pathkey.Normalize(filepath.ToSlash(relPath)), "./")
+	rel = strings.TrimSuffix(rel, "/")
+	if rel == "" || rel == "." {
+		return false
+	}
+	if (!m.hasNegation || !m.checkUnmatchedParents) && !m.couldMatch(rel) {
+		return false
+	}
+	if (m.includes != nil || len(m.literalIncludes) > 0) && (m.IncludesRel(rel) || m.IncludesRel(rel+"/")) {
+		return false
+	}
+	matched, ip := m.ign.MatchesPathHow(rel)
+	couldNegate := m.hasNegation && m.couldNegate(rel)
+	if m.hasNegation && ((couldNegate && ip != nil) || m.checkUnmatchedParents) && m.excludesParent(rel) {
+		return true
+	}
+	if !matched {
+		return false
+	}
+	if !couldNegate && ip != nil {
+		// A matched file already crossed a directory-only marker. Only a
+		// terminal /** (or repeated slash) can change this positive verdict
+		// in the directory form; ordinary default rules need no second pass.
+		line := strings.TrimSuffix(m.patterns[ip.LineNo-1], "/")
+		if !strings.HasSuffix(line, "/") && !strings.HasSuffix(line, "/**") {
+			return true
+		}
+	}
+	return m.dirs.MatchesPath(rel)
 }
 
 // Explain reports whether a repo-root-relative path is excluded and, when
@@ -220,7 +322,41 @@ func (m *Matcher) Explain(relPath string) (bool, string) {
 	if rel == "" || rel == "." {
 		return false, ""
 	}
-	matched, ip := m.ign.MatchesPathHow(rel)
+	return m.explainRel(rel, true)
+}
+
+// explainRel tests the final path first, then enforces the parent rule.
+// Without a positive match (even one later negated), ordinary patterns
+// cannot exclude a parent. Uncertain compiler forms retain the slow check.
+//
+// When the final path matched and no negation line can match it, the last
+// matching line is positive and the parent pass cannot change the verdict;
+// it only picks which line explains it. withPattern keeps that pass for
+// Explain, and MatchRel skips it.
+func (m *Matcher) explainRel(rel string, withPattern bool) (bool, string) {
+	if m.IncludesRel(rel) {
+		return false, ""
+	}
+	isDir := strings.HasSuffix(rel, "/")
+	rel = strings.TrimSuffix(rel, "/")
+	ign := m.ign
+	if isDir {
+		ign = m.dirs
+	}
+	matched, ip := ign.MatchesPathHow(rel)
+	if m.hasNegation && ((ip != nil && (withPattern || m.couldNegate(rel))) || m.checkUnmatchedParents) {
+		for i := 0; i < len(rel); i++ {
+			if rel[i] == '/' {
+				if matched, ip := m.dirs.MatchesPathHow(rel[:i]); matched && ((m.includes == nil && len(m.literalIncludes) == 0) || !m.IncludesRel(rel[:i]+"/")) {
+					return m.explainPattern(matched, ip)
+				}
+			}
+		}
+	}
+	return m.explainPattern(matched, ip)
+}
+
+func (m *Matcher) explainPattern(matched bool, ip *ignore.IgnorePattern) (bool, string) {
 	if !matched || ip == nil {
 		return matched, ""
 	}
@@ -258,6 +394,35 @@ func (m *Matcher) MatchAbsDir(absPath, root string, isDir bool) bool {
 	return m.MatchRel(rel)
 }
 
+// ExplainAbsDirInOpenDir tests only the final entry. A pruned filesystem
+// walk must already have proved every parent open. Explicit paths and
+// content-source walks must use ExplainAbsDir instead.
+func (m *Matcher) ExplainAbsDirInOpenDir(absPath, root string, isDir bool) (bool, string) {
+	if m == nil || m.ign == nil {
+		return false, ""
+	}
+	rel, err := filepath.Rel(root, absPath)
+	if err != nil {
+		return false, ""
+	}
+	rel = pathkey.Normalize(filepath.ToSlash(rel))
+	if isDir {
+		rel += "/"
+	}
+	if !m.couldMatch(rel) {
+		return false, ""
+	}
+	if m.IncludesRel(rel) {
+		return false, ""
+	}
+	ign := m.ign
+	if isDir {
+		ign = m.dirs
+	}
+	matched, ip := ign.MatchesPathHow(strings.TrimSuffix(rel, "/"))
+	return m.explainPattern(matched, ip)
+}
+
 // ExplainAbsDir is MatchAbsDir plus the pattern that excluded the path,
 // in the caller's original wording. The pattern is "" when nothing
 // matched.
@@ -273,188 +438,4 @@ func (m *Matcher) ExplainAbsDir(absPath, root string, isDir bool) (bool, string)
 		rel += "/"
 	}
 	return m.Explain(rel)
-}
-
-// HasNegatedDescendant reports whether any re-include ("!") pattern in
-// the matcher could re-include a path strictly beneath relDir. Negations
-// overridden by a later exclusion covering the whole subtree do not count.
-//
-// The index walk prunes an excluded directory with filepath.SkipDir so
-// it never descends a subtree it would only throw away. But go-gitignore
-// treats "*" as matching across "/", so a blanket like "a/b/*" reports
-// the directory "a/b" itself as excluded — pruning it would skip a later
-// "!a/b/keep/" re-include before the walk ever reaches the child. This
-// lets the walk ask "could a negation resurrect something under here?"
-// and keep descending when the answer is yes, mirroring git, which never
-// prunes a directory a negation could re-include a child from.
-//
-// relDir is a repo-root-relative, forward-slash directory path (a
-// trailing slash and a leading "./" are tolerated). The check is
-// deliberately conservative: an unanchored or wildcard-leading negation
-// can match at varying depths, so it is treated as "could be under
-// anything" and the directory is kept rather than pruned.
-func (m *Matcher) HasNegatedDescendant(relDir string) bool {
-	return m.hasNegatedDescendant(relDir, false)
-}
-
-// HasAnchoredNegatedDescendant counts only negations with a leading or
-// internal slash and a literal first segment, honoring later subtree excludes.
-func (m *Matcher) HasAnchoredNegatedDescendant(relDir string) bool {
-	return m.hasNegatedDescendant(relDir, true)
-}
-
-func (m *Matcher) hasNegatedDescendant(relDir string, anchoredOnly bool) bool {
-	if m == nil || len(m.negations) == 0 || anchoredOnly && !m.hasAnchoredNegation {
-		return false
-	}
-	relDir = pathkey.Normalize(filepath.ToSlash(relDir))
-	relDir = strings.TrimPrefix(relDir, "./")
-	relDir = strings.TrimSuffix(relDir, "/")
-	if relDir == "." {
-		relDir = ""
-	}
-	lastExclude := 0
-	if relDir != "" && m.subtreeExcludes != nil {
-		// Only negations after the last covering exclude can resurrect a
-		// descendant. Other positive patterns cannot prove subtree coverage.
-		if matched, p := m.subtreeExcludes.MatchesPathHow(relDir + "/"); matched {
-			lastExclude = p.LineNo
-		}
-	}
-	for _, p := range m.negations {
-		if p.lineNo <= lastExclude || anchoredOnly && (!p.anchored || p.unanchored) {
-			continue
-		}
-		// An unknown anchor stays conservative in both modes; unanchored
-		// and wildcard-leading negations stay conservative for walks only.
-		if p.anchor == "" || relDir == "" {
-			return true
-		}
-		// The negation's match-set intersects relDir's subtree when its
-		// literal anchor sits at or under relDir, or relDir sits under the
-		// anchor (a wildcard tail can then still reach into relDir).
-		if p.anchor == relDir || hasDirPrefix(p.anchor, relDir) || hasDirPrefix(relDir, p.anchor) {
-			return true
-		}
-	}
-	return false
-}
-
-func hasDirPrefix(path, dir string) bool {
-	return len(path) > len(dir) && path[len(dir)] == '/' && strings.HasPrefix(path, dir)
-}
-
-// parsedNegation holds the classification shared by the walk and watcher.
-// lineNo is 1-based into patterns, just like go-gitignore's LineNo.
-type parsedNegation struct {
-	lineNo   int
-	anchor   string
-	anchored bool
-	// No fixed anchor: only the walk counts these. An unsure escape also
-	// has no anchor, but remains conservative in both modes instead.
-	unanchored bool
-}
-
-func parseNegation(pattern string, lineNo int) (parsedNegation, bool) {
-	np := strings.TrimSpace(pattern[1:])
-	rooted := strings.HasPrefix(np, "/")
-	np = strings.TrimSuffix(strings.TrimPrefix(np, "/"), "/")
-	if np == "" {
-		return parsedNegation{}, false
-	}
-	first, _, slash := strings.Cut(np, "/")
-	literal, kind := literalSegment(first)
-	p := parsedNegation{
-		lineNo:   lineNo,
-		anchored: (rooted || slash) && kind != segWildcard,
-	}
-	if !slash {
-		if rooted && kind == segLiteral {
-			p.anchor = literal
-		} else {
-			p.unanchored = !rooted || kind != segUnsure
-		}
-	} else if kind != segUnsure {
-		p.anchor = literalAnchor(np)
-		p.unanchored = p.anchor == ""
-	}
-	return p, true
-}
-
-// literalAnchor returns the leading path segments of a slash-bearing
-// gitignore pattern up to (but excluding) the first segment that is not
-// a plain literal (see literalSegment). It returns "" when the first
-// segment is a wildcard ("*", "**", "?foo", ...). Escapes are decoded,
-// so `foo\*/keep.go` anchors at `foo*`.
-func literalAnchor(pattern string) string {
-	segs := strings.Split(pattern, "/")
-	lit := make([]string, 0, len(segs))
-	for _, s := range segs {
-		u, kind := literalSegment(s)
-		if kind != segLiteral {
-			break
-		}
-		lit = append(lit, u)
-	}
-	return strings.Join(lit, "/")
-}
-
-// segKind classifies one "/"-separated segment of a negation.
-type segKind int
-
-const (
-	segLiteral  segKind = iota // plain text once escapes are decoded
-	segWildcard                // holds an unescaped "*", "?" or bracket expression
-	segUnsure                  // holds an escape the matcher may read differently
-)
-
-// literalEscapes are the characters that a backslash makes literal both
-// in gitignore and in the compiled matcher: go-gitignore maps `\*` back
-// to a star, and the rest reach the regexp as plain escapes. go-gitignore
-// rewrites other escapes such as `\?`, `\.` or a letter, so the compiled
-// matcher does not read them as gitignore does.
-const literalEscapes = `*[\ ` + regexOnlyMeta
-
-// literalSegment returns segment s with its escapes decoded and its kind.
-// A trailing backslash escapes the slash the split removed, so it makes
-// the segment unsure too.
-func literalSegment(s string) (string, segKind) {
-	if !strings.ContainsAny(s, `*?[\`) {
-		return s, segLiteral
-	}
-	var b strings.Builder
-	wild := false
-	for i := 0; i < len(s); i++ {
-		switch c := s[i]; c {
-		case '\\':
-			if i+1 == len(s) || strings.IndexByte(literalEscapes, s[i+1]) < 0 {
-				return "", segUnsure
-			}
-			i++
-			b.WriteByte(s[i])
-		case '*', '?':
-			wild = true
-		case '[':
-			// literalizePattern keeps an unclosed "[" as a literal
-			// character; only a bracket expression is a wildcard.
-			if isBracketExpr(s[i:]) {
-				wild = true
-			} else {
-				b.WriteByte(c)
-			}
-		default:
-			b.WriteByte(c)
-		}
-	}
-	if wild {
-		return "", segWildcard
-	}
-	return b.String(), segLiteral
-}
-
-// isBracketExpr reports whether s starts with a bracket expression that
-// the compiled matcher reads as a character class.
-func isBracketExpr(s string) bool {
-	_, _, ok := scanBracketExpr(s)
-	return ok
 }

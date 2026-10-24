@@ -203,6 +203,10 @@ func (mw *MultiWatcher) configureManagedExcludes(prefix string, w *Watcher) {
 	w.currentExcludePatterns = func() []string {
 		return mw.multi.configMgr.EffectiveExclude(prefix)
 	}
+	w.currentIncludePatterns = func() []string {
+		return mw.multi.configMgr.EffectiveInclude(prefix)
+	}
+	w.excludePolicyIncludes = w.config.Include
 	w.excludePolicyPatterns = w.config.Exclude
 	w.excludePolicyMatcher = w.excludes
 }

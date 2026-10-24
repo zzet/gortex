@@ -141,11 +141,22 @@ func TestEffectiveExclude_IncludeForceReincludesGitignored(t *testing.T) {
 
 	got := cm.EffectiveExclude("repo-inc")
 	assert.Contains(t, got, "Pods/", "the .gitignore exclude is present")
-	assert.Equal(t, "!Pods/", got[len(got)-1], "the force-include negation lands last so it wins")
+	assert.NotContains(t, got, "!Pods/", "force-includes are not gitignore negations")
+	cfg := cm.GetRepoConfig("repo-inc")
+	assert.Equal(t, []string{"Pods/"}, cfg.Index.Include)
+	assert.Equal(t, cfg.Index.Include, cfg.Watch.Include)
 
-	// The compiled matcher must NOT exclude the force-included tree.
-	assert.False(t, excludes.New(got).MatchRel("Pods/"),
-		"a force-included gitignored dir must be re-included")
+	assert.False(t, excludes.NewWithIncludes(got, cfg.Index.Include).MatchRel("Pods/"),
+		"an unanchored literal include reopens its target when its parent is open")
+	// Root the include to reopen only this specific excluded tree.
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gortex.yaml"),
+		[]byte("include:\n  - /Pods/\n"), 0644))
+	cm.LoadWorkspaceConfig("repo-inc", repoDir)
+	cfg = cm.GetRepoConfig("repo-inc")
+	assert.Equal(t, []string{"/Pods/"}, cfg.Index.Include)
+	assert.Equal(t, cfg.Index.Include, cfg.Watch.Include)
+	assert.False(t, excludes.NewWithIncludes(got, cfg.Index.Include).MatchRel("Pods/"),
+		"an anchored force-included gitignored dir must be re-included")
 }
 
 func TestEffectiveExclude_FallsBackToBuiltin(t *testing.T) {

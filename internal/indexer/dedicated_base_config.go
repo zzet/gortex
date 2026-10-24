@@ -58,8 +58,10 @@ func snapshotDedicatedBaseConfig(
 		ProjectID   string             `json:"project_id"`
 		Index       config.IndexConfig `json:"index"`
 	}{
-		Domain:      "gortex.dedicated-base.config",
-		Version:     1,
+		Domain: "gortex.dedicated-base.config",
+		// Version 2 enforces excluded-parent negation semantics and the
+		// separate force-include policy; never reuse version 1 generations.
+		Version:     2,
 		RepoPrefix:  repoPrefix,
 		WorkspaceID: workspaceID,
 		ProjectID:   projectID,

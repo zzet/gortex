@@ -78,7 +78,7 @@ func TestWatcherAgentConfigBackendFilter(t *testing.T) {
 		{"claude_subdirectory", ".claude/sub", false},
 		{"agent_state", ".claude/state.unknown", false},
 		{"worktree_mcp", ".claude/worktrees/foo/.mcp.json", false},
-		{"negated_child_folder", "gen", true},
+		{"negated_child_folder", "gen", false},
 		{"ordinary_file", "main.go", true},
 		{"ignored_tree", "node_modules/pkg/main.js", false},
 	} {
@@ -91,10 +91,13 @@ func TestWatcherAgentConfigBackendFilter(t *testing.T) {
 		require.NoError(t, err)
 		filter := &watcherExcludeFilter{w: w}
 		require.False(t, filter.ShouldInclude("gen"))
-		require.True(t, filter.ShouldInclude("gen/keep.go"))
+		require.False(t, filter.ShouldInclude("gen/keep.go"))
 		require.True(t, filter.ShouldInclude("main.go"))
 		require.True(t, w.isExcluded("gen"))
 		require.False(t, w.isExcluded("main.go"))
+		reopened, err := NewWatcher(&Indexer{}, config.WatchConfig{Exclude: []string{"gen/*", "!gen/keep/"}}, zap.NewNop())
+		require.NoError(t, err)
+		require.True(t, (&watcherExcludeFilter{w: reopened}).ShouldInclude("gen/keep"))
 	})
 }
 
@@ -132,7 +135,8 @@ func TestWatcherAgentConfigNewDirectoryScan(t *testing.T) {
 		body  string
 		extra []string
 	}{
-		{"reincluded_child", "gen", "keep.go", "package gen\nfunc Keep() {}\n", []string{"gen", "!gen/keep.go"}},
+		{"reincluded_child", "gen", "keep.go", "package gen\nfunc Keep() {}\n", []string{"gen/*", "!gen/keep.go"}},
+		{"reopened_child_folder", "gen/keep", "keep.go", "package keep\nfunc Keep() {}\n", []string{"gen/*", "!gen/keep/"}},
 		{"claude_directory", ".claude", "mcp.json", `{"mcpServers":{"newserver":{"command":"npx"}}}`, nil},
 		{"kiro_settings", ".kiro/settings", "mcp.json", `{"mcpServers":{"newserver":{"command":"npx"}}}`, nil},
 	} {
@@ -164,6 +168,7 @@ func TestWatcherAgentConfigNewDirectoryScan(t *testing.T) {
 				scanned <- scanResult{paths: paths, err: err}
 				return result, err
 			}
+			require.True(t, (&watcherExcludeFilter{w: w}).ShouldInclude(dir), "backend must deliver the new-directory event")
 			w.handleEvent(fswatcher.WatchEvent{Path: dir, Types: []fswatcher.EventType{fswatcher.EventCreate}})
 			select {
 			case got := <-scanned:
@@ -178,7 +183,7 @@ func TestWatcherAgentConfigNewDirectoryScan(t *testing.T) {
 	}
 }
 
-// Folder events use anchored negations only; file events keep the full matcher.
+// Folder events and file events enforce the same parent-folder rule.
 func TestWatcherAgentConfigAnchoredNegations(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -193,10 +198,10 @@ func TestWatcherAgentConfigAnchoredNegations(t *testing.T) {
 		{"unanchored_env", []string{"node_modules/", "!.env.example"}, "", "", "node_modules/pkg", false, false},
 		{"wildcard_led", []string{"node_modules/", "!**/.gitkeep"}, "", "", "node_modules/pkg", false, false},
 		{"root_anchored_unrelated", []string{"node_modules/", "!/AGENTS.md"}, "", "", "node_modules/pkg", false, false},
-		{"anchored_child", []string{"gen", "!gen/keep.go"}, "", "", "gen", true, true},
-		{"root_anchored_child", []string{"gen", "!/gen/keep.go"}, "", "", "gen", true, true},
+		{"anchored_child", []string{"gen", "!gen/keep.go"}, "", "", "gen", false, false},
+		{"root_anchored_child", []string{"gen", "!/gen/keep.go"}, "", "", "gen", false, false},
 		{"per_folder_unanchored", nil, ".gortexignore", "vendor2/\n!.gitkeep\n", "vendor2/pkg", true, false},
-		{"nested_anchored", nil, "sub/.gortexignore", "gen/\n!gen/keep.go\nother/\n", "sub/gen", true, true},
+		{"nested_anchored", nil, "sub/.gortexignore", "gen/\n!gen/keep.go\nother/\n", "sub/gen", true, false},
 		{"nested_unrelated", nil, "sub/.gortexignore", "gen/\n!gen/keep.go\nother/\n", "sub/other", true, false},
 		{"flat_pruned", []string{"gen/"}, "", "", "gen", true, false},
 		{"per_folder_pruned", nil, "sub/.gortexignore", "gen/\n", "sub/gen", true, false},
@@ -238,22 +243,21 @@ func TestWatcherAgentConfigUnanchoredFileVerdict(t *testing.T) {
 	require.NoError(t, err)
 	path := filepath.Join(root, "node_modules/pkg/.gitkeep")
 	writeExcludeFixture(t, path, "")
-	// On main the negation re-includes this file, though no language claims it.
-	require.True(t, (&watcherExcludeFilter{w: w}).ShouldInclude(path))
-	require.False(t, w.isExcluded(path))
+	// A basename negation cannot bypass an excluded parent folder.
+	require.False(t, (&watcherExcludeFilter{w: w}).ShouldInclude(path))
+	require.True(t, w.isExcluded(path))
 	require.True(t, w.isExcluded(filepath.Dir(path)))
 }
 
-// The cold walk keeps its conservative check (D12): only the watcher drops
-// ignored folders that an unanchored or wildcard-led negation could reach.
-func TestWatcherAgentConfigColdWalkKeepsUnanchoredNegations(t *testing.T) {
+// Both the cold walk and watcher close an excluded parent folder.
+func TestWatcherAgentConfigColdWalkPrunesUnanchoredNegations(t *testing.T) {
 	for _, negation := range []string{"!.gitkeep", "!**/keep/"} {
 		t.Run(negation, func(t *testing.T) {
 			root := t.TempDir()
 			dir := filepath.Join(root, "node_modules", "pkg")
 			require.NoError(t, os.MkdirAll(dir, 0o755))
 			idx := newAdmissionTestIndexer(t, root, "node_modules/", negation)
-			require.False(t, idx.shouldPruneDir(dir, root))
+			require.True(t, idx.shouldPruneDir(dir, root))
 			w, err := NewWatcher(&Indexer{rootPath: root}, config.WatchConfig{Exclude: []string{"node_modules/", negation}}, zap.NewNop())
 			require.NoError(t, err)
 			require.True(t, w.isExcluded(dir))
@@ -352,7 +356,7 @@ func TestWatcherAgentConfigRootlessGuard(t *testing.T) {
 		backend bool
 	}{
 		{"gen", true, false},
-		{"gen/keep.go", false, true},
+		{"gen/keep.go", false, false},
 		{"gen/drop.go", false, false},
 		{"ignored", false, true},
 		{"ignored/child.go", false, false},
@@ -425,8 +429,8 @@ func TestWatcherAgentConfigSnapshotGuard(t *testing.T) {
 // starts no scan and its MCP config copies stay out of the graph.
 func TestWatcherAgentConfigClosedFolders(t *testing.T) {
 	root := t.TempDir()
-	// An unanchored negation keeps ignored folders open for the cold walk;
-	// closed agent-config folders are pruned regardless.
+	// Neither an unanchored negation nor the MCP exception opens arbitrary
+	// agent state folders.
 	patterns := append(append([]string{}, excludes.Builtin...), "!.gitkeep")
 	idx := newAdmissionTestIndexer(t, root, "!.gitkeep")
 	w, err := NewWatcher(idx, config.WatchConfig{Exclude: patterns}, zap.NewNop())

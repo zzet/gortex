@@ -89,52 +89,6 @@ func TestHierarchical_Negation(t *testing.T) {
 	}
 }
 
-func TestHierarchical_HasNegatedDescendant(t *testing.T) {
-	root := t.TempDir()
-	// A blanket "dir/*" plus a re-include of one child, expressed in a
-	// per-directory ignore file. The walk must keep descending pkg/ so
-	// the re-included pkg/keep/ subtree is reached.
-	mkIgnore(t, filepath.Join(root, ".gortexignore"), "pkg/*\n!pkg/keep/\n")
-	h := NewHierarchical(root, ".gortexignore")
-
-	if !h.HasNegatedDescendant(filepath.Join(root, "pkg")) {
-		t.Error("pkg/ has a re-included child and must not be pruned")
-	}
-	if h.HasNegatedDescendant(filepath.Join(root, "pkg", "other")) {
-		t.Error("pkg/other has no re-included descendant and is prunable")
-	}
-	if h.HasNegatedDescendant(filepath.Join(root, "unrelated")) {
-		t.Error("an unrelated directory has no re-included descendant")
-	}
-}
-
-func TestHierarchical_HasNegatedDescendant_Anchored(t *testing.T) {
-	root := t.TempDir()
-	// The negation lives in a nested ignore file, anchored at internal/.
-	mkIgnore(t, filepath.Join(root, "internal", ".gortexignore"), "build/*\n!build/keep/\n")
-	h := NewHierarchical(root, ".gortexignore")
-
-	if !h.HasNegatedDescendant(filepath.Join(root, "internal", "build")) {
-		t.Error("internal/build has a re-included child via the nested ignore file")
-	}
-	if h.HasNegatedDescendant(filepath.Join(root, "build")) {
-		t.Error("a root-level build/ is unaffected by internal/.gortexignore")
-	}
-}
-
-func TestHierarchical_HasNegatedDescendant_NilAndEmpty(t *testing.T) {
-	var h *Hierarchical
-	if h.HasNegatedDescendant("/anything") {
-		t.Error("nil Hierarchical should report no negated descendants")
-	}
-	root := t.TempDir()
-	mkIgnore(t, filepath.Join(root, ".gortexignore"), "pkg/*\n!pkg/keep/\n")
-	empty := NewHierarchical(root) // no filenames configured
-	if empty.HasNegatedDescendant(filepath.Join(root, "pkg")) {
-		t.Error("an empty filename list should report no negated descendants")
-	}
-}
-
 func TestHierarchical_NoFiles(t *testing.T) {
 	root := t.TempDir()
 	mkIgnore(t, filepath.Join(root, "foo.go"), "package x\n")
@@ -180,44 +134,6 @@ func TestHierarchical_MultipleFilenames(t *testing.T) {
 	}
 	if h.Match(filepath.Join(root, "c.go"), false) {
 		t.Error("c.go should not be excluded")
-	}
-}
-
-func TestHierarchical_HasAnchoredNegatedDescendant(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		file  string
-		rules string
-		dir   string
-		want  bool
-	}{
-		{"unanchored_gitkeep", ".gortexignore", "vendor2/\n!.gitkeep\n", "vendor2/pkg", false},
-		{"unanchored_env", ".gortexignore", "!.env.example\n", "vendor2/pkg", false},
-		{"wildcard_led", ".gortexignore", "!**/.gitkeep\n", "vendor2/pkg", false},
-		{"root_unrelated", ".gortexignore", "!/AGENTS.md\n", "vendor2/pkg", false},
-		{"root_at_root", ".gortexignore", "!/AGENTS.md\n", ".", true},
-		{"anchored", ".gortexignore", "gen/\n!gen/keep.go\n", "gen", true},
-		{"root_anchored", ".gortexignore", "gen/\n!/gen/keep.go\n", "gen", true},
-		{"nested", "sub/.gortexignore", "gen/\n!gen/keep.go\nother/\n", "sub/gen", true},
-		{"nested_unrelated", "sub/.gortexignore", "gen/\n!gen/keep.go\nother/\n", "sub/other", false},
-		{"nested_at_folder", "sub/.gortexignore", "!/AGENTS.md\n", "sub", true},
-		{"nested_scoping", "sub/.gortexignore", "gen/\n!gen/keep.go\n", "gen", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			root := t.TempDir()
-			mkIgnore(t, filepath.Join(root, tc.file), tc.rules)
-			h := NewHierarchical(root, ".gortexignore")
-			if got := h.HasAnchoredNegatedDescendant(filepath.Join(root, tc.dir)); got != tc.want {
-				t.Fatalf("HasAnchoredNegatedDescendant(%q) = %v, want %v", tc.dir, got, tc.want)
-			}
-			if h.HasAnchoredNegatedDescendant(filepath.Join(root, "..", "outside")) {
-				t.Fatal("outside path has no negated descendant")
-			}
-		})
-	}
-	var h *Hierarchical
-	if h.HasAnchoredNegatedDescendant("/anything") || NewHierarchical(t.TempDir()).HasAnchoredNegatedDescendant("/anything") {
-		t.Fatal("nil and empty matchers have no negated descendants")
 	}
 }
 

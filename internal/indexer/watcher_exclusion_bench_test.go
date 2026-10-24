@@ -23,16 +23,7 @@ func BenchmarkWatcherExclusion(b *testing.B) {
 		}
 		b.Run(name, func(b *testing.B) {
 			root := b.TempDir()
-			for _, dir := range []string{"src", "node_modules/pkg", ".claude"} {
-				if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
-					b.Fatal(err)
-				}
-			}
-			for _, rel := range []string{"src/main.go", "node_modules/pkg/index.js", ".claude/mcp.json"} {
-				if err := os.WriteFile(filepath.Join(root, rel), []byte("fixture\n"), 0o644); err != nil {
-					b.Fatal(err)
-				}
-			}
+			writeWatcherExclusionFixture(b, root)
 			patterns := append([]string{}, excludes.Builtin...)
 			if negation {
 				patterns = append(patterns, "!.gitkeep")
@@ -46,6 +37,7 @@ func BenchmarkWatcherExclusion(b *testing.B) {
 				{"admitted_file", "src/main.go"},
 				{"admitted_folder", "src"},
 				{"ignored_tree", "node_modules/pkg/index.js"},
+				{"deep_ignored_tree", "node_modules/pkg/a/b/c/d/e/f/index.js"},
 				{"mcp", ".claude/mcp.json"},
 			} {
 				path := filepath.Join(root, tc.rel)
@@ -69,5 +61,19 @@ func BenchmarkWatcherExclusion(b *testing.B) {
 				})
 			}
 		})
+	}
+}
+
+func writeWatcherExclusionFixture(t testing.TB, root string) {
+	t.Helper()
+	for _, dir := range []string{"src", "node_modules/pkg/a/b/c/d/e/f", ".claude"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, rel := range []string{"src/main.go", "node_modules/pkg/index.js", "node_modules/pkg/a/b/c/d/e/f/index.js", ".claude/mcp.json"} {
+		if err := os.WriteFile(filepath.Join(root, rel), []byte("fixture\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

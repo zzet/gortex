@@ -65,3 +65,20 @@ func TestSourceSearchAppliesTheIndexExclusionRules(t *testing.T) {
 	assert.Equal(t, []string{".claude/mcp.json", "main.go", "sub/kept.go"}, files)
 	assert.False(t, idx.AdmitSourceSearchBuffer(ctx, root, filepath.Join(root, ".kiro", "settings", "mcp.json"), []byte(`{"mcpServers":{}}`), patterns))
 }
+
+func TestSourceSearchPreservesIncludesWithExplicitPatterns(t *testing.T) {
+	root := t.TempDir()
+	idx := newAdmissionTestIndexer(t, root)
+	idx.config.Include = []string{"vendor/keep.go", "vendor/blocked/keep.go"}
+	for _, rel := range []string{"vendor/keep.go", "vendor/blocked/keep.go", "dir/keep.go", "main.go"} {
+		writeExcludeFixture(t, filepath.Join(root, rel), "package app\n")
+	}
+	writeExcludeFixture(t, filepath.Join(root, "vendor/blocked/.gortexignore"), "keep.go\n")
+	patterns := append(append([]string{}, excludes.Builtin...), "dir/", "!dir/keep.go")
+	files, err := idx.CurrentSourceSearchFiles(context.Background(), root, nil, nil, 0, patterns)
+	require.NoError(t, err)
+	require.Equal(t, []string{"main.go", "vendor/keep.go"}, files)
+	for rel, want := range map[string]bool{"vendor/keep.go": true, "vendor/blocked/keep.go": false, "dir/keep.go": false} {
+		require.Equal(t, want, idx.AdmitSourceSearchBuffer(context.Background(), root, filepath.Join(root, rel), []byte("package app\n"), patterns), rel)
+	}
+}

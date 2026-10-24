@@ -10,6 +10,7 @@ import (
 )
 
 func TestPruneDir_OrderedNegations(t *testing.T) {
+	// The second * closes agent/ again; descendant negations cannot reopen it.
 	patterns := []string{"*", "!/agent/", "!/research/", "*", "!/agent/extensions/**", "!/agent/skills/**", "!/agent/AGENTS.md", ".venv/", "node_modules/"}
 	for _, tc := range []struct {
 		dir   string
@@ -17,7 +18,7 @@ func TestPruneDir_OrderedNegations(t *testing.T) {
 	}{
 		{"agent/session-artifacts", true}, {"research/x", true},
 		{"agent/skills/x/.venv", true}, {"agent/extensions/x/node_modules", true},
-		{"agent/skills/x", false}, {"agent/extensions/x", false},
+		{"agent/skills/x", true}, {"agent/extensions/x", true},
 	} {
 		t.Run(tc.dir, func(t *testing.T) {
 			root := t.TempDir()

@@ -28,7 +28,8 @@ type Hierarchical struct {
 	cache map[string]*Matcher // abs dir -> compiled matcher; nil value = directory has no ignore files
 	// forgets counts Forget calls. A read that started before one does not
 	// store its result, which may predate the change Forget reports.
-	forgets uint64
+	forgets  uint64
+	diagnose func(string, *Matcher)
 
 	// observe, when set (ObserveReads), is handed every ignore file read.
 	observe func(path string, data []byte, err error)
@@ -50,6 +51,12 @@ func (h *Hierarchical) ObserveReads(fn func(path string, data []byte, err error)
 // (e.g. ".gortexignore"). An empty filename list yields a matcher that
 // excludes nothing.
 func NewHierarchical(root string, filenames ...string) *Hierarchical {
+	return NewHierarchicalWithDiagnostics(root, filenames, nil)
+}
+
+// NewHierarchicalWithDiagnostics reports each loaded list once, when cached.
+// diagnose must not call back into the hierarchical matcher.
+func NewHierarchicalWithDiagnostics(root string, filenames []string, diagnose func(string, *Matcher)) *Hierarchical {
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
@@ -57,6 +64,7 @@ func NewHierarchical(root string, filenames ...string) *Hierarchical {
 		root:      filepath.Clean(root),
 		filenames: filenames,
 		cache:     make(map[string]*Matcher),
+		diagnose:  diagnose,
 	}
 }
 
@@ -107,6 +115,16 @@ func (h *Hierarchical) Match(absPath string, isDir bool) bool {
 // nothing matched. Used to name the culprit when an over-broad ignore
 // leaves a repo with nothing to index.
 func (h *Hierarchical) Explain(absPath string, isDir bool) (bool, string, string) {
+	return h.explain(absPath, isDir, (*Matcher).ExplainAbsDir)
+}
+
+// MatchInOpenDir omits parent checks already proved by a pruned disk walk.
+func (h *Hierarchical) MatchInOpenDir(absPath string, isDir bool) bool {
+	matched, _, _ := h.explain(absPath, isDir, (*Matcher).ExplainAbsDirInOpenDir)
+	return matched
+}
+
+func (h *Hierarchical) explain(absPath string, isDir bool, match func(*Matcher, string, string, bool) (bool, string)) (bool, string, string) {
 	if h == nil || len(h.filenames) == 0 {
 		return false, "", ""
 	}
@@ -125,83 +143,17 @@ func (h *Hierarchical) Explain(absPath string, isDir bool) (bool, string, string
 	// level that excludes the path wins; a file's own directory cannot
 	// exclude the file from itself.
 	dir := h.root
-	if matched, pat := h.dirMatcher(dir).ExplainAbsDir(absPath, dir, isDir); matched {
+	if matched, pat := match(h.dirMatcher(dir), absPath, dir, isDir); matched {
 		return true, dir, pat
 	}
 	segs := strings.Split(rel, "/")
 	for _, seg := range segs[:len(segs)-1] {
 		dir = filepath.Join(dir, seg)
-		if matched, pat := h.dirMatcher(dir).ExplainAbsDir(absPath, dir, isDir); matched {
+		if matched, pat := match(h.dirMatcher(dir), absPath, dir, isDir); matched {
 			return true, dir, pat
 		}
 	}
 	return false, "", ""
-}
-
-// HasNegatedDescendant reports whether any per-directory ignore file
-// along the chain from the root down to absDir carries a re-include
-// ("!") pattern that could match a path strictly beneath absDir. The
-// index walk uses it to keep descending an excluded directory whose
-// subtree a negation could resurrect, instead of pruning it outright —
-// the per-directory counterpart of Matcher.HasNegatedDescendant. absDir
-// is an absolute directory path; a path outside the root never matches.
-func (h *Hierarchical) HasNegatedDescendant(absDir string) bool {
-	return h.hasNegatedDescendant(absDir, false)
-}
-
-// HasAnchoredNegatedDescendant is the per-directory counterpart of
-// Matcher.HasAnchoredNegatedDescendant, with each ignore file's patterns
-// relative to its own directory.
-func (h *Hierarchical) HasAnchoredNegatedDescendant(absDir string) bool {
-	return h.hasNegatedDescendant(absDir, true)
-}
-
-func (h *Hierarchical) hasNegatedDescendant(absDir string, anchoredOnly bool) bool {
-	if h == nil || len(h.filenames) == 0 {
-		return false
-	}
-	absDir = filepath.Clean(absDir)
-	rel, err := filepath.Rel(h.root, absDir)
-	if err != nil {
-		return false
-	}
-	rel = filepath.ToSlash(rel)
-	if rel == ".." || strings.HasPrefix(rel, "../") {
-		return false
-	}
-
-	// Each directory's ignore patterns are anchored at that directory, so
-	// the question "is there a negated descendant of absDir?" is asked of
-	// every ancestor matcher (and absDir's own) with absDir expressed
-	// relative to that ancestor.
-	dir := h.root
-	if h.dirMatcher(dir).hasNegatedDescendant(relUnder(dir, absDir), anchoredOnly) {
-		return true
-	}
-	if rel == "." || rel == "" {
-		return false
-	}
-	for _, seg := range strings.Split(rel, "/") {
-		dir = filepath.Join(dir, seg)
-		if h.dirMatcher(dir).hasNegatedDescendant(relUnder(dir, absDir), anchoredOnly) {
-			return true
-		}
-	}
-	return false
-}
-
-// relUnder returns child expressed relative to dir, in forward-slash
-// form. It returns "" when child is dir itself.
-func relUnder(dir, child string) string {
-	rel, err := filepath.Rel(dir, child)
-	if err != nil {
-		return ""
-	}
-	rel = filepath.ToSlash(rel)
-	if rel == "." {
-		return ""
-	}
-	return rel
 }
 
 // dirMatcher returns the compiled ignore matcher for one directory,
@@ -229,8 +181,13 @@ func (h *Hierarchical) dirMatcher(dir string) *Matcher {
 	// Store only when no Forget ran since the read and the parent is
 	// cached, so a cached folder always has cached ancestors and Forget
 	// can skip folders that are not cached.
-	if h.forgets == forgets && (dir == h.root || h.cached(filepath.Dir(dir))) {
+	if cached, ok := h.cache[dir]; ok {
+		m = cached
+	} else if h.forgets == forgets && (dir == h.root || h.cached(filepath.Dir(dir))) {
 		h.cache[dir] = m
+		if m != nil && h.diagnose != nil {
+			h.diagnose(dir, m)
+		}
 	}
 	h.mu.Unlock()
 	return m

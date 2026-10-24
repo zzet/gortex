@@ -74,10 +74,20 @@ func (idx *Indexer) admitWalkEntry(root, absPath string, size int64, isDir bool)
 // Regular files need no second Lstat for confinement. Actual symlinks still
 // take the full guard, ahead of every exclusion override and content read.
 func (idx *Indexer) admitWalkFileKnownType(root, absPath string, size int64, mode os.FileMode) walkAdmission {
+	return idx.admitFileWithRules(root, absPath, size, mode, pathExclusionRules{flat: idx.excludeMatcher(), perFolder: idx.perFolderIgnores(root)})
+}
+
+// admitFileInOpenDir is only for files yielded by walkDisk, which has
+// already checked every parent, including ancestors of a scoped root.
+func (idx *Indexer) admitFileInOpenDir(root, absPath string, size int64, mode os.FileMode) walkAdmission {
+	return idx.admitFileWithRules(root, absPath, size, mode, pathExclusionRules{flat: idx.excludeMatcher(), perFolder: idx.perFolderIgnores(root), parentsOpen: true})
+}
+
+func (idx *Indexer) admitFileWithRules(root, absPath string, size int64, mode os.FileMode, rules pathExclusionRules) walkAdmission {
 	if !mode.IsRegular() {
 		return idx.admitWalkEntry(root, absPath, size, false)
 	}
-	if idx.shouldExcludeRules(absPath, root, false) {
+	if rules.match(absPath, root, false) {
 		return walkAdmission{excluded: true}
 	}
 	return idx.admitUnexcludedWalkFile(absPath, size)
@@ -110,8 +120,13 @@ func (idx *Indexer) admitScopedWalkFile(root, absPath string) bool {
 // (every .git folder among them) and leaves file admission to fn.
 func (idx *Indexer) walkDisk(root, scope string, fn fs.WalkDirFunc) error {
 	return filepath.WalkDir(scope, func(path string, d fs.DirEntry, err error) error {
-		if err == nil && d.IsDir() && idx.shouldPruneDir(path, root) {
-			return filepath.SkipDir
+		if err == nil && d.IsDir() {
+			// The scope may start below an excluded ancestor. Check it in
+			// full; descendants have open parents proved by this walk.
+			rules := pathExclusionRules{flat: idx.excludeMatcher(), perFolder: idx.perFolderIgnores(root), parentsOpen: path != scope}
+			if rules.match(path, root, true) {
+				return filepath.SkipDir
+			}
 		}
 		return fn(path, d, err)
 	})
