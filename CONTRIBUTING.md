@@ -76,9 +76,19 @@ checks and is the right default for most work. Other optional build tags:
 go test -race ./...
 ```
 
-CI runs the suite with `-timeout=20m` on Linux and macOS. A few packages —
-`internal/persistence` in particular — are slow under `-race`, so if you hit the
-default 10-minute panic, raise the timeout rather than assuming a hang.
+CI runs the suite under `-race` on Linux. A few packages — `internal/indexer`,
+`internal/mcp` and `internal/graph/store_sqlite` in particular — are slow under
+`-race`, so if you hit the default 10-minute panic, raise the timeout rather
+than assuming a hang. CI leaves SQLite's transpiled C and its libc out of race
+instrumentation, which makes those packages several times faster; to match it
+locally, add
+`-gcflags=modernc.org/sqlite/lib=-race=false -gcflags=modernc.org/libc/...=-race=false`.
+
+To run a package the way CI does, one worker process per CPU:
+
+```bash
+TEST_RACE=true python3 scripts/ci-test-partition.py --partition mcp+store
+```
 
 ### Linting
 
@@ -113,9 +123,13 @@ go test -bench=. -benchmem ./internal/graph/
 Your PR has to get past all of these
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
-- `go build` + `go test -race` on `ubuntu-latest` and `macos-latest`
-- a native Windows CGO build, plus focused tests for the agent, path-guard, and
-  sidecar code paths whose behaviour differs there
+- the full test suite under `-race` with coverage on `ubuntu-latest`, and
+  without `-race` on `macos-latest` and `windows-latest`, as four jobs per OS
+  (macOS still race-checks the indexer's watcher tests). A batch of tests or a
+  package that fails while other tests share the runner is rerun once, whole
+  and alone; if every test passes then, the job passes and flags the failure
+  as flaky. A data race, a panic, a crash or a timeout is never rerun.
+- `go build` on each OS
 - a static Linux build (`netgo,osusergo,static_link`) verified to be
   self-contained and smoke-tested inside `debian:11` and `alpine:3`
 - golangci-lint

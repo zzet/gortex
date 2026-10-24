@@ -16,57 +16,61 @@ concurrency:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
-    # Give store/indexer six and MCP three exhaustive top-level test shards so
-    # race/coverage runs fit within the existing package and job time limits.
-    timeout-minutes: 60
+    # Each job compiles its packages once and runs their tests on one worker
+    # process per CPU (scripts/ci-test-partition.py), so four jobs per OS cover
+    # every test. Linux runs -race with coverage; macOS and Windows run the
+    # same tests without them, and macOS race-checks the indexer's watcher
+    # tests, which drive its FSEvents and kqueue backends.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        go-version: ['1.27']
-        partition: [remaining, store-0, store-1, store-2, store-3, store-4, store-5, indexer-0, indexer-1, indexer-2, indexer-3, indexer-4, indexer-5, mcp-0, mcp-1, mcp-2]
+        partition: ["indexer:1/2", "indexer:2/2", "mcp+store", "rest"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          # Keyed apart from the build jobs' go.sum-only cache, which holds
+          # no -race objects for the Linux tests to reuse.
+          cache-dependency-path: |
+            go.sum
+            go.mod
 
+      # Linux's build jobs already build the binary.
       - name: Build
+        if: matrix.partition == 'rest' && matrix.os != 'ubuntu-latest'
         run: go build -o gortex ./cmd/gortex/
 
-      # Derive each platform's compiled census; assign every top-level case once.
-      # Linux and macOS retain race/coverage checks; Windows retains its
-      # normal verbose run, whose per-test timings expose slow fixtures.
       - name: Test
         shell: bash
         env:
           TEST_PARTITION: ${{ matrix.partition }}
+          TEST_RACE: ${{ matrix.os == 'ubuntu-latest' }}
           TEST_WINDOWS: ${{ matrix.os == 'windows-latest' }}
         run: |
           if [[ "$TEST_WINDOWS" == true ]]; then
-            python - <<'PY_WINDOWS_TESTS'
-          import os
-          from pathlib import Path
-          import subprocess
-          import sys
-
-          scratch = Path(os.environ["RUNNER_TEMP"]) / "gortex-storage-tests"
-          scratch.mkdir(parents=True, exist_ok=True)
-          os.environ["GOTMPDIR"] = str(scratch)
-          print("Windows test GOTMPDIR:", scratch, flush=True)
-          sys.exit(subprocess.call([sys.executable, "scripts/ci-test-partition.py"]))
-          PY_WINDOWS_TESTS
+            python scripts/ci-test-partition.py
           else
             python3 scripts/ci-test-partition.py
           fi
 
       - name: Upload coverage
-        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.27'
+        if: matrix.os == 'ubuntu-latest'
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: coverage.out
         continue-on-error: true
+
+      - name: Upload test logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-logs-${{ matrix.os }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/gt/*/logs/
+          retention-days: 7
 
   build-linux-static:
     # The linux release ships a statically linked binary so it runs on any
@@ -126,6 +130,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+
+      - name: CI test layout
+        run: python3 -m unittest scripts/test_ci_test_partition.py
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
