@@ -6,12 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -195,7 +197,71 @@ func newMCPDispatchSlots(limit int) chan struct{} {
 
 var mcpDispatchSlots = newMCPDispatchSlots(mcpDispatchLimit(os.Getenv(mcpDispatchLimitEnv)))
 
+const (
+	// A request that finds every dispatch slot busy waits up to the queue
+	// budget for one. At most mcpDispatchQueueFactor times the pool capacity
+	// may wait; past that the request is refused at once.
+	defaultMCPDispatchQueueWait = 5 * time.Second
+	maxMCPDispatchQueueWait     = 30 * time.Second
+	mcpDispatchQueueFactor      = 16
+	mcpDispatchQueueWaitEnv     = "GORTEX_MCP_DISPATCH_QUEUE_WAIT"
+	mcpDispatchBusyRetryAfter   = time.Second
+)
+
+// mcpDispatchQueueWait parses the queue budget. "0" or "off" disables the
+// queue and restores the instant busy refusal.
+func mcpDispatchQueueWait(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultMCPDispatchQueueWait
+	}
+	if strings.EqualFold(raw, "off") {
+		return 0
+	}
+	wait, err := time.ParseDuration(raw)
+	if err != nil || wait < 0 {
+		return defaultMCPDispatchQueueWait
+	}
+	if wait > maxMCPDispatchQueueWait {
+		return maxMCPDispatchQueueWait
+	}
+	return wait
+}
+
+var mcpDispatchQueueWaitDefault = mcpDispatchQueueWait(os.Getenv(mcpDispatchQueueWaitEnv))
+
+// mcpDispatchQueueWaiterCounts maps each dispatch pool to the number of
+// requests waiting for one of its slots. Pools are few and never removed.
+var mcpDispatchQueueWaiterCounts sync.Map // chan struct{} -> *atomic.Int32
+
+func mcpDispatchQueueWaiterCount(slots chan struct{}) *atomic.Int32 {
+	waiters, _ := mcpDispatchQueueWaiterCounts.LoadOrStore(slots, new(atomic.Int32))
+	return waiters.(*atomic.Int32)
+}
+
+func mcpDispatchQueueWaiters(slots chan struct{}) int {
+	waiters, ok := mcpDispatchQueueWaiterCounts.Load(slots)
+	if !ok {
+		return 0
+	}
+	return int(waiters.(*atomic.Int32).Load())
+}
+
 var errMCPDispatchSaturated = errors.New("MCP dispatcher capacity is saturated")
+
+// mcpDispatchBusyError is a busy refusal from the dispatch queue: the budget
+// ran out, or the queue was full and the request did not wait.
+type mcpDispatchBusyError struct{ waited time.Duration }
+
+func (e *mcpDispatchBusyError) Error() string { return errMCPDispatchSaturated.Error() }
+func (e *mcpDispatchBusyError) Unwrap() error { return errMCPDispatchSaturated }
+
+var errMCPDispatchNotStarted = errors.New("MCP dispatch did not start")
+
+// mcpDispatchNotStarted reports whether err proves the handler never ran.
+func mcpDispatchNotStarted(err error) bool {
+	return errors.Is(err, errMCPDispatchNotStarted) || errors.Is(err, errMCPDispatchSaturated)
+}
 
 type mcpDispatchAdmission struct {
 	once sync.Once
@@ -205,6 +271,7 @@ type mcpDispatchAdmission struct {
 type mcpDispatchAdmissionContextKey struct{}
 type mcpDispatchWaitContextKey struct{}
 type mcpDispatchSlotsContextKey struct{}
+type mcpDispatchQueueWaitContextKey struct{}
 type mcpDispatchUnboundedContextKey struct{}
 
 func isLongLivedMCPRequest(method string) bool {
@@ -243,6 +310,17 @@ func mcpDispatchSlotsForContext(ctx context.Context) chan struct{} {
 	return mcpDispatchSlots
 }
 
+func withMCPDispatchQueueWait(ctx context.Context, wait time.Duration) context.Context {
+	return context.WithValue(ctx, mcpDispatchQueueWaitContextKey{}, wait)
+}
+
+func mcpDispatchQueueWaitForContext(ctx context.Context) time.Duration {
+	if wait, ok := ctx.Value(mcpDispatchQueueWaitContextKey{}).(time.Duration); ok {
+		return wait
+	}
+	return mcpDispatchQueueWaitDefault
+}
+
 func signalMCPDispatchAdmission(ctx context.Context) {
 	admission, _ := ctx.Value(mcpDispatchAdmissionContextKey{}).(*mcpDispatchAdmission)
 	if admission != nil {
@@ -270,8 +348,9 @@ func dispatchMCPWithContext(ctx context.Context, dispatch func() ([]byte, error)
 		select {
 		case slots <- struct{}{}:
 		default:
-			signalMCPDispatchAdmission(ctx)
-			return nil, errMCPDispatchSaturated
+			if err := awaitMCPDispatchSlot(ctx, slots); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -297,6 +376,45 @@ func dispatchMCPWithContext(ctx context.Context, dispatch func() ([]byte, error)
 	}
 }
 
+// awaitMCPDispatchSlot waits for a slot of a saturated pool for at most the
+// queue budget. Blocked senders are served in arrival order. The slot, the
+// budget and cancellation share one select, so a request that takes a slot
+// never also reports busy or not started.
+func awaitMCPDispatchSlot(ctx context.Context, slots chan struct{}) error {
+	wait := mcpDispatchQueueWaitForContext(ctx)
+	if wait <= 0 {
+		signalMCPDispatchAdmission(ctx)
+		return errMCPDispatchSaturated
+	}
+	waiters := mcpDispatchQueueWaiterCount(slots)
+	waiterCap := int32(mcpDispatchQueueFactor * cap(slots))
+	for {
+		queued := waiters.Load()
+		if queued >= waiterCap {
+			signalMCPDispatchAdmission(ctx)
+			return &mcpDispatchBusyError{}
+		}
+		if waiters.CompareAndSwap(queued, queued+1) {
+			break
+		}
+	}
+	defer waiters.Add(-1)
+	// Count the waiter before freeing the reader so the next frame observes it.
+	signalMCPDispatchAdmission(ctx)
+
+	queuedAt := time.Now()
+	budget := time.NewTimer(wait)
+	defer budget.Stop()
+	select {
+	case slots <- struct{}{}:
+		return nil
+	case <-budget.C:
+		return &mcpDispatchBusyError{waited: time.Since(queuedAt)}
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", errMCPDispatchNotStarted, ctx.Err())
+	}
+}
+
 func (s *Server) mcpToolCallTimeout() time.Duration {
 	if s != nil && s.MCPToolCallTimeout > 0 {
 		return s.MCPToolCallTimeout
@@ -311,6 +429,9 @@ func serveMCPConnection(conn net.Conn, reader *bufio.Reader, timeout time.Durati
 type mcpConnectionHooks struct {
 	beforeResponse func(json.RawMessage)
 	dispatchSlots  chan struct{}
+	// dispatchQueueWait, if set, overrides the dispatch queue budget for
+	// this connection; zero disables the queue.
+	dispatchQueueWait *time.Duration
 	// onReady, if set, is invoked once — before the read loop starts —
 	// with a function that pushes one server-initiated JSON-RPC frame
 	// through the same serialised writer the request/notification
@@ -326,6 +447,9 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 	connectionCtx, connectionCancel := context.WithCancel(context.Background())
 	if hooks != nil && hooks.dispatchSlots != nil {
 		connectionCtx = withMCPDispatchSlots(connectionCtx, hooks.dispatchSlots)
+	}
+	if hooks != nil && hooks.dispatchQueueWait != nil {
+		connectionCtx = withMCPDispatchQueueWait(connectionCtx, *hooks.dispatchQueueWait)
 	}
 	registry := &mcpRequestRegistry{}
 	writer := &mcpResponseWriter{conn: conn}
@@ -486,7 +610,7 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 					}
 				}
 				if envelope.Method == "tools/call" {
-					data["delivery_unknown"] = dispatchInvoked
+					data["delivery_unknown"] = dispatchInvoked && !mcpDispatchNotStarted(dispatchErr)
 					data["retryable"] = false
 				}
 				reply = mcpErrorResponse(requestID, code, message, data)
@@ -497,6 +621,11 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 				}
 				if envelope.Method == "tools/call" {
 					data["delivery_unknown"] = false
+				}
+				var busy *mcpDispatchBusyError
+				if errors.As(dispatchErr, &busy) {
+					data["queue_wait_ms"] = busy.waited.Milliseconds()
+					data["retry_after_ms"] = mcpDispatchBusyRetryAfter.Milliseconds()
 				}
 				reply = mcpErrorResponse(requestID, -32002, "MCP dispatcher is busy", data)
 			} else if dispatchErr != nil {

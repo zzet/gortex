@@ -622,6 +622,14 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 					zap.String("outcome", outcome),
 					zap.Duration("deadline", s.mcpToolCallTimeout()),
 					zap.Error(ctxErr))
+			} else if errors.Is(err, errMCPDispatchSaturated) {
+				// Busy refusals are expected under bursts; keep them out of Warn.
+				fields := []zap.Field{zap.String("session_id", sess.ID)}
+				var busy *mcpDispatchBusyError
+				if errors.As(err, &busy) {
+					fields = append(fields, zap.Int64("queue_wait_ms", busy.waited.Milliseconds()))
+				}
+				s.Logger.Debug("daemon: mcp dispatcher busy", fields...)
 			} else {
 				s.Logger.Warn("daemon: dispatch error",
 					zap.String("session_id", sess.ID), zap.Error(err))

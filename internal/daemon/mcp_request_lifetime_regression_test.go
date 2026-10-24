@@ -389,7 +389,7 @@ func TestMCPDispatchLimitConfiguration(t *testing.T) {
 	}
 }
 
-func TestServeMCPDispatcherSaturationFailsFastAndKeepsReaderResponsive(t *testing.T) {
+func TestServeMCPDispatcherSaturationWithQueueDisabledFailsFastAndKeepsReaderResponsive(t *testing.T) {
 	filled := 0
 	for {
 		select {
@@ -407,10 +407,11 @@ saturated:
 		}
 	}()
 	var dispatches atomic.Int32
-	conn, reader, done := startMCPConnectionTest(t, time.Second, func(context.Context, []byte) ([]byte, error) {
+	var zero time.Duration
+	conn, reader, done := startMCPConnectionWithHooksTest(t, time.Second, func(context.Context, []byte) ([]byte, error) {
 		dispatches.Add(1)
 		return nil, errors.New("saturated dispatcher unexpectedly ran")
-	})
+	}, &mcpConnectionHooks{dispatchQueueWait: &zero})
 	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"edit"}}`)
 	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","id":2,"method":"ping"}`)
 	responses := map[string]testMCPResponse{}
@@ -422,6 +423,11 @@ saturated:
 		response := responses[id]
 		if response.Error == nil || response.Error.Code != -32002 || response.Error.Data["outcome"] != "server_busy" {
 			t.Fatalf("busy response %s = %#v", id, response)
+		}
+		for _, field := range []string{"queue_wait_ms", "retry_after_ms"} {
+			if value, present := response.Error.Data[field]; present {
+				t.Fatalf("busy response %s reported %s = %#v with the queue disabled", id, field, value)
+			}
 		}
 	}
 	if responses["1"].Error.Data["delivery_unknown"] != false || responses["1"].Error.Data["retryable"] != true {

@@ -258,9 +258,14 @@ call as *unknown* and re-read before assuming it did or did not land.
 | Tool call / resource read / prompt fetch (all transports) | 60 s | `GORTEX_MCP_TOOL_TIMEOUT` (Go duration; `off` disables) |
 | Daemon socket, per JSON-RPC request | 60 s, terminal `-32001` | — |
 | Daemon socket, concurrent dispatches | 8 | `GORTEX_MCP_MAX_CONCURRENT_DISPATCHES` (max 64) |
+| Daemon socket, dispatch queue wait | 5 s, then terminal `-32002` with `queue_wait_ms` | `GORTEX_MCP_DISPATCH_QUEUE_WAIT` (Go duration, max 30 s; `0`/`off` restores the instant refusal) |
 | Control RPC (`daemon status` / `search_symbols` / `proxy`) | 30 s, terminal `timeout` | — |
 | Control RPC (`shutdown`) | unbounded on the daemon — the store flush precedes the ack. `gortex daemon stop` bounds its own wait at 30 s, then watches the process for up to 2 min and force-kills | — |
 | Control RPC (`track` / `untrack` / `reload` / `enrich_*`) | unbounded by design | — |
+
+When every dispatch slot is busy, a request waits up to the queue budget for
+one; at most 16× the dispatch cap may wait, and the wait counts against the
+request timeout.
 
 The handler bound fires just inside any deadline the transport already imposed,
 so the client receives the tool-shaped diagnosis rather than an opaque transport
