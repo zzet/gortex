@@ -746,8 +746,28 @@ func simulateSQLiteReindexSet(
 	for key, row := range initial {
 		state[key] = row
 	}
+	// Free every moving stored identity before choosing destination payloads.
+	// A chain or swap must not mistake a moving sibling for a stationary row.
+	moving := make(map[sqliteReindexKey]bool, len(mutations))
 	for _, mutation := range mutations {
-		delete(state, mutation.oldKey)
+		if mutation.oldKey != mutation.newRow.key {
+			moving[mutation.oldKey] = true
+			delete(state, mutation.oldKey)
+		}
+	}
+	for _, mutation := range mutations {
+		if mutation.oldKey == mutation.newRow.key {
+			if !moving[mutation.oldKey] {
+				// Do not resurrect an identity that this batch moves away.
+				state[mutation.newRow.key] = mutation.newRow
+			}
+			continue
+		}
+		if _, stored := initial[mutation.oldKey]; !stored {
+			// An intermediate identity created by an earlier entry still
+			// applies in order, preserving net cancellation within a batch.
+			delete(state, mutation.oldKey)
+		}
 		if _, exists := state[mutation.newRow.key]; !exists {
 			state[mutation.newRow.key] = mutation.newRow
 		}

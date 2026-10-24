@@ -128,6 +128,8 @@ func RunConformance(t *testing.T, factory Factory, semantics Semantics) {
 	t.Run("SetEdgeProvenanceBatch", func(t *testing.T) { testSetEdgeProvenanceBatch(t, factory) })
 	t.Run("ReindexEdge", func(t *testing.T) { testReindexEdge(t, factory) })
 	t.Run("ReindexEdges", func(t *testing.T) { testReindexEdges(t, factory) })
+	t.Run("ReindexConvergencePayload", func(t *testing.T) { RunReindexConvergencePayload(t, factory) })
+	t.Run("ReindexMovingSiblings", func(t *testing.T) { RunReindexMovingSiblings(t, factory) })
 	t.Run("Concurrency", func(t *testing.T) { testConcurrency(t, factory) })
 	t.Run("EdgeIdentityRevisions", func(t *testing.T) { testEdgeIdentityRevisions(t, factory) })
 	t.Run("VerifyEdgeIdentities", func(t *testing.T) { testVerifyEdgeIdentities(t, factory) })

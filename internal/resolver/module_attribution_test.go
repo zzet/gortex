@@ -279,7 +279,9 @@ func TestAttributeNonGo_BatchedWritesPreserveDedupeAndOrdering(t *testing.T) {
 	assert.Len(t, outEdgesOfKind(base, "app/c.py", graph.EdgeDependsOnModule), 1,
 		"existingDepends must suppress an already persisted dependency")
 	assert.Len(t, outEdgesOfKind(base, "app/d.py", graph.EdgeDependsOnModule), 1)
-	assert.Equal(t, 9, base.EdgeCount(), "five imports plus four dependency identities")
+	// Both app/a.py imports share line 1, so reindexing them to the same
+	// module converges them onto one edge identity.
+	assert.Equal(t, 8, base.EdgeCount(), "four import identities plus four dependency identities")
 }
 
 func TestAttributeNonGo_BoundsModuleAndDependencyWriteBatches(t *testing.T) {

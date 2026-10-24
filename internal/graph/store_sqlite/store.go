@@ -2758,8 +2758,15 @@ var errReindexWriterGateContended = errors.New("store_sqlite: reindex writer gat
 
 // ReindexEdges applies resolver re-binds through bounded VALUES relations.
 // Each bounded transaction prefetches only the relevant identities through
-// variable-safe VALUES relations, simulates the prior ordered DELETE + INSERT
-// OR IGNORE semantics, and persists only the net final-state differences.
+// variable-safe VALUES relations, frees moving identities before choosing
+// destination payloads, and persists only the net final-state differences.
+// Stationary destinations keep their payloads (including same-batch refreshes);
+// the first mover wins a fresh key. Distinct copied rows that converge at a
+// fresh key and then move it again, or reuse an already-moved stored identity,
+// are not guaranteed to converge across stores (see graph.Store.ReindexEdges).
+// Transactions hold at most 5000 entries.
+// A chain or swap split across transactions can still lose one edge, as before;
+// it does not retain the losing mover's payload at a stationary destination.
 func (s *Store) ReindexEdges(batch []graph.EdgeReindex) {
 	for _, r := range batch {
 		if r.Edge != nil && graph.IsUnresolvedTarget(r.Edge.To) {

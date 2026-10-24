@@ -35,8 +35,9 @@ import (
 // Raising it re-keys every stored generation once: nothing an older binary
 // published matches, every layer rebuilds on first contact, and from then on
 // the cache is keyed by the contract that produced it.
-// Corrected detached builtin attribution changes edges for an unchanged corpus.
-const ResolutionSemanticsVersion = 2
+// Convergence winner payloads and surviving outgoing order change stored edges
+// for an unchanged corpus.
+const ResolutionSemanticsVersion = 3
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be

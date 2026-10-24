@@ -42,6 +42,7 @@ func TestMutationReceiptIdempotentWritesProduceNoResolutionDelta(t *testing.T) {
 	token := g.BeginMutationReceipt()
 	g.AddNode(n)
 	g.AddEdge(e)
+	g.ReindexEdges([]EdgeReindex{{Edge: e, OldTo: e.To}})
 	receipt := g.EndMutationReceipt(token)
 	if !receipt.Complete {
 		t.Fatalf("idempotent receipt unexpectedly incomplete: %+v", receipt)
