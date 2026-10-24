@@ -76,7 +76,7 @@ checks and is the right default for most work. Other optional build tags:
 go test -race ./...
 ```
 
-CI runs the suite with `-timeout=20m` on Linux and macOS. A few packages —
+CI runs the suite under `-race` with `-timeout=45m` on Linux. A few packages —
 `internal/persistence` in particular — are slow under `-race`, so if you hit the
 default 10-minute panic, raise the timeout rather than assuming a hang.
 
@@ -113,9 +113,9 @@ go test -bench=. -benchmem ./internal/graph/
 Your PR has to get past all of these
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
-- `go build` + `go test -race` on `ubuntu-latest` and `macos-latest`
-- a native Windows CGO build, plus focused tests for the agent, path-guard, and
-  sidecar code paths whose behaviour differs there
+- `go build` + `go test -race` with coverage on `ubuntu-latest`
+- `go build` + the full test suite without `-race` on `macos-latest` and
+  `windows-latest`
 - a static Linux build (`netgo,osusergo,static_link`) verified to be
   self-contained and smoke-tested inside `debian:11` and `alpine:3`
 - golangci-lint

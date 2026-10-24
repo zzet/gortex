@@ -84,6 +84,134 @@ class PartitionTests(unittest.TestCase):
         self.assertIn("timeout-minutes: 60", workflow)
         self.assertEqual(planner.TEST_EXECUTION_BUDGET_SECONDS, 2700)
 
+    def test_plain_platform_layout_matches_the_workflow(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
+        rows = re.findall(r"(?m)^          - \{os: (\w+)-latest, go-version: '1.27', partition: ([\w-]+)\}$",
+                          workflow)
+        self.assertEqual({os_name for os_name, _ in rows}, {"macos", "windows"})
+        # Linux runs every race shard; the plain rows reuse some of the names.
+        linux = re.search(r"(?m)^        partition: \[(.*)\]$", workflow).group(1).split(", ")
+        self.assertEqual(linux, ["remaining"] + [f"{family}-{index}" for family, count in planner.SHARDS.items()
+                                                 for index in range(count)])
+        self.assertEqual(set(planner.PLAIN_SHARDS), {"macos", "windows"})
+        for platform, shards in planner.PLAIN_SHARDS.items():
+            expected = {"remaining", "mcp"} | {f"{family}-{index}" for family, count in shards.items()
+                                                for index in range(count)}
+            with self.subTest(platform=platform):
+                listed = [partition for os_name, partition in rows if os_name == platform]
+                self.assertEqual(sorted(listed), sorted(expected))
+        self.assertLessEqual(sum(os_name == "macos" for os_name, _ in rows), 5)
+        self.assertIn("TEST_RACE: ${{ matrix.os == 'ubuntu-latest' }}", workflow)
+        self.assertIn("os: [ubuntu-latest]\n", workflow)
+
+    def run_dry(self, partition, environ, dry_run=True):
+        module = "example.org/gortex"
+        packages = [module + suffix for suffix in ("/cmd/gortex", "/internal/graph/store_sqlite",
+                                                   "/internal/indexer", "/internal/mcp")]
+        names = self.names(12)
+
+        def capture(command):
+            if command == ["go", "list", "-m"]:
+                return module + "\n"
+            if command == ["go", "list", "./..."]:
+                return "\n".join(packages) + "\n"
+            pattern = command[command.index("-list") + 1]
+            return "\n".join(name for name in names if pattern == "." or re.fullmatch(pattern, name))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "selection.json"
+            with mock.patch.object(planner, "capture", side_effect=capture) as captured, \
+                    mock.patch.dict(planner.os.environ, environ, clear=True), \
+                    mock.patch.object(planner.sys, "argv", ["partition", "--partition", partition,
+                                                           "--manifest", str(path)] + ["--dry-run"] * dry_run), \
+                    mock.patch.object(planner.subprocess, "run") as run:
+                planner.main()
+            if dry_run:
+                run.assert_not_called()
+                return json.loads(path.read_text()), captured.call_args_list
+            return json.loads(path.read_text()), run.call_args_list
+
+    def test_plain_platforms_run_without_race_or_coverage(self):
+        for environ, partition, count in (({"TEST_RACE": "false"}, "indexer-2", 3),
+                                          ({"TEST_WINDOWS": "true"}, "indexer-3", 4)):
+            with self.subTest(environ=environ):
+                manifest, calls = self.run_dry(partition, environ)
+                self.assertEqual(manifest["shard_count"], count)
+                for command in manifest["commands"]:
+                    self.assertNotIn("-race", command)
+                    self.assertNotIn("-coverprofile=coverage.out", command)
+                    self.assertEqual("-v" in command, "TEST_WINDOWS" in environ)
+                self.assertTrue(all("-race" not in call.args[0] for call in calls))
+        for environ, verbose in (({"TEST_RACE": "false"}, []), ({"TEST_WINDOWS": "true"}, ["-v"])):
+            with self.subTest(environ=environ):
+                manifest, _ = self.run_dry("remaining", environ)
+                self.assertEqual(manifest["selected_packages"], [
+                    "example.org/gortex/cmd/gortex", "example.org/gortex/internal/graph/store_sqlite"])
+                # store_sqlite runs alone, after the other packages.
+                self.assertEqual(manifest["commands"], [
+                    ["go", "test"] + verbose + ["-timeout=45m", "example.org/gortex/cmd/gortex"],
+                    ["go", "test"] + verbose + ["-timeout=45m", "example.org/gortex/internal/graph/store_sqlite"]])
+                self.assertEqual(manifest["aggregate_test_execution_budget_seconds"], 2700)
+        manifest, _ = self.run_dry("remaining", {})
+        self.assertEqual(manifest["command"], ["go", "test", "-race", "-timeout=45m", "-coverprofile=coverage.out",
+                                               "example.org/gortex/cmd/gortex"])
+        manifest, _ = self.run_dry("mcp", {"TEST_RACE": "false"})
+        self.assertEqual(manifest["command"], ["go", "test", "-timeout=45m",
+                                               "example.org/gortex/internal/mcp"])
+        for environ in ({}, {"TEST_RACE": "true"}):
+            with self.subTest(environ=environ):
+                manifest, _ = self.run_dry("indexer-5", environ)
+                self.assertIn("-race", manifest["command"])
+                self.assertIn("-coverprofile=coverage.out", manifest["command"])
+                self.assertEqual(manifest["shard_count"], 6)
+
+    def test_plain_remaining_groups_share_the_budget_and_go_times_out_first(self):
+        with mock.patch.object(planner.time, "monotonic", side_effect=[100, 100, 700]):
+            manifest, runs = self.run_dry("remaining", {"TEST_RACE": "false"}, dry_run=False)
+        self.assertEqual([call.args[0][-1] for call in runs], [command[-1] for command in manifest["commands"]])
+        self.assertIn("-timeout=2700.000s", runs[0].args[0])
+        self.assertIn("-timeout=2100.000s", runs[1].args[0])
+        self.assertEqual([call.kwargs["timeout"] for call in runs], [3000, 2400])
+        # A single command keeps Go's plain 45m and no process timeout.
+        manifest, runs = self.run_dry("remaining", {}, dry_run=False)
+        self.assertEqual([call.args for call in runs], [(manifest["command"],)])
+        self.assertEqual(runs[0].kwargs, {"check": True})
+
+    def test_package_group_failure_still_runs_later_groups(self):
+        commands = [["go", "test", "-timeout=45m", name] for name in ("A", "B")]
+        failure = subprocess.CalledProcessError(1, commands[0])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "selection.json"
+            with mock.patch.object(planner.time, "monotonic", side_effect=[0, 0, 60]), \
+                    mock.patch.object(planner.subprocess, "run", side_effect=[failure, None]) as run:
+                with self.assertRaises(subprocess.CalledProcessError) as raised:
+                    planner.run_package_groups(commands, {}, path)
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(len(json.loads(path.read_text())["executed_commands"]), 2)
+        # When the budget runs out after a failure, the failure is reported.
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(planner.time, "monotonic", side_effect=[0, 0, 2700]), \
+                mock.patch.object(planner.subprocess, "run", side_effect=[failure]):
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                planner.run_package_groups(commands, {}, Path(directory) / "selection.json")
+            self.assertIs(raised.exception, failure)
+
+    def test_partition_and_race_settings_are_checked(self):
+        for environ, partition in (({"TEST_RACE": "false"}, "store-0"),
+                                   ({"TEST_RACE": "false"}, "indexer-3"),
+                                   ({"TEST_WINDOWS": "true"}, "indexer-4"),
+                                   ({}, "mcp"),
+                                   ({"TEST_RACE": "False"}, "remaining"),
+                                   ({"TEST_WINDOWS": "true", "TEST_RACE": "true"}, "remaining")):
+            with self.subTest(environ=environ, partition=partition), \
+                    mock.patch.dict(planner.os.environ, environ, clear=True), \
+                    mock.patch.object(planner.sys, "argv", ["partition", "--partition", partition]), \
+                    mock.patch.object(planner, "capture") as capture, \
+                    mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                planner.main()
+            capture.assert_not_called()
+
     def test_single_test_overflow_fails_without_dropping_it(self):
         with mock.patch.object(planner, "WINDOWS_COMMAND_BUDGET", 10):
             with self.assertRaisesRegex(ValueError, "one compiled test cannot fit"):

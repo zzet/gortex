@@ -11,9 +11,16 @@ import time
 from pathlib import Path
 
 SHARDS = {"store": 6, "indexer": 6, "mcp": 3}
+# macOS and Windows run without race or coverage, so they need fewer shards.
+# On those platforms store_sqlite runs whole inside "remaining" and mcp runs
+# as one job. macOS uses five jobs: the account runs at most five macOS jobs
+# at once.
+PLAIN_SHARDS = {"macos": {"indexer": 3}, "windows": {"indexer": 4}}
+PLAIN_FAMILIES = ("indexer", "mcp")
 NAME_BUNDLE = 32
 WINDOWS_COMMAND_BUDGET = 30000
 TEST_EXECUTION_BUDGET_SECONDS = 45 * 60
+BUILD_GRACE_SECONDS = 5 * 60
 LARGE_PACKAGES = {
     "store": "/internal/graph/store_sqlite",
     "indexer": "/internal/indexer",
@@ -170,6 +177,36 @@ def run_commands(commands, manifest, manifest_path):
         write_manifest(manifest_path, manifest)
 
 
+def run_package_groups(commands, manifest, manifest_path):
+    # Package groups share one 45m test budget, so the job stays inside its 60m
+    # limit. Go's own -timeout gets what is left, so a hang still prints Go's
+    # goroutine dump; the process timeout adds time for the build. A failing
+    # group does not skip the next one.
+    if len(commands) == 1:
+        run_commands(commands, manifest, manifest_path)
+        return
+    deadline = time.monotonic() + TEST_EXECUTION_BUDGET_SECONDS
+    manifest["executed_commands"] = []
+    failure = None
+    try:
+        for command in commands:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise failure or ValueError("aggregate test execution budget exhausted")
+            actual = list(command)
+            actual[actual.index("-timeout=45m")] = f"-timeout={remaining:.3f}s"
+            manifest["executed_commands"].append({"command": actual, "utf16_units": guard_command(actual)})
+            write_manifest(manifest_path, manifest)
+            try:
+                subprocess.run(actual, check=True, timeout=remaining + BUILD_GRACE_SECONDS)
+            except subprocess.CalledProcessError as error:
+                failure = failure or error
+    finally:
+        write_manifest(manifest_path, manifest)
+    if failure:
+        raise failure
+
+
 def guard_command(command):
     # Reserve room for Go's own test-binary flags and path below CreateProcess's
     # 32,767 UTF-16 code-unit limit on Windows. Other platforms do not use
@@ -186,15 +223,25 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--manifest", type=Path, default=Path("test-selection.json"))
     args = parser.parse_args()
-    valid = {"remaining"} | {f"{package}-{index}" for package, count in SHARDS.items() for index in range(count)}
+    windows = os.environ.get("TEST_WINDOWS", "false") == "true"
+    race_setting = os.environ.get("TEST_RACE", "false" if windows else "true")
+    if race_setting not in ("true", "false") or (windows and race_setting == "true"):
+        parser.error("TEST_RACE must be true or false, and false on Windows")
+    race = race_setting == "true"
+    if race:
+        shards, families = SHARDS, LARGE_PACKAGES
+    else:
+        shards = PLAIN_SHARDS["windows" if windows else "macos"]
+        families = {name: LARGE_PACKAGES[name] for name in PLAIN_FAMILIES}
+    valid = ({"remaining"} | (families.keys() - shards.keys())
+             | {f"{family}-{index}" for family, count in shards.items() for index in range(count)})
     if args.partition not in valid:
         parser.error(f"partition must be one of {sorted(valid)}")
-    windows = os.environ.get("TEST_WINDOWS", "false") == "true"
     module = capture(["go", "list", "-m"]).strip()
     packages = capture(["go", "list", "./..."]).splitlines()
     if not packages or len(packages) != len(set(packages)):
         raise ValueError("package census must be nonempty and unique")
-    package_partitions = {package: next((name for name, suffix in LARGE_PACKAGES.items()
+    package_partitions = {package: next((name for name, suffix in families.items()
                                         if package == module + suffix), "remaining")
                           for package in packages}
     family = args.partition.split("-", 1)[0]
@@ -203,17 +250,17 @@ def main():
         raise ValueError(f"no packages selected for {args.partition}")
     manifest = {"partition": args.partition, "packages": package_partitions, "selected_packages": selected}
     command = ["go", "test"]
-    if windows:
-        command += ["-v", "-timeout=45m"]
-    else:
+    if race:
         command += ["-race", "-timeout=45m", "-coverprofile=coverage.out"]
-    if family in SHARDS:
+    else:
+        command += (["-v"] if windows else []) + ["-timeout=45m"]
+    if family in shards:
         if len(selected) != 1:
             raise ValueError("a test shard must own exactly one package")
-        census_command = ["go", "test"] + ([] if windows else ["-race"]) + ["-list", ".", selected[0]]
+        census_command = ["go", "test"] + (["-race"] if race else []) + ["-list", ".", selected[0]]
         names = test_names(capture(census_command))
         assignments, pattern_chunks, bundle_size = plan_shard_commands(
-            names, census_command[:-3], command, selected[0], shard_count=SHARDS[family])
+            names, census_command[:-3], command, selected[0], shard_count=shards[family])
         # Verify the Python-generated expressions with Go's own test matcher.
         # The per-platform compiled census is the authority for every shard.
         for index, chunks in enumerate(pattern_chunks):
@@ -227,13 +274,19 @@ def main():
         index = int(args.partition.rsplit("-", 1)[1])
         commands = [command + ["-run", pattern] + selected for pattern in pattern_chunks[index]]
         manifest.update(census=names, shards=assignments, pattern_chunks=pattern_chunks,
-                        name_bundle=bundle_size, shard_count=SHARDS[family])
+                        name_bundle=bundle_size, shard_count=shards[family])
         if all(len(chunks) == 1 for chunks in pattern_chunks):
             manifest["patterns"] = [chunks[0] for chunks in pattern_chunks]
         print(f"{selected[0]}: {len(names)} compiled tests/examples/fuzz seeds; "
               f"shards={[len(shard) for shard in assignments]}; selected={index}", flush=True)
     else:
-        commands = [command + selected]
+        # On macOS and Windows store_sqlite runs inside "remaining". Its tests
+        # bound lock and wait times, so it runs alone after the other packages
+        # instead of beside them.
+        store = module + LARGE_PACKAGES["store"]
+        groups = ([package for package in selected if package != store],
+                  [package for package in selected if package == store])
+        commands = [command + group for group in groups if group]
     units = [guard_command(command) for command in commands]
     manifest["commands"] = commands
     manifest["commands_utf16_units"] = units
@@ -245,7 +298,10 @@ def main():
     write_manifest(args.manifest, manifest)
     print(f"Running {len(selected)} packages in {args.partition}; command units={units}", flush=True)
     if not args.dry_run:
-        run_commands(commands, manifest, args.manifest)
+        if family in shards:
+            run_commands(commands, manifest, args.manifest)
+        else:
+            run_package_groups(commands, manifest, args.manifest)
 
 
 if __name__ == "__main__":

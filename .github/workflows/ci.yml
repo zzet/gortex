@@ -16,15 +16,30 @@ concurrency:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
-    # Give store/indexer six and MCP three exhaustive top-level test shards so
-    # race/coverage runs fit within the existing package and job time limits.
+    # Linux gives store/indexer six and MCP three exhaustive top-level test
+    # shards so race/coverage runs fit within the package and job time limits.
+    # macOS and Windows run the same tests without race or coverage, in fewer
+    # shards (PLAIN_SHARDS in scripts/ci-test-partition.py). macOS uses five
+    # jobs, because the account runs at most five macOS jobs at once.
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest]
         go-version: ['1.27']
         partition: [remaining, store-0, store-1, store-2, store-3, store-4, store-5, indexer-0, indexer-1, indexer-2, indexer-3, indexer-4, indexer-5, mcp-0, mcp-1, mcp-2]
+        include:
+          - {os: macos-latest, go-version: '1.27', partition: remaining}
+          - {os: macos-latest, go-version: '1.27', partition: indexer-0}
+          - {os: macos-latest, go-version: '1.27', partition: indexer-1}
+          - {os: macos-latest, go-version: '1.27', partition: indexer-2}
+          - {os: macos-latest, go-version: '1.27', partition: mcp}
+          - {os: windows-latest, go-version: '1.27', partition: remaining}
+          - {os: windows-latest, go-version: '1.27', partition: indexer-0}
+          - {os: windows-latest, go-version: '1.27', partition: indexer-1}
+          - {os: windows-latest, go-version: '1.27', partition: indexer-2}
+          - {os: windows-latest, go-version: '1.27', partition: indexer-3}
+          - {os: windows-latest, go-version: '1.27', partition: mcp}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -36,12 +51,14 @@ jobs:
         run: go build -o gortex ./cmd/gortex/
 
       # Derive each platform's compiled census; assign every top-level case once.
-      # Linux and macOS retain race/coverage checks; Windows retains its
-      # normal verbose run, whose per-test timings expose slow fixtures.
+      # Linux keeps race/coverage checks. macOS and Windows run without them;
+      # Windows keeps its verbose run, whose per-test timings expose slow
+      # fixtures.
       - name: Test
         shell: bash
         env:
           TEST_PARTITION: ${{ matrix.partition }}
+          TEST_RACE: ${{ matrix.os == 'ubuntu-latest' }}
           TEST_WINDOWS: ${{ matrix.os == 'windows-latest' }}
         run: |
           if [[ "$TEST_WINDOWS" == true ]]; then
