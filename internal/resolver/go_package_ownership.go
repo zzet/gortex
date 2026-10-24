@@ -37,16 +37,20 @@ type goImportCandidateGate struct {
 	query  GoImportCandidate
 }
 
-func (g goImportCandidateGate) retain(id, repo, file string, node *graph.Node) bool {
+func (g goImportCandidateGate) ownership(id, repo, file string, node *graph.Node) GoPackageOwnershipResult {
 	if g.lookup == nil || file == "" {
-		return true
+		return GoPackageOwnershipUnknown
 	}
 	query := g.query
 	query.CandidateID = id
 	query.CandidateRepoPrefix = repo
 	query.CandidateFilePath = file
 	query.CandidateNode = node
-	return g.lookup(query) != GoPackageOwnershipDifferent
+	return g.lookup(query)
+}
+
+func (g goImportCandidateGate) retain(id, repo, file string, node *graph.Node) bool {
+	return g.ownership(id, repo, file, node) != GoPackageOwnershipDifferent
 }
 
 func (g goImportCandidateGate) retainNode(node *graph.Node) bool {

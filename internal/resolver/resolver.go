@@ -4326,12 +4326,10 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// when the indexes aren't populated (ResolveEdge invoked outside
 	// of ResolveAll/ResolveFile).
 	//
-	// When a package-manager workspace lookup is installed, all
-	// same-repo candidates are collected (not just the first) so a
-	// same-named collision across two workspace members can be broken
-	// in favour of the importer's own workspace. Without the lookup
-	// the first same-repo hit short-circuits the scan, preserving the
-	// pre-feature cost.
+	// Prefer certified Go ownership, then a same-language same-repo folder
+	// matching the import path. With a package-manager workspace lookup,
+	// collect candidates
+	// of the same match quality to break ties in the importer's workspace.
 	collectAll := r.workspaceMembers != nil
 	// A JS/TS bare specifier names a node_modules package or a workspace
 	// member. Node and tsc load such a directory through its entry point, so
@@ -4346,17 +4344,59 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// case the entry-point rule alone cannot: a repo that both depends on
 	// npm `graphql` and contains `src/feature/graphql/index.ts`.
 	externalNpmDep := bareJSTS && declaresExternalNpmDep(r.npmDep, jsTSImportCallerFile(e), importPath)
+	source := r.nodeByID[e.From]
+	if source == nil && r.nodeByID == nil {
+		source = r.graph.GetNode(e.From)
+	}
+	callerLanguage := ""
+	if source != nil {
+		callerLanguage = source.Language
+	}
+	const (
+		fallback = iota
+		folderMatch
+		exactOwnership
+	)
 	var sameRepo, crossRepoFile graph.FileNodeIdentity
 	var sameRepoFound, crossRepoFound bool
+	var sameRepoQuality int
 	var sameRepoAll []graph.FileNodeIdentity
 	consider := func(file graph.FileNodeIdentity) {
-		if !goOwnership.retainFile(file) {
+		ownership := goOwnership.ownership(file.ID, file.RepoPrefix, file.FilePath, nil)
+		if ownership == GoPackageOwnershipDifferent {
 			return
 		}
 		if bareJSTS && !isJSTSDirEntryPoint(file.FilePath) {
 			return
 		}
 		if callerRepo == "" || file.RepoPrefix == callerRepo {
+			dir := filePathDir(file.FilePath)
+			if file.RepoPrefix != "" {
+				if dir == file.RepoPrefix {
+					dir = ""
+				} else {
+					dir = strings.TrimPrefix(dir, file.RepoPrefix+"/")
+				}
+			}
+			quality := fallback
+			// The candidate's language is read only for a folder match, so an
+			// import costs no file-wide language walk.
+			if callerLanguage != "" && dir != "" && (dir == importPath || strings.HasSuffix(importPath, "/"+dir)) {
+				if node := r.cachedGetNode(file.ID); node != nil && node.Language == callerLanguage {
+					quality = folderMatch
+				}
+			}
+			if ownership == GoPackageOwnershipExact {
+				quality = exactOwnership
+			}
+			if quality < sameRepoQuality {
+				return
+			}
+			if quality > sameRepoQuality {
+				sameRepoFound = false
+				sameRepoAll = nil
+				sameRepoQuality = quality
+			}
 			if !sameRepoFound {
 				sameRepo, sameRepoFound = file, true
 			}
@@ -4374,10 +4414,11 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 			crossRepoFile, crossRepoFound = file, true
 		}
 	}
-	// stop reports whether the candidate scan can short-circuit: once a
-	// same-repo hit is found and we are not collecting every candidate
-	// for workspace disambiguation.
-	stop := func() bool { return sameRepoFound && !collectAll }
+	// A folder match cannot stop a scan that may still find certified ownership.
+	stop := func() bool {
+		return !collectAll && (sameRepoQuality == exactOwnership ||
+			(sameRepoQuality == folderMatch && goOwnership.lookup == nil))
+	}
 	if externalNpmDep {
 		// Declared node_modules package — skip the cascade outright.
 	} else if r.dirIndex != nil {
@@ -4387,7 +4428,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 				break
 			}
 		}
-		if !sameRepoFound || collectAll {
+		if !stop() {
 			for _, file := range r.lastDirIndex[lastPathComponent(importPath)] {
 				consider(file)
 				if stop() {
@@ -4921,9 +4962,21 @@ func (r *Resolver) resolveFieldRef(e *graph.Edge, fieldName string, stats *Resol
 	// Pass 3: caller is a method on type T, prefer a same-T field.
 	if callerNode := r.cachedGetNode(e.From); callerNode != nil && callerNode.Kind == graph.KindMethod {
 		callerRecv := nodeReceiverType(callerNode)
-		if callerRecv != "" {
+		packageScope := func(n *graph.Node) string {
+			if scope := scopePkgOf(n); scope != "" {
+				return scope
+			}
+			if n.Language == "go" && n.FilePath != "" {
+				return r.dirFor(n.FilePath)
+			}
+			return ""
+		}
+		callerScope := packageScope(callerNode)
+		if callerRecv != "" && (callerNode.Language != "go" || callerNode.FilePath != "") {
 			for _, c := range candidates {
-				if c.Kind == graph.KindField && nodeReceiverType(c) == callerRecv {
+				if c.Kind == graph.KindField && nodeReceiverType(c) == callerRecv &&
+					c.Language == callerNode.Language && packageScope(c) == callerScope &&
+					(c.Language != "go" || c.FilePath != "") {
 					e.To = c.ID
 					e.Confidence = 0.85
 					stats.Resolved++

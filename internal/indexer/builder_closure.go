@@ -1378,38 +1378,25 @@ func closureBareName(raw string) string {
 // every file the resolver could have bound this import to; a file it could
 // not is payload the generation pays for nothing.
 //
-// The two arms mirror resolveImport's candidate scan (resolver.go:4036-4049)
-// one for one:
+// The two arms mirror resolveImport's candidate scan:
 //
-//   - `dirIndex[importPath]`, the directory the path names outright. When it
-//     yields a candidate the resolver stops there (`stop()`, resolver.go:4032,
-//     applied at :3812) and so does this.
-//   - `lastDirIndex[lastPathComponent(importPath)]`, every directory whose
-//     last component matches. Reached only when the first arm found nothing.
+//   - `dirIndex[importPath]`, the directory the raw path names outright.
+//   - `lastDirIndex[lastPathComponent(importPath)]`, directories sharing its
+//     last component, reached when the first arm found no matching folder or
+//     when workspace disambiguation collects all matching candidates.
 //
-// WHICH candidate the resolver then binds is not something the closure can
-// predict, and that asymmetry is the whole reason this is a placement and not
-// a lookup. The same-repo branch takes the FIRST candidate the scan reaches
-// (resolver.go:4062-4070) with no precision test of any kind, in the arbitrary
-// order buildDirIndexes happened to bucket the corpus in — measured, an
-// `import "example.com/fixture/util"` from a Go file binds to a Python
-// `deep/util/__init__.py` when that is the row that sorted first. So every
-// candidate the resolver considers has to be placed, not the one this code
-// would have picked.
+// The resolver prefers certified Go ownership, then a same-language same-repo
+// directory whose repo-relative path equals the import path or is its
+// slash-delimited suffix. If neither evidence is available, it keeps
+// the first candidate, with workspace locality breaking ties at equal match
+// quality. The closure carries the candidate set rather than guessing the
+// winner, since ownership gates and the post-change graph can change it.
 //
-// In particular `dirMatchesImport` (resolver.go:5980-5996) is NOT available as
-// a narrowing here. It reads like the precision rule this wants — dir must be
-// a genuine suffix of the import path — but the resolver applies it at exactly
-// one place, the CROSS-repo arm of `consider` (resolver.go:4023-4027), and its
-// own contract says why (resolver.go:5980-5983): "Used only to authorise
-// *cross-repo* candidates … Same-repo candidates don't need it".
-// jsts_imports.go:290-293 rejects the same idea by name from the other side,
-// and jsts_imports.go:276-277 states the fact plainly: "the same-repo branch
-// of `consider` accepts the first one with no further check". Every candidate
-// this walk can see is same-repo
-// (buildDirIndexes keeps only owned paths), so applying that gate here drops
-// files the resolver binds — which is the one failure mode a closure may not
-// have.
+// A raw-directory hit may be in another language, lose to certified ownership,
+// or lose the workspace tie-break to a candidate in the fallback arm. The
+// closure has none of that ranking evidence, so it places both arms.
+// `dirMatchesImport` remains a cross-repo gate, not a same-repo rejection rule:
+// narrowing placement to suffix matches would drop the no-match fallback.
 //
 // What the resolver DOES rule out, and this mirrors, is:
 //
@@ -1455,9 +1442,9 @@ func closureBareName(raw string) string {
 // manifest gate (declaresExternalNpmDep, read at resolver.go:4000 and applied
 // at :4033-4034) skips the cascade outright for a specifier the importer's
 // package.json declares a dependency of; the closure carries no manifest
-// lookup. The Go package-ownership gate (goImportCandidateGate.retainFile,
-// go_package_ownership.go:56-58, called first in `consider` at
-// resolver.go:4005-4007) is installed by the live indexer, not by this walk.
+// lookup. The Go package-ownership gate (goImportCandidateGate.ownership,
+// called first in resolveImport's `consider`, which rejects Different and
+// ranks Exact first) is installed by the live indexer, not by this walk.
 // Both residuals admit more than the resolver binds; neither can drop, and each
 // has a differential fixture.
 //
@@ -1710,12 +1697,12 @@ func (w *closureWalk) ownedCandidateFiles(candidates []*graph.Node) []string {
 // cascadeImportedFiles is the dirIndex/lastDirIndex candidate scan itself,
 // keyed exactly as resolveImport keys it (resolver.go:4036-4049): the raw
 // specifier for the exact-directory arm, its last path component for the
-// fallback arm. The first arm short-circuits the second, mirroring `stop()`.
+// fallback arm. Keep both: ownership, language, and workspace ranking can
+// select a fallback-arm candidate even when the raw directory exists.
 func (w *closureWalk) cascadeImportedFiles(importPath string, bare bool) []string {
-	if files := closureJSTSEntryPoints(w.dirIndex[importPath], bare); len(files) > 0 {
-		return files
-	}
-	return closureJSTSEntryPoints(w.lastDirIndex[path.Base(importPath)], bare)
+	return closureUnionPlacements(
+		closureJSTSEntryPoints(w.dirIndex[importPath], bare),
+		closureJSTSEntryPoints(w.lastDirIndex[path.Base(importPath)], bare))
 }
 
 // closureUnionPlacements merges two placements into one sorted, deduplicated
