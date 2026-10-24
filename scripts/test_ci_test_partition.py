@@ -104,7 +104,7 @@ class PartitionTests(unittest.TestCase):
         self.assertIn("TEST_RACE: ${{ matrix.os == 'ubuntu-latest' }}", workflow)
         self.assertIn("os: [ubuntu-latest]\n", workflow)
 
-    def run_dry(self, partition, environ):
+    def run_dry(self, partition, environ, dry_run=True):
         module = "example.org/gortex"
         packages = [module + suffix for suffix in ("/cmd/gortex", "/internal/graph/store_sqlite",
                                                    "/internal/indexer", "/internal/mcp")]
@@ -123,11 +123,13 @@ class PartitionTests(unittest.TestCase):
             with mock.patch.object(planner, "capture", side_effect=capture) as captured, \
                     mock.patch.dict(planner.os.environ, environ, clear=True), \
                     mock.patch.object(planner.sys, "argv", ["partition", "--partition", partition,
-                                                           "--dry-run", "--manifest", str(path)]), \
+                                                           "--manifest", str(path)] + ["--dry-run"] * dry_run), \
                     mock.patch.object(planner.subprocess, "run") as run:
                 planner.main()
-            run.assert_not_called()
-            return json.loads(path.read_text()), captured.call_args_list
+            if dry_run:
+                run.assert_not_called()
+                return json.loads(path.read_text()), captured.call_args_list
+            return json.loads(path.read_text()), run.call_args_list
 
     def test_plain_platforms_run_without_race_or_coverage(self):
         for environ, partition, count in (({"TEST_RACE": "false"}, "indexer-2", 3),
@@ -140,9 +142,19 @@ class PartitionTests(unittest.TestCase):
                     self.assertNotIn("-coverprofile=coverage.out", command)
                     self.assertEqual("-v" in command, "TEST_WINDOWS" in environ)
                 self.assertTrue(all("-race" not in call.args[0] for call in calls))
-        manifest, _ = self.run_dry("remaining", {"TEST_RACE": "false"})
-        self.assertEqual(manifest["selected_packages"], [
-            "example.org/gortex/cmd/gortex", "example.org/gortex/internal/graph/store_sqlite"])
+        for environ, verbose in (({"TEST_RACE": "false"}, []), ({"TEST_WINDOWS": "true"}, ["-v"])):
+            with self.subTest(environ=environ):
+                manifest, _ = self.run_dry("remaining", environ)
+                self.assertEqual(manifest["selected_packages"], [
+                    "example.org/gortex/cmd/gortex", "example.org/gortex/internal/graph/store_sqlite"])
+                # store_sqlite runs alone, after the other packages.
+                self.assertEqual(manifest["commands"], [
+                    ["go", "test"] + verbose + ["-timeout=45m", "example.org/gortex/cmd/gortex"],
+                    ["go", "test"] + verbose + ["-timeout=45m", "example.org/gortex/internal/graph/store_sqlite"]])
+                self.assertEqual(manifest["aggregate_test_execution_budget_seconds"], 2700)
+        manifest, _ = self.run_dry("remaining", {})
+        self.assertEqual(manifest["command"], ["go", "test", "-race", "-timeout=45m", "-coverprofile=coverage.out",
+                                               "example.org/gortex/cmd/gortex"])
         manifest, _ = self.run_dry("mcp", {"TEST_RACE": "false"})
         self.assertEqual(manifest["command"], ["go", "test", "-timeout=45m",
                                                "example.org/gortex/internal/mcp"])
@@ -152,6 +164,38 @@ class PartitionTests(unittest.TestCase):
                 self.assertIn("-race", manifest["command"])
                 self.assertIn("-coverprofile=coverage.out", manifest["command"])
                 self.assertEqual(manifest["shard_count"], 6)
+
+    def test_plain_remaining_groups_share_the_budget_and_go_times_out_first(self):
+        with mock.patch.object(planner.time, "monotonic", side_effect=[100, 100, 700]):
+            manifest, runs = self.run_dry("remaining", {"TEST_RACE": "false"}, dry_run=False)
+        self.assertEqual([call.args[0][-1] for call in runs], [command[-1] for command in manifest["commands"]])
+        self.assertIn("-timeout=2700.000s", runs[0].args[0])
+        self.assertIn("-timeout=2100.000s", runs[1].args[0])
+        self.assertEqual([call.kwargs["timeout"] for call in runs], [3000, 2400])
+        # A single command keeps Go's plain 45m and no process timeout.
+        manifest, runs = self.run_dry("remaining", {}, dry_run=False)
+        self.assertEqual([call.args for call in runs], [(manifest["command"],)])
+        self.assertEqual(runs[0].kwargs, {"check": True})
+
+    def test_package_group_failure_still_runs_later_groups(self):
+        commands = [["go", "test", "-timeout=45m", name] for name in ("A", "B")]
+        failure = subprocess.CalledProcessError(1, commands[0])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "selection.json"
+            with mock.patch.object(planner.time, "monotonic", side_effect=[0, 0, 60]), \
+                    mock.patch.object(planner.subprocess, "run", side_effect=[failure, None]) as run:
+                with self.assertRaises(subprocess.CalledProcessError) as raised:
+                    planner.run_package_groups(commands, {}, path)
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(len(json.loads(path.read_text())["executed_commands"]), 2)
+        # When the budget runs out after a failure, the failure is reported.
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(planner.time, "monotonic", side_effect=[0, 0, 2700]), \
+                mock.patch.object(planner.subprocess, "run", side_effect=[failure]):
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                planner.run_package_groups(commands, {}, Path(directory) / "selection.json")
+            self.assertIs(raised.exception, failure)
 
     def test_partition_and_race_settings_are_checked(self):
         for environ, partition in (({"TEST_RACE": "false"}, "store-0"),

@@ -20,6 +20,7 @@ PLAIN_FAMILIES = ("indexer", "mcp")
 NAME_BUNDLE = 32
 WINDOWS_COMMAND_BUDGET = 30000
 TEST_EXECUTION_BUDGET_SECONDS = 45 * 60
+BUILD_GRACE_SECONDS = 5 * 60
 LARGE_PACKAGES = {
     "store": "/internal/graph/store_sqlite",
     "indexer": "/internal/indexer",
@@ -176,6 +177,36 @@ def run_commands(commands, manifest, manifest_path):
         write_manifest(manifest_path, manifest)
 
 
+def run_package_groups(commands, manifest, manifest_path):
+    # Package groups share one 45m test budget, so the job stays inside its 60m
+    # limit. Go's own -timeout gets what is left, so a hang still prints Go's
+    # goroutine dump; the process timeout adds time for the build. A failing
+    # group does not skip the next one.
+    if len(commands) == 1:
+        run_commands(commands, manifest, manifest_path)
+        return
+    deadline = time.monotonic() + TEST_EXECUTION_BUDGET_SECONDS
+    manifest["executed_commands"] = []
+    failure = None
+    try:
+        for command in commands:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise failure or ValueError("aggregate test execution budget exhausted")
+            actual = list(command)
+            actual[actual.index("-timeout=45m")] = f"-timeout={remaining:.3f}s"
+            manifest["executed_commands"].append({"command": actual, "utf16_units": guard_command(actual)})
+            write_manifest(manifest_path, manifest)
+            try:
+                subprocess.run(actual, check=True, timeout=remaining + BUILD_GRACE_SECONDS)
+            except subprocess.CalledProcessError as error:
+                failure = failure or error
+    finally:
+        write_manifest(manifest_path, manifest)
+    if failure:
+        raise failure
+
+
 def guard_command(command):
     # Reserve room for Go's own test-binary flags and path below CreateProcess's
     # 32,767 UTF-16 code-unit limit on Windows. Other platforms do not use
@@ -249,7 +280,13 @@ def main():
         print(f"{selected[0]}: {len(names)} compiled tests/examples/fuzz seeds; "
               f"shards={[len(shard) for shard in assignments]}; selected={index}", flush=True)
     else:
-        commands = [command + selected]
+        # On macOS and Windows store_sqlite runs inside "remaining". Its tests
+        # bound lock and wait times, so it runs alone after the other packages
+        # instead of beside them.
+        store = module + LARGE_PACKAGES["store"]
+        groups = ([package for package in selected if package != store],
+                  [package for package in selected if package == store])
+        commands = [command + group for group in groups if group]
     units = [guard_command(command) for command in commands]
     manifest["commands"] = commands
     manifest["commands_utf16_units"] = units
@@ -261,7 +298,10 @@ def main():
     write_manifest(args.manifest, manifest)
     print(f"Running {len(selected)} packages in {args.partition}; command units={units}", flush=True)
     if not args.dry_run:
-        run_commands(commands, manifest, args.manifest)
+        if family in shards:
+            run_commands(commands, manifest, args.manifest)
+        else:
+            run_package_groups(commands, manifest, args.manifest)
 
 
 if __name__ == "__main__":
