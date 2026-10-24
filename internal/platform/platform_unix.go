@@ -8,6 +8,7 @@
 package platform
 
 import (
+	"errors"
 	"os"
 	"syscall"
 )
@@ -28,6 +29,21 @@ func ProcessAlive(pid int) bool {
 		return false
 	}
 	return syscall.Kill(pid, 0) == nil
+}
+
+// ProcessExists reports whether a process with the given PID exists,
+// including one owned by another user that the caller may not signal
+// (kill(pid, 0) fails with EPERM). Use it where the PID belongs to a
+// different process that may run under another UID, such as an MCP
+// client of a shared daemon. A PID the caller recorded for itself (e.g.
+// a PID file) should keep using ProcessAlive: if it can no longer be
+// signalled, the PID has been reused.
+func ProcessExists(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // TerminateProcess asks the process to exit gracefully (SIGTERM).

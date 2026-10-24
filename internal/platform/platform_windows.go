@@ -39,6 +39,13 @@ func ProcessAlive(pid int) bool {
 	return code == stillActive
 }
 
+// ProcessExists reports whether a process with the given PID exists.
+// On Windows it is the same as ProcessAlive; see the Unix version for why
+// the two differ there.
+func ProcessExists(pid int) bool {
+	return ProcessAlive(pid)
+}
+
 // TerminateProcess asks the process to exit. Windows offers no graceful
 // signal a console-less detached process can receive, so this is a hard
 // TerminateProcess — the same as KillProcess. The daemon's preferred

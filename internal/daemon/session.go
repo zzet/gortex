@@ -547,7 +547,7 @@ func (r *SessionRegistry) Count() int {
 // with no recorded PID (0 — detached/HTTP transports, or a client that reported
 // none) are left untouched, since liveness can't be judged from a PID we don't
 // have. Returns the removed sessions so the caller can log / adjust metrics.
-// isAlive is injected (platform.ProcessAlive in production) so the sweep is
+// isAlive is injected (platform.ProcessExists in production) so the sweep is
 // testable without spawning real processes.
 func (r *SessionRegistry) SweepDead(isAlive func(int) bool) []*Session {
 	r.mu.Lock()

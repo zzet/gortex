@@ -403,7 +403,7 @@ var deadPeerSweepInterval = 30 * time.Second
 
 // runMaintenance is the daemon's background hygiene loop: every
 // deadPeerSweepInterval it sweeps sessions whose originating client process has
-// died (platform.ProcessAlive), and — when GORTEX_DAEMON_IDLE_TIMEOUT is set —
+// died (platform.ProcessExists, so a client running as another user counts), and — when GORTEX_DAEMON_IDLE_TIMEOUT is set —
 // it shuts the daemon down after that long with no live sessions. Exits on the
 // shutdown signal.
 func (s *Server) runMaintenance() {
@@ -424,7 +424,7 @@ func (s *Server) runMaintenance() {
 		case <-s.shutdown:
 			return
 		case <-t.C:
-			for _, sd := range s.sessions.SweepDead(platform.ProcessAlive) {
+			for _, sd := range s.sessions.SweepDead(platform.ProcessExists) {
 				if hook, ok := s.MCPDispatcher.(SessionEndedHook); ok && hook != nil {
 					hook.SessionEnded(sd)
 				}
