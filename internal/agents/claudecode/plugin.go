@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // PluginBundleSpec describes one generation of the marketplace
@@ -342,8 +343,12 @@ func EmitPluginBundle(spec PluginBundleSpec) ([]string, error) {
 	// 7. agents/<name> — sub-agent definitions, sorted for
 	// deterministic output. Mirrors the on-disk path Claude Code
 	// expects under .claude/agents/ when the plugin is installed.
+	// The MCP tool names are rewritten to the plugin-scoped spelling:
+	// under a plugin-only install Claude Code names the server's tools
+	// mcp__plugin_<plugin>_<server>__<tool>, so a sub-agent restricted to
+	// mcp__gortex__* names can call nothing at all.
 	for _, name := range sortedKeys(SubAgents) {
-		body := SubAgents[name]
+		body := pluginSubAgentBody(SubAgents[name])
 		if err := write(filepath.Join("agents", name), []byte(body), 0o644); err != nil {
 			return nil, err
 		}
@@ -374,6 +379,26 @@ func marshalJSONStable(v any) ([]byte, error) {
 		return nil, err
 	}
 	return append(out, '\n'), nil
+}
+
+// userLevelMCPToolPrefix is how Claude Code names Gortex's MCP tools
+// when the server is registered by `gortex install` at user level.
+// pluginMCPToolPrefix is how it names them when the same server ships
+// inside the plugin bundle; Claude Code inserts the plugin and server
+// names into the tool namespace.
+const (
+	userLevelMCPToolPrefix = "mcp__gortex__"
+	pluginMCPToolPrefix    = "mcp__plugin_gortex_gortex__"
+)
+
+// pluginSubAgentBody returns a sub-agent definition as it must be
+// written into the plugin bundle. The user-level bodies name their
+// tools mcp__gortex__*, which do not exist under a plugin-only install;
+// rewriting them here keeps ~/.claude/agents/ (installed by
+// `gortex install`) on the user-level spelling while the bundle names
+// only tools the plugin actually exposes.
+func pluginSubAgentBody(body string) string {
+	return strings.ReplaceAll(body, userLevelMCPToolPrefix, pluginMCPToolPrefix)
 }
 
 // sortedKeys returns the keys of m in lexicographic order. Used so

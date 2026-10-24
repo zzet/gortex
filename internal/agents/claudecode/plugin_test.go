@@ -413,9 +413,36 @@ func TestEmitPluginBundle_SubAgentBodiesMatchSource(t *testing.T) {
 			t.Errorf("read sub-agent %s: %v", name, err)
 			continue
 		}
-		if string(got) != want {
-			t.Errorf("sub-agent %s body drift: bytes do not match SubAgents[%q]", name, name)
+		if string(got) != pluginSubAgentBody(want) {
+			t.Errorf("sub-agent %s body drift: bytes do not match pluginSubAgentBody(SubAgents[%q])", name, name)
 		}
+		// A plugin-only install exposes the server's tools under the
+		// plugin-scoped namespace; the user-level names resolve to
+		// nothing there, so the bundle must not mention them.
+		if strings.Contains(string(got), userLevelMCPToolPrefix) {
+			t.Errorf("sub-agent %s still names user-level %s* tools", name, userLevelMCPToolPrefix)
+		}
+		if !strings.Contains(string(got), pluginMCPToolPrefix) {
+			t.Errorf("sub-agent %s names no %s* tools", name, pluginMCPToolPrefix)
+		}
+	}
+}
+
+func TestPluginSubAgentBody_RewritesToolNames(t *testing.T) {
+	body := "---\nname: gortex-search\ntools: mcp__gortex__explore, mcp__gortex__read\n---\n\nCall mcp__gortex__explore.\n"
+
+	got := pluginSubAgentBody(body)
+
+	if strings.Contains(got, userLevelMCPToolPrefix) {
+		t.Fatalf("rewritten body still names %s* tools:\n%s", userLevelMCPToolPrefix, got)
+	}
+	want := "---\nname: gortex-search\ntools: mcp__plugin_gortex_gortex__explore, mcp__plugin_gortex_gortex__read\n---\n\nCall mcp__plugin_gortex_gortex__explore.\n"
+	if got != want {
+		t.Fatalf("rewrite mismatch:\ngot:  %q\nwant: %q", got, want)
+	}
+	// The user-level definition must stay untouched for `gortex install`.
+	if !strings.Contains(SubAgents["gortex-search.md"], userLevelMCPToolPrefix) {
+		t.Error("the user-level sub-agent no longer names user-level tools; ~/.claude/agents/ would break")
 	}
 }
 
