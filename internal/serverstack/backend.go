@@ -55,6 +55,10 @@ func openBackendWithUpgradeOption(name, path string, logger *zap.Logger, allowRe
 	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "memory", "mem", "in-memory":
+		// Unreachable while checkBackend keeps the name gated (review
+		// zzet/gortex#901 R2): the dispatch stays here so the #902 wiring is
+		// a one-line gate removal, and so the memory store keeps exactly one
+		// production construction path.
 		return openMemoryBackend(resolved, logger, observers...)
 	}
 	if upgradeOption == nil {
@@ -71,13 +75,19 @@ func checkBackend(name string) error {
 	case "", "sqlite", "sqlite3":
 		return nil
 	case "memory", "mem", "in-memory":
-		// Re-introduced as the Tier-3 memory-resident backend
-		// (odd/tasks/tier3-memory-store.md, issue davalillo/gortex#19):
-		// graph state in RAM, mutations journaled, sqlite snapshot on close.
-		// NOT the pre-18ca30f9 ephemeral scratch store — this one is durable
-		// through the journal and shares the standard store path under the
-		// same cross-process flock.
-		return nil
+		// Tier-3 memory-resident backend (odd/tasks/tier3-memory-store.md,
+		// issue davalillo/gortex#19): graph state in RAM, journaled
+		// mutations, sqlite snapshot on close. The store layer is complete,
+		// but the daemon does not wire it yet (#902): contract analysis,
+		// checkout-lifecycle views, the dedicated base runtime, edit deltas
+		// and shadow-drain retirement are SQLite-only, and daemon startup
+		// aborts on the first of them ("contract analysis: SQLite store
+		// required", daemon_contract_analysis.go). Offering the name today
+		// selects a backend that cannot run the daemon at all, so the name
+		// stays unselectable until the wiring lands (review zzet/gortex#901
+		// R2). The store itself remains usable by tests and by #902 through
+		// openMemoryBackend.
+		return fmt.Errorf("backend %q is not selectable yet: the memory backend (also spelled mem or in-memory) is wired into the daemon in zzet/gortex#902; use --backend sqlite", name)
 	default:
 		return fmt.Errorf("unknown backend %q (expected: sqlite or memory)", name)
 	}
