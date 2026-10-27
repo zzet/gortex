@@ -11,6 +11,7 @@
 package serverstack
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -61,10 +62,48 @@ func openBackendWithUpgradeOption(name, path string, logger *zap.Logger, allowRe
 		// production construction path.
 		return openMemoryBackend(resolved, logger, observers...)
 	}
+	var store graph.Store
+	var closeFn func() error
 	if upgradeOption == nil {
-		return openSqliteBackend(resolved, allowRebuild, observers...)
+		store, closeFn, err = openSqliteBackend(resolved, allowRebuild, observers...)
+	} else {
+		store, closeFn, err = openSqliteBackendWithUpgradeOption(resolved, allowRebuild, upgradeOption, observers...)
 	}
-	return openSqliteBackendWithUpgradeOption(resolved, allowRebuild, upgradeOption, observers...)
+	if err != nil {
+		return nil, nil, err
+	}
+	if logger != nil {
+		if st, ok := store.(*store_sqlite.Store); ok && memoryPublishedStore(st) {
+			// The file was last written by the memory backend: nodes and
+			// edges are there, but none of the SQLite-only state #806
+			// reads (view generations, files, repo_index_state, FTS
+			// content, analysis/contract/checkout state). The reconciler
+			// sees no prior index and rebuilds; say so instead of letting
+			// the operator wonder why a warm store re-indexes from zero
+			// (review zzet/gortex#901, minor point 3).
+			logger.Warn("store was published by the memory backend: it carries no SQLite generation state, so this boot performs a full reindex (FTS, analysis, contract and checkout state are rebuilt)",
+				zap.String("path", resolved),
+				zap.Int("nodes", st.NodeCount()))
+		}
+	}
+	return store, closeFn, nil
+}
+
+// memoryPublishedStore reports whether a sqlite store carries data but no
+// view-generation catalog — the signature of a file whose last writer was the
+// memory backend. A fresh sqlite store is empty (NodeCount 0) and a real
+// sqlite store has a published generation, so neither trips this.
+func memoryPublishedStore(st *store_sqlite.Store) bool {
+	if st == nil || st.NodeCount() == 0 {
+		return false
+	}
+	generation := st.ViewGeneration()
+	if generation > 0 {
+		if _, found, err := st.Catalog().GetViewGeneration(context.Background(), generation); err == nil && found {
+			return false
+		}
+	}
+	return true
 }
 
 // checkBackend validates a requested backend name. It is split out of

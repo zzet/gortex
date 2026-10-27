@@ -79,8 +79,8 @@ func (m *MemoryStore) GetEdgeCandidates(endpoints []EdgeEndpoint, sites []EdgeSi
 	return m.graph.GetEdgeCandidates(endpoints, sites)
 }
 
-func (m *MemoryStore) DistinctExternalTargets(kinds []EdgeKind) []string {
-	return m.graph.DistinctExternalTargets(kinds)
+func (m *MemoryStore) DistinctExternalTargets(kinds []EdgeKind, fileSuffix string) []string {
+	return m.graph.DistinctExternalTargets(kinds, fileSuffix)
 }
 
 func (m *MemoryStore) GetRepoEdges(repoPrefix string) []*Edge {

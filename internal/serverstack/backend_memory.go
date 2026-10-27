@@ -24,12 +24,21 @@ var _ graph.FTSEngine = (*store_sqlite.Store)(nil)
 // in a graph.Graph, every mutation is appended to a JSONL journal, and a
 // sqlite snapshot dumped through the bulk loader is the durability boundary.
 //
-// The snapshot path is the SAME store file the sqlite backend uses. That is
-// deliberate: both engines are serialized by the same cross-process store
-// flock, a memory-mode shutdown leaves the file in exactly the schema a
-// sqlite-mode boot expects, and vice versa a memory-mode cold start can load
-// whatever a sqlite session last persisted. Switching engines is then just a
-// restart with a different --backend.
+// The snapshot path is the SAME store file the sqlite backend uses. Both
+// engines are serialized by the same cross-process store flock, and a
+// memory-mode shutdown leaves a valid sqlite schema behind, so a later
+// sqlite-mode boot can open the file. The continuity is NOT symmetric:
+//
+//   - sqlite -> memory is warm: the memory backend cold-loads the snapshot
+//     (nodes, edges and the file-mtime sidecar) and replays the journal on
+//     top, so a restart skips re-indexing.
+//   - memory -> sqlite is a FULL REINDEX: the dump writes nodes, edges and
+//     the mtime sidecar, but none of the sqlite-mode state #806 reads
+//     (view_generations, files, repo_index_state, FTS content, analysis,
+//     contract and checkout state). The reconciler sees no prior index
+//     (storedCensusCounts reports found=false) and rebuilds everything;
+//     openSqliteBackend logs that provenance so the switch is never silent
+//     (review zzet/gortex#901, minor point 3).
 
 // memoryJournalPath sits beside the snapshot: <snapshot>.journal.
 func memoryJournalPath(snapshotPath string) string {
@@ -261,6 +270,12 @@ func snapshotMemoryStore(store *graph.MemoryStore, snapshotPath string) error {
 	defer func() {
 		if !published {
 			_ = os.Remove(tmp)
+			// A failed dump can leave the throwaway-sidecar files too
+			// (issue davalillo/gortex#25 A4): the next successful dump
+			// overwrites tmp anyway, but between the two it is dead weight
+			// beside the live snapshot.
+			_ = os.Remove(tmp + "-wal")
+			_ = os.Remove(tmp + "-shm")
 		}
 	}()
 	snap, closeSnap, err := openSqliteBackend(tmp, true)
@@ -295,6 +310,21 @@ func snapshotMemoryStore(store *graph.MemoryStore, snapshotPath string) error {
 		}
 	}
 	closeSnap()
+	// The snapshot path is shared with the sqlite backend, so a stale
+	// -wal/-shm beside the OLD snapshot would be replayed against this
+	// brand-new file on the next open: SQLite validates a WAL against its own
+	// header, not against the database it sits beside, so frames from another
+	// database are not distinguishable. The caller holds the cross-process
+	// store flock, so nothing live owns those files — they belong to a
+	// already-dead sqlite session whose un-checkpointed commits this snapshot
+	// supersedes. Remove them BEFORE the rename: a crash between the two then
+	// leaves the old database without its WAL (a session that already
+	// crashed), never a new database paired with a foreign WAL.
+	for _, stale := range []string{snapshotPath + "-wal", snapshotPath + "-shm"} {
+		if err := os.Remove(stale); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("memory backend: clear stale sqlite sidecar %q: %w", stale, err)
+		}
+	}
 	if err := os.Rename(tmp, snapshotPath); err != nil {
 		return fmt.Errorf("memory backend: publish snapshot: %w", err)
 	}
