@@ -152,3 +152,111 @@ func TestMemoryStoreJournalsPathlessNodeEviction(t *testing.T) {
 		t.Fatalf("edges after replay: want 0, got %d", got)
 	}
 }
+
+// TestMemoryStoreJournalsExactEdgeRemoval pins the exact-identity capability:
+// two sibling call sites share from/to/kind but differ by line, and only the
+// requested identity may be removed. RemoveEdgesExact's documented coarse
+// fallback (one RemoveEdge per from/to/kind) would drop a sibling here, so the
+// memory backend must expose the set-oriented capability, journaled.
+func TestMemoryStoreJournalsExactEdgeRemoval(t *testing.T) {
+	store, path := journalTestStore(t)
+	store.AddBatch([]*Node{
+		capabilityTestNode("a", "a.go"),
+		capabilityTestNode("b", "b.go"),
+	}, []*Edge{
+		{From: "a", To: "b", Kind: EdgeCalls, FilePath: "a.go", Line: 10},
+		{From: "a", To: "b", Kind: EdgeCalls, FilePath: "a.go", Line: 20},
+	})
+	if got := store.EdgeCount(); got != 2 {
+		t.Fatalf("seeded edges: want 2 siblings, got %d", got)
+	}
+
+	remover, ok := any(store).(ExactEdgeBatchRemover)
+	if !ok {
+		t.Fatalf("MemoryStore must expose ExactEdgeBatchRemover: the coarse RemoveEdge fallback would drop sibling call sites (PR #901 review R1)")
+	}
+	before := store.JournalBytes()
+	removed := remover.RemoveEdgesExact([]*Edge{{From: "a", To: "b", Kind: EdgeCalls, FilePath: "a.go", Line: 10}})
+	if removed != 1 {
+		t.Fatalf("RemoveEdgesExact removed %d edges, want exactly 1", removed)
+	}
+	if grown := store.JournalBytes(); grown <= before {
+		t.Fatalf("exact edge removal was not journaled: bytes %d -> %d", before, grown)
+	}
+	if err := store.CloseJournal(); err != nil {
+		t.Fatalf("CloseJournal: %v", err)
+	}
+
+	replayed := NewMemoryStore()
+	if _, err := replayed.ReplayJournal(path); err != nil {
+		t.Fatalf("ReplayJournal: %v", err)
+	}
+	out := replayed.GetOutEdges("a")
+	if len(out) != 1 {
+		t.Fatalf("sibling edges after replay: want 1, got %d", len(out))
+	}
+	if out[0].Line != 20 {
+		t.Fatalf("replay removed the wrong sibling: surviving line %d, want 20", out[0].Line)
+	}
+}
+
+// TestMemoryStoreJournalsDerivedContractReplacement pins the composite
+// frontier write: the edge removal, the added nodes/edges and the touched
+// topic set must replay as one record, exactly as the live call applied them.
+func TestMemoryStoreJournalsDerivedContractReplacement(t *testing.T) {
+	store, path := journalTestStore(t)
+	store.AddBatch([]*Node{
+		capabilityTestNode("a", "a.go"),
+		capabilityTestNode("b", "b.go"),
+	}, []*Edge{
+		{From: "a", To: "b", Kind: EdgeCalls, FilePath: "a.go", Line: 10},
+		{From: "a", To: "b", Kind: EdgeCalls, FilePath: "a.go", Line: 20},
+	})
+
+	replacer, ok := any(store).(DerivedContractReplacer)
+	if !ok {
+		t.Fatalf("MemoryStore must expose DerivedContractReplacer: it is the resolver's live frontier path, not an optional enrichment (PR #901 review R1)")
+	}
+	topic := &Node{ID: "topic::t1", Kind: KindTopic, Name: "t1", FilePath: "", Language: "go"}
+	before := store.JournalBytes()
+	result, err := replacer.ReplaceDerivedContracts(DerivedContractReplacement{
+		RemoveEdges: []*Edge{{From: "a", To: "b", Kind: EdgeCalls, FilePath: "a.go", Line: 10}},
+		Nodes:       []*Node{topic},
+		Edges:       []*Edge{{From: "a", To: "topic::t1", Kind: EdgeProducesTopic, FilePath: "a.go"}},
+	})
+	if err != nil {
+		t.Fatalf("ReplaceDerivedContracts: %v", err)
+	}
+	if result.EdgesRemoved != 1 || result.NodesChanged != 1 || result.EdgesAdded != 1 {
+		t.Fatalf("result = %+v, want 1 edge removed / 1 node changed / 1 edge added", result)
+	}
+	if grown := store.JournalBytes(); grown <= before {
+		t.Fatalf("derived contract replacement was not journaled: bytes %d -> %d", before, grown)
+	}
+	if err := store.CloseJournal(); err != nil {
+		t.Fatalf("CloseJournal: %v", err)
+	}
+
+	replayed := NewMemoryStore()
+	if _, err := replayed.ReplayJournal(path); err != nil {
+		t.Fatalf("ReplayJournal: %v", err)
+	}
+	if replayed.GetNode("topic::t1") == nil {
+		t.Fatal("added topic node lost in replay")
+	}
+	if got := replayed.EdgeCount(); got != 2 {
+		t.Fatalf("edges after replay: want 2 (line-20 calls + produces-topic), got %d", got)
+	}
+	var sawCalls, sawProduces bool
+	for _, e := range replayed.GetOutEdges("a") {
+		if e.Kind == EdgeCalls && e.Line == 20 {
+			sawCalls = true
+		}
+		if e.Kind == EdgeProducesTopic && e.To == "topic::t1" {
+			sawProduces = true
+		}
+	}
+	if !sawCalls || !sawProduces {
+		t.Fatalf("replayed frontier wrong: calls@20=%v produces_topic=%v", sawCalls, sawProduces)
+	}
+}

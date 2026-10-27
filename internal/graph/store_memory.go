@@ -200,6 +200,11 @@ type journalOp struct {
 	NodeIDs []string   `json:"node_ids,omitempty"`
 	Kinds   []EdgeKind `json:"kinds,omitempty"`
 	Sources []string   `json:"sources,omitempty"`
+	// Derived-contract replacement payload (PR #901 review R1): the composite
+	// frontier travels as one record so replay applies it exactly once.
+	RemoveEdges []journalEdge `json:"remove_edges,omitempty"`
+	BridgeIDs   []string      `json:"bridge_ids,omitempty"`
+	TopicIDs    []string      `json:"topic_ids,omitempty"`
 }
 
 // countWriter tracks journal bytes without an extra stat per record.
@@ -692,9 +697,9 @@ func (m *MemoryStore) applyOp(op *journalOp) bool {
 		m.graph.EvictRepo(op.RepoPrefix)
 	case "evict_files", "evict_files_with_node_ids", "evict_edges_by_kinds",
 		"evict_pathless_nodes", "evict_contract_nodes", "evict_config_nodes",
-		"evict_edges_from_sources":
-		// Set-oriented capability evictions (PR #901 review R1) replay
-		// through the same *Graph primitives the live call used.
+		"evict_edges_from_sources", "remove_edges_exact", "replace_derived_contracts":
+		// Set-oriented capability writes (PR #901 review R1) replay through
+		// the same *Graph primitives the live call used.
 		m.applyEvictionOp(op)
 	case "journal_open":
 		// A mid-file generation header (append-open onto existing content
