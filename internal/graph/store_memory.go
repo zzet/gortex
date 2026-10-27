@@ -23,11 +23,14 @@ import (
 // the sqlite read-modify-write amplification (~10^6x for a single small edit)
 // into one sequential append per mutation (~1x).
 //
-// Reads and everything else are inherited from the embedded *Graph, which
-// satisfies the full Store contract (compile assertion in store.go). Only the
-// interface's write methods are overridden to journal first, then delegate.
+// The backing *Graph is NOT embedded: composition keeps every unjournaled
+// write method off the MemoryStore method set, so a capability assertion
+// against the live store can only reach a journaled implementation
+// (PR #901 review R1). Reads are forwarded explicitly in
+// store_memory_reads.go; every write the memory backend exposes lives in this
+// file or store_memory_capabilities.go and journals before it applies.
 type MemoryStore struct {
-	*Graph
+	graph *Graph
 
 	// applyMu serializes journal-append + delegate-apply inside one critical
 	// section per mutation (issue davalillo/gortex#20): without it, two
@@ -84,7 +87,7 @@ var _ Store = (*MemoryStore)(nil)
 // NewMemoryStore builds an empty memory-resident store. Call OpenJournal to
 // attach durability and ReplayJournal to restore a prior state.
 func NewMemoryStore(opts ...MemoryOption) *MemoryStore {
-	m := &MemoryStore{Graph: New()}
+	m := &MemoryStore{graph: New()}
 	for _, opt := range opts {
 		opt(m)
 	}
@@ -101,7 +104,7 @@ func NewMemoryStore(opts ...MemoryOption) *MemoryStore {
 func (m *MemoryStore) ColdLoadBatch(nodes []*Node, edges []*Edge) {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
-	m.Graph.AddBatch(nodes, edges)
+	m.graph.AddBatch(nodes, edges)
 }
 
 // journalNode is Node with the JSON-excluded Meta field (marked json:"-" on
@@ -188,6 +191,15 @@ type journalOp struct {
 	Kind       EdgeKind            `json:"kind,omitempty"`
 	Path       string              `json:"path,omitempty"`
 	RepoPrefix string              `json:"repo_prefix,omitempty"`
+	// Batch eviction payloads (PR #901 review R1): the journal records the
+	// set-oriented capability calls the memory backend exposes, so replay
+	// reproduces every file, edge-kind, pathless, contract, config and scoped
+	// eviction the live store applied.
+	Paths   []string   `json:"paths,omitempty"`
+	IDs     []string   `json:"ids,omitempty"`
+	NodeIDs []string   `json:"node_ids,omitempty"`
+	Kinds   []EdgeKind `json:"kinds,omitempty"`
+	Sources []string   `json:"sources,omitempty"`
 }
 
 // countWriter tracks journal bytes without an extra stat per record.
@@ -362,12 +374,12 @@ func (m *MemoryStore) record(op *journalOp) {
 
 // --- Journalled write overrides --------------------------------------------
 //
-// Every Store write method journals first, then delegates to the embedded
-// *Graph. Reads are not overridden.
+// Every Store write method journals first, then delegates to the backing
+// *Graph. Reads are forwarded in store_memory_reads.go.
 
 func (m *MemoryStore) AddNode(n *Node) {
 	m.journaledEffective(&journalOp{Op: "add_node", Node: journalNodeOf(n)},
-		func() { m.Graph.AddNode(n) },
+		func() { m.graph.AddNode(n) },
 		func() bool { return nodeInert(m.existingNode(n.ID), n) })
 }
 
@@ -410,12 +422,12 @@ func (m *MemoryStore) AddBatch(nodes []*Node, edges []*Edge) {
 			m.record(&journalOp{Op: "add_batch_edges", Edges: chunk})
 		}
 	}
-	m.Graph.AddBatch(nodes, edges)
+	m.graph.AddBatch(nodes, edges)
 }
 
 func (m *MemoryStore) AddEdge(e *Edge) {
 	m.journaledEffective(&journalOp{Op: "add_edge", Edge: journalEdgeOf(e)},
-		func() { m.Graph.AddEdge(e) },
+		func() { m.graph.AddEdge(e) },
 		func() bool { return edgeInert(m.existingEdge(e), e) })
 }
 
@@ -423,7 +435,7 @@ func (m *MemoryStore) SetEdgeProvenance(e *Edge, newOrigin string) bool {
 	var changed bool
 	m.journaledEffective(
 		&journalOp{Op: "set_edge_provenance", Edge: journalEdgeOf(e), NewOrigin: newOrigin},
-		func() { changed = m.Graph.SetEdgeProvenance(e, newOrigin) },
+		func() { changed = m.graph.SetEdgeProvenance(e, newOrigin) },
 		func() bool {
 			// SetEdgeProvenance only rewrites the existing edge's Origin;
 			// a missing edge or an unchanged origin cannot change state.
@@ -435,7 +447,7 @@ func (m *MemoryStore) SetEdgeProvenance(e *Edge, newOrigin string) bool {
 
 func (m *MemoryStore) ReindexEdge(e *Edge, oldTo string) {
 	m.journaled(&journalOp{Op: "reindex_edge", Edge: journalEdgeOf(e), OldTo: oldTo},
-		func() { m.Graph.ReindexEdge(e, oldTo) })
+		func() { m.graph.ReindexEdge(e, oldTo) })
 }
 
 func (m *MemoryStore) ReindexEdges(batch []EdgeReindex) {
@@ -451,7 +463,7 @@ func (m *MemoryStore) ReindexEdges(batch []EdgeReindex) {
 			OldLine:         r.OldLine,
 		}
 	}
-	m.journaled(&journalOp{Op: "reindex_edges", Reindexes: jr}, func() { m.Graph.ReindexEdges(batch) })
+	m.journaled(&journalOp{Op: "reindex_edges", Reindexes: jr}, func() { m.graph.ReindexEdges(batch) })
 }
 
 func (m *MemoryStore) SetEdgeProvenanceBatch(batch []EdgeProvenanceUpdate) (changed int) {
@@ -473,7 +485,7 @@ func (m *MemoryStore) SetEdgeProvenanceBatch(batch []EdgeProvenanceUpdate) (chan
 	if len(jp) > 0 {
 		m.record(&journalOp{Op: "set_edge_provenance_batch", Provenance: jp})
 	}
-	changed = m.Graph.SetEdgeProvenanceBatch(batch)
+	changed = m.graph.SetEdgeProvenanceBatch(batch)
 	return changed
 }
 
@@ -481,7 +493,7 @@ func (m *MemoryStore) RemoveEdge(from, to string, kind EdgeKind) bool {
 	var removed bool
 	m.journaledEffective(
 		&journalOp{Op: "remove_edge", From: from, To: to, Kind: kind},
-		func() { removed = m.Graph.RemoveEdge(from, to, kind) },
+		func() { removed = m.graph.RemoveEdge(from, to, kind) },
 		func() bool {
 			// Mirror Graph.RemoveEdge's own match (To == to && Kind == kind,
 			// first encounter in the out-bucket): nothing matching means the
@@ -498,14 +510,14 @@ func (m *MemoryStore) RemoveEdge(from, to string, kind EdgeKind) bool {
 
 func (m *MemoryStore) EvictFile(filePath string) (nodesRemoved, edgesRemoved int) {
 	m.journaled(&journalOp{Op: "evict_file", Path: filePath},
-		func() { nodesRemoved, edgesRemoved = m.Graph.EvictFile(filePath) })
+		func() { nodesRemoved, edgesRemoved = m.graph.EvictFile(filePath) })
 	return nodesRemoved, edgesRemoved
 }
 
 func (m *MemoryStore) EvictRepo(repoPrefix string) (nodesRemoved, edgesRemoved int) {
 	m.journaled(&journalOp{Op: "evict_repo", RepoPrefix: repoPrefix},
 		func() {
-			nodesRemoved, edgesRemoved = m.Graph.EvictRepo(repoPrefix)
+			nodesRemoved, edgesRemoved = m.graph.EvictRepo(repoPrefix)
 			// The sidecar rides the repo, like the sqlite backend's rows
 			// (davalillo/gortex#26). Not journaled: the snapshot dump copies
 			// whatever is live at close time, so clearing here keeps the
@@ -622,7 +634,7 @@ func (m *MemoryStore) applyOp(op *journalOp) bool {
 	switch op.Op {
 	case "add_node":
 		if n := op.Node.toNode(); n != nil {
-			m.Graph.AddNode(n)
+			m.graph.AddNode(n)
 		}
 	case "add_batch_nodes":
 		nodes := make([]*Node, 0, len(op.Nodes))
@@ -631,7 +643,7 @@ func (m *MemoryStore) applyOp(op *journalOp) bool {
 				nodes = append(nodes, n)
 			}
 		}
-		m.Graph.AddBatch(nodes, nil)
+		m.graph.AddBatch(nodes, nil)
 	case "add_batch_edges":
 		edges := make([]*Edge, 0, len(op.Edges))
 		for i := range op.Edges {
@@ -639,18 +651,18 @@ func (m *MemoryStore) applyOp(op *journalOp) bool {
 				edges = append(edges, e)
 			}
 		}
-		m.Graph.AddBatch(nil, edges)
+		m.graph.AddBatch(nil, edges)
 	case "add_edge":
 		if e := op.Edge.toEdge(); e != nil {
-			m.Graph.AddEdge(e)
+			m.graph.AddEdge(e)
 		}
 	case "set_edge_provenance":
 		if e := op.Edge.toEdge(); e != nil {
-			m.Graph.SetEdgeProvenance(e, op.NewOrigin)
+			m.graph.SetEdgeProvenance(e, op.NewOrigin)
 		}
 	case "reindex_edge":
 		if e := op.Edge.toEdge(); e != nil {
-			m.Graph.ReindexEdge(e, op.OldTo)
+			m.graph.ReindexEdge(e, op.OldTo)
 		}
 	case "reindex_edges":
 		batch := make([]EdgeReindex, len(op.Reindexes))
@@ -665,19 +677,25 @@ func (m *MemoryStore) applyOp(op *journalOp) bool {
 				OldLine:         r.OldLine,
 			}
 		}
-		m.Graph.ReindexEdges(batch)
+		m.graph.ReindexEdges(batch)
 	case "set_edge_provenance_batch":
 		batch := make([]EdgeProvenanceUpdate, len(op.Provenance))
 		for i, u := range op.Provenance {
 			batch[i] = EdgeProvenanceUpdate{Edge: u.Edge.toEdge(), NewOrigin: u.NewOrigin}
 		}
-		m.Graph.SetEdgeProvenanceBatch(batch)
+		m.graph.SetEdgeProvenanceBatch(batch)
 	case "remove_edge":
-		m.Graph.RemoveEdge(op.From, op.To, op.Kind)
+		m.graph.RemoveEdge(op.From, op.To, op.Kind)
 	case "evict_file":
-		m.Graph.EvictFile(op.Path)
+		m.graph.EvictFile(op.Path)
 	case "evict_repo":
-		m.Graph.EvictRepo(op.RepoPrefix)
+		m.graph.EvictRepo(op.RepoPrefix)
+	case "evict_files", "evict_files_with_node_ids", "evict_edges_by_kinds",
+		"evict_pathless_nodes", "evict_contract_nodes", "evict_config_nodes",
+		"evict_edges_from_sources":
+		// Set-oriented capability evictions (PR #901 review R1) replay
+		// through the same *Graph primitives the live call used.
+		m.applyEvictionOp(op)
 	case "journal_open":
 		// A mid-file generation header (append-open onto existing content
 		// after a crash): no state change. Known, so it counts as applied

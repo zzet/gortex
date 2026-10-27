@@ -19,9 +19,10 @@ import "reflect"
 // locks. That is safe because every MemoryStore mutation funnels through
 // applyMu (the journaled/applyOnly critical sections), so the guard's reads
 // are mutually exclusive with every writer; concurrent READERS only read the
-// same maps. A caller that writes to the embedded *Graph directly, bypassing
-// the MemoryStore write methods, breaks this invariant — the embedded Graph
-// is backend-internal.
+// same maps. A caller that writes to the backing *Graph directly, bypassing
+// the MemoryStore write methods, breaks this invariant — the graph is an
+// unexported, non-embedded field (PR #901 review R1), so only this package
+// can reach it at all.
 
 // existingNode returns the currently stored node for id, or nil.
 func (m *MemoryStore) existingNode(id string) *Node {
@@ -39,7 +40,7 @@ func (m *MemoryStore) existingEdge(e *Edge) *Edge {
 	if e == nil || e.From == "" || e.To == "" {
 		return nil
 	}
-	sFrom := m.shardFor(e.From)
+	sFrom := m.graph.shardFor(e.From)
 	if positions := sFrom.outEdgeIdx[e.From]; positions != nil {
 		h := hashEdgeKey(keyOf(e))
 		if pos, ok := positions[h]; ok && pos < len(sFrom.outEdges[e.From]) {
