@@ -191,7 +191,13 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 	stopped := make(chan struct{})
 	var stopOnce sync.Once
 	var closeOnce sync.Once
-	cfg := snapshotTriggerConfig{interval: 30 * time.Second}
+	// Trigger defaults live in loadFromEnv (odd/tasks/23-snapshot-triggers.md):
+	// the interval trigger is OFF (0) unless GORTEX_SNAPSHOT_INTERVAL enables
+	// it, the journal threshold defaults to 512 MiB and the janitor checks
+	// every 30s. A literal here would be overwritten by loadFromEnv and would
+	// only advertise a trigger that is not enabled (review zzet/gortex#901
+	// minor: "the interval trigger looks enabled when it isn't").
+	cfg := snapshotTriggerConfig{}
 	cfg.loadFromEnv(logger)
 	go func() {
 		ticker := time.NewTicker(cfg.tick)
