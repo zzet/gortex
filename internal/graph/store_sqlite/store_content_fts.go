@@ -1,7 +1,6 @@
 package store_sqlite
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -486,23 +485,32 @@ SELECT rowid, repo_prefix, file_path FROM content_fts`)
 	return err
 }
 
-// BuildContentIndex opportunistically merges FTS5 segments (a read-latency
-// improvement). Like BuildSymbolIndex it is a no-op for correctness — the
-// FTS index is maintained incrementally on every insert — and idempotent.
+// BuildContentIndex performs one bounded FTS5 segment merge for read latency.
+// Like BuildSymbolIndex it is a no-op for correctness: transactional inserts
+// maintain the index. fts_merge reports errors without failing the build.
+// Derived views and coordinated cold loads retain their existing deferral.
 func (s *Store) BuildContentIndex() error {
 	// Derived generations are immutable and invisible until publication. Their
-	// incremental FTS writes are already query-correct; optimizing the global
+	// incremental FTS writes are already query-correct; merging the global
 	// virtual table once per generation only multiplies writer hold time.
 	if s.viewGen > 0 {
 		return nil
 	}
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	var event bulkFinalizeEvent
+	merged := false
+	defer func() {
+		s.writeMu.Unlock()
+		if merged {
+			s.emitBulkFinalizeEvent(event)
+		}
+	}()
 	if s.coordinatedBulkLoad {
 		s.deferredContentFTS = true
 		return nil
 	}
-	_, _ = s.execActiveWriteLocked(context.Background(), `INSERT INTO content_fts(content_fts) VALUES('optimize')`)
+	event = s.mergeLiveFTSLocked("content_fts", `INSERT INTO content_fts(content_fts, rank) VALUES('merge', ?)`)
+	merged = true
 	return nil
 }
 
