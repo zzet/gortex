@@ -292,7 +292,8 @@ func runTrack(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 		var collision *trackPrefixCollisionError
-		if errors.As(notifyErr, &collision) {
+		var loading *repoLoadingError
+		if errors.As(notifyErr, &collision) || errors.As(notifyErr, &loading) {
 			if !already {
 				if err := removeAddedRepoEntry(absPath); err != nil {
 					return fmt.Errorf("%w; removing rejected entry from config: %v", notifyErr, err)
@@ -512,6 +513,9 @@ func notifyDaemonTrack(absPath, name string, deadline time.Time) error {
 		return err
 	}
 	if !resp.OK {
+		if resp.ErrorCode == daemon.ErrRepoLoading {
+			return &repoLoadingError{admissionReason: "identity_pending", phase: "identity_resolution"}
+		}
 		if resp.ErrorCode == daemon.ErrPrefixCollision {
 			return &trackPrefixCollisionError{message: resp.ErrorMsg}
 		}

@@ -178,14 +178,17 @@ func sessionStartStatusFromProbe(probe daemon.ProbeResponse) *daemon.StatusRespo
 	}
 	for _, r := range probe.TrackedRepos {
 		status.TrackedRepos = append(status.TrackedRepos, daemon.TrackedRepoStatus{
-			Path:      r.Path,
-			Prefix:    r.Prefix,
-			Name:      r.Name,
-			Workspace: r.Workspace,
-			Project:   r.Project,
-			Loading:   r.State == daemon.RepoStateLoading,
-			Unloaded:  r.State == daemon.RepoStateLoading || r.State == daemon.RepoStateFailed || r.State == daemon.RepoStateMissing,
-			Missing:   r.State == daemon.RepoStateMissing,
+			Path:       r.Path,
+			Prefix:     r.Prefix,
+			Name:       r.Name,
+			Workspace:  r.Workspace,
+			Project:    r.Project,
+			Loading:    r.State == daemon.RepoStateLoading,
+			Unloaded:   r.State == daemon.RepoStateLoading || r.State == daemon.RepoStateFailed || r.State == daemon.RepoStateMissing || r.State == daemon.RepoStatePrefixCollision,
+			Missing:    r.State == daemon.RepoStateMissing,
+			ErrorCode:  r.ErrorCode,
+			OwnerPath:  r.OwnerPath,
+			OwnerState: r.OwnerState,
 		})
 	}
 	return status
@@ -328,6 +331,9 @@ func renderLeanReadiness(cwd string, s *daemon.StatusResponse) string {
 		}
 	}
 	if abs != "" {
+		if collision := prefixCollisionCoverage(abs, s.TrackedRepos); collision != "" {
+			return line + "\n\n" + collision
+		}
 		if exact, _ := classifyCwd(abs, s.TrackedRepos); exact != nil {
 			return fmt.Sprintf("%s cwd tracked as `%s` — enforcement active.\n", line, exact.Name)
 		}
@@ -381,6 +387,9 @@ func renderCwdCoverage(cwd string, s *daemon.StatusResponse) string {
 	if err != nil {
 		abs = cwd
 	}
+	if collision := prefixCollisionCoverage(abs, s.TrackedRepos); collision != "" {
+		return collision
+	}
 
 	exact, contained := classifyCwd(abs, s.TrackedRepos)
 	switch {
@@ -428,6 +437,25 @@ func renderCwdCoverage(cwd string, s *daemon.StatusResponse) string {
 		return fmt.Sprintf("⚠️  **cwd `%s` is not covered by any tracked repo.** Read/Grep/Glob/Bash will fall through to soft guidance only — graph tools won't be available for this directory.\n\nTo enable enforcement: `gortex track %s`\n",
 			abs, abs)
 	}
+}
+
+func prefixCollisionCoverage(cwd string, repos []daemon.TrackedRepoStatus) string {
+	var collision *daemon.TrackedRepoStatus
+	for i := range repos {
+		rec := &repos[i]
+		if rec.ErrorCode == daemon.ErrPrefixCollision && (pathkey.EqualPaths(cwd, rec.Path) || hasPathPrefix(cwd, rec.Path)) &&
+			(collision == nil || len(rec.Path) > len(collision.Path)) {
+			collision = rec
+		}
+	}
+	if collision == nil {
+		return ""
+	}
+	remedy := "Set a unique name in the global config and run `gortex daemon reload`."
+	if collision.OwnerState == "missing" {
+		remedy = fmt.Sprintf("The owner no longer exists; inspect `gortex untrack %s` for that owner before retrying.", collision.OwnerPath)
+	}
+	return fmt.Sprintf("Gortex cannot admit `%s`: prefix_collision for `%s`, owned by `%s`. %s Native file reads and edits remain available.\n", collision.Path, collision.Prefix, collision.OwnerPath, remedy)
 }
 
 func pendingAutomaticCheckout(cwd string, repos []daemon.TrackedRepoStatus) bool {

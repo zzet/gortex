@@ -55,6 +55,8 @@ const (
 	// index, a taken prefix) or whose path is gone. Not retryable as is;
 	// the error's reason names what to repair.
 	ErrCodeRepoUnavailable ErrorCode = "repo_unavailable"
+	// ErrCodePrefixCollision names an already-owned repository namespace.
+	ErrCodePrefixCollision ErrorCode = "prefix_collision"
 
 	// ErrCodeSymbolNotFound — the requested symbol id is not in the
 	// index. Recoverable: the agent can search for it instead.

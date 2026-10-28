@@ -1049,6 +1049,7 @@ const (
 	OutputEntryWatcherPatchGraph       OutputMutationEntry = "indexer.Watcher.patchGraphWithReceiptState"
 	OutputEntryWatcherEnqueueReresolve OutputMutationEntry = "indexer.Watcher.enqueueReresolve"
 	OutputEntryCheckoutSourceMutation  OutputMutationEntry = "indexer.CheckoutLifecycle.BeginCheckoutMutation"
+	OutputEntryPromotionPublication    OutputMutationEntry = "indexer.CheckoutLifecycle.publishPromotedCorpus"
 	// OutputEntryRepositoryReconcileLane is the coalescing lane worker itself.
 	// Reconcile requests merge, so the execution — not the queuing caller — is
 	// the entry point that names an output generation.
@@ -1099,6 +1100,7 @@ var outputMutationEntryKinds = map[OutputMutationEntry]OutputGenerationKind{
 	OutputEntryWatcherPatchGraph:       OutputGenerationLegacy,
 	OutputEntryWatcherEnqueueReresolve: OutputGenerationLegacy,
 	OutputEntryCheckoutSourceMutation:  OutputGenerationCheckout,
+	OutputEntryPromotionPublication:    OutputGenerationLegacy,
 	OutputEntryRepositoryReconcileLane: OutputGenerationLegacy,
 	OutputEntryEnrichmentCorpus:        OutputGenerationLegacy,
 	OutputEntryContractBaseline:        OutputGenerationLegacy,

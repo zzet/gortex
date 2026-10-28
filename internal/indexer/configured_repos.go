@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -121,31 +122,89 @@ func (mi *MultiIndexer) ResolveConfiguredRepos(ctx context.Context, entries []co
 // loaded yet. Filter by base name before resolving workspaces: the ordinary
 // one-root case needs no workspace reads or catalog ownership pass.
 func (mi *MultiIndexer) configuredPrefixCollision(prefix, root string) error {
+	return mi.configuredPrefixCollisionBefore(context.Background(), prefix, root, time.Now().Add(prefixOwnershipTimeout))
+}
+
+func (mi *MultiIndexer) configuredPrefixCollisionBefore(ctx context.Context, prefix, root string, before time.Time) error {
 	if mi.configMgr == nil {
 		return nil
 	}
-	if mi.configMgr.RepoPathSnapshot().IsOnlyRepoForPrefix(prefix, root) {
+	candidates := mi.configMgr.RepoTrackSnapshot().InstanceCandidates(prefix)
+	if len(candidates) == 1 && !strings.Contains(prefix, "@") && candidates[0].Path == root && config.ResolvePrefix(candidates[0]) == prefix {
 		return nil
 	}
-	var candidates []config.RepoEntry
-	for _, entry := range mi.configMgr.Global().ReposSnapshot() {
-		base := config.ResolvePrefix(entry)
-		if prefix == base || entry.Name == "" && strings.HasPrefix(prefix, base+"@") {
-			candidates = append(candidates, entry)
+	var entries []config.RepoEntry
+	for _, entry := range candidates {
+		effective, err := mi.effectiveTrackPrefix(ctx, entry, before)
+		if err != nil {
+			return err
+		}
+		if effective == prefix {
+			entries = append(entries, entry)
 		}
 	}
-	if len(candidates) == 0 {
+	if len(entries) == 0 {
 		return nil
 	}
-	if len(candidates) == 1 && (pathkey.SamePathIdentity(candidates[0].Path, root) || sameDirectory(candidates[0].Path, root)) {
-		return nil
+	budget, cancel := context.WithDeadline(ctx, before)
+	defer cancel()
+	observed := make(map[string]prefixStatResult)
+	stat := func(path string) prefixStatResult {
+		if result, ok := observed[path]; ok {
+			return result
+		}
+		result := mi.prefixStats.observe(budget, path)
+		observed[path] = result
+		return result
 	}
-	for _, entry := range mi.ResolveConfiguredRepos(context.Background(), candidates) {
-		if entry.Name == prefix && !pathkey.SamePathIdentity(entry.Path, root) && !sameDirectory(entry.Path, root) {
-			return NewPrefixCollisionError(prefix, entry.Path, root)
+	same := func(a, b string) bool {
+		return a == b || sameObservedDirectory(stat(a), stat(b))
+	}
+	owner := entries[0].Path
+	// Match startup's priority: a live owner, then a published catalog owner
+	// still configured under this prefix, then configuration order.
+	if live := mi.GetMetadata(prefix); live != nil {
+		configured := false
+		for _, entry := range entries {
+			if same(entry.Path, live.RootPath) {
+				owner, configured = entry.Path, true
+				break
+			}
+		}
+		if !configured {
+			return nil // live ownership is checked separately at admission
+		}
+	} else if provider, ok := mi.graph.(interface{ Catalog() *store_sqlite.Catalog }); ok && provider.Catalog() != nil {
+		catalog := provider.Catalog()
+		binding, found, err := catalog.GetDedicatedGraph(budget, GraphIDFor(prefix))
+		if err != nil {
+			mi.logger.Warn("reading configured repository owner; using config order", zap.Error(err))
+		}
+		if err == nil && found {
+			_, published, err := catalog.DedicatedBasePublication(budget, binding.GraphID)
+			if err != nil {
+				mi.logger.Warn("reading configured repository publication; using config order", zap.Error(err))
+			}
+			if err == nil && published {
+				checkout, found, err := catalog.GetCheckout(budget, binding.OwnerCheckoutID)
+				if err != nil {
+					mi.logger.Warn("reading configured repository owner; using config order", zap.Error(err))
+				}
+				if err == nil && found {
+					for _, entry := range entries {
+						if same(entry.Path, checkout.RootPath) {
+							owner = entry.Path
+							break
+						}
+					}
+				}
+			}
 		}
 	}
-	return nil
+	if same(owner, root) {
+		return nil
+	}
+	return newObservedPrefixCollision(prefix, owner, root, stat(owner))
 }
 
 // Bucket only; SamePathIdentity still distinguishes case-sensitive directories.
@@ -161,16 +220,20 @@ func configuredRootKey(root string) string {
 // snapshot invalidates the result before the coordinated recheck. Live ownership
 // is checked separately under the registry lock at every admission boundary.
 func (mi *MultiIndexer) configuredPrefixCheck() func(string, string) error {
-	var snapshot *config.RepoPathSnapshot
+	return mi.configuredPrefixCheckContext(context.Background(), time.Now().Add(prefixOwnershipTimeout))
+}
+
+func (mi *MultiIndexer) configuredPrefixCheckContext(ctx context.Context, before time.Time) func(string, string) error {
+	var snapshot *config.RepoTrackSnapshot
 	var checkedPrefix, checkedRoot string
 	var collision error
 	return func(prefix, root string) error {
 		if mi.configMgr == nil {
 			return nil
 		}
-		current := mi.configMgr.RepoPathSnapshot()
+		current := mi.configMgr.RepoTrackSnapshot()
 		if current != snapshot || prefix != checkedPrefix || root != checkedRoot {
-			collision = mi.configuredPrefixCollision(prefix, root)
+			collision = mi.configuredPrefixCollisionBefore(ctx, prefix, root, before)
 			snapshot, checkedPrefix, checkedRoot = current, prefix, root
 		}
 		return collision

@@ -731,6 +731,9 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		}
 		result, err := s.Controller.Track(ctx, p)
 		if err != nil {
+			if errors.Is(err, indexer.ErrRepoIdentityPending) {
+				return ControlResponse{ErrorCode: ErrRepoLoading, ErrorMsg: err.Error(), Retryable: true}
+			}
 			var collision *indexer.PrefixCollisionError
 			if errors.As(err, &collision) {
 				return controlErr(ErrPrefixCollision, err.Error())

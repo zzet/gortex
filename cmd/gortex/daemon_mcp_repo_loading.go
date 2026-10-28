@@ -147,6 +147,14 @@ func (d *mcpDispatcher) repoLoadingError(sess *daemon.Session, inbound []byte, r
 // repoUnavailableError is the refusal for a session whose configured
 // repository's load ended without registering it.
 func repoUnavailableError(sess *daemon.Session, inbound []byte, rec indexer.RepoLoad) []byte {
+	if rec.ErrorCode == daemon.ErrPrefixCollision {
+		return jsonRPCErrorFrame(inbound, "repository prefix collision: "+rec.Reason, map[string]any{
+			"error_code": daemon.ErrPrefixCollision, "retryable": false,
+			"path": sess.CWD, "repo_path": rec.Root, "prefix": rec.Prefix,
+			"owner_path": rec.OwnerPath, "owner_state": rec.OwnerState,
+			"suggestion": gortexmcp.PrefixCollisionSuggestion(rec),
+		})
+	}
 	return jsonRPCErrorFrame(inbound, fmt.Sprintf("repository unavailable: %s (%s)", rec.Label(), rec.Reason), map[string]any{
 		"error_code": string(gortexmcp.ErrCodeRepoUnavailable),
 		"retryable":  false,

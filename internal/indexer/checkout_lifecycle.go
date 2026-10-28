@@ -385,6 +385,13 @@ type CheckoutLifecycle struct {
 	refViewRetention RefViewRetention
 	// indexBarrier is the promotion's test seam; nil in production.
 	indexBarrier func()
+	// afterRegisterTrack is a test-only scheduling barrier, nil in production:
+	// registry ownership can disappear after a nil Track result and before
+	// checkout recording. It does not replace the real track implementation.
+	afterRegisterTrack func()
+	// afterPromotionIndex schedules an ownership change after the real index
+	// and before publication. Nil in production; it does not replace indexing.
+	afterPromotionIndex func()
 	// routeBarrier stands in for the route withdrawal a promotion runs after
 	// the mode flip, which is the one write no fixture can make the catalog
 	// refuse. A test seam; nil in production.
@@ -738,55 +745,40 @@ func (l *CheckoutLifecycle) Register(
 	ctx context.Context,
 	entry config.RepoEntry,
 	source store_sqlite.IntentSourceKind,
-) (RegisterResult, error) {
+) (outcome RegisterResult, err error) {
 	if l == nil || l.mi == nil {
 		return RegisterResult{}, errors.New("indexer: checkout lifecycle is not wired")
 	}
-	absPath, err := filepath.Abs(entry.Path)
+	defer func() {
+		var collision *PrefixCollisionError
+		if errors.As(err, &collision) {
+			l.mi.logCollision(collision)
+		}
+	}()
+	entry, err = l.prepareRegistrationEntry(ctx, entry, time.Now().Add(prefixOwnershipTimeout))
 	if err != nil {
-		return RegisterResult{}, fmt.Errorf("resolve path %s: %w", entry.Path, err)
+		return RegisterResult{}, err
 	}
-	// Existing config is the restart authority. Do not accept a rename that
-	// AddRepo would discard, and keep a pinned name when warmup has not loaded it.
-	if l.cfgMgr != nil {
-		if configured := l.cfgMgr.RepoPathLookup()(absPath); configured != nil {
-			if entry.Name != "" && entry.Name != config.ResolvePrefix(*configured) {
-				return RegisterResult{}, fmt.Errorf("%s is already configured; set name: %s in the global config and run `gortex daemon reload`", absPath, entry.Name)
-			}
-			if entry.Name == "" {
-				entry.Name = configured.Name
-			}
-		}
-	}
-	// One fan-out for the whole registration: the family reconciliation at the
-	// end drives the same cleanup hooks a sweep does, and each of them tells
-	// the sessions the tracked set moved.
+	absPath := entry.Path
+	// Coalesce notifications only after side-effect-free admission preparation.
 	defer l.beginBatch()()
-
-	// A linked worktree of a family that already has a corpus is named by the
-	// rule at the naming seam rather than by its basename or its branch. The
-	// name is pinned onto the entry, so the indexer persists it and every later
-	// pass reads the decision back instead of taking it again.
-	if entry.Name == "" {
-		if prefix := l.dedicatedPrefixFor(ctx, absPath); prefix != "" {
-			entry.Name = prefix
-		}
-	}
 
 	// The source tells a config reload's re-registration from a user's track.
 	result, err := l.mi.TrackRepoCtx(WithIndexOrigin(ctx, "checkout_register_"+string(source)), entry)
 	if err != nil {
 		return RegisterResult{}, err
 	}
-	out := RegisterResult{Index: result, AlreadyTracked: result == nil}
-	switch {
-	case result != nil && result.RepoPrefix != "":
-		out.Prefix = result.RepoPrefix
-	default:
-		out.Prefix = l.ResolvePrefix(absPath)
+	if l.afterRegisterTrack != nil {
+		l.afterRegisterTrack()
 	}
-	if out.Prefix == "" {
-		out.Prefix = config.ResolvePrefix(entry)
+	out := RegisterResult{Index: result, AlreadyTracked: result == nil}
+	requested := config.ResolvePrefix(entry)
+	if result != nil && result.RepoPrefix != "" {
+		requested = result.RepoPrefix
+	}
+	out.Prefix, err = l.mi.registeredPrefixForExactRoot(ctx, requested, absPath)
+	if err != nil {
+		return RegisterResult{}, err
 	}
 
 	l.implicitRoots.Delete(out.Prefix)
@@ -820,14 +812,28 @@ func (l *CheckoutLifecycle) Register(
 // the next boot's seeding would read back as explicit configuration and mint a
 // manual_config intent for, turning an intent-less observation into intent one
 // restart later.
-func (l *CheckoutLifecycle) RecordImplicit(ctx context.Context, root string) error {
+func (l *CheckoutLifecycle) RecordImplicit(ctx context.Context, root string) (err error) {
 	if l == nil || l.mi == nil {
 		return nil
 	}
-	prefix := l.ResolvePrefix(root)
-	if prefix == "" {
-		return fmt.Errorf("%w: %s", ErrCheckoutNotTracked, root)
+	defer func() {
+		var collision *PrefixCollisionError
+		if errors.As(err, &collision) {
+			l.mi.logCollision(collision)
+		}
+	}()
+	if root == "" {
+		return fmt.Errorf("%w: empty implicit repository root", ErrCheckoutNotTracked)
 	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve implicit root %s: %w", root, err)
+	}
+	prefix, err := l.mi.registeredPrefixForExactRoot(ctx, config.ResolvePrefix(config.RepoEntry{Path: abs}), abs)
+	if err != nil {
+		return err
+	}
+	root = abs
 	defer l.beginBatch()()
 
 	identity, err := l.recordCheckout(ctx, prefix, root, TrackSourceImplicit, false)

@@ -334,6 +334,10 @@ func (c *realController) fileCoverageWithProbe(ctx context.Context, p daemon.Fil
 	// repo_loading. The state rides on the reply so the hook can let the
 	// native tool through instead of denying the only read path left.
 	if rec, classified := c.pendingRepoLoadForPath(abs); classified {
+		if rec.ErrorCode == daemon.ErrPrefixCollision {
+			out.RepoState, out.Repo, out.Tracked = daemon.RepoStatePrefixCollision, rec.Label(), false
+			return out, nil
+		}
 		if rec.State.Loading() && rec.State != indexer.RepoLoadIdentityPending {
 			out.RepoState, out.Repo = daemon.RepoStateLoading, rec.Label()
 		} else if !out.Tracked && (rec.State == indexer.RepoLoadIdentityPending || rec.State.Ready()) {
@@ -441,6 +445,10 @@ func (c *realController) dirCoverageWithProbe(ctx context.Context, p daemon.DirC
 	out := daemon.DirCoverageResult{View: view.answer, Tracked: c.pathTracked(abs, view)}
 	// See FileCoverage: a loading repository's scope must not deny Grep.
 	if rec, classified := c.pendingRepoLoadForPath(abs); classified {
+		if rec.ErrorCode == daemon.ErrPrefixCollision {
+			out.RepoState, out.Repo, out.Tracked = daemon.RepoStatePrefixCollision, rec.Label(), false
+			return out, nil
+		}
 		if rec.State.Loading() && rec.State != indexer.RepoLoadIdentityPending {
 			out.RepoState, out.Repo = daemon.RepoStateLoading, rec.Label()
 		} else if !out.Tracked && (rec.State == indexer.RepoLoadIdentityPending || rec.State.Ready()) {

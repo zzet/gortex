@@ -159,7 +159,9 @@ type Server struct {
 	// resetTestIndexProbe clears it on every analysis pass rather than
 	// pinning the first (possibly mid-warmup) answer for the daemon's life.
 	testIndexProbe sync.Map
-	// trackInFlight guards first-index runs by absolute repo path.
+	// trackInFlight guards first-index runs by canonical root and request
+	// options, retaining final outcomes for ten minutes while owner/config
+	// witnesses remain current. Lexical aliases share the same job pointer.
 	// track answers before the index finishes (#326), so without this a
 	// second call for the same path would start a duplicate full index:
 	// TrackRepoCtx's already-tracked check only sees repos that finished.
@@ -1736,6 +1738,9 @@ func (s *Server) stateAwareInstructionsWithCheckout(ctx context.Context, cwd, ba
 }
 
 func (s *Server) instructionsForRepoLoad(cwd, base string, rec indexer.RepoLoad) string {
+	if rec.ErrorCode == string(ErrCodePrefixCollision) {
+		return ServerInstructionsPrefixCollision(rec)
+	}
 	if rec.State == indexer.RepoLoadIdentityPending {
 		return ServerInstructionsIdentityPending() + "\n\n" + base
 	}

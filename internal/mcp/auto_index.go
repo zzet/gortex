@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"time"
@@ -63,6 +64,10 @@ func (s *Server) autoIndexCWDBackground() {
 	}
 	ctx := context.Background()
 	if _, err := s.multiIndexer.TrackRepoCtx(indexer.WithIndexOrigin(ctx, "mcp_auto_index"), config.RepoEntry{Path: root}); err != nil {
+		var collision *indexer.PrefixCollisionError
+		if errors.As(err, &collision) {
+			return // shared admission already logged this collision once
+		}
 		if s.logger != nil {
 			s.logger.Warn("auto-index: track failed", zap.String("root", root), zap.Error(err))
 		}
@@ -74,6 +79,10 @@ func (s *Server) autoIndexCWDBackground() {
 	// its own initiative, and an intent would claim otherwise.
 	if s.lifecycle != nil {
 		if err := s.lifecycle.RecordImplicit(ctx, root); err != nil && s.logger != nil {
+			var collision *indexer.PrefixCollisionError
+			if errors.As(err, &collision) {
+				return // shared exact-root admission owns the warning
+			}
 			s.logger.Warn("auto-index: recording the checkout failed",
 				zap.String("root", root), zap.Error(err))
 		}

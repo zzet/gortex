@@ -414,6 +414,7 @@ func outputMutationEntryValue(identifier string) (string, bool) {
 		"OutputEntryWatcherPatchGraph":       OutputEntryWatcherPatchGraph,
 		"OutputEntryWatcherEnqueueReresolve": OutputEntryWatcherEnqueueReresolve,
 		"OutputEntryCheckoutSourceMutation":  OutputEntryCheckoutSourceMutation,
+		"OutputEntryPromotionPublication":    OutputEntryPromotionPublication,
 		"OutputEntryRepositoryReconcileLane": OutputEntryRepositoryReconcileLane,
 		"OutputEntryEnrichmentCorpus":        OutputEntryEnrichmentCorpus,
 		"OutputEntryContractBaseline":        OutputEntryContractBaseline,

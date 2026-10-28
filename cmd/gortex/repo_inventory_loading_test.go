@@ -18,11 +18,12 @@ func TestReconcileUnloadedRepos_Warmup(t *testing.T) {
 	path := t.TempDir()
 	entry := config.RepoEntry{Path: path, Name: "repo"}
 	for _, tt := range []struct {
-		name    string
-		ready   bool
-		missing bool
-		loaded  []daemon.TrackedRepoStatus
-		want    []daemon.TrackedRepoStatus
+		name     string
+		ready    bool
+		missing  bool
+		pathless bool
+		loaded   []daemon.TrackedRepoStatus
+		want     []daemon.TrackedRepoStatus
 	}{
 		{
 			name: "warming with existing path",
@@ -44,15 +45,35 @@ func TestReconcileUnloadedRepos_Warmup(t *testing.T) {
 			loaded: []daemon.TrackedRepoStatus{{Prefix: "worktree-instance", Path: path}},
 		},
 		{
-			name:   "already loaded by prefix",
+			name:   "another root with the same prefix remains visible",
 			loaded: []daemon.TrackedRepoStatus{{Prefix: "repo", Path: filepath.Join(path, "worktree")}},
+			want: []daemon.TrackedRepoStatus{{Prefix: "repo", Path: path, Name: "repo",
+				Workspace: "repo", WorkspaceProject: "repo", Unloaded: true, Loading: true}},
+		},
+		{
+			name:     "legacy pathless configuration can match by prefix",
+			pathless: true,
+			loaded:   []daemon.TrackedRepoStatus{{Prefix: "repo"}},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got := reconcileUnloadedRepos([]config.RepoEntry{entry}, map[string]bool{path: tt.missing}, tt.loaded, tt.ready)
+			configured := entry
+			if tt.pathless {
+				configured.Path = ""
+			}
+			got := reconcileUnloadedRepos([]config.RepoEntry{configured}, map[string]bool{path: tt.missing}, tt.loaded, tt.ready)
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestReconcileUnloadedReposKeepsACollidingRootVisible(t *testing.T) {
+	owner, loser := filepath.Join(t.TempDir(), "src"), filepath.Join(t.TempDir(), "src")
+	rows := reconcileUnloadedRepos([]config.RepoEntry{{Path: loser}}, map[string]bool{loser: false},
+		[]daemon.TrackedRepoStatus{{Path: owner, Prefix: "src"}}, true)
+	require.Len(t, rows, 1)
+	require.Equal(t, loser, rows[0].Path)
+	require.True(t, rows[0].Unloaded)
 }
 
 func TestControllerStatus_LoadingFollowsReadiness(t *testing.T) {

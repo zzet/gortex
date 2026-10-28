@@ -93,6 +93,7 @@ const (
 	ErrUnsupportedMode  = "unsupported_mode"
 	ErrRepoNotTracked   = "repo_not_tracked"
 	ErrPrefixCollision  = "prefix_collision"
+	ErrRepoLoading      = "repo_loading"
 	ErrInternal         = "internal"
 	// ErrTimeout means the daemon accepted the control request but did not
 	// finish it inside the kind's budget — almost always because a
@@ -115,6 +116,7 @@ type ControlResponse struct {
 	OK        bool            `json:"ok"`
 	ErrorCode string          `json:"error_code,omitempty"`
 	ErrorMsg  string          `json:"error_msg,omitempty"`
+	Retryable bool            `json:"retryable,omitempty"`
 	Result    json.RawMessage `json:"result,omitempty"`
 }
 
@@ -307,6 +309,9 @@ type ProbeRepo struct {
 	State string `json:"state,omitempty"`
 	// StateReason explains a failed or missing repo.
 	StateReason string `json:"state_reason,omitempty"`
+	ErrorCode   string `json:"error_code,omitempty"`
+	OwnerPath   string `json:"owner_path,omitempty"`
+	OwnerState  string `json:"owner_state,omitempty"`
 }
 
 // Per-repo states a probe or coverage reply reports.
@@ -323,6 +328,9 @@ const (
 	RepoStateFailed = "failed"
 	// RepoStateMissing: the configured path does not exist.
 	RepoStateMissing = "missing"
+	// RepoStatePrefixCollision is a configured root whose prefix belongs to
+	// another root. It cannot gain admission by waiting for warmup.
+	RepoStatePrefixCollision = "prefix_collision"
 )
 
 // StatusResponse is the payload returned under Result on a successful
@@ -1241,7 +1249,10 @@ type TrackedRepoStatus struct {
 	// Loading is true when the repo is configured and its path exists, but
 	// the daemon has not finished warmup, so its index is not loaded yet.
 	// Unloaded remains true so older clients keep their existing behaviour.
-	Loading bool `json:"loading,omitempty"`
+	Loading    bool   `json:"loading,omitempty"`
+	ErrorCode  string `json:"error_code,omitempty"`
+	OwnerPath  string `json:"owner_path,omitempty"`
+	OwnerState string `json:"owner_state,omitempty"`
 	// File indexing health includes unresolved failures and ledger read errors.
 	IndexHealthError string `json:"index_health_error,omitempty"`
 	FailedFiles      int    `json:"failed_files,omitempty"`

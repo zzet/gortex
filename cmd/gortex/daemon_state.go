@@ -678,6 +678,10 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	var changedPrefixes sync.Map
 	var scopeUnknown atomic.Bool
 	deltaFrontier := newWarmupDeltaFrontier()
+	accounting := warmupRepoAccounting{
+		changed: &changedRepos, files: &filesReindexed, unknown: &scopeUnknown,
+		prefixes: &changedPrefixes, frontier: deltaFrontier,
+	}
 	if err := state.multiIndexer.RunRepositoryTopologyBatch(ctx, func(batchCtx context.Context) error {
 		coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
 		coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
@@ -748,82 +752,8 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 							}
 							priorMtimes = nil
 						}
-						pathFn := "track"
-						// indexed names the repo prefix whose generation-0
-						// index this dispatch just brought up to date, and is
-						// empty when it did not. It is the completion signal
-						// the committed-base publication waits on: a base is
-						// published from a Git tree, not from generation 0,
-						// but its identity names the checkout's committed tree
-						// and its builder runs against this repository's own
-						// admissions, so both must be settled first.
-						indexed := ""
-						if priorMtimes != nil {
-							pathFn = "reconcile"
-							res, err := state.multiIndexer.ReconcileRepoCtx(batchCtx, entry, priorMtimes)
-							switch {
-							case err != nil:
-								jobErr = err
-								logger.Warn("daemon: startup reconcile failed",
-									zap.String("path", entry.Path), zap.Error(err))
-								// Treat a failed reconcile as "changed" so the global
-								// passes still run — degrade toward correctness, not
-								// toward the fast path, when we can't trust the delta.
-								changedRepos.Add(1)
-								scopeUnknown.Store(true)
-								deltaFrontier.invalidate()
-							case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0 || res.FullRetrack):
-								changedRepos.Add(1)
-								filesReindexed.Add(int64(reconcileFileCount(res)))
-								deltaFrontier.record(res)
-								indexed = warmupRepoPrefix(state, entry, res.RepoPrefix)
-								if res.RepoPrefix != "" {
-									changedPrefixes.Store(res.RepoPrefix, struct{}{})
-								} else {
-									scopeUnknown.Store(true)
-								}
-							default:
-								// Warm no-op path: the repo re-indexed nothing, so its
-								// graph is served straight from the persisted store and
-								// no global pass has to re-run for it.
-								prefix := ""
-								if res != nil {
-									prefix = res.RepoPrefix
-								}
-								indexed = warmupRepoPrefix(state, entry, prefix)
-							}
-						} else {
-							// No prior mtimes → full cold (re)index of this repo,
-							// which is "changed" by definition.
-							deltaFrontier.invalidate()
-							changedRepos.Add(1)
-							if res, err := state.multiIndexer.TrackRepoCtx(batchCtx, entry); err != nil {
-								jobErr = err
-								logger.Warn("daemon: startup track failed",
-									zap.String("path", entry.Path), zap.Error(err))
-								scopeUnknown.Store(true)
-							} else if res != nil && res.RepoPrefix != "" {
-								// A cold TrackRepoCtx is itself a full retrack — its
-								// FileCount is the whole repo's file-level work.
-								filesReindexed.Add(int64(res.FileCount))
-								changedPrefixes.Store(res.RepoPrefix, struct{}{})
-								indexed = warmupRepoPrefix(state, entry, res.RepoPrefix)
-							} else {
-								scopeUnknown.Store(true)
-							}
-						}
-						// Schedule, do not publish. A committed base is a full
-						// index of a committed tree; running it here would put
-						// a second whole-repository index in front of the
-						// readiness flip. Schedule only appends to an unbounded
-						// pending list — it cannot park this worker, whatever
-						// the repository count — and nothing is drained until
-						// BeginDraining below, which runs after markReady. The
-						// runtime cancels the publisher the moment publisher
-						// admission closes, so shutdown stays bounded.
-						if indexed != "" {
-							state.basePublisher.Schedule(indexed)
-						}
+						pathFn, loadErr := accounting.load(batchCtx, state, entry, priorMtimes, logger)
+						jobErr = loadErr
 						elapsed := time.Since(repoStart)
 						if elapsed > 2*time.Second {
 							logger.Info("daemon: warmup repo elapsed",
