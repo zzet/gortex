@@ -149,10 +149,11 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 		state.record.Evidence = filepath.Join(dir, fmt.Sprintf("edit-%03d.jsonl", step.Ordinal))
 	}
 	for _, state := range r.states {
-		state.sink, err = os.OpenFile(state.record.Evidence, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		sink, err := os.OpenFile(state.record.Evidence, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return r, clients, err
 		}
+		state.sink = sink
 		state.startRaw()
 		state.client, err = openMCP(ctx, p.Socket, p.Repos[0].Path)
 		if err != nil {
