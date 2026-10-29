@@ -195,7 +195,10 @@ func TestReadRepairSeesCommittedAdmissionBeforeACKAndSurvivesSuccessClear(t *tes
 			t.Error("held mutation waiter was not reaped")
 		}
 	})
-	require.Eventually(t, func() bool { return s.readRepairObserver(ctx, path, idx) != nil }, 5*time.Second, time.Millisecond,
+	require.Eventually(t, func() bool {
+		witness, ok := s.captureReadRepairWitness(path, idx)
+		return ok && witness.generation != 0
+	}, 5*time.Second, time.Millisecond,
 		"a pre-ACK reader must see the real admitted ticket, not post-wait metadata")
 	pending := record.snapshot()
 	require.Empty(t, pending.ReindexReceipt)
