@@ -415,11 +415,15 @@ func attachMutationPhaseTimings(payload map[string]any, receiptID string, commit
 		if receiptID == "" || candidate.Key == receiptID {
 			snapshot = candidate
 			payload["publication_phases"] = snapshot
-			if winner := retained.CoalescedPublication(); winner != nil {
+			winner, unavailable := retained.CoalescedPublicationEvidence()
+			if winner != nil {
 				payload["coalesced_publication"] = winner
 				if winner.Background != nil {
 					payload["requested_background"] = winner.Background
 				}
+			}
+			if unavailable != nil {
+				payload["requested_background_unavailable"] = unavailable
 			}
 		}
 	} else if phases := publicationPhasesPayload(receiptID, committedAt); phases != nil {

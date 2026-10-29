@@ -93,7 +93,8 @@ The report retains raw call identities, independent ACK/physical/requested
 background accounting, and missing evidence. RPC return timestamps delimit
 latency; raw JSONL persistence runs on owned per-edit writers with separately
 reported encoding/write overhead. The initial tiny-fixture raw budget is
-8 MiB per edit, with a bounded queue. Exhaustion or persistence failure is
+8 MiB per edit, shared by accepted pending and in-flight bytes. One wake signal
+coalesces small-row bursts without a separate message-count refusal. Exhaustion or persistence failure is
 `harness_evidence_incomplete`, never product failure or a successful check.
 Reference inputs require a reviewed evidence budget before execution. One timed
 public batch restores the file after the measurement window; unknown/pending
@@ -105,6 +106,20 @@ have arrived. Receipt terminality alone still waits for late physical evidence.
 A complete native duplicate P keeps collecting until independent publisher R
 and requested-background B arrive; absent late evidence is not terminal proof
 of missing work. A validated immutable R phase failure can end failed coverage.
+An original-publication-bound `requested_background_unavailable` is also
+terminal failed coverage, not a measured zero or a successful accounting check.
+Unknown or foreign diagnostics do not stop late-evidence collection.
+
+Requested B supports ordered native timer handoffs only when each previous
+timer's actual `Stop` succeeds before its callback starts. Watcher, path and
+actual generation bind each handoff; generation gaps never infer event counts.
+Repeated native arm, quiet, stop and coalescing-control intervals accumulate
+into fixed named scalars, without interval history. A callback that already ran,
+an observed successor or retry/backoff remains unsupported, with its first
+actual immutable invalidation reason retained. Later events cannot erase an
+already accepted historical B window. Such a diagnostic may end collection
+before other late evidence arrives; it does not prove that evidence stays
+unavailable forever.
 
 `mutation_status` can separately expose `read_assisted_publication` when an
 already-needed read repair executes for the exact pending committed bytes.

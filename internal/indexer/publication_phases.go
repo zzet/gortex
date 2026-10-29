@@ -171,26 +171,27 @@ func DefaultPublicationPhases() *PublicationPhaseRecorder { return defaultPublic
 // PublicationPhaseRecord is one edit's (or one fresh request's) path to
 // publication.
 type PublicationPhaseRecord struct {
-	mu              sync.Mutex
-	key             string
-	checkoutID      string
-	source          string
-	ticket          uint64
-	generation      int64
-	origin          time.Time
-	marks           []publicationMark
-	terminal        bool
-	canonicalBound  bool
-	patchLaps       *canonicalPatchEvidence    // immutable, exact accepted attempt only
-	laneWait        *canonicalLaneWaitEvidence // separate from executor-contained laps
-	debounce        *canonicalDebounceEvidence
-	owner           weak.Pointer[PublicationPhaseRecorder] // membership only; never retains an expired recorder
-	acceptedAttempt *PublicationStamps                     // private exact winner witness, cleared on completion
-	attemptWindow   *canonicalAttemptWindow
-	admissions      *canonicalAdmissionEvidence
-	coalescedWinner weak.Pointer[PublicationPhaseRecord] // identity only; never retains an evicted attempt
-	coalescedLinked bool
-	background      *canonicalBackgroundEvidence
+	mu                    sync.Mutex
+	key                   string
+	checkoutID            string
+	source                string
+	ticket                uint64
+	generation            int64
+	origin                time.Time
+	marks                 []publicationMark
+	terminal              bool
+	canonicalBound        bool
+	patchLaps             *canonicalPatchEvidence    // immutable, exact accepted attempt only
+	laneWait              *canonicalLaneWaitEvidence // separate from executor-contained laps
+	debounce              *canonicalDebounceEvidence
+	owner                 weak.Pointer[PublicationPhaseRecorder] // membership only; never retains an expired recorder
+	acceptedAttempt       *PublicationStamps                     // private exact winner witness, cleared on completion
+	attemptWindow         *canonicalAttemptWindow
+	admissions            *canonicalAdmissionEvidence
+	coalescedWinner       weak.Pointer[PublicationPhaseRecord] // identity only; never retains an evicted attempt
+	coalescedLinked       bool
+	background            *canonicalBackgroundEvidence
+	backgroundUnavailable *RequestedBackgroundUnavailable
 }
 
 type publicationMark struct {

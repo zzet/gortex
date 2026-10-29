@@ -80,24 +80,43 @@ type CoalescedPublication struct {
 }
 
 func (p *PublicationPhaseRecord) CoalescedPublication() *CoalescedPublication {
+	winner, _ := p.CoalescedPublicationEvidence()
+	return winner
+}
+
+// CoalescedPublicationEvidence captures the related winner/background or an
+// actual immutable refusal under one recorder-membership fence. A refusal is
+// available even when no independent winner could bind; it is never coverage.
+func (p *PublicationPhaseRecord) CoalescedPublicationEvidence() (*CoalescedPublication, *RequestedBackgroundUnavailable) {
 	if p == nil {
-		return nil
+		return nil, nil
 	}
 	owner := p.owner.Value()
 	if owner == nil {
-		return nil
+		return nil, nil
 	}
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
 	p.mu.Lock()
 	winner, requested, key, background := p.coalescedWinner.Value(), p.ticket, p.key, p.background
+	var unavailable *RequestedBackgroundUnavailable
+	if p.backgroundUnavailable != nil {
+		copy := *p.backgroundUnavailable
+		unavailable = &copy
+	}
 	p.mu.Unlock()
-	if owner.byKey[key] != p || winner == nil {
-		return nil
+	if owner.byKey[key] != p {
+		return nil, nil
+	}
+	if unavailable != nil && unavailable.RequestedGeneration != requested {
+		unavailable = nil
+	}
+	if winner == nil {
+		return nil, unavailable
 	}
 	snapshot := winner.Snapshot()
 	if owner.byKey[snapshot.Key] != winner || snapshot.Ticket <= requested {
-		return nil
+		return nil, unavailable
 	}
 	out := &CoalescedPublication{RequestedGeneration: requested, AppliedGeneration: snapshot.Ticket,
 		Scope: "independent_physical_winner_serving_coalesced_receipt", BackgroundCoverage: "not_established",
@@ -105,5 +124,8 @@ func (p *PublicationPhaseRecord) CoalescedPublication() *CoalescedPublication {
 	if background != nil && background.requested == requested && background.applied == snapshot.Ticket && snapshot.attemptWindow != nil && *snapshot.attemptWindow == background.physical {
 		out.Background = background.project(out.Timings.Window.PatchAccounting)
 	}
-	return out
+	if out.Background != nil {
+		unavailable = nil
+	}
+	return out, unavailable
 }

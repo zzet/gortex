@@ -23,104 +23,269 @@ func canonicalSchedulingEntry(ctx context.Context) (context.Context, time.Time) 
 	return context.WithValue(ctx, canonicalSchedulingKey{}, entered), entered
 }
 
-// Fixed state for one requested timer successfully canceled before callback,
-// followed by exactly one native successor. No event or interval history.
+type canonicalBackgroundStage uint8
+
+const (
+	backgroundAdmission canonicalBackgroundStage = iota
+	backgroundInitialArm
+	backgroundInitialQuiet
+	backgroundHandoff
+	backgroundNativeArm
+	backgroundNativeQuiet
+	backgroundExecuting
+	backgroundReturned
+)
+
+// One ordered scalar per named lap, not an interval/timer history. Native
+// handoffs are counted only after actual successful Stop and actual next arm.
 type canonicalBackgroundOwner struct {
-	mu        sync.Mutex
-	record    weak.Pointer[PublicationPhaseRecord]
-	requested uint64
-	points    [9]time.Time
-	invalid   bool
+	mu                              sync.Mutex
+	record                          weak.Pointer[PublicationPhaseRecord]
+	watcher                         weak.Pointer[Watcher]
+	path, key                       string
+	requested, current, handoffs    uint64
+	origin, last, armStart, entered time.Time
+	phases                          [7]int64
+	stage                           canonicalBackgroundStage
+	invalid                         bool
+	reason                          string
 }
 
-func newCanonicalBackground(record *PublicationPhaseRecord, requested uint64, entered time.Time) *canonicalBackgroundOwner {
-	if record == nil || requested == 0 || entered.IsZero() {
+func newCanonicalBackground(record *PublicationPhaseRecord, w *Watcher, path string, requested uint64, entered time.Time) *canonicalBackgroundOwner {
+	if record == nil || w == nil || path == "" || requested == 0 || entered.IsZero() {
 		return nil
 	}
-	out := &canonicalBackgroundOwner{record: weak.Make(record), requested: requested}
-	out.points[0] = entered
-	return out
+	return &canonicalBackgroundOwner{record: weak.Make(record), watcher: weak.Make(w), path: path, key: record.key, requested: requested, current: requested, origin: entered, last: entered}
 }
-
-func (b *canonicalBackgroundOwner) invalidate() { b.mu.Lock(); b.invalid = true; b.mu.Unlock() }
-func (b *canonicalBackgroundOwner) armStarted(successor bool, at time.Time) {
+func (b *canonicalBackgroundOwner) failLocked(reason string) {
+	b.invalid = true
+	if b.reason == "" {
+		b.reason = reason
+	}
+}
+func (b *canonicalBackgroundOwner) invalidate(reason string) {
+	b.mu.Lock()
+	b.failLocked(reason)
+	b.mu.Unlock()
+}
+func (b *canonicalBackgroundOwner) matchesLocked(w *Watcher, path string, generation uint64) bool {
+	if b.watcher.Value() != w || b.path != path || b.current != generation {
+		b.failLocked("foreign_timer_identity")
+		return false
+	}
+	return !b.invalid
+}
+func (b *canonicalBackgroundOwner) addLocked(lap int, start, end time.Time) bool {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		b.failLocked("invalid_timing_order")
+		return false
+	}
+	delta := end.Sub(start).Nanoseconds()
+	if delta < 0 || b.phases[lap] > math.MaxInt64-delta {
+		b.failLocked("timing_overflow")
+		return false
+	}
+	b.phases[lap] += delta
+	return true
+}
+func (b *canonicalBackgroundOwner) armStarted(w *Watcher, path string, generation uint64, successor bool, at time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	index := 1
-	if successor {
-		index = 5
-	}
-	if !b.points[index].IsZero() {
-		b.invalid = true
-	}
-	b.points[index] = at
-}
-func (b *canonicalBackgroundOwner) armFinished(successor bool, at time.Time) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	index := 2
-	if successor {
-		index = 6
-	}
-	if !b.points[index].IsZero() {
-		b.invalid = true
-	}
-	b.points[index] = at
-}
-func (b *canonicalBackgroundOwner) stopped(successor bool, start, end time.Time, stopped, native bool) *canonicalBackgroundOwner {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if successor || !stopped || !native || !b.points[3].IsZero() || !b.points[7].IsZero() {
-		b.invalid = true
-	}
-	b.points[3], b.points[4] = start, end
 	if b.invalid {
-		return nil
-	}
-	return b
-}
-func (b *canonicalBackgroundOwner) callback(successor bool, at time.Time) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if !successor || !b.points[7].IsZero() {
-		b.invalid = true
-	}
-	b.points[7] = at
-}
-
-type canonicalBackgroundEvidence struct {
-	origin             time.Time
-	points             [9]int64
-	requested, applied uint64
-	physical           canonicalAttemptWindow
-	debounce           canonicalDebounceEvidence
-}
-
-func (b *canonicalBackgroundOwner) finish(attempt *pointPublicationAttempt, entered, end time.Time, retry int) {
-	if attempt == nil || !attempt.independent || retry != 0 {
 		return
 	}
+	if successor {
+		if b.watcher.Value() != w || b.path != path || generation <= b.current {
+			b.failLocked("foreign_timer_identity")
+			return
+		}
+		if b.stage != backgroundHandoff {
+			b.failLocked("unobserved_timer_handoff")
+			return
+		}
+		if b.handoffs == math.MaxUint64 {
+			b.failLocked("handoff_count_overflow")
+			return
+		}
+		if !b.addLocked(4, b.last, at) {
+			return
+		}
+		b.current = generation
+		b.handoffs++
+		b.armStart = at
+		b.stage = backgroundNativeArm
+	} else {
+		if !b.matchesLocked(w, path, generation) {
+			return
+		}
+		if b.stage != backgroundAdmission {
+			b.failLocked("repeated_timer_arm")
+			return
+		}
+		if !b.addLocked(0, b.last, at) {
+			return
+		}
+		b.armStart = at
+		b.stage = backgroundInitialArm
+	}
+	b.last = at
+}
+func (b *canonicalBackgroundOwner) armFinished(w *Watcher, path string, generation uint64, successor bool, at time.Time) {
 	b.mu.Lock()
-	if b.invalid || b.points[7] != entered || !b.points[8].IsZero() {
+	defer b.mu.Unlock()
+	if !b.matchesLocked(w, path, generation) {
+		return
+	}
+	lap, expected, next := 1, backgroundInitialArm, backgroundInitialQuiet
+	if successor {
+		lap, expected, next = 5, backgroundNativeArm, backgroundNativeQuiet
+	}
+	if b.stage != expected {
+		b.failLocked("missing_timer_arm")
+		return
+	}
+	if b.addLocked(lap, b.last, at) {
+		b.last = at
+		b.stage = next
+	}
+}
+func (b *canonicalBackgroundOwner) stopped(w *Watcher, path string, generation uint64, successor bool, start, end time.Time, stopped, native bool) *canonicalBackgroundOwner {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.matchesLocked(w, path, generation) {
+		return nil
+	}
+	if !native {
+		b.failLocked("observed_successor")
+		return nil
+	}
+	if !stopped {
+		b.failLocked("timer_stop_not_successful")
+		return nil
+	}
+	if b.stage == backgroundExecuting || b.stage == backgroundReturned {
+		b.failLocked("timer_callback_already_started")
+		return nil
+	}
+	lap, expected := 2, backgroundInitialQuiet
+	if successor {
+		lap, expected = 6, backgroundNativeQuiet
+	}
+	if b.stage != expected {
+		b.failLocked("unobserved_timer_handoff")
+		return nil
+	}
+	if !b.addLocked(lap, b.last, start) || !b.addLocked(3, start, end) {
+		return nil
+	}
+	b.last = end
+	b.stage = backgroundHandoff
+	return b
+}
+func (b *canonicalBackgroundOwner) callback(w *Watcher, path string, generation uint64, successor bool, at time.Time) {
+	b.mu.Lock()
+	if b.matchesLocked(w, path, generation) {
+		if !successor {
+			b.failLocked("requested_callback_started")
+		} else if b.stage != backgroundNativeQuiet {
+			b.failLocked("timer_callback_already_started")
+		} else if b.addLocked(6, b.last, at) {
+			b.last = at
+			b.entered = at
+			b.stage = backgroundExecuting
+		}
+	}
+	b.mu.Unlock()
+	b.publishUnavailable() // Callback has not acquired watcher/coordinator locks.
+}
+
+// Bounded diagnostic only: it provides neither a measured window nor coverage.
+// The first actual invalidation stays immutable for this retained incarnation.
+type RequestedBackgroundUnavailable struct {
+	PublicationKey         string `json:"publication_key"`
+	Scope                  string `json:"scope"`
+	Reason                 string `json:"reason"`
+	RequestedGeneration    uint64 `json:"requested_generation"`
+	LastObservedGeneration uint64 `json:"last_observed_generation"`
+	ObservedNativeHandoffs uint64 `json:"observed_native_handoffs"`
+}
+
+func (b *canonicalBackgroundOwner) unavailableLocked(reason string) RequestedBackgroundUnavailable {
+	return RequestedBackgroundUnavailable{Scope: "requested_background_observation", Reason: reason, PublicationKey: b.key, RequestedGeneration: b.requested, LastObservedGeneration: b.current, ObservedNativeHandoffs: b.handoffs}
+}
+
+// Caller must not hold watcher/coordinator locks. Recorder membership fencing
+// follows the existing recorder→record order; no expired owner is retained.
+func (b *canonicalBackgroundOwner) publishUnavailable() {
+	b.mu.Lock()
+	if b.reason == "" {
 		b.mu.Unlock()
 		return
 	}
-	b.points[8] = end
-	evidence := canonicalBackgroundEvidence{origin: b.points[0], requested: b.requested}
-	for i, at := range b.points {
-		if at.IsZero() || at.Before(b.points[0]) || i > 0 && at.Before(b.points[i-1]) {
-			b.mu.Unlock()
-			return
-		}
-		evidence.points[i] = at.Sub(b.points[0]).Nanoseconds()
-	}
+	evidence := b.unavailableLocked(b.reason)
 	b.mu.Unlock()
 	record := b.record.Value()
 	if record == nil {
 		return
 	}
 	owner := record.owner.Value()
-	if owner == nil || attempt.record.owner.Value() != owner {
+	if owner == nil {
+		return
+	}
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if owner.byKey[record.key] == record && record.ticket == b.requested && record.background == nil && record.backgroundUnavailable == nil {
+		record.backgroundUnavailable = &evidence
+	}
+}
+
+type canonicalBackgroundEvidence struct {
+	origin                         time.Time
+	phases                         [7]int64
+	startNS, endNS, lastArmStartNS int64
+	requested, applied, handoffs   uint64
+	physical                       canonicalAttemptWindow
+	debounce                       canonicalDebounceEvidence
+}
+
+func (b *canonicalBackgroundOwner) finish(attempt *pointPublicationAttempt, entered, end time.Time, retry int) {
+	if retry != 0 {
+		b.invalidate("retry_or_backoff")
+		b.publishUnavailable()
+		return
+	}
+	if attempt == nil || !attempt.independent {
+		return
+	}
+	b.mu.Lock()
+	if b.invalid {
+		b.mu.Unlock()
+		b.publishUnavailable()
+		return
+	}
+	if b.stage != backgroundExecuting || b.entered != entered || end.Before(entered) {
+		b.failLocked("serving_attempt_binding_mismatch")
+		b.mu.Unlock()
+		b.publishUnavailable()
+		return
+	}
+	b.stage = backgroundReturned
+	evidence := canonicalBackgroundEvidence{origin: b.origin, phases: b.phases, requested: b.requested, applied: b.current, handoffs: b.handoffs, startNS: entered.Sub(b.origin).Nanoseconds(), endNS: end.Sub(b.origin).Nanoseconds(), lastArmStartNS: b.armStart.Sub(b.origin).Nanoseconds()}
+	diagnostic := b.unavailableLocked("serving_attempt_binding_mismatch")
+	b.mu.Unlock()
+	record := b.record.Value()
+	if record == nil {
+		return
+	}
+	owner := record.owner.Value()
+	if owner == nil {
+		return
+	}
+	if attempt.record == nil || attempt.record == record || attempt.record.owner.Value() != owner {
+		b.invalidate("serving_attempt_binding_mismatch")
+		b.publishUnavailable()
 		return
 	}
 	owner.mu.Lock()
@@ -130,8 +295,11 @@ func (b *canonicalBackgroundOwner) finish(attempt *pointPublicationAttempt, ente
 	winner := attempt.record
 	winner.mu.Lock()
 	defer winner.mu.Unlock()
-	if owner.byKey[record.key] != record || owner.byKey[winner.key] != winner || record.ticket != b.requested ||
-		record.coalescedWinner.Value() != winner || record.background != nil || winner.attemptWindow == nil || winner.debounce == nil || winner.ticket <= b.requested {
+	if owner.byKey[record.key] != record || owner.byKey[winner.key] != winner || record.ticket != b.requested || record.background != nil || record.backgroundUnavailable != nil {
+		return
+	}
+	if record.coalescedWinner.Value() != winner || winner.attemptWindow == nil || winner.debounce == nil || winner.ticket != evidence.applied || winner.ticket <= b.requested {
+		record.backgroundUnavailable = &diagnostic
 		return
 	}
 	for _, mark := range record.marks {
@@ -143,46 +311,38 @@ func (b *canonicalBackgroundOwner) finish(attempt *pointPublicationAttempt, ente
 	evidence.physical = *winner.attemptWindow
 	evidence.debounce = *winner.debounce
 	if !winner.origin.Add(time.Duration(evidence.physical.startNS)).Equal(entered) || !winner.origin.Add(time.Duration(evidence.physical.endNS)).Equal(end) || !evidence.valid() {
+		diagnostic.Reason = "physical_evidence_incomplete"
+		record.backgroundUnavailable = &diagnostic
 		return
 	}
-	record.background = &evidence // fresh immutable late scalar, no earlier snapshot mutation
+	record.background = &evidence // Fresh late scalar; no earlier snapshot mutation.
 }
-
 func (b canonicalBackgroundEvidence) valid() bool {
-	if b.origin.IsZero() || b.requested == 0 || b.applied <= b.requested || b.points[0] != 0 {
+	if b.origin.IsZero() || b.requested == 0 || b.applied <= b.requested || b.handoffs == 0 || b.lastArmStartNS < 0 || b.startNS < b.lastArmStartNS || b.endNS < b.startNS {
 		return false
-	}
-	for i, v := range b.points {
-		if v < 0 || i > 0 && v < b.points[i-1] {
-			return false
-		}
 	}
 	p := b.physical.evaluateAccounting()
-	if !p.complete || b.physical.retry != 0 || b.physical.ticket != b.applied || b.physical.endNS-b.physical.startNS != b.points[8]-b.points[7] {
+	if !p.complete || b.physical.retry != 0 || b.physical.ticket != b.applied || b.physical.endNS-b.physical.startNS != b.endNS-b.startNS {
 		return false
 	}
-	if !b.debounce.entered || b.debounce.startedNS < 0 || b.debounce.enteredNS != b.physical.startNS || b.debounce.enteredNS-b.debounce.startedNS != b.points[7]-b.points[5] {
+	if !b.debounce.entered || b.debounce.startedNS < 0 || b.debounce.enteredNS != b.physical.startNS || b.debounce.enteredNS-b.debounce.startedNS != b.startNS-b.lastArmStartNS {
 		return false
 	}
 	sum := int64(0)
-	for i := 1; i < 8; i++ {
-		delta := b.points[i] - b.points[i-1]
-		if sum > math.MaxInt64-delta {
+	for _, delta := range b.phases {
+		if delta < 0 || sum > math.MaxInt64-delta {
 			return false
 		}
 		sum += delta
 	}
-	if p.sumNS < 0 || sum > math.MaxInt64-p.sumNS {
-		return false
-	}
-	return sum+p.sumNS == b.points[8]
+	return sum == b.startNS && p.sumNS >= 0 && sum <= math.MaxInt64-p.sumNS && sum+p.sumNS == b.endNS
 }
 
 var requestedBackgroundLapNames = [...]string{"scheduling_admission_setup", "initial_timer_arm", "canceled_quiet_wait", "timer_stop", "coalescing_control", "successor_timer_arm", "successor_quiet_wait"}
 
-// RequestedBackgroundTiming is one explicitly measured scheduler-entry through
-// serving-return window. It excludes earlier parsing/disk work and may overlap A.
-// Only the one-canceled-timer/one-successor topology is supported here.
+// RequestedBackgroundTiming is one measured scheduler-entry→serving-return
+// window. Repeated native arms/quiet/stops are actual disjoint scalar totals;
+// every canceled timer must have an observed successful pre-callback Stop.
 type RequestedBackgroundTiming struct {
 	Scope               string             `json:"scope"`
 	Coverage            string             `json:"coverage"`
@@ -190,6 +350,7 @@ type RequestedBackgroundTiming struct {
 	OriginWall          string             `json:"origin_wall"`
 	RequestedGeneration uint64             `json:"requested_generation"`
 	AppliedGeneration   uint64             `json:"applied_generation"`
+	NativeHandoffs      uint64             `json:"observed_native_handoffs"`
 	WallMS              float64            `json:"background_wall_ms"`
 	PhasesMS            map[string]float64 `json:"phases_ms"`
 	PartitionComplete   bool               `json:"observed_partition_complete"`
@@ -197,14 +358,16 @@ type RequestedBackgroundTiming struct {
 }
 
 func (b canonicalBackgroundEvidence) project(physical *EditPatchAccounting) *RequestedBackgroundTiming {
-	// This immutable evidence was fully validated at publication. The related
-	// snapshot additionally proves it still names this exact physical value.
 	if physical == nil || !physical.PartitionComplete {
 		return nil
 	}
-	out := &RequestedBackgroundTiming{Scope: "accepted_scheduling_call_entry_to_serving_attempt_return", Coverage: "one_canceled_timer_one_native_successor", SumState: "partial", OriginWall: b.origin.UTC().Format(time.RFC3339Nano), RequestedGeneration: b.requested, AppliedGeneration: b.applied, WallMS: float64(b.points[8]) / 1e6, PhasesMS: make(map[string]float64, 7+canonicalPatchLapCount), PartitionComplete: true}
+	coverage := "one_canceled_timer_one_native_successor"
+	if b.handoffs > 1 {
+		coverage = "successful_pre_callback_native_handoffs"
+	}
+	out := &RequestedBackgroundTiming{Scope: "accepted_scheduling_call_entry_to_serving_attempt_return", Coverage: coverage, SumState: "partial", OriginWall: b.origin.UTC().Format(time.RFC3339Nano), RequestedGeneration: b.requested, AppliedGeneration: b.applied, NativeHandoffs: b.handoffs, WallMS: float64(b.endNS) / 1e6, PhasesMS: make(map[string]float64, 7+canonicalPatchLapCount), PartitionComplete: true}
 	for i, name := range requestedBackgroundLapNames {
-		out.PhasesMS[name] = float64(b.points[i+1]-b.points[i]) / 1e6
+		out.PhasesMS[name] = float64(b.phases[i]) / 1e6
 	}
 	for name, value := range physical.PhasesMS {
 		if value != nil {
@@ -213,7 +376,6 @@ func (b canonicalBackgroundEvidence) project(physical *EditPatchAccounting) *Req
 	}
 	return out
 }
-
 func (p *PublicationPhaseRecord) RequestedBackground() *RequestedBackgroundTiming {
 	if related := p.CoalescedPublication(); related != nil {
 		return related.Background

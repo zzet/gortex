@@ -41,7 +41,7 @@ func TestRequestedBackgroundMeasuresCanceledInitialTimerAndActualP(t *testing.T)
 	w.mu.Unlock()
 	require.NotNil(t, owner)
 	owner.mu.Lock()
-	entered, armStarted := owner.points[0], owner.points[1]
+	entered, armStarted := owner.origin, owner.armStart
 	owner.mu.Unlock()
 	require.False(t, entered.After(gateReleased), "actual scheduler entry precedes blocked admission")
 	require.False(t, armStarted.Before(gateReleased), "admission delay remains inside the measured prefix")
@@ -130,7 +130,7 @@ func TestRequestedBackgroundPreservesAcceptedWinnerDuringLaterAdmission(t *testi
 	require.Nil(t, early.Timings.Window.PatchWallMS, "earlier related snapshots remain immutable")
 }
 
-func TestRequestedBackgroundRefusesAdditionalResetAndObservedPredecessors(t *testing.T) {
+func TestRequestedBackgroundMeasuresNativeChainButRefusesObservedPredecessor(t *testing.T) {
 	for _, secondObserved := range []bool{false, true} {
 		t.Run(map[bool]string{false: "second_native_reset", true: "second_observed_owner"}[secondObserved], func(t *testing.T) {
 			path, _, w := pointPublicationFixture(t)
@@ -159,7 +159,21 @@ func TestRequestedBackgroundRefusesAdditionalResetAndObservedPredecessors(t *tes
 				winner := r.CoalescedPublication()
 				return winner != nil && winner.Timings.Window.PatchWallMS != nil
 			}, 5*time.Second, time.Millisecond)
-			require.Nil(t, firstRecord.RequestedBackground())
+			if secondObserved {
+				require.Nil(t, firstRecord.RequestedBackground())
+				_, firstFailure := firstRecord.CoalescedPublicationEvidence()
+				_, secondFailure := secondRecord.CoalescedPublicationEvidence()
+				require.NotNil(t, firstFailure)
+				require.NotNil(t, secondFailure)
+				require.Equal(t, "observed_successor", firstFailure.Reason)
+				require.Equal(t, "preexisting_path_work", secondFailure.Reason)
+			} else {
+				require.Eventually(t, func() bool { return firstRecord.RequestedBackground() != nil }, 5*time.Second, time.Millisecond)
+				background := firstRecord.RequestedBackground()
+				require.Equal(t, uint64(2), background.NativeHandoffs)
+				require.Equal(t, third.Generation, background.AppliedGeneration)
+				require.Equal(t, "successful_pre_callback_native_handoffs", background.Coverage)
+			}
 			require.Nil(t, secondRecord.RequestedBackground())
 		})
 	}
@@ -168,7 +182,7 @@ func TestRequestedBackgroundRefusesAdditionalResetAndObservedPredecessors(t *tes
 func TestRequestedBackgroundRejectsIncompleteOrInvalidIntegerBounds(t *testing.T) {
 	_, origin, window := controlledAttemptWindow(t)
 	window.ticket = 2
-	valid := canonicalBackgroundEvidence{origin: origin, requested: 1, applied: 2, physical: window, debounce: canonicalDebounceEvidence{startedNS: 0, enteredNS: 1e6, entered: true}, points: [9]int64{0, 1, 2, 3, 4, 5, 6, 1e6 + 5, 31e6 + 5}}
+	valid := canonicalBackgroundEvidence{origin: origin, requested: 1, applied: 2, handoffs: 1, physical: window, debounce: canonicalDebounceEvidence{startedNS: 0, enteredNS: 1e6, entered: true}, phases: [7]int64{1, 1, 1, 1, 1, 1, 999999}, lastArmStartNS: 5, startNS: 1e6 + 5, endNS: 31e6 + 5}
 	require.True(t, valid.valid())
 	for _, name := range []string{"missing", "reversed", "overflow", "incomplete_P", "wrong_winner", "retry", "gap", "debounce_disagrees", "debounce_missing"} {
 		t.Run(name, func(t *testing.T) {
@@ -177,9 +191,9 @@ func TestRequestedBackgroundRejectsIncompleteOrInvalidIntegerBounds(t *testing.T
 			case "missing":
 				b.origin = time.Time{}
 			case "reversed":
-				b.points[3] = 1
+				b.phases[3] = -1
 			case "overflow":
-				b.points[8] = math.MaxInt64
+				b.phases[6] = math.MaxInt64
 			case "incomplete_P":
 				b.physical.accounting.laps[patchParse] = canonicalLapEvidence{}
 			case "wrong_winner":
@@ -187,7 +201,7 @@ func TestRequestedBackgroundRejectsIncompleteOrInvalidIntegerBounds(t *testing.T
 			case "retry":
 				b.physical.retry = 1
 			case "gap":
-				b.points[8]++
+				b.endNS++
 			case "debounce_disagrees":
 				b.debounce.enteredNS++
 			case "debounce_missing":
@@ -202,20 +216,21 @@ func TestRequestedBackgroundCallbackAndStopFailuresInvalidateOwnership(t *testin
 	for _, name := range []string{"callback_ran", "stop_false", "observed_successor", "retry", "second_stop"} {
 		t.Run(name, func(t *testing.T) {
 			record := newPointPublication(t, "background-invalid")
-			b := newCanonicalBackground(record, 1, time.Now())
+			w := &Watcher{}
+			b := newCanonicalBackground(record, w, "sample.go", 1, time.Now())
 			require.NotNil(t, b)
 			switch name {
 			case "callback_ran":
-				b.callback(false, time.Now())
+				b.callback(w, "sample.go", 1, false, time.Now())
 			case "stop_false":
-				b.stopped(false, time.Now(), time.Now(), false, true)
+				b.stopped(w, "sample.go", 1, false, time.Now(), time.Now(), false, true)
 			case "observed_successor":
-				b.stopped(false, time.Now(), time.Now(), true, false)
+				b.stopped(w, "sample.go", 1, false, time.Now(), time.Now(), true, false)
 			case "retry":
-				b.invalidate()
+				b.invalidate("retry_or_backoff")
 			case "second_stop":
-				b.stopped(false, time.Now(), time.Now(), true, true)
-				b.stopped(true, time.Now(), time.Now(), true, true)
+				b.stopped(w, "sample.go", 1, false, time.Now(), time.Now(), true, true)
+				b.stopped(w, "sample.go", 1, true, time.Now(), time.Now(), true, true)
 			}
 			b.mu.Lock()
 			invalid := b.invalid

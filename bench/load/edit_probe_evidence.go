@@ -310,8 +310,12 @@ func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAc
 	background, _ := status["requested_background"].(map[string]any)
 	bReq, _ := strconvEditProbeUint(background["requested_generation"])
 	bApplied, _ := strconvEditProbeUint(background["applied_generation"])
-	if background["observed_partition_complete"] != true || background["scope"] != "accepted_scheduling_call_entry_to_serving_attempt_return" || background["coverage"] != "one_canceled_timer_one_native_successor" || background["sum_state"] != "partial" || bReq != requested || bApplied != applied {
+	if background["observed_partition_complete"] != true || background["scope"] != "accepted_scheduling_call_entry_to_serving_attempt_return" || !editProbeSupportedBackgroundCoverage(background) || background["sum_state"] != "partial" || bReq != requested || bApplied != applied {
 		fail("requested B unavailable for actual topology/identity")
+	}
+	refusal, backgroundUnavailable := editProbeOwnedBackgroundRefusal(status, receipt, requested)
+	if backgroundUnavailable {
+		fail("requested B observed unavailable: " + refusal)
 	}
 	bPhases, _ := background["phases_ms"].(map[string]any)
 	if _, duplicate := bPhases["debounce"]; duplicate {
@@ -335,6 +339,8 @@ func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAc
 	}
 	if len(out.Reasons) == 0 {
 		out.State = "observed_single_window_checks_pass"
+	} else if ownerKnown && backgroundUnavailable {
+		out.State = "terminal_unavailable_background"
 	} else if ownerKnown && (editProbeImmutablePartialPhysical(physical, publication, applied) ||
 		duplicate && editProbeImmutablePartialReadRepair(status["read_assisted_publication"], status, receipt, requested)) {
 		out.State = "terminal_partial_physical"
@@ -397,7 +403,50 @@ func editProbeObservedDuplicatePhysical(physical, publication map[string]any, ap
 }
 
 func editProbeFinished(graphTerminal, allCorrect, requireAccounting bool, accounting editProbeAccounting) bool {
-	return graphTerminal && allCorrect && (!requireAccounting || accounting.State == "observed_single_window_checks_pass" || accounting.State == "terminal_partial_physical")
+	return graphTerminal && allCorrect && (!requireAccounting || accounting.State == "observed_single_window_checks_pass" || accounting.State == "terminal_partial_physical" || accounting.State == "terminal_unavailable_background")
+}
+
+func editProbeSupportedBackgroundCoverage(background map[string]any) bool {
+	count, present := background["observed_native_handoffs"]
+	handoffs, err := strconvEditProbeUint(count)
+	switch background["coverage"] {
+	case "one_canceled_timer_one_native_successor":
+		return !present || err == nil && handoffs == 1 // Historical single-handoff wire shape.
+	case "successful_pre_callback_native_handoffs":
+		return present && err == nil && handoffs >= 2
+	default:
+		return false
+	}
+}
+
+// Only an actual frozen refusal for this original publication can stop late-B
+// collection. Missing B, unknown/malformed diagnostics and foreign owners wait.
+// This is terminal failed coverage, never measured work or a successful edit.
+func editProbeOwnedBackgroundRefusal(status map[string]any, receipt string, requested uint64) (string, bool) {
+	if receipt == "" || status["receipt"] != receipt || requested == 0 || status["requested_background"] != nil {
+		return "", false
+	}
+	original, _ := status["publication_phases"].(map[string]any)
+	key, _ := original["key"].(string)
+	ticket, ticketErr := strconvEditProbeUint(original["ticket"])
+	if key == "" || ticketErr != nil || ticket != requested || original["source"] != "mcp_edit" || original["clock"] != "monotonic" {
+		return "", false
+	}
+	diagnostic, _ := status["requested_background_unavailable"].(map[string]any)
+	dReq, reqErr := strconvEditProbeUint(diagnostic["requested_generation"])
+	last, lastErr := strconvEditProbeUint(diagnostic["last_observed_generation"])
+	applied, appliedErr := strconvEditProbeUint(status["applied_generation"])
+	handoffs, countErr := strconvEditProbeUint(diagnostic["observed_native_handoffs"])
+	if diagnostic["scope"] != "requested_background_observation" || diagnostic["publication_key"] != key || reqErr != nil || dReq != requested || lastErr != nil || last < requested || appliedErr != nil || last > applied || countErr != nil || handoffs > 0 && last == requested {
+		return "", false
+	}
+	reason, _ := diagnostic["reason"].(string)
+	switch reason {
+	case "foreign_timer_identity", "invalid_timing_order", "timing_overflow", "handoff_count_overflow", "unobserved_timer_handoff", "repeated_timer_arm", "missing_timer_arm", "observed_successor", "preexisting_path_work", "timer_stop_not_successful", "timer_callback_already_started", "requested_callback_started", "retry_or_backoff", "serving_attempt_binding_mismatch", "physical_evidence_incomplete":
+		return reason, true
+	default:
+		return "", false
+	}
 }
 
 var requestedBackgroundLapNamesForProbe = []string{"scheduling_admission_setup", "initial_timer_arm", "canceled_quiet_wait", "timer_stop", "coalescing_control", "successor_timer_arm", "successor_quiet_wait"}
