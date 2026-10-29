@@ -52,6 +52,7 @@ type ReadRepairObservation struct {
 	// accepted-read receipt must still match the pending commit's exact bytes.
 	executionSucceeded bool
 	acceptedBlobSHA    string
+	acceptedAt         time.Time
 	contentAmbiguous   bool
 	// Execution supplies the concrete owner; a prefix lookup at completion
 	// could instead find a replacement. Do not retain a retired Indexer.
@@ -67,11 +68,17 @@ type ReadRepairObservation struct {
 func (o ReadRepairObservation) AcceptedFor(owner *Indexer, blobSHA string) bool {
 	return owner != nil && o.owner.Value() == owner && o.executionSucceeded &&
 		o.causesComplete && !o.contentAmbiguous && blobSHA != "" && o.acceptedBlobSHA == blobSHA &&
-		o.generation != 0 && !o.started.IsZero() && !o.finished.Before(o.started)
+		o.generation != 0 && !o.started.IsZero() && !o.finished.Before(o.started) &&
+		!o.acceptedAt.IsZero() && !o.acceptedAt.Before(o.started) && !o.acceptedAt.After(o.finished)
 }
 
 // Bounds are the actual execution endpoints, independent of receipt lifetime.
 func (o ReadRepairObservation) Bounds() (time.Time, time.Time) { return o.started, o.finished }
+
+// AcceptedAt is the actual applied-and-fresh acceptance, not callback time.
+// Keep the first acceptance so repeated same-byte validation cannot move it
+// past a later commit and claim a publication that preceded that commit.
+func (o ReadRepairObservation) AcceptedAt() time.Time { return o.acceptedAt }
 
 // Generation identifies the executed drain within its concrete owner.
 func (o ReadRepairObservation) Generation() uint64 { return o.generation }
@@ -92,10 +99,15 @@ func (o *ReadRepairObservation) acceptFreshBlob(path, blobSHA string, applied bo
 	}
 	if o.acceptedBlobSHA != "" && o.acceptedBlobSHA != blobSHA {
 		o.acceptedBlobSHA = ""
+		o.acceptedAt = time.Time{}
 		o.contentAmbiguous = true
 		return
 	}
+	if o.acceptedBlobSHA == blobSHA {
+		return
+	}
 	o.acceptedBlobSHA = blobSHA
+	o.acceptedAt = time.Now()
 }
 
 // Derive the ledger's Git blob identity from the exact untransformed buffer

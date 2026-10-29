@@ -129,6 +129,7 @@ func TestReadRepairActualExecutorStraddlesCommittedBookkeeping(t *testing.T) {
 	start, end := observed.observation.Bounds()
 	require.True(t, start.Before(record.committedAt), "real execution must straddle bookkeeping")
 	require.True(t, end.After(record.committedAt))
+	require.False(t, observed.observation.AcceptedAt().Before(record.committedAt))
 	require.True(t, observed.observation.AcceptedFor(idx, gitBlobSHA(after)))
 	require.NotEmpty(t, g.FindNodesByName("AddedByStraddlingReader"))
 	require.NotNil(t, record.snapshot().readRepair, "accepted publication after commit must retain its independent executor window")

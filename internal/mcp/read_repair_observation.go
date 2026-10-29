@@ -163,7 +163,7 @@ func (w mutationReadRepairWitness) complete(observation indexer.ReadRepairObserv
 		return
 	}
 	started, finished := observation.Bounds()
-	if ready.committedAt.IsZero() || started.Before(ready.committedAt) {
+	if ready.committedAt.IsZero() || observation.AcceptedAt().Before(ready.committedAt) {
 		return
 	}
 	w = ready

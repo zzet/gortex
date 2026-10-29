@@ -18,7 +18,7 @@ func TestReadRepairAcceptanceRequiresConcreteOwnerAndBytes(t *testing.T) {
 	replacement := &Indexer{}
 	now := time.Now()
 	observation := ReadRepairObservation{
-		generation: 2, started: now, finished: now,
+		generation: 2, started: now, acceptedAt: now, finished: now,
 		causesComplete: true, executionSucceeded: true,
 		acceptedBlobSHA: readRepairBlobSHA([]byte("accepted")), owner: weak.Make(owner),
 	}
@@ -27,6 +27,13 @@ func TestReadRepairAcceptanceRequiresConcreteOwnerAndBytes(t *testing.T) {
 	}
 	if observation.AcceptedFor(replacement, observation.acceptedBlobSHA) || observation.AcceptedFor(owner, readRepairBlobSHA([]byte("newer"))) {
 		t.Fatal("replacement owner or newer content borrowed earlier evidence")
+	}
+	for _, invalid := range []time.Time{{}, now.Add(-time.Nanosecond), now.Add(time.Nanosecond)} {
+		copy := observation
+		copy.acceptedAt = invalid
+		if copy.AcceptedFor(owner, observation.acceptedBlobSHA) {
+			t.Fatal("missing or out-of-window acceptance fabricated publication")
+		}
 	}
 	observation.owner = weak.Pointer[Indexer]{}
 	if observation.AcceptedFor(owner, observation.acceptedBlobSHA) {
@@ -63,6 +70,7 @@ func TestReadRepairInertSameBytesCannotClaimEarlierPublication(t *testing.T) {
 	}
 	receipt.readRepairApplied = true
 	observation.acceptFreshBlob("file.go", receipt.readRepairBlobSHA, receipt.readRepairApplied)
+	observation.finished = time.Now()
 	if !observation.AcceptedFor(owner, receipt.readRepairBlobSHA) {
 		t.Fatal("actual accepted apply lost its content proof")
 	}
@@ -106,6 +114,10 @@ func TestRepositoryReadRepairAcceptedContentCannotChangeOwners(t *testing.T) {
 	}
 	observation.acceptFreshBlob("target.go", older, true)
 	immutable := *observation
+	observation.acceptFreshBlob("target.go", older, true)
+	if !observation.acceptedAt.Equal(immutable.acceptedAt) {
+		t.Fatal("same bytes replaced their actual first publication time")
+	}
 	observation.acceptFreshBlob("target.go", newer, true)
 	observation.acceptFreshBlob("target.go", older, true)
 	if observation.acceptedBlobSHA != "" || !observation.contentAmbiguous || immutable.acceptedBlobSHA != older {
