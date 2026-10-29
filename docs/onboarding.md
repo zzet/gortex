@@ -151,6 +151,29 @@ All four degrade silently when the bridge is unreachable — they never block yo
 
 ## Troubleshooting
 
+### Recovering from a runaway warmup
+
+If you accidentally tracked a home directory, repository parent or another
+large tree, stop the daemon before removing it from the tracked configuration:
+
+```sh
+gortex daemon stop
+gortex untrack /absolute/path/to/unwanted-repository
+gortex daemon start
+```
+
+When an installed service manager owns the daemon, `daemon stop` goes through
+that manager. The stop intent also keeps an editor's MCP proxy from immediately
+restarting it. With the daemon down, `untrack` edits configuration only and
+prints `(config only)`; use the absolute repository path, not its bare prefix.
+Keep the daemon stopped until that command succeeds.
+
+On the next start, the orphan-prefix purge removes the untracked repository's
+stored rows instead of warming it again. Run `gortex daemon status` in another
+terminal: the unwanted repository should be absent, and the repositories you
+kept should become ready. This procedure does not promise that online untrack
+can interrupt a repository that is still warming.
+
 **"Gortex MCP server failed to start" in the IDE.**
 Check that `gortex` is on your `PATH` (`which gortex` should resolve). If you installed via Homebrew, restart the IDE — it caches PATH at launch.
 
