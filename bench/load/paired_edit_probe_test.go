@@ -198,7 +198,7 @@ func TestPairedEditBlockedACKCannotShiftNextOfferedPair(t *testing.T) {
 }
 
 func TestPairedEditPolicyKeepsBaselinePhasesExplicitAndPlanExact(t *testing.T) {
-	args := []string{"--build", "main=/private/main", "--build", "candidate=/private/candidate", "--manifest", "/private/manifest.json", "--scratch", t.TempDir(), "--scenario", editProbeScenario, "--agents", "0", "--edit-agents", "1", "--edit-count", "100"}
+	args := []string{"--build", "main=/private/main", "--build", "candidate=/private/candidate", "--manifest", "/private/manifest.json", "--scratch", t.TempDir(), "--scenario", editProbeScenario, "--agents", "0", "--edit-agents", "1", "--worktrees", "0", "--edit-count", "100"}
 	options, builds, err := parsePaired(args)
 	if err != nil || len(builds) != 2 || options.EditCount != 100 {
 		t.Fatalf("initial paired policy: %v %v", builds, err)

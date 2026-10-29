@@ -348,7 +348,8 @@ second:
 go run ./bench/load paired --build main=/private/bin/main \
   --build candidate=/private/bin/candidate --manifest /private/corpus.json \
   --scratch /private/paired-artifacts --host native --scenario edit-and-probe \
-  --agents 0 --edit-agents 1 --edit-count 100 --seed 42 --out /private/paired.json
+  --agents 0 --edit-agents 1 --worktrees 0 --edit-count 100 --seed 42 \
+  --out /private/paired.json
 ```
 
 Both daemons run concurrently with independent clones, stores and sockets. They
