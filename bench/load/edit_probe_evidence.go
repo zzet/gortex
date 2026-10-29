@@ -442,7 +442,7 @@ func editProbeOwnedBackgroundRefusal(status map[string]any, receipt string, requ
 	}
 	reason, _ := diagnostic["reason"].(string)
 	switch reason {
-	case "foreign_timer_identity", "invalid_timing_order", "timing_overflow", "handoff_count_overflow", "unobserved_timer_handoff", "repeated_timer_arm", "missing_timer_arm", "observed_successor", "preexisting_path_work", "timer_stop_not_successful", "timer_callback_already_started", "requested_callback_started", "retry_or_backoff", "serving_attempt_binding_mismatch", "physical_evidence_incomplete":
+	case "foreign_timer_identity", "invalid_timing_order", "timing_overflow", "handoff_count_overflow", "unobserved_timer_handoff", "repeated_timer_arm", "missing_timer_arm", "observed_successor", "preexisting_path_work", "timer_stop_not_successful", "timer_callback_already_started", "requested_callback_started", "timer_claim_superseded", "retry_or_backoff", "serving_attempt_unavailable", "serving_attempt_binding_mismatch", "physical_evidence_incomplete":
 		return reason, true
 	default:
 		return "", false

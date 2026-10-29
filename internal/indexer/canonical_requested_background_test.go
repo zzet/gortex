@@ -296,4 +296,7 @@ func TestRequestedBackgroundRejectsSupersessionBeforeAcceptance(t *testing.T) {
 	}, 5*time.Second, time.Millisecond)
 	require.Equal(t, newer.Generation, record.CoalescedPublication().AppliedGeneration)
 	require.Nil(t, record.RequestedBackground(), "the unobserved superseding quiet/reset chain is unavailable")
+	_, unavailable := record.CoalescedPublicationEvidence()
+	require.NotNil(t, unavailable)
+	require.Equal(t, "serving_attempt_binding_mismatch", unavailable.Reason)
 }

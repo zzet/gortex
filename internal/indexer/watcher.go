@@ -2051,6 +2051,10 @@ func (w *Watcher) armPointMutationTimerLocked(path string, kind ChangeKind, gene
 		// Timer.Stop can lose a race with a callback that is already queued.
 		// Only the newest timer may consume the pending entry.
 		if !w.claimPendingTimer(path, &timer) {
+			if observation != nil && observation.background != nil {
+				observation.background.invalidate("timer_claim_superseded")
+				observation.background.publishUnavailable()
+			}
 			return
 		}
 		publication := w.runPointMutationObserved(path, kind, generation, retryAttempt, observation)
@@ -2062,6 +2066,9 @@ func (w *Watcher) armPointMutationTimerLocked(path string, kind ChangeKind, gene
 			if observation.background != nil {
 				observation.background.finish(publication, observation.entered, finished, retryAttempt)
 			}
+		} else if observation != nil && observation.background != nil {
+			observation.background.invalidate("serving_attempt_unavailable")
+			observation.background.publishUnavailable()
 		}
 	})
 	w.pending[path] = timer
