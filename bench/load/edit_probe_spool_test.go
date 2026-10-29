@@ -27,8 +27,19 @@ type editProbeHeldSink struct {
 func newEditProbeHeldSink(t *testing.T) *editProbeHeldSink {
 	t.Helper()
 	sink := &editProbeHeldSink{started: make(chan struct{}), release: make(chan struct{})}
-	t.Cleanup(sink.unblock)
 	return sink
+}
+
+func startHeldEditProbeSpool(t *testing.T, sink *editProbeHeldSink) *editProbeState {
+	t.Helper()
+	state := &editProbeState{sink: sink}
+	state.startRaw()
+	t.Cleanup(func() {
+		sink.unblock()
+		state.finishRaw()
+		_ = sink.Close()
+	})
+	return state
 }
 func (s *editProbeHeldSink) unblock() { s.unblockOnce.Do(func() { close(s.release) }) }
 func (s *editProbeHeldSink) Write(p []byte) (int, error) {
@@ -62,8 +73,7 @@ func awaitEditProbeSpool(t *testing.T, done <-chan struct{}) {
 
 func TestEditProbeSpoolAcceptsMoreThan32RowsWithoutWriterBackpressure(t *testing.T) {
 	sink := newEditProbeHeldSink(t)
-	state := &editProbeState{sink: sink}
-	state.startRaw()
+	state := startHeldEditProbeSpool(t, sink)
 	if err := state.emit(map[string]int{"ordinal": -1}); err != nil {
 		t.Fatal(err)
 	}
@@ -108,8 +118,7 @@ func TestEditProbeSpoolAcceptsMoreThan32RowsWithoutWriterBackpressure(t *testing
 
 func TestEditProbeSpoolByteCapCountsInFlightBytesAndStillDrainsAcceptedData(t *testing.T) {
 	sink := newEditProbeHeldSink(t)
-	state := &editProbeState{sink: sink}
-	state.startRaw()
+	state := startHeldEditProbeSpool(t, sink)
 	if err := state.emit(strings.Repeat("x", editProbeRawLimit-3)); err != nil {
 		t.Fatal(err)
 	}
@@ -132,8 +141,7 @@ func TestEditProbeSpoolRetainsWriteAndShortWriteFailures(t *testing.T) {
 			if !short {
 				sink.writeErr = errors.New("owned sink failure")
 			}
-			state := &editProbeState{sink: sink}
-			state.startRaw()
+			state := startHeldEditProbeSpool(t, sink)
 			if err := state.emit(map[string]bool{"required": true}); err != nil {
 				t.Fatal(err)
 			}
@@ -154,8 +162,8 @@ func TestEditProbeSpoolCancellationJoinsProducerThenDrainsBeforeClose(t *testing
 	sink := newEditProbeHeldSink(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	state := &editProbeState{sink: sink, cancel: cancel}
-	state.startRaw()
+	state := startHeldEditProbeSpool(t, sink)
+	state.cancel = cancel
 	if err := state.emit(map[string]string{"event": "before_cancel"}); err != nil {
 		t.Fatal(err)
 	}
