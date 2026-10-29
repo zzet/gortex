@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"encoding/json"
 	"math"
 	"runtime"
 	"testing"
@@ -42,7 +43,7 @@ func TestRequestedBackgroundAccumulatesActualOrderedHandoffsNotGenerationDelta(t
 }
 
 func TestRequestedBackgroundHandoffRefusesForeignAndUnobservedTransitions(t *testing.T) {
-	for _, name := range []string{"owner", "path", "generation", "stop_failed", "callback_started", "observed_successor", "arm_without_stop", "reordered", "retry", "count_overflow"} {
+	for _, name := range []string{"owner", "path", "generation", "stop_failed", "callback_started", "observed_successor", "arm_without_stop", "reordered", "retry", "count_overflow", "phase_overflow"} {
 		t.Run(name, func(t *testing.T) {
 			b, w, record, origin := controlledBackgroundHandoff(t)
 			want := "foreign_timer_identity"
@@ -73,6 +74,13 @@ func TestRequestedBackgroundHandoffRefusesForeignAndUnobservedTransitions(t *tes
 				b.handoffs = math.MaxUint64
 				b.armStarted(w, "sample.go", 40, true, origin.Add(5*time.Nanosecond))
 				want = "handoff_count_overflow"
+			case "phase_overflow":
+				require.Same(t, b, b.stopped(w, "sample.go", 10, false, origin.Add(3*time.Nanosecond), origin.Add(4*time.Nanosecond), true, true))
+				b.armStarted(w, "sample.go", 40, true, origin.Add(5*time.Nanosecond))
+				b.armFinished(w, "sample.go", 40, true, origin.Add(6*time.Nanosecond))
+				b.phases[6] = math.MaxInt64
+				b.stopped(w, "sample.go", 40, true, origin.Add(7*time.Nanosecond), origin.Add(8*time.Nanosecond), true, true)
+				want = "timing_overflow"
 			case "callback_started":
 				require.Same(t, b, b.stopped(w, "sample.go", 10, false, origin.Add(3*time.Nanosecond), origin.Add(4*time.Nanosecond), true, true))
 				b.armStarted(w, "sample.go", 40, true, origin.Add(5*time.Nanosecond))
@@ -87,6 +95,13 @@ func TestRequestedBackgroundHandoffRefusesForeignAndUnobservedTransitions(t *tes
 			require.NotNil(t, unavailable)
 			require.Equal(t, want, unavailable.Reason)
 			require.Equal(t, uint64(10), unavailable.RequestedGeneration)
+			wire, err := json.Marshal(unavailable)
+			require.NoError(t, err)
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(wire, &payload))
+			require.Equal(t, record.Snapshot().Key, payload["publication_key"])
+			require.Equal(t, want, payload["reason"])
+			require.Equal(t, "requested_background_observation", payload["scope"])
 			require.Nil(t, record.RequestedBackground())
 			unavailable.Reason = "caller-mutation"
 			_, again := record.CoalescedPublicationEvidence()
