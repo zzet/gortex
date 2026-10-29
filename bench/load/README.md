@@ -340,6 +340,37 @@ reports and failures, repeat on the same host before p95 repeatability claims,
 and balance standalone build order per scenario. Coupled ratios do not replace
 independent scaling measurements.
 
+The initial Go `add_intrafile_call` / `edit.file` / JSON accounting cell can use
+the same dispatcher with exactly two builds, baseline first and candidate
+second:
+
+```sh
+go run ./bench/load paired --build main=/private/bin/main \
+  --build candidate=/private/bin/candidate --manifest /private/corpus.json \
+  --scratch /private/paired-artifacts --host native --scenario edit-and-probe \
+  --agents 0 --edit-agents 1 --edit-count 100 --seed 42 --out /private/paired.json
+```
+
+Both daemons run concurrently with independent clones, stores and sockets. They
+share the exact precomputed offered Poisson schedule. Edits and all seven oracle
+requests use the existing rotating back-to-back dispatch and matched per-request
+median ratios. Each build retains one separately opened prober session per edit;
+setup precedes the measurement window. A blocked ACK or probe does not serialize
+later offered edits. Actual lateness, errors and canceled/unstarted entries remain
+in the full offered denominator.
+
+Each build starts its immediate file/source readbacks after its own ACK, without
+waiting for its partner. Those readbacks, receipt polling and stats are build-local
+and **unpaired**; their latencies are excluded from matched ratios. First-correct
+times are coupled paired-probe observations: waiting for the partner response can
+delay the next probe, so these are not independent 25 ms freshness-budget results.
+Missing baseline phase instrumentation stays unavailable, while candidate A/P/B
+and applicable independent R accounting remain required. Evidence loss cancels
+that edit's paired probes and is a failed/censored observation, never a product
+deadline or a successful pair. This initial cell does not establish reference
+capacity, the larger tool/language/native matrix, or a no-regression verdict
+without the actual qualified paired run.
+
 `delta` rejects incompatible workload/corpus/target/host-limit identities rather
 than printing an unqualified verdict. It lists every comparable timing metric
 more than 15% slower, without introducing budgets or CI pass/fail lanes.

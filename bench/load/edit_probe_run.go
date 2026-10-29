@@ -79,6 +79,7 @@ type editProbeState struct {
 	writeNS, encodeNS                                 int64
 	sinkErr                                           error
 	cancel                                            context.CancelFunc
+	pairedContext                                     context.Context // shared per-edit probes; cleared after joined completion
 	probes                                            sync.WaitGroup
 	started, acknowledged, firstProbeWrite, editWrite time.Time
 }
@@ -593,9 +594,15 @@ func (r *editProbeRuntime) finish() error {
 		s.stopProbes()
 		s.finishRaw()
 		s.mu.Lock()
+		s.pairedContext = nil
 		if s.record.Outcome == "not_started" {
 			s.record.Outcome = "phase_censored"
 			s.record.Errors = append(s.record.Errors, "planned edit never dispatched")
+		}
+		if s.record.Outcome == "complete" && len(s.record.Errors) != 0 {
+			// A coupled partner can lose evidence after this continuation's
+			// own result completed, but before all paired probes are joined.
+			s.record.Outcome = "diagnostic_failure"
 		}
 		record := s.record
 		s.mu.Unlock()
