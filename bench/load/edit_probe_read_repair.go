@@ -61,7 +61,15 @@ func editProbeReadRepairIdentity(raw any, status map[string]any, receipt string,
 	wall, wallErr := strconvEditProbeUint(r["window_ns"])
 	blob, _ := r["accepted_blob_sha"].(string)
 	_, blobErr := hex.DecodeString(blob)
-	if ownerErr != nil || owner == 0 || reqErr != nil || req != requested || r["requested_receipt"] != receipt ||
+	// The public commit receipt and caller-chosen mutation_id are not the
+	// internal admission/publication key. Use the original requested timeline,
+	// never the independently keyed coalesced physical winner.
+	original, _ := status["publication_phases"].(map[string]any)
+	internal, _ := original["key"].(string)
+	ticket, ticketErr := strconvEditProbeUint(original["ticket"])
+	if receipt == "" || status["receipt"] != receipt || internal == "" || r["requested_receipt"] != internal ||
+		ticketErr != nil || ticket != requested || original["source"] != "mcp_edit" || original["clock"] != "monotonic" ||
+		ownerErr != nil || owner == 0 || reqErr != nil || req != requested ||
 		wallErr != nil || wall > math.MaxInt64 || len(blob) != 40 || blobErr != nil || blob != status["new_sha"] ||
 		r["scope"] != "read_assisted_reconcile" || r["clock"] != "monotonic" ||
 		r["additive_with_requested_background"] != false || r["background_relationship"] != "unavailable" {

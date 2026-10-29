@@ -8,6 +8,9 @@ import (
 func editProbeRepairAccountingFixture() map[string]any {
 	body := editProbeAccountingFixture()
 	body["new_sha"] = "ce013625030ba8dba906f756967f9e9ca394464a"
+	body["mutation_id"] = "caller-logical-id"
+	original := body["publication_phases"].(map[string]any)
+	original["ticket"], original["source"], original["clock"] = json.Number("1"), "mcp_edit", "monotonic"
 	winner := body["coalesced_publication"].(map[string]any)
 	pub := winner["publication_phases"].(map[string]any)
 	pub["clock"], pub["terminal"] = "monotonic", true
@@ -29,7 +32,7 @@ func editProbeRepairAccountingFixture() map[string]any {
 	}
 	body["read_assisted_publication"] = map[string]any{
 		"scope": "read_assisted_reconcile", "clock": "monotonic", "owner_generation": json.Number("3"),
-		"requested_receipt": "receipt-a", "requested_generation": json.Number("1"), "accepted_blob_sha": body["new_sha"],
+		"requested_receipt": "original", "requested_generation": json.Number("1"), "accepted_blob_sha": body["new_sha"],
 		"window_ns": json.Number("8000000"), "additive_with_requested_background": false, "background_relationship": "unavailable",
 		"reader_causes": []any{
 			map[string]any{"session": "reader", "request_id_key": "n:7", "admission_generation": json.Number("2")},
@@ -59,7 +62,7 @@ func TestEditProbeValidatesIndependentPublisherWithoutSummingOverlappingWindows(
 }
 
 func TestEditProbeMissingOrContradictoryPublisherRefusesSuccess(t *testing.T) {
-	for _, bad := range []string{"missing", "bytes", "receipt", "requested", "owner", "bounds", "missing_phase", "phase_state", "extra_phase", "sum", "additive", "duplicate_admission"} {
+	for _, bad := range []string{"missing", "bytes", "receipt", "requested", "owner", "bounds", "missing_phase", "phase_state", "extra_phase", "sum", "additive", "duplicate_admission", "missing_internal", "public_receipt", "caller_id", "missing_original", "original_ticket", "original_source", "original_clock", "swapped_winner"} {
 		t.Run(bad, func(t *testing.T) {
 			body := editProbeRepairAccountingFixture()
 			r := body["read_assisted_publication"].(map[string]any)
@@ -71,6 +74,22 @@ func TestEditProbeMissingOrContradictoryPublisherRefusesSuccess(t *testing.T) {
 				r["accepted_blob_sha"] = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 			case "receipt":
 				r["requested_receipt"] = "foreign"
+			case "missing_internal":
+				delete(r, "requested_receipt")
+			case "public_receipt":
+				r["requested_receipt"] = body["receipt"]
+			case "caller_id":
+				r["requested_receipt"] = body["mutation_id"]
+			case "missing_original":
+				delete(body, "publication_phases")
+			case "original_ticket":
+				body["publication_phases"].(map[string]any)["ticket"] = json.Number("2")
+			case "original_source":
+				body["publication_phases"].(map[string]any)["source"] = "canonical_coalesced_attempt"
+			case "original_clock":
+				body["publication_phases"].(map[string]any)["clock"] = "unavailable"
+			case "swapped_winner":
+				body["publication_phases"] = body["coalesced_publication"].(map[string]any)["publication_phases"]
 			case "requested":
 				r["requested_generation"] = json.Number("2")
 			case "owner":
