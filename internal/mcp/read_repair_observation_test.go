@@ -173,6 +173,19 @@ func TestReadRepairInFlightCandidateRequiresSuccessfulRetainedCommit(t *testing.
 			record := s.beginMutationCommit(canonicalTimingContext(), "write_file", "logical", "fingerprint", "file.go", "/repo/file.go")
 			candidate, ok := s.captureReadRepairWitness(record.absPath, idx)
 			require.True(t, ok)
+			if state == "evicted" || state == "replaced" || state == "superseded" {
+				record.markCommitted(gitBlobSHA([]byte("committed bytes")), len("committed bytes"))
+				phases := indexer.NewPublicationPhaseRecorder(4, 1)
+				publication := phases.Begin("", "publication", indexer.PublicationSourceMCPEdit, time.Now())
+				admission := &mutationReceipt{id: "publication", generation: 1, path: record.absPath}
+				s.mutationReceipts.Store(admission.id, admission)
+				record.mu.Lock()
+				record.publication = publication
+				record.readRepairAdmission = weak.Make(admission)
+				record.mu.Unlock()
+				_, ready := candidate.completionWitness(s, record, idx)
+				require.True(t, ready, "ownership refusal must start from a fully eligible committed record")
+			}
 			switch state {
 			case "failed":
 				record.markFailed(context.Canceled)
