@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -66,11 +67,13 @@ type editProbeState struct {
 	step                                              editProbeStep
 	record                                            editProbeRecord
 	client                                            *socketClient
-	sink                                              *os.File
+	sink                                              io.WriteCloser
 	sinkMu                                            sync.Mutex
 	rawBytes                                          int
 	rawAccepted                                       int
-	rawQueue                                          chan []byte
+	rawPending                                        []byte
+	rawWake                                           chan struct{}
+	rawClosing                                        bool
 	rawDone                                           chan struct{}
 	rawOnce                                           sync.Once
 	writeNS, encodeNS                                 int64
@@ -174,48 +177,70 @@ func (s *editProbeState) emit(value any) error {
 	if s.sinkErr != nil {
 		return s.sinkErr
 	}
+	if s.rawClosing {
+		return fmt.Errorf("%w: raw writer already closing", errEditProbeEvidenceIncomplete)
+	}
 	if s.rawAccepted+len(data)+1 > editProbeRawLimit {
 		s.sinkErr = fmt.Errorf("%w: per-edit raw evidence limit exceeded", errEditProbeEvidenceIncomplete)
 		return s.sinkErr
 	}
+	// Pending and in-flight payloads share the unchanged total byte cap. A
+	// burst of small rows need not wait for the writer's next timeslice.
+	s.rawPending = append(s.rawPending, data...)
+	s.rawPending = append(s.rawPending, '\n')
+	s.rawAccepted += len(data) + 1
 	select {
-	case s.rawQueue <- append(data, '\n'):
-		s.rawAccepted += len(data) + 1
-		return nil
-	default:
-		s.sinkErr = fmt.Errorf("%w: owned raw writer queue full", errEditProbeEvidenceIncomplete)
-		return s.sinkErr
+	case s.rawWake <- struct{}{}:
+	default: // Wake already pending; these bytes are still owned above.
 	}
+	return nil
 }
 
 // One owned writer per edit keeps persistence off response/probe timing paths.
-// Both accepted bytes and queued entries are bounded; exhaustion fails evidence.
+// All pending/in-flight bytes share the per-edit cap; exhaustion fails evidence.
 func (s *editProbeState) startRaw() {
-	s.rawQueue, s.rawDone = make(chan []byte, 32), make(chan struct{})
+	s.rawWake, s.rawDone = make(chan struct{}, 1), make(chan struct{})
 	go func() {
 		defer close(s.rawDone)
 		failed := false
-		for data := range s.rawQueue {
-			if failed {
-				continue
+		for range s.rawWake {
+			for {
+				s.sinkMu.Lock()
+				data := s.rawPending
+				s.rawPending = nil
+				s.sinkMu.Unlock()
+				if len(data) == 0 {
+					break
+				}
+				if failed {
+					continue // Never credit bytes after a failed write.
+				}
+				start := time.Now()
+				n, err := s.sink.Write(data)
+				if err == nil && n != len(data) {
+					err = io.ErrShortWrite
+				}
+				s.sinkMu.Lock()
+				s.writeNS += time.Since(start).Nanoseconds()
+				s.rawBytes += n
+				if err != nil {
+					s.sinkErr = errors.Join(s.sinkErr, fmt.Errorf("%w: raw write: %v", errEditProbeEvidenceIncomplete, err))
+					failed = true
+				}
+				s.sinkMu.Unlock()
 			}
-			start := time.Now()
-			n, err := s.sink.Write(data)
-			s.sinkMu.Lock()
-			s.writeNS += time.Since(start).Nanoseconds()
-			s.rawBytes += n
-			if err != nil {
-				s.sinkErr = fmt.Errorf("%w: raw write: %v", errEditProbeEvidenceIncomplete, err)
-				failed = true
-			}
-			s.sinkMu.Unlock()
 		}
 	}()
 }
 
 func (s *editProbeState) finishRaw() {
-	if s.rawQueue != nil {
-		s.rawOnce.Do(func() { close(s.rawQueue) })
+	if s.rawWake != nil {
+		s.rawOnce.Do(func() {
+			s.sinkMu.Lock()
+			s.rawClosing = true
+			close(s.rawWake)
+			s.sinkMu.Unlock()
+		})
 		<-s.rawDone
 	}
 }
