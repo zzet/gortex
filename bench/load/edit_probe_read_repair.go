@@ -49,7 +49,7 @@ func checkEditProbeReadRepair(raw any, status map[string]any, receipt string, re
 	subtotal, subtotalErr := strconvEditProbeUint(a["observed_subtotal_ns"])
 	residual, residualErr := strconvEditProbeUint(a["unattributed_ns"])
 	if err != nil || window.ResidualNS != 0 || subtotalErr != nil || subtotal != uint64(window.SumNS) || residualErr != nil || residual != 0 {
-		return unavailable, errors.New("R scalar partition disagrees with its own window")
+		return unavailable, errors.New("read-repair scalar partition disagrees with its own window")
 	}
 	return window, nil
 }
