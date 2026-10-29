@@ -167,9 +167,16 @@ type editProbeWindow struct {
 
 func checkEditProbeWindow(wall any, phases map[string]any) (editProbeWindow, error) {
 	ns, err := editProbeNS(wall)
-	out := editProbeWindow{WallNS: ns}
 	if err != nil {
-		return out, err
+		return editProbeWindow{WallNS: ns}, err
+	}
+	return checkEditProbeWindowNS(ns, phases)
+}
+
+func checkEditProbeWindowNS(ns int64, phases map[string]any) (editProbeWindow, error) {
+	out := editProbeWindow{WallNS: ns}
+	if ns < 0 {
+		return out, errors.New("negative window")
 	}
 	if len(phases) == 0 {
 		return out, errors.New("no observed phase values")
@@ -206,6 +213,7 @@ type editProbeAccounting struct {
 	A         *editProbeWindow `json:"acknowledgement"`
 	P         *editProbeWindow `json:"physical"`
 	B         *editProbeWindow `json:"requested_background"`
+	R         *editProbeWindow `json:"read_assisted_publisher,omitempty"`
 	Reasons   []string         `json:"reasons"`
 }
 
@@ -273,7 +281,22 @@ func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAc
 	}
 	pPhases, _ := pAccounting["phases_ms"].(map[string]any)
 	pStates, _ := pAccounting["phase_states"].(map[string]any)
+	duplicate := pAccounting["execution_disposition"] == "native_mtime_duplicate" && ownerKnown && editProbeImmutablePartialPhysical(physical, publication, applied)
+	if repair, present := status["read_assisted_publication"]; present {
+		r, repairErr := checkEditProbeReadRepair(repair, status, receipt, requested)
+		if repairErr != nil {
+			fail("R: " + repairErr.Error())
+		} else {
+			out.R = &r
+		}
+	}
+	if duplicate && out.R == nil {
+		fail("actual read-assisted publisher deep coverage unavailable")
+	}
 	for _, name := range []string{"gate_wait", "patch_parse", "apply", "search_lap", "resolve", "mtimes", "derived", "attempt_setup", "patch_inspection", "executor_control", "attempt_finalize", "cohort_admission", "lane_wait"} {
+		if duplicate && out.R != nil && (name == "executor_control" || isEditProbeRepairDeepPhase(name)) {
+			continue // explicitly unexecuted in P; validated independently in R
+		}
 		if pPhases[name] == nil || pStates[name] != "measured" {
 			fail("missing applicable P phase " + name)
 		}
