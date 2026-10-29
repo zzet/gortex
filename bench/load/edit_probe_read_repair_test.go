@@ -58,7 +58,7 @@ func TestEditProbeValidatesIndependentPublisherWithoutSummingOverlappingWindows(
 	}
 }
 
-func TestEditProbeMissingOrContradictoryPublisherRetainsTerminalPartialRefusal(t *testing.T) {
+func TestEditProbeMissingOrContradictoryPublisherRefusesSuccess(t *testing.T) {
 	for _, bad := range []string{"missing", "bytes", "receipt", "requested", "owner", "bounds", "missing_phase", "phase_state", "extra_phase", "sum", "additive", "duplicate_admission"} {
 		t.Run(bad, func(t *testing.T) {
 			body := editProbeRepairAccountingFixture()
@@ -91,8 +91,63 @@ func TestEditProbeMissingOrContradictoryPublisherRetainsTerminalPartialRefusal(t
 				r["reader_causes"].([]any)[1].(map[string]any)["admission_generation"] = json.Number("2")
 			}
 			got := checkEditProbeAccounting(body, "receipt-a")
-			if got.State != "terminal_partial_physical" || got.R != nil || len(got.Reasons) == 0 {
+			if got.State != "unavailable" || got.R != nil || len(got.Reasons) == 0 {
 				t.Fatalf("unproven R was accepted: %+v", got)
+			}
+		})
+	}
+}
+
+func TestEditProbeCollectsLateReadRepairAndBackgroundInEitherOrder(t *testing.T) {
+	for _, order := range []string{"P_then_R_then_B", "P_and_B_then_R"} {
+		t.Run(order, func(t *testing.T) {
+			body := editProbeRepairAccountingFixture()
+			r, b := body["read_assisted_publication"], body["requested_background"]
+			delete(body, "read_assisted_publication")
+			if order == "P_then_R_then_B" {
+				delete(body, "requested_background")
+			}
+			early := checkEditProbeAccounting(body, "receipt-a")
+			if early.State != "unavailable" || editProbeFinished(true, true, true, early) {
+				t.Fatalf("complete duplicate P stopped before late evidence: %+v", early)
+			}
+			body["read_assisted_publication"] = r
+			if order == "P_then_R_then_B" {
+				middle := checkEditProbeAccounting(body, "receipt-a")
+				if middle.State != "unavailable" || middle.R == nil || editProbeFinished(true, true, true, middle) {
+					t.Fatalf("valid R stopped before late B: %+v", middle)
+				}
+			}
+			body["requested_background"] = b
+			late := checkEditProbeAccounting(body, "receipt-a")
+			if late.State != "observed_single_window_checks_pass" || !editProbeFinished(true, true, true, late) {
+				t.Fatalf("late matching evidence never completed: %+v", late)
+			}
+			if early.R != nil || early.State != "unavailable" {
+				t.Fatal("late collection changed earlier evidence")
+			}
+		})
+	}
+}
+
+func TestEditProbeStopsOnlyOwnedImmutableReadRepairPhaseFailures(t *testing.T) {
+	for _, state := range []string{"missing_laps", "invalid_order", "unclassified_gap"} {
+		t.Run(state, func(t *testing.T) {
+			body := editProbeRepairAccountingFixture()
+			delete(body, "requested_background")
+			r := body["read_assisted_publication"].(map[string]any)
+			a := r["phase_accounting"].(map[string]any)
+			a["observed_partition_complete"], a["sum_state"] = false, state
+			a["phases_ms"].(map[string]any)["apply"] = nil
+			a["phase_states"].(map[string]any)["apply"] = "not_observed"
+			got := checkEditProbeAccounting(body, "receipt-a")
+			if got.State != "terminal_partial_physical" || !editProbeFinished(true, true, true, got) {
+				t.Fatalf("known owned final R cannot gain missing laps: %+v", got)
+			}
+			r["accepted_blob_sha"] = "foreign"
+			got = checkEditProbeAccounting(body, "receipt-a")
+			if got.State != "unavailable" || editProbeFinished(true, true, true, got) {
+				t.Fatalf("foreign R was used as terminal evidence: %+v", got)
 			}
 		})
 	}

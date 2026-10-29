@@ -61,6 +61,9 @@ func (a ReadRepairPhaseAccounting) Payload() map[string]any {
 		"phases_ms":                   phases, "phase_states": states,
 		"additive_with_requested_background": false,
 	}
+	if a.evidence.observed {
+		out["window_ns"] = a.windowNS // actual frozen bounds remain known even for invalid laps
+	}
 	if p.state != "not_observed" && p.state != "invalid_order" {
 		out["window_ns"], out["observed_subtotal_ns"], out["unattributed_ns"] = a.windowNS, p.sumNS, a.windowNS-p.sumNS
 	}

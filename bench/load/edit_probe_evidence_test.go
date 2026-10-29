@@ -178,7 +178,7 @@ func TestEditProbeWaitsForLatePhysicalReturnButStopsImmutableMissingLaps(t *test
 	}
 }
 
-func TestEditProbeObservedDuplicateStopsAsFailedDeepCoverage(t *testing.T) {
+func TestEditProbeObservedDuplicateWaitsForPublisherCoverage(t *testing.T) {
 	fixture := func() map[string]any {
 		body := editProbeAccountingFixture()
 		winner := body["coalesced_publication"].(map[string]any)
@@ -197,8 +197,8 @@ func TestEditProbeObservedDuplicateStopsAsFailedDeepCoverage(t *testing.T) {
 	}
 	body := fixture()
 	got := checkEditProbeAccounting(body, "receipt-a")
-	if got.State != "terminal_partial_physical" || len(got.Reasons) == 0 || !editProbeFinished(true, true, true, got) {
-		t.Fatalf("observed no-op must terminate with failed deep coverage: %+v", got)
+	if got.State != "unavailable" || len(got.Reasons) == 0 || editProbeFinished(true, true, true, got) {
+		t.Fatalf("observed no-op cannot prove late publisher evidence absent: %+v", got)
 	}
 	for _, bad := range []string{"early", "disposition", "deep_value", "deep_state", "control", "gap", "retry", "owner", "receipt"} {
 		t.Run(bad, func(t *testing.T) {

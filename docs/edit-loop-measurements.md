@@ -46,6 +46,10 @@ P admission or finalization is borrowed. The immutable accounting copy retains
 its coordinator generation and is linked only after actual owner, applied bytes
 and existing ledger acceptance checks. Missing or contradictory laps refuse
 completeness. These R durations must never be added to overlapping A, B or P.
+The collector keeps waiting when complete no-op P precedes R retention or B
+publication. Only a validated immutable phase failure (or the existing finite
+collection bound) ends that wait as incomplete; absent late evidence is not a
+proof that the missing work will never be observed.
 
 ## Duration evidence
 

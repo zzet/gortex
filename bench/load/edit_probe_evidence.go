@@ -281,7 +281,7 @@ func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAc
 	}
 	pPhases, _ := pAccounting["phases_ms"].(map[string]any)
 	pStates, _ := pAccounting["phase_states"].(map[string]any)
-	duplicate := pAccounting["execution_disposition"] == "native_mtime_duplicate" && ownerKnown && editProbeImmutablePartialPhysical(physical, publication, applied)
+	duplicate := ownerKnown && editProbeObservedDuplicatePhysical(physical, publication, applied)
 	if repair, present := status["read_assisted_publication"]; present {
 		r, repairErr := checkEditProbeReadRepair(repair, status, receipt, requested)
 		if repairErr != nil {
@@ -335,7 +335,8 @@ func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAc
 	}
 	if len(out.Reasons) == 0 {
 		out.State = "observed_single_window_checks_pass"
-	} else if ownerKnown && editProbeImmutablePartialPhysical(physical, publication, applied) {
+	} else if ownerKnown && (editProbeImmutablePartialPhysical(physical, publication, applied) ||
+		duplicate && editProbeImmutablePartialReadRepair(status["read_assisted_publication"], status, receipt, requested)) {
 		out.State = "terminal_partial_physical"
 	}
 	return out
@@ -344,27 +345,39 @@ func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAc
 // Receipt terminality can precede the actual serving return. Only the immutable
 // late window proves that missing deep laps cannot arrive. A complete P with
 // absent B must still wait: background publication follows physical publication.
-// An explicit native duplicate is terminal failed deep coverage even when its
-// own smaller no-executor P partition is complete.
+// A complete duplicate P may precede R retention and B publication, so it
+// cannot itself make absent publisher/background evidence terminal.
 func editProbeImmutablePartialPhysical(physical, publication map[string]any, applied uint64) bool {
+	accounting, ok := editProbePhysicalAccounting(physical, publication, applied)
+	return ok && accounting["observed_partition_complete"] == false &&
+		(accounting["sum_state"] == "missing_laps" || accounting["sum_state"] == "invalid_order")
+}
+
+func editProbePhysicalAccounting(physical, publication map[string]any, applied uint64) (map[string]any, bool) {
 	if _, err := editProbeNS(physical["patch_wall_ms"]); err != nil || physical["clock"] != "monotonic" || publication["clock"] != "monotonic" || publication["terminal"] != true {
-		return false
+		return nil, false
 	}
 	key, _ := publication["key"].(string)
 	ticket, err := strconvEditProbeUint(publication["ticket"])
 	if key == "" || err != nil || ticket != applied || (publication["source"] != "mcp_edit" && publication["source"] != "canonical_coalesced_attempt") {
-		return false
+		return nil, false
 	}
 	accounting, _ := physical["patch_accounting"].(map[string]any)
 	owner, err := strconvEditProbeUint(accounting["attempt_ticket"])
-	retry, retryErr := strconvEditProbeUint(accounting["attempt_retry"])
+	_, retryErr := strconvEditProbeUint(accounting["attempt_retry"])
 	if err != nil || owner != applied || retryErr != nil || accounting["scope"] != "accepted_winning_physical_attempt" {
+		return nil, false
+	}
+	return accounting, true
+}
+
+func editProbeObservedDuplicatePhysical(physical, publication map[string]any, applied uint64) bool {
+	accounting, ok := editProbePhysicalAccounting(physical, publication, applied)
+	if !ok {
 		return false
 	}
-	if accounting["observed_partition_complete"] == false {
-		return accounting["sum_state"] == "missing_laps" || accounting["sum_state"] == "invalid_order"
-	}
-	if accounting["observed_partition_complete"] != true || accounting["execution_disposition"] != "native_mtime_duplicate" || accounting["sum_state"] != "partial" || retry != 0 {
+	retry, retryErr := strconvEditProbeUint(accounting["attempt_retry"])
+	if retryErr != nil || accounting["observed_partition_complete"] != true || accounting["execution_disposition"] != "native_mtime_duplicate" || accounting["sum_state"] != "partial" || retry != 0 {
 		return false
 	}
 	phases, _ := accounting["phases_ms"].(map[string]any)
