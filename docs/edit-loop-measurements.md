@@ -36,6 +36,17 @@ still requires the requested deep evidence. A complete partition of this small
 no-op P does not measure the earlier graph publisher. Independent read-assisted
 publication R remains non-additive, and its missing deep coverage stays missing.
 
+An accepted `read_assisted_publication` can carry its own `phase_accounting`.
+Its window keeps the actual coordinator execution start and return, after
+repository lane/batch admission. The same fixed scalar collector measures the
+real gate, parse, apply, search, resolve, mtimes, derived and optional analysis
+operations. `repair_control` records the actual authority/setup, interstitial
+and return work, pausing around those named operations. No pre-R lane, debounce,
+P admission or finalization is borrowed. The immutable accounting copy retains
+its coordinator generation and is linked only after actual owner, applied bytes
+and existing ledger acceptance checks. Missing or contradictory laps refuse
+completeness. These R durations must never be added to overlapping A, B or P.
+
 ## Duration evidence
 
 `phases_ms` always lists these keys for a found mutation receipt:

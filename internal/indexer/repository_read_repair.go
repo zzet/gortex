@@ -56,6 +56,10 @@ type ReadRepairObservation struct {
 	// Execution supplies the concrete owner; a prefix lookup at completion
 	// could instead find a replacement. Do not retain a retired Indexer.
 	owner weak.Pointer[Indexer]
+	// The mutable carrier exists only during the observed execution and is
+	// removed before callbacks; accounting retains a value-only frozen copy.
+	collector  *PublicationStamps
+	accounting ReadRepairPhaseAccounting
 }
 
 // AcceptedFor verifies the executed incarnation and exact accepted Git blob.

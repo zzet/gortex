@@ -19,10 +19,12 @@ type mutationReadRepairObservation struct {
 	windowNS   int64
 	causes     [8]mutationReadRepairCause
 	causeCount int
+	accounting indexer.ReadRepairPhaseAccounting
 	// Frozen admission identity survives that existing receipt's shorter TTL;
 	// accepted R is retained by the mutation ledger, not by the receipt map.
 	requestedReceipt    string
 	requestedGeneration uint64
+	acceptedBlobSHA     string
 }
 
 type mutationReadRepairCause struct {
@@ -39,6 +41,10 @@ func (o mutationReadRepairObservation) payload() map[string]any {
 		"owner_generation": o.generation, "window_ns": o.windowNS,
 		"reader_causes": causes, "additive_with_requested_background": false,
 		"background_relationship": "unavailable",
+		"phase_accounting":        o.accounting.Payload(),
+		"requested_receipt":       o.requestedReceipt,
+		"requested_generation":    o.requestedGeneration,
+		"accepted_blob_sha":       o.acceptedBlobSHA,
 	}
 }
 
@@ -149,7 +155,7 @@ func (w mutationReadRepairWitness) complete(observation indexer.ReadRepairObserv
 	if w.committedAt.IsZero() || started.Before(w.committedAt) {
 		return
 	}
-	accepted := mutationReadRepairObservation{generation: observation.Generation(), windowNS: finished.Sub(started).Nanoseconds()}
+	accepted := mutationReadRepairObservation{generation: observation.Generation(), windowNS: finished.Sub(started).Nanoseconds(), accounting: observation.PhaseAccounting()}
 	for i := range accepted.causes {
 		session, key, generation, ok := observation.Cause(i)
 		if !ok {
@@ -206,6 +212,7 @@ func (w mutationReadRepairWitness) bind(accepted mutationReadRepairObservation) 
 		return
 	}
 	accepted.requestedReceipt, accepted.requestedGeneration = w.receipt, w.generation
+	accepted.acceptedBlobSHA = w.blobSHA
 	record.readRepair = &accepted
 }
 

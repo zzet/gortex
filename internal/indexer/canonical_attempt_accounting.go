@@ -97,6 +97,13 @@ func requiredAttemptLap(kind canonicalPatchLap) bool {
 }
 
 func (w canonicalAttemptWindow) evaluateAccounting() canonicalAttemptProjection {
+	return w.evaluateAccountingFor(false)
+}
+
+// The two existing owners share ordered scalar validation, not their scope.
+// Read repair begins after admission/lane acquisition and cannot borrow those
+// P intervals. Its one actual control interval surrounds the named operations.
+func (w canonicalAttemptWindow) evaluateAccountingFor(readRepair bool) canonicalAttemptProjection {
 	p := w.accounting
 	out := canonicalAttemptProjection{state: "not_observed"}
 	for i := range out.states {
@@ -113,6 +120,7 @@ func (w canonicalAttemptWindow) evaluateAccounting() canonicalAttemptProjection 
 		return out
 	}
 	invalid := p.invalid || p.startNS != w.startNS || p.endNS != w.endNS || w.startNS < 0 || w.endNS < w.startNS
+	invalid = invalid || readRepair && p.nativeMtimeDuplicate
 	wall := w.endNS - w.startNS
 	missing := !p.hasExecutorStart || !p.hasExecutorEnd || !p.hasDerivedStart || !p.hasDerivedEnd
 	if p.nativeMtimeDuplicate {
@@ -126,6 +134,12 @@ func (w canonicalAttemptWindow) evaluateAccounting() canonicalAttemptProjection 
 	}
 	for i, v := range p.laps {
 		kind := canonicalPatchLap(i)
+		if readRepair && kind >= canonicalDeepLapCount && kind != patchExecutorControl {
+			if v != (canonicalLapEvidence{}) {
+				invalid = true
+			}
+			continue
+		}
 		if p.nativeMtimeDuplicate && (kind < canonicalDeepLapCount || kind == patchExecutorControl) {
 			if v != (canonicalLapEvidence{}) {
 				invalid = true
@@ -133,7 +147,11 @@ func (w canonicalAttemptWindow) evaluateAccounting() canonicalAttemptProjection 
 			out.states[i] = "not_applicable"
 			continue
 		}
-		if requiredAttemptLap(kind) && (v.begun == 0 || v.begun != v.done || v.incomplete) {
+		required := requiredAttemptLap(kind)
+		if readRepair {
+			required = kind < patchBookkeeping || kind == patchExecutorControl
+		}
+		if required && (v.begun == 0 || v.begun != v.done || v.incomplete) {
 			missing = true
 		}
 		if v.incomplete || v.begun != v.done {

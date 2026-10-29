@@ -240,11 +240,13 @@ func (c *repositoryMutationCoordinator) drain() {
 				}
 			}
 			observation.started = time.Now()
+			observation.beginPhaseAccounting()
 		}
 		outcome := executeRepositoryMutationUnderAuthority(
 			outputGeneration, authorityRequired, executor, paths)
 		if observation != nil {
 			observation.finished = time.Now()
+			observation.finishPhaseAccounting()
 			result := outcome.result
 			observation.executionSucceeded = outcome.err == nil && result != nil &&
 				!result.FullRetrack && len(result.FailedFiles) == 0 && len(result.Errors) == 0 &&
@@ -514,7 +516,7 @@ func (mi *MultiIndexer) repositoryMutationCoordinator(repoPrefix string) *reposi
 		})
 		coordinator.readRepairExecutor = func(paths []string, observation *ReadRepairObservation) (*IndexResult, error) {
 			return mi.incrementalReindexRepoRawMode(repoPrefix, paths, incrementalPathMode{
-				detectDeletions: true, readRepair: observation,
+				detectDeletions: true, readRepair: observation, publication: observation.collector,
 			})
 		}
 		// Attach before publishing the slot: every execution through this stable

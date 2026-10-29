@@ -26,17 +26,21 @@ func (p *canonicalPatchLaps) closeAttemptControlLocked(at time.Time) {
 }
 
 func (s *PublicationStamps) startAttemptControl(at time.Time) {
+	s.startAttemptControlKind(at, patchAttemptSetup)
+}
+
+func (s *PublicationStamps) startAttemptControlKind(at time.Time, kind canonicalPatchLap) {
 	if s == nil || s.patchLaps == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.patchLaps
-	if at.IsZero() || p.controlObserved || p.active != 0 || !p.lastEnd.IsZero() {
+	if !isAttemptControl(kind) || at.IsZero() || p.controlObserved || p.active != 0 || !p.lastEnd.IsZero() {
 		p.invalid = true
 		return
 	}
-	p.controlObserved, p.controlKind, p.attemptStarted = true, patchAttemptSetup, at
+	p.controlObserved, p.controlKind, p.attemptStarted = true, kind, at
 	p.openAttemptControlLocked(at)
 }
 
