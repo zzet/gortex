@@ -108,6 +108,10 @@ func (s *Server) bindReadRepairAdmission(absPath string, publication *indexer.Pu
 }
 
 func (s *Server) captureReadRepairWitness(absPath string, idx *indexer.Indexer) (mutationReadRepairWitness, bool) {
+	return s.readRepairWitness(absPath, idx, true)
+}
+
+func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pendingOnly bool) (mutationReadRepairWitness, bool) {
 	if idx == nil {
 		return mutationReadRepairWitness{}, false
 	}
@@ -126,17 +130,19 @@ func (s *Server) captureReadRepairWitness(absPath string, idx *indexer.Indexer) 
 		}
 		// The newest physical entry is authoritative even if it is not yet
 		// eligible. Never fall back to an older edit of the same path.
-		admission := record.readRepairAdmission.Value()
 		if ledger.byID[record.id] == record && record.owner == s && record.disk == mutationDiskCommitted &&
-			record.commitSeq != 0 && record.newSHA != "" && record.publication != nil &&
-			admission != nil && admission.generation != 0 && admission.path == absPath && !admission.checkoutScoped && record.readRepair == nil &&
-			(!record.graphRecorded || record.graph == mutationGraphPending) {
+			record.commitSeq != 0 && record.newSHA != "" && record.readRepair == nil &&
+			(!pendingOnly || !record.graphRecorded || record.graph == mutationGraphPending) {
 			witness = mutationReadRepairWitness{
 				server: weak.Make(s), record: weak.Make(record), indexer: weak.Make(idx),
 				publication: weak.Make(record.publication), id: record.id, fingerprint: record.fingerprint,
-				admission: weak.Make(admission), absPath: absPath, blobSHA: record.newSHA, receipt: admission.id,
+				absPath: absPath, blobSHA: record.newSHA,
 				checkout: record.checkoutID, incarnation: record.checkoutIncarnation,
-				commitSeq: record.commitSeq, generation: admission.generation, committedAt: record.committedAt,
+				commitSeq: record.commitSeq, committedAt: record.committedAt,
+			}
+			if admission := record.readRepairAdmission.Value(); admission != nil && admission.generation != 0 && admission.path == absPath && !admission.checkoutScoped {
+				witness.admission = weak.Make(admission)
+				witness.receipt, witness.generation = admission.id, admission.generation
 			}
 		}
 		record.mu.RUnlock()
@@ -155,6 +161,11 @@ func (w mutationReadRepairWitness) complete(observation indexer.ReadRepairObserv
 	if w.committedAt.IsZero() || started.Before(w.committedAt) {
 		return
 	}
+	ready, ok := w.completionWitness(s, record, idx)
+	if !ok {
+		return
+	}
+	w = ready
 	accepted := mutationReadRepairObservation{generation: observation.Generation(), windowNS: finished.Sub(started).Nanoseconds(), accounting: observation.PhaseAccounting()}
 	for i := range accepted.causes {
 		session, key, generation, ok := observation.Cause(i)
@@ -168,6 +179,25 @@ func (w mutationReadRepairWitness) complete(observation indexer.ReadRepairObserv
 		return // Never silently truncate a future larger producer bound.
 	}
 	w.bind(accepted)
+}
+
+func (w mutationReadRepairWitness) completionWitness(s *Server, record *mutationCommitRecord, idx *indexer.Indexer) (mutationReadRepairWitness, bool) {
+	// A reader can observe the committed write before the editor has opened
+	// its publication and enqueued its watcher ticket. Resolve only that same
+	// retained incarnation now; never borrow a later edit's admission.
+	ready, ok := s.readRepairWitness(w.absPath, idx, false)
+	if !ok || ready.record.Value() != record || ready.id != w.id || ready.fingerprint != w.fingerprint ||
+		ready.commitSeq != w.commitSeq || ready.blobSHA != w.blobSHA || ready.committedAt != w.committedAt ||
+		ready.checkout != w.checkout || ready.incarnation != w.incarnation ||
+		ready.publication.Value() == nil || ready.admission.Value() == nil || ready.generation == 0 {
+		return mutationReadRepairWitness{}, false
+	}
+	if (w.publication != (weak.Pointer[indexer.PublicationPhaseRecord]{}) && ready.publication != w.publication) ||
+		(w.admission != (weak.Pointer[mutationReceipt]{}) && ready.admission != w.admission) ||
+		(w.receipt != "" && ready.receipt != w.receipt) || (w.generation != 0 && ready.generation != w.generation) {
+		return mutationReadRepairWitness{}, false
+	}
+	return ready, true
 }
 
 // bind is the acceptance fence after the execution's content/owner proof. It

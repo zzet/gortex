@@ -11,8 +11,12 @@ import (
 	"weak"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/search"
 )
 
 func newReadRepairWitnessFixture(t *testing.T) (*Server, *mutationCommitRecord, mutationReadRepairWitness, *indexer.PublicationPhaseRecorder) {
@@ -54,6 +58,103 @@ func (w *readRepairHeldWatcher) EnqueueFileMutation(ctx context.Context, path st
 	ticket, err := w.canonicalPublicationWatcher.EnqueueFileMutation(ctx, path)
 	close(w.enqueued)
 	return ticket, err
+}
+
+func TestReadRepairCapturedBeforeWatcherAdmissionObservesActualExecutor(t *testing.T) {
+	root := setupMiniRepo(t, "reader-admission")
+	path := filepath.Join(root, "main.go")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: root, Name: "fixture"}}}
+	gc.SetConfigPath(filepath.Join(t.TempDir(), "config.yaml"))
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(gc.ConfigPath())
+	require.NoError(t, err)
+	g := graph.New()
+	mi := indexer.NewMultiIndexer(g, testRegistry(), search.NewNull(), cm, zap.NewNop())
+	t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+	idx := mi.GetIndexer("fixture")
+	require.NotNil(t, idx)
+	s := newMutationServer()
+	w := &readRepairHeldWatcher{canonicalPublicationWatcher: canonicalPublicationWatcher{hold: true}, enqueued: make(chan struct{})}
+	s.watcher = w
+	ctx, cancel := context.WithCancel(canonicalTimingContext())
+	t.Cleanup(cancel)
+	after := []byte("package main\nfunc Hello() {}\nfunc AddedByReader() {}\n")
+	record, err := s.commitFileMutation(ctx, "write_file", "logical-reader-admission", "reader admission fixture", "main.go", path, after, 0o600)
+	require.NoError(t, err)
+	require.Nil(t, record.publication)
+	require.Nil(t, record.readRepairAdmission.Value())
+	observer := s.readRepairObserver(ctx, path, idx)
+	require.NotNil(t, observer, "committed bytes can become stale before publication/ticket binding")
+	finished := make(chan mutationReindexOutcome, 1)
+	go func() { finished <- s.mutationReindexState(ctx, path) }()
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			select {
+			case <-w.enqueued:
+				w.results[0] <- indexer.MutationResult{RequestedGeneration: 1, AppliedGeneration: 1, Reindexed: true}
+				close(w.results[0])
+			case <-time.After(5 * time.Second):
+				cancel()
+			}
+		})
+	}
+	t.Cleanup(func() {
+		release()
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			t.Error("held watcher waiter was not joined")
+		}
+	})
+	require.Eventually(t, func() bool {
+		record.mu.RLock()
+		defer record.mu.RUnlock()
+		return record.readRepairAdmission.Value() != nil
+	}, 5*time.Second, time.Millisecond)
+	// The watcher may finish its no-op before the independent executor's
+	// callback. Terminal receipt state must not erase that historical owner.
+	record.recordGraph(mutationReindexOutcome{Generation: 1, Reindexed: true})
+	result, err := mi.IncrementalReindexRepoObserved("fixture", []string{path}, observer)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotEmpty(t, g.FindNodesByName("AddedByReader"), "real executor applied the committed bytes")
+	accepted := record.snapshot()
+	require.NotNil(t, accepted.readRepair, "actual executor callback must resolve the same newly bound admission")
+	require.Equal(t, gitBlobSHA(after), accepted.readRepair.acceptedBlobSHA)
+	require.Equal(t, true, accepted.readRepair.accounting.Payload()["observed_partition_complete"])
+	release()
+	runtime.KeepAlive(idx)
+}
+
+func TestReadRepairCompletionOnlyFillsPreviouslyMissingIdentity(t *testing.T) {
+	for _, field := range []string{"publication", "admission", "receipt", "generation"} {
+		t.Run(field, func(t *testing.T) {
+			s, record, witness, phases := newReadRepairWitnessFixture(t)
+			idx := &indexer.Indexer{}
+			record.mu.Lock()
+			switch field {
+			case "publication":
+				record.publication = phases.Begin("checkout", "foreign-publication", indexer.PublicationSourceMCPEdit, time.Now())
+			case "admission":
+				other := &mutationReceipt{id: witness.receipt, generation: witness.generation, path: witness.absPath}
+				s.mutationReceipts.Store("replacement", other)
+				record.readRepairAdmission = weak.Make(other)
+			case "receipt":
+				witness.receipt = "previously-witnessed-other-receipt"
+			case "generation":
+				witness.generation++
+			}
+			record.mu.Unlock()
+			_, ok := witness.completionWitness(s, record, idx)
+			require.False(t, ok, "completion cannot replace an already witnessed %s", field)
+			require.Nil(t, record.snapshot().readRepair)
+			runtime.KeepAlive(phases)
+		})
+	}
 }
 
 func TestReadRepairSeesCommittedAdmissionBeforeACKAndSurvivesSuccessClear(t *testing.T) {
