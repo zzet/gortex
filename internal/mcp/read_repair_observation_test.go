@@ -61,6 +61,17 @@ func (w *readRepairHeldWatcher) EnqueueFileMutation(ctx context.Context, path st
 }
 
 func TestReadRepairCapturedBeforeWatcherAdmissionObservesActualExecutor(t *testing.T) {
+	for _, inFlight := range []bool{false, true} {
+		name := "committed_before_enqueue"
+		if inFlight {
+			name = "in_flight_before_commit"
+		}
+		t.Run(name, func(t *testing.T) { testReadRepairBeforeWatcherAdmission(t, inFlight, false) })
+	}
+	t.Run("execution_before_commit_refused", func(t *testing.T) { testReadRepairBeforeWatcherAdmission(t, true, true) })
+}
+
+func testReadRepairBeforeWatcherAdmission(t *testing.T, inFlight, earlyExecution bool) {
 	root := setupMiniRepo(t, "reader-admission")
 	path := filepath.Join(root, "main.go")
 	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: root, Name: "fixture"}}}
@@ -81,11 +92,30 @@ func TestReadRepairCapturedBeforeWatcherAdmissionObservesActualExecutor(t *testi
 	ctx, cancel := context.WithCancel(canonicalTimingContext())
 	t.Cleanup(cancel)
 	after := []byte("package main\nfunc Hello() {}\nfunc AddedByReader() {}\n")
+	var observer *indexer.ReadRepairObserver
+	var early indexer.ReadRepairObservation
+	if inFlight {
+		s.mutationPreCommitHook = func(record *mutationCommitRecord) {
+			require.Equal(t, mutationDiskInFlight, record.diskStatus())
+			observer = s.readRepairObserver(ctx, path, idx)
+			require.NotNil(t, observer, "capture the exact in-flight record before the real write")
+			if earlyExecution {
+				bumpFile(t, path, string(after))
+				_, repairErr := mi.IncrementalReindexRepoObserved("fixture", []string{path}, &indexer.ReadRepairObserver{
+					Complete: func(o indexer.ReadRepairObservation) { early = o },
+				})
+				require.NoError(t, repairErr)
+				require.True(t, early.AcceptedFor(idx, gitBlobSHA(after)), "real early executor applied these bytes")
+			}
+		}
+	}
 	record, err := s.commitFileMutation(ctx, "write_file", "logical-reader-admission", "reader admission fixture", "main.go", path, after, 0o600)
 	require.NoError(t, err)
 	require.Nil(t, record.publication)
 	require.Nil(t, record.readRepairAdmission.Value())
-	observer := s.readRepairObserver(ctx, path, idx)
+	if !inFlight {
+		observer = s.readRepairObserver(ctx, path, idx)
+	}
 	require.NotNil(t, observer, "committed bytes can become stale before publication/ticket binding")
 	finished := make(chan mutationReindexOutcome, 1)
 	go func() { finished <- s.mutationReindexState(ctx, path) }()
@@ -118,6 +148,11 @@ func TestReadRepairCapturedBeforeWatcherAdmissionObservesActualExecutor(t *testi
 	// The watcher may finish its no-op before the independent executor's
 	// callback. Terminal receipt state must not erase that historical owner.
 	record.recordGraph(mutationReindexOutcome{Generation: 1, Reindexed: true})
+	if earlyExecution {
+		observer.Complete(early)
+		require.Nil(t, record.snapshot().readRepair, "same bytes do not authorize an execution predating the actual commit")
+		return
+	}
 	result, err := mi.IncrementalReindexRepoObserved("fixture", []string{path}, observer)
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -128,6 +163,37 @@ func TestReadRepairCapturedBeforeWatcherAdmissionObservesActualExecutor(t *testi
 	require.Equal(t, true, accepted.readRepair.accounting.Payload()["observed_partition_complete"])
 	release()
 	runtime.KeepAlive(idx)
+}
+
+func TestReadRepairInFlightCandidateRequiresSuccessfulRetainedCommit(t *testing.T) {
+	for _, state := range []string{"in_flight", "failed", "not_applied", "evicted", "replaced", "superseded"} {
+		t.Run(state, func(t *testing.T) {
+			s := newMutationServer()
+			idx := &indexer.Indexer{}
+			record := s.beginMutationCommit(canonicalTimingContext(), "write_file", "logical", "fingerprint", "file.go", "/repo/file.go")
+			candidate, ok := s.captureReadRepairWitness(record.absPath, idx)
+			require.True(t, ok)
+			switch state {
+			case "failed":
+				record.markFailed(context.Canceled)
+			case "not_applied":
+				record.markNotApplied(context.Canceled)
+			case "evicted":
+				s.mutationCommits.mu.Lock()
+				delete(s.mutationCommits.byID, record.id)
+				s.mutationCommits.mu.Unlock()
+			case "replaced":
+				s.mutationCommits.mu.Lock()
+				s.mutationCommits.byID[record.id] = &mutationCommitRecord{}
+				s.mutationCommits.mu.Unlock()
+			case "superseded":
+				s.beginMutationCommit(canonicalTimingContext(), "write_file", "later", "new fingerprint", "file.go", record.absPath)
+			}
+			_, ok = candidate.completionWitness(s, record, idx)
+			require.False(t, ok)
+			require.Nil(t, record.snapshot().readRepair)
+		})
+	}
 }
 
 func TestReadRepairCompletionOnlyFillsPreviouslyMissingIdentity(t *testing.T) {

@@ -130,8 +130,9 @@ func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pending
 		}
 		// The newest physical entry is authoritative even if it is not yet
 		// eligible. Never fall back to an older edit of the same path.
-		if ledger.byID[record.id] == record && record.owner == s && record.disk == mutationDiskCommitted &&
-			record.commitSeq != 0 && record.newSHA != "" && record.readRepair == nil &&
+		committed := record.disk == mutationDiskCommitted && record.commitSeq != 0 && record.newSHA != ""
+		writing := pendingOnly && record.disk == mutationDiskInFlight
+		if ledger.byID[record.id] == record && record.owner == s && (committed || writing) && record.readRepair == nil &&
 			(!pendingOnly || !record.graphRecorded || record.graph == mutationGraphPending) {
 			witness = mutationReadRepairWitness{
 				server: weak.Make(s), record: weak.Make(record), indexer: weak.Make(idx),
@@ -154,15 +155,15 @@ func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pending
 
 func (w mutationReadRepairWitness) complete(observation indexer.ReadRepairObservation) {
 	s, record, idx := w.server.Value(), w.record.Value(), w.indexer.Value()
-	if s == nil || record == nil || idx == nil || !observation.AcceptedFor(idx, w.blobSHA) {
-		return
-	}
-	started, finished := observation.Bounds()
-	if w.committedAt.IsZero() || started.Before(w.committedAt) {
+	if s == nil || record == nil || idx == nil {
 		return
 	}
 	ready, ok := w.completionWitness(s, record, idx)
-	if !ok {
+	if !ok || !observation.AcceptedFor(idx, ready.blobSHA) {
+		return
+	}
+	started, finished := observation.Bounds()
+	if ready.committedAt.IsZero() || started.Before(ready.committedAt) {
 		return
 	}
 	w = ready
@@ -187,7 +188,8 @@ func (w mutationReadRepairWitness) completionWitness(s *Server, record *mutation
 	// retained incarnation now; never borrow a later edit's admission.
 	ready, ok := s.readRepairWitness(w.absPath, idx, false)
 	if !ok || ready.record.Value() != record || ready.id != w.id || ready.fingerprint != w.fingerprint ||
-		ready.commitSeq != w.commitSeq || ready.blobSHA != w.blobSHA || ready.committedAt != w.committedAt ||
+		(w.commitSeq != 0 && ready.commitSeq != w.commitSeq) || (w.blobSHA != "" && ready.blobSHA != w.blobSHA) ||
+		(!w.committedAt.IsZero() && ready.committedAt != w.committedAt) ||
 		ready.checkout != w.checkout || ready.incarnation != w.incarnation ||
 		ready.publication.Value() == nil || ready.admission.Value() == nil || ready.generation == 0 {
 		return mutationReadRepairWitness{}, false
