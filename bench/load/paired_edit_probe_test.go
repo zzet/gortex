@@ -25,7 +25,12 @@ func pairedEditProbeFixture(t *testing.T, ctx context.Context, count int, handle
 	plan.Steps = plan.Steps[:count]
 	plan.Count = count
 	for i, label := range c.labels {
-		socket := startStub(t, func(frame stubFrame) (any, *rpcError) { return handle(label, frame) })
+		socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
+			if frame.Method == "resources/read" && frame.Params["uri"] == "gortex://stats" {
+				return map[string]any{"contents": []any{map[string]any{"type": "text", "text": `{}`}}}, nil
+			}
+			return handle(label, frame)
+		})
 		editor, err := openMCP(ctx, socket, "/owned/"+label)
 		if err != nil {
 			t.Fatal(err)
