@@ -1,40 +1,24 @@
 package mcp
 
 import (
-	"bytes"
 	"context"
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
-	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/search"
 )
-
-// Hold the actual executor after its start but before extraction/application.
-// Initial indexing does not contain the marker and follows the ordinary path.
-type straddlingReadRepairExtractor struct {
-	parser.Extractor
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (e *straddlingReadRepairExtractor) Extract(path string, src []byte) (*parser.ExtractionResult, error) {
-	if bytes.Contains(src, []byte("AddedByStraddlingReader")) {
-		e.once.Do(func() { close(e.entered) })
-		<-e.release
-	}
-	return e.Extractor.Extract(path, src)
-}
 
 // This intentionally specifies the unresolved boundary: execution begins
 // before commit bookkeeping, but its actual applied bytes publish afterward.
@@ -47,13 +31,19 @@ func TestReadRepairActualExecutorStraddlesCommittedBookkeeping(t *testing.T) {
 	require.NoError(t, gc.Save())
 	cm, err := config.NewConfigManager(gc.ConfigPath())
 	require.NoError(t, err)
-	registry := testRegistry()
-	extractor, ok := registry.GetByExtension(".go")
-	require.True(t, ok)
-	held := &straddlingReadRepairExtractor{Extractor: extractor, entered: make(chan struct{}), release: make(chan struct{})}
-	registry.Register(held)
+	entered, resume := make(chan struct{}), make(chan struct{})
+	var armed atomic.Bool
+	var enteredOnce sync.Once
+	core, _ := observer.New(zap.InfoLevel)
+	logger := zap.New(core, zap.Hooks(func(entry zapcore.Entry) error {
+		if armed.Load() && entry.Message == "indexer: reconcile phase started" {
+			enteredOnce.Do(func() { close(entered) })
+			<-resume
+		}
+		return nil
+	}))
 	g := graph.New()
-	mi := indexer.NewMultiIndexer(g, registry, search.NewNull(), cm, zap.NewNop())
+	mi := indexer.NewMultiIndexer(g, testRegistry(), search.NewNull(), cm, logger)
 	t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
@@ -71,7 +61,7 @@ func TestReadRepairActualExecutorStraddlesCommittedBookkeeping(t *testing.T) {
 	}
 	done := make(chan executionResult, 1)
 	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(held.release) }) }
+	release := func() { releaseOnce.Do(func() { close(resume) }) }
 	started := false
 	joined := false
 	t.Cleanup(func() {
@@ -88,9 +78,10 @@ func TestReadRepairActualExecutorStraddlesCommittedBookkeeping(t *testing.T) {
 		require.Equal(t, mutationDiskInFlight, record.diskStatus())
 		observer := s.readRepairObserver(ctx, path, idx)
 		require.NotNil(t, observer)
-		// Test-only visible-byte setup, followed by the real atomic commit of
-		// exactly those bytes. No production write or scheduling hook is added.
-		bumpFile(t, path, string(after))
+		// R has started before its first phase log; source discovery/read is
+		// still ahead. Hold there so the real atomic write supplies the exact
+		// bytes/inode consumed by the executor. No early test-only write is used.
+		armed.Store(true)
 		started = true
 		go func() {
 			var observation indexer.ReadRepairObservation
@@ -103,9 +94,9 @@ func TestReadRepairActualExecutorStraddlesCommittedBookkeeping(t *testing.T) {
 			done <- executionResult{observation: observation, err: repairErr}
 		}()
 		select {
-		case <-held.entered:
+		case <-entered:
 		case <-time.After(5 * time.Second):
-			t.Fatal("actual executor did not enter extraction before commit")
+			t.Fatal("actual executor did not enter its first phase before commit")
 		}
 	}
 	record, err := s.commitFileMutation(ctx, "write_file", "logical-straddling", "straddling fixture", "main.go", path, after, 0o600)
