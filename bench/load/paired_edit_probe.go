@@ -22,6 +22,15 @@ type pairedEditProbeCall struct {
 	editing, pending bool
 }
 
+// The existing two completion callbacks own this one per-edit cancellation.
+// The first completed build cannot cancel its partner's outstanding probes.
+type pairedEditProbeLifetime struct {
+	mu           sync.Mutex
+	finished     int
+	cancel       context.CancelFunc
+	evidenceOnce sync.Once
+}
+
 func (r *editProbeRuntime) preparePairedCall(ctx context.Context, role string, ordinal, slot int) (pairedEditProbeCall, error) {
 	if ordinal < 0 || ordinal >= len(r.states) {
 		return pairedEditProbeCall{}, errors.New("paired edit ordinal outside offered plan")
@@ -121,20 +130,19 @@ func (c *pairedCoordinator) editProbes(ctx context.Context) error {
 // builds keep matching probes, but their first-correct endpoints never change.
 // Activation only starts tasks; it never waits for a network response.
 func (c *pairedCoordinator) activatePairedEditProbe(ctx context.Context, step editProbeStep) {
-	probeCtx, cancel := context.WithCancel(ctx)
-	var mu sync.Mutex
-	var evidenceOnce sync.Once
-	finished := 0
+	lifetime := &pairedEditProbeLifetime{}
+	var probeCtx context.Context
+	probeCtx, lifetime.cancel = context.WithCancel(ctx)
 	for _, state := range c.states {
 		var once sync.Once
 		done := func() {
 			once.Do(func() {
-				mu.Lock()
-				finished++
-				all := finished == len(c.states)
-				mu.Unlock()
+				lifetime.mu.Lock()
+				lifetime.finished++
+				all := lifetime.finished == len(c.states)
+				lifetime.mu.Unlock()
 				if all {
-					cancel()
+					lifetime.cancel()
 				}
 			})
 		}
@@ -167,8 +175,8 @@ func (c *pairedCoordinator) activatePairedEditProbe(ctx context.Context, step ed
 					}
 				}
 				if evidenceFailed {
-					evidenceOnce.Do(func() {
-						c.cancelPairedEditEvidence(step.Ordinal, cancel)
+					lifetime.evidenceOnce.Do(func() {
+						c.cancelPairedEditEvidence(step.Ordinal, lifetime.cancel)
 					})
 					return
 				}

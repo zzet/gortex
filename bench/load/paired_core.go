@@ -135,9 +135,10 @@ func (c *pairedCoordinator) execute() {
 		}
 	}
 	budget := c.options.Duration
-	if base.phase.Name == "sweep" {
+	switch base.phase.Name {
+	case "sweep":
 		budget = c.options.SweepBudget
-	} else if base.phase.Name == editProbeScenario {
+	case editProbeScenario:
 		budget, result = base.phase.editProbeRuntime.plan.budget(c.options.Deadline, len(c.states))
 		if result != nil {
 			return
@@ -158,11 +159,12 @@ func (c *pairedCoordinator) execute() {
 	c.window = measurementWindow{Started: time.Now(), Method: "coupled native back-to-back requests; process counters bracket the common group window; per-build sample endpoints retained"}
 	ctx, cancel := context.WithTimeout(c.ctx, budget)
 	defer cancel()
-	if base.phase.Name == "sweep" {
+	switch base.phase.Name {
+	case "sweep":
 		result = c.sweep(ctx)
-	} else if base.phase.Name == editProbeScenario {
+	case editProbeScenario:
 		result = c.editProbes(ctx)
-	} else {
+	default:
 		result = c.agents(ctx)
 	}
 	c.window.Ended = time.Now()
