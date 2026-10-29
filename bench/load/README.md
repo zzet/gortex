@@ -101,8 +101,10 @@ mutations prevent that cleanup rewrite. This initial cell does not implement
 the paired comparison, other cells, or establish 100-edit/reference acceptance.
 An owner-matching immutable physical return with explicitly missing or invalid
 deep laps ends that edit as failed coverage once its graph and read evidence
-have arrived. Receipt terminality alone still waits for late physical evidence;
-a complete physical partition also continues waiting for late background data.
+have arrived. Receipt terminality alone still waits for late physical evidence.
+A complete native duplicate P keeps collecting until independent publisher R
+and requested-background B arrive; absent late evidence is not terminal proof
+of missing work. A validated immutable R phase failure can end failed coverage.
 
 `mutation_status` can separately expose `read_assisted_publication` when an
 already-needed read repair executes for the exact pending committed bytes.
@@ -110,11 +112,19 @@ Its monotonic window covers the actual coordinator execution, with that
 drain's owner generation and bounded reader admission causes. A reused wire ID
 is not a unique publisher identity. This window can overlap the original
 receipt's quiet wait; it is not added to A, B or a later no-op watcher P.
-The relationship to complete requested-background accounting remains
-unavailable. Missing, failed, broad, evicted, rebound or content-mismatched
+Its own `phase_accounting` measures the actual gate, parse, apply, search,
+resolve, mtimes, derived and optional analysis operations, with an online
+`repair_control` interval around them. The harness validates that independent
+integer partition before accepting it as publisher deep coverage; the no-op
+P's unexecuted deep values remain null, never retroactively filled from R.
+R's internal `requested_receipt` matches the original `publication_phases.key`
+and requested ticket, not the public commit `receipt`, caller `mutation_id` or
+coalesced physical winner. The relationship to additive requested-background
+accounting remains unavailable. Missing, failed, broad, evicted, rebound or content-mismatched
 observations do not supply that evidence. Fresh same-byte inert validation
-does not claim the publication performed by an earlier operation. This initial repair observation
-does not provide deep phase coverage or satisfy the accounting acceptance gate.
+does not claim the publication performed by an earlier operation. One observed
+independent partition does not establish the 100-edit accounting, paired
+no-regression, reference or larger language/tool/native acceptance gates.
 R is retained only by the existing bounded mutation ledger. Evicting the
 original publication recorder's index entry does not erase an accepted ledger
 observation or make canonical P/B available; ledger eviction clears R, and a
