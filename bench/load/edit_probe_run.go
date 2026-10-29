@@ -295,6 +295,11 @@ func editProbeRetrySleep(seed int64, ordinal, stream int) func(context.Context, 
 }
 
 func (r *editProbeRuntime) perform(ctx context.Context, s *editProbeState, client *socketClient, req request, purpose, role string, stream int) (json.RawMessage, wireCallIdentity, error) {
+	data, identity, _, err := r.performObserved(ctx, s, client, req, purpose, role, stream)
+	return data, identity, err
+}
+
+func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeState, client *socketClient, req request, purpose, role string, stream int) (json.RawMessage, wireCallIdentity, []Attempt, error) {
 	budget := r.options.Deadline
 	if strings.HasPrefix(purpose, "oracle:") || purpose == "status" {
 		budget = min(budget, 20*time.Second)
@@ -308,59 +313,72 @@ func (r *editProbeRuntime) perform(ctx context.Context, s *editProbeState, clien
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
 	r.mu.Unlock()
 	evidenceErr := s.emit(map[string]any{"event": "logical_call", "purpose": purpose, "tool": req.name(), "attempts": attempts})
-	return data, caller.last, errors.Join(err, evidenceErr)
+	return data, caller.last, attempts, errors.Join(err, evidenceErr)
+}
+
+func (s *editProbeState) noteProbeStart() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending := !s.started.IsZero() && !s.record.GraphTerminal
+	if pending {
+		s.record.PendingReads++
+	}
+	return pending
+}
+
+func (r *editProbeRuntime) activateProbeState(step editProbeStep, cancel context.CancelFunc) *editProbeState {
+	s := r.states[step.Ordinal]
+	s.mu.Lock()
+	at := time.Since(r.origin).Nanoseconds()
+	s.record.ActivatedNS, s.cancel = &at, cancel
+	s.mu.Unlock()
+	return s
+}
+
+func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracle, sent time.Time, data json.RawMessage, identity wireCallIdentity, err error, pending bool) error {
+	ended := identity.Finished
+	if !identity.WriteStarted.IsZero() {
+		sent = identity.WriteStarted
+	}
+	body, decodeErr := decodeEditProbeResult(data)
+	correct := err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, r.p.Repos[0].Corpus, s.step, r.plan.Callee)
+	fresh := decodeErr == nil && editProbeClaimsFresh(body)
+	s.mu.Lock()
+	if err != nil {
+		s.record.ProbeErrors++
+	}
+	if correct {
+		if s.started.IsZero() || ended.IsZero() || ended.Before(s.started) {
+			s.record.Errors = append(s.record.Errors, "marker visible before its own edit")
+		} else if s.record.FirstCorrect[oracle.name].Value == nil {
+			s.record.FirstCorrect[oracle.name] = measured(float64(ended.Sub(s.started))/float64(time.Millisecond), "ms")
+		}
+	}
+	if !correct && fresh {
+		if !s.acknowledged.IsZero() && !sent.Before(s.acknowledged) {
+			s.record.StaleClaimedFresh = true
+		} else {
+			s.record.PrecommitFreshMismatches++
+		}
+	}
+	s.mu.Unlock()
+	return s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending})
 }
 
 // Activation only starts owned loops and returns. It never waits for a probe
 // RPC/result; a blocked prober cannot shift this or any other edit's due time.
 func (r *editProbeRuntime) activate(ctx context.Context, step editProbeStep) {
-	s := r.states[step.Ordinal]
 	probeCtx, cancel := context.WithCancel(ctx)
-	s.mu.Lock()
-	at := time.Since(r.origin).Nanoseconds()
-	s.record.ActivatedNS = &at
-	s.cancel = cancel
-	s.mu.Unlock()
+	s := r.activateProbeState(step, cancel)
 	for index, oracle := range editProbeOracles(r.p.Repos[0].Corpus, step) {
 		s.probes.Go(func() {
 			ticker := time.NewTicker(editProbePeriod)
 			defer ticker.Stop()
 			for probeCtx.Err() == nil {
 				sent := time.Now()
-				s.mu.Lock()
-				pending := !s.started.IsZero() && !s.record.GraphTerminal
-				if pending {
-					s.record.PendingReads++
-				}
-				s.mu.Unlock()
+				pending := s.noteProbeStart()
 				data, identity, err := r.perform(probeCtx, s, s.client, oracle.call, "oracle:"+oracle.name, "probe", 10+index)
-				ended := identity.Finished
-				if !identity.WriteStarted.IsZero() {
-					sent = identity.WriteStarted
-				}
-				body, decodeErr := decodeEditProbeResult(data)
-				correct := err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, r.p.Repos[0].Corpus, step, r.plan.Callee)
-				fresh := decodeErr == nil && editProbeClaimsFresh(body)
-				s.mu.Lock()
-				if err != nil {
-					s.record.ProbeErrors++
-				}
-				if correct {
-					if s.started.IsZero() {
-						s.record.Errors = append(s.record.Errors, "marker visible before its own edit")
-					} else if s.record.FirstCorrect[oracle.name].Value == nil {
-						s.record.FirstCorrect[oracle.name] = measured(float64(ended.Sub(s.started))/float64(time.Millisecond), "ms")
-					}
-				}
-				if !correct && fresh {
-					if !s.acknowledged.IsZero() && !sent.Before(s.acknowledged) {
-						s.record.StaleClaimedFresh = true
-					} else {
-						s.record.PrecommitFreshMismatches++
-					}
-				}
-				s.mu.Unlock()
-				if err := s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "start_ns": sent.Sub(r.origin).Nanoseconds(), "end_ns": ended.Sub(r.origin).Nanoseconds(), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending}); err != nil {
+				if err := r.observeProbe(s, oracle, sent, data, identity, err, pending); err != nil {
 					cancel()
 					return
 				}
@@ -383,12 +401,10 @@ func (s *editProbeState) stopProbes() {
 	}
 	s.probes.Wait()
 }
-func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
+func (r *editProbeRuntime) beginEdit(ctx context.Context, step editProbeStep) (*editProbeState, context.Context, context.CancelFunc, time.Time) {
 	s := r.states[step.Ordinal]
-	defer s.stopProbes()
 	started := time.Now()
 	callCtx, cancel := context.WithTimeout(ctx, r.options.Deadline)
-	defer cancel()
 	s.mu.Lock()
 	s.started = started
 	ns := started.Sub(r.origin).Nanoseconds()
@@ -400,7 +416,20 @@ func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
 		s.record.Errors = append(s.record.Errors, "missing pre-edit activation")
 	}
 	s.mu.Unlock()
+	return s, callCtx, cancel, started
+}
+
+func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
+	s, callCtx, cancel, started := r.beginEdit(ctx, step)
+	defer s.stopProbes()
+	defer cancel()
 	ack, identity, err := r.perform(callCtx, s, r.editor, step.Request, "edit", "workload", 0)
+	r.finishEditAfterACK(ctx, callCtx, s, step, started, ack, identity, err)
+}
+
+// The paired dispatcher can start this owned continuation on this build's own
+// ACK, without a barrier on its partner. Standalone retains the same order.
+func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *editProbeState, step editProbeStep, started time.Time, ack json.RawMessage, identity wireCallIdentity, err error) {
 	if err != nil {
 		s.mu.Lock()
 		s.record.Outcome = "edit_error"
