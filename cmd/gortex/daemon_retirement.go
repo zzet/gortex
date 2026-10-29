@@ -69,6 +69,12 @@ func (w *deferredRetirementWorker) MarkReady() {
 	w.readyOnce.Do(func() { close(w.ready) })
 }
 
+func (w *deferredRetirementWorker) Cancel() {
+	if w != nil {
+		w.cancel()
+	}
+}
+
 func (w *deferredRetirementWorker) Stop() {
 	if w == nil {
 		return

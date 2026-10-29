@@ -46,7 +46,9 @@ type healthBroadcaster struct {
 	lastSnap    map[string]any
 	interval    time.Duration
 	stopTicker  chan struct{}
-	tickerWg    sync.WaitGroup
+	tickerDone  chan struct{}
+	closed      bool
+	workers     sync.WaitGroup // ticker instances and admitted snapshot/delivery calls
 }
 
 const (
@@ -74,7 +76,9 @@ func newHealthBroadcaster(srv specificNotificationSender, snapFn HealthSnapshotF
 // the real snapshot fn later via Server.AttachHealthSnapshot.
 func (b *healthBroadcaster) setSnapshotFn(fn HealthSnapshotFn) {
 	b.mu.Lock()
-	b.snapFn = fn
+	if !b.closed {
+		b.snapFn = fn
+	}
 	b.mu.Unlock()
 }
 
@@ -88,7 +92,7 @@ func (b *healthBroadcaster) setInterval(d time.Duration) {
 		d = maxHealthInterval
 	}
 	b.mu.Lock()
-	if b.interval == d {
+	if b.closed || b.interval == d {
 		b.mu.Unlock()
 		return
 	}
@@ -110,10 +114,16 @@ func (b *healthBroadcaster) subscribe(sessionID string) bool {
 		return false
 	}
 	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return false
+	}
+	b.workers.Add(1)
 	b.subscribers[sessionID] = true
 	startTicker := b.stopTicker == nil && b.snapFn != nil
 	snapFn := b.snapFn
 	b.mu.Unlock()
+	defer b.workers.Done()
 
 	if startTicker {
 		b.start()
@@ -166,8 +176,14 @@ func (b *healthBroadcaster) publishOnce() {
 		return
 	}
 	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
+	b.workers.Add(1)
 	snapFn := b.snapFn
 	b.mu.Unlock()
+	defer b.workers.Done()
 	if snapFn == nil {
 		return
 	}
@@ -205,18 +221,18 @@ func (b *healthBroadcaster) publishOnce() {
 // must check `stopTicker == nil` themselves.
 func (b *healthBroadcaster) start() {
 	b.mu.Lock()
-	if b.stopTicker != nil {
+	if b.closed || b.stopTicker != nil {
 		b.mu.Unlock()
 		return
 	}
-	stop := make(chan struct{})
-	b.stopTicker = stop
+	stop, done := make(chan struct{}), make(chan struct{})
+	b.stopTicker, b.tickerDone = stop, done
 	interval := b.interval
+	b.workers.Add(1) // admission and Add precede terminal Wait under the same gate
 	b.mu.Unlock()
-
-	b.tickerWg.Add(1)
 	go func() {
-		defer b.tickerWg.Done()
+		defer b.workers.Done()
+		defer close(done)
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -235,14 +251,32 @@ func (b *healthBroadcaster) start() {
 // to call when no ticker is running.
 func (b *healthBroadcaster) stop() {
 	b.mu.Lock()
-	stop := b.stopTicker
-	b.stopTicker = nil
-	b.mu.Unlock()
-	if stop == nil {
-		return
+	stop, done := b.stopTicker, b.tickerDone
+	b.stopTicker, b.tickerDone = nil, nil
+	if stop != nil {
+		close(stop)
 	}
-	close(stop)
-	b.tickerWg.Wait()
+	b.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+// beginClose is terminal and nonjoining. Detached old ticker instances are
+// already canceled by stop; workers retains their actual callback completion.
+func (b *healthBroadcaster) beginClose() {
+	b.mu.Lock()
+	b.closed = true
+	if b.stopTicker != nil {
+		close(b.stopTicker)
+	}
+	b.stopTicker, b.tickerDone = nil, nil
+	b.mu.Unlock()
+}
+
+func (b *healthBroadcaster) close() {
+	b.beginClose()
+	b.workers.Wait()
 }
 
 // snapshot returns the last published snapshot for inclusion in
@@ -272,13 +306,13 @@ func (s *Server) AttachHealthSnapshot(fn HealthSnapshotFn) {
 }
 
 // StopHealthBroadcaster halts the internal ticker. Called from the
-// daemon shutdown path so a hung ticker goroutine doesn't outlive the
-// process. Idempotent.
+// daemon shutdown path and terminally refuses new starts/replays. All
+// admitted ticker and snapshot/delivery owners are joined. Idempotent.
 func (s *Server) StopHealthBroadcaster() {
 	if s == nil || s.healthBroadcaster == nil {
 		return
 	}
-	s.healthBroadcaster.stop()
+	s.healthBroadcaster.close()
 }
 
 // registerHealthTools wires the subscribe / unsubscribe MCP tools.

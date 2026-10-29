@@ -23,8 +23,9 @@ func TestEmitPluginBundle_Layout(t *testing.T) {
 	}
 
 	// The emitter should write exactly: 1 plugin.json + 1 README +
-	// 1 LICENSE + 1 .mcp.json + N commands + N skills + 1 hooks.json
-	// + 1 hook handler script.
+	// 1 LICENSE + 1 .mcp.json + N skills + N sub-agents + 1 hooks.json
+	// + 1 hook handler script. No commands/: plugin skills are already
+	// slash commands.
 	wantPaths := []string{
 		".claude-plugin/plugin.json",
 		".mcp.json",
@@ -33,11 +34,8 @@ func TestEmitPluginBundle_Layout(t *testing.T) {
 		"hooks-handlers/gortex-hook.sh",
 		"hooks/hooks.json",
 	}
-	for _, name := range sortedKeys(SlashCommands) {
-		wantPaths = append(wantPaths, filepath.Join("commands", name))
-	}
-	for _, name := range sortedKeys(GlobalSkills) {
-		wantPaths = append(wantPaths, filepath.Join("skills", name, "SKILL.md"))
+	for _, id := range sortedKeys(GlobalSkills) {
+		wantPaths = append(wantPaths, filepath.Join("skills", pluginSkillName(id), "SKILL.md"))
 	}
 	for _, name := range sortedKeys(SubAgents) {
 		wantPaths = append(wantPaths, filepath.Join("agents", name))
@@ -138,6 +136,7 @@ func TestPluginReadme_DescribesPublicAgentSurface(t *testing.T) {
 		"`edit` / `refactor`",
 		"`capabilities`",
 		"`gortex call`",
+		"`/gortex:explore`",
 	} {
 		if !strings.Contains(pluginReadmeBody, want) {
 			t.Errorf("plugin README must contain %q", want)
@@ -147,6 +146,7 @@ func TestPluginReadme_DescribesPublicAgentSurface(t *testing.T) {
 		"52 tools", "search_symbols", "find_usages", "get_call_chain",
 		"rename_symbol", "preview_edit", "simulate_chain", "facade-v1",
 		"gortex daemon start",
+		"`/gortex-",
 	} {
 		if strings.Contains(pluginReadmeBody, forbidden) {
 			t.Errorf("plugin README must not expose %q", forbidden)
@@ -255,23 +255,29 @@ func TestEmitPluginBundle_SkillBodiesMatchSource(t *testing.T) {
 	}
 
 	// Single-source-of-truth check: the bytes written under
-	// skills/<name>/SKILL.md must equal GlobalSkills[<name>] exactly.
-	// Drift means content.go was edited without re-running the
-	// emitter; the CI guard catches that case but we double-check
-	// here in unit tests.
-	for name, want := range GlobalSkills {
+	// skills/<name>/SKILL.md must equal GlobalSkills[<id>] except for
+	// the frontmatter name line. Drift means content.go was edited
+	// without re-running the emitter; the CI guard catches that case
+	// but we double-check here in unit tests.
+	for id, source := range GlobalSkills {
+		name := pluginSkillName(id)
 		got, err := os.ReadFile(filepath.Join(dir, "skills", name, "SKILL.md"))
 		if err != nil {
 			t.Errorf("read skill %s: %v", name, err)
 			continue
 		}
+		want := strings.Replace(source, "\nname: "+id+"\n", "\nname: "+name+"\n", 1)
 		if string(got) != want {
-			t.Errorf("skill %s body drift: bytes do not match GlobalSkills[%q]", name, name)
+			t.Errorf("skill %s body drift: bytes do not match GlobalSkills[%q] with the plugin name", name, id)
 		}
 	}
 }
 
-func TestEmitPluginBundle_CommandBodiesMatchSource(t *testing.T) {
+// Claude Code namespaces plugin skills as "gortex:", so a skill's
+// directory and frontmatter name must both drop the "gortex-" prefix.
+// The frontmatter name wins over the directory, so checking only one
+// would let /gortex:gortex-<name> slip back in.
+func TestEmitPluginBundle_SkillNamesDropPrefix(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := EmitPluginBundle(PluginBundleSpec{
 		TargetDir: dir,
@@ -280,14 +286,107 @@ func TestEmitPluginBundle_CommandBodiesMatchSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for name, want := range SlashCommands {
-		got, err := os.ReadFile(filepath.Join(dir, "commands", name))
+	entries, err := os.ReadDir(filepath.Join(dir, "skills"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != len(GlobalSkills) {
+		t.Fatalf("skills/ has %d entries, want %d (one per workflow)", len(entries), len(GlobalSkills))
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "gortex-") {
+			t.Errorf("skill directory %q keeps the gortex- prefix", e.Name())
+		}
+		body, err := os.ReadFile(filepath.Join(dir, "skills", e.Name(), "SKILL.md"))
 		if err != nil {
-			t.Errorf("read command %s: %v", name, err)
+			t.Errorf("read skill %s: %v", e.Name(), err)
 			continue
 		}
-		if string(got) != want {
-			t.Errorf("command %s body drift", name)
+		if !strings.Contains(string(body), "\nname: "+e.Name()+"\n") {
+			t.Errorf("skill %s: frontmatter name does not match its directory", e.Name())
+		}
+	}
+}
+
+// A plugin skill is already a slash command, so a commands/ directory
+// would list every workflow twice. The bodies there also had no
+// frontmatter, which fails `claude plugin validate --strict`.
+func TestEmitPluginBundle_NoCommandsDir(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := EmitPluginBundle(PluginBundleSpec{
+		TargetDir: dir,
+		Version:   "0.18.2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "commands")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("plugin bundle must not contain commands/ (stat err = %v)", err)
+	}
+}
+
+func TestEmitPluginBundle_RemovesLegacyPaths(t *testing.T) {
+	dir := t.TempDir()
+	cmdName := sortedKeys(SlashCommands)[0]
+	skillID := sortedKeys(GlobalSkills)[0]
+	legacy := []string{
+		filepath.Join("commands", cmdName),
+		filepath.Join("skills", skillID, "SKILL.md"),
+	}
+	for _, rel := range legacy {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Files the emitter never wrote, including one inside a legacy
+	// skill directory, must survive the cleanup.
+	userFiles := []string{
+		filepath.Join(dir, "skills", "my-own", "SKILL.md"),
+		filepath.Join(dir, "skills", sortedKeys(GlobalSkills)[1], "references", "team.md"),
+	}
+	for _, full := range userFiles {
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := EmitPluginBundle(PluginBundleSpec{TargetDir: dir, Version: "0.18.2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "commands")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("legacy commands/ should be removed (stat err = %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "skills", skillID)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("legacy skills/%s should be removed (stat err = %v)", skillID, err)
+	}
+	for _, full := range userFiles {
+		if _, err := os.Stat(full); err != nil {
+			t.Errorf("files the emitter did not write must survive: %v", err)
+		}
+	}
+	legacySkill := filepath.Join(dir, "skills", sortedKeys(GlobalSkills)[1], "SKILL.md")
+	if _, err := os.Stat(legacySkill); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("legacy %s should be removed (stat err = %v)", legacySkill, err)
+	}
+}
+
+func TestPluginSkillBody_OnlyRewritesLeadingFrontmatter(t *testing.T) {
+	cases := map[string]string{
+		"---\nname: gortex-x\ndescription: d\n---\nbody\n": "---\nname: x\ndescription: d\n---\nbody\n",
+		"# Skill\n---\nname: body\n":                       "# Skill\n---\nname: body\n",
+		"---\nmeta:\n  name: nested\n---\nname: after\n":   "---\nmeta:\n  name: nested\n---\nname: after\n",
+	}
+	for in, want := range cases {
+		if got := pluginSkillBody(in, "x"); got != want {
+			t.Errorf("pluginSkillBody(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -384,10 +483,6 @@ func TestPluginPathHelpers(t *testing.T) {
 		t.Errorf("PluginHooksPath wrong: %s", PluginHooksPath())
 	}
 
-	cmds := PluginCommandPaths()
-	if len(cmds) != len(SlashCommands) {
-		t.Errorf("PluginCommandPaths count: got %d, want %d", len(cmds), len(SlashCommands))
-	}
 	skills := PluginSkillPaths()
 	if len(skills) != len(GlobalSkills) {
 		t.Errorf("PluginSkillPaths count: got %d, want %d", len(skills), len(GlobalSkills))

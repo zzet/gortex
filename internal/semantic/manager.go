@@ -131,6 +131,7 @@ type Manager struct {
 	activePasses    sync.WaitGroup
 	closing         bool
 	closeOnce       sync.Once
+	closeDone       chan struct{}
 	closeErr        error
 }
 
@@ -1602,40 +1603,70 @@ func (m *Manager) Stats() []ProviderStatus {
 	return statuses
 }
 
-// Close shuts down all providers, including any LSP subprocesses
-// owned by the installed LSPRouter. It first cancels every context-aware pass,
-// then closes provider resources to interrupt subprocess-backed legacy calls,
-// and finally waits for every admitted pass to stop mutating before returning.
-func (m *Manager) Close() error {
+// BeginClose cancels admitted passes and starts every provider/router close
+// before joining any one owner. Registration is boot-only: callers install all
+// providers/router before publishing the manager or admitting its first pass.
+// The completion includes each admitted pass's terminal graph writes.
+func (m *Manager) BeginClose() <-chan struct{} {
 	m.closeOnce.Do(func() {
 		m.lifecycleMu.Lock()
 		m.closing = true
-		if m.lifecycleCancel != nil {
-			m.lifecycleCancel()
-		}
+		m.closeDone = make(chan struct{})
+		cancel := m.lifecycleCancel
 		providers := append([]Provider(nil), m.providers...)
 		router := m.lspRouter
 		m.lifecycleMu.Unlock()
-
-		var errs []error
-		for _, p := range providers {
-			if err := p.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("closing %s: %w", p.Name(), err))
+		if cancel != nil {
+			cancel()
+		}
+		// These optional nonjoining boundaries revoke lazy LSP construction
+		// before the actual Close calls below. Other providers are interrupted
+		// by their Close, which is always launched without waiting on a peer.
+		for _, provider := range providers {
+			if owner, ok := provider.(interface{ BeginClose() <-chan struct{} }); ok {
+				owner.BeginClose()
 			}
+		}
+		if owner, ok := router.(interface{ BeginClose() <-chan struct{} }); ok {
+			owner.BeginClose()
+		}
+		var closing sync.WaitGroup
+		errs := make([]error, len(providers)+1)
+		for i, provider := range providers {
+			closing.Add(1)
+			go func() {
+				defer closing.Done()
+				if err := provider.Close(); err != nil {
+					errs[i] = fmt.Errorf("closing %s: %w", provider.Name(), err)
+				}
+			}()
 		}
 		if router != nil {
-			if err := router.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("closing lsp router: %w", err))
-			}
+			closing.Add(1)
+			go func() {
+				defer closing.Done()
+				if err := router.Close(); err != nil {
+					errs[len(providers)] = fmt.Errorf("closing lsp router: %w", err)
+				}
+			}()
 		}
-
-		// No pass can be admitted after closing was set under lifecycleMu.
-		// Every admitted run drains its provider goroutine before endPass.
-		m.activePasses.Wait()
-		if len(errs) > 0 {
-			m.closeErr = fmt.Errorf("semantic manager close errors: %v", errs)
-		}
+		go func() {
+			defer close(m.closeDone)
+			closing.Wait()
+			// No Add can follow closing=true under lifecycleMu. A provider's
+			// cancellation/Close is never proof its manager-owned terminal
+			// marker writes ended; every complete pass must also be joined.
+			m.activePasses.Wait()
+			m.closeErr = errors.Join(errs...)
+		}()
 	})
+	return m.closeDone
+}
+
+// Close waits for actual provider resources and terminal pass writes. Later
+// callers receive the same cached error; no timeout certifies quiescence.
+func (m *Manager) Close() error {
+	<-m.BeginClose()
 	return m.closeErr
 }
 

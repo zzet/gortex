@@ -249,17 +249,15 @@ type Server struct {
 	analysisGenerationReady bool
 	analysisPruneScheduled  atomic.Bool
 	analysisPruneRequested  atomic.Bool
-	// backgroundMaintenance joins the detached analysis-generation prune
-	// goroutine. Anyone closing the backend store must DrainBackground
-	// first: an in-flight prune batch survives sql.DB.Close on its pinned
-	// connection and its next WAL commit recreates store files
-	// mid-teardown. Add is gated by the mutex + drained flag so it never
-	// races DrainBackground's Wait, and a prune requested after the drain
-	// is dropped rather than run against a closing store.
+	// backgroundMaintenance owns analysis, cochange, prune and route-reader
+	// work through actual completion. Add is serialized with permanent close;
+	// cancellation is published before joins, never treated as quiescence.
 	backgroundMaintenance        sync.WaitGroup
 	backgroundMaintenanceMu      sync.Mutex
 	backgroundMaintenanceDrained bool
-	analysisPruneCancel          context.CancelFunc // guarded by backgroundMaintenanceMu
+	backgroundContext            context.Context    // initialized under backgroundMaintenanceMu
+	backgroundCancel             context.CancelFunc // guarded by backgroundMaintenanceMu
+	backgroundDrainOnce          sync.Once
 	analysisMaterializeMu        sync.Mutex
 	analysisMu                   sync.RWMutex
 	// answerAnalysis is the analysis receipt the answer path last observed
@@ -303,6 +301,7 @@ type Server struct {
 	cochangeMu     sync.RWMutex
 	cochangeByFile map[string]map[string]float64
 	cochangeCount  map[string]map[string]int
+	cochangeErr    error // terminal mine failure, guarded by cochangeMu
 
 	// autoIndexOnce guards the opt-in (GORTEX_AUTOINDEX=1) zero-config
 	// background index of an untracked cwd, fired at most once per session
@@ -3030,8 +3029,22 @@ func (s *Server) RunAnalysis() { s.runAnalysis(true) }
 // takes the lock. Passes are serialized by analysisRunMu, and a graph whose
 // installed snapshot still matches makes the pass a no-op.
 func (s *Server) runAnalysis(background bool) {
+	ctx, done, ok := s.admitBackground()
+	if !ok {
+		return
+	}
+	defer done()
+	s.runAnalysisOwned(ctx, background)
+}
+
+// runAnalysisOwned is called only by an admitted owner, including while it
+// waits for the serial pass lock. Cancellation never certifies completion.
+func (s *Server) runAnalysisOwned(ctx context.Context, background bool) {
 	s.analysisRunMu.Lock()
 	defer s.analysisRunMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 	s.analysisPassActive.Store(true)
 	defer s.analysisPassActive.Store(false)
 	if s.analysisSnapshotStillCurrent() {
@@ -3042,7 +3055,9 @@ func (s *Server) runAnalysis(background bool) {
 		// Subscribers are still told, as after every pass: the call is the
 		// "rollups are settled" signal they wait for. Nothing was rebuilt, so
 		// the graph-invalidated broadcast and the per-graph resets stay out.
-		s.notifyBootstrapResourcesUpdated()
+		if ctx.Err() == nil {
+			s.notifyBootstrapResourcesUpdated()
+		}
 		return
 	}
 	runtimeactivity.Begin("analysis")
@@ -3057,7 +3072,10 @@ func (s *Server) runAnalysis(background bool) {
 		scheduleOSMemoryReleaseAfterBurst(s.logger, "mcp_analysis")
 	}()
 
-	analysisMetrics := s.populateAnalysis(true, background)
+	analysisMetrics := s.populateAnalysisContext(ctx, true, background)
+	if ctx.Err() != nil {
+		return // An interrupted attempt is not a settled bootstrap receipt.
+	}
 
 	// The graph was just rebuilt, so the lazy-enrichment ledger — symbol
 	// IDs whose incoming refs were confirmed against the *previous* graph

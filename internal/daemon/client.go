@@ -37,7 +37,15 @@ func Dial(h Handshake) (*Client, error) {
 // DialTo is Dial with an explicit socket path. Useful for tests and for
 // clients that want to talk to a daemon on a non-default socket.
 func DialTo(socketPath string, h Handshake) (*Client, error) {
-	d := &net.Dialer{Timeout: 500 * time.Millisecond}
+	return DialToWithDeadline(socketPath, h, time.Time{})
+}
+
+// DialToWithDeadline bounds both socket connection and handshake by one
+// absolute deadline. Zero preserves DialTo's existing timeouts. A nonzero
+// deadline remains installed after the handshake for an immediate bounded
+// exchange; callers may then manage or clear it for a longer-lived connection.
+func DialToWithDeadline(socketPath string, h Handshake, deadline time.Time) (*Client, error) {
+	d := &net.Dialer{Timeout: 500 * time.Millisecond, Deadline: deadline}
 	conn, err := d.Dial("unix", socketPath)
 	if err != nil {
 		if isNoDaemonErr(err) {
@@ -61,7 +69,12 @@ func DialTo(socketPath string, h Handshake) (*Client, error) {
 	// "is the daemon usable?" probes whose whole job is to degrade quickly.
 	// Cleared below: the connection that follows is long-lived (an MCP proxy
 	// relay streams on it for the life of the session).
-	_ = conn.SetDeadline(time.Now().Add(controlHandshakeTimeoutForTest))
+	handshakeDeadline := time.Now().Add(controlHandshakeTimeoutForTest)
+	if !deadline.IsZero() && deadline.Before(handshakeDeadline) {
+		handshakeDeadline = deadline
+	}
+	handshakeBudget := time.Until(handshakeDeadline)
+	_ = conn.SetDeadline(handshakeDeadline)
 	if err := WriteJSONLine(conn, h); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("send handshake: %w", err)
@@ -72,11 +85,11 @@ func DialTo(socketPath string, h Handshake) (*Client, error) {
 		_ = conn.Close()
 		if isTimeoutErr(err) {
 			return nil, fmt.Errorf("%w: no handshake ack within %s (the daemon is up but not answering — it may be busy indexing; check `gortex daemon status`)",
-				ErrDaemonUnresponsive, controlHandshakeTimeoutForTest)
+				ErrDaemonUnresponsive, handshakeBudget)
 		}
 		return nil, fmt.Errorf("read handshake ack: %w", err)
 	}
-	_ = conn.SetDeadline(time.Time{})
+	_ = conn.SetDeadline(deadline)
 	var ack HandshakeAck
 	if err := json.Unmarshal(ackLine, &ack); err != nil {
 		_ = conn.Close()

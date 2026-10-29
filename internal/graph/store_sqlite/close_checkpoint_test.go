@@ -112,6 +112,8 @@ func assertCloseCheckpointPoolsClosed(t *testing.T, s *Store, reader, writer *cl
 }
 
 func TestCloseCheckpointDoesNotUseInteractiveDeadline(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT", "full")
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT_MAX_S", "")
 	s, reader, writer := newCloseCheckpointFixture(t, nil, 0)
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -139,6 +141,8 @@ func TestExplicitCheckpointWALKeepsInteractiveDeadline(t *testing.T) {
 }
 
 func TestCloseCheckpointErrorStillClosesBothPools(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT", "full")
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT_MAX_S", "")
 	want := errors.New("checkpoint driver failure")
 	s, reader, writer := newCloseCheckpointFixture(t, want, 0)
 	if err := s.Close(); !errors.Is(err, want) {
@@ -151,6 +155,8 @@ func TestCloseCheckpointErrorStillClosesBothPools(t *testing.T) {
 }
 
 func TestCloseCheckpointRetainsContentionRetryBudget(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT", "full")
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT_MAX_S", "")
 	s, reader, writer := newCloseCheckpointFixture(t, nil, 1)
 	// This expires the existing contention repetition budget deterministically;
 	// it does not sleep or impose a deadline on a single successful I/O call.

@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -585,14 +586,20 @@ func (h *ResolverHelper) Close() error {
 	if h.routerBacked {
 		return nil
 	}
-	var firstErr error
+	// Resolution/pool construction has already joined at this ownership
+	// boundary. Start every owned provider before waiting for any one child.
 	for _, p := range h.providers {
-		if p == nil {
-			continue
-		}
-		if err := p.Close(); err != nil && firstErr == nil {
-			firstErr = err
+		if p != nil {
+			p.BeginClose()
 		}
 	}
-	return firstErr
+	var errs []error
+	for _, p := range h.providers {
+		if p != nil {
+			if err := p.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("resolver provider %s: %w", p.Name(), err))
+			}
+		}
+	}
+	return errors.Join(errs...)
 }

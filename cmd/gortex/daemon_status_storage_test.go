@@ -21,6 +21,8 @@ import (
 // SQLite store: file sizes, the pending backlog and the close-checkpoint
 // estimate the stop path sizes its wait by, and the reclaim's counters.
 func TestStatusStorageReportsTheStoreWAL(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT", "full")
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT_MAX_S", "")
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "status.sqlite"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.Close() })
@@ -159,6 +161,8 @@ func TestTheOneShotStatusRendererReachesTheStorageBlock(t *testing.T) {
 // the answer even while a track holds the controller mutex — which is when a
 // slow edit's lane wait, or a WAL that stopped resetting, needs explaining.
 func TestStatusCarriesStorageAndBuildLaneWhileBusy(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT", "full")
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT_MAX_S", "")
 	c := probeController(t, "repos:\n  - path: /work/alpha\n")
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "status.sqlite"))
 	require.NoError(t, err)
@@ -213,5 +217,28 @@ func TestStatusWALObservationCausesAndNullablePeak(t *testing.T) {
 			require.Nil(t, got.ObservedPeakWALBytes)
 			require.Nil(t, wire["observed_peak_wal_bytes"])
 		}
+	}
+}
+
+func TestStatusStorageReportsTheDaemonsClosePolicy(t *testing.T) {
+	for _, mode := range []string{"skip", "full"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT", mode)
+			t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT_MAX_S", "")
+			store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "policy.sqlite"))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			st := storageStatusFor(store)
+			require.NotNil(t, st)
+			require.Equal(t, mode, st.CloseCheckpointPolicy)
+			if mode == "skip" {
+				require.Zero(t, st.CloseCheckpointEstimateMS)
+			} else {
+				require.Positive(t, st.CloseCheckpointEstimateMS)
+			}
+			body, err := json.Marshal(daemon.StatusResponse{Storage: st})
+			require.NoError(t, err)
+			require.Contains(t, string(body), `"close_checkpoint_policy":"`+mode+`"`)
+		})
 	}
 }

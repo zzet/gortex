@@ -42,7 +42,9 @@ func TestOpenBackend_EmptyNameOpensSqlite(t *testing.T) {
 	if store == nil {
 		t.Fatal("nil store for the default backend")
 	}
-	cleanup()
+	if err := cleanup(); err != nil {
+		t.Fatalf("close sqlite backend: %v", err)
+	}
 }
 
 // TestOpenBackend_SqliteOpensFile asserts the sqlite backend opens (and
@@ -56,7 +58,9 @@ func TestOpenBackend_SqliteOpensFile(t *testing.T) {
 	if store == nil {
 		t.Fatal("nil sqlite store")
 	}
-	cleanup()
+	if err := cleanup(); err != nil {
+		t.Fatalf("close sqlite backend: %v", err)
+	}
 }
 
 // TestOpenBackend_Unknown asserts a stale backend name (e.g. the removed

@@ -24,7 +24,7 @@ var pluginCmd = &cobra.Command{
 
 Today this command emits the Anthropic Plugin Marketplace layout —
 a directory containing plugin.json, README, LICENSE, .mcp.json,
-slash commands, skills, and hooks. The Cursor variant lands in a
+skills, sub-agents, and hooks. The Cursor variant lands in a
 follow-up.
 
 The marketplace bundle is generated, not hand-maintained. The single

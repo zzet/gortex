@@ -211,13 +211,21 @@ func (l *CheckoutLifecycle) forgetCheckoutObservation(path string, job *checkout
 	l.observationMu.Unlock()
 }
 
-func (l *CheckoutLifecycle) closeCheckoutObservations() {
+func (l *CheckoutLifecycle) cancelCheckoutObservations() {
 	l.observationMu.Lock()
 	l.observationClosed = true
+	jobs := make([]*checkoutObservationJob, 0, len(l.observationJobs))
 	for _, job := range l.observationJobs {
-		job.cancel()
+		jobs = append(jobs, job)
 	}
 	l.observationMu.Unlock()
+	for _, job := range jobs {
+		job.cancel()
+	}
+}
+
+func (l *CheckoutLifecycle) closeCheckoutObservations() {
+	l.cancelCheckoutObservations()
 	l.observationWG.Wait()
 }
 

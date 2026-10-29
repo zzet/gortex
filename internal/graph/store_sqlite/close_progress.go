@@ -9,7 +9,7 @@ import (
 
 // Close progress and the learned close rate.
 //
-// Close's final TRUNCATE copies the whole backlog in one pass and publishes
+// An opted-in full Close TRUNCATE copies the whole backlog in one pass and publishes
 // nothing until the pass ends (nBackfill moves only when a pass completes). A
 // stop path that kills the process on a fixed deadline therefore throws the
 // whole copy away — restart #8 on 2026-09-25 stopped after 211 s with a

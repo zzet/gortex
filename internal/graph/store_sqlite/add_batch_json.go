@@ -2,8 +2,10 @@ package store_sqlite
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -159,19 +161,31 @@ func jsonbIngestEnabled() bool {
 var jsonbIngestSupport atomic.Int32
 
 func jsonbIngestSupported(tx *sql.Tx) bool {
+	supported, _ := jsonbIngestSupportedContext(context.Background(), tx)
+	return supported
+}
+
+func jsonbIngestSupportedContext(ctx context.Context, tx *sql.Tx) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	switch jsonbIngestSupport.Load() {
 	case 1:
-		return true
+		return true, nil
 	case -1:
-		return false
+		return false, nil
 	}
 	var kind string
-	if err := tx.QueryRow(`SELECT typeof(jsonb('[]'))`).Scan(&kind); err != nil || kind == "" {
+	err := tx.QueryRowContext(ctx, `SELECT typeof(jsonb('[]'))`).Scan(&kind)
+	if ctx.Err() != nil {
+		return false, errors.Join(ctx.Err(), err)
+	}
+	if err != nil || kind == "" {
 		jsonbIngestSupport.Store(-1)
-		return false
+		return false, nil
 	}
 	jsonbIngestSupport.Store(1)
-	return true
+	return true, nil
 }
 
 // jsonbIngestValue normalizes the driver-facing argument types produced by
@@ -255,10 +269,13 @@ func appendJSONBIngestRow(buffers *jsonbIngestBuffers, row []any, metaIndex, row
 	return true, nil
 }
 
-func nextJSONBNodePayload(buffers *jsonbIngestBuffers, viewGen int64, nodes []*graph.Node, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
+func nextJSONBNodePayloadContext(ctx context.Context, buffers *jsonbIngestBuffers, viewGen int64, nodes []*graph.Node, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
 	buffers.reset(nodeInsertParams + 1)
 	pos := start
 	for pos < len(nodes) && rows < jsonbIngestNodeRows {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, start, 0, err
+		}
 		node := nodes[pos]
 		if node == nil || node.ID == "" || graph.IsProxyNode(node) {
 			pos++
@@ -283,10 +300,13 @@ func nextJSONBNodePayload(buffers *jsonbIngestBuffers, viewGen int64, nodes []*g
 	return buffers.payload.Bytes(), buffers.blobs.Bytes(), pos, rows, nil
 }
 
-func nextJSONBEdgePayload(buffers *jsonbIngestBuffers, viewGen int64, edges []*graph.Edge, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
+func nextJSONBEdgePayloadContext(ctx context.Context, buffers *jsonbIngestBuffers, viewGen int64, edges []*graph.Edge, start int) (jsonPayload, blobPayload []byte, next, rows int, err error) {
 	buffers.reset(edgeInsertParams + 1)
 	pos := start
 	for pos < len(edges) && rows < jsonbIngestEdgeRows {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, start, 0, err
+		}
 		edge := edges[pos]
 		if edge == nil || graph.IsProxyID(edge.From) || graph.IsProxyID(edge.To) {
 			pos++
@@ -332,18 +352,29 @@ func insertNodeChunksJSONBTxWithBuffers(
 	returnChanged bool,
 	buffers *jsonbIngestBuffers,
 ) (rowsChanged, statements int, changedIDs map[string]int, err error) {
+	return insertNodeChunksJSONBTxWithBuffersContext(context.Background(), tx, viewGen, nodes, returnChanged, buffers)
+}
+
+func insertNodeChunksJSONBTxWithBuffersContext(
+	ctx context.Context,
+	tx *sql.Tx,
+	viewGen int64,
+	nodes []*graph.Node,
+	returnChanged bool,
+	buffers *jsonbIngestBuffers,
+) (rowsChanged, statements int, changedIDs map[string]int, err error) {
 	query := jsonbNodeIngestSQL
 	if returnChanged {
 		query += " RETURNING id"
 		changedIDs = make(map[string]int)
 	}
-	stmt, err := tx.Prepare(query)
+	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
 		return 0, 0, changedIDs, err
 	}
-	defer stmt.Close()
+	defer func() { err = errors.Join(err, stmt.Close()) }()
 	for pos := 0; pos < len(nodes); {
-		payload, blobs, next, rows, encodeErr := nextJSONBNodePayload(buffers, viewGen, nodes, pos)
+		payload, blobs, next, rows, encodeErr := nextJSONBNodePayloadContext(ctx, buffers, viewGen, nodes, pos)
 		if encodeErr != nil {
 			return rowsChanged, statements, changedIDs, encodeErr
 		}
@@ -353,7 +384,7 @@ func insertNodeChunksJSONBTxWithBuffers(
 		}
 		if returnChanged {
 			rowsAt := rowsChanged
-			returned, queryErr := stmt.Query(payload, blobs)
+			returned, queryErr := stmt.QueryContext(ctx, payload, blobs)
 			statements++
 			if queryErr != nil {
 				return rowsChanged, statements, changedIDs, queryErr
@@ -377,7 +408,7 @@ func insertNodeChunksJSONBTxWithBuffers(
 			nodeRowsWritten.Add(int64(rowsChanged - rowsAt))
 			continue
 		}
-		result, execErr := countNodeWrite(stmt.Exec(payload, blobs))
+		result, execErr := countNodeWrite(stmt.ExecContext(ctx, payload, blobs))
 		statements++
 		if execErr != nil {
 			return rowsChanged, statements, changedIDs, execErr
@@ -412,18 +443,29 @@ func insertEdgeChunksJSONBTxWithBuffers(
 	returnInserted bool,
 	buffers *jsonbIngestBuffers,
 ) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
+	return insertEdgeChunksJSONBTxWithBuffersContext(context.Background(), tx, viewGen, edges, returnInserted, buffers)
+}
+
+func insertEdgeChunksJSONBTxWithBuffersContext(
+	ctx context.Context,
+	tx *sql.Tx,
+	viewGen int64,
+	edges []*graph.Edge,
+	returnInserted bool,
+	buffers *jsonbIngestBuffers,
+) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
 	query := jsonbEdgeIngestSQL
 	if returnInserted {
 		query += " RETURNING from_id, to_id, kind, file_path, line"
 		insertedKeys = make(map[sqliteEdgeIdentity]int)
 	}
-	stmt, err := tx.Prepare(query)
+	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
 		return 0, 0, insertedKeys, err
 	}
-	defer stmt.Close()
+	defer func() { err = errors.Join(err, stmt.Close()) }()
 	for pos := 0; pos < len(edges); {
-		payload, blobs, next, rows, encodeErr := nextJSONBEdgePayload(buffers, viewGen, edges, pos)
+		payload, blobs, next, rows, encodeErr := nextJSONBEdgePayloadContext(ctx, buffers, viewGen, edges, pos)
 		if encodeErr != nil {
 			return rowsInserted, statements, insertedKeys, encodeErr
 		}
@@ -433,7 +475,7 @@ func insertEdgeChunksJSONBTxWithBuffers(
 		}
 		if returnInserted {
 			rowsAt := rowsInserted
-			returned, queryErr := stmt.Query(payload, blobs)
+			returned, queryErr := stmt.QueryContext(ctx, payload, blobs)
 			statements++
 			if queryErr != nil {
 				return rowsInserted, statements, insertedKeys, queryErr
@@ -457,7 +499,7 @@ func insertEdgeChunksJSONBTxWithBuffers(
 			edgeRowsWritten.Add(int64(rowsInserted - rowsAt))
 			continue
 		}
-		result, execErr := countEdgeWrite(stmt.Exec(payload, blobs))
+		result, execErr := countEdgeWrite(stmt.ExecContext(ctx, payload, blobs))
 		statements++
 		if execErr != nil {
 			return rowsInserted, statements, insertedKeys, execErr

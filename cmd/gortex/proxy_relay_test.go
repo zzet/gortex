@@ -569,6 +569,20 @@ func TestRelayProxySessionDoesNotReplayCompletedRequestAfterDisconnect(t *testin
 	}
 }
 
+func TestProxyTestFrameReaderRetainsCoalescedFrames(t *testing.T) {
+	frames := [][]byte{
+		[]byte(`{"jsonrpc":"2.0","method":"notifications/message"}` + "\n"),
+		[]byte(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}` + "\n"),
+		[]byte(`{"jsonrpc":"2.0","id":2,"error":{"code":-32000}}` + "\n"),
+	}
+	reader := bufio.NewReader(bytes.NewReader(bytes.Join(frames, nil)))
+	for i, want := range frames {
+		if got := mustReadTestFrame(t, reader); !bytes.Equal(got, want) {
+			t.Fatalf("coalesced frame %d = %s, want %s", i, got, want)
+		}
+	}
+}
+
 func TestRetryableProxyRequestIsConservative(t *testing.T) {
 	tests := []struct {
 		name  string

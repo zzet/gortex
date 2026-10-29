@@ -601,6 +601,9 @@ type Store struct {
 	// analysisPaged enables bounded snapshots only for revision-validated analysis.
 	// Resolver and ordinary light sequences retain their single-statement reads.
 	analysisPaged bool
+	// analysisWriteCtx belongs only to a non-owning bound handle, never the
+	// shared core or another caller's ordinary store handle.
+	analysisWriteCtx context.Context
 }
 
 // WithReadContext returns a handle over the same generation whose paged
@@ -794,7 +797,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	installSQLiteSleepGauge()
 	installWALCopyPause()
 	writerDSN := sqliteWriterDSN(path)
-	db, err := sql.Open("sqlite", writerDSN)
+	db, err := openSQLiteStoreDB(writerDSN)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite open: %w", err)
 	}
@@ -849,7 +852,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 		if err := removeStoreFiles(path); err != nil {
 			return nil, fmt.Errorf("sqlite rebuild: %w", err)
 		}
-		db, err = sql.Open("sqlite", writerDSN)
+		db, err = openSQLiteStoreDB(writerDSN)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite reopen for rebuild: %w", err)
 		}
@@ -1334,7 +1337,7 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 				return false, true
 			}
 			if checkpointDB == nil {
-				db, err := sql.Open("sqlite", sqliteCheckpointDSN(s.dbPath))
+				db, err := openSQLiteStoreDB(sqliteCheckpointDSN(s.dbPath))
 				if err != nil {
 					if ctx.Err() == nil {
 						log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=open error=%q", err)
@@ -1811,17 +1814,29 @@ func (s *Store) stopCheckpointLoop() {
 }
 
 // Close closes every prepared statement and the underlying *sql.DB. It
-// first stops the WAL-checkpoint loop and issues one final TRUNCATE
-// checkpoint so the -wal file is drained and shrunk on graceful shutdown
-// rather than lingering at its high-water mark until the next open.
+// first stops the WAL-checkpoint loop and joins the actual store owners.
+// By default committed WAL frames remain for the next open; an explicit full
+// close-checkpoint policy retains the final TRUNCATE drain.
 //
 // Only the handle Open returned tears the core down. Closing a handle
 // derived by AtGeneration is a no-op that returns nil: the derived handle
 // borrows pools and statements it does not own, and closing them would break
 // every other handle over the same database.
-func (s *Store) Close() error {
+func (s *Store) Close() (closeErr error) {
 	if !s.ownsCore {
 		return nil
+	}
+	policy := resolveCloseCheckpointPolicy()
+	started := time.Now()
+	defer func() {
+		errText := ""
+		if closeErr != nil {
+			errText = closeErr.Error()
+		}
+		log.Printf("store_sqlite: close complete checkpoint_policy=%s duration=%s error=%q", policy.mode(), time.Since(started).Round(time.Millisecond), errText)
+	}()
+	if policy.warning != "" {
+		log.Printf("store_sqlite: close checkpoint policy warning: %s", policy.warning)
 	}
 	unwatchHolds(s.storeCore)
 	forgetFreshFTS(s.storeCore)
@@ -1859,18 +1874,31 @@ func (s *Store) Close() error {
 	s.releaseGenerationBulkCheckpointLease(generationLease)
 
 	var checkpointErr error
-	if s.checkpointDone != nil { // on-disk store: drain the WAL one last time
+	if s.checkpointDone != nil && policy.full { // explicit on-disk final drain
 		if hadBulk {
-			checkpointErr = s.checkpointBulkWAL()
+			ctx := context.Background()
+			pending := int64(-1)
+			if snap, ok := readWALIndexSnapshot(s.dbPath); ok {
+				pending = snap.PendingFrames()
+			}
+			if deadline := policy.deadline(pending); deadline > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, deadline)
+				defer cancel()
+			}
+			checkpointErr = s.checkpointBulkWALContext(ctx)
 		} else {
-			// Close is a durability boundary, not an interactive checkpoint.
+			// This is an explicit full drain, not an interactive checkpoint.
 			// A successful filesystem sync can exceed CheckpointWAL's deadline
 			// on a busy disk, and a large backlog needs far longer, so the
 			// deadline scales with the pending frames (closeCheckpointWAL);
 			// withSQLiteBusyRetry still bounds repeated lock contention, and
 			// checkpoint errors remain fatal.
-			checkpointErr = s.closeCheckpointWAL()
+			checkpointErr = s.closeCheckpointWAL(policy)
 		}
+	}
+	if s.checkpointDone != nil && !policy.full {
+		log.Printf("store_sqlite: close checkpoint skipped policy=skip wal_bytes=%d", walFileSize(s.dbPath+"-wal"))
 	}
 	stmts := []*sql.Stmt{
 		s.stmtInsertNode, s.stmtGetNode, s.stmtGetNodeByQual,
@@ -2419,7 +2447,14 @@ func (s *Store) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
 // failed deferred-index seal) without taking down the daemon, instead of the
 // void AddBatch path that panics through panicOnFatal.
 func (s *Store) AddBatchChecked(nodes []*graph.Node, edges []*graph.Edge) error {
-	_, err := s.addBatchSetOriented(nodes, edges)
+	return s.AddBatchCheckedContext(context.Background(), nodes, edges)
+}
+
+// AddBatchCheckedContext keeps the selected payload handle and ordinary batch
+// semantics while making admission and SQL observe ctx. An already committed
+// batch remains durable; deferred index sealing still completes synchronously.
+func (s *Store) AddBatchCheckedContext(ctx context.Context, nodes []*graph.Node, edges []*graph.Edge) error {
+	_, err := s.addBatchSetOrientedContext(ctx, nodes, edges)
 	return wrapStorageError(err)
 }
 

@@ -1326,7 +1326,7 @@ func walFileSize(path string) int64 {
 }
 
 func openWALReclaimCheckpointDB(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", sqliteCheckpointDSN(dbPath))
+	db, err := openSQLiteStoreDB(sqliteCheckpointDSN(dbPath))
 	if err != nil {
 		return nil, err
 	}

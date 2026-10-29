@@ -74,6 +74,7 @@ func (s *Server) analysisSnapshotStillCurrent() bool {
 
 // analysisPassControl is one attempt's checkpoint state.
 type analysisPassControl struct {
+	ctx        context.Context
 	s          *Server
 	writer     graph.AnalysisGenerationStore
 	expected   uint64
@@ -88,7 +89,10 @@ func (c *analysisPassControl) checkpoint(stage string) bool {
 		hook(stage)
 	}
 	if c.background {
-		c.s.yieldAnalysisPass(c.metrics)
+		c.s.yieldAnalysisPassContext(c.ctx, c.metrics)
+	}
+	if c.ctx != nil && c.ctx.Err() != nil {
+		return false
 	}
 	if c.writer != nil && c.writer.AnalysisMutationRevision() != c.expected {
 		return false
@@ -109,14 +113,19 @@ func (s *Server) analysisShouldYield() bool {
 }
 
 // yieldAnalysisPass waits, up to analysisYieldCap, while the pass should yield.
-func (s *Server) yieldAnalysisPass(metrics *analysisRunMetrics) {
+func (s *Server) yieldAnalysisPassContext(ctx context.Context, metrics *analysisRunMetrics) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !s.analysisShouldYield() {
 		return
 	}
 	started := time.Now()
 	metrics.yields++
 	for s.analysisShouldYield() && time.Since(started) < analysisYieldCap {
-		time.Sleep(analysisYieldPoll)
+		if !waitAnalysisPoll(ctx) {
+			break
+		}
 	}
 	metrics.yielded += time.Since(started)
 }
@@ -144,26 +153,43 @@ var analysisPruneStoodDown atomic.Int64
 
 // waitForQuietEditLane waits, up to limit, while an edit cycle holds the build
 // lane, and reports whether the lane is free.
-func (s *Server) waitForQuietEditLane(limit time.Duration) bool {
+func (s *Server) waitForQuietEditLaneContext(ctx context.Context, limit time.Duration) bool {
 	started := time.Now()
 	for s.editLaneBusy() {
 		if time.Since(started) >= limit {
 			return false
 		}
-		time.Sleep(analysisYieldPoll)
+		if !waitAnalysisPoll(ctx) {
+			return false
+		}
 	}
-	return true
+	return ctx.Err() == nil
+}
+
+func waitAnalysisPoll(ctx context.Context) bool {
+	timer := time.NewTimer(analysisYieldPoll)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // cancelWhenEditCycleStarts calls cancel as soon as an edit cycle holds the
 // build lane; stop ends the watch.
-func (s *Server) cancelWhenEditCycleStarts(cancel context.CancelFunc) (stop func()) {
+func (s *Server) cancelWhenEditCycleStartsContext(ctx context.Context, cancel context.CancelFunc) (stop func()) {
 	done := make(chan struct{})
+	joined := make(chan struct{})
 	go func() {
+		defer close(joined)
 		ticker := time.NewTicker(analysisYieldPoll)
 		defer ticker.Stop()
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-done:
 				return
 			case <-ticker.C:
@@ -174,5 +200,5 @@ func (s *Server) cancelWhenEditCycleStarts(cancel context.CancelFunc) (stop func
 			}
 		}
 	}()
-	return func() { close(done) }
+	return func() { close(done); <-joined }
 }

@@ -156,7 +156,7 @@ func stopDaemonForHandoff(expected daemonIdentity) error {
 	if err != nil {
 		return err
 	}
-	stopProgress := installDaemonCloseProgress()
+	stopProgress := installDaemonCloseProgressForStore(g.state.BackendPath)
 	defer stopProgress()
 	// Revalidate immediately before the signal, including a fresh handshake;
 	// never signal a stale/reused PID merely because its file remains.

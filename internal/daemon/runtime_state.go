@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -31,6 +32,9 @@ type RuntimeState struct {
 	// PID is the daemon process that wrote this file. Readers use it to tell
 	// a live record from one a killed daemon left behind.
 	PID int `json:"pid"`
+	// ProcessBirthToken positively binds new records to their native process
+	// incarnation. Absence remains compatible with older daemon records.
+	ProcessBirthToken string `json:"process_birth_token,omitempty"`
 	// BackendPath is the resolved graph store file the daemon opened —
 	// --backend-path expanded to an absolute path, or the platform default
 	// when the flag was not given.
@@ -76,6 +80,14 @@ func RuntimeStatePath() string {
 // claims to belong to some other daemon.
 func WriteRuntimeState(st RuntimeState) error {
 	st.PID = os.Getpid()
+	identity, err := platform.CaptureProcessIdentity(st.PID)
+	if err != nil {
+		return fmt.Errorf("capture runtime owner: %w", err)
+	}
+	st.ProcessBirthToken, err = identity.Token()
+	if err != nil {
+		return fmt.Errorf("stamp runtime owner: %w", err)
+	}
 	st.StartupUpdatedAt = time.Now().UnixMilli()
 	path := RuntimeStatePath()
 	if err := EnsureParentDir(path); err != nil {

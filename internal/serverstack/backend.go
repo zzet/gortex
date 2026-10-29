@@ -36,7 +36,7 @@ import (
 // a schema newer than this binary is always refused and retained. The caller
 // must hold the store lock. NewSharedServer passes true only after acquiring
 // the exclusive flock.
-func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func(), error) {
+func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func() error, error) {
 	if err := checkBackend(name); err != nil {
 		return nil, nil, err
 	}
@@ -96,7 +96,7 @@ func resolveBackendPath(in, filename string) (string, error) {
 // openSqliteBackend opens (or creates) the SQLite store at path. The
 // pure-Go modernc.org/sqlite driver keeps the binary CGo-free while still
 // getting a real query planner that drives the graph's secondary indexes.
-func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func(), error) {
+func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func() error, error) {
 	var opts []store_sqlite.Option
 	if len(observers) > 0 && observers[0] != nil {
 		opts = append(opts, store_sqlite.WithMigrationObserver(observers[0]))
@@ -116,5 +116,5 @@ func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite
 		}
 		return nil, nil, fmt.Errorf("open sqlite store at %q: %w (%s)", path, err, hint)
 	}
-	return s, func() { _ = s.Close() }, nil
+	return s, s.Close, nil
 }

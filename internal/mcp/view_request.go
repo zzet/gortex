@@ -2719,16 +2719,21 @@ func (s *Server) queueRouteFTSWarm(materializer *graphview.Materializer, generat
 	if s == nil || materializer == nil || materializer.Store == nil || len(generations) == 0 {
 		return
 	}
+	ctx, done, ok := s.admitBackground()
+	if !ok {
+		return
+	}
 	q := &s.routeFTSWarm
 	q.mu.Lock()
 	q.pending = append(q.pending, append([]int64(nil), generations...))
 	if q.running {
 		q.mu.Unlock()
+		done()
 		return
 	}
 	q.running = true
 	q.mu.Unlock()
-	go s.runRouteFTSWarm(materializer)
+	go func() { defer done(); s.runRouteFTSWarmContext(ctx, materializer) }()
 }
 
 // runRouteFTSWarm is the warm's worker. For each queued route it reads, for
@@ -2739,13 +2744,13 @@ func (s *Server) queueRouteFTSWarm(materializer *graphview.Materializer, generat
 // the first search. Before every generation it stands down while an edit cycle
 // holds the build lane — the predicate the analysis pass and the prune yield
 // to, the edit-cycle predicate — so no read competes with an edit.
-func (s *Server) runRouteFTSWarm(materializer *graphview.Materializer) {
+func (s *Server) runRouteFTSWarmContext(ctx context.Context, materializer *graphview.Materializer) {
 	q := &s.routeFTSWarm
 	for {
 		q.mu.Lock()
 		routes := q.pending
 		q.pending = nil
-		if len(routes) == 0 {
+		if len(routes) == 0 || ctx.Err() != nil {
 			q.running = false
 			q.mu.Unlock()
 			return
@@ -2756,7 +2761,7 @@ func (s *Server) runRouteFTSWarm(materializer *graphview.Materializer) {
 		}
 		read := 0
 		for _, generations := range routes {
-			read += s.warmRouteFTS(materializer, generations)
+			read += s.warmRouteFTSContext(ctx, materializer, generations)
 		}
 		if hook := routeFTSWarmHook; hook != nil {
 			hook(read)
@@ -2766,11 +2771,10 @@ func (s *Server) runRouteFTSWarm(materializer *graphview.Materializer) {
 
 // warmRouteFTS warms one route, standing down for edits; it reports how many
 // generations it read.
-func (s *Server) warmRouteFTS(materializer *graphview.Materializer, generations []int64) int {
-	if !s.waitForQuietEditLane(routeFTSWarmLaneWait) {
+func (s *Server) warmRouteFTSContext(ctx context.Context, materializer *graphview.Materializer, generations []int64) int {
+	if !s.waitForQuietEditLaneContext(ctx, routeFTSWarmLaneWait) {
 		return 0
 	}
-	ctx := context.Background()
 	ancestry, err := materializer.RouteAncestry(ctx, generations...)
 	if err != nil {
 		return 0
@@ -2782,7 +2786,7 @@ func (s *Server) warmRouteFTS(materializer *graphview.Materializer, generations 
 		if generation == top {
 			continue
 		}
-		if !s.waitForQuietEditLane(routeFTSWarmLaneWait) {
+		if !s.waitForQuietEditLaneContext(ctx, routeFTSWarmLaneWait) {
 			break
 		}
 		n, err := search.WarmFTSGenerations(ctx, materializer.Store, []int64{generation})
