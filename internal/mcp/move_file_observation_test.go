@@ -335,3 +335,30 @@ func TestMoveOriginalDirectAdmissionCannotBeReissued(t *testing.T) {
 	after, _ := s.moveFileObservationPayload(t.Context(), observation.records[source].id)
 	require.Equal(t, before["direct_reconcile"], after["direct_reconcile"], "completed original owner changed after re-admission attempt")
 }
+
+// The source and target are written before either direct reconciliation.
+// An independent public reader may therefore publish the target first. The
+// later direct no-op cannot donate a new acceptance window to that write.
+func TestMovePublicReadPublishesTargetBeforeDirectAdmission(t *testing.T) {
+ s, observation, ctx, _, _, target := moveObservationExecutionFixture(t)
+ idx := s.multiIndexer.GetIndexer("fixture")
+ const movedID = "fixture/target.go::Moved"
+ require.Nil(t, s.engineFor(t.Context()).GetSymbol(movedID), "fixture must require an actual target publication")
+ root, ok := s.multiIndexer.RepoRoot("fixture")
+ require.True(t, ok)
+ readerCtx := WithSessionCWD(WithSessionID(ctx, "move-independent-reader"), root)
+ req := mcpgo.CallToolRequest{}
+ req.Params.Arguments = map[string]any{"id": movedID, "context_lines": 0}
+ result, err := s.handleGetSymbolSource(readerCtx, req)
+ require.NoError(t, err)
+ require.False(t, result.IsError)
+ require.Contains(t, unmarshalResult(t, result)["source"], "func Moved()")
+ require.NotNil(t, s.engineFor(t.Context()).GetSymbol(movedID), "actual public read did not apply the target")
+ // Keep real executor proof: unchanged direct work cannot be relabeled as
+ // applied acceptance, regardless of how the earlier reader is retained.
+ later := captureMoveActualExecution(t, s, target, observation.observer(ctx, target, idx))
+ require.False(t, later.AcceptedFor(idx, observation.records[target].newSHA), "fixture must exercise the later no-op, not another actual apply")
+ status, _ := s.moveFileObservationPayload(t.Context(), observation.records[target].id)
+ require.Equal(t, "observed", status["direct_reconcile_state"], "the actual earlier public publisher must retain its own independent window")
+ require.Contains(t, status, "direct_reconcile")
+}
