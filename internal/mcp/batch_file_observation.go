@@ -191,6 +191,16 @@ func (s *Server) batchFileObservationPayload(ctx context.Context, id string) (ma
 		record.mu.RUnlock()
 	}
 	ledger.mu.Unlock()
+	if ticket != "" {
+		if outcome, ok := s.mutationReceiptState(ticket); ok && outcome.Generation != 0 {
+			payload["applied_generation"] = outcome.AppliedGeneration
+			payload["publication_pending"] = outcome.Pending
+			payload["publication_fresh"] = outcome.Reindexed && outcome.Err == nil && !outcome.Pending
+			if outcome.Err != nil {
+				payload["publication_error"] = outcome.Err.Error()
+			}
+		}
+	}
 	attachMutationPhaseTimings(payload, ticket, committed, indexer.PublicationSourceMCPEdit, publication)
 	if repair != nil {
 		payload["read_assisted_publication"] = repair.payload()

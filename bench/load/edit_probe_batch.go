@@ -161,3 +161,17 @@ func (r editProbeBatchReferences) validateFileObservation(status map[string]any)
 	}
 	return nil
 }
+
+func (r editProbeBatchReferences) accounting(fileStatus, acknowledgementStatus map[string]any) editProbeAccounting {
+	if err := r.validateFileObservation(fileStatus); err != nil {
+		return editProbeAccounting{State: "unavailable", Reasons: []string{err.Error()}}
+	}
+	if acknowledgementStatus["found"] != true || acknowledgementStatus["receipt"] != r.Acknowledgement || acknowledgementStatus["receipt_kind"] != "batch_acknowledgement" {
+		return editProbeAccounting{State: "unavailable", Reasons: []string{"original shared batch ACK owner unavailable"}}
+	}
+	shared, _ := acknowledgementStatus["acknowledgement"].(map[string]any)
+	if shared == nil {
+		return editProbeAccounting{State: "unavailable", Reasons: []string{"shared batch ACK intervals unavailable"}}
+	}
+	return checkEditProbeAccountingWithAcknowledgement(fileStatus, r.Observation, "publication_generation", shared)
+}

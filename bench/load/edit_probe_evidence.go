@@ -240,12 +240,19 @@ type editProbeAccounting struct {
 }
 
 func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAccounting {
+	return checkEditProbeAccountingWithAcknowledgement(status, receipt, "reindex_generation", nil)
+}
+
+// A batch's shared RPC owner is supplied separately from its per-file P/B/R
+// owner. The windows remain independent; no map is merged into a synthetic
+// physical mutation_status reply and A is never added to background work.
+func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any) editProbeAccounting {
 	out := editProbeAccounting{State: "unavailable"}
 	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }
 	if status["receipt"] != receipt {
 		fail("receipt identity mismatch")
 	}
-	requested, err := strconvEditProbeUint(status["reindex_generation"])
+	requested, err := strconvEditProbeUint(status[requestedField])
 	if err != nil || requested == 0 {
 		fail("requested generation unavailable")
 	}
@@ -256,6 +263,9 @@ func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAc
 	}
 	out.Applied = applied
 	ack, _ := status["acknowledgement"].(map[string]any)
+	if sharedAcknowledgement != nil {
+		ack = sharedAcknowledgement
+	}
 	out.RPCID, _ = ack["rpc_id"].(string)
 	if out.RPCID == "" || ack["disjoint_observed_intervals"] != true {
 		fail("bound disjoint A identity unavailable")

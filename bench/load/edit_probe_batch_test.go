@@ -160,3 +160,35 @@ func TestEditProbeBatchFileObservationRequiresOriginalDurableIdentity(t *testing
 		}
 	}
 }
+
+func TestEditProbeBatchAccountingKeepsSharedACKOutsideFileAndWinnerWindows(t *testing.T) {
+	refs, err := decodeEditProbeBatchAcknowledgement(editProbeBatchACKFixture(), "transaction-1", editProbeBatchACKAbsPath(), "repo/file.go", editProbeBatchOfferedBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs.GraphGeneration, refs.ResultGeneration = 1, 1
+	file := editProbeAccountingFixture()
+	shared := map[string]any{"found": true, "receipt": refs.Acknowledgement, "receipt_kind": "batch_acknowledgement", "acknowledgement": file["acknowledgement"]}
+	file["acknowledgement"] = map[string]any{"rpc_id": "foreign-file-RPC"}
+	file["found"], file["receipt_kind"], file["receipt"] = true, "batch_file_observation", refs.Observation
+	file["transaction_id"], file["path"], file["batch_disk_verdict"] = refs.TransactionID, refs.RelativePath, "committed"
+	file["after_sha256"], file["publication_receipt"], file["publication_generation"] = refs.AfterSHA256, refs.GraphReceipt, json.Number("1")
+	file["writer_return_observed"], file["acknowledgement_state"] = true, "not_applicable_shared_transaction_rpc"
+	got := refs.accounting(file, shared)
+	if got.State != "observed_single_window_checks_pass" || got.RPCID != "rpc-a" || got.A == nil || got.P == nil || got.B == nil {
+		t.Fatalf("independent windows unavailable: %+v", got)
+	}
+	for _, key := range []string{"receipt", "receipt_kind", "found", "acknowledgement"} {
+		copy := map[string]any{}
+		for k, v := range shared {
+			copy[k] = v
+		}
+		delete(copy, key)
+		if refs.accounting(file, copy).State == "observed_single_window_checks_pass" {
+			t.Fatal("accepted missing shared ACK owner", key)
+		}
+	}
+	if file["acknowledgement"].(map[string]any)["rpc_id"] != "foreign-file-RPC" {
+		t.Fatal("mutated/merged original file status")
+	}
+}
