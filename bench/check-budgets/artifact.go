@@ -217,12 +217,16 @@ func (g githubClient) lookupMain(ctx context.Context, repo, revision, osName, ar
 }
 
 func binaryArtifact(path string) (mainArtifact, error) {
+	return inspectBinaryArtifact(path, "github.com/zzet/gortex/cmd/gortex")
+}
+
+func inspectBinaryArtifact(path, importPath string) (mainArtifact, error) {
 	var metadata mainArtifact
 	info, err := buildinfo.ReadFile(path)
 	if err != nil {
 		return metadata, err
 	}
-	if info.Path != "github.com/zzet/gortex/cmd/gortex" || info.GoVersion != runtime.Version() {
+	if info.Path != importPath || info.GoVersion != runtime.Version() {
 		return metadata, errors.New("artifact must be the Gortex daemon built with this pinned Go toolchain")
 	}
 	metadata.Version = 1
