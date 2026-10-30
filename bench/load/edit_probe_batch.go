@@ -12,64 +12,152 @@ import (
 // and this file's graph ticket have separate clocks/retention and are never
 // represented as one synthetic mutation_receipt.
 type editProbeBatchReferences struct {
-	TransactionID string `json:"transaction_id"`
-	Acknowledgement string `json:"acknowledgement_receipt"`
-	Path string `json:"path"`
-	RelativePath string `json:"relative_path"`
-	AfterSHA256 string `json:"after_sha256"`
-	GraphReceipt string `json:"reindex_receipt"`
-	GraphGeneration uint64 `json:"reindex_generation"`
-	ResultReceipt string `json:"result_reindex_receipt"`
-	ResultGeneration uint64 `json:"result_reindex_generation"`
+	TransactionID        string `json:"transaction_id"`
+	Observation          string `json:"file_observation_receipt"`
+	Acknowledgement      string `json:"acknowledgement_receipt"`
+	Path                 string `json:"path"`
+	RelativePath         string `json:"relative_path"`
+	AfterSHA256          string `json:"after_sha256"`
+	GraphReceipt         string `json:"reindex_receipt"`
+	GraphGeneration      uint64 `json:"reindex_generation"`
+	ResultReceipt        string `json:"result_reindex_receipt"`
+	ResultGeneration     uint64 `json:"result_reindex_generation"`
 	AcknowledgementState string `json:"acknowledgement_state"`
-	TransactionError string `json:"transaction_error,omitempty"`
+	TransactionError     string `json:"transaction_error,omitempty"`
 }
 
 // This explicit fixture offers whole-file before/after bytes. It is not the
 // generic anchor-splice batch shape: the same precomputed prefix as edit.write
 // makes its durable after-image provable without reading later server state.
-func editProbeBatchRequest(c Corpus, before, marker, transactionID string) (request,string) {
-	_,after:=editProbeWriteRequest(c,before,marker)
-	return request{Tool:"edit",Operation:"batch",Arguments:map[string]any{
-		"operation":"batch",
-		"changes":[]any{map[string]any{"op":"edit_file","path":c.File,"old_string":before,"new_string":after}},
-		"options":map[string]any{"transaction_id":transactionID},
-	}},after
+func editProbeBatchRequest(c Corpus, before, marker, transactionID string) (request, string) {
+	_, after := editProbeWriteRequest(c, before, marker)
+	return request{Tool: "edit", Operation: "batch", Arguments: map[string]any{
+		"operation": "batch",
+		"changes":   []any{map[string]any{"op": "edit_file", "path": c.File, "old_string": before, "new_string": after}},
+		"options":   map[string]any{"transaction_id": transactionID},
+	}}, after
 }
 
 // Only the pointed one-file edit_file shape is supported here. Missing timing
 // references do not negate a genuine committed ACK: validateReferences below
 // reports those independently, so unavailable accounting cannot become zero or
 // remove the successful source acknowledgement from its denominator.
-func decodeEditProbeBatchAcknowledgement(body map[string]any,transactionID,absPath,relativePath string,offered []byte)(editProbeBatchReferences,error){
-	out:=editProbeBatchReferences{}
-	if transactionID=="" || body["transaction_id"]!=transactionID || body["status"]!="committed" || body["disk_status"]!="committed" {return out,errors.New("batch transaction is not the requested committed source acknowledgement")}
-	files,ok:=body["files"].([]any);if !ok || len(files)!=1 {return out,errors.New("one-file batch acknowledgement requires exactly one durable file")}
-	results,ok:=body["results"].([]any);if !ok || len(results)!=1 {return out,errors.New("one-file batch acknowledgement requires exactly one applied result")}
-	file,ok:=files[0].(map[string]any);if !ok {return out,errors.New("invalid durable file")}
-	result,ok:=results[0].(map[string]any);if !ok || result["op"]!="edit_file" || result["status"]!="applied" || result["path"]!=relativePath {return out,errors.New("batch result does not identify the applied requested edit_file")}
-	path,_:=file["path"].(string);rel,_:=file["relative_path"].(string)
-	if !filepath.IsAbs(absPath) || filepath.Clean(absPath)!=absPath || path!=absPath || rel!=relativePath || relativePath=="" || file["after_absent"]==true || file["before_absent"]==true {return out,errors.New("batch durable file identity does not match the existing requested file")}
-	for _,name:=range []string{"after_absent","before_absent"} {if value,present:=file[name];present {if absent,ok:=value.(bool);!ok || absent {return out,errors.New("batch file absence flag contradicts existing-file edit")}}}
-	after,_:=file["after_sha256"].(string);bytes,err:=hex.DecodeString(after)
-	if err!=nil || len(bytes)!=32 || after!=strings.ToLower(after) {return out,errors.New("batch durable after-image SHA256 unavailable")}
-	expected:=sha256.Sum256(offered)
-	if len(offered)==0 || after!=hex.EncodeToString(expected[:]) {return out,errors.New("batch durable after-image does not match exact offered whole-file bytes")}
-	out.TransactionID,out.Path,out.RelativePath,out.AfterSHA256=transactionID,path,rel,after
-	if value,present:=body["error"];present {message,ok:=value.(string);if !ok {return out,errors.New("invalid transaction error")};out.TransactionError=message}
-	out.Acknowledgement,_=body["acknowledgement_receipt"].(string)
-	out.AcknowledgementState,_=body["acknowledgement_state"].(string)
-	out.GraphReceipt,_=file["reindex_receipt"].(string)
-	if value,present:=file["reindex_generation"];present {generation,err:=strconvEditProbeUint(value);if err!=nil {return out,errors.New("invalid batch file generation")};out.GraphGeneration=generation}
-	out.ResultReceipt,_=result["reindex_receipt"].(string)
-	if value,present:=result["reindex_generation"];present {generation,err:=strconvEditProbeUint(value);if err!=nil {return out,errors.New("invalid batch result generation")};out.ResultGeneration=generation}
-	return out,nil
+func decodeEditProbeBatchAcknowledgement(body map[string]any, transactionID, absPath, relativePath string, offered []byte) (editProbeBatchReferences, error) {
+	out := editProbeBatchReferences{}
+	if transactionID == "" || body["transaction_id"] != transactionID || body["status"] != "committed" || body["disk_status"] != "committed" {
+		return out, errors.New("batch transaction is not the requested committed source acknowledgement")
+	}
+	files, ok := body["files"].([]any)
+	if !ok || len(files) != 1 {
+		return out, errors.New("one-file batch acknowledgement requires exactly one durable file")
+	}
+	results, ok := body["results"].([]any)
+	if !ok || len(results) != 1 {
+		return out, errors.New("one-file batch acknowledgement requires exactly one applied result")
+	}
+	file, ok := files[0].(map[string]any)
+	if !ok {
+		return out, errors.New("invalid durable file")
+	}
+	result, ok := results[0].(map[string]any)
+	if !ok || result["op"] != "edit_file" || result["status"] != "applied" || result["path"] != relativePath {
+		return out, errors.New("batch result does not identify the applied requested edit_file")
+	}
+	path, _ := file["path"].(string)
+	rel, _ := file["relative_path"].(string)
+	if !filepath.IsAbs(absPath) || filepath.Clean(absPath) != absPath || path != absPath || rel != relativePath || relativePath == "" || file["after_absent"] == true || file["before_absent"] == true {
+		return out, errors.New("batch durable file identity does not match the existing requested file")
+	}
+	for _, name := range []string{"after_absent", "before_absent"} {
+		if value, present := file[name]; present {
+			if absent, ok := value.(bool); !ok || absent {
+				return out, errors.New("batch file absence flag contradicts existing-file edit")
+			}
+		}
+	}
+	after, _ := file["after_sha256"].(string)
+	bytes, err := hex.DecodeString(after)
+	if err != nil || len(bytes) != 32 || after != strings.ToLower(after) {
+		return out, errors.New("batch durable after-image SHA256 unavailable")
+	}
+	expected := sha256.Sum256(offered)
+	if len(offered) == 0 || after != hex.EncodeToString(expected[:]) {
+		return out, errors.New("batch durable after-image does not match exact offered whole-file bytes")
+	}
+	out.TransactionID, out.Path, out.RelativePath, out.AfterSHA256 = transactionID, path, rel, after
+	if value, present := body["error"]; present {
+		message, ok := value.(string)
+		if !ok {
+			return out, errors.New("invalid transaction error")
+		}
+		out.TransactionError = message
+	}
+	out.Acknowledgement, _ = body["acknowledgement_receipt"].(string)
+	out.AcknowledgementState, _ = body["acknowledgement_state"].(string)
+	out.GraphReceipt, _ = file["reindex_receipt"].(string)
+	if value, present := file["reindex_generation"]; present {
+		generation, err := strconvEditProbeUint(value)
+		if err != nil {
+			return out, errors.New("invalid batch file generation")
+		}
+		out.GraphGeneration = generation
+	}
+	out.ResultReceipt, _ = result["reindex_receipt"].(string)
+	if value, present := result["reindex_generation"]; present {
+		generation, err := strconvEditProbeUint(value)
+		if err != nil {
+			return out, errors.New("invalid batch result generation")
+		}
+		out.ResultGeneration = generation
+	}
+	if rows, ok := body["file_observations"].([]any); ok && len(rows) == 1 {
+		if row, ok := rows[0].(map[string]any); ok && row["path"] == relativePath {
+			out.Observation, _ = row["receipt"].(string)
+		}
+	}
+	return out, nil
 }
 
-func (r editProbeBatchReferences) validateReferences()error{
-	if !strings.HasPrefix(r.Acknowledgement,"batch-ack-") || r.Acknowledgement=="batch-ack-" || r.AcknowledgementState!="reference_only_query_mutation_status" {return errors.New("original shared batch acknowledgement reference unavailable")}
-	if r.GraphReceipt=="" || r.GraphGeneration==0 {return errors.New("original batch file graph reference unavailable")}
-	if r.ResultReceipt!=r.GraphReceipt || r.ResultGeneration!=r.GraphGeneration {return errors.New("batch result and durable file graph identities disagree")}
-	if r.TransactionID==r.Acknowledgement || r.TransactionID==r.GraphReceipt || r.Acknowledgement==r.GraphReceipt {return errors.New("batch transaction/acknowledgement/file identities are not distinct")}
+func (r editProbeBatchReferences) validateReferences() error {
+	if !strings.HasPrefix(r.Observation, "batch-file-") || r.Observation == "batch-file-" {
+		return errors.New("original batch file observation reference unavailable")
+	}
+	if r.Observation == r.TransactionID || r.Observation == r.Acknowledgement || r.Observation == r.GraphReceipt {
+		return errors.New("batch file timing identity borrowed from another domain")
+	}
+
+	if !strings.HasPrefix(r.Acknowledgement, "batch-ack-") || r.Acknowledgement == "batch-ack-" || r.AcknowledgementState != "reference_only_query_mutation_status" {
+		return errors.New("original shared batch acknowledgement reference unavailable")
+	}
+	if r.GraphReceipt == "" || r.GraphGeneration == 0 {
+		return errors.New("original batch file graph reference unavailable")
+	}
+	if r.ResultReceipt != r.GraphReceipt || r.ResultGeneration != r.GraphGeneration {
+		return errors.New("batch result and durable file graph identities disagree")
+	}
+	if r.TransactionID == r.Acknowledgement || r.TransactionID == r.GraphReceipt || r.Acknowledgement == r.GraphReceipt {
+		return errors.New("batch transaction/acknowledgement/file identities are not distinct")
+	}
+	return nil
+}
+
+// Validate the response-only observation against the durable ACK before any
+// phase accounting. This does not replace the transaction's source verdict or
+// synthesize a single-file mutation receipt from the shared RPC clock.
+func (r editProbeBatchReferences) validateFileObservation(status map[string]any) error {
+	if err := r.validateReferences(); err != nil {
+		return err
+	}
+	if status["found"] != true || status["receipt_kind"] != "batch_file_observation" ||
+		status["receipt"] != r.Observation || status["transaction_id"] != r.TransactionID ||
+		status["path"] != r.RelativePath || status["batch_disk_verdict"] != "committed" ||
+		status["after_sha256"] != r.AfterSHA256 || status["publication_receipt"] != r.GraphReceipt ||
+		status["writer_return_observed"] != true || status["acknowledgement_state"] != "not_applicable_shared_transaction_rpc" {
+		return errors.New("batch file timing does not identify original durable file and publication")
+	}
+	generation, err := strconvEditProbeUint(status["publication_generation"])
+	if err != nil || generation != r.GraphGeneration {
+		return errors.New("batch file timing publication generation mismatch")
+	}
 	return nil
 }

@@ -187,3 +187,56 @@ func TestBatchFileObservationRealReadmissionCannotReplaceOriginalTicket(t *testi
 	require.Equal(t, originalTicket, after["publication_receipt"], "readmission cannot borrow a later ticket for original writer timing")
 	require.Equal(t, before["publication_generation"], after["publication_generation"])
 }
+
+func TestBatchFileObservationActualAdmissionRefusesEarlyPublisher(t *testing.T) {
+	for _, immediate := range []bool{false, true} {
+		name := "pending-actual-ticket"
+		if immediate {
+			name = "completed-before-admission-return"
+		}
+		t.Run(name, func(t *testing.T) {
+			watcher := &canonicalPublicationWatcher{hold: !immediate}
+			s := newAtomicBatchTestServer(t, watcher)
+			s.mutationReindexWait = time.Nanosecond
+			defer func() {
+				if !immediate {
+					for _, done := range watcher.results {
+						close(done)
+					}
+				}
+			}()
+			file := writeAtomicBatchFixture(t, t.TempDir(), "target.txt", "before\n")
+			idx := &indexer.Indexer{}
+			earlyChecked := false
+			s.batchWriteOverride = func(path string, content []byte, mode os.FileMode) error {
+				require.Nil(t, s.readRepairObserver(t.Context(), path, idx), "publisher during writer cannot acquire eventual durable transaction ownership")
+				earlyChecked = true
+				return durableAtomicWriteFile(path, content, mode)
+			}
+			req := editOperationRequest("batch_edit", "")
+			req.Params.Arguments = map[string]any{"transaction_id": "early-publisher-" + name, "edits": []any{map[string]any{"op": "edit_file", "path": file, "old_string": "before\n", "new_string": "after\n"}}}
+			_, err := s.boundToolHandler(s.handleAtomicBatchEdit)(t.Context(), req)
+			require.NoError(t, err)
+			require.True(t, earlyChecked)
+			require.Len(t, watcher.records, 1)
+			require.NotNil(t, watcher.records[0], "real scheduler receives original batch file timeline")
+			value, _ := s.batchTransactions.Load("early-publisher-" + name)
+			tx := value.(*batchTransactionState).snapshot()
+			refs := s.batchFileObservationReferences(tx)
+			require.Len(t, refs, 1)
+			payload, _ := s.batchFileObservationPayload(t.Context(), refs[0].Receipt)
+			require.Equal(t, tx.Files[0].ReindexReceipt, payload["publication_receipt"])
+			if immediate {
+				// A completed requested publisher cannot be relabeled as a later reader's
+				// independently measured execution merely because the bytes now match.
+				require.Eventually(t, func() bool { return s.readRepairObserver(t.Context(), file, idx) == nil }, time.Second, time.Millisecond)
+				require.NotContains(t, payload, "read_assisted_publication")
+			} else {
+				witness, ok := s.captureReadRepairWitness(file, idx)
+				require.True(t, ok, "only the actual committed+admitted pending ticket can capture a subsequent reader")
+				require.Equal(t, tx.Files[0].ReindexReceipt, witness.receipt)
+				require.Equal(t, tx.Files[0].ReindexGeneration, witness.generation)
+			}
+		})
+	}
+}
