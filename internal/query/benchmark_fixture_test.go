@@ -15,12 +15,15 @@ func TestBenchmarkFixtureTargets(t *testing.T) {
 	eng := buildTestEngine(t)
 	for _, id := range []string{
 		benchmarkServerID,
-		benchmarkGraphID,
-		benchmarkAddNodeID,
-		benchmarkServeID,
+		benchmarkDependencyID,
+		benchmarkCallerID,
+		benchmarkUsageID,
+		benchmarkCallChainID,
 	} {
 		if eng.g.GetNode(id) == nil {
 			t.Errorf("benchmark target is absent from the indexed fixture: %s", id)
+		} else {
+			t.Logf("indexed benchmark target: %s", id)
 		}
 	}
 	observed := map[string][2]int{}
@@ -29,10 +32,10 @@ func TestBenchmarkFixtureTargets(t *testing.T) {
 	observed["Stats"] = [2]int{stats.TotalNodes, stats.TotalEdges}
 	for name, result := range map[string]*SubGraph{
 		"GetDependencies": eng.GetDependencies(benchmarkServerID, QueryOptions{Depth: 2, Limit: 50}),
-		"GetDependents":   eng.GetDependents(benchmarkGraphID, QueryOptions{Depth: 3, Limit: 50}),
-		"GetCallers":      eng.GetCallers(benchmarkAddNodeID, QueryOptions{Depth: 2, Limit: 50}),
-		"GetCallChain":    eng.GetCallChain(benchmarkServeID, QueryOptions{Depth: 4, Limit: 50}),
-		"FindUsages":      eng.FindUsages(benchmarkGraphID),
+		"GetDependents":   eng.GetDependents(benchmarkDependencyID, QueryOptions{Depth: 3, Limit: 50}),
+		"GetCallers":      eng.GetCallers(benchmarkCallerID, QueryOptions{Depth: 2, Limit: 50}),
+		"GetCallChain":    eng.GetCallChain(benchmarkCallChainID, QueryOptions{Depth: 4, Limit: 50}),
+		"FindUsages":      eng.FindUsages(benchmarkUsageID),
 		"GetCluster":      eng.GetCluster(benchmarkServerID, QueryOptions{Depth: 2, Limit: 50}),
 	} {
 		if result == nil || len(result.Nodes) < 2 || len(result.Edges) < 1 {
@@ -40,6 +43,12 @@ func TestBenchmarkFixtureTargets(t *testing.T) {
 		}
 		if result != nil {
 			observed[name] = [2]int{len(result.Nodes), len(result.Edges)}
+			for _, node := range result.Nodes {
+				t.Logf("%s node: %s", name, node.ID)
+			}
+			for _, edge := range result.Edges {
+				t.Logf("%s edge: %s --%s--> %s", name, edge.From, edge.Kind, edge.To)
+			}
 		}
 	}
 	if observed["SearchSymbols"][0] < 1 || stats.TotalNodes < 2 || stats.TotalEdges < 1 {

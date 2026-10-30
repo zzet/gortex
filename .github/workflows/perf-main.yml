@@ -34,8 +34,8 @@ jobs:
         run: go build -o "${{ runner.temp }}/perf-artifact-writer" ./bench/check-budgets
       - name: Prepare the explicit pinned fixture before compiling benchmark executables
         env:
-          # Historical query-microbenchmark input only; not the load-smoke corpus.
-          PERF_MICRO_FIXTURE_REVISION: 40f94fcc6616889086656d2d5a9d6414da926b2e
+          # Reviewed contemporary public Gortex fixture; no moving branch input.
+          PERF_MICRO_FIXTURE_REVISION: c6c6de19da02fc698db7a89f9922a8ec49cc61b5
         run: >-
           "${{ runner.temp }}/perf-artifact-writer" prepare-fixture
           --revision "$PERF_MICRO_FIXTURE_REVISION"

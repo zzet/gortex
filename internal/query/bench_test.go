@@ -20,10 +20,11 @@ var (
 )
 
 const (
-	benchmarkServerID  = "internal/mcp/server.go::NewServer"
-	benchmarkGraphID   = "internal/graph/graph.go::Graph"
-	benchmarkAddNodeID = "internal/graph/graph.go::Graph.AddNode"
-	benchmarkServeID   = "cmd/gortex/serve.go::runServe"
+	benchmarkUsageID      = "internal/graph/graph.go::hashEdgeKey"
+	benchmarkServerID     = "internal/mcp/server.go::NewServer"
+	benchmarkDependencyID = "internal/graph/graph.go::keyOf"
+	benchmarkCallerID     = "internal/graph/graph.go::fnv1aEdge"
+	benchmarkCallChainID  = "cmd/gortex/mcp.go::runMCP"
 )
 
 // buildTestEngine indexes the Gortex repo once and shares the read-only engine
@@ -66,7 +67,7 @@ func BenchmarkGetDependents(b *testing.B) {
 	eng := buildTestEngine(b)
 	b.ResetTimer()
 	for b.Loop() {
-		eng.GetDependents(benchmarkGraphID, QueryOptions{Depth: 3, Limit: 50})
+		eng.GetDependents(benchmarkDependencyID, QueryOptions{Depth: 3, Limit: 50})
 	}
 }
 
@@ -74,7 +75,7 @@ func BenchmarkGetCallers(b *testing.B) {
 	eng := buildTestEngine(b)
 	b.ResetTimer()
 	for b.Loop() {
-		eng.GetCallers(benchmarkAddNodeID, QueryOptions{Depth: 2, Limit: 50})
+		eng.GetCallers(benchmarkCallerID, QueryOptions{Depth: 2, Limit: 50})
 	}
 }
 
@@ -82,7 +83,7 @@ func BenchmarkGetCallChain(b *testing.B) {
 	eng := buildTestEngine(b)
 	b.ResetTimer()
 	for b.Loop() {
-		eng.GetCallChain(benchmarkServeID, QueryOptions{Depth: 4, Limit: 50})
+		eng.GetCallChain(benchmarkCallChainID, QueryOptions{Depth: 4, Limit: 50})
 	}
 }
 
@@ -90,7 +91,7 @@ func BenchmarkFindUsages(b *testing.B) {
 	eng := buildTestEngine(b)
 	b.ResetTimer()
 	for b.Loop() {
-		eng.FindUsages(benchmarkGraphID)
+		eng.FindUsages(benchmarkUsageID)
 	}
 }
 
