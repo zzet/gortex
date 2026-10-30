@@ -881,6 +881,40 @@
                                       "path": {
                                         "type": "string"
                                       },
+                                      "publication_route": {
+                                        "type": "string"
+                                      },
+                                      "read_assisted_reconcile": {
+                                        "anyOf": [
+                                          {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "residual_ns": {
+                                                "type": "integer"
+                                              },
+                                              "sum_ns": {
+                                                "type": "integer"
+                                              },
+                                              "wall_ns": {
+                                                "type": "integer"
+                                              },
+                                              "within_five_percent": {
+                                                "type": "boolean"
+                                              }
+                                            },
+                                            "required": [
+                                              "wall_ns",
+                                              "sum_ns",
+                                              "residual_ns",
+                                              "within_five_percent"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
                                       "receipt": {
                                         "type": "string"
                                       },
