@@ -80,11 +80,12 @@ func buildScenarioSpecs() map[string]scenarioSpec {
 	}
 	out["cold-gortex"] = scenarioSpec{wire: "cold", agents: 1, repos: 1}
 	out["warm-restart"] = scenarioSpec{wire: "restart", agents: 1, repos: 1}
+	out["idle-stop"] = scenarioSpec{wire: "idle-stop", repos: 1}
 	for _, name := range []string{"gortex", "corpus-1", "corpus-2", "corpus-3", "corpus-4", "corpus-5"} {
 		out["tools-single-"+name] = scenarioSpec{wire: "sweep", agents: 1, repos: 1}
 		out["tools-six-"+name] = scenarioSpec{wire: "sweep", agents: 1, repos: 6, missing: "frozen sweep loads manifest[0], not six scoped sessions"}
 	}
-	for _, name := range []string{"idle-stop", "idle-stop-20", "cancel", "churn-60", "cold-six", "schema21-upgrade", "cold-start", "large-freelist", "restart-831", "agent-e2e", "lapsed-upgrade"} {
+	for _, name := range []string{"idle-stop-20", "cancel", "churn-60", "cold-six", "schema21-upgrade", "cold-start", "large-freelist", "restart-831", "agent-e2e", "lapsed-upgrade"} {
 		out[name] = scenarioSpec{missing: "frozen load CLI does not identify this lifecycle/fixture as a distinct measured scenario"}
 	}
 	return out

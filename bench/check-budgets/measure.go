@@ -7,6 +7,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"time"
 )
 
 func number(m metric, unit string) (float64, error) {
@@ -20,6 +21,12 @@ func validateScenario(name string, r report) error {
 	spec := scenarioSpecs[name]
 	if spec.missing != "" {
 		return errors.New(spec.missing)
+	}
+	if len(r.Phases) != 1 {
+		return errors.New("scenario requires one actual standalone phase")
+	}
+	if len(r.Phases[0].Gate["pr_smoke_store"]) > 0 && r.Host.Profile != "native" {
+		return errors.New("PR-only retained stores cannot claim a frozen reference/floor run")
 	}
 	var w struct {
 		Scenario     string `json:"scenario"`
@@ -39,6 +46,17 @@ func validateScenario(name string, r report) error {
 		return errors.New("unknown/coupled session identity cannot establish the frozen standalone workload")
 	}
 	switch spec.wire {
+	case "idle-stop":
+		var idle struct {
+			Started  time.Time `json:"started"`
+			Finished time.Time `json:"finished"`
+			Sessions int       `json:"closed_mcp_sessions"`
+			Required int       `json:"required_idle_seconds"`
+			Complete bool      `json:"complete"`
+		}
+		if w.Agents != 0 || w.Editors != 0 || json.Unmarshal(r.Phases[0].Gate["idle_stop"], &idle) != nil || !idle.Complete || idle.Required != 2 || idle.Sessions < 1 || idle.Finished.Sub(idle.Started) < 2*time.Second {
+			return errors.New("idle-stop lacks exact zero-load, closed-session and two-second idle evidence")
+		}
 	case "edit", "many-edit":
 		if w.Agents != 0 || w.Editors != spec.editors {
 			return errors.New("edit scenario requires the exact combined-editor count and zero extra pure readers")

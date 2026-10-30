@@ -76,6 +76,7 @@ type phase struct {
 
 type report struct {
 	Started  time.Time       `json:"started"`
+	Binary   string          `json:"binary"`
 	Version  int             `json:"schema_version"`
 	RunID    string          `json:"run_id"`
 	Revision string          `json:"git_sha"`

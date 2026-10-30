@@ -170,6 +170,20 @@ func validateSmokeJob(receipt laneReceipt, d dataset) error {
 			return fmt.Errorf("%s/%d/%s is not a measured report from this same job", run.input.Scenario, run.input.Repeat, run.input.Role)
 		}
 	}
+	retained := receipt.Plan.Execution == "two_owned_smoke_stores_v1"
+	if receipt.Plan.Execution != "" && !retained {
+		return errors.New("unknown smoke store-execution contract")
+	}
+	for _, run := range d.runs {
+		if len(run.data.Phases[0].Gate["pr_smoke_store"]) > 0 && !retained {
+			return errors.New("retained-store evidence cannot claim an ordinary standalone execution")
+		}
+	}
+	if retained {
+		if err := validateSmokeStores(d); err != nil {
+			return err
+		}
+	}
 	// Host/corpus/workload equality, all planned repeats, p95 medians and safety
 	// counters are still evaluated by check. Artifact timing is never consumed.
 	return nil

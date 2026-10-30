@@ -412,58 +412,67 @@ files before running. Every missing/failed setup retains its receipt and exits
 nonzero. Preparing these artifacts does not establish 15-minute feasibility,
 acceptance samples or a passing workload lane.
 
-## PR scheduling feasibility remains unresolved
+## Fixed-store PR entry and unresolved feasibility
 
-The standalone collector plans five steps × two builds × three repeats: 30 owned
-scenario starts once fixtures exist. At 120-second read and edit windows, those
-two workloads alone consume 24 minutes, before startup, sweep, restart, stop,
-compilation/download or microbenchmarks. Even 60-second windows consume 12
-minutes. The manual 15-repeat/21-operation sweep and three fresh query benchmark
-processes per build add paced calls and cold fixture indexing. This does not
-honestly establish the required 15-minute lane.
+The disabled hosted ARM job invokes `smoke` after preparing the exact-main
+bundle, clean candidate executables and contemporary fixture. It reuses the
+normal checker and microbenchmark runner; unavailable observations still fail.
+The fixed `bench/load smoke` entry owns exactly two fresh stores, one per build,
+and runs three rotated main/candidate sequences of read16, edit/read4, sweep1,
+warm restart and idle stop. It has no resume/borrowed-path CLI. Only this entry
+owns final state deletion; each phase retains its real stop/join receipt.
 
-The first experiment should be an explicitly named **PR-only 20- or 30-second
-profile**, leaving nightly/release settings frozen. The issue does not mandate
-60/120-second PR windows. All five steps, 21 sweep operations, exact readback,
-absolute/deterministic thresholds, same-job repeats and counters remain required.
-A one-repeat sweep is already explicit in the load CLI and still executes every
-operation. No shorter profile reuses timing evidence from a different workload.
+There are 36 explicit process starts: two empty-store initializations and 34
+retained-store starts, including the six restart steps. Stores never cross
+build ownership. Edits are reset only inside owned clones while their daemon is
+joined. Exact pinned file bytes and clean Git state are verified; ready/enriched
+and public marker-removal fences precede later measurements. Every report
+retains its store/start identity, current foreground logs and execution interval;
+the checker refuses changed/shared stores, missing restoration or role rotation,
+missing steps, failures and altered paths. Default run/all, nightly/release
+profiles and legacy request hashes are unchanged.
 
-An optimistic calculation makes the tradeoff reviewable, not accepted. Mean
-agent think is 3.5 seconds and mean burst is four calls. Assuming 0.4-second
-read-burst wall time, load16 offers about 492 calls in 30 seconds or 328 in 20.
-Assuming another 0.35 seconds for an edit acknowledgement **and indexed visibility**,
-edit4 yields about 28 edits/113 reads or 19 edits/75 reads. That visibility
-assumption is not the exact-file-readback target and is unmeasured; slower
-publication reduces these counts. A roughly ten-operation read mix means only
-about 11/7 source calls per edit report, making nearest-rank p99 effectively a
-maximum. Retain actual per-tool counts and measure adequacy/flake; the estimate
-cannot stand in for them. Sweep1 requires five to seven 3–5-call bursts, hence
-10–35 seconds of think time before call latency.
+The explicit PR experiment uses 20-second read/edit windows, with 30 seconds an
+alternative. Read offers drain under their original 120-second product deadline.
+Edit/probe drain and four-editor exact readback still require integration with
+the dedicated edit/readback instrumentation; legacy indexed-symbol visibility
+is not substituted for correctness. The distinct idle step warms the configured
+root, closes MCP sessions, observes two idle seconds and retains actual normal
+stop evidence. It does not establish the separate 60-second idle memory/write
+contracts.
 
-For 30-second read/edit windows, an assumed 25-second sweep, 1.5-second restart
-and 3-second idle stop yield 537 seconds across six build/repeats. Thirty
-existing two-second settle periods add 60 seconds, leaving 303 of the 900-second
-budget for thirty cold starts, download/build, microbenchmarks, drain and logs.
-Twenty-second windows leave 423 seconds instead. Actual cold-index/publication
-cost and microbenchmark setup decide feasibility. If these do not fit, evaluate
-warm reuse/restoration then; do not first require a new restoration framework.
+Setup is a measured constraint. Thirty independently initialized phases would
+spend about 94 minutes at an observed 188-second daemon initialization, and even
+six initializations would consume 18.8 minutes before offered work. Two stores
+reduce requested cold initialization to about 376 seconds at that observation.
+At 20-second read/edit offers, those windows add 240 seconds across both builds
+and three repeats. A 25-second sweep estimate adds 150 seconds, leaving only
+134 of 900 seconds for warm starts/stops, idle intervals, drain, preparation and
+microbenchmarks. This is an estimate, not a feasible-profile result.
 
-Before changing the active owner's runtime, coordinate these exact touchpoints:
-`run.go`/`plan.go` for an explicit PR offered-window/drain profile and matching
-workload identity; `scenario.go` to stop offering calls while draining admitted
-calls to product deadlines (the current phase-end context instead censors them);
-exact readback/publication and idle-stop fixture observations; and sweep1
-configuration with complete inventory. Any drain/timeout is retained and counts
-in wall time. A reviewed profile must pass real sample/probe sufficiency and
-20-run/seeded trials. Stores, if later reused, must remain private, validated for
-their own binary/schema and restored to identical source topology; candidate
-cannot blindly reuse main state. No `bench/load` runtime/client is edited here.
+The actual contemporary query fixture check timed out after 120 seconds during
+resolver reachability setup, before it could prove any corrected benchmark
+result. A prior historical fixture attempt failed on an isolated type target;
+its successful executable/tool preparation earns no query acceptance. Query
+process order remains rotated; the runner does not silently batch samples or
+change fixture scope. Existing snapshot/cache options or a separately reviewed
+fixed core fixture must resolve this observed bottleneck before rollout.
 
-Keep performance outside `ci.yml` and on its specified ARM lane. Extra artifact
-production can still contend for hosted account concurrency, so rollout also
-requires the real 20-PR wall comparison. No runner or job is enabled by this
-source plan.
+Actual tool counts remain authoritative. With mean 3.5-second think time and
+four-call bursts, optimistic 20-second estimates are about 328 load16 calls and
+19 edits/75 reads for edit4; publication speed is unmeasured. Per-tool counts
+will be much smaller, and p99 can effectively be a maximum. Neither sample
+adequacy nor the full-job p95 <=15 minutes is established. The entry cancels
+measurement at 13 minutes, reserves cleanup time and fails after 15 minutes;
+the workflow's 18-minute outer bound permits cleanup/upload after failure. It
+cannot certify full-job timing, which includes build/download/preparation and
+requires twenty actual runs.
+
+The measurement job is visibly skipped until `PERF_PR_SMOKE_ENABLED` is reviewed
+and enabled. Main publication separately requires its new harness contract on
+main and producer enablement; no pre-merge main artifact bypass exists. Hosted
+jobs can still contend for account concurrency, so the twenty-PR CI wall-time
+comparison remains required. No runner or infrastructure is provisioned.
 
 ## Remaining lane and acceptance work
 
@@ -476,17 +485,12 @@ model calls. A PR smoke lane must remain separate from CI test jobs and run on
 `ubuntu-24.04-arm`; protected-main nightlies require available owned hosts.
 Reports/table artifacts need effective retention of at least 90 days.
 
-The implemented plan declares all five smoke steps but refuses the unavailable
-idle-stop fixture and exact observations. Exact-main retrieval, same-job admission and the Go microbenchmark/benchstat
-runner are implemented source. The measured phased PR driver, first trusted main production artifact and
-feasible duration/probe profile remain to implement and
-validate before enabling measurements.
-The frozen default
-60-second duration is not a measured feasibility guarantee; the retained native
-read1 cohort used 120-second windows. Those 120-second read/edit windows repeated
-three times already consume substantial time; do not assume the full lane fits
-15 minutes. Any shorter smoke profile
-needs matching baselines and enough observations, not reused 120-second data.
+The five-step driver and strict full-bundle setup are implemented source;
+positive contemporary query setup, four-editor exact probes, missing safety/
+restart/reclaim observations and a measured end-to-end attempt remain required.
+No measurement lane is enabled or accepted. Short PR reports need matching
+same-job baselines and sufficient actual observations; retained 120-second
+baseline data cannot be relabeled as a 20-second smoke profile.
 Nightly/release plans must preserve failed/censored runs, consecutive-night row
 history, floor-host scope restrictions and every daemon's stop/lock receipts.
 The floor class and extra lifecycle adapters require explicit reviewed support;
@@ -496,6 +500,6 @@ Actual acceptance is still required: 20 real smoke runs for wall-time/flake
 rates, linked seeded latency/edit-wait regressions, five actual nights on main,
 a seeded nightly failure, a measured release subset under eight hours per host,
 no forced daemons, and 20-PR CI wall-time comparison. None is simulated by unit
-tests. #996 must land before #997; #998 is merged. #1000's deferred 400-task
+tests. #996 and #998 implementations are merged; baseline acceptance remains separate. #1000's deferred 400-task
 harness is not recreated here. A small release scripted-agent fixture remains
 separate future work, requiring its own reviewed plan.

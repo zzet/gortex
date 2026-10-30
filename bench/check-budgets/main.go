@@ -29,6 +29,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return verifySmokeCommand(args[1:], stdout, stderr)
 		case "microbench":
 			return microbenchCommand(args[1:], stdout, stderr)
+		case "smoke":
+			return smokeDriverCommand(args[1:], stdout, stderr)
 		case "prepare-fixture", "prepare-benchstat", "prepare-tests":
 			return setupMicroCommand(args[0], args[1:], stdout, stderr)
 		}

@@ -70,6 +70,7 @@ type laneTask struct {
 
 type lanePlan struct {
 	Lane          string     `json:"lane"`
+	Execution     string     `json:"execution,omitempty"`
 	HostClass     string     `json:"host_class"`
 	Tasks         []laneTask `json:"tasks"`
 	Prerequisites []string   `json:"unavailable_prerequisites"`
@@ -522,6 +523,10 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 		tr.Finished = time.Now().UTC()
 		receipt.Tasks = append(receipt.Tasks, tr)
 	}
+	return finishLaneEvidence(c, p, plan, out, stdout, receipt, index, failures)
+}
+
+func finishLaneEvidence(c laneConfig, p policy, plan lanePlan, out string, stdout io.Writer, receipt laneReceipt, index inputs, failures []error) error {
 	if err := writeNewJSON(filepath.Join(out, "inputs.json"), index); err != nil {
 		failures = append(failures, err)
 	}
