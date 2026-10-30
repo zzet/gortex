@@ -727,6 +727,33 @@ func generationReadProbes() []genProbe {
 			return nodeTokens(got.Nodes)
 		}},
 
+		{name: "ReadKindAdjacency", run: func(t *testing.T, s *Store) []string {
+			var out []string
+			for _, dir := range []graph.Direction{graph.DirectionForward, graph.DirectionBackward} {
+				for _, id := range genReadProbeIDs() {
+					rows, err := s.ReadKindAdjacency(t.Context(), id, dir, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences, graph.EdgeImports})
+					if err != nil {
+						t.Fatal(err)
+					}
+					out = append(out, edgeTokens(rows.Edges)...)
+				}
+			}
+			return out
+		}},
+		{name: "ReadKindAdjacencyFiltered", run: func(t *testing.T, s *Store) []string {
+			var out []string
+			for _, dir := range []graph.Direction{graph.DirectionForward, graph.DirectionBackward} {
+				for _, id := range genReadProbeIDs() {
+					rows, err := s.ReadKindAdjacencyFiltered(t.Context(), id, dir, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences, graph.EdgeImports}, graph.OutlineEdgeFilter{ExcludeVia: "spring.Bean"})
+					if err != nil {
+						t.Fatal(err)
+					}
+					out = append(out, edgeTokens(rows.Edges)...)
+				}
+			}
+			return out
+		}},
+
 		{name: "GetOutEdges", run: func(t *testing.T, s *Store) []string {
 			return edgeTokens(s.GetOutEdges(genReadShared))
 		}},
@@ -2092,6 +2119,8 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.ScopedAnalysisCommunityReader)(nil), probe: "ScopedAnalysisCommunitySummaries"},
 		{iface: (*graph.AtomicVectorCorpusInstaller)(nil), skip: skipSidecar},
 		{iface: (*graph.BFSCapable)(nil), probe: "BFS"},
+		{iface: (*graph.KindAdjacencyReader)(nil), probe: "ReadKindAdjacency"},
+		{iface: (*graph.FilteredKindAdjacencyReader)(nil), probe: "ReadKindAdjacencyFiltered"},
 		{iface: (*graph.BlameEnrichmentReader)(nil), skip: skipSidecar},
 		{iface: (*graph.BlameEnrichmentWriter)(nil), skip: skipSidecar},
 		{iface: (*graph.BoundedEdgeExistenceReader)(nil), probe: "FindExistingEdgeEndpoints"},
