@@ -32,11 +32,15 @@ type editProbeBatchReferences struct {
 // makes its durable after-image provable without reading later server state.
 func editProbeBatchRequest(c Corpus, before, marker, transactionID string) (request, string) {
 	_, after := editProbeWriteRequest(c, before, marker)
+	return editProbeBatchContentRequest(c, before, after, transactionID), after
+}
+
+func editProbeBatchContentRequest(c Corpus, before, after, transactionID string) request {
 	return request{Tool: "edit", Operation: "batch", Arguments: map[string]any{
 		"operation": "batch",
 		"changes":   []any{map[string]any{"op": "edit_file", "path": c.File, "old_string": before, "new_string": after}},
 		"options":   map[string]any{"transaction_id": transactionID},
-	}}, after
+	}}
 }
 
 // Only the pointed one-file edit_file shape is supported here. Missing timing

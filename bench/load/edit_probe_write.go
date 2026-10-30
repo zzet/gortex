@@ -17,28 +17,16 @@ func editProbeTool(c Corpus) (string, error) {
 	}
 	switch tool {
 	case "edit.file":
-		if c.EditInitialContent != "" {
-			return "", errors.New("edit_initial_content requires explicit edit.write, edit.batch or edit.symbol")
+		if c.EditKind == "rename" || c.EditKind == "delete" {
+			if err := editProbeInitialFixture(c); err != nil {
+				return "", err
+			}
+		} else if c.EditInitialContent != "" {
+			return "", errors.New("edit_initial_content requires explicit edit.write, edit.batch, edit.symbol or rename/delete fixture")
 		}
 	case "edit.write", "edit.batch", "edit.symbol":
-		if c.EditInitialContent == "" || !utf8.ValidString(c.EditInitialContent) || c.EditAnchor == "" || strings.Count(c.EditInitialContent, c.EditAnchor) != 1 {
-			return "", errors.New("explicit edit.write, edit.batch and edit.symbol require UTF-8 initial content with one stable anchor")
-		}
-		switch filepath.Ext(c.File) {
-		case ".go":
-			if _, err := parser.ParseFile(token.NewFileSet(), "fixture.go", c.EditInitialContent, 0); err != nil {
-				return "", errors.New("edit.write initial Go content must parse")
-			}
-		case ".ts":
-			if valid, _ := editProbeTypeScriptFixture(c.EditInitialContent, "", ""); !valid {
-				return "", errors.New("edit.write initial TypeScript content must match the explicit fixture")
-			}
-		case ".py":
-			if valid, _ := editProbePythonFixture(c.EditInitialContent, "", ""); !valid {
-				return "", errors.New("edit.write initial python content must match the explicit fixture")
-			}
-		default:
-			return "", errors.New("unsupported edit.write fixture language")
+		if err := editProbeInitialFixture(c); err != nil {
+			return "", err
 		}
 	default:
 		return "", errors.New("edit-and-probe supports edit.file, explicit edit.write, edit.symbol or one-file edit.batch")
@@ -49,6 +37,29 @@ func editProbeTool(c Corpus) (string, error) {
 		}
 	}
 	return tool, nil
+}
+
+func editProbeInitialFixture(c Corpus) error {
+	if c.EditInitialContent == "" || !utf8.ValidString(c.EditInitialContent) || c.EditAnchor == "" || strings.Count(c.EditInitialContent, c.EditAnchor) != 1 {
+		return errors.New("explicit edit fixture requires UTF-8 initial content with one stable anchor")
+	}
+	switch filepath.Ext(c.File) {
+	case ".go":
+		if _, err := parser.ParseFile(token.NewFileSet(), "fixture.go", c.EditInitialContent, 0); err != nil {
+			return errors.New("initial Go content must parse")
+		}
+	case ".ts":
+		if valid, _ := editProbeTypeScriptFixture(c.EditInitialContent, "", ""); !valid {
+			return errors.New("initial TypeScript content must match explicit fixture")
+		}
+	case ".py":
+		if valid, _ := editProbePythonFixture(c.EditInitialContent, "", ""); !valid {
+			return errors.New("initial Python content must match explicit fixture")
+		}
+	default:
+		return errors.New("unsupported edit fixture language")
+	}
+	return nil
 }
 
 // Content is immutable offered client intent. Each request contains the original
@@ -63,7 +74,7 @@ func editProbeWriteRequest(c Corpus, content, marker string) (request, string) {
 // Check the immutable plan against the actual pinned clone before opening any
 // per-edit probe sessions or dispatching edits. This does not refresh intent.
 func editProbeWriteAdmission(c Corpus, original []byte) error {
-	if (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol") && !bytes.Equal(original, []byte(c.EditInitialContent)) {
+	if (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol" || c.EditKind == "rename" || c.EditKind == "delete") && !bytes.Equal(original, []byte(c.EditInitialContent)) {
 		return errors.New("initial content differs from the pinned edit fixture bytes")
 	}
 	return nil

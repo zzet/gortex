@@ -69,9 +69,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if kind != "add_intrafile_call" && kind != "append_leaf" && kind != "rename" && kind != "delete" {
 		return editProbePlan{}, errors.New("unsupported edit kind")
 	}
-	if (kind == "rename" || kind == "delete") && tool != "edit.symbol" {
-		return editProbePlan{}, errors.New("rename/delete fixtures currently require explicit edit.symbol")
-	}
+
 	language := "go"
 	if filepath.Ext(c.File) == ".ts" {
 		language = "typescript"
@@ -149,7 +147,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		if tool == "edit.symbol" {
 			r = editProbeSymbolRequest(c, marker)
 		}
-		if tool == "edit.write" || tool == "edit.batch" {
+		if (tool == "edit.write" || tool == "edit.batch") && kind != "rename" && kind != "delete" {
 			if strings.Contains(c.EditInitialContent, marker) {
 				return editProbePlan{}, errors.New("planned marker already exists in write fixture")
 			}
@@ -171,7 +169,20 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 				replacement = ""
 			}
 			beforeSymbol = c.File + "::" + oldName
-			r = request{Tool: "edit", Operation: "symbol", Arguments: map[string]any{"operation": "symbol", "target": map[string]any{"symbol": beforeSymbol}, "match": before, "replacement": replacement}}
+			switch tool {
+			case "edit.file":
+				r = request{Tool: "edit", Operation: "file", Arguments: map[string]any{"operation": "file", "target": map[string]any{"file": c.File}, "match": before, "replacement": replacement}}
+			case "edit.symbol":
+				r = request{Tool: "edit", Operation: "symbol", Arguments: map[string]any{"operation": "symbol", "target": map[string]any{"symbol": beforeSymbol}, "match": before, "replacement": replacement}}
+			case "edit.write", "edit.batch":
+				next := strings.Replace(writeContent, before, replacement, 1)
+				if tool == "edit.write" {
+					r = request{Tool: "edit", Operation: "write", Arguments: map[string]any{"operation": "write", "target": map[string]any{"file": c.File}, "content": next}}
+				} else {
+					r = editProbeBatchContentRequest(c, writeContent, next, fmt.Sprintf("load-batch-%016x-%03d", uint64(seed), i))
+				}
+				writeContent = next
+			}
 		}
 		if tool != "edit.batch" {
 			r.Arguments["options"] = map[string]any{"mutation_id": id}

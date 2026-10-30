@@ -81,3 +81,47 @@ func TestEditProbeRenameRejectsMissingAndAlreadyRenamedFixtures(t *testing.T) {
 		})
 	}
 }
+
+func TestEditProbeRenameDeleteUseActualFileWriteSymbolBatchSemantics(t *testing.T) {
+	for _, language := range []string{"go", "typescript", "python"} {
+		for _, kind := range []string{"rename", "delete"} {
+			for _, tool := range []string{"edit.file", "edit.write", "edit.symbol", "edit.batch"} {
+				t.Run(language+"/"+kind+"/"+tool, func(t *testing.T) {
+					c := editProbeRenameCorpus(t, language, 100)
+					c.EditKind = kind
+					c.EditTool = tool
+					plan, err := makeEditProbePlan(c, 42, 100)
+					if err != nil {
+						t.Fatal(err)
+					}
+					offered := c.EditInitialContent
+					for _, step := range plan.Steps {
+						before := strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", step.Marker+"Before"))
+						replacement := strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", step.Marker))
+						if kind == "delete" {
+							replacement = ""
+						}
+						next := strings.Replace(offered, before, replacement, 1)
+						switch tool {
+						case "edit.file", "edit.symbol":
+							if step.Request.Arguments["match"] != before || step.Request.Arguments["replacement"] != replacement {
+								t.Fatal("splice semantics changed")
+							}
+						case "edit.write":
+							if step.Request.Arguments["content"] != next {
+								t.Fatal("whole-file offered prefix was regenerated/lost")
+							}
+						case "edit.batch":
+							changes := step.Request.Arguments["changes"].([]any)
+							change := changes[0].(map[string]any)
+							if len(changes) != 1 || change["op"] != "edit_file" || change["path"] != c.File || change["old_string"] != offered || change["new_string"] != next {
+								t.Fatal("batch did not retain exact whole-file offered before/after")
+							}
+						}
+						offered = next
+					}
+				})
+			}
+		}
+	}
+}
