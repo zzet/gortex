@@ -111,6 +111,12 @@ func (p *PublicationPhaseRecord) CoalescedPublicationEvidence() (*CoalescedPubli
 	if unavailable != nil && unavailable.RequestedGeneration != requested {
 		unavailable = nil
 	}
+	if unavailable != nil {
+		// The recorder membership above proves this is the same retained owner
+		// after a legitimate final-key binding. Project only the copied diagnostic;
+		// neither its frozen timing evidence nor earlier caller snapshots change.
+		unavailable.PublicationKey = key
+	}
 	if winner == nil {
 		return nil, unavailable
 	}

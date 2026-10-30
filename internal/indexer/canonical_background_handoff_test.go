@@ -141,3 +141,35 @@ func TestRequestedBackgroundRefusalIsImmutableAndCannotResurrectEvictedOwner(t *
 	runtime.KeepAlive(w)
 	runtime.KeepAlive(recorder)
 }
+
+func TestRequestedBackgroundRefusalFollowsSameRetainedFinalKeyWithoutMutatingSnapshots(t *testing.T) {
+	recorder := NewPublicationPhaseRecorder(1, 1)
+	watcher := &Watcher{}
+	origin := time.Now()
+	record := recorder.Begin("", "batch-file-original", PublicationSourceMCPEdit, origin)
+	require.True(t, record.bindCanonicalTicket(7, origin))
+	background := newCanonicalBackground(record, watcher, "fixture.go", 7, origin)
+	background.invalidate("preexisting_timer_stop_not_successful")
+	background.publishUnavailable()
+	_, early := record.CoalescedPublicationEvidence()
+	require.NotNil(t, early)
+	require.Equal(t, "batch-file-original", early.PublicationKey)
+	require.True(t, recorder.Rekey("batch-file-original", "mutation-original"))
+	_, later := record.CoalescedPublicationEvidence()
+	require.NotNil(t, later)
+	require.Equal(t, "mutation-original", later.PublicationKey)
+	require.Equal(t, "batch-file-original", early.PublicationKey, "earlier snapshot is immutable")
+	later.PublicationKey = "foreign"
+	_, again := record.CoalescedPublicationEvidence()
+	require.Equal(t, "mutation-original", again.PublicationKey)
+	recorder.Begin("", "evict", PublicationSourceMCPEdit, origin)
+	_, expired := record.CoalescedPublicationEvidence()
+	require.Nil(t, expired)
+	replacement := recorder.Begin("", "mutation-original", PublicationSourceMCPEdit, origin)
+	require.True(t, replacement.bindCanonicalTicket(8, origin))
+	background.publishUnavailable()
+	_, foreign := replacement.CoalescedPublicationEvidence()
+	require.Nil(t, foreign, "old owner cannot donate its refusal to replacement")
+	runtime.KeepAlive(watcher)
+	runtime.KeepAlive(recorder)
+}

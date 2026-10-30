@@ -39,13 +39,17 @@ func TestEditProbeAcceptsOnlyExplicitMeasuredNativeHandoffCoverage(t *testing.T)
 }
 
 func TestEditProbeOwnedBackgroundRefusalIsTerminalFailedCoverageNotMissingAsZero(t *testing.T) {
-	for _, name := range []string{"observed", "missing", "unknown_reason", "foreign_publication", "foreign_requested", "foreign_last", "missing_count", "wrong_source", "contradictory_B"} {
+	for _, name := range []string{"observed", "preexisting_stop_failed", "missing", "unknown_reason", "foreign_publication", "foreign_requested", "foreign_last", "missing_count", "wrong_source", "contradictory_B"} {
 		t.Run(name, func(t *testing.T) {
 			body := editProbeRepairAccountingFixture()
 			delete(body, "requested_background")
 			diagnostic := map[string]any{"scope": "requested_background_observation", "reason": "timer_callback_already_started", "publication_key": "original", "requested_generation": json.Number("1"), "last_observed_generation": json.Number("2"), "observed_native_handoffs": json.Number("1")}
 			body["requested_background_unavailable"] = diagnostic
 			switch name {
+			case "preexisting_stop_failed":
+				diagnostic["reason"] = "preexisting_timer_stop_not_successful"
+				diagnostic["last_observed_generation"] = json.Number("1")
+				diagnostic["observed_native_handoffs"] = json.Number("0")
 			case "missing":
 				delete(body, "requested_background_unavailable")
 			case "unknown_reason":
@@ -67,10 +71,10 @@ func TestEditProbeOwnedBackgroundRefusalIsTerminalFailedCoverageNotMissingAsZero
 			if got.State == "observed_single_window_checks_pass" || got.B != nil {
 				t.Fatalf("unavailable B became coverage: %+v", got)
 			}
-			if (got.State == "terminal_unavailable_background") != (name == "observed") {
+			if (got.State == "terminal_unavailable_background") != (name == "observed" || name == "preexisting_stop_failed") {
 				t.Fatalf("refusal%s: %+v", name, got)
 			}
-			if editProbeFinished(true, true, true, got) != (name == "observed") {
+			if editProbeFinished(true, true, true, got) != (name == "observed" || name == "preexisting_stop_failed") {
 				t.Fatalf("unowned/missing refusal stopped collection: %+v", got)
 			}
 			if editProbeFinished(false, true, true, got) || editProbeFinished(true, false, true, got) {
