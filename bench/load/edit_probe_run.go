@@ -37,6 +37,9 @@ type editProbeRecord struct {
 	Outcome                  string                    `json:"outcome"`
 	Receipt                  string                    `json:"mutation_receipt"`
 	Batch                    *editProbeBatchReferences `json:"batch,omitempty"`
+	Move                     *editProbeMoveReferences `json:"move,omitempty"`
+	MoveAccounting           *editProbeMoveAccounting `json:"move_accounting,omitempty"`
+	GraphTerminalBasis       string `json:"graph_terminal_basis,omitempty"`
 	Ack                      Metric                    `json:"t_ack_ms"`
 	Readbacks                []editProbeReadback       `json:"readbacks"`
 	FirstCorrect             map[string]Metric         `json:"first_correct_ms"`
@@ -97,6 +100,7 @@ type editProbeRuntime struct {
 	editor            *socketClient
 	states            []*editProbeState
 	original          []byte
+	moveOriginal      []byte
 	origin            time.Time
 	mu                sync.Mutex // Phase.Attempts only; request lifetimes are never serialized
 	requireAccounting bool
@@ -120,7 +124,7 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if plan.Language == "python" {
 		language = "Python"
 	}
-	out := &editProbeReport{Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/add_intrafile_call/%s/JSON cell only", language, plan.Tool), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
+	out := &editProbeReport{Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/%s/%s/JSON cell only", language, plan.Kind, plan.Tool), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
 	for _, step := range plan.Steps {
 		out.Records = append(out.Records, newEditProbeRecord(c, step))
 	}
@@ -160,6 +164,11 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 		}
 	}
 	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editor: editor, original: original, requireAccounting: !o.editProbeBaseline}
+	if plan.Tool == "refactor.move" {
+		r.moveOriginal, err = os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(p.Repos[0].Corpus.EditDestination)))
+		if err != nil { return r, nil, err }
+		if string(r.moveOriginal) != p.Repos[0].Corpus.EditDestinationContent { return r, nil, errors.New("move destination bytes differ from offered fixture") }
+	}
 	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, r.requireAccounting)
 	if p.Repos[0].Corpus.EditKind == "add_crossfile_call" {
 		if err := r.admitCrossFileCallee(ctx); err != nil {
@@ -524,6 +533,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		return
 	}
 	receipt, _ := body["mutation_receipt"].(string)
+	var move *editProbeMoveReferences
 	var batch *editProbeBatchReferences
 	var batchOffered []byte
 	if r.plan.Tool == "edit.batch" {
@@ -544,6 +554,14 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			return
 		}
 	}
+	if step.Relocated {
+		refs, moveErr := decodeEditProbeMoveAcknowledgement(body, r.p.Repos[0].Prefix+"/"+step.BeforeSymbol, r.p.Repos[0].Prefix+"/"+step.TargetSymbol, r.movePaths())
+		if moveErr != nil {
+			s.mu.Lock(); s.record.Outcome = "invalid_ack"; s.record.Errors = append(s.record.Errors, moveErr.Error()); s.mu.Unlock()
+			return
+		}
+		move = &refs
+	}
 	s.mu.Lock()
 	s.record.Receipt = receipt
 	if batch != nil {
@@ -554,7 +572,12 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.record.Receipt = ""
 		s.record.MutationID = ""
 	}
-	if receipt == "" && batch == nil {
+	if move != nil {
+		s.record.Move = move
+		s.record.Receipt, s.record.MutationID = "", ""
+		s.record.Accounting = editProbeAccounting{State: "not_applicable_direct_move"}
+	}
+	if receipt == "" && batch == nil && move == nil {
 		s.record.Errors = append(s.record.Errors, "ACK mutation receipt unavailable")
 	} else if !identity.Finished.IsZero() {
 		s.record.Ack = measured(float64(identity.Finished.Sub(started))/float64(time.Millisecond), "ms")
@@ -566,8 +589,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
 		readbackKinds = append(readbackKinds, "old_source_absent")
 	}
+	if step.Relocated { readbackKinds = append(readbackKinds, "old_source_absent", "source_file_after_move") }
 	for index, kind := range readbackKinds {
 		target := map[string]any{"file": r.plan.File}
+		if kind == "file" && step.Relocated { target["file"] = step.DestinationFile }
 		if kind == "source" {
 			target = map[string]any{"symbol": r.plan.File + "::" + step.Marker}
 			if step.TargetSymbol != "" {
@@ -583,6 +608,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			req.ExpectedAbsentSymbol = step.BeforeSymbol
 			req.Arguments = map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}
 		}
+		if kind == "source_file_after_move" { req.Operation = "file"; req.Arguments["operation"] = "file" }
 		begin := time.Now()
 		raw, identity, readErr := r.perform(callCtx, s, r.editor, req, "readback:"+kind, "readback", 100+index)
 		payload, decodeErr := decodeEditProbeResult(raw)
@@ -610,7 +636,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		}
 		s.mu.Unlock()
 	}
-	if batch != nil {
+	if move != nil {
+		r.collectMoveEvidence(callCtx, s, *move, identity.ID)
+	} else if batch != nil {
 		r.collectBatchEvidence(callCtx, s, *batch, batchOffered)
 	} else {
 		options := map[string]any{"mutation_id": step.MutationID}
@@ -668,10 +696,13 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			s.record.Errors = append(s.record.Errors, "first-correct oracle unavailable: "+name)
 		}
 	}
-	if !s.record.GraphTerminal {
+	if !s.record.GraphTerminal && !(move != nil && !r.requireAccounting && movePublicFactsComplete(s.record)) {
 		s.record.Errors = append(s.record.Errors, "graph receipt terminal unavailable")
 	}
-	if r.requireAccounting && s.record.Accounting.State != "observed_single_window_checks_pass" {
+	if r.requireAccounting && move != nil && (s.record.MoveAccounting == nil || s.record.MoveAccounting.State != "observed_move_windows_checks_pass") {
+		s.record.Errors = append(s.record.Errors, "move shared A/per-file write/direct accounting unavailable")
+	}
+	if r.requireAccounting && move == nil && s.record.Accounting.State != "observed_single_window_checks_pass" {
 		s.record.Errors = append(s.record.Errors, "A/P/B accounting unavailable: "+strings.Join(s.record.Accounting.Reasons, "; "))
 	}
 	if s.record.StaleClaimedFresh {
@@ -798,7 +829,7 @@ func (r *editProbeRuntime) close() error {
 func (r *editProbeRuntime) restore(ctx context.Context) error {
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
 	for _, record := range r.phase.EditProbe.Records {
-		if (record.Receipt == "" && record.Batch == nil) || !record.GraphTerminal {
+		if (record.Receipt == "" && record.Batch == nil && record.Move == nil) || (!record.GraphTerminal && !(record.Move != nil && !r.requireAccounting && movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}
 	}
@@ -806,7 +837,14 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	req := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "changes": []any{map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + r.plan.File, "old_string": string(current), "new_string": string(r.original)}}, "options": map[string]any{"transaction_id": fmt.Sprintf("load-restore-%016x", uint64(r.options.Seed))}}}
+	changes := []any{map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + r.plan.File, "old_string": string(current), "new_string": string(r.original)}}
+	if r.plan.Tool == "refactor.move" {
+		destination := r.p.Repos[0].Corpus.EditDestination
+		currentDestination, readErr := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(destination)))
+		if readErr != nil { return readErr }
+		changes = append(changes, map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix+"/"+destination, "old_string": string(currentDestination), "new_string": string(r.moveOriginal)})
+	}
+	req := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "changes": changes, "options": map[string]any{"transaction_id": fmt.Sprintf("load-restore-%016x", uint64(r.options.Seed))}}}
 	start := time.Now()
 	data, _, err := callEditProbeTool(ctx, r.editor, req, req.Arguments, "cleanup", 0, len(r.states), 0, r.options.Deadline, editProbeRetrySleep(r.options.Seed, len(r.states), 0))
 	r.phase.EditProbe.RestoreMS = measured(float64(time.Since(start))/float64(time.Millisecond), "ms")
@@ -820,6 +858,11 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	}
 	if string(restored) != string(r.original) {
 		return errors.New("timed public restore batch did not restore original bytes")
+	}
+	if r.plan.Tool == "refactor.move" {
+		destination, readErr := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.p.Repos[0].Corpus.EditDestination)))
+		if readErr != nil { return readErr }
+		if string(destination) != string(r.moveOriginal) { return errors.New("timed public restore batch did not restore destination bytes") }
 	}
 	return nil
 }
