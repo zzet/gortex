@@ -118,7 +118,7 @@ func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pending
 	ledger := &s.mutationCommits
 	ledger.mu.Lock()
 	var witness mutationReadRepairWitness
-	batch:=false
+	batch := false
 	for i := len(ledger.ordered) - 1; i >= 0; i-- {
 		record := ledger.ordered[i]
 		if !record.isPublicationOwner() {
@@ -133,10 +133,15 @@ func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pending
 		// eligible. Never fall back to an older edit of the same path.
 		committed := record.disk == mutationDiskCommitted && record.commitSeq != 0 && record.newSHA != ""
 		writing := pendingOnly && record.disk == mutationDiskInFlight
-		// Batch authority is its final durable verdict, not an individual
-		// successful write. Do not retrospectively attach an executor that
-		// finished before the actual batch publication/ticket was bound.
+		// Capture may precede final batch durability and ticket admission, but
+		// only after the real forward writer has returned these known bytes.
+		// This is a weak candidate, never a committed source claim. Completion
+		// still requires this exact record's successful transaction verdict,
+		// actual accepted bytes and original publication/admission identity.
 		batchReady := record.kind != batchFileObservationCommit || (committed && record.publication != nil && record.readRepairAdmission.Value() != nil)
+		if pendingOnly && record.kind == batchFileObservationCommit && !record.committedAt.IsZero() && record.newSHA != "" && (committed || writing) {
+			batchReady = true
+		}
 		if batchReady && ledger.byID[record.id] == record && record.owner == s && (committed || writing) && record.readRepair == nil &&
 			(!pendingOnly || !record.graphRecorded || record.graph == mutationGraphPending) {
 			witness = mutationReadRepairWitness{
@@ -146,7 +151,7 @@ func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pending
 				checkout: record.checkoutID, incarnation: record.checkoutIncarnation,
 				commitSeq: record.commitSeq, committedAt: record.committedAt,
 			}
-			batch=record.kind==batchFileObservationCommit
+			batch = record.kind == batchFileObservationCommit
 			if admission := record.readRepairAdmission.Value(); admission != nil && admission.generation != 0 && admission.path == absPath && !admission.checkoutScoped {
 				witness.admission = weak.Make(admission)
 				witness.receipt, witness.generation = admission.id, admission.generation
@@ -159,7 +164,11 @@ func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pending
 	// Observation-only owners do not participate in physical recordGraph or
 	// pending-source lifecycle updates. Read the actual admission outside ledger
 	// locks rather than treating its old pending seed as an endless eligibility.
-	if pendingOnly && batch {if admission:=witness.admission.Value();admission!=nil && !admission.outcome(true).Pending {return mutationReadRepairWitness{},false}}
+	if pendingOnly && batch {
+		if admission := witness.admission.Value(); admission != nil && !admission.outcome(true).Pending {
+			return mutationReadRepairWitness{}, false
+		}
+	}
 	return witness, witness.id != ""
 }
 
