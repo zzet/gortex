@@ -15,7 +15,7 @@ func TestEditProbeMoveRefusalsDistinguishApplicabilityLanguageAndMissingEvidence
 				_, err := makeEditProbePlan(c, 42, 1)
 				want := "unsupported language"
 				if language == "go" {
-					want = "lacks per-file publication observations"
+					want = "move fixture requires"
 				}
 				if err == nil || !strings.Contains(err.Error(), want) {
 					t.Fatalf("missing explicit refusal: %v", err)

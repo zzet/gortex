@@ -32,6 +32,8 @@ type editProbeStep struct {
 	TargetSymbol    string  `json:"target_symbol,omitempty"`
 	FollowingSymbol string  `json:"following_symbol,omitempty"`
 	ExpectedLineGap int     `json:"expected_line_gap,omitempty"`
+	Relocated       bool    `json:"relocated,omitempty"`
+	DestinationFile string  `json:"destination_file,omitempty"`
 }
 
 type editProbePlan struct {
@@ -69,10 +71,16 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if kind == "" {
 		kind = "add_intrafile_call"
 	}
-	if kind != "add_intrafile_call" && kind != "append_leaf" && kind != "rename" && kind != "delete" && kind != "modify_body" && kind != "modify_caller_body" && kind != "change_signature" && kind != "add_crossfile_call" {
+	if kind != "add_intrafile_call" && kind != "append_leaf" && kind != "rename" && kind != "delete" && kind != "modify_body" && kind != "modify_caller_body" && kind != "change_signature" && kind != "add_crossfile_call" && kind != "relocate" {
 		return editProbePlan{}, errors.New("unsupported edit kind")
 	}
 
+	if kind != "relocate" && (c.EditDestination != "" || c.EditDestinationContent != "") {
+		return editProbePlan{}, errors.New("edit_destination applies only to the explicit move fixture")
+	}
+	if kind == "relocate" && tool != "refactor.move" {
+		return editProbePlan{}, errors.New("relocation requires the explicit Go move adapter")
+	}
 	language := "go"
 	if filepath.Ext(c.File) == ".ts" {
 		language = "typescript"
@@ -239,14 +247,24 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 				writeContent = next
 			}
 		}
-		if tool != "edit.batch" {
+		if kind == "relocate" {
+			beforeName := marker + "Before"
+			before := strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", beforeName))
+			if strings.Count(c.EditInitialContent, before) != 1 || strings.Contains(c.EditDestinationContent, beforeName) {
+				return editProbePlan{}, errors.New("move fixture requires exact original declaration and absent destination identity")
+			}
+			beforeSymbol = c.File + "::" + beforeName
+			targetSymbol = c.EditDestination + "::" + beforeName
+			r = request{Tool: "refactor", Operation: "move", Arguments: map[string]any{"operation": "move", "target": map[string]any{"symbol": beforeSymbol}, "destination": c.EditDestination}}
+		}
+		if tool != "edit.batch" && tool != "refactor.move" {
 			r.Arguments["options"] = map[string]any{"mutation_id": id}
 		}
 		hash, err := hashJSON(r)
 		if err != nil {
 			return editProbePlan{}, err
 		}
-		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete", TargetSymbol: targetSymbol, FollowingSymbol: followingSymbol, ExpectedLineGap: expectedGap})
+		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete", TargetSymbol: targetSymbol, FollowingSymbol: followingSymbol, ExpectedLineGap: expectedGap, Relocated: kind == "relocate", DestinationFile: c.EditDestination})
 	}
 	return p, nil
 }

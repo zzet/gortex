@@ -35,7 +35,10 @@ func editProbeTool(c Corpus) (string, error) {
 		if c.EditKind != "relocate" {
 			return "", errors.New("move_symbol applies to relocation, not append/body/signature/rename/delete fixtures")
 		}
-		return "", errors.New("move measurement unavailable: actual Go relocation lacks per-file publication observations; functional relocation is separate")
+		if err := editProbeMoveFixture(c); err != nil {
+			return "", err
+		}
+		return "refactor.move", nil
 	default:
 		return "", errors.New("edit-and-probe supports edit.file, explicit edit.write, edit.symbol or one-file edit.batch")
 	}
@@ -82,7 +85,7 @@ func editProbeWriteRequest(c Corpus, content, marker string) (request, string) {
 // Check the immutable plan against the actual pinned clone before opening any
 // per-edit probe sessions or dispatching edits. This does not refresh intent.
 func editProbeWriteAdmission(c Corpus, original []byte) error {
-	if (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol" || c.EditKind == "rename" || c.EditKind == "delete" || c.EditKind == "modify_body" || c.EditKind == "modify_caller_body" || c.EditKind == "change_signature" || c.EditKind == "add_crossfile_call") && !bytes.Equal(original, []byte(c.EditInitialContent)) {
+	if (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol" || c.EditKind == "rename" || c.EditKind == "delete" || c.EditKind == "modify_body" || c.EditKind == "modify_caller_body" || c.EditKind == "change_signature" || c.EditKind == "add_crossfile_call" || c.EditKind == "relocate") && !bytes.Equal(original, []byte(c.EditInitialContent)) {
 		return errors.New("initial content differs from the pinned edit fixture bytes")
 	}
 	return nil

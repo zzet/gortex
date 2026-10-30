@@ -388,6 +388,11 @@ func dispatchArgs(r request, repo privateRepo) map[string]any {
 			}
 		}
 	}
+	if r.name() == "refactor.move" {
+		if destination, ok := args["destination"].(string); ok {
+			args["destination"] = repo.Prefix + "/" + destination
+		}
+	}
 	if r.name() == "edit.batch" {
 		if changes, ok := args["changes"].([]any); ok {
 			for _, item := range changes {

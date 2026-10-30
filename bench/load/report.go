@@ -48,20 +48,22 @@ func distribution(values []float64, unit string) Distribution {
 }
 
 type Corpus struct {
-	Label              string `json:"label"`
-	Source             string `json:"source"`
-	Commit             string `json:"commit"`
-	File               string `json:"file"`
-	Symbol             string `json:"symbol"`
-	Query              string `json:"query"`
-	EditTemplate       string `json:"edit_template"`
-	EditAnchor         string `json:"edit_anchor"`
-	EditTool           string `json:"edit_tool,omitempty"`
-	EditKind           string `json:"edit_kind,omitempty"`
-	EditCallee         string `json:"edit_callee,omitempty"`
-	EditBeforeTemplate string `json:"edit_before_template,omitempty"`
-	EditInitialContent string `json:"edit_initial_content,omitempty"`
-	ProposedSignature  string `json:"proposed_signature"`
+	Label                  string `json:"label"`
+	Source                 string `json:"source"`
+	Commit                 string `json:"commit"`
+	File                   string `json:"file"`
+	Symbol                 string `json:"symbol"`
+	Query                  string `json:"query"`
+	EditTemplate           string `json:"edit_template"`
+	EditAnchor             string `json:"edit_anchor"`
+	EditTool               string `json:"edit_tool,omitempty"`
+	EditKind               string `json:"edit_kind,omitempty"`
+	EditCallee             string `json:"edit_callee,omitempty"`
+	EditBeforeTemplate     string `json:"edit_before_template,omitempty"`
+	EditDestination        string `json:"edit_destination,omitempty"`
+	EditDestinationContent string `json:"edit_destination_content,omitempty"`
+	EditInitialContent     string `json:"edit_initial_content,omitempty"`
+	ProposedSignature      string `json:"proposed_signature"`
 }
 
 type Host struct {
