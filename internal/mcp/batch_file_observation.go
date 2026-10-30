@@ -1,0 +1,103 @@
+package mcp
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/zzet/gortex/internal/pathkey"
+)
+
+// This first measured shape is one existing-file after-image. Other batch
+// operations retain their ordinary semantics without acquiring invented file
+// clocks. The durable transaction, never this bounded observation, is source
+// authority; duplicate/recovery arms do not call this helper.
+func (s *Server) beginBatchFileObservation(ctx context.Context, receipt batchTransactionReceipt, buffers map[string]*batchFileBuffer, paths []string) *mutationCommitRecord {
+	ack := editAcknowledgementFrom(ctx, s)
+	if ack == nil || len(paths) != 1 || len(receipt.Files) != 1 || len(receipt.Results) != 1 || receipt.Results[0].Op != "edit_file" {
+		return nil
+	}
+	buffer := buffers[paths[0]]
+	if buffer == nil || !buffer.existsBefore || !buffer.existsAfter || receipt.Files[0].Path != buffer.absPath {
+		return nil
+	}
+	record := &mutationCommitRecord{
+		kind: batchFileObservationCommit, owner: s,
+		id: "batch-file-" + strconv.FormatUint(mutationCommitSequence.Add(1), 10),
+		tool: "batch_edit", key: receipt.TransactionID, fingerprint: receipt.Fingerprint,
+		absPath: buffer.absPath, relPath: buffer.relPath,
+		startedAt: ack.entered, acknowledgement: ack,
+		disk: mutationDiskInFlight, graph: mutationGraphPending,
+		batchOwner: sha256.Sum256([]byte(receipt.TransactionID)),
+		checkoutID: receipt.CheckoutID, checkoutIncarnation: receipt.Incarnation,
+	}
+	s.mutationCommits.put(record)
+	return record
+}
+
+// Capture directly around the selected real forward writer. Journal and
+// rollback writers keep their original separate calls. No bytes or writer
+// closure are retained in the ledger, and an unobserved batch keeps its writer.
+func (s *Server) observedBatchFileWriter(record *mutationCommitRecord, writer func(string, []byte, os.FileMode) error) func(string, []byte, os.FileMode) error {
+	if record == nil { return writer }
+	return func(path string, content []byte, mode os.FileMode) error {
+		started := time.Now()
+		err := writer(path, content, mode)
+		returned := time.Now()
+		blob, after := "", [32]byte{}
+		if err == nil { blob, after = gitBlobSHA(content), sha256.Sum256(content) }
+		ledger := &s.mutationCommits
+		ledger.mu.Lock()
+		record.mu.Lock()
+		if ledger.byID[record.id] == record && record.owner == s && record.kind == batchFileObservationCommit {
+			if !record.diskWriteStartedAt.IsZero() || !pathkey.EqualPaths(record.absPath, path) {
+				record.disk, record.errText = mutationDiskFailed, "unavailable_repeated_or_foreign_writer"
+			} else {
+				record.diskWriteStartedAt, record.committedAt = started, returned
+				if err != nil {
+					record.disk, record.errText = mutationDiskFailed, err.Error()
+				} else {
+					record.newSHA, record.batchAfterSHA256, record.bytesWritten = blob, after, len(content)
+				}
+			}
+		}
+		record.mu.Unlock()
+		ledger.mu.Unlock()
+		return err // observation never changes writer/durability behavior
+	}
+}
+
+// A successful writer return alone is insufficient: directory durability and
+// the actual transaction verdict must also succeed. Keep that verdict separate
+// from committedAt's real per-file writer-return clock. Failure/rollback cannot
+// become publication ownership, and late finalization cannot resurrect eviction.
+func (s *Server) finishBatchFileObservation(record *mutationCommitRecord, receipt batchTransactionReceipt) {
+	if record == nil { return }
+	ledger := &s.mutationCommits
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if ledger.byID[record.id] != record || record.owner != s || record.kind != batchFileObservationCommit ||
+		record.batchOwner != sha256.Sum256([]byte(receipt.TransactionID)) || record.fingerprint != receipt.Fingerprint {
+		return
+	}
+	if record.disk == mutationDiskCommitted { return }
+	if receipt.Status != "committed" || receipt.DiskStatus != "committed" {
+		record.disk, record.graph, record.graphRecorded = mutationDiskFailed, mutationGraphFailed, true
+		record.errText = "batch_not_committed"
+		return
+	}
+	if len(receipt.Files) != 1 || receipt.Files[0].Path != record.absPath || receipt.Files[0].AfterAbsent || receipt.Files[0].BeforeAbsent ||
+		receipt.Files[0].AfterSHA256 != hex.EncodeToString(record.batchAfterSHA256[:]) || record.disk != mutationDiskInFlight ||
+		record.diskWriteStartedAt.IsZero() || record.committedAt.IsZero() || record.committedAt.Before(record.diskWriteStartedAt) || record.newSHA == "" {
+		record.disk, record.graph, record.graphRecorded = mutationDiskFailed, mutationGraphFailed, true
+		record.errText = "unavailable_writer_or_final_file_identity"
+		return
+	}
+	record.disk = mutationDiskCommitted
+	record.commitSeq = mutationDiskCommitSequence.Add(1)
+}

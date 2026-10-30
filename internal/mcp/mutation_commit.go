@@ -161,9 +161,10 @@ type mutationCommitRecord struct {
 	// Measurement-only admission witness. Public reindex fields are filled
 	// after waiting and deliberately omit Receipt on immediate success.
 	readRepairAdmission weak.Pointer[mutationReceipt]
-	// Only batchAcknowledgementCommit uses this fixed-size identity. It has
-	// no disk/graph outcome and cannot enter any physical mutation index.
+	// Batch observations use this fixed-size owner identity without entering
+	// any physical mutation index or durable transaction manifest.
 	batchOwner [32]byte
+	batchAfterSHA256 [32]byte
 
 	// response is the successful tool payload, retained only for records that
 	// carry a caller-chosen mutation_id. Without a key there is nothing to

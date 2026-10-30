@@ -1041,12 +1041,14 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		return state.snapshot(), nil
 	}
 	s.bindBatchAcknowledgement(ctx, state)
+	var fileObservation *mutationCommitRecord
 
 	// Only the original new transaction owns source effects. Duplicate/status
 	// and recovery replies above must not count another logical edit. This
 	// defer stays on the actual handler, including non-cancellable commits
 	// that finish after its caller has received a deadline response.
 	defer func() {
+		s.finishBatchFileObservation(fileObservation, result)
 		committed := result.Status == "committed" && result.DiskStatus == "committed"
 		observeEditSourceTerminal(ctx, committed, committed && (result.Error != "" || retErr != nil), result.DiskStatus == "rolled_back")
 	}()
@@ -1128,6 +1130,8 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 	if s.batchRemoveOverride != nil {
 		remover = s.batchRemoveOverride
 	}
+	fileObservation = s.beginBatchFileObservation(ctx, receipt, buffers, orderedPaths)
+	writer = s.observedBatchFileWriter(fileObservation, writer)
 	finishCommitFailure := func(failedPath, message string) batchTransactionReceipt {
 		status, rollbackErr := s.rollbackBatchReceipt(receipt, ctx)
 		if rollbackErr != nil {
@@ -1199,6 +1203,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		receipt.Error = "disk committed; terminal journal update failed: " + persistErr.Error()
 	}
 	state.publish(receipt, false)
+	s.finishBatchFileObservation(fileObservation, receipt)
 
 	for _, plan := range plans {
 		session := s.sessionFor(ctx)

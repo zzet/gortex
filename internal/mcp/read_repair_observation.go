@@ -133,7 +133,11 @@ func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pending
 		// eligible. Never fall back to an older edit of the same path.
 		committed := record.disk == mutationDiskCommitted && record.commitSeq != 0 && record.newSHA != ""
 		writing := pendingOnly && record.disk == mutationDiskInFlight
-		if ledger.byID[record.id] == record && record.owner == s && (committed || writing) && record.readRepair == nil &&
+		// Batch authority is its final durable verdict, not an individual
+		// successful write. Do not retrospectively attach an executor that
+		// finished before the actual batch publication/ticket was bound.
+		batchReady := record.kind != batchFileObservationCommit || (committed && record.publication != nil && record.readRepairAdmission.Value() != nil)
+		if batchReady && ledger.byID[record.id] == record && record.owner == s && (committed || writing) && record.readRepair == nil &&
 			(!pendingOnly || !record.graphRecorded || record.graph == mutationGraphPending) {
 			witness = mutationReadRepairWitness{
 				server: weak.Make(s), record: weak.Make(record), indexer: weak.Make(idx),
