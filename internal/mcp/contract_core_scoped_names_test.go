@@ -35,7 +35,7 @@ func (r *scopedExactNameSpy) FindNodesByName(name string) []*graph.Node {
 func TestContractCoreScopedExactNameRescueAvoidsUnrelatedRows(t *testing.T) {
 	s := openContractCoreCapStore(t)
 	s.AddBatch([]*graph.Node{
-		{ID: "a/needle", Name: "Needle", Kind: graph.KindFunction, RepoPrefix: "a", WorkspaceID: "ws", ProjectID: "project", FilePath: "a/focus.go", Meta: map[string]any{"signature": "func Needle()"}},
+		{ID: "a/focus.go::Needle", Name: "Needle", Kind: graph.KindFunction, RepoPrefix: "a", WorkspaceID: "ws", ProjectID: "project", FilePath: "a/focus.go", Meta: map[string]any{"signature": "func Needle()"}},
 		{ID: "external::Needle", Name: "Needle", Kind: graph.KindFunction, FilePath: "external::dependency"},
 	}, nil)
 	for pass := range 2 {
@@ -73,7 +73,7 @@ func TestContractCoreScopedExactNameRescueAvoidsUnrelatedRows(t *testing.T) {
 
 func TestContractCoreScopedExactNamesPreserveOverlayAndCancellation(t *testing.T) {
 	s := openContractCoreCapStore(t)
-	s.AddNode(&graph.Node{ID: "a/needle", Name: "Needle", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/focus.go"})
+	s.AddNode(&graph.Node{ID: "a/focus.go::Needle", Name: "Needle", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/focus.go"})
 	layer := graph.NewOverlayLayer()
 	layer.MarkFile("a/focus.go", true)
 	wrapped := newContractCoreEdges(graph.NewOverlaidView(s, layer), t.Context(), nil)

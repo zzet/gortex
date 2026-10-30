@@ -43,25 +43,25 @@ func (r *coverageCandidateSpy) DeadCodeCandidatesInScope(kinds []graph.NodeKind,
 func TestUntestedCandidateClosureMatchesWholeGraphOracle(t *testing.T) {
 	s := openContractCoreCapStore(t)
 	s.AddBatch([]*graph.Node{
-		{ID: "a/live", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/live.go"},
-		{ID: "a/dead", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/dead.go"},
-		{ID: "a/bean", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/bean.go"},
-		{ID: "a/cycle1", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/cycle.go"},
-		{ID: "a/cycle2", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/cycle.go"},
-		{ID: "a/dangling", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/dangling.go"},
-		{ID: "b/test", Kind: graph.KindFunction, RepoPrefix: "b", FilePath: "b/foreign_test.go"},
-		{ID: "b/helper", Kind: graph.KindFunction, RepoPrefix: "b", FilePath: "b/helper.go"},
+		{ID: "a/live.go::Live", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/live.go"},
+		{ID: "a/dead.go::Dead", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/dead.go"},
+		{ID: "a/bean.go::Bean", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/bean.go"},
+		{ID: "a/cycle.go::Cycle1", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/cycle.go"},
+		{ID: "a/cycle.go::Cycle2", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/cycle.go"},
+		{ID: "a/dangling.go::Dangling", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/dangling.go"},
+		{ID: "b/foreign_test.go::Test", Kind: graph.KindFunction, RepoPrefix: "b", FilePath: "b/foreign_test.go"},
+		{ID: "b/helper.go::Helper", Kind: graph.KindFunction, RepoPrefix: "b", FilePath: "b/helper.go"},
 		{ID: "contract", Kind: graph.KindContract, FilePath: "contract_test.go"},
 	}, []*graph.Edge{
-		{From: "b/test", To: "b/helper", Kind: graph.EdgeCalls},
-		{From: "b/helper", To: "a/live", Kind: graph.EdgeReferences},
-		{From: "b/test", To: "a/bean", Kind: graph.EdgeCalls, Meta: map[string]any{"via": "spring.Bean"}},
-		{From: "contract", To: "a/dead", Kind: graph.EdgeCalls},
-		{From: "b/test", To: "a/dead", Kind: graph.EdgeImports},
-		{From: "a/cycle1", To: "a/cycle2", Kind: graph.EdgeCalls},
-		{From: "a/cycle2", To: "a/cycle1", Kind: graph.EdgeCalls},
-		{From: "b/test", To: "missing-intermediate", Kind: graph.EdgeCalls},
-		{From: "missing-intermediate", To: "a/dangling", Kind: graph.EdgeReferences},
+		{From: "b/foreign_test.go::Test", To: "b/helper.go::Helper", Kind: graph.EdgeCalls},
+		{From: "b/helper.go::Helper", To: "a/live.go::Live", Kind: graph.EdgeReferences},
+		{From: "b/foreign_test.go::Test", To: "a/bean.go::Bean", Kind: graph.EdgeCalls, Meta: map[string]any{"via": "spring.Bean"}},
+		{From: "contract", To: "a/dead.go::Dead", Kind: graph.EdgeCalls},
+		{From: "b/foreign_test.go::Test", To: "a/dead.go::Dead", Kind: graph.EdgeImports},
+		{From: "a/cycle.go::Cycle1", To: "a/cycle.go::Cycle2", Kind: graph.EdgeCalls},
+		{From: "a/cycle.go::Cycle2", To: "a/cycle.go::Cycle1", Kind: graph.EdgeCalls},
+		{From: "b/foreign_test.go::Test", To: "missing-intermediate", Kind: graph.EdgeCalls},
+		{From: "missing-intermediate", To: "a/dangling.go::Dangling", Kind: graph.EdgeReferences},
 	})
 	var baseCandidateRows, baseEdgeRows int
 	for pass := range 2 {
@@ -75,11 +75,11 @@ func TestUntestedCandidateClosureMatchesWholeGraphOracle(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 1, spy.ancestorQueries, "one indexed closure statement replaces per-ancestor point reads")
 		require.Zero(t, spy.queries)
-		require.True(t, covered["a/live"], "a real foreign test path still proves coverage")
-		require.True(t, covered["a/dangling"], "the original forward walk follows missing intermediate identities")
-		require.False(t, covered["a/dead"])
-		require.False(t, covered["a/bean"])
-		require.False(t, covered["a/cycle1"])
+		require.True(t, covered["a/live.go::Live"], "a real foreign test path still proves coverage")
+		require.True(t, covered["a/dangling.go::Dangling"], "the original forward walk follows missing intermediate identities")
+		require.False(t, covered["a/dead.go::Dead"])
+		require.False(t, covered["a/bean.go::Bean"])
+		require.False(t, covered["a/cycle.go::Cycle1"])
 		require.Zero(t, spy.allNodes)
 		require.Zero(t, spy.allEdges)
 		if pass == 0 {
@@ -109,7 +109,7 @@ func TestUntestedCandidateClosureMatchesWholeGraphOracle(t *testing.T) {
 	require.NoError(t, err)
 	covered, _, err := candidateTestCoverage(t.Context(), reader, candidates)
 	require.NoError(t, err)
-	require.False(t, covered["a/live"], "a tombstoned foreign test cannot prove coverage")
+	require.False(t, covered["a/live.go::Live"], "a tombstoned foreign test cannot prove coverage")
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	_, _, err = candidateTestCoverage(ctx, reader, candidates)
