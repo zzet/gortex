@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,6 +25,8 @@ type workflowProvenance struct {
 	Ref      string `json:"ref"`
 	Revision string `json:"revision"`
 	RunURL   string `json:"run_url"`
+	Job      string `json:"job"`
+	Attempt  int    `json:"run_attempt"`
 }
 
 type budgetEvidence struct {
@@ -44,6 +47,7 @@ type laneConfig struct {
 	Machine          string               `json:"machine"`
 	Load             string               `json:"load_binary"`
 	Manifest         string               `json:"manifest"`
+	MainArtifact     string               `json:"main_artifact,omitempty"`
 	Builds           map[string]laneBuild `json:"builds"`
 	Repeats          int                  `json:"repeats"`
 	Duration         string               `json:"duration"`
@@ -90,6 +94,7 @@ type laneReceipt struct {
 	BudgetPass  bool               `json:"budget_pass"`
 	Error       string             `json:"error,omitempty"`
 	Workflow    workflowProvenance `json:"workflow"`
+	Smoke       *smokeProvenance   `json:"smoke_provenance,omitempty"`
 }
 
 func readLaneConfig(path string) (laneConfig, error) {
@@ -141,6 +146,12 @@ func readLaneConfig(path string) (laneConfig, error) {
 		return filepath.Join(base, value)
 	}
 	c.Load, c.Manifest = resolve(c.Load), resolve(c.Manifest)
+	if c.MainArtifact != "" {
+		c.MainArtifact = resolve(c.MainArtifact)
+	}
+	if c.Lane == "smoke" && c.MainArtifact == "" {
+		return c, errors.New("smoke requires the verified exact-main artifact bundle")
+	}
 	for role, build := range c.Builds {
 		build.Binary = resolve(build.Binary)
 		c.Builds[role] = build
@@ -408,8 +419,19 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 		receipt.Started = c.started
 	}
 	receipt.Workflow = workflowProvenance{Event: os.Getenv("GITHUB_EVENT_NAME"), Ref: os.Getenv("GITHUB_REF"), Revision: c.Builds["candidate"].Revision}
+	receipt.Workflow.Job = os.Getenv("GITHUB_JOB")
+	receipt.Workflow.Attempt, _ = strconv.Atoi(os.Getenv("GITHUB_RUN_ATTEMPT"))
 	if server, repo, id := os.Getenv("GITHUB_SERVER_URL"), os.Getenv("GITHUB_REPOSITORY"), os.Getenv("GITHUB_RUN_ID"); server != "" && repo != "" && id != "" {
 		receipt.Workflow.RunURL = server + "/" + repo + "/actions/runs/" + id
+	}
+	if c.Lane == "smoke" {
+		proof, err := prepareSmokeProvenance(c, receipt.Workflow)
+		if err != nil {
+			receipt.Error = err.Error()
+			receipt.Finished = time.Now().UTC()
+			return errors.Join(err, writeNewJSON(filepath.Join(out, "lane.json"), receipt))
+		}
+		receipt.Smoke = &proof
 	}
 	index := inputs{Version: 1, CandidateRevision: c.Builds["candidate"].Revision, MainRevision: c.Builds["main"].Revision, TagRevision: c.Builds["tag"].Revision, Repeats: c.Repeats, ScenarioRepeats: map[string]int{}, Hosts: map[string]string{c.HostClass: c.Machine}, Runs: []runInput{}}
 	var failures []error
@@ -469,6 +491,12 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 	// become a smaller successful matrix, and the original checker is authoritative.
 	d, err := loadInputs(filepath.Join(out, "inputs.json"))
 	if err == nil {
+		if c.Lane == "smoke" {
+			receipt.Finished = time.Now().UTC()
+			if provenanceErr := validateSmokeJob(receipt, d); provenanceErr != nil {
+				failures = append(failures, provenanceErr)
+			}
+		}
 		var rows []result
 		rows, err = check(p, d, c.Lane)
 		if err == nil {

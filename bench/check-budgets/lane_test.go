@@ -15,7 +15,7 @@ import (
 )
 
 func fixtureLaneConfig() laneConfig {
-	return laneConfig{Version: 1, Lane: "smoke", HostClass: "reference_linux", Machine: "synthetic-host", Load: "/synthetic/load", Manifest: "manifest.json", Builds: map[string]laneBuild{
+	return laneConfig{Version: 1, Lane: "smoke", HostClass: "reference_linux", Machine: "synthetic-host", Load: "/synthetic/load", Manifest: "manifest.json", MainArtifact: "main-bundle", Builds: map[string]laneBuild{
 		"candidate": {Binary: "candidate", Revision: strings.Repeat("a", 40)}, "main": {Binary: "main", Revision: strings.Repeat("d", 40)}, "tag": {Binary: "tag", Revision: shippedRevision},
 	}, Repeats: 3, Duration: "60s", Deadline: "120s", WarmTimeout: "30m", StopTimeout: "30s", SweepDuration: "10m", SweepRepetitions: 15}
 }
@@ -130,12 +130,13 @@ func TestCollectorRetainsFailedRepetitionsAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := fixtureLaneConfig()
+	c.Lane = "nightly"
 	c.Manifest = filepath.Join(parent, "manifest.json")
 	if err := writeNewJSON(c.Manifest, []map[string]any{{"label": "gortex", "source": source, "commit": strings.Repeat("c", 40)}}); err != nil {
 		t.Fatal(err)
 	}
 	p := testPolicy()
-	p.Budgets = []budget{{Metric: "read_p95", Scenario: "load-1", HostClass: c.HostClass, Mode: "block", Target: pointer(1), Unit: "s", Compare: "le", Lane: []string{"smoke"}}}
+	p.Budgets = []budget{{Metric: "read_p95", Scenario: "load-1", HostClass: c.HostClass, Mode: "block", Target: pointer(1), Unit: "s", Compare: "le", Lane: []string{"nightly"}}}
 	plan, err := makeLanePlan(p, c)
 	if err != nil {
 		t.Fatal(err)
