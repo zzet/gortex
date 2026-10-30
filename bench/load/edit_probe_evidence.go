@@ -34,6 +34,9 @@ func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
 		{"callers", request{Tool: "relations", Operation: "callers", Arguments: map[string]any{"operation": "callers", "target": map[string]any{"symbol": c.Symbol}, "options": map[string]any{"depth": 1, "limit": 1000}}}},
 		{"call_chain", request{Tool: "trace", Operation: "call_chain", Arguments: map[string]any{"operation": "call_chain", "target": marker, "options": map[string]any{"depth": 1, "limit": 1000}}}},
 	}
+	if c.EditKind == "append_leaf" {
+		oracles[5].call.Arguments["target"] = marker
+	}
 	if step.BeforeSymbol != "" {
 		oracles = append(oracles, editProbeOracle{name: "old_source_absent", call: request{Tool: "read", Operation: "source", ExpectedAbsentSymbol: step.BeforeSymbol, Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}}})
 	}
@@ -107,6 +110,9 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 				return false
 			}
 		}
+		if c.EditKind == "append_leaf" {
+			return body["name"] == step.Marker && editProbeLeafSource(c.File, source, step.Marker)
+		}
 		return body["name"] == step.Marker && editProbeFixtureSource(c.File, source, step.Marker, callee)
 	case "file":
 		source, _ := body["content"].(string)
@@ -116,6 +122,9 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 				return false
 			}
 		}
+		if c.EditKind == "append_leaf" {
+			return editProbeLeafSource(c.File, source, step.Marker)
+		}
 		return editProbeFixtureSource(c.File, source, step.Marker, callee)
 	case "text":
 		return collection("matches", func(row map[string]any) bool {
@@ -124,7 +133,11 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 			line, err := strconvEditProbeUint(row["line"])
 			prefix := "func "
 			if filepath.Ext(c.File) == ".ts" {
-				valid, correct := editProbeTypeScriptFixture(text, step.Marker, callee)
+				textCallee := callee
+				if c.EditKind == "append_leaf" {
+					textCallee = ""
+				}
+				valid, correct := editProbeTypeScriptFixture(text, step.Marker, textCallee)
 				return err == nil && line > 0 && editProbeFixturePath(path, c.File) && valid && correct
 			}
 			if filepath.Ext(c.File) == ".py" {
@@ -133,6 +146,9 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 			return err == nil && line > 0 && (path == c.File || strings.HasSuffix(path, "/"+c.File)) && strings.Contains(text, prefix+step.Marker)
 		})
 	case "callers", "call_chain":
+		if c.EditKind == "append_leaf" {
+			return editProbeLeafRelations(body, c, step)
+		}
 		return collection("edges", func(row map[string]any) bool {
 			from, _ := row["from"].(string)
 			to, _ := row["to"].(string)

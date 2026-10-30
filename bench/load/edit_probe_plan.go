@@ -66,10 +66,10 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if kind == "" {
 		kind = "add_intrafile_call"
 	}
-	if kind != "add_intrafile_call" && kind != "rename" && kind != "delete" {
+	if kind != "add_intrafile_call" && kind != "append_leaf" && kind != "rename" && kind != "delete" {
 		return editProbePlan{}, errors.New("unsupported edit kind")
 	}
-	if kind != "add_intrafile_call" && tool != "edit.symbol" {
+	if (kind == "rename" || kind == "delete") && tool != "edit.symbol" {
 		return editProbePlan{}, errors.New("rename/delete fixtures currently require explicit edit.symbol")
 	}
 	language := "go"
@@ -91,14 +91,18 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		return editProbePlan{}, errors.New("initial intrafile cell requires one plain callee symbol")
 	}
 	probeMarker := "GortexEditProbeDeclaration"
+	templateCallee := callee
+	if kind == "append_leaf" {
+		templateCallee = ""
+	}
 	switch language {
 	case "typescript":
-		valid, correct := editProbeTypeScriptFixture(strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker, callee)
+		valid, correct := editProbeTypeScriptFixture(strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker, templateCallee)
 		if !valid || !correct {
 			return editProbePlan{}, errors.New("TypeScript template must be a numeric zero-argument marker function returning the intrafile call")
 		}
 	case "python":
-		valid, correct := editProbePythonFixture(strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker, callee)
+		valid, correct := editProbePythonFixture(strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker, templateCallee)
 		if !valid || !correct {
 			return editProbePlan{}, errors.New("python template must be a top-level marker with one indented return of the intrafile call")
 		}
@@ -121,7 +125,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 				})
 			}
 		}
-		if !declaration || !call {
+		if !declaration || (kind != "append_leaf" && !call) || (kind == "append_leaf" && !editProbeLeafSource(c.File, strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker)) {
 			return editProbePlan{}, errors.New("template must declare the unique marker function and actually call the selected intrafile callee")
 		}
 	}
