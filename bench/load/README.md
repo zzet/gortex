@@ -148,6 +148,25 @@ verifies both original byte strings. Unsupported language, package, path and
 operation combinations refuse explicitly. These implementation controls do not
 establish live relocation timing or the broader traffic/reference gates.
 
+`edit_output: "toon"` opts this fixture into TOON for the offered edit ACK,
+visibility probes and immediate readbacks. Omission or `"json"` retains the
+existing JSON plan and request identity. The decoder evaluates the requested
+text; a valid structured JSON sibling, JSON fallback, malformed/truncated TOON
+or unsafe numeric value cannot supply format credit. Unknown modes refuse.
+Timing-status queries, initial presence/callee admissions and cleanup are
+separate JSON controls, preserving exact generation/nanosecond arithmetic.
+
+TOON compact subgraphs expose `total` plus explicit truncation and emitted
+rows; they omit the JSON `total_nodes` and untrimmed full `total_edges` fields.
+The harness does not insert those missing producer fields. Complete-row checks
+require the known producer operation, exact declared node total, explicit
+nontruncation and actual emitted collections; missing, clipped or contradictory
+rows remain failures. Compact rows also omit signature/end-line metadata, so
+TOON `change_signature` is explicitly unsupported pending a producer-backed
+changed-graph witness. This temporary harness refusal is not acceptance or a
+waiver of the signature/output cell. TOON source implementation and offline
+controls do not establish live, reference, traffic or performance coverage.
+
 `--scenario edit-and-probe --profile agent --agents 0 --edit-agents 1
 --worktrees 0` selects an initial `add_intrafile_call` / `edit.file` / JSON
 accounting cell. Go retains its existing AST validation. The explicit `.ts`
