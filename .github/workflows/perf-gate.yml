@@ -1,0 +1,119 @@
+name: Performance readiness and gates
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '19 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Measurements are independent of ci.yml and never borrow its test matrix.
+# Do not cancel an older measurement: every owned daemon must retain stop receipts.
+concurrency:
+  group: perf-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CGO_CFLAGS: -O2 -g -fno-strict-aliasing
+  CGO_CXXFLAGS: -O2 -g -fno-strict-aliasing
+  GOTOOLCHAIN: local
+
+jobs:
+  readiness:
+    name: Performance readiness (not acceptance)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # A green readiness job is not a passed performance gate. The JSON/summary
+      # names every unavailable observation; plan exits nonzero while gaps exist.
+      - name: Declare smoke prerequisites (not a measured smoke lane)
+        continue-on-error: true
+        run: go run ./bench/check-budgets plan --lane smoke --out smoke-readiness.json
+      - name: Declare nightly prerequisites (does not start the five-night calendar)
+        continue-on-error: true
+        run: go run ./bench/check-budgets plan --lane nightly --out nightly-readiness.json
+      - name: Declare release prerequisites
+        continue-on-error: true
+        run: go run ./bench/check-budgets plan --lane release --out release-readiness.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: performance-readiness-${{ github.run_id }}
+          path: '*-readiness.json'
+          retention-days: 90
+          if-no-files-found: error
+
+  # No owned runner is registered by this change. Enable only after reviewed
+  # host inventory, neutral artifact paths, pinned standalone controls and
+  # exact formal observations exist. Do not execute PR code on these hosts.
+  nightly-reference:
+    name: Reference nightly measurement
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.PERF_REFERENCE_NIGHTLY_ENABLED == 'true'
+    runs-on: [self-hosted, perf-reference-linux]
+    timeout-minutes: 1440
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build exact main candidate and load client
+        run: |
+          go build -o "${{ runner.temp }}/perf-candidate" ./cmd/gortex
+          go build -o "${{ runner.temp }}/perf-load" ./bench/load
+      - name: Collect full standalone matrix and enforce strict budgets
+        env:
+          PERF_CONFIG: ${{ vars.PERF_REFERENCE_NIGHTLY_CONFIG }}
+        run: >-
+          go run ./bench/check-budgets collect
+          --config "$PERF_CONFIG" --require-lane nightly
+          --expected-candidate "${{ github.sha }}"
+          --candidate-binary "${{ runner.temp }}/perf-candidate"
+          --load-binary "${{ runner.temp }}/perf-load"
+          --out "${{ runner.temp }}/perf-evidence-${{ github.run_id }}"
+      - name: Preserve failures, raw reports, stop receipts and budget table
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-reference-${{ github.run_id }}
+          path: ${{ runner.temp }}/perf-evidence-${{ github.run_id }}/
+          retention-days: 90
+          if-no-files-found: error
+
+  nightly-mac:
+    name: Apple Silicon nightly measurement (when owned host is available)
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.PERF_MAC_NIGHTLY_ENABLED == 'true'
+    runs-on: [self-hosted, perf-apple-silicon]
+    timeout-minutes: 1440
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build exact main candidate and load client
+        run: |
+          go build -o "${{ runner.temp }}/perf-candidate" ./cmd/gortex
+          go build -o "${{ runner.temp }}/perf-load" ./bench/load
+      - name: Collect full standalone matrix and enforce strict budgets
+        env:
+          PERF_CONFIG: ${{ vars.PERF_MAC_NIGHTLY_CONFIG }}
+        run: >-
+          go run ./bench/check-budgets collect
+          --config "$PERF_CONFIG" --require-lane nightly
+          --expected-candidate "${{ github.sha }}"
+          --candidate-binary "${{ runner.temp }}/perf-candidate"
+          --load-binary "${{ runner.temp }}/perf-load"
+          --out "${{ runner.temp }}/perf-evidence-${{ github.run_id }}"
+      - name: Preserve failures, raw reports, stop receipts and budget table
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-mac-${{ github.run_id }}
+          path: ${{ runner.temp }}/perf-evidence-${{ github.run_id }}/
+          retention-days: 90
+          if-no-files-found: error

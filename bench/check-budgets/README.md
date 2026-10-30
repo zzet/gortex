@@ -1,8 +1,9 @@
 # Performance budget checker
 
-This command consumes repeated, pinned #996 report-v1 files and
-[`../budgets.yaml`](../budgets.yaml). It does not run workloads, start daemons,
-provision runners or infer missing observations. The wire mapping is pinned to
+The default command consumes repeated, pinned #996 report-v1 files and
+[`../budgets.yaml`](../budgets.yaml). The `collect` subcommand runs the merged
+load client sequentially against private owned daemons; `plan` starts nothing.
+Neither provisions runners nor infers missing observations. The wire mapping is pinned to
 `95b7982bf1853b24bd963a0701aa163d9a72a2de`. The policy and input index reject
 unknown fields. Metric and scenario names are closed tables in `specs.go`.
 
@@ -15,9 +16,12 @@ go run ./bench/check-budgets --budgets bench/budgets.yaml \
 The output is a before → after table and an optional new JSON evidence file.
 Any breach, missing/null metric, wrong unit, omitted safety/censor count,
 incomplete report, unavailable prerequisite or incomparable measurement exits
-nonzero. Existing output files are never overwritten. No workflow is enabled by
-this slice: unresolved wire/infrastructure prerequisites would otherwise make
-a required PR check predictably red rather than provide useful validation.
+nonzero. Existing output files are never overwritten. The separate
+`perf-gate.yml` workflow publishes readiness, explicitly named **not acceptance**.
+Owned-host measurement jobs are skipped unless their reviewed runner/config
+variables are enabled. There is no formal PR smoke measurement job yet: hosted
+ARM capacity is not the reference cgroup, and exact smoke observations remain
+unavailable. Readiness cannot satisfy a required performance acceptance check.
 
 ## Repeated evidence and comparison identity
 
@@ -119,10 +123,129 @@ Known unavailable metrics/scenarios stay declared and fail with their reason;
 they are not silently omitted from the selected host/lane. The staged rows and
 synthetic unit fixtures do not prove any owning product target passes.
 
+## Collection, history and release entry point
+
+```sh
+# Source-only preflight. Exits nonzero with the exact unavailable prerequisites.
+go run ./bench/check-budgets plan --lane smoke --out NEW-smoke-plan.json
+go run ./bench/check-budgets plan --config reviewed-lane.json
+
+# Run supported observations and retain every failure. The full policy still
+# fails when a mandatory fixture/metric is unavailable; this is not a subset pass.
+go run ./bench/check-budgets collect --config reviewed-lane.json --out NEW-evidence-dir
+go run ./bench/release-gate --config reviewed-release.json --out NEW-release-dir
+
+# Inspect downloaded scheduled-main artifacts, replay all passing raw reports,
+# require five actual adjacent UTC dates, and flag two-night row misses.
+go run ./bench/check-budgets history --inputs downloaded-nightlies.json \
+  --through 2026-10-30 --hosts reference_linux
+```
+
+`downloaded-nightlies.json` is an array of retained artifact-directory paths,
+relative to that index or absolute. Review their run provenance before use:
+this command checks local content and replays raw evidence, not the authenticity
+of arbitrary local files. Only `schedule` events on `refs/heads/main` count.
+Dispatch, readiness, duplicate host/date, omitted dates, shortened tables and
+changed policies cannot manufacture five accepted nights. Use `--through` for
+the last required night before the candidate; stale history is not a current
+release verdict. Consecutive block misses are labeled `BLOCKER`; consecutive
+disk/memory guard misses are labeled `GUARD REVIEW`. Missing history fails.
+The workflow preserves each artifact; downloading/curating the history index
+and calling this check before the first RC remain release-owner actions.
+
+A lane configuration is strict schema1 JSON. Example below is **configuration
+shape only**, with synthetic paths/revisions and no measured baseline:
+
+```json
+{
+  "schema_version": 1,
+  "lane": "release",
+  "host_class": "reference_linux",
+  "machine": "reviewed-machine-id",
+  "load_binary": "bin/load",
+  "manifest": "corpus.json",
+  "builds": {
+    "candidate": {"binary": "bin/candidate", "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    "main": {"binary": "bin/main", "revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    "tag": {"binary": "bin/tag", "revision": "defa9f8e7a670792b5b693744d88488f741a8160"}
+  },
+  "repeats": 3,
+  "duration": "120s",
+  "deadline": "120s",
+  "warm_timeout": "30m",
+  "stop_timeout": "30s",
+  "sweep_duration": "10m",
+  "sweep_repetitions": 15
+}
+```
+
+Paths in the configuration resolve relative to its file. Manifest sources are
+absolute read-only inputs under the #996 contract; outputs must not overlap
+them, including through symlinks. Use `gortex` and `corpus-1` through `corpus-5`
+aliases. The collector selects one manifest entry for each single-repo sweep,
+the first entry for ordinary one-repo scenarios, and six for `many-edit`.
+It does not relabel the frozen one-root sweep as a six-root sweep, or reading
+worktrees as editing worktrees. Floor configs are refused until the supported
+envelope has an explicit policy and fixtures; floor evidence cannot become
+reference evidence.
+
+Each supported scenario runs the policy's full planned repetitions with matching
+seeds across roles and rotating sequential main/candidate/tag order. Tag runs
+are needed only for scenarios with guard rows. Release plans require at least
+ten warm restarts and twenty idle stops. The latter fixture is unavailable and
+does not become twenty generic clean stops. The collector retains `inputs.json`,
+raw reports/logs, a JSON budget table and text table when reports are decodable,
+plus `lane.json` with failed/missing tasks, wall time and workflow provenance.
+If startup fails before any raw report exists, the receipt/index still retain
+the failure. No failed repeat is discarded. Collector cancellation interrupts
+the load client and waits for owned-daemon cleanup rather than killing the
+client first. The release collector interrupts workload at seven hours and
+57 minutes, reserving three minutes for the harness's independent owned-daemon
+stop (configuration requires at most two minutes), logs, cleanup and checking.
+It counts all
+startup, teardown and checking toward the actual wall limit. An overrun fails;
+this is not a claim that the subset has measured under eight hours.
+
+The nightly jobs build the exact clean workflow candidate and load client.
+`--expected-candidate` binds the candidate revision; the harness rejects binary
+metadata disagreement. The owner supplies pinned standalone main/tag binaries,
+corpora and machine binding via `PERF_REFERENCE_NIGHTLY_CONFIG` or
+`PERF_MAC_NIGHTLY_CONFIG`, and enables only the matching `*_ENABLED` variable.
+Dedicated labels are `perf-reference-linux` and `perf-apple-silicon`. These jobs
+never execute PR code on owned hosts. No registration, service install, secret
+or infrastructure change is performed. Before enabling artifact publication,
+review neutral corpus labels and runtime paths; do not publish private source
+names or local benchmark paths. Repository/organization retention settings must
+actually permit the requested 90 days.
+
+The reviewed inventory must name each runner's exact reported `machine`, class,
+OS/architecture, kernel and observed limits. Linux requires an existing isolated
+cgroup v2 with effective 8 CPUs/16 GiB, sufficient physical capacity, and an
+observed 57–60 GiB benchmark filesystem. Mac requires Darwin ARM64 and an
+explicit reference/large classification; its uncapped measurements must not be
+relabeled Linux capacity. Each dedicated host needs a clean checkout, Go from
+`go.mod`, the required C/C++ compiler, the pinned standalone controls and corpus,
+and enough exclusive time to avoid simultaneous benchmark sessions. The
+workflow requests only `contents: read`; artifact upload uses the Actions job's
+normal artifact runtime token. No write-scoped PAT or repository secret is
+needed by the collector. Restrict the runner group to this repository's trusted
+main workflow and dedicated labels, and review neutral artifact contents before
+enablement. Runner registration, any host changes and repository variables are
+separate owner-approved infrastructure actions. No existing VM is adopted.
+
+After that review, the owner places the external config, sets only its matching
+config-path variable, and sets `PERF_REFERENCE_NIGHTLY_ENABLED` or
+`PERF_MAC_NIGHTLY_ENABLED` to `true`. A manual main dispatch can verify plumbing
+but cannot count as one of the five scheduled nights. Leave both enabled
+variables unset while prerequisites remain; GitHub displays measurement jobs
+as skipped. Removing the variable stops future scheduling without cancelling
+an in-flight owned daemon. A host being busy is reason to leave its lane
+disabled, not to attach to an unrelated active session.
+
 ## Remaining lane and acceptance work
 
-Before workflow/release code or external setup, review a source plan consuming
-the accepted #996 client, official baseline evidence and resolved metrics above.
+Before enabling measurement jobs or external setup, review the source plan,
+official baseline evidence and resolved metrics above.
 No self-hosted runner is currently registered. A runner owner must provide the
 reference cgroup/disk and reviewed Apple host inventory; this command does not
 register services, alter Docker/Brew, install runners, set secrets or spend
@@ -130,8 +253,11 @@ model calls. A PR smoke lane must remain separate from CI test jobs and run on
 `ubuntu-24.04-arm`; protected-main nightlies require available owned hosts.
 Reports/table artifacts need effective retention of at least 90 days.
 
-The PR plan must include all five steps, comparable main measurements, existing
-micro-benchmark benchstat and a measured duration estimate. The frozen default
+The implemented plan declares all five smoke steps but refuses the unavailable
+idle-stop fixture and exact observations. The measured PR runner, comparable
+latest-main artifact retrieval, existing micro-benchmark benchstat and measured
+duration estimate remain to implement after smoke infrastructure is reviewed.
+The frozen default
 60-second duration is not a measured feasibility guarantee; the retained native
 read1 cohort used 120-second windows. Those 120-second read/edit windows repeated
 three times already consume substantial time; do not assume the full lane fits
