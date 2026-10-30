@@ -4622,6 +4622,9 @@ func BFSOf(ctx context.Context, g Reader, seeds []string, dir Direction, kinds [
 					return nil, err
 				}
 				for _, e := range edges {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					if e == nil {
 						continue
 					}
