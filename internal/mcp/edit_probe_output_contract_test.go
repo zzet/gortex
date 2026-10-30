@@ -42,7 +42,10 @@ func TestEditProbeActualJSONAndTOONWireContracts(t *testing.T) {
 				}
 				require.NoError(t, json.Unmarshal(raw, &envelope))
 				if envelope.IsError {
-					for _, entry := range captured.FilterMessage("mcp: handler panic recovered").All() {
+					for _, entry := range captured.All() {
+						if entry.Message != "mcp: handler panic recovered" && entry.Message != "tool handler panic recovered" {
+							continue
+						}
 						t.Logf("actual handler panic stack: %v", entry.ContextMap()["stack"])
 					}
 				}
@@ -161,7 +164,10 @@ func TestEditProbeTOONSignatureFollowingCallerWireWitness(t *testing.T) {
 			output := map[string]any{"format": "toon", "max_bytes": 0}
 			decode := func(result *mcpgo.CallToolResult) map[string]any {
 				if result.IsError {
-					for _, entry := range captured.FilterMessage("mcp: handler panic recovered").All() {
+					for _, entry := range captured.All() {
+						if entry.Message != "mcp: handler panic recovered" && entry.Message != "tool handler panic recovered" {
+							continue
+						}
 						t.Logf("actual handler panic stack: %v", entry.ContextMap()["stack"])
 					}
 				}
