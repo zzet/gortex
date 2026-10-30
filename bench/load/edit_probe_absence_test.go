@@ -203,7 +203,7 @@ func TestEditProbeDisappearanceBeforeAckRetainsActualFirstCorrect(t *testing.T) 
 	run := &editProbeRuntime{p: &privateRun{Repos: []privateRepo{{Prefix: "owned"}}}, phase: &Phase{}, origin: state.started, options: runOptions{Deadline: time.Second}}
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := run.perform(ctx, state, editor, request{Tool: "edit", Operation: "symbol"}, "edit", "edit", 0)
+		_, _, err := run.perform(ctx, state, editor, request{Tool: "edit", Operation: "symbol", Arguments: map[string]any{"operation": "symbol", "target": map[string]any{"symbol": logical}, "match": "old", "replacement": ""}}, "edit", "edit", 0)
 		done <- err
 	}()
 	defer func() {
