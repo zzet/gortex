@@ -378,13 +378,29 @@ func directRequestedBackgroundFixture() map[string]any {
 	background["background_wall_ms"] = json.Number("16")
 	return status
 }
+func directRequestedBackgroundWithPredecessorFixture() map[string]any {
+	status := directRequestedBackgroundFixture()
+	status["reindex_generation"], status["applied_generation"] = json.Number("3"), json.Number("3")
+	status["publication_phases"].(map[string]any)["ticket"] = json.Number("3")
+	status["phase_timing"].(map[string]any)["patch_accounting"].(map[string]any)["attempt_ticket"] = json.Number("3")
+	b := status["requested_background"].(map[string]any)
+	b["requested_generation"], b["applied_generation"] = json.Number("3"), json.Number("3")
+	b["admission_predecessor_generation"], b["admission_predecessor_stopped"] = json.Number("2"), true
+	return status
+}
 func TestDirectRequestedBackgroundConsumerRequiresExactOwnedWindow(t *testing.T) {
 	if got := checkEditProbeAccounting(directRequestedBackgroundFixture(), "receipt-a"); got.State != "observed_single_window_checks_pass" {
 		t.Fatal("valid direct B refused", got)
 	}
-	for _, name := range []string{"missing_quiet", "borrowed_native_quiet", "wrong_applied", "fake_handoff", "unknown_shape", "predecessor_stop_false", "foreign_predecessor"} {
+	if got := checkEditProbeAccounting(directRequestedBackgroundWithPredecessorFixture(), "receipt-a"); got.State != "observed_single_window_checks_pass" {
+		t.Fatal("valid actual predecessor proof refused", got)
+	}
+	for _, name := range []string{"missing_quiet", "borrowed_native_quiet", "wrong_applied", "fake_handoff", "unknown_shape", "predecessor_stop_false", "foreign_predecessor", "malformed_predecessor", "missing_stop_proof"} {
 		t.Run(name, func(t *testing.T) {
 			status := directRequestedBackgroundFixture()
+			if strings.Contains(name, "predecessor") || name == "missing_stop_proof" {
+				status = directRequestedBackgroundWithPredecessorFixture()
+			}
 			b := status["requested_background"].(map[string]any)
 			phases := b["phases_ms"].(map[string]any)
 			switch name {
@@ -399,11 +415,13 @@ func TestDirectRequestedBackgroundConsumerRequiresExactOwnedWindow(t *testing.T)
 			case "unknown_shape":
 				b["coverage"] = "unknown"
 			case "predecessor_stop_false":
-				b["admission_predecessor_generation"] = json.Number("1")
 				b["admission_predecessor_stopped"] = false
 			case "foreign_predecessor":
-				b["admission_predecessor_generation"] = json.Number("2")
-				b["admission_predecessor_stopped"] = true
+				b["admission_predecessor_generation"] = json.Number("3")
+			case "malformed_predecessor":
+				b["admission_predecessor_generation"] = "not-a-generation"
+			case "missing_stop_proof":
+				delete(b, "admission_predecessor_stopped")
 			}
 			if got := checkEditProbeAccounting(status, "receipt-a"); got.State == "observed_single_window_checks_pass" {
 				t.Fatal("accepted contradictory direct B", name)
