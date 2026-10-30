@@ -21,7 +21,8 @@ func RegisteredCheckoutForPath(ctx context.Context, catalog *store_sqlite.Catalo
 	// root is necessarily more specific than every lexical ancestor.
 	candidates, err := catalog.CheckoutsByRootPaths(ctx, []string{cleaned})
 	if err != nil {
-		return store_sqlite.Checkout{}, false, err
+		return store_sqlite.Checkout{}, false, WrapViewError(CodeCheckoutInaccessible,
+			"read registered checkout roots", err)
 	}
 	if best, found := checkoutForPathSpelling(candidates, cleaned, false); found {
 		return best, true, nil
@@ -35,7 +36,8 @@ func RegisteredCheckoutForPath(ctx context.Context, catalog *store_sqlite.Catalo
 	}
 	candidates, err = catalog.CheckoutsByRootPaths(ctx, ancestors)
 	if err != nil {
-		return store_sqlite.Checkout{}, false, err
+		return store_sqlite.Checkout{}, false, WrapViewError(CodeCheckoutInaccessible,
+			"read registered checkout roots", err)
 	}
 	if best, found := checkoutForPathSpelling(candidates, cleaned, false); found {
 		return best, true, nil

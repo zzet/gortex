@@ -1,6 +1,7 @@
 package graphview
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -60,5 +61,29 @@ func TestRegisteredCheckoutScopedLookupPreservesCanonicalAliasPrecedence(t *test
 		if err != nil || wantErr != nil || found != wantFound || got != want {
 			t.Fatalf("path=%q: got=%+v/%v/%v want=%+v/%v/%v", path, got, found, err, want, wantFound, wantErr)
 		}
+	}
+}
+
+func TestRegisteredCheckoutScopedLookupClassifiesUnreadableCatalog(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "unreadable-binding.sqlite")
+	store, err := store_sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec("DROP TABLE checkouts"); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = RegisteredCheckoutForPath(t.Context(), store.Catalog(), "/registered/repo")
+	if CodeOf(err) != CodeCheckoutInaccessible {
+		t.Fatalf("unreadable checkout binding code=%q error=%v", CodeOf(err), err)
 	}
 }
