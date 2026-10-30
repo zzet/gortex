@@ -28,6 +28,14 @@ func editProbeTool(c Corpus) (string, error) {
 		if err := editProbeInitialFixture(c); err != nil {
 			return "", err
 		}
+	case "move_symbol", "refactor.move":
+		if filepath.Ext(c.File) != ".go" {
+			return "", errors.New("unsupported language: move_symbol fixture supports Go only")
+		}
+		if c.EditKind != "relocate" {
+			return "", errors.New("move_symbol applies to relocation, not append/body/signature/rename/delete fixtures")
+		}
+		return "", errors.New("move measurement unavailable: actual Go relocation lacks per-file publication observations; functional relocation is separate")
 	default:
 		return "", errors.New("edit-and-probe supports edit.file, explicit edit.write, edit.symbol or one-file edit.batch")
 	}
