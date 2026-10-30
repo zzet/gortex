@@ -89,7 +89,7 @@ func TestEditProbeAbsenceRequiresActualOwnedDeclarationBeforeEdit(t *testing.T) 
 			logical := c.Symbol
 			name := logical[strings.LastIndex(logical, "::")+2:]
 			source := c.EditAnchor
-			for _, variant := range []string{"actual", "comment_only", "wrong_id", "wrong_file", "wrong_name", "empty", "not_found"} {
+			for _, variant := range []string{"actual", "comment_only", "wrong_id", "wrong_file", "wrong_name", "empty", "not_found", "is_error_json"} {
 				t.Run(variant, func(t *testing.T) {
 					body := map[string]any{"id": "owned/" + logical, "file_path": "owned/" + c.File, "name": name, "source": source}
 					switch variant {

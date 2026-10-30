@@ -15,7 +15,7 @@ func editProbeCrossFileCallee(c Corpus) (file, name string, err error) {
 		return "", "", errors.New("crossfile fixture requires exact edit_callee")
 	}
 	file, name = c.EditCallee[:sep], c.EditCallee[sep+2:]
-	if filepath.Base(file) != file || file == c.File || filepath.Ext(file) != filepath.Ext(c.File) || !simpleSymbolName(name) {
+	if filepath.Base(c.File) != c.File || filepath.Base(file) != file || file == c.File || filepath.Ext(file) != filepath.Ext(c.File) || !simpleSymbolName(name) {
 		return "", "", errors.New("crossfile fixture requires distinct same-language root file and plain callee")
 	}
 	base := strings.TrimSuffix(file, filepath.Ext(file))
@@ -79,6 +79,9 @@ func (r *editProbeRuntime) admitCrossFileCallee(ctx context.Context) error {
 	req := request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": c.EditCallee}, "options": map[string]any{"context_lines": 0}}}
 	raw, identity, err := r.editor.callWithIdentity(ctx, "tools/call", map[string]any{"name": req.Tool, "arguments": dispatchArgs(req, r.p.Repos[0])})
 	if err != nil {
+		return err
+	}
+	if err := checkToolResult(raw); err != nil {
 		return err
 	}
 	proof := c

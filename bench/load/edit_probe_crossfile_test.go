@@ -54,12 +54,15 @@ func TestEditProbeCrossFileRefusesAmbiguousImportAndCallee(t *testing.T) {
 	for _, language := range []string{"go", "typescript", "python"} {
 		t.Run(language, func(t *testing.T) {
 			base := editProbeCrossFileCorpus(t, language)
-			for _, variant := range []string{"same_file", "outside", "wrong_language", "missing", "wrong_import"} {
+			for _, variant := range []string{"same_file", "outside", "nested_edited", "wrong_language", "missing", "wrong_import"} {
 				t.Run(variant, func(t *testing.T) {
 					c := base
 					switch variant {
 					case "same_file":
 						c.EditCallee = c.File + "::Hub"
+					case "nested_edited":
+						c.File = "nested/" + c.File
+						c.Symbol = "nested/" + c.Symbol
 					case "outside":
 						c.EditCallee = "../hub.go::Hub"
 					case "wrong_language":
