@@ -41,7 +41,13 @@
                 "edit_anchor": {
                   "type": "string"
                 },
+                "edit_initial_content": {
+                  "type": "string"
+                },
                 "edit_template": {
+                  "type": "string"
+                },
+                "edit_tool": {
                   "type": "string"
                 },
                 "file": {
