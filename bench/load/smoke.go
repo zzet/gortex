@@ -131,7 +131,7 @@ func smokeCommand(ctx context.Context, args []string) (result error) {
 					return errors.Join(result, err)
 				}
 				build := builds[role]
-				o := runOptions{Binary: build.binary, GitSHA: build.sha, Profile: "agent", Host: "native", Scenario: step.wire, Agents: step.readers, Editors: step.editors, Seed: int64(repeat), Duration: *offer, Deadline: *deadline, WarmTimeout: *warm, StopTimeout: *stop, SweepBudget: *sweep, SweepRepetitions: 1, smokeState: states[role], smokeMarkers: markers[role]}
+				o := runOptions{Binary: build.binary, GitSHA: build.sha, Manifest: *manifest, Scratch: *out, Output: filepath.Join(root, "report.json"), Profile: "agent", Host: "native", Scenario: step.wire, Agents: step.readers, Editors: step.editors, Seed: int64(repeat), Duration: *offer, Deadline: *deadline, WarmTimeout: *warm, StopTimeout: *stop, SweepBudget: *sweep, SweepRepetitions: 1, smokeState: states[role], smokeMarkers: markers[role]}
 				if step.wire == "read" {
 					o.PRSmokeDrain = *deadline
 				}
