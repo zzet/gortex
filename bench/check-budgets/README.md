@@ -354,19 +354,43 @@ minutes. The manual 15-repeat/21-operation sweep and three fresh query benchmark
 processes per build add paced calls and cold fixture indexing. This does not
 honestly establish the required 15-minute lane.
 
-The pointed runtime design to evaluate is three main/candidate repeat pairs
-using private warm base state, restoring identical pinned source/store state
-before each required phase and draining every call/probe before teardown.
-Preserve exact readback/output-mode correctness, all 21 sweep operations, warm
-restart and idle stop; edits must not contaminate a later phase's topology.
-Build/validate stores for their own binary/schema rather than blindly reusing
-main state with candidate. Warm ownership/restoration, actual 14-GB-host disk
-use, cold setup, phase drain and cleanup all count toward wall time.
-`bench/load` has no phased restoration contract yet; coordinate with its active
-owner before changing its runtime/client. Merely shortening windows or dropping
-probes is not this implementation. A reviewed smoke profile needs matching
-same-job controls and sufficient uncensored probes before 20-run and seeded
-regression trials.
+The first experiment should be an explicitly named **PR-only 20- or 30-second
+profile**, leaving nightly/release settings frozen. The issue does not mandate
+60/120-second PR windows. All five steps, 21 sweep operations, exact readback,
+absolute/deterministic thresholds, same-job repeats and counters remain required.
+A one-repeat sweep is already explicit in the load CLI and still executes every
+operation. No shorter profile reuses timing evidence from a different workload.
+
+An optimistic calculation makes the tradeoff reviewable, not accepted. Mean
+agent think is 3.5 seconds and mean burst is four calls. Assuming 0.4-second
+read-burst wall time, load16 offers about 492 calls in 30 seconds or 328 in 20.
+Assuming another 0.35 seconds for an edit acknowledgement **and indexed visibility**,
+edit4 yields about 28 edits/113 reads or 19 edits/75 reads. That visibility
+assumption is not the exact-file-readback target and is unmeasured; slower
+publication reduces these counts. A roughly ten-operation read mix means only
+about 11/7 source calls per edit report, making nearest-rank p99 effectively a
+maximum. Retain actual per-tool counts and measure adequacy/flake; the estimate
+cannot stand in for them. Sweep1 requires five to seven 3–5-call bursts, hence
+10–35 seconds of think time before call latency.
+
+For 30-second read/edit windows, an assumed 25-second sweep, 1.5-second restart
+and 3-second idle stop yield 537 seconds across six build/repeats. Thirty
+existing two-second settle periods add 60 seconds, leaving 303 of the 900-second
+budget for thirty cold starts, download/build, microbenchmarks, drain and logs.
+Twenty-second windows leave 423 seconds instead. Actual cold-index/publication
+cost and microbenchmark setup decide feasibility. If these do not fit, evaluate
+warm reuse/restoration then; do not first require a new restoration framework.
+
+Before changing the active owner's runtime, coordinate these exact touchpoints:
+`run.go`/`plan.go` for an explicit PR offered-window/drain profile and matching
+workload identity; `scenario.go` to stop offering calls while draining admitted
+calls to product deadlines (the current phase-end context instead censors them);
+exact readback/publication and idle-stop fixture observations; and sweep1
+configuration with complete inventory. Any drain/timeout is retained and counts
+in wall time. A reviewed profile must pass real sample/probe sufficiency and
+20-run/seeded trials. Stores, if later reused, must remain private, validated for
+their own binary/schema and restored to identical source topology; candidate
+cannot blindly reuse main state. No `bench/load` runtime/client is edited here.
 
 Keep performance outside `ci.yml` and on its specified ARM lane. Extra artifact
 production can still contend for hosted account concurrency, so rollout also
