@@ -27,11 +27,14 @@ func movePublicFactsComplete(record editProbeRecord) bool {
 		}
 		readbacks[readback.Kind] = true
 	}
+	return moveProbesComplete(record)
+}
+
+func moveProbesComplete(record editProbeRecord) bool {
+	if len(record.FirstCorrect) != 8 { return false }
 	for _, name := range []string{"source", "summary", "editing_context", "search_visible", "text", "callers", "call_chain", "old_source_absent"} {
 		first, present := record.FirstCorrect[name]
-		if !present || first.Value == nil {
-			return false
-		}
+		if !present || first.Value == nil { return false }
 	}
 	return true
 }
@@ -77,7 +80,7 @@ func (r *editProbeRuntime) collectMoveEvidence(ctx context.Context, s *editProbe
 			// functional completion, never an observed graph receipt or zero phases.
 			s.record.GraphTerminalBasis = "baseline_complete_public_move_facts_no_receipt_proof"
 		}
-		done := all && (!r.requireAccounting || accounting.State == "observed_move_windows_checks_pass" || refused || refs.ReferenceError != "")
+		done := moveProbesComplete(s.record) && (!r.requireAccounting || accounting.State == "observed_move_windows_checks_pass" || refused || refs.ReferenceError != "")
 		s.mu.Unlock()
 		if done {
 			return

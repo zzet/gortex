@@ -99,6 +99,7 @@ func TestMoveBaselinePublicCompletionNeverInventsReceiptOrMeasuredPhases(t *test
 	if movePublicFactsComplete(state.record) {
 		t.Fatal("incorrect public readback qualified baseline")
 	}
+	if !moveProbesComplete(state.record) { t.Fatal("failed immutable readback erased later probe evidence") }
 }
 
 func TestMoveRestoreUsesOnePublicBatchForBothOwnedFiles(t *testing.T) {
