@@ -1,7 +1,9 @@
 package graphview
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -85,5 +87,15 @@ func TestRegisteredCheckoutScopedLookupClassifiesUnreadableCatalog(t *testing.T)
 	_, _, err = RegisteredCheckoutForPath(t.Context(), store.Catalog(), "/registered/repo")
 	if CodeOf(err) != CodeCheckoutInaccessible {
 		t.Fatalf("unreadable checkout binding code=%q error=%v", CodeOf(err), err)
+	}
+}
+
+func TestRegisteredCheckoutScopedLookupRetainsCancellationCause(t *testing.T) {
+	store := openStackStore(t, "cancelled-registered-binding")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, _, err := RegisteredCheckoutForPath(ctx, store.Catalog(), "/registered/repo")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled registered lookup lost its cause: %v", err)
 	}
 }
