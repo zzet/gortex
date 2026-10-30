@@ -1,6 +1,10 @@
 package mcp
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -58,4 +62,63 @@ func TestBatchFileObservationStatusSeparatesWriterReturnFromDurableVerdict(t *te
 	foreign := transaction
 	foreign.TransactionID = "other"
 	require.Empty(t, s.batchFileObservationReferences(foreign))
+}
+
+func TestBatchFileObservationRealHandlerCommitAndFailedWriter(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		name := "commit"
+		if fail {
+			name = "failed-writer"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newAtomicBatchTestServer(t, mutationTestWatcher{})
+			s.ToolCallTimeout = -1
+			file := writeAtomicBatchFixture(t, t.TempDir(), "target.txt", "before\n")
+			transactionID := "file-observation-" + name
+			var insideWriter bool
+			s.batchWriteOverride = func(path string, content []byte, mode os.FileMode) error {
+				if insideWriter {
+					return durableAtomicWriteFile(path, content, mode)
+				}
+				value, ok := s.batchTransactions.Load(transactionID)
+				require.True(t, ok)
+				snapshot := value.(*batchTransactionState).snapshot()
+				refs := s.batchFileObservationReferences(snapshot)
+				require.Len(t, refs, 1)
+				status, _ := s.batchFileObservationPayload(t.Context(), refs[0].Receipt)
+				require.Equal(t, "in_flight", status["batch_disk_verdict"], "actual writer cannot certify the eventual durable verdict")
+				insideWriter = true
+				if fail {
+					return errors.New("deliberate forward writer failure")
+				}
+				return durableAtomicWriteFile(path, content, mode)
+			}
+			req := editOperationRequest("batch_edit", "")
+			req.Params.Arguments = map[string]any{"transaction_id": transactionID, "edits": []any{
+				map[string]any{"op": "edit_file", "path": file, "old_string": "before\n", "new_string": "after\n"},
+			}}
+			h := s.boundToolHandler(s.handleAtomicBatchEdit)
+			_, err := h(t.Context(), req)
+			require.NoError(t, err)
+			require.True(t, insideWriter)
+			value, _ := s.batchTransactions.Load(transactionID)
+			receipt := value.(*batchTransactionState).snapshot()
+			refs := s.batchFileObservationReferences(receipt)
+			require.Len(t, refs, 1)
+			status, _ := s.batchFileObservationPayload(t.Context(), refs[0].Receipt)
+			if fail {
+				require.Equal(t, "failed", status["batch_disk_verdict"])
+				require.NotContains(t, status, "publication_phases")
+				return
+			}
+			require.Equal(t, "committed", status["batch_disk_verdict"])
+			sum := sha256.Sum256([]byte("after\n"))
+			require.Equal(t, hex.EncodeToString(sum[:]), status["after_sha256"])
+			require.Equal(t, "after\n", readAtomicBatchFixture(t, file))
+			require.Equal(t, true, status["writer_return_observed"])
+			manifest, err := os.ReadFile(batchManifestPath(transactionID))
+			require.NoError(t, err)
+			require.NotContains(t, string(manifest), refs[0].Receipt, "timing is not durable transaction authority")
+		})
+	}
 }
