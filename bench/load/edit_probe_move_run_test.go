@@ -77,8 +77,10 @@ func TestMoveCollectorCannotBorrowForeignOrPendingRefusal(t *testing.T) {
 		t.Fatal("pending callback treated as terminal")
 	}
 	row["direct_reconcile_state"] = "unavailable_competing_commit"
- if moveOwnedRefusal(row, refs, file) { t.Fatal("missing late read-assisted route treated as irrevocable refusal") }
- row["read_assisted_reconcile_state"] = "unavailable_owner_bytes_or_acceptance"
+	if moveOwnedRefusal(row, refs, file) {
+		t.Fatal("missing late read-assisted route treated as irrevocable refusal")
+	}
+	row["read_assisted_reconcile_state"] = "unavailable_owner_bytes_or_acceptance"
 	if !moveOwnedRefusal(row, refs, file) {
 		t.Fatal("owned immutable refusal not retained")
 	}

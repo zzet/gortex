@@ -7,7 +7,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
- "strings"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,7 +74,12 @@ func TestMoveMeasurementUsesActualGoRelocationAndExplicitLanguageRefusal(t *test
 			// probes: suggestions share the line after an exact ID boundary.
 			oldWire, marshalErr := json.Marshal(oldSource)
 			require.NoError(t, marshalErr)
-			var oldEnvelope struct { Content []struct { Type string `json:"type"`; Text string `json:"text"` } `json:"content"` }
+			var oldEnvelope struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			}
 			require.NoError(t, json.Unmarshal(oldWire, &oldEnvelope))
 			require.Len(t, oldEnvelope.Content, 1)
 			require.Equal(t, "text", oldEnvelope.Content[0].Type)

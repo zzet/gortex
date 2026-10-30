@@ -46,9 +46,9 @@ func moveProbesComplete(record editProbeRecord) bool {
 // Only the original, exactly identified per-file owner can freeze a terminal
 // refusal. Missing/foreign rows and late pending callbacks remain collecting.
 func moveOwnedRefusal(row map[string]any, refs editProbeMoveReferences, file editProbeMoveFileReference) bool {
- direct, _ := row["direct_reconcile_state"].(string)
- repair, _ := row["read_assisted_reconcile_state"].(string)
- immutable := direct == "observed" || repair == "observed" || strings.HasPrefix(direct, "unavailable_") && strings.HasPrefix(repair, "unavailable_")
+	direct, _ := row["direct_reconcile_state"].(string)
+	repair, _ := row["read_assisted_reconcile_state"].(string)
+	immutable := direct == "observed" || repair == "observed" || strings.HasPrefix(direct, "unavailable_") && strings.HasPrefix(repair, "unavailable_")
 	return row["found"] == true && row["receipt_kind"] == "move_file_observation" && row["receipt"] == file.Receipt && row["operation_id"] == refs.OperationID && row["source_id"] == refs.SourceID && row["target_id"] == refs.TargetID && row["path"] == file.Path && row["role"] == file.Role && immutable
 }
 

@@ -2,10 +2,10 @@ package main
 
 import (
 	"encoding/hex"
- "encoding/json"
- "math/big"
+	"encoding/json"
 	"errors"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
 )
@@ -103,8 +103,8 @@ type editProbeMoveFileAccounting struct {
 	WriteReturnedNS *int64           `json:"write_returned_ns"`
 	WriteWindowNS   *int64           `json:"write_window_ns"`
 	D               *editProbeWindow `json:"direct_reconcile,omitempty"`
- R *editProbeWindow `json:"read_assisted_reconcile,omitempty"`
- Route string `json:"publication_route,omitempty"`
+	R               *editProbeWindow `json:"read_assisted_reconcile,omitempty"`
+	Route           string           `json:"publication_route,omitempty"`
 }
 type editProbeMoveAccounting struct {
 	State   string                        `json:"state"`
@@ -201,60 +201,96 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 			file.WriteStartedNS, file.WriteReturnedNS, file.WriteWindowNS = &start, &returned, &wall
 		}
 		route, scope := "direct_reconcile", "move_direct_reconcile"
-  coalesced := row["direct_reconcile_state"] == "observed" && row["read_assisted_reconcile_state"] == "observed"
-  var directView map[string]any
-  if row["read_assisted_reconcile_state"] == "observed" { route, scope = "read_assisted_reconcile", "move_read_assisted_reconcile" }
-  if coalesced {
-   directView, _ = row["direct_reconcile"].(map[string]any)
-   repairView, _ := row["read_assisted_reconcile"].(map[string]any)
-   directPhases, _ := directView["phase_accounting"].(map[string]any)
-   if directView["scope"] != "move_direct_reconcile" || directPhases["scope"] != "move_direct_reconcile" || !moveSameExecution(directView, repairView) { fail("conflicting observed move publication routes") }
-  }
-  file.Route = route
-  if coalesced { file.Route = "coalesced_direct_and_read_assisted" }
-  direct, _ := row[route].(map[string]any)
+		coalesced := row["direct_reconcile_state"] == "observed" && row["read_assisted_reconcile_state"] == "observed"
+		var directView map[string]any
+		if row["read_assisted_reconcile_state"] == "observed" {
+			route, scope = "read_assisted_reconcile", "move_read_assisted_reconcile"
+		}
+		if coalesced {
+			directView, _ = row["direct_reconcile"].(map[string]any)
+			repairView, _ := row["read_assisted_reconcile"].(map[string]any)
+			directPhases, _ := directView["phase_accounting"].(map[string]any)
+			if directView["scope"] != "move_direct_reconcile" || directPhases["scope"] != "move_direct_reconcile" || !moveSameExecution(directView, repairView) {
+				fail("conflicting observed move publication routes")
+			}
+		}
+		file.Route = route
+		if coalesced {
+			file.Route = "coalesced_direct_and_read_assisted"
+		}
+		direct, _ := row[route].(map[string]any)
 		owner, oe := strconvEditProbeUint(direct["owner_generation"])
 		dwall, de := moveBoundedNS(direct["window_ns"])
 		toAcceptance, ae := moveBoundedNS(direct["writer_return_to_acceptance_ns"])
 		if row[route+"_state"] != "observed" || direct["scope"] != scope || direct["clock"] != "monotonic" || direct["accepted_blob_sha"] != blob || direct["additive_with_acknowledgement"] != false || oe != nil || owner == 0 || de != nil || dwall <= 0 || ae != nil {
 			fail("move actual accepted owner/window unavailable")
 		}
-  if out.A != nil && returned > out.A.WallNS { fail("move write exceeds actual acknowledgement bounds") }
-  if !movePublicationEndpoints(direct, route, dwall, returned, toAcceptance, out.A) { fail("move actual acceptance/write/window endpoints disagree") }
-  if coalesced && !movePublicationEndpoints(directView, "direct_reconcile", dwall, returned, toAcceptance, out.A) { fail("coalesced direct work exceeds acknowledgement bounds") }
+		if out.A != nil && returned > out.A.WallNS {
+			fail("move write exceeds actual acknowledgement bounds")
+		}
+		if !movePublicationEndpoints(direct, route, dwall, returned, toAcceptance, out.A) {
+			fail("move actual acceptance/write/window endpoints disagree")
+		}
+		if coalesced && !movePublicationEndpoints(directView, "direct_reconcile", dwall, returned, toAcceptance, out.A) {
+			fail("coalesced direct work exceeds acknowledgement bounds")
+		}
 		file.OwnerGeneration = owner
-  original, _ := row["move_request_cause"].(map[string]any)
-  originalSession, _ := original["session"].(string)
-  originalKey, _ := original["request_id_key"].(string)
-  if originalSession == "" || originalKey != "n:"+strconv.FormatInt(wireID,10) { fail("original move wire cause unavailable") }
-  if session == "" { session = originalSession } else if session != originalSession { fail("move per-file original causes came from different sessions") }
-  request, _ := direct["request_cause"].(map[string]any)
-  requestSession, _ := request["session"].(string)
-  requestKey, _ := request["request_id_key"].(string)
-  requestGeneration, rge := strconvEditProbeUint(request["admission_generation"])
-  if requestSession == "" || requestKey == "" || rge != nil || requestGeneration == 0 { fail("actual move publication request cause unavailable") }
-  sameRequest := requestSession == originalSession && requestKey == originalKey
-  if route == "direct_reconcile" && !sameRequest || route == "read_assisted_reconcile" && sameRequest { fail("move publication route/request cause mismatch") }
+		original, _ := row["move_request_cause"].(map[string]any)
+		originalSession, _ := original["session"].(string)
+		originalKey, _ := original["request_id_key"].(string)
+		if originalSession == "" || originalKey != "n:"+strconv.FormatInt(wireID, 10) {
+			fail("original move wire cause unavailable")
+		}
+		if session == "" {
+			session = originalSession
+		} else if session != originalSession {
+			fail("move per-file original causes came from different sessions")
+		}
+		request, _ := direct["request_cause"].(map[string]any)
+		requestSession, _ := request["session"].(string)
+		requestKey, _ := request["request_id_key"].(string)
+		requestGeneration, rge := strconvEditProbeUint(request["admission_generation"])
+		if requestSession == "" || requestKey == "" || rge != nil || requestGeneration == 0 {
+			fail("actual move publication request cause unavailable")
+		}
+		sameRequest := requestSession == originalSession && requestKey == originalKey
+		if route == "direct_reconcile" && !sameRequest || route == "read_assisted_reconcile" && sameRequest {
+			fail("move publication route/request cause mismatch")
+		}
 		causes, _ := direct["reconcile_causes"].([]any)
 		matchedCause := false
-  matchedDirect := !coalesced
-  directRequest, _ := directView["request_cause"].(map[string]any)
-  directGeneration, dge := strconvEditProbeUint(directRequest["admission_generation"])
-  if coalesced && (directRequest["session"] != originalSession || directRequest["request_id_key"] != originalKey || dge != nil || directGeneration == 0) { fail("coalesced direct cause does not match original move") }
+		matchedDirect := !coalesced
+		directRequest, _ := directView["request_cause"].(map[string]any)
+		directGeneration, dge := strconvEditProbeUint(directRequest["admission_generation"])
+		if coalesced && (directRequest["session"] != originalSession || directRequest["request_id_key"] != originalKey || dge != nil || directGeneration == 0) {
+			fail("coalesced direct cause does not match original move")
+		}
 		seen := map[uint64]bool{}
-		if len(causes) == 0 || len(causes) > 8 { fail("move actual reconcile causes unavailable") }
+		if len(causes) == 0 || len(causes) > 8 {
+			fail("move actual reconcile causes unavailable")
+		}
 		for _, raw := range causes {
 			cause, _ := raw.(map[string]any)
 			generation, ge := strconvEditProbeUint(cause["admission_generation"])
 			s, _ := cause["session"].(string)
 			key, _ := cause["request_id_key"].(string)
-			if ge != nil || generation == 0 || generation > owner || seen[generation] || s == "" || key == "" { fail("invalid move reconcile cause") }
+			if ge != nil || generation == 0 || generation > owner || seen[generation] || s == "" || key == "" {
+				fail("invalid move reconcile cause")
+			}
 			seen[generation] = true
-   if s == requestSession && key == requestKey && generation == requestGeneration { matchedCause = true }
-   if coalesced && s == originalSession && key == originalKey && generation == directGeneration { matchedDirect = true }
+			if s == requestSession && key == requestKey && generation == requestGeneration {
+				matchedCause = true
+			}
+			if coalesced && s == originalSession && key == originalKey && generation == directGeneration {
+				matchedDirect = true
+			}
 		}
-		if !matchedCause { fail("move actual request cause not retained") }
-  if !matchedDirect { fail("coalesced original direct cause not retained") }
+		if !matchedCause {
+			fail("move actual request cause not retained")
+		}
+		if !matchedDirect {
+			fail("coalesced original direct cause not retained")
+		}
 		accounting, _ := direct["phase_accounting"].(map[string]any)
 		phaseOwner, poe := strconvEditProbeUint(accounting["owner_generation"])
 		phaseWall, pwe := moveBoundedNS(accounting["window_ns"])
@@ -274,7 +310,11 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 		if err != nil || d.ResidualNS != 0 || sue != nil || subtotal != d.SumNS || rse != nil || residual != 0 {
 			fail("move publication partition disagrees with actual window")
 		} else if len(out.Reasons) == fileReasonsBegin {
-			if route == "direct_reconcile" { file.D = &d } else { file.R = &d }
+			if route == "direct_reconcile" {
+				file.D = &d
+			} else {
+				file.R = &d
+			}
 		}
 		out.Files = append(out.Files, file)
 	}
@@ -302,43 +342,57 @@ func (r editProbeMoveReferences) validateReferences() error {
 }
 
 func moveSignedNS(value any) (int64, error) {
- switch n := value.(type) {
- case json.Number: return strconv.ParseInt(string(n), 10, 64)
- case int64: return n, nil
- case int: return int64(n), nil
- default: return 0, errors.New("missing/invalid signed monotonic nanoseconds")
- }
+	switch n := value.(type) {
+	case json.Number:
+		return strconv.ParseInt(string(n), 10, 64)
+	case int64:
+		return n, nil
+	case int:
+		return int64(n), nil
+	default:
+		return 0, errors.New("missing/invalid signed monotonic nanoseconds")
+	}
 }
 
 // The independent reader window need not begin at the move RPC. Compare exact
 // signed offsets without overflow, retain its full window, and bind actual
 // acceptance to the original file writer return. Direct work stays inside A.
 func movePublicationEndpoints(observed map[string]any, route string, wall, returned, writerToAcceptance int64, ack *editProbeWindow) bool {
- start, se := moveSignedNS(observed["started_from_ack_ns"])
- end, ee := moveSignedNS(observed["finished_from_ack_ns"])
- accepted, ae := moveBoundedNS(observed["accepted_from_start_ns"])
- if se != nil || ee != nil || ae != nil || wall <= 0 || accepted > wall { return false }
- difference := new(big.Int).Sub(big.NewInt(end), big.NewInt(start))
- actual := new(big.Int).Add(big.NewInt(start), big.NewInt(accepted))
- written := new(big.Int).Add(big.NewInt(returned), big.NewInt(writerToAcceptance))
- if difference.Cmp(big.NewInt(wall)) != 0 || !actual.IsInt64() || actual.Cmp(written) != 0 { return false }
- return route == "read_assisted_reconcile" || ack != nil && start >= 0 && end <= ack.WallNS
+	start, se := moveSignedNS(observed["started_from_ack_ns"])
+	end, ee := moveSignedNS(observed["finished_from_ack_ns"])
+	accepted, ae := moveBoundedNS(observed["accepted_from_start_ns"])
+	if se != nil || ee != nil || ae != nil || wall <= 0 || accepted > wall {
+		return false
+	}
+	difference := new(big.Int).Sub(big.NewInt(end), big.NewInt(start))
+	actual := new(big.Int).Add(big.NewInt(start), big.NewInt(accepted))
+	written := new(big.Int).Add(big.NewInt(returned), big.NewInt(writerToAcceptance))
+	if difference.Cmp(big.NewInt(wall)) != 0 || !actual.IsInt64() || actual.Cmp(written) != 0 {
+		return false
+	}
+	return route == "read_assisted_reconcile" || ack != nil && start >= 0 && end <= ack.WallNS
 }
 
 // Two admitted requests can witness one coordinator execution. Compare the
 // immutable execution facts (not route labels/request-specific admission) and
 // count that window once; differing owners, clocks, bytes or phases refuse.
 func moveSameExecution(direct, repair map[string]any) bool {
- identity := func(row map[string]any) map[string]any {
-  out := make(map[string]any)
-  for _, key := range []string{"clock", "owner_generation", "window_ns", "accepted_blob_sha", "writer_return_to_acceptance_ns", "started_from_ack_ns", "finished_from_ack_ns", "accepted_from_start_ns", "additive_with_acknowledgement", "reconcile_causes"} { out[key] = row[key] }
-  phases, _ := row["phase_accounting"].(map[string]any)
-  phaseCopy := make(map[string]any, len(phases))
-  for key, value := range phases { if key != "scope" { phaseCopy[key] = value } }
-  out["phase_accounting"] = phaseCopy
-  return out
- }
- a, ae := hashJSON(identity(direct))
- b, be := hashJSON(identity(repair))
- return ae == nil && be == nil && a == b
+	identity := func(row map[string]any) map[string]any {
+		out := make(map[string]any)
+		for _, key := range []string{"clock", "owner_generation", "window_ns", "accepted_blob_sha", "writer_return_to_acceptance_ns", "started_from_ack_ns", "finished_from_ack_ns", "accepted_from_start_ns", "additive_with_acknowledgement", "reconcile_causes"} {
+			out[key] = row[key]
+		}
+		phases, _ := row["phase_accounting"].(map[string]any)
+		phaseCopy := make(map[string]any, len(phases))
+		for key, value := range phases {
+			if key != "scope" {
+				phaseCopy[key] = value
+			}
+		}
+		out["phase_accounting"] = phaseCopy
+		return out
+	}
+	a, ae := hashJSON(identity(direct))
+	b, be := hashJSON(identity(repair))
+	return ae == nil && be == nil && a == b
 }
