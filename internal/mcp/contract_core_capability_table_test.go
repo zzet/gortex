@@ -192,7 +192,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"CrossRepoEdgeAggregator", capOf[graph.CrossRepoEdgeAggregator], capDropped, capReasonEdges},
 		{"ExtractCandidatesScanner", capOf[graph.ExtractCandidatesScanner], capDropped, capReasonEdges},
 		{"FileImportAggregator", capOf[graph.FileImportAggregator], capDropped, capReasonEdges},
-		{"ScopedOutlineNodeReader", capOf[graph.ScopedOutlineNodeReader], capSelected, "node-only membership and scoped exact-name reads retain selected-view visibility"},
+		{"ScopedOutlineNodeReader", capOf[graph.ScopedOutlineNodeReader], capWrapper, "node-only membership and scoped exact-name reads retain selected-view visibility"},
 		{"ScopedOutlineAggregator", capOf[graph.ScopedOutlineAggregator], capDropped, capReasonEdges + " (scopedOutlineCountsFor uses the private filtered adapter instead)"},
 		{"FilteredScopedOutlineAggregator", capOf[graph.FilteredScopedOutlineAggregator], capDropped, "served only by the private outline adapter, which supplies this wrapper's exact exclusions"},
 		{"FileImporters", capOf[graph.FileImporters], capDropped, capReasonEdges},

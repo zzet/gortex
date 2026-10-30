@@ -85,7 +85,7 @@ func (s *Server) buildRepoOutline(ctx context.Context, reader graph.Reader, opts
 	}
 	reader = graph.BindReadContext(reader, ctx)
 
-	scopedNodes, _ := graph.BindReadContext(contractCoreSelectedReader(reader), ctx).(graph.ScopedOutlineNodeReader)
+	scopedNodes, _ := graph.BindReadContext(reader, ctx).(graph.ScopedOutlineNodeReader)
 	var candidateErr error
 
 	var scoped []*graph.Node

@@ -1162,7 +1162,7 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 			return nil
 		}
 		findNameStart := time.Now()
-		nameMatches, err := graph.FindNodesByNameContext(ctx, e.g, query)
+		nameMatches, err := graph.FindNodesByNameScopedContext(ctx, e.g, query, graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow})
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil
 		}
