@@ -133,7 +133,8 @@ go run ./bench/check-budgets plan --config reviewed-lane.json
 # Run supported observations and retain every failure. The full policy still
 # fails when a mandatory fixture/metric is unavailable; this is not a subset pass.
 go run ./bench/check-budgets collect --config reviewed-lane.json --out NEW-evidence-dir
-go run ./bench/release-gate --config reviewed-release.json --out NEW-release-dir
+go build -o /benchmark/bin/release-gate ./bench/release-gate
+/benchmark/bin/release-gate --config reviewed-release.json --out /benchmark/NEW-release-dir
 
 # Inspect downloaded scheduled-main artifacts, replay all passing raw reports,
 # require five actual adjacent UTC dates, and flag two-night row misses.
@@ -141,8 +142,15 @@ go run ./bench/check-budgets history --inputs downloaded-nightlies.json \
   --through 2026-10-30 --hosts reference_linux
 ```
 
-The release entry point invokes the Go tool from `PATH`; select the repository's
-pinned toolchain there and use `GOTOOLCHAIN=local` for a reproducible invocation.
+Build the release entry before invoking it so a supervisor can address its PID
+directly, without an outer `go run` process. It invokes the Go tool from `PATH`
+to compile the checker into a fresh owned temporary directory before workloads;
+select the repository's pinned toolchain there and use `GOTOOLCHAIN=local`.
+Once workloads can exist, it launches the compiled collector directly. SIGTERM
+or Interrupt sent only to the entry PID is forwarded to that collector, and
+the entry waits for its cleanup and retained stop receipts before exiting.
+The temporary binary is then removed; evidence is preserved. Compilation counts
+toward the same release start time, cleanup reserve and wall-time receipt.
 
 `downloaded-nightlies.json` is an array of retained artifact-directory paths,
 relative to that index or absolute. Review their run provenance before use:

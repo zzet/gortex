@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fixtureLaneConfig() laneConfig {
@@ -194,5 +195,46 @@ func TestCollectorRetainsFailedRepetitionsAndContinues(t *testing.T) {
 	}
 	if err := validateLaneOutput(c.Manifest, filepath.Join(link, "evidence")); err == nil {
 		t.Fatal("symlink bypassed read-only source protection")
+	}
+}
+
+func TestReleaseReceiptIncludesEntryBuildTimeAndReserve(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	c := fixtureLaneConfig()
+	c.Lane = "release"
+	c.Manifest = filepath.Join(parent, "manifest.json")
+	c.started = time.Now().Add(-8 * time.Hour)
+	if err := writeNewJSON(c.Manifest, []map[string]any{{"label": "gortex", "source": source, "commit": strings.Repeat("c", 40)}}); err != nil {
+		t.Fatal(err)
+	}
+	p := testPolicy()
+	p.Budgets = []budget{{Metric: "read_p95", Scenario: "load-1", HostClass: c.HostClass, Mode: "block", Target: pointer(1), Unit: "s", Compare: "le", Lane: []string{"release"}}}
+	plan, err := makeLanePlan(p, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	fake := func(context.Context, string, []string, io.Writer) error { calls++; return nil }
+	out := filepath.Join(parent, "evidence")
+	if err := collectLane(context.Background(), c, p, plan, out, io.Discard, fake); err == nil {
+		t.Fatal("already elapsed entry deadline passed")
+	}
+	if calls != 0 {
+		t.Fatal("started workloads after entry cleanup deadline")
+	}
+	data, err := os.ReadFile(filepath.Join(out, "lane.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt laneReceipt
+	if err := json.Unmarshal(data, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if !receipt.Started.Equal(c.started) || receipt.WallSeconds < 8*time.Hour.Seconds() || !strings.Contains(receipt.Error, "exceeded eight hours") {
+		t.Fatalf("entry build time missing from receipt: %+v", receipt)
 	}
 }

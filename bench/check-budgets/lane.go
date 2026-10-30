@@ -52,6 +52,7 @@ type laneConfig struct {
 	StopTimeout      string               `json:"stop_timeout"`
 	SweepDuration    string               `json:"sweep_duration"`
 	SweepRepetitions int                  `json:"sweep_repetitions"`
+	started          time.Time
 }
 
 type laneTask struct {
@@ -220,6 +221,7 @@ func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
 	candidate := f.String("candidate-binary", "", "fresh workflow-built candidate binary; requires --expected-candidate")
 	loadBinary := f.String("load-binary", "", "fresh workflow-built load client")
 	requireLane := f.String("require-lane", "", "refuse config for any other lane")
+	releaseStarted := f.String("release-started", "", "release entry RFC3339 start, including its compilation time")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -248,6 +250,13 @@ func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
 	if *requireLane != "" && c.Lane != *requireLane {
 		fmt.Fprintln(stderr, "configuration selects the wrong required lane")
 		return 1
+	}
+	if *releaseStarted != "" {
+		c.started, err = time.Parse(time.RFC3339Nano, *releaseStarted)
+		if err != nil || c.Lane != "release" || c.started.After(time.Now()) {
+			fmt.Fprintln(stderr, "release start must be a valid nonfuture timestamp in the release lane")
+			return 2
+		}
 	}
 	if *candidate != "" {
 		if !revisionPattern.MatchString(*expected) {
@@ -395,6 +404,9 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 		return err
 	}
 	receipt := laneReceipt{Version: 1, Plan: plan, Started: time.Now().UTC(), Tasks: []taskReceipt{}}
+	if !c.started.IsZero() {
+		receipt.Started = c.started
+	}
 	receipt.Workflow = workflowProvenance{Event: os.Getenv("GITHUB_EVENT_NAME"), Ref: os.Getenv("GITHUB_REF"), Revision: c.Builds["candidate"].Revision}
 	if server, repo, id := os.Getenv("GITHUB_SERVER_URL"), os.Getenv("GITHUB_REPOSITORY"), os.Getenv("GITHUB_RUN_ID"); server != "" && repo != "" && id != "" {
 		receipt.Workflow.RunURL = server + "/" + repo + "/actions/runs/" + id
@@ -407,7 +419,7 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 	// This interrupts the signal-aware load client; it never hard-kills it.
 	if c.Lane == "release" {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 8*time.Hour-3*time.Minute)
+		ctx, cancel = context.WithDeadline(ctx, receipt.Started.Add(8*time.Hour-3*time.Minute))
 		defer cancel()
 	}
 	for _, task := range plan.Tasks {
