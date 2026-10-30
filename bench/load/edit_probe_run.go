@@ -355,7 +355,7 @@ func (c *editProbeCaller) call(ctx context.Context, method string, params any) (
 			err = expected
 		}
 	}
-	row := map[string]any{"event": "rpc", "purpose": c.purpose, "tool": c.request.name(), "wire_id": identity.ID, "call_start_ns": editProbeOffset(identity.Started, c.runtime.origin), "write_start_ns": editProbeOffset(identity.WriteStarted, c.runtime.origin), "write_end_ns": editProbeOffset(identity.WriteFinished, c.runtime.origin), "reply_delivered_ns": editProbeOffset(identity.ReplyDelivered, c.runtime.origin), "call_end_ns": editProbeOffset(identity.Finished, c.runtime.origin), "payload": data}
+	row := map[string]any{"event": "rpc", "purpose": c.purpose, "tool": c.request.name(), "wire_id": identity.ID, "call_start_ns": editProbeOffset(identity.Started, c.runtime.origin), "write_start_ns": editProbeOffset(identity.WriteStarted, c.runtime.origin), "write_end_ns": editProbeOffset(identity.WriteFinished, c.runtime.origin), "reply_delivered_ns": editProbeOffset(identity.ReplyDelivered, c.runtime.origin), "call_end_ns": editProbeOffset(identity.Finished, c.runtime.origin), "output_mode": editProbeRequestOutput(c.request), "payload": data}
 	if err != nil {
 		row["error"] = err.Error()
 		if expected, ok := err.(*editProbeExpectedAbsence); ok {
@@ -864,7 +864,7 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 		}
 		changes = append(changes, map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + destination, "old_string": string(currentDestination), "new_string": string(r.moveOriginal)})
 	}
-	req := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "changes": changes, "options": map[string]any{"transaction_id": fmt.Sprintf("load-restore-%016x", uint64(r.options.Seed))}}}
+	req := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "changes": changes, "options": map[string]any{"transaction_id": fmt.Sprintf("load-restore-%016x", uint64(r.options.Seed))}, "output": map[string]any{"format": "json", "max_bytes": 0}}}
 	start := time.Now()
 	data, _, err := callEditProbeTool(ctx, r.editor, req, req.Arguments, "cleanup", 0, len(r.states), 0, r.options.Deadline, editProbeRetrySleep(r.options.Seed, len(r.states), 0))
 	r.phase.EditProbe.RestoreMS = measured(float64(time.Since(start))/float64(time.Millisecond), "ms")

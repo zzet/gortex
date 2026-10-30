@@ -171,3 +171,11 @@ func TestEditProbeTOONCensusKeepsOmittedCountsUnavailable(t *testing.T) {
 		})
 	}
 }
+
+func TestEditProbeTOONSignatureDoesNotBorrowMissingJSONMetadata(t *testing.T) {
+	c := editProbeCorpus()
+	c.EditOutput, c.EditKind = "toon", "change_signature"
+	if _, err := makeEditProbePlan(c, 42, 1); err == nil {
+		t.Fatal("missing TOON span/signature proof silently accepted")
+	}
+}

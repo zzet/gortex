@@ -79,6 +79,9 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		return editProbePlan{}, errors.New("unsupported edit kind")
 	}
 
+	if mode == "toon" && kind == "change_signature" {
+		return editProbePlan{}, errors.New("TOON signature fixture needs producer-backed graph span/signature evidence; cell not supported yet")
+	}
 	if kind != "relocate" && (c.EditDestination != "" || c.EditDestinationContent != "") {
 		return editProbePlan{}, errors.New("edit_destination applies only to the explicit move fixture")
 	}
