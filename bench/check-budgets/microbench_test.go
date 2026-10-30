@@ -57,6 +57,8 @@ func syntheticMicroConfig(t *testing.T) microConfig {
 	run("add", "fixture.go")
 	run("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "synthetic fixture")
 	c := microConfig{Version: 1, MainRevision: strings.Repeat("a", 40), CandidateRevision: strings.Repeat("b", 40), Fixture: fixture, FixtureRevision: run("rev-parse", "HEAD"), Benchstat: "/synthetic/benchstat", Benchtime: "1x", Timeout: "1m", Repeats: 3, Binaries: map[string]microPair{}}
+	c.MainBundle = "/synthetic/main-bundle"
+	c.CandidateBuilds = "/synthetic/candidate-builds"
 	for _, pkg := range microPackages {
 		c.Binaries[pkg] = microPair{Main: "/synthetic/main-" + strings.ReplaceAll(pkg, "/", "-"), Candidate: "/synthetic/candidate-" + strings.ReplaceAll(pkg, "/", "-")}
 	}

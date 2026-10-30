@@ -169,13 +169,14 @@ func setupMicroCommand(command string, args []string, stdout, stderr io.Writer) 
 	f.SetOutput(stderr)
 	out := f.String("out", "", "NEW owned external setup directory")
 	revision := f.String("revision", "", "full reviewed fixture revision")
+	source := f.String("source", ".", "clean source checkout for prepared test executables")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
-	if *out == "" || f.NArg() != 0 || command == "prepare-fixture" && !revisionPattern.MatchString(*revision) {
+	if *out == "" || f.NArg() != 0 || (command == "prepare-fixture" || command == "prepare-tests") && !revisionPattern.MatchString(*revision) {
 		fmt.Fprintln(stderr, "setup requires --out; fixture also requires explicit full --revision")
 		return 2
 	}
@@ -187,6 +188,8 @@ func setupMicroCommand(command string, args []string, stdout, stderr io.Writer) 
 	var err error
 	if command == "prepare-fixture" {
 		err = prepareFixture(ctx, *revision, output, executeMicroProcess)
+	} else if command == "prepare-tests" {
+		err = prepareTestBinaries(ctx, pathAbsolute(*source), *revision, output, executeMicroProcess)
 	} else {
 		err = prepareBenchstat(ctx, output, executeMicroProcess)
 	}

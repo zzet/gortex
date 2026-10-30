@@ -34,6 +34,8 @@ type microConfig struct {
 	Version           int                  `json:"schema_version"`
 	MainRevision      string               `json:"main_revision"`
 	CandidateRevision string               `json:"candidate_revision"`
+	MainBundle        string               `json:"main_bundle"`
+	CandidateBuilds   string               `json:"candidate_builds"`
 	Fixture           string               `json:"fixture"`
 	FixtureRevision   string               `json:"fixture_revision"`
 	Benchstat         string               `json:"benchstat_binary"`
@@ -53,18 +55,18 @@ type microRun struct {
 	DeadlineExceeded    bool      `json:"deadline_exceeded"`
 }
 type microReceipt struct {
-	Version          int                                `json:"schema_version"`
-	Workflow         workflowProvenance                 `json:"workflow"`
-	Machine          string                             `json:"machine"`
-	OS               string                             `json:"os"`
-	Arch             string                             `json:"arch"`
-	GOMAXPROCS       int                                `json:"gomaxprocs"`
-	Config           microConfig                        `json:"config"`
-	Builds           map[string]map[string]mainArtifact `json:"builds"`
-	Runs             []microRun                         `json:"runs"`
-	Complete         bool                               `json:"complete"`
-	FormalAcceptance bool                               `json:"formal_acceptance"`
-	Error            string                             `json:"error,omitempty"`
+	Version          int                                         `json:"schema_version"`
+	Workflow         workflowProvenance                          `json:"workflow"`
+	Machine          string                                      `json:"machine"`
+	OS               string                                      `json:"os"`
+	Arch             string                                      `json:"arch"`
+	GOMAXPROCS       int                                         `json:"gomaxprocs"`
+	Config           microConfig                                 `json:"config"`
+	Builds           map[string]map[string]executableObservation `json:"builds"`
+	Runs             []microRun                                  `json:"runs"`
+	Complete         bool                                        `json:"complete"`
+	FormalAcceptance bool                                        `json:"formal_acceptance"`
+	Error            string                                      `json:"error,omitempty"`
 }
 
 type microProcess func(context.Context, string, []string, string, []string) ([]byte, []byte, error)
@@ -82,7 +84,7 @@ func executeMicroProcess(ctx context.Context, binary string, args []string, cwd 
 }
 
 func validateMicroConfig(c microConfig) error {
-	if c.Version != 1 || !revisionPattern.MatchString(c.MainRevision) || !revisionPattern.MatchString(c.CandidateRevision) || !revisionPattern.MatchString(c.FixtureRevision) || c.Fixture == "" || c.Benchstat == "" || c.Repeats < 3 || c.Repeats > 20 || len(c.Binaries) != len(microPackages) {
+	if c.Version != 1 || !revisionPattern.MatchString(c.MainRevision) || !revisionPattern.MatchString(c.CandidateRevision) || !revisionPattern.MatchString(c.FixtureRevision) || c.MainBundle == "" || c.CandidateBuilds == "" || c.Fixture == "" || c.Benchstat == "" || c.Repeats < 3 || c.Repeats > 20 || len(c.Binaries) != len(microPackages) {
 		return errors.New("microbench requires pinned builds/fixture, explicit tool/profile, >=3 repeats and exactly the existing three CI packages")
 	}
 	if duration, err := time.ParseDuration(c.Timeout); err != nil || duration <= 0 {
@@ -183,7 +185,7 @@ func validateMicroFixture(c microConfig, out string) error {
 	return nil
 }
 
-func collectMicrobench(ctx context.Context, c microConfig, out string, workflow workflowProvenance, builds map[string]map[string]mainArtifact, process microProcess) error {
+func collectMicrobench(ctx context.Context, c microConfig, out string, workflow workflowProvenance, builds map[string]map[string]executableObservation, process microProcess) error {
 	if err := os.Mkdir(out, 0o700); err != nil {
 		return err
 	}
@@ -310,6 +312,7 @@ func microbenchCommand(args []string, stdout, stderr io.Writer) int {
 		return filepath.Join(base, path)
 	}
 	c.Fixture, c.Benchstat = resolve(c.Fixture), resolve(c.Benchstat)
+	c.MainBundle, c.CandidateBuilds = resolve(c.MainBundle), resolve(c.CandidateBuilds)
 	for pkg, pair := range c.Binaries {
 		pair.Main, pair.Candidate = resolve(pair.Main), resolve(pair.Candidate)
 		c.Binaries[pkg] = pair
@@ -329,22 +332,9 @@ func microbenchCommand(args []string, stdout, stderr io.Writer) int {
 	if err == nil && (os.Getenv("GITHUB_ACTIONS") != "true" || os.Getenv("GITHUB_SHA") != c.CandidateRevision) {
 		err = errors.New("microbench requires the current owned PR job identity")
 	}
-	builds := map[string]map[string]mainArtifact{}
+	var builds map[string]map[string]executableObservation
 	if err == nil {
-		for _, pkg := range microPackages {
-			pair := c.Binaries[pkg]
-			main, mainErr := inspectBinaryArtifact(pair.Main, "github.com/zzet/gortex/"+pkg+".test")
-			candidate, candidateErr := inspectBinaryArtifact(pair.Candidate, "github.com/zzet/gortex/"+pkg+".test")
-			if mainErr != nil || candidateErr != nil {
-				err = errors.Join(mainErr, candidateErr)
-				break
-			}
-			if main.Revision != c.MainRevision || candidate.Revision != c.CandidateRevision || !sameBuildSettings(main, candidate) || main.OS != runtime.GOOS || main.Arch != runtime.GOARCH {
-				err = errors.New("microbenchmark binaries lack matching pinned revisions/build/platform identities")
-				break
-			}
-			builds[pkg] = map[string]mainArtifact{"main": main, "candidate": candidate}
-		}
+		builds, err = admitMicroBundle(c, workflow)
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, err)

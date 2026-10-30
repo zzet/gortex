@@ -272,8 +272,8 @@ disabled, not to attach to an unrelated active session.
 
 `perf-main.yml` is an opt-in build-only producer, separate from CI tests and
 measurement jobs. `PERF_MAIN_ARTIFACT_ENABLED` remains unset. Its trusted main
-push binds a clean daemon's full VCS SHA, pinned Go/C/C++ flags, platform,
-workflow run/attempt and binary hash in a two-file bundle. No build-host timing
+push binds clean daemon/test binaries and the pinned tool to full VCS SHA,
+Go/C/C++ flags, platform, workflow run/attempt and individual hashes. No build-host timing
 is compared with PR measurements. Current retained artifacts have no usable
 main daemon or benchmark bundle; publishing the first reviewed exact-main
 artifact remains required.
@@ -326,7 +326,8 @@ clean test-binary VCS/build identity is present.
 
 The strict JSON input fields are `schema_version:1`, `main_revision`,
 `candidate_revision`, `fixture`, `fixture_revision`, `benchstat_binary`,
-`benchtime`, `timeout`, `repeats`, and `binaries`. The latter maps exactly those
+`benchtime`, `timeout`, `repeats`, `main_bundle`, `candidate_builds`, and
+`binaries`. The latter maps exactly those
 three package paths to `{main,candidate}` executable paths. Paths resolve
 relative to the config. Time/iteration profile and timeout are explicit; no
 shorter profile is silently chosen. The query benchmark indexes `../..`, so
@@ -339,10 +340,54 @@ The daemon collector instead joins owned cleanup without killing its client.
 
 Outputs include per-run raw text, combined main/candidate samples, benchstat
 text and `microbench.json`. `formal_acceptance` is always false: the workload
-gate must independently pass. Trusted publication/retrieval of the **three main
-test executables** is not part of the current daemon-only artifact format;
-its packaging/hashes/build flags need review before PR enablement. Synthetic
-fixture tests are not measured benchmark evidence.
+gate must independently pass. The trusted bundle now has a complete microbenchmark extension: three exact-main
+test executables plus pinned benchstat, with observed package/module/toolchain,
+clean embedded VCS, flags, sizes and hashes. Daemon-only legacy bundles remain
+insufficient for `microbench`. Candidate executables must come from the prepared
+current PR job receipt; arbitrary paths or altered binaries fail. The runtime
+fixture commit/tree must match the trusted bundle. Synthetic fixture tests are
+not measured benchmark evidence, and the first real trusted producer artifact
+and same-job execution remain pending.
+
+## Owned fixture, executable and tool preparation
+
+The producer stays disabled. Before enabling it, review and set the full
+`PERF_SMOKE_FIXTURE_REVISION` pin; there is no moving-main or guessed fixture
+revision. The build-only workflow prepares that public Gortex snapshot,
+compiles all three test executables without running them, and installs only the
+existing benchstat pin into a fresh owned tool directory. It publishes the
+daemon, test executables, tool and one hash/provenance manifest. Reruns replace
+the same artifact name rather than leaving ambiguous older attempts.
+
+```sh
+# All outputs are NEW external directories. Use the prescribed Go/C/C++ env.
+go run ./bench/check-budgets prepare-fixture --revision REVIEWED_FIXTURE_SHA \
+  --out /benchmark/NEW-fixture
+
+go run ./bench/check-budgets prepare-tests --source . --revision EXACT_SOURCE_SHA \
+  --out /benchmark/NEW-candidate-tests
+
+go run ./bench/check-budgets prepare-benchstat --out /benchmark/NEW-tool
+```
+
+Fixture preparation uses one fixed public repository URL and a depth-one fetch
+of the explicit commit, then verifies actual clean HEAD/tree. The test builder
+requires clean pinned source before and after `go test -c -buildvcs=true
+-mod=readonly -p=2`, records every executable individually, and refuses absent
+or mismatched embedded provenance. These are setup/build steps, never test or
+benchmark execution. A native graph-test probe confirmed the expected module,
+package path, Go version, clean VCS and C/C++ flags; its roughly 284-MiB size is
+an observation, not an estimate for every platform or all executables. The
+other package/platform files are each inspected during actual preparation.
+
+A full archive has a closed six-file inventory and per-file hash/size checks,
+with bounded compressed/expanded size. The main source tree, pinned fixture
+tree, each executable and the tool remain distinct identities. The microbench
+runner requires `main_bundle` and `candidate_builds`, uses only their declared
+fixed filenames, checks current-job candidate provenance, and rechecks actual
+files before running. Every missing/failed setup retains its receipt and exits
+nonzero. Preparing these artifacts does not establish 15-minute feasibility,
+acceptance samples or a passing workload lane.
 
 ## PR scheduling feasibility remains unresolved
 
@@ -410,8 +455,8 @@ Reports/table artifacts need effective retention of at least 90 days.
 
 The implemented plan declares all five smoke steps but refuses the unavailable
 idle-stop fixture and exact observations. Exact-main retrieval, same-job admission and the Go microbenchmark/benchstat
-runner are implemented source. The measured phased PR driver, trusted main test-
-binary packaging and feasible duration/probe profile remain to implement and
+runner are implemented source. The measured phased PR driver, first trusted main production artifact and
+feasible duration/probe profile remain to implement and
 validate before enabling measurements.
 The frozen default
 60-second duration is not a measured feasibility guarantee; the retained native

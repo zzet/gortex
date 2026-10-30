@@ -53,7 +53,28 @@ func verifiedMainBundle(path string) (artifactSelection, mainArtifact, error) {
 	if err != nil {
 		return selection, metadata, err
 	}
-	return selection, metadata, verifyMainArtifact(selection, metadata, binary)
+	if err := verifyMainArtifact(selection, metadata, binary); err != nil {
+		return selection, metadata, err
+	}
+	if metadata.Microbench != nil {
+		files := map[string][]byte{}
+		for _, pkg := range microPackages {
+			data, err := os.ReadFile(filepath.Join(path, microTestName(pkg)))
+			if err != nil {
+				return selection, metadata, err
+			}
+			files[microTestName(pkg)] = data
+		}
+		data, err := os.ReadFile(filepath.Join(path, bundledBenchstatName))
+		if err != nil {
+			return selection, metadata, err
+		}
+		files[bundledBenchstatName] = data
+		if err := validateMicroBundle(metadata, files); err != nil {
+			return selection, metadata, err
+		}
+	}
+	return selection, metadata, nil
 }
 
 func sameBuildSettings(main, candidate mainArtifact) bool {

@@ -34,14 +34,34 @@ jobs:
         run: |
           go build -o "${{ runner.temp }}/perf-main-gortex" ./cmd/gortex
           go build -o "${{ runner.temp }}/perf-artifact-writer" ./bench/check-budgets
+      - name: Prepare the explicit pinned fixture before compiling benchmark executables
+        env:
+          PERF_FIXTURE_REVISION: ${{ vars.PERF_SMOKE_FIXTURE_REVISION }}
+        run: >-
+          "${{ runner.temp }}/perf-artifact-writer" prepare-fixture
+          --revision "$PERF_FIXTURE_REVISION"
+          --out "${{ runner.temp }}/perf-main-fixture"
+      - name: Build all three clean exact-main test executables
+        run: >-
+          "${{ runner.temp }}/perf-artifact-writer" prepare-tests
+          --source . --revision "${{ github.sha }}"
+          --out "${{ runner.temp }}/perf-main-tests"
+      - name: Prepare the repository-pinned benchstat tool
+        run: >-
+          "${{ runner.temp }}/perf-artifact-writer" prepare-benchstat
+          --out "${{ runner.temp }}/perf-main-tool"
       - name: Bind binary hash, build settings and exact workflow provenance
         run: >-
           "${{ runner.temp }}/perf-artifact-writer" main-artifact
           --binary "${{ runner.temp }}/perf-main-gortex"
           --out "${{ runner.temp }}/perf-main-bundle"
+          --test-binaries "${{ runner.temp }}/perf-main-tests"
+          --benchstat-binary "${{ runner.temp }}/perf-main-tool/benchstat"
+          --fixture "${{ runner.temp }}/perf-main-fixture"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: perf-main-linux-arm64-${{ github.sha }}
           path: ${{ runner.temp }}/perf-main-bundle/
           retention-days: 90
           if-no-files-found: error
+          overwrite: true

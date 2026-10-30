@@ -38,6 +38,7 @@ type mainArtifact struct {
 	GoVersion    string            `json:"go_version"`
 	BinarySHA256 string            `json:"binary_sha256"`
 	Settings     map[string]string `json:"build_settings"`
+	Microbench   *mainMicroBundle  `json:"microbench,omitempty"`
 }
 
 type githubRun struct {
@@ -255,7 +256,7 @@ func inspectBinaryArtifact(path, importPath string) (mainArtifact, error) {
 	return metadata, nil
 }
 
-func publishMainArtifact(binary, out string) error {
+func publishMainArtifact(binary, out string, extra *microPublication) error {
 	metadata, err := binaryArtifact(binary)
 	if err != nil {
 		return err
@@ -268,6 +269,31 @@ func publishMainArtifact(binary, out string) error {
 	metadata.Attempt, _ = strconv.Atoi(os.Getenv("GITHUB_RUN_ATTEMPT"))
 	if metadata.Repository != "zzet/gortex" || metadata.Event != "push" || metadata.Ref != "refs/heads/main" || metadata.RunID < 1 || metadata.Attempt < 1 || os.Getenv("GITHUB_SHA") != metadata.Revision || os.Getenv("GITHUB_WORKFLOW_SHA") != metadata.Revision || os.Getenv("GITHUB_WORKFLOW_REF") != metadata.Repository+"/"+mainArtifactWorkflow+"@refs/heads/main" {
 		return errors.New("publication requires dedicated exact-revision trusted-main push workflow provenance")
+	}
+	files, err := loadPublicationMicro(&metadata, extra)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(binary)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	total := uint64(info.Size()) + uint64(len(encoded)) + 1
+	if info.Size() > maxArtifactBytes || len(encoded) > 1024*1024 {
+		return errors.New("main executable/metadata exceeds supported bundle size")
+	}
+	for _, data := range files {
+		if len(data) > maxArtifactBytes {
+			return errors.New("benchmark executable exceeds supported bundle size")
+		}
+		total += uint64(len(data))
+	}
+	if total > 2*maxArtifactBytes {
+		return errors.New("complete executable bundle exceeds supported expanded size")
 	}
 	if err := os.Mkdir(out, 0o700); err != nil {
 		return err
@@ -286,6 +312,11 @@ func publishMainArtifact(binary, out string) error {
 	if err != nil {
 		return err
 	}
+	for name, data := range files {
+		if err := writeNewExecutable(filepath.Join(out, name), data); err != nil {
+			return err
+		}
+	}
 	return writeNewJSON(filepath.Join(out, "main-artifact.json"), metadata)
 }
 
@@ -298,9 +329,14 @@ func extractMainArtifact(selection artifactSelection, archive []byte, out string
 		return err
 	}
 	files := map[string][]byte{}
+	var expanded uint64
 	for _, entry := range reader.File {
-		if (entry.Name != "main-artifact.json" && entry.Name != mainArtifactBinary) || entry.Mode()&os.ModeType != 0 || entry.UncompressedSize64 > maxArtifactBytes || files[entry.Name] != nil {
+		if !knownBundleFile(entry.Name) || entry.Mode()&os.ModeType != 0 || entry.UncompressedSize64 > maxArtifactBytes || files[entry.Name] != nil {
 			return errors.New("bundle has duplicate, nonregular, oversized or unexpected file")
+		}
+		expanded += entry.UncompressedSize64
+		if expanded > 2*maxArtifactBytes || entry.Name == "main-artifact.json" && entry.UncompressedSize64 > 1024*1024 {
+			return errors.New("expanded bundle or metadata exceeds bounded size")
 		}
 		file, err := entry.Open()
 		if err != nil {
@@ -316,9 +352,6 @@ func extractMainArtifact(selection artifactSelection, archive []byte, out string
 		}
 		files[entry.Name] = data
 	}
-	if len(files) != 2 {
-		return errors.New("incomplete daemon artifact bundle")
-	}
 	var metadata mainArtifact
 	d := json.NewDecoder(bytes.NewReader(files["main-artifact.json"]))
 	d.DisallowUnknownFields()
@@ -331,12 +364,22 @@ func extractMainArtifact(selection artifactSelection, archive []byte, out string
 	if err := verifyMainArtifact(selection, metadata, files[mainArtifactBinary]); err != nil {
 		return err
 	}
+	count := 2
+	if metadata.Microbench != nil {
+		count += len(microPackages) + 1
+	}
+	if len(files) != count {
+		return errors.New("incomplete or undeclared executable bundle inventory")
+	}
+	if err := validateMicroBundle(metadata, files); err != nil {
+		return err
+	}
 	if err := os.Mkdir(out, 0o700); err != nil {
 		return err
 	}
 	for name, data := range files {
 		mode := os.FileMode(0o600)
-		if name == mainArtifactBinary {
+		if name != "main-artifact.json" {
 			mode = 0o700
 		}
 		if err := os.WriteFile(filepath.Join(out, name), data, mode); err != nil {
@@ -365,6 +408,9 @@ func artifactCommand(command string, args []string, stdout, stderr io.Writer) in
 	repo := f.String("repository", "zzet/gortex", "trusted repository")
 	osName := f.String("os", "linux", "required binary OS")
 	arch := f.String("arch", "arm64", "required binary architecture")
+	tests := f.String("test-binaries", "", "prepared exact-main test executable directory")
+	tool := f.String("benchstat-binary", "", "prepared pinned benchstat executable")
+	fixture := f.String("fixture", "", "prepared pinned fixture directory with fixture.json")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -375,9 +421,21 @@ func artifactCommand(command string, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintln(stderr, "publication needs --binary/--out; fetch needs exact --main-revision/--out and reviewed linux/arm64 repository")
 		return 2
 	}
+	if command == "fetch-main" && (*tests != "" || *tool != "" || *fixture != "" || *binary != "") {
+		fmt.Fprintln(stderr, "publication inputs are not accepted by fetch-main")
+		return 2
+	}
 	var err error
 	if command == "main-artifact" {
-		err = publishMainArtifact(*binary, *out)
+		var extra *microPublication
+		if *tests != "" || *tool != "" || *fixture != "" {
+			if *tests == "" || *tool == "" || *fixture == "" {
+				fmt.Fprintln(stderr, "full microbundle needs --test-binaries, --benchstat-binary and --fixture together")
+				return 2
+			}
+			extra = &microPublication{Tests: *tests, Tool: *tool, Fixture: *fixture}
+		}
+		err = publishMainArtifact(*binary, *out, extra)
 	} else {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 		defer cancel()
