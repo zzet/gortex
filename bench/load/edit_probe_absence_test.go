@@ -112,6 +112,9 @@ func TestEditProbeAbsenceRequiresActualOwnedDeclarationBeforeEdit(t *testing.T) 
 					if variant == "not_found" {
 						raw = absentSourceWire("symbol not found: owned/" + logical)
 					}
+					if variant == "is_error_json" {
+						raw, _ = json.Marshal(map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": string(payload)}}})
+					}
 					if got := editProbePresenceProof(raw, c, logical); got != (variant == "actual") {
 						t.Fatalf("presence proof=%v", got)
 					}
