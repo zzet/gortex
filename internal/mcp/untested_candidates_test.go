@@ -1,0 +1,106 @@
+package mcp
+
+import (
+	"context"
+	"fmt"
+	"iter"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/graph"
+)
+
+type coverageCandidateSpy struct {
+	*kindAdjacencySpy
+	nodes         graph.NodeScopedDeadCodeReader
+	candidateRows int
+}
+
+func (r *coverageCandidateSpy) NodesByKindInScope(kind graph.NodeKind, repos []string, scope graph.NodeScope) iter.Seq[*graph.Node] {
+	return func(yield func(*graph.Node) bool) {
+		for node := range r.nodes.NodesByKindInScope(kind, repos, scope) {
+			r.candidateRows++
+			if !yield(node) {
+				return
+			}
+		}
+	}
+}
+func (r *coverageCandidateSpy) DeadCodeCandidatesInScope(kinds []graph.NodeKind, incoming map[graph.NodeKind][]graph.EdgeKind, repos []string, scope graph.NodeScope, exclusions graph.DeadCodeCandidateExclusions) []*graph.Node {
+	return r.nodes.DeadCodeCandidatesInScope(kinds, incoming, repos, scope, exclusions)
+}
+
+func TestUntestedCandidateClosureMatchesWholeGraphOracle(t *testing.T) {
+	s := openContractCoreCapStore(t)
+	s.AddBatch([]*graph.Node{
+		{ID: "a/live", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/live.go"},
+		{ID: "a/dead", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/dead.go"},
+		{ID: "a/bean", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/bean.go"},
+		{ID: "a/cycle1", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/cycle.go"},
+		{ID: "a/cycle2", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/cycle.go"},
+		{ID: "a/dangling", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/dangling.go"},
+		{ID: "b/test", Kind: graph.KindFunction, RepoPrefix: "b", FilePath: "b/foreign_test.go"},
+		{ID: "b/helper", Kind: graph.KindFunction, RepoPrefix: "b", FilePath: "b/helper.go"},
+		{ID: "contract", Kind: graph.KindContract, FilePath: "contract_test.go"},
+	}, []*graph.Edge{
+		{From: "b/test", To: "b/helper", Kind: graph.EdgeCalls},
+		{From: "b/helper", To: "a/live", Kind: graph.EdgeReferences},
+		{From: "b/test", To: "a/bean", Kind: graph.EdgeCalls, Meta: map[string]any{"via": "spring.Bean"}},
+		{From: "contract", To: "a/dead", Kind: graph.EdgeCalls},
+		{From: "b/test", To: "a/dead", Kind: graph.EdgeImports},
+		{From: "a/cycle1", To: "a/cycle2", Kind: graph.EdgeCalls},
+		{From: "a/cycle2", To: "a/cycle1", Kind: graph.EdgeCalls},
+		{From: "b/test", To: "missing-intermediate", Kind: graph.EdgeCalls},
+		{From: "missing-intermediate", To: "a/dangling", Kind: graph.EdgeReferences},
+	})
+	var baseCandidateRows, baseEdgeRows int
+	for pass := range 2 {
+		spy := &coverageCandidateSpy{kindAdjacencySpy: &kindAdjacencySpy{Reader: s, backend: s}, nodes: s}
+		reader := newContractCoreEdges(spy, t.Context(), nil)
+		scope := graph.NodeScope{RepoAllow: map[string]bool{"a": true}}
+		candidates, err := untestedCandidates(t.Context(), reader, scope, "a/")
+		require.NoError(t, err)
+		require.Len(t, candidates, 6)
+		covered, counts, err := candidateTestCoverage(t.Context(), reader, candidates)
+		require.NoError(t, err)
+		require.True(t, covered["a/live"], "a real foreign test path still proves coverage")
+		require.True(t, covered["a/dangling"], "the original forward walk follows missing intermediate identities")
+		require.False(t, covered["a/dead"])
+		require.False(t, covered["a/bean"])
+		require.False(t, covered["a/cycle1"])
+		require.Zero(t, spy.allNodes)
+		require.Zero(t, spy.allEdges)
+		if pass == 0 {
+			baseCandidateRows, baseEdgeRows = spy.candidateRows, spy.rows
+		} else {
+			require.Equal(t, baseCandidateRows, spy.candidateRows)
+			require.Equal(t, baseEdgeRows, spy.rows, "disconnected test graphs do not increase returned ancestor rows")
+		}
+		oracle := newContractCoreEdges(s, t.Context(), nil)
+		wantCovered := reachableFromTests(legacyOutlineReader{oracle})
+		wantCounts := collectFanInByKind(oracle, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences})
+		for _, candidate := range candidates {
+			require.Equal(t, wantCovered[candidate.ID], covered[candidate.ID], candidate.ID)
+			require.Equal(t, wantCounts[candidate.ID], counts[candidate.ID], candidate.ID)
+		}
+		if pass == 0 {
+			for i := range 5 {
+				prefix := fmt.Sprintf("unrelated-%d", i)
+				s.AddBatch([]*graph.Node{{ID: prefix + "/test", Kind: graph.KindFunction, RepoPrefix: prefix, FilePath: prefix + "/file_test.go"}, {ID: prefix + "/target", Kind: graph.KindFunction, RepoPrefix: prefix, FilePath: prefix + "/file.go"}}, []*graph.Edge{{From: prefix + "/test", To: prefix + "/target", Kind: graph.EdgeCalls}})
+			}
+		}
+	}
+	layer := graph.NewOverlayLayer()
+	layer.MarkFile("b/foreign_test.go", true)
+	reader := newContractCoreEdges(graph.NewOverlaidView(s, layer), t.Context(), nil)
+	candidates, err := untestedCandidates(t.Context(), reader, graph.NodeScope{RepoAllow: map[string]bool{"a": true}}, "")
+	require.NoError(t, err)
+	covered, _, err := candidateTestCoverage(t.Context(), reader, candidates)
+	require.NoError(t, err)
+	require.False(t, covered["a/live"], "a tombstoned foreign test cannot prove coverage")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, _, err = candidateTestCoverage(ctx, reader, candidates)
+	require.ErrorIs(t, err, context.Canceled)
+}
