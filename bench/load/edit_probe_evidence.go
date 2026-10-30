@@ -273,6 +273,12 @@ func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt,
 	aPhases, _ := ack["observed_execution_ms"].(map[string]any)
 	aStates, _ := ack["phase_states"].(map[string]any)
 	for _, name := range []string{"caller_result", "disk_write", "edit_control", "middleware", "parse", "publish", "reindex_wait", "reply_prepare"} {
+		// The actual batch text-splice handler explicitly records that it
+		// performs no parser gate. Preserve that null applicability state;
+		// missing/unknown work and an applicable parse never get this escape.
+		if name == "parse" && sharedAcknowledgement != nil && ack["parse_scope"] == "not_applicable_text_splice" && aStates[name] == "not_applicable" && aPhases[name] == nil {
+			continue
+		}
 		if aPhases[name] == nil || aStates[name] != "measured" {
 			fail("missing applicable A phase " + name)
 		}

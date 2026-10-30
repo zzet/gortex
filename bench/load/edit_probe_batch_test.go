@@ -314,3 +314,44 @@ func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) 
 		t.Fatal("invented single-file mutation receipt")
 	}
 }
+
+func TestBatchAccountingTextSpliceParseApplicabilityIsExplicitAndOwned(t *testing.T) {
+	base := editProbeAccountingFixture()
+	ack := base["acknowledgement"].(map[string]any)
+	ack["phase_states"].(map[string]any)["parse"] = "not_applicable"
+	ack["observed_execution_ms"].(map[string]any)["parse"] = nil
+	ack["parse_scope"] = "not_applicable_text_splice"
+	ack["caller_response_ready_ms"] = json.Number("7")
+	if got := checkEditProbeAccountingWithAcknowledgement(base, "receipt-a", "reindex_generation", ack); got.State != "observed_single_window_checks_pass" {
+		t.Fatal("explicit unexecuted batch parse not honored", got)
+	}
+	if got := checkEditProbeAccounting(base, "receipt-a"); got.State == "observed_single_window_checks_pass" {
+		t.Fatal("weakened ordinary applicable parse")
+	}
+	for _, name := range []string{"missing_scope", "unknown_scope", "missing_state", "unknown_state", "zero_instead_of_null"} {
+		t.Run(name, func(t *testing.T) {
+			raw, _ := json.Marshal(ack)
+			var copy map[string]any
+			decoder := json.NewDecoder(strings.NewReader(string(raw)))
+			decoder.UseNumber()
+			if err := decoder.Decode(&copy); err != nil {
+				t.Fatal(err)
+			}
+			switch name {
+			case "missing_scope":
+				delete(copy, "parse_scope")
+			case "unknown_scope":
+				copy["parse_scope"] = "unknown"
+			case "missing_state":
+				delete(copy["phase_states"].(map[string]any), "parse")
+			case "unknown_state":
+				copy["phase_states"].(map[string]any)["parse"] = "unknown"
+			case "zero_instead_of_null":
+				copy["observed_execution_ms"].(map[string]any)["parse"] = json.Number("0")
+			}
+			if got := checkEditProbeAccountingWithAcknowledgement(base, "receipt-a", "reindex_generation", copy); got.State == "observed_single_window_checks_pass" {
+				t.Fatal("invented batch parse coverage", name)
+			}
+		})
+	}
+}
