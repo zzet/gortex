@@ -31,10 +31,14 @@ func movePublicFactsComplete(record editProbeRecord) bool {
 }
 
 func moveProbesComplete(record editProbeRecord) bool {
-	if len(record.FirstCorrect) != 8 { return false }
+	if len(record.FirstCorrect) != 8 {
+		return false
+	}
 	for _, name := range []string{"source", "summary", "editing_context", "search_visible", "text", "callers", "call_chain", "old_source_absent"} {
 		first, present := record.FirstCorrect[name]
-		if !present || first.Value == nil { return false }
+		if !present || first.Value == nil {
+			return false
+		}
 	}
 	return true
 }
