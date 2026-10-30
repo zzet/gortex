@@ -122,3 +122,34 @@ func TestBatchFileObservationRealHandlerCommitAndFailedWriter(t *testing.T) {
 		})
 	}
 }
+
+func TestBatchFileObservationRealRollbackRejectsSuccessfulWriter(t *testing.T) {
+	s := newAtomicBatchTestServer(t, mutationTestWatcher{})
+	dir := t.TempDir()
+	file := writeAtomicBatchFixture(t, dir, "target.txt", "before\n")
+	var failedSync bool
+	s.batchDurabilityOverride = &batchDurabilityOps{syncDirectory: func(path string) error {
+		if filepath.Clean(path) == filepath.Clean(dir) && !failedSync {
+			failedSync = true
+			return errors.New("forward directory sync refused")
+		}
+		return syncBatchDirectory(path)
+	}}
+	req := editOperationRequest("batch_edit", "")
+	req.Params.Arguments = map[string]any{"transaction_id": "file-observation-rollback", "edits": []any{
+		map[string]any{"op": "edit_file", "path": file, "old_string": "before\n", "new_string": "after\n"},
+	}}
+	_, err := s.boundToolHandler(s.handleAtomicBatchEdit)(t.Context(), req)
+	require.NoError(t, err)
+	value, _ := s.batchTransactions.Load("file-observation-rollback")
+	transaction := value.(*batchTransactionState).snapshot()
+	require.Equal(t, "rolled_back", transaction.DiskStatus)
+	require.Equal(t, "before\n", readAtomicBatchFixture(t, file))
+	refs := s.batchFileObservationReferences(transaction)
+	require.Len(t, refs, 1)
+	payload, _ := s.batchFileObservationPayload(t.Context(), refs[0].Receipt)
+	require.Equal(t, true, payload["writer_return_observed"], "successful forward return really occurred")
+	require.Equal(t, "failed", payload["batch_disk_verdict"], "rolled-back bytes never become a committed batch clock")
+	require.NotContains(t, payload, "publication_phases")
+	require.Empty(t, payload["publication_receipt"])
+}
