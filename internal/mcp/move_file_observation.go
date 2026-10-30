@@ -19,6 +19,9 @@ type moveFileObservation struct {
 	operationID, sourceID, targetID, role string
 	writeVerdict, directState             string
 	directClaimed                         bool
+	readClaimed                           bool
+	readState                             string
+	readAssisted                          *moveDirectObservation
 	direct                                *moveDirectObservation
 }
 type moveDirectObservation struct {
@@ -50,7 +53,7 @@ func (s *Server) beginMoveObservation(ctx context.Context, sourceID, targetID, s
 	checkout, incarnation := mutationCheckoutScope(ctx)
 	out := &moveObservation{server: s, id: "move-" + strconv.FormatUint(ack.id, 10), records: make(map[string]*mutationCommitRecord, 2)}
 	for _, file := range []struct{ abs, rel, role string }{{sourceAbs, sourceRel, "source"}, {targetAbs, targetRel, "target"}} {
-		record := &mutationCommitRecord{kind: moveFileObservationCommit, owner: s, id: "move-file-" + strconv.FormatUint(mutationCommitSequence.Add(1), 10), tool: "move_symbol", key: out.id, absPath: file.abs, relPath: file.rel, startedAt: ack.entered, acknowledgement: ack, disk: mutationDiskInFlight, checkoutID: checkout, checkoutIncarnation: incarnation, moveFile: &moveFileObservation{operationID: out.id, sourceID: sourceID, targetID: targetID, role: file.role, writeVerdict: "pending", directState: "not_started"}}
+		record := &mutationCommitRecord{kind: moveFileObservationCommit, owner: s, id: "move-file-" + strconv.FormatUint(mutationCommitSequence.Add(1), 10), tool: "move_symbol", key: out.id, absPath: file.abs, relPath: file.rel, startedAt: ack.entered, acknowledgement: ack, disk: mutationDiskInFlight, checkoutID: checkout, checkoutIncarnation: incarnation, moveFile: &moveFileObservation{operationID: out.id, sourceID: sourceID, targetID: targetID, role: file.role, writeVerdict: "pending", directState: "not_started", readState: "not_started"}}
 		s.mutationCommits.put(record)
 		out.records[file.abs] = record
 		out.refs = append(out.refs, moveFileObservationReference{Path: file.rel, Role: file.role, Receipt: record.id})
@@ -132,6 +135,7 @@ type moveDirectWitness struct {
 	id, operation, path, blob, session, requestKey string
 	committed                                      time.Time
 	commitSeq                                      uint64
+	readAssisted                                   bool
 }
 
 func (o *moveObservation) observer(ctx context.Context, path string, idx *indexer.Indexer) *indexer.ReadRepairObserver {
@@ -160,6 +164,40 @@ func (o *moveObservation) observer(ctx context.Context, path string, idx *indexe
 	}
 	return &indexer.ReadRepairObserver{Session: witness.session, RequestIDKey: witness.requestKey, Complete: witness.complete}
 }
+// The newest same-path publication owner is authoritative. Move observations
+// remain excluded from physical/batch ticket binding; this is a separate actual
+// reader cause attached to the same retained move file and returned write.
+func (s *Server) moveReadRepairObserver(ctx context.Context, path string, idx *indexer.Indexer) (*indexer.ReadRepairObserver, bool) {
+ if idx == nil { return nil, false }
+ ledger := &s.mutationCommits
+ ledger.mu.Lock()
+ defer ledger.mu.Unlock()
+ for i := len(ledger.ordered)-1; i >= 0; i-- {
+  record := ledger.ordered[i]
+  if !(record.isPublicationOwner() || record.kind == moveFileObservationCommit) || record.absPath != path { continue }
+  if record.kind != moveFileObservationCommit { return nil, false }
+  record.mu.Lock()
+  defer record.mu.Unlock()
+  if ledger.byID[record.id] != record || record.owner != s || record.moveFile == nil || record.moveFile.readClaimed || record.disk != mutationDiskCommitted || record.newSHA == "" || record.committedAt.IsZero() || record.commitSeq == 0 { return nil, true }
+  // Capture can precede the overall write verdict. Completion still requires
+  // that exact record's final successful verdict; no later retry can rebind it.
+  if record.moveFile.writeVerdict != "pending" && record.moveFile.writeVerdict != "all_writes_completed" { return nil, true }
+  key, _ := daemon.MCPRequestIDKeyForContext(ctx)
+  witness := moveDirectWitness{server: weak.Make(s), record: weak.Make(record), indexer: weak.Make(idx), id: record.id, operation: record.key, path: record.absPath, blob: record.newSHA, committed: record.committedAt, commitSeq: record.commitSeq, session: SessionIDFromContext(ctx), requestKey: key, readAssisted: true}
+  record.moveFile.readClaimed = true
+  record.moveFile.readState = "pending_observer"
+  return &indexer.ReadRepairObserver{Session: witness.session, RequestIDKey: witness.requestKey, Complete: witness.complete}, true
+ }
+ return nil, false
+}
+
+// Both routes retain their own immutable result and actual request cause.
+// The slot is accessed only while the owning record mutex is held.
+func (w moveDirectWitness) slot(file *moveFileObservation) (**moveDirectObservation, *string) {
+ if w.readAssisted { return &file.readAssisted, &file.readState }
+ return &file.direct, &file.directState
+}
+
 func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 	s, record, idx := w.server.Value(), w.record.Value(), w.indexer.Value()
 	if s == nil || record == nil {
@@ -234,22 +272,27 @@ func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 	}
 	if refused != "" {
 		record.mu.Lock()
-		if w.matches(record) && record.moveFile.direct == nil && record.moveFile.directState == "pending_observer" {
-			record.moveFile.directState = refused
-		}
+		if w.matchesWrite(record) {
+   value, state := w.slot(record.moveFile)
+   if *value == nil && *state == "pending_observer" { *state = refused }
+  }
 		record.mu.Unlock()
 		return
 	}
 	record.mu.Lock()
 	defer record.mu.Unlock()
-	if !w.matches(record) || record.moveFile.direct != nil || record.moveFile.directState != "pending_observer" {
-		return
-	}
-	record.moveFile.direct = &accepted
-	record.moveFile.directState = "observed"
+	if !w.matchesWrite(record) { return }
+ value, state := w.slot(record.moveFile)
+ if *value != nil || *state != "pending_observer" { return }
+ if record.moveFile.writeVerdict != "all_writes_completed" {
+  *state = "unavailable_move_write_verdict"
+  return
+ }
+ *value = &accepted
+ *state = "observed"
 }
-func (w moveDirectWitness) matches(record *mutationCommitRecord) bool {
-	return record.owner == w.server.Value() && record.id == w.id && record.kind == moveFileObservationCommit && record.moveFile != nil && record.key == w.operation && record.absPath == w.path && record.newSHA == w.blob && record.committedAt == w.committed && record.commitSeq == w.commitSeq && record.disk == mutationDiskCommitted && record.moveFile.writeVerdict == "all_writes_completed"
+func (w moveDirectWitness) matchesWrite(record *mutationCommitRecord) bool {
+	return record.owner == w.server.Value() && record.id == w.id && record.kind == moveFileObservationCommit && record.moveFile != nil && record.key == w.operation && record.absPath == w.path && record.newSHA == w.blob && record.committedAt == w.committed && record.commitSeq == w.commitSeq && record.disk == mutationDiskCommitted
 }
 func (w moveDirectWitness) unavailable(reason string) {
 	s, record := w.server.Value(), w.record.Value()
@@ -261,9 +304,10 @@ func (w moveDirectWitness) unavailable(reason string) {
 	defer ledger.mu.Unlock()
 	record.mu.Lock()
 	defer record.mu.Unlock()
-	if ledger.byID[w.id] == record && w.matches(record) && record.moveFile.direct == nil && record.moveFile.directState == "pending_observer" {
-		record.moveFile.directState = reason
-	}
+	if ledger.byID[w.id] == record && w.matchesWrite(record) {
+  value, state := w.slot(record.moveFile)
+  if *value == nil && *state == "pending_observer" { *state = reason }
+ }
 }
 
 func (o *moveObservation) reindex(ctx context.Context, path string) bool {
@@ -309,7 +353,7 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 	payload := map[string]any{"found": false, "receipt": id, "receipt_kind": "move_file_observation", "guidance": "observation only; source_id/target_id/touched and real write outcomes remain the move authority"}
 	checkout, incarnation := mutationCheckoutScope(ctx)
 	var ack *editAcknowledgement
-	var direct *moveDirectObservation
+	var direct, readAssisted *moveDirectObservation
 	ledger := &s.mutationCommits
 	ledger.mu.Lock()
 	record := ledger.byID[id]
@@ -320,6 +364,7 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 			payload["found"], payload["operation_id"], payload["source_id"], payload["target_id"], payload["path"], payload["role"] = true, data.operationID, data.sourceID, data.targetID, record.relPath, data.role
 			payload["move_write_verdict"], payload["file_write_status"], payload["writer_return_observed"], payload["new_sha"] = data.writeVerdict, record.disk, !record.committedAt.IsZero(), record.newSHA
 			payload["direct_reconcile_state"], payload["requested_background_state"] = data.directState, "not_applicable_direct_reconcile"
+			payload["read_assisted_reconcile_state"] = data.readState
 			// This handler calls the existing synchronous reconcile, never queue
 			// admission/wait. Preserve raw ACK nulls/counts and name applicability
 			// explicitly instead of manufacturing measured zero scheduler work.
@@ -339,18 +384,14 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 				copy := *data.direct
 				direct = &copy
 			}
+   if data.readAssisted != nil { copy := *data.readAssisted; readAssisted = &copy }
 			ack = record.acknowledgement
 		}
 		record.mu.RUnlock()
 	}
 	ledger.mu.Unlock()
-	if direct != nil {
-		phases := direct.accounting.Payload()
-		phases["scope"] = "move_direct_reconcile"
-		causes := make([]mutationReadRepairCause, direct.causeCount)
-		copy(causes, direct.causes[:direct.causeCount])
-		payload["direct_reconcile"] = map[string]any{"scope": "move_direct_reconcile", "clock": "monotonic", "owner_generation": direct.generation, "window_ns": direct.windowNS, "accepted_blob_sha": direct.acceptedBlob, "writer_return_to_acceptance_ns": direct.writerToAcceptanceNS, "reconcile_causes": causes, "phase_accounting": phases, "additive_with_acknowledgement": false}
-	}
+	if direct != nil { payload["direct_reconcile"] = direct.payload("move_direct_reconcile") }
+ if readAssisted != nil { payload["read_assisted_reconcile"] = readAssisted.payload("move_read_assisted_reconcile") }
 	var snapshot *editAcknowledgementSnapshot
 	if ack != nil {
 		copy := ack.snapshot()
@@ -358,4 +399,12 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 	}
 	payload["acknowledgement"] = buildAcknowledgementPayload(snapshot, "unavailable_ledger_entry_or_scope")
 	return payload, true
+}
+
+func (observed *moveDirectObservation) payload(scope string) map[string]any {
+ phases := observed.accounting.Payload()
+ phases["scope"] = scope
+ causes := make([]mutationReadRepairCause, observed.causeCount)
+ copy(causes, observed.causes[:observed.causeCount])
+ return map[string]any{"scope": scope, "clock": "monotonic", "owner_generation": observed.generation, "window_ns": observed.windowNS, "accepted_blob_sha": observed.acceptedBlob, "writer_return_to_acceptance_ns": observed.writerToAcceptanceNS, "reconcile_causes": causes, "phase_accounting": phases, "additive_with_acknowledgement": false}
 }

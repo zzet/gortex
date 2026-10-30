@@ -69,6 +69,7 @@ type mutationReadRepairWitness struct {
 }
 
 func (s *Server) readRepairObserver(ctx context.Context, absPath string, idx *indexer.Indexer) *indexer.ReadRepairObserver {
+ if observer, moveOwner := s.moveReadRepairObserver(ctx, absPath, idx); moveOwner { return observer }
 	witness, ok := s.captureReadRepairWitness(absPath, idx)
 	if !ok {
 		return nil

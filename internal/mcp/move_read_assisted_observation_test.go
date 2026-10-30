@@ -2,6 +2,7 @@ package mcp
 
 import (
  "context"
+ "fmt"
  "os"
  "testing"
  "time"
@@ -32,7 +33,7 @@ func TestMoveReadAssistedOriginalFileWinnerAndImmutableCallback(t *testing.T) {
 
 func TestMoveReadAssistedRejectsNewerPublicationOwners(t *testing.T) {
  for _, kind := range []mutationCommitKind{physicalMutationCommit, batchFileObservationCommit, moveFileObservationCommit} {
-  t.Run(string(kind), func(t *testing.T) {
+  t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
    s, move, ctx, _, _, target := moveObservationExecutionFixture(t)
    idx := s.multiIndexer.GetIndexer("fixture")
    observer := s.readRepairObserver(WithSessionID(ctx, "original-reader"), target, idx)
@@ -53,7 +54,8 @@ func TestMoveReadAssistedRejectsNewerPublicationOwners(t *testing.T) {
    observer.Complete(actual)
    repeated, _ := s.moveFileObservationPayload(t.Context(), move.records[target].id)
    require.Equal(t, status["read_assisted_reconcile_state"], repeated["read_assisted_reconcile_state"])
-   require.Nil(t, s.readRepairObserver(ctx, target, idx), "newest foreign owner cannot fall back to an older move")
+   _, moveOwner := s.moveReadRepairObserver(ctx, target, idx)
+   require.Equal(t, kind == moveFileObservationCommit, moveOwner, "latest non-move authority must not fall back to an older move")
   })
  }
 }
