@@ -5433,17 +5433,20 @@ func ringNeighborsProjection(nodes []*graph.Node, selfID string, cap int) ([]*gr
 	if cap < 1 {
 		return nil, false
 	}
-	out := make([]*graph.Node, 0, cap)
-	complete := true
+	out := make([]*graph.Node, 0, len(nodes))
 	for _, n := range nodes {
 		if n == nil || n.ID == selfID || !exploreLocalizableKind(n.Kind) {
 			continue
 		}
-		if len(out) >= cap {
-			complete = false
-			continue
-		}
 		out = append(out, n)
+	}
+	// The walk can return an uncapped neighborhood in storage order. Select
+	// the smaller evidence ring only after ordering all eligible identities,
+	// otherwise a different store plan changes which callees are shown.
+	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	complete := len(out) <= cap
+	if !complete {
+		out = out[:cap]
 	}
 	return out, complete
 }
