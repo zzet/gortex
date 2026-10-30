@@ -227,7 +227,7 @@ func checkMoveOwnACKContinuation(t *testing.T, badReadback bool) {
 			body = stubContent(map[string]any{"id": "fixture/target.go::Relocated", "name": "Relocated", "file_path": "fixture/target.go", "source": "func Relocated() int { return Callee() }"})
 		} else if operation == "source" && target["symbol"] == "fixture/source.go::Relocated" {
 			key = "old_source_absent"
-			body = map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": "symbol not found: fixture/source.go::Relocated"}}}
+			body = map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": "symbol not found: fixture/source.go::Relocated — did you mean: fixture/target.go::Relocated, fixture/source.go::Callee"}}}
 		} else if operation == "file" && target["file"] == "fixture/source.go" {
 			key = "source_file"
 			body = stubContent(map[string]any{"path": "fixture/source.go", "content": "package main\nfunc Callee() int { return 1 }\n"})

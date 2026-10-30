@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+ "strings"
 	"testing"
 	"time"
 
@@ -69,6 +70,16 @@ func TestMoveMeasurementUsesActualGoRelocationAndExplicitLanguageRefusal(t *test
 			require.NotNil(t, s.engineFor(t.Context()).GetSymbol(newID))
 			oldSource := callTool(t, s, "get_symbol_source", map[string]any{"id": oldID})
 			require.True(t, oldSource.IsError)
+			// Preserve the real producer wire shape consumed by expected-absence
+			// probes: suggestions share the line after an exact ID boundary.
+			oldWire, marshalErr := json.Marshal(oldSource)
+			require.NoError(t, marshalErr)
+			var oldEnvelope struct { Content []struct { Type string `json:"type"`; Text string `json:"text"` } `json:"content"` }
+			require.NoError(t, json.Unmarshal(oldWire, &oldEnvelope))
+			require.Len(t, oldEnvelope.Content, 1)
+			require.Equal(t, "text", oldEnvelope.Content[0].Type)
+			require.True(t, strings.HasPrefix(oldEnvelope.Content[0].Text, "symbol not found: "+oldID+" — did you mean: "))
+			require.Contains(t, oldEnvelope.Content[0].Text, newID)
 			newSource := callTool(t, s, "get_symbol_source", map[string]any{"id": newID, "context_lines": 0})
 			require.False(t, newSource.IsError)
 			require.Contains(t, unmarshalResult(t, newSource)["source"], "return 7")

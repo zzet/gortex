@@ -33,8 +33,12 @@ func editProbeExactNotFound(raw json.RawMessage, scopedID string) (string, bool)
 	}
 	text := response.Content[0].Text
 	first, _, _ := strings.Cut(text, "\n")
-	if first != "symbol not found: "+scopedID {
-		return "", false
+	exact := "symbol not found: " + scopedID
+	if first != exact {
+		// handleGetSymbolSource appends this exact same-line delimiter. The
+		// complete old ID must precede it; a prefix match is not absence proof.
+		hint, suggested := strings.CutPrefix(first, exact+" — did you mean: ")
+		if !suggested || strings.TrimSpace(hint) == "" { return "", false }
 	}
 	return text, true
 }

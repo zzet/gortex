@@ -24,6 +24,10 @@ func TestEditProbeExpectedAbsenceMatchesExactProducerRefusal(t *testing.T) {
 	}{
 		{"exact", absentSourceWire("symbol not found: " + id), true},
 		{"suggestions", absentSourceWire("symbol not found: " + id + "\nDid you mean another symbol?"), true},
+		{"producer_same_line_suggestions", absentSourceWire("symbol not found: " + id + " — did you mean: owned/new.go::Old, owned/file.go::Other"), true},
+		{"same_line_empty_hint", absentSourceWire("symbol not found: " + id + " — did you mean: "), false},
+		{"same_line_foreign_prefix", absentSourceWire("symbol not found: " + id + "Extra — did you mean: owned/new.go::Old"), false},
+		{"same_line_unknown_suffix", absentSourceWire("symbol not found: " + id + "; permission denied"), false},
 		{"foreign", absentSourceWire("symbol not found: other/file.go::Old"), false},
 		{"prefix", absentSourceWire("symbol not found: " + id + "Extra"), false},
 		{"freshness", absentSourceWire("repo is still loading"), false},
