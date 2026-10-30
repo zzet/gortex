@@ -127,6 +127,45 @@ func TestLaneConfigStrictPathsAndFloorRefusal(t *testing.T) {
 	}
 }
 
+func TestSmokeUsesOnlyNeededBuildsAndReadOfferDrain(t *testing.T) {
+	c := fixtureLaneConfig()
+	delete(c.Builds, "tag")
+	c.Duration, c.PRSmokeDrain = "20s", "120s"
+	path := filepath.Join(t.TempDir(), "smoke.json")
+	if err := writeNewJSON(path, c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readLaneConfig(path); err != nil {
+		t.Fatalf("block-only smoke must not fabricate a shipped-tag executable: %v", err)
+	}
+	p := testPolicy()
+	p.Budgets = []budget{{Metric: "read_p95", Scenario: "load-16", HostClass: hostedSmokeClass, Mode: "block", Lane: []string{"smoke"}}}
+	if _, err := makeLanePlan(p, c); err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []string{"load-16", "loadedit-4", "tools-single-gortex", "warm-restart"} {
+		args := taskArgs(c, laneTask{Scenario: scenario, Role: "candidate"}, "manifest", "scratch", "report")
+		if slices.Contains(args, "--pr-smoke-drain") != (scenario == "load-16") {
+			t.Fatal("read-only offered-window semantics leaked into another scenario")
+		}
+	}
+	p.Budgets[0].Mode = "guard"
+	if _, err := makeLanePlan(p, c); err == nil {
+		t.Fatal("guard baseline was silently omitted from the smoke matrix")
+	}
+	c.Lane = "nightly"
+	data, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readLaneConfig(path); err == nil {
+		t.Fatal("nightly omitted shipped-tag evidence or adopted PR-only drain semantics")
+	}
+}
+
 func TestCollectorRetainsFailedRepetitionsAndContinues(t *testing.T) {
 	parent := t.TempDir()
 	source := filepath.Join(parent, "source")

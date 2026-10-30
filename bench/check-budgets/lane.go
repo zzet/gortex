@@ -56,6 +56,7 @@ type laneConfig struct {
 	StopTimeout      string               `json:"stop_timeout"`
 	SweepDuration    string               `json:"sweep_duration"`
 	SweepRepetitions int                  `json:"sweep_repetitions"`
+	PRSmokeDrain     string               `json:"pr_smoke_drain,omitempty"`
 	started          time.Time
 }
 
@@ -117,11 +118,14 @@ func readLaneConfig(path string) (laneConfig, error) {
 	if !knownHostClass(c.HostClass) || c.HostClass == hostedSmokeClass && c.Lane != "smoke" {
 		return c, errors.New("unsupported host class; floor envelope is not yet a budget-policy host and cannot be relabeled reference")
 	}
-	if len(c.Builds) != 3 {
-		return c, errors.New("lane needs exactly candidate/main/tag builds")
+	if len(c.Builds) != 3 && (c.Lane != "smoke" || len(c.Builds) != 2) {
+		return c, errors.New("lane needs candidate/main builds and a shipped tag for guard comparisons")
 	}
 	for _, role := range []string{"candidate", "main", "tag"} {
 		b := c.Builds[role]
+		if role == "tag" && c.Lane == "smoke" && len(c.Builds) == 2 && b == (laneBuild{}) {
+			continue
+		}
 		if b.Binary == "" || !revisionPattern.MatchString(b.Revision) || role == "tag" && b.Revision != shippedRevision {
 			return c, fmt.Errorf("missing or unpinned %s build", role)
 		}
@@ -133,6 +137,14 @@ func readLaneConfig(path string) (laneConfig, error) {
 	}
 	if stop, _ := time.ParseDuration(c.StopTimeout); stop > 2*time.Minute {
 		return c, errors.New("gate stop_timeout must be at most two minutes, within the release cleanup reserve")
+	}
+	if c.PRSmokeDrain != "" {
+		drain, err := time.ParseDuration(c.PRSmokeDrain)
+		offer, _ := time.ParseDuration(c.Duration)
+		deadline, _ := time.ParseDuration(c.Deadline)
+		if err != nil || c.Lane != "smoke" || drain < deadline || drain > 2*time.Minute || offer != 20*time.Second && offer != 30*time.Second {
+			return c, errors.New("PR smoke drain requires a 20/30s smoke offer and original deadlines within a <=2min drain")
+		}
 	}
 	if c.SweepRepetitions < 1 || c.Load == "" || c.Manifest == "" {
 		return c, errors.New("load binary, pinned manifest and explicit sweep repetition count required")
@@ -172,6 +184,9 @@ func makeLanePlan(p policy, c laneConfig) (lanePlan, error) {
 		}
 		scenarios[b.Scenario] = max(scenarios[b.Scenario], c.Repeats, b.MinRepeats)
 		needsTag[b.Scenario] = needsTag[b.Scenario] || b.Mode == "guard"
+		if b.Mode == "guard" && c.Version == 1 && c.Builds["tag"].Binary == "" {
+			return plan, errors.New("selected guard budget requires the actual pinned shipped-tag binary")
+		}
 		if missing := metricSpecs[b.Metric].missing; missing != "" {
 			gaps[b.Scenario+" / "+b.Metric+": "+missing] = true
 		}
@@ -418,7 +433,11 @@ func taskArgs(c laneConfig, task laneTask, manifest, scratch, report string) []s
 		host = "reference"
 	}
 	build := c.Builds[task.Role]
-	return []string{"run", "--binary", build.Binary, "--git-sha", build.Revision, "--manifest", manifest, "--scratch", scratch, "--out", report, "--host", host, "--profile", "agent", "--scenario", spec.wire, "--agents", fmt.Sprint(spec.agents), "--edit-agents", fmt.Sprint(spec.editors), "--worktrees", fmt.Sprint(spec.worktrees), "--seed", fmt.Sprint(task.Seed), "--duration", c.Duration, "--deadline", c.Deadline, "--warm-timeout", c.WarmTimeout, "--stop-timeout", c.StopTimeout, "--sweep-repetitions", fmt.Sprint(c.SweepRepetitions), "--sweep-duration", c.SweepDuration}
+	args := []string{"run", "--binary", build.Binary, "--git-sha", build.Revision, "--manifest", manifest, "--scratch", scratch, "--out", report, "--host", host, "--profile", "agent", "--scenario", spec.wire, "--agents", fmt.Sprint(spec.agents), "--edit-agents", fmt.Sprint(spec.editors), "--worktrees", fmt.Sprint(spec.worktrees), "--seed", fmt.Sprint(task.Seed), "--duration", c.Duration, "--deadline", c.Deadline, "--warm-timeout", c.WarmTimeout, "--stop-timeout", c.StopTimeout, "--sweep-repetitions", fmt.Sprint(c.SweepRepetitions), "--sweep-duration", c.SweepDuration}
+	if c.Lane == "smoke" && spec.wire == "read" && c.PRSmokeDrain != "" {
+		args = append(args, "--pr-smoke-drain", c.PRSmokeDrain)
+	}
+	return args
 }
 
 func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out string, stdout io.Writer, runProcess laneProcess) error {
@@ -452,7 +471,7 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 		}
 		receipt.Smoke = &proof
 	}
-	index := inputs{Version: 1, CandidateRevision: c.Builds["candidate"].Revision, MainRevision: c.Builds["main"].Revision, TagRevision: c.Builds["tag"].Revision, Repeats: c.Repeats, ScenarioRepeats: map[string]int{}, Hosts: map[string]string{c.HostClass: c.Machine}, Runs: []runInput{}}
+	index := inputs{Version: 1, CandidateRevision: c.Builds["candidate"].Revision, MainRevision: c.Builds["main"].Revision, TagRevision: shippedRevision, Repeats: c.Repeats, ScenarioRepeats: map[string]int{}, Hosts: map[string]string{c.HostClass: c.Machine}, Runs: []runInput{}}
 	var failures []error
 	// Release wall time includes all startup, teardown and budget checking, not
 	// just offered load. Reserve three minutes for the harness's independent
