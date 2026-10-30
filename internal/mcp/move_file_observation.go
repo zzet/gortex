@@ -21,12 +21,13 @@ type moveFileObservation struct {
 	direct                                *moveDirectObservation
 }
 type moveDirectObservation struct {
-	generation   uint64
-	windowNS     int64
-	acceptedBlob string
-	causes       [8]mutationReadRepairCause
-	causeCount   int
-	accounting   indexer.ReadRepairPhaseAccounting
+	generation           uint64
+	windowNS             int64
+	writerToAcceptanceNS int64
+	acceptedBlob         string
+	causes               [8]mutationReadRepairCause
+	causeCount           int
+	accounting           indexer.ReadRepairPhaseAccounting
 }
 type moveFileObservationReference struct {
 	Path    string `json:"path"`
@@ -167,7 +168,7 @@ func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 		w.unavailable("unavailable_owner_bytes_or_acceptance")
 		return
 	}
-	accepted := moveDirectObservation{generation: observed.Generation(), windowNS: end.Sub(start).Nanoseconds(), acceptedBlob: w.blob, accounting: observed.PhaseAccounting()}
+	accepted := moveDirectObservation{generation: observed.Generation(), windowNS: end.Sub(start).Nanoseconds(), acceptedBlob: w.blob, writerToAcceptanceNS: observed.AcceptedAt().Sub(w.committed).Nanoseconds(), accounting: observed.PhaseAccounting()}
 	ownedCause := false
 	for i := range accepted.causes {
 		session, key, generation, ok := observed.Cause(i)
@@ -192,22 +193,46 @@ func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 	}
 	// A later real writer, including another observed move, cannot donate its
 	// accepted publication to this earlier file record.
+	// Keep competing rows read-locked through binding. An older admitted
+	// physical writer cannot start/commit between this check and acceptance.
+	locked := make([]*mutationCommitRecord, 0)
+	defer func() {
+		for i := len(locked) - 1; i >= 0; i-- {
+			locked[i].mu.RUnlock()
+		}
+	}()
+	firstPath := true
+	refused := ""
 	for i := len(ledger.ordered) - 1; i >= 0; i-- {
 		candidate := ledger.ordered[i]
-		if !(candidate.isPublicationOwner() || candidate.kind == moveFileObservationCommit) {
+		if !(candidate.isPublicationOwner() || candidate.kind == moveFileObservationCommit) || candidate.absPath != w.path {
 			continue
 		}
-		if candidate.absPath == w.path {
+		if firstPath {
+			firstPath = false
 			if candidate != record {
-				record.mu.Lock()
-				if w.matches(record) && record.moveFile.direct == nil {
-					record.moveFile.directState = "unavailable_superseded_owner"
-				}
-				record.mu.Unlock()
-				return
+				refused = "unavailable_superseded_owner"
 			}
-			break
 		}
+		if candidate == record {
+			continue
+		}
+		candidate.mu.RLock()
+		locked = append(locked, candidate)
+		if candidate.disk == mutationDiskCommitted && candidate.commitSeq > w.commitSeq {
+			refused = "unavailable_competing_commit"
+		}
+		if candidate.disk == mutationDiskInFlight && !candidate.diskWriteStartedAt.IsZero() && !candidate.diskWriteStartedAt.After(observed.AcceptedAt()) {
+			refused = "unavailable_competing_writer"
+		}
+	}
+	if refused != "" {
+		record.mu.Lock()
+		if w.matches(record) && record.moveFile.direct == nil {
+			record.moveFile.directState = refused
+		}
+		record.mu.Unlock()
+		return
 	}
 	record.mu.Lock()
 	defer record.mu.Unlock()
@@ -288,6 +313,17 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 			payload["found"], payload["operation_id"], payload["source_id"], payload["target_id"], payload["path"], payload["role"] = true, data.operationID, data.sourceID, data.targetID, record.relPath, data.role
 			payload["move_write_verdict"], payload["file_write_status"], payload["writer_return_observed"], payload["new_sha"] = data.writeVerdict, record.disk, !record.committedAt.IsZero(), record.newSHA
 			payload["direct_reconcile_state"], payload["requested_background_state"] = data.directState, "not_applicable_direct_reconcile"
+			timing := map[string]any{"scope": "move_file_write", "clock": "monotonic", "state": "not_observed", "outcome": record.disk}
+			if !record.diskWriteStartedAt.IsZero() && !record.committedAt.IsZero() {
+				timing["state"] = "invalid_order"
+				if !record.diskWriteStartedAt.Before(record.startedAt) && !record.committedAt.Before(record.diskWriteStartedAt) {
+					timing["state"] = "measured"
+					timing["started_ns"] = record.diskWriteStartedAt.Sub(record.startedAt).Nanoseconds()
+					timing["returned_ns"] = record.committedAt.Sub(record.startedAt).Nanoseconds()
+					timing["window_ns"] = record.committedAt.Sub(record.diskWriteStartedAt).Nanoseconds()
+				}
+			}
+			payload["write_timing"] = timing
 			if data.direct != nil {
 				copy := *data.direct
 				direct = &copy
@@ -302,7 +338,7 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 		phases["scope"] = "move_direct_reconcile"
 		causes := make([]mutationReadRepairCause, direct.causeCount)
 		copy(causes, direct.causes[:direct.causeCount])
-		payload["direct_reconcile"] = map[string]any{"scope": "move_direct_reconcile", "clock": "monotonic", "owner_generation": direct.generation, "window_ns": direct.windowNS, "accepted_blob_sha": direct.acceptedBlob, "reconcile_causes": causes, "phase_accounting": phases, "additive_with_acknowledgement": false}
+		payload["direct_reconcile"] = map[string]any{"scope": "move_direct_reconcile", "clock": "monotonic", "owner_generation": direct.generation, "window_ns": direct.windowNS, "accepted_blob_sha": direct.acceptedBlob, "writer_return_to_acceptance_ns": direct.writerToAcceptanceNS, "reconcile_causes": causes, "phase_accounting": phases, "additive_with_acknowledgement": false}
 	}
 	var snapshot *editAcknowledgementSnapshot
 	if ack != nil {
