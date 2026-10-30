@@ -25,30 +25,31 @@ type editProbeReadback struct {
 	Error   string `json:"error"`
 }
 type editProbeRecord struct {
-	Ordinal                  int                 `json:"ordinal"`
-	Marker                   string              `json:"marker"`
-	MutationID               string              `json:"mutation_id"`
-	PlannedDueNS             int64               `json:"planned_due_ns"`
-	ActivatedNS              *int64              `json:"activated_ns"`
-	StartedNS                *int64              `json:"started_ns"`
-	StartLatenessNS          *int64              `json:"start_lateness_ns"`
-	Outcome                  string              `json:"outcome"`
-	Receipt                  string              `json:"mutation_receipt"`
-	Ack                      Metric              `json:"t_ack_ms"`
-	Readbacks                []editProbeReadback `json:"readbacks"`
-	FirstCorrect             map[string]Metric   `json:"first_correct_ms"`
-	Accounting               editProbeAccounting `json:"accounting"`
-	PendingReads             int                 `json:"reads_while_receipt_observed_pending"`
-	ProbeErrors              int                 `json:"probe_errors"`
-	StaleClaimedFresh        bool                `json:"stale_claimed_fresh"`
-	PrecommitFreshMismatches int                 `json:"precommit_fresh_mismatches_unassessed"`
-	GraphTerminal            bool                `json:"graph_terminal"`
-	Evidence                 string              `json:"raw_evidence"`
-	EvidenceWriteMS          float64             `json:"evidence_write_ms"`
-	EvidenceEncodeMS         float64             `json:"evidence_encode_ms"`
-	EvidenceBytes            int                 `json:"evidence_bytes"`
-	EvidenceLimit            int                 `json:"evidence_limit_bytes"`
-	Errors                   []string            `json:"errors"`
+	Ordinal                  int                       `json:"ordinal"`
+	Marker                   string                    `json:"marker"`
+	MutationID               string                    `json:"mutation_id"`
+	PlannedDueNS             int64                     `json:"planned_due_ns"`
+	ActivatedNS              *int64                    `json:"activated_ns"`
+	StartedNS                *int64                    `json:"started_ns"`
+	StartLatenessNS          *int64                    `json:"start_lateness_ns"`
+	Outcome                  string                    `json:"outcome"`
+	Receipt                  string                    `json:"mutation_receipt"`
+	Batch                    *editProbeBatchReferences `json:"batch,omitempty"`
+	Ack                      Metric                    `json:"t_ack_ms"`
+	Readbacks                []editProbeReadback       `json:"readbacks"`
+	FirstCorrect             map[string]Metric         `json:"first_correct_ms"`
+	Accounting               editProbeAccounting       `json:"accounting"`
+	PendingReads             int                       `json:"reads_while_receipt_observed_pending"`
+	ProbeErrors              int                       `json:"probe_errors"`
+	StaleClaimedFresh        bool                      `json:"stale_claimed_fresh"`
+	PrecommitFreshMismatches int                       `json:"precommit_fresh_mismatches_unassessed"`
+	GraphTerminal            bool                      `json:"graph_terminal"`
+	Evidence                 string                    `json:"raw_evidence"`
+	EvidenceWriteMS          float64                   `json:"evidence_write_ms"`
+	EvidenceEncodeMS         float64                   `json:"evidence_encode_ms"`
+	EvidenceBytes            int                       `json:"evidence_bytes"`
+	EvidenceLimit            int                       `json:"evidence_limit_bytes"`
+	Errors                   []string                  `json:"errors"`
 }
 type editProbeReport struct {
 	Plan               editProbePlan     `json:"plan"`
@@ -472,9 +473,37 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		return
 	}
 	receipt, _ := body["mutation_receipt"].(string)
+	var batch *editProbeBatchReferences
+	var batchOffered []byte
+	if r.plan.Tool == "edit.batch" {
+		transaction, offered, requestErr := editProbeBatchIntent(step.Request)
+		if requestErr == nil {
+			refs, ackErr := decodeEditProbeBatchAcknowledgement(body, transaction, r.p.Repos[0].File, filepath.ToSlash(filepath.Join(r.p.Repos[0].Prefix, r.plan.File)), offered)
+			requestErr = ackErr
+			if ackErr == nil {
+				batch = &refs
+				batchOffered = offered
+			}
+		}
+		if requestErr != nil {
+			s.mu.Lock()
+			s.record.Outcome = "invalid_ack"
+			s.record.Errors = append(s.record.Errors, requestErr.Error())
+			s.mu.Unlock()
+			return
+		}
+	}
 	s.mu.Lock()
 	s.record.Receipt = receipt
-	if receipt == "" {
+	if batch != nil {
+		s.record.Batch = batch
+		if batch.TransactionError != "" {
+			s.record.Errors = append(s.record.Errors, batch.TransactionError)
+		}
+		s.record.Receipt = ""
+		s.record.MutationID = ""
+	}
+	if receipt == "" && batch == nil {
 		s.record.Errors = append(s.record.Errors, "ACK mutation receipt unavailable")
 	} else if !identity.Finished.IsZero() {
 		s.record.Ack = measured(float64(identity.Finished.Sub(started))/float64(time.Millisecond), "ms")
@@ -508,49 +537,53 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		}
 		s.mu.Unlock()
 	}
-	options := map[string]any{"mutation_id": step.MutationID}
-	if receipt != "" {
-		options = map[string]any{"receipt": receipt}
-	}
-	statusReq := request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": options}}
-	for callCtx.Err() == nil {
-		raw, _, statusErr := r.perform(callCtx, s, s.client, statusReq, "status", "probe", 200)
-		if errors.Is(statusErr, errEditProbeEvidenceIncomplete) {
-			break
+	if batch != nil {
+		r.collectBatchEvidence(callCtx, s, *batch, batchOffered)
+	} else {
+		options := map[string]any{"mutation_id": step.MutationID}
+		if receipt != "" {
+			options = map[string]any{"receipt": receipt}
 		}
-		if statusErr == nil {
-			if status, decodeErr := decodeEditProbeResult(raw); decodeErr == nil {
-				accounting := checkEditProbeAccounting(status, receipt)
-				s.mu.Lock()
-				s.record.Accounting = accounting
-				s.record.GraphTerminal = status["graph_status_terminal"] == true
-				all := true
-				for _, value := range s.record.FirstCorrect {
-					if value.Value == nil {
-						all = false
+		statusReq := request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": options}}
+		for callCtx.Err() == nil {
+			raw, _, statusErr := r.perform(callCtx, s, s.client, statusReq, "status", "probe", 200)
+			if errors.Is(statusErr, errEditProbeEvidenceIncomplete) {
+				break
+			}
+			if statusErr == nil {
+				if status, decodeErr := decodeEditProbeResult(raw); decodeErr == nil {
+					accounting := checkEditProbeAccounting(status, receipt)
+					s.mu.Lock()
+					s.record.Accounting = accounting
+					s.record.GraphTerminal = status["graph_status_terminal"] == true
+					all := true
+					for _, value := range s.record.FirstCorrect {
+						if value.Value == nil {
+							all = false
+						}
+					}
+					terminal := s.record.GraphTerminal
+					if terminal && status["graph_status"] != "fresh" {
+						s.record.Errors = append(s.record.Errors, "terminal graph status is not fresh")
+					}
+					s.mu.Unlock()
+					if terminal && status["graph_status"] != "fresh" {
+						break
+					}
+					if status["mutation_id"] != step.MutationID {
+						s.mu.Lock()
+						s.record.Errors = append(s.record.Errors, "status mutation identity mismatch")
+						s.mu.Unlock()
+						break
+					}
+					if editProbeFinished(terminal, all, r.requireAccounting, accounting) {
+						break
 					}
 				}
-				terminal := s.record.GraphTerminal
-				if terminal && status["graph_status"] != "fresh" {
-					s.record.Errors = append(s.record.Errors, "terminal graph status is not fresh")
-				}
-				s.mu.Unlock()
-				if terminal && status["graph_status"] != "fresh" {
-					break
-				}
-				if status["mutation_id"] != step.MutationID {
-					s.mu.Lock()
-					s.record.Errors = append(s.record.Errors, "status mutation identity mismatch")
-					s.mu.Unlock()
-					break
-				}
-				if editProbeFinished(terminal, all, r.requireAccounting, accounting) {
-					break
-				}
 			}
-		}
-		if waitContext(callCtx, editProbePeriod) != nil {
-			break
+			if waitContext(callCtx, editProbePeriod) != nil {
+				break
+			}
 		}
 	}
 	s.mu.Lock()
@@ -692,7 +725,7 @@ func (r *editProbeRuntime) close() error {
 func (r *editProbeRuntime) restore(ctx context.Context) error {
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
 	for _, record := range r.phase.EditProbe.Records {
-		if record.Receipt == "" || !record.GraphTerminal {
+		if (record.Receipt == "" && record.Batch == nil) || !record.GraphTerminal {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}
 	}

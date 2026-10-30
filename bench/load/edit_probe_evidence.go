@@ -90,7 +90,7 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 	switch oracle {
 	case "source":
 		source, _ := body["source"].(string)
-		if filepath.Ext(c.File) == ".ts" || filepath.Ext(c.File) == ".py" || c.EditTool == "edit.write" {
+		if filepath.Ext(c.File) == ".ts" || filepath.Ext(c.File) == ".py" || (c.EditTool == "edit.write" || c.EditTool == "edit.batch") {
 			id, _ := body["id"].(string)
 			path, _ := body["file_path"].(string)
 			if !editProbeSourceID(id, c.File, step.Marker) || !editProbeFixturePath(path, c.File) {
@@ -100,7 +100,7 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 		return body["name"] == step.Marker && editProbeFixtureSource(c.File, source, step.Marker, callee)
 	case "file":
 		source, _ := body["content"].(string)
-		if filepath.Ext(c.File) == ".ts" || filepath.Ext(c.File) == ".py" || c.EditTool == "edit.write" {
+		if filepath.Ext(c.File) == ".ts" || filepath.Ext(c.File) == ".py" || (c.EditTool == "edit.write" || c.EditTool == "edit.batch") {
 			path, _ := body["path"].(string)
 			if !editProbeFixturePath(path, c.File) {
 				return false

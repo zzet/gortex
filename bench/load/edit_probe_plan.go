@@ -130,13 +130,19 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		marker := fmt.Sprintf("GortexEditProbe%016xN%03d", uint64(seed), i)
 		id := fmt.Sprintf("load-edit-%016x-%03d", uint64(seed), i)
 		r := editRequest(c, marker)
-		if tool == "edit.write" {
+		if tool == "edit.write" || tool == "edit.batch" {
 			if strings.Contains(c.EditInitialContent, marker) {
 				return editProbePlan{}, errors.New("planned marker already exists in write fixture")
 			}
-			r, writeContent = editProbeWriteRequest(c, writeContent, marker)
+			if tool == "edit.batch" {
+				r, writeContent = editProbeBatchRequest(c, writeContent, marker, fmt.Sprintf("load-batch-%016x-%03d", uint64(seed), i))
+			} else {
+				r, writeContent = editProbeWriteRequest(c, writeContent, marker)
+			}
 		}
-		r.Arguments["options"] = map[string]any{"mutation_id": id}
+		if tool != "edit.batch" {
+			r.Arguments["options"] = map[string]any{"mutation_id": id}
+		}
 		hash, err := hashJSON(r)
 		if err != nil {
 			return editProbePlan{}, err

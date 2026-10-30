@@ -388,6 +388,18 @@ func dispatchArgs(r request, repo privateRepo) map[string]any {
 			}
 		}
 	}
+	if r.name() == "edit.batch" {
+		if changes, ok := args["changes"].([]any); ok {
+			for _, item := range changes {
+				if change, ok := item.(map[string]any); ok && change["op"] == "edit_file" {
+					if path, ok := change["path"].(string); ok {
+						change["path"] = repo.Prefix + "/" + path
+					}
+				}
+			}
+		}
+	}
+
 	if r.name() == "change.verify" {
 		if source, ok := args["source"].(map[string]any); ok {
 			if changes, ok := source["changes"].([]any); ok {

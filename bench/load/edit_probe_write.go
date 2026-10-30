@@ -20,7 +20,7 @@ func editProbeTool(c Corpus) (string, error) {
 		if c.EditInitialContent != "" {
 			return "", errors.New("edit_initial_content applies only to explicit edit.write")
 		}
-	case "edit.write":
+	case "edit.write", "edit.batch":
 		if c.EditInitialContent == "" || !utf8.ValidString(c.EditInitialContent) || c.EditAnchor == "" || strings.Count(c.EditInitialContent, c.EditAnchor) != 1 {
 			return "", errors.New("edit.write requires explicit UTF-8 initial content with one stable anchor")
 		}
@@ -41,7 +41,7 @@ func editProbeTool(c Corpus) (string, error) {
 			return "", errors.New("unsupported edit.write fixture language")
 		}
 	default:
-		return "", errors.New("edit-and-probe supports only edit.file or explicit edit.write")
+		return "", errors.New("edit-and-probe supports only edit.file, explicit edit.write or one-file edit.batch")
 	}
 	return tool, nil
 }
@@ -58,7 +58,7 @@ func editProbeWriteRequest(c Corpus, content, marker string) (request, string) {
 // Check the immutable plan against the actual pinned clone before opening any
 // per-edit probe sessions or dispatching edits. This does not refresh intent.
 func editProbeWriteAdmission(c Corpus, original []byte) error {
-	if c.EditTool == "edit.write" && !bytes.Equal(original, []byte(c.EditInitialContent)) {
+	if (c.EditTool == "edit.write" || c.EditTool == "edit.batch") && !bytes.Equal(original, []byte(c.EditInitialContent)) {
 		return errors.New("edit.write initial content differs from the pinned fixture bytes")
 	}
 	return nil

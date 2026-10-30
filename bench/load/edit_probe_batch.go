@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -174,4 +175,96 @@ func (r editProbeBatchReferences) accounting(fileStatus, acknowledgementStatus m
 		return editProbeAccounting{State: "unavailable", Reasons: []string{"shared batch ACK intervals unavailable"}}
 	}
 	return checkEditProbeAccountingWithAcknowledgement(fileStatus, r.Observation, "publication_generation", shared)
+}
+
+func editProbeBatchIntent(req request) (string, []byte, error) {
+	if req.Tool != "edit" || req.Operation != "batch" {
+		return "", nil, errors.New("not the supported edit.batch request")
+	}
+	options, ok := req.Arguments["options"].(map[string]any)
+	if !ok {
+		return "", nil, errors.New("batch transaction option unavailable")
+	}
+	id, _ := options["transaction_id"].(string)
+	changes, ok := req.Arguments["changes"].([]any)
+	if id == "" || !ok || len(changes) != 1 {
+		return "", nil, errors.New("one-file batch offered intent unavailable")
+	}
+	change, ok := changes[0].(map[string]any)
+	if !ok || change["op"] != "edit_file" {
+		return "", nil, errors.New("unsupported batch operation")
+	}
+	before, beforeOK := change["old_string"].(string)
+	after, afterOK := change["new_string"].(string)
+	if !beforeOK || !afterOK || before == "" || after == "" {
+		return "", nil, errors.New("batch whole-file intent unavailable")
+	}
+	return id, []byte(after), nil
+}
+
+// Poll the durable transaction separately from the shared A and original file
+// P/B/R owners. This begins only after own-ACK immediate readbacks; neither
+// scheduling nor the readback continuation waits for another offered edit.
+func (r *editProbeRuntime) collectBatchEvidence(ctx context.Context, s *editProbeState, refs editProbeBatchReferences, offered []byte) {
+	perform := func(req request, purpose string, slot int) (map[string]any, error) {
+		raw, _, err := r.perform(ctx, s, s.client, req, purpose, "probe", slot)
+		if err != nil {
+			return nil, err
+		}
+		return decodeEditProbeResult(raw)
+	}
+	for ctx.Err() == nil {
+		tx, err := perform(request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "options": map[string]any{"transaction_id": refs.TransactionID, "status_only": true}}}, "batch_transaction_status", 200)
+		if errors.Is(err, errEditProbeEvidenceIncomplete) {
+			return
+		}
+		if err == nil {
+			current, decodeErr := decodeEditProbeBatchAcknowledgement(tx, refs.TransactionID, refs.Path, refs.RelativePath, offered)
+			if decodeErr != nil {
+				s.mu.Lock()
+				s.record.Errors = append(s.record.Errors, "batch status source identity: "+decodeErr.Error())
+				s.mu.Unlock()
+				return
+			}
+			// A durable recovery may legitimately replace its live publication. That
+			// does not authorize borrowing the replacement for the original clocks.
+			if current.GraphReceipt != refs.GraphReceipt || current.GraphGeneration != refs.GraphGeneration {
+				s.mu.Lock()
+				s.record.Errors = append(s.record.Errors, "batch publication was readmitted; original accounting unavailable")
+				s.mu.Unlock()
+				return
+			}
+			file, fileErr := perform(request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": map[string]any{"receipt": refs.Observation}}}, "batch_file_status", 201)
+			ack, ackErr := perform(request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": map[string]any{"receipt": refs.Acknowledgement}}}, "batch_ack_status", 202)
+			if errors.Is(fileErr, errEditProbeEvidenceIncomplete) || errors.Is(ackErr, errEditProbeEvidenceIncomplete) {
+				return
+			}
+			if fileErr == nil && ackErr == nil {
+				accounting := refs.accounting(file, ack)
+				terminal := tx["graph_status"] == "fresh" || tx["graph_status"] == "failed"
+				s.mu.Lock()
+				s.record.Accounting = accounting
+				s.record.GraphTerminal = terminal
+				all := true
+				for _, value := range s.record.FirstCorrect {
+					if value.Value == nil {
+						all = false
+					}
+				}
+				if terminal && tx["graph_status"] != "fresh" {
+					s.record.Errors = append(s.record.Errors, "batch graph publication failed")
+				}
+				s.mu.Unlock()
+				if terminal && tx["graph_status"] != "fresh" {
+					return
+				}
+				if editProbeFinished(terminal, all, r.requireAccounting, accounting) {
+					return
+				}
+			}
+		}
+		if waitContext(ctx, editProbePeriod) != nil {
+			return
+		}
+	}
 }

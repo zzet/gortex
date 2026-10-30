@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,7 +9,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func editProbeBatchACKAbsPath() string {
@@ -190,5 +193,124 @@ func TestEditProbeBatchAccountingKeepsSharedACKOutsideFileAndWinnerWindows(t *te
 	}
 	if file["acknowledgement"].(map[string]any)["rpc_id"] != "foreign-file-RPC" {
 		t.Fatal("mutated/merged original file status")
+	}
+}
+
+func TestEditProbeBatchPlanKeepsOfferedPrefixAndScheduleAcrossFixtureLanguages(t *testing.T) {
+	for _, language := range []string{"go", "typescript", "python"} {
+		t.Run(language, func(t *testing.T) {
+			c := editProbeWriteCorpus(t, language)
+			write, err := makeEditProbePlan(c, 42, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.EditTool = "edit.batch"
+			plan, err := makeEditProbePlan(c, 42, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.Tool != "edit.batch" || len(plan.Steps) != 100 {
+				t.Fatal("wrong tool/denominator")
+			}
+			prior := c.EditInitialContent
+			for i, step := range plan.Steps {
+				id, offered, err := editProbeBatchIntent(step.Request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if id == step.MutationID || id == "" {
+					t.Fatal("borrowed single mutation identity")
+				}
+				if step.DueNS != write.Steps[i].DueNS || step.ActivateNS != write.Steps[i].ActivateNS || step.Marker != write.Steps[i].Marker {
+					t.Fatal("tool changed offered traffic")
+				}
+				if string(offered) != write.Steps[i].Request.Arguments["content"] {
+					t.Fatal("batch regenerated different offered bytes")
+				}
+				change := step.Request.Arguments["changes"].([]any)[0].(map[string]any)
+				if change["old_string"] != prior {
+					t.Fatal("batch does not require exact prior offered prefix")
+				}
+				prior = string(offered)
+				args := dispatchArgs(step.Request, privateRepo{Prefix: "owned-repo"})
+				wire := args["changes"].([]any)[0].(map[string]any)
+				if wire["path"] != "owned-repo/"+c.File || change["path"] != c.File {
+					t.Fatal("wrong actual scoped path or mutated immutable plan")
+				}
+			}
+			if err := editProbeWriteAdmission(c, []byte(c.EditInitialContent+"unexpected")); err == nil {
+				t.Fatal("accepted different initial bytes")
+			}
+		})
+	}
+}
+
+func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) {
+	refs, err := decodeEditProbeBatchAcknowledgement(editProbeBatchACKFixture(), "transaction-1", editProbeBatchACKAbsPath(), "repo/file.go", editProbeBatchOfferedBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs.GraphGeneration, refs.ResultGeneration = 1, 1
+	tx := editProbeBatchACKFixture()
+	tx["graph_status"] = "fresh"
+	tx["files"].([]any)[0].(map[string]any)["reindex_generation"] = json.Number("1")
+	tx["results"].([]any)[0].(map[string]any)["reindex_generation"] = json.Number("1")
+	file := editProbeAccountingFixture()
+	shared := map[string]any{"found": true, "receipt": refs.Acknowledgement, "receipt_kind": "batch_acknowledgement", "acknowledgement": file["acknowledgement"]}
+	delete(file, "acknowledgement")
+	file["found"], file["receipt_kind"], file["receipt"] = true, "batch_file_observation", refs.Observation
+	file["transaction_id"], file["path"], file["batch_disk_verdict"] = refs.TransactionID, refs.RelativePath, "committed"
+	file["after_sha256"], file["publication_receipt"], file["publication_generation"] = refs.AfterSHA256, refs.GraphReceipt, json.Number("1")
+	file["writer_return_observed"], file["acknowledgement_state"] = true, "not_applicable_shared_transaction_rpc"
+	var mu sync.Mutex
+	var owners []string
+	socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
+		args, _ := frame.Params["arguments"].(map[string]any)
+		options, _ := args["options"].(map[string]any)
+		var owner string
+		var response map[string]any
+		if frame.Params["name"] == "edit" {
+			owner, _ = options["transaction_id"].(string)
+			response = tx
+		} else {
+			owner, _ = options["receipt"].(string)
+			if owner == refs.Observation {
+				response = file
+			} else if owner == refs.Acknowledgement {
+				response = shared
+			}
+		}
+		mu.Lock()
+		owners = append(owners, owner)
+		mu.Unlock()
+		return stubContent(response), nil
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	client, err := openMCP(ctx, socket, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	sink, err := os.CreateTemp(t.TempDir(), "batch-evidence-*.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+	state := &editProbeState{client: client, sink: sink, record: editProbeRecord{FirstCorrect: map[string]Metric{"oracle": measured(1, "ms")}}}
+	state.startRaw()
+	defer state.finishRaw()
+	run := &editProbeRuntime{options: runOptions{Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Prefix: "repo"}}}, phase: &Phase{Metrics: map[string]Metric{}}, origin: time.Now(), requireAccounting: true}
+	run.collectBatchEvidence(ctx, state, refs, editProbeBatchOfferedBytes())
+	if ctx.Err() != nil || !state.record.GraphTerminal || state.record.Accounting.State != "observed_single_window_checks_pass" {
+		t.Fatalf("actual collector failed: %+v %v", state.record, ctx.Err())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(owners, []string{refs.TransactionID, refs.Observation, refs.Acknowledgement}) {
+		t.Fatal("owner route mismatch", owners)
+	}
+	if state.record.Receipt != "" {
+		t.Fatal("invented single-file mutation receipt")
 	}
 }
