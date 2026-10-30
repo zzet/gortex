@@ -216,6 +216,8 @@ func collectMicrobench(ctx context.Context, c microConfig, out string, workflow 
 					}
 					env := append(os.Environ(), "TMPDIR="+root, "TMP="+root, "TEMP="+root)
 					stdout, stderr, err = process(runCtx, binary, []string{"-test.run=^$", "-test.bench=.", "-test.benchmem", "-test.count=1", "-test.benchtime=" + c.Benchtime, "-test.timeout=" + c.Timeout}, filepath.Join(c.Fixture, pkg), env)
+					run.AbnormalTermination = err != nil
+					run.DeadlineExceeded = errors.Is(err, context.DeadlineExceeded)
 					cancel()
 					err = errors.Join(err, os.WriteFile(filepath.Join(root, "stdout.txt"), stdout, 0o600), os.WriteFile(filepath.Join(root, "stderr.txt"), stderr, 0o600))
 				}
@@ -232,8 +234,6 @@ func collectMicrobench(ctx context.Context, c microConfig, out string, workflow 
 				}
 				if err != nil {
 					run.Error = err.Error()
-					run.AbnormalTermination = true
-					run.DeadlineExceeded = errors.Is(err, context.DeadlineExceeded)
 					failures = append(failures, fmt.Errorf("%s/%d/%s: %w", pkg, repeat, role, err))
 				}
 				combined[role] = append(combined[role], []byte("pkg: github.com/zzet/gortex/"+pkg+"\n")...)

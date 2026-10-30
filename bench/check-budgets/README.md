@@ -20,7 +20,7 @@ nonzero. Existing output files are never overwritten. The separate
 `perf-gate.yml` workflow publishes readiness, explicitly named **not acceptance**.
 Owned-host measurement jobs are skipped unless their reviewed runner/config
 variables are enabled. There is no formal PR smoke measurement job yet: hosted
-ARM capacity is not the reference cgroup, and exact smoke observations remain
+ARM has its own scoped profile and exact smoke observations/scheduling remain
 unavailable. Readiness cannot satisfy a required performance acceptance check.
 
 ## Repeated evidence and comparison identity
@@ -46,7 +46,18 @@ Missing or non-hex plan hashes fail. No other load/scoping difference is silentl
 normalized. Paired native reports and saturation reports are rejected as formal
 capacity evidence rather than relabeled as independent agent runs.
 
-Reference Linux requires the actual validated cgroup/host observations: 8 CPU,
+The policy has 837 rows: 689 block and 148 guard. Its 38 PR smoke targets use
+`hosted_arm_smoke`, exclusively for the issue's `ubuntu-24.04-arm` lane. This is
+the public standard four-CPU runner, rather than reference-capacity evidence.
+The harness reports actual native Linux ARM64 CPU/memory/disk observations;
+the consumer requires four logical CPUs, positive observed memory/disk values,
+and current GitHub-hosted Linux ARM job attestation. Advertised 16-GB memory
+and 14-GB disk are not fabricated exact byte observations. All 38 targets,
+units, comparisons and repetition minima are unchanged. This profile is illegal
+for nightly/release policy or checking. See the
+[official runner inventory](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
+Reference Linux still requires actual validated cgroup/host observations: 8 CPU,
 16 GiB memory and a 57–60 GiB usable filesystem. Native Mac class assignment
 requires a separately reviewed runner inventory; the checker binds it to the
 exact Darwin ARM64 machine and reported limits, without claiming to discover
@@ -61,6 +72,10 @@ and correctness floors apply to every repeat; a median cannot hide one bad
 run. Complete reports must retain successful stop evidence, zero crashes and
 uncensored/error-free observations. Busy attempts remain in the busy-fraction
 denominator, including refused attempts whose eventual retry succeeded.
+Linux OOM safety requires the authoritative `scenario_cgroup_oom_kills` event
+delta alongside zero log counts. Missing counters fail. Mac authoritative
+OOM-kill evidence is an explicit prerequisite; zero OOM log lines are not
+substituted for zero kills.
 
 ## Limits and named allowances
 
@@ -253,6 +268,111 @@ as skipped. Removing the variable stops future scheduling without cancelling
 an in-flight owned daemon. A host being busy is reason to leave its lane
 disabled, not to attach to an unrelated active session.
 
+## Trusted exact-main artifacts and same-job smoke
+
+`perf-main.yml` is an opt-in build-only producer, separate from CI tests and
+measurement jobs. `PERF_MAIN_ARTIFACT_ENABLED` remains unset. Its trusted main
+push binds a clean daemon's full VCS SHA, pinned Go/C/C++ flags, platform,
+workflow run/attempt and binary hash in a two-file bundle. No build-host timing
+is compared with PR measurements. Current retained artifacts have no usable
+main daemon or benchmark bundle; publishing the first reviewed exact-main
+artifact remains required.
+
+```sh
+# Supply the job-scoped GH_TOKEN. The consumer needs actions: read for run/
+# artifact metadata and downloads, alongside contents: read; no write PAT.
+go run ./bench/check-budgets fetch-main --main-revision FULL_MAIN_SHA \
+  --out /benchmark/NEW-main-bundle
+
+go run ./bench/check-budgets collect --config reviewed-smoke.json --job-host \
+  --out /benchmark/NEW-smoke-evidence
+
+go run ./bench/check-budgets verify-smoke --evidence /benchmark/smoke-evidence \
+  --main-bundle /benchmark/main-bundle
+```
+
+The lookup accepts exactly the requested full main revision from the dedicated
+successful push workflow/repository, never a PR/fork, another workflow, older
+green revision, expired artifact, missing digest or mismatched platform. The
+newest successful matching run/attempt must have exactly one bundle. GitHub's
+archive SHA256, safe ZIP file inventory, bundled binary hash and metadata are
+verified. Redirects cannot forward authentication to another host. Offline
+verification checks content; trusted GitHub download/owner review still provide
+provenance, not arbitrary local JSON.
+
+A smoke config requires `main_artifact` pointing to that downloaded directory,
+and `builds.main.binary` to its `gortex` file. Both main and candidate execute
+sequentially in this one PR run/attempt/job under the same host/corpus/workload.
+Go/platform/build settings must match; only VCS revision/time differ. Every raw
+report start must lie inside its recorded task interval. The unchanged checker
+then applies all planned repeats, absolute limits, deterministic counters,
+median-of-three p95 and +20% rule. `--job-host` binds the actual ephemeral
+hostname only for this owned hosted PR context; it cannot relabel reference
+capacity. Missing jobs, stale reports, mismatched builds or incomplete policy
+remain failures.
+
+## Microbenchmark and benchstat integration
+
+`microbench --inputs reviewed-micro.json --out NEW-DIR` runs prebuilt exact-main
+and candidate test executables for the existing CI packages on the same job:
+`internal/parser/languages`, `internal/query`, and `internal/graph`. It requires
+at least three sequential repeats, rotates build order, retains all raw outputs
+and failures, and refuses differing benchmark/unit censuses. It invokes only
+buildinfo-verified benchstat at the existing `bench-arm.yml` pin:
+`golang.org/x/perf/cmd/benchstat@v0.0.0-20260409210113-8e83ce0f7b1c`.
+No module dependency or new version is selected. Build tools/test executables
+with the pinned Go; use `go test -c -buildvcs=true` and required C/C++ flags so
+clean test-binary VCS/build identity is present.
+
+The strict JSON input fields are `schema_version:1`, `main_revision`,
+`candidate_revision`, `fixture`, `fixture_revision`, `benchstat_binary`,
+`benchtime`, `timeout`, `repeats`, and `binaries`. The latter maps exactly those
+three package paths to `{main,candidate}` executable paths. Paths resolve
+relative to the config. Time/iteration profile and timeout are explicit; no
+shorter profile is silently chosen. The query benchmark indexes `../..`, so
+both builds run from package directories under the **same clean pinned fixture
+snapshot**, never arbitrary binary-download CWDs. Fixture cleanliness is checked
+again after runs and before benchstat. Changed input fails. Interrupted/missing
+samples remain failed evidence. Benchmark-only processes get an Interrupt then
+a two-second kill/join bound; abnormal exit/context errors cannot become success.
+The daemon collector instead joins owned cleanup without killing its client.
+
+Outputs include per-run raw text, combined main/candidate samples, benchstat
+text and `microbench.json`. `formal_acceptance` is always false: the workload
+gate must independently pass. Trusted publication/retrieval of the **three main
+test executables** is not part of the current daemon-only artifact format;
+its packaging/hashes/build flags need review before PR enablement. Synthetic
+fixture tests are not measured benchmark evidence.
+
+## PR scheduling feasibility remains unresolved
+
+The standalone collector plans five steps × two builds × three repeats: 30 owned
+scenario starts once fixtures exist. At 120-second read and edit windows, those
+two workloads alone consume 24 minutes, before startup, sweep, restart, stop,
+compilation/download or microbenchmarks. Even 60-second windows consume 12
+minutes. The manual 15-repeat/21-operation sweep and three fresh query benchmark
+processes per build add paced calls and cold fixture indexing. This does not
+honestly establish the required 15-minute lane.
+
+The pointed runtime design to evaluate is three main/candidate repeat pairs
+using private warm base state, restoring identical pinned source/store state
+before each required phase and draining every call/probe before teardown.
+Preserve exact readback/output-mode correctness, all 21 sweep operations, warm
+restart and idle stop; edits must not contaminate a later phase's topology.
+Build/validate stores for their own binary/schema rather than blindly reusing
+main state with candidate. Warm ownership/restoration, actual 14-GB-host disk
+use, cold setup, phase drain and cleanup all count toward wall time.
+`bench/load` has no phased restoration contract yet; coordinate with its active
+owner before changing its runtime/client. Merely shortening windows or dropping
+probes is not this implementation. A reviewed smoke profile needs matching
+same-job controls and sufficient uncensored probes before 20-run and seeded
+regression trials.
+
+Keep performance outside `ci.yml` and on its specified ARM lane. Extra artifact
+production can still contend for hosted account concurrency, so rollout also
+requires the real 20-PR wall comparison. No runner or job is enabled by this
+source plan.
+
 ## Remaining lane and acceptance work
 
 Before enabling measurement jobs or external setup, review the source plan,
@@ -265,9 +385,10 @@ model calls. A PR smoke lane must remain separate from CI test jobs and run on
 Reports/table artifacts need effective retention of at least 90 days.
 
 The implemented plan declares all five smoke steps but refuses the unavailable
-idle-stop fixture and exact observations. The measured PR runner, comparable
-latest-main artifact retrieval, existing micro-benchmark benchstat and measured
-duration estimate remain to implement after smoke infrastructure is reviewed.
+idle-stop fixture and exact observations. Exact-main retrieval, same-job admission and the Go microbenchmark/benchstat
+runner are implemented source. The measured phased PR driver, trusted main test-
+binary packaging and feasible duration/probe profile remain to implement and
+validate before enabling measurements.
 The frozen default
 60-second duration is not a measured feasibility guarantee; the retained native
 read1 cohort used 120-second windows. Those 120-second read/edit windows repeated
