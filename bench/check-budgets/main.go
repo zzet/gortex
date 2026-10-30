@@ -1,5 +1,6 @@
 // Command check-budgets compares repeated #996 report-v1 measurements with the
-// release policy. It consumes evidence; it never starts a benchmark or daemon.
+// release policy. The default command consumes evidence; collect invokes the
+// signal-aware load client for private owned daemons. Plan starts no workload.
 package main
 
 import (
