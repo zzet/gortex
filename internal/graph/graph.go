@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"iter"
 	"math/bits"
 	"os"
@@ -4555,6 +4556,17 @@ func bfsHopLess(a, b BFSHop) bool {
 // semantics. Always returns a nil error (the error in the signature is
 // for the disk implementation's query failures).
 func (g *Graph) BFS(seeds []string, dir Direction, kinds []EdgeKind, maxDepth, limit int) ([]BFSHop, error) {
+	return BFSOf(context.Background(), g, seeds, dir, kinds, maxDepth, limit)
+}
+
+// BFSOf is the canonical hop-set traversal over a selected reader. Adjacency
+// masks are applied by that reader before discovery; physical BFS is never
+// forwarded through a composed or contract-derived edge mask.
+func BFSOf(ctx context.Context, g Reader, seeds []string, dir Direction, kinds []EdgeKind, maxDepth, limit int) ([]BFSHop, error) {
+	ctx = normalizeNameLookupContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(seeds) == 0 {
 		return nil, nil
 	}
@@ -4591,11 +4603,23 @@ func (g *Graph) BFS(seeds []string, dir Direction, kinds []EdgeKind, maxDepth, l
 			// — matching the CTE's ROW_NUMBER pick.
 			cand := make(map[string]BFSHop)
 			for _, cur := range frontier {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				var edges []*Edge
-				if forward {
+				if typed, ok := g.(KindAdjacencyReader); ok {
+					rows, err := typed.ReadKindAdjacency(ctx, cur, dir, kinds)
+					if err != nil {
+						return nil, err
+					}
+					edges = rows.Edges
+				} else if forward {
 					edges = g.GetOutEdges(cur)
 				} else {
 					edges = g.GetInEdges(cur)
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, err
 				}
 				for _, e := range edges {
 					if e == nil {
@@ -4653,7 +4677,7 @@ func (g *Graph) BFS(seeds []string, dir Direction, kinds []EdgeKind, maxDepth, l
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
-	return out, nil
+	return out, ctx.Err()
 }
 
 // ExtractCandidates is the in-memory reference implementation of
