@@ -130,6 +130,9 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		marker := fmt.Sprintf("GortexEditProbe%016xN%03d", uint64(seed), i)
 		id := fmt.Sprintf("load-edit-%016x-%03d", uint64(seed), i)
 		r := editRequest(c, marker)
+		if tool == "edit.symbol" {
+			r = editProbeSymbolRequest(c, marker)
+		}
 		if tool == "edit.write" || tool == "edit.batch" {
 			if strings.Contains(c.EditInitialContent, marker) {
 				return editProbePlan{}, errors.New("planned marker already exists in write fixture")
