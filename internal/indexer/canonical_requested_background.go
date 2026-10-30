@@ -381,7 +381,7 @@ func (b canonicalBackgroundEvidence) project(physical *EditPatchAccounting) *Req
 	} else if b.handoffs > 1 {
 		coverage = "successful_pre_callback_native_handoffs"
 	}
-	out := &RequestedBackgroundTiming{Scope: "accepted_scheduling_call_entry_to_serving_attempt_return", Coverage: coverage, SumState: "partial", OriginWall: b.origin.UTC().Format(time.RFC3339Nano), RequestedGeneration: b.requested, AppliedGeneration: b.applied, NativeHandoffs: b.handoffs, AdmissionPredecessor: b.admissionPredecessor, AdmissionPredecessorStopped: b.admissionPredecessor != 0, WallMS: float64(b.endNS) / 1e6, PhasesMS: make(map[string]float64, len(requestedBackgroundLapNames)+canonicalPatchLapCount), PartitionComplete: true}
+	out := &RequestedBackgroundTiming{Scope: "accepted_scheduling_call_entry_to_serving_attempt_return", Coverage: coverage, SumState: "partial", OriginWall: b.origin.UTC().Format(time.RFC3339Nano), RequestedGeneration: b.requested, AppliedGeneration: b.applied, NativeHandoffs: b.handoffs, AdmissionPredecessor: b.admissionPredecessor, AdmissionPredecessorStopped: b.admissionPredecessor != 0, WallMS: float64(b.endNS) / 1e6, PhasesMS: make(map[string]float64, len(requestedBackgroundLapNames)+int(canonicalPatchLapCount)), PartitionComplete: true}
 	for i, name := range requestedBackgroundLapNames {
 		out.PhasesMS[name] = float64(b.phases[i]) / 1e6
 	}
