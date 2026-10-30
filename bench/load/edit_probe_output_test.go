@@ -174,11 +174,56 @@ func TestEditProbeTOONCensusKeepsOmittedCountsUnavailable(t *testing.T) {
 	}
 }
 
-func TestEditProbeTOONSignatureDoesNotBorrowMissingJSONMetadata(t *testing.T) {
-	c := editProbeCorpus()
-	c.EditOutput, c.EditKind = "toon", "change_signature"
-	if _, err := makeEditProbePlan(c, 42, 1); err == nil {
-		t.Fatal("missing TOON span/signature proof silently accepted")
+func TestEditProbeTOONSignatureUsesActualCompactRelativeWitness(t *testing.T) {
+	for _, language := range []string{"go", "typescript", "python"} {
+		t.Run(language, func(t *testing.T) {
+			c := editProbeSignatureCorpus(t, language, 1)
+			c.EditOutput = "toon"
+			plan, err := makeEditProbePlan(c, 42, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			step := plan.Steps[0]
+			oracles := editProbeOracles(c, step)
+			if oracles[5].call.Arguments["target"].(map[string]any)["symbol"] != step.TargetSymbol || oracles[6].call.Arguments["target"].(map[string]any)["symbol"] != step.FollowingSymbol || oracles[6].call.Arguments["options"].(map[string]any)["depth"] != 2 {
+				t.Fatal("lost actual following-caller traversal")
+			}
+			for _, oracle := range []string{"callers", "call_chain"} {
+				operation := map[string]string{"callers": "relations.callers", "call_chain": "trace.call_chain"}[oracle]
+				for _, variant := range []string{"valid", "stale_gap", "wrong_proof", "truncated", "wrong_callee", "missing_total"} {
+					gap := step.ExpectedLineGap
+					if variant == "stale_gap" {
+						gap--
+					}
+					callee := c.Symbol
+					if variant == "wrong_callee" {
+						callee = c.File + "::Foreign"
+					}
+					producer := map[string]any{"nodes": []any{map[string]any{"id": step.TargetSymbol, "start_line": 10}, map[string]any{"id": step.FollowingSymbol, "start_line": 10 + gap}}, "edges": []any{map[string]any{"from": step.TargetSymbol, "to": callee, "kind": "calls"}}, "total": 2, "truncated": variant == "truncated"}
+					if variant == "missing_total" {
+						delete(producer, "total")
+					}
+					encoded, err := toon.Marshal(producer)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if variant == "wrong_proof" {
+						operation = "read.summary"
+					}
+					body, err := decodeEditProbeOutput(outputWire(string(encoded), nil), "toon", operation)
+					if err != nil {
+						t.Fatal(err)
+					}
+					correct := editProbeCorrect(oracle, body, c, step, plan.Callee)
+					if correct != (variant == "valid") {
+						t.Fatalf("%s/%s correct=%v", oracle, variant, correct)
+					}
+					if _, exists := body["total_nodes"]; exists {
+						t.Fatal("fabricated full count")
+					}
+				}
+			}
+		})
 	}
 }
 

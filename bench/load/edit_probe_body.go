@@ -31,6 +31,13 @@ func editProbeBodyOracles(c Corpus, step editProbeStep) []editProbeOracle {
 	}
 	if c.EditKind == "change_signature" {
 		oracles[4].call.Arguments["query"] = "optional"
+		if c.EditOutput == "toon" {
+			// Compact traversal rows retain start lines, not signature/end-line
+			// metadata. The unchanged real caller supplies the relative witness.
+			oracles[5].call.Arguments["target"] = target
+			oracles[6].call.Arguments["target"] = map[string]any{"symbol": step.FollowingSymbol}
+			oracles[6].call.Arguments["options"] = map[string]any{"depth": 2, "limit": 1000}
+		}
 	}
 	return oracles
 }
@@ -149,6 +156,14 @@ func editProbeBodyCorrect(oracle string, body map[string]any, c Corpus, step edi
 			}
 		}
 		if c.EditKind == "change_signature" {
+			if c.EditOutput == "toon" {
+				operation := map[string]string{"callers": "relations.callers", "call_chain": "trace.call_chain"}[oracle]
+				proof, ok := body[editProbeTOONWireKey].(editProbeTOONWire)
+				rows, rowsOK := body["nodes"].([]any)
+				_, nodesComplete := editProbeCompleteCount(body, "nodes", "total_nodes")
+				_, edgesComplete := editProbeCompleteCount(body, "edges", "total_edges")
+				return found && ok && proof.operation == operation && rowsOK && nodesComplete && edgesComplete && editProbeBodyGap(rows, c, step)
+			}
 			return found && editProbeBodySpan(body, c, step)
 		}
 		return found

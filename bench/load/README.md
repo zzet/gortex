@@ -162,10 +162,11 @@ The harness does not insert those missing producer fields. Complete-row checks
 require the known producer operation, exact declared node total, explicit
 nontruncation and actual emitted collections; missing, clipped or contradictory
 rows remain failures. File summaries retain their full explicit counts, signature metadata and end lines.
-Compact traversal rows omit signature/end-line metadata, so
-TOON `change_signature` is explicitly unsupported pending a producer-backed
-changed-graph witness. This temporary harness refusal is not acceptance or a
-waiver of the signature/output cell. TOON source implementation and offline
+Compact traversal rows omit signature/end-line metadata. The pointed TOON
+`change_signature` fixture instead traverses its unchanged following caller and
+checks the changed relative start-line gap plus actual call relation; full
+summary and editing-context signature checks remain separate. Actual Go,
+TypeScript and Python producer controls establish that wire shape. TOON source implementation and offline
 controls do not establish live, reference, traffic or performance coverage.
 
 `--scenario edit-and-probe --profile agent --agents 0 --edit-agents 1
