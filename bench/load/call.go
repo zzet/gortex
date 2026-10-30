@@ -130,6 +130,11 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 			} else if retryTyped && remote != nil && remote.retryEditProbe() {
 				a.Outcome = "retryable"
 			}
+			if _, expected := err.(*editProbeExpectedAbsence); expected {
+				a.Outcome = "expected_refusal"
+				a.Code = -32000
+				a.ExpectedOutcome = "symbol_absent"
+			}
 			if callCtx.Err() != nil {
 				a.Outcome = terminalOutcome()
 			}

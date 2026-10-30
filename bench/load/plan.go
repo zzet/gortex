@@ -54,9 +54,10 @@ func busyBackoff(retry int) time.Duration {
 }
 
 type request struct {
-	Tool      string         `json:"tool"`
-	Operation string         `json:"operation"`
-	Arguments map[string]any `json:"arguments"`
+	Tool                 string         `json:"tool"`
+	Operation            string         `json:"operation"`
+	Arguments            map[string]any `json:"arguments"`
+	ExpectedAbsentSymbol string         `json:"expected_absent_symbol,omitempty"`
 }
 
 // Workload is the complete normalized offered load. Binary paths, private

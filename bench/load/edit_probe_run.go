@@ -19,10 +19,12 @@ const editProbeRawLimit = 8 << 20
 var errEditProbeEvidenceIncomplete = errors.New("harness evidence incomplete")
 
 type editProbeReadback struct {
-	Kind    string `json:"kind"`
-	Latency Metric `json:"latency_ms"`
-	Correct bool   `json:"correct"`
-	Error   string `json:"error"`
+	Kind            string `json:"kind"`
+	Latency         Metric `json:"latency_ms"`
+	Correct         bool   `json:"correct"`
+	Error           string `json:"error"`
+	ExpectedOutcome string `json:"expected_outcome,omitempty"`
+	Refusal         string `json:"refusal,omitempty"`
 }
 type editProbeRecord struct {
 	Ordinal                  int                       `json:"ordinal"`
@@ -40,6 +42,7 @@ type editProbeRecord struct {
 	FirstCorrect             map[string]Metric         `json:"first_correct_ms"`
 	Accounting               editProbeAccounting       `json:"accounting"`
 	PendingReads             int                       `json:"reads_while_receipt_observed_pending"`
+	ExpectedRefusals         int                       `json:"expected_refusals,omitempty"`
 	ProbeErrors              int                       `json:"probe_errors"`
 	StaleClaimedFresh        bool                      `json:"stale_claimed_fresh"`
 	PrecommitFreshMismatches int                       `json:"precommit_fresh_mismatches_unassessed"`
@@ -83,6 +86,7 @@ type editProbeState struct {
 	pairedContext                                     context.Context // shared per-edit probes; cleared after joined completion
 	probes                                            sync.WaitGroup
 	started, acknowledged, firstProbeWrite, editWrite time.Time
+	absenceBefore                                     map[string]bool
 }
 
 type editProbeRuntime struct {
@@ -284,6 +288,7 @@ type editProbeCaller struct {
 	purpose string
 	request request
 	last    wireCallIdentity
+	role    string
 }
 
 func (c *editProbeCaller) responseReturnedAt() time.Time { return c.last.Finished }
@@ -299,9 +304,18 @@ func (c *editProbeCaller) call(ctx context.Context, method string, params any) (
 		c.state.firstProbeWrite = identity.WriteStarted
 	}
 	c.state.mu.Unlock()
+	if err == nil {
+		if expected := c.expectedAbsence(data, identity); expected != nil {
+			err = expected
+		}
+	}
 	row := map[string]any{"event": "rpc", "purpose": c.purpose, "tool": c.request.name(), "wire_id": identity.ID, "call_start_ns": editProbeOffset(identity.Started, c.runtime.origin), "write_start_ns": editProbeOffset(identity.WriteStarted, c.runtime.origin), "write_end_ns": editProbeOffset(identity.WriteFinished, c.runtime.origin), "reply_delivered_ns": editProbeOffset(identity.ReplyDelivered, c.runtime.origin), "call_end_ns": editProbeOffset(identity.Finished, c.runtime.origin), "payload": data}
 	if err != nil {
 		row["error"] = err.Error()
+		if expected, ok := err.(*editProbeExpectedAbsence); ok {
+			row["expected_outcome"] = "symbol_absent"
+			row["expected_symbol"] = expected.symbol
+		}
 	}
 	if evidenceErr := c.state.emit(row); evidenceErr != nil {
 		return data, errors.Join(err, evidenceErr)
@@ -331,7 +345,7 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 	if end, ok := ctx.Deadline(); ok {
 		budget = min(budget, time.Until(end))
 	}
-	caller := &editProbeCaller{runtime: r, state: s, client: client, purpose: purpose, request: req}
+	caller := &editProbeCaller{runtime: r, state: s, client: client, purpose: purpose, request: req, role: role}
 	data, attempts, err := callEditProbeTool(ctx, caller, req, dispatchArgs(req, r.p.Repos[0]), role, 0, s.step.Ordinal, stream, budget, editProbeRetrySleep(r.options.Seed, s.step.Ordinal, stream))
 	r.mu.Lock()
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
@@ -365,10 +379,14 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 		sent = identity.WriteStarted
 	}
 	body, decodeErr := decodeEditProbeResult(data)
-	correct := err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, r.p.Repos[0].Corpus, s.step, r.plan.Callee)
+	absence, exactRefusal := err.(*editProbeExpectedAbsence)
+	expectedAbsence := oracle.call.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == r.p.Repos[0].Prefix+"/"+oracle.call.ExpectedAbsentSymbol
+	correct := expectedAbsence || err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, r.p.Repos[0].Corpus, s.step, r.plan.Callee)
 	fresh := decodeErr == nil && editProbeClaimsFresh(body)
 	s.mu.Lock()
-	if err != nil {
+	if expectedAbsence {
+		s.record.ExpectedRefusals++
+	} else if err != nil {
 		s.record.ProbeErrors++
 	}
 	if correct {
@@ -524,11 +542,18 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		if !identity.Finished.IsZero() {
 			back.Latency = measured(float64(identity.Finished.Sub(begin))/float64(time.Millisecond), "ms")
 		}
-		if readErr != nil {
-			back.Error = readErr.Error()
-		}
-		if decodeErr != nil {
-			back.Error = decodeErr.Error()
+		absence, exactRefusal := readErr.(*editProbeExpectedAbsence)
+		if req.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == r.p.Repos[0].Prefix+"/"+req.ExpectedAbsentSymbol {
+			back.Correct = true
+			back.ExpectedOutcome = "symbol_absent"
+			back.Refusal = absence.message
+		} else {
+			if readErr != nil {
+				back.Error = readErr.Error()
+			}
+			if decodeErr != nil {
+				back.Error = decodeErr.Error()
+			}
 		}
 		s.mu.Lock()
 		s.record.Readbacks = append(s.record.Readbacks, back)

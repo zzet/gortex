@@ -1,0 +1,61 @@
+package main
+
+import (
+	"encoding/json"
+	"strings"
+)
+
+// Expected absence is a declared producer refusal with its own identity and
+// endpoint. It is never an empty successful body, a transport error or a
+// blanket permission to ignore missing symbols.
+type editProbeExpectedAbsence struct{ symbol, message string }
+
+func (e *editProbeExpectedAbsence) Error() string { return e.message }
+
+func editProbeExactNotFound(raw json.RawMessage, scopedID string) (string, bool) {
+	if scopedID == "" || strings.ContainsAny(scopedID, "\r\n\x00") {
+		return "", false
+	}
+	var response struct {
+		IsError    bool `json:"isError"`
+		Structured any  `json:"structuredContent"`
+		Content    []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if json.Unmarshal(raw, &response) != nil || !response.IsError || response.Structured != nil || len(response.Content) != 1 || response.Content[0].Type != "text" {
+		return "", false
+	}
+	text := response.Content[0].Text
+	first, _, _ := strings.Cut(text, "\n")
+	if first != "symbol not found: "+scopedID {
+		return "", false
+	}
+	return text, true
+}
+
+func (c *editProbeCaller) expectedAbsence(data json.RawMessage, identity wireCallIdentity) error {
+	logical := c.request.ExpectedAbsentSymbol
+	if logical == "" || c.request.Tool != "read" || c.request.Operation != "source" || (c.role != "probe" && c.role != "readback") {
+		return nil
+	}
+	target, ok := c.request.Arguments["target"].(map[string]any)
+	if !ok || target["symbol"] != logical {
+		return nil
+	}
+	c.state.mu.Lock()
+	proven := c.state.absenceBefore[logical]
+	editStarted := c.state.editWrite
+	c.state.mu.Unlock()
+	// A reply from a request sent before the real edit wire start does not
+	// establish post-edit absence, even when its delivery happens afterward.
+	if !proven || editStarted.IsZero() || identity.WriteStarted.IsZero() || identity.WriteStarted.Before(editStarted) {
+		return nil
+	}
+	scoped := c.runtime.p.Repos[0].Prefix + "/" + logical
+	if message, matched := editProbeExactNotFound(data, scoped); matched {
+		return &editProbeExpectedAbsence{symbol: scoped, message: message}
+	}
+	return nil
+}

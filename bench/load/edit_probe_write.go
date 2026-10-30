@@ -18,11 +18,11 @@ func editProbeTool(c Corpus) (string, error) {
 	switch tool {
 	case "edit.file":
 		if c.EditInitialContent != "" {
-			return "", errors.New("edit_initial_content applies only to explicit edit.write")
+			return "", errors.New("edit_initial_content requires explicit edit.write, edit.batch or edit.symbol")
 		}
 	case "edit.write", "edit.batch", "edit.symbol":
 		if c.EditInitialContent == "" || !utf8.ValidString(c.EditInitialContent) || c.EditAnchor == "" || strings.Count(c.EditInitialContent, c.EditAnchor) != 1 {
-			return "", errors.New("edit.write requires explicit UTF-8 initial content with one stable anchor")
+			return "", errors.New("explicit edit.write, edit.batch and edit.symbol require UTF-8 initial content with one stable anchor")
 		}
 		switch filepath.Ext(c.File) {
 		case ".go":
@@ -41,7 +41,7 @@ func editProbeTool(c Corpus) (string, error) {
 			return "", errors.New("unsupported edit.write fixture language")
 		}
 	default:
-		return "", errors.New("edit-and-probe supports only edit.file, explicit edit.write or one-file edit.batch")
+		return "", errors.New("edit-and-probe supports edit.file, explicit edit.write, edit.symbol or one-file edit.batch")
 	}
 	if tool == "edit.symbol" {
 		if err := editProbeSymbolAnchor(c); err != nil {
@@ -64,7 +64,7 @@ func editProbeWriteRequest(c Corpus, content, marker string) (request, string) {
 // per-edit probe sessions or dispatching edits. This does not refresh intent.
 func editProbeWriteAdmission(c Corpus, original []byte) error {
 	if (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol") && !bytes.Equal(original, []byte(c.EditInitialContent)) {
-		return errors.New("edit.write initial content differs from the pinned fixture bytes")
+		return errors.New("initial content differs from the pinned edit fixture bytes")
 	}
 	return nil
 }
