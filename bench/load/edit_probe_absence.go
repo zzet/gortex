@@ -112,3 +112,41 @@ func editProbePresenceProof(raw json.RawMessage, c Corpus, logical string) bool 
 	}
 	return false
 }
+
+// A new call edge alone cannot prove rename reconciliation: a stale old
+// caller may remain beside it. Retain both positive new-edge and complete
+// old-identity exclusion checks on the actual relation result.
+func editProbeRenameCensus(body map[string]any, c Corpus, step editProbeStep) bool {
+	truncated, ok := body["truncated"].(bool)
+	if !ok || truncated {
+		return false
+	}
+	nodes, nok := editProbeCompleteCount(body, "nodes", "total_nodes")
+	edges, eok := editProbeCompleteCount(body, "edges", "total_edges")
+	if !nok || !eok {
+		return false
+	}
+	old := step.BeforeSymbol[strings.LastIndex(step.BeforeSymbol, "::")+2:]
+	for _, raw := range nodes {
+		node, ok := raw.(map[string]any)
+		if !ok {
+			return false
+		}
+		id, _ := node["id"].(string)
+		if editProbeSourceID(id, c.File, old) {
+			return false
+		}
+	}
+	for _, raw := range edges {
+		edge, ok := raw.(map[string]any)
+		if !ok {
+			return false
+		}
+		from, fok := edge["from"].(string)
+		to, tok := edge["to"].(string)
+		if !fok || !tok || editProbeSourceID(from, c.File, old) || editProbeSourceID(to, c.File, old) {
+			return false
+		}
+	}
+	return true
+}

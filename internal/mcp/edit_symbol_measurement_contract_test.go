@@ -131,6 +131,26 @@ func TestEditSymbolMeasurementFixtureUsesActualSpliceAndExplicitAbsence(t *testi
 					if operation == "rename" {
 						require.NotNil(t, s.engineFor(t.Context()).GetSymbol(file+"::Renamed"))
 					}
+					if operation == "delete" {
+						chain := callTool(t, s, "get_call_chain", map[string]any{"id": id, "depth": 1, "limit": 1000})
+						require.False(t, chain.IsError)
+						chainBody := unmarshalResult(t, chain)
+						require.Contains(t, chainBody, "nodes")
+						require.Contains(t, chainBody, "edges")
+						require.Nil(t, chainBody["nodes"])
+						require.Nil(t, chainBody["edges"])
+						require.Zero(t, chainBody["total_nodes"])
+						require.Zero(t, chainBody["total_edges"])
+						require.Equal(t, false, chainBody["truncated"])
+						search := callTool(t, s, "search_symbols", map[string]any{"query": "GortexDeletedMeasurementNoSuchSymbol"})
+						require.False(t, search.IsError)
+						searchBody := unmarshalResult(t, search)
+						require.Contains(t, searchBody, "results")
+						require.Nil(t, searchBody["results"])
+						require.Zero(t, searchBody["total"])
+						require.Equal(t, false, searchBody["truncated"])
+					}
+
 				}
 			})
 		}

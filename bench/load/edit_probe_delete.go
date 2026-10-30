@@ -21,9 +21,16 @@ func editProbeDeleteOracles(c Corpus, step editProbeStep) []editProbeOracle {
 }
 
 func editProbeCompleteCount(body map[string]any, key, total string) ([]any, bool) {
-	rows, ok := body[key].([]any)
+	value, present := body[key]
+	rows, ok := value.([]any)
+	// Actual producer nil slices serialize as explicit null. Only a present
+	// key plus its exact zero total can establish the empty collection.
+	if present && value == nil {
+		rows = []any{}
+		ok = true
+	}
 	count, err := strconvEditProbeUint(body[total])
-	return rows, ok && err == nil && count == uint64(len(rows))
+	return rows, present && ok && err == nil && count == uint64(len(rows))
 }
 
 // Deletion has explicit absence oracles. A generic empty object, partial

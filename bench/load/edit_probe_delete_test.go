@@ -94,3 +94,25 @@ func TestEditProbeDeleteRequiresCompleteSurvivorAndRelationEvidence(t *testing.T
 		})
 	}
 }
+
+func TestEditProbeCompleteCountAllowsOnlyExplicitProducerNullWithExactZero(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body map[string]any
+		want bool
+	}{
+		{"explicit_null", map[string]any{"nodes": nil, "total_nodes": json.Number("0")}, true},
+		{"empty_array", map[string]any{"nodes": []any{}, "total_nodes": json.Number("0")}, true},
+		{"missing_collection", map[string]any{"total_nodes": json.Number("0")}, false},
+		{"missing_total", map[string]any{"nodes": nil}, false},
+		{"null_nonzero", map[string]any{"nodes": nil, "total_nodes": json.Number("1")}, false},
+		{"wrong_type", map[string]any{"nodes": "", "total_nodes": json.Number("0")}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, got := editProbeCompleteCount(test.body, "nodes", "total_nodes")
+			if got != test.want {
+				t.Fatalf("complete=%v", got)
+			}
+		})
+	}
+}

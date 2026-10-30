@@ -146,6 +146,9 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 			return err == nil && line > 0 && (path == c.File || strings.HasSuffix(path, "/"+c.File)) && strings.Contains(text, prefix+step.Marker)
 		})
 	case "callers", "call_chain":
+		if step.BeforeSymbol != "" && !editProbeRenameCensus(body, c, step) {
+			return false
+		}
 		if c.EditKind == "append_leaf" {
 			return editProbeLeafRelations(body, c, step)
 		}

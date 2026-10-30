@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -123,5 +124,39 @@ func TestEditProbeRenameDeleteUseActualFileWriteSymbolBatchSemantics(t *testing.
 				})
 			}
 		}
+	}
+}
+
+func TestEditProbeRenameRejectsRetainedOldCallerBesideNewEdge(t *testing.T) {
+	c := editProbeRenameCorpus(t, "go", 1)
+	plan, err := makeEditProbePlan(c, 42, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := plan.Steps[0]
+	from := "owned/" + c.File + "::" + step.Marker
+	to := "owned/" + c.Symbol
+	old := "owned/" + step.BeforeSymbol
+	for _, variant := range []string{"valid", "old_node", "old_edge", "truncated", "missing_total"} {
+		t.Run(variant, func(t *testing.T) {
+			nodes := []any{map[string]any{"id": from}, map[string]any{"id": to}}
+			edges := []any{map[string]any{"from": from, "to": to, "kind": "calls"}}
+			body := map[string]any{"nodes": nodes, "edges": edges, "total_nodes": json.Number("2"), "total_edges": json.Number("1"), "truncated": false}
+			switch variant {
+			case "old_node":
+				body["nodes"] = append(nodes, map[string]any{"id": old})
+				body["total_nodes"] = json.Number("3")
+			case "old_edge":
+				body["edges"] = append(edges, map[string]any{"from": old, "to": to, "kind": "calls"})
+				body["total_edges"] = json.Number("2")
+			case "truncated":
+				body["truncated"] = true
+			case "missing_total":
+				delete(body, "total_nodes")
+			}
+			if got := editProbeCorrect("callers", body, c, step, plan.Callee); got != (variant == "valid") {
+				t.Fatalf("correct=%v", got)
+			}
+		})
 	}
 }
