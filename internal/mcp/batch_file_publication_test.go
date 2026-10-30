@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/stretchr/testify/require"
 )
@@ -237,6 +238,57 @@ func TestBatchFileObservationActualAdmissionRefusesEarlyPublisher(t *testing.T) 
 				require.Equal(t, tx.Files[0].ReindexReceipt, witness.receipt)
 				require.Equal(t, tx.Files[0].ReindexGeneration, witness.generation)
 			}
+		})
+	}
+}
+
+func TestBatchWriterReturnedCandidateRequiresFinalRetainedOriginalOwner(t *testing.T) {
+	for _, state := range []string{"in_flight", "rollback", "evicted", "replaced", "superseded", "changed_bytes", "changed_ticket"} {
+		t.Run(state, func(t *testing.T) {
+			s := newMutationServer()
+			idx := &indexer.Indexer{}
+			now := time.Now()
+			record := &mutationCommitRecord{kind: batchFileObservationCommit, owner: s, id: "batch-file-candidate", key: "transaction-original", fingerprint: "offered-original", absPath: "/repo/file.go", disk: mutationDiskInFlight, startedAt: now, committedAt: now, newSHA: gitBlobSHA([]byte("offered bytes"))}
+			s.mutationCommits.put(record)
+			candidate, ok := s.captureReadRepairWitness(record.absPath, idx)
+			require.True(t, ok, "real writer return is sufficient only for weak capture")
+			_, ready := candidate.completionWitness(s, record, idx)
+			require.False(t, ready, "writer return cannot certify final transaction or future ticket")
+			if state == "in_flight" {
+				return
+			}
+			publication := indexer.NewPublicationPhaseRecorder(2, 1).Begin("", "publication-original", indexer.PublicationSourceMCPEdit, now)
+			admission := &mutationReceipt{id: "publication-original", generation: 7, path: record.absPath}
+			s.mutationReceipts.Store(admission.id, admission)
+			record.disk, record.commitSeq = mutationDiskCommitted, 1
+			record.publication, record.readRepairAdmission = publication, weak.Make(admission)
+			record.reindexReceipt, record.reindexGeneration = admission.id, admission.generation
+			bound, ready := candidate.completionWitness(s, record, idx)
+			require.True(t, ready, "negative must start from a fully ready same-record commit and actual identity")
+			switch state {
+			case "rollback":
+				record.disk = mutationDiskFailed
+			case "evicted":
+				s.mutationCommits.mu.Lock()
+				delete(s.mutationCommits.byID, record.id)
+				s.mutationCommits.mu.Unlock()
+			case "replaced":
+				s.mutationCommits.mu.Lock()
+				s.mutationCommits.byID[record.id] = &mutationCommitRecord{}
+				s.mutationCommits.mu.Unlock()
+			case "superseded":
+				s.mutationCommits.put(&mutationCommitRecord{kind: batchFileObservationCommit, owner: s, id: "batch-file-later", absPath: record.absPath, startedAt: time.Now(), disk: mutationDiskFailed})
+			case "changed_bytes":
+				record.newSHA = gitBlobSHA([]byte("foreign bytes"))
+			case "changed_ticket":
+				candidate = bound
+				other := &mutationReceipt{id: "publication-later", generation: 8, path: record.absPath}
+				s.mutationReceipts.Store(other.id, other)
+				record.readRepairAdmission = weak.Make(other)
+				record.reindexReceipt, record.reindexGeneration = other.id, other.generation
+			}
+			_, ready = candidate.completionWitness(s, record, idx)
+			require.False(t, ready, "late validation borrowed invalid transaction/bytes/identity", state)
 		})
 	}
 }

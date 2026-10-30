@@ -23,6 +23,12 @@ import (
 )
 
 func TestBatchActualReaderCapturedBeforeFinalVerdictCompletesAfterAdmission(t *testing.T) {
+	testBatchReaderAcrossAdmission(t, false)
+}
+func TestBatchActualReaderCompletingBeforeAdmissionRemainsUnavailable(t *testing.T) {
+	testBatchReaderAcrossAdmission(t, true)
+}
+func testBatchReaderAcrossAdmission(t *testing.T, finishBeforeAdmission bool) {
 	root := setupMiniRepo(t, "batch-reader-admission")
 	path := filepath.Join(root, "main.go")
 	before, err := os.ReadFile(path)
@@ -60,6 +66,7 @@ func TestBatchActualReaderCapturedBeforeFinalVerdictCompletesAfterAdmission(t *t
 		err         error
 	}
 	done := make(chan execution, 1)
+	var actual execution
 	started, joined := false, false
 	t.Cleanup(func() {
 		release()
@@ -122,6 +129,18 @@ func TestBatchActualReaderCapturedBeforeFinalVerdictCompletesAfterAdmission(t *t
 		case <-time.After(5 * time.Second):
 			t.Fatal("actual reader did not start before batch verdict")
 		}
+		if finishBeforeAdmission {
+			release()
+			select {
+			case actual = <-done:
+				joined = true
+			case <-time.After(5 * time.Second):
+				return failCapture("early actual reader did not join")
+			}
+			if actual.err != nil || !actual.observation.AcceptedFor(idx, gitBlobSHA([]byte(after))) {
+				return failCapture("early executor did not really apply offered bytes")
+			}
+		}
 		return syncBatchDirectory(dir)
 	}}
 	req := editOperationRequest("batch_edit", "")
@@ -132,14 +151,21 @@ func TestBatchActualReaderCapturedBeforeFinalVerdictCompletesAfterAdmission(t *t
 	require.False(t, result.IsError, "%v", result.Content)
 	require.True(t, captured)
 	record.mu.RLock()
-	require.Equal(t, mutationDiskCommitted, record.disk)
-	require.NotNil(t, record.publication)
-	require.NotNil(t, record.readRepairAdmission.Value())
+	disk, publication, admission := record.disk, record.publication, record.readRepairAdmission.Value()
 	writerReturned := record.committedAt
 	ticket, generation := record.reindexReceipt, record.reindexGeneration
+	earlyRetained := record.readRepair
 	record.mu.RUnlock()
+	require.Equal(t, mutationDiskCommitted, disk)
+	require.NotNil(t, publication)
+	require.NotNil(t, admission)
+	if finishBeforeAdmission {
+		require.Nil(t, earlyRetained, "actual callback before final verdict/admission cannot be retroactively borrowed")
+		require.True(t, actual.observation.AcceptedFor(idx, gitBlobSHA([]byte(after))))
+		runtime.KeepAlive(idx)
+		return
+	}
 	release()
-	var actual execution
 	select {
 	case actual = <-done:
 		joined = true
@@ -152,10 +178,10 @@ func TestBatchActualReaderCapturedBeforeFinalVerdictCompletesAfterAdmission(t *t
 	require.NotEmpty(t, g.FindNodesByName("AddedByBatchReader"))
 	record.mu.RLock()
 	retained := record.readRepair
+	record.mu.RUnlock()
 	require.NotNil(t, retained, "successful final verdict and actual admission must validate the earlier exact candidate")
 	require.Equal(t, ticket, retained.requestedReceipt)
 	require.Equal(t, generation, retained.requestedGeneration)
 	require.Equal(t, gitBlobSHA([]byte(after)), retained.acceptedBlobSHA)
-	record.mu.RUnlock()
 	runtime.KeepAlive(idx)
 }
