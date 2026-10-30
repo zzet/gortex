@@ -38,13 +38,13 @@ func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[s
 	if envelope.IsError || len(envelope.Content) < 1 || len(envelope.Content) > 3 || envelope.Content[0].Type != "text" || envelope.Content[0].Text == "" {
 		return nil, errors.New("output requires one successful payload and only known auxiliary notes")
 	}
-	seen := map[int]bool{}
+	lastNoteKind := 0
 	for _, item := range envelope.Content[1:] {
 		kind := editProbeSessionNoteKind(item.Text)
-		if item.Type != "text" || kind == 0 || seen[kind] {
+		if item.Type != "text" || kind <= lastNoteKind {
 			return nil, errors.New("unknown or duplicate auxiliary output content")
 		}
-		seen[kind] = true
+		lastNoteKind = kind
 	}
 	text := []byte(envelope.Content[0].Text)
 	if format == "" || format == "json" {
