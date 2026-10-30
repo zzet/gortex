@@ -828,10 +828,12 @@ func incrementalReindexSucceeded(result *indexer.IndexResult, err error) bool {
 
 // reindexFile refreshes the graph for a single file after a write. Best-effort:
 // non-source files or files outside any indexed repo are silently skipped.
-func (s *Server) reindexFile(absPath string) bool {
+func (s *Server) reindexFile(absPath string) bool { return s.reindexFileObserved(absPath, nil) }
+
+func (s *Server) reindexFileObserved(absPath string, observer *indexer.ReadRepairObserver) bool {
 	if s.multiIndexer != nil {
 		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
-			result, err := s.multiIndexer.IncrementalReindexRepo(prefix, []string{absPath})
+			result, err := s.multiIndexer.IncrementalReindexRepoObserved(prefix, []string{absPath}, observer)
 			if incrementalReindexSucceeded(result, err) {
 				return true
 			}

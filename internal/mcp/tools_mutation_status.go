@@ -29,6 +29,9 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 	case receipt != "":
 		record, ok := s.mutationCommits.byReceipt(receipt)
 		if !ok {
+			if payload, handled := s.moveFileObservationPayload(ctx, receipt); handled {
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
 			if payload, handled := s.batchAcknowledgementReceiptPayload(ctx, receipt); handled {
 				return s.respondJSONOrTOON(ctx, req, payload)
 			}

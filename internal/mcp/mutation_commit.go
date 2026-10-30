@@ -107,6 +107,7 @@ const (
 	// Measurement-only file owner. Durable batch verdicts remain authoritative;
 	// this kind cannot enter ordinary commit/replay/pending-source paths.
 	batchFileObservationCommit
+	moveFileObservationCommit
 )
 
 type mutationCommitRecord struct {
@@ -163,8 +164,9 @@ type mutationCommitRecord struct {
 	readRepairAdmission weak.Pointer[mutationReceipt]
 	// Batch observations use this fixed-size owner identity without entering
 	// any physical mutation index or durable transaction manifest.
-	batchOwner [32]byte
+	batchOwner       [32]byte
 	batchAfterSHA256 [32]byte
+	moveFile         *moveFileObservation
 
 	// response is the successful tool payload, retained only for records that
 	// carry a caller-chosen mutation_id. Without a key there is nothing to
@@ -531,6 +533,7 @@ func (l *mutationCommitLedger) evictLocked(now time.Time) {
 			record.publication = nil
 			record.acknowledgement = nil
 			record.readRepair = nil
+			record.moveFile = nil
 			record.readRepairAdmission = weak.Pointer[mutationReceipt]{}
 			record.mu.Unlock()
 			delete(l.byID, record.id)
@@ -550,6 +553,7 @@ func (l *mutationCommitLedger) evictLocked(now time.Time) {
 		oldest.publication = nil
 		oldest.acknowledgement = nil
 		oldest.readRepair = nil
+		oldest.moveFile = nil
 		oldest.readRepairAdmission = weak.Pointer[mutationReceipt]{}
 		oldest.mu.Unlock()
 		delete(l.byID, oldest.id)

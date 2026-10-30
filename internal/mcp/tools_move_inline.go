@@ -378,22 +378,25 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		return s.respondJSONOrTOON(ctx, req, resp)
 	}
 
+	measurement := s.beginMoveObservation(ctx, id, resp["target_id"].(string), srcAbs, tgtAbs, srcRel, tgtRelOut, samePackage && len(callerEdits) == 0)
+	defer measurement.finishWrites(false)
 	// Apply writes atomically. Order: target first (so file exists for any
 	// caller that triggers a follow-up open), then source, then callers.
-	if err := writeMoveFileObserved(editAcknowledgementFrom(ctx, s), tgtAbs, newTgtContent); err != nil {
+	if err := measurement.write(editAcknowledgementFrom(ctx, s), tgtAbs, newTgtContent); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	observeEditSourceReplacement(ctx, tgtContent, newTgtContent, tgtExists, true)
-	if err := writeMoveFileObserved(editAcknowledgementFrom(ctx, s), srcAbs, newSrcContent); err != nil {
+	if err := measurement.write(editAcknowledgementFrom(ctx, s), srcAbs, newSrcContent); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	observeEditSourceReplacement(ctx, srcContent, newSrcContent, true, true)
 	for _, ce := range callerEdits {
-		if err := writeMoveFileObserved(editAcknowledgementFrom(ctx, s), ce.absPath, ce.newContent); err != nil {
+		if err := measurement.write(editAcknowledgementFrom(ctx, s), ce.absPath, ce.newContent); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		observeEditSourceReplacement(ctx, ce.origContent, ce.newContent, true, true)
 	}
+	measurement.finishWrites(true)
 	observeEditSourceComplete(ctx)
 
 	// Re-index every touched file so the graph picks up the new location.
@@ -401,12 +404,21 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	for _, t := range touched {
 		sess.recordModified(t.Path)
 	}
-	_ = s.reindexFile(srcAbs)
-	_ = s.reindexFile(tgtAbs)
+	if measurement != nil {
+		_ = measurement.reindex(ctx, srcAbs)
+		_ = measurement.reindex(ctx, tgtAbs)
+	} else {
+		_ = s.reindexFile(srcAbs)
+		_ = s.reindexFile(tgtAbs)
+	}
 	for _, ce := range callerEdits {
 		_ = s.reindexFile(ce.absPath)
 	}
 
+	if measurement != nil {
+		resp["move_observation_id"] = measurement.id
+		resp["file_observations"] = measurement.references()
+	}
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
