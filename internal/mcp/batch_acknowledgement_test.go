@@ -67,14 +67,14 @@ func TestBatchAcknowledgementOriginalExecutionDuplicateEvictionAndRestart(t *tes
 }
 
 func TestBatchAcknowledgementCannotBecomePhysicalMutationOrSourceEvidence(t *testing.T) {
-	assertBatchObservationCannotBecomePhysical(t,batchAcknowledgementCommit)
+	assertBatchObservationCannotBecomePhysical(t, batchAcknowledgementCommit)
 }
 
 func TestBatchFileObservationCannotBecomePhysicalMutationOrSourceEvidence(t *testing.T) {
-	assertBatchObservationCannotBecomePhysical(t,batchFileObservationCommit)
+	assertBatchObservationCannotBecomePhysical(t, batchFileObservationCommit)
 }
 
-func assertBatchObservationCannotBecomePhysical(t *testing.T,kind mutationCommitKind) {
+func assertBatchObservationCannotBecomePhysical(t *testing.T, kind mutationCommitKind) {
 	t.Helper()
 	s := newMutationServer()
 	_, ack, _ := s.withEditAcknowledgement(t.Context())

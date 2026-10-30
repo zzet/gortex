@@ -42,20 +42,22 @@ func (s *Server) openCommittedPublicationRecord(ctx context.Context, record *mut
 	if !record.isPhysicalCommit() {
 		return nil
 	}
-	return s.openOwnedPublicationRecord(ctx,record)
+	return s.openOwnedPublicationRecord(ctx, record)
 }
 
 // The batch's distinct observation kind can share the bounded recorder without
 // gaining physical mutation authority or entering committedPublicationRecord.
 func (s *Server) openOwnedPublicationRecord(ctx context.Context, record *mutationCommitRecord) *indexer.PublicationPhaseRecord {
-	if !record.isPublicationOwner() {return nil}
+	if !record.isPublicationOwner() {
+		return nil
+	}
 	ledger := &s.mutationCommits
 	ledger.mu.Lock()
 	record.mu.RLock()
 	owned := ledger.byID[record.id] == record
 	existing := record.publication
 	started, committed, checkoutID, key := record.diskWriteStartedAt, record.committedAt, record.checkoutID, record.id
-	committedVerdict:=record.kind!=batchFileObservationCommit || record.disk==mutationDiskCommitted
+	committedVerdict := record.kind != batchFileObservationCommit || record.disk == mutationDiskCommitted
 	record.mu.RUnlock()
 	ledger.mu.Unlock()
 	if !owned || !committedVerdict || started.IsZero() || committed.IsZero() {
