@@ -17,8 +17,8 @@ func syntheticSmokeJob(t *testing.T) (laneReceipt, dataset, policy) {
 	candidate.Settings = maps.Clone(mainBinary.Settings)
 	candidate.Settings["vcs.revision"] = candidate.Revision
 	started := time.Date(2026, 10, 30, 1, 0, 0, 0, time.UTC)
-	receipt := laneReceipt{Version: 1, Plan: lanePlan{Lane: "smoke", HostClass: "reference_linux", Ready: true}, Started: started, Finished: started.Add(time.Minute), Workflow: workflowProvenance{Event: "pull_request", Ref: "refs/pull/123/merge", Revision: candidate.Revision, RunURL: "https://github.com/zzet/gortex/actions/runs/789", Job: "smoke", Attempt: 1}, Smoke: &smokeProvenance{Main: selection, MainBinary: mainBinary, CandidateBinary: candidate}}
-	d := dataset{config: inputs{Version: 1, CandidateRevision: candidate.Revision, MainRevision: mainBinary.Revision, TagRevision: shippedRevision, Repeats: 3, Hosts: map[string]string{"reference_linux": "synthetic-host"}}}
+	receipt := laneReceipt{Version: 1, Plan: lanePlan{Lane: "smoke", HostClass: hostedSmokeClass, Ready: true}, Started: started, Finished: started.Add(time.Minute), Workflow: workflowProvenance{Event: "pull_request", Ref: "refs/pull/123/merge", Revision: candidate.Revision, RunURL: "https://github.com/zzet/gortex/actions/runs/789", Job: "smoke", Attempt: 1}, Smoke: &smokeProvenance{Main: selection, MainBinary: mainBinary, CandidateBinary: candidate, RunnerEnvironment: "github-hosted", RunnerOS: "Linux", RunnerArch: "ARM64"}}
+	d := dataset{config: inputs{Version: 1, CandidateRevision: candidate.Revision, MainRevision: mainBinary.Revision, TagRevision: shippedRevision, Repeats: 3, Hosts: map[string]string{hostedSmokeClass: "synthetic-host"}}}
 	for repeat := 1; repeat <= 3; repeat++ {
 		for _, role := range []string{"main", "candidate"} {
 			file := fmt.Sprintf("%s-%d.json", role, repeat)
@@ -33,6 +33,12 @@ func syntheticSmokeJob(t *testing.T) (laneReceipt, dataset, policy) {
 				raw["git_sha"] = candidate.Revision
 			}
 			raw["started"] = taskStart.Add(time.Millisecond)
+			host := raw["host"].(map[string]any)
+			host["profile"] = "native"
+			host["validated"] = false
+			limits := host["limits"].(map[string]any)
+			limits["logical_cpus"] = map[string]any{"value": 4, "unit": "cores", "reason": ""}
+			limits["disk_capacity_bytes"] = map[string]any{"value": 14 * 1024 * 1024 * 1024, "unit": "bytes", "reason": ""}
 			data, err := json.Marshal(raw)
 			if err != nil {
 				t.Fatal(err)
@@ -41,7 +47,7 @@ func syntheticSmokeJob(t *testing.T) (laneReceipt, dataset, policy) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			input := runInput{Role: role, HostClass: "reference_linux", Scenario: "load-1", Repeat: repeat, Report: file}
+			input := runInput{Role: role, HostClass: hostedSmokeClass, Scenario: "load-1", Repeat: repeat, Report: file}
 			if err := validateReport(d.config, input, r); err != nil {
 				t.Fatal(err)
 			}
@@ -50,7 +56,7 @@ func syntheticSmokeJob(t *testing.T) (laneReceipt, dataset, policy) {
 		}
 	}
 	p := testPolicy()
-	p.Budgets = []budget{{HostClass: "reference_linux", Scenario: "load-1", Metric: "read_p95", Mode: "block", Target: pointer(1), Unit: "s", Compare: "le", Lane: []string{"smoke"}}}
+	p.Budgets = []budget{{HostClass: hostedSmokeClass, Scenario: "load-1", Metric: "read_p95", Mode: "block", Target: pointer(1), Unit: "s", Compare: "le", Lane: []string{"smoke"}}}
 	receipt.Plan.PolicySHA256 = policyDigest(p)
 	return receipt, d, p
 }
@@ -133,5 +139,47 @@ func TestSameJobHostIdentityStillUsesStrictReferenceContract(t *testing.T) {
 	r.Host.Limits["cpu_quota"] = metric{Value: pointer(4), Unit: "cores"}
 	if err := validateHost("reference_linux", "synthetic-host", r); err == nil {
 		t.Fatal("same-job provenance waived four-versus-eight CPU reference contract")
+	}
+}
+
+func TestHostedSmokeProfileIsTruthfulAndCannotBecomeReference(t *testing.T) {
+	receipt, d, p := syntheticSmokeJob(t)
+	r := d.runs[0].data
+	if err := validateHost(hostedSmokeClass, "synthetic-host", r); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSmokeJob(receipt, d); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := check(p, d, "nightly"); err == nil {
+		t.Fatal("hosted smoke evidence admitted to nightly")
+	}
+	if _, err := check(p, d, "release"); err == nil {
+		t.Fatal("hosted smoke evidence admitted to release")
+	}
+	r.Host.Profile = "reference"
+	r.Host.Validated = true
+	r.Host.Limits["cpu_quota"] = metric{Value: pointer(4), Unit: "cores"}
+	if err := validateHost("reference_linux", "synthetic-host", r); err == nil {
+		t.Fatal("four-CPU hosted machine became reference capacity")
+	}
+}
+
+func TestLinuxOOMSafetyRequiresActualCounterAndLogCensus(t *testing.T) {
+	_, d, _ := syntheticSmokeJob(t)
+	r := d.runs[0].data
+	if _, err := extract("oom_kills", hostedSmokeClass, r); err == nil {
+		t.Fatal("missing authoritative OOM counter became zero")
+	}
+	r.Phases[0].Metrics["scenario_cgroup_oom_kills"] = metric{Value: pointer(0), Unit: "events"}
+	if value, err := extract("oom_kills", hostedSmokeClass, r); err != nil || value != 0 {
+		t.Fatalf("measured zero rejected: %v %v", value, err)
+	}
+	r.Phases[0].Metrics["scenario_cgroup_oom_kills"] = metric{Value: pointer(1), Unit: "events"}
+	if value, err := extract("oom_kills", hostedSmokeClass, r); err != nil || value != 1 {
+		t.Fatal("actual OOM hidden by zero log lines")
+	}
+	if _, err := extract("oom_kills", "reference_mac", r); err == nil {
+		t.Fatal("Mac log lines substituted for authoritative OOM evidence")
 	}
 }

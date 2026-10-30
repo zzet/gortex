@@ -195,6 +195,9 @@ func (d dataset) samples(role string, b budget) ([]float64, []report, error) {
 }
 
 func check(p policy, d dataset, lane string) ([]result, error) {
+	if d.config.Hosts[hostedSmokeClass] != "" && lane != "smoke" {
+		return nil, errors.New("hosted ARM smoke evidence cannot satisfy nightly or release reference capacity")
+	}
 	if !slices.Contains([]string{"smoke", "nightly", "release"}, lane) {
 		return nil, errors.New("lane must be smoke, nightly or release")
 	}

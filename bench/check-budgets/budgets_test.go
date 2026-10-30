@@ -64,3 +64,55 @@ func TestDeclaredBudgetTargetsAndNamedAllowances(t *testing.T) {
 		t.Fatal("each named allowance must have its own entry")
 	}
 }
+
+func TestHostedSmokeOwnsUnchangedTargetsWithoutReferenceCapacity(t *testing.T) {
+	data, err := os.ReadFile("../budgets.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := loadPolicy(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, row := range p.Budgets {
+		if row.HostClass != hostedSmokeClass {
+			for _, lane := range row.Lane {
+				if lane == "smoke" {
+					t.Fatal("PR smoke still mislabeled as reference/Mac capacity")
+				}
+			}
+			continue
+		}
+		count++
+		if row.Mode != "block" || len(row.Lane) != 1 || row.Lane[0] != "smoke" || len(row.Allowance) != 0 {
+			t.Fatal("hosted smoke relaxed or escaped PR block scope")
+		}
+		if row.Metric == "read_p95_vs_main" {
+			if row.Target == nil || *row.Target != 1.2 {
+				t.Fatal("20% relative rule changed")
+			}
+			continue
+		}
+		found := false
+		for _, reference := range p.Budgets {
+			if reference.HostClass == "reference_linux" && reference.Scenario == row.Scenario && reference.Metric == row.Metric {
+				found = true
+				if reference.Target == nil || row.Target == nil || *reference.Target != *row.Target || reference.Unit != row.Unit || reference.Compare != row.Compare || reference.MinRepeats != row.MinRepeats || reference.Mode != row.Mode || reference.OwningRelease != row.OwningRelease {
+					t.Fatalf("smoke target changed: %+v", row)
+				}
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("smoke target lost its unchanged reference counterpart: %+v", row)
+		}
+	}
+	if count != 38 {
+		t.Fatalf("smoke required targets missing: %d", count)
+	}
+	b := budget{Metric: "read_p95", Scenario: "load-16", HostClass: hostedSmokeClass, OwningRelease: "v0.64.12", Mode: "block", Target: pointer(1), Unit: "s", Lane: []string{"nightly"}, Compare: "le"}
+	if err := validateBudget(b, nil); err == nil {
+		t.Fatal("hosted profile allowed in nightly policy")
+	}
+}

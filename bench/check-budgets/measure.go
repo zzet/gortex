@@ -134,6 +134,16 @@ func extract(name, host string, r report) (float64, error) {
 		if !ok || n == nil {
 			return 0, errors.New("missing safety census")
 		}
+		if name == "oom_kills" {
+			if host != "reference_linux" && host != hostedSmokeClass {
+				return 0, errors.New("Mac report-v1 lacks an authoritative OOM-kill observation; zero log lines are not zero kills")
+			}
+			actual, err := number(p.Metrics["scenario_cgroup_oom_kills"], "events")
+			if err != nil {
+				return 0, fmt.Errorf("authoritative Linux OOM-kill census: %w", err)
+			}
+			return max(actual, float64(*n)), nil
+		}
 		return float64(*n), nil
 	case "force_kills":
 		return number(p.Metrics["force_killed"], "boolean")
@@ -152,7 +162,7 @@ func extract(name, host string, r report) (float64, error) {
 		key = "startup_logical_written_bytes"
 	case "idle_memory_2s_mib", "peak_memory_mib", "worktree_memory_mib":
 		field := "phys_footprint_bytes"
-		if host == "reference_linux" {
+		if host == "reference_linux" || host == hostedSmokeClass {
 			field = "pss_bytes"
 		}
 		prefix := "peak_"

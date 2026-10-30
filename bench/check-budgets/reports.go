@@ -134,7 +134,7 @@ func loadInputs(path string) (dataset, error) {
 	}
 	machines := make(map[string]bool)
 	for class, machine := range c.Hosts {
-		if (class != "reference_linux" && class != "reference_mac" && class != "large_mac") || machine == "" || machines[machine] {
+		if !knownHostClass(class) || machine == "" || machines[machine] {
 			return out, errors.New("reviewed host classes need distinct nonempty machine bindings")
 		}
 		machines[machine] = true
@@ -181,7 +181,7 @@ func validateRunInput(c inputs, r runInput) error {
 	if r.Role != "candidate" && r.Role != "main" && r.Role != "tag" {
 		return fmt.Errorf("unknown role %s", r.Role)
 	}
-	if c.Hosts[r.HostClass] == "" || (r.HostClass != "reference_linux" && r.HostClass != "reference_mac" && r.HostClass != "large_mac") || r.Repeat < 1 || r.Repeat > c.repeats(r.Scenario) || r.Report == "" {
+	if c.Hosts[r.HostClass] == "" || !knownHostClass(r.HostClass) || r.Repeat < 1 || r.Repeat > c.repeats(r.Scenario) || r.Report == "" {
 		return errors.New("run lacks reviewed host binding, planned repeat or report")
 	}
 	if _, ok := scenarioSpecs[r.Scenario]; !ok {
@@ -246,6 +246,22 @@ func validateReport(c inputs, input runInput, r report) error {
 func validateHost(class, machine string, r report) error {
 	if r.Host.Machine != machine || machine == "" || r.Host.Arch == "" || r.Host.Kernel == "" {
 		return errors.New("host identity does not match reviewed inventory")
+	}
+	if class == hostedSmokeClass {
+		if r.Host.OS != "linux" || r.Host.Arch != "arm64" || r.Host.Profile != "native" {
+			return errors.New("hosted ARM smoke requires truthful native Linux ARM64 observations")
+		}
+		cpu, err := number(r.Host.Limits["logical_cpus"], "cores")
+		if err != nil || cpu != 4 {
+			return errors.New("public hosted ARM smoke requires observed four-CPU host")
+		}
+		for _, key := range []string{"host_memory", "disk_capacity_bytes"} {
+			value, err := number(r.Host.Limits[key], "bytes")
+			if err != nil || value <= 0 {
+				return errors.New("hosted smoke requires actual positive memory and disk observations; advertised sizes are not substituted")
+			}
+		}
+		return nil
 	}
 	if class != "reference_linux" {
 		if r.Host.OS != "darwin" || r.Host.Arch != "arm64" || r.Host.Profile != "native" {

@@ -35,7 +35,7 @@ jobs:
       # names every unavailable observation; plan exits nonzero while gaps exist.
       - name: Declare smoke prerequisites (not a measured smoke lane)
         continue-on-error: true
-        run: go run ./bench/check-budgets plan --lane smoke --out smoke-readiness.json
+        run: go run ./bench/check-budgets plan --lane smoke --host-class hosted_arm_smoke --out smoke-readiness.json
       - name: Declare nightly prerequisites (does not start the five-night calendar)
         continue-on-error: true
         run: go run ./bench/check-budgets plan --lane nightly --out nightly-readiness.json

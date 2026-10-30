@@ -114,7 +114,7 @@ func readLaneConfig(path string) (laneConfig, error) {
 	if c.Version != 1 || !slices.Contains([]string{"smoke", "nightly", "release"}, c.Lane) || c.Repeats < 3 || c.Repeats > 100 || c.Machine == "" {
 		return c, errors.New("lane config needs schema1, smoke/nightly/release, 3–100 repeats and reviewed machine binding")
 	}
-	if !slices.Contains([]string{"reference_linux", "reference_mac", "large_mac"}, c.HostClass) {
+	if !knownHostClass(c.HostClass) || c.HostClass == hostedSmokeClass && c.Lane != "smoke" {
 		return c, errors.New("unsupported host class; floor envelope is not yet a budget-policy host and cannot be relabeled reference")
 	}
 	if len(c.Builds) != 3 {
@@ -177,6 +177,9 @@ func makeLanePlan(p policy, c laneConfig) (lanePlan, error) {
 		}
 		if b.Metric == "edit_written_mib" {
 			gaps[b.Scenario+" / edit_written_mib: shipped tag lacks patch-write counters; equivalent baseline strategy requires review"] = true
+		}
+		if b.Metric == "oom_kills" && c.HostClass != "reference_linux" && c.HostClass != hostedSmokeClass {
+			gaps[b.Scenario+" / oom_kills: Mac report-v1 lacks an authoritative OOM-kill census; logs are not a substitute"] = true
 		}
 	}
 	if len(scenarios) == 0 {

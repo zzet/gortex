@@ -54,6 +54,11 @@ var revisionPattern = regexp.MustCompile(`^[a-f0-9]{40}$`)
 var planPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 const shippedRevision = "defa9f8e7a670792b5b693744d88488f741a8160"
+const hostedSmokeClass = "hosted_arm_smoke"
+
+func knownHostClass(class string) bool {
+	return slices.Contains([]string{"reference_linux", "reference_mac", "large_mac", hostedSmokeClass}, class)
+}
 
 func finiteNonnegative(v float64) bool { return v >= 0 && !math.IsNaN(v) && !math.IsInf(v, 0) }
 
@@ -163,8 +168,11 @@ func validateBudget(b budget, allowances map[string]allowance) error {
 		return fmt.Errorf("unknown scenario %s", b.Scenario)
 	}
 	validOwner := releasePattern.MatchString(b.OwningRelease) || b.Mode == "guard" && b.OwningRelease == "unassigned"
-	if !slices.Contains([]string{"reference_linux", "reference_mac", "large_mac"}, b.HostClass) || !validOwner {
+	if !knownHostClass(b.HostClass) || !validOwner {
 		return errors.New("invalid host class or owning release")
+	}
+	if b.HostClass == hostedSmokeClass && (b.Mode != "block" || len(b.Lane) != 1 || b.Lane[0] != "smoke") {
+		return errors.New("hosted ARM budgets are block-only PR smoke targets, never nightly/release capacity")
 	}
 	if !slices.Contains([]string{"le", "lt", "ge", "eq"}, b.Compare) || len(b.Lane) == 0 {
 		return errors.New("explicit comparison and lanes required")

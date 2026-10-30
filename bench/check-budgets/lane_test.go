@@ -15,7 +15,7 @@ import (
 )
 
 func fixtureLaneConfig() laneConfig {
-	return laneConfig{Version: 1, Lane: "smoke", HostClass: "reference_linux", Machine: "synthetic-host", Load: "/synthetic/load", Manifest: "manifest.json", MainArtifact: "main-bundle", Builds: map[string]laneBuild{
+	return laneConfig{Version: 1, Lane: "smoke", HostClass: hostedSmokeClass, Machine: "synthetic-host", Load: "/synthetic/load", Manifest: "manifest.json", MainArtifact: "main-bundle", Builds: map[string]laneBuild{
 		"candidate": {Binary: "candidate", Revision: strings.Repeat("a", 40)}, "main": {Binary: "main", Revision: strings.Repeat("d", 40)}, "tag": {Binary: "tag", Revision: shippedRevision},
 	}, Repeats: 3, Duration: "60s", Deadline: "120s", WarmTimeout: "30m", StopTimeout: "30s", SweepDuration: "10m", SweepRepetitions: 15}
 }
@@ -32,6 +32,10 @@ func TestLanePlanPreservesFormalGapsAndReleaseCounts(t *testing.T) {
 	c := fixtureLaneConfig()
 	for _, lane := range []string{"smoke", "nightly", "release"} {
 		c.Lane = lane
+		c.HostClass = "reference_linux"
+		if lane == "smoke" {
+			c.HostClass = hostedSmokeClass
+		}
 		plan, err := makeLanePlan(p, c)
 		if err != nil {
 			t.Fatal(err)
@@ -63,7 +67,7 @@ func TestLanePlanPreservesFormalGapsAndReleaseCounts(t *testing.T) {
 
 func TestLaneOrderingAndNoExtraReadersOrTagForBlock(t *testing.T) {
 	p := testPolicy()
-	p.Budgets = []budget{{Scenario: "loadedit-4", Metric: "edit_ack_p95", Mode: "block", HostClass: "reference_linux", Lane: []string{"smoke"}}}
+	p.Budgets = []budget{{Scenario: "loadedit-4", Metric: "edit_ack_p95", Mode: "block", HostClass: hostedSmokeClass, Lane: []string{"smoke"}}}
 	c := fixtureLaneConfig()
 	plan, err := makeLanePlan(p, c)
 	if err != nil {
@@ -73,7 +77,7 @@ func TestLaneOrderingAndNoExtraReadersOrTagForBlock(t *testing.T) {
 		t.Fatal("roles not rotated or unnecessary tag runs added")
 	}
 	args := taskArgs(c, plan.Tasks[0], "manifest", "scratch", "report")
-	for flag, want := range map[string]string{"--agents": "0", "--edit-agents": "4", "--scenario": "edit", "--profile": "agent", "--host": "reference"} {
+	for flag, want := range map[string]string{"--agents": "0", "--edit-agents": "4", "--scenario": "edit", "--profile": "agent", "--host": "native"} {
 		i := slices.Index(args, flag)
 		if i < 0 || args[i+1] != want {
 			t.Fatalf("wrong %s: %v", flag, args)
@@ -131,6 +135,7 @@ func TestCollectorRetainsFailedRepetitionsAndContinues(t *testing.T) {
 	}
 	c := fixtureLaneConfig()
 	c.Lane = "nightly"
+	c.HostClass = "reference_linux"
 	c.Manifest = filepath.Join(parent, "manifest.json")
 	if err := writeNewJSON(c.Manifest, []map[string]any{{"label": "gortex", "source": source, "commit": strings.Repeat("c", 40)}}); err != nil {
 		t.Fatal(err)
@@ -207,6 +212,7 @@ func TestReleaseReceiptIncludesEntryBuildTimeAndReserve(t *testing.T) {
 	}
 	c := fixtureLaneConfig()
 	c.Lane = "release"
+	c.HostClass = "reference_linux"
 	c.Manifest = filepath.Join(parent, "manifest.json")
 	c.started = time.Now().Add(-8 * time.Hour)
 	if err := writeNewJSON(c.Manifest, []map[string]any{{"label": "gortex", "source": source, "commit": strings.Repeat("c", 40)}}); err != nil {

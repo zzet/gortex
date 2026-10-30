@@ -16,9 +16,12 @@ import (
 )
 
 type smokeProvenance struct {
-	Main            artifactSelection `json:"main_selection"`
-	MainBinary      mainArtifact      `json:"main_binary"`
-	CandidateBinary mainArtifact      `json:"candidate_binary"`
+	Main              artifactSelection `json:"main_selection"`
+	MainBinary        mainArtifact      `json:"main_binary"`
+	CandidateBinary   mainArtifact      `json:"candidate_binary"`
+	RunnerEnvironment string            `json:"runner_environment"`
+	RunnerOS          string            `json:"runner_os"`
+	RunnerArch        string            `json:"runner_arch"`
 }
 
 func readStrictJSON(path string, value any) error {
@@ -68,7 +71,7 @@ func sameBuildSettings(main, candidate mainArtifact) bool {
 
 func prepareSmokeProvenance(c laneConfig, workflow workflowProvenance) (smokeProvenance, error) {
 	var proof smokeProvenance
-	if c.MainArtifact == "" || os.Getenv("GITHUB_ACTIONS") != "true" || os.Getenv("GITHUB_SHA") != workflow.Revision {
+	if c.HostClass != hostedSmokeClass || c.MainArtifact == "" || os.Getenv("GITHUB_ACTIONS") != "true" || os.Getenv("GITHUB_SHA") != workflow.Revision || os.Getenv("RUNNER_ENVIRONMENT") != "github-hosted" || os.Getenv("RUNNER_OS") != "Linux" || os.Getenv("RUNNER_ARCH") != "ARM64" {
 		return proof, errors.New("smoke needs a verified exact-main bundle and current GitHub job provenance")
 	}
 	selection, metadata, err := verifiedMainBundle(c.MainArtifact)
@@ -93,7 +96,7 @@ func prepareSmokeProvenance(c laneConfig, workflow workflowProvenance) (smokePro
 	if candidate.Revision != c.Builds["candidate"].Revision || !sameBuildSettings(metadata, candidate) {
 		return proof, errors.New("candidate/main binary platform, pinned toolchain or build settings differ")
 	}
-	proof = smokeProvenance{Main: selection, MainBinary: metadata, CandidateBinary: candidate}
+	proof = smokeProvenance{Main: selection, MainBinary: metadata, CandidateBinary: candidate, RunnerEnvironment: os.Getenv("RUNNER_ENVIRONMENT"), RunnerOS: os.Getenv("RUNNER_OS"), RunnerArch: os.Getenv("RUNNER_ARCH")}
 	return proof, validateSmokeWorkflow(workflow)
 }
 
@@ -115,6 +118,9 @@ func validateSmokeJob(receipt laneReceipt, d dataset) error {
 		return err
 	}
 	proof := receipt.Smoke
+	if receipt.Plan.HostClass != hostedSmokeClass || d.config.Hosts[hostedSmokeClass] == "" || proof.RunnerEnvironment != "github-hosted" || proof.RunnerOS != "Linux" || proof.RunnerArch != "ARM64" {
+		return errors.New("smoke needs the scoped public hosted Linux ARM job profile, not reference capacity")
+	}
 	if proof.Main.Revision != d.config.MainRevision || proof.CandidateBinary.Revision != d.config.CandidateRevision || receipt.Workflow.Revision != d.config.CandidateRevision || !sameBuildSettings(proof.MainBinary, proof.CandidateBinary) {
 		return errors.New("smoke binary/input/workflow identities differ")
 	}
