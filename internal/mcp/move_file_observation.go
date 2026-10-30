@@ -234,7 +234,7 @@ func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 	}
 	if refused != "" {
 		record.mu.Lock()
-		if w.matches(record) && record.moveFile.direct == nil {
+		if w.matches(record) && record.moveFile.direct == nil && record.moveFile.directState == "pending_observer" {
 			record.moveFile.directState = refused
 		}
 		record.mu.Unlock()

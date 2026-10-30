@@ -226,6 +226,16 @@ func TestMoveDirectRefusesOlderAdmissionWhichActuallyCommitsLaterSameBytes(t *te
 	status, _ := s.moveFileObservationPayload(t.Context(), record.id)
 	require.Equal(t, "unavailable_competing_commit", status["direct_reconcile_state"])
 	require.NotContains(t, status, "direct_reconcile")
+	// A repeated callback must not revise the first final refusal even when
+	// competing evidence has since changed from committed to in-flight.
+	older.mu.Lock()
+	older.disk = mutationDiskInFlight
+	older.diskWriteStartedAt = actual.AcceptedAt()
+	older.mu.Unlock()
+	observer.Complete(actual)
+	repeated, _ := s.moveFileObservationPayload(t.Context(), record.id)
+	require.Equal(t, "unavailable_competing_commit", repeated["direct_reconcile_state"])
+	require.NotContains(t, repeated, "direct_reconcile")
 }
 
 func TestMoveDirectRejectsActualEarlyAcceptanceForeignOwnerBytesAndEviction(t *testing.T) {
