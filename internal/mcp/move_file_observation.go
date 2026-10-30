@@ -345,6 +345,6 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 		copy := ack.snapshot()
 		snapshot = &copy
 	}
-	attachAcknowledgementPayload(payload, snapshot, "unavailable_ledger_entry_or_scope")
+	payload["acknowledgement"] = buildAcknowledgementPayload(snapshot, "unavailable_ledger_entry_or_scope")
 	return payload, true
 }
