@@ -96,8 +96,9 @@ transaction, shared acknowledgement and per-file graph ticket separately.
 Implementation controls and a one-edit diagnostic do not establish the
 100-edit, reference, traffic-matrix or no-regression gates.
 
-The optional `edit_kind` selects `append_leaf`, `rename` or `delete`; omission
-retains `add_intrafile_call`. These are explicit fixture cells, not arbitrary
+The optional `edit_kind` selects `append_leaf`, `rename`, `delete`,
+`modify_body`, `modify_caller_body`, `change_signature`, `add_crossfile_call`
+or the Go-only `relocate`; omission retains `add_intrafile_call`. These are explicit fixture cells, not arbitrary
 source transformations. A leaf must be a numeric zero-argument function with
 no incoming or outgoing calls in complete relation results. Rename/delete
 fixtures precreate each unique `GortexEditProbe…Before` declaration in the
@@ -115,6 +116,30 @@ wire start can earn post-edit absence. Expected refusals retain their own raw
 identity, endpoint and report count; they are not ordinary successful RPCs.
 These new operation cells require actual runtime evidence before acceptance;
 other kinds and unsupported combinations fail explicitly.
+
+Body/signature fixtures retain an adjacent following declaration. Their relative
+start-line gap proves the changed body even when concurrent earlier edits shift
+both declarations. Signature changes preserve valid zero-argument callers;
+TypeScript/Python coarse signature metadata alone is not parameter proof.
+Crossfile-call fixtures require two root files, exact imports where applicable,
+and an independently admitted callee in the other file.
+
+Go relocation uses `edit_tool: "refactor.move"` (also `move_symbol`) with
+`edit_kind: "relocate"`, distinct root Go files in the same package, and pinned
+`edit_destination` / `edit_destination_content`. The offered source declarations
+already exist; no client-generated declaration is substituted for a real move.
+The seven destination/call probes plus explicit old-source absence must all
+succeed. Immediate own-ACK readbacks check the destination file, new symbol,
+old-symbol refusal and surviving source file before timing queries begin.
+Standalone move observations retain one shared RPC A and each file's actual
+write/direct-reconcile windows. Scheduled background is explicitly inapplicable,
+not a measured zero; physical mutation and batch receipts cannot supply missing
+move clocks. Baseline controls without observations can establish public
+functional completion while graph receipt proof and phases remain unavailable.
+Cleanup uses one public two-file batch only after completed outcomes, then
+verifies both original byte strings. Unsupported language, package, path and
+operation combinations refuse explicitly. These implementation controls do not
+establish live relocation timing or the broader traffic/reference gates.
 
 `--scenario edit-and-probe --profile agent --agents 0 --edit-agents 1
 --worktrees 0` selects an initial `add_intrafile_call` / `edit.file` / JSON
