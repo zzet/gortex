@@ -68,11 +68,20 @@ func TestMoveFileObservationActualDirectReconcileIsBoundPerFile(t *testing.T) {
 		require.Equal(t, mutationDiskCommitted, status["file_write_status"])
 		require.Equal(t, true, status["writer_return_observed"])
 		require.Equal(t, "not_applicable_direct_reconcile", status["requested_background_state"])
+		applicability := status["acknowledgement_phase_applicability"].(map[string]string)
+		require.Equal(t, map[string]string{"publish": "not_applicable_direct_reconcile", "reindex_wait": "not_applicable_direct_reconcile"}, applicability)
 		require.NotContains(t, status, "mutation_id")
 		require.NotContains(t, status, "transaction_id")
 		require.NotContains(t, status, "reindex_receipt")
 		ack := status["acknowledgement"].(acknowledgementPayload)
 		require.NotNil(t, ack.RPCID)
+		for _, name := range []string{"publish", "reindex_wait"} {
+			value, present := ack.ObservedExecutionMS[name]
+			require.True(t, present)
+			require.Nil(t, value)
+			require.Zero(t, ack.Counts[name].Started)
+			require.Zero(t, ack.Counts[name].Completed)
+		}
 		if sharedRPC == "" {
 			sharedRPC = *ack.RPCID
 		} else {

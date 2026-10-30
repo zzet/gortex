@@ -160,7 +160,11 @@ func (o *moveObservation) observer(ctx context.Context, path string, idx *indexe
 }
 func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 	s, record, idx := w.server.Value(), w.record.Value(), w.indexer.Value()
-	if s == nil || record == nil || idx == nil {
+	if s == nil || record == nil {
+		return
+	}
+	if idx == nil {
+		w.unavailable("unavailable_observer_owner")
 		return
 	}
 	start, end := observed.Bounds()
@@ -313,6 +317,10 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 			payload["found"], payload["operation_id"], payload["source_id"], payload["target_id"], payload["path"], payload["role"] = true, data.operationID, data.sourceID, data.targetID, record.relPath, data.role
 			payload["move_write_verdict"], payload["file_write_status"], payload["writer_return_observed"], payload["new_sha"] = data.writeVerdict, record.disk, !record.committedAt.IsZero(), record.newSHA
 			payload["direct_reconcile_state"], payload["requested_background_state"] = data.directState, "not_applicable_direct_reconcile"
+			// This handler calls the existing synchronous reconcile, never queue
+			// admission/wait. Preserve raw ACK nulls/counts and name applicability
+			// explicitly instead of manufacturing measured zero scheduler work.
+			payload["acknowledgement_phase_applicability"] = map[string]string{"publish": "not_applicable_direct_reconcile", "reindex_wait": "not_applicable_direct_reconcile"}
 			timing := map[string]any{"scope": "move_file_write", "clock": "monotonic", "state": "not_observed", "outcome": record.disk}
 			if !record.diskWriteStartedAt.IsZero() && !record.committedAt.IsZero() {
 				timing["state"] = "invalid_order"
