@@ -189,7 +189,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 		}
 		clients = append(clients, state.client)
 		if state.step.BeforeSymbol != "" {
-			req := request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": state.step.BeforeSymbol}}}
+			req := request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": state.step.BeforeSymbol}, "options": map[string]any{"context_lines": 0}}}
 			raw, identity, readErr := state.client.callWithIdentity(ctx, "tools/call", map[string]any{"name": req.Tool, "arguments": dispatchArgs(req, p.Repos[0])})
 			if readErr == nil {
 				readErr = checkToolResult(raw)
@@ -570,6 +570,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			}
 		}
 		req := request{Tool: "read", Operation: kind, Arguments: map[string]any{"operation": kind, "target": target}}
+		if kind == "source" && step.TargetSymbol != "" {
+			req.Arguments["options"] = map[string]any{"context_lines": 0}
+		}
 		if kind == "old_source_absent" || kind == "source" && step.Deleted {
 			req.Operation = "source"
 			req.ExpectedAbsentSymbol = step.BeforeSymbol

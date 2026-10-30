@@ -21,7 +21,7 @@ func editProbeBodyOracles(c Corpus, step editProbeStep) []editProbeOracle {
 	target := map[string]any{"symbol": step.TargetSymbol}
 	file := map[string]any{"file": c.File}
 	oracles := []editProbeOracle{
-		{"source", request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": target}}},
+		{"source", request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": target, "options": map[string]any{"context_lines": 0}}}},
 		{"summary", request{Tool: "read", Operation: "summary", Arguments: map[string]any{"operation": "summary", "target": file}}},
 		{"editing_context", request{Tool: "read", Operation: "editing_context", Arguments: map[string]any{"operation": "editing_context", "target": file}}},
 		{"search_visible", request{Tool: "search", Operation: "symbols", Arguments: map[string]any{"operation": "symbols", "query": step.Marker}}},

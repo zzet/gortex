@@ -70,7 +70,7 @@ func TestEditProbeRenameRejectsMissingAndAlreadyRenamedFixtures(t *testing.T) {
 					case "already_new":
 						c.EditInitialContent += strings.ReplaceAll(c.EditTemplate, "{{marker}}", "GortexEditProbe000000000000002aN000")
 					case "wrong_tool":
-						c.EditTool = "edit.write"
+						c.EditTool = "unsupported.tool"
 					case "unsupported_kind":
 						c.EditKind = "unsupported_future_kind"
 					}
