@@ -19,9 +19,16 @@ var (
 	benchmarkEngineErr  error
 )
 
+const (
+	benchmarkServerID  = "internal/mcp/server.go::NewServer"
+	benchmarkGraphID   = "internal/graph/graph.go::Graph"
+	benchmarkAddNodeID = "internal/graph/graph.go::Graph.AddNode"
+	benchmarkServeID   = "cmd/gortex/serve.go::runServe"
+)
+
 // buildTestEngine indexes the Gortex repo once and shares the read-only engine
 // across all benchmarks in this package.
-func buildTestEngine(b *testing.B) *Engine {
+func buildTestEngine(b testing.TB) *Engine {
 	b.Helper()
 	benchmarkEngineOnce.Do(func() {
 		g := graph.New()
@@ -51,7 +58,7 @@ func BenchmarkGetDependencies(b *testing.B) {
 	eng := buildTestEngine(b)
 	b.ResetTimer()
 	for b.Loop() {
-		eng.GetDependencies("internal/mcp/server.go::NewServer", QueryOptions{Depth: 2, Limit: 50})
+		eng.GetDependencies(benchmarkServerID, QueryOptions{Depth: 2, Limit: 50})
 	}
 }
 
@@ -59,7 +66,7 @@ func BenchmarkGetDependents(b *testing.B) {
 	eng := buildTestEngine(b)
 	b.ResetTimer()
 	for b.Loop() {
-		eng.GetDependents("internal/graph/graph.go::Graph", QueryOptions{Depth: 3, Limit: 50})
+		eng.GetDependents(benchmarkGraphID, QueryOptions{Depth: 3, Limit: 50})
 	}
 }
 
@@ -67,7 +74,7 @@ func BenchmarkGetCallers(b *testing.B) {
 	eng := buildTestEngine(b)
 	b.ResetTimer()
 	for b.Loop() {
-		eng.GetCallers("internal/graph/graph.go::Graph.AddNode", QueryOptions{Depth: 2, Limit: 50})
+		eng.GetCallers(benchmarkAddNodeID, QueryOptions{Depth: 2, Limit: 50})
 	}
 }
 
@@ -75,7 +82,7 @@ func BenchmarkGetCallChain(b *testing.B) {
 	eng := buildTestEngine(b)
 	b.ResetTimer()
 	for b.Loop() {
-		eng.GetCallChain("cmd/gortex/serve.go::runServe", QueryOptions{Depth: 4, Limit: 50})
+		eng.GetCallChain(benchmarkServeID, QueryOptions{Depth: 4, Limit: 50})
 	}
 }
 
@@ -83,7 +90,7 @@ func BenchmarkFindUsages(b *testing.B) {
 	eng := buildTestEngine(b)
 	b.ResetTimer()
 	for b.Loop() {
-		eng.FindUsages("internal/graph/graph.go::Graph")
+		eng.FindUsages(benchmarkGraphID)
 	}
 }
 
@@ -91,7 +98,7 @@ func BenchmarkGetCluster(b *testing.B) {
 	eng := buildTestEngine(b)
 	b.ResetTimer()
 	for b.Loop() {
-		eng.GetCluster("internal/mcp/server.go::NewServer", QueryOptions{Depth: 2, Limit: 50})
+		eng.GetCluster(benchmarkServerID, QueryOptions{Depth: 2, Limit: 50})
 	}
 }
 

@@ -34,10 +34,11 @@ jobs:
         run: go build -o "${{ runner.temp }}/perf-artifact-writer" ./bench/check-budgets
       - name: Prepare the explicit pinned fixture before compiling benchmark executables
         env:
-          PERF_FIXTURE_REVISION: ${{ vars.PERF_SMOKE_FIXTURE_REVISION }}
+          # Historical query-microbenchmark input only; not the load-smoke corpus.
+          PERF_MICRO_FIXTURE_REVISION: 40f94fcc6616889086656d2d5a9d6414da926b2e
         run: >-
           "${{ runner.temp }}/perf-artifact-writer" prepare-fixture
-          --revision "$PERF_FIXTURE_REVISION"
+          --revision "$PERF_MICRO_FIXTURE_REVISION"
           --out "${{ runner.temp }}/perf-main-fixture"
       - name: Build the clean exact-main daemon
         run: go build -o "${{ runner.temp }}/perf-main-gortex" ./cmd/gortex

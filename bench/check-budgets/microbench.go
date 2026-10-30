@@ -63,6 +63,7 @@ type microReceipt struct {
 	GOMAXPROCS       int                                         `json:"gomaxprocs"`
 	Config           microConfig                                 `json:"config"`
 	Builds           map[string]map[string]executableObservation `json:"builds"`
+	FixtureChecks    []microFixtureCheck                         `json:"fixture_checks"`
 	Runs             []microRun                                  `json:"runs"`
 	Complete         bool                                        `json:"complete"`
 	FormalAcceptance bool                                        `json:"formal_acceptance"`
@@ -195,9 +196,14 @@ func collectMicrobench(ctx context.Context, c microConfig, out string, workflow 
 	}
 	receipt := microReceipt{Version: 1, Workflow: workflow, Machine: machine, OS: runtime.GOOS, Arch: runtime.GOARCH, GOMAXPROCS: runtime.GOMAXPROCS(0), Config: c, Builds: builds, Runs: []microRun{}, FormalAcceptance: false}
 	var failures []error
+	receipt.FixtureChecks, err = checkMicroFixtureExecutables(ctx, c, out, process)
+	preflightPassed := err == nil
+	if err != nil {
+		failures = append(failures, err)
+	}
 	combined := map[string][]byte{"main": {}, "candidate": {}}
 	census := map[string][]string{}
-	for repeat := 1; repeat <= c.Repeats; repeat++ {
+	for repeat := 1; preflightPassed && repeat <= c.Repeats; repeat++ {
 		for _, pkg := range microPackages {
 			roles := []string{"main", "candidate"}
 			if repeat%2 == 0 {

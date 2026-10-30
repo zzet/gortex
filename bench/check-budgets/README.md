@@ -351,13 +351,36 @@ and same-job execution remain pending.
 
 ## Owned fixture, executable and tool preparation
 
-The producer stays disabled. Before enabling it, review and set the full
-`PERF_SMOKE_FIXTURE_REVISION` pin; there is no moving-main or guessed fixture
+The producer stays disabled. Its reviewed fixed **query microbenchmark** input
+is public Gortex commit `40f94fcc6616889086656d2d5a9d6414da926b2e`, tree
+`fdd317a9a2637a6e60d277b086985772391b905c`. There is no moving-main fixture
 revision. The build-only workflow prepares that public Gortex snapshot,
 compiles all three test executables without running them, and installs only the
 existing benchstat pin into a fresh owned tool directory. It publishes the
 daemon, test executables, tool and one hash/provenance manifest. Reruns replace
 the same artifact name rather than leaving ambiguous older attempts.
+
+This April 18 snapshot has 519 Go files, including 288 production Go files.
+It is a fixed historical query workload, not coverage of the contemporary
+repository. It is the latest main ancestor before commit
+`b636a0ac48abf976d95ec02cb495439add892506` renamed `serve.go`/`runServe` to
+`mcp.go`/`runMCP`. All four hardcoded query symbol targets exist in this
+snapshot. Parser benchmarks use embedded samples and graph benchmarks build
+synthetic graphs; neither consumes the historical repository contents. The
+separate contemporary load-smoke fixture remains reviewed main commit
+`c6c6de19da02fc698db7a89f9922a8ec49cc61b5`; the small historical snapshot must
+never be substituted for that workload.
+
+Before any timings, both query executables must advertise and pass
+`TestBenchmarkFixtureTargets` under the runner's explicit opt-in. That check
+indexes the pinned fixture, verifies every shared benchmark symbol ID, and
+requires nonempty search/statistics and meaningful nodes plus edges for every
+traversal. The runner retains each binary's test census, raw check output and
+observed result counts. Missing tests, skipped checks, absent targets or empty
+traversals refuse all timings. First usable trusted main publication therefore
+requires this test-only harness contract to land on main. Existing main
+`c6c6de19` executables do not contain it and cannot pass by reporting "no tests
+to run". Ordinary package tests skip this opt-in check and fetch no fixture.
 
 ```sh
 # All outputs are NEW external directories. Use the prescribed Go/C/C++ env.

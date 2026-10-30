@@ -6,9 +6,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func syntheticMicroFixtureResponse(args []string) ([]byte, bool) {
+	if slices.Contains(args, "-test.list=^"+microFixtureTest+"$") {
+		return []byte(microFixtureTest + "\n"), true
+	}
+	if slices.Contains(args, "-test.run=^"+microFixtureTest+"$") {
+		return []byte("--- PASS: " + microFixtureTest + " (0.01s)\n" + microFixtureMarker + `{"SearchSymbols":[1,0],"GetDependencies":[2,1],"GetDependents":[2,1],"GetCallers":[2,1],"GetCallChain":[2,1],"FindUsages":[2,1],"GetCluster":[2,1],"Stats":[2,1]}` + "\nPASS\n"), true
+	}
+	return nil, false
+}
 
 func TestMicroCensusRejectsMissingMalformedOrChangedSamples(t *testing.T) {
 	for _, data := range []string{"", "PASS\n", "BenchmarkX-2 0 10 ns/op\n", "BenchmarkX-2 1 NaN ns/op\n", "BenchmarkX-2 1 10\n", "BenchmarkX-2 1 10 ns/op\nBenchmarkX-2 1 11 ns/op\n"} {
@@ -78,6 +89,9 @@ func TestMicrobenchRunsSameFixtureAndRetainsMissingSampleFailure(t *testing.T) {
 			}
 			calls, statCalls := 0, 0
 			process := func(_ context.Context, binary string, args []string, cwd string, _ []string) ([]byte, []byte, error) {
+				if data, ok := syntheticMicroFixtureResponse(args); ok {
+					return data, nil, nil
+				}
 				if binary == c.Benchstat {
 					statCalls++
 					return []byte("synthetic comparison table\n"), nil, nil
@@ -121,7 +135,10 @@ func TestMicrobenchRejectsFixtureChangedDuringRunsBeforeBenchstat(t *testing.T) 
 	c := syntheticMicroConfig(t)
 	out := filepath.Join(t.TempDir(), "evidence")
 	calls, statCalls := 0, 0
-	process := func(_ context.Context, binary string, _ []string, _ string, _ []string) ([]byte, []byte, error) {
+	process := func(_ context.Context, binary string, args []string, _ string, _ []string) ([]byte, []byte, error) {
+		if data, ok := syntheticMicroFixtureResponse(args); ok {
+			return data, nil, nil
+		}
 		if binary == c.Benchstat {
 			statCalls++
 			return nil, nil, nil
