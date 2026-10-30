@@ -453,6 +453,16 @@ func editProbeSupportedBackgroundCoverage(background map[string]any) bool {
 			return false
 		}
 	}
+	if background["coverage"] != "direct_requested_attempt" {
+		if phases, ok := background["phases_ms"].(map[string]any); ok {
+			if quiet, present := phases["requested_quiet_wait"]; present {
+				ns, e := editProbeNS(quiet)
+				if quiet == nil || e != nil || ns != 0 {
+					return false
+				}
+			}
+		}
+	}
 	count, present := background["observed_native_handoffs"]
 	handoffs, err := strconvEditProbeUint(count)
 	switch background["coverage"] {

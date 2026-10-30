@@ -182,7 +182,7 @@ func TestRequestedBackgroundMeasuresNativeChainButRefusesObservedPredecessor(t *
 func TestRequestedBackgroundRejectsIncompleteOrInvalidIntegerBounds(t *testing.T) {
 	_, origin, window := controlledAttemptWindow(t)
 	window.ticket = 2
-	valid := canonicalBackgroundEvidence{origin: origin, requested: 1, applied: 2, handoffs: 1, physical: window, debounce: canonicalDebounceEvidence{startedNS: 0, enteredNS: 1e6, entered: true}, phases: [7]int64{1, 1, 1, 1, 1, 1, 999999}, lastArmStartNS: 5, startNS: 1e6 + 5, endNS: 31e6 + 5}
+	valid := canonicalBackgroundEvidence{origin: origin, requested: 1, applied: 2, handoffs: 1, physical: window, debounce: canonicalDebounceEvidence{startedNS: 0, enteredNS: 1e6, entered: true}, phases: [8]int64{1, 1, 1, 1, 1, 1, 999999}, lastArmStartNS: 5, startNS: 1e6 + 5, endNS: 31e6 + 5}
 	require.True(t, valid.valid())
 	for _, name := range []string{"missing", "reversed", "overflow", "incomplete_P", "wrong_winner", "retry", "gap", "debounce_disagrees", "debounce_missing"} {
 		t.Run(name, func(t *testing.T) {

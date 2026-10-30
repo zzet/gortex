@@ -429,3 +429,16 @@ func TestDirectRequestedBackgroundConsumerRequiresExactOwnedWindow(t *testing.T)
 		})
 	}
 }
+
+func TestCoalescedBackgroundCannotBorrowAnExecutedRequestedQuietLap(t *testing.T) {
+	status := editProbeAccountingFixture()
+	b := status["requested_background"].(map[string]any)
+	b["phases_ms"].(map[string]any)["requested_quiet_wait"] = json.Number("0")
+	if got := checkEditProbeAccounting(status, "receipt-a"); got.State != "observed_single_window_checks_pass" {
+		t.Fatal("new zero lap broke historical coalesced shape", got)
+	}
+	b["phases_ms"].(map[string]any)["requested_quiet_wait"] = json.Number("1")
+	if editProbeSupportedBackgroundCoverage(b) {
+		t.Fatal("coalesced shape borrowed an already-running requested callback")
+	}
+}
