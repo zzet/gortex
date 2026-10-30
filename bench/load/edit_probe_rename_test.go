@@ -71,7 +71,7 @@ func TestEditProbeRenameRejectsMissingAndAlreadyRenamedFixtures(t *testing.T) {
 					case "wrong_tool":
 						c.EditTool = "edit.write"
 					case "unsupported_kind":
-						c.EditKind = "delete"
+						c.EditKind = "unsupported_future_kind"
 					}
 					if _, err := makeEditProbePlan(c, 42, 1); err == nil {
 						t.Fatal("unsupported/contradictory rename admitted")

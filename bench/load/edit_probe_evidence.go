@@ -20,6 +20,9 @@ type editProbeOracle struct {
 }
 
 func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
+	if step.Deleted {
+		return editProbeDeleteOracles(c, step)
+	}
 	marker := map[string]any{"symbol": c.File + "::" + step.Marker}
 	file := map[string]any{"file": c.File}
 	oracles := []editProbeOracle{
@@ -80,6 +83,9 @@ func editProbeSourceID(id, file, name string) bool {
 }
 
 func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editProbeStep, callee string) bool {
+	if step.Deleted {
+		return editProbeDeleteCorrect(oracle, body, c, step, callee)
+	}
 	// Collections are producer-specific and top-level. Nested guidance/examples
 	// must never become proof that the requested graph fact was returned.
 	collection := func(key string, accept func(map[string]any) bool) bool {

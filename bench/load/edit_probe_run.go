@@ -558,7 +558,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	s.mu.Unlock()
 	// Immediate same editing session, with no sleep/receipt/freshness barrier.
 	readbackKinds := []string{"file", "source"}
-	if step.BeforeSymbol != "" {
+	if step.BeforeSymbol != "" && !step.Deleted {
 		readbackKinds = append(readbackKinds, "old_source_absent")
 	}
 	for index, kind := range readbackKinds {
@@ -567,7 +567,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			target = map[string]any{"symbol": r.plan.File + "::" + step.Marker}
 		}
 		req := request{Tool: "read", Operation: kind, Arguments: map[string]any{"operation": kind, "target": target}}
-		if kind == "old_source_absent" {
+		if kind == "old_source_absent" || kind == "source" && step.Deleted {
 			req.Operation = "source"
 			req.ExpectedAbsentSymbol = step.BeforeSymbol
 			req.Arguments = map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}

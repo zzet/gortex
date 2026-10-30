@@ -28,6 +28,7 @@ type editProbeStep struct {
 	Request      request `json:"request"`
 	RequestHash  string  `json:"request_sha256"`
 	BeforeSymbol string  `json:"before_symbol,omitempty"`
+	Deleted      bool    `json:"deleted,omitempty"`
 }
 
 type editProbePlan struct {
@@ -65,11 +66,11 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if kind == "" {
 		kind = "add_intrafile_call"
 	}
-	if kind != "add_intrafile_call" && kind != "rename" {
+	if kind != "add_intrafile_call" && kind != "rename" && kind != "delete" {
 		return editProbePlan{}, errors.New("unsupported edit kind")
 	}
 	if kind != "add_intrafile_call" && tool != "edit.symbol" {
-		return editProbePlan{}, errors.New("rename fixtures currently require explicit edit.symbol")
+		return editProbePlan{}, errors.New("rename/delete fixtures currently require explicit edit.symbol")
 	}
 	language := "go"
 	if filepath.Ext(c.File) == ".ts" {
@@ -155,13 +156,16 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 			}
 		}
 		beforeSymbol := ""
-		if kind == "rename" {
+		if kind == "rename" || kind == "delete" {
 			oldName := marker + "Before"
 			before := strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", oldName))
 			if strings.Count(c.EditInitialContent, before) != 1 || strings.Contains(c.EditInitialContent, marker+"(") {
-				return editProbePlan{}, errors.New("rename requires each exact original declaration and absent new declaration")
+				return editProbePlan{}, errors.New("rename/delete requires each exact original declaration and absent new declaration")
 			}
 			replacement := strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", marker))
+			if kind == "delete" {
+				replacement = ""
+			}
 			beforeSymbol = c.File + "::" + oldName
 			r = request{Tool: "edit", Operation: "symbol", Arguments: map[string]any{"operation": "symbol", "target": map[string]any{"symbol": beforeSymbol}, "match": before, "replacement": replacement}}
 		}
@@ -172,7 +176,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		if err != nil {
 			return editProbePlan{}, err
 		}
-		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol})
+		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete"})
 	}
 	return p, nil
 }
