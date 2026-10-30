@@ -9,7 +9,11 @@ import (
 )
 
 type editProbeMovePath struct{ Relative, Qualified, Absolute string }
-type editProbeMoveFileReference struct{ Path, Role, Receipt string }
+type editProbeMoveFileReference struct {
+	Path    string `json:"path"`
+	Role    string `json:"role"`
+	Receipt string `json:"receipt"`
+}
 type editProbeMoveReferences struct {
 	OperationID    string                       `json:"operation_id"`
 	SourceID       string                       `json:"source_id"`
@@ -93,9 +97,9 @@ type editProbeMoveFileAccounting struct {
 	Receipt         string           `json:"receipt"`
 	Blob            string           `json:"accepted_blob_sha"`
 	OwnerGeneration uint64           `json:"owner_generation"`
-	WriteStartedNS  int64            `json:"write_started_ns"`
-	WriteReturnedNS int64            `json:"write_returned_ns"`
-	WriteWindowNS   int64            `json:"write_window_ns"`
+	WriteStartedNS  *int64           `json:"write_started_ns"`
+	WriteReturnedNS *int64           `json:"write_returned_ns"`
+	WriteWindowNS   *int64           `json:"write_window_ns"`
 	D               *editProbeWindow `json:"direct_reconcile,omitempty"`
 }
 type editProbeMoveAccounting struct {
@@ -134,6 +138,7 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 			out.Files = append(out.Files, file)
 			continue
 		}
+		fileReasonsBegin := len(out.Reasons)
 		if row["move_write_verdict"] != "all_writes_completed" || row["file_write_status"] != "committed" || row["writer_return_observed"] != true {
 			fail("move source writes not confirmed")
 		}
@@ -188,7 +193,9 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 		if timing["scope"] != "move_file_write" || timing["clock"] != "monotonic" || timing["state"] != "measured" || timing["outcome"] != "committed" || se != nil || re != nil || we != nil || returned < start || wall != returned-start {
 			fail("move file write window unavailable")
 		}
-		file.WriteStartedNS, file.WriteReturnedNS, file.WriteWindowNS = start, returned, wall
+		if timing["scope"] == "move_file_write" && timing["clock"] == "monotonic" && timing["state"] == "measured" && timing["outcome"] == "committed" && se == nil && re == nil && we == nil && returned >= start && wall == returned-start {
+			file.WriteStartedNS, file.WriteReturnedNS, file.WriteWindowNS = &start, &returned, &wall
+		}
 		direct, _ := row["direct_reconcile"].(map[string]any)
 		owner, oe := strconvEditProbeUint(direct["owner_generation"])
 		dwall, de := moveBoundedNS(direct["window_ns"])
@@ -246,7 +253,7 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 		residual, rse := moveBoundedNS(accounting["unattributed_ns"])
 		if err != nil || d.ResidualNS != 0 || sue != nil || subtotal != d.SumNS || rse != nil || residual != 0 {
 			fail("move direct partition disagrees with actual window")
-		} else {
+		} else if len(out.Reasons) == fileReasonsBegin {
 			file.D = &d
 		}
 		out.Files = append(out.Files, file)

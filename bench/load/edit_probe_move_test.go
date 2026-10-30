@@ -88,7 +88,7 @@ func TestMoveConsumerUsesSeparateOwnedAWriteAndDirectWindows(t *testing.T) {
 		t.Fatal("independent executor owner was replaced by ACK/wire domain")
 	}
 	for _, file := range got.Files {
-		if file.D == nil || file.D.WallNS != 9000000 || file.D.ResidualNS != 0 || file.WriteWindowNS != 2000000 {
+		if file.D == nil || file.D.WallNS != 9000000 || file.D.ResidualNS != 0 || (file.WriteWindowNS == nil || *file.WriteWindowNS != 2000000) {
 			t.Fatalf("bad own-file windows: %+v", file)
 		}
 	}
