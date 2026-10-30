@@ -80,9 +80,16 @@ and native paired edit scenarios). This adds no hidden reader population.
 workload. The counts remain explicit in the report and workload hash.
 
 `--scenario edit-and-probe --profile agent --agents 0 --edit-agents 1
---worktrees 0` selects the initial Go `add_intrafile_call` / `edit.file` / JSON
-accounting cell. It requires a template whose unique marker function calls the
-manifest's intrafile callee. The finite plan contains 100 precomputed Poisson
+--worktrees 0` selects an initial `add_intrafile_call` / `edit.file` / JSON
+accounting cell. Go retains its existing AST validation. The explicit `.ts`
+fixture cell accepts only top-level `[export] function Name(): number`
+declarations returning a decimal integer or a plain zero-argument call; its
+template must make the unique marker return the selected intrafile callee.
+`testdata/edit-probe/typescript/main.ts` provides ten initial symbols for the
+ordinary warmup gate. Other TypeScript syntax is not supported by this fixture
+cell. Its token checks discard comments/strings as proof and require the actual
+producer symbol ID and file/path. TypeScript implementation does not constitute
+a completed runtime or reference gate. The finite plan contains 100 precomputed Poisson
 arrivals (mean 15 seconds); `--edit-count 1` is an explicit diagnostic only.
 Each edit has its own session opened before dispatch, with independent 25 ms
 probes and immediate same-editing-session file/source readbacks. Session setup
@@ -98,8 +105,8 @@ coalesces small-row bursts without a separate message-count refusal. Exhaustion 
 `harness_evidence_incomplete`, never product failure or a successful check.
 Reference inputs require a reviewed evidence budget before execution. One timed
 public batch restores the file after the measurement window; unknown/pending
-mutations prevent that cleanup rewrite. This initial cell does not implement
-the paired comparison, other cells, or establish 100-edit/reference acceptance.
+mutations prevent that cleanup rewrite. The native paired path uses the same
+cell machinery; other cells and reference acceptance remain separate gates.
 An owner-matching immutable physical return with explicitly missing or invalid
 deep laps ends that edit as failed coverage once its graph and read evidence
 have arrived. Receipt terminality alone still waits for late physical evidence.

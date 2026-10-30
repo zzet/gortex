@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"math"
 	"math/big"
+	"path/filepath"
 	"strings"
 )
 
@@ -89,16 +90,34 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 	switch oracle {
 	case "source":
 		source, _ := body["source"].(string)
-		return body["name"] == step.Marker && editProbeSourceCall(source, step.Marker, callee)
+		if filepath.Ext(c.File) == ".ts" {
+			id, _ := body["id"].(string)
+			path, _ := body["file_path"].(string)
+			if !editProbeSourceID(id, c.File, step.Marker) || !editProbeFixturePath(path, c.File) {
+				return false
+			}
+		}
+		return body["name"] == step.Marker && editProbeFixtureSource(c.File, source, step.Marker, callee)
 	case "file":
 		source, _ := body["content"].(string)
-		return editProbeSourceCall(source, step.Marker, callee)
+		if filepath.Ext(c.File) == ".ts" {
+			path, _ := body["path"].(string)
+			if !editProbeFixturePath(path, c.File) {
+				return false
+			}
+		}
+		return editProbeFixtureSource(c.File, source, step.Marker, callee)
 	case "text":
 		return collection("matches", func(row map[string]any) bool {
 			path, _ := row["path"].(string)
 			text, _ := row["text"].(string)
 			line, err := strconvEditProbeUint(row["line"])
-			return err == nil && line > 0 && (path == c.File || strings.HasSuffix(path, "/"+c.File)) && strings.Contains(text, "func "+step.Marker)
+			prefix := "func "
+			if filepath.Ext(c.File) == ".ts" {
+				valid, correct := editProbeTypeScriptFixture(text, step.Marker, callee)
+				return err == nil && line > 0 && editProbeFixturePath(path, c.File) && valid && correct
+			}
+			return err == nil && line > 0 && (path == c.File || strings.HasSuffix(path, "/"+c.File)) && strings.Contains(text, prefix+step.Marker)
 		})
 	case "callers", "call_chain":
 		return collection("edges", func(row map[string]any) bool {

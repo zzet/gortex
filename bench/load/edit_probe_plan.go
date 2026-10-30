@@ -56,40 +56,51 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if count != 1 && count != 100 {
 		return editProbePlan{}, errors.New("edit-and-probe requires 100 edits, or explicit 1-edit diagnostic")
 	}
-	if filepath.Ext(c.File) != ".go" || c.EditAnchor == "" || strings.Count(c.EditTemplate, "{{marker}}") != 1 {
-		return editProbePlan{}, errors.New("initial edit-and-probe cell requires Go/stable anchor/one marker declaration")
+	language := "go"
+	if filepath.Ext(c.File) == ".ts" {
+		language = "typescript"
+	}
+	if (filepath.Ext(c.File) != ".go" && filepath.Ext(c.File) != ".ts") || c.EditAnchor == "" || strings.Count(c.EditTemplate, "{{marker}}") != 1 {
+		return editProbePlan{}, errors.New("edit-and-probe cell requires Go or explicit TypeScript fixture/stable anchor/one marker declaration")
 	}
 	separator := strings.LastIndex(c.Symbol, "::")
 	if separator < 0 {
-		return editProbePlan{}, errors.New("initial intrafile cell requires one plain Go callee symbol")
+		return editProbePlan{}, errors.New("initial intrafile cell requires one plain callee symbol")
 	}
 	callee := c.Symbol[separator+2:]
 	if !token.IsIdentifier(callee) {
-		return editProbePlan{}, errors.New("initial intrafile cell requires one plain Go callee symbol")
+		return editProbePlan{}, errors.New("initial intrafile cell requires one plain callee symbol")
 	}
 	probeMarker := "GortexEditProbeDeclaration"
-	parsed, err := parser.ParseFile(token.NewFileSet(), "template.go", "package probe\n"+strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), 0)
-	if err != nil {
-		return editProbePlan{}, fmt.Errorf("edit template is not standalone Go declarations: %w", err)
-	}
-	declaration, call := false, false
-	for _, decl := range parsed.Decls {
-		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == probeMarker && fn.Body != nil {
-			declaration = true
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				if expr, ok := n.(*ast.CallExpr); ok {
-					if name, ok := expr.Fun.(*ast.Ident); ok && name.Name == callee {
-						call = true
+	if language == "typescript" {
+		valid, correct := editProbeTypeScriptFixture(strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker, callee)
+		if !valid || !correct {
+			return editProbePlan{}, errors.New("TypeScript template must be a numeric zero-argument marker function returning the intrafile call")
+		}
+	} else {
+		parsed, err := parser.ParseFile(token.NewFileSet(), "template.go", "package probe\n"+strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), 0)
+		if err != nil {
+			return editProbePlan{}, fmt.Errorf("edit template is not standalone Go declarations: %w", err)
+		}
+		declaration, call := false, false
+		for _, decl := range parsed.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == probeMarker && fn.Body != nil {
+				declaration = true
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					if expr, ok := n.(*ast.CallExpr); ok {
+						if name, ok := expr.Fun.(*ast.Ident); ok && name.Name == callee {
+							call = true
+						}
 					}
-				}
-				return true
-			})
+					return true
+				})
+			}
+		}
+		if !declaration || !call {
+			return editProbePlan{}, errors.New("template must declare the unique marker function and actually call the selected intrafile callee")
 		}
 	}
-	if !declaration || !call {
-		return editProbePlan{}, errors.New("template must declare the unique marker function and actually call the selected intrafile callee")
-	}
-	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: "add_intrafile_call", Tool: "edit.file", Language: "go", Mode: "json", Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", "native save/create/delete/hotfile/restart", "largest-file/reference configurations require their own reviewed manifest"}}
+	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: "add_intrafile_call", Tool: "edit.file", Language: language, Mode: "json", Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", "native save/create/delete/hotfile/restart", "largest-file/reference configurations require their own reviewed manifest"}}
 	rng := rand.New(rand.NewPCG(uint64(seed)^0xa0761d6478bd642f, uint64(seed)^0xe7037ed1a0b428db))
 	due := int64(editProbePeriod)
 	for i := 0; i < count; i++ {

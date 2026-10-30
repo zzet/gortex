@@ -108,7 +108,11 @@ func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
 
 func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeReport {
 	hash, _ := hashJSON(plan)
-	out := &editProbeReport{Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{"one Go/add_intrafile_call/edit.file/JSON cell only", "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
+	language := "Go"
+	if plan.Language == "typescript" {
+		language = "TypeScript"
+	}
+	out := &editProbeReport{Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/add_intrafile_call/edit.file/JSON cell only", language), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
 	for _, step := range plan.Steps {
 		out.Records = append(out.Records, newEditProbeRecord(c, step))
 	}
@@ -123,6 +127,12 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 	original, err := os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
 	if err != nil {
 		return nil, nil, err
+	}
+	if filepath.Ext(plan.File) == ".ts" {
+		valid, _ := editProbeTypeScriptFixture(string(original), "", "")
+		if !valid {
+			return nil, nil, errors.New("TypeScript cell requires an explicit numeric-function fixture")
+		}
 	}
 	if strings.Count(string(original), p.Repos[0].Corpus.EditAnchor) != 1 {
 		return nil, nil, errors.New("edit-probe anchor must occur exactly once in original fixture")
