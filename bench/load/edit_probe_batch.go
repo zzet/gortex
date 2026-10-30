@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"path/filepath"
@@ -24,19 +25,23 @@ type editProbeBatchReferences struct {
 	TransactionError string `json:"transaction_error,omitempty"`
 }
 
-func editProbeBatchRequest(c Corpus, marker, transactionID string) request {
+// This explicit fixture offers whole-file before/after bytes. It is not the
+// generic anchor-splice batch shape: the same precomputed prefix as edit.write
+// makes its durable after-image provable without reading later server state.
+func editProbeBatchRequest(c Corpus, before, marker, transactionID string) (request,string) {
+	_,after:=editProbeWriteRequest(c,before,marker)
 	return request{Tool:"edit",Operation:"batch",Arguments:map[string]any{
 		"operation":"batch",
-		"changes":[]any{map[string]any{"op":"edit_file","path":c.File,"old_string":c.EditAnchor,"new_string":c.EditAnchor+strings.ReplaceAll(c.EditTemplate,"{{marker}}",marker)}},
+		"changes":[]any{map[string]any{"op":"edit_file","path":c.File,"old_string":before,"new_string":after}},
 		"options":map[string]any{"transaction_id":transactionID},
-	}}
+	}},after
 }
 
 // Only the pointed one-file edit_file shape is supported here. Missing timing
 // references do not negate a genuine committed ACK: validateReferences below
 // reports those independently, so unavailable accounting cannot become zero or
 // remove the successful source acknowledgement from its denominator.
-func decodeEditProbeBatchAcknowledgement(body map[string]any,transactionID,absPath,relativePath string)(editProbeBatchReferences,error){
+func decodeEditProbeBatchAcknowledgement(body map[string]any,transactionID,absPath,relativePath string,offered []byte)(editProbeBatchReferences,error){
 	out:=editProbeBatchReferences{}
 	if transactionID=="" || body["transaction_id"]!=transactionID || body["status"]!="committed" || body["disk_status"]!="committed" {return out,errors.New("batch transaction is not the requested committed source acknowledgement")}
 	files,ok:=body["files"].([]any);if !ok || len(files)!=1 {return out,errors.New("one-file batch acknowledgement requires exactly one durable file")}
@@ -48,6 +53,8 @@ func decodeEditProbeBatchAcknowledgement(body map[string]any,transactionID,absPa
 	for _,name:=range []string{"after_absent","before_absent"} {if value,present:=file[name];present {if absent,ok:=value.(bool);!ok || absent {return out,errors.New("batch file absence flag contradicts existing-file edit")}}}
 	after,_:=file["after_sha256"].(string);bytes,err:=hex.DecodeString(after)
 	if err!=nil || len(bytes)!=32 || after!=strings.ToLower(after) {return out,errors.New("batch durable after-image SHA256 unavailable")}
+	expected:=sha256.Sum256(offered)
+	if len(offered)==0 || after!=hex.EncodeToString(expected[:]) {return out,errors.New("batch durable after-image does not match exact offered whole-file bytes")}
 	out.TransactionID,out.Path,out.RelativePath,out.AfterSHA256=transactionID,path,rel,after
 	if value,present:=body["error"];present {message,ok:=value.(string);if !ok {return out,errors.New("invalid transaction error")};out.TransactionError=message}
 	out.Acknowledgement,_=body["acknowledgement_receipt"].(string)
