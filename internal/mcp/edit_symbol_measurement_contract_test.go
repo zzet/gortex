@@ -108,10 +108,10 @@ func TestEditSymbolMeasurementFixtureUsesActualSpliceAndExplicitAbsence(t *testi
 				require.Equal(t, strings.Replace(source, declaration, replacement, 1), string(actual))
 				require.NotNil(t, s.engineFor(t.Context()).GetSymbol(file+"::Sentinel"), "neighbor must survive every splice")
 				switch operation {
-    case "sibling", "append_leaf":
+				case "sibling", "append_leaf":
 					require.NotNil(t, s.engineFor(t.Context()).GetSymbol(id))
 					require.NotNil(t, s.engineFor(t.Context()).GetSymbol(file+"::Added"))
-    case "modify_body", "change_signature":
+				case "modify_body", "change_signature":
 					afterNode := s.engineFor(t.Context()).GetSymbol(id)
 					require.NotNil(t, afterNode)
 					require.NotNil(t, s.engineFor(t.Context()).GetSymbol(file+"::Caller"), "unchanged zero-argument caller must survive")
@@ -132,7 +132,7 @@ func TestEditSymbolMeasurementFixtureUsesActualSpliceAndExplicitAbsence(t *testi
 							require.Equal(t, "def Target(...)", afterNode.Meta["signature"], "producer parameter detail is proved by exact source, not invented metadata")
 						}
 					}
-    default:
+				default:
 					require.Nil(t, s.engineFor(t.Context()).GetSymbol(id), "old identity must really be absent, not an empty successful source")
 					missing := callTool(t, s, "get_symbol_source", map[string]any{"id": id})
 					require.True(t, missing.IsError, "expected absence is an explicit producer refusal")

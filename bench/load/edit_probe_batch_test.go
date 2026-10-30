@@ -275,9 +275,11 @@ func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) 
 		} else {
 			owner, _ = options["receipt"].(string)
 			switch owner {
-   case refs.Observation: response = file
-   case refs.Acknowledgement: response = shared
-   }
+			case refs.Observation:
+				response = file
+			case refs.Acknowledgement:
+				response = shared
+			}
 		}
 		mu.Lock()
 		owners = append(owners, owner)
