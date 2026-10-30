@@ -66,11 +66,12 @@ jobs:
         run: |
           go build -o "${{ runner.temp }}/perf-candidate" ./cmd/gortex
           go build -o "${{ runner.temp }}/perf-load" ./bench/load
+          go build -o "${{ runner.temp }}/perf-check-budgets" ./bench/check-budgets
       - name: Collect full standalone matrix and enforce strict budgets
         env:
           PERF_CONFIG: ${{ vars.PERF_REFERENCE_NIGHTLY_CONFIG }}
         run: >-
-          go run ./bench/check-budgets collect
+          "${{ runner.temp }}/perf-check-budgets" collect
           --config "$PERF_CONFIG" --require-lane nightly
           --expected-candidate "${{ github.sha }}"
           --candidate-binary "${{ runner.temp }}/perf-candidate"
@@ -99,11 +100,12 @@ jobs:
         run: |
           go build -o "${{ runner.temp }}/perf-candidate" ./cmd/gortex
           go build -o "${{ runner.temp }}/perf-load" ./bench/load
+          go build -o "${{ runner.temp }}/perf-check-budgets" ./bench/check-budgets
       - name: Collect full standalone matrix and enforce strict budgets
         env:
           PERF_CONFIG: ${{ vars.PERF_MAC_NIGHTLY_CONFIG }}
         run: >-
-          go run ./bench/check-budgets collect
+          "${{ runner.temp }}/perf-check-budgets" collect
           --config "$PERF_CONFIG" --require-lane nightly
           --expected-candidate "${{ github.sha }}"
           --candidate-binary "${{ runner.temp }}/perf-candidate"
