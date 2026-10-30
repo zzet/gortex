@@ -19,14 +19,15 @@ func TestEditProbeActualJSONAndTOONWireContracts(t *testing.T) {
 	for _, format := range []string{"json", "toon"} {
 		t.Run(format, func(t *testing.T) {
 			original := "package main\n\nfunc Example() int { return 1 }\nfunc Caller() int { return Example() }\n"
-			s, root := setupMoveInlineRepo(t, map[string]string{"main.go": original})
+			s, _ := setupMoveInlineRepo(t, map[string]string{"main.go": original})
 			t.Cleanup(s.DrainBackground)
 			s.ToolCallTimeout = -1
 			logCore, captured := observer.New(zap.DebugLevel)
 			s.logger = zap.New(logCore)
 			const session = "edit-output-contract"
 			s.NoteSessionToolPolicy(session, "facade-v1", "hide")
-			ctx := WithSessionCWD(WithSessionID(t.Context(), session), root)
+			// The in-memory fixture serves its base corpus; it has no checkout catalog.
+			ctx := WithSessionID(t.Context(), session)
 			output := map[string]any{"format": format, "max_bytes": 0}
 			ack := callEditOperationFrame(t, s, ctx, "edit", map[string]any{"operation": "file", "target": map[string]any{"file": "main.go"}, "match": "func Caller() int { return Example() }", "replacement": "func Caller() int { return Example() }\nfunc Added() int { return Example() }", "options": map[string]any{"mutation_id": "output-" + format}, "output": output})
 			decode := func(result any) map[string]any {
@@ -153,14 +154,15 @@ func TestEditProbeTOONSignatureFollowingCallerWireWitness(t *testing.T) {
 				after, following = "def Target(optional=0):\n\n    return Example()", "def Following():\n    return Target()"
 			}
 			source := header + example + "\n\n" + before + "\n\n" + following + "\n"
-			s, root := setupMoveInlineRepo(t, map[string]string{file: source})
+			s, _ := setupMoveInlineRepo(t, map[string]string{file: source})
 			t.Cleanup(s.DrainBackground)
 			s.ToolCallTimeout = -1
 			logCore, captured := observer.New(zap.DebugLevel)
 			s.logger = zap.New(logCore)
 			const session = "toon-signature-witness"
 			s.NoteSessionToolPolicy(session, "facade-v1", "hide")
-			ctx := WithSessionCWD(WithSessionID(t.Context(), session), root)
+			// The in-memory fixture serves its base corpus; it has no checkout catalog.
+			ctx := WithSessionID(t.Context(), session)
 			output := map[string]any{"format": "toon", "max_bytes": 0}
 			decode := func(result *mcpgo.CallToolResult) map[string]any {
 				if result.IsError {
