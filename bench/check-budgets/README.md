@@ -141,6 +141,9 @@ go run ./bench/check-budgets history --inputs downloaded-nightlies.json \
   --through 2026-10-30 --hosts reference_linux
 ```
 
+The release entry point invokes the Go tool from `PATH`; select the repository's
+pinned toolchain there and use `GOTOOLCHAIN=local` for a reproducible invocation.
+
 `downloaded-nightlies.json` is an array of retained artifact-directory paths,
 relative to that index or absolute. Review their run provenance before use:
 this command checks local content and replays raw evidence, not the authenticity
