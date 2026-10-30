@@ -20,7 +20,7 @@ func TestBenchmarkFixtureTargets(t *testing.T) {
 		benchmarkServeID,
 	} {
 		if eng.g.GetNode(id) == nil {
-			t.Fatalf("benchmark target is absent from the indexed fixture: %s", id)
+			t.Errorf("benchmark target is absent from the indexed fixture: %s", id)
 		}
 	}
 	observed := map[string][2]int{}
@@ -36,12 +36,14 @@ func TestBenchmarkFixtureTargets(t *testing.T) {
 		"GetCluster":      eng.GetCluster(benchmarkServerID, QueryOptions{Depth: 2, Limit: 50}),
 	} {
 		if result == nil || len(result.Nodes) < 2 || len(result.Edges) < 1 {
-			t.Fatalf("benchmark %s must exercise nodes and edges, not an empty lookup: %+v", name, result)
+			t.Errorf("benchmark %s must exercise nodes and edges, not an empty lookup: %+v", name, result)
 		}
-		observed[name] = [2]int{len(result.Nodes), len(result.Edges)}
+		if result != nil {
+			observed[name] = [2]int{len(result.Nodes), len(result.Edges)}
+		}
 	}
 	if observed["SearchSymbols"][0] < 1 || stats.TotalNodes < 2 || stats.TotalEdges < 1 {
-		t.Fatal("benchmark search/statistics fixture is empty")
+		t.Error("benchmark search/statistics fixture is empty")
 	}
 	data, err := json.Marshal(observed)
 	if err != nil {
