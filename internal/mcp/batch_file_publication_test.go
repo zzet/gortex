@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"github.com/zzet/gortex/internal/indexer"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -152,4 +154,36 @@ func TestBatchFileObservationRealRollbackRejectsSuccessfulWriter(t *testing.T) {
 	require.Equal(t, "failed", payload["batch_disk_verdict"], "rolled-back bytes never become a committed batch clock")
 	require.NotContains(t, payload, "publication_phases")
 	require.Empty(t, payload["publication_receipt"])
+}
+
+func TestBatchFileObservationRealReadmissionCannotReplaceOriginalTicket(t *testing.T) {
+	done := make(chan indexer.MutationResult)
+	defer close(done)
+	s := newAtomicBatchTestServer(t, mutationTestWatcher{generation: 71, done: done})
+	s.mutationReindexWait = time.Nanosecond
+	file := writeAtomicBatchFixture(t, t.TempDir(), "target.txt", "before\n")
+	req := editOperationRequest("batch_edit", "")
+	req.Params.Arguments = map[string]any{"transaction_id": "file-observation-readmission", "edits": []any{
+		map[string]any{"op": "edit_file", "path": file, "old_string": "before\n", "new_string": "after\n"},
+	}}
+	_, err := s.boundToolHandler(s.handleAtomicBatchEdit)(t.Context(), req)
+	require.NoError(t, err)
+	value, _ := s.batchTransactions.Load("file-observation-readmission")
+	state := value.(*batchTransactionState)
+	original := state.snapshot()
+	require.Equal(t, "pending", original.GraphStatus)
+	refs := s.batchFileObservationReferences(original)
+	require.Len(t, refs, 1)
+	before, _ := s.batchFileObservationPayload(t.Context(), refs[0].Receipt)
+	originalTicket := original.Files[0].ReindexReceipt
+	require.NotEmpty(t, originalTicket)
+	require.Equal(t, originalTicket, before["publication_receipt"])
+	s.mutationReceipts.Delete(originalTicket)
+	replacement, err := s.batchTransactionStatus(t.Context(), original.TransactionID)
+	require.NoError(t, err)
+	require.NotEmpty(t, replacement.Files[0].ReindexReceipt)
+	require.NotEqual(t, originalTicket, replacement.Files[0].ReindexReceipt, "durable transaction legitimately readmits lost publication")
+	after, _ := s.batchFileObservationPayload(t.Context(), refs[0].Receipt)
+	require.Equal(t, originalTicket, after["publication_receipt"], "readmission cannot borrow a later ticket for original writer timing")
+	require.Equal(t, before["publication_generation"], after["publication_generation"])
 }
