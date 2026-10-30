@@ -155,7 +155,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 		return nil, nil, errors.New("edit-probe anchor must occur exactly once in original fixture")
 	}
 	for _, step := range plan.Steps {
-		if strings.Contains(string(original), step.Marker) {
+		if step.BeforeSymbol == "" && strings.Contains(string(original), step.Marker) {
 			return nil, nil, errors.New("planned marker already exists before edit")
 		}
 	}
@@ -188,6 +188,21 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 			return r, clients, err
 		}
 		clients = append(clients, state.client)
+		if state.step.BeforeSymbol != "" {
+			req := request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": state.step.BeforeSymbol}}}
+			raw, identity, readErr := state.client.callWithIdentity(ctx, "tools/call", map[string]any{"name": req.Tool, "arguments": dispatchArgs(req, p.Repos[0])})
+			if readErr == nil {
+				readErr = checkToolResult(raw)
+			}
+			proven := readErr == nil && editProbePresenceProof(raw, p.Repos[0].Corpus, state.step.BeforeSymbol)
+			if err := state.emit(map[string]any{"event": "before_presence_admission", "symbol": state.step.BeforeSymbol, "wire_id": identity.ID, "write_started": identity.WriteStarted, "finished": identity.Finished, "payload": raw, "proven": proven}); err != nil {
+				return r, clients, err
+			}
+			if !proven {
+				return r, clients, fmt.Errorf("original symbol presence admission failed: %s: %v", state.step.BeforeSymbol, readErr)
+			}
+			state.absenceBefore = map[string]bool{state.step.BeforeSymbol: true}
+		}
 	}
 	phase.Metrics["edit_probe_session_setup_seconds"] = measured(time.Since(setup).Seconds(), "s")
 	phase.Metrics["edit_probe_sessions"] = measured(float64(len(clients)), "sessions")
@@ -542,12 +557,21 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	}
 	s.mu.Unlock()
 	// Immediate same editing session, with no sleep/receipt/freshness barrier.
-	for index, kind := range []string{"file", "source"} {
+	readbackKinds := []string{"file", "source"}
+	if step.BeforeSymbol != "" {
+		readbackKinds = append(readbackKinds, "old_source_absent")
+	}
+	for index, kind := range readbackKinds {
 		target := map[string]any{"file": r.plan.File}
 		if kind == "source" {
 			target = map[string]any{"symbol": r.plan.File + "::" + step.Marker}
 		}
 		req := request{Tool: "read", Operation: kind, Arguments: map[string]any{"operation": kind, "target": target}}
+		if kind == "old_source_absent" {
+			req.Operation = "source"
+			req.ExpectedAbsentSymbol = step.BeforeSymbol
+			req.Arguments = map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}
+		}
 		begin := time.Now()
 		raw, identity, readErr := r.perform(callCtx, s, r.editor, req, "readback:"+kind, "readback", 100+index)
 		payload, decodeErr := decodeEditProbeResult(raw)

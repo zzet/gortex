@@ -22,7 +22,7 @@ type editProbeOracle struct {
 func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
 	marker := map[string]any{"symbol": c.File + "::" + step.Marker}
 	file := map[string]any{"file": c.File}
-	return []editProbeOracle{
+	oracles := []editProbeOracle{
 		{"source", request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": marker}}},
 		{"summary", request{Tool: "read", Operation: "summary", Arguments: map[string]any{"operation": "summary", "target": file}}},
 		{"editing_context", request{Tool: "read", Operation: "editing_context", Arguments: map[string]any{"operation": "editing_context", "target": file}}},
@@ -31,6 +31,10 @@ func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
 		{"callers", request{Tool: "relations", Operation: "callers", Arguments: map[string]any{"operation": "callers", "target": map[string]any{"symbol": c.Symbol}, "options": map[string]any{"depth": 1, "limit": 1000}}}},
 		{"call_chain", request{Tool: "trace", Operation: "call_chain", Arguments: map[string]any{"operation": "call_chain", "target": marker, "options": map[string]any{"depth": 1, "limit": 1000}}}},
 	}
+	if step.BeforeSymbol != "" {
+		oracles = append(oracles, editProbeOracle{name: "old_source_absent", call: request{Tool: "read", Operation: "source", ExpectedAbsentSymbol: step.BeforeSymbol, Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}}})
+	}
+	return oracles
 }
 
 func decodeEditProbeResult(raw json.RawMessage) (map[string]any, error) {

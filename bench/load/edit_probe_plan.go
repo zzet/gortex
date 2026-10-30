@@ -20,13 +20,14 @@ const editProbeMean = 15 * time.Second
 const editProbePeriod = 25 * time.Millisecond
 
 type editProbeStep struct {
-	Ordinal     int     `json:"ordinal"`
-	ActivateNS  int64   `json:"activate_ns"`
-	DueNS       int64   `json:"due_ns"`
-	Marker      string  `json:"marker"`
-	MutationID  string  `json:"mutation_id"`
-	Request     request `json:"request"`
-	RequestHash string  `json:"request_sha256"`
+	Ordinal      int     `json:"ordinal"`
+	ActivateNS   int64   `json:"activate_ns"`
+	DueNS        int64   `json:"due_ns"`
+	Marker       string  `json:"marker"`
+	MutationID   string  `json:"mutation_id"`
+	Request      request `json:"request"`
+	RequestHash  string  `json:"request_sha256"`
+	BeforeSymbol string  `json:"before_symbol,omitempty"`
 }
 
 type editProbePlan struct {
@@ -59,6 +60,16 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	tool, err := editProbeTool(c)
 	if err != nil {
 		return editProbePlan{}, err
+	}
+	kind := c.EditKind
+	if kind == "" {
+		kind = "add_intrafile_call"
+	}
+	if kind != "add_intrafile_call" && kind != "rename" {
+		return editProbePlan{}, errors.New("unsupported edit kind")
+	}
+	if kind != "add_intrafile_call" && tool != "edit.symbol" {
+		return editProbePlan{}, errors.New("rename fixtures currently require explicit edit.symbol")
 	}
 	language := "go"
 	if filepath.Ext(c.File) == ".ts" {
@@ -113,7 +124,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 			return editProbePlan{}, errors.New("template must declare the unique marker function and actually call the selected intrafile callee")
 		}
 	}
-	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: "add_intrafile_call", Tool: tool, Language: language, Mode: "json", Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", "native save/create/delete/hotfile/restart", "largest-file/reference configurations require their own reviewed manifest"}}
+	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: kind, Tool: tool, Language: language, Mode: "json", Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", "native save/create/delete/hotfile/restart", "largest-file/reference configurations require their own reviewed manifest"}}
 	rng := rand.New(rand.NewPCG(uint64(seed)^0xa0761d6478bd642f, uint64(seed)^0xe7037ed1a0b428db))
 	due := int64(editProbePeriod)
 	writeContent := c.EditInitialContent
@@ -143,6 +154,17 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 				r, writeContent = editProbeWriteRequest(c, writeContent, marker)
 			}
 		}
+		beforeSymbol := ""
+		if kind == "rename" {
+			oldName := marker + "Before"
+			before := strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", oldName))
+			if strings.Count(c.EditInitialContent, before) != 1 || strings.Contains(c.EditInitialContent, marker+"(") {
+				return editProbePlan{}, errors.New("rename requires each exact original declaration and absent new declaration")
+			}
+			replacement := strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", marker))
+			beforeSymbol = c.File + "::" + oldName
+			r = request{Tool: "edit", Operation: "symbol", Arguments: map[string]any{"operation": "symbol", "target": map[string]any{"symbol": beforeSymbol}, "match": before, "replacement": replacement}}
+		}
 		if tool != "edit.batch" {
 			r.Arguments["options"] = map[string]any{"mutation_id": id}
 		}
@@ -150,7 +172,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		if err != nil {
 			return editProbePlan{}, err
 		}
-		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Marker: marker, MutationID: id, Request: r, RequestHash: hash})
+		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol})
 	}
 	return p, nil
 }

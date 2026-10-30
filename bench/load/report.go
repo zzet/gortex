@@ -57,6 +57,7 @@ type Corpus struct {
 	EditTemplate       string `json:"edit_template"`
 	EditAnchor         string `json:"edit_anchor"`
 	EditTool           string `json:"edit_tool,omitempty"`
+	EditKind           string `json:"edit_kind,omitempty"`
 	EditInitialContent string `json:"edit_initial_content,omitempty"`
 	ProposedSignature  string `json:"proposed_signature"`
 }
