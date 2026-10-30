@@ -30,9 +30,8 @@ func simpleSymbolName(s string) bool {
 		return false
 	}
 	for i, r := range s {
-		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
-			return false
-		}
+		if r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9' { continue }
+  return false
 	}
 	return true
 }

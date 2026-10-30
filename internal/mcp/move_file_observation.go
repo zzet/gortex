@@ -322,7 +322,7 @@ func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 	*state = "observed"
 }
 func (w moveDirectWitness) matchesWrite(record *mutationCommitRecord) bool {
-	return record.owner == w.server.Value() && record.id == w.id && record.kind == moveFileObservationCommit && record.moveFile != nil && record.key == w.operation && record.absPath == w.path && record.newSHA == w.blob && record.committedAt == w.committed && record.commitSeq == w.commitSeq && record.disk == mutationDiskCommitted
+	return record.owner == w.server.Value() && record.id == w.id && record.kind == moveFileObservationCommit && record.moveFile != nil && record.key == w.operation && record.absPath == w.path && record.newSHA == w.blob && record.committedAt.Equal(w.committed) && record.commitSeq == w.commitSeq && record.disk == mutationDiskCommitted
 }
 func (w moveDirectWitness) unavailable(reason string) {
 	s, record := w.server.Value(), w.record.Value()

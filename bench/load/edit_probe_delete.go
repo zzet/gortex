@@ -92,7 +92,7 @@ func editProbeDeleteCorrect(oracle string, body map[string]any, c Corpus, step e
 		nodes, ok := body["defines"].([]any)
 		file, fok := body["file"].(map[string]any)
 		id, _ := file["id"].(string)
-		if !ok || !fok || !(id == c.File || strings.HasSuffix(id, "/"+c.File)) {
+		if !ok || !fok || id != c.File && !strings.HasSuffix(id, "/"+c.File) {
 			return false
 		}
 		if truncated, exists := body["truncated"]; exists && truncated != false {

@@ -710,7 +710,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			s.record.Errors = append(s.record.Errors, "first-correct oracle unavailable: "+name)
 		}
 	}
-	if !s.record.GraphTerminal && !(move != nil && !r.requireAccounting && movePublicFactsComplete(s.record)) {
+	if !s.record.GraphTerminal && (move == nil || r.requireAccounting || !movePublicFactsComplete(s.record)) {
 		s.record.Errors = append(s.record.Errors, "graph receipt terminal unavailable")
 	}
 	if r.requireAccounting && move != nil && (s.record.MoveAccounting == nil || s.record.MoveAccounting.State != "observed_move_windows_checks_pass") {
