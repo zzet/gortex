@@ -2,6 +2,8 @@ package main
 
 import (
  "context"
+ "errors"
+ "path/filepath"
  "os"
  "sync"
  "testing"
@@ -68,4 +70,57 @@ func TestMoveBaselinePublicCompletionNeverInventsReceiptOrMeasuredPhases(t *test
  if state.record.GraphTerminal || state.record.GraphTerminalBasis != "baseline_complete_public_move_facts_no_receipt_proof" || state.record.MoveAccounting == nil || state.record.MoveAccounting.State != "unavailable" || state.record.MoveAccounting.A != nil { t.Fatal(state.record) }
  state.record.Readbacks[0].Correct = false
  if movePublicFactsComplete(state.record) { t.Fatal("incorrect public readback qualified baseline") }
+}
+
+func TestMoveRestoreUsesOnePublicBatchForBothOwnedFiles(t *testing.T) {
+ root := t.TempDir()
+ source, target := filepath.Join(root, "source.go"), filepath.Join(root, "target.go")
+ sourceNow, targetNow := "package fixture\nfunc Survives() {}\n", "package fixture\nfunc Moved() {}\n"
+ sourceBefore, targetBefore := "package fixture\nfunc Moved() {}\nfunc Survives() {}\n", "package fixture\n"
+ if err := os.WriteFile(source, []byte(sourceNow), 0600); err != nil { t.Fatal(err) }
+ if err := os.WriteFile(target, []byte(targetNow), 0600); err != nil { t.Fatal(err) }
+ var mu sync.Mutex
+ var received []any
+ var handlerErr error
+ socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
+  args, _ := frame.Params["arguments"].(map[string]any)
+  changes, _ := args["changes"].([]any)
+  mu.Lock()
+  defer mu.Unlock()
+  received = changes
+  for _, raw := range changes {
+   change, _ := raw.(map[string]any)
+   path, _ := change["path"].(string)
+   before, _ := change["old_string"].(string)
+   after, _ := change["new_string"].(string)
+   var absolute, want string
+   switch path {
+   case "fixture/source.go": absolute, want = source, sourceNow
+   case "fixture/target.go": absolute, want = target, targetNow
+   default: handlerErr = errors.New("unowned restore path"); continue
+   }
+   if change["op"] != "edit_file" || before != want { handlerErr = errors.New("restore lost exact current bytes"); continue }
+   if err := os.WriteFile(absolute, []byte(after), 0600); err != nil { handlerErr = err }
+  }
+  return stubContent(map[string]any{"status": "committed"}), nil
+ })
+ ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+ defer cancel()
+ client, err := openMCP(ctx, socket, "")
+ if err != nil { t.Fatal(err) }
+ defer client.Close()
+ refs, _ := moveAccountingFixture(t)
+ run := &editProbeRuntime{options: runOptions{Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Path: root, Prefix: "fixture", Corpus: Corpus{EditDestination: "target.go"}}}}, editor: client, plan: editProbePlan{Tool: "refactor.move", File: "source.go"}, original: []byte(sourceBefore), moveOriginal: []byte(targetBefore), requireAccounting: true, phase: &Phase{EditProbe: &editProbeReport{Records: []editProbeRecord{{Move: &refs}}}}}
+ if err := run.restore(ctx); err == nil { t.Fatal("unknown publication allowed cleanup mutation") }
+ mu.Lock(); called := len(received); mu.Unlock()
+ if called != 0 { t.Fatal("pending outcome reached public restore") }
+ run.phase.EditProbe.Records[0].GraphTerminal = true
+ if err := run.restore(ctx); err != nil { t.Fatal(err) }
+ mu.Lock(); defer mu.Unlock()
+ if handlerErr != nil || len(received) != 2 { t.Fatal(received, handlerErr) }
+ actualSource, err := os.ReadFile(source)
+ if err != nil { t.Fatal(err) }
+ actualTarget, err := os.ReadFile(target)
+ if err != nil { t.Fatal(err) }
+ if string(actualSource) != sourceBefore || string(actualTarget) != targetBefore { t.Fatal("two-file restore lost bytes") }
 }
