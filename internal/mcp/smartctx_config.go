@@ -281,7 +281,7 @@ func confidenceVerdict(rec quality.ConfidenceRecord) string {
 //
 // taskRankedKnown says taskRanked already holds the ranked search of the whole
 // task, which then replaces the identical search here.
-func (s *Server) lowConfidenceRetrievalNote(ctx context.Context, task string, syms []*graph.Node, taskRanked []*rerank.Candidate, taskRankedKnown bool) map[string]any {
+func (s *Server) lowConfidenceRetrievalNote(ctx context.Context, task string, syms []*graph.Node, taskRanked []*rerank.Candidate, taskRankedKnown bool, scope query.QueryOptions) map[string]any {
 	if strings.TrimSpace(task) == "" || len(syms) == 0 {
 		return nil
 	}
@@ -296,7 +296,7 @@ func (s *Server) lowConfidenceRetrievalNote(ctx context.Context, task string, sy
 	}
 	cands := taskRanked
 	if !taskRankedKnown {
-		cands = eng.SearchSymbolsRanked(task, 10, query.QueryOptions{}, nil)
+		cands = eng.SearchSymbolsRankedContext(ctx, task, 10, scope, nil)
 	}
 	scores := make([]float64, 0, len(cands))
 	for _, c := range cands {
