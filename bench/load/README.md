@@ -132,9 +132,16 @@ The seven destination/call probes plus explicit old-source absence must all
 succeed. Immediate own-ACK readbacks check the destination file, new symbol,
 old-symbol refusal and surviving source file before timing queries begin.
 Standalone move observations retain one shared RPC A and each file's actual
-write/direct-reconcile windows. Scheduled background is explicitly inapplicable,
-not a measured zero; physical mutation and batch receipts cannot supply missing
-move clocks. Baseline controls without observations can establish public
+write and publication windows. A direct move reconcile and an independent
+public-read repair keep separate route records and actual request causes; a
+later direct no-op cannot supply an earlier reader's work. Exact coalesced
+execution identities are evaluated once while retaining both route records;
+conflicting windows refuse. Each measured window must partition its own actual
+owner and endpoints. A reader window can begin before the move RPC, remains
+non-additive with shared A, and must accept the original file bytes after that
+file's writer return. Scheduled background is explicitly inapplicable, not a
+measured zero; physical mutation and batch receipts cannot supply missing move
+clocks. Baseline controls without observations can establish public
 functional completion while graph receipt proof and phases remain unavailable.
 Cleanup uses one public two-file batch only after completed outcomes, then
 verifies both original byte strings. Unsupported language, package, path and
