@@ -67,10 +67,19 @@ func TestBatchAcknowledgementOriginalExecutionDuplicateEvictionAndRestart(t *tes
 }
 
 func TestBatchAcknowledgementCannotBecomePhysicalMutationOrSourceEvidence(t *testing.T) {
+	assertBatchObservationCannotBecomePhysical(t,batchAcknowledgementCommit)
+}
+
+func TestBatchFileObservationCannotBecomePhysicalMutationOrSourceEvidence(t *testing.T) {
+	assertBatchObservationCannotBecomePhysical(t,batchFileObservationCommit)
+}
+
+func assertBatchObservationCannotBecomePhysical(t *testing.T,kind mutationCommitKind) {
+	t.Helper()
 	s := newMutationServer()
 	_, ack, _ := s.withEditAcknowledgement(t.Context())
 	record := &mutationCommitRecord{
-		kind: batchAcknowledgementCommit, id: "batch-ack-control", startedAt: time.Now(), acknowledgement: ack,
+		kind: kind, id: "batch-observation-control", startedAt: time.Now(), acknowledgement: ack,
 		// Even a wrongly supplied physical-looking field must not enroll the
 		// distinct kind in recovery, replay or source-authority paths.
 		key: "caller-key", fingerprint: "fingerprint", relPath: "pretend.go", absPath: filepath.Join(t.TempDir(), "pretend.go"),

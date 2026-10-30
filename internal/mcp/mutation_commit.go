@@ -104,6 +104,9 @@ type mutationCommitKind uint8
 const (
 	physicalMutationCommit mutationCommitKind = iota
 	batchAcknowledgementCommit
+	// Measurement-only file owner. Durable batch verdicts remain authoritative;
+	// this kind cannot enter ordinary commit/replay/pending-source paths.
+	batchFileObservationCommit
 )
 
 type mutationCommitRecord struct {
@@ -446,6 +449,10 @@ func (r *mutationCommitRecord) isPhysicalCommit() bool {
 	return r != nil && r.kind == physicalMutationCommit
 }
 
+func (r *mutationCommitRecord) isPublicationOwner() bool {
+	return r != nil && (r.kind == physicalMutationCommit || r.kind == batchFileObservationCommit)
+}
+
 // graphStatusFor collapses a reindex outcome into the graph half of a receipt.
 func graphStatusFor(outcome mutationReindexOutcome) string {
 	switch {
@@ -499,7 +506,7 @@ func (l *mutationCommitLedger) put(record *mutationCommitRecord) {
 // unbindFreshnessLocked requires the ledger lock and the record's read or
 // write lock. Another commit may have claimed the same receipt in the interim.
 func (l *mutationCommitLedger) unbindFreshnessLocked(record *mutationCommitRecord) {
-	if !record.isPhysicalCommit() {
+	if !record.isPublicationOwner() {
 		return
 	}
 	if l.byReindexReceipt[record.reindexReceipt] == record {

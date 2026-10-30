@@ -90,7 +90,7 @@ func (s *Server) bindReadRepairAdmission(absPath string, publication *indexer.Pu
 	defer ledger.mu.Unlock()
 	for i := len(ledger.ordered) - 1; i >= 0; i-- {
 		record := ledger.ordered[i]
-		if !record.isPhysicalCommit() {
+		if !record.isPublicationOwner() {
 			continue
 		}
 		record.mu.Lock()
@@ -118,9 +118,10 @@ func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pending
 	ledger := &s.mutationCommits
 	ledger.mu.Lock()
 	var witness mutationReadRepairWitness
+	batch:=false
 	for i := len(ledger.ordered) - 1; i >= 0; i-- {
 		record := ledger.ordered[i]
-		if !record.isPhysicalCommit() {
+		if !record.isPublicationOwner() {
 			continue
 		}
 		record.mu.RLock()
@@ -128,7 +129,7 @@ func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pending
 			record.mu.RUnlock()
 			continue
 		}
-		// The newest physical entry is authoritative even if it is not yet
+		// The newest file publication owner is authoritative even if it is not yet
 		// eligible. Never fall back to an older edit of the same path.
 		committed := record.disk == mutationDiskCommitted && record.commitSeq != 0 && record.newSHA != ""
 		writing := pendingOnly && record.disk == mutationDiskInFlight
@@ -141,6 +142,7 @@ func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pending
 				checkout: record.checkoutID, incarnation: record.checkoutIncarnation,
 				commitSeq: record.commitSeq, committedAt: record.committedAt,
 			}
+			batch=record.kind==batchFileObservationCommit
 			if admission := record.readRepairAdmission.Value(); admission != nil && admission.generation != 0 && admission.path == absPath && !admission.checkoutScoped {
 				witness.admission = weak.Make(admission)
 				witness.receipt, witness.generation = admission.id, admission.generation
@@ -150,6 +152,10 @@ func (s *Server) readRepairWitness(absPath string, idx *indexer.Indexer, pending
 		break
 	}
 	ledger.mu.Unlock()
+	// Observation-only owners do not participate in physical recordGraph or
+	// pending-source lifecycle updates. Read the actual admission outside ledger
+	// locks rather than treating its old pending seed as an endless eligibility.
+	if pendingOnly && batch {if admission:=witness.admission.Value();admission!=nil && !admission.outcome(true).Pending {return mutationReadRepairWitness{},false}}
 	return witness, witness.id != ""
 }
 
@@ -219,7 +225,7 @@ func (w mutationReadRepairWitness) bind(accepted mutationReadRepairObservation) 
 	// edits do not erase this historical execution or mutate earlier snapshots.
 	for i := len(ledger.ordered) - 1; i >= 0; i-- {
 		candidate := ledger.ordered[i]
-		if !candidate.isPhysicalCommit() {
+		if !candidate.isPublicationOwner() {
 			continue
 		}
 		candidate.mu.RLock()
