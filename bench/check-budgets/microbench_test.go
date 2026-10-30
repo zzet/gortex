@@ -114,3 +114,28 @@ func TestMicrobenchRunsSameFixtureAndRetainsMissingSampleFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestMicrobenchRejectsFixtureChangedDuringRunsBeforeBenchstat(t *testing.T) {
+	c := syntheticMicroConfig(t)
+	out := filepath.Join(t.TempDir(), "evidence")
+	calls, statCalls := 0, 0
+	process := func(_ context.Context, binary string, _ []string, _ string, _ []string) ([]byte, []byte, error) {
+		if binary == c.Benchstat {
+			statCalls++
+			return nil, nil, nil
+		}
+		calls++
+		if calls == 1 {
+			if err := os.WriteFile(filepath.Join(c.Fixture, "fixture.go"), []byte("package changed\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return []byte("BenchmarkSynthetic-2 1 100 ns/op\n"), nil, nil
+	}
+	if err := collectMicrobench(context.Background(), c, out, workflowProvenance{}, nil, process); err == nil {
+		t.Fatal("dirty post-run fixture accepted")
+	}
+	if calls != 18 || statCalls != 0 {
+		t.Fatal("dirty fixture produced a comparison or lost retained runs")
+	}
+}

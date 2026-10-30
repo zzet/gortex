@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"maps"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -44,12 +43,14 @@ type microConfig struct {
 	Binaries          map[string]microPair `json:"binaries"`
 }
 type microRun struct {
-	Package  string    `json:"package"`
-	Role     string    `json:"role"`
-	Repeat   int       `json:"repeat"`
-	Started  time.Time `json:"started"`
-	Finished time.Time `json:"finished"`
-	Error    string    `json:"error,omitempty"`
+	Package             string    `json:"package"`
+	Role                string    `json:"role"`
+	Repeat              int       `json:"repeat"`
+	Started             time.Time `json:"started"`
+	Finished            time.Time `json:"finished"`
+	Error               string    `json:"error,omitempty"`
+	AbnormalTermination bool      `json:"abnormal_termination"`
+	DeadlineExceeded    bool      `json:"deadline_exceeded"`
 }
 type microReceipt struct {
 	Version          int                                `json:"schema_version"`
@@ -73,9 +74,10 @@ func executeMicroProcess(ctx context.Context, binary string, args []string, cwd 
 	cmd.Dir = cwd
 	cmd.Env = env
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = 2 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
+	err := errors.Join(cmd.Run(), ctx.Err())
 	return stdout.Bytes(), stderr.Bytes(), err
 }
 
@@ -230,6 +232,8 @@ func collectMicrobench(ctx context.Context, c microConfig, out string, workflow 
 				}
 				if err != nil {
 					run.Error = err.Error()
+					run.AbnormalTermination = true
+					run.DeadlineExceeded = errors.Is(err, context.DeadlineExceeded)
 					failures = append(failures, fmt.Errorf("%s/%d/%s: %w", pkg, repeat, role, err))
 				}
 				combined[role] = append(combined[role], []byte("pkg: github.com/zzet/gortex/"+pkg+"\n")...)
@@ -256,14 +260,19 @@ func collectMicrobench(ctx context.Context, c microConfig, out string, workflow 
 		}
 	}
 	if len(failures) == 0 {
-		stdout, stderr, err := process(ctx, c.Benchstat, []string{filepath.Join(out, "main.txt"), filepath.Join(out, "candidate.txt")}, out, os.Environ())
-		err = errors.Join(err, os.WriteFile(filepath.Join(out, "benchstat.txt"), stdout, 0o600), os.WriteFile(filepath.Join(out, "benchstat.stderr.txt"), stderr, 0o600))
-		if err != nil {
+		if err := validateMicroFixture(c, out); err != nil {
 			failures = append(failures, err)
 		}
 	}
 	if len(failures) == 0 {
-		failures = append(failures, validateMicroFixture(c, out))
+		duration, _ := time.ParseDuration(c.Timeout)
+		statCtx, cancel := context.WithTimeout(ctx, duration)
+		stdout, stderr, err := process(statCtx, c.Benchstat, []string{filepath.Join(out, "main.txt"), filepath.Join(out, "candidate.txt")}, out, os.Environ())
+		cancel()
+		err = errors.Join(err, os.WriteFile(filepath.Join(out, "benchstat.txt"), stdout, 0o600), os.WriteFile(filepath.Join(out, "benchstat.stderr.txt"), stderr, 0o600))
+		if err != nil {
+			failures = append(failures, err)
+		}
 	}
 	err = errors.Join(failures...)
 	receipt.Complete = err == nil
@@ -334,7 +343,7 @@ func microbenchCommand(args []string, stdout, stderr io.Writer) int {
 				err = errors.New("microbenchmark binaries lack matching pinned revisions/build/platform identities")
 				break
 			}
-			builds[pkg] = maps.Clone(map[string]mainArtifact{"main": main, "candidate": candidate})
+			builds[pkg] = map[string]mainArtifact{"main": main, "candidate": candidate}
 		}
 	}
 	if err != nil {
