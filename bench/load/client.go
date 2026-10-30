@@ -70,6 +70,7 @@ type socketClient struct {
 // retain monotonic readings until the scenario renders relative nanoseconds.
 type wireCallIdentity struct {
 	ID                                                             int64
+	onWriteStart                                                   func(time.Time)
 	Started, WriteStarted, WriteFinished, ReplyDelivered, Finished time.Time
 }
 
@@ -255,6 +256,9 @@ func (c *socketClient) sendObserved(ctx context.Context, value any, advisory boo
 	})
 	if observation != nil {
 		observation.WriteStarted = time.Now()
+		if observation.onWriteStart != nil {
+			observation.onWriteStart(observation.WriteStarted)
+		}
 	}
 	_, err = io.Copy(c.conn, bytes.NewReader(append(data, '\n')))
 	if observation != nil {
@@ -278,8 +282,14 @@ func (c *socketClient) call(ctx context.Context, method string, params any) (jso
 }
 
 func (c *socketClient) callWithIdentity(ctx context.Context, method string, params any) (json.RawMessage, wireCallIdentity, error) {
+	return c.callWithWriteObserver(ctx, method, params, nil)
+}
+
+func (c *socketClient) callWithWriteObserver(ctx context.Context, method string, params any, onWriteStart func(time.Time)) (json.RawMessage, wireCallIdentity, error) {
 	var observation wireCallIdentity
+	observation.onWriteStart = onWriteStart
 	data, err := c.callObserved(ctx, method, params, &observation)
+	observation.onWriteStart = nil
 	return data, observation, err
 }
 

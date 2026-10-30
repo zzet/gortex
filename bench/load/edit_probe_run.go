@@ -294,7 +294,17 @@ type editProbeCaller struct {
 func (c *editProbeCaller) responseReturnedAt() time.Time { return c.last.Finished }
 
 func (c *editProbeCaller) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	data, identity, err := c.client.callWithIdentity(ctx, method, params)
+	var onWriteStart func(time.Time)
+	if c.purpose == "edit" {
+		onWriteStart = func(at time.Time) {
+			c.state.mu.Lock()
+			if c.state.editWrite.IsZero() {
+				c.state.editWrite = at
+			}
+			c.state.mu.Unlock()
+		}
+	}
+	data, identity, err := c.client.callWithWriteObserver(ctx, method, params, onWriteStart)
 	c.last = identity
 	c.state.mu.Lock()
 	if c.purpose == "edit" && c.state.editWrite.IsZero() && !identity.WriteStarted.IsZero() {
