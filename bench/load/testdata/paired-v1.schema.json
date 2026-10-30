@@ -608,6 +608,68 @@
                                   }
                                 ]
                               },
+                              "batch": {
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "acknowledgement_receipt": {
+                                        "type": "string"
+                                      },
+                                      "acknowledgement_state": {
+                                        "type": "string"
+                                      },
+                                      "after_sha256": {
+                                        "type": "string"
+                                      },
+                                      "file_observation_receipt": {
+                                        "type": "string"
+                                      },
+                                      "path": {
+                                        "type": "string"
+                                      },
+                                      "reindex_generation": {
+                                        "type": "integer"
+                                      },
+                                      "reindex_receipt": {
+                                        "type": "string"
+                                      },
+                                      "relative_path": {
+                                        "type": "string"
+                                      },
+                                      "result_reindex_generation": {
+                                        "type": "integer"
+                                      },
+                                      "result_reindex_receipt": {
+                                        "type": "string"
+                                      },
+                                      "transaction_error": {
+                                        "type": "string"
+                                      },
+                                      "transaction_id": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "transaction_id",
+                                      "file_observation_receipt",
+                                      "acknowledgement_receipt",
+                                      "path",
+                                      "relative_path",
+                                      "after_sha256",
+                                      "reindex_receipt",
+                                      "reindex_generation",
+                                      "result_reindex_receipt",
+                                      "result_reindex_generation",
+                                      "acknowledgement_state"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
                               "errors": {
                                 "items": {
                                   "type": "string"
