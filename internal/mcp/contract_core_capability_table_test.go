@@ -171,13 +171,14 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"FileEditingContext", capOf[graph.FileEditingContext], capFiltered, "the store reads raw imports and calls"},
 
 		// Deliberate drops.
+		{"FilteredBFSAdmissionReader", capOf[graph.FilteredBFSAdmissionReader], capDropped, "private scoped admission adapter supplies exact wrapper exclusions"},
 		{"FilteredCallAncestorReader", capOf[graph.FilteredCallAncestorReader], capDropped, "private candidate coverage adapter supplies this wrapper's exact exclusions"},
 		{"FilteredKindAdjacencyReader", capOf[graph.FilteredKindAdjacencyReader], capDropped, "private typed adjacency adapter supplies this wrapper's exact exclusions"},
-		{"BFSCapable", capOf[graph.BFSCapable], capDropped, capReasonTraversal},
+		{"BFSCapable", capOf[graph.BFSCapable], capWrapper, "canonical hops recomputed over selected filtered adjacency; engine admission remains the Go contract"},
 		{"FrontierExpander", capOf[graph.FrontierExpander], capDropped, capReasonTraversal},
 		{"ReachableForwardByKinds", capOf[graph.ReachableForwardByKinds], capDropped, capReasonTraversal},
 		{"ClassHierarchyTraverser", capOf[graph.ClassHierarchyTraverser], capDropped, capReasonTraversal},
-		{"local:BFSContext", capOf[capBFSContext], capDropped, capReasonTraversal},
+		{"local:BFSContext", capOf[capBFSContext], capWrapper, "canonical selected-adjacency BFS honors request cancellation"},
 		{"local:GetInEdgesByNodeIDsContext", capOf[capInEdgesByNodeIDsContext], capDropped, capReasonEdges + " (the bound counts hidden edges; callers fall back to the filtered GetInEdgesByNodeIDs and bound visible ones)"},
 		{"local:GetOutEdgesByNodeIDsContext", capOf[memoContextEdgeReader], capDropped, capReasonEdges + " (the bound counts hidden edges; callers fall back to the filtered GetOutEdgesByNodeIDs)"},
 		{"NodeDegreeAggregator", capOf[graph.NodeDegreeAggregator], capDropped, capReasonEdges + " (degrees count hidden endpoints; callers walk filtered edges)"},
@@ -405,6 +406,7 @@ func contractCoreUnprobedCapabilities() []contractCoreCapName {
 // store does not implement, so no request can lose them to the wrapper.
 func contractCoreNonStoreInterfaces() []contractCoreCapName {
 	return []contractCoreCapName{
+		{"BFSAdmissionReader", capOf[graph.BFSAdmissionReader]},
 		{"BackendResolver", capOf[graph.BackendResolver]},
 		{"BelowFileRows", capOf[graph.BelowFileRows]},
 		{"CommunityDetector", capOf[graph.CommunityDetector]},

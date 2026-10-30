@@ -34,6 +34,8 @@ var _ graph.FileIdentityBatchEvicter = (*graph.DeltaWriter)(nil)
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
+	"graph.BFSAdmissionReader":            "optional selected-reader traversal snapshot; the query engine retains its composed point-walk admission when a delta has no snapshot accelerator",
+	"graph.FilteredBFSAdmissionReader":    "physical indexed scoped traversal; forwarding it would discard delta ownership, so the engine keeps composed Go admission instead",
 	"graph.KindAdjacencyReader":           "optional typed adjacency accelerator; ReadKindAdjacency filters the delta's composed point reads instead of forwarding physical rows past delta ownership",
 	"graph.CallAncestorReader":            "optional native recursive closure; CallAncestorsOf walks the delta's composed incoming adjacency and hydrates selected source identities",
 	"graph.ScopedOutlineNodeReader":       "optional indexed scoped names/membership; the scoped-name helper keeps composed FindNodesByName and intersects NodeScope without reaching a physical store",

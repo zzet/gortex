@@ -1525,6 +1525,27 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 		kindSet[k] = true
 	}
 
+	// A selected adjacency wrapper has always used the Go admission shape:
+	// backedges, evidence order, caps and unresolved boundaries are observable.
+	// Read its scoped neighborhood in one statement where available, then run
+	// that same admission against the detached rows. Bare unscoped stores keep
+	// their established canonical BFSCapable hop-set path below.
+	_, selectedAdmission := e.g.(graph.BFSAdmissionReader)
+	if !bidir && len(edgeKinds) > 0 && opts.Limit > 1 && !opts.ExcludeTests && !opts.IncludeDispatch && (opts.hasScopeFilter() || selectedAdmission) {
+		request := graph.BFSAdmissionRequest{Seed: nodeID, Direction: graph.DirectionForward, Kinds: edgeKinds, Depth: opts.Depth, Limit: opts.Limit,
+			Scope: graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}}
+		if !forward {
+			request.Direction = graph.DirectionBackward
+		}
+		snapshot, handled, err := graph.ReadBFSAdmissionContext(walkCtx, e.g, request)
+		if walkDone(walkCtx) {
+			return &SubGraph{}
+		}
+		if err == nil && handled {
+			return e.WithReader(graph.NewBFSAdmissionReader(snapshot, seed, request.Direction)).bfs(nodeID, opts, forward, edgeKinds)
+		}
+	}
+
 	// Prefer a single-round-trip BFS capability (the disk backend lowers it
 	// to one recursive CTE) over the layer-by-layer GetOutEdges / GetInEdges
 	// walk below, when the walk needs none of the per-layer hooks the flat
@@ -1533,7 +1554,7 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 	// implements the same capability, so both backends take this path and
 	// agree by construction; a backend without it (or a capability error)
 	// falls through to the Go walk, which stays the correctness oracle.
-	if capStore, ok := e.g.(graph.BFSCapable); ok && !bidir && len(edgeKinds) > 0 &&
+	if capStore, ok := e.g.(graph.BFSCapable); ok && !selectedAdmission && !bidir && len(edgeKinds) > 0 &&
 		!opts.hasScopeFilter() && !opts.ExcludeTests && !opts.IncludeDispatch {
 		if sg, ok := e.bfsViaCapability(capStore, nodeID, opts, forward, edgeKinds, kindSet); ok {
 			return sg

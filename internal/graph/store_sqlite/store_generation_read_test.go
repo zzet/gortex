@@ -727,6 +727,24 @@ func generationReadProbes() []genProbe {
 			return nodeTokens(got.Nodes)
 		}},
 
+		{name: "BFSAdmissionFilteredContext", run: func(t *testing.T, s *Store) []string {
+			var out []string
+			for _, dir := range []graph.Direction{graph.DirectionForward, graph.DirectionBackward} {
+				request := graph.BFSAdmissionRequest{Seed: genReadShared, Direction: dir, Kinds: []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences, graph.EdgeImports}, Depth: 3, Limit: 64}
+				rows, handled, err := s.BFSAdmissionFilteredContext(t.Context(), request, graph.OutlineEdgeFilter{ExcludeVia: "spring.Bean"})
+				if err != nil || !handled {
+					t.Fatalf("scoped BFS snapshot declined: handled=%v error=%v", handled, err)
+				}
+				for _, node := range rows.Nodes {
+					out = append(out, nodeTokens([]*graph.Node{node})...)
+				}
+				for _, adjacency := range rows.Adjacency {
+					out = append(out, edgeTokens(adjacency.Edges)...)
+				}
+			}
+			return out
+		}},
+
 		{name: "CallAncestorsContext", run: func(t *testing.T, s *Store) []string {
 			rows, err := s.CallAncestorsContext(t.Context(), genReadProbeIDs())
 			if err != nil {
@@ -2142,6 +2160,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.ScopedAnalysisCommunityReader)(nil), probe: "ScopedAnalysisCommunitySummaries"},
 		{iface: (*graph.AtomicVectorCorpusInstaller)(nil), skip: skipSidecar},
 		{iface: (*graph.BFSCapable)(nil), probe: "BFS"},
+		{iface: (*graph.FilteredBFSAdmissionReader)(nil), probe: "BFSAdmissionFilteredContext"},
 		{iface: (*graph.KindAdjacencyReader)(nil), probe: "ReadKindAdjacency"},
 		{iface: (*graph.FilteredKindAdjacencyReader)(nil), probe: "ReadKindAdjacencyFiltered"},
 		{iface: (*graph.BlameEnrichmentReader)(nil), skip: skipSidecar},
