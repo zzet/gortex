@@ -29,6 +29,9 @@ func editProbeCompleteCount(body map[string]any, key, total string) ([]any, bool
 		rows = []any{}
 		ok = true
 	}
+	if _, declared := body[total]; !declared && present && ok && editProbeTOONCompleteRows(body, key, total) {
+		return rows, true
+	}
 	count, err := strconvEditProbeUint(body[total])
 	return rows, present && ok && err == nil && count == uint64(len(rows))
 }

@@ -136,3 +136,32 @@ func editProbeOutputOracles(c Corpus, oracles []editProbeOracle) []editProbeOrac
 	}
 	return oracles
 }
+
+// This certifies only the actual format's complete emitted row census. It
+// never inserts a JSON total_nodes/total_edges value that TOON did not serve.
+// The known compact subgraph producer emits total+truncated, retains all edge
+// rows, and omits total_edges precisely when no edge rows were clipped.
+func editProbeTOONCompleteRows(body map[string]any, key, total string) bool {
+	proof, ok := body[editProbeTOONWireKey].(editProbeTOONWire)
+	if !ok || body["truncated"] != false {
+		return false
+	}
+	switch proof.operation {
+	case "read.summary", "relations.callers", "trace.call_chain":
+	default:
+		return false
+	}
+	if truncated, exists := body["_truncated_by_budget"]; exists && truncated != false {
+		return false
+	}
+	nodes, exists := body["nodes"]
+	rows, array := nodes.([]any)
+	if exists && nodes == nil {
+		rows, array = []any{}, true
+	}
+	declared, err := strconvEditProbeUint(body["total"])
+	if !exists || !array || err != nil || declared != uint64(len(rows)) {
+		return false
+	}
+	return key == "nodes" && total == "total_nodes" || key == "edges" && total == "total_edges"
+}

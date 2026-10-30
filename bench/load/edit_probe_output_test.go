@@ -116,3 +116,58 @@ func TestEditProbeOutputModePreservesDefaultPlanAndActualRequestIntent(t *testin
 		}
 	}
 }
+
+func TestEditProbeTOONCensusKeepsOmittedCountsUnavailable(t *testing.T) {
+	producer := map[string]any{"nodes": []any{map[string]any{"id": "fixture/main.go::Survivor"}}, "edges": nil, "total": 1, "truncated": false}
+	raw, err := toon.Marshal(producer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := decodeEditProbeOutput(outputWire(string(raw), nil), "toon", "relations.callers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows, ok := editProbeCompleteCount(body, "nodes", "total_nodes"); !ok || len(rows) != 1 {
+		t.Fatal("explicit TOON node census not recognized", body)
+	}
+	if rows, ok := editProbeCompleteCount(body, "edges", "total_edges"); !ok || len(rows) != 0 {
+		t.Fatal("explicit null untrimmed edge collection not recognized", body)
+	}
+	if _, present := body["total_nodes"]; present {
+		t.Fatal("fabricated JSON node count")
+	}
+	if _, present := body["total_edges"]; present {
+		t.Fatal("fabricated omitted full edge count")
+	}
+	for _, name := range []string{"missing_total", "mismatched_total", "truncated", "missing_truncation", "budget_clipped", "missing_edges", "explicit_wrong_edges", "wrong_operation", "forged_JSON_proof"} {
+		t.Run(name, func(t *testing.T) {
+			candidate, err := decodeEditProbeOutput(outputWire(string(raw), nil), "toon", "relations.callers")
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch name {
+			case "missing_total":
+				delete(candidate, "total")
+			case "mismatched_total":
+				candidate["total"] = json.Number("2")
+			case "truncated":
+				candidate["truncated"] = true
+			case "missing_truncation":
+				delete(candidate, "truncated")
+			case "budget_clipped":
+				candidate["_truncated_by_budget"] = true
+			case "missing_edges":
+				delete(candidate, "edges")
+			case "explicit_wrong_edges":
+				candidate["total_edges"] = json.Number("1")
+			case "wrong_operation":
+				candidate[editProbeTOONWireKey] = editProbeTOONWire{operation: "search.symbols"}
+			case "forged_JSON_proof":
+				candidate[editProbeTOONWireKey] = map[string]any{"operation": "relations.callers"}
+			}
+			if _, ok := editProbeCompleteCount(candidate, "edges", "total_edges"); ok {
+				t.Fatal("incomplete/foreign census accepted", name, candidate)
+			}
+		})
+	}
+}
