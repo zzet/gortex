@@ -1211,6 +1211,33 @@
             "null"
           ]
         },
+        "pr_smoke_drain": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "max_drain_seconds": {
+                  "type": "number"
+                },
+                "offered_seconds": {
+                  "type": "number"
+                },
+                "schema_version": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "schema_version",
+                "offered_seconds",
+                "max_drain_seconds"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "product_deadline_seconds": {
           "type": "number"
         },
