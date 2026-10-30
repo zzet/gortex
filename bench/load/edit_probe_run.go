@@ -552,7 +552,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			}
 			if statusErr == nil {
 				if status, decodeErr := decodeEditProbeResult(raw); decodeErr == nil {
-					accounting := checkEditProbeAccounting(status, receipt)
+					accounting := checkEditProbeAccountingForTool(status, receipt, r.plan.Tool)
 					s.mu.Lock()
 					s.record.Accounting = accounting
 					s.record.GraphTerminal = status["graph_status_terminal"] == true

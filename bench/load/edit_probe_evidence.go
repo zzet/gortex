@@ -240,13 +240,25 @@ type editProbeAccounting struct {
 }
 
 func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAccounting {
-	return checkEditProbeAccountingWithAcknowledgement(status, receipt, "reindex_generation", nil)
+	return checkEditProbeAccountingWithAcknowledgement(status, receipt, "reindex_generation", nil, false)
+}
+
+// A symbol splice has no ACK parser gate, but only the actual offered tool
+// and the retained status's matching producer identity can select that rule.
+func checkEditProbeAccountingForTool(status map[string]any, receipt, tool string) editProbeAccounting {
+	if tool == "edit.symbol" {
+		if status["tool"] != "edit_symbol" {
+			return editProbeAccounting{State: "unavailable", Reasons: []string{"status tool does not match offered edit.symbol"}}
+		}
+		return checkEditProbeAccountingWithAcknowledgement(status, receipt, "reindex_generation", nil, true)
+	}
+	return checkEditProbeAccounting(status, receipt)
 }
 
 // A batch's shared RPC owner is supplied separately from its per-file P/B/R
 // owner. The windows remain independent; no map is merged into a synthetic
 // physical mutation_status reply and A is never added to background work.
-func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any) editProbeAccounting {
+func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable bool) editProbeAccounting {
 	out := editProbeAccounting{State: "unavailable"}
 	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }
 	if status["receipt"] != receipt {
@@ -277,7 +289,7 @@ func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt,
 		// performs no parser gate. Preserve that null applicability state;
 		// missing/unknown work and an applicable parse never get this escape.
 		_, phasePresent := aPhases[name]
-		if name == "parse" && phasePresent && sharedAcknowledgement != nil && ack["parse_scope"] == "not_applicable_text_splice" && aStates[name] == "not_applicable" && aPhases[name] == nil {
+		if name == "parse" && phasePresent && parseMayBeInapplicable && ack["parse_scope"] == "not_applicable_text_splice" && aStates[name] == "not_applicable" && aPhases[name] == nil {
 			continue
 		}
 		if aPhases[name] == nil || aStates[name] != "measured" {

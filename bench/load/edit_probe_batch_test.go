@@ -322,7 +322,7 @@ func TestBatchAccountingTextSpliceParseApplicabilityIsExplicitAndOwned(t *testin
 	ack["observed_execution_ms"].(map[string]any)["parse"] = nil
 	ack["parse_scope"] = "not_applicable_text_splice"
 	ack["caller_response_ready_ms"] = json.Number("7")
-	if got := checkEditProbeAccountingWithAcknowledgement(base, "receipt-a", "reindex_generation", ack); got.State != "observed_single_window_checks_pass" {
+	if got := checkEditProbeAccountingWithAcknowledgement(base, "receipt-a", "reindex_generation", ack, true); got.State != "observed_single_window_checks_pass" {
 		t.Fatal("explicit unexecuted batch parse not honored", got)
 	}
 	if got := checkEditProbeAccounting(base, "receipt-a"); got.State == "observed_single_window_checks_pass" {
@@ -351,7 +351,7 @@ func TestBatchAccountingTextSpliceParseApplicabilityIsExplicitAndOwned(t *testin
 			case "zero_instead_of_null":
 				copy["observed_execution_ms"].(map[string]any)["parse"] = json.Number("0")
 			}
-			if got := checkEditProbeAccountingWithAcknowledgement(base, "receipt-a", "reindex_generation", copy); got.State == "observed_single_window_checks_pass" {
+			if got := checkEditProbeAccountingWithAcknowledgement(base, "receipt-a", "reindex_generation", copy, true); got.State == "observed_single_window_checks_pass" {
 				t.Fatal("invented batch parse coverage", name)
 			}
 		})

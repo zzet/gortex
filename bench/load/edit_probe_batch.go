@@ -174,7 +174,7 @@ func (r editProbeBatchReferences) accounting(fileStatus, acknowledgementStatus m
 	if shared == nil {
 		return editProbeAccounting{State: "unavailable", Reasons: []string{"shared batch ACK intervals unavailable"}}
 	}
-	return checkEditProbeAccountingWithAcknowledgement(fileStatus, r.Observation, "publication_generation", shared)
+	return checkEditProbeAccountingWithAcknowledgement(fileStatus, r.Observation, "publication_generation", shared, true)
 }
 
 func editProbeBatchIntent(req request) (string, []byte, error) {

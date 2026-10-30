@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -81,5 +82,25 @@ func TestEditProbeSymbolRefusesForeignCommentOnlyAndPartialAnchors(t *testing.T)
 				}
 			})
 		}
+	}
+}
+
+func TestEditSymbolAccountingRequiresOfferedToolAndExplicitParseApplicability(t *testing.T) {
+	status := editProbeAccountingFixture()
+	status["tool"] = "edit_symbol"
+	ack := status["acknowledgement"].(map[string]any)
+	ack["parse_scope"] = "not_applicable_text_splice"
+	ack["phase_states"].(map[string]any)["parse"] = "not_applicable"
+	ack["observed_execution_ms"].(map[string]any)["parse"] = nil
+	ack["caller_response_ready_ms"] = json.Number("7")
+	if got := checkEditProbeAccountingForTool(status, "receipt-a", "edit.symbol"); got.State != "observed_single_window_checks_pass" {
+		t.Fatal("matching actual symbol splice refused", got)
+	}
+	if got := checkEditProbeAccountingForTool(status, "receipt-a", "edit.file"); got.State == "observed_single_window_checks_pass" {
+		t.Fatal("borrowed symbol applicability for a file request")
+	}
+	status["tool"] = "edit_file"
+	if got := checkEditProbeAccountingForTool(status, "receipt-a", "edit.symbol"); got.State == "observed_single_window_checks_pass" {
+		t.Fatal("borrowed foreign producer tool")
 	}
 }
