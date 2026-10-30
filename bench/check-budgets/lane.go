@@ -111,7 +111,7 @@ func readLaneConfig(path string) (laneConfig, error) {
 	if d.Decode(new(any)) != io.EOF {
 		return c, errors.New("lane config must contain exactly one JSON document")
 	}
-	if c.Version != 1 || !slices.Contains([]string{"smoke", "nightly", "release"}, c.Lane) || c.Repeats < 3 || c.Repeats > 100 || c.Machine == "" {
+	if c.Version != 1 || !slices.Contains([]string{"smoke", "nightly", "release"}, c.Lane) || c.Repeats < 3 || c.Repeats > 100 || c.Machine == "" && c.HostClass != hostedSmokeClass {
 		return c, errors.New("lane config needs schema1, smoke/nightly/release, 3–100 repeats and reviewed machine binding")
 	}
 	if !knownHostClass(c.HostClass) || c.HostClass == hostedSmokeClass && c.Lane != "smoke" {
@@ -236,6 +236,7 @@ func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
 	loadBinary := f.String("load-binary", "", "fresh workflow-built load client")
 	requireLane := f.String("require-lane", "", "refuse config for any other lane")
 	releaseStarted := f.String("release-started", "", "release entry RFC3339 start, including its compilation time")
+	jobHost := f.Bool("job-host", false, "bind hosted PR smoke to the actual ephemeral job hostname")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -264,6 +265,21 @@ func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
 	if *requireLane != "" && c.Lane != *requireLane {
 		fmt.Fprintln(stderr, "configuration selects the wrong required lane")
 		return 1
+	}
+	if *jobHost {
+		if c.Lane != "smoke" || c.HostClass != hostedSmokeClass || os.Getenv("GITHUB_ACTIONS") != "true" || os.Getenv("RUNNER_ENVIRONMENT") != "github-hosted" {
+			fmt.Fprintln(stderr, "--job-host is only for the owned hosted PR smoke job")
+			return 2
+		}
+		c.Machine, err = os.Hostname()
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+	}
+	if command == "collect" && c.Machine == "" {
+		fmt.Fprintln(stderr, "collection requires an exact host binding; hosted smoke may use --job-host")
+		return 2
 	}
 	if *releaseStarted != "" {
 		c.started, err = time.Parse(time.RFC3339Nano, *releaseStarted)
