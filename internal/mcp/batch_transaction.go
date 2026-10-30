@@ -1271,7 +1271,10 @@ func (s *Server) beginBatchGraphRefresh(observationCtx context.Context, absPath 
 	if watcher := s.currentWatcher(); watcher != nil {
 		if scheduler, ok := watcher.(mutationScheduler); ok {
 			lap := s.beginAcknowledgementLap(observationCtx, editAckTicketAdmission)
-			record := s.batchPublicationObservation(transaction, absPath)
+			var record *mutationCommitRecord
+			if editAcknowledgementFrom(observationCtx, s) != nil {
+				record = s.batchPublicationObservation(transaction, absPath)
+			}
 			var publication *indexer.PublicationPhaseRecord
 			if record != nil {
 				publication = s.openOwnedPublicationRecord(observationCtx, record)
