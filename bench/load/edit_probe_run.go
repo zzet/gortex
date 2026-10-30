@@ -843,7 +843,7 @@ func (r *editProbeRuntime) close() error {
 func (r *editProbeRuntime) restore(ctx context.Context) error {
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
 	for _, record := range r.phase.EditProbe.Records {
-		if (record.Receipt == "" && record.Batch == nil && record.Move == nil) || (!record.GraphTerminal && !(record.Move != nil && !r.requireAccounting && movePublicFactsComplete(record))) {
+		if (record.Receipt == "" && record.Batch == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}
 	}

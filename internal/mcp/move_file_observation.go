@@ -183,7 +183,7 @@ func (s *Server) moveReadRepairObserver(ctx context.Context, path string, idx *i
 	defer ledger.mu.Unlock()
 	for i := len(ledger.ordered) - 1; i >= 0; i-- {
 		record := ledger.ordered[i]
-		if !(record.isPublicationOwner() || record.kind == moveFileObservationCommit) || record.absPath != path {
+		if !record.isPublicationOwner() && record.kind != moveFileObservationCommit || record.absPath != path {
 			continue
 		}
 		if record.kind != moveFileObservationCommit {
@@ -273,7 +273,7 @@ func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 	refused := ""
 	for i := len(ledger.ordered) - 1; i >= 0; i-- {
 		candidate := ledger.ordered[i]
-		if !(candidate.isPublicationOwner() || candidate.kind == moveFileObservationCommit) || candidate.absPath != w.path {
+		if !candidate.isPublicationOwner() && candidate.kind != moveFileObservationCommit || candidate.absPath != w.path {
 			continue
 		}
 		if firstPath {
