@@ -8,6 +8,8 @@ import (
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	toon "github.com/toon-format/toon-go"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // Exercise the actual public edit and seven probe producers. TOON is the text
@@ -20,6 +22,8 @@ func TestEditProbeActualJSONAndTOONWireContracts(t *testing.T) {
 			s, root := setupMoveInlineRepo(t, map[string]string{"main.go": original})
 			t.Cleanup(s.DrainBackground)
 			s.ToolCallTimeout = -1
+			logCore, captured := observer.New(zap.DebugLevel)
+			s.logger = zap.New(logCore)
 			const session = "edit-output-contract"
 			s.NoteSessionToolPolicy(session, "facade-v1", "hide")
 			ctx := WithSessionCWD(WithSessionID(t.Context(), session), root)
@@ -37,6 +41,11 @@ func TestEditProbeActualJSONAndTOONWireContracts(t *testing.T) {
 					} `json:"content"`
 				}
 				require.NoError(t, json.Unmarshal(raw, &envelope))
+				if envelope.IsError {
+					for _, entry := range captured.FilterMessage("mcp: handler panic recovered").All() {
+						t.Logf("actual handler panic stack: %v", entry.ContextMap()["stack"])
+					}
+				}
 				require.False(t, envelope.IsError, "%s", raw)
 				require.Len(t, envelope.Content, 1)
 				require.Equal(t, "text", envelope.Content[0].Type)
@@ -86,7 +95,7 @@ func TestEditProbeActualJSONAndTOONWireContracts(t *testing.T) {
 					require.Equal(t, false, body["truncated"])
 					require.Contains(t, body, "nodes")
 					require.Contains(t, body, "edges")
-					if format == "toon" {
+					if format == "toon" && call.operation != "summary" {
 						require.Contains(t, body, "total")
 						require.NotContains(t, body, "total_nodes", "TOON does not promise a JSON total_nodes field")
 						require.NotContains(t, body, "total_edges", "complete TOON edge rows omit this optional full-count field")
@@ -100,6 +109,13 @@ func TestEditProbeActualJSONAndTOONWireContracts(t *testing.T) {
 					} else {
 						require.Contains(t, body, "total_nodes")
 						require.Contains(t, body, "total_edges")
+						if call.operation == "summary" {
+							for _, raw := range body["nodes"].([]any) {
+								node := raw.(map[string]any)
+								require.Contains(t, node, "end_line")
+								require.Contains(t, node, "meta")
+							}
+						}
 					}
 				case "editing_context":
 					require.NotEmpty(t, body["defines"])
@@ -137,11 +153,18 @@ func TestEditProbeTOONSignatureFollowingCallerWireWitness(t *testing.T) {
 			s, root := setupMoveInlineRepo(t, map[string]string{file: source})
 			t.Cleanup(s.DrainBackground)
 			s.ToolCallTimeout = -1
+			logCore, captured := observer.New(zap.DebugLevel)
+			s.logger = zap.New(logCore)
 			const session = "toon-signature-witness"
 			s.NoteSessionToolPolicy(session, "facade-v1", "hide")
 			ctx := WithSessionCWD(WithSessionID(t.Context(), session), root)
 			output := map[string]any{"format": "toon", "max_bytes": 0}
 			decode := func(result *mcpgo.CallToolResult) map[string]any {
+				if result.IsError {
+					for _, entry := range captured.FilterMessage("mcp: handler panic recovered").All() {
+						t.Logf("actual handler panic stack: %v", entry.ContextMap()["stack"])
+					}
+				}
 				require.False(t, result.IsError)
 				text := toolText(result)
 				require.False(t, json.Valid([]byte(text)), "requested TOON fell back to JSON")
@@ -152,12 +175,17 @@ func TestEditProbeTOONSignatureFollowingCallerWireWitness(t *testing.T) {
 				return body
 			}
 			summaryArgs := map[string]any{"operation": "summary", "target": map[string]any{"file": file}, "output": output}
-			gap := func(body map[string]any) int {
+			gap := func(body map[string]any, compact bool) int {
 				positions := map[string]int{}
 				for _, raw := range body["nodes"].([]any) {
 					node := raw.(map[string]any)
-					require.NotContains(t, node, "end_line")
-					require.NotContains(t, node, "meta")
+					if compact {
+						require.NotContains(t, node, "end_line")
+						require.NotContains(t, node, "meta")
+					} else {
+						require.Contains(t, node, "end_line")
+						require.Contains(t, node, "meta")
+					}
 					id, _ := node["id"].(string)
 					if id == file+"::Target" || id == file+"::Following" {
 						number, ok := node["start_line"].(float64)
@@ -169,7 +197,7 @@ func TestEditProbeTOONSignatureFollowingCallerWireWitness(t *testing.T) {
 				require.Len(t, positions, 2)
 				return positions[file+"::Following"] - positions[file+"::Target"]
 			}
-			require.Equal(t, strings.Count(before, "\n")+2, gap(decode(callEditOperationFrame(t, s, ctx, "read", summaryArgs))))
+			require.Equal(t, strings.Count(before, "\n")+2, gap(decode(callEditOperationFrame(t, s, ctx, "read", summaryArgs)), false))
 			ack := decode(callEditOperationFrame(t, s, ctx, "edit", map[string]any{"operation": "symbol", "target": map[string]any{"symbol": file + "::Target"}, "match": before, "replacement": after, "output": output}))
 			require.NotEmpty(t, ack["mutation_receipt"])
 			for _, call := range []struct {
@@ -182,7 +210,7 @@ func TestEditProbeTOONSignatureFollowingCallerWireWitness(t *testing.T) {
 				}
 				body := decode(callEditOperationFrame(t, s, ctx, call.name, map[string]any{"operation": call.operation, "target": target, "options": map[string]any{"depth": call.depth, "limit": 1000}, "output": output}))
 				require.Equal(t, false, body["truncated"])
-				require.Equal(t, strings.Count(after, "\n")+2, gap(body))
+				require.Equal(t, strings.Count(after, "\n")+2, gap(body, call.operation != "summary"))
 				if call.operation == "summary" {
 					continue
 				}

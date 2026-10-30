@@ -139,7 +139,7 @@ func editProbeOutputOracles(c Corpus, oracles []editProbeOracle) []editProbeOrac
 
 // This certifies only the actual format's complete emitted row census. It
 // never inserts a JSON total_nodes/total_edges value that TOON did not serve.
-// The known compact subgraph producer emits total+truncated, retains all edge
+// The known compact traversal producer emits total+truncated, retains all edge
 // rows, and omits total_edges precisely when no edge rows were clipped.
 func editProbeTOONCompleteRows(body map[string]any, key, total string) bool {
 	proof, ok := body[editProbeTOONWireKey].(editProbeTOONWire)
@@ -147,7 +147,7 @@ func editProbeTOONCompleteRows(body map[string]any, key, total string) bool {
 		return false
 	}
 	switch proof.operation {
-	case "read.summary", "relations.callers", "trace.call_chain":
+	case "relations.callers", "trace.call_chain":
 	default:
 		return false
 	}

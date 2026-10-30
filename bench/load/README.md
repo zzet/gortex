@@ -156,12 +156,13 @@ or unsafe numeric value cannot supply format credit. Unknown modes refuse.
 Timing-status queries, initial presence/callee admissions and cleanup are
 separate JSON controls, preserving exact generation/nanosecond arithmetic.
 
-TOON compact subgraphs expose `total` plus explicit truncation and emitted
+TOON traversal subgraphs expose `total` plus explicit truncation and emitted
 rows; they omit the JSON `total_nodes` and untrimmed full `total_edges` fields.
 The harness does not insert those missing producer fields. Complete-row checks
 require the known producer operation, exact declared node total, explicit
 nontruncation and actual emitted collections; missing, clipped or contradictory
-rows remain failures. Compact rows also omit signature/end-line metadata, so
+rows remain failures. File summaries retain their full explicit counts, signature metadata and end lines.
+Compact traversal rows omit signature/end-line metadata, so
 TOON `change_signature` is explicitly unsupported pending a producer-backed
 changed-graph witness. This temporary harness refusal is not acceptance or a
 waiver of the signature/output cell. TOON source implementation and offline
