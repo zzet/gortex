@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	toon "github.com/toon-format/toon-go"
@@ -60,5 +61,58 @@ func TestEditProbeTOONRefusesWrongFormatSiblingAndIncompleteWire(t *testing.T) {
 	}
 	if _, err := decodeEditProbeOutput(outputWire("id: added", nil), "gcx", "read.source"); err == nil {
 		t.Fatal("unsupported mode accepted")
+	}
+}
+
+func TestEditProbeOutputModePreservesDefaultPlanAndActualRequestIntent(t *testing.T) {
+	c := editProbeCorpus()
+	original, err := makeEditProbePlan(c, 42, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.EditOutput = "json"
+	explicitJSON, err := makeEditProbePlan(c, 42, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(original, explicitJSON) {
+		t.Fatal("explicit default JSON changed normalized offered plan")
+	}
+	c.EditOutput = "toon"
+	compact, err := makeEditProbePlan(c, 42, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compact.Mode != "toon" || len(compact.Steps) != 100 {
+		t.Fatal(compact)
+	}
+	for i, step := range compact.Steps {
+		baseline := original.Steps[i]
+		if step.DueNS != baseline.DueNS || step.ActivateNS != baseline.ActivateNS || step.MutationID != baseline.MutationID || step.Marker != baseline.Marker || step.RequestHash == baseline.RequestHash || editProbeRequestOutput(step.Request) != "toon" {
+			t.Fatalf("format altered offered schedule or failed to bind request: %+v", step)
+		}
+		args := dispatchArgs(step.Request, privateRepo{Prefix: "fixture"})
+		if args["output"].(map[string]any)["format"] != "toon" {
+			t.Fatal("actual dispatch erased requested output")
+		}
+		for _, oracle := range editProbeOracles(c, step) {
+			if editProbeRequestOutput(oracle.call) != "toon" {
+				t.Fatal("probe silently requested JSON", oracle.name)
+			}
+		}
+	}
+	if original.Mode != "json" || editProbeRequestOutput(original.Steps[0].Request) != "json" {
+		t.Fatal("TOON setup mutated the original JSON plan")
+	}
+	// Measurement controls remain exact JSON even for a TOON corpus/session.
+	control := request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": map[string]any{"receipt": "commit-1"}}}
+	if dispatchArgs(control, privateRepo{Prefix: "fixture", Corpus: c})["output"].(map[string]any)["format"] != "json" {
+		t.Fatal("format changed timing-status control")
+	}
+	for _, unsupported := range []string{"TOON", "text", "gcx", "invalid"} {
+		c.EditOutput = unsupported
+		if _, err := makeEditProbePlan(c, 42, 100); err == nil {
+			t.Fatal("unsupported output mode admitted", unsupported)
+		}
 	}
 }

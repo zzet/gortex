@@ -120,6 +120,9 @@ func editProbeRequestOutput(req request) string {
 func editProbeWithOutput(req request, format string) request {
 	if format == "toon" {
 		req.Arguments = copyJSON(req.Arguments)
+		if req.Arguments == nil {
+			req.Arguments = make(map[string]any)
+		}
 		req.Arguments["output"] = map[string]any{"format": "toon", "max_bytes": 0}
 	}
 	return req
