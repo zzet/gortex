@@ -139,7 +139,7 @@ func TestEditProbeTOONCensusKeepsOmittedCountsUnavailable(t *testing.T) {
 	if _, present := body["total_edges"]; present {
 		t.Fatal("fabricated omitted full edge count")
 	}
-	for _, name := range []string{"missing_total", "mismatched_total", "truncated", "missing_truncation", "budget_clipped", "missing_edges", "explicit_wrong_edges", "wrong_operation", "forged_JSON_proof"} {
+	for _, name := range []string{"missing_total", "mismatched_total", "truncated", "missing_truncation", "budget_clipped", "missing_edges", "explicit_wrong_edges", "wrong_operation", "summary_cannot_borrow_traversal_counts", "forged_JSON_proof"} {
 		t.Run(name, func(t *testing.T) {
 			candidate, err := decodeEditProbeOutput(outputWire(string(raw), nil), "toon", "relations.callers")
 			if err != nil {
@@ -162,6 +162,8 @@ func TestEditProbeTOONCensusKeepsOmittedCountsUnavailable(t *testing.T) {
 				candidate["total_edges"] = json.Number("1")
 			case "wrong_operation":
 				candidate[editProbeTOONWireKey] = editProbeTOONWire{operation: "search.symbols"}
+			case "summary_cannot_borrow_traversal_counts":
+				candidate[editProbeTOONWireKey] = editProbeTOONWire{operation: "read.summary"}
 			case "forged_JSON_proof":
 				candidate[editProbeTOONWireKey] = map[string]any{"operation": "relations.callers"}
 			}
