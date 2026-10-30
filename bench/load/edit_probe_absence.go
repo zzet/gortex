@@ -89,10 +89,18 @@ func editProbePresenceProof(raw json.RawMessage, c Corpus, logical string) bool 
 	case ".ts":
 		valid, correct := editProbeTypeScriptFixture(source, name, "")
 		_, calls := editProbeTypeScriptFixture(source, name, c.Symbol[strings.LastIndex(c.Symbol, "::")+2:])
+		if c.EditKind == "modify_caller_body" {
+			_, alternate := editProbeTypeScriptFixture(source, name, "Alternate")
+			calls = calls || alternate
+		}
 		return valid && (correct || calls)
 	case ".py":
 		valid, correct := editProbePythonFixture(source, name, "")
 		_, calls := editProbePythonFixture(source, name, c.Symbol[strings.LastIndex(c.Symbol, "::")+2:])
+		if c.EditKind == "modify_caller_body" {
+			_, alternate := editProbePythonFixture(source, name, "Alternate")
+			calls = calls || alternate
+		}
 		return valid && (correct || calls)
 	case ".go":
 		parsed, err := parser.ParseFile(token.NewFileSet(), "before.go", source, 0)

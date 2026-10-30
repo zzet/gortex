@@ -24,6 +24,9 @@ func editProbePythonFixture(source, marker, callee string) (valid, correct bool)
 			return false, false
 		}
 		i++
+		for i < len(lines) && strings.TrimSpace(lines[i]) == "" {
+			i++
+		}
 		if i >= len(lines) {
 			return false, false
 		}

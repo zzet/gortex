@@ -20,6 +20,9 @@ type editProbeOracle struct {
 }
 
 func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
+	if step.TargetSymbol != "" {
+		return editProbeBodyOracles(c, step)
+	}
 	if step.Deleted {
 		return editProbeDeleteOracles(c, step)
 	}
@@ -86,6 +89,9 @@ func editProbeSourceID(id, file, name string) bool {
 }
 
 func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editProbeStep, callee string) bool {
+	if step.TargetSymbol != "" {
+		return editProbeBodyCorrect(oracle, body, c, step, callee)
+	}
 	if step.Deleted {
 		return editProbeDeleteCorrect(oracle, body, c, step, callee)
 	}

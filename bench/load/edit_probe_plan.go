@@ -20,15 +20,18 @@ const editProbeMean = 15 * time.Second
 const editProbePeriod = 25 * time.Millisecond
 
 type editProbeStep struct {
-	Ordinal      int     `json:"ordinal"`
-	ActivateNS   int64   `json:"activate_ns"`
-	DueNS        int64   `json:"due_ns"`
-	Marker       string  `json:"marker"`
-	MutationID   string  `json:"mutation_id"`
-	Request      request `json:"request"`
-	RequestHash  string  `json:"request_sha256"`
-	BeforeSymbol string  `json:"before_symbol,omitempty"`
-	Deleted      bool    `json:"deleted,omitempty"`
+	Ordinal         int     `json:"ordinal"`
+	ActivateNS      int64   `json:"activate_ns"`
+	DueNS           int64   `json:"due_ns"`
+	Marker          string  `json:"marker"`
+	MutationID      string  `json:"mutation_id"`
+	Request         request `json:"request"`
+	RequestHash     string  `json:"request_sha256"`
+	BeforeSymbol    string  `json:"before_symbol,omitempty"`
+	Deleted         bool    `json:"deleted,omitempty"`
+	TargetSymbol    string  `json:"target_symbol,omitempty"`
+	FollowingSymbol string  `json:"following_symbol,omitempty"`
+	ExpectedLineGap int     `json:"expected_line_gap,omitempty"`
 }
 
 type editProbePlan struct {
@@ -66,7 +69,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if kind == "" {
 		kind = "add_intrafile_call"
 	}
-	if kind != "add_intrafile_call" && kind != "append_leaf" && kind != "rename" && kind != "delete" {
+	if kind != "add_intrafile_call" && kind != "append_leaf" && kind != "rename" && kind != "delete" && kind != "modify_body" && kind != "modify_caller_body" {
 		return editProbePlan{}, errors.New("unsupported edit kind")
 	}
 
@@ -147,7 +150,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		if tool == "edit.symbol" {
 			r = editProbeSymbolRequest(c, marker)
 		}
-		if (tool == "edit.write" || tool == "edit.batch") && kind != "rename" && kind != "delete" {
+		if (tool == "edit.write" || tool == "edit.batch") && kind != "rename" && kind != "delete" && kind != "modify_body" && kind != "modify_caller_body" {
 			if strings.Contains(c.EditInitialContent, marker) {
 				return editProbePlan{}, errors.New("planned marker already exists in write fixture")
 			}
@@ -158,15 +161,42 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 			}
 		}
 		beforeSymbol := ""
-		if kind == "rename" || kind == "delete" {
+		targetSymbol, followingSymbol := "", ""
+		expectedGap := 0
+		if kind == "rename" || kind == "delete" || kind == "modify_body" || kind == "modify_caller_body" {
 			oldName := marker + "Before"
-			before := strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", oldName))
+			beforeTemplate := c.EditTemplate
+			if kind == "modify_body" || kind == "modify_caller_body" {
+				beforeTemplate = c.EditBeforeTemplate
+				if strings.Count(beforeTemplate, "{{marker}}") != 1 {
+					return editProbePlan{}, errors.New("body change requires one explicit before-template declaration")
+				}
+			}
+			before := strings.TrimSpace(strings.ReplaceAll(beforeTemplate, "{{marker}}", oldName))
 			if strings.Count(c.EditInitialContent, before) != 1 || strings.Contains(c.EditInitialContent, marker+"(") {
 				return editProbePlan{}, errors.New("rename/delete requires each exact original declaration and absent new declaration")
 			}
 			replacement := strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", marker))
 			if kind == "delete" {
 				replacement = ""
+			}
+			if kind == "modify_body" || kind == "modify_caller_body" {
+				replacement = strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", oldName))
+				following := marker + "After"
+				nextDeclaration := editProbeFollowingDeclaration(c.File, following)
+				if strings.Count(c.EditInitialContent, before+"\n\n"+nextDeclaration) != 1 || strings.Count(replacement, "\n") <= strings.Count(before, "\n") {
+					return editProbePlan{}, errors.New("body fixture requires adjacent retained follower and actual body line growth")
+				}
+				beforeValid := editProbeLeafSource(c.File, before, oldName)
+				if kind == "modify_caller_body" {
+					beforeValid = editProbeFixtureSource(c.File, before, oldName, "Alternate") && editProbeLeafSource(c.File, c.EditInitialContent, "Alternate")
+				}
+				if !beforeValid {
+					return editProbePlan{}, errors.New("before body is not the declared numeric leaf or Alternate caller")
+				}
+				targetSymbol = c.File + "::" + oldName
+				followingSymbol = c.File + "::" + following
+				expectedGap = strings.Count(replacement, "\n") + 2
 			}
 			beforeSymbol = c.File + "::" + oldName
 			switch tool {
@@ -191,7 +221,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		if err != nil {
 			return editProbePlan{}, err
 		}
-		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete"})
+		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete", TargetSymbol: targetSymbol, FollowingSymbol: followingSymbol, ExpectedLineGap: expectedGap})
 	}
 	return p, nil
 }
