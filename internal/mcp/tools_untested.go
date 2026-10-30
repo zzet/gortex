@@ -11,10 +11,10 @@ import (
 
 // handleGetUntestedSymbols returns functions and methods in non-test files
 // that no test file reaches via the call graph — the inverse of
-// get_test_targets. Test reachability is computed in a single forward BFS
-// from every symbol defined in a test file, walking `calls` and
-// `references` edges; any non-test function/method not visited is
-// considered uncovered.
+// get_test_targets. Coverage follows calls/references in the candidates'
+// ancestor closure, then marks the paths from discovered test functions and
+// methods. Real foreign tests remain evidence; disconnected repositories do
+// no coverage work. Non-test functions/methods outside those paths are uncovered.
 //
 // This is the "where should we add tests first" tool: results are sorted by
 // fan_in descending so the most-used untested symbols surface at the top —
@@ -179,11 +179,10 @@ func reachableFromTests(g graph.Reader) map[string]bool {
 }
 
 // collectFanInByKind returns the per-target incoming-edge count for
-// every edge whose kind is in the allowlist. Prefers the
-// graph.InEdgeCounter capability — backends that ship it run one
-// count(*) per request instead of an AllEdges() materialisation
-// + Go-side bucketing. An overlay view has no counter, so an
-// overlay-active request buckets its edges Go-side.
+// every edge whose kind is in the allowlist. This is the whole-corpus
+// reference helper; the scoped handler counts its candidate adjacency above.
+// Backends can aggregate by kind; capability-less views stream the selected
+// kinds through their own masks rather than materializing AllEdges.
 func collectFanInByKind(g graph.Reader, kinds []graph.EdgeKind) map[string]int {
 	if len(kinds) == 0 {
 		return map[string]int{}

@@ -36,50 +36,32 @@ func untestedCandidates(ctx context.Context, reader graph.Reader, scope graph.No
 // a final forward walk over it agrees with seeding every test in the corpus
 // without enumerating tests or edges disconnected from the candidates.
 func candidateTestCoverage(ctx context.Context, reader graph.Reader, candidates []*graph.Node) (covered map[string]bool, fanIn map[string]int, err error) {
-	seen := make(map[string]bool, len(candidates))
+	ids := make([]string, 0, len(candidates))
 	candidateIDs := make(map[string]bool, len(candidates))
-	frontier := make([]string, 0, len(candidates))
 	for _, node := range candidates {
-		if !seen[node.ID] {
-			seen[node.ID] = true
+		if !candidateIDs[node.ID] {
 			candidateIDs[node.ID] = true
-			frontier = append(frontier, node.ID)
+			ids = append(ids, node.ID)
 		}
+	}
+	rows, err := graph.CallAncestorsContext(ctx, reader, ids)
+	if err != nil {
+		return nil, nil, err
 	}
 	fanIn = make(map[string]int, len(candidates))
 	forward := make(map[string][]string)
 	var tests []string
-	kinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}
-	for len(frontier) > 0 {
-		var next []string
-		for _, id := range frontier {
-			if err := ctx.Err(); err != nil {
-				return nil, nil, err
-			}
-			rows, err := graph.ReadKindAdjacency(ctx, reader, id, graph.DirectionBackward, kinds)
-			if err != nil {
-				return nil, nil, err
-			}
-			if candidateIDs[id] {
-				fanIn[id] = len(rows.Edges)
-			}
-			for _, edge := range rows.Edges {
-				forward[edge.From] = append(forward[edge.From], edge.To)
-				if edge.From != "" && !seen[edge.From] {
-					seen[edge.From] = true
-					next = append(next, edge.From)
-				}
-			}
-		}
+	for _, row := range rows {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		for _, node := range reader.GetNodesByIDs(next) {
-			if node != nil && (node.Kind == graph.KindFunction || node.Kind == graph.KindMethod) && isTestFile(node.FilePath) {
-				tests = append(tests, node.ID)
-			}
+		if candidateIDs[row.To] {
+			fanIn[row.To]++
 		}
-		frontier = next
+		forward[row.From] = append(forward[row.From], row.To)
+		if (row.FromKind == graph.KindFunction || row.FromKind == graph.KindMethod) && isTestFile(row.FromFile) {
+			tests = append(tests, row.From)
+		}
 	}
 	covered = make(map[string]bool, len(tests))
 	for _, id := range tests {

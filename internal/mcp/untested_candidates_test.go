@@ -13,8 +13,17 @@ import (
 
 type coverageCandidateSpy struct {
 	*kindAdjacencySpy
-	nodes         graph.NodeScopedDeadCodeReader
-	candidateRows int
+	nodes           graph.NodeScopedDeadCodeReader
+	ancestors       graph.FilteredCallAncestorReader
+	candidateRows   int
+	ancestorQueries int
+}
+
+func (r *coverageCandidateSpy) CallAncestorsFilteredContext(ctx context.Context, ids []string, filter graph.OutlineEdgeFilter) ([]graph.CallAncestorRow, error) {
+	r.ancestorQueries++
+	rows, err := r.ancestors.CallAncestorsFilteredContext(ctx, ids, filter)
+	r.rows += len(rows)
+	return rows, err
 }
 
 func (r *coverageCandidateSpy) NodesByKindInScope(kind graph.NodeKind, repos []string, scope graph.NodeScope) iter.Seq[*graph.Node] {
@@ -56,7 +65,7 @@ func TestUntestedCandidateClosureMatchesWholeGraphOracle(t *testing.T) {
 	})
 	var baseCandidateRows, baseEdgeRows int
 	for pass := range 2 {
-		spy := &coverageCandidateSpy{kindAdjacencySpy: &kindAdjacencySpy{Reader: s, backend: s}, nodes: s}
+		spy := &coverageCandidateSpy{kindAdjacencySpy: &kindAdjacencySpy{Reader: s, backend: s}, nodes: s, ancestors: s}
 		reader := newContractCoreEdges(spy, t.Context(), nil)
 		scope := graph.NodeScope{RepoAllow: map[string]bool{"a": true}}
 		candidates, err := untestedCandidates(t.Context(), reader, scope, "a/")
@@ -64,6 +73,8 @@ func TestUntestedCandidateClosureMatchesWholeGraphOracle(t *testing.T) {
 		require.Len(t, candidates, 6)
 		covered, counts, err := candidateTestCoverage(t.Context(), reader, candidates)
 		require.NoError(t, err)
+		require.Equal(t, 1, spy.ancestorQueries, "one indexed closure statement replaces per-ancestor point reads")
+		require.Zero(t, spy.queries)
 		require.True(t, covered["a/live"], "a real foreign test path still proves coverage")
 		require.True(t, covered["a/dangling"], "the original forward walk follows missing intermediate identities")
 		require.False(t, covered["a/dead"])

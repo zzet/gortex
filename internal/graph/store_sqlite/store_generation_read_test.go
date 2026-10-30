@@ -727,6 +727,29 @@ func generationReadProbes() []genProbe {
 			return nodeTokens(got.Nodes)
 		}},
 
+		{name: "CallAncestorsContext", run: func(t *testing.T, s *Store) []string {
+			rows, err := s.CallAncestorsContext(t.Context(), genReadProbeIDs())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out []string
+			for _, row := range rows {
+				out = append(out, fmt.Sprintf("%s/%s/%s/%s", row.From, row.To, row.FromKind, row.FromFile))
+			}
+			return out
+		}},
+		{name: "CallAncestorsFilteredContext", run: func(t *testing.T, s *Store) []string {
+			rows, err := s.CallAncestorsFilteredContext(t.Context(), genReadProbeIDs(), graph.OutlineEdgeFilter{ExcludeVia: "spring.Bean"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out []string
+			for _, row := range rows {
+				out = append(out, fmt.Sprintf("%s/%s/%s/%s", row.From, row.To, row.FromKind, row.FromFile))
+			}
+			return out
+		}},
+
 		{name: "ReadKindAdjacency", run: func(t *testing.T, s *Store) []string {
 			var out []string
 			for _, dir := range []graph.Direction{graph.DirectionForward, graph.DirectionBackward} {
@@ -2134,6 +2157,8 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.BulkLoader)(nil), skip: "the cold-load bracket engages only on a provably empty store; its generation-0 emptiness gate is asserted by TestColdGraphStoreEmptyIgnoresDerivedGenerations"},
 		{iface: (*graph.BundleFingerprintSink)(nil), skip: skipInMemory},
 		{iface: (*graph.CallableBindingNodeSequencer)(nil), probe: "NodesInScopeSeq"},
+		{iface: (*graph.CallAncestorReader)(nil), probe: "CallAncestorsContext"},
+		{iface: (*graph.FilteredCallAncestorReader)(nil), probe: "CallAncestorsFilteredContext"},
 		{iface: (*graph.CallReferenceOutgoingReader)(nil), probe: "GetCallReferenceOutEdgesContext"},
 		{iface: (*graph.ScopedKindSummarySequencer)(nil), probe: "NodesLightByKindsInScopeSeq"},
 		{iface: (*graph.ChurnEnrichmentReader)(nil), skip: skipSidecar},
