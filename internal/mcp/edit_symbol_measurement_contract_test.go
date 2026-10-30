@@ -121,7 +121,14 @@ func TestEditSymbolMeasurementFixtureUsesActualSpliceAndExplicitAbsence(t *testi
 						require.Greater(t, afterNode.EndLine-afterNode.StartLine, beforeSpan)
 					}
 					if operation == "change_signature" {
-						require.Contains(t, afterNode.Meta["signature"], "optional")
+						switch language {
+						case "go":
+							require.Contains(t, afterNode.Meta["signature"], "optional")
+						case "typescript":
+							require.Equal(t, "function Target()", afterNode.Meta["signature"], "producer parameter detail is proved by exact source, not invented metadata")
+						case "python":
+							require.Equal(t, "def Target(...)", afterNode.Meta["signature"], "producer parameter detail is proved by exact source, not invented metadata")
+						}
 					}
 				} else {
 					require.Nil(t, s.engineFor(t.Context()).GetSymbol(id), "old identity must really be absent, not an empty successful source")
@@ -142,12 +149,16 @@ func TestEditSymbolMeasurementFixtureUsesActualSpliceAndExplicitAbsence(t *testi
 						require.Zero(t, chainBody["total_nodes"])
 						require.Zero(t, chainBody["total_edges"])
 						require.Equal(t, false, chainBody["truncated"])
-						search := callTool(t, s, "search_symbols", map[string]any{"query": "GortexDeletedMeasurementNoSuchSymbol"})
+						search := callTool(t, s, "search_symbols", map[string]any{"query": "GortexDeletedMeasurementNoSuchSymbol", "query_class": "symbol", "expand": "off"})
 						require.False(t, search.IsError)
 						searchBody := unmarshalResult(t, search)
 						require.Contains(t, searchBody, "results")
-						require.Empty(t, searchBody["results"])
-						require.Zero(t, searchBody["total"])
+						results, _ := searchBody["results"].([]any)
+						require.EqualValues(t, len(results), searchBody["total"])
+						for _, raw := range results {
+							require.NotEqual(t, id, raw.(map[string]any)["id"], "deleted identity must remain absent even in complete fallback output")
+						}
+						require.Equal(t, "symbol", searchBody["query_class"])
 						require.Equal(t, false, searchBody["truncated"])
 					}
 

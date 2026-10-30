@@ -13,7 +13,7 @@ func editProbeDeleteOracles(c Corpus, step editProbeStep) []editProbeOracle {
 		{"source", request{Tool: "read", Operation: "source", ExpectedAbsentSymbol: step.BeforeSymbol, Arguments: map[string]any{"operation": "source", "target": old}}},
 		{"summary", request{Tool: "read", Operation: "summary", Arguments: map[string]any{"operation": "summary", "target": file}}},
 		{"editing_context", request{Tool: "read", Operation: "editing_context", Arguments: map[string]any{"operation": "editing_context", "target": file}}},
-		{"search_visible", request{Tool: "search", Operation: "symbols", Arguments: map[string]any{"operation": "symbols", "query": name}}},
+		{"search_visible", request{Tool: "search", Operation: "symbols", Arguments: map[string]any{"operation": "symbols", "query": name, "options": map[string]any{"query_class": "symbol", "expand": "off"}}}},
 		{"text", request{Tool: "search", Operation: "text", Arguments: map[string]any{"operation": "text", "query": name}}},
 		{"callers", request{Tool: "relations", Operation: "callers", Arguments: map[string]any{"operation": "callers", "target": map[string]any{"symbol": c.Symbol}, "options": map[string]any{"depth": 1, "limit": 1000}}}},
 		{"call_chain", request{Tool: "trace", Operation: "call_chain", Arguments: map[string]any{"operation": "call_chain", "target": old, "options": map[string]any{"depth": 1, "limit": 1000}}}},
@@ -101,7 +101,23 @@ func editProbeDeleteCorrect(oracle string, body map[string]any, c Corpus, step e
 		return cleanNodes(nodes)
 	case "search_visible":
 		rows, ok := editProbeCompleteCount(body, "results", "total")
-		return ok && len(rows) == 0 && untruncated() && body["query_class"] == "symbol"
+		if !ok || !untruncated() || body["query_class"] != "symbol" {
+			return false
+		}
+		// Search may publish a complete decomposition/fallback population. Its
+		// unrelated rows are not the deleted symbol and must not become a false
+		// failure or a fake zero-result assertion.
+		for _, raw := range rows {
+			row, ok := raw.(map[string]any)
+			if !ok {
+				return false
+			}
+			id, ok := row["id"].(string)
+			if !ok || id == "" || editProbeSourceID(id, c.File, old) {
+				return false
+			}
+		}
+		return true
 	case "text":
 		rows, ok := editProbeCompleteCount(body, "matches", "count")
 		if body["query"] != old || !ok || len(rows) != 0 {

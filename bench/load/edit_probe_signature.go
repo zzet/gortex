@@ -54,7 +54,15 @@ func editProbeBodySignature(rows []any, c Corpus, step editProbeStep, meta bool)
 			}
 		}
 		signature, _ := row["signature"].(string)
-		return strings.Contains(signature, "optional")
+		switch filepath.Ext(c.File) {
+		case ".go":
+			return strings.Contains(signature, "optional")
+		case ".ts":
+			return signature == "function "+name+"()"
+		case ".py":
+			return signature == "def "+name+"(...)"
+		}
+		return false
 	}
 	return false
 }
