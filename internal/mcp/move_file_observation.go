@@ -18,6 +18,7 @@ import (
 type moveFileObservation struct {
 	operationID, sourceID, targetID, role string
 	writeVerdict, directState             string
+	directClaimed                         bool
 	direct                                *moveDirectObservation
 }
 type moveDirectObservation struct {
@@ -146,9 +147,10 @@ func (o *moveObservation) observer(ctx context.Context, path string, idx *indexe
 	ledger := &o.server.mutationCommits
 	ledger.mu.Lock()
 	record.mu.Lock()
-	valid := ledger.byID[record.id] == record && record.kind == moveFileObservationCommit && record.owner == o.server && record.moveFile != nil && record.moveFile.writeVerdict == "all_writes_completed" && record.disk == mutationDiskCommitted && record.newSHA != "" && !record.committedAt.IsZero() && record.commitSeq != 0
+	valid := ledger.byID[record.id] == record && record.kind == moveFileObservationCommit && record.owner == o.server && record.moveFile != nil && record.moveFile.writeVerdict == "all_writes_completed" && !record.moveFile.directClaimed && record.disk == mutationDiskCommitted && record.newSHA != "" && !record.committedAt.IsZero() && record.commitSeq != 0
 	if valid {
 		witness.id, witness.operation, witness.path, witness.blob, witness.committed, witness.commitSeq = record.id, record.key, record.absPath, record.newSHA, record.committedAt, record.commitSeq
+		record.moveFile.directClaimed = true
 		record.moveFile.directState = "pending_observer"
 	}
 	record.mu.Unlock()
@@ -240,7 +242,7 @@ func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 	}
 	record.mu.Lock()
 	defer record.mu.Unlock()
-	if !w.matches(record) || record.moveFile.direct != nil {
+	if !w.matches(record) || record.moveFile.direct != nil || record.moveFile.directState != "pending_observer" {
 		return
 	}
 	record.moveFile.direct = &accepted
@@ -259,7 +261,7 @@ func (w moveDirectWitness) unavailable(reason string) {
 	defer ledger.mu.Unlock()
 	record.mu.Lock()
 	defer record.mu.Unlock()
-	if ledger.byID[w.id] == record && w.matches(record) && record.moveFile.direct == nil {
+	if ledger.byID[w.id] == record && w.matches(record) && record.moveFile.direct == nil && record.moveFile.directState == "pending_observer" {
 		record.moveFile.directState = reason
 	}
 }
@@ -273,13 +275,13 @@ func (o *moveObservation) reindex(ctx context.Context, path string) bool {
 		idx, _ = o.server.multiIndexer.IndexerForFile(path)
 	}
 	observer := o.observer(ctx, path, idx)
-	if observer == nil {
+	if observer == nil && idx == nil {
 		o.noteDirectUnavailable(path, "unavailable_observer_owner")
 	}
 	// The existing path and fallback order remain unchanged. No scheduler is
 	// introduced, and no watcher ticket is invented for this direct reconcile.
 	success := o.server.reindexFileObserved(path, observer)
-	if !success {
+	if !success && observer != nil {
 		o.noteDirectUnavailable(path, "unavailable_reconcile_not_confirmed")
 	}
 	return success
@@ -294,7 +296,8 @@ func (o *moveObservation) noteDirectUnavailable(path, reason string) {
 	defer ledger.mu.Unlock()
 	record.mu.Lock()
 	defer record.mu.Unlock()
-	if ledger.byID[record.id] == record && record.kind == moveFileObservationCommit && record.moveFile != nil && record.key == o.id && record.moveFile.direct == nil {
+	if ledger.byID[record.id] == record && record.kind == moveFileObservationCommit && record.moveFile != nil && record.key == o.id && record.moveFile.direct == nil && (record.moveFile.directState == "not_started" || record.moveFile.directState == "pending_observer") {
+		record.moveFile.directClaimed = true
 		record.moveFile.directState = reason
 	}
 }

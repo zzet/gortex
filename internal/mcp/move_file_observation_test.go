@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -232,14 +233,13 @@ func TestMoveDirectRejectsActualEarlyAcceptanceForeignOwnerBytesAndEviction(t *t
 		t.Run(kind, func(t *testing.T) {
 			s, observation, ctx, ack, source, target := moveObservationExecutionFixture(t)
 			idx := s.multiIndexer.GetIndexer("fixture")
-			observer := observation.observer(ctx, source, idx)
+			expectedOwner := idx
+			if kind == "foreign_owner" {
+				expectedOwner = indexer.New(graph.New(), testRegistry(), config.Default().Index, zap.NewNop())
+			}
+			observer := observation.observer(ctx, source, expectedOwner)
 			require.NotNil(t, observer)
 			record := observation.records[source]
-			if kind == "foreign_owner" {
-				foreign := indexer.New(graph.New(), testRegistry(), config.Default().Index, zap.NewNop())
-				observer = observation.observer(ctx, source, foreign)
-				require.NotNil(t, observer)
-			}
 			if kind == "foreign_bytes" {
 				require.NoError(t, writeMoveFileObserved(nil, source, []byte("package main\nfunc OtherBytes() { Existing() }\n")))
 			}
@@ -274,6 +274,7 @@ func TestMoveDirectRejectsActualEarlyAcceptanceForeignOwnerBytesAndEviction(t *t
 				require.NotContains(t, status, "direct_reconcile")
 				require.Equal(t, "unavailable_owner_bytes_or_acceptance", status["direct_reconcile_state"])
 			}
+			runtime.KeepAlive(expectedOwner)
 			_ = ack // shared owner remains live until cleanup
 			_ = observation
 		})
@@ -308,4 +309,19 @@ func TestMoveFileWriteWindowsPartialFailureAndUnobservedIsolation(t *testing.T) 
 		_, physical := s.mutationCommits.byReceipt(ref.Receipt)
 		require.False(t, physical, "move timing acquired physical receipt authority")
 	}
+}
+
+func TestMoveOriginalDirectAdmissionCannotBeReissued(t *testing.T) {
+	s, observation, ctx, _, source, _ := moveObservationExecutionFixture(t)
+	idx := s.multiIndexer.GetIndexer("fixture")
+	first := observation.observer(ctx, source, idx)
+	require.NotNil(t, first)
+	require.Nil(t, observation.observer(ctx, source, idx), "an original direct observation cannot borrow a second reconcile")
+	actual := captureMoveActualExecution(t, s, source, first)
+	require.True(t, actual.AcceptedFor(idx, observation.records[source].newSHA))
+	before, _ := s.moveFileObservationPayload(t.Context(), observation.records[source].id)
+	require.Equal(t, "observed", before["direct_reconcile_state"])
+	require.Nil(t, observation.observer(ctx, source, idx))
+	after, _ := s.moveFileObservationPayload(t.Context(), observation.records[source].id)
+	require.Equal(t, before["direct_reconcile"], after["direct_reconcile"], "completed original owner changed after re-admission attempt")
 }
