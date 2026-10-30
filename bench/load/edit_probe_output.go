@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 
 	toon "github.com/toon-format/toon-go"
 )
@@ -19,7 +21,6 @@ const editProbeTOONWireKey = "\x00load.toon.wire"
 func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[string]any, error) {
 	switch format {
 	case "", "json":
-		return decodeEditProbeResult(raw)
 	case "toon":
 	default:
 		return nil, errors.New("unsupported edit output mode")
@@ -34,10 +35,30 @@ func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[s
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return nil, err
 	}
-	if envelope.IsError || len(envelope.Content) != 1 || envelope.Content[0].Type != "text" || envelope.Content[0].Text == "" {
-		return nil, errors.New("TOON requires one successful text content item")
+	if envelope.IsError || len(envelope.Content) < 1 || len(envelope.Content) > 3 || envelope.Content[0].Type != "text" || envelope.Content[0].Text == "" {
+		return nil, errors.New("output requires one successful payload and only known auxiliary notes")
+	}
+	seen := map[int]bool{}
+	for _, item := range envelope.Content[1:] {
+		kind := editProbeSessionNoteKind(item.Text)
+		if item.Type != "text" || kind == 0 || seen[kind] {
+			return nil, errors.New("unknown or duplicate auxiliary output content")
+		}
+		seen[kind] = true
 	}
 	text := []byte(envelope.Content[0].Text)
+	if format == "" || format == "json" {
+		decoder := json.NewDecoder(bytes.NewReader(text))
+		decoder.UseNumber()
+		var body map[string]any
+		if !json.Valid(text) {
+			return nil, errors.New("requested JSON returned non-JSON payload")
+		}
+		if err := decoder.Decode(&body); err != nil {
+			return nil, err
+		}
+		return body, nil
+	}
 	if json.Valid(text) {
 		return nil, errors.New("requested TOON returned JSON; no format credit")
 	}
@@ -66,6 +87,32 @@ func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[s
 	}
 	body[editProbeTOONWireKey] = editProbeTOONWire{operation: operation}
 	return body, nil
+}
+
+// These are the optional text-only notes appended by mcp/momentum.go. Selecting
+// the first payload never changes the retained raw envelope or its byte budget.
+func editProbeSessionNoteKind(text string) int {
+	const nudge = ". Every location returned so far is real and citeable — if you are localizing or answering a question, consider writing your conclusion from what you already hold and fetching only what it still lacks. This note appears once.)"
+	const escalation = " granular reads in a row. You likely have enough — answer NOW with your current best candidate and its evidence: name the file and the symbol, citing the locations already returned. A confident partial answer beats an exhausted turn budget with no answer."
+	const alternative = " If one more look is genuinely needed, a single explore call with the request in plain words returns the ranked neighborhood — symbols, source, call paths — in one response."
+	for _, form := range []struct {
+		prefix, suffix string
+		minimum, kind  int
+	}{
+		{"(Session note: graph read #", nudge, 6, 1},
+		{"(Session note: ", escalation + " This note will not repeat.)", 10, 2},
+		{"(Session note: ", escalation + alternative + " This note will not repeat.)", 10, 2},
+	} {
+		if !strings.HasPrefix(text, form.prefix) || !strings.HasSuffix(text, form.suffix) {
+			continue
+		}
+		digits := strings.TrimSuffix(strings.TrimPrefix(text, form.prefix), form.suffix)
+		n, err := strconv.Atoi(digits)
+		if err == nil && n >= form.minimum && strconv.Itoa(n) == digits {
+			return form.kind
+		}
+	}
+	return 0
 }
 
 func editProbeTOONNumbersSafe(value any) bool {

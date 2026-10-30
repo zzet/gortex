@@ -51,7 +51,11 @@ func TestEditProbeActualJSONAndTOONWireContracts(t *testing.T) {
 					}
 				}
 				require.False(t, envelope.IsError, "%s", raw)
-				require.Len(t, envelope.Content, 1)
+				require.NotEmpty(t, envelope.Content)
+				for _, auxiliary := range envelope.Content[1:] {
+					require.Equal(t, "text", auxiliary.Type)
+					require.Contains(t, []string{momentumNote(6), momentumEscalationNote(10, false), momentumEscalationNote(10, true)}, auxiliary.Text)
+				}
 				require.Equal(t, "text", envelope.Content[0].Type)
 				text := envelope.Content[0].Text
 				var body map[string]any

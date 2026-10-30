@@ -181,3 +181,40 @@ func TestEditProbeTOONSignatureDoesNotBorrowMissingJSONMetadata(t *testing.T) {
 		t.Fatal("missing TOON span/signature proof silently accepted")
 	}
 }
+
+func TestEditProbeOutputSeparatesOnlyActualSessionNotes(t *testing.T) {
+	nudge := "(Session note: graph read #6. Every location returned so far is real and citeable — if you are localizing or answering a question, consider writing your conclusion from what you already hold and fetching only what it still lacks. This note appears once.)"
+	for _, format := range []string{"json", "toon"} {
+		payload := `{"id":"owned"}`
+		if format == "toon" {
+			payload = "id: owned"
+		}
+		for name, extras := range map[string][]string{
+			"known": {nudge}, "unknown": {"Session note: arbitrary"}, "second_payload": {payload},
+			"duplicate": {nudge, nudge}, "changed": {nudge + " trailing"},
+		} {
+			t.Run(format+"/"+name, func(t *testing.T) {
+				content := []any{map[string]any{"type": "text", "text": payload}}
+				for _, extra := range extras {
+					content = append(content, map[string]any{"type": "text", "text": extra})
+				}
+				raw, err := json.Marshal(map[string]any{"content": content})
+				if err != nil {
+					t.Fatal(err)
+				}
+				before := string(raw)
+				body, err := decodeEditProbeOutput(raw, format, "relations.callers")
+				if name == "known" {
+					if err != nil || body["id"] != "owned" {
+						t.Fatal(body, err)
+					}
+				} else if err == nil {
+					t.Fatal("extra payload or unknown note accepted", body)
+				}
+				if string(raw) != before {
+					t.Fatal("raw evidence changed")
+				}
+			})
+		}
+	}
+}
