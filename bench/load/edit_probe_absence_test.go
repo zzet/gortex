@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -116,5 +117,49 @@ func TestEditProbeAbsenceRequiresActualOwnedDeclarationBeforeEdit(t *testing.T) 
 				})
 			}
 		})
+	}
+}
+
+func TestEditProbeExpectedAbsenceSurvivesPerformWithoutEvidenceFailure(t *testing.T) {
+	const logical = "file.go::Old"
+	socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
+		return map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": "symbol not found: owned/" + logical}}}, nil
+	})
+	client, err := openMCP(t.Context(), socket, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	sink := newEditProbeHeldSink(t)
+	sink.unblock()
+	state := startHeldEditProbeSpool(t, sink)
+	state.absenceBefore = map[string]bool{logical: true}
+	state.editWrite = time.Now().Add(-time.Millisecond)
+	run := &editProbeRuntime{p: &privateRun{Repos: []privateRepo{{Prefix: "owned"}}}, phase: &Phase{}, origin: time.Now(), options: runOptions{Deadline: time.Second}}
+	req := request{Tool: "read", Operation: "source", ExpectedAbsentSymbol: logical, Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": logical}}}
+	_, _, attempts, err := run.performObserved(t.Context(), state, client, req, "oracle:old_source_absent", "probe", 0)
+	if _, ok := err.(*editProbeExpectedAbsence); !ok {
+		t.Fatalf("clean expected refusal wrapped/lost: %T %v", err, err)
+	}
+	if len(attempts) != 1 || attempts[0].Outcome != "expected_refusal" {
+		t.Fatalf("attempts=%+v", attempts)
+	}
+}
+
+type canceledExpectedAbsenceCaller struct{ cancel context.CancelFunc }
+
+func (c canceledExpectedAbsenceCaller) call(context.Context, string, any) (json.RawMessage, error) {
+	c.cancel()
+	return absentSourceWire("symbol not found: owned/file.go::Old"), &editProbeExpectedAbsence{symbol: "owned/file.go::Old", message: "symbol not found: owned/file.go::Old"}
+}
+func TestEditProbeCensoredExpectedAbsenceCannotBeCorrect(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	_, attempts, err := callEditProbeTool(ctx, canceledExpectedAbsenceCaller{cancel}, request{Tool: "read", Operation: "source"}, nil, "probe", 0, 0, 0, time.Second, waitContext)
+	if _, ok := err.(*editProbeExpectedAbsence); ok {
+		t.Fatal("censored result retained eligible absence type")
+	}
+	if !errors.Is(err, context.Canceled) || len(attempts) != 1 || attempts[0].Outcome != "phase_censored" {
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
 	}
 }

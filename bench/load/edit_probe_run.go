@@ -351,7 +351,10 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
 	r.mu.Unlock()
 	evidenceErr := s.emit(map[string]any{"event": "logical_call", "purpose": purpose, "tool": req.name(), "attempts": attempts})
-	return data, caller.last, attempts, errors.Join(err, evidenceErr)
+	if evidenceErr != nil {
+		return data, caller.last, attempts, errors.Join(err, evidenceErr)
+	}
+	return data, caller.last, attempts, err
 }
 
 func (s *editProbeState) noteProbeStart() bool {

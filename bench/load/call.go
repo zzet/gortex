@@ -137,6 +137,7 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 			}
 			if callCtx.Err() != nil {
 				a.Outcome = terminalOutcome()
+				err = errors.Join(err, callCtx.Err())
 			}
 			if retryTyped && errors.Is(err, errEditProbeEvidenceIncomplete) {
 				a.Outcome = "harness_incomplete"
