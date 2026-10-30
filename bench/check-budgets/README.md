@@ -142,7 +142,7 @@ synthetic unit fixtures do not prove any owning product target passes.
 
 ```sh
 # Source-only preflight. Exits nonzero with the exact unavailable prerequisites.
-go run ./bench/check-budgets plan --lane smoke --out NEW-smoke-plan.json
+go run ./bench/check-budgets plan --lane smoke --host-class hosted_arm_smoke --out NEW-smoke-plan.json
 go run ./bench/check-budgets plan --config reviewed-lane.json
 
 # Run supported observations and retain every failure. The full policy still
