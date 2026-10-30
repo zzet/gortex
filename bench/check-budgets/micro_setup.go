@@ -186,11 +186,12 @@ func setupMicroCommand(command string, args []string, stdout, stderr io.Writer) 
 	defer cancel()
 	output := pathAbsolute(*out)
 	var err error
-	if command == "prepare-fixture" {
+	switch command {
+	case "prepare-fixture":
 		err = prepareFixture(ctx, *revision, output, executeMicroProcess)
-	} else if command == "prepare-tests" {
+	case "prepare-tests":
 		err = prepareTestBinaries(ctx, pathAbsolute(*source), *revision, output, executeMicroProcess)
-	} else {
+	default:
 		err = prepareBenchstat(ctx, output, executeMicroProcess)
 	}
 	if err != nil {
