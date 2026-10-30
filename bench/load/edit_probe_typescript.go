@@ -39,20 +39,21 @@ func editProbeTypeScriptFixture(source, marker, callee string) (valid, correct b
 			}
 		}
 		called := ""
-		if kind == scanner.Int {
+		switch kind {
+		case scanner.Int:
 			for _, digit := range text {
 				if digit < '0' || digit > '9' {
 					return false, false
 				}
 			}
 			advance()
-		} else if kind == scanner.Ident {
+		case scanner.Ident:
 			called = text
 			advance()
 			if !take("(") || !take(")") {
 				return false, false
 			}
-		} else {
+		default:
 			return false, false
 		}
 		if !take(";") || !take("}") {

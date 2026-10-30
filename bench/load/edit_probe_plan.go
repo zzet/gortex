@@ -75,17 +75,18 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		return editProbePlan{}, errors.New("initial intrafile cell requires one plain callee symbol")
 	}
 	probeMarker := "GortexEditProbeDeclaration"
-	if language == "typescript" {
+	switch language {
+	case "typescript":
 		valid, correct := editProbeTypeScriptFixture(strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker, callee)
 		if !valid || !correct {
 			return editProbePlan{}, errors.New("TypeScript template must be a numeric zero-argument marker function returning the intrafile call")
 		}
-	} else if language == "python" {
+	case "python":
 		valid, correct := editProbePythonFixture(strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker, callee)
 		if !valid || !correct {
-			return editProbePlan{}, errors.New("Python template must be a top-level marker with one indented return of the intrafile call")
+			return editProbePlan{}, errors.New("python template must be a top-level marker with one indented return of the intrafile call")
 		}
-	} else {
+	default:
 		parsed, err := parser.ParseFile(token.NewFileSet(), "template.go", "package probe\n"+strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), 0)
 		if err != nil {
 			return editProbePlan{}, fmt.Errorf("edit template is not standalone Go declarations: %w", err)

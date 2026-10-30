@@ -140,7 +140,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 	if filepath.Ext(plan.File) == ".py" {
 		valid, _ := editProbePythonFixture(string(original), "", "")
 		if !valid {
-			return nil, nil, errors.New("Python cell requires an explicit top-level single-return fixture")
+			return nil, nil, errors.New("python cell requires an explicit top-level single-return fixture")
 		}
 	}
 	if strings.Count(string(original), p.Repos[0].Corpus.EditAnchor) != 1 {
