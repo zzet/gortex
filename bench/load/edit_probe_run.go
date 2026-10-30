@@ -37,9 +37,9 @@ type editProbeRecord struct {
 	Outcome                  string                    `json:"outcome"`
 	Receipt                  string                    `json:"mutation_receipt"`
 	Batch                    *editProbeBatchReferences `json:"batch,omitempty"`
-	Move                     *editProbeMoveReferences `json:"move,omitempty"`
-	MoveAccounting           *editProbeMoveAccounting `json:"move_accounting,omitempty"`
-	GraphTerminalBasis       string `json:"graph_terminal_basis,omitempty"`
+	Move                     *editProbeMoveReferences  `json:"move,omitempty"`
+	MoveAccounting           *editProbeMoveAccounting  `json:"move_accounting,omitempty"`
+	GraphTerminalBasis       string                    `json:"graph_terminal_basis,omitempty"`
 	Ack                      Metric                    `json:"t_ack_ms"`
 	Readbacks                []editProbeReadback       `json:"readbacks"`
 	FirstCorrect             map[string]Metric         `json:"first_correct_ms"`
@@ -166,8 +166,12 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editor: editor, original: original, requireAccounting: !o.editProbeBaseline}
 	if plan.Tool == "refactor.move" {
 		r.moveOriginal, err = os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(p.Repos[0].Corpus.EditDestination)))
-		if err != nil { return r, nil, err }
-		if string(r.moveOriginal) != p.Repos[0].Corpus.EditDestinationContent { return r, nil, errors.New("move destination bytes differ from offered fixture") }
+		if err != nil {
+			return r, nil, err
+		}
+		if string(r.moveOriginal) != p.Repos[0].Corpus.EditDestinationContent {
+			return r, nil, errors.New("move destination bytes differ from offered fixture")
+		}
 	}
 	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, r.requireAccounting)
 	if p.Repos[0].Corpus.EditKind == "add_crossfile_call" {
@@ -557,7 +561,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if step.Relocated {
 		refs, moveErr := decodeEditProbeMoveAcknowledgement(body, r.p.Repos[0].Prefix+"/"+step.BeforeSymbol, r.p.Repos[0].Prefix+"/"+step.TargetSymbol, r.movePaths())
 		if moveErr != nil {
-			s.mu.Lock(); s.record.Outcome = "invalid_ack"; s.record.Errors = append(s.record.Errors, moveErr.Error()); s.mu.Unlock()
+			s.mu.Lock()
+			s.record.Outcome = "invalid_ack"
+			s.record.Errors = append(s.record.Errors, moveErr.Error())
+			s.mu.Unlock()
 			return
 		}
 		move = &refs
@@ -589,10 +596,14 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
 		readbackKinds = append(readbackKinds, "old_source_absent")
 	}
-	if step.Relocated { readbackKinds = append(readbackKinds, "old_source_absent", "source_file_after_move") }
+	if step.Relocated {
+		readbackKinds = append(readbackKinds, "old_source_absent", "source_file_after_move")
+	}
 	for index, kind := range readbackKinds {
 		target := map[string]any{"file": r.plan.File}
-		if kind == "file" && step.Relocated { target["file"] = step.DestinationFile }
+		if kind == "file" && step.Relocated {
+			target["file"] = step.DestinationFile
+		}
 		if kind == "source" {
 			target = map[string]any{"symbol": r.plan.File + "::" + step.Marker}
 			if step.TargetSymbol != "" {
@@ -608,7 +619,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			req.ExpectedAbsentSymbol = step.BeforeSymbol
 			req.Arguments = map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}
 		}
-		if kind == "source_file_after_move" { req.Operation = "file"; req.Arguments["operation"] = "file" }
+		if kind == "source_file_after_move" {
+			req.Operation = "file"
+			req.Arguments["operation"] = "file"
+		}
 		begin := time.Now()
 		raw, identity, readErr := r.perform(callCtx, s, r.editor, req, "readback:"+kind, "readback", 100+index)
 		payload, decodeErr := decodeEditProbeResult(raw)
@@ -841,8 +855,10 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	if r.plan.Tool == "refactor.move" {
 		destination := r.p.Repos[0].Corpus.EditDestination
 		currentDestination, readErr := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(destination)))
-		if readErr != nil { return readErr }
-		changes = append(changes, map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix+"/"+destination, "old_string": string(currentDestination), "new_string": string(r.moveOriginal)})
+		if readErr != nil {
+			return readErr
+		}
+		changes = append(changes, map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + destination, "old_string": string(currentDestination), "new_string": string(r.moveOriginal)})
 	}
 	req := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "changes": changes, "options": map[string]any{"transaction_id": fmt.Sprintf("load-restore-%016x", uint64(r.options.Seed))}}}
 	start := time.Now()
@@ -861,8 +877,12 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	}
 	if r.plan.Tool == "refactor.move" {
 		destination, readErr := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.p.Repos[0].Corpus.EditDestination)))
-		if readErr != nil { return readErr }
-		if string(destination) != string(r.moveOriginal) { return errors.New("timed public restore batch did not restore destination bytes") }
+		if readErr != nil {
+			return readErr
+		}
+		if string(destination) != string(r.moveOriginal) {
+			return errors.New("timed public restore batch did not restore destination bytes")
+		}
 	}
 	return nil
 }
