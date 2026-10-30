@@ -222,6 +222,9 @@ func (c *pairedCoordinator) callAcrossWithEnds(ctx context.Context, r request, r
 	baseRepo := c.states[0].p.Repos[repoIndex]
 	hash, hashErr := hashJSON(r)
 	tuple := requestTuple{Tool: r.name(), Role: role, Repo: baseRepo.Corpus.Label, Commit: baseRepo.Corpus.Commit, Agent: agent, Step: step, Slot: slot, RequestHash: hash}
+	if r.ExpectedAbsentSymbol != "" {
+		tuple.ExpectedOutcome = "symbol_absent"
+	}
 	c.mu.Lock()
 	category := role + "." + r.name()
 	tuple.Ordinal = c.orders[category]
@@ -279,6 +282,7 @@ func (c *pairedCoordinator) callAcrossWithEnds(ctx context.Context, r request, r
 			if len(rows) > 0 {
 				last := rows[len(rows)-1]
 				sample.Outcome, sample.Code, sample.Error = last.Outcome, last.Code, last.Error
+				sample.ExpectedOutcome = last.ExpectedOutcome
 				sample.Latency = measured(last.LogicalMS, "ms")
 			}
 		} else if err == nil {
