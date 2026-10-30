@@ -24,7 +24,7 @@ func editProbeBodyOracles(c Corpus, step editProbeStep) []editProbeOracle {
 		{"source", request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": target, "options": map[string]any{"context_lines": 0}}}},
 		{"summary", request{Tool: "read", Operation: "summary", Arguments: map[string]any{"operation": "summary", "target": file}}},
 		{"editing_context", request{Tool: "read", Operation: "editing_context", Arguments: map[string]any{"operation": "editing_context", "target": file}}},
-		{"search_visible", request{Tool: "search", Operation: "symbols", Arguments: map[string]any{"operation": "symbols", "query": step.Marker}}},
+		{"search_visible", request{Tool: "search", Operation: "symbols", Arguments: map[string]any{"operation": "symbols", "query": step.Marker, "options": map[string]any{"query_class": "symbol", "expand": "off", "limit": 1000, "max_per_file": 0}}}},
 		{"text", request{Tool: "search", Operation: "text", Arguments: map[string]any{"operation": "text", "query": "return " + c.Symbol[strings.LastIndex(c.Symbol, "::")+2:] + "()", "options": map[string]any{"limit": 1000}}}},
 		{"callers", request{Tool: "relations", Operation: "callers", Arguments: map[string]any{"operation": "callers", "target": map[string]any{"symbol": c.Symbol}, "options": map[string]any{"depth": 1, "limit": 1000}}}},
 		{"call_chain", request{Tool: "trace", Operation: "call_chain", Arguments: map[string]any{"operation": "call_chain", "target": target, "options": map[string]any{"depth": 1, "limit": 1000}}}},

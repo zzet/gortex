@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -165,5 +166,64 @@ func TestEditSymbolMeasurementFixtureUsesActualSpliceAndExplicitAbsence(t *testi
 				}
 			})
 		}
+	}
+}
+
+func TestDeleteMeasurementSearchCoversHundredDeclarationFixture(t *testing.T) {
+	for _, language := range []string{"go", "typescript", "python"} {
+		t.Run(language, func(t *testing.T) {
+			s, root := setupTestServer(t)
+			t.Cleanup(s.DrainBackground)
+			file, source := "fixture.go", "package main\n"
+			declaration := func(name string) string { return "func " + name + "() int { return 1 }" }
+			if language == "typescript" {
+				file = "fixture.ts"
+				source = ""
+				declaration = func(name string) string { return "export function " + name + "(): number { return 1; }" }
+			}
+			if language == "python" {
+				file = "fixture.py"
+				source = ""
+				declaration = func(name string) string { return "def " + name + "():\n    return 1" }
+			}
+			for i := 0; i < 100; i++ {
+				source += declaration(fmt.Sprintf("GortexEditProbe000000000000002aN%03dBefore", i)) + "\n\n"
+			}
+			path := filepath.Join(root, file)
+			require.NoError(t, os.WriteFile(path, []byte(source), 0600))
+			require.NoError(t, s.indexer.IndexFile(path))
+			name := "GortexEditProbe000000000000002aN099Before"
+			id := file + "::" + name
+			args := map[string]any{"query": name, "query_class": "symbol", "expand": "off", "limit": 1000, "max_per_file": 0}
+			before := callTool(t, s, "search_symbols", args)
+			require.False(t, before.IsError)
+			beforeBody := unmarshalResult(t, before)
+			found := false
+			for _, raw := range beforeBody["results"].([]any) {
+				if raw.(map[string]any)["id"] == id {
+					found = true
+				}
+			}
+			require.True(t, found, "fixture must prove actual old ID was searchable before deletion")
+			s.facades.capture(mcpgo.NewTool("edit_symbol"), s.handleEditSymbol)
+			req := editOperationRequest("edit", "symbol")
+			req.Params.Arguments = map[string]any{"operation": "symbol", "target": map[string]any{"symbol": id}, "match": declaration(name), "replacement": "", "output": map[string]any{"format": "json"}}
+			result, err := s.boundToolHandler(func(ctx context.Context, r mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+				return s.handleFacade(ctx, "edit", r)
+			})(t.Context(), req)
+			require.NoError(t, err)
+			require.False(t, result.IsError)
+			after := callTool(t, s, "search_symbols", args)
+			require.False(t, after.IsError)
+			body := unmarshalResult(t, after)
+			require.Contains(t, body, "results")
+			results, _ := body["results"].([]any)
+			require.EqualValues(t, len(results), body["total"])
+			require.Equal(t, false, body["truncated"])
+			require.Empty(t, body["next_cursor"])
+			for _, raw := range results {
+				require.NotEqual(t, id, raw.(map[string]any)["id"], "complete fallback population retained deleted exact ID")
+			}
+		})
 	}
 }
