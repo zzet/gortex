@@ -2,9 +2,11 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
@@ -78,7 +80,54 @@ func TestMoveMeasurementUsesActualGoRelocationAndExplicitLanguageRefusal(t *test
 				}
 				require.NotEqual(t, oldID, edge["to"], "caller retained old location")
 			}
-			require.True(t, found, "unchanged Go caller must resolve the new declaration location")
+			rawOut, _ := json.Marshal(s.graph.GetOutEdges(file + "::StableCaller"))
+			require.True(t, found, "unchanged Go caller must resolve new location; chain=%v raw_out=%s", unmarshalResult(t, chain), string(rawOut))
 		})
 	}
+}
+
+func TestMoveMeasurementActualMultiIndexerPreservesUnchangedCaller(t *testing.T) {
+	s, _ := setupContractMultiRepoServer(t, "fixture")
+	t.Cleanup(func() {
+		s.DrainBackground()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, s.multiIndexer.Close(ctx))
+	})
+	root, ok := s.multiIndexer.RepoRoot("fixture")
+	require.True(t, ok)
+	sourcePath, targetPath := filepath.Join(root, "move_source.go"), filepath.Join(root, "move_target.go")
+	require.NoError(t, os.WriteFile(sourcePath, []byte("package main\nfunc Relocated() int { return 7 }\nfunc StableCaller() int { return Relocated() }\n"), 0600))
+	require.NoError(t, os.WriteFile(targetPath, []byte("package main\nfunc DestinationAnchor() int { return 2 }\n"), 0600))
+	_, err := s.multiIndexer.IncrementalReindexRepo("fixture", []string{sourcePath, targetPath})
+	require.NoError(t, err)
+	oldID, newID, callerID := "fixture/move_source.go::Relocated", "fixture/move_target.go::Relocated", "fixture/move_source.go::StableCaller"
+	require.NotNil(t, s.engineFor(t.Context()).GetSymbol(callerID), "actual caller must exist before move")
+	s.facades.capture(mcpgo.NewTool("move_symbol"), s.handleMoveSymbol)
+	req := editOperationRequest("refactor", "move")
+	req.Params.Arguments = map[string]any{"operation": "move", "target": map[string]any{"symbol": oldID}, "destination": "fixture/move_target.go", "output": map[string]any{"format": "json"}}
+	result, err := s.boundToolHandler(func(ctx context.Context, r mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		return s.handleFacade(ctx, "refactor", r)
+	})(t.Context(), req)
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+	source, err := os.ReadFile(sourcePath)
+	require.NoError(t, err)
+	require.Contains(t, string(source), "func StableCaller()")
+	require.Nil(t, s.engineFor(t.Context()).GetSymbol(oldID))
+	require.NotNil(t, s.engineFor(t.Context()).GetSymbol(newID))
+	chain := callTool(t, s, "get_call_chain", map[string]any{"id": callerID, "depth": 1, "limit": 1000})
+	require.False(t, chain.IsError)
+	body := unmarshalResult(t, chain)
+	edges, _ := body["edges"].([]any)
+	found := false
+	for _, raw := range edges {
+		edge := raw.(map[string]any)
+		if edge["from"] == callerID && edge["to"] == newID && edge["kind"] == "calls" {
+			found = true
+		}
+	}
+	caller, _ := json.Marshal(s.graph.GetNode(callerID))
+	rawOut, _ := json.Marshal(s.graph.GetOutEdges(callerID))
+	require.True(t, found, "multi move chain=%v caller=%s raw_out=%s source=%s", body, string(caller), string(rawOut), string(source))
 }
