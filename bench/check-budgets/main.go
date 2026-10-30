@@ -23,6 +23,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return laneCommand(args[0], args[1:], stdout, stderr)
 		case "history":
 			return historyCommand(args[1:], stdout, stderr)
+		case "main-artifact", "fetch-main":
+			return artifactCommand(args[0], args[1:], stdout, stderr)
 		}
 	}
 	f := flag.NewFlagSet("check-budgets", flag.ContinueOnError)
