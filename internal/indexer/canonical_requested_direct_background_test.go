@@ -36,7 +36,6 @@ func TestRequestedBackgroundOwnCallbackStartsAtObservedAdmission(t *testing.T) {
 			origin, arm := owner.origin, owner.armStart
 			owner.mu.Unlock()
 			require.False(t, origin.IsZero())
-			require.False(t, arm.Before(origin))
 			result := awaitMutationRetryResult(t, ticket)
 			require.NoError(t, result.Err)
 			require.Equal(t, ticket.Generation, result.AppliedGeneration)
@@ -45,6 +44,7 @@ func TestRequestedBackgroundOwnCallbackStartsAtObservedAdmission(t *testing.T) {
 			}
 			require.Eventually(t, func() bool { return record.RequestedBackground() != nil }, time.Second, time.Millisecond, "actual own requested callback/return must have its own B")
 			background := record.RequestedBackground()
+			require.False(t, arm.Before(origin))
 			require.Equal(t, "direct_requested_attempt", background.Coverage)
 			require.Equal(t, ticket.Generation, background.RequestedGeneration)
 			require.Equal(t, ticket.Generation, background.AppliedGeneration)
