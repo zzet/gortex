@@ -19,7 +19,7 @@ type callAncestorOracle struct {
 func (r callAncestorOracle) GetInEdges(id string) []*graph.Edge {
 	var out []*graph.Edge
 	for _, edge := range r.Reader.GetInEdges(id) {
-		if r.filter.Allows(edge, r.Reader.GetNode(edge.From), r.Reader.GetNode(edge.To)) {
+		if r.filter.Allows(edge, r.GetNode(edge.From), r.GetNode(edge.To)) {
 			out = append(out, edge)
 		}
 	}
