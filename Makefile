@@ -148,14 +148,16 @@ build-windows:
 # Marketplace plugin bundle
 # ---------------------------------------------------------------------------
 
-# claude-plugin regenerates the Anthropic Plugin Marketplace bundle at
-# claude-plugin/. The bundle is checked in so the marketplace's
-# "git-subdir" source can pull it directly. The CI guard
+# claude-plugin regenerates the Claude Code plugin marketplace at
+# claude-plugin/: .claude-plugin/marketplace.json plus the plugin under
+# plugins/gortex/. publish-claude-plugin.yml syncs it to
+# gortexhq/claude-plugin. The CI guard
 # (claude-plugin-check) asserts that re-running this target produces
 # no diff against what's checked in — drift means the bundle is stale
 # vs the source-of-truth content in
 # internal/agents/commands_bodies.go.
 claude-plugin: build
+	rm -rf ./claude-plugin
 	./$(BINARY) plugin emit --target ./claude-plugin --variant anthropic
 	@echo "✓ Regenerated claude-plugin/ from internal/agents commands"
 

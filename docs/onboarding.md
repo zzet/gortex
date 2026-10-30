@@ -17,6 +17,8 @@ Setup is split into two commands so codebase-agnostic machinery lives once per u
 
 You can run them independently — `gortex init` doesn't require `gortex install` first; it just writes less if the user-level wiring isn't there.
 
+Using Claude Code? Gortex also ships as a Claude Code plugin; see [Claude Code plugin](installation.md#claude-code-plugin) for how it fits with these two commands.
+
 ```bash
 # One-time: machine-wide user-level setup
 gortex install --start --track         # install, start daemon, track current dir

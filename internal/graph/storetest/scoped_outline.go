@@ -2,7 +2,9 @@ package storetest
 
 import (
 	"reflect"
+	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -43,6 +45,11 @@ func RunScopedOutline(t *testing.T, factory Factory) {
 		{From: "a/main", To: "b/main", Kind: graph.EdgeCalls},
 		{From: "a/main", To: "no-file", Kind: graph.EdgeImports},
 	}
+	for _, n := range nodes {
+		if strings.Contains(n.ID, "main") {
+			n.Name = "main"
+		}
+	}
 	s.AddBatch(nodes, edges)
 	ref := graph.New()
 	ref.AddBatch(nodes, edges)
@@ -60,6 +67,31 @@ func RunScopedOutline(t *testing.T, factory Factory) {
 		"mixed-allow":       {RepoAllow: map[string]bool{"a": true, "b": false}},
 	} {
 		t.Run(name, func(t *testing.T) {
+			if nodeReader, ok := s.(graph.ScopedOutlineNodeReader); ok {
+				ids := make([]string, 0, len(nodes)+1)
+				for _, n := range nodes {
+					ids = append(ids, n.ID)
+				}
+				ids = append(ids, "missing")
+				gotIDs, err := nodeReader.OutlineNodeIDsInScope(scope, ids)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantIDs, _ := ref.OutlineNodeIDsInScope(scope, ids)
+				slices.Sort(gotIDs)
+				slices.Sort(wantIDs)
+				if !slices.Equal(gotIDs, wantIDs) {
+					t.Fatalf("scoped membership=%v want %v", gotIDs, wantIDs)
+				}
+				gotNames, err := nodeReader.OutlineNodesByName(scope, "main")
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantNames, _ := ref.OutlineNodesByName(scope, "main")
+				if !slices.Equal(sortNodeIDs(gotNames), sortNodeIDs(wantNames)) {
+					t.Fatalf("scoped name IDs=%v want %v", sortNodeIDs(gotNames), sortNodeIDs(wantNames))
+				}
+			}
 			got, err := ag.ScopedOutlineCounts(scope)
 			if err != nil {
 				t.Fatal(err)

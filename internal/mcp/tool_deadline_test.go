@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -350,37 +352,56 @@ func TestFailsFastWhenTooManyHandlersAreStuck(t *testing.T) {
 // scheduled FreeOSMemory can land on top of the scan and nothing schedules
 // a release when it finishes.
 func TestResourceAndPromptHandlersJoinTheActivityBracket(t *testing.T) {
+	const childEnv = "GORTEX_TEST_ACTIVITY_BRACKET_CHILD"
+	if os.Getenv(childEnv) != "1" {
+		// The tracker is process-wide: other tests can still own background
+		// work. Reuse the bounded test-process pattern for exact ownership.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0],
+			"-test.run=^TestResourceAndPromptHandlersJoinTheActivityBracket$", "-test.count=1")
+		cmd.Env = append(os.Environ(), childEnv+"=1")
+		output, err := cmd.CombinedOutput()
+		require.NoErrorf(t, err, "activity-bracket subprocess failed (context=%v):\n%s", ctx.Err(), output)
+		return
+	}
+	t.Setenv("GORTEX_DAEMON_MEMRELEASE", "0")
+	// A legitimate non-MCP owner reproduces the old assertion's false leak:
+	// global activity must remain nonzero after our own bracket has ended.
+	runtimeactivity.Begin("analysis")
+	defer runtimeactivity.End("analysis")
+	require.EqualValues(t, 1, runtimeactivity.Current().Active)
 	s := &Server{logger: zap.NewNop()}
 
-	var duringResource int64
+	var duringResource runtimeactivity.Snapshot
 	resource := s.boundResourceHandler("gortex://probe",
 		func(context.Context, mcplib.ReadResourceRequest) ([]mcplib.ResourceContents, error) {
-			duringResource = runtimeactivity.Current().Active
+			duringResource = runtimeactivity.Current()
 			return nil, nil
 		})
 	if _, err := resource(context.Background(), mcplib.ReadResourceRequest{}); err != nil {
 		t.Fatalf("resource handler: %v", err)
 	}
-	if duringResource == 0 {
-		t.Error("resource handler ran outside the activity bracket")
-	}
-	if got := runtimeactivity.Current().Active; got != 0 {
-		t.Errorf("activity leaked after the resource returned: %d", got)
-	}
+	assert.EqualValues(t, 1, duringResource.ByKind["mcp"], "resource owns its bracket independently of background activity")
+	assert.EqualValues(t, 2, duringResource.Active)
+	afterResource := runtimeactivity.Current()
+	assert.Zero(t, afterResource.ByKind["mcp"], "resource bracket ended before return")
+	assert.EqualValues(t, 1, afterResource.ByKind["analysis"], "unrelated owner stays active")
+	assert.EqualValues(t, 1, afterResource.Active, "nonzero process activity is not an owned resource leak")
 
-	var duringPrompt int64
+	var duringPrompt runtimeactivity.Snapshot
 	prompt := s.boundPromptHandler("probe",
 		func(context.Context, mcplib.GetPromptRequest) (*mcplib.GetPromptResult, error) {
-			duringPrompt = runtimeactivity.Current().Active
+			duringPrompt = runtimeactivity.Current()
 			return &mcplib.GetPromptResult{}, nil
 		})
 	if _, err := prompt(context.Background(), mcplib.GetPromptRequest{}); err != nil {
 		t.Fatalf("prompt handler: %v", err)
 	}
-	if duringPrompt == 0 {
-		t.Error("prompt handler ran outside the activity bracket")
-	}
-	if got := runtimeactivity.Current().Active; got != 0 {
-		t.Errorf("activity leaked after the prompt returned: %d", got)
-	}
+	assert.EqualValues(t, 1, duringPrompt.ByKind["mcp"], "prompt owns its bracket independently of background activity")
+	assert.EqualValues(t, 2, duringPrompt.Active)
+	afterPrompt := runtimeactivity.Current()
+	assert.Zero(t, afterPrompt.ByKind["mcp"], "prompt bracket ended before return")
+	assert.EqualValues(t, 1, afterPrompt.ByKind["analysis"], "unrelated owner stays active")
+	assert.EqualValues(t, 1, afterPrompt.Active, "nonzero process activity is not an owned prompt leak")
 }

@@ -121,6 +121,8 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 	// through json_each joins, which cannot imply a repo_prefix <> '' partial
 	// predicate, and empty-prefix rows remain part of the Store query contract.
 	{"nodes_by_repo", `CREATE INDEX IF NOT EXISTS nodes_by_repo ON nodes(repo_prefix, view_gen)`},
+	{"nodes_by_effective_workspace", nodesByEffectiveWorkspaceDDL},
+	{"nodes_deadcode_eligible_workspace", nodesDeadCodeEligibleWorkspaceDDL},
 	// Resolver warmup selects definitions by exact repository, compatible
 	// language family, and a bounded page of names. Keep the key minimal: kind
 	// is not a query predicate and WITHOUT ROWID secondary indexes already

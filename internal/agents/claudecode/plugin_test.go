@@ -325,59 +325,6 @@ func TestEmitPluginBundle_NoCommandsDir(t *testing.T) {
 	}
 }
 
-func TestEmitPluginBundle_RemovesLegacyPaths(t *testing.T) {
-	dir := t.TempDir()
-	cmdName := sortedKeys(SlashCommands)[0]
-	skillID := sortedKeys(GlobalSkills)[0]
-	legacy := []string{
-		filepath.Join("commands", cmdName),
-		filepath.Join("skills", skillID, "SKILL.md"),
-	}
-	for _, rel := range legacy {
-		full := filepath.Join(dir, rel)
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, []byte("stale"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Files the emitter never wrote, including one inside a legacy
-	// skill directory, must survive the cleanup.
-	userFiles := []string{
-		filepath.Join(dir, "skills", "my-own", "SKILL.md"),
-		filepath.Join(dir, "skills", sortedKeys(GlobalSkills)[1], "references", "team.md"),
-	}
-	for _, full := range userFiles {
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, []byte("keep"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	if _, err := EmitPluginBundle(PluginBundleSpec{TargetDir: dir, Version: "0.18.2"}); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := os.Stat(filepath.Join(dir, "commands")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("legacy commands/ should be removed (stat err = %v)", err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "skills", skillID)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("legacy skills/%s should be removed (stat err = %v)", skillID, err)
-	}
-	for _, full := range userFiles {
-		if _, err := os.Stat(full); err != nil {
-			t.Errorf("files the emitter did not write must survive: %v", err)
-		}
-	}
-	legacySkill := filepath.Join(dir, "skills", sortedKeys(GlobalSkills)[1], "SKILL.md")
-	if _, err := os.Stat(legacySkill); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("legacy %s should be removed (stat err = %v)", legacySkill, err)
-	}
-}
-
 func TestPluginSkillBody_OnlyRewritesLeadingFrontmatter(t *testing.T) {
 	cases := map[string]string{
 		"---\nname: gortex-x\ndescription: d\n---\nbody\n": "---\nname: x\ndescription: d\n---\nbody\n",

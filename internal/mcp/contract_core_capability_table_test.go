@@ -190,6 +190,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"CrossRepoEdgeAggregator", capOf[graph.CrossRepoEdgeAggregator], capDropped, capReasonEdges},
 		{"ExtractCandidatesScanner", capOf[graph.ExtractCandidatesScanner], capDropped, capReasonEdges},
 		{"FileImportAggregator", capOf[graph.FileImportAggregator], capDropped, capReasonEdges},
+		{"ScopedOutlineNodeReader", capOf[graph.ScopedOutlineNodeReader], capSelected, "node-only membership and scoped exact-name reads retain selected-view visibility"},
 		{"ScopedOutlineAggregator", capOf[graph.ScopedOutlineAggregator], capDropped, capReasonEdges + " (scopedOutlineCountsFor uses the private filtered adapter instead)"},
 		{"FilteredScopedOutlineAggregator", capOf[graph.FilteredScopedOutlineAggregator], capDropped, "served only by the private outline adapter, which supplies this wrapper's exact exclusions"},
 		{"FileImporters", capOf[graph.FileImporters], capDropped, capReasonEdges},
@@ -197,6 +198,10 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"FileSubGraphCountReader", capOf[graph.FileSubGraphCountReader], capDropped, capReasonEdges},
 		{"ThrowerErrorSurfacer", capOf[graph.ThrowerErrorSurfacer], capDropped, capReasonEdges},
 		// Probed by internal/analysis on readers mcp builds from readerFor.
+		{"ScopedDeadCodeReader", capOf[graph.ScopedDeadCodeReader], capWrapper, "recomputes scoped candidates and interface evidence through exact adjacency exclusions"},
+		{"NodeScopedDeadCodeReader", capOf[graph.NodeScopedDeadCodeReader], capWrapper, "intersects exact metadata scope before dead-code usage work with the selected adjacency mask"},
+		{"FilteredNodeScopedDeadCodeReader", capOf[graph.FilteredNodeScopedDeadCodeReader], capDropped, "private exact-scope adapter receives this wrapper's exclusions, never a raw backend query"},
+		{"FilteredScopedDeadCodeReader", capOf[graph.FilteredScopedDeadCodeReader], capDropped, "private adapter supplies this wrapper's exact exclusions; never exposed as raw filtered backend"},
 		{"DeadCodeCandidator", capOf[graph.DeadCodeCandidator], capDropped, capReasonEdges + " (zero-inbound candidates; FindDeadCode walks filtered edges)"},
 		{"InDegreeForNodes", capOf[graph.InDegreeForNodes], capDropped, capReasonEdges + " (in-degrees count hidden endpoints)"},
 		{"IfaceImplementsScanner", capOf[graph.IfaceImplementsScanner], capDropped, capReasonEdges + " (implements rows)"},

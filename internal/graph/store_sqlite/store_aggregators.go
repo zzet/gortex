@@ -111,13 +111,14 @@ func (s *Store) InEdgeCountsByKind(kinds []graph.EdgeKind) map[string]int {
 // NodeIDsByKinds returns the deduplicated IDs of every node whose kind
 // is in the supplied set.
 func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
+	ctx := s.readContext()
 	_, args := aggDedupeNodeKinds(kinds)
 	if len(args) == 0 {
 		return nil
 	}
 	q := `SELECT id FROM nodes WHERE kind IN (` + inPlaceholders(len(args)) + `) AND view_gen = ? ORDER BY id`
-	rows, err := s.db.Query(q, append(args, s.viewGen)...)
-	panicOnFatal(err)
+	rows, err := s.db.QueryContext(ctx, q, append(args, s.viewGen)...)
+	analysisProjectionReadError(ctx, err)
 	if rows == nil {
 		// swallowed teardown-race error: read returns empty (see panicOnFatal)
 		return nil
@@ -126,10 +127,10 @@ func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
 	var out []string
 	for rows.Next() {
 		var id string
-		panicOnFatal(rows.Scan(&id))
+		analysisProjectionReadError(ctx, rows.Scan(&id))
 		out = append(out, id)
 	}
-	panicOnFatal(rows.Err())
+	analysisProjectionReadError(ctx, rows.Err())
 	return out
 }
 
@@ -678,7 +679,7 @@ func (s *Store) NodesByKindsContext(ctx context.Context, kinds []graph.NodeKind)
 // cancelled ctx is returned as an error, never a panic; other failures go
 // through panicOnFatal like every node reader.
 func (s *Store) scanNodePage(ctx context.Context, q string, args ...any) ([]*graph.Node, int, string, error) {
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := outlineRows(ctx, s.db, outlineQuery{sql: q, args: args})
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, 0, "", ctx.Err()
@@ -730,6 +731,7 @@ func nodesByKindsPageSQL(kinds int) string {
 // kind is in edgeKinds and whose endpoints both have a kind in
 // nodeKinds; honours early-stop. Empty kinds yields nothing.
 func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []graph.NodeKind) iter.Seq[[2]string] {
+	ctx := s.readContext()
 	_, eArgs := aggDedupeEdgeKinds(edgeKinds)
 	_, nArgs := aggDedupeNodeKinds(nodeKinds)
 	return func(yield func([2]string) bool) {
@@ -748,8 +750,8 @@ func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []gr
 			AND nf.kind IN (` + inPlaceholders(len(nArgs)) + `)
 			AND nt.kind IN (` + inPlaceholders(len(nArgs)) + `)
 			AND e.view_gen = ?`
-		rows, err := s.db.Query(q, args...)
-		panicOnFatal(err)
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		analysisProjectionReadError(ctx, err)
 		if rows == nil {
 			// swallowed teardown-race error: read returns empty (see panicOnFatal)
 			return
@@ -757,12 +759,12 @@ func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []gr
 		defer rows.Close()
 		for rows.Next() {
 			var from, to string
-			panicOnFatal(rows.Scan(&from, &to))
+			analysisProjectionReadError(ctx, rows.Scan(&from, &to))
 			if !yield([2]string{from, to}) {
 				return
 			}
 		}
-		panicOnFatal(rows.Err())
+		analysisProjectionReadError(ctx, rows.Err())
 	}
 }
 
@@ -819,6 +821,7 @@ func (s *Store) NodeDegreeCounts(ids []string, usageKinds []graph.EdgeKind) []gr
 // and fan-out (outgoing edges in fanOutKinds) for the supplied id set.
 // Unknown ids produce no row; duplicates collapse.
 func (s *Store) NodeFanCounts(ids []string, fanInKinds, fanOutKinds []graph.EdgeKind) []graph.NodeFanRow {
+	ctx := s.readContext()
 	uniq := dedupeNonEmpty(ids)
 	if len(uniq) == 0 {
 		return nil
@@ -853,18 +856,18 @@ func (s *Store) NodeFanCounts(ids []string, fanInKinds, fanOutKinds []graph.Edge
 		args = append(args, outInline...)
 		args = append(args, toAnyArgs(chunk)...)
 		args = append(args, s.viewGen)
-		rows, err := s.db.Query(q, args...)
-		panicOnFatal(err)
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		analysisProjectionReadError(ctx, err)
 		if rows == nil {
 			// swallowed teardown-race error: read returns empty (see panicOnFatal)
 			return out
 		}
 		for rows.Next() {
 			var r graph.NodeFanRow
-			panicOnFatal(rows.Scan(&r.NodeID, &r.FanIn, &r.FanOut))
+			analysisProjectionReadError(ctx, rows.Scan(&r.NodeID, &r.FanIn, &r.FanOut))
 			out = append(out, r)
 		}
-		panicOnFatal(rows.Err())
+		analysisProjectionReadError(ctx, rows.Err())
 		_ = rows.Close()
 	}
 	return out
@@ -877,13 +880,14 @@ func (s *Store) NodeFanCounts(ids []string, fanInKinds, fanOutKinds []graph.Edge
 // community map returns nil. The community comparison runs Go-side
 // because community membership is not a node column.
 func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[string]string) map[string]int {
+	ctx := s.readContext()
 	_, args := aggDedupeEdgeKinds(kinds)
 	if len(args) == 0 || len(nodeToComm) == 0 {
 		return nil
 	}
 	q := `SELECT from_id, to_id FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `) AND view_gen = ?`
-	rows, err := s.db.Query(q, append(args, s.viewGen)...)
-	panicOnFatal(err)
+	rows, err := s.db.QueryContext(ctx, q, append(args, s.viewGen)...)
+	analysisProjectionReadError(ctx, err)
 	if rows == nil {
 		// swallowed teardown-race error: read returns empty (see panicOnFatal)
 		return nil
@@ -892,7 +896,7 @@ func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[
 	out := make(map[string]int)
 	for rows.Next() {
 		var from, to string
-		panicOnFatal(rows.Scan(&from, &to))
+		analysisProjectionReadError(ctx, rows.Scan(&from, &to))
 		fromComm, ok := nodeToComm[from]
 		if !ok {
 			continue
@@ -905,7 +909,7 @@ func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[
 			out[from]++
 		}
 	}
-	panicOnFatal(rows.Err())
+	analysisProjectionReadError(ctx, rows.Err())
 	if len(out) == 0 {
 		return nil
 	}

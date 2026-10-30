@@ -2,7 +2,6 @@ package claudecode
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,7 +43,7 @@ const (
 
 // pluginAuthorName / pluginAuthorEmail / pluginHomepage are the
 // fields baked into every plugin.json. They are package-level so the
-// marketplace.json submission script can read the same values
+// marketplace.json emitter (EmitMarketplace) reads the same values
 // without re-deriving them.
 const (
 	pluginName        = "gortex"
@@ -204,10 +203,21 @@ This plugin assumes the ` + "`gortex`" + ` binary is on PATH. Install it via:
 ` + "```sh\ncurl -fsSL https://get.gortex.dev | sh\n```" + `
 
 The installer fetches a signed release tarball, verifies cosign + SHA256,
-installs to ` + "`~/.local/bin`" + ` (or ` + "`/usr/local/bin`" + `), and runs ` + "`gortex install`" + `
-+ ` + "`gortex init`" + `. Homebrew users on macOS can also use:
+and installs to ` + "`~/.local/bin`" + ` (or ` + "`/usr/local/bin`" + `). Homebrew users on macOS
+can also use:
 
 ` + "```sh\nbrew install zzet/tap/gortex\n```" + `
+
+Then add the marketplace and install the plugin:
+
+` + "```sh\nclaude plugin marketplace add gortexhq/claude-plugin\nclaude plugin install gortex@gortex\n```" + `
+
+The plugin covers Claude Code's MCP server, workflow skills, sub-agents and
+hooks. Running ` + "`gortex install`" + ` and ` + "`gortex init`" + ` for Claude Code as well
+registers Gortex twice, which duplicates them. To avoid that, pass
+` + "`--agents-skip claude-code`" + ` to both. This also skips the CLAUDE.md blocks and
+the per-repo community skills under ` + "`.claude/skills/generated/`" + `, which the
+plugin does not provide.
 
 ## What this plugin adds
 
@@ -258,8 +268,8 @@ Copyright 2024-2026 Andrey Kumanyaev <me@zzet.org>
 // Single source of truth: skills come from agents.GlobalSkills, reused
 // from the agents package without duplication, so a change to a skill's
 // body flows through both the user-level install (~/.claude/skills/) and
-// the marketplace plugin (claude-plugin/skills/) on the next emit. Only
-// the skill name differs; see pluginSkillName.
+// the marketplace plugin (claude-plugin/plugins/gortex/skills/) on the
+// next emit. Only the skill name differs; see pluginSkillName.
 func EmitPluginBundle(spec PluginBundleSpec) ([]string, error) {
 	if spec.LayoutVariant == "" {
 		spec.LayoutVariant = LayoutVariantAnthropic
@@ -322,13 +332,6 @@ func EmitPluginBundle(spec PluginBundleSpec) ([]string, error) {
 
 	// 4. .mcp.json
 	if err := write(".mcp.json", []byte(pluginMCPJSON), 0o644); err != nil {
-		return nil, err
-	}
-
-	// Bundles from before this layout also carried commands/ and
-	// prefixed skills/gortex-*/ directories. Remove those generated paths
-	// so emitting over an old bundle does not list every workflow twice.
-	if err := removeLegacyPluginPaths(spec.TargetDir); err != nil {
 		return nil, err
 	}
 
@@ -423,35 +426,6 @@ func pluginSkillBody(body, name string) string {
 		}
 	}
 	return strings.Join(lines, "")
-}
-
-// removeLegacyPluginPaths deletes the files an older emit wrote:
-// commands/<name> for every slash command and skills/<id>/SKILL.md for
-// every skill whose plugin name now drops the gortex- prefix. Only those
-// files are deleted; their directories go only once empty, so files
-// someone added next to them survive.
-func removeLegacyPluginPaths(targetDir string) error {
-	stale := make([]string, 0, len(SlashCommands)+len(GlobalSkills))
-	dirs := []string{"commands"}
-	for _, name := range sortedKeys(SlashCommands) {
-		stale = append(stale, filepath.Join("commands", name))
-	}
-	for _, id := range sortedKeys(GlobalSkills) {
-		if pluginSkillName(id) != id {
-			stale = append(stale, filepath.Join("skills", id, "SKILL.md"))
-			dirs = append(dirs, filepath.Join("skills", id))
-		}
-	}
-	for _, rel := range stale {
-		if err := os.Remove(filepath.Join(targetDir, rel)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove stale %s: %w", rel, err)
-		}
-	}
-	for _, rel := range dirs {
-		// Fails harmlessly when the directory is absent or not empty.
-		_ = os.Remove(filepath.Join(targetDir, rel))
-	}
-	return nil
 }
 
 // marshalJSONStable returns indented JSON with sorted keys at every
