@@ -2,6 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
 	"strings"
 )
 
@@ -58,4 +62,51 @@ func (c *editProbeCaller) expectedAbsence(data json.RawMessage, identity wireCal
 		return &editProbeExpectedAbsence{symbol: scoped, message: message}
 	}
 	return nil
+}
+
+// Before-state proof is obtained on the same bound prober session during
+// untimed setup. A not-found response cannot establish its own applicability.
+func editProbePresenceProof(raw json.RawMessage, c Corpus, logical string) bool {
+	separator := strings.LastIndex(logical, "::")
+	if separator < 1 || logical[:separator] != c.File || !token.IsIdentifier(logical[separator+2:]) {
+		return false
+	}
+	if checkToolResult(raw) != nil {
+		return false
+	}
+	body, err := decodeEditProbeResult(raw)
+	if err != nil {
+		return false
+	}
+	name := logical[separator+2:]
+	id, _ := body["id"].(string)
+	path, _ := body["file_path"].(string)
+	source, _ := body["source"].(string)
+	if !editProbeSourceID(id, c.File, name) || !editProbeFixturePath(path, c.File) || body["name"] != name {
+		return false
+	}
+	switch filepath.Ext(c.File) {
+	case ".ts":
+		valid, correct := editProbeTypeScriptFixture(source, name, "")
+		return valid && correct
+	case ".py":
+		valid, correct := editProbePythonFixture(source, name, "")
+		return valid && correct
+	case ".go":
+		parsed, err := parser.ParseFile(token.NewFileSet(), "before.go", source, 0)
+		if err != nil {
+			parsed, err = parser.ParseFile(token.NewFileSet(), "before.go", "package fixture\n"+source, 0)
+		}
+		if err != nil {
+			return false
+		}
+		count := 0
+		for _, decl := range parsed.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == name && fn.Body != nil {
+				count++
+			}
+		}
+		return count == 1
+	}
+	return false
 }
