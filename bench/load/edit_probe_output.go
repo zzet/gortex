@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 
 	toon "github.com/toon-format/toon-go"
@@ -85,4 +86,50 @@ func editProbeTOONNumbersSafe(value any) bool {
 		}
 	}
 	return true
+}
+
+func editProbeOutputMode(c Corpus) (string, error) {
+	switch c.EditOutput {
+	case "", "json":
+		return "json", nil
+	case "toon":
+		return "toon", nil
+	default:
+		return "", fmt.Errorf("unsupported edit output mode %q (want json or toon)", c.EditOutput)
+	}
+}
+func editProbeRequestOutput(req request) string {
+	output, exists := req.Arguments["output"]
+	if !exists {
+		return "json"
+	}
+	fields, ok := output.(map[string]any)
+	if !ok {
+		return "invalid"
+	}
+	format, exists := fields["format"]
+	if !exists {
+		return "json"
+	}
+	value, ok := format.(string)
+	if !ok {
+		return "invalid"
+	}
+	return value
+}
+func editProbeWithOutput(req request, format string) request {
+	if format == "toon" {
+		req.Arguments = copyJSON(req.Arguments)
+		req.Arguments["output"] = map[string]any{"format": "toon", "max_bytes": 0}
+	}
+	return req
+}
+func editProbeOutputOracles(c Corpus, oracles []editProbeOracle) []editProbeOracle {
+	if c.EditOutput != "toon" {
+		return oracles
+	}
+	for i := range oracles {
+		oracles[i].call = editProbeWithOutput(oracles[i].call, "toon")
+	}
+	return oracles
 }

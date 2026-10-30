@@ -124,7 +124,10 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if plan.Language == "python" {
 		language = "Python"
 	}
-	out := &editProbeReport{Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/%s/%s/JSON cell only", language, plan.Kind, plan.Tool), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
+	out := &editProbeReport{Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
+	if plan.Mode == "toon" {
+		out.Limitations = append(out.Limitations, "TOON is evaluated from the requested text, never a structured JSON sibling; setup, timing-status and restore controls remain explicit JSON with exact numeric handling", "TOON compact subgraphs omit JSON total_nodes/full untrimmed total_edges and signature metadata; omitted fields are not synthesized")
+	}
 	for _, step := range plan.Steps {
 		out.Records = append(out.Records, newEditProbeRecord(c, step))
 	}
@@ -424,7 +427,7 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 	if !identity.WriteStarted.IsZero() {
 		sent = identity.WriteStarted
 	}
-	body, decodeErr := decodeEditProbeResult(data)
+	body, decodeErr := decodeEditProbeOutput(data, editProbeRequestOutput(oracle.call), oracle.call.name())
 	absence, exactRefusal := err.(*editProbeExpectedAbsence)
 	expectedAbsence := oracle.call.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == r.p.Repos[0].Prefix+"/"+oracle.call.ExpectedAbsentSymbol
 	correct := expectedAbsence || err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, r.p.Repos[0].Corpus, s.step, r.plan.Callee)
@@ -528,7 +531,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.mu.Unlock()
 		return
 	}
-	body, err := decodeEditProbeResult(ack)
+	body, err := decodeEditProbeOutput(ack, r.plan.Mode, r.plan.Tool)
 	if err != nil {
 		s.mu.Lock()
 		s.record.Outcome = "invalid_ack"
@@ -623,9 +626,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			req.Operation = "file"
 			req.Arguments["operation"] = "file"
 		}
+		req = editProbeWithOutput(req, r.plan.Mode)
 		begin := time.Now()
 		raw, identity, readErr := r.perform(callCtx, s, r.editor, req, "readback:"+kind, "readback", 100+index)
-		payload, decodeErr := decodeEditProbeResult(raw)
+		payload, decodeErr := decodeEditProbeOutput(raw, editProbeRequestOutput(req), req.name())
 		back := editProbeReadback{Kind: kind, Latency: unavailable("ms", "response endpoint unavailable"), Correct: readErr == nil && decodeErr == nil && editProbeCorrect(kind, payload, r.p.Repos[0].Corpus, step, r.plan.Callee)}
 		if !identity.Finished.IsZero() {
 			back.Latency = measured(float64(identity.Finished.Sub(begin))/float64(time.Millisecond), "ms")

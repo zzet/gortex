@@ -57,6 +57,7 @@ type Corpus struct {
 	EditTemplate           string `json:"edit_template"`
 	EditAnchor             string `json:"edit_anchor"`
 	EditTool               string `json:"edit_tool,omitempty"`
+	EditOutput             string `json:"edit_output,omitempty"`
 	EditKind               string `json:"edit_kind,omitempty"`
 	EditCallee             string `json:"edit_callee,omitempty"`
 	EditBeforeTemplate     string `json:"edit_before_template,omitempty"`

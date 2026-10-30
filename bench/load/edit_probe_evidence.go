@@ -21,13 +21,13 @@ type editProbeOracle struct {
 
 func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
 	if step.Relocated {
-		return editProbeMoveOracles(c, step)
+		return editProbeOutputOracles(c, editProbeMoveOracles(c, step))
 	}
 	if step.TargetSymbol != "" {
-		return editProbeBodyOracles(c, step)
+		return editProbeOutputOracles(c, editProbeBodyOracles(c, step))
 	}
 	if step.Deleted {
-		return editProbeDeleteOracles(c, step)
+		return editProbeOutputOracles(c, editProbeDeleteOracles(c, step))
 	}
 	marker := map[string]any{"symbol": c.File + "::" + step.Marker}
 	file := map[string]any{"file": c.File}
@@ -49,7 +49,7 @@ func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
 	if step.BeforeSymbol != "" {
 		oracles = append(oracles, editProbeOracle{name: "old_source_absent", call: request{Tool: "read", Operation: "source", ExpectedAbsentSymbol: step.BeforeSymbol, Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}}})
 	}
-	return oracles
+	return editProbeOutputOracles(c, oracles)
 }
 
 func decodeEditProbeResult(raw json.RawMessage) (map[string]any, error) {

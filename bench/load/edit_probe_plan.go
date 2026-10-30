@@ -63,6 +63,10 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if count != 1 && count != 100 {
 		return editProbePlan{}, errors.New("edit-and-probe requires 100 edits, or explicit 1-edit diagnostic")
 	}
+	mode, err := editProbeOutputMode(c)
+	if err != nil {
+		return editProbePlan{}, err
+	}
 	tool, err := editProbeTool(c)
 	if err != nil {
 		return editProbePlan{}, err
@@ -154,7 +158,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 			return editProbePlan{}, errors.New("template must declare the unique marker function and actually call the selected intrafile callee")
 		}
 	}
-	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: kind, Tool: tool, Language: language, Mode: "json", Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", "native save/create/delete/hotfile/restart", "largest-file/reference configurations require their own reviewed manifest"}}
+	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: kind, Tool: tool, Language: language, Mode: mode, Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", "native save/create/delete/hotfile/restart", "largest-file/reference configurations require their own reviewed manifest"}}
 	if kind == "change_signature" && language != "go" {
 		p.NotSelected = append(p.NotSelected, "parameter detail is proved by exact source; native TS/Python signature metadata omits it and graph freshness uses the relative line witness")
 	}
@@ -260,6 +264,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		if tool != "edit.batch" && tool != "refactor.move" {
 			r.Arguments["options"] = map[string]any{"mutation_id": id}
 		}
+		r = editProbeWithOutput(r, mode)
 		hash, err := hashJSON(r)
 		if err != nil {
 			return editProbePlan{}, err
