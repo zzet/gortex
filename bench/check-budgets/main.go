@@ -20,6 +20,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		switch args[0] {
 		case "plan", "collect":
 			return laneCommand(args[0], args[1:], stdout, stderr)
+		case "history":
+			return historyCommand(args[1:], stdout, stderr)
 		}
 	}
 	f := flag.NewFlagSet("check-budgets", flag.ContinueOnError)
