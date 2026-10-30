@@ -142,7 +142,7 @@ func TestMainArtifactExtractionChecksDigestIdentityAndSafeFiles(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if info.Mode().Perm() != 0o700 {
+			if runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
 				t.Fatal("download lost executable/owned-only mode")
 			}
 			if err := extractMainArtifact(selection, archive, out); err == nil {
