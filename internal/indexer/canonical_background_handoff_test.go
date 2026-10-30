@@ -38,7 +38,7 @@ func TestRequestedBackgroundAccumulatesActualOrderedHandoffsNotGenerationDelta(t
 	require.False(t, b.invalid)
 	require.Equal(t, uint64(2), b.handoffs)
 	require.Equal(t, uint64(90), b.current)
-	require.Equal(t, [7]int64{1, 1, 1, 2, 2, 2, 2}, b.phases)
+	require.Equal(t, [8]int64{1, 1, 1, 2, 2, 2, 2, 0}, b.phases)
 	require.Equal(t, backgroundExecuting, b.stage)
 }
 
