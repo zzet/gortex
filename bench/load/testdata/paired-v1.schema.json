@@ -59,6 +59,9 @@
                 "edit_kind": {
                   "type": "string"
                 },
+                "edit_output": {
+                  "type": "string"
+                },
                 "edit_template": {
                   "type": "string"
                 },
