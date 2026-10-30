@@ -32,6 +32,9 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 			if payload, handled := s.batchAcknowledgementReceiptPayload(ctx, receipt); handled {
 				return s.respondJSONOrTOON(ctx, req, payload)
 			}
+			if payload, handled := s.batchFileObservationPayload(ctx, receipt); handled {
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
 			if payload, found := s.graphRefreshReceiptPayload(ctx, receipt); found {
 				return s.respondJSONOrTOON(ctx, req, payload)
 			}

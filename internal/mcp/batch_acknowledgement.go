@@ -78,8 +78,9 @@ func (s *Server) batchAcknowledgementReceiptPayload(ctx context.Context, id stri
 // absence explicitly rather than borrowing a retry/status call's own clock.
 type batchAcknowledgementResponse struct {
 	batchTransactionReceipt
-	AcknowledgementReceipt string `json:"acknowledgement_receipt,omitempty"`
-	AcknowledgementState   string `json:"acknowledgement_state"`
+	AcknowledgementReceipt string                          `json:"acknowledgement_receipt,omitempty"`
+	AcknowledgementState   string                          `json:"acknowledgement_state"`
+	FileObservations       []batchFileObservationReference `json:"file_observations,omitempty"`
 }
 
 func (s *Server) batchAcknowledgementResponse(receipt batchTransactionReceipt) batchAcknowledgementResponse {
@@ -94,6 +95,7 @@ func (s *Server) batchAcknowledgementResponse(receipt batchTransactionReceipt) b
 			}
 		}
 	}
+	result.FileObservations = s.batchFileObservationReferences(receipt)
 	return result
 }
 

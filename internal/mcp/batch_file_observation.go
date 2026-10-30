@@ -6,6 +6,9 @@ import (
 	"encoding/hex"
 	"os"
 	"strconv"
+	"strings"
+
+	"github.com/zzet/gortex/internal/indexer"
 	"time"
 
 	"github.com/zzet/gortex/internal/pathkey"
@@ -149,4 +152,72 @@ func (s *Server) bindBatchFilePublication(record *mutationCommitRecord, outcome 
 	}
 	record.reindexReceipt, record.reindexGeneration = outcome.Receipt, outcome.Generation
 	record.graph, record.graphRecorded = graphStatusFor(outcome), true
+}
+
+// This explicit timing-only variant never substitutes for the durable batch
+// status. In particular a successful writer return is not a transaction ACK.
+func (s *Server) batchFileObservationPayload(ctx context.Context, id string) (map[string]any, bool) {
+	if !strings.HasPrefix(id, "batch-file-") {
+		return nil, false
+	}
+	payload := map[string]any{"found": false, "receipt": id, "receipt_kind": "batch_file_observation",
+		"guidance": "timing only; query transaction_id for durable batch and per-file publication outcomes"}
+	checkout, incarnation := mutationCheckoutScope(ctx)
+	ledger := &s.mutationCommits
+	ledger.mu.Lock()
+	record := ledger.byID[id]
+	var publication *indexer.PublicationPhaseRecord
+	var committed time.Time
+	var ticket string
+	var repair *mutationReadRepairObservation
+	if record != nil {
+		record.mu.RLock()
+		if record.kind == batchFileObservationCommit && record.owner == s &&
+			mutationCheckoutScopeMatches(checkout, incarnation, record.checkoutID, record.checkoutIncarnation) {
+			payload["found"], payload["transaction_id"], payload["path"] = true, record.key, record.relPath
+			payload["batch_disk_verdict"] = record.disk
+			if record.newSHA != "" {
+				payload["after_sha256"] = hex.EncodeToString(record.batchAfterSHA256[:])
+				payload["new_sha"] = record.newSHA
+			}
+			payload["publication_receipt"], payload["publication_generation"] = record.reindexReceipt, record.reindexGeneration
+			payload["writer_return_observed"] = !record.committedAt.IsZero()
+			publication, committed, ticket = record.publication, record.committedAt, record.reindexReceipt
+			if record.readRepair != nil {
+				copy := *record.readRepair
+				repair = &copy
+			}
+		}
+		record.mu.RUnlock()
+	}
+	ledger.mu.Unlock()
+	attachMutationPhaseTimings(payload, ticket, committed, indexer.PublicationSourceMCPEdit, publication)
+	if repair != nil {
+		payload["read_assisted_publication"] = repair.payload()
+	}
+	payload["acknowledgement_state"] = "not_applicable_shared_transaction_rpc"
+	return payload, true
+}
+
+type batchFileObservationReference struct {
+	Path    string `json:"path"`
+	Receipt string `json:"receipt"`
+}
+
+func (s *Server) batchFileObservationReferences(transaction batchTransactionReceipt) []batchFileObservationReference {
+	ledger := &s.mutationCommits
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	for i := len(ledger.ordered) - 1; i >= 0; i-- {
+		record := ledger.ordered[i]
+		record.mu.RLock()
+		match := record.kind == batchFileObservationCommit && record.owner == s && ledger.byID[record.id] == record &&
+			record.key == transaction.TransactionID && record.fingerprint == transaction.Fingerprint
+		reference := batchFileObservationReference{Path: record.relPath, Receipt: record.id}
+		record.mu.RUnlock()
+		if match {
+			return []batchFileObservationReference{reference}
+		}
+	}
+	return nil
 }
