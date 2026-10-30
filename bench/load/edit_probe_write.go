@@ -17,7 +17,7 @@ func editProbeTool(c Corpus) (string, error) {
 	}
 	switch tool {
 	case "edit.file":
-		if c.EditKind == "rename" || c.EditKind == "delete" || c.EditKind == "modify_body" || c.EditKind == "modify_caller_body" {
+		if c.EditKind == "rename" || c.EditKind == "delete" || c.EditKind == "modify_body" || c.EditKind == "modify_caller_body" || c.EditKind == "change_signature" {
 			if err := editProbeInitialFixture(c); err != nil {
 				return "", err
 			}
@@ -74,7 +74,7 @@ func editProbeWriteRequest(c Corpus, content, marker string) (request, string) {
 // Check the immutable plan against the actual pinned clone before opening any
 // per-edit probe sessions or dispatching edits. This does not refresh intent.
 func editProbeWriteAdmission(c Corpus, original []byte) error {
-	if (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol" || c.EditKind == "rename" || c.EditKind == "delete" || c.EditKind == "modify_body" || c.EditKind == "modify_caller_body") && !bytes.Equal(original, []byte(c.EditInitialContent)) {
+	if (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol" || c.EditKind == "rename" || c.EditKind == "delete" || c.EditKind == "modify_body" || c.EditKind == "modify_caller_body" || c.EditKind == "change_signature") && !bytes.Equal(original, []byte(c.EditInitialContent)) {
 		return errors.New("initial content differs from the pinned edit fixture bytes")
 	}
 	return nil

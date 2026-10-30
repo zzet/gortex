@@ -20,7 +20,7 @@ func editProbeFollowingDeclaration(file, name string) string {
 func editProbeBodyOracles(c Corpus, step editProbeStep) []editProbeOracle {
 	target := map[string]any{"symbol": step.TargetSymbol}
 	file := map[string]any{"file": c.File}
-	return []editProbeOracle{
+	oracles := []editProbeOracle{
 		{"source", request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": target}}},
 		{"summary", request{Tool: "read", Operation: "summary", Arguments: map[string]any{"operation": "summary", "target": file}}},
 		{"editing_context", request{Tool: "read", Operation: "editing_context", Arguments: map[string]any{"operation": "editing_context", "target": file}}},
@@ -29,6 +29,10 @@ func editProbeBodyOracles(c Corpus, step editProbeStep) []editProbeOracle {
 		{"callers", request{Tool: "relations", Operation: "callers", Arguments: map[string]any{"operation": "callers", "target": map[string]any{"symbol": c.Symbol}, "options": map[string]any{"depth": 1, "limit": 1000}}}},
 		{"call_chain", request{Tool: "trace", Operation: "call_chain", Arguments: map[string]any{"operation": "call_chain", "target": target, "options": map[string]any{"depth": 1, "limit": 1000}}}},
 	}
+	if c.EditKind == "change_signature" {
+		oracles[4].call.Arguments["query"] = "optional"
+	}
+	return oracles
 }
 
 // The precreated following declaration is an unchanged reference point. Any
@@ -74,15 +78,21 @@ func editProbeBodyCorrect(oracle string, body map[string]any, c Corpus, step edi
 		id, _ := body["id"].(string)
 		path, _ := body["file_path"].(string)
 		source, _ := body["source"].(string)
-		return body["name"] == name && editProbeSourceID(id, c.File, name) && editProbeFixturePath(path, c.File) && strings.TrimSpace(source) == expected && editProbeFixtureSource(c.File, source, name, callee)
+		return body["name"] == name && editProbeSourceID(id, c.File, name) && editProbeFixturePath(path, c.File) && strings.TrimSpace(source) == expected && editProbeFixtureSource(c.File, editProbeBodyPlain(c, source), name, callee)
 	case "file":
 		path, _ := body["path"].(string)
 		source, _ := body["content"].(string)
-		return editProbeFixturePath(path, c.File) && strings.Count(source, expected) == 1 && editProbeFixtureSource(c.File, source, name, callee)
+		return editProbeFixturePath(path, c.File) && strings.Count(source, expected) == 1 && editProbeFixtureSource(c.File, editProbeBodyPlain(c, source), name, callee)
 	case "summary", "editing_context", "search_visible":
 		key := map[string]string{"summary": "nodes", "editing_context": "defines", "search_visible": "results"}[oracle]
 		rows, ok := body[key].([]any)
-		return ok && editProbeBodyGap(rows, c, step)
+		if !ok || !editProbeBodyGap(rows, c, step) {
+			return false
+		}
+		if c.EditKind == "change_signature" && oracle != "search_visible" {
+			return editProbeBodySignature(rows, c, step, oracle == "summary")
+		}
+		return true
 	case "text":
 		rows, ok := body["matches"].([]any)
 		if !ok {
@@ -99,6 +109,9 @@ func editProbeBodyCorrect(oracle string, body map[string]any, c Corpus, step edi
 			statement := "return " + callee + "()"
 			if filepath.Ext(c.File) == ".ts" {
 				statement += ";"
+			}
+			if c.EditKind == "change_signature" {
+				statement, _, _ = strings.Cut(expected, "\n")
 			}
 			if editProbeSourceID(id, c.File, name) && editProbeFixturePath(path, c.File) && strings.TrimSpace(text) == statement {
 				return true
@@ -134,6 +147,9 @@ func editProbeBodyCorrect(oracle string, body map[string]any, c Corpus, step edi
 					found = true
 				}
 			}
+		}
+		if c.EditKind == "change_signature" {
+			return found && editProbeBodySpan(body, c, step)
 		}
 		return found
 	}

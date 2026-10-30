@@ -69,7 +69,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if kind == "" {
 		kind = "add_intrafile_call"
 	}
-	if kind != "add_intrafile_call" && kind != "append_leaf" && kind != "rename" && kind != "delete" && kind != "modify_body" && kind != "modify_caller_body" {
+	if kind != "add_intrafile_call" && kind != "append_leaf" && kind != "rename" && kind != "delete" && kind != "modify_body" && kind != "modify_caller_body" && kind != "change_signature" {
 		return editProbePlan{}, errors.New("unsupported edit kind")
 	}
 
@@ -93,17 +93,21 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	}
 	probeMarker := "GortexEditProbeDeclaration"
 	templateCallee := callee
+	templateSource := strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker)
+	if kind == "change_signature" {
+		templateSource = editProbeSignaturePlain(c.File, templateSource)
+	}
 	if kind == "append_leaf" {
 		templateCallee = ""
 	}
 	switch language {
 	case "typescript":
-		valid, correct := editProbeTypeScriptFixture(strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker, templateCallee)
+		valid, correct := editProbeTypeScriptFixture(templateSource, probeMarker, templateCallee)
 		if !valid || !correct {
 			return editProbePlan{}, errors.New("TypeScript template must be a numeric zero-argument marker function returning the intrafile call")
 		}
 	case "python":
-		valid, correct := editProbePythonFixture(strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker, templateCallee)
+		valid, correct := editProbePythonFixture(templateSource, probeMarker, templateCallee)
 		if !valid || !correct {
 			return editProbePlan{}, errors.New("python template must be a top-level marker with one indented return of the intrafile call")
 		}
@@ -150,7 +154,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		if tool == "edit.symbol" {
 			r = editProbeSymbolRequest(c, marker)
 		}
-		if (tool == "edit.write" || tool == "edit.batch") && kind != "rename" && kind != "delete" && kind != "modify_body" && kind != "modify_caller_body" {
+		if (tool == "edit.write" || tool == "edit.batch") && kind != "rename" && kind != "delete" && kind != "modify_body" && kind != "modify_caller_body" && kind != "change_signature" {
 			if strings.Contains(c.EditInitialContent, marker) {
 				return editProbePlan{}, errors.New("planned marker already exists in write fixture")
 			}
@@ -163,10 +167,10 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		beforeSymbol := ""
 		targetSymbol, followingSymbol := "", ""
 		expectedGap := 0
-		if kind == "rename" || kind == "delete" || kind == "modify_body" || kind == "modify_caller_body" {
+		if kind == "rename" || kind == "delete" || kind == "modify_body" || kind == "modify_caller_body" || kind == "change_signature" {
 			oldName := marker + "Before"
 			beforeTemplate := c.EditTemplate
-			if kind == "modify_body" || kind == "modify_caller_body" {
+			if kind == "modify_body" || kind == "modify_caller_body" || kind == "change_signature" {
 				beforeTemplate = c.EditBeforeTemplate
 				if strings.Count(beforeTemplate, "{{marker}}") != 1 {
 					return editProbePlan{}, errors.New("body change requires one explicit before-template declaration")
@@ -180,16 +184,22 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 			if kind == "delete" {
 				replacement = ""
 			}
-			if kind == "modify_body" || kind == "modify_caller_body" {
+			if kind == "modify_body" || kind == "modify_caller_body" || kind == "change_signature" {
 				replacement = strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", oldName))
 				following := marker + "After"
 				nextDeclaration := editProbeFollowingDeclaration(c.File, following)
+				if kind == "change_signature" {
+					nextDeclaration = editProbeFollowingCaller(c.File, following, oldName)
+				}
 				if strings.Count(c.EditInitialContent, before+"\n\n"+nextDeclaration) != 1 || strings.Count(replacement, "\n") <= strings.Count(before, "\n") {
 					return editProbePlan{}, errors.New("body fixture requires adjacent retained follower and actual body line growth")
 				}
 				beforeValid := editProbeLeafSource(c.File, before, oldName)
 				if kind == "modify_caller_body" {
 					beforeValid = editProbeFixtureSource(c.File, before, oldName, "Alternate") && editProbeLeafSource(c.File, c.EditInitialContent, "Alternate")
+				}
+				if kind == "change_signature" {
+					beforeValid = editProbeFixtureSource(c.File, before, oldName, callee) && editProbeSignatureHeaders(c.File, before, replacement, oldName)
 				}
 				if !beforeValid {
 					return editProbePlan{}, errors.New("before body is not the declared numeric leaf or Alternate caller")
