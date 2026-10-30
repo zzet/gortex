@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+ "encoding/json"
+ "reflect"
 	"errors"
 	"os"
 	"path/filepath"
@@ -182,4 +184,62 @@ func TestMoveRestoreUsesOnePublicBatchForBothOwnedFiles(t *testing.T) {
 	if string(actualSource) != sourceBefore || string(actualTarget) != targetBefore {
 		t.Fatal("two-file restore lost bytes")
 	}
+}
+
+// Exercise the public continuation, not just the status helper: no observation
+// request may precede the four immediate own-ACK readbacks.
+func TestMoveOwnACKReadbacksPrecedeBothOriginalOwnerQueries(t *testing.T) {
+ refs, statuses := moveAccountingFixture(t)
+ ackBody, _ := moveAckFixture()
+ var mu sync.Mutex
+ var order []string
+ socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
+  args, _ := frame.Params["arguments"].(map[string]any)
+  operation, _ := args["operation"].(string)
+  target, _ := args["target"].(map[string]any)
+  options, _ := args["options"].(map[string]any)
+  var body any
+  key := operation
+  if receipt, ok := options["receipt"].(string); ok {
+   key = receipt
+   for _, file := range refs.Files { if file.Receipt == receipt { body = stubContent(statuses[file.Role]) } }
+  } else if operation == "file" && target["file"] == "fixture/target.go" {
+   key = "destination_file"
+   body = stubContent(map[string]any{"path": "fixture/target.go", "content": "package main\nfunc Relocated() int { return Callee() }\n"})
+  } else if operation == "source" && target["symbol"] == "fixture/target.go::Relocated" {
+   key = "new_source"
+   body = stubContent(map[string]any{"id": "fixture/target.go::Relocated", "name": "Relocated", "file_path": "fixture/target.go", "source": "func Relocated() int { return Callee() }"})
+  } else if operation == "source" && target["symbol"] == "fixture/source.go::Relocated" {
+   key = "old_source_absent"
+   body = map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": "symbol not found: fixture/source.go::Relocated"}}}
+  } else if operation == "file" && target["file"] == "fixture/source.go" {
+   key = "source_file"
+   body = stubContent(map[string]any{"path": "fixture/source.go", "content": "package main\nfunc Callee() int { return 1 }\n"})
+  }
+  mu.Lock(); order = append(order, key); mu.Unlock()
+  return body, nil
+ })
+ ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+ defer cancel()
+ client, err := openMCP(ctx, socket, "")
+ if err != nil { t.Fatal(err) }
+ defer client.Close()
+ sink, err := os.CreateTemp(t.TempDir(), "move-continuation-*.jsonl")
+ if err != nil { t.Fatal(err) }
+ defer sink.Close()
+ record := completeMovePublicRecord()
+ record.Readbacks = nil
+ started := time.Now().Add(-time.Millisecond)
+ step := editProbeStep{Relocated: true, BeforeSymbol: "source.go::Relocated", TargetSymbol: "target.go::Relocated", DestinationFile: "target.go"}
+ state := &editProbeState{step: step, client: client, sink: sink, record: record, firstProbeWrite: started.Add(-time.Millisecond), editWrite: started, absenceBefore: map[string]bool{step.BeforeSymbol: true}}
+ state.startRaw()
+ defer state.finishRaw()
+ run := &editProbeRuntime{options: runOptions{Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Path: "/owned", Prefix: "fixture", Corpus: Corpus{File: "source.go", EditDestination: "target.go"}}}}, editor: client, plan: editProbePlan{Tool: "refactor.move", File: "source.go", Callee: "Callee"}, phase: &Phase{Metrics: map[string]Metric{}}, origin: started, requireAccounting: true}
+ ack, err := json.Marshal(stubContent(ackBody))
+ if err != nil { t.Fatal(err) }
+ run.finishEditAfterACK(ctx, ctx, state, step, started, ack, wireCallIdentity{ID: 17, Finished: time.Now()}, nil)
+ if state.record.Outcome != "complete" || !state.record.GraphTerminal || len(state.record.Errors) != 0 { t.Fatalf("continuation: %+v", state.record) }
+ mu.Lock(); defer mu.Unlock()
+ want := []string{"destination_file", "new_source", "old_source_absent", "source_file", refs.Files[0].Receipt, refs.Files[1].Receipt}
+ if !reflect.DeepEqual(order, want) { t.Fatalf("own-ACK continuation order=%v want=%v", order, want) }
 }
