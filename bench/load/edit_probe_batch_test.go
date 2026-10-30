@@ -328,7 +328,7 @@ func TestBatchAccountingTextSpliceParseApplicabilityIsExplicitAndOwned(t *testin
 	if got := checkEditProbeAccounting(base, "receipt-a"); got.State == "observed_single_window_checks_pass" {
 		t.Fatal("weakened ordinary applicable parse")
 	}
-	for _, name := range []string{"missing_scope", "unknown_scope", "missing_state", "unknown_state", "zero_instead_of_null"} {
+	for _, name := range []string{"missing_scope", "unknown_scope", "missing_state", "unknown_state", "missing_value", "zero_instead_of_null"} {
 		t.Run(name, func(t *testing.T) {
 			raw, _ := json.Marshal(ack)
 			var copy map[string]any
@@ -346,6 +346,8 @@ func TestBatchAccountingTextSpliceParseApplicabilityIsExplicitAndOwned(t *testin
 				delete(copy["phase_states"].(map[string]any), "parse")
 			case "unknown_state":
 				copy["phase_states"].(map[string]any)["parse"] = "unknown"
+			case "missing_value":
+				delete(copy["observed_execution_ms"].(map[string]any), "parse")
 			case "zero_instead_of_null":
 				copy["observed_execution_ms"].(map[string]any)["parse"] = json.Number("0")
 			}

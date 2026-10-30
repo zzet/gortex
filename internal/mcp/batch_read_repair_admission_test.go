@@ -127,7 +127,7 @@ func testBatchReaderAcrossAdmission(t *testing.T, finishBeforeAdmission bool) {
 		select {
 		case <-entered:
 		case <-time.After(5 * time.Second):
-			t.Fatal("actual reader did not start before batch verdict")
+			return failCapture("actual reader did not start before batch verdict")
 		}
 		if finishBeforeAdmission {
 			release()
