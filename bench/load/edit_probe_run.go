@@ -115,7 +115,7 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if plan.Language == "python" {
 		language = "Python"
 	}
-	out := &editProbeReport{Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/add_intrafile_call/edit.file/JSON cell only", language), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
+	out := &editProbeReport{Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/add_intrafile_call/%s/JSON cell only", language, plan.Tool), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
 	for _, step := range plan.Steps {
 		out.Records = append(out.Records, newEditProbeRecord(c, step))
 	}
@@ -129,6 +129,9 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 	}
 	original, err := os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := editProbeWriteAdmission(p.Repos[0].Corpus, original); err != nil {
 		return nil, nil, err
 	}
 	if filepath.Ext(plan.File) == ".ts" {

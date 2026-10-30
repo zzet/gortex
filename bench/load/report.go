@@ -48,15 +48,17 @@ func distribution(values []float64, unit string) Distribution {
 }
 
 type Corpus struct {
-	Label             string `json:"label"`
-	Source            string `json:"source"`
-	Commit            string `json:"commit"`
-	File              string `json:"file"`
-	Symbol            string `json:"symbol"`
-	Query             string `json:"query"`
-	EditTemplate      string `json:"edit_template"`
-	EditAnchor        string `json:"edit_anchor"`
-	ProposedSignature string `json:"proposed_signature"`
+	Label              string `json:"label"`
+	Source             string `json:"source"`
+	Commit             string `json:"commit"`
+	File               string `json:"file"`
+	Symbol             string `json:"symbol"`
+	Query              string `json:"query"`
+	EditTemplate       string `json:"edit_template"`
+	EditAnchor         string `json:"edit_anchor"`
+	EditTool           string `json:"edit_tool,omitempty"`
+	EditInitialContent string `json:"edit_initial_content,omitempty"`
+	ProposedSignature  string `json:"proposed_signature"`
 }
 
 type Host struct {

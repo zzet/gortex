@@ -56,6 +56,10 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if count != 1 && count != 100 {
 		return editProbePlan{}, errors.New("edit-and-probe requires 100 edits, or explicit 1-edit diagnostic")
 	}
+	tool, err := editProbeTool(c)
+	if err != nil {
+		return editProbePlan{}, err
+	}
 	language := "go"
 	if filepath.Ext(c.File) == ".ts" {
 		language = "typescript"
@@ -109,9 +113,10 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 			return editProbePlan{}, errors.New("template must declare the unique marker function and actually call the selected intrafile callee")
 		}
 	}
-	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: "add_intrafile_call", Tool: "edit.file", Language: language, Mode: "json", Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", "native save/create/delete/hotfile/restart", "largest-file/reference configurations require their own reviewed manifest"}}
+	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: "add_intrafile_call", Tool: tool, Language: language, Mode: "json", Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", "native save/create/delete/hotfile/restart", "largest-file/reference configurations require their own reviewed manifest"}}
 	rng := rand.New(rand.NewPCG(uint64(seed)^0xa0761d6478bd642f, uint64(seed)^0xe7037ed1a0b428db))
 	due := int64(editProbePeriod)
+	writeContent := c.EditInitialContent
 	for i := 0; i < count; i++ {
 		interval := rng.ExpFloat64() * float64(editProbeMean)
 		if math.IsNaN(interval) || math.IsInf(interval, 0) || interval >= float64(math.MaxInt64) {
@@ -125,6 +130,12 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		marker := fmt.Sprintf("GortexEditProbe%016xN%03d", uint64(seed), i)
 		id := fmt.Sprintf("load-edit-%016x-%03d", uint64(seed), i)
 		r := editRequest(c, marker)
+		if tool == "edit.write" {
+			if strings.Contains(c.EditInitialContent, marker) {
+				return editProbePlan{}, errors.New("planned marker already exists in write fixture")
+			}
+			r, writeContent = editProbeWriteRequest(c, writeContent, marker)
+		}
 		r.Arguments["options"] = map[string]any{"mutation_id": id}
 		hash, err := hashJSON(r)
 		if err != nil {

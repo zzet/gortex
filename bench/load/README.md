@@ -79,6 +79,20 @@ and native paired edit scenarios). This adds no hidden reader population.
 `--agents 4 --edit-agents 4` is the separate four-pure-reader/four-editor tail
 workload. The counts remain explicit in the report and workload hash.
 
+An explicit corpus `edit_tool: "edit.write"` selects whole-file write intent for
+the same narrow Go, TypeScript or Python intrafile-call fixture. It additionally
+requires `edit_initial_content` containing the exact pinned initial file bytes.
+Before opening probe sessions, the client compares those bytes with its clone.
+The complete offered requests are precomputed: write number N contains the
+initial file plus additions 0 through N. The client does not reread or regenerate
+content after another edit, serialize offered arrivals, or change retry intent.
+Out-of-order overlapping writes can overwrite later changes; ordinary stale,
+readback, refusal and evidence failures remain in the full denominator. The same
+seven oracles, per-edit sessions, own-ACK readbacks and receipt accounting apply.
+Write, symbol and batch receipts are not interchangeable; symbol and batch
+scenario adapters remain unsupported. These source cells have no runtime or
+reference acceptance until their actual runs establish it.
+
 `--scenario edit-and-probe --profile agent --agents 0 --edit-agents 1
 --worktrees 0` selects an initial `add_intrafile_call` / `edit.file` / JSON
 accounting cell. Go retains its existing AST validation. The explicit `.ts`

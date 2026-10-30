@@ -99,6 +99,24 @@ func TestEditOperationFiveRealToolSeamsLegacyAndFacade(t *testing.T) {
 				require.Zero(t, s.editOperations.completed.Load(), "preview is not a completed edit")
 				result = callEditOperationFrame(t, s, ctx, name, args)
 				require.False(t, result.IsError, "%v", result.Content)
+				if operation == "write" {
+					written := decodeFileOpsResult(t, result)
+					receipt, ok := written["mutation_receipt"].(string)
+					require.True(t, ok)
+					require.NotEmpty(t, receipt)
+					require.Equal(t, "count-write", written["mutation_id"], "facade options keep the caller mutation identity")
+					statusTool := "mutation_status"
+					statusArgs := map[string]any{"receipt": receipt, "format": "json"}
+					if facade {
+						statusTool = "change"
+						statusArgs = map[string]any{"operation": "receipt", "options": map[string]any{"receipt": receipt}, "output": map[string]any{"format": "json", "max_bytes": 0}}
+					}
+					statusResult := callEditOperationFrame(t, s, ctx, statusTool, statusArgs)
+					require.False(t, statusResult.IsError, "%v", statusResult.Content)
+					status := decodeFileOpsResult(t, statusResult)
+					require.Equal(t, receipt, status["receipt"], "status is bound to the write ACK, not its logical id")
+					require.NotEqual(t, "count-write", receipt)
+				}
 				require.EqualValues(t, 1, s.editOperations.completed.Load(), "one logical operation, not per-file commits")
 				require.Zero(t, s.editOperations.committedWithError.Load())
 				require.Zero(t, s.editOperations.failedAfterSourceEffect.Load())
