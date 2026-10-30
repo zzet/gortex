@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -75,6 +76,8 @@ func TestBatchActualReaderCapturedBeforeFinalVerdictCompletesAfterAdmission(t *t
 	})
 	transaction := "batch-reader-before-admission"
 	captured := false
+	var captureErr error
+	failCapture := func(message string) error { captureErr = errors.New(message); return captureErr }
 	var record *mutationCommitRecord
 	s.batchDurabilityOverride = &batchDurabilityOps{syncDirectory: func(dir string) error {
 		if filepath.Clean(dir) != filepath.Clean(root) || captured {
@@ -82,21 +85,31 @@ func TestBatchActualReaderCapturedBeforeFinalVerdictCompletesAfterAdmission(t *t
 		}
 		captured = true
 		value, ok := s.batchTransactions.Load(transaction)
-		require.True(t, ok)
+		if !ok {
+			return failCapture("missing original transaction during target durability")
+		}
 		refs := s.batchFileObservationReferences(value.(*batchTransactionState).snapshot())
-		require.Len(t, refs, 1)
+		if len(refs) != 1 {
+			return failCapture("missing exact file observation during target durability")
+		}
 		s.mutationCommits.mu.Lock()
 		record = s.mutationCommits.byID[refs[0].Receipt]
 		s.mutationCommits.mu.Unlock()
-		require.NotNil(t, record)
+
+		if record == nil {
+			return failCapture("missing retained batch file record")
+		}
 		record.mu.RLock()
-		require.Equal(t, mutationDiskInFlight, record.disk, "durable transaction verdict is still pending")
-		require.Equal(t, gitBlobSHA([]byte(after)), record.newSHA, "real forward writer already returned these exact bytes")
-		require.False(t, record.committedAt.IsZero())
-		require.Nil(t, record.publication)
+		writerKnown := record.disk == mutationDiskInFlight && record.newSHA == gitBlobSHA([]byte(after)) && !record.committedAt.IsZero() && record.publication == nil
 		record.mu.RUnlock()
+		if !writerKnown {
+			return failCapture("fixture did not reach actual writer-return-known pre-verdict/pre-admission boundary")
+		}
 		observed := s.readRepairObserver(t.Context(), path, idx)
-		require.NotNil(t, observed, "reader must capture the same writer-return-known record before final batch verdict/admission")
+		if observed == nil {
+			return failCapture("reader cannot capture the same writer-return-known record before final batch verdict/admission")
+		}
+
 		armed.Store(true)
 		started = true
 		go func() {
@@ -115,6 +128,7 @@ func TestBatchActualReaderCapturedBeforeFinalVerdictCompletesAfterAdmission(t *t
 	req.Params.Arguments = map[string]any{"transaction_id": transaction, "edits": []any{map[string]any{"op": "edit_file", "path": path, "old_string": string(before), "new_string": after}}}
 	result, err := s.boundToolHandler(s.handleAtomicBatchEdit)(t.Context(), req)
 	require.NoError(t, err)
+	require.NoError(t, captureErr)
 	require.False(t, result.IsError, "%v", result.Content)
 	require.True(t, captured)
 	record.mu.RLock()
