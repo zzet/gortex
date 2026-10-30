@@ -37,6 +37,9 @@ func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
 		{"callers", request{Tool: "relations", Operation: "callers", Arguments: map[string]any{"operation": "callers", "target": map[string]any{"symbol": c.Symbol}, "options": map[string]any{"depth": 1, "limit": 1000}}}},
 		{"call_chain", request{Tool: "trace", Operation: "call_chain", Arguments: map[string]any{"operation": "call_chain", "target": marker, "options": map[string]any{"depth": 1, "limit": 1000}}}},
 	}
+	if c.EditKind == "add_crossfile_call" {
+		oracles[5].call.Arguments["target"] = map[string]any{"symbol": c.EditCallee}
+	}
 	if c.EditKind == "append_leaf" {
 		oracles[5].call.Arguments["target"] = marker
 	}
@@ -109,7 +112,7 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 	switch oracle {
 	case "source":
 		source, _ := body["source"].(string)
-		if filepath.Ext(c.File) == ".ts" || filepath.Ext(c.File) == ".py" || (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol") {
+		if filepath.Ext(c.File) == ".ts" || filepath.Ext(c.File) == ".py" || (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol" || c.EditKind != "") {
 			id, _ := body["id"].(string)
 			path, _ := body["file_path"].(string)
 			if !editProbeSourceID(id, c.File, step.Marker) || !editProbeFixturePath(path, c.File) {
@@ -119,10 +122,10 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 		if c.EditKind == "append_leaf" {
 			return body["name"] == step.Marker && editProbeLeafSource(c.File, source, step.Marker)
 		}
-		return body["name"] == step.Marker && editProbeFixtureSource(c.File, source, step.Marker, callee)
+		return body["name"] == step.Marker && editProbeFixtureSource(c.File, editProbeCrossFilePlain(c, source), step.Marker, callee)
 	case "file":
 		source, _ := body["content"].(string)
-		if filepath.Ext(c.File) == ".ts" || filepath.Ext(c.File) == ".py" || (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol") {
+		if filepath.Ext(c.File) == ".ts" || filepath.Ext(c.File) == ".py" || (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol" || c.EditKind != "") {
 			path, _ := body["path"].(string)
 			if !editProbeFixturePath(path, c.File) {
 				return false
@@ -131,7 +134,7 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 		if c.EditKind == "append_leaf" {
 			return editProbeLeafSource(c.File, source, step.Marker)
 		}
-		return editProbeFixtureSource(c.File, source, step.Marker, callee)
+		return editProbeFixtureSource(c.File, editProbeCrossFilePlain(c, source), step.Marker, callee)
 	case "text":
 		return collection("matches", func(row map[string]any) bool {
 			path, _ := row["path"].(string)
@@ -161,7 +164,11 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 		return collection("edges", func(row map[string]any) bool {
 			from, _ := row["from"].(string)
 			to, _ := row["to"].(string)
-			return row["kind"] == "calls" && editProbeSourceID(from, c.File, step.Marker) && editProbeSourceID(to, c.File, callee)
+			calleeFile := c.File
+			if c.EditKind == "add_crossfile_call" {
+				calleeFile, _, _ = editProbeCrossFileCallee(c)
+			}
+			return row["kind"] == "calls" && editProbeSourceID(from, c.File, step.Marker) && editProbeSourceID(to, calleeFile, callee)
 		})
 	case "summary", "editing_context", "search_visible":
 		key := map[string]string{"summary": "nodes", "editing_context": "defines", "search_visible": "results"}[oracle]

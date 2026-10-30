@@ -140,13 +140,13 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 		return nil, nil, err
 	}
 	if filepath.Ext(plan.File) == ".ts" {
-		valid, _ := editProbeTypeScriptFixture(string(original), "", "")
+		valid, _ := editProbeTypeScriptFixture(editProbeCrossFilePlain(p.Repos[0].Corpus, string(original)), "", "")
 		if !valid {
 			return nil, nil, errors.New("TypeScript cell requires an explicit numeric-function fixture")
 		}
 	}
 	if filepath.Ext(plan.File) == ".py" {
-		valid, _ := editProbePythonFixture(string(original), "", "")
+		valid, _ := editProbePythonFixture(editProbeCrossFilePlain(p.Repos[0].Corpus, string(original)), "", "")
 		if !valid {
 			return nil, nil, errors.New("python cell requires an explicit top-level single-return fixture")
 		}
@@ -161,6 +161,11 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 	}
 	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editor: editor, original: original, requireAccounting: !o.editProbeBaseline}
 	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, r.requireAccounting)
+	if p.Repos[0].Corpus.EditKind == "add_crossfile_call" {
+		if err := r.admitCrossFileCallee(ctx); err != nil {
+			return r, nil, err
+		}
+	}
 	phase.editProbeRuntime = r
 	dir := filepath.Join(p.Root, "edit-probe")
 	if err := os.Mkdir(dir, 0o700); err != nil {

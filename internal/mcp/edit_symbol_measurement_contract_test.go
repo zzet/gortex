@@ -227,3 +227,54 @@ func TestDeleteMeasurementSearchCoversHundredDeclarationFixture(t *testing.T) {
 		})
 	}
 }
+
+func TestEditSymbolCrossFileMeasurementUsesActualResolvedCallee(t *testing.T) {
+	for _, language := range []string{"go", "typescript", "python"} {
+		t.Run(language, func(t *testing.T) {
+			s, root := setupTestServer(t)
+			t.Cleanup(s.DrainBackground)
+			file, hub, header, declaration, added, hubSource := "caller.go", "hub.go", "package main\n", "func CrossAnchor() int { return 1 }", "func CrossMarker() int { return Hub() }", "package main\nfunc Hub() int { return 2 }\n"
+			if language == "typescript" {
+				file = "caller.ts"
+				hub = "hub.ts"
+				header = "import { Hub } from \"./hub\";\n"
+				declaration = "export function CrossAnchor(): number { return 1; }"
+				added = "export function CrossMarker(): number { return Hub(); }"
+				hubSource = "export function Hub(): number { return 2; }\n"
+			}
+			if language == "python" {
+				file = "caller.py"
+				hub = "hub.py"
+				header = "from hub import Hub\n"
+				declaration = "def CrossAnchor():\n    return 1"
+				added = "def CrossMarker():\n    return Hub()"
+				hubSource = "def Hub():\n    return 2\n"
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(root, hub), []byte(hubSource), 0600))
+			require.NoError(t, s.indexer.IndexFile(filepath.Join(root, hub)))
+			require.NoError(t, os.WriteFile(filepath.Join(root, file), []byte(header+declaration+"\n"), 0600))
+			require.NoError(t, s.indexer.IndexFile(filepath.Join(root, file)))
+			s.indexer.ResolveAll()
+			s.facades.capture(mcpgo.NewTool("edit_symbol"), s.handleEditSymbol)
+			req := editOperationRequest("edit", "symbol")
+			req.Params.Arguments = map[string]any{"operation": "symbol", "target": map[string]any{"symbol": file + "::CrossAnchor"}, "match": declaration, "replacement": declaration + "\n" + added, "output": map[string]any{"format": "json"}}
+			result, err := s.boundToolHandler(func(ctx context.Context, r mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+				return s.handleFacade(ctx, "edit", r)
+			})(t.Context(), req)
+			require.NoError(t, err)
+			require.False(t, result.IsError)
+			chain := callTool(t, s, "get_call_chain", map[string]any{"id": file + "::CrossMarker", "depth": 1, "limit": 1000})
+			require.False(t, chain.IsError)
+			body := unmarshalResult(t, chain)
+			edges, _ := body["edges"].([]any)
+			found := false
+			for _, raw := range edges {
+				edge := raw.(map[string]any)
+				if edge["from"] == file+"::CrossMarker" && edge["to"] == hub+"::Hub" && edge["kind"] == "calls" {
+					found = true
+				}
+			}
+			require.True(t, found, "actual public edit must publish exact crossfile Hub edge")
+		})
+	}
+}

@@ -69,7 +69,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if kind == "" {
 		kind = "add_intrafile_call"
 	}
-	if kind != "add_intrafile_call" && kind != "append_leaf" && kind != "rename" && kind != "delete" && kind != "modify_body" && kind != "modify_caller_body" && kind != "change_signature" {
+	if kind != "add_intrafile_call" && kind != "append_leaf" && kind != "rename" && kind != "delete" && kind != "modify_body" && kind != "modify_caller_body" && kind != "change_signature" && kind != "add_crossfile_call" {
 		return editProbePlan{}, errors.New("unsupported edit kind")
 	}
 
@@ -83,11 +83,23 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if (filepath.Ext(c.File) != ".go" && filepath.Ext(c.File) != ".ts" && filepath.Ext(c.File) != ".py") || c.EditAnchor == "" || strings.Count(c.EditTemplate, "{{marker}}") != 1 {
 		return editProbePlan{}, errors.New("edit-and-probe cell requires Go or explicit TypeScript/Python fixture/stable anchor/one marker declaration")
 	}
-	separator := strings.LastIndex(c.Symbol, "::")
+	selectedCallee := c.Symbol
+	if kind == "add_crossfile_call" {
+		if _, _, err := editProbeCrossFileCallee(c); err != nil {
+			return editProbePlan{}, err
+		}
+		selectedCallee = c.EditCallee
+		if prefix := editProbeCrossFileImport(c); prefix != "" && !strings.HasPrefix(c.EditInitialContent, prefix) {
+			return editProbePlan{}, errors.New("crossfile fixture requires exact leading import")
+		}
+	} else if c.EditCallee != "" {
+		return editProbePlan{}, errors.New("edit_callee applies only to explicit crossfile fixture")
+	}
+	separator := strings.LastIndex(selectedCallee, "::")
 	if separator < 0 {
 		return editProbePlan{}, errors.New("initial intrafile cell requires one plain callee symbol")
 	}
-	callee := c.Symbol[separator+2:]
+	callee := selectedCallee[separator+2:]
 	if !token.IsIdentifier(callee) {
 		return editProbePlan{}, errors.New("initial intrafile cell requires one plain callee symbol")
 	}
