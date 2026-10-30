@@ -182,6 +182,10 @@ func validateAgentCounts(scenario string, readers, editors int) error {
 		return errors.New("reader/editor counts must be nonnegative")
 	}
 	switch scenario {
+	case "idle-stop":
+		if readers != 0 || editors != 0 {
+			return errors.New("idle-stop requires exactly zero reading/editing agents")
+		}
 	case "edit", "many-edit":
 		if editors < 1 {
 			return errors.New("edit scenarios require at least one combined edit/readback agent")

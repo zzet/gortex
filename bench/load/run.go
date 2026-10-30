@@ -36,6 +36,8 @@ type runOptions struct {
 	SweepRepetitions int
 	SweepBudget      time.Duration
 	pairedDriver     func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
+	smokeState       *privateRun // only the fixed smoke entry lends its freshly owned store
+	smokeMarkers     []string
 }
 
 func parseRun(args []string) (runOptions, error) {
@@ -59,7 +61,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.StringVar(&o.GitSHA, "git-sha", "", "full binary revision if absent from Go build metadata")
 	f.StringVar(&o.Profile, "profile", "agent", "agent (default) or explicit saturation")
 	f.StringVar(&o.Host, "host", "native", "native, reference, or floor (validated, never provisioned)")
-	f.StringVar(&o.Scenario, "scenario", "read", "read, edit, many, many-edit, worktrees, cold, restart, sweep, all")
+	f.StringVar(&o.Scenario, "scenario", "read", "read, edit, many, many-edit, worktrees, cold, restart, sweep, idle-stop, all")
 	f.IntVar(&o.Agents, "agents", 4, "pure reading agents (may be 0 only for edit/many-edit)")
 	f.IntVar(&o.Editors, "edit-agents", 4, "combined editing/readback/reading agents in edit scenarios, in addition to pure readers")
 	f.IntVar(&o.Worktrees, "worktrees", 4, "linked worktrees in addition to primary")
@@ -84,6 +86,9 @@ func validateRunOptions(o runOptions) error {
 	}
 	if err := validateAgentCounts(o.Scenario, o.Agents, o.Editors); err != nil {
 		return err
+	}
+	if o.Scenario == "idle-stop" && (o.Worktrees != 0 || o.CPUProfile != 0 || o.Profile != "agent") {
+		return errors.New("idle-stop requires an agent-profile standalone run with no worktrees or CPU profiling")
 	}
 	if _, err := parseProfile(o.Profile); err != nil {
 		return err
@@ -115,6 +120,9 @@ func validateRunOptions(o runOptions) error {
 }
 
 func selectedScenarios(o runOptions) ([]string, error) {
+	if o.Scenario == "idle-stop" {
+		return []string{"idle-stop"}, nil
+	}
 	all := []string{"read", "edit", "many", "many-edit", "worktrees", "cold", "restart", "sweep"}
 	if o.Scenario == "all" {
 		if o.Host == "floor" {

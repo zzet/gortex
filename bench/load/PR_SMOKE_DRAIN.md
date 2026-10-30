@@ -28,6 +28,8 @@ observed timing/admission receipts. Stop/owned-daemon cleanup remains the existi
 phase lifecycle, and forced stop is still a failure.
 
 The initial implementation supports reads only. Exact edit/readback/publication
-probes and a distinct idle-stop fixture remain separate required work. Actual
+probes remain required work. The fixed `load smoke` entry adds a distinct idle-stop
+step and private per-build store reuse; neither extends the read drain flag to
+edits or changes the frozen run/all profiles. Actual
 per-tool sample counts, p99 interpretation, 20 unchanged/seeded runs and the
 full job's 15-minute wall-time acceptance remain unproven.
