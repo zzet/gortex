@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"testing"
@@ -130,4 +132,24 @@ func TestMoveMeasurementActualMultiIndexerPreservesUnchangedCaller(t *testing.T)
 	caller, _ := json.Marshal(s.graph.GetNode(callerID))
 	rawOut, _ := json.Marshal(s.graph.GetOutEdges(callerID))
 	require.True(t, found, "multi move chain=%v caller=%s raw_out=%s source=%s", body, string(caller), string(rawOut), string(source))
+}
+
+func TestMoveSplicePreservesRequiredDeclarationSeparator(t *testing.T) {
+	for _, source := range []string{
+		"package main\nfunc Relocated() int { return 7 }\nfunc StableCaller() int { return Relocated() }\n",
+		"package main\n\nfunc Relocated() int { return 7 }\n\nfunc StableCaller() int { return Relocated() }\n",
+		"package main\n// Relocated is moved.\nfunc Relocated() int { return 7 }\nfunc StableCaller() int { return Relocated() }\n",
+	} {
+		set := token.NewFileSet()
+		file, err := parser.ParseFile(set, "source.go", source, parser.ParseComments)
+		require.NoError(t, err)
+		decl, _, _, err := extractGoTopLevelDecl(set, file, []byte(source), "Relocated")
+		require.NoError(t, err)
+		after, err := spliceOutGoDecl([]byte(source), set, decl)
+		require.NoError(t, err)
+		parsed, err := parser.ParseFile(token.NewFileSet(), "after.go", after, 0)
+		require.NoError(t, err, "splice emitted invalid Go: %s", after)
+		require.Len(t, parsed.Decls, 1)
+		require.Contains(t, string(after), "func StableCaller()")
+	}
 }

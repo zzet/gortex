@@ -599,7 +599,7 @@ func spliceOutGoDecl(src []byte, fset *token.FileSet, decl ast.Decl) ([]byte, er
 	}
 	// Pull start back one more newline if we now sit on a blank line so
 	// the file doesn't grow blank lines on every move.
-	if start > 0 && src[start-1] == '\n' && end < len(src) {
+	if start > 1 && src[start-1] == '\n' && src[start-2] == '\n' && end < len(src) {
 		start--
 	}
 	out := make([]byte, 0, len(src)-(end-start))
