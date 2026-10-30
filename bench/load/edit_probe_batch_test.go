@@ -357,3 +357,57 @@ func TestBatchAccountingTextSpliceParseApplicabilityIsExplicitAndOwned(t *testin
 		})
 	}
 }
+
+func directRequestedBackgroundFixture() map[string]any {
+	status := editProbeAccountingFixture()
+	winner := status["coalesced_publication"].(map[string]any)
+	phase := winner["timings"].(map[string]any)["phase_timing"].(map[string]any)
+	phase["patch_accounting"].(map[string]any)["attempt_ticket"] = json.Number("1")
+	status["phase_timing"] = phase
+	delete(status, "coalesced_publication")
+	status["applied_generation"] = json.Number("1")
+	status["publication_phases"] = map[string]any{"key": "original", "ticket": json.Number("1"), "source": "mcp_edit", "clock": "monotonic"}
+	background := status["requested_background"].(map[string]any)
+	background["coverage"], background["observed_native_handoffs"] = "direct_requested_attempt", json.Number("0")
+	background["applied_generation"] = json.Number("1")
+	phases := background["phases_ms"].(map[string]any)
+	for _, name := range []string{"canceled_quiet_wait", "timer_stop", "coalescing_control", "successor_timer_arm", "successor_quiet_wait"} {
+		phases[name] = json.Number("0")
+	}
+	phases["requested_quiet_wait"] = json.Number("1")
+	background["background_wall_ms"] = json.Number("16")
+	return status
+}
+func TestDirectRequestedBackgroundConsumerRequiresExactOwnedWindow(t *testing.T) {
+	if got := checkEditProbeAccounting(directRequestedBackgroundFixture(), "receipt-a"); got.State != "observed_single_window_checks_pass" {
+		t.Fatal("valid direct B refused", got)
+	}
+	for _, name := range []string{"missing_quiet", "borrowed_native_quiet", "wrong_applied", "fake_handoff", "unknown_shape", "predecessor_stop_false", "foreign_predecessor"} {
+		t.Run(name, func(t *testing.T) {
+			status := directRequestedBackgroundFixture()
+			b := status["requested_background"].(map[string]any)
+			phases := b["phases_ms"].(map[string]any)
+			switch name {
+			case "missing_quiet":
+				delete(phases, "requested_quiet_wait")
+			case "borrowed_native_quiet":
+				phases["successor_quiet_wait"] = json.Number("1")
+			case "wrong_applied":
+				b["applied_generation"] = json.Number("2")
+			case "fake_handoff":
+				b["observed_native_handoffs"] = json.Number("1")
+			case "unknown_shape":
+				b["coverage"] = "unknown"
+			case "predecessor_stop_false":
+				b["admission_predecessor_generation"] = json.Number("1")
+				b["admission_predecessor_stopped"] = false
+			case "foreign_predecessor":
+				b["admission_predecessor_generation"] = json.Number("2")
+				b["admission_predecessor_stopped"] = true
+			}
+			if got := checkEditProbeAccounting(status, "receipt-a"); got.State == "observed_single_window_checks_pass" {
+				t.Fatal("accepted contradictory direct B", name)
+			}
+		})
+	}
+}

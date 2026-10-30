@@ -465,6 +465,13 @@ func editProbeSupportedBackgroundCoverage(background map[string]any) bool {
 		applied, e2 := strconvEditProbeUint(background["applied_generation"])
 		phases, _ := background["phases_ms"].(map[string]any)
 		quiet, observed := phases["requested_quiet_wait"]
+		for _, name := range []string{"canceled_quiet_wait", "timer_stop", "coalescing_control", "successor_timer_arm", "successor_quiet_wait"} {
+			value, exists := phases[name]
+			ns, e := editProbeNS(value)
+			if !exists || value == nil || e != nil || ns != 0 {
+				return false
+			}
+		}
 		return present && err == nil && handoffs == 0 && e1 == nil && e2 == nil && requested > 0 && applied == requested && observed && quiet != nil
 	default:
 		return false
