@@ -16,11 +16,11 @@ import (
 // semantics, not invented operation enums or fake benchmark success.
 func TestEditSymbolMeasurementFixtureUsesActualSpliceAndExplicitAbsence(t *testing.T) {
 	for _, language := range []string{"go", "typescript", "python"} {
-		for _, operation := range []string{"sibling", "rename", "delete"} {
+		for _, operation := range []string{"sibling", "rename", "delete", "append_leaf", "modify_body", "change_signature"} {
 			t.Run(language+"/"+operation, func(t *testing.T) {
 				s, root := setupTestServer(t)
 				t.Cleanup(s.DrainBackground)
-				var file, header, declaration, survivor, added, renamed string
+				var file, header, declaration, survivor, added, renamed, leaf, modified, signatureChanged, caller string
 				switch language {
 				case "go":
 					file = "symbol-cell.go"
@@ -29,31 +29,57 @@ func TestEditSymbolMeasurementFixtureUsesActualSpliceAndExplicitAbsence(t *testi
 					survivor = "func Sentinel() int { return 2 }"
 					added = "func Added() int { return Target() }"
 					renamed = "func Renamed() int { return 1 }"
+					leaf = "func Added() int { return 7 }"
+					modified = "func Target() int {\n value := 7\n return value\n}"
+					signatureChanged = "func Target(optional ...int) int { return 1 }"
+					caller = "func Caller() int { return Target() }"
 				case "typescript":
 					file = "symbol-cell.ts"
 					declaration = "export function Target(): number { return 1; }"
 					survivor = "export function Sentinel(): number { return 2; }"
 					added = "export function Added(): number { return Target(); }"
 					renamed = "export function Renamed(): number { return 1; }"
+					leaf = "export function Added(): number { return 7; }"
+					modified = "export function Target(): number {\n const value = 7;\n return value;\n}"
+					signatureChanged = "export function Target(optional?: number): number { return 1; }"
+					caller = "export function Caller(): number { return Target(); }"
 				case "python":
 					file = "symbol-cell.py"
 					declaration = "def Target():\n    return 1"
 					survivor = "def Sentinel():\n    return 2"
 					added = "def Added():\n    return Target()"
 					renamed = "def Renamed():\n    return 1"
+					leaf = "def Added():\n    return 7"
+					modified = "def Target():\n    value = 7\n    return value"
+					signatureChanged = "def Target(optional=0):\n    return 1"
+					caller = "def Caller():\n    return Target()"
 				}
 				source := header + declaration + "\n\n" + survivor + "\n"
+				if operation == "modify_body" || operation == "change_signature" {
+					source += "\n" + caller + "\n"
+				}
 				path := filepath.Join(root, file)
 				require.NoError(t, os.WriteFile(path, []byte(source), 0600))
 				require.NoError(t, s.indexer.IndexFile(path))
 				id := file + "::Target"
-				require.NotNil(t, s.engineFor(t.Context()).GetSymbol(id), "fixture must start with actual producer-owned symbol")
+				beforeNode := s.engineFor(t.Context()).GetSymbol(id)
+				require.NotNil(t, beforeNode, "fixture must start with actual producer-owned symbol")
+				beforeSpan := beforeNode.EndLine - beforeNode.StartLine
 				replacement := declaration + "\n" + added
 				if operation == "rename" {
 					replacement = renamed
 				}
 				if operation == "delete" {
 					replacement = ""
+				}
+				if operation == "append_leaf" {
+					replacement = declaration + "\n" + leaf
+				}
+				if operation == "modify_body" {
+					replacement = modified
+				}
+				if operation == "change_signature" {
+					replacement = signatureChanged
 				}
 				s.facades.capture(mcpgo.NewTool("edit_symbol"), s.handleEditSymbol)
 				req := editOperationRequest("edit", "symbol")
@@ -80,9 +106,23 @@ func TestEditSymbolMeasurementFixtureUsesActualSpliceAndExplicitAbsence(t *testi
 				require.NoError(t, err)
 				require.Equal(t, strings.Replace(source, declaration, replacement, 1), string(actual))
 				require.NotNil(t, s.engineFor(t.Context()).GetSymbol(file+"::Sentinel"), "neighbor must survive every splice")
-				if operation == "sibling" {
+				if operation == "sibling" || operation == "append_leaf" {
 					require.NotNil(t, s.engineFor(t.Context()).GetSymbol(id))
 					require.NotNil(t, s.engineFor(t.Context()).GetSymbol(file+"::Added"))
+				} else if operation == "modify_body" || operation == "change_signature" {
+					afterNode := s.engineFor(t.Context()).GetSymbol(id)
+					require.NotNil(t, afterNode)
+					require.NotNil(t, s.engineFor(t.Context()).GetSymbol(file+"::Caller"), "unchanged zero-argument caller must survive")
+					sourceResult := callTool(t, s, "get_symbol_source", map[string]any{"id": id})
+					require.False(t, sourceResult.IsError)
+					sourceBody := unmarshalResult(t, sourceResult)
+					require.Equal(t, strings.TrimSpace(replacement), strings.TrimSpace(sourceBody["source"].(string)))
+					if operation == "modify_body" {
+						require.Greater(t, afterNode.EndLine-afterNode.StartLine, beforeSpan)
+					}
+					if operation == "change_signature" {
+						require.Contains(t, afterNode.Meta["signature"], "optional")
+					}
 				} else {
 					require.Nil(t, s.engineFor(t.Context()).GetSymbol(id), "old identity must really be absent, not an empty successful source")
 					missing := callTool(t, s, "get_symbol_source", map[string]any{"id": id})
