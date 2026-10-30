@@ -359,6 +359,8 @@ func TestMovePublicReadPublishesTargetBeforeDirectAdmission(t *testing.T) {
  later := captureMoveActualExecution(t, s, target, observation.observer(ctx, target, idx))
  require.False(t, later.AcceptedFor(idx, observation.records[target].newSHA), "fixture must exercise the later no-op, not another actual apply")
  status, _ := s.moveFileObservationPayload(t.Context(), observation.records[target].id)
- require.Equal(t, "observed", status["direct_reconcile_state"], "the actual earlier public publisher must retain its own independent window")
- require.Contains(t, status, "direct_reconcile")
+ require.Equal(t, "observed", status["read_assisted_reconcile_state"], "the actual earlier public publisher must retain its own independent window")
+ require.Contains(t, status, "read_assisted_reconcile")
+ require.NotEqual(t, "observed", status["direct_reconcile_state"], "read-assisted publication must not relabel the later direct no-op")
+ require.NotContains(t, status, "direct_reconcile")
 }
