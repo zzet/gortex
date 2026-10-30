@@ -185,8 +185,8 @@ func TestEditProbeTOONSignatureUsesActualCompactRelativeWitness(t *testing.T) {
 			}
 			step := plan.Steps[0]
 			oracles := editProbeOracles(c, step)
-			depth, depthErr := strconvEditProbeUint(oracles[6].call.Arguments["options"].(map[string]any)["depth"])
-			if oracles[5].call.Arguments["target"].(map[string]any)["symbol"] != step.TargetSymbol || oracles[6].call.Arguments["target"].(map[string]any)["symbol"] != step.FollowingSymbol || depthErr != nil || depth != 2 {
+			depth, depthOK := oracles[6].call.Arguments["options"].(map[string]any)["depth"].(float64)
+			if oracles[5].call.Arguments["target"].(map[string]any)["symbol"] != step.TargetSymbol || oracles[6].call.Arguments["target"].(map[string]any)["symbol"] != step.FollowingSymbol || !depthOK || depth != 2 {
 				t.Fatal("lost actual following-caller traversal")
 			}
 			for _, oracle := range []string{"callers", "call_chain"} {
