@@ -30,10 +30,8 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Build clean exact-main daemon and artifact writer
-        run: |
-          go build -o "${{ runner.temp }}/perf-main-gortex" ./cmd/gortex
-          go build -o "${{ runner.temp }}/perf-artifact-writer" ./bench/check-budgets
+      - name: Build the artifact preparation command
+        run: go build -o "${{ runner.temp }}/perf-artifact-writer" ./bench/check-budgets
       - name: Prepare the explicit pinned fixture before compiling benchmark executables
         env:
           PERF_FIXTURE_REVISION: ${{ vars.PERF_SMOKE_FIXTURE_REVISION }}
@@ -41,6 +39,8 @@ jobs:
           "${{ runner.temp }}/perf-artifact-writer" prepare-fixture
           --revision "$PERF_FIXTURE_REVISION"
           --out "${{ runner.temp }}/perf-main-fixture"
+      - name: Build the clean exact-main daemon
+        run: go build -o "${{ runner.temp }}/perf-main-gortex" ./cmd/gortex
       - name: Build all three clean exact-main test executables
         run: >-
           "${{ runner.temp }}/perf-artifact-writer" prepare-tests
