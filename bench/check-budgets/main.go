@@ -16,6 +16,12 @@ import (
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "plan", "collect":
+			return laneCommand(args[0], args[1:], stdout, stderr)
+		}
+	}
 	f := flag.NewFlagSet("check-budgets", flag.ContinueOnError)
 	f.SetOutput(stderr)
 	policyPath := f.String("budgets", "bench/budgets.yaml", "strict budget policy")
