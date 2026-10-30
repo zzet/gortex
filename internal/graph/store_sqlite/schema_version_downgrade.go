@@ -1,7 +1,6 @@
 package store_sqlite
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"net/url"
@@ -99,7 +98,7 @@ func checkSchemaDowngrade(path string, supported int) error {
 		return fmt.Errorf("sqlite schema probe stat: %w", err)
 	}
 	uri.Fragment = ""
-	db, err := sql.Open("sqlite", uri.String())
+	db, err := openSQLiteStoreDB(uri.String())
 	if err != nil {
 		return fmt.Errorf("sqlite schema probe open: %w", err)
 	}

@@ -151,6 +151,8 @@ func RunConformance(t *testing.T, factory Factory, semantics Semantics) {
 	t.Run("DistinctExternalTargets", func(t *testing.T) { testDistinctExternalTargets(t, factory) })
 	t.Run("SymbolBundleSearcher", func(t *testing.T) { testSymbolBundleSearcher(t, factory) })
 	t.Run("DeadCodeCandidator", func(t *testing.T) { testDeadCodeCandidator(t, factory) })
+	t.Run("ScopedDeadCodeReader", func(t *testing.T) { testScopedDeadCodeReader(t, factory) })
+	t.Run("FilteredScopedDeadCodeReader", func(t *testing.T) { testFilteredScopedDeadCodeReader(t, factory) })
 	t.Run("IfaceImplementsScanner", func(t *testing.T) { testIfaceImplementsScanner(t, factory) })
 	t.Run("NodeDegreeAggregator", func(t *testing.T) { testNodeDegreeAggregator(t, factory) })
 	t.Run("NodeFanAggregator", func(t *testing.T) { testNodeFanAggregator(t, factory) })

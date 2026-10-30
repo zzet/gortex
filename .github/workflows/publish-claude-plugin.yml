@@ -117,9 +117,9 @@ jobs:
           # the freshly-regenerated bundle. --delete removes files that
           # no longer exist in the source (e.g. a removed skill). The
           # --exclude entries protect repo-level files we don't manage
-          # from the gortex side: .git/, .github/ (publish target may
-          # carry its own readme-only CI), and a top-level README/LICENSE
-          # if the publish target maintains its own.
+          # from the gortex side: .git/ and .github/ (publish target may
+          # carry its own readme-only CI). The root README and LICENSE
+          # are generated as part of the marketplace layout.
           rsync -av --delete \
             --exclude='.git/' \
             --exclude='.github/' \

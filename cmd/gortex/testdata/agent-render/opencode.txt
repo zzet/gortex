@@ -50,10 +50,10 @@ description: "Add tests for under-tested code and coverage gaps."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -78,10 +78,10 @@ description: "Graph-grounded architectural read of a repo."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -106,10 +106,10 @@ description: "Find what changes together and hidden coupling."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -135,10 +135,10 @@ description: "Find who uses a symbol across all consumer repos."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -164,10 +164,10 @@ description: "Trace where a value flows through the code."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -193,10 +193,10 @@ description: "Debug a bug, trace an error, or find why something fails."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -222,10 +222,10 @@ description: "Reconstruct what changed in a window (postmortem, release, PR)."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -250,10 +250,10 @@ description: "Understand how code works or trace an execution flow."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -279,10 +279,10 @@ description: "Extract code into a function or method via LSP refactor."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -307,10 +307,10 @@ description: "Clear LSP diagnostics — one error, a file, or source.fixAll."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -339,10 +339,10 @@ Use this sequence for codebase work:
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -368,10 +368,10 @@ description: "Assess what breaks if you change X before editing it."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -397,10 +397,10 @@ description: "Walk a production symptom back to its root cause."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -425,10 +425,10 @@ description: "Structured tour of an unfamiliar repo."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -482,10 +482,10 @@ description: "Graph-grounded review of a pending change or PR."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -510,10 +510,10 @@ description: "Repo-scale quality scan — dead code, hotspots, clones."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -538,10 +538,10 @@ description: "Rename, extract, split, or restructure code safely."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -567,10 +567,10 @@ description: "Rename a symbol and update every reference atomically."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -595,10 +595,10 @@ description: "Preview an edit's blast radius on the shadow graph before writing.
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1119,10 +1119,10 @@ description: "Add tests for under-tested code and coverage gaps."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1148,10 +1148,10 @@ description: "Graph-grounded architectural read of a repo."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1214,10 +1214,10 @@ description: "Find what changes together and hidden coupling."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1244,10 +1244,10 @@ description: "Find who uses a symbol across all consumer repos."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1274,10 +1274,10 @@ description: "Trace where a value flows through the code."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1304,10 +1304,10 @@ description: "Debug a bug, trace an error, or find why something fails."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1334,10 +1334,10 @@ description: "Reconstruct what changed in a window (postmortem, release, PR)."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1363,10 +1363,10 @@ description: "Understand how code works or trace an execution flow."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1393,10 +1393,10 @@ description: "Extract code into a function or method via LSP refactor."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1422,10 +1422,10 @@ description: "Clear LSP diagnostics — one error, a file, or source.fixAll."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1455,10 +1455,10 @@ Use this sequence for codebase work:
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1485,10 +1485,10 @@ description: "Assess what breaks if you change X before editing it."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1515,10 +1515,10 @@ description: "Walk a production symptom back to its root cause."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1544,10 +1544,10 @@ description: "Structured tour of an unfamiliar repo."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1603,10 +1603,10 @@ description: "Graph-grounded review of a pending change or PR."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1632,10 +1632,10 @@ description: "Repo-scale quality scan — dead code, hotspots, clones."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1661,10 +1661,10 @@ description: "Rename, extract, split, or restructure code safely."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1691,10 +1691,10 @@ description: "Rename a symbol and update every reference atomically."
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 
@@ -1720,10 +1720,10 @@ description: "Preview an edit's blast radius on the shadow graph before writing.
 
 ## Required behavior
 
-- Native Gortex MCP is mandatory for this MCP-configured workflow. If its callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or switch to a CLI/shell fallback.
-- Do not substitute shell reads, file search, or Git plumbing.
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
 - Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
-- Use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
 - Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
 - Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
 

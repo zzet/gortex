@@ -784,7 +784,7 @@ func TestAnalysisWritesRefusedOnceTheirPayloadGenerationRetires(t *testing.T) {
 
 	// The bounded write gate refuses too, which is what covers an analysis
 	// begun before the retirement started.
-	if _, accepted, err := handle.beginAnalysisGenerationWrite(revision, publishedAnalysis); !errors.Is(err, ErrPayloadGenerationRetired) || accepted {
+	if _, accepted, err := handle.beginAnalysisGenerationWrite(context.Background(), revision, publishedAnalysis); !errors.Is(err, ErrPayloadGenerationRetired) || accepted {
 		t.Fatalf("append gate on a retired generation = (%v, %v), want %v", accepted, err, ErrPayloadGenerationRetired)
 	}
 
@@ -869,7 +869,7 @@ func TestAnalysisWritesRefusedThroughAHandleDerivedAfterRetirement(t *testing.T)
 		t.Fatalf("%d analysis manifest rows landed on a swept generation", got)
 	}
 	// The bounded append/seal/activate gate refuses the same way.
-	if _, accepted, err := fresh.beginAnalysisGenerationWrite(revision, 1); !errors.Is(err, ErrPayloadGenerationRetired) || accepted {
+	if _, accepted, err := fresh.beginAnalysisGenerationWrite(context.Background(), revision, 1); !errors.Is(err, ErrPayloadGenerationRetired) || accepted {
 		t.Fatalf("append gate through a handle derived after retirement = (%v, %v), want %v",
 			accepted, err, ErrPayloadGenerationRetired)
 	}

@@ -8,13 +8,14 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"github.com/zzet/gortex/internal/sqliteconn"
 
 	"modernc.org/libc"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -361,19 +362,7 @@ func setUintptrAt(p, v uintptr) {
 
 // driverConnHandles reads a modernc connection's sqlite3* and libc TLS.
 func driverConnHandles(dc any) (db uintptr, tls *libc.TLS, ok bool) {
-	rv := reflect.ValueOf(dc)
-	if rv.Kind() != reflect.Pointer || rv.IsNil() {
-		return 0, nil, false
-	}
-	rv = rv.Elem()
-	if rv.Kind() != reflect.Struct {
-		return 0, nil, false
-	}
-	dbf, tlsf := rv.FieldByName("db"), rv.FieldByName("tls")
-	if !dbf.IsValid() || !tlsf.IsValid() || dbf.Kind() != reflect.Uintptr || tlsf.Kind() != reflect.Pointer || tlsf.IsNil() {
-		return 0, nil, false
-	}
-	return uintptr(dbf.Uint()), (*libc.TLS)(tlsf.UnsafePointer()), true
+	return sqliteconn.DriverConnHandles(dc)
 }
 
 // mainFileMethods returns the io_methods table of the connection's main

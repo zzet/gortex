@@ -22,10 +22,11 @@ var pluginCmd = &cobra.Command{
 	Short: "Manage Gortex marketplace plugin bundles",
 	Long: `Generate plugin bundles for agent-host marketplaces.
 
-Today this command emits the Anthropic Plugin Marketplace layout —
-a directory containing plugin.json, README, LICENSE, .mcp.json,
-slash commands, skills, and hooks. The Cursor variant lands in a
-follow-up.
+Today this command emits a Claude Code plugin marketplace:
+.claude-plugin/marketplace.json, README and LICENSE at the root, and
+the gortex plugin under plugins/gortex/ (plugin.json, README, LICENSE,
+.mcp.json, skills, sub-agents, and hooks). The Cursor variant lands in
+a follow-up.
 
 The marketplace bundle is generated, not hand-maintained. The single
 source of truth lives in internal/agents/commands_bodies.go and
@@ -42,7 +43,9 @@ Example:
   gortex plugin emit --target ./claude-plugin --variant anthropic --version 0.18.2
 
 The target directory is created if missing; existing files are
-overwritten so re-runs converge on a deterministic output.`,
+overwritten so re-runs converge on a deterministic output. A target
+that still holds the older flat layout (the plugin at its root) is
+refused; remove it or emit into an empty directory.`,
 	RunE: runPluginEmit,
 }
 
@@ -67,7 +70,7 @@ func runPluginEmit(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve target dir: %w", err)
 	}
-	written, err := claudecode.EmitPluginBundle(claudecode.PluginBundleSpec{
+	written, err := claudecode.EmitMarketplace(claudecode.PluginBundleSpec{
 		TargetDir:     abs,
 		Version:       v,
 		LayoutVariant: claudecode.LayoutVariant(pluginEmitVariant),

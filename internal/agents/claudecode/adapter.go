@@ -284,7 +284,7 @@ func (a *Adapter) applyGlobal(env agents.Env, opts agents.ApplyOpts, res *agents
 		if opts.DryRun {
 			insAction.Action = agents.ActionWouldMerge
 			res.Files = append(res.Files, insAction)
-		} else if err := profiles.Generate(insDir); err != nil {
+		} else if err := profiles.Generate(insDir, env.BinaryVersion); err != nil {
 			logWarn(w, "could not generate instruction profiles: %v", err)
 		} else {
 			logf(w, "[gortex install] wrote instruction profiles to %s", insDir)

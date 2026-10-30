@@ -11,7 +11,35 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
 )
+
+type probeClosePolicyGraph struct {
+	graph.Store // No graph read is permitted by this policy-only fixture.
+}
+
+func (*probeClosePolicyGraph) CloseCheckpointPolicy() string { return "skip" }
+
+func TestProbeCarriesClosePolicyWithoutControllerMutexOrGraphQueries(t *testing.T) {
+	c := &realController{graph: &probeClosePolicyGraph{}}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	done := make(chan struct{})
+	var policy string
+	var err error
+	go func() {
+		defer close(done)
+		resp, probeErr := c.Probe(t.Context())
+		policy, err = resp.CloseCheckpointPolicy, probeErr
+	}()
+	select {
+	case <-done:
+		require.NoError(t, err)
+		require.Equal(t, "skip", policy)
+	case <-time.After(3 * time.Second):
+		t.Fatal("policy probe queued behind the controller mutex")
+	}
+}
 
 func probeController(t *testing.T, configBody string) *realController {
 	t.Helper()

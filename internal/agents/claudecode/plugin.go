@@ -43,7 +43,7 @@ const (
 
 // pluginAuthorName / pluginAuthorEmail / pluginHomepage are the
 // fields baked into every plugin.json. They are package-level so the
-// marketplace.json submission script can read the same values
+// marketplace.json emitter (EmitMarketplace) reads the same values
 // without re-deriving them.
 const (
 	pluginName        = "gortex"
@@ -203,17 +203,28 @@ This plugin assumes the ` + "`gortex`" + ` binary is on PATH. Install it via:
 ` + "```sh\ncurl -fsSL https://get.gortex.dev | sh\n```" + `
 
 The installer fetches a signed release tarball, verifies cosign + SHA256,
-installs to ` + "`~/.local/bin`" + ` (or ` + "`/usr/local/bin`" + `), and runs ` + "`gortex install`" + `
-+ ` + "`gortex init`" + `. Homebrew users on macOS can also use:
+and installs to ` + "`~/.local/bin`" + ` (or ` + "`/usr/local/bin`" + `). Homebrew users on macOS
+can also use:
 
 ` + "```sh\nbrew install zzet/tap/gortex\n```" + `
+
+Then add the marketplace and install the plugin:
+
+` + "```sh\nclaude plugin marketplace add gortexhq/claude-plugin\nclaude plugin install gortex@gortex\n```" + `
+
+The plugin covers Claude Code's MCP server, workflow skills, sub-agents and
+hooks. Running ` + "`gortex install`" + ` and ` + "`gortex init`" + ` for Claude Code as well
+registers Gortex twice, which duplicates them. To avoid that, pass
+` + "`--agents-skip claude-code`" + ` to both. This also skips the CLAUDE.md blocks and
+the per-repo community skills under ` + "`.claude/skills/generated/`" + `, which the
+plugin does not provide.
 
 ## What this plugin adds
 
 | Surface | What you get |
 |---------|--------------|
 | **MCP server** | 21 tools over stdio via ` + "`gortex mcp`" + `: begin with ` + "`explore`" + `, inspect with ` + "`search`" + ` / ` + "`read`" + ` / ` + "`relations`" + ` / ` + "`trace`" + `, assess with ` + "`analyze`" + ` / ` + "`change`" + ` / ` + "`review`" + `, and mutate with ` + "`edit`" + ` / ` + "`refactor`" + `. ` + "`capabilities`" + ` returns an operation's exact schema on demand. |
-| **Slash commands** | Discovery: ` + "`/gortex-guide`" + `, ` + "`/gortex-explore`" + `, ` + "`/gortex-debug`" + `, ` + "`/gortex-impact`" + `, ` + "`/gortex-dataflow-trace`" + `, ` + "`/gortex-cross-repo-usage`" + `, ` + "`/gortex-co-change`" + `, ` + "`/gortex-onboarding`" + ` · Edit & refactor: ` + "`/gortex-refactor`" + `, ` + "`/gortex-safe-edit`" + `, ` + "`/gortex-rename`" + `, ` + "`/gortex-extract-function`" + `, ` + "`/gortex-fix-all`" + `, ` + "`/gortex-add-test`" + ` · Review & operate: ` + "`/gortex-pr-review`" + `, ` + "`/gortex-pr-review-agent`" + `, ` + "`/gortex-architecture-review`" + `, ` + "`/gortex-quality-audit`" + `, ` + "`/gortex-incident-investigation`" + `, ` + "`/gortex-episode-replay`" + ` |
+| **Slash commands** | Discovery: ` + "`/gortex:guide`" + `, ` + "`/gortex:explore`" + `, ` + "`/gortex:debug`" + `, ` + "`/gortex:impact`" + `, ` + "`/gortex:dataflow-trace`" + `, ` + "`/gortex:cross-repo-usage`" + `, ` + "`/gortex:co-change`" + `, ` + "`/gortex:onboarding`" + ` · Edit & refactor: ` + "`/gortex:refactor`" + `, ` + "`/gortex:safe-edit`" + `, ` + "`/gortex:rename`" + `, ` + "`/gortex:extract-function`" + `, ` + "`/gortex:fix-all`" + `, ` + "`/gortex:add-test`" + ` · Review & operate: ` + "`/gortex:pr-review`" + `, ` + "`/gortex:pr-review-agent`" + `, ` + "`/gortex:architecture-review`" + `, ` + "`/gortex:quality-audit`" + `, ` + "`/gortex:incident-investigation`" + `, ` + "`/gortex:episode-replay`" + ` |
 | **Skills** | Twenty model-invoked, task-shaped workflows require callable native MCP, start with ` + "`explore`" + `, gate mutations with ` + "`change`" + `, write through ` + "`edit`" + ` / ` + "`refactor`" + `, and verify the result. The separate CLI skill mirrors those names through ` + "`gortex call`" + ` only for a harness with no MCP transport by design. |
 | **Hooks** | UserPromptSubmit parent-turn isolation, SubagentStart/SubagentStop agent isolation, PreToolUse graph routing, Stop post-task diagnostics, and SessionStart briefing (including after compaction). Hook guidance uses the same public MCP tool names. |
 
@@ -254,11 +265,11 @@ Copyright 2024-2026 Andrey Kumanyaev <me@zzet.org>
 // output. Returns the list of paths written, relative to TargetDir,
 // in stable order.
 //
-// Single source of truth: skills come from agents.GlobalSkills, slash
-// commands from agents.SlashCommands. Both are reused from the agents
-// package without duplication, so a change to a skill's body flows
-// through both the user-level install (~/.claude/skills/) and the
-// marketplace plugin (claude-plugin/skills/) on the next emit.
+// Single source of truth: skills come from agents.GlobalSkills, reused
+// from the agents package without duplication, so a change to a skill's
+// body flows through both the user-level install (~/.claude/skills/) and
+// the marketplace plugin (claude-plugin/plugins/gortex/skills/) on the
+// next emit. Only the skill name differs; see pluginSkillName.
 func EmitPluginBundle(spec PluginBundleSpec) ([]string, error) {
 	if spec.LayoutVariant == "" {
 		spec.LayoutVariant = LayoutVariantAnthropic
@@ -324,23 +335,18 @@ func EmitPluginBundle(spec PluginBundleSpec) ([]string, error) {
 		return nil, err
 	}
 
-	// 5. commands/gortex-*.md — sorted for deterministic output.
-	for _, name := range sortedKeys(SlashCommands) {
-		body := SlashCommands[name]
-		if err := write(filepath.Join("commands", name), []byte(body), 0o644); err != nil {
-			return nil, err
-		}
-	}
-
-	// 6. skills/<name>/SKILL.md — sorted for deterministic output.
-	for _, name := range sortedKeys(GlobalSkills) {
-		body := GlobalSkills[name]
+	// 5. skills/<name>/SKILL.md — sorted for deterministic output. No
+	// commands/ directory: a plugin skill is already a slash command, so
+	// emitting both would list every workflow twice.
+	for _, id := range sortedKeys(GlobalSkills) {
+		name := pluginSkillName(id)
+		body := pluginSkillBody(GlobalSkills[id], name)
 		if err := write(filepath.Join("skills", name, "SKILL.md"), []byte(body), 0o644); err != nil {
 			return nil, err
 		}
 	}
 
-	// 7. agents/<name> — sub-agent definitions, sorted for
+	// 6. agents/<name> — sub-agent definitions, sorted for
 	// deterministic output. Mirrors the on-disk path Claude Code
 	// expects under .claude/agents/ when the plugin is installed.
 	for _, name := range sortedKeys(SubAgents) {
@@ -350,7 +356,7 @@ func EmitPluginBundle(spec PluginBundleSpec) ([]string, error) {
 		}
 	}
 
-	// 8. hooks/hooks.json + hooks-handlers/gortex-hook.sh
+	// 7. hooks/hooks.json + hooks-handlers/gortex-hook.sh
 	pluginHooks, err := pluginHooksWithLocalizationTerminality(fmt.Appendf(nil, pluginHooksJSON, CurrentPreToolUseMatcher))
 	if err != nil {
 		return nil, err
@@ -393,6 +399,35 @@ func pluginSubAgentBody(body string) string {
 	return strings.Join(lines, "")
 }
 
+// pluginSkillName drops the "gortex-" prefix from a skill ID. Claude Code
+// already namespaces plugin skills as "gortex:", so the prefixed name
+// would read /gortex:gortex-explore. User-level installs keep the prefix
+// because they have no namespace.
+func pluginSkillName(id string) string {
+	return strings.TrimPrefix(id, "gortex-")
+}
+
+// pluginSkillBody rewrites the frontmatter name to the plugin skill name.
+// Frontmatter name overrides the directory name, so both must change.
+// Only a leading "---" block counts as frontmatter, and only its
+// top-level name key is rewritten.
+func pluginSkillBody(body, name string) string {
+	lines := strings.SplitAfter(body, "\n")
+	if strings.TrimSpace(lines[0]) != "---" {
+		return body
+	}
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "---" {
+			break
+		}
+		if strings.HasPrefix(lines[i], "name:") {
+			lines[i] = "name: " + name + "\n"
+			break
+		}
+	}
+	return strings.Join(lines, "")
+}
+
 // marshalJSONStable returns indented JSON with sorted keys at every
 // level. Two-space indent matches Claude Code's reference plugins;
 // trailing newline keeps the file POSIX-text-friendly and avoids
@@ -424,22 +459,12 @@ func PluginManifestPath() string { return filepath.Join(".claude-plugin", "plugi
 func PluginMCPPath() string      { return ".mcp.json" }
 func PluginHooksPath() string    { return filepath.Join("hooks", "hooks.json") }
 
-// PluginCommandPaths returns the in-bundle paths of all slash command
-// files in stable order.
-func PluginCommandPaths() []string {
-	out := make([]string, 0, len(SlashCommands))
-	for _, name := range sortedKeys(SlashCommands) {
-		out = append(out, filepath.Join("commands", name))
-	}
-	return out
-}
-
 // PluginSkillPaths returns the in-bundle paths of all SKILL.md files
 // in stable order.
 func PluginSkillPaths() []string {
 	out := make([]string, 0, len(GlobalSkills))
-	for _, name := range sortedKeys(GlobalSkills) {
-		out = append(out, filepath.Join("skills", name, "SKILL.md"))
+	for _, id := range sortedKeys(GlobalSkills) {
+		out = append(out, filepath.Join("skills", pluginSkillName(id), "SKILL.md"))
 	}
 	return out
 }

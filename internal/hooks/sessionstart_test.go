@@ -11,6 +11,7 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/profiles"
+	"github.com/zzet/gortex/internal/toolref"
 )
 
 func withFakeStatus(t *testing.T, fn func() (*daemon.StatusResponse, error)) {
@@ -55,7 +56,6 @@ func TestRulePreambleRoutesByOutcomeAndPreservesExactIdentifiers(t *testing.T) {
 		"SUPPORTING rows are optional context",
 		"intentionally not executed and replays the same retained terminal payload",
 		"not stale or canned output or an integration failure",
-		"Outside an active localization contract",
 	} {
 		if !strings.Contains(briefing, required) {
 			t.Fatalf("rule preamble missing %q: %s", required, briefing)
@@ -202,8 +202,8 @@ func TestRunSessionStart_DaemonDown(t *testing.T) {
 	if !strings.Contains(ac, "graph transport is unreachable") {
 		t.Errorf("expected transport-down notice, got:\n%s", ac)
 	}
-	if !strings.Contains(ac, "MCP integration failure") {
-		t.Errorf("expected integration-failure direction, got:\n%s", ac)
+	if !strings.Contains(ac, daemonUnreachableStance) {
+		t.Errorf("expected native continuation direction, got:\n%s", ac)
 	}
 	if strings.Contains(ac, "gortex daemon start") || strings.Contains(ac, "gortex call ") {
 		t.Errorf("native MCP guidance must not advertise a manual fallback, got:\n%s", ac)
@@ -316,7 +316,7 @@ func TestRunSessionStart_DaemonReady_CwdNotTracked(t *testing.T) {
 	// #900: an untracked cwd (e.g. an agent-created clone) must not receive
 	// the MCP-required stop rule — a session-start block outranks the user's
 	// own "ignore Gortex", so restating it there leaves the agent stuck.
-	if strings.Contains(ac, "Native Gortex MCP is mandatory") || strings.Contains(ac, "and stop") {
+	if strings.Contains(ac, "Native Gortex MCP is the transport for indexed code") || strings.Contains(ac, "and stop") {
 		t.Errorf("untracked cwd received the MCP-required stop rule:\n%s", ac)
 	}
 	if !strings.Contains(ac, untrackedCwdPreamble) {
@@ -354,7 +354,7 @@ func TestRunSessionStart_DaemonReady_CwdInsideTrackedRepo(t *testing.T) {
 	if strings.Contains(ac, "not covered by any tracked repo") || strings.Contains(ac, untrackedCwdPreamble) {
 		t.Errorf("subdirectory of a tracked repo was treated as untracked:\n%s", ac)
 	}
-	if !strings.Contains(ac, "Native Gortex MCP is mandatory") {
+	if !strings.Contains(ac, toolref.MCPRequiredLine()) {
 		t.Errorf("tracked repo lost the MCP-required rule:\n%s", ac)
 	}
 }
@@ -548,5 +548,51 @@ func TestDaemonVersionLabel(t *testing.T) {
 		if got := daemonVersionLabel(in); got != want {
 			t.Errorf("daemonVersionLabel(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestSessionStartSharedDegradedGuidanceAcrossStates(t *testing.T) {
+	main := filepath.Join(t.TempDir(), "main")
+	if err := os.MkdirAll(main, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionGuidanceGit(t, main, "init", "-q", "-b", "main")
+	sessionGuidanceGit(t, main, "config", "user.email", "test@example.com")
+	sessionGuidanceGit(t, main, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(main, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sessionGuidanceGit(t, main, "add", ".")
+	sessionGuidanceGit(t, main, "commit", "-q", "-m", "initial")
+	linked := filepath.Join(t.TempDir(), "linked")
+	sessionGuidanceGit(t, main, "worktree", "add", "-q", "-b", "feature", linked)
+	ready := &daemon.StatusResponse{Ready: true, EnrichmentComplete: true, TrackedRepos: []daemon.TrackedRepoStatus{{Name: "main", Path: main}}}
+	for _, test := range []struct {
+		name, cwd string
+		status    *daemon.StatusResponse
+		err       error
+	}{
+		{"ready", main, ready, nil},
+		{"unreachable", main, nil, errDaemonUnreachable},
+		{"status-error", main, nil, errors.New("synthetic status error")},
+		{"untracked", t.TempDir(), ready, nil},
+		{"pending-discovery", linked, ready, nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			withFakeStatus(t, func() (*daemon.StatusResponse, error) { return test.status, test.err })
+			output := buildSessionStartBriefing(test.cwd)
+			for _, stop := range []string{"integration failure and stop", "integration failure, stop", "stop indexed code operations"} {
+				if strings.Contains(output, stop) {
+					t.Fatalf("%s abandons a transient task: %s", test.name, output)
+				}
+			}
+			if test.name == "ready" {
+				for _, sentence := range []string{toolref.TransportClause(), toolref.DegradedModeLine()} {
+					if !strings.Contains(output, sentence) {
+						t.Fatalf("ready briefing lost canonical sentence %q", sentence)
+					}
+				}
+			}
+		})
 	}
 }

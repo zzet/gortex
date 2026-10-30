@@ -74,6 +74,19 @@ type Provider struct {
 
 	client *Client
 
+	// lifetimeMu guards publication, constructor admission and permanent close.
+	// No RPC, subprocess wait or external callback runs under this mutex.
+	lifetimeMu     sync.Mutex
+	lifetimeCtx    context.Context
+	lifetimeCancel context.CancelFunc
+	closed         bool
+	starting       *providerClientStart
+	starts         sync.WaitGroup
+	closeOnce      sync.Once
+	closeDone      chan struct{}
+	closeErr       error
+	closeErrors    map[*Client]error
+
 	// sourceCache holds file contents read by openDocument so the
 	// per-symbol column-resolution lookups don't reread the file for
 	// every hover / references / implementation query. Keyed by
@@ -337,10 +350,8 @@ func (p *Provider) Available() bool {
 }
 
 func (p *Provider) Close() error {
-	if p.client != nil {
-		return p.client.Shutdown()
-	}
-	return nil
+	<-p.BeginClose()
+	return p.closeErr
 }
 
 // nodeRelPath strips a node's own RepoPrefix from its FilePath so the
@@ -1066,7 +1077,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if !p.servesFile(rel) {
 			continue // never open a file this server can't compile
 		}
-		content, release, err := session.acquire(p.client, filepath.Join(absRoot, rel))
+		content, release, err := session.acquire(p.Client(), filepath.Join(absRoot, rel))
 		if err != nil {
 			continue
 		}
@@ -1184,7 +1195,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				// The file is unique to this group, so no two goroutines open
 				// it; the session pins it for the group and leaves it warm for
 				// a later phase that shares the file.
-				content, release, err := session.acquire(p.client, absPath)
+				content, release, err := session.acquire(p.Client(), absPath)
 				if err != nil {
 					return
 				}
@@ -1321,7 +1332,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				// definitionNodeAtSite treats as a no-verdict — the same
 				// outcome the per-site openDocument failure produced before.
 				var content []byte
-				if c, release, err := session.acquire(p.client, filepath.Join(absRoot, grp.rel)); err == nil {
+				if c, release, err := session.acquire(p.Client(), filepath.Join(absRoot, grp.rel)); err == nil {
 					content = c
 					defer release()
 				}
@@ -1478,7 +1489,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// dies mid-flight; goroutines load it atomically so the swap never
 	// races an in-flight hover.
 	var activeClient atomic.Pointer[Client]
-	activeClient.Store(p.client)
+	activeClient.Store(p.Client())
 
 	// Abort coordination: if reconnection fails permanently, the first
 	// goroutine to learn it records the error and flips aborted; the rest
@@ -2022,9 +2033,14 @@ func (p *Provider) resetForReconnect() {
 	// fresh transport. Close it best-effort first to free any
 	// pending pending-map entries; the dead read loop already closed
 	// `done` so Shutdown() is a no-op past that point.
-	if p.client != nil {
-		_ = p.client.Shutdown()
+	p.lifetimeMu.Lock()
+	client := p.client
+	if !p.closed {
 		p.client = nil
+	}
+	p.lifetimeMu.Unlock()
+	if client != nil {
+		_ = p.closeClient(client)
 	}
 	p.docMu.Lock()
 	p.docVersions = map[string]int{}
@@ -2048,6 +2064,10 @@ func (p *Provider) resetForReconnect() {
 // The dial path retries with exponential backoff capped at
 // maxDialBackoff. Each successful dial resets the backoff window.
 func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
+	ctx := p.providerContext()
+	if ctx.Err() != nil {
+		return nil, errProviderClosed
+	}
 	if p.connect != nil {
 		if err := p.connect.Validate(); err != nil {
 			return nil, fmt.Errorf("lsp passive attach: %w", err)
@@ -2055,6 +2075,7 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 		client, dialErr := NewClientWithTransport(&DialTransport{
 			Network: p.connect.Network,
 			Address: p.connect.Address,
+			ctx:     ctx,
 		}, p.logger)
 		if dialErr == nil {
 			// Reset the backoff so a flap doesn't punish the next
@@ -2091,6 +2112,9 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 				zap.Error(dialErr),
 			)
 		}
+	}
+	if ctx.Err() != nil {
+		return nil, errProviderClosed
 	}
 	if p.command == "" {
 		return nil, fmt.Errorf("lsp: no command configured and no passive attach available")
@@ -2309,7 +2333,7 @@ func (p *Provider) maybeCSharpPreRestore(workspaceRoot string) {
 		}
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), csharpRestoreTimeout)
+	ctx, cancel := context.WithTimeout(p.providerContext(), csharpRestoreTimeout)
 	defer cancel()
 	// Target the same solution the server will load (when one resolves) — a
 	// bare restore fails with MSB1011 in a multi-solution root, leaving the
@@ -2353,14 +2377,14 @@ func lastBytes(b []byte, n int) []byte {
 // For passive (connect) mode, a dead client triggers a re-dial with
 // exponential backoff, falling back to spawn only if the spec's
 // Connect.FallbackSpawn is true.
-func (p *Provider) ensureClient(workspaceRoot string) error {
+func (p *Provider) initializeClient(workspaceRoot string, start *providerClientStart) error {
 	// Liveness probe — if we have a client but its read loop has
 	// terminated, the server (or socket) is gone. Treat as
 	// disconnected: drop the dead handle and reset per-connection
 	// state so the next branch can build a fresh transport.
-	if p.client != nil {
+	if client := p.Client(); client != nil {
 		select {
-		case <-p.client.Done():
+		case <-client.Done():
 			p.resetForReconnect()
 		default:
 			return nil
@@ -2384,6 +2408,9 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 	client, err := p.dialOrSpawn(workspaceRoot)
 	if err != nil {
+		return err
+	}
+	if err := p.captureStartingClient(start, client); err != nil {
 		return err
 	}
 
@@ -2523,7 +2550,7 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 	var initResult InitializeResult
 	if err := client.Call("initialize", initParams, &initResult); err != nil {
-		_ = client.Shutdown()
+		_ = p.closeClient(client)
 		return fmt.Errorf("initialize: %w", err)
 	}
 
@@ -2536,7 +2563,7 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 	// Send initialized notification.
 	if err := client.Notify("initialized", struct{}{}); err != nil {
-		_ = client.Shutdown()
+		_ = p.closeClient(client)
 		return fmt.Errorf("initialized: %w", err)
 	}
 
@@ -2545,8 +2572,7 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 	// longer block an enrichment Call forever. See lspCallTimeout.
 	client.SetCallTimeout(lspCallTimeout())
 
-	p.client = client
-	return nil
+	return p.publishInitializedClient(client)
 }
 
 // WaitReady implements semantic.ReadinessProber for the Roslyn / MSBuild-class
@@ -2628,7 +2654,7 @@ func (p *Provider) pollWorkspaceReady(ctx context.Context, query string) error {
 // whether the server returned any symbol. A nil client or any error reads as
 // "not ready yet" rather than a hard failure.
 func (p *Provider) workspaceSymbolNonEmpty(query string) bool {
-	client := p.client
+	client := p.Client()
 	if client == nil {
 		return false
 	}
@@ -2803,7 +2829,7 @@ func (p *Provider) openDocument(repoRoot, relPath string) error {
 
 	langID := p.languageIDFor(absPath)
 
-	if err := p.client.Notify("textDocument/didOpen", DidOpenTextDocumentParams{
+	if err := p.notifyCurrentClient("textDocument/didOpen", DidOpenTextDocumentParams{
 		TextDocument: TextDocumentItem{
 			URI:        pathToURI(absPath),
 			LanguageID: langID,
@@ -2863,7 +2889,7 @@ func (p *Provider) changeDocument(absPath, newText string) error {
 	}
 	p.sourceCache[absPath] = []byte(newText)
 	p.docMu.Unlock()
-	return p.client.Notify("textDocument/didChange", DidChangeTextDocumentParams{
+	return p.notifyCurrentClient("textDocument/didChange", DidChangeTextDocumentParams{
 		TextDocument: VersionedTextDocumentIdentifier{
 			URI:     pathToURI(absPath),
 			Version: v,
@@ -2887,7 +2913,7 @@ func (p *Provider) closeDocument(absPath string) error {
 	// files would pin every one's contents until the daemon exits.
 	delete(p.sourceCache, absPath)
 	p.docMu.Unlock()
-	return p.client.Notify("textDocument/didClose", DidCloseTextDocumentParams{
+	return p.notifyCurrentClient("textDocument/didClose", DidCloseTextDocumentParams{
 		TextDocument: TextDocumentIdentifier{URI: pathToURI(absPath)},
 	})
 }
@@ -2956,7 +2982,11 @@ func (p *Provider) WaitForDiagnostics(absPath string, timeout time.Duration) []D
 
 // Client exposes the underlying LSP client for advanced callers (e.g.
 // the daemon router). Returns nil before ensureClient succeeds.
-func (p *Provider) Client() *Client { return p.client }
+func (p *Provider) Client() *Client {
+	p.lifetimeMu.Lock()
+	defer p.lifetimeMu.Unlock()
+	return p.client
+}
 
 // EnsureClient is the exported form of ensureClient — it spawns the
 // LSP server (idempotent) so callers that want diagnostics or code
@@ -3137,7 +3167,7 @@ func (p *Provider) EnrichNode(g graph.Store, repoRoot string, n *graph.Node) (bo
 	if src := p.getSource(repoRoot, rel); src != nil {
 		col = identifierColumn(src, n.StartLine, n.Name)
 	}
-	hr, err := p.hoverWith(p.client, repoRoot, rel, line, col)
+	hr, err := p.hoverWith(p.Client(), repoRoot, rel, line, col)
 	if err != nil {
 		return false, err
 	}
@@ -3172,6 +3202,9 @@ func (p *Provider) getSource(repoRoot, relPath string) []byte {
 // an in-flight hover (the goroutine holds its own pointer value).
 // KEYWORDS — lsp, hover, concurrency, reconnect
 func (p *Provider) hoverWith(c *Client, repoRoot, relPath string, line, col int) (*HoverResult, error) {
+	if c == nil {
+		return nil, errClientNotInitialized
+	}
 	absPath := filepath.Join(repoRoot, relPath)
 	params := HoverParams{
 		TextDocumentPositionParams: TextDocumentPositionParams{
@@ -3266,6 +3299,7 @@ func isServerExitError(err error) bool {
 const maxEnrichReconnectCycles = 5
 
 func (p *Provider) reconnectWithBackoff(absRoot string) (*Client, error) {
+	ctx := p.providerContext()
 	const maxReconnectAttempts = 5
 	backoff := p.dialBackoffStart
 	if backoff <= 0 {
@@ -3277,6 +3311,9 @@ func (p *Provider) reconnectWithBackoff(absRoot string) (*Client, error) {
 	}
 	var lastErr error
 	for attempt := 1; attempt <= maxReconnectAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return nil, errProviderClosed
+		}
 		p.reconnectAttempts.Add(1)
 		p.logger.Warn("LSP enrich: reconnecting after server exit",
 			zap.Int("attempt", attempt),
@@ -3286,14 +3323,20 @@ func (p *Provider) reconnectWithBackoff(absRoot string) (*Client, error) {
 			lastErr = err
 			p.logger.Warn("LSP enrich: reconnect attempt failed",
 				zap.Int("attempt", attempt), zap.Error(err))
-			time.Sleep(backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, errProviderClosed
+			case <-timer.C:
+			}
 			if backoff *= 2; backoff > maxBackoff {
 				backoff = maxBackoff
 			}
 			continue
 		}
 		p.logger.Info("LSP enrich: reconnected", zap.Int("attempt", attempt))
-		return p.client, nil
+		return p.requestClient()
 	}
 	return nil, fmt.Errorf("LSP reconnect failed after %d attempts: %w", maxReconnectAttempts, lastErr)
 }
@@ -3310,7 +3353,7 @@ func (p *Provider) findImplementations(repoRoot, relPath string, line, col int) 
 
 	p.reqStats.implementations.Add(1)
 	var locations []Location
-	if err := p.client.Call("textDocument/implementation", params, &locations); err != nil {
+	if err := p.callCurrentClient("textDocument/implementation", params, &locations); err != nil {
 		return nil, err
 	}
 	return locations, nil
@@ -3335,7 +3378,7 @@ type CodeActionsRequest struct {
 // list of CodeActionOrCommand. The provider must already have opened
 // the document via EnsureFileOpen before calling this.
 func (p *Provider) GetCodeActions(req CodeActionsRequest) ([]CodeActionOrCommand, error) {
-	if p.client == nil {
+	if p.Client() == nil {
 		return nil, fmt.Errorf("LSP client not initialized")
 	}
 	params := CodeActionParams{
@@ -3348,7 +3391,7 @@ func (p *Provider) GetCodeActions(req CodeActionsRequest) ([]CodeActionOrCommand
 		},
 	}
 	var raw []json.RawMessage
-	if err := p.client.Call("textDocument/codeAction", params, &raw); err != nil {
+	if err := p.callCurrentClient("textDocument/codeAction", params, &raw); err != nil {
 		return nil, err
 	}
 	out := make([]CodeActionOrCommand, 0, len(raw))
@@ -3369,11 +3412,11 @@ func (p *Provider) GetCodeActions(req CodeActionsRequest) ([]CodeActionOrCommand
 // analyzer, jdtls) defer the heavy WorkspaceEdit computation until
 // resolve to keep the initial codeAction call cheap.
 func (p *Provider) ResolveCodeAction(action CodeActionOrCommand) (CodeActionOrCommand, error) {
-	if p.client == nil {
+	if p.Client() == nil {
 		return action, fmt.Errorf("LSP client not initialized")
 	}
 	var resolved CodeActionOrCommand
-	if err := p.client.Call("codeAction/resolve", action, &resolved); err != nil {
+	if err := p.callCurrentClient("codeAction/resolve", action, &resolved); err != nil {
 		return action, err
 	}
 	return resolved, nil
@@ -3383,12 +3426,12 @@ func (p *Provider) ResolveCodeAction(action CodeActionOrCommand) (CodeActionOrCo
 // apply-code-action path when a CodeAction has only a Command
 // (legacy) form.
 func (p *Provider) ExecuteCommand(cmd Command) (json.RawMessage, error) {
-	if p.client == nil {
+	if p.Client() == nil {
 		return nil, fmt.Errorf("LSP client not initialized")
 	}
 	params := ExecuteCommandParams{Command: cmd.Command, Arguments: cmd.Arguments}
 	var result json.RawMessage
-	if err := p.client.Call("workspace/executeCommand", params, &result); err != nil {
+	if err := p.callCurrentClient("workspace/executeCommand", params, &result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -3407,7 +3450,7 @@ func (p *Provider) findReferences(repoRoot, relPath string, line, col int) ([]Lo
 
 	p.reqStats.references.Add(1)
 	var locations []Location
-	if err := p.client.Call("textDocument/references", params, &locations); err != nil {
+	if err := p.callCurrentClient("textDocument/references", params, &locations); err != nil {
 		return nil, err
 	}
 	return locations, nil
@@ -3421,8 +3464,9 @@ func (p *Provider) findReferences(repoRoot, relPath string, line, col int) ([]Lo
 // repoRoot is the absolute workspace root; relPath is repo-relative.
 // (line, col) are 0-based, matching LSP convention.
 func (p *Provider) FindDefinition(repoRoot, relPath string, line, col int, timeout time.Duration) ([]Location, error) {
-	if p.client == nil {
-		return nil, fmt.Errorf("LSP client not initialised")
+	client, err := p.requestClient()
+	if err != nil {
+		return nil, err
 	}
 	absPath := filepath.Join(repoRoot, relPath)
 	params := TextDocumentPositionParams{
@@ -3442,7 +3486,7 @@ func (p *Provider) FindDefinition(repoRoot, relPath string, line, col int, timeo
 		// (most common), fall back to single Location on unmarshal
 		// error.
 		var raw json.RawMessage
-		if err := p.client.Call("textDocument/definition", params, &raw); err != nil {
+		if err := client.Call("textDocument/definition", params, &raw); err != nil {
 			ch <- result{nil, err}
 			return
 		}
@@ -3836,7 +3880,7 @@ func (p *Provider) prepareCallHierarchy(repoRoot, relPath string, line, col int)
 	}
 	p.reqStats.prepareCallHierarchy.Add(1)
 	var items []CallHierarchyItem
-	if err := p.client.Call("textDocument/prepareCallHierarchy", params, &items); err != nil {
+	if err := p.callCurrentClient("textDocument/prepareCallHierarchy", params, &items); err != nil {
 		return nil, err
 	}
 	return items, nil
@@ -3846,7 +3890,7 @@ func (p *Provider) prepareCallHierarchy(repoRoot, relPath string, line, col int)
 func (p *Provider) outgoingCalls(item CallHierarchyItem) ([]CallHierarchyOutgoingCall, error) {
 	p.reqStats.outgoingCalls.Add(1)
 	var calls []CallHierarchyOutgoingCall
-	if err := p.client.Call("callHierarchy/outgoingCalls",
+	if err := p.callCurrentClient("callHierarchy/outgoingCalls",
 		CallHierarchyOutgoingCallsParams{Item: item}, &calls); err != nil {
 		return nil, err
 	}
@@ -3857,7 +3901,7 @@ func (p *Provider) outgoingCalls(item CallHierarchyItem) ([]CallHierarchyOutgoin
 func (p *Provider) incomingCalls(item CallHierarchyItem) ([]CallHierarchyIncomingCall, error) {
 	p.reqStats.incomingCalls.Add(1)
 	var calls []CallHierarchyIncomingCall
-	if err := p.client.Call("callHierarchy/incomingCalls",
+	if err := p.callCurrentClient("callHierarchy/incomingCalls",
 		CallHierarchyIncomingCallsParams{Item: item}, &calls); err != nil {
 		return nil, err
 	}
@@ -3875,7 +3919,7 @@ func (p *Provider) prepareTypeHierarchy(repoRoot, relPath string, line, col int)
 	}
 	p.reqStats.prepareTypeHierarchy.Add(1)
 	var items []TypeHierarchyItem
-	if err := p.client.Call("textDocument/prepareTypeHierarchy", params, &items); err != nil {
+	if err := p.callCurrentClient("textDocument/prepareTypeHierarchy", params, &items); err != nil {
 		return nil, err
 	}
 	return items, nil
@@ -3885,7 +3929,7 @@ func (p *Provider) prepareTypeHierarchy(repoRoot, relPath string, line, col int)
 func (p *Provider) supertypes(item TypeHierarchyItem) ([]TypeHierarchyItem, error) {
 	p.reqStats.supertypes.Add(1)
 	var items []TypeHierarchyItem
-	if err := p.client.Call("typeHierarchy/supertypes",
+	if err := p.callCurrentClient("typeHierarchy/supertypes",
 		TypeHierarchySupertypesParams{Item: item}, &items); err != nil {
 		return nil, err
 	}
@@ -3896,7 +3940,7 @@ func (p *Provider) supertypes(item TypeHierarchyItem) ([]TypeHierarchyItem, erro
 func (p *Provider) subtypes(item TypeHierarchyItem) ([]TypeHierarchyItem, error) {
 	p.reqStats.subtypes.Add(1)
 	var items []TypeHierarchyItem
-	if err := p.client.Call("typeHierarchy/subtypes",
+	if err := p.callCurrentClient("typeHierarchy/subtypes",
 		TypeHierarchySubtypesParams{Item: item}, &items); err != nil {
 		return nil, err
 	}

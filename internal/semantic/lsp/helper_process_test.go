@@ -27,7 +27,16 @@ const (
 	helperCat = "cat"
 	// helperStderrLines writes helperLinesEnv "err<N>" lines to stderr and
 	// then one line to stdout.
-	helperStderrLines = "stderr-lines"
+	helperStderrLines    = "stderr-lines"
+	helperLSPInitBarrier = "lsp-initialize-barrier"
+	helperInitEnteredEnv = "GORTEX_LSP_HELPER_INITIALIZE_ENTERED"
+	helperInitReleaseEnv = "GORTEX_LSP_HELPER_INITIALIZE_RELEASE"
+	helperLSPGraceful    = "lsp-graceful"
+	helperLSPIgnore      = "lsp-ignore-shutdown"
+	helperLSPNoRead      = "lsp-no-read"
+	helperExitClean      = "exit-clean"
+	helperTranscriptEnv  = "GORTEX_LSP_SUBPROCESS_TRANSCRIPT"
+	helperReadyEnv       = "GORTEX_LSP_SUBPROCESS_READY"
 )
 
 // helperArgs is the argv that re-runs this binary as the helper process.
@@ -61,7 +70,11 @@ func helperTransport(t *testing.T, mode string, lines int, logger *zap.Logger) *
 	return &SpawnTransport{
 		Command: helperCommand(t),
 		Args:    helperArgs,
-		Logger:  logger,
+		// Keep race detection enabled, but remove its artificial process-exit
+		// sleep from actual child-reap tests (the Go runtime's own subprocess
+		// tests use the same option). This changes only the test fixture.
+		Env:    []string{"GORACE=" + os.Getenv("GORACE") + " atexit_sleep_ms=0"},
+		Logger: logger,
 	}
 }
 
@@ -75,6 +88,10 @@ func TestSubprocessHelper(t *testing.T) {
 		return
 	}
 	switch mode {
+	case helperLSPGraceful, helperLSPIgnore, helperLSPNoRead, helperLSPInitBarrier:
+		runShutdownHelper(t, mode)
+	case helperExitClean:
+		// Immediate success exercises EOF before the caller begins shutdown.
 	case helperCat:
 		_, _ = io.Copy(os.Stdout, os.Stdin)
 	case helperStderrLines:

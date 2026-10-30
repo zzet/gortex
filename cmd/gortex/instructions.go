@@ -147,7 +147,7 @@ func runInstructionsShow(cmd *cobra.Command, args []string) error {
 func runInstructionsSwitch(cmd *cobra.Command, args []string) error {
 	name := strings.TrimSpace(args[0])
 	dir := profiles.DefaultDir()
-	p, err := profiles.Switch(dir, name)
+	p, err := profiles.Switch(dir, name, canonicalVersion())
 	if err != nil {
 		return err
 	}
@@ -206,7 +206,7 @@ func runInstructionsSwitch(cmd *cobra.Command, args []string) error {
 
 func runInstructionsRegen(cmd *cobra.Command, _ []string) error {
 	dir := profiles.DefaultDir()
-	if err := profiles.Generate(dir); err != nil {
+	if err := profiles.Generate(dir, canonicalVersion()); err != nil {
 		return err
 	}
 	cmd.Printf("Regenerated %d profile(s) in %s (active: %s — unchanged).\n",

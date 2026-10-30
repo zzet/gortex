@@ -131,16 +131,21 @@ func TestDispatcher_LoadingRepo_AnswersByMethod(t *testing.T) {
 		assert.Contains(t, text, "loading")
 	})
 
-	t.Run("initialize carries loading instructions", func(t *testing.T) {
-		parsed := dispatchJSON(t, d, sess, `{"jsonrpc":"2.0","id":30,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`)
-		result, ok := parsed["result"].(map[string]any)
-		require.True(t, ok, "loading initialize must succeed: %v", parsed)
-		instr, _ := result["instructions"].(string)
-		assert.Contains(t, instr, "LOADING")
-		assert.Contains(t, instr, "no reconnect is needed")
-		assert.NotContains(t, instr, "INACTIVE")
-		assert.NotContains(t, instr, "gortex track")
-	})
+	for method, frame := range map[string]string{
+		"initialize":      `{"jsonrpc":"2.0","id":30,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`,
+		"server/discover": `{"jsonrpc":"2.0","id":32,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"claude-code","version":"2.1.311"},"io.modelcontextprotocol/clientCapabilities":{}}}}`,
+	} {
+		t.Run(method+" carries loading instructions", func(t *testing.T) {
+			parsed := dispatchJSON(t, d, sess, frame)
+			result, ok := parsed["result"].(map[string]any)
+			require.True(t, ok, "loading discovery must succeed: %v", parsed)
+			instr, _ := result["instructions"].(string)
+			assert.Contains(t, instr, "LOADING")
+			assert.Contains(t, instr, "no reconnect is needed")
+			assert.NotContains(t, instr, "INACTIVE")
+			assert.NotContains(t, instr, "gortex track")
+		})
+	}
 
 	t.Run("tools/list answers", func(t *testing.T) {
 		parsed := dispatchJSON(t, d, sess, `{"jsonrpc":"2.0","id":31,"method":"tools/list","params":{}}`)

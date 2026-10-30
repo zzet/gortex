@@ -507,21 +507,48 @@ func newSideInputBase(t *testing.T) *sideInputBase {
 	path := filepath.Join(t.TempDir(), "base.sqlite")
 	store := builderOpenStoreAt(t, path)
 	builderIndex(t, store, repoDir)
+	want := generationPayload(store, 0)
+	if len(want) == 0 {
+		t.Fatal("the indexed base snapshot has no node or edge identity payload")
+	}
+	// This fixture transports only the main database's bytes. Explicitly
+	// checkpoint that snapshot; normal Store.Close now preserves durable WAL.
+	if err := store.CheckpointWAL(); err != nil {
+		t.Fatalf("checkpoint the main-only base snapshot: %v", err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close the base store: %v", err)
 	}
-	// A close that left a write-ahead log behind would make the bytes an
-	// incomplete database.
-	for _, sidecar := range []string{path + "-wal", path + "-shm"} {
-		if info, err := os.Stat(sidecar); err == nil && info.Size() > 0 {
-			t.Fatalf("the base store left %s behind", filepath.Base(sidecar))
-		}
+	// A nonempty WAL would make main-only bytes incomplete. The SHM index
+	// contains no database content and may remain after NO_CKPT_ON_CLOSE.
+	if info, err := os.Stat(path + "-wal"); err == nil && info.Size() > 0 {
+		t.Fatal("the base store left a nonempty WAL behind")
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("inspect the base snapshot WAL: %v", err)
 	}
 	db, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	base.db = db
+	// Prove the transported artifact itself, with no original WAL/SHM beside
+	// it: every base node/edge identity must survive the main-only copy.
+	copyPath := filepath.Join(t.TempDir(), "main-only.sqlite")
+	if err := os.WriteFile(copyPath, db, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	copyStore, err := store_sqlite.Open(copyPath)
+	if err != nil {
+		t.Fatalf("open the main-only base snapshot: %v", err)
+	}
+	defer func() {
+		if err := copyStore.Close(); err != nil {
+			t.Errorf("close the main-only base snapshot: %v", err)
+		}
+	}()
+	if missing, extra := payloadDiff(want, generationPayload(copyStore, 0)); len(missing) != 0 || len(extra) != 0 {
+		t.Fatalf("main-only snapshot changed base identities: missing=%v extra=%v", missing, extra)
+	}
 	return base
 }
 

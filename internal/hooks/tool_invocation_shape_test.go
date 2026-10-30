@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/toolref"
 )
 
 // collectHookGuidance runs every hook / adapter guidance emitter with inputs
@@ -97,13 +98,10 @@ func TestGuidanceNeverEmitsBareToolVerb(t *testing.T) {
 	}
 }
 
-// TestGuidanceRequiresNativeMCP is the positive counterpart: every rendered
-// redirect must identify a missing callable handle as a host integration
-// failure, never reinterpret it as permission to start infrastructure or use
-// the Bash mirror.
+// TestGuidanceRequiresNativeMCP checks the shared transport boundary and the
+// degraded exception together; individual adapter footers migrate separately.
 func TestGuidanceRequiresNativeMCP(t *testing.T) {
 	guidance := collectHookGuidance(t)
-	const want = "Native Gortex MCP is mandatory"
 	mustRequire := []string{
 		"defaultGrepGuidance", "defaultGlobGuidance", "formatGrepDeny",
 		"nudgeReason_empty", "gortexReadAdvisory", "kimiSubagentFallbackBriefing",
@@ -117,8 +115,10 @@ func TestGuidanceRequiresNativeMCP(t *testing.T) {
 			t.Errorf("guidance %q did not render — the collector or emitter changed", label)
 			continue
 		}
-		if !strings.Contains(text, want) {
-			t.Errorf("guidance %q does not require native MCP:\n%s", label, text)
+		for _, want := range []string{toolref.TransportClause(), toolref.DegradedModeLine()} {
+			if !strings.Contains(text, want) {
+				t.Errorf("guidance %q lost the shared sentence %q:\n%s", label, want, text)
+			}
 		}
 		if strings.Contains(text, "gortex call ") {
 			t.Errorf("guidance %q advertises a CLI fallback in an MCP-configured profile:\n%s", label, text)

@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/telemetry"
+	"github.com/zzet/gortex/internal/toolref"
 	"go.uber.org/zap"
 )
 
@@ -541,10 +542,16 @@ func TestCodingAgentInstructionsStayTerseAndDirective(t *testing.T) {
 	srv := &Server{}
 	got := srv.stateAwareInstructionsForClient("", "generic-harness")
 	require.Equal(t, codingAgentInstructions, got)
-	// The workflow directive stays compact; the shared safety policy deliberately
-	// raises the complete initialize envelope while keeping it below one 2 KiB
-	// prompt block.
-	require.Less(t, len(got), 2_048)
+	// #1030 requires the canonical transient/transport suffix in initialize.
+	// Preserve the original 2 KiB workflow/routing budget and add only the
+	// separately bounded suffix; this changes no instruction-profile ceiling.
+	suffix := "\n" + toolref.TransportClause() + " " + toolref.DegradedModeLine()
+	require.True(t, strings.HasSuffix(got, suffix))
+	require.Equal(t, 1, strings.Count(got, suffix))
+	require.Less(t, len(strings.TrimSuffix(got, suffix)), 2_048)
+	const maxSharedSuffixBytes = 1 + 80 + 1 + 240 // newline + transport + space + degraded
+	require.LessOrEqual(t, len(suffix), maxSharedSuffixBytes)
+	require.Less(t, len(got), 2_048+maxSharedSuffixBytes)
 	for _, implementationTerm := range []string{"codex", "facade", "version", "preset", "tools/list", "tools_search"} {
 		require.NotContains(t, strings.ToLower(got), implementationTerm)
 	}

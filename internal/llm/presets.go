@@ -38,6 +38,15 @@ var gatewayPresets = map[string]CustomProvider{
 		SchemaMode:    "json_schema",
 		PromptProfile: "frontier",
 	},
+	// llm.buzz (https://llm.buzz) is an OpenAI-compatible gateway; model
+	// ids carry a vendor prefix (list: GET /api/v1/models).
+	"llm-buzz": {
+		BaseURL:       "https://api.llm.buzz/api/v1",
+		Model:         "openai/gpt-5.4-mini",
+		APIKeyEnv:     "LLM_BUZZ_API_KEY",
+		SchemaMode:    "json_schema",
+		PromptProfile: "frontier",
+	},
 	// Requesty (https://docs.requesty.ai) fronts many vendors behind one
 	// key; model ids carry a vendor prefix. Regional routers:
 	// https://router.eu.requesty.ai/v1 (and .us / .ap).

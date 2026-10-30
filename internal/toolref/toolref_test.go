@@ -34,38 +34,31 @@ func TestCLIFallbackUsesCompactPublicSurface(t *testing.T) {
 
 func TestMCPRequiredLineRejectsTransportFallback(t *testing.T) {
 	t.Parallel()
-
-	got := MCPRequiredLine()
-	for _, want := range []string{
-		"Native Gortex MCP is mandatory",
-		"surface a Gortex MCP integration failure",
-		"Do not start a daemon",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("MCPRequiredLine() = %q, want %q", got, want)
-		}
-	}
-	if strings.Contains(got, "gortex call ") {
-		t.Fatalf("MCP-required guidance advertised a CLI fallback: %q", got)
+	want := "  - Native Gortex MCP is the transport for indexed code. " + TransportClause() + " " + DegradedModeLine() + "\n"
+	if got := MCPRequiredLine(); got != want {
+		t.Fatalf("MCPRequiredLine() = %q, want %q", got, want)
 	}
 }
 
-// TestMCPRequiredLineIsNotAnUnliftableStop pins #900: the stop rule must carry
-// its exception, so an agent in an untracked directory (or told by the user to
-// proceed without Gortex) continues with native tools instead of refusing.
-func TestMCPRequiredLineIsNotAnUnliftableStop(t *testing.T) {
+func TestDegradedModeAndTransportBounds(t *testing.T) {
 	t.Parallel()
-
-	got := MCPRequiredLine()
-	for _, want := range []string{
-		MCPMissingToolsException,
-		"Outside a Gortex-tracked repo",
-		"proceed without Gortex",
-		"continue with native tools",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("MCPRequiredLine() = %q, want %q", got, want)
+	line := DegradedModeLine()
+	if len(line) > 240 {
+		t.Fatalf("degraded guidance grew to %d bytes", len(line))
+	}
+	for _, text := range []string{"Never start a daemon", "empty tool search is not absence", "verify a write before resending", "do other work natively", "report only the step"} {
+		if !strings.Contains(line, text) {
+			t.Errorf("degraded guidance lost %q", text)
 		}
+	}
+	for _, text := range []string{"and stop", "gortex call "} {
+		if strings.Contains(line, text) {
+			t.Errorf("degraded guidance contains %q", text)
+		}
+	}
+	clause := TransportClause()
+	if len(clause) > 80 || !strings.Contains(clause, "`gortex call`") || !strings.Contains(clause, "git, build, and test") {
+		t.Fatalf("transport clause lost its bounded contract: %q (%d bytes)", clause, len(clause))
 	}
 }
 

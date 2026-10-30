@@ -202,6 +202,7 @@ func runInstall(cmd *cobra.Command, _ []string) (err error) {
 	}()
 
 	env := agents.Env{
+		BinaryVersion: canonicalVersion(),
 		// Root is still set so adapters that write to the daemon
 		// config use the right cwd for "this is where I was run
 		// from", but no per-repo files get written in ModeGlobal.

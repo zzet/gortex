@@ -52,8 +52,9 @@ var positioningCues = []string{
 	"MUST prefer graph queries",
 	"Hook posture is configurable",
 	"explore",
-	"Gortex MCP integration failure",
-	"Do not start a daemon",
+	toolref.TransportClause(),
+	toolref.DegradedModeLine(),
+	"Never start a daemon",
 	"automatic overlay",
 	"explicit user request to track",
 	"selected overlay plus exactly one designated primary",
@@ -114,20 +115,18 @@ func TestEveryProfileKeepsPositioningCues(t *testing.T) {
 	}
 }
 
-// TestEveryProfileBoundsTheIntegrationFailureStop pins #900: the "report an
-// integration failure and stop" rule must carry its exception in every
-// profile, so an agent in an untracked directory, or one the user told to
-// proceed without Gortex, continues with native tools instead of refusing.
-func TestEveryProfileBoundsTheIntegrationFailureStop(t *testing.T) {
+func TestEveryProfileKeepsSharedDegradedGuidance(t *testing.T) {
 	for _, p := range Table() {
 		body := p.Body()
-		stops := strings.Count(body, "integration failure and stop")
-		if stops == 0 {
-			t.Errorf("profile %q lost the tracked-repo integration-failure rule", p.Name)
+		for _, sentence := range []string{toolref.TransportClause(), toolref.DegradedModeLine()} {
+			if !strings.Contains(body, sentence) {
+				t.Errorf("profile %q lost shared sentence %q", p.Name, sentence)
+			}
 		}
-		if got := strings.Count(body, toolref.MCPMissingToolsException); got != stops {
-			t.Errorf("profile %q carries %d stop rule(s) but %d exception(s); every stop must be liftable outside a tracked repo",
-				p.Name, stops, got)
+		for _, stop := range []string{"integration failure and stop", "integration failure, stop", "stop indexed code operations"} {
+			if strings.Contains(body, stop) {
+				t.Errorf("profile %q still abandons a transient step: %q", p.Name, stop)
+			}
 		}
 	}
 }

@@ -59,6 +59,8 @@ type CheckoutMutation struct {
 	checkout        store_sqlite.Checkout
 	rootInfo        os.FileInfo
 	route           store_sqlite.CheckoutRoute
+	refusalOwner    *CheckoutLifecycle
+	refusalWitness  checkoutMutationRefusalWitness
 	recovery        bool
 	prepared        bool
 	fresh           bool
@@ -116,6 +118,18 @@ func lifecycleOutputAuthority(l *CheckoutLifecycle) *OutputGenerationAuthority {
 // waited for, bounded (awaitMutationCoordinator), and refused only if none
 // appears.
 func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutID, expectedRoot string, expectedRouteEpoch int64) (*CheckoutMutation, error) {
+	return l.beginCheckoutMutation(ctx, checkoutID, expectedRoot, expectedRouteEpoch, "", nil)
+}
+
+// BeginCheckoutMutationAtView preserves ordinary admission and additionally
+// carries a caller's already-materialized exact route/incarnation. Only refusal
+// policy uses this proof when admission cannot reach its own route check; it
+// does not replace any source admission/identity/snapshot guard.
+func (l *CheckoutLifecycle) BeginCheckoutMutationAtView(ctx context.Context, checkoutID, expectedRoot, incarnation string, route store_sqlite.CheckoutRoute) (*CheckoutMutation, error) {
+	return l.beginCheckoutMutation(ctx, checkoutID, expectedRoot, route.RouteEpoch, incarnation, &route)
+}
+
+func (l *CheckoutLifecycle) beginCheckoutMutation(ctx context.Context, checkoutID, expectedRoot string, expectedRouteEpoch int64, incarnation string, selected *store_sqlite.CheckoutRoute) (_ *CheckoutMutation, resultErr error) {
 	if l == nil || l.catalog == nil || checkoutID == "" || expectedRoot == "" || expectedRouteEpoch <= 0 {
 		return nil, fmt.Errorf("%w: exact checkout identity and route epoch are required", ErrCheckoutMutationStale)
 	}
@@ -129,6 +143,15 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 	if !found || !sameMutationRoot(checkout.RootPath, expectedRoot) {
 		return nil, fmt.Errorf("%w: checkout root changed", ErrCheckoutMutationStale)
 	}
+	witness := l.mutationRefusalWitness(checkout, expectedRouteEpoch)
+	defer func() {
+		if selected != nil && selected.CheckoutID == checkoutID && checkout.Incarnation == incarnation {
+			// Deeper admission evidence wins over selection evidence. Never
+			// fetch a replacement row after the failure to fill this gap.
+			resultErr = withMutationRefusalRoute(resultErr, *selected)
+		}
+		resultErr = l.captureMutationRefusalError(resultErr, witness)
+	}()
 	rootInfo, err := checkoutRootFileInfo(checkout.RootPath)
 	if err != nil || !rootInfo.IsDir() {
 		return nil, fmt.Errorf("%w: checkout root is unavailable", ErrCheckoutMutationStale)
@@ -178,6 +201,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 		return nil, err
 	}
 	admitted, cycleOwned = false, false // Close now owns every acquired resource.
+	l.clearMutationRefusalOnAdmission(witness, m)
 	return m, nil
 }
 
@@ -186,7 +210,7 @@ func (l *CheckoutLifecycle) BeginCheckoutMutation(ctx context.Context, checkoutI
 // caller's exact selection and requires ancestry custody previously supplied by
 // a materialized view. The caller owns source admission and cycleMu on error;
 // a returned mutation owns both until Close.
-func (l *CheckoutLifecycle) admitCheckoutMutationLocked(ctx context.Context, c *CheckoutCoordinator, checkout store_sqlite.Checkout, rootInfo os.FileInfo, expectedRouteEpoch int64, selected *store_sqlite.CheckoutRoute) (*CheckoutMutation, error) {
+func (l *CheckoutLifecycle) admitCheckoutMutationLocked(ctx context.Context, c *CheckoutCoordinator, checkout store_sqlite.Checkout, rootInfo os.FileInfo, expectedRouteEpoch int64, selected *store_sqlite.CheckoutRoute) (_ *CheckoutMutation, resultErr error) {
 	m := &CheckoutMutation{coordinator: c, checkout: checkout, rootInfo: rootInfo}
 	if err := m.validateCheckout(ctx); err != nil {
 		return nil, err
@@ -202,6 +226,7 @@ func (l *CheckoutLifecycle) admitCheckoutMutationLocked(ctx context.Context, c *
 		return nil, ErrCheckoutMutationRouteMoved
 	}
 	m.route = route
+	defer func() { resultErr = withMutationRefusalRoute(resultErr, route) }()
 	// Catalog motion is retryable regardless of whether this layout can pin
 	// HEAD without git. Refuse it before sampling; the fallback sample checks
 	// the layers again to cover a base publication racing that sample.
@@ -366,7 +391,9 @@ func (m *CheckoutMutation) Prepare(ctx context.Context) error {
 	// Any sample begun from here on will do, so one another caller starts
 	// while this one waits for the sampling lease is shared, not repeated.
 	if err := m.validateSnapshot(ctx, time.Now()); err != nil {
-		return err
+		// Policy is published only by a caller that also proves the operation
+		// wrote nothing. A batch may already have committed another file.
+		return m.prepareRefusal(ctx, err)
 	}
 	StampPublicationPhase(ctx, PublicationWriteValidated)
 	if err := m.coordinator.reserveCheckoutRefresh(); err != nil {
@@ -580,6 +607,11 @@ func sameMutationRoot(a, b string) bool {
 	return pathkey.EqualPaths(a, b)
 }
 
+type checkoutMutationSampleFailure struct{ err error }
+
+func (e *checkoutMutationSampleFailure) Error() string { return e.err.Error() }
+func (e *checkoutMutationSampleFailure) Unwrap() error { return e.err }
+
 // An unchanged route epoch does not imply unchanged disk: external editors and
 // git can run before the watcher reconciles. Refuse their newer state instead
 // of applying symbol offsets from the previously materialized generation.
@@ -593,7 +625,9 @@ func (m *CheckoutMutation) validateSnapshot(ctx context.Context, since time.Time
 	ctx = gitstate.WithUrgentSample(ctx)
 	sample, err := sampleMutationAdmission(ctx, c.sampler, since)
 	if err != nil {
-		return fmt.Errorf("%w: sample checkout: %w", ErrCheckoutMutationStale, err)
+		// Preserve the existing typed refusal/receipt while distinguishing
+		// unknown sampling I/O from an observed stale working-copy snapshot.
+		return &checkoutMutationSampleFailure{err: fmt.Errorf("%w: sample checkout: %w", ErrCheckoutMutationStale, err)}
 	}
 	StampPublicationPhase(ctx, PublicationWriteSampled)
 	if m.byteAnchor != nil {
@@ -694,7 +728,7 @@ func (c *CheckoutCoordinator) checkRouteLayers(ctx context.Context, route store_
 // without holding the cycle lock, so a stale tree is refused at once instead
 // of after the coordinator's queued build. A route that is not active at the
 // expected epoch is the same refusal the locked check would give.
-func (c *CheckoutCoordinator) refuseStaleAdmission(ctx context.Context, expectedRouteEpoch int64) error {
+func (c *CheckoutCoordinator) refuseStaleAdmission(ctx context.Context, expectedRouteEpoch int64) (resultErr error) {
 	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
 	if err != nil {
 		return err
@@ -702,6 +736,7 @@ func (c *CheckoutCoordinator) refuseStaleAdmission(ctx context.Context, expected
 	if !found || route.State != store_sqlite.RouteActive || route.RouteEpoch != expectedRouteEpoch || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
 		return fmt.Errorf("%w: checkout route changed; read the current exact view and retry", ErrCheckoutMutationRouteMoved)
 	}
+	defer func() { resultErr = withMutationRefusalRoute(resultErr, route) }()
 	if _, err := c.checkRouteLayers(ctx, route); err != nil {
 		return err
 	}
@@ -713,7 +748,7 @@ func (c *CheckoutCoordinator) refuseStaleAdmission(ctx context.Context, expected
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return checkoutMutationAdmissionError(ctx, "checkout snapshot pre-check", ctxErr)
 		}
-		return fmt.Errorf("%w: sample checkout: %w", ErrCheckoutMutationStale, err)
+		return &checkoutMutationSampleFailure{err: fmt.Errorf("%w: sample checkout: %w", ErrCheckoutMutationStale, err)}
 	}
 	return c.checkRoutedSnapshot(ctx, route, sample)
 }

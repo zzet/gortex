@@ -6,7 +6,9 @@ description: "Mandatory Gortex public-tool workflow"
 
 ## MANDATORY: Use Gortex MCP tools instead of Read/Grep
 
-For every coding task:
+Follow advertised tools and server/session instructions. Compact examples require those tools; otherwise follow legacy session guidance. Missing `change` alone is not missing editing when legacy editors are advertised. Read-only policies and explicit denials still apply.
+
+When Gortex can serve the step:
 
 1. Call `explore` first with the complete task. Work from the returned source and call paths; do not reopen them with file or shell tools.
 2. Inspect indexed code only with `search`, `read`, `relations`, and `trace`. Never use Read/Grep/Glob or shell equivalents for indexed source.
@@ -30,7 +32,7 @@ Common calls:
 
 Never restart the daemon, delete its store, or re-track merely to expose a worktree.
 
-If the Gortex server is configured but these tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or switch to a CLI/shell fallback. Outside a Gortex-tracked repo, or when the user says to proceed without Gortex, say so once and continue with native tools.
+Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
 
 Use `recall` before revisiting prior work and `remember` immediately for durable decisions, invariants, or gotchas.
 === project/home/.gemini/antigravity/knowledge/gortex-workflow/metadata.json ===
@@ -100,7 +102,9 @@ description: "Mandatory Gortex public-tool workflow"
 
 ## MANDATORY: Use Gortex MCP tools instead of Read/Grep
 
-For every coding task:
+Follow advertised tools and server/session instructions. Compact examples require those tools; otherwise follow legacy session guidance. Missing `change` alone is not missing editing when legacy editors are advertised. Read-only policies and explicit denials still apply.
+
+When Gortex can serve the step:
 
 1. Call `explore` first with the complete task. Work from the returned source and call paths; do not reopen them with file or shell tools.
 2. Inspect indexed code only with `search`, `read`, `relations`, and `trace`. Never use Read/Grep/Glob or shell equivalents for indexed source.
@@ -124,7 +128,7 @@ Common calls:
 
 Never restart the daemon, delete its store, or re-track merely to expose a worktree.
 
-If the Gortex server is configured but these tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or switch to a CLI/shell fallback. Outside a Gortex-tracked repo, or when the user says to proceed without Gortex, say so once and continue with native tools.
+Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
 
 Use `recall` before revisiting prior work and `remember` immediately for durable decisions, invariants, or gotchas.
 === global/home/.gemini/antigravity/knowledge/gortex-workflow/metadata.json ===

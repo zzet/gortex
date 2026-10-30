@@ -95,7 +95,9 @@ func (s *Server) prepareByteEditAuthority(ctx context.Context, req *mcp.CallTool
 		return ctx, nil, noop, nil
 	}
 	if err != nil {
-		return ctx, nil, noop, mcp.NewToolResultError(fmt.Sprintf("%s: byte mutation admission refused; no files were changed: %v", graphview.CodeViewReadOnly, err))
+		nativeAllowed := s.lifecycle.RecordCheckoutMutationRefusal(ctx, err)
+		message := fmt.Sprintf("%s: byte mutation admission refused; no files were changed: %v", graphview.CodeViewReadOnly, err)
+		return ctx, nil, noop, mcp.NewToolResultError(checkoutMutationRecoveryMessage(message, err, nativeAllowed))
 	}
 	root := control.Checkout.RootPath
 	info, err := indexer.SourceRootFileInfo(root)
@@ -114,6 +116,8 @@ func (s *Server) prepareByteEditAuthority(ctx context.Context, req *mcp.CallTool
 	view := &requestView{kind: requestViewKindWorktree, rider: rider, viewRoot: root, sourceScope: "file", sourceRootInfo: info, sourceResolvedRoot: resolved, sourceCheckoutIncarnation: control.Checkout.Incarnation, sourceRepoPrefix: control.RepoPrefix, sourceGraphPending: true, declared: graphview.Completeness{graphview.CapSourceSnapshot: graphview.StateComplete}}
 	ctx = withRequestView(ctx, view)
 	ctx = withCheckoutMutation(ctx, mutation, root)
+	// byteEditRequest admits only top-level single-file edit/write shapes.
+	checkoutMutationFromContext(ctx).singleFile = true
 	ctx = withCheckoutControl(ctx, control)
 	if snapshot != nil {
 		ctx = withOverlayRequestSnapshot(ctx, snapshot)

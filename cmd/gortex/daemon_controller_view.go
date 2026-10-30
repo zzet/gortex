@@ -318,10 +318,12 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 		abs = resolved
 	}
 
+	mutationProbe := c.lifecycle.CaptureCheckoutMutationProbe()
 	view := c.resolveProbeView(ctx, abs)
 	defer view.release()
 
 	out := daemon.FileCoverageResult{View: view.answer, Tracked: c.pathTracked(abs, view)}
+
 	// On a warm restart the persisted catalog binds a configured repository
 	// before warmup registers it, so the coverage below reads its persisted
 	// rows and reports the file covered while every graph call refuses with
@@ -349,6 +351,12 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 		return out, nil
 	}
 	out.Answered = true
+	if c.lifecycle != nil && view.answer != nil && view.root != "" {
+		state, reason := c.lifecycle.CheckoutMutationStateForProbe(ctx, view.answer.CheckoutID, view.root, mutationProbe, view.servable && view.answer.Exact)
+		if state == "read_only" || (state == "ready" && view.servable && view.answer.Exact) {
+			out.MutationState, out.MutationReason = state, reason
+		}
+	}
 	// Newer graph writers use slash keys; retained graphs can still hold
 	// repo-prefixed native keys. Prefer the canonical spelling without
 	// counting both copies when a graph contains both generations of keys.

@@ -67,8 +67,7 @@ func (s *Server) prepareRoutedViewMutation(
 	if mutationBeforeAdmission != nil {
 		mutationBeforeAdmission(ctx)
 	}
-	mutation, err := s.lifecycle.BeginCheckoutMutation(ctx, view.rider.CheckoutID,
-		view.viewRoot, view.materialized.CheckoutRouteEpoch)
+	mutation, err := s.beginViewMutationWithRefusalProof(ctx, view)
 	release := noop
 	// The route (or the base under it) moved between this request's view
 	// selection and its admission — a base advance or a rebuild published in
@@ -96,8 +95,7 @@ func (s *Server) prepareRoutedViewMutation(
 			break
 		}
 		var retried *indexer.CheckoutMutation
-		retried, err = s.lifecycle.BeginCheckoutMutation(ctx, reselected.rider.CheckoutID,
-			reselected.viewRoot, reselected.materialized.CheckoutRouteEpoch)
+		retried, err = s.beginViewMutationWithRefusalProof(ctx, reselected)
 		if err != nil {
 			reselected.close()
 			continue
@@ -108,14 +106,27 @@ func (s *Server) prepareRoutedViewMutation(
 		release = reselected.close
 	}
 	if err != nil {
+		nativeAllowed := s.lifecycle.RecordCheckoutMutationRefusal(ctx, err)
 		s.activateSelectedCheckout(view.rider.CheckoutID, "source mutation needs a fresh checkout view")
-		return ctx, noop, mcp.NewToolResultError(fmt.Sprintf(
-			"%s: checkout mutation was not admitted; no files were changed: %v", graphview.CodeViewReadOnly, err))
+		message := fmt.Sprintf("%s: checkout mutation was not admitted; no files were changed: %v", graphview.CodeViewReadOnly, err)
+		message = checkoutMutationRecoveryMessage(message, err, nativeAllowed)
+		return ctx, noop, mcp.NewToolResultError(message)
 	}
-	return withCheckoutMutation(ctx, mutation, view.viewRoot), func() {
+	ctx = withCheckoutMutation(ctx, mutation, view.viewRoot)
+	checkoutMutationFromContext(ctx).singleFile = singleFileCheckoutMutationTool(legacy)
+	return ctx, func() {
 		mutation.Close()
 		release()
 	}, nil
+}
+
+func singleFileCheckoutMutationTool(tool string) bool {
+	switch tool {
+	case "edit_file", "write_file", "edit_symbol":
+		return true
+	default:
+		return false
+	}
 }
 
 // routeRecompositionWait bounds how long an edit waits for its checkout's
@@ -191,4 +202,26 @@ func (s *Server) reselectMutationView(
 		return nil, fmt.Errorf("the reselected view is not the same exact checkout")
 	}
 	return view, nil
+}
+
+// Busy/Pending retain their retry semantics; only stale refusal opens the
+// checkout's native recovery path. Reconnecting is a user action, not a hook
+// daemon restart or an instruction to change configuration.
+func checkoutMutationRecoveryMessage(message string, err error, nativeAllowed bool) string {
+	if errors.Is(err, indexer.ErrCheckoutMutationStale) && !errors.Is(err, indexer.ErrCheckoutMutationBusy) && !errors.Is(err, indexer.ErrCheckoutMutationPending) {
+		if nativeAllowed {
+			message += ". Native read/edit is allowed for this checkout until a fresh view is ready."
+		} else {
+			message += ". Native fallback status was not established for this checkout."
+		}
+		message += " Wait for a fresh view and retry the Gortex edit, or reconnect the MCP session."
+	}
+	return message
+}
+
+func (s *Server) beginViewMutationWithRefusalProof(ctx context.Context, view *requestView) (*indexer.CheckoutMutation, error) {
+	if route, known := view.materialized.CheckoutMutationRoute(); known && view.answerIdentity != nil && view.answerIdentity.incarnation != "" {
+		return s.lifecycle.BeginCheckoutMutationAtView(ctx, view.rider.CheckoutID, view.viewRoot, view.answerIdentity.incarnation, route)
+	}
+	return s.lifecycle.BeginCheckoutMutation(ctx, view.rider.CheckoutID, view.viewRoot, view.materialized.CheckoutRouteEpoch)
 }

@@ -21,7 +21,7 @@ func (s *Server) outlineGenerationCommunities(ctx context.Context, reader graph.
 	if !ok {
 		return nil, false, nil
 	}
-	_, header, current := s.activeAnalysisQuery()
+	_, header, current := s.activeAnalysisQueryForAnswer()
 	if !current {
 		return nil, false, nil
 	}
@@ -53,7 +53,7 @@ func (s *Server) outlineGenerationCommunities(ctx context.Context, reader graph.
 	}
 	// Pages must all describe the same still-current publication. Never mix
 	// a partition read before a mutation with nodes from a subsequent revision.
-	_, after, current := s.activeAnalysisQuery()
+	_, after, current := s.activeAnalysisQueryForAnswer()
 	if !current || after.GenerationID != header.GenerationID {
 		return nil, false, nil
 	}

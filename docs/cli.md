@@ -80,6 +80,11 @@ gortex untrack backend
 gortex status
 ```
 
+Offline `untrack` requires a repository path; a bare prefix is resolved by the
+running daemon. To recover from an unwanted warmup, stop first, then run
+`gortex untrack /absolute/path/to/unwanted-repository`, and start the daemon
+again. See [Recovering from a runaway warmup](onboarding.md#recovering-from-a-runaway-warmup).
+
 ## Repository prefix collisions
 
 A repository prefix identifies one indexed root. By default, it is the directory
@@ -451,6 +456,21 @@ gortex instructions list
 gortex instructions switch localization   # lean machine: diet body + 10-tool surface + lean hooks
 gortex instructions switch core           # back to the balanced default
 ```
+
+
+Generated instruction profiles record the binary version that produced them.
+On daemon startup, an existing managed installation refreshes after an upgrade;
+its saved active selection stays unchanged, even when the daemon process has a
+`GORTEX_INSTRUCTIONS_PROFILE` override. The refresh applies to new sessions.
+A second start leaves already-current files unchanged.
+
+Automatic refresh accepts only recorded generated files or exact known legacy
+profile bodies from v0.64.10 and v0.64.11. It preserves customized, unrecognized or symlinked files and
+logs how to resolve the conflict; the daemon continues serving. Back up and move
+conflicting generated files aside, then run `gortex instructions regen` to
+restore them and record the current version. Keep personal guidance in your
+agent's user-managed instructions rather than editing generated profile files.
+
 
 ### `gortex analyze` — unified analysis dispatcher
 

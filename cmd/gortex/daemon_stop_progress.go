@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
@@ -39,17 +38,19 @@ func resolveDaemonCloseNoProgressBound() time.Duration {
 // A seam: the stop tests install a fake close.
 var daemonCloseProgress func() (store_sqlite.CloseProgress, bool)
 
-// installDaemonCloseProgress points daemonCloseProgress at the running
-// daemon's store and returns the reset.
-func installDaemonCloseProgress() func() {
-	if daemonCloseProgress != nil {
+func installDaemonCloseProgressForTarget(target *daemonStopTarget) func() {
+	if target.store == nil {
 		return func() {}
 	}
-	st, ok := daemon.ReadRuntimeState()
-	if !ok || strings.TrimSpace(st.BackendPath) == "" {
+	return installDaemonCloseProgressForStore(strings.TrimSuffix(target.store.path, ".lock"))
+}
+
+// Both ordinary stop and protocol handoff already captured their store before
+// signaling. Never rediscover it from a possibly replaced ambient runtime.
+func installDaemonCloseProgressForStore(path string) func() {
+	if daemonCloseProgress != nil || strings.TrimSpace(path) == "" {
 		return func() {}
 	}
-	path := st.BackendPath
 	daemonCloseProgress = func() (store_sqlite.CloseProgress, bool) { return store_sqlite.ReadCloseProgress(path) }
 	return func() { daemonCloseProgress = nil }
 }

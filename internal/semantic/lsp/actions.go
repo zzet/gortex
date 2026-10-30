@@ -87,7 +87,7 @@ type FixAllResult struct {
 // command execution by setting FixAllOptions.Kinds to include
 // "source.fixAll" or by calling ExecuteCommand directly.
 func (p *Provider) FixAllInFile(opts FixAllOptions) (*FixAllResult, error) {
-	if p.client == nil {
+	if p.Client() == nil {
 		return nil, errors.New("LSP client not initialized")
 	}
 	if opts.AbsPath == "" {

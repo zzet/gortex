@@ -10,11 +10,17 @@ import "github.com/zzet/gortex/internal/progress"
 // Order matters for goreleaser ldflag templates — keep these unchanged.
 var (
 	version = "0.64.11" // SemVer 2.0.0 string without build slot (e.g. "0.1.0", "0.1.0-rc1")
-	commit  = ""       // short git SHA (e.g. "abc1234"); becomes +<build> in the canonical form
-	date    = ""       // RFC-3339 build timestamp
+	commit  = ""        // short git SHA (e.g. "abc1234"); becomes +<build> in the canonical form
+	date    = ""        // RFC-3339 build timestamp
 )
 
 func main() {
+	lifetime := &daemonProcessLifetime{}
+	mainDaemonLifetime = lifetime
+	// Register first, so the guard also covers Cobra's post-run work and
+	// terminal restoration. In-process command tests do not call main and
+	// cannot install a process-exit hook by merely starting a daemon fixture.
+	defer lifetime.disarm()
 	// A panic that unwinds out of a command must not leave the terminal with
 	// a hidden cursor from a live progress animation.
 	defer progress.RestoreTerminal()

@@ -42,7 +42,9 @@ func TestOpenBackendRetainsNewerSchemaWithoutRestartAdvice(t *testing.T) {
 
 			g, cleanup, err := OpenBackend("sqlite", path, zap.NewNop(), allowRebuild)
 			if cleanup != nil {
-				cleanup()
+				if cleanupErr := cleanup(); cleanupErr != nil {
+					t.Fatalf("cleanup after attempted backend open: %v (open error: %v)", cleanupErr, err)
+				}
 			}
 			if g != nil || !errors.Is(err, store_sqlite.ErrSchemaTooNew) {
 				t.Fatalf("newer schema: store=%v, error=%v", g, err)
@@ -125,7 +127,9 @@ func BenchmarkOpenBackendFutureSchemaRefusal(b *testing.B) {
 	for range b.N {
 		g, cleanup, err := OpenBackend("sqlite", path, nil, true)
 		if cleanup != nil {
-			cleanup()
+			if cleanupErr := cleanup(); cleanupErr != nil {
+				b.Fatalf("cleanup after attempted backend open: %v (open error: %v)", cleanupErr, err)
+			}
 		}
 		if g != nil || !errors.Is(err, store_sqlite.ErrSchemaTooNew) {
 			b.Fatalf("newer schema: store=%v, error=%v", g, err)

@@ -55,9 +55,35 @@ var rootCmd = &cobra.Command{
 	// and consent-gated, so a default run touches no disk and never affects
 	// the command's exit.
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
-		recordCLIUsage(cmd, telemetry.NewStore(platform.TelemetryDir()), os.Getenv)
-		recordCLIEvent(cmd, os.Getenv)
+		recordCLIInvocationAfterRun(cmd)
 	},
+}
+
+const foregroundDaemonRecorded = "gortex.foreground-daemon-recorded"
+
+// A foreground daemon cannot open the CLI sidecar after its shared stack has
+// closed. Record its invocation on actual foreground entry instead. The detach
+// parent still uses the ordinary post-run path; the child exclusions below are
+// unchanged. An annotation belongs to this invocation, not a process registry.
+func recordForegroundDaemonInvocation(cmd *cobra.Command) {
+	recordCLIInvocation(cmd)
+	if cmd.Annotations == nil {
+		cmd.Annotations = make(map[string]string)
+	}
+	cmd.Annotations[foregroundDaemonRecorded] = "true"
+}
+
+func recordCLIInvocationAfterRun(cmd *cobra.Command) {
+	if cmd.Annotations[foregroundDaemonRecorded] == "true" {
+		delete(cmd.Annotations, foregroundDaemonRecorded)
+		return
+	}
+	recordCLIInvocation(cmd)
+}
+
+func recordCLIInvocation(cmd *cobra.Command) {
+	recordCLIUsage(cmd, telemetry.NewStore(platform.TelemetryDir()), os.Getenv)
+	recordCLIEvent(cmd, os.Getenv)
 }
 
 // cliEventSidecarPath resolves the sidecar database the consent-free CLI-verb

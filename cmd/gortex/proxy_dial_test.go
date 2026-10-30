@@ -85,8 +85,8 @@ func TestDialDaemonWithRetry_ProtocolMismatchConcedesImmediately(t *testing.T) {
 		return nil, fmt.Errorf("%w: stale", daemon.ErrProtocolVersionMismatch)
 	}
 	client, recoverable, err := dialDaemonWithRetry(context.Background(), daemon.Handshake{})
-	if client != nil || !recoverable || !errors.Is(err, daemon.ErrProtocolVersionMismatch) {
-		t.Fatalf("want (nil, true, mismatch), got (%v, %v, %v)", client, recoverable, err)
+	if client != nil || recoverable || !errors.Is(err, daemon.ErrProtocolVersionMismatch) {
+		t.Fatalf("want (nil, false, mismatch), got (%v, %v, %v)", client, recoverable, err)
 	}
 	// A mismatch never resolves by waiting — must not retry.
 	if got := atomic.LoadInt32(&calls); got != 1 {

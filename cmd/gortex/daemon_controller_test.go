@@ -669,3 +669,18 @@ func TestEveryControllerEnrichDoorReportsASupersededRunAsLanded(t *testing.T) {
 		})
 	}
 }
+
+func TestControllerCochangeUsesSharedTerminalMaintenanceAdmission(t *testing.T) {
+	c, mi, _, dir := buildCatalogController(t)
+	prefix, _ := trackEnrichRepo(t, c, dir, "closed-cochange")
+	// The production binding is immutable before listener publication. A
+	// terminal MCP owner must refuse the real control method before it names
+	// a new output, even though its controller and tracked targets still exist.
+	c.maintenance = &gortexmcp.Server{}
+	c.maintenance.BeginBackgroundClose()
+	before := mi.ResolvedOutputGenerationAuthority().Stats()
+	_, err := c.EnrichCochange(context.Background(), daemon.EnrichCochangeParams{Path: prefix})
+	require.ErrorIs(t, err, context.Canceled)
+	after := mi.ResolvedOutputGenerationAuthority().Stats()
+	require.Equal(t, before.Issued, after.Issued, "control path bypassed the shared close gate")
+}

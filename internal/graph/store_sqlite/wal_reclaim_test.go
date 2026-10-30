@@ -233,6 +233,8 @@ func TestWALReclaimRespectsGenerationBulkLease(t *testing.T) {
 // Close drains a large un-backfilled log: the budget scales with the backlog,
 // the final TRUNCATE resets the log, and the file is removed or empty.
 func TestCloseCheckpointDrainsLargeBacklog(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT", "full")
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT_MAX_S", "")
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
 	s, path := openWALReclaimStore(t)
 	seedWALChurnTable(t, s)

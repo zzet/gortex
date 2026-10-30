@@ -1,6 +1,6 @@
 // Package toolref renders references to Gortex tools for agent guidance.
-// MCP-capable profiles get an explicit native-MCP requirement and must surface
-// a missing callable handle as an integration failure. Bash-only profiles and
+// MCP-capable profiles keep indexed operations on MCP while temporary
+// failures leave agents free to continue other work. Bash-only profiles and
 // CLI diagnostics can separately render the real `gortex call <tool> --arg
 // k=v` shape, never the invalid bare `gortex <tool>` form.
 package toolref
@@ -52,20 +52,31 @@ func ConcreteCLIFallback(tool string) (string, bool) {
 	return example, ok
 }
 
-// MCPMissingToolsException bounds the "integration failure, stop" rule to
-// where it belongs: indexed code in a Gortex-tracked repo. In a directory no
-// tracked repo covers (an agent-created clone, a scratch checkout) the graph
-// tools are legitimately absent, and an explicit user instruction to proceed
-// without Gortex must win; otherwise the guidance is a hard stop the user
-// cannot lift (#900). The instruction profiles, the shared agent
-// InstructionsBody, and MCPRequiredLine append this sentence verbatim.
+// MCPMissingToolsException is retained for older per-agent policy strings.
+// Shared producers use the unconditional step-scoped degraded guidance below;
+// per-agent content migrations remain a separate compatibility change.
 const MCPMissingToolsException = "Outside a Gortex-tracked repo, or when the user says to proceed without Gortex, say so once and continue with native tools."
 
-// MCPRequiredLine is the standard transport rule appended to guidance emitted
-// by hooks installed for an MCP-capable profile. A configured server whose
-// tools are absent from the model's callable manifest is a host integration
-// failure, not permission to launch infrastructure or switch transports —
-// except outside a tracked repo or on an explicit user override.
+// Constant forms let shared instruction blocks remain compile-time constants;
+// the rendering helpers below return these exact sentences on every surface.
+const DegradedModeText = "If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure."
+
+// ToolSurfacePolicyText keeps installed examples subordinate to the actual
+// session policy. Explicit compatibility presets remain valid MCP surfaces;
+// this rule neither promotes tools nor bypasses an operator restriction.
+const ToolSurfacePolicyText = "Follow advertised tools and server/session instructions. Compact examples require those tools; otherwise follow legacy session guidance. Missing `change` alone is not missing editing when legacy editors are advertised. Read-only policies and explicit denials still apply."
+
+const TransportText = "Never use `gortex call` in place of MCP; git, build, and test commands are fine."
+
+// DegradedModeLine is the bounded standing policy for transient and unavailable
+// graph operations, including ambiguous write acknowledgements.
+func DegradedModeLine() string { return DegradedModeText }
+
+// TransportClause keeps the MCP transport boundary separate from ordinary
+// developer commands and native work that does not need the graph.
+func TransportClause() string { return TransportText }
+
+// MCPRequiredLine is shared by MCP-capable lifecycle guidance.
 func MCPRequiredLine() string {
-	return "  - Native Gortex MCP is mandatory for this profile. If a referenced Gortex tool is missing from the callable MCP tools despite the server being configured, surface a Gortex MCP integration failure to the user and stop. Do not start a daemon or use any CLI/shell fallback. " + MCPMissingToolsException + "\n"
+	return "  - Native Gortex MCP is the transport for indexed code. " + TransportClause() + " " + DegradedModeLine() + "\n"
 }

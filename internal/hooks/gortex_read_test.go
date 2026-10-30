@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/toolref"
 )
 
 // withForceCompress flips GORTEX_HOOK_FORCE_COMPRESS for one test and
@@ -31,7 +33,7 @@ func TestGortexReadNudge_CompactReadShape(t *testing.T) {
 		"target":    map[string]any{"file": "internal/resolver/resolver.go"},
 	}
 	msg := gortexReadNudge(gortexCompactReadTool, input)
-	for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, `read(target:{file:`, "Native Gortex MCP is mandatory"} {
+	for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, `read(target:{file:`, toolref.TransportClause(), toolref.DegradedModeLine()} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("compact read nudge missing %q:\n%s", want, msg)
 		}
