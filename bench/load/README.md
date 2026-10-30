@@ -89,9 +89,32 @@ content after another edit, serialize offered arrivals, or change retry intent.
 Out-of-order overlapping writes can overwrite later changes; ordinary stale,
 readback, refusal and evidence failures remain in the full denominator. The same
 seven oracles, per-edit sessions, own-ACK readbacks and receipt accounting apply.
-Write, symbol and batch receipts are not interchangeable; symbol and batch
-scenario adapters remain unsupported. These source cells have no runtime or
-reference acceptance until their actual runs establish it.
+Write, symbol and batch receipts are not interchangeable. `edit.symbol` uses
+an exact splice within an actual indexed declaration. The one-file `edit.batch`
+adapter offers exact whole-file before/after strings and checks the durable
+transaction, shared acknowledgement and per-file graph ticket separately.
+Implementation controls and a one-edit diagnostic do not establish the
+100-edit, reference, traffic-matrix or no-regression gates.
+
+The optional `edit_kind` selects `append_leaf`, `rename` or `delete`; omission
+retains `add_intrafile_call`. These are explicit fixture cells, not arbitrary
+source transformations. A leaf must be a numeric zero-argument function with
+no incoming or outgoing calls in complete relation results. Rename/delete
+fixtures precreate each unique `GortexEditProbe…Before` declaration in the
+pinned `edit_initial_content`; offered splices target that exact declaration.
+Whole-file write/batch requests retain the precomputed offered prefix, including
+out-of-order or lost-write outcomes. No state is regenerated after dispatch.
+
+Rename retains the seven positive new-symbol probes and adds a distinct
+old-source absence probe/readback. Delete requires the exact scoped producer
+`symbol not found` refusal, complete nontruncated graph/search collections and
+a surviving declaration. A missing body, transport failure or empty partial
+page cannot stand in for absence. The same bound prober proves the original
+symbol exists during untimed setup; only replies sent after the actual edit
+wire start can earn post-edit absence. Expected refusals retain their own raw
+identity, endpoint and report count; they are not ordinary successful RPCs.
+These new operation cells require actual runtime evidence before acceptance;
+other kinds and unsupported combinations fail explicitly.
 
 `--scenario edit-and-probe --profile agent --agents 0 --edit-agents 1
 --worktrees 0` selects an initial `add_intrafile_call` / `edit.file` / JSON
