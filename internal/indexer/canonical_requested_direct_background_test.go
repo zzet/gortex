@@ -49,6 +49,13 @@ func TestRequestedBackgroundOwnCallbackStartsAtObservedAdmission(t *testing.T) {
 			require.Equal(t, ticket.Generation, background.RequestedGeneration)
 			require.Equal(t, ticket.Generation, background.AppliedGeneration)
 			require.Zero(t, background.NativeHandoffs, "no count inferred from predecessor generation")
+			if predecessor != nil {
+				require.Equal(t, predecessor.Generation, background.AdmissionPredecessor)
+				require.True(t, background.AdmissionPredecessorStopped)
+			} else {
+				require.Zero(t, background.AdmissionPredecessor)
+				require.False(t, background.AdmissionPredecessorStopped)
+			}
 			require.Equal(t, origin.UTC().Format(time.RFC3339Nano), background.OriginWall)
 			require.True(t, background.PartitionComplete)
 			requirePointExecution(t, record, true)
@@ -97,4 +104,5 @@ func TestRequestedBackgroundRefusesActuallyStartedPredecessorTimer(t *testing.T)
 	require.Nil(t, record.RequestedBackground(), "already-started predecessor cannot supply observed replacement coverage")
 	_, unavailable := record.CoalescedPublicationEvidence()
 	require.NotNil(t, unavailable)
+	require.Equal(t, "preexisting_timer_stop_not_successful", unavailable.Reason)
 }

@@ -446,6 +446,13 @@ func editProbeFinished(graphTerminal, allCorrect, requireAccounting bool, accoun
 }
 
 func editProbeSupportedBackgroundCoverage(background map[string]any) bool {
+	if _, generationPresent := background["admission_predecessor_generation"]; generationPresent || background["admission_predecessor_stopped"] != nil {
+		predecessor, e1 := strconvEditProbeUint(background["admission_predecessor_generation"])
+		requested, e2 := strconvEditProbeUint(background["requested_generation"])
+		if e1 != nil || e2 != nil || predecessor == 0 || predecessor >= requested || background["admission_predecessor_stopped"] != true {
+			return false
+		}
+	}
 	count, present := background["observed_native_handoffs"]
 	handoffs, err := strconvEditProbeUint(count)
 	switch background["coverage"] {
@@ -453,6 +460,12 @@ func editProbeSupportedBackgroundCoverage(background map[string]any) bool {
 		return !present || err == nil && handoffs == 1 // Historical single-handoff wire shape.
 	case "successful_pre_callback_native_handoffs":
 		return present && err == nil && handoffs >= 2
+	case "direct_requested_attempt":
+		requested, e1 := strconvEditProbeUint(background["requested_generation"])
+		applied, e2 := strconvEditProbeUint(background["applied_generation"])
+		phases, _ := background["phases_ms"].(map[string]any)
+		quiet, observed := phases["requested_quiet_wait"]
+		return present && err == nil && handoffs == 0 && e1 == nil && e2 == nil && requested > 0 && applied == requested && observed && quiet != nil
 	default:
 		return false
 	}

@@ -44,8 +44,9 @@ type canonicalBackgroundOwner struct {
 	watcher                         weak.Pointer[Watcher]
 	path, key                       string
 	requested, current, handoffs    uint64
+	admissionPredecessor            uint64
 	origin, last, armStart, entered time.Time
-	phases                          [7]int64
+	phases                          [8]int64
 	stage                           canonicalBackgroundStage
 	invalid                         bool
 	reason                          string
@@ -186,7 +187,13 @@ func (b *canonicalBackgroundOwner) callback(w *Watcher, path string, generation 
 	b.mu.Lock()
 	if b.matchesLocked(w, path, generation) {
 		if !successor {
-			b.failLocked("requested_callback_started")
+			if b.stage != backgroundInitialQuiet {
+				b.failLocked("timer_callback_already_started")
+			} else if b.addLocked(7, b.last, at) {
+				b.last = at
+				b.entered = at
+				b.stage = backgroundExecuting
+			}
 		} else if b.stage != backgroundNativeQuiet {
 			b.failLocked("timer_callback_already_started")
 		} else if b.addLocked(6, b.last, at) {
@@ -243,9 +250,10 @@ func (b *canonicalBackgroundOwner) publishUnavailable() {
 
 type canonicalBackgroundEvidence struct {
 	origin                         time.Time
-	phases                         [7]int64
+	phases                         [8]int64
 	startNS, endNS, lastArmStartNS int64
 	requested, applied, handoffs   uint64
+	admissionPredecessor           uint64
 	physical                       canonicalAttemptWindow
 	debounce                       canonicalDebounceEvidence
 }
@@ -256,7 +264,7 @@ func (b *canonicalBackgroundOwner) finish(attempt *pointPublicationAttempt, ente
 		b.publishUnavailable()
 		return
 	}
-	if attempt == nil || !attempt.independent {
+	if attempt == nil {
 		return
 	}
 	b.mu.Lock()
@@ -272,7 +280,7 @@ func (b *canonicalBackgroundOwner) finish(attempt *pointPublicationAttempt, ente
 		return
 	}
 	b.stage = backgroundReturned
-	evidence := canonicalBackgroundEvidence{origin: b.origin, phases: b.phases, requested: b.requested, applied: b.current, handoffs: b.handoffs, startNS: entered.Sub(b.origin).Nanoseconds(), endNS: end.Sub(b.origin).Nanoseconds(), lastArmStartNS: b.armStart.Sub(b.origin).Nanoseconds()}
+	evidence := canonicalBackgroundEvidence{origin: b.origin, phases: b.phases, requested: b.requested, applied: b.current, handoffs: b.handoffs, admissionPredecessor: b.admissionPredecessor, startNS: entered.Sub(b.origin).Nanoseconds(), endNS: end.Sub(b.origin).Nanoseconds(), lastArmStartNS: b.armStart.Sub(b.origin).Nanoseconds()}
 	diagnostic := b.unavailableLocked("serving_attempt_binding_mismatch")
 	b.mu.Unlock()
 	record := b.record.Value()
@@ -281,6 +289,10 @@ func (b *canonicalBackgroundOwner) finish(attempt *pointPublicationAttempt, ente
 	}
 	owner := record.owner.Value()
 	if owner == nil {
+		return
+	}
+	if !attempt.independent {
+		b.finishDirect(record, owner, attempt, evidence, entered, end, diagnostic)
 		return
 	}
 	if attempt.record == nil || attempt.record == record || attempt.record.owner.Value() != owner {
@@ -318,7 +330,7 @@ func (b *canonicalBackgroundOwner) finish(attempt *pointPublicationAttempt, ente
 	record.background = &evidence // Fresh late scalar; no earlier snapshot mutation.
 }
 func (b canonicalBackgroundEvidence) valid() bool {
-	if b.origin.IsZero() || b.requested == 0 || b.applied <= b.requested || b.handoffs == 0 || b.lastArmStartNS < 0 || b.startNS < b.lastArmStartNS || b.endNS < b.startNS {
+	if b.origin.IsZero() || b.requested == 0 || b.applied < b.requested || (b.applied == b.requested && b.handoffs != 0) || (b.applied > b.requested && b.handoffs == 0) || (b.admissionPredecessor != 0 && b.admissionPredecessor >= b.requested) || b.lastArmStartNS < 0 || b.startNS < b.lastArmStartNS || b.endNS < b.startNS {
 		return false
 	}
 	p := b.physical.evaluateAccounting()
@@ -338,23 +350,25 @@ func (b canonicalBackgroundEvidence) valid() bool {
 	return sum == b.startNS && p.sumNS >= 0 && sum <= math.MaxInt64-p.sumNS && sum+p.sumNS == b.endNS
 }
 
-var requestedBackgroundLapNames = [...]string{"scheduling_admission_setup", "initial_timer_arm", "canceled_quiet_wait", "timer_stop", "coalescing_control", "successor_timer_arm", "successor_quiet_wait"}
+var requestedBackgroundLapNames = [...]string{"scheduling_admission_setup", "initial_timer_arm", "canceled_quiet_wait", "timer_stop", "coalescing_control", "successor_timer_arm", "successor_quiet_wait", "requested_quiet_wait"}
 
 // RequestedBackgroundTiming is one measured scheduler-entry→serving-return
 // window. Repeated native arms/quiet/stops are actual disjoint scalar totals;
 // every canceled timer must have an observed successful pre-callback Stop.
 type RequestedBackgroundTiming struct {
-	Scope               string             `json:"scope"`
-	Coverage            string             `json:"coverage"`
-	SumState            string             `json:"sum_state"`
-	OriginWall          string             `json:"origin_wall"`
-	RequestedGeneration uint64             `json:"requested_generation"`
-	AppliedGeneration   uint64             `json:"applied_generation"`
-	NativeHandoffs      uint64             `json:"observed_native_handoffs"`
-	WallMS              float64            `json:"background_wall_ms"`
-	PhasesMS            map[string]float64 `json:"phases_ms"`
-	PartitionComplete   bool               `json:"observed_partition_complete"`
-	UnattributedMS      float64            `json:"unattributed_ms"`
+	Scope                       string             `json:"scope"`
+	Coverage                    string             `json:"coverage"`
+	SumState                    string             `json:"sum_state"`
+	OriginWall                  string             `json:"origin_wall"`
+	RequestedGeneration         uint64             `json:"requested_generation"`
+	AppliedGeneration           uint64             `json:"applied_generation"`
+	NativeHandoffs              uint64             `json:"observed_native_handoffs"`
+	AdmissionPredecessor        uint64             `json:"admission_predecessor_generation,omitempty"`
+	AdmissionPredecessorStopped bool               `json:"admission_predecessor_stopped,omitempty"`
+	WallMS                      float64            `json:"background_wall_ms"`
+	PhasesMS                    map[string]float64 `json:"phases_ms"`
+	PartitionComplete           bool               `json:"observed_partition_complete"`
+	UnattributedMS              float64            `json:"unattributed_ms"`
 }
 
 func (b canonicalBackgroundEvidence) project(physical *EditPatchAccounting) *RequestedBackgroundTiming {
@@ -362,10 +376,12 @@ func (b canonicalBackgroundEvidence) project(physical *EditPatchAccounting) *Req
 		return nil
 	}
 	coverage := "one_canceled_timer_one_native_successor"
-	if b.handoffs > 1 {
+	if b.applied == b.requested {
+		coverage = "direct_requested_attempt"
+	} else if b.handoffs > 1 {
 		coverage = "successful_pre_callback_native_handoffs"
 	}
-	out := &RequestedBackgroundTiming{Scope: "accepted_scheduling_call_entry_to_serving_attempt_return", Coverage: coverage, SumState: "partial", OriginWall: b.origin.UTC().Format(time.RFC3339Nano), RequestedGeneration: b.requested, AppliedGeneration: b.applied, NativeHandoffs: b.handoffs, WallMS: float64(b.endNS) / 1e6, PhasesMS: make(map[string]float64, 7+canonicalPatchLapCount), PartitionComplete: true}
+	out := &RequestedBackgroundTiming{Scope: "accepted_scheduling_call_entry_to_serving_attempt_return", Coverage: coverage, SumState: "partial", OriginWall: b.origin.UTC().Format(time.RFC3339Nano), RequestedGeneration: b.requested, AppliedGeneration: b.applied, NativeHandoffs: b.handoffs, AdmissionPredecessor: b.admissionPredecessor, AdmissionPredecessorStopped: b.admissionPredecessor != 0, WallMS: float64(b.endNS) / 1e6, PhasesMS: make(map[string]float64, len(requestedBackgroundLapNames)+canonicalPatchLapCount), PartitionComplete: true}
 	for i, name := range requestedBackgroundLapNames {
 		out.PhasesMS[name] = float64(b.phases[i]) / 1e6
 	}
@@ -377,8 +393,53 @@ func (b canonicalBackgroundEvidence) project(physical *EditPatchAccounting) *Req
 	return out
 }
 func (p *PublicationPhaseRecord) RequestedBackground() *RequestedBackgroundTiming {
+	if p == nil {
+		return nil
+	}
+	if owner := p.owner.Value(); owner != nil {
+		owner.mu.Lock()
+		p.mu.Lock()
+		var direct *canonicalBackgroundEvidence
+		if owner.byKey[p.key] == p && p.background != nil && p.background.requested == p.ticket && p.background.applied == p.ticket && p.attemptWindow != nil && *p.attemptWindow == p.background.physical {
+			copy := *p.background
+			direct = &copy
+		}
+		p.mu.Unlock()
+		owner.mu.Unlock()
+		if direct != nil {
+			return direct.project(direct.physical.projectAccounting())
+		}
+	}
 	if related := p.CoalescedPublication(); related != nil {
 		return related.Background
 	}
 	return nil
+}
+
+// A direct callback owns the original record's accepted P. It must never be
+// relabeled as a coalesced/independent winner or borrow an earlier native P.
+func (b *canonicalBackgroundOwner) finishDirect(record *PublicationPhaseRecord, owner *PublicationPhaseRecorder, attempt *pointPublicationAttempt, evidence canonicalBackgroundEvidence, entered, end time.Time, diagnostic RequestedBackgroundUnavailable) {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if owner.byKey[record.key] != record || record.ticket != b.requested || record.background != nil || record.backgroundUnavailable != nil {
+		return
+	}
+	if attempt.record != record || evidence.requested != evidence.applied || evidence.handoffs != 0 || record.coalescedWinner.Value() != nil || record.attemptWindow == nil || record.debounce == nil {
+		record.backgroundUnavailable = &diagnostic
+		return
+	}
+	evidence.physical, evidence.debounce = *record.attemptWindow, *record.debounce
+	if !record.origin.Add(time.Duration(evidence.physical.startNS)).Equal(entered) || !record.origin.Add(time.Duration(evidence.physical.endNS)).Equal(end) || !evidence.valid() {
+		diagnostic.Reason = "physical_evidence_incomplete"
+		record.backgroundUnavailable = &diagnostic
+		return
+	}
+	for _, mark := range record.marks {
+		if mark.phase == PublicationTicketFailed {
+			return
+		}
+	}
+	record.background = &evidence
 }

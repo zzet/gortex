@@ -1954,6 +1954,8 @@ func (w *Watcher) scheduleFileMutationEntered(path string, kind ChangeKind, reco
 	}
 	_, hadPending := w.pending[path]
 	backgroundEligible := record != nil && !hadPending && w.observedMutationGeneration[path] == 0
+	var admissionPredecessor uint64
+	admissionStopFailed := false
 	var successorBackground *canonicalBackgroundOwner
 	var previousBackground *canonicalBackgroundOwner
 	if timer, exists := w.pending[path]; exists {
@@ -1964,6 +1966,18 @@ func (w *Watcher) scheduleFileMutationEntered(path string, kind ChangeKind, reco
 			stopStarted = time.Now()
 		}
 		stopped := timer.Stop()
+		if record != nil && w.observedMutationGeneration[path] == 0 {
+			predecessor := w.pendingGeneration[path]
+			prior := w.mutationWaiters[path][predecessor]
+			if predecessor != 0 && prior.done != nil && prior.publication == nil && prior.timerObservation == nil {
+				if stopped {
+					backgroundEligible = true
+					admissionPredecessor = predecessor
+				} else {
+					admissionStopFailed = true
+				}
+			}
+		}
 		if !stopStarted.IsZero() {
 			successorBackground = previous.background.stopped(w, path, w.pendingGeneration[path], previous.successor, stopStarted, time.Now(), stopped, record == nil)
 		}
@@ -1993,7 +2007,7 @@ func (w *Watcher) scheduleFileMutationEntered(path string, kind ChangeKind, reco
 		w.observedMutationGeneration[path] = generation
 	}
 	w.mutationWaiters[path][generation] = mutationWaiter{done: done, publication: ticket.PublicationRecord, schedulingEntered: entered, backgroundEligible: backgroundEligible}
-	armedBackground := w.armPointMutationTimerLocked(path, kind, generation, 0, time.Duration(w.config.DebounceMs)*time.Millisecond, successorBackground)
+	armedBackground := w.armPointMutationTimerLocked(path, kind, generation, 0, time.Duration(w.config.DebounceMs)*time.Millisecond, successorBackground, admissionPredecessor, admissionStopFailed)
 	w.mu.Unlock()
 	if previousBackground != nil {
 		previousBackground.publishUnavailable()
@@ -2004,7 +2018,7 @@ func (w *Watcher) scheduleFileMutationEntered(path string, kind ChangeKind, reco
 	return ticket
 }
 
-func (w *Watcher) armPointMutationTimerLocked(path string, kind ChangeKind, generation uint64, retryAttempt int, delay time.Duration, background *canonicalBackgroundOwner) *canonicalBackgroundOwner {
+func (w *Watcher) armPointMutationTimerLocked(path string, kind ChangeKind, generation uint64, retryAttempt int, delay time.Duration, background *canonicalBackgroundOwner, admissionPredecessor uint64, admissionStopFailed bool) *canonicalBackgroundOwner {
 	var timer *time.Timer
 	var observation *canonicalPointTimer
 	if w.mutationWaiters[path][generation].publication != nil {
@@ -2021,13 +2035,23 @@ func (w *Watcher) armPointMutationTimerLocked(path string, kind ChangeKind, gene
 		waiter := w.mutationWaiters[path][generation]
 		if retryAttempt == 0 && waiter.publication != nil {
 			background = newCanonicalBackground(waiter.publication, w, path, generation, waiter.schedulingEntered)
-			if background != nil && !waiter.backgroundEligible {
-				background.invalidate("preexisting_path_work")
+			if background != nil {
+				background.admissionPredecessor = admissionPredecessor
+				if !waiter.backgroundEligible {
+					reason := "preexisting_path_work"
+					if admissionStopFailed {
+						reason = "preexisting_timer_stop_not_successful"
+					}
+					background.invalidate(reason)
+				}
 			}
 		}
 		observation.background, observation.successor = background, waiter.publication == nil
 		if background != nil {
-			armStarted := time.Now()
+			armStarted := observation.debounce.started
+			if armStarted.IsZero() {
+				armStarted = time.Now()
+			}
 			background.armStarted(w, path, generation, observation.successor, armStarted)
 			if observation.successor && retryAttempt == 0 {
 				observation.debounce.started = armStarted // same actual native arm reading, never predecessor quiet
@@ -2206,7 +2230,7 @@ func (w *Watcher) schedulePointMutationRetry(path string, kind ChangeKind, gener
 		invalidated = observation.background
 		invalidated.invalidate("retry_or_backoff")
 	}
-	w.armPointMutationTimerLocked(path, kind, generation, attempt, w.mutationRetryDelay(attempt), nil)
+	w.armPointMutationTimerLocked(path, kind, generation, attempt, w.mutationRetryDelay(attempt), nil, 0, false)
 	return true
 }
 

@@ -422,6 +422,11 @@ func attachMutationPhaseTimings(payload map[string]any, receiptID string, commit
 					payload["requested_background"] = winner.Background
 				}
 			}
+			if winner == nil {
+				if background := retained.RequestedBackground(); background != nil {
+					payload["requested_background"] = background
+				}
+			}
 			if unavailable != nil {
 				payload["requested_background_unavailable"] = unavailable
 			}
