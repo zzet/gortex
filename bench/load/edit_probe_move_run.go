@@ -46,8 +46,10 @@ func moveProbesComplete(record editProbeRecord) bool {
 // Only the original, exactly identified per-file owner can freeze a terminal
 // refusal. Missing/foreign rows and late pending callbacks remain collecting.
 func moveOwnedRefusal(row map[string]any, refs editProbeMoveReferences, file editProbeMoveFileReference) bool {
-	state, _ := row["direct_reconcile_state"].(string)
-	return row["found"] == true && row["receipt_kind"] == "move_file_observation" && row["receipt"] == file.Receipt && row["operation_id"] == refs.OperationID && row["source_id"] == refs.SourceID && row["target_id"] == refs.TargetID && row["path"] == file.Path && row["role"] == file.Role && strings.HasPrefix(state, "unavailable_")
+ direct, _ := row["direct_reconcile_state"].(string)
+ repair, _ := row["read_assisted_reconcile_state"].(string)
+ immutable := direct == "observed" || repair == "observed" || strings.HasPrefix(direct, "unavailable_") && strings.HasPrefix(repair, "unavailable_")
+	return row["found"] == true && row["receipt_kind"] == "move_file_observation" && row["receipt"] == file.Receipt && row["operation_id"] == refs.OperationID && row["source_id"] == refs.SourceID && row["target_id"] == refs.TargetID && row["path"] == file.Path && row["role"] == file.Role && immutable
 }
 
 // Own-ACK readbacks precede these separate observation queries. Shared A is
@@ -78,7 +80,7 @@ func (r *editProbeRuntime) collectMoveEvidence(ctx context.Context, s *editProbe
 		all := movePublicFactsComplete(s.record)
 		if accounting.State == "observed_move_windows_checks_pass" {
 			s.record.GraphTerminal = true
-			s.record.GraphTerminalBasis = "original_move_files_actual_accepted_direct_reconcile"
+			s.record.GraphTerminalBasis = "original_move_files_actual_accepted_reconcile"
 		} else if !r.requireAccounting && all {
 			// Old controls may have no instrumentation. Public facts establish only
 			// functional completion, never an observed graph receipt or zero phases.

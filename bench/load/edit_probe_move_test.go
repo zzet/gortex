@@ -210,3 +210,20 @@ func TestMoveReadAssistedConsumerRejectsForeignCauseAndInvalidActualAcceptance(t
   })
  }
 }
+
+func TestMoveConsumerCountsCoalescedDirectAndReaderExecutionOnce(t *testing.T) {
+ refs, statuses := moveAccountingFixture(t)
+ _, other := moveAccountingFixture(t)
+ row := statuses["target"]
+ direct := other["target"]["direct_reconcile"].(map[string]any)
+ repair := moveReadAssistedFixture(row)
+ readerCause := repair["request_cause"].(map[string]any)
+ readerCause["admission_generation"] = json.Number("8")
+ causes := []any{direct["request_cause"], readerCause}
+ direct["reconcile_causes"],repair["reconcile_causes"] = causes,causes
+ row["direct_reconcile_state"],row["direct_reconcile"] = "observed",direct
+ got := checkEditProbeMoveAccounting(statuses,refs,17)
+ if got.State != "observed_move_windows_checks_pass" || got.Files[1].Route != "coalesced_direct_and_read_assisted" || got.Files[1].D != nil || got.Files[1].R == nil { t.Fatalf("same executed window double-counted or lost: %+v",got) }
+ direct["window_ns"] = json.Number("9000001")
+ if changed := checkEditProbeMoveAccounting(statuses,refs,17); changed.State == "observed_move_windows_checks_pass" { t.Fatal("different actual executions deduplicated",changed) }
+}
