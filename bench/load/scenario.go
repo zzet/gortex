@@ -373,6 +373,12 @@ func dispatchArgs(r request, repo privateRepo) map[string]any {
 }
 
 func runAgents(parent context.Context, o runOptions, p *privateRun, clients []*socketClient, editing bool, phase *Phase) error {
+	if o.PRSmokeDrain > 0 {
+		if editing {
+			return errors.New("offered-window/drain for edit/probe work is unsupported")
+		}
+		return runPRSmokeReads(parent, o, p, clients, phase)
+	}
 	ctx, cancel := context.WithTimeout(parent, o.Duration)
 	defer cancel()
 	var mu sync.Mutex
