@@ -1266,18 +1266,25 @@ func (s *Server) batchTransactionStatus(ctx context.Context, transactionID strin
 	return state.snapshot(), nil
 }
 
-func (s *Server) beginBatchGraphRefresh(observationCtx context.Context, absPath string) mutationReindexOutcome {
+func (s *Server) beginBatchGraphRefresh(observationCtx context.Context, absPath string, transaction batchTransactionReceipt) mutationReindexOutcome {
 	ctx := context.Background() // preserve the original scheduler's lifetime
 	if watcher := s.currentWatcher(); watcher != nil {
 		if scheduler, ok := watcher.(mutationScheduler); ok {
 			lap := s.beginAcknowledgementLap(observationCtx, editAckTicketAdmission)
-			ticket, err := scheduler.EnqueueFileMutation(ctx, absPath)
+			record := s.batchPublicationObservation(transaction, absPath)
+			var publication *indexer.PublicationPhaseRecord
+			if record != nil {
+				publication = s.openOwnedPublicationRecord(observationCtx, record)
+			}
+			ticket, err := scheduler.EnqueueFileMutation(indexer.WithPublicationRecord(ctx, publication), absPath)
 			lap.finish()
 			if err != nil {
 				return mutationReindexOutcome{Err: err}
 			}
 			if ticket != nil {
 				receipt := s.trackMutationTicket(ticket)
+				s.bindBatchFilePublication(record, receipt.outcome(true))
+				s.bindReadRepairAdmission(absPath, ticket.PublicationRecord, receipt)
 				return receipt.outcome(true)
 			}
 		}
@@ -1429,7 +1436,7 @@ func (s *Server) refreshBatchGraph(ctx context.Context, state *batchTransactionS
 			file.ReindexReceipt = ""
 			file.ReindexGeneration = 0
 		}
-		outcome := s.beginBatchGraphRefresh(ctx, file.Path)
+		outcome := s.beginBatchGraphRefresh(ctx, file.Path, receipt)
 		outcomes[file.Path] = outcome
 		file.ReindexReceipt = outcome.Receipt
 		file.ReindexGeneration = outcome.Generation

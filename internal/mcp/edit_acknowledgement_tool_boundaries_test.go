@@ -91,7 +91,7 @@ func TestAcknowledgementBatchAdmissionKeepsOriginalSchedulerContext(t *testing.T
 	parent, cancel := context.WithCancel(t.Context())
 	cancel()
 	ctx, a, _ := s.withEditAcknowledgement(parent)
-	outcome := s.beginBatchGraphRefresh(ctx, filepath.Join(t.TempDir(), "target.go"))
+	outcome := s.beginBatchGraphRefresh(ctx, filepath.Join(t.TempDir(), "target.go"), batchTransactionReceipt{})
 	require.NoError(t, outcome.Err, "the original canonical batch scheduler uses Background even when caller observation is cancelled")
 	a.finishActualAt(time.Now())
 	a.finishReplyAt(time.Now(), "go_error")

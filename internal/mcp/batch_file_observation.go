@@ -26,7 +26,7 @@ func (s *Server) beginBatchFileObservation(ctx context.Context, receipt batchTra
 	}
 	record := &mutationCommitRecord{
 		kind: batchFileObservationCommit, owner: s,
-		id: "batch-file-" + strconv.FormatUint(mutationCommitSequence.Add(1), 10),
+		id:   "batch-file-" + strconv.FormatUint(mutationCommitSequence.Add(1), 10),
 		tool: "batch_edit", key: receipt.TransactionID, fingerprint: receipt.Fingerprint,
 		absPath: buffer.absPath, relPath: buffer.relPath,
 		startedAt: ack.entered, acknowledgement: ack,
@@ -42,13 +42,17 @@ func (s *Server) beginBatchFileObservation(ctx context.Context, receipt batchTra
 // rollback writers keep their original separate calls. No bytes or writer
 // closure are retained in the ledger, and an unobserved batch keeps its writer.
 func (s *Server) observedBatchFileWriter(record *mutationCommitRecord, writer func(string, []byte, os.FileMode) error) func(string, []byte, os.FileMode) error {
-	if record == nil { return writer }
+	if record == nil {
+		return writer
+	}
 	return func(path string, content []byte, mode os.FileMode) error {
 		started := time.Now()
 		err := writer(path, content, mode)
 		returned := time.Now()
 		blob, after := "", [32]byte{}
-		if err == nil { blob, after = gitBlobSHA(content), sha256.Sum256(content) }
+		if err == nil {
+			blob, after = gitBlobSHA(content), sha256.Sum256(content)
+		}
 		ledger := &s.mutationCommits
 		ledger.mu.Lock()
 		record.mu.Lock()
@@ -75,7 +79,9 @@ func (s *Server) observedBatchFileWriter(record *mutationCommitRecord, writer fu
 // from committedAt's real per-file writer-return clock. Failure/rollback cannot
 // become publication ownership, and late finalization cannot resurrect eviction.
 func (s *Server) finishBatchFileObservation(record *mutationCommitRecord, receipt batchTransactionReceipt) {
-	if record == nil { return }
+	if record == nil {
+		return
+	}
 	ledger := &s.mutationCommits
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
@@ -85,7 +91,9 @@ func (s *Server) finishBatchFileObservation(record *mutationCommitRecord, receip
 		record.batchOwner != sha256.Sum256([]byte(receipt.TransactionID)) || record.fingerprint != receipt.Fingerprint {
 		return
 	}
-	if record.disk == mutationDiskCommitted { return }
+	if record.disk == mutationDiskCommitted {
+		return
+	}
 	if receipt.Status != "committed" || receipt.DiskStatus != "committed" {
 		record.disk, record.graph, record.graphRecorded = mutationDiskFailed, mutationGraphFailed, true
 		record.errText = "batch_not_committed"
@@ -100,4 +108,45 @@ func (s *Server) finishBatchFileObservation(record *mutationCommitRecord, receip
 	}
 	record.disk = mutationDiskCommitted
 	record.commitSeq = mutationDiskCommitSequence.Add(1)
+}
+
+// batchPublicationObservation selects only the original measured transaction's
+// retained file record. Recovery and duplicate admissions cannot manufacture a
+// new file clock or replace a ticket already witnessed by that record.
+func (s *Server) batchPublicationObservation(receipt batchTransactionReceipt, path string) *mutationCommitRecord {
+	ledger := &s.mutationCommits
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	for i := len(ledger.ordered) - 1; i >= 0; i-- {
+		record := ledger.ordered[i]
+		record.mu.RLock()
+		match := record.kind == batchFileObservationCommit && record.owner == s &&
+			ledger.byID[record.id] == record && record.key == receipt.TransactionID &&
+			record.fingerprint == receipt.Fingerprint && pathkey.EqualPaths(record.absPath, path) &&
+			record.disk == mutationDiskCommitted && record.commitSeq != 0 && record.reindexReceipt == ""
+		record.mu.RUnlock()
+		if match {
+			return record
+		}
+	}
+	return nil
+}
+
+// Keep the observational ticket local to this record; ordinary physical
+// mutation lookup/recovery indexes must not acquire batch authority.
+func (s *Server) bindBatchFilePublication(record *mutationCommitRecord, outcome mutationReindexOutcome) {
+	if record == nil || outcome.Receipt == "" || outcome.Generation == 0 {
+		return
+	}
+	ledger := &s.mutationCommits
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if ledger.byID[record.id] != record || record.owner != s || record.kind != batchFileObservationCommit ||
+		record.disk != mutationDiskCommitted || record.reindexReceipt != "" {
+		return
+	}
+	record.reindexReceipt, record.reindexGeneration = outcome.Receipt, outcome.Generation
+	record.graph, record.graphRecorded = graphStatusFor(outcome), true
 }
