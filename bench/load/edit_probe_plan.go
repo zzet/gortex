@@ -60,8 +60,11 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if filepath.Ext(c.File) == ".ts" {
 		language = "typescript"
 	}
-	if (filepath.Ext(c.File) != ".go" && filepath.Ext(c.File) != ".ts") || c.EditAnchor == "" || strings.Count(c.EditTemplate, "{{marker}}") != 1 {
-		return editProbePlan{}, errors.New("edit-and-probe cell requires Go or explicit TypeScript fixture/stable anchor/one marker declaration")
+	if filepath.Ext(c.File) == ".py" {
+		language = "python"
+	}
+	if (filepath.Ext(c.File) != ".go" && filepath.Ext(c.File) != ".ts" && filepath.Ext(c.File) != ".py") || c.EditAnchor == "" || strings.Count(c.EditTemplate, "{{marker}}") != 1 {
+		return editProbePlan{}, errors.New("edit-and-probe cell requires Go or explicit TypeScript/Python fixture/stable anchor/one marker declaration")
 	}
 	separator := strings.LastIndex(c.Symbol, "::")
 	if separator < 0 {
@@ -76,6 +79,11 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		valid, correct := editProbeTypeScriptFixture(strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker, callee)
 		if !valid || !correct {
 			return editProbePlan{}, errors.New("TypeScript template must be a numeric zero-argument marker function returning the intrafile call")
+		}
+	} else if language == "python" {
+		valid, correct := editProbePythonFixture(strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), probeMarker, callee)
+		if !valid || !correct {
+			return editProbePlan{}, errors.New("Python template must be a top-level marker with one indented return of the intrafile call")
 		}
 	} else {
 		parsed, err := parser.ParseFile(token.NewFileSet(), "template.go", "package probe\n"+strings.ReplaceAll(c.EditTemplate, "{{marker}}", probeMarker), 0)

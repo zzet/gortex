@@ -89,7 +89,12 @@ template must make the unique marker return the selected intrafile callee.
 ordinary warmup gate. Other TypeScript syntax is not supported by this fixture
 cell. Its token checks discard comments/strings as proof and require the actual
 producer symbol ID and file/path. TypeScript implementation does not constitute
-a completed runtime or reference gate. The finite plan contains 100 precomputed Poisson
+a completed runtime or reference gate. The `.py` fixture cell similarly permits
+only top-level `def Name():` definitions with one four-space-indented return of
+a decimal integer or plain zero-argument call. Its fixture is
+`testdata/edit-probe/python/main.py`; nested bodies, strings and comment-only
+calls cannot provide source proof. Both new language cells are implementation
+coverage only until their actual runtime checks pass. The finite plan contains 100 precomputed Poisson
 arrivals (mean 15 seconds); `--edit-count 1` is an explicit diagnostic only.
 Each edit has its own session opened before dispatch, with independent 25 ms
 probes and immediate same-editing-session file/source readbacks. Session setup

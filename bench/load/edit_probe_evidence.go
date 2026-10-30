@@ -90,7 +90,7 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 	switch oracle {
 	case "source":
 		source, _ := body["source"].(string)
-		if filepath.Ext(c.File) == ".ts" {
+		if filepath.Ext(c.File) == ".ts" || filepath.Ext(c.File) == ".py" {
 			id, _ := body["id"].(string)
 			path, _ := body["file_path"].(string)
 			if !editProbeSourceID(id, c.File, step.Marker) || !editProbeFixturePath(path, c.File) {
@@ -100,7 +100,7 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 		return body["name"] == step.Marker && editProbeFixtureSource(c.File, source, step.Marker, callee)
 	case "file":
 		source, _ := body["content"].(string)
-		if filepath.Ext(c.File) == ".ts" {
+		if filepath.Ext(c.File) == ".ts" || filepath.Ext(c.File) == ".py" {
 			path, _ := body["path"].(string)
 			if !editProbeFixturePath(path, c.File) {
 				return false
@@ -116,6 +116,9 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 			if filepath.Ext(c.File) == ".ts" {
 				valid, correct := editProbeTypeScriptFixture(text, step.Marker, callee)
 				return err == nil && line > 0 && editProbeFixturePath(path, c.File) && valid && correct
+			}
+			if filepath.Ext(c.File) == ".py" {
+				return err == nil && line > 0 && editProbeFixturePath(path, c.File) && strings.TrimSuffix(text, "\r") == "def "+step.Marker+"():"
 			}
 			return err == nil && line > 0 && (path == c.File || strings.HasSuffix(path, "/"+c.File)) && strings.Contains(text, prefix+step.Marker)
 		})

@@ -112,6 +112,9 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if plan.Language == "typescript" {
 		language = "TypeScript"
 	}
+	if plan.Language == "python" {
+		language = "Python"
+	}
 	out := &editProbeReport{Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/add_intrafile_call/edit.file/JSON cell only", language), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
 	for _, step := range plan.Steps {
 		out.Records = append(out.Records, newEditProbeRecord(c, step))
@@ -132,6 +135,12 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 		valid, _ := editProbeTypeScriptFixture(string(original), "", "")
 		if !valid {
 			return nil, nil, errors.New("TypeScript cell requires an explicit numeric-function fixture")
+		}
+	}
+	if filepath.Ext(plan.File) == ".py" {
+		valid, _ := editProbePythonFixture(string(original), "", "")
+		if !valid {
+			return nil, nil, errors.New("Python cell requires an explicit top-level single-return fixture")
 		}
 	}
 	if strings.Count(string(original), p.Repos[0].Corpus.EditAnchor) != 1 {

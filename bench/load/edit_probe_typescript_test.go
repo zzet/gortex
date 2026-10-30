@@ -103,3 +103,19 @@ func TestEditProbeTypeScriptRejectsFalseSourceAndIdentity(t *testing.T) {
 		t.Fatal("wrong file accepted")
 	}
 }
+
+func TestEditProbeTypeScriptRejectsInvalidTemplates(t *testing.T) {
+	base := editProbeTypeScriptCorpus()
+	for _, template := range []string{
+		strings.ReplaceAll(base.EditTemplate, "Example()", "Other()"),
+		"/* " + base.EditTemplate + " */",
+		strings.ReplaceAll(base.EditTemplate, "return Example();", "return \"Example()\";"),
+		strings.ReplaceAll(base.EditTemplate, "return Example();", "return 1; /* Example() */"),
+	} {
+		c := base
+		c.EditTemplate = template
+		if _, err := makeEditProbePlan(c, 42, 1); err == nil {
+			t.Fatal("invalid TypeScript fixture template admitted")
+		}
+	}
+}

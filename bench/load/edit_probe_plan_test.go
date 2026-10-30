@@ -64,7 +64,7 @@ func TestEditProbePlanRejectsUnselectedOrInvalidCells(t *testing.T) {
 			case "count":
 				count = 99
 			case "language":
-				c.File = "sample.py"
+				c.File = "sample.rs"
 			case "missing_anchor":
 				c.EditAnchor = ""
 			case "no_callee":

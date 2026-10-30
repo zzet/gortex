@@ -74,6 +74,9 @@ func editProbeFixtureSource(file, source, marker, callee string) bool {
 	case ".ts":
 		valid, correct := editProbeTypeScriptFixture(source, marker, callee)
 		return valid && correct
+	case ".py":
+		valid, correct := editProbePythonFixture(source, marker, callee)
+		return valid && correct
 	default:
 		return false
 	}
