@@ -9,6 +9,52 @@ import (
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
+// RegisteredCheckoutForPath binds an ordinary registered CWD without reading
+// the other repositories' families. A lexical match keeps CheckoutForPath's
+// precedence: only a complete lexical miss may resolve canonical aliases.
+func RegisteredCheckoutForPath(ctx context.Context, catalog *store_sqlite.Catalog, path string) (store_sqlite.Checkout, bool, error) {
+	if catalog == nil || path == "" {
+		return store_sqlite.Checkout{}, false, nil
+	}
+	cleaned := filepath.Clean(path)
+	// A repo-root CWD is the common case and needs only one seek. Its exact
+	// root is necessarily more specific than every lexical ancestor.
+	candidates, err := catalog.CheckoutsByRootPaths(ctx, []string{cleaned})
+	if err != nil {
+		return store_sqlite.Checkout{}, false, err
+	}
+	if best, found := checkoutForPathSpelling(candidates, cleaned, false); found {
+		return best, true, nil
+	}
+	var ancestors []string
+	for parent := filepath.Dir(cleaned); parent != cleaned; parent = filepath.Dir(parent) {
+		ancestors = append(ancestors, parent)
+		if next := filepath.Dir(parent); next == parent {
+			break
+		}
+	}
+	candidates, err = catalog.CheckoutsByRootPaths(ctx, ancestors)
+	if err != nil {
+		return store_sqlite.Checkout{}, false, err
+	}
+	if best, found := checkoutForPathSpelling(candidates, cleaned, false); found {
+		return best, true, nil
+	}
+	// A legacy root may itself be a symlink spelling. Resolving only the
+	// requested path would miss that root, or incorrectly prefer a canonical
+	// outer checkout over a deeper aliased one. Preserve the alias-aware
+	// catalog discovery only for a complete indexed lexical miss.
+	families, err := catalog.ListRepositoryFamilies(ctx)
+	if err != nil {
+		return store_sqlite.Checkout{}, false, err
+	}
+	ids := make([]string, len(families))
+	for i, family := range families {
+		ids[i] = family.FamilyID
+	}
+	return CheckoutForPath(ctx, catalog, ids, path)
+}
+
 // CheckoutForPath finds the registered checkout a filesystem path sits in.
 //
 // The catalog indexes checkouts by family, so the caller passes the families
