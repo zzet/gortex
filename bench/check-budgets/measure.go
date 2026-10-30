@@ -136,7 +136,7 @@ func extract(name, host string, r report) (float64, error) {
 		}
 		if name == "oom_kills" {
 			if host != "reference_linux" && host != hostedSmokeClass {
-				return 0, errors.New("Mac report-v1 lacks an authoritative OOM-kill observation; zero log lines are not zero kills")
+				return 0, errors.New("report-v1 lacks an authoritative OOM-kill observation on macOS; zero log lines are not zero kills")
 			}
 			actual, err := number(p.Metrics["scenario_cgroup_oom_kills"], "events")
 			if err != nil {
