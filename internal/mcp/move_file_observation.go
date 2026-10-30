@@ -17,6 +17,7 @@ import (
 // The first measured fixture is a same-package, two-file Go relocation.
 type moveFileObservation struct {
 	operationID, sourceID, targetID, role string
+	moveSession, moveRequestKey string
 	writeVerdict, directState             string
 	directClaimed                         bool
 	readClaimed                           bool
@@ -32,6 +33,8 @@ type moveDirectObservation struct {
 	causes               [8]mutationReadRepairCause
 	causeCount           int
 	accounting           indexer.ReadRepairPhaseAccounting
+	requestCause mutationReadRepairCause
+	startedFromAckNS, finishedFromAckNS, acceptedFromStartNS int64
 }
 type moveFileObservationReference struct {
 	Path    string `json:"path"`
@@ -51,9 +54,11 @@ func (s *Server) beginMoveObservation(ctx context.Context, sourceID, targetID, s
 		return nil
 	}
 	checkout, incarnation := mutationCheckoutScope(ctx)
+ moveRequestKey, _ := daemon.MCPRequestIDKeyForContext(ctx)
+ moveSession := SessionIDFromContext(ctx)
 	out := &moveObservation{server: s, id: "move-" + strconv.FormatUint(ack.id, 10), records: make(map[string]*mutationCommitRecord, 2)}
 	for _, file := range []struct{ abs, rel, role string }{{sourceAbs, sourceRel, "source"}, {targetAbs, targetRel, "target"}} {
-		record := &mutationCommitRecord{kind: moveFileObservationCommit, owner: s, id: "move-file-" + strconv.FormatUint(mutationCommitSequence.Add(1), 10), tool: "move_symbol", key: out.id, absPath: file.abs, relPath: file.rel, startedAt: ack.entered, acknowledgement: ack, disk: mutationDiskInFlight, checkoutID: checkout, checkoutIncarnation: incarnation, moveFile: &moveFileObservation{operationID: out.id, sourceID: sourceID, targetID: targetID, role: file.role, writeVerdict: "pending", directState: "not_started", readState: "not_started"}}
+		record := &mutationCommitRecord{kind: moveFileObservationCommit, owner: s, id: "move-file-" + strconv.FormatUint(mutationCommitSequence.Add(1), 10), tool: "move_symbol", key: out.id, absPath: file.abs, relPath: file.rel, startedAt: ack.entered, acknowledgement: ack, disk: mutationDiskInFlight, checkoutID: checkout, checkoutIncarnation: incarnation, moveFile: &moveFileObservation{operationID: out.id, sourceID: sourceID, targetID: targetID, role: file.role, moveSession: moveSession, moveRequestKey: moveRequestKey, writeVerdict: "pending", directState: "not_started", readState: "not_started"}}
 		s.mutationCommits.put(record)
 		out.records[file.abs] = record
 		out.refs = append(out.refs, moveFileObservationReference{Path: file.rel, Role: file.role, Receipt: record.id})
@@ -134,6 +139,7 @@ type moveDirectWitness struct {
 	indexer                                        weak.Pointer[indexer.Indexer]
 	id, operation, path, blob, session, requestKey string
 	committed                                      time.Time
+	ackStarted                                     time.Time
 	commitSeq                                      uint64
 	readAssisted                                   bool
 }
@@ -147,7 +153,7 @@ func (o *moveObservation) observer(ctx context.Context, path string, idx *indexe
 		return nil
 	}
 	key, _ := daemon.MCPRequestIDKeyForContext(ctx)
-	witness := moveDirectWitness{server: weak.Make(o.server), record: weak.Make(record), indexer: weak.Make(idx), session: SessionIDFromContext(ctx), requestKey: key}
+	witness := moveDirectWitness{server: weak.Make(o.server), record: weak.Make(record), indexer: weak.Make(idx), session: SessionIDFromContext(ctx), requestKey: key, ackStarted: record.startedAt}
 	ledger := &o.server.mutationCommits
 	ledger.mu.Lock()
 	record.mu.Lock()
@@ -183,7 +189,7 @@ func (s *Server) moveReadRepairObserver(ctx context.Context, path string, idx *i
   // that exact record's final successful verdict; no later retry can rebind it.
   if record.moveFile.writeVerdict != "pending" && record.moveFile.writeVerdict != "all_writes_completed" { return nil, true }
   key, _ := daemon.MCPRequestIDKeyForContext(ctx)
-  witness := moveDirectWitness{server: weak.Make(s), record: weak.Make(record), indexer: weak.Make(idx), id: record.id, operation: record.key, path: record.absPath, blob: record.newSHA, committed: record.committedAt, commitSeq: record.commitSeq, session: SessionIDFromContext(ctx), requestKey: key, readAssisted: true}
+  witness := moveDirectWitness{server: weak.Make(s), record: weak.Make(record), indexer: weak.Make(idx), id: record.id, operation: record.key, path: record.absPath, blob: record.newSHA, committed: record.committedAt, commitSeq: record.commitSeq, session: SessionIDFromContext(ctx), requestKey: key, readAssisted: true, ackStarted: record.startedAt}
   record.moveFile.readClaimed = true
   record.moveFile.readState = "pending_observer"
   return &indexer.ReadRepairObserver{Session: witness.session, RequestIDKey: witness.requestKey, Complete: witness.complete}, true
@@ -212,7 +218,7 @@ func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 		w.unavailable("unavailable_owner_bytes_or_acceptance")
 		return
 	}
-	accepted := moveDirectObservation{generation: observed.Generation(), windowNS: end.Sub(start).Nanoseconds(), acceptedBlob: w.blob, writerToAcceptanceNS: observed.AcceptedAt().Sub(w.committed).Nanoseconds(), accounting: observed.PhaseAccounting()}
+	accepted := moveDirectObservation{generation: observed.Generation(), windowNS: end.Sub(start).Nanoseconds(), acceptedBlob: w.blob, writerToAcceptanceNS: observed.AcceptedAt().Sub(w.committed).Nanoseconds(), accounting: observed.PhaseAccounting(), startedFromAckNS: start.Sub(w.ackStarted).Nanoseconds(), finishedFromAckNS: end.Sub(w.ackStarted).Nanoseconds(), acceptedFromStartNS: observed.AcceptedAt().Sub(start).Nanoseconds()}
 	ownedCause := false
 	for i := range accepted.causes {
 		session, key, generation, ok := observed.Cause(i)
@@ -222,7 +228,9 @@ func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 		accepted.causes[i] = mutationReadRepairCause{Session: session, RequestIDKey: key, AdmissionGeneration: generation}
 		accepted.causeCount++
 		if session == w.session && key == w.requestKey && generation != 0 {
+   if ownedCause && accepted.requestCause.AdmissionGeneration != generation { w.unavailable("unavailable_ambiguous_original_cause"); return }
 			ownedCause = true
+   accepted.requestCause = mutationReadRepairCause{Session: session, RequestIDKey: key, AdmissionGeneration: generation}
 		}
 	}
 	if _, _, _, more := observed.Cause(len(accepted.causes)); more || !ownedCause {
@@ -365,6 +373,7 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 			payload["move_write_verdict"], payload["file_write_status"], payload["writer_return_observed"], payload["new_sha"] = data.writeVerdict, record.disk, !record.committedAt.IsZero(), record.newSHA
 			payload["direct_reconcile_state"], payload["requested_background_state"] = data.directState, "not_applicable_direct_reconcile"
 			payload["read_assisted_reconcile_state"] = data.readState
+   payload["move_request_cause"] = map[string]string{"session": data.moveSession, "request_id_key": data.moveRequestKey}
 			// This handler calls the existing synchronous reconcile, never queue
 			// admission/wait. Preserve raw ACK nulls/counts and name applicability
 			// explicitly instead of manufacturing measured zero scheduler work.
@@ -406,5 +415,5 @@ func (observed *moveDirectObservation) payload(scope string) map[string]any {
  phases["scope"] = scope
  causes := make([]mutationReadRepairCause, observed.causeCount)
  copy(causes, observed.causes[:observed.causeCount])
- return map[string]any{"scope": scope, "clock": "monotonic", "owner_generation": observed.generation, "window_ns": observed.windowNS, "accepted_blob_sha": observed.acceptedBlob, "writer_return_to_acceptance_ns": observed.writerToAcceptanceNS, "reconcile_causes": causes, "phase_accounting": phases, "additive_with_acknowledgement": false}
+ return map[string]any{"scope": scope, "clock": "monotonic", "owner_generation": observed.generation, "window_ns": observed.windowNS, "accepted_blob_sha": observed.acceptedBlob, "writer_return_to_acceptance_ns": observed.writerToAcceptanceNS, "reconcile_causes": causes, "phase_accounting": phases, "additive_with_acknowledgement": false, "request_cause": observed.requestCause, "started_from_ack_ns": observed.startedFromAckNS, "finished_from_ack_ns": observed.finishedFromAckNS, "accepted_from_start_ns": observed.acceptedFromStartNS}
 }
