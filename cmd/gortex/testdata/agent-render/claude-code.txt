@@ -25,7 +25,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Watching for Gortex localization completion...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ],
@@ -38,7 +38,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Enforcing Gortex graph access policy...",
-            "timeout": 3000,
+            "timeout": 15,
             "type": "command"
           }
         ],
@@ -51,7 +51,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Loading Gortex graph orientation...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -63,7 +63,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Running Gortex post-task diagnostics...",
-            "timeout": 5000,
+            "timeout": 45,
             "type": "command"
           }
         ]
@@ -75,7 +75,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Starting an isolated Gortex subagent turn...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -87,7 +87,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Clearing Gortex subagent turn state...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -99,7 +99,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Surfacing relevant Gortex symbols...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -718,7 +718,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Watching for Gortex localization completion...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ],
@@ -731,7 +731,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Enforcing Gortex graph access policy...",
-            "timeout": 3000,
+            "timeout": 15,
             "type": "command"
           }
         ],
@@ -744,7 +744,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Loading Gortex graph orientation...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -756,7 +756,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Running Gortex post-task diagnostics...",
-            "timeout": 5000,
+            "timeout": 45,
             "type": "command"
           }
         ]
@@ -768,7 +768,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Starting an isolated Gortex subagent turn...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -780,7 +780,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Clearing Gortex subagent turn state...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -792,7 +792,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Surfacing relevant Gortex symbols...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -1428,16 +1428,16 @@ description: "Preview an edit's blast radius on the shadow graph before writing.
 === global/home/.gortex/instructions/active.md ===
 ## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
-A Gortex daemon is configured machine-wide via the `gortex` MCP server. On indexed source (any repo it tracks — check `gortex daemon status`), you MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
+The machine-wide `gortex` MCP server indexes tracked code. You MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when native tools remain callable.
+
+Follow advertised tools and server/session instructions. Compact examples require those tools; otherwise follow legacy session guidance. Missing `change` alone is not missing editing when legacy editors are advertised. Read-only policies and explicit denials still apply.
 
 When Gortex can serve the step:
 
-1. Named-file read/review/summarize: first new-task call `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`; do not localize. To discover a file, symbol, or evidence, call `explore(operation:"localize")` and obey `completion.required_action`; after `answer_ready`, answer from `completion.final_response` and stop. For diagnosis or modification, call `explore(operation:"task")`.
-2. In a diagnosis/change flow, make at most one follow-up on one unresolved symbol with `search`, `read`, `relations`, or `trace`; then step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
+1. Named-file read/review/summarize: first new-task call `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`; do not localize. Unknown file/symbol/evidence: `explore(operation:"localize")`; obey `completion.required_action`; at `answer_ready` answer from `completion.final_response` and stop. Diagnosis/change: `explore(operation:"task")`.
+2. Diagnosis/change: at most one follow-up on one unresolved symbol with `search`, `read`, `relations`, or `trace`; then step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
 3. Before mutation, call `change(operation:"impact")`; for a signature change, also `change(operation:"verify")` with the proposed signature. Mutate only with `edit` or `refactor`. After mutation, call `change(operation:"detect")`, then its symbol IDs with `change(operation:"tests")`, `change(operation:"guards")`, and `change(operation:"contract")`.
-4. Call `capabilities` only for an operation's exact fields.
-
-Example: `search(operation:"symbols", query:"<name>")`.
+4. `capabilities`: exact operation fields only.
 
 Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
 
@@ -1455,22 +1455,22 @@ Never restart the daemon, delete its store, or re-track merely to expose a workt
 ## Reference and discovery
 
 - **`gortex://guide` resource** (or the `gortex guide [topic]` CLI) is the full reference: LLM providers, capabilities, analyze / search_ast catalogs, token economy, MCP resources, session-start checklist. Read it on demand.
-- **`capabilities`** — request an exact operation schema only when the compact tool description is insufficient; ordinary coding needs no tool discovery.
+- **`capabilities`** — exact operation schema on demand; ordinary coding needs no discovery.
 - MCP startup manages daemon availability; do not start a daemon manually. "cwd is not covered by any tracked repo" means graph tools are unavailable there: use native tools.
 - **Instruction profiles** — this block is the active `core` profile. `gortex instructions list` shows the others (`core` balanced · `localization` lean · `full` maximum); switch with `gortex instructions switch <name>` — applies to NEW sessions only (instructions, tools/list and skills all load at session start).
 === global/home/.gortex/instructions/core.md ===
 ## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
-A Gortex daemon is configured machine-wide via the `gortex` MCP server. On indexed source (any repo it tracks — check `gortex daemon status`), you MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
+The machine-wide `gortex` MCP server indexes tracked code. You MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when native tools remain callable.
+
+Follow advertised tools and server/session instructions. Compact examples require those tools; otherwise follow legacy session guidance. Missing `change` alone is not missing editing when legacy editors are advertised. Read-only policies and explicit denials still apply.
 
 When Gortex can serve the step:
 
-1. Named-file read/review/summarize: first new-task call `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`; do not localize. To discover a file, symbol, or evidence, call `explore(operation:"localize")` and obey `completion.required_action`; after `answer_ready`, answer from `completion.final_response` and stop. For diagnosis or modification, call `explore(operation:"task")`.
-2. In a diagnosis/change flow, make at most one follow-up on one unresolved symbol with `search`, `read`, `relations`, or `trace`; then step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
+1. Named-file read/review/summarize: first new-task call `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`; do not localize. Unknown file/symbol/evidence: `explore(operation:"localize")`; obey `completion.required_action`; at `answer_ready` answer from `completion.final_response` and stop. Diagnosis/change: `explore(operation:"task")`.
+2. Diagnosis/change: at most one follow-up on one unresolved symbol with `search`, `read`, `relations`, or `trace`; then step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
 3. Before mutation, call `change(operation:"impact")`; for a signature change, also `change(operation:"verify")` with the proposed signature. Mutate only with `edit` or `refactor`. After mutation, call `change(operation:"detect")`, then its symbol IDs with `change(operation:"tests")`, `change(operation:"guards")`, and `change(operation:"contract")`.
-4. Call `capabilities` only for an operation's exact fields.
-
-Example: `search(operation:"symbols", query:"<name>")`.
+4. `capabilities`: exact operation fields only.
 
 Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
 
@@ -1488,13 +1488,15 @@ Never restart the daemon, delete its store, or re-track merely to expose a workt
 ## Reference and discovery
 
 - **`gortex://guide` resource** (or the `gortex guide [topic]` CLI) is the full reference: LLM providers, capabilities, analyze / search_ast catalogs, token economy, MCP resources, session-start checklist. Read it on demand.
-- **`capabilities`** — request an exact operation schema only when the compact tool description is insufficient; ordinary coding needs no tool discovery.
+- **`capabilities`** — exact operation schema on demand; ordinary coding needs no discovery.
 - MCP startup manages daemon availability; do not start a daemon manually. "cwd is not covered by any tracked repo" means graph tools are unavailable there: use native tools.
 - **Instruction profiles** — this block is the active `core` profile. `gortex instructions list` shows the others (`core` balanced · `localization` lean · `full` maximum); switch with `gortex instructions switch <name>` — applies to NEW sessions only (instructions, tools/list and skills all load at session start).
 === global/home/.gortex/instructions/full.md ===
 ## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
-A Gortex daemon is configured machine-wide via the `gortex` MCP server. On indexed source (any repo it tracks — check `gortex daemon status`), you MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
+The machine-wide `gortex` MCP server indexes tracked code. You MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when native tools remain callable.
+
+Follow advertised tools and server/session instructions. Compact examples require those tools; otherwise follow legacy session guidance. Missing `change` alone is not missing editing when legacy editors are advertised. Read-only policies and explicit denials still apply.
 
 For an explicitly named file to read/review/summarize, on the first direct file read caused by a new user request call `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`; do not start localization. When the file, symbol, or evidence must be discovered, call `explore(operation:"localize")` and obey `completion.required_action`; after `answer_ready` answer from `completion.final_response` and make no further tool calls. For diagnosis or requested changes, call `explore(operation:"task")`, make at most one focused follow-up, then proceed to impact, edit, and test.
 
@@ -1550,16 +1552,16 @@ Never restart the daemon, delete its store, or re-track merely to expose a workt
 === global/home/.gortex/instructions/localization.md ===
 ## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
-A machine-wide `gortex` MCP server indexes this code. You MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
+Use `gortex` MCP. You MUST prefer graph queries over file reads. Hook posture is configurable; obey its hooks even when native tools remain callable.
+
+Follow advertised tools and server/session instructions. Compact examples require those tools; otherwise follow legacy session guidance. Missing `change` alone is not missing editing when legacy editors are advertised. Read-only policies and explicit denials still apply.
 
 When Gortex can serve the step:
 
-1. Named-file read/review/summarize: first new-task call `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`; do not localize. To discover a file, symbol, or evidence, call `explore(operation:"localize")` and obey `completion.required_action`; after `answer_ready`, answer from `completion.final_response` and stop. For diagnosis or modification, call `explore(operation:"task")`.
-2. In a diagnosis/change flow, make at most one follow-up on one unresolved symbol with `search`, `read`, `relations`, or `trace`; then step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
+1. Named-file read/review/summarize: first new-task call `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`; do not localize. Unknown file/symbol/evidence: `explore(operation:"localize")`; obey `completion.required_action`; at `answer_ready` answer from `completion.final_response` and stop. Diagnosis/change: `explore(operation:"task")`.
+2. Diagnosis/change: at most one follow-up on one unresolved symbol with `search`, `read`, `relations`, or `trace`; then step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
 3. Before mutation, call `change(operation:"impact")`; for a signature change, also `change(operation:"verify")` with the proposed signature. Mutate only with `edit` or `refactor`. After mutation, call `change(operation:"detect")`, then its symbol IDs with `change(operation:"tests")`, `change(operation:"guards")`, and `change(operation:"contract")`.
-4. Call `capabilities` only for an operation's exact fields.
-
-Example: `search(operation:"symbols", query:"<name>")`.
+4. `capabilities`: exact operation fields only.
 
 Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
 
@@ -1574,5 +1576,5 @@ Use `recall` before revisiting prior work; `remember` immediately for a durable 
 - Untracking a non-primary dedicated worktree demotes it to automatic only if another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 Never restart the daemon, delete its store, or re-track merely to expose a worktree.
 
-**Reference:** call `capabilities` for an exact operation schema; use `gortex://guide` only for deeper background.
-- **Profiles:** active `localization`. Broader guidance: `gortex instructions switch core` (or `full`; `list` shows all) — NEW sessions only.
+**Reference:** `gortex://guide` for deeper background.
+- **Profiles:** active `localization`. `gortex instructions switch core` (or `full`; `list` shows all) — NEW sessions only.

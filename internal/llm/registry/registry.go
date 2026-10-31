@@ -230,11 +230,22 @@ func save(path string, m map[string]llm.CustomProvider) error {
 		return fmt.Errorf("encode providers: %w", err)
 	}
 	data = append(data, '\n')
-	// Write atomically: temp + rename, so a crash mid-write never
-	// leaves a truncated providers.json.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// Write atomically with a random-named temp file so a predictable ".tmp"
+	// name cannot be pre-created (or symlinked) by a co-tenant in the
+	// directory to redirect this write. os.CreateTemp opens the file 0600.
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp for %s: %w", path, err)
+	}
+	tmp := tmpFile.Name()
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)

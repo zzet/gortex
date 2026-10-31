@@ -208,16 +208,18 @@ type Server struct {
 	communitiesToken communityCacheToken
 	// hotspots is the lazily-built default-threshold (mean + 2*stddev)
 	// ranking. FindHotspots' inner ComputeBetweenness pass is too expensive
-	// to put on every daemon cold-start path; RunAnalysis invalidates this
-	// cache and the first hotspot-consuming request rebuilds it once for that
-	// analysis epoch. Reads/cache state are guarded by analysisMu; the separate
+	// to repeat per request; a successful explicit RunAnalysis warms the same
+	// default ranking once for its published epoch. Legacy/lazy callers can
+	// still rebuild it on first demand. Reads/cache state are guarded by
+	// analysisMu; the separate
 	// build mutex coalesces concurrent first requests without blocking unrelated
 	// analysis snapshots while betweenness runs.
-	hotspots        []analysis.HotspotEntry
-	hotspotsReady   bool
-	hotspotsOwned   bool // compact slice and cloned strings, guarded by analysisMu
-	hotspotsBuildMu sync.Mutex
-	analysisEpoch   uint64
+	hotspots         []analysis.HotspotEntry
+	hotspotsReady    bool
+	hotspotsOwned    bool // compact slice and cloned strings, guarded by analysisMu
+	hotspotsBuildMu  sync.Mutex
+	outlineResponses outlineResponseCache
+	analysisEpoch    uint64
 	// analysisRun tracks the background on-demand analysis pass so a tool
 	// call can report "running, retry in Ns" instead of blocking for
 	// minutes on a whole-graph computation.
@@ -2532,6 +2534,7 @@ func (s *Server) InvalidateSessionScopes() {
 		ss.resetScopeLocked()
 		ss.mu.Unlock()
 	}
+	s.outlineResponses.clear()
 	s.retireDeadPendingSourceIncarnations()
 }
 
@@ -3068,6 +3071,14 @@ func (s *Server) runAnalysisOwned(ctx context.Context, background bool) {
 	if ctx.Err() != nil {
 		return // An interrupted attempt is not a settled bootstrap receipt.
 	}
+	hotspotsWarmup := s.warmOutlineHotspotsContext(ctx)
+	if ctx.Err() != nil {
+		return
+	}
+	outlineWarmup := s.warmOutlineSummaries(ctx)
+	if ctx.Err() != nil {
+		return
+	}
 
 	// The graph was just rebuilt, so the lazy-enrichment ledger — symbol
 	// IDs whose incoming refs were confirmed against the *previous* graph
@@ -3112,6 +3123,11 @@ func (s *Server) runAnalysisOwned(ctx context.Context, background bool) {
 			zap.Duration("adjacency", analysisMetrics.adjacency),
 			zap.Duration("auto_concepts", analysisMetrics.autoConcepts),
 			zap.Duration("hits", analysisMetrics.hits),
+			zap.Duration("hotspots_warmup", hotspotsWarmup),
+			zap.Duration("outline_summary_warmup", outlineWarmup.elapsed),
+			zap.Int("outline_summary_scopes", outlineWarmup.scopes),
+			zap.Int("outline_summary_ready", outlineWarmup.ready),
+			zap.Int("outline_summary_owned_estimate_bytes", outlineWarmup.bytes),
 			zap.Int("attempts", analysisMetrics.attempts),
 			zap.Int("superseded", analysisMetrics.superseded),
 			zap.String("superseded_at", analysisMetrics.supersededAt),
@@ -3355,6 +3371,13 @@ func (s *Server) getHITS() *analysis.HITSResult {
 // the stale result is discarded and rebuilt against the new communities.
 // The returned slice is shared and must not be mutated by the caller.
 func (s *Server) getHotspots() []analysis.HotspotEntry {
+	return s.getHotspotsContext(context.Background())
+}
+
+func (s *Server) getHotspotsContext(ctx context.Context) []analysis.HotspotEntry {
+	if ctx.Err() != nil {
+		return nil
+	}
 	s.analysisMu.RLock()
 	if !s.analysisSnapshotCurrentLocked() {
 		s.analysisMu.RUnlock()
@@ -3367,9 +3390,14 @@ func (s *Server) getHotspots() []analysis.HotspotEntry {
 	}
 	s.analysisMu.RUnlock()
 
-	s.hotspotsBuildMu.Lock()
+	if !lockAnalysisPreparation(ctx, &s.hotspotsBuildMu) {
+		return nil
+	}
 	defer s.hotspotsBuildMu.Unlock()
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		s.analysisMu.RLock()
 		if !s.analysisSnapshotCurrentLocked() {
 			s.analysisMu.RUnlock()
@@ -3383,7 +3411,10 @@ func (s *Server) getHotspots() []analysis.HotspotEntry {
 		s.analysisMu.RUnlock()
 		// Coalesced waiters recheck the ranking before hydrating a partition.
 		// A retained result therefore needs no full community map at all.
-		materialized := s.ensureCommunitiesMaterialized()
+		materialized := s.ensureCommunitiesMaterializedContext(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
 		if !materialized && s.hotspotsFn == nil {
 			return nil
 		}
@@ -3402,14 +3433,26 @@ func (s *Server) getHotspots() []analysis.HotspotEntry {
 			continue
 		}
 
-		build := analysis.FindHotspots
-		if s.hotspotsFn != nil {
-			build = s.hotspotsFn
+		var reader graph.Reader = s.graph
+		if ctx.Done() != nil {
+			reader = graph.BindReadContext(reader, ctx)
 		}
-		hotspots := build(s.graph, communities, 0)
+		var hotspots []analysis.HotspotEntry
+		if s.hotspotsFn != nil {
+			hotspots = s.hotspotsFn(reader, communities, 0)
+		} else {
+			var err error
+			hotspots, err = analysis.FindHotspotsContext(ctx, reader, communities, 0)
+			if err != nil {
+				return nil
+			}
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
 
 		s.analysisMu.Lock()
-		if s.analysisEpoch == epoch && s.communitiesToken == token && s.analysisSnapshotCurrentLocked() {
+		if ctx.Err() == nil && s.analysisEpoch == epoch && s.communitiesToken == token && s.analysisSnapshotCurrentLocked() {
 			s.hotspots = hotspots
 			s.hotspotsReady = true
 			s.hotspotsOwned = false

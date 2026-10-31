@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -480,7 +481,10 @@ func bearerAuthMiddleware(next http.Handler, tokenFn func() string) http.Handler
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.Header.Get("Authorization") != "Bearer "+token {
+		// Constant-time compare (matching internal/server/auth.go) so the
+		// per-byte comparison does not leak the token to a timing oracle on a
+		// network-bound listener.
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="gortex"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return

@@ -91,6 +91,9 @@ func headPriorFingerprintsExcept(idx *Indexer, rootPath, sha, key string, unkept
 		return nil
 	}
 	read := func(rel string) ([]byte, bool) {
+		if !gitBlobObjectNameValid(rel) {
+			return nil, false
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "git", "-C", rootPath, "cat-file", "blob", sha+":"+rel)

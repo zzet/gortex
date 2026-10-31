@@ -910,8 +910,8 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 
 	// Apply any in-place migration steps. The version stamp is deliberately
 	// deferred until every migration-dependent postcondition below succeeds:
-	// core/sidecar indexes exist and an analysis snapshot produced against the
-	// old graph shape is durably invalidated. PRAGMA user_version is the next
+	// core/sidecar indexes exist and any required analysis invalidation has
+	// completed. PRAGMA user_version is the next
 	// Open's sole completion marker; publishing it earlier would let a crash or
 	// failure in that tail suppress the required repair forever.
 	// Fresh and pre-versioning (stored==0) stores run the in-place steps too —
@@ -939,9 +939,10 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite sidecar index: %w", err)
 	}
-	// A schema transition invalidates any generation produced against the old
-	// graph shape. The v4 migration also drops the unreleased blob-only table.
-	if stored != current {
+	// Only a fully known transition whose every step explicitly preserves
+	// analysis can retain the active generation (e.g. the additive v41 index).
+	// Older/mixed/unknown graph shapes keep conservative invalidation.
+	if stored != current && !plan.preservesAnalysis(stored, current) {
 		if _, err := db.Exec(`UPDATE analysis_generations SET state = ? WHERE generation_id IN (SELECT generation_id FROM analysis_active_generation)`, analysisGenerationStale); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite stale analysis generation after migration: %w", err)
@@ -3915,6 +3916,14 @@ const lookupChunkSize = 5000
 func (s *Store) GetNodesByIDs(ids []string) map[string]*graph.Node {
 	if len(ids) == 0 {
 		return nil
+	}
+	if s.readCtx != nil {
+		nodes, err := s.GetNodesByIDsContext(s.readCtx, ids)
+		if err != nil {
+			analysisProjectionReadError(s.readCtx, err)
+			return nil
+		}
+		return nodes
 	}
 	// Dedupe + skip empty up front to keep the chunk loop honest.
 	seen := make(map[string]struct{}, len(ids))

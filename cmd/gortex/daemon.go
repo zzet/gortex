@@ -741,7 +741,10 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			}
 		})
 		mw, warmup := warmupDaemonStateContext(ctx, state, logger, markReady, controller.startAndAttachWatcher)
-		if ctx.Err() != nil {
+		if !warmup.canFinalize(ctx) {
+			if warmup != nil && warmup.err != nil {
+				logger.Error("daemon: warmup incomplete; enrichment and view admission remain closed", zap.Error(warmup.err))
+			}
 			return
 		}
 		// Drive the /v1/events SSE stream from the MultiWatcher. The hub is

@@ -135,13 +135,18 @@ func TestRelayProxySessionRestoresProtocolAgainstRealRestartedDaemon(t *testing.
 		done <- relayProxySession(ctx, h, initial, stdinR, stdoutW, io.Discard, nil, nil)
 	}()
 	defer func() {
+		// Keep the host transport open until cancellation joins the relay.
+		// Closing it first races a synthetic ErrClosedPipe against ctx.Done.
+		// Still release every endpoint if the bounded join itself fails.
+		defer func() {
+			_ = stdinW.Close()
+			_ = stdinR.Close()
+			_ = stdoutR.Close()
+			_ = stdoutW.Close()
+			_ = initial.Close()
+		}()
 		cancel()
 		allowReconnect()
-		_ = stdinW.Close()
-		_ = stdinR.Close()
-		_ = stdoutR.Close()
-		_ = stdoutW.Close()
-		_ = initial.Close()
 		waitRelay(t, done)
 	}()
 

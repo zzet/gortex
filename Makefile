@@ -38,8 +38,10 @@ build-gomlx: deps-gomlx
 build-hugot: deps-hugot
 	go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
+PKGS ?= ./...
+
 test:
-	go test -race ./...
+	go test -race -gcflags=modernc.org/sqlite/lib=-race=false -gcflags=modernc.org/libc/...=-race=false $(PKGS)
 
 bench:
 	go test -bench=. -benchmem -count=1 -benchtime=1s \
@@ -148,15 +150,21 @@ build-windows:
 # Marketplace plugin bundle
 # ---------------------------------------------------------------------------
 
-# claude-plugin regenerates the Anthropic Plugin Marketplace bundle at
-# claude-plugin/. The bundle is checked in so the marketplace's
-# "git-subdir" source can pull it directly. The CI guard
+# claude-plugin regenerates the Claude Code plugin marketplace at
+# claude-plugin/: .claude-plugin/marketplace.json plus the plugin under
+# plugins/gortex/. publish-claude-plugin.yml syncs it to
+# gortexhq/claude-plugin. The CI guard
 # (claude-plugin-check) asserts that re-running this target produces
 # no diff against what's checked in — drift means the bundle is stale
 # vs the source-of-truth content in
 # internal/agents/commands_bodies.go.
-claude-plugin: build
-	./$(BINARY) plugin emit --target ./claude-plugin --variant anthropic
+#
+# The emitter needs none of the optional backends, so it is built without
+# `build`'s llama tag: the publish runner has no llama.cpp to link against.
+# `go run` also leaves a locally built ./gortex untouched.
+claude-plugin:
+	rm -rf ./claude-plugin
+	go run -ldflags '$(LDFLAGS)' ./cmd/gortex/ plugin emit --target ./claude-plugin --variant anthropic
 	@echo "✓ Regenerated claude-plugin/ from internal/agents commands"
 
 claude-plugin-check: claude-plugin

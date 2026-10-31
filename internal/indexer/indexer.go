@@ -7685,6 +7685,16 @@ func (idx *Indexer) runContractExtractorsForFileWithInputs(
 	return out
 }
 
+// maxContractSourceBytes bounds the bytes of a single file the contract
+// extractors scan. The regex-based extractors index src by tree-derived byte
+// offsets and run many patterns over it, so an abnormally large source (a
+// generated or minified bundle) could do substantial work and memory.
+// Skipping files above this bound keeps extraction bounded; normal source is
+// far smaller. It is intentionally a skip rather than a truncation: the
+// extractors index src by offsets computed from the full parse tree, so a
+// shortened slice could put those indices out of range.
+const maxContractSourceBytes = 4 << 20
+
 // collectContractRecordsForFile uses only its explicit accepted inputs. In
 // particular it does not inspect idx.graph, even when extraction emits no rows.
 func (idx *Indexer) collectContractRecordsForFile(
@@ -7692,6 +7702,17 @@ func (idx *Indexer) collectContractRecordsForFile(
 	exts []contracts.Extractor, tree *parser.ParseTree, endpointStore contracts.EndpointConstStore,
 ) []contracts.Contract {
 	if len(exts) == 0 {
+		return nil
+	}
+	// Bound regex-based contract extraction on abnormally large files. The
+	// extractors index src by tree-derived byte offsets, so a truncated slice
+	// risks out-of-range reads; skipping oversized files bounds the work while
+	// every extractor still sees the full src its tree was built from.
+	if len(src) > maxContractSourceBytes {
+		if idx.logger != nil {
+			idx.logger.Debug("contract extraction skipped for oversized source",
+				zap.String("file", graphPath), zap.Int64("bytes", int64(len(src))))
+		}
 		return nil
 	}
 	// Contracts from synthetic test/bench fixtures are kept (so drift

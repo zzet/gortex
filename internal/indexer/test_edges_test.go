@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -562,6 +563,27 @@ func TestMasterResolveWholeGraphReconcilesRetargetedTestCalls(t *testing.T) {
 		}
 		if e := findEdge(g, graph.EdgeTests, "repoA/pkg/foo_test.go::TestFoo", "repoA/pkg/foo.go::Foo"); e == nil {
 			t.Fatalf("master ResolveAll bound the test call but no EdgeTests was reconciled")
+		}
+	})
+
+	t.Run("canceled_after_compute_does_not_project", func(t *testing.T) {
+		mi, call, g := build()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := mi.runMasterResolveHookedContext(ctx, nil, false, cancel); !errors.Is(err, context.Canceled) {
+			t.Fatalf("resolve cancellation = %v", err)
+		}
+		if call.To != "repoA/pkg/foo.go::Foo" {
+			t.Fatalf("fixture must cancel after the real call was bound, got %q", call.To)
+		}
+		if e := findEdge(g, graph.EdgeTests, "repoA/pkg/foo_test.go::TestFoo", "repoA/pkg/foo.go::Foo"); e != nil {
+			t.Fatal("canceled resolve started the retargeted test projection")
+		}
+		// The next normal graph projection repairs the canceled tail; shutdown
+		// does not need to run that work before joining the canceled owner.
+		markTestSymbolsAndEmitEdges(g)
+		if e := findEdge(g, graph.EdgeTests, "repoA/pkg/foo_test.go::TestFoo", "repoA/pkg/foo.go::Foo"); e == nil {
+			t.Fatal("normal projection did not repair the canceled tail")
 		}
 	})
 }

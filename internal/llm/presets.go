@@ -38,6 +38,25 @@ var gatewayPresets = map[string]CustomProvider{
 		SchemaMode:    "json_schema",
 		PromptProfile: "frontier",
 	},
+	// llm.buzz (https://llm.buzz) is an OpenAI-compatible gateway; model
+	// ids carry a vendor prefix (list: GET /api/v1/models).
+	"llm-buzz": {
+		BaseURL:       "https://api.llm.buzz/api/v1",
+		Model:         "openai/gpt-5.4-mini",
+		APIKeyEnv:     "LLM_BUZZ_API_KEY",
+		SchemaMode:    "json_schema",
+		PromptProfile: "frontier",
+	},
+	// Opper (https://docs.opper.ai) is an EU-hosted OpenAI-compatible
+	// gateway at /v3/compat (no /v1); model ids are bare pool names, and a
+	// "provider/model" id such as "azure/gpt-5.5" pins one route.
+	"opper": {
+		BaseURL:       "https://api.opper.ai/v3/compat",
+		Model:         "gpt-6.1-terra",
+		APIKeyEnv:     "OPPER_API_KEY",
+		SchemaMode:    "json_schema",
+		PromptProfile: "frontier",
+	},
 	// Requesty (https://docs.requesty.ai) fronts many vendors behind one
 	// key; model ids carry a vendor prefix. Regional routers:
 	// https://router.eu.requesty.ai/v1 (and .us / .ap).

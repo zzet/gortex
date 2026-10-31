@@ -23,7 +23,9 @@ on:
       - 'internal/hooks/**'
       - 'internal/mcp/**'
       - 'cmd/gortex/**'
+      - 'Makefile'
       - '.github/workflows/skill-drift.yml'
+      - '.github/workflows/publish-claude-plugin.yml'
   workflow_dispatch:
 
 jobs:
@@ -44,3 +46,9 @@ jobs:
 
       - name: All-platform render structural check
         run: ./gortex agents render --check
+
+      # publish-claude-plugin runs this target on every release, and nothing
+      # else exercises it, so a build change that breaks it would only show
+      # when a release tries to publish.
+      - name: Claude Code plugin bundle
+        run: make claude-plugin

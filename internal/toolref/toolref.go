@@ -60,6 +60,12 @@ const MCPMissingToolsException = "Outside a Gortex-tracked repo, or when the use
 // Constant forms let shared instruction blocks remain compile-time constants;
 // the rendering helpers below return these exact sentences on every surface.
 const DegradedModeText = "If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure."
+
+// ToolSurfacePolicyText keeps installed examples subordinate to the actual
+// session policy. Explicit compatibility presets remain valid MCP surfaces;
+// this rule neither promotes tools nor bypasses an operator restriction.
+const ToolSurfacePolicyText = "Follow advertised tools and server/session instructions. Compact examples require those tools; otherwise follow legacy session guidance. Missing `change` alone is not missing editing when legacy editors are advertised. Read-only policies and explicit denials still apply."
+
 const TransportText = "Never use `gortex call` in place of MCP; git, build, and test commands are fine."
 
 // DegradedModeLine is the bounded standing policy for transient and unavailable

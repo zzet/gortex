@@ -1,17 +1,15 @@
 package store_sqlite
 
 import (
-	"context"
 	"database/sql"
 	"database/sql/driver"
-	"errors"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/sqliteconn"
 	sqlite "modernc.org/sqlite"
 )
 
@@ -21,7 +19,7 @@ func requireNoCloseCheckpoint(t *testing.T, conn *sql.Conn) {
 		if gated, ok := dc.(*gatedConn); ok {
 			dc = gated.inner
 		}
-		value, err := sqliteNoCloseCheckpointMode(dc.(driver.Conn), -1)
+		value, err := sqliteconn.NoCloseCheckpointMode(dc.(driver.Conn), -1)
 		if err != nil {
 			return err
 		}
@@ -79,7 +77,7 @@ func TestSQLiteNoCloseCheckpointCoversPhysicalPoolsAndReplacements(t *testing.T)
 				if gated, ok := dc.(*gatedConn); ok {
 					dc = gated.inner
 				}
-				value, err := sqliteNoCloseCheckpointMode(dc.(driver.Conn), 0)
+				value, err := sqliteconn.NoCloseCheckpointMode(dc.(driver.Conn), 0)
 				require.Equal(t, int32(0), value)
 				return err
 			}))
@@ -96,48 +94,6 @@ func TestSQLiteNoCloseCheckpointCoversPhysicalPoolsAndReplacements(t *testing.T)
 			require.NoError(t, conn.Close())
 		})
 	}
-}
-
-type unsupportedClosePolicyConn struct {
-	closes   atomic.Int32
-	closeErr error
-}
-
-func (*unsupportedClosePolicyConn) Prepare(string) (driver.Stmt, error) {
-	return nil, errors.New("unexpected prepare")
-}
-func (*unsupportedClosePolicyConn) Begin() (driver.Tx, error) {
-	return nil, errors.New("unexpected transaction")
-}
-func (c *unsupportedClosePolicyConn) Close() error { c.closes.Add(1); return c.closeErr }
-
-type unsupportedClosePolicyConnector struct {
-	conn  *unsupportedClosePolicyConn
-	calls atomic.Int32
-}
-
-func (c *unsupportedClosePolicyConnector) Connect(context.Context) (driver.Conn, error) {
-	c.calls.Add(1)
-	return c.conn, nil
-}
-func (*unsupportedClosePolicyConnector) Driver() driver.Driver { return closeCheckpointDriver{} }
-
-func TestSQLiteNoCloseCheckpointRefusesUnsupportedConnectionAndRetainsCloseError(t *testing.T) {
-	sentinel := errors.New("physical close failed")
-	conn := &unsupportedClosePolicyConn{closeErr: sentinel}
-	inner := &unsupportedClosePolicyConnector{conn: conn}
-	connector := noCloseCheckpointConnector{inner: inner}
-	opened, err := connector.Connect(t.Context())
-	require.Nil(t, opened)
-	require.ErrorContains(t, err, "unsupported physical connection handles")
-	require.ErrorIs(t, err, sentinel)
-	require.Equal(t, int32(1), conn.closes.Load(), "rejected connection was not actually closed exactly once")
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	opened, err = connector.Connect(ctx)
-	require.Nil(t, opened)
-	require.ErrorIs(t, err, context.Canceled)
-	require.Equal(t, int32(1), inner.calls.Load(), "canceled admission opened another physical connection")
 }
 
 func TestSQLiteNoCloseCheckpointLastConnectionPreservesWALAndReopens(t *testing.T) {
@@ -161,7 +117,7 @@ func TestSQLiteNoCloseCheckpointLastConnectionPreservesWALAndReopens(t *testing.
 				conn, err := db.Conn(t.Context())
 				require.NoError(t, err)
 				t.Cleanup(func() { _ = conn.Close() })
-				require.NoError(t, conn.Raw(func(dc any) error { _, err := sqliteNoCloseCheckpointMode(dc.(driver.Conn), 0); return err }))
+				require.NoError(t, conn.Raw(func(dc any) error { _, err := sqliteconn.NoCloseCheckpointMode(dc.(driver.Conn), 0); return err }))
 				require.NoError(t, conn.Close())
 			}
 			require.NoError(t, db.Close()) // The sole actual physical connection.

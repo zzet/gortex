@@ -6,30 +6,25 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/zzet/gortex/internal/toolref"
 )
 
-// These reconstruct only the prior shared producer's policy edits. Frozen
-// production digests are independently pinned to the supported release source.
-func previousGeneratedBody(p Profile) string {
-	body := p.Body()
-	pair := toolref.TransportClause() + " " + toolref.DegradedModeLine()
-	if p.Name == "full" {
-		body = strings.Replace(body, "When Gortex can serve the step:\n\n| Instead of...", "| Instead of...", 1)
-		return strings.Replace(body, "**Native MCP required:** "+pair,
-			"**Native MCP required:** if a configured Gortex tool is missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or use a CLI/shell fallback. "+toolref.MCPMissingToolsException, 1)
+// Frozen prior producer output is independently checked against the production
+// supported-release digests below. It must not be reconstructed from today's
+// wording: that would change the historical ownership fixture with every edit.
+func previousGeneratedBody(t *testing.T, p Profile) string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("testdata", "legacy-v0.64.11", p.Name+".md"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	body = strings.Replace(body, "When Gortex can serve the step:", "For every coding task:", 1)
-	return strings.Replace(body, pair,
-		"If the Gortex server is configured but these tools are missing from the callable MCP tools, report a Gortex MCP integration failure and stop. Do not start a daemon or fall back to a CLI/shell. "+toolref.MCPMissingToolsException, 1)
+	return string(body)
 }
 
 func writePreviousProfiles(t *testing.T, dir string, stamped bool) {
 	t.Helper()
 	stamp := generationStamp{Version: "v0.64.11", Files: make(map[string]string)}
 	for _, p := range Table() {
-		body := []byte(previousGeneratedBody(p))
+		body := []byte(previousGeneratedBody(t, p))
 		if err := os.WriteFile(filepath.Join(dir, p.Name+".md"), body, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -244,7 +239,7 @@ func TestLegacyProfileProvenanceAndCoreGrowth(t *testing.T) {
 	// independent of the raisable ceiling and must not drift with new bodies.
 	const previousCoreBytes = 4316
 	for _, p := range Table() {
-		prior := []byte(previousGeneratedBody(p))
+		prior := []byte(previousGeneratedBody(t, p))
 		if !containsGeneratedHash(legacyGeneratedHashes[p.Name+".md"], generatedHash(prior)) {
 			t.Fatalf("legacy fixture no longer matches a pinned public release: %s", p.Name)
 		}

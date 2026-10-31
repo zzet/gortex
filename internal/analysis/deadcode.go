@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"context"
 	"math"
 	"path/filepath"
 	"slices"
@@ -19,6 +20,11 @@ type DeadCodeEntry struct {
 	Kind     string `json:"kind"`
 	FilePath string `json:"file_path"`
 	Line     int    `json:"start_line"`
+	// Ownership is carried to scope-aware callers without changing the wire
+	// payload or requiring another per-result node lookup.
+	RepoPrefix  string `json:"-"`
+	WorkspaceID string `json:"-"`
+	ProjectID   string `json:"-"`
 }
 
 // HotspotEntry represents a symbol with disproportionately high complexity metrics.
@@ -58,6 +64,13 @@ type HotspotEntry struct {
 // — none of them have a meaningful "is this code dead?" answer, and
 // surfacing them drowns the real dead-function signal in noise.
 type FindDeadCodeOptions struct {
+	// NodeScope is an additional exact metadata boundary, applied before
+	// candidate method checks. Nil preserves the caller's existing view.
+	NodeScope *graph.NodeScope
+	// RepoPrefixes scopes candidates, implementing types, entry-point files
+	// and processes. Incoming callers/interfaces remain global evidence.
+	// Nil preserves the unscoped analysis; a non-nil empty set returns none.
+	RepoPrefixes []string
 	// IncludeVariables includes variable nodes in the results. Default false.
 	// Variables are excluded by default because the graph does not track
 	// intra-function data flow — local variables always appear "dead" even
@@ -96,42 +109,6 @@ type FindDeadCodeOptions struct {
 	// Useful when cross-repo linking is incomplete — functions in secondary
 	// repos may lack incoming edges from the primary repo.
 	SkipCrossRepoNodes bool
-}
-
-// neverDeadCodeKinds enumerates node kinds the dead-code analyzer must
-// never report — regardless of opt-in flags — because the question
-// "is this code dead?" has no meaningful answer for them. Includes
-// structural nodes (file/package/import), function-shape nodes
-// (param/closure/generic_param), extracted metadata (todo/team/
-// release/license), infra surface (table/column/migration/config_key/
-// flag/event/fixture/resource/kustomization/image), package metadata
-// (module), and value-extraction nodes (string/enum_member).
-// Surfacing any of these drowns real dead-function signal in noise.
-var neverDeadCodeKinds = map[graph.NodeKind]bool{
-	graph.KindFile:          true,
-	graph.KindPackage:       true,
-	graph.KindImport:        true,
-	graph.KindParam:         true,
-	graph.KindClosure:       true,
-	graph.KindGenericParam:  true,
-	graph.KindString:        true,
-	graph.KindEnumMember:    true,
-	graph.KindModule:        true,
-	graph.KindColumn:        true,
-	graph.KindTable:         true,
-	graph.KindConfigKey:     true,
-	graph.KindFlag:          true,
-	graph.KindEvent:         true,
-	graph.KindMigration:     true,
-	graph.KindFixture:       true,
-	graph.KindTodo:          true,
-	graph.KindTeam:          true,
-	graph.KindRelease:       true,
-	graph.KindLicense:       true,
-	graph.KindResource:      true,
-	graph.KindKustomization: true,
-	graph.KindImage:         true,
-	graph.KindContract:      true,
 }
 
 // incomingUsageKinds returns the set of incoming edge kinds that count
@@ -216,8 +193,8 @@ func isEntryPointNode(n *graph.Node) bool {
 // to flag (modulo the opt-in switches for fields / variables /
 // constants). Used both for the per-kind allowlist handed to the
 // DeadCodeCandidator capability and as the source of truth for the
-// Go-fallback loop. Kept in lockstep with neverDeadCodeKinds: a kind
-// MUST appear in exactly one of the two lists.
+// Go-fallback loop. Structural/metadata nodes, intra-function bindings and
+// unreviewed future kinds are not candidates, even on a legacy reader.
 var candidateNodeKinds = []graph.NodeKind{
 	graph.KindFunction,
 	graph.KindMethod,
@@ -236,15 +213,9 @@ func FindDeadCode(g graph.Reader, processes *ProcessResult, excludePatterns []st
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
-
-	// Build set of interface-required method names per type.
-	// If a type implements an interface, all methods that the interface
-	// requires are alive even if never called directly (they satisfy the
-	// contract).  We index: typeID → set of required method names.
-	// Backends that implement graph.IfaceImplementsScanner serve this
-	// from one join; the fallback walks NodesByKind + EdgesByKind
-	// just like before.
-	ifaceRequiredMethods := buildIfaceRequiredMethods(g)
+	if opt.RepoPrefixes != nil && len(opt.RepoPrefixes) == 0 {
+		return nil
+	}
 
 	// Pick the candidate-set source. When the backend implements
 	// DeadCodeCandidator, the "no incoming usage edge" filter runs
@@ -258,7 +229,19 @@ func FindDeadCode(g graph.Reader, processes *ProcessResult, excludePatterns []st
 	// Build set of entry point node IDs from processes
 	entryPoints := make(map[string]bool)
 	if processes != nil {
+		var entryNodes map[string]*graph.Node
+		allowedRepos := deadCodeRepoSet(opt.RepoPrefixes)
+		if allowedRepos != nil {
+			ids := make([]string, 0, len(processes.Processes))
+			for _, proc := range processes.Processes {
+				ids = append(ids, proc.EntryPoint)
+			}
+			entryNodes = g.GetNodesByIDs(ids)
+		}
 		for _, proc := range processes.Processes {
+			if allowedRepos != nil && !deadCodeRepoAllows(entryNodes[proc.EntryPoint], allowedRepos) {
+				continue
+			}
 			entryPoints[proc.EntryPoint] = true
 			// Also consider all nodes that participate in any process
 			for _, step := range proc.Steps {
@@ -273,22 +256,23 @@ func FindDeadCode(g graph.Reader, processes *ProcessResult, excludePatterns []st
 	// NodesByKind(KindFile) so on disk backends we don't have to
 	// materialise AllNodes() just to find the entry-point files.
 	entryPointFiles := make(map[string]bool)
-	for n := range g.NodesByKind(graph.KindFile) {
+	for n := range deadCodeFileNodes(g, opt.RepoPrefixes, opt.NodeScope) {
 		if n != nil && isEntryPointNode(n) {
 			entryPointFiles[n.FilePath] = true
 		}
 	}
+	// Interface contracts matter only for zero-incoming method candidates.
+	// Expand their actual receiver identities through the selected reader;
+	// enumerating every scoped node/implementer dominates small-repo calls.
+	ifaceRequiredMethods, methodOutEdges := deadCodeMethodEvidence(g, candidates, incomingByID, opt)
 
 	var result []DeadCodeEntry
 	var resultNodes []*graph.Node
 	for _, n := range candidates {
-		// Skip kinds the analyzer never reports — structural,
-		// extracted metadata, infra, function-shape, and value-only
-		// nodes. See neverDeadCodeKinds for the full list and why.
-		// (The server-side candidator only ships nodes whose kind is
-		// in candidateNodeKinds, but the Go fallback path scans
-		// AllNodes so we keep the explicit gate.)
-		if neverDeadCodeKinds[n.Kind] {
+		// Keep indexed and legacy readers on the same positive eligibility
+		// contract. A negative list silently admitted new local/structural
+		// kinds from AllNodes that an indexed candidator never returned.
+		if !slices.Contains(candidateNodeKinds, n.Kind) {
 			continue
 		}
 
@@ -398,7 +382,7 @@ func FindDeadCode(g graph.Reader, processes *ProcessResult, excludePatterns []st
 		// an interface contract.  Look up the receiver type via member_of edges
 		// and check if any implemented interface requires this method name.
 		if n.Kind == graph.KindMethod {
-			outEdges := g.GetOutEdges(n.ID)
+			outEdges := methodOutEdges[n.ID]
 			for _, e := range outEdges {
 				if e.Kind == graph.EdgeMemberOf {
 					if required, ok := ifaceRequiredMethods[e.To]; ok {
@@ -473,11 +457,8 @@ func FindDeadCode(g graph.Reader, processes *ProcessResult, excludePatterns []st
 		}
 
 		result = append(result, DeadCodeEntry{
-			ID:       n.ID,
-			Name:     n.Name,
-			Kind:     string(n.Kind),
-			FilePath: n.FilePath,
-			Line:     n.StartLine,
+			ID: n.ID, Name: n.Name, Kind: string(n.Kind), FilePath: n.FilePath, Line: n.StartLine,
+			RepoPrefix: n.RepoPrefix, WorkspaceID: n.WorkspaceID, ProjectID: n.ProjectID,
 		})
 		resultNodes = append(resultNodes, n)
 	}
@@ -551,100 +532,55 @@ func FindDeadCode(g graph.Reader, processes *ProcessResult, excludePatterns []st
 // behaviour. The post-filter loop in FindDeadCode handles both shapes
 // uniformly — incomingByID==nil means "filter already applied".
 func collectDeadCodeCandidates(g graph.Reader, opt FindDeadCodeOptions) (candidates []*graph.Node, incomingByID map[string][]*graph.Edge) {
-	if dc, ok := g.(graph.DeadCodeCandidator); ok {
-		kinds := candidateNodeKinds[:0:0]
-		for _, k := range candidateNodeKinds {
-			// Honour the IncludeFields / IncludeVariables / IncludeConstants
-			// opt-in switches at the candidate-source: kinds the caller
-			// explicitly excluded never need to cross cgo. The post-
-			// filter loop still re-checks these for the fallback path
-			// (which sees every kind) so the contract holds either way.
-			switch k {
-			case graph.KindField:
-				if !opt.IncludeFields {
-					continue
-				}
-			case graph.KindVariable:
-				if !opt.IncludeVariables {
-					continue
-				}
-			case graph.KindConstant:
-				if !opt.IncludeConstants {
-					continue
-				}
+	kinds := candidateNodeKinds[:0:0]
+	for _, k := range candidateNodeKinds {
+		// Honour the IncludeFields / IncludeVariables / IncludeConstants
+		// opt-in switches at the candidate-source: kinds the caller
+		// explicitly excluded never need to cross cgo. The post-
+		// filter loop still re-checks these for the fallback path
+		// (which sees every kind) so the contract holds either way.
+		switch k {
+		case graph.KindField:
+			if !opt.IncludeFields {
+				continue
 			}
-			kinds = append(kinds, k)
+		case graph.KindVariable:
+			if !opt.IncludeVariables {
+				continue
+			}
+		case graph.KindConstant:
+			if !opt.IncludeConstants {
+				continue
+			}
 		}
-		allowed := make(map[graph.NodeKind][]graph.EdgeKind, len(kinds))
-		for _, k := range kinds {
-			allowed[k] = incomingUsageKinds(k)
+		kinds = append(kinds, k)
+	}
+	allowed := make(map[graph.NodeKind][]graph.EdgeKind, len(kinds))
+	for _, k := range kinds {
+		allowed[k] = incomingUsageKinds(k)
+	}
+	if opt.NodeScope != nil {
+		if scoped, ok := g.(graph.NodeScopedDeadCodeReader); ok {
+			return scoped.DeadCodeCandidatesInScope(kinds, allowed, opt.RepoPrefixes, *opt.NodeScope, graph.DeadCodeCandidateExclusions{Stubs: true, External: true}), nil
 		}
-		return dc.DeadCodeCandidates(kinds, allowed), nil
+	}
+	if scoped, ok := g.(graph.ScopedDeadCodeReader); ok {
+		// Nil is the capability's explicit unscoped query, not a reason to
+		// bypass visibility-aware indexed filtering with an AllNodes scan.
+		return filterDeadCodeNodeScope(scoped.DeadCodeCandidatesInRepos(kinds, allowed, opt.RepoPrefixes), opt.NodeScope), nil
+	}
+	if dc, ok := g.(graph.DeadCodeCandidator); ok {
+		return filterDeadCodeNodeScope(filterDeadCodeRepos(dc.DeadCodeCandidates(kinds, allowed), opt.RepoPrefixes), opt.NodeScope), nil
 	}
 
 	// Fallback: pull every node and the batched in-edge map up front.
 	// Same shape as before the DeadCodeCandidator capability landed.
-	nodes := g.AllNodes()
+	nodes := filterDeadCodeNodeScope(filterDeadCodeRepos(g.AllNodes(), opt.RepoPrefixes), opt.NodeScope)
 	nodeIDs := make([]string, 0, len(nodes))
 	for _, n := range nodes {
 		nodeIDs = append(nodeIDs, n.ID)
 	}
 	return nodes, g.GetInEdgesByNodeIDs(nodeIDs)
-}
-
-// buildIfaceRequiredMethods returns a map from type ID → set of method names
-// that the type must implement to satisfy its interfaces.  This is computed by:
-//  1. Collecting all interfaces with their required method names (from Meta["methods"]).
-//  2. Collecting all EdgeImplements edges (type → interface).
-//  3. For each type that implements an interface, merging all required method names.
-//
-// On backends that implement graph.IfaceImplementsScanner this is a
-// single join; otherwise the fallback iterates
-// NodesByKind(KindInterface) + EdgesByKind(EdgeImplements). Both paths
-// produce the same map.
-func buildIfaceRequiredMethods(g graph.Reader) map[string]map[string]bool {
-	if scanner, ok := g.(graph.IfaceImplementsScanner); ok {
-		return buildIfaceRequiredMethodsFromRows(scanner.IfaceImplementsRows())
-	}
-
-	// Fallback: walk interfaces + EdgeImplements edges Go-side. Uses
-	// NodesByKind(KindInterface) so disk backends still issue one
-	// scan per kind instead of pulling AllNodes.
-	ifaceMethods := make(map[string]map[string]bool)
-	for n := range g.NodesByKind(graph.KindInterface) {
-		if n == nil || n.Meta == nil {
-			continue
-		}
-		raw, ok := n.Meta["methods"]
-		if !ok {
-			continue
-		}
-		methods := decodeMethodNames(raw)
-		if len(methods) > 0 {
-			ifaceMethods[n.ID] = methods
-		}
-	}
-
-	if len(ifaceMethods) == 0 {
-		return nil
-	}
-
-	result := make(map[string]map[string]bool)
-	for e := range g.EdgesByKind(graph.EdgeImplements) {
-		// EdgeImplements: From=type, To=interface
-		iface, ok := ifaceMethods[e.To]
-		if !ok {
-			continue
-		}
-		if result[e.From] == nil {
-			result[e.From] = make(map[string]bool)
-		}
-		for m := range iface {
-			result[e.From][m] = true
-		}
-	}
-
-	return result
 }
 
 // buildIfaceRequiredMethodsFromRows reduces the server-side
@@ -724,6 +660,19 @@ const hotspotBetweennessWeight = 0.4
 // other symbols — that augments the fan-in/out signals rather than replacing them.
 // If threshold <= 0, the default threshold is mean + 2*stddev.
 func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float64) []HotspotEntry {
+	result, _ := FindHotspotsContext(context.Background(), g, communities, threshold)
+	return result
+}
+
+// FindHotspotsContext computes the same ranking, but cancellation makes the
+// entire result unavailable instead of publishing a smaller partial ranking.
+func FindHotspotsContext(ctx context.Context, g graph.Reader, communities *CommunityResult, threshold float64) ([]HotspotEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ctx.Done() != nil {
+		g = graph.BindReadContext(g, ctx)
+	}
 	// Pull only function/method node IDs — the hotspots ranking is
 	// callable-only, and the scoring math doesn't touch any column
 	// beyond the id. NodeIDsByKinds returns the projection from a
@@ -751,6 +700,9 @@ func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float6
 			}
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Build lookup maps for community membership
 	nodeToComm := make(map[string]string)
@@ -763,10 +715,16 @@ func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float6
 	// list -- it never returns rows for ids the caller didn't ask
 	// for, so the cgo payload stays bounded by the candidate count
 	// rather than the whole graph.
-	fanIn, fanOut := CollectFanCounts(g, candidateIDs,
+	fanIn, fanOut, err := collectFanCountsContext(ctx, g, candidateIDs,
 		[]graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences},
 		[]graph.EdgeKind{graph.EdgeCalls},
 	)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Community crossings per node: outgoing edges (Calls or
 	// References) whose target sits in a different community than
@@ -788,7 +746,12 @@ func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float6
 	} else {
 		crossings = make(map[string]int)
 		countCrossings := func(kind graph.EdgeKind) {
+			scanned := 0
 			for e := range g.EdgesByKind(kind) {
+				if scanned&1023 == 0 && ctx.Err() != nil {
+					return
+				}
+				scanned++
 				if e == nil {
 					continue
 				}
@@ -803,11 +766,17 @@ func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float6
 			countCrossings(k)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Betweenness centrality — exact on small graphs, sampled on
 	// large ones. Normalized to 0-100 against the graph's own max so
 	// it sits on the same scale as the other score terms.
-	bc := ComputeBetweenness(g)
+	bc, err := ComputeBetweennessContext(ctx, g)
+	if err != nil {
+		return nil, err
+	}
 	betweenness := make(map[string]float64, len(bc.Scores))
 	if bc.Max > 0 {
 		for id, v := range bc.Scores {
@@ -830,7 +799,12 @@ func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float6
 	}
 
 	entries := make([]rawEntry, 0, len(candidateIDs))
-	for _, id := range candidateIDs {
+	for index, id := range candidateIDs {
+		if index&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		fi := fanIn[id]
 		fo := fanOut[id]
 		cc := crossings[id]
@@ -848,12 +822,17 @@ func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float6
 	}
 
 	if len(entries) == 0 {
-		return nil
+		return nil, ctx.Err()
 	}
 
 	// Find max raw score for normalization
 	maxRaw := 0.0
-	for _, e := range entries {
+	for index, e := range entries {
+		if index&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if e.rawScore > maxRaw {
 			maxRaw = e.rawScore
 		}
@@ -862,6 +841,11 @@ func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float6
 	// Normalize to 0-100
 	normalized := make([]float64, len(entries))
 	for i, e := range entries {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if maxRaw > 0 {
 			normalized[i] = (e.rawScore / maxRaw) * 100.0
 		}
@@ -870,13 +854,23 @@ func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float6
 	// Compute default threshold if not specified: mean + 2*stddev
 	if threshold <= 0 {
 		var sum float64
-		for _, s := range normalized {
+		for index, s := range normalized {
+			if index&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			sum += s
 		}
 		mean := sum / float64(len(normalized))
 
 		var variance float64
-		for _, s := range normalized {
+		for index, s := range normalized {
+			if index&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			diff := s - mean
 			variance += diff * diff
 		}
@@ -895,6 +889,11 @@ func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float6
 	}
 	survivors := make([]survivor, 0, len(entries))
 	for i := range entries {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		score := math.Round(normalized[i]*100) / 100 // round to 2 decimal places
 		if score < threshold {
 			continue
@@ -902,17 +901,30 @@ func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float6
 		survivors = append(survivors, survivor{entryIdx: i, score: score})
 	}
 	if len(survivors) == 0 {
-		return nil
+		return nil, ctx.Err()
 	}
 
 	survivorIDs := make([]string, 0, len(survivors))
-	for _, s := range survivors {
+	for index, s := range survivors {
+		if index&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		survivorIDs = append(survivorIDs, entries[s.entryIdx].id)
 	}
 	nodesByID := g.GetNodesByIDs(survivorIDs)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	result := make([]HotspotEntry, 0, len(survivors))
-	for _, s := range survivors {
+	for index, s := range survivors {
+		if index&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		e := entries[s.entryIdx]
 		n := nodesByID[e.id]
 		if n == nil {
@@ -937,7 +949,10 @@ func FindHotspots(g graph.Reader, communities *CommunityResult, threshold float6
 		return result[i].ComplexityScore > result[j].ComplexityScore
 	})
 
-	return result
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // isTestFilePath checks if a file path indicates a test file.
@@ -1172,13 +1187,26 @@ func matchesExcludePattern(filePath, nodeID string, patterns []string) bool {
 // keeps them per-call so a future analyzer with a different kind
 // split can share the same plumbing.
 func CollectFanCounts(g graph.Reader, ids []string, fanInKinds []graph.EdgeKind, fanOutKinds []graph.EdgeKind) (fanIn, fanOut map[string]int) {
+	fanIn, fanOut, _ = collectFanCountsContext(context.Background(), g, ids, fanInKinds, fanOutKinds)
+	return fanIn, fanOut
+}
+
+func collectFanCountsContext(ctx context.Context, g graph.Reader, ids []string, fanInKinds []graph.EdgeKind, fanOutKinds []graph.EdgeKind) (fanIn, fanOut map[string]int, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	fanIn = make(map[string]int, len(ids))
 	fanOut = make(map[string]int, len(ids))
 	if len(ids) == 0 {
-		return fanIn, fanOut
+		return fanIn, fanOut, nil
 	}
 	if agg, ok := g.(graph.NodeFanAggregator); ok {
-		for _, r := range agg.NodeFanCounts(ids, fanInKinds, fanOutKinds) {
+		for index, r := range agg.NodeFanCounts(ids, fanInKinds, fanOutKinds) {
+			if index&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, nil, err
+				}
+			}
 			if r.FanIn != 0 {
 				fanIn[r.NodeID] = r.FanIn
 			}
@@ -1186,14 +1214,22 @@ func CollectFanCounts(g graph.Reader, ids []string, fanInKinds []graph.EdgeKind,
 				fanOut[r.NodeID] = r.FanOut
 			}
 		}
-		return fanIn, fanOut
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		return fanIn, fanOut, nil
 	}
 
 	// Fallback path: stream the requested kinds via EdgesByKind and
 	// tally Go-side. ID-set membership keeps the maps bounded to
 	// candidate ids, matching the capability contract.
 	idSet := make(map[string]struct{}, len(ids))
-	for _, id := range ids {
+	for index, id := range ids {
+		if index&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+		}
 		if id != "" {
 			idSet[id] = struct{}{}
 		}
@@ -1204,7 +1240,12 @@ func CollectFanCounts(g graph.Reader, ids []string, fanInKinds []graph.EdgeKind,
 			return
 		}
 		streamed[kind] = struct{}{}
+		scanned := 0
 		for e := range g.EdgesByKind(kind) {
+			if scanned&1023 == 0 && ctx.Err() != nil {
+				return
+			}
+			scanned++
 			if e == nil {
 				continue
 			}
@@ -1239,9 +1280,15 @@ func CollectFanCounts(g graph.Reader, ids []string, fanInKinds []graph.EdgeKind,
 		allKinds = append(allKinds, k)
 	}
 	for _, k := range allKinds {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		_, toIn := inKinds[k]
 		_, toOut := outKinds[k]
 		stream(k, toIn, toOut)
 	}
-	return fanIn, fanOut
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	return fanIn, fanOut, nil
 }

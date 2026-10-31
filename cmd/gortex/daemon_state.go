@@ -321,6 +321,9 @@ func boundedStartupError(err error) string {
 // already compute — those logs stay untouched; this just also keeps the
 // values around instead of discarding them.
 type warmupTimings struct {
+	// err prevents an incomplete repair from being promoted to enriched by
+	// the outer startup owner even when its context remains live.
+	err               error
 	prelude           time.Duration
 	prepareResolve    time.Duration
 	contractRehydrate time.Duration
@@ -344,6 +347,10 @@ type warmupTimings struct {
 	// enrichScheduled is the number of repos whose deferred semantic
 	// enrichment was actually dispatched, as returned by RunDeferredPassesAll.
 	enrichScheduled int
+}
+
+func (w *warmupTimings) canFinalize(ctx context.Context) bool {
+	return ctx.Err() == nil && w != nil && w.err == nil
 }
 
 // warmupDeltaFrontier carries the exact file/derived frontier out of the
@@ -523,8 +530,8 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 	finishBatch := startWarmupStep(logger, "begin_parallel_batch")
 	state.multiIndexer.BeginParallelBatch()
 	defer func() {
-		if ctx.Err() != nil {
-			// Cancellation must release batch mode without launching derived
+		if ctx.Err() != nil || timings.err != nil {
+			// Cancellation or failed repair must release batch mode without launching derived
 			// passes. The topology callback still joins workers and seals its
 			// coordinated bulk connection before returning.
 			state.multiIndexer.ResetBatch()
@@ -956,6 +963,7 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 	// prefixed strings retained by the cold interner generation.
 	rotateColdInternGeneration(logger, "parallel_parse")
 	timings.parse = time.Since(phaseStart)
+	timings.reposChanged = int(changedRepos.Load())
 	timings.filesReindexed = int(filesReindexed.Load())
 	logger.Info("daemon: warmup phase done",
 		zap.String("phase", "parallel_parse"),
@@ -971,6 +979,18 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 		"repos_per_sec": parseStats.ItemsPerSec,
 	})
 
+	// A prior orderly cancellation may have resolved calls but skipped their
+	// test-edge projection. Repair that exact durable frontier before readiness,
+	// even when unchanged file mtimes allow the normal derived-pass fast path.
+	finishTestProjectionResume := startWarmupStep(logger, "test_projection_resume")
+	projectionResumeErr := state.multiIndexer.ResumePendingTestProjectionsContext(ctx)
+	finishTestProjectionResume(zap.Error(projectionResumeErr))
+	if projectionResumeErr != nil {
+		timings.err = projectionResumeErr
+		logger.Error("daemon: pending test projection repair incomplete", zap.Error(projectionResumeErr))
+		return nil, timings
+	}
+
 	prepareStart := time.Now()
 	logger.Info("daemon: warmup step start", zap.String("step", "prepare_resolve"))
 	// Warm-restart fast path. When the reconcile loop above re-indexed
@@ -983,7 +1003,6 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 	// The in-memory backend reaches here too, but its snapshot replay
 	// already restored the derived edges, so the skip is equally safe.
 	anyChanged := changedRepos.Load() > 0
-	timings.reposChanged = int(changedRepos.Load())
 	logger.Info("daemon: warmup change detection",
 		zap.Int64("changed_repos", changedRepos.Load()),
 		zap.Int("tracked_repos", len(repos)),
