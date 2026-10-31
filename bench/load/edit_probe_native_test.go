@@ -112,7 +112,12 @@ func editProbeDiskStub(t *testing.T, c Corpus, dir string) func(stubFrame) (any,
 // has its own prober session beside the one fixed editor.
 func newEditProbeNativeRun(t *testing.T, ctx context.Context, c Corpus, plan editProbePlan, dir string, n int) *editProbeRuntime {
 	t.Helper()
-	socket := startStub(t, editProbeDiskStub(t, c, dir))
+	return newEditProbeStubRun(t, ctx, c, plan, dir, n, editProbeDiskStub(t, c, dir))
+}
+
+func newEditProbeStubRun(t *testing.T, ctx context.Context, c Corpus, plan editProbePlan, dir string, n int, handle func(stubFrame) (any, *rpcError)) *editProbeRuntime {
+	t.Helper()
+	socket := startStub(t, handle)
 	open := func() *socketClient {
 		client, err := openMCP(ctx, socket, "")
 		if err != nil {
@@ -127,6 +132,7 @@ func newEditProbeNativeRun(t *testing.T, ctx context.Context, c Corpus, plan edi
 	}
 	phase := &Phase{Metrics: map[string]Metric{}, EditProbe: newEditProbeReport(plan, c, true)}
 	run := &editProbeRuntime{options: runOptions{Deadline: 3 * time.Second, Seed: 42}, p: &privateRun{Repos: []privateRepo{{Prefix: "fixture", Path: dir, Corpus: c}}}, phase: phase, plan: plan, editors: []*socketClient{open()}, original: original, origin: time.Now(), requireAccounting: true}
+	run.p.Socket = socket
 	for _, step := range plan.Steps[:n] {
 		sink := newEditProbeHeldSink(t)
 		sink.unblock()

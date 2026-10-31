@@ -112,6 +112,9 @@ func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
 	if err != nil || o.Agents == 0 {
 		return p, err
 	}
+	if c.EditSender == editProbeRestart {
+		return editProbePlan{}, errors.New("the restart cell has no pure readers")
+	}
 	if o.Agents < 0 || o.Agents > editProbeMaxReaders {
 		return editProbePlan{}, fmt.Errorf("edit-and-probe accepts 0..%d pure readers", editProbeMaxReaders)
 	}

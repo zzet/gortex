@@ -1305,6 +1305,157 @@
                               "reads_while_receipt_observed_pending": {
                                 "type": "integer"
                               },
+                              "restart": {
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "disk_has_marker": {
+                                        "type": "boolean"
+                                      },
+                                      "downtime_ms": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "reason": {
+                                            "type": "string"
+                                          },
+                                          "unit": {
+                                            "type": "string"
+                                          },
+                                          "value": {
+                                            "anyOf": [
+                                              {
+                                                "type": "number"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          }
+                                        },
+                                        "required": [
+                                          "value",
+                                          "unit",
+                                          "reason"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "first_correct_before_kill_ms": {
+                                        "additionalProperties": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "reason": {
+                                              "type": "string"
+                                            },
+                                            "unit": {
+                                              "type": "string"
+                                            },
+                                            "value": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "number"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "required": [
+                                            "value",
+                                            "unit",
+                                            "reason"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "type": [
+                                          "object",
+                                          "null"
+                                        ]
+                                      },
+                                      "first_correct_from_ready_ms": {
+                                        "additionalProperties": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "reason": {
+                                              "type": "string"
+                                            },
+                                            "unit": {
+                                              "type": "string"
+                                            },
+                                            "value": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "number"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "required": [
+                                            "value",
+                                            "unit",
+                                            "reason"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "type": [
+                                          "object",
+                                          "null"
+                                        ]
+                                      },
+                                      "kill_ns": {
+                                        "anyOf": [
+                                          {
+                                            "type": "integer"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "qualification": {
+                                        "type": "string"
+                                      },
+                                      "ready_ns": {
+                                        "anyOf": [
+                                          {
+                                            "type": "integer"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "receipt_pending_before_kill": {
+                                        "type": "boolean"
+                                      },
+                                      "status_after_restart": {},
+                                      "status_after_restart_error": {
+                                        "type": "string"
+                                      },
+                                      "status_before_kill": {}
+                                    },
+                                    "required": [
+                                      "receipt_pending_before_kill",
+                                      "status_before_kill",
+                                      "kill_ns",
+                                      "ready_ns",
+                                      "downtime_ms",
+                                      "status_after_restart",
+                                      "first_correct_before_kill_ms",
+                                      "first_correct_from_ready_ms",
+                                      "disk_has_marker"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
                               "stale_claimed_fresh": {
                                 "type": "boolean"
                               },

@@ -18,6 +18,7 @@ const (
 	editProbeEditorSave     = "editor_save"
 	editProbeCreateDelete   = "create_delete"
 	editProbeHotFile        = "hot_file" // MCP edits; only the arrivals are shaped
+	editProbeRestart        = "restart"  // one MCP edit; the daemon is killed while its receipt is pending
 )
 
 type editProbeFileIdentity struct {
@@ -68,6 +69,13 @@ func editProbeNativeSender(c Corpus, kind, tool string, count, editors int) erro
 		if count != 100 || editors != 1 {
 			return errors.New("create_delete runs 50 create/delete pairs: 100 edits on one editor")
 		}
+	case editProbeRestart:
+		if kind != "add_intrafile_call" || tool != "edit.file" || c.EditOutput != "" && c.EditOutput != "json" {
+			return errors.New("restart kills the daemon under one JSON edit.file call addition")
+		}
+		if count != 1 || editors != 1 {
+			return errors.New("restart is a one-edit, one-editor diagnostic")
+		}
 	case editProbeHotFile:
 		if kind != "add_intrafile_call" || tool != "edit.file" && tool != "edit.write" {
 			return errors.New("hot_file pairs edit.file or edit.write call additions on one file")
@@ -112,6 +120,9 @@ func editProbePlaceholder(seed int64, ordinal int) string {
 }
 
 func editProbeNativeLimitations(sender string) []string {
+	if sender == editProbeRestart {
+		return []string{"the restart cell reads the edit's own receipt status once after its ACK, kills the owned daemon, restarts it on the same store and reopens the editor and prober sessions; probes pause from the kill until the restarted daemon is ready, so no probe error is attributed to the downtime", "first-correct times are post-restart probe answers, from send and from ready; answers before the kill are kept separately and never count as first-correct", "a receipt already terminal before the kill qualifies the record instead of passing; the interrupted receipt has no phases, accounting or derived time, and process counters and peaks cover the pre-kill daemon only"}
+	}
 	if sender == editProbeHotFile {
 		return []string{"two fixed editors send each pair of edits to one file at the same due time; every edit keeps its own ACK, receipt and accounting, and a lost write is a measured outcome"}
 	}

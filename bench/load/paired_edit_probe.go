@@ -85,7 +85,7 @@ func (c *pairedCoordinator) preparePairedEditProbe() error {
 		return errors.New("paired edit-and-probe pairs MCP probe calls; CLI probes run unpaired")
 	}
 	if base.plan.Sender != "" {
-		return errors.New("paired edit-and-probe pairs MCP edits; native senders run unpaired")
+		return errors.New("paired edit-and-probe pairs plain MCP edit cells; native, hot-file and restart cells run unpaired")
 	}
 	for i, state := range c.states {
 		r := state.phase.editProbeRuntime

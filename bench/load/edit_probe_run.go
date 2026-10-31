@@ -42,6 +42,7 @@ type editProbeRecord struct {
 	Batch                    *editProbeBatchReferences `json:"batch,omitempty"`
 	Move                     *editProbeMoveReferences  `json:"move,omitempty"`
 	MoveAccounting           *editProbeMoveAccounting  `json:"move_accounting,omitempty"`
+	Restart                  *editProbeRestartRecord   `json:"restart,omitempty"`
 	NativeWrite              *editProbeNativeWrite     `json:"native_write,omitempty"`
 	GraphTerminalBasis       string                    `json:"graph_terminal_basis,omitempty"`
 	Ack                      Metric                    `json:"t_ack_ms"`
@@ -125,6 +126,8 @@ type editProbeRuntime struct {
 	mu                sync.Mutex // Phase.Attempts, reads and mode counts only; request lifetimes are never serialized
 	requireAccounting bool
 	finalized         bool
+	restarter         editProbeRestarter // restart cell only
+	restarted         []*socketClient    // sessions reopened after a restart; closed by close
 }
 
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
@@ -226,6 +229,9 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		}
 	}
 	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, r.requireAccounting)
+	if plan.Sender == editProbeRestart {
+		r.restarter = editProbeDaemonRestarter{p: p}
+	}
 	if p.Repos[0].Corpus.EditKind == "add_crossfile_call" {
 		if err := r.admitCrossFileCallee(ctx); err != nil {
 			return r, nil, err
@@ -518,8 +524,11 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 // RPC/result; a blocked prober cannot shift this or any other edit's due time.
 func (r *editProbeRuntime) activate(ctx context.Context, step editProbeStep) {
 	probeCtx, cancel := context.WithCancel(ctx)
-	s := r.activateProbeState(step, cancel)
-	for index, oracle := range editProbeOracles(r.p.Repos[0].Corpus, step) {
+	r.probe(probeCtx, cancel, r.activateProbeState(step, cancel))
+}
+
+func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.CancelFunc, s *editProbeState) {
+	for index, oracle := range editProbeOracles(r.p.Repos[0].Corpus, s.step) {
 		s.probes.Go(func() {
 			ticker := time.NewTicker(editProbePeriod)
 			defer ticker.Stop()
@@ -679,6 +688,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	}
 	s.mu.Unlock()
 	s.signalAck()
+	if r.plan.Sender == editProbeRestart {
+		r.finishRestart(ctx, callCtx, s, step, started, receipt)
+		return
+	}
 	readbackKinds := []string{"file", "source"}
 	if step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
 		readbackKinds = append(readbackKinds, "old_source_absent")
@@ -968,6 +981,9 @@ func (r *editProbeRuntime) close() error {
 			failures = append(failures, s.sink.Close())
 		}
 	}
+	for _, client := range r.restarted {
+		failures = append(failures, client.Close())
+	}
 	return errors.Join(failures...)
 }
 
@@ -980,8 +996,8 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	}
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
 	for _, record := range r.phase.EditProbe.Records {
-		if record.NativeWrite != nil {
-			continue // A native write is synchronous: it ended before its record did.
+		if record.NativeWrite != nil || record.Restart != nil && record.Restart.DiskHasMarker {
+			continue // A native write ended before its record did; a killed daemon's acknowledged write is on disk.
 		}
 		if (record.Receipt == "" && record.Batch == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
