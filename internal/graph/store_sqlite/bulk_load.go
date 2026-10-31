@@ -973,8 +973,10 @@ func (s *Store) FlushBulk() error {
 }
 
 // flushBulkLocked is FlushBulk's write-gate half. A seal that panics leaves the
-// pinned writer and its deferred indexes in place, exactly as a seal error
-// does, so the next FlushBulk retries the same window.
+// pinned writer and its deferred indexes in place, so the next FlushBulk
+// retries the same window. A seal that returns an error closes the window
+// anyway: the writer is restored and released, and the indexes it could not
+// rebuild stay recorded as missing for the maintenance lane's repair.
 func (s *Store) flushBulkLocked() (bulkWindowExit, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
