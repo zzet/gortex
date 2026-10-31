@@ -28,6 +28,17 @@ func fixtureDaemon(mode string) int {
 		fmt.Fprintln(os.Stderr, "panic: synthetic daemon crash")
 		return 2
 	}
+	// The startup probe runs the CLI and the hook through the same binary;
+	// answer them as against a ready daemon instead of starting another one.
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "call":
+			fmt.Println(`{"results":[]}`)
+			return 0
+		case "hook":
+			return 0
+		}
+	}
 	data, err := os.ReadFile(filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "gortex", "config.yaml"))
 	if err != nil {
 		return 3
@@ -80,7 +91,7 @@ func fixtureDaemon(mode string) int {
 						}
 						result = map[string]any{"ready": true, "enriched": true, "tracked_repos": repos, "loaded_roots": roots}
 					case "status":
-						result = map[string]any{"ready": true, "enriched": true, "views": map[string]any{}, "storage": map[string]any{"wal_pending_frames": 0}}
+						result = map[string]any{"ready": true, "enriched": true, "views": map[string]any{"coordinators": 1}, "storage": map[string]any{"wal_pending_frames": 0}}
 					case "shutdown":
 						result = map[string]any{"stopping": true}
 					default:

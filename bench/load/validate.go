@@ -119,7 +119,7 @@ func validateReport(data []byte, r Report) error {
 			if len(phase.Operations) == 0 || len(phase.Gate) == 0 || len(phase.Status) == 0 || len(phase.Stats) == 0 {
 				return errors.New("complete phase is missing plan/gate/status/stats observations")
 			}
-			if phase.Name != "cold" && phase.Name != "restart" && len(phase.Tools) == 0 {
+			if phase.Name != "cold" && phase.Name != "restart" && phase.Name != startupScenario && len(phase.Tools) == 0 {
 				return errors.New("complete workload phase has no tool observations")
 			}
 		}

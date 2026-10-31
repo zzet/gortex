@@ -193,6 +193,7 @@ func validateAgentCounts(scenario string, readers, editors int) error {
 		if readers < 1 {
 			return errors.New("zero pure readers are supported only for edit/many-edit")
 		}
+	case startupScenario: // probes only; reader and editor counts are unused
 	default:
 		return fmt.Errorf("unknown scenario %q", scenario)
 	}

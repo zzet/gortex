@@ -138,6 +138,44 @@ index; queryability and enrichment are separate observed upper bounds with a
 recorded polling interval. Older daemons without `loaded_roots` retain their
 legacy receipt and must still pass source-backed per-root checks.
 
+## Startup admission
+
+`--scenario startup` (never part of `all`) measures what agents see while a
+daemon starts. Every manifest repository is configured; `--worktrees` linked
+checkouts of the first one are discovered through it. Probing starts before
+the first daemon start, so the window before the socket exists is observed
+too. `--seed-store <file>` copies a store (for example one written by an
+older schema) into the private run first, which makes the initial boot an
+upgrade; the source is only read. `--restarts N` adds N warm restarts. Each
+boot lasts until every configured repository is ready and enriched, plus
+`--duration`.
+
+Every second, from the primary, the first linked worktree, and a directory
+whose `.gortex.yaml` names a workspace that a private `servers.toml` roster
+claims, the probe opens fresh sessions: `initialize` (the instructions
+variant is recorded), `search_symbols` and `resources/read
+gortex://index-health` on the legacy surface, and `workspace(operation:
+"index")` on the compact one. The roster's only server never listens, so a
+routed call falls back to the daemon itself. From the same directories it
+asks the PreToolUse hook about a native Read every second, and runs `gortex
+call search_symbols` through a pipe (from the start) and through a pty
+(`script(1)`, once the socket answers), each until its first success in that
+boot. Every answer keeps `error_code`, `retryable`, phase, percent, latency,
+exit code, and whether any refusal text advises `gortex track` or
+`gortex repos reconcile`. A watcher polls the readiness probe every 100 ms
+and, for 2 s after the primary registers, the checkout coordinator count.
+
+`startup-probe.jsonl` holds every answer. The phase gate `startup_probe`
+counts answers per surface and directory in three windows (no socket,
+loading, ready) and records each boot's time to ready and time to first
+success. Headline metrics include `startup_repo_not_tracked_before_ready`,
+`startup_nonconforming_loading_refusals`, the track-advice and hook-deny
+counts, `startup_restart_ready_to_first_ok_p95_ms`,
+`startup_restart_time_to_ready_p95_ms`, `startup_initial_time_to_ready_ms`,
+`startup_initial_first_ok_ms` and `startup_coordinators_within_2s_min`.
+Restart figures are unavailable unless every restart produced them, and
+`delta` compares two startup reports like any other.
+
 ## Measurements and artifacts
 
 One JSON file contains per-operation successful p50/p95/p99/max, successful
