@@ -8,6 +8,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 // Repo-scoped usages read only the scoped repository's references and the
@@ -35,6 +36,12 @@ func TestFindUsagesScopedNeverScansAndRowsStayFlat(t *testing.T) {
 // sources the scope check would drop: workspace and project boundaries, test
 // exclusion, unowned and missing sources and the contract-core edge mask all
 // leave the same candidates as reading every repository's call sites.
+//
+// Both endpoint classifiers are compared: the errorless one potential writers
+// keep, and the checked one read-only requests get, which over the store
+// itself answers from the cached contract-owned set. Over the counted store,
+// every repository-scoped lookup must be answered by the narrowed read alone,
+// so a narrowed read that declined or failed cannot pass as an equal answer.
 func TestNameOnlyCandidatesRepoNarrowMatchesUnnarrowedRead(t *testing.T) {
 	store := openContractCoreCapStore(t)
 	addScopedRowRepo(t, store, "a")
@@ -57,23 +64,42 @@ func TestNameOnlyCandidatesRepoNarrowMatchesUnnarrowedRead(t *testing.T) {
 	}))
 	target := store.GetNode(scopedRowID("a", scopedRowTarget))
 	require.NotNil(t, target)
-	narrowed := newContractCoreEdges(store, t.Context(), nil)
-	require.Implements(t, (*graph.RepoScopedInEdgeReader)(nil), narrowed)
-	unnarrowed := legacyOutlineReader{newContractCoreEdges(legacyOutlineReader{store}, t.Context(), nil)}
 	eng := query.NewEngine(store)
-	for _, opts := range []query.QueryOptions{
-		{RepoAllow: map[string]bool{"a": true}},
-		{RepoAllow: map[string]bool{"a": true, "b": true, "unrelated0": false}},
-		{RepoAllow: map[string]bool{"a": true}, WorkspaceID: "other"},
-		{RepoAllow: map[string]bool{"a": true}, WorkspaceID: "a", ProjectID: "a"},
-		{RepoAllow: map[string]bool{"a": true}, ExcludeTests: true},
-		{RepoAllow: map[string]bool{"missing": true}},
-		{WorkspaceID: "a"},
-	} {
-		want := eng.WithReader(unnarrowed).FindNameOnlyCandidates(target, nil, opts)
-		got := eng.WithReader(narrowed).FindNameOnlyCandidates(target, nil, opts)
-		require.Equal(t, want, got, "opts=%+v", opts)
+	counter := newScopedReadCounter(store)
+	for _, checked := range []bool{false, true} {
+		ctx := t.Context()
+		if checked {
+			ctx = withContractCoreReadErrors(ctx)
+		}
+		var timing rerank.CoreEdgeTiming
+		unnarrowed := legacyOutlineReader{newContractCoreEdges(legacyOutlineReader{store}, ctx, nil)}
+		narrowed := contractCoreExclusionReader(store, ctx, newContractCoreExclusionCache(contractCoreExclusionLimit), &timing)
+		require.Implements(t, (*graph.RepoScopedInEdgeReader)(nil), narrowed)
+		counted := newContractCoreEdges(counter, ctx, nil)
+		for _, opts := range []query.QueryOptions{
+			{RepoAllow: map[string]bool{"a": true}},
+			{RepoAllow: map[string]bool{"a": true, "b": true, "unrelated0": false}},
+			{RepoAllow: map[string]bool{"a": true}, WorkspaceID: "other"},
+			{RepoAllow: map[string]bool{"a": true}, WorkspaceID: "a", ProjectID: "a"},
+			{RepoAllow: map[string]bool{"a": true}, ExcludeTests: true},
+			{RepoAllow: map[string]bool{"missing": true}},
+			{WorkspaceID: "a"},
+		} {
+			want := eng.WithReader(unnarrowed).FindNameOnlyCandidates(target, nil, opts)
+			require.Equal(t, want, eng.WithReader(narrowed).FindNameOnlyCandidates(target, nil, opts), "checked=%v opts=%+v", checked, opts)
+			counter.reset()
+			require.Equal(t, want, eng.WithReader(counted).FindNameOnlyCandidates(target, nil, opts), "checked=%v opts=%+v", checked, opts)
+			reads := counter.rows()
+			_, narrowedRead := reads["GetInEdgesByNodeIDsFromRepos"]
+			_, plainRead := reads["GetInEdgesByNodeIDs"]
+			require.Equal(t, len(opts.RepoAllow) > 0, narrowedRead, "checked=%v opts=%+v", checked, opts)
+			require.NotEqual(t, narrowedRead, plainRead, "a narrowed lookup also read every call site: checked=%v opts=%+v", checked, opts)
+		}
+		if checked {
+			require.Positive(t, timing.EndpointCacheHits, "the checked classifier answered from the cached contract-owned set")
+		}
+		require.NoError(t, contractCoreReadError(ctx))
 	}
-	require.Equal(t, 6, eng.WithReader(narrowed).FindNameOnlyCandidates(target, nil, query.QueryOptions{RepoAllow: map[string]bool{"a": true}}).Total,
+	require.Equal(t, 6, eng.WithReader(newContractCoreEdges(store, t.Context(), nil)).FindNameOnlyCandidates(target, nil, query.QueryOptions{RepoAllow: map[string]bool{"a": true}}).Total,
 		"three sites in a, the unowned caller, the other workspace's caller and the test; the bean, contract and missing callers stay hidden")
 }
