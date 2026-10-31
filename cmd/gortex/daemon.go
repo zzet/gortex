@@ -1135,6 +1135,11 @@ func spawnDetachedDaemon(childArgs []string) error {
 		case werr := <-exited:
 			failMsg := fmt.Errorf("daemon exited during startup (%v); check %s and %s",
 				werr, daemon.LogFilePath(), daemon.StderrLogFilePath())
+			st, stateOK := daemon.ReadRuntimeStateOf(child.Process.Pid)
+			if reason, recorded := daemonStartupFailure(st, stateOK, child.Process.Pid); recorded {
+				failMsg = fmt.Errorf("daemon exited during startup: %s (%v); check %s and %s",
+					reason, werr, daemon.LogFilePath(), daemon.StderrLogFilePath())
+			}
 			if sp != nil {
 				sp.Fail(failMsg)
 			}
@@ -1148,6 +1153,18 @@ func spawnDetachedDaemon(childArgs []string) error {
 		sp.Fail(timeoutErr)
 	}
 	return timeoutErr
+}
+
+// daemonStartupFailure returns the reason a startup child recorded before it
+// exited, when that reason says more than the generic pointer to the log.
+func daemonStartupFailure(st daemon.RuntimeState, ok bool, childPID int) (string, bool) {
+	if !ok || st.PID != childPID || st.StartupPhase != daemon.StartupFailed {
+		return "", false
+	}
+	if st.StartupError == "" || st.StartupError == startupFailedMessage {
+		return "", false
+	}
+	return st.StartupError, true
 }
 
 func daemonStartupProgress(st daemon.RuntimeState, ok bool, childPID int, now time.Time, freshness time.Duration) (string, bool) {
