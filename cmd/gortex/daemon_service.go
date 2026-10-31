@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"runtime"
 	"slices"
 	"strings"
-	"text/template"
 
 	"github.com/spf13/cobra"
 
@@ -255,15 +253,18 @@ func runDaemonServiceStatus(cmd *cobra.Command, _ []string) error {
 // EnvironmentVariables carries the installing shell's PATH with missing
 // Homebrew / system defaults appended, plus any XDG_* overrides in effect at
 // install time, and GORTEX_DAEMON_LOGFILE — see servicePath and xdgServiceEnv.
+//
+// The verbs take, in order: label, executable, log path (twice), PATH, and
+// the rendered <key>/<string> lines of the other variables.
 const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{{.Label}}</string>
+    <string>%s</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{{.Exe}}</string>
+        <string>%s</string>
         <string>daemon</string>
         <string>start</string>
     </array>
@@ -275,17 +276,13 @@ const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
         <false/>
     </dict>
     <key>StandardOutPath</key>
-    <string>{{.LogPath}}</string>
+    <string>%s</string>
     <key>StandardErrorPath</key>
-    <string>{{.LogPath}}</string>
+    <string>%s</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>{{.Path}}</string>
-{{- range .EnvVars}}
-        <key>{{.Key}}</key>
-        <string>{{.Value}}</string>
-{{- end}}
+        <string>%s</string>%s
     </dict>
 </dict>
 </plist>
@@ -294,25 +291,18 @@ const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 // renderLaunchdPlist fills launchdPlistTemplate. String values are
 // XML-escaped so a path containing an XML metacharacter can't produce a
 // malformed, unloadable plist.
+//
+// Unit files are rendered with fmt, not text/template: executing a template
+// looks fields up by reflection, which makes the linker keep every exported
+// method of every reachable type (see scripts/ci-dumpdep).
 func renderLaunchdPlist(label, exe, logPath string, env []serviceEnvVar) (string, error) {
-	data := struct {
-		Label, Exe, LogPath, Path string
-		EnvVars                   []serviceEnvVar
-	}{
-		Label:   xmlEscape(label),
-		Exe:     xmlEscape(exe),
-		LogPath: xmlEscape(logPath),
-		Path:    xmlEscape(servicePath([]string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"})),
-		EnvVars: make([]serviceEnvVar, len(env)),
+	var vars strings.Builder
+	for _, e := range env {
+		fmt.Fprintf(&vars, "\n        <key>%s</key>\n        <string>%s</string>", e.Key, xmlEscape(e.Value))
 	}
-	for i, e := range env {
-		data.EnvVars[i] = serviceEnvVar{Key: e.Key, Value: xmlEscape(e.Value)}
-	}
-	var buf bytes.Buffer
-	if err := template.Must(template.New("plist").Parse(launchdPlistTemplate)).Execute(&buf, data); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
+	logPath = xmlEscape(logPath)
+	path := servicePath([]string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"})
+	return fmt.Sprintf(launchdPlistTemplate, xmlEscape(label), xmlEscape(exe), logPath, logPath, xmlEscape(path), vars.String()), nil
 }
 
 func launchdPlistPath() (string, error) {
@@ -625,6 +615,9 @@ func noteRunningDaemon(w io.Writer, daemonRunning func() bool) {
 // PATH, XDG_* overrides, and GORTEX_DAEMON_LOGFILE at install time so the
 // daemon resolves the same paths as the installing shell — see servicePath
 // and xdgServiceEnv.
+//
+// The verbs take, in order: executable, the rendered Environment= lines, and
+// the log path (twice).
 const systemdUnitTemplate = `[Unit]
 Description=Gortex code intelligence daemon
 Documentation=https://github.com/zzet/gortex
@@ -632,14 +625,11 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={{.Exe}} daemon start
-{{- range .EnvVars}}
-Environment={{.}}
-{{- end}}
+ExecStart=%s daemon start%s
 Restart=on-failure
 RestartSec=2
-StandardOutput=append:{{.LogPath}}
-StandardError=append:{{.LogPath}}
+StandardOutput=append:%s
+StandardError=append:%s
 
 [Install]
 WantedBy=default.target
@@ -651,24 +641,15 @@ func renderSystemdUnit(exe, logPath string, env []serviceEnvVar) (string, error)
 	if path := servicePath(nil); path != "" {
 		env = append([]serviceEnvVar{{Key: "PATH", Value: path}}, env...)
 	}
-	data := struct {
-		Exe, LogPath string
-		EnvVars      []string
-	}{
-		Exe: exe,
-		// systemd expands % specifiers in StandardOutput= and StandardError=
-		// paths too, so escape them as systemdEnvValue does.
-		LogPath: strings.ReplaceAll(logPath, "%", "%%"),
-		EnvVars: make([]string, len(env)),
+	var vars strings.Builder
+	for _, e := range env {
+		vars.WriteString("\nEnvironment=")
+		vars.WriteString(systemdEnvValue(e.Key + "=" + e.Value))
 	}
-	for i, e := range env {
-		data.EnvVars[i] = systemdEnvValue(e.Key + "=" + e.Value)
-	}
-	var buf bytes.Buffer
-	if err := template.Must(template.New("unit").Parse(systemdUnitTemplate)).Execute(&buf, data); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
+	// systemd expands % specifiers in StandardOutput= and StandardError=
+	// paths too, so escape them as systemdEnvValue does.
+	logPath = strings.ReplaceAll(logPath, "%", "%%")
+	return fmt.Sprintf(systemdUnitTemplate, exe, vars.String(), logPath, logPath), nil
 }
 
 func systemdUnitPath() (string, error) {
