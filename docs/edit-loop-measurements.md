@@ -635,3 +635,11 @@ unavailable. Its `phases_ms` copy keeps each producer null as unavailable with
 the producer's phase state, and a build without `phases_ms` (an older baseline)
 reports every lap unavailable rather than zero. Quantiles use nearest rank with
 seeded percentile-bootstrap intervals over the complete offered denominator.
+
+Probes can also run as compact text or through `gortex call`. Compact rows
+carry no IDs, edge rows or freshness fields, so they prove only a call
+addition's presence; CLI stdout drops auxiliary notes and re-encodes numbers
+through float64, so only exactly representable JSON is credited and expected
+absences are refused. GCX is reported unavailable rather than decoded as TOON.
+Each report accounts every output mode, and a mode that cannot carry a
+freshness claim reports stale claimed-fresh answers as unavailable, not 0.

@@ -152,7 +152,8 @@ establish live relocation timing or the broader traffic/reference gates.
 visibility probes and immediate readbacks. Omission or `"json"` retains the
 existing JSON plan and request identity. The decoder evaluates the requested
 text; a valid structured JSON sibling, JSON fallback, malformed/truncated TOON
-or unsafe numeric value cannot supply format credit. Unknown modes refuse.
+or unsafe numeric value cannot supply format credit. Unknown modes refuse, and
+`"gcx"` refuses as unavailable (below).
 Timing-status queries, initial presence/callee admissions and cleanup are
 separate JSON controls, preserving exact generation/nanosecond arithmetic.
 
@@ -168,6 +169,44 @@ checks the changed relative start-line gap plus actual call relation; full
 summary and editing-context signature checks remain separate. Actual Go,
 TypeScript and Python producer controls establish that wire shape. TOON source implementation and offline
 controls do not establish live, reference, traffic or performance coverage.
+
+`edit_output: "compact"` requests compact text (`output.compact`) only from the
+four probes whose operation has a compact producer: file summary, symbol
+search, callers and call chain. Source, editing-context and text probes,
+readbacks, the edit ACK and timing controls stay JSON. Compact text is one
+`<kind> <qualified name> <path>:<line>` row per symbol (symbol search may add
+` (in <owner>)`), and subgraph answers may follow their rows with a truncation
+line, one edge-count footer and concurrency notes; any other line, a missing
+final newline or a JSON answer is a decode failure, and an empty answer is zero
+rows. Because the rows carry no node IDs, edge rows, signatures or freshness
+fields, compact proves presence only: the marker (or, from the marker's call
+chain, the callee) as a top-level function row at its owned fixture path, with
+a nonzero edge footer for relations. Truncated rows never prove absence. Plans
+refuse compact for every kind except `add_intrafile_call` and
+`add_crossfile_call`.
+
+`edit_output: "cli"` sends every oracle request, with the same lowered facade
+arguments, through one owned `gortex call <facade> --json <args> --format json
+--index <clone> --quiet` process using the run's config and environment, in its
+own process group that is killed at the probe deadline or phase end. The edit,
+readbacks and receipt status stay MCP JSON. CLI stdout is credited only as one
+JSON object whose numbers stay exact after the CLI's float64 re-encoding; the
+`{"tool","format":"text","text"}` prose wrapper is refused, and a nonzero exit
+is a probe error with its stdout kept as evidence only. Probe cadence is bounded
+by process start, daemon dial and exit rather than 25 ms, and a probe's start is
+its process start. Rename, delete and relocation are refused in CLI mode,
+because their expected absence must be the exact scoped not-found refusal, and
+paired runs refuse CLI probes.
+
+Each report's `output_modes` accounts every mode: `json`, `toon`, `compact`,
+`cli` and `gcx`, each `selected`, `not_selected` or `unavailable` with a
+reason, with probe answers and decode failures counted by the actual mode of
+each probe request, claims fresh, stale answers claimed fresh after the ACK and
+pre-commit mismatches. GCX is unavailable: there is no GCX decoder here, and
+`read_file` answers a GCX request with TOON, so a GCX answer is never decoded or
+credited as TOON. A mode without answers, or one whose payload cannot carry a
+freshness claim (compact, GCX), reports its stale claimed-fresh count
+unavailable rather than 0.
 
 `--scenario edit-and-probe --profile agent --agents 0 --edit-agents 1
 --worktrees 0` selects an initial `add_intrafile_call` / `edit.file` / JSON
