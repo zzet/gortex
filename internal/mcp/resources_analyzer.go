@@ -101,13 +101,7 @@ func (s *Server) handleResourceReport(ctx context.Context, req mcp.ReadResourceR
 		}
 	}
 	g := s.readerFor(ctx)
-	totalEdges := 0
-	for _, e := range g.AllEdges() {
-		if inScope != nil && (!inScope[e.From] || !inScope[e.To]) {
-			continue
-		}
-		totalEdges++
-	}
+	totalEdges := countEdgesWithin(g, inScope)
 
 	topLangs := topNFromCountMap(byLang, 5)
 	topKinds := topNFromCountMap(byKind, 5)
