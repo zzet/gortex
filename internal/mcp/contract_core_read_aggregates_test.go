@@ -33,7 +33,7 @@ func TestContractCoreImportersAndCountsKeepSelectedAdjacency(t *testing.T) {
 	})
 	var baselineRows int
 	for pass := range 2 {
-		spy := &kindAdjacencySpy{Reader: s, backend: s}
+		spy := &kindAdjacencySpy{Reader: s}
 		ctx := withContractCoreReadErrors(t.Context())
 		reader := newContractCoreEdges(spy, ctx, nil)
 		importers, ok := reader.(graph.FileImporters)

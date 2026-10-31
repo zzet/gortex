@@ -129,7 +129,6 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 	rows := []contractCoreCapRow{
 		// Kept by the wrapper itself.
 		{"CallAncestorReader", capOf[graph.CallAncestorReader], capWrapper, "candidate-anchored calls/references closure through exact selected edge exclusions"},
-		{"KindAdjacencyReader", capOf[graph.KindAdjacencyReader], capWrapper, "typed adjacency retains the selected edge mask and full visible row count"},
 		{"Reader", capOf[graph.Reader], capWrapper, "adjacency filtered, node reads promoted"},
 		{"NodeGetter", capOf[graph.NodeGetter], capWrapper, "node reads promoted"},
 		{"BoundaryReader", capOf[graph.BoundaryReader], capWrapper, "satisfied by the filtered Reader methods"},
@@ -173,7 +172,6 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		// Deliberate drops.
 		{"FilteredBFSAdmissionReader", capOf[graph.FilteredBFSAdmissionReader], capDropped, "private scoped admission adapter supplies exact wrapper exclusions"},
 		{"FilteredCallAncestorReader", capOf[graph.FilteredCallAncestorReader], capDropped, "private candidate coverage adapter supplies this wrapper's exact exclusions"},
-		{"FilteredKindAdjacencyReader", capOf[graph.FilteredKindAdjacencyReader], capDropped, "private typed adjacency adapter supplies this wrapper's exact exclusions"},
 		{"BFSCapable", capOf[graph.BFSCapable], capWrapper, "canonical hops recomputed over selected filtered adjacency; engine admission remains the Go contract"},
 		{"FrontierExpander", capOf[graph.FrontierExpander], capDropped, capReasonTraversal},
 		{"ReachableForwardByKinds", capOf[graph.ReachableForwardByKinds], capDropped, capReasonTraversal},
@@ -419,6 +417,7 @@ func contractCoreNonStoreInterfaces() []contractCoreCapName {
 		{"GenerationLayerIdentity", capOf[graph.GenerationLayerIdentity]},
 		{"IncomingSourceNodeQuery", capOf[graph.IncomingSourceNodeQuery]},
 		{"KCorer", capOf[graph.KCorer]},
+		{"KindAdjacencyReader", capOf[graph.KindAdjacencyReader]},
 		{"OverlayDetachedFileSummaryReader", capOf[graph.OverlayDetachedFileSummaryReader]},
 		{"OverlayDetachedNodeReader", capOf[graph.OverlayDetachedNodeReader]},
 		{"OverlayDetachedSummaryReader", capOf[graph.OverlayDetachedSummaryReader]},

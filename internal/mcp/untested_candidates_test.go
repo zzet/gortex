@@ -65,7 +65,7 @@ func TestUntestedCandidateClosureMatchesWholeGraphOracle(t *testing.T) {
 	})
 	var baseCandidateRows, baseEdgeRows int
 	for pass := range 2 {
-		spy := &coverageCandidateSpy{kindAdjacencySpy: &kindAdjacencySpy{Reader: s, backend: s}, nodes: s, ancestors: s}
+		spy := &coverageCandidateSpy{kindAdjacencySpy: &kindAdjacencySpy{Reader: s}, nodes: s, ancestors: s}
 		reader := newContractCoreEdges(spy, t.Context(), nil)
 		scope := graph.NodeScope{RepoAllow: map[string]bool{"a": true}}
 		candidates, err := untestedCandidates(t.Context(), reader, scope, "a/")

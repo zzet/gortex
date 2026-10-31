@@ -13,15 +13,20 @@ import (
 
 type kindAdjacencySpy struct {
 	graph.Reader
-	backend                           graph.FilteredKindAdjacencyReader
 	rows, queries, allNodes, allEdges int
 }
 
-func (r *kindAdjacencySpy) ReadKindAdjacencyFiltered(ctx context.Context, id string, dir graph.Direction, kinds []graph.EdgeKind, filter graph.OutlineEdgeFilter) (graph.KindAdjacency, error) {
+func (r *kindAdjacencySpy) GetOutEdges(id string) []*graph.Edge {
 	r.queries++
-	out, err := r.backend.ReadKindAdjacencyFiltered(ctx, id, dir, kinds, filter)
-	r.rows += len(out.Edges)
-	return out, err
+	edges := r.Reader.GetOutEdges(id)
+	r.rows += len(edges)
+	return edges
+}
+func (r *kindAdjacencySpy) GetInEdges(id string) []*graph.Edge {
+	r.queries++
+	edges := r.Reader.GetInEdges(id)
+	r.rows += len(edges)
+	return edges
 }
 func (r *kindAdjacencySpy) AllNodes() []*graph.Node {
 	r.allNodes++
@@ -32,7 +37,9 @@ func (r *kindAdjacencySpy) AllEdges() []*graph.Edge {
 	return r.Reader.AllEdges()
 }
 
-func TestContractCoreKindAdjacencyMatchesGoWalkWithMasksCapsAndBoundaries(t *testing.T) {
+// Walks read this wrapper's masked point lookups: a typed statement over the
+// same masks cost several times more per hop.
+func TestContractCoreWalkMatchesLegacyWithMasksCapsAndBoundaries(t *testing.T) {
 	s := openContractCoreCapStore(t)
 	s.AddBatch([]*graph.Node{
 		{ID: "a/start", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/start.go"},
@@ -61,13 +68,11 @@ func TestContractCoreKindAdjacencyMatchesGoWalkWithMasksCapsAndBoundaries(t *tes
 	}
 	var baselineRows int
 	for pass := range 2 {
-		spy := &kindAdjacencySpy{Reader: s, backend: s}
+		spy := &kindAdjacencySpy{Reader: s}
 		ctx := withContractCoreReadErrors(t.Context())
 		fast := newContractCoreEdges(spy, ctx, nil)
-		_, capable := fast.(graph.KindAdjacencyReader)
-		require.True(t, capable)
-		_, raw := fast.(graph.FilteredKindAdjacencyReader)
-		require.False(t, raw, "a caller cannot bypass this wrapper's mask")
+		_, typed := fast.(graph.KindAdjacencyReader)
+		require.False(t, typed, "walks keep the masked point lookups")
 		slow := legacyOutlineReader{newContractCoreEdges(legacyOutlineReader{s}, ctx, nil)}
 		for _, limit := range []int{3, 20} {
 			for _, forward := range []bool{true, false} {
@@ -97,7 +102,7 @@ func TestContractCoreKindAdjacencyMatchesGoWalkWithMasksCapsAndBoundaries(t *tes
 				s.AddBatch([]*graph.Node{{ID: prefix + "/from", Kind: graph.KindFunction, RepoPrefix: prefix}, {ID: prefix + "/to", Kind: graph.KindFunction, RepoPrefix: prefix}}, []*graph.Edge{{From: prefix + "/from", To: prefix + "/to", Kind: graph.EdgeCalls}})
 			}
 		} else {
-			require.Equal(t, baselineRows, spy.rows, "unrelated repositories changed returned typed rows")
+			require.Equal(t, baselineRows, spy.rows, "unrelated repositories changed returned adjacency rows")
 		}
 	}
 }
