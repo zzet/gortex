@@ -101,7 +101,7 @@ func (s *Store) resetWALForReclaimWithBusyTimeout(ctx context.Context, busyMilli
 		return walCheckpointResult{}, err
 	}
 	walPath := s.dbPath + "-wal"
-	if walFileSize(walPath) < walShrinkInPlaceBytes {
+	if s.observedWALFileSize(walPath) < walShrinkInPlaceBytes {
 		var result walCheckpointResult
 		attempted := false
 		err := s.withWriterResetConnWithBusyTimeout(ctx, busyMillis, func(conn *sql.Conn) error {
@@ -354,7 +354,7 @@ func (s *Store) shrinkWALSliceOnce(ctx context.Context, ckptDB *sql.DB, slice in
 	}
 	used := int64(32) + int64(snap.MxFrame)*(24+pageSize)
 	floor := max(used, walShrinkKeepBytes)
-	out.before = walFileSize(walPath)
+	out.before = s.observedWALFileSize(walPath)
 	out.after = out.before
 	if out.before <= floor {
 		out.done = true
@@ -416,7 +416,7 @@ func (s *Store) shrinkWAL(ctx context.Context, ckptDB *sql.DB) (slices int, shru
 	// pager setting fails after the file reaches its floor.
 	s.walShrinkPending.Store(true)
 	walPath := s.dbPath + "-wal"
-	startBytes := walFileSize(walPath)
+	startBytes := s.observedWALFileSize(walPath)
 	started := time.Now()
 	slice := min(walShrinkFirstSlice, walShrinkSliceCap)
 	var maxHold time.Duration
@@ -435,7 +435,7 @@ func (s *Store) shrinkWAL(ctx context.Context, ckptDB *sql.DB) (slices int, shru
 		}
 		step, serr := s.shrinkWALSliceOnce(ctx, ckptDB, slice)
 		if serr != nil {
-			log.Printf("store_sqlite: wal shrink paused after %d slices error=%q wal_bytes=%d", slices, serr, walFileSize(walPath))
+			log.Printf("store_sqlite: wal shrink paused after %d slices error=%q wal_bytes=%d", slices, serr, s.observedWALFileSize(walPath))
 			return slices, shrunk, serr
 		}
 		if step.after < step.before {
@@ -472,7 +472,7 @@ func (s *Store) shrinkWAL(ctx context.Context, ckptDB *sql.DB) (slices int, shru
 	}
 	if slices > 0 {
 		log.Printf("store_sqlite: wal shrunk bytes_before=%d bytes_after=%d slices=%d max_slice_hold=%s elapsed=%s",
-			startBytes, walFileSize(walPath), slices, maxHold.Round(time.Millisecond), time.Since(started).Round(time.Millisecond))
+			startBytes, s.observedWALFileSize(walPath), slices, maxHold.Round(time.Millisecond), time.Since(started).Round(time.Millisecond))
 	}
 	return slices, shrunk, nil
 }

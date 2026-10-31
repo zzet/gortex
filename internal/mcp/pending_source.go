@@ -29,6 +29,9 @@ type pendingSourceKey struct {
 }
 
 func (p *pendingSourceRegistry) register(record *mutationCommitRecord) {
+	if !record.isPhysicalCommit() {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.versions == nil {
@@ -119,6 +122,9 @@ func (p *pendingSourceRegistry) paths(checkoutID, incarnation string) []string {
 // Resolve a late ticket immediately when the commit binds its receipt. The
 // receipt can finish before the mutation handler records its pending outcome.
 func (s *Server) refreshPendingSourceRecord(record *mutationCommitRecord) {
+	if !record.isPhysicalCommit() {
+		return
+	}
 	defer s.retireSettledPendingSource(record)
 	snap := record.snapshot()
 	if snap.GraphStatus == mutationGraphFresh || snap.ReindexReceipt == "" {
@@ -153,6 +159,9 @@ func (s *Server) applyPendingSourceReceipt(record *mutationCommitRecord, snap mu
 }
 
 func (s *Server) retireSettledPendingSource(record *mutationCommitRecord) {
+	if !record.isPhysicalCommit() {
+		return
+	}
 	record.mu.RLock()
 	retire := record.disk == mutationDiskNotApplied || record.disk == mutationDiskFailed ||
 		(record.graphRecorded && (record.graph == mutationGraphFresh || (record.checkoutID == "" && record.graph == mutationGraphFailed)))

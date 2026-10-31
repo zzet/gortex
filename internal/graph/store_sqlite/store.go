@@ -46,11 +46,12 @@ import (
 type generationBulkCheckpointLease uint64
 
 type backgroundCheckpointAttempt struct {
-	ctx           context.Context
-	cancel        context.CancelCauseFunc
-	timeoutCancel context.CancelFunc
-	done          chan struct{}
-	finishOnce    sync.Once
+	reclaimInterruption atomic.Uint32 // first consumed cause; counted once by reclaimWALOnce
+	ctx                 context.Context
+	cancel              context.CancelCauseFunc
+	timeoutCancel       context.CancelFunc
+	done                chan struct{}
+	finishOnce          sync.Once
 	// copy is the attempt's paced copy, set before the lane watcher starts
 	// (its passes pause only once the attempt marks it pausable).
 	copy *walCopyAttempt
@@ -1096,6 +1097,10 @@ var errGenerationBulkCheckpointCoordination = errors.New("store_sqlite: generati
 // cancelled with that cause when a cycle takes the lane (see
 // checkpoint_cycle_yield.go).
 func (s *Store) beginBackgroundCheckpointAttempt(policy checkpointCyclePolicy) (*backgroundCheckpointAttempt, error) {
+	return s.beginCheckpointAttempt(policy, false)
+}
+
+func (s *Store) beginCheckpointAttempt(policy checkpointCyclePolicy, reclaim bool) (*backgroundCheckpointAttempt, error) {
 	yieldPolicy := policy == checkpointYieldsToCycle || policy == checkpointOverridesLease
 	yields := yieldPolicy && s.cycleYieldEnabled()
 	overridesLease := policy == checkpointOverridesLease || policy == checkpointOverridesLeaseAndCycle
@@ -1113,6 +1118,10 @@ func (s *Store) beginBackgroundCheckpointAttempt(policy checkpointCyclePolicy) (
 		timeoutCancel: timeoutCancel,
 		done:          make(chan struct{}),
 		copy:          &walCopyAttempt{},
+	}
+
+	if reclaim {
+		attempt.ctx = context.WithValue(ctx, walReclaimAttemptKey{}, attempt)
 	}
 
 	coordination := &s.backgroundCheckpoint

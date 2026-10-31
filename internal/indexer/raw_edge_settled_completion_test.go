@@ -37,7 +37,7 @@ func TestRawEdgeProofWatcherSupersessionBootstrapsMetadata(t *testing.T) {
 	firstMtime := time.Now().Add(time.Minute)
 	require.NoError(t, os.Chtimes(path, firstMtime, firstMtime))
 	var applied *IndexResult
-	w.pointReindexRaw = func(p string) (*IndexResult, error) {
+	w.pointReindexRaw = func(p string, _ *PublicationStamps) (*IndexResult, error) {
 		result, err := f.mi.incrementalPointRepoRaw("fixture", p)
 		if err == nil {
 			applied = result
@@ -65,7 +65,7 @@ func TestRawEdgeProofWatcherSupersessionBootstrapsMetadata(t *testing.T) {
 	require.True(t, state.Seq > 0 && state.Settled && !state.Writing)
 	require.True(t, idx.rawEdgesPriorCompleted(owner, f.store.GetFileNodes(owner)))
 
-	w.pointReindexRaw = func(p string) (*IndexResult, error) {
+	w.pointReindexRaw = func(p string, _ *PublicationStamps) (*IndexResult, error) {
 		result, err := f.mi.incrementalPointRepoRaw("fixture", p)
 		applied = result
 		return result, err
@@ -103,7 +103,7 @@ func rawEdgeCompletionOvertakenSave(t *testing.T, f *contractJobFixture, w *Watc
 	writeFile(t, path, source)
 	future := time.Now().Add(time.Minute)
 	require.NoError(t, os.Chtimes(path, future, future))
-	w.pointReindexRaw = func(p string) (*IndexResult, error) {
+	w.pointReindexRaw = func(p string, _ *PublicationStamps) (*IndexResult, error) {
 		result, err := f.mi.incrementalPointRepoRaw("fixture", p)
 		w.mu.Lock()
 		w.pendingGeneration[p] = 8
@@ -179,7 +179,7 @@ func TestRawEdgeProofWatcherFailedTailDoesNotSettle(t *testing.T) {
 			require.NoError(t, os.Chtimes(path, mtime, mtime))
 			before := f.store.ContractReceiptWriteStates("fixture", "", []string{owner})[owner]
 			called := false
-			w.pointReindexRaw = func(p string) (*IndexResult, error) {
+			w.pointReindexRaw = func(p string, _ *PublicationStamps) (*IndexResult, error) {
 				called = true
 				result, err := f.mi.incrementalPointRepoRaw("fixture", p)
 				if err != nil {

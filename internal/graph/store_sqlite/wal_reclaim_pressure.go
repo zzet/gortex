@@ -186,9 +186,10 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 		res.recordWriterCredit(writer, adaptiveCopy)
 	}()
 	if preemptible {
-		if s.writeWanted() {
+		if demand := s.writeDemandCause(); demand != nil {
+			noteWALReclaimDemand(ctx, demand)
 			res.reason = "pressure_foreground_writer"
-			return errWALReclaimWriterWaiting
+			return demand
 		}
 	}
 	if s.bulkConn != nil && !res.leaseOverride {
@@ -240,9 +241,10 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 		return errWALPressureHold
 	}
 	// Any slow-copy readmission has finished; no own waiter is visible here.
-	if preemptible && s.writeWanted() {
+	if demand := s.writeDemandCause(); preemptible && demand != nil {
+		noteWALReclaimDemand(ctx, demand)
 		res.reason = "pressure_foreground_writer"
-		return errWALReclaimWriterWaiting
+		return demand
 	}
 	resetCtx := writer.resetContext(hctx)
 	if preemptible {
@@ -255,6 +257,7 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	}
 	result, err := s.resetWALForPressure(resetCtx)
 	if preemptible && err != nil && errors.Is(context.Cause(resetCtx), errWALReclaimWriterWaiting) {
+		noteWALReclaimDemand(ctx, context.Cause(resetCtx))
 		err = errWALReclaimWriterWaiting
 	}
 	res.pressureResetBusy = result.Busy > 0 && errors.Is(err, errSQLiteCheckpointIncomplete)
@@ -274,9 +277,10 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 // share the configured drain allowance; the writer still gets at most its
 // existing short credit and remaining aggregate allowance.
 func (s *Store) reclaimWALPressureResetAfterReaderDrain(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult, allowance time.Duration) error {
-	if s.writeWanted() {
+	if demand := s.writeDemandCause(); demand != nil {
+		noteWALReclaimDemand(ctx, demand)
 		res.reason = "pressure_foreground_writer"
-		return errWALReclaimWriterWaiting
+		return demand
 	}
 	started := time.Now()
 	pauseCtx, cancel := context.WithDeadline(ctx, started.Add(allowance))
@@ -292,6 +296,7 @@ func (s *Store) reclaimWALPressureResetAfterReaderDrain(ctx context.Context, ckp
 			res.pauseClosed = true
 		}
 		if errors.Is(context.Cause(yieldCtx), errWALReclaimWriterWaiting) {
+			noteWALReclaimDemand(ctx, context.Cause(yieldCtx))
 			err = errWALReclaimWriterWaiting
 		}
 		res.reason = fmt.Sprintf("pressure_reader_drain readers=%d error=%v", inFlight, err)
@@ -314,14 +319,16 @@ func (s *Store) reclaimWALPressureResetAfterReaderDrain(ctx context.Context, ckp
 	}()
 	if err := yieldCtx.Err(); err != nil {
 		if errors.Is(context.Cause(yieldCtx), errWALReclaimWriterWaiting) {
+			noteWALReclaimDemand(ctx, context.Cause(yieldCtx))
 			err = errWALReclaimWriterWaiting
 		}
 		res.reason = fmt.Sprintf("pressure_reader_drain error=%v", err)
 		return err
 	}
-	if s.writeWanted() {
+	if demand := s.writeDemandCause(); demand != nil {
+		noteWALReclaimDemand(ctx, demand)
 		res.reason = "pressure_foreground_writer"
-		return errWALReclaimWriterWaiting
+		return demand
 	}
 	credit := min(s.walPressureHold(), walReclaimMaxWriterHold-res.writerSpent, time.Until(started.Add(allowance)))
 	if credit <= 0 {

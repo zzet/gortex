@@ -48,15 +48,23 @@ func distribution(values []float64, unit string) Distribution {
 }
 
 type Corpus struct {
-	Label             string `json:"label"`
-	Source            string `json:"source"`
-	Commit            string `json:"commit"`
-	File              string `json:"file"`
-	Symbol            string `json:"symbol"`
-	Query             string `json:"query"`
-	EditTemplate      string `json:"edit_template"`
-	EditAnchor        string `json:"edit_anchor"`
-	ProposedSignature string `json:"proposed_signature"`
+	Label                  string `json:"label"`
+	Source                 string `json:"source"`
+	Commit                 string `json:"commit"`
+	File                   string `json:"file"`
+	Symbol                 string `json:"symbol"`
+	Query                  string `json:"query"`
+	EditTemplate           string `json:"edit_template"`
+	EditAnchor             string `json:"edit_anchor"`
+	EditTool               string `json:"edit_tool,omitempty"`
+	EditOutput             string `json:"edit_output,omitempty"`
+	EditKind               string `json:"edit_kind,omitempty"`
+	EditCallee             string `json:"edit_callee,omitempty"`
+	EditBeforeTemplate     string `json:"edit_before_template,omitempty"`
+	EditDestination        string `json:"edit_destination,omitempty"`
+	EditDestinationContent string `json:"edit_destination_content,omitempty"`
+	EditInitialContent     string `json:"edit_initial_content,omitempty"`
+	ProposedSignature      string `json:"proposed_signature"`
 }
 
 type Host struct {
@@ -73,29 +81,33 @@ type Host struct {
 // Every attempt is retained, including busy refusals and phase-censored calls.
 // Workload and readiness/visibility probes have distinct Role denominators.
 type Attempt struct {
-	Tool       string    `json:"tool"`
-	Role       string    `json:"role"`
-	Request    string    `json:"request_sha256"`
-	Agent      int       `json:"agent"`
-	Step       int       `json:"step"`
-	Slot       int       `json:"slot"`
-	Retry      int       `json:"retry"`
-	Started    time.Time `json:"started"`
-	DurationMS float64   `json:"duration_ms"`
-	LogicalMS  float64   `json:"logical_ms"` // includes earlier refusals and backoff, excludes think time
-	Code       int       `json:"code"`
-	Error      string    `json:"error"`
-	Outcome    string    `json:"outcome"` // success, error, busy, product_deadline, phase_censored
+	Tool            string    `json:"tool"`
+	Role            string    `json:"role"`
+	Request         string    `json:"request_sha256"`
+	Agent           int       `json:"agent"`
+	Step            int       `json:"step"`
+	Slot            int       `json:"slot"`
+	Retry           int       `json:"retry"`
+	Started         time.Time `json:"started"`
+	DurationMS      float64   `json:"duration_ms"`
+	LogicalMS       float64   `json:"logical_ms"` // includes earlier refusals and backoff, excludes think time
+	Code            int       `json:"code"`
+	Error           string    `json:"error"`
+	ExpectedOutcome string    `json:"expected_outcome,omitempty"`
+	Outcome         string    `json:"outcome"` // success, error, busy, product_deadline, phase_censored
 }
 
 type ToolMetrics struct {
-	Latency        Distribution   `json:"latency_ms"`
-	SuccessPerSec  Metric         `json:"successful_calls_per_second"`
-	Successes      int            `json:"successes"`
-	BusyRefusals   int            `json:"busy_refusals"`
-	Errors         map[string]int `json:"errors"`
-	PhaseCensored  int            `json:"phase_censored"`
-	ProductExpired int            `json:"product_expired"`
+	Latency           Distribution   `json:"latency_ms"`
+	SuccessPerSec     Metric         `json:"successful_calls_per_second"`
+	Successes         int            `json:"successes"`
+	ExpectedRefusals  int            `json:"expected_refusals,omitempty"`
+	BusyRefusals      int            `json:"busy_refusals"`
+	RetryableRefusals int            `json:"retryable_refusals,omitempty"`
+	HarnessIncomplete int            `json:"harness_incomplete,omitempty"`
+	Errors            map[string]int `json:"errors"`
+	PhaseCensored     int            `json:"phase_censored"`
+	ProductExpired    int            `json:"product_expired"`
 }
 
 type SweepEntry struct {
@@ -116,24 +128,26 @@ type EditObservation struct {
 }
 
 type Phase struct {
-	SessionModel string                     `json:"session_model"`
-	Operations   []request                  `json:"operations"`
-	Name         string                     `json:"name"`
-	Started      time.Time                  `json:"started"`
-	DurationSec  float64                    `json:"duration_seconds"`
-	Gate         map[string]json.RawMessage `json:"gate"`
-	Tools        map[string]ToolMetrics     `json:"tools"`
-	Probes       map[string]ToolMetrics     `json:"probes"`
-	Attempts     []Attempt                  `json:"attempts"`
-	Edits        []EditObservation          `json:"edits"`
-	EditLatency  Distribution               `json:"edit_latency_ms"`
-	Visibility   Distribution               `json:"visible_latency_ms"`
-	NeverSeen    int                        `json:"never_visible"`
-	Censored     int                        `json:"visibility_censored"`
-	Metrics      map[string]Metric          `json:"metrics"`
-	Status       []json.RawMessage          `json:"daemon_status"`
-	Stats        []json.RawMessage          `json:"graph_stats"`
-	Errors       []string                   `json:"errors"`
+	EditProbe        *editProbeReport `json:"edit_probe,omitempty"`
+	editProbeRuntime *editProbeRuntime
+	SessionModel     string                     `json:"session_model"`
+	Operations       []request                  `json:"operations"`
+	Name             string                     `json:"name"`
+	Started          time.Time                  `json:"started"`
+	DurationSec      float64                    `json:"duration_seconds"`
+	Gate             map[string]json.RawMessage `json:"gate"`
+	Tools            map[string]ToolMetrics     `json:"tools"`
+	Probes           map[string]ToolMetrics     `json:"probes"`
+	Attempts         []Attempt                  `json:"attempts"`
+	Edits            []EditObservation          `json:"edits"`
+	EditLatency      Distribution               `json:"edit_latency_ms"`
+	Visibility       Distribution               `json:"visible_latency_ms"`
+	NeverSeen        int                        `json:"never_visible"`
+	Censored         int                        `json:"visibility_censored"`
+	Metrics          map[string]Metric          `json:"metrics"`
+	Status           []json.RawMessage          `json:"daemon_status"`
+	Stats            []json.RawMessage          `json:"graph_stats"`
+	Errors           []string                   `json:"errors"`
 }
 
 type Report struct {
@@ -181,8 +195,14 @@ func summarize(attempts []Attempt, seconds float64, role string) map[string]Tool
 		case "success":
 			m.Successes++
 			latencies[a.Tool] = append(latencies[a.Tool], a.LogicalMS)
+		case "expected_refusal":
+			m.ExpectedRefusals++
 		case "busy":
 			m.BusyRefusals++
+		case "retryable":
+			m.RetryableRefusals++
+		case "harness_incomplete":
+			m.HarnessIncomplete++
 		case "phase_censored":
 			m.PhaseCensored++
 		case "product_deadline":

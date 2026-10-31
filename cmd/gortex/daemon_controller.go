@@ -1805,6 +1805,11 @@ func checkRowCounters(ctx context.Context, g graph.Store) *daemon.RowCounterStat
 
 func walReclaimStatus(st store_sqlite.WALReclaimStats) *daemon.WALReclaimStatus {
 	out := &daemon.WALReclaimStatus{
+		CancelledWriterParked: st.CancelledWriterParked,
+		CancelledWriteIntent:  st.CancelledWriteIntent,
+		CancelledOther:        st.CancelledOther,
+		WALPeakObserved:       st.WALPeakObserved,
+
 		ThresholdBytes:   st.ThresholdBytes,
 		Attempts:         st.Attempts,
 		Resets:           st.Resets,
@@ -1840,6 +1845,10 @@ func walReclaimStatus(st store_sqlite.WALReclaimStats) *daemon.WALReclaimStatus 
 		ShrinkSlices:                st.ShrinkSlices,
 		ShrinkBytes:                 st.ShrinkBytes,
 		ShrinkSliceHoldMaxMS:        durationMS(st.ShrinkSliceHoldMax),
+	}
+	if st.WALPeakObserved {
+		peak := st.ObservedPeakWALBytes
+		out.ObservedPeakWALBytes = &peak
 	}
 	if st.PauseCount > 0 {
 		out.PauseAvgMS = durationMS(st.PauseTotal / time.Duration(st.PauseCount))

@@ -147,7 +147,7 @@ func TestWatcherStormDrainWaitsForClaimedPointPatchLane(t *testing.T) {
 			close(releasePoint)
 		}
 	}()
-	watcher.pointReindexRaw = func(filePath string) (*IndexResult, error) {
+	watcher.pointReindexRaw = func(filePath string, _ *PublicationStamps) (*IndexResult, error) {
 		result, err := idx.incrementalPointWatcherPath(idx.rootPath, filePath)
 		close(pointTailEntered)
 		<-releasePoint

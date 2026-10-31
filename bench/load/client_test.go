@@ -427,3 +427,63 @@ func TestInvalidationSubscriptionRecordsAvailabilityAndActualArguments(t *testin
 		})
 	}
 }
+
+func TestRecordedCallsKeepExactIdentityAcrossMultiplexedReplies(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
+		return map[string]any{"wire_id": frame.ID, "ordinal": frame.Params["ordinal"]}, nil
+	})
+	client, err := openMCP(ctx, socket, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	type result struct {
+		ordinal  int
+		data     json.RawMessage
+		identity wireCallIdentity
+		err      error
+	}
+	results := make(chan result, 32)
+	var calls sync.WaitGroup
+	for ordinal := range 32 {
+		calls.Go(func() {
+			data, id, err := client.callWithIdentity(ctx, "identity", map[string]any{"ordinal": ordinal})
+			results <- result{ordinal, data, id, err}
+		})
+	}
+	calls.Wait()
+	close(results)
+	seen := make(map[int64]bool)
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		var decoded struct {
+			WireID  int64 `json:"wire_id"`
+			Ordinal int   `json:"ordinal"`
+		}
+		if err := json.Unmarshal(result.data, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		id := result.identity
+		if id.ID != decoded.WireID || decoded.Ordinal != result.ordinal || seen[id.ID] {
+			t.Fatalf("misattributed multiplexed reply%+v %+v", result, decoded)
+		}
+		seen[id.ID] = true
+		if id.Started.IsZero() || id.WriteStarted.Before(id.Started) || id.WriteFinished.Before(id.WriteStarted) || id.ReplyDelivered.Before(id.WriteFinished) || id.Finished.Before(id.ReplyDelivered) {
+			t.Fatalf("incomplete/reversed call readings%+v", id)
+		}
+	}
+}
+
+func TestRecordedCanceledCallDoesNotFabricateWireOrReply(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	client := &socketClient{}
+	data, id, err := client.callWithIdentity(ctx, "not-sent", nil)
+	if !errors.Is(err, context.Canceled) || data != nil || id.ID != 0 || !id.WriteStarted.IsZero() || !id.ReplyDelivered.IsZero() || id.Started.IsZero() || id.Finished.Before(id.Started) {
+		t.Fatalf("fabricated canceled call data=%s identity=%+v err=%v", data, id, err)
+	}
+}

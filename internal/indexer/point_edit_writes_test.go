@@ -196,7 +196,9 @@ func TestPointEditWriteTelemetryFieldsAndLineBudget(t *testing.T) {
 	logs.TakeAll()
 	w, err := NewWatcher(f.mi.indexers["fixture"], config.WatchConfig{}, zap.New(core))
 	require.NoError(t, err)
-	w.pointReindexRaw = func(path string) (*IndexResult, error) { return f.mi.incrementalPointRepoRaw("fixture", path) }
+	w.pointReindexRaw = func(path string, _ *PublicationStamps) (*IndexResult, error) {
+		return f.mi.incrementalPointRepoRaw("fixture", path)
+	}
 	source := pointEditText(f.sources["hub.go"], "hub", "add_func")
 	require.NoError(t, os.WriteFile(filepath.Join(f.root, "hub.go"), []byte(source), 0600))
 	require.NoError(t, w.patchGraphAfterReceiptCheck(filepath.Join(f.root, "hub.go"), ChangeModified))

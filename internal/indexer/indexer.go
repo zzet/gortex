@@ -7012,6 +7012,11 @@ type incrementalPathMode struct {
 	forceExplicitFiles        bool
 	surfaceFirstVersionChange bool
 	exactPointSemantic        bool
+	// publication carries only a canonical point attempt's local collector.
+	// Existing batch/reconcile/direct callers leave it nil. No live receipt or
+	// mutable Indexer tracing state is installed by this per-call observation.
+	publication *PublicationStamps
+	readRepair  *ReadRepairObservation
 }
 
 // indexedFilesAbsentFromDisk returns the repo-relative keys of files the graph
@@ -7449,7 +7454,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	invalidation.Files = appendUniqueSorted(invalidation.Files, idx.graphFilePaths(reparsedFiles)...)
 	invalidation.structuralFiles = appendUniqueSorted(invalidation.structuralFiles, idx.graphFilePaths(reparsedFiles)...)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, deletedDependencyFiles...)
+	mtimes := mode.publication.beginPatchLap(patchMtimes)
 	idx.pruneDeletedFileMtimes(deletedFiles)
+	mtimes.end()
 	idx.flushReparsePendingEnrichment(markerBatch)
 	if len(evictedGlobalsFiles) > 0 {
 		evicted := make(map[string]struct{}, len(evictedGlobalsFiles))

@@ -84,6 +84,7 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("symbol not found: " + id), nil
 	}
 	if !isGoSourcePath(node.FilePath) {
+		s.noteAcknowledgementParser(ctx, "unsupported_non_go_move")
 		return mcp.NewToolResultError(fmt.Sprintf("unsupported language: move_symbol only supports Go files (got %q)", node.FilePath)), nil
 	}
 	if node.Name == "" {
@@ -109,6 +110,7 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError("target_file is the same as the source file"), nil
 	}
 	if !isGoSourcePath(tgtAbs) {
+		s.noteAcknowledgementParser(ctx, "unsupported_non_go_move")
 		return mcp.NewToolResultError(fmt.Sprintf("unsupported language: target_file must be a .go file (got %q)", targetFileArg)), nil
 	}
 
@@ -122,8 +124,10 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	// Parse source file with comments so we keep doc-comments intact.
+	s.noteAcknowledgementParser(ctx, "explicit_go_parser_calls_formatting_unattributed")
+	ack := editAcknowledgementFrom(ctx, s)
 	fset := token.NewFileSet()
-	srcFile, err := parser.ParseFile(fset, srcAbs, srcContent, parser.ParseComments)
+	srcFile, err := parseAcknowledgedGoFile(ack, fset, srcAbs, srcContent, parser.ParseComments)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("could not parse source file: %v", err)), nil
 	}
@@ -143,13 +147,13 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	targetPackage := ""
 	if tgtExists {
-		tgtFileTmp, perr := parser.ParseFile(fset, tgtAbs, tgtContent, parser.ParseComments)
+		tgtFileTmp, perr := parseAcknowledgedGoFile(ack, fset, tgtAbs, tgtContent, parser.ParseComments)
 		if perr != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("could not parse target file: %v", perr)), nil
 		}
 		targetPackage = tgtFileTmp.Name.Name
 	} else {
-		targetPackage = inferGoPackageForDir(tgtDir, targetPackageOverride)
+		targetPackage = inferGoPackageForDirObserved(ack, tgtDir, targetPackageOverride)
 		if targetPackage == "" {
 			return mcp.NewToolResultError("could not determine target package; pass target_package"), nil
 		}
@@ -184,6 +188,7 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		// elsewhere; if so, the source file needs to import the target
 		// package and rewrite bare references.
 		newSrcContent, _, err = rewriteCallerFileContent(newSrcContent, srcAbs, callerRewriteOpts{
+			acknowledgement:   ack,
 			Name:              node.Name,
 			Mode:              callerSourcePkgRewrite,
 			TargetImportPath:  tgtImportPath,
@@ -207,6 +212,7 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	// reference into a same-package call after relocation).
 	if !samePackage {
 		newTgtContent, _, err = rewriteCallerFileContent(newTgtContent, tgtAbs, callerRewriteOpts{
+			acknowledgement:   ack,
 			Name:              node.Name,
 			Mode:              callerTargetPkgRewrite,
 			SourceImportPath:  srcImportPath,
@@ -287,6 +293,7 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 			mode = callerTargetPkgRewrite
 		}
 		newContent, info, rerr := rewriteCallerFileContent(content, absPath, callerRewriteOpts{
+			acknowledgement:   ack,
 			Name:              node.Name,
 			Mode:              mode,
 			SourceImportPath:  srcImportPath,
@@ -371,31 +378,47 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		return s.respondJSONOrTOON(ctx, req, resp)
 	}
 
+	measurement := s.beginMoveObservation(ctx, id, resp["target_id"].(string), srcAbs, tgtAbs, srcRel, tgtRelOut, samePackage && len(callerEdits) == 0)
+	defer measurement.finishWrites(false)
 	// Apply writes atomically. Order: target first (so file exists for any
 	// caller that triggers a follow-up open), then source, then callers.
-	if err := writeMoveFile(tgtAbs, newTgtContent); err != nil {
+	if err := measurement.write(editAcknowledgementFrom(ctx, s), tgtAbs, newTgtContent); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	if err := writeMoveFile(srcAbs, newSrcContent); err != nil {
+	observeEditSourceReplacement(ctx, tgtContent, newTgtContent, tgtExists, true)
+	if err := measurement.write(editAcknowledgementFrom(ctx, s), srcAbs, newSrcContent); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	observeEditSourceReplacement(ctx, srcContent, newSrcContent, true, true)
 	for _, ce := range callerEdits {
-		if err := writeMoveFile(ce.absPath, ce.newContent); err != nil {
+		if err := measurement.write(editAcknowledgementFrom(ctx, s), ce.absPath, ce.newContent); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		observeEditSourceReplacement(ctx, ce.origContent, ce.newContent, true, true)
 	}
+	measurement.finishWrites(true)
+	observeEditSourceComplete(ctx)
 
 	// Re-index every touched file so the graph picks up the new location.
 	sess := s.sessionFor(ctx)
 	for _, t := range touched {
 		sess.recordModified(t.Path)
 	}
-	_ = s.reindexFile(srcAbs)
-	_ = s.reindexFile(tgtAbs)
+	if measurement != nil {
+		_ = measurement.reindex(ctx, srcAbs)
+		_ = measurement.reindex(ctx, tgtAbs)
+	} else {
+		_ = s.reindexFile(srcAbs)
+		_ = s.reindexFile(tgtAbs)
+	}
 	for _, ce := range callerEdits {
 		_ = s.reindexFile(ce.absPath)
 	}
 
+	if measurement != nil {
+		resp["move_observation_id"] = measurement.id
+		resp["file_observations"] = measurement.references()
+	}
 	return s.respondJSONOrTOON(ctx, req, resp)
 }
 
@@ -442,6 +465,10 @@ func buildMovedSymbolID(s *Server, tgtAbs, name string) string {
 }
 
 func writeMoveFile(absPath string, content []byte) error {
+	return writeMoveFileObserved(nil, absPath, content)
+}
+
+func writeMoveFileObserved(a *editAcknowledgement, absPath string, content []byte) error {
 	perm := os.FileMode(0o644)
 	if info, err := os.Stat(absPath); err == nil {
 		perm = info.Mode().Perm()
@@ -449,7 +476,10 @@ func writeMoveFile(absPath string, content []byte) error {
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 		return fmt.Errorf("could not create parent dir for %s: %w", absPath, err)
 	}
-	if err := agents.AtomicWriteFile(absPath, content, perm); err != nil {
+	lap := beginEditAcknowledgementLap(a, editAckDiskWrite)
+	err := agents.AtomicWriteFile(absPath, content, perm)
+	lap.finish()
+	if err != nil {
 		return fmt.Errorf("could not write %s: %w", absPath, err)
 	}
 	return nil
@@ -581,7 +611,7 @@ func spliceOutGoDecl(src []byte, fset *token.FileSet, decl ast.Decl) ([]byte, er
 	}
 	// Pull start back one more newline if we now sit on a blank line so
 	// the file doesn't grow blank lines on every move.
-	if start > 0 && src[start-1] == '\n' && end < len(src) {
+	if start > 1 && src[start-1] == '\n' && src[start-2] == '\n' && end < len(src) {
 		start--
 	}
 	out := make([]byte, 0, len(src)-(end-start))
@@ -612,10 +642,10 @@ func readGoFileIfExists(absPath string) ([]byte, bool, error) {
 	return nil, false, fmt.Errorf("could not read target file: %w", err)
 }
 
-// inferGoPackageForDir picks a package name for a new Go file in `dir`.
-// Priority: explicit override, package of an existing .go sibling, then
-// the directory's leaf name.
-func inferGoPackageForDir(dir, override string) string {
+// inferGoPackageForDirObserved picks a package name for a new Go file.
+// Priority: explicit override, existing Go sibling, then directory leaf name.
+// The optional owner observes only actual parser calls.
+func inferGoPackageForDirObserved(ack *editAcknowledgement, dir, override string) string {
 	if override != "" {
 		return override
 	}
@@ -633,7 +663,7 @@ func inferGoPackageForDir(dir, override string) string {
 				continue
 			}
 			fset := token.NewFileSet()
-			f, perr := parser.ParseFile(fset, "", content, parser.PackageClauseOnly)
+			f, perr := parseAcknowledgedGoFile(ack, fset, "", content, parser.PackageClauseOnly)
 			if perr == nil && f.Name != nil {
 				return f.Name.Name
 			}
@@ -759,6 +789,7 @@ const (
 )
 
 type callerRewriteOpts struct {
+	acknowledgement   *editAcknowledgement
 	Name              string
 	Mode              callerRewriteMode
 	SourceImportPath  string
@@ -783,7 +814,7 @@ func rewriteCallerFileContent(content []byte, absPath string, opts callerRewrite
 		return content, callerRewriteResult{}, nil
 	}
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, absPath, content, parser.ParseComments)
+	file, err := parseAcknowledgedGoFile(opts.acknowledgement, fset, absPath, content, parser.ParseComments)
 	if err != nil {
 		return nil, callerRewriteResult{}, fmt.Errorf("could not parse %s: %w", absPath, err)
 	}

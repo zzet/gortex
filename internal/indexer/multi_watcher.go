@@ -251,8 +251,8 @@ func (mw *MultiWatcher) createWatcher(prefix string, cfg config.WatchConfig) err
 	w.explicitReindexRaw = func(paths []string) (*IndexResult, error) {
 		return mw.multi.incrementalReindexRepoRawMode(prefix, paths, incrementalPathMode{detectDeletions: true, forceExplicitFiles: true})
 	}
-	w.pointReindexRaw = func(filePath string) (*IndexResult, error) {
-		return mw.multi.incrementalPointRepoRaw(prefix, filePath)
+	w.pointReindexRaw = func(filePath string, stamps *PublicationStamps) (*IndexResult, error) {
+		return mw.multi.incrementalPointRepoRawObserved(prefix, filePath, stamps)
 	}
 
 	mw.watchers[prefix] = w
@@ -1112,6 +1112,7 @@ func (mw *MultiWatcher) OnWorktreeChangeContext(cb WorktreeChangeCallback) {
 // cannot force a synchronous fallback, and a watcher that failed to start is
 // never reported as accepting work.
 func (mw *MultiWatcher) EnqueueFileMutation(ctx context.Context, filePath string) (*MutationTicket, error) {
+	ctx, _ = canonicalSchedulingEntry(ctx)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

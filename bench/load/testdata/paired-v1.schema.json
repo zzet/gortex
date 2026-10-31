@@ -41,7 +41,31 @@
                 "edit_anchor": {
                   "type": "string"
                 },
+                "edit_before_template": {
+                  "type": "string"
+                },
+                "edit_callee": {
+                  "type": "string"
+                },
+                "edit_destination": {
+                  "type": "string"
+                },
+                "edit_destination_content": {
+                  "type": "string"
+                },
+                "edit_initial_content": {
+                  "type": "string"
+                },
+                "edit_kind": {
+                  "type": "string"
+                },
+                "edit_output": {
+                  "type": "string"
+                },
                 "edit_template": {
+                  "type": "string"
+                },
+                "edit_tool": {
                   "type": "string"
                 },
                 "file": {
@@ -234,6 +258,9 @@
                       "error": {
                         "type": "string"
                       },
+                      "expected_outcome": {
+                        "type": "string"
+                      },
                       "logical_ms": {
                         "type": "number"
                       },
@@ -419,6 +446,968 @@
                   ],
                   "type": "object"
                 },
+                "edit_probe": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "accounting_required": {
+                          "type": "boolean"
+                        },
+                        "edits": {
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "accounting": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "acknowledgement": {
+                                    "anyOf": [
+                                      {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "residual_ns": {
+                                            "type": "integer"
+                                          },
+                                          "sum_ns": {
+                                            "type": "integer"
+                                          },
+                                          "wall_ns": {
+                                            "type": "integer"
+                                          },
+                                          "within_five_percent": {
+                                            "type": "boolean"
+                                          }
+                                        },
+                                        "required": [
+                                          "wall_ns",
+                                          "sum_ns",
+                                          "residual_ns",
+                                          "within_five_percent"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "applied_generation": {
+                                    "type": "integer"
+                                  },
+                                  "bound_rpc_id": {
+                                    "type": "string"
+                                  },
+                                  "physical": {
+                                    "anyOf": [
+                                      {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "residual_ns": {
+                                            "type": "integer"
+                                          },
+                                          "sum_ns": {
+                                            "type": "integer"
+                                          },
+                                          "wall_ns": {
+                                            "type": "integer"
+                                          },
+                                          "within_five_percent": {
+                                            "type": "boolean"
+                                          }
+                                        },
+                                        "required": [
+                                          "wall_ns",
+                                          "sum_ns",
+                                          "residual_ns",
+                                          "within_five_percent"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "read_assisted_publisher": {
+                                    "anyOf": [
+                                      {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "residual_ns": {
+                                            "type": "integer"
+                                          },
+                                          "sum_ns": {
+                                            "type": "integer"
+                                          },
+                                          "wall_ns": {
+                                            "type": "integer"
+                                          },
+                                          "within_five_percent": {
+                                            "type": "boolean"
+                                          }
+                                        },
+                                        "required": [
+                                          "wall_ns",
+                                          "sum_ns",
+                                          "residual_ns",
+                                          "within_five_percent"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "reasons": {
+                                    "items": {
+                                      "type": "string"
+                                    },
+                                    "type": [
+                                      "array",
+                                      "null"
+                                    ]
+                                  },
+                                  "requested_background": {
+                                    "anyOf": [
+                                      {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "residual_ns": {
+                                            "type": "integer"
+                                          },
+                                          "sum_ns": {
+                                            "type": "integer"
+                                          },
+                                          "wall_ns": {
+                                            "type": "integer"
+                                          },
+                                          "within_five_percent": {
+                                            "type": "boolean"
+                                          }
+                                        },
+                                        "required": [
+                                          "wall_ns",
+                                          "sum_ns",
+                                          "residual_ns",
+                                          "within_five_percent"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "requested_generation": {
+                                    "type": "integer"
+                                  },
+                                  "state": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "state",
+                                  "bound_rpc_id",
+                                  "requested_generation",
+                                  "applied_generation",
+                                  "acknowledgement",
+                                  "physical",
+                                  "requested_background",
+                                  "reasons"
+                                ],
+                                "type": "object"
+                              },
+                              "activated_ns": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "batch": {
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "acknowledgement_receipt": {
+                                        "type": "string"
+                                      },
+                                      "acknowledgement_state": {
+                                        "type": "string"
+                                      },
+                                      "after_sha256": {
+                                        "type": "string"
+                                      },
+                                      "file_observation_receipt": {
+                                        "type": "string"
+                                      },
+                                      "path": {
+                                        "type": "string"
+                                      },
+                                      "reindex_generation": {
+                                        "type": "integer"
+                                      },
+                                      "reindex_receipt": {
+                                        "type": "string"
+                                      },
+                                      "relative_path": {
+                                        "type": "string"
+                                      },
+                                      "result_reindex_generation": {
+                                        "type": "integer"
+                                      },
+                                      "result_reindex_receipt": {
+                                        "type": "string"
+                                      },
+                                      "transaction_error": {
+                                        "type": "string"
+                                      },
+                                      "transaction_id": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "transaction_id",
+                                      "file_observation_receipt",
+                                      "acknowledgement_receipt",
+                                      "path",
+                                      "relative_path",
+                                      "after_sha256",
+                                      "reindex_receipt",
+                                      "reindex_generation",
+                                      "result_reindex_receipt",
+                                      "result_reindex_generation",
+                                      "acknowledgement_state"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "errors": {
+                                "items": {
+                                  "type": "string"
+                                },
+                                "type": [
+                                  "array",
+                                  "null"
+                                ]
+                              },
+                              "evidence_bytes": {
+                                "type": "integer"
+                              },
+                              "evidence_encode_ms": {
+                                "type": "number"
+                              },
+                              "evidence_limit_bytes": {
+                                "type": "integer"
+                              },
+                              "evidence_write_ms": {
+                                "type": "number"
+                              },
+                              "expected_refusals": {
+                                "type": "integer"
+                              },
+                              "first_correct_ms": {
+                                "additionalProperties": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "reason": {
+                                      "type": "string"
+                                    },
+                                    "unit": {
+                                      "type": "string"
+                                    },
+                                    "value": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "value",
+                                    "unit",
+                                    "reason"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": [
+                                  "object",
+                                  "null"
+                                ]
+                              },
+                              "graph_terminal": {
+                                "type": "boolean"
+                              },
+                              "graph_terminal_basis": {
+                                "type": "string"
+                              },
+                              "marker": {
+                                "type": "string"
+                              },
+                              "move": {
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "files": {
+                                        "items": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "path": {
+                                              "type": "string"
+                                            },
+                                            "receipt": {
+                                              "type": "string"
+                                            },
+                                            "role": {
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "path",
+                                            "role",
+                                            "receipt"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "type": [
+                                          "array",
+                                          "null"
+                                        ]
+                                      },
+                                      "operation_id": {
+                                        "type": "string"
+                                      },
+                                      "reference_error": {
+                                        "type": "string"
+                                      },
+                                      "source_id": {
+                                        "type": "string"
+                                      },
+                                      "target_id": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "operation_id",
+                                      "source_id",
+                                      "target_id",
+                                      "files"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "move_accounting": {
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "ack_rpc_id": {
+                                        "type": "string"
+                                      },
+                                      "acknowledgement": {
+                                        "anyOf": [
+                                          {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "residual_ns": {
+                                                "type": "integer"
+                                              },
+                                              "sum_ns": {
+                                                "type": "integer"
+                                              },
+                                              "wall_ns": {
+                                                "type": "integer"
+                                              },
+                                              "within_five_percent": {
+                                                "type": "boolean"
+                                              }
+                                            },
+                                            "required": [
+                                              "wall_ns",
+                                              "sum_ns",
+                                              "residual_ns",
+                                              "within_five_percent"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "files": {
+                                        "items": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "accepted_blob_sha": {
+                                              "type": "string"
+                                            },
+                                            "direct_reconcile": {
+                                              "anyOf": [
+                                                {
+                                                  "additionalProperties": false,
+                                                  "properties": {
+                                                    "residual_ns": {
+                                                      "type": "integer"
+                                                    },
+                                                    "sum_ns": {
+                                                      "type": "integer"
+                                                    },
+                                                    "wall_ns": {
+                                                      "type": "integer"
+                                                    },
+                                                    "within_five_percent": {
+                                                      "type": "boolean"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "wall_ns",
+                                                    "sum_ns",
+                                                    "residual_ns",
+                                                    "within_five_percent"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
+                                            "owner_generation": {
+                                              "type": "integer"
+                                            },
+                                            "path": {
+                                              "type": "string"
+                                            },
+                                            "publication_route": {
+                                              "type": "string"
+                                            },
+                                            "read_assisted_reconcile": {
+                                              "anyOf": [
+                                                {
+                                                  "additionalProperties": false,
+                                                  "properties": {
+                                                    "residual_ns": {
+                                                      "type": "integer"
+                                                    },
+                                                    "sum_ns": {
+                                                      "type": "integer"
+                                                    },
+                                                    "wall_ns": {
+                                                      "type": "integer"
+                                                    },
+                                                    "within_five_percent": {
+                                                      "type": "boolean"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "wall_ns",
+                                                    "sum_ns",
+                                                    "residual_ns",
+                                                    "within_five_percent"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
+                                            "receipt": {
+                                              "type": "string"
+                                            },
+                                            "role": {
+                                              "type": "string"
+                                            },
+                                            "write_returned_ns": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "integer"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
+                                            "write_started_ns": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "integer"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
+                                            "write_window_ns": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "integer"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "required": [
+                                            "path",
+                                            "role",
+                                            "receipt",
+                                            "accepted_blob_sha",
+                                            "owner_generation",
+                                            "write_started_ns",
+                                            "write_returned_ns",
+                                            "write_window_ns"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "type": [
+                                          "array",
+                                          "null"
+                                        ]
+                                      },
+                                      "reasons": {
+                                        "items": {
+                                          "type": "string"
+                                        },
+                                        "type": [
+                                          "array",
+                                          "null"
+                                        ]
+                                      },
+                                      "state": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "state",
+                                      "ack_rpc_id",
+                                      "files"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "mutation_id": {
+                                "type": "string"
+                              },
+                              "mutation_receipt": {
+                                "type": "string"
+                              },
+                              "ordinal": {
+                                "type": "integer"
+                              },
+                              "outcome": {
+                                "type": "string"
+                              },
+                              "planned_due_ns": {
+                                "type": "integer"
+                              },
+                              "precommit_fresh_mismatches_unassessed": {
+                                "type": "integer"
+                              },
+                              "probe_errors": {
+                                "type": "integer"
+                              },
+                              "raw_evidence": {
+                                "type": "string"
+                              },
+                              "readbacks": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "correct": {
+                                      "type": "boolean"
+                                    },
+                                    "error": {
+                                      "type": "string"
+                                    },
+                                    "expected_outcome": {
+                                      "type": "string"
+                                    },
+                                    "kind": {
+                                      "type": "string"
+                                    },
+                                    "latency_ms": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "refusal": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind",
+                                    "latency_ms",
+                                    "correct",
+                                    "error"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": [
+                                  "array",
+                                  "null"
+                                ]
+                              },
+                              "reads_while_receipt_observed_pending": {
+                                "type": "integer"
+                              },
+                              "stale_claimed_fresh": {
+                                "type": "boolean"
+                              },
+                              "start_lateness_ns": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "started_ns": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "t_ack_ms": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "ordinal",
+                              "marker",
+                              "mutation_id",
+                              "planned_due_ns",
+                              "activated_ns",
+                              "started_ns",
+                              "start_lateness_ns",
+                              "outcome",
+                              "mutation_receipt",
+                              "t_ack_ms",
+                              "readbacks",
+                              "first_correct_ms",
+                              "accounting",
+                              "reads_while_receipt_observed_pending",
+                              "probe_errors",
+                              "stale_claimed_fresh",
+                              "precommit_fresh_mismatches_unassessed",
+                              "graph_terminal",
+                              "raw_evidence",
+                              "evidence_write_ms",
+                              "evidence_encode_ms",
+                              "evidence_bytes",
+                              "evidence_limit_bytes",
+                              "errors"
+                            ],
+                            "type": "object"
+                          },
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "limitations": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "plan": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "arrival": {
+                              "type": "string"
+                            },
+                            "callee": {
+                              "type": "string"
+                            },
+                            "commit": {
+                              "type": "string"
+                            },
+                            "count": {
+                              "type": "integer"
+                            },
+                            "file": {
+                              "type": "string"
+                            },
+                            "kind": {
+                              "type": "string"
+                            },
+                            "language": {
+                              "type": "string"
+                            },
+                            "mean_interarrival_ns": {
+                              "type": "integer"
+                            },
+                            "mode": {
+                              "type": "string"
+                            },
+                            "not_selected_not_tested": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            },
+                            "probe_period_ns": {
+                              "type": "integer"
+                            },
+                            "repo": {
+                              "type": "string"
+                            },
+                            "seed": {
+                              "type": "integer"
+                            },
+                            "session_model": {
+                              "type": "string"
+                            },
+                            "steps": {
+                              "items": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "activate_ns": {
+                                    "type": "integer"
+                                  },
+                                  "before_symbol": {
+                                    "type": "string"
+                                  },
+                                  "deleted": {
+                                    "type": "boolean"
+                                  },
+                                  "destination_file": {
+                                    "type": "string"
+                                  },
+                                  "due_ns": {
+                                    "type": "integer"
+                                  },
+                                  "expected_line_gap": {
+                                    "type": "integer"
+                                  },
+                                  "following_symbol": {
+                                    "type": "string"
+                                  },
+                                  "marker": {
+                                    "type": "string"
+                                  },
+                                  "mutation_id": {
+                                    "type": "string"
+                                  },
+                                  "ordinal": {
+                                    "type": "integer"
+                                  },
+                                  "relocated": {
+                                    "type": "boolean"
+                                  },
+                                  "request": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "arguments": {
+                                        "additionalProperties": {},
+                                        "type": [
+                                          "object",
+                                          "null"
+                                        ]
+                                      },
+                                      "expected_absent_symbol": {
+                                        "type": "string"
+                                      },
+                                      "operation": {
+                                        "type": "string"
+                                      },
+                                      "tool": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "tool",
+                                      "operation",
+                                      "arguments"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "request_sha256": {
+                                    "type": "string"
+                                  },
+                                  "target_symbol": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "ordinal",
+                                  "activate_ns",
+                                  "due_ns",
+                                  "marker",
+                                  "mutation_id",
+                                  "request",
+                                  "request_sha256"
+                                ],
+                                "type": "object"
+                              },
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            },
+                            "tool": {
+                              "type": "string"
+                            },
+                            "version": {
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "version",
+                            "arrival",
+                            "mean_interarrival_ns",
+                            "probe_period_ns",
+                            "count",
+                            "seed",
+                            "kind",
+                            "tool",
+                            "language",
+                            "mode",
+                            "repo",
+                            "commit",
+                            "file",
+                            "callee",
+                            "session_model",
+                            "not_selected_not_tested",
+                            "steps"
+                          ],
+                          "type": "object"
+                        },
+                        "plan_sha256": {
+                          "type": "string"
+                        },
+                        "restore_batch": {},
+                        "restore_batch_ms": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "reason": {
+                              "type": "string"
+                            },
+                            "unit": {
+                              "type": "string"
+                            },
+                            "value": {
+                              "anyOf": [
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value",
+                            "unit",
+                            "reason"
+                          ],
+                          "type": "object"
+                        },
+                        "stats_after": {},
+                        "stats_before": {}
+                      },
+                      "required": [
+                        "plan",
+                        "plan_sha256",
+                        "accounting_required",
+                        "edits",
+                        "restore_batch_ms",
+                        "restore_batch",
+                        "stats_before",
+                        "stats_after",
+                        "limitations"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "edits": {
                   "items": {
                     "additionalProperties": false,
@@ -557,6 +1546,9 @@
                           "null"
                         ]
                       },
+                      "expected_absent_symbol": {
+                        "type": "string"
+                      },
                       "operation": {
                         "type": "string"
                       },
@@ -591,6 +1583,12 @@
                           "object",
                           "null"
                         ]
+                      },
+                      "expected_refusals": {
+                        "type": "integer"
+                      },
+                      "harness_incomplete": {
+                        "type": "integer"
                       },
                       "latency_ms": {
                         "additionalProperties": false,
@@ -720,6 +1718,9 @@
                         "type": "integer"
                       },
                       "product_expired": {
+                        "type": "integer"
+                      },
+                      "retryable_refusals": {
                         "type": "integer"
                       },
                       "successes": {
@@ -792,6 +1793,12 @@
                           "null"
                         ]
                       },
+                      "expected_refusals": {
+                        "type": "integer"
+                      },
+                      "harness_incomplete": {
+                        "type": "integer"
+                      },
                       "latency_ms": {
                         "additionalProperties": false,
                         "properties": {
@@ -920,6 +1927,9 @@
                         "type": "integer"
                       },
                       "product_expired": {
+                        "type": "integer"
+                      },
+                      "retryable_refusals": {
                         "type": "integer"
                       },
                       "successes": {
@@ -1188,6 +2198,179 @@
               "edit_agents": {
                 "type": "integer"
               },
+              "edit_probe": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "arrival": {
+                        "type": "string"
+                      },
+                      "callee": {
+                        "type": "string"
+                      },
+                      "commit": {
+                        "type": "string"
+                      },
+                      "count": {
+                        "type": "integer"
+                      },
+                      "file": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string"
+                      },
+                      "language": {
+                        "type": "string"
+                      },
+                      "mean_interarrival_ns": {
+                        "type": "integer"
+                      },
+                      "mode": {
+                        "type": "string"
+                      },
+                      "not_selected_not_tested": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": [
+                          "array",
+                          "null"
+                        ]
+                      },
+                      "probe_period_ns": {
+                        "type": "integer"
+                      },
+                      "repo": {
+                        "type": "string"
+                      },
+                      "seed": {
+                        "type": "integer"
+                      },
+                      "session_model": {
+                        "type": "string"
+                      },
+                      "steps": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "activate_ns": {
+                              "type": "integer"
+                            },
+                            "before_symbol": {
+                              "type": "string"
+                            },
+                            "deleted": {
+                              "type": "boolean"
+                            },
+                            "destination_file": {
+                              "type": "string"
+                            },
+                            "due_ns": {
+                              "type": "integer"
+                            },
+                            "expected_line_gap": {
+                              "type": "integer"
+                            },
+                            "following_symbol": {
+                              "type": "string"
+                            },
+                            "marker": {
+                              "type": "string"
+                            },
+                            "mutation_id": {
+                              "type": "string"
+                            },
+                            "ordinal": {
+                              "type": "integer"
+                            },
+                            "relocated": {
+                              "type": "boolean"
+                            },
+                            "request": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "arguments": {
+                                  "additionalProperties": {},
+                                  "type": [
+                                    "object",
+                                    "null"
+                                  ]
+                                },
+                                "expected_absent_symbol": {
+                                  "type": "string"
+                                },
+                                "operation": {
+                                  "type": "string"
+                                },
+                                "tool": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "tool",
+                                "operation",
+                                "arguments"
+                              ],
+                              "type": "object"
+                            },
+                            "request_sha256": {
+                              "type": "string"
+                            },
+                            "target_symbol": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "ordinal",
+                            "activate_ns",
+                            "due_ns",
+                            "marker",
+                            "mutation_id",
+                            "request",
+                            "request_sha256"
+                          ],
+                          "type": "object"
+                        },
+                        "type": [
+                          "array",
+                          "null"
+                        ]
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "version": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "version",
+                      "arrival",
+                      "mean_interarrival_ns",
+                      "probe_period_ns",
+                      "count",
+                      "seed",
+                      "kind",
+                      "tool",
+                      "language",
+                      "mode",
+                      "repo",
+                      "commit",
+                      "file",
+                      "callee",
+                      "session_model",
+                      "not_selected_not_tested",
+                      "steps"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "keep_state": {
                 "type": "boolean"
               },
@@ -1204,6 +2387,9 @@
                         "object",
                         "null"
                       ]
+                    },
+                    "expected_absent_symbol": {
+                      "type": "string"
                     },
                     "operation": {
                       "type": "string"
@@ -1470,6 +2656,9 @@
                 "error": {
                   "type": "string"
                 },
+                "expected_outcome": {
+                  "type": "string"
+                },
                 "logical_latency_ms": {
                   "additionalProperties": false,
                   "properties": {
@@ -1539,6 +2728,9 @@
                 "type": "integer"
               },
               "commit": {
+                "type": "string"
+              },
+              "expected_outcome": {
                 "type": "string"
               },
               "repo": {

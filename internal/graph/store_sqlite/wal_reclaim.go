@@ -254,10 +254,17 @@ func resolveWALReclaimConfig() walReclaimConfig {
 // read gate was closed per attempt that closed it; ReaderWait is what readers
 // actually spent held at the gate (per held read), measured on their side.
 type WALReclaimStats struct {
-	ThresholdBytes int64
-	Attempts       int64 // attempts that passed the size check and the lease
-	Resets         int64 // TRUNCATE checkpoints that reset the log
-	OpenGateResets int64 // resets reached without closing the read gate
+	// One first observed cause per final non-reset reclaim attempt, including
+	// writer-demand refusal. Parked writer precedes intent if both are seen.
+	CancelledWriterParked, CancelledWriteIntent, CancelledOther int64
+	// Lower-bound sampled high-water since this store opened, not an exact
+	// instantaneous or warm-run peak. Status reads never reset it.
+	ObservedPeakWALBytes int64
+	WALPeakObserved      bool
+	ThresholdBytes       int64
+	Attempts             int64 // attempts that passed the size check and the lease
+	Resets               int64 // TRUNCATE checkpoints that reset the log
+	OpenGateResets       int64 // resets reached without closing the read gate
 	// LastResortRuns counts attempts at walReclaimLastResortBytes (each may
 	// hold the writer up to walReclaimMaxWriterHold).
 	LastResortRuns int64
@@ -318,8 +325,10 @@ type WALReclaimStats struct {
 }
 
 type walReclaimState struct {
-	mu    sync.Mutex
-	stats WALReclaimStats
+	observedPeak atomic.Int64
+	peakObserved atomic.Bool
+	mu           sync.Mutex
+	stats        WALReclaimStats
 	// cycle is the build-lane yield shared by the reclaim and the PASSIVE
 	// loop (checkpoint_cycle_yield.go).
 	cycle checkpointCycleYield
@@ -333,6 +342,8 @@ func (s *Store) WALReclaimStats() WALReclaimStats {
 	s.walReclaim.mu.Lock()
 	out := s.walReclaim.stats
 	s.walReclaim.mu.Unlock()
+	out.WALPeakObserved = s.walReclaim.peakObserved.Load()
+	out.ObservedPeakWALBytes = s.walReclaim.observedPeak.Load()
 	cycle := &s.walReclaim.cycle
 	out.CycleDeferrals = cycle.deferrals.Load()
 	out.CycleRefusals = cycle.refusals.Load()
@@ -398,6 +409,7 @@ type walReclaimResetReaders struct {
 }
 
 type walReclaimResult struct {
+	attempt     *backgroundCheckpointAttempt // bounded cause witness, never a global registry
 	outcome     walReclaimOutcome
 	reason      string
 	frames      int
@@ -536,13 +548,14 @@ func (s *Store) reclaimWALOnce(cfg walReclaimConfig, ckptDB *sql.DB, walPath str
 	}
 	if res.outcome == walReclaimSkipped && res.bytesBefore == 0 {
 		// A refusal returns before measuring the log; the skip line reports it.
-		res.bytesBefore = walFileSize(walPath)
+		res.bytesBefore = s.observedWALFileSize(walPath)
 	}
 	if res.outcome == walReclaimReset {
 		res.progressed = true
 	}
 	s.walReclaim.update(func(st *WALReclaimStats) {
 		st.ThresholdBytes = cfg.thresholdBytes
+		st.noteInterruption(res)
 		st.LastOutcome = res.outcome.String()
 		st.LastReason = res.reason
 		if res.adaptiveUsed {
@@ -596,7 +609,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	laneBusy := s.cycleYieldEnabled() && s.buildLaneBusy()
 	hardCap, pressure := false, false
 	if cfg.ceilingBytes > 0 {
-		size := walFileSize(walPath)
+		size := s.observedWALFileSize(walPath)
 		if laneBusy && size >= walReclaimHardCapFactor*cfg.ceilingBytes && s.hardCapDue(time.Now()) {
 			policy, hardCap = checkpointIgnoresCycle, true
 			s.walReclaim.cycle.ceiling.Add(1)
@@ -609,7 +622,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 			policy, pressure = checkpointIgnoresCycle, true
 		}
 	}
-	attempt, berr := s.beginBackgroundCheckpointAttempt(policy)
+	attempt, berr := s.beginCheckpointAttempt(policy, true)
 	if errors.Is(berr, errWALCheckpointYieldedToCycle) {
 		s.walReclaim.cycle.refusals.Add(1)
 		return walReclaimResult{outcome: walReclaimSkipped, reason: "build_lane_busy"}
@@ -624,7 +637,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		// ceiling one attempt runs anyway — bounded by the writer-hold cap,
 		// its writer step taking the write gate between the window's own
 		// transactions — at most once per walReclaimLeaseOverrideSpacing.
-		size := walFileSize(walPath)
+		size := s.observedWALFileSize(walPath)
 		if cfg.ceilingBytes <= 0 || size < cfg.ceilingBytes || !s.leaseOverrideDue(time.Now()) {
 			return walReclaimResult{outcome: walReclaimSkipped, reason: "checkpoint_lease"}
 		}
@@ -632,7 +645,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		if hardCap {
 			leasePolicy = checkpointOverridesLeaseAndCycle
 		}
-		attempt, berr = s.beginBackgroundCheckpointAttempt(leasePolicy)
+		attempt, berr = s.beginCheckpointAttempt(leasePolicy, true)
 		if errors.Is(berr, errWALCheckpointYieldedToCycle) {
 			s.walReclaim.cycle.refusals.Add(1)
 			return walReclaimResult{outcome: walReclaimSkipped, reason: "build_lane_busy"}
@@ -671,7 +684,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		return walReclaimResult{outcome: walReclaimSkipped, reason: "copy_budget"}
 	}
 
-	res := walReclaimResult{bytesBefore: walFileSize(walPath), leaseOverride: leaseOverride, began: true, copy: attempt.copy, pressure: pressure, hardCap: hardCap, bulkCompletion: leaseOverride}
+	res := walReclaimResult{attempt: attempt, bytesBefore: s.observedWALFileSize(walPath), leaseOverride: leaseOverride, began: true, copy: attempt.copy, pressure: pressure, hardCap: hardCap, bulkCompletion: leaseOverride}
 	if mark := walReclaimLastResortBytes(cfg); mark > 0 && res.bytesBefore >= mark {
 		res.lastResort = true
 	}
@@ -685,7 +698,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	initial, initialErr := s.pacedPassive(attempt.ctx, ckptDB, attempt)
 	if s.walAttemptHandsOverToPressure(attempt.ctx, cfg, walPath, &res, initial, initialErr) {
 		res.outcome, res.reason = walReclaimSkipped, "pressure_mark"
-		res.bytesAfter = walFileSize(walPath)
+		res.bytesAfter = s.observedWALFileSize(walPath)
 		return res
 	}
 	// Step 2: without the writer and with the gate OPEN, wait for a log no
@@ -729,7 +742,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 			pcancel()
 			if s.walAttemptHandsOverToPressure(attempt.ctx, cfg, walPath, &res, result, perr) {
 				res.outcome, res.reason = walReclaimSkipped, "pressure_mark"
-				res.bytesAfter = walFileSize(walPath)
+				res.bytesAfter = s.observedWALFileSize(walPath)
 				return res
 			}
 			if s.walAttemptHandsOverToRequest(&res) {
@@ -810,23 +823,23 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	}
 	if !res.resetWriterFree && s.walAttemptHandsOverToRequest(&res) {
 		res.outcome, res.reason = walReclaimSkipped, "reclaim_request"
-		res.bytesAfter = walFileSize(walPath)
+		res.bytesAfter = s.observedWALFileSize(walPath)
 		return res
 	}
 	if res.resetWriterFree {
 		res.openGate = true
 		res.outcome = walReclaimReset
-		res.bytesAfter = walFileSize(walPath)
+		res.bytesAfter = s.observedWALFileSize(walPath)
 		return res
 	}
-	if cfg.thresholdBytes > 0 && walFileSize(walPath) >= walReclaimUrgentFactor*cfg.thresholdBytes {
+	if cfg.thresholdBytes > 0 && s.observedWALFileSize(walPath) >= walReclaimUrgentFactor*cfg.thresholdBytes {
 		res.urgent = true
 	}
 	// An edit began meanwhile: the copy so far is kept (every pass that
 	// completed moved nBackfill); the writer is not taken during an edit.
 	if attempt.copy != nil && attempt.copy.pausable.Load() && !attempt.copy.pressure && s.buildLaneBusy() {
 		res.outcome, res.reason = walReclaimSkipped, "build_lane_busy"
-		res.bytesAfter = walFileSize(walPath)
+		res.bytesAfter = s.observedWALFileSize(walPath)
 		return res
 	}
 	// Before the writer: converge the backfill so the capped writer step
@@ -847,22 +860,23 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	}
 	if attempt.copy != nil && attempt.copy.pausable.Load() && !attempt.copy.pressure && s.buildLaneBusy() {
 		res.outcome, res.reason = walReclaimSkipped, "build_lane_busy"
-		res.bytesAfter = walFileSize(walPath)
+		res.bytesAfter = s.observedWALFileSize(walPath)
 		return res
 	}
 	if s.walAttemptHandsOverToRequest(&res) {
 		res.outcome, res.reason = walReclaimSkipped, "reclaim_request"
-		res.bytesAfter = walFileSize(walPath)
+		res.bytesAfter = s.observedWALFileSize(walPath)
 		return res
 	}
 	if pressure && s.buildLaneBusy() {
 		// Inside the busy lane: the reset alone, under its own short cap.
 		err := s.reclaimWALPressureResetWithDrain(attempt.ctx, ckptDB, &res, cfg.drainDeadline)
-		res.bytesAfter = walFileSize(walPath)
+		res.bytesAfter = s.observedWALFileSize(walPath)
 		if err == nil {
 			res.outcome = walReclaimReset
 			return res
 		}
+		noteWALReclaimCancellation(attempt, err)
 		if res.outcome == 0 || res.outcome == walReclaimReset {
 			res.outcome = walReclaimDeferred
 		}
@@ -881,7 +895,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 			return s.reclaimWALInLane(ctx, cfg, ckptDB, &res)
 		})
 	}
-	res.bytesAfter = walFileSize(walPath)
+	res.bytesAfter = s.observedWALFileSize(walPath)
 	if err == nil {
 		res.outcome = walReclaimReset
 		return res
@@ -895,6 +909,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		return res
 	}
 	if attempt.ctx.Err() != nil {
+		noteWALReclaimCancellation(attempt, attempt.ctx.Err())
 		res.outcome, res.reason = walReclaimSkipped, "shutdown"
 		return res
 	}
@@ -927,7 +942,7 @@ func (s *Store) walAttemptHandsOverToPressure(ctx context.Context, cfg walReclai
 		return false
 	}
 	mark := walPressureMark(cfg)
-	return mark > 0 && walFileSize(walPath) >= mark
+	return mark > 0 && s.observedWALFileSize(walPath) >= mark
 }
 
 // walAttemptHandsOverToRequest reports an attempt that should end so the loop
@@ -955,9 +970,10 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	urgent := res.urgent
 	// A mutation already waiting for the writer wins outright (unless the log
 	// is urgent; the hold stays capped).
-	if !urgent && s.writeWanted() {
+	if demand := s.writeDemandCause(); !urgent && demand != nil {
+		noteWALReclaimDemand(ctx, demand)
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
-		return errWALReclaimWriterWaiting
+		return demand
 	}
 	if !res.lastResort && !res.bulkCompletion && !walReclaimSkipQuiescence && s.readGate != nil && !walReclaimSkipOpenGate && cfg.readerWait > 0 {
 		return s.reclaimWALInLaneOpenGate(ctx, cfg, ckptDB, res)
@@ -969,7 +985,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		}()
 	}
 	if res.lastResort {
-		at := walFileSize(s.dbPath + "-wal")
+		at := s.observedWALFileSize(s.dbPath + "-wal")
 		defer func() {
 			log.Printf("store_sqlite: wal reclaim last resort wal_bytes=%d mark=%d writer_hold=%s reset=%t reason=%q",
 				at, walReclaimLastResortBytes(cfg), res.writerHold.Round(time.Millisecond), res.openGate, res.reason)
@@ -1015,7 +1031,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	}
 	if expected := res.lastResortPromotion; expected != nil {
 		current, ok := readWALReclaimFrontier(s.dbPath)
-		if !ok || current.salt != expected.salt || current.mx < expected.mx || current.backfill < expected.backfill || walFileSize(s.dbPath+"-wal") < walReclaimLastResortBytes(cfg) {
+		if !ok || current.salt != expected.salt || current.mx < expected.mx || current.backfill < expected.backfill || s.observedWALFileSize(s.dbPath+"-wal") < walReclaimLastResortBytes(cfg) {
 			res.reason = "last_resort_frontier_changed"
 			return errWALReclaimReadersInFlight
 		}
@@ -1031,7 +1047,14 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		yctx, stopYield = s.yieldToWriters(hctx)
 	}
 	defer stopYield()
-	yielded := func() bool { return errors.Is(context.Cause(yctx), errWALReclaimWriterWaiting) }
+	yielded := func() bool {
+		cause := context.Cause(yctx)
+		if !errors.Is(cause, errWALReclaimWriterWaiting) {
+			return false
+		}
+		noteWALReclaimDemand(ctx, cause)
+		return true
+	}
 	giveUp := func(reason string, cause error) error {
 		if yielded() {
 			res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
@@ -1204,8 +1227,8 @@ func (s *Store) yieldToWriters(parent context.Context) (context.Context, func())
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if s.writeWanted() {
-					cancel(errWALReclaimWriterWaiting)
+				if demand := s.writeDemandCause(); demand != nil {
+					cancel(demand)
 					return
 				}
 			}
@@ -1427,7 +1450,7 @@ func (s *Store) runWALReclaimLoop(cfg walReclaimConfig, walPath string, poll tim
 			}
 			now = time.Now()
 		}
-		if !schedule.ready(now) || walFileSize(walPath) <= cfg.thresholdBytes {
+		if !schedule.ready(now) || s.observedWALFileSize(walPath) <= cfg.thresholdBytes {
 			continue
 		}
 		if ckptDB == nil {
@@ -1557,7 +1580,7 @@ func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConf
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if mark > 0 && walFileSize(s.dbPath+"-wal") >= mark {
+		if mark > 0 && s.observedWALFileSize(s.dbPath+"-wal") >= mark {
 			current, ok := readWALReclaimFrontier(s.dbPath)
 			if !entryOK || !ok || current.salt != entry.salt || current.mx < entry.mx || current.backfill < entry.backfill {
 				res.reason = "last_resort_frontier_changed"
@@ -1568,7 +1591,7 @@ func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConf
 				return errWALCheckpointYieldedToCycle
 			}
 			res.lastResort, res.lastResortPromotion = true, &current
-			if cfg.thresholdBytes > 0 && walFileSize(s.dbPath+"-wal") >= walReclaimUrgentFactor*cfg.thresholdBytes {
+			if cfg.thresholdBytes > 0 && s.observedWALFileSize(s.dbPath+"-wal") >= walReclaimUrgentFactor*cfg.thresholdBytes {
 				res.urgent = true
 			}
 			// Keep this operation's deadline and charge every preceding short
@@ -1594,7 +1617,7 @@ func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConf
 		}
 		if res.resetReaders != nil {
 			epoch, older, werr := s.waitWALRoundReaders(waitCtx, res, deadline)
-			if werr != nil && ctx.Err() == nil && waitCtx.Err() != nil && mark > 0 && walFileSize(s.dbPath+"-wal") >= mark {
+			if werr != nil && ctx.Err() == nil && waitCtx.Err() != nil && mark > 0 && s.observedWALFileSize(s.dbPath+"-wal") >= mark {
 				continue // recheck current identity/mark at the round boundary
 			}
 			if werr != nil {
@@ -1621,7 +1644,7 @@ func (s *Store) reclaimWALInLaneOpenGate(ctx context.Context, cfg walReclaimConf
 		if observer != nil {
 			observer("lane_post_copy_full_wait_end", epoch, older, werr)
 		}
-		if werr != nil && ctx.Err() == nil && waitCtx.Err() != nil && mark > 0 && walFileSize(s.dbPath+"-wal") >= mark {
+		if werr != nil && ctx.Err() == nil && waitCtx.Err() != nil && mark > 0 && s.observedWALFileSize(s.dbPath+"-wal") >= mark {
 			continue // a growing WAL now qualifies the existing completion class
 		}
 		if werr != nil {
@@ -1739,9 +1762,10 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 
 func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult, first, yieldsToLane bool, budget time.Duration) (done bool, err error) {
 	res.resetReaders = nil
-	if !res.urgent && s.writeWanted() {
+	if demand := s.writeDemandCause(); !res.urgent && demand != nil {
+		noteWALReclaimDemand(ctx, demand)
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
-		return false, errWALReclaimWriterWaiting
+		return false, demand
 	}
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
 	err = s.writeMu.LockContext(wctx)
@@ -1778,7 +1802,14 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 		yctx, stopYield = s.yieldToWriters(hctx)
 	}
 	defer stopYield()
-	yielded := func() bool { return errors.Is(context.Cause(yctx), errWALReclaimWriterWaiting) }
+	yielded := func() bool {
+		cause := context.Cause(yctx)
+		if !errors.Is(cause, errWALReclaimWriterWaiting) {
+			return false
+		}
+		noteWALReclaimDemand(ctx, cause)
+		return true
+	}
 	// Ordinary holds copy only a fitted small remainder. A positively witnessed
 	// adaptive copy is admitted by its remaining bounded time credit instead.
 	snap, ok := readWALIndexSnapshot(s.dbPath)
@@ -1887,7 +1918,7 @@ func (s *Store) watchWALMark(parent context.Context, walPath string, markBytes i
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if walFileSize(walPath) >= markBytes {
+				if s.observedWALFileSize(walPath) >= markBytes {
 					cancel()
 					return
 				}

@@ -159,7 +159,9 @@ func (s *Server) refreshCheckoutBatchGraph(ctx context.Context, state *batchTran
 						err = fmt.Errorf("checkout coordinator does not support atomic batch publication")
 					} else {
 						pin := handoffRequestView(ctx, viewmetrics.HandoffCheckoutRefresh)
+						lap := s.beginAcknowledgementLap(ctx, editAckTicketAdmission)
 						ticket, ticketErr := scheduler.EnqueueBatchRefresh(context.WithoutCancel(ctx), batchCheckoutFiles(receipt))
+						lap.finish()
 						err = ticketErr
 						if err == nil && (ticket == nil || ticket.Ticket == nil || ticket.CheckoutID != receipt.CheckoutID || ticket.Incarnation != receipt.Incarnation || !pathkey.EqualPaths(ticket.Root, receipt.CheckoutRoot)) {
 							err = fmt.Errorf("batch publication ticket does not belong to committed checkout")

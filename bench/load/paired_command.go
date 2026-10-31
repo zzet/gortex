@@ -55,6 +55,10 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 	}
 	switch o.Scenario {
 	case "read", "edit", "many", "many-edit", "worktrees", "sweep":
+	case editProbeScenario:
+		if len(builds) != 2 {
+			return o, nil, errors.New("paired edit-and-probe requires one baseline and one candidate")
+		}
 	default:
 		return o, nil, errors.New("paired supports workload scenarios; cold/restart/all use standalone runs")
 	}
@@ -108,6 +112,7 @@ func pairedCommand(ctx context.Context, args []string) error {
 			options := o
 			options.Binary = build.binary
 			options.pairedDriver = coordinator.driver(i)
+			options.editProbeBaseline = o.Scenario == editProbeScenario && i == 0
 			dir := filepath.Join(root, build.label)
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				coordinator.abort(err)

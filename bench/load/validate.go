@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 )
 
 // A bounded fixed-format check supplements decoding: absent fields are not
@@ -17,7 +18,12 @@ func requireFields(data []byte, prototype any) error {
 	}
 	t := reflect.TypeOf(prototype)
 	for i := range t.NumField() {
-		name := t.Field(i).Tag.Get("json")
+		field := t.Field(i)
+		tag := field.Tag.Get("json")
+		if field.PkgPath != "" || tag == "-" || strings.Contains(tag, ",omitempty") {
+			continue
+		}
+		name := strings.Split(tag, ",")[0]
 		if _, ok := fields[name]; !ok {
 			return fmt.Errorf("missing required %s field", name)
 		}
@@ -128,7 +134,7 @@ func validateReport(data []byte, r Report) error {
 		}
 		for _, tool := range []map[string]ToolMetrics{phase.Tools, phase.Probes} {
 			for name, row := range tool {
-				if name == "" || row.Successes < 0 || row.BusyRefusals < 0 || row.ProductExpired < 0 || row.PhaseCensored < 0 {
+				if name == "" || row.Successes < 0 || row.BusyRefusals < 0 || row.RetryableRefusals < 0 || row.HarnessIncomplete < 0 || row.ProductExpired < 0 || row.PhaseCensored < 0 {
 					return errors.New("invalid tool identity/count")
 				}
 				if err := validMetric(row.SuccessPerSec); err != nil {

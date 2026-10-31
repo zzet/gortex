@@ -158,8 +158,10 @@ func (s *Server) refreshCheckoutMutation(ctx context.Context, path string, state
 		// the generations this request read stay pinned for exactly as long as
 		// the detached publication is outstanding, cancellation tail included.
 		pin := handoffRequestView(ctx, viewmetrics.HandoffCheckoutRefresh)
-		record, interimKey := openMutationPhases(ctx, state.checkoutID, path)
+		record, interimKey := s.openMutationPhases(ctx, state.checkoutID, path)
+		admissionLap := s.beginAcknowledgementLap(ctx, editAckTicketAdmission)
 		ticket, err := scheduler.EnqueueRefresh(indexer.WithPublicationRecord(withCommittedWrite(context.WithoutCancel(ctx), state, path), record), path)
+		admissionLap.finish()
 		if err != nil {
 			failMutationPhases(record)
 			pin.release()

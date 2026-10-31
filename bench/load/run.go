@@ -14,27 +14,29 @@ import (
 )
 
 type runOptions struct {
-	Binary           string
-	Manifest         string
-	Scratch          string
-	Output           string
-	GitSHA           string
-	Profile          string
-	Host             string
-	Scenario         string
-	Agents           int
-	Editors          int
-	Worktrees        int
-	Seed             int64
-	Duration         time.Duration
-	Deadline         time.Duration
-	WarmTimeout      time.Duration
-	StopTimeout      time.Duration
-	CPUProfile       time.Duration
-	KeepState        bool
-	SweepRepetitions int
-	SweepBudget      time.Duration
-	pairedDriver     func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
+	Binary            string
+	Manifest          string
+	Scratch           string
+	Output            string
+	GitSHA            string
+	Profile           string
+	Host              string
+	Scenario          string
+	Agents            int
+	Editors           int
+	Worktrees         int
+	Seed              int64
+	Duration          time.Duration
+	Deadline          time.Duration
+	WarmTimeout       time.Duration
+	StopTimeout       time.Duration
+	CPUProfile        time.Duration
+	KeepState         bool
+	SweepRepetitions  int
+	SweepBudget       time.Duration
+	EditCount         int
+	editProbeBaseline bool
+	pairedDriver      func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
 }
 
 func parseRun(args []string) (runOptions, error) {
@@ -58,8 +60,8 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.StringVar(&o.GitSHA, "git-sha", "", "full binary revision if absent from Go build metadata")
 	f.StringVar(&o.Profile, "profile", "agent", "agent (default) or explicit saturation")
 	f.StringVar(&o.Host, "host", "native", "native, reference, or floor (validated, never provisioned)")
-	f.StringVar(&o.Scenario, "scenario", "read", "read, edit, many, many-edit, worktrees, cold, restart, sweep, all")
-	f.IntVar(&o.Agents, "agents", 4, "pure reading agents (may be 0 only for edit/many-edit)")
+	f.StringVar(&o.Scenario, "scenario", "read", "read, edit, many, many-edit, worktrees, cold, restart, sweep, edit-and-probe, all")
+	f.IntVar(&o.Agents, "agents", 4, "pure reading agents (may be 0 for edit, many-edit, or edit-and-probe)")
 	f.IntVar(&o.Editors, "edit-agents", 4, "combined editing/readback/reading agents in edit scenarios, in addition to pure readers")
 	f.IntVar(&o.Worktrees, "worktrees", 4, "linked worktrees in addition to primary")
 	f.Int64Var(&o.Seed, "seed", 1, "reproducible per-agent request/think plan seed")
@@ -71,6 +73,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.BoolVar(&o.KeepState, "keep-state", false, "retain private corpus/store for native diagnostics only (default removes completed scenario state)")
 	f.IntVar(&o.SweepRepetitions, "sweep-repetitions", 15, "samples per benchmark operation (smoke may explicitly use 1)")
 	f.DurationVar(&o.SweepBudget, "sweep-duration", 10*time.Minute, "separate total budget for the repeated paced sweep")
+	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
 }
 
 func validateRunOptions(o runOptions) error {
@@ -82,6 +85,9 @@ func validateRunOptions(o runOptions) error {
 	}
 	if _, err := parseProfile(o.Profile); err != nil {
 		return err
+	}
+	if o.Scenario == editProbeScenario && (o.Profile != "agent" || o.Agents != 0 || o.Editors != 1 || o.Worktrees != 0 || o.CPUProfile != 0 || o.EditCount != 1 && o.EditCount != 100) {
+		return errors.New("edit-and-probe initial cell requires --profile agent --agents 0 --edit-agents 1 --worktrees 0, no CPU profile, and --edit-count 100 (or explicit 1 diagnostic)")
 	}
 	if o.SweepRepetitions < 1 || o.SweepBudget <= 0 {
 		return errors.New("sweep repetitions and duration must be positive")
@@ -111,6 +117,9 @@ func validateRunOptions(o runOptions) error {
 
 func selectedScenarios(o runOptions) ([]string, error) {
 	all := []string{"read", "edit", "many", "many-edit", "worktrees", "cold", "restart", "sweep"}
+	if o.Scenario == editProbeScenario {
+		return []string{editProbeScenario}, nil
+	}
 	if o.Scenario == "all" {
 		if o.Host == "floor" {
 			return []string{"read", "edit", "worktrees", "cold", "restart", "sweep"}, nil
@@ -222,6 +231,15 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 		}
 		report.Workload.Operations = append(report.Workload.Operations, ops...)
 	}
+	if o.Scenario == editProbeScenario {
+		plan, err := makeEditProbePlan(corpora[0], o.Seed, o.EditCount)
+		if err != nil {
+			return report, err
+		}
+		report.Workload.EditProbe = &plan
+		report.Workload.Operations = editProbeOperations(plan, corpora[0])
+		report.Workload.SessionModel = plan.SessionModel
+	}
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees
 	report.Workload.DurationSec, report.Workload.DeadlineSec, report.Workload.Seed, report.Workload.Profile = o.Duration.Seconds(), o.Deadline.Seconds(), o.Seed, o.Profile
 	report.Workload.CPUProfileSec, report.Workload.WarmTimeoutSec, report.Workload.StopTimeoutSec, report.Workload.KeepState = o.CPUProfile.Seconds(), o.WarmTimeout.Seconds(), o.StopTimeout.Seconds(), o.KeepState
@@ -232,6 +250,18 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 	}
 	if o.Scenario == "all" {
 		report.Workload.SessionModel = "per_agent_load_and_per_operation_isolated_sweep"
+	}
+	if report.Workload.EditProbe != nil {
+		report.Workload.SessionModel = report.Workload.EditProbe.SessionModel
+		builds := 1
+		if o.pairedDriver != nil {
+			builds = 2
+		}
+		budget, err := report.Workload.EditProbe.budget(o.Deadline, builds)
+		if err != nil {
+			return report, err
+		}
+		report.Workload.DurationSec = budget.Seconds()
 	}
 	var err error
 	report.RequestPlan, err = hashJSON(report.Workload)

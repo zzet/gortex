@@ -50,9 +50,10 @@ type preparedExtraction struct {
 	// rawSHA256 is gitstate.BlobSHA256 of the bytes read, before the source
 	// transforms; set only for a build that proves its reads
 	// (Indexer.contentProof).
-	rawSHA256   string
-	parseLease  *parseAdmissionLease
-	releaseOnce sync.Once
+	rawSHA256         string
+	readRepairBlobSHA string
+	parseLease        *parseAdmissionLease
+	releaseOnce       sync.Once
 }
 
 // fileDeltaProbe exposes phase timings and the three delta boundaries used by
@@ -69,7 +70,8 @@ type fileDeltaProbe struct {
 	fingerprintTime        time.Duration
 	readVersion            fileReadVersion
 	// rawSHA256 is preparedExtraction.rawSHA256 of the probe's read.
-	rawSHA256 string
+	rawSHA256         string
+	readRepairBlobSHA string
 }
 
 // prepareFileDelta parses the current file once and caches that exact
@@ -89,6 +91,10 @@ func (idx *Indexer) prepareFileDelta(filePath string) (fileDeltaProbe, bool) {
 // chunk still waits, guaranteeing progress even when it is larger than the
 // entire budget (its weight is clamped to capacity).
 func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool) (fileDeltaProbe, bool, bool) {
+	return idx.prepareFileDeltaWithAdmissionObserved(filePath, tryOnly, nil)
+}
+
+func (idx *Indexer) prepareFileDeltaWithAdmissionObserved(filePath string, tryOnly bool, repair *ReadRepairObservation) (fileDeltaProbe, bool, bool) {
 	var probe fileDeltaProbe
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
@@ -150,6 +156,9 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 	if _, skip := idx.newContentAdmissionGate().skip(lang, int64(len(src))); skip {
 		return probe, false, false
 	}
+	if repair != nil && relPath == repair.path {
+		probe.readRepairBlobSHA = readRepairBlobSHA(src)
+	}
 	src = idx.transforms.run(relPath, src)
 
 	var pool *crashpool.Pool
@@ -200,14 +209,15 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 	// reach once the map slot is overwritten.
 	displaced := idx.prepared[absPath]
 	idx.prepared[absPath] = &preparedExtraction{
-		absPath:     absPath,
-		relPath:     relPath,
-		lang:        lang,
-		src:         append([]byte(nil), src...),
-		result:      result,
-		readVersion: readVersion,
-		rawSHA256:   probe.rawSHA256,
-		parseLease:  parseLease,
+		absPath:           absPath,
+		relPath:           relPath,
+		lang:              lang,
+		src:               append([]byte(nil), src...),
+		result:            result,
+		readVersion:       readVersion,
+		rawSHA256:         probe.rawSHA256,
+		readRepairBlobSHA: probe.readRepairBlobSHA,
+		parseLease:        parseLease,
 	}
 	idx.preparedMu.Unlock()
 	// Released outside the lock: release closes the tree through cgo and

@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -83,6 +84,7 @@ type repositoryMutationOutcome struct {
 type repositoryMutationWaiter struct {
 	generation uint64
 	done       chan repositoryMutationOutcome
+	readRepair *repositoryReadRepairRequest
 }
 
 // repositoryMutationCoordinator is the stable single mutation lane for one repository.
@@ -107,6 +109,7 @@ type repositoryMutationCoordinator struct {
 	// coordinators leave it nil; tests set it before admitting concurrent work.
 	batchAdmissionHook func()
 	executor           repositoryMutationExecutor
+	readRepairExecutor func([]string, *ReadRepairObservation) (*IndexResult, error)
 	// outputGeneration wraps ONE executed coalesced batch in an
 	// output-generation receipt. The coalescing lane, not the queuing caller,
 	// is the mutation entry point here: many callers merge into one execution,
@@ -127,6 +130,7 @@ type repositoryMutationCoordinator struct {
 	completedGeneration uint64
 	pending             repositoryMutationScope
 	waiters             []*repositoryMutationWaiter
+	readRepairPending   bool
 }
 
 func newRepositoryMutationCoordinator(executor repositoryMutationExecutor) *repositoryMutationCoordinator {
@@ -139,6 +143,14 @@ func (c *repositoryMutationCoordinator) reconcile(
 	ctx context.Context,
 	paths []string,
 ) (*IndexResult, error) {
+	return c.reconcileObserved(ctx, paths, nil)
+}
+
+func (c *repositoryMutationCoordinator) reconcileObserved(
+	ctx context.Context,
+	paths []string,
+	readRepair *repositoryReadRepairRequest,
+) (*IndexResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -146,6 +158,10 @@ func (c *repositoryMutationCoordinator) reconcile(
 		return nil, err
 	}
 	waiter := &repositoryMutationWaiter{done: make(chan repositoryMutationOutcome, 1)}
+	if readRepair != nil && readRepair.complete != nil {
+		request := *readRepair
+		waiter.readRepair = &request
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -158,6 +174,7 @@ func (c *repositoryMutationCoordinator) reconcile(
 	c.requestedGeneration++
 	waiter.generation = c.requestedGeneration
 	c.waiters = append(c.waiters, waiter)
+	c.readRepairPending = c.readRepairPending || waiter.readRepair != nil
 	if !c.running {
 		c.running = true
 		c.work.Add(1)
@@ -204,13 +221,40 @@ func (c *repositoryMutationCoordinator) drain() {
 		paths := c.pending.take()
 		waiters := c.waiters
 		c.waiters = nil
+		readRepairPending := c.readRepairPending
+		c.readRepairPending = false
 		executor := c.executor
+		readRepairExecutor := c.readRepairExecutor
 		outputGeneration := c.outputGeneration
 		authorityRequired := c.authorityRequired
 		c.mu.Unlock()
 
+		var observation *ReadRepairObservation
+		if readRepairPending {
+			observation = newRepositoryReadRepairObservation(generation, paths, waiters)
+		}
+		if observation != nil {
+			if readRepairExecutor != nil {
+				executor = func(paths []string) (*IndexResult, error) {
+					return readRepairExecutor(paths, observation)
+				}
+			}
+			observation.started = time.Now()
+			observation.beginPhaseAccounting()
+		}
 		outcome := executeRepositoryMutationUnderAuthority(
 			outputGeneration, authorityRequired, executor, paths)
+		if observation != nil {
+			observation.finished = time.Now()
+			observation.finishPhaseAccounting()
+			result := outcome.result
+			observation.executionSucceeded = outcome.err == nil && result != nil &&
+				!result.FullRetrack && len(result.FailedFiles) == 0 && len(result.Errors) == 0 &&
+				result.DeletedFileCount == 0 && result.QuarantinedFiles == 0 && result.SkippedFiles == 0
+			if !observation.executionSucceeded {
+				observation.acceptedBlobSHA = ""
+			}
+		}
 		c.lane <- struct{}{}
 		if batchMutationGate != nil {
 			batchMutationGate.RUnlock()
@@ -221,6 +265,7 @@ func (c *repositoryMutationCoordinator) drain() {
 			c.completedGeneration = generation
 		}
 		c.mu.Unlock()
+		completeRepositoryReadRepair(observation, waiters)
 		for _, waiter := range waiters {
 			waiter.done <- outcome
 		}
@@ -365,6 +410,10 @@ func (c *repositoryMutationCoordinator) runExclusiveMode(
 	// Batch admission precedes the repository lane. Otherwise a queued writer
 	// can acquire the batch gate while this call owns the lane, then wait for
 	// that lane itself — a gate/lane cycle that prevents either side advancing.
+	var batchAdmission canonicalAdmissionSpan
+	if batchMutationGate != nil || c.batchAdmissionHook != nil {
+		batchAdmission = PublicationStampsFrom(ctx).beginCanonicalAdmission(canonicalBatchAdmission)
+	}
 	if batchMutationGate != nil {
 		batchMutationGate.RLock()
 		defer batchMutationGate.RUnlock()
@@ -372,14 +421,17 @@ func (c *repositoryMutationCoordinator) runExclusiveMode(
 	if hook := c.batchAdmissionHook; hook != nil {
 		hook()
 	}
+	batchAdmission.end()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
+	laneTiming := beginCanonicalLaneWait(ctx)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-c.lane:
+		laneTiming.canonicalLaneAcquired()
 	}
 	defer func() { c.lane <- struct{}{} }()
 	if err := ctx.Err(); err != nil {
@@ -462,6 +514,11 @@ func (mi *MultiIndexer) repositoryMutationCoordinator(repoPrefix string) *reposi
 		coordinator = newRepositoryMutationCoordinator(func(paths []string) (*IndexResult, error) {
 			return mi.incrementalReindexRepoRaw(repoPrefix, paths)
 		})
+		coordinator.readRepairExecutor = func(paths []string, observation *ReadRepairObservation) (*IndexResult, error) {
+			return mi.incrementalReindexRepoRawMode(repoPrefix, paths, incrementalPathMode{
+				detectDeletions: true, readRepair: observation, publication: observation.collector,
+			})
+		}
 		// Attach before publishing the slot: every execution through this stable
 		// lane must participate in the owning MultiIndexer's batch transition.
 		coordinator.batchMutationGate = &mi.batchMutationGate
