@@ -198,6 +198,69 @@ func TestDenseIndexRepairBuildsFromTheRecordedDDL(t *testing.T) {
 	}
 }
 
+// TestDenseIndexRepairWaitsForAPinnedWriter: a repair that comes due while a
+// window pins the writer defers, as VACUUM does, instead of building under
+// that window, and builds on a later retry once the window has closed. A
+// generation window is the one that can open on the populated store a failed
+// seal leaves behind.
+func TestDenseIndexRepairWaitsForAPinnedWriter(t *testing.T) {
+	shortenDenseIndexRepairBackoff(t)
+	s, _ := openTempStore(t)
+	var full atomic.Bool
+	full.Store(true)
+	diskAvail := func(string) (uint64, error) {
+		if full.Load() {
+			return 0, nil
+		}
+		return 1 << 40, nil
+	}
+	s.denseRepairDiskAvail.Store(&diskAvail)
+	s.BeginBulkLoad()
+	if s.bulkConn == nil {
+		t.Fatal("bulk fast path did not engage")
+	}
+	s.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"})
+	injected := errors.New("injected seal failure")
+	restore := s.SetBulkSealHookForTest(func(index string) error {
+		if index == "nodes_by_kind" {
+			return injected
+		}
+		return nil
+	})
+	err := s.FlushBulk()
+	restore()
+	if !errors.Is(err, injected) {
+		t.Fatalf("FlushBulk error = %v, want the injected seal failure", err)
+	}
+	engaged, err := s.BeginGenerationBulkLoad(3)
+	if err != nil || !engaged {
+		t.Fatalf("BeginGenerationBulkLoad = (%v, %v), want engaged", engaged, err)
+	}
+
+	full.Store(false)
+	waitUntil(t, "two repair attempts under the pinned writer", func() bool { return s.denseIndexRepairAttempts.Load() >= 2 })
+	if got := s.denseIndexRepairs.Load(); got != 0 {
+		t.Fatalf("repairs under a pinned writer = %d, want 0", got)
+	}
+	if got := s.denseIndexesMissingNames(); !reflect.DeepEqual(got, []string{"nodes_by_kind"}) {
+		t.Fatalf("missing record under a pinned writer = %v, want [nodes_by_kind]", got)
+	}
+	if indexNames(t, s.db)["nodes_by_kind"] {
+		t.Fatal("nodes_by_kind was built under the pinned writer")
+	}
+
+	if err := s.EndGenerationBulkLoad(); err != nil {
+		t.Fatalf("EndGenerationBulkLoad: %v", err)
+	}
+	waitUntil(t, "the repair after the window closed", func() bool { return s.denseIndexRepairs.Load() == 1 })
+	if !indexNames(t, s.db)["nodes_by_kind"] {
+		t.Fatal("nodes_by_kind missing after the repair")
+	}
+	if got := s.denseIndexesMissingNames(); len(got) != 0 {
+		t.Fatalf("missing record after the repair = %v, want empty", got)
+	}
+}
+
 func waitUntil(t *testing.T, what string, done func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
