@@ -23,11 +23,12 @@ func stubIndexedPaths(t *testing.T, indexed ...string) {
 
 func TestEnrichBash_InlinePython(t *testing.T) {
 	const (
-		deny   = "deny"   // the Read deny
-		edit   = "edit"   // the shell-write advisory
-		maybe  = "maybe"  // the shell-write advisory, for a write it cannot name
-		silent = "silent" // nothing at all
-		allow  = "allow"  // no deny (another door may still advise)
+		deny    = "deny"    // the Read deny
+		edit    = "edit"    // the shell-write advisory
+		maybe   = "maybe"   // the shell-write advisory, for a write it cannot name
+		silent  = "silent"  // nothing at all
+		allow   = "allow"   // no deny (another door may still advise)
+		catDeny = "catDeny" // the shell read's own deny
 	)
 	for _, tc := range []struct {
 		name, cmd, want string
@@ -61,6 +62,10 @@ func TestEnrichBash_InlinePython(t *testing.T) {
 
 		// A Python edit after a shell read of a non-indexed path is still an edit.
 		{"python edit after a head", "head /tmp/other.go && python3 -c \"p='a.go'; s=open(p).read(); open(p,'w').write(s)\"", edit},
+
+		// The edit advisory never softens a deny the shell read earns itself.
+		{"python edit after a source cat", "cat b.go && python3 -c \"p='a.go'; s=open(p).read(); open(p,'w').write(s)\"", catDeny},
+		{"python edit before a source cat", "python3 -c \"p='a.go'; s=open(p).read(); open(p,'w').write(s)\" && cat b.go", catDeny},
 
 		// Everything else passes.
 		{"pure write", `python3 -c "open('a.go', \"w\").write('package a')"`, allow},
@@ -128,6 +133,10 @@ func TestEnrichBash_InlinePython(t *testing.T) {
 			case edit:
 				if r.deny || !strings.Contains(r.context, "Python script rewrites") {
 					t.Errorf("want the edit advisory, got %+v", r)
+				}
+			case catDeny:
+				if !r.deny || !strings.Contains(r.reason, "Bash `cat b.go` reads indexed source") {
+					t.Errorf("want the cat deny, got %+v", r)
 				}
 			case maybe:
 				if r.deny || !strings.Contains(r.context, "Python script may rewrite") {

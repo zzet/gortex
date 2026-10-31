@@ -1483,9 +1483,25 @@ func enrichBashWithProbe(toolInput map[string]any, cwd string, probe fileScopePr
 	// non-passthrough and skip the Python analysis, so `python3 -c "…"`
 	// chained after a `head` still answers. The analysis is self-limiting and
 	// silent for commands that carry no inline Python.
-	if result, answered := enrichBashScriptRead(cmd, cwd, probe); answered {
-		return result
+	//
+	// A Python deny answers at once. Anything softer (the edit advisory, a
+	// read-only or loading allowance) must not cost the command a deny its
+	// shell read earns on its own, so the shell answer is taken first when
+	// it denies.
+	py, pyAnswered := enrichBashScriptRead(cmd, cwd, probe)
+	if pyAnswered && (py.deny || c.Action == BashActionPassthrough) {
+		return py
 	}
+	shell := enrichBashShellRead(c, cwd, probe)
+	if shell.deny || !pyAnswered {
+		return shell
+	}
+	return py
+}
+
+// enrichBashShellRead answers the grep, find or source read a classified
+// Bash command leads with.
+func enrichBashShellRead(c BashClassification, cwd string, probe fileScopeProbe) enrichResult {
 	switch c.Action {
 	case BashActionGrepLike:
 		return probeSymbolPattern("Bash", c.Pattern, cwd, defaultGrepGuidance())
