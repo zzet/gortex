@@ -13,29 +13,11 @@ import (
 
 var _ graph.FilteredBFSAdmissionReader = (*Store)(nil)
 
-func bfsAdmissionColumns(dir graph.Direction) (anchor, next, index, neighbor string) {
+func bfsAdmissionColumns(dir graph.Direction) (anchor, next, index string) {
 	if dir == graph.DirectionBackward {
-		return "to_id", "from_id", "edges_by_to", "source"
+		return "to_id", "from_id", "edges_by_to"
 	}
-	return "from_id", "to_id", "edges_by_from", "target"
-}
-
-func bfsAdmissionJoins(dir graph.Direction, needNeighbor, inner bool, filter graph.OutlineEdgeFilter) string {
-	_, _, _, neighbor := bfsAdmissionColumns(dir)
-	var out string
-	for _, end := range []struct{ alias, column string }{{"source", "from_id"}, {"target", "to_id"}} {
-		if end.alias != neighbor || !needNeighbor {
-			if len(filter.ExcludeNodeKinds) == 0 {
-				continue
-			}
-		}
-		join := " LEFT JOIN "
-		if end.alias == neighbor && needNeighbor && inner {
-			join = " JOIN "
-		}
-		out += join + `nodes ` + end.alias + ` ON ` + end.alias + `.id = e.` + end.column + ` AND ` + end.alias + `.view_gen = e.view_gen`
-	}
-	return out
+	return "from_id", "to_id", "edges_by_from"
 }
 
 // A missing far-end node must remain a missing identity, while its edge still
@@ -58,57 +40,114 @@ func bfsAdmissionNeighborColumns(alias string) string {
 	return strings.Join(columns, ", ")
 }
 
+// bfsAdmissionQuery walks, counts and hydrates one neighborhood. Every
+// far-end test is a covering-index probe: a WITHOUT ROWID index entry ends in
+// the node id, so a probe never reads the wide nodes row, whose payload can
+// spill to overflow pages. hydrated is the only full-row read, one seek per
+// distinct walked node.
 func bfsAdmissionQuery(generation int64, request graph.BFSAdmissionRequest, filter graph.OutlineEdgeFilter) outlineQuery {
 	states, edges, _ := graph.BFSAdmissionBudgets(request)
-	anchor, next, index, neighbor := bfsAdmissionColumns(request.Direction)
+	anchor, next, index := bfsAdmissionColumns(request.Direction)
 	kindJSON, _ := json.Marshal(request.Kinds)
 	kindPredicate := `e.kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))`
-	scope, scopeArgs := outlineScopePredicate(request.Scope, neighbor)
-	mask, maskArgs := outlineEdgePredicate(filter, "source", "target")
+	limit := strconv.Itoa(request.Limit)
+	var q strings.Builder
+	var args []any
+	add := func(fragment string, values ...any) {
+		q.WriteString(fragment)
+		args = append(args, values...)
+	}
+	// The seed's kind is checked once in the base case; every other anchor
+	// passed the same probe as a walked neighbor. Edge-local terms need no
+	// node row at all.
+	unmasked := func(string, ...any) {}
+	if len(filter.ExcludeNodeKinds) > 0 {
+		masked, _ := json.Marshal(filter.ExcludeNodeKinds)
+		unmasked = func(id string, idArgs ...any) {
+			add(` AND NOT EXISTS (SELECT 1 FROM nodes AS n INDEXED BY nodes_by_kind
+			WHERE n.kind IN (SELECT CAST(value AS TEXT) FROM json_each(?)) AND n.view_gen = ? AND n.id = `+id+`)`,
+				append([]any{string(masked), generation}, idArgs...)...)
+		}
+	}
+	present := func(id string) {
+		add(`EXISTS (SELECT 1 FROM nodes AS n INDEXED BY nodes_by_generation WHERE n.view_gen = ? AND n.id = `+id+`)`, generation)
+	}
+	// Only the repository narrow gates the walk. Go admit checks workspace and
+	// project scope on every neighbor it reads, before recording its edge.
+	inScope := present
+	if len(request.Scope.RepoAllow) > 0 {
+		repos := outlineReposJSON(request.Scope)
+		inScope = func(id string) {
+			add(`EXISTS (SELECT 1 FROM nodes AS n INDEXED BY nodes_by_repo
+			WHERE n.repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?)) AND n.view_gen = ? AND n.id = `+id+`)`, repos, generation)
+		}
+	}
+	edgeMask, edgeMaskArgs := outlineEdgePredicate(graph.OutlineEdgeFilter{ExcludeKinds: filter.ExcludeKinds, ExcludeNodeIDs: filter.ExcludeNodeIDs}, "", "")
 	via, viaArgs := outlineViaPredicate(filter.ExcludeVia)
 	structural := strings.NewReplacer("kind", "e.kind", "to_id", "e.to_id").Replace(structuralTargetInvalidSQL)
-	visible := ` AND NOT ` + structural + mask + via
+	visible := func() {
+		add(` AND NOT `+structural+edgeMask+via, append(append([]any(nil), edgeMaskArgs...), viaArgs...)...)
+	}
 	// Reject neighbors before adding recursive states, exactly as Go admit.
-	// Unresolved edges remain in final adjacency for boundary reconstruction;
-	// resolved foreign neighbors are omitted there with the same scope rule.
+	// Unresolved edges remain in final adjacency for boundary reconstruction.
 	resolved := `e.` + next + ` NOT GLOB 'unresolved::*' AND instr(e.` + next + `, '::unresolved::') = 0 AND e.` + next + ` NOT GLOB 'external::*'`
-	q := `WITH RECURSIVE walk(id, depth) AS (
-		SELECT ?, 0
+
+	// A seed reached again adds no shorter path, only repeated states.
+	add(`WITH RECURSIVE walk(id, depth) AS (
+		SELECT ?, 0 WHERE 1`, request.Seed)
+	unmasked(`?`, request.Seed)
+	add(`
 		UNION
-		SELECT e.` + next + `, b.depth + 1 FROM walk b
-		CROSS JOIN edges e INDEXED BY ` + index + ` ON e.view_gen = ? AND e.` + anchor + ` = b.id AND ` + kindPredicate +
-		bfsAdmissionJoins(request.Direction, true, true, filter) + `
-		WHERE b.depth < ? AND ` + resolved + ` AND ` + scope + visible + `
-		LIMIT ` + strconv.Itoa(states+1) + `),
-		expanded AS MATERIALIZED (SELECT id FROM walk GROUP BY id HAVING MIN(depth) < ` + strconv.Itoa(request.Depth) + `),
-		counts AS MATERIALIZED (SELECT a.id,
-		(SELECT COUNT(*) FROM (SELECT 1 FROM edges e INDEXED BY ` + index +
-		bfsAdmissionJoins(request.Direction, false, false, filter) + `
-		WHERE e.view_gen = ? AND e.` + anchor + ` = a.id` + visible + ` LIMIT ` + strconv.Itoa(request.Limit) + `)) AS n
-		FROM expanded a)
-		SELECT (SELECT COUNT(*) FROM walk) > ` + strconv.Itoa(states) + `, e.id, counts.n, ` + lookupQualifiedEdgeCols + `, ` + bfsAdmissionNeighborColumns(neighbor) + `
-		FROM counts CROSS JOIN edges e INDEXED BY ` + index + ` ON e.view_gen = ? AND e.` + anchor + ` = counts.id AND ` + kindPredicate +
-		bfsAdmissionJoins(request.Direction, true, false, filter) + ` WHERE 1` + visible +
-		` AND (` + neighbor + `.id IS NULL OR NOT (` + resolved + `) OR (` + scope + `)) LIMIT ` + strconv.Itoa(edges+1)
-	args := []any{request.Seed, generation, string(kindJSON), request.Depth}
-	args = append(args, scopeArgs...)
-	args = append(args, maskArgs...)
-	args = append(args, viaArgs...)
-	args = append(args, generation)
-	args = append(args, maskArgs...)
-	args = append(args, viaArgs...)
-	args = append(args, generation, string(kindJSON))
-	args = append(args, maskArgs...)
-	args = append(args, viaArgs...)
-	args = append(args, scopeArgs...)
-	return outlineQuery{sql: q, args: args}
+		SELECT e.`+next+`, b.depth + 1 FROM walk AS b
+		CROSS JOIN edges AS e INDEXED BY `+index+` ON e.view_gen = ? AND e.`+anchor+` = b.id AND `+kindPredicate+`
+		WHERE b.depth < ? AND e.`+next+` <> ? AND `+resolved, generation, string(kindJSON), request.Depth, request.Seed)
+	visible()
+	add(` AND `)
+	inScope(`e.` + next)
+	unmasked(`e.` + next)
+	// room is the cap left after every walked identity. No admission over
+	// this snapshot holds more nodes, so a count below room cannot reach the
+	// engine's sort threshold whichever upper bound reports it.
+	add(`
+		LIMIT `+strconv.Itoa(states+1)+`),
+		ids AS MATERIALIZED (SELECT id, MIN(depth) AS depth FROM walk GROUP BY id),
+		ok AS MATERIALIZED (SELECT (SELECT COUNT(*) FROM walk) <= `+strconv.Itoa(states)+` AS fits, `+limit+` - COUNT(*) AS room FROM ids),
+		hydrated AS MATERIALIZED (SELECT `+qualifiedNodeColumns("n", lookupNodeCols)+`
+		FROM ok CROSS JOIN ids AS i CROSS JOIN nodes AS n ON n.id = i.id AND n.view_gen = ?
+		WHERE ok.fits AND i.id <> ?),
+		raw AS MATERIALIZED (SELECT i.id, (SELECT COUNT(*) FROM (SELECT 1 FROM edges AS e INDEXED BY `+index+`
+		WHERE e.view_gen = ? AND e.`+anchor+` = i.id LIMIT `+limit+`)) AS n
+		FROM ids AS i WHERE i.depth < `+strconv.Itoa(request.Depth)+`),
+		totals AS MATERIALIZED (SELECT r.id, CASE WHEN NOT ok.fits OR r.n < ok.room THEN r.n
+		ELSE (SELECT COUNT(*) FROM (SELECT 1 FROM edges AS e INDEXED BY `+index+`
+		WHERE e.view_gen = ? AND e.`+anchor+` = r.id`, generation, request.Seed, generation, generation)
+	visible()
+	unmasked(`e.` + next)
+	// A row survives when its far end was walked, is the seed, is an unmasked
+	// unresolved boundary, or is missing; a resolved node outside the narrow
+	// or with a masked kind is dropped. Overflow keeps rows for the sentinel.
+	add(` LIMIT `+limit+`)) END AS n
+		FROM ok CROSS JOIN raw AS r)
+		SELECT NOT ok.fits, e.id, t.n, `+lookupQualifiedEdgeCols+`, `+bfsAdmissionNeighborColumns("h")+`
+		FROM ok CROSS JOIN totals AS t CROSS JOIN edges AS e INDEXED BY `+index+` ON e.view_gen = ? AND e.`+anchor+` = t.id AND `+kindPredicate+`
+		LEFT JOIN hydrated AS h ON h.id = e.`+next+`
+		WHERE 1`, generation, string(kindJSON))
+	visible()
+	add(` AND (NOT ok.fits OR h.id IS NOT NULL OR e.`+next+` = ? OR (NOT (`+resolved+`)`, request.Seed)
+	unmasked(`e.` + next)
+	add(`) OR NOT `)
+	present(`e.` + next)
+	add(`) LIMIT ` + strconv.Itoa(edges+1))
+	return outlineQuery{sql: q.String(), args: args}
 }
 
 // BFSAdmissionFilteredContext reads an indexed neighborhood in one statement,
 // preserving Go's admission rather than substituting a discovery-hop-only
-// graph. Scope gates recursive neighbors; state/edge sentinels decline broad
-// projections. Counts saturate at the caller's cap, which is sufficient for
-// Go's exact pre-cap sort decision and bounds otherwise irrelevant counting.
+// graph. The repository narrow gates recursive neighbors and Go admit applies
+// the workspace and project scope; state/edge sentinels decline broad
+// projections. A count that could reach Go's pre-cap sort threshold is exact
+// and saturates at the caller's cap; below it, the raw adjacency size decides
+// that sort the same way without reading edge rows.
 func (s *Store) BFSAdmissionFilteredContext(ctx context.Context, request graph.BFSAdmissionRequest, filter graph.OutlineEdgeFilter) (graph.BFSAdmissionSnapshot, bool, error) {
 	ctx = liveNameContext(ctx)
 	if err := ctx.Err(); err != nil {

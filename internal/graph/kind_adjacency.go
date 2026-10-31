@@ -4,7 +4,9 @@ import "context"
 
 // KindAdjacency retains full edge payloads for the requested kinds and the
 // size of the reader's complete adjacency. Total lets capped walkers keep
-// their existing decision to sort before admission.
+// their existing decision to sort before admission. A BFS admission snapshot
+// may report a bounded upper bound instead, only where it cannot change that
+// decision; see BFSAdmissionSnapshot.
 type KindAdjacency struct {
 	Edges []*Edge
 	Total int
