@@ -233,6 +233,27 @@ func lockContext(ctx context.Context, mu *sync.Mutex) bool {
 	return true
 }
 
+// detachedNodeReader is a store whose reads stay consistent without its
+// ResolveMutex, so a lookup does not wait behind a resolver or enrichment pass
+// that holds it.
+type detachedNodeReader interface {
+	NodeReadsDetached() bool
+}
+
+// lockResolve takes g's ResolveMutex for a read, unless g's reads are detached
+// from it. A record write always takes the mutex: it rewrites whole node rows
+// that a pass holding the mutex may be rewriting too.
+func lockResolve(ctx context.Context, g graph.Store) (unlock func(), ok bool) {
+	if detached, isDetached := g.(detachedNodeReader); isDetached && detached.NodeReadsDetached() {
+		return func() {}, true
+	}
+	mu := g.ResolveMutex()
+	if !lockContext(ctx, mu) {
+		return nil, false
+	}
+	return mu.Unlock, true
+}
+
 // viewGenerationPinned is implemented by a store handle bound to one payload
 // view generation. A handle that does not report one reads and writes the base
 // corpus.
@@ -338,13 +359,13 @@ func BuildIndexCtx(ctx context.Context, g graph.Store) *Stats {
 	if !ok {
 		return &Stats{}
 	}
-	mu := g.ResolveMutex()
-	if !lockContext(ctx, mu) {
+	unlock, ok := lockResolve(ctx, g)
+	if !ok {
 		releaseTopology()
 		return &Stats{}
 	}
 	build := atomic.LoadUint64(&buildCounter)
-	mu.Unlock()
+	unlock()
 	releaseTopology()
 	stats := &Stats{Build: build}
 
@@ -385,6 +406,7 @@ func BuildIndexCtx(ctx context.Context, g graph.Store) *Stats {
 	}
 	batchCap := min(seedTotal, reachPublishBatchSize)
 	pending := make([]pendingRecord, 0, batchCap)
+	mu := g.ResolveMutex()
 	publish := func() bool {
 		if len(pending) == 0 {
 			return true
@@ -782,8 +804,8 @@ func LookupCached(g graph.Store, seedID string) (d1, d2, d3 []Entry, hit, trunca
 	if !ok {
 		return nil, nil, nil, false, true
 	}
-	mu := g.ResolveMutex()
-	if !lockContext(ctx, mu) {
+	unlock, ok := lockResolve(ctx, g)
+	if !ok {
 		releaseTopology()
 		return nil, nil, nil, false, true
 	}
@@ -793,7 +815,7 @@ func LookupCached(g graph.Store, seedID string) (d1, d2, d3 []Entry, hit, trunca
 		d1, d2, d3, truncated, hit = readCached(n, build)
 	}
 	stable := build == atomic.LoadUint64(&buildCounter)
-	mu.Unlock()
+	unlock()
 	releaseTopology()
 	if !stable {
 		return nil, nil, nil, false, true
@@ -852,20 +874,20 @@ func lookupContext(parent context.Context, g graph.Store, seedID string, keep Ed
 		if !ok {
 			return nil, nil, nil, false, true
 		}
-		mu := g.ResolveMutex()
-		if !lockContext(ctx, mu) {
+		unlock, ok := lockResolve(ctx, g)
+		if !ok {
 			releaseTopology()
 			return nil, nil, nil, false, true
 		}
 		currentBuild := atomic.LoadUint64(&buildCounter)
 		n, nodeErr := getNodeContext(ctx, g, seedID)
 		if nodeErr != nil {
-			mu.Unlock()
+			unlock()
 			releaseTopology()
 			return nil, nil, nil, true, true
 		}
 		if n == nil || !ImpactSeedKind(n.Kind) {
-			mu.Unlock()
+			unlock()
 			releaseTopology()
 			return nil, nil, nil, false, false
 		}
@@ -873,12 +895,12 @@ func lookupContext(parent context.Context, g graph.Store, seedID string, keep Ed
 		// lookup always computes.
 		if keep == nil {
 			if d1, d2, d3, cachedTruncated, cached := readCached(n, currentBuild); cached && currentBuild == atomic.LoadUint64(&buildCounter) {
-				mu.Unlock()
+				unlock()
 				releaseTopology()
 				return d1, d2, d3, true, cachedTruncated
 			}
 		}
-		mu.Unlock()
+		unlock()
 		releaseTopology()
 
 		// The expensive portion is optimistic and lock-free with respect to
