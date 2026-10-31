@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
@@ -70,6 +71,11 @@ func installDaemonContractAnalysisWith(state *daemonState, logger *zap.Logger, a
 	captureOptions.SuspectStuck = func(repo string, paths []string) { repair.Load().Suspect(repo, paths) }
 	options := indexer.ContractAnalysisCoordinatorOptions{MemoryLimitBytes: debug.SetMemoryLimit(-1), RequireRepoConfigs: true, Store: store, Leases: materializer.Leases, Registry: state.indexer.Registry(), Config: cfg, Logger: logger, Capture: indexer.NewContractFollowupSourceCapture(captureOptions), Inputs: indexer.NewContractPrimaryInputCapture(materializer), LinkedInputs: indexer.NewContractLinkedInputCapture(materializer), ReconcileBaseline: indexer.NewContractBaselineReconciler(captureOptions), Yield: contractAnalysisYield(state.mcpServer.ContractAnalysisShouldYield)}
 	options.RetireReservation = state.lifecycle.DeferContractReservationRetirement
+	// Linked worktrees' fills follow the configured policy; the demand
+	// signal is the same foreground work the shared yield gives way to.
+	linked := contractLinkedSchedule(state.contractAnalysis, os.Getenv, logger)
+	options.LinkedPolicy, options.LinkedIdleWindow, options.LinkedThrottleInterval = linked.Policy, linked.IdleWindow, linked.ThrottleInterval
+	options.Demand = state.mcpServer.ContractAnalysisShouldYield
 	if adjust != nil {
 		adjust(&options)
 	}
@@ -106,8 +112,24 @@ func installDaemonContractAnalysisWith(state *daemonState, logger *zap.Logger, a
 // contractAnalysisYield gives active ordinary tools and edits priority without
 // holding a core build lane. The producer gets a bounded progress opportunity
 // after sustained demand; strict contract waiters are excluded by the server.
+// It paces captures, primary jobs and linked jobs outside the idle policy; a
+// linked job under the idle policy parks with no progress slice instead.
 func contractAnalysisYield(shouldYield func() bool) func(context.Context) error {
 	return indexer.ContractAnalysisYield(shouldYield)
+}
+
+// contractLinkedSchedule resolves the linked-worktree contract policy from
+// the daemon config's contract_analysis block and the environment. A
+// setting that does not parse is logged and keeps its default: a typo must
+// not stop the daemon.
+func contractLinkedSchedule(cfg config.ContractAnalysisConfig, getenv func(string) string, logger *zap.Logger) indexer.ContractLinkedSchedule {
+	schedule, err := indexer.ResolveContractLinkedSchedule(cfg, getenv)
+	if err != nil {
+		logger.Warn("contract analysis linked policy setting ignored", zap.Error(err))
+	}
+	logger.Info("contract analysis linked policy", zap.String("policy", string(schedule.Policy)),
+		zap.Duration("idle_window", schedule.IdleWindow), zap.Duration("throttle_interval", schedule.ThrottleInterval))
+	return schedule
 }
 
 // Cancel revokes all contract producers before any owner is joined.

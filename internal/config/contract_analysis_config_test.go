@@ -36,3 +36,14 @@ contract_analysis:
 	assert.Equal(t, ContractAnalysisConfig{}, unset.ContractAnalysis, "an absent block leaves the shipped policy to its consumer")
 	assert.Equal(t, ContractAnalysisConfig{}, Default().ContractAnalysis)
 }
+
+// TestContractAnalysisBlockLoadsFromDaemonConfig: the daemon reads the block
+// through Load, from the same file as its views block.
+func TestContractAnalysisBlockLoadsFromDaemonConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".gortex.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("views:\n  retain_inactive: 24h\ncontract_analysis:\n  linked_policy: eager\n  linked_idle_window: 2s\n"), 0o644))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "24h", cfg.Views.RetainInactive)
+	assert.Equal(t, ContractAnalysisConfig{LinkedPolicy: "eager", LinkedIdleWindow: "2s"}, cfg.ContractAnalysis)
+}
