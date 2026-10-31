@@ -128,6 +128,7 @@ type (
 func contractCoreCapabilityTable() []contractCoreCapRow {
 	rows := []contractCoreCapRow{
 		// Kept by the wrapper itself.
+		{"KindAdjacencyReader", capOf[graph.KindAdjacencyReader], capWrapper, "typed adjacency retains the selected edge mask and full visible row count"},
 		{"Reader", capOf[graph.Reader], capWrapper, "adjacency filtered, node reads promoted"},
 		{"NodeGetter", capOf[graph.NodeGetter], capWrapper, "node reads promoted"},
 		{"BoundaryReader", capOf[graph.BoundaryReader], capWrapper, "satisfied by the filtered Reader methods"},
@@ -169,6 +170,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"FileEditingContext", capOf[graph.FileEditingContext], capFiltered, "the store reads raw imports and calls"},
 
 		// Deliberate drops.
+		{"FilteredKindAdjacencyReader", capOf[graph.FilteredKindAdjacencyReader], capDropped, "private typed adjacency adapter supplies this wrapper's exact exclusions"},
 		{"BFSCapable", capOf[graph.BFSCapable], capDropped, capReasonTraversal},
 		{"FrontierExpander", capOf[graph.FrontierExpander], capDropped, capReasonTraversal},
 		{"ReachableForwardByKinds", capOf[graph.ReachableForwardByKinds], capDropped, capReasonTraversal},

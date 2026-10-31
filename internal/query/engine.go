@@ -1660,13 +1660,31 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 		} else {
 			for _, cur := range frontier {
 				var edges []*graph.Edge
-				switch {
-				case bidir:
+				edgeTotal := 0
+				if bidir {
 					edges = append(e.g.GetOutEdges(cur), e.g.GetInEdges(cur)...)
-				case forward:
-					edges = e.g.GetOutEdges(cur)
-				default:
-					edges = e.g.GetInEdges(cur)
+					edgeTotal = len(edges)
+				} else {
+					dir := graph.DirectionForward
+					if !forward {
+						dir = graph.DirectionBackward
+					}
+					adjacency, err := graph.ReadKindAdjacency(walkCtx, e.g, cur, dir, edgeKinds)
+					if walkDone(walkCtx) {
+						return &SubGraph{}
+					}
+					if err != nil {
+						// An unavailable optional read retains the ordinary selected
+						// reader's oracle; never fall through after cancellation.
+						if forward {
+							edges = e.g.GetOutEdges(cur)
+						} else {
+							edges = e.g.GetInEdges(cur)
+						}
+						edgeTotal = len(edges)
+					} else {
+						edges, edgeTotal = adjacency.Edges, adjacency.Total
+					}
 				}
 				// One deterministic admission order before the cap: the
 				// backends hand back raw edges in storage order (insertion
@@ -1682,7 +1700,7 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 				// the batched expander and BFSCapable fast paths keep
 				// their own store order. The backends return fresh
 				// slices, so the in-place sort is safe.
-				if opts.Limit > 0 && len(allNodes)+len(edges) >= opts.Limit {
+				if opts.Limit > 0 && len(allNodes)+edgeTotal >= opts.Limit {
 					SortEdgesForPage(edges)
 				}
 				for _, edge := range edges {
