@@ -299,6 +299,10 @@ func edgeRows(byID map[string][]*graph.Edge) int {
 // requireScopedReadsStayFlat runs one scoped request before and after
 // unrelated repositories are added, and requires the same response, no
 // whole-store read, and the same rows from every counted read.
+//
+// The rows are those a read returns to Go. Rows a statement visits and
+// rejects inside SQLite are not counted, so a flat count bounds the decoded
+// and returned work, not what each statement costs.
 func requireScopedReadsStayFlat(t *testing.T, counter *scopedReadCounter, addUnrelated func(), request func() string) {
 	t.Helper()
 	counter.reset()
