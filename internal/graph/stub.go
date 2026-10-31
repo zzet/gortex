@@ -73,11 +73,9 @@ func IsStub(id string) bool {
 // We match by looking for one of the known kind segments
 // anywhere in the first two "::"-separated positions.
 func StubKind(id string) string {
-	for _, k := range stubKinds {
-		// Without repo prefix: "<kind>::..."
-		if strings.HasPrefix(id, k+"::") {
-			return k
-		}
+	// Without repo prefix: "<kind>::..."
+	if k := stubKindSegment(id); k != "" {
+		return k
 	}
 	// With repo prefix: "<repo>::<kind>::..."
 	// Find the second "::" segment.
@@ -85,23 +83,27 @@ func StubKind(id string) string {
 	if first < 0 {
 		return ""
 	}
-	rest := id[first+2:]
-	for _, k := range stubKinds {
-		if strings.HasPrefix(rest, k+"::") {
-			return k
-		}
-	}
-	return ""
+	return stubKindSegment(id[first+2:])
 }
 
-// stubKinds is the closed set of stub categories. Ordered by
-// expected frequency so the lookup loop bails early in the
-// common case.
-var stubKinds = []string{
-	StubKindStdlib,
-	StubKindExternalCall,
-	StubKindBuiltin,
-	StubKindModule,
+// stubKindSegment returns the stub kind s starts with as a whole
+// "<kind>::" segment, or "" if it starts with none. The resolver runs
+// IsStub on every name-lookup candidate, so each "<kind>::" is a
+// constant expression rather than a per-call k+"::" concatenation.
+// Cases are ordered by expected frequency so the common case bails
+// early.
+func stubKindSegment(s string) string {
+	switch {
+	case strings.HasPrefix(s, StubKindStdlib+"::"):
+		return StubKindStdlib
+	case strings.HasPrefix(s, StubKindExternalCall+"::"):
+		return StubKindExternalCall
+	case strings.HasPrefix(s, StubKindBuiltin+"::"):
+		return StubKindBuiltin
+	case strings.HasPrefix(s, StubKindModule+"::"):
+		return StubKindModule
+	}
+	return ""
 }
 
 // IsStdlibStub etc are convenience predicates that don't make
