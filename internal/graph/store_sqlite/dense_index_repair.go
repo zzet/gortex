@@ -173,9 +173,14 @@ func (s *Store) runDenseIndexRepair(ctx context.Context) {
 // denseIndexRepairSpace reports the free space on the store's volume, the
 // amount an attempt needs, and whether the attempt may run. An unreadable
 // free-space figure is a skip: the gate exists for the full volume, which is
-// exactly where a probe may fail too.
+// exactly where a probe may fail too. So is an unreadable store size
+// (CompactStats reads 0, 0 when its PRAGMAs fail), which would otherwise
+// shrink the need to the floor whatever the store's real size.
 func (s *Store) denseIndexRepairSpace() (avail, need int64, ok bool) {
 	free, total := s.CompactStats()
+	if total <= 0 {
+		return -1, -1, false
+	}
 	need = max(total-free, denseIndexRepairMinFreeBytes)
 	probe := platform.DiskAvailBytes
 	if override := s.denseRepairDiskAvail.Load(); override != nil && *override != nil {

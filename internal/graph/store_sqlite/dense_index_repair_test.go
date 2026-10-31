@@ -2,7 +2,9 @@ package store_sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -202,6 +204,30 @@ func TestDenseIndexRepairBuildsFromTheRecordedDDL(t *testing.T) {
 	}
 	if got := s.denseIndexesMissingNames(); !reflect.DeepEqual(got, []string{"forced_bad_index"}) {
 		t.Fatalf("missing record = %v, want [forced_bad_index]", got)
+	}
+}
+
+// TestDenseIndexRepairSkipsWithoutTheStoreSize: an attempt is sized by the
+// store's own used bytes, and CompactStats reads 0, 0 when it cannot read
+// them. That must skip the attempt, as an unreadable free-space figure does,
+// not shrink the need to the floor and let a large store rebuild on a volume
+// that is nearly full.
+func TestDenseIndexRepairSkipsWithoutTheStoreSize(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s := &Store{storeCore: &storeCore{db: db, dbPath: filepath.Join(t.TempDir(), "store.sqlite")}}
+	diskAvail := func(string) (uint64, error) { return 1 << 40, nil }
+	s.denseRepairDiskAvail.Store(&diskAvail)
+	if _, total := s.CompactStats(); total != 0 {
+		t.Fatalf("CompactStats total = %d on a closed pool, want 0", total)
+	}
+	if avail, need, ok := s.denseIndexRepairSpace(); ok {
+		t.Fatalf("attempt allowed with the store size unreadable: avail=%d need=%d", avail, need)
 	}
 }
 
