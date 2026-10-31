@@ -13,7 +13,9 @@ import (
 
 // The narrowed read returns exactly the rows of the ordinary incoming read
 // whose source node is in one of the repositories, in the same order, with
-// or without the indexes a bulk load drops.
+// or without the indexes a bulk load drops. A derived generation owns the
+// same callers under other repositories, so each handle must judge a source
+// by its own generation's node.
 func TestRepoScopedInEdgesMatchFilteredInEdges(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "in-edges.sqlite"))
 	require.NoError(t, err)
@@ -36,12 +38,25 @@ func TestRepoScopedInEdgesMatchFilteredInEdges(t *testing.T) {
 		&graph.Edge{From: "b/svc/worker.go::Run", To: "a/svc/worker.go::Run", Kind: graph.EdgeCalls, FilePath: "b/svc/worker.go", Line: 9},
 	)
 	require.NoError(t, s.AddBatchChecked(nodes, edges))
+	// Generation 1 keeps every call site but swaps the a and b callers'
+	// repositories and has no node for the c caller.
+	derived := s.AtGeneration(1)
+	owner := map[string]string{"a": "b", "b": "a", "": ""}
+	var moved []*graph.Node
+	for _, n := range nodes {
+		if repo, ok := owner[n.RepoPrefix]; ok {
+			copied := *n
+			copied.RepoPrefix = repo
+			moved = append(moved, &copied)
+		}
+	}
+	require.NoError(t, derived.AddBatchChecked(moved, edges))
 	ids := []string{bare, member, "a/svc/worker.go::Run", "absent"}
-	want := func(repos []string) map[string][]*graph.Edge {
+	want := func(h *Store, repos []string) map[string][]*graph.Edge {
 		out := make(map[string][]*graph.Edge)
-		for to, rows := range s.GetInEdgesByNodeIDs(ids) {
+		for to, rows := range h.GetInEdgesByNodeIDs(ids) {
 			for _, edge := range rows {
-				if source := s.GetNode(edge.From); source != nil && slices.Contains(repos, source.RepoPrefix) {
+				if source := h.GetNode(edge.From); source != nil && slices.Contains(repos, source.RepoPrefix) {
 					out[to] = append(out[to], edge)
 				}
 			}
@@ -49,15 +64,19 @@ func TestRepoScopedInEdgesMatchFilteredInEdges(t *testing.T) {
 		return out
 	}
 	check := func() {
-		for _, repos := range [][]string{{""}, {"", "a"}, {"", "a", "b"}, {"c"}, {"missing"}} {
-			got, handled, err := s.GetInEdgesByNodeIDsFromRepos(ids, repos)
-			require.NoError(t, err)
-			require.True(t, handled)
-			require.Equal(t, want(repos), got, "repos=%v", repos)
+		for _, h := range []*Store{s, derived} {
+			for _, repos := range [][]string{{""}, {"", "a"}, {"", "a", "b"}, {"c"}, {"missing"}} {
+				got, handled, err := h.GetInEdgesByNodeIDsFromRepos(ids, repos)
+				require.NoError(t, err)
+				require.True(t, handled)
+				require.Equal(t, want(h, repos), got, "generation=%d repos=%v", h.viewGen, repos)
+			}
 		}
 	}
 	check()
-	require.Len(t, want([]string{"", "a"})[bare], 4, "the fixture parks two sites from each admitted repository on the bare placeholder")
+	require.Len(t, want(s, []string{"", "a"})[bare], 4, "the fixture parks two sites from each admitted repository on the bare placeholder")
+	require.NotEqual(t, want(s, []string{"a"}), want(derived, []string{"a"}), "the generations disagree on which caller repository a owns")
+	require.Empty(t, want(derived, []string{"c"}), "only generation 0 has a node for the c caller")
 
 	rows, err := s.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+repoScopedInEdgesSQL(len(ids)), append(toAnyArgs(ids), s.viewGen, `["","a"]`)...)
 	require.NoError(t, err)
