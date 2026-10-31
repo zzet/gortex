@@ -1135,11 +1135,11 @@ func (s *Store) endCoordinatedBulkLoadLocked() (bulkWindowExit, error) {
 }
 
 // AbortCoordinatedBulkLoad gives up retryable finalization and restores the
-// writer connection unconditionally. It is for terminal owners only: dense
-// indexes whose rebuild failed stay absent, recorded as missing, until the
-// maintenance lane's repair or a restart rebuilds them, but the store no
-// longer holds synchronous=OFF, disabled automatic checkpoints, or a pinned
-// writer indefinitely.
+// writer connection unconditionally, unless a generation window holds it. It
+// is for terminal owners only: dense indexes whose rebuild failed stay absent,
+// recorded as missing, until the maintenance lane's repair or a restart
+// rebuilds them, but the store no longer holds synchronous=OFF, disabled
+// automatic checkpoints, or a pinned writer indefinitely.
 func (s *Store) AbortCoordinatedBulkLoad() error {
 	exit, err := s.abortCoordinatedBulkLoadLocked()
 	return errors.Join(err, s.finishBulkWindowExit(exit))
@@ -1148,6 +1148,14 @@ func (s *Store) AbortCoordinatedBulkLoad() error {
 func (s *Store) abortCoordinatedBulkLoadLocked() (bulkWindowExit, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if s.generationBulkLoad != 0 {
+		// Never a coordinated window (the two refuse each other), and not this
+		// caller's to close. An owner that aborts after an end which failed
+		// once the window was already closed can find the writer pinned by a
+		// payload generation opened since; closing that connection would leave
+		// its checkpoint lease bound and its EndGenerationBulkLoad inert.
+		return bulkWindowExit{}, nil
+	}
 	s.coordinatedBulkLoad = false
 	repair := s.bulkIndexesDeferred
 	err := s.closeBulkConnectionLocked()
