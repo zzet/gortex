@@ -166,7 +166,7 @@ func init() {
 	daemonStartCmd.Flags().StringSliceVar(&daemonHTTPConversationAllow, "conversation-host", nil,
 		"extra Host values (beyond loopback) the conversation-log inspector accepts without a token; repeatable")
 	daemonStartCmd.Flags().StringVar(&daemonBackend, "backend", "sqlite",
-		"storage backend: sqlite (pure-Go embedded SQL, persists to --backend-path so warm restarts skip re-indexing). It is the only backend; point --backend-path at a throwaway file for a store that does not outlive the run")
+		"storage backend: sqlite (pure-Go embedded SQL, persists to --backend-path so warm restarts skip re-indexing). The memory-resident store exists but is not selectable until its daemon wiring lands (zzet/gortex#902); point --backend-path at a throwaway file for a store that does not outlive the run")
 	daemonStartCmd.Flags().StringVar(&daemonBackendPath, "backend-path", "",
 		"path to the store file (its parent directory is created if absent). Defaults to ~/.gortex/store/store.sqlite")
 	daemonStartCmd.Flags().Uint64Var(&daemonBackendBufferPoolMBIgnored, "backend-buffer-pool-mb", 0,

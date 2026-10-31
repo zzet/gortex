@@ -11,6 +11,7 @@
 package serverstack
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -45,9 +46,53 @@ func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, obser
 		return nil, nil, err
 	}
 	if logger != nil {
-		logger.Info("opening sqlite backend", zap.String("path", resolved))
+		logger.Info("opening backend", zap.String("backend", name), zap.String("path", resolved))
 	}
-	return openSqliteBackend(resolved, allowRebuild, observers...)
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "memory", "mem", "in-memory":
+		// Unreachable while checkBackend keeps the name gated (review
+		// zzet/gortex#901 R2): the dispatch stays here so the #902 wiring is
+		// a one-line gate removal, and so the memory store keeps exactly one
+		// production construction path.
+		return openMemoryBackend(resolved, logger, observers...)
+	default:
+		store, closeFn, err := openSqliteBackend(resolved, allowRebuild, observers...)
+		if err != nil {
+			return nil, nil, err
+		}
+		if logger != nil {
+			if st, ok := store.(*store_sqlite.Store); ok && memoryPublishedStore(st) {
+				// The file was last written by the memory backend: nodes and
+				// edges are there, but none of the SQLite-only state #806
+				// reads (view generations, files, repo_index_state, FTS
+				// content, analysis/contract/checkout state). The reconciler
+				// sees no prior index and rebuilds; say so instead of letting
+				// the operator wonder why a warm store re-indexes from zero
+				// (review zzet/gortex#901, minor point 3).
+				logger.Warn("store was published by the memory backend: it carries no SQLite generation state, so this boot performs a full reindex (FTS, analysis, contract and checkout state are rebuilt)",
+					zap.String("path", resolved),
+					zap.Int("nodes", st.NodeCount()))
+			}
+		}
+		return store, closeFn, nil
+	}
+}
+
+// memoryPublishedStore reports whether a sqlite store carries data but no
+// view-generation catalog — the signature of a file whose last writer was the
+// memory backend. A fresh sqlite store is empty (NodeCount 0) and a real
+// sqlite store has a published generation, so neither trips this.
+func memoryPublishedStore(st *store_sqlite.Store) bool {
+	if st == nil || st.NodeCount() == 0 {
+		return false
+	}
+	generation := st.ViewGeneration()
+	if generation > 0 {
+		if _, found, err := st.Catalog().GetViewGeneration(context.Background(), generation); err == nil && found {
+			return false
+		}
+	}
+	return true
 }
 
 // checkBackend validates a requested backend name. It is split out of
@@ -58,13 +103,21 @@ func checkBackend(name string) error {
 	case "", "sqlite", "sqlite3":
 		return nil
 	case "memory", "mem", "in-memory":
-		// Substituting sqlite here would write a caller who asked for a
-		// throwaway store into the shared database on disk. Name the
-		// replacement and let the caller choose the path instead.
-		return errors.New("the in-memory backend is retired; use --backend sqlite --backend-path <path> " +
-			"(a throwaway path gives the old ephemeral behaviour)")
+		// Tier-3 memory-resident backend (odd/tasks/tier3-memory-store.md,
+		// issue davalillo/gortex#19): graph state in RAM, journaled
+		// mutations, sqlite snapshot on close. The store layer is complete,
+		// but the daemon does not wire it yet (#902): contract analysis,
+		// checkout-lifecycle views, the dedicated base runtime, edit deltas
+		// and shadow-drain retirement are SQLite-only, and daemon startup
+		// aborts on the first of them ("contract analysis: SQLite store
+		// required", daemon_contract_analysis.go). Offering the name today
+		// selects a backend that cannot run the daemon at all, so the name
+		// stays unselectable until the wiring lands (review zzet/gortex#901
+		// R2). The store itself remains usable by tests and by #902 through
+		// openMemoryBackend.
+		return fmt.Errorf("backend %q is not selectable yet: the memory backend (also spelled mem or in-memory) is wired into the daemon in zzet/gortex#902; use --backend sqlite", name)
 	default:
-		return fmt.Errorf("unknown backend %q (expected: sqlite)", name)
+		return fmt.Errorf("unknown backend %q (expected: sqlite or memory)", name)
 	}
 }
 
