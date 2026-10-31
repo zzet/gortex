@@ -314,9 +314,10 @@ func BeginTopologyMutation(g graph.Store) func(changed bool) {
 // graph-shaping passes settle (resolver, semantic enrichment, cross-
 // repo edges, gRPC stub resolution).
 //
-// Safe to call repeatedly: existing reach_d* entries are overwritten
-// and the build counter advances each time so any consumer that read
-// an entry from a prior generation will fall back to a live walk.
+// Safe to call repeatedly: existing reach_d* entries are overwritten.
+// A build stamps the generation it read the graph at and does not advance
+// it: the records of an unchanged graph are as current as their rebuild,
+// and advancing it would make every concurrent lookup recompute.
 func BuildIndex(g graph.Store) *Stats {
 	return BuildIndexCtx(context.Background(), g)
 }
@@ -342,7 +343,7 @@ func BuildIndexCtx(ctx context.Context, g graph.Store) *Stats {
 		releaseTopology()
 		return &Stats{}
 	}
-	build := atomic.AddUint64(&buildCounter, 1)
+	build := atomic.LoadUint64(&buildCounter)
 	mu.Unlock()
 	releaseTopology()
 	stats := &Stats{Build: build}
@@ -803,7 +804,7 @@ func LookupCached(g graph.Store, seedID string) (d1, d2, d3 []Entry, hit, trunca
 // LookupContext returns a complete reach record or a bounded lower-bound
 // record. Expensive BFS work deliberately happens outside topology and
 // resolver locks. Publication re-enters both locks, verifies the generation,
-// and retries if a mutation crossed the optimistic compute window. This keeps
+// and retries once if a mutation crossed the optimistic compute window. This keeps
 // synchronous edits from waiting behind breadth-first graph traversal.
 type contextNodeGetter interface {
 	GetNodeContext(context.Context, string) (*graph.Node, error)
@@ -846,7 +847,7 @@ func lookupContext(parent context.Context, g graph.Store, seedID string, keep Ed
 	ctx, cancel := context.WithTimeout(parent, lookupTimeout)
 	defer cancel()
 
-	for {
+	for retried := false; ; retried = true {
 		releaseTopology, ok := beginTopologyReadContext(ctx)
 		if !ok {
 			return nil, nil, nil, false, true
@@ -871,14 +872,10 @@ func lookupContext(parent context.Context, g graph.Store, seedID string, keep Ed
 		// A published record describes unfiltered adjacency, so a filtered
 		// lookup always computes.
 		if keep == nil {
-			if d1, d2, d3, cachedTruncated, cached := readCached(n, currentBuild); cached {
-				stable := currentBuild == atomic.LoadUint64(&buildCounter)
+			if d1, d2, d3, cachedTruncated, cached := readCached(n, currentBuild); cached && currentBuild == atomic.LoadUint64(&buildCounter) {
 				mu.Unlock()
 				releaseTopology()
-				if stable {
-					return d1, d2, d3, true, cachedTruncated
-				}
-				continue
+				return d1, d2, d3, true, cachedTruncated
 			}
 		}
 		mu.Unlock()
@@ -892,15 +889,19 @@ func lookupContext(parent context.Context, g graph.Store, seedID string, keep Ed
 		// also retaining topology/resolve coordination, starving the daemon.
 		//
 		// BuildIndexCtx is the sole persistent reach-cache writer. A lazy miss
-		// returns its bounded lower-bound evidence directly; a concurrent graph
-		// generation change marks that evidence truncated rather than retrying
-		// or publishing a mixed snapshot.
+		// returns its bounded lower-bound evidence directly. A traversal that a
+		// topology change crossed is retried once; a second crossing returns
+		// what it read marked truncated, rather than chasing a repository that
+		// keeps changing until the deadline.
 		tiers, traversalTruncated := compute(ctx, g, seedID, keep)
 		if ctx.Err() != nil {
 			return entriesForTier(tiers[0]), entriesForTier(tiers[1]), entriesForTier(tiers[2]), true, true
 		}
 		if currentBuild != atomic.LoadUint64(&buildCounter) {
-			continue
+			if !retried {
+				continue
+			}
+			traversalTruncated = true
 		}
 		return entriesForTier(tiers[0]), entriesForTier(tiers[1]), entriesForTier(tiers[2]), true, traversalTruncated
 	}
