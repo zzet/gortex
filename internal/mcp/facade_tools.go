@@ -18,7 +18,6 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/localizationauth"
-	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/telemetry"
 )
 
@@ -1213,7 +1212,7 @@ func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (s
 	}
 	seen := make(map[string]bool)
 	candidates := make([]string, 0, 2)
-	for _, node := range s.shorthandNameCandidates(ctx, eng, id) {
+	for _, node := range s.sessionNameCandidates(ctx, eng.Reader(), id, eng.FindSymbols) {
 		if node == nil || seen[node.ID] || !s.nodeInSessionScope(ctx, node) {
 			continue
 		}
@@ -1237,23 +1236,24 @@ func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (s
 	return resolved, nil
 }
 
-// shorthandNameCandidates returns the nodes named name that a shorthand may
-// resolve to, before the session-scope check. The every-repository read
-// decodes each tracked repository's same-named symbols only to drop them, so
-// a session bound to one repository paid for all the others. A bound session
-// whose repositories are known reads each of them, plus the unowned bucket
-// every scope admits (synthetic externals), through the selected reader's
-// repository-scoped finder instead. The finder is asked of the reader the
-// engine reads, so an overlay or routed view without one keeps the
-// every-repository read rather than bypassing its own layers.
-func (s *Server) shorthandNameCandidates(ctx context.Context, eng *query.Engine, name string) []*graph.Node {
-	finder, ok := contractCoreSelectedReader(eng.Reader()).(graph.RepoNamesNodeFinder)
+// sessionNameCandidates returns the nodes named name that a bare-name target
+// may resolve to, before the session-scope check, which callers still apply.
+// The every-repository read decodes each tracked repository's same-named
+// symbols only to drop them, so a session bound to one repository paid for
+// all the others. A bound session whose repositories are known reads each of
+// them, plus the unowned bucket every scope admits (synthetic externals),
+// through the selected reader's repository-scoped finder instead. The finder
+// is asked of the reader the caller reads, so an overlay or routed view
+// without one keeps everyRepo, the caller's every-repository read, rather
+// than bypassing its own layers.
+func (s *Server) sessionNameCandidates(ctx context.Context, reader graph.Reader, name string, everyRepo func(string) []*graph.Node) []*graph.Node {
+	finder, ok := contractCoreSelectedReader(reader).(graph.RepoNamesNodeFinder)
 	if !ok {
-		return eng.FindSymbols(name)
+		return everyRepo(name)
 	}
 	repos, bound := s.sessionWorkspaceRepoSet(ctx)
 	if !bound || len(repos) == 0 {
-		return eng.FindSymbols(name)
+		return everyRepo(name)
 	}
 	prefixes := []string{""}
 	for repo, allowed := range repos {
