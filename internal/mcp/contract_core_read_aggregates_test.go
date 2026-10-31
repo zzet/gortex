@@ -10,7 +10,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-func TestContractCoreImportersAndCountsKeepSelectedAdjacency(t *testing.T) {
+func TestContractCoreScopedImportersAndCountsKeepSelectedAdjacency(t *testing.T) {
 	s := openContractCoreCapStore(t)
 	s.AddBatch([]*graph.Node{
 		{ID: "a/file.go", Kind: graph.KindFile, RepoPrefix: "a", FilePath: "a/file.go"},

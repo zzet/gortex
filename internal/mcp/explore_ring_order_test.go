@@ -6,7 +6,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-func TestExploreRingOrdersEligibleNeighborsBeforeCap(t *testing.T) {
+func TestExploreScopedRingOrdersEligibleNeighborsBeforeCap(t *testing.T) {
 	a := &graph.Node{ID: "repo/a", Kind: graph.KindFunction}
 	b := &graph.Node{ID: "repo/b", Kind: graph.KindMethod}
 	z := &graph.Node{ID: "repo/z", Kind: graph.KindFunction}

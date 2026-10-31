@@ -40,7 +40,7 @@ func (r *coverageCandidateSpy) DeadCodeCandidatesInScope(kinds []graph.NodeKind,
 	return r.nodes.DeadCodeCandidatesInScope(kinds, incoming, repos, scope, exclusions)
 }
 
-func TestUntestedCandidateClosureMatchesWholeGraphOracle(t *testing.T) {
+func TestUntestedCandidateClosureScopedMatchesWholeGraphOracle(t *testing.T) {
 	s := openContractCoreCapStore(t)
 	s.AddBatch([]*graph.Node{
 		{ID: "a/live.go::Live", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/live.go"},
