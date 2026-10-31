@@ -524,6 +524,7 @@ gortex savings [--verbose] [--json]      # Today / Last 7 days / All time bar-ch
 gortex bench <sub>                       # user-facing benchmark suite (recall / tokens / tokens-efficiency / perf / daemon-latency / embedders / swebench / all)
 gortex audit [--badge|--format svg|json|text]  # A-F repo health grade + README-ready SVG shield
 gortex gain [--since 7d]                 # forward-looking per-call USD savings + optional history slice
+gortex store cleanup-backup [--backend-path P]  # remove the store backups taken before schema upgrades (the daemon also prunes them after 14 days)
 gortex version
 ```
 
