@@ -529,10 +529,12 @@ type Config struct {
 	// the shipped retention bounds.
 	Views ViewsConfig `mapstructure:"views" yaml:"views,omitempty"`
 	// ContractAnalysis schedules the background contract analysis of
-	// linked git worktrees. Empty takes the shipped policy. It is kept out
-	// of IndexConfig on purpose: IndexConfig is part of every published
-	// contract cohort's identity, and a scheduling choice must not
-	// invalidate what was published under another.
+	// linked git worktrees. Empty takes the shipped policy. The daemon
+	// reads it from its own config file (Load), never from a tracked
+	// repository's .gortex.yaml. It is kept out of IndexConfig on
+	// purpose: IndexConfig is part of every published contract cohort's
+	// identity, and a scheduling choice must not invalidate what was
+	// published under another.
 	ContractAnalysis ContractAnalysisConfig `mapstructure:"contract_analysis" yaml:"contract_analysis,omitempty"`
 }
 

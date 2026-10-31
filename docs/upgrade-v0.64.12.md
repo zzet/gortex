@@ -34,7 +34,8 @@ worktree's last published contract analysis, with `contract_analysis.state`
 `building` and reason `contract_analysis_pending`, or reports that no
 attachment exists yet. It does not block.
 
-To restore the earlier behavior, set the policy to `eager`:
+To restore the earlier behavior, set the policy to `eager` in the daemon's own
+config file (not a repository's `.gortex.yaml`):
 
 ```yaml
 contract_analysis:

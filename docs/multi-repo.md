@@ -384,12 +384,18 @@ published contract analysis, with `contract_analysis.state` `building` and
 reason `contract_analysis_pending`, or reports that there is no attachment yet.
 
 ```yaml
-# the daemon's .gortex.yaml (the file its views: block is read from)
+# the daemon's own config file
 contract_analysis:
   linked_policy: idle            # idle | throttled | eager
   linked_idle_window: 5s         # idle: quiet time before a linked job starts
   linked_throttle_interval: 30s  # throttled: least time between one worktree's starts
 ```
+
+The block is read once, at daemon start, from the daemon's own config file: the
+one `--config` names, else `.gortex.yaml` in the directory the daemon was
+started from, else `.gortex.yaml` in the Gortex config directory (`~/.gortex`
+by default). A `contract_analysis:` block in a tracked repository's
+`.gortex.yaml` is not read.
 
 `GORTEX_CONTRACT_LINKED_POLICY` overrides `linked_policy`. A value that does not
 parse is logged and its default is used; the daemon still starts. The daemon
