@@ -110,6 +110,9 @@ func NewProviderFromConfig(cfg ProviderConfig) (Provider, error) {
 		if cfg.APIURL == "" {
 			return nil, fmt.Errorf("embedding provider %q requires an api_url", cfg.Provider)
 		}
+		if err := ValidateEmbeddingAPIURL(cfg.APIURL); err != nil {
+			return nil, err
+		}
 		return NewAPIProvider(cfg.APIURL, cfg.APIModel), nil
 	default:
 		return nil, fmt.Errorf("unknown embedding provider %q (want static, local, or api)", cfg.Provider)

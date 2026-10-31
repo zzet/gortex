@@ -361,6 +361,18 @@ func repoConfigSeed() *Config {
 	return cfg
 }
 
+// ExtractorPluginsLocalOptInEnv gates extractor plugins declared in a
+// repo-local .gortex.yaml. Those plugins run arbitrary, operator-configured
+// commands over repo file content on the indexer's behalf, so a cloned repo
+// carrying a malicious index.extractor_plugins entry would execute
+// attacker-chosen code when the victim tracks it. The flag — mirroring
+// GORTEX_ALLOW_LOCAL_PROVIDERS — makes execution explicit: operator opt-in.
+const ExtractorPluginsLocalOptInEnv = "GORTEX_ALLOW_LOCAL_EXTRACTOR_PLUGINS"
+
+func repoLocalExtractorPluginsEnabled() bool {
+	return strings.TrimSpace(os.Getenv(ExtractorPluginsLocalOptInEnv)) == "1"
+}
+
 // LastGoodWorkspace returns the workspace config last published for
 // repoPrefix when it was read from the same root as repoPath, or nil.
 // Matching spellings require no filesystem work.
@@ -429,6 +441,14 @@ func (cm *ConfigManager) repoConfig(repoPrefix string, ws *Config, repoPath stri
 	// the indexer (which only sees IndexConfig) can honour it.
 	// Defaults to enabled when the key is unset.
 	out.Index.IndexProse = out.Search.IndexProseEnabled()
+	// Repo-local extractor plugins run untrusted commands over indexed
+	// content; drop them unless the operator has explicitly opted in via
+	// GORTEX_ALLOW_LOCAL_EXTRACTOR_PLUGINS. `out` copies the workspace
+	// config only when ws != nil, so this targets repo-local config and
+	// leaves compiled defaults untouched.
+	if ws != nil && !repoLocalExtractorPluginsEnabled() {
+		out.Index.ExtractorPlugins = nil
+	}
 	return out
 }
 

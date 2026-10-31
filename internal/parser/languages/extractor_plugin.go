@@ -433,6 +433,13 @@ func (e *SubprocessExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	return e.fileOnlyResult(filePath, src), nil
 }
 
+// shellUnsafePathChars lists shell metacharacters that must not appear in
+// GORTEX_FILE_PATH. A repo-controlled path that reaches a plugin which
+// expands the variable through a shell could otherwise inject
+// commands/operators or split the argument. The backtick is written as a
+// raw-string literal; the `"` and `\` are escaped.
+const shellUnsafePathChars = " ;|&<>()\"'\\$" + "`="
+
 // ExtractBounded runs the configured plugin with hard wire and result limits.
 // It is an all-or-nothing capability: caller cancellation, limit violations,
 // command failures, timeouts and malformed output return no partial result.
@@ -448,6 +455,18 @@ func (e *SubprocessExtractor) ExtractBounded(ctx context.Context, filePath strin
 	}
 	if limits.MaxNodes < 1 {
 		return nil, noUsage, &parser.ExtractionLimitError{Resource: "nodes", Limit: 0, Observed: 1}
+	}
+	// filePath is a repo-relative name the repository controls, so it can
+	// carry bytes that break env-var/shell handling when a plugin later
+	// expands $GORTEX_FILE_PATH. Reject control characters and shell
+	// metacharacters up front rather than exporting a value that, in a
+	// shell-expanding plugin, could inject commands (`;`), expand
+	// variables/commands (`$`, backticks), splice env vars (`=`), or
+	// word-split the path (space). `\\` and `` ` `` in the second set are
+	// the backslash and backtick; `\\$` is a literal dollar before the
+	// backtick (see the shellUnsafeChars const).
+	if strings.ContainsAny(filePath, "\x00\n\r\t\v\f") || strings.ContainsAny(filePath, shellUnsafePathChars) {
+		return nil, noUsage, fmt.Errorf("extractor plugin: file path %q contains a shell-unsafe character", filePath)
 	}
 
 	result := e.fileOnlyResult(filePath, src)

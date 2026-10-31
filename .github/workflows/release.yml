@@ -786,3 +786,22 @@ jobs:
             ./dist/*.rpm
             ./dist/*.apk
           update_release_body: true
+
+  # Releases are created with GITHUB_TOKEN, and events from GITHUB_TOKEN
+  # do not start other workflows, so publish-claude-plugin's
+  # `release: published` trigger never fires for them. workflow_dispatch
+  # is the documented exception, so start it explicitly once the
+  # release exists.
+  publish-claude-plugin:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch publish-claude-plugin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run publish-claude-plugin.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            -f ref="$GITHUB_REF_NAME"

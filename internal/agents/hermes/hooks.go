@@ -44,10 +44,9 @@ const (
 	hermesToolMatcher = "read_file|terminal"
 
 	// hermesHookTimeoutSecs bounds each hook invocation. Hermes hook
-	// timeouts are in SECONDS (default 60, max 300) — unlike Claude
-	// Code's millisecond timeouts. 5s is generous for a localhost daemon
-	// probe yet well under the ceiling, so a wedged daemon can't stall a
-	// turn for long.
+	// timeouts are in seconds (default 60, max 300). 5s is generous for a
+	// localhost daemon probe yet well under the ceiling, so a wedged
+	// daemon can't stall a turn for long.
 	hermesHookTimeoutSecs = 5
 )
 

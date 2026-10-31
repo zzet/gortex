@@ -38,8 +38,10 @@ build-gomlx: deps-gomlx
 build-hugot: deps-hugot
 	go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
+PKGS ?= ./...
+
 test:
-	go test -race ./...
+	go test -race -gcflags=modernc.org/sqlite/lib=-race=false -gcflags=modernc.org/libc/...=-race=false $(PKGS)
 
 bench:
 	go test -bench=. -benchmem -count=1 -benchtime=1s \
