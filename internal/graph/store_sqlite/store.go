@@ -339,6 +339,22 @@ type storeCore struct {
 	maintenanceDrainRunning bool
 	maintenanceDrainReason  string
 
+	// Dense-index repair (dense_index_repair.go). denseRepairOwed is the
+	// one-slot request the lane worker consumes, posted by a bulk-window exit
+	// that left indexes missing or by the backoff timer; denseRepairDelay is
+	// the backoff the next retry waits and denseRepairTimer that pending
+	// retry. All three are guarded by maintenanceSched. The counters record
+	// attempts that reached their DDL, attempts skipped for free space, and
+	// completed repairs; denseRepairDiskAvail is a test override of the
+	// free-space probe.
+	denseRepairOwed          bool
+	denseRepairDelay         time.Duration
+	denseRepairTimer         *time.Timer
+	denseIndexRepairAttempts atomic.Int64
+	denseIndexRepairSkips    atomic.Int64
+	denseIndexRepairs        atomic.Int64
+	denseRepairDiskAvail     atomic.Pointer[func(dir string) (uint64, error)]
+
 	// Lane counters. Requests counts scheduling calls, passes counts lane
 	// passes actually started (so a burst of requests collapsing into one
 	// pass is observable), jobs counts actions that reached their SQL,

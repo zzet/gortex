@@ -939,6 +939,9 @@ type bulkWindowExit struct {
 	// when no such PASSIVE ran.
 	residue         walCheckpointResult
 	residueBoundary string
+	// repairDenseIndexes: the window closed with its seal still owed, so it
+	// recorded missing dense indexes and the maintenance lane owes a repair.
+	repairDenseIndexes bool
 }
 
 // finishBulkWindowExit runs what exit owes after writeMu is released, in the
@@ -949,10 +952,14 @@ func (s *Store) finishBulkWindowExit(exit bulkWindowExit) error {
 	if exit.residueBoundary != "" {
 		s.scheduleWALDrainAboveLine(exit.residue, exit.residueBoundary)
 	}
+	var err error
 	if exit.durabilityCheckpoint {
-		return s.checkpointBulkWAL()
+		err = s.checkpointBulkWAL()
 	}
-	return nil
+	if exit.repairDenseIndexes {
+		s.scheduleDenseIndexRepair()
+	}
+	return err
 }
 
 // FlushBulk exits the bulk-load fast path: it rebuilds every dropped index,
@@ -1002,9 +1009,10 @@ func (s *Store) flushBulkLocked() (bulkWindowExit, error) {
 	}
 	hadBulk := s.bulkConn != nil
 	sealErr := s.sealBulkIndexesLocked("flush")
+	repair := s.bulkIndexesDeferred
 	closeErr := s.closeBulkConnectionLocked()
 	s.jsonbIngestBuffers.release()
-	return bulkWindowExit{durabilityCheckpoint: hadBulk}, errors.Join(sealErr, closeErr)
+	return bulkWindowExit{durabilityCheckpoint: hadBulk, repairDenseIndexes: repair}, errors.Join(sealErr, closeErr)
 }
 
 // EndCoordinatedBulkLoad closes an outer multi-repository cold-load window.
@@ -1128,16 +1136,23 @@ func (s *Store) endCoordinatedBulkLoadLocked() (bulkWindowExit, error) {
 
 // AbortCoordinatedBulkLoad gives up retryable finalization and restores the
 // writer connection unconditionally. It is for terminal owners only: dense
-// indexes whose rebuild failed may remain absent until normal schema repair or
-// restart, but the store no longer holds synchronous=OFF, disabled automatic
-// checkpoints, or a pinned writer indefinitely.
+// indexes whose rebuild failed stay absent, recorded as missing, until the
+// maintenance lane's repair or a restart rebuilds them, but the store no
+// longer holds synchronous=OFF, disabled automatic checkpoints, or a pinned
+// writer indefinitely.
 func (s *Store) AbortCoordinatedBulkLoad() error {
+	exit, err := s.abortCoordinatedBulkLoadLocked()
+	return errors.Join(err, s.finishBulkWindowExit(exit))
+}
+
+func (s *Store) abortCoordinatedBulkLoadLocked() (bulkWindowExit, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	s.coordinatedBulkLoad = false
+	repair := s.bulkIndexesDeferred
 	err := s.closeBulkConnectionLocked()
 	s.jsonbIngestBuffers.release()
-	return err
+	return bulkWindowExit{repairDenseIndexes: repair}, err
 }
 
 // noteBulkRowsLocked advances independent index-seal and WAL-checkpoint budgets

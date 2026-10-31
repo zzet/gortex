@@ -92,6 +92,9 @@ const (
 	maintenancePlannerStats maintenanceJob = "planner_stats"
 	maintenanceVacuum       maintenanceJob = "vacuum"
 	maintenanceCheckpoint   maintenanceJob = "wal_checkpoint_truncate"
+	// maintenanceDenseIndexRepair rebuilds the dense indexes an unsealed cold
+	// window left missing (dense_index_repair.go).
+	maintenanceDenseIndexRepair maintenanceJob = "dense_index_repair"
 )
 
 // preemptible reports whether a job in flight may be asked to yield the lane.
@@ -641,8 +644,16 @@ func (s *Store) runMaintenanceLane(ctx context.Context, signal <-chan struct{}, 
 				return
 			}
 		}
+		// Ahead of the pass for the same reason as the drain, and because a
+		// completed repair owes the pass that analyzes what it rebuilt.
+		if s.takeDenseIndexRepair() {
+			s.runDenseIndexRepair(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+		}
 		if !s.statsPassOwed() {
-			// The wakeup carried a drain and nothing else.
+			// The wakeup carried a drain or a repair and nothing else.
 			continue
 		}
 		if !s.claimMaintenancePass() {
@@ -732,6 +743,8 @@ func (s *Store) stopMaintenanceLane() {
 	s.maintenanceClosed = true
 	s.maintenanceOwed = false
 	s.maintenanceDrainOwed = false
+	s.denseRepairOwed = false
+	s.stopDenseIndexRepairTimerLocked()
 	cancel := s.maintenanceCancel
 	done := s.maintenanceDone
 	s.maintenanceSched.Unlock()
