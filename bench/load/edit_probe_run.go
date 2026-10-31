@@ -104,7 +104,7 @@ type editProbeState struct {
 	probes                                            sync.WaitGroup
 	started, acknowledged, firstProbeWrite, editWrite time.Time
 	absenceBefore                                     map[string]bool
-	ackReady                                          chan struct{} // closed once the own ACK is known or the edit ended without one
+	ackReady                                          chan struct{} // closed once a dependent may check this edit: its own ACK is known, or it ended
 	ackOnce                                           sync.Once
 }
 
@@ -258,7 +258,9 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 			return r, clients, err
 		}
 		clients = append(clients, state.client)
-		if state.step.BeforeSymbol != "" {
+		// A file created during the run proves its own presence before the
+		// paired delete is sent; it cannot be admitted here.
+		if state.step.BeforeSymbol != "" && state.step.File == "" {
 			req := request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": state.step.BeforeSymbol}, "options": map[string]any{"context_lines": 0}}}
 			raw, identity, readErr := state.client.callWithIdentity(ctx, "tools/call", map[string]any{"name": req.Tool, "arguments": dispatchArgs(req, p.Repos[0])})
 			if readErr == nil {
@@ -783,13 +785,17 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 // fail the record.
 func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editProbeState, step editProbeStep, readbackKinds []string, observeOnly map[string]bool) (time.Time, bool) {
 	readbackEnd, readbacksCorrect := time.Time{}, true
+	file := r.plan.File
+	if step.File != "" {
+		file = step.File
+	}
 	for index, kind := range readbackKinds {
-		target := map[string]any{"file": r.plan.File}
+		target := map[string]any{"file": file}
 		if kind == "file" && step.Relocated {
 			target["file"] = step.DestinationFile
 		}
 		if kind == "source" {
-			target = map[string]any{"symbol": r.plan.File + "::" + step.Marker}
+			target = map[string]any{"symbol": file + "::" + step.Marker}
 			if step.TargetSymbol != "" {
 				target = map[string]any{"symbol": step.TargetSymbol}
 			}
@@ -969,6 +975,9 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	if len(r.plan.Steps) > 0 && r.plan.Steps[0].ExpectedRefusal {
 		return r.confirmRefusalUnchanged()
 	}
+	if r.plan.Sender == editProbeCreateDelete {
+		return r.restoreCreatedFiles(ctx)
+	}
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
 	for _, record := range r.phase.EditProbe.Records {
 		if record.NativeWrite != nil {
@@ -991,12 +1000,7 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 		}
 		changes = append(changes, map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + destination, "old_string": string(currentDestination), "new_string": string(r.moveOriginal)})
 	}
-	req := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "changes": changes, "options": map[string]any{"transaction_id": fmt.Sprintf("load-restore-%016x", uint64(r.options.Seed))}, "output": map[string]any{"format": "json", "max_bytes": 0}}}
-	start := time.Now()
-	data, _, err := callEditProbeTool(ctx, r.editors[0], req, req.Arguments, "cleanup", 0, len(r.states), 0, r.options.Deadline, editProbeRetrySleep(r.options.Seed, len(r.states), 0))
-	r.phase.EditProbe.RestoreMS = measured(float64(time.Since(start))/float64(time.Millisecond), "ms")
-	r.phase.EditProbe.Restore = data
-	if err != nil {
+	if err := r.restoreBatch(ctx, changes); err != nil {
 		return err
 	}
 	restored, err := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.plan.File)))

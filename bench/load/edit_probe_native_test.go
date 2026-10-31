@@ -22,12 +22,12 @@ func editProbeEditorSaveCorpus(t *testing.T, count int) Corpus {
 }
 
 // editProbeDiskStub answers every default oracle, readback and the restore
-// batch from the fixture's current disk bytes, as a daemon that has indexed
-// them would. A name no longer declared answers the exact not-found refusal.
+// batch from the current bytes of the Go files on disk, as a daemon that has
+// indexed them would. A name no longer declared answers the exact not-found
+// refusal; caller subgraphs keep the stable callee's own node.
 func editProbeDiskStub(t *testing.T, c Corpus, dir string) func(stubFrame) (any, *rpcError) {
 	declared := regexp.MustCompile(`func (GortexEditProbe\w+)\(`)
 	callee := c.Symbol[strings.LastIndex(c.Symbol, "::")+2:]
-	path := filepath.Join(dir, c.File)
 	return func(frame stubFrame) (any, *rpcError) {
 		if frame.Method != "tools/call" {
 			return stubContent(map[string]any{}), nil
@@ -35,53 +35,73 @@ func editProbeDiskStub(t *testing.T, c Corpus, dir string) func(stubFrame) (any,
 		args, _ := frame.Params["arguments"].(map[string]any)
 		if frame.Params["name"] == "edit" && args["operation"] == "batch" {
 			for _, raw := range args["changes"].([]any) {
-				if err := os.WriteFile(path, []byte(raw.(map[string]any)["new_string"].(string)), 0o600); err != nil {
+				change := raw.(map[string]any)
+				path := filepath.Join(dir, strings.TrimPrefix(change["path"].(string), "fixture/"))
+				var err error
+				if change["op"] == "delete_file" {
+					err = os.Remove(path)
+				} else {
+					err = os.WriteFile(path, []byte(change["new_string"].(string)), 0o600)
+				}
+				if err != nil {
 					t.Error(err)
 				}
 			}
 			return stubContent(map[string]any{"committed": true}), nil
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Error(err)
-		}
-		var names []string
-		var nodes, edges []any
-		id := func(name string) string { return "fixture/" + c.File + "::" + name }
-		for _, match := range declared.FindAllStringSubmatch(string(data), -1) {
-			names = append(names, match[1])
-			nodes = append(nodes, map[string]any{"id": id(match[1])})
-			edges = append(edges, map[string]any{"from": id(match[1]), "to": "fixture/" + c.Symbol, "kind": "calls"})
+		owner := map[string]string{}
+		byFile := map[string][]any{}
+		graph, edges := []any{map[string]any{"id": "fixture/" + c.Symbol}}, []any{}
+		paths, _ := filepath.Glob(filepath.Join(dir, "*.go"))
+		for _, path := range paths {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Error(err)
+			}
+			file := filepath.Base(path)
+			for _, match := range declared.FindAllStringSubmatch(string(data), -1) {
+				id := "fixture/" + file + "::" + match[1]
+				owner[match[1]] = file
+				byFile[file] = append(byFile[file], map[string]any{"id": id})
+				graph = append(graph, map[string]any{"id": id})
+				edges = append(edges, map[string]any{"from": id, "to": "fixture/" + c.Symbol, "kind": "calls"})
+			}
 		}
 		target, _ := args["target"].(map[string]any)
 		symbol, _ := target["symbol"].(string)
-		symbol = strings.TrimPrefix(symbol, "fixture/")
+		file, _ := target["file"].(string)
+		symbol, file = strings.TrimPrefix(symbol, "fixture/"), strings.TrimPrefix(file, "fixture/")
 		_, name, _ := strings.Cut(symbol, "::")
 		query, _ := args["query"].(string)
+		rows := []any{}
 		switch frame.Params["name"].(string) + "." + args["operation"].(string) {
 		case "read.file":
-			return stubContent(map[string]any{"path": "fixture/" + c.File, "content": string(data)}), nil
+			data, err := os.ReadFile(filepath.Join(dir, file))
+			if err != nil {
+				t.Error(err)
+			}
+			return stubContent(map[string]any{"path": "fixture/" + file, "content": string(data)}), nil
 		case "read.source":
-			if !slices.Contains(names, name) {
+			if owner[name] == "" || symbol != owner[name]+"::"+name {
 				return map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": "symbol not found: fixture/" + symbol}}}, nil
 			}
-			return stubContent(map[string]any{"id": id(name), "name": name, "file_path": "fixture/" + c.File, "source": "func " + name + "() int { return " + callee + "() }"}), nil
+			return stubContent(map[string]any{"id": "fixture/" + symbol, "name": name, "file_path": "fixture/" + owner[name], "source": "func " + name + "() int { return " + callee + "() }"}), nil
 		case "read.summary":
-			return stubContent(map[string]any{"nodes": nodes}), nil
+			return stubContent(map[string]any{"nodes": byFile[file]}), nil
 		case "read.editing_context":
-			return stubContent(map[string]any{"defines": nodes}), nil
+			return stubContent(map[string]any{"defines": byFile[file]}), nil
 		case "search.symbols":
-			if slices.Contains(names, query) {
-				return stubContent(map[string]any{"results": []any{map[string]any{"id": id(query)}}}), nil
+			if owner[query] != "" {
+				rows = append(rows, map[string]any{"id": "fixture/" + owner[query] + "::" + query})
 			}
-			return stubContent(map[string]any{"results": []any{}}), nil
+			return stubContent(map[string]any{"results": rows, "total": len(rows), "truncated": false, "query_class": "symbol"}), nil
 		case "search.text":
-			if slices.Contains(names, query) {
-				return stubContent(map[string]any{"matches": []any{map[string]any{"path": "fixture/" + c.File, "line": 3, "text": "func " + query + "() int { return " + callee + "() }"}}}), nil
+			if owner[query] != "" {
+				rows = append(rows, map[string]any{"path": "fixture/" + owner[query], "line": 3, "text": "func " + query + "() int { return " + callee + "() }"})
 			}
-			return stubContent(map[string]any{"matches": []any{}}), nil
+			return stubContent(map[string]any{"matches": rows, "count": len(rows), "query": query, "truncated": false}), nil
 		case "relations.callers", "trace.call_chain":
-			return stubContent(map[string]any{"nodes": nodes, "edges": edges, "total_nodes": len(nodes), "total_edges": len(edges), "truncated": false}), nil
+			return stubContent(map[string]any{"nodes": graph, "edges": edges, "total_nodes": len(graph), "total_edges": len(edges), "truncated": false}), nil
 		}
 		t.Errorf("unexpected tool call %v", frame.Params)
 		return stubContent(map[string]any{}), nil

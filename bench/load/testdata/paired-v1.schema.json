@@ -1706,6 +1706,9 @@
                                   "expected_refusal": {
                                     "type": "boolean"
                                   },
+                                  "file": {
+                                    "type": "string"
+                                  },
                                   "following_symbol": {
                                     "type": "string"
                                   },
@@ -3479,6 +3482,9 @@
                             },
                             "expected_refusal": {
                               "type": "boolean"
+                            },
+                            "file": {
+                              "type": "string"
                             },
                             "following_symbol": {
                               "type": "string"

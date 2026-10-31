@@ -23,6 +23,9 @@ func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
 	if step.ExpectedRefusal {
 		return nil // A refused relocation makes no change for any probe to observe.
 	}
+	if step.File != "" {
+		return editProbeLifecycleOracles(c, step)
+	}
 	if step.Relocated {
 		return editProbeOutputOracles(c, editProbeMoveOracles(c, step))
 	}
@@ -98,6 +101,9 @@ func editProbeSourceID(id, file, name string) bool {
 }
 
 func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editProbeStep, callee string) bool {
+	if step.File != "" {
+		return editProbeLifecycleCorrect(oracle, body, c, step, callee)
+	}
 	if answer, ok := body[editProbeCompactKey].(editProbeCompactAnswer); ok {
 		return !step.Relocated && step.BeforeSymbol == "" && editProbeCompactCorrect(oracle, answer, c, step, callee)
 	}

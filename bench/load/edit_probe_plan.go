@@ -43,6 +43,7 @@ type editProbeStep struct {
 	Sender          string  `json:"sender,omitempty"`
 	After           *int    `json:"after,omitempty"`
 	AfterEvent      string  `json:"after_event,omitempty"`
+	File            string  `json:"file,omitempty"`
 }
 
 type editProbePlan struct {
@@ -257,13 +258,24 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 		p.NotSelected = append(p.NotSelected, "several editors share one repository; 6-repository and linked-worktree routing are not implemented")
 	}
 	arrivals, err := editProbeArrivals(seed, count, editors)
+	if c.EditSender == editProbeHotFile {
+		arrivals, err = editProbeHotFileArrivals(seed, count)
+	}
 	if err != nil {
 		return editProbePlan{}, err
+	}
+	pkg := ""
+	if c.EditSender == editProbeCreateDelete {
+		parsed, err := parser.ParseFile(token.NewFileSet(), c.File, c.EditInitialContent, parser.PackageClauseOnly)
+		if err != nil {
+			return editProbePlan{}, err
+		}
+		pkg = parsed.Name.Name
 	}
 	writeContent := c.EditInitialContent
 	for i, arrival := range arrivals {
 		due := arrival.DueNS
-		marker := fmt.Sprintf("GortexEditProbe%016xN%03d", uint64(seed), i)
+		marker := editProbeMarker(seed, i)
 		id := fmt.Sprintf("load-edit-%016x-%03d", uint64(seed), i)
 		r := editRequest(c, marker)
 		if tool == "edit.symbol" {
@@ -353,8 +365,16 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 			r = request{Tool: "refactor", Operation: "move", Arguments: map[string]any{"operation": "move", "target": map[string]any{"symbol": beforeSymbol}, "destination": c.EditDestination}}
 		}
 		sender, after, afterEvent := editProbeNativeStep(c.EditSender, i)
+		file, deleted := "", kind == "delete"
+		if c.EditSender == editProbeCreateDelete {
+			r, file, beforeSymbol = editProbeLifecycleStep(c, pkg, seed, i)
+			deleted = file != "" && beforeSymbol != ""
+		}
 		if sender != "" {
-			r, id = editProbeNativeRequest(c.File, sender, r), ""
+			if r.Tool != "native" {
+				r = editProbeNativeRequest(c.File, sender, r)
+			}
+			id = ""
 		} else {
 			if tool != "edit.batch" && tool != "refactor.move" {
 				r.Arguments["options"] = map[string]any{"mutation_id": id}
@@ -365,7 +385,7 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 		if err != nil {
 			return editProbePlan{}, err
 		}
-		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Editor: arrival.Editor, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete", TargetSymbol: targetSymbol, FollowingSymbol: followingSymbol, ExpectedLineGap: expectedGap, Relocated: kind == "relocate", DestinationFile: c.EditDestination, ExpectedRefusal: c.EditExpect == "refusal", Sender: sender, After: after, AfterEvent: afterEvent})
+		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Editor: arrival.Editor, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: deleted, TargetSymbol: targetSymbol, FollowingSymbol: followingSymbol, ExpectedLineGap: expectedGap, Relocated: kind == "relocate", DestinationFile: c.EditDestination, ExpectedRefusal: c.EditExpect == "refusal", Sender: sender, After: after, AfterEvent: afterEvent, File: file})
 	}
 	return p, nil
 }

@@ -16,6 +16,8 @@ import (
 const (
 	editProbeShellAfterTool = "shell_after_tool"
 	editProbeEditorSave     = "editor_save"
+	editProbeCreateDelete   = "create_delete"
+	editProbeHotFile        = "hot_file" // MCP edits; only the arrivals are shaped
 )
 
 type editProbeFileIdentity struct {
@@ -56,6 +58,23 @@ func editProbeNativeSender(c Corpus, kind, tool string, count, editors int) erro
 		if editors != 1 {
 			return errors.New("editor_save has one editor")
 		}
+	case editProbeCreateDelete:
+		if filepath.Ext(c.File) != ".go" {
+			return errors.New("create_delete is implemented for Go fixtures only; TypeScript/Python native create/delete is not implemented")
+		}
+		if kind != "add_intrafile_call" || tool != "edit.file" || filepath.Base(c.File) != c.File || c.EditOutput == "compact" || c.EditOutput == "cli" {
+			return errors.New("create_delete needs a root-level Go call-addition fixture with JSON or TOON probes: a deleted file's absence is proved by the exact refusal and complete collections")
+		}
+		if count != 100 || editors != 1 {
+			return errors.New("create_delete runs 50 create/delete pairs: 100 edits on one editor")
+		}
+	case editProbeHotFile:
+		if kind != "add_intrafile_call" || tool != "edit.file" && tool != "edit.write" {
+			return errors.New("hot_file pairs edit.file or edit.write call additions on one file")
+		}
+		if count != 100 || editors != 2 {
+			return errors.New("hot_file runs 50 simultaneous pairs: 100 edits on exactly two editors")
+		}
 	default:
 		return fmt.Errorf("unsupported edit_sender %q", c.EditSender)
 	}
@@ -71,6 +90,11 @@ func editProbeNativeStep(sender string, ordinal int) (string, *int, string) {
 		return "shell_write", &after, "ack"
 	case sender == editProbeEditorSave:
 		return "editor_save", nil, ""
+	case sender == editProbeCreateDelete && ordinal%2 == 0:
+		return "create_file", nil, ""
+	case sender == editProbeCreateDelete:
+		after := ordinal - 1
+		return "delete_file", &after, "first_correct"
 	}
 	return "", nil, ""
 }
@@ -88,12 +112,17 @@ func editProbePlaceholder(seed int64, ordinal int) string {
 }
 
 func editProbeNativeLimitations(sender string) []string {
+	if sender == editProbeHotFile {
+		return []string{"two fixed editors send each pair of edits to one file at the same due time; every edit keeps its own ACK, receipt and accounting, and a lost write is a measured outcome"}
+	}
 	out := []string{"native writes have no MCP acknowledgement, receipt, phases or derived time: each record keeps its own write window, its immediate file readback gates t_readback, graph-backed readbacks are observation-only, and it completes once every probe is first-correct inside the deadline", "the daemon learns of a native write only through its watcher, so a fresh claim after the write is counted unassessed, never stale-claimed-fresh"}
 	switch sender {
 	case editProbeShellAfterTool:
 		out = append(out, "odd ordinals are in-place shell writes (truncate, then write) dispatched at their due time or the preceding tool edit's own ACK, whichever is later; a tool edit that overlaps a shell write can lose either change, which is a measured outcome")
 	case editProbeEditorSave:
 		out = append(out, "every ordinal is an editor save: same-size bytes are written to a temporary file beside the fixture and renamed over it")
+	case editProbeCreateDelete:
+		out = append(out, "even ordinals create their own Go file beside the fixture and odd ordinals delete it once every probe of that create was first-correct; a deleted file has no gating readback, and its file-scoped summary, editing context and call chain are not probed because a missing file's answer has no pinned contract", "TypeScript/Python native create/delete is not implemented: a gap, not an inapplicable cell")
 	}
 	return out
 }
@@ -123,9 +152,10 @@ func (s *editProbeState) firstCorrectComplete() bool {
 	return true
 }
 
-// A native write runs at its due time, or once the preceding tool edit's own
-// ACK is known when it depends on one. It is never retried; a dependency
-// without an ACK is an explicit failure and nothing is written.
+// A native write runs at its due time, or once its dependency is met: the
+// preceding tool edit's own ACK, or every first-correct probe of the paired
+// create. It is never retried; an unmet dependency is an explicit failure and
+// nothing is written.
 func (r *editProbeRuntime) doNativeWrite(ctx context.Context, step editProbeStep) {
 	native := &editProbeNativeWrite{Sender: step.Sender, After: step.After, Window: unavailable("ms", "native write not performed")}
 	var written error
@@ -136,20 +166,34 @@ func (r *editProbeRuntime) doNativeWrite(ctx context.Context, step editProbeStep
 		case <-ctx.Done():
 		}
 		predecessor.mu.Lock()
-		acknowledged := !predecessor.acknowledged.IsZero()
+		met := !predecessor.acknowledged.IsZero()
+		if step.AfterEvent == "first_correct" {
+			met = predecessor.record.Outcome == "complete"
+		}
 		predecessor.mu.Unlock()
 		ready := time.Since(r.origin).Nanoseconds()
 		native.DependencyReadyNS = &ready
-		if !acknowledged && ctx.Err() == nil {
+		switch {
+		case ctx.Err() != nil:
+		case !met && step.AfterEvent == "first_correct":
+			written = fmt.Errorf("native write dependency failed: ordinal %d did not complete every first-correct probe", *step.After)
+		case !met:
 			written = fmt.Errorf("native write dependency failed: ordinal %d has no own acknowledgement", *step.After)
 		}
 	}
 	r.editsInFlight.Add(1)
 	defer r.editsInFlight.Add(-1)
 	s, callCtx, cancel, started := r.beginEdit(ctx, step)
+	defer s.signalAck()
 	defer s.stopProbes()
 	defer cancel()
 	if written == nil && ctx.Err() == nil {
+		if step.Deleted {
+			// The paired create's own completed source probe proved presence.
+			s.mu.Lock()
+			s.absenceBefore = map[string]bool{step.BeforeSymbol: true}
+			s.mu.Unlock()
+		}
 		written = r.writeNative(s, step, native)
 	}
 	s.mu.Lock()
@@ -160,6 +204,9 @@ func (r *editProbeRuntime) doNativeWrite(ctx context.Context, step editProbeStep
 	s.record.PhasesMS = editProbePhases(nil, "native write has no mutation receipt")
 	s.record.Derived = unavailable("ms", "native write has no mutation receipt")
 	s.record.Readback = unavailable("ms", "native write or its immediate file readback failed")
+	if step.Deleted {
+		s.record.Readback = unavailable("ms", "a deleted file has no readback to gate")
+	}
 	if written != nil {
 		s.record.Errors = append(s.record.Errors, written.Error())
 	}
@@ -169,10 +216,13 @@ func (r *editProbeRuntime) doNativeWrite(ctx context.Context, step editProbeStep
 		if step.BeforeSymbol != "" {
 			kinds = append(kinds, "old_source_absent")
 		}
+		if step.Deleted {
+			kinds = []string{"source"}
+		}
 		// The file is on disk once the write returns; graph answers may lag
 		// the watcher, so they are recorded without gating anything.
 		end, correct := r.immediateReadbacks(callCtx, s, step, kinds, map[string]bool{"source": true, "old_source_absent": true})
-		if correct {
+		if correct && !end.IsZero() {
 			s.mu.Lock()
 			s.record.Readback = measured(float64(end.Sub(started))/float64(time.Millisecond), "ms")
 			s.mu.Unlock()
@@ -205,58 +255,86 @@ func (r *editProbeRuntime) doNativeWrite(ctx context.Context, step editProbeStep
 	}
 }
 
-// writeNative writes only the registered owned fixture. A shell write
-// truncates and rewrites the file in place; an editor save writes same-size
-// bytes to a temporary file beside it and renames that over the fixture.
+// writeNative writes only its registered owned file: the fixture, or the
+// step's own created file. A shell write truncates and rewrites the file in
+// place; an editor save writes same-size bytes to a temporary file beside it
+// and renames that over the fixture; create and delete add or remove the
+// step's own file.
 func (r *editProbeRuntime) writeNative(s *editProbeState, step editProbeStep, native *editProbeNativeWrite) error {
 	path, _ := step.Request.Arguments["path"].(string)
-	match, _ := step.Request.Arguments["match"].(string)
-	replacement, _ := step.Request.Arguments["replacement"].(string)
+	owned := r.plan.File
+	if step.File != "" {
+		owned = step.File
+	}
 	repo := r.p.Repos[0].Path
 	target := filepath.Join(repo, filepath.FromSlash(path))
-	if step.Request.Tool != "native" || step.Request.Operation != step.Sender || path != r.plan.File || match == "" || !inside(repo, target) {
+	if step.Request.Tool != "native" || step.Request.Operation != step.Sender || path != owned || !inside(repo, target) {
 		return errors.New("native sender writes only the registered owned fixture file")
 	}
+	var write func() error
 	before, err := os.Lstat(target)
-	if err != nil {
-		return err
+	if step.Sender == "create_file" {
+		content, _ := step.Request.Arguments["content"].(string)
+		if !errors.Is(err, os.ErrNotExist) {
+			return errors.New("native create target already exists")
+		}
+		write = func() error { return editProbeCreateFile(target, []byte(content)) }
+	} else {
+		if err != nil {
+			return err
+		}
+		if !before.Mode().IsRegular() {
+			return errors.New("native sender writes only a regular owned fixture file")
+		}
+		native.Before = editProbeIdentity(before)
+		write = func() error { return os.Remove(target) }
 	}
-	if !before.Mode().IsRegular() {
-		return errors.New("native sender writes only a regular owned fixture file")
-	}
-	native.Before = editProbeIdentity(before)
-	current, err := os.ReadFile(target)
-	if err != nil {
-		return err
-	}
-	if strings.Count(string(current), match) != 1 {
-		return errors.New("native write splice does not occur exactly once in the current fixture bytes")
-	}
-	next := []byte(strings.Replace(string(current), match, replacement, 1))
-	if step.Sender == "editor_save" && len(next) != len(current) {
-		return errors.New("editor save must keep the fixture size")
+	if step.Sender == "shell_write" || step.Sender == "editor_save" {
+		match, _ := step.Request.Arguments["match"].(string)
+		replacement, _ := step.Request.Arguments["replacement"].(string)
+		current, err := os.ReadFile(target)
+		if err != nil {
+			return err
+		}
+		if match == "" || strings.Count(string(current), match) != 1 {
+			return errors.New("native write splice does not occur exactly once in the current fixture bytes")
+		}
+		next := []byte(strings.Replace(string(current), match, replacement, 1))
+		if step.Sender == "editor_save" && len(next) != len(current) {
+			return errors.New("editor save must keep the fixture size")
+		}
+		write = func() error { return editProbeShellWrite(target, next) }
+		if step.Sender == "editor_save" {
+			write = func() error { return editProbeSaveReplace(target, step.Ordinal, next, before.Mode().Perm()) }
+		}
 	}
 	start := time.Now()
 	s.mu.Lock()
 	s.editWrite = start
 	s.mu.Unlock()
-	if step.Sender == "editor_save" {
-		err = editProbeSaveReplace(target, step.Ordinal, next, before.Mode().Perm())
-	} else {
-		err = editProbeShellWrite(target, next)
-	}
+	err = write()
 	end := time.Now()
 	startNS, endNS := start.Sub(r.origin).Nanoseconds(), end.Sub(r.origin).Nanoseconds()
 	native.StartNS, native.EndNS = &startNS, &endNS
 	native.Window = measured(float64(end.Sub(start))/float64(time.Millisecond), "ms")
 	if after, statErr := os.Lstat(target); statErr == nil {
-		native.Written, native.Replaced = editProbeIdentity(after), !os.SameFile(before, after)
+		native.Written = editProbeIdentity(after)
+		native.Replaced = before != nil && !os.SameFile(before, after)
 	}
 	row := map[string]any{"event": "native_write", "sender": step.Sender, "path": path, "write_start_ns": startNS, "write_end_ns": endNS, "before": native.Before, "after": native.Written, "replaced": native.Replaced}
 	if err != nil {
 		row["error"] = err.Error()
 	}
 	return errors.Join(err, s.emit(row))
+}
+
+func editProbeCreateFile(target string, content []byte) error {
+	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = file.Write(content)
+	return errors.Join(err, file.Close())
 }
 
 // Shell redirection semantics: the existing file is truncated, then written.
