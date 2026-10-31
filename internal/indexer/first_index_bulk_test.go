@@ -19,13 +19,13 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/progress"
+	"github.com/zzet/gortex/internal/search"
 )
 
 // Embed the real store so the shadow and its optional persistence capabilities
 // stay intact. Only the drain boundaries are intercepted.
 type firstIndexBulkProbe struct {
 	*store_sqlite.Store
-	beforeBegin func()
 	duringDrain func()
 	begins      int
 	flushes     int
@@ -34,9 +34,6 @@ type firstIndexBulkProbe struct {
 
 func (s *firstIndexBulkProbe) BeginBulkLoad() {
 	s.begins++
-	if s.beforeBegin != nil {
-		s.beforeBegin()
-	}
 	s.Store.BeginBulkLoad()
 }
 
@@ -206,29 +203,129 @@ func TestDrainAddBatchReturnsStorageFailure(t *testing.T) {
 	}
 }
 
-func TestFirstIndexDrainUsesBulkWindow(t *testing.T) {
-	probe, db := newFirstIndexBulkFixture(t)
-	indexes := firstIndexSchemaIndexes(t, db)
-	probe.beforeBegin = func() { assertFirstIndexNoReceipts(t, probe.Store, "repo") }
-	probe.duringDrain = func() {
-		assert.True(t, firstIndexBulkActive(t, probe.Store), "cold shadow drain must engage standalone bulk mode")
-		assertFirstIndexNoReceipts(t, probe.Store, "repo")
-		assert.NotEqual(t, indexes, firstIndexSchemaIndexes(t, db), "dense indexes must be deferred during drain")
+// firstIndexWindowWitness counts a store's batch writes, and how many of them
+// landed inside an engaged bulk window with the dense indexes deferred. fail,
+// when set, decides whether the store refuses a batch.
+type firstIndexWindowWitness struct {
+	batches, engaged, deferred int
+	fail                       func(edgeRows int) error
+}
+
+func watchFirstIndexWindow(t *testing.T, store *store_sqlite.Store, db *sql.DB, indexes []string) *firstIndexWindowWitness {
+	t.Helper()
+	w := &firstIndexWindowWitness{}
+	t.Cleanup(store.SetBatchWriteHookForTest(func(_, edgeRows int) error {
+		w.batches++
+		if firstIndexBulkActive(t, store) {
+			w.engaged++
+		}
+		if !assert.ObjectsAreEqual(indexes, firstIndexSchemaIndexes(t, db)) {
+			w.deferred++
+		}
+		if w.fail != nil {
+			return w.fail(edgeRows)
+		}
+		return nil
+	}))
+	// The eviction runs just before the window opens, so this is the last
+	// point at which a receipt could wrongly precede the drain.
+	shadowEvictionBranchHook = func(retirement bool) {
+		assert.True(t, retirement, "a SQLite target must take the shadow-replacement retirement")
+		assertFirstIndexNoReceipts(t, store, "repo")
 	}
-	idx := newFirstIndexBulkIndexer(t, probe, "repo")
-	result, err := idx.IndexCtx(context.Background(), firstIndexFixtureRepo(t))
-	require.NoError(t, err)
-	require.Positive(t, result.NodeCount)
-	require.Positive(t, probe.batches, "test must observe the shadow drain")
-	assert.Equal(t, 1, probe.begins)
-	assert.Equal(t, 1, probe.flushes)
-	state, found, err := probe.GetRepoIndexState("repo")
+	t.Cleanup(func() { shadowEvictionBranchHook = nil })
+	return w
+}
+
+func (w *firstIndexWindowWitness) assertEngaged(t *testing.T) {
+	t.Helper()
+	require.Positive(t, w.batches, "test must observe the shadow drain")
+	assert.Positive(t, w.engaged, "cold shadow drain must engage standalone bulk mode")
+	assert.Positive(t, w.deferred, "dense indexes must be deferred during drain")
+}
+
+func assertFirstIndexReceipts(t *testing.T, store *store_sqlite.Store, result *IndexResult) {
+	t.Helper()
+	state, found, err := store.GetRepoIndexState("repo")
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, result.NodeCount, state.NodeCount)
 	assert.Equal(t, result.EdgeCount, state.EdgeCount)
-	assert.Contains(t, probe.LoadFileMtimes("repo"), "app.py")
-	assertFirstIndexRestored(t, probe.Store, db, indexes)
+	assert.NotEmpty(t, store.LoadFileMtimes("repo"))
+}
+
+// A cold first index drains through a standalone bulk window on every route
+// into it, and again on a retry after a failed drain left rows behind.
+func TestFirstIndexDrainUsesBulkWindow(t *testing.T) {
+	t.Run("IndexCtx on a fresh store", func(t *testing.T) {
+		store, db := newFirstIndexStore(t)
+		indexes := firstIndexSchemaIndexes(t, db)
+		writerSync := firstIndexWriterSynchronous(t, store)
+		w := watchFirstIndexWindow(t, store, db, indexes)
+
+		result, err := newFirstIndexBulkIndexer(t, store, "repo").IndexCtx(context.Background(), firstIndexFixtureRepo(t))
+		require.NoError(t, err)
+		require.Positive(t, result.NodeCount)
+		w.assertEngaged(t)
+		assertFirstIndexReceipts(t, store, result)
+		assert.Contains(t, store.LoadFileMtimes("repo"), "app.py")
+		assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store))
+		assertFirstIndexRestored(t, store, db, indexes)
+	})
+
+	t.Run("TrackRepoCtx on an empty multi-repo store", func(t *testing.T) {
+		store, db := newFirstIndexStore(t)
+		indexes := firstIndexSchemaIndexes(t, db)
+		writerSync := firstIndexWriterSynchronous(t, store)
+		w := watchFirstIndexWindow(t, store, db, indexes)
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, "main.go"), "package app\n\nfunc Fetch(url string) string { return url }\n")
+		mi := NewMultiIndexer(store, newTestRegistry(), search.NewNull(), newTestConfigManager(t), zap.NewNop())
+		t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
+
+		result, err := mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "repo", Path: dir})
+		require.NoError(t, err)
+		require.Positive(t, result.NodeCount)
+		w.assertEngaged(t)
+		assertFirstIndexReceipts(t, store, result)
+		assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store))
+		assertFirstIndexRestored(t, store, db, indexes)
+	})
+
+	t.Run("a retry after a failed drain engages the window again", func(t *testing.T) {
+		store, db := newFirstIndexStore(t)
+		indexes := firstIndexSchemaIndexes(t, db)
+		writerSync := firstIndexWriterSynchronous(t, store)
+		w := watchFirstIndexWindow(t, store, db, indexes)
+		injected := errors.New("injected edge batch failure")
+		refused := false
+		w.fail = func(edgeRows int) error {
+			if edgeRows > 0 && !refused {
+				refused = true
+				return injected
+			}
+			return nil
+		}
+		dir := firstIndexFixtureRepo(t)
+
+		// The node batches land; the first edge batch is refused.
+		_, err := newFirstIndexBulkIndexer(t, store, "repo").IndexCtx(context.Background(), dir)
+		require.ErrorIs(t, err, injected)
+		require.True(t, refused, "the drain never reached an edge batch")
+		w.assertEngaged(t)
+		require.Positive(t, store.NodeCount(), "the failed drain must leave rows for the retry to evict")
+		assertFirstIndexNoReceipts(t, store, "repo")
+		assertFirstIndexRestored(t, store, db, indexes)
+
+		// The retry evicts them, which leaves the store cold again.
+		w.batches, w.engaged, w.deferred = 0, 0, 0
+		result, err := newFirstIndexBulkIndexer(t, store, "repo").IndexCtx(context.Background(), dir)
+		require.NoError(t, err)
+		w.assertEngaged(t)
+		assertFirstIndexReceipts(t, store, result)
+		assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store))
+		assertFirstIndexRestored(t, store, db, indexes)
+	})
 }
 
 func TestSecondRepoWarmStoreNoBulkWindow(t *testing.T) {
