@@ -637,19 +637,26 @@ func backfillSymbolFTSRowidMap(db *sql.DB) error {
 
 // BuildSymbolIndex is a no-op for FTS5: the index is maintained
 // incrementally on every insert, so there is nothing to build after the
-// bulk parse phase. We opportunistically run the FTS5 'optimize'
-// command to merge segments (purely a read-latency improvement); any
-// error is ignored because the index is already correct without it.
+// bulk parse phase. One bounded FTS5 merge improves read latency without a
+// whole-corpus optimize. Maintenance errors are logged through fts_merge but
+// do not fail the build: the transactional index is already query-correct.
 // Idempotent — safe to call any number of times.
 func (s *Store) BuildSymbolIndex() error {
 	// A generation's rows are correct as soon as its bounded inserts commit.
-	// FTS5 optimize is global maintenance, so running it for every unpublished
-	// generation turns a view burst into repeated whole-table writer holds.
+	// FTS maintenance targets the global table, so unpublished view bursts
+	// must not schedule repeated writer holds for already query-correct rows.
 	if s.viewGen > 0 {
 		return nil
 	}
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	var event bulkFinalizeEvent
+	merged := false
+	defer func() {
+		s.writeMu.Unlock()
+		if merged {
+			s.emitBulkFinalizeEvent(event)
+		}
+	}()
 	if s.coordinatedBulkLoad {
 		// Multi-repository cold indexing calls this once per repository. A
 		// full optimize of the growing corpus after every repo is quadratic;
@@ -657,7 +664,8 @@ func (s *Store) BuildSymbolIndex() error {
 		s.deferredFTSOptimize = true
 		return nil
 	}
-	_, _ = s.execActiveWriteLocked(context.Background(), `INSERT INTO symbol_fts(symbol_fts) VALUES('optimize')`)
+	event = s.mergeLiveFTSLocked("symbol_fts", `INSERT INTO symbol_fts(symbol_fts, rank) VALUES('merge', ?)`)
+	merged = true
 	return nil
 }
 
