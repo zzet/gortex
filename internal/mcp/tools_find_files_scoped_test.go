@@ -20,6 +20,7 @@ type findFilesProjectionStore struct {
 	projectedRepos []string
 	fullReads      int
 	summaryReads   int
+	locationReads  int
 }
 
 func (s *findFilesProjectionStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
@@ -39,6 +40,12 @@ func (s *findFilesProjectionStore) NodesLightByKindsInScopeSeq(repos, files []st
 	s.summaryReads++
 	s.projectedRepos = append(s.projectedRepos, repos...)
 	return s.Store.NodesLightByKindsInScopeSeq(repos, files, kinds...)
+}
+
+func (s *findFilesProjectionStore) FileLocationsInScopeSeq(repos []string) iter.Seq[*graph.Node] {
+	s.locationReads++
+	s.projectedRepos = append(s.projectedRepos, repos...)
+	return s.Store.FileLocationsInScopeSeq(repos)
 }
 
 func TestFindFilesScopedProjectionPreservesScopeAndOverlay(t *testing.T) {

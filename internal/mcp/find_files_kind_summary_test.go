@@ -112,6 +112,118 @@ func TestFindFilesKindSummaryPreservesPublicResultsAndSelectedFallback(t *testin
 	require.Equal(t, before, tracked.summaryReads)
 }
 
+// Without a project in scope, find_files reads file locations and must answer
+// exactly as full rows do. Fourteen hits tie on score, depth and
+// repository-relative path; the twelve repository ties have descending IDs
+// but ascending languages, so the covering index order is not the ID order
+// the unstable sort's tie outcome depends on.
+func TestFindFilesLocationPathMatchesFullRowFallback(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "locations.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	var nodes []*graph.Node
+	for i := 0; i < 300; i++ {
+		for _, repo := range []string{"a", "b", ""} {
+			path := fmt.Sprintf("pkg/dir_%d/file_%03d.go", i%4, i)
+			if repo != "" {
+				path = repo + "/" + path
+			}
+			nodes = append(nodes, &graph.Node{ID: fmt.Sprintf("%s-row-%03d", repo, 299-i), Kind: graph.KindFile,
+				FilePath: path, RepoPrefix: repo, WorkspaceID: "ws", ProjectID: "p", Language: fmt.Sprintf("go-%d", i%3)})
+		}
+	}
+	for i := 0; i < 12; i++ {
+		nodes = append(nodes, &graph.Node{ID: fmt.Sprintf("tie-%02d", 11-i), Kind: graph.KindFile, FilePath: "a/docs/README.md",
+			RepoPrefix: "a", WorkspaceID: "ws", ProjectID: "p", Language: fmt.Sprintf("markdown-%02d", i)})
+	}
+	nodes = append(nodes,
+		&graph.Node{ID: "tie-unowned", Kind: graph.KindFile, FilePath: "docs/README.md", WorkspaceID: "ws", ProjectID: "p", Language: "text"},
+		&graph.Node{ID: "tie-wrong-project", Kind: graph.KindFile, FilePath: "docs/README.md", WorkspaceID: "ws", ProjectID: "other"},
+		&graph.Node{ID: "wrong-workspace", Kind: graph.KindFile, FilePath: "docs/README.md", WorkspaceID: "other", ProjectID: "p"},
+		&graph.Node{ID: "b-docs", Kind: graph.KindFile, FilePath: "b/docs/README.md", RepoPrefix: "b", WorkspaceID: "ws", ProjectID: "p"},
+		&graph.Node{ID: "a/docs/guide/README.md", Kind: graph.KindFile, FilePath: "a/docs/guide/README.md", RepoPrefix: "a", WorkspaceID: "ws", ProjectID: "p", Language: "markdown"},
+		&graph.Node{ID: "a/docs/README.md::Heading", Kind: graph.KindFunction, FilePath: "a/docs/README.md", RepoPrefix: "a", WorkspaceID: "ws", ProjectID: "p"},
+	)
+	require.NoError(t, store.AddBatchChecked(nodes, nil))
+	tracked := &findFilesProjectionStore{Store: store}
+	full := findFilesFullProjectionStore{Store: store, selected: store}
+	srv, _ := overlaySpineFixture(t)
+	srv.scopeWorkspace = "ws"
+	installContractCoreKindTestRuntime(t, srv)
+	read := func(ctx context.Context, args map[string]any) string {
+		t.Helper()
+		result, err := srv.handleFindFiles(ctx, makeReq("find_files", args))
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+		return result.Content[0].(mcplib.TextContent).Text
+	}
+	ids := func(text string) []string {
+		t.Helper()
+		var out findFilesResult
+		require.NoError(t, json.Unmarshal([]byte(text), &out))
+		got := make([]string, 0, len(out.Files))
+		for _, file := range out.Files {
+			got = append(got, file.ID)
+		}
+		return got
+	}
+	for _, args := range []map[string]any{
+		{"query": "README.md", "repo": "a", "limit": 5},
+		{"query": "README.md", "repo": "a", "limit": 13},
+		{"query": "README", "repo": "a", "limit": 500},
+		{"glob": "**/README.md", "repo": "a", "limit": 12},
+		{"query": "file_1", "repo": "a", "path": "pkg/dir_1", "limit": 7},
+		{"query": "fl", "fuzzy": true, "repo": "a", "glob": "pkg/**/*.go", "limit": 9},
+	} {
+		srv.graph = tracked
+		locations, summaries := tracked.locationReads, tracked.summaryReads
+		got := read(context.Background(), args)
+		require.Equal(t, locations+1, tracked.locationReads, "%v", args)
+		require.Equal(t, summaries, tracked.summaryReads)
+		require.Zero(t, tracked.fullReads)
+		require.Zero(t, tracked.globalReads)
+		srv.graph = full
+		require.Equal(t, read(context.Background(), args), got, "%v: location rows must answer as full rows do", args)
+	}
+	srv.graph = tracked
+	all := ids(read(context.Background(), map[string]any{"query": "README.md", "repo": "a", "limit": 500}))
+	require.Len(t, all, 15, "twelve repository ties, the unowned tie, the other-project tie and the deeper guide")
+	require.Equal(t, "a/docs/guide/README.md", all[14])
+	require.Contains(t, all, "tie-wrong-project", "no project in scope admits another project's row")
+	require.NotContains(t, all, "wrong-workspace")
+	require.NotContains(t, all, "b-docs")
+
+	// A project narrows the scope check by a column location rows lack, so
+	// the call keeps the summary read and still drops the other project.
+	srv.scopeProject = "p"
+	locations, summaries := tracked.locationReads, tracked.summaryReads
+	args := map[string]any{"query": "README.md", "repo": "a", "limit": 500}
+	scoped := read(context.Background(), args)
+	require.Equal(t, locations, tracked.locationReads)
+	require.Equal(t, summaries+1, tracked.summaryReads)
+	require.NotContains(t, ids(scoped), "tie-wrong-project")
+	require.Len(t, ids(scoped), 14)
+	srv.graph = full
+	require.Equal(t, read(context.Background(), args), scoped)
+	srv.scopeProject = ""
+
+	// An overlay masks and replaces base files, so it never offers the
+	// physical location read.
+	srv.graph = tracked
+	layer := graph.NewOverlayLayer()
+	layer.MarkFile("a/docs/guide/README.md", true)
+	layer.MarkFile("a/next/README.md", false)
+	layer.AddNode("a/next/README.md", &graph.Node{ID: "a/next/README.md", Kind: graph.KindFile, FilePath: "a/next/README.md", RepoPrefix: "a", WorkspaceID: "ws", ProjectID: "p", Language: "overlay"})
+	ctx := overlayCtx(t, srv, layer)
+	_, exposed := srv.readerFor(ctx).(graph.ScopedFileLocationSequencer)
+	require.False(t, exposed, "never reach through an overlay to the physical location read")
+	locations = tracked.locationReads
+	overlaid := ids(read(ctx, args))
+	require.Equal(t, locations, tracked.locationReads)
+	require.Contains(t, overlaid, "a/next/README.md")
+	require.NotContains(t, overlaid, "a/docs/guide/README.md", "the overlay's deletion mask still applies")
+}
+
 func TestContractCoreKindSummaryCapabilityStaysConditional(t *testing.T) {
 	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "traits.sqlite"))
 	require.NoError(t, err)
