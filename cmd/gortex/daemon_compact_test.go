@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -68,8 +69,8 @@ func TestShouldCompactStore(t *testing.T) {
 }
 
 // The store the daemon actually runs against must be the thing the boot
-// compaction probes for. This is the wiring link between warmupDaemonState's
-// maybeCompactStore(state.graph, …) call and the maintenance lane: a *Store
+// compaction probes for. This is the wiring link between the post-warmup
+// task and the maintenance lane: a *Store
 // that stopped satisfying storeCompactor would silently make boot compaction a
 // no-op instead of failing to build.
 var _ storeCompactor = (*store_sqlite.Store)(nil)
@@ -86,9 +87,9 @@ type compactStub struct {
 	compacts    int
 }
 
-func (c *compactStub) Path() string                      { return c.path }
-func (c *compactStub) CompactStats() (free, total int64) { return c.free, c.total }
-func (c *compactStub) Compact() error                    { c.compacts++; return c.compactErr }
+func (c *compactStub) Path() string                         { return c.path }
+func (c *compactStub) CompactStats() (free, total int64)    { return c.free, c.total }
+func (c *compactStub) CompactContext(context.Context) error { c.compacts++; return c.compactErr }
 
 // A deferral is not a failure. The maintenance lane refuses to rewrite the file
 // underneath a publish or a build, and boot must report that as the routine

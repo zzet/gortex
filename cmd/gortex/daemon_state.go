@@ -84,6 +84,9 @@ type daemonState struct {
 	// record so out-of-band readers (`gortex repos`) can find the same store
 	// instead of assuming the platform default.
 	backendPath string
+	// migratedStore is scoped to this open/boot, not persisted. A migration
+	// gets one complete re-index/enrichment boot before VACUUM is reconsidered.
+	migratedStore bool
 }
 
 // buildDaemonState builds the daemon's stack through the shared
@@ -104,6 +107,15 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 	if len(observers) > 0 {
 		migrationObserver = observers[0]
 	}
+	migrated := false
+	observeMigration := func(progress store_sqlite.MigrationProgress) {
+		if progress.Phase == store_sqlite.MigrationStarted {
+			migrated = true
+		}
+		if migrationObserver != nil {
+			migrationObserver(progress)
+		}
+	}
 	ss, err := serverstack.NewSharedServer(serverstack.SharedServerConfig{
 		Lifecycle:         serverstack.LifecycleDaemon,
 		Backend:           daemonBackend,
@@ -112,7 +124,7 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 		Global:            gc,
 		Logger:            logger,
 		Version:           version,
-		MigrationObserver: migrationObserver,
+		MigrationObserver: observeMigration,
 		Embedder: serverstack.EmbedderRequest{
 			FlagChanged: daemonEmbeddingsChanged,
 			FlagEnabled: daemonEmbeddings,
@@ -143,6 +155,7 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 		overlays:            ss.Overlays,
 		shared:              ss,
 		backendPath:         ss.StorePath,
+		migratedStore:       migrated || storeNeedsRebuild(ss.Graph),
 		resolverLSPRegistry: ss.ResolverLSPRegistry,
 		lspRouter:           ss.LSPRouter,
 	}
@@ -607,24 +620,9 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 		return nil, timings
 	}
 
-	// One-time store compaction, guarded (see daemon_compact.go). Placed HERE
-	// on purpose: after the orphan purge, so the pages it just freed are
-	// measured and reclaimed in the same pass; before the warmup re-index loop
-	// and the resolver/enrichment passes, whose writes would reuse freelist
-	// pages mid-measurement and whose readers would contend with VACUUM's
-	// exclusive lock. The socket is already listening (it opens before this
-	// goroutine by design), but at this point in boot the daemon's own
-	// workload is quiet and a rare early client query either finishes first or
-	// makes the VACUUM fail cleanly at busy_timeout — a skip, not a fault.
-	// Running before the socket opened instead would hold the daemon
-	// unreachable for the whole VACUUM, turning a compacting boot into an
-	// apparent hang.
-	finishCompact := startWarmupStep(logger, "store_compaction_check")
-	maybeCompactStore(state.graph, logger)
-	finishCompact()
-	if ctx.Err() != nil {
-		return nil, timings
-	}
+	// Re-index and resolver writes can reuse pages freed by the purge. Boot
+	// compaction measures again only after enrichment and the warmup producer
+	// have finished; a VACUUM must never delay this startup path.
 
 	// Register a per-repo resolver-time LSP helper for every
 	// tracked repo BEFORE the parallel warmup loop fires. The
