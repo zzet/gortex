@@ -107,8 +107,16 @@ func TestScopedBFSAdmissionMatchesLegacyGoOutputAndUnrelatedRows(t *testing.T) {
 						}
 					}
 				}
-				require.Equal(t, 8, spy.calls)
-				require.Equal(t, spy.calls, spy.handled, "ordinary scoped walks use the one-statement projection")
+				// The root's call fan-out always reads its neighborhood in one
+				// statement. Its raw caller fan-in sits at the threshold; the
+				// wrapper hides the contract caller, so masked caller walks go
+				// hop by hop.
+				wantStatements := 8
+				if masked {
+					wantStatements = 4
+				}
+				require.Equal(t, wantStatements, spy.calls)
+				require.Equal(t, spy.calls, spy.handled, "wide scoped walks use the one-statement projection")
 				require.Zero(t, spy.allNodes)
 				require.Zero(t, spy.allEdges)
 				if pass == 0 {
@@ -194,7 +202,7 @@ func TestScopedBFSAdmissionKeepsExplicitOwnershipSets(t *testing.T) {
 		eng := query.NewEngine(store)
 		opts := query.QueryOptions{Depth: 3, Limit: 20}
 		require.Equal(t, eng.WithReader(legacy).GetCallChain(admissionRoot, opts), eng.WithReader(fast).GetCallChain(admissionRoot, opts), "ownership=%v", owned)
+		require.Equal(t, 1, spy.handled, "the wide call chain uses the one-statement projection")
 		require.Equal(t, eng.WithReader(legacy).GetCallers(admissionRoot, opts), eng.WithReader(fast).GetCallers(admissionRoot, opts), "ownership=%v", owned)
-		require.Equal(t, 2, spy.handled)
 	}
 }

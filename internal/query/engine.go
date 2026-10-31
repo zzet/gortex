@@ -1525,6 +1525,12 @@ func (e *Engine) Stats() *graph.GraphStats {
 // with hundreds of implementors cannot blow up a call-chain walk.
 const defaultDispatchFanout = 24
 
+// bfsAdmissionMinFanout is the seed fan-out from which a scoped walk reads its
+// neighborhood in one admission statement. That statement costs about as much
+// as six indexed adjacency reads even for an empty neighborhood, so a seed with
+// fewer matching edges than this finishes sooner hop by hop.
+const bfsAdmissionMinFanout = 4
+
 // bfs performs breadth-first traversal from nodeID.
 // If forward is true, follows outgoing edges; if false, follows incoming.
 // If edgeKinds is nil, follows all edge kinds bidirectionally (for cluster).
@@ -1555,19 +1561,33 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 	// Read its scoped neighborhood in one statement where available, then run
 	// that same admission against the detached rows. Bare unscoped stores keep
 	// their established canonical BFSCapable hop-set path below.
+	//
+	// The statement costs several indexed adjacency reads, so it pays off only
+	// for a wide neighborhood. The seed's own adjacency, which the walk reads
+	// first anyway, decides: a narrow seed walks hop by hop from that read.
 	_, selectedAdmission := e.g.(graph.BFSAdmissionReader)
+	var seedAdjacency *graph.KindAdjacency
 	if !bidir && len(edgeKinds) > 0 && opts.Limit > 1 && !opts.ExcludeTests && !opts.IncludeDispatch && (opts.hasScopeFilter() || selectedAdmission) {
 		request := graph.BFSAdmissionRequest{Seed: nodeID, Direction: graph.DirectionForward, Kinds: edgeKinds, Depth: opts.Depth, Limit: opts.Limit,
 			Scope: graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}}
 		if !forward {
 			request.Direction = graph.DirectionBackward
 		}
-		snapshot, handled, err := graph.ReadBFSAdmissionContext(walkCtx, e.g, request)
+		first, err := graph.ReadKindAdjacency(walkCtx, e.g, nodeID, request.Direction, edgeKinds)
 		if walkDone(walkCtx) {
 			return &SubGraph{}
 		}
-		if err == nil && handled {
-			return e.WithReader(graph.NewBFSAdmissionReader(snapshot, seed, request.Direction)).bfs(nodeID, opts, forward, edgeKinds)
+		if err == nil {
+			seedAdjacency = &first
+		}
+		if err != nil || len(first.Edges) >= bfsAdmissionMinFanout {
+			snapshot, handled, err := graph.ReadBFSAdmissionContext(walkCtx, e.g, request)
+			if walkDone(walkCtx) {
+				return &SubGraph{}
+			}
+			if err == nil && handled {
+				return e.WithReader(graph.NewBFSAdmissionReader(snapshot, seed, request.Direction)).bfs(nodeID, opts, forward, edgeKinds)
+			}
 		}
 	}
 
@@ -1715,7 +1735,13 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 					if !forward {
 						dir = graph.DirectionBackward
 					}
-					adjacency, err := graph.ReadKindAdjacency(walkCtx, e.g, cur, dir, edgeKinds)
+					var adjacency graph.KindAdjacency
+					var err error
+					if seedAdjacency != nil && cur == nodeID {
+						adjacency, seedAdjacency = *seedAdjacency, nil
+					} else {
+						adjacency, err = graph.ReadKindAdjacency(walkCtx, e.g, cur, dir, edgeKinds)
+					}
 					if walkDone(walkCtx) {
 						return &SubGraph{}
 					}
