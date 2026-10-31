@@ -1,6 +1,11 @@
 # publish-claude-plugin syncs the generated marketplace bundle from
 # this repo to gortexhq/claude-plugin on every gortex release.
 #
+# release.yml dispatches it after each release: releases are created
+# with GITHUB_TOKEN, which does not fire the `release: published`
+# trigger below. That trigger only covers releases published without
+# GITHUB_TOKEN, such as by hand.
+#
 # How it works:
 #   1. Checkout gortex at the released tag
 #   2. Regenerate the bundle via `make claude-plugin`
@@ -117,9 +122,9 @@ jobs:
           # the freshly-regenerated bundle. --delete removes files that
           # no longer exist in the source (e.g. a removed skill). The
           # --exclude entries protect repo-level files we don't manage
-          # from the gortex side: .git/, .github/ (publish target may
-          # carry its own readme-only CI), and a top-level README/LICENSE
-          # if the publish target maintains its own.
+          # from the gortex side: .git/ and .github/ (publish target may
+          # carry its own readme-only CI). The root README and LICENSE
+          # are generated as part of the marketplace layout.
           rsync -av --delete \
             --exclude='.git/' \
             --exclude='.github/' \

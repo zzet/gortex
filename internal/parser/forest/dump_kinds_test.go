@@ -1,3 +1,5 @@
+//go:build grammardump
+
 package forest
 
 import (
@@ -53,7 +55,7 @@ import (
 // TestDumpGrammarKinds is a research helper. It parses a small
 // fixture per grammar and prints every named node kind seen, with
 // frequencies — feeds the per-language node-kind dispatch table.
-// Run with: go test -run TestDumpGrammarKinds -v ./internal/parser/forest/
+// Run with: go test -tags grammardump -run TestDumpGrammarKinds -v ./internal/parser/forest/
 func TestDumpGrammarKinds(t *testing.T) {
 	cases := []struct {
 		name string

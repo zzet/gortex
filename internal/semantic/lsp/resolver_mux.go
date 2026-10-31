@@ -1,13 +1,21 @@
 package lsp
 
-import "github.com/zzet/gortex/internal/resolver"
+import (
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/zzet/gortex/internal/resolver"
+)
 
 // ResolverHelperMux composes multiple resolve-time helpers for one
 // workspace. Each child helper keeps its own extension set, so a repo can
 // route .ts/.tsx definitions to tsserver and .py definitions to pyright
 // without registering multiple top-level repo-prefix entries.
 type ResolverHelperMux struct {
-	helpers []resolver.LSPHelper
+	helpers   []resolver.LSPHelper
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // NewResolverHelperMux returns nil for an empty helper set, the sole helper
@@ -63,12 +71,22 @@ func (m *ResolverHelperMux) Close() error {
 	if m == nil {
 		return nil
 	}
-	for _, h := range m.helpers {
-		if closer, ok := h.(interface{ Close() error }); ok && closer != nil {
-			if err := closer.Close(); err != nil {
-				return err
+	m.closeOnce.Do(func() {
+		var closing sync.WaitGroup
+		errs := make([]error, len(m.helpers))
+		for i, helper := range m.helpers {
+			if closer, ok := helper.(interface{ Close() error }); ok && closer != nil {
+				closing.Add(1)
+				go func() {
+					defer closing.Done()
+					if err := closer.Close(); err != nil {
+						errs[i] = fmt.Errorf("resolver mux helper %d: %w", i, err)
+					}
+				}()
 			}
 		}
-	}
-	return nil
+		closing.Wait()
+		m.closeErr = errors.Join(errs...)
+	})
+	return m.closeErr
 }

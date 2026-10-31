@@ -1,0 +1,469 @@
+{
+  "schema_version": 1,
+  "run_id": "sample-run",
+  "git_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "binary": "/private/gortex",
+  "daemon_version": "sample",
+  "started": "2026-01-01T00:00:00Z",
+  "profile": "agent",
+  "seed": 42,
+  "workload": {
+    "scenario": "read",
+    "agents": 8,
+    "edit_agents": 0,
+    "linked_worktrees": 0,
+    "duration_seconds": 60,
+    "product_deadline_seconds": 120,
+    "seed": 42,
+    "profile": "agent",
+    "operations": [
+      {
+        "tool": "search",
+        "operation": "symbols",
+        "arguments": {
+          "operation": "symbols",
+          "output": {
+            "format": "json",
+            "max_bytes": 0
+          },
+          "query": "Example"
+        }
+      },
+      {
+        "tool": "search",
+        "operation": "text",
+        "arguments": {
+          "operation": "text",
+          "output": {
+            "format": "json",
+            "max_bytes": 0
+          },
+          "query": "Example"
+        }
+      },
+      {
+        "tool": "read",
+        "operation": "source",
+        "arguments": {
+          "operation": "source",
+          "output": {
+            "format": "json",
+            "max_bytes": 0
+          },
+          "target": {
+            "symbol": "sample.go::Example"
+          }
+        }
+      },
+      {
+        "tool": "read",
+        "operation": "file",
+        "arguments": {
+          "operation": "file",
+          "output": {
+            "format": "json",
+            "max_bytes": 0
+          },
+          "target": {
+            "file": "sample.go"
+          }
+        }
+      },
+      {
+        "tool": "read",
+        "operation": "editing_context",
+        "arguments": {
+          "operation": "editing_context",
+          "output": {
+            "format": "json",
+            "max_bytes": 0
+          },
+          "target": {
+            "file": "sample.go"
+          }
+        }
+      },
+      {
+        "tool": "read",
+        "operation": "summary",
+        "arguments": {
+          "operation": "summary",
+          "output": {
+            "format": "json",
+            "max_bytes": 0
+          },
+          "target": {
+            "file": "sample.go"
+          }
+        }
+      },
+      {
+        "tool": "relations",
+        "operation": "callers",
+        "arguments": {
+          "operation": "callers",
+          "output": {
+            "format": "json",
+            "max_bytes": 0
+          },
+          "target": {
+            "symbol": "sample.go::Example"
+          }
+        }
+      },
+      {
+        "tool": "relations",
+        "operation": "usages",
+        "arguments": {
+          "operation": "usages",
+          "output": {
+            "format": "json",
+            "max_bytes": 0
+          },
+          "target": {
+            "symbol": "sample.go::Example"
+          }
+        }
+      },
+      {
+        "tool": "explore",
+        "operation": "context",
+        "arguments": {
+          "operation": "context",
+          "output": {
+            "format": "json",
+            "max_bytes": 0
+          },
+          "task": "Example"
+        }
+      },
+      {
+        "tool": "change",
+        "operation": "impact",
+        "arguments": {
+          "operation": "impact",
+          "output": {
+            "format": "json",
+            "max_bytes": 0
+          },
+          "target": {
+            "symbol": "sample.go::Example"
+          }
+        }
+      }
+    ],
+    "cpu_profile_seconds": 0,
+    "warm_timeout_seconds": 0,
+    "stop_timeout_seconds": 0,
+    "keep_state": false,
+    "session_model": "per_agent",
+    "sweep_repetitions": 0,
+    "sweep_budget_seconds": 0
+  },
+  "host": {
+    "machine": "sample-host",
+    "os": "linux",
+    "arch": "amd64",
+    "kernel": "sample",
+    "profile": "native",
+    "validated": false,
+    "limits": {
+      "cpu": {
+        "value": 8,
+        "unit": "cores",
+        "reason": ""
+      }
+    },
+    "availability": null
+  },
+  "corpus": [
+    {
+      "label": "sample",
+      "source": "/input/sample",
+      "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "file": "sample.go",
+      "symbol": "sample.go::Example",
+      "query": "Example",
+      "edit_template": "",
+      "edit_anchor": "",
+      "proposed_signature": "func Example() int"
+    }
+  ],
+  "request_plan_sha256": "c09f35245571114fb5ad710327db2f3b2b6d6934a0d6a22dc400022dc6370f81",
+  "phases": [
+    {
+      "session_model": "per_agent",
+      "operations": [
+        {
+          "tool": "search",
+          "operation": "symbols",
+          "arguments": {
+            "operation": "symbols",
+            "output": {
+              "format": "json",
+              "max_bytes": 0
+            },
+            "query": "Example"
+          }
+        },
+        {
+          "tool": "search",
+          "operation": "text",
+          "arguments": {
+            "operation": "text",
+            "output": {
+              "format": "json",
+              "max_bytes": 0
+            },
+            "query": "Example"
+          }
+        },
+        {
+          "tool": "read",
+          "operation": "source",
+          "arguments": {
+            "operation": "source",
+            "output": {
+              "format": "json",
+              "max_bytes": 0
+            },
+            "target": {
+              "symbol": "sample.go::Example"
+            }
+          }
+        },
+        {
+          "tool": "read",
+          "operation": "file",
+          "arguments": {
+            "operation": "file",
+            "output": {
+              "format": "json",
+              "max_bytes": 0
+            },
+            "target": {
+              "file": "sample.go"
+            }
+          }
+        },
+        {
+          "tool": "read",
+          "operation": "editing_context",
+          "arguments": {
+            "operation": "editing_context",
+            "output": {
+              "format": "json",
+              "max_bytes": 0
+            },
+            "target": {
+              "file": "sample.go"
+            }
+          }
+        },
+        {
+          "tool": "read",
+          "operation": "summary",
+          "arguments": {
+            "operation": "summary",
+            "output": {
+              "format": "json",
+              "max_bytes": 0
+            },
+            "target": {
+              "file": "sample.go"
+            }
+          }
+        },
+        {
+          "tool": "relations",
+          "operation": "callers",
+          "arguments": {
+            "operation": "callers",
+            "output": {
+              "format": "json",
+              "max_bytes": 0
+            },
+            "target": {
+              "symbol": "sample.go::Example"
+            }
+          }
+        },
+        {
+          "tool": "relations",
+          "operation": "usages",
+          "arguments": {
+            "operation": "usages",
+            "output": {
+              "format": "json",
+              "max_bytes": 0
+            },
+            "target": {
+              "symbol": "sample.go::Example"
+            }
+          }
+        },
+        {
+          "tool": "explore",
+          "operation": "context",
+          "arguments": {
+            "operation": "context",
+            "output": {
+              "format": "json",
+              "max_bytes": 0
+            },
+            "task": "Example"
+          }
+        },
+        {
+          "tool": "change",
+          "operation": "impact",
+          "arguments": {
+            "operation": "impact",
+            "output": {
+              "format": "json",
+              "max_bytes": 0
+            },
+            "target": {
+              "symbol": "sample.go::Example"
+            }
+          }
+        }
+      ],
+      "name": "read",
+      "started": "2026-01-01T00:00:01Z",
+      "duration_seconds": 60,
+      "gate": {
+        "readiness": {
+          "ready": true,
+          "enriched": true
+        }
+      },
+      "tools": {
+        "search.symbols": {
+          "latency_ms": {
+            "count": 1,
+            "p50": {
+              "value": 1,
+              "unit": "ms",
+              "reason": ""
+            },
+            "p95": {
+              "value": 1,
+              "unit": "ms",
+              "reason": ""
+            },
+            "p99": {
+              "value": 1,
+              "unit": "ms",
+              "reason": ""
+            },
+            "max": {
+              "value": 1,
+              "unit": "ms",
+              "reason": ""
+            }
+          },
+          "successful_calls_per_second": {
+            "value": 0.016666666666666666,
+            "unit": "calls/s",
+            "reason": ""
+          },
+          "successes": 1,
+          "busy_refusals": 0,
+          "errors": {},
+          "phase_censored": 0,
+          "product_expired": 0
+        }
+      },
+      "probes": null,
+      "attempts": null,
+      "edits": null,
+      "edit_latency_ms": {
+        "count": 0,
+        "p50": {
+          "value": null,
+          "unit": "ms",
+          "reason": "no completed observations"
+        },
+        "p95": {
+          "value": null,
+          "unit": "ms",
+          "reason": "no completed observations"
+        },
+        "p99": {
+          "value": null,
+          "unit": "ms",
+          "reason": "no completed observations"
+        },
+        "max": {
+          "value": null,
+          "unit": "ms",
+          "reason": "no completed observations"
+        }
+      },
+      "visible_latency_ms": {
+        "count": 0,
+        "p50": {
+          "value": null,
+          "unit": "ms",
+          "reason": "no completed observations"
+        },
+        "p95": {
+          "value": null,
+          "unit": "ms",
+          "reason": "no completed observations"
+        },
+        "p99": {
+          "value": null,
+          "unit": "ms",
+          "reason": "no completed observations"
+        },
+        "max": {
+          "value": null,
+          "unit": "ms",
+          "reason": "no completed observations"
+        }
+      },
+      "never_visible": 0,
+      "visibility_censored": 0,
+      "metrics": null,
+      "daemon_status": [
+        {
+          "views": {},
+          "storage": {
+            "wal_pending_frames": 0
+          }
+        }
+      ],
+      "graph_stats": [
+        {
+          "total_nodes": 2,
+          "total_edges": 1
+        }
+      ],
+      "errors": null
+    }
+  ],
+  "tool_sweep": null,
+  "metrics": {
+    "daemon_cpu_cores": {
+      "value": 2,
+      "unit": "cores",
+      "reason": ""
+    },
+    "pss": {
+      "value": null,
+      "unit": "bytes",
+      "reason": "not available on this OS"
+    },
+    "stop_seconds": {
+      "value": 1,
+      "unit": "s",
+      "reason": ""
+    }
+  },
+  "artifacts": null,
+  "crashes": null,
+  "errors": null,
+  "complete": true
+}

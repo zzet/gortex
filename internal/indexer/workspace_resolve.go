@@ -459,6 +459,15 @@ func (mi *MultiIndexer) RunGlobalResolve() {
 	mi.runCrossRepoResolve(true)
 }
 
+// RunGlobalResolveContext is the producer-owned variant used during daemon
+// startup, so shutdown does not replace an expired context with Background.
+func (mi *MultiIndexer) RunGlobalResolveContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return mi.runCrossRepoResolveContext(ctx, true)
+}
+
 // runCrossRepoResolve runs the cross-repo resolver over the shared graph,
 // lifting references that span repo boundaries. When reconcileContracts is
 // true it also reconciles contract-bridge edges; the pre-enrichment resolve

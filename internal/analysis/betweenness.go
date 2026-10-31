@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"context"
 	"math/rand"
 	"sort"
 
@@ -73,8 +74,21 @@ const (
 // Pivot sampling is seeded with a fixed seed, so results are
 // reproducible run to run.
 func ComputeBetweenness(g graph.Reader) *BetweennessResult {
+	result, _ := ComputeBetweennessContext(context.Background(), g)
+	return result
+}
+
+// ComputeBetweennessContext retains the same deterministic pivots and scores,
+// but never returns a partial ranking when its owner is cancelled.
+func ComputeBetweennessContext(ctx context.Context, g graph.Reader) (*BetweennessResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if g == nil {
-		return &BetweennessResult{Scores: map[string]float64{}}
+		return &BetweennessResult{Scores: map[string]float64{}}, nil
+	}
+	if ctx.Done() != nil {
+		g = graph.BindReadContext(g, ctx)
 	}
 	// Betweenness measures shortest-path centrality across the
 	// call / reference subgraph; only function and method nodes carry
@@ -107,9 +121,12 @@ func ComputeBetweenness(g graph.Reader) *BetweennessResult {
 	// Federation proxy nodes carry real kinds, so the kind filter above
 	// keeps them — drop them here so a remote stub is never a pivot.
 	ids = excludeProxyIDs(ids)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	n := len(ids)
 	if n == 0 {
-		return &BetweennessResult{Scores: map[string]float64{}}
+		return &BetweennessResult{Scores: map[string]float64{}}, nil
 	}
 
 	// Stable node ordering: betweenness itself is order-independent,
@@ -117,6 +134,9 @@ func ComputeBetweenness(g graph.Reader) *BetweennessResult {
 	// reproducible regardless of the iteration order
 	// NodeIDsByKinds happens to return.
 	sort.Strings(ids)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Forward adjacency over the call / reference subgraph.
 	// EdgeAdjacencyForKinds returns only the (from, to) projection of
@@ -132,37 +152,57 @@ func ComputeBetweenness(g graph.Reader) *BetweennessResult {
 	// wakeup on the production graph.
 	idIndex := make(map[string]int, n)
 	for i, id := range ids {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		idIndex[id] = i
 	}
 	adjacency := make([][]int, n)
-	appendPair := func(from, to string) {
+	scanned := 0
+	appendPair := func(from, to string) bool {
+		scanned++
+		if scanned&1023 == 0 && ctx.Err() != nil {
+			return false
+		}
 		fromIdx, fromOK := idIndex[from]
 		toIdx, toOK := idIndex[to]
 		if !fromOK || !toOK {
-			return
+			return true
 		}
 		adjacency[fromIdx] = append(adjacency[fromIdx], toIdx)
+		return true
 	}
 	if adjScan, ok := g.(graph.EdgeAdjacencyForKinds); ok {
 		for pair := range adjScan.EdgeAdjacencyForKinds(betweennessKinds, bcNodeKinds) {
-			appendPair(pair[0], pair[1])
+			if !appendPair(pair[0], pair[1]) {
+				return nil, ctx.Err()
+			}
 		}
 	} else if es, ok := g.(graph.EdgesByKindsScanner); ok {
 		for e := range es.EdgesByKinds(betweennessKinds) {
 			if e != nil {
-				appendPair(e.From, e.To)
+				if !appendPair(e.From, e.To) {
+					return nil, ctx.Err()
+				}
 			}
 		}
 	} else {
 		for _, kind := range betweennessKinds {
 			for e := range g.EdgesByKind(kind) {
 				if e != nil {
-					appendPair(e.From, e.To)
+					if !appendPair(e.From, e.To) {
+						return nil, ctx.Err()
+					}
 				}
 			}
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Adaptive fast path: exact for small graphs, sampled otherwise.
 	sources := ids
 	sampled := false
@@ -171,10 +211,15 @@ func ComputeBetweenness(g graph.Reader) *BetweennessResult {
 		sources = samplePivots(ids, betweennessPivots)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	scoreDense := make([]float64, n)
 	scratch := newBrandesScratch(n)
 	for _, src := range sources {
-		brandesAccumulate(idIndex[src], adjacency, scoreDense, &scratch)
+		if err := brandesAccumulateContext(ctx, idIndex[src], adjacency, scoreDense, &scratch); err != nil {
+			return nil, err
+		}
 	}
 
 	// Rescale the sampled estimate up to a full-source equivalent and convert
@@ -186,18 +231,26 @@ func ComputeBetweenness(g graph.Reader) *BetweennessResult {
 	score := make(map[string]float64, n)
 	var max float64
 	for i, id := range ids {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		v := scoreDense[i] * scale
 		score[id] = v
 		if v > max {
 			max = v
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return &BetweennessResult{
 		Scores:  score,
 		Max:     max,
 		Sampled: sampled,
 		Pivots:  len(sources),
-	}
+	}, nil
 }
 
 // samplePivots picks k distinct source nodes from ids using a
@@ -250,8 +303,13 @@ func newBrandesScratch(nodes int) brandesScratch {
 	}
 }
 
-func (s *brandesScratch) reset() {
+func (s *brandesScratch) resetContext(ctx context.Context) error {
 	for i := range s.dist {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		s.sigma[i] = 0
 		s.dist[i] = -1
 		s.delta[i] = 0
@@ -259,21 +317,34 @@ func (s *brandesScratch) reset() {
 	}
 	s.queue = s.queue[:0]
 	s.order = s.order[:0]
+	return ctx.Err()
 }
 
 // The graph is unweighted, so a plain BFS yields shortest paths. Node IDs have
 // already been lowered to dense integer slots by ComputeBetweenness; no maps
 // are allocated in the per-pivot loop.
-func brandesAccumulate(src int, adjacency [][]int, score []float64, scratch *brandesScratch) {
-	scratch.reset()
+func brandesAccumulateContext(ctx context.Context, src int, adjacency [][]int, score []float64, scratch *brandesScratch) error {
+	if err := scratch.resetContext(ctx); err != nil {
+		return err
+	}
 	scratch.sigma[src] = 1
 	scratch.dist[src] = 0
 	scratch.queue = append(scratch.queue, src)
 
 	for head := 0; head < len(scratch.queue); head++ {
+		if head&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		v := scratch.queue[head]
 		scratch.order = append(scratch.order, v)
-		for _, w := range adjacency[v] {
+		for edge, w := range adjacency[v] {
+			if edge&1023 == 1023 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			if scratch.dist[w] < 0 {
 				scratch.dist[w] = scratch.dist[v] + 1
 				scratch.queue = append(scratch.queue, w)
@@ -286,9 +357,19 @@ func brandesAccumulate(src int, adjacency [][]int, score []float64, scratch *bra
 	}
 
 	for i := len(scratch.order) - 1; i >= 0; i-- {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		w := scratch.order[i]
 		if scratch.sigma[w] != 0 {
-			for _, v := range scratch.preds[w] {
+			for edge, v := range scratch.preds[w] {
+				if edge&1023 == 1023 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
 				scratch.delta[v] += (scratch.sigma[v] / scratch.sigma[w]) * (1 + scratch.delta[w])
 			}
 		}
@@ -296,4 +377,5 @@ func brandesAccumulate(src int, adjacency [][]int, score []float64, scratch *bra
 			score[w] += scratch.delta[w]
 		}
 	}
+	return ctx.Err()
 }

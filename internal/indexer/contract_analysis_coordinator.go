@@ -392,25 +392,43 @@ func contractJobOutcome(err error) string {
 // leases, has ended.
 func (c *ContractAnalysisCoordinator) Close() error { return c.CloseContext(context.Background()) }
 
+// Cancel revokes every dispatcher/job without waiting for source releases.
+// Queued handoffs remain owned by workers until their asynchronous release has
+// completed, so CloseContext still cannot certify an undrained owner as closed.
+func (c *ContractAnalysisCoordinator) Cancel() {
+	if c == nil {
+		return
+	}
+	c.cancel()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	drained := make([]*ContractCaptureSource, 0, len(c.actors))
+	for _, a := range c.actors {
+		drained = append(drained, a.want.source)
+		a.want.source = nil
+		a.notifyLocked()
+	}
+	c.notifyLocked()
+	// Count the release before reopening the mutex: after closed no dispatcher
+	// can be admitted, and a concurrent CloseContext cannot miss this owner.
+	c.workers.Add(1)
+	c.mu.Unlock()
+	go func() {
+		defer c.workers.Done()
+		for _, source := range drained {
+			source.Release()
+		}
+	}()
+}
+
 // CloseContext preserves canceled pending debt and exposes an undrained worker
 // to its owner on timeout. The owner must not close the backing store early.
 func (c *ContractAnalysisCoordinator) CloseContext(ctx context.Context) error {
-	var drained []*ContractCaptureSource
-	c.mu.Lock()
-	if !c.closed {
-		c.closed = true
-		c.cancel()
-		for _, a := range c.actors {
-			drained = append(drained, a.want.source)
-			a.want.source = nil
-			a.notifyLocked()
-		}
-		c.notifyLocked()
-	}
-	c.mu.Unlock()
-	for _, source := range drained {
-		source.Release()
-	}
+	c.Cancel()
 	done := make(chan struct{})
 	go func() {
 		c.workers.Wait()

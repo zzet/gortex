@@ -600,8 +600,10 @@ type CheckoutCoordinator struct {
 	// lifetime is canceled before Close waits. Every loop-owned admission and
 	// build derives from it, so removing a checkout cannot sit behind an
 	// unrelated generation for minutes.
-	lifetime       context.Context
-	cancelLifetime context.CancelFunc
+	lifetime             context.Context
+	cancelLifetime       context.CancelFunc
+	watcherStartWG       sync.WaitGroup
+	watcherStartsDrained chan struct{}
 
 	// cycleMu serializes the loop's own cycles against a caller-driven
 	// transition. Both move this checkout's route, and a transition that
@@ -1033,6 +1035,34 @@ func (c *CheckoutCoordinator) Close() error {
 	return c.CloseContext(context.Background())
 }
 
+// Cancel revokes this coordinator's admissions and producers without joining
+// the watcher, builds or source mutations. It is permanent and idempotent.
+func (c *CheckoutCoordinator) Cancel() {
+	if c == nil {
+		return
+	}
+	c.once.Do(func() {
+		c.mu.Lock()
+		c.sourceMutationsClosing = true
+		c.watcherStartsDrained = make(chan struct{})
+		c.mu.Unlock()
+		if c.cancelLifetime != nil {
+			c.cancelLifetime()
+		}
+		c.closeDirtyChainCompactor()
+		c.cancelEnrichmentFollowup()
+		c.cancelFilesystemWatch()
+		if c.stop != nil {
+			close(c.stop)
+		}
+		// One cached completion, not a new wait goroutine on each retry.
+		go func() {
+			c.watcherStartWG.Wait()
+			close(c.watcherStartsDrained)
+		}()
+	})
+}
+
 // CloseContext cancels queued admission and in-flight cooperative work before
 // waiting. The cancellation is permanent even when the caller's wait deadline
 // expires; a later CloseContext may wait for the same shutdown to finish.
@@ -1043,22 +1073,18 @@ func (c *CheckoutCoordinator) CloseContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	c.once.Do(func() {
-		c.mu.Lock()
-		c.sourceMutationsClosing = true
-		c.mu.Unlock()
-		c.closeDirtyChainCompactor()
-		c.cancelEnrichmentFollowup()
-		if c.cancelLifetime != nil {
-			c.cancelLifetime()
-		}
-		c.closeFilesystemWatch()
-		if c.stop != nil {
-			close(c.stop)
-		}
-	})
+	c.Cancel()
 	select {
 	case <-c.done:
+		// Add/Wait is fenced by the same admission gate Cancel closes.
+		select {
+		case <-c.watcherStartsDrained:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		// Physical watcher cleanup remains part of ownership, after all
+		// coordinators have received cancellation from their lifecycle.
+		c.closeFilesystemWatch()
 		// The start-time Git index refresh has its own goroutine. Cancellation
 		// alone does not prove its process and index lock have been released.
 		if err := c.waitRacyIndexHeal(ctx); err != nil {

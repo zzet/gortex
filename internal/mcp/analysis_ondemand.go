@@ -135,21 +135,27 @@ func (s *Server) ensureAnalysis() AnalysisAvailability {
 // answers overlapping it for its whole length (minutes), and it could not
 // yield, since the tool call it would yield to is its own.
 func (s *Server) startBackgroundAnalysis(reason string) bool {
+	ctx, done, admitted := s.admitBackground()
+	if !admitted {
+		return false
+	}
 	if !s.analysisRun.running.CompareAndSwap(false, true) {
 		// A pass this path started is in flight. It reads the graph as it
 		// is when it computes, and a write after it pinned its revision
 		// supersedes it; request one more pass for that case.
 		s.analysisRun.again.Store(true)
+		done()
 		return false
 	}
 	s.analysisRun.startedAt.Store(time.Now().UnixNano())
 	go func() {
-		for {
+		defer done()
+		for ctx.Err() == nil {
 			started := time.Now()
 			if s.logger != nil {
 				s.logger.Info("analysis: starting background pass", zap.String("reason", reason))
 			}
-			s.RunAnalysis()
+			s.runAnalysisOwned(ctx, true)
 			s.analysisRun.lastTook.Store(int64(time.Since(started)))
 			if !s.analysisRun.again.Swap(false) {
 				break

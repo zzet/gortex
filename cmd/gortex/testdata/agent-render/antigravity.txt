@@ -6,6 +6,8 @@ description: "Mandatory Gortex public-tool workflow"
 
 ## MANDATORY: Use Gortex MCP tools instead of Read/Grep
 
+Follow advertised tools and server/session instructions. Compact examples require those tools; otherwise follow legacy session guidance. Missing `change` alone is not missing editing when legacy editors are advertised. Read-only policies and explicit denials still apply.
+
 When Gortex can serve the step:
 
 1. Call `explore` first with the complete task. Work from the returned source and call paths; do not reopen them with file or shell tools.
@@ -99,6 +101,8 @@ description: "Mandatory Gortex public-tool workflow"
 ---
 
 ## MANDATORY: Use Gortex MCP tools instead of Read/Grep
+
+Follow advertised tools and server/session instructions. Compact examples require those tools; otherwise follow legacy session guidance. Missing `change` alone is not missing editing when legacy editors are advertised. Read-only policies and explicit denials still apply.
 
 When Gortex can serve the step:
 

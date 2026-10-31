@@ -23,6 +23,9 @@ func (l *CheckoutLifecycle) closeRepositoryCoordinators(prefix string) {
 	}
 	l.coordMu.Unlock()
 	for actor := range actors {
+		actor.Cancel()
+	}
+	for actor := range actors {
 		_ = actor.Close()
 		l.oweRetirement(actor.DrainRetirements()...)
 		l.stopCheckoutWorkspaces(actor.root)

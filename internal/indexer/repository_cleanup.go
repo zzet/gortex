@@ -490,18 +490,24 @@ func (l *CheckoutLifecycle) finalizeRepositoryCleanupState(ctx context.Context, 
 	return true, nil
 }
 
-func (l *CheckoutLifecycle) closeRepositoryCleanup() {
+func (l *CheckoutLifecycle) cancelRepositoryCleanup() *repositoryCleanupRuntime {
 	l.repositoryCleanupMu.Lock()
 	l.repositoryCleanupClosed = true
 	runtime := l.repositoryCleanup
 	l.repositoryCleanupMu.Unlock()
-	if runtime == nil {
-		return
+	if runtime != nil {
+		runtime.mu.Lock()
+		runtime.closed = true
+		runtime.mu.Unlock()
+		runtime.cancel()
 	}
-	runtime.mu.Lock()
-	runtime.closed = true
-	runtime.cancel()
-	runtime.mu.Unlock()
-	<-runtime.done
-	runtime.waiters.Wait()
+	return runtime
+}
+
+func (l *CheckoutLifecycle) closeRepositoryCleanup() {
+	runtime := l.cancelRepositoryCleanup()
+	if runtime != nil {
+		<-runtime.done
+		runtime.waiters.Wait()
+	}
 }

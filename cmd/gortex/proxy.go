@@ -107,15 +107,14 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 		ToolsMode:        toolMode,
 	}
 	client, recoverable, err := dialDaemonWithRetry(ctx, h)
+	if errors.Is(err, daemon.ErrProtocolVersionMismatch) {
+		return false, daemonMismatchError(daemonIdentityFromMismatch(err))
+	}
 	if err != nil && !recoverable {
 		return false, fmt.Errorf("dial daemon: %w", err)
 	}
 	if client == nil {
-		if errors.Is(err, daemon.ErrProtocolVersionMismatch) {
-			fmt.Fprintln(os.Stderr, "[gortex mcp] daemon protocol mismatch")
-		} else {
-			fmt.Fprintln(os.Stderr, "[gortex mcp] daemon unreachable after retry window")
-		}
+		fmt.Fprintln(os.Stderr, "[gortex mcp] daemon unreachable after retry window")
 		return false, nil
 	}
 
@@ -241,11 +240,6 @@ func dialDaemonWithRetry(ctx context.Context, h daemon.Handshake) (client *daemo
 		}
 		if !daemon.ShouldFallBackToEmbedded(err) {
 			return nil, false, err
-		}
-		// A protocol-version mismatch is a stale daemon after an upgrade —
-		// waiting can't fix it, so return to the startup policy immediately.
-		if errors.Is(err, daemon.ErrProtocolVersionMismatch) {
-			return nil, true, err
 		}
 		if time.Now().After(deadline) {
 			return nil, true, err

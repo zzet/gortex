@@ -73,7 +73,8 @@ checks and is the right default for most work. Other optional build tags:
 ### Running Tests
 
 ```bash
-go test -race ./...
+make test PKGS=./internal/<pkg>/...   # the packages you touched
+make test                              # every package
 ```
 
 CI runs the suite under `-race` on Linux. A few packages — `internal/indexer`,
@@ -163,7 +164,7 @@ tests, and skill drift.
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-feature`)
 3. Write tests for your changes
-4. Ensure all tests pass (`go test -race ./...`)
+4. Ensure tests for the packages you touched pass (`make test PKGS=./internal/<pkg>/...`); CI runs the full suite
 5. Ensure the linter is clean (`make lint`)
 6. Commit with a clear message
 7. Open a pull request and fill in the template
@@ -283,7 +284,8 @@ skipping it leaks a file handle and a background goroutine.
 | [docs/cli.md](docs/cli.md) | CLI verb reference |
 | [docs/llm.md](docs/llm.md) | LLM provider configuration |
 | [docs/features.md](docs/features.md) | Capability tour |
-| [CLAUDE.md](CLAUDE.md) | Repo conventions for coding agents |
+| [AGENTS.md](AGENTS.md) | Repo conventions for coding agents |
+| [CLAUDE.md](CLAUDE.md) | Imports `AGENTS.md` and adds the Claude Code-only notes |
 
 ## Questions?
 

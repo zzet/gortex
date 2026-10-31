@@ -19,6 +19,23 @@ var daemonLogSetStdHandle = windows.SetStdHandle
 // wrappers alive so their finalizers cannot close a later reuse of that HANDLE.
 var daemonLogRetainedFiles []*os.File
 
+func openDaemonExitLogFile(path string) (*os.File, error) {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	// The retained diagnostic handle must not block normal log rotation.
+	// Match Go's O_APPEND access (all generic-write rights except WRITE_DATA),
+	// adding FILE_SHARE_DELETE so a rotated inode remains usable until exit.
+	access := uint32(windows.FILE_GENERIC_WRITE &^ windows.FILE_WRITE_DATA)
+	share := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE)
+	h, err := windows.CreateFile(name, access, share, nil, windows.OPEN_ALWAYS, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(h), path), nil
+}
+
 func prepareDaemonLogOutput(path string, stderr, stdout **os.File) error {
 	if !daemonServiceLog {
 		return nil

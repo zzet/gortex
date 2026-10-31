@@ -175,7 +175,7 @@ Data flow, graph schema (node and edge kinds, multi-repo fields, test taxonomy),
 
 ```bash
 make build          # binary with version stamping
-make test           # go test -race ./...
+make test           # go test -race; PKGS=./internal/<pkg>/... narrows it
 make lint           # golangci-lint
 ```
 

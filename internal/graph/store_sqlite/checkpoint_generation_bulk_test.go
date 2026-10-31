@@ -23,11 +23,15 @@ type checkpointBeginResult struct {
 	err    error
 }
 
+// checkpointWaitTimeout only bounds a broken fixture; a race-instrumented
+// SQLite needs well over 2s for a 4096-row chunk.
+const checkpointWaitTimeout = 30 * time.Second
+
 func waitCheckpointSignal(t *testing.T, signal <-chan struct{}) {
 	t.Helper()
 	select {
 	case <-signal:
-	case <-time.After(2 * time.Second):
+	case <-time.After(checkpointWaitTimeout):
 		t.Fatal("timed out waiting for checkpoint signal")
 	}
 }
@@ -37,7 +41,7 @@ func waitCheckpointAttemptResult(t *testing.T, result <-chan checkpointAttemptRe
 	select {
 	case got := <-result:
 		return got
-	case <-time.After(2 * time.Second):
+	case <-time.After(checkpointWaitTimeout):
 		t.Fatal("timed out waiting for checkpoint attempt")
 		return checkpointAttemptResult{}
 	}

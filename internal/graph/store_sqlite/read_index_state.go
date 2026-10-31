@@ -1,7 +1,6 @@
 package store_sqlite
 
 import (
-	"database/sql"
 	"fmt"
 	"os"
 	"strings"
@@ -58,7 +57,7 @@ func ReadRepoIndexStates(path string) (map[string]graph.RepoIndexState, error) {
 	// to switch the live database's mode; inheriting the on-disk WAL mode is
 	// exactly what a concurrent reader wants.
 	dsn := path + "?_pragma=busy_timeout(2000)&_pragma=query_only(1)"
-	db, err := sql.Open("sqlite", dsn)
+	db, err := openSQLiteStoreDB(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite store %q: %w", path, err)
 	}

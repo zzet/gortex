@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -98,6 +99,21 @@ func TestAnalysisGenerationBackendsFollowTheSelectedViewGeneration(t *testing.T)
 	queryHandle, ok := queryStore.(*store_sqlite.Store)
 	require.True(t, ok, "analysis query store must be the sqlite store")
 	require.Equal(t, analysisWiringViewGeneration, queryHandle.ViewGeneration())
+
+	for name, selected := range map[string]*Server{"base": {graph: store}, "selected-view": server} {
+		t.Run(name+"-context-binding", func(t *testing.T) {
+			writer, _ := selected.analysisGenerationBackends()
+			handle, ok := writer.(*store_sqlite.Store)
+			require.True(t, ok, "production selector must retain a concrete bindable SQLite handle")
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			bound := bindAnalysisWriteContext(writer, ctx)
+			require.Equal(t, handle.ViewGeneration(), bound.(*store_sqlite.Store).ViewGeneration())
+			_, accepted, err := bound.BeginAnalysisGeneration(writer.AnalysisMutationRevision(), graph.AnalysisGenerationHeader{FormatVersion: 77})
+			require.False(t, accepted)
+			require.ErrorIs(t, err, context.Canceled, "selected production writer did not receive the operation context")
+		})
+	}
 }
 
 // TestRunAnalysisPersistsUnderTheSelectedViewGeneration is the

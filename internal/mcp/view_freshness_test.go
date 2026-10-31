@@ -986,14 +986,23 @@ func TestFacadeToolHonoursTheUndeclaredFreshnessKnobs(t *testing.T) {
 	t.Setenv("GORTEX_TOOLS", "facade-v1") // a facade name is gated off the legacy surface
 	stack := newViewStack(t)
 	require.True(t, isFacadeToolName("read"), "this test must exercise a facade name")
+	// This is a wiring test, not a middleware/Git latency bound. Admission
+	// reports a deterministic stopped coordinator instead of spending a short
+	// absolute deadline on request setup before the waiter can be observed.
+	deadline := time.Now().Add(DefaultToolCallTimeout / 2) // inside the unchanged outer firewall
+	admittedDeadline := make(chan time.Time, 1)
 	waiter := &fakeFreshnessWaiter{
-		answer: func(call int, checkoutID, root string) (*indexer.CheckoutRefreshTicket, error) {
-			return pendingTicket(checkoutID, root), nil
+		answerCtx: func(ctx context.Context, _ int, _, _ string) (*indexer.CheckoutRefreshTicket, error) {
+			observed, _ := ctx.Deadline()
+			select {
+			case admittedDeadline <- observed:
+			default: // observed-call census below still rejects a second admission
+			}
+			return nil, indexer.ErrCheckoutRefreshStopped
 		},
 	}
 	stack.srv.freshnessWaiter = waiter
 
-	deadline := time.Now().Add(150 * time.Millisecond)
 	args := map[string]any{
 		requireFreshArgName: true,
 		waitDeadlineArgName: deadline.Format(time.RFC3339Nano),
@@ -1005,9 +1014,15 @@ func TestFacadeToolHonoursTheUndeclaredFreshnessKnobs(t *testing.T) {
 	calls := waiter.observed()
 	require.Len(t, calls, 1, "a facade tool's require_fresh never reached the settle signal")
 	require.Equal(t, viewTestWorktree, calls[0].checkoutID)
+	select {
+	case observed := <-admittedDeadline:
+		require.True(t, observed.Equal(deadline), "undeclared wait_deadline was not passed to the actual admission: got %s want %s", observed, deadline)
+	default:
+		t.Fatal("freshness admission did not report its deadline")
+	}
 	rider := resultFreshness(t, res)
 	require.Equal(t, false, rider["fresh"], "rider = %v", rider)
-	require.Equal(t, freshReasonDeadlineExceeded, rider["fresh_reason"], "rider = %v", rider)
+	require.Equal(t, freshReasonCheckoutRefreshStopped, rider["fresh_reason"], "rider = %v", rider)
 }
 
 // ------------------------------------------------ the rider carrier claim ---

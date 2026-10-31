@@ -29,13 +29,20 @@ No repository protection or security rules are changed by this trial.
 
 ## Conservative boundaries
 
-The initial selector optimizes only ordinary added or modified `.go` inputs
-whose owning package appears in supported build metadata. It requests the full
-suite for:
+The selector optimizes ordinary added or modified `.go` inputs whose owning
+package appears in supported build metadata. Added or modified Markdown under
+`docs/` may be omitted from the Go closure only after qualification: canonical
+paths, ordinary tracked file modes, regular UTF-8 text without symlink ancestors,
+and no embedded, containing-package or nested-module input ownership. Unknown
+ownership remains full. A mixed Go/docs change keeps the same reverse dependency
+closure as the Go changes alone. Verified docs-only changes produce a sealed,
+explicit empty test selection; builds, lint, smoke and security remain enabled.
+
+It requests the full suite for:
 
 - Deleted/renamed/copied files, including both old and new paths. It does not
   infer old dependencies from a head-only graph.
-- All non-Go files, including documentation, fixtures, embeds, C/C++ inputs,
+- Other non-Go files, including unqualified documentation, fixtures, embeds, C/C++ inputs,
   generators, CI scripts and configuration. This intentionally makes changes to
   the selector itself run the existing full cross-platform suite. Go files under
   `scripts/`, `.github/`, and `internal/citest/` also always request full mode.

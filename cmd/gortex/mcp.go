@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -244,8 +245,9 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// permission or broken-socket failure. Preserve that distinction before
 	// startup selection so even an opted-in embedded server cannot mask a live
 	// daemon or a system error.
-	if err := probeDaemonAvailability(); err != nil && !daemon.ShouldFallBackToEmbedded(err) {
-		return fmt.Errorf("check gortex daemon availability: %w", err)
+	availabilityErr := probeDaemonAvailability()
+	if availabilityErr != nil && !daemon.ShouldFallBackToEmbedded(availabilityErr) && !errors.Is(availabilityErr, daemon.ErrProtocolVersionMismatch) {
+		return fmt.Errorf("check gortex daemon availability: %w", availabilityErr)
 	}
 
 	// Daemon-first: ensure a daemon is up (auto-starting it under a
@@ -254,7 +256,13 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// identical from a terminal or a pipe given the same daemon state. The
 	// legacy --no-daemon flag is an inert no-op (warned above); embedded mode
 	// is available only through the machine-global opt-in checked below.
-	decision := resolveDaemonDecision()
+	decision, observedMismatch, startupErr := ensureDaemonReadyWithError(daemon.ParseAutostart())
+	if startupErr != nil {
+		return startupErr
+	}
+	if decision == daemonUnavailable && errors.Is(availabilityErr, daemon.ErrProtocolVersionMismatch) {
+		return daemonMismatchError(daemonIdentityFromMismatch(availabilityErr))
+	}
 	switch decision {
 	case daemonReady, daemonAutostarted:
 		ran, proxyErr := runProxy(cmd.Context(), proxyToolSurface())
@@ -280,6 +288,8 @@ func runMCP(cmd *cobra.Command, args []string) error {
 			if ran {
 				return nil
 			}
+		} else if errors.Is(probeErr, daemon.ErrProtocolVersionMismatch) {
+			return daemonMismatchError(daemonIdentityFromMismatch(probeErr))
 		} else if !daemon.ShouldFallBackToEmbedded(probeErr) {
 			return fmt.Errorf("check gortex daemon availability: %w", probeErr)
 		}
@@ -289,6 +299,15 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+	}
+	// A mismatch observed earlier in this invocation is not erased if the
+	// daemon vanishes between ensure and the proxy dial. Handoff/proxy failure
+	// must not turn a live-daemon protocol refusal into embedded startup.
+	if errors.Is(availabilityErr, daemon.ErrProtocolVersionMismatch) {
+		return daemonMismatchError(daemonIdentityFromMismatch(availabilityErr))
+	}
+	if observedMismatch.mismatch() {
+		return daemonMismatchError(observedMismatch)
 	}
 	if mcpForceProxy {
 		return fmt.Errorf("gortex daemon is unavailable and --proxy requires it; start the daemon with `gortex daemon start`")

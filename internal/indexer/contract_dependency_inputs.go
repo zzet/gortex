@@ -192,6 +192,9 @@ func (idx *Indexer) verifiedHeadContractInputs(root, sha string) func(*increment
 			}
 			defer (&parseAdmissionLease{shared: budget, sharedWeight: weight}).Release()
 		}
+		if !gitBlobObjectNameValid(stage.prepared.relPath) {
+			return contractDependencyInputs{}, false
+		}
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		src, err := exec.CommandContext(ctx, "git", "-C", root, "cat-file", "blob", sha+":"+stage.prepared.relPath).Output()

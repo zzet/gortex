@@ -35,7 +35,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 40
+const currentSchemaVersion = 43
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -50,6 +50,9 @@ type schemaMigration struct {
 	name    string
 	inPlace func(tx *sql.Tx) error
 	rebuild bool
+	// Explicit opt-in for a mechanically additive step that cannot change
+	// graph or derived-analysis meaning. Defaults remain conservative.
+	preserveAnalysis bool
 }
 
 // MigrationPhase identifies one observable boundary in an in-place schema
@@ -138,6 +141,27 @@ var schemaMigrations = []schemaMigration{
 	{version: 38, name: "cover exact node declaration reads", inPlace: coverNodeDeclarationIndex},
 	{version: 39, name: "seek supplementary name candidates by name length", inPlace: seekNameCandidatesByLength},
 	{version: 40, name: "reconcile SQLite 3.54 name length keys", inPlace: reconcileNameCandidateLengths},
+	{version: 41, name: "seek exact effective workspace nodes", inPlace: createEffectiveWorkspaceIndex, preserveAnalysis: true},
+	{version: 42, name: "seek eligible workspace dead-code candidates", inPlace: createDeadCodeEligibleWorkspaceIndex, preserveAnalysis: true},
+	{version: 43, name: "cover workspace dead-code candidate seeks", inPlace: coverDeadCodeEligibleWorkspaceIndex, preserveAnalysis: true},
+}
+
+// An existing v42 key must be replaced: IF NOT EXISTS cannot upgrade its shape.
+func coverDeadCodeEligibleWorkspaceIndex(tx *sql.Tx) error {
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS nodes_deadcode_eligible_workspace`); err != nil {
+		return err
+	}
+	return createDeadCodeEligibleWorkspaceIndex(tx)
+}
+
+func createDeadCodeEligibleWorkspaceIndex(tx *sql.Tx) error {
+	_, err := tx.Exec(nodesDeadCodeEligibleWorkspaceDDL)
+	return err
+}
+
+func createEffectiveWorkspaceIndex(tx *sql.Tx) error {
+	_, err := tx.Exec(nodesByEffectiveWorkspaceDDL)
+	return err
 }
 
 // Rebuild just the secondary index; graph payload, identity and receipts stay
@@ -1230,6 +1254,21 @@ type schemaPlan struct {
 	err     error             // refuse unsupported versions without mutation
 }
 
+// preservesAnalysis requires a known, complete transition consisting solely
+// of explicitly neutral in-place steps. Fresh/pre-versioning stamps, missing
+// registry steps and rebuilds never prove compatibility of existing payloads.
+func (p schemaPlan) preservesAnalysis(stored, current int) bool {
+	if p.err != nil || p.wipe || !p.stamp || stored <= 0 || stored >= current || len(p.inPlace) != current-stored {
+		return false
+	}
+	for i, step := range p.inPlace {
+		if step.version != stored+i+1 || step.inPlace == nil || step.rebuild || !step.preserveAnalysis {
+			return false
+		}
+	}
+	return true
+}
+
 // planSchemaMigrationWith decides how to reconcile a store at the stored
 // PRAGMA user_version to current, given the migration registry. It mutates
 // nothing. Open passes (currentSchemaVersion, schemaMigrations); tests pass
@@ -1317,6 +1356,9 @@ func validateSchemaMigrations(current int, migs []schemaMigration) error {
 		}
 		if (m.inPlace != nil) == m.rebuild {
 			return fmt.Errorf("migration v%d (%s) must set exactly one of inPlace / rebuild", m.version, m.name)
+		}
+		if m.preserveAnalysis && m.rebuild {
+			return fmt.Errorf("migration v%d (%s) cannot preserve analysis across a rebuild", m.version, m.name)
 		}
 		prev = m.version
 	}

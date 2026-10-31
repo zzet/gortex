@@ -55,7 +55,7 @@ func (p *Provider) referencesAddPass(ctx context.Context, g graph.Store, view *l
 		if !p.servesFile(rel) {
 			continue
 		}
-		content, release, err := session.acquire(p.client, filepath.Join(absRoot, rel))
+		content, release, err := session.acquire(p.Client(), filepath.Join(absRoot, rel))
 		if err != nil {
 			continue
 		}

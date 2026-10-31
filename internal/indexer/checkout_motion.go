@@ -192,14 +192,51 @@ func (c *CheckoutCoordinator) attachFilesystemWatch(w *checkoutWatch) {
 	}
 }
 
+// startFilesystemWatch owns a startup admitted before Cancel. Admission and
+// WaitGroup Add share the source gate, so Close cannot miss a late attachment.
+func (c *CheckoutCoordinator) startFilesystemWatch(start func(context.Context) (*checkoutWatch, error)) bool {
+	c.mu.Lock()
+	if c.sourceMutationsClosing {
+		c.mu.Unlock()
+		return false
+	}
+	c.watcherStartWG.Add(1)
+	c.mu.Unlock()
+	go func() {
+		defer c.watcherStartWG.Done()
+		w, err := start(c.lifetimeContext())
+		if err == nil {
+			c.attachFilesystemWatch(w)
+		}
+	}()
+	return true
+}
+
+// cancelFilesystemWatch revokes the watcher loop without waiting on its
+// backend or callback. closeFilesystemWatch retains the physical join.
+func (c *CheckoutCoordinator) cancelFilesystemWatch() {
+	c.motion.mu.Lock()
+	w := c.motion.watch
+	c.motion.mu.Unlock()
+	if w != nil && w.cancel != nil {
+		w.cancel()
+	}
+}
+
 // closeFilesystemWatch stops the checkout's watcher, if it has one.
 func (c *CheckoutCoordinator) closeFilesystemWatch() {
 	m := &c.motion
 	m.mu.Lock()
 	w := m.watch
-	m.watch = nil
 	m.mu.Unlock()
+	// Keep the pointer visible until physical close completes: a concurrent
+	// Close must join the same watcher's once, not mistake detachment for exit.
 	w.close()
+	m.mu.Lock()
+	if m.watch == w {
+		m.watch = nil
+	}
+	m.mu.Unlock()
 }
 
 // motionRoots returns the root forms reported paths are made relative to.

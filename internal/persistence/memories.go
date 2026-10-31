@@ -103,12 +103,12 @@ func SaveMemories(dir string, store *MemoryStore) error {
 		store.Entries = trimMemories(store.Entries, maxMemoriesCap)
 	}
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := persistDir(dir); err != nil {
 		return fmt.Errorf("persistence: mkdir memories: %w", err)
 	}
 
 	path := filepath.Join(dir, memoriesFile)
-	f, err := os.Create(path)
+	f, err := persistFile(path)
 	if err != nil {
 		return fmt.Errorf("persistence: create memories: %w", err)
 	}

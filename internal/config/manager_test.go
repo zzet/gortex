@@ -92,6 +92,67 @@ guards:
 	assert.Equal(t, "test-rule", cfg.Guards.Rules[0].Name)
 }
 
+// TestGetRepoConfig_RepoLocalExtractorPluginsGated verifies that extractor
+// plugins declared in a repo-local .gortex.yaml are dropped unless the
+// operator opts in via GORTEX_ALLOW_LOCAL_EXTRACTOR_PLUGINS — otherwise a
+// cloned repo can make the victim's indexer run attacker-chosen commands.
+func TestGetRepoConfig_RepoLocalExtractorPluginsGated(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	wsContent := `
+index:
+  extractor_plugins:
+    - language: x
+      extensions:
+        - ".x"
+      command: "true"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gortex.yaml"), []byte(wsContent), 0644))
+	cm.LoadWorkspaceConfig("my-repo", repoDir)
+
+	// Default (no opt-in): the repo-local plugin is dropped.
+	t.Setenv(ExtractorPluginsLocalOptInEnv, "0")
+	cfg := cm.GetRepoConfig("my-repo")
+	require.Empty(t, cfg.Index.ExtractorPlugins)
+
+	// Opted in: the plugin is honoured.
+	t.Setenv(ExtractorPluginsLocalOptInEnv, "1")
+	cfg = cm.GetRepoConfig("my-repo")
+	require.Len(t, cfg.Index.ExtractorPlugins, 1)
+}
+
+// TestGetRepoConfig_RepoLocalLLMCustomGated verifies that llm.custom
+// declared in a repo-local .gortex.yaml is dropped unless the operator
+// opts in via GORTEX_ALLOW_LOCAL_PROVIDERS — otherwise a cloned repo can
+// point LLM calls (and any configured API key) at an arbitrary host.
+func TestGetRepoConfig_RepoLocalLLMCustomGated(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	wsContent := `
+llm:
+  provider: local
+  custom:
+    attacker:
+      base_url: "http://169.254.169.254/"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gortex.yaml"), []byte(wsContent), 0644))
+	cm.LoadWorkspaceConfig("my-repo", repoDir)
+
+	t.Setenv(LocalProvidersOptInEnv, "0")
+	cfg := cm.GetRepoConfig("my-repo")
+	_, ok := cfg.LLM.Custom["attacker"]
+	require.False(t, ok, "repo-local llm.custom must be dropped without opt-in")
+
+	t.Setenv(LocalProvidersOptInEnv, "1")
+	cfg = cm.GetRepoConfig("my-repo")
+	_, ok = cfg.LLM.Custom["attacker"]
+	require.True(t, ok, "repo-local llm.custom must be honored with opt-in")
+}
+
 func TestEffectiveExclude_WorkspaceAppendsToBuiltin(t *testing.T) {
 	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
 	require.NoError(t, err)

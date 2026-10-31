@@ -92,11 +92,11 @@ func SaveKeyword(dir string, store *KeywordStore) error {
 		trim := len(store.Keywords) - maxKeywords
 		store.Keywords = store.Keywords[trim:]
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := persistDir(dir); err != nil {
 		return fmt.Errorf("persistence: mkdir keyword: %w", err)
 	}
 	path := filepath.Join(dir, keywordFile)
-	f, err := os.Create(path)
+	f, err := persistFile(path)
 	if err != nil {
 		return fmt.Errorf("persistence: create keyword: %w", err)
 	}

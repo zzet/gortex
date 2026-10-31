@@ -7,8 +7,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"strconv"
-	"strings"
 	"time"
 )
 
@@ -110,39 +108,16 @@ func closeCheckpointEstimateAt(pendingFrames int64, perFrame time.Duration) time
 	return closeCheckpointBaseBudget + time.Duration(pendingFrames)*perFrame
 }
 
-// closeCheckpointDeadline is the deadline Close actually imposes, zero meaning
-// none. By default there is none, deliberately: Close is the last durability
-// boundary, and a deadline cannot shorten shutdown anyway — an interrupted
-// TRUNCATE publishes no progress (nBackfill moves only when a pass completes)
-// and SQLite's close of the last connection then runs the same full
-// checkpoint itself, uninterruptibly. What bounds a restart is keeping the
-// backlog small (the reclaim) and letting the stop path wait the estimate
-// (CloseCheckpointEstimate). GORTEX_SQLITE_CLOSE_CHECKPOINT_MAX_S > 0 opts into
-// a deadline of min(that, the estimate).
+// closeCheckpointDeadline preserves the legacy cap calculator. A zero value
+// means no imposed deadline, not that a default close schedules a checkpoint.
 func closeCheckpointDeadline(pendingFrames int64) time.Duration {
-	raw := strings.TrimSpace(os.Getenv("GORTEX_SQLITE_CLOSE_CHECKPOINT_MAX_S"))
-	if raw == "" {
-		return 0
-	}
-	secs, err := strconv.Atoi(raw)
-	if err != nil || secs <= 0 {
-		return 0
-	}
-	if secs > 24*3600 {
-		secs = 24 * 3600
-	}
-	knob := time.Duration(secs) * time.Second
-	if est := closeCheckpointEstimate(pendingFrames); est < knob {
-		return est
-	}
-	return knob
+	return resolveCloseCheckpointPolicy().deadline(pendingFrames)
 }
 
-// CloseCheckpointEstimate reports how long Close's final checkpoint should be
-// given for the backlog on disk right now, and that backlog in frames (-1 when
-// the wal-index cannot be read). A stop path that force-kills the process
-// must wait at least this long: a killed checkpoint records no progress, and
-// the next open recovers the whole log with nBackfill back at zero.
+// CloseCheckpointEstimate reports the planned final checkpoint estimate and
+// backlog (-1 when unreadable). A skipped final checkpoint has estimate 0 while
+// retaining its real backlog. An explicit full drain retains the historical
+// estimate: interrupting its copy can lose that checkpoint's progress.
 func (s *Store) CloseCheckpointEstimate() (time.Duration, int64) {
 	if s.coreless() || s.dbPath == "" || isMemoryPath(s.dbPath) {
 		return 0, 0
@@ -150,6 +125,9 @@ func (s *Store) CloseCheckpointEstimate() (time.Duration, int64) {
 	pending := int64(-1)
 	if snap, ok := readWALIndexSnapshot(s.dbPath); ok {
 		pending = snap.PendingFrames()
+	}
+	if !resolveCloseCheckpointPolicy().full {
+		return 0, pending
 	}
 	return closeCheckpointEstimateAt(pending, closePerFrame(s.dbPath)), pending
 }
@@ -160,7 +138,7 @@ func (s *Store) CloseCheckpointEstimate() (time.Duration, int64) {
 // and the outcome is logged with the numbers an operator needs to tell
 // "drained" from "gave up" — pending frames before, frames checkpointed, reset
 // or not, duration against the backlog's estimate.
-func (s *Store) closeCheckpointWAL() error {
+func (s *Store) closeCheckpointWAL(policy closeCheckpointPolicy) error {
 	before, known := readWALIndexSnapshot(s.dbPath)
 	pending := int64(-1)
 	if known {
@@ -168,7 +146,7 @@ func (s *Store) closeCheckpointWAL() error {
 	}
 	perFrame := closePerFrame(s.dbPath)
 	estimate := closeCheckpointEstimateAt(pending, perFrame)
-	deadline := closeCheckpointDeadline(pending)
+	deadline := policy.deadline(pending)
 
 	started := time.Now()
 	// Tell the stop path how the close is going (close_progress.go): a

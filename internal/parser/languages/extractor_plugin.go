@@ -433,6 +433,48 @@ func (e *SubprocessExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	return e.fileOnlyResult(filePath, src), nil
 }
 
+// shellUnsafePathChars lists shell metacharacters that must not appear in
+// GORTEX_FILE_PATH. A repo-controlled path that reaches a plugin which
+// expands the variable through a shell could otherwise inject
+// commands/operators or split the argument. The backtick is written as a
+// raw-string literal; the `"` and `\` are escaped.
+const shellUnsafePathChars = " ;|&<>()\"'\\$" + "`="
+
+// secretEnvName reports whether an env var name is secret-shaped and must be
+// stripped from the plugin subprocess environment, so an extractor command —
+// potentially declared in a repo-local .gortex.yaml — can't read it and
+// exfiltrate it. It matches the shapes the LLM/embedding/network backends
+// actually use (e.g. OPENAI_API_KEY, GORTEX_LLM_API_KEY, GITHUB_TOKEN,
+// AWS_SECRET_ACCESS_KEY) rather than an incomplete hardcoded list, so no
+// future key escapes by an unknown name. PATH and other non-secret vars are
+// inherited normally.
+func secretEnvName(name string) bool {
+	u := strings.ToUpper(name)
+	if u == "AUTHORIZATION" {
+		return true
+	}
+	return strings.Contains(u, "AUTHORIZATION") ||
+		strings.Contains(u, "API_KEY") ||
+		strings.Contains(u, "APIKEY") ||
+		strings.Contains(u, "_TOKEN") ||
+		strings.Contains(u, "_SECRET") ||
+		strings.Contains(u, "_BEARER")
+}
+
+// stripSecretEnv returns env without secret-shaped entries. The result is a
+// fresh slice; callers append non-secret extras (e.g. GORTEX_FILE_PATH)
+// afterwards.
+func stripSecretEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok || !secretEnvName(key) {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
 // ExtractBounded runs the configured plugin with hard wire and result limits.
 // It is an all-or-nothing capability: caller cancellation, limit violations,
 // command failures, timeouts and malformed output return no partial result.
@@ -448,6 +490,18 @@ func (e *SubprocessExtractor) ExtractBounded(ctx context.Context, filePath strin
 	}
 	if limits.MaxNodes < 1 {
 		return nil, noUsage, &parser.ExtractionLimitError{Resource: "nodes", Limit: 0, Observed: 1}
+	}
+	// filePath is a repo-relative name the repository controls, so it can
+	// carry bytes that break env-var/shell handling when a plugin later
+	// expands $GORTEX_FILE_PATH. Reject control characters and shell
+	// metacharacters up front rather than exporting a value that, in a
+	// shell-expanding plugin, could inject commands (`;`), expand
+	// variables/commands (`$`, backticks), splice env vars (`=`), or
+	// word-split the path (space). `\\` and `` ` `` in the second set are
+	// the backslash and backtick; `\\$` is a literal dollar before the
+	// backtick (see the shellUnsafeChars const).
+	if strings.ContainsAny(filePath, "\x00\n\r\t\v\f") || strings.ContainsAny(filePath, shellUnsafePathChars) {
+		return nil, noUsage, fmt.Errorf("extractor plugin: file path %q contains a shell-unsafe character", filePath)
 	}
 
 	result := e.fileOnlyResult(filePath, src)
@@ -467,7 +521,12 @@ func (e *SubprocessExtractor) ExtractBounded(ctx context.Context, filePath strin
 	cmd.Stdin = bytes.NewReader(src)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	cmd.Env = append(os.Environ(), "GORTEX_FILE_PATH="+filePath)
+	// The plugin runs a command declared in the operator's / repo's
+	// .gortex.yaml and inherits this environment. Start from os.Environ()
+	// with the secret-shaped entries removed, then add GORTEX_FILE_PATH:
+	// otherwise an extractor command could read them (e.g. os.Environ())
+	// and exfiltrate them. PATH is inherited so the command resolves.
+	cmd.Env = append(stripSecretEnv(os.Environ()), "GORTEX_FILE_PATH="+filePath)
 
 	runErr := cmd.Run()
 	if err := ctx.Err(); err != nil {

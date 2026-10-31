@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"sync/atomic"
 )
@@ -100,9 +101,12 @@ func (s *Store) CommitAnalysisSnapshot(expectedRevision uint64, install func()) 
 	if install == nil {
 		return false
 	}
-	s.writeMu.Lock()
+	ctx := s.analysisWriteContext()
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return false
+	}
 	defer s.writeMu.Unlock()
-	if s.analysisRevision() != expectedRevision {
+	if ctx.Err() != nil || s.analysisRevision() != expectedRevision {
 		return false
 	}
 	install()
@@ -139,6 +143,28 @@ func (s *Store) invalidateAnalysisGenerationLocked() error {
 	return nil
 }
 
+// invalidateAnalysisGenerationLockedContext is the owned, interruptible sibling
+// used by checked batches. Durable invalidation may complete before a later
+// canceled graph write; losing this cache is safe, resurrecting it is not.
+func (s *Store) invalidateAnalysisGenerationLockedContext(ctx context.Context) (err error) {
+	if !s.analysisGenerationPresent {
+		return ctx.Err()
+	}
+	owner, err := s.beginOwnedAnalysisWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer owner.finish(&err)
+	if err = s.invalidateAnalysisViewTxContext(ctx, owner.tx); err != nil {
+		return err
+	}
+	if err = owner.commit(ctx); err != nil {
+		return err
+	}
+	s.analysisGenerationPresent = s.analysisLatchRemaining
+	return nil
+}
+
 // invalidateAnalysisViewTx is the durable invalidation for a write through
 // this handle, scoped like AnalysisViewRevision: a write at the base
 // generation stales every view's analysis (every view composes over the
@@ -150,19 +176,23 @@ func (s *Store) invalidateAnalysisGenerationLocked() error {
 // latch while another view still holds a pointer would let the next write skip
 // its invalidation). writeMu must be held.
 func (s *Store) invalidateAnalysisViewTx(tx *sql.Tx) error {
+	return s.invalidateAnalysisViewTxContext(context.Background(), tx)
+}
+
+func (s *Store) invalidateAnalysisViewTxContext(ctx context.Context, tx *sql.Tx) error {
 	if s.viewGen <= baseViewGeneration {
 		s.analysisLatchRemaining = false
-		return invalidateAnalysisGenerationTx(tx)
+		return invalidateAnalysisGenerationTxContext(ctx, tx)
 	}
-	if _, err := tx.Exec(`UPDATE analysis_generations SET state = ? WHERE view_gen = ? AND (state = ? OR generation_id IN (SELECT generation_id FROM analysis_active_generation WHERE view_gen = ?))`,
+	if _, err := tx.ExecContext(ctx, `UPDATE analysis_generations SET state = ? WHERE view_gen = ? AND (state = ? OR generation_id IN (SELECT generation_id FROM analysis_active_generation WHERE view_gen = ?))`,
 		analysisGenerationStale, s.viewGen, analysisGenerationBuilding, s.viewGen); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM analysis_active_generation WHERE view_gen = ?`, s.viewGen); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM analysis_active_generation WHERE view_gen = ?`, s.viewGen); err != nil {
 		return err
 	}
 	var remaining int
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM analysis_active_generation LIMIT 1)
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM analysis_active_generation LIMIT 1)
 		OR EXISTS(SELECT 1 FROM analysis_generations WHERE state = ? LIMIT 1)`, analysisGenerationBuilding).Scan(&remaining); err != nil {
 		return err
 	}
@@ -183,10 +213,14 @@ func (s *Store) invalidateAnalysisViewTx(tx *sql.Tx) error {
 // follow the same scope (AnalysisViewRevision), and the whole-store clock still
 // moves on every write for callers that keep it.
 func invalidateAnalysisGenerationTx(tx *sql.Tx) error {
-	if _, err := tx.Exec(`UPDATE analysis_generations SET state = ? WHERE state = ? OR generation_id IN (SELECT generation_id FROM analysis_active_generation)`, analysisGenerationStale, analysisGenerationBuilding); err != nil {
+	return invalidateAnalysisGenerationTxContext(context.Background(), tx)
+}
+
+func invalidateAnalysisGenerationTxContext(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE analysis_generations SET state = ? WHERE state = ? OR generation_id IN (SELECT generation_id FROM analysis_active_generation)`, analysisGenerationStale, analysisGenerationBuilding); err != nil {
 		return err
 	}
-	_, err := tx.Exec(`DELETE FROM analysis_active_generation`)
+	_, err := tx.ExecContext(ctx, `DELETE FROM analysis_active_generation`)
 	return err
 }
 

@@ -97,6 +97,19 @@ xattr -d com.apple.quarantine /usr/local/bin/gortex
 gortex version
 ```
 
+## Claude Code plugin
+
+Gortex also ships as a Claude Code plugin with the MCP server, workflow skills, sub-agents and hooks. With the `gortex` binary installed, add the marketplace and install the plugin:
+
+```bash
+claude plugin marketplace add gortexhq/claude-plugin
+claude plugin install gortex@gortex
+```
+
+The plugin covers Claude Code's MCP server, workflow skills, sub-agents and hooks. Running `gortex install` and `gortex init` for Claude Code as well registers Gortex twice, which duplicates them. To avoid that, pass `--agents-skip claude-code` to both. This also skips the `CLAUDE.md` blocks and the per-repo community skills under `.claude/skills/generated/`, which the plugin does not provide.
+
+The workflows appear as `/gortex:<name>`, for example `/gortex:explore`. The marketplace at [gortexhq/claude-plugin](https://github.com/gortexhq/claude-plugin) is generated from this repository by `gortex plugin emit` on each release.
+
 ## System requirements
 
 Every published binary is self-contained — there is no runtime dependency to

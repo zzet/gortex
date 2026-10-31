@@ -280,25 +280,28 @@ func (lane *lifecycleAnalysisLane) stopCh() chan struct{} {
 	return lane.stop
 }
 
-// closeAnalysisLane stops the lane and joins its worker. A pending request is
-// dropped: the process is going away.
-func (l *CheckoutLifecycle) closeAnalysisLane() {
+// stopAnalysisLane closes admission without joining an already running pass.
+func (l *CheckoutLifecycle) stopAnalysisLane() <-chan struct{} {
 	lane := l.analysis
 	if lane == nil {
-		return
+		return repositoryAlreadyDrained
 	}
 	lane.mu.Lock()
-	if lane.closed {
-		lane.mu.Unlock()
-		return
+	defer lane.mu.Unlock()
+	if !lane.closed {
+		lane.closed = true
+		close(lane.stopCh())
 	}
-	lane.closed = true
-	close(lane.stopCh())
-	started := lane.started
-	lane.mu.Unlock()
-	if started {
-		<-lane.done
+	if !lane.started {
+		return repositoryAlreadyDrained
 	}
+	return lane.done
+}
+
+// closeAnalysisLane stops the lane and joins its worker. A pending request is
+// dropped: the process is going away. Repeated callers still join a live pass.
+func (l *CheckoutLifecycle) closeAnalysisLane() {
+	<-l.stopAnalysisLane()
 }
 
 // waitAnalysisIdle waits until the lane has nothing pending or running, or
