@@ -717,6 +717,7 @@ type Option func(*openOptions)
 type openOptions struct {
 	allowRebuild      bool
 	migrationObserver MigrationObserver
+	upgradeBackup     bool
 	// diskAvail reports the free bytes on the volume holding a directory.
 	// nil means platform.DiskAvailBytes; tests inject a fixed figure.
 	diskAvail func(dir string) (uint64, error)
@@ -741,6 +742,18 @@ func WithRebuild() Option { return func(o *openOptions) { o.allowRebuild = true 
 func WithMigrationObserver(observer MigrationObserver) Option {
 	return func(o *openOptions) { o.migrationObserver = observer }
 }
+
+// WithUpgradeBackup makes Open copy an existing store to
+// UpgradeBackupPath(path, oldVersion) before the first pending in-place
+// schema step runs, when the volume has room for the copy on top of the
+// upgrade itself. Without room, or when the copy fails, the backup is
+// skipped and the reason reported to the migration observer (or the log);
+// the upgrade still runs. An existing backup of the same version is kept.
+//
+// Like WithRebuild, the caller MUST hold exclusive cross-process access to
+// the store: the copy is consistent only because no other process can write
+// the store while it is taken.
+func WithUpgradeBackup() Option { return func(o *openOptions) { o.upgradeBackup = true } }
 
 // withDiskAvail replaces the free-space probe the upgrade precheck uses.
 func withDiskAvail(fn func(dir string) (uint64, error)) Option {
@@ -804,6 +817,9 @@ func openStore(path string, current int, migrations []schemaMigration, o openOpt
 	if space, pending := measureUpgradeSpace(probe, current, planSchemaMigrationWith(probe.stored, current, migrations), o.diskAvail); pending {
 		if err := space.refuseShort(); err != nil {
 			return nil, err
+		}
+		if o.upgradeBackup {
+			backupBeforeUpgrade(space, observe)
 		}
 	}
 

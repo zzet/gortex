@@ -64,6 +64,14 @@ const (
 	MigrationStarted  MigrationPhase = "started"
 	MigrationFinished MigrationPhase = "finished"
 	MigrationFailed   MigrationPhase = "failed"
+
+	// The backup phases report the pre-upgrade backup Open takes under
+	// WithUpgradeBackup, once, before the first step starts. Version is the
+	// schema version being backed up and Detail carries the backup path
+	// (created, kept) or the reason none was taken (skipped).
+	MigrationBackupCreated MigrationPhase = "backup_created"
+	MigrationBackupKept    MigrationPhase = "backup_kept"
+	MigrationBackupSkipped MigrationPhase = "backup_skipped"
 )
 
 // MigrationProgress describes one schema migration step. Elapsed is measured
@@ -76,6 +84,7 @@ type MigrationProgress struct {
 	Phase   MigrationPhase
 	Elapsed time.Duration
 	Error   error
+	Detail  string
 }
 
 // MigrationObserver receives synchronous migration boundaries. It may be nil.
