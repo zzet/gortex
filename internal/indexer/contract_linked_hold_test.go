@@ -94,11 +94,28 @@ func (h *linkedHoldProbe) triggered() []string {
 	return append([]string(nil), h.triggers...)
 }
 
+// held reports whether actor waits in its queue, held by its linked policy
+// now.
 func (h *linkedHoldProbe) held(actor ContractActor) bool {
 	h.c.mu.Lock()
 	defer h.c.mu.Unlock()
 	a := h.c.actors[actor]
-	return a != nil && a.state == contractActorQueued && a.held
+	return a != nil && a.state == contractActorQueued && a.held && h.c.linkedHeldLocked(a, h.c.now())
+}
+
+// wake signals repo's dispatcher.
+func (h *linkedHoldProbe) wake(repo string) {
+	h.c.mu.Lock()
+	ring := h.c.rings[repo]
+	h.c.mu.Unlock()
+	ring.signal()
+}
+
+// slotWaiters is how many dispatchers wait for a job slot.
+func (h *linkedHoldProbe) slotWaiters() int {
+	h.c.slots.mu.Lock()
+	defer h.c.slots.mu.Unlock()
+	return len(h.c.slots.waiters)
 }
 
 func linkedCounter(policy ContractLinkedPolicy, event string) int64 {
@@ -156,11 +173,7 @@ func TestContractLinkedIdleDefersWhileBusyAndStartsAfterTheWindow(t *testing.T) 
 		linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
 		// The window is open: the linked actor is picked and waits for the
 		// slot the primary job holds.
-		require.Eventually(t, func() bool {
-			h.c.slots.mu.Lock()
-			defer h.c.slots.mu.Unlock()
-			return len(h.c.slots.waiters) == 1
-		}, 10*time.Second, time.Millisecond)
+		require.Eventually(t, func() bool { return h.slotWaiters() == 1 }, 10*time.Second, time.Millisecond)
 		h.busy.Store(true)
 		h.release("p/@k")
 		require.Eventually(t, func() bool { return h.held(linked.Actor) }, 10*time.Second, time.Millisecond)
@@ -201,6 +214,49 @@ func TestContractLinkedIdleDefersWhileBusyAndStartsAfterTheWindow(t *testing.T) 
 		require.Equal(t, deferred+1, linkedCounter(ContractLinkedIdle, viewmetrics.ContractLinkedDeferred))
 		require.Empty(t, h.started())
 	})
+}
+
+// TestContractLinkedActorsWaitingTheirTurnOutliveTheirInterest: the linked
+// actors of one repository share its ring and, with one job slot, run one
+// after another. One whose turn comes after its interest ran out still runs:
+// the idle policy no longer holds it once the window is open, and a
+// throttled one only waits for its turn, as a queued actor waits for the
+// slot.
+func TestContractLinkedActorsWaitingTheirTurnOutliveTheirInterest(t *testing.T) {
+	for _, policy := range []ContractLinkedPolicy{ContractLinkedIdle, ContractLinkedThrottled} {
+		t.Run(string(policy), func(t *testing.T) {
+			h := newLinkedHoldProbe(t, policy, func(options *ContractAnalysisCoordinatorOptions) { options.JobSlots = 1 })
+			h.busy.Store(true)
+			h.hold("r/wt1@k")
+			var results []ContractScheduleResult
+			for _, checkout := range []string{"wt1", "wt2", "wt3"} {
+				results = append(results, h.scheduleLinked(t.Context(), checkout, "r", "k", false))
+			}
+			if policy == ContractLinkedIdle {
+				h.settle("r")
+				for _, result := range results {
+					require.True(t, h.held(result.Actor))
+				}
+				// The window opens: the first job runs and the second waits
+				// for the slot it holds.
+				h.busy.Store(false)
+				h.advance(5 * time.Second)
+				h.wake("r")
+				require.Eventually(t, func() bool { return h.slotWaiters() == 1 }, 10*time.Second, time.Millisecond)
+			} else {
+				h.settle("r")
+				require.True(t, h.held(results[1].Actor), "one linked job is in flight already")
+				require.True(t, h.held(results[2].Actor))
+			}
+			require.Equal(t, []string{"r/wt1@k"}, h.waitStarts(1))
+			h.advance(contractInterestTTL)
+			h.release("r/wt1@k")
+			require.Equal(t, []string{"r/wt1@k", "r/wt2@k", "r/wt3@k"}, h.waitStarts(3), "no actor waiting its turn is dropped")
+			for _, result := range results {
+				require.Equal(t, ContractActorPublished, h.wait(result).Result)
+			}
+		})
+	}
 }
 
 // TestContractLinkedPolicyLeavesPrimaryActorsAlone: a held linked actor

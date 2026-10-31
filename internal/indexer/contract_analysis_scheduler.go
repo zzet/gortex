@@ -336,9 +336,11 @@ type contractActor struct {
 	interestUntil time.Time
 	// interestExpired remembers work suspended when its interest ran out.
 	interestExpired bool
-	// held is set while a queued linked actor waits for its linked policy
-	// to let it start (contract_linked_schedule.go); leaving the queue
-	// clears it. linkedStartedAt is when a linked actor was last picked.
+	// held is set once a queued linked actor's policy held it back
+	// (contract_linked_schedule.go), so the hold is counted once and its
+	// ring woken; leaving the queue clears it. Whether the policy holds
+	// the actor now is linkedHeldLocked. linkedStartedAt is when a linked
+	// actor was last picked.
 	held            bool
 	linkedStartedAt time.Time
 	// strictUntil is when the last strict request's budget ends: until then
@@ -731,9 +733,10 @@ func (c *ContractAnalysisCoordinator) expireLocked(now time.Time) {
 			continue
 		}
 		switch {
-		case a.state == contractActorDeferred, a.state == contractActorBackoff, a.state == contractActorQueued && a.held:
-			// A held linked actor no request asked for again frees its
-			// capacity like any other waiting work.
+		case a.state == contractActorDeferred, a.state == contractActorBackoff, a.state == contractActorQueued && c.idleHeldLocked(a, now):
+			// A linked actor the idle policy still holds, and no request
+			// asked for again, is dropped like any other waiting work. One
+			// waiting only for its turn is not.
 			a.interestExpired = true
 			a.want.source.Release()
 			a.want.source = nil

@@ -112,6 +112,14 @@ func (c *ContractAnalysisCoordinator) linkedHeldLocked(a *contractActor, now tim
 	return held
 }
 
+// idleHeldLocked reports whether the idle policy holds a at now. Only such a
+// hold may outlast a's interest: it lasts as long as demand does, while a
+// throttled actor only waits for its turn, as a queued actor waits for the
+// slot.
+func (c *ContractAnalysisCoordinator) idleHeldLocked(a *contractActor, now time.Time) bool {
+	return c.options.LinkedPolicy == ContractLinkedIdle && c.linkedHeldLocked(a, now)
+}
+
 // holdLocked keeps a queued actor waiting for its linked policy. The first
 // skip of a hold is counted; a held actor never pins its handoff source, so
 // the source is returned for release outside c.mu.
