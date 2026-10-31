@@ -124,6 +124,9 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 		ProjectID:   resolved.ProjectID,
 		RepoAllow:   resolved.RepoAllow,
 	}
+	// The session boundary holds for the whole call: resolve it once, not
+	// once per candidate file as nodeInSessionScope would.
+	sessionOpts, sessionBound := s.sessionScopeOptions(ctx)
 
 	if debug {
 		phase = time.Now()
@@ -173,7 +176,7 @@ func (s *Server) handleFindFiles(ctx context.Context, req mcp.CallToolRequest) (
 		if n == nil {
 			continue
 		}
-		if !s.nodeInSessionScope(ctx, n) {
+		if sessionBound && !sessionOpts.ScopeAllows(n) {
 			continue
 		}
 		if !scopeOpts.ScopeAllows(n) {
