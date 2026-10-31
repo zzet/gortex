@@ -83,11 +83,11 @@ func SaveCombo(dir string, store *ComboStore) error {
 		trim := len(store.Queries) - maxComboQueries
 		store.Queries = store.Queries[trim:]
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := persistDir(dir); err != nil {
 		return fmt.Errorf("persistence: mkdir combo: %w", err)
 	}
 	path := filepath.Join(dir, comboFile)
-	f, err := os.Create(path)
+	f, err := persistFile(path)
 	if err != nil {
 		return fmt.Errorf("persistence: create combo: %w", err)
 	}

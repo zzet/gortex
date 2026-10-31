@@ -95,11 +95,11 @@ type realController struct {
 	// selects a ready, automatic, unrouted working copy. nil in production →
 	// the real lifecycle call; a test substitutes it to observe the nudge.
 	probeActivateCheckout func(string) bool
-	// multiWatcher is an atomic pointer, not a mu-guarded field: the daemon's
-	// teardown hook reads it, and reading it under mu is what kept `daemon
-	// stop` queued behind a running track / reload / enrichment. One writer
-	// (AttachWatcher, during warmup); read via watcher().
-	multiWatcher atomic.Pointer[indexer.MultiWatcher]
+	// A slot owns the watcher before Start, but readers see it only after
+	// publication. A non-nil slot with no watcher is the terminal stopped
+	// state. Stop can revoke an in-flight start without taking mu or holding
+	// a handoff mutex across watcher I/O or callbacks.
+	multiWatcher atomic.Pointer[daemonWatcherSlot]
 	logger       *zap.Logger
 
 	// liveRouter is the multi-server Router currently wired into the
@@ -128,6 +128,9 @@ type realController struct {
 	// per-workspace learned-promotion count for `gortex daemon status`.
 	// Nil when the MCP server isn't wired (control-only daemon).
 	toolSurface func() (preset, mode string, learned int)
+	// Immutable before publication; production explicit cochange writes share
+	// MCP's cancellation/admission and actual terminal-write ownership.
+	maintenance *gortexmcp.Server
 
 	// ready flips to true once references are resolved and the graph is
 	// queryable — find_usages / get_callers return complete results from
@@ -153,6 +156,11 @@ type realController struct {
 	// Atomic, deliberately not guarded by mu: the entire point of the cache
 	// is to be readable while a minutes-long track holds mu.
 	lastAggregate atomic.Pointer[statusAggregate]
+}
+
+type daemonWatcherSlot struct {
+	watcher *indexer.MultiWatcher
+	ready   bool
 }
 
 // Track indexes a new repository and persists it to the global config.
@@ -525,11 +533,22 @@ func (c *realController) EnrichCochange(ctx context.Context, p daemon.EnrichCoch
 	started := time.Now()
 	var combined daemon.EnrichCochangeResult
 	for _, t := range targets {
+		if c.maintenance != nil {
+			count, superseded, err := c.maintenance.EnrichCochange(ctx, t.prefix, t.root)
+			if err != nil {
+				return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+			}
+			combined.Edges += count
+			combined.Superseded = combined.Superseded || superseded
+			c.logSupersededEnrichment(gortexmcp.EnrichProducerCochange, t.prefix, superseded)
+			continue
+		}
+		// A control-only caller still propagates cancellation through the producer.
 		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerCochange, t.prefix, t.root)
 		if err != nil {
 			return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
-		count, err := cochange.EnrichGraph(out.Store, out.Root, t.prefix)
+		count, err := cochange.EnrichGraphContext(ctx, out.Store, out.Root, t.prefix)
 		if err != nil {
 			out.Abandon()
 			return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
@@ -875,6 +894,9 @@ func (c *realController) Probe(ctx context.Context) (daemon.ProbeResponse, error
 	resp := daemon.ProbeResponse{
 		Ready:    c.ready.Load(),
 		Enriched: c.enriched.Load(),
+	}
+	if policy, ok := c.graph.(interface{ CloseCheckpointPolicy() string }); ok {
+		resp.CloseCheckpointPolicy = policy.CloseCheckpointPolicy()
 	}
 	if c.multiIndexer != nil {
 		roots := make([]string, 0)
@@ -1744,6 +1766,9 @@ func storageStatusFor(g graph.Store) *daemon.StorageStatus {
 		CloseCheckpointEstimateMS: estimate.Milliseconds(),
 		WALReclaim:                walReclaimStatus(reporter.WALReclaimStats()),
 	}
+	if policy, ok := g.(interface{ CloseCheckpointPolicy() string }); ok {
+		out.CloseCheckpointPolicy = policy.CloseCheckpointPolicy()
+	}
 	if counters, ok := g.(storeRowCounterReporter); ok {
 		out.RowCounters = &daemon.RowCounterStatus{Ready: counters.RowCountersReady()}
 	}
@@ -2259,7 +2284,70 @@ func probeSymbolHit(n *graph.Node) daemon.SymbolHit {
 // The lifecycle reads the watcher through this same pointer, so every
 // surface's attach and detach hit the one live watcher.
 func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
-	c.multiWatcher.Store(mw)
+	if mw == nil {
+		for {
+			previous := c.multiWatcher.Load()
+			if previous == nil || previous.watcher == nil || c.multiWatcher.CompareAndSwap(previous, nil) {
+				return
+			}
+		}
+	}
+	slot := &daemonWatcherSlot{watcher: mw}
+	if !c.multiWatcher.CompareAndSwap(nil, slot) {
+		_ = mw.Stop()
+		return
+	}
+	c.configureWatcher(mw)
+	if !c.multiWatcher.CompareAndSwap(slot, &daemonWatcherSlot{watcher: mw, ready: true}) {
+		_ = mw.Stop()
+	}
+}
+
+// startAndAttachWatcher reserves ownership before touching the filesystem.
+// Stop either stops that exact watcher or wins before the reservation, in which
+// case no Start is admitted. MultiWatcher's own Start/Stop boundary serializes
+// an already-admitted physical start. Callbacks run outside any handoff lock.
+func (c *realController) startAndAttachWatcher(ctx context.Context, mw *indexer.MultiWatcher) error {
+	return c.startAndAttachWatcherWith(ctx, mw, mw.Start)
+}
+
+// The explicit start operation gives deterministic tests a scheduling barrier;
+// production always supplies this exact watcher's physical Start method.
+func (c *realController) startAndAttachWatcherWith(ctx context.Context, mw *indexer.MultiWatcher, start func() error) error {
+	if err := ctx.Err(); err != nil {
+		_ = mw.Stop()
+		return err
+	}
+	slot := &daemonWatcherSlot{watcher: mw}
+	if !c.multiWatcher.CompareAndSwap(nil, slot) {
+		_ = mw.Stop()
+		return context.Canceled
+	}
+	reject := func(err error) error {
+		c.multiWatcher.CompareAndSwap(slot, nil)
+		_ = mw.Stop()
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return reject(err)
+	}
+	if err := start(); err != nil {
+		return reject(err)
+	}
+	c.configureWatcher(mw)
+	if err := ctx.Err(); err != nil {
+		return reject(err)
+	}
+	if !c.multiWatcher.CompareAndSwap(slot, &daemonWatcherSlot{watcher: mw, ready: true}) {
+		return reject(context.Canceled)
+	}
+	return nil
+}
+
+func (c *realController) configureWatcher(mw *indexer.MultiWatcher) {
+	if c.lifecycle == nil {
+		return
+	}
 	c.lifecycle.SetWatcherSource(func() indexer.RepoWatcher {
 		// A typed nil in an interface is not nil; return the untyped one so
 		// the lifecycle's "is there a watcher yet" test stays honest.
@@ -2268,9 +2356,6 @@ func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
 		}
 		return nil
 	})
-	if mw == nil {
-		return
-	}
 	mw.OnWorktreeChangeContext(func(dispatchCtx context.Context, repoPrefix, _ string) {
 		resolveCtx, cancel := context.WithTimeout(dispatchCtx, 10*time.Second)
 		familyID, err := c.lifecycle.ResolveFamilyID(resolveCtx, repoPrefix)
@@ -2289,7 +2374,10 @@ func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
 // The teardown path needs it, and taking mu there would put the stop request
 // back behind the minutes-long track / reload / enrichment it is trying to end.
 func (c *realController) watcher() *indexer.MultiWatcher {
-	return c.multiWatcher.Load()
+	if slot := c.multiWatcher.Load(); slot != nil && slot.ready {
+		return slot.watcher
+	}
+	return nil
 }
 
 // StopWatcher halts filesystem watching. Called first during teardown so no
@@ -2301,8 +2389,8 @@ func (c *realController) watcher() *indexer.MultiWatcher {
 // watcher pointer, which meant `gortex daemon stop` queued behind whatever
 // long operation was holding it.
 func (c *realController) StopWatcher() {
-	if mw := c.watcher(); mw != nil {
-		_ = mw.Stop()
+	if slot := c.multiWatcher.Swap(&daemonWatcherSlot{}); slot != nil && slot.watcher != nil {
+		_ = slot.watcher.Stop()
 	}
 }
 

@@ -229,6 +229,7 @@ type CheckoutLifecycle struct {
 	// an activation that has already been admitted.
 	coordinatorActivating map[string]struct{}
 	coordinatorClosing    bool
+	cancelOnce            sync.Once
 	coordinatorStartWG    sync.WaitGroup
 	// awaitingPrimary names, per primary graph, the admitted checkouts whose
 	// coordinator could not start because that primary was not registered
@@ -2723,15 +2724,14 @@ func (l *CheckoutLifecycle) watchCheckout(coordinator *CheckoutCoordinator, repo
 		}
 		matcher = policy.newExcludeMatcher(cfg.Exclude)
 	}
-	go func() {
-		w, err := startCheckoutWatch(root, matcher, logger, coordinator.noteFilesystemChange)
+	coordinator.startFilesystemWatch(func(ctx context.Context) (*checkoutWatch, error) {
+		w, err := startCheckoutWatchContext(ctx, root, matcher, logger, coordinator.noteFilesystemChange)
 		if err != nil {
 			logger.Info("checkout watch: not started; the checkout is refreshed by its poll",
 				zap.String("root", root), zap.Error(err))
-			return
 		}
-		coordinator.attachFilesystemWatch(w)
-	}()
+		return w, err
+	})
 }
 
 // warmCheckoutCompilerAtReady starts the background warm-up of a ready
@@ -3062,8 +3062,15 @@ func (l *CheckoutLifecycle) workspaceForPrefix(repoPrefix string) string {
 // ones started earlier for the same checkout that have since stopped.
 func (l *CheckoutLifecycle) trackStarted(checkoutID string, coordinator *CheckoutCoordinator) {
 	l.coordMu.Lock()
-	defer l.coordMu.Unlock()
 	l.started[checkoutID] = append(stillRunning(l.started[checkoutID]), coordinator)
+	closing := l.coordinatorClosing
+	l.coordMu.Unlock()
+	// A constructor admitted before Cancel may publish its owner after the
+	// first snapshot. It stays recorded for the final join, but cannot escape
+	// cancellation. No callback or watcher operation runs under coordMu.
+	if closing {
+		coordinator.Cancel()
+	}
 }
 
 // runningLocked reports whether a coordinator started for one checkout is
@@ -3286,32 +3293,68 @@ func (l *CheckoutLifecycle) ViewLeases() *graphview.LeaseManager {
 	return l.leases
 }
 
+// Cancel permanently closes every producer admission and revokes their
+// lifetimes before joining any one of them. Actual ownership remains with
+// Close, including actors a previously admitted constructor records later.
+func (l *CheckoutLifecycle) Cancel() {
+	if l == nil {
+		return
+	}
+	l.cancelOnce.Do(func() {
+		if l.baseAdoptionRelease != nil {
+			l.baseAdoptionRelease()
+		}
+		l.stopAnalysisLane()
+		l.stopRepositoryAdmissions()
+		l.stopRepositoryPublishers()
+		l.cancelRepositoryCleanup()
+		l.cancelCheckoutObservations()
+		l.stopAllRefViews()
+		l.transitionMu.Lock()
+		l.transitionClosed = true
+		cancel := l.cancelTransitions
+		l.transitionMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		l.retryMu.Lock()
+		l.retryClosing = true
+		for familyID, retry := range l.familyRetries {
+			retry.timer.Stop()
+			delete(l.familyRetries, familyID)
+		}
+		l.retryMu.Unlock()
+		l.coordMu.Lock()
+		l.coordinatorClosing = true
+		actors := make(map[*CheckoutCoordinator]struct{})
+		for _, actor := range l.coordinators {
+			actors[actor] = struct{}{}
+		}
+		for _, started := range l.started {
+			for _, actor := range started {
+				actors[actor] = struct{}{}
+			}
+		}
+		l.coordMu.Unlock()
+		for actor := range actors {
+			actor.Cancel()
+		}
+	})
+}
+
 // Close permanently closes lifecycle admission and joins its producers and
 // cleanup worker before the owning server releases indexers or the Store.
 func (l *CheckoutLifecycle) Close() error {
 	if l == nil {
 		return nil
 	}
-	// Unregistered first: a publication this shutdown is cancelling can still
-	// adopt, and an announcement that reaches a registry being torn down would
-	// signal coordinators this Close is about to join.
-	if l.baseAdoptionRelease != nil {
-		l.baseAdoptionRelease()
-	}
+	l.Cancel()
 	l.closeAnalysisLane()
 	readersDrained := l.stopRepositoryAdmissions()
 	publishersDrained := l.stopRepositoryPublishers()
 	l.closeRepositoryCleanup()
 	l.closeCheckoutObservations()
 	l.closeAllRefViews()
-	l.transitionMu.Lock()
-	if !l.transitionClosed {
-		l.transitionClosed = true
-		if l.cancelTransitions != nil {
-			l.cancelTransitions()
-		}
-	}
-	l.transitionMu.Unlock()
 	l.transitionWG.Wait()
 
 	// Stop admitting on-demand activations and join the ones already building.
@@ -3319,9 +3362,6 @@ func (l *CheckoutLifecycle) Close() error {
 	// to wind down; this waits for each to finish installing or bail, so its
 	// coordinator is in the registry the snapshot below closes and no activation
 	// can register one after that snapshot.
-	l.coordMu.Lock()
-	l.coordinatorClosing = true
-	l.coordMu.Unlock()
 	l.coordinatorStartWG.Wait()
 
 	// Serialize the retry phase of concurrent Close calls. The admission gate
@@ -3329,8 +3369,10 @@ func (l *CheckoutLifecycle) Close() error {
 	// starts waiting, and no new timer can be published until Close returns.
 	l.retryCloseMu.Lock()
 	defer l.retryCloseMu.Unlock()
+	// Keep a final sweep on every Close, including a repeated close after a
+	// delayed callback observed an old timer entry. Cancel's once permanently
+	// shuts admission; it must not suppress this idempotent resource cleanup.
 	l.retryMu.Lock()
-	l.retryClosing = true
 	for familyID, retry := range l.familyRetries {
 		retry.timer.Stop()
 		delete(l.familyRetries, familyID)

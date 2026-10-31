@@ -85,6 +85,9 @@ func newDocSession(p *Provider) *docSession {
 // the lru) until it is evicted or closeAll runs. err is non-nil only when
 // the disk read or the didOpen notify failed — release is a no-op then.
 func (s *docSession) acquire(c *Client, absPath string) ([]byte, func(), error) {
+	if c == nil {
+		return nil, func() {}, errClientNotInitialized
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

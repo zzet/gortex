@@ -14,10 +14,16 @@ import (
 // outlineScopePredicate is the SQL twin of graph.NodeScope.Allows. GLOB keeps
 // the external path check case-sensitive, like strings.HasPrefix in Go.
 func outlineScopePredicate(scope graph.NodeScope, alias string) (string, []any) {
+	return outlineScopePredicateWithWorkspace(scope, alias, false)
+}
+
+// A nonempty exact effective-workspace seek can discharge only the workspace
+// clause. Project and repo intersections still use the original scope.
+func outlineScopePredicateWithWorkspace(scope graph.NodeScope, alias string, workspaceProven bool) (string, []any) {
 	var terms []string
 	var args []any
 	global := `(` + alias + `.repo_prefix = '' AND ` + alias + `.workspace_id = '' AND (` + alias + `.file_path GLOB 'external::*' OR ` + alias + `.file_path GLOB 'external-call::*'))`
-	if scope.WorkspaceID != "" {
+	if scope.WorkspaceID != "" && !workspaceProven {
 		terms = append(terms, `(`+global+` OR COALESCE(NULLIF(`+alias+`.workspace_id, ''), `+alias+`.repo_prefix) = ?)`)
 		args = append(args, scope.WorkspaceID)
 	}
@@ -214,6 +220,10 @@ func outlineRows(ctx context.Context, tx outlineQueryer, query outlineQuery) (*s
 	if isNoSuchIndexErr(err) {
 		unhinted := strings.NewReplacer(
 			" INDEXED BY nodes_by_repo", "",
+			" INDEXED BY nodes_by_kind", "",
+			" INDEXED BY nodes_by_effective_workspace", "",
+			" INDEXED BY nodes_deadcode_eligible_workspace", "",
+			" INDEXED BY nodes_by_name", "",
 			" INDEXED BY edges_by_from", "",
 			" INDEXED BY edges_by_to", "",
 		).Replace(query.sql)

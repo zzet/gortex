@@ -17,7 +17,7 @@ func advancedMergeFixture(t *testing.T) (*fixture, Event, string) {
 	f.git("checkout", "-b", "pull-request")
 	prHead := f.change("leaf/value.go")
 	f.git("checkout", "main")
-	f.write("docs/cli.md", "main-only documentation\n")
+	f.write("build-input.json", "main-only non-Go build input\n")
 	f.pkg("mainconsumer", "import \"example.org/fixture/leaf\"\nfunc Value()int{return leaf.Value()}", "TestMainConsumer")
 	f.write("internal/indexer/main_dependency_test.go", "package indexer\nimport(\"testing\";\"example.org/fixture/leaf\")\nfunc TestMainAddedDependency(t *testing.T){if leaf.Value()!=42{t.Fatal(\"bad\")}}\n")
 	mainBase := f.commit()
@@ -44,19 +44,19 @@ func eventEnvironment(t *testing.T, event Event, body []byte) []string {
 
 func TestSelectionUsesVerifiedTestedMergeBaseAndMergedDependencies(t *testing.T) {
 	f, event, mainBase := advancedMergeFixture(t)
-	// The old formula really includes the unrelated docs and would force full.
+	// The old formula includes the unrelated unsafe input and would force full.
 	changes, err := f.planner.Changes(t.Context(), event.Base, event.Head)
 	if err != nil {
 		t.Fatal(err)
 	}
 	oldFallback := false
 	for _, change := range changes {
-		if slices.Contains(change.Paths, "docs/cli.md") && ordinaryChange(change) != nil {
+		if slices.Contains(change.Paths, "build-input.json") && ordinaryChange(change) != nil {
 			oldFallback = true
 		}
 	}
 	if !oldFallback {
-		t.Fatal("real DAG did not reproduce the old main-only documentation fallback")
+		t.Fatal("real DAG did not reproduce the old main-only unsafe-input fallback")
 	}
 	body, err := json.Marshal(eventPayload(event))
 	if err != nil {

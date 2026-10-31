@@ -74,6 +74,11 @@ func startCatalogTrackDaemon(t *testing.T, entries, loaded []config.RepoEntry) (
 			t.Error("daemon did not stop")
 		}
 	})
+	// Listen alone does not prove Serve has admitted its lifetime. Direct
+	// controller tests can otherwise reach cleanup before that goroutine runs.
+	client, err := daemon.DialToWithDeadline(socket, daemon.Handshake{Mode: daemon.ModeControl, ClientName: "catalog-test"}, time.Now().Add(2*time.Second))
+	require.NoError(t, err)
+	require.NoError(t, client.Close())
 	return cm, mi
 }
 
@@ -240,6 +245,9 @@ func TestUntrackConfiguredRootNeedsLoadedProof(t *testing.T) {
 			t.Error("daemon did not stop")
 		}
 	})
+	client, err := daemon.DialToWithDeadline(socket, daemon.Handshake{Mode: daemon.ModeControl, ClientName: "catalog-test"}, time.Now().Add(2*time.Second))
+	require.NoError(t, err)
+	require.NoError(t, client.Close())
 	cmd := &cobra.Command{}
 	cmd.SetErr(&bytes.Buffer{})
 	err = runUntrack(cmd, []string{root})

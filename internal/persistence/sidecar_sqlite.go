@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/zzet/gortex/internal/sqliteconn"
 )
 
 // SidecarStore is the SQLite-backed side-store for the agent's
@@ -292,7 +292,10 @@ func OpenSidecar(path string) (*SidecarStore, error) {
 	// transactions (already serialised in-process by writeMu); only changes
 	// when their write lock is taken, not whether.
 	dsn := abs + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(OFF)&_pragma=journal_size_limit(67108864)&_txlock=immediate"
-	db, err := sql.Open("sqlite", dsn)
+	// Apply the policy to every physical connection, including replacements.
+	// A late implicit checkpoint in db.Close would otherwise outlive the
+	// graph backend's close. Committed WAL is recovered on the next open.
+	db, err := sqliteconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("persistence: open sidecar: %w", err)
 	}
@@ -318,8 +321,9 @@ func OpenSidecar(path string) (*SidecarStore, error) {
 }
 
 // Close closes the underlying *sql.DB and drops it from the shared
-// cache. Primarily for tests; the daemon keeps its sidecar open for
-// the process lifetime.
+// cache. Every physical handle is actually closed, without an implicit final
+// WAL checkpoint. Committed WAL remains part of the database and is recovered
+// on reopen. The daemon owns this boundary after sidecar users have drained.
 func (s *SidecarStore) Close() error {
 	if s == nil {
 		return nil

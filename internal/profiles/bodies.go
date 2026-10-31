@@ -25,15 +25,15 @@ func sectionHeader(lean bool) string {
 	if lean {
 		return bt(`## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
-A machine-wide §gortex§ MCP server indexes this code. You MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
+Use §gortex§ MCP. You MUST prefer graph queries over file reads. Hook posture is configurable; obey its hooks even when native tools remain callable.
 
-`)
+`) + toolref.ToolSurfacePolicyText + "\n\n"
 	}
 	return bt(`## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
 
-A Gortex daemon is configured machine-wide via the §gortex§ MCP server. On indexed source (any repo it tracks — check §gortex daemon status§), you MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when raw file tools remain callable.
+The machine-wide §gortex§ MCP server indexes tracked code. You MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when native tools remain callable.
 
-`)
+`) + toolref.ToolSurfacePolicyText + "\n\n"
 }
 
 // sectionFullRuleTable is the classic nine-row instead-of table used
@@ -50,12 +50,10 @@ var sectionExploreOpener = bt(`For an explicitly named file to read/review/summa
 // can actually call; exact operation schemas remain on demand.
 var sectionCompactWorkflow = bt(`When Gortex can serve the step:
 
-1. Named-file read/review/summarize: first new-task call §read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})§; do not localize. To discover a file, symbol, or evidence, call §explore(operation:"localize")§ and obey §completion.required_action§; after §answer_ready§, answer from §completion.final_response§ and stop. For diagnosis or modification, call §explore(operation:"task")§.
-2. In a diagnosis/change flow, make at most one follow-up on one unresolved symbol with §search§, §read§, §relations§, or §trace§; then step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
+1. Named-file read/review/summarize: first new-task call §read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})§; do not localize. Unknown file/symbol/evidence: §explore(operation:"localize")§; obey §completion.required_action§; at §answer_ready§ answer from §completion.final_response§ and stop. Diagnosis/change: §explore(operation:"task")§.
+2. Diagnosis/change: at most one follow-up on one unresolved symbol with §search§, §read§, §relations§, or §trace§; then step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
 3. Before mutation, call §change(operation:"impact")§; for a signature change, also §change(operation:"verify")§ with the proposed signature. Mutate only with §edit§ or §refactor§. After mutation, call §change(operation:"detect")§, then its symbol IDs with §change(operation:"tests")§, §change(operation:"guards")§, and §change(operation:"contract")§.
-4. Call §capabilities§ only for an operation's exact fields.
-
-Example: §search(operation:"symbols", query:"<name>")§.
+4. §capabilities§: exact operation fields only.
 
 `) + toolref.TransportClause() + " " + toolref.DegradedModeLine() + `
 
@@ -151,7 +149,7 @@ The graph remembers code; these tools remember **why you made a call**. They are
 // next-session caveat, dropping only the roster prose.
 func switchBullet(active string, lean bool) string {
 	if lean {
-		return bt(fmt.Sprintf(`- **Profiles:** active §%s§. Broader guidance: §gortex instructions switch core§ (or §full§; §list§ shows all) — NEW sessions only.
+		return bt(fmt.Sprintf(`- **Profiles:** active §%s§. §gortex instructions switch core§ (or §full§; §list§ shows all) — NEW sessions only.
 `, active))
 	}
 	return bt(fmt.Sprintf(`- **Instruction profiles** — this block is the active §%s§ profile. §gortex instructions list§ shows the others (§core§ balanced · §localization§ lean · §full§ maximum); switch with §gortex instructions switch <name>§ — applies to NEW sessions only (instructions, tools/list and skills all load at session start).
@@ -168,7 +166,7 @@ func sectionDiscovery(active, surfaceLine string) string {
 `) + switchBullet(active, false)
 }
 
-var compactSurfaceLine = bt(`**§capabilities§** — request an exact operation schema only when the compact tool description is insufficient; ordinary coding needs no tool discovery.
+var compactSurfaceLine = bt(`**§capabilities§** — exact operation schema on demand; ordinary coding needs no discovery.
 `)
 
 var fullSurfaceLine = bt(`**§tools_search§** — under this profile the server publishes the full documented dev-cycle preset (~34 workhorse tools) eagerly; the long tail still loads by keyword via §tools_search§ (every tool stays callable by name).
@@ -236,6 +234,6 @@ func localizationBody() string {
 		sectionCompactWorkflow +
 		sectionCompactMemory +
 		sectionWorktreeViews +
-		bt(`**Reference:** call §capabilities§ for an exact operation schema; use §gortex://guide§ only for deeper background.
+		bt(`**Reference:** §gortex://guide§ for deeper background.
 `) + switchBullet("localization", true)
 }

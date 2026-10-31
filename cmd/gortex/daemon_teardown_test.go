@@ -108,6 +108,7 @@ func TestDaemonTeardownRunsOnASignalledExit(t *testing.T) {
 
 	srv := daemon.New(daemon.SocketPath(), "test", zap.NewNop())
 	require.NoError(t, srv.Listen())
+	t.Cleanup(func() { require.NoError(t, srv.Shutdown()) })
 
 	// Exactly the shape of runDaemonStart's tail: the teardown is deferred
 	// around the serve loop, and nothing else runs it.
@@ -116,6 +117,16 @@ func TestDaemonTeardownRunsOnASignalledExit(t *testing.T) {
 		defer func() { runTeardown() }()
 		stopped <- srv.Serve()
 	}()
+	// Listen installs the signal handler before Serve owns the accept loop.
+	// A signal in that gap correctly closes admission before Serve starts;
+	// this regression specifically exercises an already-serving daemon.
+	// A real completed handshake proves the accept loop entered, without a
+	// scheduling sleep or changing the shutdown contract.
+	client, err := daemon.DialToWithDeadline(socket, daemon.Handshake{
+		Mode: daemon.ModeControl, ClientName: "teardown-test",
+	}, time.Now().Add(5*time.Second))
+	require.NoError(t, err)
+	require.NoError(t, client.Close())
 
 	proc, err := os.FindProcess(os.Getpid())
 	require.NoError(t, err)

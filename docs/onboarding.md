@@ -17,6 +17,8 @@ Setup is split into two commands so codebase-agnostic machinery lives once per u
 
 You can run them independently — `gortex init` doesn't require `gortex install` first; it just writes less if the user-level wiring isn't there.
 
+Using Claude Code? Gortex also ships as a Claude Code plugin; see [Claude Code plugin](installation.md#claude-code-plugin) for how it fits with these two commands.
+
 ```bash
 # One-time: machine-wide user-level setup
 gortex install --start --track         # install, start daemon, track current dir
@@ -150,6 +152,29 @@ Once installed, three things happen without you lifting a finger:
 All four degrade silently when the bridge is unreachable — they never block your normal flow.
 
 ## Troubleshooting
+
+### Recovering from a runaway warmup
+
+If you accidentally tracked a home directory, repository parent or another
+large tree, stop the daemon before removing it from the tracked configuration:
+
+```sh
+gortex daemon stop
+gortex untrack /absolute/path/to/unwanted-repository
+gortex daemon start
+```
+
+When an installed service manager owns the daemon, `daemon stop` goes through
+that manager. The stop intent also keeps an editor's MCP proxy from immediately
+restarting it. With the daemon down, `untrack` edits configuration only and
+prints `(config only)`; use the absolute repository path, not its bare prefix.
+Keep the daemon stopped until that command succeeds.
+
+On the next start, the orphan-prefix purge removes the untracked repository's
+stored rows instead of warming it again. Run `gortex daemon status` in another
+terminal: the unwanted repository should be absent, and the repositories you
+kept should become ready. This procedure does not promise that online untrack
+can interrupt a repository that is still warming.
 
 **"Gortex MCP server failed to start" in the IDE.**
 Check that `gortex` is on your `PATH` (`which gortex` should resolve). If you installed via Homebrew, restart the IDE — it caches PATH at launch.

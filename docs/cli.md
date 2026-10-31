@@ -80,6 +80,11 @@ gortex untrack backend
 gortex status
 ```
 
+Offline `untrack` requires a repository path; a bare prefix is resolved by the
+running daemon. To recover from an unwanted warmup, stop first, then run
+`gortex untrack /absolute/path/to/unwanted-repository`, and start the daemon
+again. See [Recovering from a runaway warmup](onboarding.md#recovering-from-a-runaway-warmup).
+
 ## Repository prefix collisions
 
 A repository prefix identifies one indexed root. By default, it is the directory

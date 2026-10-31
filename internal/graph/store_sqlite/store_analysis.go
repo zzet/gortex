@@ -122,11 +122,15 @@ func (s *Store) DeadCodeCandidatesContext(ctx context.Context, allowedNodeKinds 
 // the pairing an incoming edge from any other generation answers "used".
 // With no allowed edge kinds, any incoming edge counts as usage.
 func deadCodeVerdictPageSQL(allowedEdgeKinds int) string {
+	return `SELECT n.id, ` + deadCodeIncomingProbeSQL(allowedEdgeKinds) + ` FROM nodes n WHERE n.view_gen = ? AND n.id > ? AND n.kind = ? ORDER BY n.id LIMIT ?`
+}
+
+func deadCodeIncomingProbeSQL(allowedEdgeKinds int) string {
 	probe := `NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.view_gen = n.view_gen)`
 	if allowedEdgeKinds > 0 {
 		probe = `NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.kind IN (` + inPlaceholders(allowedEdgeKinds) + `) AND e.view_gen = n.view_gen)`
 	}
-	return `SELECT n.id, ` + probe + ` FROM nodes n WHERE n.view_gen = ? AND n.id > ? AND n.kind = ? ORDER BY n.id LIMIT ?`
+	return probe
 }
 
 // deadCodeVerdictPage runs one verdict page: the dead ids (in id order), how
@@ -135,7 +139,11 @@ func (s *Store) deadCodeVerdictPage(ctx context.Context, q string, args ...any) 
 	// The probe's edge-kind placeholders sit in the SELECT list, before the
 	// WHERE clause's; reorder the arguments to match.
 	ordered := reorderDeadCodeArgs(args)
-	rows, err := s.db.QueryContext(ctx, q, ordered...)
+	return s.scanDeadCodeVerdictPage(ctx, q, ordered...)
+}
+
+func (s *Store) scanDeadCodeVerdictPage(ctx context.Context, q string, args ...any) ([]string, int, string, error) {
+	rows, err := outlineRows(ctx, s.db, outlineQuery{sql: q, args: args})
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, 0, "", ctx.Err()
@@ -218,6 +226,11 @@ WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL AND e.view_gen = ?`
 	if err != nil {
 		return nil
 	}
+	out, _ := scanIfaceImplementsRows(rows)
+	return out
+}
+
+func scanIfaceImplementsRows(rows *sql.Rows) ([]graph.IfaceImplementsRow, error) {
 	defer rows.Close()
 
 	var out []graph.IfaceImplementsRow
@@ -244,9 +257,9 @@ WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL AND e.view_gen = ?`
 	// iteration is different in kind — it truncates the projection — so it
 	// fails the whole call the way a failed Query does.
 	if rows.Err() != nil {
-		return nil
+		return nil, rows.Err()
 	}
-	return out
+	return out, nil
 }
 
 // --- MemberMethodsByType ------------------------------------------------

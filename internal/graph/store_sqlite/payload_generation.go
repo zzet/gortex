@@ -140,6 +140,10 @@ func (s *Store) payloadSealIfPresent(g int64) *payloadSeal {
 // handle carries no flag and returns immediately; a derived handle costs one
 // atomic load once its flag has been resolved.
 func (s *Store) refuseSealedPayloadWrite() error {
+	return s.refuseSealedPayloadWriteContext(context.Background())
+}
+
+func (s *Store) refuseSealedPayloadWriteContext(ctx context.Context) error {
 	seal := s.seal
 	if seal == nil {
 		return nil
@@ -153,14 +157,18 @@ func (s *Store) refuseSealedPayloadWrite() error {
 		// one callers match on.
 		return fmt.Errorf("%w: generation %d", ErrPayloadGenerationSealed, s.viewGen)
 	}
-	return s.resolvePayloadSeal(seal)
+	return s.resolvePayloadSealContext(ctx, seal)
 }
 
 // resolvePayloadSeal reads the generation's catalog state once and caches the
 // verdict. It runs before any write transaction is opened, so it never queries
 // through a connection it is itself holding.
 func (s *Store) resolvePayloadSeal(seal *payloadSeal) error {
-	verdict, state, found, err := s.catalogSealVerdict()
+	return s.resolvePayloadSealContext(context.Background(), seal)
+}
+
+func (s *Store) resolvePayloadSealContext(ctx context.Context, seal *payloadSeal) error {
+	verdict, state, found, err := s.catalogSealVerdictContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -173,7 +181,7 @@ func (s *Store) resolvePayloadSeal(seal *payloadSeal) error {
 			// would let a write into a swept generation through on the fast
 			// path. Leaving the flag unresolved costs a re-read on a handle
 			// nothing legitimate holds.
-			tombstoned, markErr := s.payloadGenerationTombstoned()
+			tombstoned, markErr := s.payloadGenerationTombstonedContext(ctx)
 			if markErr != nil {
 				return markErr
 			}
@@ -212,8 +220,12 @@ func (s *Store) resolvePayloadSeal(seal *payloadSeal) error {
 // "published". That is what keeps the analysis cache's admission check on the
 // cheap atomic path in the routed case, which is the common one.
 func (s *Store) catalogSealVerdict() (int32, string, bool, error) {
+	return s.catalogSealVerdictContext(context.Background())
+}
+
+func (s *Store) catalogSealVerdictContext(ctx context.Context) (int32, string, bool, error) {
 	var state string
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(ctx,
 		`SELECT state FROM view_generations WHERE generation_id = ?`, s.viewGen).Scan(&state)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -254,8 +266,12 @@ func (s *Store) catalogSealVerdict() (int32, string, bool, error) {
 // caller produces, since a handle is derived from the id its own begin
 // returned.
 func (s *Store) payloadGenerationTombstoned() (bool, error) {
+	return s.payloadGenerationTombstonedContext(context.Background())
+}
+
+func (s *Store) payloadGenerationTombstonedContext(ctx context.Context) (bool, error) {
 	var mark int64
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(ctx,
 		`SELECT seq FROM sqlite_sequence WHERE name = 'view_generations'`).Scan(&mark)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil

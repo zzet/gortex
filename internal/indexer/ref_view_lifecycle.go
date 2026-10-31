@@ -151,15 +151,23 @@ func (l *CheckoutLifecycle) finalizeRepositoryRefViews(drain *repositoryRefViewD
 	return nil
 }
 
-func (l *CheckoutLifecycle) closeAllRefViews() {
+func (l *CheckoutLifecycle) stopAllRefViews() []<-chan struct{} {
 	l.refViewMu.Lock()
 	l.refViewsClosed = true
-	drains := make([]<-chan struct{}, 0, len(l.refViews))
+	managers := make([]*RefViewManager, 0, len(l.refViews))
 	for _, manager := range l.refViews {
-		drains = append(drains, manager.CloseAdmission())
+		managers = append(managers, manager)
 	}
 	l.refViewMu.Unlock()
-	for _, done := range drains {
+	drains := make([]<-chan struct{}, 0, len(managers))
+	for _, manager := range managers {
+		drains = append(drains, manager.CloseAdmission())
+	}
+	return drains
+}
+
+func (l *CheckoutLifecycle) closeAllRefViews() {
+	for _, done := range l.stopAllRefViews() {
 		<-done
 	}
 }

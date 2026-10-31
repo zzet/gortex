@@ -167,16 +167,16 @@ func TestCoChange_PersistedEdgesTakeFastPath(t *testing.T) {
 //
 // A receipt standing for the same (producer, corpus) owner must be superseded
 // by the mine's own admission — which can only happen if the mine admitted one.
-// The fixture repositories carry no git history, so no pair is mined and no row
-// is written: the admission is resolved BEFORE the history is read (the same
-// ordering the coverage path uses for its profile), which is exactly what makes
-// this checkable without a git corpus.
+// The fixture repositories carry one commit each, below the pair-count
+// threshold, so no pair is mined and no row is written. Admission is resolved
+// BEFORE history is read (as in the coverage path), independently of any pair.
 //
 // Revert-red: with `cochange.AddEdges(s.graph, …)` and the bare
 // `s.collectRepoRoots("")` sweep back, nothing is admitted and the standing
 // receipt settles cleanly.
 func TestCoChangeMineNamesTheCorpusOutputItWrites(t *testing.T) {
 	stack := newViewStack(t)
+	commitCochangeViewRepos(t, stack)
 	standing, err := BeginBaseEnrichment(context.Background(), stack.srv.outputGenerationAuthority(),
 		stack.srv.graph, EnrichProducerCochange, "repo", stack.repoRoot)
 	require.NoError(t, err)
@@ -285,6 +285,7 @@ func TestTheCoChangeHandlerAsksThroughTheViewGate(t *testing.T) {
 
 	t.Run("base", func(t *testing.T) {
 		stack := newViewStack(t)
+		commitCochangeViewRepos(t, stack)
 		res, err := stack.callHandler(t, stack.repoRoot, "find_co_changing_symbols",
 			map[string]any{"file_path": "repo/keep.go", "refresh": true},
 			stack.srv.handleFindCoChangingSymbols)
@@ -301,4 +302,39 @@ func TestTheCoChangeHandlerAsksThroughTheViewGate(t *testing.T) {
 		require.True(t, consumed,
 			"the base request left the one-shot unconsumed")
 	})
+}
+
+func TestCochangeMineFailureDoesNotPublishCompletedEmptyCache(t *testing.T) {
+	stack := newViewStack(t)
+	// Plain fixture directories plus a missing executable are a real mine
+	// failure, never evidence of a successfully empty Git history.
+	t.Setenv("PATH", t.TempDir())
+	var standing []*EnrichmentOutput
+	for prefix, root := range map[string]string{"repo": stack.repoRoot, "other": stack.otherRoot} {
+		out, err := BeginBaseEnrichment(context.Background(), stack.srv.outputGenerationAuthority(), stack.srv.graph, EnrichProducerCochange, prefix, root)
+		require.NoError(t, err)
+		standing = append(standing, out)
+	}
+	stack.srv.mineCoChange()
+	require.False(t, stack.srv.coChangeReady(), "failed Git scan was published as a completed empty mine")
+	for _, out := range standing {
+		require.ErrorIs(t, out.Complete(), indexer.ErrOutputMutationReceiptSuperseded, "one failed target prevented another target's admission")
+	}
+	out, isErr := callFindCoChanging(t, stack.srv, map[string]any{"file_path": "repo/keep.go", "refresh": false})
+	require.False(t, isErr)
+	require.Equal(t, true, out["mining_failed"])
+	require.Equal(t, false, out["mining_in_progress"], "sticky once failure still asked callers to wait indefinitely")
+	require.NotEmpty(t, out["mining_error"])
+}
+
+// Successful mining fixtures need real committed history. The generic view
+// fixture intentionally creates plain directories, which cannot prove a
+// successful empty Git scan once errors are no longer silently discarded.
+func commitCochangeViewRepos(t *testing.T, stack *viewStack) {
+	t.Helper()
+	for _, root := range []string{stack.repoRoot, stack.otherRoot} {
+		runGitT(t, root, "init", "-q", "-b", "main")
+		runGitT(t, root, "add", ".")
+		runGitT(t, root, "-c", "user.name=Cochange Fixture", "-c", "user.email=fixture@example.com", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "fixture")
+	}
 }

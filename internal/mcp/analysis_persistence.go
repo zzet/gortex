@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/gob"
 	"fmt"
 	"io"
@@ -112,19 +113,35 @@ func (s *Server) populateAnalysisLocked() analysisRunMetrics {
 // takes it (analysis_pass.go); without it the caller holds analysisMu for the
 // whole call. A background pass yields at its checkpoints.
 func (s *Server) populateAnalysis(takeLock, background bool) analysisRunMetrics {
+	ctx, done, ok := s.admitBackground()
+	if !ok {
+		return analysisRunMetrics{}
+	}
+	defer done()
+	return s.populateAnalysisContext(ctx, takeLock, background)
+}
+
+func (s *Server) populateAnalysisContext(ctx context.Context, takeLock, background bool) analysisRunMetrics {
 	const maxSnapshotAttempts = 3
 
 	locked := func(fn func()) func() {
 		if !takeLock {
-			return fn
+			return func() {
+				if ctx.Err() == nil {
+					fn()
+				}
+			}
 		}
 		return func() {
 			s.analysisMu.Lock()
 			defer s.analysisMu.Unlock()
-			fn()
+			if ctx.Err() == nil {
+				fn()
+			}
 		}
 	}
 	generationWriter, generationQuery := s.analysisGenerationBackends()
+	generationWriter = bindAnalysisWriteContext(generationWriter, ctx)
 	generationBacked := generationWriter != nil && generationQuery != nil
 	var lastMetrics analysisRunMetrics
 	attempts, superseded, supersededAt, yields, paceParks := 0, 0, "", 0, 0
@@ -135,10 +152,16 @@ func (s *Server) populateAnalysis(takeLock, background bool) analysisRunMetrics 
 		return m
 	}
 	for attempt := 0; attempt < maxSnapshotAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return finish(lastMetrics)
+		}
 		var metrics analysisRunMetrics
 		// The attempt's first checkpoint, before its header load: a background
 		// pass yields here too. No revision is pinned yet.
-		(&analysisPassControl{s: s, background: background, metrics: &metrics}).checkpoint("load")
+		(&analysisPassControl{ctx: ctx, s: s, background: background, metrics: &metrics}).checkpoint("load")
+		if ctx.Err() != nil {
+			return finish(metrics)
+		}
 		yields += metrics.yields
 		yielded += metrics.yielded
 		metrics.yields, metrics.yielded = 0, 0
@@ -200,9 +223,12 @@ func (s *Server) populateAnalysis(takeLock, background bool) analysisRunMetrics 
 		// Pages may observe different revisions; the generation/revision gate
 		// below rejects superseded results before atomic publication.
 		analysisGraph := graph.BindAnalysisPages(s.graph)
+		if bound, ok := graph.BindReadContext(s.graph, ctx).(graph.Store); ok {
+			analysisGraph = graph.BindAnalysisPages(bound)
+		}
 		candidate := persistedAnalysis{}
 		attempts++
-		control := &analysisPassControl{s: s, writer: generationWriter, expected: expectedRevision, background: background, metrics: &metrics}
+		control := &analysisPassControl{ctx: ctx, s: s, writer: generationWriter, expected: expectedRevision, background: background, metrics: &metrics}
 		stop := func(stage string) bool {
 			if control.checkpoint(stage) {
 				return false
@@ -218,7 +244,7 @@ func (s *Server) populateAnalysis(takeLock, background bool) analysisRunMetrics 
 		// scans.
 		var pace *analysis.Pace
 		if background {
-			pace = analysis.NewPace(s.analysisShouldYield)
+			pace = analysis.NewPace(func() bool { return ctx.Err() == nil && s.analysisShouldYield() })
 		}
 		projection := analysis.NewCallRefProjection(analysisGraph, pace)
 		collectPace := func() {
@@ -315,7 +341,7 @@ func (s *Server) populateAnalysis(takeLock, background bool) analysisRunMetrics 
 		generationReady := false
 		if generationBacked {
 			started = time.Now()
-			storedHeader, stored, err := persistAnalysisGeneration(generationWriter, expectedRevision, candidate)
+			storedHeader, stored, err := persistAnalysisGenerationContext(ctx, generationWriter, expectedRevision, candidate)
 			metrics.cacheSave = time.Since(started)
 			if err != nil {
 				metrics.cacheSaveErr = err
@@ -331,6 +357,9 @@ func (s *Server) populateAnalysis(takeLock, background bool) analysisRunMetrics 
 			}
 		}
 
+		if ctx.Err() != nil {
+			return finish(metrics)
+		}
 		install := func() {
 			s.communities = candidate.communities
 			s.leidenCache = candidate.leiden
@@ -377,6 +406,9 @@ func (s *Server) populateAnalysis(takeLock, background bool) analysisRunMetrics 
 		lastMetrics = metrics
 	}
 
+	if ctx.Err() != nil {
+		return finish(lastMetrics)
+	}
 	// Continuous writes denied every bounded publish attempt. Fail closed: a
 	// result that cannot be tied to a stable graph revision is never exposed.
 	if takeLock {

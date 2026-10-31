@@ -481,6 +481,108 @@ func TestRelayProxySessionReportsDaemonProcessReset(t *testing.T) {
 	waitRelay(t, done)
 }
 
+func TestRelayProxySessionDoesNotReplayCompletedRequestAfterDisconnect(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response string
+	}{
+		{name: "success", response: `{"jsonrpc":"2.0","id":1,"result":{"content":[]}}` + "\n"},
+		{name: "canceled", response: `{"jsonrpc":"2.0","id":1,"error":{"code":-32800,"message":"context canceled"}}` + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldDial := dialDaemon
+			t.Cleanup(func() { dialDaemon = oldDial })
+			initialClient, initialDaemon := testDaemonPipe()
+			recoveredClient, recoveredDaemon := testDaemonPipe()
+			recoveredClient.Ack.DaemonInstance = "daemon-instance-b"
+			var dialCalls atomic.Int32
+			dialDaemon = func(daemon.Handshake) (*daemon.Client, error) {
+				dialCalls.Add(1)
+				return recoveredClient, nil
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			stdinR, stdinW := io.Pipe()
+			stdoutR, stdoutW := io.Pipe()
+			stdout := bufio.NewReader(stdoutR)
+			done := make(chan error, 1)
+			go func() {
+				done <- relayProxySession(ctx, testProxyHandshake(), initialClient, stdinR, stdoutW, io.Discard, nil, nil)
+			}()
+			defer func() {
+				// Keep relay I/O valid until genuine stdin EOF has stopped and
+				// joined the relay. Closing its read/output pipes first races
+				// teardown into an unrelated io.ErrClosedPipe failure.
+				defer func() {
+					cancel()
+					_ = stdinR.Close()
+					_ = stdoutR.Close()
+					_ = stdoutW.Close()
+					_ = initialDaemon.Close()
+					_ = recoveredDaemon.Close()
+					_ = initialClient.Close()
+					_ = recoveredClient.Close()
+				}()
+				_ = stdinW.Close()
+				waitRelay(t, done)
+			}()
+
+			request := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read"}}` + "\n")
+			mustWriteTestFrame(t, stdinW, request)
+			if got := mustReadTestFrame(t, initialDaemon); !bytes.Equal(got, request) {
+				t.Fatalf("initial request mismatch: %s", got)
+			}
+			mustWriteTestFrame(t, initialDaemon, []byte(tc.response))
+			if got := mustReadTestFrame(t, stdout); !bytes.Equal(got, []byte(tc.response)) {
+				t.Fatalf("terminal response changed: %s", got)
+			}
+			// The host has observed the terminal response before transport loss.
+			// Neither success nor cancellation leaves a request eligible for replay.
+			if err := initialDaemon.Close(); err != nil {
+				t.Fatal(err)
+			}
+			trigger := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read"}}` + "\n")
+			mustWriteTestFrame(t, stdinW, trigger)
+			warning := mustReadTestFrame(t, stdout)
+			if !jsonFrameMethod(warning, "notifications/message") || !bytes.Contains(warning, []byte(`"gortex_session_reset"`)) {
+				t.Fatalf("expected reset warning before any replay: %s", warning)
+			}
+			if got := mustReadTestFrame(t, stdout); !jsonFrameMethod(got, "notifications/tools/list_changed") {
+				t.Fatalf("expected tools/list_changed: %s", got)
+			}
+			reset := mustReadTestFrame(t, stdout)
+			assertTestResponse(t, reset, 2, true)
+			if !bytes.Contains(reset, []byte(`"session_reset":true`)) {
+				t.Fatalf("expected reset error for the new request: %s", reset)
+			}
+			retry := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read"}}` + "\n")
+			mustWriteTestFrame(t, stdinW, retry)
+			if got := mustReadTestFrame(t, recoveredDaemon); !bytes.Equal(got, retry) {
+				t.Fatalf("completed request replayed instead of explicit retry: %s", got)
+			}
+			mustWriteTestFrame(t, recoveredDaemon, []byte(`{"jsonrpc":"2.0","id":3,"result":{}}`+"\n"))
+			assertTestResponse(t, mustReadTestFrame(t, stdout), 3, false)
+			if got := dialCalls.Load(); got != 1 {
+				t.Fatalf("dial calls = %d, want 1", got)
+			}
+			assertRelayRunning(t, done)
+		})
+	}
+}
+
+func TestProxyTestFrameReaderRetainsCoalescedFrames(t *testing.T) {
+	frames := [][]byte{
+		[]byte(`{"jsonrpc":"2.0","method":"notifications/message"}` + "\n"),
+		[]byte(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}` + "\n"),
+		[]byte(`{"jsonrpc":"2.0","id":2,"error":{"code":-32000}}` + "\n"),
+	}
+	reader := bufio.NewReader(bytes.NewReader(bytes.Join(frames, nil)))
+	for i, want := range frames {
+		if got := mustReadTestFrame(t, reader); !bytes.Equal(got, want) {
+			t.Fatalf("coalesced frame %d = %s, want %s", i, got, want)
+		}
+	}
+}
+
 func TestRetryableProxyRequestIsConservative(t *testing.T) {
 	tests := []struct {
 		name  string

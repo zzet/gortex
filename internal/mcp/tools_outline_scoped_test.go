@@ -47,6 +47,12 @@ func (r *outlineCountingReader) GetNodesByIDs(ids []string) map[string]*graph.No
 	r.counters().lookupBatches = append(r.counters().lookupBatches, append([]string(nil), ids...))
 	return r.Store.GetNodesByIDs(ids)
 }
+func (r *outlineCountingReader) OutlineNodeIDsInScope(scope graph.NodeScope, ids []string) ([]string, error) {
+	r.counters().lookedUp = append(r.counters().lookedUp, ids...)
+	r.counters().lookupBatches = append(r.counters().lookupBatches, append([]string(nil), ids...))
+	return r.Store.OutlineNodeIDsInScope(scope, ids)
+}
+
 func (r *outlineCountingReader) ScopedOutlineCounts(scope graph.NodeScope) (graph.OutlineCounts, error) {
 	r.counters().aggregates++
 	return r.Store.ScopedOutlineCounts(scope)
@@ -419,4 +425,45 @@ func TestOutlineContractRuntimeHonorsCancellation(t *testing.T) {
 	require.True(t, errors.Is(err, context.Canceled))
 	require.Zero(t, reader.allEdges)
 	require.Zero(t, reader.allNodes)
+}
+
+func TestOutlineGoldenSixRepo(t *testing.T) {
+	store := openContractCoreCapStore(t)
+	s := &Server{graph: store, session: newSessionState(), sessions: newSessionMap(), logger: zap.NewNop()}
+	var nodes []*graph.Node
+	var edges []*graph.Edge
+	comms := &analysis.CommunityResult{Modularity: .5}
+	for i := 1; i <= 6; i++ {
+		repo := fmt.Sprintf("repo%d", i)
+		nodes = append(nodes,
+			&graph.Node{ID: repo + "-main", Name: "main", Kind: graph.KindFunction, RepoPrefix: repo, WorkspaceID: "ws", Language: "go", FilePath: repo + "/main.go"},
+			&graph.Node{ID: repo + "-lib", Name: "helper", Kind: graph.KindFunction, RepoPrefix: repo, WorkspaceID: "ws", Language: "go", FilePath: repo + "/lib.go"},
+		)
+		other := fmt.Sprintf("repo%d", i%6+1)
+		edges = append(edges,
+			&graph.Edge{From: repo + "-main", To: repo + "-lib", Kind: graph.EdgeCalls},
+			&graph.Edge{From: repo + "-main", To: repo + "-lib", Kind: graph.EdgeImports},
+			&graph.Edge{From: other + "-main", To: repo + "-lib", Kind: graph.EdgeImports},
+		)
+		comms.Communities = append(comms.Communities, analysis.Community{ID: repo, Label: repo, Size: 2, Cohesion: .5, Members: []string{repo + "-main", repo + "-lib"}})
+	}
+	store.AddBatch(nodes, edges)
+	installCommunitiesForTest(s, comms)
+	for i := 6; i >= 1; i-- {
+		repo := fmt.Sprintf("repo%d", i)
+		s.hotspots = append(s.hotspots, analysis.HotspotEntry{ID: repo + "-lib", Name: "helper", Kind: "function", FilePath: repo + "/lib.go", FanIn: 2, FanOut: 0, ComplexityScore: 3})
+	}
+	s.hotspotsReady = true
+	for i := 1; i <= 6; i++ {
+		repo := fmt.Sprintf("repo%d", i)
+		ctx := outlineBoundContext(s, repo, "ws", map[string]bool{repo: true})
+		got := outlineJSON(t, s, ctx, store)
+		oracle := outlineJSON(t, s, ctx, legacyOutlineReader{store})
+		require.JSONEq(t, string(oracle), string(got))
+		golden := fmt.Sprintf(`{"summary":{"total_nodes":2,"total_edges":2,"primary_language":"go","languages":[{"name":"go","nodes":2}]},"communities":{"count":1,"modularity":0.5,"top":[{"id":%q,"label":%q,"size":2,"cohesion":0.5}]},"hotspots":[{"id":%q,"name":"helper","kind":"function","file_path":%q,"fan_in":2,"fan_out":0,"complexity_score":3}],"most_imported_files":[{"path":%q,"import_count":2}],"entry_points":[{"id":%q,"name":"main","file_path":%q}]}`, repo, repo, repo+"-lib", repo+"/lib.go", repo+"/lib.go", repo+"-main", repo+"/main.go")
+		require.JSONEq(t, golden, string(got), repo)
+	}
+	// The unbound response still uses the exact legacy Stats/edge-count path
+	// and formatting. Even JSON key/number spelling stays byte-identical.
+	require.Equal(t, outlineJSON(t, s, context.Background(), legacyOutlineReader{store}), outlineJSON(t, s, context.Background(), store))
 }

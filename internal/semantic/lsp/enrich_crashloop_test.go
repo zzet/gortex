@@ -54,7 +54,9 @@ func TestLSP_Enrich_CrashLoopGuardAbandonsPass(t *testing.T) {
 		go srv.run(in, out)
 		t.Cleanup(cl)
 		srv.handle("textDocument/hover", dyingHover(c))
+		p.lifetimeMu.Lock()
 		p.client = c
+		p.lifetimeMu.Unlock()
 		return nil
 	}
 

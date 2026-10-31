@@ -119,11 +119,12 @@ func InstructionsDir(env Env) string {
 }
 
 // InstructionsBody is the shared, agent-neutral rule block every doc-aware
-// adapter writes. It names only the compact public tools and treats a missing
-// callable handle as an integration failure; transport versions,
-// implementation aliases, and cross-transport fallbacks do not belong in an
-// MCP-capable agent's working context.
+// adapter writes. Compact examples follow the session's actual tool policy;
+// an explicit legacy preset remains supported without exposing hidden tools
+// or adding cross-transport fallbacks.
 const InstructionsBody = `## MANDATORY: Use Gortex MCP tools instead of Read/Grep
+
+` + toolref.ToolSurfacePolicyText + `
 
 When Gortex can serve the step:
 

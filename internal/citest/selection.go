@@ -213,17 +213,26 @@ func parseChanges(out []byte) ([]Change, error) {
 	return changes, nil
 }
 func ordinaryChange(c Change) error {
-	if len(c.Paths) != 1 || (c.Status != "A" && c.Status != "M") || !strings.HasSuffix(c.Paths[0], ".go") || strings.HasPrefix(c.Paths[0], "scripts/") || strings.HasPrefix(c.Paths[0], ".github/") || strings.HasPrefix(c.Paths[0], "internal/citest/") {
+	if len(c.Paths) != 1 || (c.Status != "A" && c.Status != "M") {
 		return fmt.Errorf("full fallback for %s: %s", c.Status, strings.Join(c.Paths, " -> "))
+	}
+	name := c.Paths[0]
+	if ordinaryDocumentationPath(name) {
+		return nil // filesystem and metadata qualification still required by Select
+	}
+	if !strings.HasSuffix(name, ".go") || strings.HasPrefix(name, "scripts/") || strings.HasPrefix(name, ".github/") || strings.HasPrefix(name, "internal/citest/") {
+		return fmt.Errorf("full fallback for %s: %s", c.Status, name)
 	}
 	return nil
 }
 
 type Graph struct {
-	Module  string
-	Census  map[string][]string
-	reverse map[string]set
-	owners  map[string]set
+	Module        string
+	Census        map[string][]string
+	reverse       map[string]set
+	owners        map[string]set
+	packageDirs   set
+	documentation set
 }
 type goPackage struct {
 	ImportPath, Dir                                                                                                               string
@@ -306,7 +315,7 @@ func (p *Planner) Discover(ctx context.Context) (Graph, error) {
 	if module == "" || strings.Contains(module, "\n") {
 		return g, fmt.Errorf("ambiguous module identity")
 	}
-	g = Graph{Module: module, Census: map[string][]string{}, reverse: map[string]set{}, owners: map[string]set{}}
+	g = Graph{Module: module, Census: map[string][]string{}, reverse: map[string]set{}, owners: map[string]set{}, packageDirs: set{}}
 	root, err := filepath.Abs(p.Root)
 	if err != nil {
 		return g, err
@@ -366,6 +375,7 @@ func (p *Planner) Discover(ctx context.Context) (Graph, error) {
 				if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 					return g, fmt.Errorf("package outside checkout")
 				}
+				g.packageDirs.add(filepath.ToSlash(relative))
 				own := func(files []string, owner string) {
 					for _, file := range files {
 						addEdge(g.owners, filepath.ToSlash(filepath.Join(relative, file)), owner)
@@ -403,6 +413,12 @@ func (g Graph) Select(root string, changes []Change) ([]string, error) {
 			return nil, err
 		}
 		path := change.Paths[0]
+		if ordinaryDocumentationPath(path) {
+			if err := g.validateDocumentation(root, path); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		owners := g.owners[path]
 		if len(owners) == 0 || owners.has("<cgo>") || owners.has("<embed>") {
 			return nil, fmt.Errorf("unmapped, unsupported build-tag, embedded, or cgo input: %s", path)
@@ -463,13 +479,16 @@ func (p *Planner) Plan(ctx context.Context, event Event) (Manifest, error) {
 			var g Graph
 			g, err = p.Discover(ctx)
 			if err == nil {
+				g.documentation, err = p.documentationInputs(ctx, event.Head, changes)
+			}
+			if err == nil {
 				var selected []string
 				selected, err = g.Select(p.Root, changes)
 				if err == nil {
 					m.Toolchain, err = p.exec(ctx, p.Env, "go", "env", "GOVERSION")
 					if err == nil {
 						m.Mode = "affected"
-						m.EmptyOK = len(changes) == 0
+						m.EmptyOK = len(selected) == 0
 						m.Module = g.Module
 						m.Census = g.Census
 						m.Packages = map[string][]string{}
@@ -486,7 +505,7 @@ func (p *Planner) Plan(ctx context.Context, event Event) (Manifest, error) {
 						m.Matrix = policy.SelectedMatrix(m.Module, m.Packages)
 						m.Reason = "changed packages and transitive reverse test/import dependents"
 						if m.EmptyOK {
-							m.Reason = "no changed files; explicit empty package selection"
+							m.Reason = "only verified ordinary documentation or no changed files; explicit empty package selection"
 						}
 					}
 				}
@@ -524,7 +543,7 @@ func (p *Planner) Validate(ctx context.Context, m Manifest, target string, packa
 		return nil, fmt.Errorf("stale test selection revision")
 	}
 	if m.Mode == "full" {
-		if len(m.Packages) != 0 || len(m.Census) != 0 || m.Module != "" || m.Toolchain != "" || !slices.Equal(m.Matrix.Include, policy.FullMatrix().Include) {
+		if m.EmptyOK || len(m.Packages) != 0 || len(m.Census) != 0 || m.Module != "" || m.Toolchain != "" || !slices.Equal(m.Matrix.Include, policy.FullMatrix().Include) {
 			return nil, fmt.Errorf("incomplete full-suite manifest")
 		}
 		return nil, nil
@@ -562,6 +581,7 @@ func (p *Planner) Validate(ctx context.Context, m Manifest, target string, packa
 	if len(m.Census) != len(policy.Targets) || len(m.Packages) != len(policy.Targets) {
 		return nil, fmt.Errorf("incomplete target census")
 	}
+	hasSelected := false
 	for _, t := range policy.Targets {
 		names, ok := m.Census[t.Runner]
 		sel, selOK := m.Packages[t.Runner]
@@ -569,11 +589,15 @@ func (p *Planner) Validate(ctx context.Context, m Manifest, target string, packa
 			return nil, fmt.Errorf("invalid selected package census")
 		}
 		all := newSet(names)
+		hasSelected = hasSelected || len(sel) > 0
 		for _, name := range sel {
 			if !all.has(name) {
 				return nil, fmt.Errorf("selected package outside census")
 			}
 		}
+	}
+	if m.EmptyOK == hasSelected {
+		return nil, fmt.Errorf("explicit empty selection disagrees with selected packages")
 	}
 	actualPackages := append([]string{}, packages...)
 	slices.Sort(actualPackages)

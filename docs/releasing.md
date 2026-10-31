@@ -1,5 +1,27 @@
 # Release-candidate checks
 
+## Offline-untrack escape hatch
+
+After the shutdown dependency #1022 lands, run the native offline-untrack gate
+on both the reference Mac and reference Linux host. Use the release's pinned
+toolchain/build flags to produce the binary first, then run:
+
+```sh
+GORTEX_E2E=1 GORTEX_E2E_BINARY=/absolute/path/to/pinned/gortex \
+  go test -v -run '^TestOfflineUntrackEscapeHatch$' -count=20 -timeout=45m ./cmd/gortex/
+```
+
+Save the verbose test output for each platform, including every cold-stop and
+offline-untrack duration and normal child-exit result. Require
+20 consecutive passes per platform, every active-cold stop ≤5 seconds, zero
+SIGKILLs, offline absolute-path untrack ≤1 second, a released store lock, and
+the remaining repository ready with zero removed-prefix rows after restart.
+A skipped, timed-out, setup-failed or unexecuted gate is not a pass. These
+native 20-run gates remain required before claiming #1029 acceptance.
+Use the same recovery steps in the [v0.64.12 upgrade note](upgrade-v0.64.12.md).
+
+## Native worktree edits
+
 For every RC tag, run both native acceptance flows before claiming native
 Windows worktree edits are supported. These are manual, explicit private-daemon
 tests; a green ordinary Windows build or untagged CI run is not this gate.

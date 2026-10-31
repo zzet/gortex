@@ -41,6 +41,9 @@ type EmbedderRequest struct {
 func ResolveEmbedder(req EmbedderRequest, cfg *config.Config) (embedding.Provider, string, embedding.SelectionReport, error) {
 	if url := firstNonEmpty(req.FlagURL, os.Getenv("GORTEX_EMBEDDINGS_URL")); url != "" {
 		model := firstNonEmpty(req.FlagModel, os.Getenv("GORTEX_EMBEDDINGS_MODEL"))
+		if err := embedding.ValidateEmbeddingAPIURL(url); err != nil {
+			return nil, fmt.Sprintf("api (%s)", url), embedding.SelectionReport{}, err
+		}
 		return embedding.NewAPIProvider(url, model), fmt.Sprintf("api (%s)", url), embedding.SelectionReport{}, nil
 	}
 

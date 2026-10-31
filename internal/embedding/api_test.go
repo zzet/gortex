@@ -24,6 +24,42 @@ func TestAPIProvider_Concurrent(t *testing.T) {
 	assert.True(t, p.Concurrent(), "the API provider must opt into concurrent embedding")
 }
 
+// TestValidateEmbeddingAPIURL checks the endpoint gate: http/https with a
+// routable host pass (loopback for Ollama, private for VPC), while a
+// non-http(s) scheme, a missing host, and link-local/unspecified hosts
+// (the cloud metadata range included) are rejected.
+func TestValidateEmbeddingAPIURL(t *testing.T) {
+	cases := map[string]bool{
+		// ok
+		"http://localhost:11434/v1":   true,
+		"https://127.0.0.1:11434/v1":  true,
+		"https://api.openai.com/v1":   true,
+		"http://10.0.0.5:11434/v1":    true,
+		"http://192.168.1.10:8080/v1": true,
+		"https://example.com":         true,
+		"http://[2001:db8::1]/v1":     true, // global-routable IPv6
+		// bad
+		"file:///etc/gateway.json":  false,
+		"gopher://example.com":      false,
+		"unix:///tmp/embed.sock":    false,
+		"169.254.169.254/v1":        false, // no scheme -> missing host
+		"http://169.254.169.254/v1": false,
+		"http://0.0.0.0:11434/v1":   false,
+		"http://[fe80::1]/v1":       false, // link-local IPv6
+		"https://":                  false, // missing host
+		"":                          false,
+	}
+	for raw, wantOK := range cases {
+		err := ValidateEmbeddingAPIURL(raw)
+		if wantOK && err != nil {
+			t.Errorf("ValidateEmbeddingAPIURL(%q) = %v, want OK", raw, err)
+		}
+		if !wantOK && err == nil {
+			t.Errorf("ValidateEmbeddingAPIURL(%q) = nil error, want rejection", raw)
+		}
+	}
+}
+
 func TestAPIProvider_OllamaBoundsBatchSize(t *testing.T) {
 	texts := make([]string, 500)
 	ordinals := make(map[string]int, len(texts))
