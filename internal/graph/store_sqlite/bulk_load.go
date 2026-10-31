@@ -1375,21 +1375,21 @@ func (s *Store) closeBulkConnectionLocked() error {
 // bulkIndexesDeferred false), so this never runs for one.
 func (s *Store) noteDenseIndexesMissingLocked(ctx context.Context, conn *sql.Conn) {
 	present, err := schemaIndexNames(ctx, conn)
-	var missing []string
+	var missing []bulkDroppableIndex
 	for _, idx := range bulkDroppableIndexes {
 		if err != nil || !present[idx.name] {
-			missing = append(missing, idx.name)
+			missing = append(missing, idx)
 		}
 	}
 	s.setDenseIndexesMissingLocked(missing)
 	if len(missing) > 0 {
-		log.Printf("store_sqlite: dense indexes missing after bulk window close indexes=%s", strings.Join(missing, ","))
+		log.Printf("store_sqlite: dense indexes missing after bulk window close indexes=%s", strings.Join(s.denseIndexesMissingNames(), ","))
 	}
 }
 
 // setDenseIndexesMissingLocked replaces the missing-index record. The caller
 // holds writeMu; the slice is never modified after it is published.
-func (s *Store) setDenseIndexesMissingLocked(missing []string) {
+func (s *Store) setDenseIndexesMissingLocked(missing []bulkDroppableIndex) {
 	if len(missing) == 0 {
 		s.denseIndexesMissing.Store(nil)
 		return
@@ -1397,13 +1397,27 @@ func (s *Store) setDenseIndexesMissingLocked(missing []string) {
 	s.denseIndexesMissing.Store(&missing)
 }
 
-// denseIndexesMissingNames returns a copy of the missing-index record, or nil.
+// denseIndexesMissingRecord returns a copy of the missing-index record, or nil.
+func (s *storeCore) denseIndexesMissingRecord() []bulkDroppableIndex {
+	missing := s.denseIndexesMissing.Load()
+	if missing == nil {
+		return nil
+	}
+	return append([]bulkDroppableIndex(nil), (*missing)...)
+}
+
+// denseIndexesMissingNames returns the names in the missing-index record, or
+// nil.
 func (s *storeCore) denseIndexesMissingNames() []string {
 	missing := s.denseIndexesMissing.Load()
 	if missing == nil {
 		return nil
 	}
-	return append([]string(nil), (*missing)...)
+	names := make([]string, 0, len(*missing))
+	for _, idx := range *missing {
+		names = append(names, idx.name)
+	}
+	return names
 }
 
 func schemaIndexNames(ctx context.Context, conn *sql.Conn) (map[string]bool, error) {

@@ -33,8 +33,10 @@ import (
 //     log line, not a retry loop.
 //   - it holds the write gate one index at a time. The DDL is exactly what
 //     createGraphCoreIndexes runs (bulkDroppableIndexes is the single source
-//     for both), but each CREATE INDEX takes and releases writeMu on its own,
-//     so a writer waits behind at most one index build rather than the set.
+//     for both, copied into the record by the window that closed without it,
+//     so the lane never reads that list), but each CREATE INDEX takes and
+//     releases writeMu on its own, so a writer waits behind at most one index
+//     build rather than the set.
 //
 // It is deliberately not part of the lane's settle point (waitMaintenanceIdle):
 // a long rebuild must not hold AwaitMaintenanceIdle callers, which sit on
@@ -191,15 +193,15 @@ func (s *Store) denseIndexRepairSpace() (avail, need int64, ok bool) {
 // hold per index. It refuses, like VACUUM, while a bulk window pins the writer:
 // that window drops and seals the same indexes itself.
 func (s *Store) repairDenseIndexes(ctx context.Context) error {
-	for _, name := range s.denseIndexesMissingNames() {
-		if err := s.repairDenseIndex(ctx, name); err != nil {
+	for _, idx := range s.denseIndexesMissingRecord() {
+		if err := s.repairDenseIndex(ctx, idx); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Store) repairDenseIndex(ctx context.Context, name string) error {
+func (s *Store) repairDenseIndex(ctx context.Context, idx bulkDroppableIndex) error {
 	if err := s.writeMu.LockContext(ctx); err != nil {
 		return fmt.Errorf("%w: %s: write gate: %w", ErrMaintenanceBusy, maintenanceDenseIndexRepair, err)
 	}
@@ -207,20 +209,14 @@ func (s *Store) repairDenseIndex(ctx context.Context, name string) error {
 	if s.bulkConn != nil {
 		return fmt.Errorf("%w: %s: bulk writer pinned", ErrMaintenanceBusy, maintenanceDenseIndexRepair)
 	}
-	for _, idx := range bulkDroppableIndexes {
-		if idx.name != name {
-			continue
-		}
-		if _, err := s.writerDB.ExecContext(ctx, idx.ddl); err != nil {
-			return fmt.Errorf("store_sqlite: repair index %s: %w", name, err)
-		}
-		break
+	if _, err := s.writerDB.ExecContext(ctx, idx.ddl); err != nil {
+		return fmt.Errorf("store_sqlite: repair index %s: %w", idx.name, err)
 	}
 	// Under the hold that built it, so whichever window recorded the name, the
 	// index it names is present now.
-	var remaining []string
-	for _, missing := range s.denseIndexesMissingNames() {
-		if missing != name {
+	var remaining []bulkDroppableIndex
+	for _, missing := range s.denseIndexesMissingRecord() {
+		if missing.name != idx.name {
 			remaining = append(remaining, missing)
 		}
 	}

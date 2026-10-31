@@ -148,6 +148,56 @@ func TestFailedSealReportsDenseIndexesMissing(t *testing.T) {
 	}
 }
 
+// TestDenseIndexRepairBuildsFromTheRecordedDDL: the repair runs the DDL the
+// closing window recorded with each missing name, never a lookup in
+// bulkDroppableIndexes made when the lane gets to it. In-package cases replace
+// that list to force a seal failure and put it back while the lane may still be
+// on its way to the repair; a lookup there reads the list unsynchronised with
+// that restore, and finds no DDL for a name the record still holds.
+func TestDenseIndexRepairBuildsFromTheRecordedDDL(t *testing.T) {
+	shortenDenseIndexRepairBackoff(t)
+	s, _ := openTempStore(t)
+	var full atomic.Bool
+	full.Store(true)
+	diskAvail := func(string) (uint64, error) {
+		if full.Load() {
+			return 0, nil
+		}
+		return 1 << 40, nil
+	}
+	s.denseRepairDiskAvail.Store(&diskAvail)
+
+	originalIndexes := bulkDroppableIndexes
+	bulkDroppableIndexes = append(append([]bulkDroppableIndex(nil), originalIndexes...), bulkDroppableIndex{
+		name: "forced_bad_index",
+		ddl:  `CREATE INDEX forced_bad_index ON definitely_missing_table(id)`,
+	})
+	s.BeginBulkLoad()
+	if s.bulkConn == nil {
+		bulkDroppableIndexes = originalIndexes
+		t.Fatal("bulk fast path did not engage")
+	}
+	s.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"})
+	err := s.FlushBulk()
+	bulkDroppableIndexes = originalIndexes
+	if err == nil || !strings.Contains(err.Error(), "forced_bad_index") {
+		t.Fatalf("FlushBulk error = %v, want the forced index's DDL failure", err)
+	}
+
+	// The list no longer names the index; the record does, with the DDL that
+	// cannot succeed. Every attempt must run it and fail, not report a repair.
+	full.Store(false)
+	waitUntil(t, "a finished repair attempt", func() bool {
+		return s.denseIndexRepairs.Load() > 0 || s.denseIndexRepairAttempts.Load() >= 2
+	})
+	if got := s.denseIndexRepairs.Load(); got != 0 {
+		t.Fatalf("repairs = %d for an index whose DDL cannot run, want 0", got)
+	}
+	if got := s.denseIndexesMissingNames(); !reflect.DeepEqual(got, []string{"forced_bad_index"}) {
+		t.Fatalf("missing record = %v, want [forced_bad_index]", got)
+	}
+}
+
 func waitUntil(t *testing.T, what string, done func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
