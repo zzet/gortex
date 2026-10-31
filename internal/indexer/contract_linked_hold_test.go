@@ -13,6 +13,8 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/viewmetrics"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // linkedHoldProbe is a scheduler probe on a fake clock with a fake demand
@@ -722,4 +724,37 @@ func TestContractLinkedStrictRequestsBypassDeferral(t *testing.T) {
 		require.Equal(t, [3]bool{true, true, true}, <-ended, "a strict request ends the park, restores the shared yield and keeps the fill going")
 		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
 	})
+}
+
+// TestContractLinkedStartLineDatesItsGate: a linked job's start line says
+// how long after its policy last let it start the line was written, so a
+// log audit checks foreground work at that gate rather than at the line;
+// the completion line does not repeat it.
+func TestContractLinkedStartLineDatesItsGate(t *testing.T) {
+	h := newLinkedHoldProbe(t, ContractLinkedIdle, nil)
+	h.advance(5 * time.Second)
+	lines := make(chan [2]map[string]any, 1)
+	h.c.run = func(job *contractAnalysisJob) string {
+		lines <- [2]map[string]any{linkedLogFields(job.linkedStartFields()), linkedLogFields(job.linkedEndFields(viewmetrics.ContractJobPublished))}
+		return h.run(job)
+	}
+	linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
+	require.Equal(t, ContractActorPublished, h.wait(linked).Result)
+	got := <-lines
+	start, end := got[0], got[1]
+	require.Equal(t, string(ContractLinkedIdle), start["policy"])
+	gate, ok := start["since_gate_ms"].(float64)
+	require.True(t, ok, "the start line dates its gate: %v", start)
+	require.GreaterOrEqual(t, gate, 0.0)
+	require.Less(t, gate, float64(10*time.Second/time.Millisecond), "measured from this job's gate")
+	require.NotContains(t, end, "since_gate_ms")
+	require.Contains(t, end, "demand_stop")
+}
+
+func linkedLogFields(fields []zap.Field) map[string]any {
+	encoder := zapcore.NewMapObjectEncoder()
+	for _, field := range fields {
+		field.AddTo(encoder)
+	}
+	return encoder.Fields
 }

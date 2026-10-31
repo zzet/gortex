@@ -322,12 +322,15 @@ func (c *ContractAnalysisCoordinator) markStrictLocked(ctx context.Context, a *c
 	}
 }
 
-// linkedStartFields are a linked job's start log fields.
+// linkedStartFields are a linked job's start log fields. since_gate_ms is
+// the time since its linked policy let it start: the payload reservations
+// written in between delay the line, and a log audit checks foreground work
+// at the gate, not at the line.
 func (job *contractAnalysisJob) linkedStartFields() []zap.Field {
 	if job.linkedPolicy == "" {
 		return nil
 	}
-	return []zap.Field{zap.String("policy", string(job.linkedPolicy)), zap.Bool("strict", job.strict)}
+	return append(job.linkedFields(), zap.Float64("since_gate_ms", contractMillis(time.Since(job.gatedAt))))
 }
 
 // linkedEndFields are a linked job's completion log fields: demand_stop is
@@ -336,7 +339,13 @@ func (job *contractAnalysisJob) linkedEndFields(outcome string) []zap.Field {
 	if job.linkedPolicy == "" {
 		return nil
 	}
-	return append(job.linkedStartFields(), zap.Bool("demand_stop", job.stoppedForDemand(outcome)))
+	return append(job.linkedFields(), zap.Bool("demand_stop", job.stoppedForDemand(outcome)))
+}
+
+// linkedFields name a linked job's policy and whether a strict request
+// started it.
+func (job *contractAnalysisJob) linkedFields() []zap.Field {
+	return []zap.Field{zap.String("policy", string(job.linkedPolicy)), zap.Bool("strict", job.strict)}
 }
 
 // stoppedForDemand reports whether a job that ended with outcome stopped at
@@ -346,11 +355,12 @@ func (job *contractAnalysisJob) stoppedForDemand(outcome string) bool {
 }
 
 // countLinkedStartLocked counts a linked actor's job body about to start,
-// apart when a strict request started it.
+// apart when a strict request started it, and dates the gate it passed.
 func (c *ContractAnalysisCoordinator) countLinkedStartLocked(a *contractActor, job *contractAnalysisJob) {
 	if a.primary() {
 		return
 	}
+	job.gatedAt = time.Now()
 	event := viewmetrics.ContractLinkedStarted
 	if job.strict = c.now().Before(a.strictUntil); job.strict {
 		event = viewmetrics.ContractLinkedStrictStarted

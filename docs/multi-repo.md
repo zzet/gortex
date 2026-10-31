@@ -406,8 +406,9 @@ logs the policy in effect at startup (`contract analysis linked policy`).
 back, once per hold), `checkpoint_stopped` (a running fill stopped for returning
 work), `started`, and `strict_started` (a job a waiting request started). The
 `contract analysis job started` and `contract analysis job` log lines carry the
-job id, `checkout` and `trigger`; linked jobs add `policy` and `strict`, and the
-completion line adds `demand_stop`.
+job id, `checkout` and `trigger`; linked jobs add `policy` and `strict`. The
+start line also carries `since_gate_ms`, how long before it the policy let the
+job start, and the completion line `demand_stop`.
 
 ## CLI
 
