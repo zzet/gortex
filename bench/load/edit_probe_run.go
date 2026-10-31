@@ -158,6 +158,9 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if plan.Mode == "toon" {
 		out.Limitations = append(out.Limitations, "TOON is evaluated from the requested text, never a structured JSON sibling; setup, timing-status and restore controls remain explicit JSON with exact numeric handling", "TOON traversal subgraphs omit JSON total_nodes/full untrimmed total_edges and signature metadata; summaries keep full fields, omitted traversal fields are not synthesized", "complete TOON subgraph checks require explicit nontruncation, exact declared node total and the emitted row census; an omitted full edge-count field is not reported as a measured value")
 	}
+	if plan.Mode == "cli" {
+		out.Limitations = append(out.Limitations, "CLI oracles run one owned `gortex call --format json` process per request; the edit, readbacks and receipt status stay MCP JSON", "CLI probe cadence is bounded by process start, daemon dial and exit rather than 25 ms, and a probe's start is its process start", "CLI stdout keeps only the first text payload, re-encoded through float64: numbers that cannot be exact and prose wrappers are decode failures, and a tool refusal is a nonzero exit counted as a probe error")
+	}
 	if plan.Mode == "compact" {
 		out.Limitations = append(out.Limitations, "compact text is requested only from read.summary, search.symbols, relations.callers and trace.call_chain; source, editing_context and text probes, readbacks, the edit ACK and timing controls stay JSON", "compact rows carry no node IDs, edge rows, signatures or freshness fields: they prove the marker's presence only, relation rows prove membership of the traversal answer with a nonzero edge footer but not the edge or its tier, and stale-claimed-fresh is unavailable rather than 0", "an empty compact answer is zero rows; a JSON answer to a compact request, such as not-found guidance, counts as a decode failure")
 	}
@@ -467,7 +470,7 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 	if !identity.WriteStarted.IsZero() {
 		sent = identity.WriteStarted
 	}
-	body, decodeErr := decodeEditProbeOutput(data, editProbeRequestOutput(oracle.call), oracle.call.name())
+	body, decodeErr := decodeEditProbeOutput(data, r.probeOutput(oracle), oracle.call.name())
 	absence, exactRefusal := err.(*editProbeExpectedAbsence)
 	expectedAbsence := oracle.call.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == r.p.Repos[0].Prefix+"/"+oracle.call.ExpectedAbsentSymbol
 	correct := expectedAbsence || err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, r.p.Repos[0].Corpus, s.step, r.plan.Callee)
@@ -495,7 +498,7 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 		}
 	}
 	s.mu.Unlock()
-	r.countMode(editProbeRequestOutput(oracle.call), err == nil || expectedAbsence, err != nil || decodeErr == nil, fresh, stale, precommit)
+	r.countMode(r.probeOutput(oracle), err == nil || expectedAbsence, err != nil || decodeErr == nil, fresh, stale, precommit)
 	return s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending})
 }
 
@@ -511,7 +514,14 @@ func (r *editProbeRuntime) activate(ctx context.Context, step editProbeStep) {
 			for probeCtx.Err() == nil {
 				sent := time.Now()
 				pending := s.noteProbeStart()
-				data, identity, err := r.perform(probeCtx, s, s.client, oracle.call, "oracle:"+oracle.name, "probe", 10+index)
+				var data json.RawMessage
+				var identity wireCallIdentity
+				var err error
+				if r.plan.Mode == "cli" {
+					data, identity, err = r.performCLI(probeCtx, s, oracle.call, "oracle:"+oracle.name, 10+index)
+				} else {
+					data, identity, err = r.perform(probeCtx, s, s.client, oracle.call, "oracle:"+oracle.name, "probe", 10+index)
+				}
 				if err := r.observeProbe(s, oracle, sent, data, identity, err, pending); err != nil {
 					cancel()
 					return

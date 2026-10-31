@@ -10,10 +10,12 @@ func editProbeOutputMode(c Corpus) (string, error) {
 		return "toon", nil
 	case "compact":
 		return "compact", nil
+	case "cli":
+		return "cli", nil
 	case "gcx":
 		return "", fmt.Errorf("edit output mode gcx: %w", errEditOutputGCXUnavailable)
 	default:
-		return "", fmt.Errorf("unsupported edit output mode %q (want json, toon or compact)", c.EditOutput)
+		return "", fmt.Errorf("unsupported edit output mode %q (want json, toon, compact or cli)", c.EditOutput)
 	}
 }
 
@@ -46,12 +48,10 @@ func editProbeOutputCoverage(selected string, counts map[string]editProbeModeCou
 	for _, mode := range editProbeOutputModes {
 		count := counts[mode]
 		coverage := editProbeModeCoverage{State: "not_selected", ProbeAnswers: count.answers, DecodeFailures: count.decodeFailures, ClaimsFreshObservable: true, ClaimsFresh: count.claimsFresh, PrecommitMismatches: count.precommit}
-		switch {
-		case mode == "gcx":
+		switch mode {
+		case "gcx":
 			coverage.State, coverage.Reason, coverage.ClaimsFreshObservable = "unavailable", errEditOutputGCXUnavailable.Error(), false
-		case mode == "cli":
-			coverage.State, coverage.Reason, coverage.ClaimsFreshObservable = "unavailable", "not implemented by this harness", false
-		case mode == "compact":
+		case "compact":
 			coverage.Reason, coverage.ClaimsFreshObservable = "compact text has no freshness field; it proves call-addition presence only", false
 		}
 		if mode == selected {
@@ -68,6 +68,15 @@ func editProbeOutputCoverage(selected string, counts map[string]editProbeModeCou
 		out[mode] = coverage
 	}
 	return out
+}
+
+// A CLI probe sends the same JSON facade request through its own process, so
+// its answers are decoded and counted as CLI stdout, never as MCP JSON.
+func (r *editProbeRuntime) probeOutput(oracle editProbeOracle) string {
+	if r.plan.Mode == "cli" {
+		return "cli"
+	}
+	return editProbeRequestOutput(oracle.call)
 }
 
 func (r *editProbeRuntime) countMode(mode string, answered, decoded, fresh, stale, precommit bool) {

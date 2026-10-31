@@ -224,7 +224,7 @@ func TestPairedEditPolicyKeepsBaselinePhasesExplicitAndPlanExact(t *testing.T) {
 }
 
 func TestPairedEditPreparationRejectsForeignPlanSharedStoreAndWrongAccountingRole(t *testing.T) {
-	for _, name := range []string{"valid", "foreign_plan", "shared_store", "wrong_role"} {
+	for _, name := range []string{"valid", "foreign_plan", "shared_store", "wrong_role", "cli_probes"} {
 		t.Run(name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
@@ -240,6 +240,8 @@ func TestPairedEditPreparationRejectsForeignPlanSharedStoreAndWrongAccountingRol
 				candidate.p.Store = c.states[0].p.Store
 			case "wrong_role":
 				candidate.requireAccounting = false
+			case "cli_probes":
+				c.states[0].phase.editProbeRuntime.plan.Mode, candidate.plan.Mode = "cli", "cli"
 			}
 			if err := c.preparePairedEditProbe(); (err != nil) != (name != "valid") {
 				t.Fatalf("prepared %s: %v", name, err)

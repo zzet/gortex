@@ -36,6 +36,8 @@ func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[s
 	case "toon":
 	case "compact":
 		return decodeEditProbeCompactOutput(raw, operation)
+	case "cli":
+		return decodeEditProbeCLIOutput(raw)
 	case "gcx":
 		return nil, errEditOutputGCXUnavailable
 	default:
@@ -188,6 +190,50 @@ func decodeEditProbeCompactOutput(raw json.RawMessage, operation string) (map[st
 		}
 	}
 	return map[string]any{editProbeCompactKey: answer}, nil
+}
+
+// `gortex call --format json` prints the tool's first text payload as JSON,
+// re-encoded through float64, and wraps a prose answer as
+// {"tool","format":"text","text"}. Only a JSON object with exactly
+// representable numbers is an answer; the wrapper is never JSON credit.
+func decodeEditProbeCLIOutput(stdout []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(stdout))
+	decoder.UseNumber()
+	var body map[string]any
+	if err := decoder.Decode(&body); err != nil {
+		return nil, fmt.Errorf("CLI stdout is not one JSON object: %w", err)
+	}
+	if decoder.More() {
+		return nil, errors.New("CLI stdout has more than one JSON value")
+	}
+	if _, wrapped := body["text"].(string); wrapped && len(body) == 3 && body["format"] == "text" && body["tool"] != nil {
+		return nil, errors.New("CLI wrapped a prose answer; no JSON credit")
+	}
+	if !editProbeCLINumbersExact(body) {
+		return nil, errors.New("CLI numeric value cannot be proved exact after float64 re-encoding")
+	}
+	return body, nil
+}
+
+func editProbeCLINumbersExact(value any) bool {
+	switch value := value.(type) {
+	case json.Number:
+		number, err := value.Float64()
+		return err == nil && editProbeTOONNumbersSafe(number)
+	case map[string]any:
+		for _, nested := range value {
+			if !editProbeCLINumbersExact(nested) {
+				return false
+			}
+		}
+	case []any:
+		for _, nested := range value {
+			if !editProbeCLINumbersExact(nested) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // These are the optional text-only notes appended by mcp/momentum.go. Selecting

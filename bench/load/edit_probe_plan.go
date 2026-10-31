@@ -146,6 +146,9 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 	if mode == "compact" && kind != "add_intrafile_call" && kind != "add_crossfile_call" {
 		return editProbePlan{}, fmt.Errorf("compact output cannot check %s: compact text omits node IDs, edge rows, signatures and freshness, so it proves only a call addition's presence", kind)
 	}
+	if mode == "cli" && (kind == "rename" || kind == "delete" || kind == "relocate") {
+		return editProbePlan{}, fmt.Errorf("CLI probes cannot check %s: an expected absence must be the exact scoped not-found refusal, and the CLI reports a tool refusal only as an exit status and stderr text", kind)
+	}
 
 	if kind != "relocate" && (c.EditDestination != "" || c.EditDestinationContent != "") {
 		return editProbePlan{}, errors.New("edit_destination applies only to the explicit move fixture")

@@ -81,6 +81,9 @@ func (c *pairedCoordinator) preparePairedEditProbe() error {
 	if base == nil {
 		return errors.New("paired baseline edit runtime unavailable")
 	}
+	if base.plan.Mode == "cli" {
+		return errors.New("paired edit-and-probe pairs MCP probe calls; CLI probes run unpaired")
+	}
 	for i, state := range c.states {
 		r := state.phase.editProbeRuntime
 		if r == nil || !reflect.DeepEqual(r.plan, base.plan) || r.options.Deadline != c.options.Deadline || r.requireAccounting != (i != 0) {
