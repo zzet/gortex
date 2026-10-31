@@ -1,0 +1,131 @@
+package indexer
+
+import (
+	"time"
+
+	"github.com/zzet/gortex/internal/viewmetrics"
+)
+
+// Linked-checkout scheduling. A linked worktree's actor runs the same jobs as
+// a primary actor, but its fills compete for CPU with the reads agents make
+// in that worktree. Its linked policy decides when its job may start:
+//
+//   - idle: only once Demand has reported nothing for the idle window. The
+//     dispatcher keeps a held actor in its queue, skipping it, so a primary
+//     actor behind it still starts; a held actor keeps no handoff source and
+//     reacquires its inputs when it starts. Demand that returns between the
+//     pick and the job body sends the actor back to wait, uncounted as a
+//     start.
+//   - throttled: one linked job in flight, and one linked actor's starts at
+//     least the throttle interval apart. The idle window does not apply.
+//   - eager: as a primary actor.
+//
+// Requests and Published events still record interest and wanted inputs
+// while an actor is held; only the start waits.
+
+// contractDemandPoll is how often a dispatcher with a held actor samples
+// Demand again while the idle window is closed.
+const contractDemandPoll = 250 * time.Millisecond
+
+// linkedIdleApplies reports whether the idle policy governs a's jobs: a
+// linked actor whose inputs the scheduler can reacquire, with a demand
+// signal to wait on.
+func (c *ContractAnalysisCoordinator) linkedIdleApplies(a *contractActor) bool {
+	return !a.primary() && c.options.LinkedInputs != nil && c.options.Demand != nil && c.options.LinkedPolicy == ContractLinkedIdle
+}
+
+// idleDemand samples Demand for a dispatcher step when the idle policy can
+// hold anything. It runs outside c.mu: the signal reads edit and tool state
+// whose owners call into the scheduler under their own locks.
+func (c *ContractAnalysisCoordinator) idleDemand() bool {
+	return c.options.LinkedInputs != nil && c.options.Demand != nil && c.options.LinkedPolicy == ContractLinkedIdle && c.options.Demand()
+}
+
+// linkedDemand samples Demand for a picked actor the idle policy governs,
+// outside c.mu.
+func (c *ContractAnalysisCoordinator) linkedDemand(a *contractActor) bool {
+	return c.linkedIdleApplies(a) && c.options.Demand()
+}
+
+// linkedHoldLocked reports whether a's linked policy holds it at now, and
+// when to look again; zero waits for a signal.
+func (c *ContractAnalysisCoordinator) linkedHoldLocked(a *contractActor, now time.Time) (bool, time.Duration) {
+	if a.primary() || c.options.LinkedInputs == nil {
+		return false, 0
+	}
+	switch c.options.LinkedPolicy {
+	case ContractLinkedIdle:
+		if c.options.Demand == nil {
+			return false, 0
+		}
+		if remaining := c.options.LinkedIdleWindow - now.Sub(c.lastDemand); remaining > 0 {
+			return true, min(remaining, contractDemandPoll)
+		}
+	}
+	return false, 0
+}
+
+// linkedHeldLocked reports whether a's linked policy holds it at now.
+func (c *ContractAnalysisCoordinator) linkedHeldLocked(a *contractActor, now time.Time) bool {
+	held, _ := c.linkedHoldLocked(a, now)
+	return held
+}
+
+// holdLocked keeps a queued actor waiting for its linked policy. The first
+// skip of a hold is counted; a held actor never pins its handoff source, so
+// the source is returned for release outside c.mu.
+func (c *ContractAnalysisCoordinator) holdLocked(a *contractActor) *ContractCaptureSource {
+	if !a.held {
+		a.held = true
+		countContractLinkedJob(c.options.LinkedPolicy, viewmetrics.ContractLinkedDeferred)
+	}
+	source := a.want.source
+	a.want.source = nil
+	return source
+}
+
+// linkedHeldAgainLocked re-checks a picked actor's idle hold with a demand
+// sample taken outside c.mu: true when demand returned since the pick.
+func (c *ContractAnalysisCoordinator) linkedHeldAgainLocked(a *contractActor, busy bool) bool {
+	if !c.linkedIdleApplies(a) {
+		return false
+	}
+	now := c.now()
+	if busy {
+		c.lastDemand = now
+	}
+	return c.linkedHeldLocked(a, now)
+}
+
+// endLinkedDeferred puts a picked linked actor back in its queue, held until
+// its next idle window. No job started: its trigger is kept and the hold is
+// counted as a deferral of its own.
+func (c *ContractAnalysisCoordinator) endLinkedDeferred(a *contractActor, want contractActorWant, trigger string, triggeredAt time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if a.running.seq == want.seq {
+		a.running.contractActorKeySeq = contractActorKeySeq{}
+		a.running.cancel = nil
+	}
+	if c.supersededLocked(a, want) {
+		return
+	}
+	c.enqueueLocked(a, trigger, triggeredAt)
+	a.held = true
+	countContractLinkedJob(c.options.LinkedPolicy, viewmetrics.ContractLinkedDeferred)
+}
+
+// countLinkedStartLocked counts a linked actor's job body about to start.
+func (c *ContractAnalysisCoordinator) countLinkedStartLocked(a *contractActor) {
+	if a.primary() {
+		return
+	}
+	countContractLinkedJob(c.options.LinkedPolicy, viewmetrics.ContractLinkedStarted)
+}
+
+// releaseContractSources releases handoff sources taken under c.mu.
+func releaseContractSources(sources []*ContractCaptureSource) {
+	for _, source := range sources {
+		source.Release()
+	}
+}

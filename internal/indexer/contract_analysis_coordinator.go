@@ -62,6 +62,20 @@ type ContractAnalysisCoordinatorOptions struct {
 	JobSlots int
 	// Now replaces time.Now for interest and backoff.
 	Now func() time.Time
+	// LinkedPolicy decides when a linked-checkout actor's job may start:
+	// idle (the zero value), throttled or eager. It applies only where the
+	// scheduler can reacquire a linked actor's inputs (LinkedInputs); idle
+	// also needs Demand, without which the daemon always counts as idle.
+	LinkedPolicy ContractLinkedPolicy
+	// LinkedIdleWindow is how long Demand must have reported nothing before
+	// the idle policy starts a linked job; zero means 5 s.
+	LinkedIdleWindow time.Duration
+	// LinkedThrottleInterval is the least time between two job starts of
+	// one linked actor under the throttled policy; zero means 30 s.
+	LinkedThrottleInterval time.Duration
+	// Demand reports foreground work: active tool calls or a busy edit
+	// lane. It is sampled outside the scheduler's lock and must not wait.
+	Demand func() bool
 }
 
 type contractAnalysisJob struct {
@@ -123,6 +137,9 @@ type ContractAnalysisCoordinator struct {
 	// unsettled, when set, asks the repair to scan a cohort a job could not
 	// settle its reads in.
 	unsettled func(repos []string)
+	// lastDemand is when Demand last reported foreground work, on the
+	// coordinator's clock: the idle window runs from it.
+	lastDemand time.Time
 }
 
 func NewContractAnalysisCoordinator(options ContractAnalysisCoordinatorOptions) (*ContractAnalysisCoordinator, error) {
@@ -138,10 +155,28 @@ func NewContractAnalysisCoordinator(options ContractAnalysisCoordinatorOptions) 
 	if options.Logger == nil {
 		options.Logger = zap.NewNop()
 	}
+	switch options.LinkedPolicy {
+	case "":
+		options.LinkedPolicy = ContractLinkedIdle
+	case ContractLinkedIdle, ContractLinkedThrottled, ContractLinkedEager:
+	default:
+		return nil, fmt.Errorf("contract analysis coordinator: unknown linked policy %q", options.LinkedPolicy)
+	}
+	if options.LinkedIdleWindow < 0 || options.LinkedThrottleInterval < 0 {
+		return nil, fmt.Errorf("contract analysis coordinator: invalid linked schedule")
+	}
+	if options.LinkedIdleWindow == 0 {
+		options.LinkedIdleWindow = contractLinkedIdleWindow
+	}
+	if options.LinkedThrottleInterval == 0 {
+		options.LinkedThrottleInterval = contractLinkedThrottleInterval
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &ContractAnalysisCoordinator{deltaCaches: contractDeltaLRU{budget: contractDeltaMemoryBudget(options.MemoryLimitBytes)}, options: options, ctx: ctx, cancel: cancel, changed: make(chan struct{}),
 		acceptedEpoch: make(map[string]uint64), acceptedAt: make(map[string]time.Time), actors: make(map[ContractActor]*contractActor), rings: make(map[string]*contractRing),
 		slots: &contractJobSlots{free: contractJobSlotCount(options.JobSlots)}, capacityChanged: make(chan struct{})}
+	// A daemon that just started has not been idle for a window yet.
+	c.lastDemand = c.now()
 	return c, nil
 }
 

@@ -332,6 +332,10 @@ type contractActor struct {
 	interestUntil time.Time
 	// interestExpired remembers work suspended when its interest ran out.
 	interestExpired bool
+	// held is set while a queued linked actor waits for its linked policy
+	// to let it start (contract_linked_schedule.go); leaving the queue
+	// clears it.
+	held bool
 	// A lost/rejected partial checkpoint must not restart the same prefix forever.
 	fillNeedsCheckpoint bool
 	fillCheckpoint      ContractFillCheckpointStatus
@@ -678,6 +682,9 @@ func (c *ContractAnalysisCoordinator) setStateLocked(a *contractActor, state con
 	if state != contractActorIdle {
 		a.repairWait = contractRepairWaitNone
 	}
+	if state != contractActorQueued {
+		a.held = false
+	}
 	if had && !a.hasWork() {
 		c.capacityEpoch++
 		close(c.capacityChanged)
@@ -709,14 +716,16 @@ func (c *ContractAnalysisCoordinator) expireLocked(now time.Time) {
 		if now.Before(a.interestUntil) {
 			continue
 		}
-		switch a.state {
-		case contractActorDeferred, contractActorBackoff:
+		switch {
+		case a.state == contractActorDeferred, a.state == contractActorBackoff, a.state == contractActorQueued && a.held:
+			// A held linked actor no request asked for again frees its
+			// capacity like any other waiting work.
 			a.interestExpired = true
 			a.want.source.Release()
 			a.want.source = nil
 			a.retryOnInputs, a.dirty = false, false
 			c.setStateLocked(a, contractActorIdle)
-		case contractActorIdle:
+		case a.state == contractActorIdle:
 			// A stale primary capture can wait here with an unresolved
 			// promise. Preserve its suspended intent before dropping the
 			// Published retry; a fresh RPC may renew it after the TTL.
@@ -949,12 +958,16 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 			open = c.ctx.Err() == nil
 		}
 	}()
+	busy := c.idleDemand()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return false
 	}
 	now := c.now()
+	if busy {
+		c.lastDemand = now
+	}
 	c.expireLocked(now)
 	wait := time.Duration(-1)
 	for _, a := range ring.actors {
@@ -978,16 +991,31 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 			return true
 		}
 	}
+	// Pick the first queued actor its linked policy lets start. A held one
+	// keeps its place, so a primary actor behind it is not held up.
 	var next *contractActor
-	for len(ring.queue) > 0 && next == nil {
-		if candidate := ring.queue[0]; candidate.state == contractActorQueued {
-			next = candidate
+	var unpinned []*ContractCaptureSource
+	for i := 0; i < len(ring.queue) && next == nil; {
+		candidate := ring.queue[i]
+		if candidate.state != contractActorQueued {
+			ring.queue = slices.Delete(ring.queue, i, i+1)
+			continue
 		}
-		ring.queue = ring.queue[1:]
+		if held, recheck := c.linkedHoldLocked(candidate, now); held {
+			unpinned = append(unpinned, c.holdLocked(candidate))
+			if recheck > 0 && (wait < 0 || recheck < wait) {
+				wait = recheck
+			}
+			i++
+			continue
+		}
+		next = candidate
+		ring.queue = slices.Delete(ring.queue, i, i+1)
 	}
 	if next == nil {
 		wake := ring.wake
 		c.mu.Unlock()
+		releaseContractSources(unpinned)
 		var timeout <-chan time.Time
 		if wait >= 0 {
 			timer := time.NewTimer(wait)
@@ -1008,6 +1036,7 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 	trigger, triggeredAt := next.trigger, next.triggeredAt
 	c.setStateLocked(next, contractActorCapturing)
 	c.mu.Unlock()
+	releaseContractSources(unpinned)
 	c.startActor(next, want, trigger, triggeredAt)
 	return true
 }
@@ -1335,9 +1364,17 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 	}()
 	ctx, cancel := context.WithCancel(c.ctx)
 	defer cancel()
+	busy := c.linkedDemand(a)
 	c.mu.Lock()
 	a.running.cancel = cancel
+	// Demand that returned while the job waited for the slot sends it back
+	// to wait before it captures anything.
+	again := c.linkedHeldAgainLocked(a, busy)
 	c.mu.Unlock()
+	if again {
+		c.endLinkedDeferred(a, want, trigger, triggeredAt)
+		return
+	}
 	captureStart := time.Now()
 	if !a.primary() && source == nil {
 		c.mu.Lock()
@@ -1627,8 +1664,20 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 
 	c.options.Logger.Info("contract cache borrow", zap.String("actor", a.id.String()), zap.Bool("cache_present", cached != nil), zap.Bool("complete", cacheComplete), zap.Int64("checkpoint_bytes", cacheBytes), zap.Int64("retained_bytes", retainedBytes), zap.Uint64("registry_evictions", registryEvictions), zap.Bool("interest_expired", interestExpired))
 
+	busy = c.linkedDemand(a)
 	c.mu.Lock()
+	if c.linkedHeldAgainLocked(a, busy) {
+		// Demand returned during the capture: no job body starts while a
+		// call is in flight. The borrowed cache goes back unchanged.
+		c.mu.Unlock()
+		returnCache(session.cache)
+		release()
+		source.Release()
+		c.endLinkedDeferred(a, want, trigger, triggeredAt)
+		return
+	}
 	c.setStateLocked(a, contractActorRunning)
+	c.countLinkedStartLocked(a)
 	c.mu.Unlock()
 	run := c.execute
 	if c.run != nil {
@@ -1646,8 +1695,14 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 func (c *ContractAnalysisCoordinator) otherActorWaiting(current *contractActor) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := c.now()
 	for _, actor := range c.actors {
-		if actor != current && (actor.state == contractActorQueued || actor.state == contractActorCapturing) {
+		if actor == current {
+			continue
+		}
+		// A queued actor its linked policy holds cannot take the slot, so
+		// no running fill stops at a checkpoint for it.
+		if actor.state == contractActorCapturing || actor.state == contractActorQueued && !c.linkedHeldLocked(actor, now) {
 			return true
 		}
 	}
