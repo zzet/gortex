@@ -125,6 +125,8 @@ func (s *Server) collectSurprisingEdges(
 			totalEdges += c
 		}
 	} else {
+		// Fallback for readers without per-kind counts. The anomaly walk below
+		// needs the full edge stream anyway, so this read is shared with it.
 		allEdges = reader.AllEdges()
 		for _, e := range allEdges {
 			kindCounts[e.Kind]++

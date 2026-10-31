@@ -2159,6 +2159,8 @@ func (r *baseGraphReader) derivedStats() graph.GraphStats {
 			stats.ByLanguage[node.Language]++
 		}
 	}
+	// Only reached for a backend with no per-repo rollup (Stats prefers it),
+	// where the view's edges must be counted to stay a subset of the corpus.
 	stats.TotalEdges = len(r.AllEdges())
 	return stats
 }

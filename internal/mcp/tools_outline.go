@@ -206,6 +206,8 @@ func (s *Server) buildRepoOutline(ctx context.Context, reader graph.Reader, opts
 	} else if inScope == nil {
 		totalEdges = reader.EdgeCount()
 	} else {
+		// Repository scoping for outline is tracked separately from the
+		// read-tool work; until then a bound session counts from the full scan.
 		for _, e := range reader.AllEdges() {
 			if !inScope[e.From] || !inScope[e.To] {
 				continue
@@ -401,6 +403,8 @@ func mostImportedFiles(g graph.Reader, inScope map[string]bool, topN int) []map[
 			counts[r.FilePath] = r.Count
 		}
 	} else {
+		// Fallback for readers without the import aggregate; outline scoping is
+		// tracked separately from the read-tool work.
 		for _, e := range g.AllEdges() {
 			if e.Kind != graph.EdgeImports {
 				continue

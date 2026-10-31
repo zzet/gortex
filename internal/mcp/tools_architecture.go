@@ -487,6 +487,8 @@ func architectureCrossRepo(g graph.Reader) []crossRepoRow {
 			counts[key{kind: string(r.Kind), fromRepo: r.FromRepo, toRepo: r.ToRepo}] = r.Count
 		}
 	} else {
+		// Fallback for readers without the cross-repo aggregate: counting
+		// every repository pair is a whole-corpus question, so the scan stays.
 		for _, e := range g.AllEdges() {
 			if _, isCross := graph.BaseKindForCrossRepo(e.Kind); !isCross {
 				continue

@@ -289,6 +289,8 @@ func (binding *contractAnalysisContext) composedReader(ctx context.Context, core
 				layer.AddNode(node.FilePath, node)
 			}
 		}
+		// The analysis reader is the contract attachment, not the store: its
+		// edges are exactly the overlay being composed, so all of them apply.
 		for _, edge := range analysis.AllEdges() {
 			layer.AddEdge(edge)
 		}
