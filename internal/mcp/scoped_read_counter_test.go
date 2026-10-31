@@ -176,6 +176,12 @@ func (r *scopedReadCounter) GetOutEdgesByNodeIDs(ids []string) map[string][]*gra
 	return out
 }
 
+func (r *scopedReadCounter) GetInEdgesByNodeIDsFromRepos(ids, repos []string) (map[string][]*graph.Edge, bool, error) {
+	out, handled, err := r.Store.GetInEdgesByNodeIDsFromRepos(ids, repos)
+	r.read("GetInEdgesByNodeIDsFromRepos", edgeRows(out))
+	return out, handled, err
+}
+
 func (r *scopedReadCounter) GetInEdgesByNodeIDsContext(ctx context.Context, ids []string, limit int) (map[string][]*graph.Edge, bool, error) {
 	out, truncated, err := r.Store.GetInEdgesByNodeIDsContext(ctx, ids, limit)
 	r.read("GetInEdgesByNodeIDsContext", edgeRows(out))

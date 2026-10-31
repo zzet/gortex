@@ -72,7 +72,7 @@ func (e *Engine) FindNameOnlyCandidates(node *graph.Node, bound []*graph.Edge, o
 	// disk backend the per-id form would be four query round-trips on the
 	// find_usages / get_callers hot path.
 	placeholders := graph.UnresolvedNameCandidateIDs(node)
-	byPlaceholder := e.g.GetInEdgesByNodeIDs(placeholders)
+	byPlaceholder := e.placeholderInEdges(placeholders, opts)
 	for _, placeholder := range placeholders {
 		for _, edge := range byPlaceholder[placeholder] {
 			if edge == nil || !isCallLikeUsageKind(edge.Kind) {
@@ -131,6 +131,29 @@ func (e *Engine) FindNameOnlyCandidates(node *graph.Node, bound []*graph.Edge, o
 	}
 	sort.Slice(out.Nodes, func(i, j int) bool { return out.Nodes[i].ID < out.Nodes[j].ID })
 	return out
+}
+
+// placeholderInEdges reads the call sites parked on placeholders. The bare
+// placeholders are shared by every repository that calls the name, so a
+// repo-narrowed query reads only the sites its repositories own when the
+// reader can narrow the read. The scope check on each source still applies:
+// the narrow drops only sources that check would drop.
+func (e *Engine) placeholderInEdges(placeholders []string, opts QueryOptions) map[string][]*graph.Edge {
+	if len(opts.RepoAllow) > 0 {
+		if scoped, ok := e.g.(graph.RepoScopedInEdgeReader); ok {
+			repos := []string{""}
+			for repo, allowed := range opts.RepoAllow {
+				if allowed && repo != "" {
+					repos = append(repos, repo)
+				}
+			}
+			rows, handled, err := scoped.GetInEdgesByNodeIDsFromRepos(placeholders, repos)
+			if err == nil && handled {
+				return rows
+			}
+		}
+	}
+	return e.g.GetInEdgesByNodeIDs(placeholders)
 }
 
 // AttachNameOnlyCandidates records the candidate count on sg and, when

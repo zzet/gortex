@@ -32,4 +32,5 @@ func TestGetCallersScopedNeverScansAndRowsStayFlat(t *testing.T) {
 	require.True(t, payload.LowerBound)
 	require.Equal(t, 3, payload.NameOnlyCandidates)
 	requireScopedReadsStayFlat(t, counter, func() { addUnrelatedScopedRowRepos(t, store, 5) }, callers)
+	require.Positive(t, counter.rows()["GetInEdgesByNodeIDsFromRepos"], "the placeholder read is narrowed to the scoped repository")
 }

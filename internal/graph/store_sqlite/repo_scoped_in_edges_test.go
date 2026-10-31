@@ -1,0 +1,81 @@
+package store_sqlite
+
+import (
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/graph"
+)
+
+// The narrowed read returns exactly the rows of the ordinary incoming read
+// whose source node is in one of the repositories, in the same order, with
+// or without the indexes a bulk load drops.
+func TestRepoScopedInEdgesMatchFilteredInEdges(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "in-edges.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	const bare, member = graph.UnresolvedMarker + "Target", graph.UnresolvedMarker + "*.Target"
+	var nodes []*graph.Node
+	var edges []*graph.Edge
+	for _, repo := range []string{"a", "b", "c", ""} {
+		path := strings.TrimPrefix(repo+"/svc/worker.go", "/")
+		caller := path + "::Run"
+		nodes = append(nodes, &graph.Node{ID: caller, Name: "Run", Kind: graph.KindFunction, RepoPrefix: repo, FilePath: path})
+		edges = append(edges,
+			&graph.Edge{From: caller, To: bare, Kind: graph.EdgeCalls, FilePath: path, Line: 6},
+			&graph.Edge{From: caller, To: bare, Kind: graph.EdgeReferences, FilePath: path, Line: 6},
+			&graph.Edge{From: caller, To: member, Kind: graph.EdgeCalls, FilePath: path, Line: 8, Meta: map[string]any{"via": "retained"}},
+		)
+	}
+	edges = append(edges,
+		&graph.Edge{From: "ghost/worker.go::Run", To: bare, Kind: graph.EdgeCalls, FilePath: "ghost/worker.go", Line: 3},
+		&graph.Edge{From: "b/svc/worker.go::Run", To: "a/svc/worker.go::Run", Kind: graph.EdgeCalls, FilePath: "b/svc/worker.go", Line: 9},
+	)
+	require.NoError(t, s.AddBatchChecked(nodes, edges))
+	ids := []string{bare, member, "a/svc/worker.go::Run", "absent"}
+	want := func(repos []string) map[string][]*graph.Edge {
+		out := make(map[string][]*graph.Edge)
+		for to, rows := range s.GetInEdgesByNodeIDs(ids) {
+			for _, edge := range rows {
+				if source := s.GetNode(edge.From); source != nil && slices.Contains(repos, source.RepoPrefix) {
+					out[to] = append(out[to], edge)
+				}
+			}
+		}
+		return out
+	}
+	check := func() {
+		for _, repos := range [][]string{{""}, {"", "a"}, {"", "a", "b"}, {"c"}, {"missing"}} {
+			got, handled, err := s.GetInEdgesByNodeIDsFromRepos(ids, repos)
+			require.NoError(t, err)
+			require.True(t, handled)
+			require.Equal(t, want(repos), got, "repos=%v", repos)
+		}
+	}
+	check()
+	require.Len(t, want([]string{"", "a"})[bare], 4, "the fixture parks two sites from each admitted repository on the bare placeholder")
+
+	rows, err := s.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+repoScopedInEdgesSQL(len(ids)), append(toAnyArgs(ids), s.viewGen, `["","a"]`)...)
+	require.NoError(t, err)
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+		plan = append(plan, detail)
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+	joined := strings.Join(plan, "\n")
+	require.Contains(t, joined, "SEARCH e USING INDEX edges_by_to", joined)
+	require.Contains(t, joined, "USING COVERING INDEX nodes_by_repo (repo_prefix=? AND view_gen=? AND id=?)", joined)
+	require.NotContains(t, joined, "SCAN e", joined)
+
+	_, err = s.writerDB.Exec(`DROP INDEX nodes_by_repo; DROP INDEX edges_by_to`)
+	require.NoError(t, err)
+	check()
+}
