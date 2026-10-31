@@ -643,3 +643,13 @@ through float64, so only exactly representable JSON is credited and expected
 absences are refused. GCX is reported unavailable rather than decoded as TOON.
 Each report accounts every output mode, and a mode that cannot carry a
 freshness claim reports stale claimed-fresh answers as unavailable, not 0.
+
+Native and lifecycle cells change files around MCP: a shell write after a tool
+edit, a same-size editor save, and Go file create/delete pairs. Their records
+have no acknowledgement or receipt, so ACK, phases and derived time are
+unavailable; each keeps its own write window and file identity instead. The
+restart cell kills the daemon while the edit's receipt is pending and reports
+post-restart first-correct times from send and from ready; a receipt that was
+already terminal before the kill qualifies the record rather than passing.
+TypeScript and Python relocation is measured as the product's exact refusal
+with unchanged bytes.

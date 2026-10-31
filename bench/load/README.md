@@ -148,6 +148,18 @@ verifies both original byte strings. Unsupported language, package, path and
 operation combinations refuse explicitly. These implementation controls do not
 establish live relocation timing or the broader traffic/reference gates.
 
+`edit_expect: "refusal"` turns a TypeScript or Python relocation fixture
+(`edit_kind: "relocate"`, `edit_tool: "refactor.move"`, distinct root source and
+destination files of one language) into a live refusal cell. The actual move is
+sent, and the cell passes only on the producer's exact scoped refusal
+(`unsupported language: move_symbol only supports Go files (got "<path>")`),
+followed at most by the known session notes, with the same session's immediate
+file readback unchanged, the original symbol's source present, and both files'
+bytes unchanged on disk. Its latency is the `relocation_refusal` readback; the
+record has no probes, receipt, phases or restore batch, and the post-window step
+only rechecks the bytes. Go relocation is supported and is never offered as a
+refusal.
+
 `edit_output: "toon"` opts this fixture into TOON for the offered edit ACK,
 visibility probes and immediate readbacks. Omission or `"json"` retains the
 existing JSON plan and request identity. The decoder evaluates the requested
@@ -245,6 +257,52 @@ editor's arrival. Editors share one file, so whole-file `edit.write` and
 writes are measured as failed records, not hidden. The 1-edit diagnostic and
 the paired no-regression cell stay one editor. Routing across several
 repositories or linked worktrees is not implemented.
+
+`edit_sender` selects a native or lifecycle traffic cell; without it every plan
+is unchanged, and paired runs refuse it. A native write goes around MCP, so its
+record has no ACK, receipt, phases or derived time (each unavailable with its
+reason) and accounting `not_applicable_native_write`. It keeps its own write
+window and the file's size, mtime and inode before and after. Its immediate file
+readback gates `t_readback_ms`, graph-backed readbacks are kept as
+`observation_only`, and it completes once every probe is first-correct inside
+the deadline. The daemon learns of a native write only through its watcher, so
+a fresh claim after one is counted unassessed rather than stale. Native writes
+touch only the registered fixture file, or the step's own created file.
+
+- `shell_after_tool` (100 edits, one editor, `edit.file` call addition): even
+  ordinals are MCP edits; odd ordinals insert their own marker with an in-place
+  truncate-and-write at their due time or the preceding tool edit's own ACK,
+  whichever is later. A tool edit without its own ACK makes the shell write an
+  explicit dependency failure, and nothing is written.
+- `editor_save` (one editor, rename fixture through `edit.file`): the fixture
+  predeclares placeholders `GortexEditProbe<seed>P<ordinal>`, exactly the
+  marker's length. Each save writes same-size bytes to a temporary file beside
+  the fixture and renames it over the file; the placeholder must become absent.
+- `create_delete` (100 edits, root-level Go fixture with pinned
+  `edit_initial_content`, JSON or TOON): even ordinals create
+  `gortex_edit_probe_<marker>.go` in the fixture's package, calling the
+  fixture's callee; odd ordinals delete that file once every probe of its create
+  was first-correct. Deletion is proved by the exact scoped not-found refusal and
+  complete search, text and caller collections; a missing file's summary,
+  editing context and call chain have no pinned contract and are not probed.
+  Created files still present are removed by one timed restore batch.
+  TypeScript and Python create/delete are not implemented: a gap, not an
+  inapplicable cell.
+- `hot_file` (100 edits, `--edit-agents 2`, `edit.file` or `edit.write` call
+  addition): MCP traffic in which both editors send each pair of edits to the
+  one file at the same due time, taken from the single-editor stream. Lost
+  writes are measured outcomes.
+- `restart` (`--edit-count 1`, one editor, no readers, JSON `edit.file` call
+  addition): right after the ACK, one status read of the edit's own receipt
+  must show it pending; otherwise the record is qualified `receipt terminal
+  before kill` and fails. The owned daemon is then killed, restarted on the same
+  store and awaited until ready, and the editor and prober sessions are
+  reopened. Probes pause during the downtime. First-correct times come only from
+  the restarted daemon, from send and from ready, and answers before the kill
+  are kept apart. The old receipt's status after the restart is recorded
+  verbatim, the acknowledged marker must be on disk, and the interrupted receipt
+  reports no phases, accounting or derived time. Process counters cover the
+  pre-kill daemon only.
 
 Each edit-and-probe report names its `role`. A standalone run is the candidate
 unless `--edit-probe-role baseline` is given; the paired command assigns roles
