@@ -759,6 +759,11 @@ func exactnessWithdrawnRefusal(reason string) error {
 // session scope and request view selection. A cache miss observes only this
 // checkout of an already known Git family; it never tracks a new repository or
 // waits for parsing. Existing identities take the catalog-only fast path.
+//
+// A path inside a registered root, its subdirectories included, is answered
+// by that root and is never refused for a discovery pending elsewhere. The one
+// exception is a path inside a nested worktree that discovery has not
+// registered yet: only such a path is observed, so only it can be refused.
 func (s *Server) checkoutForRequestPath(ctx context.Context, path string) (store_sqlite.Checkout, bool, error) {
 	checkout, found, err := s.registeredCheckoutForPath(ctx, path)
 	if err != nil {

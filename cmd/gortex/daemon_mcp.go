@@ -410,17 +410,20 @@ func checkoutAdmissionError(cwd string, inbound []byte, err error) []byte {
 	}
 	_ = json.Unmarshal(inbound, &req)
 	code, retryable := checkoutAdmissionFailure(err)
+	data := map[string]any{"error_code": code, "path": cwd, "retryable": retryable}
+	// A pending discovery names the checkout root it applies to, so a caller
+	// can tell one pending worktree from an unavailable daemon.
+	var pending *indexer.CheckoutDiscoveryPendingError
+	if errors.As(err, &pending) {
+		data["path"], data["family"], data["reason"], data["state"] = pending.Root, pending.Family, pending.Reason, "discovery_pending"
+	}
 	out, _ := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      req.ID,
 		"error": map[string]any{
 			"code":    -32000,
 			"message": "checkout discovery unavailable: " + err.Error(),
-			"data": map[string]any{
-				"error_code": code,
-				"path":       cwd,
-				"retryable":  retryable,
-			},
+			"data":    data,
 		},
 	})
 	return out
