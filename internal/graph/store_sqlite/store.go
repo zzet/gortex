@@ -505,6 +505,14 @@ type storeCore struct {
 	// health probe. Written only under writeMu, by syncBulkWindowLocked.
 	bulkWindowOpen atomic.Bool
 
+	// denseIndexesMissing names the dense indexes a cold bulk window closed
+	// without rebuilding (its seal failed, or it was aborted before sealing),
+	// in bulkDroppableIndexes order; nil when none are owed. Written only
+	// under writeMu and replaced, never mutated in place, so the health probe
+	// reads it without a lock for the same reason it reads bulkWindowOpen.
+	// Not persisted: Open's createGraphCoreIndexes rebuilds them on restart.
+	denseIndexesMissing atomic.Pointer[[]string]
+
 	// Prepared statements (compiled once in Open, closed in Close).
 	stmtInsertNode          *sql.Stmt
 	stmtGetNode             *sql.Stmt

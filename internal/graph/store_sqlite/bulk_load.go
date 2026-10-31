@@ -1284,6 +1284,8 @@ func (s *Store) sealBulkIndexesLocked(reason string) error {
 		return sealErr
 	}
 	s.bulkIndexesDeferred = false
+	// Every dense index is back, including any an earlier window left missing.
+	s.setDenseIndexesMissingLocked(nil)
 	return nil
 }
 
@@ -1323,6 +1325,14 @@ func (s *Store) closeBulkConnectionLocked() error {
 	_, syncErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA synchronous = %d", s.bulkPrevSync))
 	_, cacheErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", s.bulkPrevCacheSize))
 	_, autoCheckpointErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", s.bulkPrevAutoCheckpoint))
+	if s.bulkIndexesDeferred {
+		// The window is closing with its seal still owed: a failed seal at
+		// FlushBulk or Close, or an abort that never sealed. The indexes it
+		// dropped stay absent, so say which ones before the connection that
+		// can still read the schema goes. Asked after the PRAGMA restores so
+		// it can never delay durability coming back.
+		s.noteDenseIndexesMissingLocked(ctx, conn)
+	}
 	closeErr := conn.Close()
 	s.bulkIndexesDeferred = false
 	s.bulkDeferredNodeRows = 0
@@ -1339,6 +1349,63 @@ func (s *Store) closeBulkConnectionLocked() error {
 		wrapBulkRestoreError("wal_autocheckpoint", autoCheckpointErr),
 		closeErr,
 	)
+}
+
+// noteDenseIndexesMissingLocked records which bulkDroppableIndexes are absent
+// from the schema as a cold window closes unsealed. One schema read on the
+// pinned connection gives the exact set even after a partial seal; when that
+// read fails every droppable index is listed instead, which only costs the
+// repair a few CREATE INDEX IF NOT EXISTS that find the index already there.
+// Only a cold window defers indexes (a generation window opens with
+// bulkIndexesDeferred false), so this never runs for one.
+func (s *Store) noteDenseIndexesMissingLocked(ctx context.Context, conn *sql.Conn) {
+	present, err := schemaIndexNames(ctx, conn)
+	var missing []string
+	for _, idx := range bulkDroppableIndexes {
+		if err != nil || !present[idx.name] {
+			missing = append(missing, idx.name)
+		}
+	}
+	s.setDenseIndexesMissingLocked(missing)
+	if len(missing) > 0 {
+		log.Printf("store_sqlite: dense indexes missing after bulk window close indexes=%s", strings.Join(missing, ","))
+	}
+}
+
+// setDenseIndexesMissingLocked replaces the missing-index record. The caller
+// holds writeMu; the slice is never modified after it is published.
+func (s *Store) setDenseIndexesMissingLocked(missing []string) {
+	if len(missing) == 0 {
+		s.denseIndexesMissing.Store(nil)
+		return
+	}
+	s.denseIndexesMissing.Store(&missing)
+}
+
+// denseIndexesMissingNames returns a copy of the missing-index record, or nil.
+func (s *storeCore) denseIndexesMissingNames() []string {
+	missing := s.denseIndexesMissing.Load()
+	if missing == nil {
+		return nil
+	}
+	return append([]string(nil), (*missing)...)
+}
+
+func schemaIndexNames(ctx context.Context, conn *sql.Conn) (map[string]bool, error) {
+	rows, err := conn.QueryContext(ctx, `SELECT name FROM sqlite_schema WHERE type = 'index'`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	present := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		present[name] = true
+	}
+	return present, rows.Err()
 }
 
 func wrapBulkRestoreError(pragma string, err error) error {
