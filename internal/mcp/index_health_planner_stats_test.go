@@ -199,6 +199,30 @@ func TestIndexHealth_SurfacesPlannerStats(t *testing.T) {
 			"published a receiver cardinality for an index that is not in the schema")
 	})
 
+	// Dense indexes an interrupted bulk load left out are named, with the
+	// sentence that says what they cost and how they come back. The real
+	// state repairs itself on the store's maintenance lane as soon as the
+	// volume has room, so the verdict is fixed here rather than raced.
+	t.Run("missing dense indexes are named", func(t *testing.T) {
+		_, store := newEmptySQLiteBackedServer(t)
+		missing := []string{"nodes_by_kind", "edges_by_kind"}
+		wrapped := plannerHealthOverride{Store: store, health: graph.PlannerStatsFreshness{
+			Reason: "dense_indexes_missing", DenseIndexesMissing: missing,
+		}}
+		idx := indexer.New(wrapped, testRegistry(), config.Default().Index, zap.NewNop())
+		missingSrv := NewServer(query.NewEngine(wrapped), wrapped, idx, nil, zap.NewNop(), nil)
+
+		payload, err := missingSrv.buildIndexHealthPayloadCtx(context.Background())
+		require.NoError(t, err)
+		stats, ok := payload["planner_stats"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "dense_indexes_missing", stats["reason"])
+		assert.Equal(t, missing, stats["dense_indexes_missing"])
+		recommendation, _ := payload["recommendation"].(string)
+		assert.Contains(t, recommendation, "nodes_by_kind, edges_by_kind")
+		assert.NotContains(t, recommendation, "planner statistics are stale")
+	})
+
 	// The window between a deferred cooperative pass and the boundary that
 	// finishes it, seen from the side an agent reads.
 	//
@@ -302,6 +326,16 @@ func TestIndexHealth_SurfacesPlannerStats(t *testing.T) {
 		assert.Equal(t, false, receivers["complete"],
 			"the probe stopped at its cap and the payload still presented `actual` as a count")
 	})
+}
+
+// plannerHealthOverride reports a fixed planner verdict over a real store.
+type plannerHealthOverride struct {
+	*store_sqlite.Store
+	health graph.PlannerStatsFreshness
+}
+
+func (s plannerHealthOverride) PlannerStatsHealth(context.Context) (graph.PlannerStatsFreshness, error) {
+	return s.health, nil
 }
 
 // A backend without the capability must omit the key rather than publish a
