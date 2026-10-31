@@ -621,3 +621,17 @@ Sampled since-store-open WAL peaks cannot be subtracted into a warm-window peak.
 No run-reset API, per-edit/process CPU syscall or tracing registry is introduced.
 Instrumentation cost, real client read-back, complete phase sums and the full
 workload matrix remain unmeasured acceptance work.
+
+## Load-harness per-edit times
+
+The edit-and-probe load cell (`bench/load`) reports per-edit client times from
+edit send: ACK, the last correct immediate readback, and the slowest first
+correct answer in each visibility group (file graph, relations, search). Its
+`t_derived_ms` instead reads this record's own terminal `publication_phases`
+timeline on the daemon's monotonic clock, from `received` to
+`patch_derived_finished`. That value is not additive with client times, and a
+coalesced receipt (derived in the serving publication's timeline) leaves it
+unavailable. Its `phases_ms` copy keeps each producer null as unavailable with
+the producer's phase state, and a build without `phases_ms` (an older baseline)
+reports every lap unavailable rather than zero. Quantiles use nearest rank with
+seeded percentile-bootstrap intervals over the complete offered denominator.

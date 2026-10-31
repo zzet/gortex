@@ -207,6 +207,46 @@ writes are measured as failed records, not hidden. The 1-edit diagnostic and
 the paired no-regression cell stay one editor. Routing across several
 repositories or linked worktrees is not implemented.
 
+Each edit-and-probe report names its `role`. A standalone run is the candidate
+unless `--edit-probe-role baseline` is given; the paired command assigns roles
+by build order and refuses the flag. A candidate still fails any record whose
+phase accounting is missing. Every record carries `phases_ms` for each ACK and
+patch lap the daemon names, taken from the record's own latest receipt status
+(the per-file observation status for batches). A build without `phases_ms`
+reports each lap unavailable with that reason, a producer null keeps the
+producer's phase state as its reason, and a relocation keeps its per-file move
+accounting instead. Missing laps are never zero.
+
+Records also carry client times from edit send: `t_readback_ms` (last correct
+immediate same-session readback), `t_file_graph_ms` (source, summary, editing
+context and old-source absence), `t_relations_ms` (callers and call chain) and
+`t_search_ms` (symbol and text search). A group time is its slowest member's
+first-correct time; any member that never answered correctly leaves the group
+unavailable. `t_derived_ms` is daemon-clock time from receipt origin to
+`patch_derived_finished` in the record's own terminal publication timeline,
+because no probe observes the derived step; it is not additive with client
+times and stays unavailable for coalesced receipts and relocations.
+
+The report `summary` covers the complete offered denominator: outcome counts
+and, for every per-record time, each readback, each `phases_ms` lap and each
+oracle's first-correct time, nearest-rank p50/p95/p99/max with percentile
+bootstrap 95% intervals (2000 resamples, seeded from the plan seed and the
+measure name). An interval needs at least 2, 20 or 100 observations for p50,
+p95 or p99 and is unavailable below that. Records without a value are counted
+as `missing`, never sampled as zero.
+
+`--agents R` (0 to 32) adds pure readers on their own sessions, running the
+ordinary reading plan with agent pacing. With readers, the phase opens with a
+30 second no-edit window before the edit origin; the offered edit schedule,
+relative to that origin, is unchanged, and the run budget includes the window.
+Each read is classed when it is issued: `no_edit_baseline` before the origin,
+`under_edit` while any sent edit's completion loop (ACK, readbacks, receipt
+collection) is still running, otherwise `between_edits`. An edit sent while a
+read is in flight does not reclass it, so a read can straddle an edit's start
+by up to its own latency. The report's `reads` table gives, per operation and
+class, calls, busy refusals, errors, censored calls and the latency quantiles
+of successful calls only. Paired runs refuse readers.
+
 The report retains raw call identities, independent ACK/physical/requested
 background accounting, and missing evidence. RPC return timestamps delimit
 latency; raw JSONL persistence runs on owned per-edit writers with separately
