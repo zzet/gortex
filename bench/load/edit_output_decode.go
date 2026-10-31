@@ -24,10 +24,16 @@ type editProbeTOONWire struct{ operation string }
 
 const editProbeTOONWireKey = "\x00load.toon.wire"
 
+// There is no GCX decoder here, and read_file answers a GCX request with TOON.
+// A GCX answer is reported unavailable, never decoded or credited as TOON.
+var errEditOutputGCXUnavailable = errors.New("GCX output unavailable: no GCX decoder, and read_file answers a GCX request with TOON")
+
 func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[string]any, error) {
 	switch format {
 	case "", "json":
 	case "toon":
+	case "gcx":
+		return nil, errEditOutputGCXUnavailable
 	default:
 		return nil, errors.New("unsupported edit output mode")
 	}

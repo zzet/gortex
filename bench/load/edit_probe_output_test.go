@@ -2,8 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	toon "github.com/toon-format/toon-go"
 )
@@ -262,5 +265,73 @@ func TestEditProbeOutputSeparatesOnlyActualSessionNotes(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestEditProbeGCXIsUnavailableNeverTOON(t *testing.T) {
+	encoded, err := toon.Marshal(map[string]any{"id": "fixture/main.go::Added"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeEditProbeOutput(outputWire(string(encoded), nil), "gcx", "read.file"); !errors.Is(err, errEditOutputGCXUnavailable) {
+		t.Fatalf("valid TOON text was not refused as GCX: %v", err)
+	}
+	c := editProbeCorpus()
+	c.EditOutput = "gcx"
+	if _, err := editProbeOutputMode(c); !errors.Is(err, errEditOutputGCXUnavailable) {
+		t.Fatalf("gcx selection is not the explicit unavailable refusal: %v", err)
+	}
+	c.EditOutput = "invalid"
+	if _, err := editProbeOutputMode(c); err == nil || errors.Is(err, errEditOutputGCXUnavailable) {
+		t.Fatalf("unsupported mode reported as GCX: %v", err)
+	}
+	coverage := editProbeOutputCoverage("json", nil)
+	if gcx := coverage["gcx"]; gcx.State != "unavailable" || !strings.Contains(gcx.Reason, "TOON") || gcx.StaleClaimedFresh.Value != nil {
+		t.Fatalf("gcx coverage: %+v", gcx)
+	}
+	if len(coverage) != len(editProbeOutputModes) || coverage["json"].State != "selected" || coverage["toon"].State != "not_selected" {
+		t.Fatalf("every mode must be accounted: %+v", coverage)
+	}
+}
+
+func TestEditProbeModeCoverageCountsStaleClaimsPerActualMode(t *testing.T) {
+	corpus := editProbeCorpus()
+	corpus.EditOutput = "toon"
+	plan, err := makeEditProbePlan(corpus, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := plan.Steps[0]
+	sink := newEditProbeHeldSink(t)
+	sink.unblock()
+	state := startHeldEditProbeSpool(t, sink)
+	state.step, state.record = step, newEditProbeRecord(corpus, step)
+	origin := time.Now()
+	state.started, state.acknowledged = origin.Add(time.Millisecond), origin.Add(2*time.Millisecond)
+	run := &editProbeRuntime{origin: origin, plan: plan, p: &privateRun{Repos: []privateRepo{{Corpus: corpus}}}}
+	oracle := editProbeOracles(corpus, step)[0]
+	encoded, err := toon.Marshal(map[string]any{"name": "Unrelated", "freshness": "fresh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := wireCallIdentity{WriteStarted: origin.Add(3 * time.Millisecond), Finished: origin.Add(4 * time.Millisecond)}
+	// A wrong answer claiming freshness after the ACK, then one JSON body sent
+	// to a TOON request (a decode failure, never TOON credit).
+	if err := run.observeProbe(state, oracle, identity.WriteStarted, outputWire(string(encoded), nil), identity, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.observeProbe(state, oracle, identity.WriteStarted, outputWire(`{"freshness":"fresh"}`, nil), identity, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	coverage := editProbeOutputCoverage(plan.Mode, run.modeCounts)
+	toonMode := coverage["toon"]
+	if toonMode.State != "selected" || toonMode.ProbeAnswers != 2 || toonMode.DecodeFailures != 1 || toonMode.ClaimsFresh != 1 || toonMode.StaleClaimedFresh.Value == nil || *toonMode.StaleClaimedFresh.Value != 1 {
+		t.Fatalf("toon coverage: %+v", toonMode)
+	}
+	if json := coverage["json"]; json.ProbeAnswers != 0 || json.StaleClaimedFresh.Value != nil || json.StaleClaimedFresh.Reason != "no probe answers in this mode" {
+		t.Fatalf("unselected JSON reported a measured zero: %+v", json)
+	}
+	if !state.record.StaleClaimedFresh {
+		t.Fatal("record lost its stale claim")
 	}
 }

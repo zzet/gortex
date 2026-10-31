@@ -1361,6 +1361,75 @@
                             "null"
                           ]
                         },
+                        "output_modes": {
+                          "additionalProperties": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "claims_fresh": {
+                                "type": "integer"
+                              },
+                              "claims_fresh_observable": {
+                                "type": "boolean"
+                              },
+                              "decode_failures": {
+                                "type": "integer"
+                              },
+                              "precommit_fresh_mismatches_unassessed": {
+                                "type": "integer"
+                              },
+                              "probe_answers": {
+                                "type": "integer"
+                              },
+                              "reason": {
+                                "type": "string"
+                              },
+                              "stale_claimed_fresh": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "state": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "state",
+                              "probe_answers",
+                              "decode_failures",
+                              "claims_fresh_observable",
+                              "claims_fresh",
+                              "stale_claimed_fresh",
+                              "precommit_fresh_mismatches_unassessed"
+                            ],
+                            "type": "object"
+                          },
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
                         "plan": {
                           "additionalProperties": false,
                           "properties": {

@@ -72,6 +72,7 @@ type editProbeReport struct {
 	AccountingRequired bool              `json:"accounting_required"`
 	Records            []editProbeRecord `json:"edits"`
 	Summary            *editProbeSummary `json:"summary,omitempty"`
+	OutputModes        editProbeModes    `json:"output_modes,omitempty"`
 	Reads              editProbeReads    `json:"reads,omitempty"`
 	RestoreMS          Metric            `json:"restore_batch_ms"`
 	Restore            json.RawMessage   `json:"restore_batch"`
@@ -112,11 +113,12 @@ type editProbeRuntime struct {
 	readers           []*socketClient
 	editsInFlight     atomic.Int64 // sent edits whose completion loop has not returned
 	reads             []editProbeRead
+	modeCounts        map[string]editProbeModeCounts
 	states            []*editProbeState
 	original          []byte
 	moveOriginal      []byte
 	origin            time.Time
-	mu                sync.Mutex // Phase.Attempts and reads only; request lifetimes are never serialized
+	mu                sync.Mutex // Phase.Attempts, reads and mode counts only; request lifetimes are never serialized
 	requireAccounting bool
 	finalized         bool
 }
@@ -467,6 +469,7 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 	expectedAbsence := oracle.call.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == r.p.Repos[0].Prefix+"/"+oracle.call.ExpectedAbsentSymbol
 	correct := expectedAbsence || err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, r.p.Repos[0].Corpus, s.step, r.plan.Callee)
 	fresh := decodeErr == nil && editProbeClaimsFresh(body)
+	stale, precommit := false, false
 	s.mu.Lock()
 	if expectedAbsence {
 		s.record.ExpectedRefusals++
@@ -482,12 +485,14 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 	}
 	if !correct && fresh {
 		if !s.acknowledged.IsZero() && !sent.Before(s.acknowledged) {
-			s.record.StaleClaimedFresh = true
+			s.record.StaleClaimedFresh, stale = true, true
 		} else {
 			s.record.PrecommitFreshMismatches++
+			precommit = true
 		}
 	}
 	s.mu.Unlock()
+	r.countMode(editProbeRequestOutput(oracle.call), err == nil || expectedAbsence, err != nil || decodeErr == nil, fresh, stale, precommit)
 	return s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending})
 }
 
@@ -874,6 +879,7 @@ func (r *editProbeRuntime) finish() error {
 	r.phase.EditProbe.Summary = summarizeEditProbe(r.phase.EditProbe.Records, r.plan.Seed)
 	r.mu.Lock()
 	r.phase.EditProbe.Reads = summarizeEditProbeReads(r.reads, r.plan.Seed)
+	r.phase.EditProbe.OutputModes = editProbeOutputCoverage(r.plan.Mode, r.modeCounts)
 	r.mu.Unlock()
 	return errors.Join(failures...)
 }
