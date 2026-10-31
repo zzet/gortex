@@ -376,7 +376,10 @@ func (c *ContractAnalysisCoordinator) execute(job *contractAnalysisJob) string {
 		mode = viewmetrics.ContractModeCold
 	}
 	countContractJob(mode, outcome, elapsed)
+	// The job, checkout and trigger name the start line this end belongs to,
+	// so a linked checkout's fill time can be attributed from the log alone.
 	logContractJob(c.options.Logger, mode, outcome, elapsed, report,
+		zap.String("job", job.id), zap.String("checkout", targets[0].Key.CheckoutID), zap.String("trigger", job.trigger),
 		zap.Float64("dispatch_ms", contractMillis(dispatch)), zap.Float64("capture_ms", contractMillis(job.capture)))
 	return outcome
 }
