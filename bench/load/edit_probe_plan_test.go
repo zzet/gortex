@@ -122,3 +122,52 @@ func TestEditProbeAbsoluteArrivalsDoNotWaitForEarlierACK(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The default cell (one editor, no readers, JSON, MCP sender) is the paired
+// no-regression workload. Optional dimensions must leave its offered plan, plan
+// hash and operation list byte-identical; changing a constant below needs an
+// explicit compatibility decision, not a regenerated value.
+func TestEditProbeDefaultPlanIdentityIsPinned(t *testing.T) {
+	c := editProbeCorpus()
+	hundred, err := makeEditProbePlan(c, 42, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, err := makeEditProbePlan(c, 42, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toonCorpus := c
+	toonCorpus.EditOutput = "toon"
+	toonPlan, err := makeEditProbePlan(toonCorpus, 42, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := runOptions{Scenario: editProbeScenario, Profile: "agent", Agents: 0, Editors: 1, Seed: 42, Duration: time.Minute, Deadline: 120 * time.Second, WarmTimeout: 30 * time.Minute, StopTimeout: 30 * time.Second, SweepRepetitions: 15, SweepBudget: 10 * time.Minute, EditCount: 100}
+	report, err := newRunReport(o, []Corpus{c}, "", Host{}, "run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{"100-edit plan", hundred, "0b583c59bde46c199bb4b7baa674222b29a0dc17177f0cb46e243e9e4e648ef0"},
+		{"1-edit plan", one, "616f10cc464b12060ae6b24e26218a92cee77fcc897d769f51eac20e8b7e6061"},
+		{"TOON plan", toonPlan, "15d4158514a8dd1312ca426f38765e09386f27144eaf0bc9d548640649fd100d"},
+		{"operations", editProbeOperations(hundred, c), "2fd3b48bf5c4357757b96972c99ec5e6bdd79b0ab369ea229390f73fdb205b73"},
+	}
+	for _, pin := range pinned {
+		got, err := hashJSON(pin.value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != pin.want {
+			t.Errorf("%s identity changed: %s", pin.name, got)
+		}
+	}
+	if report.RequestPlan != "eefb64b2f6272b3094fcbc908ebf6df6d0d5bfdc7d1b27570b7f0bd960b5f43d" {
+		t.Errorf("request plan hash changed: %s", report.RequestPlan)
+	}
+}
