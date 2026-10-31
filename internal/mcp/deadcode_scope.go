@@ -73,7 +73,10 @@ func (s *Server) deadCodeProcesses(ctx context.Context, reader graph.Reader) (*a
 	for _, process := range processes.Processes {
 		ids = append(ids, process.EntryPoint)
 	}
-	nodes := reader.GetNodesByIDs(ids)
+	nodes, err := deadCodeEntryNodes(ctx, reader, ids)
+	if err != nil {
+		return nil, err
+	}
 	filtered := *processes
 	filtered.Processes = nil
 	for _, process := range processes.Processes {
@@ -105,18 +108,8 @@ func (s *Server) readDeadCodeProcesses(ctx context.Context, reader graph.Reader,
 		for _, row := range rows {
 			ids = append(ids, row.EntryPoint)
 		}
-		var nodes map[string]*graph.Node
-		if checked, ok := reader.(interface {
-			GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error)
-		}); ok {
-			nodes, err = checked.GetNodesByIDsContext(ctx, ids)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			nodes = graph.BindReadContext(reader, ctx).GetNodesByIDs(ids)
-		}
-		if err := ctx.Err(); err != nil {
+		nodes, err := deadCodeEntryNodes(ctx, reader, ids)
+		if err != nil {
 			return nil, err
 		}
 		for _, row := range rows {
@@ -149,4 +142,26 @@ func (s *Server) readDeadCodeProcesses(ctx context.Context, reader graph.Reader,
 		cursor = next
 	}
 	return result, ctx.Err()
+}
+
+// deadCodeEntryNodes reads process entry points for scope admission under the
+// request: a cancellable batch lookup when the reader has one, the reader
+// bound to ctx otherwise. A bound lookup that stops with the request returns
+// no nodes, so an ended request reports ctx's error instead of admitting none.
+func deadCodeEntryNodes(ctx context.Context, reader graph.Reader, ids []string) (map[string]*graph.Node, error) {
+	var nodes map[string]*graph.Node
+	if checked, ok := reader.(interface {
+		GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error)
+	}); ok {
+		var err error
+		if nodes, err = checked.GetNodesByIDsContext(ctx, ids); err != nil {
+			return nil, err
+		}
+	} else {
+		nodes = graph.BindReadContext(reader, ctx).GetNodesByIDs(ids)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nodes, nil
 }
