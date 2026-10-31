@@ -79,6 +79,7 @@ func TestOptionalContractStaleAndMissingReadScheduleOnceNeverWait(t *testing.T) 
 			fake.schedule = func(_ context.Context, req indexer.ContractScheduleRequest) (indexer.ContractScheduleResult, error) {
 				req.Source.Release()
 				require.NotNil(t, req.Inputs)
+				require.False(t, req.Strict, "an optional read never waits, so it never asks for strict dispatch")
 				if state == "queue_full" {
 					return indexer.ContractScheduleResult{}, &indexer.ContractQueueFullError{RetryAfter: 3 * time.Second}
 				}

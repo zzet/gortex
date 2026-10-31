@@ -311,7 +311,9 @@ func (s *Server) scheduleAndWaitContractAnalysis(ctx context.Context, actor inde
 		if err != nil {
 			return indexer.ContractActorStatus{}, 0, err
 		}
-		scheduled, err := runtime.Schedule(ctx, indexer.ContractScheduleRequest{Actor: actor, Key: pending.key, Inputs: pending.inputs, Source: source, Epoch: epoch, PriorityTarget: pending.targetOnly})
+		// Strict: this caller waits on the promise, so no linked policy may
+		// hold its job back, targeted or not.
+		scheduled, err := runtime.Schedule(ctx, indexer.ContractScheduleRequest{Actor: actor, Key: pending.key, Inputs: pending.inputs, Source: source, Epoch: epoch, PriorityTarget: pending.targetOnly, Strict: true})
 		var full *indexer.ContractQueueFullError
 		if errors.As(err, &full) {
 			if runtime.AcquireLastPublishedCohort != nil {

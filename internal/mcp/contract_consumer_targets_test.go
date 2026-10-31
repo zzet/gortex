@@ -79,6 +79,7 @@ func TestContractScopedListWaitsForExactTargetWithFullDependencyVector(t *testin
 		require.ElementsMatch(t, []string{"b", "repo"}, req.Actor.Repos())
 		require.Equal(t, "repo", req.Key.RepoPrefix)
 		require.True(t, req.PriorityTarget, "scoped lists request explicit target priority")
+		require.True(t, req.Strict, "a waiting caller marks its request strict")
 		require.Len(t, req.Inputs.Witnesses, 2, "target freshness retains the full dependency authority")
 		return scheduledAt(7)(ctx, req)
 	}
