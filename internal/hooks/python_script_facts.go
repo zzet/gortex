@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +26,9 @@ type pyScriptFacts struct {
 	writeBack map[string]bool // literal paths written back
 	guessed   map[string]bool // written back only by a write it cannot name
 	seen      map[string]bool
+	osReads   []string // literal source paths os.open opens read-only
+	writes    []string // literal paths os.open opens for writing
+	commands  []string // literal command lines the script runs (os.system, subprocess)
 }
 
 // pyMaxSteps bounds the analysis of one script and pyMaxDepth its expression
@@ -54,6 +58,12 @@ type pyAnalysis struct {
 	classes    map[uintptr]bool
 	ambiguous  map[string]bool
 	bound      map[string]bool // every name bound anywhere, built on first use
+	osImports  map[string]bool // names imported by `from os import NAME`
+	imports    map[string]int  // bindings of a name by a plain `import name`
+	fromNames  map[string]int  // bindings of a name as part of `from module import …`
+	bindCount  map[string]int  // bindings of a name in any scope, built on first use
+	osStar     bool            // `from os import *`
+	extra      bool            // collect what only the extra analysis answers
 	loopEnd    uint32          // end of the outermost loop around the node collect is at
 	deadline   time.Time
 	root       uintptr
@@ -78,12 +88,19 @@ var (
 		"os.path.normpath": true, "os.fspath": true, "str": true,
 		"Path": true, "pathlib.Path": true, "PurePath": true, "pathlib.PurePath": true}
 	pyOpenModules = map[string]bool{"io": true, "codecs": true, "builtins": true}
+	// pyCommandCalls run a command line, or an argument vector as a list.
+	pyCommandCalls = map[string]bool{"os.system": true, "os.popen": true,
+		"subprocess.run": true, "subprocess.call": true, "subprocess.check_call": true,
+		"subprocess.check_output": true, "subprocess.Popen": true,
+		"subprocess.getoutput": true, "subprocess.getstatusoutput": true}
 )
 
 // analyzePythonScript parses one script and collects what it reads and
 // writes. ok is false when the script does not parse cleanly or exceeds the
-// analysis budget.
-func analyzePythonScript(code string, deadline time.Time) (pyScriptFacts, bool) {
+// analysis budget. With extra it also collects os.open accesses and the
+// command lines the script runs; without, it does no work for them at all,
+// so the reads and edits the hook has always answered cost what they did.
+func analyzePythonScript(code string, deadline time.Time, extra bool) (pyScriptFacts, bool) {
 	if len(code) > maxInlineScript || !time.Now().Before(deadline) {
 		return pyScriptFacts{}, false
 	}
@@ -114,7 +131,11 @@ func analyzePythonScript(code string, deadline time.Time) (pyScriptFacts, bool) 
 		compr:     map[uintptr]bool{},
 		classes:   map[uintptr]bool{},
 		ambiguous: map[string]bool{},
+		osImports: map[string]bool{},
+		imports:   map[string]int{},
+		fromNames: map[string]int{},
 		deadline:  deadline,
+		extra:     extra,
 		root:      root.Id(),
 		facts:     pyScriptFacts{writeBack: map[string]bool{}, guessed: map[string]bool{}, seen: map[string]bool{}},
 	}
@@ -238,6 +259,10 @@ func (a *pyAnalysis) bind(n *sitter.Node, scope uintptr, depth int) {
 		}
 	case "augmented_assignment":
 		a.bindTargets(n.ChildByFieldName("left"), scope, "")
+	case "import_statement", "import_from_statement":
+		if a.extra {
+			a.recordImport(n)
+		}
 	case "parameters", "lambda_parameters":
 		// Parameters hold no path. Their defaults run where the function is
 		// written, so a walrus in one binds the scope around it.
@@ -616,6 +641,35 @@ func (a *pyAnalysis) collectCall(n *sitter.Node, scope uintptr) {
 		return m, ok
 	}
 	switch {
+	case a.extra && (name == "os.open" || pyCommandCalls[name]) && !a.realModule(strings.SplitN(name, ".", 2)[0]):
+		// A name the script binds to something other than the module.
+	case a.extra && name == "os.open" && (kw["dir_fd"] != nil || hasSplat(pos)):
+		// Relative to a directory the hook cannot see, or flags it cannot.
+	case a.extra && name == "os.open":
+		path := kw["path"]
+		if len(pos) > 0 {
+			path = pos[0]
+		}
+		flags := kw["flags"]
+		if len(pos) > 1 {
+			flags = pos[1]
+		}
+		// A read is a read; a write is only a write target, answered after
+		// the rest of the command: it never makes a read an edit.
+		if write, ok := a.osOpenWrites(flags); ok && path != nil {
+			switch lit := a.eval(path, scope, 0); {
+			case !write:
+				if lit != "" && looksLikeSourceFile(lit) && !strings.ContainsAny(lit, "*?$") && !slices.Contains(a.facts.osReads, lit) && len(a.facts.osReads) < bashWriteProbeLimit {
+					a.facts.osReads = append(a.facts.osReads, lit)
+				}
+			case lit != "" && looksLikeSourceFile(lit) && !strings.ContainsAny(lit, "*?$") && len(a.facts.writes) < bashWriteProbeLimit:
+				a.facts.writes = append(a.facts.writes, lit)
+			}
+		}
+	case a.extra && pyCommandCalls[name]:
+		if line, ok := a.commandLine(name, pos, kw); ok && len(a.facts.commands) < maxNestedCommands {
+			a.facts.commands = append(a.facts.commands, line)
+		}
 	case name == "open" && a.shadowed("open"):
 		// The script defines or imports its own open.
 	case name == "open" || (object != nil && method == "open" && pyOpenModules[a.dotted(object)]):
@@ -639,6 +693,170 @@ func (a *pyAnalysis) collectCall(n *sitter.Node, scope uintptr) {
 	case object != nil && (method == "write_text" || method == "write_bytes"):
 		a.access(a.eval(object, scope, 0), "w")
 	}
+}
+
+// osOpenWrites reads the flags of os.open built from os.O_* names joined by
+// `|`: write is true when they open the file for writing (O_WRONLY, O_RDWR,
+// O_TRUNC, O_APPEND), false for a read — O_CREAT alone changes no file that
+// exists. ok is false when the flags are anything else, since a value the
+// hook cannot read could be a write, and for O_PATH or O_DIRECTORY, which
+// read no file content.
+func (a *pyAnalysis) osOpenWrites(flags *sitter.Node) (write, ok bool) {
+	names := map[string]bool{}
+	var walk func(n *sitter.Node, depth int) bool
+	walk = func(n *sitter.Node, depth int) bool {
+		if n == nil || depth > pyMaxDepth || !a.step(depth) {
+			return false
+		}
+		var flag string
+		switch n.Type() {
+		case "binary_operator":
+			op := n.ChildByFieldName("operator")
+			return op != nil && a.text(op) == "|" &&
+				walk(n.ChildByFieldName("left"), depth+1) && walk(n.ChildByFieldName("right"), depth+1)
+		case "parenthesized_expression":
+			return walk(n.NamedChild(0), depth+1)
+		case "attribute":
+			var ok bool
+			if flag, ok = strings.CutPrefix(a.dotted(n), "os."); !ok || !a.realModule("os") {
+				return false
+			}
+		case "identifier":
+			// Imported from os once and never rebound.
+			flag = a.text(n)
+			imported := a.osImports[flag] && a.bindings[pyBindingKey{flag, a.root}] != nil && a.bindingCount(flag) == 1
+			if !imported && (!a.osStar || a.shadowed(flag)) {
+				return false
+			}
+		default:
+			return false
+		}
+		if !strings.HasPrefix(flag, "O_") || strings.Contains(flag, ".") {
+			return false
+		}
+		names[flag] = true
+		return true
+	}
+	if !walk(flags, 0) || names["O_PATH"] || names["O_DIRECTORY"] {
+		return false, false
+	}
+	return names["O_WRONLY"] || names["O_RDWR"] || names["O_TRUNC"] || names["O_APPEND"], true
+}
+
+// commandLine returns the command line a pyCommandCalls call runs when it
+// is literal: a string the shell runs as it is, or a list or tuple of
+// strings joined with shell quoting. false for anything else, and for a
+// call that runs it in another directory (cwd=) or with another program
+// (executable=). os.system, os.popen and getoutput always run a string
+// through the shell; the Popen family runs a string through it only with
+// shell=True (without, the string is a program name), and a list only
+// without it (with, the items past the first are arguments to the shell).
+func (a *pyAnalysis) commandLine(name string, pos []*sitter.Node, kw map[string]*sitter.Node) (string, bool) {
+	// *args and **kwargs may carry anything, cwd= and shell= included.
+	if len(pos) == 0 || kw["cwd"] != nil || kw["executable"] != nil || hasSplat(pos) {
+		return "", false
+	}
+	alwaysShell := name == "os.system" || name == "os.popen" || strings.HasPrefix(name, "subprocess.get")
+	shell, hasShell := kw["shell"]
+	// An escape in the literal reads differently to Python and the shell.
+	literal := func(n *sitter.Node) (string, bool) {
+		s, ok := a.stringLiteral(n)
+		return s, ok && s != "" && !strings.Contains(s, `\`)
+	}
+	switch arg := pos[0]; arg.Type() {
+	case "string", "concatenated_string":
+		if !alwaysShell && (!hasShell || shell.Type() != "true") {
+			return "", false
+		}
+		return literal(arg)
+	case "list", "tuple":
+		if alwaysShell || hasShell && shell.Type() != "false" {
+			return "", false
+		}
+		var words []string
+		for c := range arg.NamedChildren() {
+			w, ok := literal(c)
+			if !ok || len(words) >= 256 {
+				return "", false
+			}
+			words = append(words, shellQuoteWord(w))
+		}
+		return strings.Join(words, " "), len(words) > 0
+	}
+	return "", false
+}
+
+// recordImport counts the names an import binds for realModule: a plain
+// `import os` / `import os.path` binds the module itself, and the module
+// of a `from module import …` is recorded as bound too. Bare os.O_* flag
+// names imported from os are recorded for os.open.
+func (a *pyAnalysis) recordImport(n *sitter.Node) {
+	if n.Type() == "import_statement" {
+		for c := range n.NamedChildren() {
+			if c.Type() == "dotted_name" && c.NamedChildCount() > 0 {
+				a.imports[a.text(c.NamedChild(0))]++
+			}
+		}
+		return
+	}
+	module := n.ChildByFieldName("module_name")
+	if module == nil {
+		return
+	}
+	a.countFromModule(module)
+	fromOS := a.text(module) == "os"
+	for c := range n.NamedChildren() {
+		switch {
+		case c.Id() == module.Id():
+		case fromOS && c.Type() == "wildcard_import":
+			a.osStar = true
+		case fromOS && c.Type() == "dotted_name":
+			a.osImports[a.text(c)] = true
+		}
+	}
+}
+
+// countFromModule counts the names bind records for the module of a
+// `from module import …`, a dotted name alone or inside a relative import.
+func (a *pyAnalysis) countFromModule(n *sitter.Node) {
+	for c := range n.NamedChildren() {
+		switch c.Type() {
+		case "identifier":
+			if n.Type() == "dotted_name" {
+				a.fromNames[a.text(c)]++
+			}
+		case "dotted_name":
+			a.countFromModule(c)
+		}
+	}
+}
+
+// hasSplat reports whether a call's arguments include *args or **kwargs.
+func hasSplat(args []*sitter.Node) bool {
+	for _, arg := range args {
+		if t := arg.Type(); t == "list_splat" || t == "dictionary_splat" {
+			return true
+		}
+	}
+	return false
+}
+
+// realModule reports whether name is bound only by plain `import name`
+// statements, so name.attr is the module's own: never aliased onto
+// another module, assigned, defined, deleted or declared global.
+func (a *pyAnalysis) realModule(name string) bool {
+	return a.imports[name] > 0 && !a.ambiguous[name] && a.bindingCount(name) == a.imports[name]+a.fromNames[name]
+}
+
+// bindingCount returns how many times the script binds name, in any scope.
+func (a *pyAnalysis) bindingCount(name string) int {
+	if a.bindCount == nil {
+		a.bindCount = make(map[string]int, len(a.bindings))
+		for key, bs := range a.bindings {
+			a.bindCount[key.name] += len(bs)
+		}
+	}
+	return a.bindCount[name]
 }
 
 // reboundLater reports whether the name read at pos is bound again further

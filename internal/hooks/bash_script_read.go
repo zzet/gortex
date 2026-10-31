@@ -31,12 +31,14 @@ const (
 	inlineScriptTime = 500 * time.Millisecond
 )
 
-// pythonScript is one inline Python program and where it starts in the
-// command, so a `cd` before it can be told from one after it.
-type pythonScript struct {
+// inlineScript is one inline program — a Python script, or the command
+// string of `bash -c` — and where it starts in the command, so a `cd` before
+// it can be told from one after it.
+type inlineScript struct {
 	code       string
 	pos        int
 	cwdUnknown bool // a launcher ran it elsewhere (env -C, uv run --directory)
+	wrapped    bool // found only by looking through skipLaunchWrappers' wrappers
 }
 
 // pythonBinaryRE matches python, python3, python3.12, pypy3 and the like.
@@ -64,10 +66,21 @@ var interpreterLaunchers = map[string]struct {
 // Python. cwdChanged reports a launcher option that runs it in another
 // directory.
 func pythonCommand(words []string) (python []string, cwdChanged bool) {
-	words = skipCommandPrefix(words)
-	for len(words) > 0 {
+	return launchedCommand(words, pythonBinaryRE.MatchString, false)
+}
+
+// launchedCommand returns the words from the first binary `is` accepts on,
+// looking past the same prefixes and launchers as pythonCommand, and with
+// wrappers also past skipLaunchWrappers' wrappers before every command.
+func launchedCommand(words []string, is func(name string) bool, wrappers bool) (command []string, cwdChanged bool) {
+	for words = skipCommandPrefix(words); len(words) > 0; {
+		if wrappers {
+			if words = skipLaunchWrappers(words); len(words) == 0 {
+				break
+			}
+		}
 		name := baseCommandName(words[0])
-		if pythonBinaryRE.MatchString(name) {
+		if is(name) {
 			return words, cwdChanged
 		}
 		launcher, ok := interpreterLaunchers[name]
@@ -103,6 +116,80 @@ func pythonCommand(words []string) (python []string, cwdChanged bool) {
 		skipOptions()
 	}
 	return nil, false
+}
+
+// findPython is pythonCommand, then, with extra and when that finds no
+// Python, the same search through skipLaunchWrappers' wrappers; wrapped
+// reports the second.
+func findPython(words []string, extra bool) (python []string, cwdChanged, wrapped bool) {
+	if python, cwdChanged = pythonCommand(words); python != nil || !extra {
+		return python, cwdChanged, false
+	}
+	python, cwdChanged = launchedCommand(words, pythonBinaryRE.MatchString, true)
+	return python, cwdChanged, python != nil
+}
+
+// skipLaunchWrappers is skipCommandPrefix that also looks through the
+// wrappers that run the command after them in the same filesystem and
+// directory — `exec`, `nohup`, `setsid`, `nice`, `command`, `nvm exec
+// <version>`, `direnv exec <dir>` — when finding an inline interpreter or a
+// nested shell. The shell read and write shapes do not use it: a wrapped
+// first statement would stop their classification short of a later one.
+// Wrappers that run the command against another root or host (chroot,
+// docker, ssh) are not looked through, and neither is `command -v`, which
+// runs nothing.
+func skipLaunchWrappers(tokens []string) []string {
+	for tokens = skipCommandPrefix(tokens); len(tokens) > 0; tokens = skipCommandPrefix(tokens) {
+		var opts []string
+		switch t := tokens[0]; {
+		case t == "nohup":
+			tokens = tokens[1:]
+		case t == "exec":
+			tokens, _ = skipWrapperOptions(tokens[1:], "a")
+		case t == "setsid":
+			tokens, _ = skipWrapperOptions(tokens[1:], "")
+		case t == "nice":
+			tokens, _ = skipWrapperOptions(tokens[1:], "n")
+		case t == "command":
+			rest := tokens
+			if tokens, opts = skipWrapperOptions(tokens[1:], ""); strings.ContainsAny(strings.Join(opts, ""), "vV") {
+				return rest
+			}
+		case t == "nvm" && len(tokens) > 1 && tokens[1] == "exec":
+			if tokens, _ = skipWrapperOptions(tokens[2:], ""); len(tokens) > 0 && nvmVersionRE.MatchString(tokens[0]) {
+				tokens = tokens[1:]
+			}
+		case t == "direnv" && len(tokens) > 2 && tokens[1] == "exec":
+			tokens = tokens[3:]
+		default:
+			return tokens
+		}
+	}
+	return tokens
+}
+
+// nvmVersionRE matches the version `nvm exec` takes before the command: 20,
+// v20.1.0, node, lts/iron. The version is optional, so a word that is not
+// one is the command.
+var nvmVersionRE = regexp.MustCompile(`^(?:v?[0-9][0-9.]*|node|iojs|stable|lts/\S+)$`)
+
+// skipWrapperOptions drops the options a wrapper takes before its command
+// and returns them. A short option in valued takes the next token as its
+// value unless the value is attached; `--` ends the options.
+func skipWrapperOptions(tokens []string, valued string) (rest, opts []string) {
+	for len(tokens) > 0 && strings.HasPrefix(tokens[0], "-") && tokens[0] != "-" {
+		opt := tokens[0]
+		tokens = tokens[1:]
+		if opt == "--" {
+			break
+		}
+		opts = append(opts, opt)
+		if last := opt[len(opt)-1:]; !strings.HasPrefix(opt, "--") && strings.Contains(valued, last) && len(tokens) > 0 {
+			opts = append(opts, tokens[0])
+			tokens = tokens[1:]
+		}
+	}
+	return tokens, opts
 }
 
 // pythonInline reads a Python command line: the code of `-c CODE`, or
@@ -207,15 +294,24 @@ func shellWords(s string) []string {
 }
 
 // pythonScriptsAt returns every inline Python program in cmd with its
-// position: each `-c` statement, then each heredoc body fed to a Python
-// reading standard input. Positions come from cursors that only move
+// position.
+func pythonScriptsAt(cmd string) []inlineScript {
+	scripts, _ := inlineScriptsAt(cmd, false)
+	return scripts
+}
+
+// inlineScriptsAt returns every inline Python program in cmd with its
+// position — each `-c` statement, then each heredoc body fed to a Python
+// reading standard input — and the command string of each `bash -c` (or
+// sh, dash, zsh) statement. Positions come from cursors that only move
 // forward, so a long command costs one pass and a repeated statement gets
-// its own position.
-func pythonScriptsAt(cmd string) []pythonScript {
-	if !strings.Contains(cmd, "python") && !strings.Contains(cmd, "pypy") {
-		return nil
+// its own position. Without extra it finds only what pythonCommand finds,
+// and no shells: no Python found only through a wrapper.
+func inlineScriptsAt(cmd string, extra bool) (scripts, shells []inlineScript) {
+	hasPython := strings.Contains(cmd, "python") || strings.Contains(cmd, "pypy")
+	if !hasPython && (!extra || !strings.Contains(cmd, "sh")) {
+		return nil, nil
 	}
-	var scripts []pythonScript
 	// A text not found verbatim (a segment the splitter rewrote, such as
 	// a backslash-newline) loses the cursor: what follows has no position,
 	// which only gives up on relative paths, and the scan stays one pass.
@@ -236,11 +332,19 @@ func pythonScriptsAt(cmd string) []pythonScript {
 	for _, segment := range allCommandSegments(cmd) {
 		pos := at(&segCursor, segment)
 		command, _ := splitSegmentRedirects(segment)
-		if words, moved := pythonCommand(shellWords(command)); words != nil {
-			if code, fromStdin, ok := pythonInline(words); ok && !fromStdin && code != "" {
-				scripts = append(scripts, pythonScript{code: code, pos: pos, cwdUnknown: moved})
+		words := shellWords(command)
+		if python, moved, wrapped := findPython(words, extra); python != nil {
+			if code, fromStdin, ok := pythonInline(python); ok && !fromStdin && code != "" {
+				scripts = append(scripts, inlineScript{code: code, pos: pos, cwdUnknown: moved, wrapped: wrapped})
+			}
+		} else if shell, moved := launchedCommand(words, isNestingShell, true); extra && shell != nil {
+			if code, ok := shellInline(shell); ok && code != "" {
+				shells = append(shells, inlineScript{code: code, pos: pos, cwdUnknown: moved})
 			}
 		}
+	}
+	if !hasPython {
+		return nil, shells
 	}
 	_, heredocs := splitHeredocs(cmd)
 	docCursor := 0
@@ -265,13 +369,13 @@ func pythonScriptsAt(cmd string) []pythonScript {
 			continue
 		}
 		command, _ := splitSegmentRedirects(segments[len(segments)-1])
-		if words, moved := pythonCommand(shellWords(command)); words != nil {
+		if words, moved, wrapped := findPython(shellWords(command), extra); words != nil {
 			if _, fromStdin, ok := pythonInline(words); ok && fromStdin {
-				scripts = append(scripts, pythonScript{code: heredoc.body, pos: pos, cwdUnknown: moved})
+				scripts = append(scripts, inlineScript{code: heredoc.body, pos: pos, cwdUnknown: moved, wrapped: wrapped})
 			}
 		}
 	}
-	return scripts
+	return scripts, shells
 }
 
 // segmentChangesDir reports whether a segment runs cd or pushd anywhere in
@@ -313,60 +417,146 @@ func cdPositions(cmd string, leading int) []int {
 	return positions
 }
 
+// analyzedScript is an inline Python script and what its analysis found.
+type analyzedScript struct {
+	inlineScript
+	facts pyScriptFacts
+}
+
+// analyzeInlineScripts analyses up to maxInlineScripts scripts by deadline,
+// dropping each one the analysis has no opinion on; extra is the
+// analysis mode (see analyzePythonScript). The scripts found only through a
+// wrapper come last and are capped on their own.
+func analyzeInlineScripts(scripts []inlineScript, deadline time.Time, extra bool) []analyzedScript {
+	var out []analyzedScript
+	for _, wrapped := range []bool{false, true} {
+		n := 0
+		for _, script := range scripts {
+			if script.wrapped != wrapped || n >= maxInlineScripts {
+				continue
+			}
+			n++
+			if facts, ok := analyzePythonScript(script.code, deadline, extra); ok {
+				out = append(out, analyzedScript{script, facts})
+			}
+		}
+	}
+	return out
+}
+
+// commandDirs is where the statements of one command run: the directory its
+// leading `cd` chain ends in, and where each cd the chain cannot follow
+// starts.
+type commandDirs struct {
+	dir string
+	cds []int
+}
+
+func newCommandDirs(cmd string) commandDirs {
+	dir, segments := leadingCdChain(cmd)
+	return commandDirs{dir: dir, cds: cdPositions(cmd, segments)}
+}
+
+// at returns the directory a script runs in — relative to the hook's cwd
+// unless absolute, "" for the cwd itself — or false when a cd the chain
+// cannot follow comes before it, or a launcher ran it elsewhere.
+func (d commandDirs) at(script inlineScript) (string, bool) {
+	for _, at := range d.cds {
+		if at < 0 || script.pos < 0 || at < script.pos {
+			return "", false
+		}
+	}
+	if script.cwdUnknown {
+		return "", false
+	}
+	return d.dir, true
+}
+
+// pythonDir is at for a Python script, which may also change its own
+// working directory (os.chdir, fchdir, chdir imported or aliased from os):
+// then nothing relative in it resolves against the hook's cwd.
+func (d commandDirs) pythonDir(script inlineScript) (string, bool) {
+	if strings.Contains(script.code, "chdir") {
+		return "", false
+	}
+	return d.at(script)
+}
+
+// resolve returns the path a script's literal path p names, relative to
+// the hook's cwd unless absolute, or false when it cannot be told.
+func (d commandDirs) resolve(script inlineScript, p string) (string, bool) {
+	if filepath.IsAbs(p) {
+		return p, true
+	}
+	dir, ok := d.pythonDir(script)
+	if !ok {
+		return "", false
+	}
+	if dir != "" {
+		return filepath.Join(dir, p), true
+	}
+	return p, true
+}
+
+// scriptWrites returns the files the scripts open for writing through
+// os.open, which no shell write pattern sees, as `script write` shapes: such
+// a write gets the answer open(p, 'w') gets.
+func scriptWrites(scripts []analyzedScript, dirs commandDirs) []BashWrite {
+	var writes []BashWrite
+	for _, script := range scripts {
+		for _, p := range script.facts.writes {
+			if at, ok := dirs.resolve(script.inlineScript, p); ok && len(writes) < bashWriteProbeLimit {
+				writes = append(writes, BashWrite{Path: at, Shape: "script write"})
+			}
+		}
+	}
+	return writes
+}
+
 // enrichBashScriptRead answers inline Python that reads indexed source.
 // answered is false when the command runs no such script, so the caller
 // falls through to its own verdict.
-func enrichBashScriptRead(cmd, cwd string, scopeProbe fileScopeProbe) (enrichResult, bool) {
+// The deadline bounds the analysis; a zero one is inlineScriptTime from now.
+// What only the extra analysis sees is answered by enrichBashCommand after
+// this, with its own budget.
+func enrichBashScriptRead(cmd, cwd string, scopeProbe fileScopeProbe, deadline time.Time) (enrichResult, bool) {
 	started := time.Now()
-	deadline := started.Add(inlineScriptTime)
+	if deadline.IsZero() {
+		deadline = started.Add(inlineScriptTime)
+	}
 	scripts := pythonScriptsAt(cmd)
 	if len(scripts) == 0 {
 		return enrichResult{}, false
 	}
-	if len(scripts) > maxInlineScripts {
-		scripts = scripts[:maxInlineScripts]
-	}
-	cdDir, cdSegments := leadingCdChain(cmd)
-	cds := cdPositions(cmd, cdSegments)
-	resolve := func(script pythonScript, p string) (string, bool) {
-		if filepath.IsAbs(p) {
-			return p, true
-		}
-		// A cd the chain cannot follow, made before the script runs, or a
-		// chdir inside it: the relative path is no longer the hook's.
-		for _, at := range cds {
-			if at < 0 || script.pos < 0 || at < script.pos {
-				return "", false
-			}
-		}
-		// A possible working-directory change inside the script (os.chdir,
-		// fchdir, chdir imported or aliased from os): a relative path no
-		// longer resolves against the hook's cwd.
-		if script.cwdUnknown || strings.Contains(script.code, "chdir") {
-			return "", false
-		}
-		if cdDir != "" {
-			return filepath.Join(cdDir, p), true
-		}
-		return p, true
-	}
+	dirs := newCommandDirs(cmd)
+	return scriptReadAnswer(analyzeInlineScripts(scripts, deadline, false), false, dirs, cwd, scopeProbe, started)
+}
 
+// scriptReadAnswer answers the reads and edits of the scripts: with second
+// false, the open()/pathlib reads and edits of the scripts found without a
+// wrapper; with second true, os.open reads and the reads and edits of the
+// scripts found only through a wrapper. Each call has its own probe budget.
+func scriptReadAnswer(scripts []analyzedScript, second bool, dirs commandDirs, cwd string, scopeProbe fileScopeProbe, started time.Time) (enrichResult, bool) {
 	type candidate struct {
-		script  pythonScript
+		script  inlineScript
 		path    string
 		guessed bool // the write target is unnamed: it may be another file
 	}
 	var edits, reads []candidate
 	for _, script := range scripts {
-		facts, ok := analyzePythonScript(script.code, deadline)
-		if !ok {
-			continue
+		facts := script.facts
+		if script.wrapped == second {
+			for _, p := range facts.reads {
+				if facts.writeBack[p] {
+					edits = append(edits, candidate{script.inlineScript, p, facts.guessed[p]})
+				} else {
+					reads = append(reads, candidate{script.inlineScript, p, false})
+				}
+			}
 		}
-		for _, p := range facts.reads {
-			if facts.writeBack[p] {
-				edits = append(edits, candidate{script, p, facts.guessed[p]})
-			} else {
-				reads = append(reads, candidate{script, p, false})
+		if second {
+			for _, p := range facts.osReads {
+				reads = append(reads, candidate{script.inlineScript, p, false})
 			}
 		}
 	}
@@ -379,7 +569,7 @@ func enrichBashScriptRead(cmd, cwd string, scopeProbe fileScopeProbe) (enrichRes
 		if probes >= bashWriteProbeLimit {
 			return fileIndexStatus{}, false
 		}
-		at, ok := resolve(c.script, c.path)
+		at, ok := dirs.resolve(c.script, c.path)
 		if !ok {
 			return fileIndexStatus{}, false
 		}
