@@ -2,6 +2,7 @@ package query
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -93,14 +94,25 @@ func TestBenchmarkIndexConfigUsesRepositoryConfig(t *testing.T) {
 	if _, err := benchmarkIndexConfig(t.TempDir(), root); err == nil {
 		t.Fatal("a malformed .gortex.yaml must not fall back to the default scope")
 	}
-	if err := os.WriteFile(path, []byte("index:\n  exclude:\n    - \"**/*_test.go\"\n  workers: 1\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := benchmarkIndexConfig(t.TempDir(), root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Contains(cfg.Exclude, "**/*_test.go") || cfg.Workers != 2 {
-		t.Fatalf("benchmark scope ignores the repository config: workers=%d exclude=%q", cfg.Workers, cfg.Exclude)
+	for _, tc := range []struct {
+		name          string
+		workers, want int
+	}{
+		{"floor", 1, 2},
+		{"pass-through", 5, 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf("index:\n  exclude:\n    - \"**/*_test.go\"\n  workers: %d\n", tc.workers)
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := benchmarkIndexConfig(t.TempDir(), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Contains(cfg.Exclude, "**/*_test.go") || cfg.Workers != tc.want {
+				t.Fatalf("benchmark scope ignores the repository config: workers=%d want %d exclude=%q", cfg.Workers, tc.want, cfg.Exclude)
+			}
+		})
 	}
 }
