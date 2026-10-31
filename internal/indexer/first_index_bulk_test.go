@@ -203,17 +203,23 @@ func TestDrainAddBatchReturnsStorageFailure(t *testing.T) {
 	}
 }
 
-// firstIndexWindowWitness counts a store's batch writes, and how many of them
-// landed inside an engaged bulk window with the dense indexes deferred. fail,
-// when set, decides whether the store refuses a batch.
+// firstIndexWindowWitness counts a store's batch writes, how many of them
+// landed inside an engaged bulk window with the dense indexes deferred, and how
+// often each dense index was sealed. fail, when set, decides whether the store
+// refuses a batch.
 type firstIndexWindowWitness struct {
 	batches, engaged, deferred int
+	seals                      map[string]int
 	fail                       func(edgeRows int) error
 }
 
 func watchFirstIndexWindow(t *testing.T, store *store_sqlite.Store, db *sql.DB, indexes []string) *firstIndexWindowWitness {
 	t.Helper()
-	w := &firstIndexWindowWitness{}
+	w := &firstIndexWindowWitness{seals: map[string]int{}}
+	t.Cleanup(store.SetBulkSealHookForTest(func(index string) error {
+		w.seals[index]++
+		return nil
+	}))
 	t.Cleanup(store.SetBatchWriteHookForTest(func(_, edgeRows int) error {
 		w.batches++
 		if firstIndexBulkActive(t, store) {
@@ -242,6 +248,11 @@ func (w *firstIndexWindowWitness) assertEngaged(t *testing.T) {
 	require.Positive(t, w.batches, "test must observe the shadow drain")
 	assert.Positive(t, w.engaged, "cold shadow drain must engage standalone bulk mode")
 	assert.Positive(t, w.deferred, "dense indexes must be deferred during drain")
+	// One window per drain: a second one would seal every index again.
+	require.NotEmpty(t, w.seals, "the window must seal the indexes it deferred")
+	for index, n := range w.seals {
+		assert.Equal(t, 1, n, "index %s sealed %d times", index, n)
+	}
 }
 
 func assertFirstIndexReceipts(t *testing.T, store *store_sqlite.Store, result *IndexResult) {
@@ -318,7 +329,7 @@ func TestFirstIndexDrainUsesBulkWindow(t *testing.T) {
 		assertFirstIndexRestored(t, store, db, indexes)
 
 		// The retry evicts them, which leaves the store cold again.
-		w.batches, w.engaged, w.deferred = 0, 0, 0
+		w.batches, w.engaged, w.deferred, w.seals = 0, 0, 0, map[string]int{}
 		result, err := newFirstIndexBulkIndexer(t, store, "repo").IndexCtx(context.Background(), dir)
 		require.NoError(t, err)
 		w.assertEngaged(t)
