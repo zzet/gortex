@@ -232,6 +232,23 @@ func callServerTool(port int, name string, args map[string]any) string {
 	return callServerToolHTTP(port, name, args)
 }
 
+// callServerToolWithin is callServerTool bounded by timeout. answered is false
+// when the call did not return in time: the bridge is reachable but busy,
+// which a briefing reports instead of folding it into the silence of an
+// unreachable bridge. The abandoned call ends with the hook process.
+func callServerToolWithin(port int, name string, args map[string]any, timeout time.Duration) (raw string, answered bool) {
+	done := make(chan string, 1)
+	go func() { done <- callServerTool(port, name, args) }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case raw = <-done:
+		return raw, true
+	case <-timer.C:
+		return "", false
+	}
+}
+
 // callServerToolHTTP issues a POST /v1/tools/{name} against the server and
 // returns the text content from the first response block. Returns empty string
 // on any error (server unreachable, non-200, missing content).
