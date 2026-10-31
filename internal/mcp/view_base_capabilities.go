@@ -14,15 +14,15 @@ var (
 )
 
 // The edge capabilities below are answered by this view, never by the corpus.
-// The corpus's import join, kind count and recursive walk read every
-// repository's rows, and their answers drop the reference site the narrowing
-// decides each edge by (a walk has also already passed through whatever it
-// reached), so they cannot be narrowed afterwards. Each is instead recomputed
-// over this reader's own lanes — GetInEdges, EdgesByKind, GetOutEdges and the
-// node lookups — which apply exactly the predicate adjacency applies. That
-// needs nothing from the corpus beyond the plain Reader, so a narrowed view
-// serves them whatever its corpus implements, with the answer a
-// capability-less caller would compute from the same lanes.
+// The corpus's import join, kind count and recursive walk answer without the
+// reference site the narrowing decides each edge by (a walk has also already
+// passed through whatever it reached), so their answers cannot be narrowed
+// afterwards. Each is instead recomputed over this reader's own lanes —
+// GetInEdges, EdgesByKind, GetOutEdges and the node lookups — which apply
+// exactly the predicate adjacency applies. That needs nothing from the corpus
+// beyond the plain Reader, so a narrowed view serves them whatever its corpus
+// implements, with the answer a capability-less caller would compute from the
+// same lanes.
 
 // FileImporters follows incoming imports from this file's identities through
 // the narrowed adjacency: an importer written in, or resolving to, another
@@ -35,7 +35,12 @@ func (r *baseGraphReader) FileImporters(path string) []graph.FileImporterRow {
 }
 
 // InEdgeCountsByKind counts the incoming edges this view admits, per target,
-// for the requested kinds.
+// for the requested kinds. A count by kind has no anchor to start from, so it
+// streams every edge of each requested kind from the corpus, every
+// repository's included, and decides each through this view's predicate. That
+// is the capability-less fallback's cost, not the corpus's single grouped
+// query. Scoped consumers must instead count incoming rows of their bounded
+// candidate identities.
 func (r *baseGraphReader) InEdgeCountsByKind(kinds []graph.EdgeKind) map[string]int {
 	return inEdgeCountsFromReader(r, kinds)
 }

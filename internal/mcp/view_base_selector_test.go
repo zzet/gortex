@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"maps"
 	"path/filepath"
 	"reflect"
@@ -1054,10 +1055,14 @@ type countingCorpus struct {
 	// one.
 	nodeLookups int
 	nodeBatches int
-	// allNodes and allEdges count whole-corpus scans, which a lane anchored
-	// on this view's own identities never needs.
-	allNodes int
-	allEdges int
+	// allNodes and allEdges count whole-corpus scans, and kindScans and
+	// kindRows the per-kind ones — each a stream over every repository's
+	// edges of that kind. A lane anchored on this view's own identities never
+	// needs either.
+	allNodes  int
+	allEdges  int
+	kindScans []graph.EdgeKind
+	kindRows  int
 }
 
 func newCountingCorpus(inner *graph.Graph) *countingCorpus {
@@ -1093,6 +1098,18 @@ func (c *countingCorpus) AllNodes() []*graph.Node {
 func (c *countingCorpus) AllEdges() []*graph.Edge {
 	c.allEdges++
 	return c.inner.AllEdges()
+}
+
+func (c *countingCorpus) EdgesByKind(kind graph.EdgeKind) iter.Seq[*graph.Edge] {
+	return func(yield func(*graph.Edge) bool) {
+		c.kindScans = append(c.kindScans, kind)
+		for edge := range c.inner.EdgesByKind(kind) {
+			c.kindRows++
+			if !yield(edge) {
+				return
+			}
+		}
+	}
 }
 
 // baseSiteFanoutFiles is how wide the sibling repository is in the fan-out
@@ -1535,8 +1552,8 @@ func baseCapabilityShapes(t *testing.T) []baseCapabilityShape {
 
 func (shape baseCapabilityShape) requireNoScans(t *testing.T, lane string) {
 	t.Helper()
-	if shape.scans != nil && shape.scans.allNodes+shape.scans.allEdges > 0 {
-		t.Errorf("%s scanned the whole corpus: %d node and %d edge scans", lane, shape.scans.allNodes, shape.scans.allEdges)
+	if scans := shape.scans; scans != nil && scans.allNodes+scans.allEdges+len(scans.kindScans) > 0 {
+		t.Errorf("%s scanned the whole corpus: %d node and %d edge scans, edge-kind scans %v", lane, scans.allNodes, scans.allEdges, scans.kindScans)
 	}
 }
 
@@ -1589,13 +1606,17 @@ func TestBaseGraphReaderAdvertisesFileImporters(t *testing.T) {
 	}
 }
 
-// TestBaseGraphReaderAdvertisesInEdgeCounter: get_untested ranks by fan-in
-// from graph.InEdgeCounter when the reader has it. A narrowed view counts only
-// the edges its kind streams admit — no caller from the sibling repository and
-// no reference written there — which is the fallback's answer over the same
-// view.
+// TestBaseGraphReaderAdvertisesInEdgeCounter: collectFanInByKind takes the
+// whole-corpus fan-in from graph.InEdgeCounter when the reader has it. A
+// narrowed view counts only the edges its kind streams admit — no caller from
+// the sibling repository and no reference written there — which is the
+// fallback's answer over the same view. It is the fallback's cost too: with no
+// anchor to start from, the count streams every repository's edges of each
+// requested kind, and the counting corpus pins that scan rather than letting
+// it pass unseen.
 func TestBaseGraphReaderAdvertisesInEdgeCounter(t *testing.T) {
 	kinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeImports, graph.EdgeCalls}
+	distinct := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeImports}
 	want := map[string]int{
 		baseCapabilityLibFile: 1, baseCapabilityLib: 1, baseCapabilityMain: 1, baseCapabilityHelper: 1,
 		"repo/main.go::Helper2": 1, "repo/main.go::Helper3": 1, "external::dynamic": 1,
@@ -1607,7 +1628,23 @@ func TestBaseGraphReaderAdvertisesInEdgeCounter(t *testing.T) {
 				t.Fatalf("%T does not advertise graph.InEdgeCounter", shape.scoped)
 			}
 			got := counter.InEdgeCountsByKind(kinds)
-			shape.requireNoScans(t, "InEdgeCountsByKind")
+			if scans := shape.scans; scans != nil {
+				if scans.allNodes+scans.allEdges > 0 {
+					t.Errorf("InEdgeCountsByKind scanned the whole corpus: %d node and %d edge scans", scans.allNodes, scans.allEdges)
+				}
+				if !slices.Equal(scans.kindScans, distinct) {
+					t.Errorf("InEdgeCountsByKind streamed kinds %v, want each requested kind once: %v", scans.kindScans, distinct)
+				}
+				corpusRows := 0
+				for _, kind := range distinct {
+					for range shape.store.EdgesByKind(kind) {
+						corpusRows++
+					}
+				}
+				if scans.kindRows != corpusRows {
+					t.Errorf("InEdgeCountsByKind read %d edges, want every repository's %d edges of those kinds", scans.kindRows, corpusRows)
+				}
+			}
 			if fallback := collectFanInByKind(legacyOutlineReader{shape.scoped}, kinds); !maps.Equal(got, fallback) {
 				t.Errorf("InEdgeCountsByKind = %v, the fallback over the same view counts %v", got, fallback)
 			}
