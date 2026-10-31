@@ -74,8 +74,7 @@ func TestRenderLaunchdPlist_Golden(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("PATH", "")
-			out, err := renderLaunchdPlist("com.zzet.gortex", "/opt/a&b/gortex", "/var/o'neil/<logs>/daemon.stderr.log", tc.env)
-			require.NoError(t, err)
+			out := renderLaunchdPlist("com.zzet.gortex", "/opt/a&b/gortex", "/var/o'neil/<logs>/daemon.stderr.log", tc.env)
 			require.Equal(t, head+launchdDefaultPATH()+"</string>"+tc.vars+tail, out)
 			assertWellFormedXML(t, out)
 		})
@@ -123,8 +122,7 @@ Environment="GORTEX_DAEMON_LOGFILE=/home/u/100%% logs/daemon.log"`,
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("PATH", "")
-			out, err := renderSystemdUnit("/home/u/.local/bin/gortex", "/home/u/100% logs/daemon.stderr.log", tc.env)
-			require.NoError(t, err)
+			out := renderSystemdUnit("/home/u/.local/bin/gortex", "/home/u/100% logs/daemon.stderr.log", tc.env)
 			require.Equal(t, head+tc.vars+tail, out)
 		})
 	}

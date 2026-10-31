@@ -295,14 +295,14 @@ const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 // Unit files are rendered with fmt, not text/template: executing a template
 // looks fields up by reflection, which makes the linker keep every exported
 // method of every reachable type (see scripts/ci-dumpdep).
-func renderLaunchdPlist(label, exe, logPath string, env []serviceEnvVar) (string, error) {
+func renderLaunchdPlist(label, exe, logPath string, env []serviceEnvVar) string {
 	var vars strings.Builder
 	for _, e := range env {
 		fmt.Fprintf(&vars, "\n        <key>%s</key>\n        <string>%s</string>", e.Key, xmlEscape(e.Value))
 	}
 	logPath = xmlEscape(logPath)
 	path := servicePath([]string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"})
-	return fmt.Sprintf(launchdPlistTemplate, xmlEscape(label), xmlEscape(exe), logPath, logPath, xmlEscape(path), vars.String()), nil
+	return fmt.Sprintf(launchdPlistTemplate, xmlEscape(label), xmlEscape(exe), logPath, logPath, xmlEscape(path), vars.String())
 }
 
 func launchdPlistPath() (string, error) {
@@ -327,10 +327,7 @@ func installLaunchd(w io.Writer, exe string) error {
 		return err
 	}
 	stderrLog := daemon.StderrLogPath(logFile)
-	plist, err := renderLaunchdPlist(daemonServiceName, exe, stderrLog, xdgServiceEnv(logFile))
-	if err != nil {
-		return fmt.Errorf("render plist: %w", err)
-	}
+	plist := renderLaunchdPlist(daemonServiceName, exe, stderrLog, xdgServiceEnv(logFile))
 	if err := os.WriteFile(path, []byte(plist), 0o644); err != nil {
 		return fmt.Errorf("write plist: %w", err)
 	}
@@ -637,7 +634,7 @@ WantedBy=default.target
 
 // renderSystemdUnit fills systemdUnitTemplate, quoting Environment=
 // assignments that need it.
-func renderSystemdUnit(exe, logPath string, env []serviceEnvVar) (string, error) {
+func renderSystemdUnit(exe, logPath string, env []serviceEnvVar) string {
 	if path := servicePath(nil); path != "" {
 		env = append([]serviceEnvVar{{Key: "PATH", Value: path}}, env...)
 	}
@@ -649,7 +646,7 @@ func renderSystemdUnit(exe, logPath string, env []serviceEnvVar) (string, error)
 	// systemd expands % specifiers in StandardOutput= and StandardError=
 	// paths too, so escape them as systemdEnvValue does.
 	logPath = strings.ReplaceAll(logPath, "%", "%%")
-	return fmt.Sprintf(systemdUnitTemplate, exe, vars.String(), logPath, logPath), nil
+	return fmt.Sprintf(systemdUnitTemplate, exe, vars.String(), logPath, logPath)
 }
 
 func systemdUnitPath() (string, error) {
@@ -674,10 +671,7 @@ func installSystemd(w io.Writer, exe string) error {
 		return err
 	}
 	stderrLog := daemon.StderrLogPath(logFile)
-	unit, err := renderSystemdUnit(exe, stderrLog, xdgServiceEnv(logFile))
-	if err != nil {
-		return fmt.Errorf("render unit: %w", err)
-	}
+	unit := renderSystemdUnit(exe, stderrLog, xdgServiceEnv(logFile))
 	if err := os.WriteFile(path, []byte(unit), 0o644); err != nil {
 		return fmt.Errorf("write unit: %w", err)
 	}

@@ -110,8 +110,7 @@ func TestRenderLaunchdPlist_CapturesPATH(t *testing.T) {
 	custom := filepath.Join(t.TempDir(), "a&b", "100% tools")
 	t.Setenv("PATH", custom)
 	t.Setenv("GORTEX_DAEMON_HTTP_TOKEN", "must-not-be-captured")
-	out, err := renderLaunchdPlist("com.zzet.gortex", "/bin/gortex", "/log", nil)
-	require.NoError(t, err)
+	out := renderLaunchdPlist("com.zzet.gortex", "/bin/gortex", "/log", nil)
 
 	want := strings.ReplaceAll(custom, "&", "&amp;") + sep +
 		strings.Join([]string{"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"}, sep)
@@ -124,8 +123,7 @@ func TestRenderLaunchdPlist_CapturesPATH(t *testing.T) {
 
 func TestRenderLaunchdPlist_EmptyPATH(t *testing.T) {
 	t.Setenv("PATH", "")
-	out, err := renderLaunchdPlist("com.zzet.gortex", "/bin/gortex", "/log", nil)
-	require.NoError(t, err)
+	out := renderLaunchdPlist("com.zzet.gortex", "/bin/gortex", "/log", nil)
 
 	// This is exactly the old PATH on launchd's Unix host; adapt only the
 	// path-list separator when these render tests run on Windows.
@@ -142,8 +140,7 @@ func TestRenderSystemdUnit_CapturesPATH(t *testing.T) {
 	second := filepath.Join(root, "bin")
 	t.Setenv("PATH", first+sep+second)
 	t.Setenv("GORTEX_DAEMON_HTTP_TOKEN", "must-not-be-captured")
-	out, err := renderSystemdUnit("/bin/gortex", "/log", nil)
-	require.NoError(t, err)
+	out := renderSystemdUnit("/bin/gortex", "/log", nil)
 
 	// systemd quotes whitespace and escapes backslashes within a quoted
 	// value (relevant to this native fixture when tests run on Windows).
@@ -160,8 +157,7 @@ func TestRenderSystemdUnit_EmptyPATH(t *testing.T) {
 	for _, path := range []string{"", ".", string(os.PathListSeparator) + "relative/bin"} {
 		t.Run(path, func(t *testing.T) {
 			t.Setenv("PATH", path)
-			out, err := renderSystemdUnit("/bin/gortex", "/log", nil)
-			require.NoError(t, err)
+			out := renderSystemdUnit("/bin/gortex", "/log", nil)
 			assert.NotContains(t, out, "PATH=")
 		})
 	}
@@ -276,8 +272,7 @@ func TestRenderLaunchdPlist_DaemonLogOverride(t *testing.T) {
 	for _, value := range []string{"", "/custom/a&b/daemon.log"} {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("GORTEX_DAEMON_LOGFILE", value)
-			out, err := renderLaunchdPlist("com.zzet.gortex", "/bin/gortex", daemon.StderrLogFilePath(), xdgServiceEnv(daemon.LogFilePath()))
-			require.NoError(t, err)
+			out := renderLaunchdPlist("com.zzet.gortex", "/bin/gortex", daemon.StderrLogFilePath(), xdgServiceEnv(daemon.LogFilePath()))
 			assertWellFormedXML(t, out)
 			if value == "" {
 				assert.NotContains(t, out, "GORTEX_DAEMON_LOGFILE")
@@ -293,8 +288,7 @@ func TestRenderSystemdUnit_DaemonLogOverride(t *testing.T) {
 	for _, value := range []string{"", "/custom/100% logs/daemon.log"} {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("GORTEX_DAEMON_LOGFILE", value)
-			out, err := renderSystemdUnit("/bin/gortex", daemon.StderrLogFilePath(), xdgServiceEnv(daemon.LogFilePath()))
-			require.NoError(t, err)
+			out := renderSystemdUnit("/bin/gortex", daemon.StderrLogFilePath(), xdgServiceEnv(daemon.LogFilePath()))
 			if value == "" {
 				assert.NotContains(t, out, "GORTEX_DAEMON_LOGFILE")
 			} else {
