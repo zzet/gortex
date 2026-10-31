@@ -988,16 +988,14 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 			open = c.ctx.Err() == nil
 		}
 	}()
-	busy := c.idleDemand()
+	demand := c.idleDemand()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return false
 	}
 	now := c.now()
-	if busy {
-		c.lastDemand = now
-	}
+	c.noteDemandLocked(now, demand)
 	c.expireLocked(now)
 	wait := time.Duration(-1)
 	for _, a := range ring.actors {
@@ -1397,12 +1395,12 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 	}()
 	ctx, cancel := context.WithCancel(c.ctx)
 	defer cancel()
-	busy := c.linkedDemand(a)
+	demand := c.linkedDemand(a)
 	c.mu.Lock()
 	a.running.cancel = cancel
 	// Demand that returned while the job waited for the slot sends it back
 	// to wait before it captures anything.
-	again := c.linkedHeldAgainLocked(a, busy)
+	again := c.linkedHeldAgainLocked(a, demand)
 	c.mu.Unlock()
 	if again {
 		c.endLinkedDeferred(a, want, trigger, triggeredAt)
@@ -1698,9 +1696,9 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 
 	c.options.Logger.Info("contract cache borrow", zap.String("actor", a.id.String()), zap.Bool("cache_present", cached != nil), zap.Bool("complete", cacheComplete), zap.Int64("checkpoint_bytes", cacheBytes), zap.Int64("retained_bytes", retainedBytes), zap.Uint64("registry_evictions", registryEvictions), zap.Bool("interest_expired", interestExpired))
 
-	busy = c.linkedDemand(a)
+	demand = c.linkedDemand(a)
 	c.mu.Lock()
-	if c.linkedHeldAgainLocked(a, busy) {
+	if c.linkedHeldAgainLocked(a, demand) {
 		// Demand returned during the capture: no job body starts while a
 		// call is in flight. The borrowed cache goes back unchanged.
 		c.mu.Unlock()
@@ -1712,6 +1710,8 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 	}
 	c.setStateLocked(a, contractActorRunning)
 	c.countLinkedStartLocked(a, job)
+	// The job's yield looks for demand past what its start already saw.
+	job.demandSeq.Store(c.demandSeq)
 	c.mu.Unlock()
 	run := c.execute
 	if c.run != nil {

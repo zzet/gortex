@@ -13,12 +13,13 @@ import (
 // a primary actor, but its fills compete for CPU with the reads agents make
 // in that worktree. Its linked policy decides when its job may start:
 //
-//   - idle: only once Demand has reported nothing for the idle window. The
-//     dispatcher keeps a held actor in its queue, skipping it, so a primary
-//     actor behind it still starts; a held actor keeps no handoff source,
-//     reacquires its inputs when it starts and takes no queue capacity.
-//     Demand that returns between the pick and the job body sends the actor
-//     back to wait, uncounted as a start.
+//   - idle: only once Demand has shown no foreground work for the idle
+//     window: none in flight at a sample, and no tool call that started or
+//     ended since the one before. The dispatcher keeps a held actor in its
+//     queue, skipping it, so a primary actor behind it still starts; a held
+//     actor keeps no handoff source, reacquires its inputs when it starts and
+//     takes no queue capacity. Demand that returns between the pick and the
+//     job body sends the actor back to wait, uncounted as a start.
 //   - throttled: one linked job in flight, and one linked actor's starts at
 //     least the throttle interval apart. The idle window does not apply.
 //   - eager: as a primary actor.
@@ -42,24 +43,61 @@ const contractDemandPoll = 250 * time.Millisecond
 // job slot, leases and reservations; it still stops at its next checkpoint.
 const contractLinkedParkMax = 30 * time.Second
 
+// contractDemand is one sample of Demand; sampled is false where the idle
+// policy holds nothing, so nothing was asked.
+type contractDemand struct {
+	sampled, busy bool
+	seq           uint64
+}
+
 // linkedIdleApplies reports whether the idle policy governs a's jobs: a
 // linked actor whose inputs the scheduler can reacquire, with a demand
 // signal to wait on.
 func (c *ContractAnalysisCoordinator) linkedIdleApplies(a *contractActor) bool {
-	return !a.primary() && c.options.LinkedInputs != nil && c.options.Demand != nil && c.options.LinkedPolicy == ContractLinkedIdle
+	return !a.primary() && c.idlePolicyActs()
+}
+
+// idlePolicyActs reports whether the idle policy can hold any actor.
+func (c *ContractAnalysisCoordinator) idlePolicyActs() bool {
+	return c.options.LinkedInputs != nil && c.options.Demand != nil && c.options.LinkedPolicy == ContractLinkedIdle
+}
+
+// sampleDemand samples Demand. It runs outside c.mu: the signal reads edit
+// and tool state whose owners call into the scheduler under their own locks.
+func (c *ContractAnalysisCoordinator) sampleDemand() contractDemand {
+	busy, seq := c.options.Demand()
+	return contractDemand{sampled: true, busy: busy, seq: seq}
 }
 
 // idleDemand samples Demand for a dispatcher step when the idle policy can
-// hold anything. It runs outside c.mu: the signal reads edit and tool state
-// whose owners call into the scheduler under their own locks.
-func (c *ContractAnalysisCoordinator) idleDemand() bool {
-	return c.options.LinkedInputs != nil && c.options.Demand != nil && c.options.LinkedPolicy == ContractLinkedIdle && c.options.Demand()
+// hold anything.
+func (c *ContractAnalysisCoordinator) idleDemand() contractDemand {
+	if !c.idlePolicyActs() {
+		return contractDemand{}
+	}
+	return c.sampleDemand()
 }
 
-// linkedDemand samples Demand for a picked actor the idle policy governs,
-// outside c.mu.
-func (c *ContractAnalysisCoordinator) linkedDemand(a *contractActor) bool {
-	return c.linkedIdleApplies(a) && c.options.Demand()
+// linkedDemand samples Demand for a picked actor the idle policy governs.
+func (c *ContractAnalysisCoordinator) linkedDemand(a *contractActor) contractDemand {
+	if !c.linkedIdleApplies(a) {
+		return contractDemand{}
+	}
+	return c.sampleDemand()
+}
+
+// noteDemandLocked records a sample taken outside c.mu: work in flight, or a
+// tool call that started or ended since an earlier sample, closes the idle
+// window at now. Samples may arrive out of order; one older than the highest
+// sequence seen adds nothing.
+func (c *ContractAnalysisCoordinator) noteDemandLocked(now time.Time, demand contractDemand) {
+	if !demand.sampled {
+		return
+	}
+	if demand.busy || demand.seq > c.demandSeq {
+		c.lastDemand = now
+	}
+	c.demandSeq = max(c.demandSeq, demand.seq)
 }
 
 // linkedHoldLocked reports whether a's linked policy holds it at now, and
@@ -139,14 +177,12 @@ func (c *ContractAnalysisCoordinator) holdLocked(a *contractActor) *ContractCapt
 
 // linkedHeldAgainLocked re-checks a picked actor's idle hold with a demand
 // sample taken outside c.mu: true when demand returned since the pick.
-func (c *ContractAnalysisCoordinator) linkedHeldAgainLocked(a *contractActor, busy bool) bool {
-	if !c.linkedIdleApplies(a) {
+func (c *ContractAnalysisCoordinator) linkedHeldAgainLocked(a *contractActor, demand contractDemand) bool {
+	if !demand.sampled {
 		return false
 	}
 	now := c.now()
-	if busy {
-		c.lastDemand = now
-	}
+	c.noteDemandLocked(now, demand)
 	return c.linkedHeldLocked(a, now)
 }
 
@@ -195,9 +231,11 @@ func (c *ContractAnalysisCoordinator) linkJob(a *contractActor, job *contractAna
 }
 
 // linkedYield is the yield of a linked job the idle policy governs. With no
-// demand it returns at once. With demand it marks the job and parks, with
-// no progress slice, until demand ends, another actor waits for the slot,
-// the context ends, or the job has parked for contractLinkedParkMax in all.
+// demand since its last look it returns at once. A tool call that came and
+// went since then marks the job, which stops at its next checkpoint. Work in
+// flight marks it too, and parks it with no progress slice until the work
+// ends, another actor waits for the slot, the context ends, or the job has
+// parked for contractLinkedParkMax in all.
 func (c *ContractAnalysisCoordinator) linkedYield(a *contractActor, job *contractAnalysisJob) func(context.Context) error {
 	var parked atomic.Int64
 	return func(ctx context.Context) error {
@@ -207,7 +245,8 @@ func (c *ContractAnalysisCoordinator) linkedYield(a *contractActor, job *contrac
 		if c.strict(a) {
 			return c.options.Yield(ctx)
 		}
-		if !c.options.Demand() {
+		demand := c.sampleDemand()
+		if !job.noteDemand(demand) {
 			return nil
 		}
 		job.demandSeen.Store(true)
@@ -215,29 +254,43 @@ func (c *ContractAnalysisCoordinator) linkedYield(a *contractActor, job *contrac
 		defer func() { parked.Add(int64(c.now().Sub(start))) }()
 		poll := time.NewTicker(5 * time.Millisecond)
 		defer poll.Stop()
-		for busy := true; busy; busy = c.options.Demand() {
-			if c.linkedParkEnds(a, busy) || time.Duration(parked.Load())+c.now().Sub(start) >= contractLinkedParkMax {
-				break
+		for {
+			if c.linkedParkEnds(a, demand) || !demand.busy || time.Duration(parked.Load())+c.now().Sub(start) >= contractLinkedParkMax {
+				return ctx.Err()
 			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-poll.C:
 			}
+			demand = c.sampleDemand()
+			job.noteDemand(demand)
 		}
-		return ctx.Err()
 	}
 }
 
-// linkedParkEnds records a demand sample of a parked linked job and reports
-// whether another actor waits for its slot or a strict request arrived.
-func (c *ContractAnalysisCoordinator) linkedParkEnds(a *contractActor, busy bool) bool {
+// noteDemand records a demand sample of the job and reports whether it shows
+// demand the job has not seen: work in flight, or a sequence past the
+// highest it saw.
+func (job *contractAnalysisJob) noteDemand(demand contractDemand) bool {
+	for {
+		seen := job.demandSeq.Load()
+		if demand.seq <= seen {
+			return demand.busy
+		}
+		if job.demandSeq.CompareAndSwap(seen, demand.seq) {
+			return true
+		}
+	}
+}
+
+// linkedParkEnds records a demand sample of a linked job and reports whether
+// another actor waits for its slot or a strict request arrived.
+func (c *ContractAnalysisCoordinator) linkedParkEnds(a *contractActor, demand contractDemand) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
-	if busy {
-		c.lastDemand = now
-	}
+	c.noteDemandLocked(now, demand)
 	return now.Before(a.strictUntil) || c.otherActorWaitingLocked(a, now)
 }
 

@@ -74,9 +74,12 @@ type ContractAnalysisCoordinatorOptions struct {
 	// LinkedThrottleInterval is the least time between two job starts of
 	// one linked actor under the throttled policy; zero means 30 s.
 	LinkedThrottleInterval time.Duration
-	// Demand reports foreground work: active tool calls or a busy edit
-	// lane. It is sampled outside the scheduler's lock and must not wait.
-	Demand func() bool
+	// Demand reports foreground work: busy while a tool call is in flight
+	// or the edit lane is busy, and seq, a count that moves whenever a tool
+	// call starts or ends, so a call that came and went between two
+	// samples still counts. It is sampled outside the scheduler's lock and
+	// must not wait.
+	Demand func() (busy bool, seq uint64)
 }
 
 type contractAnalysisJob struct {
@@ -101,10 +104,11 @@ type contractAnalysisJob struct {
 	// for a primary actor; strict is set when a strict request started it.
 	// demandSeen is set once the job's yield met foreground demand;
 	// demandStop when its last checkpoint question was answered yes for
-	// demand alone.
+	// demand alone. demandSeq is the highest demand sequence the job saw.
 	linkedPolicy           ContractLinkedPolicy
 	strict                 bool
 	demandSeen, demandStop atomic.Bool
+	demandSeq              atomic.Uint64
 }
 
 // contractJobTriggerInterest queues a job for a request's interest in its key.
@@ -149,9 +153,11 @@ type ContractAnalysisCoordinator struct {
 	// unsettled, when set, asks the repair to scan a cohort a job could not
 	// settle its reads in.
 	unsettled func(repos []string)
-	// lastDemand is when Demand last reported foreground work, on the
-	// coordinator's clock: the idle window runs from it.
+	// lastDemand is when a Demand sample last showed foreground work, on
+	// the coordinator's clock: the idle window runs from it. demandSeq is
+	// the highest demand sequence a sample returned.
 	lastDemand time.Time
+	demandSeq  uint64
 }
 
 func NewContractAnalysisCoordinator(options ContractAnalysisCoordinatorOptions) (*ContractAnalysisCoordinator, error) {

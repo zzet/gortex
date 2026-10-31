@@ -15,13 +15,16 @@ import (
 )
 
 // linkedHoldProbe is a scheduler probe on a fake clock with a fake demand
-// signal. Its linked actors reacquire their inputs at the key they were
-// scheduled at, so a held actor that dropped its source still starts.
+// signal: busy is work in flight, calls the sequence that moves as a tool
+// call starts or ends. Its linked actors reacquire their inputs at the key
+// they were scheduled at, so a held actor that dropped its source still
+// starts.
 type linkedHoldProbe struct {
 	*schedulerProbe
 	base       time.Time
 	clock      atomic.Int64
 	busy       atomic.Bool
+	calls      atomic.Uint64
 	samples    atomic.Int64
 	sampled    chan struct{}
 	reacquired atomic.Int64
@@ -34,13 +37,13 @@ func newLinkedHoldProbe(t *testing.T, policy ContractLinkedPolicy, adjust func(*
 	h.schedulerProbe = newSchedulerProbe(t, func(options *ContractAnalysisCoordinatorOptions) {
 		options.Now = h.now
 		options.LinkedPolicy = policy
-		options.Demand = func() bool {
+		options.Demand = func() (bool, uint64) {
 			h.samples.Add(1)
 			select {
 			case h.sampled <- struct{}{}:
 			default:
 			}
-			return h.busy.Load()
+			return h.busy.Load(), h.calls.Load()
 		}
 		options.LinkedInputs = func(ctx context.Context, actor ContractActor, repo string) (*graphview.SelectedContractInputs, *ContractCaptureSource, error) {
 			h.reacquired.Add(1)
@@ -59,6 +62,9 @@ func newLinkedHoldProbe(t *testing.T, policy ContractLinkedPolicy, adjust func(*
 func (h *linkedHoldProbe) now() time.Time { return h.base.Add(time.Duration(h.clock.Load())) }
 
 func (h *linkedHoldProbe) advance(d time.Duration) { h.clock.Add(int64(d)) }
+
+// call is a tool call that starts and ends between two demand samples.
+func (h *linkedHoldProbe) call() { h.calls.Add(2) }
 
 func linkedProbeInputs(checkout string, repos []string, key string) *graphview.SelectedContractInputs {
 	inputs := schedulerInputs(repos, key)
@@ -221,6 +227,45 @@ func TestContractLinkedIdleDefersWhileBusyAndStartsAfterTheWindow(t *testing.T) 
 		require.True(t, h.held(first.Actor), "a renewed request is held again while busy")
 		require.Equal(t, deferred+1, linkedCounter(ContractLinkedIdle, viewmetrics.ContractLinkedDeferred))
 		require.Empty(t, h.started())
+	})
+}
+
+// TestContractLinkedIdleWindowSeesCallsBetweenSamples: the idle window runs
+// from the last foreground work the scheduler learned of, including tool
+// calls that started and ended between two of its demand samples, which no
+// sample finds in flight.
+func TestContractLinkedIdleWindowSeesCallsBetweenSamples(t *testing.T) {
+	t.Run("short_calls_keep_the_window_shut", func(t *testing.T) {
+		h := newLinkedHoldProbe(t, ContractLinkedIdle, nil)
+		h.busy.Store(true)
+		linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
+		h.settle("r")
+		h.busy.Store(false)
+		for range 3 {
+			h.call()
+			h.advance(4 * time.Second)
+			h.settle("r")
+			require.True(t, h.held(linked.Actor), "a call that came and went closed the window")
+		}
+		require.Empty(t, h.started())
+		h.advance(5 * time.Second)
+		h.settle("r")
+		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
+	})
+
+	t.Run("a_call_nothing_sampled", func(t *testing.T) {
+		h := newLinkedHoldProbe(t, ContractLinkedIdle, nil)
+		// A long quiet spell with no dispatcher awake to sample, then a
+		// call that came and went just before a linked request.
+		h.advance(time.Minute)
+		h.call()
+		linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
+		h.settle("r")
+		require.True(t, h.held(linked.Actor), "the window starts at the call, not at the last sample before it")
+		require.Empty(t, h.started())
+		h.advance(5 * time.Second)
+		h.settle("r")
+		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
 	})
 }
 
@@ -480,6 +525,27 @@ func TestContractLinkedIdleFillStopsAtCheckpointAndResumesWithProgress(t *testin
 		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
 		require.True(t, <-resumed, "the resumed fill starts from its retained checkpoint")
 		require.Equal(t, []string{contractJobTriggerInterest, contractJobTriggerRequeue}, h.triggered())
+	})
+
+	t.Run("a_call_between_yields_stops_the_fill", func(t *testing.T) {
+		h := newLinkedHoldProbe(t, ContractLinkedIdle, nil)
+		h.advance(5 * time.Second)
+		seen := make(chan [3]bool, 1)
+		h.c.run = func(job *contractAnalysisJob) string {
+			quiet := job.yield(context.Background()) == nil && !job.otherActorWaiting()
+			h.call()
+			// Nothing is in flight: the yield returns at once, and the fill
+			// stops at its next checkpoint.
+			returned := job.yield(context.Background()) == nil
+			seen <- [3]bool{quiet, returned, job.otherActorWaiting()}
+			return h.run(job)
+		}
+		linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
+		require.Equal(t, [3]bool{true, true, true}, <-seen)
+		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
+		next := h.scheduleLinked(t.Context(), "wt", "r", "k2", false)
+		h.settle("r")
+		require.True(t, h.held(next.Actor), "the call closed the idle window")
 	})
 
 	t.Run("park_is_bounded", func(t *testing.T) {

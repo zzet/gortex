@@ -412,7 +412,7 @@ func TestOptionalWorktreeContractReadUnderIdlePolicyNeverBlocks(t *testing.T) {
 			}
 			moveConsumerInput(t, f, "base-moved")
 			c, err := indexer.NewContractAnalysisCoordinator(indexer.ContractAnalysisCoordinatorOptions{Store: f.store, Leases: f.srv.materializer.Leases, Registry: testRegistry(), Config: config.Default().Index, Yield: func(ctx context.Context) error { return ctx.Err() },
-				LinkedPolicy: indexer.ContractLinkedIdle, Demand: func() bool { return true },
+				LinkedPolicy: indexer.ContractLinkedIdle, Demand: func() (bool, uint64) { return true, 0 },
 				Capture: func(context.Context, *indexer.ContractCaptureSource, *graphview.SelectedContractInputs, string, string) (indexer.ContractFollowupSnapshot, []indexer.ContractFollowupTarget, error) {
 					t.Error("a held linked fill captured its inputs")
 					return indexer.ContractFollowupSnapshot{}, nil, errors.New("captured")

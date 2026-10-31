@@ -72,10 +72,11 @@ func installDaemonContractAnalysisWith(state *daemonState, logger *zap.Logger, a
 	options := indexer.ContractAnalysisCoordinatorOptions{MemoryLimitBytes: debug.SetMemoryLimit(-1), RequireRepoConfigs: true, Store: store, Leases: materializer.Leases, Registry: state.indexer.Registry(), Config: cfg, Logger: logger, Capture: indexer.NewContractFollowupSourceCapture(captureOptions), Inputs: indexer.NewContractPrimaryInputCapture(materializer), LinkedInputs: indexer.NewContractLinkedInputCapture(materializer), ReconcileBaseline: indexer.NewContractBaselineReconciler(captureOptions), Yield: contractAnalysisYield(state.mcpServer.ContractAnalysisShouldYield)}
 	options.RetireReservation = state.lifecycle.DeferContractReservationRetirement
 	// Linked worktrees' fills follow the configured policy; the demand
-	// signal is the same foreground work the shared yield gives way to.
+	// signal is the same foreground work the shared yield gives way to,
+	// plus the tool calls that came and went between two samples.
 	linked := contractLinkedSchedule(state.contractAnalysis, os.Getenv, logger)
 	options.LinkedPolicy, options.LinkedIdleWindow, options.LinkedThrottleInterval = linked.Policy, linked.IdleWindow, linked.ThrottleInterval
-	options.Demand = state.mcpServer.ContractAnalysisShouldYield
+	options.Demand = state.mcpServer.ContractAnalysisDemand
 	if adjust != nil {
 		adjust(&options)
 	}
