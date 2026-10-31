@@ -405,7 +405,7 @@ BEGIN SELECT RAISE(ABORT, 'injected drain FTS error'); END`)
 func TestFirstIndexFailureRestoresStore(t *testing.T) {
 	for _, mode := range []string{
 		"drain error", "cancel before drain", "panic in body", "panic in drain",
-		"storage full", "seal panic", "seal error",
+		"storage full", "seal panic", "seal panic after a drain panic", "seal error",
 	} {
 		t.Run(mode, func(t *testing.T) {
 			store, db := newFirstIndexStore(t)
@@ -428,7 +428,7 @@ func TestFirstIndexFailureRestoresStore(t *testing.T) {
 			defer store.SetBulkSealHookForTest(func(index string) error {
 				seals++
 				switch {
-				case mode == "seal panic" && seals == 1:
+				case (mode == "seal panic" || mode == "seal panic after a drain panic") && seals == 1:
 					panic("injected seal panic")
 				case mode == "seal error" && index == "nodes_by_kind":
 					return errors.New("injected seal failure")
@@ -440,7 +440,7 @@ func TestFirstIndexFailureRestoresStore(t *testing.T) {
 			switch mode {
 			case "drain error":
 				firstIndexDrainFTSTrigger(t, store)
-			case "panic in drain":
+			case "panic in drain", "seal panic after a drain panic":
 				fault = func() error { panic("injected drain panic") }
 			case "storage full":
 				full := sqliteFullError(t)
@@ -468,6 +468,11 @@ func TestFirstIndexFailureRestoresStore(t *testing.T) {
 				assert.Greater(t, seals, 1, "the backstop did not retry the panicked flush")
 				assert.Positive(t, idx.indexMemoryAdmission.snapshot().peak, "fixture must acquire the memory lease")
 				assert.Zero(t, idx.indexMemoryAdmission.snapshot().used, "earlier defers must release the memory lease")
+			case "seal panic after a drain panic":
+				// The flush the drain panic's unwind runs panics too; it is
+				// retried the same way, and the later panic reaches the caller.
+				require.PanicsWithValue(t, "injected seal panic", func() { _, _ = idx.IndexCtx(ctx, dir) })
+				assert.Greater(t, seals, 1, "the backstop did not retry the panicked flush")
 			case "cancel before drain":
 				_, err := idx.IndexCtx(ctx, dir)
 				require.ErrorIs(t, err, context.Canceled)

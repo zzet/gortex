@@ -3471,21 +3471,26 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			bulkFlushPending := true
 			bulkFlushInProgress := false
 			defer func() {
-				if !bulkFlushPending {
-					return
-				}
-				if !bulkFlushInProgress {
-					if err := bl.FlushBulk(); err != nil && retErr == nil {
-						retErr = fmt.Errorf("indexer: persist bulk graph: %w", err)
-					}
-					return
-				}
-				// The explicit FlushBulk below panicked. The store releases its
-				// write gate on every exit and keeps a window whose seal did not
-				// finish retryable, so one more flush closes it (restoring
+				// A FlushBulk panicked: the explicit one below, or the one the
+				// next defer runs while a drain panic unwinds. The store releases
+				// its write gate on every exit and keeps a window whose seal did
+				// not finish retryable, so one more flush closes it (restoring
 				// durability, or recording the indexes it could not rebuild)
 				// instead of leaving a pinned synchronous=OFF writer behind.
-				retryBulkFlushAfterPanic(bl, idx.logger, idx.RepoPrefix())
+				if bulkFlushPending && bulkFlushInProgress {
+					retryBulkFlushAfterPanic(bl, idx.logger, idx.RepoPrefix())
+				}
+			}()
+			defer func() {
+				if !bulkFlushPending || bulkFlushInProgress {
+					return
+				}
+				bulkFlushInProgress = true
+				err := bl.FlushBulk()
+				bulkFlushPending = false
+				if err != nil && retErr == nil {
+					retErr = fmt.Errorf("indexer: persist bulk graph: %w", err)
+				}
 			}()
 			// Transfer the shadow in explicit row/byte-capped batches. The
 			// process-wide shadow admission caps all live shadows at 1 GiB; these
