@@ -141,6 +141,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"FilteredContainingNameReader", capOf[graph.FilteredContainingNameReader], capWrapper, "conditional variant"},
 		{"ScopedNodeProjectionSequencer", capOf[graph.ScopedNodeProjectionSequencer], capWrapper, "conditional variant"},
 		{"ScopedKindSummarySequencer", capOf[graph.ScopedKindSummarySequencer], capWrapper, "conditional variant"},
+		{"ScopedFileLocationSequencer", capOf[graph.ScopedFileLocationSequencer], capWrapper, "rides on the conditional summary variant"},
 		{"ReadContextBinder", capOf[graph.ReadContextBinder], capWrapper, "binds the selected reader and wraps it again"},
 		{"local:GetNodeContext", capOf[capNodeContext], capWrapper, "checked forwarder"},
 		{"local:GetNodesByIDsContext", capOf[capNodesByIDsContext], capWrapper, "checked forwarder"},

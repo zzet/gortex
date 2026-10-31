@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"encoding/json"
 	"iter"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -99,6 +100,74 @@ func (s *Store) NodesLightByKindsInScopeSeq(repoPrefixes, filePaths []string, ki
 			}
 		}
 	}
+}
+
+// fileLocationCensusCap bounds the rows one file-location read holds in
+// memory. nodes_repo_files walks repository, workspace, language and path, so
+// its rows are sorted into ID order after the cursor closes; a larger census
+// keeps the paged summary cursor instead. A variable so tests can lower it.
+var fileLocationCensusCap = 1 << 16
+
+// fileLocationProjectionSQL reads file locations from the covering partial
+// index alone. The kind is a literal so the planner can prove the index's
+// predicate. The index key plus the WITHOUT ROWID primary key (id, view_gen)
+// supply every selected column and the generation, so no wide nodes row (and
+// none of its overflow pages) is read. Without the index the statement fails
+// to prepare and the caller falls back.
+const fileLocationProjectionSQL = `SELECT n.id, n.file_path, n.language, n.repo_prefix, n.workspace_id` +
+	` FROM nodes AS n INDEXED BY nodes_repo_files` +
+	` WHERE n.kind = 'file' AND n.repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))` +
+	` AND n.view_gen = ? LIMIT ?`
+
+// FileLocationsInScopeSeq yields the rows NodesLightByKindsInScopeSeq would
+// for KindFile, in the same ascending ID order, with only the location
+// columns populated. One statement serves the whole census and its cursor is
+// closed before the first yield. A census above fileLocationCensusCap, or a
+// read the covering index cannot serve, falls back to the summary cursor.
+func (s *Store) FileLocationsInScopeSeq(repoPrefixes []string) iter.Seq[*graph.Node] {
+	return func(yield func(*graph.Node) bool) {
+		nodes, ok := s.readFileLocations(repoPrefixes)
+		if !ok {
+			s.NodesLightByKindsInScopeSeq(repoPrefixes, nil, graph.KindFile)(yield)
+			return
+		}
+		for _, node := range nodes {
+			if !yield(node) {
+				return
+			}
+		}
+	}
+}
+
+// readFileLocations reports false when the census must come from the summary
+// cursor: the statement failed, or more than fileLocationCensusCap rows match.
+func (s *Store) readFileLocations(repoPrefixes []string) ([]*graph.Node, bool) {
+	reposJSON, ok := projectionJSON(repoPrefixes)
+	if !ok {
+		return nil, true
+	}
+	limit := fileLocationCensusCap
+	rows, err := s.db.Query(fileLocationProjectionSQL, reposJSON, s.viewGen, limit+1)
+	if err != nil {
+		return nil, false
+	}
+	nodes := make([]*graph.Node, 0, 64)
+	for rows.Next() {
+		node := &graph.Node{Kind: graph.KindFile}
+		if err := rows.Scan(&node.ID, &node.FilePath, &node.Language, &node.RepoPrefix, &node.WorkspaceID); err != nil {
+			_ = rows.Close()
+			return nil, false
+		}
+		nodes = append(nodes, node)
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil || len(nodes) > limit {
+		return nil, false
+	}
+	// strings.Compare is SQLite's BINARY collation, the summary cursor's order.
+	slices.SortFunc(nodes, func(a, b *graph.Node) int { return strings.Compare(a.ID, b.ID) })
+	return nodes, true
 }
 
 // streamScopedNodes drains one node cursor page by page. It reports false when
@@ -488,3 +557,4 @@ func (s *Store) scopedEdgeFileProvenanceCanonical(
 
 var _ graph.ScopedProjectionSequencer = (*Store)(nil)
 var _ graph.ScopedKindSummarySequencer = (*Store)(nil)
+var _ graph.ScopedFileLocationSequencer = (*Store)(nil)

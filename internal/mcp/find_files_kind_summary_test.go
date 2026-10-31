@@ -136,6 +136,7 @@ func TestContractCoreKindSummaryCapabilityStaysConditional(t *testing.T) {
 	for _, selected := range []graph.Reader{base, filtered, bounded, store} {
 		reader := newContractCoreEdges(selected, context.Background(), nil)
 		require.Implements(t, (*graph.ScopedKindSummarySequencer)(nil), reader)
+		require.Implements(t, (*graph.ScopedFileLocationSequencer)(nil), reader, "file locations ride on the summary capability")
 		require.Implements(t, (*graph.ScopedNodeProjectionSequencer)(nil), reader)
 		_, wantFiltered := selected.(graph.FilteredContainingNameReader)
 		_, gotFiltered := reader.(graph.FilteredContainingNameReader)
@@ -149,6 +150,8 @@ func TestContractCoreKindSummaryCapabilityStaysConditional(t *testing.T) {
 	hidden := newContractCoreEdges(findFilesFullProjectionStore{Store: store, selected: store}, context.Background(), nil)
 	_, summary := hidden.(graph.ScopedKindSummarySequencer)
 	require.False(t, summary)
+	_, locations := hidden.(graph.ScopedFileLocationSequencer)
+	require.False(t, locations, "no summary capability, no file locations")
 	// DeltaWriter now composes compact summaries. The optional capability must
 	// retain its selected full-row fallback and both live-layer deletion masks
 	// and additions, without exposing physical edge traversal through the wrapper.
@@ -158,6 +161,19 @@ func TestContractCoreKindSummaryCapabilityStaysConditional(t *testing.T) {
 		{ID: "b/foreign.go", Kind: graph.KindFile, FilePath: "b/foreign.go", RepoPrefix: "b", Language: "go"},
 		{ID: "a/kept.go::fn", Kind: graph.KindFunction, FilePath: "a/kept.go", RepoPrefix: "a"},
 	}, nil))
+	locationIDs := func(reader graph.Reader) []string {
+		t.Helper()
+		locations, ok := reader.(graph.ScopedFileLocationSequencer)
+		require.True(t, ok)
+		var got []string
+		for node := range locations.FileLocationsInScopeSeq([]string{"a"}) {
+			got = append(got, node.ID+"|"+node.Language)
+		}
+		return got
+	}
+	// A selected summary reader without its own location read serves the
+	// wrapper's file locations from its summary rows.
+	require.Equal(t, []string{"a/kept.go|go", "a/removed.go|go"}, locationIDs(newContractCoreEdges(base, context.Background(), nil)))
 	fullOnly := struct {
 		graph.Reader
 		graph.ScopedProjectionSequencer
@@ -174,6 +190,9 @@ func TestContractCoreKindSummaryCapabilityStaysConditional(t *testing.T) {
 			got = append(got, node.ID+"|"+node.Language)
 		}
 		require.Equal(t, []string{"a/added.go|python", "a/kept.go|go"}, got)
+		_, physical := any(delta).(graph.ScopedFileLocationSequencer)
+		require.False(t, physical, "a masking delta never offers the physical location read")
+		require.Equal(t, got, locationIDs(wrapped), "wrapped file locations keep the delta's masks and additions")
 		_, edges := wrapped.(graph.ScopedProjectionSequencer)
 		require.False(t, edges, "composed summaries must not expose physical edge traversal")
 	}
