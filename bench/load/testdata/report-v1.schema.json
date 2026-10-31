@@ -1969,6 +1969,9 @@
                               "bootstrap_resamples": {
                                 "type": "integer"
                               },
+                              "censored": {
+                                "type": "integer"
+                              },
                               "count": {
                                 "type": "integer"
                               },
@@ -1999,7 +2002,7 @@
                                 ],
                                 "type": "object"
                               },
-                              "missing": {
+                              "not_applicable": {
                                 "type": "integer"
                               },
                               "p50": {
@@ -2278,7 +2281,8 @@
                             },
                             "required": [
                               "count",
-                              "missing",
+                              "censored",
+                              "not_applicable",
                               "p50",
                               "p95",
                               "p99",
@@ -2355,6 +2359,9 @@
                                 "bootstrap_resamples": {
                                   "type": "integer"
                                 },
+                                "censored": {
+                                  "type": "integer"
+                                },
                                 "count": {
                                   "type": "integer"
                                 },
@@ -2385,7 +2392,7 @@
                                   ],
                                   "type": "object"
                                 },
-                                "missing": {
+                                "not_applicable": {
                                   "type": "integer"
                                 },
                                 "p50": {
@@ -2664,7 +2671,8 @@
                               },
                               "required": [
                                 "count",
-                                "missing",
+                                "censored",
+                                "not_applicable",
                                 "p50",
                                 "p95",
                                 "p99",

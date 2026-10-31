@@ -81,14 +81,16 @@ func (r *editProbeRuntime) recordRead(operation, class string, rows []Attempt) {
 	r.mu.Unlock()
 }
 
-// Only successful calls enter a latency sample; busy, failed and censored
-// calls stay counted beside it, never as a zero latency.
+// Only successful calls enter a latency sample. A call cut off by its
+// deadline or the run end is censored in the latency ranking; busy and failed
+// calls have no latency. None is ever a zero latency.
 func summarizeEditProbeReads(reads []editProbeRead, seed int64) editProbeReads {
 	if len(reads) == 0 {
 		return nil
 	}
 	type cell struct{ operation, class string }
 	samples := map[cell][]float64{}
+	expired := map[cell]int{}
 	stats := map[cell]*editProbeReadStats{}
 	for _, read := range reads {
 		key := cell{read.operation, read.class}
@@ -104,13 +106,17 @@ func summarizeEditProbeReads(reads []editProbeRead, seed int64) editProbeReads {
 			s.Busy++
 		case "phase_censored":
 			s.Censored++
+		case "product_deadline":
+			s.Errors++
+			expired[key]++
 		default:
 			s.Errors++
 		}
 	}
 	out := editProbeReads{}
 	for key, s := range stats {
-		s.Latency = editProbeQuantilesOf(samples[key], s.Calls-len(samples[key]), "ms", seed, "reads."+key.operation+"."+key.class)
+		censored := s.Censored + expired[key]
+		s.Latency = editProbeQuantilesOf(samples[key], censored, s.Calls-len(samples[key])-censored, "ms", seed, "reads."+key.operation+"."+key.class)
 		if out[key.operation] == nil {
 			out[key.operation] = map[string]editProbeReadStats{}
 		}

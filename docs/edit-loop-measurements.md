@@ -634,7 +634,10 @@ coalesced receipt (derived in the serving publication's timeline) leaves it
 unavailable. Its `phases_ms` copy keeps each producer null as unavailable with
 the producer's phase state, and a build without `phases_ms` (an older baseline)
 reports every lap unavailable rather than zero. Quantiles use nearest rank with
-seeded percentile-bootstrap intervals over the complete offered denominator.
+seeded percentile-bootstrap intervals over the complete offered denominator: a
+record that ended before its value was observed ranks above every observed
+value, so a tail quantile that falls among such records is unavailable rather
+than understated.
 
 Probes can also run as compact text or through `gortex call`. Compact rows
 carry no IDs, edge rows or freshness fields, so they prove only a call

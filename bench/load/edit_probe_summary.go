@@ -90,20 +90,24 @@ type editProbeInterval struct {
 	High Metric `json:"high"`
 }
 
-// Nearest-rank quantiles (the same rule as Distribution) over the observed
-// values, each with a seeded percentile-bootstrap 95% interval. Offered
-// records without a value are counted as missing, never sampled as zero.
+// Nearest-rank quantiles (the same rule as Distribution), each with a seeded
+// percentile-bootstrap 95% interval. A censored record ended (deadline, run
+// end or failure) before its value was observed: it ranks above every
+// observed value, so a quantile whose rank falls among censored records is
+// unavailable rather than understated. A not-applicable record cannot carry
+// the value. Neither is ever sampled as zero.
 type editProbeQuantiles struct {
-	Count     int               `json:"count"`
-	Missing   int               `json:"missing"`
-	P50       Metric            `json:"p50"`
-	P95       Metric            `json:"p95"`
-	P99       Metric            `json:"p99"`
-	Max       Metric            `json:"max"`
-	P50CI     editProbeInterval `json:"p50_ci95"`
-	P95CI     editProbeInterval `json:"p95_ci95"`
-	P99CI     editProbeInterval `json:"p99_ci95"`
-	Resamples int               `json:"bootstrap_resamples"`
+	Count         int               `json:"count"`
+	Censored      int               `json:"censored"`
+	NotApplicable int               `json:"not_applicable"`
+	P50           Metric            `json:"p50"`
+	P95           Metric            `json:"p95"`
+	P99           Metric            `json:"p99"`
+	Max           Metric            `json:"max"`
+	P50CI         editProbeInterval `json:"p50_ci95"`
+	P95CI         editProbeInterval `json:"p95_ci95"`
+	P99CI         editProbeInterval `json:"p99_ci95"`
+	Resamples     int               `json:"bootstrap_resamples"`
 }
 
 type editProbeSummary struct {
@@ -116,17 +120,26 @@ func editProbeRank(q float64, n int) int { return max(0, int(math.Ceil(q*float64
 
 // The resampling stream depends only on the plan seed and the measure name, so
 // a report is reproducible and one measure's interval cannot shift another's.
-// A quantile needs at least ceil(1/(1-q)) observations before its nearest rank
-// falls below the sample maximum; with fewer its interval is unavailable.
-func editProbeQuantilesOf(values []float64, missing int, unit string, seed int64, measure string) editProbeQuantiles {
-	d := distribution(values, unit)
-	out := editProbeQuantiles{Count: d.Count, Missing: missing, P50: d.P50, P95: d.P95, P99: d.P99, Max: d.Max}
+// Censored records join the ranking as +Inf. A quantile needs at least
+// ceil(1/(1-q)) ranked records before its nearest rank falls below the sample
+// maximum; with fewer its interval is unavailable.
+func editProbeQuantilesOf(values []float64, censored, notApplicable int, unit string, seed int64, measure string) editProbeQuantiles {
+	ranked := append(slices.Clone(values), slices.Repeat([]float64{math.Inf(1)}, censored)...)
+	beyond := unavailable(unit, fmt.Sprintf("nearest rank falls among %d censored records", censored))
+	bounded := func(m Metric) Metric {
+		if m.Value != nil && math.IsInf(*m.Value, 1) {
+			return beyond
+		}
+		return m
+	}
+	d := distribution(ranked, unit)
+	out := editProbeQuantiles{Count: len(values), Censored: censored, NotApplicable: notApplicable, P50: bounded(d.P50), P95: bounded(d.P95), P99: bounded(d.P99), Max: bounded(d.Max)}
 	quantiles := []float64{.50, .95, .99}
 	minimum := []int{2, 20, 100} // ceil(1/(1-q))
 	intervals := []*editProbeInterval{&out.P50CI, &out.P95CI, &out.P99CI}
 	estimates := make([][]float64, len(quantiles))
 	for i := range quantiles {
-		if len(values) < minimum[i] {
+		if len(ranked) < minimum[i] {
 			reason := fmt.Sprintf("bootstrap interval needs at least %d observations", minimum[i])
 			*intervals[i] = editProbeInterval{Low: unavailable(unit, reason), High: unavailable(unit, reason)}
 			continue
@@ -139,10 +152,10 @@ func editProbeQuantilesOf(values []float64, missing int, unit string, seed int64
 	hash := fnv.New64a()
 	_, _ = hash.Write([]byte(measure))
 	rng := rand.New(rand.NewPCG(uint64(seed), hash.Sum64()))
-	sample := make([]float64, len(values))
+	sample := make([]float64, len(ranked))
 	for range editProbeBootstrapResamples {
 		for i := range sample {
-			sample[i] = values[rng.IntN(len(values))]
+			sample[i] = ranked[rng.IntN(len(ranked))]
 		}
 		slices.Sort(sample)
 		for i, q := range quantiles {
@@ -156,26 +169,39 @@ func editProbeQuantilesOf(values []float64, missing int, unit string, seed int64
 			continue
 		}
 		slices.Sort(estimates[i])
-		*intervals[i] = editProbeInterval{Low: measured(estimates[i][editProbeRank(.025, len(estimates[i]))], unit), High: measured(estimates[i][editProbeRank(.975, len(estimates[i]))], unit)}
+		*intervals[i] = editProbeInterval{Low: bounded(measured(estimates[i][editProbeRank(.025, len(estimates[i]))], unit)), High: bounded(measured(estimates[i][editProbeRank(.975, len(estimates[i]))], unit))}
 	}
 	out.Resamples = editProbeBootstrapResamples
 	return out
 }
 
-// One summary over the complete offered denominator. Every per-record time
-// the report defines is a measure; a record without its value is missing.
+// One summary over the complete offered denominator. A completed record lacks
+// only values that do not apply to it (a native write's ACK, a coalesced
+// receipt's derived time); any other record ended before its missing values
+// were observed, so they are censored. A measure a record does not carry at
+// all is not applicable to it.
 func summarizeEditProbe(records []editProbeRecord, seed int64) *editProbeSummary {
 	out := &editProbeSummary{Offered: len(records), Outcomes: map[string]int{}, Measures: map[string]editProbeQuantiles{}}
-	values := map[string][]float64{}
-	add := func(name string, metric Metric) {
-		if metric.Value != nil {
-			values[name] = append(values[name], *metric.Value)
-		} else if _, known := values[name]; !known {
-			values[name] = nil
-		}
+	type measure struct {
+		observed []float64
+		censored int
 	}
+	values := map[string]*measure{}
 	for _, record := range records {
 		out.Outcomes[record.Outcome]++
+		add := func(name string, metric Metric) {
+			m := values[name]
+			if m == nil {
+				m = &measure{}
+				values[name] = m
+			}
+			switch {
+			case metric.Value != nil:
+				m.observed = append(m.observed, *metric.Value)
+			case record.Outcome != "complete":
+				m.censored++
+			}
+		}
 		add("t_ack_ms", record.Ack)
 		add("t_readback_ms", record.Readback)
 		add("t_file_graph_ms", record.FileGraph)
@@ -192,8 +218,8 @@ func summarizeEditProbe(records []editProbeRecord, seed int64) *editProbeSummary
 			add("first_correct_ms."+name, metric)
 		}
 	}
-	for name, observed := range values {
-		out.Measures[name] = editProbeQuantilesOf(observed, len(records)-len(observed), "ms", seed, name)
+	for name, m := range values {
+		out.Measures[name] = editProbeQuantilesOf(m.observed, m.censored, len(records)-len(m.observed)-m.censored, "ms", seed, name)
 	}
 	return out
 }

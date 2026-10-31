@@ -71,7 +71,9 @@ func TestEditProbeReadsClassifyByPendingEditsAndNeverSampleFailures(t *testing.T
 	}
 	summary := summarizeEditProbeReads(reads, 1)
 	under := summary["read.summary"]["under_edit"]
-	if under.Calls != 5 || under.Busy != 1 || under.Censored != 1 || under.Errors != 1 || under.Latency.Count != 2 || under.Latency.Missing != 3 || *under.Latency.P50.Value != 5 {
+	// Deadline and run-end cuts rank above both successes; the busy read has
+	// no latency at all.
+	if under.Calls != 5 || under.Busy != 1 || under.Censored != 1 || under.Errors != 1 || under.Latency.Count != 2 || under.Latency.Censored != 2 || under.Latency.NotApplicable != 1 || *under.Latency.P50.Value != 7 || under.Latency.P95.Value != nil {
 		t.Fatalf("failed reads entered the latency sample: %+v", under)
 	}
 	if baseline := summary["read.summary"]["no_edit_baseline"]; baseline.Calls != 1 || *baseline.Latency.Max.Value != 3 {

@@ -339,9 +339,14 @@ The report `summary` covers the complete offered denominator: outcome counts
 and, for every per-record time, each readback, each `phases_ms` lap and each
 oracle's first-correct time, nearest-rank p50/p95/p99/max with percentile
 bootstrap 95% intervals (2000 resamples, seeded from the plan seed and the
-measure name). An interval needs at least 2, 20 or 100 observations for p50,
-p95 or p99 and is unavailable below that. Records without a value are counted
-as `missing`, never sampled as zero.
+measure name). A value missing from a record that did not complete (deadline,
+run end or failure) is `censored`: the record ranks above every observed value,
+so a quantile or interval bound whose nearest rank falls among censored records
+is unavailable rather than understated. A value missing from a completed record
+(a native write's ACK, a coalesced receipt's derived time), or a measure the
+record does not carry, is `not_applicable`. An interval needs at least 2, 20 or
+100 ranked records for p50, p95 or p99 and is unavailable below that. Nothing is
+sampled as zero.
 
 `--agents R` (0 to 32) adds pure readers on their own sessions, running the
 ordinary reading plan with agent pacing. With readers, the phase opens with a
@@ -353,7 +358,9 @@ collection) is still running, otherwise `between_edits`. An edit sent while a
 read is in flight does not reclass it, so a read can straddle an edit's start
 by up to its own latency. The report's `reads` table gives, per operation and
 class, calls, busy refusals, errors, censored calls and the latency quantiles
-of successful calls only. Paired runs refuse readers.
+of successful calls, in which calls cut off by their deadline or the run end
+rank as censored; busy and failed calls are not applicable. Paired runs refuse
+readers.
 
 The report retains raw call identities, independent ACK/physical/requested
 background accounting, and missing evidence. RPC return timestamps delimit
