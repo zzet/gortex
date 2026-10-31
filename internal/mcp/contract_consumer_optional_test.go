@@ -8,11 +8,13 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/review"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 func prepareOptionalForTest(t *testing.T, ctx context.Context, f *contractConsumerFixture, exact bool) context.Context {
@@ -388,4 +390,74 @@ func TestOptionalContractMiddlewareAbsentAttachmentStillAllowsDefaultCoreAnswer(
 	require.Contains(t, viewResultText(t, result), "no_attachment")
 	require.Equal(t, int64(1), fake.schedules.Load())
 	require.Zero(t, fake.waits.Load())
+}
+
+// TestOptionalWorktreeContractReadUnderIdlePolicyNeverBlocks: under the idle
+// linked policy, with the daemon busy throughout, an optional read in a
+// linked worktree whose contract inputs moved schedules the worktree's fill
+// once and answers at once: from the cohort published earlier while the
+// fill waits, or as missing when there is none. The read never waits on the
+// producer, and the held fill neither runs nor keeps the view's lease.
+func TestOptionalWorktreeContractReadUnderIdlePolicyNeverBlocks(t *testing.T) {
+	for _, predecessor := range []bool{true, false} {
+		name := "predecessor"
+		if !predecessor {
+			name = "no_attachment"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newContractConsumerFixture(t)
+			selected := recoveryLinkedView(t, f)
+			if predecessor {
+				f.publish(t, selected, viewTestWorktree, "/linked-old")
+			}
+			moveConsumerInput(t, f, "base-moved")
+			c, err := indexer.NewContractAnalysisCoordinator(indexer.ContractAnalysisCoordinatorOptions{Store: f.store, Leases: f.srv.materializer.Leases, Registry: testRegistry(), Config: config.Default().Index, Yield: func(ctx context.Context) error { return ctx.Err() },
+				LinkedPolicy: indexer.ContractLinkedIdle, Demand: func() bool { return true },
+				Capture: func(context.Context, *indexer.ContractCaptureSource, *graphview.SelectedContractInputs, string, string) (indexer.ContractFollowupSnapshot, []indexer.ContractFollowupTarget, error) {
+					t.Error("a held linked fill captured its inputs")
+					return indexer.ContractFollowupSnapshot{}, nil, errors.New("captured")
+				},
+				LinkedInputs: func(context.Context, indexer.ContractActor, string) (*graphview.SelectedContractInputs, *indexer.ContractCaptureSource, error) {
+					t.Error("a held linked fill reacquired its inputs")
+					return nil, nil, errors.New("reacquired")
+				}})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, c.Close()) })
+			fake := &contractRuntimeFake{t: t, schedule: c.Schedule, acquire: c.AcquireLastPublishedCohort}
+			runtime := fake.runtime()
+			runtime.WaitCapacity = func(context.Context, uint64) error { t.Fatal("optional contract read waited for capacity"); return nil }
+			runtime.WaitInputs = func(context.Context, uint64) error { t.Fatal("optional contract read waited for inputs"); return nil }
+			f.srv.SetContractAnalysisRuntime(runtime)
+			deferredKey := "views_contract_linked_jobs_total{policy=idle,event=deferred}"
+			deferred := viewmetrics.Read().Counters[deferredKey]
+			leases := f.srv.materializer.Leases.Held()
+
+			ctx := withRequestView(t.Context(), &requestView{materialized: selected, rider: &graphview.ViewRider{CheckoutID: viewTestWorktree}})
+			ctx = prepareOptionalForTest(t, ctx, f, false)
+			binding := contractAnalysisFromContext(ctx)
+			reg := f.srv.optionalContractRegistryForContext(ctx)
+			status := contractConsumerStatusFromContext(ctx)
+			require.True(t, status.consulted)
+			require.False(t, status.fresh)
+			if predecessor {
+				require.NotNil(t, reg)
+				require.NotEmpty(t, reg.ByID("http::GET::/linked-old"), "the earlier cohort serves while the fill waits")
+				require.Equal(t, graphview.StateBuilding, status.state)
+				require.Equal(t, "contract_analysis_pending", status.reason)
+				require.Equal(t, "contract analysis is from an earlier input", optionalContractWarning(status))
+			} else {
+				require.Nil(t, reg)
+				require.Equal(t, graphview.StateIncomplete, status.state)
+				require.Equal(t, "no_attachment", status.reason)
+			}
+			require.Equal(t, int64(1), fake.schedules.Load())
+			require.Zero(t, fake.waits.Load())
+
+			actor := indexer.NewContractActor(viewTestWorktree, []string{"b", "repo"})
+			require.Eventually(t, func() bool { return viewmetrics.Read().Counters[deferredKey] == deferred+1 }, 10*time.Second, time.Millisecond, "the fill is held while the daemon is busy")
+			require.Equal(t, "queued", c.Status(actor).State)
+			binding.close()
+			require.Eventually(t, func() bool { return f.srv.materializer.Leases.Held() == leases }, 10*time.Second, time.Millisecond, "a held fill keeps no lease of the worktree view")
+		})
+	}
 }
