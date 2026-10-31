@@ -546,4 +546,21 @@ func TestDetectChangesLabelsPendingChangedFile(t *testing.T) {
 			t.Fatalf("detect with wait_deadline %v: graph_freshness %v after %v ms", offset, payload["graph_freshness"], waited)
 		}
 	}
+
+	// A staged diff leaves the pending caller.go out of the changed files,
+	// but the walk still reads it as a caller of the changed Target.
+	writeUnindexed(t, root, "target.go", "package p\n\nfunc Target() { _ = 0 }\n")
+	checkoutMutationGit(t, root, "add", "target.go")
+	req.Params.Arguments = map[string]any{"format": "json", "scope": "staged"}
+	result, err = s.handleDetectChanges(context.Background(), req)
+	if err != nil {
+		t.Fatalf("detect handler error: %v", err)
+	}
+	payload = lifecycleResultPayload(t, result)
+	if files, _ := payload["changed_files"].([]any); len(files) != 1 || files[0] != "target.go" {
+		t.Fatalf("staged detect changed_files = %v", payload["changed_files"])
+	}
+	if pending, _ := payload["pending_files"].([]any); payload["graph_freshness"] != "pending" || len(pending) != 1 || pending[0] != "caller.go" {
+		t.Fatalf("staged detect left the pending caller unlabelled: %v", payload)
+	}
 }

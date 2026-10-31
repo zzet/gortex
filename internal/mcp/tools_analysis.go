@@ -357,6 +357,9 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	var freshnessErr error
 	var label relationFreshness
 	var diff *analysis.DiffResult
+	var freshness requestFreshness
+	var keys []string
+	var deadline time.Time
 	if checkoutScoped {
 		pending, freshnessErr = s.mutationFreshnessSummaryForRepos(ctx, repoPrefix)
 	} else {
@@ -367,12 +370,13 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		keys := make([]string, len(files.ChangedFiles))
+		keys = make([]string, len(files.ChangedFiles))
 		for i, file := range files.ChangedFiles {
 			keys[i] = analysis.GraphKey(repoPrefix, file, analysis.RepoRelativePath)
 		}
-		freshness := takeRequestFreshness(&req)
-		label = s.awaitRelationFreshness(ctx, nil, keys, relationWaitDeadline(ctx, freshness))
+		freshness = takeRequestFreshness(&req)
+		deadline = relationWaitDeadline(ctx, freshness)
+		label = s.awaitRelationFreshness(ctx, nil, keys, deadline)
 		if freshness.requireFresh && label.state != "" {
 			return label.requireFreshError(), nil
 		}
@@ -463,6 +467,15 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	symbolIDs := make([]string, len(diff.ChangedSymbols))
 	for i, cs := range diff.ChangedSymbols {
 		symbolIDs[i] = cs.ID
+	}
+	if !checkoutScoped {
+		// The walk reads the changed symbols' callers, and an edit outside
+		// the diff (a staged or compare scope leaves the working tree out)
+		// can be changing those. They share what is left of the budget.
+		label = label.merge(s.awaitRelationFreshness(ctx, symbolIDs, keys, deadline))
+		if freshness.requireFresh && label.state != "" {
+			return label.requireFreshError(), nil
+		}
 	}
 
 	impact, err := s.analyzeDiffImpact(ctx, symbolIDs)

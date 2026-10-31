@@ -230,6 +230,29 @@ func (f relationFreshness) requireFreshError() *mcp.CallToolResult {
 	return mcp.NewToolResultError(message)
 }
 
+// merge folds the label of another scope the same answer read into f: the
+// files of both, failed over pending, and the time spent waiting on each.
+func (f relationFreshness) merge(other relationFreshness) relationFreshness {
+	f.waited += other.waited
+	if other.state == "" {
+		return f
+	}
+	if f.state != "failed" {
+		f.state = other.state
+	}
+	seen := make(map[string]bool, len(f.files))
+	for _, file := range f.files {
+		seen[file] = true
+	}
+	for _, file := range other.files {
+		if !seen[file] {
+			f.files = append(f.files, file)
+		}
+	}
+	sort.Strings(f.files)
+	return f
+}
+
 // decorate makes a rendered text answer lead with its label: TOON and plain
 // text start with the relations line; GCX keeps GCX1 as line 1, carries the
 // label as header meta and the relations line as a comment on line 2. JSON
