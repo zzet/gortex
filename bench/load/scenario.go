@@ -316,7 +316,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	if scenario == "sweep" {
 		finalizeSweepInventory(sweep, phase.Attempts, o.SweepRepetitions, &phase)
 	}
-	captureReceipt(ctx, p, clients[0], &phase)
+	captureReceipt(ctx, p, editProbeReceiptClient(&phase, clients), &phase)
 	for i, client := range clients {
 		client.mu.Lock()
 		data, marshalErr := json.Marshal(struct {

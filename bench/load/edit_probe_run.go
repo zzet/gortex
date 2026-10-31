@@ -590,6 +590,16 @@ func (r *editProbeRuntime) editorFor(step editProbeStep) *socketClient {
 	return r.editors[step.Editor]
 }
 
+// The run-level receipt after the workload goes through editor 0, which a
+// restart cell reopened on the restarted daemon: the scenario's first session
+// may belong to the killed one.
+func editProbeReceiptClient(phase *Phase, clients []*socketClient) *socketClient {
+	if phase.editProbeRuntime != nil {
+		return phase.editProbeRuntime.editors[0]
+	}
+	return clients[0]
+}
+
 func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
 	if step.Sender != "" {
 		r.doNativeWrite(ctx, step)

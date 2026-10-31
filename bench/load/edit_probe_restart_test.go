@@ -18,6 +18,7 @@ type editProbeFakeRestarter struct {
 	mu       sync.Mutex
 	calls    []string
 	startErr error
+	onKill   func()
 	onStart  func()
 }
 
@@ -25,6 +26,9 @@ func (f *editProbeFakeRestarter) kill() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "kill")
+	if f.onKill != nil {
+		f.onKill()
+	}
 	return nil
 }
 
@@ -45,10 +49,12 @@ func editProbeRestartStub(t *testing.T, c Corpus, dir string, terminal bool, res
 	disk := editProbeDiskStub(t, c, dir)
 	return func(frame stubFrame) (any, *rpcError) {
 		args, _ := frame.Params["arguments"].(map[string]any)
-		if frame.Method == "tools/call" && restarted.Load() && frame.Connection <= 2 {
-			t.Errorf("pre-kill session %d used after restart", frame.Connection)
+		if frame.Method != "" && restarted.Load() && frame.Connection <= 2 {
+			t.Errorf("pre-kill session %d used after restart: %s", frame.Connection, frame.Method)
 		}
 		switch {
+		case frame.Method == "resources/read":
+			return map[string]any{"contents": []any{map[string]any{"type": "text", "text": `{"total_nodes":1}`}}}, nil
 		case frame.Params["name"] == "edit" && args["operation"] == "file":
 			path := filepath.Join(dir, c.File)
 			data, err := os.ReadFile(path)
@@ -85,9 +91,14 @@ func runEditProbeRestartCell(t *testing.T, terminal bool, startErr error) (*edit
 	}
 	var restarted atomic.Bool
 	run := newEditProbeStubRun(t, ctx, c, plan, dir, 1, editProbeRestartStub(t, c, dir, terminal, &restarted))
-	fake := &editProbeFakeRestarter{startErr: startErr, onStart: func() { restarted.Store(true) }}
-	run.restarter = fake
+	// The kill takes every session opened before it down with the daemon.
 	before := []*socketClient{run.editors[0], run.states[0].client}
+	fake := &editProbeFakeRestarter{startErr: startErr, onStart: func() { restarted.Store(true) }, onKill: func() {
+		for _, client := range before {
+			_ = client.Close()
+		}
+	}}
+	run.restarter = fake
 	run.activate(ctx, plan.Steps[0])
 	awaitEditProbeFirstProbe(t, run.states[0])
 	run.doEdit(ctx, plan.Steps[0])
@@ -130,6 +141,22 @@ func TestEditProbeRestartReopensSessionsAndNeverReusesPreKillAnswers(t *testing.
 	run.phase.EditProbe.Records = []editProbeRecord{record}
 	if err := run.restore(t.Context()); err != nil || run.phase.EditProbe.RestoreMS.Value == nil {
 		t.Fatalf("restore after restart: %v", err)
+	}
+}
+
+// After the workload the run-level receipt is taken on the reopened editor:
+// the scenario's first session died with the killed daemon.
+func TestEditProbeRestartClosingReceiptUsesTheReopenedEditor(t *testing.T) {
+	run, _, before := runEditProbeRestartCell(t, false, nil)
+	dead := &Phase{}
+	captureReceipt(t.Context(), run.p, before[0], dead)
+	if len(dead.Stats) != 0 || len(dead.Errors) != 1 || !strings.HasPrefix(dead.Errors[0], "stats receipt: ") {
+		t.Fatalf("the pre-kill editor still answered: %v", dead.Errors)
+	}
+	run.phase.editProbeRuntime = run
+	captureReceipt(t.Context(), run.p, editProbeReceiptClient(run.phase, before[:1]), run.phase)
+	if len(run.phase.Errors) != 0 || len(run.phase.Stats) != 1 || len(run.phase.Status) != 1 {
+		t.Fatalf("closing receipt after the restart: %v", run.phase.Errors)
 	}
 }
 
