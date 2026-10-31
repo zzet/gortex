@@ -451,6 +451,9 @@ func TestFirstIndexFailureRestoresStore(t *testing.T) {
 				ctx = progress.WithReporter(ctx, firstIndexPanicReporter{})
 			}
 			idx := newFirstIndexBulkIndexer(t, store, "repo")
+			if mode == "seal panic" {
+				idx.indexMemoryAdmission = newIndexMemoryAdmissionBudget(defaultIndexMemoryAdmissionBytes)
+			}
 			dir := firstIndexFixtureRepo(t)
 
 			switch mode {
@@ -463,6 +466,8 @@ func TestFirstIndexFailureRestoresStore(t *testing.T) {
 			case "seal panic":
 				require.PanicsWithValue(t, "injected seal panic", func() { _, _ = idx.IndexCtx(ctx, dir) })
 				assert.Greater(t, seals, 1, "the backstop did not retry the panicked flush")
+				assert.Positive(t, idx.indexMemoryAdmission.snapshot().peak, "fixture must acquire the memory lease")
+				assert.Zero(t, idx.indexMemoryAdmission.snapshot().used, "earlier defers must release the memory lease")
 			case "cancel before drain":
 				_, err := idx.IndexCtx(ctx, dir)
 				require.ErrorIs(t, err, context.Canceled)
@@ -504,40 +509,6 @@ func TestFirstIndexFailureRestoresStore(t *testing.T) {
 			assert.Same(t, store, idx.graph, "panic and error paths must restore disk target")
 		})
 	}
-}
-
-func TestFirstIndexFlushPanicPropagates(t *testing.T) {
-	// Given a real store whose dense-index seal panics once, inside the
-	// drain's explicit FlushBulk.
-	store, db := newFirstIndexStore(t)
-	indexes := firstIndexSchemaIndexes(t, db)
-	writerSync := firstIndexWriterSynchronous(t, store)
-	seals := 0
-	defer store.SetBulkSealHookForTest(func(string) error {
-		seals++
-		if seals == 1 {
-			panic("injected seal panic")
-		}
-		return nil
-	})()
-	idx := newFirstIndexBulkIndexer(t, store, "repo")
-	idx.indexMemoryAdmission = newIndexMemoryAdmissionBudget(defaultIndexMemoryAdmissionBytes)
-
-	// When the completed shadow drain flushes, the panic reaches the caller.
-	require.PanicsWithValue(t, "injected seal panic", func() {
-		_, _ = idx.IndexCtx(context.Background(), firstIndexFixtureRepo(t))
-	})
-
-	// Then the backstop retried the flush once while the panic unwound, and
-	// the retry sealed and closed the window: the write gate is free, the
-	// writer is back at its own durability, and every index is rebuilt.
-	assert.Greater(t, seals, 1, "the backstop did not retry the panicked flush")
-	assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store))
-	assertFirstIndexRestored(t, store, db, indexes)
-	assert.Same(t, store, idx.graph)
-	assert.Positive(t, idx.indexMemoryAdmission.snapshot().peak, "fixture must acquire the memory lease")
-	assert.Zero(t, idx.indexMemoryAdmission.snapshot().used, "earlier defers must release the memory lease")
-	assertFirstIndexNoReceipts(t, store, "repo")
 }
 
 type firstIndexDrainPanicReporter struct{}
