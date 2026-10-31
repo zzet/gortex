@@ -153,15 +153,20 @@ func (s *Store) BFSAdmissionFilteredContext(ctx context.Context, request graph.B
 	if err := ctx.Err(); err != nil {
 		return graph.BFSAdmissionSnapshot{}, false, err
 	}
-	_, edgeBudget, supported := graph.BFSAdmissionBudgets(request)
-	if !supported || request.Direction != graph.DirectionForward && request.Direction != graph.DirectionBackward {
+	if _, _, supported := graph.BFSAdmissionBudgets(request); !supported || request.Direction != graph.DirectionForward && request.Direction != graph.DirectionBackward {
 		return graph.BFSAdmissionSnapshot{}, false, nil
 	}
 	request.Kinds = anaDedupeEdgeKinds(request.Kinds)
 	if len(request.Kinds) == 0 {
 		return graph.BFSAdmissionSnapshot{}, false, nil
 	}
-	query := bfsAdmissionQuery(s.viewGen, request, filter)
+	return s.readBFSAdmission(ctx, request, bfsAdmissionQuery(s.viewGen, request, filter))
+}
+
+// readBFSAdmission decodes one admission statement's rows. Any overflow
+// sentinel or budget breach declines the whole snapshot.
+func (s *Store) readBFSAdmission(ctx context.Context, request graph.BFSAdmissionRequest, query outlineQuery) (graph.BFSAdmissionSnapshot, bool, error) {
+	_, edgeBudget, _ := graph.BFSAdmissionBudgets(request)
 	rows, err := outlineRows(ctx, s.db, query)
 	if err != nil {
 		return graph.BFSAdmissionSnapshot{}, false, err
