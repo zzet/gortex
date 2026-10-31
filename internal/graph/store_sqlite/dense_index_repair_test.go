@@ -25,7 +25,8 @@ func shortenDenseIndexRepairBackoff(t *testing.T) {
 // rebuilding its dense indexes must still restore durability and close, must
 // say which indexes it left absent instead of letting the planner probe read
 // their absence as a clean store, must not retry the rebuild while the volume
-// is full, and must rebuild them in one maintenance attempt once it is not.
+// is full, and must rebuild them in one maintenance attempt once it is not,
+// followed by the statistics pass the rebuilt indexes need.
 func TestFailedSealReportsDenseIndexesMissing(t *testing.T) {
 	shortenDenseIndexRepairBackoff(t)
 	allDroppable := make([]string, 0, len(bulkDroppableIndexes))
@@ -143,6 +144,12 @@ func TestFailedSealReportsDenseIndexesMissing(t *testing.T) {
 					t.Fatalf("index %s missing after the repair", name)
 				}
 			}
+			// A rebuilt index has no sqlite_stat1 row, and once the repair is
+			// done nothing else asks for a statistics pass, so the repair must
+			// ask for one itself. nodes_by_kind holds the case's node.
+			waitUntil(t, "statistics for the rebuilt nodes_by_kind", func() bool {
+				return s.plannerStatsIndexesWithStats(context.Background())["nodes_by_kind"]
+			})
 			integrityOK(t, s.db)
 		})
 	}
