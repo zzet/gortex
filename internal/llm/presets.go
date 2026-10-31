@@ -67,6 +67,16 @@ var gatewayPresets = map[string]CustomProvider{
 		SchemaMode:    "json_schema",
 		PromptProfile: "frontier",
 	},
+	// Runcrate (https://www.runcrate.ai/inference/pricing) serves open
+	// models over the OpenAI Chat Completions API; model ids carry a
+	// vendor prefix.
+	"runcrate": {
+		BaseURL:       "https://api.runcrate.ai/v1",
+		Model:         "deepseek-ai/DeepSeek-V4.1-Flash",
+		APIKeyEnv:     "RUNCRATE_API_KEY",
+		SchemaMode:    "json_schema",
+		PromptProfile: "frontier",
+	},
 }
 
 // Preset returns the named gateway preset (matched case-insensitively
