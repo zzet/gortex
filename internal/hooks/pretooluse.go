@@ -1476,12 +1476,15 @@ func enrichBashWithProbe(toolInput map[string]any, cwd string, probe fileScopePr
 	if outsideGraph(c) {
 		c = classifyBashReadCommandSkipping(cmd, outsideGraph)
 	}
-	// An inline Python one-liner or heredoc that opens indexed source
-	// is the read door agents take once cat and grep are redirected.
-	if c.Action == BashActionPassthrough {
-		if result, answered := enrichBashScriptRead(cmd, cwd, probe); answered {
-			return result
-		}
+	// An inline Python one-liner or heredoc that opens indexed source is the
+	// read door agents take once cat and grep are redirected. It is answered
+	// for every command, not only when the shell leaves it passthrough: a
+	// read/grep/find that follows it would otherwise make the command
+	// non-passthrough and skip the Python analysis, so `python3 -c "…"`
+	// chained after a `head` still answers. The analysis is self-limiting and
+	// silent for commands that carry no inline Python.
+	if result, answered := enrichBashScriptRead(cmd, cwd, probe); answered {
+		return result
 	}
 	switch c.Action {
 	case BashActionGrepLike:

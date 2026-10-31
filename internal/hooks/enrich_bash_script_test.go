@@ -44,12 +44,23 @@ func TestEnrichBash_InlinePython(t *testing.T) {
 		{"read, then write elsewhere", `python3 -c "s=open('a.go').read(); open('/tmp/out.txt','w').write(s)"`, deny},
 		{"cd after the script", `python3 -c "print(open('a.go').read())" && cd /tmp`, deny},
 
+		// Chained after a shell read of a non-indexed path, the trailing
+		// head makes the whole command non-passthrough, so the Python door
+		// must run for every command, not only when the shell leaves it
+		// passthrough.
+		{"python read after a head", `python3 -c "print(open('a.go').read())" && head /tmp/other.go`, deny},
+		{"python read before a head", `head /tmp/other.go && python3 -c "print(open('a.go').read())"`, deny},
+		{"python read after a tail", `python3 -c "print(open('a.go').read())" && tail /tmp/other.go`, deny},
+
 		// A file read and written back is an edit.
 		{"read-modify-write", "python3 - <<'EOF'\nfrom pathlib import Path\np = Path('a.go'); s = p.read_text()\np.write_text(s.replace('x', 'y'))\nEOF", edit},
 		{"r+", `python3 -c "f=open('a.go','r+'); s=f.read(); f.seek(0); f.write(s)"`, edit},
 		{"expression write target", "python3 - <<'EOF'\nimport os\nf = 'a.go'\ns = open(f).read()\nopen(os.path.abspath(f), 'w').write(s)\nEOF", edit},
 		{"unnamed write target", `python3 -c "s=open('a.go').read(); open(sys.argv[1], 'w').write(s)"`, maybe},
 		{"edit wins over reads", `python3 -c "print(open('b.go').read())" && python3 -c "p='a.go'; s=open(p).read(); open(p,'w').write(s)"`, edit},
+
+		// A Python edit after a shell read of a non-indexed path is still an edit.
+		{"python edit after a head", "head /tmp/other.go && python3 -c \"p='a.go'; s=open(p).read(); open(p,'w').write(s)\"", edit},
 
 		// Everything else passes.
 		{"pure write", `python3 -c "open('a.go', \"w\").write('package a')"`, allow},
