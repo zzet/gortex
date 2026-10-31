@@ -2,6 +2,8 @@ package indexer
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -68,9 +70,13 @@ func linkedProbeInputs(checkout string, repos []string, key string) *graphview.S
 // of its own, as a worktree request does.
 func (h *linkedHoldProbe) scheduleLinked(ctx context.Context, checkout, repo, key string, strict bool) ContractScheduleResult {
 	h.t.Helper()
-	result, err := h.c.Schedule(ctx, ContractScheduleRequest{Actor: NewContractActor(checkout, []string{repo}), Key: graph.ContractAttachmentKey{RepoPrefix: repo, CheckoutID: checkout}, Inputs: linkedProbeInputs(checkout, []string{repo}, key), Source: &ContractCaptureSource{onRelease: func() { h.released.Add(1) }}, Epoch: h.c.InputEpoch(), Strict: strict})
+	result, err := h.c.Schedule(ctx, h.linkedRequest(checkout, repo, key, strict))
 	require.NoError(h.t, err)
 	return result
+}
+
+func (h *linkedHoldProbe) linkedRequest(checkout, repo, key string, strict bool) ContractScheduleRequest {
+	return ContractScheduleRequest{Actor: NewContractActor(checkout, []string{repo}), Key: graph.ContractAttachmentKey{RepoPrefix: repo, CheckoutID: checkout}, Inputs: linkedProbeInputs(checkout, []string{repo}, key), Source: &ContractCaptureSource{onRelease: func() { h.released.Add(1) }}, Epoch: h.c.InputEpoch(), Strict: strict}
 }
 
 // settle has repo's dispatcher run one whole evaluation that started after
@@ -195,8 +201,9 @@ func TestContractLinkedIdleDefersWhileBusyAndStartsAfterTheWindow(t *testing.T) 
 		h.settle("r")
 		require.True(t, h.held(first.Actor))
 		h.c.mu.Lock()
-		require.Equal(t, 1, h.c.activeLocked())
+		active, held := h.c.activeLocked(h.c.now())
 		h.c.mu.Unlock()
+		require.Equal(t, [2]int{1, 1}, [2]int{active, held})
 		h.advance(contractInterestTTL)
 		h.settle("r")
 		h.c.mu.Lock()
@@ -204,8 +211,9 @@ func TestContractLinkedIdleDefersWhileBusyAndStartsAfterTheWindow(t *testing.T) 
 		require.Equal(t, contractActorIdle, a.state)
 		require.True(t, a.interestExpired)
 		require.False(t, a.held)
-		require.Zero(t, h.c.activeLocked(), "an expired hold frees its capacity")
+		active, _ = h.c.activeLocked(h.c.now())
 		h.c.mu.Unlock()
+		require.Zero(t, active, "an expired hold leaves the registry's actors with work")
 		deferred := linkedCounter(ContractLinkedIdle, viewmetrics.ContractLinkedDeferred)
 		renewed := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
 		require.Equal(t, ContractScheduled, renewed.Result)
@@ -257,6 +265,53 @@ func TestContractLinkedActorsWaitingTheirTurnOutliveTheirInterest(t *testing.T) 
 			}
 		})
 	}
+}
+
+// TestContractLinkedIdleHoldsLeaveTheQueueCapacity: a linked actor the idle
+// policy holds pins no source, slot or lease and may wait out a long busy
+// spell, so it takes no queue capacity: a worktree an agent opens under load
+// still records its interest, and a strict request there starts at once.
+// Held actors are bounded by the registry instead.
+func TestContractLinkedIdleHoldsLeaveTheQueueCapacity(t *testing.T) {
+	h := newLinkedHoldProbe(t, ContractLinkedIdle, func(options *ContractAnalysisCoordinatorOptions) { options.QueueCapacity = 2 })
+	h.busy.Store(true)
+	capacity := h.c.CapacityEpoch()
+	for _, checkout := range []string{"wt1", "wt2", "wt3"} {
+		require.Equal(t, ContractScheduled, h.scheduleLinked(t.Context(), checkout, "r", "k", false).Result)
+		h.settle("r")
+		require.True(t, h.held(NewContractActor(checkout, []string{"r"})))
+	}
+	require.Greater(t, h.c.CapacityEpoch(), capacity, "a hold frees capacity for a request that waits for it")
+
+	h.hold("r/wt4@k")
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	strict := h.scheduleLinked(ctx, "wt4", "r", "k", true)
+	require.Equal(t, ContractScheduled, strict.Result)
+	require.Equal(t, []string{"r/wt4@k"}, h.waitStarts(1), "a strict request in a new worktree starts at once")
+	h.release("r/wt4@k")
+	require.Equal(t, ContractActorPublished, h.wait(strict).Result)
+
+	// Held actors count against the registry: once every actor it keeps has
+	// work, a new one is refused.
+	refused := false
+	for i := 5; i < 2*contractSchedulerMaxActors && !refused; i++ {
+		_, err := h.c.Schedule(t.Context(), h.linkedRequest(fmt.Sprintf("wt%d", i), "r", "k", false))
+		var full *ContractQueueFullError
+		if refused = errors.As(err, &full); !refused {
+			require.NoError(t, err)
+		}
+	}
+	require.True(t, refused)
+	h.c.mu.Lock()
+	withWork := 0
+	for _, a := range h.c.actors {
+		if a.hasWork() {
+			withWork++
+		}
+	}
+	h.c.mu.Unlock()
+	require.Equal(t, contractSchedulerMaxActors, withWork)
 }
 
 // TestContractLinkedPolicyLeavesPrimaryActorsAlone: a held linked actor

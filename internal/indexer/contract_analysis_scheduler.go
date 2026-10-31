@@ -546,7 +546,11 @@ func (c *ContractAnalysisCoordinator) Schedule(ctx context.Context, req Contract
 		return result, nil
 	}
 	if a == nil {
-		if c.activeLocked() >= c.options.QueueCapacity {
+		// A linked actor the idle policy holds pins no source, slot or
+		// lease and may wait out a long busy spell: it takes no queue
+		// capacity, so a worktree opened under load still records its
+		// interest. Held actors count against the registry instead.
+		if active, held := c.activeLocked(now); active-held >= c.options.QueueCapacity || active >= contractSchedulerMaxActors {
 			// A known actor is never refused; a new one is, and asks again
 			// once a job's time has passed.
 			label = viewmetrics.ContractRequestQueueFull
@@ -660,15 +664,19 @@ func (c *ContractAnalysisCoordinator) registerLocked(id ContractActor, now time.
 	return a
 }
 
-// activeLocked counts actors with pending or running work.
-func (c *ContractAnalysisCoordinator) activeLocked() int {
-	active := 0
+// activeLocked counts actors with pending or running work and, of those, the
+// queued ones the idle policy holds at now.
+func (c *ContractAnalysisCoordinator) activeLocked(now time.Time) (active, held int) {
 	for _, a := range c.actors {
-		if a.hasWork() {
-			active++
+		if !a.hasWork() {
+			continue
+		}
+		active++
+		if a.state == contractActorQueued && c.idleHeldLocked(a, now) {
+			held++
 		}
 	}
-	return active
+	return active, held
 }
 
 // retryAfterLocked is when a refused request should ask again: the mean job
@@ -699,9 +707,7 @@ func (c *ContractAnalysisCoordinator) setStateLocked(a *contractActor, state con
 		a.held = false
 	}
 	if had && !a.hasWork() {
-		c.capacityEpoch++
-		close(c.capacityChanged)
-		c.capacityChanged = make(chan struct{})
+		c.capacityFreedLocked()
 	}
 	if a.dirty && state != contractActorRunning && state != contractActorCapturing {
 		// A Published that arrived during the job is captured now.
@@ -711,6 +717,13 @@ func (c *ContractAnalysisCoordinator) setStateLocked(a *contractActor, state con
 		c.wakeHeldLocked()
 	}
 	a.notifyLocked()
+}
+
+// capacityFreedLocked steps the capacity epoch and wakes its waiters.
+func (c *ContractAnalysisCoordinator) capacityFreedLocked() {
+	c.capacityEpoch++
+	close(c.capacityChanged)
+	c.capacityChanged = make(chan struct{})
 }
 
 // enqueueLocked queues an actor at the back of its home ring.

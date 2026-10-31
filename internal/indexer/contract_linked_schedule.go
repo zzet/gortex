@@ -15,10 +15,10 @@ import (
 //
 //   - idle: only once Demand has reported nothing for the idle window. The
 //     dispatcher keeps a held actor in its queue, skipping it, so a primary
-//     actor behind it still starts; a held actor keeps no handoff source and
-//     reacquires its inputs when it starts. Demand that returns between the
-//     pick and the job body sends the actor back to wait, uncounted as a
-//     start.
+//     actor behind it still starts; a held actor keeps no handoff source,
+//     reacquires its inputs when it starts and takes no queue capacity.
+//     Demand that returns between the pick and the job body sends the actor
+//     back to wait, uncounted as a start.
 //   - throttled: one linked job in flight, and one linked actor's starts at
 //     least the throttle interval apart. The idle window does not apply.
 //   - eager: as a primary actor.
@@ -121,12 +121,16 @@ func (c *ContractAnalysisCoordinator) idleHeldLocked(a *contractActor, now time.
 }
 
 // holdLocked keeps a queued actor waiting for its linked policy. The first
-// skip of a hold is counted; a held actor never pins its handoff source, so
-// the source is returned for release outside c.mu.
+// skip of a hold is counted; an idle hold takes no queue capacity, so it
+// wakes requests waiting for capacity. A held actor never pins its handoff
+// source, so the source is returned for release outside c.mu.
 func (c *ContractAnalysisCoordinator) holdLocked(a *contractActor) *ContractCaptureSource {
 	if !a.held {
 		a.held = true
 		countContractLinkedJob(c.options.LinkedPolicy, viewmetrics.ContractLinkedDeferred)
+		if c.options.LinkedPolicy == ContractLinkedIdle {
+			c.capacityFreedLocked()
+		}
 	}
 	source := a.want.source
 	a.want.source = nil
@@ -151,17 +155,18 @@ func (c *ContractAnalysisCoordinator) linkedHeldAgainLocked(a *contractActor, bu
 // counted as a deferral of its own.
 func (c *ContractAnalysisCoordinator) endLinkedDeferred(a *contractActor, want contractActorWant, trigger string, triggeredAt time.Time) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if a.running.seq == want.seq {
 		a.running.contractActorKeySeq = contractActorKeySeq{}
 		a.running.cancel = nil
 	}
 	if c.supersededLocked(a, want) {
+		c.mu.Unlock()
 		return
 	}
 	c.enqueueLocked(a, trigger, triggeredAt)
-	a.held = true
-	countContractLinkedJob(c.options.LinkedPolicy, viewmetrics.ContractLinkedDeferred)
+	unpinned := c.holdLocked(a)
+	c.mu.Unlock()
+	unpinned.Release()
 }
 
 // linkJob prepares a linked actor's job for its policy before the body
