@@ -373,14 +373,18 @@ graphs; neither consumes repository contents.
 
 Before any timings, both query executables must advertise and pass
 `TestBenchmarkFixtureTargets` under the runner's explicit opt-in. That check
-indexes the pinned fixture, verifies every shared benchmark symbol ID, and
-requires nonempty search/statistics and meaningful nodes plus edges for every
-traversal. The runner retains each binary's test census, raw check output and
-observed result counts. Missing tests, skipped checks, absent targets or empty
-traversals refuse all timings. First usable trusted main publication therefore
-requires this test-only harness contract to land on main. Existing main
-`c6c6de19` executables do not contain it and cannot pass by reporting "no tests
-to run". Ordinary package tests skip this opt-in check and fetch no fixture.
+indexes the pinned fixture at the scope the daemon indexes it: the checkout's
+own `.gortex.yaml` (built-in, `.gitignore` and configured exclusions, worker
+count) with at least two parse workers, never the host's global config. It
+refuses any indexed `_test.go` source, verifies every shared benchmark symbol
+ID, and requires nonempty search/statistics and meaningful nodes plus edges for
+every traversal. The runner retains each binary's test census, raw check output
+and observed result counts. Missing tests, skipped checks, absent targets or
+empty traversals refuse all timings. First usable trusted main publication
+therefore requires this test-only harness contract to land on main. Existing
+main `c6c6de19` executables do not contain it and cannot pass by reporting "no
+tests to run". Ordinary package tests skip this opt-in check and fetch no
+fixture.
 
 ```sh
 # All outputs are NEW external directories. Use the prescribed Go/C/C++ env.

@@ -3,7 +3,12 @@ package query
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 // This is an executable contract for the separately pinned performance fixture.
@@ -13,6 +18,19 @@ func TestBenchmarkFixtureTargets(t *testing.T) {
 		t.Skip("only the owned microbenchmark fixture preflight enables this check")
 	}
 	eng := buildTestEngine(t)
+	// The benchmarks measure the graph the daemon serves, so the fixture
+	// must honour the checkout's own exclusions rather than index tests too.
+	fileNodes, testSources := 0, 0
+	for node := range eng.g.NodesByKind(graph.KindFile) {
+		fileNodes++
+		if strings.HasSuffix(node.FilePath, "_test.go") {
+			testSources++
+		}
+	}
+	if testSources > 0 {
+		t.Errorf("benchmark fixture indexed %d test sources its .gortex.yaml excludes", testSources)
+	}
+	t.Logf("indexed fixture scope: %d files, %d file nodes, %d parse workers", benchmarkFiles, fileNodes, benchmarkWorkers)
 	for _, id := range []string{
 		benchmarkServerID,
 		benchmarkDependencyID,
@@ -59,4 +77,30 @@ func TestBenchmarkFixtureTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("GORTEX_BENCHMARK_FIXTURE_V1 %s", data)
+}
+
+// The benchmark scope comes from the checkout's own config and never falls
+// back to the defaults, which would also index test sources.
+func TestBenchmarkIndexConfigUsesRepositoryConfig(t *testing.T) {
+	root := t.TempDir()
+	if _, err := benchmarkIndexConfig(t.TempDir(), root); err == nil {
+		t.Fatal("a checkout without .gortex.yaml must not fall back to the default scope")
+	}
+	path := filepath.Join(root, ".gortex.yaml")
+	if err := os.WriteFile(path, []byte("index: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := benchmarkIndexConfig(t.TempDir(), root); err == nil {
+		t.Fatal("a malformed .gortex.yaml must not fall back to the default scope")
+	}
+	if err := os.WriteFile(path, []byte("index:\n  exclude:\n    - \"**/*_test.go\"\n  workers: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := benchmarkIndexConfig(t.TempDir(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(cfg.Exclude, "**/*_test.go") || cfg.Workers != 2 {
+		t.Fatalf("benchmark scope ignores the repository config: workers=%d exclude=%q", cfg.Workers, cfg.Exclude)
+	}
 }
