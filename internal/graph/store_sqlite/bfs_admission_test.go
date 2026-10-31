@@ -82,23 +82,26 @@ func bfsAdmissionPlan(t *testing.T, s *Store, query outlineQuery) []bfsAdmission
 
 // Every far-end test reads a covering index; the one full-row node seek
 // hydrates walked identities behind the walk's fit gate, and edges are only
-// ever reached from an endpoint.
+// ever reached from an endpoint. A workspace gate adds two: the seed's row,
+// and the row of a walked neighbor outside the seed's repository.
 func TestBFSAdmissionIndexPlanAndCancellation(t *testing.T) {
 	s := openCatalogStore(t)
 	nodeProbe := regexp.MustCompile(`^SEARCH n (EXISTS )?USING COVERING INDEX (nodes_by_repo|nodes_by_generation|nodes_by_kind) \(`)
 	for _, dir := range []graph.Direction{graph.DirectionForward, graph.DirectionBackward} {
 		_, _, index := bfsAdmissionColumns(dir)
 		edgeSeek := regexp.MustCompile(`^SEARCH e USING (COVERING )?INDEX ` + index + ` \(`)
-		for _, repos := range []map[string]bool{{"a": true}, nil} {
+		for _, scope := range []graph.NodeScope{{RepoAllow: map[string]bool{"a": true}}, {}, {WorkspaceID: "work", ProjectID: "project"}} {
+			workspaceGate := scope.WorkspaceID != "" && len(scope.RepoAllow) == 0
 			for _, filter := range []graph.OutlineEdgeFilter{
 				{ExcludeKinds: []graph.EdgeKind{graph.EdgeMatches}, ExcludeNodeKinds: []graph.NodeKind{graph.KindContract}, ExcludeVia: "spring.Bean"},
 				{ExcludeNodeIDs: map[string]bool{"a/f.go::Owned": true}},
 				{},
 			} {
-				request := graph.BFSAdmissionRequest{Seed: "a/f.go::Root", Direction: dir, Kinds: []graph.EdgeKind{graph.EdgeCalls, graph.EdgeMatches}, Depth: 3, Limit: 20, Scope: graph.NodeScope{RepoAllow: repos}}
+				request := graph.BFSAdmissionRequest{Seed: "a/f.go::Root", Direction: dir, Kinds: []graph.EdgeKind{graph.EdgeCalls, graph.EdgeMatches}, Depth: 3, Limit: 20, Scope: scope}
 				plan := bfsAdmissionPlan(t, s, bfsAdmissionQuery(0, request, filter))
-				label := fmt.Sprintf("dir=%v repos=%v filter=%+v plan=%+v", dir, repos, filter, plan)
-				var primary, automatic int
+				label := fmt.Sprintf("dir=%v scope=%+v filter=%+v plan=%+v", dir, scope, filter, plan)
+				var automatic int
+				primary := map[string]int{}
 				var hydratedOuter string
 				used := map[string]bool{}
 				for _, step := range plan {
@@ -107,8 +110,14 @@ func TestBFSAdmissionIndexPlanAndCancellation(t *testing.T) {
 					}
 					switch {
 					case strings.HasPrefix(step.detail, "SEARCH n USING PRIMARY KEY "):
-						primary++
-						require.Contains(t, step.ancestors, "MATERIALIZE hydrated", label)
+						phase := "elsewhere"
+						for _, ancestor := range step.ancestors {
+							if ancestor == "MATERIALIZE hydrated" || ancestor == "MATERIALIZE seed" || ancestor == "RECURSIVE STEP" {
+								phase = ancestor
+								break
+							}
+						}
+						primary[phase]++
 					case strings.HasPrefix(step.detail, "SEARCH n ") || strings.HasPrefix(step.detail, "SCAN n"):
 						match := nodeProbe.FindStringSubmatch(step.detail)
 						require.NotNil(t, match, "node probe stays covering: %s", label)
@@ -122,9 +131,13 @@ func TestBFSAdmissionIndexPlanAndCancellation(t *testing.T) {
 				// The fit gate is hydrated's outermost loop, so an overflowing
 				// walk performs no full-row node seek at all.
 				require.Equal(t, "SCAN ok", hydratedOuter, label)
-				require.Equal(t, 1, primary, label)
+				wantPrimary := map[string]int{"MATERIALIZE hydrated": 1}
+				if workspaceGate {
+					wantPrimary["MATERIALIZE seed"], wantPrimary["RECURSIVE STEP"] = 1, 1
+				}
+				require.Equal(t, wantPrimary, primary, label)
 				require.Equal(t, 1, automatic, "rows join hydrated nodes through an automatic index: %s", label)
-				require.Equal(t, repos != nil, used["nodes_by_repo"], label)
+				require.Equal(t, len(scope.RepoAllow) > 0 || workspaceGate, used["nodes_by_repo"], label)
 				require.Equal(t, len(filter.ExcludeNodeKinds) > 0, used["nodes_by_kind"], label)
 				require.True(t, used["nodes_by_generation"], "missing far ends are probed: %s", label)
 			}
@@ -216,6 +229,85 @@ func TestBFSAdmissionScopeAndUnresolvedGatePrecedeRecursion(t *testing.T) {
 	require.Equal(t, "a::unresolved::Ghost", rows.Adjacency[root].Edges[0].To)
 }
 
+// A workspace scope without a repository narrow is a bound session's default
+// for reach tools. The walk still follows its workspace into other
+// repositories, but stops where the workspace ends: a foreign workspace's
+// neighborhood, wider than the state budget, neither costs walk states nor
+// declines the snapshot. Only the seed's repository is walked past the scope.
+func TestBFSAdmissionWorkspaceGateStopsAtForeignWorkspaces(t *testing.T) {
+	s := openCatalogStore(t)
+	const (
+		root      = "a/root.go::Root"
+		sibling   = "b/api.go::Handler"
+		beyond    = "b/next.go::Next"
+		other     = "b/other.go::Other"
+		elsewhere = "a/else.go::Else"
+		foreign   = "c/out.go::Out"
+		unowned   = "util.go::Global"
+		global    = "ext::go:fmt::Errorf"
+	)
+	node := func(id, repo, workspace, project string) *graph.Node {
+		return &graph.Node{ID: id, Kind: graph.KindFunction, FilePath: strings.Split(id, "::")[0], RepoPrefix: repo, WorkspaceID: workspace, ProjectID: project}
+	}
+	nodes := []*graph.Node{
+		node(root, "a", "work", "a"), node(sibling, "b", "work", "a"), node(beyond, "b", "work", "a"), node(other, "b", "work", "b"),
+		node(elsewhere, "a", "elsewhere", "a"), node(foreign, "c", "foreign", "c"), node(unowned, "", "", ""),
+		{ID: global, Kind: graph.KindFunction, FilePath: "external::go:fmt"},
+	}
+	var edges []*graph.Edge
+	both := func(from, to string) {
+		edges = append(edges, &graph.Edge{From: from, To: to, Kind: graph.EdgeCalls}, &graph.Edge{From: to, To: from, Kind: graph.EdgeCalls})
+	}
+	for _, neighbor := range []string{sibling, other, elsewhere, foreign, unowned, global} {
+		both(root, neighbor)
+	}
+	both(sibling, beyond)
+	request := graph.BFSAdmissionRequest{Seed: root, Kinds: []graph.EdgeKind{graph.EdgeCalls}, Depth: 3, Limit: 20}
+	states, _, _ := graph.BFSAdmissionBudgets(request)
+	for i := range states + 1 {
+		id := fmt.Sprintf("c/fan.go::Fan%04d", i)
+		nodes = append(nodes, node(id, "c", "foreign", "c"))
+		both(foreign, id)
+	}
+	s.AddBatch(nodes, edges)
+
+	for _, scope := range []graph.NodeScope{{WorkspaceID: "work"}, {WorkspaceID: "work", ProjectID: "a"}} {
+		for _, dir := range []graph.Direction{graph.DirectionForward, graph.DirectionBackward} {
+			request.Direction, request.Scope = dir, scope
+			label := fmt.Sprintf("dir=%v scope=%+v", dir, scope)
+			got, handled, err := s.BFSAdmissionFilteredContext(t.Context(), request, graph.OutlineEdgeFilter{})
+			require.NoError(t, err, label)
+			require.True(t, handled, "a foreign workspace cannot overflow the walk: %s", label)
+			walked := map[string]bool{}
+			for id, n := range got.Nodes {
+				walked[id] = true
+				require.True(t, scope.Allows(n) || n.RepoPrefix == "a", "only the seed's repository is walked past the scope: %s %s", id, label)
+			}
+			require.True(t, walked[sibling], "another repository in the workspace is walked: %s", label)
+			require.True(t, walked[beyond], label)
+			require.True(t, walked[global], "a global external is in every scope: %s", label)
+			require.True(t, walked[elsewhere], "the seed's repository is walked; admission rejects it: %s", label)
+			require.Equal(t, scope.ProjectID == "", walked[other], "the project is checked across repositories: %s", label)
+			require.False(t, walked[foreign], label)
+			require.False(t, walked[unowned], "an unowned source node is outside the workspace: %s", label)
+			var far []string
+			for _, edge := range got.Adjacency[root].Edges {
+				if dir == graph.DirectionBackward {
+					far = append(far, edge.From)
+				} else {
+					far = append(far, edge.To)
+				}
+			}
+			require.NotContains(t, far, foreign, "the rejected neighbor drops its edge: %s", label)
+			require.NotContains(t, far, unowned, label)
+			require.Contains(t, far, elsewhere, label)
+			fits, hydrated := bfsAdmissionHydration(t, s, request)
+			require.True(t, fits, label)
+			require.Equal(t, len(got.Nodes), hydrated, label)
+		}
+	}
+}
+
 // previousBFSAdmissionQuery is the statement the covering-index probes
 // replaced, kept as the snapshot oracle. It joined the full node row at the
 // far end of every walked and returned edge, and at both ends of every
@@ -289,11 +381,18 @@ func previousBFSAdmissionJoins(dir graph.Direction, needNeighbor, inner bool, fi
 }
 
 // requireBFSAdmissionMatchesPrevious compares the snapshot with the previous
-// statement's for a request without workspace or project scope. Adjacency
-// rows and their order are identical. Nodes differ only where admission never
-// reads them: the seed, which the caller supplies, and unresolved or external
-// targets. A Total differs only below the cap left after every walked
-// identity, where both values decide the engine's pre-cap sort the same way.
+// statement's. Adjacency rows and their order are identical. Nodes differ only
+// where admission never reads them: the seed, which the caller supplies, and
+// unresolved or external targets. A Total differs only below the cap left
+// after every walked identity, where both values decide the engine's pre-cap
+// sort the same way.
+//
+// The previous statement checked a workspace or project scope on every
+// walked row. Now a superset walks on: neighbors outside that scope in a
+// narrowed repository or, without a narrow, in the seed's repository, and
+// whatever they reach. Admission expands none of them and drops their edges,
+// so under such a scope the comparison keeps the previous anchors and nodes
+// and drops rows whose far end the scope rejects.
 func requireBFSAdmissionMatchesPrevious(t *testing.T, s *Store, request graph.BFSAdmissionRequest, filter graph.OutlineEdgeFilter) (got, want graph.BFSAdmissionSnapshot) {
 	t.Helper()
 	label := fmt.Sprintf("generation=%d request=%+v filter=%+v", s.viewGen, request, filter)
@@ -309,13 +408,46 @@ func requireBFSAdmissionMatchesPrevious(t *testing.T, s *Store, request graph.BF
 			wantNodes[id] = node
 		}
 	}
-	require.Equal(t, wantNodes, got.Nodes, label)
-	require.Len(t, got.Adjacency, len(want.Adjacency), label)
+	scoped := request.Scope.WorkspaceID != ""
+	if !scoped {
+		require.Equal(t, wantNodes, got.Nodes, label)
+		require.Len(t, got.Adjacency, len(want.Adjacency), label)
+	}
+	seed := s.GetNode(request.Seed)
+	for id, node := range got.Nodes {
+		if wantNode, ok := wantNodes[id]; ok {
+			require.Equal(t, wantNode, node, "node %s: %s", id, label)
+			continue
+		}
+		if !request.Scope.Allows(node) {
+			narrowed := node.RepoPrefix == "" || request.Scope.RepoAllow[node.RepoPrefix]
+			if len(request.Scope.RepoAllow) == 0 {
+				narrowed = seed != nil && node.RepoPrefix == seed.RepoPrefix
+			}
+			require.True(t, narrowed, "node %s walked outside the gate: %s", id, label)
+		}
+	}
+	for id := range wantNodes {
+		require.Contains(t, got.Nodes, id, label)
+	}
 	held := 1 + len(got.Nodes)
 	for anchor, adjacency := range want.Adjacency {
 		gotAdjacency, ok := got.Adjacency[anchor]
 		require.True(t, ok, "anchor %s: %s", anchor, label)
-		require.Equal(t, adjacency.Edges, gotAdjacency.Edges, "anchor %s: %s", anchor, label)
+		admitted := gotAdjacency.Edges
+		if scoped {
+			admitted = nil
+			for _, edge := range gotAdjacency.Edges {
+				far := edge.To
+				if request.Direction == graph.DirectionBackward {
+					far = edge.From
+				}
+				if node := got.Nodes[far]; node == nil || request.Scope.Allows(node) {
+					admitted = append(admitted, edge)
+				}
+			}
+		}
+		require.Equal(t, adjacency.Edges, admitted, "anchor %s: %s", anchor, label)
 		if room := request.Limit - held; adjacency.Total >= room {
 			require.Equal(t, adjacency.Total, gotAdjacency.Total, "anchor %s: %s", anchor, label)
 		} else {
@@ -436,11 +568,16 @@ func TestBFSAdmissionSnapshotMatchesPreviousStatement(t *testing.T) {
 		graph.DirectionBackward: {graph.EdgeCalls, graph.EdgeMatches, graph.EdgeReferences},
 	}
 	compared := 0
+	workspaceGate := map[string]bool{}
 	for _, s := range []*Store{base, derived} {
 		for _, seed := range []string{bfsCaseRoot, bfsCaseChild, bfsCaseContract, bfsCaseNowhere, bfsCaseElse, bfsCaseForeign} {
-			for _, repos := range []map[string]bool{nil, {"a": true}, {"a": true, "b": true}} {
-				scope := graph.NodeScope{RepoAllow: repos}
-				if !scope.Allows(s.GetNode(seed)) {
+			seedNode := s.GetNode(seed)
+			for _, scope := range []graph.NodeScope{
+				{}, {RepoAllow: map[string]bool{"a": true}}, {RepoAllow: map[string]bool{"a": true, "b": true}},
+				{WorkspaceID: "work"}, {WorkspaceID: "work", ProjectID: "a"}, {WorkspaceID: "elsewhere"},
+				{WorkspaceID: "work", RepoAllow: map[string]bool{"a": true, "b": true}},
+			} {
+				if !scope.Allows(seedNode) {
 					continue // the engine never walks from a seed outside its scope
 				}
 				for dir, kinds := range kindsByDirection {
@@ -448,8 +585,19 @@ func TestBFSAdmissionSnapshotMatchesPreviousStatement(t *testing.T) {
 						for _, limit := range []int{1, 2, 3, 5, 20, 50} {
 							for _, depth := range []int{1, 2, 4} {
 								request := graph.BFSAdmissionRequest{Seed: seed, Direction: dir, Kinds: kinds, Depth: depth, Limit: limit, Scope: scope}
-								requireBFSAdmissionMatchesPrevious(t, s, request, filter)
+								got, _ := requireBFSAdmissionMatchesPrevious(t, s, request, filter)
 								compared++
+								if scope.WorkspaceID == "" || len(scope.RepoAllow) > 0 || seedNode == nil {
+									continue
+								}
+								for _, node := range got.Nodes {
+									if !scope.Allows(node) {
+										workspaceGate["past the scope"] = true
+									}
+									if node.RepoPrefix != seedNode.RepoPrefix {
+										workspaceGate["across repositories"] = true
+									}
+								}
 							}
 						}
 					}
@@ -458,6 +606,8 @@ func TestBFSAdmissionSnapshotMatchesPreviousStatement(t *testing.T) {
 		}
 	}
 	require.Greater(t, compared, 1000)
+	require.Equal(t, map[string]bool{"past the scope": true, "across repositories": true}, workspaceGate,
+		"a workspace gate without a repository narrow walks both shapes")
 }
 
 func TestBFSAdmissionEdgeCaseFixtures(t *testing.T) {
@@ -585,8 +735,8 @@ func TestBFSAdmissionDroppedIndexFallback(t *testing.T) {
 	filter := graph.OutlineEdgeFilter{ExcludeKinds: []graph.EdgeKind{graph.EdgeMatches}, ExcludeNodeKinds: []graph.NodeKind{graph.KindContract}, ExcludeVia: "spring.Bean"}
 	var requests []graph.BFSAdmissionRequest
 	for _, dir := range []graph.Direction{graph.DirectionForward, graph.DirectionBackward} {
-		for _, repos := range []map[string]bool{nil, {"a": true}} {
-			requests = append(requests, graph.BFSAdmissionRequest{Seed: bfsCaseRoot, Direction: dir, Kinds: []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}, Depth: 3, Limit: 5, Scope: graph.NodeScope{RepoAllow: repos}})
+		for _, scope := range []graph.NodeScope{{}, {RepoAllow: map[string]bool{"a": true}}, {WorkspaceID: "work"}} {
+			requests = append(requests, graph.BFSAdmissionRequest{Seed: bfsCaseRoot, Direction: dir, Kinds: []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences}, Depth: 3, Limit: 5, Scope: scope})
 		}
 	}
 	indexed := make([]graph.BFSAdmissionSnapshot, len(requests))
