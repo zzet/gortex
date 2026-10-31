@@ -16,8 +16,10 @@ import (
 // the same callers and call chain whether the request reader exposes the
 // store's optional capabilities or only the plain Store contract: the scoped
 // admission statement and the repository-narrowed placeholder read are pure
-// accelerations. Boundaries, lower bounds, dynamic boundaries and truncation
-// ride the compared payloads.
+// accelerations. Boundaries, lower bounds and truncation ride the compared
+// payloads. Dynamic boundaries do not: they are detected in the target's
+// source on disk, and this fixture writes none, so they stay empty in every
+// arm.
 //
 // The contract-core wrapper hides matches edges, so only the unwrapped arm
 // may show the cross-repository match.
