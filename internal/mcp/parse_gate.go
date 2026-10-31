@@ -104,7 +104,7 @@ type parseGateResult struct {
 	Checked      bool   // the language was parseable and the gate ran
 	Blocked      bool   // newContent is a regression over oldContent
 	BecameBinary bool   // the edit turns a text file into NUL-bearing binary content
-	OldErrors    int    // parse errors in the pre-edit content
+	OldErrors    int    // parse errors in the pre-edit content; counted only when NewErrors > 0
 	NewErrors    int    // parse errors in the candidate content
 	Language     string // gate language (may be set even when Checked is false)
 }
@@ -152,8 +152,10 @@ func checkParseGate(path string, oldContent, newContent []byte) parseGateResult 
 	if !newOK {
 		return parseGateResult{Language: lang}
 	}
+	// A clean candidate cannot regress, so the prior bytes are parsed only
+	// when there are errors to compare against: a clean edit costs one parse.
 	oldErrs := 0
-	if len(oldContent) > 0 {
+	if newErrs > 0 && len(oldContent) > 0 {
 		if e, ok := parseErrorCount(lang, oldContent); ok {
 			oldErrs = e
 		}
@@ -186,8 +188,8 @@ func parseGateInfo(r parseGateResult, allowed bool) map[string]any {
 	if !r.Checked {
 		return nil
 	}
-	if r.OldErrors == r.NewErrors && r.NewErrors == 0 && !r.Blocked {
-		return nil // nothing to report — a clean file stayed clean
+	if r.NewErrors == 0 && !r.Blocked {
+		return nil // nothing to report — the candidate is clean
 	}
 	m := map[string]any{
 		"language":   r.Language,
