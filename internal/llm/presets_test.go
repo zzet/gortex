@@ -75,6 +75,12 @@ func TestConfig_ActiveCustom_PresetResolution(t *testing.T) {
 		t.Errorf("llm-buzz preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(buzz))
 	}
 
+	opper := Config{Provider: "opper"}
+	cp, ok = opper.ActiveCustom()
+	if !ok || cp.BaseURL != "https://api.opper.ai/v3/compat" || cp.Model != "gpt-6.1-terra" || cp.APIKeyEnv != "OPPER_API_KEY" || cp.SchemaMode != "json_schema" || ProfileFor(opper) != ProfileFrontier {
+		t.Errorf("opper preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(opper))
+	}
+
 	// A user custom provider of the same name always wins, wholesale —
 	// no preset field leaks into it.
 	c.Custom = map[string]CustomProvider{"testgw": {BaseURL: "https://mine/v1", Model: "my-model"}}

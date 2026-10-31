@@ -25,7 +25,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Watching for Gortex localization completion...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ],
@@ -38,7 +38,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Enforcing Gortex graph access policy...",
-            "timeout": 3000,
+            "timeout": 15,
             "type": "command"
           }
         ],
@@ -51,7 +51,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Loading Gortex graph orientation...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -63,7 +63,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Running Gortex post-task diagnostics...",
-            "timeout": 5000,
+            "timeout": 45,
             "type": "command"
           }
         ]
@@ -75,7 +75,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Starting an isolated Gortex subagent turn...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -87,7 +87,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Clearing Gortex subagent turn state...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -99,7 +99,7 @@
           {
             "command": "gortex hook",
             "statusMessage": "Surfacing relevant Gortex symbols...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -718,7 +718,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Watching for Gortex localization completion...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ],
@@ -731,7 +731,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Enforcing Gortex graph access policy...",
-            "timeout": 3000,
+            "timeout": 15,
             "type": "command"
           }
         ],
@@ -744,7 +744,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Loading Gortex graph orientation...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -756,7 +756,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Running Gortex post-task diagnostics...",
-            "timeout": 5000,
+            "timeout": 45,
             "type": "command"
           }
         ]
@@ -768,7 +768,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Starting an isolated Gortex subagent turn...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -780,7 +780,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Clearing Gortex subagent turn state...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]
@@ -792,7 +792,7 @@ In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actio
           {
             "command": "gortex hook",
             "statusMessage": "Surfacing relevant Gortex symbols...",
-            "timeout": 3000,
+            "timeout": 3,
             "type": "command"
           }
         ]

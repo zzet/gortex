@@ -56,6 +56,40 @@ func TestNew_CustomProviderDispatches(t *testing.T) {
 	}
 }
 
+// TestNew_CustomBaseURLPathIsKept proves a base URL whose path is not
+// /v1 (Opper's /v3/compat) keeps that path when /chat/completions is
+// appended.
+func TestNew_CustomBaseURLPathIsKept(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("MY_GATEWAY_KEY", "secret")
+	cfg := llm.Config{
+		Provider: "mygw",
+		Custom: map[string]llm.CustomProvider{
+			"mygw": {BaseURL: srv.URL + "/v3/compat", Model: "some-model", APIKeyEnv: "MY_GATEWAY_KEY"},
+		},
+	}
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	if _, err := p.Complete(context.Background(), llm.CompletionRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v3/compat/chat/completions" {
+		t.Errorf("path=%q want /v3/compat/chat/completions", gotPath)
+	}
+}
+
 func TestNew_CustomKeylessOmitsAuth(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

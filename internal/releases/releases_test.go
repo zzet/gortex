@@ -40,6 +40,7 @@ func setupTaggedRepo(t *testing.T) string {
 	runCmd(t, dir, "git", "init", "-q")
 	runCmd(t, dir, "git", "config", "user.email", "test@example.com")
 	runCmd(t, dir, "git", "config", "user.name", "Tester")
+	runCmd(t, dir, "git", "config", "tag.gpgsign", "false")
 
 	writeFile(t, filepath.Join(dir, "a.go"), "package main\n")
 	runCmd(t, dir, "git", "add", "a.go")

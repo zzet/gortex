@@ -1,6 +1,11 @@
 # publish-claude-plugin syncs the generated marketplace bundle from
 # this repo to gortexhq/claude-plugin on every gortex release.
 #
+# release.yml dispatches it after each release: releases are created
+# with GITHUB_TOKEN, which does not fire the `release: published`
+# trigger below. That trigger only covers releases published without
+# GITHUB_TOKEN, such as by hand.
+#
 # How it works:
 #   1. Checkout gortex at the released tag
 #   2. Regenerate the bundle via `make claude-plugin`

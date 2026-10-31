@@ -198,6 +198,9 @@ func derivationParser(
 // gitBlobContent reads a path at a commit.
 func gitBlobContent(root, commit string) func(ctx context.Context, rel string) ([]byte, bool) {
 	return func(ctx context.Context, rel string) ([]byte, bool) {
+		if !gitBlobObjectNameValid(rel) {
+			return nil, false
+		}
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		out, err := exec.CommandContext(ctx, "git", "-C", root, "cat-file", "blob", commit+":"+rel).Output()
