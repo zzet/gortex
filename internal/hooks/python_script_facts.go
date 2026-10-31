@@ -23,6 +23,7 @@ import (
 type pyScriptFacts struct {
 	reads     []string        // literal source paths read, in order
 	writeBack map[string]bool // literal paths written back
+	guessed   map[string]bool // written back only by a write it cannot name
 	seen      map[string]bool
 }
 
@@ -115,7 +116,7 @@ func analyzePythonScript(code string, deadline time.Time) (pyScriptFacts, bool) 
 		ambiguous: map[string]bool{},
 		deadline:  deadline,
 		root:      root.Id(),
-		facts:     pyScriptFacts{writeBack: map[string]bool{}, seen: map[string]bool{}},
+		facts:     pyScriptFacts{writeBack: map[string]bool{}, guessed: map[string]bool{}, seen: map[string]bool{}},
 	}
 	a.bind(root, a.root, 0)
 	a.collect(root, a.root, 0)
@@ -125,7 +126,10 @@ func analyzePythonScript(code string, deadline time.Time) (pyScriptFacts, bool) 
 	// A write the script cannot name may be any file it read.
 	if a.unresolved {
 		for _, p := range a.facts.reads {
-			a.facts.writeBack[p] = true
+			if !a.facts.writeBack[p] {
+				a.facts.writeBack[p] = true
+				a.facts.guessed[p] = true
+			}
 		}
 	}
 	return a.facts, true

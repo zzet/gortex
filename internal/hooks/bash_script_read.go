@@ -313,16 +313,12 @@ func cdPositions(cmd string, leading int) []int {
 	return positions
 }
 
-// pyChdirRE is a possible working-directory change inside the script
-// (os.chdir, fchdir, chdir imported or aliased from os), after which a
-// relative path no longer resolves against the hook's cwd.
-var pyChdirRE = regexp.MustCompile(`chdir`)
-
 // enrichBashScriptRead answers inline Python that reads indexed source.
 // answered is false when the command runs no such script, so the caller
 // falls through to its own verdict.
 func enrichBashScriptRead(cmd, cwd string, scopeProbe fileScopeProbe) (enrichResult, bool) {
-	deadline := time.Now().Add(inlineScriptTime)
+	started := time.Now()
+	deadline := started.Add(inlineScriptTime)
 	scripts := pythonScriptsAt(cmd)
 	if len(scripts) == 0 {
 		return enrichResult{}, false
@@ -343,7 +339,10 @@ func enrichBashScriptRead(cmd, cwd string, scopeProbe fileScopeProbe) (enrichRes
 				return "", false
 			}
 		}
-		if script.cwdUnknown || pyChdirRE.MatchString(script.code) {
+		// A possible working-directory change inside the script (os.chdir,
+		// fchdir, chdir imported or aliased from os): a relative path no
+		// longer resolves against the hook's cwd.
+		if script.cwdUnknown || strings.Contains(script.code, "chdir") {
 			return "", false
 		}
 		if cdDir != "" {
@@ -353,8 +352,9 @@ func enrichBashScriptRead(cmd, cwd string, scopeProbe fileScopeProbe) (enrichRes
 	}
 
 	type candidate struct {
-		script pythonScript
-		path   string
+		script  pythonScript
+		path    string
+		guessed bool // the write target is unnamed: it may be another file
 	}
 	var edits, reads []candidate
 	for _, script := range scripts {
@@ -364,9 +364,9 @@ func enrichBashScriptRead(cmd, cwd string, scopeProbe fileScopeProbe) (enrichRes
 		}
 		for _, p := range facts.reads {
 			if facts.writeBack[p] {
-				edits = append(edits, candidate{script, p})
+				edits = append(edits, candidate{script, p, facts.guessed[p]})
 			} else {
-				reads = append(reads, candidate{script, p})
+				reads = append(reads, candidate{script, p, false})
 			}
 		}
 	}
@@ -397,10 +397,15 @@ func enrichBashScriptRead(cmd, cwd string, scopeProbe fileScopeProbe) (enrichRes
 			}
 			// Read, modify, write back: an edit by another name, so it gets
 			// the shell-write answer, advisory unless edit blocking is on.
+			verb := "rewrites"
+			if c.guessed {
+				verb = "may rewrite"
+			}
+			logHookDecision("Bash", "", DecisionRedirectedWrite, st.Count, time.Since(started))
 			return writeRedirect(
 				fmt.Sprintf(
-					"Bash Python script rewrites %s (indexed source, %d symbols). A shell write goes around the graph, which only catches up afterwards, and around the parse gate `edit` runs before it touches disk. Use:",
-					c.path, st.Count),
+					"Bash Python script %s %s (indexed source, %d symbols). A shell write goes around the graph, which only catches up afterwards, and around the parse gate `edit` runs before it touches disk. Use:",
+					verb, c.path, st.Count),
 				"`edit(operation:\"symbol\", target:{symbol:\"<id>\"})` for one symbol",
 				"`edit(operation:\"file\", target:{file:\"<path>\"})` for a guarded replacement — this one parse-gates",
 				"`edit(operation:\"write\", target:{file:\"<path>\"})` for a whole-file write — this one too",

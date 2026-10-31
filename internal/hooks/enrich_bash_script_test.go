@@ -25,6 +25,7 @@ func TestEnrichBash_InlinePython(t *testing.T) {
 	const (
 		deny   = "deny"   // the Read deny
 		edit   = "edit"   // the shell-write advisory
+		maybe  = "maybe"  // the shell-write advisory, for a write it cannot name
 		silent = "silent" // nothing at all
 		allow  = "allow"  // no deny (another door may still advise)
 	)
@@ -47,7 +48,7 @@ func TestEnrichBash_InlinePython(t *testing.T) {
 		{"read-modify-write", "python3 - <<'EOF'\nfrom pathlib import Path\np = Path('a.go'); s = p.read_text()\np.write_text(s.replace('x', 'y'))\nEOF", edit},
 		{"r+", `python3 -c "f=open('a.go','r+'); s=f.read(); f.seek(0); f.write(s)"`, edit},
 		{"expression write target", "python3 - <<'EOF'\nimport os\nf = 'a.go'\ns = open(f).read()\nopen(os.path.abspath(f), 'w').write(s)\nEOF", edit},
-		{"unnamed write target", `python3 -c "s=open('a.go').read(); open(sys.argv[1], 'w').write(s)"`, edit},
+		{"unnamed write target", `python3 -c "s=open('a.go').read(); open(sys.argv[1], 'w').write(s)"`, maybe},
 		{"edit wins over reads", `python3 -c "print(open('b.go').read())" && python3 -c "p='a.go'; s=open(p).read(); open(p,'w').write(s)"`, edit},
 
 		// Everything else passes.
@@ -117,6 +118,10 @@ func TestEnrichBash_InlinePython(t *testing.T) {
 				if r.deny || !strings.Contains(r.context, "Python script rewrites") {
 					t.Errorf("want the edit advisory, got %+v", r)
 				}
+			case maybe:
+				if r.deny || !strings.Contains(r.context, "Python script may rewrite") {
+					t.Errorf("want the hedged edit advisory, got %+v", r)
+				}
 			case silent:
 				if r.deny || r.context != "" {
 					t.Errorf("want silence, got %+v", r)
@@ -139,6 +144,18 @@ func TestEnrichBash_InlinePythonEditBlocking(t *testing.T) {
 	r := enrichBash(map[string]any{"command": `python3 -c "p='a.go'; s=open(p).read(); open(p,'w').write(s)"`}, "/repo")
 	if !r.deny || !strings.Contains(r.reason, "rewrites a.go") {
 		t.Errorf("want the edit deny, got %+v", r)
+	}
+}
+
+// A redirected Python patch script is counted with the other shell writes.
+func TestEnrichBash_InlinePythonEditTelemetry(t *testing.T) {
+	log := redirectTelemetry(t)
+	stubIndexedPaths(t, "a.go")
+	t.Setenv("GORTEX_HOOK_BLOCK_EDIT", "")
+	enrichBash(map[string]any{"command": `python3 -c "p='a.go'; s=open(p).read(); open(p,'w').write(s)"`}, "/repo")
+	records := readDecisions(t, log)
+	if len(records) != 1 || records[0].Decision != DecisionRedirectedWrite || records[0].Tool != "Bash" {
+		t.Fatalf("decision log = %+v, want one Bash %q record", records, DecisionRedirectedWrite)
 	}
 }
 
