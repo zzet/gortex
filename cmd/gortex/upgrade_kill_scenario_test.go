@@ -19,6 +19,7 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
 )
 
 // The upgrade-with-kill scenario runs a real gortex binary over a copy of an
@@ -27,17 +28,27 @@ import (
 //
 //	GORTEX_UPGRADE_SCENARIO_BINARY=<gortex binary under test>
 //	GORTEX_UPGRADE_SCENARIO_STORE=<store an older release wrote>
+//	GORTEX_UPGRADE_SCENARIO_REPO=<repository that store indexed>
 //	GORTEX_UPGRADE_SCENARIO_OUT=<receipt.json>   (optional)
 //	go test -tags acceptance -run '^TestUpgradeKillScenario$' ./cmd/gortex/
 //
-// The daemon opens its socket only after the migration, so nothing can
-// answer tools/list while it runs. The receipt measures that window (every
-// sample's socket state) instead of asserting a serving gate the daemon
-// cannot meet yet.
+// The repository is tracked in the scenario's private home, and every sample
+// opens a fresh MCP session from it: it times tools/list and makes one graph
+// call. The daemon opens its socket only after the migration, so neither gets
+// an answer while it runs. The receipt measures that window instead of
+// asserting a serving gate the daemon cannot meet yet. The scenario fails only
+// on what the daemon answers once its socket is open: repo_not_tracked for the
+// tracked repository, or no graph answer before the deadline.
 const (
 	upgradeScenarioBinaryEnv = "GORTEX_UPGRADE_SCENARIO_BINARY"
 	upgradeScenarioStoreEnv  = "GORTEX_UPGRADE_SCENARIO_STORE"
+	upgradeScenarioRepoEnv   = "GORTEX_UPGRADE_SCENARIO_REPO"
 	upgradeScenarioOutEnv    = "GORTEX_UPGRADE_SCENARIO_OUT"
+
+	upgradeScenarioNoSocket = "no_socket"
+	// upgradeScenarioReadyWait bounds how long the restarted daemon may serve
+	// before the tracked repository answers a graph call.
+	upgradeScenarioReadyWait = 20 * time.Minute
 )
 
 type upgradeScenarioSample struct {
@@ -45,6 +56,14 @@ type upgradeScenarioSample struct {
 	Phase    string `json:"phase"`
 	Socket   string `json:"socket"` // "none" or "accepting"
 	WALBytes int64  `json:"wal_bytes"`
+	// ToolsListMillis covers what a fresh editor session waits for: dial,
+	// initialize and tools/list.
+	ToolsListMillis int64  `json:"tools_list_ms,omitempty"`
+	ToolsList       string `json:"tools_list"`
+	// GraphCall is the answer to a symbol search from the tracked
+	// repository: "ok", the refusal's error_code (with its phase, if any),
+	// or no_socket.
+	GraphCall string `json:"graph_call"`
 }
 
 type upgradeScenarioRun struct {
@@ -53,20 +72,22 @@ type upgradeScenarioRun struct {
 	KilledAtMillis  int64 `json:"killed_at_ms,omitempty"`
 	KilledInVersion int   `json:"killed_in_migration_version,omitempty"`
 	ServingAtMillis int64 `json:"serving_at_ms,omitempty"`
-	// ToolsListMillis covers what a fresh editor session waits for: dial,
-	// initialize and tools/list.
-	ToolsListMillis  int64                   `json:"tools_list_ms,omitempty"`
-	ToolsListOutcome string                  `json:"tools_list_outcome,omitempty"`
-	BytesWritten     *int64                  `json:"bytes_written,omitempty"` // Linux /proc/<pid>/io only
-	Samples          []upgradeScenarioSample `json:"samples"`
+	// ReadyAtMillis is the first sample whose graph call answered.
+	ReadyAtMillis int64                   `json:"ready_at_ms,omitempty"`
+	BytesWritten  *int64                  `json:"bytes_written,omitempty"` // Linux /proc/<pid>/io only
+	Samples       []upgradeScenarioSample `json:"samples"`
 }
 
 type upgradeScenarioReceipt struct {
-	FromVersion      int   `json:"from_version"`
-	StoreBytesBefore int64 `json:"store_bytes_before"`
-	StoreBytesAfter  int64 `json:"store_bytes_after"`
-	WALPeakBytes     int64 `json:"wal_peak_bytes"`
-	BackupBytes      int64 `json:"backup_bytes"`
+	FromVersion      int    `json:"from_version"`
+	Repo             string `json:"repo"`
+	StoreBytesBefore int64  `json:"store_bytes_before"`
+	StoreBytesAfter  int64  `json:"store_bytes_after"`
+	// WALPeakBytes covers the upgrade, until the restarted daemon serves;
+	// WarmupWALPeakBytes covers the load of the tracked repository after it.
+	WALPeakBytes       int64 `json:"wal_peak_bytes"`
+	WarmupWALPeakBytes int64 `json:"warmup_wal_peak_bytes"`
+	BackupBytes        int64 `json:"backup_bytes"`
 	// WallMillis runs from the first start until the restarted daemon serves.
 	WallMillis                 int64              `json:"wall_ms"`
 	Interrupted                upgradeScenarioRun `json:"interrupted"`
@@ -74,13 +95,18 @@ type upgradeScenarioReceipt struct {
 	MigratingSamples           int                `json:"migrating_samples"`
 	MigratingSamplesWithSocket int                `json:"migrating_samples_with_socket"`
 	ServingDuringMigration     bool               `json:"serving_during_migration"`
-	Note                       string             `json:"note"`
+	// ToolsListMaxMillis is the slowest tools/list among the samples that
+	// got one.
+	ToolsListMaxMillis int64 `json:"tools_list_max_ms"`
+	// GraphCalls counts every sample's graph-call answer.
+	GraphCalls map[string]int `json:"graph_calls"`
+	Note       string         `json:"note"`
 }
 
 func TestUpgradeKillScenario(t *testing.T) {
-	binary, source := os.Getenv(upgradeScenarioBinaryEnv), os.Getenv(upgradeScenarioStoreEnv)
-	if binary == "" || source == "" {
-		t.Skipf("set %s and %s to run the upgrade-with-kill scenario", upgradeScenarioBinaryEnv, upgradeScenarioStoreEnv)
+	binary, source, repo := os.Getenv(upgradeScenarioBinaryEnv), os.Getenv(upgradeScenarioStoreEnv), os.Getenv(upgradeScenarioRepoEnv)
+	if binary == "" || source == "" || repo == "" {
+		t.Skipf("set %s, %s and %s to run the upgrade-with-kill scenario", upgradeScenarioBinaryEnv, upgradeScenarioStoreEnv, upgradeScenarioRepoEnv)
 	}
 	// A short root keeps the socket path under the platform's sun_path limit.
 	root, err := os.MkdirTemp("", "gx-upgrade")
@@ -99,7 +125,7 @@ func TestUpgradeKillScenario(t *testing.T) {
 		}
 	}
 	from := scenarioUserVersion(t, store)
-	receipt := upgradeScenarioReceipt{FromVersion: from, StoreBytesBefore: fileSize(store)}
+	receipt := upgradeScenarioReceipt{FromVersion: from, Repo: repo, StoreBytesBefore: fileSize(store), GraphCalls: map[string]int{}}
 
 	home := filepath.Join(root, "home")
 	env := append(os.Environ(),
@@ -114,15 +140,32 @@ func TestUpgradeKillScenario(t *testing.T) {
 	t.Setenv("GORTEX_DAEMON_STATEFILE", filepath.Join(root, "state.json"))
 	socket := filepath.Join(root, "d.sock")
 
+	// Track the repository the way its user did, so the restarted daemon
+	// loads it from the upgraded store. With no daemon running, track only
+	// writes the config.
+	track := exec.Command(binary, "track", repo, "--no-progress")
+	track.Env = append(env, "GORTEX_AUTOSTART=off")
+	if out, err := track.CombinedOutput(); err != nil {
+		t.Fatalf("track %s: %v\n%s", repo, err, out)
+	}
+
 	start := time.Now()
-	receipt.Interrupted = runScenarioDaemon(t, binary, env, store, socket, start, true)
-	receipt.Restarted = runScenarioDaemon(t, binary, env, store, socket, start, false)
+	receipt.Interrupted = runScenarioDaemon(t, binary, env, store, socket, repo, start, true)
+	receipt.Restarted = runScenarioDaemon(t, binary, env, store, socket, repo, start, false)
 	receipt.WallMillis = receipt.Restarted.ServingAtMillis
 	receipt.StoreBytesAfter = fileSize(store)
 	receipt.BackupBytes = fileSize(store_sqlite.UpgradeBackupPath(store, from))
 	for _, run := range []upgradeScenarioRun{receipt.Interrupted, receipt.Restarted} {
 		for _, s := range run.Samples {
-			receipt.WALPeakBytes = max(receipt.WALPeakBytes, s.WALBytes)
+			if run.ServingAtMillis > 0 && s.AtMillis >= run.ServingAtMillis {
+				receipt.WarmupWALPeakBytes = max(receipt.WarmupWALPeakBytes, s.WALBytes)
+			} else {
+				receipt.WALPeakBytes = max(receipt.WALPeakBytes, s.WALBytes)
+			}
+			if s.ToolsList == "ok" {
+				receipt.ToolsListMaxMillis = max(receipt.ToolsListMaxMillis, s.ToolsListMillis)
+			}
+			receipt.GraphCalls[s.GraphCall]++
 			if s.Phase == string(daemon.StartupMigrating) {
 				receipt.MigratingSamples++
 				if s.Socket == "accepting" {
@@ -133,8 +176,8 @@ func TestUpgradeKillScenario(t *testing.T) {
 	}
 	receipt.ServingDuringMigration = receipt.MigratingSamplesWithSocket > 0
 	receipt.Note = "the daemon opens its socket only after the store migration completes, so tools/list and graph calls " +
-		"cannot be answered (not even with a retryable repo_loading) while it runs; serving during the migration " +
-		"belongs to the startup readiness work and is measured here, not gated"
+		"get no answer (not even a retryable repo_loading) while it runs, and those samples read no_socket; serving " +
+		"during the migration belongs to the startup readiness work and is measured here, not gated"
 
 	if out := os.Getenv(upgradeScenarioOutEnv); out != "" {
 		blob, err := json.MarshalIndent(receipt, "", "  ")
@@ -145,21 +188,24 @@ func TestUpgradeKillScenario(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	t.Logf("upgrade v%d: wall %dms, WAL peak %d, store %d -> %d, backup %d, migrating samples %d (with socket %d)",
-		from, receipt.WallMillis, receipt.WALPeakBytes, receipt.StoreBytesBefore, receipt.StoreBytesAfter,
-		receipt.BackupBytes, receipt.MigratingSamples, receipt.MigratingSamplesWithSocket)
+	t.Logf("upgrade v%d: wall %dms, ready %dms, WAL peak %d (warmup %d), store %d -> %d, backup %d, migrating samples %d (with socket %d), tools/list max %dms, graph calls %v",
+		from, receipt.WallMillis, receipt.Restarted.ReadyAtMillis, receipt.WALPeakBytes, receipt.WarmupWALPeakBytes, receipt.StoreBytesBefore, receipt.StoreBytesAfter,
+		receipt.BackupBytes, receipt.MigratingSamples, receipt.MigratingSamplesWithSocket, receipt.ToolsListMaxMillis, receipt.GraphCalls)
 	if got := scenarioUserVersion(t, store); got <= from {
 		t.Fatalf("the restarted daemon left the store at v%d", got)
 	}
 	if !receipt.Interrupted.Killed {
 		t.Fatalf("the first daemon finished before reporting a migration; nothing was interrupted")
 	}
+	if n := receipt.GraphCalls[string(gortexmcp.ErrCodeRepoNotTracked)]; n > 0 {
+		t.Errorf("%d graph calls from the tracked repository %s answered repo_not_tracked", n, repo)
+	}
 }
 
 // runScenarioDaemon starts the daemon in the foreground and samples its
-// startup until it serves; with kill set it SIGKILLs the daemon at the first
-// migrating sample instead.
-func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket string, origin time.Time, kill bool) upgradeScenarioRun {
+// startup until it serves and the tracked repository answers a graph call;
+// with kill set it SIGKILLs the daemon at the first migrating sample instead.
+func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket, repo string, origin time.Time, kill bool) upgradeScenarioRun {
 	t.Helper()
 	cmd := exec.Command(binary, "daemon", "start", "--no-progress", "--backend-path", store)
 	cmd.Env = env
@@ -170,9 +216,16 @@ func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket 
 	run := upgradeScenarioRun{PID: cmd.Process.Pid}
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
+	var servingAt time.Time
 	deadline := time.Now().Add(2 * time.Hour)
 	for time.Now().Before(deadline) {
-		sample := upgradeScenarioSample{AtMillis: time.Since(origin).Milliseconds(), Socket: "none", WALBytes: fileSize(store + "-wal")}
+		sample := upgradeScenarioSample{
+			AtMillis:  time.Since(origin).Milliseconds(),
+			Socket:    "none",
+			WALBytes:  fileSize(store + "-wal"),
+			ToolsList: upgradeScenarioNoSocket,
+			GraphCall: upgradeScenarioNoSocket,
+		}
 		st, ok := daemon.ReadRuntimeStateOf(cmd.Process.Pid)
 		if ok {
 			sample.Phase = string(st.StartupPhase)
@@ -180,6 +233,7 @@ func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket 
 		if conn, err := net.DialTimeout("unix", socket, 200*time.Millisecond); err == nil {
 			sample.Socket = "accepting"
 			_ = conn.Close()
+			sample.ToolsListMillis, sample.ToolsList, sample.GraphCall = scenarioProbe(socket, repo)
 		}
 		run.Samples = append(run.Samples, sample)
 		if kill && sample.Phase == string(daemon.StartupMigrating) {
@@ -189,10 +243,18 @@ func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket 
 			run.Killed, run.KilledAtMillis, run.KilledInVersion = true, sample.AtMillis, st.MigrationVersion
 			return run
 		}
-		if sample.Socket == "accepting" && sample.Phase == string(daemon.StartupServing) {
+		if servingAt.IsZero() && sample.Socket == "accepting" && sample.Phase == string(daemon.StartupServing) {
+			servingAt = time.Now()
 			run.ServingAtMillis = sample.AtMillis
-			run.ToolsListMillis, run.ToolsListOutcome = scenarioToolsList(socket)
 			run.BytesWritten = procBytesWritten(cmd.Process.Pid)
+		}
+		// A first daemon that serves without migrating is stopped at once
+		// (the scenario then fails); the restarted one is followed through
+		// the warmup a session meets after the migration.
+		if !servingAt.IsZero() && (kill || sample.GraphCall == "ok") {
+			if sample.GraphCall == "ok" {
+				run.ReadyAtMillis = sample.AtMillis
+			}
 			stop := exec.Command(binary, "daemon", "stop", "--no-progress")
 			stop.Env = env
 			_ = stop.Run()
@@ -204,6 +266,11 @@ func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket 
 			}
 			return run
 		}
+		if !servingAt.IsZero() && time.Since(servingAt) > upgradeScenarioReadyWait {
+			_ = cmd.Process.Kill()
+			<-exited
+			t.Fatalf("the tracked repository answered no graph call within %s of serving; last answer: %s", upgradeScenarioReadyWait, sample.GraphCall)
+		}
 		select {
 		case err := <-exited:
 			t.Fatalf("daemon exited during startup: %v", err)
@@ -211,39 +278,86 @@ func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket 
 		}
 	}
 	_ = cmd.Process.Kill()
-	t.Fatal("daemon did not serve within the scenario deadline")
+	t.Fatal("the daemon did not answer a graph call within the scenario deadline")
 	return run
 }
 
-// scenarioToolsList opens a fresh MCP session on the daemon socket, the way
-// an editor's proxy does, and lists the tools. The private daemon tracks no
-// repository, so the session is unbound, which tools/list allows.
-func scenarioToolsList(socket string) (int64, string) {
+// scenarioProbe opens a fresh MCP session from repo, the way an editor's
+// proxy does: it times dial, initialize and tools/list, then makes one graph
+// call. It returns the tools/list time and outcome and the graph answer.
+func scenarioProbe(socket, repo string) (int64, string, string) {
 	began := time.Now()
 	elapsed := func() int64 { return time.Since(began).Milliseconds() }
-	c, err := daemon.DialTo(socket, daemon.Handshake{Mode: daemon.ModeMCP, ClientName: "upgrade-scenario"})
+	c, err := daemon.DialToWithDeadline(socket, daemon.Handshake{Mode: daemon.ModeMCP, CWD: repo, ClientName: "upgrade-scenario"}, began.Add(30*time.Second))
 	if err != nil {
-		return elapsed(), "dial: " + err.Error()
+		return elapsed(), "dial: " + err.Error(), "dial: " + err.Error()
 	}
 	defer c.Close()
-	_ = c.Conn.SetDeadline(time.Now().Add(30 * time.Second))
-	if _, err := handoffMCPRequest(c, 1, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"upgrade-scenario","version":"1"}}}`); err != nil {
-		return elapsed(), "initialize: " + err.Error()
+	initialized, err := scenarioRequest(c, 1, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"upgrade-scenario","version":"1"}}}`)
+	if outcome := scenarioOutcome(initialized, err); outcome != "ok" {
+		return elapsed(), "initialize: " + outcome, "initialize: " + outcome
 	}
 	if err := c.WriteMCPFrame([]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)); err != nil {
-		return elapsed(), "initialized: " + err.Error()
+		return elapsed(), "initialized: " + err.Error(), "initialized: " + err.Error()
 	}
-	listed, err := handoffMCPRequest(c, 2, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	listed, err := scenarioRequest(c, 2, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	toolsListMillis, toolsList := elapsed(), scenarioOutcome(listed, err)
+	called, err := scenarioRequest(c, 3, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"operation":"symbols","query":"Open"}}}`)
+	return toolsListMillis, toolsList, scenarioOutcome(called, err)
+}
+
+// scenarioRequest sends one request and returns the reply paired to its id,
+// skipping whatever the server sends in between.
+func scenarioRequest(c *daemon.Client, id int, frame string) (map[string]any, error) {
+	if err := c.WriteMCPFrame([]byte(frame)); err != nil {
+		return nil, err
+	}
+	for {
+		raw, err := c.ReadMCPFrame()
+		if err != nil {
+			return nil, err
+		}
+		var reply map[string]any
+		if err := json.Unmarshal(raw, &reply); err != nil {
+			return nil, err
+		}
+		if got, ok := reply["id"].(float64); ok && int(got) == id && reply["method"] == nil {
+			return reply, nil
+		}
+	}
+}
+
+// scenarioOutcome names a reply: "ok", the refusal's error_code with its
+// phase when it carries one (repo_loading{phase: migrating}), or the failure.
+func scenarioOutcome(reply map[string]any, err error) string {
 	if err != nil {
-		return elapsed(), "tools/list: " + err.Error()
+		return "error: " + err.Error()
 	}
-	var tools struct {
-		Tools []json.RawMessage `json:"tools"`
+	if rpcErr, ok := reply["error"].(map[string]any); ok {
+		data, _ := rpcErr["data"].(map[string]any)
+		code, _ := data["error_code"].(string)
+		if code == "" {
+			return fmt.Sprintf("error: %v", rpcErr["message"])
+		}
+		if phase, _ := data["phase"].(string); phase != "" {
+			return fmt.Sprintf("%s{phase: %s}", code, phase)
+		}
+		return code
 	}
-	if err := json.Unmarshal(listed, &tools); err != nil {
-		return elapsed(), "tools/list: " + err.Error()
+	if result, _ := reply["result"].(map[string]any); result["isError"] == true {
+		// A tool error carries its structured error as the text block.
+		content, _ := result["content"].([]any)
+		if len(content) > 0 {
+			block, _ := content[0].(map[string]any)
+			text, _ := block["text"].(string)
+			var structured gortexmcp.StructuredError
+			if json.Unmarshal([]byte(text), &structured) == nil && structured.ErrorCode != "" {
+				return "tool_error: " + string(structured.ErrorCode)
+			}
+		}
+		return "tool_error"
 	}
-	return elapsed(), fmt.Sprintf("ok (%d tools)", len(tools.Tools))
+	return "ok"
 }
 
 // procBytesWritten reads the bytes a process caused to be written to storage,
