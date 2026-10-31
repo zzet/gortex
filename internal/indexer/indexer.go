@@ -3438,11 +3438,16 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				restubGoModuleRepoIncoming(diskTarget, idx.RepoPrefix())
 			}
 			var evictedNodes, evictedEdges int
-			if sqlite, ok := diskTarget.(*store_sqlite.Store); ok && sqlite.SupportsShadowReplacementRetirement() {
+			sqliteTarget, isSQLite := diskTarget.(*store_sqlite.Store)
+			retirement := isSQLite && sqliteTarget.SupportsShadowReplacementRetirement()
+			if shadowEvictionBranchHook != nil {
+				shadowEvictionBranchHook(retirement)
+			}
+			if retirement {
 				var err error
 				shadowReplacementStarted = true
 				restubTrackedNpmRepoIncoming(diskTarget, idx.RepoPrefix())
-				evictedNodes, evictedEdges, err = sqlite.EvictRepoForShadowReplacement(ctx, idx.RepoPrefix())
+				evictedNodes, evictedEdges, err = sqliteTarget.EvictRepoForShadowReplacement(ctx, idx.RepoPrefix())
 				if err != nil {
 					retErr = fmt.Errorf("indexer: retire shadow replacement rows: %w", err)
 					return

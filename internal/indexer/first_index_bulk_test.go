@@ -27,8 +27,6 @@ type firstIndexBulkProbe struct {
 	*store_sqlite.Store
 	beforeBegin func()
 	duringDrain func()
-	ftsErr      error
-	panicDrain  bool
 	begins      int
 	flushes     int
 	batches     int
@@ -47,9 +45,6 @@ func (s *firstIndexBulkProbe) beforeBatch() {
 	if s.duringDrain != nil {
 		s.duringDrain()
 	}
-	if s.panicDrain {
-		panic("injected drain panic")
-	}
 }
 
 func (s *firstIndexBulkProbe) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
@@ -61,13 +56,6 @@ func (s *firstIndexBulkProbe) AddBatch(nodes []*graph.Node, edges []*graph.Edge)
 func (s *firstIndexBulkProbe) AddBatchCheckedContext(ctx context.Context, nodes []*graph.Node, edges []*graph.Edge) error {
 	s.beforeBatch()
 	return s.Store.AddBatchCheckedContext(ctx, nodes, edges)
-}
-
-func (s *firstIndexBulkProbe) BatchUpsertSymbolFTS(items []graph.SymbolFTSItem) error {
-	if s.ftsErr != nil {
-		return s.ftsErr
-	}
-	return s.Store.BatchUpsertSymbolFTS(items)
 }
 
 func (s *firstIndexBulkProbe) FlushBulk() error {
@@ -164,8 +152,7 @@ func assertFirstIndexRestored(t *testing.T, store *store_sqlite.Store, db *sql.D
 	require.False(t, firstIndexBulkActive(t, store), "standalone window must be closed before restoration probes")
 	assert.Equal(t, indexes, firstIndexSchemaIndexes(t, db))
 	// PRAGMA synchronous is connection-local, so this read-only pool cannot
-	// check writer restoration. TestBulkLoadDropsAndRebuildsIndexes in
-	// store_sqlite checks the actual writer connection instead.
+	// check writer restoration; firstIndexWriterSynchronous reads the writer.
 }
 
 // sqliteFullError provokes a genuine SQLITE_FULL from the driver on a
@@ -301,53 +288,123 @@ func (firstIndexPanicReporter) Report(stage string, _, _ int) {
 	}
 }
 
+// firstIndexDrainFTSTrigger makes every symbol FTS append on store fail, the
+// way a storage error inside the drain's FTS writes would.
+func firstIndexDrainFTSTrigger(t *testing.T, store *store_sqlite.Store) {
+	t.Helper()
+	writer, err := sql.Open("sqlite", "file:"+filepath.ToSlash(store.Path()))
+	require.NoError(t, err)
+	_, err = writer.Exec(`CREATE TRIGGER fail_first_index_fts BEFORE INSERT ON symbol_fts_rowid
+BEGIN SELECT RAISE(ABORT, 'injected drain FTS error'); END`)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+}
+
+// Every way a first index can fail, on the real store: the bulk window must
+// close (no leaked write gate, writer durability back, the dense indexes back),
+// no success receipt may be written, and the indexer must hand its disk target
+// back. Faults inside the store come from its own test hooks, so the eviction
+// the drain picks is the production one for a SQLite target.
 func TestFirstIndexFailureRestoresStore(t *testing.T) {
-	for _, mode := range []string{"drain error", "cancel before drain", "panic in body", "panic in drain"} {
+	for _, mode := range []string{
+		"drain error", "cancel before drain", "panic in body", "panic in drain",
+		"storage full", "seal panic", "seal error",
+	} {
 		t.Run(mode, func(t *testing.T) {
-			probe, db := newFirstIndexBulkFixture(t)
+			store, db := newFirstIndexStore(t)
 			indexes := firstIndexSchemaIndexes(t, db)
-			injected := errors.New("injected drain FTS error")
+			writerSync := firstIndexWriterSynchronous(t, store)
+			var evictions []bool
+			shadowEvictionBranchHook = func(retirement bool) { evictions = append(evictions, retirement) }
+			t.Cleanup(func() { shadowEvictionBranchHook = nil })
+			var fault func() error
+			batches, engaged := 0, false
+			defer store.SetBatchWriteHookForTest(func(int, int) error {
+				batches++
+				engaged = engaged || firstIndexBulkActive(t, store)
+				if fault != nil {
+					return fault()
+				}
+				return nil
+			})()
+			seals := 0
+			defer store.SetBulkSealHookForTest(func(index string) error {
+				seals++
+				switch {
+				case mode == "seal panic" && seals == 1:
+					panic("injected seal panic")
+				case mode == "seal error" && index == "nodes_by_kind":
+					return errors.New("injected seal failure")
+				}
+				return nil
+			})()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			switch mode {
 			case "drain error":
-				probe.ftsErr = injected
+				firstIndexDrainFTSTrigger(t, store)
 			case "panic in drain":
-				probe.panicDrain = true
+				fault = func() error { panic("injected drain panic") }
+			case "storage full":
+				full := sqliteFullError(t)
+				fault = func() error { return full }
 			case "cancel before drain":
 				ctx = progress.WithReporter(ctx, firstIndexCancelReporter{cancel: cancel})
 			case "panic in body":
 				ctx = progress.WithReporter(ctx, firstIndexPanicReporter{})
 			}
-			probe.duringDrain = func() {
-				assert.True(t, firstIndexBulkActive(t, probe.Store), "failure fixture must exercise an engaged bulk window")
-			}
-			idx := newFirstIndexBulkIndexer(t, probe, "repo")
+			idx := newFirstIndexBulkIndexer(t, store, "repo")
 			dir := firstIndexFixtureRepo(t)
+
 			switch mode {
 			case "panic in body":
 				assert.PanicsWithValue(t, "injected body panic", func() { _, _ = idx.IndexCtx(ctx, dir) })
-				assert.Zero(t, probe.NodeCount(), "body panic must not drain shadow nodes")
-				assert.Zero(t, probe.EdgeCount(), "body panic must not drain shadow edges")
+				assert.Zero(t, store.NodeCount(), "body panic must not drain shadow nodes")
+				assert.Zero(t, store.EdgeCount(), "body panic must not drain shadow edges")
 			case "panic in drain":
 				require.PanicsWithValue(t, "injected drain panic", func() { _, _ = idx.IndexCtx(ctx, dir) })
-			case "drain error":
-				_, err := idx.IndexCtx(ctx, dir)
-				require.ErrorIs(t, err, injected)
-			default:
+			case "seal panic":
+				require.PanicsWithValue(t, "injected seal panic", func() { _, _ = idx.IndexCtx(ctx, dir) })
+				assert.Greater(t, seals, 1, "the backstop did not retry the panicked flush")
+			case "cancel before drain":
 				_, err := idx.IndexCtx(ctx, dir)
 				require.ErrorIs(t, err, context.Canceled)
+			case "drain error":
+				_, err := idx.IndexCtx(ctx, dir)
+				require.ErrorContains(t, err, "injected drain FTS error")
+			case "storage full":
+				_, err := idx.IndexCtx(ctx, dir)
+				var storageErr *store_sqlite.StorageError
+				require.ErrorAs(t, err, &storageErr)
+				assert.Contains(t, store_sqlite.SafeStorageFailureReason(err), "SQLite code 13")
+			case "seal error":
+				_, err := idx.IndexCtx(ctx, dir)
+				require.ErrorContains(t, err, "nodes_by_kind")
+				// Either still owed or already rebuilt by the maintenance lane,
+				// which runs as soon as the window closes on a volume with room.
+				health, healthErr := store.PlannerStatsHealth(context.Background())
+				require.NoError(t, healthErr)
+				if health.Reason == "dense_indexes_missing" {
+					assert.Equal(t, []string{"nodes_by_kind"}, health.DenseIndexesMissing)
+				}
+				deadline := time.Now().Add(10 * time.Second)
+				for !assert.ObjectsAreEqual(indexes, firstIndexSchemaIndexes(t, db)) && time.Now().Before(deadline) {
+					time.Sleep(10 * time.Millisecond)
+				}
 			}
+
 			if mode == "cancel before drain" || mode == "panic in body" {
-				assert.Zero(t, probe.begins)
-				assert.Zero(t, probe.batches)
+				assert.Empty(t, evictions, "a failure before the drain must not evict")
+				assert.Zero(t, batches, "a failure before the drain must not write")
 			} else {
-				require.Positive(t, probe.batches)
-				assert.Equal(t, 1, probe.begins)
+				assert.Equal(t, []bool{true}, evictions, "a SQLite target must take the shadow-replacement retirement")
+				require.Positive(t, batches, "test must observe the shadow drain")
+				assert.True(t, engaged, "failure fixture must exercise an engaged bulk window")
 			}
-			assertFirstIndexRestored(t, probe.Store, db, indexes)
-			assertFirstIndexNoReceipts(t, probe.Store, "repo")
-			assert.Same(t, probe, idx.graph, "panic and error paths must restore disk target")
+			assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store), "writer durability must be restored")
+			assertFirstIndexRestored(t, store, db, indexes)
+			assertFirstIndexNoReceipts(t, store, "repo")
+			assert.Same(t, store, idx.graph, "panic and error paths must restore disk target")
 		})
 	}
 }
@@ -411,12 +468,7 @@ func TestFirstIndexFailureRestoresSQLiteReplacement(t *testing.T) {
 			writeFile(t, baseline, "old replacement baseline")
 			ctx := context.Background()
 			if mode == "drain error" {
-				writer, err := sql.Open("sqlite", "file:"+filepath.ToSlash(probe.Path()))
-				require.NoError(t, err)
-				_, err = writer.Exec(`CREATE TRIGGER fail_first_index_fts BEFORE INSERT ON symbol_fts_rowid
-BEGIN SELECT RAISE(ABORT, 'injected drain FTS error'); END`)
-				require.NoError(t, err)
-				require.NoError(t, writer.Close())
+				firstIndexDrainFTSTrigger(t, probe.Store)
 			} else {
 				ctx = progress.WithReporter(ctx, firstIndexDrainPanicReporter{})
 			}

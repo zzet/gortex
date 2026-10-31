@@ -556,8 +556,8 @@ func insertEdgeChunksTxLimitedContext(ctx context.Context, tx *sql.Tx, viewGen i
 // is written, with the batch's node and edge counts. A returned error fails the
 // batch exactly as a failed insert would (the transaction rolls back and the
 // error reaches the caller the way that caller reports storage errors); a panic
-// unwinds the batch the same way. The hook must not call back into the store.
-// restore puts the previous hook back.
+// unwinds the batch the same way. The hook runs under the write gate, so it
+// must not call the store's write methods. restore puts the previous hook back.
 func (s *Store) SetBatchWriteHookForTest(hook func(nodeRows, edgeRows int) error) (restore func()) {
 	previous := s.batchWriteHook.Swap(&hook)
 	return func() { s.batchWriteHook.Store(previous) }

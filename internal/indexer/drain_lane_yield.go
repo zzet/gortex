@@ -37,6 +37,12 @@ var drainYieldRows = 1024
 // cooperative drain.
 var drainSubBatchHook func()
 
+// shadowEvictionBranchHook, when set (tests), observes which eviction a shadow
+// drain chose before its first disk write: true for the SQLite
+// shadow-replacement retirement, false for the generic current-generation
+// eviction.
+var shadowEvictionBranchHook func(retirement bool)
+
 type initialDrainCooperationKey struct{}
 
 // Only the initial claimed base pauses in place for announced checkout work.
