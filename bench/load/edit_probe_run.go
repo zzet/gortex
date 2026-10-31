@@ -104,6 +104,7 @@ type editProbeState struct {
 	pairedContext                                     context.Context // shared per-edit probes; cleared after joined completion
 	probes                                            sync.WaitGroup
 	started, acknowledged, firstProbeWrite, editWrite time.Time
+	dependencyMet                                     time.Time // a dependency-gated native write may proceed
 	absenceBefore                                     map[string]bool
 	ackReady                                          chan struct{} // closed once a dependent may check this edit: its own ACK is known, or it ended
 	ackOnce                                           sync.Once
@@ -501,9 +502,14 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 		s.record.ProbeErrors++
 	}
 	if correct {
-		if s.started.IsZero() || ended.IsZero() || ended.Before(s.started) {
+		switch {
+		case s.step.Deleted && s.step.After != nil && (s.dependencyMet.IsZero() || sent.Before(s.dependencyMet)):
+			// A native delete probes from its own activation but is sent only
+			// once its create completed; until then an absence answer says
+			// only that the created file is not visible yet.
+		case s.started.IsZero() || ended.IsZero() || ended.Before(s.started):
 			s.record.Errors = append(s.record.Errors, "marker visible before its own edit")
-		} else if s.record.FirstCorrect[oracle.name].Value == nil {
+		case s.record.FirstCorrect[oracle.name].Value == nil:
 			s.record.FirstCorrect[oracle.name] = measured(float64(ended.Sub(s.started))/float64(time.Millisecond), "ms")
 		}
 	}

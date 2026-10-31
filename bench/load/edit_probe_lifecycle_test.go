@@ -80,6 +80,47 @@ func TestEditProbeCreateDeletePairsUseOwnedNewFilesAndExactAbsence(t *testing.T)
 	}
 }
 
+// A delete activates at its own due time, which can come before its create's
+// file is visible. Its search, text and caller probes then answer "absent";
+// those answers precede the delete's dependency and must not count as the
+// marker seen before its own edit.
+func TestEditProbeDeleteActivatedBeforeItsCreateCompletes(t *testing.T) {
+	c := editProbeCreateDeleteCorpus(t)
+	plan, err := makeEditProbePlan(c, 42, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, c.File), []byte(c.EditInitialContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := newEditProbeNativeRun(t, ctx, c, plan, dir, 2)
+	run.activate(ctx, plan.Steps[0])
+	run.activate(ctx, plan.Steps[1])
+	awaitEditProbeFirstProbe(t, run.states[0])
+	// Two source answers mean every delete oracle has answered at least once
+	// while the created file did not exist yet.
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		run.states[1].mu.Lock()
+		answered := run.states[1].record.ProbeErrors >= 2
+		run.states[1].mu.Unlock()
+		if answered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("delete probes never answered before the create")
+		}
+	}
+	for i, step := range plan.Steps[:2] {
+		run.doEdit(ctx, step)
+		if record := run.states[i].record; record.Outcome != "complete" || len(record.Errors) != 0 {
+			t.Fatalf("%s did not complete: %+v", step.Sender, record)
+		}
+	}
+}
+
 func TestEditProbeCreatedFilesRestoredByOneTimedBatch(t *testing.T) {
 	c := editProbeCreateDeleteCorpus(t)
 	plan, err := makeEditProbePlan(c, 42, 100)

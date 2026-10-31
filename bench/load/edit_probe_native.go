@@ -182,8 +182,15 @@ func (r *editProbeRuntime) doNativeWrite(ctx context.Context, step editProbeStep
 			met = predecessor.record.Outcome == "complete"
 		}
 		predecessor.mu.Unlock()
-		ready := time.Since(r.origin).Nanoseconds()
+		now := time.Now()
+		ready := now.Sub(r.origin).Nanoseconds()
 		native.DependencyReadyNS = &ready
+		if met {
+			own := r.states[step.Ordinal]
+			own.mu.Lock()
+			own.dependencyMet = now
+			own.mu.Unlock()
+		}
 		switch {
 		case ctx.Err() != nil:
 		case !met && step.AfterEvent == "first_correct":

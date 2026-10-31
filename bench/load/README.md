@@ -282,9 +282,11 @@ touch only the registered fixture file, or the step's own created file.
   `edit_initial_content`, JSON or TOON): even ordinals create
   `gortex_edit_probe_<marker>.go` in the fixture's package, calling the
   fixture's callee; odd ordinals delete that file once every probe of its create
-  was first-correct. Deletion is proved by the exact scoped not-found refusal and
-  complete search, text and caller collections; a missing file's summary,
-  editing context and call chain have no pinned contract and are not probed.
+  was first-correct. A delete's probes start at its own activation, so an
+  absence answer sent before its create completed is not applicable to it.
+  Deletion is proved by the exact scoped not-found refusal and complete
+  search, text and caller collections; a missing file's summary, editing
+  context and call chain have no pinned contract and are not probed.
   Created files still present are removed by one timed restore batch.
   TypeScript and Python create/delete are not implemented: a gap, not an
   inapplicable cell.
