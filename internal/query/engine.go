@@ -610,16 +610,7 @@ func (e *Engine) GatherSymbolCandidatesContext(ctx context.Context, query string
 	if limit <= 0 {
 		limit = 20
 	}
-	fetchLimit := limit
-	if opts.hasScopeFilter() {
-		fetchLimit = limit * 4
-		if fetchLimit > 200 {
-			fetchLimit = 200
-		}
-		if fetchLimit < limit {
-			fetchLimit = limit
-		}
-	}
+	fetchLimit := scopeFetchLimit(limit, opts)
 
 	gatherCtx := rctx
 	if gatherCtx == nil {
@@ -628,7 +619,9 @@ func (e *Engine) GatherSymbolCandidatesContext(ctx context.Context, query string
 
 	var cands []*rerank.Candidate
 	if s := e.getSearch(); s != nil && e.backendHasCorpus(s) {
-		cands = e.gatherBackendCandidates(ctx, query, fetchLimit, opts, gatherCtx)
+		// The backend lanes size themselves: a lane that applies the scope in
+		// its own query needs no post-filter slack.
+		cands = e.gatherBackendCandidates(ctx, query, limit, opts, gatherCtx)
 	} else {
 		if ctx.Err() != nil {
 			return nil
@@ -660,6 +653,23 @@ func (e *Engine) GatherSymbolCandidatesContext(ctx context.Context, query string
 
 	crossRepoRerank(cands)
 	return cands
+}
+
+// scopeFetchLimit over-fetches a lane whose results are filtered to the
+// request scope after the lane's own limit, so that filter still leaves about
+// limit survivors.
+func scopeFetchLimit(limit int, opts QueryOptions) int {
+	if !opts.hasScopeFilter() {
+		return limit
+	}
+	fetchLimit := limit * 4
+	if fetchLimit > 200 {
+		fetchLimit = 200
+	}
+	if fetchLimit < limit {
+		fetchLimit = limit
+	}
+	return fetchLimit
 }
 
 // SearchSymbolsRanked is SearchSymbolsScoped that returns the full
@@ -888,6 +898,18 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 	viewLayered := e.viewLayersActive()
 	skipVectorChannel := opts.SkipVectorChannel || viewLayered
 
+	// Every lane is filtered to the request scope after its own limit, so it
+	// over-fetches. A repo-scoped bundle query applies RepoAllow itself: when
+	// that is the whole scope, its answer is sized and saturates at the
+	// caller's limit like an unscoped query. laneLimit is the limit of the lane
+	// that answered the text query.
+	fetchLimit := scopeFetchLimit(limit, opts)
+	scopedLimit := fetchLimit
+	if opts.WorkspaceID == "" && opts.ProjectID == "" && opts.SearchNodeFilter == nil && !viewLayered {
+		scopedLimit = limit
+	}
+	laneLimit := fetchLimit
+
 	// Bundle fast path. The SymbolBundleSearcherBackend assertion
 	// chains through Swappable → HybridBackend → SymbolSearcherBackend
 	// in production; both Swappable and HybridBackend forward when
@@ -922,13 +944,16 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 		}
 		var answer requestBundleAnswer
 		if len(opts.SearchPathPrefixes) > 0 && !viewLayered && e.overlay == nil {
-			answer = requestPathScopedSymbolBundles(bundleCtx, backend, query, repoAllowList(opts.RepoAllow), opts.SearchPathPrefixes, limit*2)
+			answer = requestPathScopedSymbolBundles(bundleCtx, backend, query, repoAllowList(opts.RepoAllow), opts.SearchPathPrefixes, fetchLimit*2)
 		}
 		if allow := repoAllowList(opts.RepoAllow); !answer.authoritative && len(allow) > 0 {
-			answer = requestScopedSymbolBundles(bundleCtx, backend, query, allow, limit*2)
+			answer = requestScopedSymbolBundles(bundleCtx, backend, query, allow, scopedLimit*2)
+			if answer.authoritative {
+				laneLimit = scopedLimit
+			}
 		}
 		if !answer.authoritative {
-			answer = requestSymbolBundles(bundleCtx, backend, query, limit*2)
+			answer = requestSymbolBundles(bundleCtx, backend, query, fetchLimit*2)
 		}
 		bundles := answer.bundles
 		scopedAnswered := answer.authoritative && len(repoAllowList(opts.RepoAllow)) > 0
@@ -1008,7 +1033,7 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 		// internal/search/rerank/query_kind.go.
 		if bundleHandled && !skipVectorChannel {
 			var stats search.ChannelTimings
-			vectorIDs, stats = requestVectorChannel(ctx, backend, query, limit*2)
+			vectorIDs, stats = requestVectorChannel(ctx, backend, query, fetchLimit*2)
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -1023,13 +1048,13 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 		switch {
 		case skipVectorChannel:
 			textStart := time.Now()
-			textResults = requestTextSearch(ctx, backend, query, limit*2)
+			textResults = requestTextSearch(ctx, backend, query, fetchLimit*2)
 			if timings != nil {
 				timings.TextBackendMS += time.Since(textStart).Milliseconds()
 			}
 		default:
 			var stats search.ChannelTimings
-			textResults, vectorIDs, stats = requestSearchChannels(ctx, backend, query, limit*2)
+			textResults, vectorIDs, stats = requestSearchChannels(ctx, backend, query, fetchLimit*2)
 			if timings != nil {
 				timings.TextBackendMS += stats.TextMS
 				timings.EmbedMS += stats.EmbedMS
@@ -1054,7 +1079,7 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 		textResults = e.viewTextCandidatesContext(
 			ctx,
 			query,
-			limit*2,
+			fetchLimit*2,
 			textResults,
 			refillBase,
 		)
@@ -1063,7 +1088,7 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 		}
 	}
 
-	if opts.SymbolSearchStats != nil && len(textResults) >= limit*2 {
+	if opts.SymbolSearchStats != nil && len(textResults) >= laneLimit*2 {
 		opts.SymbolSearchStats.TextSaturated = true
 	}
 
@@ -1147,7 +1172,7 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 	// Stop early when the native text + vector union has already exceeded the
 	// requested width; the supplementary tiers below are a fill, not a
 	// boost.
-	if len(cands) >= limit*2 {
+	if len(cands) >= laneLimit*2 {
 		return cands
 	}
 
@@ -1192,15 +1217,15 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 	// in Go — the old AllNodes loop is broken at Linux-kernel scale
 	// (10M+ symbols, hundreds of MB of nodes per query). We over-fetch
 	// by a small slack factor so dedup against existing cands still
-	// leaves room to fill `limit`.
-	if len(cands) < limit {
+	// leaves room to fill `laneLimit`.
+	if len(cands) < laneLimit {
 		if ctx.Err() != nil {
 			return nil
 		}
 		fallbackStart := time.Now()
-		fetch := (limit - len(cands)) * 2
-		if fetch < limit {
-			fetch = limit
+		fetch := (laneLimit - len(cands)) * 2
+		if fetch < laneLimit {
+			fetch = laneLimit
 		}
 		subMatches, err := graph.FindNodesByNameContainingFilteredContext(ctx, e.g, query, fetch, graph.NameSearchFilter{
 			RepoAllow: opts.RepoAllow,
@@ -1226,7 +1251,7 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 			}
 			idx[n.ID] = len(cands)
 			cands = append(cands, &rerank.Candidate{Node: n, TextRank: -1, VectorRank: -1})
-			if len(cands) >= limit {
+			if len(cands) >= laneLimit {
 				break
 			}
 		}
