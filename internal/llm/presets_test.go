@@ -81,6 +81,12 @@ func TestConfig_ActiveCustom_PresetResolution(t *testing.T) {
 		t.Errorf("opper preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(opper))
 	}
 
+	cg := Config{Provider: "cloudgpu"}
+	cp, ok = cg.ActiveCustom()
+	if !ok || cp.BaseURL != "https://cloudgpu.app/v1" || cp.Model != "deepseek-v4.1-flash" || cp.APIKeyEnv != "CLOUDGPU_API_KEY" || cp.SchemaMode != "json_schema" || ProfileFor(cg) != ProfileFrontier {
+		t.Errorf("cloudgpu preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(cg))
+	}
+
 	rc := Config{Provider: "runcrate"}
 	cp, ok = rc.ActiveCustom()
 	if !ok || cp.BaseURL != "https://api.runcrate.ai/v1" || cp.Model != "deepseek-ai/DeepSeek-V4.1-Flash" || cp.APIKeyEnv != "RUNCRATE_API_KEY" || cp.SchemaMode != "json_schema" || ProfileFor(rc) != ProfileFrontier {
