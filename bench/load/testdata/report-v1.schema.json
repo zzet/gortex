@@ -1555,7 +1555,370 @@
                     "type": "string"
                   },
                   "stats_after": {},
-                  "stats_before": {}
+                  "stats_before": {},
+                  "summary": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "measures": {
+                            "additionalProperties": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "bootstrap_resamples": {
+                                  "type": "integer"
+                                },
+                                "count": {
+                                  "type": "integer"
+                                },
+                                "max": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "reason": {
+                                      "type": "string"
+                                    },
+                                    "unit": {
+                                      "type": "string"
+                                    },
+                                    "value": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "value",
+                                    "unit",
+                                    "reason"
+                                  ],
+                                  "type": "object"
+                                },
+                                "missing": {
+                                  "type": "integer"
+                                },
+                                "p50": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "reason": {
+                                      "type": "string"
+                                    },
+                                    "unit": {
+                                      "type": "string"
+                                    },
+                                    "value": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "value",
+                                    "unit",
+                                    "reason"
+                                  ],
+                                  "type": "object"
+                                },
+                                "p50_ci95": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "high": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "low": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "low",
+                                    "high"
+                                  ],
+                                  "type": "object"
+                                },
+                                "p95": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "reason": {
+                                      "type": "string"
+                                    },
+                                    "unit": {
+                                      "type": "string"
+                                    },
+                                    "value": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "value",
+                                    "unit",
+                                    "reason"
+                                  ],
+                                  "type": "object"
+                                },
+                                "p95_ci95": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "high": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "low": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "low",
+                                    "high"
+                                  ],
+                                  "type": "object"
+                                },
+                                "p99": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "reason": {
+                                      "type": "string"
+                                    },
+                                    "unit": {
+                                      "type": "string"
+                                    },
+                                    "value": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "value",
+                                    "unit",
+                                    "reason"
+                                  ],
+                                  "type": "object"
+                                },
+                                "p99_ci95": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "high": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "low": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "low",
+                                    "high"
+                                  ],
+                                  "type": "object"
+                                }
+                              },
+                              "required": [
+                                "count",
+                                "missing",
+                                "p50",
+                                "p95",
+                                "p99",
+                                "max",
+                                "p50_ci95",
+                                "p95_ci95",
+                                "p99_ci95",
+                                "bootstrap_resamples"
+                              ],
+                              "type": "object"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "offered": {
+                            "type": "integer"
+                          },
+                          "outcomes": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "offered",
+                          "outcomes",
+                          "measures"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
                 },
                 "required": [
                   "plan",

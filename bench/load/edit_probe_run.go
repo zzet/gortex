@@ -70,6 +70,7 @@ type editProbeReport struct {
 	PlanHash           string            `json:"plan_sha256"`
 	AccountingRequired bool              `json:"accounting_required"`
 	Records            []editProbeRecord `json:"edits"`
+	Summary            *editProbeSummary `json:"summary,omitempty"`
 	RestoreMS          Metric            `json:"restore_batch_ms"`
 	Restore            json.RawMessage   `json:"restore_batch"`
 	StatsBefore        json.RawMessage   `json:"stats_before"`
@@ -850,6 +851,7 @@ func (r *editProbeRuntime) finish() error {
 		failures = append(failures, fmt.Errorf("edit %d: setup never completed", step.Ordinal))
 	}
 	finishEditProbeMetrics(r.phase)
+	r.phase.EditProbe.Summary = summarizeEditProbe(r.phase.EditProbe.Records, r.plan.Seed)
 	return errors.Join(failures...)
 }
 
