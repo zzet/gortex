@@ -39,6 +39,7 @@ type editProbeStep struct {
 	ExpectedLineGap int     `json:"expected_line_gap,omitempty"`
 	Relocated       bool    `json:"relocated,omitempty"`
 	DestinationFile string  `json:"destination_file,omitempty"`
+	ExpectedRefusal bool    `json:"expected_refusal,omitempty"`
 }
 
 type editProbePlan struct {
@@ -153,6 +154,9 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 	if kind != "relocate" && (c.EditDestination != "" || c.EditDestinationContent != "") {
 		return editProbePlan{}, errors.New("edit_destination applies only to the explicit move fixture")
 	}
+	if c.EditExpect != "" && tool != "refactor.move" {
+		return editProbePlan{}, errors.New("edit_expect refusal applies only to TypeScript/Python relocation")
+	}
 	if kind == "relocate" && tool != "refactor.move" {
 		return editProbePlan{}, errors.New("relocation requires the explicit Go move adapter")
 	}
@@ -232,6 +236,9 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: kind, Tool: tool, Language: language, Mode: mode, Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", "native save/create/delete/hotfile/restart", "largest-file/reference configurations require their own reviewed manifest"}}
 	if kind == "change_signature" && language != "go" {
 		p.NotSelected = append(p.NotSelected, "parameter detail is proved by exact source; native TS/Python signature metadata omits it and graph freshness uses the relative line witness")
+	}
+	if c.EditExpect == "refusal" {
+		p.NotSelected = append(p.NotSelected, "TypeScript/Python relocation is offered only as the product's explicit refusal; Go relocation is the supported move cell")
 	}
 	if editors > 1 {
 		p.Editors, p.SessionModel = editors, editProbeFixedEditorModel
@@ -338,7 +345,7 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 		if err != nil {
 			return editProbePlan{}, err
 		}
-		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Editor: arrival.Editor, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete", TargetSymbol: targetSymbol, FollowingSymbol: followingSymbol, ExpectedLineGap: expectedGap, Relocated: kind == "relocate", DestinationFile: c.EditDestination})
+		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Editor: arrival.Editor, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete", TargetSymbol: targetSymbol, FollowingSymbol: followingSymbol, ExpectedLineGap: expectedGap, Relocated: kind == "relocate", DestinationFile: c.EditDestination, ExpectedRefusal: c.EditExpect == "refusal"})
 	}
 	return p, nil
 }

@@ -158,6 +158,9 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if plan.Mode == "toon" {
 		out.Limitations = append(out.Limitations, "TOON is evaluated from the requested text, never a structured JSON sibling; setup, timing-status and restore controls remain explicit JSON with exact numeric handling", "TOON traversal subgraphs omit JSON total_nodes/full untrimmed total_edges and signature metadata; summaries keep full fields, omitted traversal fields are not synthesized", "complete TOON subgraph checks require explicit nontruncation, exact declared node total and the emitted row census; an omitted full edge-count field is not reported as a measured value")
 	}
+	if len(plan.Steps) > 0 && plan.Steps[0].ExpectedRefusal {
+		out.Limitations = append(out.Limitations, "a relocation refusal cell passes only on the producer's exact scoped refusal with unchanged source and destination bytes and the original symbol present; it has no probes, receipt, phases or restore batch")
+	}
 	if plan.Mode == "cli" {
 		out.Limitations = append(out.Limitations, "CLI oracles run one owned `gortex call --format json` process per request; the edit, readbacks and receipt status stay MCP JSON", "CLI probe cadence is bounded by process start, daemon dial and exit rather than 25 ms, and a probe's start is its process start", "CLI stdout keeps only the first text payload, re-encoded through float64: numbers that cannot be exact and prose wrappers are decode failures, and a tool refusal is a nonzero exit counted as a probe error")
 	}
@@ -582,6 +585,10 @@ func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
 // The paired dispatcher can start this owned continuation on this build's own
 // ACK, without a barrier on its partner. Standalone retains the same order.
 func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *editProbeState, step editProbeStep, started time.Time, ack json.RawMessage, identity wireCallIdentity, err error) {
+	if step.ExpectedRefusal {
+		r.finishRefusal(ctx, callCtx, s, step, started, ack, identity, err)
+		return
+	}
 	if err != nil {
 		s.mu.Lock()
 		s.record.Outcome = "edit_error"
@@ -935,6 +942,9 @@ func (r *editProbeRuntime) close() error {
 }
 
 func (r *editProbeRuntime) restore(ctx context.Context) error {
+	if len(r.plan.Steps) > 0 && r.plan.Steps[0].ExpectedRefusal {
+		return r.confirmRefusalUnchanged()
+	}
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
 	for _, record := range r.phase.EditProbe.Records {
 		if (record.Receipt == "" && record.Batch == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {

@@ -30,10 +30,16 @@ func editProbeTool(c Corpus) (string, error) {
 		}
 	case "move_symbol", "refactor.move":
 		if filepath.Ext(c.File) != ".go" {
-			return "", errors.New("unsupported language: move_symbol fixture supports Go only")
+			if err := editProbeRelocationRefusalFixture(c); err != nil {
+				return "", err
+			}
+			return "refactor.move", nil
 		}
 		if c.EditKind != "relocate" {
 			return "", errors.New("move_symbol applies to relocation, not append/body/signature/rename/delete fixtures")
+		}
+		if c.EditExpect != "" {
+			return "", errors.New("edit_expect refusal applies only to TypeScript/Python relocation: Go relocation is supported and measured as a move")
 		}
 		if err := editProbeMoveFixture(c); err != nil {
 			return "", err

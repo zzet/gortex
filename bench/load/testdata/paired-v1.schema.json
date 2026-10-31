@@ -53,6 +53,9 @@
                 "edit_destination_content": {
                   "type": "string"
                 },
+                "edit_expect": {
+                  "type": "string"
+                },
                 "edit_initial_content": {
                   "type": "string"
                 },
@@ -1514,6 +1517,9 @@
                                   },
                                   "expected_line_gap": {
                                     "type": "integer"
+                                  },
+                                  "expected_refusal": {
+                                    "type": "boolean"
                                   },
                                   "following_symbol": {
                                     "type": "string"
@@ -3266,6 +3272,9 @@
                             },
                             "expected_line_gap": {
                               "type": "integer"
+                            },
+                            "expected_refusal": {
+                              "type": "boolean"
                             },
                             "following_symbol": {
                               "type": "string"

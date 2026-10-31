@@ -20,6 +20,9 @@ type editProbeOracle struct {
 }
 
 func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
+	if step.ExpectedRefusal {
+		return nil // A refused relocation makes no change for any probe to observe.
+	}
 	if step.Relocated {
 		return editProbeOutputOracles(c, editProbeMoveOracles(c, step))
 	}
