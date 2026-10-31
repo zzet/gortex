@@ -243,6 +243,16 @@ func (r *daemonStartupReporter) ObserveMigration(progress store_sqlite.Migration
 			zap.Duration("elapsed", progress.Elapsed), zap.Error(progress.Error))
 		r.state.StartupPhase = daemon.StartupFailed
 		r.state.StartupError = boundedStartupError(progress.Error)
+	case store_sqlite.MigrationBackupCreated:
+		r.logger.Info("daemon: backed up the store before its schema upgrade",
+			zap.Int("from_version", progress.Version), zap.String("backup", progress.Detail),
+			zap.Duration("elapsed", progress.Elapsed))
+	case store_sqlite.MigrationBackupKept:
+		r.logger.Info("daemon: kept the existing pre-upgrade store backup",
+			zap.Int("from_version", progress.Version), zap.String("backup", progress.Detail))
+	case store_sqlite.MigrationBackupSkipped:
+		r.logger.Warn("daemon: upgrading the store schema without a backup",
+			zap.Int("from_version", progress.Version), zap.String("reason", progress.Detail))
 	}
 	r.publishLocked()
 }

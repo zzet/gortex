@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -32,10 +33,11 @@ import (
 //
 // Returns the store, a cleanup func the caller must defer (it closes the
 // handle on disk), and any open error.
-// allowRebuild permits rebuilding supported older schemas when necessary;
-// a schema newer than this binary is always refused and retained. The caller
-// must hold the store lock. NewSharedServer passes true only after acquiring
-// the exclusive flock.
+// allowRebuild permits rebuilding supported older schemas when necessary and
+// backing an existing store up before an in-place schema upgrade; a schema
+// newer than this binary is always refused and retained. The caller must
+// hold the store lock. NewSharedServer passes true only after acquiring the
+// exclusive flock.
 func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func() error, error) {
 	if err := checkBackend(name); err != nil {
 		return nil, nil, err
@@ -102,7 +104,8 @@ func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite
 		opts = append(opts, store_sqlite.WithMigrationObserver(observers[0]))
 	}
 	if allowRebuild {
-		opts = append(opts, store_sqlite.WithRebuild())
+		// Both need exclusive access to the store, which allowRebuild attests.
+		opts = append(opts, store_sqlite.WithRebuild(), store_sqlite.WithUpgradeBackup())
 	}
 	s, err := store_sqlite.Open(path, opts...)
 	if err != nil {
@@ -118,4 +121,19 @@ func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite
 		return nil, nil, fmt.Errorf("open sqlite store at %q: %w (%s)", path, err, hint)
 	}
 	return s, s.Close, nil
+}
+
+// pruneStoreUpgradeBackups removes the pre-upgrade backups of storePath that
+// have outlived store_sqlite.UpgradeBackupRetention at now, along with any
+// partial copy an interrupted upgrade left behind. The caller must hold the
+// store lock. Failures are logged, never fatal: a backup that cannot be
+// removed costs disk space, not correctness.
+func pruneStoreUpgradeBackups(storePath string, logger *zap.Logger, now time.Time) {
+	removed, err := store_sqlite.PruneUpgradeBackups(storePath, store_sqlite.UpgradeBackupRetention, now)
+	for _, path := range removed {
+		logger.Info("serverstack: removed expired store upgrade backup", zap.String("path", path))
+	}
+	if err != nil {
+		logger.Warn("serverstack: could not prune store upgrade backups", zap.String("store", storePath), zap.Error(err))
+	}
 }
