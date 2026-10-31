@@ -36,6 +36,7 @@ var _ graph.FileIdentityBatchEvicter = (*graph.DeltaWriter)(nil)
 var editDeltaAbsentCapabilities = map[string]string{
 	"graph.ExternalCallCandidateIterator": "read accelerator: external-call candidates fall back to the composed edge-kind scan, preserving delta masks",
 	"anonymous{ReindexEdgesApplied}":      "batch-drop receipt for persistent stores; DeltaWriter applies its reindexes locally and unconditionally through ReindexEdges",
+	"anonymous{AddBatchChecked}":          "checked durable publication: DeltaWriter stages non-failing writes in its local work graph through AddBatch; its owner checks final layer publication, and forwarding this capability would bypass the delta",
 	"anonymous{WriteMark}":                "process/store write telemetry, not a graph capability: the per-save indexer and resolver receive the underlying store handle's sampler explicitly; a MultiIndexer without this optional sampler falls back to process-wide counters",
 
 	"graph.ContractExtractionEdgeReader":                   "physical checked extraction adjacency; outgoingMetadataContext dispatches the composed DeltaWriter through its selected view rather than forwarding base-only rows",

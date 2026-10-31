@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"sort"
 	"strings"
@@ -467,10 +468,17 @@ func (i sqliteMutationNodeIdentity) equalsNode(n *graph.Node) bool {
 // called only while receipts are active, so the steady indexing path pays no
 // extra reads.
 func mutationNodeIdentitiesTx(tx *sql.Tx, viewGen int64, ids []string) (map[string]sqliteMutationNodeIdentity, error) {
+	return mutationNodeIdentitiesTxContext(context.Background(), tx, viewGen, ids)
+}
+
+func mutationNodeIdentitiesTxContext(ctx context.Context, tx *sql.Tx, viewGen int64, ids []string) (map[string]sqliteMutationNodeIdentity, error) {
 	const chunkSize = 900
 	unique := make(map[string]struct{}, len(ids))
 	ordered := make([]string, 0, len(ids))
 	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if id == "" {
 			continue
 		}
@@ -482,6 +490,9 @@ func mutationNodeIdentitiesTx(tx *sql.Tx, viewGen int64, ids []string) (map[stri
 	}
 	identities := make(map[string]sqliteMutationNodeIdentity, len(ordered))
 	for start := 0; start < len(ordered); start += chunkSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		end := start + chunkSize
 		if end > len(ordered) {
 			end = len(ordered)
@@ -495,7 +506,7 @@ func mutationNodeIdentitiesTx(tx *sql.Tx, viewGen int64, ids []string) (map[stri
 		// An id names one row per generation; the receipt describes the
 		// mutation the writing handle made, so it reads that handle's row.
 		args = append(args, viewGen)
-		rows, err := tx.Query(
+		rows, err := tx.QueryContext(ctx,
 			`SELECT id, kind, name, qual_name, file_path, repo_prefix FROM `+nodesByIDSource+` WHERE id IN (`+placeholders+`) AND view_gen = ?`,
 			args...,
 		)

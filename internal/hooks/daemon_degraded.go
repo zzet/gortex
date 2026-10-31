@@ -20,7 +20,7 @@ package hooks
 // briefing and the per-call degradation notice give for an outage. Shared so
 // the session-level and per-call layers cannot drift into contradicting each
 // other about what an agent should do while the daemon is down.
-const daemonUnreachableStance = "Treat this as an MCP integration failure: stop indexed code operations and report it; do not start a daemon manually or switch to a CLI fallback."
+const daemonUnreachableStance = "The graph is unavailable; continue natively for this step and report only the step that needs the graph. Never start a daemon."
 
 // daemonDownNotice is the once-per-session PreToolUse notice for an outage
 // that begins mid-session — the SessionStart briefing has already promised

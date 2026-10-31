@@ -152,6 +152,9 @@ type RepoView struct {
 	// generation identity alone cannot detect a route that moved away and back.
 	// It is zero for immutable ref views.
 	CheckoutRouteEpoch int64
+	// checkoutRoute is the exact row already pinned by materialization. It
+	// supplies refused-mutation policy evidence without a later catalog read.
+	checkoutRoute store_sqlite.CheckoutRoute
 	// Reader is the composed graph: the indexed corpus with the
 	// checkout's routed generations stacked on it.
 	Reader graph.Reader
@@ -165,6 +168,15 @@ type RepoView struct {
 	contractStore *store_sqlite.Store
 	lease         *Lease
 	closeOnce     sync.Once
+}
+
+// CheckoutMutationRoute returns the immutable route pinned by this checkout
+// view. Ref views or manually assembled handles have no such evidence.
+func (v *RepoView) CheckoutMutationRoute() (store_sqlite.CheckoutRoute, bool) {
+	if v == nil || v.checkoutRoute.RouteEpoch <= 0 || v.checkoutRoute.RouteEpoch != v.CheckoutRouteEpoch {
+		return store_sqlite.CheckoutRoute{}, false
+	}
+	return v.checkoutRoute, true
 }
 
 // Generations lists every payload generation this view holds a lease on,
@@ -392,6 +404,7 @@ func (m *Materializer) MaterializeCheckout(ctx context.Context, checkoutID strin
 			return nil, err
 		}
 		view.CheckoutRouteEpoch = route.RouteEpoch
+		view.checkoutRoute = route
 		return view, nil
 	}
 	return nil, NewViewError(CodeViewBuilding,

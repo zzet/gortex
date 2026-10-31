@@ -57,6 +57,12 @@ func runPostToolUse(data []byte) {
 	if input.HookEventName != "PostToolUse" {
 		return
 	}
+	// Mutation response observation is local and remains useful with an older
+	// or newly unreachable daemon; it never probes/starts one.
+	if observeMutationFallback(input, time.Now()) {
+		logHookEffectivenessUnknown("PostToolUse", false, 0, time.Since(started))
+		return
+	}
 	daemonUp := daemonReachableFn()
 	emitted := false
 	terminalObserved := false

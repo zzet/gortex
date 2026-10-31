@@ -145,18 +145,27 @@ func newContractStuckRepair(options ContractStuckRepairOptions, adjust func(*Con
 	return r, nil
 }
 
-// Close stops the repair and waits for every repository's pass to end.
-func (r *ContractStuckRepair) Close() {
+// Cancel refuses new repair work and cancels every pass without joining it.
+// Shutdown cancels the other producer owners before waiting on any one pass.
+func (r *ContractStuckRepair) Cancel() {
 	if r == nil {
 		return
 	}
+	r.cancel()
 	r.mu.Lock()
 	r.closed = true
 	for _, state := range r.repos {
 		state.retry = false
 	}
 	r.mu.Unlock()
-	r.cancel()
+}
+
+// Close stops the repair and waits for every repository's pass to end.
+func (r *ContractStuckRepair) Close() {
+	if r == nil {
+		return
+	}
+	r.Cancel()
 	r.workers.Wait()
 }
 

@@ -71,7 +71,7 @@ const (
 	// singleton match-all hook.
 	codexLegacyBashPreToolUseMatcher          = "^Bash$"
 	codexLegacyMCPNavigationPreToolUseMatcher = "^(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze)$"
-	codexPostToolUseMatcher                   = "^(Bash|apply_patch|(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze))$"
+	codexPostToolUseMatcher                   = "^(Bash|apply_patch|(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze|edit|edit_file|write_file|edit_symbol|batch_edit))$"
 	codexHookTimeoutSeconds                   = 5
 	codexHookModeEnvVar                       = "GORTEX_CODEX_HOOK_MODE"
 	// Codex merges its home instructions file into every session ahead of

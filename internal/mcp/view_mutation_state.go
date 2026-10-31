@@ -40,6 +40,10 @@ type checkoutMutationState struct {
 	incarnation   string
 	committedHash string
 	committedPath string
+	// Set only at top-level admission for a single-file operation. A batch
+	// may reuse commitFileMutation, but one refused file cannot prove that
+	// the batch as a whole applied no bytes.
+	singleFile bool
 }
 
 func withCheckoutMutation(ctx context.Context, mutation checkoutMutationLifecycle, root string) context.Context {

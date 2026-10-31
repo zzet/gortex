@@ -383,7 +383,7 @@ func saveGlobalConfigLocked(gc *GlobalConfig) error {
 	if err != nil {
 		return fmt.Errorf("marshaling global config: %w", err)
 	}
-	if err := globalConfigWriteFile(path, data, 0644); err != nil {
+	if err := globalConfigWriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("writing global config to %s: %w", path, err)
 	}
 	return nil

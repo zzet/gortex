@@ -29,6 +29,10 @@ func TestProcessAliveAndExistsZombie(t *testing.T) {
 		_ = child.Wait()
 	})
 	pid := child.Process.Pid
+	identity, err := CaptureProcessIdentity(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ProcessAlive(pid) || !ProcessExists(pid) {
 		t.Fatal("a live child must be alive and exist")
 	}
@@ -60,5 +64,11 @@ func TestProcessAliveAndExistsZombie(t *testing.T) {
 	}
 	if ProcessExists(pid) {
 		t.Error("ProcessExists(zombie) = true, want false before Wait")
+	}
+	if running, err := identity.Running(); err != nil || running {
+		t.Errorf("captured zombie Running() = %v, %v; want false, nil", running, err)
+	}
+	if same, err := identity.Matches(); err != nil || !same {
+		t.Errorf("captured zombie no longer has its native birth identity: same=%v error=%v", same, err)
 	}
 }

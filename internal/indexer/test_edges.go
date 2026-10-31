@@ -1,11 +1,45 @@
 package indexer
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
+
+// markTestSymbolsAndEmitEdgesForFilesContext keeps cancellation between complete
+// file projections. Never interrupt the eviction/replacement pair inside a
+// projection: already completed groups remain valid if shutdown cancels the
+// remaining frontier. The ordinary non-cancellable callers keep their single
+// projection and its existing counts.
+func markTestSymbolsAndEmitEdgesForFilesContext(ctx context.Context, g graph.Store, files []string) (marked, emitted int, err error) {
+	if err = ctx.Err(); err != nil || g == nil || len(files) == 0 {
+		return 0, 0, err
+	}
+	g.ResolveMutex().Lock()
+	defer g.ResolveMutex().Unlock()
+	if err = ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	if ctx.Done() == nil {
+		return markTestSymbolsAndEmitEdgesForFilesLocked(g, files)
+	}
+	for start := 0; start < len(files); start += testMetadataLookupBatchSize {
+		if err = ctx.Err(); err != nil {
+			return marked, emitted, err
+		}
+		end := min(start+testMetadataLookupBatchSize, len(files))
+		m, e, projectionErr := markTestSymbolsAndEmitEdgesForFilesLocked(g, files[start:end])
+		marked += m
+		emitted += e
+		if projectionErr != nil {
+			return marked, emitted, projectionErr
+		}
+	}
+	return marked, emitted, ctx.Err()
+}
 
 // Keep graph reads bounded without falling back to one backend query per file
 // or annotation. SQLite applies its own lower SQL-variable chunks inside each
@@ -68,7 +102,8 @@ func markTestSymbolsAndEmitEdgesScoped(g graph.Store, changedPrefixes map[string
 	if len(changedFiles) > 0 {
 		g.ResolveMutex().Lock()
 		defer g.ResolveMutex().Unlock()
-		return markTestSymbolsAndEmitEdgesForFilesLocked(g, changedFiles)
+		markedTests, edgesEmitted, _ = markTestSymbolsAndEmitEdgesForFilesLocked(g, changedFiles)
+		return markedTests, edgesEmitted
 	}
 	// Serialise Node.Meta mutation against other graph-wide passes
 	// (detectClonesAndEmitEdges, ResolveTemporalCalls, reach.BuildIndex).
@@ -94,7 +129,7 @@ func markTestSymbolsAndEmitEdgesScoped(g graph.Store, changedPrefixes map[string
 // Besides the changed symbols it includes only their incoming test callers: a
 // callee switching between production and test changes whether those callers'
 // parallel EdgeTests edges are valid. The caller holds ResolveMutex.
-func markTestSymbolsAndEmitEdgesForFilesLocked(g graph.Store, changedFiles []string) (int, int) {
+func markTestSymbolsAndEmitEdgesForFilesLocked(g graph.Store, changedFiles []string) (int, int, error) {
 	files := make([]string, 0, len(changedFiles))
 	seenFiles := make(map[string]struct{}, len(changedFiles))
 	for _, file := range changedFiles {
@@ -108,7 +143,7 @@ func markTestSymbolsAndEmitEdgesForFilesLocked(g graph.Store, changedFiles []str
 		files = append(files, file)
 	}
 	if len(files) == 0 {
-		return 0, 0
+		return 0, 0, nil
 	}
 
 	wantedKinds := map[graph.NodeKind]bool{
@@ -129,7 +164,7 @@ func markTestSymbolsAndEmitEdgesForFilesLocked(g graph.Store, changedFiles []str
 		}
 	}
 	if len(localNodes) == 0 {
-		return 0, 0
+		return 0, 0, nil
 	}
 
 	setMeta := func(n *graph.Node, key string, value any) bool {
@@ -282,8 +317,7 @@ func markTestSymbolsAndEmitEdgesForFilesLocked(g graph.Store, changedFiles []str
 		}
 	}
 	if len(testSources) == 0 {
-		g.AddBatch(changedNodes, nil)
-		return markedTests, 0
+		return markedTests, 0, publishTestProjectionLocked(g, changedNodes, nil, localNodes)
 	}
 
 	sourceIDs := make([]string, 0, len(testSources))
@@ -336,10 +370,12 @@ func markTestSymbolsAndEmitEdgesForFilesLocked(g graph.Store, changedFiles []str
 	)
 	if err != nil || !supported {
 		g.AddBatch(changedNodes, nil)
-		return markedTests, 0
+		if err == nil {
+			err = errors.New("test projection requires scoped test-edge eviction")
+		}
+		return markedTests, 0, err
 	}
-	g.AddBatch(changedNodes, edges)
-	return markedTests, len(edges)
+	return markedTests, len(edges), publishTestProjectionLocked(g, changedNodes, edges, localNodes)
 }
 
 func setTestMetadata(n *graph.Node, key string, value any) bool {

@@ -640,7 +640,15 @@ func (s *Server) commitFileMutation(
 	}
 	if err := prepareCheckoutMutation(ctx, absPath); err != nil {
 		record.markNotApplied(err)
-		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
+		refusal := fmt.Errorf("%w: %w", errMutationNotApplied, err)
+		// Prepare is also used by multi-file callers. Publish only here, at
+		// a proven single-file no-bytes boundary, never from the lease itself.
+		// The lifecycle additionally requires its authenticated active-lease
+		// proof and current identity/revision; a generic Stale is insufficient.
+		if singleFilePrecommitRefusal(ctx, tool) && s.lifecycle != nil && s.lifecycle.RecordCheckoutMutationRefusal(ctx, err) {
+			return record, &nativeCheckoutPrecommitRefusal{err: refusal}
+		}
+		return record, refusal
 	}
 	// Preparing may wait for durable route invalidation. Cancellation during
 	// that wait still guarantees that this handler has not written any bytes.
@@ -662,14 +670,40 @@ func (s *Server) commitFileMutation(
 	return record, nil
 }
 
+// nativeCheckoutPrecommitRefusal is private to the guarded no-bytes branch.
+// Wrapping preserves both the durable receipt's cancellation semantics and
+// errors.Is for the original typed refusal.
+type nativeCheckoutPrecommitRefusal struct{ err error }
+
+func (e *nativeCheckoutPrecommitRefusal) Error() string { return e.err.Error() }
+func (e *nativeCheckoutPrecommitRefusal) Unwrap() error { return e.err }
+
+func singleFilePrecommitRefusal(ctx context.Context, tool string) bool {
+	state := checkoutMutationFromContext(ctx)
+	if state == nil || !state.singleFile || state.committedPath != "" || ctx.Err() != nil {
+		return false
+	}
+	switch tool {
+	case "edit_file", "write_file", "edit_symbol":
+		return true
+	default:
+		return false
+	}
+}
+
 // mutationNotAppliedMessage is the terminal refusal for a write that was
 // cancelled before it started. It says "nothing changed" plainly, because that
 // is the one case where a client may retry without checking anything.
 func mutationNotAppliedMessage(what string, record *mutationCommitRecord, err error) string {
-	return fmt.Sprintf(
+	message := fmt.Sprintf(
 		"%s cancelled before the disk commit — nothing was written and the file is unchanged (disk_status=not_applied, receipt=%s): %v. "+
 			"Retrying is safe.",
 		what, record.id, err)
+	var refused *nativeCheckoutPrecommitRefusal
+	if errors.As(err, &refused) {
+		message = checkoutMutationRecoveryMessage(strings.TrimSuffix(message, "."), err, true)
+	}
+	return message
 }
 
 // attachMutationCommit puts the disk half of the receipt on a success payload.

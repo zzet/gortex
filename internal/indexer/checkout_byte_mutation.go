@@ -126,7 +126,7 @@ func (l *CheckoutLifecycle) BeginCheckoutByteHandoff(ctx context.Context, checko
 	return l.beginCheckoutByteMutation(ctx, checkoutID, root, incarnation, true)
 }
 
-func (l *CheckoutLifecycle) beginCheckoutByteMutation(ctx context.Context, checkoutID, root, incarnation string, ordinaryWhenIdle bool) (*CheckoutMutation, error) {
+func (l *CheckoutLifecycle) beginCheckoutByteMutation(ctx context.Context, checkoutID, root, incarnation string, ordinaryWhenIdle bool) (_ *CheckoutMutation, resultErr error) {
 	if l == nil || l.catalog == nil || checkoutID == "" || root == "" || incarnation == "" {
 		return nil, ErrCheckoutByteAnchorUnavailable
 	}
@@ -137,6 +137,8 @@ func (l *CheckoutLifecycle) beginCheckoutByteMutation(ctx context.Context, check
 	// anchor: checkByteAuthority admits only active or pending routes. Decline
 	// this optional admission before activation can consume the caller's whole
 	// deadline; the ordinary route wait retains its bounded refusal margin.
+	var witness checkoutMutationRefusalWitness
+	defer func() { resultErr = l.captureMutationRefusalError(resultErr, witness) }()
 	initialRoute, found, err := l.catalog.GetCheckoutRoute(ctx, checkoutID)
 	if err != nil {
 		return nil, err
@@ -182,6 +184,7 @@ func (l *CheckoutLifecycle) beginCheckoutByteMutation(ctx context.Context, check
 			if !present || checkout.Incarnation != incarnation || !sameMutationRoot(checkout.RootPath, root) {
 				return nil, fmt.Errorf("%w: checkout identity changed", ErrCheckoutMutationStale)
 			}
+			witness = l.mutationRefusalWitness(checkout, route.RouteEpoch)
 			rootInfo, err := checkoutRootFileInfo(root)
 			if err != nil || !rootInfo.IsDir() {
 				return nil, fmt.Errorf("%w: checkout root is unavailable", ErrCheckoutMutationStale)
@@ -192,6 +195,7 @@ func (l *CheckoutLifecycle) beginCheckoutByteMutation(ctx context.Context, check
 				return nil, err
 			}
 			admitted, cycleOwned = false, false
+			l.clearMutationRefusalOnAdmission(witness, m)
 			return m, nil
 		}
 	}
@@ -221,6 +225,8 @@ func (l *CheckoutLifecycle) beginCheckoutByteMutation(ctx context.Context, check
 			baseHeld.Release()
 		}
 	}()
+	witness = l.mutationRefusalWitness(anchor.checkout, anchor.route.RouteEpoch)
+	defer func() { resultErr = withMutationRefusalRoute(resultErr, anchor.route) }()
 	precheck := &CheckoutMutation{coordinator: c, checkout: anchor.checkout, rootInfo: anchor.rootInfo}
 	if err := precheck.validateCheckout(waitCtx); err != nil {
 		return nil, err
@@ -261,7 +267,7 @@ func (l *CheckoutLifecycle) beginCheckoutByteMutation(ctx context.Context, check
 	}
 	sample, err := sampleMutationAdmission(gitstate.WithUrgentSample(waitCtx), c.sampler, time.Time{})
 	if err != nil {
-		return nil, fmt.Errorf("%w: byte admission sample: %w", ErrCheckoutMutationStale, err)
+		return nil, &checkoutMutationSampleFailure{err: fmt.Errorf("%w: byte admission sample: %w", ErrCheckoutMutationStale, err)}
 	}
 	if err := m.checkByteAuthority(waitCtx, sample); err != nil {
 		return nil, err
@@ -278,6 +284,7 @@ func (l *CheckoutLifecycle) beginCheckoutByteMutation(ctx context.Context, check
 	m.byteRelease = func() { once.Do(func() { held.Release(); baseHeld.Release(); releaseDemand() }) }
 	owned, admitted, demanded, locked = false, false, false, false
 	StampPublicationPhase(ctx, PublicationMutationAdmitted)
+	l.clearMutationRefusalOnAdmission(witness, m)
 	return m, nil
 }
 

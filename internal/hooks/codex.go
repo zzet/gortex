@@ -122,7 +122,7 @@ func runCodex(data []byte, port int, selected ...CodexMode) {
 		}
 	case peek.HookEventName == "PreToolUse" && codexLocalizationPreToolUseTool(peek.ToolName):
 		runCodexLocalizationPreToolUse(data, mode)
-	case peek.HookEventName == "PostToolUse" && (peek.ToolName == "Bash" || peek.ToolName == "apply_patch" || localizationNavigationTool(peek.ToolName)):
+	case peek.HookEventName == "PostToolUse" && (peek.ToolName == "Bash" || peek.ToolName == "apply_patch" || localizationNavigationTool(peek.ToolName) || gortexMutationHookName(peek.ToolName)):
 		runCodexPostToolUse(data, port, mode)
 	case peek.HookEventName == "UserPromptSubmit":
 		// Re-surface graph symbols relevant to the prompt on every turn.
@@ -424,7 +424,21 @@ func runCodexBashRewrite(data []byte, port int) {
 		return
 	}
 
-	if updated, message, ok := rewrittenCodexBashInput(input); ok {
+	// Rewriting and advisory fallback are two branches of one door decision.
+	// Reuse its exact coverage observation rather than probing again on a
+	// read-only/unreached result that cannot be rewritten.
+	query := sessionFileScopeProbe(input.SessionID)
+	var observed fileIndexStatus
+	var observedCWD, observedPath string
+	checked := false
+	probe := func(cwd, path string) fileIndexStatus {
+		if !checked || cwd != observedCWD || path != observedPath {
+			observed = query(cwd, path)
+			observedCWD, observedPath, checked = cwd, path, true
+		}
+		return observed
+	}
+	if updated, message, ok := rewrittenCodexBashInput(input, probe); ok {
 		emitted = true
 		emitPreToolUse(HookOutput{HookSpecificOutput: &HookSpecificOutput{
 			HookEventName:      "PreToolUse",
@@ -435,7 +449,7 @@ func runCodexBashRewrite(data []byte, port int) {
 		return
 	}
 
-	result := applyMode(input, false, ModeEnrich, enrich(input, port))
+	result := applyMode(input, false, ModeEnrich, enrichWithProbe(input, port, probe))
 	if result.context == "" {
 		return
 	}
@@ -450,14 +464,14 @@ func runCodexBashRewrite(data []byte, port int) {
 // a file the daemon confirms is indexed. Head/tail, compound commands,
 // redirects, and search/list shapes retain advisory behavior because changing
 // their output contract could alter caller semantics.
-func rewrittenCodexBashInput(input HookInput) (map[string]any, string, bool) {
+func rewrittenCodexBashInput(input HookInput, probe fileScopeProbe) (map[string]any, string, bool) {
 	command, _ := input.ToolInput["command"].(string)
 	classification := classifyBashCommand(command)
 	if classification.Action != BashActionReadSource || classification.Primary != "cat" || !simpleBashCommand(command) {
 		return nil, "", false
 	}
-	indexed, _ := queryFileIndexed(input.CWD, classification.Path)
-	if !indexed {
+	st := probe(input.CWD, classification.Path)
+	if st.ReadOnly || !st.Indexed {
 		return nil, "", false
 	}
 	args, err := json.Marshal(map[string]any{"target": map[string]any{"file": classification.Path}})
@@ -495,6 +509,9 @@ func runCodexPostToolUse(data []byte, port int, mode CodexMode) {
 			logHookEffectivenessUnknown("PostToolUse", false, 0, time.Since(started))
 		}
 	}()
+	if observeMutationFallback(input, time.Now()) {
+		return
+	}
 	if localizationNavigationTool(input.ToolName) {
 		if terminal, observed := observeLocalizationTerminal(data); observed {
 			// Same accounting as the Claude Code path (runPostToolUse).

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/agentstest"
 	"github.com/zzet/gortex/internal/agents/hermes"
 	"github.com/zzet/gortex/internal/agents/skillpack"
 	"github.com/zzet/gortex/internal/profiles"
@@ -464,8 +465,9 @@ func TestPreWorktreeHashesMatchImmediatelyPriorShippedBodies(t *testing.T) {
 	assertHashes := func(name string, current map[string]string, hashes map[string][]string) {
 		t.Helper()
 		for id, body := range current {
-			old := strings.Replace(body, policy, "", 1)
-			if old == body {
+			historical := agentstest.BeforeTransientGuidance(body)
+			old := strings.Replace(historical, policy, "", 1)
+			if old == historical {
 				t.Errorf("%s/%s: policy block not found", name, id)
 				continue
 			}

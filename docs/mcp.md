@@ -116,6 +116,10 @@ For legacy presets, `tool_profile` and `tools_search` are always kept. The compa
 
 **Instruction profiles.** The machine's active instruction profile (`gortex instructions switch <core|localization|full>` — see [`cli.md`](cli.md#gortex-instructions--instruction-profiles)) can carry a tool preset; sessions pick it up between the forwarded spec and the client-aware default. Full precedence: **forwarded spec (`GORTEX_TOOLS` / `--tools`) > operator-pinned `mcp.tools` config > active instruction profile > client-aware default > server default**. The shipped `core` profile carries no preset, so nothing changes until a machine explicitly switches; profile changes apply to new sessions only.
 
+Tool names in installed instructions are examples, subject to the tools actually advertised for the session. An explicit legacy preset such as `GORTEX_TOOLS=core,+distill_session,+query_notes,+query_memories` keeps its legacy editors; the absence of the compact `change` alias does not disable those callable editors. Follow the server's session guidance, including read-only policies and explicit denials.
+
+After upgrading, `gortex instructions switch full` (or your selected profile) refreshes an already installed managed global inline block and the active profile. `instructions regen` and daemon startup refresh profile files, not every existing inline instruction file. Rerun your usual `gortex init` command in repositories with managed project instruction blocks to refresh those blocks. Start a new agent/MCP session afterward; existing sessions retain their loaded guidance and tool surface.
+
 **Two modes** (`mode`):
 
 - `defer` (the default mode for `core`) — non-allowed tools are kept out of the cold `tools/list` but stay reachable through `tools_search`, which returns their schema inline and promotes them (firing `notifications/tools/list_changed`). The lean-but-complete surface: nothing is lost, the rare tool is one discovery call away.

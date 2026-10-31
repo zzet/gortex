@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/toolref"
 
 	"github.com/zzet/gortex/internal/modelhint"
 )
@@ -244,7 +245,7 @@ func TestRunCodexPreToolUseGortexMCPReadSoftAdditionalContext(t *testing.T) {
 			if hso.HookEventName != "PreToolUse" {
 				t.Fatalf("hookEventName=%q want PreToolUse", hso.HookEventName)
 			}
-			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", "Native Gortex MCP is mandatory"} {
+			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", toolref.TransportClause(), toolref.DegradedModeLine()} {
 				if !strings.Contains(hso.AdditionalContext, want) {
 					t.Fatalf("additionalContext missing %q: %q", want, hso.AdditionalContext)
 				}

@@ -89,6 +89,10 @@ const (
 // code swaps Stderr for a buffer to assert on messages without
 // capturing process stderr.
 type Env struct {
+	// BinaryVersion identifies the actual CLI generator. Empty means a library
+	// or render fixture with no real binary identity, so no version is claimed.
+	BinaryVersion string
+
 	// Root is the absolute path to the repository. Adapters join
 	// relative paths under this.
 	Root string

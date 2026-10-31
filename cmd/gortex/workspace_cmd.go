@@ -162,9 +162,22 @@ func writeRepoYAML(repoPath string, payload map[string]any) error {
 		buf.Write(v)
 	}
 
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, []byte(buf.String()), 0o644); err != nil {
+	// Write atomically with a random-named temp file so a predictable ".tmp"
+	// name cannot be pre-created (or symlinked) by a co-tenant in the
+	// directory to redirect this write.
+	tmpFile, err := os.CreateTemp(filepath.Dir(p), filepath.Base(p)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp for %s: %w", p, err)
+	}
+	tmp := tmpFile.Name()
+	if _, err := tmpFile.Write([]byte(buf.String())); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, p); err != nil {
 		_ = os.Remove(tmp)

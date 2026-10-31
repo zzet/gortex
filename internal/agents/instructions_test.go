@@ -45,7 +45,7 @@ func TestInstructionsBody_PolicyCoreAndSingleHome(t *testing.T) {
 	for _, token := range []string{
 		"explore", "search", "read", "relations", "trace", "change",
 		"edit", "refactor", "capabilities", "recall", "remember",
-		"Gortex MCP integration failure", `operation:"verify"`,
+		toolref.TransportClause(), toolref.DegradedModeLine(), `operation:"verify"`,
 	} {
 		if !strings.Contains(InstructionsBody, token) {
 			t.Errorf("InstructionsBody no longer mentions %q — policy core regression", token)
@@ -54,7 +54,7 @@ func TestInstructionsBody_PolicyCoreAndSingleHome(t *testing.T) {
 	for _, banned := range []string{
 		providerMatrixMarker, analyzeCatalogMarker, formatDeepDiveMarker,
 		"facade-v1", "search_symbols", "get_symbol_source", "tools_search",
-		"gortex call", "daemon start", "while these tools are available",
+		"gortex call ", "daemon start", "while these tools are available",
 	} {
 		if strings.Contains(InstructionsBody, banned) {
 			t.Errorf("InstructionsBody re-carries relocated content %q — single-home violation", banned)
@@ -68,16 +68,16 @@ func TestInstructionsBody_PolicyCoreAndSingleHome(t *testing.T) {
 	}
 }
 
-// TestInstructionsBody_IntegrationFailureStopIsLiftable pins #900: the stop
-// rule written into AGENTS.md and friends must carry its exception, so an
-// agent in an untracked directory, or one the user told to proceed without
-// Gortex, continues with native tools instead of refusing to work.
-func TestInstructionsBody_IntegrationFailureStopIsLiftable(t *testing.T) {
-	if !strings.Contains(InstructionsBody, "integration failure and stop") {
-		t.Fatal("InstructionsBody lost the tracked-repo integration-failure rule")
-	}
-	if !strings.Contains(InstructionsBody, toolref.MCPMissingToolsException) {
-		t.Fatalf("InstructionsBody stop rule has no untracked-repo / user-override exception %q", toolref.MCPMissingToolsException)
+func TestInstructionsBodyContinuesDuringTransientFailures(t *testing.T) {
+	for _, body := range []string{InstructionsBody, nativeMCPRules} {
+		for _, sentence := range []string{toolref.TransportClause(), toolref.DegradedModeLine()} {
+			if !strings.Contains(body, sentence) {
+				t.Fatalf("shared instructions lost %q", sentence)
+			}
+		}
+		if strings.Contains(body, "integration failure and stop") {
+			t.Fatal("shared instructions still abandon a transient step")
+		}
 	}
 }
 
@@ -128,5 +128,25 @@ func TestGlobalPointerBody_ShapeAndSentinel(t *testing.T) {
 	const pointerByteCeiling = 512
 	if len(body) > pointerByteCeiling {
 		t.Errorf("pointer block is %d bytes, over the %d ceiling — the body belongs in the profile file", len(body), pointerByteCeiling)
+	}
+}
+
+func TestRenderedSharedCommandScopesNativeRestrictionsToAvailableSteps(t *testing.T) {
+	body, ok := SlashCommands["gortex-explore.md"]
+	if !ok || !strings.Contains(body, nativeMCPRules) {
+		t.Fatal("explore command did not render its shared policy")
+	}
+	for _, required := range []string{toolref.DegradedModeLine(), toolref.TransportClause(),
+		"When Gortex can serve the step, do not substitute shell reads",
+		"When Gortex can serve the step, use `change` before a mutation and again after it. Write only through"} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("rendered combined guidance lost %q", required)
+		}
+	}
+	if strings.Contains(body, "- Do not substitute shell reads, file search, or Git plumbing.") {
+		t.Fatal("unconditional native restriction negates the degraded exception")
+	}
+	if !strings.Contains(InstructionsBody, "When Gortex can serve the step:\n\n1.") {
+		t.Fatal("shared instruction workflow is not scoped to an available step")
 	}
 }

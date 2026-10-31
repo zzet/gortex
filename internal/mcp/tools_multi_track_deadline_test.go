@@ -134,16 +134,27 @@ func TestTrackRepositoryPrefixCollisionNamesMCPParameter(t *testing.T) {
 	req.Params.Arguments = map[string]any{"path": second}
 	res, err := srv.handleTrackRepository(t.Context(), req)
 	require.NoError(t, err)
-	require.True(t, res.IsError)
+	require.NotNil(t, res)
 	text := extractTextFromContent(t, res.Content)
+	require.True(t, res.IsError, "expected prefix collision, got: %s", text)
 	require.Contains(t, text, "name parameter")
 	require.NotContains(t, text, "gortex track --name")
 	require.Contains(t, text, first)
+	// The buffered result can arrive before the producer's deferred cleanup.
+	// Wait for this exact failed track worker to retire before changing the
+	// owner fixture and exercising a fresh missing-owner collision request.
+	absSecond, err := filepath.Abs(second)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, busy := srv.trackInFlight.Load(absSecond)
+		return !busy
+	}, 5*time.Second, time.Millisecond, "first collision worker must retire before retry")
 	require.NoError(t, os.RemoveAll(first))
 	res, err = srv.handleTrackRepository(t.Context(), req)
 	require.NoError(t, err)
-	require.True(t, res.IsError)
+	require.NotNil(t, res)
 	text = extractTextFromContent(t, res.Content)
+	require.True(t, res.IsError, "expected missing-owner collision, got: %s", text)
 	require.Contains(t, text, "no longer exists")
 	require.Contains(t, text, "untrack_repository")
 }

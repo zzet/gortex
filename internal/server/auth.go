@@ -17,10 +17,11 @@ import (
 // CORS preflights (OPTIONS) bypass the check so browsers on a different
 // origin can negotiate headers before the real request is issued.
 //
-// As a browser-EventSource workaround the middleware also accepts the
-// token via `?token=<t>`. Query-string auth leaks more readily into
-// access logs and referrer headers than a Bearer header, so prefer the
-// header when the client can set it.
+// The token is accepted only via the `Authorization` header. The query
+// string was dropped (see fix/drop-query-string-auth-token) because a
+// query token leaks into access logs, proxy logs, and Referrer headers,
+// and — paired with a CORS `*` wildcard — lets a cross-origin simple GET
+// exfiltrate it without any custom request header.
 func WithAuth(h http.Handler, token string) http.Handler {
 	if token == "" {
 		return h
@@ -49,10 +50,6 @@ func WithAuthFunc(h http.Handler, tokenFn func() string) http.Handler {
 			return
 		}
 		if authMatches([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) {
-			h.ServeHTTP(w, r)
-			return
-		}
-		if q := r.URL.Query().Get("token"); q != "" && tokenMatches([]byte(q), []byte(token)) {
 			h.ServeHTTP(w, r)
 			return
 		}

@@ -1,6 +1,8 @@
 package lsp
 
 import (
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -22,8 +24,10 @@ import (
 // underlying *Provider lifecycle. Safe for concurrent access from
 // the parallel resolver workers.
 type ResolverHelperRegistry struct {
-	mu      sync.RWMutex
-	entries []registryEntry
+	mu        sync.RWMutex
+	entries   []registryEntry
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type registryEntry struct {
@@ -89,20 +93,33 @@ func (r *ResolverHelperRegistry) Helpers() []resolver.LSPHelper {
 }
 
 // Close shuts down every registered helper's underlying provider.
-// Idempotent — a registry with no entries returns nil. Helpers that
-// don't expose a Close method (e.g. test stubs implementing only
+// Registration/resolver producers must already be joined (the shared stack
+// enforces this); Close snapshots their final entries. The result is cached.
+// Helpers that don't expose a Close method (e.g. test stubs implementing only
 // resolver.LSPHelper) are skipped silently.
 func (r *ResolverHelperRegistry) Close() error {
-	r.mu.Lock()
-	entries := r.entries
-	r.entries = nil
-	r.mu.Unlock()
-	for _, e := range entries {
-		if closer, ok := e.helper.(interface{ Close() error }); ok && closer != nil {
-			_ = closer.Close()
+	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		entries := r.entries
+		r.entries = nil
+		r.mu.Unlock()
+		var closing sync.WaitGroup
+		errs := make([]error, len(entries))
+		for i, entry := range entries {
+			if closer, ok := entry.helper.(interface{ Close() error }); ok && closer != nil {
+				closing.Add(1)
+				go func() {
+					defer closing.Done()
+					if err := closer.Close(); err != nil {
+						errs[i] = fmt.Errorf("resolver helper %q: %w", entry.prefix, err)
+					}
+				}()
+			}
 		}
-	}
-	return nil
+		closing.Wait()
+		r.closeErr = errors.Join(errs...)
+	})
+	return r.closeErr
 }
 
 // SupportsPath implements resolver.LSPHelper.

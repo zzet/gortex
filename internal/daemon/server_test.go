@@ -159,8 +159,10 @@ func newDaemon(t *testing.T, ctrl Controller) (*Server, string) {
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
 	t.Setenv("GORTEX_DAEMON_PIDFILE", filepath.Join(dir, "p"))
+	t.Setenv("GORTEX_DAEMON_STATEFILE", filepath.Join(dir, "state.json"))
 
 	srv := New(socket, "test-0.0.0", zap.NewNop())
+	srv.RuntimeStateFile = RuntimeStatePath()
 	srv.Controller = ctrl
 	require.NoError(t, srv.Listen())
 

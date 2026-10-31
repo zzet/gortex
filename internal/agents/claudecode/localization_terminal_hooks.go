@@ -21,7 +21,19 @@ const (
 		pluginMCPToolPrefix + "read|" +
 		pluginMCPToolPrefix + "relations|" +
 		pluginMCPToolPrefix + "trace|" +
-		pluginMCPToolPrefix + "analyze"
+		pluginMCPToolPrefix + "analyze|" +
+		// The same managed observer also records stale mutation refusals for
+		// older daemons. Keep it installed in every access-policy mode.
+		userMCPToolPrefix + "edit|" +
+		userMCPToolPrefix + "edit_file|" +
+		userMCPToolPrefix + "write_file|" +
+		userMCPToolPrefix + "edit_symbol|" +
+		userMCPToolPrefix + "batch_edit|" +
+		pluginMCPToolPrefix + "edit|" +
+		pluginMCPToolPrefix + "edit_file|" +
+		pluginMCPToolPrefix + "write_file|" +
+		pluginMCPToolPrefix + "edit_symbol|" +
+		pluginMCPToolPrefix + "batch_edit"
 )
 
 func desiredPostToolUseMatcher(mode string) string {
@@ -263,6 +275,7 @@ func pluginHooksWithLocalizationTerminality(data []byte) ([]byte, error) {
 		for _, rawEntry := range group["hooks"].([]any) {
 			if entry, ok := rawEntry.(map[string]any); ok {
 				entry["statusMessage"] = desiredPostToolUseStatus(HookModeDeny)
+				entry["timeout"] = hookTimeoutSeconds
 			}
 		}
 		postGroups = append(postGroups, group)

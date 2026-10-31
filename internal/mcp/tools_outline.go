@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"sort"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/query"
 )
 
 // handleGetRepoOutline returns a single-call narrative overview of the
@@ -23,13 +25,6 @@ import (
 // follows up with smart_context, find_usages, etc. on specific symbols
 // surfaced here.
 func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	const (
-		topCommunitiesN  = 5
-		topHotspotsN     = 5
-		topMostImportedN = 10
-		topEntryPointsN  = 10
-		topLanguagesN    = 5
-	)
 
 	// Bound sessions aggregate the request reader's scope in the backend.
 	// Keep unbound sessions on the cached Stats / EdgeCount path.
@@ -41,13 +36,65 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 	// Every node / edge read below goes through the request's reader, so
 	// an overlay-active caller sees its own buffers. Hoisted once: the
 	// outline touches the reader from several sections.
-	reader := graph.BindReadContext(s.readerFor(ctx), ctx)
+	reader := s.readerFor(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	key, cacheable := s.outlineCacheKey(reader, graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}, bound)
+	if cacheable {
+		if payload, ok := s.outlineResponses.get(key); ok {
+			if after, valid := s.outlineCacheKey(reader, graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}, bound); valid && after == key && ctx.Err() == nil {
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
+		}
+	}
+	payload, err := s.buildRepoOutline(ctx, reader, opts, bound)
+	if err != nil {
+		return nil, err
+	}
+	if cacheable {
+		if after, valid := s.outlineCacheKey(reader, graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}, bound); valid && after == key && ctx.Err() == nil && contractCoreReadError(ctx) == nil {
+			s.outlineResponses.put(key, payload)
+		}
+	}
+	return s.respondJSONOrTOON(ctx, req, payload)
+}
+
+const outlineMostImportedLimit = 10
+
+type outlineLanguage struct {
+	Name  string `json:"name"`
+	Nodes int    `json:"nodes"`
+}
+
+func (s *Server) buildRepoOutline(ctx context.Context, reader graph.Reader, opts query.QueryOptions, bound bool) (map[string]any, error) {
+	const (
+		topHotspotsN    = 5
+		topEntryPointsN = 10
+		topLanguagesN   = 5
+	)
+
+	scope := graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}
+	var prepared *outlinePreparedSummary
+	if key, ok := s.outlineCacheKey(reader, scope, bound); ok {
+		if counts, ready := s.outlineResponses.getSummary(key); ready {
+			if after, valid := s.outlineCacheKey(reader, scope, bound); valid && after == key {
+				prepared = &counts
+			}
+		}
+	}
+	reader = graph.BindReadContext(reader, ctx)
+
+	scopedNodes, _ := graph.BindReadContext(contractCoreSelectedReader(reader), ctx).(graph.ScopedOutlineNodeReader)
+	var candidateErr error
 
 	var scoped []*graph.Node
 	var inScope map[string]bool
 	var aggregated *graph.OutlineCounts
 	if bound {
-		if counts, ok, err := scopedOutlineCountsFor(reader, graph.NodeScope{
+		if prepared != nil {
+			aggregated = &prepared.counts
+		} else if counts, ok, err := scopedOutlineCountsFor(reader, graph.NodeScope{
 			WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow,
 		}); err != nil {
 			return nil, err
@@ -78,8 +125,16 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 				}
 			}
 			if len(missing) > 0 {
-				for id, n := range reader.GetNodesByIDs(missing) {
-					candidateScope[id] = n != nil && opts.ScopeAllows(n)
+				if scopedNodes != nil {
+					ids, err := scopedNodes.OutlineNodeIDsInScope(scope, missing)
+					candidateErr = errors.Join(candidateErr, err)
+					for _, id := range ids {
+						candidateScope[id] = true
+					}
+				} else {
+					for id, n := range reader.GetNodesByIDs(missing) {
+						candidateScope[id] = n != nil && opts.ScopeAllows(n)
+					}
 				}
 			}
 		}
@@ -103,10 +158,7 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 
 	// Language breakdown — computed from the scoped node set so the
 	// counts reflect only the session's workspace.
-	type langEntry struct {
-		Name  string `json:"name"`
-		Nodes int    `json:"nodes"`
-	}
+
 	langCounts := make(map[string]int)
 	totalScopedNodes := 0
 	if aggregated != nil {
@@ -126,9 +178,9 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 		maps.Copy(langCounts, stats.ByLanguage)
 		totalScopedNodes = stats.TotalNodes
 	}
-	var languages []langEntry
+	var languages []outlineLanguage
 	for name, n := range langCounts {
-		languages = append(languages, langEntry{Name: name, Nodes: n})
+		languages = append(languages, outlineLanguage{Name: name, Nodes: n})
 	}
 	sort.Slice(languages, func(i, j int) bool {
 		if languages[i].Nodes != languages[j].Nodes {
@@ -172,52 +224,46 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 	// Communities — top N by member count, filtered to communities
 	// with at least one member inside the session's workspace.
 	communitiesSection := map[string]any{"count": 0}
-	var comms *analysis.CommunityResult
-	generationCommunities := false
-	if aggregated != nil {
-		var err error
-		comms, generationCommunities, err = s.outlineGenerationCommunities(ctx, reader, graph.NodeScope{
-			WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow,
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-	if !generationCommunities {
-		comms = s.getCommunities()
-	}
-	if comms != nil && (generationCommunities || len(comms.Communities) > 0) {
-		sorted := make([]analysis.Community, 0, len(comms.Communities))
-		if generationCommunities {
-			sorted = append(sorted, comms.Communities...)
-		} else if aggregated != nil {
-			sorted = outlineCommunitiesInScope(comms.Communities, loadCandidates, candidateScope)
-		} else {
-			for _, c := range comms.Communities {
-				if allowsAny(c.Members) {
-					sorted = append(sorted, c)
-				}
+	if prepared != nil && prepared.communities != nil {
+		communitiesSection = prepared.communities
+	} else {
+		var comms *analysis.CommunityResult
+		generationCommunities := false
+		if aggregated != nil {
+			var err error
+			comms, generationCommunities, err = s.outlineGenerationCommunities(ctx, reader, graph.NodeScope{
+				WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow,
+			})
+			if err != nil {
+				return nil, err
 			}
 		}
-		sort.Slice(sorted, func(i, j int) bool {
-			return sorted[i].Size > sorted[j].Size
-		})
-		top := sorted
-		if len(top) > topCommunitiesN {
-			top = top[:topCommunitiesN]
+		if !generationCommunities {
+			comms = s.getCommunities()
 		}
-		communitiesSection = map[string]any{
-			"count":      len(sorted),
-			"modularity": comms.Modularity,
-			"top":        topCommunitiesSummary(top),
+		if comms != nil && (generationCommunities || len(comms.Communities) > 0) {
+			sorted := make([]analysis.Community, 0, len(comms.Communities))
+			if generationCommunities {
+				sorted = append(sorted, comms.Communities...)
+			} else if aggregated != nil {
+				sorted = outlineCommunitiesInScope(comms.Communities, loadCandidates, candidateScope)
+			} else {
+				for _, c := range comms.Communities {
+					if allowsAny(c.Members) {
+						sorted = append(sorted, c)
+					}
+				}
+			}
+			communitiesSection = outlineCommunitySection(sorted, comms.Modularity)
 		}
+
 	}
 
 	// Hotspots — load-bearing symbols by fan-in/out/crossings. Use a low
 	// threshold to ensure we get the top N regardless of repo size.
 	// Post-filtered to the session's workspace.
 	hotspotsSection := []map[string]any{}
-	hs := s.getHotspots()
+	hs := s.outlineHotspots()
 	for i, h := range hs {
 		if len(hotspotsSection) >= topHotspotsN {
 			break
@@ -253,29 +299,58 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 		for _, row := range aggregated.FileImports {
 			counts[row.FilePath] = row.Count
 		}
-		imported = rankImportedFiles(counts, topMostImportedN)
-		mains := reader.FindNodesByName("main")
-		ids := make([]string, 0, len(mains))
-		for _, n := range mains {
-			if n != nil {
-				ids = append(ids, n.ID)
+		if prepared != nil {
+			imported = prepared.imports
+		} else {
+			imported = rankImportedFiles(counts, outlineMostImportedLimit)
+		}
+		if scopedNodes != nil {
+			mains, err := scopedNodes.OutlineNodesByName(scope, "main")
+			if err != nil {
+				return nil, err
 			}
+			entries = entryPointsForNodes(mains, nil, topEntryPointsN)
+		} else {
+			mains := reader.FindNodesByName("main")
+			ids := make([]string, 0, len(mains))
+			for _, n := range mains {
+				if n != nil {
+					ids = append(ids, n.ID)
+				}
+			}
+			for id, n := range reader.GetNodesByIDs(ids) {
+				candidateScope[id] = opts.ScopeAllows(n)
+			}
+			entries = entryPointsForNodes(mains, candidateScope, topEntryPointsN)
 		}
-		for id, n := range reader.GetNodesByIDs(ids) {
-			candidateScope[id] = opts.ScopeAllows(n)
-		}
-		entries = entryPointsForNodes(mains, candidateScope, topEntryPointsN)
 	} else {
-		imported = mostImportedFiles(reader, inScope, topMostImportedN)
+		imported = mostImportedFiles(reader, inScope, outlineMostImportedLimit)
 		entries = entryPoints(reader, inScope, topEntryPointsN)
 	}
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	if candidateErr != nil {
+		return nil, candidateErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return map[string]any{
 		"summary":             summary,
 		"communities":         communitiesSection,
 		"hotspots":            hotspotsSection,
 		"most_imported_files": imported,
 		"entry_points":        entries,
-	})
+	}, nil
+}
+
+// outlineCommunitySection shares the exact legacy ranking/tie behavior with
+// explicit summary preparation; only the small final section is retained.
+func outlineCommunitySection(sorted []analysis.Community, modularity float64) map[string]any {
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Size > sorted[j].Size })
+	top := sorted
+	if len(top) > 5 {
+		top = top[:5]
+	}
+	return map[string]any{"count": len(sorted), "modularity": modularity, "top": topCommunitiesSummary(top)}
 }
 
 // topCommunitiesSummary shapes a subset of communities for the outline.

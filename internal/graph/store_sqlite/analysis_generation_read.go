@@ -102,7 +102,7 @@ func (s *Store) LoadActiveAnalysisHeader(formatVersion uint32) (graph.AnalysisGe
 // rather than as a hit.
 func (s *Store) ensureAnalysisGenerationReadableLocked(generationID int64) error {
 	var one int
-	err := s.db.QueryRow(`
+	err := s.db.QueryRowContext(s.readContext(), `
 		SELECT 1 FROM analysis_active_generation a
 		JOIN analysis_generations g ON g.generation_id = a.generation_id
 		WHERE a.view_gen = ? AND a.slot = 1 AND a.generation_id = ? AND g.state = ?`,
@@ -333,7 +333,7 @@ func (s *Store) ListAnalysisCommunitySummaries(generationID int64, limit int, cu
 	if err := s.ensureAnalysisGenerationReadableLocked(generationID); err != nil {
 		return nil, "", err
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(s.readContext(), `
 		SELECT community_id, label, hub, parent_id, size, cohesion
 		FROM analysis_communities WHERE generation_id = ? AND community_id > ?
 		ORDER BY community_id LIMIT ?`, generationID, cursorID, limit+1)
@@ -378,7 +378,7 @@ func (s *Store) loadAnalysisCommunityFilesLocked(generationID int64, items []gra
 		args = append(args, items[i].ID)
 		positions[items[i].ID] = i
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(s.readContext(), `
 		SELECT community_id, file_path FROM analysis_community_files
 		WHERE generation_id = ? AND community_id IN (`+analysisPlaceholders(len(items))+`)
 		ORDER BY community_id, ordinal`, args...)
@@ -409,7 +409,7 @@ func (s *Store) AnalysisCommunityMembers(generationID int64, communityID string,
 	if err := s.ensureAnalysisGenerationReadableLocked(generationID); err != nil {
 		return nil, "", err
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(s.readContext(), `
 		SELECT id, node_id, community_id, pagerank, authority, hub
 		FROM analysis_nodes
 		WHERE generation_id = ? AND community_id = ? AND node_id > ?

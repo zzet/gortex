@@ -343,11 +343,14 @@ type privateEdgeMigrationSnapshot struct {
 	IndexDDL    string
 	EdgeRows    int
 	DatabaseSHA string
+	WALSHA      string
 }
 
 func privateEdgeMigrationDiskSnapshot(tb testing.TB, path string) privateEdgeMigrationSnapshot {
 	tb.Helper()
-	db, err := sql.Open("sqlite", path)
+	// The snapshot must not checkpoint on its own last connection close:
+	// Store.Close intentionally leaves durable WAL frames for recovery.
+	db, err := openSQLiteStoreDB(sqliteReaderDSN(path))
 	if err != nil {
 		tb.Fatalf("open snapshot database: %v", err)
 	}
@@ -384,6 +387,13 @@ func privateEdgeMigrationDiskSnapshot(tb testing.TB, path string) privateEdgeMig
 		tb.Fatalf("read snapshot database bytes: %v", err)
 	}
 	snapshot.DatabaseSHA = fmt.Sprintf("%x", sha256.Sum256(bytes))
+	wal, err := os.ReadFile(path + "-wal")
+	if err != nil && !os.IsNotExist(err) {
+		tb.Fatalf("read snapshot WAL bytes: %v", err)
+	}
+	if err == nil {
+		snapshot.WALSHA = fmt.Sprintf("%x", sha256.Sum256(wal))
+	}
 	return snapshot
 }
 

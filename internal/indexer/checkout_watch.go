@@ -50,10 +50,11 @@ func checkoutWatchEnabled() bool {
 
 // checkoutWatch is a started watcher; close stops it and waits for its loop.
 type checkoutWatch struct {
-	fsw    fswatcher.Watcher
-	cancel context.CancelFunc
-	done   chan struct{}
-	once   sync.Once
+	fsw         fswatcher.Watcher
+	cancel      context.CancelFunc
+	done        chan struct{}
+	backendDone chan struct{}
+	once        sync.Once
 }
 
 // checkoutWatchFilter drops, inside the backend, events no build of the
@@ -97,12 +98,15 @@ func checkoutRelPath(root, path string) (string, bool) {
 	return filepath.ToSlash(rel), true
 }
 
-// startCheckoutWatch watches root recursively and calls onChange with the
+// startCheckoutWatchContext watches root recursively and calls onChange with the
 // changed paths (absolute, as the backend reports them) of each batch of
 // events. A nil slice means changes were lost (a queue overflow or a dropped
 // event) and the paths are unknown. matcher carries the repository's exclude
 // and include rules; nil takes the built-in list.
-func startCheckoutWatch(root string, matcher *excludes.Matcher, logger *zap.Logger, onChange func([]string)) (*checkoutWatch, error) {
+func startCheckoutWatchContext(parent context.Context, root string, matcher *excludes.Matcher, logger *zap.Logger, onChange func([]string)) (*checkoutWatch, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
 	if root == "" || onChange == nil {
 		return nil, errors.New("indexer: checkout watch needs a root and a consumer")
 	}
@@ -142,13 +146,23 @@ func startCheckoutWatch(root string, matcher *excludes.Matcher, logger *zap.Logg
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	watchErr := make(chan error, 1)
-	go func() { watchErr <- fsw.Watch(ctx) }()
+	backendDone := make(chan struct{})
+	go func() {
+		defer close(backendDone)
+		watchErr <- fsw.Watch(ctx)
+	}()
 	select {
+	case <-ctx.Done():
+		cancel()
+		fsw.Close()
+		<-backendDone
+		return nil, ctx.Err()
 	case <-ready:
 	case err := <-watchErr:
 		cancel()
+		<-backendDone
 		if err == nil {
 			err = errors.New("indexer: checkout watch stopped before it was ready")
 		}
@@ -156,9 +170,10 @@ func startCheckoutWatch(root string, matcher *excludes.Matcher, logger *zap.Logg
 	case <-time.After(checkoutWatchReadyTimeout):
 		cancel()
 		fsw.Close()
+		<-backendDone
 		return nil, errors.New("indexer: checkout watch did not become ready")
 	}
-	w := &checkoutWatch{fsw: fsw, cancel: cancel, done: make(chan struct{})}
+	w := &checkoutWatch{fsw: fsw, cancel: cancel, done: make(chan struct{}), backendDone: backendDone}
 	go w.loop(ctx, events, dropped, watchErr, logger, onChange)
 	return w, nil
 }
@@ -239,6 +254,9 @@ func (w *checkoutWatch) close() {
 		}
 		if w.done != nil {
 			<-w.done
+		}
+		if w.backendDone != nil {
+			<-w.backendDone
 		}
 	})
 }

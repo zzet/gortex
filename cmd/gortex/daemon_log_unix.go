@@ -9,6 +9,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func openDaemonExitLogFile(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+}
+
 func replaceDaemonLogFD(target **os.File, source *os.File) error {
 	return unix.Dup2(int(source.Fd()), int((*target).Fd()))
 }

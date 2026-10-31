@@ -46,7 +46,7 @@ func TestPreToolUseDaemonDownStandsDownWithOneNotice(t *testing.T) {
 	if !strings.Contains(first, "standing down to rule-only guidance") {
 		t.Fatalf("first degraded call should carry the once-per-session notice: %q", first)
 	}
-	if !strings.Contains(first, "MCP integration failure") {
+	if !strings.Contains(first, daemonUnreachableStance) {
 		t.Fatalf("notice must state the briefing's outage stance: %q", first)
 	}
 

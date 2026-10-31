@@ -13,6 +13,8 @@ import (
 // a close that copied enough frames records its per-frame cost, and the next
 // estimate uses the measured cost instead of the default.
 func TestCloseReportsProgressAndLearnsItsRate(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT", "full")
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT_MAX_S", "")
 	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
 	prevMin, prevInterval := closeRateMinFrames, closeProgressInterval
 	closeRateMinFrames, closeProgressInterval = 1000, 20*time.Millisecond

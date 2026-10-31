@@ -336,16 +336,29 @@ func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
 // Below the pressure mark a held lane still refuses the reclaim, as in the
 // samples of a normal run.
 func TestBelowThePressureMarkAHeldLaneRefusesTheReclaim(t *testing.T) {
-	s, path, lane := pressureStore(t, 0)
-	growWAL(t, s, 10) // ~10 MiB: over the 4 MiB threshold, under the 16 MiB mark
+	// Drive this branch directly. The autonomous poller must not race the
+	// precondition, and the seed table/schema WAL is not part of the edit log.
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_CEILING_MB", "64")
+	s, path := openWALReclaimStore(t)
+	t.Cleanup(func() { _ = s.Close() })
+	seedWALChurnTable(t, s)
+	require.NoError(t, s.CheckpointWAL())
+	growWAL(t, s, 6)
+	lane := &fakeBuildLane{}
+	lane.install(s)
+	// Open captured disabled reclaim; changing this env only constructs the
+	// explicit attempt's production configuration, without starting a poller.
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "4")
+	cfg := resolveWALReclaimConfig()
 	size := walFileSize(path + "-wal")
+	require.Greater(t, size, cfg.thresholdBytes, "precondition: above ordinary reclaim threshold")
 	require.Less(t, size, int64(16<<20), "precondition: under the mark")
 	ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
 	require.NoError(t, err)
 	defer func() { _ = ckpt.Close() }()
 	lane.held.Store(true)
 	defer lane.held.Store(false)
-	cfg := resolveWALReclaimConfig()
 	before := s.WALCopyStats()
 	res := s.reclaimWALOnce(cfg, ckpt, path+"-wal")
 	require.Equal(t, walReclaimSkipped, res.outcome)

@@ -72,10 +72,11 @@ func TestSharedServerCloseReleasesNotebookSidecar(t *testing.T) {
 			if err := sidecar.UpsertNotebook(repoKey, entry); err != nil {
 				t.Fatalf("write notebook: %v", err)
 			}
-			stack.cleanup = append(stack.cleanup, func() {
+			stack.addCleanup("sidecar_live_probe", func() error {
 				if _, err := sidecar.LoadNotebookRows(repoKey); err != nil {
 					t.Errorf("notebook sidecar closed before teardown finished: %v", err)
 				}
+				return nil
 			})
 
 			if err := stack.Close(); err != nil {

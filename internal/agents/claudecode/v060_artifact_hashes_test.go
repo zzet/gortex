@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/agentstest"
 	"github.com/zzet/gortex/internal/profiles"
 )
 
@@ -36,8 +37,9 @@ func TestPreWorktreeArtifactHashCatalogMatchesShippedBodies(t *testing.T) {
 			t.Errorf("%s hashes = %d, want %d", kind, len(hashes), len(current))
 		}
 		for name, body := range current {
-			old := strings.Replace(body, policy, "", 1)
-			if old == body {
+			historical := agentstest.BeforeTransientGuidance(body)
+			old := strings.Replace(historical, policy, "", 1)
+			if old == historical {
 				t.Errorf("%s/%s: policy block absent", kind, name)
 				continue
 			}
@@ -60,7 +62,7 @@ func TestWriteAgentArtifactMigratesRealPreWorktreeBodiesSafely(t *testing.T) {
 		{"subagent", SubAgents["gortex-search.md"], []string{v060SubAgentHashes["gortex-search.md"], preWorktreeSubAgentHashes["gortex-search.md"]}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			old := strings.Replace(tc.current, policy, "", 1)
+			old := strings.Replace(agentstest.BeforeTransientGuidance(tc.current), policy, "", 1)
 			path := filepath.Join(t.TempDir(), tc.name+".md")
 			if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
 				t.Fatal(err)
@@ -104,7 +106,7 @@ func TestInstallGlobalClaudeArtifactsMigratesEveryPreWorktreeBody(t *testing.T) 
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(path, []byte(strings.Replace(body, policy, "", 1)), 0o644); err != nil {
+			if err := os.WriteFile(path, []byte(strings.Replace(agentstest.BeforeTransientGuidance(body), policy, "", 1)), 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}

@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +21,7 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/platform"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // drainingController is a daemon whose store close takes closeFor: its
@@ -26,13 +31,120 @@ import (
 // otherwise (an older daemon, or one whose store is not SQLite).
 type drainingController struct {
 	*realController
-	closeFor time.Duration
-	storage  *daemon.StorageStatus
-	exited   atomic.Bool
+	closeFor    time.Duration
+	storage     *daemon.StorageStatus
+	exited      atomic.Bool
+	probePolicy string
+	statusCalls atomic.Int32
+	probeErr    error
 }
 
 func (c *drainingController) Status(context.Context) (daemon.StatusResponse, error) {
+	c.statusCalls.Add(1)
 	return daemon.StatusResponse{UptimeSeconds: 42, Storage: c.storage}, nil
+}
+
+func (c *drainingController) Probe(context.Context) (daemon.ProbeResponse, error) {
+	if c.probeErr != nil {
+		return daemon.ProbeResponse{}, c.probeErr
+	}
+	return daemon.ProbeResponse{CloseCheckpointPolicy: c.probePolicy, UptimeSeconds: 42}, nil
+}
+
+func TestDaemonStopFailedProbeSkipsDecorativeStatusFallback(t *testing.T) {
+	controller := &drainingController{
+		realController: &realController{}, probeErr: errors.New("probe unavailable"),
+		storage: &daemon.StorageStatus{CloseCheckpointEstimateMS: 1200},
+	}
+	newStopFixture(t, controller)
+	pre := daemonStatusBeforeStop()
+	require.Empty(t, pre.closePolicy)
+	require.False(t, pre.estimateKnown)
+	require.Zero(t, controller.statusCalls.Load())
+}
+
+func TestDaemonStopSkipPolicyUsesDaemonProbeWithoutStatus(t *testing.T) {
+	controller := &drainingController{realController: &realController{}, probePolicy: "skip"}
+	newStopFixture(t, controller)
+	// Deliberately contradictory CLI environment must not replace the actual
+	// remote daemon policy with a local full-drain assumption.
+	t.Setenv("GORTEX_SQLITE_CLOSE_CHECKPOINT", "full")
+	pre := daemonStatusBeforeStop()
+	require.Equal(t, "skip", pre.closePolicy)
+	require.Equal(t, os.Getpid(), pre.probePID, "the actual server stamps probe identity and uptime")
+	require.False(t, pre.estimateKnown)
+	require.Zero(t, controller.statusCalls.Load())
+}
+
+func TestDaemonStopFullAndLegacyPoliciesRetainStatusEstimate(t *testing.T) {
+	for _, policy := range []string{"full", "", "unrecognized"} {
+		t.Run(policy, func(t *testing.T) {
+			controller := &drainingController{
+				realController: &realController{}, probePolicy: policy,
+				storage: &daemon.StorageStatus{CloseCheckpointEstimateMS: 1200, WALPendingFrames: 42},
+			}
+			newStopFixture(t, controller)
+			pre := daemonStatusBeforeStop()
+			require.True(t, pre.estimateKnown)
+			require.Equal(t, 1200*time.Millisecond, pre.closeEstimate)
+			require.Equal(t, int64(42), pre.pendingFrames)
+			require.Equal(t, int32(1), controller.statusCalls.Load())
+		})
+	}
+}
+
+func TestDaemonStopAdvisoryHandshakeHasOneBudgetAndNoStatusRetry(t *testing.T) {
+	socket := filepath.Join(testenv.ShortTempDir(t), "s")
+	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
+	listener, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+	var mu sync.Mutex
+	var connections []net.Conn
+	var closing bool
+	var accepted atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			if closing {
+				mu.Unlock()
+				_ = conn.Close()
+				return
+			}
+			connections = append(connections, conn)
+			mu.Unlock()
+			accepted.Add(1)
+			// Consume the handshake but never send its ACK. Wait for the
+			// advisory caller itself to close this exact connection.
+			_, _ = io.Copy(io.Discard, conn)
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		mu.Lock()
+		closing = true
+		owned := append([]net.Conn(nil), connections...)
+		mu.Unlock()
+		for _, conn := range owned {
+			_ = conn.Close()
+		}
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("owned advisory socket fixture did not join")
+		}
+	})
+	started := time.Now()
+	pre := daemonStatusBeforeStop()
+	require.Less(t, time.Since(started), time.Second, "advisory lookup inherited the ordinary 10s handshake budget")
+	require.Empty(t, pre.closePolicy)
+	require.False(t, pre.estimateKnown)
+	require.Equal(t, int32(1), accepted.Load(), "failed Probe started a second decorative Status handshake")
 }
 
 func (c *drainingController) Shutdown(context.Context) error {
@@ -53,6 +165,7 @@ type stopFixture struct {
 
 func newStopFixture(t *testing.T, controller *drainingController) *stopFixture {
 	t.Helper()
+	t.Setenv("GORTEX_STOP_DUMP", "0") // Process control is simulated; the test PID is not a diagnostic target.
 	dir := t.TempDir()
 	socket := filepath.Join(os.TempDir(), fmt.Sprintf("gx-stop-drain-%d.sock", os.Getpid()))
 	_ = os.Remove(socket)
@@ -67,12 +180,14 @@ func newStopFixture(t *testing.T, controller *drainingController) *stopFixture {
 	serviceActive = func() bool { return false }
 	prevAck, prevNoAck, prevAcked, prevCap, prevProgress := daemonShutdownAckWait,
 		daemonNoAckExitGrace, daemonAckedExitGrace, daemonExitGraceCap, daemonDrainProgressPeriod
-	prevAlive, prevKill := daemonProcessAlive, daemonKillProcess
+	prevRunning, prevKill := daemonCapturedProcessRunning, daemonKillCapturedProcess
+	prevTerminate := daemonTerminateCapturedProcess
 	t.Cleanup(func() {
 		restoreServiceSeams()
 		daemonShutdownAckWait, daemonNoAckExitGrace, daemonAckedExitGrace = prevAck, prevNoAck, prevAcked
 		daemonExitGraceCap, daemonDrainProgressPeriod = prevCap, prevProgress
-		daemonProcessAlive, daemonKillProcess = prevAlive, prevKill
+		daemonCapturedProcessRunning, daemonKillCapturedProcess = prevRunning, prevKill
+		daemonTerminateCapturedProcess = prevTerminate
 	})
 	// Scaled clocks: the ack is given up on at 100ms, a daemon with no
 	// reported backlog is force-killed 300ms later, and the normal exit
@@ -82,13 +197,14 @@ func newStopFixture(t *testing.T, controller *drainingController) *stopFixture {
 	daemonAckedExitGrace = 500 * time.Millisecond
 	daemonExitGraceCap = 10 * time.Second
 	daemonDrainProgressPeriod = 250 * time.Millisecond
-	daemonProcessAlive = func(pid int) bool {
-		if pid != os.Getpid() {
-			return platform.ProcessAlive(pid)
+	daemonCapturedProcessRunning = func(identity platform.ProcessIdentity) (bool, error) {
+		if identity.PID() != os.Getpid() {
+			return identity.Running()
 		}
-		return !controller.exited.Load() && f.kills.Load() == 0
+		return !controller.exited.Load() && f.kills.Load() == 0, nil
 	}
-	daemonKillProcess = func(int) error { f.kills.Add(1); return nil }
+	daemonKillCapturedProcess = func(platform.ProcessIdentity) error { f.kills.Add(1); return nil }
+	daemonTerminateCapturedProcess = func(platform.ProcessIdentity) error { f.kills.Add(1); return nil }
 
 	srv := daemon.New(socket, "test", zap.NewNop())
 	srv.Controller = controller
@@ -166,7 +282,7 @@ func TestDaemonStopKeepsItsScheduleWithoutAnEstimate(t *testing.T) {
 	out := f.stderr.String()
 
 	assert.Equal(t, int32(1), f.kills.Load(), "a daemon with no reported backlog keeps the old no-ack schedule")
-	assert.Contains(t, out, "graceful shutdown timed out — force-killing")
+	assert.Contains(t, out, "graceful shutdown timed out — sent force-kill")
 	assert.NotContains(t, out, "draining")
 }
 
