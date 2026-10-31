@@ -24,6 +24,14 @@ func (r *contractCoreEdges) FileImporters(path string) []graph.FileImporterRow {
 // enumeration to those kinds, through this wrapper's mask. Scoped consumers
 // must instead count incoming rows of their bounded candidate identities.
 func (r *contractCoreEdges) InEdgeCountsByKind(kinds []graph.EdgeKind) map[string]int {
+	return inEdgeCountsFromReader(r, kinds)
+}
+
+// inEdgeCountsFromReader counts incoming edges per target for each distinct
+// requested kind, through reader's own kind iterators. A wrapper that filters
+// adjacency answers the capability with it, so the counts see exactly the
+// edges its EdgesByKind admits.
+func inEdgeCountsFromReader(reader graph.Reader, kinds []graph.EdgeKind) map[string]int {
 	out := make(map[string]int)
 	seen := make(map[graph.EdgeKind]bool, len(kinds))
 	for _, kind := range kinds {
@@ -31,8 +39,10 @@ func (r *contractCoreEdges) InEdgeCountsByKind(kinds []graph.EdgeKind) map[strin
 			continue
 		}
 		seen[kind] = true
-		for edge := range r.EdgesByKind(kind) {
-			out[edge.To]++
+		for edge := range reader.EdgesByKind(kind) {
+			if edge != nil {
+				out[edge.To]++
+			}
 		}
 	}
 	return out
