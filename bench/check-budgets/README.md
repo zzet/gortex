@@ -454,13 +454,13 @@ and three repeats. A 25-second sweep estimate adds 150 seconds, leaving only
 134 of 900 seconds for warm starts/stops, idle intervals, drain, preparation and
 microbenchmarks. This is an estimate, not a feasible-profile result.
 
-The actual contemporary query fixture check timed out after 120 seconds during
-resolver reachability setup, before it could prove any corrected benchmark
-result. A prior historical fixture attempt failed on an isolated type target;
-its successful executable/tool preparation earns no query acceptance. Query
-process order remains rotated; the runner does not silently batch samples or
-change fixture scope. Existing snapshot/cache options or a separately reviewed
-fixed core fixture must resolve this observed bottleneck before rollout.
+The contemporary query fixture check indexes the checkout's own `.gortex.yaml`
+scope described above; indexing the whole checkout with an empty config
+exceeded the 120-second bound. One sample at `GOMAXPROCS=2` passed in about 51
+seconds, well inside that unchanged bound. Confirmation on the reference runner
+is still pending, so that sample earns no query acceptance. Query process order
+remains rotated; the runner does not silently batch samples and never changes
+fixture scope itself.
 
 Actual tool counts remain authoritative. With mean 3.5-second think time and
 four-call bursts, optimistic 20-second estimates are about 328 load16 calls and
