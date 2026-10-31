@@ -5,20 +5,27 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 )
 
-// announceConfiguredRepos makes every configured repository read as loading.
-//
-// The warmup goroutine calls it first, ahead of checkout seeding rather than
-// when warmup reaches its job loop: seeding takes seconds on a large worktree
-// farm, and for that whole window the admission gate otherwise told sessions
-// their configured repository was untracked. It is not called before Listen:
-// it stats every configured root, and a hung mount must not keep the socket
-// from coming up.
+// listenConfiguredDaemon publishes lexical configured roots before opening
+// either listener. It performs no filesystem validation of those roots; warmup
+// does that later so a hung mount cannot delay serving other configured repos.
+func listenConfiguredDaemon(srv *daemon.Server, state *daemonState) error {
+	if state != nil && state.multiIndexer != nil && state.configManager != nil {
+		if gc := state.configManager.Global(); gc != nil {
+			state.multiIndexer.DeclareRepos(gc.ReposSnapshot())
+		}
+	}
+	return srv.Listen()
+}
+
+// announceConfiguredRepos fills the declarations' filesystem identity before
+// checkout seeding. Serving has already started, so filesystem work stays here
+// rather than in the lexical declaration that precedes Listen.
 func announceConfiguredRepos(state *daemonState) {
 	if state == nil || state.multiIndexer == nil || state.configManager == nil {
 		return
 	}
 	if gc := state.configManager.Global(); gc != nil {
-		state.multiIndexer.ExpectRepos(gc.Repos)
+		state.multiIndexer.ExpectRepos(gc.ReposSnapshot())
 	}
 }
 
@@ -60,16 +67,12 @@ func publicRepoState(state indexer.RepoLoadState) string {
 	return ""
 }
 
-// loadingRepoForPath names the configured repository abs belongs to when that
-// repository is still loading, for the coverage replies the hooks turn into a
-// deny. Lock-free; reads no store.
-func (c *realController) loadingRepoForPath(abs string) (repo string, loading bool) {
+// pendingRepoLoadForPath reads one snapshot: ownership and unresolved identity
+// must never be separated by a concurrent warmup publication. Ready records
+// still require ordinary coverage authority, not permission from this table.
+func (c *realController) pendingRepoLoadForPath(abs string) (indexer.RepoLoad, bool) {
 	if c == nil || c.multiIndexer == nil {
-		return "", false
+		return indexer.RepoLoad{}, false
 	}
-	rec, pending := c.multiIndexer.PendingRepoForPath(abs)
-	if !pending || !rec.State.Loading() {
-		return "", false
-	}
-	return rec.Label(), true
+	return c.multiIndexer.RepoLoadAdmissionForPath(abs)
 }

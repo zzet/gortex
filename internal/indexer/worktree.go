@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -43,6 +44,14 @@ type WorktreeInfo struct {
 // repository have multiple checkouts, each assigned to its own
 // workspace and indexed from its own branch / working tree.
 func ResolveWorktree(path string) WorktreeInfo {
+	info, _ := resolveWorktreeChecked(path)
+	return info
+}
+
+// resolveWorktreeChecked keeps I/O uncertainty distinct from a non-git root.
+// Startup identity publication must not treat a best-effort fallback as proof
+// that no configured alias can own a request.
+func resolveWorktreeChecked(path string) (WorktreeInfo, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		abs = path
@@ -52,35 +61,53 @@ func ResolveWorktree(path string) WorktreeInfo {
 	gitPath := filepath.Join(abs, ".git")
 	st, err := os.Stat(gitPath)
 	if err != nil {
-		return info // not a git repository
+		if errors.Is(err, os.ErrNotExist) {
+			return info, nil
+		}
+		return info, err
 	}
 	if st.IsDir() {
 		info.GitCommonDir = gitPath
-		return info // the main checkout
+		return info, nil // the main checkout
 	}
 
 	// `.git` is a file: a linked worktree or a submodule. Read the
 	// gitdir indirection.
 	content, err := os.ReadFile(gitPath)
 	if err != nil {
-		return info
+		return info, err
 	}
 	line := strings.TrimSpace(string(content))
 	wtGitDir := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
 	if wtGitDir == "" || wtGitDir == line {
-		return info // malformed .git file
+		return info, fmt.Errorf("malformed gitdir in %s", gitPath)
 	}
 	if !filepath.IsAbs(wtGitDir) {
 		wtGitDir = filepath.Join(abs, wtGitDir)
+	}
+
+	gitInfo, err := os.Stat(wtGitDir)
+	if err != nil {
+		return info, err
+	}
+	if !gitInfo.IsDir() {
+		return info, fmt.Errorf("gitdir %s is not a directory", wtGitDir)
 	}
 
 	// Only a worktree's gitdir carries a `commondir` file; a
 	// submodule's does not. Its absence means "not a worktree".
 	commonRaw, err := os.ReadFile(filepath.Join(wtGitDir, "commondir"))
 	if err != nil {
-		return info
+		if errors.Is(err, os.ErrNotExist) {
+			info.GitCommonDir = filepath.Clean(wtGitDir)
+			return info, nil // separate gitdir or submodule: still its own primary
+		}
+		return info, err
 	}
 	common := strings.TrimSpace(string(commonRaw))
+	if common == "" {
+		return info, fmt.Errorf("empty commondir in %s", wtGitDir)
+	}
 	if !filepath.IsAbs(common) {
 		common = filepath.Join(wtGitDir, common)
 	}
@@ -92,7 +119,7 @@ func ResolveWorktree(path string) WorktreeInfo {
 	if filepath.Base(common) == ".git" {
 		info.MainRepoPath = filepath.Dir(common)
 	}
-	return info
+	return info, nil
 }
 
 // WorktreeInstanceName decides the repo prefix that absPath should be

@@ -35,8 +35,7 @@ func newWorktreeMCPServer(t *testing.T, repos ...config.RepoEntry) (*Server, *in
 	preg := testRegistry()
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, preg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	singleton := indexer.New(g, preg, config.IndexConfig{}, zap.NewNop())

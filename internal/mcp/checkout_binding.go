@@ -771,7 +771,10 @@ func (s *Server) checkoutForRequestPath(ctx context.Context, path string) (store
 			return checkout, true, nil
 		}
 	}
-	if s.lifecycle == nil {
+	if s.lifecycle == nil || (s.multiIndexer != nil && s.multiIndexer.RepoIdentityPending()) {
+		// Registered catalog positives above remain usable. An unresolved configured
+		// identity is not a reason to allocate a checkout-observation job on a miss;
+		// startup admission will report identity-pending without guessing ownership.
 		return store_sqlite.Checkout{}, false, parentErr
 	}
 	// CWD observation establishes a session's scope. A different explicit

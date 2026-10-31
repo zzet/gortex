@@ -1577,6 +1577,16 @@ func ServerInstructionsPendingAutomaticCheckout(cwd string, roots ...string) str
 	return appendTrackedRootsDiagnostic(msg+"\n\n"+toolref.TransportClause()+" "+toolref.DegradedModeLine(), roots)
 }
 
+// PendingAutomaticCheckoutInstructions captures the verified family verdict
+// with its canonical rendered guidance. A later reader must not re-probe the
+// filesystem and accidentally turn this pending result into untracked advice.
+func PendingAutomaticCheckoutInstructions(cwd string, roots ...string) (string, bool) {
+	if !agents.PendingAutomaticCheckout(cwd, roots) {
+		return "", false
+	}
+	return ServerInstructionsPendingAutomaticCheckout(cwd, roots...), true
+}
+
 // ServerInstructionsPendingFamilyLoad retains the terminal load failure as
 // context, without suggesting a second track operation for a declared family.
 func ServerInstructionsPendingFamilyLoad(cwd string, load indexer.RepoLoad, roots ...string) string {
@@ -1672,6 +1682,12 @@ func (s *Server) stateAwareInstructionsWithBase(cwd, base string) string {
 }
 
 func (s *Server) stateAwareInstructionsContext(ctx context.Context, cwd, base string) string {
+	return s.stateAwareInstructionsWithCheckout(ctx, cwd, base, s.CheckoutServesCWDChecked)
+}
+
+// Keep the existing checkout lookup explicit so publication during that
+// lookup can be exercised without a global hook or changing the transport.
+func (s *Server) stateAwareInstructionsWithCheckout(ctx context.Context, cwd, base string, lookup func(context.Context, string) (bool, error)) string {
 	// The reachability test must match the dispatcher's gate exactly.
 	// Telling a session it is INACTIVE while every call succeeds is the
 	// same divergence as the reverse, just quieter.
@@ -1683,23 +1699,32 @@ func (s *Server) stateAwareInstructionsContext(ctx context.Context, cwd, base st
 			// untracked: telling it to track itself and reconnect is the
 			// advice that made agents re-track or stop on every restart.
 			if rec, pending := s.multiIndexer.PendingRepoForPath(cwd); pending {
-				if !rec.State.Loading() {
-					roots := agents.FamilyRepoRoots(s.trackedRepoRoots(), s.multiIndexer.ConfiguredRepoRoots())
-					if agents.PendingAutomaticCheckout(cwd, roots) {
-						return ServerInstructionsPendingFamilyLoad(cwd, rec, roots...)
-					}
-					return ServerInstructionsUnavailable(rec.Root, rec.Reason)
-				}
-				// The ordinary instructions follow the loading preamble: the
-				// client reads them once, and they must still be right after
-				// the repository is ready.
-				phase, percent := s.WarmupProgress()
-				return ServerInstructionsLoading(rec.Label(), phase, percent) + "\n\n" + base
+				return s.instructionsForRepoLoad(cwd, base, rec)
 			}
-			if serves, err := s.CheckoutServesCWDChecked(ctx, cwd); err != nil {
+			if serves, err := lookup(ctx, cwd); err != nil {
 				return CheckoutAdmissionInstructions(cwd, err)
 			} else if serves {
 				return s.appendLiveInstructions(cwd, base)
+			}
+			if rec, classified := s.multiIndexer.RepoLoadAdmissionForPath(cwd); classified {
+				if rec.State.Ready() {
+					_, _, _, inside = s.multiIndexer.ScopeForCWD(cwd)
+					_, _, contains = s.multiIndexer.ContainedReposScope(cwd)
+					if inside || contains {
+						return s.appendLiveInstructions(cwd, base)
+					}
+					if serves, err := lookup(ctx, cwd); err != nil {
+						return CheckoutAdmissionInstructions(cwd, err)
+					} else if serves {
+						return s.appendLiveInstructions(cwd, base)
+					}
+					roots := agents.FamilyRepoRoots(s.trackedRepoRoots(), s.multiIndexer.ConfiguredRepoRoots())
+					if instructions, known := PendingAutomaticCheckoutInstructions(cwd, roots...); known {
+						return instructions
+					}
+					return ServerInstructionsScopeBindingPending() + "\n\n" + base
+				}
+				return s.instructionsForRepoLoad(cwd, base, rec)
 			}
 			roots := agents.FamilyRepoRoots(s.trackedRepoRoots(), s.multiIndexer.ConfiguredRepoRoots())
 			if agents.PendingAutomaticCheckout(cwd, roots) {
@@ -1709,6 +1734,21 @@ func (s *Server) stateAwareInstructionsContext(ctx context.Context, cwd, base st
 		}
 	}
 	return s.appendLiveInstructions(cwd, base)
+}
+
+func (s *Server) instructionsForRepoLoad(cwd, base string, rec indexer.RepoLoad) string {
+	if rec.State == indexer.RepoLoadIdentityPending {
+		return ServerInstructionsIdentityPending() + "\n\n" + base
+	}
+	if !rec.State.Loading() {
+		roots := agents.FamilyRepoRoots(s.trackedRepoRoots(), s.multiIndexer.ConfiguredRepoRoots())
+		if agents.PendingAutomaticCheckout(cwd, roots) {
+			return ServerInstructionsPendingFamilyLoad(cwd, rec, roots...)
+		}
+		return ServerInstructionsUnavailable(rec.Root, rec.Reason)
+	}
+	phase, percent := s.WarmupProgress()
+	return ServerInstructionsLoading(rec.Label(), phase, percent) + "\n\n" + base
 }
 
 func (s *Server) appendLiveInstructions(cwd, base string) string {
@@ -2431,7 +2471,7 @@ func (s *Server) sessionScope(ctx context.Context) (workspaceID, projectID strin
 	// too, but only for now. Caching the sentinel would leave the session
 	// blind after the repository registers, so it is not cached: the next
 	// call resolves again.
-	if rec, pending := s.multiIndexer.PendingRepoForPath(cwd); pending && rec.State.Loading() {
+	if _, classified := s.multiIndexer.RepoLoadAdmissionForPath(cwd); classified {
 		ss.scopeResolved = false
 	}
 	ss.scopeWorkspaceID = unresolvedWorkspacePrefix + cwd

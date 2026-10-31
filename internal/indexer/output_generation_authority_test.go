@@ -298,7 +298,6 @@ func TestEveryProductionMutationEntryPointIsRegistered(t *testing.T) {
 	// same function still names an entry.
 	required := []mutationDoor{
 		{file: "contract_baseline_reconcile.go", fn: "reconcilePrimaryContractBaseline", door: "withRepositoryMutationLanes", entries: []string{"OutputEntryContractBaseline"}},
-		{file: "multi.go", fn: "indexMultiRepo", door: "withRepositoryMutationLanes", entries: []string{"OutputEntryIndexMultiRepo"}},
 		{file: "multi.go", fn: "IndexRepo", door: "runExclusive", entries: []string{"OutputEntryIndexRepo"}},
 		{file: "multi.go", fn: "incrementalDiscoverRepo", door: "runExclusive", entries: []string{"OutputEntryIncrementalDiscoverRepo"}},
 		{file: "repository_topology_batch.go", fn: "coordinateRepositoryTopologyMutation", door: "runExclusiveLaneOnly", entries: []string{"OutputEntryRepositoryTopology"}},
@@ -407,7 +406,6 @@ func outputMutationEntryValue(identifier string) (string, bool) {
 		"OutputEntryReresolveFileScoped":     OutputEntryReresolveFileScoped,
 		"OutputEntryDeferredPasses":          OutputEntryDeferredPasses,
 		"OutputEntryRepositoryTopology":      OutputEntryRepositoryTopology,
-		"OutputEntryIndexMultiRepo":          OutputEntryIndexMultiRepo,
 		"OutputEntryIndexRepo":               OutputEntryIndexRepo,
 		"OutputEntryIncrementalDiscoverRepo": OutputEntryIncrementalDiscoverRepo,
 		"OutputEntryGitWatcherFinalize":      OutputEntryGitWatcherFinalize,
@@ -619,7 +617,7 @@ func TestSupersededWorkIsRefusedBeforeItWrites(t *testing.T) {
 	}
 
 	// The batch form refuses the same way, before the batch writes anything.
-	batchOlder, err := authority.Begin(ctx, OutputEntryIndexMultiRepo, target)
+	batchOlder, err := authority.Begin(ctx, OutputEntryRepositoryTopology, target)
 	if err != nil {
 		t.Fatalf("batch receipt: %v", err)
 	}
@@ -627,7 +625,7 @@ func TestSupersededWorkIsRefusedBeforeItWrites(t *testing.T) {
 	if err := batch.Current(); err != nil {
 		t.Fatalf("an uncontested batch must be current: %v", err)
 	}
-	contender, err := authority.Begin(ctx, OutputEntryIndexMultiRepo, target)
+	contender, err := authority.Begin(ctx, OutputEntryRepositoryTopology, target)
 	if err != nil {
 		t.Fatalf("batch contender: %v", err)
 	}
@@ -1429,9 +1427,9 @@ func TestColdBatchOpensOneReceiptPerRepositoryOwner(t *testing.T) {
 		t.Fatalf("IndexAll: %v", err)
 	}
 	stats := authority.Stats()
-	if got := stats.Entries[OutputEntryIndexMultiRepo]; got != 2 {
+	if got := stats.Entries[OutputEntryRepositoryTopology]; got != 2 {
 		t.Fatalf("the cold batch opened %d receipts under %s, want one per repository owner (2)",
-			got, OutputEntryIndexMultiRepo)
+			got, OutputEntryRepositoryTopology)
 	}
 	if stats.Superseded != 0 || stats.Settled != stats.Issued {
 		t.Fatalf("every batch receipt must settle cleanly: %+v", stats)

@@ -323,6 +323,9 @@ const (
 	// RepoStateLoading: configured, and the daemon has not registered it
 	// since it started. Graph calls answer repo_loading until it is ready.
 	RepoStateLoading = "loading"
+	// RepoStateIdentityPending means configured identities are unresolved; it
+	// does not claim that the requested path belongs to a repository.
+	RepoStateIdentityPending = "identity_pending"
 	// RepoStateReady: registered; graph calls answer.
 	RepoStateReady = "ready"
 	// RepoStateFailed: its load ended without registering it.
@@ -1024,6 +1027,8 @@ type FileCoverageResult struct {
 	// Graph calls for such a repo answer repo_loading, so a coverage verdict
 	// read from its persisted rows must not turn into a deny of the native
 	// tool: the agent would have no read path at all. Repo names it.
+	// RepoStateIdentityPending instead reports unresolved configured identities
+	// without asserting ownership of Path; Repo is empty and no graph is read.
 	RepoState string `json:"repo_state,omitempty"`
 	Repo      string `json:"repo,omitempty"`
 	// MutationState is read_only while the current checkout's exact route has

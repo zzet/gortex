@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -151,8 +152,12 @@ func newPrefixFixture(t *testing.T) (*Server, string, string) {
 	reg.Register(languages.NewGoExtractor())
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	// These fixtures test path ownership/freshness, not cross-repo batch
+	// resolution. Register their explicit roots through the production path.
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err)
+	}
 
 	return &Server{multiIndexer: mi}, repoA, repoB
 }

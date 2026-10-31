@@ -127,8 +127,7 @@ func fetchUsers() {
 
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, preg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	return NewServer(eng, g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{

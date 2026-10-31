@@ -1041,7 +1041,6 @@ const (
 	// lane worker, which names OutputEntryRepositoryReconcileLane below.
 	OutputEntryDeferredPasses          OutputMutationEntry = "indexer.MultiIndexer.withDeferredRepositoryMutation"
 	OutputEntryRepositoryTopology      OutputMutationEntry = "indexer.MultiIndexer.coordinateRepositoryTopologyMutation"
-	OutputEntryIndexMultiRepo          OutputMutationEntry = "indexer.MultiIndexer.indexMultiRepo"
 	OutputEntryIndexRepo               OutputMutationEntry = "indexer.MultiIndexer.IndexRepo"
 	OutputEntryIncrementalDiscoverRepo OutputMutationEntry = "indexer.MultiIndexer.incrementalDiscoverRepo"
 	OutputEntryGitWatcherFinalize      OutputMutationEntry = "indexer.GitWatcher.finalizeReconcile"
@@ -1092,7 +1091,6 @@ var outputMutationEntryKinds = map[OutputMutationEntry]OutputGenerationKind{
 	OutputEntryReresolveFileScoped:     OutputGenerationLegacy,
 	OutputEntryDeferredPasses:          OutputGenerationLegacy,
 	OutputEntryRepositoryTopology:      OutputGenerationLegacy,
-	OutputEntryIndexMultiRepo:          OutputGenerationLegacy,
 	OutputEntryIndexRepo:               OutputGenerationLegacy,
 	OutputEntryIncrementalDiscoverRepo: OutputGenerationLegacy,
 	OutputEntryGitWatcherFinalize:      OutputGenerationLegacy,

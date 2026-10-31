@@ -54,7 +54,7 @@ func TestStatus_TrackedRepoRowFollowsTheLiveGraph(t *testing.T) {
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
+	_, err = mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: dir})
 	require.NoError(t, err)
 
 	metas := mi.AllMetadata()
@@ -130,7 +130,7 @@ func TestStatus_TwoReposEachReportTheirOwnBucket(t *testing.T) {
 	// A is indexed while it is the only configured repo.
 	g := graph.New()
 	mi1 := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi1.IndexAll()
+	_, err = mi1.TrackRepoCtx(context.Background(), config.RepoEntry{Path: dirA})
 	require.NoError(t, err)
 	var priorA map[string]int64
 	for _, m := range mi1.AllMetadata() {

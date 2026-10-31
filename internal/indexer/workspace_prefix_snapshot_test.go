@@ -16,11 +16,11 @@ import (
 func TestIndexMultiRepoWithoutConfigManager(t *testing.T) {
 	mi := newColdOrchestrationMulti(graph.New(), zap.NewNop())
 	t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
-	results, err := mi.indexMultiRepo(nil)
+	results, err := mi.indexFixtureRepos(nil)
 	require.NoError(t, err)
 	assert.Empty(t, results)
 	repos := coldOrchestrationRepos(t, 1)
-	results, err = mi.indexMultiRepo(repos)
+	results, err = mi.indexFixtureRepos(repos)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.NotNil(t, mi.GetMetadata(config.ResolvePrefix(repos[0])))

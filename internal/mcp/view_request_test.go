@@ -154,9 +154,7 @@ func newViewStackWithRepos(t *testing.T, includeOther bool) *viewStack {
 	languages.RegisterAll(reg)
 	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(store, reg, bm, cm, zap.NewNop())
-	if _, err := mi.IndexScoped("", ""); err != nil {
-		t.Fatalf("index fixture repos: %v", err)
-	}
+	registerMCPFixtureRepos(t, mi, cm)
 
 	graphID := indexer.GraphIDFor("repo")
 	stack := &viewStack{

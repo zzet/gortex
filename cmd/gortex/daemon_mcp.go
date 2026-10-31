@@ -123,7 +123,7 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 		admissionErr = nil
 	}
 	var terminalFamilyLoad []indexer.RepoLoad
-	if pending != nil && !pending.load.State.Loading() && agents.PendingAutomaticCheckout(sess.CWD, d.familyRoots()) {
+	if pending != nil && pending.load.State.Unavailable() && agents.PendingAutomaticCheckout(sess.CWD, d.familyRoots()) {
 		terminalFamilyLoad = []indexer.RepoLoad{pending.load}
 		pending = nil // still unadmitted; only the guidance/refusal classification changes
 	}
@@ -135,7 +135,7 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 		return d.familyDiscoveryRefusal(sess.CWD, frame, "family_member"), nil
 	}
 	if pending != nil {
-		if refused := d.pendingRepoRefusal(sess, frame, pending.load); refused != nil {
+		if refused := d.pendingRepoRefusal(sess, frame, pending); refused != nil {
 			return refused, nil
 		}
 	}
@@ -234,6 +234,9 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	}
 	if admissionErr != nil {
 		out = rewriteCheckoutAdmissionResponse(peekFrameMethod(frame), out, sess.CWD, admissionErr)
+	}
+	if pending != nil && pending.familyInstructions != "" {
+		out = rewriteMCPAdmissionInstructions(peekFrameMethod(frame), out, pending.familyInstructions)
 	}
 	if pending != nil {
 		d.notePendingRepoSession(sess, peekFrameMethod(frame), pending.load)
@@ -427,6 +430,10 @@ func checkoutAdmissionError(cwd string, inbound []byte, err error) []byte {
 }
 
 func rewriteCheckoutAdmissionResponse(method string, out []byte, cwd string, err error) []byte {
+	return rewriteMCPAdmissionInstructions(method, out, gortexmcp.CheckoutAdmissionInstructions(cwd, err))
+}
+
+func rewriteMCPAdmissionInstructions(method string, out []byte, instructions string) []byte {
 	if method != "initialize" && method != "server/discover" {
 		return out
 	}
@@ -438,7 +445,7 @@ func rewriteCheckoutAdmissionResponse(method string, out []byte, cwd string, err
 	if !ok {
 		return out
 	}
-	result["instructions"] = gortexmcp.CheckoutAdmissionInstructions(cwd, err)
+	result["instructions"] = instructions
 	updated, marshalErr := json.Marshal(reply)
 	if marshalErr != nil {
 		return out
@@ -450,7 +457,7 @@ func (d *mcpDispatcher) cwdReachableChecked(ctx context.Context, cwd string) (bo
 	if cwd == "" {
 		return true, nil
 	}
-	if d.isCWDTracked(cwd) {
+	if d.registeredCWDReachable(cwd) {
 		return true, nil
 	}
 	// Workspace-root fallback: a cwd that CONTAINS tracked repos — an
@@ -468,12 +475,6 @@ func (d *mcpDispatcher) cwdReachableChecked(ctx context.Context, cwd string) (bo
 	// left the session with no working call and a remedy (`gortex track
 	// <parent>`) that would have indexed every child a second time.
 	if d.multiIndexer != nil {
-		if _, _, _, ok := d.multiIndexer.ScopeForCWD(cwd); ok {
-			return true, nil
-		}
-		if _, _, ok := d.multiIndexer.ContainedReposScope(cwd); ok {
-			return true, nil
-		}
 		// Configured but not registered yet: warmup has not reached the
 		// repository, or its load ended without registering it. Decided
 		// before the checkout and router arms, so a worktree of a loading
@@ -499,16 +500,59 @@ func (d *mcpDispatcher) cwdReachableChecked(ctx context.Context, cwd string) (bo
 			return err == nil && reachable, err
 		}
 	}
-	rtr := d.router.Load()
-	if rtr == nil {
-		return false, nil
+	if rtr := d.router.Load(); rtr != nil {
+		lookup := rtr.LookupForCwd(cwd, "")
+		switch lookup.Source {
+		case "scope-override", "config-yaml", "roster":
+			return true, nil
+		}
 	}
-	lookup := rtr.LookupForCwd(cwd, "")
-	switch lookup.Source {
-	case "scope-override", "config-yaml", "roster":
-		return true, nil
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if d.multiIndexer != nil {
+		if rec, classified := d.multiIndexer.RepoLoadAdmissionForPath(cwd); classified {
+			if rec.State.Ready() {
+				// Registration can publish during the probes above. The load table is
+				// identity evidence, not graph authority: recheck ordinary scope once.
+				if d.registeredCWDReachable(cwd) {
+					return true, nil
+				}
+				if probe != nil {
+					reachable, err := probe(ctx, cwd)
+					if err != nil || reachable {
+						return err == nil && reachable, err
+					}
+				}
+				if instructions, known := gortexmcp.PendingAutomaticCheckoutInstructions(cwd, d.familyRoots()...); known {
+					return false, &repoPendingAdmission{load: rec, familyInstructions: instructions}
+				}
+				rec = indexer.RepoLoad{State: indexer.RepoLoadIdentityPending, Reason: "scope_binding_pending"}
+			}
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			return false, &repoPendingAdmission{load: rec}
+		}
 	}
 	return false, nil
+}
+
+// registeredCWDReachable is the existing registry/scope positive authority,
+// also rechecked when registration races a negative checkout probe.
+func (d *mcpDispatcher) registeredCWDReachable(cwd string) bool {
+	if d.isCWDTracked(cwd) {
+		return true
+	}
+	if d.multiIndexer != nil {
+		if _, _, _, ok := d.multiIndexer.ScopeForCWD(cwd); ok {
+			return true
+		}
+		if _, _, ok := d.multiIndexer.ContainedReposScope(cwd); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // isCWDTracked reports whether the proxy's cwd lies inside any tracked

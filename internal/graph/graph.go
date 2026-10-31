@@ -464,10 +464,8 @@ func removeEdgeFromBucket(bucket map[string][]*Edge, keys map[string][]edgeHash,
 // constructed against this Graph. Per-shard locks protect individual
 // node/edge writes, but resolution phases (ResolveAll, ResolveFile)
 // iterate every shard and mutate edge targets in place — two
-// resolvers racing on the same edge produced the data race that
-// MultiIndexer.indexMultiRepo triggered when its per-repo goroutines
-// each created their own Resolver. Routing every resolver through
-// this single mutex serialises those phases without blocking
+// per-repository resolvers can race on the same shared edge. Routing every
+// resolver through this single mutex serialises those phases without blocking
 // ordinary shard-scoped reads and writes.
 type Graph struct {
 	// shards holds the lock-sharded node/edge maps. Its length is

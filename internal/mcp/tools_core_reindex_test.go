@@ -276,8 +276,7 @@ func TestHandleReindexRepository_MultiRepoRoutesByPrefix(t *testing.T) {
 
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 	require.True(t, mi.IsMultiRepo())
 
 	eng := query.NewEngine(g)
@@ -334,8 +333,7 @@ func TestHandleReindexRepository_MultiRepoPathScoped(t *testing.T) {
 
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
@@ -388,8 +386,7 @@ func TestHandleReindexRepository_MultiRepoRejectsUntrackedPath(t *testing.T) {
 
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{

@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -249,4 +250,154 @@ func TestPrimaryRegisteredStartsTheCoordinatorsThatWaitedForIt(t *testing.T) {
 	f.lc.PrimaryRegistered(f.mainPrefix)
 	require.Eventually(t, func() bool { return f.lc.hasCoordinator(checkout.CheckoutID) },
 		5*time.Second, 20*time.Millisecond, "the primary's registration must start the coordinator that waited for it")
+}
+
+// A selected restart cohort must all be retried by registration, rather than
+// only the first checkout noticed before the primary's index was registered.
+// These are real Git worktrees and durable catalog identities; this test is not
+// the separate reference-host warm-restart workload or its latency evidence.
+func TestPrimaryRegisteredStartsAll24WaitingCoordinators(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	ctx := context.Background()
+	main := f.gitRepo("await-cohort-main")
+	const wanted = 24
+	for i := range wanted {
+		f.worktreeOf(main, fmt.Sprintf("await-cohort-%02d", i))
+	}
+	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: main, Name: "await-cohort-main"}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, tracked.CatalogErr)
+
+	f.restart()
+	require.NoError(t, f.lc.Seed(ctx))
+	require.Nil(t, f.mi.GetMetadata(tracked.Prefix))
+	checkouts, err := f.catalog.ListCheckouts(ctx, tracked.FamilyID)
+	require.NoError(t, err)
+	require.Len(t, checkouts, wanted+1, "the primary and every linked checkout must survive restart")
+	for _, checkout := range checkouts {
+		if checkout.CheckoutID == tracked.CheckoutID {
+			continue
+		}
+		// The same startup edge as an activation reaching ensureCoordinator:
+		// the catalog identity exists, but its primary is not registered yet.
+		f.lc.ensureCoordinator(ctx, tracked.GraphID, checkout)
+		require.False(t, f.lc.hasCoordinator(checkout.CheckoutID))
+	}
+	f.lc.awaitingPrimaryMu.Lock()
+	waiting := len(f.lc.awaitingPrimary[tracked.GraphID])
+	f.lc.awaitingPrimaryMu.Unlock()
+	require.Equal(t, wanted, waiting)
+
+	f.lc.PrimaryRegistered("unrelated-primary")
+	require.Zero(t, f.lc.LiveCoordinators(tracked.FamilyID),
+		"another repository's event must not wake this cohort")
+	registered := make(chan time.Time, 1)
+	f.mi.OnRepoRegistered(func(rec RepoLoad) {
+		if rec.Prefix == tracked.Prefix {
+			registered <- time.Now()
+		}
+		f.lc.PrimaryRegistered(rec.Prefix)
+	})
+	_, err = f.mi.TrackRepoCtx(ctx, config.RepoEntry{Path: main, Name: tracked.Prefix})
+	require.NoError(t, err)
+	var registeredAt time.Time
+	select {
+	case registeredAt = <-registered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the real registration event did not drive the retry")
+	}
+	remaining := time.Until(registeredAt.Add(2 * time.Second))
+	require.Positive(t, remaining, "the retry must start within the registration budget")
+	require.Eventually(t, func() bool {
+		return f.lc.LiveCoordinators(tracked.FamilyID) == wanted
+	}, remaining, 5*time.Millisecond,
+		"all waiting build loops must be live without a janitor sweep")
+	t.Logf("%d/%d coordinators live %s after primary registration", wanted, wanted, time.Since(registeredAt))
+	assert.Empty(t, f.lc.CoordinatorStartFailures())
+	f.lc.awaitingPrimaryMu.Lock()
+	waiting = len(f.lc.awaitingPrimary[tracked.GraphID])
+	f.lc.awaitingPrimaryMu.Unlock()
+	assert.Zero(t, waiting, "successful retries must drain the waiting cohort")
+}
+
+func TestDeclareRepos_DefersFilesystemIdentityUntilWarmup(t *testing.T) {
+	mi := newRepoLoadTestMulti(t)
+	missing := filepath.Join(t.TempDir(), "not-mounted")
+	entries := []config.RepoEntry{{Path: missing, Name: "pending"}, {Path: missing}}
+	mi.DeclareRepos(entries)
+	require.Len(t, mi.RepoLoads(), 1)
+	rec, ok := mi.RepoLoadFor(missing)
+	require.True(t, ok)
+	assert.Equal(t, RepoLoadQueued, rec.State, "declaration must not stat a configured root before Listen")
+	assert.True(t, rec.identityPending)
+	assert.Empty(t, rec.Reason)
+	rec, pending := mi.PendingRepoForPath(filepath.Join(missing, "pkg"))
+	require.True(t, pending)
+	assert.Equal(t, "pending", rec.Prefix)
+
+	mi.ExpectRepos(entries)
+	rec, ok = mi.RepoLoadFor(missing)
+	require.True(t, ok)
+	assert.Equal(t, RepoLoadMissing, rec.State, "warmup still diagnoses missing paths")
+	assert.False(t, rec.identityPending)
+}
+
+func TestDeclareRepos_WarmupEnrichmentPreservesRunningState(t *testing.T) {
+	mi := newRepoLoadTestMulti(t)
+	root, worktree := linkedWorktreeLayout(t)
+	entries := []config.RepoEntry{{Path: root}}
+	mi.DeclareRepos(entries)
+	_, pending := mi.PendingRepoForPath(filepath.Join(worktree, "pkg"))
+	require.False(t, pending, "an unresolved declaration cannot name the worktree's family without request filesystem work")
+	require.True(t, mi.RepoIdentityPending(), "negative startup admission must remain generically retryable until the owner resolves identity")
+
+	mi.StartRepoLoad(root)
+	before, _ := mi.RepoLoadFor(root)
+	mi.ExpectRepos(entries)
+	after, ok := mi.RepoLoadFor(root)
+	require.True(t, ok)
+	assert.Equal(t, RepoLoadRunning, after.State)
+	assert.Equal(t, before.Since, after.Since)
+	assert.False(t, after.identityPending)
+	rec, pending := mi.PendingRepoForPath(worktree)
+	assert.True(t, pending)
+	assert.Equal(t, root, rec.Root, "the owner now proves the linked worktree's configured family")
+
+	mi.DeclareRepos(nil)
+	assert.Empty(t, mi.RepoLoads(), "removed declarations must not remain loading forever")
+}
+
+// The daemon invalidates cached scopes and publishes workspace_readiness from
+// OnRepoRegistered. A real file-save mutation must not trigger that boot event.
+func TestRepoRegistration_FileSaveDoesNotAnnounceAgain(t *testing.T) {
+	mi := newRepoLoadTestMulti(t)
+	root := filepath.Join(t.TempDir(), "saved")
+	writeRepoLoadSource(t, root)
+	mi.ExpectRepos([]config.RepoEntry{{Path: root}})
+	announced := make(chan RepoLoad, 4)
+	mi.OnRepoRegistered(func(rec RepoLoad) { announced <- rec })
+	res, err := mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: root})
+	require.NoError(t, err)
+	select {
+	case <-announced:
+	case <-time.After(time.Second):
+		t.Fatal("initial cold registration was not announced")
+	}
+	before, ok := mi.RepoLoadFor(root)
+	require.True(t, ok)
+	require.Equal(t, RepoLoadReady, before.State)
+	idx := mi.GetIndexer(res.RepoPrefix)
+	require.NotNil(t, idx)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n\nfunc SavedAfterRegistration() {}\n"), 0o644))
+	require.NoError(t, idx.IndexFile("main.go"))
+	after, ok := mi.RepoLoadFor(root)
+	require.True(t, ok)
+	assert.Equal(t, before.Since, after.Since, "a save must not create another registration epoch")
+	assert.Equal(t, before.State, after.State)
+	select {
+	case rec := <-announced:
+		t.Fatalf("file save emitted a boot readiness/scope-invalidation event: %+v", rec)
+	case <-time.After(100 * time.Millisecond):
+	}
 }

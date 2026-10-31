@@ -98,7 +98,7 @@ func TestFinishColdDeferredPassesDoesNotRepeatFullCrossRepoResolve(t *testing.T)
 	store := &coldOrchestrationProbeStore{Graph: graph.New()}
 	mi := newColdOrchestrationMulti(store, zap.NewNop())
 
-	result := mi.finishColdDeferredPasses(t.Context(), nil)
+	result := mi.finishFixtureDeferredPasses(t.Context(), nil)
 
 	assert.True(t, result.ExactCrossRepoComplete)
 	assert.Zero(t, store.unresolvedScans.Load(),
@@ -112,7 +112,7 @@ func TestIndexMultiRepoUsesOneCoordinatedBaseResolve(t *testing.T) {
 	mi := newColdOrchestrationMulti(graph.New(), zap.New(core))
 	repos := coldOrchestrationRepos(t, 8)
 
-	results, err := mi.indexMultiRepo(repos)
+	results, err := mi.indexFixtureRepos(repos)
 	require.NoError(t, err)
 	require.Len(t, results, len(repos))
 
@@ -139,7 +139,7 @@ func TestIndexMultiRepoAllFailuresDoNotRunCompletionPipeline(t *testing.T) {
 		})
 	}
 
-	results, err := mi.indexMultiRepo(repos)
+	results, err := mi.indexFixtureRepos(repos)
 	require.Error(t, err)
 	assert.Nil(t, results)
 	assert.Empty(t, logs.FilterMessage("DEFERRED-TIMING master.ResolveAll").All())
@@ -332,7 +332,7 @@ func snapshotColdGraph(store graph.Store, repos []config.RepoEntry) coldGraphSha
 func TestCoordinatedColdPipelineMatchesSerialReferenceGraph(t *testing.T) {
 	repos := coldOrchestrationRepos(t, 5)
 	coordinated := newColdOrchestrationMulti(graph.New(), zap.NewNop())
-	_, err := coordinated.indexMultiRepo(repos)
+	_, err := coordinated.indexFixtureRepos(repos)
 	require.NoError(t, err)
 	serial := serialColdReference(t, repos)
 
@@ -407,7 +407,7 @@ func TestIndexMultiRepoRefFactsMatchesSingleFullAndUsesOneSetRebuild(t *testing.
 	counting := &coldRefFactsCountingStore{Store: store}
 	multi := newColdOrchestrationMulti(counting, zap.NewNop())
 
-	results, err := multi.indexMultiRepo(requested)
+	results, err := multi.indexFixtureRepos(requested)
 	require.NoError(t, err)
 	require.Len(t, results, len(repos))
 	require.Equal(t, 1, counting.rebuildCalls,
@@ -449,11 +449,11 @@ func TestColdRefFactRebuildPreservesFailureAndCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	err := mi.rebuildColdRefFacts(ctx, []string{"repo-a", "repo-b"})
+	err := mi.rebuildFixtureRefFacts(ctx, []string{"repo-a", "repo-b"})
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, probe.rebuildCalls, "cancellation before the boundary must skip the rebuild")
 
-	err = mi.rebuildColdRefFacts(t.Context(), []string{"repo-a", "repo-b"})
+	err = mi.rebuildFixtureRefFacts(t.Context(), []string{"repo-a", "repo-b"})
 	require.ErrorIs(t, err, sentinel)
 	require.Equal(t, 1, probe.rebuildCalls)
 	require.Equal(t, []string{"repo-a", "repo-b"}, probe.rebuildPrefixes)
@@ -465,7 +465,7 @@ func TestIndexMultiRepoRefFactFailureStopsGlobalConsumers(t *testing.T) {
 	probe := &coldRefFactsProbeStore{Store: graph.New(), rebuildErr: sentinel}
 	mi := newColdOrchestrationMulti(probe, zap.New(core))
 
-	results, err := mi.indexMultiRepo(coldRefFactRepos(t, 2))
+	results, err := mi.indexFixtureRepos(coldRefFactRepos(t, 2))
 	require.ErrorIs(t, err, sentinel)
 	require.Len(t, results, 2, "successful parse results remain available with the completion error")
 	require.Equal(t, 1, probe.rebuildCalls)

@@ -60,8 +60,7 @@ func TestHandleIndexRepository_MultiRepoRoutesThroughMultiIndexer(t *testing.T) 
 
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 	require.True(t, mi.IsMultiRepo())
 
 	// Invariant before: every node has a non-empty RepoPrefix, and both repos
@@ -196,8 +195,7 @@ func TestHandleIndexRepository_MultiRepoRejectsUntrackedPath(t *testing.T) {
 
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
