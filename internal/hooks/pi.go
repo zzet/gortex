@@ -3,7 +3,9 @@ package hooks
 import (
 	"encoding/json"
 	"io"
+	"maps"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -33,7 +35,7 @@ import (
 type BridgeEvent struct {
 	// Event is the lifecycle phase. Each host extension spells its phases
 	// its own way; bridgeEventSlot folds every accepted spelling onto the
-	// three slots the core answers (tool call, orientation, prompt).
+	// four slots the core answers (tool call, orientation, prompt, stop).
 	Event string `json:"event"`
 
 	// ToolName / ToolInput carry a tool_call, already mapped into the
@@ -62,11 +64,25 @@ type BridgeEvent struct {
 	// consult-unlock handshake and the nudge streak-reset recognise a
 	// graph query the same way the in-process Claude hook does.
 	IsGortexTool bool `json:"is_gortex_tool,omitempty"`
+
+	// RecordOnly marks a tool_call the host forwards with enforcement off:
+	// its write targets are still credited to the session, so the stop
+	// briefing can tell this session's edits from a sibling's, and nothing
+	// is decided.
+	RecordOnly bool `json:"record_only,omitempty"`
+
+	// LastAssistantMessage and StopHookActive carry a stop the way Claude
+	// Code's Stop hook does: the final reply the claim check reads, and
+	// whether the run that ended was the continuation a stop asked for.
+	LastAssistantMessage string `json:"last_assistant_message,omitempty"`
+	StopHookActive       bool   `json:"stop_hook_active,omitempty"`
 }
 
 // BridgeDecision is what a bridge run writes to stdout. The extension applies
 // it: Block→deny the tool call with Reason; AdditionalContext→inject a soft
 // tip; Orientation→inject as a tail user message before the next LLM call.
+// On a stop, Block→keep the agent working on Reason, and AdditionalContext
+// carries the post-task diagnostics.
 // All fields are optional; an empty decision means "do nothing" (fail-open).
 type BridgeDecision struct {
 	Block             bool   `json:"block,omitempty"`
@@ -85,7 +101,7 @@ type (
 
 // bridgeSlot is the semantic phase an envelope resolves to. Hosts differ in
 // how many lifecycle events they expose and what they call them; the core
-// answers exactly three.
+// answers exactly four.
 type bridgeSlot int
 
 const (
@@ -93,6 +109,7 @@ const (
 	bridgeSlotToolCall
 	bridgeSlotOrientation
 	bridgeSlotPrompt
+	bridgeSlotStop
 )
 
 // RunPi reads a single Pi event envelope from stdin, dispatches on the event
@@ -136,14 +153,16 @@ func handleBridgeEvent(ev BridgeEvent, port int, mode Mode) BridgeDecision {
 		return bridgeOrientation(ev)
 	case bridgeSlotPrompt:
 		return bridgePrompt(ev)
+	case bridgeSlotStop:
+		return bridgeStop(ev, port)
 	default:
 		return BridgeDecision{}
 	}
 }
 
 // bridgeEventSlot folds every spelling the bridged hosts send onto one of the
-// three slots. Pi names its phases session_start / before_agent_start /
-// before_compact / tool_call; OpenCode's plugin hooks are tool.execute.before,
+// four slots. Pi names its phases session_start / before_agent_start /
+// before_compact / tool_call / prompt / stop; OpenCode's plugin hooks are tool.execute.before,
 // permission.ask and chat.message, and its bus event carries a session open.
 // All three orientation moments answer the same way — inject the briefing as
 // a tail user message — so they share a slot.
@@ -155,6 +174,8 @@ func bridgeEventSlot(event string) bridgeSlot {
 		return bridgeSlotOrientation
 	case "prompt", "user_prompt", "chat_message":
 		return bridgeSlotPrompt
+	case "stop":
+		return bridgeSlotStop
 	default:
 		return bridgeSlotNone
 	}
@@ -178,6 +199,17 @@ func piToolCall(ev BridgeEvent, port int, mode Mode) BridgeDecision {
 // bridgeToolCall maps a normalized tool_call onto the shared enrich +
 // applyMode pipeline and lowers the resulting enrichResult into a decision.
 func bridgeToolCall(ev BridgeEvent, port int, mode Mode) (decision BridgeDecision) {
+	// Credit the session with what the call writes, for the stop briefing.
+	// A refused call is never credited.
+	defer func() {
+		if !decision.Block {
+			recordSessionWriteTargets(bridgeWriteInput(ev))
+		}
+	}()
+	if ev.RecordOnly {
+		return BridgeDecision{}
+	}
+
 	started := time.Now()
 	daemonUp := daemonReachableFn()
 
@@ -233,6 +265,43 @@ func bridgeToolCall(ev BridgeEvent, port int, mode Mode) (decision BridgeDecisio
 		return BridgeDecision{AdditionalContext: result.context}
 	}
 	return BridgeDecision{}
+}
+
+// bridgeWriteInput spells a bridged call the way recordSessionWriteTargets
+// reads Claude's: a Gortex tool under its MCP name, and a host path anchored
+// at the host's cwd, since a relative one would be read as repo-relative.
+func bridgeWriteInput(ev BridgeEvent) HookInput {
+	input := HookInput{ToolName: ev.ToolName, ToolInput: ev.ToolInput, CWD: ev.CWD, SessionID: ev.SessionID}
+	if ev.IsGortexTool {
+		if !isGortexMCPToolName(ev.ToolName) {
+			input.ToolName = gortexMCPToolPrefix + ev.ToolName
+		}
+		return input
+	}
+	if path := mapString(ev.ToolInput, "file_path"); path != "" && ev.CWD != "" && !filepath.IsAbs(path) {
+		input.ToolInput = maps.Clone(ev.ToolInput)
+		input.ToolInput["file_path"] = filepath.Join(ev.CWD, path)
+	}
+	return input
+}
+
+// bridgeStop answers the end of an agent run with the checks Claude Code's
+// Stop hook runs. The checks reach the daemon through the hook cwd, which
+// Claude's dispatcher sets from its payload.
+func bridgeStop(ev BridgeEvent, port int) BridgeDecision {
+	setHookCWD(ev.CWD)
+	defer setHookCWD("")
+	claimCheck, briefing := postTaskFindings(PostTaskInput{
+		HookEventName:        "Stop",
+		SessionID:            ev.SessionID,
+		CWD:                  ev.CWD,
+		LastAssistantMessage: ev.LastAssistantMessage,
+		StopHookActive:       ev.StopHookActive,
+	}, port)
+	if claimCheck != "" {
+		return BridgeDecision{Block: true, Reason: claimCheck}
+	}
+	return BridgeDecision{AdditionalContext: briefing}
 }
 
 // bridgeOrientation answers a session/orientation moment with the session
