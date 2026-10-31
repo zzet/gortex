@@ -275,14 +275,16 @@ call as *unknown* and re-read before assuming it did or did not land.
 |---|---|---|
 | Tool call / resource read / prompt fetch (all transports) | 60 s | `GORTEX_MCP_TOOL_TIMEOUT` (Go duration; `off` disables) |
 | Daemon socket, per JSON-RPC request | 60 s, terminal `-32001` | — |
-| Daemon Unix and HTTP, shared concurrent dispatches | 8 | `GORTEX_MCP_MAX_CONCURRENT_DISPATCHES` (max 64) |
-| Daemon Unix and HTTP, tool dispatch queue wait | Up to 5 s, clamped to the request deadline minus 100 ms; terminal `-32002` includes `queue_wait_ms` and `retry_after_ms` | `GORTEX_MCP_DISPATCH_QUEUE_WAIT` (Go duration, max 30 s; `0`/`off` restores the instant refusal) |
+| Daemon socket and HTTP `/mcp`, shared concurrent dispatches | 8 | `GORTEX_MCP_MAX_CONCURRENT_DISPATCHES` (max 64) |
+| Daemon socket and HTTP `/mcp`, tool dispatch queue wait | Up to 5 s, clamped to the request deadline minus 100 ms; terminal `-32002` includes `queue_wait_ms` and `retry_after_ms` | `GORTEX_MCP_DISPATCH_QUEUE_WAIT` (Go duration, max 30 s; `0`/`off` restores the instant refusal) |
 | Control RPC (`daemon status` / `search_symbols` / `proxy`) | 30 s, terminal `timeout` | — |
 | Control RPC (`shutdown`) | unbounded on the daemon — the store flush precedes the ack. `gortex daemon stop` bounds its own wait at 30 s, then watches the process for up to 2 min and force-kills | — |
 | Control RPC (`track` / `untrack` / `reload` / `enrich_*`) | unbounded by design | — |
 
-Daemon tools share three admission lanes. Mutating calls have two reserved
-slots and can also use free shared slots. Slow calls (`outline`, `dead_code`
+MCP tool calls to the daemon, over its socket or `/mcp`, share three admission
+lanes. REST `/v1/tools/<name>` calls run their handlers directly and are not
+admitted through these lanes. Mutating calls have two reserved slots and can
+also use free shared slots. Slow calls (`outline`, `dead_code`
 and analysis) hold at most two slots; other calls use the fast lane. Free slots
 serve queued mutating calls first, then fast, then slow. Sessions take turns
 within each lane; a session holding four slots yields to another waiting
