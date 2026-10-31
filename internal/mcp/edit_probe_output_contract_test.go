@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -241,5 +242,93 @@ func TestEditProbeTOONSignatureFollowingCallerWireWitness(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Pin the actual compact text an edit probe may request. Compact is one line
+// per symbol with no node IDs, edge rows, signatures or freshness fields, so it
+// can prove only presence, and only where the operation offers it. The other
+// probe operations and the edit ACK ignore output.compact and answer JSON,
+// which is pinned too: the harness keeps those requests JSON.
+func TestEditProbeActualCompactTextContracts(t *testing.T) {
+	original := "package main\n\nfunc Example() int { return 1 }\nfunc Caller() int { return Example() }\n"
+	s, _ := setupMoveInlineRepo(t, map[string]string{"main.go": original})
+	t.Cleanup(s.DrainBackground)
+	s.ToolCallTimeout = -1
+	const session = "edit-compact-contract"
+	s.NoteSessionToolPolicy(session, "facade-v1", "hide")
+	// The in-memory fixture serves its base corpus; it has no checkout catalog.
+	ctx := WithSessionID(t.Context(), session)
+	plain := map[string]any{"format": "json", "max_bytes": 0}
+	compact := map[string]any{"format": "json", "compact": true, "max_bytes": 0}
+	edit := func(name string, output map[string]any) *mcpgo.CallToolResult {
+		return callEditOperationFrame(t, s, ctx, "edit", map[string]any{"operation": "file", "target": map[string]any{"file": "main.go"}, "match": "func Caller() int { return Example() }", "replacement": "func Caller() int { return Example() }\nfunc " + name + "() int { return Example() }", "options": map[string]any{"mutation_id": "compact-" + name}, "output": output})
+	}
+	ack := edit("Added", plain)
+	require.False(t, ack.IsError, "%s", toolText(ack))
+	first := func(result *mcpgo.CallToolResult) string {
+		require.NotEmpty(t, result.Content)
+		text, ok := result.Content[0].(mcpgo.TextContent)
+		require.True(t, ok)
+		return text.Text
+	}
+	row := regexp.MustCompile(`^([a-z_]+) (\S+) (\S+):([1-9][0-9]*)( \(in \S+\))?$`)
+	footer := regexp.MustCompile(`^edges: [0-9]+( of [0-9]+)? total(, [0-9]+ (EXTRACTED|INFERRED|AMBIGUOUS))*$`)
+	lines := func(result *mcpgo.CallToolResult) (rows []string, edges string) {
+		require.False(t, result.IsError, "%s", toolText(result))
+		text := first(result)
+		require.False(t, json.Valid([]byte(text)), "compact silently returned JSON: %s", text)
+		require.True(t, strings.HasSuffix(text, "\n"), "every compact line ends with a newline: %q", text)
+		require.NotContains(t, text, "fresh", "compact text carries no freshness claim")
+		for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+			switch {
+			case row.MatchString(line):
+				rows = append(rows, line)
+			case footer.MatchString(line):
+				require.Empty(t, edges, "one edge footer: %s", text)
+				edges = line
+			default:
+				t.Fatalf("compact line outside the known grammar: %q in %q", line, text)
+			}
+		}
+		return rows, edges
+	}
+	// The four operations that offer compact, with the probes' own options.
+	marker, callee, caller := "function Added main.go:5", "function Example main.go:3", "function Caller main.go:4"
+	rows, edges := lines(callEditOperationFrame(t, s, ctx, "read", map[string]any{"operation": "summary", "target": map[string]any{"file": "main.go"}, "output": compact}))
+	require.Contains(t, rows, marker)
+	require.Contains(t, rows, callee)
+	require.NotEmpty(t, edges, "summary keeps its edge footer, never edge rows")
+	rows, edges = lines(callEditOperationFrame(t, s, ctx, "search", map[string]any{"operation": "symbols", "query": "Added", "output": compact}))
+	require.Contains(t, rows, marker)
+	require.Empty(t, edges)
+	rows, edges = lines(callEditOperationFrame(t, s, ctx, "relations", map[string]any{"operation": "callers", "target": map[string]any{"symbol": "main.go::Example"}, "options": map[string]any{"depth": 1, "limit": 1000}, "output": compact}))
+	require.Contains(t, rows, marker)
+	require.Contains(t, rows, caller)
+	require.NotEmpty(t, edges)
+	rows, edges = lines(callEditOperationFrame(t, s, ctx, "trace", map[string]any{"operation": "call_chain", "target": map[string]any{"symbol": "main.go::Added"}, "options": map[string]any{"depth": 1, "limit": 1000}, "output": compact}))
+	require.Contains(t, rows, callee)
+	require.NotEmpty(t, edges)
+	// Operations without a compact producer, and the edit ACK.
+	outcome := func(result *mcpgo.CallToolResult) string {
+		text := first(result)
+		switch {
+		case result.IsError:
+			return "refused: " + text
+		case json.Valid([]byte(text)):
+			return "json"
+		default:
+			return "text"
+		}
+	}
+	observed := map[string]string{
+		"read.source":          outcome(callEditOperationFrame(t, s, ctx, "read", map[string]any{"operation": "source", "target": map[string]any{"symbol": "main.go::Added"}, "output": compact})),
+		"read.editing_context": outcome(callEditOperationFrame(t, s, ctx, "read", map[string]any{"operation": "editing_context", "target": map[string]any{"file": "main.go"}, "output": compact})),
+		"read.file":            outcome(callEditOperationFrame(t, s, ctx, "read", map[string]any{"operation": "file", "target": map[string]any{"file": "main.go"}, "output": compact})),
+		"search.text":          outcome(callEditOperationFrame(t, s, ctx, "search", map[string]any{"operation": "text", "query": "Added", "output": compact})),
+		"edit.file":            outcome(edit("AddedCompact", compact)),
+	}
+	for operation, got := range observed {
+		require.Equal(t, "json", got, "%s answered output.compact; all observed: %v", operation, observed)
 	}
 }
