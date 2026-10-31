@@ -8,9 +8,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The render tests in daemon_service_test.go check fragments. These pin
-// whole unit files, byte for byte, so a change to how they are rendered
-// cannot move a newline, an indent or an escape unnoticed.
+// These pin whole unit files, byte for byte, so a change to how they are
+// rendered cannot move a newline, an indent or an escape unnoticed. The
+// render tests in daemon_service_test.go check how the installing shell's
+// PATH and daemon log override reach them.
 
 // launchdDefaultPATH is the plist PATH when the installing shell's PATH
 // contributes nothing: the launchd defaults, joined with the host's list
