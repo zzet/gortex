@@ -106,8 +106,9 @@ func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite
 	}
 	s, err := store_sqlite.Open(path, opts...)
 	if err != nil {
-		if errors.Is(err, store_sqlite.ErrSchemaTooNew) {
-			// Restarting another process cannot make this binary compatible.
+		if errors.Is(err, store_sqlite.ErrSchemaTooNew) || errors.Is(err, store_sqlite.ErrInsufficientUpgradeSpace) {
+			// Restarting another process cannot make this binary compatible,
+			// nor free the disk space an upgrade needs.
 			return nil, nil, fmt.Errorf("open sqlite store at %q: %w", path, err)
 		}
 		hint := "if another gortex daemon is using this store, stop it first (`gortex daemon status` / `gortex daemon stop`)"

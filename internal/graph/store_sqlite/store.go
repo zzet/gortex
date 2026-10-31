@@ -717,6 +717,9 @@ type Option func(*openOptions)
 type openOptions struct {
 	allowRebuild      bool
 	migrationObserver MigrationObserver
+	// diskAvail reports the free bytes on the volume holding a directory.
+	// nil means platform.DiskAvailBytes; tests inject a fixed figure.
+	diskAvail func(dir string) (uint64, error)
 }
 
 // WithRebuild permits Open to drop and recreate an on-disk database whose
@@ -737,6 +740,11 @@ func WithRebuild() Option { return func(o *openOptions) { o.allowRebuild = true 
 // return promptly. It is not called when the store is already current.
 func WithMigrationObserver(observer MigrationObserver) Option {
 	return func(o *openOptions) { o.migrationObserver = observer }
+}
+
+// withDiskAvail replaces the free-space probe the upgrade precheck uses.
+func withDiskAvail(fn func(dir string) (uint64, error)) Option {
+	return func(o *openOptions) { o.diskAvail = fn }
 }
 
 // ErrSchemaRebuildRequired is returned by Open when an on-disk database needs a
@@ -789,6 +797,14 @@ func openStore(path string, current int, migrations []schemaMigration, o openOpt
 	}
 	if err := probe.refuseNewer(current); err != nil {
 		return nil, err
+	}
+	// Size a pending in-place upgrade while the store is still untouched: a
+	// refusal here leaves the file byte-identical. The writer handle below
+	// re-plans from its own read of the version; this plan only sizes.
+	if space, pending := measureUpgradeSpace(probe, current, planSchemaMigrationWith(probe.stored, current, migrations), o.diskAvail); pending {
+		if err := space.refuseShort(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Pragmas: WAL + synchronous=NORMAL is the standard write-heavy
