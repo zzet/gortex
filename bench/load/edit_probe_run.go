@@ -43,6 +43,11 @@ type editProbeRecord struct {
 	GraphTerminalBasis       string                    `json:"graph_terminal_basis,omitempty"`
 	Ack                      Metric                    `json:"t_ack_ms"`
 	PhasesMS                 map[string]Metric         `json:"phases_ms,omitempty"`
+	Readback                 Metric                    `json:"t_readback_ms,omitempty"`
+	FileGraph                Metric                    `json:"t_file_graph_ms,omitempty"`
+	Relations                Metric                    `json:"t_relations_ms,omitempty"`
+	Search                   Metric                    `json:"t_search_ms,omitempty"`
+	Derived                  Metric                    `json:"t_derived_ms,omitempty"`
 	Readbacks                []editProbeReadback       `json:"readbacks"`
 	FirstCorrect             map[string]Metric         `json:"first_correct_ms"`
 	Accounting               editProbeAccounting       `json:"accounting"`
@@ -111,11 +116,18 @@ type editProbeRuntime struct {
 }
 
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
-	record := editProbeRecord{Ordinal: step.Ordinal, Editor: step.Editor, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
+	record := editProbeRecord{Ordinal: step.Ordinal, Editor: step.Editor, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), Readback: unavailable("ms", "edit not acknowledged"), Derived: unavailable("ms", "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
 	for _, oracle := range editProbeOracles(c, step) {
 		record.FirstCorrect[oracle.name] = unavailable("ms", "not observed")
 	}
+	record.groupTimes()
 	return record
+}
+
+func (record *editProbeRecord) groupTimes() {
+	record.FileGraph = editProbeGroupTime(record.FirstCorrect, "file_graph")
+	record.Relations = editProbeGroupTime(record.FirstCorrect, "relations")
+	record.Search = editProbeGroupTime(record.FirstCorrect, "search")
 }
 
 func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeReport {
@@ -131,7 +143,7 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if required {
 		role = "candidate"
 	}
-	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
+	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator", "t_readback/file_graph/relations/search are client times from edit send; t_derived is daemon-clock time from receipt origin and is not additive with them"}}
 	if plan.Mode == "toon" {
 		out.Limitations = append(out.Limitations, "TOON is evaluated from the requested text, never a structured JSON sibling; setup, timing-status and restore controls remain explicit JSON with exact numeric handling", "TOON traversal subgraphs omit JSON total_nodes/full untrimmed total_edges and signature metadata; summaries keep full fields, omitted traversal fields are not synthesized", "complete TOON subgraph checks require explicit nontruncation, exact declared node total and the emitted row census; an omitted full edge-count field is not reported as a measured value")
 	}
@@ -604,6 +616,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.record.Receipt, s.record.MutationID = "", ""
 		s.record.Accounting = editProbeAccounting{State: "not_applicable_direct_move"}
 		s.record.PhasesMS = editProbePhases(nil, "relocation reports per-file move accounting, not one receipt's phases_ms")
+		s.record.Derived = unavailable("ms", "relocation reports per-file move accounting, not one receipt's timeline")
 	}
 	if receipt == "" && batch == nil && move == nil {
 		s.record.Errors = append(s.record.Errors, "ACK mutation receipt unavailable")
@@ -620,6 +633,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if step.Relocated {
 		readbackKinds = append(readbackKinds, "old_source_absent", "source_file_after_move")
 	}
+	readbackEnd, readbacksCorrect := time.Time{}, true
 	for index, kind := range readbackKinds {
 		target := map[string]any{"file": r.plan.File}
 		if kind == "file" && step.Relocated {
@@ -671,7 +685,18 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			s.record.Errors = append(s.record.Errors, "immediate "+kind+" readback incorrect")
 		}
 		s.mu.Unlock()
+		readbacksCorrect = readbacksCorrect && back.Correct && !identity.Finished.IsZero()
+		if identity.Finished.After(readbackEnd) {
+			readbackEnd = identity.Finished
+		}
 	}
+	// The agent has its edit back once the last immediate readback is correct.
+	s.mu.Lock()
+	s.record.Readback = unavailable("ms", "immediate readback missing or incorrect")
+	if readbacksCorrect {
+		s.record.Readback = measured(float64(readbackEnd.Sub(started))/float64(time.Millisecond), "ms")
+	}
+	s.mu.Unlock()
 	if move != nil {
 		r.collectMoveEvidence(callCtx, s, *move, identity.ID)
 	} else if batch != nil {
@@ -693,6 +718,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					s.mu.Lock()
 					s.record.Accounting = accounting
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
+					s.record.Derived = editProbeDerived(status)
 					s.record.GraphTerminal = status["graph_status_terminal"] == true
 					all := true
 					for _, value := range s.record.FirstCorrect {
@@ -802,6 +828,7 @@ func (r *editProbeRuntime) finish() error {
 		}
 		record := s.record
 		s.mu.Unlock()
+		record.groupTimes()
 		s.sinkMu.Lock()
 		sinkErr := s.sinkErr
 		record.EvidenceWriteMS = float64(s.writeNS) / 1e6

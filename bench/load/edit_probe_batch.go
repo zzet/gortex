@@ -249,6 +249,7 @@ func (r *editProbeRuntime) collectBatchEvidence(ctx context.Context, s *editProb
 				s.mu.Lock()
 				s.record.Accounting = accounting
 				s.record.PhasesMS = editProbePhases(file, "batch file status exposes no phases_ms")
+				s.record.Derived = editProbeDerived(file)
 				s.record.GraphTerminal = terminal
 				all := true
 				for _, value := range s.record.FirstCorrect {

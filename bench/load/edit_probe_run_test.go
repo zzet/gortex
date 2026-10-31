@@ -315,7 +315,7 @@ func TestEditProbeEditsAndOwnReadbacksUseTheirFixedEditorConnection(t *testing.T
 	mu.Lock()
 	defer mu.Unlock()
 	for i, step := range plan.Steps {
-		if record := run.phase.EditProbe.Records[i]; record.Editor != step.Editor || record.Receipt != "commit-test" || record.PhasesMS["derived"].Reason != "status exposes no phases_ms" {
+		if record := run.phase.EditProbe.Records[i]; record.Editor != step.Editor || record.Receipt != "commit-test" || record.PhasesMS["derived"].Reason != "status exposes no phases_ms" || record.Readback.Value != nil || record.Derived.Reason != "status exposes no publication_phases" {
 			t.Fatalf("record lost its fixed editor, ACK or unavailable phases: %+v", record)
 		}
 		edits, reads := 0, 0
