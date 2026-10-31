@@ -708,7 +708,7 @@ func Open(path string, opts ...Option) (*Store, error) {
 	for _, opt := range opts {
 		opt(&o)
 	}
-	return openWithObserver(path, currentSchemaVersion, schemaMigrations, o.allowRebuild, o.migrationObserver)
+	return openStore(path, currentSchemaVersion, schemaMigrations, o)
 }
 
 // Option configures Open.
@@ -769,13 +769,25 @@ func configureConnectionPool(db *sql.DB) {
 }
 
 func openWith(path string, current int, migrations []schemaMigration, allowRebuild bool) (*Store, error) {
-	return openWithObserver(path, current, migrations, allowRebuild, nil)
+	return openStore(path, current, migrations, openOptions{allowRebuild: allowRebuild})
 }
 
 func openWithObserver(path string, current int, migrations []schemaMigration, allowRebuild bool, observe MigrationObserver) (*Store, error) {
+	return openStore(path, current, migrations, openOptions{allowRebuild: allowRebuild, migrationObserver: observe})
+}
+
+// openStore is Open with the target version, the migration registry and the
+// resolved options spelled out, so tests can drive any transition without
+// mutating package globals.
+func openStore(path string, current int, migrations []schemaMigration, o openOptions) (*Store, error) {
+	allowRebuild, observe := o.allowRebuild, o.migrationObserver
 	// Refuse unsupported newer schemas before a writer connection can change
 	// journal mode or checkpoint their WAL. WithRebuild does not override this.
-	if err := checkSchemaDowngrade(path, current); err != nil {
+	probe, err := probeStoreSchema(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := probe.refuseNewer(current); err != nil {
 		return nil, err
 	}
 
