@@ -215,13 +215,17 @@ func TestScopedBFSAdmissionKeepsExplicitOwnershipSets(t *testing.T) {
 	}
 }
 
-// The statement leaves workspace and project scope to Go admission and may
-// report an index-only count below the engine's sort threshold. Neither may
-// change a capped page. The wide seeds here reorder their edges when they
-// sort before a small cap, and same-repository neighbors in another workspace
-// or project reach in-scope nodes by a shorter path than admission accepts.
+// The statement walks a superset of the workspace and project scope, which Go
+// admission narrows, and may report an index-only count below the engine's
+// sort threshold. Neither may change a capped page. The wide seeds here
+// reorder their edges when they sort before a small cap, and same-repository
+// neighbors in another workspace or project reach in-scope nodes by a shorter
+// path than admission accepts. Without a repository narrow, a bound session's
+// default, the walk crosses repositories inside the workspace but not into a
+// foreign workspace whose neighborhood is wider than the state budget.
 func TestScopedBFSAdmissionGoldenThresholdAndWorkspaceScope(t *testing.T) {
 	const elsewhere, otherProject, deep = "a/else.go::Else", "a/project.go::Other", "a/deep.go::Deep"
+	const foreign, sibling = "other/out.go::Out", "b/test_test.go::Test"
 	store := openContractCoreCapStore(t)
 	seedAdmissionFixture(store)
 	node := func(id, workspace, project string) *graph.Node {
@@ -253,23 +257,43 @@ func TestScopedBFSAdmissionGoldenThresholdAndWorkspaceScope(t *testing.T) {
 			edges = append(edges, &graph.Edge{From: fan, To: elsewhere, Kind: graph.EdgeCalls}, &graph.Edge{From: elsewhere, To: caller, Kind: graph.EdgeCalls})
 		}
 	}
+	edges = append(edges, &graph.Edge{From: foreign, To: admissionRoot, Kind: graph.EdgeCalls})
+	states, _, _ := graph.BFSAdmissionBudgets(graph.BFSAdmissionRequest{Seed: admissionRoot, Kinds: []graph.EdgeKind{graph.EdgeCalls}, Depth: 4, Limit: 50})
+	for i := range states + 1 {
+		callee, caller := fmt.Sprintf("other/fan.go::Callee%03d", i), fmt.Sprintf("other/fan.go::Caller%03d", i)
+		for _, id := range []string{callee, caller} {
+			nodes = append(nodes, &graph.Node{ID: id, Kind: graph.KindFunction, FilePath: "other/fan.go", RepoPrefix: "other", WorkspaceID: "foreign", ProjectID: "project"})
+		}
+		edges = append(edges, &graph.Edge{From: foreign, To: callee, Kind: graph.EdgeCalls}, &graph.Edge{From: caller, To: foreign, Kind: graph.EdgeCalls})
+	}
 	store.AddBatch(nodes, edges)
 
 	for _, masked := range []bool{false, true} {
-		spy := &bfsAdmissionSpy{Reader: store, backend: store}
-		var fast graph.Reader = spy
-		var selected graph.Reader = store
-		if masked {
-			fast = newContractCoreEdges(spy, t.Context(), nil)
-			selected = newContractCoreEdges(store, t.Context(), nil)
-		}
-		legacy := legacyOutlineReader{selected}
-		eng := query.NewEngine(store)
-		for _, repos := range []map[string]bool{{"a": true}, {"a": true, "b": true}} {
+		// The last scope, a workspace alone, is a bound session's default.
+		for _, scope := range []graph.NodeScope{
+			{WorkspaceID: "work", ProjectID: "project", RepoAllow: map[string]bool{"a": true}},
+			{WorkspaceID: "work", ProjectID: "project", RepoAllow: map[string]bool{"a": true, "b": true}},
+			{WorkspaceID: "work", ProjectID: "project"},
+			{WorkspaceID: "work"},
+		} {
+			spy := &bfsAdmissionSpy{Reader: store, backend: store}
+			var fast graph.Reader = spy
+			var selected graph.Reader = store
+			if masked {
+				fast = newContractCoreEdges(spy, t.Context(), nil)
+				selected = newContractCoreEdges(store, t.Context(), nil)
+			}
+			legacy := legacyOutlineReader{selected}
+			eng := query.NewEngine(store)
+			arm := fmt.Sprintf("masked=%v scope=%+v", masked, scope)
+			rejected := []string{elsewhere, foreign}
+			if scope.ProjectID != "" {
+				rejected = append(rejected, otherProject)
+			}
 			for _, limit := range []int{1, 2, 3, 5, 20, 50} {
 				for depth := 1; depth <= 4; depth++ {
-					opts := query.QueryOptions{WorkspaceID: "work", ProjectID: "project", RepoAllow: repos, Depth: depth, Limit: limit, Context: t.Context()}
-					label := fmt.Sprintf("masked=%v repos=%v limit=%d depth=%d", masked, repos, limit, depth)
+					opts := query.QueryOptions{WorkspaceID: scope.WorkspaceID, ProjectID: scope.ProjectID, RepoAllow: scope.RepoAllow, Depth: depth, Limit: limit, Context: t.Context()}
+					label := fmt.Sprintf("%s limit=%d depth=%d", arm, limit, depth)
 					for _, forward := range []bool{true, false} {
 						var got, want *query.SubGraph
 						if forward {
@@ -279,16 +303,19 @@ func TestScopedBFSAdmissionGoldenThresholdAndWorkspaceScope(t *testing.T) {
 						}
 						require.Equal(t, want, got, "%s forward=%v", label, forward)
 						for _, n := range got.Nodes {
-							require.NotContains(t, []string{elsewhere, otherProject}, n.ID, label)
+							require.NotContains(t, rejected, n.ID, label)
 						}
 					}
 				}
 			}
+			require.Positive(t, spy.handled, "%s: wide scoped walks read one statement", arm)
+			require.Equal(t, spy.calls, spy.handled, "%s: a foreign workspace wider than the state budget declines no snapshot", arm)
+			require.True(t, spy.walked[elsewhere], "%s: the statement walks another workspace; Go admission rejects it", arm)
+			require.True(t, spy.walked[otherProject], "%s: and another project", arm)
+			require.False(t, spy.walked[foreign], "%s: the walk stops at the foreign workspace", arm)
+			require.Equal(t, scope.RepoAllow == nil || scope.RepoAllow["b"], spy.walked[sibling], "%s: the walk follows the workspace into another repository", arm)
+			require.Zero(t, spy.allNodes)
+			require.Zero(t, spy.allEdges)
 		}
-		require.Positive(t, spy.handled, "masked=%v: wide scoped walks read one statement", masked)
-		require.True(t, spy.walked[elsewhere], "masked=%v: the statement walks another workspace; Go admission rejects it", masked)
-		require.True(t, spy.walked[otherProject], "masked=%v: and another project", masked)
-		require.Zero(t, spy.allNodes)
-		require.Zero(t, spy.allEdges)
 	}
 }
