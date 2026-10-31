@@ -373,11 +373,7 @@ func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients
 
 func dispatchArgs(r request, repo privateRepo) map[string]any {
 	args := copyJSON(r.Arguments)
-	format := "json"
-	if editProbeRequestOutput(r) == "toon" {
-		format = "toon"
-	}
-	args["output"] = map[string]any{"format": format, "max_bytes": 0}
+	args["output"] = editProbeDispatchOutput(r)
 	if target, ok := args["target"].(map[string]any); ok {
 		for _, key := range []string{"file", "symbol"} {
 			if value, ok := target[key].(string); ok {

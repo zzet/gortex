@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -32,33 +34,17 @@ func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[s
 	switch format {
 	case "", "json":
 	case "toon":
+	case "compact":
+		return decodeEditProbeCompactOutput(raw, operation)
 	case "gcx":
 		return nil, errEditOutputGCXUnavailable
 	default:
 		return nil, errors.New("unsupported edit output mode")
 	}
-	var envelope struct {
-		IsError bool `json:"isError"`
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
+	text, err := editOutputPayload(raw, false)
+	if err != nil {
 		return nil, err
 	}
-	if envelope.IsError || len(envelope.Content) < 1 || len(envelope.Content) > 3 || envelope.Content[0].Type != "text" || envelope.Content[0].Text == "" {
-		return nil, errors.New("output requires one successful payload and only known auxiliary notes")
-	}
-	lastNoteKind := 0
-	for _, item := range envelope.Content[1:] {
-		kind := editProbeSessionNoteKind(item.Text)
-		if item.Type != "text" || kind <= lastNoteKind {
-			return nil, errors.New("unknown or duplicate auxiliary output content")
-		}
-		lastNoteKind = kind
-	}
-	text := []byte(envelope.Content[0].Text)
 	if format == "" || format == "json" {
 		decoder := json.NewDecoder(bytes.NewReader(text))
 		decoder.UseNumber()
@@ -99,6 +85,109 @@ func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[s
 	}
 	body[editProbeTOONWireKey] = editProbeTOONWire{operation: operation}
 	return body, nil
+}
+
+// One successful text payload, followed only by the known ordered auxiliary
+// session notes. Only compact text may be empty: it is a zero-row answer.
+func editOutputPayload(raw json.RawMessage, allowEmpty bool) ([]byte, error) {
+	var envelope struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Type string  `json:"type"`
+			Text *string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, err
+	}
+	if envelope.IsError || len(envelope.Content) < 1 || len(envelope.Content) > 3 || envelope.Content[0].Type != "text" || envelope.Content[0].Text == nil || *envelope.Content[0].Text == "" && !allowEmpty {
+		return nil, errors.New("output requires one successful payload and only known auxiliary notes")
+	}
+	lastNoteKind := 0
+	for _, item := range envelope.Content[1:] {
+		kind := 0
+		if item.Text != nil {
+			kind = editProbeSessionNoteKind(*item.Text)
+		}
+		if item.Type != "text" || kind <= lastNoteKind {
+			return nil, errors.New("unknown or duplicate auxiliary output content")
+		}
+		lastNoteKind = kind
+	}
+	return []byte(*envelope.Content[0].Text), nil
+}
+
+// Compact text is one line per symbol: kind, qualified name, path:line, and
+// for symbol search an optional enclosing owner. Subgraph answers may follow
+// their rows with a truncation line, one edge-count footer and concurrency
+// notes. There are no node IDs, edge rows, signatures or freshness fields.
+type editProbeCompactRow struct {
+	Kind, Qualified, Path, Owner string
+	Line                         uint64
+}
+
+// This typed, harness-local answer cannot be supplied by a JSON response.
+type editProbeCompactAnswer struct {
+	operation string
+	rows      []editProbeCompactRow
+	truncated bool
+	edges     int // -1 without an edge footer
+}
+
+const editProbeCompactKey = "\x00load.compact.rows"
+
+// Only these operations have a compact text producer; every other request
+// stays JSON.
+var editProbeCompactOperations = map[string]bool{"read.summary": true, "search.symbols": true, "relations.callers": true, "trace.call_chain": true}
+
+var (
+	editProbeCompactRowLine      = regexp.MustCompile(`^([a-z_]+) (\S+) (\S+):([1-9][0-9]*)( \(in (\S+)\))?$`)
+	editProbeCompactTruncated    = regexp.MustCompile(`^\.\.\. truncated \([0-9]+ total\)$`)
+	editProbeCompactEdges        = regexp.MustCompile(`^edges: ([0-9]+)( of [0-9]+)? total(, [0-9]+ (EXTRACTED|INFERRED|AMBIGUOUS))*$`)
+	editProbeCompactConcurrency  = regexp.MustCompile(`^concurrency \S+:( sync_guarded)?( cross_concurrent)?$`)
+	editProbeCompactBudgetMarker = "... trimmed to byte budget; pass max_bytes:0 for the full result"
+)
+
+func decodeEditProbeCompactOutput(raw json.RawMessage, operation string) (map[string]any, error) {
+	if !editProbeCompactOperations[operation] {
+		return nil, errors.New("operation has no compact text producer")
+	}
+	text, err := editOutputPayload(raw, true)
+	if err != nil {
+		return nil, err
+	}
+	if json.Valid(text) {
+		return nil, errors.New("requested compact text returned JSON; no format credit")
+	}
+	if len(text) > 0 && text[len(text)-1] != '\n' {
+		return nil, errors.New("compact text must end each line with a newline")
+	}
+	answer := editProbeCompactAnswer{operation: operation, edges: -1}
+	subgraph := operation != "search.symbols"
+	stage := 0 // rows, then truncation, then the edge footer, then concurrency notes
+	for _, line := range strings.Split(string(text), "\n")[:bytes.Count(text, []byte("\n"))] {
+		switch match := editProbeCompactRowLine.FindStringSubmatch(line); {
+		case match != nil && stage == 0 && (match[6] == "" || !subgraph):
+			number, err := strconv.ParseUint(match[4], 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			answer.rows = append(answer.rows, editProbeCompactRow{Kind: match[1], Qualified: match[2], Path: match[3], Owner: match[6], Line: number})
+		case subgraph && stage < 1 && (editProbeCompactTruncated.MatchString(line) || line == editProbeCompactBudgetMarker):
+			answer.truncated, stage = true, 1
+		case subgraph && stage < 2 && editProbeCompactEdges.MatchString(line):
+			edges, err := strconv.Atoi(editProbeCompactEdges.FindStringSubmatch(line)[1])
+			if err != nil {
+				return nil, err
+			}
+			answer.edges, stage = edges, 2
+		case subgraph && editProbeCompactConcurrency.MatchString(line):
+			stage = 3
+		default:
+			return nil, fmt.Errorf("compact line outside the %s grammar: %q", operation, line)
+		}
+	}
+	return map[string]any{editProbeCompactKey: answer}, nil
 }
 
 // These are the optional text-only notes appended by mcp/momentum.go. Selecting

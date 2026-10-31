@@ -158,6 +158,9 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if plan.Mode == "toon" {
 		out.Limitations = append(out.Limitations, "TOON is evaluated from the requested text, never a structured JSON sibling; setup, timing-status and restore controls remain explicit JSON with exact numeric handling", "TOON traversal subgraphs omit JSON total_nodes/full untrimmed total_edges and signature metadata; summaries keep full fields, omitted traversal fields are not synthesized", "complete TOON subgraph checks require explicit nontruncation, exact declared node total and the emitted row census; an omitted full edge-count field is not reported as a measured value")
 	}
+	if plan.Mode == "compact" {
+		out.Limitations = append(out.Limitations, "compact text is requested only from read.summary, search.symbols, relations.callers and trace.call_chain; source, editing_context and text probes, readbacks, the edit ACK and timing controls stay JSON", "compact rows carry no node IDs, edge rows, signatures or freshness fields: they prove the marker's presence only, relation rows prove membership of the traversal answer with a nonzero edge footer but not the edge or its tier, and stale-claimed-fresh is unavailable rather than 0", "an empty compact answer is zero rows; a JSON answer to a compact request, such as not-found guidance, counts as a decode failure")
+	}
 	for _, step := range plan.Steps {
 		out.Records = append(out.Records, newEditProbeRecord(c, step))
 	}
@@ -579,7 +582,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.mu.Unlock()
 		return
 	}
-	body, err := decodeEditProbeOutput(ack, r.plan.Mode, r.plan.Tool)
+	body, err := decodeEditProbeOutput(ack, editProbeRequestOutput(step.Request), r.plan.Tool)
 	if err != nil {
 		s.mu.Lock()
 		s.record.Outcome = "invalid_ack"

@@ -8,10 +8,12 @@ func editProbeOutputMode(c Corpus) (string, error) {
 		return "json", nil
 	case "toon":
 		return "toon", nil
+	case "compact":
+		return "compact", nil
 	case "gcx":
 		return "", fmt.Errorf("edit output mode gcx: %w", errEditOutputGCXUnavailable)
 	default:
-		return "", fmt.Errorf("unsupported edit output mode %q (want json or toon)", c.EditOutput)
+		return "", fmt.Errorf("unsupported edit output mode %q (want json, toon or compact)", c.EditOutput)
 	}
 }
 
@@ -47,9 +49,12 @@ func editProbeOutputCoverage(selected string, counts map[string]editProbeModeCou
 		switch {
 		case mode == "gcx":
 			coverage.State, coverage.Reason, coverage.ClaimsFreshObservable = "unavailable", errEditOutputGCXUnavailable.Error(), false
-		case mode == "compact" || mode == "cli":
+		case mode == "cli":
 			coverage.State, coverage.Reason, coverage.ClaimsFreshObservable = "unavailable", "not implemented by this harness", false
-		case mode == selected:
+		case mode == "compact":
+			coverage.Reason, coverage.ClaimsFreshObservable = "compact text has no freshness field; it proves call-addition presence only", false
+		}
+		if mode == selected {
 			coverage.State = "selected"
 		}
 		switch {
@@ -99,32 +104,56 @@ func editProbeRequestOutput(req request) string {
 	if !ok {
 		return "invalid"
 	}
-	format, exists := fields["format"]
-	if !exists {
-		return "json"
+	value := "json"
+	if format, exists := fields["format"]; exists {
+		if value, ok = format.(string); !ok {
+			return "invalid"
+		}
 	}
-	value, ok := format.(string)
-	if !ok {
-		return "invalid"
+	if compact, exists := fields["compact"]; exists {
+		if compact != true || value != "json" {
+			return "invalid"
+		}
+		return "compact"
 	}
 	return value
 }
-func editProbeWithOutput(req request, format string) request {
-	if format == "toon" {
-		req.Arguments = copyJSON(req.Arguments)
-		if req.Arguments == nil {
-			req.Arguments = make(map[string]any)
-		}
-		req.Arguments["output"] = map[string]any{"format": "toon", "max_bytes": 0}
+
+// The dispatched output keeps each request's selected wire explicit with no
+// byte budget; any request that selected nothing else stays JSON.
+func editProbeDispatchOutput(req request) map[string]any {
+	switch editProbeRequestOutput(req) {
+	case "toon":
+		return map[string]any{"format": "toon", "max_bytes": 0}
+	case "compact":
+		return map[string]any{"format": "json", "compact": true, "max_bytes": 0}
 	}
+	return map[string]any{"format": "json", "max_bytes": 0}
+}
+
+// Compact is requested only from the operations with a compact producer;
+// every other request, including edits and readbacks, keeps its JSON wire.
+func editProbeWithOutput(req request, format string) request {
+	output := map[string]any{"format": "toon", "max_bytes": 0}
+	switch {
+	case format == "compact" && editProbeCompactOperations[req.name()]:
+		output = map[string]any{"format": "json", "compact": true, "max_bytes": 0}
+	case format != "toon":
+		return req
+	}
+	req.Arguments = copyJSON(req.Arguments)
+	if req.Arguments == nil {
+		req.Arguments = make(map[string]any)
+	}
+	req.Arguments["output"] = output
 	return req
 }
 func editProbeOutputOracles(c Corpus, oracles []editProbeOracle) []editProbeOracle {
-	if c.EditOutput != "toon" {
+	if c.EditOutput != "toon" && c.EditOutput != "compact" {
 		return oracles
 	}
 	for i := range oracles {
-		oracles[i].call = editProbeWithOutput(oracles[i].call, "toon")
+		oracles[i].call = editProbeWithOutput(oracles[i].call, c.EditOutput)
 	}
 	return oracles
 }

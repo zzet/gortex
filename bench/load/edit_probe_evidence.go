@@ -95,6 +95,9 @@ func editProbeSourceID(id, file, name string) bool {
 }
 
 func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editProbeStep, callee string) bool {
+	if answer, ok := body[editProbeCompactKey].(editProbeCompactAnswer); ok {
+		return !step.Relocated && step.BeforeSymbol == "" && editProbeCompactCorrect(oracle, answer, c, step, callee)
+	}
 	if step.Relocated {
 		return editProbeMoveCorrect(oracle, body, c, step, callee)
 	}
@@ -185,6 +188,33 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 	default:
 		return false
 	}
+}
+
+// Compact rows prove presence only: the marker, or from the marker's call
+// chain the callee, as a top-level function row at its owned fixture path.
+// Relation answers must also report at least one edge; they still do not show
+// which edge or its tier. Truncated rows prove presence, never absence.
+func editProbeCompactCorrect(oracle string, answer editProbeCompactAnswer, c Corpus, step editProbeStep, callee string) bool {
+	operation := map[string]string{"summary": "read.summary", "search_visible": "search.symbols", "callers": "relations.callers", "call_chain": "trace.call_chain"}[oracle]
+	if operation == "" || answer.operation != operation {
+		return false
+	}
+	name, file := step.Marker, c.File
+	if oracle == "call_chain" {
+		name = callee
+		if c.EditKind == "add_crossfile_call" {
+			file, _, _ = editProbeCrossFileCallee(c)
+		}
+	}
+	if (oracle == "callers" || oracle == "call_chain") && answer.edges < 1 {
+		return false
+	}
+	for _, row := range answer.rows {
+		if row.Kind == "function" && row.Qualified == name && row.Owner == "" && editProbeFixturePath(row.Path, file) {
+			return true
+		}
+	}
+	return false
 }
 
 func editProbeClaimsFresh(body map[string]any) bool {

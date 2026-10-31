@@ -143,6 +143,9 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 	if kind != "add_intrafile_call" && kind != "append_leaf" && kind != "rename" && kind != "delete" && kind != "modify_body" && kind != "modify_caller_body" && kind != "change_signature" && kind != "add_crossfile_call" && kind != "relocate" {
 		return editProbePlan{}, errors.New("unsupported edit kind")
 	}
+	if mode == "compact" && kind != "add_intrafile_call" && kind != "add_crossfile_call" {
+		return editProbePlan{}, fmt.Errorf("compact output cannot check %s: compact text omits node IDs, edge rows, signatures and freshness, so it proves only a call addition's presence", kind)
+	}
 
 	if kind != "relocate" && (c.EditDestination != "" || c.EditDestinationContent != "") {
 		return editProbePlan{}, errors.New("edit_destination applies only to the explicit move fixture")
