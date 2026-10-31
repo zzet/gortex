@@ -44,7 +44,7 @@ func (s *firstIndexBulkProbe) BeginBulkLoad() {
 	s.Store.BeginBulkLoad()
 }
 
-func (s *firstIndexBulkProbe) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+func (s *firstIndexBulkProbe) beforeBatch() {
 	s.batches++
 	if s.duringDrain != nil {
 		s.duringDrain()
@@ -52,7 +52,17 @@ func (s *firstIndexBulkProbe) AddBatch(nodes []*graph.Node, edges []*graph.Edge)
 	if s.panicDrain {
 		panic("injected drain panic")
 	}
+}
+
+func (s *firstIndexBulkProbe) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	s.beforeBatch()
 	s.Store.AddBatch(nodes, edges)
+}
+
+// The drain writes through the checked path when the target has one.
+func (s *firstIndexBulkProbe) AddBatchCheckedContext(ctx context.Context, nodes []*graph.Node, edges []*graph.Edge) error {
+	s.beforeBatch()
+	return s.Store.AddBatchCheckedContext(ctx, nodes, edges)
 }
 
 func (s *firstIndexBulkProbe) BatchUpsertSymbolFTS(items []graph.SymbolFTSItem) error {
@@ -143,6 +153,57 @@ func assertFirstIndexRestored(t *testing.T, store *store_sqlite.Store, db *sql.D
 	// PRAGMA synchronous is connection-local, so this read-only pool cannot
 	// check writer restoration. TestBulkLoadDropsAndRebuildsIndexes in
 	// store_sqlite checks the actual writer connection instead.
+}
+
+// sqliteFullError provokes a genuine SQLITE_FULL from the driver on a
+// throwaway in-memory database capped at a few pages, so a test can hand a
+// store the exact error a full volume produces without filling a disk.
+func sqliteFullError(t *testing.T) error {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	db.SetMaxOpenConns(1)
+	_, err = db.Exec(`PRAGMA max_page_count = 2`)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE TABLE filler(v BLOB)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO filler VALUES (randomblob(65536))`)
+	require.Error(t, err)
+	return err
+}
+
+// A drain chunk the store refuses comes back as a typed storage error, for an
+// ordinary drain and for the initial claimed one, instead of panicking out of
+// the void AddBatch, and none of the refused chunk is committed.
+func TestDrainAddBatchReturnsStorageFailure(t *testing.T) {
+	full := sqliteFullError(t)
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{"ordinary", context.Background()},
+		{"initial claimed", withInitialDrainCooperation(context.Background(), func() bool { return false })},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			defer store.SetBatchWriteHookForTest(func(int, int) error { return full })()
+			nodes := []*graph.Node{{
+				ID: "app.py::fetch", Name: "fetch", Kind: graph.KindFunction,
+				RepoPrefix: "repo", FilePath: "app.py", Language: "python",
+			}}
+
+			var drainErr error
+			require.NotPanics(t, func() { drainErr = drainAddBatch(tc.ctx, store, nodes, nil) })
+			var storageErr *store_sqlite.StorageError
+			require.ErrorAs(t, drainErr, &storageErr)
+			assert.Contains(t, store_sqlite.SafeStorageFailureReason(drainErr), "SQLite code 13")
+			assert.Contains(t, drainBatchError(tc.ctx, drainErr).Error(), "indexer: persist bulk graph batch:")
+			assert.Zero(t, store.NodeCount(), "the refused chunk must roll back")
+		})
+	}
 }
 
 func TestFirstIndexDrainUsesBulkWindow(t *testing.T) {

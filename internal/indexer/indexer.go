@@ -3513,8 +3513,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						restampedBuiltins = append(restampedBuiltins, &copied)
 					}
 				}
-				if err := drainAddBatch(ctx, diskTarget, nodes, nil); err != nil && retErr == nil {
-					retErr = fmt.Errorf("indexer: cooperative drain stopped: %w", err)
+				if err := drainAddBatch(ctx, diskTarget, nodes, nil); err != nil {
+					// A refused write fails every later batch the same way, and
+					// a cooperative stop is final; either ends the node drain.
+					if retErr == nil {
+						retErr = drainBatchError(ctx, err)
+					}
+					break
 				}
 				if retErr != nil && drainChecksCancellation(ctx) && ctx.Err() != nil {
 					break
@@ -3576,7 +3581,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				}
 				if err := drainAddBatch(ctx, diskTarget, nil, edges); err != nil {
 					if retErr == nil {
-						retErr = fmt.Errorf("indexer: cooperative drain stopped: %w", err)
+						retErr = drainBatchError(ctx, err)
 					}
 					break
 				}
@@ -3605,8 +3610,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// row or no composed view can equal it. The set is one row per
 			// distinct builtin the repository references, so the copy is
 			// bounded by the language's builtin vocabulary, not by corpus size.
-			if len(restampedBuiltins) > 0 {
-				diskTarget.AddBatch(restampedBuiltins, nil)
+			//
+			// Only after a drain that is still succeeding: a failed one publishes
+			// nothing and is evicted before its retry, and after a refused write
+			// this one would only be refused again.
+			if len(restampedBuiltins) > 0 && retErr == nil {
+				if err := drainWrite(ctx, diskTarget, restampedBuiltins, nil); err != nil {
+					retErr = drainBatchError(ctx, err)
+				}
 			}
 
 			flushStart := time.Now()
