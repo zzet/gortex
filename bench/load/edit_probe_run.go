@@ -42,6 +42,7 @@ type editProbeRecord struct {
 	MoveAccounting           *editProbeMoveAccounting  `json:"move_accounting,omitempty"`
 	GraphTerminalBasis       string                    `json:"graph_terminal_basis,omitempty"`
 	Ack                      Metric                    `json:"t_ack_ms"`
+	PhasesMS                 map[string]Metric         `json:"phases_ms,omitempty"`
 	Readbacks                []editProbeReadback       `json:"readbacks"`
 	FirstCorrect             map[string]Metric         `json:"first_correct_ms"`
 	Accounting               editProbeAccounting       `json:"accounting"`
@@ -59,6 +60,7 @@ type editProbeRecord struct {
 	Errors                   []string                  `json:"errors"`
 }
 type editProbeReport struct {
+	Role               string            `json:"role,omitempty"`
 	Plan               editProbePlan     `json:"plan"`
 	PlanHash           string            `json:"plan_sha256"`
 	AccountingRequired bool              `json:"accounting_required"`
@@ -109,7 +111,7 @@ type editProbeRuntime struct {
 }
 
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
-	record := editProbeRecord{Ordinal: step.Ordinal, Editor: step.Editor, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
+	record := editProbeRecord{Ordinal: step.Ordinal, Editor: step.Editor, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
 	for _, oracle := range editProbeOracles(c, step) {
 		record.FirstCorrect[oracle.name] = unavailable("ms", "not observed")
 	}
@@ -125,7 +127,11 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if plan.Language == "python" {
 		language = "Python"
 	}
-	out := &editProbeReport{Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
+	role := "baseline"
+	if required {
+		role = "candidate"
+	}
+	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator"}}
 	if plan.Mode == "toon" {
 		out.Limitations = append(out.Limitations, "TOON is evaluated from the requested text, never a structured JSON sibling; setup, timing-status and restore controls remain explicit JSON with exact numeric handling", "TOON traversal subgraphs omit JSON total_nodes/full untrimmed total_edges and signature metadata; summaries keep full fields, omitted traversal fields are not synthesized", "complete TOON subgraph checks require explicit nontruncation, exact declared node total and the emitted row census; an omitted full edge-count field is not reported as a measured value")
 	}
@@ -597,6 +603,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.record.Move = move
 		s.record.Receipt, s.record.MutationID = "", ""
 		s.record.Accounting = editProbeAccounting{State: "not_applicable_direct_move"}
+		s.record.PhasesMS = editProbePhases(nil, "relocation reports per-file move accounting, not one receipt's phases_ms")
 	}
 	if receipt == "" && batch == nil && move == nil {
 		s.record.Errors = append(s.record.Errors, "ACK mutation receipt unavailable")
@@ -685,6 +692,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					accounting := checkEditProbeAccountingForTool(status, receipt, r.plan.Tool)
 					s.mu.Lock()
 					s.record.Accounting = accounting
+					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
 					s.record.GraphTerminal = status["graph_status_terminal"] == true
 					all := true
 					for _, value := range s.record.FirstCorrect {

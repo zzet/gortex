@@ -62,6 +62,9 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 		if o.Editors != 1 {
 			return o, nil, errors.New("paired edit-and-probe is the one-editor no-regression cell")
 		}
+		if o.EditProbeRole != "" {
+			return o, nil, errors.New("paired edit-and-probe assigns baseline and candidate roles by build order")
+		}
 	default:
 		return o, nil, errors.New("paired supports workload scenarios; cold/restart/all use standalone runs")
 	}

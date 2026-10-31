@@ -35,6 +35,7 @@ type runOptions struct {
 	SweepRepetitions  int
 	SweepBudget       time.Duration
 	EditCount         int
+	EditProbeRole     string
 	editProbeBaseline bool
 	pairedDriver      func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
 }
@@ -49,6 +50,7 @@ func parseRun(args []string) (runOptions, error) {
 	if f.NArg() != 0 {
 		return o, errors.New("unexpected positional run arguments")
 	}
+	o.editProbeBaseline = o.EditProbeRole == "baseline"
 	return o, validateRunOptions(o)
 }
 
@@ -74,6 +76,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.SweepRepetitions, "sweep-repetitions", 15, "samples per benchmark operation (smoke may explicitly use 1)")
 	f.DurationVar(&o.SweepBudget, "sweep-duration", 10*time.Minute, "separate total budget for the repeated paced sweep")
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
+	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
 
 func validateRunOptions(o runOptions) error {
@@ -88,6 +91,9 @@ func validateRunOptions(o runOptions) error {
 	}
 	if o.Scenario == editProbeScenario && (o.Profile != "agent" || o.Agents != 0 || o.Editors < 1 || o.Editors > editProbeMaxEditors || o.Worktrees != 0 || o.CPUProfile != 0 || o.EditCount != 1 && o.EditCount != 100 || o.EditCount == 1 && o.Editors != 1) {
 		return fmt.Errorf("edit-and-probe requires --profile agent --agents 0 --edit-agents 1..%d on one repository --worktrees 0, no CPU profile, and --edit-count 100 (or an explicit 1-edit, 1-editor diagnostic)", editProbeMaxEditors)
+	}
+	if o.EditProbeRole != "" && (o.Scenario != editProbeScenario || o.EditProbeRole != "candidate" && o.EditProbeRole != "baseline") {
+		return errors.New("--edit-probe-role is candidate or baseline, for edit-and-probe only")
 	}
 	if o.SweepRepetitions < 1 || o.SweepBudget <= 0 {
 		return errors.New("sweep repetitions and duration must be positive")

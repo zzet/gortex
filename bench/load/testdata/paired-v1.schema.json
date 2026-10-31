@@ -1025,6 +1025,39 @@
                               "outcome": {
                                 "type": "string"
                               },
+                              "phases_ms": {
+                                "additionalProperties": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "reason": {
+                                      "type": "string"
+                                    },
+                                    "unit": {
+                                      "type": "string"
+                                    },
+                                    "value": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "value",
+                                    "unit",
+                                    "reason"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": [
+                                  "object",
+                                  "null"
+                                ]
+                              },
                               "planned_due_ns": {
                                 "type": "integer"
                               },
@@ -1395,6 +1428,9 @@
                             "reason"
                           ],
                           "type": "object"
+                        },
+                        "role": {
+                          "type": "string"
                         },
                         "stats_after": {},
                         "stats_before": {}
