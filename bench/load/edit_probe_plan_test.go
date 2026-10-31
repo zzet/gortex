@@ -171,3 +171,83 @@ func TestEditProbeDefaultPlanIdentityIsPinned(t *testing.T) {
 		t.Errorf("request plan hash changed: %s", report.RequestPlan)
 	}
 }
+
+func TestEditProbeEditorStreamsAreIndependentOpenLoopPoisson(t *testing.T) {
+	c := editProbeCorpus()
+	one, err := makeEditProbePlan(c, 42, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams := func(p editProbePlan) map[int][]int64 {
+		out := map[int][]int64{}
+		for _, step := range p.Steps {
+			out[step.Editor] = append(out[step.Editor], step.DueNS)
+		}
+		return out
+	}
+	plans := map[int]editProbePlan{}
+	for _, editors := range []int{2, 4} {
+		p, err := makeEditProbeTrafficPlan(c, 42, 100, editors)
+		if err != nil {
+			t.Fatal(err)
+		}
+		again, err := makeEditProbeTrafficPlan(c, 42, 100, editors)
+		if err != nil || !reflect.DeepEqual(p, again) {
+			t.Fatal("same seed/editor count changed the offered plan", err)
+		}
+		if p.Editors != editors || p.SessionModel != editProbeFixedEditorModel || len(p.Steps) != 100 {
+			t.Fatalf("editor plan identity: %d %q %d", p.Editors, p.SessionModel, len(p.Steps))
+		}
+		last := editProbeStep{DueNS: -1}
+		for i, step := range p.Steps {
+			// Markers and mutation IDs stay keyed by the global ordinal.
+			if step.Ordinal != i || step.Marker != one.Steps[i].Marker || step.MutationID != one.Steps[i].MutationID || step.ActivateNS != step.DueNS-int64(editProbePeriod) || step.Editor < 0 || step.Editor >= editors {
+				t.Fatalf("bad merged step %+v", step)
+			}
+			if step.DueNS < last.DueNS || step.DueNS == last.DueNS && step.Editor <= last.Editor {
+				t.Fatalf("merge order is not due time then editor: %+v after %+v", step, last)
+			}
+			last = step
+		}
+		byEditor := streams(p)
+		if len(byEditor) != editors {
+			t.Fatalf("an editor offered no arrivals: %v", byEditor)
+		}
+		// Editor 0 keeps the one-editor stream; adding editors cannot shift it.
+		for k, due := range byEditor[0] {
+			if due != one.Steps[k].DueNS {
+				t.Fatalf("editor 0 arrival %d moved: %d != %d", k, due, one.Steps[k].DueNS)
+			}
+		}
+		plans[editors] = p
+	}
+	// Each editor's gaps come from its own stream, independent of how many
+	// other editors exist; the merged plan only truncates each stream.
+	two, four := streams(plans[2]), streams(plans[4])
+	for k := range min(len(two[1]), len(four[1])) {
+		if two[1][k] != four[1][k] {
+			t.Fatalf("editor 1 stream depends on editor count at arrival %d", k)
+		}
+	}
+	if reflect.DeepEqual(four[0][:min(len(four[0]), len(four[1]))], four[1][:min(len(four[0]), len(four[1]))]) {
+		t.Fatal("editors share one arrival stream")
+	}
+	shifted, err := makeEditProbeTrafficPlan(c, 43, 100, 4)
+	if err != nil || reflect.DeepEqual(shifted.Steps, plans[4].Steps) {
+		t.Fatal("seed did not change the several-editor schedule", err)
+	}
+}
+
+func TestEditProbeEditorCountRefusals(t *testing.T) {
+	c := editProbeCorpus()
+	for _, cell := range []struct{ count, editors int }{{100, 0}, {100, editProbeMaxEditors + 1}, {1, 2}, {100, -1}} {
+		if _, err := makeEditProbeTrafficPlan(c, 42, cell.count, cell.editors); err == nil {
+			t.Fatalf("invalid editor cell accepted: %+v", cell)
+		}
+	}
+	for _, cell := range []struct{ count, editors int }{{1, 1}, {100, 1}, {100, editProbeMaxEditors}} {
+		if _, err := makeEditProbeTrafficPlan(c, 42, cell.count, cell.editors); err != nil {
+			t.Fatalf("valid editor cell refused: %+v: %v", cell, err)
+		}
+	}
+}

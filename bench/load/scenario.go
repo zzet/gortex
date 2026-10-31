@@ -83,7 +83,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 	}
 	if scenario == editProbeScenario {
-		plan, err := makeEditProbePlan(selected[0], o.Seed, o.EditCount)
+		plan, err := planEditProbe(selected[0], o)
 		if err != nil {
 			return phase, nil, artifacts, crashes, "", err
 		}

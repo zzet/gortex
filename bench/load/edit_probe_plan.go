@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -18,11 +20,14 @@ import (
 const editProbeScenario = "edit-and-probe"
 const editProbeMean = 15 * time.Second
 const editProbePeriod = 25 * time.Millisecond
+const editProbeMaxEditors = 32
+const editProbeFixedEditorModel = "fixed_editor_per_ordinal_plus_one_separate_prober_per_edit"
 
 type editProbeStep struct {
 	Ordinal         int     `json:"ordinal"`
 	ActivateNS      int64   `json:"activate_ns"`
 	DueNS           int64   `json:"due_ns"`
+	Editor          int     `json:"editor,omitempty"`
 	Marker          string  `json:"marker"`
 	MutationID      string  `json:"mutation_id"`
 	Request         request `json:"request"`
@@ -42,6 +47,7 @@ type editProbePlan struct {
 	MeanNS        int64           `json:"mean_interarrival_ns"`
 	ProbePeriodNS int64           `json:"probe_period_ns"`
 	Count         int             `json:"count"`
+	Editors       int             `json:"editors,omitempty"`
 	Seed          int64           `json:"seed"`
 	Kind          string          `json:"kind"`
 	Tool          string          `json:"tool"`
@@ -56,12 +62,59 @@ type editProbePlan struct {
 	Steps         []editProbeStep `json:"steps"`
 }
 
+type editProbeArrival struct {
+	DueNS  int64
+	Editor int
+}
+
+// Each editor offers its own open-loop Poisson stream with the single-editor
+// mean. Editor 0 keeps the original seeding, so one editor offers exactly the
+// original arrivals. Streams merge by due time (ties by editor) and the merge
+// order is the global ordinal: every ordinal belongs to one fixed editor.
+func editProbeArrivals(seed int64, count, editors int) ([]editProbeArrival, error) {
+	var merged []editProbeArrival
+	for editor := range editors {
+		rng := rand.New(rand.NewPCG(uint64(seed)^0xa0761d6478bd642f^uint64(editor)*0x9e3779b97f4a7c15, uint64(seed)^0xe7037ed1a0b428db))
+		due := int64(editProbePeriod)
+		for range count {
+			interval := rng.ExpFloat64() * float64(editProbeMean)
+			if math.IsNaN(interval) || math.IsInf(interval, 0) || interval >= float64(math.MaxInt64) {
+				return nil, errors.New("poisson interval overflow")
+			}
+			delta := max(int64(1), int64(interval))
+			if due > math.MaxInt64-delta {
+				return nil, errors.New("poisson offered-plan duration overflow")
+			}
+			due += delta
+			merged = append(merged, editProbeArrival{DueNS: due, Editor: editor})
+		}
+	}
+	slices.SortFunc(merged, func(a, b editProbeArrival) int {
+		return cmp.Or(cmp.Compare(a.DueNS, b.DueNS), cmp.Compare(a.Editor, b.Editor))
+	})
+	return merged[:count], nil
+}
+
 func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
+	return makeEditProbeTrafficPlan(c, seed, count, 1)
+}
+
+func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
+	return makeEditProbeTrafficPlan(c, o.Seed, o.EditCount, o.Editors)
+}
+
+func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editProbePlan, error) {
 	if err := validateCorpus(c); err != nil {
 		return editProbePlan{}, err
 	}
 	if count != 1 && count != 100 {
 		return editProbePlan{}, errors.New("edit-and-probe requires 100 edits, or explicit 1-edit diagnostic")
+	}
+	if editors < 1 || editors > editProbeMaxEditors {
+		return editProbePlan{}, fmt.Errorf("edit-and-probe requires 1..%d fixed editors", editProbeMaxEditors)
+	}
+	if count == 1 && editors > 1 {
+		return editProbePlan{}, errors.New("the 1-edit diagnostic has exactly one editor")
 	}
 	mode, err := editProbeOutputMode(c)
 	if err != nil {
@@ -162,19 +215,17 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 	if kind == "change_signature" && language != "go" {
 		p.NotSelected = append(p.NotSelected, "parameter detail is proved by exact source; native TS/Python signature metadata omits it and graph freshness uses the relative line witness")
 	}
-	rng := rand.New(rand.NewPCG(uint64(seed)^0xa0761d6478bd642f, uint64(seed)^0xe7037ed1a0b428db))
-	due := int64(editProbePeriod)
+	if editors > 1 {
+		p.Editors, p.SessionModel = editors, editProbeFixedEditorModel
+		p.NotSelected = append(p.NotSelected, "several editors share one repository; 6-repository and linked-worktree routing are not implemented")
+	}
+	arrivals, err := editProbeArrivals(seed, count, editors)
+	if err != nil {
+		return editProbePlan{}, err
+	}
 	writeContent := c.EditInitialContent
-	for i := 0; i < count; i++ {
-		interval := rng.ExpFloat64() * float64(editProbeMean)
-		if math.IsNaN(interval) || math.IsInf(interval, 0) || interval >= float64(math.MaxInt64) {
-			return editProbePlan{}, errors.New("poisson interval overflow")
-		}
-		delta := max(int64(1), int64(interval))
-		if due > math.MaxInt64-delta {
-			return editProbePlan{}, errors.New("poisson offered-plan duration overflow")
-		}
-		due += delta
+	for i, arrival := range arrivals {
+		due := arrival.DueNS
 		marker := fmt.Sprintf("GortexEditProbe%016xN%03d", uint64(seed), i)
 		id := fmt.Sprintf("load-edit-%016x-%03d", uint64(seed), i)
 		r := editRequest(c, marker)
@@ -269,7 +320,7 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 		if err != nil {
 			return editProbePlan{}, err
 		}
-		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete", TargetSymbol: targetSymbol, FollowingSymbol: followingSymbol, ExpectedLineGap: expectedGap, Relocated: kind == "relocate", DestinationFile: c.EditDestination})
+		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Editor: arrival.Editor, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete", TargetSymbol: targetSymbol, FollowingSymbol: followingSymbol, ExpectedLineGap: expectedGap, Relocated: kind == "relocate", DestinationFile: c.EditDestination})
 	}
 	return p, nil
 }

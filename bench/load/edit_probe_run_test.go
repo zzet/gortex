@@ -36,7 +36,7 @@ func TestEditProbeCensoredSetupKeepsCompleteOfferedDenominator(t *testing.T) {
 	p := &privateRun{Root: root, Socket: filepath.Join(root, "absent.sock"), Repos: []privateRepo{{Path: root, Corpus: corpus}}}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	run, clients, err := prepareEditProbe(ctx, runOptions{Seed: 1, EditCount: 100}, p, nil, phase)
+	run, clients, err := prepareEditProbe(ctx, runOptions{Seed: 1, EditCount: 100, Editors: 1}, p, nil, phase)
 	if err == nil || run == nil || len(clients) != 0 {
 		t.Fatalf("setup cancellation missingrun=%v clients=%d err=%v", run != nil, len(clients), err)
 	}

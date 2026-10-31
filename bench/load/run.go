@@ -232,7 +232,7 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 		report.Workload.Operations = append(report.Workload.Operations, ops...)
 	}
 	if o.Scenario == editProbeScenario {
-		plan, err := makeEditProbePlan(corpora[0], o.Seed, o.EditCount)
+		plan, err := planEditProbe(corpora[0], o)
 		if err != nil {
 			return report, err
 		}

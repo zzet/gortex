@@ -1192,6 +1192,9 @@
                       "count": {
                         "type": "integer"
                       },
+                      "editors": {
+                        "type": "integer"
+                      },
                       "file": {
                         "type": "string"
                       },
@@ -1245,6 +1248,9 @@
                               "type": "string"
                             },
                             "due_ns": {
+                              "type": "integer"
+                            },
+                            "editor": {
                               "type": "integer"
                             },
                             "expected_line_gap": {
@@ -2202,6 +2208,9 @@
                 "count": {
                   "type": "integer"
                 },
+                "editors": {
+                  "type": "integer"
+                },
                 "file": {
                   "type": "string"
                 },
@@ -2255,6 +2264,9 @@
                         "type": "string"
                       },
                       "due_ns": {
+                        "type": "integer"
+                      },
+                      "editor": {
                         "type": "integer"
                       },
                       "expected_line_gap": {

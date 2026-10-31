@@ -135,7 +135,7 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 }
 
 func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *socketClient, phase *Phase) (*editProbeRuntime, []*socketClient, error) {
-	plan, err := makeEditProbePlan(p.Repos[0].Corpus, o.Seed, o.EditCount)
+	plan, err := planEditProbe(p.Repos[0].Corpus, o)
 	if err != nil {
 		return nil, nil, err
 	}
