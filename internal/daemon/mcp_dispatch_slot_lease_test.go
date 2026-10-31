@@ -203,6 +203,8 @@ func TestSessionDispatchSlotReleaseAcrossFollowerRetryFreesOnlyItsOwnSlot(t *tes
 	oldCtx := withMCPDispatchSlotLease(oldParent)
 	oldStarted := make(chan struct{})
 	releaseOld := make(chan struct{})
+	unblockOld := sync.OnceFunc(func() { close(releaseOld) })
+	t.Cleanup(unblockOld)
 	oldHandlerReturned := make(chan struct{})
 	oldDone := make(chan error, 1)
 	go func() {
@@ -256,27 +258,35 @@ func TestSessionDispatchSlotReleaseAcrossFollowerRetryFreesOnlyItsOwnSlot(t *tes
 	case <-time.After(time.Second):
 		t.Fatal("new connection did not retry the cancelled flight")
 	}
-	if retried.held != 2 || !retried.returned || retried.after != 1 {
-		t.Fatalf("retrying follower = %+v, want its own slot of two returned", retried)
+	if retried.held != 1 || !retried.returned || retried.after != 0 {
+		t.Fatalf("retrying follower = %+v, want only its own active slot returned", retried)
 	}
 	if err := <-newDone; err != nil {
 		t.Fatalf("retried flight error = %v", err)
 	}
-	if got := len(pool); got != 1 {
-		t.Fatalf("dispatch pool holds %d slots while the orphaned owner runs, want 1", got)
-	}
-
-	if !ReleaseMCPDispatchSlot(oldCtx) {
-		t.Fatal("orphaned owner's release returned no slot")
-	}
 	if got := len(pool); got != 0 {
-		t.Fatalf("dispatch pool holds %d slots after the owner's release", got)
+		t.Fatalf("dispatch pool holds %d slots while the orphaned owner drains, want 0", got)
+	}
+	if got := mcpSchedulerFor(pool).snapshot().Lanes["fast"].Draining; got != 1 {
+		t.Fatalf("orphaned owner draining count = %d, want 1", got)
+	}
+	keeper := takeScheduled(t, mcpSchedulerFor(pool), MCPDispatchFast, "unrelated-keeper")
+
+	if ReleaseMCPDispatchSlot(oldCtx) {
+		t.Fatal("cancelled owner's late release claimed active capacity")
+	}
+	if got := len(pool); got != 1 {
+		t.Fatalf("owner's stale release changed keeper's slot count to %d", got)
 	}
 	if ReleaseMCPDispatchSlot(newCtx) {
 		t.Fatal("follower's second release returned a slot")
 	}
-	close(releaseOld)
+	unblockOld()
 	awaitMCPTestSignal(t, oldHandlerReturned, "old orphan handler did not return")
+	if got := len(pool); got != 1 {
+		t.Fatalf("orphan completion changed keeper's slot count to %d", got)
+	}
+	keeper.complete()
 	if got := len(pool); got != 0 {
 		t.Fatalf("dispatch pool holds %d slots after the orphan returned", got)
 	}

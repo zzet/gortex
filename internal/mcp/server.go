@@ -413,8 +413,8 @@ type Server struct {
 	// mutationRouteWaitEntered observes a real pending source-mutation route
 	// after selection and before polling. Nil outside deterministic tests.
 	mutationRouteWaitEntered func(context.Context)
-	// releaseDispatchSlot replaces daemon.ReleaseMCPDispatchSlot in tests.
-	releaseDispatchSlot func(context.Context) bool
+	// releaseDispatchSlot replaces daemon.MoveMCPDispatchToSlowLane in tests.
+	releaseDispatchSlot func(context.Context, <-chan struct{}) bool
 
 	// mutationCommits is the durable disk-commit ledger for the single-file
 	// mutating tools (mutation_commit.go). It answers the question the

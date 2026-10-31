@@ -103,3 +103,98 @@ func TestDeadCodeGenerationProcessesReadOnlyAdmittedSteps(t *testing.T) {
 	_, err = s.readDeadCodeProcesses(cancelled, spy, query, graph.AnalysisGenerationHeader{GenerationID: 7})
 	require.ErrorIs(t, err, context.Canceled)
 }
+
+// deadCodeFallbackEntrySpy separates entry-point lookups made through the
+// request-bound reader from lookups on the unbound request reader.
+type deadCodeFallbackEntrySpy struct {
+	graph.Reader
+	unbound, bound int
+	boundCtx       context.Context
+	cancel         context.CancelFunc
+}
+
+func (r *deadCodeFallbackEntrySpy) GetNodesByIDs(ids []string) map[string]*graph.Node {
+	r.unbound++
+	return r.Reader.GetNodesByIDs(ids)
+}
+func (r *deadCodeFallbackEntrySpy) BindReadContext(ctx context.Context) graph.Reader {
+	return &deadCodeFallbackBoundEntries{Reader: r.Reader, spy: r, ctx: ctx}
+}
+
+type deadCodeFallbackBoundEntries struct {
+	graph.Reader
+	spy *deadCodeFallbackEntrySpy
+	ctx context.Context
+}
+
+// GetNodesByIDs behaves like a bound store whose lookup stops with the
+// request: once ctx ends it returns no nodes and no error.
+func (r *deadCodeFallbackBoundEntries) GetNodesByIDs(ids []string) map[string]*graph.Node {
+	r.spy.bound++
+	r.spy.boundCtx = r.ctx
+	if r.spy.cancel != nil {
+		r.spy.cancel()
+	}
+	if r.ctx.Err() != nil {
+		return nil
+	}
+	return r.Reader.GetNodesByIDs(ids)
+}
+
+func TestDeadCodeFallbackProcessAdmissionStopsWithTheRequest(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "entry-a", RepoPrefix: "a"})
+	g.AddNode(&graph.Node{ID: "entry-b", RepoPrefix: "b"})
+	s := &Server{graph: g, session: newSessionState()}
+	installProcessesForTest(s, &analysis.ProcessResult{Processes: []analysis.Process{
+		{ID: "process-a", Name: "a flow", EntryPoint: "entry-a", StepCount: 1},
+		{ID: "process-b", Name: "b flow", EntryPoint: "entry-b", StepCount: 1},
+	}})
+	ctx := withRepoAllow(t.Context(), map[string]bool{"a": true})
+	require.NotNil(t, s.getProcesses(), "fixture: the process snapshot must be current")
+	_, _, current := s.activeAnalysisQueryForAnswer()
+	require.False(t, current, "fixture: without a current analysis generation, admission takes the fallback")
+
+	spy := &deadCodeFallbackEntrySpy{Reader: g}
+	result, err := s.deadCodeProcesses(ctx, spy)
+	require.NoError(t, err)
+	require.Len(t, result.Processes, 1)
+	require.Equal(t, "process-a", result.Processes[0].ID)
+	require.Zero(t, spy.unbound, "entry points must not be read through the unbound request reader")
+	require.Equal(t, 1, spy.bound)
+	require.Same(t, ctx, spy.boundCtx, "the lookup must be bound to the request context")
+
+	ended, cancel := context.WithCancel(ctx)
+	spy = &deadCodeFallbackEntrySpy{Reader: g, cancel: cancel}
+	result, err = s.deadCodeProcesses(ended, spy)
+	require.ErrorIs(t, err, context.Canceled, "a request that ends during admission must not admit an empty process set")
+	require.Nil(t, result)
+	require.Zero(t, spy.unbound)
+}
+
+// deadCodeFailingEntries is a reader whose cancellable entry-point lookup
+// fails for a reason other than the request ending.
+type deadCodeFailingEntries struct {
+	graph.Reader
+	err error
+}
+
+func (r deadCodeFailingEntries) GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error) {
+	return nil, r.err
+}
+
+func TestDeadCodeFallbackProcessAdmissionReportsALookupFailure(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "entry-a", RepoPrefix: "a"})
+	s := &Server{graph: g, session: newSessionState()}
+	installProcessesForTest(s, &analysis.ProcessResult{Processes: []analysis.Process{
+		{ID: "process-a", Name: "a flow", EntryPoint: "entry-a", StepCount: 1},
+	}})
+	_, _, current := s.activeAnalysisQueryForAnswer()
+	require.False(t, current, "fixture: without a current analysis generation, admission takes the fallback")
+
+	failure := errors.New("entry lookup failed")
+	result, err := s.deadCodeProcesses(withRepoAllow(t.Context(), map[string]bool{"a": true}), deadCodeFailingEntries{Reader: g, err: failure})
+	require.ErrorIs(t, err, failure, "a failed scope lookup must not admit a silently empty process set")
+	require.Nil(t, result)
+}

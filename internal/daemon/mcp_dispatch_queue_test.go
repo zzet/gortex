@@ -297,6 +297,7 @@ func TestServeMCPDispatchQueueCancellationWhileQueued(t *testing.T) {
 func TestServeMCPDispatchQueueDeadlineWhileQueued(t *testing.T) {
 	f := startMCPDispatchQueueFixture(t, 300*time.Millisecond, 2*time.Second)
 	f.hold(t)
+	queuedAt := time.Now()
 	writeMCPTestFrame(t, f.conn, mcpDispatchQueueToolCall("2"))
 
 	responses := readMCPTestResponsesByID(t, f.conn, f.reader, 2)
@@ -305,11 +306,22 @@ func TestServeMCPDispatchQueueDeadlineWhileQueued(t *testing.T) {
 		t.Fatalf("started holder deadline response = %#v", holder)
 	}
 	queued := responses["2"]
-	if queued.Error == nil || queued.Error.Code != mcpRequestTimeoutCode {
+	if queued.Error == nil || queued.Error.Code != -32002 {
 		t.Fatalf("queued deadline response = %#v", queued)
 	}
-	if data := queued.Error.Data; data["outcome"] != "deadline" || data["deadline_ms"] != float64(300) || data["retryable"] != false || data["delivery_unknown"] != false {
-		t.Fatalf("queued deadline data = %#v", data)
+	// The lane budget deliberately reserves 100ms of the request deadline
+	// for its not-started busy reply. The exact clamp is separately pinned
+	// by TestDispatchSchedulerDeadlineBudgetAndSmallOverrides; allow broad
+	// scheduling slack here instead of a tight wall-clock tolerance.
+	data := assertMCPDispatchQueueBusy(t, queued, "2")
+	if waited, ok := data["queue_wait_ms"].(float64); !ok || waited <= 0 || waited >= 300 {
+		t.Fatalf("queued budget did not leave response time: %#v", data)
+	}
+	if retry, ok := data["retry_after_ms"].(float64); !ok || retry < 100 || retry > 5000 {
+		t.Fatalf("queued retry guidance = %#v", data)
+	}
+	if elapsed := time.Since(queuedAt); elapsed >= 2*time.Second {
+		t.Fatalf("deadline-clamped calls consumed configured 2s queue budget: %s", elapsed)
 	}
 	if got := f.callCount("2"); got != 0 {
 		t.Fatalf("queued request ran %d times", got)

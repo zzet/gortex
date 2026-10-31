@@ -652,7 +652,10 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 		return
 	}
 
+	classifier, _ := s.MCPDispatcher.(MCPDispatchClassifier)
 	hooks := &mcpConnectionHooks{
+		sessionID: sess.ID,
+		classify:  classifier,
 		onReady: func(write func([]byte) error) {
 			if hook, ok := s.MCPDispatcher.(SessionStartedHook); ok && hook != nil {
 				hook.SessionStarted(sess, write)
@@ -660,13 +663,7 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 		},
 	}
 	serveMCPConnectionWithHooks(conn, reader, s.mcpToolCallTimeout(), func(ctx context.Context, line []byte) ([]byte, error) {
-		reply, _, err := sess.dispatchMCPOnceContext(ctx, line, func() ([]byte, error) {
-			reply, err := s.MCPDispatcher.Dispatch(ctx, sess, line)
-			if ctxErr := ctx.Err(); ctxErr != nil && (!isMCPDispatchUnbounded(ctx) || err != nil || len(reply) == 0) {
-				return nil, ctxErr
-			}
-			return reply, err
-		})
+		reply, err := DispatchMCPFrame(ctx, sess, line, s.MCPDispatcher)
 		if err != nil && s.Logger != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				outcome := "cancelled"
@@ -887,6 +884,8 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		}
 		// Binary-drift self-report: did the on-disk daemon image get
 		// replaced under this running process? See populateBinaryStatus.
+		dispatch := MCPDispatchSnapshot()
+		st.MCPDispatch = &dispatch
 		s.populateBinaryStatus(&st)
 		buf, _ := json.Marshal(st)
 		return ControlResponse{OK: true, Result: buf}

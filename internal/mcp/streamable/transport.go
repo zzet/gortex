@@ -98,6 +98,13 @@ type Config struct {
 	// unresolved or local route falls through to Dispatcher. Pass
 	// nil for the single-server case (no servers.toml).
 	Router *daemon.Router
+	// DispatcherRoutesTools hands Router's tools/call attempt to the
+	// Dispatcher instead of running it before dispatch: the same attempt
+	// (inputs, order and reply framing) rides the context, see
+	// ToolRouteFromContext. The daemon bridge sets it so its shared admission
+	// covers a remote call exactly like a local one; standalone transports
+	// leave it off and keep routing here.
+	DispatcherRoutesTools bool
 
 	// AllowedOrigins, when non-empty, restricts which Origin
 	// header values the transport accepts on POST. Defends against
@@ -147,15 +154,16 @@ type InitializeHook func(ctx context.Context, state *SessionState)
 // the only shared mutable state and is itself goroutine-safe by
 // contract.
 type Transport struct {
-	dispatcher      Dispatcher
-	store           SessionStore
-	logger          *zap.Logger
-	router          *daemon.Router
-	allowedOrigins  map[string]struct{}
-	protocolVersion string
-	maxRequestBytes int64
-	sessionTTL      time.Duration
-	initializeHook  InitializeHook
+	dispatcher            Dispatcher
+	store                 SessionStore
+	logger                *zap.Logger
+	router                *daemon.Router
+	dispatcherRoutesTools bool
+	allowedOrigins        map[string]struct{}
+	protocolVersion       string
+	maxRequestBytes       int64
+	sessionTTL            time.Duration
+	initializeHook        InitializeHook
 
 	streamsMu sync.Mutex
 	streams   map[string]*serverStream
@@ -199,16 +207,17 @@ func New(cfg Config) *Transport {
 		allowed[strings.ToLower(o)] = struct{}{}
 	}
 	return &Transport{
-		dispatcher:      cfg.Dispatcher,
-		store:           store,
-		logger:          logger,
-		router:          cfg.Router,
-		allowedOrigins:  allowed,
-		protocolVersion: version,
-		maxRequestBytes: maxBytes,
-		sessionTTL:      sessionTTL,
-		initializeHook:  cfg.InitializeHook,
-		streams:         make(map[string]*serverStream),
+		dispatcher:            cfg.Dispatcher,
+		store:                 store,
+		logger:                logger,
+		router:                cfg.Router,
+		dispatcherRoutesTools: cfg.DispatcherRoutesTools,
+		allowedOrigins:        allowed,
+		protocolVersion:       version,
+		maxRequestBytes:       maxBytes,
+		sessionTTL:            sessionTTL,
+		initializeHook:        cfg.InitializeHook,
+		streams:               make(map[string]*serverStream),
 	}
 }
 
@@ -471,12 +480,40 @@ func (t *Transport) dispatchFrame(r *http.Request, state *SessionState, frame []
 	// to the in-process MCP server — federating them would change
 	// semantics.
 	if method == "tools/call" && t.router != nil {
+		if t.dispatcherRoutesTools {
+			return t.localDispatch(t.withToolRoute(r, *state, frame), *state, frame)
+		}
 		if out, status, ok := t.tryRouteToolCall(r, *state, frame); ok {
 			return out, status, nil
 		}
 	}
 
 	return t.localDispatch(r, *state, frame)
+}
+
+// ToolRoute is the transport's routing attempt for one tools/call frame, run
+// under the context the Dispatcher passes. It reports false when the call
+// stays local, and the Dispatcher then handles the frame itself.
+type ToolRoute func(ctx context.Context) ([]byte, bool)
+
+type toolRouteContextKey struct{}
+
+// ToolRouteFromContext returns the routing attempt the transport handed to its
+// Dispatcher (Config.DispatcherRoutesTools), or nil when there is none.
+func ToolRouteFromContext(ctx context.Context) ToolRoute {
+	route, _ := ctx.Value(toolRouteContextKey{}).(ToolRoute)
+	return route
+}
+
+// withToolRoute defers tryRouteToolCall to the Dispatcher. The attempt keeps
+// this request's inputs — the call's arguments, the session's workspace pin
+// and cwd, the headers — so only where it runs changes, not what it routes on.
+func (t *Transport) withToolRoute(r *http.Request, state SessionState, frame []byte) *http.Request {
+	route := ToolRoute(func(ctx context.Context) ([]byte, bool) {
+		out, _, ok := t.tryRouteToolCall(r.WithContext(ctx), state, frame)
+		return out, ok
+	})
+	return r.WithContext(context.WithValue(r.Context(), toolRouteContextKey{}, route))
 }
 
 // localDispatch attaches the session id / cwd / workspace to the

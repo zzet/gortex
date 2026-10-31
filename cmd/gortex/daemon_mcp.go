@@ -74,6 +74,16 @@ func (d *mcpDispatcher) SetRouter(r *daemon.Router) { d.router.Store(r) }
 // without rebuilding it from servers.toml a second time.
 func (d *mcpDispatcher) Router() *daemon.Router { return d.router.Load() }
 
+// DispatchClass lowers facade calls through the same immutable registry used
+// by execution, before either daemon transport acquires admission capacity.
+func (d *mcpDispatcher) DispatchClass(name string, arguments map[string]any) daemon.MCPDispatchClass {
+	if d.srv == nil {
+		class, _ := daemon.ToolDispatchClass(name)
+		return class
+	}
+	return d.srv.DispatchClass(name, arguments)
+}
+
 // Dispatch implements daemon.MCPDispatcher. It hands the raw JSON-RPC
 // frame to MCPServer.HandleMessage and returns the response bytes.
 // Empty return value means the client sent a notification (no response).

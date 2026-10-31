@@ -334,6 +334,7 @@ const (
 // StatusResponse is the payload returned under Result on a successful
 // ControlStatus call.
 type StatusResponse struct {
+	MCPDispatch   *MCPDispatchStatus  `json:"mcp_dispatch,omitempty"`
 	Version       string              `json:"version"`
 	PID           int                 `json:"pid"`
 	UptimeSeconds int64               `json:"uptime_seconds"`
