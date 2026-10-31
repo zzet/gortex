@@ -118,6 +118,30 @@ func TestDispatcher_PendingDiscoveryStaysInItsWorktree(t *testing.T) {
 		wg.Wait()
 	}
 
+	// The checks below run once the hung discovery is past its work deadline
+	// and still running: a session waiting on it is then refused as draining.
+	waiting := -1
+	for i, raw := range stuckReplies {
+		require.NoError(t, stuckErrs[i])
+		var parsed map[string]any
+		require.NoError(t, json.Unmarshal(raw, &parsed))
+		if errorData(t, parsed)["reason"] == "in_progress" {
+			waiting = i
+			break
+		}
+	}
+	require.NotEqual(t, -1, waiting, "no session waits on a hung discovery")
+	drainBy := time.Now().Add(6 * time.Second)
+	for {
+		data := errorData(t, dispatchJSON(t, d, stuckSessions[waiting], searchFrame))
+		if data["reason"] == "draining" {
+			break
+		}
+		require.Equal(t, "in_progress", data["reason"], "%v", data)
+		require.True(t, time.Now().Before(drainBy), "the hung discovery did not pass its work deadline: %v", data)
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	// Another family's new worktree gets its identity; it may wait for its own
 	// discovery, never for the hung one.
 	deadline := time.Now().Add(30 * time.Second)

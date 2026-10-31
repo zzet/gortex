@@ -368,9 +368,24 @@ func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
 	}
 
 	observeOutside("stuck", len(jobs))
-	checkout, found, err := observeCheckoutUntilSettled(t, lc, late)
-	if err != nil || !found || checkout.FamilyID != tracked.FamilyID || !pathkey.EqualPaths(checkout.RootPath, pathkey.CanonicalExistingRoot(late)) {
-		t.Errorf("another family's new worktree was refused: %+v found=%v err=%v", checkout, found, err)
+	// Another family's new worktree may wait for its own discovery only.
+	lateRoot := pathkey.CanonicalExistingRoot(late)
+	for deadline := time.Now().Add(checkoutObservationWorkTimeout); ; {
+		checkout, found, err := lc.ObserveCheckoutPath(t.Context(), late)
+		var pending *CheckoutDiscoveryPendingError
+		if !errors.As(err, &pending) {
+			if err != nil || !found || checkout.FamilyID != tracked.FamilyID || !pathkey.EqualPaths(checkout.RootPath, lateRoot) {
+				t.Errorf("another family's new worktree was not admitted: %+v found=%v err=%v", checkout, found, err)
+			}
+			break
+		}
+		if pending.Reason != checkoutDiscoveryInProgress || pending.Family != tracked.FamilyID || !pathkey.EqualPaths(pending.Root, lateRoot) {
+			t.Fatalf("another family's new worktree was refused: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("another family's new worktree discovery did not finish: %v", err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	extra := filepath.Join(stuck, "extra")
 	if err := os.Mkdir(extra, 0o755); err != nil {
@@ -383,6 +398,87 @@ func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
 	}
 	if _, _, err := lc.ObserveCheckoutPath(t.Context(), draining); !errors.Is(err, ErrCheckoutMutationBusy) || checkoutDiscoveryReason(err) != checkoutDiscoveryDraining {
 		t.Errorf("stuck path did not keep its draining refusal: %v", err)
+	}
+}
+
+// A request that joins a running discovery is refused for that discovery's
+// checkout, whatever its own .git marker read finds now. Here the marker of a
+// worktree nested in the primary checkout is removed, so a fresh read names
+// the primary checkout instead.
+func TestObserveCheckoutPathJoinedRefusalNamesItsOwnCheckout(t *testing.T) {
+	lc, _, primary, familyID, _, _ := newCheckoutObservationFixture(t)
+	nested := filepath.Join(primary, "nested")
+	builderGit(t, primary, "worktree", "add", "-b", "nested", nested)
+	nestedRoot := pathkey.CanonicalExistingRoot(nested)
+	release := make(chan struct{})
+	defer close(release)
+	entered := make(chan struct{})
+	var once sync.Once
+	lc.observationInventory = func(context.Context, string) (*gitstate.FamilyInventory, error) {
+		once.Do(func() { close(entered) })
+		<-release // Ignores cancellation, so the job outlives its deadline.
+		return nil, context.Canceled
+	}
+	refused := func(phase, reason string) {
+		t.Helper()
+		_, found, err := lc.ObserveCheckoutPath(t.Context(), nested)
+		var pending *CheckoutDiscoveryPendingError
+		if found || !errors.As(err, &pending) || pending.Reason != reason || pending.Family != familyID || !pathkey.EqualPaths(pending.Root, nestedRoot) {
+			t.Fatalf("%s: want a %s refusal for %s in family %s, got found=%v err=%v", phase, reason, nestedRoot, familyID, found, err)
+		}
+	}
+	refused("first request", checkoutDiscoveryInProgress)
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("discovery did not reach the stalled inventory")
+	}
+	if err := os.Remove(filepath.Join(nested, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	refused("joined request", checkoutDiscoveryInProgress)
+	job := checkoutObservationJobForTest(lc, nested)
+	if job == nil {
+		t.Fatal("the stalled discovery is not registered")
+	}
+	job.cancel() // Past its work deadline; the worker keeps running.
+	refused("draining request", checkoutDiscoveryDraining)
+}
+
+// A proven discovery that no caller was authorized to use runs no Git work;
+// it only waits for an authorized caller until its deadline. Requests denied
+// in a family therefore never hold that family's discovery slots.
+func TestObserveCheckoutPathDeniedDiscoveriesLeaveFamilyCapacity(t *testing.T) {
+	lc, _, primary, familyID, _, _ := newCheckoutObservationFixture(t)
+	worktree := filepath.Join(filepath.Dir(primary), "own")
+	builderGit(t, primary, "worktree", "add", "-b", "own", worktree)
+	denied := errors.New("outside authorized workspace")
+	for i := range checkoutObservationFamilyCapacity {
+		dir := filepath.Join(primary, fmt.Sprintf("denied-%d", i))
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, found, err := observeCheckoutUntilSettled(t, lc, dir, func(string) error { return denied }); found || !errors.Is(err, denied) {
+			t.Fatalf("denied observation %d: found=%v err=%v", i, found, err)
+		}
+	}
+	lc.observationMu.Lock()
+	waiting := 0
+	for _, job := range lc.observationJobs {
+		if job.familyID == familyID && job.ctx.Err() == nil && !channelClosed(job.authorized) {
+			waiting++
+		}
+	}
+	lc.observationMu.Unlock()
+	if waiting != checkoutObservationFamilyCapacity {
+		t.Fatalf("%d denied discoveries still wait for authorization, want %d", waiting, checkoutObservationFamilyCapacity)
+	}
+	if _, _, err := lc.ObserveCheckoutPath(t.Context(), worktree); checkoutDiscoveryReason(err) == checkoutDiscoveryFamilyCapacity {
+		t.Fatalf("denied discoveries held the family's slots: %v", err)
+	}
+	checkout, found, err := observeCheckoutUntilSettled(t, lc, worktree)
+	if err != nil || !found || checkout.FamilyID != familyID || !pathkey.EqualPaths(checkout.RootPath, pathkey.CanonicalExistingRoot(worktree)) {
+		t.Fatalf("the family's own new worktree was not admitted: %+v found=%v err=%v", checkout, found, err)
 	}
 }
 

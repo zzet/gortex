@@ -415,7 +415,10 @@ func checkoutAdmissionError(cwd string, inbound []byte, err error) []byte {
 	// can tell one pending worktree from an unavailable daemon.
 	var pending *indexer.CheckoutDiscoveryPendingError
 	if errors.As(err, &pending) {
-		data["path"], data["family"], data["reason"], data["state"] = pending.Root, pending.Family, pending.Reason, "discovery_pending"
+		data["family"], data["reason"], data["state"] = pending.Family, pending.Reason, "discovery_pending"
+		if pending.Root != "" {
+			data["path"] = pending.Root
+		}
 	}
 	out, _ := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",

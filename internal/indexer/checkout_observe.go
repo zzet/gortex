@@ -92,7 +92,9 @@ type checkoutObservationMarker struct {
 }
 
 type checkoutObservationJob struct {
-	familyID      string
+	// The checkout and family the job was started for. Refusals of requests
+	// that join it name these, whatever those requests' markers read now.
+	checkoutObservationTarget
 	ctx           context.Context
 	cancel        context.CancelFunc
 	proofReady    chan struct{}
@@ -154,6 +156,8 @@ func (l *CheckoutLifecycle) ObserveCheckoutPath(ctx context.Context, path string
 	if err != nil || job == nil {
 		return checkout, false, err
 	}
+	// Refusals from here on name the joined discovery's checkout.
+	target = job.checkoutObservationTarget
 	select {
 	case <-ctx.Done():
 		return checkout, false, ctx.Err()
@@ -236,7 +240,7 @@ func (l *CheckoutLifecycle) checkoutObservation(path string, target checkoutObse
 		if job.ctx.Err() == nil {
 			return job, nil
 		}
-		return nil, target.refusal(checkoutDiscoveryDraining)
+		return nil, job.refusal(checkoutDiscoveryDraining)
 	}
 	if !start {
 		return nil, nil
@@ -244,10 +248,8 @@ func (l *CheckoutLifecycle) checkoutObservation(path string, target checkoutObse
 	// One family's burst or stall never refuses another family's paths.
 	inFlight, stuck, familyStuck := 0, 0, false
 	for _, job := range l.observationJobs {
-		select {
-		case <-job.done:
-			continue // Finished; at most a retained result.
-		default:
+		if !job.holdsSlot() {
+			continue
 		}
 		expired := job.ctx.Err() != nil
 		if expired {
@@ -268,11 +270,21 @@ func (l *CheckoutLifecycle) checkoutObservation(path string, target checkoutObse
 		l.observationJobs = make(map[string]*checkoutObservationJob)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), checkoutObservationWorkTimeout)
-	job := &checkoutObservationJob{familyID: target.familyID, ctx: ctx, cancel: cancel, proofReady: make(chan struct{}), authorized: make(chan struct{}), done: make(chan struct{})}
+	job := &checkoutObservationJob{checkoutObservationTarget: target, ctx: ctx, cancel: cancel, proofReady: make(chan struct{}), authorized: make(chan struct{}), done: make(chan struct{})}
 	l.observationJobs[path] = job
 	l.observationWG.Add(1)
 	go l.runCheckoutObservation(path, job)
 	return job, nil
+}
+
+// holdsSlot reports whether job counts against discovery capacity. A finished
+// job keeps at most its result, and a proven job that no caller has authorized
+// runs no Git work: it only waits for one until its deadline.
+func (job *checkoutObservationJob) holdsSlot() bool {
+	if channelClosed(job.done) {
+		return false
+	}
+	return channelClosed(job.authorized) || !channelClosed(job.proofReady)
 }
 
 func (l *CheckoutLifecycle) runCheckoutObservation(path string, job *checkoutObservationJob) {
