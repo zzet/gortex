@@ -11,7 +11,12 @@ var _ graph.RepoScopedInEdgeReader = (*Store)(nil)
 // GetInEdgesByNodeIDsFromRepos implements graph.RepoScopedInEdgeReader. It
 // walks the same incoming index as GetInEdgesByNodeIDs and probes each source
 // through the repository index, so the rows other repositories park on a
-// shared target are skipped inside SQLite rather than decoded and returned.
+// shared target are rejected inside SQLite: they are not decoded, returned or
+// looked up as source nodes by the caller. They are still visited. The
+// incoming index does not carry the source, so each such row costs a read of
+// its edge row plus its repository probes, and the statement's own cost still
+// grows with other repositories' call sites, only more slowly than the
+// unnarrowed read's.
 // The named repositories are probed before the empty prefix: in a
 // one-repository scope an owned source costs one probe, and only unowned or
 // out-of-scope sources pay for the empty prefix as well.
