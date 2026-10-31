@@ -99,7 +99,7 @@ func TestDispatchCompletionOwnerFollowsSlowTransferButNotPassiveRelease(t *testi
 	attached := lease.attach(nil)
 	attached.scheduled = mutation
 	owned := WithMCPDispatchCompletionOwner(ctx)
-	if err := MoveMCPDispatchToSlowLane(owned); err != nil {
+	if err := MoveMCPDispatchToSlowLane(owned, nil); err != nil {
 		t.Fatal(err)
 	}
 	slow := lease.scheduledGrant(attached, mutation)

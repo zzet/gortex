@@ -111,10 +111,10 @@ func TestDispatchEditWaitMovesToSlowAfterReturningMutationCapacity(t *testing.T)
 	go func() {
 		_, err := dispatchMCPWithContext(ctx, func() ([]byte, error) {
 			close(entered)
-			if err := MoveMCPDispatchToSlowLane(ctx); err != nil {
+			if err := MoveMCPDispatchToSlowLane(ctx, nil); err != nil {
 				return nil, err
 			}
-			if err := MoveMCPDispatchToSlowLane(ctx); err != nil {
+			if err := MoveMCPDispatchToSlowLane(ctx, nil); err != nil {
 				return nil, err
 			} // idempotent
 			close(slowStarted)
@@ -153,5 +153,66 @@ func TestDispatchEditWaitMovesToSlowAfterReturningMutationCapacity(t *testing.T)
 	}
 	if len(slots) != 0 {
 		t.Fatalf("slow wait leaked %d tokens", len(slots))
+	}
+}
+
+func TestDispatchEditWaitNeedsNoSlowSlotOncePublished(t *testing.T) {
+	for _, when := range []string{"while_queued", "before_moving"} {
+		t.Run(when, func(t *testing.T) {
+			slots := newMCPDispatchSlots(8)
+			pool := mcpSchedulerFor(slots)
+			takeScheduled(t, pool, MCPDispatchSlow, "outline")
+			takeScheduled(t, pool, MCPDispatchSlow, "dead_code")
+			ctx := scheduledContext(t, slots, MCPDispatchMutating, "editor")
+			published := make(chan struct{})
+			if when == "before_moving" {
+				close(published)
+			}
+			moved, finish, done := make(chan error, 1), make(chan struct{}), make(chan error, 1)
+			unblock := sync.OnceFunc(func() { close(finish) })
+			t.Cleanup(unblock)
+			go func() {
+				_, err := dispatchMCPWithContext(ctx, func() ([]byte, error) {
+					moved <- MoveMCPDispatchToSlowLane(ctx, published)
+					<-finish
+					return []byte(`{"ok":true}`), nil
+				})
+				done <- err
+			}()
+			if when == "while_queued" {
+				awaitMCPDispatchQueueWaiters(t, slots, 1)
+				close(published)
+			}
+			// The queue budget is seconds; a finished publication must not spend it.
+			select {
+			case err := <-moved:
+				if err != nil {
+					t.Fatalf("published edit wait: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("published edit wait stayed queued behind the slow lane")
+			}
+			pool.owner.mu.Lock()
+			mutating := 0
+			if when == "before_moving" {
+				mutating = 1 // nothing left to wait for, so nothing to move
+			}
+			if pool.active[MCPDispatchSlow] != 2 || pool.active[MCPDispatchMutating] != mutating || pool.lanes[MCPDispatchSlow].queued != 0 {
+				t.Errorf("published edit wait lanes: active=%v slow queued=%d", pool.active, pool.lanes[MCPDispatchSlow].queued)
+			}
+			pool.owner.mu.Unlock()
+			unblock()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("edit dispatch did not complete")
+			}
+			if len(slots) != 2 {
+				t.Fatalf("published edit wait left %d tokens, want the two slow holders", len(slots))
+			}
+		})
 	}
 }

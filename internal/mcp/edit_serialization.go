@@ -505,14 +505,14 @@ func noDispatchSlotRelease(ctx context.Context) bool {
 // releaseDispatchSlotForWait returns mutation capacity and admits a passive
 // post-commit wait to the slow lane. False leaves the committed receipt pending;
 // it must never become a retryable busy result. Embedded calls are unchanged.
-func (s *Server) releaseDispatchSlotForWait(ctx context.Context) bool {
+func (s *Server) releaseDispatchSlotForWait(ctx context.Context, published <-chan struct{}) bool {
 	if noDispatchSlotRelease(ctx) {
 		return true
 	}
 	if s.releaseDispatchSlot != nil {
-		return s.releaseDispatchSlot(ctx)
+		return s.releaseDispatchSlot(ctx, published)
 	}
-	return daemon.MoveMCPDispatchToSlowLane(ctx) == nil
+	return daemon.MoveMCPDispatchToSlowLane(ctx, published) == nil
 }
 
 func (s *Server) mutationWaitDuration() time.Duration {
@@ -567,10 +567,10 @@ func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutat
 				resumeIntent := suspendSourceMutationWriteIntent(ctx)
 				defer resumeIntent()
 				// Only waiting from here on: let other requests use this
-				// dispatch slot.
+				// dispatch slot. A publication that lands first needs none.
 				waitCtx, cancel := context.WithTimeout(ctx, s.mutationWaitDuration())
 				defer cancel()
-				if !s.releaseDispatchSlotForWait(waitCtx) {
+				if !s.releaseDispatchSlotForWait(waitCtx, receipt.done) {
 					return receipt.outcome(true)
 				}
 				select {

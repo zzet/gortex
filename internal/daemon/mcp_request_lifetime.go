@@ -397,12 +397,16 @@ func ReleaseMCPDispatchSlot(ctx context.Context) bool {
 }
 
 // MoveMCPDispatchToSlowLane returns mutation capacity before joining the
-// bounded slow lane for a passive post-commit freshness wait. On refusal or
-// cancellation the committed mutation must report its existing pending receipt,
-// not a retryable busy response. Outside daemon dispatch this is a no-op.
-func MoveMCPDispatchToSlowLane(ctx context.Context) error {
+// bounded slow lane for a passive post-commit freshness wait. done closes when
+// that wait is over, and a wait that is over needs no slow slot: one already
+// over keeps its capacity for the handler's last steps, and a slow admission
+// still queued when it ends is withdrawn and reported as success without
+// capacity. On refusal or cancellation the committed mutation must report its
+// existing pending receipt, not a retryable busy response. Outside daemon
+// dispatch this is a no-op.
+func MoveMCPDispatchToSlowLane(ctx context.Context, done <-chan struct{}) error {
 	lease := mcpDispatchSlotLeaseForContext(ctx)
-	if lease == nil {
+	if lease == nil || closedMCPSignal(done) {
 		return nil
 	}
 	lease.mu.Lock()
@@ -423,8 +427,24 @@ func MoveMCPDispatchToSlowLane(ctx context.Context) error {
 	}
 	// Never hold the lease mutex through admission: caller cancellation must
 	// still release/cancel the current lease without waiting for this queue.
-	next, err := old.pool.acquire(ctx, MCPDispatchSlow, old.session)
+	// The queued admission alone also stops when the wait ends; the caller's
+	// own context still decides whether an admitted grant is cancelled below.
+	admission, withdraw := context.WithCancel(ctx)
+	defer withdraw()
+	if done != nil {
+		go func() {
+			select {
+			case <-done:
+				withdraw()
+			case <-admission.Done():
+			}
+		}()
+	}
+	next, err := old.pool.acquire(admission, MCPDispatchSlow, old.session)
 	if err != nil {
+		if ctx.Err() == nil && closedMCPSignal(done) {
+			return nil
+		}
 		return err
 	}
 	lease.mu.Lock()
@@ -439,6 +459,16 @@ func MoveMCPDispatchToSlowLane(ctx context.Context) error {
 		next.cancel()
 	}
 	return nil
+}
+
+// closedMCPSignal reports whether signal has closed; a nil signal never does.
+func closedMCPSignal(signal <-chan struct{}) bool {
+	select {
+	case <-signal:
+		return true
+	default:
+		return false
+	}
 }
 
 func (l *mcpDispatchSlotLease) scheduledGrant(grant *mcpDispatchSlotGrant, fallback *mcpScheduledGrant) *mcpScheduledGrant {

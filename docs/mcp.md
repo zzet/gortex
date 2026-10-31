@@ -295,9 +295,11 @@ Each lane permits at most 16× the total dispatch cap to wait. Queue time counts
 against the request timeout, leaving 100 ms for a refusal to reach the client.
 Busy replies are retryable and include `retry_after_ms`, estimated from the
 lane's observed drain rate and clamped to 100–5,000 ms (1 s before observations).
-An edit that opts to wait for graph publication returns mutation capacity
-before entering the slow lane. If slow admission fails after the disk commit,
-the edit returns its pending receipt instead of a retryable busy refusal.
+An edit that waits for graph publication returns mutation capacity before
+entering the slow lane, and stops queueing for it once publication lands: a
+finished publication never waits for a slot. If slow admission fails after the
+disk commit, the edit returns its pending receipt instead of a retryable busy
+refusal.
 
 Cancellation returns logical lane capacity within 100 ms while the process
 has room in its four-handler draining allowance. Abandoned handlers, including

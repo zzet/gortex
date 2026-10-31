@@ -29,7 +29,7 @@ type slotReleaseRecorder struct {
 // recordSlotReleases stands in for the daemon's slot release on s.
 func recordSlotReleases(s *Server, receipt func() *mutationReceipt) *slotReleaseRecorder {
 	r := &slotReleaseRecorder{called: make(chan struct{}, 8)}
-	s.releaseDispatchSlot = func(context.Context) bool {
+	s.releaseDispatchSlot = func(context.Context, <-chan struct{}) bool {
 		var seen slotRelease
 		if tracked := receipt(); tracked != nil {
 			seen.tracked = true
@@ -217,6 +217,87 @@ func TestWaitBatchGraphReceiptsReturnsTheDispatchSlotOnlyWhileAReceiptIsPending(
 		})
 		require.Empty(t, recorder.calls())
 	})
+
+	t.Run("published_while_queued", func(t *testing.T) {
+		s := &Server{mutationReindexWait: time.Minute}
+		first, publishFirst := track(t, s, caller, 1)
+		second, publishSecond := track(t, s, target, 2)
+		queued := make(chan struct{})
+		// Stands in for a slow-lane admission that stays queued for the whole
+		// budget unless the wait it is for ends first.
+		s.releaseDispatchSlot = func(_ context.Context, ended <-chan struct{}) bool {
+			close(queued)
+			select {
+			case <-ended:
+				return true
+			case <-time.After(5 * time.Second):
+				return false
+			}
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.waitBatchGraphReceipts(context.Background(), []batchTransactionFile{
+				{Path: caller, ReindexReceipt: first.id},
+				{Path: target, ReindexReceipt: second.id},
+			})
+		}()
+		select {
+		case <-queued:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the batch wait never asked for slow-lane capacity")
+		}
+		publishFirst()
+		published(t, first)
+		select {
+		case <-done:
+			t.Fatal("the batch wait ended while a receipt was still pending")
+		case <-time.After(20 * time.Millisecond):
+		}
+		publishSecond()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("the batch wait stayed queued after every receipt published")
+		}
+	})
+}
+
+func TestMutationReindexStateStopsQueueingOncePublished(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "edited.go")
+	ctx, cancel, intent, w, _, complete := primaryPublicationIntentFixture(t, nil, path)
+	defer cancel()
+	defer func() { complete(); intent.close() }()
+	s := &Server{watcher: w, mutationReindexWait: time.Minute}
+	queued := make(chan struct{})
+	// Stands in for a slow-lane admission that stays queued for the whole
+	// budget unless the wait it is for ends first.
+	s.releaseDispatchSlot = func(_ context.Context, published <-chan struct{}) bool {
+		close(queued)
+		select {
+		case <-published:
+			return true
+		case <-time.After(5 * time.Second):
+			return false
+		}
+	}
+	outcomes := make(chan mutationReindexOutcome, 1)
+	go func() { outcomes <- s.mutationReindexState(ctx, path) }()
+	select {
+	case <-queued:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the edit wait never asked for slow-lane capacity")
+	}
+	complete()
+	select {
+	case outcome := <-outcomes:
+		require.NoError(t, outcome.Err)
+		require.True(t, outcome.Reindexed)
+		require.False(t, outcome.Pending)
+		require.Empty(t, outcome.Receipt)
+	case <-time.After(time.Second):
+		t.Fatal("a published edit stayed queued for slow-lane capacity")
+	}
 }
 
 func TestRenameReturnsTheDispatchSlotOnlyAtItsLastFile(t *testing.T) {
@@ -232,7 +313,7 @@ func TestRenameReturnsTheDispatchSlotOnlyAtItsLastFile(t *testing.T) {
 	s := newMutationServer()
 	s.watcher = mutationTestWatcher{}
 	var lastWritten []bool
-	s.releaseDispatchSlot = func(context.Context) bool {
+	s.releaseDispatchSlot = func(context.Context, <-chan struct{}) bool {
 		content, err := os.ReadFile(writes[len(writes)-1].AbsPath)
 		lastWritten = append(lastWritten, err == nil && string(content) == "package p // new\n")
 		return true
@@ -254,7 +335,7 @@ func TestMutationReindexStateKeepsReceiptWhenSlowWaitAdmissionUnavailable(t *tes
 	committed := []byte("package fixture\nfunc Committed(){}\n")
 	require.NoError(t, os.WriteFile(path, committed, 0600))
 	s := &Server{watcher: w, mutationReindexWait: time.Minute}
-	s.releaseDispatchSlot = func(context.Context) bool { return false }
+	s.releaseDispatchSlot = func(context.Context, <-chan struct{}) bool { return false }
 	outcome := s.mutationReindexState(ctx, path)
 	require.True(t, outcome.Pending)
 	require.NotEmpty(t, outcome.Receipt)
