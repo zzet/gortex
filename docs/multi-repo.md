@@ -362,10 +362,12 @@ the same worktrees. The linked policy decides when a linked worktree's analysis
 may run:
 
 - `idle` (default): a linked worktree's job starts only once the daemon has had
-  no foreground work — no tool call in flight and no edit being applied — for
-  the idle window (5 s). Requests still record what each worktree needs; only
-  the start waits. A fill that is running when work comes back pauses, stops at
-  its next checkpoint, and resumes from there in the next idle window.
+  no foreground work for the idle window (5 s): no tool call has started or
+  ended, none is in flight, and no edit is being applied. Requests still record
+  what each worktree needs, and a waiting worktree does not take a place in the
+  analysis queue; only the start waits. A fill that is running when work comes
+  back pauses, stops at its next checkpoint, and resumes from there in the next
+  idle window.
 - `throttled`: at most one linked worktree's job runs at a time, and one
   worktree's jobs start at least the throttle interval (30 s) apart. Foreground
   work does not matter.

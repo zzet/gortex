@@ -23,8 +23,8 @@ See the [onboarding troubleshooting guide](onboarding.md#recovering-from-a-runaw
 ## Contract analysis in linked worktrees waits for idle time
 
 Contract analysis of linked git worktrees now runs only while the daemon is
-idle: a worktree's job starts once no tool call or edit has been in flight for
-5 s, and a fill that is running when work comes back stops at its next
+idle: a worktree's job starts once the daemon has seen no tool call and no edit
+for 5 s, and a fill that is running when work comes back stops at its next
 checkpoint and resumes later. The primary checkout is not affected, and a
 request that waits for fresh contract results still starts its worktree's
 analysis at once.
