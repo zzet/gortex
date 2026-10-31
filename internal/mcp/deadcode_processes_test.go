@@ -171,3 +171,30 @@ func TestDeadCodeFallbackProcessAdmissionStopsWithTheRequest(t *testing.T) {
 	require.Nil(t, result)
 	require.Zero(t, spy.unbound)
 }
+
+// deadCodeFailingEntries is a reader whose cancellable entry-point lookup
+// fails for a reason other than the request ending.
+type deadCodeFailingEntries struct {
+	graph.Reader
+	err error
+}
+
+func (r deadCodeFailingEntries) GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error) {
+	return nil, r.err
+}
+
+func TestDeadCodeFallbackProcessAdmissionReportsALookupFailure(t *testing.T) {
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "entry-a", RepoPrefix: "a"})
+	s := &Server{graph: g, session: newSessionState()}
+	installProcessesForTest(s, &analysis.ProcessResult{Processes: []analysis.Process{
+		{ID: "process-a", Name: "a flow", EntryPoint: "entry-a", StepCount: 1},
+	}})
+	_, _, current := s.activeAnalysisQueryForAnswer()
+	require.False(t, current, "fixture: without a current analysis generation, admission takes the fallback")
+
+	failure := errors.New("entry lookup failed")
+	result, err := s.deadCodeProcesses(withRepoAllow(t.Context(), map[string]bool{"a": true}), deadCodeFailingEntries{Reader: g, err: failure})
+	require.ErrorIs(t, err, failure, "a failed scope lookup must not admit a silently empty process set")
+	require.Nil(t, result)
+}
