@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -198,6 +199,35 @@ func TestContractLinkedIdleDefersWhileBusyAndStartsAfterTheWindow(t *testing.T) 
 		h.settle("r")
 		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
 		require.Equal(t, []string{contractJobTriggerInterest, contractJobTriggerInterest}, h.triggered())
+	})
+
+	t.Run("demand_returns_during_the_capture", func(t *testing.T) {
+		// A call comes and goes while the first capture runs.
+		var once sync.Once
+		var h *linkedHoldProbe
+		h = newLinkedHoldProbe(t, ContractLinkedIdle, func(options *ContractAnalysisCoordinatorOptions) {
+			capture := options.Capture
+			options.Capture = func(ctx context.Context, source *ContractCaptureSource, inputs *graphview.SelectedContractInputs, repo, checkout string) (ContractFollowupSnapshot, []ContractFollowupTarget, error) {
+				once.Do(h.call)
+				return capture(ctx, source, inputs, repo, checkout)
+			}
+		})
+		h.advance(5 * time.Second)
+		deferred := linkedCounter(ContractLinkedIdle, viewmetrics.ContractLinkedDeferred)
+		started := linkedCounter(ContractLinkedIdle, viewmetrics.ContractLinkedStarted)
+		linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
+		require.Eventually(t, func() bool { return h.held(linked.Actor) }, 10*time.Second, time.Millisecond)
+		require.Empty(t, h.started(), "no body starts once a call met the capture")
+		require.EqualValues(t, 1, h.releases.Load(), "the capture's snapshot is released")
+		require.EqualValues(t, 1, h.released.Load(), "and so is the request's source")
+		require.Equal(t, deferred+1, linkedCounter(ContractLinkedIdle, viewmetrics.ContractLinkedDeferred))
+		require.Equal(t, started, linkedCounter(ContractLinkedIdle, viewmetrics.ContractLinkedStarted))
+		h.advance(5 * time.Second)
+		h.settle("r")
+		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
+		require.EqualValues(t, 1, h.reacquired.Load(), "the held actor reacquires its inputs to start")
+		require.Equal(t, []string{contractJobTriggerInterest}, h.triggered(), "the deferral keeps what queued the job")
+		require.Equal(t, started+1, linkedCounter(ContractLinkedIdle, viewmetrics.ContractLinkedStarted))
 	})
 
 	t.Run("interest_expires_while_held", func(t *testing.T) {
@@ -593,6 +623,28 @@ func TestContractLinkedIdleFillStopsAtCheckpointAndResumesWithProgress(t *testin
 		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
 		require.Equal(t, ContractActorPublished, h.wait(primary).Result)
 	})
+}
+
+// TestContractLinkedEagerPolicyNeverHolds: under the eager policy a linked
+// actor starts as a primary one does, on the shared yield, whatever the
+// demand; the policy never asks for it.
+func TestContractLinkedEagerPolicyNeverHolds(t *testing.T) {
+	h := newLinkedHoldProbe(t, ContractLinkedEager, nil)
+	jobs := make(chan [2]bool, 1)
+	h.c.run = func(job *contractAnalysisJob) string {
+		jobs <- [2]bool{job.linkedPolicy == ContractLinkedEager, job.yield == nil}
+		return h.run(job)
+	}
+	deferred := linkedCounter(ContractLinkedEager, viewmetrics.ContractLinkedDeferred)
+	started := linkedCounter(ContractLinkedEager, viewmetrics.ContractLinkedStarted)
+	h.busy.Store(true)
+	h.call()
+	linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
+	require.Equal(t, ContractActorPublished, h.wait(linked).Result)
+	require.Equal(t, [2]bool{true, true}, <-jobs, "an eager linked job runs on the shared yield")
+	require.Equal(t, started+1, linkedCounter(ContractLinkedEager, viewmetrics.ContractLinkedStarted))
+	require.Equal(t, deferred, linkedCounter(ContractLinkedEager, viewmetrics.ContractLinkedDeferred))
+	require.Zero(t, h.samples.Load(), "the eager policy never asks for demand")
 }
 
 // TestContractLinkedStrictRequestsBypassDeferral: a request whose caller
