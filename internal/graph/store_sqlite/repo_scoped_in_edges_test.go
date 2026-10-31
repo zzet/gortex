@@ -65,7 +65,7 @@ func TestRepoScopedInEdgesMatchFilteredInEdges(t *testing.T) {
 	}
 	check := func() {
 		for _, h := range []*Store{s, derived} {
-			for _, repos := range [][]string{{""}, {"", "a"}, {"", "a", "b"}, {"c"}, {"missing"}} {
+			for _, repos := range [][]string{{""}, {"", "a"}, {"", "a", "b"}, {"b", "", "a"}, {"c"}, {"missing"}} {
 				got, handled, err := h.GetInEdgesByNodeIDsFromRepos(ids, repos)
 				require.NoError(t, err)
 				require.True(t, handled)
@@ -78,21 +78,29 @@ func TestRepoScopedInEdgesMatchFilteredInEdges(t *testing.T) {
 	require.NotEqual(t, want(s, []string{"a"}), want(derived, []string{"a"}), "the generations disagree on which caller repository a owns")
 	require.Empty(t, want(derived, []string{"c"}), "only generation 0 has a node for the c caller")
 
-	rows, err := s.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+repoScopedInEdgesSQL(len(ids)), append(toAnyArgs(ids), s.viewGen, `["","a"]`)...)
-	require.NoError(t, err)
-	var plan []string
-	for rows.Next() {
-		var id, parent, unused int
-		var detail string
-		require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
-		plan = append(plan, detail)
+	// Each source probe, the named list and the empty prefix alike, is a
+	// covering seek on the full repository key.
+	for _, shape := range []struct {
+		unowned bool
+		probes  int
+	}{{false, 1}, {true, 2}} {
+		rows, err := s.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+repoScopedInEdgesSQL(len(ids), shape.unowned), append(toAnyArgs(ids), s.viewGen, `["a"]`)...)
+		require.NoError(t, err)
+		var plan []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+			plan = append(plan, detail)
+		}
+		require.NoError(t, rows.Err())
+		require.NoError(t, rows.Close())
+		joined := strings.Join(plan, "\n")
+		require.Contains(t, joined, "SEARCH e USING INDEX edges_by_to", joined)
+		require.Equal(t, shape.probes, strings.Count(joined, "USING COVERING INDEX nodes_by_repo (repo_prefix=? AND view_gen=? AND id=?)"), joined)
+		require.NotContains(t, joined, "SCAN e", joined)
+		require.NotContains(t, joined, "SCAN n", joined)
 	}
-	require.NoError(t, rows.Err())
-	require.NoError(t, rows.Close())
-	joined := strings.Join(plan, "\n")
-	require.Contains(t, joined, "SEARCH e USING INDEX edges_by_to", joined)
-	require.Contains(t, joined, "USING COVERING INDEX nodes_by_repo (repo_prefix=? AND view_gen=? AND id=?)", joined)
-	require.NotContains(t, joined, "SCAN e", joined)
 
 	_, err = s.writerDB.Exec(`DROP INDEX nodes_by_repo; DROP INDEX edges_by_to`)
 	require.NoError(t, err)
