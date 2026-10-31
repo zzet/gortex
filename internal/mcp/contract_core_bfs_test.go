@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -15,6 +16,7 @@ type bfsAdmissionSpy struct {
 	graph.Reader
 	backend                                          graph.FilteredBFSAdmissionReader
 	calls, handled, returnedRows, allNodes, allEdges int
+	walked                                           map[string]bool
 }
 
 func (r *bfsAdmissionSpy) BFSAdmissionFilteredContext(ctx context.Context, request graph.BFSAdmissionRequest, filter graph.OutlineEdgeFilter) (graph.BFSAdmissionSnapshot, bool, error) {
@@ -25,6 +27,12 @@ func (r *bfsAdmissionSpy) BFSAdmissionFilteredContext(ctx context.Context, reque
 	}
 	for _, adjacency := range rows.Adjacency {
 		r.returnedRows += len(adjacency.Edges)
+	}
+	for id := range rows.Nodes {
+		if r.walked == nil {
+			r.walked = map[string]bool{}
+		}
+		r.walked[id] = true
 	}
 	return rows, handled, err
 }
@@ -204,5 +212,83 @@ func TestScopedBFSAdmissionKeepsExplicitOwnershipSets(t *testing.T) {
 		require.Equal(t, eng.WithReader(legacy).GetCallChain(admissionRoot, opts), eng.WithReader(fast).GetCallChain(admissionRoot, opts), "ownership=%v", owned)
 		require.Equal(t, 1, spy.handled, "the wide call chain uses the one-statement projection")
 		require.Equal(t, eng.WithReader(legacy).GetCallers(admissionRoot, opts), eng.WithReader(fast).GetCallers(admissionRoot, opts), "ownership=%v", owned)
+	}
+}
+
+// The statement leaves workspace and project scope to Go admission and may
+// report an index-only count below the engine's sort threshold. Neither may
+// change a capped page. The wide seeds here reorder their edges when they
+// sort before a small cap, and same-repository neighbors in another workspace
+// or project reach in-scope nodes by a shorter path than admission accepts.
+func TestScopedBFSAdmissionGoldenThresholdAndWorkspaceScope(t *testing.T) {
+	const elsewhere, otherProject, deep = "a/else.go::Else", "a/project.go::Other", "a/deep.go::Deep"
+	store := openContractCoreCapStore(t)
+	seedAdmissionFixture(store)
+	node := func(id, workspace, project string) *graph.Node {
+		return &graph.Node{ID: id, Kind: graph.KindFunction, FilePath: strings.Split(id, "::")[0], RepoPrefix: "a", WorkspaceID: workspace, ProjectID: project}
+	}
+	nodes := []*graph.Node{node(elsewhere, "foreign", "project"), node(otherProject, "work", "other"), node(deep, "work", "project"),
+		node("a/mid.go::Mid", "work", "project"), node("a/after.go::After", "work", "project")}
+	edges := []*graph.Edge{
+		{From: admissionRoot, To: elsewhere, Kind: graph.EdgeCalls, FilePath: "a/start.go", Line: 5, Origin: "lsp_resolved", Confidence: .95},
+		{From: elsewhere, To: deep, Kind: graph.EdgeCalls},
+		{From: elsewhere, To: admissionRoot, Kind: graph.EdgeCalls, Origin: "lsp_resolved", Confidence: .95},
+		{From: admissionRoot, To: otherProject, Kind: graph.EdgeCalls, FilePath: "a/start.go", Line: 6, Origin: "lsp_resolved", Confidence: .95},
+		{From: otherProject, To: "a/after.go::After", Kind: graph.EdgeCalls},
+		{From: otherProject, To: admissionRoot, Kind: graph.EdgeReferences, Origin: "lsp_resolved", Confidence: .95},
+		{From: "a/child.go::Child", To: "a/mid.go::Mid", Kind: graph.EdgeCalls, FilePath: "a/child.go", Line: 3},
+		{From: "a/mid.go::Mid", To: deep, Kind: graph.EdgeCalls},
+		{From: deep, To: elsewhere, Kind: graph.EdgeCalls},
+	}
+	// Line order is weakest evidence first, so the pre-cap sort reorders it.
+	for i := range 12 {
+		fan := fmt.Sprintf("a/fan.go::Fan%02d", i)
+		caller := fmt.Sprintf("a/callers.go::Caller%02d", i)
+		nodes = append(nodes, node(fan, "work", "project"), node(caller, "work", "project"))
+		confidence := .3 + float64(i)*.05
+		edges = append(edges,
+			&graph.Edge{From: admissionRoot, To: fan, Kind: graph.EdgeCalls, FilePath: "a/start.go", Line: 60 + i, Origin: "ast_inferred", Confidence: confidence},
+			&graph.Edge{From: caller, To: admissionRoot, Kind: graph.EdgeCalls, FilePath: "a/callers.go", Line: 60 + i, Origin: "ast_inferred", Confidence: confidence})
+		if i%3 == 0 {
+			edges = append(edges, &graph.Edge{From: fan, To: elsewhere, Kind: graph.EdgeCalls}, &graph.Edge{From: elsewhere, To: caller, Kind: graph.EdgeCalls})
+		}
+	}
+	store.AddBatch(nodes, edges)
+
+	for _, masked := range []bool{false, true} {
+		spy := &bfsAdmissionSpy{Reader: store, backend: store}
+		var fast graph.Reader = spy
+		var selected graph.Reader = store
+		if masked {
+			fast = newContractCoreEdges(spy, t.Context(), nil)
+			selected = newContractCoreEdges(store, t.Context(), nil)
+		}
+		legacy := legacyOutlineReader{selected}
+		eng := query.NewEngine(store)
+		for _, repos := range []map[string]bool{{"a": true}, {"a": true, "b": true}} {
+			for _, limit := range []int{1, 2, 3, 5, 20, 50} {
+				for depth := 1; depth <= 4; depth++ {
+					opts := query.QueryOptions{WorkspaceID: "work", ProjectID: "project", RepoAllow: repos, Depth: depth, Limit: limit, Context: t.Context()}
+					label := fmt.Sprintf("masked=%v repos=%v limit=%d depth=%d", masked, repos, limit, depth)
+					for _, forward := range []bool{true, false} {
+						var got, want *query.SubGraph
+						if forward {
+							got, want = eng.WithReader(fast).GetCallChain(admissionRoot, opts), eng.WithReader(legacy).GetCallChain(admissionRoot, opts)
+						} else {
+							got, want = eng.WithReader(fast).GetCallers(admissionRoot, opts), eng.WithReader(legacy).GetCallers(admissionRoot, opts)
+						}
+						require.Equal(t, want, got, "%s forward=%v", label, forward)
+						for _, n := range got.Nodes {
+							require.NotContains(t, []string{elsewhere, otherProject}, n.ID, label)
+						}
+					}
+				}
+			}
+		}
+		require.Positive(t, spy.handled, "masked=%v: wide scoped walks read one statement", masked)
+		require.True(t, spy.walked[elsewhere], "masked=%v: the statement walks another workspace; Go admission rejects it", masked)
+		require.True(t, spy.walked[otherProject], "masked=%v: and another project", masked)
+		require.Zero(t, spy.allNodes)
+		require.Zero(t, spy.allEdges)
 	}
 }
