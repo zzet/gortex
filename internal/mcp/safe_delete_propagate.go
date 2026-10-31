@@ -3,7 +3,9 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -16,8 +18,8 @@ import (
 // reference the deleted symbol. buildPropagationPlan reads each call site and
 // classifies it — a standalone statement call can be removed outright; an
 // embedded reference is flagged for manual patching — and applyRemoveLinePatches
-// deletes the removable lines (parse-gate validated) so the delete leaves no
-// dangling reference behind.
+// deletes the removable lines (text-anchored, parse-gate validated) so the
+// delete leaves no dangling reference behind.
 
 type callerPatch struct {
 	File        string `json:"file"`
@@ -99,52 +101,84 @@ func classifyCallSite(line, target string) (action, reason string) {
 	return "manual", "could not confirm a standalone call — patch by hand"
 }
 
-// applyRemoveLinePatches deletes the remove_line patches from their files,
-// grouped per file and applied bottom-up so earlier line numbers stay valid.
-// A patch whose removal would introduce new parse errors is not applied and is
-// returned in failed. Manual patches are ignored here.
-func (s *Server) applyRemoveLinePatches(plan []callerPatch) (applied, failed []callerPatch, err error) {
+// applyRemoveLinePatches deletes the remove_line patches from their files.
+// Manual patches are ignored here. Every caller file is locked before any is
+// written, so a lock that cannot be taken (a cancelled request, a path the
+// checkout guard refuses) leaves them all untouched. Each file is then handled
+// by removePlannedLines; a refused patch lands in failed exactly once, with
+// its Reason replaced by the refusal code.
+func (s *Server) applyRemoveLinePatches(ctx context.Context, plan []callerPatch) (applied, failed []callerPatch, err error) {
 	byFile := make(map[string][]callerPatch)
 	for _, p := range plan {
 		if p.Action == "remove_line" {
 			byFile[p.abs] = append(byFile[p.abs], p)
 		}
 	}
-	for abs, patches := range byFile {
-		content, readErr := os.ReadFile(abs)
-		if readErr != nil {
-			return applied, failed, fmt.Errorf("read %s: %w", abs, readErr)
-		}
-		lines := strings.Split(string(content), "\n")
-		// Apply bottom-up so deletions don't shift later indices.
-		sort.Slice(patches, func(a, b int) bool { return patches[a].Line > patches[b].Line })
-		kept := patches[:0]
-		newLines := append([]string{}, lines...)
-		for _, p := range patches {
-			if p.Line < 1 || p.Line > len(newLines) {
-				failed = append(failed, p)
-				continue
-			}
-			newLines = append(newLines[:p.Line-1], newLines[p.Line:]...)
-			kept = append(kept, p)
-		}
-		newContent := []byte(strings.Join(newLines, "\n"))
-		// Parse gate: never let a propagated removal corrupt a file.
-		relPath := patches[0].File
-		if gate := checkParseGate(relPath, content, newContent); gate.Blocked {
-			failed = append(failed, patches...)
-			continue
-		}
-		perm := os.FileMode(0o644)
-		if info, statErr := os.Stat(abs); statErr == nil {
-			perm = info.Mode().Perm()
-		}
-		if writeErr := agents.AtomicWriteFile(abs, newContent, perm); writeErr != nil {
-			return applied, failed, fmt.Errorf("write %s: %w", abs, writeErr)
-		}
-		s.reindexFile(abs)
-		applied = append(applied, kept...)
+	paths := slices.Sorted(maps.Keys(byFile))
+	release, err := acquireMutationPaths(ctx, paths)
+	if err != nil {
+		return nil, nil, fmt.Errorf("lock caller files: %w", err)
 	}
+	defer release()
+	for _, abs := range paths {
+		ok, refused, ferr := s.removePlannedLines(abs, byFile[abs])
+		applied = append(applied, ok...)
+		failed = append(failed, refused...)
+		if ferr != nil {
+			return applied, failed, ferr
+		}
+	}
+	return applied, failed, nil
+}
+
+// removePlannedLines applies one file's patches bottom-up, so earlier line
+// numbers stay valid; the caller holds the file's mutation lock, so no
+// concurrent writer lands between the read and the write. A patch is anchored
+// on its planned text: a line that was edited or shifted since planning is
+// refused as line_changed instead of being deleted by number. When the
+// surviving removals would introduce new parse errors the file is left
+// untouched and they are refused as parse_errors. Nothing is written when
+// every patch is refused.
+func (s *Server) removePlannedLines(abs string, patches []callerPatch) (applied, failed []callerPatch, err error) {
+	content, err := os.ReadFile(abs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read %s: %w", abs, err)
+	}
+	lines := strings.Split(string(content), "\n")
+	sort.Slice(patches, func(a, b int) bool { return patches[a].Line > patches[b].Line })
+	for _, p := range patches {
+		switch {
+		case p.Line < 1 || p.Line > len(lines):
+			p.Reason = "line_out_of_range"
+			failed = append(failed, p)
+		case strings.TrimSpace(lines[p.Line-1]) != p.CurrentText:
+			p.Reason = "line_changed"
+			failed = append(failed, p)
+		default:
+			lines = append(lines[:p.Line-1], lines[p.Line:]...)
+			applied = append(applied, p)
+		}
+	}
+	if len(applied) == 0 {
+		return nil, failed, nil
+	}
+	newContent := []byte(strings.Join(lines, "\n"))
+	// Parse gate: never let a propagated removal corrupt a file.
+	if gate := checkParseGate(patches[0].File, content, newContent); gate.Blocked {
+		for _, p := range applied {
+			p.Reason = "parse_errors"
+			failed = append(failed, p)
+		}
+		return nil, failed, nil
+	}
+	perm := os.FileMode(0o644)
+	if info, statErr := os.Stat(abs); statErr == nil {
+		perm = info.Mode().Perm()
+	}
+	if writeErr := agents.AtomicWriteFile(abs, newContent, perm); writeErr != nil {
+		return nil, failed, fmt.Errorf("write %s: %w", abs, writeErr)
+	}
+	s.reindexFile(abs)
 	return applied, failed, nil
 }
 
