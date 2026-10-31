@@ -220,9 +220,9 @@ func (s *Server) handleResourceSurprises(ctx context.Context, req mcp.ReadResour
 	}
 
 	return jsonResource(req.Params.URI, map[string]any{
-		"cycles":            cycles,
-		"dead_code":         deadAll,
-		"dead_code_truncated": deadTrunc,
+		"cycles":               cycles,
+		"dead_code":            deadAll,
+		"dead_code_truncated":  deadTrunc,
 		"cross_community_hubs": topHubs,
 	})
 }
@@ -344,4 +344,3 @@ func topNFromCountMap(m map[string]int, n int) []map[string]any {
 	}
 	return out
 }
-
