@@ -897,6 +897,9 @@ func (s *Server) handleChangeContract(ctx context.Context, req mcp.CallToolReque
 	if s == nil || s.graph == nil {
 		return mcp.NewToolResultError("change_contract: server not fully initialised"), nil
 	}
+	// Snapshot the unpublished edits before the walk; the changed symbols
+	// that scope the label are known only once it has run.
+	gaps := s.laggingMutationReceipts(ctx)
 	p, err := s.lowerChange(ctx, req)
 	if err != nil {
 		if ctxErr := requestContextError(ctx, err); ctxErr != nil {
@@ -909,5 +912,7 @@ func (s *Server) handleChangeContract(ctx context.Context, req mcp.CallToolReque
 	}
 	violations := s.evaluateChange(ctx, p)
 	env := s.assembleEnvelope(ctx, p, violations)
-	return s.respondJSONOrTOON(ctx, req, env)
+	label := s.labelRelations(ctx, gaps, p.changedIDs, nil)
+	res, err := s.respondJSONOrTOON(ctx, req, label.labelled(env))
+	return label.decorate(res), err
 }
