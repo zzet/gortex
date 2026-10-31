@@ -91,12 +91,12 @@ func SaveNotes(dir string, store *NoteStore) error {
 		store.Entries = trimNotes(store.Entries, maxNotesCap)
 	}
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := persistDir(dir); err != nil {
 		return fmt.Errorf("persistence: mkdir notes: %w", err)
 	}
 
 	path := filepath.Join(dir, notesFile)
-	f, err := os.Create(path)
+	f, err := persistFile(path)
 	if err != nil {
 		return fmt.Errorf("persistence: create notes: %w", err)
 	}

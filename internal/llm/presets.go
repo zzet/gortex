@@ -47,6 +47,16 @@ var gatewayPresets = map[string]CustomProvider{
 		SchemaMode:    "json_schema",
 		PromptProfile: "frontier",
 	},
+	// Opper (https://docs.opper.ai) is an EU-hosted OpenAI-compatible
+	// gateway at /v3/compat (no /v1); model ids are bare pool names, and a
+	// "provider/model" id such as "azure/gpt-5.5" pins one route.
+	"opper": {
+		BaseURL:       "https://api.opper.ai/v3/compat",
+		Model:         "gpt-6.1-terra",
+		APIKeyEnv:     "OPPER_API_KEY",
+		SchemaMode:    "json_schema",
+		PromptProfile: "frontier",
+	},
 	// Requesty (https://docs.requesty.ai) fronts many vendors behind one
 	// key; model ids carry a vendor prefix. Regional routers:
 	// https://router.eu.requesty.ai/v1 (and .us / .ap).
@@ -54,6 +64,16 @@ var gatewayPresets = map[string]CustomProvider{
 		BaseURL:       "https://router.requesty.ai/v1",
 		Model:         "openai/gpt-4o-mini",
 		APIKeyEnv:     "REQUESTY_API_KEY",
+		SchemaMode:    "json_schema",
+		PromptProfile: "frontier",
+	},
+	// Runcrate (https://www.runcrate.ai/inference/pricing) serves open
+	// models over the OpenAI Chat Completions API; model ids carry a
+	// vendor prefix.
+	"runcrate": {
+		BaseURL:       "https://api.runcrate.ai/v1",
+		Model:         "deepseek-ai/DeepSeek-V4.1-Flash",
+		APIKeyEnv:     "RUNCRATE_API_KEY",
 		SchemaMode:    "json_schema",
 		PromptProfile: "frontier",
 	},

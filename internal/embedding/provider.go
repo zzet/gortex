@@ -29,7 +29,11 @@ type Provider interface {
 	// Embed returns the embedding vector for the given text.
 	Embed(ctx context.Context, text string) ([]float32, error)
 
-	// EmbedBatch returns embeddings for multiple texts.
+	// EmbedBatch returns embeddings for multiple texts, in input order.
+	// The caller owns the returned slices: each vector must be freshly
+	// allocated, must not share a backing array with another vector, and
+	// must not be retained or modified by the provider after it returns.
+	// The indexer stores them in its vector plan without copying.
 	EmbedBatch(ctx context.Context, texts []string) ([][]float32, error)
 
 	// Dimensions returns the embedding vector size.

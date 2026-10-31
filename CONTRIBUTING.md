@@ -284,7 +284,8 @@ skipping it leaks a file handle and a background goroutine.
 | [docs/cli.md](docs/cli.md) | CLI verb reference |
 | [docs/llm.md](docs/llm.md) | LLM provider configuration |
 | [docs/features.md](docs/features.md) | Capability tour |
-| [CLAUDE.md](CLAUDE.md) | Repo conventions for coding agents |
+| [AGENTS.md](AGENTS.md) | Repo conventions for coding agents |
+| [CLAUDE.md](CLAUDE.md) | Imports `AGENTS.md` and adds the Claude Code-only notes |
 
 ## Questions?
 
