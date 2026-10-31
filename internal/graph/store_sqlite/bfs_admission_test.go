@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -49,26 +50,84 @@ func TestBFSAdmissionPreservesPointPayloadsOrderAndGeneration(t *testing.T) {
 	}
 }
 
+type bfsAdmissionPlanStep struct {
+	detail    string
+	ancestors []string
+}
+
+func bfsAdmissionPlan(t *testing.T, s *Store, query outlineQuery) []bfsAdmissionPlanStep {
+	t.Helper()
+	rows, err := s.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query.sql, query.args...)
+	require.NoError(t, err)
+	defer rows.Close()
+	details := map[int]string{}
+	parents := map[int]int{}
+	var plan []bfsAdmissionPlanStep
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+		details[id], parents[id] = detail, parent
+		step := bfsAdmissionPlanStep{detail: detail}
+		for up := parent; up != 0; up = parents[up] {
+			step.ancestors = append(step.ancestors, details[up])
+		}
+		plan = append(plan, step)
+	}
+	require.NoError(t, rows.Err())
+	return plan
+}
+
+// Every far-end test reads a covering index; the one full-row node seek
+// hydrates walked identities behind the walk's fit gate, and edges are only
+// ever reached from an endpoint.
 func TestBFSAdmissionIndexPlanAndCancellation(t *testing.T) {
 	s := openCatalogStore(t)
+	nodeProbe := regexp.MustCompile(`^SEARCH n (EXISTS )?USING COVERING INDEX (nodes_by_repo|nodes_by_generation|nodes_by_kind) \(`)
 	for _, dir := range []graph.Direction{graph.DirectionForward, graph.DirectionBackward} {
-		request := graph.BFSAdmissionRequest{Seed: "a/f.go::Root", Direction: dir, Kinds: []graph.EdgeKind{graph.EdgeCalls, graph.EdgeMatches}, Depth: 3, Limit: 20, Scope: graph.NodeScope{RepoAllow: map[string]bool{"a": true}}}
-		query := bfsAdmissionQuery(0, request, graph.OutlineEdgeFilter{ExcludeNodeKinds: []graph.NodeKind{graph.KindContract}, ExcludeVia: "spring.Bean"})
-		rows, err := s.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query.sql, query.args...)
-		require.NoError(t, err)
-		var plan []string
-		for rows.Next() {
-			var id, parent, unused int
-			var detail string
-			require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
-			plan = append(plan, detail)
+		_, _, index := bfsAdmissionColumns(dir)
+		edgeSeek := regexp.MustCompile(`^SEARCH e USING (COVERING )?INDEX ` + index + ` \(`)
+		for _, repos := range []map[string]bool{{"a": true}, nil} {
+			for _, filter := range []graph.OutlineEdgeFilter{
+				{ExcludeKinds: []graph.EdgeKind{graph.EdgeMatches}, ExcludeNodeKinds: []graph.NodeKind{graph.KindContract}, ExcludeVia: "spring.Bean"},
+				{ExcludeNodeIDs: map[string]bool{"a/f.go::Owned": true}},
+				{},
+			} {
+				request := graph.BFSAdmissionRequest{Seed: "a/f.go::Root", Direction: dir, Kinds: []graph.EdgeKind{graph.EdgeCalls, graph.EdgeMatches}, Depth: 3, Limit: 20, Scope: graph.NodeScope{RepoAllow: repos}}
+				plan := bfsAdmissionPlan(t, s, bfsAdmissionQuery(0, request, filter))
+				label := fmt.Sprintf("dir=%v repos=%v filter=%+v plan=%+v", dir, repos, filter, plan)
+				var primary, automatic int
+				var hydratedOuter string
+				used := map[string]bool{}
+				for _, step := range plan {
+					if hydratedOuter == "" && len(step.ancestors) > 0 && step.ancestors[0] == "MATERIALIZE hydrated" {
+						hydratedOuter = step.detail
+					}
+					switch {
+					case strings.HasPrefix(step.detail, "SEARCH n USING PRIMARY KEY "):
+						primary++
+						require.Contains(t, step.ancestors, "MATERIALIZE hydrated", label)
+					case strings.HasPrefix(step.detail, "SEARCH n ") || strings.HasPrefix(step.detail, "SCAN n"):
+						match := nodeProbe.FindStringSubmatch(step.detail)
+						require.NotNil(t, match, "node probe stays covering: %s", label)
+						used[match[2]] = true
+					case strings.HasPrefix(step.detail, "SEARCH e ") || strings.HasPrefix(step.detail, "SCAN e"):
+						require.Regexp(t, edgeSeek, step.detail, label)
+					case strings.HasPrefix(step.detail, "SEARCH h USING AUTOMATIC "):
+						automatic++
+					}
+				}
+				// The fit gate is hydrated's outermost loop, so an overflowing
+				// walk performs no full-row node seek at all.
+				require.Equal(t, "SCAN ok", hydratedOuter, label)
+				require.Equal(t, 1, primary, label)
+				require.Equal(t, 1, automatic, "rows join hydrated nodes through an automatic index: %s", label)
+				require.Equal(t, repos != nil, used["nodes_by_repo"], label)
+				require.Equal(t, len(filter.ExcludeNodeKinds) > 0, used["nodes_by_kind"], label)
+				require.True(t, used["nodes_by_generation"], "missing far ends are probed: %s", label)
+			}
 		}
-		require.NoError(t, rows.Err())
-		require.NoError(t, rows.Close())
-		joined := strings.Join(plan, "\n")
-		require.GreaterOrEqual(t, strings.Count(joined, "SEARCH e USING INDEX edges_by_"), 3, "recursive, bounded-count and result reads stay endpoint-driven: %s", joined)
-		require.Contains(t, joined, "kind=?")
-		require.NotContains(t, joined, "SCAN e ")
+		request := graph.BFSAdmissionRequest{Seed: "a/f.go::Root", Direction: dir, Kinds: []graph.EdgeKind{graph.EdgeCalls}, Depth: 3, Limit: 20}
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 		_, handled, err := s.BFSAdmissionFilteredContext(ctx, request, graph.OutlineEdgeFilter{})
@@ -93,6 +152,10 @@ func TestBFSAdmissionBudgetsDeclineWithoutPartialResult(t *testing.T) {
 	require.False(t, handled)
 	require.Empty(t, rows.Nodes)
 	require.Empty(t, rows.Adjacency)
+	// Edge overflow is found after hydration, which the fitting walk allowed.
+	fits, hydrated := bfsAdmissionHydration(t, s, request)
+	require.True(t, fits)
+	require.Equal(t, 1, hydrated)
 	// A wide state frontier also declines before any partial rows can escape.
 	stateStore := openCatalogStore(t)
 	stateStore.AddNode(&graph.Node{ID: root, Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/root.go"})
@@ -109,6 +172,21 @@ func TestBFSAdmissionBudgetsDeclineWithoutPartialResult(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, handled)
 	require.Empty(t, rows.Adjacency)
+	fits, hydrated = bfsAdmissionHydration(t, stateStore, request)
+	require.False(t, fits)
+	require.Zero(t, hydrated, "an overflowing walk reads no full node row")
+}
+
+// bfsAdmissionHydration runs the admission statement's CTEs alone and reports
+// the walk's fit flag and how many full node rows hydrated read.
+func bfsAdmissionHydration(t *testing.T, s *Store, request graph.BFSAdmissionRequest) (fits bool, hydrated int) {
+	t.Helper()
+	query := bfsAdmissionQuery(s.viewGen, request, graph.OutlineEdgeFilter{})
+	ctes, _, found := strings.Cut(query.sql, "SELECT NOT ok.fits")
+	require.True(t, found)
+	probe := ctes + "SELECT (SELECT fits FROM ok), (SELECT COUNT(*) FROM hydrated)"
+	require.NoError(t, s.db.QueryRowContext(t.Context(), probe, query.args[:strings.Count(ctes, "?")]...).Scan(&fits, &hydrated))
+	return fits, hydrated
 }
 
 func TestBFSAdmissionScopeAndUnresolvedGatePrecedeRecursion(t *testing.T) {
