@@ -2422,10 +2422,12 @@ func (s *Server) sessionScope(ctx context.Context) (workspaceID, projectID strin
 		return ss.scopeWorkspaceID, ss.scopeProjectID, true
 	}
 
-	// cwd neither lives inside nor contains a tracked repo. The daemon
-	// dispatcher rejects unreachable cwds before dispatch, so this is
-	// defensive: the sentinel matches no node, so the session sees
-	// nothing rather than the whole global graph.
+	// cwd neither lives inside nor contains a tracked repo. Nothing
+	// upstream rejects such a cwd — the daemon dispatcher only logs it
+	// and dispatches anyway — so this is the live path for every
+	// uncovered cwd, not a defensive one. It fails closed: the sentinel
+	// matches no node, so the session sees nothing rather than the whole
+	// global graph.
 	//
 	// A cwd in a configured repository that is still loading resolves here
 	// too, but only for now. Caching the sentinel would leave the session
