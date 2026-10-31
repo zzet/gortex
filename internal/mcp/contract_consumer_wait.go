@@ -71,6 +71,14 @@ func (s *Server) ContractAnalysisShouldYield() bool {
 	return runtimeactivity.Current().ByKind["mcp"] > s.contractAnalysisWaiters.Load()
 }
 
+// ContractAnalysisDemand is ContractAnalysisShouldYield with a sequence that
+// moves whenever a tool call starts or ends: a scheduler that samples it now
+// and then still sees the calls that came and went between two samples.
+func (s *Server) ContractAnalysisDemand() (busy bool, seq uint64) {
+	seq = runtimeactivity.KindEpoch("mcp")
+	return s.ContractAnalysisShouldYield(), seq
+}
+
 type contractConsumerContextKey struct{}
 
 type contractConsumerStatus struct {

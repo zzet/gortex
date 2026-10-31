@@ -628,6 +628,21 @@ func TestContractConsumerYieldCountsOrdinaryWorkAndBalancesFailure(t *testing.T)
 	require.True(t, f.srv.ContractAnalysisShouldYield())
 }
 
+// TestContractAnalysisDemandSeesCallsBetweenSamples: a tool call that starts
+// and ends between two samples is in flight at neither, but it moves the
+// demand sequence the contract scheduler's idle window watches.
+func TestContractAnalysisDemandSeesCallsBetweenSamples(t *testing.T) {
+	f := newContractConsumerFixture(t)
+	_, before := f.srv.ContractAnalysisDemand()
+	runtimeactivity.Begin("mcp")
+	busy, during := f.srv.ContractAnalysisDemand()
+	runtimeactivity.End("mcp")
+	_, after := f.srv.ContractAnalysisDemand()
+	require.True(t, busy)
+	require.Greater(t, during, before, "a call's start moves the sequence")
+	require.Greater(t, after, during, "so does its end")
+}
+
 func (f *contractConsumerFixture) strictList(ctx context.Context, wait time.Duration) (*mcplib.CallToolResult, error) {
 	return f.request(ctx, "contracts", map[string]any{"action": "list", "format": "json", "wait_deadline": time.Now().Add(wait).Format(time.RFC3339Nano)}, f.srv.handleContracts)
 }
