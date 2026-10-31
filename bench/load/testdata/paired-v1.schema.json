@@ -691,6 +691,9 @@
                                   }
                                 ]
                               },
+                              "editor": {
+                                "type": "integer"
+                              },
                               "errors": {
                                 "items": {
                                   "type": "string"

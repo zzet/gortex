@@ -59,6 +59,9 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 		if len(builds) != 2 {
 			return o, nil, errors.New("paired edit-and-probe requires one baseline and one candidate")
 		}
+		if o.Editors != 1 {
+			return o, nil, errors.New("paired edit-and-probe is the one-editor no-regression cell")
+		}
 	default:
 		return o, nil, errors.New("paired supports workload scenarios; cold/restart/all use standalone runs")
 	}

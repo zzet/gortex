@@ -78,7 +78,7 @@ func (r *editProbeRuntime) admitCrossFileCallee(ctx context.Context) error {
 		return errors.New("crossfile fixture callee must be a real numeric leaf")
 	}
 	req := request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": c.EditCallee}, "options": map[string]any{"context_lines": 0}}}
-	raw, identity, err := r.editor.callWithIdentity(ctx, "tools/call", map[string]any{"name": req.Tool, "arguments": dispatchArgs(req, r.p.Repos[0])})
+	raw, identity, err := r.editors[0].callWithIdentity(ctx, "tools/call", map[string]any{"name": req.Tool, "arguments": dispatchArgs(req, r.p.Repos[0])})
 	if err != nil {
 		return err
 	}

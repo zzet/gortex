@@ -36,7 +36,7 @@ func TestEditProbeCensoredSetupKeepsCompleteOfferedDenominator(t *testing.T) {
 	p := &privateRun{Root: root, Socket: filepath.Join(root, "absent.sock"), Repos: []privateRepo{{Path: root, Corpus: corpus}}}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	run, clients, err := prepareEditProbe(ctx, runOptions{Seed: 1, EditCount: 100, Editors: 1}, p, nil, phase)
+	run, clients, err := prepareEditProbe(ctx, runOptions{Seed: 1, EditCount: 100, Editors: 1}, p, []*socketClient{nil}, phase)
 	if err == nil || run == nil || len(clients) != 0 {
 		t.Fatalf("setup cancellation missingrun=%v clients=%d err=%v", run != nil, len(clients), err)
 	}
@@ -98,7 +98,7 @@ func TestEditProbeBlockedProbeResponsesCannotDelayEditDispatch(t *testing.T) {
 	state.startRaw()
 	defer state.finishRaw()
 	phase := &Phase{Metrics: make(map[string]Metric), EditProbe: newEditProbeReport(plan, corpus, true)}
-	run := &editProbeRuntime{options: runOptions{Seed: 1, Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Prefix: "sample", Corpus: corpus}}}, phase: phase, plan: plan, editor: editor, states: []*editProbeState{state}, origin: time.Now(), requireAccounting: true}
+	run := &editProbeRuntime{options: runOptions{Seed: 1, Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Prefix: "sample", Corpus: corpus}}}, phase: phase, plan: plan, editors: []*socketClient{editor}, states: []*editProbeState{state}, origin: time.Now(), requireAccounting: true}
 	done := make(chan error, 1)
 	go func() { done <- runEditProbeArrivals(ctx, plan, run.origin, run.activate, run.doEdit, waitContext) }()
 	select {
@@ -222,5 +222,136 @@ func TestEditProbeRawCapIsExplicitFailure(t *testing.T) {
 	}
 	if err := state.emit(nil); !errors.Is(err, state.sinkErr) {
 		t.Fatal("evidence failure was cleared")
+	}
+}
+
+func TestEditProbeEditsAndOwnReadbacksUseTheirFixedEditorConnection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	const editors = 3
+	var mu sync.Mutex
+	frames := map[int][]stubFrame{}
+	edited := make(chan int, 2*editors)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
+		if frame.Method != "tools/call" {
+			return stubContent(map[string]any{}), nil
+		}
+		mu.Lock()
+		frames[frame.Connection] = append(frames[frame.Connection], frame)
+		mu.Unlock()
+		if frame.Params["name"] == "edit" {
+			edited <- frame.Connection
+			if frame.Connection == 1 {
+				// Editor 0's ACK stays blocked until both later editors sent.
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+			}
+			return stubContent(map[string]any{"mutation_receipt": "commit-test"}), nil
+		}
+		return stubContent(map[string]any{}), nil
+	})
+	corpus := editProbeCorpus()
+	full, err := makeEditProbeTrafficPlan(corpus, 7, 100, editors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := full
+	plan.Steps = nil
+	for editor := range editors {
+		for _, step := range full.Steps {
+			if step.Editor == editor {
+				step.Ordinal = len(plan.Steps)
+				step.ActivateNS = int64(len(plan.Steps)) * int64(10*time.Millisecond)
+				step.DueNS = step.ActivateNS + int64(editProbePeriod)
+				plan.Steps = append(plan.Steps, step)
+				break
+			}
+		}
+	}
+	var sessions []*socketClient // editors on connections 1..3, probers on 4..6
+	for range 2 * editors {
+		client, err := openMCP(ctx, socket, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		sessions = append(sessions, client)
+	}
+	phase := &Phase{Metrics: make(map[string]Metric), EditProbe: newEditProbeReport(plan, corpus, true)}
+	run := &editProbeRuntime{options: runOptions{Seed: 1, Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Prefix: "sample", Corpus: corpus}}}, phase: phase, plan: plan, editors: sessions[:editors], origin: time.Now(), requireAccounting: true}
+	for i, step := range plan.Steps {
+		file, err := os.CreateTemp(t.TempDir(), "probe-*.jsonl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		record := newEditProbeRecord(corpus, step)
+		record.Outcome, record.Errors = "not_started", nil
+		state := &editProbeState{step: step, record: record, client: sessions[editors+i], sink: file}
+		state.startRaw()
+		run.states = append(run.states, state)
+	}
+	done := make(chan error, 1)
+	go func() { done <- runEditProbeArrivals(ctx, plan, run.origin, run.activate, run.doEdit, waitContext) }()
+	seen := map[int]bool{}
+	for !seen[2] || !seen[3] {
+		select {
+		case connection := <-edited:
+			seen[connection] = true
+		case <-ctx.Done():
+			t.Fatal("a blocked editor delayed another editor's offered arrival")
+		}
+	}
+	unblock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	_ = run.finish() // stub receipts never turn terminal
+	mu.Lock()
+	defer mu.Unlock()
+	for i, step := range plan.Steps {
+		if record := run.phase.EditProbe.Records[i]; record.Editor != step.Editor || record.Receipt != "commit-test" {
+			t.Fatalf("record lost its fixed editor or ACK: %+v", record)
+		}
+		edits, reads := 0, 0
+		for _, frame := range frames[step.Editor+1] {
+			args, _ := json.Marshal(frame.Params["arguments"])
+			for _, other := range plan.Steps {
+				if other.Ordinal != step.Ordinal && strings.Contains(string(args), other.Marker) {
+					t.Fatalf("editor %d carried another ordinal's call: %s", step.Editor, args)
+				}
+			}
+			switch frame.Params["name"] {
+			case "edit":
+				edits++
+			case "read":
+				reads++
+			default:
+				t.Fatalf("editor session carried a probe/status call: %v", frame.Params["name"])
+			}
+		}
+		if edits != 1 || reads < 2 {
+			t.Fatalf("editor %d: edits=%d immediate readbacks=%d", step.Editor, edits, reads)
+		}
+		for _, frame := range frames[editors+i+1] {
+			if frame.Params["name"] == "edit" {
+				t.Fatal("prober session carried an edit")
+			}
+		}
+	}
+	// Cleanup rewrites the shared file, so it waits for every editor's receipt.
+	for i := range run.phase.EditProbe.Records {
+		run.phase.EditProbe.Records[i].GraphTerminal = run.phase.EditProbe.Records[i].Editor != 1
+	}
+	if err := run.restore(ctx); err == nil || !strings.Contains(err.Error(), "pending") {
+		t.Fatalf("restore raced another editor's pending receipt: %v", err)
+	}
+	if err := run.close(); err != nil {
+		t.Fatal(err)
 	}
 }

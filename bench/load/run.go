@@ -86,8 +86,8 @@ func validateRunOptions(o runOptions) error {
 	if _, err := parseProfile(o.Profile); err != nil {
 		return err
 	}
-	if o.Scenario == editProbeScenario && (o.Profile != "agent" || o.Agents != 0 || o.Editors != 1 || o.Worktrees != 0 || o.CPUProfile != 0 || o.EditCount != 1 && o.EditCount != 100) {
-		return errors.New("edit-and-probe initial cell requires --profile agent --agents 0 --edit-agents 1 --worktrees 0, no CPU profile, and --edit-count 100 (or explicit 1 diagnostic)")
+	if o.Scenario == editProbeScenario && (o.Profile != "agent" || o.Agents != 0 || o.Editors < 1 || o.Editors > editProbeMaxEditors || o.Worktrees != 0 || o.CPUProfile != 0 || o.EditCount != 1 && o.EditCount != 100 || o.EditCount == 1 && o.Editors != 1) {
+		return fmt.Errorf("edit-and-probe requires --profile agent --agents 0 --edit-agents 1..%d on one repository --worktrees 0, no CPU profile, and --edit-count 100 (or an explicit 1-edit, 1-editor diagnostic)", editProbeMaxEditors)
 	}
 	if o.SweepRepetitions < 1 || o.SweepBudget <= 0 {
 		return errors.New("sweep repetitions and duration must be positive")
@@ -99,7 +99,7 @@ func validateRunOptions(o runOptions) error {
 		return errors.New("--cpu-profile requires a whole number of seconds")
 	}
 	activeAgents := o.Agents
-	if o.Scenario == "edit" || o.Scenario == "many-edit" || o.Scenario == "all" {
+	if o.Scenario == "edit" || o.Scenario == "many-edit" || o.Scenario == "all" || o.Scenario == editProbeScenario {
 		activeAgents += o.Editors
 	}
 	activeWorktrees := 1

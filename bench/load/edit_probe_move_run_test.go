@@ -161,7 +161,7 @@ func TestMoveRestoreUsesOnePublicBatchForBothOwnedFiles(t *testing.T) {
 	}
 	defer client.Close()
 	refs, _ := moveAccountingFixture(t)
-	run := &editProbeRuntime{options: runOptions{Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Path: root, Prefix: "fixture", Corpus: Corpus{EditDestination: "target.go"}}}}, editor: client, plan: editProbePlan{Tool: "refactor.move", File: "source.go"}, original: []byte(sourceBefore), moveOriginal: []byte(targetBefore), requireAccounting: true, phase: &Phase{EditProbe: &editProbeReport{Records: []editProbeRecord{{Move: &refs}}}}}
+	run := &editProbeRuntime{options: runOptions{Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Path: root, Prefix: "fixture", Corpus: Corpus{EditDestination: "target.go"}}}}, editors: []*socketClient{client}, plan: editProbePlan{Tool: "refactor.move", File: "source.go"}, original: []byte(sourceBefore), moveOriginal: []byte(targetBefore), requireAccounting: true, phase: &Phase{EditProbe: &editProbeReport{Records: []editProbeRecord{{Move: &refs}}}}}
 	if err := run.restore(ctx); err == nil {
 		t.Fatal("unknown publication allowed cleanup mutation")
 	}
@@ -260,7 +260,7 @@ func checkMoveOwnACKContinuation(t *testing.T, badReadback bool) {
 	state := &editProbeState{step: step, client: client, sink: sink, record: record, firstProbeWrite: started.Add(-time.Millisecond), editWrite: started, absenceBefore: map[string]bool{step.BeforeSymbol: true}}
 	state.startRaw()
 	defer state.finishRaw()
-	run := &editProbeRuntime{options: runOptions{Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Path: "/owned", Prefix: "fixture", Corpus: Corpus{File: "source.go", EditDestination: "target.go"}}}}, editor: client, plan: editProbePlan{Tool: "refactor.move", File: "source.go", Callee: "Callee"}, phase: &Phase{Metrics: map[string]Metric{}}, origin: started, requireAccounting: true}
+	run := &editProbeRuntime{options: runOptions{Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Path: "/owned", Prefix: "fixture", Corpus: Corpus{File: "source.go", EditDestination: "target.go"}}}}, editors: []*socketClient{client}, plan: editProbePlan{Tool: "refactor.move", File: "source.go", Callee: "Callee"}, phase: &Phase{Metrics: map[string]Metric{}}, origin: started, requireAccounting: true}
 	ack, err := json.Marshal(stubContent(ackBody))
 	if err != nil {
 		t.Fatal(err)

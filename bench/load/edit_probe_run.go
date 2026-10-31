@@ -28,6 +28,7 @@ type editProbeReadback struct {
 }
 type editProbeRecord struct {
 	Ordinal                  int                       `json:"ordinal"`
+	Editor                   int                       `json:"editor,omitempty"`
 	Marker                   string                    `json:"marker"`
 	MutationID               string                    `json:"mutation_id"`
 	PlannedDueNS             int64                     `json:"planned_due_ns"`
@@ -97,7 +98,7 @@ type editProbeRuntime struct {
 	p                 *privateRun
 	phase             *Phase
 	plan              editProbePlan
-	editor            *socketClient
+	editors           []*socketClient // fixed per ordinal; editors[0] owns run-level controls
 	states            []*editProbeState
 	original          []byte
 	moveOriginal      []byte
@@ -108,7 +109,7 @@ type editProbeRuntime struct {
 }
 
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
-	record := editProbeRecord{Ordinal: step.Ordinal, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
+	record := editProbeRecord{Ordinal: step.Ordinal, Editor: step.Editor, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
 	for _, oracle := range editProbeOracles(c, step) {
 		record.FirstCorrect[oracle.name] = unavailable("ms", "not observed")
 	}
@@ -134,10 +135,13 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	return out
 }
 
-func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *socketClient, phase *Phase) (*editProbeRuntime, []*socketClient, error) {
+func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editors []*socketClient, phase *Phase) (*editProbeRuntime, []*socketClient, error) {
 	plan, err := planEditProbe(p.Repos[0].Corpus, o)
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(editors) != max(1, plan.Editors) {
+		return nil, nil, fmt.Errorf("edit-and-probe plan has %d fixed editors but %d editor sessions", max(1, plan.Editors), len(editors))
 	}
 	original, err := os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
 	if err != nil {
@@ -166,7 +170,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 			return nil, nil, errors.New("planned marker already exists before edit")
 		}
 	}
-	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editor: editor, original: original, requireAccounting: !o.editProbeBaseline}
+	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, original: original, requireAccounting: !o.editProbeBaseline}
 	if plan.Tool == "refactor.move" {
 		r.moveOriginal, err = os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(p.Repos[0].Corpus.EditDestination)))
 		if err != nil {
@@ -227,6 +231,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editor *
 	}
 	phase.Metrics["edit_probe_session_setup_seconds"] = measured(time.Since(setup).Seconds(), "s")
 	phase.Metrics["edit_probe_sessions"] = measured(float64(len(clients)), "sessions")
+	phase.Metrics["edit_probe_editor_sessions"] = measured(float64(len(editors)), "sessions")
 	phase.SessionModel = plan.SessionModel
 	return r, clients, nil
 }
@@ -510,11 +515,17 @@ func (r *editProbeRuntime) beginEdit(ctx context.Context, step editProbeStep) (*
 	return s, callCtx, cancel, started
 }
 
+// Each edit and its own immediate readbacks use the ordinal's fixed editor;
+// probes and receipt status stay on that edit's separate prober session.
+func (r *editProbeRuntime) editorFor(step editProbeStep) *socketClient {
+	return r.editors[step.Editor]
+}
+
 func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
 	s, callCtx, cancel, started := r.beginEdit(ctx, step)
 	defer s.stopProbes()
 	defer cancel()
-	ack, identity, err := r.perform(callCtx, s, r.editor, step.Request, "edit", "workload", 0)
+	ack, identity, err := r.perform(callCtx, s, r.editorFor(step), step.Request, "edit", "workload", 0)
 	r.finishEditAfterACK(ctx, callCtx, s, step, started, ack, identity, err)
 }
 
@@ -628,7 +639,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		}
 		req = editProbeWithOutput(req, r.plan.Mode)
 		begin := time.Now()
-		raw, identity, readErr := r.perform(callCtx, s, r.editor, req, "readback:"+kind, "readback", 100+index)
+		raw, identity, readErr := r.perform(callCtx, s, r.editorFor(step), req, "readback:"+kind, "readback", 100+index)
 		payload, decodeErr := decodeEditProbeOutput(raw, editProbeRequestOutput(req), req.name())
 		back := editProbeReadback{Kind: kind, Latency: unavailable("ms", "response endpoint unavailable"), Correct: readErr == nil && decodeErr == nil && editProbeCorrect(kind, payload, r.p.Repos[0].Corpus, step, r.plan.Callee)}
 		if !identity.Finished.IsZero() {
@@ -743,7 +754,7 @@ func (r *editProbeRuntime) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	captureReceipt(ctx, r.p, r.editor, r.phase)
+	captureReceipt(ctx, r.p, r.editors[0], r.phase)
 	before, statsErr := r.stats(ctx)
 	r.phase.EditProbe.StatsBefore = before
 	if statsErr != nil {
@@ -866,7 +877,7 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	}
 	req := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "changes": changes, "options": map[string]any{"transaction_id": fmt.Sprintf("load-restore-%016x", uint64(r.options.Seed))}, "output": map[string]any{"format": "json", "max_bytes": 0}}}
 	start := time.Now()
-	data, _, err := callEditProbeTool(ctx, r.editor, req, req.Arguments, "cleanup", 0, len(r.states), 0, r.options.Deadline, editProbeRetrySleep(r.options.Seed, len(r.states), 0))
+	data, _, err := callEditProbeTool(ctx, r.editors[0], req, req.Arguments, "cleanup", 0, len(r.states), 0, r.options.Deadline, editProbeRetrySleep(r.options.Seed, len(r.states), 0))
 	r.phase.EditProbe.RestoreMS = measured(float64(time.Since(start))/float64(time.Millisecond), "ms")
 	r.phase.EditProbe.Restore = data
 	if err != nil {
@@ -894,7 +905,7 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 func (r *editProbeRuntime) stats(ctx context.Context) (json.RawMessage, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	data, err := r.editor.call(ctx, "resources/read", map[string]any{"uri": "gortex://stats"})
+	data, err := r.editors[0].call(ctx, "resources/read", map[string]any{"uri": "gortex://stats"})
 	if err != nil {
 		return data, err
 	}

@@ -39,7 +39,7 @@ func pairedEditProbeFixture(t *testing.T, ctx context.Context, count int, handle
 		root := t.TempDir()
 		p := &privateRun{Root: root, Store: filepath.Join(root, "store.db"), Socket: socket, Repos: []privateRepo{{Corpus: corpus, Prefix: "sample"}}}
 		phase := &Phase{Metrics: make(map[string]Metric), EditProbe: newEditProbeReport(plan, corpus, i != 0)}
-		r := &editProbeRuntime{options: options, p: p, phase: phase, plan: plan, editor: editor, origin: time.Now(), requireAccounting: i != 0}
+		r := &editProbeRuntime{options: options, p: p, phase: phase, plan: plan, editors: []*socketClient{editor}, origin: time.Now(), requireAccounting: i != 0}
 		phase.editProbeRuntime = r
 		clients := []*socketClient{editor}
 		for _, step := range plan.Steps {

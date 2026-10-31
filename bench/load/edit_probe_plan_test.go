@@ -250,4 +250,19 @@ func TestEditProbeEditorCountRefusals(t *testing.T) {
 			t.Fatalf("valid editor cell refused: %+v: %v", cell, err)
 		}
 	}
+	base := []string{"--binary", "unused", "--manifest", "unused", "--scratch", t.TempDir(), "--scenario", editProbeScenario, "--agents", "0", "--worktrees", "0"}
+	for _, editors := range []string{"1", "4", "32"} {
+		if o, err := parseRun(append(base, "--edit-agents", editors)); err != nil || o.Editors < 1 {
+			t.Fatalf("--edit-agents %s refused: %v", editors, err)
+		}
+	}
+	for _, extra := range [][]string{{"--edit-agents", "0"}, {"--edit-agents", "33"}, {"--edit-agents", "2", "--edit-count", "1"}, {"--edit-agents", "8", "--host", "floor"}} {
+		if _, err := parseRun(append(base, extra...)); err == nil {
+			t.Fatalf("invalid edit-and-probe editors accepted: %v", extra)
+		}
+	}
+	paired := []string{"--build", "main=/private/main", "--build", "candidate=/private/candidate", "--manifest", "/private/manifest.json", "--scratch", t.TempDir(), "--scenario", editProbeScenario, "--agents", "0", "--worktrees", "0", "--edit-agents", "2"}
+	if _, _, err := parsePaired(paired); err == nil {
+		t.Fatal("paired no-regression cell widened past one editor")
+	}
 }

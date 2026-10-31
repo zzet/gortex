@@ -58,7 +58,7 @@ func (r *editProbeRuntime) preparePairedCall(ctx context.Context, role string, o
 func (call pairedEditProbeCall) perform(req request, role string, stream int) (json.RawMessage, wireCallIdentity, []Attempt, error) {
 	client := call.state.client
 	if call.editing {
-		client = call.runtime.editor
+		client = call.runtime.editorFor(call.state.step)
 	}
 	return call.runtime.performObserved(call.ctx, call.state, client, req, call.purpose, role, stream)
 }
