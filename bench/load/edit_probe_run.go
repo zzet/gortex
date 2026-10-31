@@ -26,6 +26,7 @@ type editProbeReadback struct {
 	Error           string `json:"error"`
 	ExpectedOutcome string `json:"expected_outcome,omitempty"`
 	Refusal         string `json:"refusal,omitempty"`
+	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
 	Ordinal                  int                       `json:"ordinal"`
@@ -41,6 +42,7 @@ type editProbeRecord struct {
 	Batch                    *editProbeBatchReferences `json:"batch,omitempty"`
 	Move                     *editProbeMoveReferences  `json:"move,omitempty"`
 	MoveAccounting           *editProbeMoveAccounting  `json:"move_accounting,omitempty"`
+	NativeWrite              *editProbeNativeWrite     `json:"native_write,omitempty"`
 	GraphTerminalBasis       string                    `json:"graph_terminal_basis,omitempty"`
 	Ack                      Metric                    `json:"t_ack_ms"`
 	PhasesMS                 map[string]Metric         `json:"phases_ms,omitempty"`
@@ -102,6 +104,8 @@ type editProbeState struct {
 	probes                                            sync.WaitGroup
 	started, acknowledged, firstProbeWrite, editWrite time.Time
 	absenceBefore                                     map[string]bool
+	ackReady                                          chan struct{} // closed once the own ACK is known or the edit ended without one
+	ackOnce                                           sync.Once
 }
 
 type editProbeRuntime struct {
@@ -163,6 +167,9 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	}
 	if plan.Mode == "cli" {
 		out.Limitations = append(out.Limitations, "CLI oracles run one owned `gortex call --format json` process per request; the edit, readbacks and receipt status stay MCP JSON", "CLI probe cadence is bounded by process start, daemon dial and exit rather than 25 ms, and a probe's start is its process start", "CLI stdout keeps only the first text payload, re-encoded through float64: numbers that cannot be exact and prose wrappers are decode failures, and a tool refusal is a nonzero exit counted as a probe error")
+	}
+	if plan.Sender != "" {
+		out.Limitations = append(out.Limitations, editProbeNativeLimitations(plan.Sender)...)
 	}
 	if plan.Mode == "compact" {
 		out.Limitations = append(out.Limitations, "compact text is requested only from read.summary, search.symbols, relations.callers and trace.call_chain; source, editing_context and text probes, readbacks, the edit ACK and timing controls stay JSON", "compact rows carry no node IDs, edge rows, signatures or freshness fields: they prove the marker's presence only, relation rows prove membership of the traversal answer with a nonzero edge footer but not the edge or its tier, and stale-claimed-fresh is unavailable rather than 0", "an empty compact answer is zero rows; a JSON answer to a compact request, such as not-found guidance, counts as a decode failure")
@@ -573,9 +580,14 @@ func (r *editProbeRuntime) editorFor(step editProbeStep) *socketClient {
 }
 
 func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
+	if step.Sender != "" {
+		r.doNativeWrite(ctx, step)
+		return
+	}
 	r.editsInFlight.Add(1)
 	defer r.editsInFlight.Add(-1)
 	s, callCtx, cancel, started := r.beginEdit(ctx, step)
+	defer s.signalAck()
 	defer s.stopProbes()
 	defer cancel()
 	ack, identity, err := r.perform(callCtx, s, r.editorFor(step), step.Request, "edit", "workload", 0)
@@ -664,7 +676,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.acknowledged = identity.Finished
 	}
 	s.mu.Unlock()
-	// Immediate same editing session, with no sleep/receipt/freshness barrier.
+	s.signalAck()
 	readbackKinds := []string{"file", "source"}
 	if step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
 		readbackKinds = append(readbackKinds, "old_source_absent")
@@ -672,63 +684,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if step.Relocated {
 		readbackKinds = append(readbackKinds, "old_source_absent", "source_file_after_move")
 	}
-	readbackEnd, readbacksCorrect := time.Time{}, true
-	for index, kind := range readbackKinds {
-		target := map[string]any{"file": r.plan.File}
-		if kind == "file" && step.Relocated {
-			target["file"] = step.DestinationFile
-		}
-		if kind == "source" {
-			target = map[string]any{"symbol": r.plan.File + "::" + step.Marker}
-			if step.TargetSymbol != "" {
-				target = map[string]any{"symbol": step.TargetSymbol}
-			}
-		}
-		req := request{Tool: "read", Operation: kind, Arguments: map[string]any{"operation": kind, "target": target}}
-		if kind == "source" && step.TargetSymbol != "" {
-			req.Arguments["options"] = map[string]any{"context_lines": 0}
-		}
-		if kind == "old_source_absent" || kind == "source" && step.Deleted {
-			req.Operation = "source"
-			req.ExpectedAbsentSymbol = step.BeforeSymbol
-			req.Arguments = map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}
-		}
-		if kind == "source_file_after_move" {
-			req.Operation = "file"
-			req.Arguments["operation"] = "file"
-		}
-		req = editProbeWithOutput(req, r.plan.Mode)
-		begin := time.Now()
-		raw, identity, readErr := r.perform(callCtx, s, r.editorFor(step), req, "readback:"+kind, "readback", 100+index)
-		payload, decodeErr := decodeEditProbeOutput(raw, editProbeRequestOutput(req), req.name())
-		back := editProbeReadback{Kind: kind, Latency: unavailable("ms", "response endpoint unavailable"), Correct: readErr == nil && decodeErr == nil && editProbeCorrect(kind, payload, r.p.Repos[0].Corpus, step, r.plan.Callee)}
-		if !identity.Finished.IsZero() {
-			back.Latency = measured(float64(identity.Finished.Sub(begin))/float64(time.Millisecond), "ms")
-		}
-		absence, exactRefusal := readErr.(*editProbeExpectedAbsence)
-		if req.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == r.p.Repos[0].Prefix+"/"+req.ExpectedAbsentSymbol {
-			back.Correct = true
-			back.ExpectedOutcome = "symbol_absent"
-			back.Refusal = absence.message
-		} else {
-			if readErr != nil {
-				back.Error = readErr.Error()
-			}
-			if decodeErr != nil {
-				back.Error = decodeErr.Error()
-			}
-		}
-		s.mu.Lock()
-		s.record.Readbacks = append(s.record.Readbacks, back)
-		if !back.Correct {
-			s.record.Errors = append(s.record.Errors, "immediate "+kind+" readback incorrect")
-		}
-		s.mu.Unlock()
-		readbacksCorrect = readbacksCorrect && back.Correct && !identity.Finished.IsZero()
-		if identity.Finished.After(readbackEnd) {
-			readbackEnd = identity.Finished
-		}
-	}
+	readbackEnd, readbacksCorrect := r.immediateReadbacks(callCtx, s, step, readbackKinds, nil)
 	// The agent has its edit back once the last immediate readback is correct.
 	s.mu.Lock()
 	s.record.Readback = unavailable("ms", "immediate readback missing or incorrect")
@@ -820,6 +776,74 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.record.Outcome = "diagnostic_failure"
 	}
 	s.mu.Unlock()
+}
+
+// Immediate same editing session, with no sleep/receipt/freshness barrier.
+// Observation-only kinds are recorded but neither gate the readback time nor
+// fail the record.
+func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editProbeState, step editProbeStep, readbackKinds []string, observeOnly map[string]bool) (time.Time, bool) {
+	readbackEnd, readbacksCorrect := time.Time{}, true
+	for index, kind := range readbackKinds {
+		target := map[string]any{"file": r.plan.File}
+		if kind == "file" && step.Relocated {
+			target["file"] = step.DestinationFile
+		}
+		if kind == "source" {
+			target = map[string]any{"symbol": r.plan.File + "::" + step.Marker}
+			if step.TargetSymbol != "" {
+				target = map[string]any{"symbol": step.TargetSymbol}
+			}
+		}
+		req := request{Tool: "read", Operation: kind, Arguments: map[string]any{"operation": kind, "target": target}}
+		if kind == "source" && step.TargetSymbol != "" {
+			req.Arguments["options"] = map[string]any{"context_lines": 0}
+		}
+		if kind == "old_source_absent" || kind == "source" && step.Deleted {
+			req.Operation = "source"
+			req.ExpectedAbsentSymbol = step.BeforeSymbol
+			req.Arguments = map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}
+		}
+		if kind == "source_file_after_move" {
+			req.Operation = "file"
+			req.Arguments["operation"] = "file"
+		}
+		req = editProbeWithOutput(req, r.plan.Mode)
+		begin := time.Now()
+		raw, identity, readErr := r.perform(callCtx, s, r.editorFor(step), req, "readback:"+kind, "readback", 100+index)
+		payload, decodeErr := decodeEditProbeOutput(raw, editProbeRequestOutput(req), req.name())
+		back := editProbeReadback{Kind: kind, Latency: unavailable("ms", "response endpoint unavailable"), Correct: readErr == nil && decodeErr == nil && editProbeCorrect(kind, payload, r.p.Repos[0].Corpus, step, r.plan.Callee)}
+		if !identity.Finished.IsZero() {
+			back.Latency = measured(float64(identity.Finished.Sub(begin))/float64(time.Millisecond), "ms")
+		}
+		absence, exactRefusal := readErr.(*editProbeExpectedAbsence)
+		if req.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == r.p.Repos[0].Prefix+"/"+req.ExpectedAbsentSymbol {
+			back.Correct = true
+			back.ExpectedOutcome = "symbol_absent"
+			back.Refusal = absence.message
+		} else {
+			if readErr != nil {
+				back.Error = readErr.Error()
+			}
+			if decodeErr != nil {
+				back.Error = decodeErr.Error()
+			}
+		}
+		back.ObservationOnly = observeOnly[kind]
+		s.mu.Lock()
+		s.record.Readbacks = append(s.record.Readbacks, back)
+		if !back.Correct && !back.ObservationOnly {
+			s.record.Errors = append(s.record.Errors, "immediate "+kind+" readback incorrect")
+		}
+		s.mu.Unlock()
+		if back.ObservationOnly {
+			continue
+		}
+		readbacksCorrect = readbacksCorrect && back.Correct && !identity.Finished.IsZero()
+		if identity.Finished.After(readbackEnd) {
+			readbackEnd = identity.Finished
+		}
+	}
+	return readbackEnd, readbacksCorrect
 }
 
 func (r *editProbeRuntime) run(ctx context.Context) error {
@@ -947,6 +971,9 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	}
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
 	for _, record := range r.phase.EditProbe.Records {
+		if record.NativeWrite != nil {
+			continue // A native write is synchronous: it ended before its record did.
+		}
 		if (record.Receipt == "" && record.Batch == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}

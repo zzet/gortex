@@ -52,6 +52,9 @@
           "edit_output": {
             "type": "string"
           },
+          "edit_sender": {
+            "type": "string"
+          },
           "edit_template": {
             "type": "string"
           },
@@ -1009,6 +1012,169 @@
                         "mutation_receipt": {
                           "type": "string"
                         },
+                        "native_write": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "after": {
+                                  "anyOf": [
+                                    {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "inode": {
+                                          "anyOf": [
+                                            {
+                                              "type": "integer"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        },
+                                        "mtime_ns": {
+                                          "type": "integer"
+                                        },
+                                        "size": {
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "size",
+                                        "mtime_ns",
+                                        "inode"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "after_ordinal": {
+                                  "anyOf": [
+                                    {
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "before": {
+                                  "anyOf": [
+                                    {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "inode": {
+                                          "anyOf": [
+                                            {
+                                              "type": "integer"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        },
+                                        "mtime_ns": {
+                                          "type": "integer"
+                                        },
+                                        "size": {
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "size",
+                                        "mtime_ns",
+                                        "inode"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "dependency_ready_ns": {
+                                  "anyOf": [
+                                    {
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "replaced": {
+                                  "type": "boolean"
+                                },
+                                "sender": {
+                                  "type": "string"
+                                },
+                                "write_end_ns": {
+                                  "anyOf": [
+                                    {
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "write_start_ns": {
+                                  "anyOf": [
+                                    {
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "write_window_ms": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "reason": {
+                                      "type": "string"
+                                    },
+                                    "unit": {
+                                      "type": "string"
+                                    },
+                                    "value": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "value",
+                                    "unit",
+                                    "reason"
+                                  ],
+                                  "type": "object"
+                                }
+                              },
+                              "required": [
+                                "sender",
+                                "write_start_ns",
+                                "write_end_ns",
+                                "write_window_ms",
+                                "before",
+                                "after",
+                                "replaced"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "ordinal": {
                           "type": "integer"
                         },
@@ -1102,6 +1268,9 @@
                                   "reason"
                                 ],
                                 "type": "object"
+                              },
+                              "observation_only": {
+                                "type": "boolean"
                               },
                               "refusal": {
                                 "type": "string"
@@ -1477,6 +1646,9 @@
                       "seed": {
                         "type": "integer"
                       },
+                      "sender": {
+                        "type": "string"
+                      },
                       "session_model": {
                         "type": "string"
                       },
@@ -1486,6 +1658,19 @@
                           "properties": {
                             "activate_ns": {
                               "type": "integer"
+                            },
+                            "after": {
+                              "anyOf": [
+                                {
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "after_event": {
+                              "type": "string"
                             },
                             "before_symbol": {
                               "type": "string"
@@ -1551,6 +1736,9 @@
                               "type": "object"
                             },
                             "request_sha256": {
+                              "type": "string"
+                            },
+                            "sender": {
                               "type": "string"
                             },
                             "target_symbol": {
@@ -3232,6 +3420,9 @@
                 "seed": {
                   "type": "integer"
                 },
+                "sender": {
+                  "type": "string"
+                },
                 "session_model": {
                   "type": "string"
                 },
@@ -3241,6 +3432,19 @@
                     "properties": {
                       "activate_ns": {
                         "type": "integer"
+                      },
+                      "after": {
+                        "anyOf": [
+                          {
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "after_event": {
+                        "type": "string"
                       },
                       "before_symbol": {
                         "type": "string"
@@ -3306,6 +3510,9 @@
                         "type": "object"
                       },
                       "request_sha256": {
+                        "type": "string"
+                      },
+                      "sender": {
                         "type": "string"
                       },
                       "target_symbol": {

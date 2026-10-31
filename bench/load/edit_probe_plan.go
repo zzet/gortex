@@ -40,6 +40,9 @@ type editProbeStep struct {
 	Relocated       bool    `json:"relocated,omitempty"`
 	DestinationFile string  `json:"destination_file,omitempty"`
 	ExpectedRefusal bool    `json:"expected_refusal,omitempty"`
+	Sender          string  `json:"sender,omitempty"`
+	After           *int    `json:"after,omitempty"`
+	AfterEvent      string  `json:"after_event,omitempty"`
 }
 
 type editProbePlan struct {
@@ -56,6 +59,7 @@ type editProbePlan struct {
 	Tool          string          `json:"tool"`
 	Language      string          `json:"language"`
 	Mode          string          `json:"mode"`
+	Sender        string          `json:"sender,omitempty"`
 	Repo          string          `json:"repo"`
 	Commit        string          `json:"commit"`
 	File          string          `json:"file"`
@@ -160,6 +164,9 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 	if kind == "relocate" && tool != "refactor.move" {
 		return editProbePlan{}, errors.New("relocation requires the explicit Go move adapter")
 	}
+	if err := editProbeNativeSender(c, kind, tool, count, editors); err != nil {
+		return editProbePlan{}, err
+	}
 	language := "go"
 	if filepath.Ext(c.File) == ".ts" {
 		language = "typescript"
@@ -233,13 +240,18 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 			return editProbePlan{}, errors.New("template must declare the unique marker function and actually call the selected intrafile callee")
 		}
 	}
-	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: kind, Tool: tool, Language: language, Mode: mode, Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", "native save/create/delete/hotfile/restart", "largest-file/reference configurations require their own reviewed manifest"}}
+	native := "native save/create/delete/hotfile/restart"
+	if c.EditSender != "" {
+		native = "other native senders run as their own cells"
+	}
+	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: kind, Tool: tool, Language: language, Mode: mode, Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", native, "largest-file/reference configurations require their own reviewed manifest"}}
 	if kind == "change_signature" && language != "go" {
 		p.NotSelected = append(p.NotSelected, "parameter detail is proved by exact source; native TS/Python signature metadata omits it and graph freshness uses the relative line witness")
 	}
 	if c.EditExpect == "refusal" {
 		p.NotSelected = append(p.NotSelected, "TypeScript/Python relocation is offered only as the product's explicit refusal; Go relocation is the supported move cell")
 	}
+	p.Sender = c.EditSender
 	if editors > 1 {
 		p.Editors, p.SessionModel = editors, editProbeFixedEditorModel
 		p.NotSelected = append(p.NotSelected, "several editors share one repository; 6-repository and linked-worktree routing are not implemented")
@@ -272,6 +284,9 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 		expectedGap := 0
 		if kind == "rename" || kind == "delete" || kind == "modify_body" || kind == "modify_caller_body" || kind == "change_signature" {
 			oldName := marker + "Before"
+			if c.EditSender == editProbeEditorSave {
+				oldName = editProbePlaceholder(seed, i)
+			}
 			beforeTemplate := c.EditTemplate
 			if kind == "modify_body" || kind == "modify_caller_body" || kind == "change_signature" {
 				beforeTemplate = c.EditBeforeTemplate
@@ -337,15 +352,20 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 			targetSymbol = c.EditDestination + "::" + beforeName
 			r = request{Tool: "refactor", Operation: "move", Arguments: map[string]any{"operation": "move", "target": map[string]any{"symbol": beforeSymbol}, "destination": c.EditDestination}}
 		}
-		if tool != "edit.batch" && tool != "refactor.move" {
-			r.Arguments["options"] = map[string]any{"mutation_id": id}
+		sender, after, afterEvent := editProbeNativeStep(c.EditSender, i)
+		if sender != "" {
+			r, id = editProbeNativeRequest(c.File, sender, r), ""
+		} else {
+			if tool != "edit.batch" && tool != "refactor.move" {
+				r.Arguments["options"] = map[string]any{"mutation_id": id}
+			}
+			r = editProbeWithOutput(r, mode)
 		}
-		r = editProbeWithOutput(r, mode)
 		hash, err := hashJSON(r)
 		if err != nil {
 			return editProbePlan{}, err
 		}
-		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Editor: arrival.Editor, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete", TargetSymbol: targetSymbol, FollowingSymbol: followingSymbol, ExpectedLineGap: expectedGap, Relocated: kind == "relocate", DestinationFile: c.EditDestination, ExpectedRefusal: c.EditExpect == "refusal"})
+		p.Steps = append(p.Steps, editProbeStep{Ordinal: i, ActivateNS: due - int64(editProbePeriod), DueNS: due, Editor: arrival.Editor, Marker: marker, MutationID: id, Request: r, RequestHash: hash, BeforeSymbol: beforeSymbol, Deleted: kind == "delete", TargetSymbol: targetSymbol, FollowingSymbol: followingSymbol, ExpectedLineGap: expectedGap, Relocated: kind == "relocate", DestinationFile: c.EditDestination, ExpectedRefusal: c.EditExpect == "refusal", Sender: sender, After: after, AfterEvent: afterEvent})
 	}
 	return p, nil
 }
