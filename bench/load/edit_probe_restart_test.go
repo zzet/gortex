@@ -42,11 +42,14 @@ func (f *editProbeFakeRestarter) start(context.Context) error {
 	return f.startErr
 }
 
-// The edit splices the fixture on disk. Its receipt reads pending (or
+// The edit splices the fixture on disk and, unless its receipt is already
+// terminal, holds its ACK until the restart, as a daemon waiting on the
+// receipt would. Status by mutation_id reads committed and pending (or
 // terminal) before the kill and is unknown to the restarted daemon. Sessions
 // opened before the kill (connections 1 and 2) must not be used after it.
 func editProbeRestartStub(t *testing.T, c Corpus, dir string, terminal bool, restarted *atomic.Bool) func(stubFrame) (any, *rpcError) {
 	disk := editProbeDiskStub(t, c, dir)
+	var committed atomic.Bool
 	return func(frame stubFrame) (any, *rpcError) {
 		args, _ := frame.Params["arguments"].(map[string]any)
 		if frame.Method != "" && restarted.Load() && frame.Connection <= 2 {
@@ -64,12 +67,22 @@ func editProbeRestartStub(t *testing.T, c Corpus, dir string, terminal bool, res
 			if err != nil {
 				t.Error(err)
 			}
-			return stubContent(map[string]any{"mutation_receipt": "receipt-1"}), nil
-		case frame.Params["name"] == "change":
-			if restarted.Load() {
-				return map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": "unknown receipt: receipt-1"}}}, nil
+			committed.Store(true)
+			for deadline := time.Now().Add(2 * time.Second); !terminal && !restarted.Load() && time.Now().Before(deadline); {
+				time.Sleep(time.Millisecond)
 			}
-			return stubContent(map[string]any{"graph_status_terminal": terminal, "graph_status": "pending"}), nil
+			return stubContent(map[string]any{"mutation_receipt": "receipt-1", "graph_status": "fresh"}), nil
+		case frame.Params["name"] == "change":
+			options, _ := args["options"].(map[string]any)
+			id, _ := options["mutation_id"].(string)
+			if restarted.Load() || !committed.Load() || id == "" {
+				return map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": "no mutation recorded for mutation_id " + id}}}, nil
+			}
+			graph := "pending"
+			if terminal {
+				graph = "fresh"
+			}
+			return stubContent(map[string]any{"found": true, "receipt": "receipt-1", "mutation_id": id, "disk_status": "committed", "graph_status": graph, "graph_status_terminal": terminal}), nil
 		}
 		return disk(frame)
 	}
@@ -117,11 +130,23 @@ func TestEditProbeRestartReopensSessionsAndNeverReusesPreKillAnswers(t *testing.
 	if record.Outcome != "complete" || len(record.Errors) != 0 || restart == nil || !restart.PendingBeforeKill || restart.Qualification != "" || !reflect.DeepEqual(fake.calls, []string{"kill", "start"}) {
 		t.Fatalf("restart cell did not complete after a pending kill: %+v %+v %v", record, restart, fake.calls)
 	}
-	if restart.KillNS == nil || restart.ReadyNS == nil || *restart.ReadyNS < *restart.KillNS || restart.Downtime.Value == nil || !strings.Contains(restart.StatusAfterError, "unknown receipt") || len(restart.StatusAfterRestart) == 0 || !restart.DiskHasMarker {
+	if restart.KillNS == nil || restart.ReadyNS == nil || *restart.ReadyNS < *restart.KillNS || restart.Downtime.Value == nil || !strings.Contains(restart.StatusAfterError, "no mutation recorded") || len(restart.StatusAfterRestart) == 0 || !restart.DiskHasMarker || !strings.Contains(string(restart.StatusBeforeKill), `"disk_status":"committed"`) {
 		t.Fatalf("restart evidence missing: %+v", restart)
 	}
-	if record.Ack.Value == nil || record.Readback.Value == nil || record.Accounting.State != "not_applicable_restart" || record.Derived.Value != nil {
+	// The daemon was killed while the edit's ACK was outstanding: no ACK time,
+	// the receipt comes from the committed status, and the abandoned call is
+	// censored rather than a workload error.
+	if record.Ack.Value != nil || record.Ack.Reason != "the daemon was killed while this edit's ACK was outstanding" || record.Receipt != "receipt-1" || record.Readback.Value == nil || record.Accounting.State != "not_applicable_restart" || record.Derived.Value != nil {
 		t.Fatalf("restart record timings: %+v", record)
+	}
+	var edits []string
+	for _, attempt := range run.phase.Attempts {
+		if attempt.Role == "workload" {
+			edits = append(edits, attempt.Outcome)
+		}
+	}
+	if !reflect.DeepEqual(edits, []string{"phase_censored"}) {
+		t.Fatalf("abandoned edit call reported as %v", edits)
 	}
 	for name, lap := range record.PhasesMS {
 		if lap.Value != nil {
@@ -137,7 +162,7 @@ func TestEditProbeRestartReopensSessionsAndNeverReusesPreKillAnswers(t *testing.
 	if run.editors[0] == before[0] || run.states[0].client == before[1] || len(run.restarted) != 2 {
 		t.Fatal("restart did not reopen the editor and prober sessions")
 	}
-	// The killed daemon's acknowledged write is on disk, so restore proceeds.
+	// The killed daemon's committed write is on disk, so restore proceeds.
 	run.phase.EditProbe.Records = []editProbeRecord{record}
 	if err := run.restore(t.Context()); err != nil || run.phase.EditProbe.RestoreMS.Value == nil {
 		t.Fatalf("restore after restart: %v", err)

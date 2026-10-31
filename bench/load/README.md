@@ -293,16 +293,22 @@ touch only the registered fixture file, or the step's own created file.
   one file at the same due time, taken from the single-editor stream. Lost
   writes are measured outcomes.
 - `restart` (`--edit-count 1`, one editor, no readers, JSON `edit.file` call
-  addition): right after the ACK, one status read of the edit's own receipt
-  must show it pending; otherwise the record is qualified `receipt terminal
-  before kill` and fails. The owned daemon is then killed, restarted on the same
-  store and awaited until ready, and the editor and prober sessions are
-  reopened. Probes pause during the downtime. First-correct times come only from
-  the restarted daemon, from send and from ready, and answers before the kill
-  are kept apart. The old receipt's status after the restart is recorded
-  verbatim, the acknowledged marker must be on disk, and the interrupted receipt
-  reports no phases, accounting or derived time. Process counters cover the
-  pre-kill daemon only.
+  addition): the edit ACK waits for its graph receipt, so the cell does not
+  wait for it. While the ACK is outstanding, the edit's status is polled by its
+  `mutation_id` every 5 ms; once the bytes are committed and the receipt is not
+  yet terminal, the harness stops waiting for the ACK and kills the owned
+  daemon. `t_ack_ms` is then unavailable and the abandoned call is counted
+  censored, not as an error. An ACK that returns first leaves one status read
+  just before the kill to decide: a receipt already terminal there qualifies
+  the record `receipt terminal before kill` and it fails. The daemon is
+  restarted on the same store and awaited until ready, and the editor and
+  prober sessions are reopened. Probes pause during the downtime. First-correct
+  times come only from the restarted daemon, from send and from ready, and
+  answers before the kill are kept apart. The status after the restart is
+  recorded verbatim, the committed marker must be on disk, and the interrupted
+  receipt reports no phases, accounting or derived time. The run-level receipt
+  after the workload is taken on the reopened editor. Process counters cover
+  the pre-kill daemon only.
 
 Each edit-and-probe report names its `role`. A standalone run is the candidate
 unless `--edit-probe-role baseline` is given; the paired command assigns roles

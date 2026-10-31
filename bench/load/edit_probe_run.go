@@ -605,6 +605,10 @@ func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
 		r.doNativeWrite(ctx, step)
 		return
 	}
+	if r.plan.Sender == editProbeRestart {
+		r.doRestartEdit(ctx, step)
+		return
+	}
 	r.editsInFlight.Add(1)
 	defer r.editsInFlight.Add(-1)
 	s, callCtx, cancel, started := r.beginEdit(ctx, step)
@@ -698,10 +702,6 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	}
 	s.mu.Unlock()
 	s.signalAck()
-	if r.plan.Sender == editProbeRestart {
-		r.finishRestart(ctx, callCtx, s, step, started, receipt)
-		return
-	}
 	readbackKinds := []string{"file", "source"}
 	if step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
 		readbackKinds = append(readbackKinds, "old_source_absent")
@@ -1007,7 +1007,7 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
 	for _, record := range r.phase.EditProbe.Records {
 		if record.NativeWrite != nil || record.Restart != nil && record.Restart.DiskHasMarker {
-			continue // A native write ended before its record did; a killed daemon's acknowledged write is on disk.
+			continue // A native write ended before its record did; a killed daemon's committed write is on disk.
 		}
 		if (record.Receipt == "" && record.Batch == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")

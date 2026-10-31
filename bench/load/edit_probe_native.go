@@ -18,7 +18,7 @@ const (
 	editProbeEditorSave     = "editor_save"
 	editProbeCreateDelete   = "create_delete"
 	editProbeHotFile        = "hot_file" // MCP edits; only the arrivals are shaped
-	editProbeRestart        = "restart"  // one MCP edit; the daemon is killed while its receipt is pending
+	editProbeRestart        = "restart"  // one MCP edit; the daemon is killed while its ACK and receipt are pending
 )
 
 type editProbeFileIdentity struct {
@@ -121,7 +121,7 @@ func editProbePlaceholder(seed int64, ordinal int) string {
 
 func editProbeNativeLimitations(sender string) []string {
 	if sender == editProbeRestart {
-		return []string{"the restart cell reads the edit's own receipt status once after its ACK, kills the owned daemon, restarts it on the same store and reopens the editor and prober sessions; probes pause from the kill until the restarted daemon is ready, so no probe error is attributed to the downtime", "first-correct times are post-restart probe answers, from send and from ready; answers before the kill are kept separately and never count as first-correct", "a receipt already terminal before the kill qualifies the record instead of passing; the interrupted receipt has no phases, accounting or derived time, and process counters and peaks cover the pre-kill daemon only"}
+		return []string{"the restart cell polls its edit's status by mutation_id while the ACK is outstanding and kills the owned daemon once the bytes are committed and the graph receipt is not yet terminal; the harness stops waiting for that ACK, so t_ack is unavailable and the abandoned call is counted censored, not as an error", "the daemon is restarted on the same store and the editor and prober sessions are reopened; probes pause from the kill until the restarted daemon is ready, so no probe error is attributed to the downtime", "first-correct times are post-restart probe answers, from send and from ready; answers before the kill are kept separately and never count as first-correct", "a receipt already terminal at the last status read before the kill (as when the ACK returns first) qualifies the record instead of passing; the interrupted receipt has no phases, accounting or derived time, and process counters and peaks cover the pre-kill daemon only"}
 	}
 	if sender == editProbeHotFile {
 		return []string{"two fixed editors send each pair of edits to one file at the same due time; every edit keeps its own ACK, receipt and accounting, and a lost write is a measured outcome"}

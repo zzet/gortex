@@ -648,8 +648,10 @@ Native and lifecycle cells change files around MCP: a shell write after a tool
 edit, a same-size editor save, and Go file create/delete pairs. Their records
 have no acknowledgement or receipt, so ACK, phases and derived time are
 unavailable; each keeps its own write window and file identity instead. The
-restart cell kills the daemon while the edit's receipt is pending and reports
-post-restart first-correct times from send and from ready; a receipt that was
-already terminal before the kill qualifies the record rather than passing.
+restart cell kills the daemon while the edit's ACK is outstanding and its
+committed bytes still have a pending receipt (the ACK itself waits for that
+receipt), and reports post-restart first-correct times from send and from
+ready; a receipt that was already terminal before the kill qualifies the record
+rather than passing.
 TypeScript and Python relocation is measured as the product's exact refusal
 with unchanged bytes.
