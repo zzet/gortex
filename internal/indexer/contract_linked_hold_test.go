@@ -220,3 +220,50 @@ func TestContractLinkedPolicyLeavesPrimaryActorsAlone(t *testing.T) {
 	require.Equal(t, [2]bool{true, false}, <-waiting, "a held linked actor is not waiting for the slot")
 	require.True(t, h.held(linked.Actor))
 }
+
+// TestContractLinkedThrottledRunsOneJobAndSpacesStarts: under the throttled
+// policy demand does not matter; at most one linked job is in flight even
+// with a free job slot, and one linked actor starts at most once per
+// interval.
+func TestContractLinkedThrottledRunsOneJobAndSpacesStarts(t *testing.T) {
+	h := newLinkedHoldProbe(t, ContractLinkedThrottled, func(options *ContractAnalysisCoordinatorOptions) { options.JobSlots = 2 })
+	h.outcome = func(key string, n int) string {
+		if key == "r1/wt1@k" && n == 1 {
+			return viewmetrics.ContractJobFillContinued
+		}
+		return viewmetrics.ContractJobPublished
+	}
+	deferred := linkedCounter(ContractLinkedThrottled, viewmetrics.ContractLinkedDeferred)
+	started := linkedCounter(ContractLinkedThrottled, viewmetrics.ContractLinkedStarted)
+	h.busy.Store(true)
+	h.hold("r1/wt1@k")
+	h.hold("r2/wt2@k")
+	first := h.scheduleLinked(t.Context(), "wt1", "r1", "k", false)
+	h.waitStarts(1)
+	second := h.scheduleLinked(t.Context(), "wt2", "r2", "k", false)
+	h.settle("r2")
+	require.True(t, h.held(second.Actor), "one linked job is in flight already")
+	require.Equal(t, deferred+1, linkedCounter(ContractLinkedThrottled, viewmetrics.ContractLinkedDeferred))
+
+	// The first job stops at a checkpoint and is requeued: the held actor
+	// takes its turn, and the first waits for its interval.
+	h.release("r1/wt1@k")
+	require.Equal(t, []string{"r1/wt1@k", "r2/wt2@k"}, h.waitStarts(2))
+	require.Eventually(t, func() bool { return h.held(first.Actor) }, 10*time.Second, time.Millisecond)
+	h.release("r2/wt2@k")
+	require.Equal(t, ContractActorPublished, h.wait(second).Result)
+	h.advance(29900 * time.Millisecond)
+	h.settle("r1")
+	require.True(t, h.held(first.Actor), "the interval since its last start has not passed")
+	require.Len(t, h.started(), 2)
+	h.advance(100 * time.Millisecond)
+	h.settle("r1")
+	require.Equal(t, ContractActorPublished, h.wait(first).Result)
+	require.Equal(t, []string{"r1/wt1@k", "r2/wt2@k", "r1/wt1@k"}, h.started())
+	h.mu.Lock()
+	require.Equal(t, 1, h.maxAll, "linked jobs never overlapped")
+	h.mu.Unlock()
+	require.Equal(t, deferred+2, linkedCounter(ContractLinkedThrottled, viewmetrics.ContractLinkedDeferred))
+	require.Equal(t, started+3, linkedCounter(ContractLinkedThrottled, viewmetrics.ContractLinkedStarted))
+	require.Zero(t, h.samples.Load(), "the throttled policy never asks for demand")
+}

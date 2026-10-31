@@ -334,8 +334,9 @@ type contractActor struct {
 	interestExpired bool
 	// held is set while a queued linked actor waits for its linked policy
 	// to let it start (contract_linked_schedule.go); leaving the queue
-	// clears it.
-	held bool
+	// clears it. linkedStartedAt is when a linked actor was last picked.
+	held            bool
+	linkedStartedAt time.Time
 	// A lost/rejected partial checkpoint must not restart the same prefix forever.
 	fillNeedsCheckpoint bool
 	fillCheckpoint      ContractFillCheckpointStatus
@@ -671,7 +672,7 @@ func (c *ContractAnalysisCoordinator) retryAfterLocked() time.Duration {
 // setStateLocked moves an actor to state, stepping the capacity epoch when it
 // leaves pending or running work.
 func (c *ContractAnalysisCoordinator) setStateLocked(a *contractActor, state contractActorState) {
-	had := a.hasWork()
+	had, was := a.hasWork(), a.state
 	a.state = state
 	if state != contractActorDeferred {
 		a.deferred = ""
@@ -693,6 +694,9 @@ func (c *ContractAnalysisCoordinator) setStateLocked(a *contractActor, state con
 	if a.dirty && state != contractActorRunning && state != contractActorCapturing {
 		// A Published that arrived during the job is captured now.
 		a.ring.signal()
+	}
+	if !a.primary() && c.options.LinkedPolicy == ContractLinkedThrottled && (was == contractActorCapturing || was == contractActorRunning) && state != contractActorCapturing && state != contractActorRunning {
+		c.wakeHeldLocked()
 	}
 	a.notifyLocked()
 }
@@ -1033,6 +1037,9 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 	want := next.want
 	next.want.source = nil
 	next.running.contractActorKeySeq = contractActorKeySeq{want.key, want.seq}
+	if !next.primary() {
+		next.linkedStartedAt = now
+	}
 	trigger, triggeredAt := next.trigger, next.triggeredAt
 	c.setStateLocked(next, contractActorCapturing)
 	c.mu.Unlock()

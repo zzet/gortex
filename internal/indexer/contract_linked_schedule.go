@@ -61,8 +61,34 @@ func (c *ContractAnalysisCoordinator) linkedHoldLocked(a *contractActor, now tim
 		if remaining := c.options.LinkedIdleWindow - now.Sub(c.lastDemand); remaining > 0 {
 			return true, min(remaining, contractDemandPoll)
 		}
+	case ContractLinkedThrottled:
+		// One linked job in flight: the one in flight wakes the held when
+		// it leaves (wakeHeldLocked).
+		for _, other := range c.actors {
+			if other != a && !other.primary() && (other.state == contractActorCapturing || other.state == contractActorRunning) {
+				return true, 0
+			}
+		}
+		if !a.linkedStartedAt.IsZero() {
+			if remaining := c.options.LinkedThrottleInterval - now.Sub(a.linkedStartedAt); remaining > 0 {
+				return true, remaining
+			}
+		}
 	}
 	return false, 0
+}
+
+// wakeHeldLocked signals every ring that holds an actor, when a linked job
+// that throttled them leaves its slot.
+func (c *ContractAnalysisCoordinator) wakeHeldLocked() {
+	for _, ring := range c.rings {
+		for _, queued := range ring.queue {
+			if queued.held {
+				ring.signal()
+				break
+			}
+		}
+	}
 }
 
 // linkedHeldLocked reports whether a's linked policy holds it at now.
