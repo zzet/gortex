@@ -174,6 +174,7 @@ A gateway preset is a built-in, ready-made custom provider for a well-known Open
 | `llm-buzz` | `https://api.llm.buzz/api/v1` | `openai/gpt-5.4-mini` | `LLM_BUZZ_API_KEY` | `frontier` |
 | `opper` | `https://api.opper.ai/v3/compat` | `gpt-6.1-terra` | `OPPER_API_KEY` | `frontier` |
 | `requesty` | `https://router.requesty.ai/v1` (EU: `https://router.eu.requesty.ai/v1`) | `openai/gpt-4o-mini` | `REQUESTY_API_KEY` | `frontier` |
+| `runcrate` | `https://api.runcrate.ai/v1` | `deepseek-ai/DeepSeek-V4.1-Flash` | `RUNCRATE_API_KEY` | `frontier` |
 
 When `llm.provider` names `X`, gortex resolves it in this order: a true built-in provider `X` → your custom provider `X` (global `providers.json`, the opt-in repo-local one, or inline `llm.custom.X`) → the preset `X`. Your own entry always wins over a same-named preset, as a whole — no preset field leaks into it. `GORTEX_LLM_MODEL` / `GORTEX_LLM_EFFORT` apply on top of whichever entry is resolved.
 

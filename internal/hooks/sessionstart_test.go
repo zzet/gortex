@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/profiles"
@@ -131,6 +132,72 @@ func TestRenderCwdCoverageWaitsForAutomaticFamilyCheckout(t *testing.T) {
 	unrelatedGuidance := renderCwdCoverage(unrelated, status)
 	if !strings.Contains(unrelatedGuidance, "gortex track "+unrelated) {
 		t.Fatalf("truly unrelated directory lost explicit-track guidance:\n%s", unrelatedGuidance)
+	}
+}
+
+// A linked worktree the daemon already routes to its own composed view is
+// absent from tracked repos; the briefing must follow the daemon's view, not
+// report discovery as pending (#933).
+func TestRenderCwdCoverageReportsRoutedAutomaticCheckout(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	main := filepath.Join(t.TempDir(), "main")
+	if err := os.MkdirAll(main, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionGuidanceGit(t, main, "init", "-q", "-b", "main")
+	sessionGuidanceGit(t, main, "config", "user.email", "test@example.com")
+	sessionGuidanceGit(t, main, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(main, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sessionGuidanceGit(t, main, "add", ".")
+	sessionGuidanceGit(t, main, "commit", "-q", "-m", "initial")
+	linked := filepath.Join(t.TempDir(), "linked")
+	sessionGuidanceGit(t, main, "worktree", "add", "-q", "-b", "feature", linked)
+
+	previous := dirCoverageFn
+	t.Cleanup(func() { dirCoverageFn = previous })
+	dirCoverageFn = func(string, time.Duration) (daemon.DirCoverageResult, bool) {
+		return daemon.DirCoverageResult{Answered: true, Tracked: true, View: &daemon.ProbeView{
+			Kind: daemon.ProbeViewWorktree, CheckoutID: "ck-linked", RepoPrefix: "main", Exact: true,
+		}}, true
+	}
+
+	status := &daemon.StatusResponse{Ready: true, TrackedRepos: []daemon.TrackedRepoStatus{{Name: "main", Path: main}}}
+	got := renderCwdCoverage(linked, status)
+	if strings.Contains(got, "discovery is pending") || !strings.Contains(got, "is tracked") {
+		t.Fatalf("routed automatic checkout reported as pending:\n%s", got)
+	}
+	withFakeStatus(t, func() (*daemon.StatusResponse, error) { return status, nil })
+	if hint := buildStaleIndexHint(linked); hint != "" {
+		t.Fatalf("routed automatic checkout got a stale-index hint: %s", hint)
+	}
+
+	dirCoverageFn = func(string, time.Duration) (daemon.DirCoverageResult, bool) {
+		return daemon.DirCoverageResult{Tracked: true, View: &daemon.ProbeView{
+			Kind: daemon.ProbeViewUnrouted, Exact: false, FallbackReason: daemon.FallbackViewBuilding,
+		}}, true
+	}
+	if got := renderCwdCoverage(linked, status); !strings.Contains(got, "Checkout discovery is pending") {
+		t.Fatalf("unrouted automatic checkout lost pending guidance:\n%s", got)
+	}
+}
+
+// During warmup the daemon reports a tracked repo with no Name and zero
+// nodes; the briefing must name it by prefix and say it is loading (#933).
+func TestRenderCwdCoverageNamesUnnamedLoadingRepo(t *testing.T) {
+	repo := t.TempDir()
+	status := &daemon.StatusResponse{TrackedRepos: []daemon.TrackedRepoStatus{{
+		Prefix: "gortex", Path: repo, Workspace: "gortex", Unloaded: true, Loading: true,
+	}}}
+	got := renderCwdCoverage(repo, status)
+	if !strings.Contains(got, "as repo `gortex`") || !strings.Contains(got, "still loading") || strings.Contains(got, "0 nodes") {
+		t.Fatalf("unnamed loading repo misreported:\n%s", got)
+	}
+	if lean := renderLeanReadiness(repo, status); !strings.Contains(lean, "tracked as `gortex`") {
+		t.Fatalf("lean readiness lost the repo name:\n%s", lean)
 	}
 }
 
