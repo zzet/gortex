@@ -98,10 +98,12 @@ type contractAnalysisJob struct {
 	// idle policy governs parks without a progress slice.
 	yield func(context.Context) error
 	// linkedPolicy names the policy a linked actor's job ran under, empty
-	// for a primary actor. demandSeen is set once the job's yield met
-	// foreground demand; demandStop when its last checkpoint question was
-	// answered yes for demand alone.
+	// for a primary actor; strict is set when a strict request started it.
+	// demandSeen is set once the job's yield met foreground demand;
+	// demandStop when its last checkpoint question was answered yes for
+	// demand alone.
 	linkedPolicy           ContractLinkedPolicy
+	strict                 bool
 	demandSeen, demandStop atomic.Bool
 }
 

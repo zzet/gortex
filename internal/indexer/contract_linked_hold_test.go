@@ -68,7 +68,7 @@ func linkedProbeInputs(checkout string, repos []string, key string) *graphview.S
 // of its own, as a worktree request does.
 func (h *linkedHoldProbe) scheduleLinked(ctx context.Context, checkout, repo, key string, strict bool) ContractScheduleResult {
 	h.t.Helper()
-	result, err := h.c.Schedule(ctx, ContractScheduleRequest{Actor: NewContractActor(checkout, []string{repo}), Key: graph.ContractAttachmentKey{RepoPrefix: repo, CheckoutID: checkout}, Inputs: linkedProbeInputs(checkout, []string{repo}, key), Source: &ContractCaptureSource{onRelease: func() { h.released.Add(1) }}, Epoch: h.c.InputEpoch()})
+	result, err := h.c.Schedule(ctx, ContractScheduleRequest{Actor: NewContractActor(checkout, []string{repo}), Key: graph.ContractAttachmentKey{RepoPrefix: repo, CheckoutID: checkout}, Inputs: linkedProbeInputs(checkout, []string{repo}, key), Source: &ContractCaptureSource{onRelease: func() { h.released.Add(1) }}, Epoch: h.c.InputEpoch(), Strict: strict})
 	require.NoError(h.t, err)
 	return result
 }
@@ -301,12 +301,12 @@ func (h *linkedHoldProbe) parkedYield(job *contractAnalysisJob) (returned chan e
 	}
 }
 
-func receiveYield(returned chan error) (error, bool) {
+func receiveYield(returned chan error) (bool, error) {
 	select {
 	case err := <-returned:
-		return err, true
+		return true, err
 	case <-time.After(10 * time.Second):
-		return nil, false
+		return false, nil
 	}
 }
 
@@ -343,7 +343,7 @@ func TestContractLinkedIdleFillStopsAtCheckpointAndResumesWithProgress(t *testin
 			returned, parked := h.parkedYield(job)
 			seen.parked = parked
 			h.busy.Store(false)
-			seen.err, seen.returned = receiveYield(returned)
+			seen.returned, seen.err = receiveYield(returned)
 			seen.stop = job.otherActorWaiting()
 			unit := &contractUnit{path: "r/file.go"}
 			job.delta.cache = &contractDeltaCache{identity: job.delta.identity, units: map[string]*contractUnit{unit.path: unit}, continuation: &contractFillContinuation{identity: job.delta.identity, units: []contractFillUnitProof{{unit: unit}}}}
@@ -381,10 +381,10 @@ func TestContractLinkedIdleFillStopsAtCheckpointAndResumesWithProgress(t *testin
 			returned, parked := h.parkedYield(job)
 			o.parked = parked
 			h.advance(contractLinkedParkMax)
-			_, o.bounded = receiveYield(returned)
+			o.bounded, _ = receiveYield(returned)
 			again := make(chan error, 1)
 			go func() { again <- job.yield(context.Background()) }()
-			_, o.immediate = receiveYield(again)
+			o.immediate, _ = receiveYield(again)
 			h.busy.Store(false)
 			seen <- o
 			return h.run(job)
@@ -405,7 +405,7 @@ func TestContractLinkedIdleFillStopsAtCheckpointAndResumesWithProgress(t *testin
 			}
 			returned, parked := h.parkedYield(job)
 			parkedCh <- parked
-			_, ok := receiveYield(returned)
+			ok, _ := receiveYield(returned)
 			ended <- [2]bool{ok, job.otherActorWaiting()}
 			return h.run(job)
 		}
@@ -415,5 +415,74 @@ func TestContractLinkedIdleFillStopsAtCheckpointAndResumesWithProgress(t *testin
 		require.Equal(t, [2]bool{true, true}, <-ended, "a primary waiting for the slot ends the park and the fill")
 		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
 		require.Equal(t, ContractActorPublished, h.wait(primary).Result)
+	})
+}
+
+// TestContractLinkedStrictRequestsBypassDeferral: a request whose caller
+// waits for fresh results starts its linked actor's job at once under every
+// policy, for the rest of the caller's budget only.
+func TestContractLinkedStrictRequestsBypassDeferral(t *testing.T) {
+	for _, policy := range []ContractLinkedPolicy{ContractLinkedIdle, ContractLinkedThrottled} {
+		t.Run(string(policy), func(t *testing.T) {
+			h := newLinkedHoldProbe(t, policy, nil)
+			h.busy.Store(true)
+			if policy == ContractLinkedThrottled {
+				// A first job opens the actor's throttle interval.
+				require.Equal(t, ContractActorPublished, h.wait(h.scheduleLinked(t.Context(), "wt", "r", "k0", false)).Result)
+			}
+			before := len(h.started())
+			strictStarted := linkedCounter(policy, viewmetrics.ContractLinkedStrictStarted)
+			held := h.scheduleLinked(t.Context(), "wt", "r", "k1", false)
+			h.settle("r")
+			require.True(t, h.held(held.Actor))
+			h.hold("r/wt@k1")
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			strict := h.scheduleLinked(ctx, "wt", "r", "k1", true)
+			require.Equal(t, ContractCoalesced, strict.Result)
+			require.Equal(t, held.ArrivalSeq, strict.ArrivalSeq)
+			require.Equal(t, "r/wt@k1", h.waitStarts(before + 1)[before], "a strict request releases the hold at once")
+			require.Equal(t, strictStarted+1, linkedCounter(policy, viewmetrics.ContractLinkedStrictStarted))
+			h.release("r/wt@k1")
+			require.Equal(t, ContractActorPublished, h.wait(strict).Result)
+
+			// The exemption ends with the strict caller's budget.
+			h.advance(2 * time.Second)
+			later := h.scheduleLinked(t.Context(), "wt", "r", "k2", false)
+			h.settle("r")
+			require.True(t, h.held(later.Actor), "a lapsed strict marker holds again")
+			require.Len(t, h.started(), before+1)
+		})
+	}
+
+	t.Run("a_strict_request_ends_a_park", func(t *testing.T) {
+		var shared atomic.Int64
+		h := newLinkedHoldProbe(t, ContractLinkedIdle, func(options *ContractAnalysisCoordinatorOptions) {
+			options.Yield = func(ctx context.Context) error {
+				shared.Add(1)
+				return ctx.Err()
+			}
+		})
+		h.advance(5 * time.Second)
+		parkedCh := make(chan bool, 1)
+		ended := make(chan [3]bool, 1)
+		h.c.run = func(job *contractAnalysisJob) string {
+			returned, parked := h.parkedYield(job)
+			parkedCh <- parked
+			ok, _ := receiveYield(returned)
+			calls := shared.Load()
+			err := job.yield(context.Background())
+			ended <- [3]bool{ok, err == nil && shared.Load() == calls+1, !job.otherActorWaiting()}
+			h.busy.Store(false)
+			return h.run(job)
+		}
+		linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
+		require.True(t, <-parkedCh)
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		strict := h.scheduleLinked(ctx, "wt", "r", "k", true)
+		require.Equal(t, ContractRunning, strict.Result)
+		require.Equal(t, [3]bool{true, true, true}, <-ended, "a strict request ends the park, restores the shared yield and keeps the fill going")
+		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
 	})
 }

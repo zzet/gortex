@@ -23,6 +23,9 @@ import (
 //     least the throttle interval apart. The idle window does not apply.
 //   - eager: as a primary actor.
 //
+// A strict request, whose caller waits for fresh results, exempts its actor
+// from every policy for the rest of the caller's budget.
+//
 // Requests and Published events still record interest and wanted inputs
 // while an actor is held; only the start waits. A linked fill the idle
 // policy started yields to demand without the progress slice the shared
@@ -62,7 +65,7 @@ func (c *ContractAnalysisCoordinator) linkedDemand(a *contractActor) bool {
 // linkedHoldLocked reports whether a's linked policy holds it at now, and
 // when to look again; zero waits for a signal.
 func (c *ContractAnalysisCoordinator) linkedHoldLocked(a *contractActor, now time.Time) (bool, time.Duration) {
-	if a.primary() || c.options.LinkedInputs == nil {
+	if a.primary() || c.options.LinkedInputs == nil || now.Before(a.strictUntil) {
 		return false, 0
 	}
 	switch c.options.LinkedPolicy {
@@ -171,7 +174,7 @@ func (c *ContractAnalysisCoordinator) linkJob(a *contractActor, job *contractAna
 				job.demandStop.Store(false)
 				return true
 			}
-			stop := job.demandSeen.Load()
+			stop := job.demandSeen.Load() && !c.strict(a)
 			job.demandStop.Store(stop)
 			return stop
 		}
@@ -187,6 +190,9 @@ func (c *ContractAnalysisCoordinator) linkedYield(a *contractActor, job *contrac
 	return func(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if c.strict(a) {
+			return c.options.Yield(ctx)
 		}
 		if !c.options.Demand() {
 			return nil
@@ -211,7 +217,7 @@ func (c *ContractAnalysisCoordinator) linkedYield(a *contractActor, job *contrac
 }
 
 // linkedParkEnds records a demand sample of a parked linked job and reports
-// whether another actor waits for its slot.
+// whether another actor waits for its slot or a strict request arrived.
 func (c *ContractAnalysisCoordinator) linkedParkEnds(a *contractActor, busy bool) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -219,7 +225,31 @@ func (c *ContractAnalysisCoordinator) linkedParkEnds(a *contractActor, busy bool
 	if busy {
 		c.lastDemand = now
 	}
-	return c.otherActorWaitingLocked(a, now)
+	return now.Before(a.strictUntil) || c.otherActorWaitingLocked(a, now)
+}
+
+// strict reports whether a strict request's budget exempts a's jobs now.
+func (c *ContractAnalysisCoordinator) strict(a *contractActor) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now().Before(a.strictUntil)
+}
+
+// markStrictLocked exempts a's jobs from its linked policy for the rest of a
+// strict request's budget, at most the interest TTL, and wakes its ring so
+// a held actor starts at once. The budget is a duration, so it is added to
+// the coordinator's own clock.
+func (c *ContractAnalysisCoordinator) markStrictLocked(ctx context.Context, a *contractActor, now time.Time) {
+	budget := contractInterestTTL
+	if deadline, ok := ctx.Deadline(); ok {
+		budget = min(budget, time.Until(deadline))
+	}
+	if until := now.Add(budget); until.After(a.strictUntil) {
+		a.strictUntil = until
+	}
+	if a.state == contractActorQueued {
+		a.ring.signal()
+	}
 }
 
 // linkedStartFields are a linked job's start log fields.
@@ -227,7 +257,7 @@ func (job *contractAnalysisJob) linkedStartFields() []zap.Field {
 	if job.linkedPolicy == "" {
 		return nil
 	}
-	return []zap.Field{zap.String("policy", string(job.linkedPolicy))}
+	return []zap.Field{zap.String("policy", string(job.linkedPolicy)), zap.Bool("strict", job.strict)}
 }
 
 // linkedEndFields are a linked job's completion log fields: demand_stop is
@@ -245,12 +275,17 @@ func (job *contractAnalysisJob) stoppedForDemand(outcome string) bool {
 	return outcome == viewmetrics.ContractJobFillContinued && job.demandStop.Load()
 }
 
-// countLinkedStartLocked counts a linked actor's job body about to start.
-func (c *ContractAnalysisCoordinator) countLinkedStartLocked(a *contractActor) {
+// countLinkedStartLocked counts a linked actor's job body about to start,
+// apart when a strict request started it.
+func (c *ContractAnalysisCoordinator) countLinkedStartLocked(a *contractActor, job *contractAnalysisJob) {
 	if a.primary() {
 		return
 	}
-	countContractLinkedJob(c.options.LinkedPolicy, viewmetrics.ContractLinkedStarted)
+	event := viewmetrics.ContractLinkedStarted
+	if job.strict = c.now().Before(a.strictUntil); job.strict {
+		event = viewmetrics.ContractLinkedStrictStarted
+	}
+	countContractLinkedJob(c.options.LinkedPolicy, event)
 }
 
 // releaseContractSources releases handoff sources taken under c.mu.

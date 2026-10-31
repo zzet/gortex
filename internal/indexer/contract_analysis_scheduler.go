@@ -149,6 +149,10 @@ type ContractScheduleRequest struct {
 	// PriorityTarget is an explicit response-target hint. Accepted edits are
 	// prioritized independently, including actors reached through repo: *.
 	PriorityTarget bool
+	// Strict marks a request whose caller waits on this request's promise.
+	// For the rest of the caller's budget, at most the interest TTL, the
+	// actor's jobs start and run outside its linked policy.
+	Strict bool
 }
 
 // ContractScheduleOutcome is what Schedule did with a request.
@@ -337,6 +341,9 @@ type contractActor struct {
 	// clears it. linkedStartedAt is when a linked actor was last picked.
 	held            bool
 	linkedStartedAt time.Time
+	// strictUntil is when the last strict request's budget ends: until then
+	// no linked policy holds or stops the actor's jobs.
+	strictUntil time.Time
 	// A lost/rejected partial checkpoint must not restart the same prefix forever.
 	fillNeedsCheckpoint bool
 	fillCheckpoint      ContractFillCheckpointStatus
@@ -546,6 +553,9 @@ func (c *ContractAnalysisCoordinator) Schedule(ctx context.Context, req Contract
 		a = c.registerLocked(req.Actor, now)
 	}
 	a.interestUntil, a.lastUsed = now.Add(contractInterestTTL), now
+	if req.Strict {
+		c.markStrictLocked(ctx, a, now)
+	}
 	defer func() {
 		if label == viewmetrics.ContractRequestAdmitted || label == viewmetrics.ContractRequestCoalesced {
 			switch {
@@ -1685,7 +1695,7 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 		return
 	}
 	c.setStateLocked(a, contractActorRunning)
-	c.countLinkedStartLocked(a)
+	c.countLinkedStartLocked(a, job)
 	c.mu.Unlock()
 	run := c.execute
 	if c.run != nil {
