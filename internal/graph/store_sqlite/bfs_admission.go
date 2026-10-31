@@ -44,7 +44,8 @@ func bfsAdmissionNeighborColumns(alias string) string {
 // far-end test is a covering-index probe: a WITHOUT ROWID index entry ends in
 // the node id, so a probe never reads the wide nodes row, whose payload can
 // spill to overflow pages. hydrated is the only full-row read, one seek per
-// distinct walked node.
+// distinct walked node, apart from a workspace gate's: the seed's row and the
+// row of each neighbor outside the seed's repository.
 func bfsAdmissionQuery(generation int64, request graph.BFSAdmissionRequest, filter graph.OutlineEdgeFilter) outlineQuery {
 	states, edges, _ := graph.BFSAdmissionBudgets(request)
 	anchor, next, index := bfsAdmissionColumns(request.Direction)
@@ -72,14 +73,30 @@ func bfsAdmissionQuery(generation int64, request graph.BFSAdmissionRequest, filt
 	present := func(id string) {
 		add(`EXISTS (SELECT 1 FROM nodes AS n INDEXED BY nodes_by_generation WHERE n.view_gen = ? AND n.id = `+id+`)`, generation)
 	}
-	// Only the repository narrow gates the walk. Go admit checks workspace and
-	// project scope on every neighbor it reads, before recording its edge.
+	// A repository narrow, or else a workspace scope, gates the walk with a
+	// superset of the scope. Go admit checks the exact workspace and project
+	// scope on every neighbor it reads, before recording its edge.
 	inScope := present
-	if len(request.Scope.RepoAllow) > 0 {
+	workspaceGate := false
+	switch {
+	case len(request.Scope.RepoAllow) > 0:
 		repos := outlineReposJSON(request.Scope)
 		inScope = func(id string) {
 			add(`EXISTS (SELECT 1 FROM nodes AS n INDEXED BY nodes_by_repo
 			WHERE n.repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?)) AND n.view_gen = ? AND n.id = `+id+`)`, repos, generation)
+		}
+	case request.Scope.WorkspaceID != "":
+		// A neighbor in the seed's repository passes on a covering probe. Any
+		// other is checked against the scope on its own row, so the walk
+		// stops at the workspace boundary instead of following edges into
+		// every repository they reach.
+		workspaceGate = true
+		scope, scopeArgs := outlineScopePredicate(request.Scope, "n")
+		inScope = func(id string) {
+			add(`(EXISTS (SELECT 1 FROM nodes AS n INDEXED BY nodes_by_repo
+			WHERE n.repo_prefix = (SELECT repo FROM seed) AND n.view_gen = ? AND n.id = `+id+`)
+			OR EXISTS (SELECT 1 FROM nodes AS n WHERE n.id = `+id+` AND n.view_gen = ? AND `+scope+`))`,
+				append([]any{generation, generation}, scopeArgs...)...)
 		}
 	}
 	edgeMask, edgeMaskArgs := outlineEdgePredicate(graph.OutlineEdgeFilter{ExcludeKinds: filter.ExcludeKinds, ExcludeNodeIDs: filter.ExcludeNodeIDs}, "", "")
@@ -92,8 +109,13 @@ func bfsAdmissionQuery(generation int64, request graph.BFSAdmissionRequest, filt
 	// Unresolved edges remain in final adjacency for boundary reconstruction.
 	resolved := `e.` + next + ` NOT GLOB 'unresolved::*' AND instr(e.` + next + `, '::unresolved::') = 0 AND e.` + next + ` NOT GLOB 'external::*'`
 
+	add(`WITH RECURSIVE `)
+	if workspaceGate {
+		add(`seed(repo) AS MATERIALIZED (SELECT n.repo_prefix FROM nodes AS n WHERE n.id = ? AND n.view_gen = ?),
+		`, request.Seed, generation)
+	}
 	// A seed reached again adds no shorter path, only repeated states.
-	add(`WITH RECURSIVE walk(id, depth) AS (
+	add(`walk(id, depth) AS (
 		SELECT ?, 0 WHERE 1`, request.Seed)
 	unmasked(`?`, request.Seed)
 	add(`
@@ -124,8 +146,8 @@ func bfsAdmissionQuery(generation int64, request graph.BFSAdmissionRequest, filt
 	visible()
 	unmasked(`e.` + next)
 	// A row survives when its far end was walked, is the seed, is an unmasked
-	// unresolved boundary, or is missing; a resolved node outside the narrow
-	// or with a masked kind is dropped. Overflow keeps rows for the sentinel.
+	// unresolved boundary, or is missing; a resolved node outside the gate or
+	// with a masked kind is dropped. Overflow keeps rows for the sentinel.
 	add(` LIMIT `+limit+`)) END AS n
 		FROM ok CROSS JOIN raw AS r)
 		SELECT NOT ok.fits, e.id, t.n, `+lookupQualifiedEdgeCols+`, `+bfsAdmissionNeighborColumns("h")+`
@@ -143,11 +165,12 @@ func bfsAdmissionQuery(generation int64, request graph.BFSAdmissionRequest, filt
 
 // BFSAdmissionFilteredContext reads an indexed neighborhood in one statement,
 // preserving Go's admission rather than substituting a discovery-hop-only
-// graph. The repository narrow gates recursive neighbors and Go admit applies
-// the workspace and project scope; state/edge sentinels decline broad
-// projections. A count that could reach Go's pre-cap sort threshold is exact
-// and saturates at the caller's cap; below it, the raw adjacency size decides
-// that sort the same way without reading edge rows.
+// graph. The repository narrow, or without one the workspace, gates recursive
+// neighbors and Go admit applies the exact workspace and project scope;
+// state/edge sentinels decline broad projections. A count that could reach
+// Go's pre-cap sort threshold is exact and saturates at the caller's cap;
+// below it, the raw adjacency size decides that sort the same way without
+// reading edge rows.
 func (s *Store) BFSAdmissionFilteredContext(ctx context.Context, request graph.BFSAdmissionRequest, filter graph.OutlineEdgeFilter) (graph.BFSAdmissionSnapshot, bool, error) {
 	ctx = liveNameContext(ctx)
 	if err := ctx.Err(); err != nil {

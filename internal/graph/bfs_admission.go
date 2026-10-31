@@ -19,8 +19,9 @@ type BFSAdmissionRequest struct {
 // oracle. Nodes holds walked neighbors only. The caller supplies the seed, and
 // unresolved or external targets, which admission never reads, are absent like
 // missing neighbors; their edges remain evidence, including unresolved-target
-// boundaries. Nodes may also hold in-repository neighbors outside the
-// workspace or project scope, which admission rejects itself.
+// boundaries. Nodes may also hold neighbors outside the workspace or project
+// scope, which admission rejects itself: under a repository narrow, any in a
+// narrowed repository; without one, any in the seed's repository.
 //
 // Adjacency.Total is either the visible count saturated at Request.Limit, or
 // an upper bound below Request.Limit-1-len(Nodes). Admission over the snapshot
