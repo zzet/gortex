@@ -21,18 +21,23 @@ type linkedHoldProbe struct {
 	clock      atomic.Int64
 	busy       atomic.Bool
 	samples    atomic.Int64
+	sampled    chan struct{}
 	reacquired atomic.Int64
 	released   atomic.Int64
 }
 
 func newLinkedHoldProbe(t *testing.T, policy ContractLinkedPolicy, adjust func(*ContractAnalysisCoordinatorOptions)) *linkedHoldProbe {
 	t.Helper()
-	h := &linkedHoldProbe{base: time.Unix(1_000_000, 0)}
+	h := &linkedHoldProbe{base: time.Unix(1_000_000, 0), sampled: make(chan struct{}, 64)}
 	h.schedulerProbe = newSchedulerProbe(t, func(options *ContractAnalysisCoordinatorOptions) {
 		options.Now = h.now
 		options.LinkedPolicy = policy
 		options.Demand = func() bool {
 			h.samples.Add(1)
+			select {
+			case h.sampled <- struct{}{}:
+			default:
+			}
 			return h.busy.Load()
 		}
 		options.LinkedInputs = func(ctx context.Context, actor ContractActor, repo string) (*graphview.SelectedContractInputs, *ContractCaptureSource, error) {
@@ -205,9 +210,11 @@ func TestContractLinkedPolicyLeavesPrimaryActorsAlone(t *testing.T) {
 	h := newLinkedHoldProbe(t, ContractLinkedIdle, nil)
 	// Whether the primary job can stop at a checkpoint at all, and whether
 	// it sees another actor waiting for the slot.
-	waiting := make(chan [2]bool, 1)
+	// The third: it runs on the coordinator's own yield, outside any
+	// linked policy.
+	waiting := make(chan [3]bool, 1)
 	h.c.run = func(job *contractAnalysisJob) string {
-		waiting <- [2]bool{job.otherActorWaiting != nil, job.otherActorWaiting != nil && job.otherActorWaiting()}
+		waiting <- [3]bool{job.otherActorWaiting != nil, job.otherActorWaiting != nil && job.otherActorWaiting(), job.yield == nil && job.linkedPolicy == ""}
 		return h.run(job)
 	}
 	h.busy.Store(true)
@@ -217,7 +224,7 @@ func TestContractLinkedPolicyLeavesPrimaryActorsAlone(t *testing.T) {
 	primary := h.schedule("", []string{"r"}, "r", "k")
 	require.Equal(t, ContractActorPublished, h.wait(primary).Result)
 	require.Equal(t, []string{"r/@k"}, h.started())
-	require.Equal(t, [2]bool{true, false}, <-waiting, "a held linked actor is not waiting for the slot")
+	require.Equal(t, [3]bool{true, false, true}, <-waiting, "a held linked actor is not waiting for the slot")
 	require.True(t, h.held(linked.Actor))
 }
 
@@ -266,4 +273,147 @@ func TestContractLinkedThrottledRunsOneJobAndSpacesStarts(t *testing.T) {
 	require.Equal(t, deferred+2, linkedCounter(ContractLinkedThrottled, viewmetrics.ContractLinkedDeferred))
 	require.Equal(t, started+3, linkedCounter(ContractLinkedThrottled, viewmetrics.ContractLinkedStarted))
 	require.Zero(t, h.samples.Load(), "the throttled policy never asks for demand")
+}
+
+// parkedYield calls a job's yield on its own goroutine with demand on and
+// reports whether it was still parked after several more demand samples.
+func (h *linkedHoldProbe) parkedYield(job *contractAnalysisJob) (returned chan error, parked bool) {
+	for len(h.sampled) > 0 {
+		<-h.sampled
+	}
+	h.busy.Store(true)
+	returned = make(chan error, 1)
+	go func() { returned <- job.yield(context.Background()) }()
+	for range 4 {
+		select {
+		case <-h.sampled:
+		case <-returned:
+			return returned, false
+		case <-time.After(10 * time.Second):
+			return returned, false
+		}
+	}
+	select {
+	case <-returned:
+		return returned, false
+	default:
+		return returned, true
+	}
+}
+
+func receiveYield(returned chan error) (error, bool) {
+	select {
+	case err := <-returned:
+		return err, true
+	case <-time.After(10 * time.Second):
+		return nil, false
+	}
+}
+
+// TestContractLinkedIdleFillStopsAtCheckpointAndResumesWithProgress: a
+// linked fill that meets demand parks with no progress slice, then stops at
+// its next checkpoint; it is held until the next idle window and resumes
+// from the checkpoint it retained.
+func TestContractLinkedIdleFillStopsAtCheckpointAndResumesWithProgress(t *testing.T) {
+	t.Run("stops_and_resumes", func(t *testing.T) {
+		h := newLinkedHoldProbe(t, ContractLinkedIdle, nil)
+		h.advance(5 * time.Second)
+		h.outcome = func(_ string, n int) string {
+			if n == 1 {
+				return viewmetrics.ContractJobFillContinued
+			}
+			return viewmetrics.ContractJobPublished
+		}
+		type observed struct {
+			linked, parked, returned, stop bool
+			err                            error
+		}
+		first, resumed := make(chan observed, 1), make(chan bool, 1)
+		var runs atomic.Int64
+		h.c.run = func(job *contractAnalysisJob) string {
+			if runs.Add(1) > 1 {
+				resumed <- job.delta.cache != nil && job.delta.cache.continuation != nil
+				return h.run(job)
+			}
+			seen := observed{linked: job.yield != nil && job.linkedPolicy == ContractLinkedIdle && job.otherActorWaiting != nil}
+			if !seen.linked {
+				first <- seen
+				return h.run(job)
+			}
+			returned, parked := h.parkedYield(job)
+			seen.parked = parked
+			h.busy.Store(false)
+			seen.err, seen.returned = receiveYield(returned)
+			seen.stop = job.otherActorWaiting()
+			unit := &contractUnit{path: "r/file.go"}
+			job.delta.cache = &contractDeltaCache{identity: job.delta.identity, units: map[string]*contractUnit{unit.path: unit}, continuation: &contractFillContinuation{identity: job.delta.identity, units: []contractFillUnitProof{{unit: unit}}}}
+			job.delta.continued = true
+			first <- seen
+			return h.run(job)
+		}
+		stopped := linkedCounter(ContractLinkedIdle, viewmetrics.ContractLinkedCheckpointStopped)
+		linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
+		seen := <-first
+		require.True(t, seen.linked, "a linked idle job yields and checkpoints by its policy")
+		require.True(t, seen.parked, "demand parks the job across several samples, with no progress slice")
+		require.True(t, seen.returned, "the park ends with the demand")
+		require.NoError(t, seen.err)
+		require.True(t, seen.stop, "a fill that met demand stops at its next checkpoint")
+		require.Eventually(t, func() bool { return h.held(linked.Actor) }, 10*time.Second, time.Millisecond, "the stopped fill waits for the next idle window")
+		require.Equal(t, stopped+1, linkedCounter(ContractLinkedIdle, viewmetrics.ContractLinkedCheckpointStopped))
+		require.Equal(t, ContractFillCheckpointRetained, h.c.Status(linked.Actor).FillCheckpoint)
+		h.settle("r")
+		require.Len(t, h.started(), 1, "no restart inside the window the demand reopened")
+		h.advance(5 * time.Second)
+		h.settle("r")
+		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
+		require.True(t, <-resumed, "the resumed fill starts from its retained checkpoint")
+		require.Equal(t, []string{contractJobTriggerInterest, contractJobTriggerRequeue}, h.triggered())
+	})
+
+	t.Run("park_is_bounded", func(t *testing.T) {
+		h := newLinkedHoldProbe(t, ContractLinkedIdle, nil)
+		h.advance(5 * time.Second)
+		type observed struct{ parked, bounded, immediate bool }
+		seen := make(chan observed, 1)
+		h.c.run = func(job *contractAnalysisJob) string {
+			var o observed
+			returned, parked := h.parkedYield(job)
+			o.parked = parked
+			h.advance(contractLinkedParkMax)
+			_, o.bounded = receiveYield(returned)
+			again := make(chan error, 1)
+			go func() { again <- job.yield(context.Background()) }()
+			_, o.immediate = receiveYield(again)
+			h.busy.Store(false)
+			seen <- o
+			return h.run(job)
+		}
+		linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
+		require.Equal(t, observed{parked: true, bounded: true, immediate: true}, <-seen, "demand that outlasts the bound no longer parks the job")
+		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
+	})
+
+	t.Run("a_waiting_actor_ends_the_park", func(t *testing.T) {
+		h := newLinkedHoldProbe(t, ContractLinkedIdle, nil)
+		h.advance(5 * time.Second)
+		parkedCh := make(chan bool, 1)
+		ended := make(chan [2]bool, 1)
+		h.c.run = func(job *contractAnalysisJob) string {
+			if job.linkedPolicy == "" {
+				return h.run(job)
+			}
+			returned, parked := h.parkedYield(job)
+			parkedCh <- parked
+			_, ok := receiveYield(returned)
+			ended <- [2]bool{ok, job.otherActorWaiting()}
+			return h.run(job)
+		}
+		linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
+		require.True(t, <-parkedCh)
+		primary := h.schedule("", []string{"p"}, "p", "k")
+		require.Equal(t, [2]bool{true, true}, <-ended, "a primary waiting for the slot ends the park and the fill")
+		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
+		require.Equal(t, ContractActorPublished, h.wait(primary).Result)
+	})
 }

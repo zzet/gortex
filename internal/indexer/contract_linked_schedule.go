@@ -1,9 +1,12 @@
 package indexer
 
 import (
+	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/viewmetrics"
+	"go.uber.org/zap"
 )
 
 // Linked-checkout scheduling. A linked worktree's actor runs the same jobs as
@@ -21,11 +24,20 @@ import (
 //   - eager: as a primary actor.
 //
 // Requests and Published events still record interest and wanted inputs
-// while an actor is held; only the start waits.
+// while an actor is held; only the start waits. A linked fill the idle
+// policy started yields to demand without the progress slice the shared
+// yield grants, and stops at its next fill checkpoint once it met demand:
+// the actor is requeued, held until the next idle window, and resumes from
+// its retained checkpoint.
 
 // contractDemandPoll is how often a dispatcher with a held actor samples
 // Demand again while the idle window is closed.
 const contractDemandPoll = 250 * time.Millisecond
+
+// contractLinkedParkMax bounds how long one linked job parks for demand in
+// all. Past it the job no longer parks: a long busy spell must not pin its
+// job slot, leases and reservations; it still stops at its next checkpoint.
+const contractLinkedParkMax = 30 * time.Second
 
 // linkedIdleApplies reports whether the idle policy governs a's jobs: a
 // linked actor whose inputs the scheduler can reacquire, with a demand
@@ -139,6 +151,98 @@ func (c *ContractAnalysisCoordinator) endLinkedDeferred(a *contractActor, want c
 	c.enqueueLocked(a, trigger, triggeredAt)
 	a.held = true
 	countContractLinkedJob(c.options.LinkedPolicy, viewmetrics.ContractLinkedDeferred)
+}
+
+// linkJob prepares a linked actor's job for its policy before the body
+// starts: an idle-governed job yields without a progress slice and stops at
+// its next fill checkpoint once it met demand.
+func (c *ContractAnalysisCoordinator) linkJob(a *contractActor, job *contractAnalysisJob) {
+	if a.primary() {
+		return
+	}
+	job.linkedPolicy = c.options.LinkedPolicy
+	if !c.linkedIdleApplies(a) {
+		return
+	}
+	job.yield = c.linkedYield(a, job)
+	if other := job.otherActorWaiting; other != nil {
+		job.otherActorWaiting = func() bool {
+			if other() {
+				job.demandStop.Store(false)
+				return true
+			}
+			stop := job.demandSeen.Load()
+			job.demandStop.Store(stop)
+			return stop
+		}
+	}
+}
+
+// linkedYield is the yield of a linked job the idle policy governs. With no
+// demand it returns at once. With demand it marks the job and parks, with
+// no progress slice, until demand ends, another actor waits for the slot,
+// the context ends, or the job has parked for contractLinkedParkMax in all.
+func (c *ContractAnalysisCoordinator) linkedYield(a *contractActor, job *contractAnalysisJob) func(context.Context) error {
+	var parked atomic.Int64
+	return func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !c.options.Demand() {
+			return nil
+		}
+		job.demandSeen.Store(true)
+		start := c.now()
+		defer func() { parked.Add(int64(c.now().Sub(start))) }()
+		poll := time.NewTicker(5 * time.Millisecond)
+		defer poll.Stop()
+		for busy := true; busy; busy = c.options.Demand() {
+			if c.linkedParkEnds(a, busy) || time.Duration(parked.Load())+c.now().Sub(start) >= contractLinkedParkMax {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-poll.C:
+			}
+		}
+		return ctx.Err()
+	}
+}
+
+// linkedParkEnds records a demand sample of a parked linked job and reports
+// whether another actor waits for its slot.
+func (c *ContractAnalysisCoordinator) linkedParkEnds(a *contractActor, busy bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	if busy {
+		c.lastDemand = now
+	}
+	return c.otherActorWaitingLocked(a, now)
+}
+
+// linkedStartFields are a linked job's start log fields.
+func (job *contractAnalysisJob) linkedStartFields() []zap.Field {
+	if job.linkedPolicy == "" {
+		return nil
+	}
+	return []zap.Field{zap.String("policy", string(job.linkedPolicy))}
+}
+
+// linkedEndFields are a linked job's completion log fields: demand_stop is
+// set when the fill stopped at a checkpoint for demand.
+func (job *contractAnalysisJob) linkedEndFields(outcome string) []zap.Field {
+	if job.linkedPolicy == "" {
+		return nil
+	}
+	return append(job.linkedStartFields(), zap.Bool("demand_stop", job.stoppedForDemand(outcome)))
+}
+
+// stoppedForDemand reports whether a job that ended with outcome stopped at
+// a fill checkpoint because it met demand.
+func (job *contractAnalysisJob) stoppedForDemand(outcome string) bool {
+	return outcome == viewmetrics.ContractJobFillContinued && job.demandStop.Load()
 }
 
 // countLinkedStartLocked counts a linked actor's job body about to start.

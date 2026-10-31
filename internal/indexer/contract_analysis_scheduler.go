@@ -1632,6 +1632,7 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 	if (a.primary() || c.options.LinkedInputs != nil) && canContinueFill {
 		job.otherActorWaiting = func() bool { return c.otherActorWaiting(a) }
 	}
+	c.linkJob(a, job)
 	// Registered after capture succeeds and before the body starts. Returning
 	// cache custody precedes panic recovery; a panic discards its unproven state.
 	returnedCache := false
@@ -1692,6 +1693,9 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 	}
 	body := time.Now()
 	outcome := run(job)
+	if job.stoppedForDemand(outcome) {
+		countContractLinkedJob(job.linkedPolicy, viewmetrics.ContractLinkedCheckpointStopped)
+	}
 	returnCache(session.cache)
 	release()
 	source.Release()
@@ -1702,7 +1706,10 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 func (c *ContractAnalysisCoordinator) otherActorWaiting(current *contractActor) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	now := c.now()
+	return c.otherActorWaitingLocked(current, c.now())
+}
+
+func (c *ContractAnalysisCoordinator) otherActorWaitingLocked(current *contractActor, now time.Time) bool {
 	for _, actor := range c.actors {
 		if actor == current {
 			continue

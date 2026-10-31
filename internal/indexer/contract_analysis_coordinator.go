@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/config"
@@ -93,6 +94,15 @@ type contractAnalysisJob struct {
 	priorityRepos     []string
 	targetPublished   func(ContractFollowupTargetResult)
 	backgroundCurrent func(context.Context) error
+	// yield replaces the coordinator's Yield for this job: a linked job the
+	// idle policy governs parks without a progress slice.
+	yield func(context.Context) error
+	// linkedPolicy names the policy a linked actor's job ran under, empty
+	// for a primary actor. demandSeen is set once the job's yield met
+	// foreground demand; demandStop when its last checkpoint question was
+	// answered yes for demand alone.
+	linkedPolicy           ContractLinkedPolicy
+	demandSeen, demandStop atomic.Bool
 }
 
 // contractJobTriggerInterest queues a job for a request's interest in its key.
@@ -361,11 +371,15 @@ func (c *ContractAnalysisCoordinator) execute(job *contractAnalysisJob) string {
 			}
 		}
 	}
-	c.options.Logger.Info("contract analysis job started", zap.String("mode", startMode), zap.String("job", job.id),
+	c.options.Logger.Info("contract analysis job started", append([]zap.Field{zap.String("mode", startMode), zap.String("job", job.id),
 		zap.String("repo", targets[0].Key.RepoPrefix), zap.String("checkout", targets[0].Key.CheckoutID), zap.Int("targets", len(targets)),
 		zap.String("trigger", job.trigger), zap.Float64("since_trigger_ms", contractMillis(dispatch)),
-		zap.Float64("since_accept_ms", sinceAccept), zap.Float64("capture_ms", contractMillis(job.capture)))
-	report, err := RunContractFollowupBatch(c.ctx, ContractFollowupBatchRequest{Snapshot: job.snapshot, Targets: targets, RebuildReason: ContractFollowupUnknownInterval, Registry: c.options.Registry, Config: c.options.Config, RepoConfigs: job.snapshot.RepoConfigs, Logger: c.options.Logger, Leases: c.options.Leases, ScratchParent: c.options.ScratchParent, Yield: c.options.Yield,
+		zap.Float64("since_accept_ms", sinceAccept), zap.Float64("capture_ms", contractMillis(job.capture))}, job.linkedStartFields()...)...)
+	yield := c.options.Yield
+	if job.yield != nil {
+		yield = job.yield
+	}
+	report, err := RunContractFollowupBatch(c.ctx, ContractFollowupBatchRequest{Snapshot: job.snapshot, Targets: targets, RebuildReason: ContractFollowupUnknownInterval, Registry: c.options.Registry, Config: c.options.Config, RepoConfigs: job.snapshot.RepoConfigs, Logger: c.options.Logger, Leases: c.options.Leases, ScratchParent: c.options.ScratchParent, Yield: yield,
 		PublishedEpoch: c.publishedEpoch, WaitPublished: c.waitPublished, OtherActorWaiting: job.otherActorWaiting, delta: job.delta,
 		PriorityRepos: job.priorityRepos, BackgroundCurrent: job.backgroundCurrent,
 		TargetPublished: func(result ContractFollowupTargetResult) {
@@ -413,9 +427,9 @@ func (c *ContractAnalysisCoordinator) execute(job *contractAnalysisJob) string {
 	countContractJob(mode, outcome, elapsed)
 	// The job, checkout and trigger name the start line this end belongs to,
 	// so a linked checkout's fill time can be attributed from the log alone.
-	logContractJob(c.options.Logger, mode, outcome, elapsed, report,
+	logContractJob(c.options.Logger, mode, outcome, elapsed, report, append([]zap.Field{
 		zap.String("job", job.id), zap.String("checkout", targets[0].Key.CheckoutID), zap.String("trigger", job.trigger),
-		zap.Float64("dispatch_ms", contractMillis(dispatch)), zap.Float64("capture_ms", contractMillis(job.capture)))
+		zap.Float64("dispatch_ms", contractMillis(dispatch)), zap.Float64("capture_ms", contractMillis(job.capture))}, job.linkedEndFields(outcome)...)...)
 	return outcome
 }
 
