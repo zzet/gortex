@@ -111,11 +111,43 @@ func (d *daemonStreamableDispatcher) Dispatch(ctx context.Context, frame []byte)
 		defer d.unbridge(sess.ID)
 		defer d.registry.RemoveByID(sess.ID)
 	}
-	reply, err := daemon.DispatchMCPFrame(ctx, sess, frame, d.inner)
+	inner := d.inner
+	if route := streamable.ToolRouteFromContext(ctx); route != nil {
+		inner = transportRoutedDispatcher{MCPDispatcher: d.inner, route: route}
+	}
+	reply, err := daemon.DispatchMCPFrame(ctx, sess, frame, inner)
 	if busy := daemon.MCPDispatchBusyResponse(frame, err); len(busy) > 0 {
 		return busy, nil
 	}
 	return reply, err
+}
+
+// transportRoutedDispatcher runs the streamable transport's own tools/call
+// routing attempt once shared admission has granted the frame a slot, then
+// falls through to the wrapped dispatcher for a call that stays local. The
+// order is the one the transport used when it routed before dispatch, so a
+// remote hop is admitted like a local call without changing what it routes on
+// (session workspace pin, the call's cwd) or how its failure is framed.
+type transportRoutedDispatcher struct {
+	daemon.MCPDispatcher
+	route streamable.ToolRoute
+}
+
+func (d transportRoutedDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, frame []byte) ([]byte, error) {
+	if out, ok := d.route(ctx); ok {
+		return out, nil
+	}
+	return d.MCPDispatcher.Dispatch(ctx, sess, frame)
+}
+
+// DispatchClass keeps the wrapped dispatcher's admission class: a routed call
+// is classified by its local name, exactly like the unwrapped dispatch.
+func (d transportRoutedDispatcher) DispatchClass(name string, arguments map[string]any) daemon.MCPDispatchClass {
+	if classifier, ok := d.MCPDispatcher.(daemon.MCPDispatchClassifier); ok {
+		return classifier.DispatchClass(name, arguments)
+	}
+	class, _ := daemon.ToolDispatchClass(name)
+	return class
 }
 
 // acquire returns the synthetic daemon.Session for a streamable

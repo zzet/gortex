@@ -369,3 +369,139 @@ func TestDaemonHTTPCancellationReachesAFullDispatchPool(t *testing.T) {
 		}
 	}
 }
+
+// TestDaemonHTTPRoutesWithTheTransportsInputsInsideAdmission keeps the /mcp
+// mount routing on everything the transport knows about the caller: a session
+// pinned to a workspace at initialize, and a call naming its own cwd. Moving
+// the hop inside shared admission must not narrow those inputs to the
+// dispatcher's per-call workspace and session cwd, nor change how an upstream
+// failure is framed.
+func TestDaemonHTTPRoutesWithTheTransportsInputsInsideAdmission(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
+	t.Setenv("GORTEX_QUERY_LOG_DISABLE", "1")
+	t.Setenv("GORTEX_TOOLS", "full")
+	t.Setenv("GORTEX_TOOLS_MODE", "hide")
+	checkout := t.TempDir()
+	if err := os.WriteFile(filepath.Join(checkout, ".gortex.yaml"), []byte("workspace: cwd-remote\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	type hop struct {
+		server, path, cwd string
+		fastInFlight      int
+	}
+	hops := make(chan hop, 4)
+	upstream := func(name string) *httptest.Server {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hops <- hop{server: name, path: r.URL.Path, cwd: r.Header.Get("X-Gortex-Cwd"), fastInFlight: daemon.MCPDispatchSnapshot().Lanes["fast"].InFlight}
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path == "/v1/tools/find_usages" {
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_, _ = io.WriteString(w, `{"error":"unknown symbol"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"answer from `+name+`"}]}`)
+		}))
+		t.Cleanup(server.Close)
+		return server
+	}
+	// The first roster entry is the default for a call nothing else routes,
+	// so only the caller's own inputs can pick the second one.
+	elsewhere, remote := upstream("elsewhere"), upstream("remote")
+	router := daemon.NewRouter(daemon.RouterConfig{Servers: &daemon.ServersConfig{Server: []daemon.ServerEntry{
+		{Slug: "elsewhere", URL: elsewhere.URL},
+		{Slug: "remote", URL: remote.URL, Workspaces: []string{"pinned-remote", "cwd-remote"}},
+	}}, LocalSlug: daemon.LocalServerSentinel, Logger: zap.NewNop()})
+	g := graph.New()
+	policy := gortexmcp.ToolPolicyConfig{Preset: "full"}
+	srv := gortexmcp.NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil, gortexmcp.MultiRepoOptions{ToolPolicy: &policy})
+	dispatcher := newMCPDispatcher(srv, nil, zap.NewNop())
+	dispatcher.SetRouter(router)
+	httpServer := httptest.NewServer(buildDaemonStreamableHandler(dispatcher, daemon.NewSessionRegistry(), router, zap.NewNop(), nil))
+	t.Cleanup(httpServer.Close)
+	httpClient := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	t.Cleanup(httpClient.CloseIdleConnections)
+	post := func(session, frame string) ([]byte, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/mcp", bytes.NewBufferString(frame))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if session != "" {
+			req.Header.Set(streamable.HeaderSessionID, session)
+		}
+		response, err := httpClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		payload, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("HTTP status %d: %s", response.StatusCode, payload)
+		}
+		return payload, response.Header.Get(streamable.HeaderSessionID)
+	}
+	initialize := func(meta string) string {
+		t.Helper()
+		_, sid := post("", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"route-test","version":"1"}`+meta+`}}`)
+		if sid == "" {
+			t.Fatal("HTTP initialization minted no session")
+		}
+		return sid
+	}
+	routed := func(name string, reply []byte) hop {
+		t.Helper()
+		select {
+		case got := <-hops:
+			if got.server != "remote" || got.path != "/v1/tools/"+name {
+				t.Fatalf("hop to %s%s, want remote/v1/tools/%s; reply=%s", got.server, got.path, name, reply)
+			}
+			if got.fastInFlight < 1 {
+				t.Fatalf("remote hop for %s ran outside dispatch admission", name)
+			}
+			return got
+		default:
+			t.Fatalf("%s was not routed: %s", name, reply)
+			return hop{}
+		}
+	}
+
+	pinned := initialize(`,"_meta":{"workspace":"pinned-remote"}`)
+	reply, _ := post(pinned, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_symbols","arguments":{"query":"Needle"}}}`)
+	routed("search_symbols", reply)
+	if !bytes.Contains(reply, []byte("answer from remote")) {
+		t.Fatalf("pinned session reply=%s", reply)
+	}
+
+	unpinned := initialize("")
+	reply, _ = post(unpinned, fmt.Sprintf(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_symbols","arguments":{"query":"Needle","cwd":%q}}}`, checkout))
+	if got := routed("search_symbols", reply); got.cwd != checkout {
+		t.Fatalf("call routed by cwd %q told the remote cwd %q", checkout, got.cwd)
+	}
+	if !bytes.Contains(reply, []byte("answer from remote")) {
+		t.Fatalf("cwd-routed reply=%s", reply)
+	}
+
+	reply, _ = post(pinned, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"find_usages","arguments":{"id":"missing"}}}`)
+	routed("find_usages", reply)
+	var failed struct {
+		Error struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(reply, &failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed.Error.Code != -32603 || failed.Error.Message != "remote tool call failed (HTTP 422)" {
+		t.Fatalf("upstream 4xx reply=%s", reply)
+	}
+}

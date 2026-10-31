@@ -98,9 +98,12 @@ type Config struct {
 	// unresolved or local route falls through to Dispatcher. Pass
 	// nil for the single-server case (no servers.toml).
 	Router *daemon.Router
-	// DispatcherRoutesTools is used only by the daemon bridge, whose shared
-	// admission entry must cover remote calls as well as local calls. Standalone
-	// transports keep routing here; catalogue/status still use Router.
+	// DispatcherRoutesTools hands Router's tools/call attempt to the
+	// Dispatcher instead of running it before dispatch: the same attempt
+	// (inputs, order and reply framing) rides the context, see
+	// ToolRouteFromContext. The daemon bridge sets it so its shared admission
+	// covers a remote call exactly like a local one; standalone transports
+	// leave it off and keep routing here.
 	DispatcherRoutesTools bool
 
 	// AllowedOrigins, when non-empty, restricts which Origin
@@ -476,13 +479,41 @@ func (t *Transport) dispatchFrame(r *http.Request, state *SessionState, frame []
 	// Other frames (tools/list, ping, resources/*, prompts/*) flow
 	// to the in-process MCP server — federating them would change
 	// semantics.
-	if method == "tools/call" && t.router != nil && !t.dispatcherRoutesTools {
+	if method == "tools/call" && t.router != nil {
+		if t.dispatcherRoutesTools {
+			return t.localDispatch(t.withToolRoute(r, *state, frame), *state, frame)
+		}
 		if out, status, ok := t.tryRouteToolCall(r, *state, frame); ok {
 			return out, status, nil
 		}
 	}
 
 	return t.localDispatch(r, *state, frame)
+}
+
+// ToolRoute is the transport's routing attempt for one tools/call frame, run
+// under the context the Dispatcher passes. It reports false when the call
+// stays local, and the Dispatcher then handles the frame itself.
+type ToolRoute func(ctx context.Context) ([]byte, bool)
+
+type toolRouteContextKey struct{}
+
+// ToolRouteFromContext returns the routing attempt the transport handed to its
+// Dispatcher (Config.DispatcherRoutesTools), or nil when there is none.
+func ToolRouteFromContext(ctx context.Context) ToolRoute {
+	route, _ := ctx.Value(toolRouteContextKey{}).(ToolRoute)
+	return route
+}
+
+// withToolRoute defers tryRouteToolCall to the Dispatcher. The attempt keeps
+// this request's inputs — the call's arguments, the session's workspace pin
+// and cwd, the headers — so only where it runs changes, not what it routes on.
+func (t *Transport) withToolRoute(r *http.Request, state SessionState, frame []byte) *http.Request {
+	route := ToolRoute(func(ctx context.Context) ([]byte, bool) {
+		out, _, ok := t.tryRouteToolCall(r.WithContext(ctx), state, frame)
+		return out, ok
+	})
+	return r.WithContext(context.WithValue(r.Context(), toolRouteContextKey{}, route))
 }
 
 // localDispatch attaches the session id / cwd / workspace to the
