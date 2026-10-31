@@ -252,9 +252,12 @@ Plan steps and edit records name that editor. An edit and its immediate
 file/source readbacks go through its own editor's session; probes and receipt
 status stay on the edit's separate prober session, and run-level status, stats
 and the restore batch use editor 0. A blocked editor ACK does not delay another
-editor's arrival. Editors share one file, so whole-file `edit.write` and
-`edit.batch` content can overwrite a concurrent editor's change; such lost
-writes are measured as failed records, not hidden. The 1-edit diagnostic and
+editor's arrival. Editors share one file. `edit.write` carries whole-file
+content precomputed in ordinal order, so an out-of-order write would silently
+drop another editor's marker until the next write restored it; it is refused
+with more than one editor. An out-of-order `edit.batch` fails its `old_string`
+precondition and stays a failed record, and `edit.file` anchor insertions do
+not depend on order. The 1-edit diagnostic and
 the paired no-regression cell stay one editor. Routing across several
 repositories or linked worktrees is not implemented.
 
@@ -290,10 +293,10 @@ touch only the registered fixture file, or the step's own created file.
   Created files still present are removed by one timed restore batch.
   TypeScript and Python create/delete are not implemented: a gap, not an
   inapplicable cell.
-- `hot_file` (100 edits, `--edit-agents 2`, `edit.file` or `edit.write` call
-  addition): MCP traffic in which both editors send each pair of edits to the
-  one file at the same due time, taken from the single-editor stream. Lost
-  writes are measured outcomes.
+- `hot_file` (100 edits, `--edit-agents 2`, `edit.file` call addition): MCP
+  traffic in which both editors send each pair of edits to the one file at the
+  same due time, taken from the single-editor stream. A lost write leaves its
+  marker invisible and is a measured failure.
 - `restart` (`--edit-count 1`, one editor, no readers, JSON `edit.file` call
   addition): the edit ACK waits for its graph receipt, so the cell does not
   wait for it. While the ACK is outstanding, the edit's status is polled by its

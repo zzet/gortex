@@ -168,6 +168,13 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 	if kind == "relocate" && tool != "refactor.move" {
 		return editProbePlan{}, errors.New("relocation requires the explicit Go move adapter")
 	}
+	// Each write carries whole-file content precomputed in ordinal order. With
+	// several editors an out-of-order write silently drops another editor's
+	// marker, and the next ordinal's write restores it; a batch's old_string
+	// precondition fails visibly instead.
+	if tool == "edit.write" && editors > 1 {
+		return editProbePlan{}, errors.New("edit.write with several editors would silently drop a concurrent editor's marker: use edit.file or edit.batch")
+	}
 	if err := editProbeNativeSender(c, kind, tool, count, editors); err != nil {
 		return editProbePlan{}, err
 	}

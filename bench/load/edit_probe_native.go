@@ -77,8 +77,8 @@ func editProbeNativeSender(c Corpus, kind, tool string, count, editors int) erro
 			return errors.New("restart is a one-edit, one-editor diagnostic")
 		}
 	case editProbeHotFile:
-		if kind != "add_intrafile_call" || tool != "edit.file" && tool != "edit.write" {
-			return errors.New("hot_file pairs edit.file or edit.write call additions on one file")
+		if kind != "add_intrafile_call" || tool != "edit.file" {
+			return errors.New("hot_file pairs edit.file call additions on one file")
 		}
 		if count != 100 || editors != 2 {
 			return errors.New("hot_file runs 50 simultaneous pairs: 100 edits on exactly two editors")

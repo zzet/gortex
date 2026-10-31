@@ -189,24 +189,23 @@ func TestEditProbeHotFilePairsShareDueAndFixedEditors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range []Corpus{editProbeCorpus(), editProbeWriteCorpus(t, "go")} {
-		c.EditSender = editProbeHotFile
-		plan, err := makeEditProbeTrafficPlan(c, 42, 100, 2)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if plan.Editors != 2 || plan.Sender != editProbeHotFile || plan.SessionModel != editProbeFixedEditorModel || len(plan.Steps) != 100 {
-			t.Fatalf("hot-file plan identity: %+v", plan)
-		}
-		for k := range 50 {
-			a, b := plan.Steps[2*k], plan.Steps[2*k+1]
-			if a.DueNS != b.DueNS || a.DueNS != single.Steps[k].DueNS || a.Editor != 0 || b.Editor != 1 || a.Sender != "" || b.Sender != "" || a.MutationID == "" || b.MutationID == "" || a.Marker == b.Marker {
-				t.Fatalf("hot-file pair %d is not two MCP edits at one due time: %+v %+v", k, a, b)
-			}
-		}
-	}
 	hot := editProbeCorpus()
 	hot.EditSender = editProbeHotFile
+	plan, err := makeEditProbeTrafficPlan(hot, 42, 100, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Editors != 2 || plan.Sender != editProbeHotFile || plan.SessionModel != editProbeFixedEditorModel || len(plan.Steps) != 100 {
+		t.Fatalf("hot-file plan identity: %+v", plan)
+	}
+	for k := range 50 {
+		a, b := plan.Steps[2*k], plan.Steps[2*k+1]
+		if a.DueNS != b.DueNS || a.DueNS != single.Steps[k].DueNS || a.Editor != 0 || b.Editor != 1 || a.Sender != "" || b.Sender != "" || a.MutationID == "" || b.MutationID == "" || a.Marker == b.Marker {
+			t.Fatalf("hot-file pair %d is not two MCP edits at one due time: %+v %+v", k, a, b)
+		}
+	}
+	write := editProbeWriteCorpus(t, "go")
+	write.EditSender = editProbeHotFile
 	symbol := editProbeSymbolCorpus(t, "go")
 	symbol.EditSender = editProbeHotFile
 	rename := editProbeRenameCorpus(t, "go", 100)
@@ -216,6 +215,7 @@ func TestEditProbeHotFilePairsShareDueAndFixedEditors(t *testing.T) {
 		"three_editors": func() (editProbePlan, error) { return makeEditProbeTrafficPlan(hot, 42, 100, 3) },
 		"symbol_tool":   func() (editProbePlan, error) { return makeEditProbeTrafficPlan(symbol, 42, 100, 2) },
 		"rename":        func() (editProbePlan, error) { return makeEditProbeTrafficPlan(rename, 42, 100, 2) },
+		"write_tool":    func() (editProbePlan, error) { return makeEditProbeTrafficPlan(write, 42, 100, 2) },
 	} {
 		if _, err := build(); err == nil {
 			t.Errorf("%s: hot file planned", name)

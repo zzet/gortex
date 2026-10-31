@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -249,6 +250,19 @@ func TestEditProbeEditorCountRefusals(t *testing.T) {
 		if _, err := makeEditProbeTrafficPlan(c, 42, cell.count, cell.editors); err != nil {
 			t.Fatalf("valid editor cell refused: %+v: %v", cell, err)
 		}
+	}
+	// Precomputed whole-file writes would silently drop a concurrent editor's
+	// marker; a batch's old_string precondition fails visibly instead.
+	write, batch := editProbeWriteCorpus(t, "go"), editProbeWriteCorpus(t, "go")
+	batch.EditTool = "edit.batch"
+	if _, err := makeEditProbeTrafficPlan(write, 42, 100, 1); err != nil {
+		t.Fatalf("one-editor edit.write refused: %v", err)
+	}
+	if _, err := makeEditProbeTrafficPlan(write, 42, 100, 2); err == nil || !strings.Contains(err.Error(), "silently drop") {
+		t.Fatalf("several-editor edit.write planned: %v", err)
+	}
+	if _, err := makeEditProbeTrafficPlan(batch, 42, 100, 2); err != nil {
+		t.Fatalf("several-editor edit.batch refused: %v", err)
 	}
 	base := []string{"--binary", "unused", "--manifest", "unused", "--scratch", t.TempDir(), "--scenario", editProbeScenario, "--agents", "0", "--worktrees", "0"}
 	for _, editors := range []string{"1", "4", "32"} {
