@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -71,6 +72,7 @@ type editProbeReport struct {
 	AccountingRequired bool              `json:"accounting_required"`
 	Records            []editProbeRecord `json:"edits"`
 	Summary            *editProbeSummary `json:"summary,omitempty"`
+	Reads              editProbeReads    `json:"reads,omitempty"`
 	RestoreMS          Metric            `json:"restore_batch_ms"`
 	Restore            json.RawMessage   `json:"restore_batch"`
 	StatsBefore        json.RawMessage   `json:"stats_before"`
@@ -107,11 +109,14 @@ type editProbeRuntime struct {
 	phase             *Phase
 	plan              editProbePlan
 	editors           []*socketClient // fixed per ordinal; editors[0] owns run-level controls
+	readers           []*socketClient
+	editsInFlight     atomic.Int64 // sent edits whose completion loop has not returned
+	reads             []editProbeRead
 	states            []*editProbeState
 	original          []byte
 	moveOriginal      []byte
 	origin            time.Time
-	mu                sync.Mutex // Phase.Attempts only; request lifetimes are never serialized
+	mu                sync.Mutex // Phase.Attempts and reads only; request lifetimes are never serialized
 	requireAccounting bool
 	finalized         bool
 }
@@ -145,6 +150,9 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 		role = "candidate"
 	}
 	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator", "t_readback/file_graph/relations/search are client times from edit send; t_derived is daemon-clock time from receipt origin and is not additive with them"}}
+	if plan.Readers > 0 {
+		out.Limitations = append(out.Limitations, "pure reads are classed when issued (no-edit baseline before the edit origin, under edit while any sent edit is unfinished, otherwise between edits); an edit sent while a read is in flight does not reclass it")
+	}
 	if plan.Mode == "toon" {
 		out.Limitations = append(out.Limitations, "TOON is evaluated from the requested text, never a structured JSON sibling; setup, timing-status and restore controls remain explicit JSON with exact numeric handling", "TOON traversal subgraphs omit JSON total_nodes/full untrimmed total_edges and signature metadata; summaries keep full fields, omitted traversal fields are not synthesized", "complete TOON subgraph checks require explicit nontruncation, exact declared node total and the emitted row census; an omitted full edge-count field is not reported as a measured value")
 	}
@@ -154,13 +162,13 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	return out
 }
 
-func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editors []*socketClient, phase *Phase) (*editProbeRuntime, []*socketClient, error) {
+func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers, editors []*socketClient, phase *Phase) (*editProbeRuntime, []*socketClient, error) {
 	plan, err := planEditProbe(p.Repos[0].Corpus, o)
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(editors) != max(1, plan.Editors) {
-		return nil, nil, fmt.Errorf("edit-and-probe plan has %d fixed editors but %d editor sessions", max(1, plan.Editors), len(editors))
+	if len(editors) != max(1, plan.Editors) || len(readers) != plan.Readers {
+		return nil, nil, fmt.Errorf("edit-and-probe plan has %d fixed editors and %d readers but %d editor and %d reader sessions", max(1, plan.Editors), plan.Readers, len(editors), len(readers))
 	}
 	original, err := os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
 	if err != nil {
@@ -189,7 +197,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editors 
 			return nil, nil, errors.New("planned marker already exists before edit")
 		}
 	}
-	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, original: original, requireAccounting: !o.editProbeBaseline}
+	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, original: original, requireAccounting: !o.editProbeBaseline}
 	if plan.Tool == "refactor.move" {
 		r.moveOriginal, err = os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(p.Repos[0].Corpus.EditDestination)))
 		if err != nil {
@@ -251,6 +259,9 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, editors 
 	phase.Metrics["edit_probe_session_setup_seconds"] = measured(time.Since(setup).Seconds(), "s")
 	phase.Metrics["edit_probe_sessions"] = measured(float64(len(clients)), "sessions")
 	phase.Metrics["edit_probe_editor_sessions"] = measured(float64(len(editors)), "sessions")
+	if len(readers) > 0 {
+		phase.Metrics["edit_probe_reader_sessions"] = measured(float64(len(readers)), "sessions")
+	}
 	phase.SessionModel = plan.SessionModel
 	return r, clients, nil
 }
@@ -541,6 +552,8 @@ func (r *editProbeRuntime) editorFor(step editProbeStep) *socketClient {
 }
 
 func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
+	r.editsInFlight.Add(1)
+	defer r.editsInFlight.Add(-1)
 	s, callCtx, cancel, started := r.beginEdit(ctx, step)
 	defer s.stopProbes()
 	defer cancel()
@@ -795,11 +808,18 @@ func (r *editProbeRuntime) run(ctx context.Context) error {
 	if statsErr != nil {
 		return statsErr
 	}
-	r.origin = time.Now()
-	r.phase.Started = r.origin
+	// Pure readers start with the phase; the offered edits keep their own
+	// schedule relative to an origin after the no-edit window.
+	r.phase.Started = time.Now()
+	r.origin = r.phase.Started.Add(time.Duration(r.plan.NoEditWindow))
 	measuredCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	readCtx, stopReads := context.WithCancel(measuredCtx)
+	var readers sync.WaitGroup
+	r.startReaders(readCtx, &readers)
 	err = runEditProbeArrivals(measuredCtx, r.plan, r.origin, r.activate, r.doEdit, waitContext)
+	stopReads()
+	readers.Wait()
 	finished := r.finish()
 	after, statsErr := r.stats(measuredCtx)
 	r.phase.EditProbe.StatsAfter = after
@@ -852,6 +872,9 @@ func (r *editProbeRuntime) finish() error {
 	}
 	finishEditProbeMetrics(r.phase)
 	r.phase.EditProbe.Summary = summarizeEditProbe(r.phase.EditProbe.Records, r.plan.Seed)
+	r.mu.Lock()
+	r.phase.EditProbe.Reads = summarizeEditProbeReads(r.reads, r.plan.Seed)
+	r.mu.Unlock()
 	return errors.Join(failures...)
 }
 

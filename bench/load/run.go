@@ -89,8 +89,8 @@ func validateRunOptions(o runOptions) error {
 	if _, err := parseProfile(o.Profile); err != nil {
 		return err
 	}
-	if o.Scenario == editProbeScenario && (o.Profile != "agent" || o.Agents != 0 || o.Editors < 1 || o.Editors > editProbeMaxEditors || o.Worktrees != 0 || o.CPUProfile != 0 || o.EditCount != 1 && o.EditCount != 100 || o.EditCount == 1 && o.Editors != 1) {
-		return fmt.Errorf("edit-and-probe requires --profile agent --agents 0 --edit-agents 1..%d on one repository --worktrees 0, no CPU profile, and --edit-count 100 (or an explicit 1-edit, 1-editor diagnostic)", editProbeMaxEditors)
+	if o.Scenario == editProbeScenario && (o.Profile != "agent" || o.Agents > editProbeMaxReaders || o.Editors < 1 || o.Editors > editProbeMaxEditors || o.Worktrees != 0 || o.CPUProfile != 0 || o.EditCount != 1 && o.EditCount != 100 || o.EditCount == 1 && o.Editors != 1) {
+		return fmt.Errorf("edit-and-probe requires --profile agent --agents 0..%d --edit-agents 1..%d on one repository --worktrees 0, no CPU profile, and --edit-count 100 (or an explicit 1-edit, 1-editor diagnostic)", editProbeMaxReaders, editProbeMaxEditors)
 	}
 	if o.EditProbeRole != "" && (o.Scenario != editProbeScenario || o.EditProbeRole != "candidate" && o.EditProbeRole != "baseline") {
 		return errors.New("--edit-probe-role is candidate or baseline, for edit-and-probe only")

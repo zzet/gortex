@@ -283,7 +283,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	}
 	phase.Metrics["mcp_sessions"] = measured(float64(len(clients)), "sessions")
 	if scenario == editProbeScenario {
-		runtime, probers, prepareErr := prepareEditProbe(warmCtx, o, p, clients[:o.Editors], &phase)
+		runtime, probers, prepareErr := prepareEditProbe(warmCtx, o, p, clients[:o.Agents], clients[o.Agents:o.Agents+o.Editors], &phase)
 		clients = append(clients, probers...)
 		if runtime != nil {
 			defer func() { resultErr = errors.Join(resultErr, runtime.close()) }()

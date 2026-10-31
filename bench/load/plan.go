@@ -184,8 +184,8 @@ func validateAgentCounts(scenario string, readers, editors int) error {
 	}
 	switch scenario {
 	case editProbeScenario:
-		if readers != 0 || editors < 1 || editors > editProbeMaxEditors {
-			return fmt.Errorf("edit-and-probe has 1..%d fixed editors and no pure readers", editProbeMaxEditors)
+		if readers > editProbeMaxReaders || editors < 1 || editors > editProbeMaxEditors {
+			return fmt.Errorf("edit-and-probe has 1..%d fixed editors and 0..%d pure readers", editProbeMaxEditors, editProbeMaxReaders)
 		}
 	case "edit", "many-edit":
 		if editors < 1 {

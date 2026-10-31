@@ -48,6 +48,8 @@ type editProbePlan struct {
 	ProbePeriodNS int64           `json:"probe_period_ns"`
 	Count         int             `json:"count"`
 	Editors       int             `json:"editors,omitempty"`
+	Readers       int             `json:"readers,omitempty"`
+	NoEditWindow  int64           `json:"no_edit_window_ns,omitempty"`
 	Seed          int64           `json:"seed"`
 	Kind          string          `json:"kind"`
 	Tool          string          `json:"tool"`
@@ -100,7 +102,17 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 }
 
 func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
-	return makeEditProbeTrafficPlan(c, o.Seed, o.EditCount, o.Editors)
+	p, err := makeEditProbeTrafficPlan(c, o.Seed, o.EditCount, o.Editors)
+	if err != nil || o.Agents == 0 {
+		return p, err
+	}
+	if o.Agents < 0 || o.Agents > editProbeMaxReaders {
+		return editProbePlan{}, fmt.Errorf("edit-and-probe accepts 0..%d pure readers", editProbeMaxReaders)
+	}
+	// Readers first run a same-run no-edit window; the offered edit schedule,
+	// relative to the edit origin after that window, is unchanged.
+	p.Readers, p.NoEditWindow = o.Agents, int64(editProbeNoEditWindow)
+	return p, nil
 }
 
 func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editProbePlan, error) {
@@ -334,10 +346,10 @@ func (p editProbePlan) budget(deadline time.Duration, builds int) (time.Duration
 		return 0, errors.New("edit-probe deadline overflow")
 	}
 	drain := int64(deadline) * int64(builds)
-	if tail > math.MaxInt64-drain {
+	if p.NoEditWindow < 0 || tail > math.MaxInt64-drain || tail+drain > math.MaxInt64-p.NoEditWindow {
 		return 0, errors.New("edit-probe run budget overflow")
 	}
-	return time.Duration(tail + drain), nil
+	return time.Duration(p.NoEditWindow + tail + drain), nil
 }
 
 func editProbeOperations(plan editProbePlan, c Corpus) []request {
