@@ -434,6 +434,9 @@ type storeCore struct {
 	// bulkFinalizeObserver is a package-private test/diagnostic hook. It runs
 	// synchronously under writeMu and therefore must not call back into Store.
 	bulkFinalizeObserver func(bulkFinalizeEvent)
+	// bulkSealHook is SetBulkSealHookForTest's hook. Per store rather than
+	// package-wide so parallel tests that each own a store do not share it.
+	bulkSealHook atomic.Pointer[func(index string) error]
 
 	// Planner-statistics freshness ledger (planner_stats_freshness.go). It
 	// lives on the core rather than the handle so every AtGeneration view
