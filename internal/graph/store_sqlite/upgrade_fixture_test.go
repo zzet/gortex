@@ -39,8 +39,10 @@ const upgradeFixtureDir = "testdata/upgrade"
 // upgradeFixtureScale is how many synthetic rows a fixture store gets. The
 // default is about a sixth of the graph the daemon builds for this repository
 // today: deep enough for every index rebuild to do real work, small enough
-// for the crash matrix to fit a CI budget. GORTEX_TEST_UPGRADE_STORE runs the
-// same matrix on a full-size real store.
+// for the crash matrix to fit a CI budget. Race and -short runs, the Linux CI
+// leg among them, build a tenth of it; every kill point is a seam, so a
+// smaller store moves no kill off its boundary. GORTEX_TEST_UPGRADE_STORE
+// runs the same matrix on a full-size real store.
 type upgradeFixtureScale struct {
 	nodes, edges int
 }
