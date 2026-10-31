@@ -80,6 +80,7 @@ func (r *editProbeRuntime) collectMoveEvidence(ctx context.Context, s *editProbe
 		all := movePublicFactsComplete(s.record)
 		if accounting.State == "observed_move_windows_checks_pass" {
 			s.record.GraphTerminal = true
+			r.settlePendingLocked(s)
 			s.record.GraphTerminalBasis = "original_move_files_actual_accepted_reconcile"
 		} else if !r.requireAccounting && all {
 			// Old controls may have no instrumentation. Public facts establish only

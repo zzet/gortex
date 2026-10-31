@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -53,11 +56,11 @@ func TestEditProbeReadsClassifyByPendingEditsAndNeverSampleFailures(t *testing.T
 		t.Fatal(got)
 	}
 	r.origin = time.Now().Add(-time.Second)
-	r.editsInFlight.Add(1)
+	r.pendingEdits.Add(1)
 	if got := r.readClass(time.Now()); got != "under_edit" {
 		t.Fatal(got)
 	}
-	r.editsInFlight.Add(-1)
+	r.pendingEdits.Add(-1)
 	if got := r.readClass(time.Now()); got != "between_edits" {
 		t.Fatal(got)
 	}
@@ -81,6 +84,61 @@ func TestEditProbeReadsClassifyByPendingEditsAndNeverSampleFailures(t *testing.T
 	}
 	if summarizeEditProbeReads(nil, 1) != nil {
 		t.Fatal("no readers reported an empty read table")
+	}
+}
+
+// Reads are under edit while a sent edit's receipt is pending. Once its own
+// status is terminal, reads issued while the edit still waits for its probes
+// are between edits.
+func TestEditProbeReadsUnderEditEndWhenTheReceiptTurnsTerminal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	c := editProbeCorpus()
+	plan, err := makeEditProbePlan(c, 42, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, c.File), []byte("package sample\n\n"+c.EditAnchor+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var terminal atomic.Bool
+	run := newEditProbeStubRun(t, ctx, c, plan, dir, 1, func(frame stubFrame) (any, *rpcError) {
+		switch frame.Params["name"] {
+		case "edit":
+			return stubContent(map[string]any{"mutation_receipt": "receipt-1"}), nil
+		case "change":
+			return stubContent(map[string]any{"mutation_id": plan.Steps[0].MutationID, "graph_status": "fresh", "graph_status_terminal": terminal.Load()}), nil
+		}
+		return stubContent(map[string]any{}), nil // probes and readbacks never answer correctly
+	})
+	run.options.Deadline = time.Second
+	run.activate(ctx, plan.Steps[0])
+	awaitEditProbeFirstProbe(t, run.states[0])
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		run.doEdit(ctx, plan.Steps[0])
+	}()
+	await := func(want string) {
+		t.Helper()
+		for deadline := time.Now().Add(2 * time.Second); run.readClass(time.Now()) != want; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("read class never became %s", want)
+			}
+		}
+	}
+	await("under_edit")
+	terminal.Store(true)
+	await("between_edits")
+	select {
+	case <-done:
+		t.Fatal("the edit ended before its probes; a terminal receipt was not observed mid-loop")
+	default:
+	}
+	<-done
+	if got := run.readClass(time.Now()); got != "between_edits" || run.pendingEdits.Load() != 0 {
+		t.Fatalf("pending edits after the loop: %s %d", got, run.pendingEdits.Load())
 	}
 }
 

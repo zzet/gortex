@@ -67,6 +67,8 @@ const editProbeRestartPoll = 5 * time.Millisecond
 // pending. The harness stops waiting for that ACK just before the kill.
 func (r *editProbeRuntime) doRestartEdit(ctx context.Context, step editProbeStep) {
 	s, callCtx, cancel, started := r.beginEdit(ctx, step)
+	r.markPending(s)
+	defer r.settlePending(s)
 	defer s.signalAck()
 	defer s.stopProbes()
 	defer cancel()

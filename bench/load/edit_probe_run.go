@@ -105,6 +105,7 @@ type editProbeState struct {
 	probes                                            sync.WaitGroup
 	started, acknowledged, firstProbeWrite, editWrite time.Time
 	dependencyMet                                     time.Time // a dependency-gated native write may proceed
+	pending                                           bool      // counted in the runtime's pending edits
 	absenceBefore                                     map[string]bool
 	ackReady                                          chan struct{} // closed once a dependent may check this edit: its own ACK is known, or it ended
 	ackOnce                                           sync.Once
@@ -117,7 +118,7 @@ type editProbeRuntime struct {
 	plan              editProbePlan
 	editors           []*socketClient // fixed per ordinal; editors[0] owns run-level controls
 	readers           []*socketClient
-	editsInFlight     atomic.Int64 // sent edits whose completion loop has not returned
+	pendingEdits      atomic.Int64 // sent edits whose receipt is not yet observed terminal and whose loop has not ended
 	reads             []editProbeRead
 	modeCounts        map[string]editProbeModeCounts
 	states            []*editProbeState
@@ -161,7 +162,7 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	}
 	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator", "t_readback/file_graph/relations/search are client times from edit send; t_derived is daemon-clock time from receipt origin and is not additive with them"}}
 	if plan.Readers > 0 {
-		out.Limitations = append(out.Limitations, "pure reads are classed when issued (no-edit baseline before the edit origin, under edit while any sent edit is unfinished, otherwise between edits); an edit sent while a read is in flight does not reclass it")
+		out.Limitations = append(out.Limitations, "pure reads are classed when issued (no-edit baseline before the edit origin, under edit while any sent edit's receipt is not yet observed terminal, otherwise between edits); an edit without a receipt to observe stays pending until its loop ends, and an edit sent while a read is in flight does not reclass it")
 	}
 	if plan.Mode == "toon" {
 		out.Limitations = append(out.Limitations, "TOON is evaluated from the requested text, never a structured JSON sibling; setup, timing-status and restore controls remain explicit JSON with exact numeric handling", "TOON traversal subgraphs omit JSON total_nodes/full untrimmed total_edges and signature metadata; summaries keep full fields, omitted traversal fields are not synthesized", "complete TOON subgraph checks require explicit nontruncation, exact declared node total and the emitted row census; an omitted full edge-count field is not reported as a measured value")
@@ -590,6 +591,32 @@ func (r *editProbeRuntime) beginEdit(ctx context.Context, step editProbeStep) (*
 	return s, callCtx, cancel, started
 }
 
+// A sent edit is pending for read classification until its receipt is first
+// observed terminal, or until its loop ends without that (a failed edit, or a
+// native write, which has no receipt).
+func (r *editProbeRuntime) markPending(s *editProbeState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.pending {
+		s.pending = true
+		r.pendingEdits.Add(1)
+	}
+}
+
+func (r *editProbeRuntime) settlePending(s *editProbeState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r.settlePendingLocked(s)
+}
+
+// The caller holds s.mu.
+func (r *editProbeRuntime) settlePendingLocked(s *editProbeState) {
+	if s.pending {
+		s.pending = false
+		r.pendingEdits.Add(-1)
+	}
+}
+
 // Each edit and its own immediate readbacks use the ordinal's fixed editor;
 // probes and receipt status stay on that edit's separate prober session.
 func (r *editProbeRuntime) editorFor(step editProbeStep) *socketClient {
@@ -615,9 +642,9 @@ func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
 		r.doRestartEdit(ctx, step)
 		return
 	}
-	r.editsInFlight.Add(1)
-	defer r.editsInFlight.Add(-1)
 	s, callCtx, cancel, started := r.beginEdit(ctx, step)
+	r.markPending(s)
+	defer r.settlePending(s)
 	defer s.signalAck()
 	defer s.stopProbes()
 	defer cancel()
@@ -746,6 +773,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
 					s.record.Derived = editProbeDerived(status)
 					s.record.GraphTerminal = status["graph_status_terminal"] == true
+					if s.record.GraphTerminal {
+						r.settlePendingLocked(s)
+					}
 					all := true
 					for _, value := range s.record.FirstCorrect {
 						if value.Value == nil {

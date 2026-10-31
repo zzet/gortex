@@ -11,9 +11,9 @@ const editProbeMaxReaders = 32
 
 // Pure readers run the ordinary reading plan beside the edits. Each call is
 // classed when it is issued: before the edit origin it is the same run's
-// no-edit baseline, afterwards it is under edit while any offered edit is sent
-// but not yet finished, and between edits otherwise. An edit sent while the
-// read is in flight does not reclass it.
+// no-edit baseline, afterwards it is under edit while any sent edit's receipt
+// is pending (not yet observed terminal), and between edits otherwise. An edit
+// sent while the read is in flight does not reclass it.
 type editProbeReadStats struct {
 	Calls    int                `json:"calls"`
 	Busy     int                `json:"busy_refusals"`
@@ -34,7 +34,7 @@ func (r *editProbeRuntime) readClass(at time.Time) string {
 	switch {
 	case at.Before(r.origin):
 		return "no_edit_baseline"
-	case r.editsInFlight.Load() > 0:
+	case r.pendingEdits.Load() > 0:
 		return "under_edit"
 	default:
 		return "between_edits"

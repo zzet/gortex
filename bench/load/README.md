@@ -353,10 +353,12 @@ ordinary reading plan with agent pacing. With readers, the phase opens with a
 30 second no-edit window before the edit origin; the offered edit schedule,
 relative to that origin, is unchanged, and the run budget includes the window.
 Each read is classed when it is issued: `no_edit_baseline` before the origin,
-`under_edit` while any sent edit's completion loop (ACK, readbacks, receipt
-collection) is still running, otherwise `between_edits`. An edit sent while a
-read is in flight does not reclass it, so a read can straddle an edit's start
-by up to its own latency. The report's `reads` table gives, per operation and
+`under_edit` while any sent edit's receipt is pending, otherwise
+`between_edits`. A sent edit is pending until the harness first observes its
+receipt terminal; an edit without one to observe (a failed edit, or a native
+write) stays pending until its loop ends. An edit sent while a read is in
+flight does not reclass it, so a read can straddle an edit's start by up to its
+own latency. The report's `reads` table gives, per operation and
 class, calls, busy refusals, errors, censored calls and the latency quantiles
 of successful calls, in which calls cut off by their deadline or the run end
 rank as censored; busy and failed calls are not applicable. Paired runs refuse

@@ -199,9 +199,9 @@ func (r *editProbeRuntime) doNativeWrite(ctx context.Context, step editProbeStep
 			written = fmt.Errorf("native write dependency failed: ordinal %d has no own acknowledgement", *step.After)
 		}
 	}
-	r.editsInFlight.Add(1)
-	defer r.editsInFlight.Add(-1)
 	s, callCtx, cancel, started := r.beginEdit(ctx, step)
+	r.markPending(s)
+	defer r.settlePending(s)
 	defer s.signalAck()
 	defer s.stopProbes()
 	defer cancel()
