@@ -46,7 +46,11 @@ func schemaFor(t reflect.Type) map[string]any {
 			field := t.Field(i)
 			name := strings.Split(field.Tag.Get("json"), ",")[0]
 			properties[name] = schemaFor(field.Type)
-			required = append(required, name)
+			// Only this new optional Workload extension is omitted. Historical
+			// required lists, including existing omitempty fields, stay intact.
+			if t != reflect.TypeFor[Workload]() || field.Name != "PRSmokeDrain" {
+				required = append(required, name)
+			}
 		}
 		return map[string]any{"type": "object", "properties": properties, "required": required, "additionalProperties": false}
 	case reflect.Map:

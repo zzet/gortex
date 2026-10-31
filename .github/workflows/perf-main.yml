@@ -1,0 +1,47 @@
+name: Trusted main performance binary
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-main-binary-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CGO_CFLAGS: -O2 -g -fno-strict-aliasing
+  CGO_CXXFLAGS: -O2 -g -fno-strict-aliasing
+  GOTOOLCHAIN: local
+
+jobs:
+  main-linux-arm64:
+    # Build-only artifact plumbing needs no reference-capacity claim. Leave
+    # disabled until the owner approves extra hosted scheduling. Dispatch is
+    # not publishable provenance and is deliberately excluded.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.PERF_MAIN_ARTIFACT_ENABLED == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build clean exact-main daemon and artifact writer
+        run: |
+          go build -o "${{ runner.temp }}/perf-main-gortex" ./cmd/gortex
+          go build -o "${{ runner.temp }}/perf-artifact-writer" ./bench/check-budgets
+      - name: Bind binary hash, build settings and exact workflow provenance
+        run: >-
+          "${{ runner.temp }}/perf-artifact-writer" main-artifact
+          --binary "${{ runner.temp }}/perf-main-gortex"
+          --out "${{ runner.temp }}/perf-main-bundle"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: perf-main-linux-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/perf-main-bundle/
+          retention-days: 90
+          if-no-files-found: error

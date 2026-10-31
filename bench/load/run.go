@@ -27,6 +27,7 @@ type runOptions struct {
 	Worktrees        int
 	Seed             int64
 	Duration         time.Duration
+	PRSmokeDrain     time.Duration
 	Deadline         time.Duration
 	WarmTimeout      time.Duration
 	StopTimeout      time.Duration
@@ -64,6 +65,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.Worktrees, "worktrees", 4, "linked worktrees in addition to primary")
 	f.Int64Var(&o.Seed, "seed", 1, "reproducible per-agent request/think plan seed")
 	f.DurationVar(&o.Duration, "duration", time.Minute, "measured workload phase duration")
+	f.DurationVar(&o.PRSmokeDrain, "pr-smoke-drain", 0, "opt-in standalone PR read drain budget after 20s/30s offered duration; unsupported for edits/probes/paired")
 	f.DurationVar(&o.Deadline, "deadline", 120*time.Second, "product call/visibility deadline, independently of phase clipping")
 	f.DurationVar(&o.WarmTimeout, "warm-timeout", 30*time.Minute, "startup/enrichment/public analysis gate budget")
 	f.DurationVar(&o.StopTimeout, "stop-timeout", 30*time.Second, "graceful owned-daemon shutdown budget before force kill")
@@ -74,6 +76,9 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 }
 
 func validateRunOptions(o runOptions) error {
+	if err := validatePRSmokeDrain(o); err != nil {
+		return err
+	}
 	if o.Binary == "" || o.Manifest == "" || o.Scratch == "" || o.Worktrees < 0 || o.Duration <= 0 || o.Deadline <= 0 || o.WarmTimeout <= 0 || o.StopTimeout <= 0 || o.CPUProfile < 0 || o.CPUProfile > o.Duration {
 		return errors.New("run requires --binary, --manifest, --scratch and nonnegative counts and positive budgets")
 	}
@@ -224,6 +229,9 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 	}
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees
 	report.Workload.DurationSec, report.Workload.DeadlineSec, report.Workload.Seed, report.Workload.Profile = o.Duration.Seconds(), o.Deadline.Seconds(), o.Seed, o.Profile
+	if o.PRSmokeDrain > 0 {
+		report.Workload.PRSmokeDrain = &PRSmokeDrain{Version: 1, OfferedSeconds: o.Duration.Seconds(), MaxDrainSeconds: o.PRSmokeDrain.Seconds()}
+	}
 	report.Workload.CPUProfileSec, report.Workload.WarmTimeoutSec, report.Workload.StopTimeoutSec, report.Workload.KeepState = o.CPUProfile.Seconds(), o.WarmTimeout.Seconds(), o.StopTimeout.Seconds(), o.KeepState
 	report.Workload.SessionModel = "per_agent"
 	report.Workload.SweepRepetitions, report.Workload.SweepBudgetSec = o.SweepRepetitions, o.SweepBudget.Seconds()

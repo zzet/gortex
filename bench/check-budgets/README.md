@@ -1,0 +1,433 @@
+# Performance budget checker
+
+The default command consumes repeated, pinned #996 report-v1 files and
+[`../budgets.yaml`](../budgets.yaml). The `collect` subcommand runs the merged
+load client sequentially against private owned daemons; `plan` starts nothing.
+Neither provisions runners nor infers missing observations. The wire mapping is pinned to
+`95b7982bf1853b24bd963a0701aa163d9a72a2de`. The policy and input index reject
+unknown fields. Metric and scenario names are closed tables in `specs.go`.
+
+```sh
+go test ./bench/check-budgets
+go run ./bench/check-budgets --budgets bench/budgets.yaml \
+  --inputs reviewed-inputs.json --lane smoke --out budget-results.json
+```
+
+The output is a before → after table and an optional new JSON evidence file.
+Any breach, missing/null metric, wrong unit, omitted safety/censor count,
+incomplete report, unavailable prerequisite or incomparable measurement exits
+nonzero. Existing output files are never overwritten. The separate
+`perf-gate.yml` workflow publishes readiness, explicitly named **not acceptance**.
+Owned-host measurement jobs are skipped unless their reviewed runner/config
+variables are enabled. There is no formal PR smoke measurement job yet: hosted
+ARM has its own scoped profile and exact smoke observations/scheduling remain
+unavailable. Readiness cannot satisfy a required performance acceptance check.
+
+## Repeated evidence and comparison identity
+
+An input index has `schema_version: 1`, full `candidate_revision`,
+`main_revision`, `tag_revision`, a default `repeats` of at least three, and
+`hosts` mapping reviewed host classes to exact observed machine IDs. `runs`
+contains `{role, host_class, scenario, repeat, report}` records; paths are
+relative to the index or absolute. Roles are `candidate`, `main`, and `tag`.
+The shipped tag is pinned to v0.64.10 / defa9f8e. `scenario_repeats` can declare
+larger planned counts, notably `{"idle-stop-20":20}`. A row's `min_repeats`
+cannot reduce the three-repeat minimum. Every planned repeat must be present;
+missing or failed repetitions are not discarded. Reusing a report/run identity
+does not constitute additional repetitions.
+
+All roles within a matching repeat must have the same observed host/limits,
+corpus commits and logical targets, actual normalized workload and request-plan
+hash. Different owned source paths are expected and are excluded from corpus
+identity. Repetition seeds may vary, but only the seed may vary across repeats;
+it must agree across roles in that repeat. The load32/load8 denominator permits
+only the intentional agent-count difference and still requires matching seeds.
+Missing or non-hex plan hashes fail. No other load/scoping difference is silently
+normalized. Paired native reports and saturation reports are rejected as formal
+capacity evidence rather than relabeled as independent agent runs.
+
+The policy has 837 rows: 689 block and 148 guard. Its 38 PR smoke targets use
+`hosted_arm_smoke`, exclusively for the issue's `ubuntu-24.04-arm` lane. This is
+the public standard four-CPU runner, rather than reference-capacity evidence.
+The harness reports actual native Linux ARM64 CPU/memory/disk observations;
+the consumer requires four logical CPUs, positive observed memory/disk values,
+and current GitHub-hosted Linux ARM job attestation. Advertised 16-GB memory
+and 14-GB disk are not fabricated exact byte observations. All 38 targets,
+units, comparisons and repetition minima are unchanged. This profile is illegal
+for nightly/release policy or checking. See the
+[official runner inventory](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
+Reference Linux still requires actual validated cgroup/host observations: 8 CPU,
+16 GiB memory and a 57–60 GiB usable filesystem. Native Mac class assignment
+requires a separately reviewed runner inventory; the checker binds it to the
+exact Darwin ARM64 machine and reported limits, without claiming to discover
+whether a host is reference or large. Linux PSS and Mac physical footprint are
+distinct fixed memory observations, compared only within the same host class
+and measurement identity. Neither silently substitutes RSS when unavailable.
+
+Each repeat contributes its own p95/p99/p50 or counter observation. The checker
+uses the median of at least three repeats, not a pooled percentile. A ratio row
+uses the ratio of repeated medians. Hard edit/stop maxima, zero-safety counters
+and correctness floors apply to every repeat; a median cannot hide one bad
+run. Complete reports must retain successful stop evidence, zero crashes and
+uncensored/error-free observations. Busy attempts remain in the busy-fraction
+denominator, including refused attempts whose eventual retry succeeded.
+Linux OOM safety requires the authoritative `scenario_cgroup_oom_kills` event
+delta alongside zero log counts. Missing counters fail. Mac authoritative
+OOM-kill evidence is an explicit prerequisite; zero OOM log lines are not
+substituted for zero kills.
+
+## Limits and named allowances
+
+`block` uses its absolute target. In smoke, p95 observations also fail when their
+median is more than 20% worse than main; `read_p95_vs_main` expresses the read
+comparison without inventing an absolute one-repo p95 ceiling.
+
+`guard` starts with the shipped median × 1.15. Only a disk/memory cell whose
+pinned main median already exceeds shipped × 1.15 selects main instead. This
+selection is independent of the candidate. A missing shipped observation cannot
+trigger fallback. Named additive allowances then add their declared amounts.
+
+The WAL-reclaim allowance is a **guard limit**, not an extra 2 GiB and not an
+absolute cap: the resulting limit is `max(noise-adjusted baseline, 2048 MiB)`.
+The table/JSON retain the effective added headroom. A baseline already above
+2 GiB keeps its noise allowance; the WAL entry adds zero headroom in that case.
+The pending-edit and dispatch-queue allowances add 64 MiB each only where
+explicitly named/applicable, with their owning releases recorded.
+
+A guard can retain a known future absolute `target`, ignored until its mode
+changes to `block`. Guard allowances are not applied after that promotion.
+An unknown future target is explicitly null. Unresolved `owning_release` is
+explicitly `unassigned`, legal only for guards; those rows cannot be promoted
+without resolving ownership. No measured baseline numbers live in the policy.
+
+Known scheduling evidence: #1065 owns 15 MiB/edit at 1/4/8 agents in v0.64.15;
+#1061 owns the 8/16-worktree peak in v0.64.14; #1076 owns distinct 60-second
+idle/Go-Sys observations in v0.64.16; #1088 owns noncold WAL in v0.64.17; #1092
+states the 1 MiB/min idle-write goal in v0.65.0. The conditional 6 MiB/edit
+diff-on target from #1075 is **not** made the default: it depends on 14 clean
+nightlies. #997 names v0.64.14 for cold writes while #1073's actual milestone is
+v0.64.15; the policy uses the concrete owning issue's v0.64.15 milestone and
+records that cross-reference conflict. Its future absolute target remains null
+until the 20/40/45 GiB cells have matching measured topology definitions.
+Generic peak/2-second-idle ownership
+remains unassigned rather than borrowing stronger, different observations.
+
+## Exact frozen-wire mapping and prerequisites
+
+| Policy observation | Frozen source / limitation |
+| --- | --- |
+| Edit acknowledgement | `edit_latency_ms.p95/max`, ms converted to s; not indexed visibility |
+| Read p95 | Successful workload `attempts[].logical_ms`, nearest-rank per repeat; includes backoff, excludes think time |
+| Tool timing | `tools[search.symbols/read.source/explore.outline/analyze.dead_code].latency_ms`; completed count required |
+| Busy fraction | Workload busy attempts / all workload attempts; probes use another denominator |
+| CPU, WAL, stop | Phase metrics `daemon_cpu_avg_cores`, `peak_wal_bytes`, `stop_seconds`; actual `force_killed` required |
+| Memory | Linux PSS / Mac physical footprint, with distinct peak and `idle_after_2s_` keys |
+| Cold bytes | `startup_logical_written_bytes`; startup includes enrichment/analysis, not an isolated parser call |
+| MiB/edit | Top-level inferred-contained patch WAL + main counters / acknowledged edits; reject missing, reset/lower-bound, boundary or overlapping evidence. This is amortized process-interval activity, not exclusive edit ownership. Tag cannot emit the new counters: an approved equivalent baseline strategy or explicit policy change is needed; whole-process bytes are not substituted. |
+| Exact file readback/correctness | Missing. Indexed new-symbol visibility and mixed reading bursts are weaker observations. |
+| Unflagged stale output / relations / derived lag | Missing structured output-mode correctness/publication observations; never inferred from visibility. |
+| Reclaim writer hold / read-gate closures / cancellation release | Missing distributions/censuses, not inferred from WAL size or client deadline. |
+| Primary stale refusals / restart refusal census / ready-to-first-OK | Missing structured reason and configured-root/worktree probes. Launch-to-queryable is not ready-to-first-OK. |
+| Six-repo per-scope sweep | Frozen `sweep` loads only manifest[0]. `many`'s fast read mix is not the required sweep. |
+| Linked-worktree edit probes | Frozen `worktrees` drives read bursts; its CPU/memory are not the combined edit scenario. |
+| Idle/churn/schema21/freelist/lapsed/stop20 fixtures | Not distinct measured CLI scenarios yet. Stop20 requires 20 planned reports, not three zeros. |
+| 60-second idle / cold Go Sys peak / idle bytes per minute | Missing. Two-second footprint and status snapshots cannot stand in for those intervals. |
+
+Known unavailable metrics/scenarios stay declared and fail with their reason;
+they are not silently omitted from the selected host/lane. The staged rows and
+synthetic unit fixtures do not prove any owning product target passes.
+
+## Collection, history and release entry point
+
+```sh
+# Source-only preflight. Exits nonzero with the exact unavailable prerequisites.
+go run ./bench/check-budgets plan --lane smoke --host-class hosted_arm_smoke --out NEW-smoke-plan.json
+go run ./bench/check-budgets plan --config reviewed-lane.json
+
+# Run supported observations and retain every failure. The full policy still
+# fails when a mandatory fixture/metric is unavailable; this is not a subset pass.
+go run ./bench/check-budgets collect --config reviewed-lane.json --out NEW-evidence-dir
+go build -o /benchmark/bin/release-gate ./bench/release-gate
+/benchmark/bin/release-gate --config reviewed-release.json --out /benchmark/NEW-release-dir
+
+# Inspect downloaded scheduled-main artifacts, replay all passing raw reports,
+# require five actual adjacent UTC dates, and flag two-night row misses.
+go run ./bench/check-budgets history --inputs downloaded-nightlies.json \
+  --through 2026-10-30 --hosts reference_linux
+```
+
+Build the release entry before invoking it so a supervisor can address its PID
+directly, without an outer `go run` process. It invokes the Go tool from `PATH`
+to compile the checker into a fresh owned temporary directory before workloads;
+select the repository's pinned toolchain there and use `GOTOOLCHAIN=local`.
+Once workloads can exist, it launches the compiled collector directly. SIGTERM
+or Interrupt sent only to the entry PID is forwarded to that collector, and
+the entry waits for its cleanup and retained stop receipts before exiting.
+The temporary binary is then removed; evidence is preserved. Compilation counts
+toward the same release start time, cleanup reserve and wall-time receipt.
+
+`downloaded-nightlies.json` is an array of retained artifact-directory paths,
+relative to that index or absolute. Review their run provenance before use:
+this command checks local content and replays raw evidence, not the authenticity
+of arbitrary local files. Only `schedule` events on `refs/heads/main` count.
+Dispatch, readiness, duplicate host/date, omitted dates, shortened tables and
+changed policies cannot manufacture five accepted nights. Use `--through` for
+the last required night before the candidate; stale history is not a current
+release verdict. Consecutive block misses are labeled `BLOCKER`; consecutive
+disk/memory guard misses are labeled `GUARD REVIEW`. Missing history fails.
+The workflow preserves each artifact; downloading/curating the history index
+and calling this check before the first RC remain release-owner actions.
+
+A lane configuration is strict schema1 JSON. Example below is **configuration
+shape only**, with synthetic paths/revisions and no measured baseline:
+
+```json
+{
+  "schema_version": 1,
+  "lane": "release",
+  "host_class": "reference_linux",
+  "machine": "reviewed-machine-id",
+  "load_binary": "bin/load",
+  "manifest": "corpus.json",
+  "builds": {
+    "candidate": {"binary": "bin/candidate", "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    "main": {"binary": "bin/main", "revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    "tag": {"binary": "bin/tag", "revision": "defa9f8e7a670792b5b693744d88488f741a8160"}
+  },
+  "repeats": 3,
+  "duration": "120s",
+  "deadline": "120s",
+  "warm_timeout": "30m",
+  "stop_timeout": "30s",
+  "sweep_duration": "10m",
+  "sweep_repetitions": 15
+}
+```
+
+Paths in the configuration resolve relative to its file. Manifest sources are
+absolute read-only inputs under the #996 contract; outputs must not overlap
+them, including through symlinks. Use `gortex` and `corpus-1` through `corpus-5`
+aliases. The collector selects one manifest entry for each single-repo sweep,
+the first entry for ordinary one-repo scenarios, and six for `many-edit`.
+It does not relabel the frozen one-root sweep as a six-root sweep, or reading
+worktrees as editing worktrees. Floor configs are refused until the supported
+envelope has an explicit policy and fixtures; floor evidence cannot become
+reference evidence.
+
+Each supported scenario runs the policy's full planned repetitions with matching
+seeds across roles and rotating sequential main/candidate/tag order. Tag runs
+are needed only for scenarios with guard rows. Release plans require at least
+ten warm restarts and twenty idle stops. The latter fixture is unavailable and
+does not become twenty generic clean stops. The collector retains `inputs.json`,
+raw reports/logs, a JSON budget table and text table when reports are decodable,
+plus `lane.json` with failed/missing tasks, wall time and workflow provenance.
+If startup fails before any raw report exists, the receipt/index still retain
+the failure. No failed repeat is discarded. Collector cancellation interrupts
+the load client and waits for owned-daemon cleanup rather than killing the
+client first. The release collector interrupts workload at seven hours and
+57 minutes, reserving three minutes for the harness's independent owned-daemon
+stop (configuration requires at most two minutes), logs, cleanup and checking.
+It counts all
+startup, teardown and checking toward the actual wall limit. An overrun fails;
+this is not a claim that the subset has measured under eight hours.
+
+The nightly jobs build the exact clean workflow candidate and load client.
+`--expected-candidate` binds the candidate revision; the harness rejects binary
+metadata disagreement. The owner supplies pinned standalone main/tag binaries,
+corpora and machine binding via `PERF_REFERENCE_NIGHTLY_CONFIG` or
+`PERF_MAC_NIGHTLY_CONFIG`, and enables only the matching `*_ENABLED` variable.
+Dedicated labels are `perf-reference-linux` and `perf-apple-silicon`. These jobs
+never execute PR code on owned hosts. No registration, service install, secret
+or infrastructure change is performed. Before enabling artifact publication,
+review neutral corpus labels and runtime paths; do not publish private source
+names or local benchmark paths. Repository/organization retention settings must
+actually permit the requested 90 days.
+
+The reviewed inventory must name each runner's exact reported `machine`, class,
+OS/architecture, kernel and observed limits. Linux requires an existing isolated
+cgroup v2 with effective 8 CPUs/16 GiB, sufficient physical capacity, and an
+observed 57–60 GiB benchmark filesystem. Mac requires Darwin ARM64 and an
+explicit reference/large classification; its uncapped measurements must not be
+relabeled Linux capacity. Each dedicated host needs a clean checkout, Go from
+`go.mod`, the required C/C++ compiler, the pinned standalone controls and corpus,
+and enough exclusive time to avoid simultaneous benchmark sessions. The
+workflow requests only `contents: read`; artifact upload uses the Actions job's
+normal artifact runtime token. No write-scoped PAT or repository secret is
+needed by the collector. Restrict the runner group to this repository's trusted
+main workflow and dedicated labels, and review neutral artifact contents before
+enablement. Runner registration, any host changes and repository variables are
+separate owner-approved infrastructure actions. No existing VM is adopted.
+
+After that review, the owner places the external config, sets only its matching
+config-path variable, and sets `PERF_REFERENCE_NIGHTLY_ENABLED` or
+`PERF_MAC_NIGHTLY_ENABLED` to `true`. A manual main dispatch can verify plumbing
+but cannot count as one of the five scheduled nights. Leave both enabled
+variables unset while prerequisites remain; GitHub displays measurement jobs
+as skipped. Removing the variable stops future scheduling without cancelling
+an in-flight owned daemon. A host being busy is reason to leave its lane
+disabled, not to attach to an unrelated active session.
+
+## Trusted exact-main artifacts and same-job smoke
+
+`perf-main.yml` is an opt-in build-only producer, separate from CI tests and
+measurement jobs. `PERF_MAIN_ARTIFACT_ENABLED` remains unset. Its trusted main
+push binds a clean daemon's full VCS SHA, pinned Go/C/C++ flags, platform,
+workflow run/attempt and binary hash in a two-file bundle. No build-host timing
+is compared with PR measurements. Current retained artifacts have no usable
+main daemon or benchmark bundle; publishing the first reviewed exact-main
+artifact remains required.
+
+```sh
+# Supply the job-scoped GH_TOKEN. The consumer needs actions: read for run/
+# artifact metadata and downloads, alongside contents: read; no write PAT.
+go run ./bench/check-budgets fetch-main --main-revision FULL_MAIN_SHA \
+  --out /benchmark/NEW-main-bundle
+
+go run ./bench/check-budgets collect --config reviewed-smoke.json --job-host \
+  --out /benchmark/NEW-smoke-evidence
+
+go run ./bench/check-budgets verify-smoke --evidence /benchmark/smoke-evidence \
+  --main-bundle /benchmark/main-bundle
+```
+
+The lookup accepts exactly the requested full main revision from the dedicated
+successful push workflow/repository, never a PR/fork, another workflow, older
+green revision, expired artifact, missing digest or mismatched platform. The
+newest successful matching run/attempt must have exactly one bundle. GitHub's
+archive SHA256, safe ZIP file inventory, bundled binary hash and metadata are
+verified. Redirects cannot forward authentication to another host. Offline
+verification checks content; trusted GitHub download/owner review still provide
+provenance, not arbitrary local JSON.
+
+A smoke config requires `main_artifact` pointing to that downloaded directory,
+and `builds.main.binary` to its `gortex` file. Both main and candidate execute
+sequentially in this one PR run/attempt/job under the same host/corpus/workload.
+Go/platform/build settings must match; only VCS revision/time differ. Every raw
+report start must lie inside its recorded task interval. The unchanged checker
+then applies all planned repeats, absolute limits, deterministic counters,
+median-of-three p95 and +20% rule. `--job-host` binds the actual ephemeral
+hostname only for this owned hosted PR context; it cannot relabel reference
+capacity. Missing jobs, stale reports, mismatched builds or incomplete policy
+remain failures.
+
+## Microbenchmark and benchstat integration
+
+`microbench --inputs reviewed-micro.json --out NEW-DIR` runs prebuilt exact-main
+and candidate test executables for the existing CI packages on the same job:
+`internal/parser/languages`, `internal/query`, and `internal/graph`. It requires
+at least three sequential repeats, rotates build order, retains all raw outputs
+and failures, and refuses differing benchmark/unit censuses. It invokes only
+buildinfo-verified benchstat at the existing `bench-arm.yml` pin:
+`golang.org/x/perf/cmd/benchstat@v0.0.0-20260409210113-8e83ce0f7b1c`.
+No module dependency or new version is selected. Build tools/test executables
+with the pinned Go; use `go test -c -buildvcs=true` and required C/C++ flags so
+clean test-binary VCS/build identity is present.
+
+The strict JSON input fields are `schema_version:1`, `main_revision`,
+`candidate_revision`, `fixture`, `fixture_revision`, `benchstat_binary`,
+`benchtime`, `timeout`, `repeats`, and `binaries`. The latter maps exactly those
+three package paths to `{main,candidate}` executable paths. Paths resolve
+relative to the config. Time/iteration profile and timeout are explicit; no
+shorter profile is silently chosen. The query benchmark indexes `../..`, so
+both builds run from package directories under the **same clean pinned fixture
+snapshot**, never arbitrary binary-download CWDs. Fixture cleanliness is checked
+again after runs and before benchstat. Changed input fails. Interrupted/missing
+samples remain failed evidence. Benchmark-only processes get an Interrupt then
+a two-second kill/join bound; abnormal exit/context errors cannot become success.
+The daemon collector instead joins owned cleanup without killing its client.
+
+Outputs include per-run raw text, combined main/candidate samples, benchstat
+text and `microbench.json`. `formal_acceptance` is always false: the workload
+gate must independently pass. Trusted publication/retrieval of the **three main
+test executables** is not part of the current daemon-only artifact format;
+its packaging/hashes/build flags need review before PR enablement. Synthetic
+fixture tests are not measured benchmark evidence.
+
+## PR scheduling feasibility remains unresolved
+
+The standalone collector plans five steps × two builds × three repeats: 30 owned
+scenario starts once fixtures exist. At 120-second read and edit windows, those
+two workloads alone consume 24 minutes, before startup, sweep, restart, stop,
+compilation/download or microbenchmarks. Even 60-second windows consume 12
+minutes. The manual 15-repeat/21-operation sweep and three fresh query benchmark
+processes per build add paced calls and cold fixture indexing. This does not
+honestly establish the required 15-minute lane.
+
+The first experiment should be an explicitly named **PR-only 20- or 30-second
+profile**, leaving nightly/release settings frozen. The issue does not mandate
+60/120-second PR windows. All five steps, 21 sweep operations, exact readback,
+absolute/deterministic thresholds, same-job repeats and counters remain required.
+A one-repeat sweep is already explicit in the load CLI and still executes every
+operation. No shorter profile reuses timing evidence from a different workload.
+
+An optimistic calculation makes the tradeoff reviewable, not accepted. Mean
+agent think is 3.5 seconds and mean burst is four calls. Assuming 0.4-second
+read-burst wall time, load16 offers about 492 calls in 30 seconds or 328 in 20.
+Assuming another 0.35 seconds for an edit acknowledgement **and indexed visibility**,
+edit4 yields about 28 edits/113 reads or 19 edits/75 reads. That visibility
+assumption is not the exact-file-readback target and is unmeasured; slower
+publication reduces these counts. A roughly ten-operation read mix means only
+about 11/7 source calls per edit report, making nearest-rank p99 effectively a
+maximum. Retain actual per-tool counts and measure adequacy/flake; the estimate
+cannot stand in for them. Sweep1 requires five to seven 3–5-call bursts, hence
+10–35 seconds of think time before call latency.
+
+For 30-second read/edit windows, an assumed 25-second sweep, 1.5-second restart
+and 3-second idle stop yield 537 seconds across six build/repeats. Thirty
+existing two-second settle periods add 60 seconds, leaving 303 of the 900-second
+budget for thirty cold starts, download/build, microbenchmarks, drain and logs.
+Twenty-second windows leave 423 seconds instead. Actual cold-index/publication
+cost and microbenchmark setup decide feasibility. If these do not fit, evaluate
+warm reuse/restoration then; do not first require a new restoration framework.
+
+Before changing the active owner's runtime, coordinate these exact touchpoints:
+`run.go`/`plan.go` for an explicit PR offered-window/drain profile and matching
+workload identity; `scenario.go` to stop offering calls while draining admitted
+calls to product deadlines (the current phase-end context instead censors them);
+exact readback/publication and idle-stop fixture observations; and sweep1
+configuration with complete inventory. Any drain/timeout is retained and counts
+in wall time. A reviewed profile must pass real sample/probe sufficiency and
+20-run/seeded trials. Stores, if later reused, must remain private, validated for
+their own binary/schema and restored to identical source topology; candidate
+cannot blindly reuse main state. No `bench/load` runtime/client is edited here.
+
+Keep performance outside `ci.yml` and on its specified ARM lane. Extra artifact
+production can still contend for hosted account concurrency, so rollout also
+requires the real 20-PR wall comparison. No runner or job is enabled by this
+source plan.
+
+## Remaining lane and acceptance work
+
+Before enabling measurement jobs or external setup, review the source plan,
+official baseline evidence and resolved metrics above.
+No self-hosted runner is currently registered. A runner owner must provide the
+reference cgroup/disk and reviewed Apple host inventory; this command does not
+register services, alter Docker/Brew, install runners, set secrets or spend
+model calls. A PR smoke lane must remain separate from CI test jobs and run on
+`ubuntu-24.04-arm`; protected-main nightlies require available owned hosts.
+Reports/table artifacts need effective retention of at least 90 days.
+
+The implemented plan declares all five smoke steps but refuses the unavailable
+idle-stop fixture and exact observations. Exact-main retrieval, same-job admission and the Go microbenchmark/benchstat
+runner are implemented source. The measured phased PR driver, trusted main test-
+binary packaging and feasible duration/probe profile remain to implement and
+validate before enabling measurements.
+The frozen default
+60-second duration is not a measured feasibility guarantee; the retained native
+read1 cohort used 120-second windows. Those 120-second read/edit windows repeated
+three times already consume substantial time; do not assume the full lane fits
+15 minutes. Any shorter smoke profile
+needs matching baselines and enough observations, not reused 120-second data.
+Nightly/release plans must preserve failed/censored runs, consecutive-night row
+history, floor-host scope restrictions and every daemon's stop/lock receipts.
+The floor class and extra lifecycle adapters require explicit reviewed support;
+do not relabel floor runs as reference Linux.
+
+Actual acceptance is still required: 20 real smoke runs for wall-time/flake
+rates, linked seeded latency/edit-wait regressions, five actual nights on main,
+a seeded nightly failure, a measured release subset under eight hours per host,
+no forced daemons, and 20-PR CI wall-time comparison. None is simulated by unit
+tests. #996 must land before #997; #998 is merged. #1000's deferred 400-task
+harness is not recreated here. A small release scripted-agent fixture remains
+separate future work, requiring its own reviewed plan.
