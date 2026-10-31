@@ -3519,6 +3519,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// The builtin sentinels the drain is about to move, kept aside for
 			// the re-assert below. See restampedBuiltins.
 			var restampedBuiltins []*graph.Node
+			nodeDrainStopped := false
 			for nodes := range inMemShadow.DrainNodeBatches(persistChunkRows, persistChunkBytes) {
 				for _, node := range nodes {
 					if node != nil && graph.IsBuiltinStub(node.ID) {
@@ -3528,10 +3529,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				}
 				if err := drainAddBatch(ctx, diskTarget, nodes, nil); err != nil {
 					// A refused write fails every later batch the same way, and
-					// a cooperative stop is final; either ends the node drain.
+					// a cooperative stop is final; either ends the drain, so the
+					// edge drain below writes nothing for this failed build.
 					if retErr == nil {
 						retErr = drainBatchError(ctx, err)
 					}
+					nodeDrainStopped = true
 					break
 				}
 				if retErr != nil && drainChecksCancellation(ctx) && ctx.Err() != nil {
@@ -3586,6 +3589,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				drainPressure.afterNodeBatch(nodeRows)
 			}
 			for edges := range inMemShadow.DrainEdgeBatches(persistChunkRows, persistChunkBytes) {
+				if nodeDrainStopped {
+					break
+				}
 				if drainChecksCancellation(ctx) && ctx.Err() != nil {
 					if retErr == nil {
 						retErr = fmt.Errorf("indexer: cooperative drain stopped: %w", ctx.Err())

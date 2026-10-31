@@ -479,6 +479,7 @@ func TestFirstIndexFailureRestoresStore(t *testing.T) {
 				var storageErr *store_sqlite.StorageError
 				require.ErrorAs(t, err, &storageErr)
 				assert.Contains(t, store_sqlite.SafeStorageFailureReason(err), "SQLite code 13")
+				assert.Equal(t, 1, batches, "a refused write must be the drain's last")
 			case "seal error":
 				_, err := idx.IndexCtx(ctx, dir)
 				require.ErrorContains(t, err, "nodes_by_kind")
