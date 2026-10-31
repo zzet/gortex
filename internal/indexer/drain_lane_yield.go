@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -156,4 +158,21 @@ func drainBatchError(ctx context.Context, err error) error {
 		return fmt.Errorf("indexer: cooperative drain stopped: %w", err)
 	}
 	return fmt.Errorf("indexer: persist bulk graph batch: %w", err)
+}
+
+// retryBulkFlushAfterPanic retries a FlushBulk that panicked, once, while that
+// panic is unwinding. The retry recovers its own panic and only logs what it
+// hit, so the original panic is the one that reaches the caller. Under an
+// outer coordinated or generation window FlushBulk is a no-op, so this is too.
+func retryBulkFlushAfterPanic(bl graph.BulkLoader, logger *zap.Logger, repo string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("indexer: bulk flush retry after panic panicked",
+				zap.String("repo", repo), zap.Any("panic", r))
+		}
+	}()
+	if err := bl.FlushBulk(); err != nil {
+		logger.Error("indexer: bulk flush retry after panic failed",
+			zap.String("repo", repo), zap.Error(err))
+	}
 }

@@ -1546,6 +1546,30 @@ SELECT NOT EXISTS(SELECT 1 FROM nodes WHERE view_gen = ?)
 	return err == nil && empty == 1
 }
 
+// WriterPragmaForTest reads an integer PRAGMA off the store's writer
+// connection: the pinned bulk connection while a window holds one, the single
+// writer-pool connection otherwise. PRAGMAs such as synchronous are
+// connection-local, so a read-pool connection cannot show what the writer runs
+// with. It takes the write gate under ctx, so a deadline also proves the gate
+// is free. name must be a bare PRAGMA name.
+func (s *Store) WriterPragmaForTest(ctx context.Context, name string) (int64, error) {
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && r != '_' {
+			return 0, fmt.Errorf("store_sqlite: not a pragma name: %q", name)
+		}
+	}
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return 0, err
+	}
+	defer s.writeMu.Unlock()
+	conn, release, err := s.activeWriteConnLocked(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	return pragmaInt(ctx, conn, name)
+}
+
 // pragmaInt reads a single-integer PRAGMA (synchronous, cache_size, wal_autocheckpoint) off the
 // given connection.
 func pragmaInt(ctx context.Context, conn *sql.Conn, pragma string) (int64, error) {

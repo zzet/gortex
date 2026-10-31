@@ -6,8 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,8 +29,6 @@ type firstIndexBulkProbe struct {
 	duringDrain func()
 	ftsErr      error
 	panicDrain  bool
-	panicFlush  bool
-	flushMu     sync.Mutex
 	begins      int
 	flushes     int
 	batches     int
@@ -74,15 +72,18 @@ func (s *firstIndexBulkProbe) BatchUpsertSymbolFTS(items []graph.SymbolFTSItem) 
 
 func (s *firstIndexBulkProbe) FlushBulk() error {
 	s.flushes++
-	if s.panicFlush {
-		// Model a FlushBulk panic that leaves its writer lock held.
-		s.flushMu.Lock()
-		panic("injected flush panic")
-	}
 	return s.Store.FlushBulk()
 }
 
 func newFirstIndexBulkFixture(t *testing.T) (*firstIndexBulkProbe, *sql.DB) {
+	t.Helper()
+	store, db := newFirstIndexStore(t)
+	return &firstIndexBulkProbe{Store: store}, db
+}
+
+// newFirstIndexStore opens a fresh on-disk store for the shadow route with a
+// read-only pool beside it for schema probes.
+func newFirstIndexStore(t *testing.T) (*store_sqlite.Store, *sql.DB) {
 	t.Helper()
 	t.Setenv("GORTEX_SHADOW_MAX_FILES", "1000000")
 	t.Setenv("GORTEX_SHADOW_MAX_BYTES", "1073741824")
@@ -94,7 +95,19 @@ func newFirstIndexBulkFixture(t *testing.T) (*firstIndexBulkProbe, *sql.DB) {
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=synchronous(NORMAL)")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	return &firstIndexBulkProbe{Store: store}, db
+	return store, db
+}
+
+// firstIndexWriterSynchronous reads PRAGMA synchronous off the store's writer
+// connection. It takes the write gate under a deadline, so it also fails,
+// rather than hangs, when a failure path leaked the gate.
+func firstIndexWriterSynchronous(t *testing.T, store *store_sqlite.Store) int64 {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sync, err := store.WriterPragmaForTest(ctx, "synchronous")
+	require.NoError(t, err, "the store's write gate is still held")
+	return sync
 }
 
 func firstIndexFixtureRepo(t *testing.T) string {
@@ -340,27 +353,37 @@ func TestFirstIndexFailureRestoresStore(t *testing.T) {
 }
 
 func TestFirstIndexFlushPanicPropagates(t *testing.T) {
-	// Given a FlushBulk implementation that panics while holding its writer lock.
-	probe, _ := newFirstIndexBulkFixture(t)
-	probe.panicFlush = true
-	idx := newFirstIndexBulkIndexer(t, probe, "repo")
+	// Given a real store whose dense-index seal panics once, inside the
+	// drain's explicit FlushBulk.
+	store, db := newFirstIndexStore(t)
+	indexes := firstIndexSchemaIndexes(t, db)
+	writerSync := firstIndexWriterSynchronous(t, store)
+	seals := 0
+	defer store.SetBulkSealHookForTest(func(string) error {
+		seals++
+		if seals == 1 {
+			panic("injected seal panic")
+		}
+		return nil
+	})()
+	idx := newFirstIndexBulkIndexer(t, store, "repo")
 	idx.indexMemoryAdmission = newIndexMemoryAdmissionBudget(defaultIndexMemoryAdmissionBytes)
-	// The probe's lock is independent of Store; close the real bulk window at cleanup.
-	t.Cleanup(func() { require.NoError(t, probe.Store.FlushBulk()) })
 
-	// When the completed shadow drain flushes, it must not retry that locked call.
-	require.PanicsWithValue(t, "injected flush panic", func() {
+	// When the completed shadow drain flushes, the panic reaches the caller.
+	require.PanicsWithValue(t, "injected seal panic", func() {
 		_, _ = idx.IndexCtx(context.Background(), firstIndexFixtureRepo(t))
 	})
 
-	// Then the panic propagates and the backstop does not re-enter FlushBulk.
-	// This fixture has no failure-ledger rows, so it does not cover a real
-	// store whose FlushBulk panics with writeMu held while the ledger is dirty.
-	assert.Equal(t, 1, probe.flushes)
-	assert.Same(t, probe, idx.graph)
+	// Then the backstop retried the flush once while the panic unwound, and
+	// the retry sealed and closed the window: the write gate is free, the
+	// writer is back at its own durability, and every index is rebuilt.
+	assert.Greater(t, seals, 1, "the backstop did not retry the panicked flush")
+	assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store))
+	assertFirstIndexRestored(t, store, db, indexes)
+	assert.Same(t, store, idx.graph)
 	assert.Positive(t, idx.indexMemoryAdmission.snapshot().peak, "fixture must acquire the memory lease")
 	assert.Zero(t, idx.indexMemoryAdmission.snapshot().used, "earlier defers must release the memory lease")
-	assertFirstIndexNoReceipts(t, probe.Store, "repo")
+	assertFirstIndexNoReceipts(t, store, "repo")
 }
 
 type firstIndexDrainPanicReporter struct{}
