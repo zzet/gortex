@@ -201,7 +201,7 @@ func TestObserveCheckoutPathRetainsStaleObservationAcrossRetries(t *testing.T) {
 	if job == nil || job.ctx.Err() != nil {
 		t.Fatal("stale refusal did not retain a live discovery job")
 	}
-	// The retained job owns capacity and a worker until expiry or shutdown.
+	// The retained job holds a worker until expiry or shutdown.
 	lc.closeCheckoutObservations()
 	if !errors.Is(job.ctx.Err(), context.Canceled) {
 		t.Fatalf("Close did not cancel retained stale discovery: %v", job.ctx.Err())
@@ -261,6 +261,128 @@ func TestObserveCheckoutPathUnknownFamilyAndDeniedScopeHaveNoSideEffects(t *test
 	after, err := os.ReadFile(configPath)
 	if err != nil || string(before) != string(after) {
 		t.Fatalf("refused observation changed config: %v", err)
+	}
+}
+
+// One family's stuck discovery bounds only that family. Its own new paths are
+// refused, another known family's new worktree still gets its identity, and a
+// path outside every known family never takes a discovery slot.
+func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
+	lc, _, primary, familyID, _, _ := newCheckoutObservationFixture(t)
+	base := filepath.Dir(primary)
+	other := filepath.Join(base, "other")
+	if err := os.Mkdir(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	builderGit(t, other, "init", "--initial-branch=main")
+	builderWriteTree(t, other, builderTreeA())
+	builderGit(t, other, "add", "-A")
+	builderGit(t, other, "commit", "-m", "other")
+	tracked, err := lc.Register(t.Context(), config.RepoEntry{Path: other, Name: "other"}, TrackSourceCLI)
+	if err != nil || tracked.CatalogErr != nil {
+		t.Fatalf("register other family: %v %v", err, tracked.CatalogErr)
+	}
+	stuck := filepath.Join(base, "stuck")
+	builderGit(t, primary, "worktree", "add", "-b", "stuck", stuck)
+	late := filepath.Join(base, "late")
+	builderGit(t, other, "worktree", "add", "-b", "late", late)
+	outside := []string{filepath.Join(base, "plain")}
+	for i := range 40 {
+		outside = append(outside, filepath.Join(base, fmt.Sprintf("unknown-%d", i)))
+	}
+	for i, dir := range outside {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if i > 0 {
+			builderGit(t, dir, "init", "--initial-branch=main")
+		}
+	}
+	release := make(chan struct{})
+	defer close(release)
+	stuckRoot := pathkey.CanonicalExistingRoot(stuck)
+	var entered atomic.Int32
+	lc.observationInventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
+		if pathkey.HasPathPrefix(path, stuckRoot) {
+			entered.Add(1)
+			<-release // Git or a mount that ignores cancellation.
+			return nil, context.Canceled
+		}
+		return gitstate.Inventory(ctx, path)
+	}
+	activeJobs := func() int {
+		lc.observationMu.Lock()
+		defer lc.observationMu.Unlock()
+		return len(lc.observationJobs)
+	}
+	observeOutside := func(phase string, wantJobs int) {
+		t.Helper()
+		for _, dir := range outside {
+			_, found, err := lc.ObserveCheckoutPath(t.Context(), dir)
+			if jobs := activeJobs(); found || err != nil || jobs != wantJobs {
+				t.Errorf("%s: %s is in no known family: found=%v err=%v jobs=%d, want %d", phase, dir, found, err, jobs, wantJobs)
+				return
+			}
+		}
+	}
+	observeOutside("idle", 0)
+
+	requests := make([]string, 40)
+	errs := make([]error, len(requests))
+	for i := range requests {
+		requests[i] = filepath.Join(stuck, fmt.Sprintf("request-%d", i))
+		if err := os.Mkdir(requests[i], 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Go(func() { _, _, errs[i] = lc.ObserveCheckoutPath(t.Context(), requests[i]) })
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if !errors.Is(err, ErrCheckoutMutationBusy) {
+			t.Fatalf("stuck family request %d: %v", i, err)
+		}
+	}
+	lc.observationMu.Lock()
+	jobs := make([]*checkoutObservationJob, 0, len(lc.observationJobs))
+	draining := ""
+	for path, job := range lc.observationJobs {
+		jobs = append(jobs, job)
+		draining = path
+	}
+	lc.observationMu.Unlock()
+	if len(jobs) != checkoutObservationFamilyCapacity {
+		t.Errorf("one family holds %d discovery jobs, want its own bound of %d", len(jobs), checkoutObservationFamilyCapacity)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for int(entered.Load()) < len(jobs) {
+		if time.Now().After(deadline) {
+			t.Fatalf("workers did not reach the stalled inventory: %d of %d", entered.Load(), len(jobs))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for _, job := range jobs {
+		job.cancel() // Past the work deadline; the workers keep running.
+	}
+
+	observeOutside("stuck", len(jobs))
+	checkout, found, err := observeCheckoutUntilSettled(t, lc, late)
+	if err != nil || !found || checkout.FamilyID != tracked.FamilyID || !pathkey.EqualPaths(checkout.RootPath, pathkey.CanonicalExistingRoot(late)) {
+		t.Errorf("another family's new worktree was refused: %+v found=%v err=%v", checkout, found, err)
+	}
+	extra := filepath.Join(stuck, "extra")
+	if err := os.Mkdir(extra, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = lc.ObserveCheckoutPath(t.Context(), extra)
+	var pending *CheckoutDiscoveryPendingError
+	if !errors.Is(err, ErrCheckoutMutationBusy) || !errors.As(err, &pending) || !pathkey.EqualPaths(pending.Root, stuckRoot) || pending.Family != familyID || pending.Reason != checkoutDiscoveryFamilyCapacity {
+		t.Errorf("stuck family's new path: %v", err)
+	}
+	if _, _, err := lc.ObserveCheckoutPath(t.Context(), draining); !errors.Is(err, ErrCheckoutMutationBusy) || checkoutDiscoveryReason(err) != checkoutDiscoveryDraining {
+		t.Errorf("stuck path did not keep its draining refusal: %v", err)
 	}
 }
 
@@ -390,54 +512,84 @@ func TestObserveCheckoutPathSlowObservationRunsOnceAcrossRetries(t *testing.T) {
 	}
 }
 
-func TestObserveCheckoutPathExpiredJobsStayBoundedUntilTheyDrain(t *testing.T) {
+// checkoutDiscoveryReason is the reason of a pending discovery refusal, ""
+// for any other outcome.
+func checkoutDiscoveryReason(err error) string {
+	var pending *CheckoutDiscoveryPendingError
+	if errors.As(err, &pending) {
+		return pending.Reason
+	}
+	return ""
+}
+
+func TestObserveCheckoutPathStuckJobsStayBoundedWithoutRefusingOtherFamilies(t *testing.T) {
 	lc, catalog, primary, familyID, _, _ := newCheckoutObservationFixture(t)
 	release := make(chan struct{})
 	defer close(release)
-	entered := make(chan struct{})
-	var started atomic.Int32
+	var entered atomic.Int32
 	lc.observationInventory = func(context.Context, string) (*gitstate.FamilyInventory, error) {
-		if started.Add(1) == checkoutObservationCapacity {
-			close(entered)
-		}
+		entered.Add(1)
 		<-release // Deliberately model a dependency that ignores cancellation.
 		return nil, context.Canceled
 	}
-	jobs := make([]*checkoutObservationJob, 0, checkoutObservationCapacity)
-	for i := 0; i < checkoutObservationCapacity; i++ {
-		path := filepath.Join(primary, fmt.Sprintf("request-%d", i))
-		if err := os.Mkdir(path, 0o755); err != nil {
+	// Capacity is accounted to the family the pre-check names. Every worker
+	// proves the fixture's real family through Git, then stalls in Inventory.
+	observe := func(family string, i int) (*checkoutObservationJob, error) {
+		path := filepath.Join(primary, fmt.Sprintf("%s-%d", family, i))
+		if err := os.MkdirAll(path, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		job, err := lc.checkoutObservation(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		jobs = append(jobs, job)
+		return lc.checkoutObservation(path, checkoutObservationTarget{root: primary, familyID: family}, true)
 	}
+	var jobs []*checkoutObservationJob
+	for f := 0; f < checkoutObservationStuckCapacity/checkoutObservationFamilyCapacity; f++ {
+		family := fmt.Sprintf("full-%d", f)
+		for i := 0; i < checkoutObservationFamilyCapacity; i++ {
+			job, err := observe(family, i)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jobs = append(jobs, job)
+		}
+		if _, err := observe(family, checkoutObservationFamilyCapacity); checkoutDiscoveryReason(err) != checkoutDiscoveryFamilyCapacity {
+			t.Fatalf("full family admitted another discovery: %v", err)
+		}
+	}
+	partial, err := observe("partial", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs = append(jobs, partial)
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	select {
-	case <-entered:
-	case <-ctx.Done():
-		t.Fatalf("workers did not enter inventory: started=%d: %v", started.Load(), ctx.Err())
-	}
-	if got := started.Load(); got != checkoutObservationCapacity {
-		t.Fatalf("workers did not start: %d", got)
+	for int(entered.Load()) < len(jobs) {
+		if ctx.Err() != nil {
+			t.Fatalf("workers did not enter inventory: %d of %d", entered.Load(), len(jobs))
+		}
+		time.Sleep(time.Millisecond)
 	}
 	for _, job := range jobs {
 		job.cancel() // Expiry must not release capacity before the worker exits.
 	}
-	for i := 0; i < 2*checkoutObservationCapacity; i++ {
-		if _, err := lc.checkoutObservation(filepath.Join(primary, fmt.Sprintf("extra-%d", i))); !errors.Is(err, ErrCheckoutMutationBusy) {
-			t.Fatalf("canceled but running jobs released capacity: %v", err)
+	// Past the daemon-wide stuck bound, a family that owns stuck work is
+	// refused below its own bound, and a stuck path keeps draining.
+	for i := 1; i < 2*checkoutObservationStuckCapacity; i++ {
+		if _, err := observe("partial", i); checkoutDiscoveryReason(err) != checkoutDiscoveryStuckCapacity {
+			t.Fatalf("family with stuck work escaped the stuck bound: %v", err)
 		}
+	}
+	if _, err := observe("partial", 0); checkoutDiscoveryReason(err) != checkoutDiscoveryDraining {
+		t.Fatalf("stuck path was not draining: %v", err)
+	}
+	// A family without stuck work is never refused for another family's.
+	if job, err := observe("fresh", 0); err != nil || job == nil {
+		t.Fatalf("family without stuck work was refused: %v", err)
 	}
 	lc.observationMu.Lock()
 	active := len(lc.observationJobs)
 	lc.observationMu.Unlock()
-	if active != checkoutObservationCapacity || started.Load() != checkoutObservationCapacity {
-		t.Fatalf("discovery bound escaped: jobs=%d workers=%d", active, started.Load())
+	if want := len(jobs) + 1; active != want || int(entered.Load()) > want {
+		t.Fatalf("discovery bound escaped: jobs=%d workers=%d, want %d", active, entered.Load(), want)
 	}
 	rows, err := catalog.ListCheckouts(t.Context(), familyID)
 	if err != nil || len(rows) != 1 {
@@ -455,7 +607,7 @@ func TestObserveCheckoutPathCloseCancelsAndJoinsMetadata(t *testing.T) {
 		close(exited)
 		return nil, ctx.Err()
 	}
-	if _, err := lc.checkoutObservation(primary); err != nil {
+	if _, err := lc.checkoutObservation(primary, checkoutObservationTarget{}, true); err != nil {
 		t.Fatal(err)
 	}
 	<-entered
@@ -473,7 +625,7 @@ func TestObserveCheckoutPathCloseCancelsAndJoinsMetadata(t *testing.T) {
 	if active != 0 {
 		t.Fatalf("Close retained %d discovery jobs", active)
 	}
-	if _, err := lc.checkoutObservation(primary); !errors.Is(err, ErrCheckoutRefreshStopped) {
+	if _, err := lc.checkoutObservation(primary, checkoutObservationTarget{}, true); !errors.Is(err, ErrCheckoutRefreshStopped) {
 		t.Fatalf("closed lifecycle admitted new work: %v", err)
 	}
 }
@@ -504,7 +656,7 @@ func TestObserveCheckoutPathRejectsInventoryWithReboundGitMarker(t *testing.T) {
 	// Judge the job that received the pre-rebind inventory, not a request retry
 	// loop. Slow Git can outlast the request wait, the refused job is then
 	// forgotten, and a retry's fresh inventory legitimately sees the new binding.
-	job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(worktree))
+	job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(worktree), checkoutObservationTarget{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -531,7 +683,7 @@ func TestObserveCheckoutPathRejectsBindingChangesWhileProofIsPending(t *testing.
 			lc, catalog, primary, familyID, _, _ := newCheckoutObservationFixture(t)
 			worktree := filepath.Join(filepath.Dir(primary), "pending-proof")
 			builderGit(t, primary, "worktree", "add", "-b", "pending-proof", worktree)
-			job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(worktree))
+			job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(worktree), checkoutObservationTarget{}, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -630,7 +782,7 @@ func completedCheckoutObservationForTest(t *testing.T) (*CheckoutLifecycle, *che
 		calls.Add(1)
 		return gitstate.Inventory(ctx, path)
 	}
-	job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(worktree))
+	job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(worktree), checkoutObservationTarget{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}

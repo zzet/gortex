@@ -19,8 +19,59 @@ import (
 const (
 	checkoutObservationTimeout     = 250 * time.Millisecond
 	checkoutObservationWorkTimeout = 5 * time.Second
-	checkoutObservationCapacity    = 32
+	// A family runs at most this many discoveries at once. Reaching it refuses
+	// only that family's new paths.
+	checkoutObservationFamilyCapacity = 8
+	// Workers still running past their work deadline (Git or a mount that
+	// ignores cancellation) are bounded daemon-wide. Reaching it refuses only
+	// families that own such a worker.
+	checkoutObservationStuckCapacity = 32
 )
+
+// Reasons a CheckoutDiscoveryPendingError carries. Every one is retryable.
+const (
+	checkoutDiscoveryInProgress     = "in_progress"
+	checkoutDiscoveryDraining       = "draining"
+	checkoutDiscoveryFamilyCapacity = "family_capacity"
+	checkoutDiscoveryStuckCapacity  = "stuck_capacity"
+)
+
+// CheckoutDiscoveryPendingError refuses a request whose checkout discovery
+// cannot answer yet. It applies to Root, the checkout root holding the
+// requested path, in Family; no request outside Root is refused because of it.
+type CheckoutDiscoveryPendingError struct {
+	Root   string
+	Family string
+	Reason string
+	cause  error
+}
+
+func (e *CheckoutDiscoveryPendingError) Error() string {
+	msg := fmt.Sprintf("%v: checkout discovery is pending for %s (family %s, reason %s)", ErrCheckoutMutationBusy, e.Root, e.Family, e.Reason)
+	if e.cause != nil {
+		msg += ": " + e.cause.Error()
+	}
+	return msg
+}
+
+// Unwrap keeps the refusal a retryable busy-lane error and its cause, such as
+// the request deadline, inspectable.
+func (e *CheckoutDiscoveryPendingError) Unwrap() []error {
+	if e.cause == nil {
+		return []error{ErrCheckoutMutationBusy}
+	}
+	return []error{ErrCheckoutMutationBusy, e.cause}
+}
+
+// checkoutObservationTarget is what a request learns from its .git marker,
+// without running Git, before its discovery may take capacity.
+type checkoutObservationTarget struct {
+	root, familyID string
+}
+
+func (t checkoutObservationTarget) refusal(reason string) error {
+	return &CheckoutDiscoveryPendingError{Root: t.root, Family: t.familyID, Reason: reason}
+}
 
 type checkoutObservationProof struct {
 	inventory    *gitstate.FamilyInventory
@@ -41,6 +92,7 @@ type checkoutObservationMarker struct {
 }
 
 type checkoutObservationJob struct {
+	familyID      string
 	ctx           context.Context
 	cancel        context.CancelFunc
 	proofReady    chan struct{}
@@ -61,8 +113,9 @@ type checkoutObservationJob struct {
 // up to five seconds across retries. Slow Git startup therefore cannot restart
 // the same unfinished work indefinitely. Graph builds use existing activation.
 //
-// found=false, err=nil means the path has no known family to serve it from.
-// A busy/error outcome carries no permission to fall through to another graph.
+// found=false, err=nil means the path has no known family to serve it from;
+// that is decided from its .git marker before any discovery work starts. A
+// busy/error outcome carries no permission to fall through to another graph.
 // Explicit selectors must provide an authorizer for the known primary prefix;
 // it runs outside locks and before any catalog observation or build activation.
 func (l *CheckoutLifecycle) ObserveCheckoutPath(ctx context.Context, path string, authorize ...func(string) error) (checkout store_sqlite.Checkout, found bool, err error) {
@@ -77,6 +130,7 @@ func (l *CheckoutLifecycle) ObserveCheckoutPath(ctx context.Context, path string
 	}
 	ctx, cancel := context.WithTimeout(ctx, checkoutObservationTimeout)
 	defer cancel()
+	var target checkoutObservationTarget
 	defer func() {
 		if err != nil && ctx.Err() != nil {
 			err = errors.Join(ctx.Err(), err)
@@ -84,12 +138,20 @@ func (l *CheckoutLifecycle) ObserveCheckoutPath(ctx context.Context, path string
 				return
 			}
 		}
-		if err != nil && (errors.Is(err, context.DeadlineExceeded) || retryableCheckoutRefreshError(err)) {
-			err = fmt.Errorf("%w: selected checkout discovery is pending: %w", ErrCheckoutMutationBusy, err)
+		var pending *CheckoutDiscoveryPendingError
+		if err != nil && !errors.As(err, &pending) && (errors.Is(err, context.DeadlineExceeded) || retryableCheckoutRefreshError(err)) {
+			err = &CheckoutDiscoveryPendingError{Root: target.root, Family: target.familyID, Reason: checkoutDiscoveryInProgress, cause: err}
 		}
 	}()
-	job, err := l.checkoutObservation(pathkey.CanonicalExistingRoot(path))
+	path = pathkey.CanonicalExistingRoot(path)
+	target, known, err := l.observationTarget(ctx, path)
 	if err != nil {
+		return checkout, false, err
+	}
+	// A discovery already running for this path still answers it, so a binding
+	// that changed under its pending proof is reported stale.
+	job, err := l.checkoutObservation(path, target, known)
+	if err != nil || job == nil {
 		return checkout, false, err
 	}
 	select {
@@ -147,7 +209,24 @@ func (job *checkoutObservationJob) invalidateStaleProof(err error) error {
 	return err
 }
 
-func (l *CheckoutLifecycle) checkoutObservation(path string) (*checkoutObservationJob, error) {
+// observationTarget resolves path's family from its .git marker alone. A path
+// outside Git, or in a family the catalog does not know, has nothing to
+// observe and never takes a discovery slot; ordinary scope resolution handles
+// it. The job's own proof still resolves the family through Git.
+func (l *CheckoutLifecycle) observationTarget(ctx context.Context, path string) (checkoutObservationTarget, bool, error) {
+	root, commonDir, ok := gitstate.MarkerCommonDir(path)
+	if !ok {
+		return checkoutObservationTarget{}, false, nil
+	}
+	target := checkoutObservationTarget{root: root, familyID: FamilyIDFor(commonDir)}
+	_, known, err := l.catalog.GetRepositoryFamily(ctx, target.familyID)
+	return target, known, err
+}
+
+// checkoutObservation joins path's running discovery. Without one it starts
+// a discovery when start is set and target's family has capacity, and
+// otherwise returns no job.
+func (l *CheckoutLifecycle) checkoutObservation(path string, target checkoutObservationTarget, start bool) (*checkoutObservationJob, error) {
 	l.observationMu.Lock()
 	defer l.observationMu.Unlock()
 	if l.observationClosed {
@@ -157,16 +236,39 @@ func (l *CheckoutLifecycle) checkoutObservation(path string) (*checkoutObservati
 		if job.ctx.Err() == nil {
 			return job, nil
 		}
-		return nil, fmt.Errorf("%w: expired checkout discovery is draining", ErrCheckoutMutationBusy)
+		return nil, target.refusal(checkoutDiscoveryDraining)
 	}
-	if len(l.observationJobs) >= checkoutObservationCapacity {
-		return nil, fmt.Errorf("%w: checkout discovery capacity reached", ErrCheckoutMutationBusy)
+	if !start {
+		return nil, nil
+	}
+	// One family's burst or stall never refuses another family's paths.
+	inFlight, stuck, familyStuck := 0, 0, false
+	for _, job := range l.observationJobs {
+		select {
+		case <-job.done:
+			continue // Finished; at most a retained result.
+		default:
+		}
+		expired := job.ctx.Err() != nil
+		if expired {
+			stuck++
+		}
+		if job.familyID == target.familyID {
+			inFlight++
+			familyStuck = familyStuck || expired
+		}
+	}
+	if inFlight >= checkoutObservationFamilyCapacity {
+		return nil, target.refusal(checkoutDiscoveryFamilyCapacity)
+	}
+	if familyStuck && stuck >= checkoutObservationStuckCapacity {
+		return nil, target.refusal(checkoutDiscoveryStuckCapacity)
 	}
 	if l.observationJobs == nil {
 		l.observationJobs = make(map[string]*checkoutObservationJob)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), checkoutObservationWorkTimeout)
-	job := &checkoutObservationJob{ctx: ctx, cancel: cancel, proofReady: make(chan struct{}), authorized: make(chan struct{}), done: make(chan struct{})}
+	job := &checkoutObservationJob{familyID: target.familyID, ctx: ctx, cancel: cancel, proofReady: make(chan struct{}), authorized: make(chan struct{}), done: make(chan struct{})}
 	l.observationJobs[path] = job
 	l.observationWG.Add(1)
 	go l.runCheckoutObservation(path, job)
