@@ -18,10 +18,13 @@ Any breach, missing/null metric, wrong unit, omitted safety/censor count,
 incomplete report, unavailable prerequisite or incomparable measurement exits
 nonzero. Existing output files are never overwritten. The separate
 `perf-gate.yml` workflow publishes readiness, explicitly named **not acceptance**.
-Owned-host measurement jobs are skipped unless their reviewed runner/config
-variables are enabled. There is no formal PR smoke measurement job yet: hosted
-ARM has its own scoped profile and exact smoke observations/scheduling remain
-unavailable. Readiness cannot satisfy a required performance acceptance check.
+Its `smoke` job runs the five-step PR smoke and the same-job microbenchmark
+comparison on `ubuntu-24.04-arm`, but only when the repository variable
+`PERF_PR_SMOKE_ENABLED` is `true`; while it is unset, GitHub shows the job as
+skipped. Owned-host nightly jobs are likewise skipped unless their reviewed
+runner/config variables are enabled. Several smoke rows still have no exact
+observation, so an enabled smoke run fails on them rather than passing them.
+Readiness cannot satisfy a required performance acceptance check.
 
 ## Repeated evidence and comparison identity
 
