@@ -25,7 +25,14 @@ import (
 // Whole-store reads are counted per call: a scoped request must make none.
 // Every other counted read records the rows it returned, per method, so a
 // test can require that adding unrelated repositories changes neither the
-// response nor what was read to build it.
+// response nor what was read to build it. A symbol search backend built over
+// the counter has its index reads counted as well.
+//
+// One production path stays out of reach: the contract-core exclusion cache
+// serves only a concrete store, so over the counter, edge endpoints are
+// classified by per-batch membership reads, which are counted, instead of the
+// cached contract-owned set. That set spans the whole store, is read once per
+// store revision and has its own tests.
 type scopedReadCounter struct {
 	*store_sqlite.Store
 	tally *scopedReadTally
@@ -281,6 +288,30 @@ func (r *scopedReadCounter) NodesLightByKindsInScopeSeq(repos, files []string, k
 	}
 }
 
+func (r *scopedReadCounter) SearchSymbolsContext(ctx context.Context, text string, limit int) ([]graph.SymbolHit, error) {
+	out, err := r.Store.SearchSymbolsContext(ctx, text, limit)
+	r.read("SearchSymbolsContext", len(out))
+	return out, err
+}
+
+func (r *scopedReadCounter) SearchSymbolBundlesContext(ctx context.Context, text string, limit int) ([]graph.SymbolBundle, error) {
+	out, err := r.Store.SearchSymbolBundlesContext(ctx, text, limit)
+	r.read("SearchSymbolBundlesContext", bundleRows(out))
+	return out, err
+}
+
+func (r *scopedReadCounter) SearchSymbolBundlesRepoScopedContext(ctx context.Context, text string, repoAllow []string, limit int) ([]graph.SymbolBundle, error) {
+	out, err := r.Store.SearchSymbolBundlesRepoScopedContext(ctx, text, repoAllow, limit)
+	r.read("SearchSymbolBundlesRepoScopedContext", bundleRows(out))
+	return out, err
+}
+
+func (r *scopedReadCounter) SearchSymbolBundlesPathScopedContext(ctx context.Context, text string, repos, paths []string, limit int) ([]graph.SymbolBundle, error) {
+	out, err := r.Store.SearchSymbolBundlesPathScopedContext(ctx, text, repos, paths, limit)
+	r.read("SearchSymbolBundlesPathScopedContext", bundleRows(out))
+	return out, err
+}
+
 func nonNilNodes(n *graph.Node) int {
 	if n == nil {
 		return 0
@@ -292,6 +323,15 @@ func edgeRows(byID map[string][]*graph.Edge) int {
 	rows := 0
 	for _, edges := range byID {
 		rows += len(edges)
+	}
+	return rows
+}
+
+// bundleRows counts a symbol search's hits with the edges bundled with them.
+func bundleRows(bundles []graph.SymbolBundle) int {
+	rows := 0
+	for _, bundle := range bundles {
+		rows += nonNilNodes(bundle.Node) + len(bundle.InEdges) + len(bundle.OutEdges)
 	}
 	return rows
 }

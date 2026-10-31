@@ -40,15 +40,16 @@ func addSearchRowsRepo(t *testing.T, store *store_sqlite.Store, repo string) {
 
 // A repo-scoped symbol search ranks inside the scoped repository's run of the
 // symbol index, so every other repository defining the same Close methods
-// changes neither the hits nor the graph rows read to hydrate them.
+// changes neither the hits, nor the rows the index search returns, nor the
+// graph rows read to hydrate them.
 func TestSearchSymbolsScopedNeverScansAndRowsStayFlat(t *testing.T) {
 	store := openContractCoreCapStore(t)
 	addSearchRowsRepo(t, store, "a")
 	counter := newScopedReadCounter(store)
 	eng := query.NewEngine(counter)
-	// The daemon searches the store itself: its repo-scoped ranking is
-	// adapted from the concrete store, so the counter wraps only graph reads.
-	eng.SetSearch(search.NewSwappable(search.NewHybrid(search.NewSymbolSearcherBackend(store), nil, nil)))
+	// The daemon searches the store itself rather than the request reader;
+	// the counter is that store with its index reads counted.
+	eng.SetSearch(search.NewSwappable(search.NewHybrid(search.NewSymbolSearcherBackend(counter), nil, nil)))
 	eng.SetRerank(nil)
 	srv := NewServer(eng, counter, nil, nil, zap.NewNop(), nil)
 	off := false
@@ -71,4 +72,7 @@ func TestSearchSymbolsScopedNeverScansAndRowsStayFlat(t *testing.T) {
 			addSearchRowsRepo(t, store, fmt.Sprintf("unrelated%d", i))
 		}
 	}, find)
+	reads := counter.rows()
+	require.Positive(t, reads["SearchSymbolBundlesRepoScopedContext"], "the repository-scoped index search is counted")
+	require.Positive(t, reads["SearchSymbolBundlesPathScopedContext"], "the path-scoped index search is counted")
 }
