@@ -191,6 +191,22 @@ probes and immediate same-editing-session file/source readbacks. Session setup
 is outside the edit window. Future arrivals do not wait for earlier ACKs or
 probe replies. Canceled/unstarted edits remain in the offered denominator.
 
+`--edit-agents N` (1 to 32) runs N fixed editors against the same single
+repository. Each editor offers its own open-loop Poisson stream with the same
+15 second mean; editor 0 keeps the one-editor seeding, so `--edit-agents 1`
+offers exactly the original plan. The streams merge by due time (ties by editor
+index) and the merge order is the global ordinal, so markers and mutation IDs
+stay keyed by ordinal and each ordinal is owned by one editor for the whole run.
+Plan steps and edit records name that editor. An edit and its immediate
+file/source readbacks go through its own editor's session; probes and receipt
+status stay on the edit's separate prober session, and run-level status, stats
+and the restore batch use editor 0. A blocked editor ACK does not delay another
+editor's arrival. Editors share one file, so whole-file `edit.write` and
+`edit.batch` content can overwrite a concurrent editor's change; such lost
+writes are measured as failed records, not hidden. The 1-edit diagnostic and
+the paired no-regression cell stay one editor. Routing across several
+repositories or linked worktrees is not implemented.
+
 The report retains raw call identities, independent ACK/physical/requested
 background accounting, and missing evidence. RPC return timestamps delimit
 latency; raw JSONL persistence runs on owned per-edit writers with separately
