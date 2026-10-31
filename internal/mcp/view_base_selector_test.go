@@ -2,9 +2,11 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -1051,6 +1054,10 @@ type countingCorpus struct {
 	// one.
 	nodeLookups int
 	nodeBatches int
+	// allNodes and allEdges count whole-corpus scans, which a lane anchored
+	// on this view's own identities never needs.
+	allNodes int
+	allEdges int
 }
 
 func newCountingCorpus(inner *graph.Graph) *countingCorpus {
@@ -1076,6 +1083,16 @@ func (c *countingCorpus) GetNode(id string) *graph.Node {
 func (c *countingCorpus) GetNodesByIDs(ids []string) map[string]*graph.Node {
 	c.nodeBatches++
 	return c.inner.GetNodesByIDs(ids)
+}
+
+func (c *countingCorpus) AllNodes() []*graph.Node {
+	c.allNodes++
+	return c.inner.AllNodes()
+}
+
+func (c *countingCorpus) AllEdges() []*graph.Edge {
+	c.allEdges++
+	return c.inner.AllEdges()
 }
 
 // baseSiteFanoutFiles is how wide the sibling repository is in the fan-out
@@ -1428,5 +1445,252 @@ func TestBaseSelectorTakesTheBatchDoorOnTheProductionStore(t *testing.T) {
 	}
 	if _, batched := corpus.(fileNodesBatchReader); !batched {
 		t.Errorf("the narrowed reader's corpus (%T) offers no batched file-node door", corpus)
+	}
+}
+
+// The edge capabilities a narrowed view serves (view_base_capabilities.go) are
+// pinned on one corpus: this view's own calls and imports beside a sibling
+// repository that imports this view's file, sits on the only call path from
+// Main to Lib, and is the site of a reference into this view whose caller the
+// corpus never resolved.
+const (
+	baseCapabilityLibFile = "repo/lib.go"
+	baseCapabilityLib     = "repo/lib.go::Lib"
+	baseCapabilityMain    = "repo/main.go::Main"
+	baseCapabilityHelper  = "repo/main.go::Helper"
+	baseCapabilitySibling = "other/x.go::X"
+)
+
+func seedBaseCapabilityCorpus(store graph.Store) {
+	file := func(path, repo string) *graph.Node {
+		return &graph.Node{ID: path, Kind: graph.KindFile, Name: filepath.Base(path), FilePath: path, RepoPrefix: repo, Language: "go"}
+	}
+	function := func(id, repo string) *graph.Node {
+		path, name, _ := strings.Cut(id, "::")
+		return &graph.Node{ID: id, Kind: graph.KindFunction, Name: name, FilePath: path, RepoPrefix: repo, Language: "go"}
+	}
+	edge := func(from, to string, kind graph.EdgeKind, site string, line int) *graph.Edge {
+		return &graph.Edge{From: from, To: to, Kind: kind, FilePath: site, Line: line}
+	}
+	store.AddBatch([]*graph.Node{
+		file(baseCapabilityLibFile, "repo"), function(baseCapabilityLib, "repo"),
+		file("repo/main.go", "repo"), function(baseCapabilityMain, "repo"), function(baseCapabilityHelper, "repo"),
+		function("repo/main.go::Helper2", "repo"), function("repo/main.go::Helper3", "repo"),
+		file("repo/b.go", "repo"),
+		file("other/x.go", baseSelectorForeignRepo), function(baseCapabilitySibling, baseSelectorForeignRepo),
+	}, []*graph.Edge{
+		edge("repo/main.go", baseCapabilityLibFile, graph.EdgeImports, "repo/main.go", 1),
+		edge("repo/b.go", baseCapabilityLib, graph.EdgeImports, "repo/b.go", 1),
+		edge("other/x.go", baseCapabilityLibFile, graph.EdgeImports, "other/x.go", 1),
+		// Four callees, so an engine walk from Main asks for one-statement
+		// admission before it walks.
+		edge(baseCapabilityMain, baseCapabilityHelper, graph.EdgeCalls, "repo/main.go", 3),
+		edge(baseCapabilityMain, "repo/main.go::Helper2", graph.EdgeCalls, "repo/main.go", 4),
+		edge(baseCapabilityMain, "repo/main.go::Helper3", graph.EdgeCalls, "repo/main.go", 5),
+		edge(baseCapabilityMain, "external::dynamic", graph.EdgeCalls, "repo/main.go", 6),
+		// A backedge: the engine's Go walk reports it, the hop-set path does not.
+		edge(baseCapabilityHelper, baseCapabilityMain, graph.EdgeCalls, "repo/main.go", 9),
+		edge(baseCapabilityMain, baseCapabilitySibling, graph.EdgeCalls, "repo/main.go", 7),
+		edge(baseCapabilitySibling, baseCapabilityLib, graph.EdgeCalls, "other/x.go", 2),
+		edge("other/z.go::Ghost", baseCapabilityHelper, graph.EdgeCalls, "other/z.go", 2),
+	})
+}
+
+type baseCapabilityShape struct {
+	name string
+	// store backs the query engine in the walk comparison.
+	store  graph.Store
+	corpus graph.Reader
+	scoped graph.Reader
+	// scans is the corpus when it counts its whole-corpus scans.
+	scans *countingCorpus
+}
+
+// baseCapabilityShapes narrows that corpus three ways: the in-memory graph and
+// the SQLite store, which implement every edge capability themselves (the
+// store through the content-search variant of the view), and a corpus that
+// implements none of them and counts its whole-corpus scans.
+func baseCapabilityShapes(t *testing.T) []baseCapabilityShape {
+	t.Helper()
+	memory := graph.New()
+	seedBaseCapabilityCorpus(memory)
+	store := openContractCoreCapStore(t)
+	seedBaseCapabilityCorpus(store)
+	bare := graph.New()
+	seedBaseCapabilityCorpus(bare)
+	scans := newCountingCorpus(bare)
+	shapes := []baseCapabilityShape{
+		{name: "memory graph", store: memory, corpus: memory, scoped: newBaseGraphReader(memory, "repo")},
+		{name: "sqlite store", store: store, corpus: store, scoped: newBaseGraphReader(store, "repo")},
+		{name: "corpus without the capabilities", store: bare, corpus: scans, scoped: newBaseGraphReader(scans, "repo"), scans: scans},
+	}
+	if _, ok := shapes[1].scoped.(*baseGraphContentReader); !ok {
+		t.Fatalf("the SQLite store narrowed to %T, so the content-search variant goes untested", shapes[1].scoped)
+	}
+	if _, ok := any(scans).(graph.FileImporters); ok {
+		t.Fatal("the counting corpus exposes its graph's capabilities, so it is not a corpus without them")
+	}
+	return shapes
+}
+
+func (shape baseCapabilityShape) requireNoScans(t *testing.T, lane string) {
+	t.Helper()
+	if shape.scans != nil && shape.scans.allNodes+shape.scans.allEdges > 0 {
+		t.Errorf("%s scanned the whole corpus: %d node and %d edge scans", lane, shape.scans.allNodes, shape.scans.allEdges)
+	}
+}
+
+// TestBaseGraphReaderAdvertisesFileImporters: check_references asks a reader
+// that implements graph.FileImporters for a file's importers in one call. A
+// narrowed view answers it with exactly the rows the handler's fallback reads
+// through the view's own lanes, whatever its corpus implements; the corpus's
+// answer names the sibling repository's importer.
+func TestBaseGraphReaderAdvertisesFileImporters(t *testing.T) {
+	target := &graph.Node{FilePath: baseCapabilityLibFile}
+	for _, shape := range baseCapabilityShapes(t) {
+		t.Run(shape.name, func(t *testing.T) {
+			importers, ok := shape.scoped.(graph.FileImporters)
+			if !ok {
+				t.Fatalf("%T does not advertise graph.FileImporters", shape.scoped)
+			}
+			got := importers.FileImporters(baseCapabilityLibFile)
+			shape.requireNoScans(t, "FileImporters")
+			want, err := fileImportersFromReader(t.Context(), legacyOutlineReader{shape.scoped}, baseCapabilityLibFile)
+			if err != nil {
+				t.Fatalf("fallback: %v", err)
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("FileImporters = %+v, the fallback over the same view reads %+v", got, want)
+			}
+
+			files, err := collectImportingFilesContext(t.Context(), shape.scoped, target, false)
+			if err != nil {
+				t.Fatalf("capability: %v", err)
+			}
+			fallback, err := collectImportingFilesContext(t.Context(), legacyOutlineReader{shape.scoped}, target, false)
+			if err != nil {
+				t.Fatalf("fallback: %v", err)
+			}
+			if !slices.Equal(files, fallback) {
+				t.Errorf("importing files = %v through the capability, %v through the fallback", files, fallback)
+			}
+			if want := []string{"repo/b.go", "repo/main.go"}; !slices.Equal(files, want) {
+				t.Errorf("importing files = %v, want %v", files, want)
+			}
+
+			leaked, err := collectImportingFilesContext(t.Context(), shape.corpus, target, false)
+			if err != nil {
+				t.Fatalf("corpus: %v", err)
+			}
+			if !slices.Contains(leaked, "other/x.go") {
+				t.Fatalf("the corpus names no foreign importer (%v), so the narrowing proves nothing", leaked)
+			}
+		})
+	}
+}
+
+// TestBaseGraphReaderAdvertisesInEdgeCounter: get_untested ranks by fan-in
+// from graph.InEdgeCounter when the reader has it. A narrowed view counts only
+// the edges its kind streams admit — no caller from the sibling repository and
+// no reference written there — which is the fallback's answer over the same
+// view.
+func TestBaseGraphReaderAdvertisesInEdgeCounter(t *testing.T) {
+	kinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeImports, graph.EdgeCalls}
+	want := map[string]int{
+		baseCapabilityLibFile: 1, baseCapabilityLib: 1, baseCapabilityMain: 1, baseCapabilityHelper: 1,
+		"repo/main.go::Helper2": 1, "repo/main.go::Helper3": 1, "external::dynamic": 1,
+	}
+	for _, shape := range baseCapabilityShapes(t) {
+		t.Run(shape.name, func(t *testing.T) {
+			counter, ok := shape.scoped.(graph.InEdgeCounter)
+			if !ok {
+				t.Fatalf("%T does not advertise graph.InEdgeCounter", shape.scoped)
+			}
+			got := counter.InEdgeCountsByKind(kinds)
+			shape.requireNoScans(t, "InEdgeCountsByKind")
+			if fallback := collectFanInByKind(legacyOutlineReader{shape.scoped}, kinds); !maps.Equal(got, fallback) {
+				t.Errorf("InEdgeCountsByKind = %v, the fallback over the same view counts %v", got, fallback)
+			}
+			if !maps.Equal(got, want) {
+				t.Errorf("InEdgeCountsByKind = %v, want %v", got, want)
+			}
+
+			corpus := collectFanInByKind(shape.corpus, kinds)
+			if corpus[baseCapabilitySibling] == 0 || corpus[baseCapabilityHelper] <= want[baseCapabilityHelper] {
+				t.Fatalf("the corpus counts nothing this view must drop (%v), so the narrowing proves nothing", corpus)
+			}
+		})
+	}
+}
+
+// TestBaseGraphReaderAdvertisesBFSCapable: the hop-set walk runs over the
+// view's adjacency, so it never passes through the sibling repository, and it
+// equals the canonical walk over the same view. Advertising it must not move
+// the query engine off its Go walk, which the declining admission keeps.
+func TestBaseGraphReaderAdvertisesBFSCapable(t *testing.T) {
+	calls := []graph.EdgeKind{graph.EdgeCalls}
+	for _, shape := range baseCapabilityShapes(t) {
+		t.Run(shape.name, func(t *testing.T) {
+			walker, ok := shape.scoped.(graph.BFSCapable)
+			if !ok {
+				t.Fatalf("%T does not advertise graph.BFSCapable", shape.scoped)
+			}
+			for _, walk := range []struct {
+				seed string
+				dir  graph.Direction
+				want []string
+			}{
+				{baseCapabilityMain, graph.DirectionForward, []string{baseCapabilityMain, baseCapabilityHelper, "repo/main.go::Helper2", "repo/main.go::Helper3"}},
+				{baseCapabilityHelper, graph.DirectionBackward, []string{baseCapabilityHelper, baseCapabilityMain}},
+			} {
+				got, err := walker.BFS([]string{walk.seed}, walk.dir, calls, 3, 0)
+				if err != nil {
+					t.Fatalf("BFS %s: %v", walk.dir, err)
+				}
+				want, err := graph.BFSOf(t.Context(), legacyOutlineReader{shape.scoped}, []string{walk.seed}, walk.dir, calls, 3, 0)
+				if err != nil {
+					t.Fatalf("fallback %s: %v", walk.dir, err)
+				}
+				if !slices.Equal(got, want) {
+					t.Errorf("BFS %s = %+v, the canonical walk over the same view reads %+v", walk.dir, got, want)
+				}
+				reached := make([]string, 0, len(got))
+				for _, hop := range got {
+					reached = append(reached, hop.NodeID)
+				}
+				if !slices.Equal(reached, walk.want) {
+					t.Errorf("BFS %s reached %v, want %v", walk.dir, reached, walk.want)
+				}
+			}
+			shape.requireNoScans(t, "BFS")
+
+			corpusWalk, err := graph.BFSOf(t.Context(), shape.corpus, []string{baseCapabilityMain}, graph.DirectionForward, calls, 3, 0)
+			if err != nil {
+				t.Fatalf("corpus walk: %v", err)
+			}
+			if !slices.ContainsFunc(corpusWalk, func(hop graph.BFSHop) bool { return hop.NodeID == baseCapabilityLib }) {
+				t.Fatalf("the corpus walk never reaches Lib through the sibling (%+v), so the narrowing proves nothing", corpusWalk)
+			}
+
+			cancelled, cancel := context.WithCancel(t.Context())
+			cancel()
+			if _, err := shape.scoped.(capBFSContext).BFSContext(cancelled, []string{baseCapabilityMain}, graph.DirectionForward, calls, 3, 0); !errors.Is(err, context.Canceled) {
+				t.Errorf("BFSContext on an ended request = %v, want context.Canceled", err)
+			}
+
+			eng := query.NewEngine(shape.store)
+			opts := query.QueryOptions{Depth: 3, Limit: 20, Context: t.Context()}
+			chain := eng.WithReader(shape.scoped).GetCallChain(baseCapabilityMain, opts)
+			if legacy := eng.WithReader(legacyOutlineReader{shape.scoped}).GetCallChain(baseCapabilityMain, opts); !reflect.DeepEqual(chain, legacy) {
+				t.Errorf("GetCallChain = %+v, the Go walk over the same view = %+v", chain, legacy)
+			}
+			if !edgeBetween(chain.Edges, baseCapabilityHelper, baseCapabilityMain) {
+				t.Error("the call chain lost the backedge the Go walk reports, so it took the hop-set path")
+			}
+			callers := eng.WithReader(shape.scoped).GetCallers(baseCapabilityHelper, opts)
+			if legacy := eng.WithReader(legacyOutlineReader{shape.scoped}).GetCallers(baseCapabilityHelper, opts); !reflect.DeepEqual(callers, legacy) {
+				t.Errorf("GetCallers = %+v, the Go walk over the same view = %+v", callers, legacy)
+			}
+		})
 	}
 }

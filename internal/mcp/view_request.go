@@ -1484,15 +1484,22 @@ func (s *Server) viewForBaseSelector(ctx context.Context, selector graphview.Sel
 // therefore a predicate on what the corpus already holds — a node belongs to
 // this view when the repository it was indexed under is this graph's.
 //
-// It deliberately forwards none of the optional store capabilities (the
+// It forwards no optional store capability as the corpus answers it (the
 // bounded adjacency projections, the name and file readers, the degree
 // aggregators). Forwarding one without re-applying the predicate would hand a
 // caller rows from every repository through a reader that promised one, so the
 // type assertions fail and each call site takes its plain-Reader path instead.
-// That costs work on those paths; it cannot cost correctness. The one
-// capability that is forwarded is content search, which takes the repository
-// to search as an argument and so can be narrowed exactly — see
-// baseGraphContentReader.
+// That costs work on those paths; it cannot cost correctness. The capabilities
+// it does serve are narrowed exactly:
+//
+//   - content search takes the repository to search as an argument, so the
+//     view pins that argument rather than filtering the answer — see
+//     baseGraphContentReader;
+//   - node kinds by id pass the corpus's rows through the same predicate as
+//     every node lane (GetNodeKindsByIDsContext);
+//   - file importers, in-edge counts by kind and the BFS hop-set are
+//     recomputed over this reader's own lanes, which is how they apply the
+//     predicate adjacency applies — see view_base_capabilities.go.
 type baseGraphReader struct {
 	base       graph.Reader
 	repoPrefix string
