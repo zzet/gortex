@@ -211,6 +211,7 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"indexer.repoSemanticStateReleaser":                    "semantic (go/types) state: the enrichment stage runs over the generation handle after the delta (runEnrichment), not over the DeltaWriter",
 	"indexer.repoSemanticStateRetainer":                    "semantic (go/types) state: the enrichment stage runs over the generation handle after the delta (runEnrichment), not over the DeltaWriter",
 	"indexer.repositoryCleanupPayload":                     "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
+	"indexer.drainCheckedWriter":                           "checked write of the whole-repository shadow drain into the durable store (full index, shadow replacement); not on a file delta's per-save path, and a store without it takes the void AddBatch",
 	"resolver.backendResolveWorkIndicator":                 "whole-graph pass (ResolveAll, a cold warm-up, a whole-repository derived rebuild); a delta resolves and re-derives by its receipt frontier",
 	"resolver.batchClaimingResolver":                       "framework synthesizer contract, asserted on synthesizers",
 	"resolver.claimEdgeVocabulary":                         "framework synthesizer contract, asserted on synthesizers",
