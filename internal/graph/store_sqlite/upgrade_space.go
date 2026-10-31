@@ -27,14 +27,21 @@ import (
 
 const (
 	// upgradeRewritePercent is the share of live pages a transition is
-	// assumed to rewrite when any pending step may reshape graph data (a
-	// table rebuild, a re-scoped hot index, a backfill).
-	upgradeRewritePercent = 100
+	// assumed to write when any pending step may reshape graph data (a
+	// re-scoped hot index, a backfill). Measured worst case, WAL peak plus
+	// main-file growth: 0.56x live upgrading the v21 fixture and 0.46x
+	// upgrading a 1.5 GB v21 store a release wrote, against about 1.0x for
+	// this share. A step that rebuilds whole graph tables (edges and nodes
+	// with their indexes are about 80% of a real store) writes more than
+	// that and must raise this share.
+	upgradeRewritePercent = 50
 	// upgradeAdditiveStepPercent is the share of live pages each explicitly
-	// additive step (one that preserves analysis — a single new or reshaped
-	// index) is assumed to write. The total is capped at
-	// upgradeRewritePercent.
-	upgradeAdditiveStepPercent = 25
+	// additive step (one that preserves analysis: a single new or reshaped
+	// index) is assumed to write, capped at upgradeRewritePercent in total.
+	// The three such steps measured wrote 0.016x live each; the largest
+	// secondary index of a real store is 7.2% of it, which this share
+	// still covers.
+	upgradeAdditiveStepPercent = 10
 	// upgradeSpaceHeadroom covers what the estimate does not model: the
 	// tables and columns schemaSQL adds, the FTS backfills, the analysis
 	// invalidation, and the -shm file. It equals journal_size_limit, the
@@ -145,7 +152,7 @@ type upgradeSpaceEstimate struct {
 // estimateUpgradeSpace sizes a pending transition from the store's live
 // pages. An additive-only transition (every step preserves analysis) writes
 // a fixed share of the live pages per step; anything else is assumed to
-// rewrite the whole live store.
+// write upgradeRewritePercent of them.
 func estimateUpgradeSpace(stats storeSpaceStats, pending []schemaMigration) upgradeSpaceEstimate {
 	percent := uint64(upgradeRewritePercent)
 	if additiveOnly(pending) {

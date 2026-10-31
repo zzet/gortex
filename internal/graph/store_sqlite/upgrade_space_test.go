@@ -117,20 +117,20 @@ func TestUpgradeFreeSpaceEstimateScalesWithPendingSteps(t *testing.T) {
 	require.Less(t, one.Need, three.Need, "each additive step adds its share")
 	require.LessOrEqual(t, three.Need, full.Need)
 	require.Equal(t, full, estimateUpgradeSpace(stats, []schemaMigration{additive(25), reshaping}),
-		"one reshaping step makes the whole transition a rewrite")
+		"one reshaping step sizes the whole transition at the rewrite share")
 	many := make([]schemaMigration, 0, 10)
 	for v := range 10 {
 		many = append(many, additive(50+v))
 	}
-	require.Equal(t, full, estimateUpgradeSpace(stats, many), "additive shares are capped at a full rewrite")
+	require.Equal(t, full, estimateUpgradeSpace(stats, many), "additive shares are capped at the rewrite share")
 
 	// Free pages absorb main-file growth but not WAL frames.
 	freed := stats
-	freed.freelistPages = 4_000
+	freed.freelistPages = 1_000
 	withFree := estimateUpgradeSpace(freed, []schemaMigration{reshaping})
-	live := freed.livePages()
-	require.Equal(t, walFileHeaderBytes+live*(freed.pageSize+walFrameHeaderBytes), withFree.WALPeak)
-	require.Equal(t, (live-freed.freelistPages)*freed.pageSize, withFree.Growth)
+	rewritten := (freed.livePages()*upgradeRewritePercent + 99) / 100
+	require.Equal(t, walFileHeaderBytes+rewritten*(freed.pageSize+walFrameHeaderBytes), withFree.WALPeak)
+	require.Equal(t, (rewritten-freed.freelistPages)*freed.pageSize, withFree.Growth)
 	mostlyFree := stats
 	mostlyFree.freelistPages = 8_000
 	require.Zero(t, estimateUpgradeSpace(mostlyFree, []schemaMigration{reshaping}).Growth)
@@ -182,5 +182,62 @@ func TestUpgradeFreeSpaceCheckLetsRoomyOrUnmeasuredVolumesProceed(t *testing.T) 
 			require.Equal(t, filepath.Dir(path), probed, "free space is read for the store's own directory")
 			require.Equal(t, currentSchemaVersion, rawUserVersion(t, path))
 		})
+	}
+}
+
+// TestUpgradeFreeSpaceEstimateCoversMeasuredUpgrades upgrades every fixture
+// at gortex scale and measures what the transition actually claimed on disk:
+// the -wal file at its peak (nothing checkpoints during Open) plus the main
+// file growth once those frames are checkpointed. The estimate must cover
+// it; the logged ratios are what the estimator's shares are sized from.
+func TestUpgradeFreeSpaceEstimateCoversMeasuredUpgrades(t *testing.T) {
+	upgraded := 0
+	for _, source := range upgradeSources(t) {
+		if source.version >= currentSchemaVersion {
+			continue
+		}
+		upgraded++
+		t.Run(source.name, func(t *testing.T) {
+			path := source.path
+			probe, err := probeStoreSchema(path)
+			require.NoError(t, err)
+			space, pending := measureUpgradeSpace(probe, currentSchemaVersion,
+				planSchemaMigrationWith(probe.stored, currentSchemaVersion, schemaMigrations), fixedDiskAvail(1<<50))
+			require.True(t, pending)
+			before, err := os.Stat(path)
+			require.NoError(t, err)
+
+			var walPeak int64
+			sample := func() {
+				if info, err := os.Stat(path + "-wal"); err == nil && info.Size() > walPeak {
+					walPeak = info.Size()
+				}
+			}
+			s, err := Open(path, WithRebuild(), withDiskAvail(fixedDiskAvail(1<<50)),
+				withUpgradeHook(func(upgradePoint, int) { sample() }))
+			require.NoError(t, err)
+			sample() // Open's own writes after the stamp land in the same WAL
+			require.NoError(t, s.CheckpointWAL())
+			after, err := os.Stat(path)
+			require.NoError(t, err)
+			require.NoError(t, s.Close())
+
+			growth := max(after.Size()-before.Size(), 0)
+			measured := uint64(walPeak + growth)
+			live := space.stats.livePages() * space.stats.pageSize
+			t.Logf("v%d -> v%d: live=%d wal_peak=%d (%.3f x live) growth=%d (%.3f x live); estimate wal=%d growth=%d need=%d (%.2f x measured)",
+				source.version, currentSchemaVersion, live, walPeak, float64(walPeak)/float64(live), growth, float64(growth)/float64(live),
+				space.estimate.WALPeak, space.estimate.Growth, space.estimate.Need, float64(space.estimate.Need)/float64(measured))
+			require.GreaterOrEqual(t, space.estimate.Need, measured, "the precheck must never admit an upgrade the disk cannot hold")
+			if live >= upgradeSpaceHeadroom {
+				// Once the fixed allowance no longer dominates, the model alone
+				// must keep a margin over what the upgrade really wrote.
+				require.GreaterOrEqual(t, float64(space.estimate.WALPeak+space.estimate.Growth), 1.25*float64(measured),
+					"the shares need a 1.25x margin over the measured upgrade")
+			}
+		})
+	}
+	if upgraded == 0 {
+		t.Skip("no store older than the current schema")
 	}
 }
