@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
+	mcpserver "github.com/mark3labs/mcp-go/server"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/daemon"
@@ -228,5 +230,142 @@ func TestDaemonHTTPAndUnixShareLanesBeforeRemoteRouting(t *testing.T) {
 		}
 	default:
 		t.Fatal("remote received no session identity")
+	}
+}
+
+// heldToolDispatcher runs frames through a plain mcp-go server, so an HTTP
+// notifications/cancelled reaches the same in-flight cancellation a daemon
+// session relies on. Its tools only wait; the classifier lets them fill the
+// shared and the reserved mutating slots alike.
+type heldToolDispatcher struct {
+	server *mcpserver.MCPServer
+}
+
+func (d heldToolDispatcher) Dispatch(ctx context.Context, _ *daemon.Session, frame []byte) ([]byte, error) {
+	reply := d.server.HandleMessage(ctx, json.RawMessage(frame))
+	if reply == nil {
+		return nil, nil
+	}
+	return json.Marshal(reply)
+}
+
+func (heldToolDispatcher) DispatchClass(name string, _ map[string]any) daemon.MCPDispatchClass {
+	if name == "hold_edit" {
+		return daemon.MCPDispatchMutating
+	}
+	return daemon.MCPDispatchFast
+}
+
+func TestDaemonHTTPCancellationReachesAFullDispatchPool(t *testing.T) {
+	status := daemon.MCPDispatchSnapshot()
+	limit, reserve := status.Limit, status.MutationReserve
+	started := make(chan struct{}, limit)
+	release := make(chan struct{})
+	hold := func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return mcp.NewToolResultText("released"), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	tools := mcpserver.NewMCPServer("cancel-test", "1")
+	tools.AddTool(mcp.NewTool("hold_read"), hold)
+	tools.AddTool(mcp.NewTool("hold_edit"), hold)
+	mount := buildDaemonStreamableHandler(heldToolDispatcher{server: tools}, daemon.NewSessionRegistry(), nil, zap.NewNop(), nil)
+	httpServer := httptest.NewServer(mount)
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(func() { unblock(); httpServer.Close() })
+	transport := &http.Transport{Proxy: nil}
+	t.Cleanup(transport.CloseIdleConnections)
+	holderClient := &http.Client{Timeout: 30 * time.Second, Transport: transport}
+	// The bound only has to tell "delivered now" from "delivered once a holder
+	// finishes": these holders never finish on their own.
+	cancelClient := &http.Client{Timeout: 2 * time.Second, Transport: transport}
+	type posted struct {
+		id      int
+		status  int
+		session string
+		body    []byte
+		err     error
+	}
+	post := func(client *http.Client, id int, session, frame string) posted {
+		out := posted{id: id}
+		req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/mcp", bytes.NewBufferString(frame))
+		if err != nil {
+			out.err = err
+			return out
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if session != "" {
+			req.Header.Set(streamable.HeaderSessionID, session)
+		}
+		response, err := client.Do(req)
+		if err != nil {
+			out.err = err
+			return out
+		}
+		defer response.Body.Close()
+		out.status, out.session = response.StatusCode, response.Header.Get(streamable.HeaderSessionID)
+		out.body, out.err = io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		return out
+	}
+	initialized := post(holderClient, 1, "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"cancel-test","version":"1"}}}`)
+	if initialized.err != nil || initialized.session == "" {
+		t.Fatalf("HTTP initialization: session=%q err=%v body=%s", initialized.session, initialized.err, initialized.body)
+	}
+	sid := initialized.session
+
+	// Every slot is held: the shared ones by reads, the reserved ones by edits.
+	results := make(chan posted, limit)
+	for i := range limit {
+		name := "hold_read"
+		if i >= limit-reserve {
+			name = "hold_edit"
+		}
+		id := 100 + i
+		go func() {
+			results <- post(holderClient, id, sid, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":%q,"arguments":{}}}`, id, name))
+		}()
+		select {
+		case <-started:
+		case early := <-results:
+			t.Fatalf("holder %d returned before holding a slot: status=%d err=%v body=%s", early.id, early.status, early.err, early.body)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("holder %d did not take a dispatch slot", id)
+		}
+	}
+	full := daemon.MCPDispatchSnapshot()
+	if full.Lanes["fast"].InFlight != limit-reserve || full.Lanes["mutating"].InFlight != reserve {
+		t.Fatalf("holders do not fill the pool: %+v", full.Lanes)
+	}
+
+	cancelled := post(cancelClient, 0, sid, `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":100}}`)
+	if cancelled.err != nil || cancelled.status != http.StatusAccepted {
+		t.Fatalf("cancellation waited for the capacity it frees: status=%d err=%v body=%s", cancelled.status, cancelled.err, cancelled.body)
+	}
+	select {
+	case got := <-results:
+		if got.id != 100 || got.err != nil || bytes.Contains(got.body, []byte("released")) {
+			t.Fatalf("cancelled holder: id=%d status=%d err=%v body=%s", got.id, got.status, got.err, got.body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the cancelled call kept its slot")
+	}
+	// The reply follows the slot's release, so the lane already shows it.
+	if after := daemon.MCPDispatchSnapshot(); after.Lanes["fast"].InFlight != limit-reserve-1 || after.Lanes["mutating"].InFlight != reserve {
+		t.Fatalf("cancelled call did not return its slot: %+v", after.Lanes)
+	}
+	unblock()
+	for range limit - 1 {
+		select {
+		case got := <-results:
+			if got.err != nil || !bytes.Contains(got.body, []byte("released")) {
+				t.Fatalf("holder %d: status=%d err=%v body=%s", got.id, got.status, got.err, got.body)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("released holders did not finish")
+		}
 	}
 }

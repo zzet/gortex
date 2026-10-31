@@ -306,8 +306,9 @@ they actually return. When all four drains are occupied, further cancelled
 handlers remain capacity-charged; physical dispatcher work stays bounded by
 the configured cap plus four. Initialization (`initialize` or `server/discover`)
 and notifications share total capacity but are exempt from tool reservations;
-notifications wait without a queue budget. `subscriptions/listen` stays
-unbounded and consumes no dispatch slot.
+notifications wait without a queue budget. `notifications/cancelled` takes no
+slot on either transport, so a full pool cannot hold back the cancellation that
+frees it. `subscriptions/listen` stays unbounded and consumes no dispatch slot.
 
 Daemon status exposes `mcp_dispatch`: lane in-flight, queued, draining and
 cancelled-but-held counts, refusals, reserved-slot use and queue-wait histograms

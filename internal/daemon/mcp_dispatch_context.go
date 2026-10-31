@@ -44,10 +44,19 @@ func prepareMCPDispatchContext(ctx context.Context, session string, envelope mcp
 		class = MCPDispatchFast
 	}
 	ctx = withMCPDispatchRequest(ctx, mcpDispatchRequestInfo{class: class, session: session, protocol: isMCPInitializationRequest(envelope.Method) || len(envelope.ID) == 0 && envelope.Method != ""})
-	if isLongLivedMCPRequest(envelope.Method) {
+	if isLongLivedMCPRequest(envelope.Method) || isMCPCancellation(envelope.Method) {
 		ctx = withMCPDispatchUnbounded(ctx)
 	}
 	return ctx
+}
+
+// isMCPCancellation marks the one notification that must not wait for a slot.
+// It only gives capacity back, so queueing it behind a full pool would keep
+// that capacity held exactly when it is needed. The Unix reader cancels in
+// place and never dispatches it; HTTP hands it to the MCP server, which owns
+// the in-flight request it cancels.
+func isMCPCancellation(method string) bool {
+	return method == "notifications/cancelled"
 }
 
 // DispatchMCPFrame is the shared admission/replay entry for the daemon's Unix
