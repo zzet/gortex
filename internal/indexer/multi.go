@@ -2463,8 +2463,12 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 				coordinatedBulk, _ := mi.graph.(graph.CoordinatedBulkLoader)
 				coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
 				defer func() {
+					// The last call on the window: a retry of the finalize below
+					// when that failed, or the only end after an early return or
+					// a panic. Abort if it fails too, so the window cannot hold
+					// its relaxed-durability writer until the store closes.
 					if coordinatedBulkActive {
-						if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+						if err := graph.EndOrAbortCoordinatedBulkLoad(coordinatedBulk); err != nil {
 							mi.logger.Error("multi-repo bulk-load cleanup failed", zap.Error(err))
 						}
 					}
