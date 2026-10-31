@@ -131,6 +131,18 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go build -o gortex ./cmd/gortex/
+      # The unused-method check from build-linux-static, linked the way
+      # release.yml links these platforms' binaries: no build tags, and on
+      # windows the mingw runtime linked in statically. Compilation is cached
+      # from the build above, so this costs one more link.
+      - name: Keep unused methods prunable
+        shell: bash
+        run: |
+          set -o pipefail
+          extld=
+          if [ "$RUNNER_OS" = Windows ]; then extld=-extldflags=-static; fi
+          go build -ldflags "-s -w $extld -dumpdep" \
+            -o "$RUNNER_TEMP/gortex-dumpdep" ./cmd/gortex/ 2>&1 | go run ./scripts/ci-dumpdep
 
   smoke:
     needs: plan
@@ -182,6 +194,22 @@ jobs:
         run: |
           file gortex-static
           sh scripts/verify-static-elf.sh gortex-static
+
+      # Executing a text/template or html/template, like any other reflect
+      # method lookup by a run-time name, makes the linker keep every exported
+      # method of every reachable type: ~6 MB of the stripped binary when the
+      # service unit files were rendered with text/template. Relink (the
+      # compile above is cached) with -dumpdep, which lists what the linker
+      # keeps and why; scripts/ci-dumpdep fails with the call chain that
+      # reaches such a lookup.
+      - name: Keep unused methods prunable
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -o pipefail
+          go build -tags netgo,osusergo,static_link \
+            -ldflags '-s -w -extldflags "-static" -dumpdep' \
+            -o /dev/null ./cmd/gortex/ 2>&1 | go run ./scripts/ci-dumpdep
 
       # The static-only code path (custom grammars declining instead of
       # dlopen'ing) is compiled out of every other job, so it needs its tests
