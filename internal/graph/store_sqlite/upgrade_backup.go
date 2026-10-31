@@ -177,7 +177,7 @@ func removeSQLiteFileSet(path string) error {
 // backupBeforeUpgrade snapshots the store the pending upgrade described by
 // space is about to change. It never fails Open: a backup that cannot be
 // taken is skipped with the reason reported, and the upgrade proceeds.
-func backupBeforeUpgrade(space upgradeSpace, observe MigrationObserver) {
+func backupBeforeUpgrade(space upgradeSpace, observe MigrationObserver, hook upgradeHook) {
 	final := UpgradeBackupPath(space.path, space.from)
 	started := time.Now()
 	report := func(phase MigrationPhase, detail string) {
@@ -205,7 +205,7 @@ func backupBeforeUpgrade(space upgradeSpace, observe MigrationObserver) {
 			space.available, space.estimate.Need, copyBytes))
 		return
 	}
-	if err := writeUpgradeBackup(space.path, final); err != nil {
+	if err := writeUpgradeBackup(space.path, final, func() { hook.at(upgradeBackupCopied, space.from) }); err != nil {
 		report(MigrationBackupSkipped, fmt.Sprintf("backup failed: %v", err))
 		return
 	}
@@ -215,7 +215,8 @@ func backupBeforeUpgrade(space upgradeSpace, observe MigrationObserver) {
 // writeUpgradeBackup copies the quiescent store (main file plus any WAL) to
 // final's partial name, folds the WAL into a single self-contained file, and
 // renames it into place durably. Every path out on error removes the partial.
-func writeUpgradeBackup(storePath, final string) (err error) {
+// copied runs once both files are in the partial copy.
+func writeUpgradeBackup(storePath, final string, copied func()) (err error) {
 	partial := final + upgradeBackupPartialSuffix
 	defer func() {
 		if err != nil {
@@ -228,6 +229,7 @@ func writeUpgradeBackup(storePath, final string) (err error) {
 	if err := copyFileDurably(storePath+"-wal", partial+"-wal"); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	copied()
 	if err := foldBackupWAL(partial); err != nil {
 		return err
 	}

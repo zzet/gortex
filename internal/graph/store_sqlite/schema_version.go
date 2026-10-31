@@ -1395,14 +1395,49 @@ func setUserVersion(db *sql.DB, v int) error {
 	return nil
 }
 
+// upgradePoint names a boundary inside a schema transition at which the
+// in-package crash tests stop the process, to prove the next Open completes
+// the transition from whatever a kill there leaves on disk.
+type upgradePoint string
+
+const (
+	// upgradeInStep follows a step body inside the uncommitted migration
+	// transaction; version is that step's.
+	upgradeInStep upgradePoint = "in_step"
+	// upgradeIndexRecreation falls between the core and the sidecar index
+	// rebuilds, after the migration transaction has committed.
+	upgradeIndexRecreation upgradePoint = "index_recreation"
+	// upgradeBeforeStamp is the last moment before user_version is written.
+	upgradeBeforeStamp upgradePoint = "before_stamp"
+	// upgradeBackupCopied follows the pre-upgrade copy into its partial file,
+	// before the copy is folded and renamed into place.
+	upgradeBackupCopied upgradePoint = "backup_copied"
+)
+
+// upgradeHook is called synchronously at each upgradePoint. Only tests set
+// one; a nil hook is a no-op.
+type upgradeHook func(point upgradePoint, version int)
+
+func (h upgradeHook) at(point upgradePoint, version int) {
+	if h != nil {
+		h(point, version)
+	}
+}
+
 // applyInPlaceMigrations runs the in-place steps in a single transaction.
 func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration, observers ...MigrationObserver) error {
-	if len(steps) == 0 {
-		return nil
-	}
 	var observe MigrationObserver
 	if len(observers) > 0 {
 		observe = observers[0]
+	}
+	return applyInPlaceMigrationsWith(db, steps, observe, nil)
+}
+
+// applyInPlaceMigrationsWith is applyInPlaceMigrations with the crash-test
+// hook threaded through.
+func applyInPlaceMigrationsWith(db *sql.DB, steps []schemaMigration, observe MigrationObserver, hook upgradeHook) error {
+	if len(steps) == 0 {
+		return nil
 	}
 	tx, err := db.Begin()
 	if err != nil {
@@ -1426,6 +1461,7 @@ func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration, observers ...Mi
 			}
 			return fmt.Errorf("schema migration v%d (%s): %w", m.version, m.name, err)
 		}
+		hook.at(upgradeInStep, m.version)
 		if observe != nil {
 			observe(MigrationProgress{
 				Version: m.version,

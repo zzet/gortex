@@ -718,6 +718,7 @@ type openOptions struct {
 	allowRebuild      bool
 	migrationObserver MigrationObserver
 	upgradeBackup     bool
+	upgradeHook       upgradeHook
 	// diskAvail reports the free bytes on the volume holding a directory.
 	// nil means platform.DiskAvailBytes; tests inject a fixed figure.
 	diskAvail func(dir string) (uint64, error)
@@ -754,6 +755,11 @@ func WithMigrationObserver(observer MigrationObserver) Option {
 // the store: the copy is consistent only because no other process can write
 // the store while it is taken.
 func WithUpgradeBackup() Option { return func(o *openOptions) { o.upgradeBackup = true } }
+
+// withUpgradeHook installs the crash-test hook on the schema transition.
+func withUpgradeHook(hook upgradeHook) Option {
+	return func(o *openOptions) { o.upgradeHook = hook }
+}
 
 // withDiskAvail replaces the free-space probe the upgrade precheck uses.
 func withDiskAvail(fn func(dir string) (uint64, error)) Option {
@@ -801,7 +807,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 // resolved options spelled out, so tests can drive any transition without
 // mutating package globals.
 func openStore(path string, current int, migrations []schemaMigration, o openOptions) (*Store, error) {
-	allowRebuild, observe := o.allowRebuild, o.migrationObserver
+	allowRebuild, observe, hook := o.allowRebuild, o.migrationObserver, o.upgradeHook
 	// Refuse unsupported newer schemas before a writer connection can change
 	// journal mode or checkpoint their WAL. WithRebuild does not override this.
 	probe, err := probeStoreSchema(path)
@@ -819,7 +825,7 @@ func openStore(path string, current int, migrations []schemaMigration, o openOpt
 			return nil, err
 		}
 		if o.upgradeBackup {
-			backupBeforeUpgrade(space, observe)
+			backupBeforeUpgrade(space, observe, hook)
 		}
 	}
 
@@ -964,7 +970,7 @@ func openStore(path string, current int, migrations []schemaMigration, o openOpt
 	// pass WithRebuild. A wipe plan carries no in-place steps, and after a wipe
 	// the store is empty and the daemon's normal indexing repopulates it.
 	if plan.stamp {
-		if err := applyInPlaceMigrations(db, plan.inPlace, observe); err != nil {
+		if err := applyInPlaceMigrationsWith(db, plan.inPlace, observe, hook); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite schema migrate: %w", err)
 		}
@@ -978,6 +984,9 @@ func openStore(path string, current int, migrations []schemaMigration, o openOpt
 	if err := createGraphCoreIndexes(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite core index: %w", err)
+	}
+	if plan.stamp {
+		hook.at(upgradeIndexRecreation, current)
 	}
 	if err := createSidecarIndexes(db); err != nil {
 		_ = db.Close()
@@ -1000,6 +1009,7 @@ func openStore(path string, current int, migrations []schemaMigration, o openOpt
 	// preceding operation is idempotent, so an interruption before this point
 	// leaves the old version and safely retries the transition on the next Open.
 	if plan.stamp {
+		hook.at(upgradeBeforeStamp, current)
 		if err := setUserVersion(db, current); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
