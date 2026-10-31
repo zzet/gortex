@@ -579,9 +579,15 @@ func TestContractLinkedIdleFillStopsAtCheckpointAndResumesWithProgress(t *testin
 	})
 
 	t.Run("park_is_bounded", func(t *testing.T) {
-		h := newLinkedHoldProbe(t, ContractLinkedIdle, nil)
+		var shared atomic.Int64
+		h := newLinkedHoldProbe(t, ContractLinkedIdle, func(options *ContractAnalysisCoordinatorOptions) {
+			options.Yield = func(ctx context.Context) error {
+				shared.Add(1)
+				return ctx.Err()
+			}
+		})
 		h.advance(5 * time.Second)
-		type observed struct{ parked, bounded, immediate bool }
+		type observed struct{ parked, bounded, paced bool }
 		seen := make(chan observed, 1)
 		h.c.run = func(job *contractAnalysisJob) string {
 			var o observed
@@ -589,15 +595,17 @@ func TestContractLinkedIdleFillStopsAtCheckpointAndResumesWithProgress(t *testin
 			o.parked = parked
 			h.advance(contractLinkedParkMax)
 			o.bounded, _ = receiveYield(returned)
+			calls := shared.Load()
 			again := make(chan error, 1)
 			go func() { again <- job.yield(context.Background()) }()
-			o.immediate, _ = receiveYield(again)
+			returnedAgain, err := receiveYield(again)
+			o.paced = returnedAgain && err == nil && shared.Load() == calls+1
 			h.busy.Store(false)
 			seen <- o
 			return h.run(job)
 		}
 		linked := h.scheduleLinked(t.Context(), "wt", "r", "k", false)
-		require.Equal(t, observed{parked: true, bounded: true, immediate: true}, <-seen, "demand that outlasts the bound no longer parks the job")
+		require.Equal(t, observed{parked: true, bounded: true, paced: true}, <-seen, "demand that outlasts the bound no longer parks the job; it yields on the shared yield")
 		require.Equal(t, ContractActorPublished, h.wait(linked).Result)
 	})
 

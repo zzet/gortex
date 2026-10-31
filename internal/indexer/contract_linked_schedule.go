@@ -40,7 +40,8 @@ const contractDemandPoll = 250 * time.Millisecond
 
 // contractLinkedParkMax bounds how long one linked job parks for demand in
 // all. Past it the job no longer parks: a long busy spell must not pin its
-// job slot, leases and reservations; it still stops at its next checkpoint.
+// job slot, leases and reservations. It yields on the shared yield instead,
+// as a primary job does, and still stops at its next checkpoint.
 const contractLinkedParkMax = 30 * time.Second
 
 // contractDemand is one sample of Demand; sampled is false where the idle
@@ -234,8 +235,8 @@ func (c *ContractAnalysisCoordinator) linkJob(a *contractActor, job *contractAna
 // demand since its last look it returns at once. A tool call that came and
 // went since then marks the job, which stops at its next checkpoint. Work in
 // flight marks it too, and parks it with no progress slice until the work
-// ends, another actor waits for the slot, the context ends, or the job has
-// parked for contractLinkedParkMax in all.
+// ends, another actor waits for the slot or the context ends. A job that has
+// parked for contractLinkedParkMax in all yields on the shared yield.
 func (c *ContractAnalysisCoordinator) linkedYield(a *contractActor, job *contractAnalysisJob) func(context.Context) error {
 	var parked atomic.Int64
 	return func(ctx context.Context) error {
@@ -255,8 +256,11 @@ func (c *ContractAnalysisCoordinator) linkedYield(a *contractActor, job *contrac
 		poll := time.NewTicker(5 * time.Millisecond)
 		defer poll.Stop()
 		for {
-			if c.linkedParkEnds(a, demand) || !demand.busy || time.Duration(parked.Load())+c.now().Sub(start) >= contractLinkedParkMax {
+			if c.linkedParkEnds(a, demand) || !demand.busy {
 				return ctx.Err()
+			}
+			if time.Duration(parked.Load())+c.now().Sub(start) >= contractLinkedParkMax {
+				return c.options.Yield(ctx)
 			}
 			select {
 			case <-ctx.Done():
