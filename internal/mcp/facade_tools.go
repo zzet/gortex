@@ -18,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/localizationauth"
+	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/telemetry"
 )
 
@@ -1212,7 +1213,7 @@ func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (s
 	}
 	seen := make(map[string]bool)
 	candidates := make([]string, 0, 2)
-	for _, node := range eng.FindSymbols(id) {
+	for _, node := range s.shorthandNameCandidates(ctx, eng, id) {
 		if node == nil || seen[node.ID] || !s.nodeInSessionScope(ctx, node) {
 			continue
 		}
@@ -1234,6 +1235,38 @@ func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (s
 		return id, candidates
 	}
 	return resolved, nil
+}
+
+// shorthandNameCandidates returns the nodes named name that a shorthand may
+// resolve to, before the session-scope check. The every-repository read
+// decodes each tracked repository's same-named symbols only to drop them, so
+// a session bound to one repository paid for all the others. A bound session
+// whose repositories are known reads each of them, plus the unowned bucket
+// every scope admits (synthetic externals), through the selected reader's
+// repository-scoped finder instead. The finder is asked of the reader the
+// engine reads, so an overlay or routed view without one keeps the
+// every-repository read rather than bypassing its own layers.
+func (s *Server) shorthandNameCandidates(ctx context.Context, eng *query.Engine, name string) []*graph.Node {
+	finder, ok := contractCoreSelectedReader(eng.Reader()).(graph.RepoNamesNodeFinder)
+	if !ok {
+		return eng.FindSymbols(name)
+	}
+	repos, bound := s.sessionWorkspaceRepoSet(ctx)
+	if !bound || len(repos) == 0 {
+		return eng.FindSymbols(name)
+	}
+	prefixes := []string{""}
+	for repo, allowed := range repos {
+		if allowed && repo != "" {
+			prefixes = append(prefixes, repo)
+		}
+	}
+	sort.Strings(prefixes)
+	var nodes []*graph.Node
+	for _, prefix := range prefixes {
+		nodes = append(nodes, finder.FindNodesByNamesInRepo([]string{name}, prefix)[name]...)
+	}
+	return nodes
 }
 
 // requestedAnalyzeKind applies the same argument-container precedence as the
