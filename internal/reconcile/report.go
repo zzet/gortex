@@ -28,7 +28,8 @@ const (
 	// ActionMarkedUnavailable is retained for catalog/report compatibility with
 	// older daemons. New passes retire an inaccessible checkout when its grace
 	// expires instead of leaving this terminal state behind.
-	ActionMarkedUnavailable CheckoutAction = "marked_unavailable"
+	ActionMarkedUnavailable        CheckoutAction = "marked_unavailable"
+	ActionPrimaryRetirementRefused CheckoutAction = "primary_retirement_refused"
 	// ActionRemovalGraceStarted means a removal was evidenced and the removal
 	// clock was started.
 	ActionRemovalGraceStarted CheckoutAction = "removal_grace_started"

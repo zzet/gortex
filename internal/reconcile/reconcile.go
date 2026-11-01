@@ -221,6 +221,7 @@ type familyPass struct {
 	primaryGraphID string
 	now            time.Time
 	beforeAllocate func() error
+	commonFresh    PathEvidence
 }
 
 // ReconcileFamily brings one family's catalog rows in line with what git and
@@ -250,6 +251,7 @@ func (r *Reconciler) ReconcileFamily(ctx context.Context, familyID, probeDir str
 		inventory:    inv,
 		inventoryErr: ValidateInventory(inv, invErr, family.CommonDirIdentity),
 		now:          r.now(),
+		commonFresh:  SampledPathEvidence(r.samplePath(family.CommonDirIdentity)),
 	}
 	// The inventory is the pass's one unbounded cost — a git plumbing call
 	// against a directory that may be on a sleeping volume — so it is timed
@@ -337,6 +339,9 @@ func (r *Reconciler) reconcileKnown(
 	}
 	fresh := SampledPathEvidence(r.samplePath(root))
 	class := Classify(pass.inventoryErr, record, StoredPathEvidence(storedRow), fresh)
+	if pass.inventoryErr != nil && !pass.commonFresh.RootExists && pass.commonFresh.ancestorVolumeUsable() && storedRow.CommonDirVolumeKind == pass.commonFresh.AncestorVolumeKind && storedRow.CommonDirVolumeToken != "" && storedRow.CommonDirVolumeToken == pass.commonFresh.AncestorVolumeToken {
+		class = Classification{Disposition: DispositionRemoved, Evidence: EvidencePrunableConfirmed, Detail: "family common directory absent on its still-mounted volume"}
+	}
 	r.recordClassification(pass, existing, record, fresh, class)
 
 	entry := CheckoutReport{
@@ -412,6 +417,8 @@ func (r *Reconciler) reconcileKnown(
 		entry.RetryAt = req.AvailabilityDeadline
 	case ActionRemovalGraceStarted, ActionRemovalHeld:
 		entry.RetryAt = req.RemovalDeadline
+	case ActionMarkedUnavailable, ActionPrimaryRetirementRefused:
+		entry.RetryAt = pass.now.Add(r.cfg.AvailabilityGrace).Unix()
 	}
 
 	if err := r.catalog.UpdateCheckoutObservation(ctx, req); err != nil {
@@ -427,8 +434,17 @@ func (r *Reconciler) reconcileKnown(
 	entry.State = req.State
 	recordTransition(existing.State, req.State, class)
 
-	if class.Disposition == DispositionPresent {
-		row := fresh.CatalogRow(existing.CheckoutID, pass.now.Unix(), storedRow.SampleGeneration+1)
+	if class.Disposition == DispositionPresent || pass.inventoryErr == nil {
+		row := storedRow
+		if class.Disposition == DispositionPresent {
+			row = fresh.CatalogRow(existing.CheckoutID, pass.now.Unix(), storedRow.SampleGeneration+1)
+		}
+		row.CheckoutID = existing.CheckoutID
+		row.CommonDirVolumeKind, row.CommonDirVolumeToken = storedRow.CommonDirVolumeKind, storedRow.CommonDirVolumeToken
+		if pass.inventoryErr == nil {
+			row.CommonDirVolumeKind = pass.commonFresh.RootVolumeKind
+			row.CommonDirVolumeToken = pass.commonFresh.RootVolumeToken
+		}
 		if err := r.catalog.UpsertCheckoutPathEvidence(ctx, row); err != nil {
 			return entry, err
 		}
@@ -504,6 +520,9 @@ func (r *Reconciler) applyInaccessible(
 	if existing.AvailabilityDeadline == 0 || now < existing.AvailabilityDeadline {
 		return ActionAvailabilityHeld, false, nil
 	}
+	if action, retained, err := r.retainIntended(ctx, pass, existing, req); retained || err != nil {
+		return action, false, err
+	}
 	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing)
 }
 
@@ -537,7 +556,48 @@ func (r *Reconciler) applyRemoved(
 		return ActionRemovalHeld, false, nil
 	}
 
+	if action, retained, err := r.retainIntended(ctx, pass, existing, req); retained || err != nil {
+		return action, false, err
+	}
 	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing)
+}
+
+// retainIntended expires serving layers without revoking the user's tracking
+// intent or deleting its graph/config identity. The purge journal is idempotent
+// and is cleared by recovery, so a later outage can purge rebuilt layers again.
+func (r *Reconciler) retainIntended(ctx context.Context, pass *familyPass, existing store_sqlite.Checkout, req *store_sqlite.UpdateCheckoutObservationRequest) (CheckoutAction, bool, error) {
+	owned, err := r.ownedGraph(ctx, existing.FamilyID, existing.CheckoutID)
+	if err != nil {
+		return "", false, err
+	}
+	intended := owned != nil
+	if !intended {
+		intents, err := r.catalog.ListTrackingIntents(ctx, existing.CheckoutID)
+		if err != nil {
+			return "", false, err
+		}
+		for _, intent := range intents {
+			if intent.Active && string(intent.SourceKind) != "implicit" {
+				intended = true
+				break
+			}
+		}
+	}
+	if !intended {
+		return "", false, nil
+	}
+	action := ActionMarkedUnavailable
+	if owned != nil && owned.IsPrimaryBase {
+		action = ActionPrimaryRetirementRefused
+		if existing.State != store_sqlite.CheckoutStateUnavailable {
+			r.logger.Warn("primary_retirement_refused", zap.String("family", existing.FamilyID), zap.String("checkout", existing.CheckoutID), zap.String("root", existing.RootPath), zap.String("cause", "reconcile_availability"))
+		}
+	}
+	if err := r.purgeLayersOnce(context.WithoutCancel(ctx), existing); err != nil {
+		return "", true, err
+	}
+	req.State = store_sqlite.CheckoutStateUnavailable
+	return action, true, nil
 }
 
 // retireCheckout runs the guarded teardown shared by authoritative removal and
@@ -803,7 +863,11 @@ func (r *Reconciler) recordClassification(
 			zap.Bool("git_root_accessible", record.RootAccessible),
 			zap.Bool("git_prunable", record.Prunable))
 	}
-	r.logger.Debug("checkout reconcile: classified", fields...)
+	if class.Disposition != DispositionPresent {
+		r.logger.Info("checkout reconcile: classified", append(fields, zap.String("cause", "reconcile_"+string(class.Disposition)))...)
+	} else {
+		r.logger.Debug("checkout reconcile: classified", fields...)
+	}
 }
 
 // headFor reads HEAD out of a reachable working tree, falling back to what the
