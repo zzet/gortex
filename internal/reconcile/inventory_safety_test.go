@@ -121,3 +121,62 @@ func TestPrimaryRetirementRefusedLogsOnce(t *testing.T) {
 		t.Fatalf("refused removal cause=%v", cause)
 	}
 }
+
+func TestInventoryCandidatesTryNextBeforeFreezingClocks(t *testing.T) {
+	f := newFixture(t, Default())
+	f.seedPrimaryGraph("base")
+	f.git.setRecords(presentRecord("work", "/repo/work"))
+	f.git.samples["/repo/work"] = gitSampleExisting(volumeA)
+	calls := []string{}
+	WithInventory(func(ctx context.Context, dir string) (*gitstate.FamilyInventory, error) {
+		calls = append(calls, dir)
+		if dir == "/damaged" {
+			return nil, gitstate.ErrInventoryUnavailable
+		}
+		return f.git.inventory(ctx, dir)
+	})(f.rec)
+	report, err := f.rec.ReconcileFamilyCandidates(context.Background(), f.familyID, "/damaged", "/repo")
+	if err != nil || !report.InventoryUsable || len(calls) != 2 {
+		t.Fatalf("candidate fallback report=%+v calls=%v err=%v", report, calls, err)
+	}
+	if entry := f.entry(report, "work"); entry.State != store_sqlite.CheckoutStateReady {
+		t.Fatalf("usable fallback did not keep checkout ready: %+v", entry)
+	}
+}
+
+func TestAutomaticRetirementPreservesIntentAddedDuringPurge(t *testing.T) {
+	clock := &steppedClock{now: time.Unix(1900000000, 0)}
+	f := newFixture(t, Default(), WithClock(clock.Now))
+	f.seedPrimaryGraph("base")
+	f.seedCheckout("automatic", "inc", "work", store_sqlite.CheckoutModeAutomatic)
+	f.git.setRecords(presentRecord("work", "/repo/work"))
+	f.git.samples["/repo/work"] = gitSampleExisting(volumeA)
+	f.reconcile()
+	f.git.setRecords()
+	f.reconcile()
+	clock.advance(31 * time.Second)
+	f.hooks.onPurge = func(checkoutID string) {
+		if err := f.catalog.UpsertTrackingIntent(context.Background(), store_sqlite.TrackingIntent{IntentID: "concurrent", CheckoutID: checkoutID, SourceKind: store_sqlite.IntentSourceCLITrack, SourceLocator: "cli", Active: true}); err != nil {
+			t.Error(err)
+		}
+	}
+	report := f.reconcile()
+	row, found, err := f.catalog.GetCheckout(context.Background(), "automatic")
+	if err != nil || !found {
+		t.Fatalf("automatic retirement removed concurrently intended checkout: %+v found=%v err=%v", row, found, err)
+	}
+	if entry := f.entry(report, "work"); entry.Action == ActionForgotten {
+		t.Fatal("automatic pass reported retirement of intended checkout")
+	}
+	if err := f.rec.Resume(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	row = f.checkout("automatic")
+	if row.State != store_sqlite.CheckoutStateUnavailable {
+		t.Fatalf("retained checkout state=%s", row.State)
+	}
+	intents, err := f.catalog.ListTrackingIntents(context.Background(), "automatic")
+	if err != nil || len(intents) != 1 || !intents[0].Active {
+		t.Fatalf("concurrent intent lost: %+v err=%v", intents, err)
+	}
+}
