@@ -749,3 +749,29 @@ Inspect a profile with
 `go tool pprof -sample_index=inuse_space -top worktrees.step3.heap-load-peak.pprof`,
 and what one more worktree retains with
 `go tool pprof -sample_index=inuse_space -top -base worktrees.step2.heap-idle.pprof worktrees.step3.heap-idle.pprof`.
+
+### Live checkout discovery containment
+
+`--scenario worktree-discovery` starts with the first two pinned repositories
+in the manifest. It keeps their reading/editing sessions open while adding
+`--worktrees` detached checkouts to the first repository during the offered
+window. Each added checkout gets separate root and subdirectory query sessions.
+Use `--agents 0 --edit-agents 8` for eight combined edit/readback agents, or
+`--agents 8 --edit-agents 0` for a read-only control. Editing requires the same
+validated edit fixtures as the ordinary edit scenarios.
+
+`phase.gate.checkout_discovery` records every added root, first request, first
+observed exact worktree view, and the resulting visibility lag. That lag is an
+upper bound on catalog identity allocation; it does not claim an unobserved
+earlier allocation time. Each cwd has its class, call/error/refusal counts,
+complete-call read latency distribution and separately counted censored reads.
+Attempts retain the actual session cwd and structured RPC `error_data`, including
+the refused root, family, reason and retryability when supplied by the daemon.
+A refusal or completed error outside a currently pending checkout fails the run.
+
+Run an otherwise identical `--worktrees 0` control to compare primary read p95.
+Keep both reports and all refused/censored attempts. Zero refusals without any
+`pending_refusals` is not evidence of fault containment under a stuck discovery.
+A hung-discovery fixture, upgraded-store fixture and the reference-host runs
+remain separate acceptance cells; this scenario does not manufacture them.
+All measurements require an isolated host window and fresh owned clones/stores.

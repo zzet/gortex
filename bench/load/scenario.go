@@ -62,13 +62,16 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 	}()
 	selected := corpora[:1]
-	if scenario == "many" || scenario == "many-edit" {
+	if scenario == "many" || scenario == "many-edit" || scenario == checkoutDiscoveryScenario {
 		if len(corpora) < 2 {
 			return phase, nil, artifacts, crashes, "", errors.New("many-repository scenarios require at least two pinned repositories")
 		}
 		selected = corpora
+		if scenario == checkoutDiscoveryScenario {
+			selected = corpora[:2]
+		}
 	}
-	editing := scenario == "edit" || scenario == "many-edit" || scenario == editProbeScenario
+	editing := scenario == "edit" || scenario == "many-edit" || scenario == editProbeScenario || scenario == checkoutDiscoveryScenario && o.Editors > 0
 	for _, corpus := range selected {
 		operations, planErr := readingPlan(corpus)
 		if planErr != nil {
@@ -429,6 +432,8 @@ func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients
 		sweepCtx, cancelSweep := context.WithTimeout(ctx, o.SweepBudget)
 		defer cancelSweep()
 		err = runSweep(sweepCtx, o, sweepClients, p.Repos[0], sweepRequests, sweep, phase, waitContext)
+	} else if phase.Name == checkoutDiscoveryScenario {
+		err = measureCheckoutDiscovery(ctx, o, p, clients, phase)
 	} else if phase.Name != "cold" && phase.Name != "restart" {
 		err = runAgents(ctx, o, p, clients, phase.Name == "edit" || phase.Name == "many-edit", phase)
 	}

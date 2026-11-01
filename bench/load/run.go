@@ -70,7 +70,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.StringVar(&o.GitSHA, "git-sha", "", "full binary revision if absent from Go build metadata")
 	f.StringVar(&o.Profile, "profile", "agent", "agent (default) or explicit saturation")
 	f.StringVar(&o.Host, "host", "native", "native, reference, or floor (validated, never provisioned)")
-	f.StringVar(&o.Scenario, "scenario", "read", "read, edit, many, many-edit, worktrees, cold, restart, sweep, idle-stop, edit-and-probe, all")
+	f.StringVar(&o.Scenario, "scenario", "read", "read, edit, many, many-edit, worktrees, worktree-discovery, cold, restart, sweep, idle-stop, edit-and-probe, all")
 	f.IntVar(&o.Agents, "agents", 4, "pure reading agents (may be 0 for edit, many-edit, or edit-and-probe; idle-stop requires 0)")
 	f.IntVar(&o.Editors, "edit-agents", 4, "combined editing/readback/reading agents in edit scenarios, in addition to pure readers")
 	f.IntVar(&o.Worktrees, "worktrees", 4, "linked worktrees in addition to primary")
@@ -141,6 +141,12 @@ func validateRunOptions(o runOptions) error {
 }
 
 func selectedScenarios(o runOptions) ([]string, error) {
+	if o.Scenario == checkoutDiscoveryScenario {
+		if o.Agents+o.Editors < 2 || o.Host == "floor" {
+			return nil, errors.New("worktree-discovery requires at least two reading/editing sessions and a native or reference host")
+		}
+		return []string{checkoutDiscoveryScenario}, nil
+	}
 	if o.Scenario == "idle-stop" {
 		return []string{"idle-stop"}, nil
 	}
