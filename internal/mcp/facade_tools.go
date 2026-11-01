@@ -1173,6 +1173,7 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		return refusal, nil
 	}
 	ctx = s.captureToolFreshness(ctx)
+	ctx, forwarded = s.reserveToolFreshnessBudget(ctx, spec.Legacy, forwarded)
 	result, err = legacy.handler(ctx, forwarded)
 	if err == nil {
 		// Book the retrieval half of the savings ledger under the LEGACY tool

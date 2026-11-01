@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -559,6 +560,26 @@ func renderFreshnessLine(res *mcp.CallToolResult, fields map[string]any) *mcp.Ca
 // their watcher; checkout routes retain their own scoped receipt authority.
 func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []string, snapshots ...[]*mutationReceipt) relationFreshness {
 	label := relationFreshness{scope: scope}
+	paths, watched := s.canonicalTierPaths(ctx)
+	var receipts []*mutationReceipt
+	if !watched {
+		receipts = s.laggingMutationReceipts(ctx)
+	}
+	startup := s.multiIndexer != nil && s.multiIndexer.RelationsPending()
+	var snapshot toolFreshnessSnapshot
+	if len(snapshots) > 0 {
+		snapshot, _ = ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot)
+	}
+	gapCount := len(paths) + len(receipts) + len(snapshot.paths)
+	if len(snapshots) > 0 {
+		gapCount += len(snapshots[0])
+	}
+	if gapCount == 0 {
+		if scope != "file" && (startup || snapshot.startup) {
+			label.state = "pending"
+		}
+		return label // idle reads do not resolve seeds or enumerate incoming edges
+	}
 	inScope := s.relationScope(ctx, ids, files)
 	type pathState struct {
 		state      string
@@ -605,12 +626,12 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 			put(receipt.path, state, receipt.generation)
 		}
 	}
-	if paths, watched := s.canonicalTierPaths(ctx); watched {
+	if watched {
 		for path, tiers := range paths {
 			putTiers(path, tiers)
 		}
 	} else {
-		for _, receipt := range s.laggingMutationReceipts(ctx) {
+		for _, receipt := range receipts {
 			outcome := receipt.outcome(true)
 			if !outcome.Pending && outcome.Err == nil && outcome.Reindexed {
 				continue // a receipt can finish between selection and this read
@@ -629,7 +650,6 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 		}
 	}
 	slices.Sort(label.files)
-	startup := s.multiIndexer != nil && s.multiIndexer.RelationsPending()
 	if len(snapshots) > 0 {
 		if snapshot, ok := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); ok {
 			startup = startup || snapshot.startup
@@ -731,12 +751,108 @@ func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp
 		}
 	}
 	if rider := s.freshnessRiderFor(name, req); rider != nil {
-		return decorateResultWithFreshness(res, rider)
+		res = decorateResultWithFreshness(res, rider)
 	}
 	if isFreshnessListTool(name) {
-		return s.decorateListResultWithFreshness(res)
+		res = s.decorateListResultWithFreshness(res)
 	}
-	return res
+	return fitToolFreshnessBudget(ctx, req, res)
+}
+
+type toolFreshnessBudgetKey struct{}
+
+// Reserve the rider before the existing per-shape fitters choose rows. The
+// original cap remains request-local so a late publication gap is fitted too.
+func (s *Server) reserveToolFreshnessBudget(ctx context.Context, name string, req mcp.CallToolRequest) (context.Context, mcp.CallToolRequest) {
+	if _, reserved := ctx.Value(toolFreshnessBudgetKey{}).(int); reserved {
+		return ctx, req
+	}
+	budget := effectiveBudget(req)
+	if budget <= 0 {
+		return ctx, req
+	}
+	scope, ids, files := freshnessTargets(name, req)
+	if scope == "" {
+		return ctx, req
+	}
+	if requested := takeRequestFreshness(&req).scope; requested != "" {
+		scope = requested
+	}
+	label := s.freshnessFor(ctx, scope, ids, files)
+	if snapshot, ok := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); ok {
+		label = s.freshnessFor(ctx, scope, ids, files, snapshot.receipts)
+	}
+	if label.state == "" {
+		return ctx, req
+	}
+	reserve := len(label.line()) + 1
+	if !isCompact(req) {
+		fields := make(map[string]any)
+		label.apply(fields)
+		encoded, _ := json.Marshal(fields)
+		reserve += 2*len(encoded) + 64 // JSON block or escaped GCX header metadata
+	}
+	args := maps.Clone(req.GetArguments())
+	if args == nil {
+		args = make(map[string]any)
+	}
+	args["max_bytes"] = max(1, budget-reserve)
+	req.Params.Arguments, req.Params.RawArguments = args, nil
+	return context.WithValue(ctx, toolFreshnessBudgetKey{}, budget), req
+}
+
+func fitToolFreshnessBudget(ctx context.Context, req mcp.CallToolRequest, res *mcp.CallToolResult) *mcp.CallToolResult {
+	budget, reserved := ctx.Value(toolFreshnessBudgetKey{}).(int)
+	if !reserved {
+		budget = effectiveBudget(req)
+	}
+	body, ok := singleTextContent(res)
+	if !ok || budget <= 0 || len(body) <= budget {
+		return res
+	}
+	var fields map[string]any
+	if json.Unmarshal([]byte(body), &fields) == nil && fields != nil {
+		rider, labelled := fields["freshness"].(map[string]any)
+		if !labelled {
+			return res
+		}
+		fitted, _ := applyBudget(fields, budget)
+		encoded, err := json.Marshal(fitted)
+		if err == nil && len(encoded) <= budget {
+			return rebuildTextResult(res, string(encoded))
+		}
+		// An indivisible scalar can leave no answer rows to trim. Keep an
+		// explicit partial response, including the full pending-file count.
+		minimal := map[string]any{"freshness": maps.Clone(rider), budgetTruncatedKey: true}
+		minimalRider := minimal["freshness"].(map[string]any)
+		delete(minimalRider, "pending_files")
+		encoded, err = json.Marshal(minimal)
+		if err == nil && len(encoded) <= budget {
+			return rebuildTextResult(res, string(encoded))
+		}
+		return mcp.NewToolResultError("freshness exceeds max_bytes")
+	}
+	line, _, _ := strings.Cut(body, "\n")
+	labelled := strings.HasPrefix(line, "file: ") || strings.HasPrefix(line, "relations: ") || strings.HasPrefix(line, "derived: ")
+	if strings.HasPrefix(body, wire.Tag) {
+		trimmed, _ := trimGCXBytes([]byte(body), budget)
+		if len(trimmed) <= budget {
+			return rebuildTextResult(res, string(trimmed))
+		}
+		return mcp.NewToolResultError("freshness exceeds max_bytes")
+	}
+	if !labelled {
+		return res
+	}
+	if isCompact(req) || req.GetString("format", "") == "text" {
+		return rebuildTextResult(res, line+"\n"+trimTextToBudget(strings.TrimPrefix(body, line+"\n"), max(0, budget-len(line)-1)))
+	}
+	// TOON has no generic byte-cut operation. A newly admitted gap may have
+	// outgrown the reservation; return a labelled refusal rather than a torn table.
+	if len(line) <= budget {
+		return mcp.NewToolResultError(line)
+	}
+	return mcp.NewToolResultError("freshness exceeds max_bytes")
 }
 
 func (s *Server) awaitWatchedFreshness(ctx context.Context, name string, req mcp.CallToolRequest, freshness requestFreshness) *mcp.CallToolResult {
