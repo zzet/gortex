@@ -28,7 +28,7 @@ const maxLabelledPendingFiles = 16
 // its scope are still being published. The zero value is a fresh scope.
 type relationFreshness struct {
 	scope  string
-	state  string   // "", "pending" or "failed"
+	state  string   // Empty is fresh internally; explicit responses may render fresh or unknown.
 	files  []string // graph-keyed paths of the lagging in-scope edits, sorted
 	waited time.Duration
 }
