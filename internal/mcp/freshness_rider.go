@@ -504,10 +504,13 @@ func decorateResultWithFreshness(res *mcp.CallToolResult, rider map[string]any) 
 	if json.Unmarshal([]byte(text), &asObj) != nil {
 		return renderFreshnessLine(res, rider)
 	}
-	if _, exists := asObj["freshness"]; exists {
-		return res
+	if existing, ok := asObj["freshness"].(map[string]any); ok {
+		for key, value := range rider {
+			existing[key] = value
+		}
+	} else {
+		asObj["freshness"] = rider
 	}
-	asObj["freshness"] = rider
 	body, err := json.Marshal(asObj)
 	if err != nil {
 		return res

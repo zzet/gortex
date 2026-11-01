@@ -64,7 +64,9 @@ func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, to
 	defer exec.Close()
 	out, err := callToolWaitingForLoad(exec, tool, args, effectiveLoadingWait())
 	if freshnessErr := checkCLIFreshness(rootCmd, out, err); freshnessErr != nil {
-		return nil, freshnessErr
+		if _, coded := freshnessErr.(*exitCodeError); coded {
+			return nil, freshnessErr
+		}
 	}
 	if err != nil {
 		if errors.Is(err, ErrRepoNotTracked) {
