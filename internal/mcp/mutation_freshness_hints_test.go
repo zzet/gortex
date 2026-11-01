@@ -105,7 +105,7 @@ func TestFreshnessRefusalAnnotationBoundsAndScope(t *testing.T) {
 // Exercise the public call shapes against real handlers and an owned working
 // tree. The existing watcher seam supplies a failed publication result after
 // the edit acknowledges; this does not inject a real store patch failure.
-func TestFreshnessRefusalRecoveryFlow(t *testing.T) {
+func TestRelationFreshnessRecoveryFlow(t *testing.T) {
 	s, root := setupTestServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -144,14 +144,10 @@ func TestFreshnessRefusalRecoveryFlow(t *testing.T) {
 	waitCheckoutReceipt(t, s, id)
 
 	detectArgs := map[string]any{"operation": "detect", "options": map[string]any{"scope": "unstaged"}}
-	refused := call("change", detectArgs)
-	require.True(t, refused.IsError)
-	for _, want := range []string{
-		"graph freshness unavailable", "change.receipt options.receipt=" + id,
-		"workspace_admin operation=reindex", "paths=[P]", `mutation_id="recovery-flow"`,
-	} {
-		require.Contains(t, resultText(refused), want)
-	}
+	partial := resultJSON(t, call("change", detectArgs))
+	require.Equal(t, false, partial["complete"])
+	require.Equal(t, "failed", partial["graph_freshness"])
+	require.NotEmpty(t, partial["recovery_hint"])
 	status := resultJSON(t, call("change", map[string]any{
 		"operation": "receipt", "options": map[string]any{"mutation_id": id},
 	}))

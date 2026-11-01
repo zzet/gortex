@@ -64,7 +64,8 @@ func (s *Server) enrichNodeOnDemand(ctx context.Context, node *graph.Node) {
 // point: a request reading a checkout of its own has no writable output, so it
 // must not spawn a server or hover any bytes at all. Returns a nil output for
 // that case, for a path that cannot be placed on disk, and when no server
-// serves the language.
+// serves the language. A nonempty path with nil output means admission succeeded
+// but provider resolution failed; callers can back off that failure separately.
 func (s *Server) lspEnrichmentTarget(
 	ctx context.Context, producer string, node *graph.Node,
 ) (string, *EnrichmentOutput, *lsp.Provider) {
@@ -95,7 +96,7 @@ func (s *Server) lspEnrichmentTarget(
 	provider, _, err := s.lspProviderForPath(absPath)
 	if err != nil || provider == nil {
 		out.Abandon()
-		return "", nil, nil
+		return absPath, nil, nil
 	}
 	return absPath, out, provider
 }
@@ -110,37 +111,79 @@ func lspEnrichmentCapability(producer string) graphview.CapabilityID {
 	return graphview.CapLSPHover
 }
 
-// confirmSymbolRefsOnDemand faults in a callable symbol's INCOMING references
-// on a usages-shaped query (find_usages / get_callers) when the synchronous
-// LSP sweep is off. It lazy-spawns the language server, confirms this one
-// symbol's callers via call hierarchy, and lands the lsp_resolved edges into
-// the graph so the query answer — and every repeat — reflects compiler-grade
-// usages accuracy. Idempotent per session via the refsConfirmed ledger; a
-// no-op for non-callable nodes, when no call-hierarchy server serves the
-// language, or when already confirmed.
+// referenceConfirmation is immutable once published. An entry with neither a
+// deadline nor confirmed set is an active claim; its pointer is the finish token.
+// Replacing that exact token prevents an old attempt from restoring a reset entry.
+type referenceConfirmation struct {
+	retryAfter time.Time
+	confirmed  bool
+}
+
+const referenceRetryCooldown = time.Minute
+
+func (s *Server) claimReferenceConfirmation(id string, now time.Time) *referenceConfirmation {
+	for {
+		previous, loaded := s.refsConfirmed.Load(id)
+		if loaded {
+			entry := previous.(*referenceConfirmation)
+			if entry.confirmed || entry.retryAfter.IsZero() || now.Before(entry.retryAfter) {
+				return nil
+			}
+			claim := &referenceConfirmation{}
+			if s.refsConfirmed.CompareAndSwap(id, entry, claim) {
+				return claim
+			}
+		} else {
+			claim := &referenceConfirmation{}
+			if _, loaded := s.refsConfirmed.LoadOrStore(id, claim); !loaded {
+				return claim
+			}
+		}
+	}
+}
+
+// confirmSymbolRefsOnDemand faults in compiler-confirmed incoming calls for a
+// callable symbol. Positive, accepted results last for the analysis epoch. Empty
+// results (including a still-indexing server), errors, and refused completions
+// retry after a short cooldown, reusing the provider's existing client.
 func (s *Server) confirmSymbolRefsOnDemand(ctx context.Context, node *graph.Node) {
+	s.confirmSymbolRefsAt(ctx, node, time.Now())
+}
+
+func (s *Server) confirmSymbolRefsAt(ctx context.Context, node *graph.Node, now time.Time) {
 	if node == nil || s.semanticMgr == nil || s.graph == nil {
 		return
 	}
 	if node.Kind != graph.KindFunction && node.Kind != graph.KindMethod {
 		return
 	}
-	if _, done := s.refsConfirmed.Load(node.ID); done {
+	claim := s.claimReferenceConfirmation(node.ID, now)
+	if claim == nil {
 		return
 	}
-	_, out, provider := s.lspEnrichmentTarget(ctx, EnrichProducerSymbolRefs, node)
+	path, out, provider := s.lspEnrichmentTarget(ctx, EnrichProducerSymbolRefs, node)
 	if out == nil {
+		// Admission refusal, particularly a routed view, must leave the primary
+		// symbol eligible. Only remove our own claim, never a later epoch's entry.
+		if path == "" {
+			s.refsConfirmed.CompareAndDelete(node.ID, claim)
+		} else {
+			// Output was admitted, but its provider failed to start or resolve.
+			s.refsConfirmed.CompareAndSwap(node.ID, claim, &referenceConfirmation{retryAfter: now.Add(referenceRetryCooldown)})
+		}
 		return
 	}
-	if _, err := provider.ConfirmSymbolRefs(out.Store, out.Root, node); err != nil {
+	count, err := provider.ConfirmSymbolRefs(out.Store, out.Root, node)
+	accepted := false
+	if err != nil {
 		out.Abandon()
 	} else {
-		_ = out.Complete()
+		accepted = out.Complete() == nil
 	}
-	// Record after the attempt (even on 0/err) so a query doesn't re-spawn the
-	// server every call; a file re-index clears staleness through the normal
-	// restub path. Durable-ledger + retry semantics are the fuller version.
-	s.refsConfirmed.Store(node.ID, struct{}{})
+	s.refsConfirmed.CompareAndSwap(node.ID, claim, &referenceConfirmation{
+		confirmed:  count > 0 && err == nil && accepted,
+		retryAfter: now.Add(referenceRetryCooldown),
+	})
 }
 
 // registerLSPTools wires the LSP-action MCP surface:
