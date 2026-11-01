@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -342,6 +343,14 @@ func TestARefusedFoldGetsItsResetInBoundedTimeWithTheDaemonDefaults(t *testing.T
 			_ = churnWriteOnce(s, k)
 		}
 	}()
+	var stopWriterOnce sync.Once
+	stopWriter := func() {
+		stopWriterOnce.Do(func() {
+			close(stop)
+			<-writerDone
+		})
+	}
+	defer stopWriter() // Also join when an assertion exits the fold loop.
 	resets := s.WALReclaimStats().Resets
 	var requested time.Time
 	var reset time.Duration
@@ -361,8 +370,7 @@ func TestARefusedFoldGetsItsResetInBoundedTimeWithTheDaemonDefaults(t *testing.T
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	close(stop)
-	<-writerDone
+	stopWriter()
 	cp := s.WALCopyStats()
 	t.Logf("fold refused at log=%.0fMiB; reset %s after the request; pressure_runs=%d lane_resets=%d give_ups=%d",
 		float64(chainFoldWALMark+(64<<20))/(1<<20), reset.Round(time.Millisecond), cp.PressureRuns, cp.PressureLaneResets, cp.PressureGiveUps)

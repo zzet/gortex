@@ -401,7 +401,7 @@ func TestConfiguredPrefixCheckReusesResolutionUntilConfigChanges(t *testing.T) {
 	f.cm.Global().Repos = []config.RepoEntry{{Path: first, Name: "src"}, {Path: second, Name: "src"}}
 	require.NoError(t, f.cm.Global().Save())
 	calls := 0
-	f.mi.canonicalRoot = func(root string) string { calls++; return pathkey.CanonicalPath(root) }
+	f.mi.prefixStats.stat = func(root string) (os.FileInfo, error) { calls++; return os.Stat(root) }
 	check := f.mi.configuredPrefixCheck()
 	require.NoError(t, check("src", second))
 	firstCalls := calls

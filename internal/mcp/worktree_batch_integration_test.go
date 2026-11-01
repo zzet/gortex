@@ -159,6 +159,16 @@ func TestWorktreeBatchFacadeGuardedTwoFileEdit(t *testing.T) {
 			payload := lifecycleResultPayload(t, written)
 			require.Equal(t, "committed", payload["status"])
 			require.Equal(t, "committed", payload["disk_status"])
+			state, retained := f.srv.batchTransactions.Load("guarded-two-file")
+			require.True(t, retained)
+			ack := f.srv.batchAcknowledgement(state.(*batchTransactionState))
+			require.Equal(t, "observed", ack.State)
+			require.NotNil(t, ack.Snapshot)
+			require.EqualValues(t, 3, ack.Snapshot.DiskWrite.Completed, "two physical files and one forward directory-sync envelope")
+			require.Equal(t, "not_applicable", ack.Snapshot.ParseGate.State)
+			if root == f.worktree {
+				require.EqualValues(t, 1, ack.Snapshot.TicketAdmission.Completed, "one actual checkout batch admission, not one per file")
+			}
 			if root == f.worktree {
 				require.Equal(t, f.checkoutID, payload["checkout_id"])
 				require.Equal(t, f.worktree, payload["checkout_root"])

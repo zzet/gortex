@@ -125,6 +125,8 @@ func (s *Server) collectSurprisingEdges(
 			totalEdges += c
 		}
 	} else {
+		// Fallback for readers without per-kind counts. The anomaly walk below
+		// needs the full edge stream anyway, so this read is shared with it.
 		allEdges = reader.AllEdges()
 		for _, e := range allEdges {
 			kindCounts[e.Kind]++
@@ -140,6 +142,7 @@ func (s *Server) collectSurprisingEdges(
 	// thousands of indexed subqueries are noticeably slower than the
 	// single AllEdges materialisation the anomaly walk already pays.
 	if allEdges == nil {
+		// The per-kind counts spared the tally its scan, not this walk.
 		allEdges = reader.AllEdges()
 	}
 	inDegree := make(map[string]int, len(scopedSet))
