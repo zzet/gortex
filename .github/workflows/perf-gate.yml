@@ -93,22 +93,34 @@ jobs:
           --source . --revision "${{ github.sha }}"
           --out "${{ runner.temp }}/perf-candidate-tests"
       - name: Run five standalone steps and same-job microbenchmark comparison
-        run: >-
-          "${{ runner.temp }}/perf-check-budgets" smoke
-          --candidate-binary "${{ runner.temp }}/perf-candidate"
-          --load-binary "${{ runner.temp }}/perf-load"
-          --main-bundle "${{ runner.temp }}/perf-main"
-          --candidate-builds "${{ runner.temp }}/perf-candidate-tests"
-          --fixture "${{ runner.temp }}/perf-fixture"
-          --offer 20s
-          --out "${{ runner.temp }}/perf-smoke-evidence"
+        # Resolve the tool caches prepared by this job before private daemons
+        # isolate HOME. Graph stores remain fresh and owned by their build.
+        run: |
+          env GOCACHE="$(go env GOCACHE)" GOMODCACHE="$(go env GOMODCACHE)" \
+            "${{ runner.temp }}/perf-check-budgets" smoke \
+            --candidate-binary "${{ runner.temp }}/perf-candidate" \
+            --load-binary "${{ runner.temp }}/perf-load" \
+            --main-bundle "${{ runner.temp }}/perf-main" \
+            --candidate-builds "${{ runner.temp }}/perf-candidate-tests" \
+            --fixture "${{ runner.temp }}/perf-fixture" \
+            --offer 20s \
+            --out "${{ runner.temp }}/perf-smoke-evidence"
       - name: Preserve attempted smoke reports and failures
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pr-performance-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/perf-smoke-evidence/
+            ${{ runner.temp }}/perf-smoke-evidence/*.json
+            ${{ runner.temp }}/perf-smoke-evidence/workload/*.json
+            ${{ runner.temp }}/perf-smoke-evidence/workload/*.txt
+            ${{ runner.temp }}/perf-smoke-evidence/workload/*.log
+            ${{ runner.temp }}/perf-smoke-evidence/workload/runs/sequence.json
+            ${{ runner.temp }}/perf-smoke-evidence/workload/runs/*/report.json
+            ${{ runner.temp }}/perf-smoke-evidence/workload/runs/*/logs/
+            ${{ runner.temp }}/perf-smoke-evidence/microbench/*.json
+            ${{ runner.temp }}/perf-smoke-evidence/microbench/*.txt
+            ${{ runner.temp }}/perf-smoke-evidence/microbench/*/*.txt
             ${{ runner.temp }}/perf-fixture/fixture.json
             ${{ runner.temp }}/perf-fixture/fixture-setup.log
             ${{ runner.temp }}/perf-candidate-tests/test-build.json

@@ -376,9 +376,22 @@ func (p *privateRun) stop(ctx context.Context) (elapsed time.Duration, forced bo
 }
 
 func (p *privateRun) removeState() error {
+	if p.Root == "" || !filepath.IsAbs(p.Root) || filepath.Dir(p.Root) == p.Root {
+		return errors.New("refused cleanup without an owned run directory")
+	}
+	info, err := os.Lstat(p.Root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("refused cleanup through a replaced run directory")
+	}
 	var result error
 	for _, name := range []string{"repos", "cache", "data", "home", "config", "runtime", "tmp", "store.db", "store.db-wal", "store.db-shm"} {
-		result = errors.Join(result, os.RemoveAll(filepath.Join(p.Root, name)))
+		result = errors.Join(result, removeOwnedState(filepath.Join(p.Root, name)))
 	}
 	return result
 }
