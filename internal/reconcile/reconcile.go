@@ -392,6 +392,7 @@ func (r *Reconciler) reconcileKnown(
 			req.LastError = ""
 			entry.Action = ActionReadyConfirmed
 			if existing.State != store_sqlite.CheckoutStateReady {
+				req.State = store_sqlite.CheckoutStateReconciling
 				entry.Action = ActionAvailabilityRecovered
 			}
 		} else {
@@ -511,8 +512,10 @@ func (r *Reconciler) applyPresent(
 
 	switch {
 	case existing.RemovalDetectedAt != 0:
+		req.State = store_sqlite.CheckoutStateReconciling
 		return ActionRemovalCancelled
 	case existing.State != store_sqlite.CheckoutStateReady:
+		req.State = store_sqlite.CheckoutStateReconciling
 		return ActionAvailabilityRecovered
 	}
 	return ActionReadyConfirmed

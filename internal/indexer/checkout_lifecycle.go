@@ -2203,9 +2203,19 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 	if l == nil || l.store == nil || l.catalog == nil {
 		return
 	}
-	for _, entry := range report.Checkouts {
+	for i, entry := range report.Checkouts {
 		if entry.CheckoutID == "" || !entry.Durable {
 			continue
+		}
+		if entry.State == store_sqlite.CheckoutStateReconciling && (entry.Action == reconcile.ActionAvailabilityRecovered || entry.Action == reconcile.ActionRemovalCancelled) {
+			if err := l.recoverCheckout(ctx, entry.CheckoutID); err != nil {
+				l.logger.Warn("checkout recovery failed", zap.String("checkout", entry.CheckoutID), zap.Error(err))
+				report.Checkouts[i].State = store_sqlite.CheckoutStateUnavailable
+				report.Checkouts[i].RetryAt = l.clock().Add(30 * time.Second).Unix()
+				continue
+			}
+			entry.State = store_sqlite.CheckoutStateReady
+			report.Checkouts[i].State = entry.State
 		}
 		if report.PrimaryGraphID == "" || entry.State != store_sqlite.CheckoutStateReady {
 			l.dropCoordinator(entry.CheckoutID)
@@ -2227,6 +2237,47 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 		}
 	}
 	l.markInitialInventory(report)
+}
+
+// recoverCheckout makes an outage recovery fresh before serving it again.
+// The retained metadata supplies the offline mtime snapshot and the existing
+// repository mutation lane still owns all indexing and publication.
+func (l *CheckoutLifecycle) recoverCheckout(ctx context.Context, checkoutID string) error {
+	checkout, found, err := l.catalog.GetCheckout(ctx, checkoutID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return store_sqlite.ErrCatalogNotFound
+	}
+	if err := l.rec.ResetRecoveredLayers(ctx, checkoutID, checkout.Incarnation); err != nil {
+		return err
+	}
+	prefix := l.prefixForCheckout(ctx, checkoutID)
+	if prefix != "" && checkout.EffectiveMode == store_sqlite.CheckoutModeDedicated {
+		meta, idx := l.mi.GetMetadata(prefix), l.mi.GetIndexer(prefix)
+		_, err = l.mi.ReconcileRepoCtx(ctx, config.RepoEntry{Path: checkout.RootPath, Name: prefix}, l.mi.FileMtimes(prefix))
+		// ReconcileRepoCtx restores a missing registration; an already registered
+		// identity is deliberately a no-op there. Its stable mutation owner performs
+		// the actual full-tree catch-up for this retained live registration.
+		if err == nil && meta != nil && idx != nil {
+			coordinator, current := l.mi.repositoryMutationCoordinatorForSnapshot(prefix, meta, idx)
+			if !current {
+				err = store_sqlite.ErrCatalogStaleGuard
+			} else {
+				_, err = coordinator.reconcile(ctx, nil)
+			}
+		}
+		if err != nil {
+			stateErr := l.catalog.UpdateCheckoutRecoveryState(ctx, checkoutID, checkout.Incarnation, store_sqlite.CheckoutStateReconciling, store_sqlite.CheckoutStateUnavailable, err.Error(), l.clock().Unix())
+			return errors.Join(err, stateErr)
+		}
+		l.attachWatcherContext(ctx, prefix)
+	}
+	if err := l.catalog.UpdateCheckoutRecoveryState(ctx, checkoutID, checkout.Incarnation, store_sqlite.CheckoutStateReconciling, store_sqlite.CheckoutStateReady, "", l.clock().Unix()); err != nil {
+		return err
+	}
+	return nil
 }
 
 // coordinatorAdmitted decides whether one ready, automatic, primary-backed
@@ -2251,7 +2302,7 @@ func (l *CheckoutLifecycle) coordinatorAdmitted(
 	inventoried := l.initialInventoryTaken[checkout.FamilyID]
 	l.admitMu.Unlock()
 	return inventoried &&
-		action == reconcile.ActionIdentityAllocated &&
+		(action == reconcile.ActionIdentityAllocated || action == reconcile.ActionAvailabilityRecovered || action == reconcile.ActionRemovalCancelled) &&
 		!l.cfgLazyWorktrees
 }
 
@@ -4797,6 +4848,9 @@ func (l *CheckoutLifecycle) prefixForCheckout(ctx context.Context, checkoutID st
 				return g.RepoPrefix
 			}
 		}
+	}
+	if checkout.EffectiveMode == store_sqlite.CheckoutModeDedicated {
+		return l.registeredPrefixForRoot(checkout.RootPath)
 	}
 	return ""
 }
