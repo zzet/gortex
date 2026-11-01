@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"encoding/json"
 	"flag"
 	"os"
 	"path/filepath"
@@ -23,6 +24,8 @@ var updateSearchGolden = flag.Bool("update-search-golden", false, "rewrite the s
 // searchGoldenCursor matches a page cursor, which names a sequence minted at
 // random on every call.
 var searchGoldenCursor = regexp.MustCompile(`"next_cursor":"[A-Za-z0-9_-]+"`)
+
+var searchGoldenAbsolutePath = regexp.MustCompile(`("absolute_file_path"\s*:\s*)("(?:\\.|[^"\\])*")`)
 
 // searchGoldenFixture is a small module whose names share prefixes, so exact,
 // prefix and concept queries rank different candidate sets, and whose bodies
@@ -147,9 +150,7 @@ func TestSearchOutputsMatchGoldens(t *testing.T) {
 			res := callTool(t, srv, tc.tool, tc.args)
 			require.NotEmpty(t, res.Content)
 			got := res.Content[0].(mcplib.TextContent).Text
-			for _, root := range roots {
-				got = strings.ReplaceAll(got, root, "$ROOT")
-			}
+			got = normalizeSearchGoldenRoots(got, roots)
 			got = searchGoldenCursor.ReplaceAllLiteralString(got, `"next_cursor":"$CURSOR"`)
 			golden := filepath.Join("testdata", "search_golden", tc.name+".txt")
 			if *updateSearchGolden {
@@ -160,6 +161,97 @@ func TestSearchOutputsMatchGoldens(t *testing.T) {
 			want, err := os.ReadFile(golden)
 			require.NoError(t, err)
 			require.Equal(t, string(want), got)
+		})
+	}
+}
+
+func normalizeSearchGoldenRoots(got string, roots []string) string {
+	// Rewrite only the path string token, retaining field order, whitespace,
+	// exact numeric spelling and every unrelated source string byte.
+	if json.Valid([]byte(got)) {
+		return searchGoldenAbsolutePath.ReplaceAllStringFunc(got, func(match string) string {
+			parts := searchGoldenAbsolutePath.FindStringSubmatch(match)
+			var path string
+			if json.Unmarshal([]byte(parts[2]), &path) != nil {
+				return match
+			}
+			normalized := normalizeSearchGoldenPath(path, roots)
+			if normalized == path {
+				return match
+			}
+			encoded, err := json.Marshal(normalized)
+			if err != nil {
+				return match
+			}
+			return parts[1] + string(encoded)
+		})
+	}
+	if strings.HasPrefix(got, "GCX1 ") {
+		lines := strings.Split(got, "\n")
+		column := -1
+		for _, word := range strings.Fields(lines[0]) {
+			if fields, ok := strings.CutPrefix(word, "fields="); ok {
+				for i, name := range strings.Split(fields, ",") {
+					if name == "path_abs" {
+						column = i
+					}
+				}
+			}
+		}
+		if column >= 0 {
+			for i, line := range lines[1:] {
+				if strings.HasPrefix(line, "#") {
+					continue
+				}
+				fields := strings.Split(line, "\t")
+				if column < len(fields) {
+					fields[column] = normalizeSearchGoldenPath(fields[column], roots)
+					lines[i+1] = strings.Join(fields, "\t")
+				}
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+	for _, root := range roots {
+		got = strings.ReplaceAll(got, root, "$ROOT")
+	}
+	return got
+}
+
+func normalizeSearchGoldenPath(path string, roots []string) string {
+	original := path
+	path = strings.ReplaceAll(path, `\`, "/")
+	for _, root := range roots {
+		root = strings.TrimSuffix(strings.ReplaceAll(root, `\`, "/"), "/")
+		if path == root {
+			return "$ROOT"
+		}
+		if strings.HasPrefix(path, root+"/") {
+			return "$ROOT" + strings.TrimPrefix(path, root)
+		}
+	}
+	return original
+}
+
+func TestSearchGoldenRootNormalizationPreservesActualWindowsPaths(t *testing.T) {
+	root := `D:\a\_temp\owned`
+	for _, mode := range []string{"json", "gcx"} {
+		t.Run(mode, func(t *testing.T) {
+			var actual, want string
+			if mode == "json" {
+				value := map[string]any{"absolute_file_path": root + `\server\server.go`, "doc": "literal " + root, "unrelated": root + `-sibling\server.go`}
+				data, err := json.Marshal(value)
+				require.NoError(t, err)
+				actual = string(data)
+				value["absolute_file_path"] = "$ROOT/server/server.go"
+				data, err = json.Marshal(value)
+				require.NoError(t, err)
+				want = string(data)
+			} else {
+				actual = "GCX1 tool=search_symbols fields=id,path_abs,sig\nserver::Handle\t" + root + `\server\server.go` + "\t" + `func literal("D:\code")` + "\n"
+				want = "GCX1 tool=search_symbols fields=id,path_abs,sig\nserver::Handle\t$ROOT/server/server.go\t" + `func literal("D:\code")` + "\n"
+			}
+			require.Equal(t, want, normalizeSearchGoldenRoots(actual, []string{root}))
 		})
 	}
 }
