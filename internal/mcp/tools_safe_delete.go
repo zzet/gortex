@@ -52,10 +52,11 @@ func (s *Server) registerSafeDeleteSymbolTool() {
 // information for the caller to navigate to it and remove it before
 // retrying the delete.
 type safeDeleteReference struct {
-	FromID   string `json:"from_id"`
+	FromID   string `json:"from_id,omitempty"`
 	Kind     string `json:"kind"`
 	FromName string `json:"from_name,omitempty"`
 	FilePath string `json:"file_path,omitempty"`
+	Line     int    `json:"line,omitempty"`
 }
 
 // cascadeClosureEntry describes a symbol that the cascade pass added
@@ -109,6 +110,20 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	// EdgeDefines / EdgeMemberOf are skipped (they don't represent
 	// "someone calls this").
 	refs := collectReferencingEdges(g, id)
+	// A call that an edit added and the graph has not read yet blocks the
+	// delete like a graph reference does: a provisional reference here, a
+	// manual patch in propagate mode. The same snapshot labels the answer.
+	gaps := s.laggingMutationReceipts(ctx)
+	provisional := s.provisionalSites(g, gaps, node)
+	for _, site := range provisional {
+		refs = append(refs, safeDeleteReference{Kind: "provisional", FilePath: site.File, Line: site.Line})
+	}
+	respond := func(result map[string]any) (*mcp.CallToolResult, error) {
+		label := s.labelRelations(ctx, gaps, []string{id}, nil)
+		label.apply(result)
+		res, err := s.respondJSONOrTOON(ctx, req, result)
+		return label.decorate(res), err
+	}
 
 	// SRN-7: propagate-delete — patch the surviving call sites instead of
 	// refusing. Builds a per-caller plan, applies the removable standalone
@@ -116,9 +131,18 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	var appliedPatches, failedPatches []callerPatch
 	if req.GetBool("propagate", false) && len(refs) > 0 {
 		plan := s.buildPropagationPlan(ctx, g, node)
+		for _, site := range provisional {
+			reason := "provisional: named in a file whose edit the graph has not read yet — patch by hand"
+			if site.Line == 0 {
+				reason = "provisional: the graph has not read the latest edit to the symbol's own file — retry once it publishes"
+			}
+			plan = append(plan, callerPatch{
+				File: site.File, Line: site.Line, CurrentText: site.Text, Action: "manual", Reason: reason,
+			})
+		}
 		manual := countManual(plan)
 		if dryRun {
-			return s.respondJSONOrTOON(ctx, req, map[string]any{
+			return respond(map[string]any{
 				"status":          "propagation_plan",
 				"symbol":          id,
 				"file":            node.FilePath,
@@ -131,7 +155,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 			})
 		}
 		if manual > 0 && !force {
-			return s.respondJSONOrTOON(ctx, req, map[string]any{
+			return respond(map[string]any{
 				"status":         "propagation_blocked_manual",
 				"symbol":         id,
 				"caller_patches": plan,
@@ -145,7 +169,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		}
 		appliedPatches, failedPatches = applied, failed
 		if len(failed) > 0 && !force {
-			return s.respondJSONOrTOON(ctx, req, map[string]any{
+			return respond(map[string]any{
 				"status":          "propagation_partial",
 				"symbol":          id,
 				"patches_applied": applied,
@@ -158,7 +182,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		force = true
 		node = g.GetNode(id)
 		if node == nil {
-			return s.respondJSONOrTOON(ctx, req, map[string]any{
+			return respond(map[string]any{
 				"status":          "deleted_by_propagation",
 				"symbol":          id,
 				"patches_applied": appliedPatches,
@@ -171,7 +195,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	}
 
 	if len(refs) > 0 && !force {
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
+		return respond(map[string]any{
 			"status":             "rejected_has_references",
 			"symbol":             id,
 			"file":               node.FilePath,
@@ -194,6 +218,40 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	)
 	if cascadeMode != cascadeModeOff {
 		closure, cascadeTruncated = computeCascadeClosure(g, node, cascadeIntoTests)
+	}
+	if cascadeMode == cascadeModeApply {
+		// The closure is orphaned by the graph's edges only. A call that an
+		// unpublished edit added keeps a member alive, and force does not
+		// cover the members, so the cascade waits for that edit.
+		var blocked []safeDeleteReference
+		var members []string
+		for _, entry := range closure {
+			member := g.GetNode(entry.ID)
+			if member == nil {
+				continue
+			}
+			sites := s.provisionalSites(g, gaps, member)
+			if len(sites) > 0 {
+				members = append(members, entry.ID)
+			}
+			for _, site := range sites {
+				blocked = append(blocked, safeDeleteReference{Kind: "provisional", FilePath: site.File, Line: site.Line})
+			}
+		}
+		if len(blocked) > 0 {
+			return respond(map[string]any{
+				"status":          "rejected_has_references",
+				"symbol":          id,
+				"file":            node.FilePath,
+				"references":      blocked,
+				"reference_count": len(blocked),
+				"dry_run":         dryRun,
+				"force":           force,
+				"cascade_mode":    cascadeMode,
+				"cascade_closure": closure,
+				"hint":            "cascade member(s) " + strings.Join(members, ", ") + " are named in files whose edits the graph has not read yet; retry once those publish, or delete without cascade",
+			})
+		}
 	}
 
 	absPath, err := s.resolveNodePath(ctx, node)
@@ -242,7 +300,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 
 	if dryRun {
 		result["status"] = "preview"
-		return s.respondJSONOrTOON(ctx, req, result)
+		return respond(result)
 	}
 
 	// Commit phase. cascadeModeApply expands the work to every entry
@@ -282,7 +340,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		result["status"] = "partial_failure"
 		result["cascade_deleted"] = deletedIDs
 		result["error"] = err.Error()
-		return s.respondJSONOrTOON(ctx, req, result)
+		return respond(result)
 	}
 
 	// Persist session state and re-index every touched file.
@@ -310,7 +368,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	if len(failedPatches) > 0 {
 		result["patches_failed"] = failedPatches
 	}
-	return s.respondJSONOrTOON(ctx, req, result)
+	return respond(result)
 }
 
 // normaliseCascadeMode coerces the cascade parameter to a known
