@@ -188,7 +188,9 @@ func TestReclaimReadmissionCatchesProducerTailWithinRemainingCredit(t *testing.T
 				defer stop()
 				_, err := writer.passive(original, operation, db, 25*time.Millisecond, false)
 				if kind == "slow_tail" {
-					require.ErrorIs(t, err, context.DeadlineExceeded)
+					require.NoError(t, operation.Err(), "only the owned credit expired")
+					require.ErrorIs(t, err, errWALReclaimReadersInFlight)
+					require.NotErrorIs(t, err, context.DeadlineExceeded)
 					require.Equal(t, 2, copies)
 					require.True(t, writer.readmitted)
 					require.False(t, writer.held)
