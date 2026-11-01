@@ -1,7 +1,9 @@
 package indexer
 
 import (
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -165,4 +167,56 @@ func TestRepoPatchBindingAReferenceRetiresTheOtherRepo(t *testing.T) {
 
 	_, _, _, hit, _ = reach.LookupCached(g, "lib/lib.go::Hello")
 	require.False(t, hit, "a reference bound from app into lib left the records of lib current")
+}
+
+// Patches of independent repositories run their resolver and derived tails
+// concurrently. Exercise their shared state together with impact lookups.
+func TestConcurrentRepoPatchTails(t *testing.T) {
+	for _, coupled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("coupled=%v", coupled), func(t *testing.T) {
+			mi, g, roots := repoTopologyFixture(t)
+			awaitRepoCoupling(t, g)
+			var wg sync.WaitGroup
+			patch := func(prefix, file string, body func(i int) string) {
+				defer wg.Done()
+				for i := range 12 {
+					writeFile(t, file, body(i))
+					if _, err := mi.IncrementalReindexRepo(prefix, []string{file}); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+			}
+			wg.Add(3)
+			go patch("lib", filepath.Join(roots["lib"], "lib.go"), func(i int) string {
+				var b strings.Builder
+				b.WriteString("package library\nfunc Hello() {}\nfunc Local() { Hello() }\n")
+				for j := range i % 4 {
+					fmt.Fprintf(&b, "func Extra%d() { Local() }\n", j)
+				}
+				return b.String()
+			})
+			go patch("app", filepath.Join(roots["app"], "main.go"), func(i int) string {
+				if coupled && i%2 == 1 {
+					return fmt.Sprintf("package app\nimport library \"example.org/library\"\nfunc Run() {}\nfunc Start() { Run(); library.Hello() }\nfunc V%d() {}\n", i)
+				}
+				return fmt.Sprintf("package app\nfunc Run() {}\nfunc Start() { Run() }\nfunc V%d() { Start() }\n", i)
+			})
+			go func() {
+				defer wg.Done()
+				for range 60 {
+					reach.LookupContext(t.Context(), g, "lib/lib.go::Hello")
+					reach.LookupContext(t.Context(), g, "app/main.go::Run")
+				}
+			}()
+			wg.Wait()
+			d1, _, _, hit, truncated := reach.LookupContext(t.Context(), g, "lib/lib.go::Local")
+			if !hit || truncated {
+				t.Fatalf("final lookup hit=%v truncated=%v", hit, truncated)
+			}
+			if got := reachIDs(d1); len(got) != 3 {
+				t.Fatalf("callers of Local after the last patch = %v, want Extra0..Extra2", got)
+			}
+		})
+	}
 }
