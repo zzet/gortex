@@ -186,6 +186,18 @@ func TestPendingProjectionPublishRetire(t *testing.T) {
 	require.Equal(t, map[string]int64{"superseded": 1, "path_case": 1}, health["refused"])
 }
 
+func TestDiskStampCapturesFileIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.go")
+	require.NoError(t, os.WriteFile(path, []byte("package p\n"), 0o644))
+	stamp, err := statDiskStamp(path)
+	require.NoError(t, err)
+	require.NotNil(t, stamp.info)
+	// No identity comparison before removal: Windows Lstat can defer loading
+	// the file ID until SameFile, when this path no longer identifies the file.
+	require.NoError(t, os.Remove(path))
+	require.True(t, os.SameFile(stamp.info, stamp.info), "a stamp must retain identity without reopening its path")
+}
+
 func TestPendingProjectionLookupChecksDisk(t *testing.T) {
 	f := newProjectionFixture(t)
 	path := filepath.Join(f.dir, "a.go")

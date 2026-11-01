@@ -125,6 +125,12 @@ func statDiskStamp(path string) (diskStamp, error) {
 	if err != nil {
 		return diskStamp{}, err
 	}
+	// Windows Lstat loads file identity lazily through SameFile. Resolve it
+	// now, while the path still identifies this file, rather than comparing
+	// two identities loaded from a later replacement during lookup.
+	if !os.SameFile(info, info) {
+		return diskStamp{}, &os.PathError{Op: "fileidentity", Path: path, Err: fs.ErrInvalid}
+	}
 	return diskStamp{info: info}, nil
 }
 
