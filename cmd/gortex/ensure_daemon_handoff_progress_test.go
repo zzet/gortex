@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,4 +87,58 @@ func writeHandoffStateFixture(t *testing.T, phase daemon.StartupPhase, updated t
 	body, err = json.Marshal(state)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(path, body, 0o600))
+}
+
+func TestStartupHandoffRejectsUnchangedStaleOwnerToken(t *testing.T) {
+	t.Setenv("GORTEX_DAEMON_STATEFILE", filepath.Join(t.TempDir(), "state.json"))
+	now := time.Now()
+	writeHandoffStateFixture(t, daemon.StartupMigrating, now)
+	body, err := os.ReadFile(daemon.RuntimeStatePath())
+	require.NoError(t, err)
+	var state daemon.RuntimeState
+	require.NoError(t, json.Unmarshal(body, &state))
+	// Model an old incarnation's unchanged, well-formed token at a PID that
+	// currently names a live different incarnation. The real native identity
+	// disagrees, although both reads of this owned record agree with each other.
+	parts := strings.Split(state.ProcessBirthToken, ":")
+	require.Len(t, parts, 5)
+	first := "f"
+	if strings.HasPrefix(parts[2], first) {
+		first = "e"
+	}
+	parts[2] = first + parts[2][1:]
+	state.ProcessBirthToken = strings.Join(parts, ":")
+	recordedToken := state.ProcessBirthToken
+	body, err = json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(daemon.RuntimeStatePath(), body, 0o600))
+	waiter := daemonStartupHeartbeatWaiter()
+	require.True(t, waiter(now), "legacy pre-socket freshness behavior stays unchanged")
+	state.StartupPhase = daemon.StartupServing
+	body, err = json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(daemon.RuntimeStatePath(), body, 0o600))
+	require.Equal(t, recordedToken, state.ProcessBirthToken, "the stale owner token never changes")
+	require.False(t, waiter(now.Add(time.Millisecond)), "file-to-file equality cannot authorize a native-incarnation handoff")
+}
+
+func TestStartupHandoffLegacyPresocketDoesNotGrantServingLease(t *testing.T) {
+	t.Setenv("GORTEX_DAEMON_STATEFILE", filepath.Join(t.TempDir(), "state.json"))
+	now := time.Now()
+	writeHandoffStateFixture(t, daemon.StartupOpeningStore, now)
+	body, err := os.ReadFile(daemon.RuntimeStatePath())
+	require.NoError(t, err)
+	var state daemon.RuntimeState
+	require.NoError(t, json.Unmarshal(body, &state))
+	state.ProcessBirthToken = ""
+	body, err = json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(daemon.RuntimeStatePath(), body, 0o600))
+	waiter := daemonStartupHeartbeatWaiter()
+	require.True(t, waiter(now))
+	state.StartupPhase = daemon.StartupServing
+	body, err = json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(daemon.RuntimeStatePath(), body, 0o600))
+	require.False(t, waiter(now.Add(time.Millisecond)), "a legacy record cannot establish the new incarnation-bound Serving lease")
 }
