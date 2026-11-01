@@ -3771,6 +3771,18 @@ func (s *Server) buildGraphStatsPayloadFromStats(ctx context.Context, stats *gra
 	}
 
 	result["token_savings"] = s.tokenStatsFor(ctx).snapshot()
+	// Watcher totals describe the active instances, independently of the
+	// selected graph view. Unsupported watchers do not invent zero readings.
+	if observer, ok := s.currentWatcher().(interface{ MutationCounters() map[string]uint64 }); ok {
+		if counters := observer.MutationCounters(); counters != nil {
+			observation := make(map[string]any, len(counters)+1)
+			observation["scope"] = "active_watchers"
+			for name, count := range counters {
+				observation[name] = count
+			}
+			result["watcher_mutation_counters"] = observation
+		}
+	}
 	// Process CPU and this Server's logical edit outcomes span all views and
 	// clients. Keep that scope explicit beside the view-derived graph stats.
 	result["process_edit_window"] = s.processEditWindow()
