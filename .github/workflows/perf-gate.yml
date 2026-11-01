@@ -17,6 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  CGO_ENABLED: '1'
   CGO_CFLAGS: -O2 -g -fno-strict-aliasing
   CGO_CXXFLAGS: -O2 -g -fno-strict-aliasing
   GOTOOLCHAIN: local
