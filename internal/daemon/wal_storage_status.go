@@ -12,6 +12,8 @@ func WALReclaimStatusFrom(st store_sqlite.WALReclaimStats) *WALReclaimStatus {
 	out := &WALReclaimStatus{
 		WriterHold:            walHistogramStatus(st.WriterHold),
 		WriterWait:            walHistogramStatus(st.WriterWait),
+		PauseDrain:            walHistogramStatus(st.PauseDrain),
+		PauseTruncate:         walHistogramStatus(st.PauseTruncate),
 		CancelledWriterParked: st.CancelledWriterParked,
 		CancelledWriteIntent:  st.CancelledWriteIntent,
 		CancelledOther:        st.CancelledOther,
@@ -19,6 +21,7 @@ func WALReclaimStatusFrom(st store_sqlite.WALReclaimStats) *WALReclaimStatus {
 
 		ThresholdBytes:   st.ThresholdBytes,
 		Attempts:         st.Attempts,
+		UrgentAttempts:   st.UrgentAttempts,
 		Resets:           st.Resets,
 		OpenGateResets:   st.OpenGateResets,
 		WriterHoldMaxMS:  walDurationMS(st.WriterHoldMax),
@@ -79,3 +82,18 @@ func walHistogramStatus(h store_sqlite.DurationHistogram) WALDurationHistogramSt
 }
 
 func walDurationMS(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+
+// WALCheckpointStatusFrom shares the cheap live counter conversion.
+func WALCheckpointStatusFrom(st store_sqlite.WALPassiveStats) *WALCheckpointStatus {
+	out := &WALCheckpointStatus{
+		Attempts: st.Attempts, Complete: st.Complete, Incomplete: st.Incomplete, ZeroProgress: st.ZeroProgress,
+		DeferredBuildLane: st.DeferredBuildLane, LongestBuildLaneDeferralMS: walDurationMS(st.LongestBuildLaneDeferral),
+		RefusedLease: st.RefusedLease, RefusedInflight: st.RefusedInflight, StoodAsideReclaim: st.StoodAsideReclaim,
+		YieldCancelled: st.YieldCancelled, Failed: st.Failed, FramesBackfilledTotal: st.FramesBackfilledTotal,
+		FramesUnobserved: st.FramesUnobserved, LastOutcome: st.LastOutcome,
+	}
+	if !st.LastOKAt.IsZero() {
+		out.LastOKAt = st.LastOKAt.UTC().Format(time.RFC3339Nano)
+	}
+	return out
+}

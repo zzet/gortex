@@ -1,7 +1,9 @@
 package store_sqlite
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -25,6 +27,47 @@ func TestWALReclaimRealFinalWritersRecordHistograms(t *testing.T) {
 			require.GreaterOrEqual(t, after.Total, before.Total)
 			require.Equal(t, after, s.WALReclaimStats().WriterHold, "the public counter snapshot must expose actual producer holds")
 			require.True(t, walLogIsReset(s.dbPath, s.dbPath+"-wal"), "completion control must really reset its private WAL")
+		})
+	}
+}
+
+func TestWALReclaimUrgentAttemptCountsOnlyAdmittedAttempts(t *testing.T) {
+	for _, cell := range []struct {
+		name      string
+		threshold int64
+		leased    bool
+		want      int64
+	}{
+		{"ordinary", 1 << 30, false, 0},
+		{"urgent", 1, false, 1},
+		{"bulk_lease_refused", 1, true, 0},
+	} {
+		t.Run(cell.name, func(t *testing.T) {
+			s, db := finalBackfillFixture(t)
+			if cell.leased {
+				lease, err := s.acquireGenerationBulkCheckpointLease()
+				require.NoError(t, err)
+				defer s.releaseGenerationBulkCheckpointLease(lease)
+			}
+			res := s.reclaimWALOnce(walReclaimConfig{thresholdBytes: cell.threshold, drainDeadline: time.Second, truncateBudget: walReclaimTruncateBudget, readerWait: time.Second}, db, s.dbPath+"-wal")
+			if cell.leased {
+				require.Equal(t, walReclaimSkipped, res.outcome)
+				require.Zero(t, s.WALReclaimStats().Attempts)
+			} else {
+				require.Equal(t, walReclaimReset, res.outcome, "real owned checkpoint must complete")
+				require.Equal(t, cell.want != 0, res.urgent, "the fixture must exercise the requested urgency")
+				require.EqualValues(t, 1, s.WALReclaimStats().Attempts)
+			}
+			// Observe the public snapshot without requiring a not-yet-added Go
+			// field: the pre-fix code must execute, not just fail to compile.
+			data, err := json.Marshal(s.WALReclaimStats())
+			require.NoError(t, err)
+			var wire struct {
+				Urgent *int64 `json:"UrgentAttempts"`
+			}
+			require.NoError(t, json.Unmarshal(data, &wire))
+			require.NotNil(t, wire.Urgent, "urgent attempts are absent from the actual reclaim snapshot")
+			require.Equal(t, cell.want, *wire.Urgent)
 		})
 	}
 }

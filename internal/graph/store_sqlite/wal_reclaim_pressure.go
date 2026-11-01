@@ -255,6 +255,9 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 		resetCtx, stopYield = s.yieldToWriters(resetCtx)
 		defer stopYield()
 	}
+	if preemptible {
+		res.pauseResetStarted = time.Now()
+	}
 	result, err := s.resetWALForPressure(resetCtx)
 	if preemptible && err != nil && errors.Is(context.Cause(resetCtx), errWALReclaimWriterWaiting) {
 		noteWALReclaimDemand(ctx, context.Cause(resetCtx))
@@ -283,6 +286,7 @@ func (s *Store) reclaimWALPressureResetAfterReaderDrain(ctx context.Context, ckp
 		return demand
 	}
 	started := time.Now()
+	res.pauseResetStarted = time.Time{}
 	pauseCtx, cancel := context.WithDeadline(ctx, started.Add(allowance))
 	defer cancel()
 	yieldCtx, stopYield := s.yieldToWriters(pauseCtx)
@@ -292,8 +296,7 @@ func (s *Store) reclaimWALPressureResetAfterReaderDrain(ctx context.Context, ckp
 	reopen, inFlight, err := s.readGate.quiesce(yieldCtx, started.Add(allowance))
 	if err != nil {
 		if !errors.Is(err, errReadGateBusy) {
-			res.pause += time.Since(started)
-			res.pauseClosed = true
+			res.notePauseInterval(started, time.Now(), time.Time{})
 		}
 		if errors.Is(context.Cause(yieldCtx), errWALReclaimWriterWaiting) {
 			noteWALReclaimDemand(ctx, context.Cause(yieldCtx))
@@ -314,8 +317,7 @@ func (s *Store) reclaimWALPressureResetAfterReaderDrain(ctx context.Context, ckp
 		if !stopped {
 			<-timerJoined
 		}
-		res.pause += (<-released).Sub(started)
-		res.pauseClosed = true
+		res.notePauseInterval(started, <-released, res.pauseResetStarted)
 	}()
 	if err := yieldCtx.Err(); err != nil {
 		if errors.Is(context.Cause(yieldCtx), errWALReclaimWriterWaiting) {

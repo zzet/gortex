@@ -1782,6 +1782,11 @@ func storageStatusFor(g graph.Store) *daemon.StorageStatus {
 		CloseCheckpointEstimateMS: estimate.Milliseconds(),
 		WALReclaim:                walReclaimStatus(reporter.WALReclaimStats()),
 	}
+	if passive, ok := g.(interface {
+		WALPassiveStats() store_sqlite.WALPassiveStats
+	}); ok {
+		out.WALCheckpoint = daemon.WALCheckpointStatusFrom(passive.WALPassiveStats())
+	}
 	if policy, ok := g.(interface{ CloseCheckpointPolicy() string }); ok {
 		out.CloseCheckpointPolicy = policy.CloseCheckpointPolicy()
 	}

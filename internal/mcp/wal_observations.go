@@ -11,6 +11,10 @@ import (
 // walReclaimSnapshotReader is intentionally smaller than daemon storage status:
 // WALReclaimStats copies counters under a short mutex plus atomic loads. It
 // does not stat files, read the wal-index, query SQL or wait for the writer.
+type walPassiveSnapshotReader interface {
+	WALPassiveStats() store_sqlite.WALPassiveStats
+}
+
 type walReclaimSnapshotReader interface {
 	WALReclaimStats() store_sqlite.WALReclaimStats
 }
@@ -76,5 +80,9 @@ func (s *Server) indexHealthReclaimStorage() map[string]any {
 	if value := reflect.ValueOf(reader); value.Kind() == reflect.Pointer && value.IsNil() {
 		return nil
 	}
-	return map[string]any{"scope": "physical_store_since_open", "wal_reclaim": daemon.WALReclaimStatusFrom(reader.WALReclaimStats())}
+	out := map[string]any{"scope": "physical_store_since_open", "wal_reclaim": daemon.WALReclaimStatusFrom(reader.WALReclaimStats())}
+	if passive, ok := s.graph.(walPassiveSnapshotReader); ok {
+		out["wal_checkpoint"] = daemon.WALCheckpointStatusFrom(passive.WALPassiveStats())
+	}
+	return out
 }
