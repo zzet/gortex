@@ -387,8 +387,11 @@ may run:
 The policy never applies to the primary checkout, nor to a request that waits
 for fresh contract results (`contracts`, `api_impact`, `analyze kind=routes`,
 or any call that requires the contracts capability): such a request starts its
-worktree's analysis at once under every policy, for as long as its caller
-waits. An ordinary read in a worktree
+worktree's analysis at once under every policy. The exemption lasts until the
+request's deadline, capped at 60 s; completion or cancellation does not shorten
+it. Other jobs for that worktree can start during that remaining budget. A
+strict request joining a held job reacquires the worktree's inputs before the
+job starts. An ordinary read in a worktree
 whose analysis is waiting does not block: it answers from the worktree's last
 published contract analysis, with `contract_analysis.state` `building` and
 reason `contract_analysis_pending`, or reports that there is no attachment yet.
@@ -414,7 +417,8 @@ logs the policy in effect at startup (`contract analysis linked policy`).
 `gortex daemon status` counts what the policy did in
 `views_contract_linked_jobs_total{policy,event}`: `deferred` (a linked job held
 back, once per hold), `checkpoint_stopped` (a running fill stopped for returning
-work), `started`, and `strict_started` (a job a waiting request started). The
+work), `started`, and `strict_started` (a job started during a strict request's
+remaining budget). The
 `contract analysis job started` and `contract analysis job` log lines carry the
 job id, `checkout` and `trigger`; linked jobs add `policy` and `strict`. The
 start line also carries `since_gate_ms`, how long before it the policy let the
