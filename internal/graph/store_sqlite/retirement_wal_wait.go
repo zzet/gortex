@@ -95,20 +95,47 @@ func (s *Store) awaitWALUnderCeiling(ctx context.Context, generationID int64, ep
 	if s.buildLaneBusy() || s.walCopy.editing(time.Now()) {
 		waitMax = retirementWALWaitEditingMax
 	}
-	deadline := time.NewTimer(waitMax)
-	defer deadline.Stop()
+	if err := s.waitForWALReclaim(ctx, waitMax, func() bool { return s.retirementLogBytes() < ceiling }); err != nil && ctx.Err() == nil {
+		s.walReclaim.cycle.retirementTimeouts.Add(1)
+	}
+}
+
+// AwaitWarmupWAL is the producer boundary for bounded startup-restage chunks.
+// It holds no writer or reader while the existing reclaim makes progress.
+// Unlike retirement's best-effort wait, refusal stops the next warmup chunk.
+// A reset allocation below half the ceiling remains reusable; a logical reset
+// alone cannot admit a physical file that has consumed that chunk headroom.
+// This early pressure boundary is not an arbitrary-transaction byte quota.
+func (s *Store) AwaitWarmupWAL(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	threshold, ceiling := s.walReclaimBounds()
+	mark := retirementWALMark(threshold, ceiling)
+	if mark <= 0 || s.dbPath == "" {
+		return nil
+	}
+	return s.waitForWALReclaim(ctx, retirementWALWaitMax, func() bool {
+		return s.retirementLogBytes() < mark && walFileSize(s.dbPath+"-wal") <= ceiling/2
+	})
+}
+
+func (s *Store) waitForWALReclaim(ctx context.Context, maxWait time.Duration, ready func() bool) error {
+	if ready() {
+		return nil
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, maxWait)
+	defer cancel()
+	s.RequestWALReclaim()
 	poll := time.NewTicker(retirementWALWaitPoll)
 	defer poll.Stop()
 	for {
 		select {
-		case <-ctx.Done():
-			return
-		case <-deadline.C:
-			s.walReclaim.cycle.retirementTimeouts.Add(1)
-			return
+		case <-waitCtx.Done():
+			return waitCtx.Err()
 		case <-poll.C:
-			if s.retirementLogBytes() < ceiling {
-				return
+			if ready() {
+				return nil
 			}
 			s.RequestWALReclaim()
 		}

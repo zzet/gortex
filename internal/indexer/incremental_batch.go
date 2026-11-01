@@ -230,6 +230,12 @@ func (idx *Indexer) reindexIncrementalStalePass(
 	var plan DerivedInvalidationPlan
 	var reparsed, failed, versionChanged []string
 	for start := 0; start < len(files); {
+		if idx.warmupWriteBoundary != nil {
+			if err := idx.warmupWriteBoundary(); err != nil {
+				idx.contractRestatementErr = err
+				return plan, reparsed, append(failed, files[start:]...), versionChanged
+			}
+		}
 		end := min(start+incrementalBatchFiles, len(files))
 		consumed, chunkPlan, chunkReparsed, chunkFailed, chunkVersionChanged := idx.reindexIncrementalChunk(
 			files[start:end], markerBatch, acceptPreparedSnapshot,

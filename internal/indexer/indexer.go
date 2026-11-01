@@ -201,6 +201,9 @@ type Indexer struct {
 	// construction. Reading graph before repository-lane admission would race
 	// a cold index temporarily replacing it with an in-memory shadow.
 	primaryWatcherWriteIntent func() func()
+	// warmupWriteBoundary belongs only to a not-yet-published restored indexer.
+	// ReconcileRepoCtx clears it before publication; edits never inherit waits.
+	warmupWriteBoundary func() error
 	// Contract followups use accepted selected-view evidence exclusively. These
 	// fields are installed only on the private analysis Indexer, never the core
 	// publisher; a missing source callback is an incomplete analysis input.
