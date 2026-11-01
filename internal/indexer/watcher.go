@@ -65,6 +65,8 @@ type MutationTicket struct {
 	// events have none. The watcher binds it before waking work; the existing
 	// consumer of Done records completion, never a second channel reader.
 	PublicationRecord *PublicationPhaseRecord `json:"-"`
+	tierMu            sync.RWMutex
+	tiers             MutationTierState
 }
 
 // mutationWaiter owns only outstanding ticket state. Publication metadata is
