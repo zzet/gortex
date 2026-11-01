@@ -193,3 +193,58 @@ func TestEditLoopNightlySingleEditorRetainsItsOfferedSchedule(t *testing.T) {
 		t.Fatalf("nightly's 100 edits at the original 15-second single-editor cadence got an invented smoke deadline: %v", err)
 	}
 }
+
+func TestEditLoopCompactQualificationNeverWaivesMissingProof(t *testing.T) {
+	for _, variant := range []string{"complete", "missing_supported_tool", "one_correct_edit", "decode_failure", "missing_refusal", "missing_fallback", "untested_unsupported"} {
+		t.Run(variant, func(t *testing.T) {
+			r := editLoopEvidenceFixture(t)
+			var raw map[string]any
+			if err := json.Unmarshal(r.Phases[0].EditProbe, &raw); err != nil {
+				t.Fatal(err)
+			}
+			mode := raw["output_modes"].(map[string]any)["compact"].(map[string]any)
+			mode["claims_fresh_observable"], mode["claims_fresh"] = false, 0
+			mode["stale_claimed_fresh"] = map[string]any{"value": nil, "unit": "answers", "reason": "compact freshness metadata unobservable"}
+			tools := mode["tools"].(map[string]any)
+			for name, value := range tools {
+				tool := value.(map[string]any)
+				if name == "read.source" || name == "read.editing_context" || name == "search.text" {
+					tool["state"], tool["reason"], tool["refused_edits"], tool["fallback_answers"], tool["observed_edits"] = "UNSUPPORTED", "harness compact-format refusal; actual JSON fallback retained", 20, 20, 0
+				} else {
+					tool["correct_edits"] = 20
+				}
+			}
+			switch variant {
+			case "missing_supported_tool":
+				delete(tools, "read.summary")
+			case "one_correct_edit":
+				tools["read.summary"].(map[string]any)["correct_edits"] = 1
+			case "decode_failure":
+				tools["read.summary"].(map[string]any)["decode_failures"] = 1
+			case "missing_refusal":
+				delete(tools["read.source"].(map[string]any), "refused_edits")
+			case "missing_fallback":
+				delete(tools["read.source"].(map[string]any), "fallback_answers")
+			case "untested_unsupported":
+				tools["read.source"].(map[string]any)["refused_edits"] = 0
+			}
+			data, err := json.Marshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Phases[0].EditProbe = data
+			d := dataset{config: inputs{Repeats: 3}}
+			for repeat := 1; repeat <= 3; repeat++ {
+				d.runs = append(d.runs, observation{input: runInput{Role: "candidate", HostClass: "reference_linux", Scenario: "loadedit-4", Repeat: repeat}, data: r})
+			}
+			row := assessEditLoopRow(budget{Metric: "silent_stale_compact", Scenario: "loadedit-4", HostClass: "reference_linux", Target: pointer(0), Compare: "eq", Unit: "count"}, d)
+			if variant == "complete" {
+				if row.State != "UNOBSERVABLE" || row.Value != nil || row.Reason == "" {
+					t.Errorf("qualified compact needs explicit nonnumeric reason: %+v", row)
+				}
+			} else if row.State == "PASS" || row.State == "UNOBSERVABLE" || row.Value != nil {
+				t.Errorf("missing compact proof qualified: %+v", row)
+			}
+		})
+	}
+}

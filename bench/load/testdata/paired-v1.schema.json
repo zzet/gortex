@@ -1849,17 +1849,48 @@
                                     "claims_fresh": {
                                       "type": "integer"
                                     },
+                                    "correct_edits": {
+                                      "type": "integer"
+                                    },
                                     "decode_failures": {
                                       "type": "integer"
+                                    },
+                                    "fallback_answers": {
+                                      "anyOf": [
+                                        {
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
                                     },
                                     "observed_edits": {
                                       "type": "integer"
                                     },
                                     "probe_answers": {
                                       "type": "integer"
+                                    },
+                                    "reason": {
+                                      "type": "string"
+                                    },
+                                    "refused_edits": {
+                                      "anyOf": [
+                                        {
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "state": {
+                                      "type": "string"
                                     }
                                   },
                                   "required": [
+                                    "state",
+                                    "correct_edits",
                                     "probe_answers",
                                     "observed_edits",
                                     "decode_failures",

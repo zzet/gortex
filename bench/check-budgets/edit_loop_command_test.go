@@ -54,6 +54,17 @@ func TestEditLoopCommandRetainsActualRowsAndSeededBreaches(t *testing.T) {
 				}
 				compact := raw["output_modes"].(map[string]any)["compact"].(map[string]any)
 				compact["claims_fresh_observable"], compact["claims_fresh"] = false, 0
+				compact["stale_claimed_fresh"] = map[string]any{"value": nil, "unit": "answers", "reason": "compact freshness metadata unobservable"}
+				tools := compact["tools"].(map[string]any)
+				for name, value := range tools {
+					tool := value.(map[string]any)
+					if name == "read.source" || name == "read.editing_context" || name == "search.text" {
+						tool["state"], tool["reason"], tool["refused_edits"], tool["fallback_answers"], tool["observed_edits"] = "UNSUPPORTED", "harness compact-format refusal; actual JSON fallback retained", 20, 20, 0
+					} else {
+						tool["correct_edits"] = 20
+					}
+				}
+
 				if variant == "ack_wait" || variant == "repeat_disagreement" && repeat == 3 {
 					for _, value := range raw["edits"].([]any) {
 						value.(map[string]any)["t_ack_ms"] = map[string]any{"value": 3000, "unit": "ms", "reason": ""}
@@ -73,8 +84,8 @@ func TestEditLoopCommandRetainsActualRowsAndSeededBreaches(t *testing.T) {
 			}
 			write("inputs.json", config)
 			var out, diagnostics bytes.Buffer
-			if exit := run([]string{"edit-loop", "--budgets", "../budgets.yaml", "--scenario", "loadedit-4", "--inputs", filepath.Join(dir, "inputs.json"), "--out", filepath.Join(dir, "result.json")}, &out, &diagnostics); exit != 1 {
-				t.Fatalf("unobservable compact cell must stay explicit/nonpassing, exit%d: %s", exit, diagnostics.String())
+			if exit := run([]string{"edit-loop", "--budgets", "../budgets.yaml", "--scenario", "loadedit-4", "--inputs", filepath.Join(dir, "inputs.json"), "--out", filepath.Join(dir, "result.json")}, &out, &diagnostics); exit != map[bool]int{true: 0, false: 1}[variant == "complete"] {
+				t.Fatalf("qualified compact cell must stay nonnumeric while blocking breaches fail, exit%d: %s", exit, diagnostics.String())
 			}
 			data, err := os.ReadFile(filepath.Join(dir, "result.json"))
 			if err != nil {
@@ -90,7 +101,7 @@ func TestEditLoopCommandRetainsActualRowsAndSeededBreaches(t *testing.T) {
 			for _, row := range result.Rows {
 				rows[row.Metric] = row
 			}
-			if rows["silent_stale_compact"].State != "UNAVAILABLE" || rows["silent_stale_compact"].Value != nil {
+			if rows["silent_stale_compact"].State != "UNOBSERVABLE" || rows["silent_stale_compact"].Value != nil {
 				t.Error("unobservable compact freshness became numeric pass")
 			}
 			if row := rows["wal_p95_mib"]; row.State != "PASS" || row.Value == nil || *row.Value != 32 || row.Baseline == nil || *row.Baseline != 1059 || row.Delta == nil || *row.Delta != -1027 {

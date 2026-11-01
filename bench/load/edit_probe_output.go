@@ -26,10 +26,15 @@ var editProbeOutputModes = []string{"json", "toon", "compact", "cli", "gcx"}
 type editProbeModes map[string]editProbeModeCoverage
 
 type editProbeToolCoverage struct {
-	ProbeAnswers   int `json:"probe_answers"`
-	ObservedEdits  int `json:"observed_edits"`
-	DecodeFailures int `json:"decode_failures"`
-	ClaimsFresh    int `json:"claims_fresh"`
+	State           string `json:"state"`
+	Reason          string `json:"reason,omitempty"`
+	CorrectEdits    int    `json:"correct_edits"`
+	RefusedEdits    *int   `json:"refused_edits,omitempty"`
+	FallbackAnswers *int   `json:"fallback_answers,omitempty"`
+	ProbeAnswers    int    `json:"probe_answers"`
+	ObservedEdits   int    `json:"observed_edits"`
+	DecodeFailures  int    `json:"decode_failures"`
+	ClaimsFresh     int    `json:"claims_fresh"`
 }
 
 type editProbeModeCoverage struct {
@@ -57,8 +62,9 @@ type editProbeGateCounts struct {
 }
 
 type editProbeGateToolCounts struct {
-	answers, decodeFailures, claimsFresh int
-	edits                                map[int]bool
+	answers, decodeFailures, claimsFresh, fallbackAnswers int
+	correct, refused                                      map[int]bool
+	edits                                                 map[int]bool
 }
 
 // Answers count by each oracle request's actual output mode. A mode without
@@ -83,10 +89,26 @@ func editProbeOutputCoverage(selected string, counts map[string]editProbeModeCou
 		if selected == "gate" {
 			observed := 0
 			coverage.Tools = map[string]editProbeToolCoverage{}
+			for _, tool := range []string{"read.source", "read.summary", "read.editing_context", "search.symbols", "search.text", "relations.callers", "trace.call_chain"} {
+				row := editProbeToolCoverage{State: "MISSING"}
+				if mode == "compact" && !editProbeCompactOperations[tool] {
+					zero := 0
+					row.State, row.Reason, row.RefusedEdits, row.FallbackAnswers = "UNSUPPORTED", "harness compact-format refusal: operation has no compact producer; actual JSON fallback must be witnessed", &zero, &zero
+				}
+				coverage.Tools[tool] = row
+			}
 			if gate != nil {
 				observed = len(gate.edits)
 				for tool, count := range gate.tools {
-					coverage.Tools[tool] = editProbeToolCoverage{ProbeAnswers: count.answers, ObservedEdits: len(count.edits), DecodeFailures: count.decodeFailures, ClaimsFresh: count.claimsFresh}
+					row := coverage.Tools[tool]
+					row.ProbeAnswers, row.ObservedEdits, row.DecodeFailures, row.ClaimsFresh, row.CorrectEdits = count.answers, len(count.edits), count.decodeFailures, count.claimsFresh, len(count.correct)
+					if row.State == "UNSUPPORTED" {
+						refused, fallback := len(count.refused), count.fallbackAnswers
+						row.RefusedEdits, row.FallbackAnswers = &refused, &fallback
+					} else if row.ObservedEdits > 0 {
+						row.State = "OBSERVED"
+					}
+					coverage.Tools[tool] = row
 				}
 			}
 			coverage.ObservedEdits = &observed
@@ -160,40 +182,58 @@ func (r *editProbeRuntime) countMode(mode string, answered, decoded, fresh, stal
 // Gate witnesses belong to the record's assigned surface. A real JSON
 // fallback remains counted as JSON traffic, but cannot lend edit coverage or
 // freshness claims to either another record's JSON cell or its compact cell.
-func (r *editProbeRuntime) countGateMode(step editProbeStep, mode, tool string, answered, decoded, fresh, stale, precommit bool) {
-	if !r.plan.GateModes || mode != step.ProbeMode || !answered {
+func (r *editProbeRuntime) countGateMode(step editProbeStep, mode, tool string, answered, decoded, fresh, stale, precommit, correct, postACK bool) {
+	if !r.plan.GateModes || !answered {
+		return
+	}
+	fallback := step.ProbeMode == "compact" && mode == "json" && !editProbeCompactOperations[tool]
+	if mode != step.ProbeMode && !fallback {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	count := r.modeCounts[mode]
+	count := r.modeCounts[step.ProbeMode]
 	if count.gate == nil {
 		count.gate = &editProbeGateCounts{edits: map[int]bool{}, tools: map[string]*editProbeGateToolCounts{}}
 	}
 	gate := count.gate
-	gate.answers++
 	if gate.tools[tool] == nil {
-		gate.tools[tool] = &editProbeGateToolCounts{edits: map[int]bool{}}
+		gate.tools[tool] = &editProbeGateToolCounts{edits: map[int]bool{}, correct: map[int]bool{}, refused: map[int]bool{}}
 	}
 	toolCount := gate.tools[tool]
-	toolCount.answers++
-	if decoded {
-		gate.edits[step.Ordinal], toolCount.edits[step.Ordinal] = true, true
+	if fallback {
+		toolCount.fallbackAnswers++
+		if decoded && postACK {
+			toolCount.refused[step.Ordinal] = true
+		}
+		if !decoded {
+			toolCount.decodeFailures++
+			gate.decodeFailures++
+		}
 	} else {
-		gate.decodeFailures++
-		toolCount.decodeFailures++
+		gate.answers++
+		toolCount.answers++
+		if decoded && postACK {
+			gate.edits[step.Ordinal], toolCount.edits[step.Ordinal] = true, true
+			if correct {
+				toolCount.correct[step.Ordinal] = true
+			}
+		} else if !decoded {
+			gate.decodeFailures++
+			toolCount.decodeFailures++
+		}
+		if fresh && postACK {
+			toolCount.claimsFresh++
+			gate.claimsFresh++
+		}
+		if stale {
+			gate.stale++
+		}
+		if precommit {
+			gate.precommit++
+		}
 	}
-	if fresh {
-		toolCount.claimsFresh++
-		gate.claimsFresh++
-	}
-	if stale {
-		gate.stale++
-	}
-	if precommit {
-		gate.precommit++
-	}
-	r.modeCounts[mode] = count
+	r.modeCounts[step.ProbeMode] = count
 }
 
 func editProbeRequestOutput(req request) string {

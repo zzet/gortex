@@ -262,6 +262,9 @@ func TestEditGateModeCoverageCountsDistinctAssignedEditsAndActualTools(t *testin
 		defer state.finishRaw()
 	}
 	now := time.Now()
+	for _, state := range run.states {
+		state.started, state.acknowledged = now.Add(-2*time.Millisecond), now.Add(-time.Millisecond)
+	}
 	identity := wireCallIdentity{WriteStarted: now, Finished: now.Add(time.Microsecond)}
 	summary := editProbeOracle{name: "summary", call: request{Tool: "read", Operation: "summary"}}
 	for range 2 {
@@ -302,5 +305,80 @@ func TestEditGateModeCoverageCountsDistinctAssignedEditsAndActualTools(t *testin
 	}
 	if _, exists := coverage["facade"]; !exists {
 		t.Errorf("facade mode omitted entirely: %s", data)
+	}
+}
+
+func TestEditGateCompactCoverageRequiresPostACKSemanticAndRefusalProof(t *testing.T) {
+	for _, variant := range []string{"pre_ack", "wrong_content", "correct_content", "decode_failure", "unsupported_fallback"} {
+		t.Run(variant, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			c := editProbeCorpus()
+			plan, err := makeEditProbePlan(c, 42, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.GateModes = true
+			plan.Steps[0].ProbeMode = "compact"
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, c.File), []byte("package fixture\n"+c.EditAnchor+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			run := newEditProbeStubRun(t, ctx, c, plan, dir, 1, func(stubFrame) (any, *rpcError) { return stubContent(map[string]any{}), nil })
+			state := run.states[0]
+			defer state.finishRaw()
+			now := time.Now()
+			state.started, state.acknowledged = now.Add(-3*time.Millisecond), now.Add(-time.Millisecond)
+			sent := now
+			if variant == "pre_ack" {
+				sent = now.Add(-2 * time.Millisecond)
+			}
+			oracle := editProbeOracle{name: "summary", call: editProbeWithOutput(request{Tool: "read", Operation: "summary"}, "compact")}
+			row := "function " + state.step.Marker + " fixture/" + c.File + ":5\n"
+			raw := outputWire(row, nil)
+			if variant == "wrong_content" {
+				raw = outputWire("function Wrong fixture/"+c.File+":5\n", nil)
+			}
+			if variant == "decode_failure" {
+				raw = outputWire(`{"fresh":true}`, nil)
+			}
+			if variant == "unsupported_fallback" {
+				oracle = editProbeOracle{name: "source", call: request{Tool: "read", Operation: "source"}}
+				raw = outputWire(`{}`, nil)
+			}
+			if err := run.observeProbe(state, oracle, sent, raw, wireCallIdentity{WriteStarted: sent, Finished: sent.Add(time.Microsecond)}, nil, false); err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(editProbeOutputCoverage("gate", run.modeCounts))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var modes map[string]struct {
+				Tools map[string]struct {
+					Correct  *int   `json:"correct_edits"`
+					Refused  *int   `json:"refused_edits"`
+					Fallback *int   `json:"fallback_answers"`
+					State    string `json:"state"`
+				} `json:"tools"`
+			}
+			if err := json.Unmarshal(data, &modes); err != nil {
+				t.Fatal(err)
+			}
+			if variant == "unsupported_fallback" {
+				tool := modes["compact"].Tools["read.source"]
+				if tool.State != "UNSUPPORTED" || tool.Refused == nil || *tool.Refused != 1 || tool.Fallback == nil || *tool.Fallback != 1 {
+					t.Errorf("actual unsupported fallback/refusal was lost: %s", data)
+				}
+				return
+			}
+			tool := modes["compact"].Tools["read.summary"]
+			want := 0
+			if variant == "correct_content" {
+				want = 1
+			}
+			if tool.Correct == nil || *tool.Correct != want {
+				t.Errorf("compact semantic witness borrowed pre-ACK, wrong or undecoded content: %s", data)
+			}
+		})
 	}
 }

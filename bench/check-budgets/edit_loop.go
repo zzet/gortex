@@ -55,10 +55,15 @@ type editLoopWire struct {
 	} `json:"edits"`
 	Modes map[string]struct {
 		Tools map[string]struct {
-			ObservedEdits  *int `json:"observed_edits"`
-			Answers        int  `json:"probe_answers"`
-			DecodeFailures int  `json:"decode_failures"`
-			ClaimsFresh    *int `json:"claims_fresh"`
+			State           string `json:"state"`
+			Reason          string `json:"reason"`
+			CorrectEdits    *int   `json:"correct_edits"`
+			RefusedEdits    *int   `json:"refused_edits"`
+			FallbackAnswers *int   `json:"fallback_answers"`
+			ObservedEdits   *int   `json:"observed_edits"`
+			Answers         int    `json:"probe_answers"`
+			DecodeFailures  int    `json:"decode_failures"`
+			ClaimsFresh     *int   `json:"claims_fresh"`
 		} `json:"tools"`
 		ObservedEdits  *int   `json:"observed_edits"`
 		ClaimsFresh    *int   `json:"claims_fresh"`
@@ -113,7 +118,7 @@ func editLoopCommand(args []string, stdout, stderr io.Writer) int {
 		} else {
 			row = assessEditLoopRow(b, dataset)
 		}
-		if row.State != "PASS" {
+		if editLoopRowBlocks(row) {
 			pass = false
 		}
 		rows = append(rows, row)
@@ -235,6 +240,9 @@ func decodeEditLoopWire(phase phase) (editLoopWire, error) {
 
 func assessEditLoopRow(b budget, dataset dataset) editLoopRow {
 	row := editLoopRow{Metric: b.Metric, Scenario: b.Scenario, State: "UNAVAILABLE", Budget: b.Target, Unit: b.Unit, Baseline: editLoopBaseline(b, dataset)}
+	if b.Metric == "silent_stale_compact" {
+		return assessCompactEditLoopRow(row, b, dataset)
+	}
 	values := make([]float64, 0, dataset.config.repeats(b.Scenario))
 	verdict := -1
 	for repeat := 1; repeat <= dataset.config.repeats(b.Scenario); repeat++ {
@@ -318,6 +326,67 @@ func editLoopBaseline(b budget, d dataset) *float64 {
 		return nil
 	}
 	return &value
+}
+
+// Only the explicitly accepted compact metadata contract is qualified. Every
+// supported compact tool still proves decoded post-ACK content for every
+// assigned edit; unsupported operations prove the harness's format refusal
+// and actual JSON fallback without receiving any compact-format credit.
+func assessCompactEditLoopRow(row editLoopRow, b budget, d dataset) editLoopRow {
+	if d.config.repeats(b.Scenario) < 3 {
+		row.Reason = "at least three actual repeats required"
+		return row
+	}
+	for repeat := 1; repeat <= d.config.repeats(b.Scenario); repeat++ {
+		found := false
+		for _, observation := range d.runs {
+			if observation.input.Role != "candidate" || observation.input.HostClass != b.HostClass || observation.input.Scenario != b.Scenario || observation.input.Repeat != repeat {
+				continue
+			}
+			found = true
+			wire, err := decodeEditLoopWire(observation.data.Phases[0])
+			if err != nil {
+				row.Reason = err.Error()
+				return row
+			}
+			expected := 0
+			for _, record := range wire.Edits {
+				if record.Mode == "compact" {
+					expected++
+				}
+			}
+			mode, exists := wire.Modes["compact"]
+			if !exists || expected == 0 || mode.ObservedEdits == nil || *mode.ObservedEdits != expected || mode.Answers < expected || mode.DecodeFailures != 0 || mode.Observable || mode.ClaimsFresh == nil || *mode.ClaimsFresh != 0 || mode.Stale.Value != nil || mode.Stale.Reason == "" {
+				row.Reason = "compact actual assigned-edit/decoder proof missing or contradicts known unobservable contract"
+				return row
+			}
+			for _, name := range []string{"read.summary", "search.symbols", "relations.callers", "trace.call_chain"} {
+				tool, exists := mode.Tools[name]
+				if !exists || tool.ObservedEdits == nil || *tool.ObservedEdits != expected || tool.CorrectEdits == nil || *tool.CorrectEdits != expected || tool.Answers < expected || tool.DecodeFailures != 0 {
+					row.Reason = "compact supported tool lacks post-ACK semantic witness: " + name
+					return row
+				}
+			}
+			for _, name := range []string{"read.source", "read.editing_context", "search.text"} {
+				tool, exists := mode.Tools[name]
+				if !exists || tool.State != "UNSUPPORTED" || tool.Reason == "" || tool.RefusedEdits == nil || *tool.RefusedEdits != expected || tool.FallbackAnswers == nil || *tool.FallbackAnswers < expected || tool.ObservedEdits == nil || *tool.ObservedEdits != 0 || tool.DecodeFailures != 0 {
+					row.Reason = "compact unsupported operation lacks explicit format refusal and actual fallback proof: " + name
+					return row
+				}
+			}
+		}
+		if !found {
+			row.Reason = "missing candidate repeat"
+			return row
+		}
+	}
+	row.State = "UNOBSERVABLE"
+	row.Reason = "compact freshness metadata is unobservable under the accepted contract; actual supported content/tool and unsupported-refusal proofs passed; no numeric silent-stale claim"
+	return row
+}
+
+func editLoopRowBlocks(row editLoopRow) bool {
+	return row.State != "PASS" && !(row.Metric == "silent_stale_compact" && row.State == "UNOBSERVABLE" && row.Value == nil)
 }
 
 func editLoopCompare(value, target float64, compare string) bool {

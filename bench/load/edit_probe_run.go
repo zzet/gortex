@@ -639,6 +639,7 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 	fresh := decodeErr == nil && editProbeClaimsFresh(body)
 	stale, precommit := false, false
 	s.mu.Lock()
+	postACK := !s.acknowledged.IsZero() && !sent.Before(s.acknowledged)
 	if expectedAbsence {
 		s.record.ExpectedRefusals++
 	} else if err != nil {
@@ -666,7 +667,7 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 	}
 	s.mu.Unlock()
 	r.countMode(r.probeOutput(oracle, s.step), err == nil || expectedAbsence, err != nil || decodeErr == nil, fresh, stale, precommit)
-	r.countGateMode(s.step, r.probeOutput(oracle, s.step), oracle.call.name(), err == nil || expectedAbsence, decodeErr == nil, fresh, stale, precommit)
+	r.countGateMode(s.step, r.probeOutput(oracle, s.step), oracle.call.name(), err == nil || expectedAbsence, decodeErr == nil, fresh, stale, precommit, correct, postACK)
 	return s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "requested_mode": r.stepProbeMode(s.step), "output_mode": r.probeOutput(oracle, s.step), "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending})
 }
 

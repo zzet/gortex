@@ -62,7 +62,7 @@ func finishEditLoopLaneEvidence(c laneConfig, p policy, plan lanePlan, out strin
 		} else {
 			row = assessEditLoopRow(b, d)
 		}
-		if row.State != "PASS" {
+		if editLoopRowBlocks(row) {
 			pass = false
 		}
 		rows = append(rows, row)
