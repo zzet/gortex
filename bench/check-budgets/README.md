@@ -21,9 +21,12 @@ nonzero. Existing output files are never overwritten. The separate
 Its `smoke` job runs the five-step PR smoke and the same-job microbenchmark
 comparison on `ubuntu-24.04-arm`, but only when the repository variable
 `PERF_PR_SMOKE_ENABLED` is `true`; while it is unset, GitHub shows the job as
-skipped. Owned-host nightly jobs are likewise skipped unless their reviewed
+skipped. The smoke job is report-only: job-level `continue-on-error: true`
+keeps measurement, preparation and artifact failures from failing the PR.
+Owned-host nightly jobs are likewise skipped unless their reviewed
 runner/config variables are enabled. Several smoke rows still have no exact
-observation, so an enabled smoke run fails on them rather than passing them.
+observation, so the strict checker reports a failure for those rows. The
+report-only job preserves that failed evidence without enforcing acceptance.
 Readiness cannot satisfy a required performance acceptance check.
 
 ## Repeated evidence and comparison identity

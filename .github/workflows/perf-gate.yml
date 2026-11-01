@@ -50,8 +50,11 @@ jobs:
           if-no-files-found: error
 
   smoke:
-    name: PR performance measurement (not enabled until reviewed)
+    name: PR performance measurement (report-only)
     if: github.event_name == 'pull_request' && vars.PERF_PR_SMOKE_ENABLED == 'true'
+    # Keep the checker strict and retain failed evidence without failing a PR.
+    # Job scope also covers preparation, retrieval and artifact-upload failures.
+    continue-on-error: true
     runs-on: ubuntu-24.04-arm
     # The driver cancels measurement after 13m and reserves <=2m for cleanup.
     # This outer bound also permits artifact upload after a failed attempt.
