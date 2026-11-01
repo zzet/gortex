@@ -87,8 +87,7 @@ func setupWorktreePair(t *testing.T) (mainRepo, worktree string, srv *Server) {
 
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 	require.True(t, mi.IsMultiRepo())
 
 	eng := query.NewEngine(g)
@@ -420,8 +419,7 @@ func TestEditTools_UnprefixedPathAmbiguousAcrossTwoWorktrees(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
 		ConfigManager: cm,
 		MultiIndexer:  mi,

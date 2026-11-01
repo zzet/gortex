@@ -79,8 +79,7 @@ func newSharedWorkspaceServer(t *testing.T, flagOn bool) sharedWSOptions {
 	reg := testRegistry()
 	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "")
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	eng.SetSearch(bm)
@@ -117,8 +116,7 @@ func newSplitProjectWorkspaceServer(t *testing.T, flagOn bool) sharedWSOptions {
 	reg := testRegistry()
 	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "")
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	eng.SetSearch(bm)
@@ -696,8 +694,7 @@ func newLoneRepoServer(t *testing.T, flagOn bool) (*Server, string) {
 	reg := testRegistry()
 	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "")
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	eng.SetSearch(bm)
@@ -838,8 +835,7 @@ func newTwoRepoServer(t *testing.T) (*Server, string) {
 
 	backend := search.NewSymbolSearcherBackend(store)
 	mi := indexer.NewMultiIndexer(store, testRegistry(), backend, cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "")
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 	requireSymbolFTS(t, store)
 
 	eng := query.NewEngine(store)

@@ -16,6 +16,9 @@ func (s *Store) DBStats() (dbBytes, walBytes int64) {
 	}
 	if fi, err := os.Stat(s.dbPath + "-wal"); err == nil {
 		walBytes = fi.Size()
+		s.noteObservedWALBytes(walBytes)
+	} else if os.IsNotExist(err) {
+		s.noteObservedWALBytes(0)
 	}
 	return dbBytes, walBytes
 }

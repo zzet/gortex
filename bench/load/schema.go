@@ -45,8 +45,13 @@ func schemaFor(t reflect.Type) map[string]any {
 		for i := range t.NumField() {
 			field := t.Field(i)
 			name := strings.Split(field.Tag.Get("json"), ",")[0]
+			if field.PkgPath != "" || name == "-" {
+				continue
+			}
 			properties[name] = schemaFor(field.Type)
-			required = append(required, name)
+			if !strings.Contains(field.Tag.Get("json"), ",omitempty") {
+				required = append(required, name)
+			}
 		}
 		return map[string]any{"type": "object", "properties": properties, "required": required, "additionalProperties": false}
 	case reflect.Map:

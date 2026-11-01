@@ -273,3 +273,45 @@ func TestDispatcher_LoadingRepo_ToolsWorkInPlaceAfterRegistration(t *testing.T) 
 	assert.Empty(t, errorCode(parsed), "the same session must be served after registration: %v", parsed)
 	assert.Contains(t, toolResultText(t, parsed), "LoadProbe", "the session's scope must bind to the repository it is in")
 }
+
+func TestDispatcher_ColdTrackCollisionBecomesTypedPromptly(t *testing.T) {
+	d, mi, registered, loading := loadingDispatcherSetup(t)
+	mi.StartRepoLoad(loading)
+	// Use the real cold-track path and a genuine ownership failure, not a
+	// synthetic FinishRepoLoad error. The existing owner must stay registered.
+	_, err := mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: loading, Name: filepath.Base(registered)})
+	var collision *indexer.PrefixCollisionError
+	require.ErrorAs(t, err, &collision)
+	failed := time.Now()
+	mi.FinishRepoLoad(loading, err)
+	sess := &daemon.Session{ID: "cold_failure", CWD: loading}
+	data := errorData(t, dispatchJSON(t, d, sess,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_symbols","arguments":{"query":"LoadProbe"}}}`))
+	assert.Equal(t, "prefix_collision", data["error_code"])
+	assert.Equal(t, false, data["retryable"])
+	assert.Equal(t, registered, data["owner_path"])
+	assert.Equal(t, filepath.Base(registered), data["prefix"])
+	assert.Equal(t, "present", data["owner_state"])
+	assert.Less(t, time.Since(failed), time.Second, "a completed cold-track failure must not remain repo_loading")
+	assert.NotNil(t, mi.GetMetadata(filepath.Base(registered)), "failure must not displace the prefix owner")
+}
+
+func TestDispatcher_ColdTrackFailureBecomesUnavailablePromptly(t *testing.T) {
+	d, mi, registered, loading := loadingDispatcherSetup(t)
+	mi.StartRepoLoad(loading)
+	// A real missing-root failure remains unavailable; it must not acquire
+	// collision semantics merely because another repository is registered.
+	require.NoError(t, os.RemoveAll(loading))
+	_, err := mi.TrackRepoCtx(context.Background(), config.RepoEntry{Path: loading})
+	require.Error(t, err)
+	failed := time.Now()
+	mi.FinishRepoLoad(loading, err)
+	sess := &daemon.Session{ID: "cold_failure", CWD: loading}
+	data := errorData(t, dispatchJSON(t, d, sess,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_symbols","arguments":{"query":"LoadProbe"}}}`))
+	assert.Equal(t, "repo_unavailable", data["error_code"])
+	assert.Equal(t, false, data["retryable"])
+	assert.Contains(t, data["reason"], "path does not exist")
+	assert.Less(t, time.Since(failed), time.Second)
+	assert.NotNil(t, mi.GetMetadata(filepath.Base(registered)))
+}
