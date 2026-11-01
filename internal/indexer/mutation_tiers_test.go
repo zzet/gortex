@@ -108,7 +108,9 @@ func TestExplicitTierRepairIsBoundToFailedGeneration(t *testing.T) {
 			}
 			if scenario == "newer_pending" {
 				ticket := newMutationTierTicket(path, 8, nil)
-				watcher.mutationWaiters[path] = map[uint64]mutationWaiter{8: {ticket: ticket}}
+				watcher.mutationWaiters = map[string]map[uint64]mutationWaiter{
+					path: {8: {ticket: ticket}},
+				}
 			}
 			if repair != nil {
 				repair()
