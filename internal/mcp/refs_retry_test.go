@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/lspuri"
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/semantic/lsp"
 )
@@ -32,6 +33,11 @@ func newReferenceRetryStack(t *testing.T, first string, beforeIncoming func()) (
 	path := filepath.Join(stack.repoRoot, "retry.rs")
 	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	// A Windows drive must be in the URI path, never its authority.
+	uri := lspuri.PathToURI(path)
+	if got := lspuri.URIToAbsPath(uri); got != path {
+		t.Fatalf("fixture URI %q resolves to %q, want %q", uri, got, path)
 	}
 	target := viewRepoNode("repo/retry.rs::target", "target", graph.KindFunction, "repo/retry.rs", 1)
 	caller := viewRepoNode("repo/retry.rs::caller", "caller", graph.KindFunction, "repo/retry.rs", 2)
@@ -99,7 +105,7 @@ func newReferenceRetryStack(t *testing.T, first string, beforeIncoming func()) (
 					rpcError = map[string]any{"code": -32603, "message": "workspace loading"}
 				}
 				if first != "zero" && (attempt > 1 || first == "positive" || first == "incoming-error") {
-					result = []lsp.CallHierarchyItem{{Name: "target", Kind: 12, URI: "file://" + path, Range: lsp.Range{Start: lsp.Position{Line: 0}, End: lsp.Position{Line: 0, Character: 14}}, SelectionRange: lsp.Range{Start: lsp.Position{Line: 0, Character: 3}, End: lsp.Position{Line: 0, Character: 9}}}}
+					result = []lsp.CallHierarchyItem{{Name: "target", Kind: 12, URI: uri, Range: lsp.Range{Start: lsp.Position{Line: 0}, End: lsp.Position{Line: 0, Character: 14}}, SelectionRange: lsp.Range{Start: lsp.Position{Line: 0, Character: 3}, End: lsp.Position{Line: 0, Character: 9}}}}
 				} else {
 					result = []any{}
 				}
@@ -110,7 +116,7 @@ func newReferenceRetryStack(t *testing.T, first string, beforeIncoming func()) (
 				if beforeIncoming != nil {
 					beforeIncoming()
 				}
-				result = []lsp.CallHierarchyIncomingCall{{From: lsp.CallHierarchyItem{Name: "caller", Kind: 12, URI: "file://" + path, Range: lsp.Range{Start: lsp.Position{Line: 1}, End: lsp.Position{Line: 1, Character: 25}}, SelectionRange: lsp.Range{Start: lsp.Position{Line: 1, Character: 3}, End: lsp.Position{Line: 1, Character: 9}}}, FromRanges: []lsp.Range{{Start: lsp.Position{Line: 1, Character: 14}, End: lsp.Position{Line: 1, Character: 20}}}}}
+				result = []lsp.CallHierarchyIncomingCall{{From: lsp.CallHierarchyItem{Name: "caller", Kind: 12, URI: uri, Range: lsp.Range{Start: lsp.Position{Line: 1}, End: lsp.Position{Line: 1, Character: 25}}, SelectionRange: lsp.Range{Start: lsp.Position{Line: 1, Character: 3}, End: lsp.Position{Line: 1, Character: 9}}}, FromRanges: []lsp.Range{{Start: lsp.Position{Line: 1, Character: 14}, End: lsp.Position{Line: 1, Character: 20}}}}}
 			}
 			reply := map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result}
 			if rpcError != nil {
