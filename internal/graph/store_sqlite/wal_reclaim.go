@@ -433,6 +433,8 @@ type walReclaimResetReaders struct {
 }
 
 type walReclaimResult struct {
+	// Compile-tagged closed-gate fault only, never a bulk/hard-cap exception.
+	closedGateSeed                             bool
 	deferredEditBurst, deferredInteractiveRead bool
 	attempt                                    *backgroundCheckpointAttempt // bounded cause witness, never a global registry
 	outcome                                    walReclaimOutcome
@@ -1005,9 +1007,10 @@ func (s *Store) walLaneHoldCap() time.Duration {
 }
 
 func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult) error {
+	res.closedGateSeed = editGateClosedSeedPolicy(cfg)
 	// A mutation already waiting for the writer wins outright, including
 	// urgent attempts, except the explicit bulk/hard-cap completion classes.
-	if demand := s.writeDemandCause(); !res.burstException() && demand != nil {
+	if demand := s.writeDemandCause(); !res.closedGateSeed && !res.burstException() && demand != nil {
 		noteWALReclaimDemand(ctx, demand)
 		res.deferredEditBurst = true
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
@@ -1062,7 +1065,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	}
 	held := time.Now()
 	writer := newWALReclaimWriterCredit(s, held)
-	writer.yieldToWriters = !res.burstException()
+	writer.yieldToWriters = !res.closedGateSeed && !res.burstException()
 	writer.result = res
 	defer func() {
 		writer.release()
@@ -1266,6 +1269,7 @@ func (s *Store) yieldToWriters(parent context.Context) (context.Context, func())
 
 func (s *Store) yieldWALReclaim(parent context.Context, res *walReclaimResult) (context.Context, func()) {
 	exception := res != nil && res.burstException()
+	seed := res != nil && res.closedGateSeed
 	limit, bounded := parent.Deadline()
 	longHold := bounded && time.Until(limit) > walReclaimResetHold
 	ctx, cancel := context.WithCancelCause(parent)
@@ -1280,11 +1284,11 @@ func (s *Store) yieldWALReclaim(parent context.Context, res *walReclaimResult) (
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if demand := s.writeDemandCause(); !exception && demand != nil {
+				if demand := s.writeDemandCause(); !seed && !exception && demand != nil {
 					cancel(demand)
 					return
 				}
-				if res != nil {
+				if res != nil && !seed {
 					if s.walReclaim.interactive.active.Load() > 0 {
 						cancel(errWALReclaimInteractiveRead)
 						return
@@ -1838,7 +1842,7 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 
 func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult, first, yieldsToLane bool, budget time.Duration) (done bool, err error) {
 	res.resetReaders = nil
-	if demand := s.writeDemandCause(); !res.burstException() && demand != nil {
+	if demand := s.writeDemandCause(); !res.closedGateSeed && !res.burstException() && demand != nil {
 		noteWALReclaimDemand(ctx, demand)
 		res.deferredEditBurst = true
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
@@ -1859,7 +1863,7 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 	}
 	held := time.Now()
 	writer := newWALReclaimWriterCredit(s, held)
-	writer.yieldToWriters = !res.burstException()
+	writer.yieldToWriters = !res.closedGateSeed && !res.burstException()
 	writer.result = res
 	adaptiveCopy := false
 	defer func() {

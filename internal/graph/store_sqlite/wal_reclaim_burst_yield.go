@@ -44,6 +44,9 @@ func (r *walReclaimResult) burstException() bool {
 // interactive reads remain independent, so removing the former policy never
 // removes the latter, including from hard-cap and bulk-completion attempts.
 func (s *Store) reclaimYieldCause(ctx context.Context, r *walReclaimResult) error {
+	if r.closedGateSeed {
+		return nil
+	}
 	if !r.burstException() {
 		if demand := s.writeDemandCause(); demand != nil {
 			noteWALReclaimDemand(ctx, demand)
@@ -63,6 +66,9 @@ func (s *Store) reclaimYieldCause(ctx context.Context, r *walReclaimResult) erro
 // Long completion and every read-gate closure wait for an edit gap. A short
 // open-gate reset may still proceed during a build when no writer needs it.
 func (s *Store) reclaimCompletionCause(ctx context.Context, r *walReclaimResult) error {
+	if r.closedGateSeed {
+		return nil
+	}
 	if err := s.reclaimYieldCause(ctx, r); err != nil {
 		return err
 	}
