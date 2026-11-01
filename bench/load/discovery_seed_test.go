@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,4 +156,42 @@ func TestDiscoverySeedRefusesRekeyedCatalogBeforeCopy(t *testing.T) {
 	_, err = resumeDiscoveryState(t.Context(), o, corpora)
 	require.ErrorContains(t, err, "catalog identity mapping changed")
 	require.NoFileExists(t, filepath.Join(l.OwnedRoot, "store.db"))
+}
+
+func TestDiscoverySeedVerifiesLiveCatalogAfterResume(t *testing.T) {
+	for _, rekey := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rekey_%t", rekey), func(t *testing.T) {
+			o, corpora, l := syntheticDiscoverySeed(t)
+			var proof discoverySeedProof
+			require.NoError(t, discoveryReadJSON(l.IdentityReceipt, &proof))
+			var raw discoveryCatalogReceipt
+			require.NoError(t, discoveryReadJSON(proof.CatalogReceipt, &raw))
+			require.NoError(t, discoveryWriteJSON(o.Discovery.Resume, l))
+			p, err := resumeDiscoveryState(t.Context(), o, corpora)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = os.RemoveAll(p.SocketDir) })
+			var calls atomic.Int32
+			p.Socket = startStub(t, func(frame stubFrame) (any, *rpcError) {
+				calls.Add(1)
+				if frame.Method != "tools/call" || frame.Params["name"] != "list_checkouts" {
+					return nil, &rpcError{Code: -32601, Message: "unexpected synthetic call"}
+				}
+				overview := raw.After[frame.Connection-1].Overview
+				if rekey && frame.Connection == 1 {
+					overview.Families[0].Checkouts[1].CheckoutID = "unique-live-rekey"
+				}
+				return stubContent(overview), nil
+			})
+			observed, err := p.verifyDiscoveryCatalog(t.Context())
+			require.Equal(t, int32(2), calls.Load(), "both primary family scopes must be observed")
+			if rekey {
+				require.ErrorContains(t, err, "changed observed catalog checkout identity")
+				require.NoFileExists(t, filepath.Join(p.Root, "resumed-catalog-observed.json"))
+			} else {
+				require.NoError(t, err)
+				require.NotEmpty(t, observed)
+				require.FileExists(t, filepath.Join(p.Root, "resumed-catalog-observed.json"))
+			}
+		})
+	}
 }
