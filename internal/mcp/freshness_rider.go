@@ -1,12 +1,16 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
+	wire "github.com/gortexhq/gcx-go"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -498,7 +502,7 @@ func decorateResultWithFreshness(res *mcp.CallToolResult, rider map[string]any) 
 	}
 	var asObj map[string]any
 	if json.Unmarshal([]byte(text), &asObj) != nil {
-		return res
+		return renderFreshnessLine(res, rider)
 	}
 	if _, exists := asObj["freshness"]; exists {
 		return res
@@ -509,6 +513,228 @@ func decorateResultWithFreshness(res *mcp.CallToolResult, rider map[string]any) 
 		return res
 	}
 	return rebuildTextResult(res, string(body))
+}
+
+func renderFreshnessLine(res *mcp.CallToolResult, fields map[string]any) *mcp.CallToolResult {
+	state, _ := fields["graph_freshness"].(string)
+	scope, _ := fields["freshness_scope"].(string)
+	if state == "" {
+		if fields["stale"] != true && fields["missing"] != true && fields["index_frozen"] != true {
+			return res
+		}
+		state, scope = "pending", "file"
+	}
+	if state == "fresh" || state == "" {
+		return res
+	}
+	if scope == "" {
+		scope = "relations"
+	}
+	count := fields["pending_file_count"]
+	if count == nil {
+		count = 1
+	}
+	line := fmt.Sprintf("%s: %s (%v files)", scope, state, count)
+	body, ok := singleTextContent(res)
+	if !ok || strings.HasPrefix(body, line+"\n") {
+		return res
+	}
+	if strings.HasPrefix(body, wire.Tag) {
+		body, _ = injectGCXHeaderMeta(body, fields)
+		head, rows, _ := strings.Cut(body, wire.RowSep)
+		if strings.HasPrefix(rows, wire.CommentPrefix+" "+line+wire.RowSep) {
+			return rebuildTextResult(res, body)
+		}
+		body = head + wire.RowSep + wire.CommentPrefix + " " + line + wire.RowSep + rows
+	} else {
+		body = line + "\n" + body
+	}
+	return rebuildTextResult(res, body)
+}
+
+// freshnessFor is the single tier producer. Canonical paths are read from
+// their watcher; checkout routes retain their own scoped receipt authority.
+func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []string) relationFreshness {
+	label := relationFreshness{}
+	inScope := s.relationScope(ctx, ids, files)
+	states := make(map[string]string)
+	watcher, watched := s.currentWatcher().(interface {
+		TierPaths() map[string]indexer.MutationTierState
+	})
+	view := requestViewFromContext(ctx)
+	if watched && (view == nil || !view.readsOwnCheckout()) {
+		for path, tiers := range watcher.TierPaths() {
+			if len(ids)+len(files) > 0 && !inScope(path) {
+				continue
+			}
+			at := tiers.RelationsAt
+			if scope == "file" {
+				at = tiers.FileGraphAt
+			} else if scope == "derived" {
+				at = tiers.DerivedAt
+			}
+			state := ""
+			if tiers.Failed {
+				state = "failed"
+			} else if at.IsZero() || scope == "derived" && tiers.Partial {
+				state = "pending"
+			}
+			if state != "" {
+				states[s.repoRelative(path)] = state
+			}
+		}
+	} else {
+		for _, receipt := range s.laggingMutationReceipts(ctx) {
+			if !inScope(receipt.path) {
+				continue
+			}
+			state := "failed"
+			if receipt.outcome(true).Pending {
+				state = "pending"
+			}
+			states[s.repoRelative(receipt.path)] = state
+		}
+	}
+	for path, state := range states {
+		label.files = append(label.files, path)
+		if label.state != "failed" {
+			label.state = state
+		}
+	}
+	slices.Sort(label.files)
+	if label.state == "" && scope != "file" && s.multiIndexer != nil && s.multiIndexer.RelationsPending() {
+		label.state = "pending"
+	}
+	return label
+}
+
+func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, files []string) {
+	if file := targetRepoFileRaw(name, req); file != "" {
+		return "file", nil, []string{file}
+	}
+	switch name {
+	case "get_callers", "find_usages", "get_call_chain", "get_dependencies", "get_dependents", "find_implementations", "walk_graph":
+		for _, key := range []string{"id", "symbol_id", "start_id"} {
+			if id := req.GetString(key, ""); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) > 0 {
+			return "relations", ids, nil
+		}
+	}
+	return "", nil, nil
+}
+
+func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp.CallToolRequest, res *mcp.CallToolResult) *mcp.CallToolResult {
+	scope, ids, files := freshnessTargets(name, req)
+	if scope != "" {
+		if selected := takeRequestFreshness(&req).scope; selected != "" {
+			scope = selected
+		}
+		label := s.freshnessFor(ctx, scope, ids, files)
+		if label.state != "" {
+			fields := make(map[string]any)
+			label.apply(fields)
+			fields["freshness_scope"] = scope
+			res = decorateResultWithFreshness(res, fields)
+		}
+	}
+	if rider := s.freshnessRiderFor(name, req); rider != nil {
+		return decorateResultWithFreshness(res, rider)
+	}
+	if isFreshnessListTool(name) {
+		return s.decorateListResultWithFreshness(res)
+	}
+	return res
+}
+
+func (s *Server) awaitWatchedFreshness(ctx context.Context, name string, req mcp.CallToolRequest, freshness requestFreshness) *mcp.CallToolResult {
+	view := requestViewFromContext(ctx)
+	if !freshness.requireFresh || view != nil && view.readsOwnCheckout() {
+		return nil
+	}
+	if _, ok := s.currentWatcher().(interface {
+		TierPaths() map[string]indexer.MutationTierState
+	}); !ok {
+		return nil
+	}
+	scope, ids, files := freshnessTargets(name, req)
+	if scope == "" {
+		return nil
+	}
+	if freshness.scope != "" {
+		scope = freshness.scope
+	}
+	deadline := freshness.effectiveDeadline(time.Now(), ctx)
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		label := s.freshnessFor(ctx, scope, ids, files)
+		if label.state == "" {
+			return nil
+		}
+		if label.state == "failed" || !time.Now().Before(deadline) {
+			return label.requireFreshError()
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return label.requireFreshError()
+		}
+	}
+}
+
+func (f relationFreshness) apply(result map[string]any) {
+	if f.state == "" {
+		return
+	}
+	result["complete"] = false
+	result["graph_freshness"] = f.state
+	result["freshness_scope"] = "relations"
+	result["pending_file_count"] = len(f.files)
+	result["pending_files"] = f.files[:min(maxLabelledPendingFiles, len(f.files))]
+	if f.state == "failed" {
+		result["recovery_hint"] = mutationFreshnessRecoveryHint()
+	}
+}
+
+func (f relationFreshness) decorate(res *mcp.CallToolResult) *mcp.CallToolResult {
+	if f.state == "" || res == nil || res.IsError {
+		return res
+	}
+	body, ok := singleTextContent(res)
+	if !ok || strings.HasPrefix(strings.TrimSpace(body), "{") {
+		return res
+	}
+	fields := make(map[string]any)
+	f.apply(fields)
+	return renderFreshnessLine(res, fields)
+}
+
+func appendSourceFreshness(fields map[string]any, view *requestView) {
+	fields["graph_freshness"] = "unknown"
+	if view.sourceGraphPending {
+		fields["graph_freshness"] = "pending"
+	}
+}
+
+func attachReceiptTiers(payload map[string]any, receipt *mutationReceipt) {
+	if receipt == nil || receipt.ticket == nil {
+		return
+	}
+	tiers := receipt.ticket.TierState()
+	if tiers.AckAt.IsZero() {
+		return
+	}
+	for key, at := range map[string]time.Time{
+		"ack_at": tiers.AckAt, "file_graph_at": tiers.FileGraphAt,
+		"relations_at": tiers.RelationsAt, "derived_at": tiers.DerivedAt,
+	} {
+		if !at.IsZero() {
+			payload[key] = at.UTC().Format(time.RFC3339Nano)
+		}
+	}
 }
 
 // shortFreshSHA trims a git SHA to 12 chars for the rider.

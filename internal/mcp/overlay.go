@@ -276,6 +276,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// Publishing is a no-op when no firewall frame is above us (an
 		// unbounded call).
 		noteRetainedRequest(ctx, view, scope)
+		if refusal := s.awaitWatchedFreshness(ctx, legacyName, req, freshness); refusal != nil {
+			return refusal, nil
+		}
 		if requireExactView && view != nil && view.rider != nil && !view.rider.Exact {
 			return mcp.NewToolResultError(graphview.NewViewError(graphview.CodeViewBuilding,
 				"the requested exact checkout view is unavailable; retry after publication; no fallback was served").Error()), nil
@@ -435,13 +438,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// small `freshness` block so the agent knows the graph view may lag
 		// the working tree. Omitted (zero cost) for the common fresh case.
 		if hErr == nil {
-			if rider := s.freshnessRiderFor(req.Params.Name, req); rider != nil {
-				res = decorateResultWithFreshness(res, rider)
-			} else if isFreshnessListTool(req.Params.Name) {
-				// List tools get a per-file sweep: any hit whose file drifted
-				// or vanished on disk is flagged with per-repo provenance.
-				res = s.decorateListResultWithFreshness(res)
-			}
+			res = s.decorateToolFreshness(ctx, req.Params.Name, req, res)
 			// Which view answered rides in that same block: a response that
 			// came from somewhere other than the base — or fell back to it —
 			// must say so where the caller already looks for provenance.

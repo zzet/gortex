@@ -1177,12 +1177,12 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		// handler actually retrieved, not the riders bolted on afterwards.
 		raw := result
 		afterFreshSymbolAcceptance(ctx, func() { s.recordRetrievalSavings(ctx, spec.Legacy, raw) })
-		result = s.decorateFacadeFreshness(spec.Legacy, forwarded, result)
+		result = s.decorateFacadeFreshness(ctx, spec.Legacy, forwarded, result)
 	}
 	result = decorateFacadeResultIdentity(result, spec)
 	if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
 		state.decorate = func(raw *mcpgo.CallToolResult) *mcpgo.CallToolResult {
-			return decorateFacadeResultIdentity(s.decorateFacadeFreshness(spec.Legacy, forwarded, raw), spec)
+			return decorateFacadeResultIdentity(s.decorateFacadeFreshness(ctx, spec.Legacy, forwarded, raw), spec)
 		}
 	}
 	return result, err
@@ -1483,14 +1483,8 @@ func blockedAnalyzeKindResult(kind string) *mcpgo.CallToolResult {
 // The outer facade middleware only sees compact names/targets (read,
 // relations, target.file, ...), so applying the policy there would miss the
 // legacy path/id fields the rider is deliberately keyed to.
-func (s *Server) decorateFacadeFreshness(legacy string, req mcpgo.CallToolRequest, result *mcpgo.CallToolResult) *mcpgo.CallToolResult {
-	if rider := s.freshnessRiderFor(legacy, req); rider != nil {
-		return decorateResultWithFreshness(result, rider)
-	}
-	if isFreshnessListTool(legacy) {
-		return s.decorateListResultWithFreshness(result)
-	}
-	return result
+func (s *Server) decorateFacadeFreshness(ctx context.Context, legacy string, req mcpgo.CallToolRequest, result *mcpgo.CallToolResult) *mcpgo.CallToolResult {
+	return s.decorateToolFreshness(ctx, legacy, req, result)
 }
 
 func facadeLegacyManagesOwnOverlay(name string) bool {

@@ -19,14 +19,15 @@ import (
 // rather than of any one tool — the middleware reads them for every tool, no
 // handler ever does — so they are named once here.
 const (
-	requireExactArgName = "require_exact"
-	requireFreshArgName = "require_fresh"
-	waitDeadlineArgName = "wait_deadline"
+	requireExactArgName   = "require_exact"
+	requireFreshArgName   = "require_fresh"
+	waitDeadlineArgName   = "wait_deadline"
+	freshnessScopeArgName = "freshness_scope"
 )
 
 // requestFreshnessArgNames is the accepted set, in the order the guide states
 // them.
-var requestFreshnessArgNames = []string{requireExactArgName, requireFreshArgName, waitDeadlineArgName}
+var requestFreshnessArgNames = []string{requireExactArgName, requireFreshArgName, waitDeadlineArgName, freshnessScopeArgName}
 
 // requestFreshnessArgKeys is THE allowlist that makes the three knobs callable
 // on every tool. It is the single place the set is enumerated for dispatch:
@@ -104,6 +105,7 @@ type requestFreshness struct {
 	// requireFresh asks for a bounded wait until the selected checkout route
 	// reflects the working copy as it is now.
 	requireFresh bool
+	scope        string
 	// deadline bounds that wait. It is absolute (RFC3339) so a retry carries
 	// the same ceiling rather than restarting the clock.
 	deadline    time.Time
@@ -172,6 +174,15 @@ func takeRequestFreshness(req *mcp.CallToolRequest) requestFreshness {
 	freshness := requestFreshness{
 		requireExact: requestRequiresExactCheckoutView(req),
 		requireFresh: requestBoolArg(req, requireFreshArgName),
+	}
+	if raw, present := requestRawArg(req, freshnessScopeArgName); present {
+		value, ok := raw.(string)
+		if !ok || value != "file" && value != "relations" && value != "derived" {
+			freshness.err = graphview.NewViewError(graphview.CodeInvalidViewSelector,
+				"freshness_scope must be file, relations, or derived")
+			return freshness
+		}
+		freshness.scope = value
 	}
 	raw, present := requestRawArg(req, waitDeadlineArgName)
 	if !present || raw == nil {

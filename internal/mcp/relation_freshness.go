@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	wire "github.com/gortexhq/gcx-go"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -57,51 +56,29 @@ func relationWaitDeadline(ctx context.Context, freshness requestFreshness) time.
 // the scope are neither waited on nor reported.
 func (s *Server) awaitRelationFreshness(ctx context.Context, ids, files []string, deadline time.Time) relationFreshness {
 	started := time.Now()
-	lagging := s.laggingMutationReceipts(ctx)
-	if len(lagging) == 0 {
-		return relationFreshness{waited: time.Since(started)}
+	label := s.freshnessFor(ctx, "relations", ids, files)
+	if label.state == "" || label.state == "failed" || !deadline.After(started) {
+		label.waited = time.Since(started)
+		return label
 	}
-	inScope := s.relationScope(ctx, ids, files)
-	if remaining := time.Until(deadline); remaining > 0 {
-		timer := time.NewTimer(remaining)
-		defer timer.Stop()
-	wait:
-		for _, receipt := range lagging {
-			if !inScope(receipt.path) {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			label = s.freshnessFor(ctx, "relations", ids, files)
+			if label.state != "" && label.state != "failed" {
 				continue
 			}
-			select {
-			case <-receipt.done:
-			case <-timer.C:
-				break wait
-			case <-ctx.Done():
-				break wait
-			}
+		case <-timer.C:
+			label = s.freshnessFor(ctx, "relations", ids, files)
+		case <-ctx.Done():
 		}
-		lagging = s.laggingMutationReceipts(ctx)
+		label.waited = time.Since(started)
+		return label
 	}
-
-	states := make(map[string]string)
-	for _, receipt := range lagging {
-		if !inScope(receipt.path) {
-			continue
-		}
-		key := s.repoRelative(receipt.path)
-		if receipt.outcome(true).Pending {
-			states[key] = "pending"
-		} else if states[key] == "" {
-			states[key] = "failed"
-		}
-	}
-	label := relationFreshness{waited: time.Since(started)}
-	for path, state := range states {
-		label.files = append(label.files, path)
-		if label.state != "failed" {
-			label.state = state
-		}
-	}
-	sort.Strings(label.files)
-	return label
 }
 
 // laggingMutationReceipts returns the request's mutation receipts whose edit
@@ -198,22 +175,6 @@ func namesAnyIdentifier(data []byte, names []string) bool {
 	return false
 }
 
-// apply writes the label into an answer's fields. A fresh scope writes
-// nothing, so an answer with nothing lagging keeps its shape.
-func (f relationFreshness) apply(result map[string]any) {
-	if f.state == "" {
-		return
-	}
-	result["complete"] = false
-	result["graph_freshness"] = f.state
-	result["freshness_scope"] = "relations"
-	result["pending_file_count"] = len(f.files)
-	result["pending_files"] = f.files[:min(maxLabelledPendingFiles, len(f.files))]
-	if f.state == "failed" {
-		result["recovery_hint"] = mutationFreshnessRecoveryHint()
-	}
-}
-
 // line is the relations line a text answer leads with.
 func (f relationFreshness) line() string {
 	return fmt.Sprintf("relations: %s (%d files)", f.state, len(f.files))
@@ -251,31 +212,4 @@ func (f relationFreshness) merge(other relationFreshness) relationFreshness {
 	}
 	sort.Strings(f.files)
 	return f
-}
-
-// decorate makes a rendered text answer lead with its label: TOON and plain
-// text start with the relations line; GCX keeps GCX1 as line 1, carries the
-// label as header meta and the relations line as a comment on line 2. JSON
-// already carries the label in its fields and passes through unchanged.
-func (f relationFreshness) decorate(res *mcp.CallToolResult) *mcp.CallToolResult {
-	if f.state == "" || res == nil || res.IsError || len(res.Content) == 0 {
-		return res
-	}
-	text, ok := res.Content[0].(mcp.TextContent)
-	if !ok || strings.HasPrefix(strings.TrimSpace(text.Text), "{") {
-		return res
-	}
-	body := text.Text
-	if strings.HasPrefix(body, wire.Tag) {
-		body, _ = injectGCXHeaderMeta(body, map[string]any{
-			"graph_freshness":    f.state,
-			"freshness_scope":    "relations",
-			"pending_file_count": len(f.files),
-		})
-		head, rows, _ := strings.Cut(body, wire.RowSep)
-		body = head + wire.RowSep + wire.CommentPrefix + " " + f.line() + wire.RowSep + rows
-	} else {
-		body = f.line() + "\n" + body
-	}
-	return rebuildTextResult(res, body)
 }
