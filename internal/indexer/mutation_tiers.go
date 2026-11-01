@@ -143,6 +143,11 @@ func (w *Watcher) TierState(path string) MutationTierState {
 	return state
 }
 
+// CaptureTierRepair binds a successful explicit single-file reparse to the
+// failure it observed before starting. The caller invokes it only after proof
+// that this exact file was reparsed successfully.
+func (w *Watcher) CaptureTierRepair(_ string) func() { return nil }
+
 func (mw *MultiWatcher) TierPaths() map[string]MutationTierState {
 	mw.mu.Lock()
 	watchers := make([]*Watcher, 0, len(mw.watchers))

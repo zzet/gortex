@@ -91,6 +91,43 @@ func TestIdentityPatchPublishesTicketTiers(t *testing.T) {
 	require.False(t, tiers.Failed)
 }
 
+func TestExplicitTierRepairIsBoundToFailedGeneration(t *testing.T) {
+	for _, scenario := range []string{"same_failure", "newer_failure", "partial", "newer_pending"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir, _, watcher := inertTestWatcher(t, "main.go", "package main\nfunc Main() {}\n")
+			path := filepath.Join(dir, "main.go")
+			failure := MutationTierState{Generation: 7, Failed: true, failedAt: time.Now()}
+			if scenario == "partial" {
+				failure.Failed, failure.Partial = false, true
+			}
+			watcher.failedPaths = map[string]MutationTierState{path: failure}
+			repair := watcher.CaptureTierRepair(path)
+			if scenario == "newer_failure" {
+				failure.Generation++
+				watcher.failedPaths[path] = failure
+			}
+			if scenario == "newer_pending" {
+				ticket := newMutationTierTicket(path, 8, nil)
+				watcher.mutationWaiters[path] = map[uint64]mutationWaiter{8: {ticket: ticket}}
+			}
+			if repair != nil {
+				repair()
+			}
+			switch scenario {
+			case "same_failure":
+				require.NotContains(t, watcher.TierPaths(), path, "an explicit successful reparse repairs the captured failure")
+			case "newer_failure":
+				require.Equal(t, failure, watcher.TierState(path), "the pass did not observe this later failure")
+			case "partial":
+				require.True(t, watcher.TierState(path).Partial, "a file parse alone cannot certify bounded derived fanout")
+			case "newer_pending":
+				require.Equal(t, uint64(8), watcher.TierState(path).Generation)
+				require.NotContains(t, watcher.failedPaths, path)
+			}
+		})
+	}
+}
+
 func TestStartupRelationsRemainPendingAfterCancelledBatchReset(t *testing.T) {
 	mi := &MultiIndexer{}
 	mi.BeginParallelBatch()
