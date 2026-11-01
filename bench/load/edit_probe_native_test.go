@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,6 +33,10 @@ func editProbeDiskStub(t *testing.T, c Corpus, dir string) func(stubFrame) (any,
 }
 
 func editProbeDiskReplies(c Corpus, dir string, report func(error)) func(stubFrame) (any, *rpcError) {
+	return editProbeDiskRepliesWithReadFile(c, dir, report, os.ReadFile)
+}
+
+func editProbeDiskRepliesWithReadFile(c Corpus, dir string, report func(error), readFile func(string) ([]byte, error)) func(stubFrame) (any, *rpcError) {
 	declared := regexp.MustCompile(`func (GortexEditProbe\w+)\(`)
 	callee := c.Symbol[strings.LastIndex(c.Symbol, "::")+2:]
 	return func(frame stubFrame) (any, *rpcError) {
@@ -60,9 +65,16 @@ func editProbeDiskReplies(c Corpus, dir string, report func(error)) func(stubFra
 		graph, edges := []any{map[string]any{"id": "fixture/" + c.Symbol}}, []any{}
 		paths, _ := filepath.Glob(filepath.Join(dir, "*.go"))
 		for _, path := range paths {
-			data, err := os.ReadFile(path)
+			data, err := readFile(path)
+			// Native delete can remove an enumerated file before this read.
+			// That file is absent in this reply's snapshot. Direct read.file
+			// calls and every other IO error still fail the fixture.
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			if err != nil {
 				report(err)
+				continue
 			}
 			file := filepath.Base(path)
 			for _, match := range declared.FindAllStringSubmatch(string(data), -1) {
@@ -82,7 +94,7 @@ func editProbeDiskReplies(c Corpus, dir string, report func(error)) func(stubFra
 		rows := []any{}
 		switch frame.Params["name"].(string) + "." + args["operation"].(string) {
 		case "read.file":
-			data, err := os.ReadFile(filepath.Join(dir, file))
+			data, err := readFile(filepath.Join(dir, file))
 			if err != nil {
 				report(err)
 			}
