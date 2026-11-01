@@ -5,9 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 func TestRegisterPoisonedProbeKeepsConfig(t *testing.T) {
@@ -44,6 +46,7 @@ func TestInRepoLaneForgetKeepsPrimaryWatcher(t *testing.T) {
 			continue
 		}
 		found = true
+		require.Empty(t, f.lc.prefixForCheckout(context.Background(), checkout.CheckoutID))
 		require.NoError(t, f.lc.Reconciler().ForgetCheckout(context.Background(), checkout.CheckoutID, checkout.Incarnation))
 	}
 	require.True(t, found)
@@ -70,4 +73,41 @@ func TestApplyReloadCanonicalRootNoRedundantRegister(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, result.Added, "an alias of an already tracked root was registered again")
 	require.Zero(t, result.Removed)
+}
+
+func TestPrimaryUnavailableRecovery(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	root := f.gitRepo("recover-primary")
+	tracked, err := f.lc.Register(context.Background(), config.RepoEntry{Path: root, Name: "recover-primary"}, TrackSourceCLI)
+	require.NoError(t, err)
+	held := root + "-away"
+	require.NoError(t, os.Rename(root, held))
+	_, err = f.lc.ReconcileFamily(context.Background(), tracked.FamilyID)
+	require.NoError(t, err)
+	f.clock.advance(lifecycleGrace.AvailabilityGrace + time.Second)
+	_, err = f.lc.ReconcileFamily(context.Background(), tracked.FamilyID)
+	require.NoError(t, err)
+	row, found, err := f.catalog.GetCheckout(context.Background(), tracked.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, store_sqlite.CheckoutStateUnavailable, row.State)
+	require.Contains(t, f.configPaths(), root)
+	require.NoError(t, os.WriteFile(filepath.Join(held, "recover-primary.go"), []byte("package a\n\nfunc EditedWhileAway() {}\n"), 0o600))
+	require.NoError(t, os.Rename(held, root))
+	_, err = f.lc.ReconcileFamily(context.Background(), tracked.FamilyID)
+	require.NoError(t, err)
+	require.True(t, f.watcher.isAttached(tracked.Prefix), "recovery did not reattach the watcher")
+	require.Eventually(t, func() bool {
+		for _, node := range f.store.GetFileNodes(tracked.Prefix + "/recover-primary.go") {
+			if node.Name == "EditedWhileAway" {
+				return true
+			}
+		}
+		return false
+	}, time.Second, 10*time.Millisecond, "offline edit was not indexed on recovery")
+	row, found, err = f.catalog.GetCheckout(context.Background(), tracked.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, store_sqlite.CheckoutStateReady, row.State)
 }
