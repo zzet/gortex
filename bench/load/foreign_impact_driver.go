@@ -5,10 +5,36 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
 )
+
+const foreignImpactRawLimit = int64(1 << 30)
+
+type foreignImpactEvidenceWriter struct {
+	w     io.Writer
+	bytes int64
+	limit int64
+}
+
+func (w *foreignImpactEvidenceWriter) emit(row foreignImpactSample) error {
+	data, err := json.Marshal(row)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if w.limit <= 0 || int64(len(data)) > w.limit-w.bytes {
+		return errors.New("foreign impact raw evidence limit exhausted; execution incomplete")
+	}
+	n, err := w.w.Write(data)
+	w.bytes += int64(n)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	return err
+}
 
 type foreignImpactRunReport struct {
 	EditedRepo     string               `json:"edited_repo"`
@@ -25,6 +51,8 @@ type foreignImpactRunReport struct {
 	ProbeFinished  time.Time            `json:"probe_finished"`
 	Summary        foreignImpactSummary `json:"summary"`
 	RawFile        string               `json:"raw_file"`
+	RawBytes       int64                `json:"raw_bytes"`
+	RawLimit       int64                `json:"raw_limit"`
 	Complete       bool                 `json:"complete"`
 }
 
@@ -71,6 +99,11 @@ func foreignImpactQueryTargets(repos []privateRepo, clients []*socketClient, edi
 // hook after all six roots pass readiness. It creates no process, store, source
 // clone, or new traffic scheduler. The normal lifecycle still owns shutdown.
 func runForeignImpactWithEdits(ctx context.Context, o runOptions, p *privateRun, clients []*socketClient, phase *Phase, editedOrdinal int) (report foreignImpactRunReport, resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			report.Complete = false
+		}
+	}()
 	targets, err := foreignImpactQueryTargets(p.Repos, clients, editedOrdinal)
 	if err != nil {
 		return report, err
@@ -129,6 +162,9 @@ func runForeignImpactWithEdits(ctx context.Context, o runOptions, p *privateRun,
 	}
 	defer func() { resultErr = errors.Join(resultErr, raw.Close()) }()
 	report.RawFile = rawPath
+	report.RawLimit = foreignImpactRawLimit
+	evidence := foreignImpactEvidenceWriter{w: raw, limit: foreignImpactRawLimit}
+	defer func() { report.RawBytes = evidence.bytes }()
 	budget, err := plan.budget(o.Deadline, 1)
 	if err != nil {
 		return report, err
@@ -181,7 +217,7 @@ awaitWrite:
 			resultErr = errors.New("actual edit start was too late to cover the full foreign window")
 		} else {
 			report.ProbeStarted = time.Now()
-			report.Summary, err = runForeignImpactStream(measuredCtx, targets, edited, report.Window, func(row foreignImpactSample) error { return json.NewEncoder(raw).Encode(row) })
+			report.Summary, err = runForeignImpactStream(measuredCtx, targets, edited, report.Window, evidence.emit)
 			report.ProbeFinished = time.Now()
 			resultErr = errors.Join(resultErr, err)
 			if err != nil {

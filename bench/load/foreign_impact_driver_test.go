@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -67,5 +69,25 @@ func TestForeignImpactCommandRejectsChangedTrafficAndBudgets(t *testing.T) {
 		if _, _, err := parseForeignImpact(append(append([]string(nil), args...), changed...)); err == nil {
 			t.Fatalf("accepted changed foreign cell %v", changed)
 		}
+	}
+}
+
+func TestForeignImpactEvidenceLimitRetainsPriorRowsAndStopsAtBoundary(t *testing.T) {
+	row := foreignImpactSample{TargetRepo: "A", EditedRepo: "B", RPCID: 9}
+	data, err := json.Marshal(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dst bytes.Buffer
+	writer := foreignImpactEvidenceWriter{w: &dst, limit: int64(len(data) + 1)}
+	if err := writer.emit(row); err != nil {
+		t.Fatal(err)
+	}
+	before := append([]byte(nil), dst.Bytes()...)
+	if err := writer.emit(row); err == nil {
+		t.Fatal("exhausted raw evidence storage silently accepted another offer")
+	}
+	if !bytes.Equal(before, dst.Bytes()) || writer.bytes != int64(len(before)) {
+		t.Fatal("quota failure changed previously retained evidence")
 	}
 }
