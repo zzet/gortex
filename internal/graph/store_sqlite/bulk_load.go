@@ -383,10 +383,8 @@ func (s *Store) activeWriteConnLocked(ctx context.Context) (*sql.Conn, func(), e
 func (s *Store) BeginBulkLoad() {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.coordinatedBulkLoad {
-		return
-	}
-	s.beginBulkLoadLocked()
+	outcome, reason := s.beginBulkLoadLocked()
+	log.Printf("store_sqlite: bulk begin window=standalone outcome=%s reason=%s", outcome, reason)
 }
 
 // BeginCoordinatedBulkLoad opens one outer cold-load window around a set of
@@ -398,11 +396,9 @@ func (s *Store) BeginBulkLoad() {
 func (s *Store) BeginCoordinatedBulkLoad() bool {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.coordinatedBulkLoad || s.bulkConn != nil {
-		return false
-	}
-	s.beginBulkLoadLocked()
-	if s.bulkConn == nil {
+	outcome, reason := s.beginBulkLoadLocked()
+	log.Printf("store_sqlite: bulk begin window=coordinated outcome=%s reason=%s", outcome, reason)
+	if outcome != "engaged" {
 		return false
 	}
 	s.coordinatedBulkLoad = true
@@ -410,14 +406,17 @@ func (s *Store) BeginCoordinatedBulkLoad() bool {
 	return true
 }
 
-func (s *Store) beginBulkLoadLocked() {
-
-	// Re-entrancy / non-disk guard: a second BeginBulkLoad without an
-	// intervening FlushBulk, or an in-memory store, stays a no-op.
-	if s.bulkConn != nil || isMemoryPath(s.dbPath) {
-		return
+func (s *Store) beginBulkLoadLocked() (outcome, reason string) {
+	if s.generationBulkLoad != 0 {
+		return "refused_generation_window", "generation_window"
 	}
-
+	if s.coordinatedBulkLoad || s.bulkConn != nil {
+		return "nested_noop", "active_window"
+	}
+	if isMemoryPath(s.dbPath) {
+		return "memory_store", "memory_store"
+	}
+	outcome, reason = "refused_setup", "writer_connection"
 	ctx := context.Background()
 	conn, err := s.writerDB.Conn(ctx)
 	if err != nil {
@@ -427,10 +426,11 @@ func (s *Store) beginBulkLoadLocked() {
 	// Nodes alone are not a cold-store proof. A degraded warm store can have
 	// zero nodes while retaining millions of edges, and sidecar receipts prove
 	// an incremental lifecycle even when both graph tables happen to be empty.
-	if !coldGraphStoreEmpty(ctx, conn) {
+	if predicate := coldGraphStoreRefusal(ctx, conn); predicate != "" {
 		_ = conn.Close()
-		return
+		return "refused_not_cold", predicate
 	}
+	reason = "pragma_setup"
 
 	// Capture prior pragma values so FlushBulk (and every early-return /
 	// error path) can restore them. If they can't be read, don't engage —
@@ -500,6 +500,7 @@ func (s *Store) beginBulkLoadLocked() {
 	// The bulk path changes durability and secondary-index maintenance outside
 	// the ordinary row mutation protocol. Active receipts therefore fail closed.
 	s.markMutationReceiptsIncompleteLocked()
+	return "engaged", "cold_store"
 }
 
 // ErrGenerationBulkLoadPopulated refuses a generation-scoped bulk window over
@@ -1560,14 +1561,24 @@ func shouldBackoffBulkRowCheckpoint(err error) bool {
 // rows has been indexed before, whichever view wrote them, so it is not the
 // cold store this fast path is for.
 func coldGraphStoreEmpty(ctx context.Context, conn *sql.Conn) bool {
-	var empty int
+	return coldGraphStoreRefusal(ctx, conn) == ""
+}
+
+// One bounded probe retains the cold-store proof and identifies its first
+// failed predicate without counting or hydrating any graph rows.
+func coldGraphStoreRefusal(ctx context.Context, conn *sql.Conn) string {
+	var reason string
 	err := conn.QueryRowContext(ctx, `
-SELECT NOT EXISTS(SELECT 1 FROM nodes WHERE view_gen = ?)
-   AND NOT EXISTS(SELECT 1 FROM edges WHERE view_gen = ?)
-   AND NOT EXISTS(SELECT 1 FROM file_mtimes)
-   AND NOT EXISTS(SELECT 1 FROM repo_index_state)`,
-		baseViewGeneration, baseViewGeneration).Scan(&empty)
-	return err == nil && empty == 1
+SELECT CASE
+ WHEN EXISTS(SELECT 1 FROM nodes WHERE view_gen = ?) THEN 'nodes'
+ WHEN EXISTS(SELECT 1 FROM edges WHERE view_gen = ?) THEN 'edges'
+ WHEN EXISTS(SELECT 1 FROM file_mtimes) THEN 'file_mtimes'
+ WHEN EXISTS(SELECT 1 FROM repo_index_state) THEN 'repo_index_state'
+ ELSE '' END`, baseViewGeneration, baseViewGeneration).Scan(&reason)
+	if err != nil {
+		return "cold_probe_error"
+	}
+	return reason
 }
 
 // WriterPragmaForTest reads an integer PRAGMA off the store's writer
