@@ -280,20 +280,30 @@ func (p *privateRun) addWorktrees(ctx context.Context, count int) error {
 	if len(p.Repos) != 1 {
 		return errors.New("worktree scenario requires exactly one primary corpus")
 	}
-	primary := p.Repos[0]
-	for i := range count {
-		path := filepath.Join(p.Root, "repos", fmt.Sprintf("linked-%d", i+1))
-		if _, err := p.git(ctx, primary.Path, "worktree", "add", "--detach", path, primary.Corpus.Commit); err != nil {
+	for range count {
+		if err := p.addWorktree(ctx); err != nil {
 			return err
 		}
-		file, err := ownedFile(path, primary.Corpus.File)
-		if err != nil {
-			return err
-		}
-		corpus := primary.Corpus
-		corpus.Label = fmt.Sprintf("linked-%d", i+1)
-		p.Repos = append(p.Repos, privateRepo{Corpus: corpus, Path: path, File: file})
 	}
+	return nil
+}
+
+// addWorktree links the next detached worktree of the primary at its pinned
+// commit; the Nth linked checkout is labelled linked-N.
+func (p *privateRun) addWorktree(ctx context.Context) error {
+	primary := p.Repos[0]
+	label := fmt.Sprintf("linked-%d", len(p.Repos))
+	path := filepath.Join(p.Root, "repos", label)
+	if _, err := p.git(ctx, primary.Path, "worktree", "add", "--detach", path, primary.Corpus.Commit); err != nil {
+		return err
+	}
+	file, err := ownedFile(path, primary.Corpus.File)
+	if err != nil {
+		return err
+	}
+	corpus := primary.Corpus
+	corpus.Label = label
+	p.Repos = append(p.Repos, privateRepo{Corpus: corpus, Path: path, File: file})
 	return nil
 }
 

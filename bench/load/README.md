@@ -480,6 +480,44 @@ index; queryability and enrichment are separate observed upper bounds with a
 recorded polling interval. Older daemons without `loaded_roots` retain their
 legacy receipt and must still pass source-backed per-root checks.
 
+## Startup admission
+
+`--scenario startup` (never part of `all`) measures what agents see while a
+daemon starts. Every manifest repository is configured; `--worktrees` linked
+checkouts of the first one are discovered through it. Probing starts before
+the first daemon start, so the window before the socket exists is observed
+too. `--seed-store <file>` copies a store (for example one written by an
+older schema) into the private run first, which makes the initial boot an
+upgrade; the source is only read. `--restarts N` adds N warm restarts. Each
+boot lasts until every configured repository is ready and enriched, plus
+`--duration`.
+
+Every second, from the primary, the first linked worktree, and a directory
+whose `.gortex.yaml` names a workspace that a private `servers.toml` roster
+claims, the probe opens fresh sessions: `initialize` (the instructions
+variant is recorded), `search_symbols` and `resources/read
+gortex://index-health` on the legacy surface, and `workspace(operation:
+"index")` on the compact one. The roster's only server never listens, so a
+routed call falls back to the daemon itself. From the same directories it
+asks the PreToolUse hook about a native Read every second, and runs `gortex
+call search_symbols` through a pipe (from the start) and through a pty
+(`script(1)`, once the socket answers), each until its first success in that
+boot. Every answer keeps `error_code`, `retryable`, phase, percent, latency,
+exit code, and whether any refusal text advises `gortex track` or
+`gortex repos reconcile`. A watcher polls the readiness probe every 100 ms
+and, for 2 s after the primary registers, the checkout coordinator count.
+
+`startup-probe.jsonl` holds every answer. The phase gate `startup_probe`
+counts answers per surface and directory in three windows (no socket,
+loading, ready) and records each boot's time to ready and time to first
+success. Headline metrics include `startup_repo_not_tracked_before_ready`,
+`startup_nonconforming_loading_refusals`, the track-advice and hook-deny
+counts, `startup_restart_ready_to_first_ok_p95_ms`,
+`startup_restart_time_to_ready_p95_ms`, `startup_initial_time_to_ready_ms`,
+`startup_initial_first_ok_ms` and `startup_coordinators_within_2s_min`.
+Restart figures are unavailable unless every restart produced them, and
+`delta` compares two startup reports like any other.
+
 ## Measurements and artifacts
 
 One JSON file contains per-operation successful p50/p95/p99/max, successful
@@ -657,3 +695,57 @@ Inspect artifacts with `go tool pprof -top -nodecount=30 profile.cpu.pprof` and
 retain the exact run JSON alongside them. Real reference/floor baselines,
 repeatability, throughput scaling, and CPU-cause attribution require measured
 evidence; fixture tests or native diagnostics do not satisfy those gates.
+
+## Memory diagnosis
+
+`--gauges` (standalone runs only) subscribes one extra session to the daemon's
+`daemon_health` channel at a 10-second cadence for each measured phase, from
+the moment the daemon reports ready to the end of the phase, so the series also
+covers the warmup gates and the level after enrichment before any load. Every
+push becomes a row of `gate.gauge_series`: the daemon's own gauges (Go heap,
+`sys`, released heap, resident and proportional set or macOS footprint, SQLite
+page cache, live checkout coordinators) next to the harness's external sample
+of the daemon process taken as the push arrived. On Linux the sample adds
+`children_pss_bytes`, the proportional set of every descendant of the daemon
+(language servers and other helpers, found through each thread's
+`/proc/<pid>/task/<tid>/children`), and in a cgroup it adds the group's
+`memory.current`, which charges those children too, with its anonymous and
+file-backed parts from `memory.stat` (`cgroup_anon_bytes`,
+`cgroup_file_bytes`). The daemon runs its health ticker only while a session is
+subscribed, so the gauges cost nothing in runs that do not ask, and a
+`--gauges` run compared with the same run without it measures what the gauges
+cost. `--heap-profiles` (with `--gauges`) also saves two heap profiles per load
+window: one at load start and one at the highest footprint the series sampled
+during the load (or at its end, when that is higher). The peak captures run
+inside the measured window, so leave the option off when latency is being
+compared. If the OS/build has no process-footprint reader, the peak profile is
+unavailable with a reason in the phase gate or worktree step, and no peak
+artifact is advertised. Load-start and collected idle profiles remain available.
+Heap profiles are taken as of the daemon's last GC; no collection is forced
+during load.
+
+Live gauges and heap profiles are refused for `startup-probe`, which records
+its own boot observations without a gauge series, for `idle-stop`, whose
+measured interval requires every MCP session closed, and for the edit-and-probe
+`edit_sender: restart` cell, which replaces the process during its measured
+phase. Ordinary `--scenario restart` is supported: its series starts only
+after the replacement daemon is ready. `all` keeps independent per-scenario
+series; steady read/edit runs and worktree-step measurements remain supported.
+
+`--worktree-steps 0,1,2,4` (worktrees scenario, ending at `--worktrees`)
+measures what each linked worktree costs. One daemon starts with the first
+count of linked worktrees and grows through the rest. At each count it serves
+the reading agents for `--duration` from fresh sessions spread over every
+checkout, then sits idle for `--duration`; a session stays parked in each
+linked checkout throughout. Each idle window opens with one forced collection
+and a heap profile taken right after it, so every idle level follows a load of
+its own count and holds what the checkouts retain rather than the load's
+garbage. `gate.worktree_steps` records each count's load and idle windows,
+load-window process peaks, per-tool latency and heap profile paths, and the
+gauge series spans the whole run. The phase session model names the counts
+(`per_agent_per_worktree_step:0,1,2,4`), so `delta` refuses to compare a step
+run with an ordinary worktrees run or with a step run over other counts.
+Inspect a profile with
+`go tool pprof -sample_index=inuse_space -top worktrees.step3.heap-load-peak.pprof`,
+and what one more worktree retains with
+`go tool pprof -sample_index=inuse_space -top -base worktrees.step2.heap-idle.pprof worktrees.step3.heap-idle.pprof`.

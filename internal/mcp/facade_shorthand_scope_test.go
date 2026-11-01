@@ -93,8 +93,7 @@ func newShorthandScopeFixture(t *testing.T) shorthandScopeFixture {
 
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, testRegistry(), search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "")
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 	for i := range 40 {
 		repo := fmt.Sprintf("far-%02d", i)
 		for _, name := range []string{"Needle", "Twin", "Shared"} {

@@ -108,6 +108,9 @@ func makeEditProbePlan(c Corpus, seed int64, count int) (editProbePlan, error) {
 }
 
 func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
+	if c.EditSender == editProbeRestart && wantsGaugeSeries(o) {
+		return editProbePlan{}, errors.New("live memory gauges and profiles are unsupported for the in-run restart sender: its process and health session are replaced")
+	}
 	p, err := makeEditProbeTrafficPlan(c, o.Seed, o.EditCount, o.Editors)
 	if err != nil || o.Agents == 0 {
 		return p, err

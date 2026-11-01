@@ -55,3 +55,31 @@ func TestLoadingRepo_SearchScopeAllowed(t *testing.T) {
 		t.Fatalf("a loading repository's scope must read as holding nothing the graph answers for: hasSource=%v probeOK=%v", hasSource, probeOK)
 	}
 }
+
+func TestIdentityPending_NativeDoorsDoNotClaimOwnership(t *testing.T) {
+	st := fileIndexStatusFromCoverage(daemon.FileCoverageResult{RepoState: daemon.RepoStateIdentityPending})
+	if !st.Loading || st.Indexed || st.Tracked || st.LoadingRepo != "" {
+		t.Fatalf("uncertain identity is not an indexed or tracked verdict: %#v", st)
+	}
+	stubFileIndexScope(t, st)
+	for name, res := range map[string]enrichResult{
+		"Read":     enrichRead(map[string]any{"file_path": "internal/graph/graph.go"}, "/repo"),
+		"Edit":     enrichEdit(map[string]any{"file_path": "internal/graph/graph.go"}, "/repo"),
+		"Bash cat": enrichBash(map[string]any{"command": "cat internal/graph/graph.go"}, "/repo"),
+	} {
+		if res.deny {
+			t.Fatalf("%s denied while graph admission is unresolved: %#v", name, res)
+		}
+		if strings.Contains(res.context, "this repository is still loading") || strings.Contains(res.context, "already configured") {
+			t.Fatalf("%s invented repository ownership: %s", name, res.context)
+		}
+	}
+	read := enrichRead(map[string]any{"file_path": "internal/graph/graph.go"}, "/repo")
+	if !strings.Contains(read.context, "identity_pending") {
+		t.Fatalf("missing honest reason: %s", read.context)
+	}
+	hasSource, ok := scopeTrackedFromCoverage(daemon.DirCoverageResult{RepoState: daemon.RepoStateIdentityPending})
+	if hasSource || !ok {
+		t.Fatalf("pending directory must not redirect to graph: source=%v known=%v", hasSource, ok)
+	}
+}

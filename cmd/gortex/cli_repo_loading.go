@@ -38,9 +38,10 @@ func init() {
 // It carries exit code 75, so a script or hook that runs the CLI can retry
 // later without parsing the message.
 type repoLoadingError struct {
-	repo    string
-	phase   string
-	percent int
+	admissionReason string
+	repo            string
+	phase           string
+	percent         int
 	// waited is how long the CLI already waited before giving up for now.
 	waited time.Duration
 }
@@ -49,6 +50,13 @@ func (e *repoLoadingError) Error() string {
 	msg := fmt.Sprintf("the gortex daemon is still loading %s after a restart (%s, %d%%)", e.repo, e.phase, e.percent)
 	if e.waited > 0 {
 		msg += fmt.Sprintf("; still loading after waiting %s", e.waited.Round(time.Second))
+	}
+	if e.admissionReason != "" {
+		msg = fmt.Sprintf("the gortex daemon is still resolving graph admission (repo_loading, %s)", e.admissionReason)
+		if e.waited > 0 {
+			msg += fmt.Sprintf("; still loading after waiting %s", e.waited.Round(time.Second))
+		}
+		return msg + " — graph admission for this path is not yet established; retry shortly (or pass --loading-wait to wait for it)"
 	}
 	return msg + " — the repository is already tracked; retry shortly (or pass --loading-wait to wait for it)"
 }
