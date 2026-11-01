@@ -47,7 +47,8 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		if phase.NeverSeen > 0 {
 			phase.Errors = append(phase.Errors, fmt.Sprintf("%d acknowledged edits never visible before product deadline", phase.NeverSeen))
 		}
-		if scenario != "cold" && scenario != "restart" && len(phase.Tools) == 0 {
+		nativeWork := scenario == editProbeScenario && editProbeNativeWorkObserved(phase.EditProbe)
+		if scenario != "cold" && scenario != "restart" && len(phase.Tools) == 0 && !nativeWork {
 			phase.Errors = append(phase.Errors, "no workload calls observed before phase end")
 		}
 		if resultErr != nil {

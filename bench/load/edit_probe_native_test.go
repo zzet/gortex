@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -26,6 +27,11 @@ func editProbeEditorSaveCorpus(t *testing.T, count int) Corpus {
 // indexed them would. A name no longer declared answers the exact not-found
 // refusal; caller subgraphs keep the stable callee's own node.
 func editProbeDiskStub(t *testing.T, c Corpus, dir string) func(stubFrame) (any, *rpcError) {
+	t.Helper()
+	return editProbeDiskReplies(c, dir, func(err error) { t.Error(err) })
+}
+
+func editProbeDiskReplies(c Corpus, dir string, report func(error)) func(stubFrame) (any, *rpcError) {
 	declared := regexp.MustCompile(`func (GortexEditProbe\w+)\(`)
 	callee := c.Symbol[strings.LastIndex(c.Symbol, "::")+2:]
 	return func(frame stubFrame) (any, *rpcError) {
@@ -44,7 +50,7 @@ func editProbeDiskStub(t *testing.T, c Corpus, dir string) func(stubFrame) (any,
 					err = os.WriteFile(path, []byte(change["new_string"].(string)), 0o600)
 				}
 				if err != nil {
-					t.Error(err)
+					report(err)
 				}
 			}
 			return stubContent(map[string]any{"committed": true}), nil
@@ -56,7 +62,7 @@ func editProbeDiskStub(t *testing.T, c Corpus, dir string) func(stubFrame) (any,
 		for _, path := range paths {
 			data, err := os.ReadFile(path)
 			if err != nil {
-				t.Error(err)
+				report(err)
 			}
 			file := filepath.Base(path)
 			for _, match := range declared.FindAllStringSubmatch(string(data), -1) {
@@ -78,7 +84,7 @@ func editProbeDiskStub(t *testing.T, c Corpus, dir string) func(stubFrame) (any,
 		case "read.file":
 			data, err := os.ReadFile(filepath.Join(dir, file))
 			if err != nil {
-				t.Error(err)
+				report(err)
 			}
 			return stubContent(map[string]any{"path": "fixture/" + file, "content": string(data)}), nil
 		case "read.source":
@@ -103,7 +109,7 @@ func editProbeDiskStub(t *testing.T, c Corpus, dir string) func(stubFrame) (any,
 		case "relations.callers", "trace.call_chain":
 			return stubContent(map[string]any{"nodes": graph, "edges": edges, "total_nodes": len(graph), "total_edges": len(edges), "truncated": false}), nil
 		}
-		t.Errorf("unexpected tool call %v", frame.Params)
+		report(fmt.Errorf("unexpected tool call %v", frame.Params))
 		return stubContent(map[string]any{}), nil
 	}
 }

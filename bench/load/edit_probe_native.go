@@ -39,6 +39,31 @@ type editProbeNativeWrite struct {
 	Replaced          bool                   `json:"replaced"`
 }
 
+// Native operations have no MCP workload attempt. A completed write with all
+// of its correctness probes observed still proves that this phase did work.
+func editProbeNativeWorkObserved(report *editProbeReport) bool {
+	if report == nil {
+		return false
+	}
+	for _, record := range report.Records {
+		write := record.NativeWrite
+		if record.Outcome != "complete" || len(record.Errors) != 0 || write == nil || write.Sender == "" || write.StartNS == nil || write.EndNS == nil || *write.EndNS < *write.StartNS || write.Window.Value == nil || *write.Window.Value < 0 || len(record.FirstCorrect) == 0 {
+			continue
+		}
+		correct := true
+		for _, observed := range record.FirstCorrect {
+			if observed.Value == nil {
+				correct = false
+				break
+			}
+		}
+		if correct {
+			return true
+		}
+	}
+	return false
+}
+
 // editProbeNativeSender admits a native sender only with the fixture shape it
 // writes. An empty edit_sender leaves every MCP cell unchanged.
 func editProbeNativeSender(c Corpus, kind, tool string, count, editors int) error {
