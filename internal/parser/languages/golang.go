@@ -447,10 +447,14 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 			// No-op (the package name is not currently surfaced as a node).
 
 		case m.Captures["func.def"] != nil:
-			e.emitFunction(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			root.WithScratch(func() {
+				e.emitFunction(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			})
 
 		case m.Captures["method.def"] != nil:
-			e.emitMethod(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			root.WithScratch(func() {
+				e.emitMethod(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			})
 
 		case m.Captures["typedef.def"] != nil:
 			e.emitTypeDecl(m, filePath, fileID, src, result, seenTypeName)
