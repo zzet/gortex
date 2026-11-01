@@ -27,6 +27,7 @@ type foreignImpactSample struct {
 	EditedRepo       string          `json:"edited_repo"`
 	TargetSymbol     string          `json:"target_symbol"`
 	RPCID            int64           `json:"rpc_id"`
+	QueryCWD         string          `json:"cwd,omitempty"`
 	Started          time.Time       `json:"started"`
 	Finished         time.Time       `json:"finished"`
 	WithinWindow     bool            `json:"within_window"`
@@ -45,7 +46,11 @@ type foreignImpactSample struct {
 func observeForeignImpact(ctx context.Context, client *socketClient, target, edited privateRepo, window foreignImpactWindow) foreignImpactSample {
 	symbol := target.Prefix + "/" + target.Corpus.Symbol
 	invalid := func(message string) foreignImpactSample {
-		return foreignImpactObservation(window, target.Corpus.Label, edited.Corpus.Label, symbol, nil, wireCallIdentity{}, errors.New(message))
+		row := foreignImpactObservation(window, target.Corpus.Label, edited.Corpus.Label, symbol, nil, wireCallIdentity{}, errors.New(message))
+		if client != nil {
+			row.QueryCWD = client.cwd
+		}
+		return row
 	}
 	if client == nil || client.cwd == "" || target.Path == "" || filepath.Clean(client.cwd) != filepath.Clean(target.Path) {
 		return invalid("foreign impact requires its target checkout's own query session")
@@ -58,7 +63,9 @@ func observeForeignImpact(ctx context.Context, client *socketClient, target, edi
 	}
 	args := map[string]any{"operation": "impact", "target": map[string]any{"symbol": symbol}, "output": map[string]any{"format": "json", "max_bytes": 0}}
 	raw, identity, err := client.callWithIdentity(ctx, "tools/call", map[string]any{"name": "change", "arguments": args})
-	return foreignImpactObservation(window, target.Corpus.Label, edited.Corpus.Label, symbol, raw, identity, err)
+	row := foreignImpactObservation(window, target.Corpus.Label, edited.Corpus.Label, symbol, raw, identity, err)
+	row.QueryCWD = client.cwd
+	return row
 }
 
 func foreignImpactObservation(window foreignImpactWindow, targetRepo, editedRepo, symbol string, raw json.RawMessage, identity wireCallIdentity, callErr error) foreignImpactSample {
