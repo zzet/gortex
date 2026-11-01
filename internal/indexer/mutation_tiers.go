@@ -145,8 +145,37 @@ func (w *Watcher) TierState(path string) MutationTierState {
 
 // CaptureTierRepair binds a successful explicit single-file reparse to the
 // failure it observed before starting. The caller invokes it only after proof
-// that this exact file was reparsed successfully.
-func (w *Watcher) CaptureTierRepair(_ string) func() { return nil }
+// that this exact file was reparsed successfully. Bounded derived incompleteness
+// is separate evidence and cannot be repaired by a file parse alone.
+func (w *Watcher) CaptureTierRepair(path string) func() {
+	path = filepath.Clean(path)
+	w.mu.Lock()
+	observed := w.failedPaths[path]
+	w.mu.Unlock()
+	if !observed.Failed || observed.Partial {
+		return nil
+	}
+	return func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.failedPaths[path] == observed {
+			delete(w.failedPaths, path)
+		}
+	}
+}
+
+func (mw *MultiWatcher) CaptureTierRepair(path string) func() {
+	mw.mu.Lock()
+	_, prefix := mw.multi.IndexerForFile(path)
+	watcher := mw.watchers[prefix]
+	mw.mu.Unlock()
+	if watcher != nil {
+		// Capture this exact owner now. Looking it up after the reparse could
+		// clear a replacement watcher's failure that the pass never observed.
+		return watcher.CaptureTierRepair(path)
+	}
+	return nil
+}
 
 func (mw *MultiWatcher) TierPaths() map[string]MutationTierState {
 	mw.mu.Lock()

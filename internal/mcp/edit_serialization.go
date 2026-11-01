@@ -442,6 +442,18 @@ func (s *Server) failedReceiptsBefore(paths []string, root string) map[string]st
 	return eligible
 }
 
+func (s *Server) captureWatcherTierRepair(paths []string, root string) func() {
+	path, ok := reindexCandidatePath(paths, root)
+	if !ok {
+		return nil
+	}
+	watcher, ok := s.currentWatcher().(interface{ CaptureTierRepair(string) func() })
+	if !ok {
+		return nil
+	}
+	return watcher.CaptureTierRepair(path)
+}
+
 func (s *Server) resolveReindexedPathReceipts(reindexedPath string, eligible map[string]struct{}) {
 	cleanPath := filepath.Clean(reindexedPath)
 	s.mutationReceipts.Range(func(_, value any) bool {
