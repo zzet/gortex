@@ -31,6 +31,13 @@ const editProbeTOONWireKey = "\x00load.toon.wire"
 var errEditOutputGCXUnavailable = errors.New("GCX output unavailable: no GCX decoder, and read_file answers a GCX request with TOON")
 
 func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[string]any, error) {
+	facade := format == "facade"
+	if facade {
+		if err := verifyEditProbeFacade(raw, operation); err != nil {
+			return nil, err
+		}
+		format = "json"
+	}
 	switch format {
 	case "", "json":
 	case "toon":
@@ -56,6 +63,9 @@ func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[s
 		}
 		if err := decoder.Decode(&body); err != nil {
 			return nil, err
+		}
+		if facade {
+			body[editProbeFacadeWireKey] = editProbeFacadeWire{operation: operation}
 		}
 		return body, nil
 	}

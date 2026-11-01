@@ -24,6 +24,7 @@ const editProbeMaxEditors = 32
 const editProbeFixedEditorModel = "fixed_editor_per_ordinal_plus_one_separate_prober_per_edit"
 
 type editProbeStep struct {
+	ProbeMode       string  `json:"probe_mode,omitempty"`
 	Ordinal         int     `json:"ordinal"`
 	ActivateNS      int64   `json:"activate_ns"`
 	DueNS           int64   `json:"due_ns"`
@@ -60,6 +61,7 @@ type editProbeRoute struct {
 }
 
 type editProbePlan struct {
+	GateModes       bool             `json:"gate_modes,omitempty"`
 	Version         int              `json:"version"`
 	Arrival         string           `json:"arrival"`
 	MeanNS          int64            `json:"mean_interarrival_ns"`
@@ -134,8 +136,21 @@ func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
 		mean = editProbeMean
 	}
 	p, err := makeEditProbeTrafficPlanWithMean(c, o.Seed, o.EditCount, o.Editors, mean)
-	if err != nil || o.Agents == 0 {
+	if err != nil {
 		return p, err
+	}
+	if o.EditGateModes {
+		if p.Count != 100 || p.Mode != "json" || p.Kind != "add_intrafile_call" || p.Tool != "edit.file" {
+			return editProbePlan{}, errors.New("five-mode gate requires 100 call-addition edits with unchanged JSON edit.file ACKs")
+		}
+		p.GateModes = true
+		modes := []string{"json", "toon", "compact", "facade", "cli"}
+		for i := range p.Steps {
+			p.Steps[i].ProbeMode = modes[i%len(modes)]
+		}
+	}
+	if o.Agents == 0 {
+		return p, nil
 	}
 	if c.EditSender == editProbeRestart {
 		return editProbePlan{}, errors.New("the restart cell has no pure readers")

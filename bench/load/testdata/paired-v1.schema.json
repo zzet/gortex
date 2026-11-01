@@ -1239,6 +1239,9 @@
                               "probe_errors": {
                                 "type": "integer"
                               },
+                              "probe_mode": {
+                                "type": "string"
+                              },
                               "raw_evidence": {
                                 "type": "string"
                               },
@@ -1780,6 +1783,9 @@
                             "file": {
                               "type": "string"
                             },
+                            "gate_modes": {
+                              "type": "boolean"
+                            },
                             "kind": {
                               "type": "string"
                             },
@@ -1930,6 +1936,9 @@
                                   },
                                   "ordinal": {
                                     "type": "integer"
+                                  },
+                                  "probe_mode": {
+                                    "type": "string"
                                   },
                                   "relocated": {
                                     "type": "boolean"
@@ -3621,6 +3630,9 @@
                       "file": {
                         "type": "string"
                       },
+                      "gate_modes": {
+                        "type": "boolean"
+                      },
                       "kind": {
                         "type": "string"
                       },
@@ -3771,6 +3783,9 @@
                             },
                             "ordinal": {
                               "type": "integer"
+                            },
+                            "probe_mode": {
+                              "type": "string"
                             },
                             "relocated": {
                               "type": "boolean"

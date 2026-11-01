@@ -40,6 +40,7 @@ type runOptions struct {
 	SweepBudget       time.Duration
 	EditMean          time.Duration
 	EditCount         int
+	EditGateModes     bool
 	EditRepos         int
 	EditProbeRole     string
 	editProbeBaseline bool
@@ -93,10 +94,14 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.DurationVar(&o.EditMean, "edit-mean", 0, "edit-and-probe per-editor Poisson mean; 0 preserves the 15s default")
 	f.IntVar(&o.EditRepos, "edit-repos", 1, "edit-and-probe: one repository (default), or exactly six distinct pinned repositories")
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
+	f.BoolVar(&o.EditGateModes, "edit-gate-modes", false, "edit-and-probe gate: rotate five probe surfaces over 100 total edits; JSON ACKs remain unchanged")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
 
 func validateRunOptions(o runOptions) error {
+	if o.EditGateModes && (o.Scenario != editProbeScenario || o.EditCount != 100 || o.Agents != 0) {
+		return errors.New("--edit-gate-modes requires edit-and-probe, 100 total edits and no extra pure readers")
+	}
 	if o.EditMean < 0 || o.EditMean > 0 && o.Scenario != editProbeScenario {
 		return errors.New("--edit-mean requires edit-and-probe and a nonnegative duration; 0 uses the 15s default")
 	}

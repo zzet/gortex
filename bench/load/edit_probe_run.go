@@ -29,6 +29,7 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
+	ProbeMode                string                    `json:"probe_mode,omitempty"`
 	Ordinal                  int                       `json:"ordinal"`
 	Editor                   int                       `json:"editor,omitempty"`
 	Route                    string                    `json:"route,omitempty"`
@@ -137,7 +138,7 @@ type editProbeRuntime struct {
 }
 
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
-	record := editProbeRecord{Ordinal: step.Ordinal, Editor: step.Editor, Route: step.Route, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), Readback: unavailable("ms", "edit not acknowledged"), Derived: unavailable("ms", "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
+	record := editProbeRecord{ProbeMode: step.ProbeMode, Ordinal: step.Ordinal, Editor: step.Editor, Route: step.Route, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), Readback: unavailable("ms", "edit not acknowledged"), Derived: unavailable("ms", "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
 	for _, oracle := range editProbeOracles(c, step) {
 		record.FirstCorrect[oracle.name] = unavailable("ms", "not observed")
 	}
