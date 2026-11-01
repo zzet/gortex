@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"iter"
 	"path/filepath"
 	"testing"
@@ -17,9 +18,12 @@ import (
 type findFilesProjectionStore struct {
 	*store_sqlite.Store
 	globalReads    int
+	edgeReads      int
 	projectedRepos []string
 	fullReads      int
 	summaryReads   int
+	locationReads  int
+	locationRows   int
 }
 
 func (s *findFilesProjectionStore) NodesByKind(kind graph.NodeKind) iter.Seq[*graph.Node] {
@@ -27,6 +31,21 @@ func (s *findFilesProjectionStore) NodesByKind(kind graph.NodeKind) iter.Seq[*gr
 		s.globalReads++
 		s.Store.NodesByKind(kind)(yield)
 	}
+}
+
+func (s *findFilesProjectionStore) AllNodes() []*graph.Node {
+	s.globalReads++
+	return s.Store.AllNodes()
+}
+
+func (s *findFilesProjectionStore) AllNodesLight() []*graph.Node {
+	s.globalReads++
+	return s.Store.AllNodesLight()
+}
+
+func (s *findFilesProjectionStore) AllEdges() []*graph.Edge {
+	s.edgeReads++
+	return s.Store.AllEdges()
 }
 
 func (s *findFilesProjectionStore) NodesInScopeSeq(repos, files []string, kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
@@ -39,6 +58,71 @@ func (s *findFilesProjectionStore) NodesLightByKindsInScopeSeq(repos, files []st
 	s.summaryReads++
 	s.projectedRepos = append(s.projectedRepos, repos...)
 	return s.Store.NodesLightByKindsInScopeSeq(repos, files, kinds...)
+}
+
+func (s *findFilesProjectionStore) FileLocationsInScopeSeq(repos []string) iter.Seq[*graph.Node] {
+	s.locationReads++
+	s.projectedRepos = append(s.projectedRepos, repos...)
+	return func(yield func(*graph.Node) bool) {
+		for node := range s.Store.FileLocationsInScopeSeq(repos) {
+			s.locationRows++
+			if !yield(node) {
+				return
+			}
+		}
+	}
+}
+
+// Unrelated repositories holding the same paths must change neither the
+// answer nor the rows the location read yields: the read is bounded by the
+// requested repository and the unowned files, never by the store.
+func TestFindFilesScopedNeverScansAndRowsStayFlat(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "flat.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	readmes := func(repo string) []*graph.Node {
+		nodes := make([]*graph.Node, 0, 50)
+		for i := range 50 {
+			path := fmt.Sprintf("%s/svc_%02d/README.md", repo, i)
+			nodes = append(nodes, &graph.Node{ID: path, Kind: graph.KindFile, FilePath: path, RepoPrefix: repo,
+				WorkspaceID: "ws", ProjectID: "p", Language: "markdown"})
+		}
+		return nodes
+	}
+	require.NoError(t, store.AddBatchChecked(append(readmes("a"),
+		&graph.Node{ID: "README.md", Kind: graph.KindFile, FilePath: "README.md", WorkspaceID: "ws", ProjectID: "p", Language: "markdown"}), nil))
+	tracked := &findFilesProjectionStore{Store: store}
+	srv, _ := overlaySpineFixture(t)
+	srv.graph = tracked
+	srv.scopeWorkspace = "ws"
+	installContractCoreKindTestRuntime(t, srv)
+	require.Implements(t, (*graph.ScopedFileLocationSequencer)(nil), srv.readerFor(t.Context()))
+	read := func() (string, int) {
+		t.Helper()
+		tracked.projectedRepos, tracked.locationReads, tracked.locationRows = nil, 0, 0
+		res, err := srv.handleFindFiles(t.Context(), makeReq("find_files", map[string]any{"query": "README.md", "repo": "a", "limit": 500}))
+		require.NoError(t, err)
+		require.False(t, res.IsError)
+		require.Zero(t, tracked.globalReads, "a scoped find_files read the whole store")
+		require.Zero(t, tracked.edgeReads, "a scoped find_files read every edge")
+		require.Zero(t, tracked.fullReads)
+		require.Zero(t, tracked.summaryReads, "no project narrows the scope, so file locations suffice")
+		require.Equal(t, 1, tracked.locationReads)
+		require.Equal(t, []string{"", "a"}, tracked.projectedRepos)
+		return res.Content[0].(mcplib.TextContent).Text, tracked.locationRows
+	}
+	baseline, baselineRows := read()
+	var out findFilesResult
+	require.NoError(t, json.Unmarshal([]byte(baseline), &out))
+	require.Len(t, out.Files, 51)
+	require.Equal(t, 51, baselineRows, "the requested repository's files and the unowned one")
+
+	for _, repo := range []string{"b", "c", "d", "e", "f"} {
+		require.NoError(t, store.AddBatchChecked(readmes(repo), nil))
+	}
+	payload, rows := read()
+	require.JSONEq(t, baseline, payload, "unrelated repositories changed the scoped answer")
+	require.Equal(t, baselineRows, rows, "unrelated repositories changed the rows the location read yielded")
 }
 
 func TestFindFilesScopedProjectionPreservesScopeAndOverlay(t *testing.T) {

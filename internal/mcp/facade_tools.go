@@ -520,10 +520,9 @@ func parseLocalizationNewUserBoundary(facade, operation string, arguments map[st
 	return boundary, nil
 }
 
-func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-	started := time.Now()
-	input, _ := req.Params.Arguments.(map[string]any)
-	localizationAuthToken := localizationauth.TakeArgument(input)
+// facadeRequestOperation is the side-effect-free operation selection shared
+// by admission classification and the actual facade dispatcher.
+func facadeRequestOperation(facade string, req mcpgo.CallToolRequest) string {
 	operation := resolveFacadeOperationAlias(facade, normalizeFacadeOperation(req.GetString("operation", "")))
 	if facade == "analyze" {
 		operation = requestedAnalyzeKind(req.GetArguments())
@@ -540,6 +539,14 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	if facade == "read" {
 		operation = normalizeFacadeReadOperation(operation, req.GetArguments())
 	}
+	return operation
+}
+
+func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	started := time.Now()
+	input, _ := req.Params.Arguments.(map[string]any)
+	localizationAuthToken := localizationauth.TakeArgument(input)
+	operation := facadeRequestOperation(facade, req)
 	terminal := s.localizationFor(ctx)
 	freshLocalizeFlow := facade == "explore" && operation == "localize"
 	newUserTask, invalidBoundary := parseLocalizationNewUserBoundary(facade, operation, req.GetArguments())
@@ -1212,7 +1219,7 @@ func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (s
 	}
 	seen := make(map[string]bool)
 	candidates := make([]string, 0, 2)
-	for _, node := range eng.FindSymbols(id) {
+	for _, node := range s.sessionNameCandidates(ctx, eng.Reader(), id, eng.Reader().FindNodesByName) {
 		if node == nil || seen[node.ID] || !s.nodeInSessionScope(ctx, node) {
 			continue
 		}
@@ -1234,6 +1241,39 @@ func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (s
 		return id, candidates
 	}
 	return resolved, nil
+}
+
+// sessionNameCandidates returns the nodes named name that a bare-name target
+// may resolve to, before the session-scope check, which callers still apply.
+// The every-repository read decodes each tracked repository's same-named
+// symbols only to drop them, so a session bound to one repository paid for
+// all the others. A bound session whose repositories are known reads each of
+// them, plus the unowned bucket every scope admits (synthetic externals),
+// through the selected reader's repository-scoped finder instead. The finder
+// is asked of the reader the caller reads, so an overlay or routed view
+// without one keeps everyRepo, the caller's every-repository read, rather
+// than bypassing its own layers.
+func (s *Server) sessionNameCandidates(ctx context.Context, reader graph.Reader, name string, everyRepo func(string) []*graph.Node) []*graph.Node {
+	finder, ok := contractCoreSelectedReader(reader).(graph.RepoNamesNodeFinder)
+	if !ok {
+		return everyRepo(name)
+	}
+	repos, bound := s.sessionWorkspaceRepoSet(ctx)
+	if !bound || len(repos) == 0 {
+		return everyRepo(name)
+	}
+	prefixes := []string{""}
+	for repo, allowed := range repos {
+		if allowed && repo != "" {
+			prefixes = append(prefixes, repo)
+		}
+	}
+	sort.Strings(prefixes)
+	var nodes []*graph.Node
+	for _, prefix := range prefixes {
+		nodes = append(nodes, finder.FindNodesByNamesInRepo([]string{name}, prefix)[name]...)
+	}
+	return nodes
 }
 
 // requestedAnalyzeKind applies the same argument-container precedence as the

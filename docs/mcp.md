@@ -241,7 +241,7 @@ Four additional push channels modeled on `subscribe_diagnostics` — per-session
 |------|-------------|
 | `subscribe_workspace_readiness` | `notifications/workspace_readiness` — daemon warmup phase transitions (snapshot_loaded → parallel_parse → deferred_passes_all → global_resolve → end_batch → watcher_started → ready), plus one `{event:"repo_state", repo, repo_path, state:"ready"}` event each time a configured repository registers. Last-known phase replayed to late subscribers. A graph tool *called during warmup* does not need this subscription to cope: for a session whose repository is already registered it returns an in-band `warming` block plus best-effort partial results; for a session whose repository warmup has not registered yet it returns `repo_loading` (see [Startup states](#startup-states)) |
 | `unsubscribe_workspace_readiness` | Opt back out — idempotent |
-| `subscribe_daemon_health` | `notifications/daemon_health` — periodic ticker (default 15 s, `interval_ms` clamped to 1 s..5 min) snapshots uptime, alloc/sys/heap, num_goroutine, num_gc, tracked_repos, sessions, lsp_alive, graph nodes/edges. Ticker only runs while ≥1 subscriber is attached |
+| `subscribe_daemon_health` | `notifications/daemon_health` — periodic ticker (default 15 s, `interval_ms` clamped to 1 s..5 min) snapshots uptime, alloc/sys/heap, num_goroutine, num_gc, tracked_repos, sessions, lsp_alive, graph nodes/edges, live checkout `coordinators`, the process-wide SQLite page cache (`sqlite_page_cache_bytes`, `sqlite_page_cache_peak_bytes`) and the OS view of the process: resident set (`rss_bytes`, `rss_peak_bytes`), Linux proportional set (`pss_bytes`, `pss_file_bytes`), macOS physical footprint (`footprint_bytes`, `footprint_peak_bytes`); an OS figure is omitted where the platform has no reader. Ticker only runs while ≥1 subscriber is attached |
 | `unsubscribe_daemon_health` | Opt back out — idempotent |
 | `subscribe_stale_refs` | `notifications/stale_refs` — per-session intersect of watcher symbol-change events against the session's viewed/modified working set. Fires only when a change actually touches what *this* session has consumed |
 | `unsubscribe_stale_refs` | Opt back out — idempotent |
@@ -255,20 +255,35 @@ After a daemon start, a repository is served once warmup registers it, which on 
 | State | When | `tools/call` | `initialize` instructions |
 |---|---|---|---|
 | loading | configured, warmup job queued or running | `repo_loading`, `retryable:true`, with `phase`, `percent`, `repo`, `repo_path` | a LOADING preamble ahead of the ordinary instructions |
+| prefix collision | the configured root's prefix belongs to another root | `prefix_collision`, `retryable:false`, with `prefix`, `owner_path`, `owner_state` | owner-specific naming guidance |
 | failed | the warmup job ended without registering it | `repo_unavailable`, `retryable:false`, with `reason` | how to repair it |
 | missing | the configured path does not exist | `repo_unavailable`, `retryable:false` | how to repair it |
 | ready | registered | served normally | ordinary |
 
 While loading, `index_health` (also `workspace(operation:"index")`), `capabilities`, `tools_search` and the `subscribe_*` / `unsubscribe_*` tools answer; `index_health` lists only the caller's repository. `track_repository`, `index_repository` and `workspace_admin(operation:"track")` for the repository answer `{status:"already_configured", state:"loading"}`; once its load has failed they run normally, because tracking it again is the repair. Every other tool call, `resources/read` and `prompts/get` returns `repo_loading`, and mutations stay refused.
 
-Tools start working **in place** when the repository registers: no reconnect is needed. The session's cached scope is dropped at registration, and a session whose `initialize` reported the repository as loading receives one `notifications/message` saying it is ready. A directory outside every configured repository still gets `repo_not_tracked`. The control-socket probe that hooks and the CLI pre-flight read reports the same per-repository `state` (`loading`, `ready`, `failed`, `missing`), the hook lets native Read/Grep/Edit through for a loading repository instead of denying them, and the CLI maps `repo_loading` to "the daemon is still loading <repo>": on a terminal it waits up to `--loading-wait` (default 30 s), otherwise it exits with code 75 (`EX_TEMPFAIL`).
+Tools start working **in place** when the repository registers: no reconnect is needed. The session's cached scope is dropped at registration, and a session whose `initialize` reported the repository as loading receives one `notifications/message` saying it is ready. A directory outside every configured repository still gets `repo_not_tracked`. The control-socket probe that hooks and the CLI pre-flight read reports the same per-repository `state` (`loading`, `ready`, `failed`, `missing`, `prefix_collision`), the hook lets native Read/Grep/Edit through for a loading repository instead of denying them, and the CLI maps `repo_loading` to "the daemon is still loading <repo>": on a terminal it waits up to `--loading-wait` (default 30 s), otherwise it exits with code 75 (`EX_TEMPFAIL`).
+
+A known prefix collision takes precedence over loading guidance: re-tracking
+that configured root returns `prefix_collision`, never `already_configured`.
+Use `name` for a new root, or edit the configured root's `name` and reload.
+`owner_state` is `present`, `missing` or `unknown`; only `missing` suggests
+inspecting an untrack of the owner.
+
+`track_repository` may answer `accepted` while its detached initial index
+continues. Its final outcome is retained for ten minutes under the canonical
+root and the request's `name`, `as_worktree` and `force` options. A retry reads
+that outcome without starting another index. Collision outcomes are errors with
+structured `error_code: prefix_collision`, `prefix`, `owner_path` and
+`owner_state` fields. Changing the options, configured ownership or live owner
+invalidates reuse, so choosing a different name can repair the request. Native
+file reads and edits remain available while a collision prevents graph access.
 
 ## Request lifetime (why a call can never hang)
 
 Every tool call and resource read is bounded, on every transport. A request that
 overruns its budget is **abandoned**: the client gets a terminal, structured
-error and the transport's slot is released immediately, so the session keeps
-serving later requests. The handler itself keeps running — it may be inside a
+error so the session keeps serving later requests. The handler itself can keep running — it may be inside a
 store call that cannot be interrupted — so treat any side effect of an abandoned
 call as *unknown* and re-read before assuming it did or did not land.
 
@@ -276,17 +291,49 @@ call as *unknown* and re-read before assuming it did or did not land.
 |---|---|---|
 | Tool call / resource read / prompt fetch (all transports) | 60 s | `GORTEX_MCP_TOOL_TIMEOUT` (Go duration; `off` disables) |
 | Daemon socket, per JSON-RPC request | 60 s, terminal `-32001` | — |
-| Daemon socket, concurrent dispatches | 8 | `GORTEX_MCP_MAX_CONCURRENT_DISPATCHES` (max 64) |
-| Daemon socket, dispatch queue wait | 5 s, then terminal `-32002` with `queue_wait_ms` | `GORTEX_MCP_DISPATCH_QUEUE_WAIT` (Go duration, max 30 s; `0`/`off` restores the instant refusal) |
+| Daemon socket and HTTP `/mcp`, shared concurrent dispatches | 8 | `GORTEX_MCP_MAX_CONCURRENT_DISPATCHES` (max 64) |
+| Daemon socket and HTTP `/mcp`, tool dispatch queue wait | Up to 5 s, clamped to the request deadline minus 100 ms; terminal `-32002` includes `queue_wait_ms` and `retry_after_ms` | `GORTEX_MCP_DISPATCH_QUEUE_WAIT` (Go duration, max 30 s; `0`/`off` restores the instant refusal) |
 | Control RPC (`daemon status` / `search_symbols` / `proxy`) | 30 s, terminal `timeout` | — |
 | Control RPC (`shutdown`) | unbounded on the daemon — the store flush precedes the ack. `gortex daemon stop` bounds its own wait at 30 s, then watches the process for up to 2 min and force-kills | — |
 | Control RPC (`track` / `untrack` / `reload` / `enrich_*`) | unbounded by design | — |
 
-When every dispatch slot is busy, a request waits up to the queue budget for
-one; at most 16× the dispatch cap may wait, and the wait counts against the
-request timeout. A source edit gives its slot back while it waits for its graph
-refresh to publish, so editing agents do not hold slots that other requests
-need.
+MCP tool calls to the daemon, over its socket or `/mcp`, share three admission
+lanes. REST `/v1/tools/<name>` calls run their handlers directly and are not
+admitted through these lanes. Mutating calls have two reserved slots and can
+also use free shared slots. Slow calls (`outline`, `dead_code`
+and analysis) hold at most two slots; other calls use the fast lane. Free slots
+serve queued mutating calls first, then fast, then slow. Sessions take turns
+within each lane; a session holding four slots yields to another waiting
+session. For small cap overrides, the reservation is `min(2, cap-1)` and the
+slow limit is `min(2, cap-reservation)`, so cap 1 remains usable.
+
+Each lane permits at most 16× the total dispatch cap to wait. Queue time counts
+against the request timeout, leaving 100 ms for a refusal to reach the client.
+Busy replies are retryable and include `retry_after_ms`, estimated from the
+lane's observed drain rate and clamped to 100–5,000 ms (1 s before observations).
+An edit that waits for graph publication returns mutation capacity before
+entering the slow lane, and stops queueing for it once publication lands: a
+finished publication never waits for a slot. If slow admission fails after the
+disk commit, the edit returns its pending receipt instead of a retryable busy
+refusal.
+
+Cancellation returns logical lane capacity within 100 ms while the process
+has room in its four-handler draining allowance. Abandoned handlers, including
+inner tool handlers whose middleware has already returned, stay counted until
+they actually return. When all four drains are occupied, further cancelled
+handlers remain capacity-charged; physical dispatcher work stays bounded by
+the configured cap plus four. Initialization (`initialize` or `server/discover`)
+and notifications share total capacity but are exempt from tool reservations;
+notifications wait without a queue budget. `notifications/cancelled` takes no
+slot on either transport, so a full pool cannot hold back the cancellation that
+frees it. `subscriptions/listen` stays unbounded and consumes no dispatch slot.
+
+Daemon status exposes `mcp_dispatch`: lane in-flight, queued, draining and
+cancelled-but-held counts, refusals, reserved-slot use and queue-wait histograms
+for admitted, refused and cancelled calls. Histogram buckets are disjoint
+upper bounds in milliseconds and include zero-wait admissions. The metrics
+surface reports the corresponding `views_mcp_dispatch_*` series without
+session or request identifiers.
 
 The handler bound fires just inside any deadline the transport already imposed,
 so the client receives the tool-shaped diagnosis rather than an opaque transport

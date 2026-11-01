@@ -41,8 +41,10 @@ func setupMultiRepoStatsServer(t *testing.T) *Server {
 
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err)
+	}
 	require.True(t, mi.IsMultiRepo())
 
 	eng := query.NewEngine(g)
