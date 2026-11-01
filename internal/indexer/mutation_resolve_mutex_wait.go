@@ -25,8 +25,10 @@ type mutationResolveMutexEvidence struct {
 	invalid, incomplete      bool
 }
 
+// Only the existing canonical physical P identity may own this diagnostic.
+// The separate read-repair collector intentionally has no such ticket/origin.
 func (s *PublicationStamps) mutationResolveMutexObserver() func(time.Time, time.Time) {
-	if s == nil || s.patchLaps == nil {
+	if s == nil || s.patchLaps == nil || s.patchLaps.ticket == 0 || s.patchLaps.origin.IsZero() {
 		return nil
 	}
 	return s.observeMutationResolveMutexWait

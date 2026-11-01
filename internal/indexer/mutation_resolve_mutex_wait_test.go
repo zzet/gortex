@@ -8,8 +8,17 @@ import (
 	"time"
 )
 
+func mutationMutexFixture(t *testing.T) (*PublicationPhaseRecord, *PublicationStamps, time.Time) {
+	t.Helper()
+	record, stamps, origin := scalarPatchFixture(t)
+	// Bind through the production collector factory, never a synthetic R owner.
+	stamps = record.newCanonicalPatchStamps()
+	stamps.markAt(PublicationPatchExecutionStarted, origin.Add(2*time.Millisecond))
+	return record, stamps, origin
+}
+
 func TestMutationResolveMutexSubsetAggregatesWithoutChangingPatchLaps(t *testing.T) {
-	r, s, origin := scalarPatchFixture(t)
+	r, s, origin := mutationMutexFixture(t)
 	at := func(ms int) time.Time { return origin.Add(time.Duration(ms) * time.Millisecond) }
 	span := s.beginPatchLapAt(patchResolve, at(3))
 	before := s.patchLaps.laps
@@ -59,7 +68,7 @@ func TestMutationResolveMutexSubsetAggregatesWithoutChangingPatchLaps(t *testing
 func TestMutationResolveMutexSubsetRejectsWrongSpanWithoutPoisoningAccounting(t *testing.T) {
 	for _, kind := range []string{"before", "after", "backwards", "wrong_lap"} {
 		t.Run(kind, func(t *testing.T) {
-			r, s, origin := scalarPatchFixture(t)
+			r, s, origin := mutationMutexFixture(t)
 			at := func(ms int) time.Time { return origin.Add(time.Duration(ms) * time.Millisecond) }
 			lap := patchResolve
 			if kind == "wrong_lap" {
@@ -96,10 +105,10 @@ func TestMutationResolveMutexSubsetRejectsWrongSpanWithoutPoisoningAccounting(t 
 
 func TestMutationResolveMutexSubsetNilAndZeroCompatibility(t *testing.T) {
 	var absent *PublicationStamps
-	if absent.mutationResolveMutexObserver() != nil || (&PublicationStamps{}).mutationResolveMutexObserver() != nil {
+	if absent.mutationResolveMutexObserver() != nil || (&PublicationStamps{}).mutationResolveMutexObserver() != nil || (&PublicationStamps{patchLaps: &canonicalPatchLaps{}}).mutationResolveMutexObserver() != nil {
 		t.Fatal("unobserved execution allocated callback")
 	}
-	r, s, origin := scalarPatchFixture(t)
+	r, s, origin := mutationMutexFixture(t)
 	at := func(ms int) time.Time { return origin.Add(time.Duration(ms) * time.Millisecond) }
 	span := s.beginPatchLapAt(patchResolve, at(3))
 	span.endAt(at(7))
@@ -109,7 +118,7 @@ func TestMutationResolveMutexSubsetNilAndZeroCompatibility(t *testing.T) {
 	if r.Snapshot().EditTimings().Window.ResolveMutexWait != nil {
 		t.Fatal("missing observer became measured zero")
 	}
-	r, s, origin = scalarPatchFixture(t)
+	r, s, origin = mutationMutexFixture(t)
 	span = s.beginPatchLapAt(patchResolve, at(3))
 	s.mutationResolveMutexObserver()(at(4), at(4))
 	span.endAt(at(7))
