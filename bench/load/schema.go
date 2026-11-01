@@ -45,10 +45,11 @@ func schemaFor(t reflect.Type) map[string]any {
 		for i := range t.NumField() {
 			field := t.Field(i)
 			name := strings.Split(field.Tag.Get("json"), ",")[0]
+			if field.PkgPath != "" || name == "-" {
+				continue
+			}
 			properties[name] = schemaFor(field.Type)
-			// Only this new optional Workload extension is omitted. Historical
-			// required lists, including existing omitempty fields, stay intact.
-			if t != reflect.TypeFor[Workload]() || field.Name != "PRSmokeDrain" {
+			if !strings.Contains(field.Tag.Get("json"), ",omitempty") {
 				required = append(required, name)
 			}
 		}

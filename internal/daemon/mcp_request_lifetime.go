@@ -284,8 +284,10 @@ type mcpDispatchCompletionOwner struct {
 // mcpDispatchSlotLease lets the handler running a dispatch give its slot back
 // before it returns.
 type mcpDispatchSlotLease struct {
-	mu    sync.Mutex
-	grant *mcpDispatchSlotGrant // the attached dispatch's release; nil when none
+	mu           sync.Mutex
+	grant        *mcpDispatchSlotGrant // the attached dispatch's release; nil when none
+	timing       MCPDispatchTiming     // immutable original admission, guarded by mu
+	requestIDKey string                // immutable validated wire key, assigned before dispatch
 }
 
 // mcpDispatchSlotGrant carries one dispatch's slot release. Its address
@@ -334,7 +336,11 @@ func mcpDispatchSlotsForContext(ctx context.Context) chan struct{} {
 // withMCPDispatchSlotLease gives one request an empty lease. A dispatch that
 // takes a slot attaches its release to the lease while its handler runs.
 func withMCPDispatchSlotLease(ctx context.Context) context.Context {
-	return context.WithValue(ctx, mcpDispatchSlotLeaseContextKey{}, &mcpDispatchSlotLease{})
+	return withMCPDispatchSlotLeaseForRequest(ctx, "")
+}
+
+func withMCPDispatchSlotLeaseForRequest(ctx context.Context, requestIDKey string) context.Context {
+	return context.WithValue(ctx, mcpDispatchSlotLeaseContextKey{}, &mcpDispatchSlotLease{requestIDKey: requestIDKey})
 }
 
 func mcpDispatchSlotLeaseForContext(ctx context.Context) *mcpDispatchSlotLease {
@@ -546,6 +552,8 @@ func dispatchMCPWithContext(ctx context.Context, dispatch func() ([]byte, error)
 		signalMCPDispatchAdmission(ctx)
 		return dispatch()
 	}
+	lease := mcpDispatchSlotLeaseForContext(ctx)
+	timing := lease.beginTiming()
 	pool := mcpSchedulerFor(mcpDispatchSlotsForContext(ctx))
 	info := mcpDispatchRequestForContext(ctx)
 	var scheduled *mcpScheduledGrant
@@ -559,6 +567,7 @@ func dispatchMCPWithContext(ctx context.Context, dispatch func() ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
+	timing.granted()
 	if err := ctx.Err(); err != nil {
 		scheduled.complete()
 		signalMCPDispatchAdmission(ctx)
@@ -566,7 +575,6 @@ func dispatchMCPWithContext(ctx context.Context, dispatch func() ([]byte, error)
 	}
 	result := make(chan mcpDispatchResult, 1)
 	started := make(chan struct{})
-	lease := mcpDispatchSlotLeaseForContext(ctx)
 	var grant *mcpDispatchSlotGrant
 	go func() {
 		grant = lease.attach(func() { scheduled.releaseEarly() })
@@ -746,7 +754,7 @@ func serveMCPConnectionWithHooks(conn net.Conn, reader *bufio.Reader, timeout ti
 		requestID := append(json.RawMessage(nil), responseID...)
 		admission := newMCPDispatchAdmission()
 		requestCtx = prepareMCPDispatchContext(requestCtx, sessionID, envelope, classifier)
-		dispatchCtx := withMCPDispatchSlotLease(withMCPDispatchAdmission(requestCtx, admission))
+		dispatchCtx := withMCPDispatchSlotLeaseForRequest(withMCPDispatchAdmission(requestCtx, admission), entry.key)
 		requests.Add(1)
 		go func() {
 			defer requests.Done()
