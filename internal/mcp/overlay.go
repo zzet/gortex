@@ -466,6 +466,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// (momentum.go). No-op for non-read tools and error results.
 		if hErr == nil {
 			res = s.maybeAttachMomentumNote(ctx, req.Params.Name, res)
+			if _, reserved := ctx.Value(toolFreshnessBudgetKey{}).(int); reserved {
+				res = fitToolFreshnessBudget(ctx, req, res)
+			}
 		}
 		return res, hErr
 	}))
