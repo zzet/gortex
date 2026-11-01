@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/indexer"
 )
 
 func TestVerifyChangeNeverBareCleanWhilePending(t *testing.T) {
@@ -146,6 +148,38 @@ func TestRenameNeverWritesPendingDefinitionOrKnownCaller(t *testing.T) {
 				callerAfter, err := os.ReadFile(filepath.Join(root, "caller.go"))
 				require.NoError(t, err)
 				require.Equal(t, callerBefore, callerAfter)
+			}
+		})
+	}
+}
+
+// Native watcher evidence must flow through the same producer and mutation
+// safety checks as tool-write receipts, including files with no graph rows.
+func TestRenameNativeTierGapIsProvisionalAndNeverWritten(t *testing.T) {
+	for _, file := range []string{"namer.go", "caller.go", "target.go"} {
+		t.Run(file, func(t *testing.T) {
+			s, root := newRelationFixture(t)
+			text := "package p\nfunc Namer() { Target() }\n"
+			switch file {
+			case "caller.go":
+				text = "package p\nfunc Caller() { Target(); Target() }\n"
+			case "target.go":
+				text = "package p\nfunc Target() {} // native edit\n"
+			}
+			path := writeUnindexed(t, root, file, text)
+			s.SetWatcher(&watchedTierFixture{paths: map[string]indexer.MutationTierState{
+				path: {Generation: 7, AckAt: time.Now()},
+			}})
+			payload := lifecycleResultPayload(t, callChangeTool(t, s.handleRenameSymbol, "rename_symbol", map[string]any{
+				"id": targetID(t, s), "new_name": "Renamed", "format": "json",
+			}))
+			require.Equal(t, "pending", payload["graph_freshness"])
+			current, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, text, string(current), "native pending source must never be an automatic rename target")
+			require.Greater(t, payload["provisional_site_count"], float64(0))
+			if file == "target.go" {
+				require.Equal(t, false, payload["written"])
 			}
 		})
 	}
