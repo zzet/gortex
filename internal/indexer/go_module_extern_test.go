@@ -153,8 +153,17 @@ func Caller() { library.Hello(); child.Nested() }
 					}
 				case "parallel":
 					errors := make(chan error, len(repos))
+					// This is a module-binding test, not an identity-admission
+					// saturation test. The decoy case has three roots; retain
+					// parallel tracking within the two native observation slots.
+					admitted := make(chan struct{}, 2)
 					for _, entry := range repos {
-						go func() { _, e := mi.TrackRepoCtx(context.Background(), entry); errors <- e }()
+						go func() {
+							admitted <- struct{}{}
+							defer func() { <-admitted }()
+							_, e := mi.TrackRepoCtx(context.Background(), entry)
+							errors <- e
+						}()
 					}
 					for range repos {
 						require.NoError(t, <-errors)
