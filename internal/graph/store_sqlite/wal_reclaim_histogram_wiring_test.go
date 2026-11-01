@@ -16,8 +16,12 @@ func TestWALReclaimRealFinalWritersRecordHistograms(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			s, db := finalBackfillFixture(t)
 			before := s.writeMu.reclaimHold.snapshot()
-			s.writeMu.Lock()
-			s.writeMu.Unlock()
+			func() {
+				s.writeMu.Lock()
+				defer s.writeMu.Unlock()
+				_, err := s.writerDB.ExecContext(t.Context(), `UPDATE wal_churn SET rowid=rowid WHERE rowid=1`)
+				require.NoError(t, err)
+			}()
 			require.Equal(t, before.Count(), s.writeMu.reclaimHold.snapshot().Count(), "an ordinary writer must not be attributed to reclaim")
 
 			res := &walReclaimResult{}
