@@ -24,6 +24,11 @@ type smokeSequenceReceipt struct {
 }
 
 func collectSmokeSequence(ctx context.Context, c laneConfig, p policy, plan lanePlan, out string, stdout io.Writer, process laneProcess) error {
+	warm, err := smokeWarmBudget(ctx)
+	if err != nil {
+		return err
+	}
+	c.WarmTimeout = warm.String()
 	if err := validateLaneOutput(c.Manifest, out); err != nil {
 		return err
 	}
@@ -73,6 +78,23 @@ func collectSmokeSequence(ctx context.Context, c laneConfig, p policy, plan lane
 		index.Runs = append(index.Runs, runInput{Role: task.Role, HostClass: hostedSmokeClass, Scenario: task.Scenario, Repeat: task.Repeat, Report: task.Report})
 	}
 	return finishLaneEvidence(c, p, plan, out, stdout, receipt, index, failures)
+}
+
+// The PR entry owns the aggregate deadline. Each strict readiness gate may use
+// its remaining budget; it must not introduce an unrelated cold-start cutoff.
+func smokeWarmBudget(ctx context.Context) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0, errors.New("smoke readiness requires its parent measurement deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0, context.DeadlineExceeded
+	}
+	return min(remaining, 13*time.Minute), nil
 }
 
 func validateSmokeSequence(s smokeSequenceReceipt, plan lanePlan, started, finished time.Time) error {
