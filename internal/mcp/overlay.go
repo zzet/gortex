@@ -96,6 +96,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 	// leaf handler — the overlay build, the freshness sweep, and the response
 	// capture below all touch the graph and can block on the same locks.
 	return s.boundToolHandler(s.retryFreshSymbolSearch(func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+		s.noteAcknowledgementMiddleware(ctx)
 		// The instant the call entered the middleware: the origin a mutation's
 		// or a fresh request's publication phases are measured from.
 		ctx = withToolReceivedAt(ctx, time.Now())
@@ -353,7 +354,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withContractCoreReadErrors(ctx)
 		}
 		indexer.StampPublicationPhase(ctx, indexer.PublicationHandlerStarted)
-		res, hErr := h(ctx, req)
+		res, hErr := s.invokeAcknowledgedLeaf(ctx, req, h)
 		if hErr == nil && res != nil && !res.IsError && lateExactnessRefusalIsSafe(req.Params.Name) {
 			if err := contractCoreReadError(ctx); err != nil {
 				res = mcp.NewToolResultError(err.Error())

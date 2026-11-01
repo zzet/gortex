@@ -233,13 +233,15 @@ func TestSymbolRepoSparseMembershipAdmissionAndSingleCursor(t *testing.T) {
 			scatterRepoMembershipRow(t, s, fmt.Sprintf("owned-%04d", count-2))
 			match := s.buildFTSMatch("needle", true)
 			got, handled, err := s.searchSymbolRepoSpanPlan(t.Context(), match, "repo", 5)
-			if err != nil || handled != (count == 1024) || (handled && len(got) != 5) || (!handled && got != nil) {
+			if err != nil || !handled || len(got) != 5 {
 				t.Fatalf("count=%d handled=%v err=%v got=%v", count, handled, err, got)
 			}
+			// An overflowing ownership set ranks inside its run instead of
+			// declining; both answers equal the unbounded stream.
 			want := unboundedSingleGeneration(t, s, 0, "needle", []string{"repo"}, 5)
 			public, err := s.SearchSymbolsRepoScopedContext(t.Context(), "needle", []string{"repo"}, 5)
-			if err != nil || !reflect.DeepEqual(public, want) {
-				t.Fatalf("overflow fallback err=%v got=%v want=%v", err, public, want)
+			if err != nil || !reflect.DeepEqual(public, want) || !reflect.DeepEqual(got, want) {
+				t.Fatalf("count=%d err=%v public=%v got=%v want=%v", count, err, public, got, want)
 			}
 			if count != 1024 {
 				return

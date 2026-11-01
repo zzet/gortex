@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -484,4 +485,66 @@ func TestSearchText_Regexp(t *testing.T) {
 	bad := callTool(t, srv, "search_text",
 		map[string]any{"query": "func Handle(", "regexp": true})
 	require.True(t, bad.IsError)
+}
+
+// A repo-scoped search_text greps only the scoped repository and attributes
+// each hit through point reads of its own file, so repositories sharing the
+// marker, the file path and the enclosing symbol's name change neither the
+// matches nor what was read to attribute and enrich them.
+func TestSearchTextScopedNeverScansAndRowsStayFlat(t *testing.T) {
+	const body = "package svc\n\nfunc Handle() {\n\t// shared_scope_marker one\n\t// shared_scope_marker two\n}\n"
+	serve := func(t *testing.T, repos int) (*Server, *scopedReadCounter) {
+		gc := &config.GlobalConfig{}
+		for i := range repos {
+			name := "alpha"
+			if i > 0 {
+				name = fmt.Sprintf("unrelated%d", i)
+			}
+			gc.Repos = append(gc.Repos, config.RepoEntry{Path: setupSearchTextWorkspaceRepo(t, name, "shared", body), Name: name, Project: "backend"})
+		}
+		gc.SetConfigPath(filepath.Join(t.TempDir(), "config.yaml"))
+		require.NoError(t, gc.Save())
+		cm, err := config.NewConfigManager(gc.ConfigPath())
+		require.NoError(t, err)
+		reg := parser.NewRegistry()
+		reg.Register(languages.NewGoExtractor())
+		counter := newScopedReadCounter(openContractCoreCapStore(t))
+		mi := indexer.NewMultiIndexer(counter, reg, search.NewNull(), cm, zap.NewNop())
+		registerMCPFixtureRepos(t, mi, cm)
+		srv := NewServer(query.NewEngine(counter), counter, nil, nil, zap.NewNop(), nil, MultiRepoOptions{ConfigManager: cm, MultiIndexer: mi})
+		installContractCoreKindTestRuntime(t, srv)
+		return srv, counter
+	}
+	for _, regexp := range []bool{false, true} {
+		t.Run(fmt.Sprintf("regexp=%v", regexp), func(t *testing.T) {
+			args := map[string]any{"query": "shared_scope_marker", "repo": "alpha"}
+			if regexp {
+				args["query"], args["regexp"] = "shared_scope_marker (one|two)", true
+			}
+			var baseline string
+			var baselineRows map[string]int
+			for _, repos := range []int{1, 6} {
+				srv, counter := serve(t, repos)
+				counter.reset()
+				payload := scopedRowCall(t, srv, srv.handleSearchText, t.Context(), "search_text", args)
+				require.Empty(t, counter.scans(), "a scoped search read the whole store")
+				if repos == 1 {
+					var out struct {
+						Matches []enrichedTextMatch `json:"matches"`
+					}
+					require.NoError(t, json.Unmarshal([]byte(payload), &out))
+					require.Len(t, out.Matches, 2)
+					for _, match := range out.Matches {
+						require.Equal(t, "alpha/main.go", match.Path)
+						require.Equal(t, "Handle", match.SymbolName, "every hit is attributed to its enclosing function")
+					}
+					baseline, baselineRows = payload, counter.rows()
+					require.NotEmpty(t, baselineRows)
+					continue
+				}
+				require.JSONEq(t, baseline, payload, "unrelated repositories changed the scoped matches")
+				require.Equal(t, baselineRows, counter.rows(), "unrelated repositories changed the rows a scoped search read")
+			}
+		})
+	}
 }

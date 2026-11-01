@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 
 	"go.uber.org/zap"
 	"golang.org/x/mod/modfile"
@@ -2404,6 +2405,18 @@ func (mi *MultiIndexer) RefreshRepoConfigs() int {
 // directories; otherwise the whole repo root is scanned. Returns an
 // error when the prefix is not a tracked repo.
 func (mi *MultiIndexer) IncrementalReindexRepo(repoPrefix string, paths []string) (*IndexResult, error) {
+	return mi.IncrementalReindexRepoObserved(repoPrefix, paths, nil)
+}
+
+// IncrementalReindexRepoObserved retains the ordinary reconciliation behavior.
+// Observation belongs to the executed coordinator drain, not the reader RPC.
+func (mi *MultiIndexer) IncrementalReindexRepoObserved(repoPrefix string, paths []string, observer *ReadRepairObserver) (*IndexResult, error) {
+	var request *repositoryReadRepairRequest
+	if observer != nil && observer.Complete != nil {
+		request = &repositoryReadRepairRequest{
+			session: observer.Session, requestIDKey: observer.RequestIDKey, complete: observer.Complete,
+		}
+	}
 	for attempt := 0; attempt < 3; attempt++ {
 		mi.mu.RLock()
 		meta, ok := mi.repos[repoPrefix]
@@ -2424,7 +2437,7 @@ func (mi *MultiIndexer) IncrementalReindexRepo(repoPrefix string, paths []string
 		if !current {
 			continue
 		}
-		result, err := coordinator.reconcile(context.Background(), canonical)
+		result, err := coordinator.reconcileObserved(context.Background(), canonical, request)
 		if err == errRepositoryMutationCoordinatorClosed {
 			continue
 		}
@@ -2480,9 +2493,14 @@ func (mi *MultiIndexer) incrementalDiscoverRepoRaw(repoPrefix string, paths []st
 // full shared resolver, semantic, metadata, and precise derived tail without
 // submitting back into a coordinated public API.
 func (mi *MultiIndexer) incrementalPointRepoRaw(repoPrefix, path string) (*IndexResult, error) {
+	return mi.incrementalPointRepoRawObserved(repoPrefix, path, nil)
+}
+
+func (mi *MultiIndexer) incrementalPointRepoRawObserved(repoPrefix, path string, stamps *PublicationStamps) (*IndexResult, error) {
 	return mi.incrementalReindexRepoRawMode(repoPrefix, []string{path}, incrementalPathMode{
 		detectDeletions:    true,
 		forceExplicitFiles: true,
+		publication:        stamps,
 	})
 }
 
@@ -2555,6 +2573,9 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	if idx == nil {
 		return nil, fmt.Errorf("repository mutation executor has no live indexer: %s", repoPrefix)
 	}
+	if mode.readRepair != nil {
+		mode.readRepair.owner = weak.Make(idx)
+	}
 
 	// Refresh the producer under its already-held repository lane. A watcher
 	// admission refresh alone would still leave unignored source excluded by
@@ -2566,7 +2587,9 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	// The stable per-repository lane is held before this executor runs. Take
 	// the global reachability topology gate second and keep it through the
 	// resolver, metadata, and derived tails to avoid lane/gate inversion.
+	gate := mode.publication.beginPatchLap(patchGateWait)
 	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
+	gate.end()
 	topologyChanged := true
 	defer func() { finishTopologyMutation(topologyChanged) }()
 
@@ -2592,6 +2615,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 		repoPrefix, result, receipt, batch, mode.exactPointSemantic,
 	)
 
+	mtimes := mode.publication.beginPatchLap(patchMtimes)
 	fileMtimes := idx.publishFileMtimes()
 	mi.mu.Lock()
 	mi.repos[repoPrefix] = &RepoMetadata{
@@ -2613,11 +2637,14 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 		IsWorktree: meta.IsWorktree,
 	}
 	mi.mu.Unlock()
+	mtimes.end()
 
 	idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
+	derived := mode.publication.beginDerivedPatchLap()
 	mi.runIncrementalDerivedPassesWithPriorTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{
 		repoPrefix: result.DerivedInvalidation,
 	}, result.capabilityPrior)
+	derived.endDerived()
 
 	topologyChanged = incrementalTopologyChanged(result)
 	return result, nil

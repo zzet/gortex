@@ -20,23 +20,24 @@ type pairedState struct {
 }
 
 type pairedCoordinator struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	options    runOptions
-	labels     []string
-	group      string
-	mu         sync.Mutex
-	states     []*pairedState
-	registered int
-	started    bool
-	finished   bool
-	err        error
-	firstReady chan struct{}
-	done       chan struct{}
-	orders     map[string]uint64
-	records    []pairedRecord
-	window     measurementWindow
-	metrics    map[string]Metric
+	ctx               context.Context
+	cancel            context.CancelFunc
+	options           runOptions
+	labels            []string
+	group             string
+	mu                sync.Mutex
+	states            []*pairedState
+	registered        int
+	started           bool
+	finished          bool
+	err               error
+	firstReady        chan struct{}
+	done              chan struct{}
+	orders            map[string]uint64
+	records           []pairedRecord
+	window            measurementWindow
+	metrics           map[string]Metric
+	editContinuations sync.WaitGroup // owned own-ACK readback/status continuations
 }
 
 func newPairedCoordinator(ctx context.Context, o runOptions, labels []string, group string) (*pairedCoordinator, error) {
@@ -128,6 +129,21 @@ func (c *pairedCoordinator) execute() {
 			}
 		}
 	}
+	if base.phase.Name == editProbeScenario {
+		if result = c.preparePairedEditProbe(); result != nil {
+			return
+		}
+	}
+	budget := c.options.Duration
+	switch base.phase.Name {
+	case "sweep":
+		budget = c.options.SweepBudget
+	case editProbeScenario:
+		budget, result = base.phase.editProbeRuntime.plan.budget(c.options.Deadline, len(c.states))
+		if result != nil {
+			return
+		}
+	}
 	samplers := make([]processSampler, len(c.states))
 	monitors := make([]*phaseMonitor, len(c.states))
 	for i, state := range c.states {
@@ -141,15 +157,14 @@ func (c *pairedCoordinator) execute() {
 		groupBefore = cgroupMetrics(c.group, os.Getpagesize())
 	}
 	c.window = measurementWindow{Started: time.Now(), Method: "coupled native back-to-back requests; process counters bracket the common group window; per-build sample endpoints retained"}
-	budget := c.options.Duration
-	if base.phase.Name == "sweep" {
-		budget = c.options.SweepBudget
-	}
 	ctx, cancel := context.WithTimeout(c.ctx, budget)
 	defer cancel()
-	if base.phase.Name == "sweep" {
+	switch base.phase.Name {
+	case "sweep":
 		result = c.sweep(ctx)
-	} else {
+	case editProbeScenario:
+		result = c.editProbes(ctx)
+	default:
 		result = c.agents(ctx)
 	}
 	c.window.Ended = time.Now()
@@ -185,14 +200,18 @@ func (c *pairedCoordinator) execute() {
 		} else {
 			state.phase.Gate["paired_measurement_window"] = data
 		}
-		finishEditMetrics(state.phase)
+		if state.phase.EditProbe == nil {
+			finishEditMetrics(state.phase)
+		}
 	}
 }
 
 type pairedCallResult struct {
-	data   json.RawMessage
-	err    error
-	sample pairedSample
+	data     json.RawMessage
+	err      error
+	sample   pairedSample
+	identity wireCallIdentity
+	pending  bool
 }
 
 func (c *pairedCoordinator) callAcross(ctx context.Context, r request, repoIndex, agent, step, slot int, role string, timeout time.Duration, sweepIndex int) map[string]pairedCallResult {
@@ -203,6 +222,9 @@ func (c *pairedCoordinator) callAcrossWithEnds(ctx context.Context, r request, r
 	baseRepo := c.states[0].p.Repos[repoIndex]
 	hash, hashErr := hashJSON(r)
 	tuple := requestTuple{Tool: r.name(), Role: role, Repo: baseRepo.Corpus.Label, Commit: baseRepo.Corpus.Commit, Agent: agent, Step: step, Slot: slot, RequestHash: hash}
+	if r.ExpectedAbsentSymbol != "" {
+		tuple.ExpectedOutcome = "symbol_absent"
+	}
 	c.mu.Lock()
 	category := role + "." + r.name()
 	tuple.Ordinal = c.orders[category]
@@ -222,7 +244,17 @@ func (c *pairedCoordinator) callAcrossWithEnds(ctx context.Context, r request, r
 		sample := pairedSample{Repo: repo.Corpus.Label, Commit: repo.Corpus.Commit, RequestHash: hash, Started: time.Now(), Latency: unavailable("ms", "request was not dispatched"), Outcome: "phase_censored"}
 		var data json.RawMessage
 		var rows []Attempt
+		var identity wireCallIdentity
+		var editCall pairedEditProbeCall
 		err := hashErr
+		if runtime := state.phase.editProbeRuntime; runtime != nil {
+			var prepareErr error
+			editCall, prepareErr = runtime.preparePairedCall(ctx, role, step, slot)
+			if prepareErr != nil {
+				err = errors.Join(err, prepareErr)
+				c.abort(prepareErr)
+			}
+		}
 		budget := timeout
 		if end, ok := ends[label]; ok {
 			budget = time.Until(end)
@@ -238,28 +270,49 @@ func (c *pairedCoordinator) callAcrossWithEnds(ctx context.Context, r request, r
 			}
 			sample.Latency = unavailable("ms", "visibility deadline elapsed before probe dispatch")
 		} else if err == nil && ctx.Err() == nil {
-			client := state.clients[agent]
-			if sweepIndex >= 0 {
-				client = state.sweepClients[sweepIndex]
+			if editCall.runtime != nil {
+				data, identity, rows, err = editCall.perform(r, role, slot)
+			} else {
+				client := state.clients[agent]
+				if sweepIndex >= 0 {
+					client = state.sweepClients[sweepIndex]
+				}
+				data, rows, err = callTool(ctx, client, r, dispatchArgs(r, repo), role, agent, step, slot, budget, waitContext)
 			}
-			data, rows, err = callTool(ctx, client, r, dispatchArgs(r, repo), role, agent, step, slot, budget, waitContext)
 			if len(rows) > 0 {
 				last := rows[len(rows)-1]
 				sample.Outcome, sample.Code, sample.Error = last.Outcome, last.Code, last.Error
+				sample.ExpectedOutcome = last.ExpectedOutcome
 				sample.Latency = measured(last.LogicalMS, "ms")
 			}
 		} else if err == nil {
 			err = ctx.Err()
 		}
+		if editCall.runtime != nil && err != nil && sample.Outcome == "success" {
+			// Logical evidence persistence may fail after a genuine RPC reply.
+			// Retain its endpoint, but never use incomplete evidence in ratios.
+			sample.Outcome = "error"
+			if errors.Is(err, errEditProbeEvidenceIncomplete) {
+				sample.Outcome = "harness_incomplete"
+			}
+		}
 		if err != nil && sample.Error == "" {
 			sample.Error = err.Error()
 		}
 		sample.Ended = time.Now()
+		if !identity.Finished.IsZero() {
+			sample.Ended = identity.Finished
+		}
+		// Start this build's own-ACK continuation before the loop awaits the
+		// partner response. Its readbacks/status remain explicitly unpaired.
+		editCall.continueAfterACK(c, data, identity, err)
 		record.Samples[label] = sample
-		results[label] = pairedCallResult{data: data, err: err, sample: sample}
-		c.mu.Lock()
-		state.phase.Attempts = append(state.phase.Attempts, rows...)
-		c.mu.Unlock()
+		results[label] = pairedCallResult{data: data, err: err, sample: sample, identity: identity, pending: editCall.pending}
+		if editCall.runtime == nil { // editProbe.perform already owns its attempt append.
+			c.mu.Lock()
+			state.phase.Attempts = append(state.phase.Attempts, rows...)
+			c.mu.Unlock()
+		}
 	}
 	c.mu.Lock()
 	c.records = append(c.records, record)

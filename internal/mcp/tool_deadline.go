@@ -17,6 +17,7 @@ import (
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
@@ -150,6 +151,7 @@ func boundHandler[Req, Res any](
 		// keep it pinned — and say what it is holding — if it ever stops
 		// waiting for the handler that is reading it.
 		callCtx, viewNote := withRetainedViewNote(callCtx)
+		callCtx = daemon.WithMCPDispatchCompletionOwner(callCtx)
 
 		type outcome struct {
 			res Res
@@ -189,6 +191,10 @@ func boundHandler[Req, Res any](
 		case got := <-done:
 			return got.res, got.err
 		case <-callCtx.Done():
+			// The outer dispatch may return before this inner handler. Carry
+			// its unfinished physical work through the daemon's bounded drain
+			// accounting, rather than releasing it when this firewall returns.
+			releaseDispatch := daemon.RetainMCPDispatchCompletion(callCtx)
 			if ctx.Err() != nil {
 				// The *caller* went away (client cancelled, or the transport's
 				// own request lifetime fired first). Report that, not a
@@ -221,10 +227,13 @@ func boundHandler[Req, Res any](
 				// refusing everyone else's calls; the lifetime hole is the
 				// pin, and the pin is what this fixes.
 				retained := viewNote.retain()
-				if retained != nil {
+				if retained != nil || releaseDispatch != nil {
 					go func() {
 						<-done
 						retained.release()
+						if releaseDispatch != nil {
+							releaseDispatch()
+						}
 					}()
 				}
 				var zero Res
@@ -242,6 +251,9 @@ func boundHandler[Req, Res any](
 			go func() {
 				<-done
 				retained.release()
+				if releaseDispatch != nil {
+					releaseDispatch()
+				}
 				abandonedToolCalls.Add(-1)
 			}()
 			if s != nil && s.logger != nil {
@@ -515,19 +527,43 @@ func abandonedToolMessage(name string, timeout time.Duration, verdict mutationCo
 
 func (s *Server) boundToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		name := req.Params.Name
-		return boundHandler(s, "tool", name, (func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error))(h),
-			func(stuck int64, timeout time.Duration) (*mcp.CallToolResult, error) {
-				return mcp.NewToolResultError(busyMessage("tool calls", stuck, timeout)), nil
-			},
-			func(timeout time.Duration, note *mutationCommitNote, retained *requestViewPin) (*mcp.CallToolResult, error) {
-				return mcp.NewToolResultError(abandonedToolMessage(name, timeout, note.verdict(), retained)), nil
-			},
-			func(r any) (*mcp.CallToolResult, error) {
-				return mcp.NewToolResultError(fmt.Sprintf("tool %q internal error: %v", name, r)), nil
-			},
-		)(ctx, req)
+		if s != nil && measuredSourceEdit(req) {
+			return s.runAcknowledgedEdit(ctx, req, h)
+		}
+		// The ordinary path has no mutation-only named returns, defer or
+		// closure captures. Reads do not create an observer or sample a clock.
+		return s.runBoundToolHandler(ctx, req, h)
 	}
+}
+
+func (s *Server) runAcknowledgedEdit(ctx context.Context, req mcp.CallToolRequest, h mcpserver.ToolHandlerFunc) (result *mcp.CallToolResult, err error) {
+	ctx, ack, owner := s.withEditAcknowledgement(ctx)
+	if owner {
+		defer func() { ack.finishReply(result, err) }()
+	}
+	actual := func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if owner {
+			defer ack.finishActual()
+		}
+		// Actual completion and its counters stay INSIDE the firewall.
+		return s.runMeasuredEditOperation(ctx, req, h)
+	}
+	return s.runBoundToolHandler(ctx, req, actual)
+}
+
+func (s *Server) runBoundToolHandler(ctx context.Context, req mcp.CallToolRequest, h mcpserver.ToolHandlerFunc) (*mcp.CallToolResult, error) {
+	name := req.Params.Name
+	return boundHandler(s, "tool", name, (func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error))(h),
+		func(stuck int64, timeout time.Duration) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultError(busyMessage("tool calls", stuck, timeout)), nil
+		},
+		func(timeout time.Duration, note *mutationCommitNote, retained *requestViewPin) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultError(abandonedToolMessage(name, timeout, note.verdict(), retained)), nil
+		},
+		func(r any) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultError(fmt.Sprintf("tool %q internal error: %v", name, r)), nil
+		},
+	)(ctx, req)
 }
 
 // addResource registers a resource with the same hang firewall tool calls get.
