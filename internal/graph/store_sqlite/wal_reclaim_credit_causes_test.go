@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -20,12 +21,15 @@ func (q badCreditSQL) QueryRowContext(ctx context.Context, _ string, _ ...any) *
 // Real checkpoint work reaches the owned child's admission exit. Errors from
 // the caller, finite SQL scope, custom withdrawal or SQL itself stay distinct.
 func TestWALOwnedCreditExpiryPreservesOperationAndSQLCauses(t *testing.T) {
-	for _, kind := range []string{"owned_credit", "unowned_credit", "parent_cancel", "parent_deadline", "parent_custom_deadline", "child_custom_deadline", "child_custom_cancel", "sql_deadline", "sql_error"} {
+	for _, kind := range []string{"owned_credit", "unowned_credit", "parent_cancel", "parent_deadline", "parent_custom_deadline", "child_custom_deadline", "child_wrapped_deadline", "child_custom_cancel", "sql_deadline", "sql_error"} {
 		t.Run(kind, func(t *testing.T) {
 			s, db := finalBackfillFixture(t)
 			stopStoreBackgroundReaders(s)
 			synctest.Test(t, func(t *testing.T) {
-				custom := errors.New("owned credit custom withdrawal")
+				custom := error(errors.New("owned credit custom withdrawal"))
+				if kind == "child_wrapped_deadline" {
+					custom = fmt.Errorf("custom withdrawal: %w", context.DeadlineExceeded)
+				}
 				parentBudget := 20 * time.Second
 				parentCause := error(context.DeadlineExceeded)
 				if kind == "parent_deadline" || kind == "parent_custom_deadline" {
@@ -39,7 +43,7 @@ func TestWALOwnedCreditExpiryPreservesOperationAndSQLCauses(t *testing.T) {
 				operation, cancelOperation := context.WithCancelCause(parent)
 				defer cancelOperation(context.Canceled)
 				childCause := error(context.DeadlineExceeded)
-				if kind == "child_custom_deadline" {
+				if kind == "child_custom_deadline" || kind == "child_wrapped_deadline" {
 					childCause = custom
 				}
 				child, stopChild := context.WithTimeoutCause(operation, 25*time.Millisecond, childCause)
@@ -117,7 +121,7 @@ func TestWALOwnedCreditExpiryPreservesOperationAndSQLCauses(t *testing.T) {
 					require.NoError(t, operation.Err())
 					require.ErrorIs(t, err, context.Canceled)
 					require.Same(t, custom, context.Cause(child))
-				case "child_custom_deadline":
+				case "child_custom_deadline", "child_wrapped_deadline":
 					require.NoError(t, operation.Err())
 					require.ErrorIs(t, err, context.DeadlineExceeded)
 					require.Same(t, custom, context.Cause(child))

@@ -51,6 +51,17 @@ func (w *walReclaimWriterCredit) resetContext(original context.Context) context.
 	return original
 }
 
+// admissionError classifies only a known owned credit/admission failure.
+// SQL failures never pass through this path, and both operation scopes must
+// still be live before a child deadline becomes the lost-credit refusal.
+// Sentinel identity is deliberate: a wrapped custom cause is not our timer.
+func (w *walReclaimWriterCredit) admissionError(creditCtx, operationCtx, sqlCtx context.Context, err error) error {
+	if w.readmitted && w.resetCtx != nil && creditCtx == w.resetCtx && operationCtx.Err() == nil && sqlCtx.Err() == nil && err == context.DeadlineExceeded && creditCtx.Err() == context.DeadlineExceeded && context.Cause(creditCtx) == context.DeadlineExceeded {
+		return errWALReclaimReadersInFlight
+	}
+	return err
+}
+
 // PASSIVE uses the separate checkpoint connection and never takes SQLite's
 // writer lock. Its WAL-copy/database-sync ordering is unchanged. Fast passes
 // retain a short writer gap so queued writes cannot starve reset admission;
@@ -154,7 +165,7 @@ func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *
 	if ctx.Err() != nil {
 		unused := allowance - w.spent
 		if w.readmitted || unused <= 0 || operationCtx.Err() != nil || !errors.Is(ctx.Err(), context.DeadlineExceeded) || !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
-			return result, ctx.Err()
+			return result, w.admissionError(ctx, operationCtx, opCtx, ctx.Err())
 		}
 		if demand := w.store.writeDemandCause(); w.yieldToWriters && demand != nil {
 			noteWALReclaimDemand(operationCtx, demand)
@@ -175,7 +186,7 @@ func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *
 		w.cancelReset = func() { stopYield(); cancel() }
 	}
 	if err := w.store.writeMu.LockContext(admissionCtx); err != nil {
-		return result, err
+		return result, w.admissionError(admissionCtx, operationCtx, opCtx, err)
 	}
 	w.since, w.held = time.Now(), true
 	if w.store.bulkConn != nil && !leaseOverride {
