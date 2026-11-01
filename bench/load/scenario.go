@@ -277,6 +277,11 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			return phase, nil, artifacts, crashes, "", errors.New("readiness has no actual repo prefix")
 		}
 	}
+	if observed, err := p.verifyDiscoveryCatalog(ctx); err != nil {
+		return phase, nil, artifacts, crashes, "", err
+	} else if observed != nil {
+		phase.Gate["resumed_catalog"] = observed
+	}
 	var clients []*socketClient
 	defer func() {
 		for _, client := range clients {

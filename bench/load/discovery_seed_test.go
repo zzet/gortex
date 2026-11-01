@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/indexer"
 )
 
 // This is only a byte-copy/parser fixture, deliberately not a real SQLite
@@ -45,12 +47,33 @@ func syntheticDiscoverySeed(t *testing.T) (runOptions, []Corpus, discoverySeedLi
 }
 func rewriteSyntheticDiscoveryProofs(t *testing.T, l *discoverySeedLineage) {
 	t.Helper()
-	proof := discoverySeedProof{State: "OBSERVED_OWNED_UPGRADE", ObservedAt: time.Now(), OwnedRoot: l.OwnedRoot, OwnerPID: l.OwnerPID, NormalStop: l.NormalStop, OwnersExited: l.OwnersExited, MainSHA256: l.MainSHA256, WALSHA256: l.WALSHA256, SchemaVersion: l.SchemaVersion, UpgradeBinarySHA256: l.UpgradeBinarySHA256, Repos: l.Repos}
+	catalogPath := filepath.Join(l.OwnedRoot, "synthetic-catalog.json")
+	var scopes []discoveryCatalogScope
+	for i := 0; i < 2; i++ {
+		repo := l.Repos[i]
+		family := indexer.FamilyOverview{FamilyID: fmt.Sprintf("synthetic-family-%d", i), CommonDir: repo.CommonDir, PrimaryRepoPrefix: repo.Repo.Prefix}
+		family.Graphs = []indexer.GraphOverview{{GraphID: fmt.Sprintf("synthetic-graph-%d", i), RepoPrefix: repo.Repo.Prefix, OwnerCheckoutID: fmt.Sprintf("synthetic-checkout-%d", i)}}
+		for j, row := range l.Repos {
+			if row.CommonDir != repo.CommonDir {
+				continue
+			}
+			checkout := indexer.CheckoutOverview{CheckoutID: fmt.Sprintf("synthetic-checkout-%d", j), Incarnation: fmt.Sprintf("synthetic-incarnation-%d", j), RootPath: row.Repo.Path}
+			if j == i {
+				checkout.GraphID = family.Graphs[0].GraphID
+			}
+			family.Checkouts = append(family.Checkouts, checkout)
+		}
+		scopes = append(scopes, discoveryCatalogScope{CWD: repo.Repo.Path, Overview: indexer.FamiliesOverview{Families: []indexer.FamilyOverview{family}}})
+	}
+	_ = os.Remove(catalogPath)
+	require.NoError(t, discoveryWriteJSON(catalogPath, discoveryCatalogReceipt{Before: scopes, After: scopes}))
+	catalogSHA, err := discoveryFileSHA(catalogPath)
+	require.NoError(t, err)
+	proof := discoverySeedProof{CatalogReceipt: catalogPath, CatalogReceiptSHA256: catalogSHA, State: "OBSERVED_OWNED_UPGRADE", ObservedAt: time.Now(), OwnedRoot: l.OwnedRoot, OwnerPID: l.OwnerPID, NormalStop: l.NormalStop, OwnersExited: l.OwnersExited, MainSHA256: l.MainSHA256, WALSHA256: l.WALSHA256, SchemaVersion: l.SchemaVersion, UpgradeBinarySHA256: l.UpgradeBinarySHA256, Repos: l.Repos}
 	for _, path := range []string{l.StopReceipt, l.IdentityReceipt} {
 		_ = os.Remove(path)
 		require.NoError(t, discoveryWriteJSON(path, proof))
 	}
-	var err error
 	l.StopReceiptSHA256, err = discoveryFileSHA(l.StopReceipt)
 	require.NoError(t, err)
 	l.IdentityReceiptSHA256, err = discoveryFileSHA(l.IdentityReceipt)
@@ -106,4 +129,30 @@ func TestDiscoverySeedCopiesSnapshotWithoutChangingExistingIdentities(t *testing
 	require.Equal(t, source, dest)
 	_, err = resumeDiscoveryState(t.Context(), o, corpora)
 	require.Error(t, err, "a prepared run is consumed once")
+}
+
+func TestDiscoverySeedRefusesRekeyedCatalogBeforeCopy(t *testing.T) {
+	o, corpora, l := syntheticDiscoverySeed(t)
+	var proof discoverySeedProof
+	require.NoError(t, discoveryReadJSON(l.IdentityReceipt, &proof))
+	var raw discoveryCatalogReceipt
+	require.NoError(t, discoveryReadJSON(proof.CatalogReceipt, &raw))
+	raw.After[0].Overview.Families[0].Checkouts[1].Incarnation = "synthetic-rekeyed-incarnation"
+	require.NoError(t, os.Remove(proof.CatalogReceipt))
+	require.NoError(t, discoveryWriteJSON(proof.CatalogReceipt, raw))
+	var err error
+	proof.CatalogReceiptSHA256, err = discoveryFileSHA(proof.CatalogReceipt)
+	require.NoError(t, err)
+	for _, path := range []string{l.StopReceipt, l.IdentityReceipt} {
+		require.NoError(t, os.Remove(path))
+		require.NoError(t, discoveryWriteJSON(path, proof))
+	}
+	l.StopReceiptSHA256, err = discoveryFileSHA(l.StopReceipt)
+	require.NoError(t, err)
+	l.IdentityReceiptSHA256, err = discoveryFileSHA(l.IdentityReceipt)
+	require.NoError(t, err)
+	require.NoError(t, discoveryWriteJSON(o.Discovery.Resume, l))
+	_, err = resumeDiscoveryState(t.Context(), o, corpora)
+	require.ErrorContains(t, err, "catalog identity mapping changed")
+	require.NoFileExists(t, filepath.Join(l.OwnedRoot, "store.db"))
 }

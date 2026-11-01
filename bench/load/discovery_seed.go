@@ -243,6 +243,7 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 			return nil, errors.New("discovery configuration/producer proof digest mismatch")
 		}
 	}
+	var catalog map[string]discoveryCatalogIdentity
 	for _, proofPath := range []string{l.StopReceipt, l.IdentityReceipt} {
 		var proof discoverySeedProof
 		if err := discoveryReadJSON(proofPath, &proof); err != nil {
@@ -251,6 +252,14 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 		if proof.State != "OBSERVED_OWNED_UPGRADE" || proof.ObservedAt.IsZero() || proof.OwnedRoot != root || proof.OwnerPID != l.OwnerPID || !proof.NormalStop || !proof.OwnersExited || proof.MainSHA256 != l.MainSHA256 || proof.WALSHA256 != l.WALSHA256 || proof.SchemaVersion != 44 || proof.UpgradeBinarySHA256 != l.UpgradeBinarySHA256 || !reflect.DeepEqual(proof.Repos, d.Repos) {
 			return nil, errors.New("discovery producer proof is unknown or does not bind this stopped snapshot and identity topology")
 		}
+		observed, err := discoveryReadCatalogReceipt(root, proof, d.Repos)
+		if err != nil {
+			return nil, err
+		}
+		if catalog != nil && !reflect.DeepEqual(catalog, observed) {
+			return nil, errors.New("discovery producer proofs disagree on catalog identities")
+		}
+		catalog = observed
 	}
 	process, err := os.FindProcess(l.OwnerPID)
 	if err != nil {
@@ -327,6 +336,7 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 	if err != nil || copied != before {
 		return nil, errors.New("discovery seed copy differs; partial destination retained")
 	}
+	p.discoveryCatalog = catalog
 	p.SocketDir, err = os.MkdirTemp("/tmp", "gl-")
 	if err != nil {
 		return nil, err
@@ -355,15 +365,17 @@ func discoverySeedPair(path string) ([2]string, error) {
 // Both retained producer receipts must bind observations to this exact stopped
 // output; state assertions without snapshot and identity evidence are refused.
 type discoverySeedProof struct {
-	State               string              `json:"state"`
-	ObservedAt          time.Time           `json:"observed_at"`
-	OwnedRoot           string              `json:"owned_root"`
-	OwnerPID            int                 `json:"owner_pid"`
-	NormalStop          bool                `json:"normal_stop"`
-	OwnersExited        bool                `json:"owners_exited"`
-	MainSHA256          string              `json:"main_sha256"`
-	WALSHA256           string              `json:"wal_sha256"`
-	SchemaVersion       int                 `json:"schema_version"`
-	UpgradeBinarySHA256 string              `json:"upgrade_binary_sha256"`
-	Repos               []discoverySeedRepo `json:"repositories"`
+	CatalogReceipt       string              `json:"catalog_receipt"`
+	CatalogReceiptSHA256 string              `json:"catalog_receipt_sha256"`
+	State                string              `json:"state"`
+	ObservedAt           time.Time           `json:"observed_at"`
+	OwnedRoot            string              `json:"owned_root"`
+	OwnerPID             int                 `json:"owner_pid"`
+	NormalStop           bool                `json:"normal_stop"`
+	OwnersExited         bool                `json:"owners_exited"`
+	MainSHA256           string              `json:"main_sha256"`
+	WALSHA256            string              `json:"wal_sha256"`
+	SchemaVersion        int                 `json:"schema_version"`
+	UpgradeBinarySHA256  string              `json:"upgrade_binary_sha256"`
+	Repos                []discoverySeedRepo `json:"repositories"`
 }
