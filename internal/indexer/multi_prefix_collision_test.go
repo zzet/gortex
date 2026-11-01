@@ -41,17 +41,16 @@ func TestRepositoryPrefixCollision(t *testing.T) {
 				result, err = mi.TrackRepoCtx(t.Context(), entry)
 			}
 			if reconcile {
-				// Startup keeps the base outcome: not loaded, warning only.
-				require.NoError(t, err)
-			} else {
-				var collision *PrefixCollisionError
-				require.ErrorAs(t, err, &collision)
-				assert.Equal(t, "src", collision.Prefix)
-				assert.Equal(t, first, collision.ExistingPath)
-				assert.Equal(t, second, collision.Path)
-				assert.Contains(t, err.Error(), first)
-				assert.Contains(t, err.Error(), "gortex track --name <other>")
+				var skipped *RepositoryCollisionSkip
+				require.ErrorAs(t, err, &skipped, "reconcile must not certify a rejected root as a successful no-op")
 			}
+			var collision *PrefixCollisionError
+			require.ErrorAs(t, err, &collision)
+			assert.Equal(t, "src", collision.Prefix)
+			assert.Equal(t, first, collision.ExistingPath)
+			assert.Equal(t, second, collision.Path)
+			assert.Contains(t, err.Error(), first)
+			assert.Contains(t, err.Error(), "gortex track --name <other>")
 			assert.Nil(t, result)
 			assert.Len(t, mi.AllMetadata(), 1)
 			assert.Equal(t, ownerMeta, *mi.GetMetadata("src"))
@@ -189,12 +188,16 @@ func TestRepositoryPrefixCollisionAfterCoordination(t *testing.T) {
 					result, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Path: second})
 				}
 				require.True(t, admitted)
-				if samePath || reconcile {
+				if samePath {
 					require.NoError(t, err)
 				} else {
 					var collision *PrefixCollisionError
 					require.ErrorAs(t, err, &collision)
 					assert.Equal(t, first, collision.ExistingPath)
+					if reconcile {
+						var skipped *RepositoryCollisionSkip
+						require.ErrorAs(t, err, &skipped, "the coordinated loser must remain a typed unchanged skip")
+					}
 				}
 				assert.Nil(t, result)
 				assert.Len(t, mi.AllMetadata(), 1)

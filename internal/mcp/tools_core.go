@@ -1719,7 +1719,7 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 
 	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFresh([]string{parts[0]})
+		s.ensureFreshContext(ctx, []string{parts[0]})
 	}
 
 	node := s.engineFor(ctx).GetSymbol(id)
@@ -2748,7 +2748,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	fp = s.graphRelPath(ctx, fp)
 
 	// Auto re-index stale file before querying.
-	s.ensureFresh([]string{fp})
+	s.ensureFreshContext(ctx, []string{fp})
 
 	// gcx is the high-volume agent format and only emits total_edges
 	// in its meta header — never per-edge rows. Route gcx-only calls
@@ -3771,6 +3771,10 @@ func (s *Server) buildGraphStatsPayloadFromStats(ctx context.Context, stats *gra
 	}
 
 	result["token_savings"] = s.tokenStatsFor(ctx).snapshot()
+	// Process CPU and this Server's logical edit outcomes span all views and
+	// clients. Keep that scope explicit beside the view-derived graph stats.
+	result["process_edit_window"] = s.processEditWindow()
+	result["wal_reclaim_observation"] = s.walReclaimObservation()
 
 	if cs := s.cumulativeSavingsSnapshot(); cs != nil {
 		result["cumulative_savings"] = cs

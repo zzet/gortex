@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -64,8 +65,10 @@ func TestFreshnessRider_ExtractorStalenessIsScopedToTheFilesLanguage(t *testing.
 	g := graph.New()
 	store := &riderIndexStateStore{Store: g}
 	mi := indexer.NewMultiIndexer(store, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err)
+	}
 
 	// Use the actual policy snapshot persisted by this index, so unrelated
 	// extractor or global policy bumps cannot accidentally stale the Go file.

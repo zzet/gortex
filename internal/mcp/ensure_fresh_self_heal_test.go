@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -44,8 +45,12 @@ func TestEnsureFresh_MultiRepoSelfHealsStaleFile(t *testing.T) {
 
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	// These fixtures test path ownership/freshness, not cross-repo batch
+	// resolution. Register their explicit roots through the production path.
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err)
+	}
 	require.True(t, mi.IsMultiRepo())
 
 	eng := query.NewEngine(g)

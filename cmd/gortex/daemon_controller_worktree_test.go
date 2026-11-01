@@ -75,8 +75,12 @@ func buildWorktreeController(t *testing.T) (*realController, *indexer.MultiIndex
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	// Exercise the same registration path as a cold production startup. This
+	// fixture asserts worktree identity/reload effects, not batch resolution.
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err)
+	}
 
 	// An in-memory graph has no checkout catalog, so the lifecycle runs in
 	// its degraded shape here: no identities, and the same index / watcher /

@@ -101,13 +101,7 @@ func (s *Server) handleResourceReport(ctx context.Context, req mcp.ReadResourceR
 		}
 	}
 	g := s.readerFor(ctx)
-	totalEdges := 0
-	for _, e := range g.AllEdges() {
-		if inScope != nil && (!inScope[e.From] || !inScope[e.To]) {
-			continue
-		}
-		totalEdges++
-	}
+	totalEdges := countEdgesWithin(g, inScope)
 
 	topLangs := topNFromCountMap(byLang, 5)
 	topKinds := topNFromCountMap(byKind, 5)
@@ -220,9 +214,9 @@ func (s *Server) handleResourceSurprises(ctx context.Context, req mcp.ReadResour
 	}
 
 	return jsonResource(req.Params.URI, map[string]any{
-		"cycles":            cycles,
-		"dead_code":         deadAll,
-		"dead_code_truncated": deadTrunc,
+		"cycles":               cycles,
+		"dead_code":            deadAll,
+		"dead_code_truncated":  deadTrunc,
 		"cross_community_hubs": topHubs,
 	})
 }
@@ -344,4 +338,3 @@ func topNFromCountMap(m map[string]int, n int) []map[string]any {
 	}
 	return out
 }
-

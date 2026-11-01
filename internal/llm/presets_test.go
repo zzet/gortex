@@ -75,6 +75,24 @@ func TestConfig_ActiveCustom_PresetResolution(t *testing.T) {
 		t.Errorf("llm-buzz preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(buzz))
 	}
 
+	opper := Config{Provider: "opper"}
+	cp, ok = opper.ActiveCustom()
+	if !ok || cp.BaseURL != "https://api.opper.ai/v3/compat" || cp.Model != "gpt-6.1-terra" || cp.APIKeyEnv != "OPPER_API_KEY" || cp.SchemaMode != "json_schema" || ProfileFor(opper) != ProfileFrontier {
+		t.Errorf("opper preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(opper))
+	}
+
+	cg := Config{Provider: "cloudgpu"}
+	cp, ok = cg.ActiveCustom()
+	if !ok || cp.BaseURL != "https://cloudgpu.app/v1" || cp.Model != "deepseek-v4.1-flash" || cp.APIKeyEnv != "CLOUDGPU_API_KEY" || cp.SchemaMode != "json_schema" || ProfileFor(cg) != ProfileFrontier {
+		t.Errorf("cloudgpu preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(cg))
+	}
+
+	rc := Config{Provider: "runcrate"}
+	cp, ok = rc.ActiveCustom()
+	if !ok || cp.BaseURL != "https://api.runcrate.ai/v1" || cp.Model != "deepseek-ai/DeepSeek-V4.1-Flash" || cp.APIKeyEnv != "RUNCRATE_API_KEY" || cp.SchemaMode != "json_schema" || ProfileFor(rc) != ProfileFrontier {
+		t.Errorf("runcrate preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(rc))
+	}
+
 	// A user custom provider of the same name always wins, wholesale —
 	// no preset field leaks into it.
 	c.Custom = map[string]CustomProvider{"testgw": {BaseURL: "https://mine/v1", Model: "my-model"}}

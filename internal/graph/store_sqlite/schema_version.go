@@ -35,7 +35,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 43
+const currentSchemaVersion = 44
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -144,6 +144,7 @@ var schemaMigrations = []schemaMigration{
 	{version: 41, name: "seek exact effective workspace nodes", inPlace: createEffectiveWorkspaceIndex, preserveAnalysis: true},
 	{version: 42, name: "seek eligible workspace dead-code candidates", inPlace: createDeadCodeEligibleWorkspaceIndex, preserveAnalysis: true},
 	{version: 43, name: "cover workspace dead-code candidate seeks", inPlace: coverDeadCodeEligibleWorkspaceIndex, preserveAnalysis: true},
+	{version: 44, name: "seek registered checkout roots", inPlace: createCheckoutRootIndexes, preserveAnalysis: true},
 }
 
 // An existing v42 key must be replaced: IF NOT EXISTS cannot upgrade its shape.
