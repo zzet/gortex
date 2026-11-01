@@ -69,7 +69,6 @@ func codexStopBriefing(briefing string) HookOutput {
 // diagnostics briefing. The claim-check block (decision/reason) is valid
 // on every host, so it does not go through wrap.
 func runPostTaskWith(data []byte, port int, wrap func(briefing string) HookOutput) {
-	started := time.Now()
 	var input PostTaskInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
@@ -77,39 +76,43 @@ func runPostTaskWith(data []byte, port int, wrap func(briefing string) HookOutpu
 	if input.HookEventName != "Stop" {
 		return
 	}
-	_ = clearLocalizationProblemStatementForTurn(input.SessionID, input.PromptID, input.AgentID, input.CWD)
-	emitted := false
-	defer func() {
-		logHookEffectiveness("Stop", emitted, daemonReachableFn(), 0, time.Since(started))
-	}()
-	// Prevent recursion — if we're already rerunning a Stop hook, don't fire again.
-	if input.StopHookActive {
+	claimCheck, briefing := postTaskFindings(input, port)
+	var output HookOutput
+	switch {
+	case claimCheck != "":
+		output = HookOutput{Decision: "block", Reason: claimCheck}
+	case briefing != "":
+		output = wrap(briefing)
+	default:
 		return
 	}
-	if claimCheck := localizationClaimCheck(input); claimCheck != "" {
-		output := HookOutput{Decision: "block", Reason: claimCheck}
-		out, err := json.Marshal(output)
-		if err == nil {
-			emitted = true
-			fmt.Print(string(out))
-		}
-		return
-	}
-
-	briefing := buildPostTaskBriefing(port, sessionScope{
-		SessionID: input.SessionID,
-		CWD:       firstNonEmpty(input.CWD, loadHookCWD()),
-	})
-	if briefing == "" {
-		return
-	}
-
-	out, err := json.Marshal(wrap(briefing))
+	out, err := json.Marshal(output)
 	if err != nil {
 		return
 	}
-	emitted = true
 	fmt.Print(string(out))
+}
+
+// postTaskFindings runs the Stop checks every host shares: the claim check,
+// which asks the agent to keep working, and otherwise the diagnostics
+// briefing. At most one is non-empty, and both are empty on a rerun Stop.
+func postTaskFindings(input PostTaskInput, port int) (claimCheck, briefing string) {
+	started := time.Now()
+	_ = clearLocalizationProblemStatementForTurn(input.SessionID, input.PromptID, input.AgentID, input.CWD)
+	defer func() {
+		logHookEffectiveness("Stop", claimCheck != "" || briefing != "", daemonReachableFn(), 0, time.Since(started))
+	}()
+	// Prevent recursion — if we're already rerunning a Stop hook, don't fire again.
+	if input.StopHookActive {
+		return "", ""
+	}
+	if claimCheck = localizationClaimCheck(input); claimCheck != "" {
+		return claimCheck, ""
+	}
+	return "", buildPostTaskBriefing(port, sessionScope{
+		SessionID: input.SessionID,
+		CWD:       firstNonEmpty(input.CWD, loadHookCWD()),
+	})
 }
 
 // changedSymbol is one entry of detect_changes' changed_symbols list.

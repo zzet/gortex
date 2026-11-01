@@ -63,6 +63,8 @@ func (s *Server) handleAnalyzeEdgeAudit(ctx context.Context, req mcp.CallToolReq
 	// tiers grade the state this request reads — the caller's buffers
 	// when a view is active.
 	reader := s.readerFor(ctx)
+	// The audit grades every edge's provenance tier, so it reads the whole
+	// edge set by design; it is an analyze kind and runs in the slow lane.
 	for _, e := range reader.AllEdges() {
 		if scoped && (!s.analyzeNodeVisible(ctx, reader.GetNode(e.From)) || !s.analyzeNodeVisible(ctx, reader.GetNode(e.To))) {
 			continue
