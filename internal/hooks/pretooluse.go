@@ -1476,6 +1476,32 @@ func enrichBashWithProbe(toolInput map[string]any, cwd string, probe fileScopePr
 	if outsideGraph(c) {
 		c = classifyBashReadCommandSkipping(cmd, outsideGraph)
 	}
+	// An inline Python one-liner or heredoc that opens indexed source is the
+	// read door agents take once cat and grep are redirected. It is answered
+	// for every command, not only when the shell leaves it passthrough: a
+	// read/grep/find that follows it would otherwise make the command
+	// non-passthrough and skip the Python analysis, so `python3 -c "…"`
+	// chained after a `head` still answers. The analysis is self-limiting and
+	// silent for commands that carry no inline Python.
+	//
+	// A Python deny answers at once. Anything softer (the edit advisory, a
+	// read-only or loading allowance) must not cost the command a deny its
+	// shell read earns on its own, so the shell answer is taken first when
+	// it denies.
+	py, pyAnswered := enrichBashScriptRead(cmd, cwd, probe)
+	if pyAnswered && (py.deny || c.Action == BashActionPassthrough) {
+		return py
+	}
+	shell := enrichBashShellRead(c, cwd, probe)
+	if shell.deny || !pyAnswered {
+		return shell
+	}
+	return py
+}
+
+// enrichBashShellRead answers the grep, find or source read a classified
+// Bash command leads with.
+func enrichBashShellRead(c BashClassification, cwd string, probe fileScopeProbe) enrichResult {
 	switch c.Action {
 	case BashActionGrepLike:
 		return probeSymbolPattern("Bash", c.Pattern, cwd, defaultGrepGuidance())

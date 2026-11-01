@@ -63,6 +63,7 @@ type request struct {
 // Workload is the complete normalized offered load. Binary paths, private
 // clone paths and revisions belong to the run identity, never the plan hash.
 type Workload struct {
+	PRSmokeDrain     *PRSmokeDrain  `json:"pr_smoke_drain,omitempty"`
 	Scenario         string         `json:"scenario"`
 	Agents           int            `json:"agents"`
 	EditAgents       int            `json:"edit_agents"`
@@ -183,6 +184,10 @@ func validateAgentCounts(scenario string, readers, editors int) error {
 		return errors.New("reader/editor counts must be nonnegative")
 	}
 	switch scenario {
+	case "idle-stop":
+		if readers != 0 || editors != 0 {
+			return errors.New("idle-stop requires exactly zero reading/editing agents")
+		}
 	case editProbeScenario:
 		if readers > editProbeMaxReaders || editors < 1 || editors > editProbeMaxEditors {
 			return fmt.Errorf("edit-and-probe has 1..%d fixed editors and 0..%d pure readers", editProbeMaxEditors, editProbeMaxReaders)
