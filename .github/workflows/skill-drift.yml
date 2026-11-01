@@ -2,15 +2,17 @@ name: Skill drift
 
 # Fences every agent integration's generated output against what is
 # checked in — across all platforms (not Claude-only), on every PR (not
-# release-only). Two complementary checks run:
+# release-only). Three complementary checks run:
 #
 #   1. The all-platform render golden (go test) byte-compares every
 #      adapter's rendered MCP config / instructions / hooks / routing
 #      blocks against committed goldens.
 #   2. A structural --check that every adapter still emits a gortex
 #      registration.
+#   3. `make claude-plugin-check` generates the Claude Code plugin
+#      marketplace and validates it with `claude plugin validate --strict`.
 #
-# Both build the pure-Go CLI (no -tags llama), so the gate runs on a
+# All build the pure-Go CLI (no -tags llama), so the gate runs on a
 # stock runner. When a check fails on an intended change, regenerate and
 # commit the goldens:
 #   go test ./cmd/gortex -run TestAgentsRenderGolden -update-agent-render
@@ -47,8 +49,14 @@ jobs:
       - name: All-platform render structural check
         run: ./gortex agents render --check
 
-      # publish-claude-plugin runs this target on every release, and nothing
-      # else exercises it, so a build change that breaks it would only show
-      # when a release tries to publish.
-      - name: Claude Code plugin bundle
-        run: make claude-plugin
+      # `claude plugin validate` needs no sign-in. The version is pinned like
+      # the actions above; bump it to pick up new validator checks.
+      - name: Install the Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code@2.1.316
+
+      # publish-claude-plugin runs `make claude-plugin` on every release, and
+      # nothing else exercises it, so a build change that breaks it would
+      # only show when a release tries to publish. The check target builds
+      # the bundle the same way and then validates it with --strict.
+      - name: Claude Code plugin bundle validates
+        run: make claude-plugin-check
