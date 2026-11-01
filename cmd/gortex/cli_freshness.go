@@ -41,12 +41,19 @@ func checkCLIFreshness(cmd *cobra.Command, raw json.RawMessage, callErr error) e
 	} else {
 		text := string(raw)
 		if callErr != nil {
-			text = callErr.Error()
+			var labelled bool
+			text, labelled = strings.CutPrefix(callErr.Error(), "require_fresh: ")
+			if !labelled {
+				return callErr
+			}
+		} else if json.Valid(raw) {
+			return nil // source strings inside JSON are not freshness metadata
 		}
+		text, _, _ = strings.Cut(text, "\n")
 		for _, tier := range []string{"file", "relations", "derived"} {
 			for _, status := range []string{"pending", "failed", "unknown"} {
 				prefix := tier + ": " + status + " ("
-				if _, tail, ok := strings.Cut(text, prefix); ok {
+				if tail, ok := strings.CutPrefix(text, prefix); ok {
 					if count, _, closed := strings.Cut(tail, " files)"); closed {
 						line = prefix + count + " files)"
 					}

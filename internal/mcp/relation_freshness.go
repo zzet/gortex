@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -27,6 +28,7 @@ const maxLabelledPendingFiles = 16
 // relationFreshness labels an answer read from graph relations while edits in
 // its scope are still being published. The zero value is a fresh scope.
 type relationFreshness struct {
+	scope  string
 	state  string   // "", "pending" or "failed"
 	files  []string // graph-keyed paths of the lagging in-scope edits, sorted
 	waited time.Duration
@@ -118,6 +120,16 @@ func (s *Server) laggingMutationReceipts(ctx context.Context) []*mutationReceipt
 func (s *Server) relationScope(ctx context.Context, ids, files []string) func(absPath string) bool {
 	scoped := make(map[string]bool, len(files)+len(ids))
 	for _, file := range files {
+		if strings.HasPrefix(file, "file://") {
+			if abs, err := s.resolveOverlayAbsPath(file); err == nil {
+				file = abs
+			}
+		}
+		if filepath.IsAbs(file) {
+			file = s.repoRelative(file)
+		} else {
+			file = filepath.ToSlash(filepath.Clean(file))
+		}
 		scoped[file] = true
 	}
 	var names []string
@@ -193,7 +205,11 @@ func namesAnyIdentifier(data []byte, names []string) bool {
 
 // line is the relations line a text answer leads with.
 func (f relationFreshness) line() string {
-	return fmt.Sprintf("relations: %s (%d files)", f.state, len(f.files))
+	scope := f.scope
+	if scope == "" {
+		scope = "relations"
+	}
+	return fmt.Sprintf("%s: %s (%d files)", scope, f.state, len(f.files))
 }
 
 // requireFreshError is the answer to a require_fresh call whose wait ended
@@ -210,6 +226,9 @@ func (f relationFreshness) requireFreshError() *mcp.CallToolResult {
 // merge folds the label of another scope the same answer read into f: the
 // files of both, failed over pending, and the time spent waiting on each.
 func (f relationFreshness) merge(other relationFreshness) relationFreshness {
+	if f.scope == "" {
+		f.scope = other.scope
+	}
 	f.waited += other.waited
 	if other.state == "" {
 		return f
