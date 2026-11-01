@@ -36,7 +36,7 @@ func TestReceiptTierTimestampsAreOrdered(t *testing.T) {
 }
 
 func TestNativeOnlyStormHasFreshnessEvidence(t *testing.T) {
-	dir, _, watcher := inertTestWatcher(t, "main.go", "package main\nfunc Before() {}\n")
+	dir, watcher := toolAdmissionFixture(t)
 	path := filepath.Join(dir, "main.go")
 	watcher.config.StormQuietPeriodMs = int(time.Hour / time.Millisecond)
 	writeTestFile(t, path, "package main\nfunc After() {}\n")
