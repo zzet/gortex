@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,18 +10,43 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 )
+
+func explicitFreshnessFixture(t *testing.T) (*Server, context.Context, func()) {
+	t.Helper()
+	stack := newViewStack(t)
+	require.NoError(t, stack.leases.RegisterRepositoryOwner(viewTestOwner()))
+	authority := indexer.NewOutputGenerationAuthority(stack.leases)
+	mutate := func() {
+		t.Helper()
+		receipt, err := authority.Begin(t.Context(), indexer.OutputEntryWatcherDirScan, indexer.OutputMutationTarget{
+			Kind: indexer.OutputGenerationLegacy, OwnerKey: "root:" + stack.repoRoot, RepoPrefix: "repo", RootPath: stack.repoRoot,
+		})
+		require.NoError(t, err)
+		stack.store.AddNode(viewRepoNode("repo/target.go::Target", "Target", graph.KindFunction, "repo/target.go", 1))
+		require.NoError(t, receipt.Complete())
+	}
+	mutate()
+	stack.srv.SetWatcher(&watchedTierFixture{})
+	ctx := withRequestView(t.Context(), &requestView{reader: newBaseGraphReader(stack.store, "repo"), baseNarrowed: true})
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"require_fresh": true}
+	ctx, release := stack.srv.captureExplicitFreshness(ctx, req)
+	require.NotNil(t, release)
+	t.Cleanup(release)
+	return stack.srv, ctx, mutate
+}
 
 func TestRequireFreshReportsExplicitGraphTier(t *testing.T) {
 	for _, scope := range []string{"file", "relations", "derived"} {
 		for _, format := range []string{"json", "toon", "text", "gcx", "compact"} {
 			t.Run(scope+"/"+format, func(t *testing.T) {
-				s, _ := newRelationFixture(t)
-				s.SetWatcher(&watchedTierFixture{})
+				s, ctx, _ := explicitFreshnessFixture(t)
 				req := mcp.CallToolRequest{}
 				req.Params.Name = "get_callers"
-				req.Params.Arguments = map[string]any{"id": targetID(t, s), "require_fresh": true, "freshness_scope": scope, "format": format}
+				req.Params.Arguments = map[string]any{"id": "repo/target.go::Target", "require_fresh": true, "freshness_scope": scope, "format": format}
 				body := "callers[0]{id}:"
 				if format == "json" {
 					body = `{"callers":[],"complete":false}`
@@ -30,7 +56,7 @@ func TestRequireFreshReportsExplicitGraphTier(t *testing.T) {
 					req.Params.Arguments.(map[string]any)["compact"] = true
 				}
 				original := mcp.NewToolResultText(body)
-				got := s.decorateToolFreshness(t.Context(), req.Params.Name, req, original)
+				got := s.decorateToolFreshness(ctx, req.Params.Name, req, original)
 				if format == "compact" {
 					require.Same(t, original, got, "compact has no new explicit-fresh contract")
 					return
@@ -52,6 +78,18 @@ func TestRequireFreshReportsExplicitGraphTier(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestRequireFreshRejectsCompletedMutationDuringRead(t *testing.T) {
+	s, ctx, mutate := explicitFreshnessFixture(t)
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "get_callers"
+	req.Params.Arguments = map[string]any{"id": "repo/target.go::Target", "require_fresh": true, "format": "json"}
+	before := s.decorateToolFreshness(ctx, req.Params.Name, req, mcp.NewToolResultText(`{"callers":[]}`))
+	require.Equal(t, "fresh", resultJSON(t, before)["freshness"].(map[string]any)["graph_freshness"])
+	mutate() // The accepted publication completes; no pending path survives.
+	after := s.decorateToolFreshness(ctx, req.Params.Name, req, mcp.NewToolResultText(`{"callers":[]}`))
+	require.Equal(t, "unknown", resultJSON(t, after)["freshness"].(map[string]any)["graph_freshness"])
 }
 
 func TestRequireFreshDoesNotInventGraphAuthority(t *testing.T) {

@@ -15,6 +15,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 )
 
@@ -527,7 +528,7 @@ func renderFreshnessLine(res *mcp.CallToolResult, fields map[string]any) *mcp.Ca
 		}
 		state, scope = "pending", "file"
 	}
-	if state == "fresh" || state == "" {
+	if state == "" {
 		return res
 	}
 	if scope == "" {
@@ -586,6 +587,11 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 	}
 	states := make(map[string]pathState)
 	put := func(path, state string, generation uint64) {
+		if len(ids)+len(files) == 0 {
+			if prefix := baseNarrowedRepoPrefix(requestViewFromContext(ctx)); prefix != "" && !strings.HasPrefix(s.repoRelative(path), prefix+"/") {
+				return
+			}
+		}
 		if len(ids)+len(files) > 0 && !inScope(path) {
 			return
 		}
@@ -697,6 +703,12 @@ func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, 
 		return "file", nil, []string{file}
 	}
 	switch name {
+	case "search_symbols", "search_text":
+		// A query is not a file identity. An explicit tier answer for these
+		// tools covers the selected canonical repository's whole graph.
+		if requestBoolArg(&req, requireFreshArgName) && !isCompact(req) {
+			return "relations", nil, nil
+		}
 	case "verify_change":
 		var changes []struct {
 			SymbolID string `json:"symbol_id"`
@@ -720,7 +732,7 @@ func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, 
 		if len(ids) > 0 {
 			return "relations", ids, nil
 		}
-	case "get_callers", "find_usages", "get_call_chain", "get_dependencies", "get_dependents", "find_implementations", "walk_graph":
+	case "get_callers", "find_usages", "get_call_chain", "trace_call_chain", "get_dependencies", "get_dependents", "find_implementations", "walk_graph":
 		for _, key := range []string{"id", "symbol_id", "start_id"} {
 			if id := req.GetString(key, ""); id != "" {
 				ids = append(ids, id)
@@ -735,11 +747,12 @@ func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, 
 
 func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp.CallToolRequest, res *mcp.CallToolResult) *mcp.CallToolResult {
 	scope, ids, files := freshnessTargets(name, req)
+	var label relationFreshness
 	if scope != "" {
 		if selected := takeRequestFreshness(&req).scope; selected != "" {
 			scope = selected
 		}
-		label := s.freshnessFor(ctx, scope, ids, files)
+		label = s.freshnessFor(ctx, scope, ids, files)
 		if snapshot, ok := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); ok {
 			label = s.freshnessFor(ctx, scope, ids, files, snapshot.receipts)
 		}
@@ -750,13 +763,62 @@ func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp
 			res = decorateResultWithFreshness(res, fields)
 		}
 	}
+	beforeFileRiders := res
 	if rider := s.freshnessRiderFor(name, req); rider != nil {
 		res = decorateResultWithFreshness(res, rider)
 	}
 	if isFreshnessListTool(name) {
 		res = s.decorateListResultWithFreshness(res)
 	}
+	// A disk-drift or missing-file rider must not be joined to a fresh claim.
+	// Keep the producer's internal zero state unchanged; only an opted-in
+	// successful response renders its explicit equivalent.
+	if scope != "" && label.state == "" && res != nil && !res.IsError && res == beforeFileRiders {
+		label = s.explicitFreshness(ctx, req, label)
+		if label.state != "" {
+			fields := make(map[string]any)
+			label.apply(fields)
+			res = decorateResultWithFreshness(res, fields)
+		}
+	}
 	return fitToolFreshnessBudget(ctx, req, res)
+}
+
+func (s *Server) explicitFreshness(ctx context.Context, req mcp.CallToolRequest, label relationFreshness) relationFreshness {
+	if label.state != "" || !requestBoolArg(&req, requireFreshArgName) || isCompact(req) {
+		return label
+	}
+	// Absence of a local receipt is not proof for another checkout, a source
+	// fallback, an immutable view, or an unwatched graph. Route freshness is
+	// a different claim and cannot provide this tier authority.
+	if _, watched := s.canonicalTierPaths(ctx); watched {
+		label.state = "unknown"
+		if pin, ok := ctx.Value(explicitFreshnessPinKey{}).(*graphview.BasePin); ok && pin.ValidateAcceptedCurrent() == nil {
+			label.state = "fresh"
+		}
+	}
+	return label
+}
+
+type explicitFreshnessPinKey struct{}
+
+// The accepted source witness belongs to the canonical repository that this
+// request's reader actually filters. It is captured before the read, released
+// with the request, and checked again when that read's tier label is rendered.
+func (s *Server) captureExplicitFreshness(ctx context.Context, req mcp.CallToolRequest) (context.Context, func()) {
+	if !requestBoolArg(&req, requireFreshArgName) || isCompact(req) || s.materializer == nil || s.materializer.Leases == nil {
+		return ctx, nil
+	}
+	prefix := baseNarrowedRepoPrefix(requestViewFromContext(ctx))
+	if prefix == "" {
+		return ctx, nil
+	}
+	pin := s.materializer.Leases.AcquireBaseCorpus(prefix)
+	if pin.ValidateAcceptedCurrent() != nil {
+		pin.Release()
+		return ctx, nil
+	}
+	return context.WithValue(ctx, explicitFreshnessPinKey{}, pin), pin.Release
 }
 
 type toolFreshnessBudgetKey struct{}
@@ -782,6 +844,7 @@ func (s *Server) reserveToolFreshnessBudget(ctx context.Context, name string, re
 	if snapshot, ok := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); ok {
 		label = s.freshnessFor(ctx, scope, ids, files, snapshot.receipts)
 	}
+	label = s.explicitFreshness(ctx, req, label)
 	if label.state == "" {
 		return ctx, req
 	}
@@ -899,7 +962,9 @@ func (f relationFreshness) apply(result map[string]any) {
 	if f.state == "" {
 		return
 	}
-	result["complete"] = false
+	if f.state != "fresh" {
+		result["complete"] = false
+	}
 	result["graph_freshness"] = f.state
 	scope := f.scope
 	if scope == "" {
