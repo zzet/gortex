@@ -133,6 +133,7 @@ type MultiWatcher struct {
 	// atomically with an ownership-epoch dispatch admission.
 	callbackMu     sync.Mutex
 	symbolChangeCb SymbolChangeCallback
+	sourceEventCb  func(string)
 	// degradedCb is fanned out to every per-repo Watcher (and re-applied at
 	// AddRepo) so a watcher entering a degraded state — inotify / FD
 	// exhaustion — pushes a single health notice through the daemon.
@@ -233,6 +234,9 @@ func (mw *MultiWatcher) createWatcher(prefix string, cfg config.WatchConfig) err
 	if err != nil {
 		return fmt.Errorf("creating watcher for %s: %w", prefix, err)
 	}
+	// Resolve the current callback at delivery time: replacements and future
+	// watchers share registration without a stale fanout snapshot.
+	w.OnSourceEvent(mw.notifySourceEvent)
 	if mw.configManagedExcludes {
 		mw.configureManagedExcludes(prefix, w)
 	}
@@ -1019,6 +1023,23 @@ func (mw *MultiWatcher) HistorySince(since time.Time) []GraphChangeEvent {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.After(out[j].Timestamp) })
 	return out
+}
+
+// OnSourceEvent replaces the synchronous source-path callback for every
+// current and future per-repo watcher. The callback must return promptly.
+func (mw *MultiWatcher) OnSourceEvent(cb func(string)) {
+	mw.callbackMu.Lock()
+	mw.sourceEventCb = cb
+	mw.callbackMu.Unlock()
+}
+
+func (mw *MultiWatcher) notifySourceEvent(path string) {
+	mw.callbackMu.Lock()
+	cb := mw.sourceEventCb
+	mw.callbackMu.Unlock()
+	if cb != nil {
+		cb(path)
+	}
 }
 
 // OnSymbolChange registers the callback against every current per-repo

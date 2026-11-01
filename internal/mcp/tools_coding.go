@@ -365,8 +365,10 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	// mode — the cause of spurious "no symbols found for file" misses.
 	fp = s.graphRelPath(ctx, fp)
 
-	// Auto re-index stale file before querying.
-	s.ensureFreshContext(ctx, []string{fp})
+	ctx, err = s.ensureProjected(ctx, []string{fp})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	s.sessionFor(ctx).recordFile(fp)
 	// Tool-call observer: credit the recent search for the symbols in
@@ -947,9 +949,11 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("id is required"), nil
 	}
 
-	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFreshContext(ctx, []string{parts[0]})
+		ctx, err = s.ensureProjected(ctx, []string{parts[0]})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 
 	node := s.engineFor(ctx).GetSymbol(id)
@@ -1022,11 +1026,14 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		if guardErr := s.guardSymlinkWithinRepo(ctx, absPath); guardErr != nil {
 			return mcp.NewToolResultError(guardErr.Error()), nil
 		}
-		var err error
-		source, startLine, totalFileChars, err = s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, contextLines)
+		ns, err := s.readNodeSource(ctx, node, absPath)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("could not read source: %v", err)), nil
 		}
+		resolved := *node
+		resolved.StartLine, resolved.EndLine = ns.startLine, ns.endLine
+		node = &resolved
+		source, startLine, totalFileChars, _ = extractLinesFromContent(ns.content, ns.startLine, ns.endLine, contextLines)
 	}
 
 	compressBodies := req.GetBool("compress_bodies", false)
@@ -1353,7 +1360,9 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 		// Source code (optional).
 		if includeSource && node.StartLine > 0 && node.EndLine > 0 {
 			if absPath, err := s.resolveNodePath(ctx, node); err == nil {
-				if source, fromLine, totalFileChars, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, contextLines); err == nil {
+				if ns, err := s.readNodeSource(ctx, node, absPath); err == nil {
+					source, fromLine, totalFileChars, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, contextLines)
+					entry["start_line"], entry["end_line"] = ns.startLine, ns.endLine
 					entry["source"] = source
 					entry["from_line"] = fromLine
 					pending = append(pending, pendingSavings{
@@ -1719,7 +1728,8 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 	// 1. Get the example source.
 	if node.StartLine > 0 && node.EndLine > 0 {
 		if absPath, err := s.resolveNodePath(ctx, node); err == nil {
-			if source, _, _, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, 0); err == nil {
+			if ns, err := s.readNodeSource(ctx, node, absPath); err == nil {
+				source, _, _, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, 0)
 				result["example_source"] = elideSourceForPattern(source, maxSourceLines)
 			}
 		}
@@ -1767,7 +1777,9 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 		// Get the registration source (the caller function that wires this symbol).
 		if cn.StartLine > 0 && cn.EndLine > 0 {
 			if absPath, err := s.resolveNodePath(ctx, cn); err == nil {
-				if source, _, _, err := s.readLinesForCtx(ctx, absPath, cn.StartLine, cn.EndLine, 0); err == nil {
+				if ns, err := s.readNodeSource(ctx, cn, absPath); err == nil {
+					source, _, _, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, 0)
+					entry["start_line"] = ns.startLine
 					entry["source"] = elideSourceForPattern(source, maxSourceLines)
 				}
 			}
@@ -1797,7 +1809,9 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 			// Get test source.
 			if tn.StartLine > 0 && tn.EndLine > 0 {
 				if absPath, err := s.resolveNodePath(ctx, tn); err == nil {
-					if source, _, _, err := s.readLinesForCtx(ctx, absPath, tn.StartLine, tn.EndLine, 0); err == nil {
+					if ns, err := s.readNodeSource(ctx, tn, absPath); err == nil {
+						source, _, _, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, 0)
+						entry["start_line"] = ns.startLine
 						entry["source"] = elideSourceForPattern(source, maxSourceLines)
 					}
 				}
@@ -2301,7 +2315,9 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 			(sym.Kind == graph.KindFunction || sym.Kind == graph.KindMethod) &&
 			sym.StartLine > 0 && sym.EndLine > 0 {
 			if absPath, err := s.resolveNodePath(ctx, sym); err == nil {
-				if source, _, totalFileChars, err := s.readLinesForCtx(ctx, absPath, sym.StartLine, sym.EndLine, 0); err == nil {
+				if ns, err := s.readNodeSource(ctx, sym, absPath); err == nil {
+					source, _, totalFileChars, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, 0)
+					entry["start_line"] = ns.startLine
 					if red, did := s.maybeRedactConfigLeaf(sym.Language, sym.FilePath, false, source); did {
 						source = red
 					}

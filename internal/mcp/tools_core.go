@@ -1723,9 +1723,11 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError("id is required"), nil
 	}
 
-	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFreshContext(ctx, []string{parts[0]})
+		ctx, err = s.ensureProjected(ctx, []string{parts[0]})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 
 	node := s.engineFor(ctx).GetSymbol(id)
@@ -2753,8 +2755,10 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	// mode — the cause of spurious file_not_indexed misses.
 	fp = s.graphRelPath(ctx, fp)
 
-	// Auto re-index stale file before querying.
-	s.ensureFreshContext(ctx, []string{fp})
+	ctx, err = s.ensureProjected(ctx, []string{fp})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	// gcx is the high-volume agent format and only emits total_edges
 	// in its meta header — never per-edge rows. Route gcx-only calls

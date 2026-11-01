@@ -222,6 +222,8 @@ type Watcher struct {
 	stoppedOnce      sync.Once
 	symbolChangeCb   SymbolChangeCallback
 	symbolChangeCbMu sync.RWMutex
+	sourceEventCb    func(string)
+	sourceEventCbMu  sync.RWMutex
 
 	// Degraded-watch state: set when the OS can't fully cover the tree —
 	// inotify watch exhaustion (ENOSPC) or FD exhaustion (EMFILE/ENFILE).
@@ -1314,6 +1316,23 @@ func (w *Watcher) OnSymbolChange(cb SymbolChangeCallback) {
 	w.symbolChangeCb = cb
 }
 
+// OnSourceEvent replaces the callback invoked synchronously for a source path
+// before storm handling or debounce. The callback must return promptly.
+func (w *Watcher) OnSourceEvent(cb func(string)) {
+	w.sourceEventCbMu.Lock()
+	w.sourceEventCb = cb
+	w.sourceEventCbMu.Unlock()
+}
+
+func (w *Watcher) notifySourceEvent(path string) {
+	w.sourceEventCbMu.RLock()
+	cb := w.sourceEventCb
+	w.sourceEventCbMu.RUnlock()
+	if cb != nil {
+		cb(path)
+	}
+}
+
 // OnDegraded registers a callback invoked once when the file watcher first
 // enters a degraded state (inotify / FD exhaustion, a stopped backend, an
 // incomplete startup barrier). The daemon wires it to its health
@@ -1738,6 +1757,7 @@ func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
 		}
 		return
 	}
+	w.notifySourceEvent(path)
 
 	// Before the exclusion check: an ignore file can sit in a folder whose
 	// own events are excluded, and its rules apply all the same.
