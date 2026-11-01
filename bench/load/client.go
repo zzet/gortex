@@ -64,6 +64,7 @@ type socketClient struct {
 	notifies      []notificationObservation
 	notifyDropped int
 	version       string
+	cwd           string // immutable checkout supplied by the successful handshake
 }
 
 // Per-call values returned to its caller, never a shared last-ID cache. Times
@@ -142,7 +143,7 @@ func openMCP(ctx context.Context, socket, cwd string) (*socketClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &socketClient{conn: conn, reader: reader, pending: make(map[int64]chan wireReply), done: make(chan struct{}), version: version, writeGate: make(chan struct{}, 1)}
+	c := &socketClient{conn: conn, reader: reader, pending: make(map[int64]chan wireReply), done: make(chan struct{}), version: version, cwd: cwd, writeGate: make(chan struct{}, 1)}
 	go c.readLoop()
 	if _, err := c.call(ctx, "initialize", map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "gortex-load", "version": "1"}}); err != nil {
 		_ = c.Close()
