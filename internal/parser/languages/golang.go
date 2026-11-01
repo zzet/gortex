@@ -1278,14 +1278,14 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 	// override method emits as a separate KindMethod node, so this
 	// post-pass runs after every node in the file has been emitted and
 	// rewires any convention-derived EdgeModelsTable to the literal.
-	rewireORMTableNameOverrides(root, src, result)
+	root.WithScratch(func() { rewireORMTableNameOverrides(root, src, result) })
 
 	// WebSocket upgrade handlers → real-time endpoint edges.
 	emitGoWebSocketEdges(src, filePath, result)
 
 	// Same-file constant/variable value references → impact-radius reads.
-	captureValueRefCandidates(result, root, filePath, src)
-	captureFnValueCandidates(result, root, filePath, src)
+	root.WithScratch(func() { captureValueRefCandidates(result, root, filePath, src) })
+	root.WithScratch(func() { captureFnValueCandidates(result, root, filePath, src) })
 
 	// Gin middleware-chain dispatcher + route registrations → resolver hints.
 	mineGinMiddleware(src, result)
@@ -1294,10 +1294,10 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 	// map key/value, channel element. These positions are dropped by the
 	// bare-name type passes, so without this find_usages of a type misses
 	// every place it appears only as an argument/element type.
-	emitGoTypeArgReferences(root, src, filePath, fileID, funcRanges, result)
+	root.WithScratch(func() { emitGoTypeArgReferences(root, src, filePath, fileID, funcRanges, result) })
 
 	// GoFrame reflective routes: g.Meta-tagged request structs → controllers.
-	captureGoFrameRoutes(result, root, filePath, src)
+	root.WithScratch(func() { captureGoFrameRoutes(result, root, filePath, src) })
 
 	return result, nil
 }
