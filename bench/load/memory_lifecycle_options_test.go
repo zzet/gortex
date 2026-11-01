@@ -59,3 +59,15 @@ func TestEditProbeMemoryGaugesRefuseRestartSender(t *testing.T) {
 		}
 	}
 }
+
+func TestMemoryGaugesRefuseStartupProbeWithoutARecordedSeries(t *testing.T) {
+	if err := validateMemoryOptions(runOptions{Scenario: startupScenario}); err != nil {
+		t.Fatalf("ordinary startup probe refused: %v", err)
+	}
+	for _, profiles := range []bool{false, true} {
+		err := validateMemoryOptions(runOptions{Scenario: startupScenario, Gauges: true, HeapProfiles: profiles})
+		if err == nil || !strings.Contains(err.Error(), "unsupported") {
+			t.Errorf("startup probe silently accepted an unrecorded series: profiles=%v err=%v", profiles, err)
+		}
+	}
+}

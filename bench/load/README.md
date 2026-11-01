@@ -724,8 +724,9 @@ artifact is advertised. Load-start and collected idle profiles remain available.
 Heap profiles are taken as of the daemon's last GC; no collection is forced
 during load.
 
-Live gauges and heap profiles are refused for `idle-stop`, whose measured
-interval requires every MCP session closed, and for the edit-and-probe
+Live gauges and heap profiles are refused for `startup-probe`, which records
+its own boot observations without a gauge series, for `idle-stop`, whose
+measured interval requires every MCP session closed, and for the edit-and-probe
 `edit_sender: restart` cell, which replaces the process during its measured
 phase. Ordinary `--scenario restart` is supported: its series starts only
 after the replacement daemon is ready. `all` keeps independent per-scenario

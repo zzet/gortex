@@ -64,6 +64,9 @@ func bindMemoryFlags(f *flag.FlagSet, o *runOptions) {
 }
 
 func validateMemoryOptions(o runOptions) error {
+	if o.Scenario == startupScenario && wantsGaugeSeries(o) {
+		return errors.New("--gauges and --heap-profiles are unsupported for startup-probe")
+	}
 	if o.Scenario == "idle-stop" && wantsGaugeSeries(o) {
 		return errors.New("live memory gauges and profiles are unsupported for idle-stop: the extra health session prevents an idle interval")
 	}
