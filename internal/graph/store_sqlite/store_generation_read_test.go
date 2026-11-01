@@ -1515,6 +1515,13 @@ func generationReadProbes() []genProbe {
 			}
 			return nodeTokens(out)
 		}},
+		{name: "FileLocationsInScopeSeq", run: func(t *testing.T, s *Store) []string {
+			var out []string
+			for n := range s.FileLocationsInScopeSeq([]string{"", genReadRepo}) {
+				out = append(out, fmt.Sprintf("file %s|%s|%s|%s|%s", n.ID, n.FilePath, n.Language, n.RepoPrefix, n.WorkspaceID))
+			}
+			return out
+		}},
 		{name: "EdgesInScopeSeq", run: func(t *testing.T, s *Store) []string {
 			var out []string
 			for row := range s.EdgesInScopeSeq([]string{genReadRepo}, nil, graph.EdgeCalls) {
@@ -2151,6 +2158,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.FilteredCallAncestorReader)(nil), probe: "CallAncestorsFilteredContext"},
 		{iface: (*graph.CallReferenceOutgoingReader)(nil), probe: "GetCallReferenceOutEdgesContext"},
 		{iface: (*graph.ScopedKindSummarySequencer)(nil), probe: "NodesLightByKindsInScopeSeq"},
+		{iface: (*graph.ScopedFileLocationSequencer)(nil), probe: "FileLocationsInScopeSeq"},
 		{iface: (*graph.ChurnEnrichmentReader)(nil), skip: skipSidecar},
 		{iface: (*graph.ChurnEnrichmentWriter)(nil), skip: skipSidecar},
 		{iface: (*graph.ClassHierarchyTraverser)(nil), probe: "ClassHierarchyTraverse"},
