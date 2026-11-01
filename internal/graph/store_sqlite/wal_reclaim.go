@@ -254,6 +254,10 @@ func resolveWALReclaimConfig() walReclaimConfig {
 // read gate was closed per attempt that closed it; ReaderWait is what readers
 // actually spent held at the gate (per held read), measured on their side.
 type WALReclaimStats struct {
+	// Per writer-gate acquisition, including credit reacquisition. Snapshots
+	// are copied from the timed gate without waiting on its current holder.
+	WriterHold, WriterWait DurationHistogram
+
 	// One first observed cause per final non-reset reclaim attempt, including
 	// writer-demand refusal. Parked writer precedes intent if both are seen.
 	CancelledWriterParked, CancelledWriteIntent, CancelledOther int64
@@ -342,6 +346,8 @@ func (s *Store) WALReclaimStats() WALReclaimStats {
 	s.walReclaim.mu.Lock()
 	out := s.walReclaim.stats
 	s.walReclaim.mu.Unlock()
+	out.WriterHold = s.writeMu.reclaimHold.snapshot()
+	out.WriterWait = s.writeMu.reclaimWait.snapshot()
 	out.WALPeakObserved = s.walReclaim.peakObserved.Load()
 	out.ObservedPeakWALBytes = s.walReclaim.observedPeak.Load()
 	cycle := &s.walReclaim.cycle
@@ -1011,7 +1017,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	// open-gate stages disabled).
 	// 3. Writer quiescence, capped at walReclaimMaxWriterHold from here on.
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
-	err := s.writeMu.LockContext(wctx)
+	err := s.writeMu.lockReclaim(wctx)
 	wcancel()
 	if err != nil {
 		res.reason = "writer_gate"
@@ -1768,7 +1774,7 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 		return false, demand
 	}
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
-	err = s.writeMu.LockContext(wctx)
+	err = s.writeMu.lockReclaim(wctx)
 	wcancel()
 	if err != nil {
 		res.reason = "writer_gate"

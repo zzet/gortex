@@ -562,7 +562,22 @@ type RowCounterStatus struct {
 // WALReclaimStatus mirrors the store's bounded WAL-reclaim counters. Pause is
 // the time the read gate was closed for a reset; ReaderWait is the time new
 // reads spent waiting at it.
+// WALDurationHistogramStatus is a since-store-open distribution. Bucket counts
+// are disjoint so callers can subtract snapshots for a measured window.
+type WALDurationHistogramStatus struct {
+	Count        int64     `json:"count"`
+	TotalMS      float64   `json:"total_ms"`
+	MaxMS        float64   `json:"max_ms"`
+	P50MS        float64   `json:"p50_ms"`
+	P95MS        float64   `json:"p95_ms"`
+	BucketLeMS   []float64 `json:"bucket_le_ms"`
+	BucketCounts []int64   `json:"bucket_counts"`
+}
+
 type WALReclaimStatus struct {
+	WriterHold WALDurationHistogramStatus `json:"writer_hold"`
+	WriterWait WALDurationHistogramStatus `json:"writer_wait"`
+
 	// Same since-store-open observations exposed by graph_stats. The peak is
 	// a sampled lower bound and remains null until actually observed; reads
 	// and WAL resets never clear it or the cancellation counters.

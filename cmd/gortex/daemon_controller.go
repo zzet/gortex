@@ -1820,59 +1820,7 @@ func checkRowCounters(ctx context.Context, g graph.Store) *daemon.RowCounterStat
 }
 
 func walReclaimStatus(st store_sqlite.WALReclaimStats) *daemon.WALReclaimStatus {
-	out := &daemon.WALReclaimStatus{
-		CancelledWriterParked: st.CancelledWriterParked,
-		CancelledWriteIntent:  st.CancelledWriteIntent,
-		CancelledOther:        st.CancelledOther,
-		WALPeakObserved:       st.WALPeakObserved,
-
-		ThresholdBytes:   st.ThresholdBytes,
-		Attempts:         st.Attempts,
-		Resets:           st.Resets,
-		OpenGateResets:   st.OpenGateResets,
-		WriterHoldMaxMS:  durationMS(st.WriterHoldMax),
-		WriterHoldLastMS: durationMS(st.WriterHoldLast),
-		Deferrals:        st.Deferrals,
-		Skips:            st.Skips,
-		Failures:         st.Failures,
-		FramesReclaimed:  st.FramesReclaimed,
-		BytesReclaimed:   st.BytesReclaimed,
-		PauseCount:       st.PauseCount,
-		PauseMaxMS:       durationMS(st.PauseMax),
-		PauseLastMS:      durationMS(st.PauseLast),
-		ReaderWaits:      st.ReaderWaits,
-		ReaderWaitMaxMS:  durationMS(st.ReaderWaitMax),
-		BackoffMS:        st.Backoff.Milliseconds(),
-		LastOutcome:      st.LastOutcome,
-		LastReason:       st.LastReason,
-		CycleDeferrals:   st.CycleDeferrals,
-		CycleRefusals:    st.CycleRefusals,
-		CycleYields:      st.CycleYields,
-		CycleForced:      st.CycleForced,
-		CycleCeilingRuns: st.CycleCeilingRuns,
-		CeilingBytes:     st.CeilingBytes,
-
-		RetirementEditYields:        st.RetirementEditYields,
-		RetirementEditYieldTimeouts: st.RetirementEditYieldTimeouts,
-		RetirementWaits:             st.RetirementWaits,
-		RetirementWaitTimeouts:      st.RetirementWaitTimeouts,
-		LeaseOverrides:              st.LeaseOverrides,
-		ShrinkInPlaceResets:         st.ShrinkInPlaceResets,
-		ShrinkSlices:                st.ShrinkSlices,
-		ShrinkBytes:                 st.ShrinkBytes,
-		ShrinkSliceHoldMaxMS:        durationMS(st.ShrinkSliceHoldMax),
-	}
-	if st.WALPeakObserved {
-		peak := st.ObservedPeakWALBytes
-		out.ObservedPeakWALBytes = &peak
-	}
-	if st.PauseCount > 0 {
-		out.PauseAvgMS = durationMS(st.PauseTotal / time.Duration(st.PauseCount))
-	}
-	if st.ReaderWaits > 0 {
-		out.ReaderWaitAvgMS = durationMS(st.ReaderWaitTotal / time.Duration(st.ReaderWaits))
-	}
-	return out
+	return daemon.WALReclaimStatusFrom(st)
 }
 
 // buildLaneStatusFor renders the view-build lane: its holder (kind, checkout,

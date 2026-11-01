@@ -171,7 +171,7 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	// to about 2.4 s in a burst), then gives up. The hold itself stays
 	// walReclaimPressureHold.
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimPressureWriterWait)
-	err := s.writeMu.LockContext(wctx)
+	err := s.writeMu.lockReclaim(wctx)
 	wcancel()
 	if err != nil {
 		res.reason = "pressure_writer_busy"
