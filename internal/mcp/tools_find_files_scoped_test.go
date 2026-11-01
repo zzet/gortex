@@ -18,6 +18,7 @@ import (
 type findFilesProjectionStore struct {
 	*store_sqlite.Store
 	globalReads    int
+	edgeReads      int
 	projectedRepos []string
 	fullReads      int
 	summaryReads   int
@@ -40,6 +41,11 @@ func (s *findFilesProjectionStore) AllNodes() []*graph.Node {
 func (s *findFilesProjectionStore) AllNodesLight() []*graph.Node {
 	s.globalReads++
 	return s.Store.AllNodesLight()
+}
+
+func (s *findFilesProjectionStore) AllEdges() []*graph.Edge {
+	s.edgeReads++
+	return s.Store.AllEdges()
 }
 
 func (s *findFilesProjectionStore) NodesInScopeSeq(repos, files []string, kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
@@ -98,6 +104,7 @@ func TestFindFilesScopedNeverScansAndRowsStayFlat(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, res.IsError)
 		require.Zero(t, tracked.globalReads, "a scoped find_files read the whole store")
+		require.Zero(t, tracked.edgeReads, "a scoped find_files read every edge")
 		require.Zero(t, tracked.fullReads)
 		require.Zero(t, tracked.summaryReads, "no project narrows the scope, so file locations suffice")
 		require.Equal(t, 1, tracked.locationReads)
