@@ -597,9 +597,10 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 	}
 	putTiers := func(path string, tiers indexer.MutationTierState) {
 		at := tiers.RelationsAt
-		if scope == "file" {
+		switch scope {
+		case "file":
 			at = tiers.FileGraphAt
-		} else if scope == "derived" {
+		case "derived":
 			at = tiers.DerivedAt
 		}
 		state := ""
