@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -118,6 +120,116 @@ func TestEditProbeDeleteActivatedBeforeItsCreateCompletes(t *testing.T) {
 		if record := run.states[i].record; record.Outcome != "complete" || len(record.Errors) != 0 {
 			t.Fatalf("%s did not complete: %+v", step.Sender, record)
 		}
+	}
+}
+
+// A probe can enumerate the created file just before the native delete
+// removes it. Its later read must observe absence, not invent a fixture IO
+// failure. Prove presence first and force that exact ordering without sleeps.
+func TestEditProbeDiskSnapshotFollowsCreateThenConcurrentDelete(t *testing.T) {
+	c := editProbeCreateDeleteCorpus(t)
+	plan, err := makeEditProbePlan(c, 42, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, c.File), []byte(c.EditInitialContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	created := filepath.Join(dir, plan.Steps[0].File)
+	removeOnRead := false
+	var reported []error
+	handle := editProbeDiskRepliesWithReadFile(c, dir, func(err error) { reported = append(reported, err) }, func(path string) ([]byte, error) {
+		if path == created && removeOnRead {
+			removeOnRead = false
+			if err := os.Remove(path); err != nil {
+				return nil, err
+			}
+		}
+		return os.ReadFile(path)
+	})
+	invoke := func(oracle editProbeOracle) json.RawMessage {
+		t.Helper()
+		answer, rpcErr := handle(stubFrame{Method: "tools/call", Params: map[string]any{"name": oracle.call.Tool, "arguments": oracle.call.Arguments}})
+		if rpcErr != nil {
+			t.Fatal(rpcErr)
+		}
+		raw, err := json.Marshal(answer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	if _, found := editProbeExactNotFound(invoke(editProbeOracles(c, plan.Steps[0])[0]), "fixture/"+plan.Steps[1].BeforeSymbol); !found {
+		t.Fatal("not-yet-created file was not exactly absent")
+	}
+	content := plan.Steps[0].Request.Arguments["content"].(string)
+	if err := os.WriteFile(created, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	callee := c.Symbol[strings.LastIndex(c.Symbol, "::")+2:]
+	for _, oracle := range editProbeOracles(c, plan.Steps[0]) {
+		body, err := decodeEditProbeResult(invoke(oracle))
+		if err != nil || !editProbeCorrect(oracle.name, body, c, plan.Steps[0], callee) {
+			t.Fatalf("create presence was not proved by %s: %v %+v", oracle.name, err, body)
+		}
+	}
+	removeOnRead = true
+	for _, oracle := range editProbeOracles(c, plan.Steps[1]) {
+		raw := invoke(oracle)
+		if oracle.name == "source" {
+			if _, found := editProbeExactNotFound(raw, "fixture/"+plan.Steps[1].BeforeSymbol); !found {
+				t.Fatal("deleted file lacks its exact not-found identity")
+			}
+			continue
+		}
+		body, err := decodeEditProbeResult(raw)
+		if err != nil || !editProbeCorrect(oracle.name, body, c, plan.Steps[1], callee) {
+			t.Fatalf("delete absence was not proved by %s: %v %+v", oracle.name, err, body)
+		}
+	}
+	if removeOnRead {
+		t.Fatal("delete did not occur between enumeration and read")
+	}
+	if _, err := os.Stat(created); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("created file remains after causal delete: %v", err)
+	}
+	if len(reported) != 0 {
+		t.Fatalf("causal disappearance was reported as a fixture failure: %v", reported)
+	}
+}
+
+func TestEditProbeDiskSnapshotKeepsOtherReadFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, operation string
+		err             error
+	}{
+		{"snapshot_permission", "summary", os.ErrPermission},
+		{"direct_file_missing", "file", os.ErrNotExist},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := editProbeCreateDeleteCorpus(t)
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, c.File), []byte(c.EditInitialContent), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var reported []error
+			handle := editProbeDiskRepliesWithReadFile(c, dir, func(err error) { reported = append(reported, err) }, func(path string) ([]byte, error) {
+				return nil, &os.PathError{Op: "open", Path: path, Err: tc.err}
+			})
+			_, rpcErr := handle(stubFrame{Method: "tools/call", Params: map[string]any{"name": "read", "arguments": map[string]any{"operation": tc.operation, "target": map[string]any{"file": c.File}}}})
+			if rpcErr != nil {
+				t.Fatal(rpcErr)
+			}
+			if len(reported) == 0 {
+				t.Fatal("fixture read failure was silently accepted")
+			}
+			for _, err := range reported {
+				if !errors.Is(err, tc.err) {
+					t.Fatalf("wrong retained read failure: %v", err)
+				}
+			}
+		})
 	}
 }
 

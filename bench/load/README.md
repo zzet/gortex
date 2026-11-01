@@ -242,7 +242,7 @@ probes and immediate same-editing-session file/source readbacks. Session setup
 is outside the edit window. Future arrivals do not wait for earlier ACKs or
 probe replies. Canceled/unstarted edits remain in the offered denominator.
 
-`--edit-agents N` (1 to 32) runs N fixed editors against the same single
+`--edit-agents N` (1 to 32) defaults to N fixed editors against one
 repository. Each editor offers its own open-loop Poisson stream with the same
 15 second mean; editor 0 keeps the one-editor seeding, so `--edit-agents 1`
 offers exactly the original plan. The streams merge by due time (ties by editor
@@ -250,16 +250,38 @@ index) and the merge order is the global ordinal, so markers and mutation IDs
 stay keyed by ordinal and each ordinal is owned by one editor for the whole run.
 Plan steps and edit records name that editor. An edit and its immediate
 file/source readbacks go through its own editor's session; probes and receipt
-status stay on the edit's separate prober session, and run-level status, stats
-and the restore batch use editor 0. A blocked editor ACK does not delay another
-editor's arrival. Editors share one file. `edit.write` carries whole-file
+status stay on the edit's separate prober session, and run-level status and
+stats use editor 0. The singleton restore batch also uses editor 0. A blocked editor ACK does not delay another
+editor's arrival. In a singleton cell, editors share one file. `edit.write` carries whole-file
 content precomputed in ordinal order, so an out-of-order write would silently
 drop another editor's marker until the next write restored it; it is refused
 with more than one editor. An out-of-order `edit.batch` fails its `old_string`
 precondition and stays a failed record, and `edit.file` anchor insertions do
 not depend on order. The 1-edit diagnostic and
-the paired no-regression cell stay one editor. Routing across several
-repositories or linked worktrees is not implemented.
+the paired no-regression cell stay one editor.
+
+`--edit-repos 6 --edit-agents 6 --agents 0 --worktrees 0` selects exactly
+six distinct pinned repositories. Source checkouts that share one Git common
+directory count as one repository. For linked views of one pinned primary,
+use `--edit-repos 1 --worktrees 3 --edit-agents 4 --agents 0`; linked counts
+3, 7 and 15 give 4, 8 and 16 total checkouts. These routed cells require 100
+global offered edits, at least one fixed editor per checkout, and ordinary Go
+`add_intrafile_call` / `edit.file` / JSON fixtures. Pure readers, native and
+lifecycle senders, moves and other output/tool/language cells are explicitly
+unsupported for routed runs; their existing singleton cells remain separate.
+
+The plan pins every route's logical repository, checkout identity, commit,
+file and callee. A fixed editor, its immediate readbacks, and each edit's
+independent prober and receipt query stay on that checkout's cwd. Linked
+checkouts require their own exact public view admission even though their
+repository prefix is shared. Linked edit records retain that admitted checkout
+ID; a missing or different receipt checkout ID cannot supply terminal graph
+or accounting evidence. Each route restores its admitted original bytes
+through its own editor and transaction after mutation outcomes settle. The
+source repositories stay read-only. Route steps preserve the original merged
+editor arrival stream and global marker/mutation IDs; a route with no offered
+ordinal is not silently given an extra edit. Implementation and fixture tests
+do not establish a completed live or reference campaign.
 
 `edit_sender` selects a native or lifecycle traffic cell; without it every plan
 is unchanged, and paired runs refuse it. A native write goes around MCP, so its

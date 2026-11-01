@@ -22,6 +22,7 @@ type stubFrame struct {
 	Params     map[string]any `json:"params"`
 	Kind       string         `json:"kind"`
 	Connection int            `json:"-"`
+	Cwd        string         `json:"-"`
 }
 
 // A real newline-framed daemon stub exercises the public CLI's transport;
@@ -78,6 +79,7 @@ func startStub(t *testing.T, handle func(stubFrame) (any, *rpcError)) string {
 						return
 					}
 					frame.Connection = connectionID
+					frame.Cwd, _ = handshake["cwd"].(string)
 					if frame.Kind != "" {
 						result, _ := handle(frame)
 						encode(map[string]any{"ok": true, "result": result})
