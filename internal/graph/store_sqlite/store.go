@@ -46,11 +46,12 @@ import (
 type generationBulkCheckpointLease uint64
 
 type backgroundCheckpointAttempt struct {
-	ctx           context.Context
-	cancel        context.CancelCauseFunc
-	timeoutCancel context.CancelFunc
-	done          chan struct{}
-	finishOnce    sync.Once
+	reclaimInterruption atomic.Uint32 // first consumed cause; counted once by reclaimWALOnce
+	ctx                 context.Context
+	cancel              context.CancelCauseFunc
+	timeoutCancel       context.CancelFunc
+	done                chan struct{}
+	finishOnce          sync.Once
 	// copy is the attempt's paced copy, set before the lane watcher starts
 	// (its passes pause only once the attempt marks it pausable).
 	copy *walCopyAttempt
@@ -432,8 +433,12 @@ type storeCore struct {
 	jsonbIngestBuffers jsonbIngestBuffers
 
 	// bulkFinalizeObserver is a package-private test/diagnostic hook. It runs
-	// synchronously under writeMu and therefore must not call back into Store.
+	// synchronously under writeMu on cold paths; live FTS finalize emits after
+	// releasing the gate. Cold observers must not call back into Store.
 	bulkFinalizeObserver func(bulkFinalizeEvent)
+	// Live FTS-finalize statement trace for tests; invoked only on those two
+	// maintenance calls, never on ordinary graph/edit writes.
+	ftsMaintenanceObserver func(string, []any)
 
 	// Planner-statistics freshness ledger (planner_stats_freshness.go). It
 	// lives on the core rather than the handle so every AtGeneration view
@@ -1096,6 +1101,10 @@ var errGenerationBulkCheckpointCoordination = errors.New("store_sqlite: generati
 // cancelled with that cause when a cycle takes the lane (see
 // checkpoint_cycle_yield.go).
 func (s *Store) beginBackgroundCheckpointAttempt(policy checkpointCyclePolicy) (*backgroundCheckpointAttempt, error) {
+	return s.beginCheckpointAttempt(policy, false)
+}
+
+func (s *Store) beginCheckpointAttempt(policy checkpointCyclePolicy, reclaim bool) (*backgroundCheckpointAttempt, error) {
 	yieldPolicy := policy == checkpointYieldsToCycle || policy == checkpointOverridesLease
 	yields := yieldPolicy && s.cycleYieldEnabled()
 	overridesLease := policy == checkpointOverridesLease || policy == checkpointOverridesLeaseAndCycle
@@ -1113,6 +1122,10 @@ func (s *Store) beginBackgroundCheckpointAttempt(policy checkpointCyclePolicy) (
 		timeoutCancel: timeoutCancel,
 		done:          make(chan struct{}),
 		copy:          &walCopyAttempt{},
+	}
+
+	if reclaim {
+		attempt.ctx = context.WithValue(ctx, walReclaimAttemptKey{}, attempt)
 	}
 
 	coordination := &s.backgroundCheckpoint

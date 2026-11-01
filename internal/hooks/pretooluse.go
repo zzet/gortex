@@ -1205,7 +1205,7 @@ func readOnlyNativeAllowance(writing bool) enrichResult {
 // hook lets it through because the path's repository is still loading.
 func repoLoadingNativeAllowance(repo string) string {
 	if repo == "" {
-		repo = "this repository"
+		return "[Gortex] Graph admission for this path is still resolving and is not yet established (repo_loading, identity_pending). Native tools are allowed while this temporary state resolves. Retry shortly without changing tracking configuration.\n"
 	}
 	return fmt.Sprintf("[Gortex] %s is still loading after a restart; graph tools return repo_loading until it is ready. "+
 		"Native reads are allowed until then.\n", repo)
@@ -1314,7 +1314,7 @@ func fileIndexStatusFromCoverage(result daemon.FileCoverageResult) fileIndexStat
 		st.ProbeOK, st.ReadOnly, st.MutationKnown, st.MutationReason = true, true, true, result.MutationReason
 	}
 	st.MutationKnown = st.MutationKnown || result.MutationState == "ready"
-	if result.RepoState == daemon.RepoStateLoading {
+	if result.RepoState == daemon.RepoStateLoading || result.RepoState == daemon.RepoStateIdentityPending {
 		// Coverage read from a loading repository's persisted rows is not a
 		// reason to deny: report it as loading, never as indexed.
 		st.ProbeOK, st.Loading, st.LoadingRepo = true, true, result.Repo
@@ -1476,6 +1476,32 @@ func enrichBashWithProbe(toolInput map[string]any, cwd string, probe fileScopePr
 	if outsideGraph(c) {
 		c = classifyBashReadCommandSkipping(cmd, outsideGraph)
 	}
+	// An inline Python one-liner or heredoc that opens indexed source is the
+	// read door agents take once cat and grep are redirected. It is answered
+	// for every command, not only when the shell leaves it passthrough: a
+	// read/grep/find that follows it would otherwise make the command
+	// non-passthrough and skip the Python analysis, so `python3 -c "…"`
+	// chained after a `head` still answers. The analysis is self-limiting and
+	// silent for commands that carry no inline Python.
+	//
+	// A Python deny answers at once. Anything softer (the edit advisory, a
+	// read-only or loading allowance) must not cost the command a deny its
+	// shell read earns on its own, so the shell answer is taken first when
+	// it denies.
+	py, pyAnswered := enrichBashScriptRead(cmd, cwd, probe)
+	if pyAnswered && (py.deny || c.Action == BashActionPassthrough) {
+		return py
+	}
+	shell := enrichBashShellRead(c, cwd, probe)
+	if shell.deny || !pyAnswered {
+		return shell
+	}
+	return py
+}
+
+// enrichBashShellRead answers the grep, find or source read a classified
+// Bash command leads with.
+func enrichBashShellRead(c BashClassification, cwd string, probe fileScopeProbe) enrichResult {
 	switch c.Action {
 	case BashActionGrepLike:
 		return probeSymbolPattern("Bash", c.Pattern, cwd, defaultGrepGuidance())
@@ -1614,7 +1640,7 @@ var dirCoverageFn = dirCoverageViaDaemon
 // Only a completed walk that claimed nothing proves a scope holds no source.
 // From the graph alone a scope mid-walk looks exactly like an excluded one.
 func scopeTrackedFromCoverage(result daemon.DirCoverageResult) (hasSource, probeOK bool) {
-	if result.RepoState == daemon.RepoStateLoading {
+	if result.RepoState == daemon.RepoStateLoading || result.RepoState == daemon.RepoStateIdentityPending {
 		// A loading repository's scope holds nothing the graph will answer
 		// for yet, whatever its persisted rows say (see fileIndexStatus).
 		return false, true

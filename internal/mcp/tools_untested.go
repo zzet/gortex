@@ -7,21 +7,26 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/graphpath"
 )
 
 // handleGetUntestedSymbols returns functions and methods in non-test files
 // that no test file reaches via the call graph — the inverse of
-// get_test_targets. Test reachability is computed in a single forward BFS
-// from every symbol defined in a test file, walking `calls` and
-// `references` edges; any non-test function/method not visited is
-// considered uncovered.
+// get_test_targets. Coverage follows calls/references in the candidates'
+// ancestor closure, then marks the paths from discovered test functions and
+// methods. Real foreign tests remain evidence; disconnected repositories do
+// no coverage work. Non-test functions/methods outside those paths are uncovered.
 //
 // This is the "where should we add tests first" tool: results are sorted by
 // fan_in descending so the most-used untested symbols surface at the top —
 // they're the ones most likely to break something when changed without a
 // safety net.
 func (s *Server) handleGetUntestedSymbols(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	limit := req.GetInt("limit", 50)
 	if limit <= 0 {
 		limit = 50
@@ -29,18 +34,20 @@ func (s *Server) handleGetUntestedSymbols(ctx context.Context, req mcp.CallToolR
 	filePrefix := req.GetString("file_prefix", "")
 	minFanIn := req.GetInt("min_fan_in", 0)
 
-	// One reader for the whole call: both passes below must see the same
-	// state, and under an overlay that state is the caller's buffers.
-	reader := s.readerFor(ctx)
-	covered := reachableFromTests(reader)
-
-	// Fan-in map for ranking — incoming calls/references only; imports and
-	// defines would flood every exported symbol with meaningless coverage.
-	// Backends that implement graph.InEdgeCounter serve this from one
-	// count(*) join — on a disk backend the legacy AllEdges() loop
-	// materialised every edge over the storage boundary just to bucket two kinds. The
-	// fallback walks AllEdges() as before.
-	fanIn := collectFanInByKind(reader, []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences})
+	// Candidate ownership is scoped before payloads cross the storage boundary.
+	// Coverage and fan-in then follow only those identities' real callers,
+	// retaining cross-repository evidence through the selected edge mask.
+	reader := graph.BindReadContext(s.readerFor(ctx), ctx)
+	opts, _ := s.scopeOptionsWithRepoNarrow(ctx, repoAllowFromContext(ctx))
+	scope := graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}
+	candidates, err := untestedCandidates(ctx, reader, scope, filePrefix)
+	if err != nil {
+		return nil, err
+	}
+	covered, fanIn, err := candidateTestCoverage(ctx, reader, candidates)
+	if err != nil {
+		return nil, err
+	}
 
 	type untestedEntry struct {
 		ID       string `json:"id"`
@@ -52,17 +59,8 @@ func (s *Server) handleGetUntestedSymbols(ctx context.Context, req mcp.CallToolR
 	}
 
 	var entries []untestedEntry
-	totalCandidates := 0
-	scoped := s.scopedNodesByKinds(ctx, []graph.NodeKind{graph.KindFunction, graph.KindMethod})
-	for _, n := range scoped {
-		// Skip symbols defined inside test files — those ARE test code.
-		if isTestFile(n.FilePath) {
-			continue
-		}
-		if !graphpath.HasPrefix(n.FilePath, filePrefix) {
-			continue
-		}
-		totalCandidates++
+	totalCandidates := len(candidates)
+	for _, n := range candidates {
 		if covered[n.ID] {
 			continue
 		}
@@ -181,11 +179,10 @@ func reachableFromTests(g graph.Reader) map[string]bool {
 }
 
 // collectFanInByKind returns the per-target incoming-edge count for
-// every edge whose kind is in the allowlist. Prefers the
-// graph.InEdgeCounter capability — backends that ship it run one
-// count(*) per request instead of an AllEdges() materialisation
-// + Go-side bucketing. An overlay view has no counter, so an
-// overlay-active request buckets its edges Go-side.
+// every edge whose kind is in the allowlist. This is the whole-corpus
+// reference helper; the scoped handler counts its candidate adjacency above.
+// Backends can aggregate by kind; capability-less views stream the selected
+// kinds through their own masks rather than materializing AllEdges.
 func collectFanInByKind(g graph.Reader, kinds []graph.EdgeKind) map[string]int {
 	if len(kinds) == 0 {
 		return map[string]int{}
@@ -196,16 +193,18 @@ func collectFanInByKind(g graph.Reader, kinds []graph.EdgeKind) map[string]int {
 		}
 		return map[string]int{}
 	}
-	allowed := make(map[graph.EdgeKind]struct{}, len(kinds))
-	for _, k := range kinds {
-		allowed[k] = struct{}{}
-	}
+	seen := make(map[graph.EdgeKind]bool, len(kinds))
 	out := make(map[string]int)
-	for _, e := range g.AllEdges() {
-		if _, ok := allowed[e.Kind]; !ok {
+	for _, kind := range kinds {
+		if seen[kind] {
 			continue
 		}
-		out[e.To]++
+		seen[kind] = true
+		for edge := range g.EdgesByKind(kind) {
+			if edge != nil {
+				out[edge.To]++
+			}
+		}
 	}
 	return out
 }

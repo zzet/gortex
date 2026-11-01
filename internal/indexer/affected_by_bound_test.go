@@ -640,7 +640,7 @@ func enqueueAffectedByPointMutationWith(
 //
 // Revert-red: remove the derived-fan-out window from
 // patchGraphWithReceiptStateRawModern (or stop threading it into
-// completeMutationWaitersWithFanout, or drop the field from MutationResult)
+// completeMutationWaitersObserved, or drop the field from MutationResult)
 // and a knowingly incomplete mutation reports Observed=false — the shape in
 // which the fact reached the receipt and then reached no consumer at all.
 func TestAdmittedPointMutationReportsTheDerivedFanoutCut(t *testing.T) {
@@ -843,7 +843,7 @@ func TestFailedPointMutationPublishesNoDerivedFanoutVerdict(t *testing.T) {
 	t.Run("executor fails after the bounded pass ran", func(t *testing.T) {
 		result, observed, _ := enqueueAffectedByPointMutationWith(t, newSqliteGraph(t), 3, 2,
 			func(idx *Indexer, w *Watcher) {
-				w.pointReindexRaw = func(path string) (*IndexResult, error) {
+				w.pointReindexRaw = func(path string, _ *PublicationStamps) (*IndexResult, error) {
 					// Run the real executor first so the bounded pass records a
 					// genuine cut into this mutation's window, then fail.
 					_, _ = idx.incrementalPointWatcherPath(idx.rootPath, path)
@@ -864,7 +864,7 @@ func TestFailedPointMutationPublishesNoDerivedFanoutVerdict(t *testing.T) {
 	t.Run("patch fails after the executor returned", func(t *testing.T) {
 		result, observed, _ := enqueueAffectedByPointMutationWith(t, newSqliteGraph(t), 3, 2,
 			func(idx *Indexer, w *Watcher) {
-				w.pointReindexRaw = func(path string) (*IndexResult, error) {
+				w.pointReindexRaw = func(path string, _ *PublicationStamps) (*IndexResult, error) {
 					out, err := idx.incrementalPointWatcherPath(idx.rootPath, path)
 					if out != nil {
 						out.FailedFiles = append(out.FailedFiles, path)
@@ -968,7 +968,7 @@ func TestPatchGraphObservingFanoutStampsNothingOnAFailedPatch(t *testing.T) {
 	idx.SetRootPath(dir)
 	w, err := NewWatcher(idx, config.WatchConfig{Enabled: true, DebounceMs: 5}, zap.NewNop())
 	require.NoError(t, err)
-	w.pointReindexRaw = func(path string) (*IndexResult, error) {
+	w.pointReindexRaw = func(path string, _ *PublicationStamps) (*IndexResult, error) {
 		// The bounded pass runs for real and is cut, so a verdict exists.
 		_, _ = idx.incrementalPointWatcherPath(idx.rootPath, path)
 		return nil, errors.New("watcher-test: executor failed after the bounded pass")
