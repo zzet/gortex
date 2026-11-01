@@ -134,9 +134,10 @@ func TestWarmupWALWaitGatesNextAllocationUntilReaderProgress(t *testing.T) {
 				"warmup did not request the existing production reclaim")
 			require.Zero(t, allocations.Load())
 			require.Equal(t, before, walFileSize(s.dbPath+"-wal"), "refused producer allocated another chunk")
-			if kind == "reader_release" {
+			switch kind {
+			case "reader_release":
 				require.NoError(t, pin.Rollback())
-			} else if kind == "cancel" {
+			case "cancel":
 				cancel()
 			}
 			select {
