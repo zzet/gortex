@@ -89,12 +89,12 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/home/u/.local/bin/gortex daemon start`
+ExecStart=/srv/u/.local/bin/gortex daemon start`
 	const tail = `
 Restart=on-failure
 RestartSec=2
-StandardOutput=append:/home/u/100%% logs/daemon.stderr.log
-StandardError=append:/home/u/100%% logs/daemon.stderr.log
+StandardOutput=append:/srv/u/100%% logs/daemon.stderr.log
+StandardError=append:/srv/u/100%% logs/daemon.stderr.log
 
 [Install]
 WantedBy=default.target
@@ -108,21 +108,21 @@ WantedBy=default.target
 		{
 			name: "env",
 			env: []serviceEnvVar{
-				{Key: "XDG_CACHE_HOME", Value: "/home/u/.cache"},
-				{Key: "XDG_DATA_HOME", Value: "/home/u/has space"},
-				{Key: "XDG_CONFIG_HOME", Value: `/home/u/"q"\x`},
-				{Key: "GORTEX_DAEMON_LOGFILE", Value: "/home/u/100% logs/daemon.log"},
+				{Key: "XDG_CACHE_HOME", Value: "/srv/u/.cache"},
+				{Key: "XDG_DATA_HOME", Value: "/srv/u/has space"},
+				{Key: "XDG_CONFIG_HOME", Value: `/srv/u/"q"\x`},
+				{Key: "GORTEX_DAEMON_LOGFILE", Value: "/srv/u/100% logs/daemon.log"},
 			},
 			vars: `
-Environment=XDG_CACHE_HOME=/home/u/.cache
-Environment="XDG_DATA_HOME=/home/u/has space"
-Environment="XDG_CONFIG_HOME=/home/u/\"q\"\\x"
-Environment="GORTEX_DAEMON_LOGFILE=/home/u/100%% logs/daemon.log"`,
+Environment=XDG_CACHE_HOME=/srv/u/.cache
+Environment="XDG_DATA_HOME=/srv/u/has space"
+Environment="XDG_CONFIG_HOME=/srv/u/\"q\"\\x"
+Environment="GORTEX_DAEMON_LOGFILE=/srv/u/100%% logs/daemon.log"`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("PATH", "")
-			out := renderSystemdUnit("/home/u/.local/bin/gortex", "/home/u/100% logs/daemon.stderr.log", tc.env)
+			out := renderSystemdUnit("/srv/u/.local/bin/gortex", "/srv/u/100% logs/daemon.stderr.log", tc.env)
 			require.Equal(t, head+tc.vars+tail, out)
 		})
 	}
