@@ -132,6 +132,12 @@ func parseGateEnabled() bool {
 // to text, binary to binary — carry no parse-error baseline at all, so
 // they are never a regression.
 func checkParseGate(path string, oldContent, newContent []byte) parseGateResult {
+	return checkParseGateWithVerdict(path, oldContent, newContent, false, 0)
+}
+
+// A supplied verdict describes the exact candidate bytes. Unknown input uses
+// the original parse; binary transitions and old-byte comparisons stay shared.
+func checkParseGateWithVerdict(path string, oldContent, newContent []byte, checked bool, candidateErrors int) parseGateResult {
 	lang := parseGateLanguage(path)
 	if lang == "" {
 		return parseGateResult{Language: lang}
@@ -148,7 +154,10 @@ func checkParseGate(path string, oldContent, newContent []byte) parseGateResult 
 			Language:     lang,
 		}
 	}
-	newErrs, newOK := parseErrorCount(lang, newContent)
+	newErrs, newOK := candidateErrors, checked && candidateErrors >= 0
+	if !newOK {
+		newErrs, newOK = parseErrorCount(lang, newContent)
+	}
 	if !newOK {
 		return parseGateResult{Language: lang}
 	}
