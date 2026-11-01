@@ -197,18 +197,8 @@ func TestMemoryGaugesRecordSeriesAndHeapProfiles(t *testing.T) {
 			// The series starts once the daemon is ready, ahead of the warmup
 			// gates, so it covers the level after enrichment before any load.
 			rows := readSeries(t, phase)
-			first, probes := rows[0].Received, 0
-			for _, attempt := range phase.Attempts {
-				if attempt.Role != "probe" {
-					continue
-				}
-				probes++
-				if !first.Before(attempt.Started) {
-					t.Fatalf("series started after a warmup gate: first row %v, gate call %v", first, attempt.Started)
-				}
-			}
-			if probes == 0 {
-				t.Fatal("no warmup gate calls recorded")
+			if err := gaugeWarmupOrderError(rows, phase.Attempts); err != nil {
+				t.Fatal(err)
 			}
 			if profiles {
 				readProfile(t, artifacts["heap_profile_load_start"], "")

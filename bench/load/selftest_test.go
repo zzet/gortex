@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -82,6 +83,7 @@ func fixtureDaemon(mode string) int {
 		return len(views)
 	}
 	var shutdown sync.Once
+	var warmupCalls atomic.Uint64
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -157,6 +159,9 @@ func fixtureDaemon(mode string) int {
 					}
 					result = map[string]any{"contents": []any{map[string]any{"type": "text", "text": payload}}}
 				case "tools/call":
+					if frame.Params["name"] != "session" {
+						warmupCalls.Add(1)
+					}
 					arguments, _ := frame.Params["arguments"].(map[string]any)
 					switch {
 					case frame.Params["name"] == "analyze":
@@ -169,18 +174,26 @@ func fixtureDaemon(mode string) int {
 							}
 						}
 						healthOnce.Do(func() {
+							sendHealth := func(initial bool) error {
+								health := map[string]any{"ts": time.Now().UTC().Format(time.RFC3339Nano), "coordinators": coordinators(), "sqlite_page_cache_bytes": 4096, "initial_replay": initial, "fixture_warmup_calls": warmupCalls.Load()}
+								return encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/daemon_health", "params": health})
+							}
+							// Production delivers its initial replay before the subscribe
+							// reply. Keep that causal boundary independent of clock ticks.
+							if sendHealth(true) != nil {
+								return
+							}
 							go func() {
 								ticker := time.NewTicker(interval)
 								defer ticker.Stop()
 								for {
-									health := map[string]any{"ts": time.Now().UTC().Format(time.RFC3339Nano), "coordinators": coordinators(), "sqlite_page_cache_bytes": 4096}
-									if encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/daemon_health", "params": health}) != nil {
-										return
-									}
 									select {
 									case <-healthDone:
 										return
 									case <-ticker.C:
+										if sendHealth(false) != nil {
+											return
+										}
 									}
 								}
 							}()
