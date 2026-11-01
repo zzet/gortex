@@ -697,6 +697,9 @@
                                   }
                                 ]
                               },
+                              "checkout_id": {
+                                "type": "string"
+                              },
                               "editor": {
                                 "type": "integer"
                               },

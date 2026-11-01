@@ -274,7 +274,9 @@ The plan pins every route's logical repository, checkout identity, commit,
 file and callee. A fixed editor, its immediate readbacks, and each edit's
 independent prober and receipt query stay on that checkout's cwd. Linked
 checkouts require their own exact public view admission even though their
-repository prefix is shared. Each route restores its admitted original bytes
+repository prefix is shared. Linked edit records retain that admitted checkout
+ID; a missing or different receipt checkout ID cannot supply terminal graph
+or accounting evidence. Each route restores its admitted original bytes
 through its own editor and transaction after mutation outcomes settle. The
 source repositories stay read-only. Route steps preserve the original merged
 editor arrival stream and global marker/mutation IDs; a route with no offered

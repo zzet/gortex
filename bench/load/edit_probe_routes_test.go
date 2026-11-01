@@ -129,7 +129,14 @@ func TestEditProbeSelectedCheckoutsKeepProberSessionsOnTheirEditorRoute(t *testi
 				editors = append(editors, client)
 			}
 			t.Cleanup(func() { closeClients(editors) })
-			phase := &Phase{Metrics: map[string]Metric{}}
+			phase := &Phase{Metrics: map[string]Metric{}, Gate: map[string]json.RawMessage{}}
+			if sharedPrefix {
+				view, err := json.Marshal(map[string]any{"view": map[string]any{"kind": "worktree", "exact": true, "repo_prefix": "fixture", "checkout_id": "socket-linked-checkout"}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				phase.Gate["linked-1.view"] = view
+			}
 			options := runOptions{Seed: 42, EditCount: 100, Editors: 2, Deadline: time.Second}
 			if sharedPrefix {
 				options.Worktrees = 1 // one linked checkout in addition to primary

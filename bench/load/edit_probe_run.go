@@ -32,6 +32,7 @@ type editProbeRecord struct {
 	Ordinal                  int                       `json:"ordinal"`
 	Editor                   int                       `json:"editor,omitempty"`
 	Route                    string                    `json:"route,omitempty"`
+	CheckoutID               string                    `json:"checkout_id,omitempty"`
 	Marker                   string                    `json:"marker"`
 	MutationID               string                    `json:"mutation_id"`
 	PlannedDueNS             int64                     `json:"planned_due_ns"`
@@ -125,6 +126,7 @@ type editProbeRuntime struct {
 	states            []*editProbeState
 	original          []byte
 	originals         map[string][]byte // routed checkout path -> independently admitted original bytes
+	checkoutIDs       map[string]string // linked checkout path -> exact admitted public view identity
 	moveOriginal      []byte
 	origin            time.Time
 	mu                sync.Mutex // Phase.Attempts, reads and mode counts only; request lifetimes are never serialized
@@ -250,6 +252,9 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	if err != nil {
 		return nil, nil, err
 	}
+	if len(plan.Routes) > 0 && len(plan.Routes) != len(p.Repos) {
+		return nil, nil, errors.New("offered edit routes differ from registered private checkout count")
+	}
 	if len(p.Repos) > 1 {
 		for _, repo := range p.Repos {
 			c := repo.Corpus
@@ -312,6 +317,29 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 			r.originals[repo.Path] = data
 		}
 	}
+	if plan.LinkedWorktrees > 0 {
+		r.checkoutIDs = make(map[string]string, plan.LinkedWorktrees)
+		seen := map[string]bool{}
+		for _, repo := range p.Repos[1:] {
+			var admitted struct {
+				View *struct {
+					Kind   string `json:"kind"`
+					Exact  bool   `json:"exact"`
+					Prefix string `json:"repo_prefix"`
+					ID     string `json:"checkout_id"`
+				} `json:"view"`
+			}
+			if err := json.Unmarshal(phase.Gate[repo.Corpus.Label+".view"], &admitted); err != nil || admitted.View == nil || !admitted.View.Exact || admitted.View.Kind != "worktree" || admitted.View.Prefix != repo.Prefix || strings.TrimSpace(admitted.View.ID) == "" {
+				return r, nil, errors.New("linked checkout has no exact admitted public checkout identity")
+			}
+			id := admitted.View.ID
+			if seen[id] {
+				return r, nil, errors.New("linked checkouts share an admitted checkout identity")
+			}
+			seen[id] = true
+			r.checkoutIDs[repo.Path] = id
+		}
+	}
 	if plan.Tool == "refactor.move" {
 		r.moveOriginal, err = os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(p.Repos[0].Corpus.EditDestination)))
 		if err != nil {
@@ -342,6 +370,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 			return r, nil, err
 		}
 		record := newEditProbeRecord(repo.Corpus, step)
+		record.CheckoutID = r.checkoutIDs[repo.Path]
 		record.Outcome = "not_started"
 		record.Errors = nil
 		state := &editProbeState{step: step, record: record}
@@ -884,6 +913,12 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			}
 			if statusErr == nil {
 				if status, decodeErr := decodeEditProbeResult(raw); decodeErr == nil {
+					if expected := s.record.CheckoutID; expected != "" && status["checkout_id"] != expected {
+						s.mu.Lock()
+						s.record.Errors = append(s.record.Errors, "status checkout identity does not match the admitted linked view")
+						s.mu.Unlock()
+						break // Foreign terminal/accounting fields cannot settle this edit.
+					}
 					accounting := checkEditProbeAccountingForTool(status, receipt, r.plan.Tool)
 					s.mu.Lock()
 					s.record.Accounting = accounting
