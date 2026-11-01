@@ -11,6 +11,7 @@ type metricSpec struct {
 }
 
 var metricSpecs = map[string]metricSpec{
+	"readback_max":          {unit: "s", axis: "timing", everyRepeat: true, missing: "report-v1 does not retain exact edited-file readback latency"},
 	"wal_p95_mib":           {unit: "MiB", axis: "disk", missing: "report-v1 does not retain a WAL observation distribution"},
 	"edit_ack_p95":          {unit: "s", axis: "timing"},
 	"edit_ack_max":          {unit: "s", axis: "timing", everyRepeat: true},

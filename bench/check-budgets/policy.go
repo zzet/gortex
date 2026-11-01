@@ -151,10 +151,13 @@ func (p policy) validate() error {
 			return fmt.Errorf("budget %d: %w", i+1, err)
 		}
 		key := b.HostClass + "/" + b.Scenario + "/" + b.Metric
-		if seen[key] {
-			return fmt.Errorf("duplicate budget %s", key)
+		for _, lane := range b.Lane {
+			laneKey := key + "/" + lane
+			if seen[laneKey] {
+				return fmt.Errorf("duplicate budget %s", laneKey)
+			}
+			seen[laneKey] = true
 		}
-		seen[key] = true
 	}
 	return nil
 }
