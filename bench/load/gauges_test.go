@@ -3,12 +3,93 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type gaugeFixtureSampler map[string]Metric
+
+func (s gaugeFixtureSampler) sample(int) map[string]Metric { return s }
+
+func TestHeapProfilesWithoutFootprintDoNotAdvertisePeak(t *testing.T) {
+	for _, cell := range []struct {
+		name      string
+		available bool
+		fail      bool
+		keepPrior bool
+	}{{"unavailable", false, false, false}, {"measured", true, false, false}, {"capture_failure", true, true, false}, {"later_capture_failure", true, true, true}} {
+		t.Run(cell.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/debug/pprof/heap" {
+					t.Errorf("unexpected profile endpoint: %s", r.URL)
+				}
+				if count := requests.Add(1); cell.fail && (!cell.keepPrior || count > 2) {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				_, _ = w.Write([]byte("retained-heap-profile"))
+			}))
+			defer server.Close()
+			status, _ := json.Marshal(map[string]any{"pprof_addr": strings.TrimPrefix(server.URL, "http://")})
+			metrics := absentProcessMetrics("fixture has no process collector")
+			if cell.available {
+				metrics["rss_bytes"] = measured(4096, "bytes")
+			}
+			series := &gaugeSeries{client: &socketClient{}, sampler: gaugeFixtureSampler(metrics)}
+			window := series.watchLoad(t.Context(), status, filepath.Join(t.TempDir(), "load"))
+			if cell.keepPrior {
+				window.observe(metrics)
+				metrics["rss_bytes"] = measured(8192, "bytes")
+			}
+			phase := &Phase{Gate: make(map[string]json.RawMessage)}
+			artifacts := map[string]string{}
+			err := series.endLoadProfiles(window, phase, artifacts)
+			if cell.fail {
+				if err == nil || len(phase.Gate["heap_profile_load_peak_unavailable"]) != 0 {
+					t.Fatalf("profile capture failure became unavailable telemetry: %v %s", err, phase.Gate)
+				}
+				peak, advertised := artifacts["heap_profile_load_peak"]
+				if cell.keepPrior {
+					if data, err := os.ReadFile(peak); !advertised || err != nil || string(data) != "retained-heap-profile" {
+						t.Fatalf("later capture failure lost the actual earlier peak: %q %v", data, err)
+					}
+				} else if advertised {
+					t.Fatalf("failed peak capture advertised a nonexistent artifact: %s", peak)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if data, err := os.ReadFile(artifacts["heap_profile_load_start"]); err != nil || string(data) != "retained-heap-profile" {
+				t.Fatalf("load-start profile lost: %q %v", data, err)
+			}
+			peak, advertised := artifacts["heap_profile_load_peak"]
+			if !cell.available {
+				if advertised {
+					t.Fatalf("unmeasured peak advertised as an artifact: %s", peak)
+				}
+				if _, err := os.Stat(window.peak); !os.IsNotExist(err) {
+					t.Fatalf("unavailable footprint produced a peak file: %v", err)
+				}
+				var reason string
+				if err := json.Unmarshal(phase.Gate["heap_profile_load_peak_unavailable"], &reason); err != nil || reason == "" {
+					t.Fatalf("missing peak has no explicit unavailable reason: %q %v", reason, err)
+				}
+			} else if data, err := os.ReadFile(peak); !advertised || err != nil || string(data) != "retained-heap-profile" {
+				t.Fatalf("measured peak profile lost: %q %v", data, err)
+			}
+		})
+	}
+}
 
 func TestWorktreeStepAndGaugeOptions(t *testing.T) {
 	base := []string{"--binary", "unused", "--manifest", "unused", "--scratch", t.TempDir()}
@@ -92,6 +173,17 @@ func TestMemoryGaugesRecordSeriesAndHeapProfiles(t *testing.T) {
 			t.Fatalf("heap profile %q not retained: %q %v", path, data, err)
 		}
 	}
+	readPeak := func(t *testing.T, path, reason string, sampled, advertised bool) {
+		t.Helper()
+		if sampled {
+			if reason != "" || !advertised {
+				t.Fatalf("measured peak marked unavailable: %q %v", reason, advertised)
+			}
+			readProfile(t, path, "")
+		} else if reason == "" || path != "" || advertised {
+			t.Fatalf("unavailable peak advertised without a reason: %q %q %v", path, reason, advertised)
+		}
+	}
 
 	t.Run("gauges", func(t *testing.T) {
 		for _, profiles := range []bool{false, true} {
@@ -104,7 +196,8 @@ func TestMemoryGaugesRecordSeriesAndHeapProfiles(t *testing.T) {
 			}
 			// The series starts once the daemon is ready, ahead of the warmup
 			// gates, so it covers the level after enrichment before any load.
-			first, probes := readSeries(t, phase)[0].Received, 0
+			rows := readSeries(t, phase)
+			first, probes := rows[0].Received, 0
 			for _, attempt := range phase.Attempts {
 				if attempt.Role != "probe" {
 					continue
@@ -119,7 +212,20 @@ func TestMemoryGaugesRecordSeriesAndHeapProfiles(t *testing.T) {
 			}
 			if profiles {
 				readProfile(t, artifacts["heap_profile_load_start"], "")
-				readProfile(t, artifacts["heap_profile_load_peak"], "")
+				sampled := false
+				for _, row := range rows {
+					if _, ok := footprintOf(row.Process); ok {
+						sampled = true
+					}
+				}
+				var reason string
+				if raw := phase.Gate["heap_profile_load_peak_unavailable"]; len(raw) != 0 {
+					if err := json.Unmarshal(raw, &reason); err != nil {
+						t.Fatal(err)
+					}
+				}
+				peak, advertised := artifacts["heap_profile_load_peak"]
+				readPeak(t, peak, reason, sampled, advertised)
 				continue
 			}
 			taken, _ := filepath.Glob(filepath.Join(artifacts["private_root"], "*.pprof*"))
@@ -152,7 +258,9 @@ func TestMemoryGaugesRecordSeriesAndHeapProfiles(t *testing.T) {
 				t.Fatalf("step %d has no load-window process peaks: %+v", i, step.Load)
 			}
 			readProfile(t, step.HeapLoadStart, "")
-			readProfile(t, step.HeapLoadPeak, "")
+			_, sampled := footprintOf(map[string]Metric{"rss_bytes": step.Load["peak_rss_bytes"], "pss_bytes": step.Load["peak_pss_bytes"], "phys_footprint_bytes": step.Load["peak_phys_footprint_bytes"]})
+			_, advertised := artifacts[stepArtifact(i, "heap_profile_load_peak")]
+			readPeak(t, step.HeapLoadPeak, step.HeapLoadPeakUnavailable, sampled, advertised)
 			readProfile(t, step.HeapIdle, "1")
 			if artifacts[stepArtifact(i, "heap_profile_load_peak")] != step.HeapLoadPeak || artifacts[stepArtifact(i, "heap_profile_idle")] != step.HeapIdle {
 				t.Fatalf("step %d profile is not a run artifact: %v", i, artifacts)

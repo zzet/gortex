@@ -145,12 +145,14 @@ func (s *gaugeSeries) stop() ([]gaugeRow, error) {
 // load starts, and one at the highest daemon footprint the series sampled
 // during it (or at the window's end, when that is higher).
 type heapWindow struct {
-	ctx    context.Context
-	status json.RawMessage
-	start  string
-	peak   string
-	high   float64
-	err    error
+	ctx             context.Context
+	status          json.RawMessage
+	start           string
+	peak            string
+	peakCaptured    bool
+	peakUnavailable string
+	high            float64
+	err             error
 }
 
 // watchLoad takes the load-start profile now and the peak profile as rows
@@ -170,6 +172,13 @@ func (s *gaugeSeries) endLoad(w *heapWindow) (start, peak string, err error) {
 	defer s.mu.Unlock()
 	s.watch = nil
 	w.observe(s.sample())
+	if w.high < 0 {
+		w.peakUnavailable = "no external process footprint sample was available during load"
+		return w.start, "", w.err
+	}
+	if !w.peakCaptured {
+		return w.start, "", w.err
+	}
 	return w.start, w.peak, w.err
 }
 
@@ -191,6 +200,8 @@ func (w *heapWindow) observe(process map[string]Metric) {
 		// repeat it.
 		w.err = errors.Join(w.err, fmt.Errorf("peak heap profile %s: %w", filepath.Base(w.peak), err))
 		w.high = math.Inf(1)
+	} else {
+		w.peakCaptured = true
 	}
 }
 
@@ -223,12 +234,18 @@ func (s *gaugeSeries) watchLoadProfiles(ctx context.Context, o runOptions, p *pr
 }
 
 // endLoadProfiles ends the load window and keeps its profiles as artifacts.
-func (s *gaugeSeries) endLoadProfiles(w *heapWindow, artifacts map[string]string) error {
+func (s *gaugeSeries) endLoadProfiles(w *heapWindow, phase *Phase, artifacts map[string]string) error {
 	if w == nil {
 		return nil
 	}
 	start, peak, err := s.endLoad(w)
-	artifacts["heap_profile_load_start"], artifacts["heap_profile_load_peak"] = start, peak
+	artifacts["heap_profile_load_start"] = start
+	if peak != "" {
+		artifacts["heap_profile_load_peak"] = peak
+	}
+	if w.peakUnavailable != "" {
+		phase.Gate["heap_profile_load_peak_unavailable"], _ = json.Marshal(w.peakUnavailable)
+	}
 	return err
 }
 

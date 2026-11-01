@@ -361,7 +361,7 @@ func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients
 	}
 	phase.DurationSec = time.Since(phase.Started).Seconds()
 	monitor.finish(phase)
-	err = errors.Join(err, series.endLoadProfiles(heap, artifacts))
+	err = errors.Join(err, series.endLoadProfiles(heap, phase, artifacts))
 	if profileDone != nil {
 		err = errors.Join(err, <-profileDone)
 	}

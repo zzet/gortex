@@ -32,16 +32,17 @@ import (
 var stepIdleOverride time.Duration
 
 type worktreeStep struct {
-	LinkedWorktrees int                    `json:"linked_worktrees"`
-	LoadStarted     time.Time              `json:"load_started"`
-	LoadEnded       time.Time              `json:"load_ended"`
-	IdleStarted     time.Time              `json:"idle_started"`
-	IdleEnded       time.Time              `json:"idle_ended"`
-	Load            map[string]Metric      `json:"load_metrics"`
-	Tools           map[string]ToolMetrics `json:"tools"`
-	HeapLoadStart   string                 `json:"heap_profile_load_start"`
-	HeapLoadPeak    string                 `json:"heap_profile_load_peak"`
-	HeapIdle        string                 `json:"heap_profile_idle"`
+	LinkedWorktrees         int                    `json:"linked_worktrees"`
+	LoadStarted             time.Time              `json:"load_started"`
+	LoadEnded               time.Time              `json:"load_ended"`
+	IdleStarted             time.Time              `json:"idle_started"`
+	IdleEnded               time.Time              `json:"idle_ended"`
+	Load                    map[string]Metric      `json:"load_metrics"`
+	Tools                   map[string]ToolMetrics `json:"tools"`
+	HeapLoadStart           string                 `json:"heap_profile_load_start"`
+	HeapLoadPeak            string                 `json:"heap_profile_load_peak"`
+	HeapLoadPeakUnavailable string                 `json:"heap_profile_load_peak_unavailable,omitempty"`
+	HeapIdle                string                 `json:"heap_profile_idle"`
 }
 
 // bindMemoryFlags registers the standalone memory-diagnosis options. Paired
@@ -144,7 +145,11 @@ func measureWorktreeSteps(ctx context.Context, o runOptions, p *privateRun, rece
 		step.Tools = summarize(load.Attempts, step.LoadEnded.Sub(step.LoadStarted).Seconds(), "workload")
 		var heapErr error
 		step.HeapLoadStart, step.HeapLoadPeak, heapErr = series.endLoad(window)
-		artifacts[stepArtifact(k, "heap_profile_load_start")], artifacts[stepArtifact(k, "heap_profile_load_peak")] = step.HeapLoadStart, step.HeapLoadPeak
+		step.HeapLoadPeakUnavailable = window.peakUnavailable
+		artifacts[stepArtifact(k, "heap_profile_load_start")] = step.HeapLoadStart
+		if step.HeapLoadPeak != "" {
+			artifacts[stepArtifact(k, "heap_profile_load_peak")] = step.HeapLoadPeak
+		}
 		stepErr := errors.Join(loadErr, heapErr)
 		if stepErr == nil {
 			step.HeapIdle = base + ".heap-idle.pprof"

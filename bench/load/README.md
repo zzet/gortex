@@ -306,8 +306,11 @@ cost. `--heap-profiles` (with `--gauges`) also saves two heap profiles per load
 window: one at load start and one at the highest footprint the series sampled
 during the load (or at its end, when that is higher). The peak captures run
 inside the measured window, so leave the option off when latency is being
-compared. Heap profiles are taken as of the daemon's last GC; no collection is
-forced.
+compared. If the OS/build has no process-footprint reader, the peak profile is
+unavailable with a reason in the phase gate or worktree step, and no peak
+artifact is advertised. Load-start and collected idle profiles remain available.
+Heap profiles are taken as of the daemon's last GC; no collection is forced
+during load.
 
 `--worktree-steps 0,1,2,4` (worktrees scenario, ending at `--worktrees`)
 measures what each linked worktree costs. One daemon starts with the first
