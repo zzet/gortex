@@ -12,6 +12,7 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -136,8 +137,13 @@ func acquireMutationPath(ctx context.Context, path string) (func(), error) {
 	if err := guardCheckoutMutationPath(ctx, path); err != nil {
 		return nil, err
 	}
-	path = filepath.Clean(path)
+	return acquireMutationPathKey(ctx, pathkey.MutationKey(path))
+}
 
+// acquireMutationPathKey acquires an already-admitted, captured path identity.
+// Keeping that key through acquisition also keeps release independent of any
+// later symlink change.
+func acquireMutationPathKey(ctx context.Context, path string) (func(), error) {
 	mutationPathLocks.Lock()
 	entry := mutationPathLocks.byPath[path]
 	if entry == nil {
@@ -176,18 +182,21 @@ func acquireMutationPaths(ctx context.Context, paths []string) (func(), error) {
 	unique := make(map[string]struct{}, len(paths))
 	ordered := make([]string, 0, len(paths))
 	for _, path := range paths {
-		clean := filepath.Clean(path)
-		if _, exists := unique[clean]; exists {
+		if err := guardCheckoutMutationPath(ctx, path); err != nil {
+			return nil, err
+		}
+		key := pathkey.MutationKey(path)
+		if _, exists := unique[key]; exists {
 			continue
 		}
-		unique[clean] = struct{}{}
-		ordered = append(ordered, clean)
+		unique[key] = struct{}{}
+		ordered = append(ordered, key)
 	}
 	sort.Strings(ordered)
 
 	releases := make([]func(), 0, len(ordered))
-	for _, path := range ordered {
-		release, err := acquireMutationPath(ctx, path)
+	for _, key := range ordered {
+		release, err := acquireMutationPathKey(ctx, key)
 		if err != nil {
 			for i := len(releases) - 1; i >= 0; i-- {
 				releases[i]()
