@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -289,23 +290,28 @@ func TestAttachMutationFreshnessPendingOmitsStaleSyntaxHealth(t *testing.T) {
 	}
 }
 
-func TestApplyBatchFileEditSerializesConcurrentWrites(t *testing.T) {
+func TestAtomicBatchSerializesConcurrentFileEdits(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "concurrent.txt")
 	if err := os.WriteFile(path, []byte("alpha beta\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{watcher: mutationTestWatcher{}, session: newSessionState()}
+	s := newAtomicBatchTestServer(t, mutationTestWatcher{})
 
 	start := make(chan struct{})
 	results := make(chan batchEditResult, 2)
-	for _, edit := range []batchEditItem{
-		{Path: path, OldString: "alpha", NewString: "ALPHA"},
-		{Path: path, OldString: "beta", NewString: "BETA"},
+	for i, edit := range []batchEditItem{
+		{Op: "edit_file", Path: path, OldString: "alpha", NewString: "ALPHA"},
+		{Op: "edit_file", Path: path, OldString: "beta", NewString: "BETA"},
 	} {
 		edit := edit
 		go func() {
 			<-start
-			results <- s.applyBatchFileEdit(context.Background(), edit, true)
+			receipt, err := s.runBatchTransaction(context.Background(), []batchEditItem{edit}, fmt.Sprintf("concurrent-file-%d", i))
+			if err != nil {
+				results <- batchEditResult{Status: "failed", Error: err.Error()}
+				return
+			}
+			results <- receipt.Results[0]
 		}()
 	}
 	close(start)
@@ -324,7 +330,7 @@ func TestApplyBatchFileEditSerializesConcurrentWrites(t *testing.T) {
 	}
 }
 
-func TestApplyBatchSymbolEditFallsBackAfterPendingLineShift(t *testing.T) {
+func TestAtomicBatchSymbolEditFallsBackAfterPendingLineShift(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "shifted.go")
 	content := "package sample\n\nfunc target() {\n\tprintln(\"old\")\n}\n\nfunc other() {}\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -341,17 +347,18 @@ func TestApplyBatchSymbolEditFallsBackAfterPendingLineShift(t *testing.T) {
 		EndLine:   7,
 	}
 	g.AddNode(node)
-	s := &Server{
-		engine:  query.NewEngine(g),
-		graph:   g,
-		watcher: mutationTestWatcher{},
-		session: newSessionState(),
-	}
-	result := s.applyBatchSymbolEdit(context.Background(), batchEditItem{
+	s := newAtomicBatchTestServer(t, mutationTestWatcher{})
+	s.engine, s.graph = query.NewEngine(g), g
+	receipt, runErr := s.runBatchTransaction(context.Background(), []batchEditItem{{
+		Op:        "edit_symbol",
 		SymbolID:  node.ID,
 		OldSource: "println(\"old\")",
 		NewSource: "println(\"new\")",
-	}, true)
+	}}, "shifted-symbol")
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	result := receipt.Results[0]
 	if result.Status != "applied" || !result.Reindexed || result.ReindexPending || result.ReindexError != "" {
 		t.Fatalf("unexpected result: %+v", result)
 	}
