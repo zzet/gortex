@@ -1169,6 +1169,10 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 	forwarded.Params.Name = spec.Legacy
 	forwarded.Params.Arguments = normalized
 	forwarded.Params.RawArguments = nil
+	if refusal := s.awaitWatchedFreshness(ctx, spec.Legacy, forwarded, takeRequestFreshness(&forwarded)); refusal != nil {
+		return refusal, nil
+	}
+	ctx = s.captureToolFreshness(ctx)
 	result, err = legacy.handler(ctx, forwarded)
 	if err == nil {
 		// Book the retrieval half of the savings ledger under the LEGACY tool

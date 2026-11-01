@@ -560,32 +560,31 @@ func renderFreshnessLine(res *mcp.CallToolResult, fields map[string]any) *mcp.Ca
 func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []string, snapshots ...[]*mutationReceipt) relationFreshness {
 	label := relationFreshness{}
 	inScope := s.relationScope(ctx, ids, files)
+	type pathState struct {
+		state      string
+		generation uint64
+	}
+	states := make(map[string]pathState)
+	put := func(path, state string, generation uint64) {
+		if len(ids)+len(files) > 0 && !inScope(path) {
+			return
+		}
+		key := s.repoRelative(path)
+		if prior, exists := states[key]; !exists || generation >= prior.generation {
+			states[key] = pathState{state, generation}
+		}
+	}
 	if len(snapshots) > 0 {
 		for _, receipt := range snapshots[0] {
-			if !inScope(receipt.path) {
-				continue
+			state := "pending"
+			if outcome := receipt.outcome(true); !outcome.Pending && (outcome.Err != nil || !outcome.Reindexed) {
+				state = "failed"
 			}
-			label.files = append(label.files, s.repoRelative(receipt.path))
-			if label.state != "failed" {
-				label.state = "pending"
-				if outcome := receipt.outcome(true); !outcome.Pending && (outcome.Err != nil || !outcome.Reindexed) {
-					label.state = "failed"
-				}
-			}
+			put(receipt.path, state, receipt.generation)
 		}
-		slices.Sort(label.files)
-		label.files = slices.Compact(label.files)
-		if snapshot, ok := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); ok && snapshot.startup && scope != "file" && label.state == "" {
-			label.state = "pending"
-		}
-		return label.merge(s.freshnessFor(ctx, scope, ids, files))
 	}
-	states := make(map[string]string)
 	if paths, watched := s.canonicalTierPaths(ctx); watched {
 		for path, tiers := range paths {
-			if len(ids)+len(files) > 0 && !inScope(path) {
-				continue
-			}
 			at := tiers.RelationsAt
 			if scope == "file" {
 				at = tiers.FileGraphAt
@@ -599,29 +598,32 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 				state = "pending"
 			}
 			if state != "" {
-				states[s.repoRelative(path)] = state
+				put(path, state, tiers.Generation)
 			}
 		}
 	} else {
 		for _, receipt := range s.laggingMutationReceipts(ctx) {
-			if !inScope(receipt.path) {
-				continue
-			}
 			state := "failed"
 			if receipt.outcome(true).Pending {
 				state = "pending"
 			}
-			states[s.repoRelative(receipt.path)] = state
+			put(receipt.path, state, receipt.generation)
 		}
 	}
 	for path, state := range states {
 		label.files = append(label.files, path)
 		if label.state != "failed" {
-			label.state = state
+			label.state = state.state
 		}
 	}
 	slices.Sort(label.files)
-	if label.state == "" && scope != "file" && s.multiIndexer != nil && s.multiIndexer.RelationsPending() {
+	startup := s.multiIndexer != nil && s.multiIndexer.RelationsPending()
+	if len(snapshots) > 0 {
+		if snapshot, ok := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); ok {
+			startup = startup || snapshot.startup
+		}
+	}
+	if label.state == "" && scope != "file" && startup {
 		label.state = "pending"
 	}
 	return label
@@ -648,6 +650,9 @@ func (s *Server) captureToolFreshness(ctx context.Context) context.Context {
 	receipts := s.laggingMutationReceipts(ctx)
 	startup := s.multiIndexer != nil && s.multiIndexer.RelationsPending()
 	if len(receipts) == 0 && !startup {
+		if _, exists := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); exists {
+			return context.WithValue(ctx, toolFreshnessSnapshotKey{}, toolFreshnessSnapshot{})
+		}
 		return ctx
 	}
 	return context.WithValue(ctx, toolFreshnessSnapshotKey{}, toolFreshnessSnapshot{receipts, startup})
@@ -714,20 +719,24 @@ func (s *Server) awaitWatchedFreshness(ctx context.Context, name string, req mcp
 	if freshness.scope != "" {
 		scope = freshness.scope
 	}
-	deadline := freshness.effectiveDeadline(time.Now(), ctx)
+	started := time.Now()
+	deadline := freshness.effectiveDeadline(started, ctx)
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		label := s.freshnessFor(ctx, scope, ids, files)
 		if label.state == "" {
+			annotateRequestFreshness(view, &requestFreshnessOutcome{fresh: true, deadline: deadline}, started)
 			return nil
 		}
 		if label.state == "failed" || !time.Now().Before(deadline) {
+			label.waited = time.Since(started)
 			return label.requireFreshError()
 		}
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
+			label.waited = time.Since(started)
 			return label.requireFreshError()
 		}
 	}
