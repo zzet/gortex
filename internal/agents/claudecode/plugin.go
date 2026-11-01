@@ -95,7 +95,7 @@ const pluginHooksJSON = `{
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
-            "timeout": 3000,
+            "timeout": 15,
             "statusMessage": "Enforcing Gortex graph access policy..."
           }
         ]
@@ -107,7 +107,7 @@ const pluginHooksJSON = `{
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
-            "timeout": 3000,
+            "timeout": 3,
             "statusMessage": "Starting a fresh Gortex turn..."
           }
         ]
@@ -119,7 +119,7 @@ const pluginHooksJSON = `{
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
-            "timeout": 3000,
+            "timeout": 3,
             "statusMessage": "Starting an isolated Gortex subagent turn..."
           }
         ]
@@ -131,7 +131,7 @@ const pluginHooksJSON = `{
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
-            "timeout": 3000,
+            "timeout": 3,
             "statusMessage": "Clearing Gortex subagent turn state..."
           }
         ]
@@ -143,7 +143,7 @@ const pluginHooksJSON = `{
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
-            "timeout": 5000,
+            "timeout": 45,
             "statusMessage": "Running Gortex post-task diagnostics..."
           }
         ]
@@ -155,7 +155,7 @@ const pluginHooksJSON = `{
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/gortex-hook.sh\"",
-            "timeout": 3000,
+            "timeout": 3,
             "statusMessage": "Loading Gortex graph orientation..."
           }
         ]

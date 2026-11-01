@@ -275,6 +275,7 @@ func pluginHooksWithLocalizationTerminality(data []byte) ([]byte, error) {
 		for _, rawEntry := range group["hooks"].([]any) {
 			if entry, ok := rawEntry.(map[string]any); ok {
 				entry["statusMessage"] = desiredPostToolUseStatus(HookModeDeny)
+				entry["timeout"] = hookTimeoutSeconds
 			}
 		}
 		postGroups = append(postGroups, group)

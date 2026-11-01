@@ -200,6 +200,8 @@ func TestEmitPluginBundle_HooksShape(t *testing.T) {
 		}
 	}
 
+	assertHookTimeoutsInSeconds(t, hooks)
+
 	// PreCompact output is discarded by Claude Code; the post-compaction
 	// briefing rides on SessionStart(source="compact") instead (#814).
 	if _, ok := hooks["PreCompact"]; ok {
