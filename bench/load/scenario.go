@@ -243,7 +243,8 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	for i := range p.Repos {
 		for _, tracked := range readinessState.TrackedRepos {
 			if filepath.Clean(tracked.Path) == filepath.Clean(p.Repos[i].Path) {
-				p.Repos[i].Prefix = tracked.Prefix
+				if scenario==checkoutDiscoveryScenario && o.Discovery.Resume!="" && p.Repos[i].Prefix!=tracked.Prefix {return phase,nil,artifacts,crashes,"",errors.New("resumed discovery changed a prepared repository identity prefix")}
+ p.Repos[i].Prefix = tracked.Prefix
 			}
 		}
 		if i > 0 && scenario == "worktrees" || i>=2 && scenario==checkoutDiscoveryScenario {
