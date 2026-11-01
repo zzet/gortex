@@ -15,6 +15,9 @@ import (
 // it is not compressed to fit the smoke-only deadline.
 func makeEditLoopLanePlan(p policy, c laneConfig) (lanePlan, error) {
 	plan := lanePlan{Lane: c.Lane, Execution: "edit-loop", HostClass: c.HostClass, Ready: true, PolicySHA256: policyDigest(p), Prerequisites: []string{}}
+	if c.EditGateSeed != "" && (c.Lane != "smoke" || c.EditGateSeed != "ack-wait" && c.EditGateSeed != "closed-read-gate") {
+		return plan, errors.New("edit gate faults are closed smoke-only modes")
+	}
 	if c.HostClass != "reference_linux" || c.Lane != "smoke" && c.Lane != "nightly" {
 		return plan, errors.New("edit gates require the reference Linux host and smoke or nightly lane")
 	}
@@ -27,7 +30,7 @@ func makeEditLoopLanePlan(p policy, c laneConfig) (lanePlan, error) {
 	}
 	for _, scenario := range scenarios {
 		for repeat := 1; repeat <= max(3, c.Repeats); repeat++ {
-			task := laneTask{Scenario: scenario, Role: "candidate", Repeat: repeat, Seed: int64(repeat), EditGate: true, EditCount: 100, ProbeModes: []string{"json", "toon", "compact", "facade", "cli"}}
+			task := laneTask{EditGateSeed: c.EditGateSeed, Scenario: scenario, Role: "candidate", Repeat: repeat, Seed: int64(repeat), EditGate: true, EditCount: 100, ProbeModes: []string{"json", "toon", "compact", "facade", "cli"}}
 			if scenario == "loadedit-4-largefile" && c.LargeFileManifest == "" {
 				task.Unavailable = "large-file gate needs actual >=10000-line target admission; a scenario alias is not evidence"
 			}
@@ -66,6 +69,13 @@ func finishEditLoopLaneEvidence(c laneConfig, p policy, plan lanePlan, out strin
 			pass = false
 		}
 		rows = append(rows, row)
+	}
+	if scenarios["multirepoedit-6"] {
+		row := assessSixRepoReadObservation(d, loadErr)
+		rows = append(rows, row)
+		if editLoopRowBlocks(row) {
+			pass = false
+		}
 	}
 	var table bytes.Buffer
 	if err := printEditLoopRows(io.MultiWriter(stdout, &table), rows); err != nil {

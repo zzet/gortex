@@ -139,6 +139,13 @@ func editLoopCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		rows = append(rows, row)
 	}
+	if *scenario == "multirepoedit-6" {
+		row := assessSixRepoReadObservation(dataset, loadErr)
+		rows = append(rows, row)
+		if editLoopRowBlocks(row) {
+			pass = false
+		}
+	}
 	writer := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(writer, "scenario\tmetric\tvalue\tbudget\tunit\tbaseline\tdelta\tstate\treason")
 	for _, row := range rows {
@@ -441,6 +448,9 @@ func assessCompactEditLoopRow(row editLoopRow, b budget, d dataset) editLoopRow 
 }
 
 func editLoopRowBlocks(row editLoopRow) bool {
+	if row.Scenario == "multirepoedit-6" && row.Metric == "readback_p95" && row.State == "OBSERVATIONAL" && row.Budget == nil && row.Value != nil && finiteNonnegative(*row.Value) && row.Unit == "s" {
+		return false
+	}
 	return row.State != "PASS" && !(row.Metric == "silent_stale_compact" && row.State == "UNOBSERVABLE" && row.Value == nil)
 }
 
@@ -553,4 +563,47 @@ func measureEditLoopRow(phase phase, name string) (float64, error) {
 		return values[len(values)-1], nil
 	}
 	return values[(95*len(values)+99)/100-1], nil
+}
+
+// This population has no dedicated p95 target in the accepted contract. Retain
+// its actual value without borrowing a single-repository limit or a PASS.
+func assessSixRepoReadObservation(d dataset, loadErr error) editLoopRow {
+	row := editLoopRow{Scenario: "multirepoedit-6", Metric: "readback_p95", State: "UNAVAILABLE", Unit: "s"}
+	if loadErr != nil {
+		row.Reason = loadErr.Error()
+		return row
+	}
+	values := []float64{}
+	for repeat := 1; repeat <= d.config.repeats(row.Scenario); repeat++ {
+		found := false
+		for _, sample := range d.runs {
+			if sample.input.Role != "candidate" || sample.input.HostClass != "reference_linux" || sample.input.Scenario != row.Scenario || sample.input.Repeat != repeat {
+				continue
+			}
+			if found {
+				row.Reason = "duplicate candidate repeat"
+				return row
+			}
+			found = true
+			value, err := measureEditLoopRow(sample.data.Phases[0], row.Metric)
+			if err != nil {
+				row.Reason = err.Error()
+				return row
+			}
+			values = append(values, value)
+		}
+		if !found {
+			row.Reason = "missing candidate repeat"
+			return row
+		}
+	}
+	if len(values) == 0 {
+		row.Reason = "no actual observations"
+		return row
+	}
+	value := slices.Max(values)
+	row.Value = &value
+	row.State = "OBSERVATIONAL"
+	row.Reason = "unbudgeted: no dedicated six-repository p95 target; universal readback max remains blocking"
+	return row
 }

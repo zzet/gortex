@@ -41,6 +41,7 @@ type laneBuild struct {
 }
 
 type laneConfig struct {
+	EditGateSeed      string               `json:"edit_gate_seed,omitempty"`
 	Version           int                  `json:"schema_version"`
 	Lane              string               `json:"lane"`
 	HostClass         string               `json:"host_class"`
@@ -62,14 +63,15 @@ type laneConfig struct {
 }
 
 type laneTask struct {
-	EditGate    bool     `json:"edit_gate,omitempty"`
-	EditCount   int      `json:"edit_count,omitempty"`
-	ProbeModes  []string `json:"probe_modes,omitempty"`
-	Scenario    string   `json:"scenario"`
-	Role        string   `json:"role"`
-	Repeat      int      `json:"repeat"`
-	Seed        int64    `json:"seed"`
-	Unavailable string   `json:"unavailable,omitempty"`
+	EditGateSeed string   `json:"edit_gate_seed,omitempty"`
+	EditGate     bool     `json:"edit_gate,omitempty"`
+	EditCount    int      `json:"edit_count,omitempty"`
+	ProbeModes   []string `json:"probe_modes,omitempty"`
+	Scenario     string   `json:"scenario"`
+	Role         string   `json:"role"`
+	Repeat       int      `json:"repeat"`
+	Seed         int64    `json:"seed"`
+	Unavailable  string   `json:"unavailable,omitempty"`
 }
 
 type lanePlan struct {
@@ -116,6 +118,9 @@ func readLaneConfig(path string, editGate ...bool) (laneConfig, error) {
 	}
 	if d.Decode(new(any)) != io.EOF {
 		return c, errors.New("lane config must contain exactly one JSON document")
+	}
+	if c.EditGateSeed != "" && (len(editGate) == 0 || !editGate[0] || c.Lane != "smoke" || c.EditGateSeed != "ack-wait" && c.EditGateSeed != "closed-read-gate") {
+		return c, errors.New("edit_gate_seed requires the explicit edit smoke collector and ack-wait or closed-read-gate")
 	}
 	if c.Version != 1 || !slices.Contains([]string{"smoke", "nightly", "release"}, c.Lane) || c.Repeats < 3 || c.Repeats > 100 || c.Machine == "" && c.HostClass != hostedSmokeClass {
 		return c, errors.New("lane config needs schema1, smoke/nightly/release, 3–100 repeats and reviewed machine binding")
@@ -464,6 +469,9 @@ func taskArgs(c laneConfig, task laneTask, manifest, scratch, report string) []s
 	args := []string{"run", "--binary", build.Binary, "--git-sha", build.Revision, "--manifest", manifest, "--scratch", scratch, "--out", report, "--host", host, "--profile", "agent", "--scenario", spec.wire, "--agents", fmt.Sprint(spec.agents), "--edit-agents", fmt.Sprint(spec.editors), "--worktrees", fmt.Sprint(spec.worktrees), "--seed", fmt.Sprint(task.Seed), "--duration", c.Duration, "--deadline", c.Deadline, "--warm-timeout", c.WarmTimeout, "--stop-timeout", c.StopTimeout, "--sweep-repetitions", fmt.Sprint(c.SweepRepetitions), "--sweep-duration", c.SweepDuration}
 	if task.EditGate {
 		args = append(args, "--edit-gate-modes", "--edit-count", "100", "--edit-repos", fmt.Sprint(spec.repos))
+	}
+	if task.EditGate && task.EditGateSeed != "" {
+		args = append(args, "--edit-gate-seed", task.EditGateSeed)
 	}
 	if c.Lane == "smoke" && spec.wire == "read" && c.PRSmokeDrain != "" {
 		args = append(args, "--pr-smoke-drain", c.PRSmokeDrain)
