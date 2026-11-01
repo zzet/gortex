@@ -1782,6 +1782,14 @@ func storageStatusFor(g graph.Store) *daemon.StorageStatus {
 		CloseCheckpointEstimateMS: estimate.Milliseconds(),
 		WALReclaim:                walReclaimStatus(reporter.WALReclaimStats()),
 	}
+	if reporter, ok := g.(interface{ DenseIndexesMissing() []string }); ok {
+		out.DenseIndexesMissing = reporter.DenseIndexesMissing()
+	}
+	if reporter, ok := g.(interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}); ok {
+		out.LastFirstIndexDrain = reporter.LastFirstIndexDrains()
+	}
 	if policy, ok := g.(interface{ CloseCheckpointPolicy() string }); ok {
 		out.CloseCheckpointPolicy = policy.CloseCheckpointPolicy()
 	}

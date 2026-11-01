@@ -3698,6 +3698,19 @@ func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string
 			plannerStats["last_refresh_at"] = planner.LastRefreshAt.UTC().Format(time.RFC3339)
 			plannerStats["last_refresh_reason"] = planner.LastRefreshReason
 		}
+		// Named, not counted: they are what an operator checks the schema for,
+		// and the reason above alone does not say which lookups are scanning.
+		if len(planner.DenseIndexesMissing) > 0 {
+			plannerStats["dense_indexes_missing"] = planner.DenseIndexesMissing
+			msg := "A bulk index load ended without rebuilding these SQLite indexes: " + strings.Join(planner.DenseIndexesMissing, ", ") +
+				". Queries that use them scan instead until they are back. The store rebuilds them in the background once " +
+				"its volume has free space at least the size of the store, and a daemon restart rebuilds them too."
+			if recommendation == "" {
+				recommendation = msg
+			} else {
+				recommendation = msg + " " + recommendation
+			}
+		}
 		result["planner_stats"] = plannerStats
 		if planner.Stale {
 			msg := "SQLite planner statistics are stale (" + planner.Reason + "): the graph has grown past what the query " +
@@ -3708,6 +3721,13 @@ func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string
 			} else {
 				recommendation = msg + " " + recommendation
 			}
+		}
+	}
+	if reporter, ok := s.graph.(interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}); ok {
+		if observations := reporter.LastFirstIndexDrains(); len(observations) > 0 {
+			result["last_first_index_drain"] = observations
 		}
 	}
 	if prefixAuditOK {

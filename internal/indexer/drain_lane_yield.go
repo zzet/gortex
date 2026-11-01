@@ -2,7 +2,11 @@ package indexer
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -32,6 +36,12 @@ var drainYieldRows = 1024
 // drainSubBatchHook, when set (tests), runs before every sub-batch write of a
 // cooperative drain.
 var drainSubBatchHook func()
+
+// shadowEvictionBranchHook, when set (tests), observes which eviction a shadow
+// drain chose before its first disk write: true for the SQLite
+// shadow-replacement retirement, false for the generic current-generation
+// eviction.
+var shadowEvictionBranchHook func(retirement bool)
 
 type initialDrainCooperationKey struct{}
 
@@ -87,11 +97,13 @@ func drainYieldable(ctx context.Context) bool {
 // claimed drain uses sub-batches and stops on context cancellation. The initial
 // claimed drain also stands down, boundedly, for interactive demand before each
 // slice; ordinary and foreground drains keep their single-batch behavior.
+//
+// A cooperative stop returns the context's own error; anything else is the
+// store refusing a write (see drainWrite). drainBatchError tells them apart.
 func drainAddBatch(ctx context.Context, target graph.Store, nodes []*graph.Node, edges []*graph.Edge) error {
 	wanted := initialDrainDemand(ctx)
 	if !drainYieldable(ctx) && wanted == nil {
-		target.AddBatch(nodes, edges)
-		return nil
+		return drainWrite(ctx, target, nodes, edges)
 	}
 	step := drainYieldRows
 	if step <= 0 {
@@ -110,13 +122,63 @@ func drainAddBatch(ctx context.Context, target graph.Store, nodes []*graph.Node,
 		}
 		if len(nodes) > 0 {
 			n := min(len(nodes), step)
-			target.AddBatch(nodes[:n], nil)
+			if err := drainWrite(ctx, target, nodes[:n], nil); err != nil {
+				return err
+			}
 			nodes = nodes[n:]
 			continue
 		}
 		n := min(len(edges), step)
-		target.AddBatch(nil, edges[:n])
+		if err := drainWrite(ctx, target, nil, edges[:n]); err != nil {
+			return err
+		}
 		edges = edges[n:]
 	}
 	return nil
+}
+
+// drainCheckedWriter is the error-returning batch write a durable backend
+// offers beside the void graph.Store AddBatch.
+type drainCheckedWriter interface {
+	AddBatchCheckedContext(ctx context.Context, nodes []*graph.Node, edges []*graph.Edge) error
+}
+
+// drainWrite writes one batch, through the checked path when target has one,
+// so a storage failure (a full volume, an I/O error, a failed deferred-index
+// seal) fails the drain as an error instead of panicking out of AddBatch. The
+// write itself never observes ctx's cancellation: a drain stops between
+// batches, never inside one.
+func drainWrite(ctx context.Context, target graph.Store, nodes []*graph.Node, edges []*graph.Edge) error {
+	if checked, ok := target.(drainCheckedWriter); ok {
+		return checked.AddBatchCheckedContext(context.WithoutCancel(ctx), nodes, edges)
+	}
+	target.AddBatch(nodes, edges)
+	return nil
+}
+
+// drainBatchError wraps a drainAddBatch error for the build's result: a
+// cooperative stop keeps its established wording, and a refused write says the
+// graph could not be persisted.
+func drainBatchError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+		return fmt.Errorf("indexer: cooperative drain stopped: %w", err)
+	}
+	return fmt.Errorf("indexer: persist bulk graph batch: %w", err)
+}
+
+// retryBulkFlushAfterPanic retries a FlushBulk that panicked, once, while that
+// panic is unwinding. The retry recovers its own panic and only logs what it
+// hit, so the original panic is the one that reaches the caller. Under an
+// outer coordinated or generation window FlushBulk is a no-op, so this is too.
+func retryBulkFlushAfterPanic(bl graph.BulkLoader, logger *zap.Logger, repo string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("indexer: bulk flush retry after panic panicked",
+				zap.String("repo", repo), zap.Any("panic", r))
+		}
+	}()
+	if err := bl.FlushBulk(); err != nil {
+		logger.Error("indexer: bulk flush retry after panic failed",
+			zap.String("repo", repo), zap.Error(err))
+	}
 }
