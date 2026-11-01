@@ -139,7 +139,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 				"hint":           fmt.Sprintf("%d call site(s) need manual patching; resolve them or pass force=true to delete anyway", manual),
 			})
 		}
-		applied, failed, perr := s.applyRemoveLinePatches(plan)
+		applied, failed, perr := s.applyRemoveLinePatches(ctx, plan)
 		if perr != nil {
 			return mcp.NewToolResultError(perr.Error()), nil
 		}
@@ -150,7 +150,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 				"symbol":          id,
 				"patches_applied": applied,
 				"patches_failed":  failed,
-				"hint":            "some removals would break their file's syntax and were skipped; patch them by hand or pass force=true to delete the symbol anyway",
+				"hint":            "some removals were refused (reason line_changed or line_out_of_range: the line no longer holds the planned call, re-run the plan; parse_errors: removing it would break the file's syntax); patch them by hand or pass force=true to delete the symbol anyway",
 			})
 		}
 		// Callers patched — proceed with the deletion. Re-fetch the node in
