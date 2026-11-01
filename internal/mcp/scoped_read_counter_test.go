@@ -288,6 +288,19 @@ func (r *scopedReadCounter) NodesLightByKindsInScopeSeq(repos, files []string, k
 	}
 }
 
+func (r *scopedReadCounter) FileLocationsInScopeSeq(repos []string) iter.Seq[*graph.Node] {
+	return func(yield func(*graph.Node) bool) {
+		rows := 0
+		defer func() { r.read("FileLocationsInScopeSeq", rows) }()
+		for n := range r.Store.FileLocationsInScopeSeq(repos) {
+			rows++
+			if !yield(n) {
+				return
+			}
+		}
+	}
+}
+
 func (r *scopedReadCounter) SearchSymbolsContext(ctx context.Context, text string, limit int) ([]graph.SymbolHit, error) {
 	out, err := r.Store.SearchSymbolsContext(ctx, text, limit)
 	r.read("SearchSymbolsContext", len(out))
