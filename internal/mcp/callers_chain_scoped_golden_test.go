@@ -69,6 +69,7 @@ func TestGetCallersAndCallChainScopedGoldenMultiRepo(t *testing.T) {
 	production := payloads(server(store, true))
 	require.Equal(t, payloads(server(struct{ graph.Store }{store}, true)), production, "optional capabilities changed a scoped payload")
 	unwrapped := payloads(server(store, false))
+	require.Equal(t, payloads(server(struct{ graph.Store }{store}, false)), unwrapped, "optional capabilities changed a scoped payload containing cross-repository matches")
 
 	var callers struct {
 		Nodes []struct {
@@ -91,4 +92,9 @@ func TestGetCallersAndCallChainScopedGoldenMultiRepo(t *testing.T) {
 	}
 	require.Contains(t, unwrapped[0], `"kind":"matches"`, "the unwrapped caller walk crosses the match")
 	require.Contains(t, unwrapped[3], `"kind":"matches"`, "the unwrapped call chain crosses the match")
+	var unwrappedCallers struct {
+		Boundaries []json.RawMessage `json:"boundaries"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(unwrapped[0]), &unwrappedCallers))
+	require.NotEmpty(t, unwrappedCallers.Boundaries, "the unwrapped oracle comparison includes the interface dispatch boundary")
 }
