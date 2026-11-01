@@ -195,7 +195,9 @@ func TestDeleteMeasurementSearchCoversHundredDeclarationFixture(t *testing.T) {
 			require.NoError(t, s.indexer.IndexFile(path))
 			name := "GortexEditProbe000000000000002aN099Before"
 			id := file + "::" + name
-			args := map[string]any{"query": name, "query_class": "symbol", "expand": "off", "limit": 1000, "max_per_file": 0}
+			// Like the edit-probe harness, request complete output: absolute fixture
+			// paths can push a hundred declarations past the default byte budget.
+			args := map[string]any{"query": name, "query_class": "symbol", "expand": "off", "limit": 1000, "max_per_file": 0, "max_bytes": 0}
 			before := callTool(t, s, "search_symbols", args)
 			require.False(t, before.IsError)
 			beforeBody := unmarshalResult(t, before)
@@ -218,6 +220,7 @@ func TestDeleteMeasurementSearchCoversHundredDeclarationFixture(t *testing.T) {
 			require.False(t, after.IsError)
 			body := unmarshalResult(t, after)
 			require.Contains(t, body, "results")
+			require.NotContains(t, body, "_truncated_by_budget", "complete deletion evidence must not be a budget-trimmed page")
 			results, _ := body["results"].([]any)
 			require.EqualValues(t, len(results), body["total"])
 			require.Equal(t, false, body["truncated"])
