@@ -281,22 +281,33 @@ func TestRequestedBackgroundRejectsSupersessionBeforeAcceptance(t *testing.T) {
 	awaitPublicationSignal(t, reached)
 	require.Nil(t, record.RequestedBackground())
 	newer := w.scheduleFileMutation(path, ChangeModified)
+	unblock()
+	for _, ticket := range []*MutationTicket{first, native} {
+		result := awaitMutationRetryResult(t, ticket)
+		require.NoError(t, result.Err)
+		require.Equal(t, native.Generation, result.AppliedGeneration, "the landed body covers only its own and prior tickets")
+	}
+	select {
+	case result := <-newer.Done:
+		t.Fatalf("covered completion consumed the unexecuted successor: %+v", result)
+	default:
+	}
+	// Keep the successor in its native quiet window until covered completion
+	// is proved. This avoids racing two valid successful serving attempts.
 	w.mu.Lock()
 	w.pending[path].Reset(time.Millisecond)
 	w.mu.Unlock()
-	unblock()
-	for _, ticket := range []*MutationTicket{first, native, newer} {
-		result := awaitMutationRetryResult(t, ticket)
-		require.NoError(t, result.Err)
-		require.Equal(t, newer.Generation, result.AppliedGeneration)
-	}
+	newerResult := awaitMutationRetryResult(t, newer)
+	require.NoError(t, newerResult.Err)
+	require.Equal(t, newer.Generation, newerResult.AppliedGeneration)
+	// Coverage is separate from publication acceptance: the overtaken body
+	// serves the old receipts, but neither it nor unrelated later work may
+	// become their accepted timing winner.
+	requirePointExecution(t, record, false)
+	require.Nil(t, record.CoalescedPublication())
+	require.Nil(t, record.RequestedBackground(), "the superseded serving attempt remains unavailable")
 	require.Eventually(t, func() bool {
-		winner := record.CoalescedPublication()
-		return winner != nil && winner.Timings.Window.PatchWallMS != nil
-	}, 5*time.Second, time.Millisecond)
-	require.Equal(t, newer.Generation, record.CoalescedPublication().AppliedGeneration)
-	require.Nil(t, record.RequestedBackground(), "the unobserved superseding quiet/reset chain is unavailable")
-	_, unavailable := record.CoalescedPublicationEvidence()
-	require.NotNil(t, unavailable)
-	require.Equal(t, "serving_attempt_binding_mismatch", unavailable.Reason)
+		_, unavailable := record.CoalescedPublicationEvidence()
+		return unavailable != nil && unavailable.Reason == "serving_attempt_binding_mismatch"
+	}, 5*time.Second, time.Millisecond, "retain the actual refusal diagnostic even without an accepted winner")
 }

@@ -413,7 +413,6 @@ type Server struct {
 	// defaults. sync.Map keeps directly-constructed servers usable.
 	mutationReceipts    sync.Map
 	mutationReindexWait time.Duration
-	mutationSafetyWait  time.Duration
 	// mutationReceiptAfterFunc replaces retention scheduling in deterministic
 	// tests. Nil uses time.AfterFunc with the unchanged retention windows.
 	mutationReceiptAfterFunc func(time.Duration, func())

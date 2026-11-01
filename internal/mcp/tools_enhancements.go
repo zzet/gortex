@@ -425,7 +425,13 @@ func (s *Server) handleVerifyChange(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("changes array is empty"), nil
 	}
 
+	gaps := s.laggingMutationReceipts(ctx)
 	result := analysis.VerifyChanges(s.readerFor(ctx), s.engineFor(ctx), changes)
+	ids := make([]string, 0, len(changes))
+	for _, change := range changes {
+		ids = append(ids, change.SymbolID)
+	}
+	label := s.labelRelations(ctx, gaps, ids, nil)
 
 	if isCompact(req) {
 		var b strings.Builder
@@ -453,10 +459,11 @@ func (s *Server) handleVerifyChange(ctx context.Context, req mcp.CallToolRequest
 		if result.Clean {
 			fmt.Fprintf(&b, "clean: checked %d callers, %d implementors\n", result.CheckedCallers, result.CheckedImpls)
 		}
-		return mcp.NewToolResultText(b.String()), nil
+		return label.decorate(mcp.NewToolResultText(b.String())), nil
 	}
 
-	return s.respondJSONOrTOON(ctx, req, result)
+	res, err := s.respondJSONOrTOON(ctx, req, label.labelled(result))
+	return label.decorate(res), err
 }
 
 // ---------------------------------------------------------------------------
@@ -2574,6 +2581,7 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 		opts.SkipCrossRepoNodes = true
 	}
 
+	gaps := s.laggingMutationReceipts(ctx)
 	reader := s.readerFor(ctx)
 	opts.RepoPrefixes = s.deadCodeRepoPrefixes(ctx)
 	if scope, active := s.scopeOptionsWithRepoNarrow(ctx, repoAllowFromContext(ctx)); active {
@@ -2609,6 +2617,22 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 		entries = kept
 	}
 
+	// A pending definition or an unindexed caller cannot support a dead-code
+	// verdict. Keep those candidates separate in every output mode.
+	var label relationFreshness
+	var pendingUnknown []analysis.DeadCodeEntry
+	dead := make([]analysis.DeadCodeEntry, 0, len(entries))
+	for _, entry := range entries {
+		candidate := s.labelRelations(ctx, gaps, []string{entry.ID}, nil)
+		if candidate.state != "" {
+			pendingUnknown = append(pendingUnknown, entry)
+			label = label.merge(candidate)
+		} else {
+			dead = append(dead, entry)
+		}
+	}
+	entries = dead
+
 	// Cap response size — large repos surface thousands of dead-code
 	// candidates and the default JSON encoding spills past the MCP
 	// per-response token cap. Callers that need the full list can
@@ -2617,12 +2641,15 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 	if v, ok := args["limit"].(float64); ok && v > 0 {
 		limit = int(v)
 	}
-	totalEntries := len(entries)
-	deadTruncated := false
-	if len(entries) > limit {
-		entries = entries[:limit]
-		deadTruncated = true
+	totalEntries, totalUnknown := len(entries), len(pendingUnknown)
+	if len(pendingUnknown) > limit {
+		pendingUnknown = pendingUnknown[:limit]
 	}
+	remaining := limit - len(pendingUnknown)
+	if len(entries) > remaining {
+		entries = entries[:remaining]
+	}
+	deadTruncated := len(entries) < totalEntries || len(pendingUnknown) < totalUnknown
 
 	variablesNote := buildDeadCodeNote(opts)
 
@@ -2637,7 +2664,23 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 				Line: e.Line,
 			})
 		}
-		return s.gcxResponseWithBudget(req)(encodeAnalyze("dead_code", items))
+		data, err := encodeAnalyze("dead_code", items)
+		if err != nil {
+			return nil, err
+		}
+		if len(pendingUnknown) > 0 {
+			unknown := make([]deadCodeItem, 0, len(pendingUnknown))
+			for _, e := range pendingUnknown {
+				unknown = append(unknown, deadCodeItem{ID: e.ID, Kind: e.Kind, Name: e.Name, Path: e.FilePath, Line: e.Line})
+			}
+			section, err := encodeAnalyze("pending_unknown", unknown)
+			if err != nil {
+				return nil, err
+			}
+			data = append(data, section...)
+		}
+		res, err := s.gcxResponseWithBudget(req)(data, nil)
+		return label.decorate(res), err
 	}
 
 	if isCompact(req) {
@@ -2645,13 +2688,16 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 		for _, e := range entries {
 			fmt.Fprintf(&b, "%s %s %s:%d\n", e.Kind, e.ID, e.FilePath, e.Line)
 		}
-		if len(entries) == 0 {
+		for _, e := range pendingUnknown {
+			fmt.Fprintf(&b, "pending_unknown %s %s %s:%d\n", e.Kind, e.ID, e.FilePath, e.Line)
+		}
+		if len(entries) == 0 && len(pendingUnknown) == 0 {
 			b.WriteString("no dead code found\n")
 		}
 		if variablesNote != "" {
 			fmt.Fprintf(&b, "\nnote: %s\n", variablesNote)
 		}
-		return mcp.NewToolResultText(b.String()), nil
+		return label.decorate(mcp.NewToolResultText(b.String())), nil
 	}
 
 	result := map[string]any{
@@ -2659,13 +2705,19 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 		"total":     totalEntries,
 		"truncated": deadTruncated,
 	}
+	if totalUnknown > 0 {
+		result["pending_unknown"] = pendingUnknown
+		result["pending_unknown_count"] = totalUnknown
+	}
 	if deadTruncated {
 		result["limit"] = limit
 	}
 	if variablesNote != "" {
 		result["note"] = variablesNote
 	}
-	return s.respondJSONOrTOON(ctx, req, result)
+	label.apply(result)
+	res, err := s.respondJSONOrTOON(ctx, req, result)
+	return label.decorate(res), err
 }
 
 // buildDeadCodeNote summarises which low-signal kinds the analyzer

@@ -63,7 +63,11 @@ func (c *editProbeCaller) expectedAbsence(data json.RawMessage, identity wireCal
 	if !proven || editStarted.IsZero() || identity.WriteStarted.IsZero() || identity.WriteStarted.Before(editStarted) {
 		return nil
 	}
-	scoped := c.runtime.p.Repos[0].Prefix + "/" + logical
+	repo, err := c.runtime.repoFor(c.state.step)
+	if err != nil {
+		return err
+	}
+	scoped := repo.Prefix + "/" + logical
 	if message, matched := editProbeExactNotFound(data, scoped); matched {
 		return &editProbeExpectedAbsence{symbol: scoped, message: message}
 	}

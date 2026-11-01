@@ -1857,6 +1857,7 @@ func (s *Server) handleGetEditPlan(ctx context.Context, req mcp.CallToolRequest)
 		ids[i] = strings.TrimSpace(ids[i])
 	}
 
+	gaps := s.laggingMutationReceipts(ctx)
 	depth := req.GetInt("depth", 3)
 
 	type editStep struct {
@@ -1997,12 +1998,16 @@ func (s *Server) handleGetEditPlan(ctx context.Context, req mcp.CallToolRequest)
 		}
 	}
 
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	response := map[string]any{
 		"edit_order":  editSteps,
 		"test_after":  testSteps,
 		"total_files": len(steps),
 		"summary":     fmt.Sprintf("%d files to edit, %d test files to verify", len(editSteps), len(testSteps)),
-	})
+	}
+	label := s.labelRelations(ctx, gaps, ids, nil)
+	label.apply(response)
+	res, err := s.respondJSONOrTOON(ctx, req, response)
+	return label.decorate(res), err
 }
 
 // extractPrefix returns the common prefix of a camelCase/PascalCase name.
@@ -2753,6 +2758,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 	dryRun := req.GetBool("dry_run", false)
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 
+	gaps := s.laggingMutationReceipts(ctx)
 	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
 		if recovery := s.unindexedRenameRecovery(ctx, id, newName, dryRun); recovery != nil {
@@ -2915,27 +2921,80 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		}
 	}
 
+	// Graph-backed edits in a pending file are provisional too: its current
+	// line can have a different binding even when the spelling still matches.
+	pendingFiles := make(map[string]bool, len(gaps))
+	for _, gap := range gaps {
+		pendingFiles[s.repoRelative(gap.path)] = true
+	}
+	var verified, provisional []renameEdit
+	for _, edit := range edits {
+		if pendingFiles[edit.File] {
+			edit.Confidence = "provisional"
+			edit.Reason = "relations pending; verify this site manually"
+			provisional = append(provisional, edit)
+		} else {
+			verified = append(verified, edit)
+		}
+	}
+	for _, site := range s.provisionalSites(s.readerFor(ctx), gaps, node) {
+		key := fmt.Sprintf("%s:%d", site.File, site.Line)
+		if editSeen[key] {
+			continue
+		}
+		editSeen[key] = true
+		replacement, _ := rewrite(site.Text)
+		provisional = append(provisional, renameEdit{File: site.File, Line: site.Line,
+			OldText: site.Text, NewText: replacement, Confidence: "provisional",
+			Reason: "relations pending; verify this site manually"})
+	}
+	// Only verified edits ever reach planRenameWrites and the commit loop.
+	edits = verified
+	reported := append(append([]renameEdit(nil), verified...), provisional...)
+	label := s.labelRelations(ctx, gaps, []string{id}, nil)
+	respond := func(payload map[string]any) (*mcp.CallToolResult, error) {
+		label.apply(payload)
+		res, err := s.respondJSONOrTOON(ctx, req, payload)
+		return label.decorate(res), err
+	}
+
 	// Collect affected files.
 	fileSet := make(map[string]bool)
 	for _, e := range edits {
 		fileSet[e.File] = true
 	}
 
+	reportedFiles := make(map[string]bool, len(fileSet))
+	for _, edit := range reported {
+		reportedFiles[edit.File] = true
+	}
 	resp := map[string]any{
 		"old_name":       oldName,
 		"new_name":       newName,
-		"edits":          edits,
-		"total_edits":    len(edits),
-		"files_affected": len(fileSet),
+		"edits":          reported,
+		"total_edits":    len(reported),
+		"files_affected": len(reportedFiles),
 		"dry_run":        dryRun,
 	}
 
+	if len(provisional) > 0 {
+		resp["provisional_site_count"] = len(provisional)
+		resp["manual_required"] = true
+	}
+	if !dryRun && pendingFiles[node.FilePath] {
+		resp["status"] = "pending_definition"
+		resp["written"] = false
+		return respond(resp)
+	}
 	if len(edits) == 0 {
 		// Nothing to write either way. Say so rather than reporting an
 		// applied rename that touched no bytes.
 		resp["status"] = "no_edits"
+		if len(provisional) > 0 {
+			resp["status"] = "provisional_only"
+		}
 		resp["written"] = false
-		return s.respondJSONOrTOON(ctx, req, resp)
+		return respond(resp)
 	}
 
 	// Lock every affected path before verifying, so the check that each line
@@ -2963,7 +3022,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		resp["status"] = "would_apply"
 		resp["written"] = false
 		resp["files"] = previewRenameWrites(writes)
-		return s.respondJSONOrTOON(ctx, req, resp)
+		return respond(resp)
 	}
 
 	results := s.commitRenameWrites(ctx, writes)
@@ -2977,6 +3036,9 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		failed++
 	}
 	resp["status"] = "applied"
+	if len(provisional) > 0 {
+		resp["status"] = "applied_with_provisional"
+	}
 	resp["written"] = written > 0
 	resp["files"] = results
 	resp["files_written"] = written
@@ -2990,7 +3052,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 			resp["status"] = "failed"
 		}
 	}
-	return s.respondJSONOrTOON(ctx, req, resp)
+	return respond(resp)
 }
 
 func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

@@ -542,8 +542,9 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 
 // runCrossRepoResolveFiles binds both outgoing and incoming unresolved edges
 // for one coordinated mutation frontier. Its caller owns the repository lane
-// and global topology-writer gate, so the graph cannot expose a half-resolved
-// batch between same-repo, semantic, and cross-repository phases.
+// and the topology-writer gates of every repository the mutation can affect, so
+// the graph cannot expose a half-resolved batch between same-repo, semantic,
+// and cross-repository phases.
 func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) {
 	mi.runCrossRepoResolveMutationFiles(filePaths, filePaths)
 }
