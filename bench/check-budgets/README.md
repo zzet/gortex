@@ -482,7 +482,11 @@ four-call bursts, optimistic 20-second estimates are about 328 load16 calls and
 19 edits/75 reads for edit4; publication speed is unmeasured. Per-tool counts
 will be much smaller, and p99 can effectively be a maximum. Neither sample
 adequacy nor the full-job p95 <=15 minutes is established. The entry cancels
-measurement at 13 minutes, reserves cleanup time and fails after 15 minutes;
+measurement at 13 minutes, reserves cleanup time and fails after 15 minutes.
+Strict startup/enrichment uses the remaining measurement deadline instead of an
+independent five-minute cold-start cutoff; parent cancellation still interrupts
+the load client for owned cleanup. This harness bound is not a cold-start
+performance allowance or evidence that the full profile fits fifteen minutes;
 the workflow's 18-minute outer bound permits cleanup/upload after failure. It
 cannot certify full-job timing, which includes build/download/preparation and
 requires twenty actual runs.
