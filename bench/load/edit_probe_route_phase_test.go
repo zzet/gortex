@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -144,10 +145,21 @@ func TestEditProbeSourceRepositoryIdentityDoesNotCountLinkedViewsTwice(t *testin
 		t.Fatal(err)
 	}
 	linkedPath := filepath.Join(t.TempDir(), "linked-source")
-	cmd := exec.CommandContext(t.Context(), "git", "-C", primary.Source, "-c", "core.hooksPath="+os.DevNull, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "worktree", "add", "--detach", linkedPath, primary.Commit)
+	cmd := exec.CommandContext(t.Context(), "git", "-C", primary.Source, "-c", "core.hooksPath="+os.DevNull, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.autocrlf=true", "-c", "core.eol=crlf", "worktree", "add", "--detach", linkedPath, primary.Commit)
 	if data, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("own source worktree: %v %s", err, data)
 	}
+	// Git can materialize the same tree with different line endings. Capture
+	// each checkout before admission; equality to the primary's bytes would
+	// falsely blame a read-only query for Git's checkout normalization.
+	linkedBefore, err := os.ReadFile(filepath.Join(linkedPath, primary.File))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(linkedBefore, []byte("\r\n")) || bytes.Equal(linkedBefore, before) {
+		t.Fatal("fixture must distinguish the linked CRLF checkout from the primary LF source")
+	}
+	originals := map[string][]byte{primary.Source: before, linkedPath: linkedBefore}
 	linked := primary
 	linked.Source, linked.Label = linkedPath, "linked-source"
 	if err := validateEditProbeSourceRepos(t.Context(), []Corpus{primary, linked}, t.TempDir()); err == nil || !strings.Contains(err.Error(), "distinct source repositories") {
@@ -159,8 +171,8 @@ func TestEditProbeSourceRepositoryIdentityDoesNotCountLinkedViewsTwice(t *testin
 	}
 	for _, c := range []Corpus{primary, linked} {
 		after, err := os.ReadFile(filepath.Join(c.Source, c.File))
-		if err != nil || string(after) != string(before) {
-			t.Fatalf("read-only identity admission mutated source bytes: %v", err)
+		if err != nil || !bytes.Equal(after, originals[c.Source]) {
+			t.Fatalf("read-only identity admission mutated %s source bytes: %v", c.Label, err)
 		}
 	}
 }
