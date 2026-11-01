@@ -47,6 +47,10 @@ import (
 // Routing each path to its owning per-repo indexer keeps the check accurate and
 // the work bounded to the file the caller is about to read.
 func (s *Server) ensureFresh(filePaths []string) []string {
+	return s.ensureFreshContext(context.Background(), filePaths)
+}
+
+func (s *Server) ensureFreshContext(ctx context.Context, filePaths []string) []string {
 	var refreshed []string
 	const limit = 5
 	for _, fp := range filePaths {
@@ -70,7 +74,7 @@ func (s *Server) ensureFresh(filePaths []string) []string {
 		if !idx.IsTrackedStale(rel) {
 			continue
 		}
-		if !s.reindexFile(absPath) {
+		if !s.reindexFileForRead(ctx, absPath, idx) {
 			s.logger.Warn("auto re-index failed",
 				zap.String("file", fp),
 				zap.String("resolved", absPath))
