@@ -17,6 +17,7 @@ import (
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
@@ -150,6 +151,7 @@ func boundHandler[Req, Res any](
 		// keep it pinned — and say what it is holding — if it ever stops
 		// waiting for the handler that is reading it.
 		callCtx, viewNote := withRetainedViewNote(callCtx)
+		callCtx = daemon.WithMCPDispatchCompletionOwner(callCtx)
 
 		type outcome struct {
 			res Res
@@ -189,6 +191,10 @@ func boundHandler[Req, Res any](
 		case got := <-done:
 			return got.res, got.err
 		case <-callCtx.Done():
+			// The outer dispatch may return before this inner handler. Carry
+			// its unfinished physical work through the daemon's bounded drain
+			// accounting, rather than releasing it when this firewall returns.
+			releaseDispatch := daemon.RetainMCPDispatchCompletion(callCtx)
 			if ctx.Err() != nil {
 				// The *caller* went away (client cancelled, or the transport's
 				// own request lifetime fired first). Report that, not a
@@ -221,10 +227,13 @@ func boundHandler[Req, Res any](
 				// refusing everyone else's calls; the lifetime hole is the
 				// pin, and the pin is what this fixes.
 				retained := viewNote.retain()
-				if retained != nil {
+				if retained != nil || releaseDispatch != nil {
 					go func() {
 						<-done
 						retained.release()
+						if releaseDispatch != nil {
+							releaseDispatch()
+						}
 					}()
 				}
 				var zero Res
@@ -242,6 +251,9 @@ func boundHandler[Req, Res any](
 			go func() {
 				<-done
 				retained.release()
+				if releaseDispatch != nil {
+					releaseDispatch()
+				}
 				abandonedToolCalls.Add(-1)
 			}()
 			if s != nil && s.logger != nil {

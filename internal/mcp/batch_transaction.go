@@ -1295,8 +1295,39 @@ func (s *Server) beginBatchGraphRefresh(observationCtx context.Context, absPath 
 	return mutationReindexOutcome{Reindexed: s.reindexFile(absPath)}
 }
 
+// batchReceiptsPublished closes once every tracked receipt of files has
+// published, so a passive wait still queued for slow-lane capacity can stop
+// queueing: nothing is left to wait for. It stops watching when ctx ends.
+func (s *Server) batchReceiptsPublished(ctx context.Context, files []batchTransactionFile) <-chan struct{} {
+	var receipts []*mutationReceipt
+	for _, file := range files {
+		if file.ReindexReceipt == "" {
+			continue
+		}
+		if value, ok := s.mutationReceipts.Load(file.ReindexReceipt); ok {
+			if receipt, ok := value.(*mutationReceipt); ok {
+				receipts = append(receipts, receipt)
+			}
+		}
+	}
+	published := make(chan struct{})
+	go func() {
+		for _, receipt := range receipts {
+			select {
+			case <-receipt.done:
+			case <-ctx.Done():
+				return
+			}
+		}
+		close(published)
+	}()
+	return published
+}
+
 func (s *Server) waitBatchGraphReceipts(ctx context.Context, files []batchTransactionFile) {
 	deadline := time.Now().Add(s.mutationWaitDuration())
+	waitCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	var resumeIntent func()
 	for _, file := range files {
 		if file.ReindexReceipt == "" {
@@ -1318,6 +1349,7 @@ func (s *Server) waitBatchGraphReceipts(ctx context.Context, files []batchTransa
 		if remaining <= 0 {
 			return
 		}
+		waitLap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
 		if resumeIntent == nil {
 			// All disk writes and admissions (including synchronous fallback)
 			// finished before this passive wait. Restore ordinary priority
@@ -1325,11 +1357,22 @@ func (s *Server) waitBatchGraphReceipts(ctx context.Context, files []batchTransa
 			resumeIntent = suspendSourceMutationWriteIntent(ctx)
 			defer resumeIntent()
 			// Only waiting from here on: let other requests use this
-			// dispatch slot.
-			s.releaseDispatchSlotForWait(ctx)
+			// dispatch slot. Publications that all land first need none.
+			if !s.releaseDispatchSlotForWait(waitCtx, s.batchReceiptsPublished(waitCtx, files)) {
+				waitLap.finish()
+				return
+			}
+		}
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			waitLap.finish()
+			return
 		}
 		timer := time.NewTimer(remaining)
-		waitLap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+		// Preserve the bounded post-commit wait after successful admission,
+		// even if the caller canceled while committing. Already-admitted
+		// publication can still make this durable receipt fresh. The slow-lane
+		// admission above remains cancellation-aware and can leave it pending.
 		select {
 		case <-receipt.done:
 			waitLap.finish()
