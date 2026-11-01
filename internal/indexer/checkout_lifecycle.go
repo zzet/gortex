@@ -137,6 +137,11 @@ type CheckoutLifecycleConfig struct {
 // A store with no catalog — or a repository git does not administer — still
 // works: the catalog steps are skipped and the real side effects (index,
 // watcher, config, invalidation) happen exactly as they did before.
+type familyInventoryRetry struct {
+	deadline int64
+	step     int
+}
+
 type familyRetry struct {
 	deadline int64
 	timer    *time.Timer
@@ -201,11 +206,12 @@ type CheckoutLifecycle struct {
 	// grace; these timers guarantee its expiry is reconciled even when Git is
 	// otherwise quiet. retryClosing rejects new timer and callback admission
 	// while Close joins callbacks that fired before the gate closed.
-	retryCloseMu  sync.Mutex
-	retryMu       sync.Mutex
-	retryClosing  bool
-	retryWG       sync.WaitGroup
-	familyRetries map[string]familyRetry
+	retryCloseMu           sync.Mutex
+	retryMu                sync.Mutex
+	retryClosing           bool
+	retryWG                sync.WaitGroup
+	familyRetries          map[string]familyRetry
+	familyInventoryRetries map[string]familyInventoryRetry
 	// familyRetryBarrier runs after a fired retry is admitted and counted.
 	// It is a deterministic shutdown test seam; nil in production.
 	familyRetryBarrier func()
@@ -1934,7 +1940,37 @@ func (l *CheckoutLifecycle) scheduleFamilyRetry(report reconcile.FamilyReport) {
 			deadline = checkout.RetryAt
 		}
 	}
+	unknown := l.inventoryUnknownRetryAt(report.FamilyID, report.InventoryUsable)
+	if unknown > 0 && (deadline == 0 || unknown < deadline) {
+		deadline = unknown
+	}
 	l.scheduleFamilyRetryAt(report.FamilyID, deadline)
+}
+
+// Only retry scheduling is process-local. Restart begins with the short first
+// interval; checkout clocks and cleanup authorization remain durable catalog data.
+func (l *CheckoutLifecycle) inventoryUnknownRetryAt(familyID string, usable bool) int64 {
+	l.retryMu.Lock()
+	defer l.retryMu.Unlock()
+	if usable {
+		delete(l.familyInventoryRetries, familyID)
+		return 0
+	}
+	if l.familyInventoryRetries == nil {
+		l.familyInventoryRetries = map[string]familyInventoryRetry{}
+	}
+	retry := l.familyInventoryRetries[familyID]
+	now := l.clock()
+	if retry.deadline > now.Unix() {
+		return retry.deadline
+	}
+	delays := [...]time.Duration{30 * time.Second, 2 * time.Minute, 8 * time.Minute, 30 * time.Minute}
+	retry.deadline = now.Add(delays[retry.step]).Unix()
+	if retry.step < len(delays)-1 {
+		retry.step++
+	}
+	l.familyInventoryRetries[familyID] = retry
+	return retry.deadline
 }
 
 func (l *CheckoutLifecycle) scheduleFamilyRetryAt(familyID string, deadline int64) {
