@@ -217,7 +217,10 @@ func TestEditProbeDiskSnapshotKeepsOtherReadFailures(t *testing.T) {
 			handle := editProbeDiskRepliesWithReadFile(c, dir, func(err error) { reported = append(reported, err) }, func(path string) ([]byte, error) {
 				return nil, &os.PathError{Op: "open", Path: path, Err: tc.err}
 			})
-			handle(stubFrame{Method: "tools/call", Params: map[string]any{"name": "read", "arguments": map[string]any{"operation": tc.operation, "target": map[string]any{"file": c.File}}}})
+			_, rpcErr := handle(stubFrame{Method: "tools/call", Params: map[string]any{"name": "read", "arguments": map[string]any{"operation": tc.operation, "target": map[string]any{"file": c.File}}}})
+			if rpcErr != nil {
+				t.Fatal(rpcErr)
+			}
 			if len(reported) == 0 {
 				t.Fatal("fixture read failure was silently accepted")
 			}
