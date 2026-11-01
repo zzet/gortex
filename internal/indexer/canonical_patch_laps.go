@@ -43,6 +43,7 @@ type canonicalLapTotal struct {
 }
 
 type canonicalPatchLaps struct {
+	resolveMutexWait                 mutationResolveMutexWait
 	laps                             [canonicalPatchLapCount]canonicalLapTotal
 	lastEnd                          time.Time
 	active                           int
@@ -126,6 +127,9 @@ func (p *canonicalPatchLaps) beginLapLocked(lap canonicalPatchLap, at time.Time)
 }
 
 func (p *canonicalPatchLaps) endLapLocked(lap canonicalPatchLap, start, at time.Time) {
+	if lap == patchResolve {
+		p.resolveMutexWait.finishResolveSpan(start, at)
+	}
 	v := &p.laps[lap]
 	if at.IsZero() || at.Before(start) || p.active != 1 || p.activeKind != lap || !p.activeStarted.Equal(start) {
 		p.invalid = true
@@ -183,15 +187,16 @@ type canonicalLapEvidence struct {
 }
 
 type canonicalPatchEvidence struct {
-	laps    [canonicalDeepLapCount]canonicalLapEvidence
-	invalid bool
+	resolveMutexWait mutationResolveMutexEvidence
+	laps             [canonicalDeepLapCount]canonicalLapEvidence
+	invalid          bool
 }
 
 // freeze converts only same-process monotonic readings, never wall strings.
 // Called under the collector lock; the returned value has no mutable aliases.
 func (p *canonicalPatchLaps) freeze(origin time.Time) canonicalPatchEvidence {
 	openOuterControl := p.controlObserved && p.active == 1 && isAttemptControl(p.activeKind)
-	out := canonicalPatchEvidence{invalid: p.invalid || p.active != 0 && !openOuterControl}
+	out := canonicalPatchEvidence{invalid: p.invalid || p.active != 0 && !openOuterControl, resolveMutexWait: p.resolveMutexWait.freeze(origin)}
 	for i, v := range p.laps[:canonicalDeepLapCount] {
 		out.laps[i] = canonicalLapEvidence{totalNS: int64(v.total), begun: v.begun, done: v.done, incomplete: v.incomplete}
 		if v.begun != 0 {
@@ -254,6 +259,7 @@ func (p *canonicalPatchEvidence) project(offsets map[PublicationPhase]int64, ter
 		ms := float64(v.totalNS) / 1e6
 		out.Milliseconds[name], out.States[name] = &ms, "measured"
 	}
+	out.Window.ResolveMutexWait = p.resolveMutexWait.project(p.laps[patchResolve], invalid || !hasStart || !hasEnd)
 }
 
 func (s *PublicationStamps) beginDerivedPatchLap() canonicalLapSpan {
