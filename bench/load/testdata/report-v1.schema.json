@@ -1315,7 +1315,16 @@
                               "error": {
                                 "type": "string"
                               },
+                              "expected_id": {
+                                "type": "string"
+                              },
+                              "expected_line": {
+                                "type": "integer"
+                              },
                               "expected_outcome": {
+                                "type": "string"
+                              },
+                              "expected_path": {
                                 "type": "string"
                               },
                               "kind": {
@@ -2037,6 +2046,9 @@
                           "null"
                         ]
                       },
+                      "search_readback_acceptance": {
+                        "type": "boolean"
+                      },
                       "seed": {
                         "type": "integer"
                       },
@@ -2086,6 +2098,9 @@
                             },
                             "expected_refusal": {
                               "type": "boolean"
+                            },
+                            "expected_search_line": {
+                              "type": "integer"
                             },
                             "file": {
                               "type": "string"
@@ -2593,6 +2608,86 @@
                   },
                   "role": {
                     "type": "string"
+                  },
+                  "search_readback_acceptance": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "acknowledged": {
+                            "type": "integer"
+                          },
+                          "actual_edits_by_editor": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "editors": {
+                            "type": "integer"
+                          },
+                          "immediate_witnesses": {
+                            "additionalProperties": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "correct": {
+                                  "type": "integer"
+                                },
+                                "errors": {
+                                  "type": "integer"
+                                },
+                                "missing": {
+                                  "type": "integer"
+                                },
+                                "observed": {
+                                  "type": "integer"
+                                },
+                                "refusals": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "observed",
+                                "correct",
+                                "errors",
+                                "refusals",
+                                "missing"
+                              ],
+                              "type": "object"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "offered": {
+                            "type": "integer"
+                          },
+                          "pass": {
+                            "type": "boolean"
+                          },
+                          "records": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "offered",
+                          "editors",
+                          "acknowledged",
+                          "records",
+                          "pass",
+                          "immediate_witnesses",
+                          "actual_edits_by_editor"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   },
                   "stats_after": {},
                   "stats_before": {},
@@ -3887,6 +3982,9 @@
                     "null"
                   ]
                 },
+                "search_readback_acceptance": {
+                  "type": "boolean"
+                },
                 "seed": {
                   "type": "integer"
                 },
@@ -3936,6 +4034,9 @@
                       },
                       "expected_refusal": {
                         "type": "boolean"
+                      },
+                      "expected_search_line": {
+                        "type": "integer"
                       },
                       "file": {
                         "type": "string"

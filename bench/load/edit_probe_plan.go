@@ -24,28 +24,29 @@ const editProbeMaxEditors = 32
 const editProbeFixedEditorModel = "fixed_editor_per_ordinal_plus_one_separate_prober_per_edit"
 
 type editProbeStep struct {
-	ProbeMode       string  `json:"probe_mode,omitempty"`
-	Ordinal         int     `json:"ordinal"`
-	ActivateNS      int64   `json:"activate_ns"`
-	DueNS           int64   `json:"due_ns"`
-	Editor          int     `json:"editor,omitempty"`
-	Route           string  `json:"route,omitempty"`
-	Marker          string  `json:"marker"`
-	MutationID      string  `json:"mutation_id"`
-	Request         request `json:"request"`
-	RequestHash     string  `json:"request_sha256"`
-	BeforeSymbol    string  `json:"before_symbol,omitempty"`
-	Deleted         bool    `json:"deleted,omitempty"`
-	TargetSymbol    string  `json:"target_symbol,omitempty"`
-	FollowingSymbol string  `json:"following_symbol,omitempty"`
-	ExpectedLineGap int     `json:"expected_line_gap,omitempty"`
-	Relocated       bool    `json:"relocated,omitempty"`
-	DestinationFile string  `json:"destination_file,omitempty"`
-	ExpectedRefusal bool    `json:"expected_refusal,omitempty"`
-	Sender          string  `json:"sender,omitempty"`
-	After           *int    `json:"after,omitempty"`
-	AfterEvent      string  `json:"after_event,omitempty"`
-	File            string  `json:"file,omitempty"`
+	ProbeMode          string  `json:"probe_mode,omitempty"`
+	ExpectedSearchLine int     `json:"expected_search_line,omitempty"`
+	Ordinal            int     `json:"ordinal"`
+	ActivateNS         int64   `json:"activate_ns"`
+	DueNS              int64   `json:"due_ns"`
+	Editor             int     `json:"editor,omitempty"`
+	Route              string  `json:"route,omitempty"`
+	Marker             string  `json:"marker"`
+	MutationID         string  `json:"mutation_id"`
+	Request            request `json:"request"`
+	RequestHash        string  `json:"request_sha256"`
+	BeforeSymbol       string  `json:"before_symbol,omitempty"`
+	Deleted            bool    `json:"deleted,omitempty"`
+	TargetSymbol       string  `json:"target_symbol,omitempty"`
+	FollowingSymbol    string  `json:"following_symbol,omitempty"`
+	ExpectedLineGap    int     `json:"expected_line_gap,omitempty"`
+	Relocated          bool    `json:"relocated,omitempty"`
+	DestinationFile    string  `json:"destination_file,omitempty"`
+	ExpectedRefusal    bool    `json:"expected_refusal,omitempty"`
+	Sender             string  `json:"sender,omitempty"`
+	After              *int    `json:"after,omitempty"`
+	AfterEvent         string  `json:"after_event,omitempty"`
+	File               string  `json:"file,omitempty"`
 }
 
 type editProbeRoute struct {
@@ -61,30 +62,31 @@ type editProbeRoute struct {
 }
 
 type editProbePlan struct {
-	GateModes       bool             `json:"gate_modes,omitempty"`
-	Version         int              `json:"version"`
-	Arrival         string           `json:"arrival"`
-	MeanNS          int64            `json:"mean_interarrival_ns"`
-	ProbePeriodNS   int64            `json:"probe_period_ns"`
-	Count           int              `json:"count"`
-	Editors         int              `json:"editors,omitempty"`
-	Readers         int              `json:"readers,omitempty"`
-	NoEditWindow    int64            `json:"no_edit_window_ns,omitempty"`
-	Seed            int64            `json:"seed"`
-	Kind            string           `json:"kind"`
-	Tool            string           `json:"tool"`
-	Language        string           `json:"language"`
-	Mode            string           `json:"mode"`
-	Sender          string           `json:"sender,omitempty"`
-	Repo            string           `json:"repo"`
-	Commit          string           `json:"commit"`
-	File            string           `json:"file"`
-	Callee          string           `json:"callee"`
-	SessionModel    string           `json:"session_model"`
-	NotSelected     []string         `json:"not_selected_not_tested"`
-	Steps           []editProbeStep  `json:"steps"`
-	Routes          []editProbeRoute `json:"routes,omitempty"`
-	LinkedWorktrees int              `json:"linked_worktrees,omitempty"`
+	GateModes                bool             `json:"gate_modes,omitempty"`
+	SearchReadbackAcceptance bool             `json:"search_readback_acceptance,omitempty"`
+	Version                  int              `json:"version"`
+	Arrival                  string           `json:"arrival"`
+	MeanNS                   int64            `json:"mean_interarrival_ns"`
+	ProbePeriodNS            int64            `json:"probe_period_ns"`
+	Count                    int              `json:"count"`
+	Editors                  int              `json:"editors,omitempty"`
+	Readers                  int              `json:"readers,omitempty"`
+	NoEditWindow             int64            `json:"no_edit_window_ns,omitempty"`
+	Seed                     int64            `json:"seed"`
+	Kind                     string           `json:"kind"`
+	Tool                     string           `json:"tool"`
+	Language                 string           `json:"language"`
+	Mode                     string           `json:"mode"`
+	Sender                   string           `json:"sender,omitempty"`
+	Repo                     string           `json:"repo"`
+	Commit                   string           `json:"commit"`
+	File                     string           `json:"file"`
+	Callee                   string           `json:"callee"`
+	SessionModel             string           `json:"session_model"`
+	NotSelected              []string         `json:"not_selected_not_tested"`
+	Steps                    []editProbeStep  `json:"steps"`
+	Routes                   []editProbeRoute `json:"routes,omitempty"`
+	LinkedWorktrees          int              `json:"linked_worktrees,omitempty"`
 }
 
 type editProbeArrival struct {
@@ -135,7 +137,15 @@ func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
 	if mean == 0 {
 		mean = editProbeMean
 	}
-	p, err := makeEditProbeTrafficPlanWithMean(c, o.Seed, o.EditCount, o.Editors, mean)
+	p, err := makeEditProbeTrafficPlanSized(c, o.Seed, o.EditCount, o.Editors, mean, o.SearchReadbackAcceptance)
+	if err == nil && o.SearchReadbackAcceptance {
+		if err := bindSearchReadbackExpectations(c, &p); err != nil {
+			return editProbePlan{}, err
+		}
+		p.SearchReadbackAcceptance = true
+		p.SessionModel = "fixed_editors_immediate_search_then_independent_uncredited_probes"
+		p.NotSelected = append(p.NotSelected, "search acceptance uses pinned line-preserving renames; only first same-editor post-ACK search responses count, never later polling")
+	}
 	if err != nil {
 		return p, err
 	}
@@ -313,10 +323,14 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 }
 
 func makeEditProbeTrafficPlanWithMean(c Corpus, seed int64, count, editors int, mean time.Duration) (editProbePlan, error) {
+	return makeEditProbeTrafficPlanSized(c, seed, count, editors, mean, false)
+}
+
+func makeEditProbeTrafficPlanSized(c Corpus, seed int64, count, editors int, mean time.Duration, searchAcceptance bool) (editProbePlan, error) {
 	if err := validateCorpus(c); err != nil {
 		return editProbePlan{}, err
 	}
-	if count != 1 && count != 100 {
+	if count != 1 && count != 100 && (!searchAcceptance || count != 1000) {
 		return editProbePlan{}, errors.New("edit-and-probe requires 100 edits, or explicit 1-edit diagnostic")
 	}
 	if editors < 1 || editors > editProbeMaxEditors {

@@ -14,42 +14,43 @@ import (
 )
 
 type runOptions struct {
-	Binary            string
-	Manifest          string
-	Scratch           string
-	Output            string
-	GitSHA            string
-	Profile           string
-	Host              string
-	Scenario          string
-	Agents            int
-	Editors           int
-	Worktrees         int
-	Seed              int64
-	Duration          time.Duration
-	PRSmokeDrain      time.Duration
-	Deadline          time.Duration
-	WarmTimeout       time.Duration
-	StopTimeout       time.Duration
-	CPUProfile        time.Duration
-	Gauges            bool
-	HeapProfiles      bool
-	WorktreeSteps     []int
-	KeepState         bool
-	SweepRepetitions  int
-	SweepBudget       time.Duration
-	EditMean          time.Duration
-	EditCount         int
-	EditGateModes     bool
-	EditGateSeed      string
-	EditRepos         int
-	EditProbeRole     string
-	editProbeBaseline bool
-	Discovery         discoveryOptions
-	Startup           startupOptions
-	pairedDriver      func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
-	smokeState        *privateRun // only the fixed smoke entry lends its freshly owned store
-	smokeMarkers      []string
+	Binary                   string
+	Manifest                 string
+	Scratch                  string
+	Output                   string
+	GitSHA                   string
+	Profile                  string
+	Host                     string
+	Scenario                 string
+	Agents                   int
+	Editors                  int
+	Worktrees                int
+	Seed                     int64
+	Duration                 time.Duration
+	PRSmokeDrain             time.Duration
+	Deadline                 time.Duration
+	WarmTimeout              time.Duration
+	StopTimeout              time.Duration
+	CPUProfile               time.Duration
+	Gauges                   bool
+	HeapProfiles             bool
+	WorktreeSteps            []int
+	KeepState                bool
+	SweepRepetitions         int
+	SweepBudget              time.Duration
+	EditMean                 time.Duration
+	EditCount                int
+	SearchReadbackAcceptance bool
+	EditGateModes            bool
+	EditGateSeed             string
+	EditRepos                int
+	EditProbeRole            string
+	editProbeBaseline        bool
+	Discovery                discoveryOptions
+	Startup                  startupOptions
+	pairedDriver             func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
+	smokeState               *privateRun // only the fixed smoke entry lends its freshly owned store
+	smokeMarkers             []string
 }
 
 func parseRun(args []string) (runOptions, error) {
@@ -97,12 +98,16 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.EditRepos, "edit-repos", 1, "edit-and-probe: one repository (default), or exactly six distinct pinned repositories")
 	bindDiscoveryFlags(f, &o.Discovery)
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
+	f.BoolVar(&o.SearchReadbackAcceptance, "search-readback-acceptance", false, "explicit search acceptance: 1000 immediate same-session search witnesses at 1, 4 or 8 editors")
 	f.BoolVar(&o.EditGateModes, "edit-gate-modes", false, "edit-and-probe gate: rotate five probe surfaces over 100 total edits; JSON ACKs remain unchanged")
 	f.StringVar(&o.EditGateSeed, "edit-gate-seed", "", "explicit gate-only fault: ack-wait or closed-read-gate; requires a seed-tagged binary")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
 
 func validateRunOptions(o runOptions) error {
+	if o.SearchReadbackAcceptance && (o.Scenario != editProbeScenario || o.EditCount != 1000 || o.Editors != 1 && o.Editors != 4 && o.Editors != 8 || o.Agents != 0 || o.Worktrees != 0 || o.EditRepos != 1) {
+		return errors.New("--search-readback-acceptance requires edit-and-probe, 1000 edits, 1/4/8 editors, one primary repository and no pure readers or worktrees")
+	}
 	if o.EditGateSeed != "" && (!o.EditGateModes || o.EditGateSeed != "ack-wait" && o.EditGateSeed != "closed-read-gate") {
 		return errors.New("--edit-gate-seed requires --edit-gate-modes and ack-wait or closed-read-gate")
 	}
@@ -137,7 +142,7 @@ func validateRunOptions(o runOptions) error {
 	if _, err := parseProfile(o.Profile); err != nil {
 		return err
 	}
-	if o.Scenario == editProbeScenario && (o.Profile != "agent" || o.Agents > editProbeMaxReaders || o.Editors < 1 || o.Editors > editProbeMaxEditors || o.Worktrees > 15 || o.CPUProfile != 0 || o.EditCount != 1 && o.EditCount != 100 || o.EditCount == 1 && o.Editors != 1) {
+	if o.Scenario == editProbeScenario && (o.Profile != "agent" || o.Agents > editProbeMaxReaders || o.Editors < 1 || o.Editors > editProbeMaxEditors || o.Worktrees > 15 || o.CPUProfile != 0 || !o.SearchReadbackAcceptance && o.EditCount != 1 && o.EditCount != 100 || o.EditCount == 1 && o.Editors != 1) {
 		return fmt.Errorf("edit-and-probe requires --profile agent --agents 0..%d --edit-agents 1..%d on one repository or explicit routed checkouts, at most 15 linked worktrees, no CPU profile, and --edit-count 100 (or an explicit 1-edit, 1-editor diagnostic)", editProbeMaxReaders, editProbeMaxEditors)
 	}
 	if o.Scenario == editProbeScenario && (o.EditRepos > 1 || o.Worktrees > 0) && (o.EditRepos > 1 && o.Worktrees > 0 || o.Agents != 0 || o.EditCount != 100 || o.Editors < max(o.EditRepos, o.Worktrees+1)) {
