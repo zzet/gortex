@@ -96,3 +96,119 @@ func TestRelationVerdictsRequireFreshDeadlineReturnAnswers(t *testing.T) {
 		})
 	}
 }
+
+func TestDeadCodeWaitKeepsDerivedScopeAndOriginalPassDeadline(t *testing.T) {
+	s, root := newRelationFixture(t)
+	path := writeUnindexed(t, root, "unused.go", "package p\nfunc unused() {}\nfunc secondUnused() {}\nfunc thirdUnused() {}\n")
+	require.NoError(t, s.indexer.IndexFile(path))
+	now := time.Now()
+	s.SetWatcher(&watchedTierFixture{paths: map[string]indexer.MutationTierState{path: {Generation: 1, AckAt: now, FileGraphAt: now, RelationsAt: now}}})
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "find_dead_code"
+	req.Params.Arguments = map[string]any{"require_fresh": true, "freshness_scope": "relations", "wait_deadline": time.Now().Add(250 * time.Millisecond).Format(time.RFC3339Nano), "format": "json"}
+	started := time.Now()
+	res, err := s.wrapToolHandler(s.handleFindDeadCode)(t.Context(), req)
+	require.NoError(t, err)
+	require.False(t, res.IsError)
+	require.GreaterOrEqual(t, time.Since(started), 200*time.Millisecond, "a weaker request tier cannot bypass derived publication")
+	require.Less(t, time.Since(started), time.Second, "candidate waits share one original deadline")
+	payload := lifecycleResultPayload(t, res)
+	require.EqualValues(t, 3, payload["pending_unknown_count"])
+	require.Equal(t, "derived", payload["freshness_scope"])
+	require.Empty(t, payload["dead_code"])
+}
+
+func TestDeadCodeDerivedWaitIncludesPendingInboundAndIgnoresUnrelated(t *testing.T) {
+	for _, inbound := range []bool{false, true} {
+		t.Run(fmt.Sprint(inbound), func(t *testing.T) {
+			s, root := newRelationFixture(t)
+			file := writeUnindexed(t, root, "unused.go", "package p\nfunc unused() {}\n")
+			require.NoError(t, s.indexer.IndexFile(file))
+			text := "package p\nfunc Namer() {}\n"
+			if inbound {
+				text = "package p\nfunc Namer() { unused() }\n"
+			}
+			pending := writeUnindexed(t, root, "namer.go", text)
+			now := time.Now()
+			s.SetWatcher(&watchedTierFixture{paths: map[string]indexer.MutationTierState{pending: {Generation: 1, AckAt: now, FileGraphAt: now, RelationsAt: now}}})
+			req := mcp.CallToolRequest{}
+			req.Params.Name = "find_dead_code"
+			req.Params.Arguments = map[string]any{"require_fresh": true, "wait_deadline": time.Now().Add(500 * time.Millisecond).Format(time.RFC3339Nano), "format": "json"}
+			started := time.Now()
+			res, err := s.wrapToolHandler(s.handleFindDeadCode)(t.Context(), req)
+			require.NoError(t, err)
+			require.False(t, res.IsError)
+			if inbound {
+				require.GreaterOrEqual(t, time.Since(started), 400*time.Millisecond)
+				require.Contains(t, freshnessToolResultText(res), "pending_unknown")
+			} else {
+				require.Less(t, time.Since(started), 300*time.Millisecond, "an unrelated derived gap must not create a workspace wait")
+				require.NotContains(t, freshnessToolResultText(res), "pending_unknown")
+			}
+		})
+	}
+}
+
+func TestOrdinaryRelationReadStillRefusesExpiredRequireFresh(t *testing.T) {
+	s, root := newRelationFixture(t)
+	s.SetWatcher(&watchedTierFixture{paths: map[string]indexer.MutationTierState{filepath.Join(root, "caller.go"): {Generation: 1, AckAt: time.Now()}}})
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "get_callers"
+	req.Params.Arguments = map[string]any{"id": targetID(t, s), "require_fresh": true, "wait_deadline": time.Now().Add(100 * time.Millisecond).Format(time.RFC3339Nano), "format": "json"}
+	res, err := s.wrapToolHandler(s.handleGetCallers)(t.Context(), req)
+	require.NoError(t, err)
+	require.True(t, res.IsError, "ordinary read freshness contract remains a refusal")
+}
+
+func TestFacadeVerifyDeadlineReturnsLabelledVerdict(t *testing.T) {
+	for _, format := range []string{"json", "toon", "gcx", "compact"} {
+		t.Run(format, func(t *testing.T) {
+			s, root := newRelationFixture(t)
+			s.SetWatcher(&watchedTierFixture{paths: map[string]indexer.MutationTierState{filepath.Join(root, "caller.go"): {Generation: 1, AckAt: time.Now()}}})
+			output := map[string]any{"format": format}
+			if format == "compact" {
+				output["format"] = "json"
+				output["compact"] = true
+			}
+			req := mcp.CallToolRequest{}
+			req.Params.Name = "change"
+			req.Params.Arguments = map[string]any{"operation": "verify", "source": map[string]any{"changes": []any{map[string]any{"symbol_id": targetID(t, s), "new_signature": "func Target()"}}}, "options": map[string]any{"require_fresh": true, "wait_deadline": time.Now().Add(150 * time.Millisecond).Format(time.RFC3339Nano)}, "output": output}
+			res, err := s.handleFacade(t.Context(), "change", req)
+			require.NoError(t, err)
+			require.False(t, res.IsError, freshnessToolResultText(res))
+			require.Contains(t, freshnessToolResultText(res), "pending")
+		})
+	}
+}
+
+func TestRelationVerdictCallerCancellationIsNotFreshnessExpiry(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprint(deadline), func(t *testing.T) {
+			s, root := newRelationFixture(t)
+			s.SetWatcher(&watchedTierFixture{paths: map[string]indexer.MutationTierState{
+				filepath.Join(root, "caller.go"): {Generation: 1, AckAt: time.Now()},
+			}})
+			req := mcp.CallToolRequest{}
+			req.Params.Name = "verify_change"
+			req.Params.Arguments = map[string]any{
+				"changes":       fmt.Sprintf(`[{"symbol_id":%q,"new_signature":"func Target()"}]`, targetID(t, s)),
+				"require_fresh": true, "wait_deadline": time.Now().Add(time.Second).Format(time.RFC3339Nano), "format": "json",
+			}
+			var ctx context.Context
+			var cancel context.CancelFunc
+			want := context.Canceled
+			if deadline {
+				ctx, cancel = context.WithDeadline(t.Context(), time.Now().Add(-time.Millisecond))
+				want = context.DeadlineExceeded
+			} else {
+				ctx, cancel = context.WithCancel(t.Context())
+				timer := time.AfterFunc(100*time.Millisecond, cancel)
+				defer timer.Stop()
+			}
+			defer cancel()
+			result, err := s.wrapToolHandler(s.handleVerifyChange)(ctx, req)
+			require.ErrorIs(t, err, want, "caller cancellation must not become a labelled successful verdict")
+			require.Nil(t, result)
+		})
+	}
+}
