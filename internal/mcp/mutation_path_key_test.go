@@ -63,3 +63,30 @@ func TestMutationPathLockSerializesAliasSpellings(t *testing.T) {
 		})
 	}
 }
+
+func TestMutationPathsCheckEveryRequestedSpellingBeforeDeduplication(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "a.go")
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pathkey.MutationKey(relative) != pathkey.MutationKey(path) {
+		t.Fatal("test paths must name the same mutation key")
+	}
+	ctx := withCheckoutMutation(context.Background(), &fakeCheckoutMutationLifecycle{}, root)
+	release, err := acquireMutationPaths(ctx, []string{path, relative})
+	if release != nil {
+		release()
+	}
+	if err == nil {
+		t.Fatal("deduplication bypassed checkout admission for a relative requested spelling")
+	}
+	if refs := mutationRefs(path); refs != 0 {
+		t.Fatalf("refused mutation set retained %d lock references", refs)
+	}
+}

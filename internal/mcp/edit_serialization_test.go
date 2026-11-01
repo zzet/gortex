@@ -12,6 +12,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 )
 
@@ -67,7 +68,7 @@ type degradedMutationTestWatcher struct {
 func (w degradedMutationTestWatcher) DegradedReason() string { return w.reason }
 
 func mutationRefs(path string) int {
-	path = filepath.Clean(path)
+	path = pathkey.MutationKey(path)
 	mutationPathLocks.Lock()
 	defer mutationPathLocks.Unlock()
 	if entry := mutationPathLocks.byPath[path]; entry != nil {
