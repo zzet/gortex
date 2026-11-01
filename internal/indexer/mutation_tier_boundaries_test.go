@@ -89,3 +89,21 @@ func TestMixedBatchDoesNotPublishFailedRelationsBeforeDerived(t *testing.T) {
 		}
 	}
 }
+
+func TestDeferredNativeBatchDoesNotCertifyUnrunTiers(t *testing.T) {
+	dir, watcher := toolAdmissionFixture(t)
+	idx := watcher.indexer
+	idx.SetDeferGlobalPasses(true)
+	path := filepath.Join(dir, "main.go")
+	writeTestFile(t, path, "package main\nfunc DeferredChanged() {}\n")
+	watcher.config.StormQuietPeriodMs = int(time.Hour / time.Millisecond)
+	watcher.recordInStormEvent(path, ChangeModified, true)
+	frontier := watcher.mutationTierFrontier([]string{path})
+	result, fanout, err := watcher.reindexMutationPaths([]string{path}, false, frontier)
+	require.NoError(t, err)
+	require.NotEmpty(t, idx.graph.FindNodesByName("DeferredChanged"), "file graph actually published")
+	watcher.completeStormMutationWaiters(frontier, result, nil, fanout)
+	state := watcher.TierState(path)
+	require.True(t, state.Partial, "deferred passes must remain visibly incomplete")
+	require.True(t, state.DerivedAt.IsZero(), "a skipped derived pass has no publication stamp")
+}
