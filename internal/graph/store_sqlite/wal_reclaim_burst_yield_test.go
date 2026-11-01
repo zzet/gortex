@@ -28,14 +28,19 @@ func TestWALReclaimUrgentResetYieldsToEditBurst(t *testing.T) {
 func TestWALReclaimUrgentRefusesQueuedWriter(t *testing.T) {
 	s, db := finalBackfillFixture(t)
 	s.writeMu.Lock()
-	writerDone := make(chan struct{})
-	go func() { s.writeMu.Lock(); s.writeMu.Unlock(); close(writerDone) }()
+	writerDone := make(chan error, 1)
+	go func() {
+		s.writeMu.Lock()
+		_, err := s.writerDB.ExecContext(t.Context(), `UPDATE wal_churn SET payload='queued-edit' WHERE id=1`)
+		s.writeMu.Unlock()
+		writerDone <- err
+	}()
 	require.Eventually(t, func() bool { return s.writeMu.waiting() > 0 }, time.Second, time.Millisecond)
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	_, err := s.reclaimWALResetHoldOnce(ctx, walReclaimConfig{}, db, &walReclaimResult{urgent: true}, true, false, walReclaimResetHold)
 	s.writeMu.Unlock()
-	<-writerDone
+	require.NoError(t, <-writerDone)
 	require.ErrorIs(t, err, errWALReclaimWriterWaiting, "urgent reclaim must refuse queued edits before writer admission")
 }
 
