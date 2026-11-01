@@ -1691,7 +1691,7 @@ func (l *CheckoutLifecycle) ApplyReload(ctx context.Context) (ReloadResult, erro
 	trackedByRoot := map[string]string{}
 	for prefix, meta := range l.mi.AllMetadata() {
 		if meta != nil {
-			trackedByRoot[meta.RootPath] = prefix
+			trackedByRoot[pathkey.CanonicalExistingRoot(meta.RootPath)] = prefix
 		}
 	}
 
@@ -1701,7 +1701,7 @@ func (l *CheckoutLifecycle) ApplyReload(ctx context.Context) (ReloadResult, erro
 		if err != nil {
 			abs = entry.Path
 		}
-		if prefix, ok := trackedByRoot[abs]; ok {
+		if prefix, ok := trackedByRoot[pathkey.CanonicalExistingRoot(abs)]; ok {
 			wanted[prefix] = true
 			continue
 		}
@@ -1870,7 +1870,7 @@ func (l *CheckoutLifecycle) sweep(ctx context.Context, retirePayload bool) (Swee
 		errs = append(errs, err)
 	}
 	for _, fam := range l.knownFamilies(ctx) {
-		report, err := l.rec.ReconcileFamily(ctx, fam.familyID, fam.probeDir)
+		report, err := l.reconcileCatalogFamily(ctx, fam.familyID, fam.probeDir)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("family %s: %w", fam.familyID, err))
 			continue
@@ -2047,7 +2047,7 @@ func (l *CheckoutLifecycle) reconcileFamilyNow(ctx context.Context, familyID, fa
 		return errors.New("checkout lifecycle: family reconciliation is not wired")
 	}
 	baseline := l.repoSetFingerprint()
-	report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, fallbackDir))
+	report, err := l.reconcileCatalogFamily(ctx, familyID, fallbackDir)
 	if err != nil {
 		l.logger.Debug("checkout lifecycle: could not reconcile the family",
 			zap.String("family", familyID), zap.Error(err))
@@ -2137,22 +2137,47 @@ func (l *CheckoutLifecycle) familyForPrefix(ctx context.Context, prefix string) 
 	return binding.FamilyID
 }
 
-// probeDirFor picks the directory a family's inventory is read from.
-func (l *CheckoutLifecycle) probeDirFor(ctx context.Context, familyID, fallback string) string {
+// probeDirsFor prefers the primary, then shared Git data, then linked
+// checkouts. Every candidate is attempted before declaring inventory unavailable.
+func (l *CheckoutLifecycle) probeDirsFor(ctx context.Context, familyID, fallback string) []string {
+	var dirs []string
+	seen := map[string]bool{}
+	add := func(path string) {
+		if path != "" && !seen[path] && dirExists(path) {
+			seen[path] = true
+			dirs = append(dirs, path)
+		}
+	}
 	checkouts, err := l.catalog.ListCheckouts(ctx, familyID)
 	if err == nil {
 		for _, checkout := range checkouts {
-			if checkout.RootPath != "" && dirExists(checkout.RootPath) {
-				return checkout.RootPath
+			if checkout.AdminName == gitstate.MainAdminName {
+				add(checkout.RootPath)
 			}
 		}
 	}
 	if family, ok, err := l.catalog.GetRepositoryFamily(ctx, familyID); err == nil && ok {
-		if dirExists(family.CommonDirIdentity) {
-			return family.CommonDirIdentity
+		add(family.CommonDirIdentity)
+	}
+	if err == nil {
+		for _, checkout := range checkouts {
+			add(checkout.RootPath)
 		}
 	}
+	add(fallback)
+	return dirs
+}
+
+func (l *CheckoutLifecycle) probeDirFor(ctx context.Context, familyID, fallback string) string {
+	dirs := l.probeDirsFor(ctx, familyID, fallback)
+	if len(dirs) > 0 {
+		return dirs[0]
+	}
 	return fallback
+}
+
+func (l *CheckoutLifecycle) reconcileCatalogFamily(ctx context.Context, familyID, fallback string) (reconcile.FamilyReport, error) {
+	return l.rec.ReconcileFamilyCandidates(ctx, familyID, l.probeDirsFor(ctx, familyID, fallback)...)
 }
 
 // --- per-checkout coordinators ------------------------------------------
@@ -4387,7 +4412,7 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 		familyStarted := stageStarted("reconcile_family", zap.String("family", familyID))
 		reconcileStarted := stageStarted("reconcile_family_catalog", zap.String("family", familyID))
 		baseline := l.repoSetFingerprint()
-		report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, probeDir))
+		report, err := l.reconcileCatalogFamily(ctx, familyID, probeDir)
 		stageCompleted("reconcile_family_catalog", reconcileStarted, err, zap.String("family", familyID))
 		if err != nil {
 			logger.Debug("checkout lifecycle: could not reconcile the family",
@@ -4773,7 +4798,7 @@ func (l *CheckoutLifecycle) prefixForCheckout(ctx context.Context, checkoutID st
 			}
 		}
 	}
-	return l.ResolvePrefix(checkout.RootPath)
+	return ""
 }
 
 // --- identifiers --------------------------------------------------------

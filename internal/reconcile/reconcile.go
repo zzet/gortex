@@ -235,6 +235,12 @@ type familyPass struct {
 // removal clock expires, which runs a saga, or when a caller enters one of
 // the saga entry points directly.
 func (r *Reconciler) ReconcileFamily(ctx context.Context, familyID, probeDir string) (FamilyReport, error) {
+	return r.ReconcileFamilyCandidates(ctx, familyID, probeDir)
+}
+
+// ReconcileFamilyCandidates tries ordered probes without letting one damaged
+// checkout stand in for the availability of every checkout in its family.
+func (r *Reconciler) ReconcileFamilyCandidates(ctx context.Context, familyID string, probeDirs ...string) (FamilyReport, error) {
 	family, ok, err := r.catalog.GetRepositoryFamily(ctx, familyID)
 	if err != nil {
 		return FamilyReport{}, err
@@ -244,7 +250,19 @@ func (r *Reconciler) ReconcileFamily(ctx context.Context, familyID, probeDir str
 	}
 
 	started := time.Now()
-	inv, invErr := r.inventory(ctx, probeDir)
+	var inv *gitstate.FamilyInventory
+	invErr := gitstate.ErrInventoryUnavailable
+	for _, probeDir := range probeDirs {
+		if ctx.Err() != nil {
+			invErr = ctx.Err()
+			break
+		}
+		inv, invErr = r.inventory(ctx, probeDir)
+		invErr = ValidateInventory(inv, invErr, family.CommonDirIdentity)
+		if invErr == nil {
+			break
+		}
+	}
 	elapsed := time.Since(started)
 	pass := &familyPass{
 		family:       family,
