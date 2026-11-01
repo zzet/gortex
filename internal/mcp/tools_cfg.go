@@ -65,10 +65,14 @@ func (s *Server) buildSymbolCFG(ctx context.Context, id string) (*symbolCFG, err
 	if err != nil {
 		return nil, err
 	}
-	source, fromLine, _, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, 0)
+	ns, err := s.readNodeSource(ctx, node, absPath)
 	if err != nil {
 		return nil, fmt.Errorf("could not read source: %v", err)
 	}
+	resolved := *node
+	resolved.StartLine, resolved.EndLine = ns.startLine, ns.endLine
+	node = &resolved
+	source, fromLine, _, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, 0)
 	c, err := cfg.Build([]byte(source), node.Language, cfg.Options{
 		LineOffset: fromLine - 1,
 		FuncName:   node.Name,
