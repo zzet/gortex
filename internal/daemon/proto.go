@@ -739,6 +739,19 @@ type RuntimeStats struct {
 	StackInuse   uint64 `json:"stack_inuse"`   // goroutine stacks
 	NumGC        uint32 `json:"num_gc"`        // completed GC cycles
 	NumGoroutine int    `json:"num_goroutine"` // live goroutines
+
+	// What the Go runtime cannot see. Most of a daemon's footprint can be
+	// outside the Go heap: SQLite's page caches and parser allocations come
+	// from C allocators, and memory-mapped store files are file pages. The
+	// operating-system figures are omitted where the platform has no reader.
+	RSS                 uint64 `json:"rss,omitempty"`                    // resident set now
+	RSSPeak             uint64 `json:"rss_peak,omitempty"`               // lifetime maximum resident set
+	PSS                 uint64 `json:"pss,omitempty"`                    // Linux proportional set: shared pages divided among sharers
+	PSSFile             uint64 `json:"pss_file,omitempty"`               // file-backed part of PSS: mapped store files, executable
+	Footprint           uint64 `json:"footprint,omitempty"`              // macOS physical footprint now
+	FootprintPeak       uint64 `json:"footprint_peak,omitempty"`         // macOS lifetime maximum physical footprint
+	SQLitePageCache     uint64 `json:"sqlite_page_cache,omitempty"`      // every SQLite connection's page cache, process-wide
+	SQLitePageCachePeak uint64 `json:"sqlite_page_cache_peak,omitempty"` // lifetime maximum of the above
 }
 
 // TrigramCacheStats reports the process-wide trigram searcher cache: how

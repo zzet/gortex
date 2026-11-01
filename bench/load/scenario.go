@@ -152,7 +152,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 	}()
 	if scenario == "worktrees" {
-		if err := p.addWorktrees(ctx, o.Worktrees); err != nil {
+		if err := p.addWorktrees(ctx, bootWorktrees(o)); err != nil {
 			return phase, nil, artifacts, crashes, "", err
 		}
 	}
@@ -198,6 +198,27 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	}
 	if err != nil {
 		return phase, nil, artifacts, crashes, "", err
+	}
+	// The gauge series starts as soon as the measured daemon is ready, so it
+	// also covers the warmup gates and the level after enrichment, before any
+	// load. A restart replaces the process, so there it starts after the
+	// restart instead.
+	var series *gaugeSeries
+	startSeries := func() (err error) {
+		if wantsGaugeSeries(o) {
+			series, err = startGaugeSeries(ctx, p, newProcessSampler(), group)
+		}
+		return err
+	}
+	defer func() {
+		if series != nil {
+			resultErr = errors.Join(resultErr, series.stopInto(&phase))
+		}
+	}()
+	if scenario != "restart" {
+		if err := startSeries(); err != nil {
+			return phase, nil, artifacts, crashes, "", err
+		}
 	}
 	var readinessState readiness
 	if err := json.Unmarshal(gate["readiness"], &readinessState); err != nil {
@@ -284,6 +305,9 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		if err != nil {
 			return phase, nil, artifacts, crashes, version, err
 		}
+		if err := startSeries(); err != nil {
+			return phase, nil, artifacts, crashes, version, err
+		}
 		client, err := openMCP(warmCtx, p.Socket, p.Repos[0].Path)
 		if err != nil {
 			return phase, nil, artifacts, crashes, version, err
@@ -338,7 +362,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	} else if o.pairedDriver != nil {
 		err = o.pairedDriver(ctx, p, clients, sweepClients, &phase)
 	} else {
-		err = measureStandalone(ctx, o, p, clients, sweepClients, sweepRequests, sweep, &phase, artifacts, sampler, group)
+		err = measureStandalone(ctx, o, p, clients, sweepClients, sweepRequests, sweep, &phase, artifacts, series, sampler, group)
 	}
 	if err != nil {
 		resultErr = errors.Join(resultErr, err)
@@ -379,7 +403,11 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	return phase, sweep, artifacts, crashes, version, resultErr
 }
 
-func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients, sweepClients []*socketClient, sweepRequests []request, sweep []SweepEntry, phase *Phase, artifacts map[string]string, sampler processSampler, group string) error {
+func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients, sweepClients []*socketClient, sweepRequests []request, sweep []SweepEntry, phase *Phase, artifacts map[string]string, series *gaugeSeries, sampler processSampler, group string) error {
+	if len(o.WorktreeSteps) > 0 {
+		return measureWorktreeSteps(ctx, o, p, clients[0], phase, artifacts, series, sampler, group)
+	}
+	heap := series.watchLoadProfiles(ctx, o, p, phase)
 	phase.Started = time.Now()
 	monitor := startMonitor(p, sampler, group)
 	var profileDone chan error
@@ -406,6 +434,7 @@ func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients
 	}
 	phase.DurationSec = time.Since(phase.Started).Seconds()
 	monitor.finish(phase)
+	err = errors.Join(err, series.endLoadProfiles(heap, phase, artifacts))
 	if profileDone != nil {
 		err = errors.Join(err, <-profileDone)
 	}

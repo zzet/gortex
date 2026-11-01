@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -66,7 +68,38 @@ func fixtureDaemon(mode string) int {
 		return 5
 	}
 	defer listener.Close()
+	// A loopback pprof listener whose heap endpoint serves a fixed body that
+	// names any forced collection, so captured profiles are recognisable.
+	pprof, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 6
+	}
+	defer pprof.Close()
+	go func() {
+		_ = http.Serve(pprof, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/debug/pprof/heap" {
+				_, _ = w.Write([]byte("fixture-heap-profile gc=" + r.URL.Query().Get("gc")))
+				return
+			}
+			http.NotFound(w, r)
+		}))
+	}()
+	// Linked checkouts get a view the first time a control search names them;
+	// daemon_health reports how many there are as its coordinator count.
+	var viewsMu sync.Mutex
+	views := make(map[string]bool)
+	// Configured roots already own their primary coordinators. Linked views
+	// join the same census when a control search first names the checkout.
+	for _, repo := range config.Repos {
+		views[filepath.Clean(repo.Path)] = true
+	}
+	coordinators := func() int {
+		viewsMu.Lock()
+		defer viewsMu.Unlock()
+		return len(views)
+	}
 	var shutdown sync.Once
+	var warmupCalls atomic.Uint64
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -75,14 +108,22 @@ func fixtureDaemon(mode string) int {
 		go func() {
 			defer conn.Close()
 			decoder := json.NewDecoder(conn)
-			encoder := json.NewEncoder(conn)
+			var writeMu sync.Mutex
+			encode := func(value any) error {
+				writeMu.Lock()
+				defer writeMu.Unlock()
+				return json.NewEncoder(conn).Encode(value)
+			}
 			var handshake map[string]any
 			if decoder.Decode(&handshake) != nil {
 				return
 			}
-			if encoder.Encode(map[string]any{"ok": true, "daemon_version": "fixture-v1"}) != nil {
+			if encode(map[string]any{"ok": true, "daemon_version": "fixture-v1"}) != nil {
 				return
 			}
+			healthDone := make(chan struct{})
+			defer close(healthDone)
+			var healthOnce sync.Once
 			for {
 				var frame stubFrame
 				if decoder.Decode(&frame) != nil {
@@ -100,13 +141,20 @@ func fixtureDaemon(mode string) int {
 						}
 						result = map[string]any{"ready": true, "enriched": true, "tracked_repos": repos, "loaded_roots": roots}
 					case "status":
-						result = map[string]any{"ready": true, "enriched": true, "views": map[string]any{"coordinators": 1}, "storage": map[string]any{"wal_pending_frames": 0}}
+						result = map[string]any{"ready": true, "enriched": true, "views": map[string]any{"coordinators": coordinators()}, "storage": map[string]any{"wal_pending_frames": 0}, "pprof_addr": pprof.Addr().String()}
+					case "search_symbols":
+						if path, _ := frame.Params["path"].(string); path != "" {
+							viewsMu.Lock()
+							views[filepath.Clean(path)] = true
+							viewsMu.Unlock()
+						}
+						result = map[string]any{"view": map[string]any{"kind": "worktree", "exact": true, "repo_prefix": config.Repos[0].Name}}
 					case "shutdown":
 						result = map[string]any{"stopping": true}
 					default:
 						result = map[string]any{}
 					}
-					if encoder.Encode(map[string]any{"ok": true, "result": result}) != nil {
+					if encode(map[string]any{"ok": true, "result": result}) != nil {
 						return
 					}
 					if frame.Kind == "shutdown" {
@@ -127,11 +175,49 @@ func fixtureDaemon(mode string) int {
 					}
 					result = map[string]any{"contents": []any{map[string]any{"type": "text", "text": payload}}}
 				case "tools/call":
-					if frame.Params["name"] == "analyze" {
+					if frame.Params["name"] != "session" {
+						warmupCalls.Add(1)
+					}
+					arguments, _ := frame.Params["arguments"].(map[string]any)
+					switch {
+					case frame.Params["name"] == "analyze":
 						result = stubContent(map[string]any{"hotspots": []any{}, "total": 0})
-					} else if frame.Params["name"] == "session" {
+					case frame.Params["name"] == "session" && arguments["channel"] == "daemon_health" && arguments["operation"] == "subscribe":
+						interval := time.Second
+						if extra, ok := arguments["arguments"].(map[string]any); ok {
+							if ms, ok := extra["interval_ms"].(float64); ok && ms > 0 {
+								interval = time.Duration(ms) * time.Millisecond
+							}
+						}
+						healthOnce.Do(func() {
+							sendHealth := func(initial bool) error {
+								health := map[string]any{"ts": time.Now().UTC().Format(time.RFC3339Nano), "coordinators": coordinators(), "sqlite_page_cache_bytes": 4096, "initial_replay": initial, "fixture_warmup_calls": warmupCalls.Load()}
+								return encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/daemon_health", "params": health})
+							}
+							// Production delivers its initial replay before the subscribe
+							// reply. Keep that causal boundary independent of clock ticks.
+							if sendHealth(true) != nil {
+								return
+							}
+							go func() {
+								ticker := time.NewTicker(interval)
+								defer ticker.Stop()
+								for {
+									select {
+									case <-healthDone:
+										return
+									case <-ticker.C:
+										if sendHealth(false) != nil {
+											return
+										}
+									}
+								}
+							}()
+						})
+						result = stubContent(map[string]any{"subscribed": true})
+					case frame.Params["name"] == "session":
 						result = stubContent(map[string]any{})
-					} else if nativeReplies != nil {
+					case nativeReplies != nil:
 						args, _ := frame.Params["arguments"].(map[string]any)
 						target, _ := args["target"].(map[string]any)
 						if frame.Params["name"] == "read" && args["operation"] == "source" && target["symbol"] == "fixture/"+nativeCorpus.Symbol {
@@ -139,11 +225,11 @@ func fixtureDaemon(mode string) int {
 						} else {
 							result, _ = nativeReplies(frame)
 						}
-					} else {
+					default:
 						result = stubContent(map[string]any{"id": "sample/sample.go::Example", "source": "func Example() {}"})
 					}
 				}
-				if encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": frame.ID, "result": result}) != nil {
+				if encode(map[string]any{"jsonrpc": "2.0", "id": frame.ID, "result": result}) != nil {
 					return
 				}
 			}
