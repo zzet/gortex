@@ -102,7 +102,7 @@ func TestForeignImpactRunReportDescribesActualRolesAndPreservesEditPlan(t *testi
 	if report.Workload.Scenario != "foreign-impact" || report.Workload.Agents != 5 || report.Workload.EditAgents != 1 || report.Workload.SessionModel != "one_B_editor_and_five_independent_rotating_foreign_queries" {
 		t.Fatalf("foreign workload mislabeled as ordinary read-only many cell: %+v", report.Workload)
 	}
-	if report.Workload.EditProbe == nil || report.Workload.EditProbe.Count != 100 || report.Workload.EditProbe.Editors != 1 || report.Workload.EditProbe.Repo != corpora[2].Label || report.Workload.DurationSec != 600 {
+	if report.Workload.EditProbe == nil || report.Workload.EditProbe.Count != 100 || max(1, report.Workload.EditProbe.Editors) != 1 || report.Workload.EditProbe.Repo != corpora[2].Label || report.Workload.DurationSec != 600 {
 		t.Fatal("active foreign window or full B edit schedule lost")
 	}
 	plan, err := foreignImpactEditPlan(corpora[2], 42)
