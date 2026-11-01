@@ -291,7 +291,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// warmupDaemonState below so the socket opens immediately instead
 	// of waiting 30–60s for contract re-extraction across every tracked
 	// repo.
-	state, err := buildDaemonState(logger, startupReporter.ObserveMigration)
+	state, err := buildDaemonStateForStart(logger, startupReporter.ObserveMigration)
 	if err != nil {
 		startupReporter.Fail(err)
 		return fmt.Errorf("build daemon state: %w", err)
