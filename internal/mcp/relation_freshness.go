@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -120,17 +119,7 @@ func (s *Server) laggingMutationReceipts(ctx context.Context) []*mutationReceipt
 func (s *Server) relationScope(ctx context.Context, ids, files []string) func(absPath string) bool {
 	scoped := make(map[string]bool, len(files)+len(ids))
 	for _, file := range files {
-		if strings.HasPrefix(file, "file://") {
-			if abs, err := s.resolveOverlayAbsPath(file); err == nil {
-				file = abs
-			}
-		}
-		if filepath.IsAbs(file) {
-			file = s.repoRelative(file)
-		} else {
-			file = filepath.ToSlash(filepath.Clean(file))
-		}
-		scoped[file] = true
+		scoped[s.graphRelPath(ctx, file)] = true
 	}
 	var names []string
 	reader := s.readerFor(ctx)
