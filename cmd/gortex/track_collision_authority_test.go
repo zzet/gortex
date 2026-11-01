@@ -41,6 +41,8 @@ func TestRunTrackConfiguredCollisionReachesDaemonAuthority(t *testing.T) {
 		cmd.SetErr(&bytes.Buffer{})
 		err := runTrack(cmd, []string{loser})
 		require.ErrorContains(t, err, owner)
+		var authoritative *trackPrefixCollisionError
+		require.ErrorAs(t, err, &authoritative)
 		after, err := os.ReadFile(cm.Global().ConfigPath())
 		require.NoError(t, err)
 		require.Equal(t, before, after, "collision must never save the loser")
@@ -57,4 +59,25 @@ func TestRunTrackConfiguredCollisionReachesDaemonAuthority(t *testing.T) {
 	cmd.SetErr(&bytes.Buffer{})
 	require.NoError(t, runTrack(cmd, []string{owner}))
 	require.Len(t, logs.FilterMessage("repository not loaded").All(), 1, "same-root no-op adds no collision warning")
+}
+
+func TestRunTrackLocalCollisionCannotRegisterWhenDaemonHasNoOwner(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	owner, loser := filepath.Join(t.TempDir(), "src"), filepath.Join(t.TempDir(), "src")
+	for _, root := range []string{owner, loser} {
+		require.NoError(t, os.MkdirAll(root, 0o755))
+	}
+	cm, mi := startCatalogTrackDaemon(t, []config.RepoEntry{{Path: owner, Name: "src"}}, nil)
+	before, err := os.ReadFile(cm.Global().ConfigPath())
+	require.NoError(t, err)
+	oldWait, oldName, oldAsWorktree := trackWait, trackName, trackAsWorktree
+	t.Cleanup(func() { trackWait, trackName, trackAsWorktree = oldWait, oldName, oldAsWorktree })
+	trackWait, trackName, trackAsWorktree = false, "", false
+	cmd := &cobra.Command{}
+	cmd.SetErr(&bytes.Buffer{})
+	require.ErrorContains(t, runTrack(cmd, []string{loser}), owner)
+	after, err := os.ReadFile(cm.Global().ConfigPath())
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	require.Nil(t, mi.GetMetadata("src"), "read-only preflight must never register the loser when daemon ownership is unresolved")
 }

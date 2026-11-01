@@ -128,9 +128,11 @@ type ControlResponse struct {
 
 // Control operation kinds. One constant per kind so callers can't typo.
 const (
-	ControlTrack   = "track"
-	ControlUntrack = "untrack"
-	ControlReload  = "reload"
+	ControlTrack = "track"
+	// ControlTrackPreflight observes ownership without registering or saving.
+	ControlTrackPreflight = "track_preflight"
+	ControlUntrack        = "untrack"
+	ControlReload         = "reload"
 	// ControlProxy reloads servers.toml and rebuilds + atomically swaps
 	// the daemon's multi-server Router, then invalidates the roster
 	// cache — so `gortex proxy on/off/add/remove` apply to a running
