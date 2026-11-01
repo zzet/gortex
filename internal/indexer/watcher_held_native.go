@@ -31,6 +31,11 @@ func (w *Watcher) drainHeldNative(path string) {
 	delete(w.heldNative, path)
 	w.mu.Unlock()
 	if idx := w.currentMutationIndexer(); idx != nil && idx.fileMtimeMatches(path) {
+		// A provisional hold becomes an echo only after content validation.
+		// Multiple native events coalesced in this path count one attachment.
+		w.mu.Lock()
+		w.mutationEchoesAttached++
+		w.mu.Unlock()
 		return
 	}
 	// This rechecks tool ownership at admission in case a tool arrived while

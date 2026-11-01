@@ -190,7 +190,10 @@ type Watcher struct {
 	pendingGeneration          map[string]uint64
 	mutationWaiters            map[string]map[uint64]mutationWaiter
 	heldNative                 map[string]ChangeKind // native echoes awaiting outstanding tool receipts; guarded by mu
-	observedMutationGeneration map[string]uint64     // lazy index into outstanding waiters, not timing history
+	mutationEchoesAttached     uint64
+	mutationSuperseded         uint64
+	mutationWaitersLater       uint64
+	observedMutationGeneration map[string]uint64 // lazy index into outstanding waiters, not timing history
 	nextGeneration             uint64
 	// mutationRetryDelayFn and pointMutationPatch are deterministic test seams.
 	// Production retries use mutationRetryBackoff and the complete point pipeline.
@@ -2181,6 +2184,7 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 		}
 		if errors.Is(admissionErr, errMutationAdmissionDeferred) {
 			if w.mutationGenerationSuperseded(path, generation) {
+				w.noteMutationSuperseded()
 				return
 			}
 			if w.schedulePointMutationRetry(path, kind, generation, retryAttempt+1) {
@@ -2191,6 +2195,7 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 				return
 			}
 			if w.mutationGenerationSuperseded(path, generation) {
+				w.noteMutationSuperseded()
 				return
 			}
 		}
@@ -2199,6 +2204,7 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 	}
 	defer release()
 	complete := true
+	supersededRecorded := false
 	// The completeness fact for the bounded derived passes this patch runs.
 	// Read by the deferred completion below, so it must outlive the patch call
 	// and stay the zero value ("not observed") on every arm that never reaches
@@ -2218,6 +2224,9 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 				w.mutationBeforeComplete(path, generation)
 			}
 			if !w.completeMutationWaitersObserved(path, generation, patchErr, fanout, true, publication) && patchErr == nil {
+				if !supersededRecorded {
+					w.noteMutationSuperseded()
+				}
 				// The graph body landed, but a successor won admission before
 				// this completion. Cover only older receipts without accepting
 				// this attempt as the current timing/publication winner.
@@ -2238,10 +2247,18 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 		patchErr = errWatcherStopped
 		return
 	}
+	if errors.Is(patchErr, errMutationSuperseded) {
+		w.noteMutationSuperseded()
+		supersededRecorded = true
+	}
 	if errors.Is(patchErr, errPatchLandedSuperseded) {
 		patchErr = nil
 	}
 	if w.mutationGenerationSuperseded(path, generation) {
+		if !supersededRecorded {
+			w.noteMutationSuperseded()
+			supersededRecorded = true
+		}
 		// A successful body covers its own receipt even when a newer write
 		// now needs another patch. Pre-write aborts and errors cover none.
 		complete = patchErr == nil
@@ -2259,6 +2276,9 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 		return
 	}
 	if w.mutationGenerationSuperseded(path, generation) {
+		if !supersededRecorded {
+			w.noteMutationSuperseded()
+		}
 		patchErr = errMutationSuperseded
 		complete = false
 	}
@@ -2347,6 +2367,9 @@ func (w *Watcher) completeMutationWaitersObserved(
 	var accepted *PublicationPhaseRecord
 	for generation, waiter := range w.mutationWaiters[path] {
 		if generation <= appliedGeneration {
+			if err == nil && generation < appliedGeneration {
+				w.mutationWaitersLater++
+			}
 			if publication != nil && err == nil && !w.stopping && generation == appliedGeneration && waiter.publication == publication.record {
 				accepted = waiter.publication
 			}
@@ -2709,6 +2732,9 @@ func (w *Watcher) completeStormMutationWaiters(
 				pathErr = fmt.Errorf("storm mutation batch failed to index %s", path)
 			}
 		}
+		if !w.stopping && w.pendingGeneration[path] > appliedGeneration {
+			w.mutationSuperseded++
+		}
 		// Failed/unlanded work cannot cover receipts owned by a newer
 		// repair. A successful path covers only its applied ordinal.
 		if pathErr != nil && w.pendingGeneration[path] > appliedGeneration {
@@ -2724,6 +2750,9 @@ func (w *Watcher) completeStormMutationWaiters(
 		for requestedGeneration, waiter := range w.mutationWaiters[path] {
 			if requestedGeneration > appliedGeneration {
 				continue
+			}
+			if pathErr == nil && requestedGeneration < appliedGeneration {
+				w.mutationWaitersLater++
 			}
 			completions = append(completions, completion{
 				done: waiter.done,

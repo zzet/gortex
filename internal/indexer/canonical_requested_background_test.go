@@ -281,19 +281,25 @@ func TestRequestedBackgroundRejectsSupersessionBeforeAcceptance(t *testing.T) {
 	awaitPublicationSignal(t, reached)
 	require.Nil(t, record.RequestedBackground())
 	newer := w.scheduleFileMutation(path, ChangeModified)
+	unblock()
+	for _, ticket := range []*MutationTicket{first, native} {
+		result := awaitMutationRetryResult(t, ticket)
+		require.NoError(t, result.Err)
+		require.Equal(t, native.Generation, result.AppliedGeneration, "the landed body covers only its own and prior tickets")
+	}
+	select {
+	case result := <-newer.Done:
+		t.Fatalf("covered completion consumed the unexecuted successor: %+v", result)
+	default:
+	}
+	// Keep the successor in its native quiet window until covered completion
+	// is proved. This avoids racing two valid successful serving attempts.
 	w.mu.Lock()
 	w.pending[path].Reset(time.Millisecond)
 	w.mu.Unlock()
-	unblock()
-	for _, ticket := range []*MutationTicket{first, native, newer} {
-		result := awaitMutationRetryResult(t, ticket)
-		require.NoError(t, result.Err)
-		applied := native.Generation
-		if ticket == newer {
-			applied = newer.Generation
-		}
-		require.Equal(t, applied, result.AppliedGeneration, "the landed body covers only its own and prior tickets")
-	}
+	newerResult := awaitMutationRetryResult(t, newer)
+	require.NoError(t, newerResult.Err)
+	require.Equal(t, newer.Generation, newerResult.AppliedGeneration)
 	// Coverage is separate from publication acceptance: the overtaken body
 	// serves the old receipts, but neither it nor unrelated later work may
 	// become their accepted timing winner.
