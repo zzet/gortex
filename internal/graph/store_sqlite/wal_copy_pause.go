@@ -290,10 +290,17 @@ func (p *walCopyPacer) beforeWrite(n int64) {
 		}
 	}
 	p.pages++
-	if p.rate > 0 && !p.overPacingMark && st.walCopy.editing(now) && !p.stopped() {
+	// A blocked warm producer is not an edit burst: its own lane must not
+	// consume the background editing allowance before it can make progress.
+	// Recheck actual writer demand for every page and inside an existing wait.
+	warmupWaiting := st.warmupWALWaiters.Load() > 0 && !st.writeWanted()
+	if p.rate > 0 && !p.overPacingMark && !warmupWaiting && st.walCopy.editing(now) && !p.stopped() {
 		if wait := st.walCopy.take(now, n, p.rate); wait > 0 {
 			deadline := now.Add(wait)
 			for time.Now().Before(deadline) && !p.stopped() {
+				if st.warmupWALWaiters.Load() > 0 && !st.writeWanted() {
+					break
+				}
 				// Writers can cross the pressure mark while this page waits
 				// for budget. Do not retain a below-mark decision until the
 				// next 256 copied pages while those writers keep appending.
