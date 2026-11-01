@@ -48,6 +48,7 @@ func (s *Store) reclaimYieldCause(ctx context.Context, r *walReclaimResult) erro
 		if demand := s.writeDemandCause(); demand != nil {
 			noteWALReclaimDemand(ctx, demand)
 			r.deferredEditBurst = true
+			r.reason = "writer_waiting"
 			return demand
 		}
 	}
@@ -55,6 +56,15 @@ func (s *Store) reclaimYieldCause(ctx context.Context, r *walReclaimResult) erro
 		r.deferredInteractiveRead = true
 		r.reason = "interactive_read"
 		return errWALReclaimInteractiveRead
+	}
+	return nil
+}
+
+// Long completion and every read-gate closure wait for an edit gap. A short
+// open-gate reset may still proceed during a build when no writer needs it.
+func (s *Store) reclaimCompletionCause(ctx context.Context, r *walReclaimResult) error {
+	if err := s.reclaimYieldCause(ctx, r); err != nil {
+		return err
 	}
 	if !r.burstException() && s.editBurstActive() {
 		r.deferredEditBurst = true
@@ -71,23 +81,52 @@ func (s *Store) lockWALReclaimWriter(ctx context.Context, r *walReclaimResult) e
 	if err := s.reclaimYieldCause(ctx, r); err != nil {
 		return err
 	}
-	if err := s.writeMu.LockContext(ctx); err != nil {
+	if err := s.writeMu.lockContext(ctx, false); err != nil {
 		return err
 	}
 	state := &s.walReclaim.interactive
 	state.mu.Lock()
-	defer state.mu.Unlock()
 	if err := s.reclaimYieldCause(ctx, r); err != nil {
+		state.mu.Unlock()
 		s.writeMu.Unlock()
 		return err
 	}
 	s.writeMu.beginReclaim(s.editBurstActive())
 	check := s.editBurstActive
 	s.writeMu.reclaimBurstCheck.Store(&check)
-	if r.bulkCompletion {
-		s.writeMu.reclaimBulkExceptions.Add(1)
-	} else if r.hardCap || r.lastResort {
+	if r.hardCap || r.lastResort {
 		s.writeMu.reclaimHardExceptions.Add(1)
+	} else if r.bulkCompletion {
+		s.writeMu.reclaimBulkExceptions.Add(1)
+	}
+	state.mu.Unlock()
+	return nil
+}
+
+// Shrink/configuration completion may outlive a short reset. Revalidate the
+// edit-gap condition after queuing, before starting that work. Interactive
+// admission itself remains ordered by lockWALReclaimWriter.
+func (s *Store) lockWALReclaimCompletion(ctx context.Context, r *walReclaimResult) error {
+	if err := s.reclaimCompletionCause(ctx, r); err != nil {
+		return err
+	}
+	if err := s.lockWALReclaimWriter(ctx, r); err != nil {
+		return err
+	}
+	if err := s.reclaimCompletionCause(ctx, r); err != nil {
+		s.writeMu.Unlock()
+		return err
 	}
 	return nil
+}
+
+func (s *Store) noteReclaimDeferral(r *walReclaimResult) {
+	s.walReclaim.update(func(st *WALReclaimStats) {
+		if r.deferredEditBurst {
+			st.DeferredEditBurst++
+		}
+		if r.deferredInteractiveRead {
+			st.DeferredInteractiveRead++
+		}
+	})
 }

@@ -327,7 +327,7 @@ func (g *sqliteReadGate) quiesceReclaim(ctx context.Context, deadline time.Time,
 	if store != nil {
 		state := &store.walReclaim.interactive
 		state.mu.Lock()
-		if err := store.reclaimYieldCause(ctx, res); err != nil {
+		if err := store.reclaimCompletionCause(ctx, res); err != nil {
 			state.mu.Unlock()
 			g.mu.Unlock()
 			return nil, 0, errors.Join(errReadGateBusy, err)

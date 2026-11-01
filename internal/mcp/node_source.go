@@ -118,7 +118,11 @@ func (s *Server) readNodeSource(ctx context.Context, node *graph.Node, absPath s
 	if content, ok := s.overlayContentFor(ctx, absPath); ok {
 		return nodeSource{content: content, startLine: node.StartLine, endLine: node.EndLine}, nil
 	}
-	raw, err := os.ReadFile(absPath)
+	raw, err := func() ([]byte, error) {
+		release := s.beginEditedFileRead(ctx, absPath)
+		defer release()
+		return os.ReadFile(absPath)
+	}()
 	if err != nil {
 		return nodeSource{}, err
 	}

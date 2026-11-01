@@ -9,31 +9,20 @@ import (
 )
 
 func TestWALReclaimUrgentResetYieldsToEditBurst(t *testing.T) {
-	for _, kind := range []string{"announced", "build_lane"} {
-		t.Run(kind, func(t *testing.T) {
-			s, db := finalBackfillFixture(t)
-			var release func()
-			if kind == "announced" {
-				release = s.AnnounceWrite()
-			} else {
-				lane := &fakeBuildLane{}
-				lane.install(s)
-				lane.held.Store(true)
-				release = func() { lane.held.Store(false) }
-			}
-			defer release()
-			before := s.WALReclaimStats().WriterHold.Count()
-			res := &walReclaimResult{urgent: true}
-			done, _ := s.reclaimWALResetHold(t.Context(), walReclaimConfig{}, db, res, true, false)
-			require.False(t, done, "urgent reclaim reset during an active edit burst")
-			require.Equal(t, before, s.WALReclaimStats().WriterHold.Count(), "urgent reclaim acquired the writer during an active edit burst")
-			release()
-			done, err := s.reclaimWALResetHold(t.Context(), walReclaimConfig{}, db, &walReclaimResult{urgent: true}, true, false)
-			require.NoError(t, err)
-			require.True(t, done, "the same owned WAL must reset after the burst ends")
-			require.True(t, walLogIsReset(s.dbPath, s.dbPath+"-wal"))
-		})
-	}
+	s, db := finalBackfillFixture(t)
+	release := s.AnnounceWrite()
+	defer release()
+	before := s.WALReclaimStats().WriterHold.Count()
+	res := &walReclaimResult{urgent: true}
+	done, err := s.reclaimWALResetHold(t.Context(), walReclaimConfig{}, db, res, true, false)
+	require.ErrorIs(t, err, errWALReclaimWriterWaiting)
+	require.False(t, done)
+	require.Equal(t, before, s.WALReclaimStats().WriterHold.Count(), "urgent reclaim acquired the writer despite an announced edit")
+	release()
+	done, err = s.reclaimWALResetHold(t.Context(), walReclaimConfig{}, db, &walReclaimResult{urgent: true}, true, false)
+	require.NoError(t, err)
+	require.True(t, done, "the same owned WAL must reset after writer demand ends")
+	require.True(t, walLogIsReset(s.dbPath, s.dbPath+"-wal"))
 }
 
 func TestWALReclaimUrgentRefusesQueuedWriter(t *testing.T) {
@@ -93,7 +82,8 @@ func TestWALReclaimInteractiveReadWinsQueuedAdmission(t *testing.T) {
 	res := &walReclaimResult{urgent: true, lastResort: true}
 	done := make(chan error, 1)
 	go func() { done <- s.lockWALReclaimWriter(t.Context(), res) }()
-	require.Eventually(t, func() bool { return s.writeMu.waiting() > 0 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return s.writeMu.reclaimWaiters.Load() > 0 }, time.Second, time.Millisecond)
+	require.Nil(t, s.writeDemandCause(), "a reclaim must not preempt itself as a queued foreground writer")
 	release := s.AnnounceInteractiveRead()
 	defer release()
 	before := s.WALReclaimStats().WriterHold.Count()
@@ -161,4 +151,134 @@ func TestWALReclaimBurstRefusesAdaptiveWriterCredit(t *testing.T) {
 	require.ErrorIs(t, err, errWALReclaimWriterWaiting)
 	require.False(t, res.adaptiveUsed)
 	require.Zero(t, s.WALReclaimStats().WriterHold.Count())
+}
+
+func TestWALReclaimBusyLaneStillAllowsShortOpenGateReset(t *testing.T) {
+	s, db := finalBackfillFixture(t)
+	lane := &fakeBuildLane{}
+	lane.install(s)
+	lane.held.Store(true)
+	defer lane.held.Store(false)
+	res := &walReclaimResult{urgent: true, pressure: true}
+	require.NoError(t, s.reclaimWALPressureResetOnce(t.Context(), db, res, walReclaimResetHold, false))
+	require.True(t, walLogIsReset(s.dbPath, s.dbPath+"-wal"))
+	stats := s.WALReclaimStats()
+	require.Positive(t, stats.EditBurstWriterHold.Count(), "the real short slice must populate burst observations")
+	require.LessOrEqual(t, stats.EditBurstWriterHold.Max, walReclaimResetHold)
+	require.Zero(t, stats.EditBurstGateClosures)
+}
+
+func TestWALReclaimBuildLaneRefusesAdaptiveCompletion(t *testing.T) {
+	s, db := finalBackfillFixture(t)
+	frontier, ok := readWALReclaimFrontier(s.dbPath)
+	require.True(t, ok)
+	lane := &fakeBuildLane{}
+	lane.install(s)
+	lane.held.Store(true)
+	defer lane.held.Store(false)
+	res := &walReclaimResult{urgent: true, slowTail: &walReclaimSlowTail{salt: frontier.salt, covered: frontier.backfill, copyElapsed: time.Second}}
+	budget := res.takeAdaptiveWriterBudget()
+	require.Greater(t, budget, walReclaimResetHold)
+	_, err := s.reclaimWALResetHoldOnce(t.Context(), walReclaimConfig{}, db, res, true, false, budget)
+	require.ErrorIs(t, err, errWALReclaimEditBurst)
+	require.Zero(t, s.WALReclaimStats().WriterHold.Count())
+	require.False(t, res.adaptiveUsed)
+}
+
+func TestWALReclaimBurstDeferralsRetainActualCounters(t *testing.T) {
+	for _, kind := range []string{"edit", "interactive"} {
+		t.Run(kind, func(t *testing.T) {
+			s, db := finalBackfillFixture(t)
+			var release func()
+			if kind == "edit" {
+				release = s.AnnounceWrite()
+			} else {
+				release = s.AnnounceInteractiveRead()
+			}
+			cfg := walReclaimConfig{thresholdBytes: 1, drainDeadline: time.Second, truncateBudget: walReclaimTruncateBudget}
+			res := s.reclaimWALOnce(cfg, db, s.dbPath+"-wal")
+			release()
+			require.NotEqual(t, walReclaimReset, res.outcome)
+			stats := s.WALReclaimStats()
+			if kind == "edit" {
+				require.EqualValues(t, 1, stats.DeferredEditBurst)
+				require.Zero(t, stats.DeferredInteractiveRead)
+			} else {
+				require.EqualValues(t, 1, stats.DeferredInteractiveRead)
+				require.Zero(t, stats.DeferredEditBurst)
+			}
+			require.Zero(t, stats.WriterHold.Count())
+			require.Zero(t, stats.EditBurstGateClosures)
+			require.Zero(t, stats.PauseCount)
+		})
+	}
+}
+
+func TestWALReclaimShrinkDefersWithoutLosingMandatoryCleanup(t *testing.T) {
+	s, db := finalBackfillFixture(t)
+	s.walShrinkPending.Store(true)
+	release := s.AnnounceInteractiveRead()
+	_, err := s.shrinkWALSliceOnce(t.Context(), db, walShrinkMinSlice)
+	require.ErrorIs(t, err, errWALReclaimInteractiveRead)
+	require.ErrorIs(t, s.restoreWriterJournalLimit(t.Context()), errWALReclaimInteractiveRead)
+	require.True(t, s.walShrinkPending.Load(), "a refused restoration erased mandatory journal-limit cleanup")
+	require.Zero(t, s.WALReclaimStats().WriterHold.Count())
+	release()
+	require.NoError(t, s.restoreWriterJournalLimit(t.Context()))
+	require.False(t, s.walShrinkPending.Load(), "cleanup must complete after the interactive call ends")
+	require.Positive(t, s.WALReclaimStats().WriterHold.Count())
+	require.EqualValues(t, 2, s.WALReclaimStats().DeferredInteractiveRead)
+}
+
+func TestWALReclaimBurstArrivesBetweenLastShrinkSliceAndRestore(t *testing.T) {
+	for _, kind := range []string{"interactive", "build"} {
+		t.Run(kind, func(t *testing.T) {
+			s, db := finalBackfillFixture(t)
+			lane := &fakeBuildLane{}
+			lane.install(s)
+			var release func()
+			oldHook := walShrinkBeforeRestore
+			walShrinkBeforeRestore = func() {
+				if kind == "interactive" {
+					release = s.AnnounceInteractiveRead()
+				} else {
+					lane.held.Store(true)
+					release = func() { lane.held.Store(false) }
+				}
+			}
+			t.Cleanup(func() {
+				walShrinkBeforeRestore = oldHook
+				if release != nil {
+					release()
+				}
+			})
+			_, _, err := s.shrinkWAL(t.Context(), db)
+			require.Error(t, err, "the last-slice gap must not admit restore during new interactive/edit demand")
+			require.True(t, s.walShrinkPending.Load(), "refused restore lost its retryable cleanup intent")
+			if kind == "interactive" {
+				require.ErrorIs(t, err, errWALReclaimInteractiveRead)
+			} else {
+				require.ErrorIs(t, err, errWALReclaimEditBurst)
+			}
+			release()
+			walShrinkBeforeRestore = nil
+			_, _, err = s.shrinkWAL(t.Context(), db)
+			require.NoError(t, err)
+			require.False(t, s.walShrinkPending.Load())
+		})
+	}
+}
+
+func TestWALReclaimClosedGateDefersDuringBuild(t *testing.T) {
+	s, db := finalBackfillFixture(t)
+	lane := &fakeBuildLane{}
+	lane.install(s)
+	lane.held.Store(true)
+	defer lane.held.Store(false)
+	res := &walReclaimResult{urgent: true}
+	err := s.reclaimWALInLane(t.Context(), walReclaimConfig{drainDeadline: time.Second, truncateBudget: walReclaimTruncateBudget}, db, res)
+	require.ErrorIs(t, err, errWALReclaimEditBurst)
+	require.False(t, res.pauseClosed)
+	require.Zero(t, s.WALReclaimStats().WriterHold.Count())
+	require.Zero(t, s.WALReclaimStats().EditBurstGateClosures)
 }

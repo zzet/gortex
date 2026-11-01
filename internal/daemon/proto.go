@@ -596,12 +596,12 @@ type WALDurationHistogramStatus struct {
 }
 
 type WALReclaimStatus struct {
-	EditBurstWriterHold     WALDurationHistogramStatus `json:"edit_burst_writer_hold"`
-	EditBurstGateClosures   int64                      `json:"edit_burst_gate_closures"`
-	DeferredEditBurst       int64                      `json:"deferred_edit_burst"`
-	DeferredInteractiveRead int64                      `json:"deferred_interactive_read"`
-	BulkExceptionHolds      int64                      `json:"bulk_exception_holds"`
-	HardCapExceptionHolds   int64                      `json:"hard_cap_exception_holds"`
+	EditBurstWriterHold     *WALDurationHistogramStatus `json:"edit_burst_writer_hold"`
+	EditBurstGateClosures   int64                       `json:"edit_burst_gate_closures"`
+	DeferredEditBurst       int64                       `json:"deferred_edit_burst"`
+	DeferredInteractiveRead int64                       `json:"deferred_interactive_read"`
+	BulkExceptionHolds      int64                       `json:"bulk_exception_holds"`
+	HardCapExceptionHolds   int64                       `json:"hard_cap_exception_holds"`
 
 	WriterHold    WALDurationHistogramStatus `json:"writer_hold"`
 	WriterWait    WALDurationHistogramStatus `json:"writer_wait"`

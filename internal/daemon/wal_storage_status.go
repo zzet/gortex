@@ -10,7 +10,6 @@ import (
 // Both status and live index health use this conversion.
 func WALReclaimStatusFrom(st store_sqlite.WALReclaimStats) *WALReclaimStatus {
 	out := &WALReclaimStatus{
-		EditBurstWriterHold:     walHistogramStatus(st.EditBurstWriterHold),
 		EditBurstGateClosures:   st.EditBurstGateClosures,
 		DeferredEditBurst:       st.DeferredEditBurst,
 		DeferredInteractiveRead: st.DeferredInteractiveRead,
@@ -61,6 +60,10 @@ func WALReclaimStatusFrom(st store_sqlite.WALReclaimStats) *WALReclaimStatus {
 		ShrinkSlices:                st.ShrinkSlices,
 		ShrinkBytes:                 st.ShrinkBytes,
 		ShrinkSliceHoldMaxMS:        walDurationMS(st.ShrinkSliceHoldMax),
+	}
+	if st.EditBurstWriterHold.Count() > 0 {
+		burst := walHistogramStatus(st.EditBurstWriterHold)
+		out.EditBurstWriterHold = &burst
 	}
 	if st.WALPeakObserved {
 		peak := st.ObservedPeakWALBytes

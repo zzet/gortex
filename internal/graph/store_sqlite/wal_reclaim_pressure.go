@@ -148,7 +148,10 @@ func (s *Store) reclaimWALPressureResetWithDrain(ctx context.Context, ckptDB *sq
 		return err
 	}
 	if !res.pressureResetBusy {
-		if budget := res.takeAdaptiveWriterBudget(); budget > 0 && (res.burstException() || !s.editBurstActive()) && s.walReclaim.interactive.active.Load() == 0 {
+		if budget := res.takeAdaptiveWriterBudget(); budget > 0 {
+			if block := s.reclaimCompletionCause(ctx, res); block != nil {
+				return block
+			}
 			res.reason = ""
 			err = s.reclaimWALPressureResetOnce(operationCtx, ckptDB, res, budget, false)
 		}
@@ -161,6 +164,11 @@ func (s *Store) reclaimWALPressureResetWithDrain(ctx context.Context, ckptDB *sq
 
 func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult, budget time.Duration, preemptible bool) error {
 	res.pressureResetBusy = false
+	if budget > walReclaimResetHold {
+		if err := s.reclaimCompletionCause(ctx, res); err != nil {
+			return err
+		}
+	}
 	// What the hold may still copy: half the cap at the rate the convergence
 	// measured, and never less than walReclaimPressureSmallFrames.
 	allowed := walReclaimPressureSmallFrames
@@ -172,10 +180,17 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	// to about 2.4 s in a burst), then gives up. The hold itself stays
 	// walReclaimPressureHold.
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimPressureWriterWait)
-	err := s.lockWALReclaimWriter(wctx, res)
+	var err error
+	if budget > walReclaimResetHold {
+		err = s.lockWALReclaimCompletion(wctx, res)
+	} else {
+		err = s.lockWALReclaimWriter(wctx, res)
+	}
 	wcancel()
 	if err != nil {
-		res.reason = "pressure_writer_busy"
+		if !errors.Is(err, errWALReclaimInteractiveRead) && !errors.Is(err, errWALReclaimEditBurst) && !errors.Is(err, errWALReclaimWriterWaiting) {
+			res.reason = "pressure_writer_busy"
+		}
 		s.walCopy.pressureGiveUps.Add(1)
 		return fmt.Errorf("%w: %w", errWALPressureHold, err)
 	}
@@ -245,10 +260,8 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 		return errWALPressureHold
 	}
 	// Any slow-copy readmission has finished; no own waiter is visible here.
-	if demand := s.writeDemandCause(); preemptible && demand != nil {
-		noteWALReclaimDemand(ctx, demand)
-		res.reason = "pressure_foreground_writer"
-		return demand
+	if err := s.reclaimYieldCause(ctx, res); err != nil {
+		return err
 	}
 	resetCtx := writer.resetContext(hctx)
 
@@ -277,7 +290,7 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 // share the configured drain allowance; the writer still gets at most its
 // existing short credit and remaining aggregate allowance.
 func (s *Store) reclaimWALPressureResetAfterReaderDrain(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult, allowance time.Duration) error {
-	if err := s.reclaimYieldCause(ctx, res); err != nil {
+	if err := s.reclaimCompletionCause(ctx, res); err != nil {
 		return err
 	}
 	if demand := s.writeDemandCause(); demand != nil {

@@ -1009,11 +1009,15 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	// urgent attempts, except the explicit bulk/hard-cap completion classes.
 	if demand := s.writeDemandCause(); !res.burstException() && demand != nil {
 		noteWALReclaimDemand(ctx, demand)
+		res.deferredEditBurst = true
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
 		return demand
 	}
 	if !res.lastResort && !res.bulkCompletion && !walReclaimSkipQuiescence && s.readGate != nil && !walReclaimSkipOpenGate && cfg.readerWait > 0 {
 		return s.reclaimWALInLaneOpenGate(ctx, cfg, ckptDB, res)
+	}
+	if err := s.reclaimCompletionCause(ctx, res); err != nil {
+		return err
 	}
 	if res.bulkCompletion && !res.lastResort {
 		defer func() {
@@ -1048,7 +1052,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	// open-gate stages disabled).
 	// 3. Writer quiescence, capped at walReclaimMaxWriterHold from here on.
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
-	err := s.lockWALReclaimWriter(wctx, res)
+	err := s.lockWALReclaimCompletion(wctx, res)
 	wcancel()
 	if err != nil {
 		if !errors.Is(err, errWALReclaimInteractiveRead) && !errors.Is(err, errWALReclaimEditBurst) && !errors.Is(err, errWALReclaimWriterWaiting) {
@@ -1262,6 +1266,8 @@ func (s *Store) yieldToWriters(parent context.Context) (context.Context, func())
 
 func (s *Store) yieldWALReclaim(parent context.Context, res *walReclaimResult) (context.Context, func()) {
 	exception := res != nil && res.burstException()
+	limit, bounded := parent.Deadline()
+	longHold := bounded && time.Until(limit) > walReclaimResetHold
 	ctx, cancel := context.WithCancelCause(parent)
 	done := make(chan struct{})
 	go func() {
@@ -1283,7 +1289,7 @@ func (s *Store) yieldWALReclaim(parent context.Context, res *walReclaimResult) (
 						cancel(errWALReclaimInteractiveRead)
 						return
 					}
-					if !exception && s.editBurstActive() {
+					if !exception && longHold && s.editBurstActive() {
 						cancel(errWALReclaimEditBurst)
 						return
 					}
@@ -1295,6 +1301,7 @@ func (s *Store) yieldWALReclaim(parent context.Context, res *walReclaimResult) (
 		close(done)
 		if res != nil {
 			cause := context.Cause(ctx)
+			noteWALReclaimDemand(parent, cause)
 			if errors.Is(cause, errWALReclaimInteractiveRead) {
 				res.deferredInteractiveRead = true
 			}
@@ -1820,7 +1827,10 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 	if done || err != nil || ctx.Err() != nil {
 		return done, err
 	}
-	if budget := res.takeAdaptiveWriterBudget(); budget > 0 && (res.burstException() || !s.editBurstActive()) && s.walReclaim.interactive.active.Load() == 0 {
+	if budget := res.takeAdaptiveWriterBudget(); budget > 0 {
+		if err := s.reclaimCompletionCause(ctx, res); err != nil {
+			return done, err
+		}
 		return s.reclaimWALResetHoldOnce(ctx, cfg, ckptDB, res, first, yieldsToLane, budget)
 	}
 	return done, err
@@ -1830,11 +1840,16 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 	res.resetReaders = nil
 	if demand := s.writeDemandCause(); !res.burstException() && demand != nil {
 		noteWALReclaimDemand(ctx, demand)
+		res.deferredEditBurst = true
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
 		return false, demand
 	}
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
-	err = s.lockWALReclaimWriter(wctx, res)
+	if budget > walReclaimResetHold {
+		err = s.lockWALReclaimCompletion(wctx, res)
+	} else {
+		err = s.lockWALReclaimWriter(wctx, res)
+	}
 	wcancel()
 	if err != nil {
 		if !errors.Is(err, errWALReclaimInteractiveRead) && !errors.Is(err, errWALReclaimEditBurst) && !errors.Is(err, errWALReclaimWriterWaiting) {
@@ -1938,6 +1953,9 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 			epoch, older = cohort.epoch, cohort.older
 		}
 		observer("short_reset_before", epoch, older, nil)
+	}
+	if err := s.reclaimYieldCause(ctx, res); err != nil {
+		return false, err
 	}
 	_, terr := s.resetWALForReclaim(writer.resetContext(yctx))
 	if observer := walReclaimRoundObserver; observer != nil {
