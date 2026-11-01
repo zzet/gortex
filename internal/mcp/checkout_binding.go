@@ -15,7 +15,7 @@ import (
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
-// The three request-level freshness knobs. They are arguments of the request
+// Request-level freshness knobs. They are arguments of the request
 // rather than of any one tool — the middleware reads them for every tool, no
 // handler ever does — so they are named once here.
 const (
@@ -29,7 +29,7 @@ const (
 // them.
 var requestFreshnessArgNames = []string{requireExactArgName, requireFreshArgName, waitDeadlineArgName, freshnessScopeArgName}
 
-// requestFreshnessArgKeys is THE allowlist that makes the three knobs callable
+// requestFreshnessArgKeys is THE allowlist that makes these knobs callable
 // on every tool. It is the single place the set is enumerated for dispatch:
 // wrapToolArgGuard consults it (arg_schema_guard.go) so a guarded tool's closed
 // schema cannot refuse a knob the request middleware honours, and the tests
@@ -156,7 +156,7 @@ func (f requestFreshness) effectiveDeadline(now time.Time, ctx context.Context) 
 	return deadline
 }
 
-// takeRequestFreshness parses the three request-level knobs.
+// takeRequestFreshness parses the request-level knobs.
 //
 // It deliberately does not strip them from the argument map: require_exact has
 // always travelled through to the handler and every tool ignores an argument
