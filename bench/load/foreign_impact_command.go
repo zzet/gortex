@@ -69,7 +69,7 @@ func foreignImpactCommand(ctx context.Context, args []string) error {
 	if err := validateEditProbeSourceRepos(ctx, corpora, root); err != nil {
 		return err
 	}
-	report, err := newRunReport(o, corpora, sha, host, root)
+	report, err := newForeignImpactRunReport(o, corpora, edited, sha, host, root)
 	if err != nil {
 		return err
 	}
@@ -83,6 +83,9 @@ func foreignImpactCommand(ctx context.Context, args []string) error {
 		return errors.Join(runErr, encodeErr)
 	}
 	phase, sweep, artifacts, crashes, version, runErr := runPhase(ctx, o, "many", corpora, group, root)
+	phase.Name = "foreign-impact"
+	phase.SessionModel = report.Workload.SessionModel
+	phase.Operations = report.Workload.Operations
 	artifacts["foreign_impact_summary"] = foreignPath
 	addPhase(&report, phase, sweep, artifacts, crashes, version, runErr)
 	if err := finishReport(&report, 1); err != nil {
@@ -95,4 +98,35 @@ func foreignImpactCommand(ctx context.Context, args []string) error {
 		return fmt.Errorf("incomplete foreign-impact run; evidence retained in %s", o.Output)
 	}
 	return nil
+}
+
+// The ordinary many lifecycle is an implementation detail. The persisted load
+// identity names the actual five foreign readers and complete B edit plan;
+// duration is the query window, while Phase retains the full edit/drain time.
+func newForeignImpactRunReport(o runOptions, corpora []Corpus, edited int, sha string, host Host, root string) (Report, error) {
+	if len(corpora) != 6 || edited < 0 || edited >= len(corpora) {
+		return Report{}, errors.New("foreign report requires six roots and an edited-repository ordinal")
+	}
+	report, err := newRunReport(o, corpora, sha, host, root)
+	if err != nil {
+		return report, err
+	}
+	plan, err := foreignImpactEditPlan(corpora[edited], o.Seed)
+	if err != nil {
+		return report, err
+	}
+	report.Workload.Scenario = "foreign-impact"
+	report.Workload.Agents = 5
+	report.Workload.EditAgents = 1
+	report.Workload.SessionModel = "one_B_editor_and_five_independent_rotating_foreign_queries"
+	report.Workload.EditProbe = &plan
+	report.Workload.Operations = editProbeOperations(plan, corpora[edited])
+	for i, c := range corpora {
+		if i == edited {
+			continue
+		}
+		report.Workload.Operations = append(report.Workload.Operations, request{Tool: "change", Operation: "impact", Arguments: map[string]any{"operation": "impact", "target": map[string]any{"symbol": c.Label + "/" + c.Symbol}, "output": map[string]any{"format": "json", "max_bytes": 0}}})
+	}
+	report.RequestPlan, err = hashJSON(report.Workload)
+	return report, err
 }

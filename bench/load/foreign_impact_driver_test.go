@@ -91,3 +91,47 @@ func TestForeignImpactEvidenceLimitRetainsPriorRowsAndStopsAtBoundary(t *testing
 		t.Fatal("quota failure changed previously retained evidence")
 	}
 }
+
+func TestForeignImpactRunReportDescribesActualRolesAndPreservesEditPlan(t *testing.T) {
+	corpora := editProbeRoutingCorpora()
+	o := runOptions{Scenario: "many", Agents: 6, Editors: 1, Seed: 42, Duration: foreignImpactDuration, Deadline: 120 * time.Second, WarmTimeout: 30 * time.Minute, StopTimeout: 30 * time.Second, Profile: "agent", EditCount: 100}
+	report, err := newForeignImpactRunReport(o, corpora, 2, corpora[0].Commit, Host{}, "owned-report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Workload.Scenario != "foreign-impact" || report.Workload.Agents != 5 || report.Workload.EditAgents != 1 || report.Workload.SessionModel != "one_B_editor_and_five_independent_rotating_foreign_queries" {
+		t.Fatalf("foreign workload mislabeled as ordinary read-only many cell: %+v", report.Workload)
+	}
+	if report.Workload.EditProbe == nil || report.Workload.EditProbe.Count != 100 || report.Workload.EditProbe.Editors != 1 || report.Workload.EditProbe.Repo != corpora[2].Label || report.Workload.DurationSec != 600 {
+		t.Fatal("active foreign window or full B edit schedule lost")
+	}
+	plan, err := foreignImpactEditPlan(corpora[2], 42)
+	if err != nil || !reflect.DeepEqual(*report.Workload.EditProbe, plan) {
+		t.Fatal("outer report differs from actual seeded B editor plan")
+	}
+	if len(report.Workload.Operations) < 5 || report.Workload.Operations[0].name() != "edit.file" {
+		t.Fatal("outer report omitted offered edits")
+	}
+	for i, op := range report.Workload.Operations[len(report.Workload.Operations)-5:] {
+		foreign := i
+		if foreign >= 2 {
+			foreign++
+		}
+		target := op.Arguments["target"].(map[string]any)["symbol"]
+		if op.name() != "change.impact" || target != corpora[foreign].Label+"/"+corpora[foreign].Symbol {
+			t.Fatal("foreign target route lost or replaced with B")
+		}
+	}
+	before := report.RequestPlan
+	for i := range corpora {
+		corpora[i].Source = filepath.Join("/other-owned-copy", corpora[i].Label)
+	}
+	moved, err := newForeignImpactRunReport(o, corpora, 2, corpora[0].Commit, Host{}, "other-report")
+	if err != nil || moved.RequestPlan != before {
+		t.Fatal("private clone paths changed the actual foreign workload hash")
+	}
+	differentB, err := newForeignImpactRunReport(o, corpora, 1, corpora[0].Commit, Host{}, "other-report")
+	if err != nil || differentB.RequestPlan == before {
+		t.Fatal("foreign workload hash omitted edited-repository routing")
+	}
+}
