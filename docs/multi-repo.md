@@ -59,6 +59,16 @@ would disappear on restart. Set `name:` in the global config and run
 `gortex daemon reload`. Tracking a configured but unloaded root without a name
 keeps its configured name.
 
+Collisions use the `prefix_collision` code across control, MCP and probe
+responses, with the prefix, owner path and captured owner state. A missing
+owner is different from an owner whose availability could not be established:
+only a confirmed missing owner produces advice to inspect its untrack preview.
+The colliding path is never a remedy for removing the owner's corpus.
+
+Same-directory spellings and same-folder-name symlink aliases remain no-ops.
+Selected configured roots retain their pinned name and workspace; admission
+does not scan unrelated configured filesystems.
+
 Alternatively, `gortex untrack <absolute-path>` can remove an exact configured
 root that the daemon proves is not loaded, then reload the config. It does not
 untrack a containing live root or start retirement of an implicit live root.

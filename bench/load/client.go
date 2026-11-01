@@ -89,6 +89,12 @@ func readWireLine(reader *bufio.Reader) ([]byte, error) {
 }
 
 func dialSocket(ctx context.Context, socket, cwd, mode string) (net.Conn, *bufio.Reader, string, error) {
+	return dialSocketSurface(ctx, socket, cwd, mode, "facade-v1", "hide")
+}
+
+// dialSocketSurface negotiates the session's tool surface in the handshake,
+// as the CLI does per connection; the load workload always uses the facade.
+func dialSocketSurface(ctx context.Context, socket, cwd, mode, tools, toolsMode string) (net.Conn, *bufio.Reader, string, error) {
 	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socket)
 	if err != nil {
 		return nil, nil, "", err
@@ -103,7 +109,7 @@ func dialSocket(ctx context.Context, socket, cwd, mode string) (net.Conn, *bufio
 	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
-	handshake := map[string]any{"version": 1, "mode": mode, "cwd": cwd, "client": "gortex-load", "tools": "facade-v1", "tools_mode": "hide"}
+	handshake := map[string]any{"version": 1, "mode": mode, "cwd": cwd, "client": "gortex-load", "tools": tools, "tools_mode": toolsMode}
 	if err := json.NewEncoder(conn).Encode(handshake); err != nil {
 		_ = conn.Close()
 		return nil, nil, "", err
