@@ -129,3 +129,30 @@ func TestLegacyExplicitGraphCleanupInfersDemotion(t *testing.T) {
 		t.Fatalf("legacy explicit-only cleanup causes=%v", f.hooks.causes)
 	}
 }
+
+func TestLegacyAutomaticForgetRetainsActiveIntent(t *testing.T) {
+	f := newFixture(t, Default())
+	f.seedCheckout("owner", "inc", "work", store_sqlite.CheckoutModeDedicated)
+	f.seedOwnedGraph("owned", "owner")
+	if err := f.catalog.UpsertTrackingIntent(context.Background(), store_sqlite.TrackingIntent{IntentID: "wanted", CheckoutID: "owner", SourceKind: store_sqlite.IntentSourceManualConfig, SourceLocator: "config", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	target := sagaTarget{Kind: sagaForgetCheckout, CheckoutID: "owner", Incarnation: "inc", FamilyID: f.familyID, GraphID: "owned"}
+	payload, err := json.Marshal(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.catalog.UpsertCleanupEntry(context.Background(), store_sqlite.CleanupEntry{CleanupID: target.cleanupID(), OpaqueTargetIDs: string(payload), Reason: string(target.Kind), Phase: store_sqlite.CleanupPhasePending}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.rec.Resume(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	owner, found, err := f.catalog.GetCheckout(context.Background(), "owner")
+	if err != nil || !found || owner.State != store_sqlite.CheckoutStateUnavailable {
+		t.Fatalf("legacy automatic forget lost intended identity: %+v found=%v err=%v", owner, found, err)
+	}
+	if !f.graphExists("owned") {
+		t.Fatal("legacy automatic forget released intended graph")
+	}
+}
