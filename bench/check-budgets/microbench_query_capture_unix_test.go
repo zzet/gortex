@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -21,6 +22,7 @@ type queryMicroChild struct {
 	done           chan struct{}
 	cancel         context.CancelFunc
 	pid            int
+	pgid           int
 	stdout, stderr []byte
 	err            error
 }
@@ -43,6 +45,13 @@ func startQueryMicroChild(t *testing.T, mode string) *queryMicroChild {
 	}()
 	t.Cleanup(func() {
 		cancel()
+		// Only this helper can create this fresh PID receipt. Retain cleanup
+		// even when the implementation under test leaves its child behind.
+		if data, err := os.ReadFile(ready + ".child"); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
 		select {
 		case <-child.done:
 			return
@@ -74,6 +83,10 @@ func startQueryMicroChild(t *testing.T, mode string) *queryMicroChild {
 			}
 		}
 	}
+	child.pgid, err = syscall.Getpgid(child.pid)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return child
 }
 
@@ -81,7 +94,7 @@ func joinQueryMicroChild(t *testing.T, child *queryMicroChild) {
 	t.Helper()
 	select {
 	case <-child.done:
-	case <-time.After(15 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("query child exceeded bounded capture cleanup")
 	}
 	if !errors.Is(child.err, context.Canceled) {
@@ -98,6 +111,9 @@ func TestQueryMicroTimeoutRetainsGoStackAndGC(t *testing.T) {
 	joinQueryMicroChild(t, child)
 	if !strings.Contains(string(child.stderr), "SIGQUIT") || !strings.Contains(string(child.stderr), "goroutine ") {
 		t.Fatalf("query timeout lost Go stack: %s", child.stderr)
+	}
+	if !strings.Contains(string(child.stderr), "TestQueryMicroCaptureHelper") {
+		t.Fatal("stack did not come from the actual owned benchmark helper")
 	}
 	if !strings.Contains(string(child.stderr), "gc ") {
 		t.Fatalf("query timeout lost GC evidence: %s", child.stderr)
@@ -123,6 +139,18 @@ func TestQueryMicroIgnoringQuitHasBoundedFailedExit(t *testing.T) {
 	}
 }
 
+func TestQueryMicroTimeoutReapsOwnedDescendants(t *testing.T) {
+	child := startQueryMicroChild(t, "descendants")
+	if child.pgid != child.pid {
+		t.Errorf("query did not own its process group: pid=%d pgid=%d", child.pid, child.pgid)
+	}
+	child.cancel()
+	joinQueryMicroChild(t, child)
+	if err := syscall.Kill(-child.pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("owned descendant group survived failed query cleanup: %v", err)
+	}
+}
+
 func TestQueryMicroSuccessPreservesDebugSettings(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
@@ -141,6 +169,31 @@ func TestQueryMicroSuccessPreservesDebugSettings(t *testing.T) {
 	}
 }
 
+// A deadline callback can lose a scheduling race with a successful child exit.
+// Keep Done/Err undelivered to exercise that race without waiting two minutes.
+type delayedQueryDeadline struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c delayedQueryDeadline) Deadline() (time.Time, bool) { return c.deadline, true }
+
+func TestQueryMicroLateDeadlineCallbackStillFails(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := delayedQueryDeadline{
+		Context:  context.WithValue(context.Background(), queryMicroDiagnosticsKey{}, true),
+		deadline: time.Now().Add(20 * time.Millisecond),
+	}
+	_, _, err = executeMicroProcess(ctx, binary, []string{"-test.run=^TestQueryMicroCaptureHelper$"}, t.TempDir(),
+		append(os.Environ(), "PERF_QUERY_CAPTURE_HELPER=success"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("query passed after its original deadline while callback lagged: %v", err)
+	}
+}
+
 func TestQueryMicroCaptureHelper(t *testing.T) {
 	mode := os.Getenv("PERF_QUERY_CAPTURE_HELPER")
 	if mode == "" {
@@ -152,8 +205,37 @@ func TestQueryMicroCaptureHelper(t *testing.T) {
 		fmt.Println(os.Getenv("GODEBUG") + "|" + os.Getenv("GOTRACEBACK"))
 		os.Exit(0)
 	}
-	if mode == "ignore" {
+	if mode == "ignore" || mode == "descendants" || mode == "descendant" {
 		signal.Ignore(syscall.SIGQUIT)
+	}
+	if mode == "descendant" {
+		signal.Ignore(syscall.SIGTERM)
+	}
+	if mode == "descendants" {
+		ready := os.Args[len(os.Args)-1]
+		binary, err := os.Executable()
+		if err != nil {
+			os.Exit(2)
+		}
+		cmd := exec.Command(binary, "-test.run=^TestQueryMicroCaptureHelper$", "--", ready+".child")
+		cmd.Env = append(os.Environ(), "PERF_QUERY_CAPTURE_HELPER=descendant")
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Start(); err != nil {
+			os.Exit(2)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(ready + ".child"); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				os.Exit(2)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		go func() { _ = cmd.Wait() }()
 	}
 	if mode == "zero" {
 		signals := make(chan os.Signal, 1)

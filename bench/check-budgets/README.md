@@ -340,8 +340,18 @@ shorter profile is silently chosen. The query benchmark indexes `../..`, so
 both builds run from package directories under the **same clean pinned fixture
 snapshot**, never arbitrary binary-download CWDs. Fixture cleanliness is checked
 again after runs and before benchstat. Changed input fails. Interrupted/missing
-samples remain failed evidence. Benchmark-only processes get an Interrupt then
-a two-second kill/join bound; abnormal exit/context errors cannot become success.
+samples remain failed evidence. Linux query test executables (fixture preflight
+and benchmark group) enable GC logs and all-goroutine tracebacks. At the original
+context deadline they receive SIGQUIT, with at most ten seconds to capture output
+before forced kill/join. Query processes own a separate process group; surviving
+descendants receive TERM then KILL with at most two seconds to join after each.
+Leftover work is failed evidence even when cleanup succeeds. The receipt records `linux_query_sigquit_v1` and the
+capture grace separately. Crossing the original deadline always fails, including
+a child that handles SIGQUIT and exits zero. The monotonic deadline is checked
+after Wait as well, so a delayed timer callback cannot admit a late zero exit.
+The passing budget is unchanged.
+Other processes retain Interrupt and the two-second kill/join bound;
+abnormal exit/context errors cannot become success.
 The daemon collector instead joins owned cleanup without killing its client.
 
 For a separately reviewed query setup diagnosis, the test executable accepts
@@ -351,7 +361,7 @@ monotonic elapsed durations, and the indexed file/worker census. A start without
 a finish remains incomplete evidence. An existing sidecar or write failure
 fails the requested diagnosis. The unset default emits no sidecars. This trace
 does not change query bodies, fixture scope, timers, or child safety bounds;
-setup still runs before each benchmark's `ResetTimer`.
+shared setup runs once per executable and remains outside the benchmark timers.
 
 Outputs include per-run raw text, combined main/candidate samples, benchstat
 text and `microbench.json`. `formal_acceptance` is always false: the workload

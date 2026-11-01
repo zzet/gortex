@@ -53,6 +53,8 @@ type microRun struct {
 	Error               string    `json:"error,omitempty"`
 	AbnormalTermination bool      `json:"abnormal_termination"`
 	DeadlineExceeded    bool      `json:"deadline_exceeded"`
+	TimeoutCapture      string    `json:"timeout_capture,omitempty"`
+	CaptureGraceSeconds int       `json:"timeout_capture_grace_seconds,omitempty"`
 }
 type microReceipt struct {
 	Version          int                                         `json:"schema_version"`
@@ -74,16 +76,66 @@ type microProcess func(context.Context, string, []string, string, []string) ([]b
 
 type queryMicroDiagnosticsKey struct{}
 
+const queryMicroCaptureGrace = 10 * time.Second
+const queryMicroCapturePolicy = "linux_query_sigquit_v1"
+
 func executeMicroProcess(ctx context.Context, binary string, args []string, cwd string, env []string) ([]byte, []byte, error) {
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = cwd
 	cmd.Env = env
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
 	cmd.WaitDelay = 2 * time.Second
+	cleanup := func() error { return nil }
+	capture, _ := ctx.Value(queryMicroDiagnosticsKey{}).(bool)
+	if capture {
+		// Go stops its test alarm before running benchmarks. Request the
+		// owned Go child's stack at the existing context deadline, then allow
+		// only bounded output capture. ctx.Err below keeps every late exit a
+		// failure, even if the child handles SIGQUIT and exits successfully.
+		cmd.Env = queryMicroDiagnosticEnv(env)
+		cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGQUIT) }
+		cmd.WaitDelay = queryMicroCaptureGrace
+		cleanup = ownQueryMicroProcess(cmd)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := errors.Join(cmd.Run(), ctx.Err())
+	runErr := cmd.Run()
+	cleanupErr := cleanup()
+	ctxErr := ctx.Err()
+	if capture {
+		// Do not let a delayed deadline callback turn a late zero exit into
+		// passing evidence. The complete window includes owned-group
+		// quiescence; cleanup grace never extends the passing deadline.
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			ctxErr = errors.Join(ctxErr, context.DeadlineExceeded)
+		}
+	}
+	err := errors.Join(runErr, ctxErr, cleanupErr)
 	return stdout.Bytes(), stderr.Bytes(), err
+}
+
+func queryMicroDiagnosticEnv(env []string) []string {
+	result := make([]string, 0, len(env)+2)
+	var debug string
+	for _, entry := range env {
+		key, value, _ := strings.Cut(entry, "=")
+		switch key {
+		case "GODEBUG":
+			debug = value // exec also gives the last duplicate key precedence.
+		case "GOTRACEBACK":
+		default:
+			result = append(result, entry)
+		}
+	}
+	var flags []string
+	for _, option := range strings.Split(debug, ",") {
+		key, _, _ := strings.Cut(option, "=")
+		if option != "" && key != "gctrace" {
+			flags = append(flags, option)
+		}
+	}
+	flags = append(flags, "gctrace=1")
+	return append(result, "GODEBUG="+strings.Join(flags, ","), "GOTRACEBACK=all")
 }
 
 func validateMicroConfig(c microConfig) error {
@@ -219,6 +271,11 @@ func collectMicrobench(ctx context.Context, c microConfig, out string, workflow 
 				if err == nil {
 					duration, _ := time.ParseDuration(c.Timeout)
 					runCtx, cancel := context.WithTimeout(ctx, duration)
+					if runtime.GOOS == "linux" && pkg == "internal/query" {
+						runCtx = context.WithValue(runCtx, queryMicroDiagnosticsKey{}, true)
+						run.TimeoutCapture = queryMicroCapturePolicy
+						run.CaptureGraceSeconds = int(queryMicroCaptureGrace / time.Second)
+					}
 					pair := c.Binaries[pkg]
 					binary := pair.Main
 					if role == "candidate" {
