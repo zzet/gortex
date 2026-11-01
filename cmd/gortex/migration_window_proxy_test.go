@@ -89,9 +89,41 @@ func TestMigrationWindowMCPProxyHelper(t *testing.T) {
 	require.Equal(t, input.SpawnLock, daemon.SpawnLockPath())
 	require.Equal(t, input.GlobalPath, config.DefaultGlobalConfigPath())
 	witnessDir := input.Root
+	var trace []map[string]any
+	defer func() {
+		body, err := json.Marshal(trace)
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "MIGRATION_WAIT_TRACE %s\n", body)
+		}
+	}()
+	waitForDaemonSpawnLock = func(ctx context.Context, lock spawnLockTryer, opts spawnLockWaitOptions) (bool, error) {
+		progress := opts.startupProgress
+		opts.startupProgress = func(now time.Time) bool {
+			fresh := progress(now)
+			state, ok := daemon.ReadRuntimeState()
+			trace = append(trace, map[string]any{"kind": "startup_progress", "at": time.Now(), "now": now, "fresh": fresh, "state_read": ok, "state": state})
+			return fresh
+		}
+		locked, err := waitForSpawnLock(ctx, lock, opts)
+		event := map[string]any{"kind": "wait_return", "at": time.Now(), "locked": locked}
+		if err != nil {
+			event["error"] = err.Error()
+		}
+		trace = append(trace, event)
+		body, marshalErr := json.Marshal(trace)
+		require.NoError(t, marshalErr)
+		require.NoError(t, os.WriteFile(filepath.Join(witnessDir, "wait-return.json"), body, 0o600))
+		return locked, err
+	}
 	checks := 0
 	isDaemonRunning = func() bool {
-		running := daemon.IsRunning()
+		probeErr := daemon.ProbeAvailability()
+		running := probeErr == nil
+		event := map[string]any{"kind": "availability", "at": time.Now(), "running": running}
+		if probeErr != nil {
+			event["error"] = probeErr.Error()
+		}
+		trace = append(trace, event)
 		checks++
 		if !running && checks >= 2 {
 			probe := flock.New(daemon.SpawnLockPath())
@@ -246,8 +278,17 @@ func TestMCPWaitsThroughMigrationWindow(t *testing.T) {
 		if !reaped {
 			select {
 			case <-exited:
+				reaped = true
 			case <-time.After(2 * time.Second):
 				t.Error("owned MCP helper did not reap")
+			}
+		}
+		if t.Failed() {
+			if reaped {
+				t.Logf("owned MCP helper stderr:\n%s", stderr.String())
+			}
+			if trace, err := os.ReadFile(filepath.Join(base, "wait-return.json")); err == nil {
+				t.Logf("actual startup wait decisions:\n%s", trace)
 			}
 		}
 	})
@@ -283,6 +324,13 @@ func TestMCPWaitsThroughMigrationWindow(t *testing.T) {
 	case frame := <-frames:
 		t.Fatalf("MCP produced output before migration release: %s (%v)", frame.frame, frame.err)
 	default:
+	}
+	// An embedded build can delay its first frame. Prove the real startup wait
+	// itself has not returned; absence of stdout alone cannot establish this.
+	if returned, readErr := os.ReadFile(filepath.Join(base, "wait-return.json")); readErr == nil {
+		t.Fatalf("startup wait returned while the actual migration and spawn lock remained held: %s", returned)
+	} else {
+		require.ErrorIs(t, readErr, os.ErrNotExist)
 	}
 	releaseOnce.Do(func() { close(release) })
 	select {

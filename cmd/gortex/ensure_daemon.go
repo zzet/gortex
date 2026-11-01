@@ -136,12 +136,13 @@ func daemonStartupHeartbeatFresh(now time.Time) bool {
 // Injectable seams so the race/fallback/spawn-failure branches are
 // testable without a real daemon.
 var (
-	isDaemonRunning   = daemon.IsRunning
-	spawnDaemon       = spawnBareDaemon
-	stopIntentActive  = daemon.StopIntentActive
-	runningDaemonInfo = dialRunningDaemonIdentity
-	binaryVersion     = canonicalVersion
-	stopStaleDaemon   = stopDaemonForHandoff
+	waitForDaemonSpawnLock = waitForSpawnLock
+	isDaemonRunning        = daemon.IsRunning
+	spawnDaemon            = spawnBareDaemon
+	stopIntentActive       = daemon.StopIntentActive
+	runningDaemonInfo      = dialRunningDaemonIdentity
+	binaryVersion          = canonicalVersion
+	stopStaleDaemon        = stopDaemonForHandoff
 )
 
 // spawnBareDaemon is the autostart default for spawnDaemon. Autostart has no
@@ -204,7 +205,7 @@ func ensureDaemonReadyWithError(autostart bool) (daemonDecision, daemonIdentity,
 	_ = os.MkdirAll(filepath.Dir(lockPath), 0o700)
 	lock := flock.New(lockPath)
 
-	locked, err := waitForSpawnLock(context.Background(), lock, spawnLockWaitOptions{
+	locked, err := waitForDaemonSpawnLock(context.Background(), lock, spawnLockWaitOptions{
 		daemonRunning:   isDaemonRunning,
 		startupProgress: daemonStartupHeartbeatFresh,
 	})
@@ -254,7 +255,7 @@ func replaceStaleDaemon(observed daemonIdentity) (daemonDecision, daemonIdentity
 	_ = os.MkdirAll(filepath.Dir(lockPath), 0o700)
 	lock := flock.New(lockPath)
 
-	locked, err := waitForSpawnLock(context.Background(), lock, spawnLockWaitOptions{
+	locked, err := waitForDaemonSpawnLock(context.Background(), lock, spawnLockWaitOptions{
 		startupProgress: daemonStartupHeartbeatFresh,
 	})
 	if err != nil || !locked {
