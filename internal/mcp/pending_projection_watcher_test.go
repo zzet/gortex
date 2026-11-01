@@ -50,3 +50,35 @@ func TestWatcherEventMarksPendingProjectionSuspect(t *testing.T) {
 	require.Eventually(t, e.suspect.Load, 5*time.Second, 10*time.Millisecond,
 		"the watcher event for %s did not mark its projection suspect", path)
 }
+
+type projectionSourceEventWatcher struct {
+	mutationTestWatcher
+	onSourceEvent func(string)
+}
+
+func (w *projectionSourceEventWatcher) OnSourceEvent(cb func(string)) {
+	w.onSourceEvent = cb
+}
+
+func TestSetWatcherReplacementInstallsProjectionInvalidation(t *testing.T) {
+	f := newProjectionFixture(t)
+	prev := pendingFileProjections
+	pendingFileProjections = newPendingProjections()
+	t.Cleanup(func() { pendingFileProjections = prev })
+	e := f.edit("a.go", "package p\n\nfunc New() {}\n")
+	require.NoError(t, pendingFileProjections.publish(e))
+	first, second := &projectionSourceEventWatcher{}, &projectionSourceEventWatcher{}
+	s := newTestServer(t)
+	s.SetWatcher(first)
+	s.SetWatcher(second)
+	require.NotNil(t, second.onSourceEvent)
+	second.onSourceEvent(e.absPath)
+	require.True(t, e.suspect.Load(), "the replacement watcher must invalidate a live projection")
+
+	// An in-flight event from the old watcher can still conservatively mark
+	// the process-wide entry suspect; it cannot clear or retire the entry.
+	e.suspect.Store(false)
+	first.onSourceEvent(e.absPath)
+	require.True(t, e.suspect.Load())
+	require.Same(t, e, liveEntry(pendingFileProjections, e.absPath))
+}
