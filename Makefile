@@ -152,12 +152,9 @@ build-windows:
 
 # claude-plugin regenerates the Claude Code plugin marketplace at
 # claude-plugin/: .claude-plugin/marketplace.json plus the plugin under
-# plugins/gortex/. publish-claude-plugin.yml syncs it to
-# gortexhq/claude-plugin. The CI guard
-# (claude-plugin-check) asserts that re-running this target produces
-# no diff against what's checked in — drift means the bundle is stale
-# vs the source-of-truth content in
-# internal/agents/commands_bodies.go.
+# plugins/gortex/. The bundle is generated, not checked in: its source of
+# truth is internal/agents, and publish-claude-plugin.yml regenerates it
+# and syncs it to gortexhq/claude-plugin on each release.
 #
 # The emitter needs none of the optional backends, so it is built without
 # `build`'s llama tag: the publish runner has no llama.cpp to link against.
@@ -167,13 +164,19 @@ claude-plugin:
 	go run -ldflags '$(LDFLAGS)' ./cmd/gortex/ plugin emit --target ./claude-plugin --variant anthropic
 	@echo "✓ Regenerated claude-plugin/ from internal/agents commands"
 
+# claude-plugin-check regenerates the bundle and validates the marketplace
+# and the plugin with `claude plugin validate --strict`, so a broken
+# manifest or a skill without frontmatter fails before it is published.
+# Needs the Claude Code CLI: npm install -g @anthropic-ai/claude-code.
+# CI runs it in skill-drift.yml.
 claude-plugin-check: claude-plugin
-	@if ! git diff --exit-code -- claude-plugin >/dev/null 2>&1; then \
-		echo "claude-plugin/ is out of date — run 'make claude-plugin' and commit the result"; \
-		git --no-pager diff --stat -- claude-plugin; \
+	@command -v claude >/dev/null 2>&1 || { \
+		echo "claude-plugin-check needs the claude CLI: npm install -g @anthropic-ai/claude-code" >&2; \
 		exit 1; \
-	fi
-	@echo "✓ claude-plugin/ matches generated output"
+	}
+	claude plugin validate --strict ./claude-plugin
+	claude plugin validate --strict ./claude-plugin/plugins/gortex
+	@echo "✓ claude-plugin/ validates"
 
 # ---------------------------------------------------------------------------
 # Embedding backend dependencies

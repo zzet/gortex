@@ -424,10 +424,14 @@ saturated:
 		if response.Error == nil || response.Error.Code != -32002 || response.Error.Data["outcome"] != "server_busy" {
 			t.Fatalf("busy response %s = %#v", id, response)
 		}
-		for _, field := range []string{"queue_wait_ms", "retry_after_ms"} {
-			if value, present := response.Error.Data[field]; present {
-				t.Fatalf("busy response %s reported %s = %#v with the queue disabled", id, field, value)
-			}
+		// Lane admission supplies bounded retry guidance even with queueing off;
+		// this remains a not-started refusal and does not relax lifetime safety.
+		retry, ok := response.Error.Data["retry_after_ms"].(float64)
+		if !ok || retry < 100 || retry > 5000 {
+			t.Fatalf("busy response %s retry=%#v", id, response.Error.Data["retry_after_ms"])
+		}
+		if waited, ok := response.Error.Data["queue_wait_ms"].(float64); !ok || waited != 0 {
+			t.Fatalf("queue-off response %s wait=%#v", id, response.Error.Data["queue_wait_ms"])
 		}
 	}
 	if responses["1"].Error.Data["delivery_unknown"] != false || responses["1"].Error.Data["retryable"] != true {

@@ -58,8 +58,10 @@ func newWorkspaceRootBoundServer(t *testing.T) (s *Server, root string) {
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
 	mi := indexer.NewMultiIndexer(store, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err)
+	}
 
 	// A content node owned by z, with its body in the content index.
 	store.AddNode(&graph.Node{
