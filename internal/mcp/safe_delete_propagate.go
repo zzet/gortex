@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -121,7 +120,7 @@ func (s *Server) applyRemoveLinePatches(ctx context.Context, plan []callerPatch)
 	}
 	defer release()
 	for _, abs := range paths {
-		ok, refused, ferr := s.removePlannedLines(abs, byFile[abs])
+		ok, refused, ferr := s.removePlannedLines(ctx, abs, byFile[abs])
 		applied = append(applied, ok...)
 		failed = append(failed, refused...)
 		if ferr != nil {
@@ -139,7 +138,7 @@ func (s *Server) applyRemoveLinePatches(ctx context.Context, plan []callerPatch)
 // surviving removals would introduce new parse errors the file is left
 // untouched and they are refused as parse_errors. Nothing is written when
 // every patch is refused.
-func (s *Server) removePlannedLines(abs string, patches []callerPatch) (applied, failed []callerPatch, err error) {
+func (s *Server) removePlannedLines(ctx context.Context, abs string, patches []callerPatch) (applied, failed []callerPatch, err error) {
 	content, err := os.ReadFile(abs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read %s: %w", abs, err)
@@ -175,10 +174,13 @@ func (s *Server) removePlannedLines(abs string, patches []callerPatch) (applied,
 	if info, statErr := os.Stat(abs); statErr == nil {
 		perm = info.Mode().Perm()
 	}
-	if writeErr := agents.AtomicWriteFile(abs, newContent, perm); writeErr != nil {
+	commit, writeErr := s.commitFileMutation(ctx, "safe_delete_symbol", "", "", patches[0].File, abs, newContent, perm)
+	if writeErr != nil {
 		return nil, failed, fmt.Errorf("write %s: %w", abs, writeErr)
 	}
-	s.reindexFile(abs)
+	// The caller may still delete the target after propagation. Preserve its
+	// synchronous graph step and dispatch ownership until that terminal write.
+	commit.recordGraph(mutationReindexOutcome{Reindexed: s.reindexFile(abs)})
 	return applied, failed, nil
 }
 

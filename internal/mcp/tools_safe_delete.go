@@ -411,6 +411,14 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 		}
 		byFile[p.abs] = append(byFile[p.abs], p)
 	}
+	// The complete delete set is admitted before any file is read or written.
+	// Propagated caller locks have their own lifetime and cannot authorize the
+	// later definition delete (or another member of a cascade).
+	ctx, release, err := acquireMutationPaths(ctx, order)
+	if err != nil {
+		return nil, fmt.Errorf("lock delete files: %w", err)
+	}
+	defer release()
 
 	deleted := make([]string, 0, len(pending))
 	for _, abs := range order {
