@@ -700,6 +700,9 @@ func (s *Server) captureToolFreshness(ctx context.Context) context.Context {
 
 func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, files []string) {
 	if file := targetRepoFileRaw(name, req); file != "" {
+		if (name == "get_file_summary" || name == "get_editing_context") && requestBoolArg(&req, requireFreshArgName) {
+			return "relations", nil, []string{file}
+		}
 		return "file", nil, []string{file}
 	}
 	switch name {
@@ -793,32 +796,104 @@ func (s *Server) explicitFreshness(ctx context.Context, req mcp.CallToolRequest,
 	// a different claim and cannot provide this tier authority.
 	if _, watched := s.canonicalTierPaths(ctx); watched {
 		label.state = "unknown"
-		if pin, ok := ctx.Value(explicitFreshnessPinKey{}).(*graphview.BasePin); ok && pin.ValidateAcceptedCurrent() == nil {
-			label.state = "fresh"
+		witness, ok := ctx.Value(explicitFreshnessPinKey{}).(*explicitFreshnessWitness)
+		if !ok || witness.watcher != s.currentWatcher() || !slices.Equal(witness.prefixes, s.canonicalFreshnessPrefixes(ctx)) {
+			return label
 		}
+		authority, tracked := s.currentWatcher().(interface{ TierAuthority(string) bool })
+		if !tracked {
+			return label
+		}
+		inScope := func(file string) bool {
+			return slices.ContainsFunc(witness.prefixes, func(prefix string) bool { return strings.HasPrefix(file, prefix+"/") })
+		}
+		_, ids, files := freshnessTargets(req.Params.Name, req)
+		for _, id := range ids {
+			file := graph.IDFile(id)
+			if file == "" || !inScope(file) {
+				return label
+			}
+		}
+		for _, file := range files {
+			if !inScope(s.graphRelPath(ctx, file)) {
+				return label
+			}
+		}
+		for i, pin := range witness.pins {
+			root, known := s.multiIndexer.RepoRoot(witness.prefixes[i])
+			if !known || root != witness.roots[i] || s.multiIndexer.GetIndexer(witness.prefixes[i]) != witness.owners[i] || !authority.TierAuthority(witness.prefixes[i]) || pin.ValidateAcceptedCurrent() != nil {
+				return label
+			}
+		}
+		label.state = "fresh"
 	}
 	return label
 }
 
 type explicitFreshnessPinKey struct{}
 
-// The accepted source witness belongs to the canonical repository that this
-// request's reader actually filters. It is captured before the read, released
-// with the request, and checked again when that read's tier label is rendered.
+type explicitFreshnessWitness struct {
+	watcher watcherHistory
+	prefixes []string
+	pins []*graphview.BasePin
+	owners []*indexer.Indexer
+	roots []string
+}
+
+func (s *Server) canonicalFreshnessPrefixes(ctx context.Context) []string {
+	view := requestViewFromContext(ctx)
+	if OverlayViewFromContext(ctx) != nil || view != nil && (view.readsOwnCheckout() || view.rider != nil && !view.routeless && !view.rider.Exact) {
+		return nil
+	}
+	if prefix := baseNarrowedRepoPrefix(view); prefix != "" {
+		return []string{prefix}
+	}
+	if view != nil && view.reader != nil || s.multiIndexer == nil {
+		return nil
+	}
+	// AUTO can serve the unnarrowed shared corpus. Witness every canonical
+	// owner that reader may consult; do not substitute a BASE selector or a
+	// narrower query merely to obtain a positive freshness observation.
+	prefixes := s.multiIndexer.RepoPrefixes()
+	slices.Sort(prefixes)
+	return prefixes
+}
+
+// Capture accepted source witnesses for the actual canonical reader before
+// the read. Projection, editor layers and other checkout/ref readers retain
+// their existing scope and cannot borrow these canonical publication facts.
 func (s *Server) captureExplicitFreshness(ctx context.Context, req mcp.CallToolRequest) (context.Context, func()) {
-	if !requestBoolArg(&req, requireFreshArgName) || isCompact(req) || s.materializer == nil || s.materializer.Leases == nil {
+	if !requestBoolArg(&req, requireFreshArgName) || isCompact(req) || s.materializer == nil || s.materializer.Leases == nil || s.multiIndexer == nil {
 		return ctx, nil
 	}
-	prefix := baseNarrowedRepoPrefix(requestViewFromContext(ctx))
-	if prefix == "" {
+	prefixes := s.canonicalFreshnessPrefixes(ctx)
+	authority, tracked := s.currentWatcher().(interface{ TierAuthority(string) bool })
+	if len(prefixes) == 0 || !tracked {
 		return ctx, nil
 	}
-	pin := s.materializer.Leases.AcquireBaseCorpus(prefix)
-	if pin.ValidateAcceptedCurrent() != nil {
-		pin.Release()
-		return ctx, nil
+	witness := &explicitFreshnessWitness{watcher: s.currentWatcher(), prefixes: prefixes}
+	release := func() {
+		for _, pin := range witness.pins {
+			pin.Release()
+		}
 	}
-	return context.WithValue(ctx, explicitFreshnessPinKey{}, pin), pin.Release
+	for _, prefix := range prefixes {
+		owner := s.multiIndexer.GetIndexer(prefix)
+		root, known := s.multiIndexer.RepoRoot(prefix)
+		if owner == nil || !known || root == "" || !authority.TierAuthority(prefix) {
+			release()
+			return ctx, nil
+		}
+		pin := s.materializer.Leases.AcquireBaseCorpus(prefix)
+		witness.pins = append(witness.pins, pin)
+		witness.owners = append(witness.owners, owner)
+		witness.roots = append(witness.roots, root)
+		if pin.ValidateAcceptedCurrent() != nil {
+			release()
+			return ctx, nil
+		}
+	}
+	return context.WithValue(ctx, explicitFreshnessPinKey{}, witness), release
 }
 
 type toolFreshnessBudgetKey struct{}

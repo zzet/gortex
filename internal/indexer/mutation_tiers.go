@@ -196,6 +196,18 @@ func (mw *MultiWatcher) TierPaths() map[string]MutationTierState {
 	return states
 }
 
+// TierAuthority reports whether this canonical repository has a live, healthy
+// watcher. An empty outstanding-path set alone cannot establish that fact.
+func (mw *MultiWatcher) TierAuthority(prefix string) bool {
+	if mw == nil {
+		return false
+	}
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	w := mw.watchers[prefix]
+	return !mw.stopped && mw.started[prefix] && w != nil && w.DegradedReason() == ""
+}
+
 func (mw *MultiWatcher) TierState(path string) MutationTierState {
 	mw.mu.Lock()
 	_, prefix := mw.multi.IndexerForFile(path)
