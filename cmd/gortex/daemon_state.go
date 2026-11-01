@@ -626,7 +626,13 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 					return nil, timings
 				}
 				finishPurge := startWarmupStep(logger, "orphan_prefix_purge", zap.String("repo", prefix))
-				if err := purger.PurgeRepo(prefix); err != nil {
+				purge := purger.PurgeRepo
+				if scoped, ok := state.graph.(interface {
+					PurgeRepoContext(context.Context, string) error
+				}); ok {
+					purge = func(prefix string) error { return scoped.PurgeRepoContext(ctx, prefix) }
+				}
+				if err := purge(prefix); err != nil {
 					purgeFailures++
 					finishPurge(zap.String("outcome", "error"), zap.Error(err))
 					logger.Warn("daemon: purging orphaned repo prefix failed",
