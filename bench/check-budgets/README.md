@@ -482,14 +482,22 @@ four-call bursts, optimistic 20-second estimates are about 328 load16 calls and
 19 edits/75 reads for edit4; publication speed is unmeasured. Per-tool counts
 will be much smaller, and p99 can effectively be a maximum. Neither sample
 adequacy nor the full-job p95 <=15 minutes is established. The entry cancels
-measurement at 13 minutes, reserves cleanup time and fails after 15 minutes.
-Strict startup/enrichment uses the remaining measurement deadline instead of an
-independent five-minute cold-start cutoff; parent cancellation still interrupts
-the load client for owned cleanup. This harness bound is not a cold-start
-performance allowance or evidence that the full profile fits fifteen minutes;
-the workflow's 18-minute outer bound permits cleanup/upload after failure. It
-cannot certify full-job timing, which includes build/download/preparation and
-requires twenty actual runs.
+measurement at 120 minutes and reserves two minutes for owned cleanup.
+Strict startup/enrichment uses the remaining measurement deadline; parent
+cancellation interrupts the load client for cleanup. The job caps setup steps
+at twenty minutes in total, the measurement step at 122 minutes including
+cleanup, and always-upload at three minutes, within a 145-minute job bound.
+These are measurement safety bounds, not accepted performance targets.
+
+The original full-job p95 <=15-minute target is explicitly deferred while a
+complete run is measured; it has not become a 120-minute target. The receipt
+retains the original 900-second target, reports deferred timing acceptance and
+whether the entry alone exceeded that target, and never grants formal
+acceptance. Full-job timing includes build/download/preparation; an entry below
+fifteen minutes would not establish full-job acceptance either. One naturally
+triggered complete attempt is reviewed before any repeat campaign. Fixture,
+readiness, five phases, three repeats, both fresh stores, thirty-six starts and
+all other strict checker thresholds remain unchanged.
 
 The measurement job is visibly skipped until `PERF_PR_SMOKE_ENABLED` is reviewed
 and enabled. Main publication separately requires its new harness contract on
