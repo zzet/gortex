@@ -326,8 +326,20 @@ func (r *editProbeRuntime) writeNative(s *editProbeState, step editProbeStep, na
 		if err != nil {
 			return err
 		}
-		if !before.Mode().IsRegular() {
-			return errors.New("native sender writes only a regular owned fixture file")
+		before, err = editProbeNativeSnapshot(before, func() (os.FileInfo, error) {
+			// Windows Lstat resolves file IDs lazily by pathname. A handle
+			// Stat pins this file's ID before a save can replace the path.
+			file, err := os.Open(target)
+			if err != nil {
+				return nil, err
+			}
+			info, err := file.Stat()
+			// Release the handle before mutation so Windows sharing and
+			// delete permissions are unchanged during the measured write.
+			return info, errors.Join(err, file.Close())
+		})
+		if err != nil {
+			return err
 		}
 		native.Before = editProbeIdentity(before)
 		write = func() error { return os.Remove(target) }
@@ -411,4 +423,13 @@ func editProbeSaveReplace(target string, ordinal int, content []byte, mode os.Fi
 
 func editProbeIdentity(info os.FileInfo) *editProbeFileIdentity {
 	return &editProbeFileIdentity{Size: info.Size(), MtimeNS: info.ModTime().UnixNano(), Inode: editProbeInode(info)}
+}
+
+// editProbeNativeSnapshot keeps the owned regular-file guard before taking
+// the identity snapshot. The capture callback is local to this native writer.
+func editProbeNativeSnapshot(before os.FileInfo, capture func() (os.FileInfo, error)) (os.FileInfo, error) {
+	if !before.Mode().IsRegular() {
+		return nil, errors.New("native sender writes only a regular owned fixture file")
+	}
+	return capture()
 }
