@@ -611,8 +611,12 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 		}
 	} else {
 		for _, receipt := range s.laggingMutationReceipts(ctx) {
+			outcome := receipt.outcome(true)
+			if !outcome.Pending && outcome.Err == nil && outcome.Reindexed {
+				continue // a receipt can finish between selection and this read
+			}
 			state := "failed"
-			if receipt.outcome(true).Pending {
+			if outcome.Pending {
 				state = "pending"
 			}
 			put(receipt.path, state, receipt.generation)
