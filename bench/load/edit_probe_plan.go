@@ -28,6 +28,7 @@ type editProbeStep struct {
 	ActivateNS      int64   `json:"activate_ns"`
 	DueNS           int64   `json:"due_ns"`
 	Editor          int     `json:"editor,omitempty"`
+	Route           string  `json:"route,omitempty"`
 	Marker          string  `json:"marker"`
 	MutationID      string  `json:"mutation_id"`
 	Request         request `json:"request"`
@@ -46,28 +47,41 @@ type editProbeStep struct {
 	File            string  `json:"file,omitempty"`
 }
 
+type editProbeRoute struct {
+	ID       string `json:"id"`
+	Repo     string `json:"repo"`
+	Commit   string `json:"commit"`
+	File     string `json:"file"`
+	Callee   string `json:"callee"`
+	Kind     string `json:"kind"`
+	Tool     string `json:"tool"`
+	Language string `json:"language"`
+	Mode     string `json:"mode"`
+}
+
 type editProbePlan struct {
-	Version       int             `json:"version"`
-	Arrival       string          `json:"arrival"`
-	MeanNS        int64           `json:"mean_interarrival_ns"`
-	ProbePeriodNS int64           `json:"probe_period_ns"`
-	Count         int             `json:"count"`
-	Editors       int             `json:"editors,omitempty"`
-	Readers       int             `json:"readers,omitempty"`
-	NoEditWindow  int64           `json:"no_edit_window_ns,omitempty"`
-	Seed          int64           `json:"seed"`
-	Kind          string          `json:"kind"`
-	Tool          string          `json:"tool"`
-	Language      string          `json:"language"`
-	Mode          string          `json:"mode"`
-	Sender        string          `json:"sender,omitempty"`
-	Repo          string          `json:"repo"`
-	Commit        string          `json:"commit"`
-	File          string          `json:"file"`
-	Callee        string          `json:"callee"`
-	SessionModel  string          `json:"session_model"`
-	NotSelected   []string        `json:"not_selected_not_tested"`
-	Steps         []editProbeStep `json:"steps"`
+	Version       int              `json:"version"`
+	Arrival       string           `json:"arrival"`
+	MeanNS        int64            `json:"mean_interarrival_ns"`
+	ProbePeriodNS int64            `json:"probe_period_ns"`
+	Count         int              `json:"count"`
+	Editors       int              `json:"editors,omitempty"`
+	Readers       int              `json:"readers,omitempty"`
+	NoEditWindow  int64            `json:"no_edit_window_ns,omitempty"`
+	Seed          int64            `json:"seed"`
+	Kind          string           `json:"kind"`
+	Tool          string           `json:"tool"`
+	Language      string           `json:"language"`
+	Mode          string           `json:"mode"`
+	Sender        string           `json:"sender,omitempty"`
+	Repo          string           `json:"repo"`
+	Commit        string           `json:"commit"`
+	File          string           `json:"file"`
+	Callee        string           `json:"callee"`
+	SessionModel  string           `json:"session_model"`
+	NotSelected   []string         `json:"not_selected_not_tested"`
+	Steps         []editProbeStep  `json:"steps"`
+	Routes        []editProbeRoute `json:"routes,omitempty"`
 }
 
 type editProbeArrival struct {
@@ -125,6 +139,95 @@ func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
 	// relative to the edit origin after that window, is unchanged.
 	p.Readers, p.NoEditWindow = o.Agents, int64(editProbeNoEditWindow)
 	return p, nil
+}
+
+// Routed plans reuse each corpus's existing finite plan. Every corpus sees
+// the same global ordinals/arrivals; each fixed editor takes only its own
+// corpus's request at that ordinal, so no secondary stream is reseeded.
+func planEditProbeRoutes(corpora []Corpus, o runOptions) (editProbePlan, error) {
+	if len(corpora) == 0 {
+		return editProbePlan{}, errors.New("edit-and-probe requires a pinned corpus")
+	}
+	if o.EditRepos < 0 {
+		return editProbePlan{}, errors.New("invalid edit repository count")
+	}
+	if o.EditRepos <= 1 {
+		return planEditProbe(corpora[0], o)
+	}
+	if o.EditRepos != 6 || len(corpora) != 6 || o.Editors < 6 || o.EditCount != 100 || o.Agents != 0 || o.Worktrees != 0 {
+		return editProbePlan{}, errors.New("six-repository planning requires exactly six pinned corpora, at least six fixed editors, 100 edits, no pure readers and no linked worktrees")
+	}
+	plans := make([]editProbePlan, len(corpora))
+	routes := make([]editProbeRoute, len(corpora))
+	labels, sources := map[string]bool{}, map[string]bool{}
+	for i, c := range corpora {
+		if c.Label == "" || labels[c.Label] || sources[c.Source] {
+			return editProbePlan{}, errors.New("six-repository routes require distinct corpus labels and source repositories")
+		}
+		labels[c.Label], sources[c.Source] = true, true
+		p, err := planEditProbe(c, o)
+		if err != nil {
+			return editProbePlan{}, fmt.Errorf("route %s: %w", c.Label, err)
+		}
+		if p.Kind != "add_intrafile_call" || p.Tool != "edit.file" || p.Language != "go" || p.Mode != "json" || p.Sender != "" {
+			return editProbePlan{}, errors.New("six-repository planning currently supports ordinary Go add_intrafile_call/edit.file JSON fixtures only; native, lifecycle, move and other output cells are unsupported")
+		}
+		plans[i] = p
+		routes[i] = editProbeRoute{ID: c.Label, Repo: c.Label, Commit: c.Commit, File: p.File, Callee: p.Callee, Kind: p.Kind, Tool: p.Tool, Language: p.Language, Mode: p.Mode}
+	}
+	out := plans[0]
+	out.Routes = routes
+	out.Steps = append([]editProbeStep(nil), out.Steps...)
+	for i, step := range out.Steps {
+		route := step.Editor % len(plans)
+		out.Steps[i] = plans[route].Steps[i]
+		out.Steps[i].Route = routes[route].ID
+	}
+	out.NotSelected = nil
+	for _, limitation := range plans[0].NotSelected {
+		if limitation != "several editors share one repository; 6-repository and linked-worktree routing are not implemented" {
+			out.NotSelected = append(out.NotSelected, limitation)
+		}
+	}
+	out.NotSelected = append(out.NotSelected, "multi-repository execution remains refused until routed oracle and restore ownership are validated")
+	return out, nil
+}
+
+func editProbeRouteOperations(plan editProbePlan, corpora []Corpus) ([]request, error) {
+	if len(corpora) == 0 {
+		return nil, errors.New("edit-and-probe operations require a pinned corpus")
+	}
+	if len(plan.Routes) == 0 {
+		for _, step := range plan.Steps {
+			if step.Route != "" {
+				return nil, errors.New("edit route has no pinned route metadata")
+			}
+		}
+		return editProbeOperations(plan, corpora[0]), nil
+	}
+	if len(plan.Routes) != len(corpora) {
+		return nil, errors.New("edit route corpus denominator differs from pinned metadata")
+	}
+	byRoute := make(map[string]Corpus, len(corpora))
+	for i, c := range corpora {
+		route := plan.Routes[i]
+		if _, duplicate := byRoute[route.ID]; duplicate || route.ID != c.Label || route.Repo != c.Label || route.Commit != c.Commit || route.File != c.File {
+			return nil, errors.New("edit route metadata differs from its pinned corpus")
+		}
+		byRoute[route.ID] = c
+	}
+	var operations []request
+	for _, step := range plan.Steps {
+		c, found := byRoute[step.Route]
+		if !found || step.Route == "" || step.Editor < 0 || step.Editor >= plan.Editors || step.Route != plan.Routes[step.Editor%len(plan.Routes)].ID {
+			return nil, errors.New("offered edit has an unknown or foreign repository route")
+		}
+		operations = append(operations, step.Request)
+		for _, oracle := range editProbeOracles(c, step) {
+			operations = append(operations, oracle.call)
+		}
+	}
+	return operations, nil
 }
 
 func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editProbePlan, error) {

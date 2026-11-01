@@ -39,6 +39,7 @@ type runOptions struct {
 	SweepRepetitions  int
 	SweepBudget       time.Duration
 	EditCount         int
+	EditRepos         int
 	EditProbeRole     string
 	editProbeBaseline bool
 	Startup           startupOptions
@@ -57,6 +58,9 @@ func parseRun(args []string) (runOptions, error) {
 	}
 	if f.NArg() != 0 {
 		return o, errors.New("unexpected positional run arguments")
+	}
+	if o.EditRepos < 1 {
+		return o, errors.New("--edit-repos must be positive")
 	}
 	o.editProbeBaseline = o.EditProbeRole == "baseline"
 	return o, errors.Join(validateRunOptions(o), validateMemoryOptions(o))
@@ -85,11 +89,16 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.SweepRepetitions, "sweep-repetitions", 15, "samples per benchmark operation (smoke may explicitly use 1)")
 	f.DurationVar(&o.SweepBudget, "sweep-duration", 10*time.Minute, "separate total budget for the repeated paced sweep")
 	bindStartupFlags(f, &o.Startup)
+	f.IntVar(&o.EditRepos, "edit-repos", 1, "edit-and-probe: one repository (default), or an explicit six-pinned-repository plan")
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
 
 func validateRunOptions(o runOptions) error {
+	if o.EditRepos < 0 || o.EditRepos > 1 && (o.EditRepos != 6 || o.Scenario != editProbeScenario) {
+		return errors.New("--edit-repos selects one repository or exactly six for edit-and-probe only")
+	}
+
 	if err := validatePRSmokeDrain(o); err != nil {
 		return err
 	}
@@ -263,12 +272,15 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 		report.Workload.Operations = append(report.Workload.Operations, ops...)
 	}
 	if o.Scenario == editProbeScenario {
-		plan, err := planEditProbe(corpora[0], o)
+		plan, err := planEditProbeRoutes(corpora, o)
 		if err != nil {
 			return report, err
 		}
 		report.Workload.EditProbe = &plan
-		report.Workload.Operations = editProbeOperations(plan, corpora[0])
+		report.Workload.Operations, err = editProbeRouteOperations(plan, corpora)
+		if err != nil {
+			return report, err
+		}
 		report.Workload.SessionModel = plan.SessionModel
 	}
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees

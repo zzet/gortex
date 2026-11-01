@@ -61,6 +61,9 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			resultErr = errors.New(strings.Join(phase.Errors, "; "))
 		}
 	}()
+	if scenario == editProbeScenario && o.EditRepos > 1 {
+		return phase, nil, artifacts, crashes, "", errors.New("multi-repository edit-and-probe execution is unsupported until routed oracle and restore ownership are validated")
+	}
 	selected := corpora[:1]
 	if scenario == "many" || scenario == "many-edit" {
 		if len(corpora) < 2 {

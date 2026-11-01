@@ -1443,6 +1443,9 @@
                             }
                           ]
                         },
+                        "route": {
+                          "type": "string"
+                        },
                         "stale_claimed_fresh": {
                           "type": "boolean"
                         },
@@ -1794,6 +1797,56 @@
                       "repo": {
                         "type": "string"
                       },
+                      "routes": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "callee": {
+                              "type": "string"
+                            },
+                            "commit": {
+                              "type": "string"
+                            },
+                            "file": {
+                              "type": "string"
+                            },
+                            "id": {
+                              "type": "string"
+                            },
+                            "kind": {
+                              "type": "string"
+                            },
+                            "language": {
+                              "type": "string"
+                            },
+                            "mode": {
+                              "type": "string"
+                            },
+                            "repo": {
+                              "type": "string"
+                            },
+                            "tool": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "repo",
+                            "commit",
+                            "file",
+                            "callee",
+                            "kind",
+                            "tool",
+                            "language",
+                            "mode"
+                          ],
+                          "type": "object"
+                        },
+                        "type": [
+                          "array",
+                          "null"
+                        ]
+                      },
                       "seed": {
                         "type": "integer"
                       },
@@ -1890,6 +1943,9 @@
                               "type": "object"
                             },
                             "request_sha256": {
+                              "type": "string"
+                            },
+                            "route": {
                               "type": "string"
                             },
                             "sender": {
@@ -3579,6 +3635,56 @@
                 "repo": {
                   "type": "string"
                 },
+                "routes": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "callee": {
+                        "type": "string"
+                      },
+                      "commit": {
+                        "type": "string"
+                      },
+                      "file": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string"
+                      },
+                      "language": {
+                        "type": "string"
+                      },
+                      "mode": {
+                        "type": "string"
+                      },
+                      "repo": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "repo",
+                      "commit",
+                      "file",
+                      "callee",
+                      "kind",
+                      "tool",
+                      "language",
+                      "mode"
+                    ],
+                    "type": "object"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
                 "seed": {
                   "type": "integer"
                 },
@@ -3675,6 +3781,9 @@
                         "type": "object"
                       },
                       "request_sha256": {
+                        "type": "string"
+                      },
+                      "route": {
                         "type": "string"
                       },
                       "sender": {
