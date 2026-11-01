@@ -738,6 +738,20 @@ func attachReceiptTiers(payload map[string]any, receipt *mutationReceipt) {
 			payload[key] = at.UTC().Format(time.RFC3339Nano)
 		}
 	}
+	states := make(map[string]string, 3)
+	for name, at := range map[string]time.Time{"file_graph": tiers.FileGraphAt, "relations": tiers.RelationsAt, "derived": tiers.DerivedAt} {
+		state := "pending"
+		if !at.IsZero() {
+			state = "fresh"
+		}
+		if tiers.Failed {
+			state = "failed"
+		} else if name == "derived" && tiers.Partial {
+			state = "partial"
+		}
+		states[name] = state
+	}
+	payload["tier_state"] = states
 }
 
 // shortFreshSHA trims a git SHA to 12 chars for the rider.
