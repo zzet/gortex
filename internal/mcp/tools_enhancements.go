@@ -425,12 +425,15 @@ func (s *Server) handleVerifyChange(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("changes array is empty"), nil
 	}
 
-	gaps := s.laggingMutationReceipts(ctx)
-	result := analysis.VerifyChanges(s.readerFor(ctx), s.engineFor(ctx), changes)
 	ids := make([]string, 0, len(changes))
 	for _, change := range changes {
 		ids = append(ids, change.SymbolID)
 	}
+	if err := s.awaitConsumerFreshness(ctx, req, "relations", ids, nil, time.Time{}); err != nil {
+		return nil, err
+	}
+	gaps := s.laggingMutationReceipts(ctx)
+	result := analysis.VerifyChanges(s.readerFor(ctx), s.engineFor(ctx), changes)
 	label := s.labelRelations(ctx, gaps, ids, nil)
 
 	if isCompact(req) {
@@ -2587,6 +2590,11 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 	if _, captured := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); !captured {
 		ctx = s.captureToolFreshness(ctx)
 	}
+	freshness := takeRequestFreshness(&req)
+	deadline := time.Time{}
+	if freshness.requireFresh {
+		deadline = freshness.effectiveDeadline(time.Now(), ctx)
+	}
 	gaps := s.laggingMutationReceipts(ctx)
 	reader := s.readerFor(ctx)
 	opts.RepoPrefixes = s.deadCodeRepoPrefixes(ctx)
@@ -2631,6 +2639,11 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 	for _, entry := range entries {
 		candidate := s.freshnessFor(ctx, "derived", []string{entry.ID}, nil, gaps)
 		if candidate.state != "" {
+			// Keep a pre-walk pending candidate unknown even if publication lands
+			// during the wait: these analysis rows preceded that publication.
+			if err := s.awaitConsumerFreshness(ctx, req, "derived", []string{entry.ID}, nil, deadline); err != nil {
+				return nil, err
+			}
 			pendingUnknown = append(pendingUnknown, entry)
 			label = label.merge(candidate)
 		} else {

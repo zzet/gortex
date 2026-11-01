@@ -1847,6 +1847,9 @@ func (s *Server) handleGetEditPlan(ctx context.Context, req mcp.CallToolRequest)
 		ids[i] = strings.TrimSpace(ids[i])
 	}
 
+	if err := s.awaitConsumerFreshness(ctx, req, "relations", ids, nil, time.Time{}); err != nil {
+		return nil, err
+	}
 	gaps := s.laggingMutationReceipts(ctx)
 	depth := req.GetInt("depth", 3)
 

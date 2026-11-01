@@ -994,6 +994,12 @@ func fitToolFreshnessBudget(ctx context.Context, req mcp.CallToolRequest, res *m
 }
 
 func (s *Server) awaitWatchedFreshness(ctx context.Context, name string, req mcp.CallToolRequest, freshness requestFreshness) *mcp.CallToolResult {
+	// These relation consumers own their scoped wait after lowering targets.
+	// An expired request yields their labelled verdict, not a pre-handler refusal.
+	switch name {
+	case "verify_change", "get_edit_plan", "change_contract", "preview_edit":
+		return nil
+	}
 	view := requestViewFromContext(ctx)
 	if !freshness.requireFresh || view != nil && view.readsOwnCheckout() {
 		return nil
