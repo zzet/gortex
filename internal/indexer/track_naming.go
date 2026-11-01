@@ -86,8 +86,12 @@ func (a *prefixStatAllowance) observeNaming(ctx context.Context, root string, re
 	workerCtx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	go func() {
-		defer func() { <-slots }()
-		done <- read(workerCtx, root)
+		facts := func() trackNamingFacts {
+			defer func() { <-slots }()
+			return read(workerCtx, root)
+		}()
+		// Completion includes permit return, as for root Stat observations.
+		done <- facts
 	}()
 	select {
 	case <-ctx.Done():
