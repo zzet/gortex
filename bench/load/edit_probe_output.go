@@ -25,41 +25,85 @@ var editProbeOutputModes = []string{"json", "toon", "compact", "cli", "gcx"}
 
 type editProbeModes map[string]editProbeModeCoverage
 
+type editProbeToolCoverage struct {
+	ProbeAnswers   int `json:"probe_answers"`
+	ObservedEdits  int `json:"observed_edits"`
+	DecodeFailures int `json:"decode_failures"`
+}
+
 type editProbeModeCoverage struct {
-	State                 string `json:"state"`
-	Reason                string `json:"reason,omitempty"`
-	ProbeAnswers          int    `json:"probe_answers"`
-	DecodeFailures        int    `json:"decode_failures"`
-	ClaimsFreshObservable bool   `json:"claims_fresh_observable"`
-	ClaimsFresh           int    `json:"claims_fresh"`
-	StaleClaimedFresh     Metric `json:"stale_claimed_fresh"`
-	PrecommitMismatches   int    `json:"precommit_fresh_mismatches_unassessed"`
+	ObservedEdits         *int                             `json:"observed_edits,omitempty"`
+	Tools                 map[string]editProbeToolCoverage `json:"tools,omitempty"`
+	State                 string                           `json:"state"`
+	Reason                string                           `json:"reason,omitempty"`
+	ProbeAnswers          int                              `json:"probe_answers"`
+	DecodeFailures        int                              `json:"decode_failures"`
+	ClaimsFreshObservable bool                             `json:"claims_fresh_observable"`
+	ClaimsFresh           int                              `json:"claims_fresh"`
+	StaleClaimedFresh     Metric                           `json:"stale_claimed_fresh"`
+	PrecommitMismatches   int                              `json:"precommit_fresh_mismatches_unassessed"`
 }
 
 type editProbeModeCounts struct {
 	answers, decodeFailures, claimsFresh, stale, precommit int
+	gate                                                   *editProbeGateCounts
+}
+
+type editProbeGateCounts struct {
+	answers, decodeFailures, claimsFresh, stale, precommit int
+	edits                                                  map[int]bool
+	tools                                                  map[string]*editProbeGateToolCounts
+}
+
+type editProbeGateToolCounts struct {
+	answers, decodeFailures int
+	edits                   map[int]bool
 }
 
 // Answers count by each oracle request's actual output mode. A mode without
 // answers, or whose payload cannot carry a freshness claim, reports its stale
 // claimed-fresh count unavailable rather than zero.
 func editProbeOutputCoverage(selected string, counts map[string]editProbeModeCounts) editProbeModes {
-	out := make(editProbeModes, len(editProbeOutputModes))
-	for _, mode := range editProbeOutputModes {
+	modes := editProbeOutputModes
+	if selected == "gate" {
+		modes = append(append([]string(nil), modes...), "facade")
+	}
+	out := make(editProbeModes, len(modes))
+	for _, mode := range modes {
 		count := counts[mode]
+		gate := count.gate
+		if selected == "gate" {
+			count = editProbeModeCounts{}
+			if gate != nil {
+				count.answers, count.decodeFailures, count.claimsFresh, count.stale, count.precommit = gate.answers, gate.decodeFailures, gate.claimsFresh, gate.stale, gate.precommit
+			}
+		}
 		coverage := editProbeModeCoverage{State: "not_selected", ProbeAnswers: count.answers, DecodeFailures: count.decodeFailures, ClaimsFreshObservable: true, ClaimsFresh: count.claimsFresh, PrecommitMismatches: count.precommit}
+		if selected == "gate" {
+			observed := 0
+			coverage.Tools = map[string]editProbeToolCoverage{}
+			if gate != nil {
+				observed = len(gate.edits)
+				for tool, count := range gate.tools {
+					coverage.Tools[tool] = editProbeToolCoverage{ProbeAnswers: count.answers, ObservedEdits: len(count.edits), DecodeFailures: count.decodeFailures}
+				}
+			}
+			coverage.ObservedEdits = &observed
+		}
 		switch mode {
 		case "gcx":
 			coverage.State, coverage.Reason, coverage.ClaimsFreshObservable = "unavailable", errEditOutputGCXUnavailable.Error(), false
 		case "compact":
 			coverage.Reason, coverage.ClaimsFreshObservable = "compact text has no freshness field; it proves call-addition presence only", false
 		}
-		if mode == selected {
+		if mode == selected || selected == "gate" && mode != "gcx" {
 			coverage.State = "selected"
 		}
 		switch {
 		case !coverage.ClaimsFreshObservable:
 			coverage.StaleClaimedFresh = unavailable("answers", "mode cannot carry a freshness claim here")
+		case selected == "gate" && count.claimsFresh == 0:
+			coverage.StaleClaimedFresh = unavailable("answers", "no explicit freshness claims from assigned edits in this mode")
 		case count.answers == 0:
 			coverage.StaleClaimedFresh = unavailable("answers", "no probe answers in this mode")
 		default:
@@ -72,9 +116,17 @@ func editProbeOutputCoverage(selected string, counts map[string]editProbeModeCou
 
 // A CLI probe sends the same JSON facade request through its own process, so
 // its answers are decoded and counted as CLI stdout, never as MCP JSON.
-func (r *editProbeRuntime) probeOutput(oracle editProbeOracle) string {
-	if r.plan.Mode == "cli" {
-		return "cli"
+func (r *editProbeRuntime) stepProbeMode(step editProbeStep) string {
+	if step.ProbeMode != "" {
+		return step.ProbeMode
+	}
+	return r.plan.Mode
+}
+
+func (r *editProbeRuntime) probeOutput(oracle editProbeOracle, step editProbeStep) string {
+	mode := r.stepProbeMode(step)
+	if mode == "cli" || mode == "facade" {
+		return mode
 	}
 	return editProbeRequestOutput(oracle.call)
 }
@@ -100,6 +152,44 @@ func (r *editProbeRuntime) countMode(mode string, answered, decoded, fresh, stal
 	}
 	if precommit {
 		count.precommit++
+	}
+	r.modeCounts[mode] = count
+}
+
+// Gate witnesses belong to the record's assigned surface. A real JSON
+// fallback remains counted as JSON traffic, but cannot lend edit coverage or
+// freshness claims to either another record's JSON cell or its compact cell.
+func (r *editProbeRuntime) countGateMode(step editProbeStep, mode, tool string, answered, decoded, fresh, stale, precommit bool) {
+	if !r.plan.GateModes || mode != step.ProbeMode || !answered {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := r.modeCounts[mode]
+	if count.gate == nil {
+		count.gate = &editProbeGateCounts{edits: map[int]bool{}, tools: map[string]*editProbeGateToolCounts{}}
+	}
+	gate := count.gate
+	gate.answers++
+	if gate.tools[tool] == nil {
+		gate.tools[tool] = &editProbeGateToolCounts{edits: map[int]bool{}}
+	}
+	toolCount := gate.tools[tool]
+	toolCount.answers++
+	if decoded {
+		gate.edits[step.Ordinal], toolCount.edits[step.Ordinal] = true, true
+	} else {
+		gate.decodeFailures++
+		toolCount.decodeFailures++
+	}
+	if fresh {
+		gate.claimsFresh++
+	}
+	if stale {
+		gate.stale++
+	}
+	if precommit {
+		gate.precommit++
 	}
 	r.modeCounts[mode] = count
 }

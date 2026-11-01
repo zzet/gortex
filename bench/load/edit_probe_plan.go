@@ -140,7 +140,7 @@ func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
 		return p, err
 	}
 	if o.EditGateModes {
-		if p.Count != 100 || p.Mode != "json" || p.Kind != "add_intrafile_call" || p.Tool != "edit.file" {
+		if p.Count != 100 || p.MeanNS != int64(editProbeMean) || p.Mode != "json" || p.Kind != "add_intrafile_call" || p.Tool != "edit.file" {
 			return editProbePlan{}, errors.New("five-mode gate requires 100 call-addition edits with unchanged JSON edit.file ACKs")
 		}
 		p.GateModes = true

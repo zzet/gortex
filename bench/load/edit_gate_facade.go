@@ -13,10 +13,8 @@ const editProbeFacadeWireKey = "\x00load.facade.wire"
 // Surface identity is proof from the actual MCP envelope, independent from
 // its JSON payload. A GCX/TOON decoder or structured sibling cannot supply it.
 func verifyEditProbeFacade(raw json.RawMessage, operation string) error {
-	canonical := map[string]string{
-		"read.file": "read_file", "read.source": "get_symbol_source", "read.summary": "get_file_summary", "read.editing_context": "get_editing_context",
-		"search.symbols": "search_symbols", "search.text": "search_text", "relations.callers": "get_callers", "trace.call_chain": "get_call_chain",
-	}[operation]
+	canonical := editProbeCanonicalTool(operation)
+
 	facade, op, ok := strings.Cut(operation, ".")
 	if !ok || canonical == "" {
 		return errors.New("facade dispatch proof unavailable for this operation")
@@ -39,4 +37,11 @@ func verifyEditProbeFacade(raw json.RawMessage, operation string) error {
 		return errors.New("missing or mismatched facade-v1 dispatch identity")
 	}
 	return nil
+}
+
+func editProbeCanonicalTool(operation string) string {
+	return map[string]string{
+		"read.file": "read_file", "read.source": "get_symbol_source", "read.summary": "get_file_summary", "read.editing_context": "get_editing_context",
+		"search.symbols": "search_symbols", "search.text": "search_text", "relations.callers": "get_callers", "trace.call_chain": "get_call_chain",
+	}[operation]
 }

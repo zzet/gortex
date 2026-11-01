@@ -26,6 +26,8 @@ type editLoopRow struct {
 
 type editLoopWire struct {
 	Plan struct {
+		MeanNS    *int64 `json:"mean_interarrival_ns"`
+		Arrival   string `json:"arrival"`
 		GateModes bool   `json:"gate_modes"`
 		Count     int    `json:"count"`
 		Editors   int    `json:"editors"`
@@ -52,6 +54,8 @@ type editLoopWire struct {
 		Errors []string `json:"errors"`
 	} `json:"edits"`
 	Modes map[string]struct {
+		ObservedEdits  *int   `json:"observed_edits"`
+		ClaimsFresh    *int   `json:"claims_fresh"`
 		Answers        int    `json:"probe_answers"`
 		DecodeFailures int    `json:"decode_failures"`
 		Observable     bool   `json:"claims_fresh_observable"`
@@ -152,8 +156,16 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 		}
 	}
 	phase := r.Phases[0]
-	if len(phase.Errors) != 0 || phase.Duration <= 0 || phase.Duration > 900 {
+	if phase.Name != "edit-and-probe" || phase.SessionModel == "" || len(phase.Errors) != 0 || !finiteNonnegative(phase.Duration) || phase.Duration <= 0 || phase.Duration > 900 {
 		return errors.New("edit-loop phase incomplete or exceeds the 15-minute gate")
+	}
+	var wall struct {
+		Clock    string `json:"clock"`
+		NS       *int64 `json:"wall_ns"`
+		Complete bool   `json:"complete"`
+	}
+	if json.Unmarshal(phase.Gate["edit_loop_wall"], &wall) != nil || wall.Clock != "monotonic" || wall.NS == nil || *wall.NS <= 0 || *wall.NS > 900000000000 || float64(*wall.NS) < phase.Duration*1e9 || !wall.Complete {
+		return errors.New("missing, incomplete or over-15-minute whole-run wall observation")
 	}
 	if _, coupled := phase.Gate["paired_measurement_window"]; coupled {
 		return errors.New("paired child cannot supply standalone gate evidence")
@@ -174,14 +186,22 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 	if input.Scenario == "loadedit-4-largefile" {
 		expected = 4
 	}
-	if workload.Scenario != "edit-and-probe" || workload.Agents != 0 || workload.Editors != expected || workload.Session != "fixed_editor_per_ordinal_plus_one_separate_prober_per_edit" {
+	session := "fixed_editor_per_ordinal_plus_one_separate_prober_per_edit"
+	if expected == 1 {
+		session = "one_editor_plus_one_separate_prober_per_edit"
+	}
+	if workload.Scenario != "edit-and-probe" || workload.Agents != 0 || workload.Editors != expected || workload.Session != session || phase.SessionModel != session {
 		return errors.New("incorrect edit-loop workload population or session model")
 	}
 	wire, err := decodeEditLoopWire(phase)
 	if err != nil {
 		return err
 	}
-	if wire.Plan.Editors != expected {
+	editors := wire.Plan.Editors
+	if editors == 0 && wire.Plan.Session == "one_editor_plus_one_separate_prober_per_edit" {
+		editors = 1
+	}
+	if editors != expected || wire.Plan.Session != session {
 		return errors.New("plan editor population differs from workload")
 	}
 	return nil
@@ -191,6 +211,9 @@ func decodeEditLoopWire(phase phase) (editLoopWire, error) {
 	var wire editLoopWire
 	if err := json.Unmarshal(phase.EditProbe, &wire); err != nil {
 		return wire, fmt.Errorf("missing edit-probe evidence: %w", err)
+	}
+	if wire.Plan.MeanNS == nil || *wire.Plan.MeanNS != 15000000000 || wire.Plan.Arrival != "precomputed_open_loop_poisson" {
+		return wire, errors.New("gate changed the offered 15-second-per-editor open-loop schedule")
 	}
 	if !wire.Plan.GateModes || wire.Plan.Count < 100 || len(wire.Edits) != wire.Plan.Count || len(wire.Plan.Steps) != wire.Plan.Count || wire.Plan.Mode != "json" {
 		return wire, errors.New("gate needs the complete >=100-total JSON-ACK/five-mode denominator")
@@ -288,7 +311,13 @@ func measureEditLoopRow(phase phase, name string) (float64, error) {
 	}
 	if mode, ok := strings.CutPrefix(name, "silent_stale_"); ok {
 		coverage, exists := wire.Modes[mode]
-		if !exists || coverage.Answers < 20 || coverage.DecodeFailures != 0 || !coverage.Observable {
+		expected := 0
+		for _, record := range wire.Edits {
+			if record.Mode == mode {
+				expected++
+			}
+		}
+		if !exists || expected == 0 || coverage.ObservedEdits == nil || *coverage.ObservedEdits != expected || coverage.ClaimsFresh == nil || *coverage.ClaimsFresh <= 0 || coverage.Answers < expected || coverage.DecodeFailures != 0 || !coverage.Observable {
 			return 0, errors.New("missing or unobservable actual output-mode coverage; absent freshness is never zero-stale")
 		}
 		return number(coverage.Stale, "answers")
