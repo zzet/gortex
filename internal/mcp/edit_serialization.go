@@ -593,6 +593,12 @@ func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutat
 				waitCtx, cancel := context.WithTimeout(ctx, s.mutationWaitDuration())
 				defer cancel()
 				waitLap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+				if seedErr := editGateACKSeed(ctx, s); seedErr != nil {
+					waitLap.finish()
+					outcome := receipt.outcome(true)
+					outcome.Err = errors.Join(outcome.Err, seedErr)
+					return outcome
+				}
 				if !s.releaseDispatchSlotForWait(waitCtx, receipt.done) {
 					waitLap.finish()
 					return receipt.outcome(true)

@@ -1280,7 +1280,9 @@ func (s *Store) writeWanted() bool {
 // mutation queued behind them upstream of the write gate is not held by them
 // either. The release is idempotent.
 func (s *Store) AnnounceWrite() (release func()) {
-	return s.announceWrite(true)
+	release = s.announceWrite(true)
+	editGateClosedReclaimSeed(s)
+	return release
 }
 
 // AnnounceCheckoutRefresh retains global mutation demand while a checkout
