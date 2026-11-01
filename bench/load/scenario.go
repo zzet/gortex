@@ -47,7 +47,8 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		if phase.NeverSeen > 0 {
 			phase.Errors = append(phase.Errors, fmt.Sprintf("%d acknowledged edits never visible before product deadline", phase.NeverSeen))
 		}
-		if scenario != "cold" && scenario != "restart" && scenario != "idle-stop" && len(phase.Tools) == 0 {
+		nativeWork := scenario == editProbeScenario && editProbeNativeWorkObserved(phase.EditProbe)
+		if scenario != "cold" && scenario != "restart" && scenario != "idle-stop" && len(phase.Tools) == 0 && !nativeWork {
 			phase.Errors = append(phase.Errors, "no workload calls observed before phase end")
 		}
 		if resultErr != nil {
@@ -64,7 +65,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 		selected = corpora
 	}
-	editing := scenario == "edit" || scenario == "many-edit"
+	editing := scenario == "edit" || scenario == "many-edit" || scenario == editProbeScenario
 	for _, corpus := range selected {
 		operations, planErr := readingPlan(corpus)
 		if planErr != nil {
@@ -81,6 +82,15 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 				return phase, nil, artifacts, crashes, "", errors.New("edit scenarios require a stable unique edit_anchor and language-valid edit_template with one {{marker}} declaration")
 			}
 		}
+	}
+	if scenario == editProbeScenario {
+		plan, err := planEditProbe(selected[0], o)
+		if err != nil {
+			return phase, nil, artifacts, crashes, "", err
+		}
+		phase.Operations = editProbeOperations(plan, selected[0])
+		phase.EditProbe = newEditProbeReport(plan, selected[0], !o.editProbeBaseline)
+		phase.SessionModel = plan.SessionModel
 	}
 	p := o.smokeState
 	var err error
@@ -306,6 +316,18 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		phase.Metrics["sweep_operation_sessions"] = measured(float64(len(sweepClients)), "sessions")
 	}
 	phase.Metrics["mcp_sessions"] = measured(float64(len(clients)), "sessions")
+	if scenario == editProbeScenario {
+		runtime, probers, prepareErr := prepareEditProbe(warmCtx, o, p, clients[:o.Agents], clients[o.Agents:o.Agents+o.Editors], &phase)
+		clients = append(clients, probers...)
+		if runtime != nil {
+			defer func() { resultErr = errors.Join(resultErr, runtime.close()) }()
+		}
+		if prepareErr != nil {
+			return phase, sweep, artifacts, crashes, version, prepareErr
+		}
+		phase.Metrics["mcp_sessions"] = measured(float64(len(clients)), "sessions")
+		artifacts["edit_probe_raw"] = filepath.Join(p.Root, "edit-probe")
+	}
 	captureReceipt(ctx, p, clients[0], &phase)
 	sampler := newProcessSampler()
 	if scenario == "idle-stop" {
@@ -318,11 +340,20 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	if err != nil {
 		resultErr = errors.Join(resultErr, err)
 	}
+	if phase.editProbeRuntime != nil {
+		if ctx.Err() != nil {
+			resultErr = errors.Join(resultErr, errors.New("restore batch unavailable after canceled workload"))
+		} else {
+			restoreCtx, cancel := context.WithTimeout(ctx, o.Deadline)
+			resultErr = errors.Join(resultErr, phase.editProbeRuntime.restore(restoreCtx))
+			cancel()
+		}
+	}
 	if scenario == "sweep" {
 		finalizeSweepInventory(sweep, phase.Attempts, o.SweepRepetitions, &phase)
 	}
 	if scenario != "idle-stop" {
-		captureReceipt(ctx, p, clients[0], &phase)
+		captureReceipt(ctx, p, editProbeReceiptClient(&phase, clients), &phase)
 	}
 	for i, client := range clients {
 		client.mu.Lock()
@@ -361,7 +392,9 @@ func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients
 		}
 	}
 	var err error
-	if phase.Name == "sweep" {
+	if phase.Name == editProbeScenario {
+		err = phase.editProbeRuntime.run(ctx)
+	} else if phase.Name == "sweep" {
 		sweepCtx, cancelSweep := context.WithTimeout(ctx, o.SweepBudget)
 		defer cancelSweep()
 		err = runSweep(sweepCtx, o, sweepClients, p.Repos[0], sweepRequests, sweep, phase, waitContext)
@@ -378,7 +411,7 @@ func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients
 
 func dispatchArgs(r request, repo privateRepo) map[string]any {
 	args := copyJSON(r.Arguments)
-	args["output"] = map[string]any{"format": "json", "max_bytes": 0}
+	args["output"] = editProbeDispatchOutput(r)
 	if target, ok := args["target"].(map[string]any); ok {
 		for _, key := range []string{"file", "symbol"} {
 			if value, ok := target[key].(string); ok {
@@ -393,6 +426,23 @@ func dispatchArgs(r request, repo privateRepo) map[string]any {
 			}
 		}
 	}
+	if r.name() == "refactor.move" {
+		if destination, ok := args["destination"].(string); ok {
+			args["destination"] = repo.Prefix + "/" + destination
+		}
+	}
+	if r.name() == "edit.batch" {
+		if changes, ok := args["changes"].([]any); ok {
+			for _, item := range changes {
+				if change, ok := item.(map[string]any); ok && change["op"] == "edit_file" {
+					if path, ok := change["path"].(string); ok {
+						change["path"] = repo.Prefix + "/" + path
+					}
+				}
+			}
+		}
+	}
+
 	if r.name() == "change.verify" {
 		if source, ok := args["source"].(map[string]any); ok {
 			if changes, ok := source["changes"].([]any); ok {

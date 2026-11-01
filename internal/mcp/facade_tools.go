@@ -520,10 +520,9 @@ func parseLocalizationNewUserBoundary(facade, operation string, arguments map[st
 	return boundary, nil
 }
 
-func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-	started := time.Now()
-	input, _ := req.Params.Arguments.(map[string]any)
-	localizationAuthToken := localizationauth.TakeArgument(input)
+// facadeRequestOperation is the side-effect-free operation selection shared
+// by admission classification and the actual facade dispatcher.
+func facadeRequestOperation(facade string, req mcpgo.CallToolRequest) string {
 	operation := resolveFacadeOperationAlias(facade, normalizeFacadeOperation(req.GetString("operation", "")))
 	if facade == "analyze" {
 		operation = requestedAnalyzeKind(req.GetArguments())
@@ -540,6 +539,14 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	if facade == "read" {
 		operation = normalizeFacadeReadOperation(operation, req.GetArguments())
 	}
+	return operation
+}
+
+func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	started := time.Now()
+	input, _ := req.Params.Arguments.(map[string]any)
+	localizationAuthToken := localizationauth.TakeArgument(input)
+	operation := facadeRequestOperation(facade, req)
 	terminal := s.localizationFor(ctx)
 	freshLocalizeFlow := facade == "explore" && operation == "localize"
 	newUserTask, invalidBoundary := parseLocalizationNewUserBoundary(facade, operation, req.GetArguments())
