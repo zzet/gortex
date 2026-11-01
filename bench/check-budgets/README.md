@@ -432,6 +432,15 @@ and runs three rotated main/candidate sequences of read16, edit/read4, sweep1,
 warm restart and idle stop. It has no resume/borrowed-path CLI. Only this entry
 owns final state deletion; each phase retains its real stop/join receipt.
 
+The PR workflow resolves the current job's prepared Go build and module caches
+before the daemon isolates HOME. Both builds reuse those tool caches while
+keeping their graph stores fresh and separate. Owned cleanup restores writable
+directory permissions without following symlinks, including read-only module
+directories created during a failed attempt. Uploads select reports, receipts,
+foreground logs and raw microbenchmark output, excluding clones, stores and
+tool caches. A readiness failure names the last observed ready/enriched/coverage
+state; it does not relax those gates or establish full-job feasibility.
+
 There are 36 explicit process starts: two empty-store initializations and 34
 retained-store starts, including the six restart steps. Stores never cross
 build ownership. Edits are reset only inside owned clones while their daemon is
