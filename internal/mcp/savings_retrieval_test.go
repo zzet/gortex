@@ -68,8 +68,7 @@ func Widget%d%d(key string, depth int) (string, bool) {
 	reg.Register(languages.NewGoExtractor())
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
 		ConfigManager: cm,

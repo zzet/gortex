@@ -168,9 +168,7 @@ func newUnadmittedRefStack(t *testing.T) *refStack {
 	languages.RegisterAll(reg)
 	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(store, reg, bm, cm, zap.NewNop())
-	if _, err := mi.IndexScoped("", ""); err != nil {
-		t.Fatalf("index the fixture repository: %v", err)
-	}
+	registerMCPFixtureRepos(t, mi, cm)
 
 	graphID := indexer.GraphIDFor(refTestPrefix)
 	seedRefCatalog(t, store, graphID, repo, headTree)

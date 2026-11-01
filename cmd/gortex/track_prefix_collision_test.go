@@ -65,6 +65,48 @@ func TestRunTrackPrefixCollision(t *testing.T) {
 	}
 }
 
+func TestRunTrackIdentityPendingRemovesOnlyItsNewEntry(t *testing.T) {
+	for _, wait := range []bool{false, true} {
+		for _, preexisting := range []bool{false, true} {
+			t.Run(fmt.Sprintf("wait=%v/preexisting=%v", wait, preexisting), func(t *testing.T) {
+				t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+				t.Setenv("GORTEX_DAEMON_SOCKET", filepath.Join(t.TempDir(), "absent.sock"))
+				root := pathkey.CanonicalExistingRoot(t.TempDir())
+				gc, err := config.LoadGlobal()
+				require.NoError(t, err)
+				if preexisting {
+					require.NoError(t, gc.AddRepo(config.RepoEntry{Path: root, Name: "chosen"}))
+				}
+				require.NoError(t, gc.Save())
+				oldWait, oldName, oldAsWorktree := trackWait, trackName, trackAsWorktree
+				oldEnsure, oldNotify := trackEnsureDaemonReadyFn, trackNotifyDaemonTrackFn
+				t.Cleanup(func() {
+					trackWait, trackName, trackAsWorktree = oldWait, oldName, oldAsWorktree
+					trackEnsureDaemonReadyFn, trackNotifyDaemonTrackFn = oldEnsure, oldNotify
+				})
+				trackWait, trackName, trackAsWorktree = wait, "chosen", false
+				trackEnsureDaemonReadyFn = func(bool) daemonDecision { return daemonReady }
+				trackNotifyDaemonTrackFn = func(string, string, time.Time) error {
+					return &repoLoadingError{admissionReason: "identity_pending", phase: "identity_resolution"}
+				}
+				cmd := &cobra.Command{}
+				cmd.SetErr(&bytes.Buffer{})
+				err = runTrack(cmd, []string{root})
+				var pending *repoLoadingError
+				require.ErrorAs(t, err, &pending)
+				require.Equal(t, exitTempFail, pending.ExitCode())
+				gc, err = config.LoadGlobal()
+				require.NoError(t, err)
+				if preexisting {
+					require.Len(t, gc.Repos, 1)
+				} else {
+					require.Empty(t, gc.Repos, "uncertainty cannot persist an unproved new physical-root entry")
+				}
+			})
+		}
+	}
+}
+
 // The rollback removes only the entry this run added, never another
 // spelling of the same directory that was already in config.
 func TestRunTrackPrefixCollisionKeepsAliasEntry(t *testing.T) {
