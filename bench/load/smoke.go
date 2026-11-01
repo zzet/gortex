@@ -34,7 +34,7 @@ func smokeCommand(ctx context.Context, args []string) (result error) {
 	candidateRevision := f.String("candidate-revision", "", "full candidate revision")
 	manifest := f.String("manifest", "", "one pinned contemporary corpus")
 	out := f.String("out", "", "NEW owned stores/report directory outside source")
-	offer := f.Duration("offer", 20*time.Second, "PR offered window: 20s or 30s")
+	offer := f.Duration("offer", 20*time.Second, "version 2 PR smoke offered window: 20s")
 	deadline := f.Duration("deadline", 120*time.Second, "original product deadline")
 	warm := f.Duration("warm-timeout", 5*time.Minute, "each ready/enriched/public-analysis gate budget")
 	stop := f.Duration("stop-timeout", 30*time.Second, "owned normal-stop budget")
@@ -42,8 +42,8 @@ func smokeCommand(ctx context.Context, args []string) (result error) {
 	if err := f.Parse(args); err != nil {
 		return err
 	}
-	if f.NArg() != 0 || *manifest == "" || *out == "" || *offer != 20*time.Second && *offer != 30*time.Second || *deadline <= 0 || *deadline > 2*time.Minute || *warm <= 0 || *stop <= 0 || *stop > 2*time.Minute || *sweep <= 0 {
-		return errors.New("smoke requires fixed two-build inputs, one corpus, 20/30s offers and bounded positive budgets")
+	if f.NArg() != 0 || *manifest == "" || *out == "" || *offer != 20*time.Second || *deadline != 120*time.Second || *warm <= 0 || *stop <= 0 || *stop > 2*time.Minute || *sweep <= 0 {
+		return errors.New("version 2 smoke requires fixed two-build inputs, one corpus, original 20s offers/120s product budgets and bounded positive safety budgets")
 	}
 	builds := map[string]buildSpec{"main": {label: "main", binary: *mainBinary, sha: *mainRevision}, "candidate": {label: "candidate", binary: *candidateBinary, sha: *candidateRevision}}
 	for role, build := range builds {
@@ -134,6 +134,9 @@ func smokeCommand(ctx context.Context, args []string) (result error) {
 				o := runOptions{Binary: build.binary, GitSHA: build.sha, Manifest: *manifest, Scratch: *out, Output: filepath.Join(root, "report.json"), Profile: "agent", Host: "native", Scenario: step.wire, Agents: step.readers, Editors: step.editors, Seed: int64(repeat), Duration: *offer, Deadline: *deadline, WarmTimeout: *warm, StopTimeout: *stop, SweepBudget: *sweep, SweepRepetitions: 1, smokeState: states[role], smokeMarkers: markers[role]}
 				if step.wire == "read" {
 					o.PRSmokeDrain = *deadline
+				}
+				if step.wire == "edit" {
+					o.PRSmokeDrain, o.PRSmokeDrainVersion = *deadline, 2
 				}
 				if err := validateRunOptions(o); err != nil {
 					return errors.Join(result, err)

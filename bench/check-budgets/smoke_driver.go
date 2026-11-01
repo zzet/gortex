@@ -40,15 +40,15 @@ func smokeDriverCommand(args []string, stdout, stderr io.Writer) int {
 	fixture := f.String("fixture", "", "owned prepared contemporary fixture directory")
 	out := f.String("out", "", "NEW evidence directory outside the fixture")
 	budgets := f.String("budgets", "bench/budgets.yaml", "full strict policy")
-	offer := f.Duration("offer", 20*time.Second, "explicit PR-only offered window: 20s or 30s")
+	offer := f.Duration("offer", 20*time.Second, "version 2 PR-only offered window: 20s")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
-	if f.NArg() != 0 || *candidate == "" || *load == "" || *bundle == "" || *tests == "" || *fixture == "" || *out == "" || *offer != 20*time.Second && *offer != 30*time.Second {
-		fmt.Fprintln(stderr, "smoke needs candidate/load/main-bundle/candidate-builds/fixture/out and an explicit 20s/30s PR profile")
+	if f.NArg() != 0 || *candidate == "" || *load == "" || *bundle == "" || *tests == "" || *fixture == "" || *out == "" || *offer != 20*time.Second {
+		fmt.Fprintln(stderr, "smoke needs candidate/load/main-bundle/candidate-builds/fixture/out and the original 20s PR profile")
 		return 2
 	}
 	workflow := currentBuildWorkflow(os.Getenv("GITHUB_SHA"))
