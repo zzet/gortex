@@ -108,3 +108,22 @@ func TestProjectedDiskLayerStaysBelowPinnedEditorLayer(t *testing.T) {
 	require.Nil(t, srv.readerFor(ctx).GetNode("main.go::AddedOnDisk"))
 	require.Nil(t, srv.graph.GetNode("main.go::AddedOnDisk"))
 }
+
+func TestPinnedEditorFileNeedsNoDiskProjection(t *testing.T) {
+	srv, dir := setupTestServer(t)
+	path := filepath.Join(dir, "main.go")
+	// The pinned editor snapshot owns this entire file. Oversized disk bytes
+	// cannot contribute an answer and must not consume its projection budget.
+	require.NoError(t, os.WriteFile(path, make([]byte, (1<<20)+1), 0o644))
+	layer := graph.NewOverlayLayer()
+	layer.MarkFile("main.go", false)
+	bufferNode := &graph.Node{ID: "main.go::InBuffer", Name: "InBuffer", FilePath: "main.go", Kind: graph.KindFunction}
+	layer.AddNode("main.go", bufferNode)
+	pinned := graph.NewOverlaidView(srv.graph, layer)
+	ctx := WithOverlayView(t.Context(), pinned)
+	ctx, err := srv.ensureProjected(ctx, []string{"main.go"})
+	require.NoError(t, err)
+	require.Same(t, pinned, OverlayViewFromContext(ctx))
+	require.Empty(t, requestProjectionLayers(ctx))
+	require.Same(t, bufferNode, srv.readerFor(ctx).GetNode(bufferNode.ID))
+}
