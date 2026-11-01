@@ -41,7 +41,7 @@ const (
 	// DispositionUnknown freezes lifecycle clocks when the family cannot be inventoried.
 	DispositionUnknown Disposition = "unknown"
 	// DispositionInaccessible means the checkout did not answer and nothing
-	// proves it is gone. It is the default for every uncertain case.
+	// proves it is gone, while the family inventory itself remains usable.
 	DispositionInaccessible Disposition = "inaccessible"
 	// DispositionRemoved means the checkout is gone, with evidence.
 	DispositionRemoved Disposition = "removed"
@@ -72,6 +72,7 @@ type Classification struct {
 type PathEvidence struct {
 	// RootExists is true when the root itself was reachable at sample time.
 	RootExists      bool
+	RootMissing     bool
 	GitMarkerExists bool
 	// RootIdentity is the opaque token of the root object, empty when the
 	// root did not exist or the platform reports no identity.
@@ -92,6 +93,7 @@ type PathEvidence struct {
 func SampledPathEvidence(sample gitstate.PathEvidence) PathEvidence {
 	return PathEvidence{
 		RootExists:          sample.RootExists,
+		RootMissing:         sample.RootMissing,
 		GitMarkerExists:     sample.GitMarkerExists,
 		RootIdentity:        sample.RootIdentity,
 		RootVolumeKind:      sample.VolumeKind,
@@ -187,10 +189,9 @@ func ValidateInventory(inv *gitstate.FamilyInventory, invErr error, familyCommon
 // Classify decides what one checkout's observation means.
 //
 // The asymmetry is deliberate: presence and inaccessibility are cheap to be
-// wrong about, removal is not, so every path that is not positively proven
-// lands on inaccessible. inventoryErr non-nil short-circuits everything —
-// without a trustworthy inventory, an absent record is an absent inventory,
-// not an absent checkout.
+// wrong about, removal is not. An unavailable inventory freezes clocks as
+// Unknown unless this checkout's own fresh root and .git marker prove presence.
+// An absent inventory never proves an absent checkout.
 //
 // record is nil when a usable inventory did not list the checkout's admin
 // name. persisted is the last sample stored for the checkout; fresh is a

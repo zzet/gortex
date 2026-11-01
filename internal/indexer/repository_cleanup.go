@@ -216,7 +216,7 @@ func (h cleanupHooks) BeginGraphCleanupAttempt(ctx context.Context, graphID stri
 		return nil, err
 	}
 	state.mu.Lock()
-	if len(causes) > 0 {
+	if len(causes) > 0 && (state.cause == "" || reconcile.ConfigRemovalAllowed(causes[0])) {
 		state.cause = causes[0]
 	}
 	state.mu.Unlock()

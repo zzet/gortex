@@ -283,7 +283,7 @@ func TestReconcileFamilyAgainstRealGit(t *testing.T) {
 	runGit(t, repo, "worktree", "add", "-q", "--", worktree, "feature")
 	report = pass()
 	revived := find(report, adminName)
-	if revived.Action != ActionRemovalCancelled || revived.State != store_sqlite.CheckoutStateReady {
+	if revived.Action != ActionRemovalCancelled || revived.State != store_sqlite.CheckoutStateReconciling {
 		t.Fatalf("recreated worktree = %+v", revived)
 	}
 	if revived.CheckoutID != linked.CheckoutID || revived.Incarnation != linked.Incarnation {

@@ -42,6 +42,7 @@ var (
 type recordingHooks struct {
 	mu          sync.Mutex
 	calls       []string
+	causes      []string
 	failPurge   int
 	failRelease int
 	// deferRelease names a graph whose release is deferred until it is reset.
@@ -67,10 +68,11 @@ func (h *recordingHooks) PurgeCheckoutLayers(_ context.Context, checkoutID, inca
 	return nil
 }
 
-func (h *recordingHooks) ReleaseGraph(_ context.Context, graphID, _ string) error {
+func (h *recordingHooks) ReleaseGraph(_ context.Context, graphID, cause string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.calls = append(h.calls, "release:"+graphID)
+	h.causes = append(h.causes, cause)
 	if h.failRelease > 0 {
 		h.failRelease--
 		return errHookFailed
@@ -192,6 +194,7 @@ func gitSampleExisting(token string) gitstate.PathEvidence {
 // present on token.
 func gitSampleAbsent(token string) gitstate.PathEvidence {
 	return gitstate.PathEvidence{
+		RootMissing:         true,
 		AncestorPath:        "/repo",
 		AncestorVolumeKind:  gitstate.VolumeKindUnixDev,
 		AncestorVolumeToken: token,
@@ -202,6 +205,7 @@ func gitSampleAbsent(token string) gitstate.PathEvidence {
 type fixture struct {
 	t        *testing.T
 	store    *store_sqlite.Store
+	dbPath   string
 	catalog  *store_sqlite.Catalog
 	hooks    *recordingHooks
 	git      *fakeGit
@@ -215,7 +219,8 @@ type fixture struct {
 // against this package's own idea of them.
 func newFixture(t *testing.T, cfg Config, opts ...Option) *fixture {
 	t.Helper()
-	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "catalog.sqlite"))
+	dbPath := filepath.Join(t.TempDir(), "catalog.sqlite")
+	store, err := store_sqlite.Open(dbPath)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -224,6 +229,7 @@ func newFixture(t *testing.T, cfg Config, opts ...Option) *fixture {
 	f := &fixture{
 		t:        t,
 		store:    store,
+		dbPath:   dbPath,
 		catalog:  store.Catalog(),
 		hooks:    &recordingHooks{},
 		git:      newFakeGit(),

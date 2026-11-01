@@ -231,9 +231,9 @@ type familyPass struct {
 // and then validated against the family's recorded common-dir identity, so an
 // inventory of some other repository can never be read as this family's.
 //
-// The pass never deletes an identity by itself. Deletion happens when a
-// removal clock expires, which runs a saga, or when a caller enters one of
-// the saga entry points directly.
+// Only automatic checkouts may expire through a pass. An intended checkout
+// keeps its identity and configuration when its layers become unavailable;
+// removing tracking configuration requires an authorized cleanup cause.
 func (r *Reconciler) ReconcileFamily(ctx context.Context, familyID, probeDir string) (FamilyReport, error) {
 	return r.ReconcileFamilyCandidates(ctx, familyID, probeDir)
 }
@@ -357,7 +357,7 @@ func (r *Reconciler) reconcileKnown(
 	}
 	fresh := SampledPathEvidence(r.samplePath(root))
 	class := Classify(pass.inventoryErr, record, StoredPathEvidence(storedRow), fresh)
-	if pass.inventoryErr != nil && !pass.commonFresh.RootExists && pass.commonFresh.ancestorVolumeUsable() && storedRow.CommonDirVolumeKind == pass.commonFresh.AncestorVolumeKind && storedRow.CommonDirVolumeToken != "" && storedRow.CommonDirVolumeToken == pass.commonFresh.AncestorVolumeToken {
+	if pass.inventoryErr != nil && pass.commonFresh.RootMissing && pass.commonFresh.ancestorVolumeUsable() && storedRow.CommonDirVolumeKind == pass.commonFresh.AncestorVolumeKind && storedRow.CommonDirVolumeToken != "" && storedRow.CommonDirVolumeToken == pass.commonFresh.AncestorVolumeToken {
 		class = Classification{Disposition: DispositionRemoved, Evidence: EvidencePrunableConfirmed, Detail: "family common directory absent on its still-mounted volume"}
 	}
 	r.recordClassification(pass, existing, record, fresh, class)
@@ -522,9 +522,8 @@ func (r *Reconciler) applyPresent(
 }
 
 // applyInaccessible advances the availability clock without starting a second
-// removal grace. Once the availability grace expires, the checkout is retired
-// exactly like an authoritatively removed worktree: an inaccessible worktree
-// must not leave a shadow graph or tracking state behind indefinitely.
+// removal grace. Expiry purges an intended checkout's layers and keeps its
+// tracking identity; automatic checkouts retain their ordinary retirement.
 func (r *Reconciler) applyInaccessible(
 	ctx context.Context,
 	pass *familyPass,
@@ -591,6 +590,33 @@ func (r *Reconciler) retainIntended(ctx context.Context, pass *familyPass, exist
 	if err != nil {
 		return "", false, err
 	}
+	// A user-authorized cleanup already owns this identity. Observations must
+	// not turn its withdrawn checkout back into ordinary unavailable state.
+	ids := []string{sagaTarget{Kind: sagaForgetCheckout, CheckoutID: existing.CheckoutID, Incarnation: existing.Incarnation}.cleanupID()}
+	if owned != nil && owned.IsPrimaryBase {
+		ids = append([]string{sagaTarget{Kind: sagaRetirePrimaryClosure, GraphID: owned.GraphID}.cleanupID()}, ids...)
+	}
+	for _, id := range ids {
+		target, found, err := r.loadSagaTarget(ctx, id)
+		if err != nil {
+			return "", false, err
+		}
+		if !found {
+			continue
+		}
+		cause, err := r.inferCleanupCause(ctx, target)
+		if err != nil {
+			return "", false, err
+		}
+		if !ConfigRemovalAllowed(cause) {
+			continue
+		}
+		err = r.runSaga(context.WithoutCancel(ctx), target)
+		if err != nil && !r.cleanupDeferred(err) {
+			return "", true, err
+		}
+		return ActionGuardLost, true, nil
+	}
 	intended := owned != nil
 	if !intended {
 		intents, err := r.catalog.ListTrackingIntents(ctx, existing.CheckoutID)
@@ -607,14 +633,18 @@ func (r *Reconciler) retainIntended(ctx context.Context, pass *familyPass, exist
 	if !intended {
 		return "", false, nil
 	}
+	cause := CauseReconcileAvailability
+	if existing.RemovalDetectedAt != 0 {
+		cause = CauseReconcileRemoval
+	}
 	action := ActionMarkedUnavailable
 	if owned != nil && owned.IsPrimaryBase {
 		action = ActionPrimaryRetirementRefused
-		if existing.State != store_sqlite.CheckoutStateUnavailable {
-			r.logger.Warn("primary_retirement_refused", zap.String("family", existing.FamilyID), zap.String("checkout", existing.CheckoutID), zap.String("root", existing.RootPath), zap.String("cause", CauseReconcileAvailability))
+		if existing.State != store_sqlite.CheckoutStateUnavailable && r.logger != nil {
+			r.logger.Warn("primary_retirement_refused", zap.String("family", existing.FamilyID), zap.String("checkout", existing.CheckoutID), zap.String("root", existing.RootPath), zap.String("cause", cause))
 		}
 	}
-	if err := r.purgeLayersOnce(context.WithoutCancel(ctx), existing); err != nil {
+	if err := r.purgeLayersOnce(context.WithoutCancel(ctx), existing, cause); err != nil {
 		return "", true, err
 	}
 	req.State = store_sqlite.CheckoutStateUnavailable
@@ -773,6 +803,8 @@ func (r *Reconciler) observeNew(
 		return entry, err
 	}
 	row := fresh.CatalogRow(checkout.CheckoutID, pass.now.Unix(), 1)
+	row.CommonDirVolumeKind = pass.commonFresh.RootVolumeKind
+	row.CommonDirVolumeToken = pass.commonFresh.RootVolumeToken
 	if err := r.catalog.UpsertCheckoutPathEvidence(ctx, row); err != nil {
 		return entry, err
 	}
@@ -854,9 +886,8 @@ func evidenceClass(class Classification) string {
 // prunable-confirmed proof, so a removal that surprises someone can be argued
 // with from the log rather than guessed at.
 //
-// It is a Debug line and it is per checkout per pass. That is deliberate: the
-// pass runs on the janitor's schedule, not per request, and a classification
-// nobody can reconstruct is the failure mode this exists to prevent.
+// Non-present verdicts are Info lines so an intended checkout's availability
+// can be reconstructed from ordinary logs. Healthy confirmations remain Debug.
 func (r *Reconciler) recordClassification(
 	pass *familyPass,
 	existing store_sqlite.Checkout,

@@ -1,6 +1,8 @@
 package gitstate
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -42,6 +44,8 @@ const (
 type PathEvidence struct {
 	// RootExists is true when the root itself could be statted.
 	RootExists bool
+	// RootMissing is true only for an explicit not-exist result, never permission or I/O failure.
+	RootMissing bool
 	// GitMarkerExists is fresh presence of the checkout .git file or directory.
 	GitMarkerExists bool
 	// RootIdentity is an opaque token that stays the same for the same
@@ -84,6 +88,8 @@ func SamplePathEvidence(root string) PathEvidence {
 			ev.GitMarkerExists = true
 		}
 		ev.VolumeKind, ev.VolumeToken, ev.RootIdentity = pathIdentity(abs, fi)
+	} else {
+		ev.RootMissing = errors.Is(statErr, fs.ErrNotExist)
 	}
 
 	parent := filepath.Dir(abs)

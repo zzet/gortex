@@ -130,9 +130,10 @@ type lifecycleFixture struct {
 	watcher *fakeWatcher
 	notify  *countingNotifier
 	clock   *manualClock
+	logger  *zap.Logger
 }
 
-func newLifecycleFixture(t *testing.T) *lifecycleFixture {
+func newLifecycleFixture(t *testing.T, loggers ...*zap.Logger) *lifecycleFixture {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git binary not available in PATH")
@@ -152,6 +153,9 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	gc.SetConfigPath(f.cfgPath)
 	require.NoError(t, gc.Save())
 
+	if len(loggers) > 0 {
+		f.logger = loggers[0]
+	}
 	f.open()
 	return f
 }
@@ -161,6 +165,10 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 // dropping the whole stack and building a fresh one over the same files.
 func (f *lifecycleFixture) open() {
 	f.t.Helper()
+	logger := f.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	store, err := store_sqlite.Open(f.dbPath)
 	require.NoError(f.t, err)
 	f.store = store
@@ -170,12 +178,12 @@ func (f *lifecycleFixture) open() {
 	require.NoError(f.t, err)
 	f.cm = cm
 
-	f.mi = NewMultiIndexer(store, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
+	f.mi = NewMultiIndexer(store, newTestRegistry(), search.NewNull(), cm, logger)
 	lc, err := NewCheckoutLifecycle(CheckoutLifecycleConfig{
 		MultiIndexer:  f.mi,
 		ConfigManager: cm,
 		Graph:         store,
-		Logger:        zap.NewNop(),
+		Logger:        logger,
 		Reconcile:     lifecycleGrace,
 		Clock:         f.clock.Now,
 	})

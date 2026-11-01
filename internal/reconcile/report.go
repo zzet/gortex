@@ -25,9 +25,8 @@ const (
 	// ActionAvailabilityHeld means the checkout is still unreachable and the
 	// availability axis did not move this pass.
 	ActionAvailabilityHeld CheckoutAction = "availability_held"
-	// ActionMarkedUnavailable is retained for catalog/report compatibility with
-	// older daemons. New passes retire an inaccessible checkout when its grace
-	// expires instead of leaving this terminal state behind.
+	// ActionMarkedUnavailable means serving layers expired while the user's
+	// tracking identity and graph remain available for recovery.
 	ActionMarkedUnavailable        CheckoutAction = "marked_unavailable"
 	ActionPrimaryRetirementRefused CheckoutAction = "primary_retirement_refused"
 	// ActionRemovalGraceStarted means a removal was evidenced and the removal
@@ -88,9 +87,9 @@ type FamilyReport struct {
 	FamilyID string
 	// CommonDir is the shared git directory the pass worked against.
 	CommonDir string
-	// InventoryUsable is false when git could not be trusted this pass. A first
-	// such observation starts availability grace; a later pass at its deadline
-	// may still retire the inaccessible checkout.
+	// InventoryUsable is false when the family could not be inventoried.
+	// Unknown observations freeze checkout clocks; the lifecycle schedules a
+	// bounded runtime retry independently of those durable clocks.
 	InventoryUsable bool
 	// PrimaryGraphID is the family's primary dedicated graph, empty when it
 	// has none.

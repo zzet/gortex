@@ -110,6 +110,7 @@ var sagaPhases = map[sagaKind][]sagaPhase{
 type sagaTarget struct {
 	AttemptID string `json:"cleanup_attempt_id,omitempty"`
 	Cause     string `json:"cause,omitempty"`
+	Root      string `json:"root,omitempty"`
 	// Exact persisted snapshot for one-time legacy recovery; never serialized.
 	journalSnapshot *store_sqlite.CleanupEntry
 	Kind            sagaKind  `json:"kind"`
@@ -334,10 +335,29 @@ func (r *Reconciler) runSaga(ctx context.Context, target sagaTarget) error {
 	if err != nil {
 		return err
 	}
+	if target.CheckoutID == "" && target.GraphID != "" {
+		if graph, found, err := r.catalog.GetDedicatedGraph(ctx, target.GraphID); err != nil {
+			return err
+		} else if found {
+			target.CheckoutID = graph.OwnerCheckoutID
+			if target.FamilyID == "" {
+				target.FamilyID = graph.FamilyID
+			}
+		}
+	}
+	if target.Root == "" && target.CheckoutID != "" {
+		if checkout, found, err := r.catalog.GetCheckout(ctx, target.CheckoutID); err != nil {
+			return err
+		} else if found {
+			target.Root = checkout.RootPath
+		}
+	}
 	if refused, err := r.refuseAutomaticPrimaryClosure(ctx, target); refused || err != nil {
 		return err
 	}
-	r.logger.Info("checkout cleanup: entered", zap.String("family", target.FamilyID), zap.String("checkout", target.CheckoutID), zap.String("graph", target.GraphID), zap.String("cause", target.Cause), zap.String("kind", string(target.Kind)))
+	if r.logger != nil {
+		r.logger.Info("checkout cleanup: entered", zap.String("family", target.FamilyID), zap.String("checkout", target.CheckoutID), zap.String("graph", target.GraphID), zap.String("cause", target.Cause), zap.String("kind", string(target.Kind)), zap.String("root", target.Root), zap.String("disposition", "cleanup"), zap.String("evidence", string(EvidenceNone)), zap.String("detail", string(target.Phase)))
+	}
 
 	// LIFO is intentional: final graph notifications precede release of the
 	// stable-ID gate, so an old finish callback cannot mark a successor done.
@@ -652,9 +672,14 @@ func (r *Reconciler) deleteFamilyRow(ctx context.Context, target sagaTarget) err
 // records it as done for this exact incarnation. It is what an expiring
 // availability grace calls, and the journal entry is what stops a restart from
 // purging the same incarnation a second time.
-func (r *Reconciler) purgeLayersOnce(ctx context.Context, checkout store_sqlite.Checkout) error {
+func (r *Reconciler) purgeLayersOnce(ctx context.Context, checkout store_sqlite.Checkout, causes ...string) error {
+	cause := CauseReconcileAvailability
+	if len(causes) > 0 {
+		cause = causes[0]
+	}
 	target := sagaTarget{
 		Kind:        sagaPurgeLayers,
+		Cause:       cause,
 		CheckoutID:  checkout.CheckoutID,
 		Incarnation: checkout.Incarnation,
 		FamilyID:    checkout.FamilyID,
