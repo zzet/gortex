@@ -48,6 +48,7 @@ type Engine struct {
 	// pre-materialised (the bundle fast path) predates the overlay and
 	// has to be re-read through the reader before it can be trusted.
 	overlay *graph.OverlayLayer
+	layers  []graph.OverlayLayerReader
 	// viewLayers are the persisted generations stacked in the reader,
 	// bottom first, empty for a plain base reader. Each carries its own
 	// text corpus, so candidate enumeration queries them alongside the
@@ -135,6 +136,7 @@ func (e *Engine) WithReader(r graph.Reader) *Engine {
 	clone := *e
 	clone.g = r
 	clone.overlay = nil
+	clone.layers = nil
 	// A reader swap re-decides which corpora answer, so the stack the
 	// previous reader named never carries over — WithViewLayers is the
 	// only way one is bound.
@@ -142,6 +144,9 @@ func (e *Engine) WithReader(r graph.Reader) *Engine {
 	clone.viewExcludesBase = false
 	if view, ok := r.(overlayLayered); ok {
 		clone.overlay = view.Layer()
+		if clone.overlay != nil {
+			clone.layers = []graph.OverlayLayerReader{clone.overlay}
+		}
 	}
 	return &clone
 }
@@ -943,7 +948,7 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 			bundleCtx = search.WithSymbolBundleTimingsObserver(ctx, timings.BundleLegs.Add)
 		}
 		var answer requestBundleAnswer
-		if len(opts.SearchPathPrefixes) > 0 && !viewLayered && e.overlay == nil {
+		if len(opts.SearchPathPrefixes) > 0 && !viewLayered && e.overlay == nil && len(e.layers) == 0 {
 			answer = requestPathScopedSymbolBundles(bundleCtx, backend, query, repoAllowList(opts.RepoAllow), opts.SearchPathPrefixes, fetchLimit*2)
 		}
 		if allow := repoAllowList(opts.RepoAllow); !answer.authoritative && len(allow) > 0 {
@@ -964,22 +969,14 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 		if timings != nil {
 			timings.BundleMS += time.Since(bundleStart).Milliseconds()
 		}
-		// A per-request overlay reader invalidates the bundle payload:
-		// the backend indexes the base graph, so a symbol the buffer
-		// replaced arrives carrying its pre-edit node, and a symbol the
-		// buffer deleted arrives at all. Keep the BM25 ranking — the
-		// scores are still the corpus's answer — and drop the payload:
-		// every hit falls through to the view-aware batched lookup
-		// below, which substitutes the overlay's node and omits the IDs
-		// the view no longer exposes.
-		//
-		// A composed view invalidates it for the same reason one level
-		// down: the bundle's payload is the indexed corpus's row, and a
-		// generation in the stack may have replaced or deleted it.
-		rehydrateThroughReader := e.overlay != nil || viewLayered
+		// Ownership is explicit even when the runtime wraps the view reader.
+		// Keep each safe base payload and adjacency; only affected hits fall back
+		// to the composed reader. Partial adjacency seeds remain partial.
+
 		if len(bundles) > 0 {
 			bundleHandled = true
 			textResults = make([]search.SearchResult, 0, len(bundles))
+			allEdgesSeeded := true
 			outSeed := make(map[string][]*graph.Edge, len(bundles))
 			inSeed := make(map[string][]*graph.Edge, len(bundles))
 			for _, b := range bundles {
@@ -987,31 +984,20 @@ func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limi
 					continue
 				}
 				textResults = append(textResults, search.SearchResult{ID: b.Node.ID, Score: b.Score})
-				if rehydrateThroughReader {
+				if !e.bundleNodeNeedsReader(b.Node) {
+					bundleNodeByID[b.Node.ID] = b.Node
+				}
+				if e.bundleEdgesNeedReader(b) {
+					allEdgesSeeded = false
 					continue
 				}
-				bundleNodeByID[b.Node.ID] = b.Node
 				outSeed[b.Node.ID] = b.OutEdges
 				inSeed[b.Node.ID] = b.InEdges
 			}
-			// Seed the rerank context's edge caches so prepare() can
-			// skip its own batched fetch for the bundle-covered IDs.
-			// preSeeded=true is the contract that prepare's batched
-			// edge fetch is now redundant — see rerank.Context for the
-			// invariant the engine relies on (the next caller's
-			// candidate set is fully covered by these maps for the
-			// BM25 hits; vector / substring fallback hits are still
-			// served by the per-candidate accessor fallback).
-			//
-			// Under an overlay the seed is skipped entirely rather than
-			// filtered down to the uncovered files: the layer also
-			// *introduces* edges no base bundle carries, so no subset of
-			// base edges can honour the pre-seed contract. Dropping it
-			// hands the fetch back to the rerank pass, which reads
-			// through the same overlay-aware reader.
-			if rctx != nil && !rehydrateThroughReader {
-				rctx.SeedEdgeCaches(inSeed, outSeed, true)
+			if rctx != nil && len(outSeed) > 0 {
+				rctx.SeedEdgeCaches(inSeed, outSeed, allEdgesSeeded)
 			}
+
 		} else if scopedAnswered {
 			// A scoped query that answered zero IS the answer. Leaving
 			// bundleHandled false here would send the miss down the

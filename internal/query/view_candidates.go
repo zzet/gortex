@@ -43,6 +43,11 @@ func (e *Engine) WithViewLayers(r graph.Reader, layers []ViewLayerSource) *Engin
 		return clone
 	}
 	clone.viewLayers = layers
+	for _, source := range layers {
+		if source.Layer != nil {
+			clone.layers = append(clone.layers, source.Layer)
+		}
+	}
 	return clone
 }
 
