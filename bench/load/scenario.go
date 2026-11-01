@@ -101,7 +101,11 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	p := o.smokeState
 	var err error
 	if p == nil {
-		if scenario==checkoutDiscoveryScenario && o.Discovery.Resume!="" {p,err=resumeDiscoveryState(ctx,o,selected)} else {p, err = newPrivateRun(ctx, outputRoot, o.Binary, selected)}
+		if scenario == checkoutDiscoveryScenario && o.Discovery.Resume != "" {
+			p, err = resumeDiscoveryState(ctx, o, selected)
+		} else {
+			p, err = newPrivateRun(ctx, outputRoot, o.Binary, selected)
+		}
 	} else {
 		err = validateSmokeOwner(p, o.Binary, selected)
 	}
@@ -109,7 +113,13 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		return phase, nil, artifacts, crashes, "", err
 	}
 	artifacts["private_root"] = p.Root
- if scenario==checkoutDiscoveryScenario && o.Discovery.Resume!="" {raw,err:=os.ReadFile(o.Discovery.Resume);if err!=nil{return phase,nil,artifacts,crashes,"",err};phase.Gate["discovery_seed_lineage"]=json.RawMessage(raw)}
+	if scenario == checkoutDiscoveryScenario && o.Discovery.Resume != "" {
+		raw, err := os.ReadFile(o.Discovery.Resume)
+		if err != nil {
+			return phase, nil, artifacts, crashes, "", err
+		}
+		phase.Gate["discovery_seed_lineage"] = json.RawMessage(raw)
+	}
 	firstStart := p.startCount + 1
 	if o.smokeState != nil {
 		info, statErr := os.Stat(p.Store)
@@ -169,22 +179,33 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	warmCtx, cancelWarm := context.WithTimeout(ctx, o.WarmTimeout)
 	defer cancelWarm()
 	var configured []privateRepo
- if scenario==checkoutDiscoveryScenario {configured,err=p.writeDiscoveryBootRepos()}else{configured,err=p.writeBootRepos(scenario == "worktrees")}
+	if scenario == checkoutDiscoveryScenario {
+		configured, err = p.writeDiscoveryBootRepos()
+	} else {
+		configured, err = p.writeBootRepos(scenario == "worktrees")
+	}
 	if err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
-	if scenario==checkoutDiscoveryScenario && o.Discovery.StallFirst {
- release,files,err:=p.installDiscoveryFault();if err!=nil{return phase,nil,artifacts,crashes,"",err}
- for name,path:=range files {artifacts[name]=path}
- defer func(){
- resultErr=errors.Join(resultErr,release())
- raw,err:=os.ReadFile(files["discovery_git_events"])
- observed:=err==nil && len(bytes.TrimSpace(raw))>0
- phase.Gate["discovery_git_fault"],_=json.Marshal(map[string]any{"configured":true,"observed":observed,"raw_events":string(raw),"absolute_child_bound_seconds":60})
- if !observed {resultErr=errors.Join(resultErr,errors.New("Git stall never entered the intended new checkout"),err)}
- }()
- }
- coldStart := time.Now()
+	if scenario == checkoutDiscoveryScenario && o.Discovery.StallFirst {
+		release, files, err := p.installDiscoveryFault()
+		if err != nil {
+			return phase, nil, artifacts, crashes, "", err
+		}
+		for name, path := range files {
+			artifacts[name] = path
+		}
+		defer func() {
+			resultErr = errors.Join(resultErr, release())
+			raw, err := os.ReadFile(files["discovery_git_events"])
+			observed := err == nil && len(bytes.TrimSpace(raw)) > 0
+			phase.Gate["discovery_git_fault"], _ = json.Marshal(map[string]any{"configured": true, "observed": observed, "raw_events": string(raw), "absolute_child_bound_seconds": 60})
+			if !observed {
+				resultErr = errors.Join(resultErr, errors.New("Git stall never entered the intended new checkout"), err)
+			}
+		}()
+	}
+	coldStart := time.Now()
 	if err := p.start(); err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
@@ -243,11 +264,13 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	for i := range p.Repos {
 		for _, tracked := range readinessState.TrackedRepos {
 			if filepath.Clean(tracked.Path) == filepath.Clean(p.Repos[i].Path) {
-				if scenario==checkoutDiscoveryScenario && o.Discovery.Resume!="" && p.Repos[i].Prefix!=tracked.Prefix {return phase,nil,artifacts,crashes,"",errors.New("resumed discovery changed a prepared repository identity prefix")}
- p.Repos[i].Prefix = tracked.Prefix
+				if scenario == checkoutDiscoveryScenario && o.Discovery.Resume != "" && p.Repos[i].Prefix != tracked.Prefix {
+					return phase, nil, artifacts, crashes, "", errors.New("resumed discovery changed a prepared repository identity prefix")
+				}
+				p.Repos[i].Prefix = tracked.Prefix
 			}
 		}
-		if i > 0 && scenario == "worktrees" || i>=2 && scenario==checkoutDiscoveryScenario {
+		if i > 0 && scenario == "worktrees" || i >= 2 && scenario == checkoutDiscoveryScenario {
 			p.Repos[i].Prefix = p.Repos[0].Prefix
 		}
 		if p.Repos[i].Prefix == "" {
@@ -277,7 +300,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		version = client.version
 		if i < len(p.Repos) {
 			subscribeInvalidations(warmCtx, client, repo.Corpus.Label, o.Deadline, &phase)
-			if err := preflightRoot(warmCtx, p, client, repo, scenario == "worktrees" && i > 0 || scenario==checkoutDiscoveryScenario && i>=2, o.Deadline, &phase); err != nil {
+			if err := preflightRoot(warmCtx, p, client, repo, scenario == "worktrees" && i > 0 || scenario == checkoutDiscoveryScenario && i >= 2, o.Deadline, &phase); err != nil {
 				return phase, nil, artifacts, crashes, version, err
 			}
 			gate, rows, err := warmAnalysis(warmCtx, client, o.Deadline)

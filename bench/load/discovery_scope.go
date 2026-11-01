@@ -15,9 +15,9 @@ const checkoutDiscoveryScenario = "worktree-discovery"
 
 type checkoutDiscoveryObservation struct {
 	Root         string          `json:"root"`
- FamilyRole string `json:"family_role"`
- Prefix string `json:"repo_prefix"`
- Query string `json:"query"`
+	FamilyRole   string          `json:"family_role"`
+	Prefix       string          `json:"repo_prefix"`
+	Query        string          `json:"query"`
 	Added        time.Time       `json:"added"`
 	FirstRequest time.Time       `json:"first_request"`
 	ExactAt      time.Time       `json:"exact_at"`
@@ -37,12 +37,12 @@ type checkoutCWDCounts struct {
 }
 
 type checkoutDiscoveryReport struct {
-	ForeignCapacityRefusals int `json:"foreign_capacity_refusals"`
- PendingRefusals        int                            `json:"pending_refusals"`
-	Checkouts              []checkoutDiscoveryObservation `json:"checkouts"`
-	ByCWD                  map[string]checkoutCWDCounts   `json:"by_cwd"`
-	OutsidePendingRefusals int                            `json:"outside_pending_refusals"`
-	OutsidePendingErrors   int                            `json:"outside_pending_errors"`
+	ForeignCapacityRefusals int                            `json:"foreign_capacity_refusals"`
+	PendingRefusals         int                            `json:"pending_refusals"`
+	Checkouts               []checkoutDiscoveryObservation `json:"checkouts"`
+	ByCWD                   map[string]checkoutCWDCounts   `json:"by_cwd"`
+	OutsidePendingRefusals  int                            `json:"outside_pending_refusals"`
+	OutsidePendingErrors    int                            `json:"outside_pending_errors"`
 }
 
 // A refusal belongs to a pending checkout only while its discovery is
@@ -73,7 +73,12 @@ func summarizeCheckoutDiscovery(attempts []Attempt, checkouts []checkoutDiscover
 		for _, checkout := range checkouts {
 			if inside(checkout.Root, a.CWD) {
 				row.Class = "new_worktree"
- if checkout.FamilyRole == "foreign" { row.Class = "foreign_new_worktree"; if a.Code != 0 && (a.ErrorData["reason"] == "family_capacity" || a.ErrorData["reason"] == "stuck_capacity") {out.ForeignCapacityRefusals++} }
+				if checkout.FamilyRole == "foreign" {
+					row.Class = "foreign_new_worktree"
+					if a.Code != 0 && (a.ErrorData["reason"] == "family_capacity" || a.ErrorData["reason"] == "stuck_capacity") {
+						out.ForeignCapacityRefusals++
+					}
+				}
 			}
 		}
 		if a.Role == "workload" && !strings.HasPrefix(a.Tool, "edit.") {
@@ -141,8 +146,10 @@ func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRu
 		}
 		report := summarizeCheckoutDiscovery(phase.Attempts[first:], checkouts, frozen.Repos[0].Path, frozen.Repos[1].Path)
 		phase.Gate["checkout_discovery"], _ = json.Marshal(report)
-		if o.Discovery.StallFirst && report.PendingRefusals==0 {resultErr=errors.Join(resultErr,errors.New("Git stall produced no pending refusal exposure"))}
- if report.OutsidePendingRefusals > 0 || report.OutsidePendingErrors > 0 || report.ForeignCapacityRefusals > 0 {
+		if o.Discovery.StallFirst && report.PendingRefusals == 0 {
+			resultErr = errors.Join(resultErr, errors.New("Git stall produced no pending refusal exposure"))
+		}
+		if report.OutsidePendingRefusals > 0 || report.OutsidePendingErrors > 0 || report.ForeignCapacityRefusals > 0 {
 			resultErr = errors.Join(resultErr, fmt.Errorf("checkout discovery affected other cwds: %d refusals, %d errors, %d foreign capacity refusals", report.OutsidePendingRefusals, report.OutsidePendingErrors, report.ForeignCapacityRefusals))
 		}
 		if parent.Err() != nil {
@@ -162,14 +169,16 @@ func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRu
 		case <-ticker.C:
 		}
 		if len(checkouts) < o.Worktrees && !time.Now().Before(nextAdd) {
-			family := len(checkouts)%2
- if err := p.addDiscoveryWorktree(ctx, family); err != nil {
+			family := len(checkouts) % 2
+			if err := p.addDiscoveryWorktree(ctx, family); err != nil {
 				return err
 			}
 			repo := p.Repos[len(p.Repos)-1]
-			role:="primary"
- if family==1 {role="foreign"}
-			entry := checkoutDiscoveryObservation{Root: repo.Path, FamilyRole:role,Prefix:repo.Prefix,Query:repo.Corpus.Query, Added: time.Now(), ExactViewLag: unavailable("ms", "no exact worktree view observed before phase end")}
+			role := "primary"
+			if family == 1 {
+				role = "foreign"
+			}
+			entry := checkoutDiscoveryObservation{Root: repo.Path, FamilyRole: role, Prefix: repo.Prefix, Query: repo.Corpus.Query, Added: time.Now(), ExactViewLag: unavailable("ms", "no exact worktree view observed before phase end")}
 			checkouts = append(checkouts, entry)
 			nextAdd = nextAdd.Add(interval)
 			subdir := filepath.Join(repo.Path, ".discovery-probe")
