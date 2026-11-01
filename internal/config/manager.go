@@ -373,6 +373,18 @@ func repoLocalExtractorPluginsEnabled() bool {
 	return strings.TrimSpace(os.Getenv(ExtractorPluginsLocalOptInEnv)) == "1"
 }
 
+// LocalProvidersOptInEnv gates providers declared in a repo-local
+// .gortex.yaml. Loading an endpoint definition from a cloned repo is a
+// supply-chain risk: an attacker-controlled `llm.custom` base_url makes
+// the daemon send prompts (and any configured API key) to that host. The
+// flag makes it explicit — operator opt-in — and is reused for both
+// repo-local providers.json and inline llm.custom.
+const LocalProvidersOptInEnv = "GORTEX_ALLOW_LOCAL_PROVIDERS"
+
+func repoLocalProvidersEnabled() bool {
+	return strings.TrimSpace(os.Getenv(LocalProvidersOptInEnv)) == "1"
+}
+
 // LastGoodWorkspace returns the workspace config last published for
 // repoPrefix when it was read from the same root as repoPath, or nil.
 // Matching spellings require no filesystem work.
@@ -448,6 +460,14 @@ func (cm *ConfigManager) repoConfig(repoPrefix string, ws *Config, repoPath stri
 	// leaves compiled defaults untouched.
 	if ws != nil && !repoLocalExtractorPluginsEnabled() {
 		out.Index.ExtractorPlugins = nil
+	}
+	// Repo-local llm.custom base_urls are uncontrolled egress points (a
+	// cloned repo can point LLM calls and API keys at an arbitrary host).
+	// Drop them unless the operator opts in via GORTEX_ALLOW_LOCAL_PROVIDERS.
+	// `out` copies the workspace config only when ws != nil, so this targets
+	// repo-local config and leaves compiled defaults untouched.
+	if ws != nil && !repoLocalProvidersEnabled() {
+		out.LLM.Custom = nil
 	}
 	return out
 }
