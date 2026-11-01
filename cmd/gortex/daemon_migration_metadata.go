@@ -35,9 +35,9 @@ type migrationMetadataDispatcher struct {
 func newMigrationMetadataDispatcher(cfg *config.Config, logger *zap.Logger, reporter *daemonStartupReporter) *migrationMetadataDispatcher {
 	policy := gortexmcp.ToolPolicyConfig{Preset: cfg.MCP.Tools.Preset, Mode: cfg.MCP.Tools.Mode, Allow: cfg.MCP.Tools.Allow, Deny: cfg.MCP.Tools.Deny, OperatorPinned: cfg.MCP.Tools.Explicit}
 	// Metadata registration needs no graph or query engine. Every graph call
- // is refused by this dispatcher until the real durable runtime is handed
- // over, so constructing an in-memory persistence substitute is unnecessary.
- server := gortexmcp.NewServer(nil, nil, nil, nil, logger, nil, gortexmcp.MultiRepoOptions{ToolPolicy: &policy})
+	// is refused by this dispatcher until the real durable runtime is handed
+	// over, so constructing an in-memory persistence substitute is unnecessary.
+	server := gortexmcp.NewServer(nil, nil, nil, nil, logger, nil, gortexmcp.MultiRepoOptions{ToolPolicy: &policy})
 	return &migrationMetadataDispatcher{catalog: newMCPDispatcher(server, nil, logger), reporter: reporter, sessions: &sync.Map{}}
 }
 
