@@ -2537,6 +2537,29 @@ func (w *Watcher) recordInStormEvent(path string, kind ChangeKind, native bool) 
 			w.stormGenerations[path] = generation
 		}
 	}
+	// A native-only storm path has no stopped point timer to adopt. Give it
+	// the same path generation and live ticket evidence as point admission.
+	if w.stormGenerations[path] == 0 {
+		w.nextGeneration++
+		generation := w.nextGeneration
+		if w.stormGenerations == nil {
+			w.stormGenerations = make(map[string]uint64)
+		}
+		if w.pendingGeneration == nil {
+			w.pendingGeneration = make(map[string]uint64)
+		}
+		if w.mutationWaiters == nil {
+			w.mutationWaiters = make(map[string]map[uint64]mutationWaiter)
+		}
+		if w.mutationWaiters[path] == nil {
+			w.mutationWaiters[path] = make(map[uint64]mutationWaiter)
+		}
+		done := make(chan MutationResult, 1)
+		ticket := newMutationTierTicket(path, generation, done)
+		w.mutationWaiters[path][generation] = mutationWaiter{done: done, ticket: ticket}
+		w.pendingGeneration[path] = generation
+		w.stormGenerations[path] = generation
+	}
 	w.mu.Unlock()
 	w.stormBatch[path] = kind
 	w.stormRetryAttempt = 0

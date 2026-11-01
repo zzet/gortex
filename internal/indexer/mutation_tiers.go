@@ -97,7 +97,8 @@ func (w *Watcher) finishMutationTierLocked(path string, ticket *MutationTicket, 
 	}
 }
 
-// TierPaths returns only outstanding paths and retained per-path failures.
+// TierPaths returns outstanding paths and unrepaired per-path failures.
+// Receipt expiry is not content evidence; only a successful patch retires gaps.
 // It shares the waiter's existing path index; idle reads allocate no map.
 func (w *Watcher) TierPaths() map[string]MutationTierState {
 	w.mu.Lock()
@@ -112,10 +113,6 @@ func (w *Watcher) TierPaths() map[string]MutationTierState {
 		}
 	}
 	for path, state := range w.failedPaths {
-		if time.Since(state.failedAt) >= 10*time.Minute {
-			delete(w.failedPaths, path)
-			continue
-		}
 		put(path, state)
 	}
 	for path, byGeneration := range w.mutationWaiters {
@@ -133,10 +130,6 @@ func (w *Watcher) TierState(path string) MutationTierState {
 	defer w.mu.Unlock()
 	path = filepath.Clean(path)
 	state := w.failedPaths[path]
-	if !state.failedAt.IsZero() && time.Since(state.failedAt) >= 10*time.Minute {
-		delete(w.failedPaths, path)
-		state = MutationTierState{}
-	}
 	for generation, waiter := range w.mutationWaiters[path] {
 		if generation >= state.Generation && waiter.ticket != nil {
 			state = waiter.ticket.TierState()
