@@ -45,7 +45,7 @@ func emitGoTypeArgReferences(root *sitter.Node, src []byte, filePath, fileID str
 	if root == nil {
 		return
 	}
-	typeParams := collectGoTypeParamNames(root, src)
+	typeParams, containers := collectGoTypeReferenceWork(root, src)
 	seen := map[string]bool{}
 	emit := func(name string, line int) {
 		t := canonicalizeGoTypeRef(name)
@@ -101,7 +101,7 @@ func emitGoTypeArgReferences(root *sitter.Node, src []byte, filePath, fileID str
 		}
 	}
 
-	walkNodes(root, func(n *sitter.Node) {
+	for _, n := range containers {
 		switch n.Type() {
 		case "type_arguments":
 			// Generic instantiation arguments: the bracketed list under a
@@ -137,18 +137,26 @@ func emitGoTypeArgReferences(root *sitter.Node, src []byte, filePath, fileID str
 				}
 			}
 		}
-	})
+	}
 }
 
-// collectGoTypeParamNames returns the set of every type-parameter name
+// collectGoTypeReferenceWork collects every type-parameter name
 // declared anywhere in the file (function, method, or type generic
 // parameter lists). These names are NOT real types — a generic
 // instantiation `List[T]` inside `func F[T any]` must not emit a
 // reference to a phantom type `T` — so the type-arg pass skips them.
-func collectGoTypeParamNames(root *sitter.Node, src []byte) map[string]bool {
+// Containers keep the original preorder, but emission waits until every name
+// is known, including later declarations. Their wrappers remain within the
+// caller's existing scratch lifetime.
+func collectGoTypeReferenceWork(root *sitter.Node, src []byte) (map[string]bool, []*sitter.Node) {
 	out := map[string]bool{}
+	var containers []*sitter.Node
 	walkNodes(root, func(n *sitter.Node) {
 		t := n.Type()
+		if t == "type_arguments" || t == "map_type" || t == "channel_type" {
+			containers = append(containers, n)
+			return
+		}
 		if t != "type_parameter_declaration" && t != "parameter_declaration" {
 			return
 		}
@@ -172,5 +180,5 @@ func collectGoTypeParamNames(root *sitter.Node, src []byte) map[string]bool {
 			}
 		}
 	})
-	return out
+	return out, containers
 }
