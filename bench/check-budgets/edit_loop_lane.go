@@ -28,14 +28,14 @@ func makeEditLoopLanePlan(p policy, c laneConfig) (lanePlan, error) {
 	for _, scenario := range scenarios {
 		for repeat := 1; repeat <= max(3, c.Repeats); repeat++ {
 			task := laneTask{Scenario: scenario, Role: "candidate", Repeat: repeat, Seed: int64(repeat), EditGate: true, EditCount: 100, ProbeModes: []string{"json", "toon", "compact", "facade", "cli"}}
-			if scenario == "loadedit-4-largefile" {
+			if scenario == "loadedit-4-largefile" && c.LargeFileManifest == "" {
 				task.Unavailable = "large-file gate needs actual >=10000-line target admission; a scenario alias is not evidence"
 			}
 			plan.Tasks = append(plan.Tasks, task)
 		}
 	}
-	if c.Lane == "nightly" {
-		plan.Prerequisites = append(plan.Prerequisites, "large-file actual target-line census not yet bound to this lane")
+	if c.Lane == "nightly" && c.LargeFileManifest == "" {
+		plan.Prerequisites = append(plan.Prerequisites, "separate large_file_manifest required; actual >=10000-line admission is validated from each report")
 	}
 	plan.Ready = len(plan.Prerequisites) == 0
 	return plan, nil

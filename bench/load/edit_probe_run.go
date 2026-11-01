@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,7 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
+	AdmittedTargetLines      *int                      `json:"admitted_target_lines,omitempty"`
 	MutationTiers            *editProbeLiveTiers       `json:"mutation_tiers,omitempty"`
 	GateReadback             *Metric                   `json:"t_gate_readback_ms,omitempty"`
 	ACKReadbackExact         *bool                     `json:"ack_readback_exact,omitempty"`
@@ -738,6 +740,22 @@ func (r *editProbeRuntime) beginEdit(ctx context.Context, step editProbeStep) (*
 	s.record.StartedNS = &ns
 	s.record.StartLatenessNS = &late
 	s.record.Outcome = "in_flight"
+	if r.plan.GateModes {
+		initial := r.original
+		if len(r.p.Repos) > 1 {
+			initial = nil
+			if repo, err := r.repoFor(step); err == nil {
+				initial = r.originals[repo.Path]
+			}
+		}
+		if initial != nil {
+			lines := bytes.Count(initial, []byte{'\n'})
+			if len(initial) > 0 && initial[len(initial)-1] != '\n' {
+				lines++
+			}
+			s.record.AdmittedTargetLines = &lines
+		}
+	}
 	if s.record.ActivatedNS == nil {
 		s.record.Errors = append(s.record.Errors, "missing pre-edit activation")
 	}

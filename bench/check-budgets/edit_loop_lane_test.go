@@ -56,7 +56,7 @@ func TestEditLoopLanePlanKeepsSmokeAndNightlyDenominators(t *testing.T) {
 }
 
 func TestEditLoopTaskActuallySelectsGateInsteadOfLegacyEditTraffic(t *testing.T) {
-	for _, scenario := range []string{"loadedit-4", "multirepoedit-6"} {
+	for _, scenario := range []string{"loadedit-4", "multirepoedit-6", "loadedit-4-largefile"} {
 		t.Run(scenario, func(t *testing.T) {
 			var task laneTask
 			if err := json.Unmarshal([]byte(`{"scenario":"`+scenario+`","role":"candidate","repeat":1,"edit_gate":true}`), &task); err != nil {
@@ -75,6 +75,9 @@ func TestEditLoopTaskActuallySelectsGateInsteadOfLegacyEditTraffic(t *testing.T)
 			}
 			if arg("--scenario") != "edit-and-probe" || arg("--agents") != "0" || arg("--edit-count") != "100" || !slices.Contains(args, "--edit-gate-modes") {
 				t.Errorf("actual process still runs legacy edit traffic: %v", args)
+			}
+			if scenario == "loadedit-4-largefile" && (arg("--edit-repos") != "1" || arg("--edit-agents") != "4") {
+				t.Errorf("large-file row has no actual4-editor target: %v", args)
 			}
 			if scenario == "multirepoedit-6" && (arg("--edit-repos") != "6" || arg("--edit-agents") != "6") {
 				t.Errorf("six-repository row lost real routing: %v", args)

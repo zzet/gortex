@@ -632,6 +632,16 @@
                             }
                           ]
                         },
+                        "admitted_target_lines": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "batch": {
                           "anyOf": [
                             {

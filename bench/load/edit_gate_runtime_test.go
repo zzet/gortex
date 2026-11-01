@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -378,6 +380,50 @@ func TestEditGateCompactCoverageRequiresPostACKSemanticAndRefusalProof(t *testin
 			}
 			if tool.Correct == nil || *tool.Correct != want {
 				t.Errorf("compact semantic witness borrowed pre-ACK, wrong or undecoded content: %s", data)
+			}
+		})
+	}
+}
+
+func TestEditGateRetainsActualAdmittedTargetLineCount(t *testing.T) {
+	for _, lines := range []int{9999, 10000, 10001} {
+		t.Run(fmt.Sprint(lines), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			c := editProbeCorpus()
+			plan, err := makeEditProbePlan(c, 42, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.GateModes = true
+			plan.Steps[0].ProbeMode = "json"
+			dir := t.TempDir()
+			source := "package fixture\r\n" + strings.Repeat("// padding\r\n", lines-2) + c.EditAnchor
+			file := filepath.Join(dir, c.File)
+			if err := os.WriteFile(file, []byte(source), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			run := newEditProbeStubRun(t, ctx, c, plan, dir, 1, func(stubFrame) (any, *rpcError) { return stubContent(map[string]any{}), nil })
+			defer run.states[0].finishRaw()
+			// Later bytes cannot promote an initially small target into the
+			// separate large-file admission class.
+			if err := os.WriteFile(file, []byte(source+"\n"+strings.Repeat("// later\n", 10000)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, _, finish, _ := run.beginEdit(ctx, plan.Steps[0])
+			finish()
+			data, err := json.Marshal(run.states[0].record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire struct {
+				Lines *int `json:"admitted_target_lines"`
+			}
+			if err := json.Unmarshal(data, &wire); err != nil {
+				t.Fatal(err)
+			}
+			if wire.Lines == nil || *wire.Lines != lines {
+				t.Errorf("target class was omitted or borrowed from later bytes: %s", data)
 			}
 		})
 	}

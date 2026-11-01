@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -244,6 +245,97 @@ func TestEditLoopCompactQualificationNeverWaivesMissingProof(t *testing.T) {
 				}
 			} else if row.State == "PASS" || row.State == "UNOBSERVABLE" || row.Value != nil {
 				t.Errorf("missing compact proof qualified: %+v", row)
+			}
+		})
+	}
+}
+
+func TestEditLoopLargeFileRequiresActualTargetCensus(t *testing.T) {
+	for _, variant := range []string{"complete", "small", "missing"} {
+		t.Run(variant, func(t *testing.T) {
+			r := editLoopEvidenceFixture(t)
+			var raw map[string]any
+			if err := json.Unmarshal(r.Phases[0].EditProbe, &raw); err != nil {
+				t.Fatal(err)
+			}
+			for _, value := range raw["edits"].([]any) {
+				value.(map[string]any)["admitted_target_lines"] = 10000
+			}
+			first := raw["edits"].([]any)[0].(map[string]any)
+			if variant == "small" {
+				first["admitted_target_lines"] = 9999
+			}
+			if variant == "missing" {
+				delete(first, "admitted_target_lines")
+			}
+			data, err := json.Marshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Phases[0].EditProbe = data
+			config := inputs{CandidateRevision: strings.Repeat("a", 40), Hosts: map[string]string{"reference_linux": "synthetic-host"}}
+			err = validateEditLoopReport(config, runInput{Role: "candidate", HostClass: "reference_linux", Scenario: "loadedit-4-largefile"}, r)
+			if (err == nil) != (variant == "complete") {
+				t.Errorf("large-file alias accepted without actual target admission, variant%s error%v", variant, err)
+			}
+		})
+	}
+}
+
+func TestEditLoopSixRepoCellRequiresPinnedRoutedEvidence(t *testing.T) {
+	for _, variant := range []string{"complete", "missing_routes", "duplicate_route", "foreign_record", "foreign_pin", "one_corpus"} {
+		t.Run(variant, func(t *testing.T) {
+			r := editLoopEvidenceFixture(t)
+			var raw, workload map[string]any
+			if err := json.Unmarshal(r.Phases[0].EditProbe, &raw); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(r.Workload, &workload); err != nil {
+				t.Fatal(err)
+			}
+			workload["edit_agents"] = 6
+			plan := raw["plan"].(map[string]any)
+			plan["editors"] = 6
+			routes := make([]any, 6)
+			r.Corpus = nil
+			for i := range 6 {
+				label := fmt.Sprintf("repo-%d", i)
+				commit := fmt.Sprintf("%040x", i+1)
+				routes[i] = map[string]any{"id": label, "repo": label, "commit": commit, "file": "fixture.go", "kind": "add_intrafile_call", "tool": "edit.file", "language": "go", "mode": "json"}
+				r.Corpus = append(r.Corpus, map[string]any{"label": label, "commit": commit})
+			}
+			plan["routes"] = routes
+			for i, value := range raw["edits"].([]any) {
+				record := value.(map[string]any)
+				step := plan["steps"].([]any)[i].(map[string]any)
+				label := fmt.Sprintf("repo-%d", i%6)
+				record["editor"], record["route"], step["editor"], step["route"] = i%6, label, i%6, label
+			}
+			switch variant {
+			case "missing_routes":
+				delete(plan, "routes")
+			case "duplicate_route":
+				routes[1].(map[string]any)["id"] = routes[0].(map[string]any)["id"]
+			case "foreign_record":
+				raw["edits"].([]any)[0].(map[string]any)["route"] = "repo-1"
+			case "foreign_pin":
+				routes[0].(map[string]any)["commit"] = strings.Repeat("f", 40)
+			case "one_corpus":
+				r.Corpus = r.Corpus[:1]
+			}
+			var err error
+			r.Workload, err = json.Marshal(workload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Phases[0].EditProbe, err = json.Marshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := inputs{CandidateRevision: strings.Repeat("a", 40), Hosts: map[string]string{"reference_linux": "synthetic-host"}}
+			err = validateEditLoopReport(config, runInput{Role: "candidate", HostClass: "reference_linux", Scenario: "multirepoedit-6"}, r)
+			if (err == nil) != (variant == "complete") {
+				t.Errorf("six-repo alias borrowed unproved routes, variant%s error%v", variant, err)
 			}
 		})
 	}

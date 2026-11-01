@@ -41,23 +41,24 @@ type laneBuild struct {
 }
 
 type laneConfig struct {
-	Version          int                  `json:"schema_version"`
-	Lane             string               `json:"lane"`
-	HostClass        string               `json:"host_class"`
-	Machine          string               `json:"machine"`
-	Load             string               `json:"load_binary"`
-	Manifest         string               `json:"manifest"`
-	MainArtifact     string               `json:"main_artifact,omitempty"`
-	Builds           map[string]laneBuild `json:"builds"`
-	Repeats          int                  `json:"repeats"`
-	Duration         string               `json:"duration"`
-	Deadline         string               `json:"deadline"`
-	WarmTimeout      string               `json:"warm_timeout"`
-	StopTimeout      string               `json:"stop_timeout"`
-	SweepDuration    string               `json:"sweep_duration"`
-	SweepRepetitions int                  `json:"sweep_repetitions"`
-	PRSmokeDrain     string               `json:"pr_smoke_drain,omitempty"`
-	started          time.Time
+	Version           int                  `json:"schema_version"`
+	Lane              string               `json:"lane"`
+	HostClass         string               `json:"host_class"`
+	Machine           string               `json:"machine"`
+	Load              string               `json:"load_binary"`
+	Manifest          string               `json:"manifest"`
+	LargeFileManifest string               `json:"large_file_manifest,omitempty"`
+	MainArtifact      string               `json:"main_artifact,omitempty"`
+	Builds            map[string]laneBuild `json:"builds"`
+	Repeats           int                  `json:"repeats"`
+	Duration          string               `json:"duration"`
+	Deadline          string               `json:"deadline"`
+	WarmTimeout       string               `json:"warm_timeout"`
+	StopTimeout       string               `json:"stop_timeout"`
+	SweepDuration     string               `json:"sweep_duration"`
+	SweepRepetitions  int                  `json:"sweep_repetitions"`
+	PRSmokeDrain      string               `json:"pr_smoke_drain,omitempty"`
+	started           time.Time
 }
 
 type laneTask struct {
@@ -162,6 +163,9 @@ func readLaneConfig(path string, editGate ...bool) (laneConfig, error) {
 		return filepath.Join(base, value)
 	}
 	c.Load, c.Manifest = resolve(c.Load), resolve(c.Manifest)
+	if c.LargeFileManifest != "" {
+		c.LargeFileManifest = resolve(c.LargeFileManifest)
+	}
 	if c.MainArtifact != "" {
 		c.MainArtifact = resolve(c.MainArtifact)
 	}
@@ -401,7 +405,11 @@ func writeNewJSON(path string, value any) error {
 }
 
 func taskManifest(c laneConfig, task laneTask, root string) (string, error) {
-	data, err := os.ReadFile(c.Manifest)
+	manifest := c.Manifest
+	if task.EditGate && task.Scenario == "loadedit-4-largefile" {
+		manifest = c.LargeFileManifest
+	}
+	data, err := os.ReadFile(manifest)
 	if err != nil {
 		return "", err
 	}
@@ -410,6 +418,9 @@ func taskManifest(c laneConfig, task laneTask, root string) (string, error) {
 		return "", err
 	}
 	spec := scenarioSpecs[task.Scenario]
+	if task.EditGate && task.Scenario == "loadedit-4-largefile" {
+		spec.editors, spec.repos = 4, 1
+	}
 	if len(corpora) < spec.repos {
 		return "", fmt.Errorf("%s needs %d pinned corpora", task.Scenario, spec.repos)
 	}
@@ -441,6 +452,9 @@ func taskArgs(c laneConfig, task laneTask, manifest, scratch, report string) []s
 	spec := scenarioSpecs[task.Scenario]
 	if task.EditGate {
 		spec.wire, spec.agents = "edit-and-probe", 0
+		if task.Scenario == "loadedit-4-largefile" {
+			spec.editors, spec.repos = 4, 1
+		}
 	}
 	host := "native"
 	if c.HostClass == "reference_linux" {

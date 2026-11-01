@@ -26,26 +26,42 @@ type editLoopRow struct {
 
 type editLoopWire struct {
 	Plan struct {
-		MeanNS    *int64 `json:"mean_interarrival_ns"`
-		Arrival   string `json:"arrival"`
-		GateModes bool   `json:"gate_modes"`
-		Count     int    `json:"count"`
-		Editors   int    `json:"editors"`
-		Mode      string `json:"mode"`
-		Session   string `json:"session_model"`
-		Steps     []struct {
+		Routes []struct {
+			ID       string `json:"id"`
+			Repo     string `json:"repo"`
+			Commit   string `json:"commit"`
+			File     string `json:"file"`
+			Kind     string `json:"kind"`
+			Tool     string `json:"tool"`
+			Language string `json:"language"`
+			Mode     string `json:"mode"`
+		} `json:"routes"`
+		LinkedWorktrees int    `json:"linked_worktrees"`
+		MeanNS          *int64 `json:"mean_interarrival_ns"`
+		Arrival         string `json:"arrival"`
+		GateModes       bool   `json:"gate_modes"`
+		Count           int    `json:"count"`
+		Editors         int    `json:"editors"`
+		Mode            string `json:"mode"`
+		Session         string `json:"session_model"`
+		Steps           []struct {
+			Editor  int    `json:"editor"`
+			Route   string `json:"route"`
 			Ordinal int    `json:"ordinal"`
 			Mode    string `json:"probe_mode"`
 		} `json:"steps"`
 	} `json:"plan"`
 	Edits []struct {
-		Ordinal   int    `json:"ordinal"`
-		Mode      string `json:"probe_mode"`
-		Outcome   string `json:"outcome"`
-		ACK       metric `json:"t_ack_ms"`
-		OneRead   metric `json:"t_gate_readback_ms"`
-		ACKExact  *bool  `json:"ack_readback_exact"`
-		Readbacks []struct {
+		Editor      int    `json:"editor"`
+		Route       string `json:"route"`
+		TargetLines *int   `json:"admitted_target_lines"`
+		Ordinal     int    `json:"ordinal"`
+		Mode        string `json:"probe_mode"`
+		Outcome     string `json:"outcome"`
+		ACK         metric `json:"t_ack_ms"`
+		OneRead     metric `json:"t_gate_readback_ms"`
+		ACKExact    *bool  `json:"ack_readback_exact"`
+		Readbacks   []struct {
 			Kind            string `json:"kind"`
 			Correct         *bool  `json:"correct"`
 			Error           string `json:"error"`
@@ -214,6 +230,45 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 	}
 	if editors != expected || wire.Plan.Session != session {
 		return errors.New("plan editor population differs from workload")
+	}
+	if input.Scenario == "loadedit-4-largefile" {
+		for _, record := range wire.Edits {
+			if record.TargetLines == nil || *record.TargetLines < 10000 {
+				return errors.New("large-file row lacks actual >=10000-line admitted target evidence")
+			}
+		}
+	}
+	if input.Scenario == "multirepoedit-6" {
+		if len(wire.Plan.Routes) != 6 || len(r.Corpus) != 6 || wire.Plan.LinkedWorktrees != 0 {
+			return errors.New("six-repository cell requires six independent pinned corpus routes")
+		}
+		corpora := map[string]string{}
+		for _, corpus := range r.Corpus {
+			label, _ := corpus["label"].(string)
+			commit, _ := corpus["commit"].(string)
+			if label == "" || corpora[label] != "" || !revisionPattern.MatchString(commit) {
+				return errors.New("invalid six-repository corpus pins")
+			}
+			corpora[label] = commit
+		}
+		seen := map[string]bool{}
+		for _, route := range wire.Plan.Routes {
+			if route.ID == "" || seen[route.ID] || route.Repo != route.ID || corpora[route.ID] != route.Commit || route.File == "" || route.Kind != "add_intrafile_call" || route.Tool != "edit.file" || route.Language != "go" || route.Mode != "json" {
+				return errors.New("six-repository route differs from admitted corpus pin")
+			}
+			seen[route.ID] = true
+		}
+		used := map[string]bool{}
+		for i, record := range wire.Edits {
+			step := wire.Plan.Steps[i]
+			if record.Editor < 0 || record.Editor >= 6 || step.Editor != record.Editor || record.Route != step.Route || record.Route != wire.Plan.Routes[record.Editor].ID {
+				return errors.New("edit borrowed a foreign six-repository editor/route")
+			}
+			used[record.Route] = true
+		}
+		if len(used) != 6 {
+			return errors.New("six-repository cell did not actually edit all routes")
+		}
 	}
 	return nil
 }
