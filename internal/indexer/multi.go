@@ -1084,13 +1084,17 @@ func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
 // holding the mutation's pre-eviction evidence (resolveWithDeferredEvidence),
 // which the master resolver inherits for this one resolve.
 func (mi *MultiIndexer) runMasterResolveFilesWithEvidence(files []string, useLSP bool, evidence *resolver.Resolver) {
+	mi.runMasterResolveFilesObserved(files, useLSP, evidence, nil)
+}
+
+func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) {
 	master := mi.newMasterResolver(useLSP)
 	if master == nil {
 		return
 	}
 	master.InheritIncrementalEvidence(evidence)
 	mt := time.Now()
-	stats := master.ResolveFilesAndIncoming(files)
+	stats := master.ResolveFilesAndIncomingObserved(files, observe)
 	mi.logger.Info("DEFERRED-TIMING master.ResolveFilesAndIncoming",
 		zap.Duration("elapsed", time.Since(mt)),
 		zap.Bool("lsp_enabled", useLSP && mi.resolverLSPHelper != nil),

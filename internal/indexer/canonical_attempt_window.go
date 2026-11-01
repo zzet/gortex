@@ -100,7 +100,7 @@ func (p *PublicationPhaseRecord) completePhysicalAttempt(stamps *PublicationStam
 		}
 	}
 	if window.accounting.observed {
-		if p.patchLaps == nil || *p.patchLaps != lateDeep || p.admissions == nil || *p.admissions != lateAdmissions ||
+		if p.patchLaps == nil || !p.patchLaps.sameAccounting(lateDeep) || p.admissions == nil || *p.admissions != lateAdmissions ||
 			(p.laneWait == nil && (lateLane.started || lateLane.invalid)) || (p.laneWait != nil && *p.laneWait != lateLane) ||
 			!window.accounting.agreesWithAdmissions(lateAdmissions, lateLane) {
 			window.accounting.invalid = true

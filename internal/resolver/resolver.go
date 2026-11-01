@@ -3073,13 +3073,13 @@ func collectIncrementalFileFrontierKeys(
 	return frontier
 }
 
-// ResolveFilesAndIncoming runs the forward and reverse passes for a
+// resolveFilesAndIncoming runs the forward and reverse passes for a
 // batch of files under one lock, one build of the per-pass indexes, and
 // one run of the attribution passes. The affected-by re-resolution path
 // uses this: calling ResolveFileAndIncoming per file would rebuild the
 // four pass indexes and re-run the whole-graph attribution sweeps once
 // per file, turning a bounded fan-out into N whole-graph passes.
-func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
+func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(started, acquired time.Time)) *ResolveStats {
 	stats := &ResolveStats{}
 	if len(filePaths) == 0 {
 		return stats
@@ -3123,8 +3123,18 @@ func (r *Resolver) ResolveFilesAndIncoming(filePaths []string) *ResolveStats {
 			zap.Duration("total", time.Since(started)))
 	}()
 	finish := r.startIncrementalPhase(logger, "wait_lock")
+	var mutexStarted, mutexAcquired time.Time
+	if observe != nil {
+		mutexStarted = time.Now()
+	}
 	r.mu.Lock()
+	if observe != nil {
+		mutexAcquired = time.Now()
+	}
 	defer r.mu.Unlock()
+	if observe != nil {
+		observe(mutexStarted, mutexAcquired)
+	}
 	r.refreshGoModules()
 	lockDuration = finish()
 	// The edited files may have (re)stamped global usings — reconcile the

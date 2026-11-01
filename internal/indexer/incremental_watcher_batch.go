@@ -336,7 +336,7 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 				idx.incrementalResolveFilesHook(frontier)
 				return
 			}
-			idx.resolver.ResolveFilesAndIncoming(frontier)
+			idx.resolver.ResolveFilesAndIncomingObserved(frontier, eviction.batch.publicationStamps().mutationResolveMutexObserver())
 		})
 	} else if needed && !exact {
 		idx.observeIncrementalCatchup("resolve", nil)
@@ -395,7 +395,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 				idx.incrementalResolveFilesHook(frontier)
 				return
 			}
-			idx.resolver.ResolveFilesAndIncoming(frontier)
+			idx.resolver.ResolveFilesAndIncomingObserved(frontier, batch.publicationStamps().mutationResolveMutexObserver())
 		})
 		names := mode.publication.beginPatchLap(patchResolve)
 		idx.resolveReceiptNamePendings(receipt)
@@ -572,7 +572,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 				idx.incrementalResolveFilesHook(frontier)
 				return
 			}
-			mi.runMasterResolveFilesWithEvidence(frontier, false, idx.resolver)
+			mi.runMasterResolveFilesObserved(frontier, false, idx.resolver, batch.publicationStamps().mutationResolveMutexObserver())
 		})
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, resolvedFiles...)
 		if receipt != nil && receipt.Complete {
@@ -584,7 +584,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		}
 	} else if needed && len(files) > 0 {
 		resolve := batch.publicationStamps().beginPatchLap(patchResolve)
-		mi.runMasterResolveFiles(files, false)
+		mi.runMasterResolveFilesObserved(files, false, nil, batch.publicationStamps().mutationResolveMutexObserver())
 		resolve.end()
 		if receipt != nil && receipt.Complete {
 			names := batch.publicationStamps().beginPatchLap(patchResolve)
@@ -629,7 +629,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		}
 		cross := batch.publicationStamps().beginPatchLap(patchResolve)
 		if len(crossRepoFiles) > 0 {
-			mi.runCrossRepoResolveFiles(crossRepoFiles)
+			mi.runCrossRepoResolveMutationFrontiersObserved(crossRepoFiles, crossRepoFiles, crossRepoFiles, batch.publicationStamps().mutationResolveMutexObserver())
 		} else {
 			wide = true
 			mi.runCrossRepoResolve(false)
