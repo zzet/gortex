@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -212,4 +213,83 @@ func (f relationFreshness) merge(other relationFreshness) relationFreshness {
 	}
 	sort.Strings(f.files)
 	return f
+}
+
+// labelRelations keeps the pre-walk gaps as evidence even if they completed
+// during the read, and also includes edits admitted while the walk ran.
+func (s *Server) labelRelations(ctx context.Context, gaps []*mutationReceipt, ids, files []string) relationFreshness {
+	return s.freshnessFor(ctx, "relations", ids, files, gaps)
+}
+
+// labelled is payload with the label's fields merged in, a struct payload
+// being re-read as its JSON object first. A fresh scope returns payload
+// unchanged.
+func (f relationFreshness) labelled(payload any) any {
+	if f.state == "" {
+		return payload
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return payload
+	}
+	var fields map[string]any
+	if json.Unmarshal(data, &fields) != nil || fields == nil {
+		return payload
+	}
+	f.apply(fields)
+	return fields
+}
+
+// provisionalSite is a line of a file whose edit the graph has not published
+// that names a symbol as a whole identifier: a reference the graph cannot show
+// yet, reported so a mutator neither misses it nor rewrites it. Line is 0 for
+// the symbol's own file, which is provisional as a whole.
+type provisionalSite struct {
+	File string `json:"file"`
+	Line int    `json:"line"`
+	Text string `json:"text"`
+}
+
+// provisionalSites scans the files of gaps for lines naming node, leaving out
+// the lines where g already holds a reference to it. When the node's own file
+// is among them it is one site without a line: until that edit publishes, the
+// graph's span of the node may not hold, and a line that names the node there
+// may be a new caller or the definition itself.
+func (s *Server) provisionalSites(g graph.Reader, gaps []*mutationReceipt, node *graph.Node) []provisionalSite {
+	names := []string{identifierName(node.Name)}
+	known := make(map[string]bool)
+	for _, e := range g.GetInEdges(node.ID) {
+		if caller := g.GetNode(e.From); caller != nil && isReferencingEdgeKind(e.Kind) {
+			known[fmt.Sprintf("%s:%d", caller.FilePath, e.Line)] = true
+		}
+	}
+	seen := make(map[string]bool)
+	var sites []provisionalSite
+	for _, receipt := range gaps {
+		file := s.repoRelative(receipt.path)
+		if seen[file] {
+			continue
+		}
+		seen[file] = true
+		if file == node.FilePath {
+			sites = append(sites, provisionalSite{File: file})
+			continue
+		}
+		data, err := os.ReadFile(receipt.path)
+		if err != nil || !namesAnyIdentifier(data, names) {
+			continue
+		}
+		for i, line := range strings.Split(string(data), "\n") {
+			if namesAnyIdentifier([]byte(line), names) && !known[fmt.Sprintf("%s:%d", file, i+1)] {
+				sites = append(sites, provisionalSite{File: file, Line: i + 1, Text: strings.TrimSpace(line)})
+			}
+		}
+	}
+	sort.Slice(sites, func(i, j int) bool {
+		if sites[i].File != sites[j].File {
+			return sites[i].File < sites[j].File
+		}
+		return sites[i].Line < sites[j].Line
+	})
+	return sites
 }

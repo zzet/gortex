@@ -192,3 +192,130 @@ func TestChangeAnswersStartWithRelationsLine(t *testing.T) {
 		map[string]any{"format": "toon"}))
 	require.Equal(t, line, strings.SplitN(detect, "\n", 2)[0], detect)
 }
+
+func nodeID(t *testing.T, s *Server, name string) string {
+	t.Helper()
+	for _, n := range s.graph.AllNodes() {
+		if n.Name == name && n.Kind == graph.KindFunction {
+			return n.ID
+		}
+	}
+	t.Fatalf("%s is not indexed", name)
+	return ""
+}
+
+// A call to a symbol that an edit added and the graph has not read yet must
+// block safe_delete like a graph reference, in plain and propagate mode. An
+// edit to the symbol's own file blocks it as a whole: it may add a caller
+// there, and the graph's span of the symbol may no longer hold.
+func TestSafeDeleteRejectsTargetCalledFromPendingFile(t *testing.T) {
+	for name, edit := range map[string]struct {
+		file, src string
+		ref       map[string]any
+	}{
+		"caller file": {"namer.go", "package p\n\nfunc Namer() {\n\tOther()\n}\n",
+			map[string]any{"kind": "provisional", "file_path": "namer.go", "line": float64(4)}},
+		"definition file": {"other.go", "package p\n\nfunc Extra() {\n\tOther()\n}\n\nfunc Other() {}\n",
+			map[string]any{"kind": "provisional", "file_path": "other.go"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, root := newRelationFixture(t)
+			pendingFreshnessReceipt(s, "receipt-"+edit.file, "", writeUnindexed(t, root, edit.file, edit.src), 1)
+			otherPath := filepath.Join(root, "other.go")
+			before, err := os.ReadFile(otherPath)
+			require.NoError(t, err)
+			id := nodeID(t, s, "Other")
+
+			payload := lifecycleResultPayload(t, callChangeTool(t, s.handleSafeDeleteSymbol, "safe_delete_symbol",
+				map[string]any{"id": id, "dry_run": false, "format": "json"}))
+			require.Equal(t, "rejected_has_references", payload["status"])
+			require.Equal(t, []any{edit.ref}, payload["references"])
+			require.Equal(t, "pending", payload["graph_freshness"])
+
+			payload = lifecycleResultPayload(t, callChangeTool(t, s.handleSafeDeleteSymbol, "safe_delete_symbol",
+				map[string]any{"id": id, "propagate": true, "dry_run": false, "format": "json"}))
+			require.Equal(t, "propagation_blocked_manual", payload["status"])
+			require.Equal(t, float64(1), payload["manual"])
+
+			after, err := os.ReadFile(otherPath)
+			require.NoError(t, err)
+			require.Equal(t, string(before), string(after), "the target was deleted with a pending caller")
+		})
+	}
+
+	// A call the graph already holds is listed once, as the graph's
+	// reference, when its file has an unrelated pending edit; propagate can
+	// still remove it.
+	t.Run("graph reference", func(t *testing.T) {
+		s, root := newRelationFixture(t)
+		pendingFreshnessReceipt(s, "receipt-caller", "",
+			writeUnindexed(t, root, "caller.go", "package p\n\nfunc Caller() {\n\tTarget()\n}\n\nfunc More() {}\n"), 1)
+		payload := lifecycleResultPayload(t, callChangeTool(t, s.handleSafeDeleteSymbol, "safe_delete_symbol",
+			map[string]any{"id": targetID(t, s), "format": "json"}))
+		require.Equal(t, "rejected_has_references", payload["status"])
+		require.Equal(t, float64(1), payload["reference_count"], "%v", payload["references"])
+		payload = lifecycleResultPayload(t, callChangeTool(t, s.handleSafeDeleteSymbol, "safe_delete_symbol",
+			map[string]any{"id": targetID(t, s), "propagate": true, "format": "json"}))
+		require.Equal(t, "propagation_plan", payload["status"])
+		require.Equal(t, float64(0), payload["manual"], "%v", payload["caller_patches"])
+	})
+
+	// Target is orphaned with Caller by the graph's edges, but a pending edit
+	// now calls it: the cascade must not delete it with Caller.
+	t.Run("cascade member", func(t *testing.T) {
+		s, root := newRelationFixture(t)
+		pendingFreshnessReceipt(s, "receipt-namer", "",
+			writeUnindexed(t, root, "namer.go", "package p\n\nfunc Namer() {\n\tTarget()\n}\n"), 1)
+		sources := map[string]string{}
+		for _, name := range []string{"caller.go", "target.go"} {
+			data, err := os.ReadFile(filepath.Join(root, name))
+			require.NoError(t, err)
+			sources[name] = string(data)
+		}
+		payload := lifecycleResultPayload(t, callChangeTool(t, s.handleSafeDeleteSymbol, "safe_delete_symbol",
+			map[string]any{"id": nodeID(t, s, "Caller"), "cascade": "apply", "dry_run": false, "format": "json"}))
+		require.Equal(t, "rejected_has_references", payload["status"], "%v", payload)
+		require.Equal(t, []any{map[string]any{"kind": "provisional", "file_path": "namer.go", "line": float64(4)}}, payload["references"])
+		for name, src := range sources {
+			data, err := os.ReadFile(filepath.Join(root, name))
+			require.NoError(t, err)
+			require.Equal(t, src, string(data), "%s changed although the cascade was refused", name)
+		}
+	})
+}
+
+// The relation-reading mutators answer at once and label the answer while an
+// edit in their scope never publishes; they never wait it out or refuse.
+func TestRelationToolsLabelAndNeverRefuseWithUnresolvedReceipt(t *testing.T) {
+	s, root := newRelationFixture(t)
+	pendingFreshnessReceipt(s, "receipt-namer", "",
+		writeUnindexed(t, root, "namer.go", "package p\n\nfunc Namer() {\n\tTarget()\n}\n"), 1)
+	id := targetID(t, s)
+	rename := `{"changes":{"target.go":[{"range":{"start":{"line":2,"character":5},"end":{"line":2,"character":11}},"newText":"Renamed"}]}}`
+	comment := `{"changes":{"file://` + filepath.ToSlash(filepath.Join(root, "namer.go")) +
+		`":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"// Namer names Target.\n"}]}}`
+
+	for tool, call := range map[string]func() *mcpgo.CallToolResult{
+		"change_contract": func() *mcpgo.CallToolResult {
+			return callChangeTool(t, s.handleChangeContract, "change_contract",
+				map[string]any{"source": "symbols", "symbols": id, "format": "json"})
+		},
+		"preview_edit": func() *mcpgo.CallToolResult {
+			return callChangeTool(t, s.handlePreviewEdit, "preview_edit",
+				map[string]any{"workspace_edit": rename, "diagnostics": false})
+		},
+		// No symbol is removed or renamed: only the touched file, named by
+		// an absolute file URI, brings the pending edit into scope.
+		"preview_edit file uri": func() *mcpgo.CallToolResult {
+			return callChangeTool(t, s.handlePreviewEdit, "preview_edit",
+				map[string]any{"workspace_edit": comment, "diagnostics": false})
+		},
+	} {
+		started := time.Now()
+		payload := lifecycleResultPayload(t, call())
+		require.Less(t, time.Since(started), 2*time.Second, "%s waited on a receipt that never publishes", tool)
+		require.Equal(t, "pending", payload["graph_freshness"], "%s: %v", tool, payload)
+		require.Equal(t, []any{"namer.go"}, payload["pending_files"], tool)
+		require.Equal(t, false, payload["complete"], tool)
+	}
+}

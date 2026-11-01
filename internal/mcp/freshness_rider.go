@@ -557,9 +557,26 @@ func renderFreshnessLine(res *mcp.CallToolResult, fields map[string]any) *mcp.Ca
 
 // freshnessFor is the single tier producer. Canonical paths are read from
 // their watcher; checkout routes retain their own scoped receipt authority.
-func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []string) relationFreshness {
+func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []string, snapshots ...[]*mutationReceipt) relationFreshness {
 	label := relationFreshness{}
 	inScope := s.relationScope(ctx, ids, files)
+	if len(snapshots) > 0 {
+		for _, receipt := range snapshots[0] {
+			if !inScope(receipt.path) {
+				continue
+			}
+			label.files = append(label.files, s.repoRelative(receipt.path))
+			if label.state != "failed" {
+				label.state = "pending"
+				if outcome := receipt.outcome(true); !outcome.Pending && (outcome.Err != nil || !outcome.Reindexed) {
+					label.state = "failed"
+				}
+			}
+		}
+		slices.Sort(label.files)
+		label.files = slices.Compact(label.files)
+		return label.merge(s.freshnessFor(ctx, scope, ids, files))
+	}
 	states := make(map[string]string)
 	watcher, watched := s.currentWatcher().(interface {
 		TierPaths() map[string]indexer.MutationTierState
