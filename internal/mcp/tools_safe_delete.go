@@ -52,10 +52,11 @@ func (s *Server) registerSafeDeleteSymbolTool() {
 // information for the caller to navigate to it and remove it before
 // retrying the delete.
 type safeDeleteReference struct {
-	FromID   string `json:"from_id"`
+	FromID   string `json:"from_id,omitempty"`
 	Kind     string `json:"kind"`
 	FromName string `json:"from_name,omitempty"`
 	FilePath string `json:"file_path,omitempty"`
+	Line     int    `json:"line,omitempty"`
 }
 
 // cascadeClosureEntry describes a symbol that the cascade pass added
@@ -109,6 +110,20 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	// EdgeDefines / EdgeMemberOf are skipped (they don't represent
 	// "someone calls this").
 	refs := collectReferencingEdges(g, id)
+	// A call that an edit added and the graph has not read yet blocks the
+	// delete like a graph reference does: a provisional reference here, a
+	// manual patch in propagate mode. The same snapshot labels the answer.
+	gaps := s.laggingMutationReceipts(ctx)
+	provisional := s.provisionalSites(g, gaps, node)
+	for _, site := range provisional {
+		refs = append(refs, safeDeleteReference{Kind: "provisional", FilePath: site.File, Line: site.Line})
+	}
+	respond := func(result map[string]any) (*mcp.CallToolResult, error) {
+		label := s.labelRelations(ctx, gaps, []string{id}, nil)
+		label.apply(result)
+		res, err := s.respondJSONOrTOON(ctx, req, result)
+		return label.decorate(res), err
+	}
 
 	// SRN-7: propagate-delete — patch the surviving call sites instead of
 	// refusing. Builds a per-caller plan, applies the removable standalone
@@ -116,9 +131,18 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	var appliedPatches, failedPatches []callerPatch
 	if req.GetBool("propagate", false) && len(refs) > 0 {
 		plan := s.buildPropagationPlan(ctx, g, node)
+		for _, site := range provisional {
+			reason := "provisional: named in a file whose edit the graph has not read yet — patch by hand"
+			if site.Line == 0 {
+				reason = "provisional: the graph has not read the latest edit to the symbol's own file — retry once it publishes"
+			}
+			plan = append(plan, callerPatch{
+				File: site.File, Line: site.Line, CurrentText: site.Text, Action: "manual", Reason: reason,
+			})
+		}
 		manual := countManual(plan)
 		if dryRun {
-			return s.respondJSONOrTOON(ctx, req, map[string]any{
+			return respond(map[string]any{
 				"status":          "propagation_plan",
 				"symbol":          id,
 				"file":            node.FilePath,
@@ -131,7 +155,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 			})
 		}
 		if manual > 0 && !force {
-			return s.respondJSONOrTOON(ctx, req, map[string]any{
+			return respond(map[string]any{
 				"status":         "propagation_blocked_manual",
 				"symbol":         id,
 				"caller_patches": plan,
@@ -139,18 +163,18 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 				"hint":           fmt.Sprintf("%d call site(s) need manual patching; resolve them or pass force=true to delete anyway", manual),
 			})
 		}
-		applied, failed, perr := s.applyRemoveLinePatches(plan)
+		applied, failed, perr := s.applyRemoveLinePatches(ctx, plan)
 		if perr != nil {
 			return mcp.NewToolResultError(perr.Error()), nil
 		}
 		appliedPatches, failedPatches = applied, failed
 		if len(failed) > 0 && !force {
-			return s.respondJSONOrTOON(ctx, req, map[string]any{
+			return respond(map[string]any{
 				"status":          "propagation_partial",
 				"symbol":          id,
 				"patches_applied": applied,
 				"patches_failed":  failed,
-				"hint":            "some removals would break their file's syntax and were skipped; patch them by hand or pass force=true to delete the symbol anyway",
+				"hint":            "some removals were refused (reason line_changed or line_out_of_range: the line no longer holds the planned call, re-run the plan; parse_errors: removing it would break the file's syntax); patch them by hand or pass force=true to delete the symbol anyway",
 			})
 		}
 		// Callers patched — proceed with the deletion. Re-fetch the node in
@@ -158,7 +182,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		force = true
 		node = g.GetNode(id)
 		if node == nil {
-			return s.respondJSONOrTOON(ctx, req, map[string]any{
+			return respond(map[string]any{
 				"status":          "deleted_by_propagation",
 				"symbol":          id,
 				"patches_applied": appliedPatches,
@@ -171,7 +195,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	}
 
 	if len(refs) > 0 && !force {
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
+		return respond(map[string]any{
 			"status":             "rejected_has_references",
 			"symbol":             id,
 			"file":               node.FilePath,
@@ -195,6 +219,40 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	if cascadeMode != cascadeModeOff {
 		closure, cascadeTruncated = computeCascadeClosure(g, node, cascadeIntoTests)
 	}
+	if cascadeMode == cascadeModeApply {
+		// The closure is orphaned by the graph's edges only. A call that an
+		// unpublished edit added keeps a member alive, and force does not
+		// cover the members, so the cascade waits for that edit.
+		var blocked []safeDeleteReference
+		var members []string
+		for _, entry := range closure {
+			member := g.GetNode(entry.ID)
+			if member == nil {
+				continue
+			}
+			sites := s.provisionalSites(g, gaps, member)
+			if len(sites) > 0 {
+				members = append(members, entry.ID)
+			}
+			for _, site := range sites {
+				blocked = append(blocked, safeDeleteReference{Kind: "provisional", FilePath: site.File, Line: site.Line})
+			}
+		}
+		if len(blocked) > 0 {
+			return respond(map[string]any{
+				"status":          "rejected_has_references",
+				"symbol":          id,
+				"file":            node.FilePath,
+				"references":      blocked,
+				"reference_count": len(blocked),
+				"dry_run":         dryRun,
+				"force":           force,
+				"cascade_mode":    cascadeMode,
+				"cascade_closure": closure,
+				"hint":            "cascade member(s) " + strings.Join(members, ", ") + " are named in files whose edits the graph has not read yet; retry once those publish, or delete without cascade",
+			})
+		}
+	}
 
 	absPath, err := s.resolveNodePath(ctx, node)
 	if err != nil {
@@ -212,14 +270,24 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError(refuseUTF16Edit("safe_delete_symbol", node.FilePath).Error()), nil
 	}
 	lines := strings.Split(string(content), "\n")
-	if node.StartLine > len(lines) || node.EndLine > len(lines) {
-		return mcp.NewToolResultError("symbol line range exceeds file length"), nil
+	if dryRun {
+		start, end, err := s.nodeLinesIn(ctx, node, content)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		resolved := *node
+		resolved.StartLine, resolved.EndLine = start, end
+		node = &resolved
 	}
-
-	deleteStart, deleteEnd := expandDeleteRange(node, lines)
-
-	deletedChunk := strings.Join(lines[deleteStart-1:deleteEnd], "\n")
-	linesDeleted := deleteEnd - deleteStart + 1
+	// An actual delete resolves again only under its complete held path set.
+	// These initial response fields are replaced by the applied snapshot.
+	deleteStart, deleteEnd, linesDeleted := 0, 0, 0
+	deletedChunk := ""
+	if node.StartLine >= 1 && node.EndLine >= node.StartLine && node.EndLine <= len(lines) {
+		deleteStart, deleteEnd = expandDeleteRange(node, lines)
+		deletedChunk = strings.Join(lines[deleteStart-1:deleteEnd], "\n")
+		linesDeleted = deleteEnd - deleteStart + 1
+	}
 
 	result := map[string]any{
 		"symbol":             id,
@@ -242,7 +310,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 
 	if dryRun {
 		result["status"] = "preview"
-		return s.respondJSONOrTOON(ctx, req, result)
+		return respond(result)
 	}
 
 	// Commit phase. cascadeModeApply expands the work to every entry
@@ -277,13 +345,19 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 
 	deletedIDs, err := s.applyPendingDeletes(ctx, pending)
 	if err != nil {
-		// Fail-fast: surface what was done up to this point so the
-		// caller can recover. Treat the failure as a tool error.
+		if len(deletedIDs) == 0 {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		// Surface only source effects whose physical commit succeeded.
 		result["status"] = "partial_failure"
 		result["cascade_deleted"] = deletedIDs
 		result["error"] = err.Error()
-		return s.respondJSONOrTOON(ctx, req, result)
+		return respond(result)
 	}
+
+	result["start_line"], result["end_line"] = pending[0].start, pending[0].end
+	result["lines_deleted"] = pending[0].end - pending[0].start + 1
+	result["preview"] = pending[0].preview
 
 	// Persist session state and re-index every touched file.
 	sess := s.sessionFor(ctx)
@@ -310,7 +384,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	if len(failedPatches) > 0 {
 		result["patches_failed"] = failedPatches
 	}
-	return s.respondJSONOrTOON(ctx, req, result)
+	return respond(result)
 }
 
 // normaliseCascadeMode coerces the cascade parameter to a known
@@ -328,14 +402,14 @@ func normaliseCascadeMode(raw string) string {
 }
 
 // pendingDelete buffers everything needed to delete one symbol from
-// its file. start/end of zero mean "compute lazily from the node and
-// the file contents" — only the original target arrives pre-computed
-// because the dry_run preview already needed those numbers.
+// its file. Every span is resolved against the bytes read under the held
+// path set; the response retains that actual removed snapshot.
 type pendingDelete struct {
-	node  *graph.Node
-	abs   string
-	start int
-	end   int
+	node    *graph.Node
+	abs     string
+	start   int
+	end     int
+	preview string
 }
 
 // applyPendingDeletes groups pending deletes by absolute file path
@@ -353,6 +427,14 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 		}
 		byFile[p.abs] = append(byFile[p.abs], p)
 	}
+	// The complete delete set is admitted before any file is read or written.
+	// Propagated caller locks have their own lifetime and cannot authorize the
+	// later definition delete (or another member of a cascade).
+	ctx, release, err := acquireMutationPaths(ctx, order)
+	if err != nil {
+		return nil, fmt.Errorf("lock delete files: %w", err)
+	}
+	defer release()
 
 	deleted := make([]string, 0, len(pending))
 	for _, abs := range order {
@@ -367,16 +449,16 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 			return deleted, refuseUTF16Edit("safe_delete_symbol", abs)
 		}
 		lines := strings.Split(string(content), "\n")
-		// Materialise ranges for entries that arrived with zero
-		// start/end (the cascade tail; the original target arrives
-		// pre-computed for parity with the dry_run preview).
 		for _, p := range bucket {
-			if p.start == 0 || p.end == 0 {
-				if p.node.StartLine > len(lines) || p.node.EndLine > len(lines) {
-					return deleted, fmt.Errorf("symbol %s line range exceeds file %s", p.node.ID, abs)
-				}
-				p.start, p.end = expandDeleteRange(p.node, lines)
+			start, end, err := s.symbolLinesUnderLock(ctx, p.node, abs, content)
+			if err != nil {
+				return deleted, err
 			}
+			resolved := *p.node
+			resolved.StartLine, resolved.EndLine = start, end
+			p.node = &resolved
+			p.start, p.end = expandDeleteRange(p.node, lines)
+			p.preview = strings.Join(lines[p.start-1:p.end], "\n")
 		}
 		// Sort descending so deletions earlier in the file don't
 		// shift the line indexes of later ones.
@@ -396,7 +478,6 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 		}
 		for _, p := range bucket {
 			lines = append(lines[:p.start-1], lines[p.end:]...)
-			deleted = append(deleted, p.node.ID)
 		}
 		newContent := strings.Join(lines, "\n")
 		// The UTF-16 refusal above is the early, per-file UX; the commit
@@ -421,6 +502,9 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 		}
 		if _, werr := s.commitFileMutation(ctx, "safe_delete_symbol", "", "", rel, abs, []byte(newContent), perm); werr != nil {
 			return deleted, fmt.Errorf("could not write %s: %v", abs, werr)
+		}
+		for _, p := range bucket {
+			deleted = append(deleted, p.node.ID)
 		}
 	}
 	return deleted, nil

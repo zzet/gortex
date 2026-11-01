@@ -98,7 +98,7 @@ func TestReadRepairActualExecutorStraddlesCommittedBookkeeping(t *testing.T) {
 			t.Fatal("actual executor did not enter its first phase before commit")
 		}
 	}
-	record, err := s.commitFileMutation(ctx, "write_file", "logical-straddling", "straddling fixture", "main.go", path, after, 0o600)
+	record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "logical-straddling", "straddling fixture", "main.go", path, after, 0o600)
 	require.NoError(t, err)
 	waiterDone := make(chan mutationReindexOutcome, 1)
 	go func() { waiterDone <- s.mutationReindexState(ctx, path) }()

@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 func TestSourceMutationWriteIntentRestoresAdmissionAndCancelsWait(t *testing.T) {
@@ -48,4 +49,20 @@ func TestSourceMutationWriteIntentRestoresAdmissionAndCancelsWait(t *testing.T) 
 	closedIntent.close()
 	resume()
 	require.False(t, store.WriteWanted(), "cleanup cannot be undone by a late wait return")
+}
+
+func TestSelectedCheckoutSourceMutationStillAnnouncesStoreIntent(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "checkout-intent.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	srv, root := setupTestServer(t)
+	srv.materializer = &graphview.Materializer{Store: store}
+	selected := withCheckoutMutation(t.Context(), &fakeCheckoutMutationLifecycle{}, root)
+	_, release := srv.withSourceMutationWriteIntent(selected, "edit_file")
+	require.True(t, store.WriteWanted(), "a selected store-writing checkout retains foreground preemption")
+	release()
+	require.False(t, store.WriteWanted())
+	_, releaseRead := srv.withSourceMutationWriteIntent(selected, "get_symbol")
+	defer releaseRead()
+	require.False(t, store.WriteWanted(), "read requests never acquire a writer intent")
 }

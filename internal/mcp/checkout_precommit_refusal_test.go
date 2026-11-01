@@ -109,7 +109,7 @@ func TestCheckoutPrecommitRefusalExcludesMultiFileAndAppliedScopes(t *testing.T)
 				require.NoError(t, os.WriteFile(state.committedPath, []byte("applied earlier\n"), 0o644))
 			}
 			f.srv.mutationPreCommitHook = func(*mutationCommitRecord) { movePrecommitHEAD(t, f) }
-			record, err := f.srv.commitFileMutation(ctx, tc.tool, "", "", "edit.go", filepath.Join(f.worktree, "edit.go"), []byte("package repo\n"), 0o644)
+			record, err := f.srv.commitHeldFileMutationForTest(t, ctx, tc.tool, "", "", "edit.go", filepath.Join(f.worktree, "edit.go"), []byte("package repo\n"), 0o644)
 			require.ErrorIs(t, err, indexer.ErrCheckoutMutationStale)
 			require.ErrorIs(t, err, errMutationNotApplied)
 			require.Equal(t, mutationDiskNotApplied, record.diskStatus())
@@ -154,7 +154,7 @@ func TestCheckoutPrecommitRefusalRejectsUnprovenErrors(t *testing.T) {
 			lease := &primitiveCheckoutMutation{prepareErr: cause}
 			ctx := withCheckoutMutation(t.Context(), lease, f.worktree)
 			checkoutMutationFromContext(ctx).singleFile = true
-			record, err := f.srv.commitFileMutation(ctx, "edit_file", "", "", "edit.go", filepath.Join(f.worktree, "edit.go"), []byte("package repo\n"), 0o644)
+			record, err := f.srv.commitHeldFileMutationForTest(t, ctx, "edit_file", "", "", "edit.go", filepath.Join(f.worktree, "edit.go"), []byte("package repo\n"), 0o644)
 			require.ErrorIs(t, err, cause)
 			require.Equal(t, mutationDiskNotApplied, record.diskStatus())
 			require.NotContains(t, mutationNotAppliedMessage("edit", record, err), "Native read/edit is allowed")
@@ -173,7 +173,7 @@ func TestCheckoutPrecommitRefusalDoesNotExtendToEncodingIOOrPostwrite(t *testing
 		lease := &primitiveCheckoutMutation{prepareErr: indexer.ErrCheckoutMutationStale}
 		ctx := withCheckoutMutation(t.Context(), lease, f.worktree)
 		checkoutMutationFromContext(ctx).singleFile = true
-		record, err := f.srv.commitFileMutation(ctx, "write_file", "", "", "utf16.go", path, []byte("package repo\n"), 0o644)
+		record, err := f.srv.commitHeldFileMutationForTest(t, ctx, "write_file", "", "", "utf16.go", path, []byte("package repo\n"), 0o644)
 		require.ErrorContains(t, err, "UTF-16")
 		require.Zero(t, lease.prepared, "encoding refusal must not borrow a lease refusal")
 		require.Equal(t, mutationDiskNotApplied, record.diskStatus())
@@ -187,7 +187,7 @@ func TestCheckoutPrecommitRefusalDoesNotExtendToEncodingIOOrPostwrite(t *testing
 		lease := &primitiveCheckoutMutation{}
 		ctx := withCheckoutMutation(t.Context(), lease, f.worktree)
 		checkoutMutationFromContext(ctx).singleFile = true
-		record, err := f.srv.commitFileMutation(ctx, "write_file", "", "", "directory.go", path, []byte("package repo\n"), 0o644)
+		record, err := f.srv.commitHeldFileMutationForTest(t, ctx, "write_file", "", "", "directory.go", path, []byte("package repo\n"), 0o644)
 		require.Error(t, err)
 		require.Equal(t, 1, lease.prepared)
 		require.Equal(t, mutationDiskFailed, record.diskStatus())
@@ -201,7 +201,7 @@ func TestCheckoutPrecommitRefusalDoesNotExtendToEncodingIOOrPostwrite(t *testing
 		state := checkoutMutationFromContext(ctx)
 		state.singleFile = true
 		data := []byte("package repo\n")
-		record, err := f.srv.commitFileMutation(ctx, "write_file", "", "", "postwrite.go", path, data, 0o644)
+		record, err := f.srv.commitHeldFileMutationForTest(t, ctx, "write_file", "", "", "postwrite.go", path, data, 0o644)
 		require.NoError(t, err)
 		require.Equal(t, mutationDiskCommitted, record.diskStatus())
 		outcome := f.srv.refreshCheckoutMutation(ctx, path, state)

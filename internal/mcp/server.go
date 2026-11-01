@@ -413,7 +413,6 @@ type Server struct {
 	// defaults. sync.Map keeps directly-constructed servers usable.
 	mutationReceipts    sync.Map
 	mutationReindexWait time.Duration
-	mutationSafetyWait  time.Duration
 	// mutationReceiptAfterFunc replaces retention scheduling in deterministic
 	// tests. Nil uses time.AfterFunc with the unchanged retention windows.
 	mutationReceiptAfterFunc func(time.Duration, func())
@@ -3781,6 +3780,11 @@ func (s *Server) SetWatcher(w watcherHistory) {
 	s.watcherMu.Lock()
 	s.watcher = w
 	s.watcherMu.Unlock()
+	if sourceEvents, ok := w.(interface{ OnSourceEvent(func(string)) }); ok {
+		sourceEvents.OnSourceEvent(func(path string) {
+			pendingFileProjections.markSuspect(path)
+		})
+	}
 
 	// Register callback to track symbol modifications for
 	// get_symbol_history AND fan stale_refs notifications to any

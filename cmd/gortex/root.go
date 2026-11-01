@@ -167,6 +167,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default .gortex.yaml)")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "log level: debug|info|warn|error")
 	rootCmd.PersistentFlags().BoolVar(&noProgress, "no-progress", false, "disable animated progress output (also honored: NO_COLOR, TERM=dumb, CI, non-TTY stderr)")
+	rootCmd.PersistentFlags().BoolVar(&cliRequireFresh, "require-fresh", false, "wait for graph freshness; exit 4 if the requested tier remains pending or failed")
 }
 
 func newLoggerConfig() zap.Config {

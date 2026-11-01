@@ -17,6 +17,8 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // The commit ledger exists because a tool call has two independent terminal
@@ -86,7 +88,7 @@ const mutationIDParamDescription = "Optional idempotency key. Retrying with the 
 	"replays the first result instead of writing twice — the safe way to retry an abandoned call. " +
 	"A different edit under the same key is refused."
 
-var mutationCommitSequence atomic.Uint64
+var mutationCommitSequence = epochMutationSequence()
 
 // mutationDiskCommitSequence orders disk commits. It is stamped after the
 // rename and before the commit's refresh ticket is admitted, so a fresh
@@ -167,6 +169,7 @@ type mutationCommitRecord struct {
 	batchOwner       [32]byte
 	batchAfterSHA256 [32]byte
 	moveFile         *moveFileObservation
+	moveTimingOwner  weak.Pointer[mutationCommitRecord]
 
 	// response is the successful tool payload, retained only for records that
 	// carry a caller-chosen mutation_id. Without a key there is nothing to
@@ -723,6 +726,24 @@ func (s *Server) beginMutationCommit(ctx context.Context, tool, mutationID, fing
 	return record
 }
 
+type sourceMutationOperationKind uint8
+
+const (
+	batchForwardWrite sourceMutationOperationKind = iota + 1
+	batchForwardRemove
+	batchRestoreWrite
+	batchRestoreRemove
+	sourceRemove
+)
+
+// A durable batch already owns its complete prepared path set and terminal
+// verdict. This descriptor selects only source I/O; journal and backup writes
+// never enter this boundary. Observation belongs exclusively to forward I/O.
+type sourceMutationOperation struct {
+	kind        sourceMutationOperationKind
+	observation *mutationCommitRecord
+}
+
 // commitFileMutation is the single guarded disk-commit primitive for the
 // single-file mutating tools. Every caller gets three things it did not have
 // before: a refusal when the request is already dead, a durable receipt, and a
@@ -732,7 +753,48 @@ func (s *Server) commitFileMutation(
 	tool, mutationID, fingerprint, relPath, absPath string,
 	data []byte,
 	perm os.FileMode,
+	operations ...sourceMutationOperation,
 ) (*mutationCommitRecord, error) {
+	remove := len(operations) == 1 && operations[0].kind == sourceRemove
+	if len(operations) != 0 && !remove {
+		// Branch before beginMutationCommit: it registers ordinary source
+		// authority even before markCommitted. The durable transaction is the
+		// sole authority for forward effects and restoration alike.
+		if len(operations) != 1 {
+			return nil, fmt.Errorf("%w: invalid source operation", errMutationNotApplied)
+		}
+		operation := operations[0]
+		if !mutationPathAdmitted(ctx, pathkey.MutationKey(absPath)) {
+			return nil, fmt.Errorf("%w: batch source path is not held for mutation", errMutationNotApplied)
+		}
+		if err := guardCheckoutMutationPath(ctx, absPath); err != nil {
+			return nil, err
+		}
+		// No cancellation or per-file Prepare here: the coordinator has crossed
+		// its existing commit boundary and must reach a durable terminal state.
+		ops := s.batchDurability()
+		switch operation.kind {
+		case batchForwardWrite:
+			writer := ops.writeFile
+			if s.batchWriteOverride != nil {
+				writer = s.batchWriteOverride
+			}
+			writer = s.observedBatchFileWriter(operation.observation, writer)
+			return nil, s.writeAcknowledgedBatchFile(ctx, writer, absPath, data, perm)
+		case batchForwardRemove:
+			remover := ops.removeFile
+			if s.batchRemoveOverride != nil {
+				remover = s.batchRemoveOverride
+			}
+			return nil, s.removeAcknowledgedBatchFile(ctx, remover, absPath)
+		case batchRestoreWrite:
+			return nil, ops.writeFile(absPath, data, perm)
+		case batchRestoreRemove:
+			return nil, ops.removeFile(absPath)
+		default:
+			return nil, fmt.Errorf("%w: invalid batch source operation", errMutationNotApplied)
+		}
+	}
 	record := s.beginMutationCommit(ctx, tool, mutationID, fingerprint, relPath, absPath)
 	if s.mutationPreCommitHook != nil {
 		s.mutationPreCommitHook(record)
@@ -745,14 +807,21 @@ func (s *Server) commitFileMutation(
 		record.markNotApplied(err)
 		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
 	}
+	if !mutationPathAdmitted(ctx, pathkey.MutationKey(absPath)) {
+		err := fmt.Errorf("%w: source path is not held for mutation", errMutationNotApplied)
+		record.markNotApplied(err)
+		return record, err
+	}
 	// UTF-16 sources refuse every write (#846): the indexer decodes them for
 	// extraction, so their symbols are discoverable and every tool that
 	// writes from graph positions — present or future — funnels here.
 	// Splicing UTF-8 into NUL-interleaved bytes corrupts the file; the
 	// refusal names the encoding and the re-encode escape hatch.
-	if err := guardUTF16SourceWrite(tool, relPath, absPath); err != nil {
-		record.markNotApplied(err)
-		return record, err
+	if !remove {
+		if err := guardUTF16SourceWrite(tool, relPath, absPath); err != nil {
+			record.markNotApplied(err)
+			return record, err
+		}
 	}
 	if err := prepareCheckoutMutation(ctx, absPath); err != nil {
 		record.markNotApplied(err)
@@ -777,18 +846,34 @@ func (s *Server) commitFileMutation(
 	record.mu.Unlock()
 	indexer.StampPublicationPhase(ctx, indexer.PublicationDiskWriteStarted)
 	diskLap := s.beginAcknowledgementLap(ctx, editAckDiskWrite)
-	writeErr := agents.AtomicWriteFile(absPath, data, perm)
+	var writeErr error
+	if remove {
+		writeErr = platform.RemoveFile(absPath)
+		if errors.Is(writeErr, os.ErrNotExist) {
+			writeErr = nil
+		}
+	} else {
+		writeErr = agents.AtomicWriteFile(absPath, data, perm)
+	}
 	diskLap.finish() // actual call end, before committed-hash/receipt bookkeeping
 	if err := writeErr; err != nil {
 		record.markFailed(err)
 		return record, err
 	}
 	if state := checkoutMutationFromContext(ctx); state != nil {
-		sum := sha256.Sum256(data)
-		state.committedHash = hex.EncodeToString(sum[:])
+		if remove {
+			state.committedHash = ""
+		} else {
+			sum := sha256.Sum256(data)
+			state.committedHash = hex.EncodeToString(sum[:])
+		}
 		state.committedPath = absPath
 	}
-	record.markCommitted(gitBlobSHA(data), len(data))
+	if remove {
+		record.markCommitted("", 0)
+	} else {
+		record.markCommitted(gitBlobSHA(data), len(data))
+	}
 	return record, nil
 }
 
