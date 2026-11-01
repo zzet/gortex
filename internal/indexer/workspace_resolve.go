@@ -6,6 +6,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -554,6 +555,10 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materi
 }
 
 func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) {
+	mi.runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
+}
+
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) {
 	if len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
 		return
 	}
@@ -561,7 +566,7 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, ed
 	if cr == nil {
 		return
 	}
-	cr.ResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles)
+	cr.ResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, observe)
 	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
 }
