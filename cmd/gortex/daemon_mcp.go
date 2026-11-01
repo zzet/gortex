@@ -845,16 +845,19 @@ func (d *mcpDispatcher) notTrackedError(sess *daemon.Session, inbound []byte) []
 	}
 	_ = json.Unmarshal(inbound, &peek)
 
+	// Tool arguments cannot change session admission. Point callers to an
+	// explicit listing instead of enumerating unrelated repositories per error.
+	const recovery = "Use `gortex repos` to list tracked repositories, then reconnect MCP with its working directory inside the intended repository."
 	resp := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      peek.ID,
 		"error": map[string]any{
 			"code":    -32000,
-			"message": fmt.Sprintf("repository not tracked: %s", sess.CWD),
+			"message": fmt.Sprintf("repository not tracked: %s. %s", sess.CWD, recovery),
 			"data": map[string]any{
 				"error_code": "repo_not_tracked",
 				"path":       sess.CWD,
-				"suggestion": fmt.Sprintf("Run `gortex track %s` to include this repo in the shared graph.", sess.CWD),
+				"suggestion": fmt.Sprintf("%s Alternatively, run `gortex track %s` to include this repo in the shared graph.", recovery, sess.CWD),
 			},
 		},
 	}
