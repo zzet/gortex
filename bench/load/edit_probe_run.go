@@ -692,6 +692,10 @@ func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.Cancel
 	corpus := repo.Corpus
 	corpus.EditOutput = r.stepProbeMode(s.step)
 	for index, oracle := range editProbeOracles(corpus, s.step) {
+		if r.plan.GateModes && r.stepProbeMode(s.step) != "compact" {
+			oracle.call.Arguments = copyJSON(oracle.call.Arguments)
+			oracle.call.Arguments["require_fresh"] = true
+		}
 		s.probes.Go(func() {
 			ticker := time.NewTicker(editProbePeriod)
 			defer ticker.Stop()
