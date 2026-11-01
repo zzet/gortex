@@ -47,7 +47,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		if phase.NeverSeen > 0 {
 			phase.Errors = append(phase.Errors, fmt.Sprintf("%d acknowledged edits never visible before product deadline", phase.NeverSeen))
 		}
-		if scenario != "cold" && scenario != "restart" && len(phase.Tools) == 0 {
+		if scenario != "cold" && scenario != "restart" && scenario != "idle-stop" && len(phase.Tools) == 0 {
 			phase.Errors = append(phase.Errors, "no workload calls observed before phase end")
 		}
 		if resultErr != nil {
@@ -82,11 +82,30 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			}
 		}
 	}
-	p, err := newPrivateRun(ctx, outputRoot, o.Binary, selected)
+	p := o.smokeState
+	var err error
+	if p == nil {
+		p, err = newPrivateRun(ctx, outputRoot, o.Binary, selected)
+	} else {
+		err = validateSmokeOwner(p, o.Binary, selected)
+	}
 	if err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
 	artifacts["private_root"] = p.Root
+	firstStart := p.startCount + 1
+	if o.smokeState != nil {
+		info, statErr := os.Stat(p.Store)
+		present := statErr == nil
+		if p.startCount == 0 && !errors.Is(statErr, os.ErrNotExist) || p.startCount > 0 && (statErr != nil || info.Size() == 0) {
+			return phase, nil, artifacts, crashes, "", errors.New("smoke needs one initially absent store, then the same nonempty retained store")
+		}
+		data, err := json.Marshal(map[string]any{"owned_root": p.Root, "binary": p.Binary, "starts_before_phase": p.startCount, "store_present": present})
+		if err != nil {
+			return phase, nil, artifacts, crashes, "", err
+		}
+		phase.Gate["pr_smoke_store"] = data
+	}
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), o.StopTimeout)
 		elapsed, forced, err := p.stop(stopCtx)
@@ -98,15 +117,24 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 		phase.Metrics["force_killed"] = measured(forcedValue, "boolean")
 		resultErr = errors.Join(resultErr, err)
-		logArtifacts, logCrashes, err := collectLogs(p.Root)
+		var logArtifacts map[string]string
+		var logCrashes map[string]int
+		if o.smokeState == nil {
+			logArtifacts, logCrashes, err = collectLogs(p.Root)
+		} else {
+			logArtifacts, logCrashes, err = collectRunLogs(p.Root, outputRoot, firstStart)
+		}
 		for name, path := range logArtifacts {
 			artifacts[name] = path
 		}
 		for name, count := range logCrashes {
 			crashes[name] += count
 		}
-		resultErr = errors.Join(resultErr, err, collectPatchWrites(logArtifacts, &phase), os.RemoveAll(p.SocketDir))
-		if !o.KeepState {
+		resultErr = errors.Join(resultErr, err, collectPatchWrites(logArtifacts, &phase))
+		if o.smokeState == nil {
+			resultErr = errors.Join(resultErr, os.RemoveAll(p.SocketDir))
+		}
+		if !o.KeepState && o.smokeState == nil {
 			resultErr = errors.Join(resultErr, p.removeState())
 		}
 	}()
@@ -212,6 +240,11 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 	}
 	finishStartup()
+	if len(o.smokeMarkers) > 0 {
+		if err := awaitSmokeRestoration(warmCtx, o, p, clients[0], &phase); err != nil {
+			return phase, nil, artifacts, crashes, version, err
+		}
+	}
 	if scenario == "restart" {
 		for _, client := range clients {
 			_ = client.Close()
@@ -275,7 +308,9 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	phase.Metrics["mcp_sessions"] = measured(float64(len(clients)), "sessions")
 	captureReceipt(ctx, p, clients[0], &phase)
 	sampler := newProcessSampler()
-	if o.pairedDriver != nil {
+	if scenario == "idle-stop" {
+		err = measureIdleStop(ctx, p, clients, &phase, sampler, group)
+	} else if o.pairedDriver != nil {
 		err = o.pairedDriver(ctx, p, clients, sweepClients, &phase)
 	} else {
 		err = measureStandalone(ctx, o, p, clients, sweepClients, sweepRequests, sweep, &phase, artifacts, sampler, group)
@@ -286,7 +321,9 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	if scenario == "sweep" {
 		finalizeSweepInventory(sweep, phase.Attempts, o.SweepRepetitions, &phase)
 	}
-	captureReceipt(ctx, p, clients[0], &phase)
+	if scenario != "idle-stop" {
+		captureReceipt(ctx, p, clients[0], &phase)
+	}
 	for i, client := range clients {
 		client.mu.Lock()
 		data, marshalErr := json.Marshal(struct {
@@ -373,6 +410,12 @@ func dispatchArgs(r request, repo privateRepo) map[string]any {
 }
 
 func runAgents(parent context.Context, o runOptions, p *privateRun, clients []*socketClient, editing bool, phase *Phase) error {
+	if o.PRSmokeDrain > 0 {
+		if editing {
+			return errors.New("offered-window/drain for edit/probe work is unsupported")
+		}
+		return runPRSmokeReads(parent, o, p, clients, phase)
+	}
 	ctx, cancel := context.WithTimeout(parent, o.Duration)
 	defer cancel()
 	var mu sync.Mutex
