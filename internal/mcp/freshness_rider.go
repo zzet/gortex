@@ -574,7 +574,29 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 			states[key] = pathState{state, generation}
 		}
 	}
+	putTiers := func(path string, tiers indexer.MutationTierState) {
+		at := tiers.RelationsAt
+		if scope == "file" {
+			at = tiers.FileGraphAt
+		} else if scope == "derived" {
+			at = tiers.DerivedAt
+		}
+		state := ""
+		if tiers.Failed {
+			state = "failed"
+		} else if at.IsZero() || scope == "derived" && tiers.Partial {
+			state = "pending"
+		}
+		if state != "" {
+			put(path, state, tiers.Generation)
+		}
+	}
 	if len(snapshots) > 0 {
+		if snapshot, ok := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); ok {
+			for path, tiers := range snapshot.paths {
+				putTiers(path, tiers)
+			}
+		}
 		for _, receipt := range snapshots[0] {
 			state := "pending"
 			if outcome := receipt.outcome(true); !outcome.Pending && (outcome.Err != nil || !outcome.Reindexed) {
@@ -585,21 +607,7 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 	}
 	if paths, watched := s.canonicalTierPaths(ctx); watched {
 		for path, tiers := range paths {
-			at := tiers.RelationsAt
-			if scope == "file" {
-				at = tiers.FileGraphAt
-			} else if scope == "derived" {
-				at = tiers.DerivedAt
-			}
-			state := ""
-			if tiers.Failed {
-				state = "failed"
-			} else if at.IsZero() || scope == "derived" && tiers.Partial {
-				state = "pending"
-			}
-			if state != "" {
-				put(path, state, tiers.Generation)
-			}
+			putTiers(path, tiers)
 		}
 	} else {
 		for _, receipt := range s.laggingMutationReceipts(ctx) {
@@ -643,19 +651,21 @@ func (s *Server) canonicalTierPaths(ctx context.Context) (map[string]indexer.Mut
 type toolFreshnessSnapshotKey struct{}
 type toolFreshnessSnapshot struct {
 	receipts []*mutationReceipt
+	paths    map[string]indexer.MutationTierState
 	startup  bool
 }
 
 func (s *Server) captureToolFreshness(ctx context.Context) context.Context {
 	receipts := s.laggingMutationReceipts(ctx)
+	paths, _ := s.canonicalTierPaths(ctx)
 	startup := s.multiIndexer != nil && s.multiIndexer.RelationsPending()
-	if len(receipts) == 0 && !startup {
+	if len(receipts) == 0 && len(paths) == 0 && !startup {
 		if _, exists := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); exists {
 			return context.WithValue(ctx, toolFreshnessSnapshotKey{}, toolFreshnessSnapshot{})
 		}
 		return ctx
 	}
-	return context.WithValue(ctx, toolFreshnessSnapshotKey{}, toolFreshnessSnapshot{receipts, startup})
+	return context.WithValue(ctx, toolFreshnessSnapshotKey{}, toolFreshnessSnapshot{receipts: receipts, paths: paths, startup: startup})
 }
 
 func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, files []string) {
