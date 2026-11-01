@@ -148,3 +148,31 @@ func TestEditGateFacadeRequiresMatchingDispatchEnvelopeAndActualJSON(t *testing.
 		})
 	}
 }
+
+func TestEditGateJSONAndFacadeRefuseNullPayloadWithoutPanic(t *testing.T) {
+	for _, mode := range []string{"json", "facade"} {
+		t.Run(mode, func(t *testing.T) {
+			defer func() {
+				if value := recover(); value != nil {
+					t.Errorf("invalid actual response panicked instead of refusing evidence: %v", value)
+				}
+			}()
+			raw := outputWire("null", nil)
+			if mode == "facade" {
+				var envelope map[string]any
+				if err := json.Unmarshal(raw, &envelope); err != nil {
+					t.Fatal(err)
+				}
+				envelope["_meta"] = map[string]any{"gortex_facade": map[string]any{"surface_version": "facade-v1", "facade": "read", "operation": "summary", "canonical_tool": "get_file_summary"}}
+				var err error
+				raw, err = json.Marshal(envelope)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := decodeEditProbeOutput(raw, mode, "read.summary"); err == nil {
+				t.Error("null payload counted as a decoded answer")
+			}
+		})
+	}
+}

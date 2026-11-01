@@ -72,6 +72,9 @@ func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[s
 		if err := decoder.Decode(&body); err != nil {
 			return nil, err
 		}
+		if body == nil {
+			return nil, errors.New("requested JSON must return an object, not null")
+		}
 		if facade {
 			body[editProbeFacadeWireKey] = editProbeFacadeWire{operation: operation}
 		}

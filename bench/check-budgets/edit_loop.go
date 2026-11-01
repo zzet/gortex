@@ -234,7 +234,7 @@ func decodeEditLoopWire(phase phase) (editLoopWire, error) {
 }
 
 func assessEditLoopRow(b budget, dataset dataset) editLoopRow {
-	row := editLoopRow{Metric: b.Metric, Scenario: b.Scenario, State: "UNAVAILABLE", Budget: b.Target, Unit: b.Unit}
+	row := editLoopRow{Metric: b.Metric, Scenario: b.Scenario, State: "UNAVAILABLE", Budget: b.Target, Unit: b.Unit, Baseline: editLoopBaseline(b, dataset)}
 	values := make([]float64, 0, dataset.config.repeats(b.Scenario))
 	verdict := -1
 	for repeat := 1; repeat <= dataset.config.repeats(b.Scenario); repeat++ {
@@ -275,11 +275,49 @@ func assessEditLoopRow(b budget, dataset dataset) editLoopRow {
 		value = slices.Min(values)
 	}
 	row.Value = &value
+	if row.Baseline != nil {
+		delta := value - *row.Baseline
+		row.Delta = &delta
+	}
 	row.State = "FAIL"
 	if verdict == 1 {
 		row.State = "PASS"
 	}
 	return row
+}
+
+// The WAL policy explicitly adopts each shipped release peak as the p95
+// baseline. Other rows use actual matched shipped reports when available;
+// the historical development-machine ACK numbers are not reference-host data.
+func editLoopBaseline(b budget, d dataset) *float64 {
+	if b.Metric == "wal_p95_mib" {
+		if value, exists := map[string]float64{"loadedit-1": 1007, "loadedit-4": 1059, "loadedit-8": 960, "multirepoedit-6": 760}[b.Scenario]; exists {
+			return &value
+		}
+	}
+	values := make([]float64, 0, d.config.repeats(b.Scenario))
+	for repeat := 1; repeat <= d.config.repeats(b.Scenario); repeat++ {
+		found := false
+		for _, observation := range d.runs {
+			if observation.input.Role != "tag" || observation.input.HostClass != b.HostClass || observation.input.Scenario != b.Scenario || observation.input.Repeat != repeat {
+				continue
+			}
+			value, err := measureEditLoopRow(observation.data.Phases[0], b.Metric)
+			if err != nil {
+				return nil
+			}
+			values = append(values, value)
+			found = true
+		}
+		if !found {
+			return nil
+		}
+	}
+	value, err := median(values)
+	if err != nil {
+		return nil
+	}
+	return &value
 }
 
 func editLoopCompare(value, target float64, compare string) bool {
