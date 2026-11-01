@@ -141,3 +141,64 @@ func TestLookupTraversalDoesNotStarveTopologyOrResolverLocks(t *testing.T) {
 
 	<-done
 }
+
+// openSeedAndCaller opens a SQLite store holding one seed and its caller.
+func openSeedAndCaller(t *testing.T) *store_sqlite.Store {
+	t.Helper()
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "reach.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	store.AddBatch([]*graph.Node{
+		{ID: "seed", Kind: graph.KindFunction, Name: "seed"},
+		{ID: "caller", Kind: graph.KindFunction, Name: "caller"},
+	}, []*graph.Edge{{From: "caller", To: "seed", Kind: graph.EdgeCalls, Confidence: 1}})
+	return store
+}
+
+// A SQLite read runs on its own snapshot, so a resolver or enrichment pass that
+// holds ResolveMutex must not make an impact lookup wait for it.
+func TestLookupDoesNotWaitForSQLiteResolveMutex(t *testing.T) {
+	store := openSeedAndCaller(t)
+	store.ResolveMutex().Lock()
+	defer store.ResolveMutex().Unlock()
+	started := time.Now()
+	d1, _, _, hit, truncated := LookupContext(t.Context(), store, "seed")
+	if elapsed := time.Since(started); elapsed > lookupTimeout/3 {
+		t.Fatalf("lookup waited %s behind ResolveMutex", elapsed)
+	}
+	if !hit || truncated || joinIDs(d1) != "caller" {
+		t.Fatalf("d1=%v hit=%v truncated=%v, want the caller as an exact hit", d1, hit, truncated)
+	}
+}
+
+// A record write rewrites the seed's whole row, so on SQLite too it waits for a
+// pass that holds ResolveMutex while it rewrites rows.
+func TestReachRecordWritesWaitForSQLiteResolveMutex(t *testing.T) {
+	store := openSeedAndCaller(t)
+	mu := store.ResolveMutex()
+
+	mu.Lock()
+	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	BuildIndexCtx(ctx, store)
+	cancel()
+	mu.Unlock()
+	if _, _, _, hit, _ := LookupCached(store, "seed"); hit {
+		t.Fatal("the eager build published a record while ResolveMutex was held")
+	}
+
+	mu.Lock()
+	cleared := make(chan struct{})
+	go func() {
+		ClearIndex(store)
+		close(cleared)
+	}()
+	select {
+	case <-cleared:
+		t.Error("ClearIndex rewrote rows while ResolveMutex was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	mu.Unlock()
+	<-cleared
+}
