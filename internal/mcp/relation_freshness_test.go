@@ -292,7 +292,7 @@ func TestRelationToolsLabelAndNeverRefuseWithUnresolvedReceipt(t *testing.T) {
 		writeUnindexed(t, root, "namer.go", "package p\n\nfunc Namer() {\n\tTarget()\n}\n"), 1)
 	id := targetID(t, s)
 	rename := `{"changes":{"target.go":[{"range":{"start":{"line":2,"character":5},"end":{"line":2,"character":11}},"newText":"Renamed"}]}}`
-	comment := `{"changes":{"file://` + filepath.ToSlash(filepath.Join(root, "namer.go")) +
+	comment := `{"changes":{"` + nativeFileURI(filepath.Join(root, "namer.go")) +
 		`":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"// Namer names Target.\n"}]}}`
 
 	for tool, call := range map[string]func() *mcpgo.CallToolResult{
