@@ -113,6 +113,7 @@ func summarizeCheckoutDiscovery(attempts []Attempt, checkouts []checkoutDiscover
 // throughout the additions. Discovery probes own separate root/subdirectory
 // sessions; every refusal remains an attempt instead of being retried away.
 func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRun, clients []*socketClient, phase *Phase) (resultErr error) {
+	phase.SessionModel = "per_agent_plus_new_worktree_root_and_subdirectory_probes"
 	ctx, cancel := context.WithTimeout(parent, o.Duration)
 	defer cancel()
 	frozen := *p
