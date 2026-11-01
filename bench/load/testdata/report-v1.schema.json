@@ -1833,6 +1833,9 @@
                           "additionalProperties": {
                             "additionalProperties": false,
                             "properties": {
+                              "claims_fresh": {
+                                "type": "integer"
+                              },
                               "decode_failures": {
                                 "type": "integer"
                               },
@@ -1846,7 +1849,8 @@
                             "required": [
                               "probe_answers",
                               "observed_edits",
-                              "decode_failures"
+                              "decode_failures",
+                              "claims_fresh"
                             ],
                             "type": "object"
                           },

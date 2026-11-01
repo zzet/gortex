@@ -33,7 +33,11 @@ func editLoopEvidenceFixture(t *testing.T) report {
 	}
 	coverage := map[string]any{}
 	for _, mode := range modes {
-		coverage[mode] = map[string]any{"probe_answers": 20, "observed_edits": 20, "decode_failures": 0, "claims_fresh": 20, "claims_fresh_observable": true, "stale_claimed_fresh": value(0, "answers")}
+		tools := map[string]any{}
+		for _, tool := range []string{"read.source", "read.summary", "read.editing_context", "search.symbols", "search.text", "relations.callers", "trace.call_chain"} {
+			tools[tool] = map[string]any{"probe_answers": 20, "observed_edits": 20, "decode_failures": 0, "claims_fresh": 20}
+		}
+		coverage[mode] = map[string]any{"tools": tools, "probe_answers": 140, "observed_edits": 20, "decode_failures": 0, "claims_fresh": 140, "claims_fresh_observable": true, "stale_claimed_fresh": value(0, "answers")}
 	}
 	phase["edit_probe"] = map[string]any{"plan": map[string]any{"gate_modes": true, "count": 100, "editors": 4, "mode": "json", "arrival": "precomputed_open_loop_poisson", "mean_interarrival_ns": int64(15000000000), "session_model": workload["session_model"], "steps": steps}, "edits": records, "output_modes": coverage}
 	data, err := json.Marshal(raw)
@@ -125,5 +129,67 @@ func TestEditLoopModeCoverageCannotBorrowAnotherEditOrMissingFreshClaims(t *test
 				t.Fatal("missing/refused per-mode evidence became zero-stale")
 			}
 		})
+	}
+}
+
+func TestEditLoopModeCoverageRequiresEveryApplicableTool(t *testing.T) {
+	for _, variant := range []string{"missing_tool", "one_edit", "decode_failed", "missing_fresh_claim"} {
+		t.Run(variant, func(t *testing.T) {
+			r := editLoopEvidenceFixture(t)
+			var raw map[string]any
+			if err := json.Unmarshal(r.Phases[0].EditProbe, &raw); err != nil {
+				t.Fatal(err)
+			}
+			tools := raw["output_modes"].(map[string]any)["json"].(map[string]any)["tools"].(map[string]any)
+			tool := tools["read.summary"].(map[string]any)
+			switch variant {
+			case "missing_tool":
+				delete(tools, "read.summary")
+			case "one_edit":
+				tool["observed_edits"] = 1
+			case "decode_failed":
+				tool["decode_failures"] = 1
+			case "missing_fresh_claim":
+				delete(tool, "claims_fresh")
+			}
+			data, err := json.Marshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Phases[0].EditProbe = data
+			if _, err := measureEditLoopRow(r.Phases[0], "silent_stale_json"); err == nil {
+				t.Fatal("another tool lent coverage or freshness credit to an unproved tool")
+			}
+		})
+	}
+}
+
+func TestEditLoopNightlySingleEditorRetainsItsOfferedSchedule(t *testing.T) {
+	r := editLoopEvidenceFixture(t)
+	var workload, raw map[string]any
+	if err := json.Unmarshal(r.Workload, &workload); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(r.Phases[0].EditProbe, &raw); err != nil {
+		t.Fatal(err)
+	}
+	session := "one_editor_plus_one_separate_prober_per_edit"
+	workload["edit_agents"], workload["session_model"] = 1, session
+	plan := raw["plan"].(map[string]any)
+	plan["editors"], plan["session_model"] = 1, session
+	var err error
+	r.Workload, err = json.Marshal(workload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Phases[0].EditProbe, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Phases[0].SessionModel, r.Phases[0].Duration = session, 1500
+	r.Phases[0].Gate["edit_loop_wall"] = json.RawMessage(`{"clock":"monotonic","wall_ns":1500000000000,"complete":true}`)
+	config := inputs{CandidateRevision: strings.Repeat("a", 40), Hosts: map[string]string{"reference_linux": "synthetic-host"}}
+	if err := validateEditLoopReport(config, runInput{Role: "candidate", HostClass: "reference_linux", Scenario: "loadedit-1"}, r); err != nil {
+		t.Fatalf("nightly's 100 edits at the original 15-second single-editor cadence got an invented smoke deadline: %v", err)
 	}
 }

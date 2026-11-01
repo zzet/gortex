@@ -46,6 +46,9 @@ func TestEditGateRuntimeReadsEveryRequiredKindAndRetainsLiveTiers(t *testing.T) 
 	run.doEdit(ctx, step)
 	state := run.states[0]
 	state.finishRaw()
+	if len(state.record.Readbacks) == 0 || state.record.Readbacks[0].Kind != "source" {
+		t.Error("edit + one read must end at the first symbol-source/summary response, not read_file")
+	}
 	seen := map[string]bool{}
 	for _, back := range state.record.Readbacks {
 		seen[back.Kind] = true

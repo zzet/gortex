@@ -29,6 +29,7 @@ type editProbeToolCoverage struct {
 	ProbeAnswers   int `json:"probe_answers"`
 	ObservedEdits  int `json:"observed_edits"`
 	DecodeFailures int `json:"decode_failures"`
+	ClaimsFresh    int `json:"claims_fresh"`
 }
 
 type editProbeModeCoverage struct {
@@ -56,8 +57,8 @@ type editProbeGateCounts struct {
 }
 
 type editProbeGateToolCounts struct {
-	answers, decodeFailures int
-	edits                   map[int]bool
+	answers, decodeFailures, claimsFresh int
+	edits                                map[int]bool
 }
 
 // Answers count by each oracle request's actual output mode. A mode without
@@ -85,7 +86,7 @@ func editProbeOutputCoverage(selected string, counts map[string]editProbeModeCou
 			if gate != nil {
 				observed = len(gate.edits)
 				for tool, count := range gate.tools {
-					coverage.Tools[tool] = editProbeToolCoverage{ProbeAnswers: count.answers, ObservedEdits: len(count.edits), DecodeFailures: count.decodeFailures}
+					coverage.Tools[tool] = editProbeToolCoverage{ProbeAnswers: count.answers, ObservedEdits: len(count.edits), DecodeFailures: count.decodeFailures, ClaimsFresh: count.claimsFresh}
 				}
 			}
 			coverage.ObservedEdits = &observed
@@ -183,6 +184,7 @@ func (r *editProbeRuntime) countGateMode(step editProbeStep, mode, tool string, 
 		toolCount.decodeFailures++
 	}
 	if fresh {
+		toolCount.claimsFresh++
 		gate.claimsFresh++
 	}
 	if stale {

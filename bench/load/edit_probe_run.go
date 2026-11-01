@@ -897,7 +897,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	s.signalAck()
 	readbackKinds := []string{"file", "source"}
 	if r.plan.GateModes {
-		readbackKinds = append(readbackKinds, "summary", "search_visible", "text")
+		readbackKinds = []string{"source", "file", "summary", "search_visible", "text"}
 	}
 	if step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
 		readbackKinds = append(readbackKinds, "old_source_absent")
@@ -1083,7 +1083,7 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 		back.ObservationOnly = observeOnly[kind]
 		s.mu.Lock()
 		if r.plan.GateModes && index == 0 {
-			metric := unavailable("ms", "first same-editor readback endpoint missing or incorrect")
+			metric := unavailable("ms", "first same-editor symbol-source readback endpoint missing or incorrect")
 			if back.Correct && !identity.Finished.IsZero() && !s.started.IsZero() && !identity.Finished.Before(s.started) {
 				metric = measured(float64(identity.Finished.Sub(s.started))/float64(time.Millisecond), "ms")
 			}

@@ -54,6 +54,12 @@ type editLoopWire struct {
 		Errors []string `json:"errors"`
 	} `json:"edits"`
 	Modes map[string]struct {
+		Tools map[string]struct {
+			ObservedEdits  *int `json:"observed_edits"`
+			Answers        int  `json:"probe_answers"`
+			DecodeFailures int  `json:"decode_failures"`
+			ClaimsFresh    *int `json:"claims_fresh"`
+		} `json:"tools"`
 		ObservedEdits  *int   `json:"observed_edits"`
 		ClaimsFresh    *int   `json:"claims_fresh"`
 		Answers        int    `json:"probe_answers"`
@@ -156,7 +162,7 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 		}
 	}
 	phase := r.Phases[0]
-	if phase.Name != "edit-and-probe" || phase.SessionModel == "" || len(phase.Errors) != 0 || !finiteNonnegative(phase.Duration) || phase.Duration <= 0 || phase.Duration > 900 {
+	if phase.Name != "edit-and-probe" || phase.SessionModel == "" || len(phase.Errors) != 0 || !finiteNonnegative(phase.Duration) || phase.Duration <= 0 || input.Scenario == "loadedit-4" && phase.Duration > 900 {
 		return errors.New("edit-loop phase incomplete or exceeds the 15-minute gate")
 	}
 	var wall struct {
@@ -164,7 +170,7 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 		NS       *int64 `json:"wall_ns"`
 		Complete bool   `json:"complete"`
 	}
-	if json.Unmarshal(phase.Gate["edit_loop_wall"], &wall) != nil || wall.Clock != "monotonic" || wall.NS == nil || *wall.NS <= 0 || *wall.NS > 900000000000 || float64(*wall.NS) < phase.Duration*1e9 || !wall.Complete {
+	if json.Unmarshal(phase.Gate["edit_loop_wall"], &wall) != nil || wall.Clock != "monotonic" || wall.NS == nil || *wall.NS <= 0 || input.Scenario == "loadedit-4" && *wall.NS > 900000000000 || float64(*wall.NS) < phase.Duration*1e9 || !wall.Complete {
 		return errors.New("missing, incomplete or over-15-minute whole-run wall observation")
 	}
 	if _, coupled := phase.Gate["paired_measurement_window"]; coupled {
@@ -319,6 +325,12 @@ func measureEditLoopRow(phase phase, name string) (float64, error) {
 		}
 		if !exists || expected == 0 || coverage.ObservedEdits == nil || *coverage.ObservedEdits != expected || coverage.ClaimsFresh == nil || *coverage.ClaimsFresh <= 0 || coverage.Answers < expected || coverage.DecodeFailures != 0 || !coverage.Observable {
 			return 0, errors.New("missing or unobservable actual output-mode coverage; absent freshness is never zero-stale")
+		}
+		for _, name := range []string{"read.source", "read.summary", "read.editing_context", "search.symbols", "search.text", "relations.callers", "trace.call_chain"} {
+			tool, exists := coverage.Tools[name]
+			if !exists || tool.ObservedEdits == nil || *tool.ObservedEdits != expected || tool.Answers < expected || tool.DecodeFailures != 0 || tool.ClaimsFresh == nil || *tool.ClaimsFresh <= 0 {
+				return 0, fmt.Errorf("missing actual %s/%s coverage or explicit freshness claims", mode, name)
+			}
 		}
 		return number(coverage.Stale, "answers")
 	}
