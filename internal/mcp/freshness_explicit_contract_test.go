@@ -57,11 +57,12 @@ func TestRequireFreshReportsExplicitGraphTier(t *testing.T) {
 				req.Params.Name = "get_callers"
 				req.Params.Arguments = map[string]any{"id": "repo/target.go::Target", "require_fresh": true, "freshness_scope": scope, "format": format}
 				body := "callers[0]{id}:"
-				if format == "json" {
+				switch format {
+				case "json":
 					body = `{"callers":[],"complete":false}`
-				} else if format == "gcx" {
+				case "gcx":
 					body = "GCX1 tool=get_callers\nrow1"
-				} else if format == "compact" {
+				case "compact":
 					req.Params.Arguments.(map[string]any)["compact"] = true
 				}
 				original := mcp.NewToolResultText(body)
@@ -70,7 +71,8 @@ func TestRequireFreshReportsExplicitGraphTier(t *testing.T) {
 					require.Same(t, original, got, "compact has no new explicit-fresh contract")
 					return
 				}
-				if format == "json" {
+				switch format {
+				case "json":
 					payload := resultJSON(t, got)
 					fields, ok := payload["freshness"].(map[string]any)
 					require.True(t, ok, resultText(got))
@@ -78,10 +80,10 @@ func TestRequireFreshReportsExplicitGraphTier(t *testing.T) {
 					require.Equal(t, scope, fields["freshness_scope"])
 					require.EqualValues(t, 0, fields["pending_file_count"])
 					require.Equal(t, false, payload["complete"], "freshness must preserve an answer's completeness")
-				} else if format == "gcx" {
+				case "gcx":
 					require.Contains(t, resultText(got), "graph_freshness=fresh")
 					require.Contains(t, resultText(got), "# "+scope+": fresh (0 files)\n")
-				} else {
+				default:
 					require.True(t, strings.HasPrefix(resultText(got), scope+": fresh (0 files)\n"), resultText(got))
 				}
 			})
