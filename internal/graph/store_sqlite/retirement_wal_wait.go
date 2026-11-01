@@ -115,9 +115,15 @@ func (s *Store) AwaitWarmupWAL(ctx context.Context) error {
 	if mark <= 0 || s.dbPath == "" {
 		return nil
 	}
-	return s.waitForWALReclaim(ctx, retirementWALWaitMax, func() bool {
+	ready := func() bool {
 		return s.retirementLogBytes() < mark && walFileSize(s.dbPath+"-wal") <= ceiling/2
-	})
+	}
+	if ready() {
+		return nil
+	}
+	s.warmupWALWaiters.Add(1)
+	defer s.warmupWALWaiters.Add(-1)
+	return s.waitForWALReclaim(ctx, retirementWALWaitMax, ready)
 }
 
 func (s *Store) waitForWALReclaim(ctx context.Context, maxWait time.Duration, ready func() bool) error {

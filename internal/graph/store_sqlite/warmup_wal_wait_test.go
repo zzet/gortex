@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -85,6 +86,49 @@ func TestWarmupWALWaitKeepsPhysicalHeadroomAfterLogicalReset(t *testing.T) {
 	require.LessOrEqual(t, walFileSize(s.dbPath+"-wal"), int64(4<<20))
 }
 
+// Exercise the production large-file shrink branch as well as the small-file
+// TRUNCATE path above. Extending only dead space after a real restart leaves a
+// valid reusable WAL prefix; no synthetic frontier or successful copy is forged.
+func TestWarmupWALWaitReclaimsLargeRetainedAllocation(t *testing.T) {
+	s, db := warmupWALFixture(t)
+	_, err := checkpointWALOnceOn(t.Context(), db, "RESTART")
+	require.NoError(t, err)
+	s.writeMu.Lock()
+	_, err = s.writerDB.Exec(`UPDATE wal_churn SET payload='large-retained-allocation' WHERE id=1`)
+	if err == nil {
+		err = os.Truncate(s.dbPath+"-wal", walShrinkInPlaceBytes+walShrinkKeepBytes)
+	}
+	s.writeMu.Unlock()
+	require.NoError(t, err)
+	require.Greater(t, walFileSize(s.dbPath+"-wal"), int64(512<<20))
+	require.Less(t, s.retirementLogBytes(), int64(1<<20))
+	lane := &fakeBuildLane{}
+	lane.install(s)
+	lane.held.Store(true)
+	defer lane.held.Store(false)
+	releaseWriter := s.AnnounceWrite()
+	defer func() { releaseWriter() }()
+	startWarmupFixtureReclaimer(t, s, "1024")
+	refused, stop := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	require.ErrorIs(t, s.AwaitWarmupWAL(refused), context.DeadlineExceeded)
+	stop()
+	require.Zero(t, s.warmupWALWaiters.Load(), "refused producer retained its lane exception")
+	require.Zero(t, s.WALReclaimStats().ShrinkSlices, "warm wait bypassed foreground writer priority")
+	require.Equal(t, walShrinkInPlaceBytes+walShrinkKeepBytes, walFileSize(s.dbPath+"-wal"))
+	releaseWriter()
+	releaseWriter = func() {}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, s.AwaitWarmupWAL(ctx))
+	require.Zero(t, s.warmupWALWaiters.Load(), "admitted producer retained its lane exception")
+	require.Eventually(t, func() bool { return s.WALReclaimStats().ShrinkSlices > 0 }, time.Second, time.Millisecond,
+		"production nudge did not shrink retained dead space")
+	require.LessOrEqual(t, walFileSize(s.dbPath+"-wal"), int64(512<<20))
+	var payload string
+	require.NoError(t, s.db.QueryRow(`SELECT payload FROM wal_churn WHERE id=1`).Scan(&payload))
+	require.Equal(t, "large-retained-allocation", payload)
+}
+
 // This is a producer boundary: no next chunk is allocated while an older
 // reader prevents progress. Cancellation refuses it; a real reader release
 // plus checkpoint admits the next actual bounded write.
@@ -160,6 +204,7 @@ func TestWarmupWALWaitGatesNextAllocationUntilReaderProgress(t *testing.T) {
 				require.Zero(t, allocations.Load())
 				require.Equal(t, before, walFileSize(s.dbPath+"-wal"))
 			}
+			require.Zero(t, s.warmupWALWaiters.Load(), "finished boundary retained its lane exception")
 		})
 	}
 }
