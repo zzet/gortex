@@ -451,7 +451,10 @@ func editLoopRowBlocks(row editLoopRow) bool {
 	if row.Scenario == "multirepoedit-6" && row.Metric == "readback_p95" && row.State == "OBSERVATIONAL" && row.Budget == nil && row.Value != nil && finiteNonnegative(*row.Value) && row.Unit == "s" {
 		return false
 	}
-	return row.State != "PASS" && !(row.Metric == "silent_stale_compact" && row.State == "UNOBSERVABLE" && row.Value == nil)
+	if row.Metric == "silent_stale_compact" && row.State == "UNOBSERVABLE" && row.Value == nil {
+		return false
+	}
+	return row.State != "PASS"
 }
 
 func editLoopCompare(value, target float64, compare string) bool {
