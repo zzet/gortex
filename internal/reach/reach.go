@@ -360,11 +360,23 @@ type detachedNodeReader interface {
 // from it. A record write always takes the mutex: it rewrites whole node rows
 // that a pass holding the mutex may be rewriting too.
 func lockResolve(ctx context.Context, g graph.Store) (unlock func(), ok bool) {
+	observer := coordinationWaitObserver(ctx)
 	if detached, isDetached := g.(detachedNodeReader); isDetached && detached.NodeReadsDetached() {
+		if observer != nil {
+			observer(CoordinationWait{Phase: "resolve_mutex_wait", Acquired: true})
+		}
 		return func() {}, true
 	}
+	var started time.Time
+	if observer != nil {
+		started = time.Now()
+	}
 	mu := g.ResolveMutex()
-	if !lockContext(ctx, mu) {
+	ok = lockContext(ctx, mu)
+	if observer != nil {
+		observer(CoordinationWait{Phase: "resolve_mutex_wait", Duration: time.Since(started), Attempted: true, Acquired: ok})
+	}
+	if !ok {
 		return nil, false
 	}
 	return mu.Unlock, true
@@ -1224,7 +1236,7 @@ func lookupContext(parent context.Context, g graph.Store, seedID string, keep Ed
 
 	scope := seedScope(ctx, g, seedID)
 	for retried := false; ; retried = true {
-		releaseTopology, ok := beginTopologyRead(ctx, scope)
+		releaseTopology, ok := observedTopologyRead(ctx, scope)
 		if !ok {
 			return nil, nil, nil, false, true
 		}
