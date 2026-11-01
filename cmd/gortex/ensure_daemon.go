@@ -13,6 +13,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // daemonDecision is the resolved auto-start outcome.
@@ -133,6 +134,26 @@ func waitSpawnLockInterval(ctx context.Context, pause time.Duration) error {
 // reaches this caller. Honor that same process's handoff for one bounded lease;
 // an already-serving daemon must not keep a replacement wait alive forever.
 func daemonStartupHeartbeatWaiter() func(time.Time) bool {
+	return startupHeartbeatWaiterWithOwnerProof(startupRuntimeOwnerMatches)
+}
+
+func startupRuntimeOwnerMatches(state daemon.RuntimeState) bool {
+	if state.ProcessBirthToken == "" {
+		return false
+	}
+	owner, err := platform.CaptureProcessIdentity(state.PID)
+	if err != nil {
+		return false
+	}
+	token, err := owner.Token()
+	if err != nil || token != state.ProcessBirthToken {
+		return false
+	}
+	running, err := owner.Running()
+	return err == nil && running
+}
+
+func startupHeartbeatWaiterWithOwnerProof(ownerMatches func(daemon.RuntimeState) bool) func(time.Time) bool {
 	var ownerPID int
 	var ownerBirth string
 	var handoffUntil time.Time
@@ -142,11 +163,17 @@ func daemonStartupHeartbeatWaiter() func(time.Time) bool {
 			return false
 		}
 		if state.StartupProgressFresh(now, spawnProgressFreshness) {
-			ownerPID, ownerBirth = state.PID, state.ProcessBirthToken
-			handoffUntil = now.Add(spawnProgressFreshness)
+			ownerPID, ownerBirth = 0, ""
+			handoffUntil = time.Time{}
+			// Preserve legacy pre-socket waiting, but grant the new Serving lease
+			// only when the recorded incarnation matches the actual live process.
+			if ownerMatches(state) {
+				ownerPID, ownerBirth = state.PID, state.ProcessBirthToken
+				handoffUntil = now.Add(spawnProgressFreshness)
+			}
 			return true
 		}
-		if state.StartupPhase != daemon.StartupServing || ownerPID <= 0 || state.PID != ownerPID || state.ProcessBirthToken != ownerBirth || !now.Before(handoffUntil) {
+		if state.StartupPhase != daemon.StartupServing || ownerPID <= 0 || state.PID != ownerPID || state.ProcessBirthToken != ownerBirth || !now.Before(handoffUntil) || !ownerMatches(state) {
 			return false
 		}
 		// This is a local copy only: reuse the existing timestamp/skew checks

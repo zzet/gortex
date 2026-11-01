@@ -142,3 +142,22 @@ func TestStartupHandoffLegacyPresocketDoesNotGrantServingLease(t *testing.T) {
 	require.NoError(t, os.WriteFile(daemon.RuntimeStatePath(), body, 0o600))
 	require.False(t, waiter(now.Add(time.Millisecond)), "a legacy record cannot establish the new incarnation-bound Serving lease")
 }
+
+func TestStartupHandoffRechecksNativeProofWhenConsumed(t *testing.T) {
+	t.Setenv("GORTEX_DAEMON_STATEFILE", filepath.Join(t.TempDir(), "state.json"))
+	now := time.Now()
+	proofAvailable := true
+	waiter := startupHeartbeatWaiterWithOwnerProof(func(state daemon.RuntimeState) bool { return proofAvailable && startupRuntimeOwnerMatches(state) })
+	writeHandoffStateFixture(t, daemon.StartupMigrating, now)
+	require.True(t, waiter(now))
+	before, ok := daemon.ReadRuntimeState()
+	require.True(t, ok)
+	// Native metadata may become inaccessible or identify another incarnation
+	// after grant. Keeping the record unchanged cannot substitute for re-proof.
+	proofAvailable = false
+	writeHandoffStateFixture(t, daemon.StartupServing, now)
+	after, ok := daemon.ReadRuntimeState()
+	require.True(t, ok)
+	require.Equal(t, before.ProcessBirthToken, after.ProcessBirthToken)
+	require.False(t, waiter(now.Add(time.Millisecond)))
+}
