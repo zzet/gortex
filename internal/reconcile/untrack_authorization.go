@@ -40,6 +40,7 @@ func (r *Reconciler) ForgetCheckoutExplicit(
 ) (IntentRevocation, error) {
 	target := sagaTarget{
 		Kind:        sagaForgetCheckout,
+		Cause:       CauseUntrack,
 		CheckoutID:  checkoutID,
 		Incarnation: incarnation,
 		FamilyID:    familyID,
@@ -64,6 +65,7 @@ func (r *Reconciler) RetirePrimaryClosureExplicit(
 ) (IntentRevocation, error) {
 	target := sagaTarget{
 		Kind:         sagaRetirePrimaryClosure,
+		Cause:        CauseUntrack,
 		GraphID:      graphID,
 		CheckoutID:   checkoutID,
 		Incarnation:  incarnation,
@@ -197,6 +199,7 @@ func (r *Reconciler) CommitAuthorizedDemotion(
 	if authorization.OwnedGraphID != "" {
 		target := sagaTarget{
 			Kind:       sagaRetireGraph,
+			Cause:      CauseDemotion,
 			GraphID:    authorization.OwnedGraphID,
 			FamilyID:   checkout.FamilyID,
 			CheckoutID: checkout.CheckoutID,

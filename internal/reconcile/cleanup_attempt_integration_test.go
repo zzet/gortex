@@ -38,7 +38,7 @@ func (h *cleanupAttemptHooks) PurgeCheckoutLayers(ctx context.Context, _, _ stri
 	}
 }
 
-func (h *cleanupAttemptHooks) ReleaseGraph(context.Context, string) error {
+func (h *cleanupAttemptHooks) ReleaseGraph(context.Context, string, string) error {
 	h.releaseCalls.Add(1)
 	if h.failRelease.Load() {
 		return errCleanupAttemptRetry

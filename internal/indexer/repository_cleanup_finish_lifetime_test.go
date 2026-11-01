@@ -72,17 +72,17 @@ func (h *lifecycleFinishBoundaryHooks) BeginGraphCleanup(ctx context.Context, gr
 // Optional V2 seam; the baseline Reconciler ignores this method and uses its
 // existing graph-ID notification below. This keeps the same regression source
 // valid before and after the captured-state repair.
-func (h *lifecycleFinishBoundaryHooks) BeginGraphCleanupAttempt(ctx context.Context, graphID string) (func(), error) {
+func (h *lifecycleFinishBoundaryHooks) BeginGraphCleanupAttempt(ctx context.Context, graphID string, causes ...string) (func(), error) {
 	if err := h.prepareDrainedState(ctx, graphID); err != nil {
 		return nil, err
 	}
 	hook, ok := any(cleanupHooks{l: h.l}).(interface {
-		BeginGraphCleanupAttempt(context.Context, string) (func(), error)
+		BeginGraphCleanupAttempt(context.Context, string, ...string) (func(), error)
 	})
 	if !ok {
 		return nil, fmt.Errorf("Reconciler selected captured-finish mode without a lifecycle implementation")
 	}
-	finish, err := hook.BeginGraphCleanupAttempt(ctx, graphID)
+	finish, err := hook.BeginGraphCleanupAttempt(ctx, graphID, causes...)
 	if finish == nil {
 		return nil, err
 	}
@@ -108,7 +108,7 @@ func (h *lifecycleFinishBoundaryHooks) PurgeCheckoutLayers(ctx context.Context, 
 	}
 }
 
-func (h *lifecycleFinishBoundaryHooks) ReleaseGraph(ctx context.Context, graphID string) error {
+func (h *lifecycleFinishBoundaryHooks) ReleaseGraph(ctx context.Context, graphID, cause string) error {
 	if ctx.Value(cleanupFinishActorKey{}) == "replacement" {
 		h.replacementOnce.Do(func() { close(h.replacementRelease) })
 		select {

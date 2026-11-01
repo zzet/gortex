@@ -67,7 +67,7 @@ func (h *recordingHooks) PurgeCheckoutLayers(_ context.Context, checkoutID, inca
 	return nil
 }
 
-func (h *recordingHooks) ReleaseGraph(_ context.Context, graphID string) error {
+func (h *recordingHooks) ReleaseGraph(_ context.Context, graphID, _ string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.calls = append(h.calls, "release:"+graphID)

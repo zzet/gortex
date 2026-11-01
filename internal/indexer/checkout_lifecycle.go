@@ -1789,7 +1789,7 @@ func (l *CheckoutLifecycle) retireOnReload(ctx context.Context, prefix string) (
 		// directory git does not administer. Keeping the pre-catalog
 		// behaviour is what stops such a repository from becoming
 		// impossible to remove.
-		if _, _, err := l.evictRepo(ctx, prefix); err != nil {
+		if _, _, err := l.evictRepo(ctx, prefix, reconcile.CauseReloadRemoved); err != nil {
 			return "", err
 		}
 		return reconcile.OutcomeForgotten, nil
@@ -1799,7 +1799,7 @@ func (l *CheckoutLifecycle) retireOnReload(ctx context.Context, prefix string) (
 		return "", err
 	}
 	if outcome == reconcile.OutcomeForgotten && l.mi.GetMetadata(prefix) != nil {
-		if _, _, err := l.evictRepo(ctx, prefix); err != nil {
+		if _, _, err := l.evictRepo(ctx, prefix, reconcile.CauseReloadRemoved); err != nil {
 			return outcome, err
 		}
 	}
@@ -4453,7 +4453,7 @@ func (h cleanupHooks) CleanupDeferred(err error) bool {
 // is the repository eviction the untrack path has always run — in the order
 // that path established: detach the watcher before evicting, so a late
 // filesystem event cannot re-index files whose nodes are already gone.
-func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
+func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID, cause string) error {
 	// Read BEFORE the release: once the registry stops serving the prefix its
 	// workspace is unreadable, and the cohort consumers that just lost a member
 	// would then never be told. Read here rather than inside
@@ -4524,7 +4524,7 @@ func (l *CheckoutLifecycle) cohortSubjectForGraph(
 // that removal. Durable transitions use the returned save error to stay
 // retryable instead of completing with stale explicit configuration.
 func (l *CheckoutLifecycle) evictRepoChecked(
-	ctx context.Context, prefix, rootPath string,
+	ctx context.Context, prefix, rootPath, cause string,
 ) (nodesRemoved, edgesRemoved int, err error) {
 	if prefix == "" {
 		return 0, 0, nil
@@ -4534,24 +4534,7 @@ func (l *CheckoutLifecycle) evictRepoChecked(
 	// would then never be told.
 	workspaceID := l.workspaceForPrefix(prefix)
 	l.detachWatcherContext(ctx, prefix)
-	finalize := func(meta *RepoMetadata) error {
-		if l.cfgMgr == nil {
-			return nil
-		}
-		path := rootPath
-		if meta != nil && meta.RootPath != "" {
-			// Prefer the original configured spelling while this process still
-			// has it. A vanished macOS path can no longer resolve /var through
-			// /private/var, while the catalog deliberately keeps the canonical
-			// spelling; the configured spelling remains the exact durable key.
-			path = meta.RootPath
-		}
-		if path == "" {
-			return nil
-		}
-		_, err := l.cfgMgr.Global().RemoveRepoAndSaveIfPresent(path)
-		return err
-	}
+	finalize := l.repositoryConfigFinalizer(rootPath, cause)
 	nodesRemoved, edgesRemoved, err = l.mi.purgeRepoChecked(ctx, prefix, finalize)
 	if l.mi.GetMetadata(prefix) == nil {
 		l.implicitRoots.Delete(prefix)
@@ -4572,7 +4555,7 @@ func (l *CheckoutLifecycle) evictRepoChecked(
 // evictRepo runs the repository teardown every caller shares: watcher first,
 // then the graph, then the persisted configuration, then the sessions.
 func (l *CheckoutLifecycle) evictRepo(
-	ctx context.Context, prefix string,
+	ctx context.Context, prefix string, causes ...string,
 ) (nodesRemoved, edgesRemoved int, err error) {
 	if prefix == "" {
 		return 0, 0, nil
@@ -4581,7 +4564,11 @@ func (l *CheckoutLifecycle) evictRepo(
 	if meta := l.mi.GetMetadata(prefix); meta != nil {
 		rootPath = meta.RootPath
 	}
-	return l.evictRepoChecked(ctx, prefix, rootPath)
+	cause := reconcile.CauseUntrack
+	if len(causes) > 0 {
+		cause = causes[0]
+	}
+	return l.evictRepoChecked(ctx, prefix, rootPath, cause)
 }
 
 // attachWatcher wires a tracked prefix into the live file watcher. A failure

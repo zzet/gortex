@@ -256,7 +256,7 @@ func (r *Reconciler) RetireCheckout(ctx context.Context, checkoutID, incarnation
 		primary.OwnerCheckoutID != checkoutID &&
 		primary.State == GraphStateReady
 	if demotable {
-		if err := r.ForgetCheckout(ctx, checkoutID, incarnation); err != nil {
+		if err := r.forgetCheckout(ctx, checkoutID, incarnation, cause); err != nil {
 			return "", err
 		}
 		return OutcomeForgotten, nil

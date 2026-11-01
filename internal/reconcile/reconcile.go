@@ -97,7 +97,7 @@ type CleanupHooks interface {
 	// reader still holds the graph and they resume the saga once it drains,
 	// also implement CleanupDeferred(error) bool to tell that error apart from
 	// a failure.
-	ReleaseGraph(ctx context.Context, graphID string) error
+	ReleaseGraph(ctx context.Context, graphID, cause string) error
 }
 
 // InventoryFunc enumerates a checkout family. It has gitstate.Inventory's
@@ -523,7 +523,7 @@ func (r *Reconciler) applyInaccessible(
 	if action, retained, err := r.retainIntended(ctx, pass, existing, req); retained || err != nil {
 		return action, false, err
 	}
-	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing)
+	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing, CauseReconcileAvailability)
 }
 
 // applyRemoved advances the removal clock only, and runs the right teardown
@@ -559,7 +559,7 @@ func (r *Reconciler) applyRemoved(
 	if action, retained, err := r.retainIntended(ctx, pass, existing, req); retained || err != nil {
 		return action, false, err
 	}
-	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing)
+	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing, CauseReconcileRemoval)
 }
 
 // retainIntended expires serving layers without revoking the user's tracking
@@ -590,7 +590,7 @@ func (r *Reconciler) retainIntended(ctx context.Context, pass *familyPass, exist
 	if owned != nil && owned.IsPrimaryBase {
 		action = ActionPrimaryRetirementRefused
 		if existing.State != store_sqlite.CheckoutStateUnavailable {
-			r.logger.Warn("primary_retirement_refused", zap.String("family", existing.FamilyID), zap.String("checkout", existing.CheckoutID), zap.String("root", existing.RootPath), zap.String("cause", "reconcile_availability"))
+			r.logger.Warn("primary_retirement_refused", zap.String("family", existing.FamilyID), zap.String("checkout", existing.CheckoutID), zap.String("root", existing.RootPath), zap.String("cause", CauseReconcileAvailability))
 		}
 	}
 	if err := r.purgeLayersOnce(context.WithoutCancel(ctx), existing); err != nil {
@@ -615,6 +615,7 @@ func (r *Reconciler) retireCheckout(
 	ctx context.Context,
 	pass *familyPass,
 	existing store_sqlite.Checkout,
+	cause string,
 ) (CheckoutAction, bool, error) {
 	owned, err := r.ownedGraph(ctx, existing.FamilyID, existing.CheckoutID)
 	if err != nil {
@@ -622,11 +623,11 @@ func (r *Reconciler) retireCheckout(
 	}
 	action := ActionForgotten
 	target := sagaTarget{Kind: sagaForgetCheckout, CheckoutID: existing.CheckoutID, Incarnation: existing.Incarnation}
-	retire := func() error { return r.ForgetCheckout(ctx, existing.CheckoutID, existing.Incarnation) }
+	retire := func() error { return r.forgetCheckout(ctx, existing.CheckoutID, existing.Incarnation, cause) }
 	if owned != nil && owned.IsPrimaryBase {
 		action = ActionPrimaryClosureRetired
 		target = sagaTarget{Kind: sagaRetirePrimaryClosure, GraphID: owned.GraphID}
-		retire = func() error { return r.RetirePrimaryClosure(ctx, owned.GraphID, pass.family.PrimaryEpoch) }
+		retire = func() error { return r.retirePrimaryClosure(ctx, owned.GraphID, pass.family.PrimaryEpoch, cause) }
 	}
 	prior, journaled, err := r.loadSagaTarget(ctx, target.cleanupID())
 	if err != nil {
@@ -864,7 +865,12 @@ func (r *Reconciler) recordClassification(
 			zap.Bool("git_prunable", record.Prunable))
 	}
 	if class.Disposition != DispositionPresent {
-		r.logger.Info("checkout reconcile: classified", append(fields, zap.String("cause", "reconcile_"+string(class.Disposition)))...)
+		r.logger.Info("checkout reconcile: classified", append(fields, zap.String("cause", func() string {
+			if class.Disposition == DispositionRemoved {
+				return CauseReconcileRemoval
+			}
+			return CauseReconcileAvailability
+		}()))...)
 	} else {
 		r.logger.Debug("checkout reconcile: classified", fields...)
 	}
