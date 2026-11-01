@@ -285,3 +285,40 @@ func TestFailedCouplingReadIsNotRetried(t *testing.T) {
 		t.Fatal("a mutation of a store with no coupling kept the records of another repository")
 	}
 }
+
+// A writer that queued before another mutation joined its repository to a
+// neighbour must acquire the expanded component when it is admitted.
+func TestWaitingRepoTopologyWriterRechecksNewCoupling(t *testing.T) {
+	store := repoTopologyStore(t)
+	awaitRepoCoupling(t, store)
+	finishA := BeginRepoTopologyMutation(store, "a")
+	finishB := BeginRepoTopologyMutation(store, "b")
+	queued := make(chan func(bool, []string), 1)
+	go func() { queued <- BeginRepoTopologyMutation(store, "a") }()
+	deadline := time.Now().Add(topologyScopeWait)
+	for {
+		topology.mu.Lock()
+		waiting := topology.repos["a"].writersWaiting > 0
+		topology.mu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			finishA(false, nil)
+			finishB(false, nil)
+			t.Fatal("the second writer never queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.AddBatch(nil, []*graph.Edge{{From: seedA, To: seedB, Kind: graph.EdgeReferences}})
+	finishA(true, []string{"a/a.go"})
+	select {
+	case finish := <-queued:
+		finish(false, nil)
+		finishB(false, nil)
+		t.Fatal("the queued writer entered beside its newly coupled neighbour")
+	case <-time.After(20 * time.Millisecond):
+	}
+	finishB(false, nil)
+	(<-queued)(false, nil)
+}

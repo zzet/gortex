@@ -552,6 +552,8 @@ func (c *repoCoupling) union(a, b string) {
 	}
 	c.parent[ra] = rb
 	c.parent[rb] = rb
+	// Queued writers must recompute their gate set when components grow.
+	c.epoch++
 }
 
 // component lists prefix and every repository coupled with it, sorted.
