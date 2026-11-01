@@ -833,11 +833,11 @@ func (s *Server) explicitFreshness(ctx context.Context, req mcp.CallToolRequest,
 type explicitFreshnessPinKey struct{}
 
 type explicitFreshnessWitness struct {
-	watcher watcherHistory
+	watcher  watcherHistory
 	prefixes []string
-	pins []*graphview.BasePin
-	owners []*indexer.Indexer
-	roots []string
+	pins     []*graphview.BasePin
+	owners   []*indexer.Indexer
+	roots    []string
 }
 
 func (s *Server) canonicalFreshnessPrefixes(ctx context.Context) []string {
