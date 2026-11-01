@@ -510,8 +510,7 @@ func TestSearchTextScopedNeverScansAndRowsStayFlat(t *testing.T) {
 		reg.Register(languages.NewGoExtractor())
 		counter := newScopedReadCounter(openContractCoreCapStore(t))
 		mi := indexer.NewMultiIndexer(counter, reg, search.NewNull(), cm, zap.NewNop())
-		_, err = mi.IndexAll()
-		require.NoError(t, err)
+		registerMCPFixtureRepos(t, mi, cm)
 		srv := NewServer(query.NewEngine(counter), counter, nil, nil, zap.NewNop(), nil, MultiRepoOptions{ConfigManager: cm, MultiIndexer: mi})
 		installContractCoreKindTestRuntime(t, srv)
 		return srv, counter
