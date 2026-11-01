@@ -1548,8 +1548,12 @@ func (s *Server) requestLayers(ctx context.Context) []graph.OverlayLayerReader {
 			layers = append(layers, source.Layer)
 		}
 	}
-	if overlay := OverlayViewFromContext(ctx); overlay != nil && overlay.Layer() != nil {
-		layers = append(layers, overlay.Layer())
+	// Disk projections are immutable request snapshots. Borrow the existing
+	// ownership layers below the session buffer; do not rebuild or enumerate
+	// the base corpus for unrelated cached hits.
+	layers = append(layers, requestProjectionLayers(ctx)...)
+	if overlay := OverlayViewFromContext(ctx); overlay != nil && overlay.LayerReader() != nil {
+		layers = append(layers, overlay.LayerReader())
 	}
 	return layers
 }
