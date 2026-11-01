@@ -38,6 +38,11 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 		if err := buildCtx.Err(); err != nil {
 			return ctx, err
 		}
+		if editor := OverlayViewFromContext(ctx); editor != nil && editor.LayerReader() != nil && editor.LayerReader().HasFile(graphPath) {
+			// This pinned buffer completely owns the file. Disk contributes
+			// neither nodes nor edges, so do not read or parse it underneath.
+			continue
+		}
 		idx, rel := s.indexerForRel(graphPath)
 		if idx == nil || !idx.IsTracked(rel) {
 			continue // untracked-file tools retain their raw-source guidance
