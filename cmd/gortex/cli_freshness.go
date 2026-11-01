@@ -28,6 +28,15 @@ func checkCLIFreshness(cmd *cobra.Command, raw json.RawMessage, callErr error) e
 	}
 	state, _ := fields["graph_freshness"].(string)
 	scope, _ := fields["freshness_scope"].(string)
+	if state == "" {
+		stale, _ := fields["stale_files"].([]any)
+		missing, _ := fields["missing_files"].([]any)
+		count := len(stale) + len(missing)
+		if count > 0 || fields["stale"] == true || fields["missing"] == true || fields["index_frozen"] == true {
+			state, scope = "pending", "file"
+			fields["pending_file_count"] = max(1, count)
+		}
+	}
 	line := ""
 	if state != "" && state != "fresh" {
 		if scope == "" {
