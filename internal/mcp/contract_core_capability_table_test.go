@@ -183,6 +183,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"NodeDegreeByKinds", capOf[graph.NodeDegreeByKinds], capDropped, capReasonEdges + " (degrees count hidden endpoints)"},
 		{"EdgeKindCounter", capOf[graph.EdgeKindCounter], capDropped, capReasonEdges + " (counts include hidden kinds, endpoints and spring.Bean calls)"},
 		{"InEdgeCounter", capOf[graph.InEdgeCounter], capWrapper, "requested kind counts recomputed through filtered kind iterators"},
+		{"RepoScopedInEdgeReader", capOf[graph.RepoScopedInEdgeReader], capWrapper, "repository-narrowed incoming rows pass the same edge mask; declines when the selected reader lacks it"},
 		{"EdgesByKindsScanner", capOf[graph.EdgesByKindsScanner], capDropped, capReasonEdges},
 		{"BoundedEdgeExistenceReader", capOf[graph.BoundedEdgeExistenceReader], capDropped, capReasonEdges},
 		{"BoundedIncomingEdgeIdentityReader", capOf[graph.BoundedIncomingEdgeIdentityReader], capDropped, capReasonEdges},
