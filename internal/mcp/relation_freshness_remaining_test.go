@@ -184,3 +184,45 @@ func TestRenameNativeTierGapIsProvisionalAndNeverWritten(t *testing.T) {
 		})
 	}
 }
+
+func TestDeadCodeRequiresDerivedTierForEachCandidate(t *testing.T) {
+	for _, test := range []struct {
+		name                      string
+		pendingFile               string
+		derivedReady, wantUnknown bool
+	}{
+		{name: "relations-published-derived-pending", pendingFile: "unused.go", wantUnknown: true},
+		{name: "derived-published", pendingFile: "unused.go", derivedReady: true},
+		{name: "unrelated-derived-pending", pendingFile: "other.go"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, root := newRelationFixture(t)
+			unused := writeUnindexed(t, root, "unused.go", "package p\nfunc unused() {}\n")
+			require.NoError(t, s.indexer.IndexFile(unused))
+			now := time.Now()
+			tier := indexer.MutationTierState{Generation: 11, AckAt: now, FileGraphAt: now, RelationsAt: now}
+			if test.derivedReady {
+				tier.DerivedAt = now
+			}
+			s.SetWatcher(&watchedTierFixture{paths: map[string]indexer.MutationTierState{
+				filepath.Join(root, test.pendingFile): tier,
+			}})
+			payload := lifecycleResultPayload(t, callChangeTool(t, s.handleFindDeadCode, "find_dead_code", map[string]any{"format": "json"}))
+			contains := func(key string) bool {
+				rows, _ := payload[key].([]any)
+				for _, raw := range rows {
+					if raw.(map[string]any)["id"] == "unused.go::unused" {
+						return true
+					}
+				}
+				return false
+			}
+			require.Equal(t, test.wantUnknown, contains("pending_unknown"))
+			require.Equal(t, !test.wantUnknown, contains("dead_code"))
+			if test.wantUnknown {
+				require.Equal(t, "pending", payload["graph_freshness"])
+				require.Equal(t, "derived", payload["freshness_scope"])
+			}
+		})
+	}
+}

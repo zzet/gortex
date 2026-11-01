@@ -2581,6 +2581,12 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 		opts.SkipCrossRepoNodes = true
 	}
 
+	// Preserve pre-walk tier evidence even when derived publication completes
+	// while the analysis is reading graph rows. An outer request snapshot
+	// remains authoritative when the middleware already captured it.
+	if _, captured := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); !captured {
+		ctx = s.captureToolFreshness(ctx)
+	}
 	gaps := s.laggingMutationReceipts(ctx)
 	reader := s.readerFor(ctx)
 	opts.RepoPrefixes = s.deadCodeRepoPrefixes(ctx)
@@ -2623,7 +2629,7 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 	var pendingUnknown []analysis.DeadCodeEntry
 	dead := make([]analysis.DeadCodeEntry, 0, len(entries))
 	for _, entry := range entries {
-		candidate := s.labelRelations(ctx, gaps, []string{entry.ID}, nil)
+		candidate := s.freshnessFor(ctx, "derived", []string{entry.ID}, nil, gaps)
 		if candidate.state != "" {
 			pendingUnknown = append(pendingUnknown, entry)
 			label = label.merge(candidate)
