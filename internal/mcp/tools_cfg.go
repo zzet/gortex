@@ -89,9 +89,11 @@ func (s *Server) handleGetCFG(ctx context.Context, req mcp.CallToolRequest) (*mc
 		return mcp.NewToolResultError("id is required"), nil
 	}
 
-	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFreshContext(ctx, []string{parts[0]})
+		ctx, err = s.ensureProjected(ctx, []string{parts[0]})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 
 	sc, buildErr := s.buildSymbolCFG(ctx, id)
