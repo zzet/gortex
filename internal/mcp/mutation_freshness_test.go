@@ -434,41 +434,44 @@ func TestMutationReposForSymbolIDsUnresolvedWidensBarrier(t *testing.T) {
 	}
 }
 
-func TestChangeImpactFreshnessGuardAndRetry(t *testing.T) {
+func TestChangeImpactLabelsLaggingReceiptsInScope(t *testing.T) {
 	g := graph.New()
 	g.AddNode(&graph.Node{
 		ID:         "repo-a::target",
 		Kind:       graph.KindFunction,
 		Name:       "target",
-		FilePath:   "target.go",
+		FilePath:   "/repo-a/target.go",
 		StartLine:  1,
 		EndLine:    1,
 		Language:   "go",
 		RepoPrefix: "repo-a",
 	})
 	s := &Server{
-		graph:              g,
-		engine:             query.NewEngine(g),
-		session:            newSessionState(),
-		mutationSafetyWait: time.Millisecond,
+		graph:   g,
+		engine:  query.NewEngine(g),
+		session: newSessionState(),
 	}
 	receipt := pendingFreshnessReceipt(s, "receipt-impact", "repo-a", "/repo-a/target.go", 11)
 	req := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
 		Name:      "explain_change_impact",
 		Arguments: map[string]any{"ids": "repo-a::target", "format": "json"},
 	}}
-
-	result, err := s.handleEnhancedChangeImpact(context.Background(), req)
-	if err != nil {
-		t.Fatalf("pending impact handler error: %v", err)
-	}
-	if result == nil || !result.IsError {
-		t.Fatalf("pending impact result = %#v, want MCP error", result)
-	}
-	for _, want := range []string{"change impact refused a stale graph", "receipt-impact", "generation=11"} {
-		if !strings.Contains(freshnessToolResultText(result), want) {
-			t.Fatalf("pending impact response %q does not contain %q", freshnessToolResultText(result), want)
+	impact := func() map[string]any {
+		t.Helper()
+		result, err := s.handleEnhancedChangeImpact(context.Background(), req)
+		if err != nil {
+			t.Fatalf("impact handler error: %v", err)
 		}
+		return lifecycleResultPayload(t, result)
+	}
+
+	// A pending edit to the symbol's own file is labelled, never refused.
+	payload := impact()
+	if payload["graph_freshness"] != "pending" || payload["complete"] != false {
+		t.Fatalf("pending impact = %v, want a pending partial", payload)
+	}
+	if files, _ := payload["pending_files"].([]any); len(files) != 1 || files[0] != "/repo-a/target.go" {
+		t.Fatalf("pending impact files = %v", payload["pending_files"])
 	}
 
 	completeFreshnessReceipt(receipt, indexer.MutationResult{
@@ -476,22 +479,31 @@ func TestChangeImpactFreshnessGuardAndRetry(t *testing.T) {
 		AppliedGeneration:   11,
 		Reindexed:           true,
 	})
-	result, err = s.handleEnhancedChangeImpact(context.Background(), req)
-	if err != nil {
-		t.Fatalf("completed impact handler error: %v", err)
+	if payload = impact(); payload["graph_freshness"] != nil {
+		t.Fatalf("published edit still labelled: %v", payload)
 	}
-	if result == nil || result.IsError {
-		t.Fatalf("completed impact remained blocked: %q", freshnessToolResultText(result))
+
+	// A terminally failed edit in scope is a labelled partial with a
+	// recovery hint, not a tool error.
+	failed := pendingFreshnessReceipt(s, "receipt-failed", "repo-a", "/repo-a/target.go", 12)
+	completeFreshnessReceipt(failed, indexer.MutationResult{
+		RequestedGeneration: 12,
+		AppliedGeneration:   12,
+		Err:                 errors.New("syntax patch failed"),
+	})
+	payload = impact()
+	if payload["graph_freshness"] != "failed" || payload["complete"] != false {
+		t.Fatalf("failed impact = %v, want a failed partial", payload)
+	}
+	if hint, _ := payload["recovery_hint"].(string); !strings.Contains(hint, "reindex") {
+		t.Fatalf("failed impact recovery hint = %q", hint)
 	}
 }
 
-func TestDetectChangesFreshnessGuard(t *testing.T) {
-	s := &Server{
-		graph:              graph.New(),
-		session:            newSessionState(),
-		mutationSafetyWait: time.Millisecond,
-	}
-	pendingFreshnessReceipt(s, "receipt-detect", "repo-a", "/repo-a/changed.go", 12)
+func TestDetectChangesLabelsPendingChangedFile(t *testing.T) {
+	s, root := newRelationFixture(t)
+	pendingFreshnessReceipt(s, "receipt-detect", "",
+		writeUnindexed(t, root, "caller.go", "package p\n\nfunc Caller() {\n\tTarget()\n\tTarget()\n}\n"), 12)
 	req := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
 		Name:      "detect_changes",
 		Arguments: map[string]any{"format": "json"},
@@ -501,12 +513,54 @@ func TestDetectChangesFreshnessGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("detect handler error: %v", err)
 	}
-	if result == nil || !result.IsError {
-		t.Fatalf("pending detect result = %#v, want MCP error", result)
-	}
-	for _, want := range []string{"change detection refused a stale graph", "receipt-detect", "generation=12"} {
-		if !strings.Contains(freshnessToolResultText(result), want) {
-			t.Fatalf("pending detect response %q does not contain %q", freshnessToolResultText(result), want)
+	payload := lifecycleResultPayload(t, result)
+	for key, want := range map[string]any{
+		"complete":           false,
+		"graph_freshness":    "pending",
+		"pending_file_count": float64(1),
+	} {
+		if payload[key] != want {
+			t.Fatalf("detect %s = %v, want %v: %v", key, payload[key], want, payload)
 		}
+	}
+	if files, _ := payload["changed_files"].([]any); len(files) != 1 || files[0] != "caller.go" {
+		t.Fatalf("detect changed_files = %v", payload["changed_files"])
+	}
+	// The walk still ran: the changed symbol is mapped and risk is scored.
+	if symbols, _ := payload["changed_symbols"].([]any); len(symbols) == 0 || payload["risk"] == "UNKNOWN" {
+		t.Fatalf("labelled detect skipped the walk: %v", payload)
+	}
+
+	// The Stop hook bounds the wait with an earlier wait_deadline, which can
+	// pass between admission and the handler reading it. Either way the
+	// answer is labelled without sitting out the default budget.
+	for _, offset := range []time.Duration{50 * time.Millisecond, -time.Second} {
+		req.Params.Arguments = map[string]any{"format": "json",
+			"wait_deadline": time.Now().Add(offset).Format(time.RFC3339Nano)}
+		result, err = s.handleDetectChanges(context.Background(), req)
+		if err != nil {
+			t.Fatalf("detect handler error: %v", err)
+		}
+		payload = lifecycleResultPayload(t, result)
+		if waited, _ := payload["barrier_wait_ms"].(float64); payload["graph_freshness"] != "pending" || waited >= 200 {
+			t.Fatalf("detect with wait_deadline %v: graph_freshness %v after %v ms", offset, payload["graph_freshness"], waited)
+		}
+	}
+
+	// A staged diff leaves the pending caller.go out of the changed files,
+	// but the walk still reads it as a caller of the changed Target.
+	writeUnindexed(t, root, "target.go", "package p\n\nfunc Target() { _ = 0 }\n")
+	checkoutMutationGit(t, root, "add", "target.go")
+	req.Params.Arguments = map[string]any{"format": "json", "scope": "staged"}
+	result, err = s.handleDetectChanges(context.Background(), req)
+	if err != nil {
+		t.Fatalf("detect handler error: %v", err)
+	}
+	payload = lifecycleResultPayload(t, result)
+	if files, _ := payload["changed_files"].([]any); len(files) != 1 || files[0] != "target.go" {
+		t.Fatalf("staged detect changed_files = %v", payload["changed_files"])
+	}
+	if pending, _ := payload["pending_files"].([]any); payload["graph_freshness"] != "pending" || len(pending) != 1 || pending[0] != "caller.go" {
+		t.Fatalf("staged detect left the pending caller unlabelled: %v", payload)
 	}
 }
