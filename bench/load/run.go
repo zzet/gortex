@@ -31,6 +31,9 @@ type runOptions struct {
 	WarmTimeout      time.Duration
 	StopTimeout      time.Duration
 	CPUProfile       time.Duration
+	Gauges           bool
+	HeapProfiles     bool
+	WorktreeSteps    []int
 	KeepState        bool
 	SweepRepetitions int
 	SweepBudget      time.Duration
@@ -41,13 +44,14 @@ func parseRun(args []string) (runOptions, error) {
 	var o runOptions
 	f := flag.NewFlagSet("load run", flag.ContinueOnError)
 	bindRunFlags(f, &o)
+	bindMemoryFlags(f, &o)
 	if err := f.Parse(args); err != nil {
 		return o, err
 	}
 	if f.NArg() != 0 {
 		return o, errors.New("unexpected positional run arguments")
 	}
-	return o, validateRunOptions(o)
+	return o, errors.Join(validateRunOptions(o), validateMemoryOptions(o))
 }
 
 func bindRunFlags(f *flag.FlagSet, o *runOptions) {
