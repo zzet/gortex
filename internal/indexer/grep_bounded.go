@@ -27,6 +27,7 @@ func (idx *Indexer) GrepTextBounded(
 	var release func()
 	var bytes int64
 	if warm {
+		idx.applyToolWritesLocked()
 		release = idx.trigramReleaseLocked()
 		bytes = searcher.ApproxIndexBytes()
 	}
@@ -62,6 +63,7 @@ func (idx *Indexer) GrepLiteralBounded(
 	var release func()
 	var bytes int64
 	if warm {
+		idx.applyToolWritesLocked()
 		release = idx.trigramReleaseLocked()
 		bytes = searcher.ApproxIndexBytes()
 	}
