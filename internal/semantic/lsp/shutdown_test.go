@@ -37,6 +37,10 @@ func runShutdownHelper(t *testing.T, mode string) {
 		os.Exit(2)
 	}
 	defer func() { _ = trace.Close() }()
+	var transcript io.Writer = trace
+	if entered := os.Getenv(helperExitSyncStallEnv); entered != "" {
+		transcript = &exitSyncStallTranscript{File: trace, entered: entered}
+	}
 	in := bufio.NewReader(os.Stdin)
 	for {
 		body, ok := readFramed(in)
@@ -55,8 +59,10 @@ func runShutdownHelper(t *testing.T, mode string) {
 		if err := json.Unmarshal(body, &req); err != nil {
 			os.Exit(2)
 		}
-		_, _ = fmt.Fprintln(trace, req.Method)
-		_ = trace.Sync()
+		_, _ = fmt.Fprintln(transcript, req.Method)
+		// The transcript is an unbuffered write, read only after the exact
+		// child's Wait. Disk durability is not part of LSP cooperation and must
+		// not hold its exit behind an unrelated filesystem sync.
 		if req.Method == "initialize" && mode == helperLSPInitBarrier {
 			if err := os.WriteFile(os.Getenv(helperInitEnteredEnv), []byte(fmt.Sprint(os.Getpid())), 0o600); err != nil {
 				os.Exit(2)
