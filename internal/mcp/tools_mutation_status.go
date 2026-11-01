@@ -42,10 +42,11 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 				return s.respondJSONOrTOON(ctx, req, payload)
 			}
 		}
-		if !ok || !mutationCommitInScope(ctx, record) {
-			return mcp.NewToolResultError(
-				"no mutation receipt " + receipt + " — receipts are kept for " + mutationCommitRetention.String() +
-					"; query by path instead, or read the file to see its current state"), nil
+		if ok && !mutationCommitInScope(ctx, record) {
+			return mcp.NewToolResultError("no mutation receipt " + receipt), nil
+		}
+		if !ok {
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("receipt", receipt))
 		}
 		return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 
@@ -56,11 +57,13 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 				payload["note"] = "this is a graph freshness receipt id, not a caller mutation_id"
 				return s.respondJSONOrTOON(ctx, req, payload)
 			}
-			return mcp.NewToolResultError("no mutation recorded for mutation_id " + mutationID +
-				" — use change.receipt options.receipt=" + mutationID + " to query a graph freshness receipt"), nil
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("mutation_id", mutationID))
 		}
-		if !ok || !mutationCommitInScope(ctx, record) {
+		if ok && !mutationCommitInScope(ctx, record) {
 			return mcp.NewToolResultError("no mutation recorded for mutation_id " + mutationID), nil
+		}
+		if !ok {
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("mutation_id", mutationID))
 		}
 		return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 
@@ -163,6 +166,7 @@ func (s *Server) graphRefreshReceiptPayload(ctx context.Context, id string) (map
 	}
 	attachMutationPhaseTimings(payload, receipt.id, time.Time{}, indexer.PublicationSourceFreshRequest, retained)
 	attachAcknowledgementPayload(payload, acknowledgement, acknowledgementState)
+	attachReceiptTiers(payload, receipt)
 	return payload, true
 }
 
@@ -248,6 +252,11 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 		acknowledgement = &snapshot
 	}
 	attachAcknowledgementPayload(payload, acknowledgement, "unavailable_recording_or_evicted")
+	if value, found := s.mutationReceipts.Load(snap.ReindexReceipt); found {
+		if receipt, ok := value.(*mutationReceipt); ok {
+			attachReceiptTiers(payload, receipt)
+		}
+	}
 	return payload
 }
 

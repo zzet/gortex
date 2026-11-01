@@ -5,13 +5,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 )
 
@@ -67,7 +67,7 @@ type degradedMutationTestWatcher struct {
 func (w degradedMutationTestWatcher) DegradedReason() string { return w.reason }
 
 func mutationRefs(path string) int {
-	path = filepath.Clean(path)
+	path = pathkey.MutationKey(path)
 	mutationPathLocks.Lock()
 	defer mutationPathLocks.Unlock()
 	if entry := mutationPathLocks.byPath[path]; entry != nil {
@@ -230,7 +230,6 @@ func TestMutationReindexStateSlowTicketReceiptCompletes(t *testing.T) {
 	s := &Server{
 		watcher:             mutationTestWatcher{done: done, generation: 7},
 		mutationReindexWait: 5 * time.Millisecond,
-		mutationSafetyWait:  5 * time.Millisecond,
 	}
 	outcome := s.mutationReindexState(context.Background(), "/tmp/slow.go")
 	if outcome.Reindexed || !outcome.Pending || outcome.Receipt == "" || outcome.Generation != 7 {
@@ -238,9 +237,6 @@ func TestMutationReindexStateSlowTicketReceiptCompletes(t *testing.T) {
 	}
 	if status, ok := s.mutationReceiptState(outcome.Receipt); !ok || !status.Pending || status.Generation != 7 {
 		t.Fatalf("pending receipt state = %+v, ok=%v", status, ok)
-	}
-	if err := s.awaitMutationFreshness(context.Background()); err == nil || !strings.Contains(err.Error(), "pending receipt=") {
-		t.Fatalf("pending safety barrier error = %v", err)
 	}
 
 	done <- indexer.MutationResult{
@@ -253,9 +249,6 @@ func TestMutationReindexStateSlowTicketReceiptCompletes(t *testing.T) {
 	for time.Now().Before(deadline) {
 		status, ok := s.mutationReceiptState(outcome.Receipt)
 		if ok && status.Reindexed && !status.Pending && status.AppliedGeneration == 8 {
-			if err := s.awaitMutationFreshness(context.Background()); err != nil {
-				t.Fatalf("completed safety barrier: %v", err)
-			}
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -263,7 +256,7 @@ func TestMutationReindexStateSlowTicketReceiptCompletes(t *testing.T) {
 	t.Fatal("mutation receipt did not reach a terminal reindexed state")
 }
 
-func TestMutationReindexStateFailureBlocksSafetyReads(t *testing.T) {
+func TestMutationReindexStatePreservesFailure(t *testing.T) {
 	patchFailure := errors.New("patch failed")
 	done := make(chan indexer.MutationResult, 1)
 	done <- indexer.MutationResult{RequestedGeneration: 3, AppliedGeneration: 3, Err: patchFailure}
@@ -272,9 +265,6 @@ func TestMutationReindexStateFailureBlocksSafetyReads(t *testing.T) {
 	outcome := s.mutationReindexState(context.Background(), "/tmp/broken.go")
 	if !errors.Is(outcome.Err, patchFailure) || outcome.Reindexed || outcome.Pending {
 		t.Fatalf("failed ticket outcome = %+v", outcome)
-	}
-	if err := s.awaitMutationFreshness(context.Background()); err == nil || !strings.Contains(err.Error(), "patch failed") {
-		t.Fatalf("failed safety barrier error = %v", err)
 	}
 }
 

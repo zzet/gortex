@@ -123,16 +123,16 @@ func wireContractGolden(name string) string {
 		// ProjectID, were added.
 		return "a600bd906c9e09ffa0828427f5d6622acd5fe244798a61d5712c151053be5dac"
 	case "graph.Edge":
-		// Bumped when NameOnly was added — the marker on a synthesized
-		// name-only candidate row (a call site that named the symbol but
-		// never bound to it, projected onto it by find_usages /
-		// get_callers under min_tier:"text_matched"). Set only on the
-		// in-memory projection, so a persisted edge always carries it
-		// false; not part of the edge identity / dedup key.
-		// (Previously bumped when Alias — the renamed name carried by a
-		// per-binding import or re-export edge — then Via, ReturnUsage,
+		// Bumped when Provisional was added — the marker on a stored call
+		// edge carried onto an overlay that re-parsed its file before
+		// relations were rebuilt. Set only on the in-memory overlay, so a
+		// persisted edge always carries it false; not part of the edge
+		// identity / dedup key.
+		// (Previously bumped when NameOnly — the marker on a synthesized
+		// name-only candidate row projected by find_usages / get_callers
+		// under min_tier:"text_matched" — then Alias, Via, ReturnUsage,
 		// Context, and Tier, were added.)
-		return "d27d737c6c164243e2d55b4ca265a46d658e9617546f20306e9357e17aa46603"
+		return "fb8425eff2fe4f2b17d665fd182a48b6f5f5b832c90dc750ca4f933b639cee2c"
 	default:
 		panic(fmt.Sprintf("no golden fingerprint for %s", name))
 	}

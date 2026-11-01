@@ -7021,6 +7021,7 @@ type incrementalPathMode struct {
 	// mutable Indexer tracing state is installed by this per-call observation.
 	publication *PublicationStamps
 	readRepair  *ReadRepairObservation
+	onRelations func() // resolver and file publication complete, before derived work
 }
 
 // indexedFilesAbsentFromDisk returns the repo-relative keys of files the graph

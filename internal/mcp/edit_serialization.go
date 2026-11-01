@@ -7,21 +7,20 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 const (
 	defaultMutationReindexWait = 3 * time.Second
-	defaultMutationSafetyWait  = 3 * time.Second
 	mutationReceiptRetention   = 10 * time.Minute
 )
 
-var mutationReceiptSequence atomic.Uint64
+var mutationReceiptSequence = epochMutationSequence()
 
 // mutationPathLocks serializes read-modify-write tool calls per on-disk path.
 // MCP requests can run concurrently, and atomic rename only makes each write
@@ -71,6 +70,7 @@ type mutationReceipt struct {
 	mu                         sync.RWMutex
 	result                     indexer.MutationResult
 	completed                  bool
+	ticket                     *indexer.MutationTicket
 	checkoutScoped             bool
 	checkoutID                 string
 	checkoutIncarnation        string
@@ -136,8 +136,13 @@ func acquireMutationPath(ctx context.Context, path string) (func(), error) {
 	if err := guardCheckoutMutationPath(ctx, path); err != nil {
 		return nil, err
 	}
-	path = filepath.Clean(path)
+	return acquireMutationPathKey(ctx, pathkey.MutationKey(path))
+}
 
+// acquireMutationPathKey acquires an already-admitted, captured path identity.
+// Keeping that key through acquisition also keeps release independent of any
+// later symlink change.
+func acquireMutationPathKey(ctx context.Context, path string) (func(), error) {
 	mutationPathLocks.Lock()
 	entry := mutationPathLocks.byPath[path]
 	if entry == nil {
@@ -176,18 +181,21 @@ func acquireMutationPaths(ctx context.Context, paths []string) (func(), error) {
 	unique := make(map[string]struct{}, len(paths))
 	ordered := make([]string, 0, len(paths))
 	for _, path := range paths {
-		clean := filepath.Clean(path)
-		if _, exists := unique[clean]; exists {
+		if err := guardCheckoutMutationPath(ctx, path); err != nil {
+			return nil, err
+		}
+		key := pathkey.MutationKey(path)
+		if _, exists := unique[key]; exists {
 			continue
 		}
-		unique[clean] = struct{}{}
-		ordered = append(ordered, clean)
+		unique[key] = struct{}{}
+		ordered = append(ordered, key)
 	}
 	sort.Strings(ordered)
 
 	releases := make([]func(), 0, len(ordered))
-	for _, path := range ordered {
-		release, err := acquireMutationPath(ctx, path)
+	for _, key := range ordered {
+		release, err := acquireMutationPathKey(ctx, key)
 		if err != nil {
 			for i := len(releases) - 1; i >= 0; i-- {
 				releases[i]()
@@ -244,6 +252,7 @@ func (s *Server) trackCheckoutRecoveryTicket(ticket *indexer.CheckoutRefreshTick
 
 func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo, checkoutID, incarnation string, recoveryCandidates map[string]struct{}) *mutationReceipt {
 	receipt := &mutationReceipt{
+		ticket:              ticket,
 		id:                  fmt.Sprintf("mutation-%d", mutationReceiptSequence.Add(1)),
 		repo:                repo,
 		path:                ticket.Path,
@@ -442,6 +451,18 @@ func (s *Server) failedReceiptsBefore(paths []string, root string) map[string]st
 	return eligible
 }
 
+func (s *Server) captureWatcherTierRepair(paths []string, root string) func() {
+	path, ok := reindexCandidatePath(paths, root)
+	if !ok {
+		return nil
+	}
+	watcher, ok := s.currentWatcher().(interface{ CaptureTierRepair(string) func() })
+	if !ok {
+		return nil
+	}
+	return watcher.CaptureTierRepair(path)
+}
+
 func (s *Server) resolveReindexedPathReceipts(reindexedPath string, eligible map[string]struct{}) {
 	cleanPath := filepath.Clean(reindexedPath)
 	s.mutationReceipts.Range(func(_, value any) bool {
@@ -533,13 +554,6 @@ func (s *Server) mutationWaitDuration() time.Duration {
 	return defaultMutationReindexWait
 }
 
-func (s *Server) mutationSafetyWaitDuration() time.Duration {
-	if s.mutationSafetyWait > 0 {
-		return s.mutationSafetyWait
-	}
-	return defaultMutationSafetyWait
-}
-
 // mutationReindexState returns the graph-freshness state to expose after a
 // successful disk mutation. A live watcher already owns debouncing, patch
 // serialization, and latest-bytes reconciliation, so duplicating IndexFile in
@@ -609,12 +623,6 @@ func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutat
 		return mutationReindexOutcome{Err: err}
 	}
 	return mutationReindexOutcome{Reindexed: s.reindexFile(absPath)}
-}
-
-// awaitMutationFreshness is the conservative all-repository safety barrier.
-// Callers that can resolve a target repository should use the scoped sibling.
-func (s *Server) awaitMutationFreshness(ctx context.Context) error {
-	return s.awaitMutationFreshnessForRepos(ctx)
 }
 
 // mutationCheckoutScope is metadata-only so receipts remain inspectable while
@@ -702,116 +710,6 @@ func (s *Server) mutationFreshnessSummaryForRepos(ctx context.Context, repos ...
 		}
 	}
 	return pending, errors.Join(failures...)
-}
-
-// awaitMutationFreshnessForRepos waits once, under one shared budget, for every
-// selected ticket. On timeout it reports all pending and terminally failed
-// generations rather than hiding the remaining gaps behind the first one.
-func (s *Server) awaitMutationFreshnessForRepos(ctx context.Context, repos ...string) error {
-	receipts := s.mutationReceiptsForRepos(ctx, repos...)
-	if len(receipts) == 0 {
-		return nil
-	}
-	sort.Slice(receipts, func(i, j int) bool {
-		if receipts[i].repo != receipts[j].repo {
-			return receipts[i].repo < receipts[j].repo
-		}
-		if receipts[i].path != receipts[j].path {
-			return receipts[i].path < receipts[j].path
-		}
-		if receipts[i].generation != receipts[j].generation {
-			return receipts[i].generation < receipts[j].generation
-		}
-		return receipts[i].id < receipts[j].id
-	})
-
-	timer := time.NewTimer(s.mutationSafetyWaitDuration())
-	defer timer.Stop()
-	waitReason := ""
-waitLoop:
-	for _, receipt := range receipts {
-		select {
-		case <-receipt.done:
-		case <-timer.C:
-			waitReason = "wait budget expired"
-			break waitLoop
-		case <-ctx.Done():
-			waitReason = "request cancelled: " + ctx.Err().Error()
-			break waitLoop
-		}
-	}
-
-	issues := make([]string, 0, len(receipts))
-	hasTerminalFailure := false
-	for _, receipt := range receipts {
-		issue := ""
-		select {
-		case <-receipt.done:
-			outcome := receipt.outcome(false)
-			switch {
-			case outcome.Err != nil:
-				hasTerminalFailure = true
-				issue = fmt.Sprintf(
-					"failed receipt=%s repo=%q path=%q generation=%d error=%q",
-					receipt.id, receipt.repo, receipt.path, receipt.generation, outcome.Err.Error())
-			case !outcome.Reindexed:
-				hasTerminalFailure = true
-				issue = fmt.Sprintf(
-					"failed receipt=%s repo=%q path=%q generation=%d error=%q",
-					receipt.id, receipt.repo, receipt.path, receipt.generation, "reindex not confirmed")
-			}
-		default:
-			issue = fmt.Sprintf(
-				"pending receipt=%s repo=%q path=%q generation=%d",
-				receipt.id, receipt.repo, receipt.path, receipt.generation)
-		}
-		if issue != "" {
-			issues = append(issues, issue+s.mutationFreshnessReceiptHint(ctx, receipt.id))
-		}
-	}
-	if len(issues) == 0 {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("graph freshness wait cancelled: %w", err)
-		}
-		return nil
-	}
-
-	message := "graph freshness unavailable"
-	if waitReason != "" {
-		message += " (" + waitReason + ")"
-	}
-	for i, issue := range issues {
-		if i == 0 {
-			message += ": "
-		} else {
-			message += "; "
-		}
-		message += issue
-	}
-	if hasTerminalFailure {
-		message += "; " + mutationFreshnessRecoveryHint()
-	}
-	return fmt.Errorf("%s", message)
-}
-
-// mutationReposForSymbolIDs resolves a complete repository scope for a symbol
-// request. Any unresolved input returns nil, which deliberately widens the
-// barrier to all receipts rather than excluding an unknown mutation.
-func (s *Server) mutationReposForSymbolIDs(ctx context.Context, ids []string) []string {
-	repos := make(map[string]struct{}, len(ids))
-	for _, id := range ids {
-		node := s.engineFor(ctx).GetSymbol(id)
-		if node == nil || node.RepoPrefix == "" {
-			return nil
-		}
-		repos[node.RepoPrefix] = struct{}{}
-	}
-	result := make([]string, 0, len(repos))
-	for repo := range repos {
-		result = append(result, repo)
-	}
-	sort.Strings(result)
-	return result
 }
 
 // derivedFanoutKeyComplete is the wire spelling of the bounded-derived-pass

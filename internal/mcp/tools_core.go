@@ -1549,6 +1549,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		// the cutoff declines some safe resolutions, which is the right way
 		// to be wrong here.
 		eligible map[string]struct{}
+		repair   func()
 	)
 
 	// Multi-repo mode: route through the per-repo indexer so nodes keep
@@ -1580,6 +1581,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 			return mcp.NewToolResultError(scopeErr.Error()), nil
 		}
 		eligible = s.failedReceiptsBefore(paths, reindexRoot)
+		repair = s.captureWatcherTierRepair(paths, reindexRoot)
 		result, err = s.multiIndexer.IncrementalReindexRepo(prefix, paths)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -1602,6 +1604,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		}
 		reindexRoot = root
 		eligible = s.failedReceiptsBefore(paths, reindexRoot)
+		repair = s.captureWatcherTierRepair(paths, reindexRoot)
 		result, err = s.indexer.IncrementalReindexPaths(root, paths)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -1622,6 +1625,9 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 	// prevent — so anything wider is left alone.
 	if resolved, ok := reindexedReceiptPath(paths, reindexRoot, result); ok {
 		s.resolveReindexedPathReceipts(resolved, eligible)
+		if repair != nil {
+			repair()
+		}
 	}
 
 	s.startBackgroundAnalysis("reindex")
@@ -1717,9 +1723,11 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError("id is required"), nil
 	}
 
-	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFreshContext(ctx, []string{parts[0]})
+		ctx, err = s.ensureProjected(ctx, []string{parts[0]})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 
 	node := s.engineFor(ctx).GetSymbol(id)
@@ -2747,8 +2755,10 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	// mode — the cause of spurious file_not_indexed misses.
 	fp = s.graphRelPath(ctx, fp)
 
-	// Auto re-index stale file before querying.
-	s.ensureFreshContext(ctx, []string{fp})
+	ctx, err = s.ensureProjected(ctx, []string{fp})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	// gcx is the high-volume agent format and only emits total_edges
 	// in its meta header — never per-edge rows. Route gcx-only calls
