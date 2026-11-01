@@ -171,7 +171,7 @@ var ErrCommonDirMismatch = fmt.Errorf(
 //
 // A nil return is the caller's licence to treat a missing record as a removal.
 // Any other return must be passed to Classify as the inventory error, which
-// makes every checkout of the family inaccessible instead.
+// leaves checkout clocks frozen unless fresh local evidence proves presence.
 func ValidateInventory(inv *gitstate.FamilyInventory, invErr error, familyCommonDir string) error {
 	if invErr != nil {
 		return invErr
@@ -188,9 +188,9 @@ func ValidateInventory(inv *gitstate.FamilyInventory, invErr error, familyCommon
 
 // Classify decides what one checkout's observation means.
 //
-// The asymmetry is deliberate: presence and inaccessibility are cheap to be
-// wrong about, removal is not. An unavailable inventory freezes clocks as
-// Unknown unless this checkout's own fresh root and .git marker prove presence.
+// Family inventory failure is uncertainty, not an availability deadline.
+// It freezes clocks as Unknown unless this checkout's own fresh root and
+// .git marker prove presence.
 // An absent inventory never proves an absent checkout.
 //
 // record is nil when a usable inventory did not list the checkout's admin

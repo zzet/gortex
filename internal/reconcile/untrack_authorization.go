@@ -85,6 +85,9 @@ func (r *Reconciler) authorizeExplicitCleanup(
 	target sagaTarget,
 	plan store_sqlite.UntrackAuthorizationPlan,
 ) (IntentRevocation, sagaTarget, error) {
+	// This method is the explicit authorization boundary, including callers
+	// that construct a target directly. Its durable cause is never inferred.
+	target.Cause = CauseUntrack
 	entry, err := r.pendingCleanupEntry(target)
 	if err != nil {
 		return IntentRevocation{}, sagaTarget{}, err

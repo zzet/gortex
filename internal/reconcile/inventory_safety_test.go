@@ -3,13 +3,13 @@ package reconcile
 import (
 	"context"
 	"fmt"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest/observer"
 	"testing"
 	"time"
 
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestInventoryFailureFreezesIntendedPrimaryClocks(t *testing.T) {
@@ -164,6 +164,17 @@ func TestAutomaticRetirementPreservesIntentAddedDuringPurge(t *testing.T) {
 	row, found, err := f.catalog.GetCheckout(context.Background(), "automatic")
 	if err != nil || !found {
 		t.Fatalf("automatic retirement removed concurrently intended checkout: %+v found=%v err=%v", row, found, err)
+	}
+	if row.State == store_sqlite.CheckoutStateReady || row.State == store_sqlite.CheckoutStateReconciling {
+		t.Fatalf("purged checkout still eligible to serve: state=%s", row.State)
+	}
+	if _, routed, routeErr := f.catalog.GetCheckoutRoute(context.Background(), "automatic"); routeErr != nil || routed {
+		t.Fatalf("purged checkout retained serving route: routed=%v err=%v", routed, routeErr)
+	}
+	cleanupID := (sagaTarget{Kind: sagaForgetCheckout, CheckoutID: "automatic", Incarnation: "inc"}).cleanupID()
+	pending, journaled, journalErr := f.catalog.GetCleanupEntry(context.Background(), cleanupID)
+	if journalErr != nil || !journaled || pending.Phase != store_sqlite.CleanupPhaseFailed {
+		t.Fatalf("declined deletion falsely completed cleanup: %+v found=%v err=%v", pending, journaled, journalErr)
 	}
 	if entry := f.entry(report, "work"); entry.Action == ActionForgotten {
 		t.Fatal("automatic pass reported retirement of intended checkout")

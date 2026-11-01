@@ -46,6 +46,7 @@ func TestLegacyJournalCauseInference(t *testing.T) {
 			}
 		})
 	}
+	t.Run("explicit-only-kind", testLegacyExplicitGraphCleanupInfersDemotion)
 }
 
 func TestCauseReachesReleaseGraphAcrossRestart(t *testing.T) {
@@ -109,7 +110,7 @@ func TestCauseReachesReleaseGraphAcrossRestart(t *testing.T) {
 	}
 }
 
-func TestLegacyExplicitGraphCleanupInfersDemotion(t *testing.T) {
+func testLegacyExplicitGraphCleanupInfersDemotion(t *testing.T) {
 	f := newFixture(t, Default())
 	f.seedCheckout("owner", "inc", "work", store_sqlite.CheckoutModeDedicated)
 	f.seedOwnedGraph("owned", "owner")

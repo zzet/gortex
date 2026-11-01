@@ -2,25 +2,23 @@ package reconcile
 
 import (
 	"context"
+
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 const (
-	CauseUntrack               = "untrack"
-	CauseForget                = "forget"
-	CauseReloadRemoved         = "reload_removed_from_config"
-	CauseDemotion              = "demotion"
-	CauseReconcileRemoval      = "reconcile_removal"
-	CauseReconcileAvailability = "reconcile_availability"
+	CauseUntrack               = store_sqlite.CleanupCauseUntrack
+	CauseForget                = store_sqlite.CleanupCauseForget
+	CauseReloadRemoved         = store_sqlite.CleanupCauseReloadRemoved
+	CauseDemotion              = store_sqlite.CleanupCauseDemotion
+	CauseReconcileRemoval      = store_sqlite.CleanupCauseReconcileRemoval
+	CauseReconcileAvailability = store_sqlite.CleanupCauseReconcileAvailability
 )
 
 // ConfigRemovalAllowed names the only authorized reasons to persist untracking.
 // Unknown causes, including legacy missing causes, always keep configuration.
 func ConfigRemovalAllowed(cause string) bool {
-	switch cause {
-	case CauseUntrack, CauseForget, CauseReloadRemoved, CauseDemotion:
-		return true
-	}
-	return false
+	return store_sqlite.CleanupCauseAllowsConfigRemoval(cause)
 }
 
 func (r *Reconciler) inferCleanupCause(ctx context.Context, target sagaTarget) (string, error) {
@@ -44,10 +42,10 @@ func (r *Reconciler) inferCleanupCause(ctx context.Context, target sagaTarget) (
 	return CauseReconcileRemoval, nil
 }
 
-// Legacy automatic primary closures must not resume destructive phases merely
+// Legacy automatic cleanup must not resume destructive phases merely
 // because an old journal omitted the user's authorization cause.
-func (r *Reconciler) refuseAutomaticPrimaryClosure(ctx context.Context, target sagaTarget) (bool, error) {
-	if target.Kind != sagaRetirePrimaryClosure || ConfigRemovalAllowed(target.Cause) {
+func (r *Reconciler) refuseAutomaticCleanup(ctx context.Context, target sagaTarget) (bool, error) {
+	if (target.Kind != sagaRetirePrimaryClosure && target.Kind != sagaForgetCheckout) || ConfigRemovalAllowed(target.Cause) {
 		return false, nil
 	}
 	owner, found, err := r.catalog.GetCheckout(ctx, target.CheckoutID)
@@ -59,7 +57,10 @@ func (r *Reconciler) refuseAutomaticPrimaryClosure(ctx context.Context, target s
 		return false, err
 	}
 	req := observationFrom(owner)
-	_, _, err = r.retainIntended(ctx, &familyPass{family: family, now: r.now()}, owner, &req)
+	_, retained, err := r.retainIntended(ctx, &familyPass{family: family, now: r.now()}, owner, &req)
+	if !retained && err == nil {
+		return false, nil
+	}
 	if err != nil {
 		return true, err
 	}

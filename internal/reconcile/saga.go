@@ -352,11 +352,12 @@ func (r *Reconciler) runSaga(ctx context.Context, target sagaTarget) error {
 			target.Root = checkout.RootPath
 		}
 	}
-	if refused, err := r.refuseAutomaticPrimaryClosure(ctx, target); refused || err != nil {
-		return err
-	}
 	if r.logger != nil {
 		r.logger.Info("checkout cleanup: entered", zap.String("family", target.FamilyID), zap.String("checkout", target.CheckoutID), zap.String("graph", target.GraphID), zap.String("cause", target.Cause), zap.String("kind", string(target.Kind)), zap.String("root", target.Root), zap.String("disposition", "cleanup"), zap.String("evidence", string(EvidenceNone)), zap.String("detail", string(target.Phase)))
+	}
+
+	if refused, err := r.refuseAutomaticCleanup(ctx, target); refused || err != nil {
+		return err
 	}
 
 	// LIFO is intentional: final graph notifications precede release of the
@@ -505,7 +506,13 @@ func (r *Reconciler) deleteCheckoutRow(ctx context.Context, target sagaTarget) e
 	if target.CheckoutID == "" {
 		return nil
 	}
-	if err := ignoreNotFound(r.catalog.DeleteCheckout(ctx, target.CheckoutID)); err != nil {
+	var err error
+	if ConfigRemovalAllowed(target.Cause) {
+		err = r.catalog.DeleteCheckout(ctx, target.CheckoutID)
+	} else {
+		err = r.catalog.DeleteAutomaticCheckout(ctx, target.CheckoutID, target.Incarnation)
+	}
+	if err := ignoreNotFound(err); err != nil {
 		return err
 	}
 	return ignoreNotFound(r.catalog.DeleteCleanupEntry(ctx, target.purgeCleanupID()))

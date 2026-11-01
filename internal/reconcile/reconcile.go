@@ -693,6 +693,15 @@ func (r *Reconciler) retireCheckout(
 	case journaled && prior.Deferred:
 		return ActionGuardLost, false, nil
 	}
+	if err == nil {
+		// A late tracking intent can turn an automatic attempt into a retained
+		// unavailable checkout. Never report its identity as retired in that case.
+		if _, stillPresent, readErr := r.catalog.GetCheckout(ctx, existing.CheckoutID); readErr != nil {
+			return "", false, readErr
+		} else if stillPresent {
+			return ActionGuardLost, false, nil
+		}
+	}
 	return action, true, nil
 }
 

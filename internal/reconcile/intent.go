@@ -250,7 +250,7 @@ func (r *Reconciler) RetireCheckout(ctx context.Context, checkoutID, incarnation
 		}
 	}
 
-	demotable := checkout.State == store_sqlite.CheckoutStateReady &&
+	demotable := ConfigRemovalAllowed(cause) && checkout.State == store_sqlite.CheckoutStateReady &&
 		(owned == nil || !owned.IsPrimaryBase) &&
 		primary != nil &&
 		primary.OwnerCheckoutID != checkoutID &&
