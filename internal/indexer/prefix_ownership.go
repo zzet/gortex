@@ -60,9 +60,14 @@ func (a *prefixStatAllowance) observe(ctx context.Context, path string) prefixSt
 	slots := a.slots
 	done := make(chan prefixStatResult, 1)
 	go func() {
-		defer func() { <-slots }()
-		info, err := stat(path)
-		done <- prefixStatResult{info: info, err: err}
+		result := func() prefixStatResult {
+			defer func() { <-slots }()
+			info, err := stat(path)
+			return prefixStatResult{info: info, err: err}
+		}()
+		// A completed result authorizes the caller's next observation.
+		// Return this permit first, even when the receiver runs immediately.
+		done <- result
 	}()
 	select {
 	case <-ctx.Done():
