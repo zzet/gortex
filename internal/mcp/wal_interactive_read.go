@@ -14,14 +14,30 @@ type interactiveReadAnnouncer interface{ AnnounceInteractiveRead() func() }
 
 type interactiveEditedFile struct{ path, checkoutID, incarnation string }
 
-func (s *Server) announceInteractiveRead() func() {
+func (s *Server) announceInteractiveRead(ctx context.Context) func() {
+	if ctx != nil && ctx.Err() != nil {
+		return func() {}
+	}
+	var release func()
 	if store, ok := s.graph.(interactiveReadAnnouncer); ok {
-		return store.AnnounceInteractiveRead()
+		release = store.AnnounceInteractiveRead()
+	} else if s.materializer != nil && s.materializer.Store != nil {
+		release = s.materializer.Store.AnnounceInteractiveRead()
 	}
-	if s.materializer != nil && s.materializer.Store != nil {
-		return s.materializer.Store.AnnounceInteractiveRead()
+	if release == nil {
+		return func() {}
 	}
-	return func() {}
+	if ctx == nil || ctx.Done() == nil {
+		return release
+	}
+	// Physical I/O can outlive the transport caller. Do not retain priority
+	// while an abandoned handler is still unwinding. Both releases use the
+	// store's idempotent release; this adds no timer or publication wait.
+	stop := context.AfterFunc(ctx, release)
+	return func() {
+		stop()
+		release()
+	}
 }
 
 func interactiveFileKey(ctx context.Context, absPath string) interactiveEditedFile {
@@ -54,6 +70,9 @@ func (s *Server) rememberInteractiveEdit(ctx context.Context, absPath string) {
 // a confined physical file plus the existing checkout identity;
 // another session/checkout, ref or editor projection cannot borrow the marker.
 func (s *Server) beginEditedFileRead(ctx context.Context, absPath string) func() {
+	if ctx != nil && ctx.Err() != nil {
+		return func() {}
+	}
 	if !filepath.IsAbs(absPath) {
 		return func() {}
 	}
@@ -90,12 +109,15 @@ func (s *Server) beginEditedFileRead(ctx context.Context, absPath string) func()
 	if !matched {
 		return func() {}
 	}
-	return s.announceInteractiveRead()
+	return s.announceInteractiveRead(ctx)
 }
 
 // Begin only after publication/repair and response graph reads have finished.
 // No store mutation or publication wait may run within this formatting scope.
 func (s *Server) beginEditAcknowledgement(ctx context.Context, absPath string) func() {
+	if ctx != nil && ctx.Err() != nil {
+		return func() {}
+	}
 	s.rememberInteractiveEdit(ctx, absPath)
-	return s.announceInteractiveRead()
+	return s.announceInteractiveRead(ctx)
 }

@@ -67,7 +67,11 @@ func TestEditAcknowledgementMarksOnlyPostAwaitFormatting(t *testing.T) {
 				done <- indexer.MutationResult{Reindexed: true}
 			}
 			<-joined
-			require.EqualValues(t, 1, formattingActive.Load(), "actual post-await ACK evidence/formatting was unmarked")
+			if cancelled {
+				require.Zero(t, formattingActive.Load(), "an already canceled caller must not acquire new interactive priority")
+			} else {
+				require.EqualValues(t, 1, formattingActive.Load(), "actual post-await ACK evidence/formatting was unmarked")
+			}
 			require.Zero(t, spy.active.Load(), "interactive marker leaked after return/cancellation")
 		})
 	}
