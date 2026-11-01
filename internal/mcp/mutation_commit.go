@@ -86,7 +86,7 @@ const mutationIDParamDescription = "Optional idempotency key. Retrying with the 
 	"replays the first result instead of writing twice — the safe way to retry an abandoned call. " +
 	"A different edit under the same key is refused."
 
-var mutationCommitSequence atomic.Uint64
+var mutationCommitSequence = epochMutationSequence()
 
 // mutationDiskCommitSequence orders disk commits. It is stamped after the
 // rename and before the commit's refresh ticket is admitted, so a fresh

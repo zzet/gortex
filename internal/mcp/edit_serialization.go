@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
@@ -21,7 +20,7 @@ const (
 	mutationReceiptRetention   = 10 * time.Minute
 )
 
-var mutationReceiptSequence atomic.Uint64
+var mutationReceiptSequence = epochMutationSequence()
 
 // mutationPathLocks serializes read-modify-write tool calls per on-disk path.
 // MCP requests can run concurrently, and atomic rename only makes each write
@@ -71,6 +70,7 @@ type mutationReceipt struct {
 	mu                         sync.RWMutex
 	result                     indexer.MutationResult
 	completed                  bool
+	ticket                     *indexer.MutationTicket
 	checkoutScoped             bool
 	checkoutID                 string
 	checkoutIncarnation        string
@@ -244,6 +244,7 @@ func (s *Server) trackCheckoutRecoveryTicket(ticket *indexer.CheckoutRefreshTick
 
 func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo, checkoutID, incarnation string, recoveryCandidates map[string]struct{}) *mutationReceipt {
 	receipt := &mutationReceipt{
+		ticket:              ticket,
 		id:                  fmt.Sprintf("mutation-%d", mutationReceiptSequence.Add(1)),
 		repo:                repo,
 		path:                ticket.Path,
