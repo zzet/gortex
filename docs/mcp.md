@@ -472,6 +472,31 @@ the first attests *what bytes* are on disk, the second whether the write
 happened at all. A call abandoned before its response returns no evidence block
 — only the receipt — which is exactly when `disk_status` is the field you need.
 
+### Publication tiers and freshness
+
+`readback_exact:true` means the written bytes can be used immediately; continue
+without polling. Graph relations and derived analyses can publish later. Check
+`graph_freshness` before acting on callers, usages, impact, or rename plans.
+Before a rename, deletion, or signature change, send `require_fresh:true`,
+`freshness_scope:"relations"`, and an absolute RFC3339 `wait_deadline`.
+`freshness_scope` accepts `file`, `relations`, and `derived` as request metadata;
+it is intentionally absent from tool schemas. Text and declaration capability
+scopes do not select a publication tier.
+
+Pending or failed answers carry a visible tier line in text/TOON/compact output;
+GCX preserves its `GCX1` header and places the line immediately after it. JSON
+carries the same fields in its freshness block. An idle fresh answer gains no
+fields. Never classify a symbol as dead while its file is pending.
+
+`mutation_status` reads live `ack_at`, `file_graph_at`, `relations_at`, and
+`derived_at` stamps when a watcher ticket observed them. Missing stamps mean
+unobserved work. Unknown receipt or mutation IDs return `state:"lost"` immediately;
+a lost receipt cannot certify freshness. After restart, relation queries remain
+pending until the shared startup resolver has published. File reads still check
+current disk state. CLI verbs print the freshness line on stderr;
+`--require-fresh` exits with code 4 when the requested tier remains pending or
+failed.
+
 ## Agent-optimized (token efficiency)
 
 | Tool | Description |
