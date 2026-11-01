@@ -100,7 +100,7 @@ Five proactive push channels — per-session opt-in, delta-filtered, initial rep
 
 - **`notifications/diagnostics`** — LSP `publishDiagnostics` fan-out. Filter by `min_severity` / `path_prefix`.
 - **`notifications/workspace_readiness`** — daemon warmup phase transitions (snapshot_loaded → parallel_parse → deferred_passes_all → global_resolve → end_batch → watcher_started → ready). Late subscribers get the last-known phase replayed.
-- **`notifications/daemon_health`** — periodic ticker (default 15 s, clampable 1 s..5 min). Snapshots uptime, alloc/sys/heap, num_goroutine, num_gc, tracked_repos, sessions, lsp_alive, graph nodes/edges. Only runs while ≥1 subscriber is attached.
+- **`notifications/daemon_health`** — periodic ticker (default 15 s, clampable 1 s..5 min). Snapshots uptime, alloc/sys/heap, num_goroutine, num_gc, tracked_repos, sessions, lsp_alive, graph nodes/edges, live checkout coordinators, the process-wide SQLite page cache, and the OS view of the process (resident set; Linux proportional set and its file-backed part; macOS physical footprint; each omitted where the platform has no reader). Only runs while ≥1 subscriber is attached.
 - **`notifications/stale_refs`** — per-session intersect of watcher symbol-change events against the session's viewed/modified working set. Fires only when a change actually touches what *this* session has consumed.
 - **`notifications/graph_invalidated`** — coarse "the graph was rebuilt, drop cached results" signal. `{node_count, edge_count, reason, ts}`. Unfiltered.
 

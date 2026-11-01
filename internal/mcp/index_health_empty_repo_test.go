@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -43,8 +44,10 @@ func healthServerWithIndexedRepos(t *testing.T, named map[string]string) *Server
 	reg := parser.NewRegistry()
 	reg.Register(languages.NewGoExtractor())
 	mi := indexer.NewMultiIndexer(graph.New(), reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err)
+	}
 
 	srv.configManager = cm
 	srv.multiIndexer = mi

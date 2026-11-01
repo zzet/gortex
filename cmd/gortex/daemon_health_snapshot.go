@@ -6,7 +6,9 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/runtimeactivity"
+	"github.com/zzet/gortex/internal/sqliteconn"
 )
 
 var daemonHealthMetricNames = [...]string{
@@ -39,7 +41,7 @@ func daemonHealthRuntimeStats() daemon.RuntimeStats {
 	heapUnused := values["/memory/classes/heap/unused:bytes"]
 	heapFree := values["/memory/classes/heap/free:bytes"]
 	heapReleased := values["/memory/classes/heap/released:bytes"]
-	return daemon.RuntimeStats{
+	return withProcessGauges(daemon.RuntimeStats{
 		Alloc:        heapObjects,
 		Sys:          values["/memory/classes/total:bytes"],
 		HeapInuse:    heapObjects + heapUnused,
@@ -48,7 +50,20 @@ func daemonHealthRuntimeStats() daemon.RuntimeStats {
 		StackInuse:   values["/memory/classes/heap/stacks:bytes"],
 		NumGC:        uint32(values["/gc/cycles/total:gc-cycles"]),
 		NumGoroutine: int(values["/sched/goroutines:goroutines"]),
-	}
+	})
+}
+
+// withProcessGauges adds what the Go runtime cannot see to one of its samples:
+// the operating system's resident accounting and SQLite's page caches. Status
+// and health read them only when someone asks, so a daemon nobody watches
+// pays nothing for them.
+func withProcessGauges(stats daemon.RuntimeStats) daemon.RuntimeStats {
+	mem := platform.ReadProcessMemory()
+	stats.RSS, stats.RSSPeak, stats.PSS, stats.PSSFile = mem.RSSBytes, mem.PeakRSSBytes, mem.PSSBytes, mem.PSSFileBytes
+	stats.Footprint, stats.FootprintPeak = mem.FootprintBytes, mem.PeakFootprintBytes
+	pageCache, pageCachePeak := sqliteconn.PageCacheBytes()
+	stats.SQLitePageCache, stats.SQLitePageCachePeak = uint64(max(pageCache, 0)), uint64(max(pageCachePeak, 0))
+	return stats
 }
 
 // buildDaemonHealthSnapshot is intentionally query-free. Health subscribers
@@ -79,11 +94,28 @@ func buildDaemonHealthSnapshot(
 		"stack_inuse_bytes":   runtimeStats.StackInuse,
 		"num_goroutine":       runtimeStats.NumGoroutine,
 		"num_gc":              runtimeStats.NumGC,
+
+		"sqlite_page_cache_bytes":      runtimeStats.SQLitePageCache,
+		"sqlite_page_cache_peak_bytes": runtimeStats.SQLitePageCachePeak,
+	}
+	// A figure the platform has no reader for is left out, not reported as 0.
+	for key, value := range map[string]uint64{
+		"rss_bytes":            runtimeStats.RSS,
+		"rss_peak_bytes":       runtimeStats.RSSPeak,
+		"pss_bytes":            runtimeStats.PSS,
+		"pss_file_bytes":       runtimeStats.PSSFile,
+		"footprint_bytes":      runtimeStats.Footprint,
+		"footprint_peak_bytes": runtimeStats.FootprintPeak,
+	} {
+		if value > 0 {
+			out[key] = value
+		}
 	}
 	if controller != nil {
 		out["ready"] = controller.IsReady()
 		out["enriched"] = controller.IsEnriched()
 		out["warmup_seconds"] = controller.warmupSeconds.Load()
+		out["coordinators"] = controller.lifecycle.LiveCoordinators("")
 		if lspStatus := controller.collectLSPRouterStatus(); lspStatus != nil {
 			out["lsp_alive"] = len(lspStatus.ActiveProviders)
 			out["lsp_specs_registered"] = len(lspStatus.EnabledSpecs)

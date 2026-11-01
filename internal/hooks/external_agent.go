@@ -99,6 +99,15 @@ func buildStaleIndexHint(cwd string) string {
 	case err != nil:
 		return ""
 	}
+	if cwd != "" {
+		abs, err := filepath.Abs(cwd)
+		if err != nil {
+			abs = cwd
+		}
+		if collision := prefixCollisionCoverage(abs, status.TrackedRepos); collision != "" {
+			return "[Gortex] " + collision
+		}
+	}
 	if !status.Ready {
 		return fmt.Sprintf("[Gortex] daemon is warming up (%s elapsed); graph answers may be partial until it is ready.", formatDuration(status.WarmupSeconds))
 	}
@@ -110,6 +119,9 @@ func buildStaleIndexHint(cwd string) string {
 		exact, contained := classifyCwd(abs, status.TrackedRepos)
 		if exact == nil && len(contained) == 0 {
 			if pendingAutomaticCheckout(abs, status.TrackedRepos) {
+				if routedAutomaticCheckout(abs) != nil {
+					return ""
+				}
 				return fmt.Sprintf("[Gortex] checkout discovery is pending for cwd `%s`. %s", abs, agents.PendingAutomaticCheckoutGuidance)
 			}
 			return fmt.Sprintf("[Gortex] cwd `%s` is not tracked — run `gortex track %s` to enable graph context here.", abs, abs)

@@ -112,15 +112,7 @@ func viewlessCatalogTool(name string) bool {
 // Catalog lookup must not depend on a ready corpus listing its repository:
 // that is precisely the missing state a recovery request is meant to repair.
 func (s *Server) registeredCheckoutForPath(ctx context.Context, path string) (store_sqlite.Checkout, bool, error) {
-	families, err := s.materializer.Catalog.ListRepositoryFamilies(ctx)
-	if err != nil {
-		return store_sqlite.Checkout{}, false, err
-	}
-	ids := make([]string, len(families))
-	for i, family := range families {
-		ids[i] = family.FamilyID
-	}
-	return graphview.CheckoutForPath(ctx, s.materializer.Catalog, ids, path)
+	return graphview.RegisteredCheckoutForPath(ctx, s.materializer.Catalog, path)
 }
 
 // registeredWorktreeSelector shares exact-root matching between control and

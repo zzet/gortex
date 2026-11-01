@@ -316,7 +316,10 @@ var pendingEditRecordSequence atomic.Uint64
 // admission through indexer.WithPublicationRecord, so the coordinator binds
 // the ticket to it (and marks ticket_enqueued) before it wakes the cycle that
 // serves it. Its origin is the instant the tool call entered the middleware.
-func openMutationPhases(ctx context.Context, checkoutID, path string) (*indexer.PublicationPhaseRecord, string) {
+func (s *Server) openMutationPhases(ctx context.Context, checkoutID, path string) (*indexer.PublicationPhaseRecord, string) {
+	if record := s.committedPublicationRecord(ctx, path); record != nil {
+		return record, record.Key()
+	}
 	key := fmt.Sprintf("edit-pending-%d", pendingEditRecordSequence.Add(1))
 	record := indexer.DefaultPublicationPhases().Begin(checkoutID, key, indexer.PublicationSourceMCPEdit, toolReceivedAt(ctx))
 	// The disk commit happened before admission, on this request: its
@@ -387,11 +390,53 @@ func committedAtFor(ctx context.Context, path string) time.Time {
 // publicationPhasesPayload renders the publication record kept under a
 // graph-refresh receipt, folding in the disk commit instant the commit ledger
 // holds (same process, same monotonic clock). Nil when no record exists.
-func publicationPhasesPayload(receiptID string, committedAt time.Time) any {
+func publicationPhasesPayload(receiptID string, committedAt time.Time) *indexer.PublicationPhaseSnapshot {
 	record, ok := indexer.DefaultPublicationPhases().Lookup(receiptID)
 	if !ok {
 		return nil
 	}
 	record.MarkAt(indexer.PublicationReceiptCommitted, committedAt)
-	return record.Snapshot()
+	snapshot := record.Snapshot()
+	return &snapshot
+}
+
+// attachMutationPhaseTimings reads one publication snapshot for both payloads,
+// so a concurrently completing receipt cannot give them different endpoints.
+// Older/canonical paths without a timeline expose unavailable durations, not
+// zeroes. The legacy publication_phases value and vocabulary stay unchanged.
+func attachMutationPhaseTimings(payload map[string]any, receiptID string, committedAt time.Time, source string, retained *indexer.PublicationPhaseRecord) {
+	snapshot := indexer.PublicationPhaseSnapshot{Source: source}
+	if retained != nil {
+		// Recovery may rebind the commit to a different freshness receipt.
+		// Its physical write record must not borrow the replacement's phases,
+		// or let an older completion appear to finish that newer request.
+		retained.MarkAt(indexer.PublicationReceiptCommitted, committedAt)
+		candidate := retained.Snapshot()
+		if receiptID == "" || candidate.Key == receiptID {
+			snapshot = candidate
+			payload["publication_phases"] = snapshot
+			winner, unavailable := retained.CoalescedPublicationEvidence()
+			if winner != nil {
+				payload["coalesced_publication"] = winner
+				if winner.Background != nil {
+					payload["requested_background"] = winner.Background
+				}
+			}
+			if winner == nil {
+				if background := retained.RequestedBackground(); background != nil {
+					payload["requested_background"] = background
+				}
+			}
+			if unavailable != nil {
+				payload["requested_background_unavailable"] = unavailable
+			}
+		}
+	} else if phases := publicationPhasesPayload(receiptID, committedAt); phases != nil {
+		snapshot = *phases
+		payload["publication_phases"] = snapshot
+	}
+	timings := snapshot.EditTimings()
+	payload["phases_ms"] = timings.Milliseconds
+	payload["phase_states"] = timings.States
+	payload["phase_timing"] = timings.Window
 }

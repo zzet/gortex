@@ -6,12 +6,19 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 func collectLogs(root string) (map[string]string, map[string]int, error) {
+	return collectRunLogs(root, root, 0)
+}
+
+// Retained smoke stores have multiple process lifetimes. Copy only this
+// phase's numbered foreground logs, into this phase's exclusive evidence dir.
+func collectRunLogs(root, output string, firstStart int) (map[string]string, map[string]int, error) {
 	artifacts, crashes := make(map[string]string), map[string]int{"panic_lines": 0, "sigabrt_lines": 0, "oom_log_lines": 0}
-	dir := filepath.Join(root, "logs")
+	dir := filepath.Join(output, "logs")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return artifacts, crashes, err
 	}
@@ -22,6 +29,12 @@ func collectLogs(root string) (map[string]string, map[string]int, error) {
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "daemon") || !strings.HasSuffix(entry.Name(), ".log") {
 			continue
+		}
+		if firstStart > 0 && strings.HasPrefix(entry.Name(), "daemon-") {
+			start, err := strconv.Atoi(strings.SplitN(strings.TrimPrefix(entry.Name(), "daemon-"), ".", 2)[0])
+			if err == nil && start < firstStart {
+				continue
+			}
 		}
 		source, err := os.Open(filepath.Join(root, entry.Name()))
 		if err != nil {

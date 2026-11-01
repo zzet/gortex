@@ -49,7 +49,7 @@ func TestScopeForCWD_And_ReposInWorkspace(t *testing.T) {
 
 	g := graph.New()
 	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "") // empty scope → index every configured repo
+	_, err = mi.indexFixtureScope("", "") // empty scope → index every configured repo
 	require.NoError(t, err)
 
 	// cwd inside repo-a → workspace "alpha", home repo "repo-a".
@@ -236,7 +236,7 @@ func TestScopeForCWD_WorkspaceRoot(t *testing.T) {
 
 	g := graph.New()
 	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "")
+	_, err = mi.indexFixtureScope("", "")
 	require.NoError(t, err)
 
 	// Workspace root above exactly one tracked repo: binds with the
@@ -321,7 +321,7 @@ func TestContainedReposScope(t *testing.T) {
 
 	g := graph.New()
 	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "")
+	_, err = mi.indexFixtureScope("", "")
 	require.NoError(t, err)
 
 	// ScopeForCWD still fails closed on the mixed parent — this change
@@ -403,7 +403,7 @@ func TestContainedReposScope_RefusesOverbroadRoots(t *testing.T) {
 
 	g := graph.New()
 	mi := NewMultiIndexer(g, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "")
+	_, err = mi.indexFixtureScope("", "")
 	require.NoError(t, err)
 
 	// Precondition: a genuine parent inside home still binds, so the
@@ -455,7 +455,7 @@ func TestScopeForCWD_RefusesOverbroadRootSharedWorkspace(t *testing.T) {
 	require.NoError(t, err)
 
 	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "")
+	_, err = mi.indexFixtureScope("", "")
 	require.NoError(t, err)
 
 	// Precondition: the shared slug makes the reverse-containment arm
