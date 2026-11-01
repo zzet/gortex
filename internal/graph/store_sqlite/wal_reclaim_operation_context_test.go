@@ -142,6 +142,84 @@ func TestReclaimReadmissionSharesAggregateCredit(t *testing.T) {
 	})
 }
 
+// A producer may append a small tail after the completed copy gives up its
+// first writer slice. Final admission must use the unused slice to cover that
+// tail, rather than discard an otherwise durable completed copy.
+func TestReclaimReadmissionCatchesProducerTailWithinRemainingCredit(t *testing.T) {
+	for _, kind := range []string{"unblocked", "pinned_reader", "slow_tail"} {
+		t.Run(kind, func(t *testing.T) {
+			s, db := finalBackfillFixture(t)
+			stopStoreBackgroundReaders(s)
+			synctest.Test(t, func(t *testing.T) {
+				copies := 0
+				var pin *sql.Tx
+				defer func() {
+					if pin != nil {
+						_ = pin.Rollback()
+					}
+				}()
+				pauseReclaimCopyReturn(t, func() {
+					copies++
+					if copies != 1 {
+						if kind == "slow_tail" {
+							time.Sleep(300 * time.Millisecond)
+						}
+						return
+					}
+					time.Sleep(300 * time.Millisecond)
+					if kind == "pinned_reader" {
+						var err error
+						pin, err = s.db.BeginTx(t.Context(), &sql.TxOptions{ReadOnly: true})
+						require.NoError(t, err)
+						var payload string
+						require.NoError(t, pin.QueryRow(`SELECT payload FROM wal_churn WHERE id=1`).Scan(&payload))
+					}
+					s.writeMu.Lock()
+					_, err := s.writerDB.Exec(`UPDATE wal_churn SET payload='producer-tail' WHERE id=1`)
+					s.writeMu.Unlock()
+					require.NoError(t, err)
+				})
+				operation, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				s.writeMu.Lock()
+				writer := newWALReclaimWriterCredit(s, time.Now())
+				defer writer.release()
+				original, stop := context.WithTimeout(operation, 50*time.Millisecond)
+				defer stop()
+				_, err := writer.passive(original, operation, db, 25*time.Millisecond, false)
+				if kind == "slow_tail" {
+					require.ErrorIs(t, err, context.DeadlineExceeded)
+					require.Equal(t, 2, copies)
+					require.True(t, writer.readmitted)
+					require.False(t, writer.held)
+					require.Equal(t, 50*time.Millisecond, writer.spent, "tail copy renewed the aggregate allowance")
+					return
+				}
+				if pin != nil {
+					require.ErrorIs(t, err, errWALReclaimReadersInFlight)
+				} else {
+					require.NoError(t, err, "the completed copy's new tail never used its remaining writer credit")
+				}
+				require.True(t, writer.readmitted)
+				require.Equal(t, 2, copies, "tail completion must make exactly one additional real PASSIVE")
+				resetCtx := writer.resetContext(original)
+				deadline, bounded := resetCtx.Deadline()
+				require.True(t, bounded)
+				require.Equal(t, 50*time.Millisecond-writer.spent, time.Until(deadline))
+				if pin == nil {
+					_, err = s.resetWALForReclaim(resetCtx)
+					require.NoError(t, err)
+				}
+				writer.release()
+				require.Equal(t, 25*time.Millisecond, writer.spent)
+				var payload string
+				require.NoError(t, s.db.QueryRow(`SELECT payload FROM wal_churn WHERE id=1`).Scan(&payload))
+				require.Equal(t, "producer-tail", payload)
+			})
+		})
+	}
+}
+
 func TestReclaimReadmissionDoesNotReviveCancellationOrSpentCredit(t *testing.T) {
 	for _, kind := range []string{"spent", "cancel_cause", "writer_demand"} {
 		t.Run(kind, func(t *testing.T) {

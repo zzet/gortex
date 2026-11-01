@@ -19,6 +19,7 @@ type walReclaimWriterCredit struct {
 	resetCtx       context.Context
 	cancelReset    context.CancelFunc
 	readmitted     bool
+	tailCopyTried  bool
 	yieldToWriters bool
 	slowTail       *walReclaimSlowTail
 }
@@ -181,6 +182,22 @@ func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *
 		return result, errWALCheckpointDeferredBulk
 	}
 	snap, ok := readWALIndexSnapshot(w.store.dbPath)
+	// A producer may append after the durable slow copy released its first
+	// slice. An admitted final slice may finish that tail once, under exactly
+	// its remaining deadline. It cannot renew admission or writer credit.
+	if ok && snap.MxFrame != snap.NBackfill && w.readmitted && !w.tailCopyTried {
+		w.tailCopyTried = true
+		if limit, bounded := admissionCtx.Deadline(); bounded && time.Until(limit) > 0 {
+			result, err = w.passive(admissionCtx, operationCtx, db, time.Until(limit), leaseOverride)
+			if err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
+				return result, err
+			}
+			if !w.held {
+				return result, errWALReclaimReadersInFlight
+			}
+			snap, ok = readWALIndexSnapshot(w.store.dbPath)
+		}
+	}
 	if !ok || snap.MxFrame != snap.NBackfill {
 		return result, errWALReclaimReadersInFlight
 	}
