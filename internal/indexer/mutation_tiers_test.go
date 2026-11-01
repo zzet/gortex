@@ -48,3 +48,13 @@ func TestIdentityPatchPublishesTicketTiers(t *testing.T) {
 	require.False(t, tiers.DerivedAt.IsZero(), "a successful identity no-op still certifies the admitted bytes")
 	require.False(t, tiers.Failed)
 }
+
+func TestStartupRelationsRemainPendingAfterCancelledBatchReset(t *testing.T) {
+	mi := &MultiIndexer{}
+	mi.BeginParallelBatch()
+	require.True(t, mi.RelationsPending())
+	mi.ResetBatch() // also used when warmup fails or is cancelled
+	require.True(t, mi.RelationsPending(), "an aborted batch cannot certify startup relations")
+	mi.CompleteStartupRelations()
+	require.False(t, mi.RelationsPending())
+}

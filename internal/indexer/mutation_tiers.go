@@ -175,6 +175,10 @@ func (mw *MultiWatcher) TierState(path string) MutationTierState {
 	return MutationTierState{}
 }
 
+// RelationsPending reports a restarted workspace's shared resolver boundary.
+// The early serving boundary can precede cross-repository reference binding.
+func (mi *MultiIndexer) RelationsPending() bool { return mi.relationsPending.Load() }
+
 // TierState reads a ticket's live stamps; the ticket survives waiter removal.
 func (t *MutationTicket) TierState() MutationTierState {
 	if t == nil {
@@ -184,3 +188,7 @@ func (t *MutationTicket) TierState() MutationTierState {
 	defer t.tierMu.RUnlock()
 	return t.tiers
 }
+
+// CompleteStartupRelations is called only after successful warmup resolution.
+// ResetBatch also serves cancelled warmup and cannot certify this boundary.
+func (mi *MultiIndexer) CompleteStartupRelations() { mi.relationsPending.Store(false) }
