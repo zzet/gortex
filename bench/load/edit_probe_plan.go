@@ -79,13 +79,16 @@ type editProbeArrival struct {
 // mean. Editor 0 keeps the original seeding, so one editor offers exactly the
 // original arrivals. Streams merge by due time (ties by editor) and the merge
 // order is the global ordinal: every ordinal belongs to one fixed editor.
-func editProbeArrivals(seed int64, count, editors int) ([]editProbeArrival, error) {
+func editProbeArrivals(seed int64, count, editors int, mean time.Duration) ([]editProbeArrival, error) {
+	if mean <= 0 {
+		return nil, errors.New("edit offered mean must be positive")
+	}
 	var merged []editProbeArrival
 	for editor := range editors {
 		rng := rand.New(rand.NewPCG(uint64(seed)^0xa0761d6478bd642f^uint64(editor)*0x9e3779b97f4a7c15, uint64(seed)^0xe7037ed1a0b428db))
 		due := int64(editProbePeriod)
 		for range count {
-			interval := rng.ExpFloat64() * float64(editProbeMean)
+			interval := rng.ExpFloat64() * float64(mean)
 			if math.IsNaN(interval) || math.IsInf(interval, 0) || interval >= float64(math.MaxInt64) {
 				return nil, errors.New("poisson interval overflow")
 			}
@@ -111,7 +114,11 @@ func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
 	if c.EditSender == editProbeRestart && wantsGaugeSeries(o) {
 		return editProbePlan{}, errors.New("live memory gauges and profiles are unsupported for the in-run restart sender: its process and health session are replaced")
 	}
-	p, err := makeEditProbeTrafficPlan(c, o.Seed, o.EditCount, o.Editors)
+	mean := o.EditMean
+	if mean == 0 {
+		mean = editProbeMean
+	}
+	p, err := makeEditProbeTrafficPlanWithMean(c, o.Seed, o.EditCount, o.Editors, mean)
 	if err != nil || o.Agents == 0 {
 		return p, err
 	}
@@ -128,6 +135,10 @@ func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
 }
 
 func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editProbePlan, error) {
+	return makeEditProbeTrafficPlanWithMean(c, seed, count, editors, editProbeMean)
+}
+
+func makeEditProbeTrafficPlanWithMean(c Corpus, seed int64, count, editors int, mean time.Duration) (editProbePlan, error) {
 	if err := validateCorpus(c); err != nil {
 		return editProbePlan{}, err
 	}
@@ -258,7 +269,7 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 	if c.EditSender != "" {
 		native = "other native senders run as their own cells"
 	}
-	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(editProbeMean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: kind, Tool: tool, Language: language, Mode: mode, Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", native, "largest-file/reference configurations require their own reviewed manifest"}}
+	p := editProbePlan{Version: 1, Arrival: "precomputed_open_loop_poisson", MeanNS: int64(mean), ProbePeriodNS: int64(editProbePeriod), Count: count, Seed: seed, Kind: kind, Tool: tool, Language: language, Mode: mode, Repo: c.Label, Commit: c.Commit, File: c.File, Callee: callee, SessionModel: "one_editor_plus_one_separate_prober_per_edit", NotSelected: []string{"other edit kinds/tools/languages/output modes", native, "largest-file/reference configurations require their own reviewed manifest"}}
 	if kind == "change_signature" && language != "go" {
 		p.NotSelected = append(p.NotSelected, "parameter detail is proved by exact source; native TS/Python signature metadata omits it and graph freshness uses the relative line witness")
 	}
@@ -270,9 +281,9 @@ func makeEditProbeTrafficPlan(c Corpus, seed int64, count, editors int) (editPro
 		p.Editors, p.SessionModel = editors, editProbeFixedEditorModel
 		p.NotSelected = append(p.NotSelected, "several editors share one repository; 6-repository and linked-worktree routing are not implemented")
 	}
-	arrivals, err := editProbeArrivals(seed, count, editors)
+	arrivals, err := editProbeArrivals(seed, count, editors, mean)
 	if c.EditSender == editProbeHotFile {
-		arrivals, err = editProbeHotFileArrivals(seed, count)
+		arrivals, err = editProbeHotFileArrivals(seed, count, mean)
 	}
 	if err != nil {
 		return editProbePlan{}, err

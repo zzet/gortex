@@ -242,6 +242,13 @@ probes and immediate same-editing-session file/source readbacks. Session setup
 is outside the edit window. Future arrivals do not wait for earlier ACKs or
 probe replies. Canceled/unstarted edits remain in the offered denominator.
 
+`--edit-mean DURATION` explicitly changes the per-editor offered Poisson mean
+for `edit-and-probe`, including paired hot-file offers. The default (or `0`)
+preserves the original 15-second plan and seeding. For example, `250ms` offers
+four edits per second on average from each fixed editor. The plan records its
+actual mean and due times; a changed offered rate is a separate measurement,
+not evidence for an earlier frozen plan or an accepted performance gate.
+
 `--edit-agents N` (1 to 32) runs N fixed editors against the same single
 repository. Each editor offers its own open-loop Poisson stream with the same
 15 second mean; editor 0 keeps the one-editor seeding, so `--edit-agents 1`

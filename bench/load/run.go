@@ -38,6 +38,7 @@ type runOptions struct {
 	KeepState         bool
 	SweepRepetitions  int
 	SweepBudget       time.Duration
+	EditMean          time.Duration
 	EditCount         int
 	EditProbeRole     string
 	editProbeBaseline bool
@@ -85,11 +86,15 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.SweepRepetitions, "sweep-repetitions", 15, "samples per benchmark operation (smoke may explicitly use 1)")
 	f.DurationVar(&o.SweepBudget, "sweep-duration", 10*time.Minute, "separate total budget for the repeated paced sweep")
 	bindStartupFlags(f, &o.Startup)
+	f.DurationVar(&o.EditMean, "edit-mean", 0, "edit-and-probe per-editor Poisson mean; 0 preserves the 15s default")
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
 
 func validateRunOptions(o runOptions) error {
+	if o.EditMean < 0 || o.EditMean > 0 && o.Scenario != editProbeScenario {
+		return errors.New("--edit-mean requires edit-and-probe and a nonnegative duration; 0 uses the 15s default")
+	}
 	if err := validatePRSmokeDrain(o); err != nil {
 		return err
 	}
