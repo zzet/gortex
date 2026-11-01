@@ -10,9 +10,9 @@ import (
 
 func mutationMutexFixture(t *testing.T) (*PublicationPhaseRecord, *PublicationStamps, time.Time) {
 	t.Helper()
-	record, stamps, origin := scalarPatchFixture(t)
+	record, _, origin := scalarPatchFixture(t)
 	// Bind through the production collector factory, never a synthetic R owner.
-	stamps = record.newCanonicalPatchStamps()
+	stamps := record.newCanonicalPatchStamps()
 	stamps.markAt(PublicationPatchExecutionStarted, origin.Add(2*time.Millisecond))
 	return record, stamps, origin
 }
