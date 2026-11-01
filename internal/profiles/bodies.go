@@ -70,7 +70,7 @@ var sectionCompactMemory = bt(`Use §recall§ before revisiting prior work; §re
 // this constant rather than paraphrase it; routing is safety policy, and two
 // almost-equivalent copies eventually teach agents different destructive
 // actions.
-const WorktreeBranchRoutingPolicy = "- Session/CWD selects the view. Discovered checkouts, linked worktrees included, are an automatic overlay; do not `track` them. Only an explicit user request to track creates a dedicated graph.\n" +
+const WorktreeBranchRoutingPolicy = "- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.\n" +
 	"- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.\n" +
 	"- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:\"relations\"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.\n" +
 	"- Target another CWD: `view:{kind:\\\"worktree\\\",checkout_id:\\\"…\\\"}` or `view:{kind:\\\"git_ref\\\",value:\\\"refs/heads/release\\\",graph_id:\\\"…\\\"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.\n" +
