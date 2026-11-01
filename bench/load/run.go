@@ -89,7 +89,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.SweepRepetitions, "sweep-repetitions", 15, "samples per benchmark operation (smoke may explicitly use 1)")
 	f.DurationVar(&o.SweepBudget, "sweep-duration", 10*time.Minute, "separate total budget for the repeated paced sweep")
 	bindStartupFlags(f, &o.Startup)
-	f.IntVar(&o.EditRepos, "edit-repos", 1, "edit-and-probe: one repository (default), or an explicit six-pinned-repository plan")
+	f.IntVar(&o.EditRepos, "edit-repos", 1, "edit-and-probe: one repository (default), or exactly six distinct pinned repositories")
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
@@ -117,8 +117,11 @@ func validateRunOptions(o runOptions) error {
 	if _, err := parseProfile(o.Profile); err != nil {
 		return err
 	}
-	if o.Scenario == editProbeScenario && (o.Profile != "agent" || o.Agents > editProbeMaxReaders || o.Editors < 1 || o.Editors > editProbeMaxEditors || o.Worktrees != 0 || o.CPUProfile != 0 || o.EditCount != 1 && o.EditCount != 100 || o.EditCount == 1 && o.Editors != 1) {
-		return fmt.Errorf("edit-and-probe requires --profile agent --agents 0..%d --edit-agents 1..%d on one repository --worktrees 0, no CPU profile, and --edit-count 100 (or an explicit 1-edit, 1-editor diagnostic)", editProbeMaxReaders, editProbeMaxEditors)
+	if o.Scenario == editProbeScenario && (o.Profile != "agent" || o.Agents > editProbeMaxReaders || o.Editors < 1 || o.Editors > editProbeMaxEditors || o.Worktrees > 15 || o.CPUProfile != 0 || o.EditCount != 1 && o.EditCount != 100 || o.EditCount == 1 && o.Editors != 1) {
+		return fmt.Errorf("edit-and-probe requires --profile agent --agents 0..%d --edit-agents 1..%d on one repository or explicit routed checkouts, at most 15 linked worktrees, no CPU profile, and --edit-count 100 (or an explicit 1-edit, 1-editor diagnostic)", editProbeMaxReaders, editProbeMaxEditors)
+	}
+	if o.Scenario == editProbeScenario && (o.EditRepos > 1 || o.Worktrees > 0) && (o.EditRepos > 1 && o.Worktrees > 0 || o.Agents != 0 || o.EditCount != 100 || o.Editors < max(o.EditRepos, o.Worktrees+1)) {
+		return errors.New("routed edit-and-probe selects six repositories or linked checkouts, 100 edits, no pure readers and at least one fixed editor per checkout")
 	}
 	if o.EditProbeRole != "" && (o.Scenario != editProbeScenario || o.EditProbeRole != "candidate" && o.EditProbeRole != "baseline") {
 		return errors.New("--edit-probe-role is candidate or baseline, for edit-and-probe only")
@@ -137,7 +140,7 @@ func validateRunOptions(o runOptions) error {
 		activeAgents += o.Editors
 	}
 	activeWorktrees := 1
-	if o.Scenario == "worktrees" || o.Scenario == "all" {
+	if o.Scenario == "worktrees" || o.Scenario == "all" || o.Scenario == editProbeScenario && o.Worktrees > 0 {
 		activeWorktrees += o.Worktrees
 	}
 	if o.Host == "floor" && (activeAgents > 4 || activeWorktrees > 4) {

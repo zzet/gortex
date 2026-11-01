@@ -1783,6 +1783,9 @@
                             "language": {
                               "type": "string"
                             },
+                            "linked_worktrees": {
+                              "type": "integer"
+                            },
                             "mean_interarrival_ns": {
                               "type": "integer"
                             },
@@ -3620,6 +3623,9 @@
                       },
                       "language": {
                         "type": "string"
+                      },
+                      "linked_worktrees": {
+                        "type": "integer"
                       },
                       "mean_interarrival_ns": {
                         "type": "integer"

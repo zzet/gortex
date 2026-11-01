@@ -60,28 +60,29 @@ type editProbeRoute struct {
 }
 
 type editProbePlan struct {
-	Version       int              `json:"version"`
-	Arrival       string           `json:"arrival"`
-	MeanNS        int64            `json:"mean_interarrival_ns"`
-	ProbePeriodNS int64            `json:"probe_period_ns"`
-	Count         int              `json:"count"`
-	Editors       int              `json:"editors,omitempty"`
-	Readers       int              `json:"readers,omitempty"`
-	NoEditWindow  int64            `json:"no_edit_window_ns,omitempty"`
-	Seed          int64            `json:"seed"`
-	Kind          string           `json:"kind"`
-	Tool          string           `json:"tool"`
-	Language      string           `json:"language"`
-	Mode          string           `json:"mode"`
-	Sender        string           `json:"sender,omitempty"`
-	Repo          string           `json:"repo"`
-	Commit        string           `json:"commit"`
-	File          string           `json:"file"`
-	Callee        string           `json:"callee"`
-	SessionModel  string           `json:"session_model"`
-	NotSelected   []string         `json:"not_selected_not_tested"`
-	Steps         []editProbeStep  `json:"steps"`
-	Routes        []editProbeRoute `json:"routes,omitempty"`
+	Version         int              `json:"version"`
+	Arrival         string           `json:"arrival"`
+	MeanNS          int64            `json:"mean_interarrival_ns"`
+	ProbePeriodNS   int64            `json:"probe_period_ns"`
+	Count           int              `json:"count"`
+	Editors         int              `json:"editors,omitempty"`
+	Readers         int              `json:"readers,omitempty"`
+	NoEditWindow    int64            `json:"no_edit_window_ns,omitempty"`
+	Seed            int64            `json:"seed"`
+	Kind            string           `json:"kind"`
+	Tool            string           `json:"tool"`
+	Language        string           `json:"language"`
+	Mode            string           `json:"mode"`
+	Sender          string           `json:"sender,omitempty"`
+	Repo            string           `json:"repo"`
+	Commit          string           `json:"commit"`
+	File            string           `json:"file"`
+	Callee          string           `json:"callee"`
+	SessionModel    string           `json:"session_model"`
+	NotSelected     []string         `json:"not_selected_not_tested"`
+	Steps           []editProbeStep  `json:"steps"`
+	Routes          []editProbeRoute `json:"routes,omitempty"`
+	LinkedWorktrees int              `json:"linked_worktrees,omitempty"`
 }
 
 type editProbeArrival struct {
@@ -141,6 +142,30 @@ func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
 	return p, nil
 }
 
+// A linked plan has one logical repository and separately identified checkouts.
+// The runtime supplies the expanded private corpora; reporting starts from the
+// one pinned primary. Both must describe the same immutable source fixture.
+func editProbeLinkedCorpora(corpora []Corpus, linked int) ([]Corpus, error) {
+	if linked < 1 || linked > 15 || len(corpora) != 1 && len(corpora) != linked+1 {
+		return nil, errors.New("linked edit-probe routes require one primary and at most 15 linked checkouts")
+	}
+	primary := corpora[0]
+	out := []Corpus{primary}
+	for i := 1; i <= linked; i++ {
+		label := fmt.Sprintf("linked-%d", i)
+		if primary.Label == label {
+			return nil, errors.New("primary label collides with a linked checkout identity")
+		}
+		c := primary
+		c.Label = label
+		if len(corpora) > 1 && corpora[i] != c {
+			return nil, errors.New("linked checkout differs from the pinned primary fixture")
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
 // Routed plans reuse each corpus's existing finite plan. Every corpus sees
 // the same global ordinals/arrivals; each fixed editor takes only its own
 // corpus's request at that ordinal, so no secondary stream is reseeded.
@@ -151,20 +176,33 @@ func planEditProbeRoutes(corpora []Corpus, o runOptions) (editProbePlan, error) 
 	if o.EditRepos < 0 {
 		return editProbePlan{}, errors.New("invalid edit repository count")
 	}
-	if o.EditRepos <= 1 {
+	linked := o.Worktrees > 0
+	if !linked && o.EditRepos <= 1 {
 		return planEditProbe(corpora[0], o)
 	}
-	if o.EditRepos != 6 || len(corpora) != 6 || o.Editors < 6 || o.EditCount != 100 || o.Agents != 0 || o.Worktrees != 0 {
-		return editProbePlan{}, errors.New("six-repository planning requires exactly six pinned corpora, at least six fixed editors, 100 edits, no pure readers and no linked worktrees")
+	if linked {
+		if o.EditRepos > 1 {
+			return editProbePlan{}, errors.New("six repositories and linked checkouts are separate edit-probe cells")
+		}
+		var err error
+		corpora, err = editProbeLinkedCorpora(corpora, o.Worktrees)
+		if err != nil {
+			return editProbePlan{}, err
+		}
+	} else if o.EditRepos != 6 || len(corpora) != 6 {
+		return editProbePlan{}, errors.New("six-repository planning requires exactly six distinct pinned corpora")
+	}
+	if o.Editors < len(corpora) || o.EditCount != 100 || o.Agents != 0 {
+		return editProbePlan{}, errors.New("routed planning requires at least one fixed editor per checkout, 100 edits and no pure readers")
 	}
 	plans := make([]editProbePlan, len(corpora))
 	routes := make([]editProbeRoute, len(corpora))
 	labels, sources := map[string]bool{}, map[string]bool{}
 	for i, c := range corpora {
-		if c.Label == "" || labels[c.Label] || sources[c.Source] {
+		if c.Label == "" || labels[c.Label] || !linked && sources[filepath.Clean(c.Source)] {
 			return editProbePlan{}, errors.New("six-repository routes require distinct corpus labels and source repositories")
 		}
-		labels[c.Label], sources[c.Source] = true, true
+		labels[c.Label], sources[filepath.Clean(c.Source)] = true, true
 		p, err := planEditProbe(c, o)
 		if err != nil {
 			return editProbePlan{}, fmt.Errorf("route %s: %w", c.Label, err)
@@ -173,10 +211,17 @@ func planEditProbeRoutes(corpora []Corpus, o runOptions) (editProbePlan, error) 
 			return editProbePlan{}, errors.New("six-repository planning currently supports ordinary Go add_intrafile_call/edit.file JSON fixtures only; native, lifecycle, move and other output cells are unsupported")
 		}
 		plans[i] = p
-		routes[i] = editProbeRoute{ID: c.Label, Repo: c.Label, Commit: c.Commit, File: p.File, Callee: p.Callee, Kind: p.Kind, Tool: p.Tool, Language: p.Language, Mode: p.Mode}
+		logicalRepo := c.Label
+		if linked {
+			logicalRepo = corpora[0].Label
+		}
+		routes[i] = editProbeRoute{ID: c.Label, Repo: logicalRepo, Commit: c.Commit, File: p.File, Callee: p.Callee, Kind: p.Kind, Tool: p.Tool, Language: p.Language, Mode: p.Mode}
 	}
 	out := plans[0]
 	out.Routes = routes
+	if linked {
+		out.LinkedWorktrees = o.Worktrees
+	}
 	out.Steps = append([]editProbeStep(nil), out.Steps...)
 	for i, step := range out.Steps {
 		route := step.Editor % len(plans)
@@ -189,7 +234,7 @@ func planEditProbeRoutes(corpora []Corpus, o runOptions) (editProbePlan, error) 
 			out.NotSelected = append(out.NotSelected, limitation)
 		}
 	}
-	out.NotSelected = append(out.NotSelected, "multi-repository execution remains refused until routed oracle and restore ownership are validated")
+	out.NotSelected = append(out.NotSelected, "routed cells support ordinary Go add_intrafile_call/edit.file JSON only; reference and live campaign acceptance remains separate")
 	return out, nil
 }
 
@@ -205,13 +250,24 @@ func editProbeRouteOperations(plan editProbePlan, corpora []Corpus) ([]request, 
 		}
 		return editProbeOperations(plan, corpora[0]), nil
 	}
+	if plan.LinkedWorktrees > 0 {
+		var err error
+		corpora, err = editProbeLinkedCorpora(corpora, plan.LinkedWorktrees)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(plan.Routes) != len(corpora) {
 		return nil, errors.New("edit route corpus denominator differs from pinned metadata")
 	}
 	byRoute := make(map[string]Corpus, len(corpora))
 	for i, c := range corpora {
 		route := plan.Routes[i]
-		if _, duplicate := byRoute[route.ID]; duplicate || route.ID != c.Label || route.Repo != c.Label || route.Commit != c.Commit || route.File != c.File {
+		logicalRepo := c.Label
+		if plan.LinkedWorktrees > 0 {
+			logicalRepo = corpora[0].Label
+		}
+		if _, duplicate := byRoute[route.ID]; duplicate || route.ID != c.Label || route.Repo != logicalRepo || route.Commit != c.Commit || route.File != c.File {
 			return nil, errors.New("edit route metadata differs from its pinned corpus")
 		}
 		byRoute[route.ID] = c

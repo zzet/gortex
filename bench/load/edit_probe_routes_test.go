@@ -109,6 +109,9 @@ func TestEditProbeSelectedCheckoutsKeepProberSessionsOnTheirEditorRoute(t *testi
 				prefix := c.Label
 				if sharedPrefix {
 					prefix, c.Label = "fixture", "fixture"
+					if i > 0 {
+						c.Label = fmt.Sprintf("linked-%d", i)
+					}
 				}
 				p.Repos = append(p.Repos, privateRepo{Path: root, File: filepath.Join(root, c.File), Prefix: prefix, Corpus: c})
 			}
@@ -288,10 +291,12 @@ func TestEditProbeRoutedPlansRejectMissingOrForeignOwnership(t *testing.T) {
 	}
 }
 
-func TestEditProbeRoutedPlanDoesNotEnableAnUnvalidatedRuntime(t *testing.T) {
-	o := runOptions{Scenario: editProbeScenario, EditRepos: 6}
-	phase, _, artifacts, _, _, err := runPhase(t.Context(), o, editProbeScenario, editProbeRoutingCorpora(), "", t.TempDir())
-	if err == nil || !strings.Contains(err.Error(), "multi-repository edit-and-probe execution is unsupported") || artifacts["private_root"] != "" || phase.editProbeRuntime != nil {
-		t.Fatalf("planning metadata silently enabled a partial runtime: err=%v artifacts=%v", err, artifacts)
+func TestEditProbeRoutedPhaseRefusesUnsupportedTrafficBeforeAllocatingOwner(t *testing.T) {
+	corpora := editProbeRoutingCorpora()
+	corpora[1].EditOutput = "cli"
+	o := runOptions{Scenario: editProbeScenario, EditRepos: 6, Editors: 6, EditCount: 100, Seed: 42}
+	phase, _, artifacts, _, _, err := runPhase(t.Context(), o, editProbeScenario, corpora, "", t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "unsupported") || artifacts["private_root"] != "" || phase.editProbeRuntime != nil {
+		t.Fatalf("unsupported routed traffic allocated an execution owner: err=%v artifacts=%v", err, artifacts)
 	}
 }

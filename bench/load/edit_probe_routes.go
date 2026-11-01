@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -69,6 +70,39 @@ func (r *editProbeRuntime) restoreRoutes(ctx context.Context) (resultErr error) 
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// Distinct source repositories are a physical admission check, not a path in
+// the workload hash. Read-only git metadata cannot turn linked source views
+// into six independent repositories or touch any source working bytes.
+func validateEditProbeSourceRepos(ctx context.Context, corpora []Corpus, outputRoot string) error {
+	reader := &privateRun{Root: outputRoot, Env: append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")}
+	var seen []os.FileInfo
+	for _, c := range corpora {
+		data, err := reader.git(ctx, c.Source, "rev-parse", "--git-common-dir")
+		if err != nil {
+			return err
+		}
+		common := strings.TrimSpace(string(data))
+		if !filepath.IsAbs(common) {
+			common = filepath.Join(c.Source, common)
+		}
+		common, err = canonicalPath(common)
+		if err != nil {
+			return err
+		}
+		identity, err := os.Stat(common)
+		if err != nil {
+			return err
+		}
+		for _, prior := range seen {
+			if os.SameFile(prior, identity) {
+				return errors.New("six-repository execution requires six distinct source repositories; linked checkouts share one repository")
+			}
+		}
+		seen = append(seen, identity)
 	}
 	return nil
 }

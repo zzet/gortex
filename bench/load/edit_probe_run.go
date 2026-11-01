@@ -213,7 +213,11 @@ func (r *editProbeRuntime) repoFor(step editProbeStep) (privateRepo, error) {
 	}
 	for _, repo := range r.p.Repos {
 		if editor.cwd != "" && filepath.Clean(editor.cwd) == filepath.Clean(repo.Path) {
-			if offered != nil && (offered.Repo != repo.Corpus.Label || offered.Commit != repo.Corpus.Commit || offered.File != repo.Corpus.File) {
+			logicalRepo := repo.Corpus.Label
+			if r.plan.LinkedWorktrees > 0 {
+				logicalRepo = r.plan.Repo
+			}
+			if offered != nil && (offered.ID != repo.Corpus.Label || offered.Repo != logicalRepo || offered.Commit != repo.Corpus.Commit || offered.File != repo.Corpus.File) {
 				return privateRepo{}, errors.New("editor checkout differs from its offered route pin")
 			}
 			return repo, nil
