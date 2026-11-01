@@ -72,6 +72,8 @@ type microReceipt struct {
 
 type microProcess func(context.Context, string, []string, string, []string) ([]byte, []byte, error)
 
+type queryMicroDiagnosticsKey struct{}
+
 func executeMicroProcess(ctx context.Context, binary string, args []string, cwd string, env []string) ([]byte, []byte, error) {
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Dir = cwd
