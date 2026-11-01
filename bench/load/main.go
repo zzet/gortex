@@ -17,9 +17,12 @@ func main() {
 }
 
 func command(args []string) error {
-	if len(args) > 0 && (args[0] == "run" || args[0] == "paired" || args[0] == "smoke") {
+	if len(args) > 0 && (args[0] == "run" || args[0] == "paired" || args[0] == "smoke" || args[0] == "foreign-impact") {
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
+		if args[0] == "foreign-impact" {
+			return foreignImpactCommand(ctx, args[1:])
+		}
 		if args[0] == "paired" {
 			return pairedCommand(ctx, args[1:])
 		}
