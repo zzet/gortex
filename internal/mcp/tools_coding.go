@@ -366,7 +366,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	fp = s.graphRelPath(ctx, fp)
 
 	// Auto re-index stale file before querying.
-	s.ensureFresh([]string{fp})
+	s.ensureFreshContext(ctx, []string{fp})
 
 	s.sessionFor(ctx).recordFile(fp)
 	// Tool-call observer: credit the recent search for the symbols in
@@ -949,7 +949,7 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 
 	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFresh([]string{parts[0]})
+		s.ensureFreshContext(ctx, []string{parts[0]})
 	}
 
 	node := s.engineFor(ctx).GetSymbol(id)
@@ -2024,6 +2024,20 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		task = taskFQ.Text
 	}
 
+	// Scope candidate retrieval itself: filtering the global search head after
+	// its limit both reads unrelated repositories and can hide the local match.
+	allowed, filterErr := s.resolveRepoFilter(ctx, req)
+	if filterErr != nil {
+		return mcp.NewToolResultError(filterErr.Error()), nil
+	}
+	pathFilter := normalizePathPrefixes(s.resolvePathFilter(req, taskFQ))
+	searchScope := query.QueryOptions{RepoAllow: allowed, SearchPathPrefixes: pathFilter}
+	if len(pathFilter) > 0 {
+		searchScope.SearchNodeFilter = func(n *graph.Node) bool {
+			return pathMatchesAnyPrefix(repoRelativePath(n), pathFilter)
+		}
+	}
+
 	entryPoint := req.GetString("entry_point", "")
 	// Seed count defaults adaptively to repo size — req.GetInt can't
 	// tell an absent argument from an explicit value, so detect
@@ -2074,7 +2088,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		ranked := s.engineFor(ctx).SearchSymbolsRankedContext(ctx, kw, 10, query.QueryOptions{}, nil)
+		ranked := s.engineFor(ctx).SearchSymbolsRankedContext(ctx, kw, 10, searchScope, nil)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -2126,15 +2140,11 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	// 3b. Apply repo/project filter to relevant symbols.
-	allowed, filterErr := s.resolveRepoFilter(ctx, req)
-	if filterErr != nil {
-		return mcp.NewToolResultError(filterErr.Error()), nil
-	}
 	relevantSymbols = filterNodes(relevantSymbols, allowed)
 	// Sub-path scoping: a `path` argument, an inline path: clause, or
 	// a scope's saved paths narrow smart_context to a monorepo
 	// service slice.
-	if pathFilter := s.resolvePathFilter(req, taskFQ); len(pathFilter) > 0 {
+	if len(pathFilter) > 0 {
 		relevantSymbols = applyPathFilter(relevantSymbols, pathFilter)
 	}
 
@@ -2466,7 +2476,7 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 	// routing the agent to Gortex's richer escape hatches. Suppressed for
 	// single-symbol / distinctive-identifier lookups, so a confident exact
 	// query never draws a hedge.
-	if note := s.lowConfidenceRetrievalNote(ctx, task, relevantSymbols, taskRanked, taskRankedKnown); note != nil {
+	if note := s.lowConfidenceRetrievalNote(ctx, task, relevantSymbols, taskRanked, taskRankedKnown, searchScope); note != nil {
 		result["retrieval_note"] = note
 	}
 
@@ -2972,6 +2982,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 }
 
 func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.noteAcknowledgementParser(ctx, "not_applicable_text_splice")
 	id, err := s.symbolIDArg(ctx, req)
 	if err != nil {
 		return mcp.NewToolResultError("id is required"), nil
@@ -3184,6 +3195,9 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		}
 		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
+	observeEditSourceEffect(ctx, true, true) // identical symbol edits already refused above
+	observeEditSourceComplete(ctx)
+
 	sess := s.sessionFor(ctx)
 	sess.recordModified(node.FilePath)
 	sess.recordSymbol(id)

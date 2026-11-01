@@ -202,6 +202,21 @@ func (r *contractCoreEdges) GetInEdgesByNodeIDs(ids []string) map[string][]*grap
 	return r.filterBatch(r.Reader.GetInEdgesByNodeIDs(ids))
 }
 
+// GetInEdgesByNodeIDsFromRepos applies the same edge mask to the selected
+// reader's repository-narrowed incoming read. A selected reader without one,
+// such as an overlay, declines, and the caller reads every incoming edge.
+func (r *contractCoreEdges) GetInEdgesByNodeIDsFromRepos(ids, repos []string) (map[string][]*graph.Edge, bool, error) {
+	scoped, ok := r.Reader.(graph.RepoScopedInEdgeReader)
+	if !ok {
+		return nil, false, nil
+	}
+	rows, handled, err := scoped.GetInEdgesByNodeIDsFromRepos(ids, repos)
+	if err != nil || !handled {
+		return nil, handled, err
+	}
+	return r.filterBatch(rows), true, nil
+}
+
 // ImpactReachContext gives impact the bounded reach traversal over the edges
 // this wrapper shows: each level's bounded read passes through filterBatch,
 // while the traversal budget counts the rows read. Only a store has the
@@ -289,6 +304,8 @@ func (binding *contractAnalysisContext) composedReader(ctx context.Context, core
 				layer.AddNode(node.FilePath, node)
 			}
 		}
+		// The analysis reader is the contract attachment, not the store: its
+		// edges are exactly the overlay being composed, so all of them apply.
 		for _, edge := range analysis.AllEdges() {
 			layer.AddEdge(edge)
 		}

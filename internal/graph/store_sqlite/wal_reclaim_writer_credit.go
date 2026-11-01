@@ -155,8 +155,9 @@ func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *
 		if w.readmitted || unused <= 0 || operationCtx.Err() != nil || !errors.Is(ctx.Err(), context.DeadlineExceeded) || !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
 			return result, ctx.Err()
 		}
-		if w.yieldToWriters && w.store.writeWanted() {
-			return result, errWALReclaimWriterWaiting
+		if demand := w.store.writeDemandCause(); w.yieldToWriters && demand != nil {
+			noteWALReclaimDemand(operationCtx, demand)
+			return result, demand
 		}
 		limit := time.Now().Add(unused)
 		if operationLimit, ok := opCtx.Deadline(); ok && operationLimit.Before(limit) {

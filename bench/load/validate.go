@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 )
 
 // A bounded fixed-format check supplements decoding: absent fields are not
@@ -17,7 +18,12 @@ func requireFields(data []byte, prototype any) error {
 	}
 	t := reflect.TypeOf(prototype)
 	for i := range t.NumField() {
-		name := t.Field(i).Tag.Get("json")
+		field := t.Field(i)
+		tag := field.Tag.Get("json")
+		if field.PkgPath != "" || tag == "-" || strings.Contains(tag, ",omitempty") {
+			continue
+		}
+		name := strings.Split(tag, ",")[0]
 		if _, ok := fields[name]; !ok {
 			return fmt.Errorf("missing required %s field", name)
 		}
@@ -54,6 +60,11 @@ func validateReport(data []byte, r Report) error {
 	}
 	if r.Workload.Profile != r.Profile || r.Workload.Seed != r.Seed || r.Workload.Scenario == "" || r.Workload.LinkedWorktrees < 0 || r.Workload.DurationSec <= 0 || r.Workload.DeadlineSec <= 0 || len(r.Workload.Operations) == 0 {
 		return errors.New("invalid or incomplete offered workload")
+	}
+	if drain := r.Workload.PRSmokeDrain; drain != nil {
+		if drain.Version != 1 || drain.OfferedSeconds != r.Workload.DurationSec || math.IsNaN(drain.MaxDrainSeconds) || math.IsInf(drain.MaxDrainSeconds, 0) || drain.MaxDrainSeconds < r.Workload.DeadlineSec || drain.MaxDrainSeconds > 120 || (drain.OfferedSeconds != 20 && drain.OfferedSeconds != 30) || r.Profile != "agent" || r.Host.Profile != "native" || r.Workload.Scenario != "read" || r.Workload.EditAgents != 0 || r.Workload.LinkedWorktrees != 0 || r.Workload.CPUProfileSec != 0 || r.Workload.KeepState {
+			return errors.New("invalid or unsupported PR read offered-window/drain identity")
+		}
 	}
 	if err := validateAgentCounts(r.Workload.Scenario, r.Workload.Agents, r.Workload.EditAgents); err != nil {
 		return err
@@ -119,7 +130,7 @@ func validateReport(data []byte, r Report) error {
 			if len(phase.Operations) == 0 || len(phase.Gate) == 0 || len(phase.Status) == 0 || len(phase.Stats) == 0 {
 				return errors.New("complete phase is missing plan/gate/status/stats observations")
 			}
-			if phase.Name != "cold" && phase.Name != "restart" && len(phase.Tools) == 0 {
+			if phase.Name != "cold" && phase.Name != "restart" && phase.Name != startupScenario && len(phase.Tools) == 0 {
 				return errors.New("complete workload phase has no tool observations")
 			}
 		}
@@ -128,7 +139,7 @@ func validateReport(data []byte, r Report) error {
 		}
 		for _, tool := range []map[string]ToolMetrics{phase.Tools, phase.Probes} {
 			for name, row := range tool {
-				if name == "" || row.Successes < 0 || row.BusyRefusals < 0 || row.ProductExpired < 0 || row.PhaseCensored < 0 {
+				if name == "" || row.Successes < 0 || row.BusyRefusals < 0 || row.RetryableRefusals < 0 || row.HarnessIncomplete < 0 || row.ProductExpired < 0 || row.PhaseCensored < 0 {
 					return errors.New("invalid tool identity/count")
 				}
 				if err := validMetric(row.SuccessPerSec); err != nil {
@@ -146,7 +157,7 @@ func validateReport(data []byte, r Report) error {
 			return err
 		}
 	}
-	return nil
+	return validatePRDrainObservation(r)
 }
 
 func validDistribution(d Distribution) error {

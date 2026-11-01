@@ -31,6 +31,16 @@ type ScopedKindSummarySequencer interface {
 	NodesLightByKindsInScopeSeq(repoPrefixes, filePaths []string, kinds ...NodeKind) iter.Seq[*Node]
 }
 
+// ScopedFileLocationSequencer is an optional file inventory narrower than
+// ScopedKindSummarySequencer. It yields exactly the rows of
+// NodesLightByKindsInScopeSeq(repoPrefixes, nil, KindFile), in the same
+// ascending-ID order, but populates only ID, Kind, FilePath, Language,
+// RepoPrefix and WorkspaceID. A reader that masks, replaces or adds rows
+// over a physical store (an overlay or delta layer) must not implement it.
+type ScopedFileLocationSequencer interface {
+	FileLocationsInScopeSeq(repoPrefixes []string) iter.Seq[*Node]
+}
+
 // ScopedProjectionSequencer additionally exposes the selected edge stream.
 type ScopedProjectionSequencer interface {
 	ScopedNodeProjectionSequencer
