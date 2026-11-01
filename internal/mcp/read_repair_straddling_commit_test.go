@@ -116,6 +116,14 @@ func TestReadRepairActualExecutorStraddlesCommittedBookkeeping(t *testing.T) {
 		return record.readRepairAdmission.Value() != nil
 	}, 5*time.Second, time.Millisecond)
 	// Admission is bound, without waiting for the edit ACK or its timer.
+	// The executor is still held inside the pre-write gate until this release;
+	// this handshake proves causality even when clock readings share a tick.
+	require.Equal(t, mutationDiskCommitted, record.diskStatus())
+	select {
+	case <-done:
+		t.Fatal("actual executor completed before its post-commit release")
+	default:
+	}
 	release()
 	var observed executionResult
 	select {
@@ -126,8 +134,13 @@ func TestReadRepairActualExecutorStraddlesCommittedBookkeeping(t *testing.T) {
 	}
 	require.NoError(t, observed.err)
 	start, end := observed.observation.Bounds()
-	require.True(t, start.Before(record.committedAt), "real execution must straddle bookkeeping")
-	require.True(t, end.After(record.committedAt))
+	require.False(t, start.IsZero())
+	require.False(t, end.IsZero())
+	require.False(t, record.committedAt.IsZero())
+	// Entry-before-write and release-after-commit are synchronized above.
+	// Equal clock values preserve that proven order; reversed bounds do not.
+	require.False(t, start.After(record.committedAt), "executor entered before bookkeeping")
+	require.False(t, end.Before(record.committedAt), "executor completed after bookkeeping")
 	require.False(t, observed.observation.AcceptedAt().Before(record.committedAt))
 	require.True(t, observed.observation.AcceptedFor(idx, gitBlobSHA(after)))
 	require.NotEmpty(t, g.FindNodesByName("AddedByStraddlingReader"))

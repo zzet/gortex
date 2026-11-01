@@ -309,7 +309,9 @@ func TestMoveFileWriteWindowsPartialFailureAndUnobservedIsolation(t *testing.T) 
 	timing := targetStatus["write_timing"].(map[string]any)
 	require.Equal(t, "measured", timing["state"])
 	require.Equal(t, timing["window_ns"], timing["returned_ns"].(int64)-timing["started_ns"].(int64))
-	require.Positive(t, timing["window_ns"])
+	// The writer was observed even when both clock reads land on one tick.
+	// Preserve its exact zero; a negative or invented positive window is invalid.
+	require.GreaterOrEqual(t, timing["window_ns"].(int64), int64(0))
 	require.Nil(t, observation.observer(ctx, target, s.multiIndexer.GetIndexer("fixture")), "partial move must not gain successful source verdict")
 	require.NotContains(t, targetStatus, "direct_reconcile")
 	before := len(s.mutationCommits.ordered)
@@ -363,4 +365,50 @@ func TestMovePublicReadPublishesTargetBeforeDirectAdmission(t *testing.T) {
 	require.Contains(t, status, "read_assisted_reconcile")
 	require.NotEqual(t, "observed", status["direct_reconcile_state"], "read-assisted publication must not relabel the later direct no-op")
 	require.NotContains(t, status, "direct_reconcile")
+}
+
+func TestMoveFileWriteTimingPreservesEqualClockReadings(t *testing.T) {
+	for _, tc := range []struct {
+		name, state string
+		returned    time.Duration
+		missing     bool
+	}{
+		{name: "same_tick", state: "measured", returned: 5 * time.Nanosecond},
+		{name: "later_tick", state: "measured", returned: 9 * time.Nanosecond},
+		{name: "reversed", state: "invalid_order", returned: 4 * time.Nanosecond},
+		{name: "missing", state: "not_observed", missing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newMutationServer()
+			ctx, ack, _ := s.withEditAcknowledgement(t.Context())
+			defer ack.finishActual()
+			root := t.TempDir()
+			source, target := filepath.Join(root, "source.go"), filepath.Join(root, "target.go")
+			observation := s.beginMoveObservation(ctx, "fixture/source.go::Before", "fixture/target.go::Before", source, target, "fixture/source.go", "fixture/target.go", true)
+			require.NotNil(t, observation)
+			require.NoError(t, observation.write(ack, target, []byte("package main\n")))
+			record := observation.records[target]
+			// Model clock resolution at the report boundary after a real write.
+			// No producer value is rounded up or replaced by a timing sleep.
+			record.mu.Lock()
+			record.diskWriteStartedAt = record.startedAt.Add(5 * time.Nanosecond)
+			record.committedAt = record.startedAt.Add(tc.returned)
+			if tc.missing {
+				record.committedAt = time.Time{}
+			}
+			record.mu.Unlock()
+			status, found := s.moveFileObservationPayload(ctx, record.id)
+			require.True(t, found)
+			timing := status["write_timing"].(map[string]any)
+			require.Equal(t, tc.state, timing["state"])
+			if tc.state == "measured" {
+				require.Equal(t, int64(5), timing["started_ns"])
+				require.Equal(t, int64(tc.returned), timing["returned_ns"])
+				require.Equal(t, int64(tc.returned-5*time.Nanosecond), timing["window_ns"])
+			} else {
+				require.NotContains(t, timing, "window_ns")
+				require.NotContains(t, timing, "returned_ns")
+			}
+		})
+	}
 }
