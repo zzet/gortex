@@ -114,7 +114,7 @@ func TestWatcherEnqueueFileMutationWaitsForCompletePointTail(t *testing.T) {
 			close(releaseResolve)
 		}
 	}()
-	watcher.pointReindexRaw = func(filePath string) (*IndexResult, error) {
+	watcher.pointReindexRaw = func(filePath string, _ *PublicationStamps) (*IndexResult, error) {
 		result, err := idx.incrementalPointWatcherPath(idx.rootPath, filePath)
 		resolveEntered <- filePath
 		<-releaseResolve

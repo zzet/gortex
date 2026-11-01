@@ -80,18 +80,21 @@ WHERE view_gen = ? AND repo_prefix = ? ORDER BY fts_rowid `+order+` LIMIT 1`, s.
 		if readErr != nil {
 			return nil, true, readErr
 		}
-		if !complete {
-			return nil, false, nil
+		// A large repository keeps the bounded query above: FTS5's own rank
+		// sorter over the run returns the unbounded stream's in-scope rows in
+		// the same order, and never reads more of the table than the MATCH
+		// alone would, however wide the run.
+		if complete {
+			if len(ids) == 0 {
+				return nil, true, ctx.Err()
+			}
+			query = symbolRepoMembershipQuery(len(ids))
+			args = []any{s.viewGen, match}
+			for _, id := range ids {
+				args = append(args, id)
+			}
+			args = append(args, repo, limit)
 		}
-		if len(ids) == 0 {
-			return nil, true, ctx.Err()
-		}
-		query = symbolRepoMembershipQuery(len(ids))
-		args = []any{s.viewGen, match}
-		for _, id := range ids {
-			args = append(args, id)
-		}
-		args = append(args, repo, limit)
 	} else if s.viewGen == baseViewGeneration {
 		query = symbolRepoDenseSpanQuery
 	}

@@ -82,8 +82,7 @@ func newAnalyzeServer(t *testing.T, flagOn bool, repos ...analyzeRepoSpec) (*Ser
 	reg := testRegistry()
 	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "")
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	eng.SetSearch(bm)

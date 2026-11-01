@@ -1,0 +1,10 @@
+export function Example(): number { return 1; }
+export function Caller(): number { return Example(); }
+export function FixtureOne(): number { return 1; }
+export function FixtureTwo(): number { return 2; }
+export function FixtureThree(): number { return 3; }
+export function FixtureFour(): number { return 4; }
+export function FixtureFive(): number { return 5; }
+export function FixtureSix(): number { return 6; }
+export function FixtureSeven(): number { return 7; }
+export function FixtureEight(): number { return 8; }

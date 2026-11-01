@@ -79,6 +79,348 @@ and native paired edit scenarios). This adds no hidden reader population.
 `--agents 4 --edit-agents 4` is the separate four-pure-reader/four-editor tail
 workload. The counts remain explicit in the report and workload hash.
 
+An explicit corpus `edit_tool: "edit.write"` selects whole-file write intent for
+the same narrow Go, TypeScript or Python intrafile-call fixture. It additionally
+requires `edit_initial_content` containing the exact pinned initial file bytes.
+Before opening probe sessions, the client compares those bytes with its clone.
+The complete offered requests are precomputed: write number N contains the
+initial file plus additions 0 through N. The client does not reread or regenerate
+content after another edit, serialize offered arrivals, or change retry intent.
+Out-of-order overlapping writes can overwrite later changes; ordinary stale,
+readback, refusal and evidence failures remain in the full denominator. The same
+seven oracles, per-edit sessions, own-ACK readbacks and receipt accounting apply.
+Write, symbol and batch receipts are not interchangeable. `edit.symbol` uses
+an exact splice within an actual indexed declaration. The one-file `edit.batch`
+adapter offers exact whole-file before/after strings and checks the durable
+transaction, shared acknowledgement and per-file graph ticket separately.
+Implementation controls and a one-edit diagnostic do not establish the
+100-edit, reference, traffic-matrix or no-regression gates.
+
+The optional `edit_kind` selects `append_leaf`, `rename`, `delete`,
+`modify_body`, `modify_caller_body`, `change_signature`, `add_crossfile_call`
+or the Go-only `relocate`; omission retains `add_intrafile_call`. These are explicit fixture cells, not arbitrary
+source transformations. A leaf must be a numeric zero-argument function with
+no incoming or outgoing calls in complete relation results. Rename/delete
+fixtures precreate each unique `GortexEditProbe…Before` declaration in the
+pinned `edit_initial_content`; offered splices target that exact declaration.
+Whole-file write/batch requests retain the precomputed offered prefix, including
+out-of-order or lost-write outcomes. No state is regenerated after dispatch.
+
+Rename retains the seven positive new-symbol probes and adds a distinct
+old-source absence probe/readback. Delete requires the exact scoped producer
+`symbol not found` refusal, complete nontruncated graph/search collections and
+a surviving declaration. A missing body, transport failure or empty partial
+page cannot stand in for absence. The same bound prober proves the original
+symbol exists during untimed setup; only replies sent after the actual edit
+wire start can earn post-edit absence. Expected refusals retain their own raw
+identity, endpoint and report count; they are not ordinary successful RPCs.
+These new operation cells require actual runtime evidence before acceptance;
+other kinds and unsupported combinations fail explicitly.
+
+Body/signature fixtures retain an adjacent following declaration. Their relative
+start-line gap proves the changed body even when concurrent earlier edits shift
+both declarations. Signature changes preserve valid zero-argument callers;
+TypeScript/Python coarse signature metadata alone is not parameter proof.
+Crossfile-call fixtures require two root files, exact imports where applicable,
+and an independently admitted callee in the other file.
+
+Go relocation uses `edit_tool: "refactor.move"` (also `move_symbol`) with
+`edit_kind: "relocate"`, distinct root Go files in the same package, and pinned
+`edit_destination` / `edit_destination_content`. The offered source declarations
+already exist; no client-generated declaration is substituted for a real move.
+The seven destination/call probes plus explicit old-source absence must all
+succeed. Immediate own-ACK readbacks check the destination file, new symbol,
+old-symbol refusal and surviving source file before timing queries begin.
+Standalone move observations retain one shared RPC A and each file's actual
+write and publication windows. A direct move reconcile and an independent
+public-read repair keep separate route records and actual request causes; a
+later direct no-op cannot supply an earlier reader's work. Exact coalesced
+execution identities are evaluated once while retaining both route records;
+conflicting windows refuse. Each measured window must partition its own actual
+owner and endpoints. A reader window can begin before the move RPC, remains
+non-additive with shared A, and must accept the original file bytes after that
+file's writer return. Scheduled background is explicitly inapplicable, not a
+measured zero; physical mutation and batch receipts cannot supply missing move
+clocks. Baseline controls without observations can establish public
+functional completion while graph receipt proof and phases remain unavailable.
+Cleanup uses one public two-file batch only after completed outcomes, then
+verifies both original byte strings. Unsupported language, package, path and
+operation combinations refuse explicitly. These implementation controls do not
+establish live relocation timing or the broader traffic/reference gates.
+
+`edit_expect: "refusal"` turns a TypeScript or Python relocation fixture
+(`edit_kind: "relocate"`, `edit_tool: "refactor.move"`, distinct root source and
+destination files of one language) into a live refusal cell. The actual move is
+sent, and the cell passes only on the producer's exact scoped refusal
+(`unsupported language: move_symbol only supports Go files (got "<path>")`),
+followed at most by the known session notes, with the same session's immediate
+file readback unchanged, the original symbol's source present, and both files'
+bytes unchanged on disk. Its latency is the `relocation_refusal` readback; the
+record has no probes, receipt, phases or restore batch, and the post-window step
+only rechecks the bytes. Go relocation is supported and is never offered as a
+refusal.
+
+`edit_output: "toon"` opts this fixture into TOON for the offered edit ACK,
+visibility probes and immediate readbacks. Omission or `"json"` retains the
+existing JSON plan and request identity. The decoder evaluates the requested
+text; a valid structured JSON sibling, JSON fallback, malformed/truncated TOON
+or unsafe numeric value cannot supply format credit. Unknown modes refuse, and
+`"gcx"` refuses as unavailable (below).
+Timing-status queries, initial presence/callee admissions and cleanup are
+separate JSON controls, preserving exact generation/nanosecond arithmetic.
+
+TOON traversal subgraphs expose `total` plus explicit truncation and emitted
+rows; they omit the JSON `total_nodes` and untrimmed full `total_edges` fields.
+The harness does not insert those missing producer fields. Complete-row checks
+require the known producer operation, exact declared node total, explicit
+nontruncation and actual emitted collections; missing, clipped or contradictory
+rows remain failures. File summaries retain their full explicit counts, signature metadata and end lines.
+Compact traversal rows omit signature/end-line metadata. The pointed TOON
+`change_signature` fixture instead traverses its unchanged following caller and
+checks the changed relative start-line gap plus actual call relation; full
+summary and editing-context signature checks remain separate. Actual Go,
+TypeScript and Python producer controls establish that wire shape. TOON source implementation and offline
+controls do not establish live, reference, traffic or performance coverage.
+
+`edit_output: "compact"` requests compact text (`output.compact`) only from the
+four probes whose operation has a compact producer: file summary, symbol
+search, callers and call chain. Source, editing-context and text probes,
+readbacks, the edit ACK and timing controls stay JSON. Compact text is one
+`<kind> <qualified name> <path>:<line>` row per symbol (symbol search may add
+` (in <owner>)`), and subgraph answers may follow their rows with a truncation
+line, one edge-count footer and concurrency notes; any other line, a missing
+final newline or a JSON answer is a decode failure, and an empty answer is zero
+rows. Because the rows carry no node IDs, edge rows, signatures or freshness
+fields, compact proves presence only: the marker (or, from the marker's call
+chain, the callee) as a top-level function row at its owned fixture path, with
+a nonzero edge footer for relations. Truncated rows never prove absence. Plans
+refuse compact for every kind except `add_intrafile_call` and
+`add_crossfile_call`.
+
+`edit_output: "cli"` sends every oracle request, with the same lowered facade
+arguments, through one owned `gortex call <facade> --json <args> --format json
+--index <clone> --quiet` process using the run's config and environment, in its
+own process group that is killed at the probe deadline or phase end. The edit,
+readbacks and receipt status stay MCP JSON. CLI stdout is credited only as one
+JSON object whose numbers stay exact after the CLI's float64 re-encoding; the
+`{"tool","format":"text","text"}` prose wrapper is refused, and a nonzero exit
+is a probe error with its stdout kept as evidence only. Probe cadence is bounded
+by process start, daemon dial and exit rather than 25 ms, and a probe's start is
+its process start. Rename, delete and relocation are refused in CLI mode,
+because their expected absence must be the exact scoped not-found refusal, and
+paired runs refuse CLI probes.
+
+Each report's `output_modes` accounts every mode: `json`, `toon`, `compact`,
+`cli` and `gcx`, each `selected`, `not_selected` or `unavailable` with a
+reason, with probe answers and decode failures counted by the actual mode of
+each probe request, claims fresh, stale answers claimed fresh after the ACK and
+pre-commit mismatches. GCX is unavailable: there is no GCX decoder here, and
+`read_file` answers a GCX request with TOON, so a GCX answer is never decoded or
+credited as TOON. A mode without answers, or one whose payload cannot carry a
+freshness claim (compact, GCX), reports its stale claimed-fresh count
+unavailable rather than 0.
+
+`--scenario edit-and-probe --profile agent --agents 0 --edit-agents 1
+--worktrees 0` selects an initial `add_intrafile_call` / `edit.file` / JSON
+accounting cell. Go retains its existing AST validation. The explicit `.ts`
+fixture cell accepts only top-level `[export] function Name(): number`
+declarations returning a decimal integer or a plain zero-argument call; its
+template must make the unique marker return the selected intrafile callee.
+`testdata/edit-probe/typescript/main.ts` provides ten initial symbols for the
+ordinary warmup gate. Other TypeScript syntax is not supported by this fixture
+cell. Its token checks discard comments/strings as proof and require the actual
+producer symbol ID and file/path. TypeScript implementation does not constitute
+a completed runtime or reference gate. The `.py` fixture cell similarly permits
+only top-level `def Name():` definitions with one four-space-indented return of
+a decimal integer or plain zero-argument call. Its fixture is
+`testdata/edit-probe/python/main.py`; nested bodies, strings and comment-only
+calls cannot provide source proof. Both new language cells are implementation
+coverage only until their actual runtime checks pass. The finite plan contains 100 precomputed Poisson
+arrivals (mean 15 seconds); `--edit-count 1` is an explicit diagnostic only.
+Each edit has its own session opened before dispatch, with independent 25 ms
+probes and immediate same-editing-session file/source readbacks. Session setup
+is outside the edit window. Future arrivals do not wait for earlier ACKs or
+probe replies. Canceled/unstarted edits remain in the offered denominator.
+
+`--edit-agents N` (1 to 32) runs N fixed editors against the same single
+repository. Each editor offers its own open-loop Poisson stream with the same
+15 second mean; editor 0 keeps the one-editor seeding, so `--edit-agents 1`
+offers exactly the original plan. The streams merge by due time (ties by editor
+index) and the merge order is the global ordinal, so markers and mutation IDs
+stay keyed by ordinal and each ordinal is owned by one editor for the whole run.
+Plan steps and edit records name that editor. An edit and its immediate
+file/source readbacks go through its own editor's session; probes and receipt
+status stay on the edit's separate prober session, and run-level status, stats
+and the restore batch use editor 0. A blocked editor ACK does not delay another
+editor's arrival. Editors share one file. `edit.write` carries whole-file
+content precomputed in ordinal order, so an out-of-order write would silently
+drop another editor's marker until the next write restored it; it is refused
+with more than one editor. An out-of-order `edit.batch` fails its `old_string`
+precondition and stays a failed record, and `edit.file` anchor insertions do
+not depend on order. The 1-edit diagnostic and
+the paired no-regression cell stay one editor. Routing across several
+repositories or linked worktrees is not implemented.
+
+`edit_sender` selects a native or lifecycle traffic cell; without it every plan
+is unchanged, and paired runs refuse it. A native write goes around MCP, so its
+record has no ACK, receipt, phases or derived time (each unavailable with its
+reason) and accounting `not_applicable_native_write`. It keeps its own write
+window and the file's size, mtime and inode before and after. Its immediate file
+readback gates `t_readback_ms`, graph-backed readbacks are kept as
+`observation_only`, and it completes once every probe is first-correct inside
+the deadline. The daemon learns of a native write only through its watcher, so
+a fresh claim after one is counted unassessed rather than stale. Native writes
+touch only the registered fixture file, or the step's own created file.
+
+- `shell_after_tool` (100 edits, one editor, `edit.file` call addition): even
+  ordinals are MCP edits; odd ordinals insert their own marker with an in-place
+  truncate-and-write at their due time or the preceding tool edit's own ACK,
+  whichever is later. A tool edit without its own ACK makes the shell write an
+  explicit dependency failure, and nothing is written.
+- `editor_save` (one editor, rename fixture through `edit.file`): the fixture
+  predeclares placeholders `GortexEditProbe<seed>P<ordinal>`, exactly the
+  marker's length. Each save writes same-size bytes to a temporary file beside
+  the fixture and renames it over the file; the placeholder must become absent.
+- `create_delete` (100 edits, root-level Go fixture with pinned
+  `edit_initial_content`, JSON or TOON): even ordinals create
+  `gortex_edit_probe_<marker>.go` in the fixture's package, calling the
+  fixture's callee; odd ordinals delete that file once every probe of its create
+  was first-correct. A delete's probes start at its own activation, so an
+  absence answer sent before its create completed is not applicable to it.
+  Deletion is proved by the exact scoped not-found refusal and complete
+  search, text and caller collections; a missing file's summary, editing
+  context and call chain have no pinned contract and are not probed.
+  Created files still present are removed by one timed restore batch.
+  TypeScript and Python create/delete are not implemented: a gap, not an
+  inapplicable cell.
+- `hot_file` (100 edits, `--edit-agents 2`, `edit.file` call addition): MCP
+  traffic in which both editors send each pair of edits to the one file at the
+  same due time, taken from the single-editor stream. A lost write leaves its
+  marker invisible and is a measured failure.
+- `restart` (`--edit-count 1`, one editor, no readers, JSON `edit.file` call
+  addition): the edit ACK waits for its graph receipt, so the cell does not
+  wait for it. While the ACK is outstanding, the edit's status is polled by its
+  `mutation_id` every 5 ms; once the bytes are committed and the receipt is not
+  yet terminal, the harness stops waiting for the ACK and kills the owned
+  daemon. `t_ack_ms` is then unavailable and the abandoned call is counted
+  censored, not as an error. An ACK that returns first leaves one status read
+  just before the kill to decide: a receipt already terminal there qualifies
+  the record `receipt terminal before kill` and it fails. The daemon is
+  restarted on the same store and awaited until ready, and the editor and
+  prober sessions are reopened. Probes pause during the downtime. First-correct
+  times come only from the restarted daemon, from send and from ready, and
+  answers before the kill are kept apart. The status after the restart is
+  recorded verbatim, the committed marker must be on disk, and the interrupted
+  receipt reports no phases, accounting or derived time. The run-level receipt
+  after the workload is taken on the reopened editor. Process counters cover
+  the pre-kill daemon only.
+
+Each edit-and-probe report names its `role`. A standalone run is the candidate
+unless `--edit-probe-role baseline` is given; the paired command assigns roles
+by build order and refuses the flag. A candidate still fails any record whose
+phase accounting is missing. Every record carries `phases_ms` for each ACK and
+patch lap the daemon names, taken from the record's own latest receipt status
+(the per-file observation status for batches). A build without `phases_ms`
+reports each lap unavailable with that reason, a producer null keeps the
+producer's phase state as its reason, and a relocation keeps its per-file move
+accounting instead. Missing laps are never zero.
+
+Records also carry client times from edit send: `t_readback_ms` (last correct
+immediate same-session readback), `t_file_graph_ms` (source, summary, editing
+context and old-source absence), `t_relations_ms` (callers and call chain) and
+`t_search_ms` (symbol and text search). A group time is its slowest member's
+first-correct time; any member that never answered correctly leaves the group
+unavailable. `t_derived_ms` is daemon-clock time from receipt origin to
+`patch_derived_finished` in the record's own terminal publication timeline,
+because no probe observes the derived step; it is not additive with client
+times and stays unavailable for coalesced receipts and relocations.
+
+The report `summary` covers the complete offered denominator: outcome counts
+and, for every per-record time, each readback, each `phases_ms` lap and each
+oracle's first-correct time, nearest-rank p50/p95/p99/max with percentile
+bootstrap 95% intervals (2000 resamples, seeded from the plan seed and the
+measure name). A value missing from a record that did not complete (deadline,
+run end or failure) is `censored`: the record ranks above every observed value,
+so a quantile or interval bound whose nearest rank falls among censored records
+is unavailable rather than understated. A value missing from a completed record
+(a native write's ACK, a coalesced receipt's derived time), or a measure the
+record does not carry, is `not_applicable`. An interval needs at least 2, 20 or
+100 ranked records for p50, p95 or p99 and is unavailable below that. Nothing is
+sampled as zero.
+
+`--agents R` (0 to 32) adds pure readers on their own sessions, running the
+ordinary reading plan with agent pacing. With readers, the phase opens with a
+30 second no-edit window before the edit origin; the offered edit schedule,
+relative to that origin, is unchanged, and the run budget includes the window.
+Each read is classed when it is issued: `no_edit_baseline` before the origin,
+`under_edit` while any sent edit's receipt is pending, otherwise
+`between_edits`. A sent edit is pending until the harness first observes its
+receipt terminal; an edit without one to observe (a failed edit, or a native
+write) stays pending until its loop ends. An edit sent while a read is in
+flight does not reclass it, so a read can straddle an edit's start by up to its
+own latency. The report's `reads` table gives, per operation and
+class, calls, busy refusals, errors, censored calls and the latency quantiles
+of successful calls, in which calls cut off by their deadline or the run end
+rank as censored; busy and failed calls are not applicable. Paired runs refuse
+readers.
+
+The report retains raw call identities, independent ACK/physical/requested
+background accounting, and missing evidence. RPC return timestamps delimit
+latency; raw JSONL persistence runs on owned per-edit writers with separately
+reported encoding/write overhead. The initial tiny-fixture raw budget is
+8 MiB per edit, shared by accepted pending and in-flight bytes. One wake signal
+coalesces small-row bursts without a separate message-count refusal. Exhaustion or persistence failure is
+`harness_evidence_incomplete`, never product failure or a successful check.
+Reference inputs require a reviewed evidence budget before execution. One timed
+public batch restores the file after the measurement window; unknown/pending
+mutations prevent that cleanup rewrite. The native paired path uses the same
+cell machinery; other cells and reference acceptance remain separate gates.
+An owner-matching immutable physical return with explicitly missing or invalid
+deep laps ends that edit as failed coverage once its graph and read evidence
+have arrived. Receipt terminality alone still waits for late physical evidence.
+A complete native duplicate P keeps collecting until independent publisher R
+and requested-background B arrive; absent late evidence is not terminal proof
+of missing work. A validated immutable R phase failure can end failed coverage.
+An original-publication-bound `requested_background_unavailable` is also
+terminal failed coverage, not a measured zero or a successful accounting check.
+Unknown or foreign diagnostics do not stop late-evidence collection.
+
+Requested B supports ordered native timer handoffs only when each previous
+timer's actual `Stop` succeeds before its callback starts. Watcher, path and
+actual generation bind each handoff; generation gaps never infer event counts.
+Repeated native arm, quiet, stop and coalescing-control intervals accumulate
+into fixed named scalars, without interval history. A callback that already ran,
+an observed successor or retry/backoff remains unsupported, with its first
+actual immutable invalidation reason retained. Later events cannot erase an
+already accepted historical B window. Such a diagnostic may end collection
+before other late evidence arrives; it does not prove that evidence stays
+unavailable forever.
+
+`mutation_status` can separately expose `read_assisted_publication` when an
+already-needed read repair executes for the exact pending committed bytes.
+Its monotonic window covers the actual coordinator execution, with that
+drain's owner generation and bounded reader admission causes. A reused wire ID
+is not a unique publisher identity. This window can overlap the original
+receipt's quiet wait; it is not added to A, B or a later no-op watcher P.
+Its own `phase_accounting` measures the actual gate, parse, apply, search,
+resolve, mtimes, derived and optional analysis operations, with an online
+`repair_control` interval around them. The harness validates that independent
+integer partition before accepting it as publisher deep coverage; the no-op
+P's unexecuted deep values remain null, never retroactively filled from R.
+R's internal `requested_receipt` matches the original `publication_phases.key`
+and requested ticket, not the public commit `receipt`, caller `mutation_id` or
+coalesced physical winner. The relationship to additive requested-background
+accounting remains unavailable. Missing, failed, broad, evicted, rebound or content-mismatched
+observations do not supply that evidence. Fresh same-byte inert validation
+does not claim the publication performed by an earlier operation. One observed
+independent partition does not establish the 100-edit accounting, paired
+no-regression, reference or larger language/tool/native acceptance gates.
+R is retained only by the existing bounded mutation ledger. Evicting the
+original publication recorder's index entry does not erase an accepted ledger
+observation or make canonical P/B available; ledger eviction clears R, and a
+freshness rebind refuses the old relation. Earlier returned snapshots remain
+immutable.
+
 Edit scenarios require at least one editor; zero total or negative counts are
 rejected. Zero pure readers are allowed only for `edit`/`many-edit`; `all` needs
 both populations, and other scenarios need at least one reader. Inactive editor
@@ -137,6 +479,44 @@ publication. Cold startup polls readiness while the boot-time configured repos
 index; queryability and enrichment are separate observed upper bounds with a
 recorded polling interval. Older daemons without `loaded_roots` retain their
 legacy receipt and must still pass source-backed per-root checks.
+
+## Startup admission
+
+`--scenario startup` (never part of `all`) measures what agents see while a
+daemon starts. Every manifest repository is configured; `--worktrees` linked
+checkouts of the first one are discovered through it. Probing starts before
+the first daemon start, so the window before the socket exists is observed
+too. `--seed-store <file>` copies a store (for example one written by an
+older schema) into the private run first, which makes the initial boot an
+upgrade; the source is only read. `--restarts N` adds N warm restarts. Each
+boot lasts until every configured repository is ready and enriched, plus
+`--duration`.
+
+Every second, from the primary, the first linked worktree, and a directory
+whose `.gortex.yaml` names a workspace that a private `servers.toml` roster
+claims, the probe opens fresh sessions: `initialize` (the instructions
+variant is recorded), `search_symbols` and `resources/read
+gortex://index-health` on the legacy surface, and `workspace(operation:
+"index")` on the compact one. The roster's only server never listens, so a
+routed call falls back to the daemon itself. From the same directories it
+asks the PreToolUse hook about a native Read every second, and runs `gortex
+call search_symbols` through a pipe (from the start) and through a pty
+(`script(1)`, once the socket answers), each until its first success in that
+boot. Every answer keeps `error_code`, `retryable`, phase, percent, latency,
+exit code, and whether any refusal text advises `gortex track` or
+`gortex repos reconcile`. A watcher polls the readiness probe every 100 ms
+and, for 2 s after the primary registers, the checkout coordinator count.
+
+`startup-probe.jsonl` holds every answer. The phase gate `startup_probe`
+counts answers per surface and directory in three windows (no socket,
+loading, ready) and records each boot's time to ready and time to first
+success. Headline metrics include `startup_repo_not_tracked_before_ready`,
+`startup_nonconforming_loading_refusals`, the track-advice and hook-deny
+counts, `startup_restart_ready_to_first_ok_p95_ms`,
+`startup_restart_time_to_ready_p95_ms`, `startup_initial_time_to_ready_ms`,
+`startup_initial_first_ok_ms` and `startup_coordinators_within_2s_min`.
+Restart figures are unavailable unless every restart produced them, and
+`delta` compares two startup reports like any other.
 
 ## Measurements and artifacts
 
@@ -273,6 +653,38 @@ reports and failures, repeat on the same host before p95 repeatability claims,
 and balance standalone build order per scenario. Coupled ratios do not replace
 independent scaling measurements.
 
+The initial Go `add_intrafile_call` / `edit.file` / JSON accounting cell can use
+the same dispatcher with exactly two builds, baseline first and candidate
+second:
+
+```sh
+go run ./bench/load paired --build main=/private/bin/main \
+  --build candidate=/private/bin/candidate --manifest /private/corpus.json \
+  --scratch /private/paired-artifacts --host native --scenario edit-and-probe \
+  --agents 0 --edit-agents 1 --worktrees 0 --edit-count 100 --seed 42 \
+  --out /private/paired.json
+```
+
+Both daemons run concurrently with independent clones, stores and sockets. They
+share the exact precomputed offered Poisson schedule. Edits and all seven oracle
+requests use the existing rotating back-to-back dispatch and matched per-request
+median ratios. Each build retains one separately opened prober session per edit;
+setup precedes the measurement window. A blocked ACK or probe does not serialize
+later offered edits. Actual lateness, errors and canceled/unstarted entries remain
+in the full offered denominator.
+
+Each build starts its immediate file/source readbacks after its own ACK, without
+waiting for its partner. Those readbacks, receipt polling and stats are build-local
+and **unpaired**; their latencies are excluded from matched ratios. First-correct
+times are coupled paired-probe observations: waiting for the partner response can
+delay the next probe, so these are not independent 25 ms freshness-budget results.
+Missing baseline phase instrumentation stays unavailable, while candidate A/P/B
+and applicable independent R accounting remain required. Evidence loss cancels
+that edit's paired probes and is a failed/censored observation, never a product
+deadline or a successful pair. This initial cell does not establish reference
+capacity, the larger tool/language/native matrix, or a no-regression verdict
+without the actual qualified paired run.
+
 `delta` rejects incompatible workload/corpus/target/host-limit identities rather
 than printing an unqualified verdict. It lists every comparable timing metric
 more than 15% slower, without introducing budgets or CI pass/fail lanes.
@@ -283,3 +695,57 @@ Inspect artifacts with `go tool pprof -top -nodecount=30 profile.cpu.pprof` and
 retain the exact run JSON alongside them. Real reference/floor baselines,
 repeatability, throughput scaling, and CPU-cause attribution require measured
 evidence; fixture tests or native diagnostics do not satisfy those gates.
+
+## Memory diagnosis
+
+`--gauges` (standalone runs only) subscribes one extra session to the daemon's
+`daemon_health` channel at a 10-second cadence for each measured phase, from
+the moment the daemon reports ready to the end of the phase, so the series also
+covers the warmup gates and the level after enrichment before any load. Every
+push becomes a row of `gate.gauge_series`: the daemon's own gauges (Go heap,
+`sys`, released heap, resident and proportional set or macOS footprint, SQLite
+page cache, live checkout coordinators) next to the harness's external sample
+of the daemon process taken as the push arrived. On Linux the sample adds
+`children_pss_bytes`, the proportional set of every descendant of the daemon
+(language servers and other helpers, found through each thread's
+`/proc/<pid>/task/<tid>/children`), and in a cgroup it adds the group's
+`memory.current`, which charges those children too, with its anonymous and
+file-backed parts from `memory.stat` (`cgroup_anon_bytes`,
+`cgroup_file_bytes`). The daemon runs its health ticker only while a session is
+subscribed, so the gauges cost nothing in runs that do not ask, and a
+`--gauges` run compared with the same run without it measures what the gauges
+cost. `--heap-profiles` (with `--gauges`) also saves two heap profiles per load
+window: one at load start and one at the highest footprint the series sampled
+during the load (or at its end, when that is higher). The peak captures run
+inside the measured window, so leave the option off when latency is being
+compared. If the OS/build has no process-footprint reader, the peak profile is
+unavailable with a reason in the phase gate or worktree step, and no peak
+artifact is advertised. Load-start and collected idle profiles remain available.
+Heap profiles are taken as of the daemon's last GC; no collection is forced
+during load.
+
+Live gauges and heap profiles are refused for `startup-probe`, which records
+its own boot observations without a gauge series, for `idle-stop`, whose
+measured interval requires every MCP session closed, and for the edit-and-probe
+`edit_sender: restart` cell, which replaces the process during its measured
+phase. Ordinary `--scenario restart` is supported: its series starts only
+after the replacement daemon is ready. `all` keeps independent per-scenario
+series; steady read/edit runs and worktree-step measurements remain supported.
+
+`--worktree-steps 0,1,2,4` (worktrees scenario, ending at `--worktrees`)
+measures what each linked worktree costs. One daemon starts with the first
+count of linked worktrees and grows through the rest. At each count it serves
+the reading agents for `--duration` from fresh sessions spread over every
+checkout, then sits idle for `--duration`; a session stays parked in each
+linked checkout throughout. Each idle window opens with one forced collection
+and a heap profile taken right after it, so every idle level follows a load of
+its own count and holds what the checkouts retain rather than the load's
+garbage. `gate.worktree_steps` records each count's load and idle windows,
+load-window process peaks, per-tool latency and heap profile paths, and the
+gauge series spans the whole run. The phase session model names the counts
+(`per_agent_per_worktree_step:0,1,2,4`), so `delta` refuses to compare a step
+run with an ordinary worktrees run or with a step run over other counts.
+Inspect a profile with
+`go tool pprof -sample_index=inuse_space -top worktrees.step3.heap-load-peak.pprof`,
+and what one more worktree retains with
+`go tool pprof -sample_index=inuse_space -top -base worktrees.step2.heap-idle.pprof worktrees.step3.heap-idle.pprof`.

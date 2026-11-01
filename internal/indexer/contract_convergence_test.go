@@ -3375,7 +3375,7 @@ func TestContractWatcherPatchOvertakenAfterItsWritesEndsItsWindow(t *testing.T) 
 	require.NoError(t, err)
 	path := filepath.Join(idx.rootPath, "consts.go")
 	const generation = 7
-	w.pointReindexRaw = func(p string) (*IndexResult, error) {
+	w.pointReindexRaw = func(p string, _ *PublicationStamps) (*IndexResult, error) {
 		result, err := idx.incrementalPointWatcherPath(idx.rootPath, p)
 		// A newer save of the file is scheduled while the patch ran.
 		w.mu.Lock()
@@ -3419,7 +3419,7 @@ func TestContractCaptureAdmitsAnUnacceptedRowOnTheRuleAJobProvesItsReadsBy(t *te
 		require.NoError(t, err)
 		path := filepath.Join(idx.rootPath, "consts.go")
 		const generation = 7
-		w.pointReindexRaw = func(p string) (*IndexResult, error) {
+		w.pointReindexRaw = func(p string, _ *PublicationStamps) (*IndexResult, error) {
 			result, err := idx.incrementalPointWatcherPath(idx.rootPath, p)
 			w.mu.Lock()
 			w.pendingGeneration[p] = generation + 1
@@ -4736,7 +4736,7 @@ func TestContractWatcherPatchThatFailsKeepsItsWindowOpen(t *testing.T) {
 	require.NoError(t, err)
 	path := filepath.Join(idx.rootPath, "consts.go")
 	const generation = 7
-	w.pointReindexRaw = func(p string) (*IndexResult, error) {
+	w.pointReindexRaw = func(p string, _ *PublicationStamps) (*IndexResult, error) {
 		if _, err := idx.incrementalPointWatcherPath(idx.rootPath, p); err != nil {
 			return nil, err
 		}
