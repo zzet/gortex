@@ -83,6 +83,13 @@ func IdentityKey(p string) string {
 	return foldPath(p, CaseInsensitivePaths)
 }
 
+// IdentityKeyForCase is IdentityKey with a fixed case policy. Persisted SQL
+// index collations use it so changing the host comparison policy selects a
+// different index instead of changing the ordering of an existing index.
+func IdentityKeyForCase(p string, caseInsensitive bool) string {
+	return foldPath(p, caseInsensitive)
+}
+
 // HasPathPrefix reports whether path is root itself or lies beneath it,
 // comparing on folded identity and respecting path-component boundaries:
 // "/Users/me/Doc" is not under "/Users/me/Documents". The volume root

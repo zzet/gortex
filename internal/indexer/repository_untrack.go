@@ -50,6 +50,29 @@ func (mi *MultiIndexer) untrackRepoCheckedRetainingAdmission(
 	finalize func(*RepoMetadata) error,
 	retainAdmission bool,
 ) (nodesRemoved, edgesRemoved int, err error) {
+	return mi.untrackRepoWithOwner(ctx, repoPrefix, force, finalize, retainAdmission, nil, nil)
+}
+
+// purgeRepoOwnedChecked is promotion rollback, not authoritative untrack. It
+// may remove only the registration that attempt actually observed. The witness
+// is checked again after the existing stable lane drains and before payload or
+// registry teardown; a replacement owner is never selected by prefix alone.
+func (mi *MultiIndexer) purgeRepoOwnedChecked(ctx context.Context, expected prefixOwnerWitness, stopWatcher func()) (int, int, error) {
+	if expected.meta == nil || expected.prefix == "" {
+		return 0, 0, errPrefixIdentityUnknown
+	}
+	return mi.untrackRepoWithOwner(ctx, expected.prefix, true, nil, false, &expected, stopWatcher)
+}
+
+func (mi *MultiIndexer) untrackRepoWithOwner(
+	ctx context.Context,
+	repoPrefix string,
+	force bool,
+	finalize func(*RepoMetadata) error,
+	retainAdmission bool,
+	expected *prefixOwnerWitness,
+	stopOwnedWatcher func(),
+) (nodesRemoved, edgesRemoved int, err error) {
 	if repoPrefix == "" {
 		return 0, 0, fmt.Errorf("indexer: repository teardown refuses an empty prefix")
 	}
@@ -67,7 +90,11 @@ func (mi *MultiIndexer) untrackRepoCheckedRetainingAdmission(
 	state := mi.pendingRepositoryUntracks[repoPrefix]
 	metaSnapshot, tracked := mi.repos[repoPrefix]
 	idxSnapshot := mi.indexers[repoPrefix]
+	ownerErr := mi.validatePrefixCleanupOwnerLocked(repoPrefix, expected)
 	mi.mu.RUnlock()
+	if ownerErr != nil {
+		return 0, 0, ownerErr
+	}
 
 	var coordinator *repositoryMutationCoordinator
 	if state != nil {
@@ -101,6 +128,12 @@ func (mi *MultiIndexer) untrackRepoCheckedRetainingAdmission(
 	if err := coordinator.closeAndWait(ctx); err != nil {
 		return 0, 0, fmt.Errorf("indexer: drain repository %s before teardown: %w", repoPrefix, err)
 	}
+	mi.mu.RLock()
+	ownerErr = mi.validatePrefixCleanupOwnerLocked(repoPrefix, expected)
+	mi.mu.RUnlock()
+	if ownerErr != nil {
+		return 0, 0, ownerErr
+	}
 
 	mi.batchMutationGate.RLock()
 	defer mi.batchMutationGate.RUnlock()
@@ -115,6 +148,10 @@ func (mi *MultiIndexer) untrackRepoCheckedRetainingAdmission(
 	hadRules := mi.configMgr != nil && len(mi.configMgr.GetRepoConfig(repoPrefix).CrossWorkspaceDeps) > 0
 	goModuleAffected := hadGoModule || hadRules || len(graph.ReadRepoFilePaths(mi.graph, repoPrefix, "", []string{"go"}, nil)) > 0
 	mi.mu.Lock()
+	if err := mi.validatePrefixCleanupOwnerLocked(repoPrefix, expected); err != nil {
+		mi.mu.Unlock()
+		return 0, 0, err
+	}
 	state = mi.pendingRepositoryUntracks[repoPrefix]
 	if state == nil {
 		meta := mi.repos[repoPrefix]
@@ -149,6 +186,12 @@ func (mi *MultiIndexer) untrackRepoCheckedRetainingAdmission(
 	mi.mu.Unlock()
 	if state.metadata != nil {
 		mi.forgetRepoLoad(state.metadata.RootPath)
+	}
+	if expected != nil && stopOwnedWatcher != nil {
+		// The witness was accepted inside the drained stable lane and the
+		// registry is hidden. Stop only that owner's watcher, outside mi.mu
+		// and the cleanup continuation lock, before any payload is removed.
+		stopOwnedWatcher()
 	}
 
 	state.mu.Lock()
