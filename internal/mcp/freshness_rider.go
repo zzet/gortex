@@ -489,10 +489,9 @@ func collectGraphFilePaths(v any) []string {
 	return out
 }
 
-// decorateResultWithFreshness attaches the freshness rider to a JSON-object
-// tool response under the "freshness" key. Non-JSON-object payloads
-// (GCX / TOON / arrays) are left untouched — a best-effort hint must never
-// reshape a compact wire format the caller opted into.
+// decorateResultWithFreshness merges freshness into JSON-object responses
+// and renders an in-band label for other output modes. Freshness-free
+// responses pass through unchanged.
 func decorateResultWithFreshness(res *mcp.CallToolResult, rider map[string]any) *mcp.CallToolResult {
 	if len(rider) == 0 {
 		return res
