@@ -29,15 +29,16 @@ type measurementWindow struct {
 }
 
 type requestTuple struct {
-	Repo        string `json:"repo"`
-	Commit      string `json:"commit"`
-	Tool        string `json:"tool"`
-	Role        string `json:"role"`
-	Agent       int    `json:"agent"`
-	Step        int    `json:"step"`
-	Slot        int    `json:"slot"`
-	RequestHash string `json:"request_sha256"`
-	Ordinal     uint64 `json:"category_ordinal"`
+	Repo            string `json:"repo"`
+	Commit          string `json:"commit"`
+	Tool            string `json:"tool"`
+	Role            string `json:"role"`
+	Agent           int    `json:"agent"`
+	Step            int    `json:"step"`
+	Slot            int    `json:"slot"`
+	RequestHash     string `json:"request_sha256"`
+	Ordinal         uint64 `json:"category_ordinal"`
+	ExpectedOutcome string `json:"expected_outcome,omitempty"`
 }
 
 type pairedRecord struct {
@@ -48,15 +49,16 @@ type pairedRecord struct {
 }
 
 type pairedSample struct {
-	Repo        string    `json:"repo"`
-	Commit      string    `json:"commit"`
-	RequestHash string    `json:"request_sha256"`
-	Started     time.Time `json:"started"`
-	Ended       time.Time `json:"ended"`
-	Latency     Metric    `json:"logical_latency_ms"`
-	Outcome     string    `json:"outcome"`
-	Code        int       `json:"code"`
-	Error       string    `json:"error"`
+	Repo            string    `json:"repo"`
+	Commit          string    `json:"commit"`
+	RequestHash     string    `json:"request_sha256"`
+	Started         time.Time `json:"started"`
+	Ended           time.Time `json:"ended"`
+	Latency         Metric    `json:"logical_latency_ms"`
+	Outcome         string    `json:"outcome"`
+	ExpectedOutcome string    `json:"expected_outcome,omitempty"`
+	Code            int       `json:"code"`
+	Error           string    `json:"error"`
 }
 
 type pairedRatio struct {
@@ -99,6 +101,9 @@ func matchedLatencyRatios(labels []string, records []pairedRecord) map[string]ma
 		values := make(map[string][]float64)
 		for _, record := range records {
 			category := record.Tuple.Role + "." + record.Tuple.Tool
+			if record.Tuple.ExpectedOutcome != "" {
+				category += "." + record.Tuple.ExpectedOutcome
+			}
 			row := rows[category]
 			if row.FirstBuildCounts == nil {
 				row.FirstBuildCounts = make(map[string]int)
@@ -108,7 +113,11 @@ func matchedLatencyRatios(labels []string, records []pairedRecord) map[string]ma
 			}
 			a, aOK := record.Samples[labels[0]]
 			b, bOK := record.Samples[label]
-			if !aOK || !bOK || a.Outcome != "success" || b.Outcome != "success" || a.RequestHash != record.Tuple.RequestHash || b.RequestHash != record.Tuple.RequestHash || a.Repo != record.Tuple.Repo || b.Repo != record.Tuple.Repo || a.Commit != record.Tuple.Commit || b.Commit != record.Tuple.Commit || a.Latency.Value == nil || b.Latency.Value == nil || *a.Latency.Value <= 0 || *b.Latency.Value <= 0 {
+			validOutcomes := a.Outcome == "success" && b.Outcome == "success" && record.Tuple.ExpectedOutcome == "" && a.ExpectedOutcome == "" && b.ExpectedOutcome == ""
+			if record.Tuple.ExpectedOutcome == "symbol_absent" {
+				validOutcomes = a.Outcome == "expected_refusal" && b.Outcome == "expected_refusal" && a.ExpectedOutcome == "symbol_absent" && b.ExpectedOutcome == "symbol_absent"
+			}
+			if !aOK || !bOK || !validOutcomes || a.RequestHash != record.Tuple.RequestHash || b.RequestHash != record.Tuple.RequestHash || a.Repo != record.Tuple.Repo || b.Repo != record.Tuple.Repo || a.Commit != record.Tuple.Commit || b.Commit != record.Tuple.Commit || a.Latency.Value == nil || b.Latency.Value == nil || *a.Latency.Value <= 0 || *b.Latency.Value <= 0 {
 				row.Excluded++
 			} else {
 				row.Matched++

@@ -92,15 +92,15 @@ func TestRetrievalNoteFromAKeywordRankingEqualsItsOwnSearch(t *testing.T) {
 	ctx := context.Background()
 	ranked := srv.engineFor(ctx).SearchSymbolsRankedContext(ctx, "parser", 10, query.QueryOptions{}, nil)
 	before := len(rb.queries())
-	reused := srv.lowConfidenceRetrievalNote(ctx, "parser", pack, ranked, true)
+	reused := srv.lowConfidenceRetrievalNote(ctx, "parser", pack, ranked, true, query.QueryOptions{})
 	require.Len(t, rb.queries(), before, "a known task ranking must not search again")
-	searched := srv.lowConfidenceRetrievalNote(ctx, "parser", pack, nil, false)
+	searched := srv.lowConfidenceRetrievalNote(ctx, "parser", pack, nil, false, query.QueryOptions{})
 	require.Len(t, rb.queries(), before+1)
 	require.NotNil(t, searched, "a flat ranking must draw the note")
 	require.Equal(t, searched, reused)
 
 	// A distinctive identifier draws no note and reaches no search.
 	before = len(rb.queries())
-	require.Nil(t, srv.lowConfidenceRetrievalNote(ctx, "parseConfig", pack, nil, false))
+	require.Nil(t, srv.lowConfidenceRetrievalNote(ctx, "parseConfig", pack, nil, false, query.QueryOptions{}))
 	require.Len(t, rb.queries(), before)
 }

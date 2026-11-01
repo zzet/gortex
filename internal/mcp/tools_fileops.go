@@ -828,10 +828,12 @@ func incrementalReindexSucceeded(result *indexer.IndexResult, err error) bool {
 
 // reindexFile refreshes the graph for a single file after a write. Best-effort:
 // non-source files or files outside any indexed repo are silently skipped.
-func (s *Server) reindexFile(absPath string) bool {
+func (s *Server) reindexFile(absPath string) bool { return s.reindexFileObserved(absPath, nil) }
+
+func (s *Server) reindexFileObserved(absPath string, observer *indexer.ReadRepairObserver) bool {
 	if s.multiIndexer != nil {
 		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
-			result, err := s.multiIndexer.IncrementalReindexRepo(prefix, []string{absPath})
+			result, err := s.multiIndexer.IncrementalReindexRepoObserved(prefix, []string{absPath}, observer)
 			if incrementalReindexSucceeded(result, err) {
 				return true
 			}
@@ -1015,7 +1017,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 	var gate parseGateResult
 	if parseGateEnabled() {
-		gate = checkParseGate(relPath, content, newContentBytes)
+		gate = s.checkAcknowledgedParseGate(ctx, relPath, content, newContentBytes)
 		if gate.Blocked && !allowParseErrors && !dryRun {
 			return mcp.NewToolResultError(parseGateError(relPath, gate)), nil
 		}
@@ -1056,6 +1058,9 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		}
 		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
+
+	observeEditSourceEffect(ctx, true, true) // identical edits already refused above
+	observeEditSourceComplete(ctx)
 
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
@@ -1134,6 +1139,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	status := "created"
 	perm := os.FileMode(0o644)
 	fileExists := false
+	fileExistenceKnown := false
 	if info, err := os.Stat(absPath); err == nil {
 		if info.IsDir() {
 			return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
@@ -1141,6 +1147,9 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		status = "overwritten"
 		perm = info.Mode().Perm()
 		fileExists = true
+		fileExistenceKnown = true
+	} else {
+		fileExistenceKnown = errors.Is(err, os.ErrNotExist)
 	}
 
 	// Drift guard: when the caller observed the file at base_sha,
@@ -1166,8 +1175,11 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	// Read the prior bytes once: the parse gate compares against them, and an
 	// evidence receipt digests them as before_sha256.
 	var priorContent []byte
+	priorContentKnown := fileExistenceKnown && !fileExists
 	if fileExists {
-		priorContent, _ = os.ReadFile(absPath)
+		var readErr error
+		priorContent, readErr = os.ReadFile(absPath)
+		priorContentKnown = readErr == nil
 	}
 	// Before anything is written, so a withheld receipt never leaves an
 	// overwritten file behind.
@@ -1180,7 +1192,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 	var gate parseGateResult
 	if parseGateEnabled() {
-		gate = checkParseGate(relPath, priorContent, contentBytes)
+		gate = s.checkAcknowledgedParseGate(ctx, relPath, priorContent, contentBytes)
 		if gate.Blocked && !allowParseErrors && !dryRun {
 			return mcp.NewToolResultError(parseGateError(relPath, gate)), nil
 		}
@@ -1219,6 +1231,9 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		}
 		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
+
+	observeEditSourceReplacement(ctx, priorContent, contentBytes, fileExists, priorContentKnown)
+	observeEditSourceComplete(ctx)
 
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)

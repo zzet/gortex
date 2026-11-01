@@ -319,7 +319,7 @@ func (s *Server) StopHealthBroadcaster() {
 func (s *Server) registerHealthTools() {
 	s.addTool(
 		mcp.NewTool("subscribe_daemon_health",
-			mcp.WithDescription("Opt the current MCP session into `notifications/daemon_health` push events. A periodic ticker (default 15 s) snapshots `{uptime_seconds, alloc_bytes, sys_bytes, num_goroutine, num_gc, tracked_repos, sessions, lsp_alive, …}` and pushes it to subscribed sessions. Repeated-identical snapshots are suppressed by a payload-hash delta filter. The current snapshot is replayed immediately as `initial_replay: true`. Optional `interval_ms` overrides the cadence (clamped to [1000, 300000]). Pair with `unsubscribe_daemon_health` to opt back out."),
+			mcp.WithDescription("Opt the current MCP session into `notifications/daemon_health` push events. A periodic ticker (default 15 s) snapshots `{uptime_seconds, alloc_bytes, sys_bytes, num_goroutine, num_gc, tracked_repos, sessions, lsp_alive, coordinators, sqlite_page_cache_bytes, rss_bytes, pss_bytes, footprint_bytes, …}` and pushes it to subscribed sessions; an OS memory figure is omitted where the platform has no reader, and the SQLite page cache is process-wide. Repeated-identical snapshots are suppressed by a payload-hash delta filter. The current snapshot is replayed immediately as `initial_replay: true`. Optional `interval_ms` overrides the cadence (clamped to [1000, 300000]). Pair with `unsubscribe_daemon_health` to opt back out."),
 			mcp.WithNumber("interval_ms", mcp.Description("Publish cadence in milliseconds. Default 15000; clamped to [1000, 300000].")),
 		),
 		s.handleSubscribeHealth,
