@@ -375,9 +375,9 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 	// don't defer Close — closing happens in the indexer after the
 	// contract pass releases its ref.
 	pt := parser.NewParseTree(tree, src, "go")
-	result := &parser.ExtractionResult{Tree: pt}
-
 	root := tree.RootNode()
+	checked, parseErrors := parser.ParseErrorVerdict(root)
+	result := &parser.ExtractionResult{Tree: pt, ParseChecked: checked, ParseErrors: parseErrors}
 
 	fileNode := &graph.Node{
 		ID:        filePath,

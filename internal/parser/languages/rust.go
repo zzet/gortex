@@ -177,7 +177,8 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	defer tree.Close()
 
 	root := tree.RootNode()
-	result := &parser.ExtractionResult{}
+	checked, parseErrors := parser.ParseErrorVerdict(root)
+	result := &parser.ExtractionResult{ParseChecked: checked, ParseErrors: parseErrors}
 
 	fileNode := &graph.Node{
 		ID: filePath, Kind: graph.KindFile, Name: filePath,

@@ -52,11 +52,12 @@ type Projection struct {
 	// ContentHash is computed over the transformed bytes with the same
 	// function as FileMetaRow.ContentHash, so the two are equal once the
 	// index holds these bytes.
-	ContentHash string
-	Nodes       []*graph.Node
-	Edges       []*graph.Edge
-	ParseErrors int
-	BuildTime   time.Duration
+	ContentHash  string
+	Nodes        []*graph.Node
+	Edges        []*graph.Edge
+	ParseErrors  int
+	ParseChecked bool // zero errors are trustworthy only with the explicit full-parse proof
+	BuildTime    time.Duration
 }
 
 // ProjectSource builds the projection of src, the bytes a tool just wrote to
@@ -147,17 +148,21 @@ func (idx *Indexer) ProjectSource(ctx context.Context, absPath string, src []byt
 			break
 		}
 	}
+	if result.ParseChecked && result.ParseErrors >= 0 {
+		parseErrors = result.ParseErrors
+	}
 	if time.Since(started) > projectionBuildDeadline {
 		return nil, ErrProjectionDeadline
 	}
 	return &Projection{
-		GraphPath:   idx.prefixPath(relPath),
-		Language:    language,
-		ContentHash: contentHashForSource(transformed),
-		Nodes:       result.Nodes,
-		Edges:       result.Edges,
-		ParseErrors: parseErrors,
-		BuildTime:   time.Since(started),
+		GraphPath:    idx.prefixPath(relPath),
+		Language:     language,
+		ContentHash:  contentHashForSource(transformed),
+		Nodes:        result.Nodes,
+		Edges:        result.Edges,
+		ParseErrors:  parseErrors,
+		ParseChecked: result.ParseChecked && result.ParseErrors >= 0,
+		BuildTime:    time.Since(started),
 	}, nil
 }
 
