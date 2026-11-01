@@ -3408,6 +3408,19 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				return
 			}
 			drainStart := time.Now()
+			var drainWALPeak int64
+			var drainWALObserved bool
+			walReporter, hasWALReporter := diskTarget.(interface{ DBStats() (int64, int64) })
+			sampleDrainWAL := func() {
+				if hasWALReporter {
+					_, walBytes := walReporter.DBStats()
+					if walBytes > 0 {
+						drainWALObserved = true
+					}
+					drainWALPeak = max(drainWALPeak, walBytes)
+				}
+			}
+			sampleDrainWAL()
 			shadowNodeCount := inMemShadow.NodeCount()
 			shadowEdgeCount := inMemShadow.EdgeCount()
 			if !shadowEstimateReady {
@@ -3466,6 +3479,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				return
 			}
 			bl.BeginBulkLoad()
+			bulkWindow := "unknown"
+			if reporter, ok := diskTarget.(interface{ BulkLoadWindow() string }); ok {
+				bulkWindow = reporter.BulkLoadWindow()
+			}
 			// FlushBulk is a no-op under an outer coordinated window. Otherwise
 			// it must also restore the standalone window if a drain write panics.
 			bulkFlushPending := true
@@ -3542,6 +3559,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					nodeDrainStopped = true
 					break
 				}
+				sampleDrainWAL()
 				if retErr != nil && drainChecksCancellation(ctx) && ctx.Err() != nil {
 					break
 				}
@@ -3562,6 +3580,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						ftsReady = false
 						return false
 					}
+					sampleDrainWAL()
 					ftsItemCount += len(ftsItems)
 					ftsItems = make([]graph.SymbolFTSItem, 0, min(len(nodes), persistFTSChunkRows))
 					ftsBytes = 0
@@ -3609,6 +3628,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					}
 					break
 				}
+				sampleDrainWAL()
 				edgeRows := len(edges)
 				drainPressure.afterEdgeBatch(edgeRows)
 			}
@@ -3644,6 +3664,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				}
 			}
 
+			sampleDrainWAL()
 			flushStart := time.Now()
 			idx.logger.Info("indexer: FlushBulk start",
 				zap.String("repo", idx.RepoPrefix()),
@@ -3656,7 +3677,26 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if ferr != nil && retErr == nil {
 				retErr = fmt.Errorf("indexer: persist bulk graph: %w", ferr)
 			}
+			sealElapsed := time.Since(flushStart)
+			sampleDrainWAL()
+			drainElapsed := time.Since(drainStart)
+			if recorder, ok := diskTarget.(interface {
+				RecordFirstIndexDrain(string, graph.FirstIndexDrain)
+			}); ok {
+				observation := graph.FirstIndexDrain{
+					Window: bulkWindow, Nodes: shadowNodeCount, Edges: shadowEdgeCount,
+					DrainMS: float64(drainElapsed) / float64(time.Millisecond),
+					SealMS:  float64(sealElapsed) / float64(time.Millisecond), CompletedAt: time.Now(),
+					WALPeakBytes: drainWALPeak, WALPeakObserved: drainWALObserved, WALPeakScope: "shared_store_drain_chunk_samples",
+				}
+				if retErr != nil {
+					observation.Error = retErr.Error()
+				}
+				recorder.RecordFirstIndexDrain(idx.RepoPrefix(), observation)
+			}
 			idx.logger.Info("indexer: FlushBulk complete",
+				zap.String("window", bulkWindow),
+				zap.Duration("seal_elapsed", sealElapsed),
 				zap.String("repo", idx.RepoPrefix()),
 				zap.Duration("flush_elapsed", time.Since(flushStart)),
 				zap.Duration("total_drain", time.Since(drainStart)),

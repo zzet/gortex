@@ -3723,6 +3723,13 @@ func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string
 			}
 		}
 	}
+	if reporter, ok := s.graph.(interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}); ok {
+		if observations := reporter.LastFirstIndexDrains(); len(observations) > 0 {
+			result["last_first_index_drain"] = observations
+		}
+	}
 	if prefixAuditOK {
 		ownership := map[string]any{
 			"owned_code_nodes":   prefixAudit.OwnedCodeNodes,

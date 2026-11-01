@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,11 +18,27 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 )
+
+// The existing missing-index log is emitted after the atomic record is installed
+// and before repair is scheduled. Observe status at that causal boundary instead
+// of racing a successful background repair after warmup returns.
+type warmupSealStatusProbe struct {
+	output  io.Writer
+	missing func()
+}
+
+func (p warmupSealStatusProbe) Write(data []byte) (int, error) {
+	if strings.Contains(string(data), "store_sqlite: dense indexes missing after bulk window close") {
+		p.missing()
+	}
+	return p.output.Write(data)
+}
 
 func TestDrainGoModAndFinalizeWarmupBulkOrdersDrainBeforeFinalize(t *testing.T) {
 	var order []string
@@ -95,7 +115,22 @@ func TestWarmupFailedFinalSealGivesUpTheCoordinatedWindow(t *testing.T) {
 		return nil
 	})
 
+	missingStatus := make(chan []string, 1)
+	priorOutput := log.Writer()
+	log.SetOutput(warmupSealStatusProbe{output: priorOutput, missing: func() {
+		select {
+		case missingStatus <- storageStatusFor(store).DenseIndexesMissing:
+		default:
+		}
+	}})
+	defer log.SetOutput(priorOutput)
 	_, _ = warmupDaemonState(state, logger, func() {})
+	select {
+	case missing := <-missingStatus:
+		assert.Contains(t, missing, "nodes_by_kind", "status reads the existing missing-index record before repair is scheduled")
+	default:
+		t.Error("the failed seal never published its missing-index boundary")
+	}
 	restore()
 	require.NotEmpty(t, observed.FilterMessage("daemon: coordinated cold bulk-load finalize failed").All(),
 		"the fixture must fail the coordinated window's final seal")
@@ -112,4 +147,18 @@ func TestWarmupFailedFinalSealGivesUpTheCoordinatedWindow(t *testing.T) {
 		require.NoError(t, err)
 	}
 	assert.NotEqual(t, "dense_indexes_missing", health.Reason, "the repair must rebuild the index the seal left out")
+}
+
+func TestStorageStatusReportsFirstIndexDrainWithoutInventingEmptyResult(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "status.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	empty, err := json.Marshal(storageStatusFor(store))
+	require.NoError(t, err)
+	assert.NotContains(t, string(empty), "last_first_index_drain")
+	store.RecordFirstIndexDrain("repo", graph.FirstIndexDrain{Window: "coordinated", Nodes: 7, Edges: 9})
+	response := storageStatusFor(store)
+	require.NotNil(t, response)
+	assert.Equal(t, 7, response.LastFirstIndexDrain["repo"].Nodes)
+	assert.Equal(t, "coordinated", response.LastFirstIndexDrain["repo"].Window)
 }

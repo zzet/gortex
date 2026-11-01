@@ -34,6 +34,11 @@ var _ graph.FileIdentityBatchEvicter = (*graph.DeltaWriter)(nil)
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
+	"anonymous{DBStats}": "physical durable-store file-size telemetry; full-shadow drain samples a real store, whereas DeltaWriter stages per-file changes without owning a database or WAL file",
+
+	"anonymous{BulkLoadWindow}":        "physical durable-store full-shadow window telemetry; DeltaWriter stages per-file changes and does not own a cold or generation bulk window",
+	"anonymous{RecordFirstIndexDrain}": "physical durable-store full-shadow completion telemetry; a per-file DeltaWriter has no full-shadow drain to record and must not forward writes to its base",
+
 	"graph.BFSAdmissionReader":            "optional selected-reader traversal snapshot; the query engine retains its composed point-walk admission when a delta has no snapshot accelerator",
 	"graph.FilteredBFSAdmissionReader":    "physical indexed scoped traversal; forwarding it would discard delta ownership, so the engine keeps composed Go admission instead",
 	"graph.KindAdjacencyReader":           "optional typed adjacency accelerator; ReadKindAdjacency filters the delta's composed point reads instead of forwarding physical rows past delta ownership",

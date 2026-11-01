@@ -66,6 +66,9 @@ type backgroundCheckpointCoordination struct {
 }
 
 type storeCore struct {
+	firstIndexDrainsMu sync.Mutex
+	firstIndexDrains   map[string]graph.FirstIndexDrain
+
 	// baseFTSPages retains only exact ranked rows keyed by same-transaction
 	// global FTS state and mutable base ownership revision.
 	baseFTSPages symbolFTSPageCache

@@ -348,3 +348,26 @@ func TestIndexHealth_PlannerStatsAbsentOnBackendWithoutCapability(t *testing.T) 
 	assert.NotContains(t, payload, "planner_stats",
 		"the in-memory graph has no planner statistics; reporting zeros would invent a defect")
 }
+
+func TestIndexHealthReportsLastFirstIndexDrain(t *testing.T) {
+	t.Setenv("GORTEX_STREAMING_FLUSH", "0")
+	t.Setenv("GORTEX_SHADOW_MAX_FILES", "1000000")
+	t.Setenv("GORTEX_SHADOW_MAX_BYTES", "1073741824")
+	srv, _ := newSQLiteBackedServer(t)
+	payload, err := srv.buildIndexHealthPayloadCtx(t.Context())
+	require.NoError(t, err)
+	observations, ok := payload["last_first_index_drain"].(map[string]graph.FirstIndexDrain)
+	require.True(t, ok, "a completed first index must publish its actual drain observation")
+	require.Len(t, observations, 1)
+	for _, observation := range observations {
+		assert.Equal(t, "cold", observation.Window)
+		assert.Greater(t, observation.Nodes, 0)
+		assert.GreaterOrEqual(t, observation.DrainMS, observation.SealMS)
+		assert.False(t, observation.CompletedAt.IsZero())
+		assert.Equal(t, "shared_store_drain_chunk_samples", observation.WALPeakScope)
+	}
+	empty, _ := newEmptySQLiteBackedServer(t)
+	noDrain, err := empty.buildIndexHealthPayloadCtx(t.Context())
+	require.NoError(t, err)
+	assert.NotContains(t, noDrain, "last_first_index_drain", "absence is not a fabricated completed zero drain")
+}

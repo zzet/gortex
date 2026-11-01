@@ -774,3 +774,15 @@ Read-only, URI-addressable, no args. Clients that speak resources can `resources
 | `pre_commit` | Review uncommitted changes — shows changed symbols, blast radius, risk level, affected tests |
 | `orientation` | Orient in an unfamiliar codebase — graph stats, communities, execution flows, key symbols |
 | `safe_to_change` | Analyze whether it's safe to change specific symbols — blast radius, edit plan, affected tests |
+
+`index_health` includes `last_first_index_drain` after a full shadow index has
+persisted, keyed by repository prefix. Daemon status exposes the same snapshot
+under `storage`, together with `dense_indexes_missing` when a failed seal owes
+index repair. A drain records its actual window kind, node/edge counts, drain
+and seal-call durations, completion time and any seal error. A coordinated
+window seals at its outer boundary, so its per-repository seal call can be a
+no-op. `wal_peak_scope=shared_store_drain_chunk_samples` identifies physical WAL
+observations at the start, bounded graph/FTS chunks and seal boundaries. This
+is a sampled peak on the shared store; concurrent repository work can contribute
+and a peak between samples can be missed. Missing observations
+are omitted, and these process-local snapshots reset when the store reopens.

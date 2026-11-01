@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
@@ -576,4 +577,19 @@ func TestFirstIndexFailureRestoresSQLiteReplacement(t *testing.T) {
 			assert.Nil(t, probe.GetNode("repo::stale"), "replacement must evict stale graph rows")
 		})
 	}
+}
+
+func TestFirstIndexDrainReportsWindowAndSeal(t *testing.T) {
+	store, _ := newFirstIndexStore(t)
+	core, observed := observer.New(zap.InfoLevel)
+	idx := newFirstIndexBulkIndexer(t, store, "repo")
+	idx.logger = zap.New(core)
+	result, err := idx.IndexCtx(t.Context(), firstIndexFixtureRepo(t))
+	require.NoError(t, err)
+	entries := observed.FilterMessage("indexer: FlushBulk complete").All()
+	require.Len(t, entries, 1)
+	fields := entries[0].ContextMap()
+	assert.Equal(t, "cold", fields["window"])
+	assert.Contains(t, fields, "seal_elapsed")
+	assert.EqualValues(t, result.NodeCount, fields["nodes"])
 }
