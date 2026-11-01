@@ -344,6 +344,15 @@ samples remain failed evidence. Benchmark-only processes get an Interrupt then
 a two-second kill/join bound; abnormal exit/context errors cannot become success.
 The daemon collector instead joins owned cleanup without killing its client.
 
+For a separately reviewed query setup diagnosis, the test executable accepts
+`GORTEX_BENCH_QUERY_SETUP_TRACE` as a new output-file prefix. It writes exclusive
+`.start.json` and `.finish.json` sidecars with shared setup and indexing clocks,
+monotonic elapsed durations, and the indexed file/worker census. A start without
+a finish remains incomplete evidence. An existing sidecar or write failure
+fails the requested diagnosis. The unset default emits no sidecars. This trace
+does not change query bodies, fixture scope, timers, or child safety bounds;
+setup still runs before each benchmark's `ResetTimer`.
+
 Outputs include per-run raw text, combined main/candidate samples, benchstat
 text and `microbench.json`. `formal_acceptance` is always false: the workload
 gate must independently pass. The trusted bundle now has a complete microbenchmark extension: three exact-main
