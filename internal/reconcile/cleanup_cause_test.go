@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -154,5 +155,47 @@ func TestLegacyAutomaticForgetRetainsActiveIntent(t *testing.T) {
 	}
 	if !f.graphExists("owned") {
 		t.Fatal("legacy automatic forget released intended graph")
+	}
+}
+
+func TestExplicitUntrackDoesNotAdoptAutomaticCleanupCause(t *testing.T) {
+	f := newFixture(t, Default())
+	f.seedCheckout("owner", "inc", "work", store_sqlite.CheckoutModeDedicated)
+	f.seedOwnedGraph("owned", "owner")
+	if err := f.catalog.UpsertTrackingIntent(context.Background(), store_sqlite.TrackingIntent{IntentID: "wanted", CheckoutID: "owner", SourceKind: store_sqlite.IntentSourceCLITrack, SourceLocator: "cli", Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	target := sagaTarget{Kind: sagaForgetCheckout, CheckoutID: "owner", Incarnation: "inc", FamilyID: f.familyID, GraphID: "owned", Cause: CauseReconcileRemoval}
+	payload, err := json.Marshal(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := store_sqlite.CleanupEntry{CleanupID: target.cleanupID(), OpaqueTargetIDs: string(payload), Reason: string(target.Kind), Phase: store_sqlite.CleanupPhasePending}
+	if err := f.catalog.UpsertCleanupEntry(context.Background(), entry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.rec.ForgetCheckoutExplicit(context.Background(), "owner", "inc", f.familyID, "owned"); !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+		t.Fatalf("explicit request adopted automatic work without authorization: %v", err)
+	}
+	graph, found, err := f.catalog.GetDedicatedGraph(context.Background(), "owned")
+	if err != nil || !found || graph.State != GraphStateReady {
+		t.Fatalf("refused adoption closed graph: %+v found=%v err=%v", graph, found, err)
+	}
+	intents, err := f.catalog.ListTrackingIntents(context.Background(), "owner")
+	if err != nil || len(intents) != 1 || !intents[0].Active {
+		t.Fatalf("refused adoption changed intent: %+v err=%v", intents, err)
+	}
+	current, found, err := f.catalog.GetCleanupEntry(context.Background(), target.cleanupID())
+	if err != nil || !found || current.OpaqueTargetIDs != entry.OpaqueTargetIDs || current.Phase != entry.Phase {
+		t.Fatalf("refused adoption changed journal: %+v err=%v", current, err)
+	}
+	if err := f.rec.Resume(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.rec.ForgetCheckoutExplicit(context.Background(), "owner", "inc", f.familyID, "owned"); err != nil {
+		t.Fatalf("explicit retry after safe automatic resume: %v", err)
+	}
+	if _, found, err := f.catalog.GetCheckout(context.Background(), "owner"); err != nil || found {
+		t.Fatalf("explicit retry did not finish: found=%v err=%v", found, err)
 	}
 }
