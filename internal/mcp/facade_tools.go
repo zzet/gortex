@@ -1212,7 +1212,7 @@ func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (s
 	}
 	seen := make(map[string]bool)
 	candidates := make([]string, 0, 2)
-	for _, node := range s.sessionNameCandidates(ctx, eng.Reader(), id, eng.FindSymbols) {
+	for _, node := range s.sessionNameCandidates(ctx, eng.Reader(), id, eng.Reader().FindNodesByName) {
 		if node == nil || seen[node.ID] || !s.nodeInSessionScope(ctx, node) {
 			continue
 		}
