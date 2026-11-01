@@ -724,6 +724,23 @@ func (s *Server) beginMutationCommit(ctx context.Context, tool, mutationID, fing
 	return record
 }
 
+type sourceMutationOperationKind uint8
+
+const (
+	batchForwardWrite sourceMutationOperationKind = iota + 1
+	batchForwardRemove
+	batchRestoreWrite
+	batchRestoreRemove
+)
+
+// A durable batch already owns its complete prepared path set and terminal
+// verdict. This descriptor selects only source I/O; journal and backup writes
+// never enter this boundary. Observation belongs exclusively to forward I/O.
+type sourceMutationOperation struct {
+	kind        sourceMutationOperationKind
+	observation *mutationCommitRecord
+}
+
 // commitFileMutation is the single guarded disk-commit primitive for the
 // single-file mutating tools. Every caller gets three things it did not have
 // before: a refusal when the request is already dead, a durable receipt, and a
@@ -733,7 +750,47 @@ func (s *Server) commitFileMutation(
 	tool, mutationID, fingerprint, relPath, absPath string,
 	data []byte,
 	perm os.FileMode,
+	operations ...sourceMutationOperation,
 ) (*mutationCommitRecord, error) {
+	if len(operations) != 0 {
+		// Branch before beginMutationCommit: it registers ordinary source
+		// authority even before markCommitted. The durable transaction is the
+		// sole authority for forward effects and restoration alike.
+		if len(operations) != 1 {
+			return nil, fmt.Errorf("%w: invalid source operation", errMutationNotApplied)
+		}
+		operation := operations[0]
+		if !mutationPathAdmitted(ctx, pathkey.MutationKey(absPath)) {
+			return nil, fmt.Errorf("%w: batch source path is not held for mutation", errMutationNotApplied)
+		}
+		if err := guardCheckoutMutationPath(ctx, absPath); err != nil {
+			return nil, err
+		}
+		// No cancellation or per-file Prepare here: the coordinator has crossed
+		// its existing commit boundary and must reach a durable terminal state.
+		ops := s.batchDurability()
+		switch operation.kind {
+		case batchForwardWrite:
+			writer := ops.writeFile
+			if s.batchWriteOverride != nil {
+				writer = s.batchWriteOverride
+			}
+			writer = s.observedBatchFileWriter(operation.observation, writer)
+			return nil, s.writeAcknowledgedBatchFile(ctx, writer, absPath, data, perm)
+		case batchForwardRemove:
+			remover := ops.removeFile
+			if s.batchRemoveOverride != nil {
+				remover = s.batchRemoveOverride
+			}
+			return nil, s.removeAcknowledgedBatchFile(ctx, remover, absPath)
+		case batchRestoreWrite:
+			return nil, ops.writeFile(absPath, data, perm)
+		case batchRestoreRemove:
+			return nil, ops.removeFile(absPath)
+		default:
+			return nil, fmt.Errorf("%w: invalid batch source operation", errMutationNotApplied)
+		}
+	}
 	record := s.beginMutationCommit(ctx, tool, mutationID, fingerprint, relPath, absPath)
 	if s.mutationPreCommitHook != nil {
 		s.mutationPreCommitHook(record)

@@ -1120,18 +1120,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 
 	// Commit is deliberately non-cancellable. Once the first rename succeeds,
 	// every remaining write or rollback must run to a terminal disk state.
-	writer := s.batchDurability().writeFile
-	remover := s.batchDurability().removeFile
-	if s.batchWriteOverride != nil {
-		// Preserve the target-only fault-injection seam used by commit tests;
-		// journal and rollback writes always retain the durability discipline.
-		writer = s.batchWriteOverride
-	}
-	if s.batchRemoveOverride != nil {
-		remover = s.batchRemoveOverride
-	}
 	fileObservation = s.beginBatchFileObservation(ctx, receipt, buffers, orderedPaths)
-	writer = s.observedBatchFileWriter(fileObservation, writer)
 	finishCommitFailure := func(failedPath, message string) batchTransactionReceipt {
 		status, rollbackErr := s.rollbackBatchReceipt(receipt, ctx)
 		if rollbackErr != nil {
@@ -1161,10 +1150,10 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 			if targetErr := s.validateBatchCreateTarget(ctx, path, buffer.relPath); targetErr != nil {
 				commitErr = targetErr
 			} else {
-				commitErr = s.writeAcknowledgedBatchFile(ctx, writer, path, buffer.content, buffer.mode)
+				_, commitErr = s.commitFileMutation(ctx, "batch_edit", "", "", buffer.relPath, path, buffer.content, buffer.mode, sourceMutationOperation{kind: batchForwardWrite, observation: fileObservation})
 			}
 		} else {
-			commitErr = s.writeAcknowledgedBatchFile(ctx, writer, path, buffer.content, buffer.mode)
+			_, commitErr = s.commitFileMutation(ctx, "batch_edit", "", "", buffer.relPath, path, buffer.content, buffer.mode, sourceMutationOperation{kind: batchForwardWrite, observation: fileObservation})
 		}
 		if commitErr != nil {
 			message := fmt.Sprintf("could not commit %s: %v", buffer.relPath, commitErr)
@@ -1180,7 +1169,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		if err := guardCheckoutMutationPath(ctx, path); err != nil {
 			return finishCommitFailure(buffer.relPath, err.Error()), nil
 		}
-		if commitErr := s.removeAcknowledgedBatchFile(ctx, remover, path); commitErr != nil {
+		if _, commitErr := s.commitFileMutation(ctx, "batch_edit", "", "", buffer.relPath, path, nil, 0, sourceMutationOperation{kind: batchForwardRemove}); commitErr != nil {
 			message := fmt.Sprintf("could not commit %s: %v", buffer.relPath, commitErr)
 			return finishCommitFailure(buffer.relPath, message), nil
 		}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/gitstate"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 const batchTransactionDirEnv = "GORTEX_BATCH_TRANSACTION_DIR"
@@ -273,12 +274,16 @@ func classifyBatchFiles(files []batchTransactionFile) (before, after, unknown []
 	return before, after, unknown, err
 }
 
-func (s *Server) rollbackBatchReceipt(receipt batchTransactionReceipt, contexts ...context.Context) (string, error) {
-	for _, ctx := range contexts {
-		for _, file := range receipt.Files {
-			if err := guardCheckoutMutationPath(ctx, file.Path); err != nil {
-				return "recovery_conflict", err
-			}
+func (s *Server) rollbackBatchReceipt(receipt batchTransactionReceipt, ctx context.Context) (string, error) {
+	// Prove the entire original recovery set before restoring any file. The
+	// transaction still owns rollback and durability; no per-file ordinary
+	// commit record may advertise a partial restore as source authority.
+	for _, file := range receipt.Files {
+		if !mutationPathAdmitted(ctx, pathkey.MutationKey(file.Path)) {
+			return "recovery_conflict", fmt.Errorf("%w: rollback source path is not held for mutation", errMutationNotApplied)
+		}
+		if err := guardCheckoutMutationPath(ctx, file.Path); err != nil {
+			return "recovery_conflict", err
 		}
 	}
 	_, after, unknown, classifyErr := classifyBatchFiles(receipt.Files)
@@ -287,7 +292,7 @@ func (s *Server) rollbackBatchReceipt(receipt batchTransactionReceipt, contexts 
 	}
 	for _, file := range after {
 		if file.BeforeAbsent {
-			if err := s.batchDurability().removeFile(file.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if _, err := s.commitFileMutation(ctx, "batch_edit", "", "", file.RelativePath, file.Path, nil, 0, sourceMutationOperation{kind: batchRestoreRemove}); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return "recovery_conflict", fmt.Errorf("remove rollback-created %s: %w", file.RelativePath, err)
 			}
 			continue
@@ -296,7 +301,7 @@ func (s *Server) rollbackBatchReceipt(receipt batchTransactionReceipt, contexts 
 		if err != nil {
 			return "recovery_conflict", fmt.Errorf("load rollback backup for %s: %w", file.RelativePath, err)
 		}
-		if err := s.batchDurability().writeFile(file.Path, backup, file.Mode); err != nil {
+		if _, err := s.commitFileMutation(ctx, "batch_edit", "", "", file.RelativePath, file.Path, backup, file.Mode, sourceMutationOperation{kind: batchRestoreWrite}); err != nil {
 			return "recovery_conflict", fmt.Errorf("restore %s: %w", file.RelativePath, err)
 		}
 	}
@@ -374,12 +379,12 @@ func (s *Server) recoverBatchTransaction(ctx context.Context, state *batchTransa
 		receipt.Recovered = true
 		s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", "recovered prepared transaction before commit")
 	default:
-		if err := prepareBatchRecovery(ctx); err != nil {
+		if err := prepareBatchRecovery(recoveryCtx); err != nil {
 			receipt.Error = err.Error()
 			state.publish(receipt, true)
 			return
 		}
-		status, rollbackErr := s.rollbackBatchReceipt(receipt, ctx)
+		status, rollbackErr := s.rollbackBatchReceipt(receipt, recoveryCtx)
 		receipt.Recovered = true
 		message := "recovered interrupted mixed commit by restoring original bytes"
 		if rollbackErr != nil {
