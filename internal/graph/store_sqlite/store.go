@@ -432,8 +432,12 @@ type storeCore struct {
 	jsonbIngestBuffers jsonbIngestBuffers
 
 	// bulkFinalizeObserver is a package-private test/diagnostic hook. It runs
-	// synchronously under writeMu and therefore must not call back into Store.
+	// synchronously under writeMu on cold paths; live FTS finalize emits after
+	// releasing the gate. Cold observers must not call back into Store.
 	bulkFinalizeObserver func(bulkFinalizeEvent)
+	// Live FTS-finalize statement trace for tests; invoked only on those two
+	// maintenance calls, never on ordinary graph/edit writes.
+	ftsMaintenanceObserver func(string, []any)
 
 	// Planner-statistics freshness ledger (planner_stats_freshness.go). It
 	// lives on the core rather than the handle so every AtGeneration view
