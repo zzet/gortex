@@ -686,6 +686,13 @@ artifact is advertised. Load-start and collected idle profiles remain available.
 Heap profiles are taken as of the daemon's last GC; no collection is forced
 during load.
 
+Live gauges and heap profiles are refused for `idle-stop`, whose measured
+interval requires every MCP session closed, and for the edit-and-probe
+`edit_sender: restart` cell, which replaces the process during its measured
+phase. Ordinary `--scenario restart` is supported: its series starts only
+after the replacement daemon is ready. `all` keeps independent per-scenario
+series; steady read/edit runs and worktree-step measurements remain supported.
+
 `--worktree-steps 0,1,2,4` (worktrees scenario, ending at `--worktrees`)
 measures what each linked worktree costs. One daemon starts with the first
 count of linked worktrees and grows through the rest. At each count it serves
