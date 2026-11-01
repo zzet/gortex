@@ -53,10 +53,15 @@ func validatePRSmokeDrain(o runOptions) error {
 		return errors.New("offered-window drain must be nonnegative")
 	}
 	if o.PRSmokeDrain == 0 {
+		if o.PRSmokeDrainVersion != 0 && o.PRSmokeDrainVersion != 1 {
+			return errors.New("explicit edit drain version requires --pr-smoke-drain")
+		}
 		return nil
 	}
 	version := prSmokeDrainVersion(o)
-	if (version != 1 || o.Scenario != "read" || o.Editors != 0) && (version != 2 || o.Scenario != "edit" || o.Editors < 1) || o.Host != "native" || o.Profile != "agent" || o.Worktrees != 0 || o.CPUProfile != 0 || o.KeepState {
+	read := version == 1 && o.Scenario == "read" && o.Editors == 0
+	edit := version == 2 && o.Scenario == "edit" && o.Editors > 0
+	if (!read && !edit) || o.Host != "native" || o.Profile != "agent" || o.Worktrees != 0 || o.CPUProfile != 0 || o.KeepState {
 		return errors.New("offered-window/drain supports standalone native agent reads (version 1) or explicit edits with visibility probes (version 2) only")
 	}
 	if o.Duration != 20*time.Second && o.Duration != 30*time.Second {
@@ -163,8 +168,8 @@ func validatePREditDrainObservation(phase Phase, observed prDrainObservation, de
 	probes := 0
 	for _, attempt := range phase.Attempts {
 		key := prDrainCall{attempt.Agent, attempt.Step, attempt.Slot, attempt.Tool}
-		if attempt.Started.After(observed.Finished) {
-			return errors.New("edit drain attempt starts after phase completion")
+		if attempt.DurationMS < 0 || math.IsNaN(attempt.DurationMS) || math.IsInf(attempt.DurationMS, 0) || attempt.DurationMS > observed.Finished.Sub(observed.Started).Seconds()*1000+1e-3 || attempt.Started.Add(time.Duration(attempt.DurationMS*float64(time.Millisecond))).After(observed.Finished.Add(time.Microsecond)) {
+			return errors.New("edit drain attempt has invalid elapsed time or ends after phase completion")
 		}
 		switch attempt.Role {
 		case "workload":

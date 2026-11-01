@@ -17,7 +17,7 @@ func TestPREditDrainRequiresExplicitVersionTwo(t *testing.T) {
 	if _, err := parseRun(append(base, "--pr-smoke-drain-version", "2")); err != nil {
 		t.Fatalf("explicit version2 edit offer/drain refused: %v", err)
 	}
-	for _, extra := range [][]string{{"--scenario", "read"}, {"--scenario", "edit-and-probe"}, {"--scenario", "many-edit"}, {"--host", "reference"}, {"--duration", "30s"}, {"--deadline", "119s"}, {"--profile", "saturation"}, {"--worktrees", "1"}, {"--pr-smoke-drain-version", "3"}} {
+	for _, extra := range [][]string{{"--scenario", "read"}, {"--scenario", "edit-and-probe"}, {"--scenario", "many-edit"}, {"--host", "reference"}, {"--duration", "30s"}, {"--deadline", "119s"}, {"--profile", "saturation"}, {"--worktrees", "1"}, {"--pr-smoke-drain-version", "3"}, {"--pr-smoke-drain", "0"}} {
 		args := append(slices.Clone(base), "--pr-smoke-drain-version", "2")
 		if _, err := parseRun(append(args, extra...)); err == nil {
 			t.Fatalf("unsupported edit drain accepted: %v", extra)
@@ -29,6 +29,8 @@ func TestPREditWindowDrainsEditAndVisibilityWithoutOfferingReads(t *testing.T) {
 	for _, held := range []string{"edit", "visibility"} {
 		t.Run(held, func(t *testing.T) {
 			reply := make(chan struct{})
+			var release sync.Once
+			defer release.Do(func() { close(reply) })
 			socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
 				if frame.Method == "tools/call" {
 					tool, _ := frame.Params["name"].(string)
@@ -46,7 +48,7 @@ func TestPREditWindowDrainsEditAndVisibilityWithoutOfferingReads(t *testing.T) {
 			phase := Phase{}
 			o := runOptions{Profile: "saturation", Editors: 1, Duration: 30 * time.Millisecond, PRSmokeDrain: time.Second, PRSmokeDrainVersion: 2, Deadline: time.Second}
 			p := &privateRun{Repos: []privateRepo{{Corpus: editProbeCorpus(), Prefix: "sample"}}}
-			timer := time.AfterFunc(70*time.Millisecond, func() { close(reply) })
+			timer := time.AfterFunc(70*time.Millisecond, func() { release.Do(func() { close(reply) }) })
 			defer timer.Stop()
 			if err := runPRSmokeWindow(context.Background(), o, p, []*socketClient{client}, true, &phase); err != nil {
 				t.Fatalf("admitted %s tail was clipped: %v", held, err)
@@ -158,7 +160,7 @@ func TestPREditDrainChecksDistinctAdmissionsAndProbeLineage(t *testing.T) {
 	if err := validatePREditDrainObservation(phase, observed, 120); err != nil {
 		t.Fatal(err)
 	}
-	for _, mutation := range []string{"late-offer", "orphan-probe", "missing-edit", "wrong-count", "replayed-call", "missing-first-attempt", "expired-visibility"} {
+	for _, mutation := range []string{"late-offer", "orphan-probe", "missing-edit", "wrong-count", "replayed-call", "missing-first-attempt", "expired-visibility", "unfinished-attempt"} {
 		t.Run(mutation, func(t *testing.T) {
 			phase, observed := build()
 			switch mutation {
@@ -176,6 +178,8 @@ func TestPREditDrainChecksDistinctAdmissionsAndProbeLineage(t *testing.T) {
 				phase.Attempts[0].Retry = 1
 			case "expired-visibility":
 				phase.Edits[0].VisibilityMS = measured(120001, "ms")
+			case "unfinished-attempt":
+				phase.Attempts[2].DurationMS = 2000
 			}
 			if err := validatePREditDrainObservation(phase, observed, 120); err == nil {
 				t.Fatalf("%s was accepted as complete", mutation)
