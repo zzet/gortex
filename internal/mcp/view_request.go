@@ -2597,10 +2597,7 @@ func viewRiderFields(view *requestView) map[string]any {
 		fields["freshness_scope"] = view.sourceScope
 		fields["checkout_incarnation"] = view.sourceCheckoutIncarnation
 		fields["capability_scope"] = view.sourceScope
-		fields["graph_freshness"] = "unknown"
-		if view.sourceGraphPending {
-			fields["graph_freshness"] = "pending"
-		}
+		appendSourceFreshness(fields, view)
 		if len(view.sourcePendingPaths) > 0 {
 			fields["pending_file_count"] = len(view.sourcePendingPaths)
 			fields["pending_files"] = view.sourcePendingPaths[:min(16, len(view.sourcePendingPaths))]

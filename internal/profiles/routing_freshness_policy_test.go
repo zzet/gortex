@@ -38,7 +38,12 @@ func TestRoutingPolicyQualifiesTheFreshnessWait(t *testing.T) {
 	// The qualification itself: what require_fresh waits for, and what the
 	// rest of the view space gets instead.
 	for _, required := range []string{
-		"routed automatic checkouts only",
+		"watched primaries",
+		"routed automatic checkouts",
+		"ref/commit views",
+		"readback_exact:true",
+		"freshness_scope:\"relations\"",
+		"pending files are not dead",
 		"fresh:false",
 	} {
 		if !strings.Contains(policy, required) {
