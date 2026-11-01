@@ -72,7 +72,7 @@ func smokeDriverCommand(args []string, stdout, stderr io.Writer) int {
 	if err == nil {
 		builds, err = admitMicroBundle(micro, workflow)
 	}
-	c := laneConfig{Version: 1, Lane: "smoke", HostClass: hostedSmokeClass, Load: pathAbsolute(*load), Manifest: filepath.Join(output, "manifest.json"), MainArtifact: mainBundle, Builds: map[string]laneBuild{"main": {Binary: filepath.Join(mainBundle, mainArtifactBinary), Revision: metadata.Revision}, "candidate": {Binary: pathAbsolute(*candidate), Revision: workflow.Revision}}, Repeats: 3, Duration: offer.String(), Deadline: "120s", PRSmokeDrain: "120s", WarmTimeout: "5m", StopTimeout: "30s", SweepDuration: "2m", SweepRepetitions: 1, started: started}
+	c := laneConfig{Version: 1, Lane: "smoke", HostClass: hostedSmokeClass, Load: pathAbsolute(*load), Manifest: filepath.Join(output, "manifest.json"), MainArtifact: mainBundle, Builds: map[string]laneBuild{"main": {Binary: filepath.Join(mainBundle, mainArtifactBinary), Revision: metadata.Revision}, "candidate": {Binary: pathAbsolute(*candidate), Revision: workflow.Revision}}, Repeats: 3, Duration: offer.String(), Deadline: "120s", PRSmokeDrain: "120s", WarmTimeout: "13m", StopTimeout: "30s", SweepDuration: "2m", SweepRepetitions: 1, started: started}
 	if err == nil {
 		c.Machine, err = os.Hostname()
 	}

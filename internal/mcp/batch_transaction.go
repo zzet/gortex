@@ -1279,7 +1279,7 @@ func (s *Server) beginBatchGraphRefresh(observationCtx context.Context, absPath 
 			if record != nil {
 				publication = s.openOwnedPublicationRecord(observationCtx, record)
 			}
-			ticket, err := scheduler.EnqueueFileMutation(indexer.WithPublicationRecord(ctx, publication), absPath)
+			ticket, err := scheduler.EnqueueToolMutation(indexer.WithPublicationRecord(ctx, publication), absPath)
 			lap.finish()
 			if err != nil {
 				return mutationReindexOutcome{Err: err}

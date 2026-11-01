@@ -24,7 +24,7 @@ type canonicalPublicationWatcher struct {
 	results   []chan indexer.MutationResult
 }
 
-func (w *canonicalPublicationWatcher) EnqueueFileMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
+func (w *canonicalPublicationWatcher) EnqueueToolMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
 	if w.scheduleErr != nil {
 		return nil, w.scheduleErr
 	}

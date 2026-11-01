@@ -29,8 +29,8 @@ func editProbeLifecycleStep(c Corpus, pkg string, seed int64, ordinal int) (r re
 
 // Hot-file pairs share one due time on both fixed editors. The pair stream
 // is the single-editor stream, so each editor still offers that mean.
-func editProbeHotFileArrivals(seed int64, count int) ([]editProbeArrival, error) {
-	pairs, err := editProbeArrivals(seed, count/2, 1)
+func editProbeHotFileArrivals(seed int64, count int, mean time.Duration) ([]editProbeArrival, error) {
+	pairs, err := editProbeArrivals(seed, count/2, 1, mean)
 	if err != nil {
 		return nil, err
 	}
