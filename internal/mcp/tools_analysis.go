@@ -476,7 +476,9 @@ func (s *Server) tryImpactAnalysisSnapshots() (*analysis.CommunityResult, *analy
 
 // handleEnhancedChangeImpact replaces the original explain_change_impact with risk tiering
 // and cross-community warnings.
-func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToolRequest) (out *mcp.CallToolResult, outErr error) {
+	ctx, waits := withImpactCoordinationWaits(ctx)
+	defer func() { out = attachImpactCoordinationWaits(out, waits) }()
 	idsStr, err := req.RequireString("ids")
 	if err != nil {
 		return mcp.NewToolResultError("ids is required"), nil
