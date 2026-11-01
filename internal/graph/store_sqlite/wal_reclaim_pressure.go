@@ -32,14 +32,15 @@ import (
 //     the reset, nothing else. If that does not finish in time it gives up
 //     (counted as a pressure give-up) and the next attempt tries again.
 //     A proven slow completed copy with a new tail permits one adaptive
-//     completion slice for an urgent attempt; its aggregate writer time is
-//     still capped by walReclaimMaxWriterHold.
+//     completion slice for an urgent attempt only outside edit bursts;
+//     its aggregate writer time is still capped by walReclaimMaxWriterHold.
 //
 // Below the mark nothing changes.
 
 var (
 	// walReclaimPressureHold is the ordinary writer step inside a busy lane;
-	// proven urgent slow-copy tails may use one bounded adaptive slice.
+	// proven urgent slow-copy tails may use one bounded adaptive slice only
+	// outside edit bursts. Interactive ACK/read-back calls forbid admission.
 	walReclaimPressureHold = 50 * time.Millisecond
 	// walReclaimPressureWriterWait bounds how long that step queues for the
 	// writer.
@@ -147,7 +148,7 @@ func (s *Store) reclaimWALPressureResetWithDrain(ctx context.Context, ckptDB *sq
 		return err
 	}
 	if !res.pressureResetBusy {
-		if budget := res.takeAdaptiveWriterBudget(); budget > 0 {
+		if budget := res.takeAdaptiveWriterBudget(); budget > 0 && (res.burstException() || !s.editBurstActive()) && s.walReclaim.interactive.active.Load() == 0 {
 			res.reason = ""
 			err = s.reclaimWALPressureResetOnce(operationCtx, ckptDB, res, budget, false)
 		}
@@ -171,7 +172,7 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	// to about 2.4 s in a burst), then gives up. The hold itself stays
 	// walReclaimPressureHold.
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimPressureWriterWait)
-	err := s.writeMu.lockReclaim(wctx)
+	err := s.lockWALReclaimWriter(wctx, res)
 	wcancel()
 	if err != nil {
 		res.reason = "pressure_writer_busy"
@@ -180,6 +181,7 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	}
 	held := time.Now()
 	writer := newWALReclaimWriterCredit(s, held)
+	writer.result = res
 	adaptiveCopy := false
 	defer func() {
 		writer.release()
@@ -214,6 +216,8 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 	}
 	hctx, hcancel := context.WithDeadline(ctx, held.Add(budget))
 	defer hcancel()
+	hctx, stopHeldYield := s.yieldWALReclaim(hctx, res)
+	defer stopHeldYield()
 	if hook := walPressureResetHook; hook != nil {
 		hook(hctx)
 	}
@@ -247,14 +251,7 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 		return demand
 	}
 	resetCtx := writer.resetContext(hctx)
-	if preemptible {
-		// Poll only the held reset, after any passive readmission completed.
-		// The copy keeps its original timed writer credit; no watcher sees
-		// this background operation's own acquisition as a foreground waiter.
-		var stopYield func()
-		resetCtx, stopYield = s.yieldToWriters(resetCtx)
-		defer stopYield()
-	}
+
 	if preemptible {
 		res.pauseResetStarted = time.Now()
 	}
@@ -280,6 +277,9 @@ func (s *Store) reclaimWALPressureResetOnce(ctx context.Context, ckptDB *sql.DB,
 // share the configured drain allowance; the writer still gets at most its
 // existing short credit and remaining aggregate allowance.
 func (s *Store) reclaimWALPressureResetAfterReaderDrain(ctx context.Context, ckptDB *sql.DB, res *walReclaimResult, allowance time.Duration) error {
+	if err := s.reclaimYieldCause(ctx, res); err != nil {
+		return err
+	}
 	if demand := s.writeDemandCause(); demand != nil {
 		noteWALReclaimDemand(ctx, demand)
 		res.reason = "pressure_foreground_writer"
@@ -289,11 +289,11 @@ func (s *Store) reclaimWALPressureResetAfterReaderDrain(ctx context.Context, ckp
 	res.pauseResetStarted = time.Time{}
 	pauseCtx, cancel := context.WithDeadline(ctx, started.Add(allowance))
 	defer cancel()
-	yieldCtx, stopYield := s.yieldToWriters(pauseCtx)
+	yieldCtx, stopYield := s.yieldWALReclaim(pauseCtx, res)
 	var stopOnce sync.Once
 	stop := func() { stopOnce.Do(stopYield) }
 	defer stop()
-	reopen, inFlight, err := s.readGate.quiesce(yieldCtx, started.Add(allowance))
+	reopen, inFlight, err := s.readGate.quiesceReclaim(yieldCtx, started.Add(allowance), s, res)
 	if err != nil {
 		if !errors.Is(err, errReadGateBusy) {
 			res.notePauseInterval(started, time.Now(), time.Time{})

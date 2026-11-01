@@ -315,12 +315,31 @@ var errReadGateBusy = errors.New("store_sqlite: read gate already quiescing")
 // maintenance lane, so a second concurrent caller is refused rather than
 // queued.
 func (g *sqliteReadGate) quiesce(ctx context.Context, deadline time.Time) (reopen func(), inFlight int, err error) {
+	return g.quiesceReclaim(ctx, deadline, nil, nil)
+}
+
+func (g *sqliteReadGate) quiesceReclaim(ctx context.Context, deadline time.Time, store *Store, res *walReclaimResult) (reopen func(), inFlight int, err error) {
 	g.mu.Lock()
 	if g.closed.Load() {
 		g.mu.Unlock()
 		return nil, 0, errReadGateBusy
 	}
-	g.closed.Store(true)
+	if store != nil {
+		state := &store.walReclaim.interactive
+		state.mu.Lock()
+		if err := store.reclaimYieldCause(ctx, res); err != nil {
+			state.mu.Unlock()
+			g.mu.Unlock()
+			return nil, 0, errors.Join(errReadGateBusy, err)
+		}
+		g.closed.Store(true)
+		if store.editBurstActive() {
+			store.walReclaim.update(func(st *WALReclaimStats) { st.EditBurstGateClosures++ })
+		}
+		state.mu.Unlock()
+	} else {
+		g.closed.Store(true)
+	}
 	g.reopen = make(chan struct{})
 	var once sync.Once
 	reopen = func() {

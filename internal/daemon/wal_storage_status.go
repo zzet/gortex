@@ -10,14 +10,20 @@ import (
 // Both status and live index health use this conversion.
 func WALReclaimStatusFrom(st store_sqlite.WALReclaimStats) *WALReclaimStatus {
 	out := &WALReclaimStatus{
-		WriterHold:            walHistogramStatus(st.WriterHold),
-		WriterWait:            walHistogramStatus(st.WriterWait),
-		PauseDrain:            walHistogramStatus(st.PauseDrain),
-		PauseTruncate:         walHistogramStatus(st.PauseTruncate),
-		CancelledWriterParked: st.CancelledWriterParked,
-		CancelledWriteIntent:  st.CancelledWriteIntent,
-		CancelledOther:        st.CancelledOther,
-		WALPeakObserved:       st.WALPeakObserved,
+		EditBurstWriterHold:     walHistogramStatus(st.EditBurstWriterHold),
+		EditBurstGateClosures:   st.EditBurstGateClosures,
+		DeferredEditBurst:       st.DeferredEditBurst,
+		DeferredInteractiveRead: st.DeferredInteractiveRead,
+		BulkExceptionHolds:      st.BulkExceptionHolds,
+		HardCapExceptionHolds:   st.HardCapExceptionHolds,
+		WriterHold:              walHistogramStatus(st.WriterHold),
+		WriterWait:              walHistogramStatus(st.WriterWait),
+		PauseDrain:              walHistogramStatus(st.PauseDrain),
+		PauseTruncate:           walHistogramStatus(st.PauseTruncate),
+		CancelledWriterParked:   st.CancelledWriterParked,
+		CancelledWriteIntent:    st.CancelledWriteIntent,
+		CancelledOther:          st.CancelledOther,
+		WALPeakObserved:         st.WALPeakObserved,
 
 		ThresholdBytes:   st.ThresholdBytes,
 		Attempts:         st.Attempts,

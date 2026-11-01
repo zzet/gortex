@@ -12,6 +12,7 @@ import (
 // own once/channel handoff; it never reads the writer state or result counters.
 type walReclaimWriterCredit struct {
 	store          *Store
+	result         *walReclaimResult
 	held           bool
 	since          time.Time
 	longest        time.Duration
@@ -167,13 +168,17 @@ func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *
 		admissionCtx, cancel = context.WithDeadline(operationCtx, limit)
 		stopYield := func() {}
 		if w.yieldToWriters {
-			admissionCtx, stopYield = w.store.yieldToWriters(admissionCtx)
+			admissionCtx, stopYield = w.store.yieldWALReclaim(admissionCtx, w.result)
 		}
 		w.readmitted = true
 		w.resetCtx = admissionCtx
 		w.cancelReset = func() { stopYield(); cancel() }
 	}
-	if err := w.store.writeMu.lockReclaim(admissionCtx); err != nil {
+	res := w.result
+	if res == nil {
+		res = &walReclaimResult{}
+	}
+	if err := w.store.lockWALReclaimWriter(admissionCtx, res); err != nil {
 		return result, err
 	}
 	w.since, w.held = time.Now(), true

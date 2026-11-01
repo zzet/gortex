@@ -32,10 +32,14 @@ type sqliteWriteGate struct {
 	// its hold began and reclaimQueued when another writer first queued
 	// behind it (gateClock readings, zero when unset); Unlock turns them into
 	// how long the reclaim held the writer and how long writers waited for it.
-	reclaimSince  atomic.Int64
-	reclaimQueued atomic.Int64
-	reclaimHold   durationHistogram
-	reclaimWait   durationHistogram
+	reclaimSince                                 atomic.Int64
+	reclaimQueued                                atomic.Int64
+	reclaimHold                                  durationHistogram
+	reclaimBurstHold                             durationHistogram
+	reclaimBurst                                 atomic.Bool
+	reclaimBurstCheck                            atomic.Pointer[func() bool]
+	reclaimBulkExceptions, reclaimHardExceptions atomic.Int64
+	reclaimWait                                  durationHistogram
 }
 
 // gateEpoch anchors gateClock to the monotonic clock, so a wall-clock step
@@ -105,6 +109,12 @@ func (g *sqliteWriteGate) lockReclaim(ctx context.Context) error {
 	if err := g.LockContext(ctx); err != nil {
 		return err
 	}
+	g.beginReclaim(false)
+	return nil
+}
+
+func (g *sqliteWriteGate) beginReclaim(burst bool) {
+	g.reclaimBurst.Store(burst)
 	now := gateClock()
 	g.reclaimQueued.Store(0)
 	g.reclaimSince.Store(now)
@@ -113,7 +123,6 @@ func (g *sqliteWriteGate) lockReclaim(ctx context.Context) error {
 	if g.waiters.Load() > 0 {
 		g.reclaimQueued.CompareAndSwap(0, now)
 	}
-	return nil
 }
 
 func (g *sqliteWriteGate) TryLock() bool {
@@ -138,6 +147,13 @@ func (g *sqliteWriteGate) Unlock() {
 		g.reclaimSince.Store(0)
 		now := gateClock()
 		g.reclaimHold.observe(time.Duration(now - since))
+		burst := g.reclaimBurst.Swap(false)
+		if check := g.reclaimBurstCheck.Swap(nil); check != nil {
+			burst = burst || (*check)()
+		}
+		if burst {
+			g.reclaimBurstHold.observe(time.Duration(now - since))
+		}
 		if queued := g.reclaimQueued.Swap(0); queued != 0 {
 			g.reclaimWait.observe(time.Duration(now - max(since, queued)))
 		}
