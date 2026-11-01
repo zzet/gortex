@@ -89,6 +89,10 @@ type daemonState struct {
 	migratedStore bool
 }
 
+// buildDaemonStateForStart keeps the foreground startup boundary injectable for
+// owned-process migration/listener regressions. Production uses the same builder.
+var buildDaemonStateForStart = buildDaemonState
+
 // buildDaemonState builds the daemon's stack through the shared
 // serverstack constructor and returns the long-lived daemonState the
 // warmup loop and controller share.

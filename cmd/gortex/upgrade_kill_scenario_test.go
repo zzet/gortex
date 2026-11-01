@@ -34,11 +34,10 @@ import (
 //
 // The repository is tracked in the scenario's private home, and every sample
 // opens a fresh MCP session from it: it times tools/list and makes one graph
-// call. The daemon opens its socket only after the migration, so neither gets
-// an answer while it runs. The receipt measures that window instead of
-// asserting a serving gate the daemon cannot meet yet. The scenario fails only
-// on what the daemon answers once its socket is open: repo_not_tracked for the
-// tracked repository, or no graph answer before the deadline.
+// call. During a migration the same listener must answer tools/list within
+// one second and graph calls must report retryable repo_loading:migrating.
+// A step transition is retained separately from a stable migration sample.
+
 const (
 	upgradeScenarioBinaryEnv = "GORTEX_UPGRADE_SCENARIO_BINARY"
 	upgradeScenarioStoreEnv  = "GORTEX_UPGRADE_SCENARIO_STORE"
@@ -63,7 +62,9 @@ type upgradeScenarioSample struct {
 	// GraphCall is the answer to a symbol search from the tracked
 	// repository: "ok", the refusal's error_code (with its phase, if any),
 	// or no_socket.
-	GraphCall string `json:"graph_call"`
+	GraphCall       string `json:"graph_call"`
+	GraphRetryable  *bool  `json:"graph_retryable,omitempty"`
+	StableMigration bool   `json:"stable_migration"`
 }
 
 type upgradeScenarioRun struct {
@@ -92,6 +93,7 @@ type upgradeScenarioReceipt struct {
 	WallMillis                 int64              `json:"wall_ms"`
 	Interrupted                upgradeScenarioRun `json:"interrupted"`
 	Restarted                  upgradeScenarioRun `json:"restarted"`
+	StableMigratingSamples     int                `json:"stable_migrating_samples"`
 	MigratingSamples           int                `json:"migrating_samples"`
 	MigratingSamplesWithSocket int                `json:"migrating_samples_with_socket"`
 	ServingDuringMigration     bool               `json:"serving_during_migration"`
@@ -168,6 +170,12 @@ func TestUpgradeKillScenario(t *testing.T) {
 			receipt.GraphCalls[s.GraphCall]++
 			if s.Phase == string(daemon.StartupMigrating) {
 				receipt.MigratingSamples++
+				if s.StableMigration {
+					receipt.StableMigratingSamples++
+				}
+				if err := validateMigrationSocketSample(s); err != nil {
+					t.Errorf("migration sample %dms: %v", s.AtMillis, err)
+				}
 				if s.Socket == "accepting" {
 					receipt.MigratingSamplesWithSocket++
 				}
@@ -175,9 +183,10 @@ func TestUpgradeKillScenario(t *testing.T) {
 		}
 	}
 	receipt.ServingDuringMigration = receipt.MigratingSamplesWithSocket > 0
-	receipt.Note = "the daemon opens its socket only after the store migration completes, so tools/list and graph calls " +
-		"get no answer (not even a retryable repo_loading) while it runs, and those samples read no_socket; serving " +
-		"during the migration belongs to the startup readiness work and is measured here, not gated"
+	receipt.Note = "Migration-window metadata is gated at <1s with an accepting socket; stable migration steps require retryable repo_loading{phase: migrating}. Step-transition samples remain explicit and do not invent graph-phase evidence."
+	if receipt.StableMigratingSamples == 0 {
+		t.Error("AC6 has no stable migrating sample; graph-phase evidence is unavailable")
+	}
 
 	if out := os.Getenv(upgradeScenarioOutEnv); out != "" {
 		blob, err := json.MarshalIndent(receipt, "", "  ")
@@ -233,8 +242,10 @@ func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket,
 		if conn, err := net.DialTimeout("unix", socket, 200*time.Millisecond); err == nil {
 			sample.Socket = "accepting"
 			_ = conn.Close()
-			sample.ToolsListMillis, sample.ToolsList, sample.GraphCall = scenarioProbe(socket, repo)
+			sample.ToolsListMillis, sample.ToolsList, sample.GraphCall, sample.GraphRetryable = scenarioProbe(socket, repo)
 		}
+		after, afterOK := daemon.ReadRuntimeStateOf(cmd.Process.Pid)
+		sample.StableMigration = ok && afterOK && st.StartupPhase == daemon.StartupMigrating && after.StartupPhase == daemon.StartupMigrating && st.MigrationVersion == after.MigrationVersion
 		run.Samples = append(run.Samples, sample)
 		if kill && sample.Phase == string(daemon.StartupMigrating) {
 			run.BytesWritten = procBytesWritten(cmd.Process.Pid)
@@ -285,25 +296,36 @@ func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket,
 // scenarioProbe opens a fresh MCP session from repo, the way an editor's
 // proxy does: it times dial, initialize and tools/list, then makes one graph
 // call. It returns the tools/list time and outcome and the graph answer.
-func scenarioProbe(socket, repo string) (int64, string, string) {
+func scenarioProbe(socket, repo string) (int64, string, string, *bool) {
 	began := time.Now()
 	elapsed := func() int64 { return time.Since(began).Milliseconds() }
-	c, err := daemon.DialToWithDeadline(socket, daemon.Handshake{Mode: daemon.ModeMCP, CWD: repo, ClientName: "upgrade-scenario"}, began.Add(30*time.Second))
+	c, err := daemon.DialToWithDeadline(socket, daemon.Handshake{Mode: daemon.ModeMCP, CWD: repo, ClientName: "upgrade-scenario"}, began.Add(time.Second))
 	if err != nil {
-		return elapsed(), "dial: " + err.Error(), "dial: " + err.Error()
+		return elapsed(), "dial: " + err.Error(), "dial: " + err.Error(), nil
 	}
 	defer c.Close()
 	initialized, err := scenarioRequest(c, 1, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"upgrade-scenario","version":"1"}}}`)
 	if outcome := scenarioOutcome(initialized, err); outcome != "ok" {
-		return elapsed(), "initialize: " + outcome, "initialize: " + outcome
+		return elapsed(), "initialize: " + outcome, "initialize: " + outcome, nil
 	}
 	if err := c.WriteMCPFrame([]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)); err != nil {
-		return elapsed(), "initialized: " + err.Error(), "initialized: " + err.Error()
+		return elapsed(), "initialized: " + err.Error(), "initialized: " + err.Error(), nil
 	}
 	listed, err := scenarioRequest(c, 2, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
 	toolsListMillis, toolsList := elapsed(), scenarioOutcome(listed, err)
+	if err := c.Conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return toolsListMillis, toolsList, "error: " + err.Error(), nil
+	}
 	called, err := scenarioRequest(c, 3, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"operation":"symbols","query":"Open"}}}`)
-	return toolsListMillis, toolsList, scenarioOutcome(called, err)
+	var retryable *bool
+	if remote, ok := called["error"].(map[string]any); ok {
+		if data, ok := remote["data"].(map[string]any); ok {
+			if value, ok := data["retryable"].(bool); ok {
+				retryable = &value
+			}
+		}
+	}
+	return toolsListMillis, toolsList, scenarioOutcome(called, err), retryable
 }
 
 // scenarioRequest sends one request and returns the reply paired to its id,
@@ -414,4 +436,45 @@ func fileSize(path string) int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+// No fixture is opened by this predicate or its negative controls.
+func validateMigrationSocketSample(s upgradeScenarioSample) error {
+	if s.Socket != "accepting" || s.ToolsList != "ok" {
+		return fmt.Errorf("migration metadata unavailable: socket=%s tools/list=%s", s.Socket, s.ToolsList)
+	}
+	if s.ToolsListMillis >= 1000 {
+		return fmt.Errorf("tools/list took %dms; millisecond evidence must be below 1000ms", s.ToolsListMillis)
+	}
+	if s.StableMigration && (s.GraphCall != "repo_loading{phase: migrating}" || s.GraphRetryable == nil || !*s.GraphRetryable) {
+		return fmt.Errorf("stable migration graph reply is not retryable migrating: %s", s.GraphCall)
+	}
+	return nil
+}
+
+func TestUpgradeMigrationSocketSampleGate(t *testing.T) {
+	retryable := true
+	valid := upgradeScenarioSample{Socket: "accepting", ToolsList: "ok", ToolsListMillis: 2, GraphCall: "repo_loading{phase: migrating}", GraphRetryable: &retryable, StableMigration: true}
+	if err := validateMigrationSocketSample(valid); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*upgradeScenarioSample){
+		func(s *upgradeScenarioSample) { s.Socket = "none" },
+		func(s *upgradeScenarioSample) { s.ToolsList = upgradeScenarioNoSocket },
+		func(s *upgradeScenarioSample) { s.ToolsListMillis = 1000 },
+		func(s *upgradeScenarioSample) { s.GraphCall = "repo_not_tracked" },
+		func(s *upgradeScenarioSample) { s.GraphRetryable = nil },
+	} {
+		broken := valid
+		mutate(&broken)
+		if err := validateMigrationSocketSample(broken); err == nil {
+			t.Fatalf("invalid migration evidence passed: %+v", broken)
+		}
+	}
+	transition := valid
+	transition.StableMigration = false
+	transition.GraphCall = "repo_loading{phase: snapshot_loaded}"
+	if err := validateMigrationSocketSample(transition); err != nil {
+		t.Fatal("a real transition must not claim a stable migration phase", err)
+	}
 }
