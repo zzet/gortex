@@ -47,7 +47,8 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		if phase.NeverSeen > 0 {
 			phase.Errors = append(phase.Errors, fmt.Sprintf("%d acknowledged edits never visible before product deadline", phase.NeverSeen))
 		}
-		if scenario != "cold" && scenario != "restart" && len(phase.Tools) == 0 {
+		nativeWork := scenario == editProbeScenario && editProbeNativeWorkObserved(phase.EditProbe)
+		if scenario != "cold" && scenario != "restart" && scenario != "idle-stop" && len(phase.Tools) == 0 && !nativeWork {
 			phase.Errors = append(phase.Errors, "no workload calls observed before phase end")
 		}
 		if resultErr != nil {
@@ -64,7 +65,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 		selected = corpora
 	}
-	editing := scenario == "edit" || scenario == "many-edit"
+	editing := scenario == "edit" || scenario == "many-edit" || scenario == editProbeScenario
 	for _, corpus := range selected {
 		operations, planErr := readingPlan(corpus)
 		if planErr != nil {
@@ -82,11 +83,39 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			}
 		}
 	}
-	p, err := newPrivateRun(ctx, outputRoot, o.Binary, selected)
+	if scenario == editProbeScenario {
+		plan, err := planEditProbe(selected[0], o)
+		if err != nil {
+			return phase, nil, artifacts, crashes, "", err
+		}
+		phase.Operations = editProbeOperations(plan, selected[0])
+		phase.EditProbe = newEditProbeReport(plan, selected[0], !o.editProbeBaseline)
+		phase.SessionModel = plan.SessionModel
+	}
+	p := o.smokeState
+	var err error
+	if p == nil {
+		p, err = newPrivateRun(ctx, outputRoot, o.Binary, selected)
+	} else {
+		err = validateSmokeOwner(p, o.Binary, selected)
+	}
 	if err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
 	artifacts["private_root"] = p.Root
+	firstStart := p.startCount + 1
+	if o.smokeState != nil {
+		info, statErr := os.Stat(p.Store)
+		present := statErr == nil
+		if p.startCount == 0 && !errors.Is(statErr, os.ErrNotExist) || p.startCount > 0 && (statErr != nil || info.Size() == 0) {
+			return phase, nil, artifacts, crashes, "", errors.New("smoke needs one initially absent store, then the same nonempty retained store")
+		}
+		data, err := json.Marshal(map[string]any{"owned_root": p.Root, "binary": p.Binary, "starts_before_phase": p.startCount, "store_present": present})
+		if err != nil {
+			return phase, nil, artifacts, crashes, "", err
+		}
+		phase.Gate["pr_smoke_store"] = data
+	}
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), o.StopTimeout)
 		elapsed, forced, err := p.stop(stopCtx)
@@ -98,15 +127,24 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 		phase.Metrics["force_killed"] = measured(forcedValue, "boolean")
 		resultErr = errors.Join(resultErr, err)
-		logArtifacts, logCrashes, err := collectLogs(p.Root)
+		var logArtifacts map[string]string
+		var logCrashes map[string]int
+		if o.smokeState == nil {
+			logArtifacts, logCrashes, err = collectLogs(p.Root)
+		} else {
+			logArtifacts, logCrashes, err = collectRunLogs(p.Root, outputRoot, firstStart)
+		}
 		for name, path := range logArtifacts {
 			artifacts[name] = path
 		}
 		for name, count := range logCrashes {
 			crashes[name] += count
 		}
-		resultErr = errors.Join(resultErr, err, collectPatchWrites(logArtifacts, &phase), os.RemoveAll(p.SocketDir))
-		if !o.KeepState {
+		resultErr = errors.Join(resultErr, err, collectPatchWrites(logArtifacts, &phase))
+		if o.smokeState == nil {
+			resultErr = errors.Join(resultErr, os.RemoveAll(p.SocketDir))
+		}
+		if !o.KeepState && o.smokeState == nil {
 			resultErr = errors.Join(resultErr, p.removeState())
 		}
 	}()
@@ -212,6 +250,11 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 	}
 	finishStartup()
+	if len(o.smokeMarkers) > 0 {
+		if err := awaitSmokeRestoration(warmCtx, o, p, clients[0], &phase); err != nil {
+			return phase, nil, artifacts, crashes, version, err
+		}
+	}
 	if scenario == "restart" {
 		for _, client := range clients {
 			_ = client.Close()
@@ -273,9 +316,23 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		phase.Metrics["sweep_operation_sessions"] = measured(float64(len(sweepClients)), "sessions")
 	}
 	phase.Metrics["mcp_sessions"] = measured(float64(len(clients)), "sessions")
+	if scenario == editProbeScenario {
+		runtime, probers, prepareErr := prepareEditProbe(warmCtx, o, p, clients[:o.Agents], clients[o.Agents:o.Agents+o.Editors], &phase)
+		clients = append(clients, probers...)
+		if runtime != nil {
+			defer func() { resultErr = errors.Join(resultErr, runtime.close()) }()
+		}
+		if prepareErr != nil {
+			return phase, sweep, artifacts, crashes, version, prepareErr
+		}
+		phase.Metrics["mcp_sessions"] = measured(float64(len(clients)), "sessions")
+		artifacts["edit_probe_raw"] = filepath.Join(p.Root, "edit-probe")
+	}
 	captureReceipt(ctx, p, clients[0], &phase)
 	sampler := newProcessSampler()
-	if o.pairedDriver != nil {
+	if scenario == "idle-stop" {
+		err = measureIdleStop(ctx, p, clients, &phase, sampler, group)
+	} else if o.pairedDriver != nil {
 		err = o.pairedDriver(ctx, p, clients, sweepClients, &phase)
 	} else {
 		err = measureStandalone(ctx, o, p, clients, sweepClients, sweepRequests, sweep, &phase, artifacts, sampler, group)
@@ -283,10 +340,21 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	if err != nil {
 		resultErr = errors.Join(resultErr, err)
 	}
+	if phase.editProbeRuntime != nil {
+		if ctx.Err() != nil {
+			resultErr = errors.Join(resultErr, errors.New("restore batch unavailable after canceled workload"))
+		} else {
+			restoreCtx, cancel := context.WithTimeout(ctx, o.Deadline)
+			resultErr = errors.Join(resultErr, phase.editProbeRuntime.restore(restoreCtx))
+			cancel()
+		}
+	}
 	if scenario == "sweep" {
 		finalizeSweepInventory(sweep, phase.Attempts, o.SweepRepetitions, &phase)
 	}
-	captureReceipt(ctx, p, clients[0], &phase)
+	if scenario != "idle-stop" {
+		captureReceipt(ctx, p, editProbeReceiptClient(&phase, clients), &phase)
+	}
 	for i, client := range clients {
 		client.mu.Lock()
 		data, marshalErr := json.Marshal(struct {
@@ -324,7 +392,9 @@ func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients
 		}
 	}
 	var err error
-	if phase.Name == "sweep" {
+	if phase.Name == editProbeScenario {
+		err = phase.editProbeRuntime.run(ctx)
+	} else if phase.Name == "sweep" {
 		sweepCtx, cancelSweep := context.WithTimeout(ctx, o.SweepBudget)
 		defer cancelSweep()
 		err = runSweep(sweepCtx, o, sweepClients, p.Repos[0], sweepRequests, sweep, phase, waitContext)
@@ -341,7 +411,7 @@ func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients
 
 func dispatchArgs(r request, repo privateRepo) map[string]any {
 	args := copyJSON(r.Arguments)
-	args["output"] = map[string]any{"format": "json", "max_bytes": 0}
+	args["output"] = editProbeDispatchOutput(r)
 	if target, ok := args["target"].(map[string]any); ok {
 		for _, key := range []string{"file", "symbol"} {
 			if value, ok := target[key].(string); ok {
@@ -356,6 +426,23 @@ func dispatchArgs(r request, repo privateRepo) map[string]any {
 			}
 		}
 	}
+	if r.name() == "refactor.move" {
+		if destination, ok := args["destination"].(string); ok {
+			args["destination"] = repo.Prefix + "/" + destination
+		}
+	}
+	if r.name() == "edit.batch" {
+		if changes, ok := args["changes"].([]any); ok {
+			for _, item := range changes {
+				if change, ok := item.(map[string]any); ok && change["op"] == "edit_file" {
+					if path, ok := change["path"].(string); ok {
+						change["path"] = repo.Prefix + "/" + path
+					}
+				}
+			}
+		}
+	}
+
 	if r.name() == "change.verify" {
 		if source, ok := args["source"].(map[string]any); ok {
 			if changes, ok := source["changes"].([]any); ok {
@@ -373,6 +460,12 @@ func dispatchArgs(r request, repo privateRepo) map[string]any {
 }
 
 func runAgents(parent context.Context, o runOptions, p *privateRun, clients []*socketClient, editing bool, phase *Phase) error {
+	if o.PRSmokeDrain > 0 {
+		if editing {
+			return errors.New("offered-window/drain for edit/probe work is unsupported")
+		}
+		return runPRSmokeReads(parent, o, p, clients, phase)
+	}
 	ctx, cancel := context.WithTimeout(parent, o.Duration)
 	defer cancel()
 	var mu sync.Mutex

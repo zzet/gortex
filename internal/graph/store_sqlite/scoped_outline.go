@@ -221,6 +221,7 @@ func outlineRows(ctx context.Context, tx outlineQueryer, query outlineQuery) (*s
 		unhinted := strings.NewReplacer(
 			" INDEXED BY nodes_by_repo", "",
 			" INDEXED BY nodes_by_kind", "",
+			" INDEXED BY nodes_by_generation", "",
 			" INDEXED BY nodes_by_effective_workspace", "",
 			" INDEXED BY nodes_deadcode_eligible_workspace", "",
 			" INDEXED BY nodes_by_name", "",

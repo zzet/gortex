@@ -1,0 +1,187 @@
+package mcp
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/search"
+)
+
+func TestBatchActualReaderCapturedBeforeFinalVerdictCompletesAfterAdmission(t *testing.T) {
+	testBatchReaderAcrossAdmission(t, false)
+}
+func TestBatchActualReaderCompletingBeforeAdmissionRemainsUnavailable(t *testing.T) {
+	testBatchReaderAcrossAdmission(t, true)
+}
+func testBatchReaderAcrossAdmission(t *testing.T, finishBeforeAdmission bool) {
+	root := setupMiniRepo(t, "batch-reader-admission")
+	path := filepath.Join(root, "main.go")
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	after := string(before) + "\nfunc AddedByBatchReader() { Hello() }\n"
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: root, Name: "fixture"}}}
+	gc.SetConfigPath(filepath.Join(t.TempDir(), "config.yaml"))
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(gc.ConfigPath())
+	require.NoError(t, err)
+	entered, resume := make(chan struct{}), make(chan struct{})
+	var armed atomic.Bool
+	var enterOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(resume) }) }
+	core, _ := observer.New(zap.InfoLevel)
+	logger := zap.New(core, zap.Hooks(func(entry zapcore.Entry) error {
+		if armed.Load() && entry.Message == "indexer: reconcile phase started" {
+			enterOnce.Do(func() { close(entered) })
+			<-resume
+		}
+		return nil
+	}))
+	g := graph.New()
+	mi := indexer.NewMultiIndexer(g, testRegistry(), search.NewNull(), cm, logger)
+	t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+	idx := mi.GetIndexer("fixture")
+	require.NotNil(t, idx)
+	watcher := &canonicalPublicationWatcher{hold: true}
+	s := newAtomicBatchTestServer(t, watcher)
+	s.mutationReindexWait = time.Nanosecond
+	type execution struct {
+		observation indexer.ReadRepairObservation
+		err         error
+	}
+	done := make(chan execution, 1)
+	var actual execution
+	started, joined := false, false
+	t.Cleanup(func() {
+		release()
+		if started && !joined {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Error("batch reader was not joined")
+			}
+		}
+		for _, ch := range watcher.results {
+			close(ch)
+		}
+	})
+	transaction := "batch-reader-before-admission"
+	captured := false
+	var captureErr error
+	failCapture := func(message string) error { captureErr = errors.New(message); return captureErr }
+	var record *mutationCommitRecord
+	s.batchDurabilityOverride = &batchDurabilityOps{syncDirectory: func(dir string) error {
+		if filepath.Clean(dir) != filepath.Clean(root) || captured {
+			return syncBatchDirectory(dir)
+		}
+		captured = true
+		value, ok := s.batchTransactions.Load(transaction)
+		if !ok {
+			return failCapture("missing original transaction during target durability")
+		}
+		refs := s.batchFileObservationReferences(value.(*batchTransactionState).snapshot())
+		if len(refs) != 1 {
+			return failCapture("missing exact file observation during target durability")
+		}
+		s.mutationCommits.mu.Lock()
+		record = s.mutationCommits.byID[refs[0].Receipt]
+		s.mutationCommits.mu.Unlock()
+
+		if record == nil {
+			return failCapture("missing retained batch file record")
+		}
+		record.mu.RLock()
+		writerKnown := record.disk == mutationDiskInFlight && record.newSHA == gitBlobSHA([]byte(after)) && !record.committedAt.IsZero() && record.publication == nil
+		record.mu.RUnlock()
+		if !writerKnown {
+			return failCapture("fixture did not reach actual writer-return-known pre-verdict/pre-admission boundary")
+		}
+		observed := s.readRepairObserver(t.Context(), path, idx)
+		if observed == nil {
+			return failCapture("reader cannot capture the same writer-return-known record before final batch verdict/admission")
+		}
+
+		armed.Store(true)
+		started = true
+		go func() {
+			var observation indexer.ReadRepairObservation
+			_, repairErr := mi.IncrementalReindexRepoObserved("fixture", []string{path}, &indexer.ReadRepairObserver{Complete: func(o indexer.ReadRepairObservation) { observation = o; observed.Complete(o) }})
+			done <- execution{observation, repairErr}
+		}()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			return failCapture("actual reader did not start before batch verdict")
+		}
+		if finishBeforeAdmission {
+			release()
+			select {
+			case actual = <-done:
+				joined = true
+			case <-time.After(5 * time.Second):
+				return failCapture("early actual reader did not join")
+			}
+			if actual.err != nil || !actual.observation.AcceptedFor(idx, gitBlobSHA([]byte(after))) {
+				return failCapture("early executor did not really apply offered bytes")
+			}
+		}
+		return syncBatchDirectory(dir)
+	}}
+	req := editOperationRequest("batch_edit", "")
+	req.Params.Arguments = map[string]any{"transaction_id": transaction, "edits": []any{map[string]any{"op": "edit_file", "path": path, "old_string": string(before), "new_string": after}}}
+	result, err := s.boundToolHandler(s.handleAtomicBatchEdit)(t.Context(), req)
+	require.NoError(t, err)
+	require.NoError(t, captureErr)
+	require.False(t, result.IsError, "%v", result.Content)
+	require.True(t, captured)
+	record.mu.RLock()
+	disk, publication, admission := record.disk, record.publication, record.readRepairAdmission.Value()
+	writerReturned := record.committedAt
+	ticket, generation := record.reindexReceipt, record.reindexGeneration
+	earlyRetained := record.readRepair
+	record.mu.RUnlock()
+	require.Equal(t, mutationDiskCommitted, disk)
+	require.NotNil(t, publication)
+	require.NotNil(t, admission)
+	if finishBeforeAdmission {
+		require.Nil(t, earlyRetained, "actual callback before final verdict/admission cannot be retroactively borrowed")
+		require.True(t, actual.observation.AcceptedFor(idx, gitBlobSHA([]byte(after))))
+		runtime.KeepAlive(idx)
+		return
+	}
+	release()
+	select {
+	case actual = <-done:
+		joined = true
+	case <-time.After(5 * time.Second):
+		t.Fatal("actual reader did not finish after admission")
+	}
+	require.NoError(t, actual.err)
+	require.True(t, actual.observation.AcceptedFor(idx, gitBlobSHA([]byte(after))), "actual executor must apply the offered after-image")
+	require.False(t, actual.observation.AcceptedAt().Before(writerReturned))
+	require.NotEmpty(t, g.FindNodesByName("AddedByBatchReader"))
+	record.mu.RLock()
+	retained := record.readRepair
+	record.mu.RUnlock()
+	require.NotNil(t, retained, "successful final verdict and actual admission must validate the earlier exact candidate")
+	require.Equal(t, ticket, retained.requestedReceipt)
+	require.Equal(t, generation, retained.requestedGeneration)
+	require.Equal(t, gitBlobSHA([]byte(after)), retained.acceptedBlobSHA)
+	runtime.KeepAlive(idx)
+}

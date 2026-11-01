@@ -17,11 +17,26 @@ import (
 const maxWireBytes = 64 << 20
 
 type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code      int            `json:"code"`
+	Message   string         `json:"message"`
+	Data      map[string]any `json:"data,omitempty"`
+	Retriable bool           `json:"-"` // typed tool-result refusal, not a JSON-RPC top-level field
 }
 
 func (e *rpcError) Error() string { return fmt.Sprintf("RPC %d: %s", e.Code, e.Message) }
+
+func (e *rpcError) retryEditProbe() bool {
+	if unknown, _ := e.Data["delivery_unknown"].(bool); unknown {
+		return false
+	}
+	// These are actual front-door shapes: dispatcher -32002 in
+	// mcp_request_lifetime.go, and repo_loading data in
+	// cmd/gortex/daemon_mcp_repo_loading.go. Unknowns stay terminal.
+	if e.Code == -32002 {
+		return true
+	}
+	return e.Retriable || e.Code == -32000 && e.Data["error_code"] == "repo_loading" && e.Data["retryable"] == true
+}
 
 type wireReply struct {
 	ID     json.Number     `json:"id"`
@@ -49,6 +64,14 @@ type socketClient struct {
 	notifies      []notificationObservation
 	notifyDropped int
 	version       string
+}
+
+// Per-call values returned to its caller, never a shared last-ID cache. Times
+// retain monotonic readings until the scenario renders relative nanoseconds.
+type wireCallIdentity struct {
+	ID                                                             int64
+	onWriteStart                                                   func(time.Time)
+	Started, WriteStarted, WriteFinished, ReplyDelivered, Finished time.Time
 }
 
 func readWireLine(reader *bufio.Reader) ([]byte, error) {
@@ -190,6 +213,10 @@ func (c *socketClient) Close() error {
 }
 
 func (c *socketClient) send(ctx context.Context, value any, advisory bool) error {
+	return c.sendObserved(ctx, value, advisory, nil)
+}
+
+func (c *socketClient) sendObserved(ctx context.Context, value any, advisory bool, observation *wireCallIdentity) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -227,7 +254,16 @@ func (c *socketClient) send(ctx context.Context, value any, advisory bool) error
 		_ = c.conn.Close()
 		close(interrupted)
 	})
+	if observation != nil {
+		observation.WriteStarted = time.Now()
+		if observation.onWriteStart != nil {
+			observation.onWriteStart(observation.WriteStarted)
+		}
+	}
 	_, err = io.Copy(c.conn, bytes.NewReader(append(data, '\n')))
+	if observation != nil {
+		observation.WriteFinished = time.Now()
+	}
 	if !stop() {
 		<-interrupted
 	}
@@ -242,6 +278,26 @@ func (c *socketClient) send(ctx context.Context, value any, advisory bool) error
 }
 
 func (c *socketClient) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	return c.callObserved(ctx, method, params, nil)
+}
+
+func (c *socketClient) callWithIdentity(ctx context.Context, method string, params any) (json.RawMessage, wireCallIdentity, error) {
+	return c.callWithWriteObserver(ctx, method, params, nil)
+}
+
+func (c *socketClient) callWithWriteObserver(ctx context.Context, method string, params any, onWriteStart func(time.Time)) (json.RawMessage, wireCallIdentity, error) {
+	var observation wireCallIdentity
+	observation.onWriteStart = onWriteStart
+	data, err := c.callObserved(ctx, method, params, &observation)
+	observation.onWriteStart = nil
+	return data, observation, err
+}
+
+func (c *socketClient) callObserved(ctx context.Context, method string, params any, observation *wireCallIdentity) (json.RawMessage, error) {
+	if observation != nil {
+		observation.Started = time.Now()
+		defer func() { observation.Finished = time.Now() }()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -253,6 +309,9 @@ func (c *socketClient) call(ctx context.Context, method string, params any) (jso
 	}
 	c.next++
 	id := c.next
+	if observation != nil {
+		observation.ID = id
+	}
 	ch := make(chan wireReply, 1)
 	c.pending[id] = ch
 	c.mu.Unlock()
@@ -261,7 +320,7 @@ func (c *socketClient) call(ctx context.Context, method string, params any) (jso
 		delete(c.pending, id)
 		c.mu.Unlock()
 	}()
-	if err := c.send(ctx, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}, false); err != nil {
+	if err := c.sendObserved(ctx, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}, false, observation); err != nil {
 		return nil, err
 	}
 	select {
@@ -273,6 +332,9 @@ func (c *socketClient) call(ctx context.Context, method string, params any) (jso
 		cancel()
 		return nil, ctx.Err()
 	case reply := <-ch:
+		if observation != nil {
+			observation.ReplyDelivered = time.Now()
+		}
 		if ctx.Err() != nil {
 			return reply.Result, ctx.Err()
 		}
