@@ -18,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // The commit ledger exists because a tool call has two independent terminal
@@ -168,6 +169,7 @@ type mutationCommitRecord struct {
 	batchOwner       [32]byte
 	batchAfterSHA256 [32]byte
 	moveFile         *moveFileObservation
+	moveTimingOwner  weak.Pointer[mutationCommitRecord]
 
 	// response is the successful tool payload, retained only for records that
 	// carry a caller-chosen mutation_id. Without a key there is nothing to
@@ -731,6 +733,7 @@ const (
 	batchForwardRemove
 	batchRestoreWrite
 	batchRestoreRemove
+	sourceRemove
 )
 
 // A durable batch already owns its complete prepared path set and terminal
@@ -752,7 +755,8 @@ func (s *Server) commitFileMutation(
 	perm os.FileMode,
 	operations ...sourceMutationOperation,
 ) (*mutationCommitRecord, error) {
-	if len(operations) != 0 {
+	remove := len(operations) == 1 && operations[0].kind == sourceRemove
+	if len(operations) != 0 && !remove {
 		// Branch before beginMutationCommit: it registers ordinary source
 		// authority even before markCommitted. The durable transaction is the
 		// sole authority for forward effects and restoration alike.
@@ -813,9 +817,11 @@ func (s *Server) commitFileMutation(
 	// writes from graph positions — present or future — funnels here.
 	// Splicing UTF-8 into NUL-interleaved bytes corrupts the file; the
 	// refusal names the encoding and the re-encode escape hatch.
-	if err := guardUTF16SourceWrite(tool, relPath, absPath); err != nil {
-		record.markNotApplied(err)
-		return record, err
+	if !remove {
+		if err := guardUTF16SourceWrite(tool, relPath, absPath); err != nil {
+			record.markNotApplied(err)
+			return record, err
+		}
 	}
 	if err := prepareCheckoutMutation(ctx, absPath); err != nil {
 		record.markNotApplied(err)
@@ -840,18 +846,34 @@ func (s *Server) commitFileMutation(
 	record.mu.Unlock()
 	indexer.StampPublicationPhase(ctx, indexer.PublicationDiskWriteStarted)
 	diskLap := s.beginAcknowledgementLap(ctx, editAckDiskWrite)
-	writeErr := agents.AtomicWriteFile(absPath, data, perm)
+	var writeErr error
+	if remove {
+		writeErr = platform.RemoveFile(absPath)
+		if errors.Is(writeErr, os.ErrNotExist) {
+			writeErr = nil
+		}
+	} else {
+		writeErr = agents.AtomicWriteFile(absPath, data, perm)
+	}
 	diskLap.finish() // actual call end, before committed-hash/receipt bookkeeping
 	if err := writeErr; err != nil {
 		record.markFailed(err)
 		return record, err
 	}
 	if state := checkoutMutationFromContext(ctx); state != nil {
-		sum := sha256.Sum256(data)
-		state.committedHash = hex.EncodeToString(sum[:])
+		if remove {
+			state.committedHash = ""
+		} else {
+			sum := sha256.Sum256(data)
+			state.committedHash = hex.EncodeToString(sum[:])
+		}
 		state.committedPath = absPath
 	}
-	record.markCommitted(gitBlobSHA(data), len(data))
+	if remove {
+		record.markCommitted("", 0)
+	} else {
+		record.markCommitted(gitBlobSHA(data), len(data))
+	}
 	return record, nil
 }
 

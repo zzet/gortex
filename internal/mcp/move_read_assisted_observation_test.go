@@ -52,7 +52,7 @@ func TestMoveReadAssistedRejectsNewerPublicationOwners(t *testing.T) {
 			// owner has the actual later commit order for each supported owner kind.
 			bytes, err := os.ReadFile(target)
 			require.NoError(t, err)
-			require.NoError(t, writeMoveFileObserved(nil, target, bytes))
+			require.NoError(t, writeMoveFileForTest(t, s, nil, target, bytes))
 			foreign := &mutationCommitRecord{kind: kind, owner: s, id: "foreign-newer", absPath: target, disk: mutationDiskCommitted, newSHA: gitBlobSHA(bytes), committedAt: time.Now(), commitSeq: mutationDiskCommitSequence.Add(1)}
 			s.mutationCommits.put(foreign)
 			actual := captureMoveActualExecution(t, s, target, observer)

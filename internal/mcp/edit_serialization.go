@@ -1,9 +1,11 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -878,4 +880,38 @@ func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath s
 			resp["syntax_health"] = health
 		}
 	}
+}
+
+// plannedSource retains the bytes used to calculate a multi-file rewrite.
+// Admission verifies the complete set before the first physical effect.
+type plannedSource struct {
+	path    string
+	before  []byte
+	existed bool
+}
+
+func lockPlannedSources(ctx context.Context, plans []plannedSource) (context.Context, func(), error) {
+	paths := make([]string, 0, len(plans))
+	for _, plan := range plans {
+		paths = append(paths, plan.path)
+	}
+	ctx, release, err := acquireMutationPaths(ctx, paths)
+	if err != nil {
+		return ctx, nil, err
+	}
+	for _, plan := range plans {
+		current, readErr := os.ReadFile(plan.path)
+		if !plan.existed && errors.Is(readErr, os.ErrNotExist) {
+			continue
+		}
+		if readErr != nil || !plan.existed || !bytes.Equal(current, plan.before) {
+			release()
+			return ctx, nil, fmt.Errorf("%w: planned source changed before admission: %s", errMutationNotApplied, plan.path)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		release()
+		return ctx, nil, err
+	}
+	return ctx, release, nil
 }
