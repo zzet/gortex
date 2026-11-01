@@ -12,6 +12,7 @@ import (
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // TestTrackRepositoryDetachesFirstIndexFromRequestLifetime pins #326.
@@ -137,18 +138,18 @@ func TestTrackRepositoryPrefixCollisionNamesMCPParameter(t *testing.T) {
 	require.NotNil(t, res)
 	text := extractTextFromContent(t, res.Content)
 	require.True(t, res.IsError, "expected prefix collision, got: %s", text)
-	require.Contains(t, text, "name parameter")
-	require.NotContains(t, text, "gortex track --name")
-	require.Contains(t, text, first)
-	// The buffered result can arrive before the producer's deferred cleanup.
-	// Wait for this exact failed track worker to retire before changing the
-	// owner fixture and exercising a fresh missing-owner collision request.
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(text), &payload))
+	require.Contains(t, payload["message"], "name parameter")
+	require.NotContains(t, payload["message"], "gortex track --name")
+	require.Equal(t, "prefix_collision", payload["error_code"])
+	require.Equal(t, first, payload["owner_path"], "compare decoded paths, including Windows JSON escapes")
+	// Preflight rejects the collision before a track job exists, so there is
+	// no worker to retire before the missing-owner retry below.
 	absSecond, err := filepath.Abs(second)
 	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		_, busy := srv.trackInFlight.Load(absSecond)
-		return !busy
-	}, 5*time.Second, time.Millisecond, "first collision worker must retire before retry")
+	_, stored := srv.trackInFlight.Load(trackRequestKey(pathkey.NormalizeVolume(absSecond), config.RepoEntry{Path: second}))
+	require.False(t, stored, "a preflight collision must not store a track job")
 	require.NoError(t, os.RemoveAll(first))
 	res, err = srv.handleTrackRepository(t.Context(), req)
 	require.NoError(t, err)

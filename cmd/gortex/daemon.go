@@ -656,7 +656,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		state.lifecycle.EnableDeferredSeedRetirements()
 	}
 
-	if err := srv.Listen(); err != nil {
+	if err := listenConfiguredDaemon(srv, state); err != nil {
 		startupReporter.Fail(err)
 		return err
 	}

@@ -251,8 +251,7 @@ func consumer() int { return uniqueDecl() + uniqueDecl() }
 	reg.Register(languages.NewGoExtractor())
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 	require.True(t, mi.IsMultiRepo())
 
 	eng := query.NewEngine(g)

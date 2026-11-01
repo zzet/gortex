@@ -31,6 +31,17 @@ func fixtureDaemon(mode string) int {
 		fmt.Fprintln(os.Stderr, "panic: synthetic daemon crash")
 		return 2
 	}
+	// The startup probe runs the CLI and the hook through the same binary;
+	// answer them as against a ready daemon instead of starting another one.
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "call":
+			fmt.Println(`{"results":[]}`)
+			return 0
+		case "hook":
+			return 0
+		}
+	}
 	data, err := os.ReadFile(filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "gortex", "config.yaml"))
 	if err != nil {
 		return 3
@@ -77,6 +88,11 @@ func fixtureDaemon(mode string) int {
 	// daemon_health reports how many there are as its coordinator count.
 	var viewsMu sync.Mutex
 	views := make(map[string]bool)
+	// Configured roots already own their primary coordinators. Linked views
+	// join the same census when a control search first names the checkout.
+	for _, repo := range config.Repos {
+		views[filepath.Clean(repo.Path)] = true
+	}
 	coordinators := func() int {
 		viewsMu.Lock()
 		defer viewsMu.Unlock()
@@ -129,7 +145,7 @@ func fixtureDaemon(mode string) int {
 					case "search_symbols":
 						if path, _ := frame.Params["path"].(string); path != "" {
 							viewsMu.Lock()
-							views[path] = true
+							views[filepath.Clean(path)] = true
 							viewsMu.Unlock()
 						}
 						result = map[string]any{"view": map[string]any{"kind": "worktree", "exact": true, "repo_prefix": config.Repos[0].Name}}

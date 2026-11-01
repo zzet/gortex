@@ -96,6 +96,7 @@ const (
 	ErrUnsupportedMode  = "unsupported_mode"
 	ErrRepoNotTracked   = "repo_not_tracked"
 	ErrPrefixCollision  = "prefix_collision"
+	ErrRepoLoading      = "repo_loading"
 	ErrInternal         = "internal"
 	// ErrTimeout means the daemon accepted the control request but did not
 	// finish it inside the kind's budget — almost always because a
@@ -118,6 +119,7 @@ type ControlResponse struct {
 	OK        bool            `json:"ok"`
 	ErrorCode string          `json:"error_code,omitempty"`
 	ErrorMsg  string          `json:"error_msg,omitempty"`
+	Retryable bool            `json:"retryable,omitempty"`
 	Result    json.RawMessage `json:"result,omitempty"`
 	// Warnings report cleanup errors after shutdown was accepted. OK does not
 	// certify store-close success or process exit; callers still wait for exit.
@@ -316,6 +318,9 @@ type ProbeRepo struct {
 	State string `json:"state,omitempty"`
 	// StateReason explains a failed or missing repo.
 	StateReason string `json:"state_reason,omitempty"`
+	ErrorCode   string `json:"error_code,omitempty"`
+	OwnerPath   string `json:"owner_path,omitempty"`
+	OwnerState  string `json:"owner_state,omitempty"`
 }
 
 // Per-repo states a probe or coverage reply reports.
@@ -323,12 +328,18 @@ const (
 	// RepoStateLoading: configured, and the daemon has not registered it
 	// since it started. Graph calls answer repo_loading until it is ready.
 	RepoStateLoading = "loading"
+	// RepoStateIdentityPending means configured identities are unresolved; it
+	// does not claim that the requested path belongs to a repository.
+	RepoStateIdentityPending = "identity_pending"
 	// RepoStateReady: registered; graph calls answer.
 	RepoStateReady = "ready"
 	// RepoStateFailed: its load ended without registering it.
 	RepoStateFailed = "failed"
 	// RepoStateMissing: the configured path does not exist.
 	RepoStateMissing = "missing"
+	// RepoStatePrefixCollision is a configured root whose prefix belongs to
+	// another root. It cannot gain admission by waiting for warmup.
+	RepoStatePrefixCollision = "prefix_collision"
 )
 
 // StatusResponse is the payload returned under Result on a successful
@@ -1047,6 +1058,8 @@ type FileCoverageResult struct {
 	// Graph calls for such a repo answer repo_loading, so a coverage verdict
 	// read from its persisted rows must not turn into a deny of the native
 	// tool: the agent would have no read path at all. Repo names it.
+	// RepoStateIdentityPending instead reports unresolved configured identities
+	// without asserting ownership of Path; Repo is empty and no graph is read.
 	RepoState string `json:"repo_state,omitempty"`
 	Repo      string `json:"repo,omitempty"`
 	// MutationState is read_only while the current checkout's exact route has
@@ -1272,7 +1285,10 @@ type TrackedRepoStatus struct {
 	// Loading is true when the repo is configured and its path exists, but
 	// the daemon has not finished warmup, so its index is not loaded yet.
 	// Unloaded remains true so older clients keep their existing behaviour.
-	Loading bool `json:"loading,omitempty"`
+	Loading    bool   `json:"loading,omitempty"`
+	ErrorCode  string `json:"error_code,omitempty"`
+	OwnerPath  string `json:"owner_path,omitempty"`
+	OwnerState string `json:"owner_state,omitempty"`
 	// File indexing health includes unresolved failures and ledger read errors.
 	IndexHealthError string `json:"index_health_error,omitempty"`
 	FailedFiles      int    `json:"failed_files,omitempty"`

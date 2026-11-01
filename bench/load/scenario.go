@@ -14,6 +14,9 @@ import (
 )
 
 func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corpus, group, outputRoot string) (phase Phase, sweep []SweepEntry, artifacts map[string]string, crashes map[string]int, version string, resultErr error) {
+	if scenario == startupScenario {
+		return runStartupPhase(ctx, o, corpora, outputRoot)
+	}
 	phase = Phase{Name: scenario, SessionModel: "per_agent", Started: time.Now().UTC(), Gate: make(map[string]json.RawMessage), Metrics: make(map[string]Metric), EditLatency: distribution(nil, "ms"), Visibility: distribution(nil, "ms")}
 	artifacts, crashes = make(map[string]string), make(map[string]int)
 	var scenarioGroupStart map[string]Metric

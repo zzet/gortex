@@ -54,8 +54,7 @@ func testBatchReaderAcrossAdmission(t *testing.T, finishBeforeAdmission bool) {
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, testRegistry(), search.NewNull(), cm, logger)
 	t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 	idx := mi.GetIndexer("fixture")
 	require.NotNil(t, idx)
 	watcher := &canonicalPublicationWatcher{hold: true}

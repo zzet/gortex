@@ -140,7 +140,11 @@ func extractToolResult(resp []byte) (json.RawMessage, error) {
 			if repo == "" {
 				repo = data.RepoPath
 			}
-			return nil, &repoLoadingError{repo: repo, phase: data.Phase, percent: data.Percent}
+			admissionReason := ""
+			if data.Reason == "identity_pending" || data.Reason == "scope_binding_pending" {
+				admissionReason = data.Reason
+			}
+			return nil, &repoLoadingError{repo: repo, phase: data.Phase, percent: data.Percent, admissionReason: admissionReason}
 		case string(gortexmcp.ErrCodeRepoUnavailable):
 			return nil, fmt.Errorf("the gortex daemon could not load %s after its restart (%s). %s",
 				data.RepoPath, data.Reason, data.Suggestion)

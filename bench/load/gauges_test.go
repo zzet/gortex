@@ -266,8 +266,11 @@ func TestMemoryGaugesRecordSeriesAndHeapProfiles(t *testing.T) {
 			}
 			seen[health.Coordinators] = true
 		}
-		if !seen[0] || !seen[2] {
-			t.Fatalf("series did not follow the steps: coordinators seen %v", seen)
+		// The configured primary remains live while linked coordinators grow.
+		firstTotal := 1 + options.WorktreeSteps[0]
+		lastTotal := 1 + options.WorktreeSteps[len(options.WorktreeSteps)-1]
+		if !seen[firstTotal] || !seen[lastTotal] {
+			t.Fatalf("series did not follow primary+linked coordinators: want %d→%d, seen %v", firstTotal, lastTotal, seen)
 		}
 	})
 }
