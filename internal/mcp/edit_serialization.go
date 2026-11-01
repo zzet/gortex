@@ -253,6 +253,16 @@ func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo,
 		checkoutID:          checkoutID,
 		checkoutIncarnation: incarnation,
 	}
+	// Canonical admission already bound this record before waking the watcher.
+	// Keep only this existing consumer's local hold until Done reports; do not
+	// add completed timing history to the TTL receipt map.
+	publication := ticket.PublicationRecord
+	if checkoutID != "" {
+		publication = nil // checkout publication retains its existing lifecycle
+	}
+	if publication != nil {
+		indexer.DefaultPublicationPhases().Rekey(publication.Key(), receipt.id)
+	}
 	s.mutationReceipts.Store(receipt.id, receipt)
 	go func() {
 		result, ok := <-ticket.Done
@@ -266,6 +276,7 @@ func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo,
 		receipt.result = result
 		receipt.completed = true
 		receipt.mu.Unlock()
+		completeCanonicalPublication(publication, result)
 		if result.Err == nil && result.Reindexed && !receipt.checkoutScoped {
 			s.resolveSupersededFailedReceipts(receipt.path, receipt.generation, result)
 		}
@@ -548,18 +559,24 @@ func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutat
 			// admitted work and let the receipt hold the pin until the ticket
 			// reports. Nil whenever no generation stack answered this request.
 			pin := handoffRequestView(ctx, viewmetrics.HandoffFileMutation)
-			ticket, scheduleErr := scheduler.EnqueueFileMutation(context.WithoutCancel(ctx), absPath)
+			publication := s.committedPublicationRecord(ctx, absPath)
+			admissionLap := s.beginAcknowledgementLap(ctx, editAckTicketAdmission)
+			ticket, scheduleErr := scheduler.EnqueueFileMutation(indexer.WithPublicationRecord(context.WithoutCancel(ctx), publication), absPath)
+			admissionLap.finish()
 			if scheduleErr != nil {
+				failMutationPhases(publication)
 				pin.release()
 				return mutationReindexOutcome{Err: scheduleErr}
 			}
 			if ticket == nil {
+				failMutationPhases(publication)
 				// Admission declined to schedule anything, so nothing outlives
 				// this frame and the fall-through below reindexes inline.
 				pin.release()
 			}
 			if ticket != nil {
 				receipt := s.trackMutationTicket(ticket)
+				s.bindReadRepairAdmission(absPath, ticket.PublicationRecord, receipt)
 				receipt.pinView(pin)
 				// The disk write and ticket admission are complete. This wait
 				// must not announce another ordinary writer while the watcher
@@ -571,14 +588,18 @@ func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutat
 				s.releaseDispatchSlotForWait(ctx)
 				timer := time.NewTimer(s.mutationWaitDuration())
 				defer timer.Stop()
+				waitLap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
 				select {
 				case <-receipt.done:
+					waitLap.finish()
 					outcome := receipt.outcome(false)
 					outcome.Receipt = ""
 					return outcome
 				case <-timer.C:
+					waitLap.finish()
 					return receipt.outcome(true)
 				case <-ctx.Done():
+					waitLap.finish()
 					return receipt.outcome(true)
 				}
 			}

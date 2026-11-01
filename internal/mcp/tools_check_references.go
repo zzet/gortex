@@ -56,6 +56,12 @@ type checkRefsSameName struct {
 }
 
 func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	symbolID := strings.TrimSpace(req.GetString("symbol_id", ""))
 	name := strings.TrimSpace(req.GetString("name", ""))
 	if symbolID == "" && name == "" {
@@ -156,10 +162,12 @@ func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequ
 		if target != nil {
 			excludePath = target.FilePath
 		}
-		for _, n := range s.scopedNodesLight(ctx) {
-			if n.Name != name {
-				continue
-			}
+		opts, _ := s.scopeOptionsWithRepoNarrow(ctx, repoAllowFromContext(ctx))
+		matches, err := graph.FindNodesByNameScopedContext(ctx, g, name, graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow})
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range matches {
 			if target != nil && n.ID == target.ID {
 				continue
 			}
@@ -179,9 +187,12 @@ func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequ
 	// EdgeImports edge into the target's FilePath. Backends that
 	// implement graph.FileImporters serve this from one query
 	// (no AllEdges() materialisation, no per-edge GetNode round-
-	// trip). The legacy AllEdges + per-edge GetNode loop stays as
-	// the fallback for backends that don't ship the capability.
-	importingFiles := collectImportingFiles(g, target, excludeTests)
+	// trip). Selected views without the capability follow incoming imports
+	// from this file's node identities, preserving their own visibility.
+	importingFiles, err := collectImportingFilesContext(ctx, g, target, excludeTests)
+	if err != nil {
+		return nil, err
+	}
 
 	referenced := totalEdges > 0 || len(sameName) > 0 || len(importingFiles) > 0
 
@@ -201,17 +212,25 @@ func (s *Server) handleCheckReferences(ctx context.Context, req mcp.CallToolRequ
 
 // collectImportingFiles answers "which files import the file that
 // holds target?". Prefers the graph.FileImporters capability when
-// the backend implements it — that path runs one query
-// instead of an AllEdges() scan plus 2× per-edge GetNode round-trip.
+// the backend implements it; the fallback follows incoming imports from
+// this file's node identities through the selected reader.
 // Returns a sorted, deduplicated, optionally test-filtered slice
 // of file paths.
 //
 // When target is nil or has no FilePath the question is undefined;
 // returns an empty slice (consistent with the legacy behaviour).
 func collectImportingFiles(g graph.Reader, target *graph.Node, excludeTests bool) []string {
+	files, _ := collectImportingFilesContext(context.Background(), g, target, excludeTests)
+	return files
+}
+
+func collectImportingFilesContext(ctx context.Context, g graph.Reader, target *graph.Node, excludeTests bool) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	importingFiles := []string{}
 	if target == nil || target.FilePath == "" {
-		return importingFiles
+		return importingFiles, nil
 	}
 	seen := map[string]bool{}
 	add := func(fromFile string) {
@@ -233,31 +252,20 @@ func collectImportingFiles(g graph.Reader, target *graph.Node, excludeTests bool
 			add(row.FromFile)
 		}
 		sort.Strings(importingFiles)
-		return importingFiles
+		return importingFiles, ctx.Err()
 	}
 
-	// Fallback: pull every edge and filter Go-side. Identical
-	// pre-capability behaviour — only the cgo-heavy backend ever
-	// reaches this path.
-	for _, e := range g.AllEdges() {
-		if e.Kind != graph.EdgeImports {
-			continue
-		}
-		toNode := g.GetNode(e.To)
-		if toNode == nil {
-			continue
-		}
-		if toNode.FilePath != target.FilePath && toNode.ID != target.FilePath {
-			continue
-		}
-		fromNode := g.GetNode(e.From)
-		if fromNode == nil {
-			continue
-		}
-		add(fromNode.FilePath)
+	// Capability-less selected views use the same file-anchored adjacency
+	// projection, retaining tombstones and endpoint masks without AllEdges.
+	rows, err := fileImportersFromReader(ctx, g, target.FilePath)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		add(row.FromFile)
 	}
 	sort.Strings(importingFiles)
-	return importingFiles
+	return importingFiles, ctx.Err()
 }
 
 // isCheckRefEdge identifies edges that mean "this symbol is being

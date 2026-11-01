@@ -107,3 +107,31 @@ func TestMatchedRatiosExcludeZeroClockSamplesOnEitherBuild(t *testing.T) {
 		}
 	}
 }
+
+func TestMatchedAbsenceRatiosRemainDistinctFromSuccessAndGenericErrors(t *testing.T) {
+	var records []pairedRecord
+	for _, variant := range []string{"valid", "generic_error", "ordinary_success", "missing_expectation", "censored"} {
+		a := pairedSample{Outcome: "expected_refusal", ExpectedOutcome: "symbol_absent", RequestHash: "same", Latency: measured(10, "ms")}
+		b := a
+		b.Latency = measured(11, "ms")
+		switch variant {
+		case "generic_error":
+			b.Outcome = "error"
+		case "ordinary_success":
+			b.Outcome = "success"
+		case "missing_expectation":
+			b.ExpectedOutcome = ""
+		case "censored":
+			b.Outcome = "phase_censored"
+		}
+		records = append(records, pairedRecord{Tuple: requestTuple{Tool: "read.source", Role: "probe", RequestHash: "same", ExpectedOutcome: "symbol_absent"}, Order: []string{"main", "candidate"}, Samples: map[string]pairedSample{"main": a, "candidate": b}})
+	}
+	rows := matchedLatencyRatios([]string{"main", "candidate"}, records)["candidate/main"]
+	got := rows["probe.read.source.symbol_absent"]
+	if got.Matched != 1 || got.Excluded != 4 || got.Median.Value == nil || *got.Median.Value != 1.1 {
+		t.Fatalf("absence ratio lost explicit outcomes: %+v", got)
+	}
+	if _, ok := rows["probe.read.source"]; ok {
+		t.Fatal("expected absence was folded into ordinary successful RPC ratios")
+	}
+}

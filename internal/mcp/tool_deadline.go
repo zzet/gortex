@@ -515,19 +515,43 @@ func abandonedToolMessage(name string, timeout time.Duration, verdict mutationCo
 
 func (s *Server) boundToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		name := req.Params.Name
-		return boundHandler(s, "tool", name, (func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error))(h),
-			func(stuck int64, timeout time.Duration) (*mcp.CallToolResult, error) {
-				return mcp.NewToolResultError(busyMessage("tool calls", stuck, timeout)), nil
-			},
-			func(timeout time.Duration, note *mutationCommitNote, retained *requestViewPin) (*mcp.CallToolResult, error) {
-				return mcp.NewToolResultError(abandonedToolMessage(name, timeout, note.verdict(), retained)), nil
-			},
-			func(r any) (*mcp.CallToolResult, error) {
-				return mcp.NewToolResultError(fmt.Sprintf("tool %q internal error: %v", name, r)), nil
-			},
-		)(ctx, req)
+		if s != nil && measuredSourceEdit(req) {
+			return s.runAcknowledgedEdit(ctx, req, h)
+		}
+		// The ordinary path has no mutation-only named returns, defer or
+		// closure captures. Reads do not create an observer or sample a clock.
+		return s.runBoundToolHandler(ctx, req, h)
 	}
+}
+
+func (s *Server) runAcknowledgedEdit(ctx context.Context, req mcp.CallToolRequest, h mcpserver.ToolHandlerFunc) (result *mcp.CallToolResult, err error) {
+	ctx, ack, owner := s.withEditAcknowledgement(ctx)
+	if owner {
+		defer func() { ack.finishReply(result, err) }()
+	}
+	actual := func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if owner {
+			defer ack.finishActual()
+		}
+		// Actual completion and its counters stay INSIDE the firewall.
+		return s.runMeasuredEditOperation(ctx, req, h)
+	}
+	return s.runBoundToolHandler(ctx, req, actual)
+}
+
+func (s *Server) runBoundToolHandler(ctx context.Context, req mcp.CallToolRequest, h mcpserver.ToolHandlerFunc) (*mcp.CallToolResult, error) {
+	name := req.Params.Name
+	return boundHandler(s, "tool", name, (func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error))(h),
+		func(stuck int64, timeout time.Duration) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultError(busyMessage("tool calls", stuck, timeout)), nil
+		},
+		func(timeout time.Duration, note *mutationCommitNote, retained *requestViewPin) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultError(abandonedToolMessage(name, timeout, note.verdict(), retained)), nil
+		},
+		func(r any) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultError(fmt.Sprintf("tool %q internal error: %v", name, r)), nil
+		},
+	)(ctx, req)
 }
 
 // addResource registers a resource with the same hang firewall tool calls get.

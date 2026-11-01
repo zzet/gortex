@@ -814,7 +814,7 @@ CREATE TABLE IF NOT EXISTS cleanup_journal (
     last_progress     INTEGER NOT NULL DEFAULT 0,
     last_error        TEXT NOT NULL DEFAULT ''
 ) WITHOUT ROWID;
-`
+` + checkoutRootIndexesSQL
 
 // vectorTableSQL is the durable embedding sidecar's CREATE statement. The v10
 // migration rebuilds the table from it, so it shares the registry body every

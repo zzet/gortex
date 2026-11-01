@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -41,6 +42,14 @@ func fixtureDaemon(mode string) int {
 	}
 	if json.Unmarshal(data, &config) != nil || len(config.Repos) == 0 {
 		return 4
+	}
+	var nativeCorpus Corpus
+	var nativeReplies func(stubFrame) (any, *rpcError)
+	if mode == "native" {
+		if json.Unmarshal([]byte(os.Getenv("LOAD_NATIVE_CORPUS")), &nativeCorpus) != nil {
+			return 6
+		}
+		nativeReplies = editProbeDiskReplies(nativeCorpus, config.Repos[0].Path, func(err error) { panic(err) })
 	}
 	listener, err := net.Listen("unix", os.Getenv("GORTEX_DAEMON_SOCKET"))
 	if err != nil {
@@ -177,6 +186,16 @@ func fixtureDaemon(mode string) int {
 							}()
 						})
 						result = stubContent(map[string]any{"subscribed": true})
+					case frame.Params["name"] == "session":
+						result = stubContent(map[string]any{})
+					case nativeReplies != nil:
+						args, _ := frame.Params["arguments"].(map[string]any)
+						target, _ := args["target"].(map[string]any)
+						if frame.Params["name"] == "read" && args["operation"] == "source" && target["symbol"] == "fixture/"+nativeCorpus.Symbol {
+							result = stubContent(map[string]any{"id": "fixture/" + nativeCorpus.Symbol, "source": "func Example() int { return 1 }"})
+						} else {
+							result, _ = nativeReplies(frame)
+						}
 					default:
 						result = stubContent(map[string]any{"id": "sample/sample.go::Example", "source": "func Example() {}"})
 					}
@@ -242,5 +261,79 @@ func TestFailedPrivateDaemonStillCollectsCrashEvidence(t *testing.T) {
 	}
 	if _, err := os.Stat(artifacts["daemon-1.stderr.log"]); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Exercise runPhase's final validation after a real native save and socket
+// probes. The paired driver only skips the Poisson delay in this diagnostic.
+func TestNativeEditProbePhaseRequiresWriteAndProbeEvidence(t *testing.T) {
+	for _, mode := range []string{"complete", "empty", "missing_write", "missing_probes"} {
+		t.Run(mode, func(t *testing.T) {
+			c := editProbeEditorSaveCorpus(t, 1)
+			pin := gitFixture(t)
+			c.Source, c.Label = pin.Source, "fixture"
+			if err := os.WriteFile(filepath.Join(c.Source, c.File), []byte(c.EditInitialContent), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, args := range [][]string{{"add", c.File}, {"commit", "--quiet", "-m", "native fixture"}, {"rev-parse", "HEAD"}} {
+				cmd := exec.Command("git", append([]string{"-C", c.Source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "core.hooksPath=" + os.DevNull}, args...)...)
+				data, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("git %v: %v %s", args, err, data)
+				}
+				if args[0] == "rev-parse" {
+					c.Commit = strings.TrimSpace(string(data))
+				}
+			}
+			corpusJSON, err := json.Marshal(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("LOAD_DAEMON_FIXTURE", "native")
+			t.Setenv("LOAD_NATIVE_CORPUS", string(corpusJSON))
+			binary, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			o := runOptions{Binary: binary, Profile: "agent", Host: "native", Editors: 1, EditCount: 1, Seed: 42, Duration: time.Second, Deadline: 2 * time.Second, WarmTimeout: 10 * time.Second, StopTimeout: 5 * time.Second}
+			o.pairedDriver = func(ctx context.Context, p *privateRun, clients, sweepClients []*socketClient, phase *Phase) error {
+				r := phase.editProbeRuntime
+				if mode == "empty" {
+					r.finalized = true
+					return nil
+				}
+				r.origin = time.Now()
+				step := r.plan.Steps[0]
+				r.activate(ctx, step)
+				awaitEditProbeFirstProbe(t, r.states[0])
+				r.doEdit(ctx, step)
+				if err := r.finish(); err != nil {
+					return err
+				}
+				if mode == "missing_write" {
+					phase.EditProbe.Records[0].NativeWrite.EndNS = nil
+				}
+				if mode == "missing_probes" {
+					phase.EditProbe.Records[0].FirstCorrect["source"] = unavailable("ms", "not observed")
+				}
+				return nil
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			phase, _, artifacts, _, _, err := runPhase(ctx, o, editProbeScenario, []Corpus{c}, "", t.TempDir())
+			if data, _ := os.ReadFile(artifacts["daemon-1.stderr.log"]); len(data) != 0 {
+				t.Logf("native fixture stderr: %s", data)
+			}
+			if len(phase.Tools) != 0 {
+				t.Fatalf("native save invented MCP workload calls: %+v", phase.Tools)
+			}
+			if mode == "complete" {
+				if err != nil {
+					t.Fatalf("native save failed final phase validation: %v", err)
+				}
+			} else if err == nil || !strings.Contains(strings.Join(phase.Errors, "; "), "no workload calls observed before phase end") {
+				t.Fatalf("%s native evidence accepted: %v", mode, err)
+			}
+		})
 	}
 }
