@@ -181,7 +181,7 @@ func validateBudget(b budget, allowances map[string]allowance) error {
 		return errors.New("min_repeats cannot weaken the three-repeat minimum")
 	}
 	for i, lane := range b.Lane {
-		if !slices.Contains([]string{"smoke", "nightly", "release"}, lane) || slices.Contains(b.Lane[:i], lane) {
+		if !slices.Contains([]string{"smoke", "nightly", "release", "edit-smoke"}, lane) || slices.Contains(b.Lane[:i], lane) {
 			return fmt.Errorf("unknown or repeated lane %s", lane)
 		}
 	}

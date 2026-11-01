@@ -11,6 +11,7 @@ type metricSpec struct {
 }
 
 var metricSpecs = map[string]metricSpec{
+	"wal_p95_mib":           {unit: "MiB", axis: "disk", missing: "report-v1 does not retain a WAL observation distribution"},
 	"edit_ack_p95":          {unit: "s", axis: "timing"},
 	"edit_ack_max":          {unit: "s", axis: "timing", everyRepeat: true},
 	"read_p95":              {unit: "s", axis: "timing"},
@@ -49,6 +50,11 @@ var metricSpecs = map[string]metricSpec{
 	"idle_written_mib_min":  {unit: "MiB/min", axis: "disk", missing: "report-v1 lacks an idle-write observation interval"},
 	"idle_memory_60s_mib":   {unit: "MiB", axis: "memory", missing: "idle_after_2s is not a 60-second post-enrichment footprint observation"},
 	"cold_go_sys_peak_mib":  {unit: "MiB", axis: "memory", missing: "daemon status Go Sys snapshots do not establish cold-window peak Go Sys"},
+	"silent_stale_json":     {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 does not retain mode-specific edit oracle observations"},
+	"silent_stale_toon":     {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 does not retain mode-specific edit oracle observations"},
+	"silent_stale_compact":  {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 does not retain mode-specific edit oracle observations"},
+	"silent_stale_facade":   {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 does not retain mode-specific edit oracle observations"},
+	"silent_stale_cli":      {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 does not retain mode-specific edit oracle observations"},
 }
 
 type scenarioSpec struct {
@@ -71,6 +77,7 @@ func buildScenarioSpecs() map[string]scenarioSpec {
 		out["load-"+cell.name] = scenarioSpec{wire: "read", agents: cell.n, repos: 1}
 		out["loadedit-"+cell.name] = scenarioSpec{wire: "edit", editors: cell.n, repos: 1}
 	}
+	out["loadedit-4-largefile"] = scenarioSpec{missing: "frozen report-v1 has no identified large-file edit-probe fixture"}
 	out["multirepoedit-6"] = scenarioSpec{wire: "many-edit", editors: 6, repos: 6}
 	for _, cell := range []struct {
 		name string

@@ -894,3 +894,16 @@ budgets:
   - {"metric": "sigaborts", "scenario": "warm-restart", "host_class": "hosted_arm_smoke", "owning_release": "v0.64.12", "mode": "block", "target": 0, "unit": "count", "allowance": [], "lane": ["smoke"], "compare": "eq"}
   - {"metric": "oom_kills", "scenario": "warm-restart", "host_class": "hosted_arm_smoke", "owning_release": "v0.64.12", "mode": "block", "target": 0, "unit": "count", "allowance": [], "lane": ["smoke"], "compare": "eq"}
   - {"metric": "force_kills", "scenario": "warm-restart", "host_class": "hosted_arm_smoke", "owning_release": "v0.64.12", "mode": "block", "target": 0, "unit": "count", "allowance": [], "lane": ["smoke"], "compare": "eq"}
+
+  # Dedicated edit-loop evidence; the frozen report-v1 lane cannot satisfy these.
+  - {"metric": "silent_stale_json", "scenario": "loadedit-4", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 0, "unit": "count", "allowance": [], "lane": ["edit-smoke"], "compare": "eq"}
+  - {"metric": "silent_stale_toon", "scenario": "loadedit-4", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 0, "unit": "count", "allowance": [], "lane": ["edit-smoke"], "compare": "eq"}
+  - {"metric": "silent_stale_compact", "scenario": "loadedit-4", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 0, "unit": "count", "allowance": [], "lane": ["edit-smoke"], "compare": "eq"}
+  - {"metric": "silent_stale_facade", "scenario": "loadedit-4", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 0, "unit": "count", "allowance": [], "lane": ["edit-smoke"], "compare": "eq"}
+  - {"metric": "silent_stale_cli", "scenario": "loadedit-4", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 0, "unit": "count", "allowance": [], "lane": ["edit-smoke"], "compare": "eq"}
+  - {"metric": "wal_p95_mib", "scenario": "loadedit-1", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 1007, "unit": "MiB", "allowance": [], "lane": ["edit-smoke"], "compare": "le"}
+  - {"metric": "wal_p95_mib", "scenario": "loadedit-4", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 1059, "unit": "MiB", "allowance": [], "lane": ["edit-smoke"], "compare": "le"}
+  - {"metric": "wal_p95_mib", "scenario": "loadedit-8", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 960, "unit": "MiB", "allowance": [], "lane": ["edit-smoke"], "compare": "le"}
+  - {"metric": "wal_p95_mib", "scenario": "multirepoedit-6", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 760, "unit": "MiB", "allowance": [], "lane": ["edit-smoke"], "compare": "le"}
+  - {"metric": "edit_ack_p95", "scenario": "loadedit-4-largefile", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 0.6, "unit": "s", "allowance": [], "lane": ["edit-smoke"], "compare": "le"}
+  - {"metric": "edit_ack_max", "scenario": "loadedit-4-largefile", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 1, "unit": "s", "allowance": [], "lane": ["edit-smoke"], "compare": "le"}
