@@ -1065,7 +1065,9 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	admission := s.admitSourceMutations(ctx, absPath)
+	releaseMutation()
+	reindexOutcome := s.awaitSourceMutations(ctx, admission)
 	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{
@@ -1238,7 +1240,9 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	admission := s.admitSourceMutations(ctx, absPath)
+	releaseMutation()
+	reindexOutcome := s.awaitSourceMutations(ctx, admission)
 	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{

@@ -559,9 +559,9 @@ func noDispatchSlotRelease(ctx context.Context) bool {
 	return marked
 }
 
-// releaseDispatchSlotForWait returns mutation capacity and admits a passive
-// post-commit wait to the slow lane. False leaves the committed receipt pending;
-// it must never become a retryable busy result. Embedded calls are unchanged.
+// releaseDispatchSlotForWait returns the completed source handler's dispatch
+// capacity before its passive publication wait. A refused test adapter keeps
+// the committed receipt pending; it never becomes a retryable busy result.
 func (s *Server) releaseDispatchSlotForWait(ctx context.Context, published <-chan struct{}) bool {
 	if noDispatchSlotRelease(ctx) {
 		return true
@@ -569,7 +569,8 @@ func (s *Server) releaseDispatchSlotForWait(ctx context.Context, published <-cha
 	if s.releaseDispatchSlot != nil {
 		return s.releaseDispatchSlot(ctx, published)
 	}
-	return daemon.MoveMCPDispatchToSlowLane(ctx, published) == nil
+	daemon.ReleaseMCPDispatchSlot(ctx)
+	return true
 }
 
 func (s *Server) mutationWaitDuration() time.Duration {
@@ -579,75 +580,88 @@ func (s *Server) mutationWaitDuration() time.Duration {
 	return defaultMutationReindexWait
 }
 
-// mutationReindexState returns the graph-freshness state to expose after a
-// successful disk mutation. A live watcher already owns debouncing, patch
-// serialization, and latest-bytes reconciliation, so duplicating IndexFile in
-// the request path both blocks the response and races the watcher. Embedded
-// servers have no watcher and retain the synchronous freshness contract.
-func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutationReindexOutcome {
+// sourceMutationAdmission separates committing/admitting under the path lock
+// from passive graph waiting after the lock has been returned.
+type sourceMutationAdmission struct {
+	receipt    *mutationReceipt
+	immediate  mutationReindexOutcome
+	inlinePath string
+	checkout   *checkoutMutationState
+}
+
+// admitSourceMutations captures publication ownership before another writer
+// can commit this path. It never waits for a queued watcher publication.
+func (s *Server) admitSourceMutations(ctx context.Context, absPath string) sourceMutationAdmission {
 	if state := checkoutMutationFromContext(ctx); state != nil {
-		return s.refreshCheckoutMutation(ctx, absPath, state)
-	}
-	if watcher := s.currentWatcher(); watcher != nil {
-		// Admission is path-scoped and authoritative. Scheduling uses a detached
-		// context because the disk commit already happened; client cancellation
-		// must not leave the graph permanently stale.
-		if scheduler, ok := watcher.(mutationScheduler); ok {
-			// The reindex is detached from this request, so the request's own
-			// lease cannot be what keeps its payload alive: join it for the
-			// admitted work and let the receipt hold the pin until the ticket
-			// reports. Nil whenever no generation stack answered this request.
-			pin := handoffRequestView(ctx, viewmetrics.HandoffFileMutation)
-			publication := s.committedPublicationRecord(ctx, absPath)
-			admissionLap := s.beginAcknowledgementLap(ctx, editAckTicketAdmission)
-			ticket, scheduleErr := scheduler.EnqueueToolMutation(indexer.WithPublicationRecord(context.WithoutCancel(ctx), publication), absPath)
-			admissionLap.finish()
-			if scheduleErr != nil {
-				failMutationPhases(publication)
-				pin.release()
-				return mutationReindexOutcome{Err: scheduleErr}
-			}
-			if ticket == nil {
-				failMutationPhases(publication)
-				// Admission declined to schedule anything, so nothing outlives
-				// this frame and the fall-through below reindexes inline.
-				pin.release()
-			}
-			if ticket != nil {
-				receipt := s.trackMutationTicket(ticket)
-				s.bindReadRepairAdmission(absPath, ticket.PublicationRecord, receipt)
-				receipt.pinView(pin)
-				// The disk write and ticket admission are complete. This wait
-				// must not announce another ordinary writer while the watcher
-				// publishes; actual queued writes still preempt chain folds.
-				resumeIntent := suspendSourceMutationWriteIntent(ctx)
-				defer resumeIntent()
-				// Only waiting from here on: let other requests use this
-				// dispatch slot. A publication that lands first needs none.
-				waitCtx, cancel := context.WithTimeout(ctx, s.mutationWaitDuration())
-				defer cancel()
-				waitLap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
-				if !s.releaseDispatchSlotForWait(waitCtx, receipt.done) {
-					waitLap.finish()
-					return receipt.outcome(true)
-				}
-				select {
-				case <-receipt.done:
-					waitLap.finish()
-					outcome := receipt.outcome(false)
-					outcome.Receipt = ""
-					return outcome
-				case <-waitCtx.Done():
-					waitLap.finish()
-					return receipt.outcome(true)
-				}
-			}
+		if _, queued := state.mutation.(checkoutMutationScheduler); queued {
+			return sourceMutationAdmission{immediate: s.refreshCheckoutMutation(ctx, absPath, state)}
 		}
+		return sourceMutationAdmission{inlinePath: absPath, checkout: state}
 	}
-	if err := ctx.Err(); err != nil {
-		return mutationReindexOutcome{Err: err}
+	if scheduler, ok := s.currentWatcher().(mutationScheduler); ok {
+		pin := handoffRequestView(ctx, viewmetrics.HandoffFileMutation)
+		publication := s.committedPublicationRecord(ctx, absPath)
+		admissionLap := s.beginAcknowledgementLap(ctx, editAckTicketAdmission)
+		ticket, err := scheduler.EnqueueToolMutation(indexer.WithPublicationRecord(context.WithoutCancel(ctx), publication), absPath)
+		admissionLap.finish()
+		if err != nil {
+			failMutationPhases(publication)
+			pin.release()
+			return sourceMutationAdmission{immediate: mutationReindexOutcome{Err: err}}
+		}
+		if ticket != nil {
+			receipt := s.trackMutationTicket(ticket)
+			s.bindReadRepairAdmission(absPath, ticket.PublicationRecord, receipt)
+			receipt.pinView(pin)
+			return sourceMutationAdmission{receipt: receipt}
+		}
+		failMutationPhases(publication)
+		pin.release()
 	}
-	return mutationReindexOutcome{Reindexed: s.reindexFile(absPath)}
+	return sourceMutationAdmission{inlinePath: absPath}
+}
+
+// awaitSourceMutations performs only the admitted publication wait for a live
+// watcher. Embedded adapters retain their synchronous refresh after unlocking.
+func (s *Server) awaitSourceMutations(ctx context.Context, admission sourceMutationAdmission) mutationReindexOutcome {
+	if admission.receipt == nil {
+		if admission.checkout != nil {
+			return s.refreshCheckoutMutation(ctx, admission.inlinePath, admission.checkout)
+		}
+		if admission.inlinePath == "" {
+			return admission.immediate
+		}
+		if err := ctx.Err(); err != nil {
+			return mutationReindexOutcome{Err: err}
+		}
+		return mutationReindexOutcome{Reindexed: s.reindexFile(admission.inlinePath)}
+	}
+	receipt := admission.receipt
+	resumeIntent := suspendSourceMutationWriteIntent(ctx)
+	defer resumeIntent()
+	waitCtx, cancel := context.WithTimeout(ctx, s.mutationWaitDuration())
+	defer cancel()
+	waitLap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+	if !s.releaseDispatchSlotForWait(waitCtx, receipt.done) {
+		waitLap.finish()
+		return receipt.outcome(true)
+	}
+	select {
+	case <-receipt.done:
+		waitLap.finish()
+		outcome := receipt.outcome(false)
+		outcome.Receipt = ""
+		return outcome
+	case <-waitCtx.Done():
+		waitLap.finish()
+		return receipt.outcome(true)
+	}
+}
+
+// Keep the combined entry for callers that have no source path lock. Source
+// handlers admit first and explicitly release their locks before awaiting.
+func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutationReindexOutcome {
+	return s.awaitSourceMutations(ctx, s.admitSourceMutations(ctx, absPath))
 }
 
 // mutationCheckoutScope is metadata-only so receipts remain inspectable while
