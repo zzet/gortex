@@ -754,7 +754,7 @@ and what one more worktree retains with
 
 `--scenario worktree-discovery` starts with the first two pinned repositories
 in the manifest. It keeps their reading/editing sessions open while adding
-`--worktrees` detached checkouts to the first repository during the offered
+`--worktrees` detached checkouts alternating the two repositories during the offered
 window. Each added checkout gets separate root and subdirectory query sessions.
 Use `--agents 0 --edit-agents 8` for eight combined edit/readback agents, or
 `--agents 8 --edit-agents 0` for a read-only control. Editing requires the same
@@ -775,3 +775,13 @@ Keep both reports and all refused/censored attempts. Zero refusals without any
 A hung-discovery fixture, upgraded-store fixture and the reference-host runs
 remain separate acceptance cells; this scenario does not manufacture them.
 All measurements require an isolated host window and fresh owned clones/stores.
+
+
+Discovery additions alternate the primary and unrelated control families. Each
+new root keeps its own family query and prefix for the exact-view witness;
+foreign-family capacity refusals fail the containment gate even while that
+new root is pending. `--discovery-stall-first` installs a daemon-only Git shim
+for the first new primary-family checkout. Its child ignores TERM and retains
+stdout until explicit release or a 60-second bound. The harness releases it
+before daemon shutdown and retains child/root/operation events. A missing
+stall or pending-refusal observation fails this cell.

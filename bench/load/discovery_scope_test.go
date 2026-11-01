@@ -116,3 +116,34 @@ func TestDiscoveryAddsWorktreesWhileOriginalSessionsKeepReading(t *testing.T) {
 	require.Positive(t, report.ByCWD[filepath.Join(root, ".discovery-probe")].Calls)
 	require.Zero(t, report.OutsidePendingRefusals)
 }
+
+func TestDiscoveryForeignCapacityIsNotExcusedAsPending(t *testing.T) {
+ start:=time.Unix(100,0);root:=filepath.Join(t.TempDir(),"foreign-new")
+ entries:=[]checkoutDiscoveryObservation{{Root:root,FamilyRole:"foreign",Added:start}}
+ rows:=[]Attempt{
+  {CWD:root,Started:start.Add(time.Millisecond),Code:-32000,Outcome:"error",ErrorData:map[string]any{"reason":"in_progress"}},
+  {CWD:root,Started:start.Add(time.Millisecond),Code:-32000,Outcome:"error",ErrorData:map[string]any{"reason":"family_capacity"}},
+  {CWD:filepath.Join(root,"subdir"),Started:start.Add(time.Millisecond),Code:-32000,Outcome:"error",ErrorData:map[string]any{"reason":"stuck_capacity"}},
+ }
+ report:=summarizeCheckoutDiscovery(rows,entries,root+"-primary",root+"-other")
+ require.Equal(t,3,report.PendingRefusals)
+ require.Equal(t,2,report.ForeignCapacityRefusals,"foreign family capacity cannot be hidden by the new-root pending window")
+ require.Equal(t,"foreign_new_worktree",report.ByCWD[root].Class)
+}
+
+func TestDiscoveryNewRootsRetainEachUnrelatedFamily(t *testing.T) {
+ first,second:=gitFixture(t),gitFixture(t);second.Label="other";second.Query="ForeignOnly"
+ p,err:=newPrivateRun(t.Context(),t.TempDir(),"unused",[]Corpus{first,second});require.NoError(t,err)
+ t.Cleanup(func(){_=os.RemoveAll(p.SocketDir)})
+ p.Repos[0].Prefix,p.Repos[1].Prefix="primary","foreign"
+ for _,family:=range []int{0,1,0,1} {
+  require.NoError(t,p.addDiscoveryWorktree(t.Context(),family))
+  linked:=p.Repos[len(p.Repos)-1];primary:=p.Repos[family]
+  expected,err:=p.git(t.Context(),primary.Path,"rev-parse","--path-format=absolute","--git-common-dir");require.NoError(t,err)
+  actual,err:=p.git(t.Context(),linked.Path,"rev-parse","--path-format=absolute","--git-common-dir");require.NoError(t,err)
+  require.Equal(t,string(expected),string(actual),"linked checkout must share only its selected family")
+  require.Equal(t,primary.Prefix,linked.Prefix)
+  require.Equal(t,primary.Corpus.Query,linked.Corpus.Query)
+ }
+ require.Error(t,p.addDiscoveryWorktree(t.Context(),2))
+}

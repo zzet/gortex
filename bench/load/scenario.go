@@ -167,11 +167,23 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	}
 	warmCtx, cancelWarm := context.WithTimeout(ctx, o.WarmTimeout)
 	defer cancelWarm()
-	configured, err := p.writeBootRepos(scenario == "worktrees")
+	var configured []privateRepo
+ if scenario==checkoutDiscoveryScenario {configured,err=p.writeDiscoveryBootRepos()}else{configured,err=p.writeBootRepos(scenario == "worktrees")}
 	if err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
-	coldStart := time.Now()
+	if scenario==checkoutDiscoveryScenario && o.Discovery.StallFirst {
+ release,files,err:=p.installDiscoveryFault();if err!=nil{return phase,nil,artifacts,crashes,"",err}
+ for name,path:=range files {artifacts[name]=path}
+ defer func(){
+ resultErr=errors.Join(resultErr,release())
+ raw,err:=os.ReadFile(files["discovery_git_events"])
+ observed:=err==nil && len(bytes.TrimSpace(raw))>0
+ phase.Gate["discovery_git_fault"],_=json.Marshal(map[string]any{"configured":true,"observed":observed,"raw_events":string(raw),"absolute_child_bound_seconds":60})
+ if !observed {resultErr=errors.Join(resultErr,errors.New("Git stall never entered the intended new checkout"),err)}
+ }()
+ }
+ coldStart := time.Now()
 	if err := p.start(); err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
@@ -233,7 +245,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 				p.Repos[i].Prefix = tracked.Prefix
 			}
 		}
-		if i > 0 && scenario == "worktrees" {
+		if i > 0 && scenario == "worktrees" || i>=2 && scenario==checkoutDiscoveryScenario {
 			p.Repos[i].Prefix = p.Repos[0].Prefix
 		}
 		if p.Repos[i].Prefix == "" {
@@ -263,7 +275,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		version = client.version
 		if i < len(p.Repos) {
 			subscribeInvalidations(warmCtx, client, repo.Corpus.Label, o.Deadline, &phase)
-			if err := preflightRoot(warmCtx, p, client, repo, scenario == "worktrees" && i > 0, o.Deadline, &phase); err != nil {
+			if err := preflightRoot(warmCtx, p, client, repo, scenario == "worktrees" && i > 0 || scenario==checkoutDiscoveryScenario && i>=2, o.Deadline, &phase); err != nil {
 				return phase, nil, artifacts, crashes, version, err
 			}
 			gate, rows, err := warmAnalysis(warmCtx, client, o.Deadline)

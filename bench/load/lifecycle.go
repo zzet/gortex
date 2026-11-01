@@ -28,6 +28,7 @@ type privateRun struct {
 	Store      string
 	Config     string
 	Env        []string
+ daemonEnv []string // optional owned scenario shim; harness Git keeps Env
 	Repos      []privateRepo
 	Binary     string
 	process    *exec.Cmd
@@ -343,7 +344,9 @@ func (p *privateRun) start() error {
 	}
 	cmd := exec.Command(p.Binary, "--config", p.Config, "daemon", "start", "--backend-path", p.Store, "--tools", "facade-v1", "--tools-mode", "hide")
 	configureOwnedProcess(cmd)
-	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = p.Root, p.Env, p.stdout, p.stderr
+	env:=p.Env
+ if p.daemonEnv!=nil {env=p.daemonEnv}
+ cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = p.Root, env, p.stdout, p.stderr
 	if err := cmd.Start(); err != nil {
 		_ = p.stdout.Close()
 		_ = p.stderr.Close()

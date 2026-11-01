@@ -15,6 +15,9 @@ const checkoutDiscoveryScenario = "worktree-discovery"
 
 type checkoutDiscoveryObservation struct {
 	Root         string          `json:"root"`
+ FamilyRole string `json:"family_role"`
+ Prefix string `json:"repo_prefix"`
+ Query string `json:"query"`
 	Added        time.Time       `json:"added"`
 	FirstRequest time.Time       `json:"first_request"`
 	ExactAt      time.Time       `json:"exact_at"`
@@ -34,7 +37,8 @@ type checkoutCWDCounts struct {
 }
 
 type checkoutDiscoveryReport struct {
-	PendingRefusals        int                            `json:"pending_refusals"`
+	ForeignCapacityRefusals int `json:"foreign_capacity_refusals"`
+ PendingRefusals        int                            `json:"pending_refusals"`
 	Checkouts              []checkoutDiscoveryObservation `json:"checkouts"`
 	ByCWD                  map[string]checkoutCWDCounts   `json:"by_cwd"`
 	OutsidePendingRefusals int                            `json:"outside_pending_refusals"`
@@ -69,6 +73,7 @@ func summarizeCheckoutDiscovery(attempts []Attempt, checkouts []checkoutDiscover
 		for _, checkout := range checkouts {
 			if inside(checkout.Root, a.CWD) {
 				row.Class = "new_worktree"
+ if checkout.FamilyRole == "foreign" { row.Class = "foreign_new_worktree"; if a.Code != 0 && (a.ErrorData["reason"] == "family_capacity" || a.ErrorData["reason"] == "stuck_capacity") {out.ForeignCapacityRefusals++} }
 			}
 		}
 		if a.Role == "workload" && !strings.HasPrefix(a.Tool, "edit.") {
@@ -136,8 +141,9 @@ func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRu
 		}
 		report := summarizeCheckoutDiscovery(phase.Attempts[first:], checkouts, frozen.Repos[0].Path, frozen.Repos[1].Path)
 		phase.Gate["checkout_discovery"], _ = json.Marshal(report)
-		if report.OutsidePendingRefusals > 0 || report.OutsidePendingErrors > 0 {
-			resultErr = errors.Join(resultErr, fmt.Errorf("checkout discovery affected other cwds: %d refusals, %d errors", report.OutsidePendingRefusals, report.OutsidePendingErrors))
+		if o.Discovery.StallFirst && report.PendingRefusals==0 {resultErr=errors.Join(resultErr,errors.New("Git stall produced no pending refusal exposure"))}
+ if report.OutsidePendingRefusals > 0 || report.OutsidePendingErrors > 0 || report.ForeignCapacityRefusals > 0 {
+			resultErr = errors.Join(resultErr, fmt.Errorf("checkout discovery affected other cwds: %d refusals, %d errors, %d foreign capacity refusals", report.OutsidePendingRefusals, report.OutsidePendingErrors, report.ForeignCapacityRefusals))
 		}
 		if parent.Err() != nil {
 			resultErr = errors.Join(resultErr, parent.Err(), loadErr)
@@ -156,13 +162,14 @@ func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRu
 		case <-ticker.C:
 		}
 		if len(checkouts) < o.Worktrees && !time.Now().Before(nextAdd) {
-			if err := p.addWorktree(ctx); err != nil {
+			family := len(checkouts)%2
+ if err := p.addDiscoveryWorktree(ctx, family); err != nil {
 				return err
 			}
 			repo := p.Repos[len(p.Repos)-1]
-			repo.Prefix = p.Repos[0].Prefix
-			p.Repos[len(p.Repos)-1].Prefix = repo.Prefix
-			entry := checkoutDiscoveryObservation{Root: repo.Path, Added: time.Now(), ExactViewLag: unavailable("ms", "no exact worktree view observed before phase end")}
+			role:="primary"
+ if family==1 {role="foreign"}
+			entry := checkoutDiscoveryObservation{Root: repo.Path, FamilyRole:role,Prefix:repo.Prefix,Query:repo.Corpus.Query, Added: time.Now(), ExactViewLag: unavailable("ms", "no exact worktree view observed before phase end")}
 			checkouts = append(checkouts, entry)
 			nextAdd = nextAdd.Add(interval)
 			subdir := filepath.Join(repo.Path, ".discovery-probe")
@@ -182,13 +189,13 @@ func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRu
 			if entry.FirstRequest.IsZero() {
 				entry.FirstRequest = time.Now()
 			}
-			r := request{Tool: "search", Operation: "symbols", Arguments: map[string]any{"operation": "symbols", "query": p.Repos[0].Corpus.Query}}
+			r := request{Tool: "search", Operation: "symbols", Arguments: map[string]any{"operation": "symbols", "query": entry.Query}}
 			_, rows, _ := callTool(ctx, client, r, r.Arguments, "probe", i, len(checkouts), 0, o.Deadline, waitContext)
 			phase.Attempts = append(phase.Attempts, rows...)
 			if i%2 != 0 || !entry.ExactAt.IsZero() || ctx.Err() != nil {
 				continue
 			}
-			raw, err := control(ctx, p.Socket, "search_symbols", map[string]any{"path": entry.Root, "query": p.Repos[0].Corpus.Query, "limit": 1})
+			raw, err := control(ctx, p.Socket, "search_symbols", map[string]any{"path": entry.Root, "query": entry.Query, "limit": 1})
 			entry.View = append(json.RawMessage(nil), raw...)
 			if err != nil {
 				entry.Error = err.Error()
@@ -205,7 +212,7 @@ func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRu
 				entry.Error = err.Error()
 				continue
 			}
-			if answer.View.Exact && answer.View.Kind == "worktree" && answer.View.Prefix == p.Repos[0].Prefix {
+			if answer.View.Exact && answer.View.Kind == "worktree" && answer.View.Prefix == entry.Prefix {
 				entry.ExactAt = time.Now()
 				entry.ExactViewLag = measured(float64(entry.ExactAt.Sub(entry.FirstRequest))/float64(time.Millisecond), "ms")
 				entry.Error = ""
