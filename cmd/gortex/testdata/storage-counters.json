@@ -4,6 +4,47 @@
   "wal_pending_frames": 7,
   "close_checkpoint_estimate_ms": 15000,
   "wal_reclaim": {
+    "edit_burst_writer_hold": {
+      "count": 2,
+      "total_ms": 75,
+      "max_ms": 50,
+      "p50_ms": 50,
+      "p95_ms": 50,
+      "bucket_le_ms": [
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        250,
+        500,
+        1000,
+        2000,
+        5000
+      ],
+      "bucket_counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        2,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "edit_burst_gate_closures": 0,
+    "deferred_edit_burst": 2,
+    "deferred_interactive_read": 1,
+    "bulk_exception_holds": 1,
+    "hard_cap_exception_holds": 2,
     "writer_hold": {
       "count": 2,
       "total_ms": 75,
