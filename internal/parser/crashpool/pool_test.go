@@ -1,6 +1,7 @@
 package crashpool
 
 import (
+	"bytes"
 	"encoding/gob"
 	"fmt"
 	"os"
@@ -187,6 +188,7 @@ func TestPool_CrashIsolation(t *testing.T) {
 
 	bad := p.Submit("dir/BOOM.mock", "mock", []byte("x"))
 	require.True(t, bad.Crashed)
+	require.False(t, bad.ParseChecked)
 	require.True(t, bad.Bad())
 	require.Contains(t, bad.Err, "crashed")
 
@@ -222,6 +224,7 @@ func TestPool_RequestTimeout(t *testing.T) {
 	p := newTestPool(t, "slow", Config{Workers: 1, RequestTimeout: 250 * time.Millisecond})
 	res := p.Submit("slow.mock", "mock", []byte("x"))
 	require.True(t, res.Crashed)
+	require.False(t, res.ParseChecked)
 	require.Contains(t, res.Err, "timed out")
 }
 
@@ -265,4 +268,39 @@ func TestPool_RoutesWorkerStderrThroughLogger(t *testing.T) {
 	}
 	require.Contains(t, lines, "worker stderr line 1")
 	require.Contains(t, lines, "worker stderr line 2")
+}
+
+// Old workers and plugin extractors have no full-parse proof; the additive
+// wire field must remain unknown instead of certifying their zero default.
+func TestParseVerdictOldWorkerAndPluginRemainUnknown(t *testing.T) {
+	var wire bytes.Buffer
+	old := struct {
+		Seq         uint64
+		ParseErrors int
+		HasParseErr bool
+	}{Seq: 9}
+	require.NoError(t, gob.NewEncoder(&wire).Encode(old))
+	var response extractResponse
+	require.NoError(t, gob.NewDecoder(&wire).Decode(&response))
+	require.False(t, response.ParseChecked)
+	require.Zero(t, response.ParseErrors)
+	require.False(t, serveOne(mockRegistry(), extractRequest{Language: "mock", RelPath: "x.mock"}).ParseChecked)
+	require.False(t, serveOne(mockRegistry(), extractRequest{Language: "mockpanic", RelPath: "x.mp"}).ParseChecked)
+	require.False(t, serveOne(mockRegistry(), extractRequest{Language: "unknown"}).ParseChecked)
+}
+
+func TestPoolNativeSyntaxVerdictRoundTrip(t *testing.T) {
+	p := newTestPool(t, "real", Config{Workers: 1})
+	for _, source := range []string{"package p\nfunc Good() {}\n", "@@@ <<<<<\n"} {
+		result := p.Submit("main.go", "go", []byte(source))
+		require.False(t, result.Bad(), result.Err)
+		require.True(t, result.ParseChecked)
+		if source[0] == '@' {
+			require.Positive(t, result.ParseErrors)
+			require.True(t, result.HasParseErr)
+		} else {
+			require.Zero(t, result.ParseErrors)
+			require.False(t, result.HasParseErr)
+		}
+	}
 }

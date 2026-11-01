@@ -375,9 +375,9 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 	// don't defer Close — closing happens in the indexer after the
 	// contract pass releases its ref.
 	pt := parser.NewParseTree(tree, src, "go")
-	result := &parser.ExtractionResult{Tree: pt}
-
 	root := tree.RootNode()
+	checked, parseErrors := parser.ParseErrorVerdict(root)
+	result := &parser.ExtractionResult{Tree: pt, ParseChecked: checked, ParseErrors: parseErrors}
 
 	fileNode := &graph.Node{
 		ID:        filePath,
@@ -447,10 +447,14 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 			// No-op (the package name is not currently surfaced as a node).
 
 		case m.Captures["func.def"] != nil:
-			e.emitFunction(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			root.WithScratch(func() {
+				e.emitFunction(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			})
 
 		case m.Captures["method.def"] != nil:
-			e.emitMethod(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			root.WithScratch(func() {
+				e.emitMethod(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			})
 
 		case m.Captures["typedef.def"] != nil:
 			e.emitTypeDecl(m, filePath, fileID, src, result, seenTypeName)
@@ -1278,14 +1282,14 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 	// override method emits as a separate KindMethod node, so this
 	// post-pass runs after every node in the file has been emitted and
 	// rewires any convention-derived EdgeModelsTable to the literal.
-	rewireORMTableNameOverrides(root, src, result)
+	root.WithScratch(func() { rewireORMTableNameOverrides(root, src, result) })
 
 	// WebSocket upgrade handlers → real-time endpoint edges.
 	emitGoWebSocketEdges(src, filePath, result)
 
 	// Same-file constant/variable value references → impact-radius reads.
-	captureValueRefCandidates(result, root, filePath, src)
-	captureFnValueCandidates(result, root, filePath, src)
+	root.WithScratch(func() { captureValueRefCandidates(result, root, filePath, src) })
+	root.WithScratch(func() { captureFnValueCandidates(result, root, filePath, src) })
 
 	// Gin middleware-chain dispatcher + route registrations → resolver hints.
 	mineGinMiddleware(src, result)
@@ -1294,10 +1298,10 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 	// map key/value, channel element. These positions are dropped by the
 	// bare-name type passes, so without this find_usages of a type misses
 	// every place it appears only as an argument/element type.
-	emitGoTypeArgReferences(root, src, filePath, fileID, funcRanges, result)
+	root.WithScratch(func() { emitGoTypeArgReferences(root, src, filePath, fileID, funcRanges, result) })
 
 	// GoFrame reflective routes: g.Meta-tagged request structs → controllers.
-	captureGoFrameRoutes(result, root, filePath, src)
+	root.WithScratch(func() { captureGoFrameRoutes(result, root, filePath, src) })
 
 	return result, nil
 }

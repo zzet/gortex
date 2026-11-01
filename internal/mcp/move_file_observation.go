@@ -24,6 +24,7 @@ type moveFileObservation struct {
 	readState                             string
 	readAssisted                          *moveDirectObservation
 	direct                                *moveDirectObservation
+	physical                              weak.Pointer[mutationCommitRecord]
 }
 type moveDirectObservation struct {
 	generation                                               uint64
@@ -66,43 +67,67 @@ func (s *Server) beginMoveObservation(ctx context.Context, sourceID, targetID, s
 	return out
 }
 
-func (o *moveObservation) write(ack *editAcknowledgement, path string, content []byte) error {
+func (o *moveObservation) write(ctx context.Context, s *Server, path string, content []byte) (*mutationCommitRecord, error) {
+	physical, err := s.writeMoveFile(ctx, "move_symbol", path, content)
 	if o == nil {
-		return writeMoveFileObserved(ack, path, content)
+		return physical, err
 	}
-	started := time.Now()
-	err := writeMoveFileObserved(ack, path, content)
-	returned := time.Now()
 	record := o.records[path]
 	if record == nil {
-		return err
+		return physical, err
 	}
-	blob := ""
-	if err == nil {
-		blob = gitBlobSHA(content)
-	} // no existing fingerprint is produced by the move writer
 	ledger := &o.server.mutationCommits
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
+	if physical != nil {
+		physical.mu.Lock()
+		defer physical.mu.Unlock()
+	}
 	record.mu.Lock()
 	defer record.mu.Unlock()
-	if ledger.byID[record.id] != record || record.owner != o.server || record.kind != moveFileObservationCommit || record.moveFile == nil || record.key != o.id {
-		return err
+	if ledger.byID[record.id] != record || record.owner != s || record.kind != moveFileObservationCommit || record.moveFile == nil || record.key != o.id {
+		return physical, err
 	}
 	if !record.diskWriteStartedAt.IsZero() {
-		record.disk = mutationDiskFailed
-		record.errText = "unavailable_repeated_writer"
-		return err
+		record.disk, record.errText = mutationDiskFailed, "unavailable_repeated_writer"
+		return physical, err
 	}
-	record.diskWriteStartedAt, record.committedAt = started, returned
-	if err != nil {
+	if err != nil || physical == nil {
 		record.disk = mutationDiskFailed
-		record.errText = err.Error()
-		return err
+		if err != nil {
+			record.errText = err.Error()
+		}
+		return physical, err
 	}
-	record.disk, record.newSHA, record.bytesWritten = mutationDiskCommitted, blob, len(content)
-	record.commitSeq = mutationDiskCommitSequence.Add(1)
-	return err // observation never changes the real writer outcome
+	if ledger.byID[physical.id] != physical || physical.owner != s || physical.kind != physicalMutationCommit || physical.acknowledgement == nil || physical.acknowledgement != record.acknowledgement || physical.absPath != path || physical.disk != mutationDiskCommitted {
+		record.disk, record.errText = mutationDiskFailed, "unavailable_physical_owner"
+		return physical, err
+	}
+	// This is one write event. Borrow its actual physical timestamps and
+	// sequence; no second disk lap, commit sequence or source authority.
+	record.diskWriteStartedAt, record.committedAt = physical.diskWriteStartedAt, physical.committedAt
+	record.disk, record.newSHA, record.bytesWritten, record.commitSeq = physical.disk, physical.newSHA, physical.bytesWritten, physical.commitSeq
+	record.moveFile.physical = weak.Make(physical)
+	physical.moveTimingOwner = weak.Make(record)
+	return physical, err
+}
+
+// The caller holds ledger and the timing record. A weak association grants
+// no lifetime: eviction, a foreign ACK/path/owner or a replaced link refuses.
+func linkedMovePhysicalLocked(ledger *mutationCommitLedger, s *Server, record *mutationCommitRecord) *mutationCommitRecord {
+	if record.moveFile == nil {
+		return nil
+	}
+	physical := record.moveFile.physical.Value()
+	if physical == nil || physical == record {
+		return nil
+	}
+	physical.mu.RLock()
+	defer physical.mu.RUnlock()
+	if ledger.byID[record.id] != record || ledger.byID[physical.id] != physical || record.owner != s || physical.owner != s || record.kind != moveFileObservationCommit || physical.kind != physicalMutationCommit || physical.moveTimingOwner.Value() != record || record.acknowledgement == nil || physical.acknowledgement != record.acknowledgement || physical.absPath != record.absPath || physical.disk != mutationDiskCommitted || physical.commitSeq == 0 || physical.commitSeq != record.commitSeq || physical.newSHA == "" || physical.newSHA != record.newSHA || !physical.committedAt.Equal(record.committedAt) || !physical.diskWriteStartedAt.Equal(record.diskWriteStartedAt) {
+		return nil
+	}
+	return physical
 }
 
 func (o *moveObservation) finishWrites(success bool) {
@@ -158,6 +183,7 @@ func (o *moveObservation) observer(ctx context.Context, path string, idx *indexe
 	ledger.mu.Lock()
 	record.mu.Lock()
 	valid := ledger.byID[record.id] == record && record.kind == moveFileObservationCommit && record.owner == o.server && record.moveFile != nil && record.moveFile.writeVerdict == "all_writes_completed" && !record.moveFile.directClaimed && record.disk == mutationDiskCommitted && record.newSHA != "" && !record.committedAt.IsZero() && record.commitSeq != 0
+	valid = valid && linkedMovePhysicalLocked(ledger, o.server, record) != nil
 	if valid {
 		witness.id, witness.operation, witness.path, witness.blob, witness.committed, witness.commitSeq = record.id, record.key, record.absPath, record.newSHA, record.committedAt, record.commitSeq
 		record.moveFile.directClaimed = true
@@ -186,14 +212,23 @@ func (s *Server) moveReadRepairObserver(ctx context.Context, path string, idx *i
 		if !record.isPublicationOwner() && record.kind != moveFileObservationCommit || record.absPath != path {
 			continue
 		}
+		physical := record
 		if record.kind != moveFileObservationCommit {
-			return nil, false
+			record.mu.RLock()
+			paired := record.moveTimingOwner.Value()
+			record.mu.RUnlock()
+			if paired == nil {
+				return nil, false
+			}
+			record = paired
 		}
 		record.mu.Lock()
 		defer record.mu.Unlock()
-		if ledger.byID[record.id] != record || record.owner != s || record.moveFile == nil || record.moveFile.readClaimed || record.disk != mutationDiskCommitted || record.newSHA == "" || record.committedAt.IsZero() || record.commitSeq == 0 {
+		linked := linkedMovePhysicalLocked(ledger, s, record)
+		if linked == nil || physical != record && linked != physical || ledger.byID[record.id] != record || record.owner != s || record.moveFile == nil || record.moveFile.readClaimed || record.disk != mutationDiskCommitted || record.newSHA == "" || record.committedAt.IsZero() || record.commitSeq == 0 {
 			return nil, true
 		}
+
 		// Capture can precede the overall write verdict. Completion still requires
 		// that exact record's final successful verdict; no later retry can rebind it.
 		if record.moveFile.writeVerdict != "pending" && record.moveFile.writeVerdict != "all_writes_completed" {
@@ -269,10 +304,19 @@ func (w moveDirectWitness) complete(observed indexer.ReadRepairObservation) {
 			locked[i].mu.RUnlock()
 		}
 	}()
+	record.mu.RLock()
+	ownedPhysical := linkedMovePhysicalLocked(ledger, s, record)
+	record.mu.RUnlock()
 	firstPath := true
 	refused := ""
+	if ownedPhysical == nil {
+		refused = "unavailable_physical_owner"
+	}
 	for i := len(ledger.ordered) - 1; i >= 0; i-- {
 		candidate := ledger.ordered[i]
+		if candidate == ownedPhysical {
+			continue
+		} // same actual write, already checked above
 		if !candidate.isPublicationOwner() && candidate.kind != moveFileObservationCommit || candidate.absPath != w.path {
 			continue
 		}

@@ -54,8 +54,8 @@ type readRepairHeldWatcher struct {
 	enqueued chan struct{}
 }
 
-func (w *readRepairHeldWatcher) EnqueueFileMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
-	ticket, err := w.canonicalPublicationWatcher.EnqueueFileMutation(ctx, path)
+func (w *readRepairHeldWatcher) EnqueueToolMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
+	ticket, err := w.canonicalPublicationWatcher.EnqueueToolMutation(ctx, path)
 	close(w.enqueued)
 	return ticket, err
 }
@@ -108,7 +108,7 @@ func testReadRepairBeforeWatcherAdmission(t *testing.T, inFlight, earlyExecution
 			}
 		}
 	}
-	record, err := s.commitFileMutation(ctx, "write_file", "logical-reader-admission", "reader admission fixture", "main.go", path, after, 0o600)
+	record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "logical-reader-admission", "reader admission fixture", "main.go", path, after, 0o600)
 	require.NoError(t, err)
 	require.Nil(t, record.publication)
 	require.Nil(t, record.readRepairAdmission.Value())
@@ -243,7 +243,7 @@ func TestReadRepairSeesCommittedAdmissionBeforeACKAndSurvivesSuccessClear(t *tes
 	ctx, cancel := context.WithCancel(canonicalTimingContext())
 	t.Cleanup(cancel)
 	path := filepath.Join(t.TempDir(), "edit.go")
-	record, err := s.commitFileMutation(ctx, "write_file", "caller-logical-id", "distinct-id fixture", filepath.Base(path), path, []byte("package edited\n"), 0o600)
+	record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "caller-logical-id", "distinct-id fixture", filepath.Base(path), path, []byte("package edited\n"), 0o600)
 	require.NoError(t, err)
 	idx := &indexer.Indexer{}
 	outcome := make(chan mutationReindexOutcome, 1)

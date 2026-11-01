@@ -472,6 +472,31 @@ the first attests *what bytes* are on disk, the second whether the write
 happened at all. A call abandoned before its response returns no evidence block
 — only the receipt — which is exactly when `disk_status` is the field you need.
 
+### Publication tiers and freshness
+
+`readback_exact:true` means the written bytes can be used immediately; continue
+without polling. Graph relations and derived analyses can publish later. Check
+`graph_freshness` before acting on callers, usages, impact, or rename plans.
+Before a rename, deletion, or signature change, send `require_fresh:true`,
+`freshness_scope:"relations"`, and an absolute RFC3339 `wait_deadline`.
+`freshness_scope` accepts `file`, `relations`, and `derived` as request metadata;
+it is intentionally absent from tool schemas. Text and declaration capability
+scopes do not select a publication tier.
+
+Pending or failed answers carry a visible tier line in text/TOON/compact output;
+GCX preserves its `GCX1` header and places the line immediately after it. JSON
+carries the same fields in its freshness block. An idle fresh answer gains no
+fields. Never classify a symbol as dead while its file is pending.
+
+`mutation_status` reads live `ack_at`, `file_graph_at`, `relations_at`, and
+`derived_at` stamps when a watcher ticket observed them. Missing stamps mean
+unobserved work. Unknown receipt or mutation IDs return `state:"lost"` immediately;
+a lost receipt cannot certify freshness. After restart, relation queries remain
+pending until the shared startup resolver has published. File reads still check
+current disk state. CLI verbs print the freshness line on stderr;
+`--require-fresh` exits with code 4 when the requested tier remains pending or
+failed.
+
 ## Agent-optimized (token efficiency)
 
 | Tool | Description |
@@ -511,6 +536,8 @@ Gortex captures every large tool response into a bounded per-session ring; these
 | `find_co_changing_symbols` | Ranked git co-change neighbours for a symbol — over the mined cosine-weighted `co_change` edge layer |
 | `search_artifacts` | Full-text search over the context-artifacts manifest — DB schemas, API specs, infra configs, ADRs registered via `.gortex.yaml::artifacts` |
 | `get_artifact` | Fetch one context artifact by id, with its content and the symbols it references |
+
+`detect_changes` and `explain_change_impact` wait up to 250 ms for edits in the answer's relation scope: the symbols' files, their callers, files naming the symbols, and the diff's changed files. Edits outside that scope do not delay the answer. Pending or failed edits return the usual analysis with `complete:false`, `graph_freshness:pending|failed`, `freshness_scope:relations`, `pending_files` (at most 16), and `pending_file_count`; failures include a recovery hint. Every answer reports `barrier_wait_ms`. An earlier `wait_deadline` shortens the wait; `require_fresh:true` instead waits until its request deadline and returns an error if the scope is still lagging. Text answers begin with `relations: pending|failed (N files)`; GCX preserves `GCX1` on line 1 and puts the relations comment on line 2. Stop and post-edit briefings bound detection to 300 ms and report pending relations instead of silently omitting the briefing.
 
 ## Proactive safety
 

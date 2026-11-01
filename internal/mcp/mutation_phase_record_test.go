@@ -24,7 +24,7 @@ type canonicalPublicationWatcher struct {
 	results   []chan indexer.MutationResult
 }
 
-func (w *canonicalPublicationWatcher) EnqueueFileMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
+func (w *canonicalPublicationWatcher) EnqueueToolMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
 	if w.scheduleErr != nil {
 		return nil, w.scheduleErr
 	}
@@ -53,7 +53,7 @@ func canonicalTimingContext() context.Context {
 
 func commitTimingFixture(t *testing.T, s *Server, ctx context.Context, path, content string) *mutationCommitRecord {
 	t.Helper()
-	record, err := s.commitFileMutation(ctx, "write_file", "", "", filepath.Base(path), path, []byte(content), 0o600)
+	record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "", filepath.Base(path), path, []byte(content), 0o600)
 	require.NoError(t, err)
 	return record
 }

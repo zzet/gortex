@@ -9,7 +9,6 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 
-	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
@@ -326,6 +325,11 @@ func (s *Server) diskWriteForMerge(ctx context.Context) daemon.DiskWriteFn {
 		if resolveErr != nil {
 			return fmt.Errorf("merge to_disk: %s: %w", f.Path, resolveErr)
 		}
+		ctx, release, err := acquireMutationPath(ctx, absPath)
+		if err != nil {
+			return fmt.Errorf("merge to_disk: lock %s: %w", f.Path, err)
+		}
+		defer release()
 		if f.Deleted {
 			// Tombstone-on-disk: remove the file. Honour the
 			// drift guard before removal so a concurrent edit
@@ -345,10 +349,12 @@ func (s *Server) diskWriteForMerge(ctx context.Context) daemon.DiskWriteFn {
 					return fmt.Errorf("%s: %w", f.Path, daemon.ErrOverlayDrift)
 				}
 			}
-			if rmErr := os.Remove(absPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			commit, rmErr := s.commitFileMutation(ctx, "overlay_merge", "", "", f.Path, absPath, nil, 0, sourceMutationOperation{kind: sourceRemove})
+			if rmErr != nil {
 				return fmt.Errorf("merge to_disk: remove %s: %w", absPath, rmErr)
 			}
-			s.reindexFile(absPath)
+			release()
+			commit.recordGraph(mutationReindexOutcome{Reindexed: s.reindexFile(absPath)})
 			return nil
 		}
 		if f.BaseSHA != "" {
@@ -369,10 +375,12 @@ func (s *Server) diskWriteForMerge(ctx context.Context) daemon.DiskWriteFn {
 		if info, statErr := os.Stat(absPath); statErr == nil {
 			perm = info.Mode().Perm()
 		}
-		if err := agents.AtomicWriteFile(absPath, []byte(f.Content), perm); err != nil {
+		commit, err := s.commitFileMutation(ctx, "overlay_merge", "", "", f.Path, absPath, []byte(f.Content), perm)
+		if err != nil {
 			return fmt.Errorf("merge to_disk: write %s: %w", absPath, err)
 		}
-		s.reindexFile(absPath)
+		release()
+		commit.recordGraph(mutationReindexOutcome{Reindexed: s.reindexFile(absPath)})
 		return nil
 	}
 }

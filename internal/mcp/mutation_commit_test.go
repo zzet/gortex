@@ -49,6 +49,21 @@ func editFileRequest(args map[string]any) mcp.CallToolRequest {
 	return req
 }
 
+// commitHeldFileMutationForTest supplies the real path lock now required by
+// the primitive. Keep the original request context (including cancellation and
+// checkout refusal evidence) so these existing deeper-boundary tests still
+// exercise their intended guard rather than a lock-admission refusal.
+func (s *Server) commitHeldFileMutationForTest(t *testing.T, ctx context.Context,
+	tool, mutationID, fingerprint, relPath, absPath string, data []byte, perm os.FileMode,
+) (*mutationCommitRecord, error) {
+	t.Helper()
+	held, release, err := acquireMutationPath(context.Background(), absPath)
+	require.NoError(t, err)
+	defer release()
+	ctx = context.WithValue(ctx, mutationPathAdmissionKey{}, held.Value(mutationPathAdmissionKey{}))
+	return s.commitFileMutation(ctx, tool, mutationID, fingerprint, relPath, absPath, data, perm)
+}
+
 // --- Criterion: timeout BEFORE the write applies nothing -------------------
 
 // A cancelled request must not reach the disk. The handler takes its
@@ -155,7 +170,7 @@ func TestAbandonedCallReportsCommittedDiskWrite(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	handler := func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		record, err := s.commitFileMutation(ctx, "write_file", "", "fp", "landed.go", target,
+		record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "fp", "landed.go", target,
 			[]byte("package p\n"), 0o644)
 		require.NoError(t, err)
 		require.Equal(t, mutationDiskCommitted, record.diskStatus())
@@ -208,7 +223,7 @@ func TestAbandonedCallReportsNotAppliedWrite(t *testing.T) {
 
 	handler := func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		<-ctx.Done() // the deadline fires first
-		_, err := s.commitFileMutation(ctx, "write_file", "", "fp", "refused.go", target,
+		_, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "fp", "refused.go", target,
 			[]byte("package p\n"), 0o644)
 		require.Error(t, err)
 		return mcp.NewToolResultText("unreachable"), nil
@@ -312,15 +327,14 @@ func TestMutationStatusResolvesReceiptPathAndListing(t *testing.T) {
 	require.Equal(t, "unrecorded", unknown["disk_status"])
 }
 
-func TestMutationStatusUnknownReceiptIsAnError(t *testing.T) {
+func TestMutationStatusUnknownReceiptIsLost(t *testing.T) {
 	s := newMutationServer()
 	req := mcp.CallToolRequest{}
 	req.Params.Name = "mutation_status"
 	req.Params.Arguments = map[string]any{"receipt": "commit-does-not-exist"}
 	res, err := s.handleMutationStatus(context.Background(), req)
 	require.NoError(t, err)
-	require.True(t, res.IsError)
-	require.Contains(t, resultText(res), "no mutation receipt")
+	require.Equal(t, "lost", resultJSON(t, res)["state"])
 }
 
 // --- Criterion: retrying after a timeout is idempotent ---------------------
