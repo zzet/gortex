@@ -38,6 +38,7 @@ type runOptions struct {
 	EditCount         int
 	EditProbeRole     string
 	editProbeBaseline bool
+	Startup           startupOptions
 	pairedDriver      func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
 	smokeState        *privateRun // only the fixed smoke entry lends its freshly owned store
 	smokeMarkers      []string
@@ -79,6 +80,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.BoolVar(&o.KeepState, "keep-state", false, "retain private corpus/store for native diagnostics only (default removes completed scenario state)")
 	f.IntVar(&o.SweepRepetitions, "sweep-repetitions", 15, "samples per benchmark operation (smoke may explicitly use 1)")
 	f.DurationVar(&o.SweepBudget, "sweep-duration", 10*time.Minute, "separate total budget for the repeated paced sweep")
+	bindStartupFlags(f, &o.Startup)
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
@@ -91,6 +93,9 @@ func validateRunOptions(o runOptions) error {
 		return errors.New("run requires --binary, --manifest, --scratch and nonnegative counts and positive budgets")
 	}
 	if err := validateAgentCounts(o.Scenario, o.Agents, o.Editors); err != nil {
+		return err
+	}
+	if err := o.Startup.validate(o.Scenario); err != nil {
 		return err
 	}
 	if o.Scenario == "idle-stop" && (o.Worktrees != 0 || o.CPUProfile != 0 || o.Profile != "agent") {
@@ -136,6 +141,9 @@ func selectedScenarios(o runOptions) ([]string, error) {
 		return []string{"idle-stop"}, nil
 	}
 	all := []string{"read", "edit", "many", "many-edit", "worktrees", "cold", "restart", "sweep"}
+	if o.Scenario == startupScenario {
+		return []string{startupScenario}, nil
+	}
 	if o.Scenario == editProbeScenario {
 		return []string{editProbeScenario}, nil
 	}

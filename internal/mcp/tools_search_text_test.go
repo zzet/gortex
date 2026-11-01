@@ -183,8 +183,7 @@ func TestSearchText_MultiRepoFanout(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 	require.True(t, mi.IsMultiRepo())
 
 	eng := query.NewEngine(g)
@@ -239,8 +238,7 @@ func TestSearchText_MultiRepoScopedGrepDoesNotLetOutOfScopeRepoConsumeLimit(t *t
 	reg.Register(languages.NewGoExtractor())
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	flagOn := true
@@ -297,8 +295,7 @@ func TestFilterTextMatchesByResolvedScope_FailsClosed(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	srv := NewServer(eng, g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
@@ -367,8 +364,7 @@ func TestGetFileSummary_MultiRepoRelativePath(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 	require.True(t, mi.IsMultiRepo())
 
 	eng := query.NewEngine(g)
@@ -514,8 +510,7 @@ func TestSearchTextScopedNeverScansAndRowsStayFlat(t *testing.T) {
 		reg.Register(languages.NewGoExtractor())
 		counter := newScopedReadCounter(openContractCoreCapStore(t))
 		mi := indexer.NewMultiIndexer(counter, reg, search.NewNull(), cm, zap.NewNop())
-		_, err = mi.IndexAll()
-		require.NoError(t, err)
+		registerMCPFixtureRepos(t, mi, cm)
 		srv := NewServer(query.NewEngine(counter), counter, nil, nil, zap.NewNop(), nil, MultiRepoOptions{ConfigManager: cm, MultiIndexer: mi})
 		installContractCoreKindTestRuntime(t, srv)
 		return srv, counter

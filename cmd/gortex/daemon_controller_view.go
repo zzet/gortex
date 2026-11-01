@@ -310,6 +310,10 @@ func fallbackProbeView(kind, checkoutID, repoPrefix, reason string) *daemon.Prob
 // and one whose view is not built yet is answered as uncovered so the hook
 // allows the native tool through.
 func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverageParams) (daemon.FileCoverageResult, error) {
+	return c.fileCoverageWithProbe(ctx, p, c.resolveProbeView)
+}
+
+func (c *realController) fileCoverageWithProbe(ctx context.Context, p daemon.FileCoverageParams, resolve func(context.Context, string) probeView) (daemon.FileCoverageResult, error) {
 	if c == nil || p.Path == "" {
 		return daemon.FileCoverageResult{}, nil
 	}
@@ -319,7 +323,7 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 	}
 
 	mutationProbe := c.lifecycle.CaptureCheckoutMutationProbe()
-	view := c.resolveProbeView(ctx, abs)
+	view := resolve(ctx, abs)
 	defer view.release()
 
 	out := daemon.FileCoverageResult{View: view.answer, Tracked: c.pathTracked(abs, view)}
@@ -329,8 +333,13 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 	// rows and reports the file covered while every graph call refuses with
 	// repo_loading. The state rides on the reply so the hook can let the
 	// native tool through instead of denying the only read path left.
-	if repo, loading := c.loadingRepoForPath(abs); loading {
-		out.RepoState, out.Repo = daemon.RepoStateLoading, repo
+	if rec, classified := c.pendingRepoLoadForPath(abs); classified {
+		if rec.State.Loading() && rec.State != indexer.RepoLoadIdentityPending {
+			out.RepoState, out.Repo = daemon.RepoStateLoading, rec.Label()
+		} else if !out.Tracked && (rec.State == indexer.RepoLoadIdentityPending || rec.State.Ready()) {
+			out.RepoState = daemon.RepoStateIdentityPending
+			return out, nil // unknown or newly ready needs a fresh authoritative probe
+		}
 	}
 	if !view.servable {
 		return out, nil
@@ -414,6 +423,10 @@ const dirCoverageWalkBudget = 500 * time.Millisecond
 // there. It is the scope verdict a PreToolUse hook turns into a Grep/Glob
 // deny; both halves are exact rather than sampled.
 func (c *realController) DirCoverage(ctx context.Context, p daemon.DirCoverageParams) (daemon.DirCoverageResult, error) {
+	return c.dirCoverageWithProbe(ctx, p, c.resolveProbeView)
+}
+
+func (c *realController) dirCoverageWithProbe(ctx context.Context, p daemon.DirCoverageParams, resolve func(context.Context, string) probeView) (daemon.DirCoverageResult, error) {
 	if c == nil || p.Path == "" {
 		return daemon.DirCoverageResult{}, nil
 	}
@@ -422,13 +435,18 @@ func (c *realController) DirCoverage(ctx context.Context, p daemon.DirCoveragePa
 		abs = resolved
 	}
 
-	view := c.resolveProbeView(ctx, abs)
+	view := resolve(ctx, abs)
 	defer view.release()
 
 	out := daemon.DirCoverageResult{View: view.answer, Tracked: c.pathTracked(abs, view)}
 	// See FileCoverage: a loading repository's scope must not deny Grep.
-	if repo, loading := c.loadingRepoForPath(abs); loading {
-		out.RepoState, out.Repo = daemon.RepoStateLoading, repo
+	if rec, classified := c.pendingRepoLoadForPath(abs); classified {
+		if rec.State.Loading() && rec.State != indexer.RepoLoadIdentityPending {
+			out.RepoState, out.Repo = daemon.RepoStateLoading, rec.Label()
+		} else if !out.Tracked && (rec.State == indexer.RepoLoadIdentityPending || rec.State.Ready()) {
+			out.RepoState = daemon.RepoStateIdentityPending
+			return out, nil // unknown or newly ready needs a fresh authoritative probe
+		}
 	}
 	if !view.servable {
 		return out, nil
