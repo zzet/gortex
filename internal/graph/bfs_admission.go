@@ -4,7 +4,9 @@ import "context"
 
 // BFSAdmissionRequest describes the ordinary one-direction walk whose
 // admission remains in the query engine. Dispatch and test-exclusion hooks
-// keep their selected-reader walk instead of using this projection.
+// keep their selected-reader walk instead of using this projection. The
+// engine admits the seed against Scope before asking, so a projection keeps
+// visible edges back to the seed without checking its scope again.
 type BFSAdmissionRequest struct {
 	Seed         string
 	Direction    Direction
@@ -13,11 +15,18 @@ type BFSAdmissionRequest struct {
 	Scope        NodeScope
 }
 
-// BFSAdmissionSnapshot carries exactly the selected adjacency needed by Go's
-// admission oracle. Adjacency.Total may saturate at Request.Limit: every sort
-// threshold in that walk is at most that limit. It must never underestimate
-// a smaller threshold. Missing neighbors are absent from Nodes; their edges
-// remain evidence, including unresolved-target boundaries.
+// BFSAdmissionSnapshot carries the selected adjacency needed by Go's admission
+// oracle. Nodes holds walked neighbors only. The caller supplies the seed, and
+// unresolved or external targets, which admission never reads, are absent like
+// missing neighbors; their edges remain evidence, including unresolved-target
+// boundaries. Nodes may also hold neighbors outside the workspace or project
+// scope, which admission rejects itself: under a repository narrow, any in a
+// narrowed repository; without one, any in the seed's repository.
+//
+// Adjacency.Total is either the visible count saturated at Request.Limit, or
+// an upper bound below Request.Limit-1-len(Nodes). Admission over the snapshot
+// holds at most 1+len(Nodes) nodes and sorts before its cap once held nodes
+// plus Total reach Limit, so both forms decide that sort the same way.
 type BFSAdmissionSnapshot struct {
 	Nodes     map[string]*Node
 	Adjacency map[string]KindAdjacency
