@@ -542,17 +542,19 @@ func (idx *Indexer) reindexIncrementalFallback(
 		plan.ContractBridgeNodeIDs,
 		contractBridgeNodeIDsForNodes(idx.graph, fallback.priorNodes)...,
 	)
+	// The refresh can reject the prepared snapshot because the source moved
+	// on. The combined fallback has no proof for restating the old graph's
+	// inert rows, including when applying its new read fails.
+	delete(idx.inertReparsed, fallback.graphPath)
 	resolve := markerBatch == nil || !markerBatch.deferResolverCatchup
 	if err := idx.indexFile(fallback.filePath, resolve, markerBatch); err != nil {
 		return err
 	}
 	freshNodes := idx.graph.GetFileNodesByPaths([]string{fallback.graphPath})[fallback.graphPath]
 	freshDerived := storedDerivedFingerprints(freshNodes)
-	if fallback.probeOK && fallback.probe.derived.complete() {
-		freshDerived = fallback.probe.derived
-	}
-	semanticChanged := !fallback.probeOK || fallback.storedGraph.semantic == "" ||
-		fallback.probe.fingerprints.semantic != fallback.storedGraph.semantic
+	freshGraph := storedExtractionGraphFingerprints(freshNodes)
+	semanticChanged := fallback.storedGraph.semantic == "" || freshGraph.semantic == "" ||
+		freshGraph.semantic != fallback.storedGraph.semantic
 	plan.Merge(derivedPlanForDelta(
 		fallback.storedDerived, freshDerived, semanticChanged,
 		fallback.graphPath, fallback.priorNodes, freshNodes,

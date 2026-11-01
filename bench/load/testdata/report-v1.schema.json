@@ -684,6 +684,9 @@
                             }
                           ]
                         },
+                        "checkout_id": {
+                          "type": "string"
+                        },
                         "editor": {
                           "type": "integer"
                         },
@@ -1443,6 +1446,9 @@
                             }
                           ]
                         },
+                        "route": {
+                          "type": "string"
+                        },
                         "stale_claimed_fresh": {
                           "type": "boolean"
                         },
@@ -1767,6 +1773,9 @@
                       "language": {
                         "type": "string"
                       },
+                      "linked_worktrees": {
+                        "type": "integer"
+                      },
                       "mean_interarrival_ns": {
                         "type": "integer"
                       },
@@ -1793,6 +1802,56 @@
                       },
                       "repo": {
                         "type": "string"
+                      },
+                      "routes": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "callee": {
+                              "type": "string"
+                            },
+                            "commit": {
+                              "type": "string"
+                            },
+                            "file": {
+                              "type": "string"
+                            },
+                            "id": {
+                              "type": "string"
+                            },
+                            "kind": {
+                              "type": "string"
+                            },
+                            "language": {
+                              "type": "string"
+                            },
+                            "mode": {
+                              "type": "string"
+                            },
+                            "repo": {
+                              "type": "string"
+                            },
+                            "tool": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "repo",
+                            "commit",
+                            "file",
+                            "callee",
+                            "kind",
+                            "tool",
+                            "language",
+                            "mode"
+                          ],
+                          "type": "object"
+                        },
+                        "type": [
+                          "array",
+                          "null"
+                        ]
                       },
                       "seed": {
                         "type": "integer"
@@ -1890,6 +1949,9 @@
                               "type": "object"
                             },
                             "request_sha256": {
+                              "type": "string"
+                            },
+                            "route": {
                               "type": "string"
                             },
                             "sender": {
@@ -3552,6 +3614,9 @@
                 "language": {
                   "type": "string"
                 },
+                "linked_worktrees": {
+                  "type": "integer"
+                },
                 "mean_interarrival_ns": {
                   "type": "integer"
                 },
@@ -3578,6 +3643,56 @@
                 },
                 "repo": {
                   "type": "string"
+                },
+                "routes": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "callee": {
+                        "type": "string"
+                      },
+                      "commit": {
+                        "type": "string"
+                      },
+                      "file": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string"
+                      },
+                      "language": {
+                        "type": "string"
+                      },
+                      "mode": {
+                        "type": "string"
+                      },
+                      "repo": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "repo",
+                      "commit",
+                      "file",
+                      "callee",
+                      "kind",
+                      "tool",
+                      "language",
+                      "mode"
+                    ],
+                    "type": "object"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
                 },
                 "seed": {
                   "type": "integer"
@@ -3675,6 +3790,9 @@
                         "type": "object"
                       },
                       "request_sha256": {
+                        "type": "string"
+                      },
+                      "route": {
                         "type": "string"
                       },
                       "sender": {

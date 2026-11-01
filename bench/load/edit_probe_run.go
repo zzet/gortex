@@ -31,6 +31,8 @@ type editProbeReadback struct {
 type editProbeRecord struct {
 	Ordinal                  int                       `json:"ordinal"`
 	Editor                   int                       `json:"editor,omitempty"`
+	Route                    string                    `json:"route,omitempty"`
+	CheckoutID               string                    `json:"checkout_id,omitempty"`
 	Marker                   string                    `json:"marker"`
 	MutationID               string                    `json:"mutation_id"`
 	PlannedDueNS             int64                     `json:"planned_due_ns"`
@@ -123,6 +125,8 @@ type editProbeRuntime struct {
 	modeCounts        map[string]editProbeModeCounts
 	states            []*editProbeState
 	original          []byte
+	originals         map[string][]byte // routed checkout path -> independently admitted original bytes
+	checkoutIDs       map[string]string // linked checkout path -> exact admitted public view identity
 	moveOriginal      []byte
 	origin            time.Time
 	mu                sync.Mutex // Phase.Attempts, reads and mode counts only; request lifetimes are never serialized
@@ -133,7 +137,7 @@ type editProbeRuntime struct {
 }
 
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
-	record := editProbeRecord{Ordinal: step.Ordinal, Editor: step.Editor, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), Readback: unavailable("ms", "edit not acknowledged"), Derived: unavailable("ms", "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
+	record := editProbeRecord{Ordinal: step.Ordinal, Editor: step.Editor, Route: step.Route, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), Readback: unavailable("ms", "edit not acknowledged"), Derived: unavailable("ms", "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
 	for _, oracle := range editProbeOracles(c, step) {
 		record.FirstCorrect[oracle.name] = unavailable("ms", "not observed")
 	}
@@ -185,14 +189,84 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	return out
 }
 
+// The editor's successful handshake owns its checkout. Prefixes are shared by
+// linked worktrees and cannot identify a view. A singleton has one unambiguous
+// route; with several checkouts an unknown session never inherits the primary.
+func (r *editProbeRuntime) repoFor(step editProbeStep) (privateRepo, error) {
+	if len(r.p.Repos) == 1 {
+		return r.p.Repos[0], nil // standalone receipt collectors need no editor session
+	}
+	if step.Editor < 0 || step.Editor >= len(r.editors) {
+		return privateRepo{}, fmt.Errorf("edit %d has unknown editor %d", step.Ordinal, step.Editor)
+	}
+	editor := r.editors[step.Editor]
+	if editor == nil {
+		return privateRepo{}, fmt.Errorf("edit %d has no editor session", step.Ordinal)
+	}
+	var offered *editProbeRoute
+	for i := range r.plan.Routes {
+		if r.plan.Routes[i].ID == step.Route {
+			offered = &r.plan.Routes[i]
+			break
+		}
+	}
+	if len(r.plan.Routes) > 0 && (offered == nil || step.Route == "" || r.plan.Routes[step.Editor%len(r.plan.Routes)].ID != step.Route) || len(r.plan.Routes) == 0 && step.Route != "" {
+		return privateRepo{}, errors.New("edit has an unknown or foreign offered route")
+	}
+	for _, repo := range r.p.Repos {
+		if editor.cwd != "" && filepath.Clean(editor.cwd) == filepath.Clean(repo.Path) {
+			logicalRepo := repo.Corpus.Label
+			if r.plan.LinkedWorktrees > 0 {
+				logicalRepo = r.plan.Repo
+			}
+			if offered != nil && (offered.ID != repo.Corpus.Label || offered.Repo != logicalRepo || offered.Commit != repo.Corpus.Commit || offered.File != repo.Corpus.File) {
+				return privateRepo{}, errors.New("editor checkout differs from its offered route pin")
+			}
+			return repo, nil
+		}
+	}
+	return privateRepo{}, fmt.Errorf("edit %d editor checkout is not a registered route", step.Ordinal)
+}
+
+func (r *editProbeRuntime) calleeFor(repo privateRepo) string {
+	if len(r.p.Repos) == 1 {
+		return r.plan.Callee
+	}
+	selected := repo.Corpus.Symbol
+	if repo.Corpus.EditKind == "add_crossfile_call" {
+		selected = repo.Corpus.EditCallee
+	}
+	separator := strings.LastIndex(selected, "::")
+	if separator < 0 {
+		return ""
+	}
+	return selected[separator+2:]
+}
+
 func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers, editors []*socketClient, phase *Phase) (*editProbeRuntime, []*socketClient, error) {
-	plan, err := planEditProbe(p.Repos[0].Corpus, o)
+	corpora := make([]Corpus, len(p.Repos))
+	for i, repo := range p.Repos {
+		corpora[i] = repo.Corpus
+	}
+	plan, err := planEditProbeRoutes(corpora, o)
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(plan.Routes) > 0 && len(plan.Routes) != len(p.Repos) {
+		return nil, nil, errors.New("offered edit routes differ from registered private checkout count")
+	}
+	if len(p.Repos) > 1 {
+		for _, repo := range p.Repos {
+			c := repo.Corpus
+			if plan.Kind != "add_intrafile_call" || plan.Tool != "edit.file" || plan.Mode != "json" || plan.Sender != "" || filepath.Ext(c.File) != ".go" || c.EditSender != "" || c.EditKind != "" && c.EditKind != "add_intrafile_call" || c.EditTool != "" && c.EditTool != "edit.file" || c.EditOutput != "" && c.EditOutput != "json" {
+				return nil, nil, errors.New("routed edit-probe runtime currently supports ordinary Go add_intrafile_call/edit.file JSON fixtures only")
+			}
+		}
 	}
 	if len(editors) != max(1, plan.Editors) || len(readers) != plan.Readers {
 		return nil, nil, fmt.Errorf("edit-and-probe plan has %d fixed editors and %d readers but %d editor and %d reader sessions", max(1, plan.Editors), plan.Readers, len(editors), len(readers))
 	}
+	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, requireAccounting: !o.editProbeBaseline}
 	original, err := os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
 	if err != nil {
 		return nil, nil, err
@@ -220,7 +294,52 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 			return nil, nil, errors.New("planned marker already exists before edit")
 		}
 	}
-	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, original: original, requireAccounting: !o.editProbeBaseline}
+	r.original = original
+	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, r.requireAccounting)
+	if len(p.Repos) > 1 {
+		r.originals = make(map[string][]byte, len(p.Repos))
+		for _, repo := range p.Repos {
+			data, readErr := os.ReadFile(filepath.Join(repo.Path, filepath.FromSlash(repo.Corpus.File)))
+			if readErr != nil {
+				return r, nil, readErr
+			}
+			if err := editProbeWriteAdmission(repo.Corpus, data); err != nil {
+				return r, nil, err
+			}
+			if strings.Count(string(data), repo.Corpus.EditAnchor) != 1 {
+				return r, nil, errors.New("each routed edit-probe anchor must occur exactly once")
+			}
+			for _, step := range plan.Steps {
+				if strings.Contains(string(data), step.Marker) {
+					return r, nil, errors.New("planned marker already exists in a routed fixture")
+				}
+			}
+			r.originals[repo.Path] = data
+		}
+	}
+	if plan.LinkedWorktrees > 0 {
+		r.checkoutIDs = make(map[string]string, plan.LinkedWorktrees)
+		seen := map[string]bool{}
+		for _, repo := range p.Repos[1:] {
+			var admitted struct {
+				View *struct {
+					Kind   string `json:"kind"`
+					Exact  bool   `json:"exact"`
+					Prefix string `json:"repo_prefix"`
+					ID     string `json:"checkout_id"`
+				} `json:"view"`
+			}
+			if err := json.Unmarshal(phase.Gate[repo.Corpus.Label+".view"], &admitted); err != nil || admitted.View == nil || !admitted.View.Exact || admitted.View.Kind != "worktree" || admitted.View.Prefix != repo.Prefix || strings.TrimSpace(admitted.View.ID) == "" {
+				return r, nil, errors.New("linked checkout has no exact admitted public checkout identity")
+			}
+			id := admitted.View.ID
+			if seen[id] {
+				return r, nil, errors.New("linked checkouts share an admitted checkout identity")
+			}
+			seen[id] = true
+			r.checkoutIDs[repo.Path] = id
+		}
+	}
 	if plan.Tool == "refactor.move" {
 		r.moveOriginal, err = os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(p.Repos[0].Corpus.EditDestination)))
 		if err != nil {
@@ -230,7 +349,6 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 			return r, nil, errors.New("move destination bytes differ from offered fixture")
 		}
 	}
-	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, r.requireAccounting)
 	if plan.Sender == editProbeRestart {
 		r.restarter = editProbeDaemonRestarter{p: p}
 	}
@@ -247,7 +365,12 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	var clients []*socketClient
 	setup := time.Now()
 	for _, step := range plan.Steps {
-		record := newEditProbeRecord(p.Repos[0].Corpus, step)
+		repo, err := r.repoFor(step)
+		if err != nil {
+			return r, nil, err
+		}
+		record := newEditProbeRecord(repo.Corpus, step)
+		record.CheckoutID = r.checkoutIDs[repo.Path]
 		record.Outcome = "not_started"
 		record.Errors = nil
 		state := &editProbeState{step: step, record: record}
@@ -255,13 +378,17 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		state.record.Evidence = filepath.Join(dir, fmt.Sprintf("edit-%03d.jsonl", step.Ordinal))
 	}
 	for _, state := range r.states {
+		repo, err := r.repoFor(state.step)
+		if err != nil {
+			return r, clients, err
+		}
 		sink, err := os.OpenFile(state.record.Evidence, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return r, clients, err
 		}
 		state.sink = sink
 		state.startRaw()
-		state.client, err = openMCP(ctx, p.Socket, p.Repos[0].Path)
+		state.client, err = openMCP(ctx, p.Socket, repo.Path)
 		if err != nil {
 			return r, clients, err
 		}
@@ -270,11 +397,11 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		// paired delete is sent; it cannot be admitted here.
 		if state.step.BeforeSymbol != "" && state.step.File == "" {
 			req := request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": state.step.BeforeSymbol}, "options": map[string]any{"context_lines": 0}}}
-			raw, identity, readErr := state.client.callWithIdentity(ctx, "tools/call", map[string]any{"name": req.Tool, "arguments": dispatchArgs(req, p.Repos[0])})
+			raw, identity, readErr := state.client.callWithIdentity(ctx, "tools/call", map[string]any{"name": req.Tool, "arguments": dispatchArgs(req, repo)})
 			if readErr == nil {
 				readErr = checkToolResult(raw)
 			}
-			proven := readErr == nil && editProbePresenceProof(raw, p.Repos[0].Corpus, state.step.BeforeSymbol)
+			proven := readErr == nil && editProbePresenceProof(raw, repo.Corpus, state.step.BeforeSymbol)
 			if err := state.emit(map[string]any{"event": "before_presence_admission", "symbol": state.step.BeforeSymbol, "wire_id": identity.ID, "write_started": identity.WriteStarted, "finished": identity.Finished, "payload": raw, "proven": proven}); err != nil {
 				return r, clients, err
 			}
@@ -447,6 +574,13 @@ func (r *editProbeRuntime) perform(ctx context.Context, s *editProbeState, clien
 }
 
 func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeState, client *socketClient, req request, purpose, role string, stream int) (json.RawMessage, wireCallIdentity, []Attempt, error) {
+	repo, routeErr := r.repoFor(s.step)
+	if routeErr != nil {
+		return nil, wireCallIdentity{}, nil, routeErr
+	}
+	if len(r.p.Repos) > 1 && (client == nil || filepath.Clean(client.cwd) != filepath.Clean(repo.Path)) {
+		return nil, wireCallIdentity{}, nil, errors.New("edit-probe request session belongs to another checkout")
+	}
 	budget := r.options.Deadline
 	if strings.HasPrefix(purpose, "oracle:") || purpose == "status" {
 		budget = min(budget, 20*time.Second)
@@ -455,7 +589,7 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 		budget = min(budget, time.Until(end))
 	}
 	caller := &editProbeCaller{runtime: r, state: s, client: client, purpose: purpose, request: req, role: role}
-	data, attempts, err := callEditProbeTool(ctx, caller, req, dispatchArgs(req, r.p.Repos[0]), role, 0, s.step.Ordinal, stream, budget, editProbeRetrySleep(r.options.Seed, s.step.Ordinal, stream))
+	data, attempts, err := callEditProbeTool(ctx, caller, req, dispatchArgs(req, repo), role, 0, s.step.Ordinal, stream, budget, editProbeRetrySleep(r.options.Seed, s.step.Ordinal, stream))
 	r.mu.Lock()
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
 	r.mu.Unlock()
@@ -486,14 +620,18 @@ func (r *editProbeRuntime) activateProbeState(step editProbeStep, cancel context
 }
 
 func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracle, sent time.Time, data json.RawMessage, identity wireCallIdentity, err error, pending bool) error {
+	repo, routeErr := r.repoFor(s.step)
+	if routeErr != nil {
+		return routeErr
+	}
 	ended := identity.Finished
 	if !identity.WriteStarted.IsZero() {
 		sent = identity.WriteStarted
 	}
 	body, decodeErr := decodeEditProbeOutput(data, r.probeOutput(oracle), oracle.call.name())
 	absence, exactRefusal := err.(*editProbeExpectedAbsence)
-	expectedAbsence := oracle.call.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == r.p.Repos[0].Prefix+"/"+oracle.call.ExpectedAbsentSymbol
-	correct := expectedAbsence || err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, r.p.Repos[0].Corpus, s.step, r.plan.Callee)
+	expectedAbsence := oracle.call.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == repo.Prefix+"/"+oracle.call.ExpectedAbsentSymbol
+	correct := expectedAbsence || err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, repo.Corpus, s.step, r.calleeFor(repo))
 	fresh := decodeErr == nil && editProbeClaimsFresh(body)
 	stale, precommit := false, false
 	s.mu.Lock()
@@ -535,7 +673,15 @@ func (r *editProbeRuntime) activate(ctx context.Context, step editProbeStep) {
 }
 
 func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.CancelFunc, s *editProbeState) {
-	for index, oracle := range editProbeOracles(r.p.Repos[0].Corpus, s.step) {
+	repo, err := r.repoFor(s.step)
+	if err != nil {
+		s.mu.Lock()
+		s.record.Errors = append(s.record.Errors, err.Error())
+		s.mu.Unlock()
+		cancel()
+		return
+	}
+	for index, oracle := range editProbeOracles(repo.Corpus, s.step) {
 		s.probes.Go(func() {
 			ticker := time.NewTicker(editProbePeriod)
 			defer ticker.Stop()
@@ -767,6 +913,12 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			}
 			if statusErr == nil {
 				if status, decodeErr := decodeEditProbeResult(raw); decodeErr == nil {
+					if expected := s.record.CheckoutID; expected != "" && status["checkout_id"] != expected {
+						s.mu.Lock()
+						s.record.Errors = append(s.record.Errors, "status checkout identity does not match the admitted linked view")
+						s.mu.Unlock()
+						break // Foreign terminal/accounting fields cannot settle this edit.
+					}
 					accounting := checkEditProbeAccountingForTool(status, receipt, r.plan.Tool)
 					s.mu.Lock()
 					s.record.Accounting = accounting
@@ -843,8 +995,15 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 // Observation-only kinds are recorded but neither gate the readback time nor
 // fail the record.
 func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editProbeState, step editProbeStep, readbackKinds []string, observeOnly map[string]bool) (time.Time, bool) {
+	repo, err := r.repoFor(step)
+	if err != nil {
+		s.mu.Lock()
+		s.record.Errors = append(s.record.Errors, err.Error())
+		s.mu.Unlock()
+		return time.Time{}, false
+	}
 	readbackEnd, readbacksCorrect := time.Time{}, true
-	file := r.plan.File
+	file := repo.Corpus.File
 	if step.File != "" {
 		file = step.File
 	}
@@ -876,12 +1035,12 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 		begin := time.Now()
 		raw, identity, readErr := r.perform(callCtx, s, r.editorFor(step), req, "readback:"+kind, "readback", 100+index)
 		payload, decodeErr := decodeEditProbeOutput(raw, editProbeRequestOutput(req), req.name())
-		back := editProbeReadback{Kind: kind, Latency: unavailable("ms", "response endpoint unavailable"), Correct: readErr == nil && decodeErr == nil && editProbeCorrect(kind, payload, r.p.Repos[0].Corpus, step, r.plan.Callee)}
+		back := editProbeReadback{Kind: kind, Latency: unavailable("ms", "response endpoint unavailable"), Correct: readErr == nil && decodeErr == nil && editProbeCorrect(kind, payload, repo.Corpus, step, r.calleeFor(repo))}
 		if !identity.Finished.IsZero() {
 			back.Latency = measured(float64(identity.Finished.Sub(begin))/float64(time.Millisecond), "ms")
 		}
 		absence, exactRefusal := readErr.(*editProbeExpectedAbsence)
-		if req.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == r.p.Repos[0].Prefix+"/"+req.ExpectedAbsentSymbol {
+		if req.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == repo.Prefix+"/"+req.ExpectedAbsentSymbol {
 			back.Correct = true
 			back.ExpectedOutcome = "symbol_absent"
 			back.Refusal = absence.message
@@ -1048,6 +1207,9 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 		if (record.Receipt == "" && record.Batch == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}
+	}
+	if len(r.p.Repos) > 1 {
+		return r.restoreRoutes(ctx)
 	}
 	current, err := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.plan.File)))
 	if err != nil {
