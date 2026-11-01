@@ -2929,16 +2929,26 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 
 	if !dryRun && s.indexer != nil {
+		paths := make([]string, 0, len(result.Edits))
+		for _, edit := range result.Edits {
+			abs, err := s.resolveGraphPath(ctx, edit.FilePath)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			paths = append(paths, abs)
+		}
+		ctx, release, err := acquireMutationPaths(ctx, paths)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		defer release()
 		// Apply edits by writing files. Every write funnels through
 		// commitFileMutation — the UTF-16 refusal (#846), the cancellation
 		// gate, and the mutation receipt live there. A direct os.WriteFile
 		// used to splice UTF-8 into NUL-interleaved bytes and corrupt the
 		// file from the insertion point on.
-		for _, edit := range result.Edits {
-			absPath := edit.FilePath
-			if root := s.indexer.RootPath(); root != "" {
-				absPath = filepath.Join(root, edit.FilePath)
-			}
+		for i, edit := range result.Edits {
+			absPath := paths[i]
 			content, readErr := os.ReadFile(absPath)
 			if readErr != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("could not read %s: %v", edit.FilePath, readErr)), nil
