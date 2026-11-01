@@ -53,6 +53,7 @@ func requireDaemonTool(repoPath, tool string, args map[string]any) (json.RawMess
 // surface without changing daemon-global configuration. It shares the normal
 // daemon-required and repo-not-tracked error behavior.
 func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, tools, toolsMode string) (json.RawMessage, error) {
+	args = applyCLIRequireFresh(args)
 	exec, err := resolveExecutorWithToolSurface(repoPath, tools, toolsMode)
 	if err != nil {
 		if errors.Is(err, ErrNoExecutor) {
@@ -62,6 +63,11 @@ func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, to
 	}
 	defer exec.Close()
 	out, err := callToolWaitingForLoad(exec, tool, args, effectiveLoadingWait())
+	if freshnessErr := checkCLIFreshness(rootCmd, out, err); freshnessErr != nil {
+		if _, coded := freshnessErr.(*exitCodeError); coded {
+			return nil, freshnessErr
+		}
+	}
 	if err != nil {
 		if errors.Is(err, ErrRepoNotTracked) {
 			return nil, daemonRequiredErr(repoPath)

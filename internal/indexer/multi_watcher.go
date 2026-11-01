@@ -248,12 +248,6 @@ func (mw *MultiWatcher) createWatcher(prefix string, cfg config.WatchConfig) err
 	w.discoverReindex = func(paths []string) (*IndexResult, error) {
 		return mw.multi.incrementalDiscoverRepo(prefix, paths)
 	}
-	w.explicitReindexRaw = func(paths []string) (*IndexResult, error) {
-		return mw.multi.incrementalReindexRepoRawMode(prefix, paths, incrementalPathMode{detectDeletions: true, forceExplicitFiles: true})
-	}
-	w.pointReindexRaw = func(filePath string, stamps *PublicationStamps) (*IndexResult, error) {
-		return mw.multi.incrementalPointRepoRawObserved(prefix, filePath, stamps)
-	}
 
 	mw.watchers[prefix] = w
 	return nil
@@ -1112,6 +1106,16 @@ func (mw *MultiWatcher) OnWorktreeChangeContext(cb WorktreeChangeCallback) {
 // cannot force a synchronous fallback, and a watcher that failed to start is
 // never reported as accepting work.
 func (mw *MultiWatcher) EnqueueFileMutation(ctx context.Context, filePath string) (*MutationTicket, error) {
+	return mw.enqueueFileMutation(ctx, filePath, false)
+}
+
+// EnqueueToolMutation routes committed tool writes through the same owner and
+// startup checks, without native debounce once the owner accepts them.
+func (mw *MultiWatcher) EnqueueToolMutation(ctx context.Context, filePath string) (*MutationTicket, error) {
+	return mw.enqueueFileMutation(ctx, filePath, true)
+}
+
+func (mw *MultiWatcher) enqueueFileMutation(ctx context.Context, filePath string, tool bool) (*MutationTicket, error) {
 	ctx, _ = canonicalSchedulingEntry(ctx)
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1133,6 +1137,9 @@ func (mw *MultiWatcher) EnqueueFileMutation(ctx context.Context, filePath string
 	if w == nil || !started {
 		return nil, nil
 	}
+	if tool {
+		return w.EnqueueToolMutation(ctx, filePath)
+	}
 	return w.EnqueueFileMutation(ctx, filePath)
 }
 
@@ -1140,7 +1147,7 @@ func (mw *MultiWatcher) EnqueueFileMutation(ctx context.Context, filePath string
 // Mixed owners retain the existing point admission path in the caller.
 func (mw *MultiWatcher) EnqueueFileMutations(ctx context.Context, paths []string) (map[string]*MutationTicket, error) {
 	if len(paths) == 1 {
-		ticket, err := mw.EnqueueFileMutation(ctx, paths[0])
+		ticket, err := mw.EnqueueToolMutation(ctx, paths[0])
 		if ticket == nil {
 			return nil, err
 		}

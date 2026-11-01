@@ -281,7 +281,7 @@ func TestRejectedCheckoutRefreshAdmissionReleasesItsPin(t *testing.T) {
 }
 
 // TestScheduledFileMutationPinsTheViewUntilTheTicketReports is the watcher
-// half of the same contract: EnqueueFileMutation is admitted on a detached
+// half of the same contract: EnqueueToolMutation is admitted on a detached
 // context and the reindex runs on the watcher's own loop.
 func TestScheduledFileMutationPinsTheViewUntilTheTicketReports(t *testing.T) {
 	viewmetrics.Reset()

@@ -1313,8 +1313,11 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 		logger.Info("daemon: reconciled post-batch contract edges",
 			zap.Int("contract_edges", reconciled))
 	case warmGlobalResolveFull:
-		if err := state.multiIndexer.RunGlobalResolveContext(ctx); err != nil && ctx.Err() == nil {
-			logger.Warn("daemon: warmup post-batch resolve incomplete", zap.Error(err))
+		if err := state.multiIndexer.RunGlobalResolveContext(ctx); err != nil {
+			resolveOK = false
+			if ctx.Err() == nil {
+				logger.Warn("daemon: warmup post-batch resolve incomplete", zap.Error(err))
+			}
 		}
 		logger.Info("daemon: post-batch workspace eligibility change forced full cross-repo catch-up")
 	}
@@ -1359,6 +1362,9 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 	// readiness is what publication must not precede, not what it depends on.
 	if ctx.Err() != nil {
 		return nil, timings
+	}
+	if resolveOK {
+		state.multiIndexer.CompleteStartupRelations()
 	}
 	state.basePublisher.BeginDraining()
 

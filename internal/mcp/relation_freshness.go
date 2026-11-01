@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"time"
 
-	wire "github.com/gortexhq/gcx-go"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -27,6 +27,7 @@ const maxLabelledPendingFiles = 16
 // relationFreshness labels an answer read from graph relations while edits in
 // its scope are still being published. The zero value is a fresh scope.
 type relationFreshness struct {
+	scope  string
 	state  string   // "", "pending" or "failed"
 	files  []string // graph-keyed paths of the lagging in-scope edits, sorted
 	waited time.Duration
@@ -58,78 +59,49 @@ func relationWaitDeadline(ctx context.Context, freshness requestFreshness) time.
 // the scope are neither waited on nor reported.
 func (s *Server) awaitRelationFreshness(ctx context.Context, ids, files []string, deadline time.Time) relationFreshness {
 	started := time.Now()
-	lagging := s.laggingMutationReceipts(ctx)
-	if len(lagging) == 0 {
-		return relationFreshness{waited: time.Since(started)}
+	label := s.freshnessFor(ctx, "relations", ids, files)
+	if label.state == "" || label.state == "failed" || !deadline.After(started) {
+		label.waited = time.Since(started)
+		return label
 	}
-	inScope := s.relationScope(ctx, ids, files)
-	if remaining := time.Until(deadline); remaining > 0 {
-		timer := time.NewTimer(remaining)
-		defer timer.Stop()
-	wait:
-		for _, receipt := range lagging {
-			if !inScope(receipt.path) {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			label = s.freshnessFor(ctx, "relations", ids, files)
+			if label.state != "" && label.state != "failed" {
 				continue
 			}
-			select {
-			case <-receipt.done:
-			case <-timer.C:
-				break wait
-			case <-ctx.Done():
-				break wait
-			}
+		case <-timer.C:
+			label = s.freshnessFor(ctx, "relations", ids, files)
+		case <-ctx.Done():
 		}
-		lagging = s.laggingMutationReceipts(ctx)
+		label.waited = time.Since(started)
+		return label
 	}
-	label := s.relationLabel(lagging, inScope)
-	label.waited = time.Since(started)
-	return label
-}
-
-// labelRelations labels an answer that read relations without waiting. gaps
-// is the laggingMutationReceipts snapshot taken before the walk; the scope of
-// ids and files, known only once the walk has run, filters it afterwards. An
-// edit that published during the walk still labels the answer, which may
-// have read around it.
-func (s *Server) labelRelations(ctx context.Context, gaps []*mutationReceipt, ids, files []string) relationFreshness {
-	if len(gaps) == 0 {
-		return relationFreshness{}
-	}
-	return s.relationLabel(gaps, s.relationScope(ctx, ids, files))
-}
-
-// relationLabel labels the receipts that fall in scope: failed when the edit
-// failed to publish, pending otherwise. One pending receipt for a path
-// outweighs an older failed one, and any failed path makes the label failed.
-func (s *Server) relationLabel(receipts []*mutationReceipt, inScope func(absPath string) bool) relationFreshness {
-	states := make(map[string]string)
-	for _, receipt := range receipts {
-		if !inScope(receipt.path) {
-			continue
-		}
-		key := s.repoRelative(receipt.path)
-		outcome := receipt.outcome(true)
-		if outcome.Pending || (outcome.Err == nil && outcome.Reindexed) {
-			states[key] = "pending"
-		} else if states[key] == "" {
-			states[key] = "failed"
-		}
-	}
-	var label relationFreshness
-	for path, state := range states {
-		label.files = append(label.files, path)
-		if label.state != "failed" {
-			label.state = state
-		}
-	}
-	sort.Strings(label.files)
-	return label
 }
 
 // laggingMutationReceipts returns the request's mutation receipts whose edit
 // the graph has not published: still pending, or terminally failed.
 func (s *Server) laggingMutationReceipts(ctx context.Context) []*mutationReceipt {
 	var lagging []*mutationReceipt
+	if paths, watched := s.canonicalTierPaths(ctx); watched {
+		for path, tiers := range paths {
+			if !tiers.Failed && !tiers.RelationsAt.IsZero() {
+				continue
+			}
+			receipt := &mutationReceipt{path: path, generation: tiers.Generation}
+			if tiers.Failed {
+				receipt.completed = true
+				receipt.result.Err = errors.New("file publication failed")
+			}
+			lagging = append(lagging, receipt)
+		}
+		return lagging
+	}
 	for _, receipt := range s.mutationReceiptsForRepos(ctx) {
 		if outcome := receipt.outcome(true); outcome.Pending || outcome.Err != nil || !outcome.Reindexed {
 			lagging = append(lagging, receipt)
@@ -147,7 +119,7 @@ func (s *Server) laggingMutationReceipts(ctx context.Context) []*mutationReceipt
 func (s *Server) relationScope(ctx context.Context, ids, files []string) func(absPath string) bool {
 	scoped := make(map[string]bool, len(files)+len(ids))
 	for _, file := range files {
-		scoped[file] = true
+		scoped[s.graphRelPath(ctx, file)] = true
 	}
 	var names []string
 	reader := s.readerFor(ctx)
@@ -220,44 +192,13 @@ func namesAnyIdentifier(data []byte, names []string) bool {
 	return false
 }
 
-// apply writes the label into an answer's fields. A fresh scope writes
-// nothing, so an answer with nothing lagging keeps its shape.
-func (f relationFreshness) apply(result map[string]any) {
-	if f.state == "" {
-		return
-	}
-	result["complete"] = false
-	result["graph_freshness"] = f.state
-	result["freshness_scope"] = "relations"
-	result["pending_file_count"] = len(f.files)
-	result["pending_files"] = f.files[:min(maxLabelledPendingFiles, len(f.files))]
-	if f.state == "failed" {
-		result["recovery_hint"] = mutationFreshnessRecoveryHint()
-	}
-}
-
-// labelled is payload with the label's fields merged in, a struct payload
-// being re-read as its JSON object first. A fresh scope returns payload
-// unchanged.
-func (f relationFreshness) labelled(payload any) any {
-	if f.state == "" {
-		return payload
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return payload
-	}
-	var fields map[string]any
-	if json.Unmarshal(data, &fields) != nil || fields == nil {
-		return payload
-	}
-	f.apply(fields)
-	return fields
-}
-
 // line is the relations line a text answer leads with.
 func (f relationFreshness) line() string {
-	return fmt.Sprintf("relations: %s (%d files)", f.state, len(f.files))
+	scope := f.scope
+	if scope == "" {
+		scope = "relations"
+	}
+	return fmt.Sprintf("%s: %s (%d files)", scope, f.state, len(f.files))
 }
 
 // requireFreshError is the answer to a require_fresh call whose wait ended
@@ -274,6 +215,9 @@ func (f relationFreshness) requireFreshError() *mcp.CallToolResult {
 // merge folds the label of another scope the same answer read into f: the
 // files of both, failed over pending, and the time spent waiting on each.
 func (f relationFreshness) merge(other relationFreshness) relationFreshness {
+	if f.scope == "" {
+		f.scope = other.scope
+	}
 	f.waited += other.waited
 	if other.state == "" {
 		return f
@@ -294,31 +238,29 @@ func (f relationFreshness) merge(other relationFreshness) relationFreshness {
 	return f
 }
 
-// decorate makes a rendered text answer lead with its label: TOON and plain
-// text start with the relations line; GCX keeps GCX1 as line 1, carries the
-// label as header meta and the relations line as a comment on line 2. JSON
-// already carries the label in its fields and passes through unchanged.
-func (f relationFreshness) decorate(res *mcp.CallToolResult) *mcp.CallToolResult {
-	if f.state == "" || res == nil || res.IsError || len(res.Content) == 0 {
-		return res
+// labelRelations keeps the pre-walk gaps as evidence even if they completed
+// during the read, and also includes edits admitted while the walk ran.
+func (s *Server) labelRelations(ctx context.Context, gaps []*mutationReceipt, ids, files []string) relationFreshness {
+	return s.freshnessFor(ctx, "relations", ids, files, gaps)
+}
+
+// labelled is payload with the label's fields merged in, a struct payload
+// being re-read as its JSON object first. A fresh scope returns payload
+// unchanged.
+func (f relationFreshness) labelled(payload any) any {
+	if f.state == "" {
+		return payload
 	}
-	text, ok := res.Content[0].(mcp.TextContent)
-	if !ok || strings.HasPrefix(strings.TrimSpace(text.Text), "{") {
-		return res
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return payload
 	}
-	body := text.Text
-	if strings.HasPrefix(body, wire.Tag) {
-		body, _ = injectGCXHeaderMeta(body, map[string]any{
-			"graph_freshness":    f.state,
-			"freshness_scope":    "relations",
-			"pending_file_count": len(f.files),
-		})
-		head, rows, _ := strings.Cut(body, wire.RowSep)
-		body = head + wire.RowSep + wire.CommentPrefix + " " + f.line() + wire.RowSep + rows
-	} else {
-		body = f.line() + "\n" + body
+	var fields map[string]any
+	if json.Unmarshal(data, &fields) != nil || fields == nil {
+		return payload
 	}
-	return rebuildTextResult(res, body)
+	f.apply(fields)
+	return fields
 }
 
 // provisionalSite is a line of a file whose edit the graph has not published
