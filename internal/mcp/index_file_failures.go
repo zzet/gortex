@@ -272,6 +272,11 @@ func (s *Server) refreshIndexHealthFileFailures(ctx context.Context, baseline ma
 			result[key] = value
 		}
 	}
+	if storage := s.indexHealthReclaimStorage(); storage != nil {
+		result["storage"] = storage
+	} else {
+		delete(result, "storage")
+	}
 	failures, readErr := s.readIndexFileFailures(ctx, ResolvedScope{})
 	totalDetected, _ := baseline["total_detected"].(int)
 	fileNodes, _ := baseline["file_node_count"].(int)

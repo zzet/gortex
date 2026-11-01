@@ -6,6 +6,8 @@ import (
 	"maps"
 	"sync"
 	"time"
+
+	"github.com/zzet/gortex/internal/daemon"
 )
 
 const indexHealthSnapshotTTL = 30 * time.Second
@@ -113,6 +115,15 @@ func compactIndexHealth(payload map[string]any, updatedAt time.Time, refreshing 
 	if failedFiles > 0 || payload["status"] == "degraded" {
 		status = "degraded"
 	}
-	return fmt.Sprintf("health=%v nodes=%v stale=%d failures=%d status=%s age=%ds failed_files=%d unreadable_files=%d\n",
+	line := fmt.Sprintf("health=%v nodes=%v stale=%d failures=%d status=%s age=%ds failed_files=%d unreadable_files=%d\n",
 		payload["health_score"], payload["node_count"], len(stale), parseFailureCount, status, int(time.Since(updatedAt).Seconds()), failedFiles, unreadableFiles)
+	if storage, ok := payload["storage"].(map[string]any); ok {
+		if checkpoint, ok := storage["wal_checkpoint"].(*daemon.WALCheckpointStatus); ok {
+			line += fmt.Sprintf("wal_checkpoint: scope=physical_store_since_open attempts=%d complete=%d incomplete=%d zero_progress=%d last_outcome=%s\n", checkpoint.Attempts, checkpoint.Complete, checkpoint.Incomplete, checkpoint.ZeroProgress, checkpoint.LastOutcome)
+		}
+		if reclaim, ok := storage["wal_reclaim"].(*daemon.WALReclaimStatus); ok {
+			line += fmt.Sprintf("wal_reclaim: scope=physical_store_since_open writer_hold_count=%d writer_hold_p95_ms=%g writer_wait_count=%d writer_wait_p95_ms=%g\n", reclaim.WriterHold.Count, reclaim.WriterHold.P95MS, reclaim.WriterWait.Count, reclaim.WriterWait.P95MS)
+		}
+	}
+	return line
 }
