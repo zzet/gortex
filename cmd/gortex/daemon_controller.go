@@ -1083,6 +1083,20 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	// every queued control request wait out the pause as well.
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
+	// The operating system's and SQLite's figures are read in the same breath,
+	// so the runtime block describes one moment. Read after the view census
+	// and the aggregate, which can wait seconds for the mutex, they would
+	// describe a later process than the Go heap beside them.
+	runtimeStats := withProcessGauges(daemon.RuntimeStats{
+		Alloc:        mem.Alloc,
+		Sys:          mem.Sys,
+		HeapInuse:    mem.HeapInuse,
+		HeapIdle:     mem.HeapIdle,
+		HeapReleased: mem.HeapReleased,
+		StackInuse:   mem.StackInuse,
+		NumGC:        mem.NumGC,
+		NumGoroutine: runtime.NumGoroutine(),
+	})
 
 	// Stat every configured repo path before taking c.mu. A stat is cheap
 	// on a live path and on a deleted one, but an unresponsive network
@@ -1133,25 +1147,16 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	tracked := append([]daemon.TrackedRepoStatus(nil), agg.tracked...)
 	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, agg.tracked, ready)...)
 
-	// mem was sampled before the mutex was taken — see the note at the top
-	// of status.
+	// mem and the runtime block were sampled before the mutex was taken —
+	// see the note at the top of status.
 
 	resp := daemon.StatusResponse{
-		TrackedRepos:   tracked,
-		MemoryBytes:    mem.Alloc,
-		SearchBackend:  agg.searchBackend,
-		TrigramCache:   trigramCacheForResponse(),
-		GraphIntegrity: daemon.GraphIntegrityStatusFor(g),
-		Runtime: daemon.RuntimeStats{
-			Alloc:        mem.Alloc,
-			Sys:          mem.Sys,
-			HeapInuse:    mem.HeapInuse,
-			HeapIdle:     mem.HeapIdle,
-			HeapReleased: mem.HeapReleased,
-			StackInuse:   mem.StackInuse,
-			NumGC:        mem.NumGC,
-			NumGoroutine: runtime.NumGoroutine(),
-		},
+		TrackedRepos:       tracked,
+		MemoryBytes:        mem.Alloc,
+		SearchBackend:      agg.searchBackend,
+		TrigramCache:       trigramCacheForResponse(),
+		GraphIntegrity:     daemon.GraphIntegrityStatusFor(g),
+		Runtime:            runtimeStats,
 		PProfAddr:          daemonPProfAddr(),
 		Ready:              ready,
 		WarmupSeconds:      c.warmupSeconds.Load(),
