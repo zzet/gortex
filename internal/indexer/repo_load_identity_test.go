@@ -137,7 +137,10 @@ func TestRepoIdentitySeparateGitDirAndLinkedBoundary(t *testing.T) {
 }
 
 func TestRepoIdentityRegistrationPublishesCanonicalBinding(t *testing.T) {
-	physical := t.TempDir()
+	// RepoLoadFor reads snapshot keys only; the temporary directory may itself
+	// be an alias, such as Darwin's /var -> /private/var.
+	physical, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
 	alias := filepath.Join(t.TempDir(), "different-name")
 	require.NoError(t, os.Symlink(physical, alias))
 	mi := newRepoLoadTestMulti(t)
