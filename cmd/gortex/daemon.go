@@ -2408,12 +2408,17 @@ func renderDaemonStorage(w io.Writer, st daemon.StatusResponse) {
 			fmt.Fprintf(w, "    first drift: %s\n", rc.FirstDrift)
 		}
 	}
+	if p := s.WALCheckpoint; p != nil {
+		fmt.Fprintf(w, "  wal checkpoint: attempts=%d complete=%d incomplete=%d zero-progress=%d failures=%d last=%s\n", p.Attempts, p.Complete, p.Incomplete, p.ZeroProgress, p.Failed, orDash(p.LastOutcome))
+		fmt.Fprintf(w, "    deferred build lane=%d longest=%.1fms lease refusals=%d in-flight refusals=%d reclaim stand-asides=%d yields=%d frames=%d unobserved=%d\n", p.DeferredBuildLane, p.LongestBuildLaneDeferralMS, p.RefusedLease, p.RefusedInflight, p.StoodAsideReclaim, p.YieldCancelled, p.FramesBackfilledTotal, p.FramesUnobserved)
+	}
 	r := s.WALReclaim
 	if r == nil {
 		return
 	}
 	fmt.Fprintf(w, "  wal reclaim: threshold=%s  attempts=%d  resets=%d  deferrals=%d  skips=%d  failures=%d\n",
 		formatBytes(nonNegative(r.ThresholdBytes)), r.Attempts, r.Resets, r.Deferrals, r.Skips, r.Failures)
+	fmt.Fprintf(w, "    urgent attempts=%d writer hold p95=%.1fms writer wait p95=%.1fms closed-admission drain=%.1fms final-reset=%.1fms\n", r.UrgentAttempts, r.WriterHold.P95MS, r.WriterWait.P95MS, r.PauseDrain.TotalMS, r.PauseTruncate.TotalMS)
 	fmt.Fprintf(w, "    reclaimed frames=%d  bytes=%s\n", r.FramesReclaimed, formatBytes(nonNegative(r.BytesReclaimed)))
 	fmt.Fprintf(w, "    open-gate resets=%d  writer hold max=%.1fms  last=%.1fms\n",
 		r.OpenGateResets, r.WriterHoldMaxMS, r.WriterHoldLastMS)
