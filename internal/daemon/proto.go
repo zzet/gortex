@@ -337,6 +337,7 @@ const (
 // StatusResponse is the payload returned under Result on a successful
 // ControlStatus call.
 type StatusResponse struct {
+	MCPDispatch   *MCPDispatchStatus  `json:"mcp_dispatch,omitempty"`
 	Version       string              `json:"version"`
 	PID           int                 `json:"pid"`
 	UptimeSeconds int64               `json:"uptime_seconds"`
@@ -554,6 +555,15 @@ type RowCounterStatus struct {
 // the time the read gate was closed for a reset; ReaderWait is the time new
 // reads spent waiting at it.
 type WALReclaimStatus struct {
+	// Same since-store-open observations exposed by graph_stats. The peak is
+	// a sampled lower bound and remains null until actually observed; reads
+	// and WAL resets never clear it or the cancellation counters.
+	CancelledWriterParked int64  `json:"cancelled_writer_parked"`
+	CancelledWriteIntent  int64  `json:"cancelled_write_intent"`
+	CancelledOther        int64  `json:"cancelled_other"`
+	ObservedPeakWALBytes  *int64 `json:"observed_peak_wal_bytes"`
+	WALPeakObserved       bool   `json:"wal_peak_observed"`
+
 	ThresholdBytes int64 `json:"threshold_bytes"`
 	Attempts       int64 `json:"attempts"`
 	Resets         int64 `json:"resets"`
