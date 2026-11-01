@@ -165,17 +165,20 @@ type topologyGate struct {
 // A scope is nil for the whole graph, or a sorted list of repository
 // prefixes. One mutex guards every gate, so a mutation takes all of its gates
 // in one step and gates need no lock order among themselves. Waiters sleep on
-// wake, which is closed and replaced whenever a holder leaves.
+// wake, which is allocated only while callers are waiting and cleared on
+// broadcast or when its last waiter leaves. In particular, an idle state must
+// not retain a channel owned by a caller's synctest bubble.
 //
 // The state is process-global, like buildCounter. Repository gates are created
 // on first use and dropped once idle, so the map holds only work in flight.
 // Production multi-repo indexers share one Store; tests that reuse a prefix
 // across stores only over-serialise.
 type topologyState struct {
-	mu    sync.Mutex
-	wake  chan struct{}
-	all   topologyGate
-	repos map[string]*topologyGate
+	mu               sync.Mutex
+	wake             chan struct{}
+	wakeWaitersCount int // Waiters of wake only; broadcast generations retire independently.
+	all              topologyGate
+	repos            map[string]*topologyGate
 	// Readers, writers and waiting writers of repository scopes, so that
 	// whole-graph admission need not scan repos.
 	repoReaders, repoWriters, repoWritersWaiting int
@@ -189,7 +192,6 @@ type topologyState struct {
 }
 
 var topology = &topologyState{
-	wake:      make(chan struct{}),
 	repos:     make(map[string]*topologyGate),
 	repoBuild: make(map[string]uint64),
 }
@@ -261,9 +263,21 @@ func (t *topologyState) add(scope []string, readers, writers, waiting int) {
 // wait sleeps until a holder leaves and reports false when ctx ends first.
 // t.mu is held on entry and on return.
 func (t *topologyState) wait(ctx context.Context) bool {
+	if t.wake == nil {
+		t.wake = make(chan struct{})
+	}
 	wake := t.wake
+	t.wakeWaitersCount++
 	t.mu.Unlock()
-	defer t.mu.Lock()
+	defer func() {
+		t.mu.Lock()
+		if t.wake == wake {
+			t.wakeWaitersCount--
+			if t.wakeWaitersCount == 0 {
+				t.wake = nil
+			}
+		}
+	}()
 	select {
 	case <-wake:
 		return true
@@ -272,10 +286,14 @@ func (t *topologyState) wait(ctx context.Context) bool {
 	}
 }
 
-// wakeWaiters lets every waiter re-check its admission. t.mu is held.
+// wakeWaiters lets every waiter re-check its admission. t.mu is held. A
+// replacement is created by the next actual waiter, never by the releaser.
 func (t *topologyState) wakeWaiters() {
-	close(t.wake)
-	t.wake = make(chan struct{})
+	if t.wake != nil {
+		close(t.wake)
+		t.wake = nil
+		t.wakeWaitersCount = 0
+	}
 }
 
 // retire moves the reach generation of scope past every value issued so far.
