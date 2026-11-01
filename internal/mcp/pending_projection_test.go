@@ -71,6 +71,43 @@ func liveEntry(p *pendingProjections, path string) *projectionEntry {
 	return p.snap.Load().entries[pathkey.MutationKey(path)]
 }
 
+type projectionRetirementSpy struct {
+	*graph.Graph
+	metadataReads int
+	nodeReads     int
+}
+
+func (s *projectionRetirementSpy) FileMetasByPaths(prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
+	s.metadataReads++
+	return s.Graph.FileMetasByPaths(prefix, paths)
+}
+
+func (s *projectionRetirementSpy) GetFileNodes(path string) []*graph.Node {
+	s.nodeReads++
+	return s.Graph.GetFileNodes(path)
+}
+
+func TestPendingProjectionRetirementUsesBackendContentEvidence(t *testing.T) {
+	f := newProjectionFixture(t)
+	p := newPendingProjections()
+	e := f.edit("a.go", "package p\n\nfunc New() {}\n")
+	require.NoError(t, p.publish(e))
+	store := &projectionRetirementSpy{Graph: f.g}
+	wrapped := newContractCoreEdges(store, t.Context(), nil)
+	require.NotImplements(t, (*graph.FileMetaPathReader)(nil), wrapped,
+		"durable retirement evidence is backend state, not a request-view capability")
+	require.Zero(t, p.retire(store), "old durable bytes cannot retire a newer projection")
+	require.Equal(t, 1, store.metadataReads)
+	require.Zero(t, store.nodeReads, "mismatched hashes need no node comparison")
+
+	require.NoError(t, f.idx.IndexFile(filepath.Join(f.dir, "a.go")))
+	require.Equal(t, 1, p.retire(store))
+	require.Equal(t, 3, store.metadataReads, "retirement brackets its node comparison with durable hashes")
+	require.Equal(t, 1, store.nodeReads)
+	require.Zero(t, p.divergence.Load())
+	require.Nil(t, liveEntry(p, e.absPath))
+}
+
 func TestPendingProjectionPublishRetire(t *testing.T) {
 	f := newProjectionFixture(t)
 	p := newPendingProjections()
