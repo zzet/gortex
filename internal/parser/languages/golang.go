@@ -1344,7 +1344,7 @@ func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string
 	if tp := goTypeParams(def.Node, src); len(tp) > 0 {
 		node.Meta["type_params"] = tp
 	}
-	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+	if doc := ExtractDocAboveByte(src, int(def.Node.StartByte()), DocLangSlashSlash); doc != "" {
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
@@ -1461,7 +1461,7 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 	if tp := goTypeParams(def.Node, src); len(tp) > 0 {
 		node.Meta["type_params"] = tp
 	}
-	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+	if doc := ExtractDocAboveByte(src, int(def.Node.StartByte()), DocLangSlashSlash); doc != "" {
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
@@ -1661,7 +1661,7 @@ func (e *GoExtractor) emitTypeDecl(m parser.QueryResult, filePath, fileID string
 			isStruct = true
 		}
 	}
-	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+	if doc := ExtractDocAboveByte(src, int(def.Node.StartByte()), DocLangSlashSlash); doc != "" {
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
@@ -1832,7 +1832,7 @@ func emitGoFieldNode(decl, anchor *sitter.Node, fieldName, fieldType, ownerID, o
 	if fieldType != "" {
 		meta["field_type"] = fieldType
 	}
-	if doc := ExtractDocAbove(src, int(anchor.StartPoint().Row), DocLangSlashSlash); doc != "" {
+	if doc := ExtractDocAboveByte(src, int(anchor.StartByte()), DocLangSlashSlash); doc != "" {
 		meta["doc"] = doc
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
@@ -1903,7 +1903,7 @@ func (e *GoExtractor) emitTypeAlias(m parser.QueryResult, filePath, fileID strin
 			"alias": true,
 		},
 	}
-	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+	if doc := ExtractDocAboveByte(src, int(def.Node.StartByte()), DocLangSlashSlash); doc != "" {
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
