@@ -11,9 +11,20 @@ import (
  "strings"
 )
 
-type discoveryOptions struct { StallFirst bool }
-func bindDiscoveryFlags(f *flag.FlagSet,o *discoveryOptions){f.BoolVar(&o.StallFirst,"discovery-stall-first",false,"worktree-discovery: hold Git stdout for the first new owned checkout, ignoring TERM with a 60-second child bound")}
+type discoveryOptions struct { StallFirst bool; Prepare string; Resume string; ExistingWorktrees int; ExistingNested int }
+func bindDiscoveryFlags(f *flag.FlagSet,o *discoveryOptions){
+ f.StringVar(&o.Prepare,"discovery-prepare","","worktree-discovery: prepare owned roots and write a descriptor without launching a daemon")
+ f.StringVar(&o.Resume,"discovery-resume","","worktree-discovery: consume exact owned upgraded-store lineage at unchanged prepared roots")
+ f.IntVar(&o.ExistingNested,"discovery-existing-nested",0,"discovery preparation: existing linked checkouts placed inside the primary repository")
+ f.IntVar(&o.ExistingWorktrees,"discovery-existing-worktrees",0,"discovery preparation: existing linked checkouts of the first family")
+ f.BoolVar(&o.StallFirst,"discovery-stall-first",false,"worktree-discovery: hold Git stdout for the first new owned checkout, ignoring TERM with a 60-second child bound")}
 func(o discoveryOptions)validate(scenario string,count int)error{
+ if o.ExistingNested<0||o.ExistingNested>o.ExistingWorktrees{return errors.New("discovery existing nested count must fit the existing topology")}
+ if o.ExistingWorktrees<0{return errors.New("discovery existing-worktree count must be nonnegative")}
+ if o.Prepare!="" || o.Resume!="" || o.ExistingWorktrees!=0 || o.ExistingNested!=0 {
+  if scenario!=checkoutDiscoveryScenario||o.Prepare!=""&&o.Resume!=""||o.ExistingWorktrees!=0&&o.Prepare=="" {return errors.New("discovery prepare/resume flags require that scenario, exclusive modes and preparation for existing topology")}
+  if runtime.GOOS=="windows"{return errors.New("owned discovery seed resume currently requires Unix owner checks")}
+ }
  if !o.StallFirst{return nil}
  if scenario!=checkoutDiscoveryScenario||count<1{return errors.New("--discovery-stall-first requires worktree-discovery and at least one new worktree")}
  if runtime.GOOS=="windows" {return errors.New("discovery Git stall requires Unix process ownership")}

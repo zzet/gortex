@@ -215,7 +215,8 @@ func runCommand(ctx context.Context, args []string) error {
 	if err := validateOutputRoots(corpora, o.Scratch, o.Output); err != nil {
 		return err
 	}
-	sha, err := binaryRevision(o.Binary, o.GitSHA)
+	if o.Discovery.Prepare!="" {return prepareDiscoveryState(ctx,o,corpora)}
+ sha, err := binaryRevision(o.Binary, o.GitSHA)
 	if err != nil {
 		return err
 	}

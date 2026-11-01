@@ -785,3 +785,23 @@ for the first new primary-family checkout. Its child ignores TERM and retains
 stdout until explicit release or a 60-second bound. The harness releases it
 before daemon shutdown and retains child/root/operation events. A missing
 stall or pending-refusal observation fails this cell.
+
+For upgraded fixtures, `--discovery-prepare <descriptor.json>` prepares owned
+roots without opening a store or launching a daemon. Add
+`--discovery-existing-worktrees 20 --discovery-existing-nested 5` to create five
+in-repository and fifteen sibling checkouts of the first family. The unrelated
+control is retained, so descriptor counts are two primaries plus twenty linked
+checkouts; selected-family counts are one plus twenty. The descriptor records
+actual paths, Git common directories, commits, source and configuration hashes,
+and a random owner token. Preparation requires a separate exclusive fixture
+producer to populate and upgrade the store at those exact paths.
+
+`--discovery-resume <lineage.json>` consumes that prepared root once. Lineage
+must bind the descriptor, old and upgrade binary/source pins, schema-44 main
+and WAL hashes, and structured normal-stop/catalog-identity receipts. Unknown,
+live, changed or relocated identities are refused. The stopped immutable
+snapshot remains inside the owned root; the destination store must be absent.
+The existing seed copier copies only main/WAL files, then both source and
+copied hashes are checked again. There is no SQL or catalog path rewriting.
+These discovery-only flags preserve the startup scenario's `--seed-store`
+contract. A copied fixture or synthetic parser control is not upgrade acceptance.

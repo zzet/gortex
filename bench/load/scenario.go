@@ -101,7 +101,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	p := o.smokeState
 	var err error
 	if p == nil {
-		p, err = newPrivateRun(ctx, outputRoot, o.Binary, selected)
+		if scenario==checkoutDiscoveryScenario && o.Discovery.Resume!="" {p,err=resumeDiscoveryState(ctx,o,selected)} else {p, err = newPrivateRun(ctx, outputRoot, o.Binary, selected)}
 	} else {
 		err = validateSmokeOwner(p, o.Binary, selected)
 	}
@@ -109,6 +109,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		return phase, nil, artifacts, crashes, "", err
 	}
 	artifacts["private_root"] = p.Root
+ if scenario==checkoutDiscoveryScenario && o.Discovery.Resume!="" {raw,err:=os.ReadFile(o.Discovery.Resume);if err!=nil{return phase,nil,artifacts,crashes,"",err};phase.Gate["discovery_seed_lineage"]=json.RawMessage(raw)}
 	firstStart := p.startCount + 1
 	if o.smokeState != nil {
 		info, statErr := os.Stat(p.Store)
