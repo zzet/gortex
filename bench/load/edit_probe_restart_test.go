@@ -130,7 +130,11 @@ func TestEditProbeRestartReopensSessionsAndNeverReusesPreKillAnswers(t *testing.
 	if record.Outcome != "complete" || len(record.Errors) != 0 || restart == nil || !restart.PendingBeforeKill || restart.Qualification != "" || !reflect.DeepEqual(fake.calls, []string{"kill", "start"}) {
 		t.Fatalf("restart cell did not complete after a pending kill: %+v %+v %v", record, restart, fake.calls)
 	}
-	if restart.KillNS == nil || restart.ReadyNS == nil || *restart.ReadyNS < *restart.KillNS || restart.Downtime.Value == nil || !strings.Contains(restart.StatusAfterError, "no mutation recorded") || len(restart.StatusAfterRestart) == 0 || !restart.DiskHasMarker || !strings.Contains(string(restart.StatusBeforeKill), `"disk_status":"committed"`) {
+	beforeStatus, err := decodeEditProbeResult(restart.StatusBeforeKill)
+	if err != nil || beforeStatus["disk_status"] != "committed" || beforeStatus["receipt"] != record.Receipt {
+		t.Fatalf("restart did not retain its committed receipt status: %s (%v)", restart.StatusBeforeKill, err)
+	}
+	if restart.KillNS == nil || restart.ReadyNS == nil || *restart.ReadyNS < *restart.KillNS || restart.Downtime.Value == nil || !strings.Contains(restart.StatusAfterError, "no mutation recorded") || len(restart.StatusAfterRestart) == 0 || !restart.DiskHasMarker {
 		t.Fatalf("restart evidence missing: %+v", restart)
 	}
 	// The daemon was killed while the edit's ACK was outstanding: no ACK time,
