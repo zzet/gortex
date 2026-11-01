@@ -227,7 +227,7 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 		binding := contractAnalysisFromContext(ctx)
 		reader := s.readerFor(ctx)
 		view := requestViewFromContext(ctx)
-		layers := append([]query.ViewLayerSource(nil), view.candidateLayers()...)
+		layers := append([]query.ViewLayerSource(nil), requestSearchCandidates(ctx)...)
 		for _, analysis := range binding.views {
 			layers = append(layers, query.ViewLayerSource{Search: analysis.SearchBackend(), Layer: binding.composedLayer})
 		}
@@ -239,7 +239,7 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	}
 	if s.contractAnalysisRuntime != nil {
 		view := requestViewFromContext(ctx)
-		return s.engine.WithComposedView(s.readerFor(ctx), view.candidateLayers(), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
+		return s.engine.WithComposedView(s.readerFor(ctx), requestSearchCandidates(ctx), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
 	}
 	// A routed or overlaid request engine is already a per-request clone, and
 	// it carries the request's lifetime so its long graph walks stop when the
@@ -248,13 +248,13 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	// context through QueryOptions.Context instead.
 	view := requestViewFromContext(ctx)
 	if len(requestProjectionLayers(ctx)) != 0 {
-		return s.engine.WithComposedView(s.readerFor(ctx), view.candidateLayers(), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
+		return s.engine.WithComposedView(s.readerFor(ctx), requestSearchCandidates(ctx), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
 	}
 	if v := OverlayViewFromContext(ctx); v != nil {
-		return s.engine.WithViewLayersContext(v, view.candidateLayers(), ctx).WithLayers(s.requestLayers(ctx))
+		return s.engine.WithViewLayersContext(v, requestSearchCandidates(ctx), ctx).WithLayers(s.requestLayers(ctx))
 	}
 	if view.routed() {
-		return s.engine.WithComposedView(view.reader, view.candidateLayers(), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
+		return s.engine.WithComposedView(view.reader, requestSearchCandidates(ctx), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
 	}
 	return s.engine
 }

@@ -74,6 +74,7 @@ type projectionEntry struct {
 	disk          diskStamp
 	language      string
 	layer         *graph.OverlayLayer
+	names         *projectionNameSearch
 	parseErrors   int
 	fileView      *fileViewEvidence
 	parseChecked  bool
@@ -160,6 +161,7 @@ func newProjectionEntry(absPath, repoPrefix string, projection *indexer.Projecti
 	for _, e := range projection.Edges {
 		layer.AddEdge(e)
 	}
+	names := newProjectionNameSearch(projection.Nodes)
 	return &projectionEntry{
 		key:          pathkey.MutationKey(absPath),
 		absPath:      absPath,
@@ -171,10 +173,11 @@ func newProjectionEntry(absPath, repoPrefix string, projection *indexer.Projecti
 		disk:         disk,
 		language:     projection.Language,
 		layer:        layer,
+		names:        names,
 		parseErrors:  projection.ParseErrors,
 		parseChecked: projection.ParseChecked,
 		buildTime:    projection.BuildTime,
-		size:         int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes,
+		size:         int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes + names.chargedBytes,
 	}
 }
 
@@ -185,7 +188,7 @@ func (e *projectionEntry) committedCopy(sequence uint64, disk diskStamp) *projec
 	copy := &projectionEntry{
 		key: e.key, absPath: e.absPath, graphPath: e.graphPath, repoPrefix: e.repoPrefix,
 		commitSeq: sequence, hash: e.hash, rawHash: e.rawHash, contentSHA256: e.contentSHA256, disk: disk, language: e.language,
-		layer: e.layer, fileView: e.fileView, parseErrors: e.parseErrors, parseChecked: e.parseChecked,
+		layer: e.layer, names: e.names, fileView: e.fileView, parseErrors: e.parseErrors, parseChecked: e.parseChecked,
 		buildTime: e.buildTime, size: e.size, tombstone: e.tombstone,
 	}
 	if e.suspect.Load() {

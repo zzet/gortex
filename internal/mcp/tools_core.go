@@ -1827,6 +1827,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	if errResult != nil {
 		return errResult, nil
 	}
+	ctx, err = s.bindPendingSearch(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if offset == 0 && !isCompact(req) && !s.isGCX(ctx, req) && !s.isTOON(ctx, req) {
 		ctx = context.WithValue(ctx, symbolPageOwnerKey{}, sess)
 		ctx = context.WithValue(ctx, symbolPageCacheKey{}, s.symbolPages(ctx))
