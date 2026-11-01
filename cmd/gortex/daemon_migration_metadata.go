@@ -10,9 +10,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
-	"github.com/zzet/gortex/internal/graph"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
-	"github.com/zzet/gortex/internal/query"
 )
 
 // These records retain connection protocol state only, never cwd ownership.
@@ -35,9 +33,11 @@ type migrationMetadataDispatcher struct {
 }
 
 func newMigrationMetadataDispatcher(cfg *config.Config, logger *zap.Logger, reporter *daemonStartupReporter) *migrationMetadataDispatcher {
-	g := graph.New()
 	policy := gortexmcp.ToolPolicyConfig{Preset: cfg.MCP.Tools.Preset, Mode: cfg.MCP.Tools.Mode, Allow: cfg.MCP.Tools.Allow, Deny: cfg.MCP.Tools.Deny, OperatorPinned: cfg.MCP.Tools.Explicit}
-	server := gortexmcp.NewServer(query.NewEngine(g), g, nil, nil, logger, nil, gortexmcp.MultiRepoOptions{ToolPolicy: &policy})
+	// Metadata registration needs no graph or query engine. Every graph call
+ // is refused by this dispatcher until the real durable runtime is handed
+ // over, so constructing an in-memory persistence substitute is unnecessary.
+ server := gortexmcp.NewServer(nil, nil, nil, nil, logger, nil, gortexmcp.MultiRepoOptions{ToolPolicy: &policy})
 	return &migrationMetadataDispatcher{catalog: newMCPDispatcher(server, nil, logger), reporter: reporter, sessions: &sync.Map{}}
 }
 
