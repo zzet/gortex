@@ -2096,7 +2096,7 @@ func (l *CheckoutLifecycle) knownFamilies(ctx context.Context) []familyProbe {
 		seen[familyID] = true
 		out = append(out, familyProbe{
 			familyID: familyID,
-			probeDir: l.probeDirFor(ctx, familyID, fallbackDir),
+			probeDir: fallbackDir,
 		})
 	}
 
@@ -2137,9 +2137,9 @@ func (l *CheckoutLifecycle) familyForPrefix(ctx context.Context, prefix string) 
 	return binding.FamilyID
 }
 
-// probeDirsFor prefers the primary, then shared Git data, then linked
+// probeDirFor prefers the primary, then shared Git data, then linked
 // checkouts. Every candidate is attempted before declaring inventory unavailable.
-func (l *CheckoutLifecycle) probeDirsFor(ctx context.Context, familyID, fallback string) []string {
+func (l *CheckoutLifecycle) probeDirFor(ctx context.Context, familyID, fallback string) []string {
 	var dirs []string
 	seen := map[string]bool{}
 	add := func(path string) {
@@ -2168,16 +2168,8 @@ func (l *CheckoutLifecycle) probeDirsFor(ctx context.Context, familyID, fallback
 	return dirs
 }
 
-func (l *CheckoutLifecycle) probeDirFor(ctx context.Context, familyID, fallback string) string {
-	dirs := l.probeDirsFor(ctx, familyID, fallback)
-	if len(dirs) > 0 {
-		return dirs[0]
-	}
-	return fallback
-}
-
 func (l *CheckoutLifecycle) reconcileCatalogFamily(ctx context.Context, familyID, fallback string) (reconcile.FamilyReport, error) {
-	return l.rec.ReconcileFamilyCandidates(ctx, familyID, l.probeDirsFor(ctx, familyID, fallback)...)
+	return l.rec.ReconcileFamilyCandidates(ctx, familyID, l.probeDirFor(ctx, familyID, fallback)...)
 }
 
 // --- per-checkout coordinators ------------------------------------------

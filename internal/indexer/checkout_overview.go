@@ -697,7 +697,7 @@ func (l *CheckoutLifecycle) reconcileFamily(
 	}
 	defer l.beginBatch()()
 	baseline := l.repoSetFingerprint()
-	report, err := l.reconcileCatalogFamily(ctx, familyID, l.probeDirFor(ctx, familyID, ""))
+	report, err := l.reconcileCatalogFamily(ctx, familyID, "")
 	if err != nil {
 		return reconcile.FamilyReport{}, err
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/pathkey"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
@@ -21,8 +22,16 @@ func TestRegisterPoisonedProbeKeepsConfig(t *testing.T) {
 	tracked, err := f.lc.Register(context.Background(), config.RepoEntry{Path: root, Name: "safe-primary"}, TrackSourceCLI)
 	require.NoError(t, err)
 	f.worktreeOf(root, "0lane")
+	dash := filepath.Join(f.dir, "-agent")
+	runGit(t, root, "worktree", "add", "-q", "-b", "dash-admin", dash)
 	_, err = f.lc.ReconcileFamily(context.Background(), tracked.FamilyID)
 	require.NoError(t, err)
+	candidates := f.lc.probeDirFor(context.Background(), tracked.FamilyID, "")
+	require.GreaterOrEqual(t, len(candidates), 2)
+	checkouts, err := f.catalog.ListCheckouts(context.Background(), tracked.FamilyID)
+	require.NoError(t, err)
+	require.True(t, pathkey.EqualPaths(pathkey.CanonicalExistingRoot(root), candidates[0]), "the primary is the first probe: candidates=%v checkouts=%+v", candidates, checkouts)
+	require.True(t, pathkey.EqualPaths(pathkey.CanonicalExistingRoot(filepath.Join(root, ".git")), candidates[1]), "shared Git data is the second probe")
 	require.NoError(t, os.Remove(filepath.Join(root, ".git", "worktrees", "0lane", "HEAD")))
 	report, err := f.lc.ReconcileFamily(context.Background(), tracked.FamilyID)
 	require.NoError(t, err)
