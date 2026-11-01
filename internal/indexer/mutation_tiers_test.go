@@ -34,7 +34,7 @@ func TestReceiptTierTimestampsAreOrdered(t *testing.T) {
 	require.True(t, tiers.DerivedAt.IsZero(), "relations must publish before blocked derived work")
 }
 
-func TestFailedPatchRetainsOnlyItsTicketTier(t *testing.T) {
+func TestIdentityPatchPublishesTicketTiers(t *testing.T) {
 	dir, _, watcher := inertTestWatcher(t, "main.go", "package main\nfunc Before() {}\n")
 	ticket, err := watcher.EnqueueToolMutation(t.Context(), filepath.Join(dir, "main.go"))
 	require.NoError(t, err)

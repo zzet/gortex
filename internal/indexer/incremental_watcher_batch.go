@@ -406,6 +406,9 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		idx.ResolveAll()
 		resolve.end()
 	}
+	if mode.onRelations != nil {
+		mode.onRelations()
+	}
 	if mode.forceExplicitFiles || !idx.deferGlobalPasses.Load() {
 		if mode.exactPointSemantic {
 			idx.runIncrementalPointSemantic(result.DerivedInvalidation.Files)
@@ -480,7 +483,15 @@ func vanishedReceiptNames(g graph.Store, receipt *graph.MutationReceipt) []strin
 
 // reindexExplicitMutationPaths preserves forced point-read semantics for the
 // complete admitted set, with one lane-owned resolver/derived tail.
-func (w *Watcher) reindexExplicitMutationPaths(paths []string) (*IndexResult, DerivedFanoutCompleteness, error) {
+func (w *Watcher) reindexExplicitMutationPaths(paths []string, admitted ...map[string]uint64) (*IndexResult, DerivedFanoutCompleteness, error) {
+	frontier := w.mutationTierFrontier(paths)
+	if len(admitted) > 0 {
+		frontier = admitted[0]
+	}
+	return w.reindexMutationPaths(paths, true, frontier)
+}
+
+func (w *Watcher) reindexMutationPaths(paths []string, force bool, frontier map[string]uint64) (*IndexResult, DerivedFanoutCompleteness, error) {
 	var result *IndexResult
 	var fanout DerivedFanoutCompleteness
 	ctx, cancel := w.mutationLaneContext()
@@ -492,11 +503,10 @@ func (w *Watcher) reindexExplicitMutationPaths(paths []string) (*IndexResult, De
 		}
 		observation := beginDerivedFanoutObservation(idx)
 		defer observation.close()
-		mode := incrementalPathMode{detectDeletions: true, forceExplicitFiles: true}
+		mode := incrementalPathMode{detectDeletions: true, forceExplicitFiles: force,
+			onRelations: func() { w.markRelationsFrontier(frontier) }}
 		var err error
-		if w.explicitReindexRaw != nil {
-			result, err = w.explicitReindexRaw(paths)
-		} else if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
+		if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
 			result, err = owner.incrementalReindexRepoRawMode(idx.repoPrefix, paths, mode)
 		} else {
 			result, err = idx.incrementalWatcherPaths(idx.rootPath, paths, mode)
@@ -510,14 +520,19 @@ func (w *Watcher) reindexExplicitMutationPaths(paths []string) (*IndexResult, De
 	return result, fanout, err
 }
 
-func (w *Watcher) reindexStormPaths(paths []string) (*IndexResult, error) {
-	if w.batchReindex != nil {
+func (w *Watcher) reindexStormPaths(paths []string, admitted ...map[string]uint64) (*IndexResult, error) {
+	if w.batchReindex != nil && (w.indexer == nil || w.indexer.repositoryMutationOwner == nil) {
 		return w.batchReindex(paths)
 	}
 	if w.indexer == nil || w.indexer.rootPath == "" {
 		return nil, fmt.Errorf("watcher: index root is not initialized")
 	}
-	return w.indexer.IncrementalReindexPaths(w.indexer.rootPath, paths)
+	frontier := w.mutationTierFrontier(paths)
+	if len(admitted) > 0 {
+		frontier = admitted[0]
+	}
+	result, _, err := w.reindexMutationPaths(paths, false, frontier)
+	return result, err
 }
 
 func (gw *GitWatcher) reindexChangedPaths(paths []string) (*IndexResult, error) {

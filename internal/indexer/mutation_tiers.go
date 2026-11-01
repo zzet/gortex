@@ -1,6 +1,9 @@
 package indexer
 
-import "time"
+import (
+	"path/filepath"
+	"time"
+)
 
 // MutationTierState is the publication evidence for one admitted path. An
 // absent timestamp is unobserved, rather than evidence of a fresh tier.
@@ -12,6 +15,164 @@ type MutationTierState struct {
 	DerivedAt   time.Time `json:"derived_at,omitempty"`
 	Failed      bool      `json:"failed,omitempty"`
 	Partial     bool      `json:"partial,omitempty"`
+	failedAt    time.Time
+}
+
+func newMutationTierTicket(path string, generation uint64, done <-chan MutationResult) *MutationTicket {
+	return &MutationTicket{Path: path, Generation: generation, Done: done,
+		tiers: MutationTierState{Generation: generation, AckAt: time.Now()}}
+}
+
+func (w *Watcher) markRelations(path string, generation uint64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for ordinal, waiter := range w.mutationWaiters[path] {
+		if ordinal <= generation && waiter.ticket != nil {
+			waiter.ticket.tierMu.Lock()
+			stampRelations(&waiter.ticket.tiers, time.Now())
+			waiter.ticket.tierMu.Unlock()
+		}
+	}
+}
+
+func stampRelations(state *MutationTierState, at time.Time) {
+	if state.FileGraphAt.IsZero() {
+		state.FileGraphAt = at
+	}
+	if state.RelationsAt.IsZero() {
+		state.RelationsAt = at
+	}
+}
+
+func (w *Watcher) mutationTierFrontier(paths []string) map[string]uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	frontier := make(map[string]uint64, len(paths))
+	for _, path := range paths {
+		frontier[path] = w.pendingGeneration[path]
+	}
+	return frontier
+}
+
+func (w *Watcher) markRelationsFrontier(frontier map[string]uint64) {
+	for path, generation := range frontier {
+		w.markRelations(path, generation)
+	}
+}
+
+// finishMutationTierLocked runs before removing a waiter or delivering Done.
+// Successful paths retain no watcher history; the caller's ticket owns stamps.
+func (w *Watcher) finishMutationTierLocked(path string, ticket *MutationTicket, err error, fanout DerivedFanoutCompleteness) {
+	if ticket == nil {
+		return
+	}
+	ticket.tierMu.Lock()
+	defer ticket.tierMu.Unlock()
+	state := &ticket.tiers
+	if err != nil {
+		state.Failed = true
+		state.failedAt = time.Now()
+		if w.failedPaths == nil {
+			w.failedPaths = make(map[string]MutationTierState)
+		}
+		if prior := w.failedPaths[path]; prior.Generation <= state.Generation {
+			w.failedPaths[path] = *state
+		}
+		return
+	}
+	at := time.Now()
+	stampRelations(state, at) // identity no-ops and test executors have no tail
+	state.DerivedAt = at
+	state.Partial = fanout.Observed && !fanout.Complete
+	if state.Partial {
+		state.failedAt = at
+		if w.failedPaths == nil {
+			w.failedPaths = make(map[string]MutationTierState)
+		}
+		if prior := w.failedPaths[path]; prior.Generation <= state.Generation {
+			w.failedPaths[path] = *state
+		}
+	} else if prior := w.failedPaths[path]; prior.Generation <= state.Generation {
+		delete(w.failedPaths, path)
+	}
+}
+
+// TierPaths returns only outstanding paths and retained per-path failures.
+// It shares the waiter's existing path index; idle reads allocate no map.
+func (w *Watcher) TierPaths() map[string]MutationTierState {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var states map[string]MutationTierState
+	put := func(path string, state MutationTierState) {
+		if states == nil {
+			states = make(map[string]MutationTierState)
+		}
+		if states[path].Generation <= state.Generation {
+			states[path] = state
+		}
+	}
+	for path, state := range w.failedPaths {
+		if time.Since(state.failedAt) >= 10*time.Minute {
+			delete(w.failedPaths, path)
+			continue
+		}
+		put(path, state)
+	}
+	for path, byGeneration := range w.mutationWaiters {
+		for _, waiter := range byGeneration {
+			if waiter.ticket != nil {
+				put(path, waiter.ticket.TierState())
+			}
+		}
+	}
+	return states
+}
+
+func (w *Watcher) TierState(path string) MutationTierState {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	path = filepath.Clean(path)
+	state := w.failedPaths[path]
+	if !state.failedAt.IsZero() && time.Since(state.failedAt) >= 10*time.Minute {
+		delete(w.failedPaths, path)
+		state = MutationTierState{}
+	}
+	for generation, waiter := range w.mutationWaiters[path] {
+		if generation >= state.Generation && waiter.ticket != nil {
+			state = waiter.ticket.TierState()
+		}
+	}
+	return state
+}
+
+func (mw *MultiWatcher) TierPaths() map[string]MutationTierState {
+	mw.mu.Lock()
+	watchers := make([]*Watcher, 0, len(mw.watchers))
+	for _, watcher := range mw.watchers {
+		watchers = append(watchers, watcher)
+	}
+	mw.mu.Unlock()
+	var states map[string]MutationTierState
+	for _, watcher := range watchers {
+		for path, state := range watcher.TierPaths() {
+			if states == nil {
+				states = make(map[string]MutationTierState)
+			}
+			states[path] = state
+		}
+	}
+	return states
+}
+
+func (mw *MultiWatcher) TierState(path string) MutationTierState {
+	mw.mu.Lock()
+	_, prefix := mw.multi.IndexerForFile(path)
+	watcher := mw.watchers[prefix]
+	mw.mu.Unlock()
+	if watcher != nil {
+		return watcher.TierState(path)
+	}
+	return MutationTierState{}
 }
 
 // TierState reads a ticket's live stamps; the ticket survives waiter removal.
