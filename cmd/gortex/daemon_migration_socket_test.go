@@ -45,6 +45,8 @@ func TestMigrationSocketOwnedHelper(t *testing.T) {
 	}
 	cfgFile, daemonBackendPath, daemonBackend = filepath.Join(root, "repo.yaml"), filepath.Join(root, "store.sqlite"), "sqlite"
 	daemonDetach = false
+ daemonHTTPAddr,daemonHTTPAuthToken,daemonHTTPCORSOrigin="","",""
+ for _,key:=range []string{"GORTEX_DAEMON_HTTP_ADDR","GORTEX_DAEMON_HTTP_TOKEN","GORTEX_DAEMON_PPROF_ADDR","GORTEX_TOOLS","GORTEX_TOOLS_MODE"}{t.Setenv(key,"")}
 	buildDaemonStateForStart = func(logger *zap.Logger, observers ...store_sqlite.MigrationObserver) (*daemonState, error) {
 		return buildDaemonState(logger, func(progress store_sqlite.MigrationProgress) {
 			if len(observers) > 0 {
