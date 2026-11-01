@@ -86,6 +86,7 @@ type repositoryUntrackState struct {
 // MultiIndexer orchestrates indexing across multiple repositories.
 type MultiIndexer struct {
 	graph               graph.Store
+	relationsPending    atomic.Bool // restart batch has not published its shared resolver tail
 	contractCoreRuntime atomic.Pointer[ContractCoreRuntimeHooks]
 	// contractSources caches the accepted bytes each journal fingerprinted,
 	// by source fingerprint, for contract analysis reads.
@@ -557,6 +558,7 @@ func (mi *MultiIndexer) BeginBatch() {
 // EndBatch; call RunDeferredPassesAllResult between the parallel parse and
 // EndBatch to run the deferred per-repo passes serially.
 func (mi *MultiIndexer) BeginParallelBatch() {
+	mi.relationsPending.Store(true)
 	mi.batchMutationGate.Lock()
 	defer mi.batchMutationGate.Unlock()
 
@@ -2520,9 +2522,10 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 		return 0, 0, fmt.Errorf("repository mutation executor has no live indexer: %s", repoPrefix)
 	}
 
-	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
+	finishTopologyMutation := reach.BeginRepoTopologyMutation(mi.graph, repoPrefix)
 	topologyChanged := true
-	defer func() { finishTopologyMutation(topologyChanged) }()
+	var topologyFrontier []string
+	defer func() { finishTopologyMutation(topologyChanged, topologyFrontier) }()
 
 	eviction := idx.evictFileIncrementalRaw(path)
 	result := eviction.result
@@ -2532,7 +2535,7 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 		)
 	}
 	if result.DeletedFileCount > 0 {
-		mi.resolveIncrementalRepoMutation(repoPrefix, result, nil, eviction.batch)
+		topologyFrontier = mi.resolveIncrementalRepoMutation(repoPrefix, result, nil, eviction.batch)
 	}
 
 	fileMtimes := idx.publishFileMtimes()
@@ -2585,19 +2588,22 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	}
 
 	// The stable per-repository lane is held before this executor runs. Take
-	// the global reachability topology gate second and keep it through the
-	// resolver, metadata, and derived tails to avoid lane/gate inversion.
+	// the repository's reachability topology gates second and keep them through
+	// the resolver, metadata, and derived tails to avoid lane/gate inversion.
 	gate := mode.publication.beginPatchLap(patchGateWait)
-	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
+	finishTopologyMutation := reach.BeginRepoTopologyMutation(mi.graph, repoPrefix)
 	gate.end()
 	topologyChanged := true
-	defer func() { finishTopologyMutation(topologyChanged) }()
+	var topologyFrontier []string
+	defer func() { finishTopologyMutation(topologyChanged, topologyFrontier) }()
 
+	goModChanged := false
 	for _, path := range paths {
 		if filepath.Base(path) == "go.mod" {
 			mi.goModuleMu.Lock()
 			mi.goModuleChecked = time.Time{}
 			mi.goModuleMu.Unlock()
+			goModChanged = true
 			break
 		}
 	}
@@ -2611,9 +2617,13 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	// changed/definition file frontier; only an incomplete receipt falls back to
 	// conservative scoped-global resolution. Derived invalidations run once
 	// below after both binding layers are current.
-	mi.resolveIncrementalRepoMutationMode(
+	frontier := mi.resolveIncrementalRepoMutationMode(
 		repoPrefix, result, receipt, batch, mode.exactPointSemantic,
 	)
+	// Module changes and full retracks may rebind edges outside the frontier.
+	if !goModChanged && !result.FullRetrack {
+		topologyFrontier = frontier
+	}
 
 	mtimes := mode.publication.beginPatchLap(patchMtimes)
 	fileMtimes := idx.publishFileMtimes()
@@ -2639,6 +2649,9 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	mi.mu.Unlock()
 	mtimes.end()
 
+	if mode.onRelations != nil && len(result.FailedFiles) == 0 {
+		mode.onRelations()
+	}
 	idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 	derived := mode.publication.beginDerivedPatchLap()
 	mi.runIncrementalDerivedPassesWithPriorTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{
