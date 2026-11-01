@@ -19,7 +19,7 @@ type batchSetSchedulerSpy struct {
 	admissionErr error
 }
 
-func (w *batchSetSchedulerSpy) EnqueueFileMutation(_ context.Context, path string) (*indexer.MutationTicket, error) {
+func (w *batchSetSchedulerSpy) EnqueueToolMutation(_ context.Context, path string) (*indexer.MutationTicket, error) {
 	w.points = append(w.points, path)
 	return completedBatchSetTicket(path, uint64(len(w.points))), nil
 }

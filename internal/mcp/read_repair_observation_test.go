@@ -54,8 +54,8 @@ type readRepairHeldWatcher struct {
 	enqueued chan struct{}
 }
 
-func (w *readRepairHeldWatcher) EnqueueFileMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
-	ticket, err := w.canonicalPublicationWatcher.EnqueueFileMutation(ctx, path)
+func (w *readRepairHeldWatcher) EnqueueToolMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
+	ticket, err := w.canonicalPublicationWatcher.EnqueueToolMutation(ctx, path)
 	close(w.enqueued)
 	return ticket, err
 }

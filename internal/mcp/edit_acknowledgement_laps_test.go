@@ -181,8 +181,8 @@ type acknowledgementWaitWatcher struct {
 	afterAdmission func()
 }
 
-func (w acknowledgementWaitWatcher) EnqueueFileMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
-	ticket, err := w.mutationTestWatcher.EnqueueFileMutation(ctx, path)
+func (w acknowledgementWaitWatcher) EnqueueToolMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
+	ticket, err := w.mutationTestWatcher.EnqueueToolMutation(ctx, path)
 	if w.afterAdmission != nil {
 		w.afterAdmission()
 	}

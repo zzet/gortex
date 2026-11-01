@@ -71,6 +71,7 @@ type MutationTicket struct {
 // released with the same completion/stop paths as its existing result channel;
 // it is not a separate tracing registry or completed-history collection.
 type mutationWaiter struct {
+	tool               bool
 	done               chan MutationResult
 	publication        *PublicationPhaseRecord
 	schedulingEntered  time.Time
@@ -195,6 +196,7 @@ type Watcher struct {
 	mutationRetryDelayFn   func(int) time.Duration
 	pointMutationPatch     func(string, ChangeKind, uint64) error
 	mutationBeforeComplete func(string, uint64)
+	mutationTimerArmed     func(time.Duration) // test hook: actual point/storm timer argument
 	mu                     sync.Mutex
 	stopping               bool
 	asyncWork              sync.WaitGroup
@@ -1791,42 +1793,64 @@ func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
 
 // EnqueueFileMutation hands a committed filesystem mutation directly to the
 // watcher's debounced generation queue. It does not depend on fsnotify delivery,
-// so daemon-backed MCP edits remain reliable even when native watch delivery is
-// degraded. The request context governs admission only; the returned ticket
+// so drift repair remains reliable even when native watch delivery is
+// degraded. Tool writes use EnqueueToolMutation instead. The request context
+// governs admission only; the returned ticket
 // resolves when this generation or a newer coalesced generation reaches a
 // terminal graph state.
 func (w *Watcher) EnqueueFileMutation(ctx context.Context, filePath string) (*MutationTicket, error) {
-	ctx, schedulingEntered := canonicalSchedulingEntry(ctx)
+	return w.enqueueFileMutation(ctx, filePath, false)
+}
+
+// EnqueueToolMutation admits an already committed tool write without waiting
+// for native-event quiet time. It shares validation and generation ownership
+// with EnqueueFileMutation; the request context governs admission only.
+func (w *Watcher) EnqueueToolMutation(ctx context.Context, filePath string) (*MutationTicket, error) {
+	return w.enqueueFileMutation(ctx, filePath, true)
+}
+
+// mutationAdmissionPath is the common validation prologue for point and set
+// admission. A set validates every member before publishing any generation.
+func (w *Watcher) mutationAdmissionPath(ctx context.Context, filePath string) (string, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return "", err
 	}
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	root := w.indexer.RootPath()
 	if root == "" {
-		return nil, nil
+		return "", nil
 	}
 	rel, err := filepath.Rel(root, absPath)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, nil
+		return "", nil
 	}
 	if w.isExcluded(absPath) {
-		return nil, nil
+		return "", nil
 	}
 	if _, ok := w.indexer.effectiveLanguage(absPath, nil); !ok {
-		return nil, nil
+		return "", nil
 	}
 	select {
 	case <-w.done:
-		return nil, errWatcherStopped
+		return "", errWatcherStopped
 	default:
+	}
+	return absPath, nil
+}
+
+func (w *Watcher) enqueueFileMutation(ctx context.Context, filePath string, tool bool) (*MutationTicket, error) {
+	ctx, schedulingEntered := canonicalSchedulingEntry(ctx)
+	absPath, err := w.mutationAdmissionPath(ctx, filePath)
+	if err != nil || absPath == "" {
+		return nil, err
 	}
 	if w.mutationBeforeAdmission != nil {
 		w.mutationBeforeAdmission()
 	}
-	ticket := w.scheduleFileMutationEntered(absPath, ChangeModified, PublicationRecordFromContext(ctx), schedulingEntered)
+	ticket := w.scheduleMutationEntered(absPath, ChangeModified, PublicationRecordFromContext(ctx), schedulingEntered, tool)
 	if ticket == nil {
 		return nil, errWatcherStopped
 	}
@@ -1837,7 +1861,7 @@ func (w *Watcher) EnqueueFileMutation(ctx context.Context, filePath string) (*Mu
 // A nil map means the owner cannot schedule this set; no member was admitted.
 func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map[string]*MutationTicket, error) {
 	if len(files) == 1 {
-		ticket, err := w.EnqueueFileMutation(ctx, files[0])
+		ticket, err := w.EnqueueToolMutation(ctx, files[0])
 		if ticket == nil {
 			return nil, err
 		}
@@ -1847,21 +1871,10 @@ func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map
 		return nil, err
 	}
 	paths := make(map[string]struct{}, len(files))
-	root := w.indexer.RootPath()
-	if root == "" {
-		return nil, nil
-	}
 	for _, file := range files {
-		path, err := filepath.Abs(file)
-		if err != nil {
+		path, err := w.mutationAdmissionPath(ctx, file)
+		if err != nil || path == "" {
 			return nil, err
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || w.isExcluded(path) {
-			return nil, nil
-		}
-		if _, ok := w.indexer.effectiveLanguage(path, nil); !ok {
-			return nil, nil
 		}
 		paths[path] = struct{}{}
 	}
@@ -1870,7 +1883,7 @@ func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map
 	}
 	if len(paths) == 1 {
 		for path := range paths {
-			ticket, err := w.EnqueueFileMutation(ctx, path)
+			ticket, err := w.EnqueueToolMutation(ctx, path)
 			if ticket == nil {
 				return nil, err
 			}
@@ -1916,7 +1929,7 @@ func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map
 			w.mutationWaiters[path] = make(map[uint64]mutationWaiter)
 		}
 		done := make(chan MutationResult, 1)
-		w.mutationWaiters[path][generation] = mutationWaiter{done: done}
+		w.mutationWaiters[path][generation] = mutationWaiter{done: done, tool: true}
 		w.pendingGeneration[path] = generation
 		w.stormGenerations[path] = generation
 		w.stormBatch[path] = ChangeModified
@@ -1947,6 +1960,10 @@ func (w *Watcher) scheduleFileMutationWithRecord(path string, kind ChangeKind, r
 }
 
 func (w *Watcher) scheduleFileMutationEntered(path string, kind ChangeKind, record *PublicationPhaseRecord, entered time.Time) *MutationTicket {
+	return w.scheduleMutationEntered(path, kind, record, entered, false)
+}
+
+func (w *Watcher) scheduleMutationEntered(path string, kind ChangeKind, record *PublicationPhaseRecord, entered time.Time, tool bool) *MutationTicket {
 	w.mu.Lock()
 	if w.stopping {
 		w.mu.Unlock()
@@ -2006,8 +2023,12 @@ func (w *Watcher) scheduleFileMutationEntered(path string, kind ChangeKind, reco
 		}
 		w.observedMutationGeneration[path] = generation
 	}
-	w.mutationWaiters[path][generation] = mutationWaiter{done: done, publication: ticket.PublicationRecord, schedulingEntered: entered, backgroundEligible: backgroundEligible}
-	armedBackground := w.armPointMutationTimerLocked(path, kind, generation, 0, time.Duration(w.config.DebounceMs)*time.Millisecond, successorBackground, admissionPredecessor, admissionStopFailed)
+	w.mutationWaiters[path][generation] = mutationWaiter{done: done, publication: ticket.PublicationRecord, schedulingEntered: entered, backgroundEligible: backgroundEligible, tool: tool}
+	delay := time.Duration(w.config.DebounceMs) * time.Millisecond
+	if tool {
+		delay = 0
+	}
+	armedBackground := w.armPointMutationTimerLocked(path, kind, generation, 0, delay, successorBackground, admissionPredecessor, admissionStopFailed)
 	w.mu.Unlock()
 	if previousBackground != nil {
 		previousBackground.publishUnavailable()
@@ -2061,6 +2082,9 @@ func (w *Watcher) armPointMutationTimerLocked(path string, kind ChangeKind, gene
 		w.mutationWaiters[path][generation] = waiter
 	}
 	w.asyncWork.Add(1)
+	if w.mutationTimerArmed != nil {
+		w.mutationTimerArmed(delay)
+	}
 	timer = time.AfterFunc(delay, func() {
 		if observation != nil {
 			observation.entered = time.Now() // callback entry precedes claim/admission
@@ -2449,6 +2473,9 @@ func (w *Watcher) recordInStorm(path string, kind ChangeKind) {
 
 func (w *Watcher) armStormTimerLocked(delay time.Duration) {
 	w.stormWork.Add(1)
+	if w.mutationTimerArmed != nil {
+		w.mutationTimerArmed(delay)
+	}
 	w.stormTimer = time.AfterFunc(delay, func() {
 		defer w.stormWork.Done()
 		w.drainStorm()
