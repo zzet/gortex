@@ -815,6 +815,13 @@ func generationReadProbes() []genProbe {
 			}
 			return edgeSliceMapTokens(m)
 		}},
+		{name: "GetInEdgesByNodeIDsFromRepos", run: func(t *testing.T, s *Store) []string {
+			m, handled, err := s.GetInEdgesByNodeIDsFromRepos(genReadProbeIDs(), []string{"", genReadRepo, genReadOtherRepo, "extra"})
+			if err != nil || !handled {
+				t.Fatalf("GetInEdgesByNodeIDsFromRepos: handled=%v err=%v", handled, err)
+			}
+			return edgeSliceMapTokens(m)
+		}},
 		{name: "GetRepoEdges", run: func(t *testing.T, s *Store) []string {
 			return edgeTokens(s.GetRepoEdges(genReadRepo))
 		}},
@@ -2305,6 +2312,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.RepoNamesNodeFinder)(nil), probe: "FindNodesByNamesInRepo"},
 		{iface: (*graph.RepoNodeIdentitySequencer)(nil), probe: "NodesInScopeSeq"},
 		{iface: (*graph.RepoNodeKindIDReader)(nil), probe: "RepoProjections"},
+		{iface: (*graph.RepoScopedInEdgeReader)(nil), probe: "GetInEdgesByNodeIDsFromRepos"},
 		{iface: (*graph.ResolverNameScopeFinder)(nil), probe: "FindNodesByResolverNameScopes"},
 		{iface: (*graph.ScopeBindingNodeSequencer)(nil), probe: "NodesInScopeSeq"},
 		{iface: (*graph.ScopedCrossRepoCandidates)(nil), probe: "CrossRepoCandidatesForRepos"},

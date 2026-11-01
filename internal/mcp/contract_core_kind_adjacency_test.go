@@ -39,7 +39,7 @@ func (r *kindAdjacencySpy) AllEdges() []*graph.Edge {
 
 // Walks read this wrapper's masked point lookups: a typed statement over the
 // same masks cost several times more per hop.
-func TestContractCoreWalkMatchesLegacyWithMasksCapsAndBoundaries(t *testing.T) {
+func TestContractCoreScopedWalkMatchesLegacyWithMasksCapsAndBoundaries(t *testing.T) {
 	s := openContractCoreCapStore(t)
 	s.AddBatch([]*graph.Node{
 		{ID: "a/start", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/start.go"},
@@ -107,7 +107,7 @@ func TestContractCoreWalkMatchesLegacyWithMasksCapsAndBoundaries(t *testing.T) {
 	}
 }
 
-func TestContractCoreKindAdjacencyKeepsOverlayTombstones(t *testing.T) {
+func TestContractCoreScopedKindAdjacencyKeepsOverlayTombstones(t *testing.T) {
 	s := newContractCoreEditingStore(t)
 	layer := graph.NewOverlayLayer()
 	layer.MarkFile("repo/b.go", true)

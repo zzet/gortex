@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"testing"
 
-	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
@@ -13,21 +12,6 @@ import (
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search"
 )
-
-type contextScopeReader struct {
-	*graph.Graph
-	allNodes, allEdges int
-}
-
-func (r *contextScopeReader) AllNodes() []*graph.Node {
-	r.allNodes++
-	return r.Graph.AllNodes()
-}
-
-func (r *contextScopeReader) AllEdges() []*graph.Edge {
-	r.allEdges++
-	return r.Graph.AllEdges()
-}
 
 type contextScopeBackend struct {
 	searchSymbolsContextBackend
@@ -64,34 +48,44 @@ func (b *contextScopeBackend) SearchSymbolBundlesPathScopedContext(_ context.Con
 	return b.scoped(repos, paths, limit), true
 }
 
-func TestSmartContextRetrievalScopeCost(t *testing.T) {
+// A repo-scoped smart_context retrieves, ranks and expands only the scoped
+// repository: every keyword search and the whole-task confidence query use
+// the same scope, and the name lookups, caller walks and blast radius that
+// follow read the same graph rows however many repositories share the
+// symbol names and paths.
+func TestSmartContextScopedNeverScansAndRowsStayFlat(t *testing.T) {
 	for _, path := range []string{"", "pkg"} {
 		t.Run("path="+path, func(t *testing.T) {
-			var baselineRows int
+			var baseline string
+			var baselineBundles int
+			var baselineRows map[string]int
 			for _, repositories := range []int{1, 6} {
 				t.Run(fmt.Sprintf("repos=%d", repositories), func(t *testing.T) {
-					r := &contextScopeReader{Graph: graph.New()}
+					store := openContractCoreCapStore(t)
 					b := &contextScopeBackend{}
 					for repo := 0; repo < repositories; repo++ {
 						prefix := fmt.Sprintf("repo-%d", repo)
+						var nodes []*graph.Node
+						var edges []*graph.Edge
 						for i := 0; i < 4; i++ {
-							n := &graph.Node{ID: fmt.Sprintf("%s/pkg/p%d.go::parser%d", prefix, i, i), Name: fmt.Sprintf("parser%d", i), FilePath: fmt.Sprintf("%s/pkg/p%d.go", prefix, i), RepoPrefix: prefix, Kind: graph.KindFunction}
-							r.AddNode(n)
-							b.nodes = append(b.nodes, n)
+							nodes = append(nodes, &graph.Node{ID: fmt.Sprintf("%s/pkg/p%d.go::parser%d", prefix, i, i), Name: fmt.Sprintf("parser%d", i), FilePath: fmt.Sprintf("%s/pkg/p%d.go", prefix, i), RepoPrefix: prefix, Kind: graph.KindFunction, Language: "go", StartLine: 3, EndLine: 9})
+							if i > 0 {
+								edges = append(edges, &graph.Edge{From: nodes[i-1].ID, To: nodes[i].ID, Kind: graph.EdgeCalls, FilePath: nodes[i-1].FilePath, Line: 5, Origin: graph.OriginASTResolved, Confidence: .9})
+							}
 						}
+						edges = append(edges, &graph.Edge{From: nodes[3].ID, To: graph.UnresolvedMarker + "parser0", Kind: graph.EdgeCalls, FilePath: nodes[3].FilePath, Line: 7})
+						require.NoError(t, store.AddBatchChecked(nodes, edges))
+						b.nodes = append(b.nodes, nodes...)
 					}
-					eng := query.NewEngine(r)
+					counter := newScopedReadCounter(store)
+					eng := query.NewEngine(counter)
 					eng.SetSearch(b)
 					eng.SetRerank(nil)
-					srv := NewServer(eng, r, nil, nil, zap.NewNop(), nil)
-					req := mcplib.CallToolRequest{}
-					req.Params.Name = "smart_context"
+					srv := NewServer(eng, counter, nil, nil, zap.NewNop(), nil)
+					installContractCoreKindTestRuntime(t, srv)
 					// The whole-task confidence query must use the same scope as
 					// each keyword search. More unrelated repos change neither.
-					req.Params.Arguments = map[string]any{"task": "how does parser work", "repo": "repo-0", "path": path}
-					res, err := srv.handleSmartContext(context.Background(), req)
-					require.NoError(t, err)
-					require.False(t, res.IsError)
+					payload := scopedRowCall(t, srv, srv.handleSmartContext, t.Context(), "smart_context", map[string]any{"task": "how does parser work", "repo": "repo-0", "path": path})
 					require.Zero(t, b.contextCalls.Load(), "unscoped bundle query")
 					require.Zero(t, b.legacyBundleCalls.Load())
 					require.Zero(t, b.legacySearchCalls.Load())
@@ -100,13 +94,16 @@ func TestSmartContextRetrievalScopeCost(t *testing.T) {
 						require.Equal(t, 3, b.pathCalls)
 					}
 					require.Positive(t, b.rows)
+					require.Empty(t, counter.scans(), "a scoped request read the whole store")
+					rows := counter.rows()
+					require.NotEmpty(t, rows)
 					if repositories == 1 {
-						baselineRows = b.rows
-					} else {
-						require.Equal(t, baselineRows, b.rows, "adding unrelated repositories increased returned bundle rows")
+						baseline, baselineBundles, baselineRows = payload, b.rows, rows
+						return
 					}
-					require.Zero(t, r.allNodes)
-					require.Zero(t, r.allEdges)
+					require.JSONEq(t, baseline, payload, "unrelated repositories changed the scoped context")
+					require.Equal(t, baselineBundles, b.rows, "unrelated repositories increased returned bundle rows")
+					require.Equal(t, baselineRows, rows, "unrelated repositories changed the graph rows a scoped request read")
 				})
 			}
 		})
