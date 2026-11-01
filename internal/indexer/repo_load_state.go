@@ -69,6 +69,11 @@ type RepoLoad struct {
 	State  RepoLoadState `json:"state"`
 	// Reason explains a failed or missing repository.
 	Reason string `json:"reason,omitempty"`
+	// Collision identity is captured by the loading operation, not restatted
+	// on a probe/read path. Unknown is distinct from a missing owner.
+	ErrorCode  string `json:"error_code,omitempty"`
+	OwnerPath  string `json:"owner_path,omitempty"`
+	OwnerState string `json:"owner_state,omitempty"`
 	// Since is when the repository entered State.
 	Since time.Time `json:"since"`
 
@@ -86,6 +91,11 @@ type RepoLoad struct {
 	// filesystem identity warmup fills in. It grants no graph admission.
 	identityPending bool
 	identityToken   *byte
+	// Prefix inference is safe before registration only for an explicit name
+	// or a resolved ordinary root. Linked worktrees retain lifecycle naming.
+	prefixPinned  bool
+	plainRoot     bool
+	forceInstance bool
 }
 
 // Label names the repository in user-facing text: its prefix, or its root
@@ -115,10 +125,11 @@ type repoLoadSnapshot struct {
 	// can skip its filesystem walk once warmup has settled.
 	loading         int
 	identityPending bool
+	readyByPrefix   map[string]int
 }
 
 func newRepoLoadSnapshot(records []RepoLoad) *repoLoadSnapshot {
-	snap := &repoLoadSnapshot{records: records, index: make(map[string]int, 2*len(records))}
+	snap := &repoLoadSnapshot{records: records, index: make(map[string]int, 2*len(records)), readyByPrefix: make(map[string]int)}
 	for i, rec := range records {
 		snap.index[rec.key] = i
 		if rec.identityPending {
@@ -129,6 +140,9 @@ func newRepoLoadSnapshot(records []RepoLoad) *repoLoadSnapshot {
 		}
 		if rec.State.Loading() {
 			snap.loading++
+		}
+		if rec.State.Ready() && rec.Prefix != "" {
+			snap.readyByPrefix[rec.Prefix] = i
 		}
 	}
 	return snap
@@ -170,7 +184,7 @@ func (t *repoLoadTable) update(mutate func(records []RepoLoad) ([]RepoLoad, bool
 // when a start announces its repositories and when one registers.
 func newRepoLoad(root, prefix string, state RepoLoadState, now time.Time) RepoLoad {
 	rec := RepoLoad{Root: root, Prefix: prefix, State: state, Since: now,
-		key: pathkey.IdentityKey(root), identityPending: true, identityToken: new(byte)}
+		key: pathkey.IdentityKey(root), identityPending: true, identityToken: new(byte), prefixPinned: state.Ready()}
 	resolved, err := resolveRepoLoadIdentity(rec)
 	if err != nil {
 		rec.Reason = "identity resolution pending: " + err.Error()
@@ -236,7 +250,8 @@ func (mi *MultiIndexer) expectRepos(entries []config.RepoEntry, inspect bool) {
 				continue
 			}
 			added = append(added, RepoLoad{Root: root, Prefix: config.ResolvePrefix(entry), State: RepoLoadQueued,
-				Since: now, key: key, commonDir: filepath.Join(root, ".git"), identityPending: true, identityToken: new(byte)})
+				Since: now, key: key, commonDir: filepath.Join(root, ".git"), identityPending: true, identityToken: new(byte),
+				prefixPinned: entry.Name != "", forceInstance: entry.AsWorktree})
 			addedKeys[key] = true
 		}
 		next := make([]RepoLoad, 0, len(records)+len(added))
@@ -307,6 +322,7 @@ func resolveRepoLoadIdentityWith(rec RepoLoad, canonicalize func(string) (string
 			if resolveErr != nil {
 				return rec, resolveErr
 			}
+			rec.plainRoot = !info.IsWorktree
 			rec.commonDir = ""
 			if info.GitCommonDir != "" {
 				common, commonErr := filepath.EvalSymlinks(info.GitCommonDir)
@@ -329,6 +345,7 @@ func (mi *MultiIndexer) publishRepoLoadIdentity(before, resolved RepoLoad) {
 		}
 		rec := &records[i]
 		rec.canonicalKey, rec.commonDir, rec.identityPending = resolved.canonicalKey, resolved.commonDir, false
+		rec.plainRoot = resolved.plainRoot
 		if strings.HasPrefix(rec.Reason, "identity resolution pending: ") {
 			rec.Reason = ""
 		}
@@ -374,6 +391,19 @@ func (mi *MultiIndexer) FinishRepoLoad(path string, jobErr error) {
 		return
 	}
 	rec := snap.records[i]
+	var collision *PrefixCollisionError
+	if errors.As(jobErr, &collision) {
+		mi.setRepoLoad(root, func(rec *RepoLoad) bool {
+			if !rec.State.Loading() {
+				return false
+			}
+			rec.State, rec.Reason, rec.Since = RepoLoadFailed, "prefix_collision: "+collision.Error(), time.Now()
+			rec.Prefix, rec.ErrorCode = collision.Prefix, "prefix_collision"
+			rec.OwnerPath, rec.OwnerState = collision.ExistingPath, collision.OwnerState
+			return true
+		})
+		return
+	}
 	// The job may have found the repository registered under another spelling
 	// of the same directory, which is a success the registration hook could
 	// not attribute to this record.
@@ -473,12 +503,14 @@ func (mi *MultiIndexer) markRepoRegistered(prefix, root string) {
 		listeners = slices.Clone(mi.repoLoads.listeners)
 		if i, ok := newRepoLoadSnapshot(records).find(root); ok {
 			records[i].State, records[i].Reason, records[i].Since = RepoLoadReady, "", now
+			records[i].ErrorCode, records[i].OwnerPath, records[i].OwnerState = "", "", ""
 			if registered.canonicalKey != "" {
 				records[i].canonicalKey = registered.canonicalKey
 			}
 			records[i].commonDir = registered.commonDir
 			records[i].identityPending = registered.identityPending
 			records[i].identityToken = registered.identityToken
+			records[i].prefixPinned, records[i].plainRoot = true, registered.plainRoot
 			if registered.identityPending {
 				records[i].Reason = registered.Reason
 			}
@@ -522,7 +554,12 @@ func (mi *MultiIndexer) RepoLoads() []RepoLoad {
 	if mi == nil {
 		return nil
 	}
-	return slices.Clone(mi.repoLoads.load().records)
+	snap := mi.repoLoads.load()
+	out := slices.Clone(snap.records)
+	for i := range out {
+		out[i] = snap.withPrefixCollision(out[i])
+	}
+	return out
 }
 
 // ConfiguredRepoRoots includes declarations whose loading finished without
@@ -546,7 +583,7 @@ func (mi *MultiIndexer) RepoLoadFor(path string) (RepoLoad, bool) {
 	if !ok {
 		return RepoLoad{}, false
 	}
-	return snap.records[i], true
+	return snap.withPrefixCollision(snap.records[i]), true
 }
 
 // PendingRepoForPath returns the configured, not-yet-registered repository
@@ -562,7 +599,12 @@ func (mi *MultiIndexer) PendingRepoForPath(path string) (RepoLoad, bool) {
 	if mi == nil || path == "" {
 		return RepoLoad{}, false
 	}
-	return mi.repoLoads.load().matchForPath(path, false)
+	snap := mi.repoLoads.load()
+	rec, matched := snap.matchForPath(path, false)
+	if matched {
+		rec = snap.withPrefixCollision(rec)
+	}
+	return rec, matched
 }
 
 // RepoLoadAdmissionForPath classifies a final negative from one immutable
@@ -578,12 +620,35 @@ func (mi *MultiIndexer) RepoLoadAdmissionForPath(path string) (RepoLoad, bool) {
 
 func (s *repoLoadSnapshot) admissionForPath(path string) (RepoLoad, bool) {
 	if rec, matched := s.matchForPath(path, true); matched {
-		return rec, true
+		return s.withPrefixCollision(rec), true
 	}
 	if s.identityPending {
 		return RepoLoad{State: RepoLoadIdentityPending}, true
 	}
 	return RepoLoad{}, false
+}
+
+// withPrefixCollision uses completed identity facts from this same snapshot.
+// It performs no I/O, takes no registry lock, and does not change the producer's
+// queued/running state. Unknown identities and linked naming never guess.
+func (s *repoLoadSnapshot) withPrefixCollision(rec RepoLoad) RepoLoad {
+	if rec.State.Ready() || rec.ErrorCode != "" || rec.identityPending || rec.canonicalKey == "" ||
+		!rec.prefixPinned && (!rec.plainRoot || rec.forceInstance) {
+		return rec
+	}
+	index, ok := s.readyByPrefix[rec.Prefix]
+	if !ok {
+		return rec
+	}
+	owner := s.records[index]
+	if owner.identityPending || owner.canonicalKey == "" || owner.canonicalKey == rec.canonicalKey {
+		return rec
+	}
+	collision := &PrefixCollisionError{Prefix: rec.Prefix, ExistingPath: owner.Root, Path: rec.Root, OwnerState: "present"}
+	rec.State, rec.ErrorCode = RepoLoadFailed, "prefix_collision"
+	rec.OwnerPath, rec.OwnerState = owner.Root, "present"
+	rec.Reason = "prefix_collision: " + collision.Error()
+	return rec
 }
 
 func (snap *repoLoadSnapshot) matchForPath(path string, includeReady bool) (RepoLoad, bool) {

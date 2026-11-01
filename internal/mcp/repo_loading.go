@@ -77,10 +77,27 @@ func RepoLoadingSuggestion(repo string) string {
 // RepoUnavailableSuggestion is the remedy text a repo_unavailable refusal
 // carries.
 func RepoUnavailableSuggestion(rec indexer.RepoLoad) string {
+	if rec.ErrorCode == string(ErrCodePrefixCollision) {
+		return PrefixCollisionSuggestion(rec)
+	}
 	if rec.State == indexer.RepoLoadMissing {
 		return fmt.Sprintf("The configured path %s does not exist. Restore it, or remove it with `gortex untrack %s`.", rec.Root, rec.Root)
 	}
 	return fmt.Sprintf("Gortex could not load %s after the restart. Run `gortex track %s` to index it again, or `gortex doctor` to diagnose.", rec.Root, rec.Root)
+}
+
+// PrefixCollisionSuggestion uses only the captured owner evidence. Missing
+// means an observed ENOENT, never a timeout or permission failure.
+func PrefixCollisionSuggestion(rec indexer.RepoLoad) string {
+	if rec.OwnerState == "missing" {
+		return fmt.Sprintf("The owner %s no longer exists. Inspect `gortex untrack %s` for that owner before retrying %s.", rec.OwnerPath, rec.OwnerPath, rec.Root)
+	}
+	return fmt.Sprintf("Prefix %q belongs to %s. Use a different name parameter for a new root; for the configured root %s set a unique name in the global config and run `gortex daemon reload`.", rec.Prefix, rec.OwnerPath, rec.Root)
+}
+
+func ServerInstructionsPrefixCollision(rec indexer.RepoLoad) string {
+	return "Gortex cannot admit this configured root (prefix_collision). " + PrefixCollisionSuggestion(rec) +
+		" Graph tools cannot answer for this root until its prefix is unique. Native file reads and edits remain available."
 }
 
 // loadingPhaseLabel names the warmup phase; before the first phase is
