@@ -124,3 +124,33 @@ func TestReclaimBurstCounterCompleteness(t *testing.T) {
 		})
 	}
 }
+
+func TestReclaimBurstMetricsRequiresObservedMaximum(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		max      any
+		present  bool
+		observed bool
+	}{
+		{name: "missing maximum", present: false},
+		{name: "null maximum", present: true, max: nil},
+		{name: "maximum above last occupied finite bucket", present: true, max: 1000},
+		{name: "genuine measured zero", present: true, max: 0, observed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := reclaimBuckets(0, map[int]int{0: 1})
+			h["count"] = 1
+			delete(h, "max_ms")
+			if tc.present {
+				h["max_ms"] = tc.max
+			}
+			m := reclaimMetrics([]json.RawMessage{burstReceipt(t, store_sqlite.WALReclaimStats{}), reclaimReceipt(t, map[string]any{"edit_burst_writer_hold": h})})
+			if tc.observed {
+				requireMetric(t, m, "reclaim_edit_burst_writer_holds", 1, "holds")
+				requireMetric(t, m, "reclaim_edit_burst_writer_hold_p95_ms", 0, "ms")
+			} else {
+				requireUnavailable(t, m, "reclaim_edit_burst_writer_hold_p95_ms", "invalid")
+			}
+		})
+	}
+}

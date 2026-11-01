@@ -144,7 +144,10 @@ func reclaimBurstHistograms(before, after json.RawMessage) (*reclaimHistogram, *
 			return nil, true
 		}
 		var h reclaimHistogram
-		if json.Unmarshal(raw, &h) != nil || !h.validBurstPopulation() {
+		var maximum struct {
+			Value *float64 `json:"max_ms"`
+		}
+		if json.Unmarshal(raw, &h) != nil || json.Unmarshal(raw, &maximum) != nil || maximum.Value == nil || !h.validBurstPopulation() {
 			return nil, false
 		}
 		return &h, true
@@ -175,15 +178,24 @@ func (h *reclaimHistogram) validBurstPopulation() bool {
 			return false
 		}
 	}
-	n := 0.0
+	n, last := 0.0, -1
 	for i, c := range h.BucketCounts {
 		if c < 0 || math.Trunc(c) != c {
 			return false
 		}
-		if c > 0 && i > 0 && h.MaxMS <= h.BucketLEMS[i-1] {
-			return false
+		if c > 0 {
+			last = i
+			if i > 0 && h.MaxMS <= h.BucketLEMS[i-1] {
+				return false
+			}
 		}
 		n += c
+	}
+	// The producer's Max can lead Counts during recording. Such a snapshot
+	// does not yet witness a consistent distribution: leave it unavailable
+	// rather than combining that maximum with the lower counted population.
+	if last >= 0 && last < len(h.BucketLEMS) && h.MaxMS > h.BucketLEMS[last] {
+		return false
 	}
 	return n == float64(*h.Count)
 }
