@@ -21,7 +21,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		switch args[0] {
 		case "edit-loop":
 			return editLoopCommand(args[1:], stdout, stderr)
-		case "plan", "collect":
+		case "plan", "collect", "edit-plan", "edit-collect":
 			return laneCommand(args[0], args[1:], stdout, stderr)
 		case "history":
 			return historyCommand(args[1:], stdout, stderr)

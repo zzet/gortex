@@ -61,11 +61,14 @@ type laneConfig struct {
 }
 
 type laneTask struct {
-	Scenario    string `json:"scenario"`
-	Role        string `json:"role"`
-	Repeat      int    `json:"repeat"`
-	Seed        int64  `json:"seed"`
-	Unavailable string `json:"unavailable,omitempty"`
+	EditGate    bool     `json:"edit_gate,omitempty"`
+	EditCount   int      `json:"edit_count,omitempty"`
+	ProbeModes  []string `json:"probe_modes,omitempty"`
+	Scenario    string   `json:"scenario"`
+	Role        string   `json:"role"`
+	Repeat      int      `json:"repeat"`
+	Seed        int64    `json:"seed"`
+	Unavailable string   `json:"unavailable,omitempty"`
 }
 
 type lanePlan struct {
@@ -99,7 +102,7 @@ type laneReceipt struct {
 	Smoke       *smokeProvenance   `json:"smoke_provenance,omitempty"`
 }
 
-func readLaneConfig(path string) (laneConfig, error) {
+func readLaneConfig(path string, editGate ...bool) (laneConfig, error) {
 	var c laneConfig
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -162,7 +165,7 @@ func readLaneConfig(path string) (laneConfig, error) {
 	if c.MainArtifact != "" {
 		c.MainArtifact = resolve(c.MainArtifact)
 	}
-	if c.Lane == "smoke" && c.MainArtifact == "" {
+	if c.Lane == "smoke" && c.MainArtifact == "" && (len(editGate) == 0 || !editGate[0]) {
 		return c, errors.New("smoke requires the verified exact-main artifact bundle")
 	}
 	for role, build := range c.Builds {
@@ -240,6 +243,8 @@ func policyDigest(p policy) string {
 }
 
 func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
+	editGate := strings.HasPrefix(command, "edit-")
+	command = strings.TrimPrefix(command, "edit-")
 	f := flag.NewFlagSet(command, flag.ContinueOnError)
 	f.SetOutput(stderr)
 	config := f.String("config", "", "strict pinned lane config")
@@ -270,7 +275,7 @@ func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
 	c := laneConfig{Lane: *lane, HostClass: *host, Repeats: 3}
 	var err error
 	if *config != "" {
-		c, err = readLaneConfig(*config)
+		c, err = readLaneConfig(*config, editGate)
 	} else if !slices.Contains([]string{"smoke", "nightly", "release"}, *lane) {
 		err = errors.New("unknown lane")
 	}
@@ -328,7 +333,12 @@ func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	plan, err := makeLanePlan(p, c)
+	var plan lanePlan
+	if editGate {
+		plan, err = makeEditLoopLanePlan(p, c)
+	} else {
+		plan, err = makeLanePlan(p, c)
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -429,12 +439,18 @@ func taskManifest(c laneConfig, task laneTask, root string) (string, error) {
 
 func taskArgs(c laneConfig, task laneTask, manifest, scratch, report string) []string {
 	spec := scenarioSpecs[task.Scenario]
+	if task.EditGate {
+		spec.wire, spec.agents = "edit-and-probe", 0
+	}
 	host := "native"
 	if c.HostClass == "reference_linux" {
 		host = "reference"
 	}
 	build := c.Builds[task.Role]
 	args := []string{"run", "--binary", build.Binary, "--git-sha", build.Revision, "--manifest", manifest, "--scratch", scratch, "--out", report, "--host", host, "--profile", "agent", "--scenario", spec.wire, "--agents", fmt.Sprint(spec.agents), "--edit-agents", fmt.Sprint(spec.editors), "--worktrees", fmt.Sprint(spec.worktrees), "--seed", fmt.Sprint(task.Seed), "--duration", c.Duration, "--deadline", c.Deadline, "--warm-timeout", c.WarmTimeout, "--stop-timeout", c.StopTimeout, "--sweep-repetitions", fmt.Sprint(c.SweepRepetitions), "--sweep-duration", c.SweepDuration}
+	if task.EditGate {
+		args = append(args, "--edit-gate-modes", "--edit-count", "100", "--edit-repos", fmt.Sprint(spec.repos))
+	}
 	if c.Lane == "smoke" && spec.wire == "read" && c.PRSmokeDrain != "" {
 		args = append(args, "--pr-smoke-drain", c.PRSmokeDrain)
 	}
@@ -463,7 +479,7 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 	if server, repo, id := os.Getenv("GITHUB_SERVER_URL"), os.Getenv("GITHUB_REPOSITORY"), os.Getenv("GITHUB_RUN_ID"); server != "" && repo != "" && id != "" {
 		receipt.Workflow.RunURL = server + "/" + repo + "/actions/runs/" + id
 	}
-	if c.Lane == "smoke" {
+	if c.Lane == "smoke" && plan.Execution != "edit-loop" {
 		proof, err := prepareSmokeProvenance(c, receipt.Workflow)
 		if err != nil {
 			receipt.Error = err.Error()
@@ -510,7 +526,18 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 			var log *os.File
 			log, err = os.OpenFile(filepath.Join(root, "client.log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 			if err == nil {
-				err = runProcess(ctx, c.Load, taskArgs(c, task, manifest, filepath.Join(root, "state"), reportPath), log)
+				taskCtx := ctx
+				cancel := func() {}
+				if task.EditGate && c.Lane == "smoke" {
+					// Interrupt the signal-aware client at 13m, preserving its
+					// independent <=2m owned cleanup inside the 15m per-run cap.
+					taskCtx, cancel = context.WithDeadline(ctx, tr.Started.Add(13*time.Minute))
+				}
+				err = runProcess(taskCtx, c.Load, taskArgs(c, task, manifest, filepath.Join(root, "state"), reportPath), log)
+				cancel()
+				if task.EditGate && c.Lane == "smoke" && time.Since(tr.Started) > 15*time.Minute {
+					err = errors.Join(err, errors.New("edit smoke run exceeded 15 minutes including startup and cleanup"))
+				}
 				err = errors.Join(err, log.Close())
 			}
 		}
@@ -522,6 +549,9 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 		}
 		tr.Finished = time.Now().UTC()
 		receipt.Tasks = append(receipt.Tasks, tr)
+	}
+	if plan.Execution == "edit-loop" {
+		return finishEditLoopLaneEvidence(c, p, plan, out, stdout, receipt, index, failures)
 	}
 	return finishLaneEvidence(c, p, plan, out, stdout, receipt, index, failures)
 }
