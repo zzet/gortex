@@ -201,7 +201,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			observed := err == nil && len(bytes.TrimSpace(raw)) > 0
 			phase.Gate["discovery_git_fault"], _ = json.Marshal(map[string]any{"configured": true, "observed": observed, "raw_events": string(raw), "absolute_child_bound_seconds": 60})
 			if !observed {
-				resultErr = errors.Join(resultErr, errors.New("Git stall never entered the intended new checkout"), err)
+				resultErr = errors.Join(resultErr, errors.New("git stall never entered the intended new checkout"), err)
 			}
 		}()
 	}

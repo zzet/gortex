@@ -147,7 +147,7 @@ func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRu
 		report := summarizeCheckoutDiscovery(phase.Attempts[first:], checkouts, frozen.Repos[0].Path, frozen.Repos[1].Path)
 		phase.Gate["checkout_discovery"], _ = json.Marshal(report)
 		if o.Discovery.StallFirst && report.PendingRefusals == 0 {
-			resultErr = errors.Join(resultErr, errors.New("Git stall produced no pending refusal exposure"))
+			resultErr = errors.Join(resultErr, errors.New("git stall produced no pending refusal exposure"))
 		}
 		if report.OutsidePendingRefusals > 0 || report.OutsidePendingErrors > 0 || report.ForeignCapacityRefusals > 0 {
 			resultErr = errors.Join(resultErr, fmt.Errorf("checkout discovery affected other cwds: %d refusals, %d errors, %d foreign capacity refusals", report.OutsidePendingRefusals, report.OutsidePendingErrors, report.ForeignCapacityRefusals))
