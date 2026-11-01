@@ -13,7 +13,7 @@ import (
 	wire "github.com/gortexhq/gcx-go"
 )
 
-var editProbeTierLine = regexp.MustCompile(`^(file|relations|derived): (pending|pending_unknown|unknown|failed) \(([0-9]+) files\)$`)
+var editProbeTierLine = regexp.MustCompile(`^(file|relations|derived): (pending|pending_unknown|unknown|failed|fresh) \(([0-9]+) files\)$`)
 
 // The label is producer evidence, not disposable prose. Keep its exact scope,
 // state and count while decoding the underlying compact/TOON payload normally.
@@ -29,6 +29,9 @@ func editProbeTierPrefix(text []byte) ([]byte, map[string]any, error) {
 	count, err := strconv.ParseUint(string(match[3]), 10, 63)
 	if err != nil {
 		return nil, nil, err
+	}
+	if string(match[2]) == "fresh" && count != 0 {
+		return nil, nil, errors.New("freshness label claims fresh with pending files")
 	}
 	next, _, _ := bytes.Cut(rest, []byte("\n"))
 	if editProbeTierLine.Match(next) {
