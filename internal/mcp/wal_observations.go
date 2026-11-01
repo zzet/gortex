@@ -3,12 +3,18 @@ package mcp
 import (
 	"reflect"
 
+	"github.com/zzet/gortex/internal/daemon"
+
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 // walReclaimSnapshotReader is intentionally smaller than daemon storage status:
 // WALReclaimStats copies counters under a short mutex plus atomic loads. It
 // does not stat files, read the wal-index, query SQL or wait for the writer.
+type walPassiveSnapshotReader interface {
+	WALPassiveStats() store_sqlite.WALPassiveStats
+}
+
 type walReclaimSnapshotReader interface {
 	WALReclaimStats() store_sqlite.WALReclaimStats
 }
@@ -61,4 +67,22 @@ func (s *Server) walReclaimObservation() walReclaimObservation {
 		result.ObservedPeakWALBytes = &peak
 	}
 	return result
+}
+
+// indexHealthReclaimStorage uses the physical binding, never a composed reader
+// and never DBStats or the wal-index. An unsupported new binding removes any
+// stale storage block retained in a cached health baseline.
+func (s *Server) indexHealthReclaimStorage() map[string]any {
+	reader, ok := s.graph.(walReclaimSnapshotReader)
+	if !ok {
+		return nil
+	}
+	if value := reflect.ValueOf(reader); value.Kind() == reflect.Pointer && value.IsNil() {
+		return nil
+	}
+	out := map[string]any{"scope": "physical_store_since_open", "wal_reclaim": daemon.WALReclaimStatusFrom(reader.WALReclaimStats())}
+	if passive, ok := s.graph.(walPassiveSnapshotReader); ok {
+		out["wal_checkpoint"] = daemon.WALCheckpointStatusFrom(passive.WALPassiveStats())
+	}
+	return out
 }

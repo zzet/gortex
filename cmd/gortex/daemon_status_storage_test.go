@@ -44,13 +44,15 @@ func TestStatusStorageReportsTheStoreWAL(t *testing.T) {
 	assert.Equal(t, wantEstimate.Milliseconds(), st.CloseCheckpointEstimateMS)
 	assert.Equal(t, wantPending, st.WALPendingFrames)
 	assert.Positive(t, st.CloseCheckpointEstimateMS)
+	require.NotNil(t, st.WALCheckpoint)
+	assert.Equal(t, store.WALPassiveStats().LastOutcome, st.WALCheckpoint.LastOutcome)
 	require.NotNil(t, st.WALReclaim)
 	assert.Equal(t, store.WALReclaimStats().ThresholdBytes, st.WALReclaim.ThresholdBytes)
 
 	body, err := json.Marshal(daemon.StatusResponse{Storage: st})
 	require.NoError(t, err)
 	for _, key := range []string{`"storage"`, `"wal_bytes"`, `"wal_pending_frames"`,
-		`"close_checkpoint_estimate_ms"`, `"wal_reclaim"`, `"resets"`, `"deferrals"`, `"pause_max_ms"`} {
+		`"close_checkpoint_estimate_ms"`, `"wal_checkpoint"`, `"frames_unobserved"`, `"wal_reclaim"`, `"urgent_attempts"`, `"pause_drain"`, `"pause_truncate"`, `"resets"`, `"deferrals"`, `"pause_max_ms"`} {
 		assert.Contains(t, string(body), key)
 	}
 }

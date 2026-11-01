@@ -173,7 +173,7 @@ func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *
 		w.resetCtx = admissionCtx
 		w.cancelReset = func() { stopYield(); cancel() }
 	}
-	if err := w.store.writeMu.LockContext(admissionCtx); err != nil {
+	if err := w.store.writeMu.lockReclaim(admissionCtx); err != nil {
 		return result, err
 	}
 	w.since, w.held = time.Now(), true
