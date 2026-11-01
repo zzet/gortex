@@ -34,13 +34,13 @@ func TestMutationPathLockSerializesAliasSpellings(t *testing.T) {
 	}
 	for _, alias := range aliases {
 		t.Run(filepath.Base(filepath.Dir(alias))+"/"+filepath.Base(alias), func(t *testing.T) {
-			release, err := acquireMutationPath(context.Background(), realPath)
+			_, release, err := acquireMutationPath(context.Background(), realPath)
 			if err != nil {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 			defer cancel()
-			aliasRelease, err := acquireMutationPath(ctx, alias)
+			_, aliasRelease, err := acquireMutationPath(ctx, alias)
 			if err == nil {
 				aliasRelease()
 				release()
@@ -55,7 +55,7 @@ func TestMutationPathLockSerializesAliasSpellings(t *testing.T) {
 			// One request naming both spellings takes the lock once.
 			ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			both, err := acquireMutationPaths(ctx, []string{realPath, alias})
+			_, both, err := acquireMutationPaths(ctx, []string{realPath, alias})
 			if err != nil {
 				t.Fatalf("acquiring both spellings in one request: %v", err)
 			}
@@ -79,7 +79,7 @@ func TestMutationPathsCheckEveryRequestedSpellingBeforeDeduplication(t *testing.
 		t.Fatal("test paths must name the same mutation key")
 	}
 	ctx := withCheckoutMutation(context.Background(), &fakeCheckoutMutationLifecycle{}, root)
-	release, err := acquireMutationPaths(ctx, []string{path, relative})
+	_, release, err := acquireMutationPaths(ctx, []string{path, relative})
 	if release != nil {
 		release()
 	}

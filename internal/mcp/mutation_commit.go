@@ -17,6 +17,7 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // The commit ledger exists because a tool call has two independent terminal
@@ -744,6 +745,11 @@ func (s *Server) commitFileMutation(
 	if err := ctx.Err(); err != nil {
 		record.markNotApplied(err)
 		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
+	}
+	if !mutationPathAdmitted(ctx, pathkey.MutationKey(absPath)) {
+		err := fmt.Errorf("%w: source path is not held for mutation", errMutationNotApplied)
+		record.markNotApplied(err)
+		return record, err
 	}
 	// UTF-16 sources refuse every write (#846): the indexer decodes them for
 	// extraction, so their symbols are discoverable and every tool that

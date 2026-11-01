@@ -1068,7 +1068,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 			paths = append(paths, plan.destinationPath)
 		}
 	}
-	release, lockErr := acquireMutationPaths(ctx, paths)
+	ctx, release, lockErr := acquireMutationPaths(ctx, paths)
 	if lockErr != nil {
 		receipt.Results = batchFailureResults(plans, 0, "edit cancelled while waiting for exclusive file access: "+lockErr.Error())
 		receipt.Summary = batchSummary(receipt.Results)

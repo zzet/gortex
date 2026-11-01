@@ -115,7 +115,7 @@ func (s *Server) applyRemoveLinePatches(ctx context.Context, plan []callerPatch)
 		}
 	}
 	paths := slices.Sorted(maps.Keys(byFile))
-	release, err := acquireMutationPaths(ctx, paths)
+	ctx, release, err := acquireMutationPaths(ctx, paths)
 	if err != nil {
 		return nil, nil, fmt.Errorf("lock caller files: %w", err)
 	}

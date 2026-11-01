@@ -4459,12 +4459,13 @@ func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem, w
 		return res
 	}
 	if write {
-		releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+		admitted, releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
 		if lockErr != nil {
 			res.Status, res.Error = "failed", "edit cancelled while waiting for exclusive file access: "+lockErr.Error()
 			return res
 		}
 		defer releaseMutation()
+		ctx = admitted
 	}
 	content, readErr := os.ReadFile(absPath)
 	if readErr != nil {
@@ -4593,12 +4594,13 @@ func (s *Server) applyBatchFileEdit(ctx context.Context, edit batchEditItem, wri
 	}
 	res.FilePath = relPath
 	if write {
-		releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+		admitted, releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
 		if lockErr != nil {
 			res.Status, res.Error = "failed", "edit cancelled while waiting for exclusive file access: "+lockErr.Error()
 			return res
 		}
 		defer releaseMutation()
+		ctx = admitted
 	}
 	content, readErr := os.ReadFile(absPath)
 	if readErr != nil {

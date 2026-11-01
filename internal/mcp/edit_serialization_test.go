@@ -90,7 +90,7 @@ func waitForMutationRefs(t *testing.T, path string, want int) {
 
 func TestAcquireMutationPathSerializesAndCleansUp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "same.go")
-	firstRelease, err := acquireMutationPath(context.Background(), path)
+	_, firstRelease, err := acquireMutationPath(context.Background(), path)
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestAcquireMutationPathSerializesAndCleansUp(t *testing.T) {
 	acquired := make(chan func(), 1)
 	errs := make(chan error, 1)
 	go func() {
-		release, acquireErr := acquireMutationPath(context.Background(), path)
+		_, release, acquireErr := acquireMutationPath(context.Background(), path)
 		if acquireErr != nil {
 			errs <- acquireErr
 			return
@@ -127,7 +127,7 @@ func TestAcquireMutationPathSerializesAndCleansUp(t *testing.T) {
 
 func TestAcquireMutationPathCancellationReleasesQueueReference(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cancel.go")
-	ownerRelease, err := acquireMutationPath(context.Background(), path)
+	_, ownerRelease, err := acquireMutationPath(context.Background(), path)
 	if err != nil {
 		t.Fatalf("owner acquire: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestAcquireMutationPathCancellationReleasesQueueReference(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errs := make(chan error, 1)
 	go func() {
-		_, acquireErr := acquireMutationPath(ctx, path)
+		_, _, acquireErr := acquireMutationPath(ctx, path)
 		errs <- acquireErr
 	}()
 	waitForMutationRefs(t, path, 2)
@@ -160,7 +160,7 @@ func TestAcquireMutationPathsCancellationReleasesEarlierLocks(t *testing.T) {
 		first, second = second, first
 	}
 
-	releaseSecond, err := acquireMutationPath(context.Background(), second)
+	_, releaseSecond, err := acquireMutationPath(context.Background(), second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestAcquireMutationPathsCancellationReleasesEarlierLocks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		release, lockErr := acquireMutationPaths(ctx, []string{second, first, first})
+		_, release, lockErr := acquireMutationPaths(ctx, []string{second, first, first})
 		if release != nil {
 			release()
 		}

@@ -340,7 +340,7 @@ func (s *Server) recoverBatchTransaction(ctx context.Context, state *batchTransa
 	}
 	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	release, err := acquireMutationPaths(recoveryCtx, paths)
+	recoveryCtx, release, err := acquireMutationPaths(recoveryCtx, paths)
 	if err != nil {
 		s.finishBatchTransaction(state, receipt, "recovery_conflict", "conflict", "not_started", "could not acquire recovery locks: "+err.Error())
 		return

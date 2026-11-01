@@ -181,7 +181,7 @@ func TestMoveDirectRefusesOlderAdmissionWhichActuallyCommitsLaterSameBytes(t *te
 	done := make(chan result, 1)
 	joined := false
 	go func() {
-		record, err := s.commitFileMutation(t.Context(), "edit_file", "older-admission", "same-bytes", "fixture/source.go", source, bytes, 0600)
+		record, err := s.commitHeldFileMutationForTest(t, t.Context(), "edit_file", "older-admission", "same-bytes", "fixture/source.go", source, bytes, 0600)
 		done <- result{record, err}
 	}()
 	t.Cleanup(func() {

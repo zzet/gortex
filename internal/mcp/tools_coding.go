@@ -3007,7 +3007,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		}
 		absPaths = append(absPaths, abs)
 	}
-	releaseMutation, lockErr := acquireMutationPaths(ctx, absPaths)
+	ctx, releaseMutation, lockErr := acquireMutationPaths(ctx, absPaths)
 	if lockErr != nil {
 		return mcp.NewToolResultError("rename cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
@@ -3098,7 +3098,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	ctx, releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
 	if lockErr != nil {
 		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}

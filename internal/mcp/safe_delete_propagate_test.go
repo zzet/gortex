@@ -214,7 +214,7 @@ func TestPropagateWritesNothingWhenACallerLockFails(t *testing.T) {
 		name := fmt.Sprintf("c%d.go", i)
 		plan = append(plan, callerPatch{File: name, Line: 4, CurrentText: "Target()", Action: "remove_line", abs: filepath.Join(dir, name)})
 	}
-	release, err := acquireMutationPath(context.Background(), plan[len(plan)-1].abs)
+	_, release, err := acquireMutationPath(context.Background(), plan[len(plan)-1].abs)
 	require.NoError(t, err)
 	defer release()
 

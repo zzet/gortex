@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
@@ -129,14 +130,33 @@ type mutationSetScheduler interface {
 	EnqueueFileMutations(context.Context, []string) (map[string]*indexer.MutationTicket, error)
 }
 
-// acquireMutationPath waits for exclusive mutation access to path. Waiting is
-// context-aware: a cancelled MCP request leaves the queue immediately, which
-// lets its dispatcher goroutine finish and release admission capacity.
-func acquireMutationPath(ctx context.Context, path string) (func(), error) {
-	if err := guardCheckoutMutationPath(ctx, path); err != nil {
-		return nil, err
+type mutationPathAdmissionKey struct{}
+
+// A context proves ownership only while the captured lock set is held. The
+// release bit is shared with every derived context, so saved contexts cannot
+// authorize a later write after their owner returned the token.
+type mutationPathAdmission struct {
+	keys     map[string]struct{}
+	parent   *mutationPathAdmission
+	released atomic.Bool
+}
+
+func mutationPathAdmitted(ctx context.Context, key string) bool {
+	admission, _ := ctx.Value(mutationPathAdmissionKey{}).(*mutationPathAdmission)
+	for ; admission != nil; admission = admission.parent {
+		if !admission.released.Load() {
+			if _, ok := admission.keys[key]; ok {
+				return true
+			}
+		}
 	}
-	return acquireMutationPathKey(ctx, pathkey.MutationKey(path))
+	return false
+}
+
+// acquireMutationPath waits for exclusive mutation access and returns the
+// context proving ownership of that captured path identity until release.
+func acquireMutationPath(ctx context.Context, path string) (context.Context, func(), error) {
+	return acquireMutationPaths(ctx, []string{path})
 }
 
 // acquireMutationPathKey acquires an already-admitted, captured path identity.
@@ -177,15 +197,17 @@ func acquireMutationPathKey(ctx context.Context, path string) (func(), error) {
 // acquireMutationPaths locks a mutation set in lexical path order. A stable
 // order prevents deadlock between overlapping batches; cancellation while
 // waiting releases every previously acquired path in reverse order.
-func acquireMutationPaths(ctx context.Context, paths []string) (func(), error) {
+func acquireMutationPaths(ctx context.Context, paths []string) (context.Context, func(), error) {
 	unique := make(map[string]struct{}, len(paths))
 	ordered := make([]string, 0, len(paths))
 	for _, path := range paths {
+		// Admission applies to every spelling, even when two names resolve
+		// to the same lock. A denied alias must never disappear in dedupe.
 		if err := guardCheckoutMutationPath(ctx, path); err != nil {
-			return nil, err
+			return ctx, nil, err
 		}
 		key := pathkey.MutationKey(path)
-		if _, exists := unique[key]; exists {
+		if _, exists := unique[key]; exists || mutationPathAdmitted(ctx, key) {
 			continue
 		}
 		unique[key] = struct{}{}
@@ -200,14 +222,17 @@ func acquireMutationPaths(ctx context.Context, paths []string) (func(), error) {
 			for i := len(releases) - 1; i >= 0; i-- {
 				releases[i]()
 			}
-			return nil, err
+			return ctx, nil, err
 		}
 		releases = append(releases, release)
 	}
-
+	parent, _ := ctx.Value(mutationPathAdmissionKey{}).(*mutationPathAdmission)
+	admission := &mutationPathAdmission{keys: unique, parent: parent}
+	ctx = context.WithValue(ctx, mutationPathAdmissionKey{}, admission)
 	var once sync.Once
-	return func() {
+	return ctx, func() {
 		once.Do(func() {
+			admission.released.Store(true)
 			for i := len(releases) - 1; i >= 0; i-- {
 				releases[i]()
 			}
