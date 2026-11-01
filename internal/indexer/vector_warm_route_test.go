@@ -36,7 +36,7 @@ func TestWarmScopedReconcileRestoresDurableVectorCorpus(t *testing.T) {
 	seed := NewMultiIndexer(graph.Store(store), newTestRegistry(), seedSw, cm, zap.NewNop())
 	seedEmb := &poolEmbedder{}
 	seed.SetEmbedder(seedEmb)
-	results, err := seed.indexMultiRepo([]config.RepoEntry{entry})
+	results, err := seed.indexFixtureRepos([]config.RepoEntry{entry})
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	require.Greater(t, seedEmb.calls, int32(0))

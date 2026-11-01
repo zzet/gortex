@@ -178,14 +178,17 @@ func sessionStartStatusFromProbe(probe daemon.ProbeResponse) *daemon.StatusRespo
 	}
 	for _, r := range probe.TrackedRepos {
 		status.TrackedRepos = append(status.TrackedRepos, daemon.TrackedRepoStatus{
-			Path:      r.Path,
-			Prefix:    r.Prefix,
-			Name:      r.Name,
-			Workspace: r.Workspace,
-			Project:   r.Project,
-			Loading:   r.State == daemon.RepoStateLoading,
-			Unloaded:  r.State == daemon.RepoStateLoading || r.State == daemon.RepoStateFailed || r.State == daemon.RepoStateMissing,
-			Missing:   r.State == daemon.RepoStateMissing,
+			Path:       r.Path,
+			Prefix:     r.Prefix,
+			Name:       r.Name,
+			Workspace:  r.Workspace,
+			Project:    r.Project,
+			Loading:    r.State == daemon.RepoStateLoading,
+			Unloaded:   r.State == daemon.RepoStateLoading || r.State == daemon.RepoStateFailed || r.State == daemon.RepoStateMissing || r.State == daemon.RepoStatePrefixCollision,
+			Missing:    r.State == daemon.RepoStateMissing,
+			ErrorCode:  r.ErrorCode,
+			OwnerPath:  r.OwnerPath,
+			OwnerState: r.OwnerState,
 		})
 	}
 	return status
@@ -328,8 +331,11 @@ func renderLeanReadiness(cwd string, s *daemon.StatusResponse) string {
 		}
 	}
 	if abs != "" {
+		if collision := prefixCollisionCoverage(abs, s.TrackedRepos); collision != "" {
+			return line + "\n\n" + collision
+		}
 		if exact, _ := classifyCwd(abs, s.TrackedRepos); exact != nil {
-			return fmt.Sprintf("%s cwd tracked as `%s` — enforcement active.\n", line, exact.Name)
+			return fmt.Sprintf("%s cwd tracked as `%s` — enforcement active.\n", line, trackedRepoName(*exact))
 		}
 		// Workspace-root and not-covered explanations stay verbatim.
 		return line + "\n\n" + renderCwdCoverage(cwd, s)
@@ -381,6 +387,9 @@ func renderCwdCoverage(cwd string, s *daemon.StatusResponse) string {
 	if err != nil {
 		abs = cwd
 	}
+	if collision := prefixCollisionCoverage(abs, s.TrackedRepos); collision != "" {
+		return collision
+	}
 
 	exact, contained := classifyCwd(abs, s.TrackedRepos)
 	switch {
@@ -388,17 +397,23 @@ func renderCwdCoverage(cwd string, s *daemon.StatusResponse) string {
 		// Coverage is the load-bearing claim here and the probe can answer it;
 		// the node count is colour, and an uncomputed zero would misreport an
 		// indexed repo as empty.
+		name := trackedRepoName(*exact)
+		// A repo still warming up reports zero nodes; that is not its size.
+		if exact.Loading || (!s.Ready && exact.Nodes == 0) {
+			return fmt.Sprintf("**cwd `%s` is tracked** as repo `%s` (workspace: `%s`, still loading). Enforcement is active.\n",
+				abs, name, exact.Workspace)
+		}
 		if s.CountsUnknown {
 			return fmt.Sprintf("**cwd `%s` is tracked** as repo `%s` (workspace: `%s`). Enforcement is active.\n",
-				abs, exact.Name, exact.Workspace)
+				abs, name, exact.Workspace)
 		}
 		return fmt.Sprintf("**cwd `%s` is tracked** as repo `%s` (workspace: `%s`, %d nodes). Enforcement is active.\n",
-			abs, exact.Name, exact.Workspace, exact.Nodes)
+			abs, name, exact.Workspace, exact.Nodes)
 	case len(contained) > 0:
 		// cwd is a parent of one or more tracked repos.
 		names := make([]string, 0, len(contained))
 		for _, r := range contained {
-			names = append(names, r.Name)
+			names = append(names, trackedRepoName(r))
 		}
 		sort.Strings(names)
 		shown := names
@@ -423,11 +438,47 @@ func renderCwdCoverage(cwd string, s *daemon.StatusResponse) string {
 			abs, len(contained), summary, len(contained), example)
 	default:
 		if pendingAutomaticCheckout(abs, s.TrackedRepos) {
+			if view := routedAutomaticCheckout(abs); view != nil {
+				return fmt.Sprintf("**cwd `%s` is tracked** as an automatic checkout of repo `%s` (checkout `%s`). Enforcement is active.\n",
+					abs, view.RepoPrefix, view.CheckoutID)
+			}
 			return fmt.Sprintf("⏳ **Checkout discovery is pending for cwd `%s`.** %s\n", abs, agents.PendingAutomaticCheckoutGuidance)
 		}
 		return fmt.Sprintf("⚠️  **cwd `%s` is not covered by any tracked repo.** Read/Grep/Glob/Bash will fall through to soft guidance only — graph tools won't be available for this directory.\n\nTo enable enforcement: `gortex track %s`\n",
 			abs, abs)
 	}
+}
+
+func prefixCollisionCoverage(cwd string, repos []daemon.TrackedRepoStatus) string {
+	var collision *daemon.TrackedRepoStatus
+	for i := range repos {
+		rec := &repos[i]
+		if rec.ErrorCode == daemon.ErrPrefixCollision && (pathkey.EqualPaths(cwd, rec.Path) || hasPathPrefix(cwd, rec.Path)) &&
+			(collision == nil || len(rec.Path) > len(collision.Path)) {
+			collision = rec
+		}
+	}
+	if collision == nil {
+		return ""
+	}
+	remedy := "Set a unique name in the global config and run `gortex daemon reload`."
+	if collision.OwnerState == "missing" {
+		remedy = fmt.Sprintf("The owner no longer exists; inspect `gortex untrack %s` for that owner before retrying.", collision.OwnerPath)
+	}
+	return fmt.Sprintf("Gortex cannot admit `%s`: prefix_collision for `%s`, owned by `%s`. %s Native file reads and edits remain available.\n", collision.Path, collision.Prefix, collision.OwnerPath, remedy)
+}
+
+// trackedRepoName labels a tracked repo for display. The daemon leaves Name
+// empty unless the config entry names the repo, so fall back to its prefix,
+// then to the checkout directory's base name (#933).
+func trackedRepoName(r daemon.TrackedRepoStatus) string {
+	if r.Name != "" {
+		return r.Name
+	}
+	if r.Prefix != "" {
+		return r.Prefix
+	}
+	return filepath.Base(r.Path)
 }
 
 func pendingAutomaticCheckout(cwd string, repos []daemon.TrackedRepoStatus) bool {
@@ -438,6 +489,19 @@ func pendingAutomaticCheckout(cwd string, repos []daemon.TrackedRepoStatus) bool
 		}
 	}
 	return agents.PendingAutomaticCheckout(cwd, agents.FamilyRepoRoots(roots, hookConfiguredRepoRoots()))
+}
+
+// routedAutomaticCheckout returns the view serving cwd when the daemon routes
+// it to the checkout's own composed view. Tracked repos never list automatic
+// checkouts, so family identity alone cannot tell a routed worktree from one
+// still awaiting discovery; the daemon's answer is the one explain_view and
+// the dispatcher use (#933).
+func routedAutomaticCheckout(cwd string) *daemon.ProbeView {
+	result, ok := dirCoverageFn(cwd, sessionStartProbeBudget)
+	if !ok || result.View == nil || result.View.Kind != daemon.ProbeViewWorktree || !result.View.Exact {
+		return nil
+	}
+	return result.View
 }
 
 // Hooks read only declarations; an unavailable config does not invent family
