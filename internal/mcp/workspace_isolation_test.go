@@ -59,8 +59,7 @@ func newIsolationServer(t *testing.T) (srv *Server, repoA, repoB string) {
 	reg := testRegistry()
 	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, reg, bm, cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "") // index every configured repo
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm) // index every configured repo
 
 	eng := query.NewEngine(g)
 	eng.SetSearch(bm)

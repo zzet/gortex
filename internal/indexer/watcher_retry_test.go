@@ -143,7 +143,7 @@ func TestPointMutationRepanicsArbitraryPanicWithoutCompletingTicket(t *testing.T
 	done := make(chan MutationResult, 1)
 	w.mu.Lock()
 	w.pendingGeneration[path] = 1
-	w.mutationWaiters = map[string]map[uint64]chan MutationResult{path: {1: done}}
+	w.mutationWaiters = map[string]map[uint64]mutationWaiter{path: {1: {done: done}}}
 	w.mu.Unlock()
 	wantPanic := &struct{ label string }{label: "programmer panic"}
 	w.pointMutationPatch = func(string, ChangeKind, uint64) error {
@@ -222,7 +222,7 @@ func TestStormMutationRetryMergesNewerState(t *testing.T) {
 	secondDone := make(chan MutationResult, 1)
 	w.mu.Lock()
 	w.pendingGeneration[path] = 1
-	w.mutationWaiters = map[string]map[uint64]chan MutationResult{path: {1: firstDone}}
+	w.mutationWaiters = map[string]map[uint64]mutationWaiter{path: {1: {done: firstDone}}}
 	w.mu.Unlock()
 	w.stormMu.Lock()
 	w.stormBatch[path] = ChangeCreated
@@ -239,7 +239,7 @@ func TestStormMutationRetryMergesNewerState(t *testing.T) {
 			w.stormMu.Unlock()
 			w.mu.Lock()
 			w.pendingGeneration[path] = 2
-			w.mutationWaiters[path][2] = secondDone
+			w.mutationWaiters[path][2] = mutationWaiter{done: secondDone}
 			w.mu.Unlock()
 			return nil, fmt.Errorf("busy: %w", context.DeadlineExceeded)
 		}
@@ -329,7 +329,7 @@ func TestStormPermanentCompletionDefersToSuccessor(t *testing.T) {
 	secondDone := make(chan MutationResult, 1)
 	w.mu.Lock()
 	w.pendingGeneration[path] = 1
-	w.mutationWaiters = map[string]map[uint64]chan MutationResult{path: {1: firstDone}}
+	w.mutationWaiters = map[string]map[uint64]mutationWaiter{path: {1: {done: firstDone}}}
 	w.mu.Unlock()
 	w.stormMu.Lock()
 	w.stormBatch[path] = ChangeModified
@@ -359,7 +359,7 @@ func TestStormPermanentCompletionDefersToSuccessor(t *testing.T) {
 	<-beforeComplete
 	w.mu.Lock()
 	w.pendingGeneration[path] = 2
-	w.mutationWaiters[path][2] = secondDone
+	w.mutationWaiters[path][2] = mutationWaiter{done: secondDone}
 	w.mu.Unlock()
 	w.stormMu.Lock()
 	w.stormBatch[path] = ChangeDeleted
@@ -393,7 +393,7 @@ func TestStormStoragePanicCompletesDetachedWaitersWithTypedError(t *testing.T) {
 	done := make(chan MutationResult, 1)
 	w.mu.Lock()
 	w.pendingGeneration[path] = 1
-	w.mutationWaiters = map[string]map[uint64]chan MutationResult{path: {1: done}}
+	w.mutationWaiters = map[string]map[uint64]mutationWaiter{path: {1: {done: done}}}
 	w.mu.Unlock()
 	w.stormMu.Lock()
 	w.stormBatch[path] = ChangeModified
@@ -427,7 +427,7 @@ func TestStormDrainRepanicsArbitraryPanicWithoutCompletingWaiters(t *testing.T) 
 	done := make(chan MutationResult, 1)
 	w.mu.Lock()
 	w.pendingGeneration[path] = 1
-	w.mutationWaiters = map[string]map[uint64]chan MutationResult{path: {1: done}}
+	w.mutationWaiters = map[string]map[uint64]mutationWaiter{path: {1: {done: done}}}
 	w.mu.Unlock()
 	w.stormMu.Lock()
 	w.stormBatch[path] = ChangeModified

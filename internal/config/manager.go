@@ -44,6 +44,9 @@ type ConfigManager struct {
 	lookupGlobal   *GlobalConfig
 	lookupRevision uint64
 	pathSnapshot   *RepoPathSnapshot
+	trackGlobal    *GlobalConfig
+	trackRevision  uint64
+	trackSnapshot  *RepoTrackSnapshot
 }
 
 // NewConfigManager creates a ConfigManager by loading the GlobalConfig
