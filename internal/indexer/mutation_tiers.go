@@ -81,9 +81,14 @@ func (w *Watcher) finishMutationTierLocked(path string, ticket *MutationTicket, 
 		return
 	}
 	at := time.Now()
-	stampRelations(state, at) // identity no-ops and test executors have no tail
-	state.DerivedAt = at
-	state.Partial = fanout.Observed && !fanout.Complete
+	deferred := state.Partial
+	if !deferred {
+		stampRelations(state, at) // identity no-ops and test executors have no tail
+		state.DerivedAt = at
+	} else if state.FileGraphAt.IsZero() {
+		state.FileGraphAt = at
+	}
+	state.Partial = deferred || fanout.Observed && !fanout.Complete
 	if state.Partial {
 		state.failedAt = at
 		if w.failedPaths == nil {
@@ -185,3 +190,17 @@ func (t *MutationTicket) TierState() MutationTierState {
 // CompleteStartupRelations is called only after successful warmup resolution.
 // ResetBatch also serves cancelled warmup and cannot certify this boundary.
 func (mi *MultiIndexer) CompleteStartupRelations() { mi.relationsPending.Store(false) }
+
+func (w *Watcher) markDeferredMutationTiers(frontier map[string]uint64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for path, generation := range frontier {
+		for ordinal, waiter := range w.mutationWaiters[path] {
+			if ordinal <= generation && waiter.ticket != nil {
+				waiter.ticket.tierMu.Lock()
+				waiter.ticket.tiers.Partial = true
+				waiter.ticket.tierMu.Unlock()
+			}
+		}
+	}
+}

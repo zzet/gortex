@@ -2659,7 +2659,7 @@ func (w *Watcher) drainStorm() {
 	if explicit {
 		result, fanout, err = w.reindexExplicitMutationPaths(paths, generations)
 	} else {
-		result, err = w.reindexStormPaths(paths, generations)
+		result, fanout, err = w.reindexStormPathsObserved(paths, generations)
 	}
 
 	reindexed, deleted, failed := 0, 0, 0

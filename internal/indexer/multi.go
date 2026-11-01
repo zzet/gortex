@@ -2649,7 +2649,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	mi.mu.Unlock()
 	mtimes.end()
 
-	if mode.onRelations != nil {
+	if mode.onRelations != nil && len(result.FailedFiles) == 0 {
 		mode.onRelations()
 	}
 	idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)

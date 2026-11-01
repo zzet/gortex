@@ -406,14 +406,14 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		idx.ResolveAll()
 		resolve.end()
 	}
-	if mode.onRelations != nil {
-		mode.onRelations()
-	}
 	if mode.forceExplicitFiles || !idx.deferGlobalPasses.Load() {
 		if mode.exactPointSemantic {
 			idx.runIncrementalPointSemantic(result.DerivedInvalidation.Files)
 		} else {
 			idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+		}
+		if mode.onRelations != nil && len(result.FailedFiles) == 0 {
+			mode.onRelations()
 		}
 		idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 		derived := mode.publication.beginDerivedPatchLap()
@@ -503,6 +503,9 @@ func (w *Watcher) reindexMutationPaths(paths []string, force bool, frontier map[
 		}
 		observation := beginDerivedFanoutObservation(idx)
 		defer observation.close()
+		if !force && idx.deferGlobalPasses.Load() {
+			w.markDeferredMutationTiers(frontier)
+		}
 		mode := incrementalPathMode{detectDeletions: true, forceExplicitFiles: force,
 			onRelations: func() { w.markRelationsFrontier(frontier) }}
 		var err error
@@ -521,18 +524,23 @@ func (w *Watcher) reindexMutationPaths(paths []string, force bool, frontier map[
 }
 
 func (w *Watcher) reindexStormPaths(paths []string, admitted ...map[string]uint64) (*IndexResult, error) {
+	result, _, err := w.reindexStormPathsObserved(paths, admitted...)
+	return result, err
+}
+
+func (w *Watcher) reindexStormPathsObserved(paths []string, admitted ...map[string]uint64) (*IndexResult, DerivedFanoutCompleteness, error) {
 	if w.batchReindex != nil && (w.indexer == nil || w.indexer.repositoryMutationOwner == nil) {
-		return w.batchReindex(paths)
+		result, err := w.batchReindex(paths)
+		return result, DerivedFanoutCompleteness{}, err
 	}
 	if w.indexer == nil || w.indexer.rootPath == "" {
-		return nil, fmt.Errorf("watcher: index root is not initialized")
+		return nil, DerivedFanoutCompleteness{}, fmt.Errorf("watcher: index root is not initialized")
 	}
 	frontier := w.mutationTierFrontier(paths)
 	if len(admitted) > 0 {
 		frontier = admitted[0]
 	}
-	result, _, err := w.reindexMutationPaths(paths, false, frontier)
-	return result, err
+	return w.reindexMutationPaths(paths, false, frontier)
 }
 
 func (gw *GitWatcher) reindexChangedPaths(paths []string) (*IndexResult, error) {
