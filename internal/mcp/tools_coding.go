@@ -3141,91 +3141,27 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		}
 	}
 
+	start, end, locateErr := s.symbolLinesUnderLock(ctx, node, absPath, content)
+	if locateErr != nil {
+		return mcp.NewToolResultError(locateErr.Error()), nil
+	}
+	resolved := *node
+	resolved.StartLine, resolved.EndLine = start, end
+	node = &resolved
 	fileStr := string(content)
-
-	// Extract the symbol's source lines to verify old_source is within them.
-	lines := strings.Split(fileStr, "\n")
-	if node.StartLine > len(lines) || node.EndLine > len(lines) {
-		return mcp.NewToolResultError("symbol line range exceeds file length"), nil
-	}
-
-	symbolSource := strings.Join(lines[node.StartLine-1:node.EndLine], "\n")
-
-	if findEOLMatches(symbolSource, oldSource).count == 0 {
-		// Expand search to include preceding doc comments (agents often include
-		// them because get_symbol_source returns context_lines above the symbol).
-		expandedStart := node.StartLine - 1
-		for expandedStart > 0 {
-			trimmed := strings.TrimSpace(lines[expandedStart-1])
-			if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") ||
-				strings.HasPrefix(trimmed, "*") || trimmed == "" {
-				expandedStart--
-			} else {
-				break
-			}
+	edit, locateErr := locateSymbolEdit(fileStr, start, end, oldSource)
+	if locateErr != nil {
+		if errors.Is(locateErr, errEditFragmentRepeated) {
+			return mcp.NewToolResultError("old_source appears multiple times within the symbol. Provide a larger fragment to make it unique."), nil
 		}
-		if expandedStart < node.StartLine-1 {
-			symbolSource = strings.Join(lines[expandedStart:node.EndLine], "\n")
+		if errors.Is(locateErr, errEditFragmentNotFound) {
+			return mcp.NewToolResultError(fmt.Sprintf("old_source not found within symbol %s (lines %d-%d). Use get_symbol_source to see the current code.", id, start, end)), nil
 		}
+		return mcp.NewToolResultError(locateErr.Error()), nil
 	}
-
-	srcMatches := findEOLMatches(symbolSource, oldSource)
-	if srcMatches.count == 0 {
-		return mcp.NewToolResultError(fmt.Sprintf(
-			"old_source not found within symbol %s (lines %d-%d). Use get_symbol_source to see the current code.",
-			id, node.StartLine, node.EndLine)), nil
-	}
-
-	// Verify old_source is unique within the symbol.
-	if srcMatches.count > 1 {
-		return mcp.NewToolResultError(
-			"old_source appears multiple times within the symbol. Provide a larger fragment to make it unique."), nil
-	}
-
-	// Apply the edit to the full file content.
-	// Find old_source within the symbol's line range only (not the whole file).
-	// Use the expanded start if doc comments were included.
-	effectiveStart := node.StartLine
-	if findEOLMatches(strings.Join(lines[node.StartLine-1:node.EndLine], "\n"), oldSource).count == 0 {
-		// Recalculate expanded start for offset computation.
-		expandedStart := node.StartLine - 1
-		for expandedStart > 0 {
-			trimmed := strings.TrimSpace(lines[expandedStart-1])
-			if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") ||
-				strings.HasPrefix(trimmed, "*") || trimmed == "" {
-				expandedStart--
-			} else {
-				break
-			}
-		}
-		effectiveStart = expandedStart + 1
-	}
-
-	symbolStart := 0
-	for i := 0; i < effectiveStart-1 && i < len(lines); i++ {
-		symbolStart += len(lines[i]) + 1 // +1 for newline
-	}
-
-	symbolEnd := symbolStart + len(symbolSource)
-	if symbolEnd > len(fileStr) {
-		symbolEnd = len(fileStr)
-	}
-
-	// Find old_source within the symbol region (EOL-tolerant: an
-	// LF-authored fragment still matches a CRLF region). Spans are byte
-	// offsets into the raw region, so the splice below always lands on the
-	// real on-disk bytes.
-	regionMatches := findEOLMatches(fileStr[symbolStart:symbolEnd], oldSource)
-	if len(regionMatches.spans) == 0 {
-		return mcp.NewToolResultError("old_source not found in symbol region"), nil
-	}
-	span := regionMatches.spans[0]
-
-	// Build the new file content.
-	editStart := symbolStart + span.start
-	editEnd := symbolStart + span.end
+	editStart, editEnd := edit.start, edit.end
 	effectiveNew := newSource
-	if regionMatches.normalized {
+	if edit.normalized {
 		// Rewrite new_source's terminators to the matched region's own
 		// style so the splice never introduces mixed line endings.
 		effectiveNew = adaptToDominantEOL(newSource, fileStr[editStart:editEnd])
@@ -3251,7 +3187,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 			"diff":         unifiedDiff(node.FilePath, fileStr, newContent),
 			"new_sha":      gitBlobSHA(newContentBytes),
 		}
-		if regionMatches.normalized {
+		if edit.normalized {
 			preview["eol_normalized"] = true
 		}
 		return s.respondJSONOrTOON(ctx, req, preview)
@@ -3276,7 +3212,9 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	sess.recordModified(node.FilePath)
 	sess.recordSymbol(id)
 
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	admission := s.admitSourceMutations(ctx, absPath)
+	releaseMutation()
+	reindexOutcome := s.awaitSourceMutations(ctx, admission)
 	commit.recordGraph(reindexOutcome)
 
 	// Count lines changed.
@@ -3292,7 +3230,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		"status":       "applied",
 		"new_sha":      gitBlobSHA(newContentBytes),
 	}
-	if regionMatches.normalized {
+	if edit.normalized {
 		resp["eol_normalized"] = true
 	}
 	if reindexOutcome.Err != nil {

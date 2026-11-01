@@ -11,6 +11,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // errSymbolRemoved reports that a symbol the graph still lists is no longer
@@ -46,7 +47,10 @@ func (s *Server) nodeLinesIn(ctx context.Context, node *graph.Node, content []by
 	if !ok {
 		return 0, 0, fmt.Errorf("symbol %s has no file-local id", node.ID)
 	}
+	s.noteAcknowledgementParser(ctx, "source_extraction_for_symbol_location")
+	parseLap := s.beginAcknowledgementLap(ctx, editAckParseGate)
 	extracted, err := owner.ExtractSource(ctx, rel, content)
+	parseLap.finish()
 	if err != nil {
 		return 0, 0, fmt.Errorf("locate %s in the current file: %w", node.ID, err)
 	}
@@ -123,4 +127,13 @@ func (s *Server) readNodeSource(ctx context.Context, node *graph.Node, absPath s
 		return nodeSource{}, err
 	}
 	return nodeSource{content: string(indexer.DecodeUTF16Source(raw)), startLine: start, endLine: end}, nil
+}
+
+// symbolLinesUnderLock is the write-side resolver. The source snapshot and
+// declaration identity are checked only while this request owns the path.
+func (s *Server) symbolLinesUnderLock(ctx context.Context, node *graph.Node, absPath string, content []byte) (int, int, error) {
+	if !mutationPathAdmitted(ctx, pathkey.MutationKey(absPath)) {
+		return 0, 0, fmt.Errorf("%w: symbol path is not held", errMutationNotApplied)
+	}
+	return s.nodeLinesIn(ctx, node, content)
 }

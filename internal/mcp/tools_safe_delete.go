@@ -270,14 +270,24 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError(refuseUTF16Edit("safe_delete_symbol", node.FilePath).Error()), nil
 	}
 	lines := strings.Split(string(content), "\n")
-	if node.StartLine > len(lines) || node.EndLine > len(lines) {
-		return mcp.NewToolResultError("symbol line range exceeds file length"), nil
+	if dryRun {
+		start, end, err := s.nodeLinesIn(ctx, node, content)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		resolved := *node
+		resolved.StartLine, resolved.EndLine = start, end
+		node = &resolved
 	}
-
-	deleteStart, deleteEnd := expandDeleteRange(node, lines)
-
-	deletedChunk := strings.Join(lines[deleteStart-1:deleteEnd], "\n")
-	linesDeleted := deleteEnd - deleteStart + 1
+	// An actual delete resolves again only under its complete held path set.
+	// These initial response fields are replaced by the applied snapshot.
+	deleteStart, deleteEnd, linesDeleted := 0, 0, 0
+	deletedChunk := ""
+	if node.StartLine >= 1 && node.EndLine >= node.StartLine && node.EndLine <= len(lines) {
+		deleteStart, deleteEnd = expandDeleteRange(node, lines)
+		deletedChunk = strings.Join(lines[deleteStart-1:deleteEnd], "\n")
+		linesDeleted = deleteEnd - deleteStart + 1
+	}
 
 	result := map[string]any{
 		"symbol":             id,
@@ -335,13 +345,19 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 
 	deletedIDs, err := s.applyPendingDeletes(ctx, pending)
 	if err != nil {
-		// Fail-fast: surface what was done up to this point so the
-		// caller can recover. Treat the failure as a tool error.
+		if len(deletedIDs) == 0 {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		// Surface only source effects whose physical commit succeeded.
 		result["status"] = "partial_failure"
 		result["cascade_deleted"] = deletedIDs
 		result["error"] = err.Error()
 		return respond(result)
 	}
+
+	result["start_line"], result["end_line"] = pending[0].start, pending[0].end
+	result["lines_deleted"] = pending[0].end - pending[0].start + 1
+	result["preview"] = pending[0].preview
 
 	// Persist session state and re-index every touched file.
 	sess := s.sessionFor(ctx)
@@ -386,14 +402,14 @@ func normaliseCascadeMode(raw string) string {
 }
 
 // pendingDelete buffers everything needed to delete one symbol from
-// its file. start/end of zero mean "compute lazily from the node and
-// the file contents" — only the original target arrives pre-computed
-// because the dry_run preview already needed those numbers.
+// its file. Every span is resolved against the bytes read under the held
+// path set; the response retains that actual removed snapshot.
 type pendingDelete struct {
-	node  *graph.Node
-	abs   string
-	start int
-	end   int
+	node    *graph.Node
+	abs     string
+	start   int
+	end     int
+	preview string
 }
 
 // applyPendingDeletes groups pending deletes by absolute file path
@@ -433,16 +449,16 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 			return deleted, refuseUTF16Edit("safe_delete_symbol", abs)
 		}
 		lines := strings.Split(string(content), "\n")
-		// Materialise ranges for entries that arrived with zero
-		// start/end (the cascade tail; the original target arrives
-		// pre-computed for parity with the dry_run preview).
 		for _, p := range bucket {
-			if p.start == 0 || p.end == 0 {
-				if p.node.StartLine > len(lines) || p.node.EndLine > len(lines) {
-					return deleted, fmt.Errorf("symbol %s line range exceeds file %s", p.node.ID, abs)
-				}
-				p.start, p.end = expandDeleteRange(p.node, lines)
+			start, end, err := s.symbolLinesUnderLock(ctx, p.node, abs, content)
+			if err != nil {
+				return deleted, err
 			}
+			resolved := *p.node
+			resolved.StartLine, resolved.EndLine = start, end
+			p.node = &resolved
+			p.start, p.end = expandDeleteRange(p.node, lines)
+			p.preview = strings.Join(lines[p.start-1:p.end], "\n")
 		}
 		// Sort descending so deletions earlier in the file don't
 		// shift the line indexes of later ones.
@@ -462,7 +478,6 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 		}
 		for _, p := range bucket {
 			lines = append(lines[:p.start-1], lines[p.end:]...)
-			deleted = append(deleted, p.node.ID)
 		}
 		newContent := strings.Join(lines, "\n")
 		// The UTF-16 refusal above is the early, per-file UX; the commit
@@ -487,6 +502,9 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 		}
 		if _, werr := s.commitFileMutation(ctx, "safe_delete_symbol", "", "", rel, abs, []byte(newContent), perm); werr != nil {
 			return deleted, fmt.Errorf("could not write %s: %v", abs, werr)
+		}
+		for _, p := range bucket {
+			deleted = append(deleted, p.node.ID)
 		}
 	}
 	return deleted, nil
