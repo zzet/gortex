@@ -3775,6 +3775,9 @@
               "edit_agents": {
                 "type": "integer"
               },
+              "edit_gate_seed": {
+                "type": "string"
+              },
               "edit_probe": {
                 "anyOf": [
                   {

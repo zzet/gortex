@@ -33,3 +33,15 @@ func editGateACKSeed(ctx context.Context, s *Server) error {
 		return nil
 	}
 }
+
+// The checkout adapter fast-ACKs an admitted ticket without a normal graph
+// wait. Only a seed build records the deliberately restored legacy wait here.
+// When admission/await are split, this belongs after the source path is released.
+func editGateCheckoutACKSeed(ctx context.Context, s *Server) error {
+	if os.Getenv("GORTEX_EDIT_GATE_SEED") != "ack-wait" {
+		return nil
+	}
+	lap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+	defer lap.finish()
+	return editGateACKSeed(ctx, s)
+}

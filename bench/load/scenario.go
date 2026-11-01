@@ -14,6 +14,10 @@ import (
 )
 
 func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corpus, group, outputRoot string) (phase Phase, sweep []SweepEntry, artifacts map[string]string, crashes map[string]int, version string, resultErr error) {
+	seedEnv, err := editGateSeedEnvironment(o)
+	if err != nil {
+		return phase, nil, nil, nil, "", err
+	}
 	var gateWallStart time.Time
 	if o.EditGateModes {
 		gateWallStart = time.Now()
@@ -127,7 +131,6 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		phase.SessionModel = plan.SessionModel
 	}
 	p := o.smokeState
-	var err error
 	if p == nil {
 		p, err = newPrivateRun(ctx, outputRoot, o.Binary, selected)
 	} else {
@@ -136,6 +139,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	if err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
+	p.Env = append(p.Env, seedEnv...)
 	artifacts["private_root"] = p.Root
 	firstStart := p.startCount + 1
 	if o.smokeState != nil {

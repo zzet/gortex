@@ -552,7 +552,11 @@ func (s *Server) mutationWaitDuration() time.Duration {
 // servers have no watcher and retain the synchronous freshness contract.
 func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutationReindexOutcome {
 	if state := checkoutMutationFromContext(ctx); state != nil {
-		return s.refreshCheckoutMutation(ctx, absPath, state)
+		outcome := s.refreshCheckoutMutation(ctx, absPath, state)
+		if outcome.Err == nil && outcome.Pending && outcome.Receipt != "" {
+			outcome.Err = editGateCheckoutACKSeed(ctx, s)
+		}
+		return outcome
 	}
 	if watcher := s.currentWatcher(); watcher != nil {
 		// Admission is path-scoped and authoritative. Scheduling uses a detached

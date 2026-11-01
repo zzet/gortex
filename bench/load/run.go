@@ -41,6 +41,7 @@ type runOptions struct {
 	EditMean          time.Duration
 	EditCount         int
 	EditGateModes     bool
+	EditGateSeed      string
 	EditRepos         int
 	EditProbeRole     string
 	editProbeBaseline bool
@@ -95,10 +96,14 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.EditRepos, "edit-repos", 1, "edit-and-probe: one repository (default), or exactly six distinct pinned repositories")
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
 	f.BoolVar(&o.EditGateModes, "edit-gate-modes", false, "edit-and-probe gate: rotate five probe surfaces over 100 total edits; JSON ACKs remain unchanged")
+	f.StringVar(&o.EditGateSeed, "edit-gate-seed", "", "explicit gate-only fault: ack-wait or closed-read-gate; requires a seed-tagged binary")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
 
 func validateRunOptions(o runOptions) error {
+	if o.EditGateSeed != "" && (!o.EditGateModes || o.EditGateSeed != "ack-wait" && o.EditGateSeed != "closed-read-gate") {
+		return errors.New("--edit-gate-seed requires --edit-gate-modes and ack-wait or closed-read-gate")
+	}
 	if o.EditGateModes && (o.Scenario != editProbeScenario || o.EditCount != 100 || o.Agents != 0) {
 		return errors.New("--edit-gate-modes requires edit-and-probe, 100 total edits and no extra pure readers")
 	}
@@ -296,6 +301,7 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 		}
 		report.Workload.SessionModel = plan.SessionModel
 	}
+	report.Workload.EditGateSeed = o.EditGateSeed
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees
 	report.Workload.DurationSec, report.Workload.DeadlineSec, report.Workload.Seed, report.Workload.Profile = o.Duration.Seconds(), o.Deadline.Seconds(), o.Seed, o.Profile
 	if o.PRSmokeDrain > 0 {
