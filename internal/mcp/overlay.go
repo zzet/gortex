@@ -229,11 +229,6 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// read that must stay reachable while publication is pending, and the
 		// tools that must not be hostage to the binding they exist to fix.
 		viewless := catalogOnlyCheckoutControl(controlOperation) || viewlessCatalogTool(legacyName)
-		// A source mutation preempts background writers while it selects and
-		// enters its mutation lane. Publication waits temporarily release that
-		// intent so the previous edit can finish the route this one needs.
-		ctx, releaseWriteIntent := s.withSourceMutationWriteIntent(ctx, req.Params.Name)
-		defer releaseWriteIntent()
 		ctx = s.withMutationPublicationStamps(ctx, req.Params.Name)
 		byteCtx, byteView, releaseByte, byteRefusal := s.prepareByteEditAuthority(ctx, &req, selector, freshness, capabilities)
 		if byteRefusal != nil {
@@ -265,6 +260,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withRequestView(ctx, view)
 			defer view.close()
 		}
+		// The selected route identifies whether this handler writes the view
+		// store. File-only canonical edits never announce a store writer.
+		ctx, releaseWriteIntent := s.withSourceMutationWriteIntent(ctx, legacyName)
+		defer releaseWriteIntent()
 		indexer.StampPublicationPhase(ctx, indexer.PublicationViewResolved)
 		// Tell the deadline firewall what this call is reading and what
 		// repositories it is admitted to. If it stops waiting for this handler
