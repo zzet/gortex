@@ -575,15 +575,14 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 		}
 		slices.Sort(label.files)
 		label.files = slices.Compact(label.files)
+		if snapshot, ok := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); ok && snapshot.startup && scope != "file" && label.state == "" {
+			label.state = "pending"
+		}
 		return label.merge(s.freshnessFor(ctx, scope, ids, files))
 	}
 	states := make(map[string]string)
-	watcher, watched := s.currentWatcher().(interface {
-		TierPaths() map[string]indexer.MutationTierState
-	})
-	view := requestViewFromContext(ctx)
-	if watched && (view == nil || !view.readsOwnCheckout()) {
-		for path, tiers := range watcher.TierPaths() {
+	if paths, watched := s.canonicalTierPaths(ctx); watched {
+		for path, tiers := range paths {
 			if len(ids)+len(files) > 0 && !inScope(path) {
 				continue
 			}
@@ -628,6 +627,32 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 	return label
 }
 
+func (s *Server) canonicalTierPaths(ctx context.Context) (map[string]indexer.MutationTierState, bool) {
+	watcher, watched := s.currentWatcher().(interface {
+		TierPaths() map[string]indexer.MutationTierState
+	})
+	view := requestViewFromContext(ctx)
+	if !watched || view != nil && view.readsOwnCheckout() {
+		return nil, false
+	}
+	return watcher.TierPaths(), true
+}
+
+type toolFreshnessSnapshotKey struct{}
+type toolFreshnessSnapshot struct {
+	receipts []*mutationReceipt
+	startup  bool
+}
+
+func (s *Server) captureToolFreshness(ctx context.Context) context.Context {
+	receipts := s.laggingMutationReceipts(ctx)
+	startup := s.multiIndexer != nil && s.multiIndexer.RelationsPending()
+	if len(receipts) == 0 && !startup {
+		return ctx
+	}
+	return context.WithValue(ctx, toolFreshnessSnapshotKey{}, toolFreshnessSnapshot{receipts, startup})
+}
+
 func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, files []string) {
 	if file := targetRepoFileRaw(name, req); file != "" {
 		return "file", nil, []string{file}
@@ -653,6 +678,9 @@ func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp
 			scope = selected
 		}
 		label := s.freshnessFor(ctx, scope, ids, files)
+		if snapshot, ok := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); ok {
+			label = s.freshnessFor(ctx, scope, ids, files, snapshot.receipts)
+		}
 		if label.state != "" {
 			fields := make(map[string]any)
 			label.apply(fields)

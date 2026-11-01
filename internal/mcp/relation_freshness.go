@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -86,6 +87,20 @@ func (s *Server) awaitRelationFreshness(ctx context.Context, ids, files []string
 // the graph has not published: still pending, or terminally failed.
 func (s *Server) laggingMutationReceipts(ctx context.Context) []*mutationReceipt {
 	var lagging []*mutationReceipt
+	if paths, watched := s.canonicalTierPaths(ctx); watched {
+		for path, tiers := range paths {
+			if !tiers.Failed && !tiers.RelationsAt.IsZero() {
+				continue
+			}
+			receipt := &mutationReceipt{path: path, generation: tiers.Generation}
+			if tiers.Failed {
+				receipt.completed = true
+				receipt.result.Err = errors.New("file publication failed")
+			}
+			lagging = append(lagging, receipt)
+		}
+		return lagging
+	}
 	for _, receipt := range s.mutationReceiptsForRepos(ctx) {
 		if outcome := receipt.outcome(true); outcome.Pending || outcome.Err != nil || !outcome.Reindexed {
 			lagging = append(lagging, receipt)
