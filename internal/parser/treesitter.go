@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -106,6 +107,14 @@ func LooksBinary(src []byte) bool {
 	return bytes.IndexByte(src, 0) >= 0
 }
 
+// parseCount counts the sources ParseFile handed to tree-sitter.
+var parseCount atomic.Uint64
+
+// ParseCount reports how many sources ParseFile has handed to tree-sitter
+// since the process started. Callers compare two readings to pin how many
+// parses a code path costs.
+func ParseCount() uint64 { return parseCount.Load() }
+
 // ParseFile parses source bytes with the given language and returns the tree.
 // The caller must call tree.Close() when done.
 func ParseFile(src []byte, lang *sitter.Language) (*sitter.Tree, error) {
@@ -144,6 +153,7 @@ func ParseFile(src []byte, lang *sitter.Language) (*sitter.Tree, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), parseTimeout)
 	defer cancel()
 
+	parseCount.Add(1)
 	tree, err := parser.ParseCtx(ctx, nil, src)
 	if err != nil {
 		return nil, fmt.Errorf("tree-sitter parse: %w", err)
