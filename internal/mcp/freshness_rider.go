@@ -663,6 +663,29 @@ func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, 
 		return "file", nil, []string{file}
 	}
 	switch name {
+	case "verify_change":
+		var changes []struct {
+			SymbolID string `json:"symbol_id"`
+		}
+		if json.Unmarshal([]byte(req.GetString("changes", "")), &changes) == nil {
+			for _, change := range changes {
+				if change.SymbolID != "" {
+					ids = append(ids, change.SymbolID)
+				}
+			}
+		}
+		if len(ids) > 0 {
+			return "relations", ids, nil
+		}
+	case "get_edit_plan", "explain_change_impact", "check_guards":
+		for _, id := range strings.Split(req.GetString("ids", ""), ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) > 0 {
+			return "relations", ids, nil
+		}
 	case "get_callers", "find_usages", "get_call_chain", "get_dependencies", "get_dependents", "find_implementations", "walk_graph":
 		for _, key := range []string{"id", "symbol_id", "start_id"} {
 			if id := req.GetString(key, ""); id != "" {

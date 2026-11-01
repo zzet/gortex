@@ -120,6 +120,34 @@ func TestFailedPatchLabelsOnlyItsFile(t *testing.T) {
 	require.Equal(t, []string{"other.go"}, label.files)
 }
 
+func TestVerifyChangeCompactCarriesFreshnessFirstLine(t *testing.T) {
+	s, root := newRelationFixture(t)
+	s.SetWatcher(&watchedTierFixture{paths: map[string]indexer.MutationTierState{
+		filepath.Join(root, "caller.go"): {Generation: 1, AckAt: time.Now()},
+	}})
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "verify_change"
+	req.Params.Arguments = map[string]any{"changes": `[{"symbol_id":"` + targetID(t, s) + `","new_signature":"func Target()"}]`, "compact": true}
+	result, err := s.wrapToolHandler(s.handleVerifyChange)(t.Context(), req)
+	require.NoError(t, err)
+	require.False(t, result.IsError, resultText(result))
+	require.True(t, strings.HasPrefix(resultText(result), "relations: pending (1 files)\n"), resultText(result))
+}
+
+func TestIdleFreshnessIsANoOp(t *testing.T) {
+	s, _ := newRelationFixture(t)
+	s.SetWatcher(&watchedTierFixture{})
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "get_callers"
+	req.Params.Arguments = map[string]any{"id": targetID(t, s)}
+	for _, body := range []string{`{"nodes":[]}`, "no callers", "callers[0]:"} {
+		original := mcp.NewToolResultText(body)
+		actual := s.decorateToolFreshness(t.Context(), req.Params.Name, req, original)
+		require.Same(t, original, actual)
+		require.Equal(t, body, resultText(actual))
+	}
+}
+
 func TestFreshnessRiderLabelsEveryOutputMode(t *testing.T) {
 	rider := map[string]any{"freshness_scope": "relations", "graph_freshness": "pending",
 		"pending_file_count": 2, "pending_files": []string{"caller.go", "target.go"}}
