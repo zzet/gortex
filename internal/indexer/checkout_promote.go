@@ -57,11 +57,10 @@ type PromoteResult struct {
 // the checkout exists does anything the query surface reads change — the mode
 // flips to dedicated and the automatic route and coordinator are retired.
 //
-// Every failure before that flip leaves the automatic view serving. The corpus
-// half-built for the new prefix is evicted, the graph row that named it is
-// dropped, and the journalled intent stays pending, which is what Retryable
-// means: nothing about the checkout changed, so asking again is the whole of
-// the recovery.
+// Every failure before that flip leaves the automatic view serving. Cleanup
+// evicts only the witnessed registration and its own unpublished graph row;
+// replaced or unknown ownership is retained rather than purged by prefix. The
+// journalled intent stays pending, which is what Retryable means.
 func (l *CheckoutLifecycle) PromoteCheckout(
 	ctx context.Context, checkoutID string, source store_sqlite.IntentSourceKind,
 ) (PromoteResult, error) {
@@ -202,12 +201,12 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		return out, l.promotionFailed(ctx, &out, transition,
 			fmt.Errorf("indexer: no dedicated prefix can be derived for %s", checkout.RootPath))
 	}
-	index, resampled, err := l.indexPromotedCorpus(ctx, checkout, out.Prefix)
+	index, resampled, owned, err := l.indexPromotedCorpus(ctx, checkout, out.Prefix)
 	out.Index, out.Resampled = index, resampled
 	if err != nil {
 		var collision *PrefixCollisionError
 		if !errors.As(err, &collision) {
-			l.rollbackPromotionOrLog(ctx, out.Prefix, "")
+			err = errors.Join(err, l.rollbackPromotionOrLog(ctx, out.Prefix, "", checkout, owned))
 		}
 		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
@@ -221,12 +220,11 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 		IsPrimaryBase:   false,
 		State:           reconcile.GraphStateReady,
 	}
-	if err := l.catalog.UpsertDedicatedGraph(ctx, row); err != nil {
-		l.rollbackPromotionOrLog(ctx, out.Prefix, "")
-		return out, l.promotionFailed(ctx, &out, transition, err)
+	if l.afterPromotionIndex != nil {
+		l.afterPromotionIndex()
 	}
-	if err := l.serveFromOwnCorpus(ctx, checkout); err != nil {
-		l.rollbackPromotionOrLog(ctx, out.Prefix, out.GraphID)
+	if err := l.publishPromotedCorpus(ctx, checkout, row, owned); err != nil {
+		err = errors.Join(err, l.rollbackPromotionOrLog(ctx, out.Prefix, out.GraphID, checkout, owned))
 		return out, l.promotionFailed(ctx, &out, transition, err)
 	}
 
@@ -238,6 +236,47 @@ func (l *CheckoutLifecycle) promoteCheckoutTransition(
 			zap.String("checkout", checkout.CheckoutID), zap.Error(err))
 	}
 	return out, nil
+}
+
+// publishPromotedCorpus retains the existing repository mutation lane across
+// the owner recheck and publication. Untrack/retrack cannot substitute a new
+// corpus between that check and the mode flip. No filesystem work or catalog
+// call runs under mi.mu.
+func (l *CheckoutLifecycle) publishPromotedCorpus(ctx context.Context, checkout store_sqlite.Checkout, row store_sqlite.DedicatedGraph, owned prefixOwnerWitness) error {
+	l.mi.mu.RLock()
+	err := l.mi.validatePrefixCleanupOwnerLocked(row.RepoPrefix, &owned)
+	idx := l.mi.indexers[row.RepoPrefix]
+	l.mi.mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	lane, current := l.mi.repositoryMutationCoordinatorForSnapshot(row.RepoPrefix, owned.meta, idx)
+	if !current || lane == nil {
+		return errPrefixOwnerChanged
+	}
+	return lane.runExclusive(ctx, func() error {
+		l.mi.mu.RLock()
+		err := l.mi.validatePrefixCleanupOwnerLocked(row.RepoPrefix, &owned)
+		l.mi.mu.RUnlock()
+		if err != nil {
+			return err
+		}
+		return idx.withOutputGeneration(ctx, OutputEntryPromotionPublication, func() error {
+			// Legacy unpublished catalog rows allow rebinding. Promotion cannot use
+			// that compatibility behavior to overwrite a different checkout owner.
+			binding, found, err := l.catalog.GetDedicatedGraph(ctx, row.GraphID)
+			if err != nil {
+				return err
+			}
+			if found && (binding.OwnerCheckoutID != checkout.CheckoutID || binding.FamilyID != checkout.FamilyID) {
+				return fmt.Errorf("%w: promotion graph %s belongs to another checkout", store_sqlite.ErrCatalogStaleGuard, row.GraphID)
+			}
+			if err := l.catalog.UpsertDedicatedGraph(ctx, row); err != nil {
+				return err
+			}
+			return l.serveFromOwnCorpus(ctx, checkout)
+		})
+	})
 }
 
 // checkoutSample is the state a promotion has to describe: what the checkout
@@ -276,37 +315,48 @@ func sampleCheckout(ctx context.Context, root string) (checkoutSample, error) {
 // automatic view is still there to fall back on.
 func (l *CheckoutLifecycle) indexPromotedCorpus(
 	ctx context.Context, checkout store_sqlite.Checkout, prefix string,
-) (*IndexResult, int, error) {
+) (*IndexResult, int, prefixOwnerWitness, error) {
 	resampled := 0
+	var owned prefixOwnerWitness
 	for attempt := 0; attempt < 2; attempt++ {
 		before, err := sampleCheckout(ctx, checkout.RootPath)
 		if err != nil {
-			return nil, resampled, err
+			return nil, resampled, owned, err
 		}
 		if l.indexBarrier != nil {
 			l.indexBarrier()
 		}
 		result, err := l.mi.TrackRepoCtx(WithIndexOrigin(ctx, "checkout_promotion"), config.RepoEntry{Path: checkout.RootPath, Name: prefix})
 		if err != nil {
-			return nil, resampled, err
+			// Another registration may have claimed this exact root under a
+			// different name after promotion selected its prefix. Configured
+			// name validation then refuses Track before its normal ownership
+			// check. Preserve the typed collision for this established owner;
+			// neither the requested corpus nor its rollback is authorized.
+			observation, ownerErr := l.mi.observePrefixOwnership(ctx, prefix, checkout.RootPath)
+			if ownerErr == nil && observation.registeredPrefix != "" && observation.registeredPrefix != prefix {
+				return nil, resampled, owned, newObservedPrefixCollision(prefix, checkout.RootPath, checkout.RootPath, observation.candidate)
+			}
+			return nil, resampled, owned, err
 		}
-		if result == nil && l.mi.GetMetadata(prefix) == nil {
-			return nil, resampled, fmt.Errorf(
-				"indexer: %s could not be indexed under prefix %s", checkout.RootPath, prefix)
+		owned, err = l.mi.prefixOwnerForRoot(ctx, prefix, checkout.RootPath)
+		if err != nil {
+			return nil, resampled, owned, err
 		}
 		after, err := sampleCheckout(ctx, checkout.RootPath)
 		if err != nil {
-			return nil, resampled, err
+			return nil, resampled, owned, err
 		}
 		if after == before {
-			return result, resampled, nil
+			return result, resampled, owned, nil
 		}
 		resampled++
-		if _, _, err := l.mi.UntrackRepoChecked(ctx, prefix); err != nil {
-			return nil, resampled, err
+		if _, _, err := l.mi.purgeRepoOwnedChecked(ctx, owned, nil); err != nil {
+			return nil, resampled, owned, err
 		}
+		owned = prefixOwnerWitness{}
 	}
-	return nil, resampled, fmt.Errorf("%w: %s moved under two full indexes",
+	return nil, resampled, owned, fmt.Errorf("%w: %s moved under two full indexes",
 		ErrCheckoutMoved, checkout.RootPath)
 }
 
@@ -373,31 +423,62 @@ func (l *CheckoutLifecycle) withdrawAutomaticRoute(ctx context.Context, checkout
 // rollbackPromotion undoes what a failed promotion built. The automatic view
 // was never touched, so putting the corpus and the graph row back the way they
 // were is the whole of it.
-func (l *CheckoutLifecycle) rollbackPromotion(ctx context.Context, prefix, graphID string) error {
-	if prefix != "" {
-		l.detachWatcher(prefix)
-		if _, _, err := l.mi.purgeRepoChecked(ctx, prefix, nil); err != nil {
-			return fmt.Errorf("indexer: purge rolled-back repository %q: %w", prefix, err)
+func (l *CheckoutLifecycle) rollbackPromotion(ctx context.Context, prefix, graphID string, checkout store_sqlite.Checkout, owned prefixOwnerWitness) error {
+	if prefix == "" || owned.meta == nil || owned.prefix != prefix {
+		return errPrefixIdentityUnknown
+	}
+	// Even a failure before our Upsert must not purge a corpus now bound to
+	// another checkout/family. Read the actual row; never infer ownership from
+	// its graph id or the class of the primary failure.
+	binding, found, err := l.catalog.GetDedicatedGraph(ctx, GraphIDFor(prefix))
+	if err != nil {
+		return err
+	}
+	if found {
+		if binding.OwnerCheckoutID != checkout.CheckoutID || binding.FamilyID != checkout.FamilyID {
+			owner, ownerFound, ownerErr := l.catalog.GetCheckout(ctx, binding.OwnerCheckoutID)
+			if ownerErr != nil {
+				return ownerErr
+			}
+			root := ""
+			if ownerFound {
+				root = owner.RootPath
+			}
+			return newObservedPrefixCollision(prefix, root, checkout.RootPath, prefixStatResult{err: errPrefixOwnerChanged})
+		}
+		_, published, err := l.catalog.DedicatedBasePublication(ctx, binding.GraphID)
+		if err != nil {
+			return err
+		}
+		if published {
+			return fmt.Errorf("%w: promotion rollback refuses published graph %s", store_sqlite.ErrCatalogStaleGuard, binding.GraphID)
 		}
 	}
-	if graphID != "" {
-		if err := l.catalog.DeleteDedicatedGraph(ctx, graphID); err != nil &&
-			!errors.Is(err, store_sqlite.ErrCatalogNotFound) {
-			return fmt.Errorf("indexer: drop rolled-back graph binding %q: %w", graphID, err)
+	if graphID != "" && graphID != GraphIDFor(prefix) {
+		return fmt.Errorf("%w: promotion rollback graph/prefix mismatch", store_sqlite.ErrCatalogStaleGuard)
+	}
+	if _, _, err := l.mi.purgeRepoOwnedChecked(ctx, owned, func() { l.detachWatcher(prefix) }); err != nil {
+		return fmt.Errorf("indexer: purge owned rolled-back repository %q: %w", prefix, err)
+	}
+	if graphID != "" && found {
+		// This guarded delete compares the complete row and refuses publication
+		// acquired after the observation. It never deletes a replacement binding.
+		if err := l.catalog.DeleteUnpublishedDedicatedGraph(ctx, binding); err != nil {
+			return fmt.Errorf("indexer: drop owned rolled-back graph binding %q: %w", graphID, err)
 		}
 	}
 	return nil
 }
 
-// rollbackPromotionOrLog performs the best-effort rollback of a failed
-// promotion and only logs any cleanup error: the caller is already returning
-// the promotion failure that triggered the rollback, so a cleanup error is
-// secondary and has nothing to act on beyond the record.
-func (l *CheckoutLifecycle) rollbackPromotionOrLog(ctx context.Context, prefix, graphID string) {
-	if err := l.rollbackPromotion(ctx, prefix, graphID); err != nil {
+// rollbackPromotionOrLog retains cleanup errors alongside the primary failure.
+// Unknown/replaced ownership is a refusal to purge, never a successful cleanup.
+func (l *CheckoutLifecycle) rollbackPromotionOrLog(ctx context.Context, prefix, graphID string, checkout store_sqlite.Checkout, owned prefixOwnerWitness) error {
+	err := l.rollbackPromotion(ctx, prefix, graphID, checkout, owned)
+	if err != nil {
 		l.logger.Warn("checkout lifecycle: could not roll back a failed promotion",
-			zap.String("prefix", prefix), zap.String("graph", graphID), zap.Error(err))
+			zap.String("prefix", prefix), zap.String("root", checkout.RootPath), zap.String("graph", graphID), zap.Error(err))
 	}
+	return err
 }
 
 // beginModeChange journals a mode change, adopting the entry an interrupted

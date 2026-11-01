@@ -99,6 +99,15 @@ func buildStaleIndexHint(cwd string) string {
 	case err != nil:
 		return ""
 	}
+	if cwd != "" {
+		abs, err := filepath.Abs(cwd)
+		if err != nil {
+			abs = cwd
+		}
+		if collision := prefixCollisionCoverage(abs, status.TrackedRepos); collision != "" {
+			return "[Gortex] " + collision
+		}
+	}
 	if !status.Ready {
 		return fmt.Sprintf("[Gortex] daemon is warming up (%s elapsed); graph answers may be partial until it is ready.", formatDuration(status.WarmupSeconds))
 	}

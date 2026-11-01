@@ -36,6 +36,25 @@ func ServerInstructionsLoading(repo, phase string, percent int) string {
 		"the repository is already configured.", repo, loadingPhaseLabel(phase), percent)
 }
 
+// ServerInstructionsIdentityPending describes uncertainty, not ownership of
+// the caller's path. It is shared by initialization and modern discovery.
+func ServerInstructionsIdentityPending() string {
+	return serverInstructionsAdmissionPending("identity_resolution", "identity_pending")
+}
+
+// ServerInstructionsScopeBindingPending applies after registration when the
+// ordinary checkout/scope authority has not established the path's route yet.
+func ServerInstructionsScopeBindingPending() string {
+	return serverInstructionsAdmissionPending("scope_binding", "scope_binding_pending")
+}
+
+func serverInstructionsAdmissionPending(phase, reason string) string {
+	return fmt.Sprintf("Gortex is LOADING graph admission after a restart (%s, 0%%). "+
+		"Graph admission for this path is not yet established; calls return repo_loading (retryable, %s). "+
+		"Retry shortly or continue work natively while admission completes. No graph scope has been granted; "+
+		"do not change tracking configuration or reconnect to resolve this temporary state.", phase, reason)
+}
+
 // ServerInstructionsUnavailable is the inactive initialize variant for a
 // configured repository whose load ended without registering it.
 func ServerInstructionsUnavailable(repo, reason string) string {
@@ -58,10 +77,27 @@ func RepoLoadingSuggestion(repo string) string {
 // RepoUnavailableSuggestion is the remedy text a repo_unavailable refusal
 // carries.
 func RepoUnavailableSuggestion(rec indexer.RepoLoad) string {
+	if rec.ErrorCode == string(ErrCodePrefixCollision) {
+		return PrefixCollisionSuggestion(rec)
+	}
 	if rec.State == indexer.RepoLoadMissing {
 		return fmt.Sprintf("The configured path %s does not exist. Restore it, or remove it with `gortex untrack %s`.", rec.Root, rec.Root)
 	}
 	return fmt.Sprintf("Gortex could not load %s after the restart. Run `gortex track %s` to index it again, or `gortex doctor` to diagnose.", rec.Root, rec.Root)
+}
+
+// PrefixCollisionSuggestion uses only the captured owner evidence. Missing
+// means an observed ENOENT, never a timeout or permission failure.
+func PrefixCollisionSuggestion(rec indexer.RepoLoad) string {
+	if rec.OwnerState == "missing" {
+		return fmt.Sprintf("The owner %s no longer exists. Inspect `gortex untrack %s` for that owner before retrying %s.", rec.OwnerPath, rec.OwnerPath, rec.Root)
+	}
+	return fmt.Sprintf("Prefix %q belongs to %s. Use a different name parameter for a new root; for the configured root %s set a unique name in the global config and run `gortex daemon reload`.", rec.Prefix, rec.OwnerPath, rec.Root)
+}
+
+func ServerInstructionsPrefixCollision(rec indexer.RepoLoad) string {
+	return "Gortex cannot admit this configured root (prefix_collision). " + PrefixCollisionSuggestion(rec) +
+		" Graph tools cannot answer for this root until its prefix is unique. Native file reads and edits remain available."
 }
 
 // loadingPhaseLabel names the warmup phase; before the first phase is

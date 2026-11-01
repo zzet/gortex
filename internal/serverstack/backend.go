@@ -93,6 +93,13 @@ func resolveBackendPath(in, filename string) (string, error) {
 	return abs, nil
 }
 
+// ResolveStorePath applies the same path/default/parent rules as the daemon
+// stack without opening SQLite. Detached startup needs this before exec so
+// SQLITE_TMPDIR is present in SQLite's process-start environment.
+func ResolveStorePath(path string) (string, error) {
+	return resolveBackendPath(path, "store.sqlite")
+}
+
 // openSqliteBackend opens (or creates) the SQLite store at path. The
 // pure-Go modernc.org/sqlite driver keeps the binary CGo-free while still
 // getting a real query planner that drives the graph's secondary indexes.

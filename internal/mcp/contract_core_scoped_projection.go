@@ -43,6 +43,16 @@ func (p *contractCoreKindSummaryProjection) NodesLightByKindsInScopeSeq(repos, f
 	return p.selected.NodesLightByKindsInScopeSeq(repos, files, kinds...)
 }
 
+// FileLocationsInScopeSeq rides on the summary capability: the selected
+// reader's location read when it has one, its summary file rows otherwise, so
+// a composed selected reader (a delta) keeps applying its own masks.
+func (p *contractCoreKindSummaryProjection) FileLocationsInScopeSeq(repos []string) iter.Seq[*graph.Node] {
+	if locations, ok := p.selected.(graph.ScopedFileLocationSequencer); ok {
+		return locations.FileLocationsInScopeSeq(repos)
+	}
+	return p.selected.NodesLightByKindsInScopeSeq(repos, nil, graph.KindFile)
+}
+
 type contractCoreScopedSummary struct {
 	*contractCoreScoped
 	*contractCoreKindSummaryProjection
