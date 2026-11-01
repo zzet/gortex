@@ -39,3 +39,18 @@ func TestInventoryFailureFreezesIntendedPrimaryClocks(t *testing.T) {
 		t.Fatalf("inventory failure removed primary graph: exists=%v err=%v", exists, err)
 	}
 }
+
+func TestInventoryFailureUsesFreshGitMarker(t *testing.T) {
+	for _, marker := range []bool{false, true} {
+		fresh := sampleOnVolume(volumeA)
+		fresh.GitMarkerExists = marker
+		class := Classify(gitstate.ErrInventoryUnavailable, nil, PathEvidence{}, fresh)
+		want := DispositionUnknown
+		if marker {
+			want = DispositionPresent
+		}
+		if class.Disposition != want {
+			t.Fatalf("marker=%v: disposition=%s want=%s", marker, class.Disposition, want)
+		}
+	}
+}

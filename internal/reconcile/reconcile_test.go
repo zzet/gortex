@@ -207,11 +207,11 @@ func TestReconcileFamilyInventoryFailureNeverRemoves(t *testing.T) {
 		t.Fatal("report claims a usable inventory")
 	}
 	entry := f.entry(report, "wt")
-	if entry.Classification.Disposition != DispositionInaccessible {
+	if entry.Classification.Disposition != DispositionUnknown {
 		t.Fatalf("classified %q, want inaccessible", entry.Classification.Disposition)
 	}
-	if entry.Action != ActionAvailabilityGraceStarted {
-		t.Fatalf("action = %q, want the availability clock started", entry.Action)
+	if entry.Action != ActionInventoryUnknown {
+		t.Fatalf("action = %q, want clocks frozen", entry.Action)
 	}
 	row := f.checkout(allocated.CheckoutID)
 	if row.RemovalDetectedAt != 0 || row.RemovalDeadline != 0 || row.RemovalEvidence != "" {
@@ -223,7 +223,7 @@ func TestReconcileFamilyInventoryFailureNeverRemoves(t *testing.T) {
 	f.git.commonDir = "/somewhere/else/.git"
 	f.git.setRecords()
 	entry = f.entry(f.reconcile(), "wt")
-	if entry.Classification.Disposition != DispositionInaccessible {
+	if entry.Classification.Disposition != DispositionUnknown {
 		t.Fatalf("mismatched common dir classified %q", entry.Classification.Disposition)
 	}
 	if row := f.checkout(allocated.CheckoutID); row.RemovalDetectedAt != 0 {

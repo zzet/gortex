@@ -304,8 +304,13 @@ func TestReconcileFamilyAgainstRealGit(t *testing.T) {
 		t.Fatal("an inventory of a different repository was accepted")
 	}
 	for _, entry := range report.Checkouts {
-		if entry.Classification.Disposition != DispositionInaccessible {
-			t.Fatalf("%s classified %q against a foreign inventory", entry.AdminName, entry.Classification.Disposition)
+		fresh := gitstate.SamplePathEvidence(entry.RootPath)
+		want := DispositionUnknown
+		if fresh.RootExists && fresh.GitMarkerExists {
+			want = DispositionPresent
+		}
+		if entry.Classification.Disposition != want {
+			t.Fatalf("%s classified %q against a foreign inventory, want %s", entry.AdminName, entry.Classification.Disposition, want)
 		}
 	}
 }

@@ -42,6 +42,8 @@ const (
 type PathEvidence struct {
 	// RootExists is true when the root itself could be statted.
 	RootExists bool
+	// GitMarkerExists is fresh presence of the checkout .git file or directory.
+	GitMarkerExists bool
 	// RootIdentity is an opaque token that stays the same for the same
 	// filesystem object and changes when the object is replaced. Empty
 	// when the root does not exist or the platform is unsupported.
@@ -78,6 +80,9 @@ func SamplePathEvidence(root string) PathEvidence {
 
 	if fi, statErr := os.Lstat(abs); statErr == nil {
 		ev.RootExists = true
+		if _, markerErr := os.Lstat(filepath.Join(abs, ".git")); markerErr == nil {
+			ev.GitMarkerExists = true
+		}
 		ev.VolumeKind, ev.VolumeToken, ev.RootIdentity = pathIdentity(abs, fi)
 	}
 

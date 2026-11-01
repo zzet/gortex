@@ -358,8 +358,22 @@ func (r *Reconciler) reconcileKnown(
 	observeDiscoveryLag(pass.now, existing.LastSeen)
 
 	switch class.Disposition {
+	case DispositionUnknown:
+		entry.Action = ActionInventoryUnknown
+		req.LastError = class.Code + ": " + class.Detail
 	case DispositionPresent:
-		entry.Action = r.applyPresent(ctx, pass, existing, record, &req)
+		if record == nil {
+			// A fresh local marker proves this checkout is reachable, not that the
+			// failed family inventory is evidence about any other checkout or clock.
+			req.State = store_sqlite.CheckoutStateReady
+			req.LastError = ""
+			entry.Action = ActionReadyConfirmed
+			if existing.State != store_sqlite.CheckoutStateReady {
+				entry.Action = ActionAvailabilityRecovered
+			}
+		} else {
+			entry.Action = r.applyPresent(ctx, pass, existing, record, &req)
+		}
 	case DispositionInaccessible:
 		action, gone, err := r.applyInaccessible(ctx, pass, existing, &req)
 		if err != nil {

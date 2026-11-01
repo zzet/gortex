@@ -10,7 +10,8 @@ type CheckoutAction string
 const (
 	// ActionObserved means the checkout was seen and deliberately not
 	// persisted. It is the ephemeral outcome.
-	ActionObserved CheckoutAction = "observed"
+	ActionObserved         CheckoutAction = "observed"
+	ActionInventoryUnknown CheckoutAction = "inventory_unknown"
 	// ActionIdentityAllocated means a durable identity was minted for a
 	// checkout the catalog had never seen.
 	ActionIdentityAllocated CheckoutAction = "identity_allocated"

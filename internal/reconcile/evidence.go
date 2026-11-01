@@ -38,6 +38,8 @@ type Disposition string
 const (
 	// DispositionPresent means the checkout answered.
 	DispositionPresent Disposition = "present"
+	// DispositionUnknown freezes lifecycle clocks when the family cannot be inventoried.
+	DispositionUnknown Disposition = "unknown"
 	// DispositionInaccessible means the checkout did not answer and nothing
 	// proves it is gone. It is the default for every uncertain case.
 	DispositionInaccessible Disposition = "inaccessible"
@@ -69,7 +71,8 @@ type Classification struct {
 // be read from the wrong side.
 type PathEvidence struct {
 	// RootExists is true when the root itself was reachable at sample time.
-	RootExists bool
+	RootExists      bool
+	GitMarkerExists bool
 	// RootIdentity is the opaque token of the root object, empty when the
 	// root did not exist or the platform reports no identity.
 	RootIdentity string
@@ -89,6 +92,7 @@ type PathEvidence struct {
 func SampledPathEvidence(sample gitstate.PathEvidence) PathEvidence {
 	return PathEvidence{
 		RootExists:          sample.RootExists,
+		GitMarkerExists:     sample.GitMarkerExists,
 		RootIdentity:        sample.RootIdentity,
 		RootVolumeKind:      sample.VolumeKind,
 		RootVolumeToken:     sample.VolumeToken,
@@ -193,10 +197,13 @@ func ValidateInventory(inv *gitstate.FamilyInventory, invErr error, familyCommon
 // sample taken during this pass.
 func Classify(inventoryErr error, record *gitstate.WorktreeRecord, persisted, fresh PathEvidence) Classification {
 	if inventoryErr != nil {
+		if fresh.RootExists && fresh.GitMarkerExists {
+			return Classification{Disposition: DispositionPresent, Evidence: EvidenceNone, Detail: "checkout root and .git marker are reachable despite unavailable family inventory"}
+		}
 		return Classification{
-			Disposition: DispositionInaccessible,
+			Disposition: DispositionUnknown,
 			Evidence:    EvidenceNone,
-			Code:        graphview.CodeCheckoutInaccessible,
+			Code:        "inventory_unavailable",
 			Detail:      "inventory unavailable: " + inventoryErr.Error(),
 		}
 	}
