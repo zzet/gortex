@@ -41,9 +41,10 @@ func TestMCPDispatchTimingActualGrantAndLeaseReplacement(t *testing.T) {
 func TestMCPDispatchTimingQueuedGrantIsNotEarlyAdmissionSignal(t *testing.T) {
 	parent, cancel := context.WithCancel(t.Context())
 	slots := newMCPDispatchSlots(1)
-	slots <- struct{}{}
+	holder, err := mcpSchedulerFor(slots).acquire(t.Context(), MCPDispatchFast, "holder")
+	require.NoError(t, err)
 	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { <-slots }) }
+	release := func() { releaseOnce.Do(holder.complete) }
 	admission := newMCPDispatchAdmission()
 	ctx := withMCPDispatchQueueWait(withMCPDispatchSlots(withMCPDispatchSlotLease(withMCPDispatchAdmission(parent, admission)), slots), time.Minute)
 	done := make(chan error, 1)
