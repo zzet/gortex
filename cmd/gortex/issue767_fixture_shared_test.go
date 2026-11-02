@@ -264,6 +264,11 @@ func (f *issue767Fixture) lastResponse() string {
 	return f.lastOutput
 }
 
+// issue767GracefulStopOwner binds one child's two cleanup entry points.
+func issue767GracefulStopOwner(request func() error) func() error {
+	return request
+}
+
 func (f *issue767Fixture) start() {
 	f.t.Helper()
 	run := f.nextRun()
@@ -280,7 +285,7 @@ func (f *issue767Fixture) start() {
 	// Global testing timeout bypasses Cleanup. Request the same private,
 	// graceful shutdown as stop before exec's bounded last-resort kill.
 	// os.Interrupt cannot be sent to a process on native Windows.
-	cmd.Cancel = func() error { return f.requestGracefulStop(cmd, "cancel") }
+	cmd.Cancel = issue767GracefulStopOwner(func() error { return f.requestGracefulStop(cmd, "stop") })
 	cmd.WaitDelay = 10 * time.Second
 	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = f.primary, f.env, log, log
 	if err := cmd.Start(); err != nil {
