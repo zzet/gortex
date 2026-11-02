@@ -86,6 +86,9 @@ type storeCore struct {
 	// walShrinkPending: the WAL reclaim reset a big log in place and its
 	// file still has to be shrunk in slices (wal_shrink.go).
 	walShrinkPending atomic.Bool
+	// A blocked warm producer can own the build lane while awaiting shrink.
+	// Its scoped wait permits shrink through that lane; writer demand still wins.
+	warmupWALWaiters atomic.Int64
 	// walLimitKept: an in-place reset gave up on this fully copied log and
 	// left the writer's journal_size_limit lifted; the shrink restores it
 	// once the log has restarted (wal_shrink.go).
@@ -748,7 +751,7 @@ func Open(path string, opts ...Option) (*Store, error) {
 	for _, opt := range opts {
 		opt(&o)
 	}
-	return openWithObserver(path, currentSchemaVersion, schemaMigrations, o.allowRebuild, o.migrationObserver)
+	return openStore(path, currentSchemaVersion, schemaMigrations, o)
 }
 
 // Option configures Open.
@@ -757,6 +760,11 @@ type Option func(*openOptions)
 type openOptions struct {
 	allowRebuild      bool
 	migrationObserver MigrationObserver
+	upgradeBackup     bool
+	upgradeHook       upgradeHook
+	// diskAvail reports the free bytes on the volume holding a directory.
+	// nil means platform.DiskAvailBytes; tests inject a fixed figure.
+	diskAvail func(dir string) (uint64, error)
 }
 
 // WithRebuild permits Open to drop and recreate an on-disk database whose
@@ -777,6 +785,28 @@ func WithRebuild() Option { return func(o *openOptions) { o.allowRebuild = true 
 // return promptly. It is not called when the store is already current.
 func WithMigrationObserver(observer MigrationObserver) Option {
 	return func(o *openOptions) { o.migrationObserver = observer }
+}
+
+// WithUpgradeBackup makes Open copy an existing store to
+// UpgradeBackupPath(path, oldVersion) before the first pending in-place
+// schema step runs, when the volume has room for the copy on top of the
+// upgrade itself. Without room, or when the copy fails, the backup is
+// skipped and the reason reported to the migration observer (or the log);
+// the upgrade still runs. An existing backup of the same version is kept.
+//
+// Like WithRebuild, the caller MUST hold exclusive cross-process access to
+// the store: the copy is consistent only because no other process can write
+// the store while it is taken.
+func WithUpgradeBackup() Option { return func(o *openOptions) { o.upgradeBackup = true } }
+
+// withUpgradeHook installs the crash-test hook on the schema transition.
+func withUpgradeHook(hook upgradeHook) Option {
+	return func(o *openOptions) { o.upgradeHook = hook }
+}
+
+// withDiskAvail replaces the free-space probe the upgrade precheck uses.
+func withDiskAvail(fn func(dir string) (uint64, error)) Option {
+	return func(o *openOptions) { o.diskAvail = fn }
 }
 
 // ErrSchemaRebuildRequired is returned by Open when an on-disk database needs a
@@ -809,14 +839,37 @@ func configureConnectionPool(db *sql.DB) {
 }
 
 func openWith(path string, current int, migrations []schemaMigration, allowRebuild bool) (*Store, error) {
-	return openWithObserver(path, current, migrations, allowRebuild, nil)
+	return openStore(path, current, migrations, openOptions{allowRebuild: allowRebuild})
 }
 
 func openWithObserver(path string, current int, migrations []schemaMigration, allowRebuild bool, observe MigrationObserver) (*Store, error) {
+	return openStore(path, current, migrations, openOptions{allowRebuild: allowRebuild, migrationObserver: observe})
+}
+
+// openStore is Open with the target version, the migration registry and the
+// resolved options spelled out, so tests can drive any transition without
+// mutating package globals.
+func openStore(path string, current int, migrations []schemaMigration, o openOptions) (*Store, error) {
+	allowRebuild, observe, hook := o.allowRebuild, o.migrationObserver, o.upgradeHook
 	// Refuse unsupported newer schemas before a writer connection can change
 	// journal mode or checkpoint their WAL. WithRebuild does not override this.
-	if err := checkSchemaDowngrade(path, current); err != nil {
+	probe, err := probeStoreSchema(path)
+	if err != nil {
 		return nil, err
+	}
+	if err := probe.refuseNewer(current); err != nil {
+		return nil, err
+	}
+	// Size a pending in-place upgrade while the store is still untouched: a
+	// refusal here leaves the file byte-identical. The writer handle below
+	// re-plans from its own read of the version; this plan only sizes.
+	if space, pending := measureUpgradeSpace(probe, current, planSchemaMigrationWith(probe.stored, current, migrations), o.diskAvail); pending {
+		if err := space.refuseShort(); err != nil {
+			return nil, err
+		}
+		if o.upgradeBackup {
+			backupBeforeUpgrade(space, observe, hook)
+		}
 	}
 
 	// Pragmas: WAL + synchronous=NORMAL is the standard write-heavy
@@ -960,7 +1013,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// pass WithRebuild. A wipe plan carries no in-place steps, and after a wipe
 	// the store is empty and the daemon's normal indexing repopulates it.
 	if plan.stamp {
-		if err := applyInPlaceMigrations(db, plan.inPlace, observe); err != nil {
+		if err := applyInPlaceMigrationsWith(db, plan.inPlace, observe, hook); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite schema migrate: %w", err)
 		}
@@ -974,6 +1027,9 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	if err := createGraphCoreIndexes(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite core index: %w", err)
+	}
+	if plan.stamp {
+		hook.at(upgradeIndexRecreation, current)
 	}
 	if err := createSidecarIndexes(db); err != nil {
 		_ = db.Close()
@@ -996,6 +1052,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// preceding operation is idempotent, so an interruption before this point
 	// leaves the old version and safely retries the transition on the next Open.
 	if plan.stamp {
+		hook.at(upgradeBeforeStamp, current)
 		if err := setUserVersion(db, current); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
