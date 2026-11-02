@@ -222,9 +222,9 @@ func TestMutationSetPublicationRejectsFailedPathSpellings(t *testing.T) {
 			require.True(t, record.bindCanonicalTicket(2, time.Now()))
 			ticket := &MutationTicket{Path: spelling.member, Generation: 2, PublicationRecord: record}
 			w := &Watcher{
-				pendingGeneration: map[string]uint64{spelling.member: 2},
+				pendingGeneration:          map[string]uint64{spelling.member: 2},
 				observedMutationGeneration: map[string]uint64{spelling.member: 2},
-				mutationWaiters: map[string]map[uint64]mutationWaiter{spelling.member: {2: {publication: record, ticket: ticket}}},
+				mutationWaiters:            map[string]map[uint64]mutationWaiter{spelling.member: {2: {publication: record, ticket: ticket}}},
 			}
 			attempt := w.beginMutationSetPublication(map[string]uint64{spelling.member: 2}, time.Now(), 0)
 			require.NotNil(t, attempt)
