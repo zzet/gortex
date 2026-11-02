@@ -904,9 +904,9 @@ func TestPointMutationWithDeferredGlobalPassesPublishesNoVerdict(t *testing.T) {
 		"a mutation that never ran the bounded pass published a verdict: %+v", result.DerivedFanout)
 }
 
-// The daemon does NOT run the standalone point executor. MultiWatcher replaces
-// the seam with MultiIndexer.incrementalPointRepoRaw (multi_watcher.go), which
-// reaches the bounded pass through incrementalReindexRepoRawMode instead. Drive
+// The daemon does NOT run the standalone point executor. Its registered
+// Indexer's repositoryMutationOwner selects incrementalReindexRepoRawMode
+// while retaining the watcher's relation-tier publication callback. Drive
 // that arm end to end so a change to the MultiIndexer executor's receipt or
 // catch-up handling cannot silently drop the verdict the shipped daemon
 // publishes.
@@ -919,7 +919,18 @@ func TestDaemonPointExecutorReportsTheDerivedFanoutCut(t *testing.T) {
 	multi := NewMultiIndexer(store, newTestRegistry(), nil, nil, zap.NewNop())
 	multi.repos[prefix] = &RepoMetadata{RepoPrefix: prefix, RootPath: dir}
 	multi.indexers[prefix] = idx
+	// Keep the custom fan-out fixture, but bind the owner that the production
+	// MultiIndexer factory installs before registering an Indexer.
+	idx.repositoryMutationOwner = multi
 	idx.attachRepositoryMutationCoordinator(multi.repositoryMutationCoordinator(prefix))
+	var crossCalls atomic.Int32
+	priorCatchup := idx.incrementalCatchupHook
+	idx.incrementalCatchupHook = func(kind string, files []string) {
+		priorCatchup(kind, files)
+		if kind == "cross_repo" {
+			crossCalls.Add(1)
+		}
+	}
 
 	mw, err := NewMultiWatcher(multi, map[string]config.WatchConfig{
 		prefix: {Enabled: true, DebounceMs: 5},
@@ -927,8 +938,15 @@ func TestDaemonPointExecutorReportsTheDerivedFanoutCut(t *testing.T) {
 	require.NoError(t, err)
 	w := mw.watchers[prefix]
 	require.NotNil(t, w, "MultiWatcher registered no watcher for %s", prefix)
-	require.NotNil(t, w.pointReindexRaw,
-		"the daemon arm under test is not installed; this would silently run the standalone executor")
+	// Explicit admission drives the real executor without starting fsnotify.
+	// Stop must close its handle without waiting for a loop that never ran.
+	w.degradedNoFsnotify = true
+	t.Cleanup(func() { require.NoError(t, w.Stop()) })
+	current := w.currentMutationIndexer()
+	require.NotNil(t, current)
+	require.NotNil(t, current.repositoryMutationOwner,
+		"the daemon owner must be installed; otherwise this silently runs the standalone executor")
+	require.Same(t, multi, current.repositoryMutationOwner)
 
 	bumpMtime(t, defPaths[0], "package p\n\nfunc F0(x int, y int) int { return x + y }\n")
 	ticket, err := w.EnqueueFileMutation(context.Background(), defPaths[0])
@@ -944,6 +962,7 @@ func TestDaemonPointExecutorReportsTheDerivedFanoutCut(t *testing.T) {
 
 	require.Len(t, truncationEntries(observed), 1,
 		"the daemon arm did not truncate; the assertions below would be vacuous")
+	require.EqualValues(t, 1, crossCalls.Load(), "the real daemon resolver tail must run, not the standalone fallback")
 	require.Empty(t, obs.uncarriedCuts())
 	require.NoError(t, result.Err)
 	require.True(t, result.Reindexed, "the daemon-arm mutation did not apply: %+v", result)
