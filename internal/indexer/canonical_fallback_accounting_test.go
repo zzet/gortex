@@ -1,10 +1,10 @@
 package indexer
 
 import (
-	"os"
 	"errors"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
