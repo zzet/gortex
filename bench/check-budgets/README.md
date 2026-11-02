@@ -157,10 +157,11 @@ go run ./bench/check-budgets collect --config reviewed-lane.json --out NEW-evide
 go build -o /benchmark/bin/release-gate ./bench/release-gate
 /benchmark/bin/release-gate --config reviewed-release.json --out /benchmark/NEW-release-dir
 
-# Inspect downloaded scheduled-main artifacts, replay all passing raw reports,
-# require five actual adjacent UTC dates, and flag two-night row misses.
+# Inspect downloaded scheduled/manual-main artifacts and replay all passing
+# raw reports. Require one complete run at the reviewed main revision across
+# every required host; keep two-night row-miss monitoring separately.
 go run ./bench/check-budgets history --inputs downloaded-nightlies.json \
-  --through 2026-10-30 --hosts reference_linux
+  --revision "$REVIEWED_MAIN_SHA" --through 2026-10-30 --hosts reference_linux
 ```
 
 Build the release entry before invoking it so a supervisor can address its PID
@@ -176,14 +177,21 @@ toward the same release start time, cleanup reserve and wall-time receipt.
 `downloaded-nightlies.json` is an array of retained artifact-directory paths,
 relative to that index or absolute. Review their run provenance before use:
 this command checks local content and replays raw evidence, not the authenticity
-of arbitrary local files. Only `schedule` events on `refs/heads/main` count.
-Dispatch, readiness, duplicate host/date, omitted dates, shortened tables and
-changed policies cannot manufacture five accepted nights. Use `--through` for
-the last required night before the candidate; stale history is not a current
-release verdict. Consecutive block misses are labeled `BLOCKER`; consecutive
-disk/memory guard misses are labeled `GUARD REVIEW`. Missing history fails.
-The workflow preserves each artifact; downloading/curating the history index
-and calling this check before the first RC remain release-owner actions.
+of arbitrary local files. One complete qualifying main nightly-equivalent run
+is required: either a scheduled event or an explicit workflow_dispatch on
+refs/heads/main, at the reviewed --revision with the same pinned policy,
+complete matrix, independent repetitions, host coverage, raw schema and budget
+table. Required host artifacts must belong to the SAME workflow run/attempt;
+unrelated hosts, revisions or reruns cannot be assembled into a qualifying run.
+The --through date is a review cutoff, not a calendar waiting period. PR,
+readiness, synthetic, shortened or incomplete artifacts do not qualify. Same-day
+separate real runs remain inspectable; duplicate run/attempt/host artifacts fail.
+Nightly monitoring continues: consecutive block misses are labeled BLOCKER and
+consecutive disk/memory guard misses GUARD REVIEW. Manual passes and same-day
+retries do not erase scheduled misses. A seeded RED nightly gate
+proof remains separately required; neither this green-run check nor synthetic
+unit fixtures supplies it. The workflow preserves each artifact; reviewing the
+provenance/index and the separate seeded RED proof remains release-owner work.
 
 A lane configuration is strict schema1 JSON. Example below is **configuration
 shape only**, with synthetic paths/revisions and no measured baseline:
@@ -267,8 +275,10 @@ separate owner-approved infrastructure actions. No existing VM is adopted.
 
 After that review, the owner places the external config, sets only its matching
 config-path variable, and sets `PERF_REFERENCE_NIGHTLY_ENABLED` or
-`PERF_MAC_NIGHTLY_ENABLED` to `true`. A manual main dispatch can verify plumbing
-but cannot count as one of the five scheduled nights. Leave both enabled
+`PERF_MAC_NIGHTLY_ENABLED` to `true`. A manual main dispatch qualifies only when
+its dedicated nightly jobs collect the same complete policy, matrix, required
+hosts, independent repeats, raw JSON and budget table as a scheduled run.
+A smoke or plumbing-only dispatch does not qualify. Leave both enabled
 variables unset while prerequisites remain; GitHub displays measurement jobs
 as skipped. Removing the variable stops future scheduling without cancelling
 an in-flight owned daemon. A host being busy is reason to leave its lane
@@ -547,8 +557,9 @@ The floor class and extra lifecycle adapters require explicit reviewed support;
 do not relabel floor runs as reference Linux.
 
 Actual acceptance is still required: 20 real smoke runs for wall-time/flake
-rates, linked seeded latency/edit-wait regressions, five actual nights on main,
-a seeded nightly failure, a measured release subset under eight hours per host,
+rates, linked seeded latency/edit-wait regressions, one complete qualifying main
+nightly-equivalent run (scheduled or manual) with raw JSON and budget table,
+a separate seeded nightly failure, a measured release subset under eight hours per host,
 no forced daemons, and 20-PR CI wall-time comparison. None is simulated by unit
 tests. #996 and #998 implementations are merged; baseline acceptance remains separate. #1000's deferred 400-task
 harness is not recreated here. A small release scripted-agent fixture remains

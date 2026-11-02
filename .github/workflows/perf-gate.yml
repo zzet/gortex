@@ -37,7 +37,7 @@ jobs:
       - name: Declare smoke prerequisites (not a measured smoke lane)
         continue-on-error: true
         run: go run ./bench/check-budgets plan --lane smoke --host-class hosted_arm_smoke --out smoke-readiness.json
-      - name: Declare nightly prerequisites (does not start the five-night calendar)
+      - name: Declare nightly prerequisites (not measured nightly-equivalent evidence)
         continue-on-error: true
         run: go run ./bench/check-budgets plan --lane nightly --out nightly-readiness.json
       - name: Declare release prerequisites
