@@ -22,8 +22,8 @@ func privateRunSocketBase() (string, error) {
 		if err != nil || real != base {
 			return "", fmt.Errorf("load socket base must not traverse directory aliases: %s", base)
 		}
-		// Darwin's sockaddr_un allows103 path bytes plus its terminatingNUL.
-		// The MkdirTemp suffix uses at most10 decimal digits. Keep the
+		// Darwin's sockaddr_un allows 103 path bytes plus its terminating NUL.
+		// The MkdirTemp suffix uses at most 10 decimal digits. Keep the
 		// explicit override portable without changing default placement.
 		if len(filepath.Join(base, "gl-1234567890", "d.sock")) >= 104 {
 			return "", fmt.Errorf("load socket base exceeds the portable Unix socket path limit: %s", base)

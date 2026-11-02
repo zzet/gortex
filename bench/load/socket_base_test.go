@@ -21,7 +21,11 @@ func shortPrivateSocketBase(t *testing.T) string {
 			t.Error(err)
 		}
 	})
-	return root
+	real, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return real
 }
 
 func TestPrivateSocketBaseDefaultCompatibility(t *testing.T) {
