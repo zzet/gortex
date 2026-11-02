@@ -22,13 +22,14 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 )
 
-// This is a physical-writer/read-back correctness control. It samples no
-// latency and provides no reference-host, WAL, or full-mode performance proof.
+// This verifies the #1012 right-symbol write criterion with an independent disk
+// oracle. Public source outcomes are a separate two-session census, never the
+// #1014 1/8/32-agent acceptance row. No latency or reference-host credit.
 func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 	previous := pendingFileProjections
 	pendingFileProjections = newPendingProjections()
 	t.Cleanup(func() { pendingFileProjections = previous })
-	const original = "package sample\n\nfunc first() int {\n\treturn 0\n}\n\nfunc second() int {\n\treturn 0\n}\n"
+	const original = "package sample\n\nfunc first() int {\n\treturn 0\n}\n\nfunc second() int {\n\treturn 0\n}\n\nfunc decoyZero() int {\n\treturn 0\n}\n\nfunc decoyFirst() int {\n\treturn 11\n}\n\nfunc decoySecond() int {\n\treturn 22\n}\n"
 	s, root := setupMoveInlineRepo(t, map[string]string{"sample.go": original})
 	watcher, err := indexer.NewWatcher(s.indexer, config.WatchConfig{Enabled: true, DebounceMs: 5}, zap.NewNop())
 	require.NoError(t, err)
@@ -82,9 +83,12 @@ func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 	defer cancel()
 	start := make(chan struct{})
 	type outcome struct {
-		name      string
-		completed int
-		err       error
+		name          string
+		completed     int
+		sourceExact   int
+		sourcePending int
+		sourceRefused int
+		err           error
 	}
 	outcomes := make(chan outcome, 2)
 	var workers sync.WaitGroup
@@ -96,8 +100,15 @@ func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 			defer func() { outcomes <- result }()
 			session := WithSessionID(ctx, "repeat-"+name)
 			<-start
+			unique := 11
+			if name == "second" {
+				unique = 22
+			}
 			for ordinal := 0; ordinal < 500; ordinal++ {
-				before, after := ordinal%2, (ordinal+1)%2
+				before, after := 0, unique
+				if ordinal%2 == 1 {
+					before, after = unique, 0
+				}
 				ack, err := invoke(session, "edit_symbol", map[string]any{
 					"id": "sample.go::" + name, "old_source": fmt.Sprintf("\treturn %d", before), "new_source": fmt.Sprintf("\treturn %d", after), "dry_run": false, "format": "json",
 				})
@@ -111,17 +122,43 @@ func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 					cancel()
 					return
 				}
-				body, err := invoke(session, "get_symbol_source", map[string]any{"id": "sample.go::" + name, "context_lines": 0, "format": "json"})
-				if err != nil {
-					result.err = fmt.Errorf("read %d: %w", ordinal, err)
+				body, readErr := invoke(session, "get_symbol_source", map[string]any{"id": "sample.go::" + name, "context_lines": 0, "format": "json"})
+				want := fmt.Sprintf("func %s() int {\n\treturn %d\n}", name, after)
+				switch {
+				case readErr != nil:
+					result.sourceRefused++
+				case body["source"] == want:
+					result.sourceExact++
+				case body["source"] == nil && body["source_state"] == "pending" && body["complete"] == false:
+					result.sourcePending++
+				default:
+					result.err = fmt.Errorf("read %d returned an incorrect source payload: want %q response=%v", ordinal, want, body)
 					cancel()
 					return
 				}
-				want := fmt.Sprintf("func %s() int {\n\treturn %d\n}", name, after)
-				if body["source"] != want {
-					result.err = fmt.Errorf("read %d used the wrong repeated fragment: got %q want %q", ordinal, body["source"], want)
+				// Stabilize only the independent physical oracle, AFTER the actual
+				// immediate public read above. This adds no wait to that probe and
+				// prevents a peer's temporary rename from racing the oracle's open.
+				path := filepath.Join(root, "sample.go")
+				_, release, err := acquireMutationPaths(session, []string{path})
+				if err != nil {
+					result.err = err
 					cancel()
 					return
+				}
+				current, diskErr := os.ReadFile(path)
+				release()
+				if diskErr != nil || !strings.Contains(string(current), want) {
+					result.err = fmt.Errorf("disk oracle edit %d must land in %s: err=%v want=%q actual=%q", ordinal, name, diskErr, want, current)
+					cancel()
+					return
+				}
+				for _, decoy := range []string{"func decoyZero() int {\n\treturn 0\n}", "func decoyFirst() int {\n\treturn 11\n}", "func decoySecond() int {\n\treturn 22\n}"} {
+					if !strings.Contains(string(current), decoy) {
+						result.err = fmt.Errorf("edit %d changed an unrelated repeated fragment: %q", ordinal, decoy)
+						cancel()
+						return
+					}
 				}
 				result.completed++
 			}
@@ -130,17 +167,21 @@ func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 	close(start)
 	workers.Wait()
 	close(outcomes)
-	total := 0
+	total, sourceExact, sourcePending, sourceRefused := 0, 0, 0, 0
 	for result := range outcomes {
 		require.NoError(t, result.err, "session %s completed %d", result.name, result.completed)
 		require.Equal(t, 500, result.completed)
 		total += result.completed
+		sourceExact += result.sourceExact
+		sourcePending += result.sourcePending
+		sourceRefused += result.sourceRefused
 	}
 	require.Equal(t, 1000, total)
-	require.GreaterOrEqual(t, auxiliaryResponses.Load(), int64(2), "both real session-note paths must remain enabled")
-	t.Logf("actual committed full/fresh ACKs and exact source readbacks: %d/1000; two sessions, 500 edits each; no latency sample", total)
+	require.Equal(t, 1000, sourceExact+sourcePending+sourceRefused, "every immediate public read outcome remains accounted for")
+	t.Logf("#1012 physical right-symbol writes=%d/1000, default full/fresh ACKs; unrelated repeated fragments unchanged", total)
+	t.Logf("separate two-session public source census: exact=%d pending=%d refused=%d auxiliary_note_responses=%d; NO #1014 1/8/32-agent or latency acceptance credit", sourceExact, sourcePending, sourceRefused, auxiliaryResponses.Load())
 	current, err := os.ReadFile(filepath.Join(root, "sample.go"))
 	require.NoError(t, err)
 	require.Equal(t, original, string(current), "500 alternating commits per declaration preserve both repeated fragments")
-	require.Equal(t, 2, strings.Count(string(current), "\treturn 0"))
+	require.Equal(t, 3, strings.Count(string(current), "\treturn 0"))
 }
