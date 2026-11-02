@@ -1087,17 +1087,13 @@ func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
 // holding the mutation's pre-eviction evidence (resolveWithDeferredEvidence),
 // which the master resolver inherits for this one resolve.
 func (mi *MultiIndexer) runMasterResolveFilesWithEvidence(files []string, useLSP bool, evidence *resolver.Resolver) {
-	mi.runMasterResolveFilesObserved(files, useLSP, evidence, nil)
-}
-
-func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) {
 	master := mi.newMasterResolver(useLSP)
 	if master == nil {
 		return
 	}
 	master.InheritIncrementalEvidence(evidence)
 	mt := time.Now()
-	stats := master.ResolveFilesAndIncomingObserved(files, observe)
+	stats := master.ResolveFilesAndIncoming(files)
 	mi.logger.Info("DEFERRED-TIMING master.ResolveFilesAndIncoming",
 		zap.Duration("elapsed", time.Since(mt)),
 		zap.Bool("lsp_enabled", useLSP && mi.resolverLSPHelper != nil),
@@ -2527,10 +2523,9 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 		return 0, 0, fmt.Errorf("repository mutation executor has no live indexer: %s", repoPrefix)
 	}
 
-	finishTopologyMutation := reach.BeginRepoTopologyMutation(mi.graph, repoPrefix)
+	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 	topologyChanged := true
-	var topologyFrontier []string
-	defer func() { finishTopologyMutation(topologyChanged, topologyFrontier) }()
+	defer func() { finishTopologyMutation(topologyChanged) }()
 
 	eviction := idx.evictFileIncrementalRaw(path)
 	result := eviction.result
@@ -2540,7 +2535,7 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 		)
 	}
 	if result.DeletedFileCount > 0 {
-		topologyFrontier = mi.resolveIncrementalRepoMutation(repoPrefix, result, nil, eviction.batch)
+		mi.resolveIncrementalRepoMutation(repoPrefix, result, nil, eviction.batch)
 	}
 
 	fileMtimes := idx.publishFileMtimes()
@@ -2593,22 +2588,19 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	}
 
 	// The stable per-repository lane is held before this executor runs. Take
-	// the repository's reachability topology gates second and keep them through
-	// the resolver, metadata, and derived tails to avoid lane/gate inversion.
+	// the global reachability topology gate second and keep it through the
+	// resolver, metadata, and derived tails to avoid lane/gate inversion.
 	gate := mode.publication.beginPatchLap(patchGateWait)
-	finishTopologyMutation := reach.BeginRepoTopologyMutation(mi.graph, repoPrefix)
+	finishTopologyMutation := reach.BeginTopologyMutation(mi.graph)
 	gate.end()
 	topologyChanged := true
-	var topologyFrontier []string
-	defer func() { finishTopologyMutation(topologyChanged, topologyFrontier) }()
+	defer func() { finishTopologyMutation(topologyChanged) }()
 
-	goModChanged := false
 	for _, path := range paths {
 		if filepath.Base(path) == "go.mod" {
 			mi.goModuleMu.Lock()
 			mi.goModuleChecked = time.Time{}
 			mi.goModuleMu.Unlock()
-			goModChanged = true
 			break
 		}
 	}
@@ -2622,13 +2614,9 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	// changed/definition file frontier; only an incomplete receipt falls back to
 	// conservative scoped-global resolution. Derived invalidations run once
 	// below after both binding layers are current.
-	frontier := mi.resolveIncrementalRepoMutationMode(
+	mi.resolveIncrementalRepoMutationMode(
 		repoPrefix, result, receipt, batch, mode.exactPointSemantic,
 	)
-	// Module changes and full retracks may rebind edges outside the frontier.
-	if !goModChanged && !result.FullRetrack {
-		topologyFrontier = frontier
-	}
 
 	mtimes := mode.publication.beginPatchLap(patchMtimes)
 	fileMtimes := idx.publishFileMtimes()
