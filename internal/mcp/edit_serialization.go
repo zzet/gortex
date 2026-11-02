@@ -553,7 +553,9 @@ func (s *Server) mutationWaitDuration() time.Duration {
 func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutationReindexOutcome {
 	if state := checkoutMutationFromContext(ctx); state != nil {
 		outcome := s.refreshCheckoutMutation(ctx, absPath, state)
-		if outcome.Err == nil && outcome.Pending && outcome.Receipt != "" {
+		// A completed ticket is still this write's actual admission. The
+		// tagged legacy-wait control must not disappear with completion timing.
+		if outcome.Err == nil && outcome.Receipt != "" {
 			outcome.Err = editGateCheckoutACKSeed(ctx, s)
 		}
 		return outcome
