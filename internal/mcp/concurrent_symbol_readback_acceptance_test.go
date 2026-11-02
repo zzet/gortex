@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,6 +39,7 @@ func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 	require.Equal(t, config.EditAckFull, s.sourceAckPolicy(t.Context()).mode)
 	edit := s.wrapToolHandler(s.handleEditSymbol)
 	read := s.wrapToolHandler(s.handleGetSymbolSource)
+	var auxiliaryResponses atomic.Int64
 	invoke := func(ctx context.Context, name string, args map[string]any) (map[string]any, error) {
 		req := mcplib.CallToolRequest{}
 		req.Params.Name = name
@@ -58,9 +60,21 @@ func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 		if result.IsError {
 			return nil, fmt.Errorf("%s refused: %s", name, resultText(result))
 		}
+		if len(result.Content) == 0 {
+			return nil, fmt.Errorf("%s returned no primary payload", name)
+		}
+		primary, ok := result.Content[0].(mcplib.TextContent)
+		if !ok {
+			return nil, fmt.Errorf("%s returned a non-text primary payload", name)
+		}
+		// Session notes are separate MCP content blocks, not trailing JSON.
+		// Keep the real middleware enabled and decode only its primary record.
+		if len(result.Content) > 1 {
+			auxiliaryResponses.Add(1)
+		}
 		var fields map[string]any
-		if err := json.Unmarshal([]byte(resultText(result)), &fields); err != nil {
-			return nil, err
+		if err := json.Unmarshal([]byte(primary.Text), &fields); err != nil {
+			return nil, fmt.Errorf("%s primary JSON: %w; payload=%q", name, err, primary.Text)
 		}
 		return fields, nil
 	}
@@ -123,6 +137,7 @@ func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 		total += result.completed
 	}
 	require.Equal(t, 1000, total)
+	require.GreaterOrEqual(t, auxiliaryResponses.Load(), int64(2), "both real session-note paths must remain enabled")
 	t.Logf("actual committed full/fresh ACKs and exact source readbacks: %d/1000; two sessions, 500 edits each; no latency sample", total)
 	current, err := os.ReadFile(filepath.Join(root, "sample.go"))
 	require.NoError(t, err)
