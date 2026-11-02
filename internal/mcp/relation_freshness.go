@@ -28,6 +28,7 @@ const maxLabelledPendingFiles = 16
 // its scope are still being published. The zero value is a fresh scope.
 type relationFreshness struct {
 	projected  bool   // current request served an exact file-local projection
+	storeBusy  bool   // selected store sections were unavailable
 	fileReason string // an observed reason the request deferred a file projection
 	scope      string
 	state      string   // Empty is fresh internally; explicit responses may render fresh or unknown.
