@@ -92,19 +92,6 @@ func TestGoBodyCapturePlan_OrderedIndependentBodyParity(t *testing.T) {
 					params := goParamNamesFromCapture(&parser.CapturedNode{Node: def.ChildByFieldName("parameters")}, src)
 					emitGoDataflow(owner.ID, owner.StartLine, body, params, map[string]string{"pkg": "some/pkg"}, src, "body_plan.go", oracle)
 				})
-				if tc.name == "closure_legacy_typeswitch_nested" {
-					root.WithScratch(func() {
-						walkGoNodes(body, func(n *sitter.Node) bool {
-							if n.Type() != "func_literal" {
-								return true
-							}
-							locals := map[string]bool{}
-							legacyBodyCaptureClosureLocals(n, src, locals)
-							t.Logf("untouched legacy locals=%v AST=%s", locals, n.String())
-							return false
-						})
-					})
-				}
 				require.Equal(t, metricOracle.Meta, owner.Meta, "all body metrics and surrounding metadata retain old independent walkers")
 				var actualNodes []*graph.Node
 				for _, n := range actual.Nodes {
