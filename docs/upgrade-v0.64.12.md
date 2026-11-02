@@ -20,6 +20,17 @@ remaining repositories should become ready.
 
 See the [onboarding troubleshooting guide](onboarding.md#recovering-from-a-runaway-warmup).
 
+## Tracked repositories survive inventory failures
+
+Family inventory failures no longer expire an explicitly tracked repository out
+of configuration. Temporary outages retain its identity and recover its watcher
+and offline edits when the checkout returns. Cleanup authorization is stored as
+`Cause` in the existing journal; this safety change does not add a schema step.
+
+An older build ignores `Cause` when reading that journal and does not enforce
+this cleanup policy. Finish pending cleanup with the newer build before a
+downgrade. See [tracking and temporary outages](multi-repo.md#tracking-and-temporary-outages).
+
 ## The store schema upgrade
 
 The first daemon start after upgrading from v0.64.10 (store schema v21) or

@@ -29,9 +29,8 @@ const (
 	// checkout but its removal deadline has not expired. Queries fall back to
 	// the family primary while the identity remains recoverable.
 	CheckoutStateRemovalGrace CheckoutState = "removal_grace"
-	// CheckoutStateUnavailable is a legacy persisted value from releases that
-	// retained an inaccessible checkout after grace. Current reconciliation
-	// retires it at the deadline; accepting the value keeps upgrades readable.
+	// CheckoutStateUnavailable retains an intended checkout after serving
+	// layers expire. Its identity and tracking configuration survive recovery.
 	CheckoutStateUnavailable CheckoutState = "checkout_unavailable"
 	// CheckoutStateReconciling means a reconciler is bringing the checkout's
 	// effective mode in line with its desired mode.

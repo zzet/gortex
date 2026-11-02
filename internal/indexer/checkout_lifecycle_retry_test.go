@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
@@ -14,40 +13,42 @@ import (
 	"github.com/zzet/gortex/internal/reconcile"
 )
 
-func TestCheckoutLifecycleReconcileFamilyPersistsExpiredInaccessible(t *testing.T) {
+func TestCheckoutLifecycleReconcileFamilyRetainsExpiredIntendedCheckout(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
 	ctx := context.Background()
-
 	root := f.gitRepo("event-offline")
 	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: root, Name: "event-offline"}, TrackSourceCLI)
 	require.NoError(t, err)
 	require.NoError(t, tracked.CatalogErr)
+	evidence, _, err := f.catalog.GetCheckoutPathEvidence(ctx, tracked.CheckoutID)
+	require.NoError(t, err)
+	proven := evidence.CommonDirVolumeToken != ""
 	require.NoError(t, os.RemoveAll(root))
-
 	graced, err := f.lc.ReconcileFamily(ctx, tracked.FamilyID)
 	require.NoError(t, err)
 	entry := checkoutReportByID(t, graced, tracked.CheckoutID)
-	assert.Equal(t, reconcile.ActionAvailabilityGraceStarted, entry.Action)
-	assert.NotZero(t, entry.RetryAt)
-
+	if proven {
+		require.Equal(t, reconcile.ActionRemovalGraceStarted, entry.Action)
+	} else {
+		require.Equal(t, reconcile.ActionInventoryUnknown, entry.Action)
+	}
 	f.lc.retryMu.Lock()
 	retry, armed := f.lc.familyRetries[tracked.FamilyID]
 	f.lc.retryMu.Unlock()
-	require.True(t, armed, "the grace deadline must not depend on the hourly sweep")
-	assert.Equal(t, entry.RetryAt, retry.deadline)
-
+	require.True(t, armed, "unknown inventories and grace windows both need a retry")
+	require.Greater(t, retry.deadline, f.clock.Now().Unix())
 	f.clock.advance(lifecycleGrace.AvailabilityGrace + time.Second)
 	expired, err := f.lc.ReconcileFamily(ctx, tracked.FamilyID)
 	require.NoError(t, err)
 	entry = checkoutReportByID(t, expired, tracked.CheckoutID)
-	assert.Equal(t, reconcile.ActionPrimaryClosureRetired, entry.Action)
-	// The build the registration started can still hold the corpus, so the
-	// purge may be the cleanup runtime's to finish.
-	require.Eventually(t, func() bool {
-		return f.mi.GetMetadata("event-offline") == nil && !f.lc.RepositoryAdmissionClosed("event-offline")
-	}, 30*time.Second, 10*time.Millisecond, "its corpus is never evicted")
-	assert.NotContains(t, f.configPaths(), root, "event-driven cleanup is persisted")
+	if proven {
+		require.Equal(t, reconcile.ActionPrimaryRetirementRefused, entry.Action)
+	} else {
+		require.Equal(t, reconcile.ActionInventoryUnknown, entry.Action)
+	}
+	require.NotNil(t, f.mi.GetMetadata("event-offline"))
+	require.Contains(t, f.configPaths(), root)
 }
 
 func TestCheckoutLifecycleFamilyRetryTimerFires(t *testing.T) {
