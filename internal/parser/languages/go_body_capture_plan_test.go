@@ -84,7 +84,9 @@ func TestGoBodyCapturePlan_OrderedIndependentBodyParity(t *testing.T) {
 						metricOracle.Meta[key] = value
 					}
 				}
+				legacyMetrics := &graph.Node{Name: owner.Name}
 				root.WithScratch(func() {
+					stampGoBodyMetrics(legacyMetrics, body, src)
 					StampFunctionMetrics(metricOracle, body, "go")
 					StampLoopSignals(metricOracle, body, src, "go")
 					legacyBodyCaptureClosureNodes(owner.ID, owner.StartLine, body, src, "body_plan.go", oracle)
@@ -92,6 +94,9 @@ func TestGoBodyCapturePlan_OrderedIndependentBodyParity(t *testing.T) {
 					params := goParamNamesFromCapture(&parser.CapturedNode{Node: def.ChildByFieldName("parameters")}, src)
 					emitGoDataflow(owner.ID, owner.StartLine, body, params, map[string]string{"pkg": "some/pkg"}, src, "body_plan.go", oracle)
 				})
+				for key := range keys {
+					require.Equal(t, metricOracle.Meta[key], legacyMetrics.Meta[key], "superseded fused metrics retain the independent oracle")
+				}
 				require.Equal(t, metricOracle.Meta, owner.Meta, "all body metrics and surrounding metadata retain old independent walkers")
 				var actualNodes []*graph.Node
 				for _, n := range actual.Nodes {

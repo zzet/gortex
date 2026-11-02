@@ -90,9 +90,10 @@ func collectGoBodyCapturePlan(node *graph.Node, body *sitter.Node, src []byte) *
 			plan.closures = append(plan.closures, collectGoClosureCapturePlan(n, src))
 			return
 		}
-		if kind == "send_statement" {
+		switch kind {
+		case "send_statement":
 			plan.channels = append(plan.channels, n)
-		} else if kind == "unary_expression" {
+		case "unary_expression":
 			if op := n.ChildByFieldName("operator"); op != nil && op.Content(src) == "<-" {
 				plan.channels = append(plan.channels, n)
 			}
