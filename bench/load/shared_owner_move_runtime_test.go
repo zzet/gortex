@@ -168,7 +168,7 @@ func TestSharedMoveFinalContradictionRetainsACKAndOfferedMembers(t *testing.T) {
 	entry := report.Definitions[accounting.Files[0].Shared.DefinitionKey]
 	entry.State, entry.Execution, entry.Background = "contradictory_definition", nil, nil
 	record := editProbeRecord{Ordinal: 7, Outcome: "complete", GraphTerminal: true, Ack: measured(2, "ms"), Move: &refs, MoveAccounting: &accounting}
-	invalidateSharedAccounting(&record, report)
+	invalidateSharedAccounting(&record, report, true)
 	if record.Ordinal != 7 || record.Outcome != "diagnostic_failure" || record.MoveAccounting.A != ack || record.MoveAccounting.State != "unavailable_move_shared_owner" || len(record.MoveAccounting.Files) != 2 || len(record.Errors) == 0 || record.Ack.Value == nil || *record.Ack.Value != 2 || !record.GraphTerminal {
 		t.Fatalf("late owner contradiction dropped offered members/ACK facts or kept accounting credit: %+v", record)
 	}

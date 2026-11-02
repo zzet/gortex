@@ -52,7 +52,7 @@ func TestSharedRuntimeFinalContradictionKeepsEditDenominatorAndACK(t *testing.T)
 				t.Fatal("contradictory frozen definition accepted")
 			}
 		}
-		invalidateSharedAccounting(&record, &report)
+		invalidateSharedAccounting(&record, &report, true)
 		if record.Ordinal != 9 || record.Accounting.A != ack || record.Ack.Value == nil || *record.Ack.Value != 2 || !record.GraphTerminal || record.Accounting.P != nil || record.Accounting.B != nil || len(record.Errors) == 0 || record.Accounting.State != "terminal_unavailable_shared_owner" {
 			t.Fatalf("late contradiction changed edit/ACK facts or retained accounting credit: %+v", record)
 		}

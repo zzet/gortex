@@ -87,7 +87,7 @@ func (r *editProbeRuntime) finishSharedOwners() *editProbeSharedOwnerReport {
 	return &r.sharedReport
 }
 
-func invalidateSharedAccounting(record *editProbeRecord, report *editProbeSharedOwnerReport) {
+func invalidateSharedAccounting(record *editProbeRecord, report *editProbeSharedOwnerReport, required bool) {
 	if record.MoveAccounting != nil {
 		for _, file := range record.MoveAccounting.Files {
 			if file.Shared == nil {
@@ -96,9 +96,11 @@ func invalidateSharedAccounting(record *editProbeRecord, report *editProbeShared
 			if err := report.definitionError(file.Shared); err != nil {
 				record.MoveAccounting.State = "unavailable_move_shared_owner"
 				record.MoveAccounting.Reasons = append(record.MoveAccounting.Reasons, err.Error())
-				record.Errors = append(record.Errors, "move shared owner accounting invalidated: "+err.Error())
-				if record.Outcome == "complete" {
-					record.Outcome = "diagnostic_failure"
+				if required {
+					record.Errors = append(record.Errors, "move shared owner accounting invalidated: "+err.Error())
+					if record.Outcome == "complete" {
+						record.Outcome = "diagnostic_failure"
+					}
 				}
 			}
 		}
@@ -109,9 +111,11 @@ func invalidateSharedAccounting(record *editProbeRecord, report *editProbeShared
 	if err := report.definitionError(record.Accounting.Shared); err != nil {
 		record.Accounting.State = "terminal_unavailable_shared_owner"
 		record.Accounting.Reasons = append(record.Accounting.Reasons, err.Error())
-		record.Errors = append(record.Errors, "shared owner accounting invalidated: "+err.Error())
-		if record.Outcome == "complete" {
-			record.Outcome = "diagnostic_failure"
+		if required {
+			record.Errors = append(record.Errors, "shared owner accounting invalidated: "+err.Error())
+			if record.Outcome == "complete" {
+				record.Outcome = "diagnostic_failure"
+			}
 		}
 	}
 }

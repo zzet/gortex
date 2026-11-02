@@ -1226,7 +1226,7 @@ func (r *editProbeRuntime) finish() error {
 		}
 		record := s.record
 		s.mu.Unlock()
-		invalidateSharedAccounting(&record, r.phase.EditProbe.SharedOwners)
+		invalidateSharedAccounting(&record, r.phase.EditProbe.SharedOwners, r.requireAccounting)
 		record.groupTimes()
 		s.sinkMu.Lock()
 		sinkErr := s.sinkErr
