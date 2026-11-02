@@ -124,10 +124,8 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 			}
 			ctx, err = retainRequestProjection(ctx, entry)
 			if err != nil {
-				if ctx.Err() == nil && errors.Is(err, projectionSuperseded) {
-					markRequestProjectionDeferred(ctx, graphPath, "external_write")
-					continue
-				}
+				// This entry was already selected for checked retirement/carry.
+				// A new owner forbids serving its old facts or falling back.
 				return ctx, err
 			}
 			layers = append(layers, layer)
