@@ -81,7 +81,9 @@ func TestSearchReadbackAcceptanceKeepsFirstSameSessionExactLineWitness(t *testin
 					if err := os.WriteFile(filepath.Join(dir, c.File), []byte(strings.Replace(string(data), match, replacement, 1)), 0o600); err != nil {
 						t.Error(err)
 					}
-					return stubContent(map[string]any{"mutation_receipt": "owned-rename"}), nil
+					ack := searchACKFixture()
+					ack["mutation_receipt"] = "owned-rename"
+					return stubContent(ack), nil
 				}
 				if name == "change" {
 					return stubContent(map[string]any{"graph_status_terminal": true, "graph_status": "fresh", "mutation_id": step.MutationID}), nil
@@ -129,6 +131,9 @@ func TestSearchReadbackAcceptanceKeepsFirstSameSessionExactLineWitness(t *testin
 			state.record.ActivatedNS = &zero
 			run.doEdit(ctx, step)
 			state.finishRaw()
+			if !searchReadbackObjectACK(state.record.SearchACK) {
+				t.Fatalf("actual local/object metadata was not retained from the edit ACK: %v", state.record.SearchACK)
+			}
 			mu.Lock()
 			calls := append([]string(nil), editorCalls...)
 			searchCount := searches

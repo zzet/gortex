@@ -33,6 +33,7 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
+	SearchACK                map[string]any            `json:"search_ack,omitempty"`
 	AdmittedTargetLines      *int                      `json:"admitted_target_lines,omitempty"`
 	MutationTiers            *editProbeLiveTiers       `json:"mutation_tiers,omitempty"`
 	GateReadback             *Metric                   `json:"t_gate_readback_ms,omitempty"`
@@ -898,6 +899,16 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		move = &refs
 	}
 	s.mu.Lock()
+	if r.plan.SearchReadbackAcceptance {
+		// Retain only this response's owned metadata; do not encode, hash or
+		// perform another read before the first semantic search witness.
+		s.record.SearchACK = make(map[string]any, 5)
+		for _, key := range []string{"ack_mode", "content_sha256", "readback_exact", "file_view", "graph_status_hint"} {
+			if value, present := body[key]; present {
+				s.record.SearchACK[key] = value
+			}
+		}
+	}
 	s.record.Receipt = receipt
 	if batch != nil {
 		s.record.Batch = batch

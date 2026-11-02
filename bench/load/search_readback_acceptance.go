@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -18,13 +19,16 @@ type searchReadbackCounts struct {
 }
 
 type searchReadbackAcceptance struct {
-	Offered       int                             `json:"offered"`
-	Editors       int                             `json:"editors"`
-	Acknowledged  int                             `json:"acknowledged"`
-	Records       int                             `json:"records"`
-	Pass          bool                            `json:"pass"`
-	Witnesses     map[string]searchReadbackCounts `json:"immediate_witnesses"`
-	EditsByEditor map[int]int                     `json:"actual_edits_by_editor"`
+	LocalObjectACKs int                             `json:"local_object_acks"`
+	ACKModes        map[string]int                  `json:"actual_ack_modes"`
+	FileViewStates  map[string]int                  `json:"actual_file_view_states"`
+	Offered         int                             `json:"offered"`
+	Editors         int                             `json:"editors"`
+	Acknowledged    int                             `json:"acknowledged"`
+	Records         int                             `json:"records"`
+	Pass            bool                            `json:"pass"`
+	Witnesses       map[string]searchReadbackCounts `json:"immediate_witnesses"`
+	EditsByEditor   map[int]int                     `json:"actual_edits_by_editor"`
 }
 
 // Only the retained first editor-session responses contribute. Polling's
@@ -33,7 +37,7 @@ func summarizeSearchReadbacks(plan editProbePlan, records []editProbeRecord) *se
 	if !plan.SearchReadbackAcceptance {
 		return nil
 	}
-	out := &searchReadbackAcceptance{Offered: plan.Count, Editors: max(1, plan.Editors), Records: len(records), Witnesses: map[string]searchReadbackCounts{}, EditsByEditor: map[int]int{}}
+	out := &searchReadbackAcceptance{Offered: plan.Count, Editors: max(1, plan.Editors), Records: len(records), Witnesses: map[string]searchReadbackCounts{}, EditsByEditor: map[int]int{}, ACKModes: map[string]int{}, FileViewStates: map[string]int{}}
 	for _, kind := range []string{"search_visible", "text", "old_search_absent", "old_text_absent"} {
 		out.Witnesses[kind] = searchReadbackCounts{Missing: plan.Count}
 	}
@@ -50,6 +54,14 @@ func summarizeSearchReadbacks(plan editProbePlan, records []editProbeRecord) *se
 			valid = false
 		}
 		out.EditsByEditor[record.Editor]++
+		mode, _ := record.SearchACK["ack_mode"].(string)
+		out.ACKModes[mode]++
+		view, _ := record.SearchACK["file_view"].(map[string]any)
+		state, _ := view["state"].(string)
+		out.FileViewStates[state]++
+		if searchReadbackObjectACK(record.SearchACK) {
+			out.LocalObjectACKs++
+		}
 		if record.Ack.Value != nil && !math.IsNaN(*record.Ack.Value) && !math.IsInf(*record.Ack.Value, 0) && *record.Ack.Value >= 0 {
 			out.Acknowledged++
 		}
@@ -81,7 +93,7 @@ func summarizeSearchReadbacks(plan editProbePlan, records []editProbeRecord) *se
 	for _, count := range out.Witnesses {
 		valid = valid && count.Observed == plan.Count && count.Correct == plan.Count && count.Errors == 0 && count.Refusals == 0 && count.Missing == 0
 	}
-	out.Pass = valid && len(out.EditsByEditor) == out.Editors && out.Acknowledged == plan.Count && (out.Editors == 1 || out.Editors == 4 || out.Editors == 8)
+	out.Pass = valid && len(out.EditsByEditor) == out.Editors && out.Acknowledged == plan.Count && out.LocalObjectACKs == plan.Count && (out.Editors == 1 || out.Editors == 4 || out.Editors == 8)
 	return out
 }
 
@@ -133,7 +145,10 @@ func searchReadbackRequest(kind string, repo privateRepo, step editProbeStep) re
 		// locate the file and accidentally satisfy the pending-write probe.
 		query = "func " + step.Marker + "("
 	}
-	options := map[string]any{"limit": 10000, "max_bytes": 0, "path": c.File, "repo": repo.Prefix}
+	options := map[string]any{"limit": 10000, "max_bytes": 0, "repo": repo.Prefix}
+	if kind == "old_search_absent" || kind == "old_text_absent" {
+		options["path"] = c.File
+	}
 	if operation == "symbols" {
 		options["query_class"], options["expand"], options["max_per_file"] = "symbol", "off", 0
 	}
@@ -200,4 +215,73 @@ func exactSearchReadback(kind string, body map[string]any, repo privateRepo, ste
 		}
 	}
 	return false
+}
+
+// This is wire-shape evidence, not an assertion of current graph freshness.
+// A newer physical mutation can legitimately make this ACK's view historical;
+// retain its explicit unavailable/null fields while testing content separately.
+func searchReadbackObjectACK(ack map[string]any) bool {
+	if ack["ack_mode"] != "local" {
+		return false
+	}
+	hash, _ := ack["content_sha256"].(string)
+	decoded, err := hex.DecodeString(hash)
+	if err != nil || len(decoded) != 32 {
+		return false
+	}
+	if hint, _ := ack["graph_status_hint"].(string); hint == "" {
+		return false
+	}
+	if _, ok := ack["readback_exact"].(bool); !ok {
+		return false
+	}
+	view, ok := ack["file_view"].(map[string]any)
+	if !ok {
+		return false
+	}
+	state, _ := view["state"].(string)
+	if state != "projected" && state != "unavailable" {
+		return false
+	}
+	if state == "unavailable" {
+		if reason, _ := view["reason"].(string); reason == "" {
+			return false
+		}
+	}
+	if delta, _ := view["delta_state"].(string); delta == "" {
+		return false
+	}
+	counts, present := view["counts"]
+	if !present {
+		return false
+	}
+	if counts != nil {
+		if _, ok := counts.(map[string]any); !ok {
+			return false
+		}
+	}
+	symbols, present := view["symbols"]
+	if !present {
+		return false
+	}
+	if symbols != nil {
+		if _, ok := symbols.([]any); !ok {
+			return false
+		}
+	}
+	if _, ok := view["truncated"].(bool); !ok {
+		return false
+	}
+	syntax, ok := view["syntax_health"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if state, _ := syntax["state"].(string); state == "" {
+		return false
+	}
+	if _, ok := syntax["checked"].(bool); !ok {
+		return false
+	}
+	_, present = syntax["errors"]
+	return present
 }

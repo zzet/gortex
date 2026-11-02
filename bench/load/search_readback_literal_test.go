@@ -19,6 +19,12 @@ func TestSearchReadbackLiteralExistsOnlyAfterOfferedRename(t *testing.T) {
 	repo := privateRepo{Prefix: "owned", Corpus: corpus}
 	for _, index := range []int{0, 499, 999} {
 		step := plan.Steps[index]
+		for _, kind := range []string{"text", "search_visible"} {
+			options, _ := searchReadbackRequest(kind, repo, step).Arguments["options"].(map[string]any)
+			if _, scoped := options["path"]; scoped {
+				t.Fatalf("%s positive probe preselected its file and can bypass the native search cache", kind)
+			}
+		}
 		query, _ := searchReadbackRequest("text", repo, step).Arguments["query"].(string)
 		replacement, _ := step.Request.Arguments["replacement"].(string)
 		novelTrigram := false

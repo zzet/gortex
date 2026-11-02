@@ -22,7 +22,7 @@ func TestProjectionSearchChargesImmutableNameCacheToExistingCap(t *testing.T) {
 	previous := pendingFileProjections
 	pendingFileProjections = newPendingProjections()
 	t.Cleanup(func() { pendingFileProjections = previous })
-	server, root := setupTestServer(t)
+	server, root := ackModeServer(t, "local")
 	searchProjectedAck(t, server, root, "ChargedNames")
 	entry := liveEntry(pendingFileProjections, filepath.Join(root, "main.go"))
 	require.NotNil(t, entry)
@@ -56,7 +56,7 @@ func TestProjectionSearchUsesNativeBackendRankRatherThanSubstringFallback(t *tes
 	require.NotEmpty(t, backend.Search("helper", 10), "fixture must exercise actual SQLite native symbol search")
 	engine := query.NewEngine(store)
 	engine.SetSearch(backend)
-	server := NewServer(engine, store, idx, nil, zap.NewNop(), nil)
+	server := NewServer(engine, store, idx, nil, zap.NewNop(), nil, MultiRepoOptions{EditAckMode: config.EditAckLocal})
 	searchProjectedAck(t, server, root, "NativeACKOnly")
 	result := callTool(t, server, "search_symbols", map[string]any{"query": "NativeACKOnly", "query_class": "symbol", "expand": "off", "limit": 1, "max_bytes": 0})
 	require.False(t, result.IsError)
@@ -80,7 +80,7 @@ func TestProjectionSearchCapturedVersionsKeepCandidatesAndRowsTogether(t *testin
 	previous := pendingFileProjections
 	pendingFileProjections = newPendingProjections()
 	t.Cleanup(func() { pendingFileProjections = previous })
-	server, root := setupTestServer(t)
+	server, root := ackModeServer(t, "local")
 	searchProjectedAck(t, server, root, "PinnedACKOne")
 	first, err := server.bindPendingSearch(t.Context())
 	require.NoError(t, err)
@@ -110,12 +110,12 @@ func TestProjectionSearchEmptyAndForeignOnlyRegistriesPreserveBaseEngine(t *test
 	previous := pendingFileProjections
 	pendingFileProjections = newPendingProjections()
 	t.Cleanup(func() { pendingFileProjections = previous })
-	selected, _ := setupTestServer(t)
+	selected, _ := ackModeServer(t, "local")
 	ctx := t.Context()
 	bound, err := selected.bindPendingSearch(ctx)
 	require.NoError(t, err)
 	require.Same(t, selected.engine, selected.engineFor(bound))
-	sibling, root := setupTestServer(t)
+	sibling, root := ackModeServer(t, "local")
 	searchProjectedAck(t, sibling, root, "ForeignOnly")
 	bound, err = selected.bindPendingSearch(ctx)
 	require.NoError(t, err)
@@ -126,7 +126,7 @@ func TestProjectionSearchEditorRemainsAbovePendingDisk(t *testing.T) {
 	previous := pendingFileProjections
 	pendingFileProjections = newPendingProjections()
 	t.Cleanup(func() { pendingFileProjections = previous })
-	server, root := setupTestServer(t)
+	server, root := ackModeServer(t, "local")
 	searchProjectedAck(t, server, root, "DiskOnly")
 	buffer := graph.NewOverlayLayer()
 	buffer.MarkFile("main.go", false)
@@ -145,7 +145,7 @@ func TestProjectionSearchExactAndPrefixSurviveHighBaseScoreAndLimitOne(t *testin
 	previous := pendingFileProjections
 	pendingFileProjections = newPendingProjections()
 	t.Cleanup(func() { pendingFileProjections = previous })
-	server, root := setupTestServer(t)
+	server, root := ackModeServer(t, "local")
 	searchProjectedAck(t, server, root, "ACKSearchRanked")
 	base := &graph.Node{ID: "aaa.go::Unrelated", Name: "Unrelated", Kind: graph.KindFunction, FilePath: "aaa.go", StartLine: 1}
 	server.graph.AddNode(base)
@@ -163,7 +163,7 @@ func TestProjectionSearchMasksOldDeclarationWhileBaseRemainsPending(t *testing.T
 	previous := pendingFileProjections
 	pendingFileProjections = newPendingProjections()
 	t.Cleanup(func() { pendingFileProjections = previous })
-	server, root := setupTestServer(t)
+	server, root := ackModeServer(t, "local")
 	searchProjectedAck(t, server, root, "BeforeRename")
 	result := callTool(t, server, "edit_file", map[string]any{"path": filepath.Join(root, "main.go"), "old_string": "func helper() {}", "new_string": "func AfterRename() {}", "format": "json"})
 	require.False(t, result.IsError)

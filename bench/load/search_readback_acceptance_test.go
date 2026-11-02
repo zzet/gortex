@@ -76,27 +76,7 @@ func TestSearchReadbackAcceptanceRefusesUnselectedPopulations(t *testing.T) {
 }
 
 func TestSearchReadbackAcceptanceNeverCreditsLaterPollingOrMissingWitnesses(t *testing.T) {
-	fixture := func() (editProbePlan, []editProbeRecord) {
-		o, err := parseRun(append(searchAcceptanceArgs(4, 1000), "--search-readback-acceptance"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		c := editProbeRenameCorpus(t, "go", 1000)
-		c.EditTool = "edit.file"
-		plan, err := planEditProbe(c, o)
-		if err != nil {
-			t.Fatal(err)
-		}
-		records := make([]editProbeRecord, len(plan.Steps))
-		for i, step := range plan.Steps {
-			records[i] = newEditProbeRecord(c, step)
-			records[i].Ack = measured(1, "ms")
-			for _, kind := range []string{"search_visible", "text", "old_search_absent", "old_text_absent"} {
-				records[i].Readbacks = append(records[i].Readbacks, editProbeReadback{Kind: kind, Correct: true, Latency: measured(1, "ms"), ExpectedLine: step.ExpectedSearchLine, ExpectedPath: "fixture/" + c.File, ExpectedID: "fixture/" + c.File + "::" + step.Marker})
-			}
-		}
-		return plan, records
-	}
+	fixture := func() (editProbePlan, []editProbeRecord) { return completeSearchReadbackCensus(t) }
 	plan, records := fixture()
 	if got := summarizeSearchReadbacks(plan, records); !got.Pass || got.Witnesses["search_visible"].Correct != 1000 || len(got.EditsByEditor) != 4 {
 		t.Fatalf("complete immediate census refused: %+v", got)
@@ -130,4 +110,28 @@ func TestSearchReadbackAcceptanceNeverCreditsLaterPollingOrMissingWitnesses(t *t
 			}
 		})
 	}
+}
+
+func completeSearchReadbackCensus(t *testing.T) (editProbePlan, []editProbeRecord) {
+	t.Helper()
+	o, err := parseRun(append(searchAcceptanceArgs(4, 1000), "--search-readback-acceptance"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := editProbeRenameCorpus(t, "go", 1000)
+	c.EditTool = "edit.file"
+	plan, err := planEditProbe(c, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := make([]editProbeRecord, len(plan.Steps))
+	for i, step := range plan.Steps {
+		records[i] = newEditProbeRecord(c, step)
+		records[i].Ack = measured(1, "ms")
+		for _, kind := range []string{"search_visible", "text", "old_search_absent", "old_text_absent"} {
+			records[i].Readbacks = append(records[i].Readbacks, editProbeReadback{Kind: kind, Correct: true, Latency: measured(1, "ms"), ExpectedLine: step.ExpectedSearchLine, ExpectedPath: "fixture/" + c.File, ExpectedID: "fixture/" + c.File + "::" + step.Marker})
+		}
+		addSearchACKFixture(t, &records[i], searchACKFixture())
+	}
+	return plan, records
 }
