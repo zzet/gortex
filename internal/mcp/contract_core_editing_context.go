@@ -54,6 +54,9 @@ func fileEditingContextContext(ctx context.Context, reader graph.Reader, path st
 		return nil
 	})
 	if err != nil {
+		if deadlineErr := ctx.Err(); deadlineErr != nil {
+			return nil, deadlineErr
+		}
 		return nil, err
 	}
 	return result, nil
@@ -115,4 +118,40 @@ func (r *editingContextCoreRows) GetOutEdgesByNodeIDs(ids []string) map[string][
 }
 func (r *editingContextCoreRows) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
 	return r.filterBatch(r.FileEditingContextRows.GetInEdgesByNodeIDs(ids))
+}
+
+// requestLocalEditingContext borrows only the request's already captured
+// in-memory file layer. It never refetches the selected store, parses bytes,
+// or turns unavailable cross-file relations into an apparently complete set.
+func requestLocalEditingContext(ctx context.Context, path string) *graph.FileEditingContextResult {
+	var selected *graph.OverlayLayer
+	for _, candidate := range requestProjectionLayers(ctx) {
+		if layer, ok := candidate.(*graph.OverlayLayer); ok && layer.HasFile(path) {
+			selected = layer
+		}
+	}
+	if editor := OverlayViewFromContext(ctx); editor != nil {
+		if layer := editor.Layer(); layer != nil && layer.HasFile(path) {
+			selected = layer
+		}
+	}
+	result := &graph.FileEditingContextResult{}
+	if selected == nil {
+		return result
+	}
+	for _, node := range selected.FileNodes(path) {
+		if node.Kind == graph.KindFile {
+			result.FileNode = node
+		} else {
+			result.Defines = append(result.Defines, node)
+		}
+	}
+	if result.FileNode != nil {
+		for _, edge := range selected.OutEdges(result.FileNode.ID) {
+			if edge != nil && edge.Kind == graph.EdgeImports {
+				result.Imports = append(result.Imports, edge)
+			}
+		}
+	}
+	return result
 }
