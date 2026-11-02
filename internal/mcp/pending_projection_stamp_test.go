@@ -55,6 +55,9 @@ func TestDiskStampPreservesLeafType(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, info.Mode().Type(), stamp.info.Mode().Type())
 	}
+	missing, err := statDiskStamp(filepath.Join(dir, "absent.go"))
+	require.NoError(t, err)
+	require.Nil(t, missing.info)
 	link := filepath.Join(dir, "symlink.go")
 	if err := os.Symlink(path, link); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
@@ -62,7 +65,4 @@ func TestDiskStampPreservesLeafType(t *testing.T) {
 	stamp, err := statDiskStamp(link)
 	require.NoError(t, err)
 	require.NotZero(t, stamp.info.Mode()&os.ModeSymlink, "a disk stamp must not follow the leaf")
-	missing, err := statDiskStamp(filepath.Join(dir, "absent.go"))
-	require.NoError(t, err)
-	require.Nil(t, missing.info)
 }

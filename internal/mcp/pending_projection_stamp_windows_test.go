@@ -22,7 +22,7 @@ func TestDiskStampFailsClosedWhenWindowsIdentityCannotBeLoaded(t *testing.T) {
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
 	require.NoError(t, err)
-	defer windows.CloseHandle(handle)
+	defer func() { require.NoError(t, windows.CloseHandle(handle)) }()
 	_, err = os.Lstat(path)
 	require.NoError(t, err)
 	stamp, err := statDiskStamp(path)
