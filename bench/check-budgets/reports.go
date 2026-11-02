@@ -13,14 +13,15 @@ import (
 )
 
 type inputs struct {
-	Version           int               `json:"schema_version"`
-	CandidateRevision string            `json:"candidate_revision"`
-	MainRevision      string            `json:"main_revision"`
-	TagRevision       string            `json:"tag_revision"`
-	Repeats           int               `json:"repeats"`
-	ScenarioRepeats   map[string]int    `json:"scenario_repeats"`
-	Hosts             map[string]string `json:"hosts"` // reviewed host class -> exact observed machine
-	Runs              []runInput        `json:"runs"`
+	NightlySeed       *nightlyWorkloadSeed `json:"nightly_workload_seed,omitempty"`
+	Version           int                  `json:"schema_version"`
+	CandidateRevision string               `json:"candidate_revision"`
+	MainRevision      string               `json:"main_revision"`
+	TagRevision       string               `json:"tag_revision"`
+	Repeats           int                  `json:"repeats"`
+	ScenarioRepeats   map[string]int       `json:"scenario_repeats"`
+	Hosts             map[string]string    `json:"hosts"` // reviewed host class -> exact observed machine
+	Runs              []runInput           `json:"runs"`
 }
 
 type runInput struct {
@@ -53,11 +54,13 @@ type toolResult struct {
 }
 
 type attempt struct {
-	Tool      string   `json:"tool"`
-	Role      string   `json:"role"`
-	Outcome   string   `json:"outcome"`
-	Code      *int     `json:"code"`
-	LogicalMS *float64 `json:"logical_ms"`
+	NightlySeed    string   `json:"nightly_workload_seed,omitempty"`
+	NightlyDelayNS int64    `json:"nightly_delay_ns,omitempty"`
+	Tool           string   `json:"tool"`
+	Role           string   `json:"role"`
+	Outcome        string   `json:"outcome"`
+	Code           *int     `json:"code"`
+	LogicalMS      *float64 `json:"logical_ms"`
 }
 
 type phase struct {
@@ -76,16 +79,17 @@ type phase struct {
 }
 
 type report struct {
-	Started  time.Time       `json:"started"`
-	Binary   string          `json:"binary"`
-	Version  int             `json:"schema_version"`
-	RunID    string          `json:"run_id"`
-	Revision string          `json:"git_sha"`
-	Profile  string          `json:"profile"`
-	Plan     string          `json:"request_plan_sha256"`
-	Seed     int64           `json:"seed"`
-	Workload json.RawMessage `json:"workload"`
-	Host     struct {
+	NightlySeed string          `json:"nightly_workload_seed,omitempty"`
+	Started     time.Time       `json:"started"`
+	Binary      string          `json:"binary"`
+	Version     int             `json:"schema_version"`
+	RunID       string          `json:"run_id"`
+	Revision    string          `json:"git_sha"`
+	Profile     string          `json:"profile"`
+	Plan        string          `json:"request_plan_sha256"`
+	Seed        int64           `json:"seed"`
+	Workload    json.RawMessage `json:"workload"`
+	Host        struct {
 		Machine   string            `json:"machine"`
 		OS        string            `json:"os"`
 		Arch      string            `json:"arch"`
@@ -202,6 +206,9 @@ func (c inputs) repeats(scenario string) int {
 }
 
 func validateReport(c inputs, input runInput, r report) error {
+	if err := validateNightlySeedReport(c, input, r); err != nil {
+		return err
+	}
 	want := map[string]string{"candidate": c.CandidateRevision, "main": c.MainRevision, "tag": c.TagRevision}[input.Role]
 	if r.Version != 1 || !r.Complete || r.RunID == "" || r.Revision != want || r.Profile != "agent" || !planPattern.MatchString(r.Plan) || len(r.Errors) != 0 || len(r.Phases) != 1 {
 		return errors.New("need complete standalone report-v1 with pinned identity and agent profile; paired/saturation evidence is not capacity evidence")

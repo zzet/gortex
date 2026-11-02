@@ -41,7 +41,7 @@ type laneBuild struct {
 }
 
 type laneConfig struct {
-	NightlySeed *nightlyWorkloadSeed `json:"nightly_workload_seed,omitempty"`
+	NightlySeed       *nightlyWorkloadSeed `json:"nightly_workload_seed,omitempty"`
 	EditGateSeed      string               `json:"edit_gate_seed,omitempty"`
 	Version           int                  `json:"schema_version"`
 	Lane              string               `json:"lane"`
@@ -76,14 +76,14 @@ type laneTask struct {
 }
 
 type lanePlan struct {
-	NightlySeed *nightlyWorkloadSeed `json:"nightly_workload_seed,omitempty"`
-	Lane          string     `json:"lane"`
-	Execution     string     `json:"execution,omitempty"`
-	HostClass     string     `json:"host_class"`
-	Tasks         []laneTask `json:"tasks"`
-	Prerequisites []string   `json:"unavailable_prerequisites"`
-	Ready         bool       `json:"ready"`
-	PolicySHA256  string     `json:"policy_sha256"`
+	NightlySeed   *nightlyWorkloadSeed `json:"nightly_workload_seed,omitempty"`
+	Lane          string               `json:"lane"`
+	Execution     string               `json:"execution,omitempty"`
+	HostClass     string               `json:"host_class"`
+	Tasks         []laneTask           `json:"tasks"`
+	Prerequisites []string             `json:"unavailable_prerequisites"`
+	Ready         bool                 `json:"ready"`
+	PolicySHA256  string               `json:"policy_sha256"`
 }
 
 type taskReceipt struct {
@@ -202,9 +202,7 @@ func makeLanePlan(p policy, c laneConfig) (lanePlan, error) {
 	scenarios := map[string]int{}
 	needsTag := map[string]bool{}
 	gaps := map[string]bool{}
-	if c.NightlySeed != nil {
-		gaps["nightly workload seed requires the coordinated load request-delay implementation and actual raw fault provenance"] = true
-	}
+
 	for _, b := range p.Budgets {
 		if b.HostClass != c.HostClass || !slices.Contains(b.Lane, c.Lane) {
 			continue
@@ -527,7 +525,7 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 		}
 		receipt.Smoke = &proof
 	}
-	index := inputs{Version: 1, CandidateRevision: c.Builds["candidate"].Revision, MainRevision: c.Builds["main"].Revision, TagRevision: shippedRevision, Repeats: c.Repeats, ScenarioRepeats: map[string]int{}, Hosts: map[string]string{c.HostClass: c.Machine}, Runs: []runInput{}}
+	index := inputs{NightlySeed: c.NightlySeed, Version: 1, CandidateRevision: c.Builds["candidate"].Revision, MainRevision: c.Builds["main"].Revision, TagRevision: shippedRevision, Repeats: c.Repeats, ScenarioRepeats: map[string]int{}, Hosts: map[string]string{c.HostClass: c.Machine}, Runs: []runInput{}}
 	var failures []error
 	// Release wall time includes all startup, teardown and budget checking, not
 	// just offered load. Reserve three minutes for the harness's independent

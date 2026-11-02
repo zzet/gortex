@@ -14,6 +14,9 @@ import (
 )
 
 func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corpus, group, outputRoot string) (phase Phase, sweep []SweepEntry, artifacts map[string]string, crashes map[string]int, version string, resultErr error) {
+	if o.NightlySeed != "" {
+		ctx = context.WithValue(ctx, nightlySeedKey{}, o.NightlySeed)
+	}
 	seedEnv, err := editGateSeedEnvironment(o)
 	if err != nil {
 		return phase, nil, nil, nil, "", err

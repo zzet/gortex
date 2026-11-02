@@ -98,6 +98,9 @@ func loadNightlyHistory(index string, p policy) ([]nightlyEvidence, error) {
 			if dataset.config.CandidateRevision != r.Workflow.Revision {
 				return nil, errors.New("nightly workflow and raw evidence revisions differ")
 			}
+			if dataset.config.NightlySeed != nil {
+				return nil, errors.New("seeded raw evidence cannot supply GREEN nightly history")
+			}
 			rows, err := check(p, dataset, "nightly")
 			if err != nil {
 				return nil, err
