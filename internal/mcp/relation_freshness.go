@@ -27,11 +27,14 @@ const maxLabelledPendingFiles = 16
 // relationFreshness labels an answer read from graph relations while edits in
 // its scope are still being published. The zero value is a fresh scope.
 type relationFreshness struct {
-	projected bool // current request served an exact file-local projection
-	scope     string
-	state     string   // Empty is fresh internally; explicit responses may render fresh or unknown.
-	files     []string // graph-keyed paths of the lagging in-scope edits, sorted
-	waited    time.Duration
+	backgroundMissing bool   // this request could not obtain background admission
+	projected         bool   // current request served an exact file-local projection
+	storeBusy         bool   // selected store sections were unavailable
+	fileReason        string // an observed reason the request deferred a file projection
+	scope             string
+	state             string   // Empty is fresh internally; explicit responses may render fresh or unknown.
+	files             []string // graph-keyed paths of the lagging in-scope edits, sorted
+	waited            time.Duration
 }
 
 // relationWaitDeadline is when a change tool stops waiting for its relation

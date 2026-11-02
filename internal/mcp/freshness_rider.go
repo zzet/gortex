@@ -588,7 +588,9 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 	if len(snapshots) > 0 {
 		snapshot, _ = ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot)
 	}
-	gapCount := len(paths) + len(receipts) + len(snapshot.paths) + len(projectedFiles)
+	deferredFiles := requestDeferredProjectionFiles(ctx)
+	storeBusyFiles := requestStoreBusyFiles(ctx)
+	gapCount := len(paths) + len(receipts) + len(snapshot.paths) + len(projectedFiles) + len(deferredFiles) + len(storeBusyFiles)
 	if len(snapshots) > 0 {
 		gapCount += len(snapshots[0])
 	}
@@ -626,6 +628,41 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 	// request's observed gap conservative instead of certifying graph freshness.
 	for _, file := range projectedFiles {
 		put(file, "pending", 0)
+	}
+	for file, reason := range deferredFiles {
+		if reason == "watcher_unavailable" {
+			if len(ids)+len(files) > 0 && !inScope(file) {
+				continue
+			}
+			if len(ids)+len(files) == 0 {
+				if prefix := baseNarrowedRepoPrefix(requestViewFromContext(ctx)); prefix != "" && !strings.HasPrefix(s.repoRelative(file), prefix+"/") {
+					continue
+				}
+			}
+			label.backgroundMissing = true
+			put(file, "pending", 0)
+			continue
+		}
+		put(file, "pending", 0)
+		if _, included := states[s.repoRelative(file)]; included {
+			label.fileReason = reason
+		}
+	}
+	for _, file := range storeBusyFiles {
+		if len(ids)+len(files) > 0 && !inScope(file) {
+			continue
+		}
+		if len(ids)+len(files) == 0 {
+			if prefix := baseNarrowedRepoPrefix(requestViewFromContext(ctx)); prefix != "" && !strings.HasPrefix(s.repoRelative(file), prefix+"/") {
+				continue
+			}
+		}
+		key := s.repoRelative(file)
+		prior := states[key]
+		if prior.state != "failed" {
+			states[key] = pathState{"pending", prior.generation}
+		}
+		label.storeBusy = true
 	}
 	putTiers := func(path string, tiers indexer.MutationTierState) {
 		at := tiers.RelationsAt
@@ -1079,6 +1116,10 @@ func (s *Server) awaitWatchedFreshness(ctx context.Context, name string, req mcp
 }
 
 func (f relationFreshness) apply(result map[string]any) {
+	if f.backgroundMissing {
+		result["background_admission"] = "unavailable"
+		result["background_state"] = "pending"
+	}
 	if f.projected {
 		result["file_view"] = "projected"
 		result["readback_exact"] = true
@@ -1090,6 +1131,12 @@ func (f relationFreshness) apply(result map[string]any) {
 		result["complete"] = false
 	}
 	result["graph_freshness"] = f.state
+	if f.state == "pending" && f.fileReason != "" {
+		result["file_reason"] = f.fileReason
+	}
+	if f.state == "pending" && f.storeBusy {
+		result["reason"] = "store_busy"
+	}
 	scope := f.scope
 	if scope == "" {
 		scope = "relations"

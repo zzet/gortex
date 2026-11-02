@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"sync"
 	"time"
@@ -11,7 +12,9 @@ import (
 	"github.com/zeebo/blake3"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/indexer/source"
+	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
@@ -26,7 +29,7 @@ func requestProjectionLayers(ctx context.Context) []graph.OverlayLayerReader {
 	return layers
 }
 
-// ensureProjected reads current tracked bytes without publishing graph/store
+// ensureProjected reads current admitted bytes without publishing graph/store
 // state. Failure is explicit: an old graph must never masquerade as a current
 // answer after the checked file could not be projected.
 func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.Context, error) {
@@ -37,12 +40,20 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 	if err := validateRequestProjections(ctx); err != nil {
 		return ctx, err
 	}
-	buildCtx, cancel := context.WithTimeout(ctx, projectedReadBudget)
+	deadline := time.Now().Add(projectedReadBudget)
+	if original, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && original.Before(deadline) {
+		deadline = original
+	}
+	buildCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	layers := append([]graph.OverlayLayerReader(nil), requestProjectionLayers(ctx)...)
 	for _, graphPath := range paths {
 		if err := buildCtx.Err(); err != nil {
-			return ctx, err
+			if ctx.Err() != nil {
+				return ctx, ctx.Err()
+			}
+			markRequestProjectionDeferred(ctx, graphPath, "external_write")
+			continue
 		}
 		if editor := OverlayViewFromContext(ctx); editor != nil && editor.LayerReader() != nil && editor.LayerReader().HasFile(graphPath) {
 			// This pinned buffer completely owns the file. Disk contributes
@@ -66,15 +77,23 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 			continue
 		}
 		idx, rel := s.indexerForRel(graphPath)
-		if idx == nil || !idx.IsTracked(rel) {
-			continue // untracked-file tools retain their raw-source guidance
+		if idx == nil {
+			continue
 		}
 		abs, err := s.resolveGraphPath(ctx, graphPath)
 		if err != nil {
 			return ctx, err
 		}
+		if watcher, ok := s.currentWatcher().(interface{ StormActiveForFile(string) bool }); ok && watcher.StormActiveForFile(abs) {
+			markRequestProjectionStorm(ctx, graphPath)
+			continue
+		}
 		entry, err := s.projectCurrentTrackedFile(buildCtx, ctx, abs, graphPath, rel)
 		if err != nil {
+			if projectionBudgetUnavailable(ctx, err) || ctx.Err() == nil && (errors.Is(err, errProjectionExternalWrite) || errors.Is(err, projectionSuperseded)) {
+				markRequestProjectionDeferred(ctx, graphPath, "external_write")
+				continue
+			}
 			return ctx, fmt.Errorf("file graph pending for %s: %w", graphPath, err)
 		}
 		if entry != nil {
@@ -82,7 +101,11 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 				continue
 			}
 			if err := buildCtx.Err(); err != nil {
-				return ctx, err
+				if ctx.Err() != nil {
+					return ctx, ctx.Err()
+				}
+				markRequestProjectionDeferred(ctx, graphPath, "external_write")
+				continue
 			}
 			layer, err := projectedFileVisibility(buildCtx, s.requestSelectedBaseReader(ctx), entry)
 			if err != nil {
@@ -93,10 +116,18 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 				layer = entry.layer
 			}
 			if err := buildCtx.Err(); err != nil {
-				return ctx, err
+				if ctx.Err() != nil {
+					return ctx, ctx.Err()
+				}
+				markRequestProjectionDeferred(ctx, graphPath, "external_write")
+				continue
 			}
 			ctx, err = retainRequestProjection(ctx, entry)
 			if err != nil {
+				if ctx.Err() == nil && errors.Is(err, projectionSuperseded) {
+					markRequestProjectionDeferred(ctx, graphPath, "external_write")
+					continue
+				}
 				return ctx, err
 			}
 			layers = append(layers, layer)
@@ -117,15 +148,48 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 	return ctx, nil
 }
 
+// Only the private projection budget may degrade into a qualified graph
+// answer. Caller cancellation, identity/parse failures and unsupported sources
+// retain their refusals; no old graph gains exactness or completed-work credit.
+func projectionBudgetUnavailable(caller context.Context, err error) bool {
+	return caller.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, indexer.ErrProjectionDeadline) || errors.Is(err, indexer.ErrProjectionNoSlot))
+}
+
+// Both projection and source slicing use this same selected-root boundary.
+func selectedProjectionReadPath(ctx context.Context, root, prefix, abs string) (string, string, string, error) {
+	if selected := requestViewPathRoot(ctx); selected.serves(prefix) {
+		root = selected.root
+	}
+	rel, ok := relativeWithinRoot(root, abs)
+	if !ok {
+		return "", "", "", errors.New("file is outside the selected checkout")
+	}
+	key := pathkey.MutationKey(abs)
+	if !pathguard.WithinRoot(key, pathkey.IdentityKey(pathguard.ResolveRoot(root))) {
+		return "", "", "", errors.New("file parent is outside the selected checkout")
+	}
+	return root, rel, key, nil
+}
+
 func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context, abs, graphPath, rel string) (*projectionEntry, error) {
 	idx, _ := s.indexerForRel(graphPath)
-	key := pathkey.MutationKey(abs)
+	tracked := idx.IsTracked(rel)
+	root, readPath, key, err := selectedProjectionReadPath(requestCtx, idx.RootPath(), idx.RepoPrefix(), abs)
+	if err != nil {
+		return nil, err
+	}
 	expected := pendingFileProjections.snap.Load().entries[key]
 	before, err := statDiskStamp(abs)
 	if err != nil {
 		return nil, err
 	}
 	if before.info == nil {
+		if expected != nil && expected.tombstone && liveProjectionForAcknowledgement(expected) {
+			return expected, nil
+		}
+		if !tracked && expected == nil {
+			return nil, nil
+		}
 		entry := newProjectionTombstone(abs, graphPath, idx.RepoPrefix(), 0)
 		latest, err := statDiskStamp(abs)
 		if err != nil || latest.info != nil || pathkey.MutationKey(abs) != key {
@@ -134,18 +198,25 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 		if err := pendingFileProjections.publishExpected(entry, expected); err != nil {
 			return nil, err
 		}
+		s.admitReadBuiltProjection(requestCtx, root, idx, tracked, entry)
 		return entry, nil
 	}
 	// Reuse the confined, bounded, nonblocking regular-file reader. A FIFO,
 	// symlink or unsupported platform is a refusal, never an unsafe Open.
-	files, err := source.NewFilesystemSource(filepath.Dir(abs))
+	files, err := source.NewFilesystemSource(root)
 	if err != nil {
 		return nil, err
 	}
 	defer files.Close()
-	raw, _, err := files.ReadRegularFile(buildCtx, filepath.Base(abs), 1<<20)
+	raw, _, err := files.ReadRegularFile(buildCtx, filepath.ToSlash(readPath), 1<<20)
 	if err != nil {
 		return nil, err
+	}
+	// The existing buffer admission applies the owning indexer's exclusions,
+	// selected checkout's ignore files, language and content gates to these
+	// already-confined bytes. A new file need not have a watcher inventory row.
+	if !tracked && !idx.AdmitSourceSearchBuffer(buildCtx, root, abs, raw, nil) {
+		return nil, errors.New("file is not admitted source")
 	}
 	after, err := statDiskStamp(abs)
 	if err != nil || !before.matches(after) {
@@ -175,6 +246,9 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	if err != nil {
 		return nil, err
 	}
+	if !tracked && !projection.ParseChecked {
+		return nil, errors.New("untracked source parse health is unavailable")
+	}
 	entry := newProjectionEntry(abs, idx.RepoPrefix(), projection, raw, 0, after)
 	latest, err := statDiskStamp(abs)
 	if err != nil || !after.matches(latest) {
@@ -182,7 +256,7 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	}
 	// Stat identity alone misses equal-size in-place edits with restored mtime,
 	// including a newer version that retired while this extraction was running.
-	current, _, readErr := files.ReadRegularFile(buildCtx, filepath.Base(abs), 1<<20)
+	current, _, readErr := files.ReadRegularFile(buildCtx, filepath.ToSlash(readPath), 1<<20)
 	finalStamp, statErr := statDiskStamp(abs)
 	if readErr != nil || statErr != nil || !latest.matches(finalStamp) || blake3.Sum256(current) != rawHash || pathkey.MutationKey(abs) != key {
 		return nil, errors.Join(readErr, statErr, errProjectionExternalWrite)
@@ -190,6 +264,7 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	if err := pendingFileProjections.publishExpected(entry, expected); err != nil {
 		return nil, err
 	}
+	s.admitReadBuiltProjection(requestCtx, root, idx, tracked, entry)
 	return entry, nil
 }
 
@@ -198,8 +273,10 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 // graph layers retained by each derived context remain immutable snapshots.
 type requestProjectionFactsKey struct{}
 type requestProjectionFacts struct {
-	mu      sync.RWMutex
-	entries map[string]*projectionEntry
+	mu             sync.RWMutex
+	entries        map[string]*projectionEntry
+	deferredFiles  map[string]string   // projection deferral observations, not publication authority
+	storeBusyFiles map[string]struct{} // selected store sections were unavailable
 }
 
 func withRequestProjectionFacts(ctx context.Context) context.Context {
@@ -207,6 +284,62 @@ func withRequestProjectionFacts(ctx context.Context) context.Context {
 		return ctx
 	}
 	return context.WithValue(ctx, requestProjectionFactsKey{}, &requestProjectionFacts{entries: make(map[string]*projectionEntry)})
+}
+
+// A queued storm defers disk projection for this request. Keep its observed
+// pending file in the same request-local facts consumed by the tier producer;
+// detached background work has no storm witness and retains generic labels.
+func markRequestProjectionStorm(ctx context.Context, path string) {
+	markRequestProjectionDeferred(ctx, path, "storm")
+}
+
+func markRequestProjectionDeferred(ctx context.Context, path, reason string) {
+	facts := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	facts.mu.Lock()
+	defer facts.mu.Unlock()
+	if facts.deferredFiles == nil {
+		facts.deferredFiles = make(map[string]string)
+	}
+	facts.deferredFiles[path] = reason
+}
+
+// markRequestStoreBusy records a failed selected-store section in the same
+// request facts consumed by freshnessFor. It does not authorize fallback to a
+// canonical reader or certify any omitted rows. Callers pass a graph-keyed path.
+func markRequestStoreBusy(ctx context.Context, path string) context.Context {
+	ctx = withRequestProjectionFacts(ctx)
+	facts := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	facts.mu.Lock()
+	defer facts.mu.Unlock()
+	if facts.storeBusyFiles == nil {
+		facts.storeBusyFiles = make(map[string]struct{})
+	}
+	facts.storeBusyFiles[path] = struct{}{}
+	return ctx
+}
+
+func requestDeferredProjectionFiles(ctx context.Context) map[string]string {
+	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	if !ok {
+		return nil
+	}
+	facts.mu.RLock()
+	defer facts.mu.RUnlock()
+	return maps.Clone(facts.deferredFiles)
+}
+
+func requestStoreBusyFiles(ctx context.Context) []string {
+	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	if !ok {
+		return nil
+	}
+	facts.mu.RLock()
+	defer facts.mu.RUnlock()
+	var paths []string
+	for path := range facts.storeBusyFiles {
+		paths = append(paths, path)
+	}
+	return paths
 }
 
 // retainRequestProjection shares the existing request-owned freshness facts
@@ -252,7 +385,7 @@ func validateRequestProjections(ctx context.Context) error {
 
 func withProjectedReadToolFacts(ctx context.Context, name string) context.Context {
 	switch name {
-	case "get_symbol", "get_symbol_source", "get_file_summary", "get_editing_context", "get_cfg", "search_symbols":
+	case "get_symbol", "get_symbol_source", "get_file_summary", "get_editing_context", "get_cfg", "search_symbols", "read_file":
 		return withRequestProjectionFacts(ctx)
 	default:
 		return ctx

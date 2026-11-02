@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"github.com/zeebo/blake3"
 	"io"
 	"math"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/tokens"
 )
@@ -1679,6 +1681,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			// indexer extracted (#846); the indexer holds symbols from the
 			// decoded file, so serving raw NUL-interleaved bytes makes
 			// discovery and reads disagree.
+			diskContent = b
 			b, utf16Decoded = decodedSourceForRead(b)
 			content = b
 		}
@@ -1699,6 +1702,7 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 
 	isBinary := looksBinary(content)
 	bodiesElided := false
+	compressionPending := false
 	var keptSymbols []string
 	var language string
 	if sourceRequestView(ctx) != nil {
@@ -1706,14 +1710,34 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	} else {
 		language = s.detectLanguageForPath(ctx, absPath, relPath)
 	}
+	// Graph-dependent compression must use the same current file as its
+	// source bytes. Ordinary raw reads and unsupported eliders stay untouched.
+	if req.GetBool("compress_bodies", false) && req.GetString("keep", "") != "" && elide.IsSupported(language) && sourceRequestView(ctx) == nil && refViewFilesFor(ctx) == nil && !installedSkillPath(rawPath) {
+		ctx, err = s.ensureProjected(ctx, []string{relPath})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if !servedFromOverlay {
+			compressionPending = true
+			if facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts); ok {
+				facts.mu.RLock()
+				entry := facts.entries[pathkey.MutationKey(absPath)]
+				facts.mu.RUnlock()
+				compressionPending = entry == nil
+				if entry != nil && (!liveProjectionForAcknowledgement(entry) || entry.rawHash != blake3.Sum256(diskContent)) {
+					return mcp.NewToolResultError(errProjectedSourceMoved.Error()), nil
+				}
+			}
+		}
+	}
 	// Tool-call observer: credit the recent search for the symbols in
 	// the file the agent is reading.
 	var sg *query.SubGraph
-	if sourceRequestView(ctx) == nil {
+	if sourceRequestView(ctx) == nil && !compressionPending {
 		afterFreshSymbolAcceptance(ctx, func() { s.creditFileConsumption(ctx, relPath) })
 		sg = s.engineFor(ctx).GetFileSymbols(relPath)
 	}
-	if req.GetBool("compress_bodies", false) && language != "" && elide.IsSupported(language) {
+	if !compressionPending && req.GetBool("compress_bodies", false) && language != "" && elide.IsSupported(language) {
 		var symbols []*graph.Node
 		if sg != nil {
 			symbols = sg.Nodes
@@ -1800,6 +1824,10 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		"bytes":          len(content),
 		"original_bytes": originalBytes,
 		"content":        string(content),
+	}
+	if compressionPending {
+		result["compression_state"] = "pending"
+		result["compression_reason"] = "source_projection_unavailable"
 	}
 	if sourceRequestView(ctx) != nil {
 		source := "disk"

@@ -380,18 +380,22 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	calleeCap := 20
 
 	bundle, bundleErr := fileEditingContextContext(ctx, s.readerFor(ctx), fp, []graph.NodeKind{graph.KindFunction, graph.KindMethod})
-	if bundleErr != nil {
+	storeBusy := errors.Is(bundleErr, context.DeadlineExceeded) && ctx.Err() == nil
+	if storeBusy {
+		ctx = markRequestStoreBusy(ctx, fp)
+		bundle = requestLocalEditingContext(ctx, fp)
+	} else if bundleErr != nil {
 		return mcp.NewToolResultError("get_editing_context: " + bundleErr.Error()), nil
 	}
 
-	if bundle == nil || (bundle.FileNode == nil && len(bundle.Defines) == 0) {
+	if !storeBusy && (bundle == nil || (bundle.FileNode == nil && len(bundle.Defines) == 0)) {
 		return mcp.NewToolResultError("no symbols found for file: " + fp), nil
 	}
 	fileNodeForScope = bundle.FileNode
 	if fileNodeForScope == nil && len(bundle.Defines) > 0 {
 		fileNodeForScope = bundle.Defines[0]
 	}
-	if !s.nodeInSessionScope(ctx, fileNodeForScope) {
+	if fileNodeForScope != nil && !s.nodeInSessionScope(ctx, fileNodeForScope) {
 		return mcp.NewToolResultError("no symbols found for file: " + fp), nil
 	}
 	for _, n := range bundle.Defines {
@@ -533,7 +537,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		// invalidates the cached entry on the caller side.
 		etag = computeETag([2]any{out, sourceCompressed})
 	}
-	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
+	if ifNoneMatch := req.GetString("if_none_match", ""); !storeBusy && ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}
 
@@ -869,6 +873,16 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 
 	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
+		removed, err := s.removedByPendingProjection(ctx, req, id)
+		if errors.Is(err, errProjectedSourceMoved) {
+			return nil, err
+		}
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if removed {
+			return removedProjectedSymbolGuidance(id, true), nil
+		}
 		return mcp.NewToolResultError("symbol not found: " + id + s.suggestSymbolIDs(ctx, id)), nil
 	}
 	// A by-id fetch must not cross the session's workspace boundary —
@@ -939,6 +953,12 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		}
 		ns, err := s.readNodeSource(ctx, node, absPath)
 		if err != nil {
+			if errors.Is(err, errProjectedSourceMoved) {
+				return nil, err
+			}
+			if errors.Is(err, errProjectedSourceDeferred) {
+				return s.respondJSONOrTOON(ctx, req, map[string]any{"id": node.ID, "source_state": "pending", "source_reason": "external_write", "complete": false})
+			}
 			return mcp.NewToolResultError(fmt.Sprintf("could not read source: %v", err)), nil
 		}
 		resolved := *node
