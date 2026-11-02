@@ -44,6 +44,7 @@ type issue767Fixture struct {
 	t                                    *testing.T
 	binary, root, primary, linked, store string
 	env                                  []string
+	removalFailure                       sync.Once
 
 	// mu guards every field a concurrent reader may touch while the fixture
 	// starts, stops or restarts the child. The sustained harness samples the
@@ -215,7 +216,17 @@ func (f *issue767Fixture) tryGit(dir string, args ...string) ([]byte, error) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir, cmd.Env = dir, f.env
-	return cmd.CombinedOutput()
+	liveRemoval := len(args) == 4 && args[0] == "worktree" && args[1] == "remove" && args[2] == "--force" && args[3] == f.linked
+	if liveRemoval {
+		cmd.Env = append(append([]string(nil), f.env...), "GIT_TRACE2_EVENT="+filepath.Join(f.root, "worktree-remove-trace.jsonl"))
+	}
+	output, err := cmd.CombinedOutput()
+	if liveRemoval && err != nil {
+		// Capture before the caller's Fatal starts normal daemon cleanup. The
+		// original Git failure remains authoritative even if diagnostics fail.
+		f.removalFailure.Do(func() { f.retainRemovalFailure(dir, args, output, err) })
+	}
+	return output, err
 }
 
 func (f *issue767Fixture) command(timeout time.Duration, dir string, args ...string) []byte {
