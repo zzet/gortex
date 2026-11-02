@@ -512,6 +512,8 @@ Gortex captures every large tool response into a bounded per-session ring; these
 | `search_artifacts` | Full-text search over the context-artifacts manifest — DB schemas, API specs, infra configs, ADRs registered via `.gortex.yaml::artifacts` |
 | `get_artifact` | Fetch one context artifact by id, with its content and the symbols it references |
 
+`detect_changes` and `explain_change_impact` wait up to 250 ms for edits in the answer's relation scope: the symbols' files, their callers, files naming the symbols, and the diff's changed files. Edits outside that scope do not delay the answer. Pending or failed edits return the usual analysis with `complete:false`, `graph_freshness:pending|failed`, `freshness_scope:relations`, `pending_files` (at most 16), and `pending_file_count`; failures include a recovery hint. Every answer reports `barrier_wait_ms`. An earlier `wait_deadline` shortens the wait; `require_fresh:true` instead waits until its request deadline and returns an error if the scope is still lagging. Text answers begin with `relations: pending|failed (N files)`; GCX preserves `GCX1` on line 1 and puts the relations comment on line 2. Stop and post-edit briefings bound detection to 300 ms and report pending relations instead of silently omitting the briefing.
+
 ## Proactive safety
 
 | Tool | Description |
