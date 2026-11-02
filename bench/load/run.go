@@ -14,40 +14,41 @@ import (
 )
 
 type runOptions struct {
-	Binary            string
-	Manifest          string
-	Scratch           string
-	Output            string
-	GitSHA            string
-	Profile           string
-	Host              string
-	Scenario          string
-	Agents            int
-	Editors           int
-	Worktrees         int
-	Seed              int64
-	Duration          time.Duration
-	PRSmokeDrain      time.Duration
-	Deadline          time.Duration
-	WarmTimeout       time.Duration
-	StopTimeout       time.Duration
-	CPUProfile        time.Duration
-	Gauges            bool
-	HeapProfiles      bool
-	WorktreeSteps     []int
-	KeepState         bool
-	SweepRepetitions  int
-	SweepBudget       time.Duration
-	EditMean          time.Duration
-	EditCount         int
-	EditRepos         int
-	EditProbeRole     string
-	editProbeBaseline bool
-	Discovery         discoveryOptions
-	Startup           startupOptions
-	pairedDriver      func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
-	smokeState        *privateRun // only the fixed smoke entry lends its freshly owned store
-	smokeMarkers      []string
+	Binary              string
+	Manifest            string
+	Scratch             string
+	Output              string
+	GitSHA              string
+	Profile             string
+	Host                string
+	Scenario            string
+	Agents              int
+	Editors             int
+	Worktrees           int
+	Seed                int64
+	Duration            time.Duration
+	PRSmokeDrain        time.Duration
+	PRSmokeDrainVersion int
+	Deadline            time.Duration
+	WarmTimeout         time.Duration
+	StopTimeout         time.Duration
+	CPUProfile          time.Duration
+	Gauges              bool
+	HeapProfiles        bool
+	WorktreeSteps       []int
+	KeepState           bool
+	SweepRepetitions    int
+	SweepBudget         time.Duration
+	EditMean            time.Duration
+	EditCount           int
+	EditRepos           int
+	EditProbeRole       string
+	editProbeBaseline   bool
+	Discovery           discoveryOptions
+	Startup             startupOptions
+	pairedDriver        func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
+	smokeState          *privateRun // only the fixed smoke entry lends its freshly owned store
+	smokeMarkers        []string
 }
 
 func parseRun(args []string) (runOptions, error) {
@@ -82,7 +83,8 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.Worktrees, "worktrees", 4, "linked worktrees in addition to primary")
 	f.Int64Var(&o.Seed, "seed", 1, "reproducible per-agent request/think plan seed")
 	f.DurationVar(&o.Duration, "duration", time.Minute, "measured workload phase duration")
-	f.DurationVar(&o.PRSmokeDrain, "pr-smoke-drain", 0, "opt-in standalone PR read drain budget after 20s/30s offered duration; unsupported for edits/probes/paired")
+	f.DurationVar(&o.PRSmokeDrain, "pr-smoke-drain", 0, "opt-in standalone PR drain budget after the offered duration; unsupported for paired runs")
+	f.IntVar(&o.PRSmokeDrainVersion, "pr-smoke-drain-version", 1, "PR drain identity: 1 for reads, explicit 2 for edits and their visibility probes")
 	f.DurationVar(&o.Deadline, "deadline", 120*time.Second, "product call/visibility deadline, independently of phase clipping")
 	f.DurationVar(&o.WarmTimeout, "warm-timeout", 30*time.Minute, "startup/enrichment/public analysis gate budget")
 	f.DurationVar(&o.StopTimeout, "stop-timeout", 30*time.Second, "graceful owned-daemon shutdown budget before force kill")
@@ -308,7 +310,7 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees
 	report.Workload.DurationSec, report.Workload.DeadlineSec, report.Workload.Seed, report.Workload.Profile = o.Duration.Seconds(), o.Deadline.Seconds(), o.Seed, o.Profile
 	if o.PRSmokeDrain > 0 {
-		report.Workload.PRSmokeDrain = &PRSmokeDrain{Version: 1, OfferedSeconds: o.Duration.Seconds(), MaxDrainSeconds: o.PRSmokeDrain.Seconds()}
+		report.Workload.PRSmokeDrain = &PRSmokeDrain{Version: prSmokeDrainVersion(o), OfferedSeconds: o.Duration.Seconds(), MaxDrainSeconds: o.PRSmokeDrain.Seconds()}
 	}
 	report.Workload.CPUProfileSec, report.Workload.WarmTimeoutSec, report.Workload.StopTimeoutSec, report.Workload.KeepState = o.CPUProfile.Seconds(), o.WarmTimeout.Seconds(), o.StopTimeout.Seconds(), o.KeepState
 	report.Workload.SessionModel = "per_agent"
