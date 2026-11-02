@@ -12,6 +12,7 @@ import (
 	"github.com/zeebo/blake3"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -44,7 +45,11 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 	layers := append([]graph.OverlayLayerReader(nil), requestProjectionLayers(ctx)...)
 	for _, graphPath := range paths {
 		if err := buildCtx.Err(); err != nil {
-			return ctx, err
+			if ctx.Err() != nil {
+				return ctx, ctx.Err()
+			}
+			markRequestProjectionDeferred(ctx, graphPath, "external_write")
+			continue
 		}
 		if editor := OverlayViewFromContext(ctx); editor != nil && editor.LayerReader() != nil && editor.LayerReader().HasFile(graphPath) {
 			// This pinned buffer completely owns the file. Disk contributes
@@ -81,6 +86,10 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 		}
 		entry, err := s.projectCurrentTrackedFile(buildCtx, ctx, abs, graphPath, rel)
 		if err != nil {
+			if projectionBudgetUnavailable(ctx, err) {
+				markRequestProjectionDeferred(ctx, graphPath, "external_write")
+				continue
+			}
 			return ctx, fmt.Errorf("file graph pending for %s: %w", graphPath, err)
 		}
 		if entry != nil {
@@ -88,7 +97,11 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 				continue
 			}
 			if err := buildCtx.Err(); err != nil {
-				return ctx, err
+				if ctx.Err() != nil {
+					return ctx, ctx.Err()
+				}
+				markRequestProjectionDeferred(ctx, graphPath, "external_write")
+				continue
 			}
 			layer, err := projectedFileVisibility(buildCtx, s.requestSelectedBaseReader(ctx), entry)
 			if err != nil {
@@ -99,7 +112,11 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 				layer = entry.layer
 			}
 			if err := buildCtx.Err(); err != nil {
-				return ctx, err
+				if ctx.Err() != nil {
+					return ctx, ctx.Err()
+				}
+				markRequestProjectionDeferred(ctx, graphPath, "external_write")
+				continue
 			}
 			ctx, err = retainRequestProjection(ctx, entry)
 			if err != nil {
@@ -121,6 +138,13 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 		ctx = WithOverlayView(ctx, graph.NewOverlaidViewWithLayer(s.requestBaseReader(ctx), editor.LayerReader()))
 	}
 	return ctx, nil
+}
+
+// Only the private projection budget may degrade into a qualified graph
+// answer. Caller cancellation, identity/parse failures and unsupported sources
+// retain their refusals; no old graph gains exactness or completed-work credit.
+func projectionBudgetUnavailable(caller context.Context, err error) bool {
+	return caller.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, indexer.ErrProjectionDeadline) || errors.Is(err, indexer.ErrProjectionNoSlot))
 }
 
 func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context, abs, graphPath, rel string) (*projectionEntry, error) {
