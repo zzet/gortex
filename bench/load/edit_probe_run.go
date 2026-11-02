@@ -81,20 +81,21 @@ type editProbeRecord struct {
 	Errors                   []string                  `json:"errors"`
 }
 type editProbeReport struct {
-	SearchReadbacks    *searchReadbackAcceptance `json:"search_readback_acceptance,omitempty"`
-	Role               string                    `json:"role,omitempty"`
-	Plan               editProbePlan             `json:"plan"`
-	PlanHash           string                    `json:"plan_sha256"`
-	AccountingRequired bool                      `json:"accounting_required"`
-	Records            []editProbeRecord         `json:"edits"`
-	Summary            *editProbeSummary         `json:"summary,omitempty"`
-	OutputModes        editProbeModes            `json:"output_modes,omitempty"`
-	Reads              editProbeReads            `json:"reads,omitempty"`
-	RestoreMS          Metric                    `json:"restore_batch_ms"`
-	Restore            json.RawMessage           `json:"restore_batch"`
-	StatsBefore        json.RawMessage           `json:"stats_before"`
-	StatsAfter         json.RawMessage           `json:"stats_after"`
-	Limitations        []string                  `json:"limitations"`
+	SharedOwners       *editProbeSharedOwnerReport `json:"shared_owners,omitempty"`
+	SearchReadbacks    *searchReadbackAcceptance   `json:"search_readback_acceptance,omitempty"`
+	Role               string                      `json:"role,omitempty"`
+	Plan               editProbePlan               `json:"plan"`
+	PlanHash           string                      `json:"plan_sha256"`
+	AccountingRequired bool                        `json:"accounting_required"`
+	Records            []editProbeRecord           `json:"edits"`
+	Summary            *editProbeSummary           `json:"summary,omitempty"`
+	OutputModes        editProbeModes              `json:"output_modes,omitempty"`
+	Reads              editProbeReads              `json:"reads,omitempty"`
+	RestoreMS          Metric                      `json:"restore_batch_ms"`
+	Restore            json.RawMessage             `json:"restore_batch"`
+	StatsBefore        json.RawMessage             `json:"stats_before"`
+	StatsAfter         json.RawMessage             `json:"stats_after"`
+	Limitations        []string                    `json:"limitations"`
 }
 
 type editProbeState struct {
@@ -125,6 +126,9 @@ type editProbeState struct {
 }
 
 type editProbeRuntime struct {
+	sharedMu          sync.Mutex // optional shared report evidence only; never serializes ordinary requests
+	sharedBinding     *editProbeSharedBinding
+	sharedReport      editProbeSharedOwnerReport
 	options           runOptions
 	p                 *privateRun
 	phase             *Phase
@@ -982,7 +986,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						s.mu.Unlock()
 						break // Foreign terminal/accounting fields cannot settle this edit.
 					}
-					accounting := checkEditProbeAccountingForTool(status, receipt, r.plan.Tool)
+					accounting := r.accountingForStatus(callCtx, status, receipt, r.plan.Tool)
 					s.mu.Lock()
 					s.record.Accounting = accounting
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
@@ -1040,7 +1044,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if r.requireAccounting && move != nil && (s.record.MoveAccounting == nil || s.record.MoveAccounting.State != "observed_move_windows_checks_pass") {
 		s.record.Errors = append(s.record.Errors, "move shared A/per-file write/direct accounting unavailable")
 	}
-	if r.requireAccounting && move == nil && s.record.Accounting.State != "observed_single_window_checks_pass" {
+	if r.requireAccounting && move == nil && !editProbeAccountingComplete(s.record.Accounting) {
 		s.record.Errors = append(s.record.Errors, "A/P/B accounting unavailable: "+strings.Join(s.record.Accounting.Reasons, "; "))
 	}
 	if s.record.StaleClaimedFresh {
@@ -1200,6 +1204,11 @@ func (r *editProbeRuntime) finish() error {
 		return nil
 	}
 	r.finalized = true
+	for _, s := range r.states {
+		s.stopProbes()
+		s.finishRaw()
+	}
+	r.phase.EditProbe.SharedOwners = r.finishSharedOwners()
 	r.phase.EditProbe.Records = nil
 	for _, s := range r.states {
 		s.stopProbes()
@@ -1217,6 +1226,7 @@ func (r *editProbeRuntime) finish() error {
 		}
 		record := s.record
 		s.mu.Unlock()
+		invalidateSharedAccounting(&record, r.phase.EditProbe.SharedOwners)
 		record.groupTimes()
 		s.sinkMu.Lock()
 		sinkErr := s.sinkErr

@@ -25,6 +25,7 @@ type editProbeSharedProof struct {
 	ownerKey   string
 	definition json.RawMessage
 	reference  json.RawMessage
+	membership json.RawMessage
 	member     editProbeSharedMember
 	execution  *editProbeWindow
 	background *editProbeWindow
@@ -115,7 +116,14 @@ func validateEditProbeSharedOwner(owner map[string]any, binding *editProbeShared
 // check against the actual live owned child; it cannot revive a later reply.
 func checkEditProbeSharedProof(status map[string]any, receipt string, binding *editProbeSharedBinding, p *privateRun, role string) (editProbeSharedProof, error) {
 	var out editProbeSharedProof
-	bad := func(reason string) (editProbeSharedProof, error) { return out, errors.New(reason) }
+	bad := func(reason string) (editProbeSharedProof, error) {
+		if out.ownerKey != "" {
+			if err := binding.validate(p, role); err != nil {
+				return editProbeSharedProof{}, err
+			}
+		}
+		return out, errors.New(reason)
+	}
 	if err := binding.validate(p, role); err != nil {
 		return bad(err.Error())
 	}
@@ -226,6 +234,10 @@ func checkEditProbeSharedProof(status map[string]any, receipt string, binding *e
 	out.reference, err = json.Marshal(reference)
 	if err != nil {
 		return bad("shared reference normalization failed")
+	}
+	out.membership, err = json.Marshal(membership)
+	if err != nil {
+		return bad("shared same-status witness normalization failed")
 	}
 	out.member = m
 	execution, _ := definition["execution"].(map[string]any)

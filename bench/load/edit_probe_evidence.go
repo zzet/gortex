@@ -315,15 +315,16 @@ func checkEditProbeWindowNS(ns int64, phases map[string]any) (editProbeWindow, e
 }
 
 type editProbeAccounting struct {
-	State     string           `json:"state"`
-	RPCID     string           `json:"bound_rpc_id"`
-	Requested uint64           `json:"requested_generation"`
-	Applied   uint64           `json:"applied_generation"`
-	A         *editProbeWindow `json:"acknowledgement"`
-	P         *editProbeWindow `json:"physical"`
-	B         *editProbeWindow `json:"requested_background"`
-	R         *editProbeWindow `json:"read_assisted_publisher,omitempty"`
-	Reasons   []string         `json:"reasons"`
+	Shared    *editProbeSharedReference `json:"shared_owner,omitempty"`
+	State     string                    `json:"state"`
+	RPCID     string                    `json:"bound_rpc_id"`
+	Requested uint64                    `json:"requested_generation"`
+	Applied   uint64                    `json:"applied_generation"`
+	A         *editProbeWindow          `json:"acknowledgement"`
+	P         *editProbeWindow          `json:"physical"`
+	B         *editProbeWindow          `json:"requested_background"`
+	R         *editProbeWindow          `json:"read_assisted_publisher,omitempty"`
+	Reasons   []string                  `json:"reasons"`
 }
 
 func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAccounting {
@@ -559,7 +560,11 @@ func editProbeObservedDuplicatePhysical(physical, publication map[string]any, ap
 }
 
 func editProbeFinished(graphTerminal, allCorrect, requireAccounting bool, accounting editProbeAccounting) bool {
-	return graphTerminal && allCorrect && (!requireAccounting || accounting.State == "observed_single_window_checks_pass" || accounting.State == "terminal_partial_physical" || accounting.State == "terminal_unavailable_background")
+	return graphTerminal && allCorrect && (!requireAccounting || editProbeAccountingComplete(accounting) || accounting.State == "terminal_partial_physical" || accounting.State == "terminal_unavailable_background" || accounting.State == "terminal_unavailable_shared_owner")
+}
+
+func editProbeAccountingComplete(accounting editProbeAccounting) bool {
+	return accounting.State == "observed_single_window_checks_pass" || accounting.State == "observed_shared_owner_windows_checks_pass"
 }
 
 func editProbeSupportedBackgroundCoverage(background map[string]any) bool {
