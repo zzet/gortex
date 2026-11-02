@@ -91,86 +91,113 @@ func TestSymbolSourceCanonicalPromotionAfterLeafUsesBoundedFreshAttempt(t *testi
 			calls := 0
 			var first context.Context
 			var deadlines []time.Time
+			var onOwner func(func()) bool
 			leaf := func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-				calls++
-				deadlines = append(deadlines, ctx.Value(projectedSourceDeadlineKey{}).(time.Time))
-				result, readErr := s.handleGetSymbolSource(ctx, req)
-				require.NoError(t, readErr)
-				require.NotNil(t, result)
-				require.False(t, result.IsError, resultText(result))
-				require.Equal(t, body, extractTextResult(t, result)["source"])
-				if calls != 1 {
-					return result, nil
+
+				var result *mcplib.CallToolResult
+				var err error
+				if !onOwner(func() {
+					result, err = func() (*mcplib.CallToolResult, error) {
+						t.Logf("tool=%s stage=callback_entry remaining_original_budget=%s", "get_symbol_source", time.Until(originalDeadline))
+						leafStarted := time.Now()
+						calls++
+						deadlines = append(deadlines, ctx.Value(projectedSourceDeadlineKey{}).(time.Time))
+						result, readErr := s.handleGetSymbolSource(ctx, req)
+						t.Logf("tool=%s stage=leaf_return elapsed=%s remaining_original_budget=%s", "get_symbol_source", time.Since(leafStarted), time.Until(originalDeadline))
+						require.NoError(t, readErr)
+						require.NotNil(t, result)
+						require.False(t, result.IsError, resultText(result))
+						require.Equal(t, body, extractTextResult(t, result)["source"])
+						if calls != 1 {
+							return result, nil
+						}
+						first = ctx
+						require.True(t, s.hasRequestProjectionFact(ctx, "main.go"), "the real source handler must borrow the ACK owner before the transition")
+						switch transition {
+						case "canonical_promotion", "canonical_cancelled":
+							// Actual parser/store publication, not a fabricated Done result,
+							// matching hash alone, peer edit or manual registry deletion.
+							publicationStarted := time.Now()
+							publicationErr := s.indexer.IndexFile(path)
+							t.Logf("publication elapsed=%s remaining_original_budget=%s", time.Since(publicationStarted), time.Until(originalDeadline))
+							require.NoError(t, publicationErr)
+							require.Equal(t, 8, store.GetNode("main.go::Neighbor").StartLine)
+							rows, metaErr := store.FileMetasByPaths(entry.repoPrefix, []string{entry.graphPath})
+							require.NoError(t, metaErr)
+							require.Equal(t, entry.hash, rows[entry.graphPath].ContentHash)
+							retirement.run()
+							require.Nil(t, liveEntry(pendingFileProjections, path))
+							require.Positive(t, pendingFileProjections.retired.Load())
+							require.False(t, entry.suspect.Load(), "canonical promotion is not a native invalidation")
+							require.True(t, time.Now().Before(originalDeadline), "canonical retirement must fit the original read allowance")
+							require.True(t, entry.checkedRetired.Load())
+							if transition == "canonical_cancelled" {
+								cancel()
+							}
+						case "receipt_only":
+							retirement.run()
+							require.Same(t, entry, liveEntry(pendingFileProjections, path), "an unadvanced canonical store cannot retire the acknowledged bytes")
+							require.Zero(t, pendingFileProjections.retired.Load())
+						case "unchecked_eviction":
+							pendingFileProjections.drop(entry)
+							require.Nil(t, liveEntry(pendingFileProjections, path))
+							require.False(t, entry.checkedRetired.Load())
+						case "peer_same_bytes_commit", "peer_retired":
+							held, release, lockErr := acquireMutationPath(t.Context(), path)
+							require.NoError(t, lockErr)
+							commit, writeErr := s.commitFileMutation(held, "write_file", "", "", "main.go", path, after, 0600)
+							release()
+							require.NoError(t, writeErr)
+							require.Greater(t, commit.commitSeq, sequence)
+							require.NotSame(t, entry, liveEntry(pendingFileProjections, path))
+							require.Equal(t, entry.rawHash, liveEntry(pendingFileProjections, path).rawHash)
+							if transition == "peer_retired" {
+								newer := liveEntry(pendingFileProjections, path)
+								publicationStarted := time.Now()
+								publicationErr := s.indexer.IndexFile(path)
+								t.Logf("publication elapsed=%s remaining_original_budget=%s", time.Since(publicationStarted), time.Until(originalDeadline))
+								require.NoError(t, publicationErr)
+								retirement.run()
+								require.Nil(t, liveEntry(pendingFileProjections, path))
+								require.True(t, newer.checkedRetired.Load())
+								require.False(t, entry.checkedRetired.Load(), "another owner's retirement cannot authorize this old selection")
+							}
+						case "same_bytes_event", "event_then_retire":
+							pendingFileProjections.markSuspect(path)
+							require.Same(t, entry, liveEntry(pendingFileProjections, path))
+							require.True(t, entry.suspect.Load())
+							if transition == "event_then_retire" {
+								publicationStarted := time.Now()
+								publicationErr := s.indexer.IndexFile(path)
+								t.Logf("publication elapsed=%s remaining_original_budget=%s", time.Since(publicationStarted), time.Until(originalDeadline))
+								require.NoError(t, publicationErr)
+								retirement.run()
+								require.Nil(t, liveEntry(pendingFileProjections, path))
+								require.False(t, entry.checkedRetired.Load())
+							}
+						}
+						require.Equal(t, sequence, entry.commitSeq)
+						require.Same(t, layer, entry.layer)
+						current, diskErr := os.ReadFile(path)
+						require.NoError(t, diskErr)
+						require.Equal(t, after, current, "the retirement/event controls must never introduce another physical edit")
+						if transition != "receipt_only" && transition != "canonical_cancelled" {
+							require.ErrorIs(t, validateRequestProjections(first), projectionSuperseded, "the old context must remain unusable; a fresh attempt cannot rebind its facts")
+						}
+						return result, nil
+					}()
+				}) {
+					return mcplib.NewToolResultError("fixture callback aborted"), nil
 				}
-				first = ctx
-				require.True(t, s.hasRequestProjectionFact(ctx, "main.go"), "the real source handler must borrow the ACK owner before the transition")
-				switch transition {
-				case "canonical_promotion", "canonical_cancelled":
-					// Actual parser/store publication, not a fabricated Done result,
-					// matching hash alone, peer edit or manual registry deletion.
-					require.NoError(t, s.indexer.IndexFile(path))
-					require.Equal(t, 8, store.GetNode("main.go::Neighbor").StartLine)
-					rows, metaErr := store.FileMetasByPaths(entry.repoPrefix, []string{entry.graphPath})
-					require.NoError(t, metaErr)
-					require.Equal(t, entry.hash, rows[entry.graphPath].ContentHash)
-					retirement.run()
-					require.Nil(t, liveEntry(pendingFileProjections, path))
-					require.Positive(t, pendingFileProjections.retired.Load())
-					require.False(t, entry.suspect.Load(), "canonical promotion is not a native invalidation")
-					require.True(t, time.Now().Before(originalDeadline), "canonical retirement must fit the original read allowance")
-					require.True(t, entry.checkedRetired.Load())
-					if transition == "canonical_cancelled" {
-						cancel()
-					}
-				case "receipt_only":
-					retirement.run()
-					require.Same(t, entry, liveEntry(pendingFileProjections, path), "an unadvanced canonical store cannot retire the acknowledged bytes")
-					require.Zero(t, pendingFileProjections.retired.Load())
-				case "unchecked_eviction":
-					pendingFileProjections.drop(entry)
-					require.Nil(t, liveEntry(pendingFileProjections, path))
-					require.False(t, entry.checkedRetired.Load())
-				case "peer_same_bytes_commit", "peer_retired":
-					held, release, lockErr := acquireMutationPath(t.Context(), path)
-					require.NoError(t, lockErr)
-					commit, writeErr := s.commitFileMutation(held, "write_file", "", "", "main.go", path, after, 0600)
-					release()
-					require.NoError(t, writeErr)
-					require.Greater(t, commit.commitSeq, sequence)
-					require.NotSame(t, entry, liveEntry(pendingFileProjections, path))
-					require.Equal(t, entry.rawHash, liveEntry(pendingFileProjections, path).rawHash)
-					if transition == "peer_retired" {
-						newer := liveEntry(pendingFileProjections, path)
-						require.NoError(t, s.indexer.IndexFile(path))
-						retirement.run()
-						require.Nil(t, liveEntry(pendingFileProjections, path))
-						require.True(t, newer.checkedRetired.Load())
-						require.False(t, entry.checkedRetired.Load(), "another owner's retirement cannot authorize this old selection")
-					}
-				case "same_bytes_event", "event_then_retire":
-					pendingFileProjections.markSuspect(path)
-					require.Same(t, entry, liveEntry(pendingFileProjections, path))
-					require.True(t, entry.suspect.Load())
-					if transition == "event_then_retire" {
-						require.NoError(t, s.indexer.IndexFile(path))
-						retirement.run()
-						require.Nil(t, liveEntry(pendingFileProjections, path))
-						require.False(t, entry.checkedRetired.Load())
-					}
-				}
-				require.Equal(t, sequence, entry.commitSeq)
-				require.Same(t, layer, entry.layer)
-				current, diskErr := os.ReadFile(path)
-				require.NoError(t, diskErr)
-				require.Equal(t, after, current, "the retirement/event controls must never introduce another physical edit")
-				if transition != "receipt_only" && transition != "canonical_cancelled" {
-					require.ErrorIs(t, validateRequestProjections(first), projectionSuperseded, "the old context must remain unusable; a fresh attempt cannot rebind its facts")
-				}
-				return result, nil
+				return result, err
 			}
-			result, err := s.wrapToolHandler(leaf)(ctx, makeReq("get_symbol_source", map[string]any{
-				"id": "main.go::Target", "context_lines": 0, "format": "json",
-			}))
+			t.Logf("tool=%s stage=dispatch remaining_original_budget=%s", "get_symbol_source", time.Until(originalDeadline))
+			result, err := canonicalReadWithOwner(t, func(dispatch func(func()) bool) (*mcplib.CallToolResult, error) {
+				onOwner = dispatch
+				return s.wrapToolHandler(leaf)(ctx, makeReq("get_symbol_source", map[string]any{
+					"id": "main.go::Target", "context_lines": 0, "format": "json",
+				}))
+			})
 			if transition == "canonical_cancelled" {
 				require.True(t, err != nil || result != nil && result.IsError, "cancellation cannot become an accepted result")
 				require.Equal(t, 1, calls)

@@ -44,8 +44,12 @@ func (s *preselectionRetirementStore) FileMetasByPaths(prefix string, paths []st
 // before registered MCP dispatch, not a direct leaf call.
 func preselectionRegisteredCall(t *testing.T, s *Server, ctx context.Context, id int, name string, args map[string]any) *mcplib.CallToolResult {
 	t.Helper()
+	started := time.Now()
 	require.True(t, s.IsToolEnabledForSession(ctx, name), "the entire initialized connection uses all/defer")
 	s.EnsureToolPromotedForSession(ctx, name)
+	if deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok {
+		t.Logf("registered tool=%s stage=before_sdk_dispatch authorization_and_promotion=%s remaining_original_budget=%s", name, time.Since(started), time.Until(deadline))
+	}
 	return guardE2ECall(t, s, WithAuthorizedToolCall(ctx, name), id, name, args)
 }
 
@@ -115,19 +119,37 @@ func TestRegisteredPreselectionRetirementKeepsCurrentFileRows(t *testing.T) {
 			}
 			retirement := s.canonicalProjectionRetirement(path)
 			require.NotNil(t, retirement)
+			var beforeNode, afterNode *graph.Node
+			var publicationErr error
+			var publicationElapsed time.Duration
+			var publicationFinished, callbackEntered time.Time
+			var checkedRetired bool
+			var current *projectionEntry
 			backend.publish = func() {
-				require.Equal(t, 5, sql.GetNode("main.go::Neighbor").StartLine)
-				require.NoError(t, idx.IndexFile(path))
-				require.Equal(t, 8, sql.GetNode("main.go::Neighbor").StartLine)
+				callbackEntered = time.Now()
+				beforeNode = sql.GetNode("main.go::Neighbor")
+				started := time.Now()
+				publicationErr = idx.IndexFile(path)
+				publicationElapsed = time.Since(started)
+				afterNode = sql.GetNode("main.go::Neighbor")
 				retirement.run()
-				require.True(t, entry.checkedRetired.Load())
-				require.Nil(t, liveEntry(pendingFileProjections, path))
+				checkedRetired = entry.checkedRetired.Load()
+				current = liveEntry(pendingFileProjections, path)
+				publicationFinished = time.Now()
 			}
 			deadline := time.Now().Add(projectedReadBudget)
 			ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
 			backend.armed.Store(true)
 			result := preselectionRegisteredCall(t, s, ctx, 20, tool, map[string]any{"path": "main.go", "format": "json"})
 			require.Equal(t, int32(1), backend.reads.Load(), "actual preselection metadata seam must be reached")
+			t.Logf("registered stage=callback_entry remaining_original_budget=%s publication_elapsed=%s remaining_at_publication=%s", deadline.Sub(callbackEntered), publicationElapsed, deadline.Sub(publicationFinished))
+			require.NotNil(t, beforeNode)
+			require.Equal(t, 5, beforeNode.StartLine)
+			require.NoError(t, publicationErr)
+			require.NotNil(t, afterNode)
+			require.Equal(t, 8, afterNode.StartLine)
+			require.True(t, checkedRetired)
+			require.Nil(t, current)
 			t.Logf("registered tool=%s result=%s remaining_original_budget=%s", tool, resultText(result), time.Until(deadline))
 			requireCanonicalDefinitionRows(t, tool, result, raw)
 		})
