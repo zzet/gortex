@@ -242,7 +242,8 @@ func TestSelectedProjectionNewerPointerDuringNodesSurvives(t *testing.T) {
 	entry := selectedPendingEntry(t, stack)
 	publishSelectedEntry(t, stack, entry, false)
 	ctx, view := routedEnrichmentView(t, stack)
-	newer := entry.committedCopy(9, entry.disk)
+	newer := entry.committedCopy(entry.commitSeq+1, entry.disk)
+	require.Greater(t, newer.commitSeq, entry.commitSeq, "the replacement must be newer in a full package run too")
 	probe := &selectedRetirementProbe{Reader: view.reader, beforeNodes: func() { require.NoError(t, pendingFileProjections.publish(newer)) }}
 	view.reader = probe
 	view.materialized.Reader = probe
