@@ -240,7 +240,10 @@ func fnRefStartsCall(spec fnRefSpec, n *sitter.Node, src []byte) bool {
 // parent's `name` field where that parent also declares `parameters` is a
 // declaration however it is spelled.
 func fnRefIsCallableDeclName(n *sitter.Node) bool {
-	p := n.Parent()
+	return fnRefIsCallableDeclNameWithParent(n, n.Parent())
+}
+
+func fnRefIsCallableDeclNameWithParent(n, p *sitter.Node) bool {
 	if p == nil {
 		return false
 	}
