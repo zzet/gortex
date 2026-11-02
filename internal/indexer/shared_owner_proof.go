@@ -75,9 +75,11 @@ type SharedOwnerProjection struct {
  Member map[string]any
  PhysicalMembers []SharedPhysicalOwner
  Ticket uint64
+ originals []sharedOwnerMember
 }
 
 func (w *Watcher) prepareSharedOwnerAttempt(a *mutationSetPublicationAttempt) {
+ a.proofFailure="missing_physical_member"
  if len(a.members)==0 || len(a.members)!=a.executorFiles { return }
  call:=a.members[0].invocation
  if call==nil || call.invalid.Load() || call.count!=len(a.members) { return }
@@ -90,6 +92,7 @@ func (w *Watcher) prepareSharedOwnerAttempt(a *mutationSetPublicationAttempt) {
   m.record.mu.Lock(); physical:=m.record.sharedPhysical; valid:=physical!=nil && physical.Receipt==m.record.key && physical.Path==m.path && physical.Checkout=="" && physical.Incarnation==""; m.record.mu.Unlock()
   if !valid { return }
  }
+ a.proofFailure=""
  a.sharedInvocation=call
  // Same existing ordered collector; no allocation on a point attempt.
  a.stamps.patchLaps.sharedIntervalLimit=len(a.members)*int(canonicalPatchLapCount)*8
@@ -97,7 +100,12 @@ func (w *Watcher) prepareSharedOwnerAttempt(a *mutationSetPublicationAttempt) {
 }
 
 func (w *Watcher) finishSharedOwnerProof(a *mutationSetPublicationAttempt, timer *mutationSetTimerObservation, returned time.Time) {
- if a==nil || a.sharedInvocation==nil || a.sharedInvocation.invalid.Load() || a.retry!=0 || a.executionReturned.IsZero() || returned.Before(a.executionReturned) || timer==nil || timer.watcher.Value()!=w || timer.invocation!=a.sharedInvocation || timer.invalid.Load() || a.sharedInvocation.arms.Load()!=1 { return }
+ if a==nil { return }
+ attached:=false
+ reason:=a.proofFailure
+ if reason=="" {reason="unsupported_invocation"}
+ defer func(){if !attached {a.publishSharedOwnerUnavailable(reason)}}()
+ if a.sharedInvocation==nil || a.sharedInvocation.invalid.Load() || a.retry!=0 || a.executionReturned.IsZero() || returned.Before(a.executionReturned) || timer==nil || timer.watcher.Value()!=w || timer.invocation!=a.sharedInvocation || timer.invalid.Load() || a.sharedInvocation.arms.Load()!=1 { return }
  call:=a.sharedInvocation
  if a.executorFiles!=call.count || len(a.members)!=call.count { return }
  a.stamps.mu.Lock()
@@ -129,8 +137,9 @@ func (w *Watcher) finishSharedOwnerProof(a *mutationSetPublicationAttempt, timer
   r.mu.Unlock(); if !valid { return }
  }
  for _,m:=range members {
-  r:=m.record.Value(); r.mu.Lock(); copy:=*r.sharedSetExecution; copy.ownerProof=frozen; r.sharedSetExecution=&copy; r.mu.Unlock()
+  r:=m.record.Value(); r.mu.Lock(); copy:=*r.sharedSetExecution; copy.ownerProof=frozen;copy.ownerProofState="frozen"; r.sharedSetExecution=&copy; r.mu.Unlock()
  }
+ attached=true
 }
 
 func sharedMemberWire(m sharedOwnerMember) map[string]any { return map[string]any{"receipt":m.physical.Receipt,"publication_key":m.key,"path":m.path,"ticket":m.ticket,"physical_commit_sequence":m.physical.Sequence,"content_sha256":m.physical.Hash,"checkout_id":m.physical.Checkout,"checkout_incarnation":m.physical.Incarnation} }
@@ -163,10 +172,30 @@ func (p *PublicationPhaseRecord) SharedOwnerProof(current *PublicationPhaseRecor
  physical:=make([]SharedPhysicalOwner,0,len(f.members))
  for i:=range f.members {
   m:=&f.members[i];r:=m.record.Value();if r==nil || current.byKey[m.key]!=r || r.owner.Value()!=current {return nil}
-  r.mu.Lock();valid:=r.key==m.key && r.ticket==m.ticket && r.sharedPhysical!=nil && *r.sharedPhysical==m.physical && r.sharedSetExecution!=nil && r.sharedSetExecution.ownerProof==f
+  r.mu.Lock();valid:=r.key==m.key && r.ticket==m.ticket && r.sharedPhysical!=nil && *r.sharedPhysical==m.physical && r.sharedSetExecution!=nil && r.sharedSetExecution.ownerProof==f && r.terminal
   for _,mark:=range r.marks{if mark.phase==PublicationTicketFailed{valid=false}}
   r.mu.Unlock();if !valid{return nil};if r==p{selected=m};physical=append(physical,m.physical)
  }
  if selected==nil{return nil}
- return &SharedOwnerProjection{Definition:f.definitionWire(),Owner:f.ownerWire(),Member:sharedMemberWire(*selected),PhysicalMembers:physical,Ticket:selected.ticket}
+ return &SharedOwnerProjection{Definition:f.definitionWire(),Owner:f.ownerWire(),Member:sharedMemberWire(*selected),PhysicalMembers:physical,Ticket:selected.ticket,originals:f.members}
+}
+
+func (a *mutationSetPublicationAttempt) publishSharedOwnerUnavailable(reason string) {
+ for _,m:=range a.members {
+  m.record.mu.Lock()
+  if prior:=m.record.sharedSetExecution;prior!=nil && prior.ownerProofState=="" { copy:=*prior;copy.ownerProofState="unavailable";copy.ownerProofReason=reason;m.record.sharedSetExecution=&copy }
+  m.record.mu.Unlock()
+ }
+}
+
+func (p *PublicationPhaseRecord) SharedOwnerProofAvailability() (string,string) {
+ p.mu.Lock();defer p.mu.Unlock()
+ if p.sharedSetExecution==nil {return "",""}
+ if p.sharedSetExecution.ownerProofState!="" {return p.sharedSetExecution.ownerProofState,p.sharedSetExecution.ownerProofReason}
+ return "pending",""
+}
+
+func (p *SharedOwnerProjection) MatchesPublication(receipt string, publication *PublicationPhaseRecord, applied uint64) bool {
+ for _,m:=range p.originals {if m.physical.Receipt==receipt {return m.record.Value()==publication && m.ticket==applied}}
+ return false
 }

@@ -15,6 +15,15 @@ func (s *Server) bindSharedPhysicalOwner(record *mutationCommitRecord, publicati
 
 func (s *Server) attachSharedOwnerAccounting(payload map[string]any, record *mutationCommitRecord, publication *indexer.PublicationPhaseRecord) {
  if publication==nil || record==nil || !record.isPhysicalCommit() || !s.validSharedIdentity() { return }
+ state,reason:=publication.SharedOwnerProofAvailability()
+ if state!="" {var why any;if reason!=""{why=reason};payload["shared_owner_accounting_v1_availability"]=map[string]any{"state":state,"reason":why}}
+ preliminary:=publication.SharedOwnerProof(indexer.DefaultPublicationPhases())
+ if preliminary!=nil {
+  for _,member:=range preliminary.PhysicalMembers {
+   s.mutationCommits.mu.Lock();peer:=s.mutationCommits.byID[member.Receipt];s.mutationCommits.mu.Unlock()
+   if peer!=nil && peer.owner==s {s.refreshPendingSourceRecord(peer)}
+  }
+ }
  // Keep the actual current ledger fixed while checking ALL original members.
  s.mutationCommits.mu.Lock();defer s.mutationCommits.mu.Unlock()
  if s.mutationCommits.byID[record.id]!=record || record.owner!=s { return }
@@ -26,6 +35,7 @@ func (s *Server) attachSharedOwnerAccounting(payload map[string]any, record *mut
   current.mu.RLock()
   valid:=current.isPhysicalCommit() && current.id==member.Receipt && current.commitSeq==member.Sequence && current.contentSHA256==member.Hash && current.absPath==member.Path && current.checkoutID==member.Checkout && current.checkoutIncarnation==member.Incarnation && current.disk==mutationDiskCommitted && member.Server==s.sharedIdentity.name && member.PID==s.sharedIdentity.pid && member.Birth==s.sharedIdentity.birth
   retained:=current.publication
+  valid=valid && current.graphRecorded && current.graph==mutationGraphFresh && proof.MatchesPublication(member.Receipt,retained,current.appliedGeneration)
   current.mu.RUnlock()
   if !valid || retained==nil { return }
  }

@@ -63,6 +63,7 @@ func (p *PublicationPhaseRecord) ownsMutationSetGeneration(generation uint64) bo
 // member. No member record or unrelated request clock supplies its origin.
 type mutationSetPublicationAttempt struct {
  sharedInvocation *sharedSetInvocation
+ proofFailure string
  executionReturned time.Time
  sharedWindow canonicalAttemptWindow
 	members       []mutationSetPublicationMember
@@ -74,6 +75,8 @@ type mutationSetPublicationAttempt struct {
 
 type sharedMutationSetExecution struct {
  ownerProof *sharedOwnerFrozen
+ ownerProofState string
+ ownerProofReason string
 	generation    uint64
 	members       int
 	executorFiles int

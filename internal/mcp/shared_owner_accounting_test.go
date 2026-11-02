@@ -79,6 +79,7 @@ func sharedOwnerStatusWire(t *testing.T, status map[string]any) map[string]any {
 
 func TestSharedOwnerAccountingBindsBothActualPhysicalReceipts(t *testing.T) {
 	s, records := sharedOwnerPhysicalSetFixture(t)
+ t.Cleanup(func(){if t.Failed(){body,_:=json.Marshal(s.mutationStatusPayload(records[0]));t.Logf("shared owner status: %s",body)}})
 	var definition map[string]any
 	for _, record := range records {
 		var proof map[string]any
