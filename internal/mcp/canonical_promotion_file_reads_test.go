@@ -119,59 +119,80 @@ func TestCanonicalPromotionFileReadsKeepIndependentDefinitionOracle(t *testing.T
 				calls := 0
 				var first context.Context
 				cancelledLeafDone := make(chan struct{})
+				var onOwner func(func()) bool
 				leaf := func(ctx context.Context, request mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-					calls++
-					if transition == "cancelled_promotion" {
-						defer close(cancelledLeafDone)
-					}
-					require.Equal(t, deadline, ctx.Value(projectedSourceDeadlineKey{}))
+
 					var result *mcplib.CallToolResult
 					var err error
-					if tool == "get_file_summary" {
-						result, err = s.handleGetFileSummary(ctx, request)
-					} else {
-						result, err = s.handleGetEditingContext(ctx, request)
+					if !onOwner(func() {
+						result, err = func() (*mcplib.CallToolResult, error) {
+							t.Logf("tool=%s stage=callback_entry remaining_original_budget=%s", tool, time.Until(deadline))
+							leafStarted := time.Now()
+							calls++
+							if transition == "cancelled_promotion" {
+								defer close(cancelledLeafDone)
+							}
+							require.Equal(t, deadline, ctx.Value(projectedSourceDeadlineKey{}))
+							var result *mcplib.CallToolResult
+							var err error
+							if tool == "get_file_summary" {
+								result, err = s.handleGetFileSummary(ctx, request)
+							} else {
+								result, err = s.handleGetEditingContext(ctx, request)
+							}
+							t.Logf("tool=%s stage=leaf_return elapsed=%s remaining_original_budget=%s", tool, time.Since(leafStarted), time.Until(deadline))
+							require.NoError(t, err)
+							requireCanonicalDefinitionRows(t, tool, result, raw)
+							if calls != 1 {
+								return result, nil
+							}
+							first = ctx
+							require.True(t, s.hasRequestProjectionFact(ctx, "main.go"))
+							switch transition {
+							case "canonical_promotion", "compression_not_audited", "cancelled_promotion":
+								require.Equal(t, 5, s.graph.GetNode("main.go::Neighbor").StartLine)
+								publicationStarted := time.Now()
+								publicationErr := s.indexer.IndexFile(path)
+								t.Logf("publication elapsed=%s remaining_original_budget=%s", time.Since(publicationStarted), time.Until(deadline))
+								require.NoError(t, publicationErr)
+								require.Equal(t, 8, s.graph.GetNode("main.go::Neighbor").StartLine)
+								retirement.run()
+								require.True(t, entry.checkedRetired.Load())
+								require.Nil(t, liveEntry(pendingFileProjections, path))
+								require.True(t, time.Now().Before(deadline))
+							case "peer_same_bytes":
+								held, release, err := acquireMutationPath(t.Context(), path)
+								require.NoError(t, err)
+								commit, writeErr := s.commitFileMutation(held, "write_file", "", "", "main.go", path, raw, 0600)
+								release()
+								require.NoError(t, writeErr)
+								require.Greater(t, commit.commitSeq, entry.commitSeq)
+							case "same_bytes_event":
+								pendingFileProjections.markSuspect(path)
+							case "unchecked_eviction":
+								pendingFileProjections.drop(entry)
+								require.False(t, entry.checkedRetired.Load())
+							}
+							require.ErrorIs(t, validateRequestProjections(first), projectionSuperseded)
+							if transition == "cancelled_promotion" {
+								cancel()
+							}
+							return result, nil
+						}()
+					}) {
+						return mcplib.NewToolResultError("fixture callback aborted"), nil
 					}
-					require.NoError(t, err)
-					requireCanonicalDefinitionRows(t, tool, result, raw)
-					if calls != 1 {
-						return result, nil
-					}
-					first = ctx
-					require.True(t, s.hasRequestProjectionFact(ctx, "main.go"))
-					switch transition {
-					case "canonical_promotion", "compression_not_audited", "cancelled_promotion":
-						require.Equal(t, 5, s.graph.GetNode("main.go::Neighbor").StartLine)
-						require.NoError(t, s.indexer.IndexFile(path))
-						require.Equal(t, 8, s.graph.GetNode("main.go::Neighbor").StartLine)
-						retirement.run()
-						require.True(t, entry.checkedRetired.Load())
-						require.Nil(t, liveEntry(pendingFileProjections, path))
-						require.True(t, time.Now().Before(deadline))
-					case "peer_same_bytes":
-						held, release, err := acquireMutationPath(t.Context(), path)
-						require.NoError(t, err)
-						commit, writeErr := s.commitFileMutation(held, "write_file", "", "", "main.go", path, raw, 0600)
-						release()
-						require.NoError(t, writeErr)
-						require.Greater(t, commit.commitSeq, entry.commitSeq)
-					case "same_bytes_event":
-						pendingFileProjections.markSuspect(path)
-					case "unchecked_eviction":
-						pendingFileProjections.drop(entry)
-						require.False(t, entry.checkedRetired.Load())
-					}
-					require.ErrorIs(t, validateRequestProjections(first), projectionSuperseded)
-					if transition == "cancelled_promotion" {
-						cancel()
-					}
-					return result, nil
+					return result, err
 				}
 				args := map[string]any{"path": "main.go", "format": "json"}
 				if transition == "compression_not_audited" {
 					args["compress_bodies"] = true
 				}
-				result, err := s.wrapToolHandler(leaf)(ctx, makeReq(tool, args))
+				t.Logf("tool=%s stage=dispatch remaining_original_budget=%s", tool, time.Until(deadline))
+				result, err := canonicalReadWithOwner(t, func(dispatch func(func()) bool) (*mcplib.CallToolResult, error) {
+					onOwner = dispatch
+					return s.wrapToolHandler(leaf)(ctx, makeReq(tool, args))
+				})
 				if transition == "cancelled_promotion" {
 					require.True(t, err != nil || result != nil && result.IsError)
 					select {
