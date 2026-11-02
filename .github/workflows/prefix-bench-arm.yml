@@ -40,8 +40,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ && "$AFTER_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$BEFORE_SHA" != "$AFTER_SHA" ]]
+          if ! [[ "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ && "$AFTER_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$BEFORE_SHA" == "$AFTER_SHA" ]]; then
+            echo 'Two distinct full lowercase commit SHAs are required.' >&2
+            exit 2
+          fi
           [[ "$(uname -m)" == aarch64 ]]
           root="$RUNNER_TEMP/prefix-pair-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           test ! -e "$root"
