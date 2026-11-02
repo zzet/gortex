@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
@@ -37,6 +38,15 @@ func (s *preselectionRetirementStore) FileMetasByPaths(prefix string, paths []st
 		s.publish()
 	}
 	return rows, err
+}
+
+// This is the production daemon's promote-on-demand and per-call authorization
+// before registered MCP dispatch, not a direct leaf call.
+func preselectionRegisteredCall(t *testing.T, s *Server, ctx context.Context, id int, name string, args map[string]any) *mcplib.CallToolResult {
+	t.Helper()
+	require.True(t, s.IsToolEnabledForSession(ctx, name), "the entire initialized connection uses all/defer")
+	s.EnsureToolPromotedForSession(ctx, name)
+	return guardE2ECall(t, s, WithAuthorizedToolCall(ctx, name), id, name, args)
 }
 
 func TestRegisteredPreselectionRetirementKeepsCurrentFileRows(t *testing.T) {
@@ -75,7 +85,7 @@ func TestRegisteredPreselectionRetirementKeepsCurrentFileRows(t *testing.T) {
 			initializeSession(t, s, session)
 			s.NoteSessionToolPolicy(session, "all", "defer")
 			ctx := s.WithClientSession(t.Context(), session)
-			ack := guardE2ECall(t, s, ctx, 10, "edit_file", map[string]any{"path": path, "old_string": "func Target() int { return 1 }", "new_string": "func Target() int {\n\tvalue := 7\n\treturn value\n}", "format": "json"})
+			ack := preselectionRegisteredCall(t, s, ctx, 10, "edit_file", map[string]any{"path": path, "old_string": "func Target() int { return 1 }", "new_string": "func Target() int {\n\tvalue := 7\n\treturn value\n}", "format": "json"})
 			require.False(t, ack.IsError, resultText(ack))
 			fields := extractTextResult(t, ack)
 			require.Equal(t, "local", fields["ack_mode"])
@@ -99,7 +109,7 @@ func TestRegisteredPreselectionRetirementKeepsCurrentFileRows(t *testing.T) {
 						args["detail"] = "full"
 					}
 				}
-				result := guardE2ECall(t, s, ctx, 11+i, name, args)
+				result := preselectionRegisteredCall(t, s, ctx, 11+i, name, args)
 				require.False(t, result.IsError, resultText(result))
 			}
 			retirement := s.canonicalProjectionRetirement(path)
@@ -115,7 +125,7 @@ func TestRegisteredPreselectionRetirementKeepsCurrentFileRows(t *testing.T) {
 			deadline := time.Now().Add(projectedReadBudget)
 			ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
 			backend.armed.Store(true)
-			result := guardE2ECall(t, s, ctx, 20, tool, map[string]any{"path": "main.go", "format": "json"})
+			result := preselectionRegisteredCall(t, s, ctx, 20, tool, map[string]any{"path": "main.go", "format": "json"})
 			require.Equal(t, int32(1), backend.reads.Load(), "actual preselection metadata seam must be reached")
 			t.Logf("registered tool=%s result=%s remaining_original_budget=%s", tool, resultText(result), time.Until(deadline))
 			requireCanonicalDefinitionRows(t, tool, result, raw)
