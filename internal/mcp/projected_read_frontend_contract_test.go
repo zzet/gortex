@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -47,6 +49,7 @@ func TestSymbolSourceRechecksSelectedHashAfterSameStampWrite(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, first, 0600))
 	var changed atomic.Bool
 	var observed *projectionEntry
+	var originalContext context.Context
 	actual := func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		var err error
 		ctx, err = s.ensureProjected(ctx, []string{"sample.go"})
@@ -54,6 +57,7 @@ func TestSymbolSourceRechecksSelectedHashAfterSameStampWrite(t *testing.T) {
 			return nil, err
 		}
 		if changed.CompareAndSwap(false, true) {
+			originalContext = ctx
 			info, err := os.Stat(path)
 			if err != nil {
 				return nil, err
@@ -83,6 +87,14 @@ func TestSymbolSourceRechecksSelectedHashAfterSameStampWrite(t *testing.T) {
 	require.Equal(t, "func Probe() int { return 2 }", fields["source"])
 	require.NotNil(t, observed)
 	require.Equal(t, blake3.Sum256(second), observed.rawHash, "returned bytes and selected graph/freshness must share one actual parsed-file identity")
+	require.Error(t, validateRequestProjections(originalContext), "released or superseded original contexts remain unusable")
+	originalFacts := originalContext.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	originalFacts.mu.RLock()
+	originalEntry := originalFacts.entries[pathkey.MutationKey(path)]
+	originalFacts.mu.RUnlock()
+	require.NotSame(t, observed, originalEntry, "whole-attempt retry cannot rebind the original facts")
+	require.Equal(t, blake3.Sum256(first), originalEntry.rawHash)
+	require.False(t, liveProjectionForAcknowledgement(originalEntry))
 }
 
 func TestRemovedProjectedSymbolHasSpecificReason(t *testing.T) {
@@ -110,6 +122,60 @@ func TestRemovedProjectedSymbolHasSpecificReason(t *testing.T) {
 			require.NotContains(t, resultText(unknown), "removed by pending edit", "absence alone is not evidence of removal")
 			removed := invoke("main.go::helper")
 			require.Contains(t, resultText(removed), "removed by pending edit", "the current parsed projection must explain the known removed declaration")
+		})
+	}
+}
+
+func TestSymbolSourceRetryIsBoundedAndCancellationDoesNotReplay(t *testing.T) {
+	for _, cancelFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel_%v", cancelFirst), func(t *testing.T) {
+			selectedProjectionRegistry(t)
+			s, root := setupMoveInlineRepo(t, map[string]string{"sample.go": "package sample\nfunc Probe() int { return 0 }\n"})
+			path := filepath.Join(root, "sample.go")
+			require.NoError(t, os.WriteFile(path, []byte("package sample\nfunc Probe() int { return 1 }\n"), 0600))
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var calls atomic.Int64
+			actual := func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+				var err error
+				ctx, err = s.ensureProjected(ctx, []string{"sample.go"})
+				if err != nil {
+					return nil, err
+				}
+				ordinal := calls.Add(1)
+				info, err := os.Stat(path)
+				if err != nil {
+					return nil, err
+				}
+				next := []byte(fmt.Sprintf("package sample\nfunc Probe() int { return %d }\n", ordinal+1))
+				if err := os.WriteFile(path, next, 0600); err != nil {
+					return nil, err
+				}
+				if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+					return nil, err
+				}
+				result, err := s.handleGetSymbolSource(ctx, req)
+				if cancelFirst {
+					cancel()
+				}
+				return result, err
+			}
+			req := mcplib.CallToolRequest{}
+			req.Params.Name = "get_symbol_source"
+			req.Params.Arguments = map[string]any{"id": "sample.go::Probe", "context_lines": 0, "format": "json"}
+			// Audit the retry controller over the actual source handler synchronously;
+			// the public middleware race is covered by the positive test above.
+			result, err := s.retryProjectedSymbolSource(actual)(ctx, req)
+			if cancelFirst {
+				require.True(t, errors.Is(err, context.Canceled) || result != nil && result.IsError)
+				require.EqualValues(t, 1, calls.Load())
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				require.True(t, result.IsError, "a second actual movement must refuse, not retry forever")
+				require.EqualValues(t, 2, calls.Load())
+				require.NotContains(t, resultText(result), "readback_exact")
+			}
 		})
 	}
 }

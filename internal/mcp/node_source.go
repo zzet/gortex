@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/zeebo/blake3"
 
@@ -123,6 +124,12 @@ type nodeSource struct {
 // node's range against exactly the bytes it read. An editor overlay is served
 // with the node's own range, since the overlay view parsed that content.
 func (s *Server) readNodeSource(ctx context.Context, node *graph.Node, absPath string) (nodeSource, error) {
+	caller := ctx
+	if deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
 	if content, ok := s.overlayContentFor(ctx, absPath); ok {
 		return nodeSource{content: content, startLine: node.StartLine, endLine: node.EndLine}, nil
 	}
@@ -144,6 +151,9 @@ func (s *Server) readNodeSource(ctx context.Context, node *graph.Node, absPath s
 	defer files.Close()
 	raw, _, err := files.ReadRegularFile(ctx, filepath.ToSlash(rel), 1<<20)
 	if err != nil {
+		if caller.Err() == nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nodeSource{}, errProjectedSourceDeferred
+		}
 		return nodeSource{}, err
 	}
 	var entry *projectionEntry
@@ -164,6 +174,9 @@ func (s *Server) readNodeSource(ctx context.Context, node *graph.Node, absPath s
 	}
 	start, end, err := s.nodeLinesIn(ctx, node, raw)
 	if err != nil {
+		if caller.Err() == nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nodeSource{}, errProjectedSourceDeferred
+		}
 		return nodeSource{}, err
 	}
 	return nodeSource{content: string(indexer.DecodeUTF16Source(raw)), startLine: start, endLine: end}, nil
