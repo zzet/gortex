@@ -239,10 +239,13 @@ func TestProjectionSearchHandlerLatencyAcceptance(t *testing.T) {
 			arguments["expand"] = "off"
 		}
 		req.Params.Arguments = arguments
-		if probe.Tool == "search_symbols" {
-			return fixtures[entries].server.handleSearchSymbols(ctx, req)
+		tool := fixtures[entries].server.MCPServer().GetTool(probe.Tool)
+		if tool == nil {
+			return nil, fmt.Errorf("native fixture has no registered public handler for %s", probe.Tool)
 		}
-		return fixtures[entries].server.handleSearchText(ctx, req)
+		// Include the actual response ownership/freshness fences. Calling the
+		// bare leaf would hide their real cost for the 512-entry population.
+		return tool.Handler(ctx, req)
 	}
 	warmup, err := sampleProjectionHandlers(probes, 1, selectPopulation, call, validateProjectionLatencyResult)
 	warmupData, encodeErr := json.MarshalIndent(warmup, "", "  ")

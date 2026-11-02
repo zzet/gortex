@@ -19,10 +19,11 @@ import (
 	"github.com/zzet/gortex/internal/reach"
 )
 
-// The first public post-ACK search must find a new trigram in the live native
-// cache. A deliberately unannounced write first proves that streaming or old
-// postings cannot satisfy this fixture. No file filter or intervening read is
-// allowed to repair the measured search.
+// The first public post-ACK search must find a new literal that the actual
+// warm native cache initially cannot locate. An unannounced write proves old
+// postings or a streaming fallback cannot satisfy the fixture precondition.
+// The pending-source merge may supply the result; no file filter or earlier
+// public read is allowed to repair that first search.
 func TestSearchTextFindsNewTrigramOnFirstLocalACKBeforeBasePublication(t *testing.T) {
 	previous := pendingFileProjections
 	pendingFileProjections = newPendingProjections()
