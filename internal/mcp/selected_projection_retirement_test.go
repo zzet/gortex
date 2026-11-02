@@ -248,7 +248,7 @@ func TestSelectedProjectionNewerPointerDuringNodesSurvives(t *testing.T) {
 	view.reader = probe
 	view.materialized.Reader = probe
 	_, err := stack.srv.ensureProjected(ctx, []string{entry.graphPath})
-	require.NoError(t, err)
+	require.ErrorIs(t, err, projectionSuperseded, "a selection superseded during checked retirement must not serve older facts")
 	require.Same(t, newer, liveEntry(pendingFileProjections, entry.absPath), "checked selected nodes cannot remove a later registry pointer")
 }
 
