@@ -32,8 +32,9 @@ func TestSymbolWritersUseCurrentDeclarationAfterLineShift(t *testing.T) {
 				ack.finishReply(result, callErr)
 				ack.finishActual()
 				observed := ack.snapshot()
-				require.EqualValues(t, 1, observed.ParseGate.Started, "actual source relocation extraction must be observed")
-				require.EqualValues(t, 1, observed.ParseGate.Completed)
+				require.EqualValues(t, 2, observed.ParseGate.Started, "actual relocation extraction and committed projection each own one observed parse")
+				require.EqualValues(t, 2, observed.ParseGate.Completed)
+				require.Equal(t, "mixed_observed_parser_paths", observed.ParserScope)
 				require.True(t, observed.LapsDisjoint)
 			} else {
 				result, callErr = srv.handleSafeDeleteSymbol(t.Context(), req)
