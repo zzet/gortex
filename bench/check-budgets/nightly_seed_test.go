@@ -43,6 +43,7 @@ func TestNightlySeedIsCandidateOnlyAndDoesNotShrinkMatrix(t *testing.T) {
 	plain, err := makeLanePlan(p, c)
 	if err != nil { t.Fatal(err) }
 	c.NightlySeed = &nightlyWorkloadSeed{Version: 1, Kind: "search-delay-v1", CandidateRevision: c.Builds["candidate"].Revision}
+	if _, err := makeEditLoopLanePlan(p, c); err == nil { t.Fatal("partial edit collector accepted nightly fault") }
 	seeded, err := makeLanePlan(p, c)
 	if err != nil { t.Fatal(err) }
 	if len(seeded.Tasks) != len(plain.Tasks) || seeded.PolicySHA256 != plain.PolicySHA256 { t.Fatal("seed changed policy or task census") }

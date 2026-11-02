@@ -124,6 +124,9 @@ func readLaneConfig(path string, editGate ...bool) (laneConfig, error) {
 	if err := validateNightlySeed(c); err != nil {
 		return c, err
 	}
+	if c.NightlySeed != nil && len(editGate) > 0 && editGate[0] {
+		return c, errors.New("nightly workload fault requires the full collector, not edit-collect")
+	}
 	if c.EditGateSeed != "" && (len(editGate) == 0 || !editGate[0] || c.Lane != "smoke" || c.EditGateSeed != "ack-wait" && c.EditGateSeed != "closed-read-gate") {
 		return c, errors.New("edit_gate_seed requires the explicit edit smoke collector and ack-wait or closed-read-gate")
 	}

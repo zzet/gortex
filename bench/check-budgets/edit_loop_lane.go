@@ -14,6 +14,9 @@ import (
 // <=15m wall limit. The nightly's single-editor Poisson schedule is retained;
 // it is not compressed to fit the smoke-only deadline.
 func makeEditLoopLanePlan(p policy, c laneConfig) (lanePlan, error) {
+	if c.NightlySeed != nil {
+		return lanePlan{}, errors.New("nightly workload fault requires full collection, not the partial edit gate")
+	}
 	plan := lanePlan{Lane: c.Lane, Execution: "edit-loop", HostClass: c.HostClass, Ready: true, PolicySHA256: policyDigest(p), Prerequisites: []string{}}
 	if c.EditGateSeed != "" && (c.Lane != "smoke" || c.EditGateSeed != "ack-wait" && c.EditGateSeed != "closed-read-gate") {
 		return plan, errors.New("edit gate faults are closed smoke-only modes")
