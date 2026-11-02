@@ -24,7 +24,9 @@ import (
 // This is a physical-writer/read-back correctness control. It samples no
 // latency and provides no reference-host, WAL, or full-mode performance proof.
 func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
-	selectedProjectionRegistry(t)
+	previous := pendingFileProjections
+	pendingFileProjections = newPendingProjections()
+	t.Cleanup(func() { pendingFileProjections = previous })
 	const original = "package sample\n\nfunc first() int {\n\treturn 0\n}\n\nfunc second() int {\n\treturn 0\n}\n"
 	s, root := setupMoveInlineRepo(t, map[string]string{"sample.go": original})
 	watcher, err := indexer.NewWatcher(s.indexer, config.WatchConfig{Enabled: true, DebounceMs: 5}, zap.NewNop())
