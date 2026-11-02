@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -104,8 +105,9 @@ func checkEditProbeSharedExecution(execution map[string]any, members int) (editP
 			}
 			continue
 		}
+		_, numeric := phases[name].(json.Number)
 		ns, err := editProbeNS(phases[name])
-		if err != nil || states[name] != "measured" || counts[name] == 0 || sums[name] != ns {
+		if !numeric || err != nil || states[name] != "measured" || counts[name] == 0 || sums[name] != ns {
 			return invalid("shared execution lacks exact measured interval sum: " + name)
 		}
 	}

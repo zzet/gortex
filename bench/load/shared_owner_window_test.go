@@ -49,6 +49,7 @@ func TestSharedExecutionChecksIntervalsAndDirectOnlyApplicability(t *testing.T) 
 		}},
 		{"missing required phase", func(v map[string]any) { delete(v["phases_ms"].(map[string]any), "resolve") }},
 		{"unknown additive phase", func(v map[string]any) { v["phases_ms"].(map[string]any)["resolve_mutex_wait"] = json.Number("1") }},
+		{"numeric text is not a measured JSON number", func(v map[string]any) { v["phases_ms"].(map[string]any)["resolve"] = "1" }},
 		{"extra phase state", func(v map[string]any) { v["phase_states"].(map[string]any)["worker_parse"] = "measured" }},
 		{"missing interval cannot become measured zero", func(v map[string]any) {
 			v["intervals"] = v["intervals"].([]any)[1:]
