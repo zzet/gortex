@@ -53,11 +53,11 @@ func fileEditingContextContext(ctx context.Context, reader graph.Reader, path st
 // withFileStoreRows gives every section of one file response the SAME 30ms
 // cancellable, coherent selected-store scope. No legacy API is a fallback.
 func withFileStoreRows(ctx context.Context, reader graph.Reader, consume func(graph.FileEditingContextRows) error) error {
-	deadline := time.Now().Add(30 * time.Millisecond)
-	if original, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && original.Before(deadline) {
-		deadline = original
-	}
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	// Projection/whole-attempt retries have a separate 150ms allowance. Once
+	// it expires, a labelled pending reply may still read useful canonical
+	// rows. This scope earns no projection freshness or retry permission and
+	// remains bounded by both the caller's hard deadline and its own 30ms cap.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
 	defer cancel()
 	selected := reader
 	var core *contractCoreEdges
