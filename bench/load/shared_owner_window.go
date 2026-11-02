@@ -40,7 +40,7 @@ func checkEditProbeSharedExecution(execution map[string]any, members int) (editP
 	invalid := func(reason string) (editProbeWindow, error) {
 		return editProbeWindow{}, errors.New(reason)
 	}
-	if !editProbeExactKeys(execution, "clock", "origin", "entry_disposition", "start_ns", "end_ns", "observed_partition_complete", "phases_ms", "phase_states", "intervals") ||
+	if !editProbeExactKeys(execution, "clock", "origin", "entry_disposition", "start_ns", "end_ns", "observed_partition_complete", "phases_ms", "phase_states", "phase_dispositions", "intervals") ||
 		execution["clock"] != "monotonic" || execution["origin"] != "actual_callback_entry" || execution["entry_disposition"] != "direct_shared_set" || execution["observed_partition_complete"] != true {
 		return invalid("shared execution scope/disposition/completeness unavailable")
 	}
@@ -56,6 +56,17 @@ func checkEditProbeSharedExecution(execution map[string]any, members int) (editP
 	states, _ := execution["phase_states"].(map[string]any)
 	if !editProbeExactKeys(phases, editProbeSharedPhaseNames[:]...) || !editProbeExactKeys(states, editProbeSharedPhaseNames[:]...) {
 		return invalid("shared execution phase set differs from the declared partition")
+	}
+	dispositions, ok := execution["phase_dispositions"].(map[string]any)
+	if !ok || dispositions == nil {
+		return invalid("shared execution actual optional branch dispositions unavailable")
+	}
+	optionalReasons := map[string]string{"patch_analysis": "resolution_catchup_not_entered", "batch_admission": "no_batch_gate_or_hook"}
+	for name, reason := range dispositions {
+		expected, optional := optionalReasons[name]
+		if !optional || reason != expected || states[name] != "not_applicable" || phases[name] != nil {
+			return invalid("shared execution has false optional branch disposition: " + name)
+		}
 	}
 	intervals, ok := execution["intervals"].([]any)
 	if !ok || members <= 0 || members > math.MaxInt/(len(editProbeSharedPhaseNames)*8) || len(intervals) > members*len(editProbeSharedPhaseNames)*8 {
@@ -86,9 +97,9 @@ func checkEditProbeSharedExecution(execution map[string]any, members int) (editP
 		// These two operations are absent only on the producer-proven direct
 		// entry. Even measured zero would falsely borrow a point-path event.
 		directAbsent := name == "cohort_admission" || name == "patch_inspection"
-		optional := name == "patch_analysis" || name == "batch_admission"
+		reason, optional := optionalReasons[name]
 		if directAbsent || optional && states[name] == "not_applicable" {
-			if states[name] != "not_applicable" || phases[name] != nil || counts[name] != 0 {
+			if states[name] != "not_applicable" || phases[name] != nil || counts[name] != 0 || optional && dispositions[name] != reason {
 				return invalid("shared execution has contradictory applicability: " + name)
 			}
 			continue

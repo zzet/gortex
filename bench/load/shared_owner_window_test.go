@@ -19,7 +19,8 @@ func sharedExecutionFixture() map[string]any {
 		intervals = append(intervals, map[string]any{"phase": name, "start_ns": json.Number(strconv.FormatInt(end, 10)), "end_ns": json.Number(strconv.FormatInt(end+1_000_000, 10))})
 		end += 1_000_000
 	}
-	return map[string]any{"clock": "monotonic", "origin": "actual_callback_entry", "entry_disposition": "direct_shared_set", "start_ns": json.Number("0"), "end_ns": json.Number(strconv.FormatInt(end, 10)), "observed_partition_complete": true, "phases_ms": phases, "phase_states": states, "intervals": intervals}
+	return map[string]any{"clock": "monotonic", "origin": "actual_callback_entry", "entry_disposition": "direct_shared_set", "start_ns": json.Number("0"), "end_ns": json.Number(strconv.FormatInt(end, 10)), "observed_partition_complete": true, "phases_ms": phases, "phase_states": states, "intervals": intervals,
+		"phase_dispositions": map[string]any{"patch_analysis": "resolution_catchup_not_entered", "batch_admission": "no_batch_gate_or_hook"}}
 }
 
 // These are numerical wire controls only. Actual producer provenance, full
@@ -101,6 +102,85 @@ func TestSharedExecutionRetainsRepeatedChunksAndObservedZero(t *testing.T) {
 	}
 	if _, err := checkEditProbeSharedExecution(v, 0); err == nil {
 		t.Fatal("missing frontier must not credit even a zero partition")
+	}
+}
+
+func TestSharedExecutionRequiresActualOptionalDisposition(t *testing.T) {
+	v := sharedExecutionFixture()
+	delete(v, "phase_dispositions")
+	if got, err := checkEditProbeSharedExecution(v, 2); err == nil {
+		t.Fatalf("optional null phases received credit without actual branch disposition: %+v", got)
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(map[string]any)
+	}{
+		{"missing actual branch reason", func(v map[string]any) { delete(v["phase_dispositions"].(map[string]any), "batch_admission") }},
+		{"unknown reason", func(v map[string]any) {
+			v["phase_dispositions"].(map[string]any)["batch_admission"] = "missing_measurement"
+		}},
+		{"mandatory phase cannot borrow optional reason", func(v map[string]any) {
+			v["phase_dispositions"].(map[string]any)["resolve"] = "resolution_catchup_not_entered"
+		}},
+		{"direct entry exemption has its own proof", func(v map[string]any) {
+			v["phase_dispositions"].(map[string]any)["cohort_admission"] = "no_batch_gate_or_hook"
+		}},
+		{"measured work cannot also be absent", func(v map[string]any) {
+			v["phase_states"].(map[string]any)["patch_analysis"] = "measured"
+			v["phases_ms"].(map[string]any)["patch_analysis"] = json.Number("0")
+		}},
+		{"unknown is not proven absent", func(v map[string]any) { v["phase_states"].(map[string]any)["batch_admission"] = "not_observed" }},
+		{"null disposition object", func(v map[string]any) { v["phase_dispositions"] = nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := sharedExecutionFixture()
+			tc.change(v)
+			if got, err := checkEditProbeSharedExecution(v, 2); err == nil {
+				t.Fatalf("unsupported branch disposition received numeric credit: %+v", got)
+			}
+		})
+	}
+	// When both optional operations actually execute, an empty disposition
+	// object and actual measured zero intervals are distinct from absence.
+	v = sharedExecutionFixture()
+	v["phase_dispositions"] = map[string]any{}
+	for _, name := range []string{"patch_analysis", "batch_admission"} {
+		v["phase_states"].(map[string]any)[name] = "measured"
+		v["phases_ms"].(map[string]any)[name] = json.Number("0")
+		v["intervals"] = append(v["intervals"].([]any), map[string]any{"phase": name, "start_ns": v["end_ns"], "end_ns": v["end_ns"]})
+	}
+	if _, err := checkEditProbeSharedExecution(v, 2); err != nil {
+		t.Fatalf("actual optional zero measurements were treated as missing: %v", err)
+	}
+}
+
+func TestSharedOwnerPathKeepsIndependentAcknowledgementFailures(t *testing.T) {
+	status := editProbeAccountingFixture()
+	point := checkEditProbeAccounting(status, "receipt-a")
+	only := checkEditProbeAcknowledgement(status, "receipt-a", "reindex_generation", nil, false)
+	if point.A == nil || only.A == nil || *point.A != *only.A || len(only.Reasons) != 0 || only.P != nil || only.B != nil {
+		t.Fatalf("extracting A changed its measurements or borrowed P/B: point=%+v A=%+v", point, only)
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(map[string]any)
+	}{
+		{"missing bound A", func(v map[string]any) { delete(v, "acknowledgement") }},
+		{"wrong receipt", func(v map[string]any) { v["receipt"] = "other" }},
+		{"missing requested generation", func(v map[string]any) { delete(v, "reindex_generation") }},
+		{"missing RPC owner", func(v map[string]any) { delete(v["acknowledgement"].(map[string]any), "rpc_id") }},
+		{"unmeasured applicable parse", func(v map[string]any) {
+			v["acknowledgement"].(map[string]any)["phase_states"].(map[string]any)["parse"] = "not_observed"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status := editProbeAccountingFixture()
+			tc.change(status)
+			got := checkEditProbeAcknowledgement(status, "receipt-a", "reindex_generation", nil, false)
+			if len(got.Reasons) == 0 || got.State != "unavailable" || got.P != nil || got.B != nil {
+				t.Fatalf("a distinct E/B owner must never erase an A/identity failure: %+v", got)
+			}
+		})
 	}
 }
 

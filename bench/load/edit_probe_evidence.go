@@ -342,10 +342,9 @@ func checkEditProbeAccountingForTool(status map[string]any, receipt, tool string
 	return checkEditProbeAccounting(status, receipt)
 }
 
-// A batch's shared RPC owner is supplied separately from its per-file P/B/R
-// owner. The windows remain independent; no map is merged into a synthetic
-// physical mutation_status reply and A is never added to background work.
-func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable bool) editProbeAccounting {
+// checkEditProbeAcknowledgement validates A and receipt/generation identities only.
+// Callers retain every reason before validating their distinct execution owner.
+func checkEditProbeAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable bool) editProbeAccounting {
 	out := editProbeAccounting{State: "unavailable"}
 	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }
 	if status["receipt"] != receipt {
@@ -389,6 +388,16 @@ func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt,
 	} else {
 		out.A = &a
 	}
+	return out
+}
+
+// A batch's shared RPC owner is supplied separately from its per-file P/B/R
+// owner. The windows remain independent; no map is merged into a synthetic
+// physical mutation_status reply and A is never added to background work.
+func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable bool) editProbeAccounting {
+	out := checkEditProbeAcknowledgement(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable)
+	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }
+	requested, applied := out.Requested, out.Applied
 	// Shared execution has a distinct owner/domain proof. Even malformed or
 	// unknown versions cannot fall through to valid-looking per-file numbers.
 	// Preserve the independently validated A window without borrowing P/B.
