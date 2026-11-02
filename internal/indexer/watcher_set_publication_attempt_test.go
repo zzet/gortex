@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -196,6 +197,39 @@ func TestMutationSetTimerObservationRequiresOwnedPublication(t *testing.T) {
 			require.Equal(t, uint64(2), observation.frontier)
 			require.False(t, observation.armStarted.IsZero())
 			require.False(t, observation.armFinished.Before(observation.armStarted))
+		})
+	}
+}
+
+// The acceptance boundary compares failed-file identity in the same native
+// spelling used by the result producer, including slash spellings on Windows.
+// This is a scalar boundary control, not a claim of runtime path reachability.
+func TestMutationSetPublicationRejectsFailedPathSpellings(t *testing.T) {
+	native := filepath.Join(t.TempDir(), "a.go")
+	slash := filepath.ToSlash(native)
+	for _, spelling := range []struct {
+		name, member, failed string
+	}{
+		{"native-native", native, native},
+		{"native-slash", native, slash},
+		{"slash-native", slash, native},
+		{"slash-slash", slash, slash},
+	} {
+		t.Run(spelling.name, func(t *testing.T) {
+			owner := NewPublicationPhaseRecorder(2, 1)
+			defer runtime.KeepAlive(owner)
+			record := owner.Begin("checkout", "failed-spelling", PublicationSourceMCPEdit, time.Now())
+			require.True(t, record.bindCanonicalTicket(2, time.Now()))
+			ticket := &MutationTicket{Path: spelling.member, Generation: 2, PublicationRecord: record}
+			w := &Watcher{
+				pendingGeneration:          map[string]uint64{spelling.member: 2},
+				observedMutationGeneration: map[string]uint64{spelling.member: 2},
+				mutationWaiters:            map[string]map[uint64]mutationWaiter{spelling.member: {2: {publication: record, ticket: ticket}}},
+			}
+			attempt := w.beginMutationSetPublication(map[string]uint64{spelling.member: 2}, time.Now(), 0)
+			require.NotNil(t, attempt)
+			w.finishMutationSetPublication(attempt, &IndexResult{FailedFiles: []string{spelling.failed}}, nil, time.Now())
+			require.Nil(t, record.Snapshot().SharedSetExecution(), "a failed member cannot acquire successful execution evidence")
 		})
 	}
 }

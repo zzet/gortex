@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +38,10 @@ func runShutdownHelper(t *testing.T, mode string) {
 		os.Exit(2)
 	}
 	defer func() { _ = trace.Close() }()
+	var transcript io.Writer = trace
+	if entered := os.Getenv(helperExitSyncStallEnv); entered != "" {
+		transcript = &exitSyncStallTranscript{File: trace, entered: entered}
+	}
 	in := bufio.NewReader(os.Stdin)
 	for {
 		body, ok := readFramed(in)
@@ -55,8 +60,10 @@ func runShutdownHelper(t *testing.T, mode string) {
 		if err := json.Unmarshal(body, &req); err != nil {
 			os.Exit(2)
 		}
-		_, _ = fmt.Fprintln(trace, req.Method)
-		_ = trace.Sync()
+		_, _ = fmt.Fprintln(transcript, req.Method)
+		// The transcript is an unbuffered write, read only after the exact
+		// child's Wait. Disk durability is not part of LSP cooperation and must
+		// not hold its exit behind an unrelated filesystem sync.
 		if req.Method == "initialize" && mode == helperLSPInitBarrier {
 			if err := os.WriteFile(os.Getenv(helperInitEnteredEnv), []byte(fmt.Sprint(os.Getpid())), 0o600); err != nil {
 				os.Exit(2)
@@ -206,8 +213,9 @@ func TestClientShutdownInterruptsAnActualBlockedPipeWriter(t *testing.T) {
 	ready := filepath.Join(t.TempDir(), "child-ready")
 	t.Setenv(helperReadyEnv, ready)
 	c, tr, _ := shutdownClientFixture(t, helperLSPNoRead)
-	require.Eventually(t, func() bool { _, err := os.Stat(ready); return err == nil }, 3*time.Second, time.Millisecond)
-	readyPID, err := os.ReadFile(ready)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	readyPID, err := waitShutdownHelperPID(ctx, ready, fmt.Sprint(tr.cmd.Process.Pid), os.ReadFile)
 	require.NoError(t, err)
 	require.Equal(t, fmt.Sprint(tr.cmd.Process.Pid), string(readyPID), "ready receipt must belong to this exact child")
 	writer := &observedShutdownWriter{WriteCloser: c.stdin, entered: make(chan struct{}), returned: make(chan struct{})}

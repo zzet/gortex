@@ -2,7 +2,6 @@ package resolver
 
 import (
 	"context"
-	"time"
 
 	"go.uber.org/zap"
 
@@ -59,28 +58,14 @@ func (cr *CrossRepoResolver) ResolveMutationFrontiers(resolutionFiles, edgeSourc
 // files' own outgoing edges, and its CrossRepoStats — which count exactly that
 // — would otherwise read as a complete pass.
 func (cr *CrossRepoResolver) ResolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles []string) (*CrossRepoStats, CrossRepoIncomingAdmission) {
-	return cr.resolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
-}
-
-func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) (*CrossRepoStats, CrossRepoIncomingAdmission) {
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 	var admission CrossRepoIncomingAdmission
 	if cr == nil || cr.graph == nil || len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
 		return stats, admission
 	}
 
-	var started, acquired time.Time
-	if observe != nil {
-		started = time.Now()
-	}
 	cr.mu.Lock()
-	if observe != nil {
-		acquired = time.Now()
-	}
 	defer cr.mu.Unlock()
-	if observe != nil {
-		observe(started, acquired)
-	}
 
 	if len(resolutionFiles) > 0 {
 		frontier := collectIncrementalFileFrontier(cr.graph, resolutionFiles, nil)

@@ -109,7 +109,7 @@ func (w *Watcher) finishMutationSetPublication(attempt *mutationSetPublicationAt
 		return
 	}
 	for _, member := range attempt.members {
-		if failed[member.path] || w.pendingGeneration[member.path] != member.generation || w.observedMutationGeneration[member.path] != member.generation {
+		if failed[filepath.Clean(member.path)] || w.pendingGeneration[member.path] != member.generation || w.observedMutationGeneration[member.path] != member.generation {
 			continue
 		}
 		waiter := w.mutationWaiters[member.path][member.generation]

@@ -69,27 +69,19 @@ func TestLookupCoordinationWaitKeepsGateAndMutexSeparate(t *testing.T) {
 	}
 }
 
-func TestLookupCoordinationWaitReportsDetachedMutexAsNotAttempted(t *testing.T) {
-	store := repoTopologyStore(t)
-	mu := store.ResolveMutex()
-	mu.Lock()
-	defer mu.Unlock()
+func TestLookupCoordinationWaitReportsCancelledGlobalGate(t *testing.T) {
+	g, ids := newCallChain(t, 2)
+	finish := BeginTopologyMutation(g)
+	defer finish(false)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
 	var events []CoordinationWait
-	ctx := WithCoordinationWaitObserver(t.Context(), func(wait CoordinationWait) { events = append(events, wait) })
-	_, _, _, hit, truncated := LookupContext(ctx, store, seedA)
-	if !hit || truncated {
-		t.Fatalf("detached lookup hit=%v truncated=%v", hit, truncated)
+	ctx = WithCoordinationWaitObserver(ctx, func(wait CoordinationWait) { events = append(events, wait) })
+	_, _, _, _, truncated := LookupContext(ctx, g, ids[1])
+	if !truncated {
+		t.Fatal("cancelled gate admission must retain its conservative result")
 	}
-	found := false
-	for _, wait := range events {
-		if wait.Phase == "resolve_mutex_wait" {
-			found = true
-			if wait.Attempted || !wait.Acquired {
-				t.Fatalf("detached read claimed to acquire the held mutex: %+v", wait)
-			}
-		}
-	}
-	if !found {
-		t.Fatal("detached mutex disposition was absent")
+	if len(events) != 1 || events[0].Phase != "gate_wait" || !events[0].Attempted || events[0].Acquired {
+		t.Fatalf("cancelled global gate claimed successful or mutex admission: %+v", events)
 	}
 }
