@@ -1,13 +1,12 @@
 package mcp
 
 import (
- "context"
 
  "github.com/zzet/gortex/internal/indexer"
 )
 
 func (s *Server) bindSharedPhysicalOwner(record *mutationCommitRecord, publication *indexer.PublicationPhaseRecord) {
- if publication==nil || record==nil || !record.isPhysicalCommit() || !s.validSharedIdentity() { return }
+ if publication==nil || record==nil || !record.isPhysicalCommit() || !s.sharedIdentity.constructorValid(s) { return }
  s.mutationCommits.mu.Lock();defer s.mutationCommits.mu.Unlock()
  record.mu.RLock();defer record.mu.RUnlock()
  if record.owner!=s || s.mutationCommits.byID[record.id]!=record || record.publication!=publication || record.disk!=mutationDiskCommitted || record.commitSeq==0 { return }
@@ -40,7 +39,3 @@ func (s *Server) attachSharedOwnerAccounting(payload map[string]any, record *mut
  payload["shared_owner_accounting_v1_availability"]=map[string]any{"state":"frozen","reason":nil}
 }
 
-// Keep this callsite context signature local to existing original ownership.
-func (s *Server) bindOpenedSharedOwner(_ context.Context, record *mutationCommitRecord, publication *indexer.PublicationPhaseRecord) {
- s.bindSharedPhysicalOwner(record,publication)
-}

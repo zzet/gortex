@@ -1979,6 +1979,7 @@ func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map
 	tickets := make(map[string]*MutationTicket, len(paths))
 	for path := range paths {
 		backgroundEligible := freshSet && w.pendingGeneration[path] == 0 && w.observedMutationGeneration[path] == 0
+ if !backgroundEligible { call.invalid.Store(true) }
 		if timer, ok := w.pending[path]; ok {
 			if observation := w.mutationWaiters[path][w.pendingGeneration[path]].timerObservation; observation != nil && observation.background != nil {
 				observation.background.invalidate("superseded_by_mutation_set")

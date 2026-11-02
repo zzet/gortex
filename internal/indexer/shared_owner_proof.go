@@ -87,7 +87,7 @@ func (w *Watcher) prepareSharedOwnerAttempt(a *mutationSetPublicationAttempt) {
   r:=m.record.owner.Value()
   if r==nil || r.sharedSelf.Value()!=r || r.sharedInstance=="" || recorder!=nil && r!=recorder { return }
   recorder=r
-  m.record.mu.Lock(); physical:=m.record.sharedPhysical; valid:=physical!=nil && physical.Path==m.path && physical.Checkout=="" && physical.Incarnation==""; m.record.mu.Unlock()
+  m.record.mu.Lock(); physical:=m.record.sharedPhysical; valid:=physical!=nil && physical.Receipt==m.record.key && physical.Path==m.path && physical.Checkout=="" && physical.Incarnation==""; m.record.mu.Unlock()
   if !valid { return }
  }
  a.sharedInvocation=call
@@ -117,7 +117,7 @@ func (w *Watcher) finishSharedOwnerProof(a *mutationSetPublicationAttempt, timer
  if owner==nil || owner.sharedSelf.Value()!=owner || owner.sharedInstance=="" { return }
  first:=members[0].physical
  for i,m:=range members {
-  if m.physical.Server!=first.Server || m.physical.PID!=first.PID || m.physical.Birth!=first.Birth || m.physical.Checkout!="" || m.physical.Incarnation!="" || i>0 && (m.path==members[i-1].path || m.key==members[i-1].key) { return }
+  if m.key!=m.physical.Receipt || m.physical.Server!=first.Server || m.physical.PID!=first.PID || m.physical.Birth!=first.Birth || m.physical.Checkout!="" || m.physical.Incarnation!="" || i>0 && (m.path==members[i-1].path || m.key==members[i-1].key) { return }
  }
  frozen:=&sharedOwnerFrozen{members:members,recorder:weak.Make(owner),recorderName:owner.sharedInstance,invocation:call,arm:timer.frontier,retry:a.retry,execution:a.sharedWindow,intervals:intervals,callbackEntry:a.entered,executionReturn:a.executionReturned,drainReturn:returned,timerStart:timer.armStarted,timerEnd:timer.armFinished}
  if timer.armStarted.Before(call.entered) || timer.armFinished.Before(timer.armStarted) || a.entered.Before(timer.armFinished) { frozen.backgroundReason="overlapping_or_invalid_arm" }
