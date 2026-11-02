@@ -1720,7 +1720,6 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		if !servedFromOverlay {
-			compressionPending = true
 			var entry *projectionEntry
 			if facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts); ok {
 				facts.mu.RLock()

@@ -59,7 +59,8 @@ func TestReadFileCompressionRejectsHashABAAndNewPendingOwner(t *testing.T) {
 			base := s.graph
 			wrapped := &compressionCheckedStore{Store: base, checked: base.(graph.ConstantValueProjectionReader), nodes: base.(graph.OverlayLayerContractFileNodesReader)}
 			var published *projectionEntry
-			if mode == "hash_aba" {
+			switch mode {
+			case "hash_aba":
 				wrapped.afterNodes = func() {
 					nodes := base.GetFileNodes("service.go")
 					require.NotEmpty(t, nodes)
@@ -69,7 +70,7 @@ func TestReadFileCompressionRejectsHashABAAndNewPendingOwner(t *testing.T) {
 					base.AddNode(&changed)
 					base.AddNode(original)
 				}
-			} else if mode == "same_bytes_new_owner" || mode == "pending_owner_aba" {
+			case "same_bytes_new_owner", "pending_owner_aba":
 				wrapped.afterNodes = func() {
 					stamp, statErr := statDiskStamp(path)
 					require.NoError(t, statErr)
