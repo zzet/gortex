@@ -101,6 +101,11 @@ func waitForDaemonTarget(w io.Writer, target *daemonStopTarget, grace time.Durat
 			return daemonStopResult{}, fmt.Errorf("cannot verify daemon store ownership: %w", err)
 		}
 		if free {
+			// Exit or runtime cleanup may have completed after the first poll.
+			// Free ownership alone still cannot authorize success or a signal.
+			if complete, err := target.completeStop(w); complete || err != nil {
+				return daemonStopResult{}, err
+			}
 			return daemonStopResult{}, errors.New("daemon store is free but its captured runtime cleanup has not completed; process left unsignaled")
 		}
 		if reporting && progress.Since(now) < daemonCloseNoProgressBound {
