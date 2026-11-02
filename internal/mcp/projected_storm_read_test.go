@@ -40,3 +40,26 @@ func TestReadDuringStormLabelsPending(t *testing.T) {
 	require.Empty(t, pendingFileProjections.snap.Load().entries, "storm read must not publish a projection")
 	require.Nil(t, s.graph.GetNode("main.go::DuringStorm"))
 }
+
+func TestStormReadDoesNotHideAnUnrelatedFile(t *testing.T) {
+	selectedProjectionRegistry(t)
+	s, root := setupTestServer(t)
+	path := filepath.Join(root, "main.go")
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, append(before, []byte("\nfunc OutsideStorm() {}\n")...), 0600))
+	s.SetWatcher(projectedStormWatcher{path: filepath.Join(root, "other.go")})
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "get_file_summary"
+	req.Params.Arguments = map[string]any{"path": "main.go", "format": "json"}
+	result, err := s.wrapToolHandler(s.handleGetFileSummary)(t.Context(), req)
+	require.NoError(t, err)
+	require.False(t, result.IsError, "%s", resultText(result))
+	fields := extractTextResult(t, result)
+	freshness := fields["freshness"].(map[string]any)
+	require.Equal(t, true, freshness["readback_exact"])
+	require.Equal(t, "projected", freshness["file_view"])
+	require.NotContains(t, freshness, "file_reason")
+	require.NotEmpty(t, pendingFileProjections.snap.Load().entries)
+	require.Nil(t, s.graph.GetNode("main.go::OutsideStorm"))
+}

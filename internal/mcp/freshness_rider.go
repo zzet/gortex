@@ -588,7 +588,8 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 	if len(snapshots) > 0 {
 		snapshot, _ = ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot)
 	}
-	gapCount := len(paths) + len(receipts) + len(snapshot.paths) + len(projectedFiles)
+	stormFiles := requestProjectionStormFiles(ctx)
+	gapCount := len(paths) + len(receipts) + len(snapshot.paths) + len(projectedFiles) + len(stormFiles)
 	if len(snapshots) > 0 {
 		gapCount += len(snapshots[0])
 	}
@@ -626,6 +627,12 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 	// request's observed gap conservative instead of certifying graph freshness.
 	for _, file := range projectedFiles {
 		put(file, "pending", 0)
+	}
+	for _, file := range stormFiles {
+		put(file, "pending", 0)
+		if _, included := states[s.repoRelative(file)]; included {
+			label.fileReason = "storm"
+		}
 	}
 	putTiers := func(path string, tiers indexer.MutationTierState) {
 		at := tiers.RelationsAt
@@ -1090,6 +1097,9 @@ func (f relationFreshness) apply(result map[string]any) {
 		result["complete"] = false
 	}
 	result["graph_freshness"] = f.state
+	if f.state == "pending" && f.fileReason != "" {
+		result["file_reason"] = f.fileReason
+	}
 	scope := f.scope
 	if scope == "" {
 		scope = "relations"

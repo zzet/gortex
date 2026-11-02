@@ -74,6 +74,10 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 		if err != nil {
 			return ctx, err
 		}
+		if watcher, ok := s.currentWatcher().(interface{ StormActiveForFile(string) bool }); ok && watcher.StormActiveForFile(abs) {
+			markRequestProjectionStorm(ctx, graphPath)
+			continue
+		}
 		entry, err := s.projectCurrentTrackedFile(buildCtx, ctx, abs, graphPath, rel)
 		if err != nil {
 			return ctx, fmt.Errorf("file graph pending for %s: %w", graphPath, err)
@@ -224,8 +228,9 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 // graph layers retained by each derived context remain immutable snapshots.
 type requestProjectionFactsKey struct{}
 type requestProjectionFacts struct {
-	mu      sync.RWMutex
-	entries map[string]*projectionEntry
+	mu         sync.RWMutex
+	entries    map[string]*projectionEntry
+	stormFiles map[string]struct{} // queued storm observations, not publication authority
 }
 
 func withRequestProjectionFacts(ctx context.Context) context.Context {
@@ -233,6 +238,33 @@ func withRequestProjectionFacts(ctx context.Context) context.Context {
 		return ctx
 	}
 	return context.WithValue(ctx, requestProjectionFactsKey{}, &requestProjectionFacts{entries: make(map[string]*projectionEntry)})
+}
+
+// A queued storm defers disk projection for this request. Keep its observed
+// pending file in the same request-local facts consumed by the tier producer;
+// detached background work has no storm witness and retains generic labels.
+func markRequestProjectionStorm(ctx context.Context, path string) {
+	facts := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	facts.mu.Lock()
+	defer facts.mu.Unlock()
+	if facts.stormFiles == nil {
+		facts.stormFiles = make(map[string]struct{})
+	}
+	facts.stormFiles[path] = struct{}{}
+}
+
+func requestProjectionStormFiles(ctx context.Context) []string {
+	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	if !ok {
+		return nil
+	}
+	facts.mu.RLock()
+	defer facts.mu.RUnlock()
+	var paths []string
+	for path := range facts.stormFiles {
+		paths = append(paths, path)
+	}
+	return paths
 }
 
 // retainRequestProjection shares the existing request-owned freshness facts
