@@ -19,6 +19,7 @@ type walReclaimWriterCredit struct {
 	resetCtx       context.Context
 	cancelReset    context.CancelFunc
 	readmitted     bool
+	tailCopyTried  bool
 	yieldToWriters bool
 	slowTail       *walReclaimSlowTail
 }
@@ -48,6 +49,17 @@ func (w *walReclaimWriterCredit) resetContext(original context.Context) context.
 		return w.resetCtx
 	}
 	return original
+}
+
+// admissionError classifies only a known owned credit/admission failure.
+// SQL failures never pass through this path, and both operation scopes must
+// still be live before a child deadline becomes the lost-credit refusal.
+// Sentinel identity is deliberate: a wrapped custom cause is not our timer.
+func (w *walReclaimWriterCredit) admissionError(creditCtx, operationCtx, sqlCtx context.Context, err error) error {
+	if w.readmitted && w.resetCtx != nil && creditCtx == w.resetCtx && operationCtx.Err() == nil && sqlCtx.Err() == nil && err == context.DeadlineExceeded && creditCtx.Err() == context.DeadlineExceeded && context.Cause(creditCtx) == context.DeadlineExceeded {
+		return errWALReclaimReadersInFlight
+	}
+	return err
 }
 
 // PASSIVE uses the separate checkpoint connection and never takes SQLite's
@@ -153,7 +165,7 @@ func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *
 	if ctx.Err() != nil {
 		unused := allowance - w.spent
 		if w.readmitted || unused <= 0 || operationCtx.Err() != nil || !errors.Is(ctx.Err(), context.DeadlineExceeded) || !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
-			return result, ctx.Err()
+			return result, w.admissionError(ctx, operationCtx, opCtx, ctx.Err())
 		}
 		if demand := w.store.writeDemandCause(); w.yieldToWriters && demand != nil {
 			noteWALReclaimDemand(operationCtx, demand)
@@ -174,13 +186,29 @@ func (w *walReclaimWriterCredit) passive(ctx, operationCtx context.Context, db *
 		w.cancelReset = func() { stopYield(); cancel() }
 	}
 	if err := w.store.writeMu.lockReclaim(admissionCtx); err != nil {
-		return result, err
+		return result, w.admissionError(admissionCtx, operationCtx, opCtx, err)
 	}
 	w.since, w.held = time.Now(), true
 	if w.store.bulkConn != nil && !leaseOverride {
 		return result, errWALCheckpointDeferredBulk
 	}
 	snap, ok := readWALIndexSnapshot(w.store.dbPath)
+	// A producer may append after the durable slow copy released its first
+	// slice. An admitted final slice may finish that tail once, under exactly
+	// its remaining deadline. It cannot renew admission or writer credit.
+	if ok && snap.MxFrame != snap.NBackfill && w.readmitted && !w.tailCopyTried {
+		w.tailCopyTried = true
+		if limit, bounded := admissionCtx.Deadline(); bounded && time.Until(limit) > 0 {
+			result, err = w.passive(admissionCtx, operationCtx, db, time.Until(limit), leaseOverride)
+			if err != nil && !errors.Is(err, errSQLiteCheckpointIncomplete) {
+				return result, err
+			}
+			if !w.held {
+				return result, errWALReclaimReadersInFlight
+			}
+			snap, ok = readWALIndexSnapshot(w.store.dbPath)
+		}
+	}
 	if !ok || snap.MxFrame != snap.NBackfill {
 		return result, errWALReclaimReadersInFlight
 	}
