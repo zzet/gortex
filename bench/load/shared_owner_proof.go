@@ -36,6 +36,18 @@ func editProbeSharedHash(value string) bool {
 	return err == nil && len(decoded) == sha256.Size && hex.EncodeToString(decoded) == value
 }
 
+func editProbeSharedReplyError(status map[string]any) error {
+	for _, name := range []string{"truncated", "_truncated_by_budget", "_truncated_by_limit", "budget_exceeded", "budget_exhausted", "refused", "is_error"} {
+		if value, present := status[name]; present && value != false {
+			return errors.New("shared status has truncation/budget/refusal evidence: " + name)
+		}
+	}
+	if value := status["error"]; value != nil && value != "" {
+		return errors.New("shared status has error evidence")
+	}
+	return nil
+}
+
 func decodeEditProbeSharedMember(value any, binding *editProbeSharedBinding) (editProbeSharedMember, error) {
 	object, _ := value.(map[string]any)
 	if !editProbeExactKeys(object, "receipt", "publication_key", "path", "ticket", "physical_commit_sequence", "content_sha256", "checkout_id", "checkout_incarnation") {
@@ -127,13 +139,8 @@ func checkEditProbeSharedProof(status map[string]any, receipt string, binding *e
 	if err := binding.validate(p, role); err != nil {
 		return bad(err.Error())
 	}
-	for _, name := range []string{"truncated", "_truncated_by_budget", "_truncated_by_limit", "budget_exceeded", "budget_exhausted", "refused", "is_error"} {
-		if value, present := status[name]; present && value != false {
-			return bad("shared status has truncation/budget/refusal evidence: " + name)
-		}
-	}
-	if value := status["error"]; value != nil && value != "" {
-		return bad("shared status has error evidence")
+	if err := editProbeSharedReplyError(status); err != nil {
+		return bad(err.Error())
 	}
 	for name := range status {
 		if strings.HasPrefix(name, "shared_owner_accounting_v") && name != "shared_owner_accounting_v1" && name != "shared_owner_accounting_v1_availability" {

@@ -94,17 +94,18 @@ func decodeEditProbeMoveAcknowledgement(body map[string]any, sourceID, targetID 
 }
 
 type editProbeMoveFileAccounting struct {
-	Path            string           `json:"path"`
-	Role            string           `json:"role"`
-	Receipt         string           `json:"receipt"`
-	Blob            string           `json:"accepted_blob_sha"`
-	OwnerGeneration uint64           `json:"owner_generation"`
-	WriteStartedNS  *int64           `json:"write_started_ns"`
-	WriteReturnedNS *int64           `json:"write_returned_ns"`
-	WriteWindowNS   *int64           `json:"write_window_ns"`
-	D               *editProbeWindow `json:"direct_reconcile,omitempty"`
-	R               *editProbeWindow `json:"read_assisted_reconcile,omitempty"`
-	Route           string           `json:"publication_route,omitempty"`
+	Shared          *editProbeSharedReference `json:"shared_owner,omitempty"`
+	Path            string                    `json:"path"`
+	Role            string                    `json:"role"`
+	Receipt         string                    `json:"receipt"`
+	Blob            string                    `json:"accepted_blob_sha"`
+	OwnerGeneration uint64                    `json:"owner_generation"`
+	WriteStartedNS  *int64                    `json:"write_started_ns"`
+	WriteReturnedNS *int64                    `json:"write_returned_ns"`
+	WriteWindowNS   *int64                    `json:"write_window_ns"`
+	D               *editProbeWindow          `json:"direct_reconcile,omitempty"`
+	R               *editProbeWindow          `json:"read_assisted_reconcile,omitempty"`
+	Route           string                    `json:"publication_route,omitempty"`
 }
 type editProbeMoveAccounting struct {
 	State   string                        `json:"state"`

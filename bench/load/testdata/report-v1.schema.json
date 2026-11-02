@@ -1028,6 +1028,68 @@
                                       "role": {
                                         "type": "string"
                                       },
+                                      "shared_owner": {
+                                        "anyOf": [
+                                          {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "definition_key": {
+                                                "type": "string"
+                                              },
+                                              "member": {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "checkout_id": {
+                                                    "type": "string"
+                                                  },
+                                                  "checkout_incarnation": {
+                                                    "type": "string"
+                                                  },
+                                                  "content_sha256": {
+                                                    "type": "string"
+                                                  },
+                                                  "path": {
+                                                    "type": "string"
+                                                  },
+                                                  "physical_commit_sequence": {
+                                                    "type": "integer"
+                                                  },
+                                                  "publication_key": {
+                                                    "type": "string"
+                                                  },
+                                                  "receipt": {
+                                                    "type": "string"
+                                                  },
+                                                  "ticket": {
+                                                    "type": "integer"
+                                                  }
+                                                },
+                                                "required": [
+                                                  "receipt",
+                                                  "publication_key",
+                                                  "path",
+                                                  "ticket",
+                                                  "physical_commit_sequence",
+                                                  "content_sha256",
+                                                  "checkout_id",
+                                                  "checkout_incarnation"
+                                                ],
+                                                "type": "object"
+                                              },
+                                              "same_status_membership": {}
+                                            },
+                                            "required": [
+                                              "definition_key",
+                                              "member",
+                                              "same_status_membership"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
                                       "write_returned_ns": {
                                         "anyOf": [
                                           {

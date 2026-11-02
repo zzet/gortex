@@ -141,7 +141,7 @@ func TestSharedOwnerNativeMoveUsesActualServerMembership(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 	prefix := p.Repos[0].Prefix
 	sourceID, targetID := prefix+"/a.go::Moved", prefix+"/b.go::Moved"
-	raw, _, err := client.callWithIdentity(ctx, "tools/call", map[string]any{"name": "refactor", "arguments": map[string]any{"operation": "move", "target": map[string]any{"symbol": sourceID}, "destination": "b.go", "format": "json"}})
+	raw, identity, err := client.callWithIdentity(ctx, "tools/call", map[string]any{"name": "refactor", "arguments": map[string]any{"operation": "move", "target": map[string]any{"symbol": sourceID}, "destination": "b.go", "format": "json"}})
 	keep("move-ack.json", raw)
 	if err != nil {
 		t.Fatal(err)
@@ -164,6 +164,7 @@ func TestSharedOwnerNativeMoveUsesActualServerMembership(t *testing.T) {
 	}
 	var report editProbeSharedOwnerReport
 	var references []*editProbeSharedReference
+	statuses := make(map[string]map[string]any, 2)
 	for _, file := range refs.Files {
 		for {
 			raw, err := client.call(ctx, "tools/call", map[string]any{"name": "change", "arguments": map[string]any{"operation": "receipt", "options": map[string]any{"receipt": file.Receipt}}})
@@ -188,6 +189,7 @@ func TestSharedOwnerNativeMoveUsesActualServerMembership(t *testing.T) {
 					t.Fatalf("actual live Server/member proof rejected: %v", err)
 				}
 				references = append(references, ref)
+				statuses[file.Role] = row
 				break
 			}
 			if availability["state"] == "unavailable" || ctx.Err() != nil {
@@ -213,5 +215,15 @@ func TestSharedOwnerNativeMoveUsesActualServerMembership(t *testing.T) {
 		t.Fatal(err)
 	}
 	keep("normalized-owner-windows.json", normalized)
+	runtime := &editProbeRuntime{p: p, phase: &Phase{EditProbe: &editProbeReport{Role: "candidate"}}}
+	accounting := runtime.accountingForMoveStatuses(ctx, statuses, refs, identity.ID)
+	if accounting.State != "observed_move_shared_owner_windows_checks_pass" || accounting.A == nil {
+		t.Fatalf("actual native move did not preserve one A plus exact shared physical child ownership: %+v", accounting)
+	}
+	normalized, err = json.MarshalIndent(accounting, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep("normalized-move-accounting.json", normalized)
 	t.Log("actual owned SQLite/public-MCP two-file membership passed; no latency/campaign or per-file P/B acceptance claimed")
 }

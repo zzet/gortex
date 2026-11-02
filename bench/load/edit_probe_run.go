@@ -1041,7 +1041,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if !s.record.GraphTerminal && (move == nil || r.requireAccounting || !movePublicFactsComplete(s.record)) {
 		s.record.Errors = append(s.record.Errors, "graph receipt terminal unavailable")
 	}
-	if r.requireAccounting && move != nil && (s.record.MoveAccounting == nil || s.record.MoveAccounting.State != "observed_move_windows_checks_pass") {
+	if r.requireAccounting && move != nil && (s.record.MoveAccounting == nil || !editProbeMoveAccountingComplete(*s.record.MoveAccounting)) {
 		s.record.Errors = append(s.record.Errors, "move shared A/per-file write/direct accounting unavailable")
 	}
 	if r.requireAccounting && move == nil && !editProbeAccountingComplete(s.record.Accounting) {
