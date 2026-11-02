@@ -184,11 +184,16 @@ func TestQueryMicroLateDeadlineCallbackStillFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := delayedQueryDeadline{
-		Context:  context.WithValue(context.Background(), queryMicroDiagnosticsKey{}, true),
-		deadline: time.Now().Add(20 * time.Millisecond),
+		Context: context.WithValue(context.Background(), queryMicroDiagnosticsKey{}, true),
+		// The child must finish after the deadline regardless of startup speed.
+		// Done and Err still deliberately remain undelivered.
+		deadline: time.Now().Add(-time.Millisecond),
 	}
-	_, _, err = executeMicroProcess(ctx, binary, []string{"-test.run=^TestQueryMicroCaptureHelper$"}, t.TempDir(),
+	stdout, stderr, err := executeMicroProcess(ctx, binary, []string{"-test.run=^TestQueryMicroCaptureHelper$"}, t.TempDir(),
 		append(os.Environ(), "PERF_QUERY_CAPTURE_HELPER=success"))
+	if !strings.Contains(string(stdout), "|all") {
+		t.Fatalf("query helper did not reach its zero-exit path: %v\n%s\n%s", err, stdout, stderr)
+	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("query passed after its original deadline while callback lagged: %v", err)
 	}
