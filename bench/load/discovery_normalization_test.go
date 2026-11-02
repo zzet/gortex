@@ -79,7 +79,7 @@ func syntheticNormalization(t *testing.T)*normalizationFixture{
   "checkpoint_busy_log_checkpointed":[]int{0,0,0},"logical_table_count":len(tables),"all_logical_snapshots_equal":true,"catalog_identity_count":len(expected),"operator_source_sha256":operatorSHA,"normalizer_binary_sha256":binarySHA,"registrar_source_commit":l.UpgradeSourceCommit,"helper_main_source_sha256":helperSHA,"helper_build_vcs":"disabled (-buildvcs=false), synthetic private helper","qualification":"synthetic metadata/parser fixture only, not upgrade acceptance",
  }}
  f.docs["native"]=raw
- f.docs["plan"]=map[string]any{"source_root":root,"output_root":filepath.Dir(copyRoot),"files":files,"expected_schema":44,"native":map[string]any{"path":"not-executed-native","sha256":binarySHA},"operator":map[string]any{"path":"not-executed-operator","sha256":operatorSHA}}
+ f.docs["plan"]=map[string]any{"source_root":root,"output_root":filepath.Dir(copyRoot),"files":files,"expected_schema":44,"expected_raw_header_schema":21,"native":map[string]any{"path":"not-executed-native","sha256":binarySHA},"operator":map[string]any{"path":"not-executed-operator","sha256":operatorSHA}}
  f.docs["build"]=map[string]any{"source_commit":l.UpgradeSourceCommit,"source_tree":strings.Repeat("7",40),"module_inputs":[]map[string]any{{"path":"not-opened/main.go","sha256":helperSHA}},"product":map[string]any{"path":"not-executed-native","sha256":binarySHA},"vcs_qualification":"external private module -buildvcs=false"}
  f.docs["lane"]=map[string]any{"state":"terminal","supervisor_pid":pid+1,"child_pid":pid+2,"exit":0,"started_unix":float64(begin.UnixNano())/1e9,"finished_unix":float64(end.UnixNano())/1e9}
  f.docs["process"]=map[string]any{"pid":pid,"pgid":pid}
@@ -132,4 +132,68 @@ func TestDiscoveryNormalizationCannotUseLegacySamePairAssertion(t *testing.T){
  _,err:=resumeDiscoveryState(t.Context(),f.options,f.corpora)
  require.ErrorContains(t,err,"producer proof")
  require.NoDirExists(t,f.options.Discovery.RuntimeRoot)
+}
+
+func TestDiscoveryNormalizationRejectsContradictoryRawProvenance(t *testing.T){
+ for _,name:=range []string{"roles_alias","normal_close_missing","native_exit_nonzero","native_exit_missing","source_pair","operator_pin","build_source_pin","native_logical_change","schema_change","catalog_rekey","missing_catalog_rows","missing_count","duplicate_table","missing_after_close","failed_integrity","source_stop_not_normal","exit_owner","start_after_finish","live_normalizer","snapshot_shm","snapshot_header"}{
+  t.Run(name,func(t *testing.T){
+   f:=syntheticNormalization(t)
+   phase:=func(which string)map[string]any{return f.docs["native"][which].(map[string]any)}
+   table:=func(which string,index int)map[string]any{return phase(which)["tables"].([]any)[index].(map[string]any)}
+   switch name{
+   case "roles_alias":f.proof["normalizer_pid"]=f.lineage.OwnerPID
+   case "normal_close_missing":delete(f.proof,"normal_sql_close")
+   case "native_exit_nonzero":f.proof["normalizer_exit_code"]=1
+   case "native_exit_missing":delete(f.proof,"normalizer_exit_code")
+   case "source_pair":f.proof["source_main_sha256"]=strings.Repeat("f",64)
+   case "operator_pin":f.docs["plan"]["operator"].(map[string]any)["sha256"]=strings.Repeat("e",64)
+   case "build_source_pin":f.docs["build"]["source_commit"]=strings.Repeat("e",40)
+   case "native_logical_change":table("after_checkpoint",4)["sha256"]=strings.Repeat("e",64)
+   case "schema_change":phase("after_close")["schema_sha256"]=strings.Repeat("e",64)
+   case "catalog_rekey":for _,which:=range []string{"before","after_checkpoint","after_close"}{table(which,1)["catalog_rows"].([]any)[0].(map[string]any)["incarnation"]="synthetic-rekey"}
+   case "missing_catalog_rows":delete(table("before",0),"catalog_rows")
+   case "missing_count":delete(table("before",4),"rows")
+   case "duplicate_table":table("before",0)["name"]="nodes"
+   case "missing_after_close":delete(f.docs["native"],"after_close")
+   case "failed_integrity":phase("after_close")["integrity_check"]=[]string{"row missing"}
+   case "source_stop_not_normal":f.docs["stop"]["normal_stop"]=false
+   case "exit_owner":f.docs["exit"]["native_pid"]=f.lineage.OwnerPID
+   case "start_after_finish":f.docs["start"]["at"]=time.Now().Add(24*time.Hour).UTC().Format(time.RFC3339Nano)
+   case "live_normalizer":
+    pid:=os.Getpid();f.proof["normalizer_pid"]=pid;f.docs["process"]["pid"]=pid;f.docs["process"]["pgid"]=pid;f.docs["exit"]["native_pid"]=pid;f.docs["exit"]["process_groups_checked"]=[]int{pid}
+   case "snapshot_shm":require.NoError(t,os.WriteFile(f.lineage.Snapshot+"-shm",nil,0600))
+   case "snapshot_header":
+    bytes,err:=os.ReadFile(f.lineage.Snapshot);require.NoError(t,err);binary.BigEndian.PutUint32(bytes[60:64],21);require.NoError(t,os.WriteFile(f.lineage.Snapshot,bytes,0600))
+    sha,err:=discoveryFileSHA(f.lineage.Snapshot);require.NoError(t,err);f.lineage.MainSHA256=sha;f.proof["main_sha256"]=sha;f.docs["native"]["final_main_sha256"]=sha;f.docs["terminal"]["copy_after"].(map[string]any)["store.db"].(map[string]any)["sha256"]=sha
+   }
+   f.write(t)
+   before:=discoverySourceHashes(t,f.lineage.OwnedRoot)
+   p,err:=resumeDiscoveryState(t.Context(),f.options,f.corpora)
+   if p!=nil{t.Cleanup(func(){_ = os.RemoveAll(p.SocketDir)})}
+   require.Error(t,err,"summary assertions cannot replace raw role/hash/native evidence")
+   require.NoDirExists(t,f.options.Discovery.RuntimeRoot)
+   require.Equal(t,before,discoverySourceHashes(t,f.lineage.OwnedRoot))
+  })
+ }
+}
+
+func TestDiscoveryNormalizationRefCannotBeOpaqueOrRehashedWrongInput(t *testing.T){
+ for _,name:=range []string{"opaque","empty","tampered_native_ref","outside_owner","source_shm"}{
+  t.Run(name,func(t *testing.T){
+   f:=syntheticNormalization(t);lineage:=f.write(t)
+   switch name{
+   case "opaque":lineage["normalization_proof"]=map[string]any{"equivalent":true}
+   case "empty":lineage["normalization_proof"]=map[string]any{}
+   case "tampered_native_ref":
+    f.proof["native_observation"].(map[string]any)["sha256"]=strings.Repeat("0",64)
+    ref:=lineage["normalization_proof"].(map[string]any);path:=ref["path"].(string);require.NoError(t,os.Remove(path));require.NoError(t,discoveryWriteJSON(path,f.proof));sha,err:=discoveryFileSHA(path);require.NoError(t,err);ref["sha256"]=sha
+   case "outside_owner":
+    path:=filepath.Join(t.TempDir(),"proof.json");require.NoError(t,discoveryWriteJSON(path,f.proof));sha,err:=discoveryFileSHA(path);require.NoError(t,err);lineage["normalization_proof"]=map[string]any{"path":path,"sha256":sha}
+   case "source_shm":f.proof["source_shm_sha256"]=strings.Repeat("e",64);lineage=f.write(t)
+   }
+   require.NoError(t,os.Remove(f.options.Discovery.Resume));require.NoError(t,discoveryWriteJSON(f.options.Discovery.Resume,lineage))
+   _,err:=resumeDiscoveryState(t.Context(),f.options,f.corpora);require.Error(t,err)
+   require.NoDirExists(t,f.options.Discovery.RuntimeRoot)
+  })
+ }
 }

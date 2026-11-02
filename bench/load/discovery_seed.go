@@ -59,6 +59,7 @@ type discoverySeedLineage struct {
 	IdentityReceipt       string              `json:"identity_receipt"`
 	IdentityReceiptSHA256 string              `json:"identity_receipt_sha256"`
 	Repos                 []discoverySeedRepo `json:"repositories"`
+	NormalizationProof *discoveryNormalizationRef `json:"normalization_proof,omitempty"`
 }
 
 func discoveryFileSHA(path string) (string, error) {
@@ -243,13 +244,21 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 			return nil, errors.New("discovery configuration/producer proof digest mismatch")
 		}
 	}
+	normalization, err := readDiscoveryNormalization(root, l)
+	if err != nil {
+		return nil, err
+	}
+	sourceMain, sourceWAL := l.MainSHA256, l.WALSHA256
+	if normalization != nil {
+		sourceMain, sourceWAL = normalization.SourceMainSHA256, normalization.SourceWALSHA256
+	}
 	var catalog map[string]discoveryCatalogIdentity
 	for _, proofPath := range []string{l.StopReceipt, l.IdentityReceipt} {
 		var proof discoverySeedProof
 		if err := discoveryReadJSON(proofPath, &proof); err != nil {
 			return nil, err
 		}
-		if proof.State != "OBSERVED_OWNED_UPGRADE" || proof.ObservedAt.IsZero() || proof.OwnedRoot != root || proof.OwnerPID != l.OwnerPID || !proof.NormalStop || !proof.OwnersExited || proof.MainSHA256 != l.MainSHA256 || proof.WALSHA256 != l.WALSHA256 || proof.SchemaVersion != 44 || proof.UpgradeBinarySHA256 != l.UpgradeBinarySHA256 || !reflect.DeepEqual(proof.Repos, d.Repos) {
+		if proof.State != "OBSERVED_OWNED_UPGRADE" || proof.ObservedAt.IsZero() || proof.OwnedRoot != root || proof.OwnerPID != l.OwnerPID || !proof.NormalStop || !proof.OwnersExited || proof.MainSHA256 != sourceMain || proof.WALSHA256 != sourceWAL || proof.SchemaVersion != 44 || proof.UpgradeBinarySHA256 != l.UpgradeBinarySHA256 || !reflect.DeepEqual(proof.Repos, d.Repos) {
 			return nil, errors.New("discovery producer proof is unknown or does not bind this stopped snapshot and identity topology")
 		}
 		observed, err := discoveryReadCatalogReceipt(root, proof, d.Repos)
@@ -261,14 +270,26 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 		}
 		catalog = observed
 	}
-	process, err := os.FindProcess(l.OwnerPID)
+	if err := validateDiscoveryNormalization(root, l, normalization, catalog); err != nil {
+		return nil, err
+	}
+	owners := []int{l.OwnerPID}
+	if normalization != nil {
+		owners = append(owners, normalization.NormalizerPID)
+	}
+	for _, ownerPID := range owners {
+	process, err := os.FindProcess(ownerPID)
 	if err != nil {
 		return nil, err
 	}
 	err = process.Signal(syscall.Signal(0))
 	_ = process.Release()
 	if !errors.Is(err, syscall.ESRCH) && !errors.Is(err, os.ErrProcessDone) {
+		if ownerPID != l.OwnerPID {
+			return nil, errors.New("discovery normalizer owner is live or cannot be proven exited")
+		}
 		return nil, errors.New("discovery upgrade owner is live or cannot be proven exited")
+	}
 	}
 	binaryPath, err := filepath.Abs(o.Binary)
 	if err != nil {
