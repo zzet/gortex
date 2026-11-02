@@ -135,10 +135,10 @@ func linkedMovePhysicalLocked(ledger *mutationCommitLedger, s *Server, record *m
 // A status witness adds no authority: it only authenticates the existing weak
 // physical child across rendering, which refreshes and reacquires the ledger.
 type movePhysicalStatusWitness struct {
-	ack *editAcknowledgement
+	ack                               *editAcknowledgement
 	path, blob, checkout, incarnation string
-	sequence uint64
-	committed, writeStarted time.Time
+	sequence                          uint64
+	committed, writeStarted           time.Time
 }
 
 // Caller holds ledger then timing record. Keep the existing newest-owner and
@@ -149,7 +149,7 @@ func movePhysicalStatusLocked(ledger *mutationCommitLedger, s *Server, record *m
 		return nil
 	}
 	firstPath := true
-	for i := len(ledger.ordered)-1; i >= 0; i-- {
+	for i := len(ledger.ordered) - 1; i >= 0; i-- {
 		candidate := ledger.ordered[i]
 		if candidate == physical || (!candidate.isPublicationOwner() && candidate.kind != moveFileObservationCommit) || candidate.absPath != record.absPath {
 			continue
