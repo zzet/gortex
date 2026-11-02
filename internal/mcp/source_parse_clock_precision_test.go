@@ -22,7 +22,8 @@ func TestMeasuredParseEqualClockTickIsNotMissingOrReversed(t *testing.T) {
 			}
 			ack.finishActualAt(at)
 			ack.finishReplyAt(at, "result")
-			payload := buildAcknowledgementPayload(ack.snapshot(), "observed")
+			snapshot := ack.snapshot()
+			payload := buildAcknowledgementPayload(&snapshot, "observed")
 			parse := payload.ObservedExecutionMS["parse"]
 			if kind == "completed_equal" {
 				require.Equal(t, "measured", payload.PhaseStates["parse"])
