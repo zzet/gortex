@@ -322,7 +322,7 @@ type walShrinkSlice struct {
 func (s *Store) shrinkWALSliceOnce(ctx context.Context, ckptDB *sql.DB, slice int64) (out walShrinkSlice, err error) {
 	walPath := s.dbPath + "-wal"
 	wctx, cancel := context.WithTimeout(ctx, walReclaimWriterWait)
-	err = s.writeMu.LockContext(wctx)
+	err = s.writeMu.lockReclaim(wctx)
 	cancel()
 	if err != nil {
 		return out, fmt.Errorf("%w: wal shrink: writer gate: %w", ErrMaintenanceBusy, err)
@@ -486,7 +486,7 @@ func (s *Store) shrinkWAL(ctx context.Context, ckptDB *sql.DB) (slices int, shru
 // also holds.
 func (s *Store) restoreWriterJournalLimit(ctx context.Context) error {
 	wctx, cancel := context.WithTimeout(ctx, walReclaimWriterWait)
-	err := s.writeMu.LockContext(wctx)
+	err := s.writeMu.lockReclaim(wctx)
 	cancel()
 	if err != nil {
 		return err

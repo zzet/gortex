@@ -36,6 +36,9 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		if phase.DurationSec <= 0 {
 			phase.DurationSec = time.Since(phase.Started).Seconds()
 		}
+		for name, metric := range reclaimMetrics(phase.Status) {
+			phase.Metrics[name] = metric
+		}
 		phase.Tools = summarize(phase.Attempts, phase.DurationSec, "workload")
 		phase.Probes = summarize(phase.Attempts, phase.DurationSec, "probe")
 		for tool, row := range phase.Tools {

@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -272,6 +273,7 @@ func testPressureReaderDrainPolicy(t *testing.T, adaptive, productionPolicy, inP
 	}
 	require.False(t, s.readGate.closed.Load())
 	require.True(t, res.pauseClosed)
+	requirePauseAttribution(t, res)
 	require.Positive(t, res.pause)
 	require.LessOrEqual(t, res.writerSpent, walReclaimMaxWriterHold)
 	var after int
@@ -410,6 +412,7 @@ func TestPressureReaderDrainReopensForCancellationAndForegroundWrite(t *testing.
 				t.Fatal("foreground cancellation failed to stop drain")
 			}
 			require.False(t, s.readGate.closed.Load())
+			requirePauseAttribution(t, res)
 			close(release)
 			require.NoError(t, joinReader())
 		})
@@ -464,4 +467,18 @@ func TestPressureReaderDrainDoesNotReopenForeignGate(t *testing.T) {
 	require.False(t, s.readGate.closed.Load())
 	close(release)
 	require.NoError(t, joinReader())
+}
+
+func requirePauseAttribution(t *testing.T, res walReclaimResult) {
+	t.Helper()
+	value := reflect.ValueOf(res)
+	drain, truncate := value.FieldByName("pauseDrain"), value.FieldByName("pauseTruncate")
+	require.True(t, drain.IsValid() && truncate.IsValid(), "actual closed-gate pause has no drain/final-reset attribution")
+	require.GreaterOrEqual(t, drain.Int(), int64(0))
+	require.GreaterOrEqual(t, truncate.Int(), int64(0))
+	require.Equal(t, int64(res.pause), drain.Int()+truncate.Int(), "attribution must cover only actual closed admission, including cancellation")
+}
+
+func TestPressureReaderPauseAttribution(t *testing.T) {
+	testPressureReaderDrainPolicy(t, false, false, false)
 }
