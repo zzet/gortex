@@ -322,7 +322,7 @@ func targetRepoFileRaw(toolName string, req mcp.CallToolRequest) string {
 	switch toolName {
 	case "read_file", "get_file_summary", "get_editing_context":
 		raw = req.GetString("path", "")
-	case "get_symbol_source", "get_symbol":
+	case "get_symbol_source", "get_symbol", "get_cfg":
 		id := req.GetString("id", "")
 		if i := strings.Index(id, "::"); i >= 0 {
 			raw = id[:i]
@@ -490,9 +490,9 @@ func collectGraphFilePaths(v any) []string {
 	return out
 }
 
-// decorateResultWithFreshness merges freshness into JSON-object responses
-// and renders an in-band label for other output modes. Freshness-free
-// responses pass through unchanged.
+// decorateResultWithFreshness attaches the freshness rider under the
+// "freshness" key for JSON objects and uses the shared line renderer for
+// compact formats. An absent rider leaves the response byte-identical.
 func decorateResultWithFreshness(res *mcp.CallToolResult, rider map[string]any) *mcp.CallToolResult {
 	if len(rider) == 0 {
 		return res
@@ -522,6 +522,10 @@ func decorateResultWithFreshness(res *mcp.CallToolResult, rider map[string]any) 
 func renderFreshnessLine(res *mcp.CallToolResult, fields map[string]any) *mcp.CallToolResult {
 	state, _ := fields["graph_freshness"].(string)
 	scope, _ := fields["freshness_scope"].(string)
+	projected := fields["file_view"] == "projected" && fields["readback_exact"] == true
+	if state == "" && projected {
+		state, scope = "projected", "file"
+	}
 	if state == "" {
 		if fields["stale"] != true && fields["missing"] != true && fields["index_frozen"] != true {
 			return res
@@ -539,6 +543,9 @@ func renderFreshnessLine(res *mcp.CallToolResult, fields map[string]any) *mcp.Ca
 		count = 1
 	}
 	line := fmt.Sprintf("%s: %s (%v files)", scope, state, count)
+	if state == "projected" {
+		line = "file: projected (readback exact)"
+	}
 	body, ok := singleTextContent(res)
 	if !ok || strings.HasPrefix(body, line+"\n") {
 		return res
@@ -560,6 +567,17 @@ func renderFreshnessLine(res *mcp.CallToolResult, fields map[string]any) *mcp.Ca
 // their watcher; checkout routes retain their own scoped receipt authority.
 func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []string, snapshots ...[]*mutationReceipt) relationFreshness {
 	label := relationFreshness{scope: scope}
+	var projectedFiles []string
+	if len(files) > 0 {
+		label.projected = true
+		for _, file := range files {
+			projected := s.hasRequestProjectionFact(ctx, file)
+			label.projected = label.projected && projected
+			if scope != "file" && projected {
+				projectedFiles = append(projectedFiles, file)
+			}
+		}
+	}
 	paths, watched := s.canonicalTierPaths(ctx)
 	var receipts []*mutationReceipt
 	if !watched {
@@ -570,7 +588,9 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 	if len(snapshots) > 0 {
 		snapshot, _ = ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot)
 	}
-	gapCount := len(paths) + len(receipts) + len(snapshot.paths)
+	deferredFiles := requestDeferredProjectionFiles(ctx)
+	storeBusyFiles := requestStoreBusyFiles(ctx)
+	gapCount := len(paths) + len(receipts) + len(snapshot.paths) + len(projectedFiles) + len(deferredFiles) + len(storeBusyFiles)
 	if len(snapshots) > 0 {
 		gapCount += len(snapshots[0])
 	}
@@ -595,10 +615,54 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 		if len(ids)+len(files) > 0 && !inScope(path) {
 			return
 		}
+		if scope == "file" && s.hasRequestProjectionFact(ctx, path) {
+			return
+		}
 		key := s.repoRelative(path)
 		if prior, exists := states[key]; !exists || generation >= prior.generation {
 			states[key] = pathState{state, generation}
 		}
+	}
+	// Exact local projection is independent of background relation/derived
+	// publication, including external writes with no watcher receipt. Keep the
+	// request's observed gap conservative instead of certifying graph freshness.
+	for _, file := range projectedFiles {
+		put(file, "pending", 0)
+	}
+	for file, reason := range deferredFiles {
+		if reason == "watcher_unavailable" {
+			if len(ids)+len(files) > 0 && !inScope(file) {
+				continue
+			}
+			if len(ids)+len(files) == 0 {
+				if prefix := baseNarrowedRepoPrefix(requestViewFromContext(ctx)); prefix != "" && !strings.HasPrefix(s.repoRelative(file), prefix+"/") {
+					continue
+				}
+			}
+			label.backgroundMissing = true
+			put(file, "pending", 0)
+			continue
+		}
+		put(file, "pending", 0)
+		if _, included := states[s.repoRelative(file)]; included {
+			label.fileReason = reason
+		}
+	}
+	for _, file := range storeBusyFiles {
+		if len(ids)+len(files) > 0 && !inScope(file) {
+			continue
+		}
+		if len(ids)+len(files) == 0 {
+			if prefix := baseNarrowedRepoPrefix(requestViewFromContext(ctx)); prefix != "" && !strings.HasPrefix(s.repoRelative(file), prefix+"/") {
+				continue
+			}
+		}
+		key := s.repoRelative(file)
+		prior := states[key]
+		if prior.state != "failed" {
+			states[key] = pathState{"pending", prior.generation}
+		}
+		label.storeBusy = true
 	}
 	putTiers := func(path string, tiers indexer.MutationTierState) {
 		at := tiers.RelationsAt
@@ -695,13 +759,19 @@ func (s *Server) captureToolFreshness(ctx context.Context) context.Context {
 		}
 		return ctx
 	}
+	ctx = withRequestProjectionFacts(ctx)
 	return context.WithValue(ctx, toolFreshnessSnapshotKey{}, toolFreshnessSnapshot{receipts: receipts, paths: paths, startup: startup})
 }
 
 func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, files []string) {
 	if file := targetRepoFileRaw(name, req); file != "" {
-		if (name == "get_file_summary" || name == "get_editing_context") && requestBoolArg(&req, requireFreshArgName) {
+		switch name {
+		case "get_file_summary", "get_editing_context":
 			return "relations", nil, []string{file}
+		case "get_symbol":
+			if req.GetString("detail", "brief") == "full" {
+				return "relations", nil, []string{file}
+			}
 		}
 		return "file", nil, []string{file}
 	}
@@ -749,7 +819,16 @@ func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, 
 }
 
 func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp.CallToolRequest, res *mcp.CallToolResult) *mcp.CallToolResult {
+	// The leaf may have read before a newer physical execution replaced its
+	// borrowed source view. Refuse the entire read before labelling/rendering;
+	// effectful responses retain their actual disk effects and receipts.
+	if res != nil && !res.IsError && lateExactnessRefusalIsSafe(name) {
+		if err := validateRequestProjections(ctx); err != nil {
+			return mcp.NewToolResultError(err.Error())
+		}
+	}
 	scope, ids, files := freshnessTargets(name, req)
+	projected := false
 	var label relationFreshness
 	if scope != "" {
 		if selected := takeRequestFreshness(&req).scope; selected != "" {
@@ -759,7 +838,8 @@ func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp
 		if snapshot, ok := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); ok {
 			label = s.freshnessFor(ctx, scope, ids, files, snapshot.receipts)
 		}
-		if label.state != "" {
+		projected = label.projected
+		if label.state != "" || projected {
 			fields := make(map[string]any)
 			label.apply(fields)
 			fields["freshness_scope"] = scope
@@ -767,8 +847,10 @@ func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp
 		}
 	}
 	beforeFileRiders := res
-	if rider := s.freshnessRiderFor(name, req); rider != nil {
-		res = decorateResultWithFreshness(res, rider)
+	if !projected {
+		if rider := s.freshnessRiderFor(name, req); rider != nil {
+			res = decorateResultWithFreshness(res, rider)
+		}
 	}
 	if isFreshnessListTool(name) {
 		res = s.decorateListResultWithFreshness(res)
@@ -1034,6 +1116,14 @@ func (s *Server) awaitWatchedFreshness(ctx context.Context, name string, req mcp
 }
 
 func (f relationFreshness) apply(result map[string]any) {
+	if f.backgroundMissing {
+		result["background_admission"] = "unavailable"
+		result["background_state"] = "pending"
+	}
+	if f.projected {
+		result["file_view"] = "projected"
+		result["readback_exact"] = true
+	}
 	if f.state == "" {
 		return
 	}
@@ -1041,6 +1131,12 @@ func (f relationFreshness) apply(result map[string]any) {
 		result["complete"] = false
 	}
 	result["graph_freshness"] = f.state
+	if f.state == "pending" && f.fileReason != "" {
+		result["file_reason"] = f.fileReason
+	}
+	if f.state == "pending" && f.storeBusy {
+		result["reason"] = "store_busy"
+	}
 	scope := f.scope
 	if scope == "" {
 		scope = "relations"
@@ -1054,7 +1150,7 @@ func (f relationFreshness) apply(result map[string]any) {
 }
 
 func (f relationFreshness) decorate(res *mcp.CallToolResult) *mcp.CallToolResult {
-	if f.state == "" || res == nil || res.IsError {
+	if f.state == "" && !f.projected || res == nil || res.IsError {
 		return res
 	}
 	body, ok := singleTextContent(res)

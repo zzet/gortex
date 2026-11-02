@@ -2621,8 +2621,9 @@ type ClassHierarchyTraverser interface {
 // any defines node, filtered to symbols outside the file). All five
 // projections are scoped to the input file in one round-trip each.
 //
-// Optional capability — handleGetEditingContext falls back to the
-// per-symbol loop when the backend doesn't implement it.
+// Legacy synchronous capability. The MCP handler uses FileEditingContextReadScope
+// so cancellation, incomplete reads and selected-layer revisions are checked
+// before accepting a bundle; it never falls back to this errorless interface.
 type FileEditingContextResult struct {
 	FileNode *Node
 	Defines  []*Node

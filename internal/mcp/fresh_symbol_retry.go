@@ -33,7 +33,7 @@ func freshReadReplayAllowed(legacy string) bool {
 }
 
 func (s *Server) retryFreshSymbolSearch(attempt mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
-	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	return s.withProjectedSourceReadBudget(func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		freshness := takeRequestFreshness(&req)
 		legacy, known := s.legacyToolName(&req)
 		cursor, _ := requestRawArg(&req, "cursor")
@@ -75,7 +75,7 @@ func (s *Server) retryFreshSymbolSearch(attempt mcpserver.ToolHandlerFunc) mcpse
 				return last, nil
 			}
 		}
-	}
+	})
 }
 
 func cloneFreshSymbolArguments(args map[string]any) map[string]any {

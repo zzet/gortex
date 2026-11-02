@@ -548,48 +548,6 @@ func TestPropertyCrossCommunityWarningCorrectness(t *testing.T) {
 // 13.7 Property 17: Auto re-index rate limit
 // ============================================================================
 
-// Feature: gortex-enhancements, Property 17: Auto re-index rate limit
-//
-// ensureFresh refreshes at most 5 files even when more are stale.
-func TestPropertyAutoReindexRateLimit(t *testing.T) {
-	rapid.Check(t, func(rt *rapid.T) {
-		// Generate a list of stale file paths
-		staleCount := rapid.IntRange(1, 50).Draw(rt, "staleCount")
-		var staleFiles []string
-		for i := 0; i < staleCount; i++ {
-			staleFiles = append(staleFiles, "pkg/"+strings.Repeat("f", i+1)+".go")
-		}
-
-		// Simulate the ensureFresh rate limiting logic
-		limit := 5
-		var refreshed []string
-		for _, fp := range staleFiles {
-			if len(refreshed) >= limit {
-				break
-			}
-			// Simulate: all files are stale
-			refreshed = append(refreshed, fp)
-		}
-
-		// Verify: at most 5 files refreshed
-		if len(refreshed) > 5 {
-			rt.Errorf("ensureFresh refreshed %d files, expected at most 5", len(refreshed))
-		}
-
-		// Verify: when staleCount > 5, exactly 5 are refreshed
-		if staleCount > 5 && len(refreshed) != 5 {
-			rt.Errorf("with %d stale files, expected exactly 5 refreshed, got %d",
-				staleCount, len(refreshed))
-		}
-
-		// Verify: when staleCount <= 5, all are refreshed
-		if staleCount <= 5 && len(refreshed) != staleCount {
-			rt.Errorf("with %d stale files, expected all %d refreshed, got %d",
-				staleCount, staleCount, len(refreshed))
-		}
-	})
-}
-
 // ============================================================================
 // 14.1 Unit tests for tool handler edge cases
 // ============================================================================
@@ -689,34 +647,6 @@ func TestSingleCommunityImpactHasNullWarning(t *testing.T) {
 
 	if warning != nil {
 		t.Errorf("expected nil warning for single community, got: %+v", warning)
-	}
-}
-
-// TestWatchModeActiveSkipsAutoReindex verifies that ensureFresh returns nil
-// when watcher is active.
-func TestWatchModeActiveSkipsAutoReindex(t *testing.T) {
-	srv := &Server{
-		watcher: &indexer.Watcher{}, // non-nil watcher means watch mode is active
-	}
-
-	result := srv.ensureFresh([]string{"pkg/file.go", "pkg/other.go"})
-	if result != nil {
-		t.Errorf("expected nil when watcher is active, got: %v", result)
-	}
-}
-
-// TestAutoReindexFailureReturnsStaleDataWithWarning verifies that when
-// ensureFresh cannot re-index a file, it continues without crashing.
-// The ensureFresh method logs a warning and skips the file.
-func TestAutoReindexFailureReturnsStaleDataWithWarning(t *testing.T) {
-	// ensureFresh with nil indexer returns nil (no crash)
-	srv := &Server{
-		indexer: nil,
-		watcher: nil,
-	}
-	result := srv.ensureFresh([]string{"nonexistent/file.go"})
-	if result != nil {
-		t.Errorf("expected nil when indexer is nil, got: %v", result)
 	}
 }
 
