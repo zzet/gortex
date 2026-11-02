@@ -77,39 +77,67 @@ type FnValueCandidate struct {
 // the file actually declares means it never emits a candidate that cannot bind.
 // Call it once at the end of an extractor's Extract with the parse-tree root.
 func captureFnValueCandidates(result *parser.ExtractionResult, root *sitter.Node, filePath string, src []byte) {
+	captureFnValueCandidatesWithGoWork(result, root, filePath, src, nil)
+}
+
+// captureFnValueCandidatesWithGoWork retains the common semantic callback.
+// Only Go supplies the two qualifying grammar kinds from its existing tail
+// preorder; other extractors keep the original all-node walk through the wrapper.
+func captureFnValueCandidatesWithGoWork(result *parser.ExtractionResult, root *sitter.Node, filePath string, src []byte, goWork *goTailWork) {
 	if root == nil || result == nil {
 		return
 	}
-	lang, fileID := "", ""
-	funcs := map[string]bool{}
-	for _, n := range result.Nodes {
-		if n == nil || n.FilePath != filePath {
-			continue
-		}
-		if n.Kind == graph.KindFile {
-			if lang == "" {
-				lang = n.Language
+	var lang, fileID string
+	var funcs map[string]bool
+	var funcRanges []funcRange
+	if goWork != nil {
+		scope := goWork.referenceScope
+		lang, fileID, funcs, funcRanges = scope.lang, scope.fileID, scope.functions, scope.ranges
+	} else {
+		lang, fileID = "", ""
+		funcs = map[string]bool{}
+		for _, n := range result.Nodes {
+			if n == nil || n.FilePath != filePath {
+				continue
 			}
-			if fileID == "" {
-				fileID = n.ID
+			if n.Kind == graph.KindFile {
+				if lang == "" {
+					lang = n.Language
+				}
+				if fileID == "" {
+					fileID = n.ID
+				}
+			}
+			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
+				funcs[n.Name] = true
 			}
 		}
-		if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
-			funcs[n.Name] = true
-		}
+		funcRanges = buildFuncRanges(result)
 	}
-	funcRanges := buildFuncRanges(result)
 	if len(funcRanges) == 0 && fileID == "" {
 		return
 	}
 	spec := fnRefSpecFor(lang)
 	var cands []FnValueCandidate
 	seen := map[string]bool{}
-	walkNodes(root, func(n *sitter.Node) {
+	visit := func(n *sitter.Node, fact *goReferenceFact) {
+		normalize := normalizeFnRefSpecial
+		if fact != nil {
+			normalize = func(node *sitter.Node, src []byte) (string, string, bool) {
+				if node == n {
+					if fact.kind == "selector_expression" {
+						return swiftSelector(node, src)
+					}
+				} else if fact.parentKind == "selector_expression" {
+					return swiftSelector(node, src)
+				}
+				return "", "", false
+			}
+		}
 		// Special whole-node forms (method references, this.m / self.m,
 		// Ruby symbol callables, selectors) are normalised to a (member,
 		// receiver-hint) pair before the plain-identifier path.
-		if refName, recvHint, ok := normalizeFnRefSpecial(n, src); ok {
+		if refName, recvHint, ok := normalize(n, src); ok {
 			typeQualified := recvHint != "" && recvHint != "<self>"
 			// Flood guard: a `<self>` / selector member must name a same-file
 			// function/method; a type-qualified ref (`Foo::bar`) may bind
@@ -148,18 +176,29 @@ func captureFnValueCandidates(result *parser.ExtractionResult, root *sitter.Node
 			})
 			return
 		}
-		if !spec.matchesIDNode(n.Type()) {
+		if fact == nil && !spec.matchesIDNode(n.Type()) {
 			return
 		}
 		// Skip an identifier that is a component of a special form already
 		// captured as a whole (the `valueOf` in `Demo::valueOf`, the `handle`
 		// in `self.handle`), so it is not double-counted as a bare name.
-		if p := n.Parent(); p != nil {
-			if _, _, ok := normalizeFnRefSpecial(p, src); ok {
+		parent := func() *sitter.Node {
+			if fact != nil {
+				return fact.parent
+			}
+			return n.Parent()
+		}()
+		if p := parent; p != nil {
+			if _, _, ok := normalize(p, src); ok {
 				return
 			}
 		}
-		name := fnRefNodeName(n, src)
+		name := ""
+		if fact != nil {
+			name = fact.name
+		} else {
+			name = fnRefNodeName(n, src)
+		}
 		if name == "" {
 			return
 		}
@@ -169,7 +208,13 @@ func captureFnValueCandidates(result *parser.ExtractionResult, root *sitter.Node
 			// only when it is an explicit qualified path (e.g. Rust `m::f`) —
 			// a bare identifier that is not a same-file function is a local /
 			// param / builtin and is dropped to avoid flooding the gate.
-			if !spec.ungated || !isQualifiedFnRefNode(n.Type()) {
+			qualified := false
+			if fact != nil {
+				qualified = fact.kind == "selector_expression"
+			} else {
+				qualified = isQualifiedFnRefNode(n.Type())
+			}
+			if !spec.ungated || !qualified {
 				return
 			}
 			ungated = true
@@ -177,7 +222,13 @@ func captureFnValueCandidates(result *parser.ExtractionResult, root *sitter.Node
 		if fnRefStartsCall(spec, n, src) {
 			return // callee of a call (incl. tagged template), not a value use
 		}
-		if fnRefIsCallableDeclName(n) {
+		isDecl := false
+		if fact == nil {
+			isDecl = fnRefIsCallableDeclName(n)
+		} else {
+			isDecl = fnRefIsCallableDeclNameWithParent(n, parent)
+		}
+		if isDecl {
 			return // the declaration of the function, not a use of it
 		}
 		line := int(n.StartPoint().Row) + 1
@@ -194,7 +245,15 @@ func captureFnValueCandidates(result *parser.ExtractionResult, root *sitter.Node
 			FromID: fromID, Name: name, FilePath: filePath, Line: line,
 			Form: spec.fnRefForm(n), Lang: lang, Ungated: ungated,
 		})
-	})
+	}
+	if goWork == nil {
+		walkNodes(root, func(n *sitter.Node) { visit(n, nil) })
+	} else {
+		for i := range goWork.references {
+			fact := &goWork.references[i]
+			visit(fact.node, fact)
+		}
+	}
 	EmitFnValueCandidates(result, cands)
 }
 
