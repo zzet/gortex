@@ -329,8 +329,10 @@ func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
 					defer wg.Done()
 					select {
 					case <-resetEntered:
-					case <-resetFinished: return
-					case <-editCtx.Done(): return
+					case <-resetFinished:
+						return
+					case <-editCtx.Done():
+						return
 					}
 					editCalls++
 					reclaimHeldAtEdit = s.writeMu.reclaimSince.Load() != 0
@@ -338,7 +340,9 @@ func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
 					defer release()
 					started := time.Now()
 					editAcquireErr = s.writeMu.LockContext(editCtx)
-					if editAcquireErr != nil { return }
+					if editAcquireErr != nil {
+						return
+					}
 					wait = time.Since(started)
 					editAcquisitions++
 					s.writeMu.Unlock()

@@ -434,10 +434,10 @@ type walReclaimResetReaders struct {
 
 type walReclaimResult struct {
 	// Compile-tagged closed-gate fault only, never a bulk/hard-cap exception.
-	closedGateSeed                             bool
+	closedGateSeed bool
 	// Only shrink slices/journal-limit restoration may pass a build lane whose
 	// producer is currently blocked in AwaitWarmupWAL. Rechecked at admission.
-	warmupShrink bool
+	warmupShrink                               bool
 	deferredEditBurst, deferredInteractiveRead bool
 	attempt                                    *backgroundCheckpointAttempt // bounded cause witness, never a global registry
 	outcome                                    walReclaimOutcome
