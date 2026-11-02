@@ -1436,10 +1436,23 @@ func TestContractAnalysisCoordinatorPublishedIsLevelTriggered(t *testing.T) {
 func TestContractJobRetryWaitsWhileAnOwnerIsInFlight(t *testing.T) {
 	f := newRouteConstantFixture(t)
 	extractions, revalidations := 0, 0
-	var done chan struct{}
+	var release func()
+	held, waits, blocked := false, 0, 0
+	t.Cleanup(func() {
+		if held {
+			release()
+		}
+	})
+	f.onWait = func() {
+		if held {
+			waits++
+			f.announce() // Unrelated acceptance wakes while the owner stays held.
+		}
+	}
 	hooks := &contractConvergenceHooks{
 		revalidated: func(path string, equal bool) {
 			if path == "fixture/routes.go" {
+				require.False(t, held, "no recorded read may be asked while its owner is in flight")
 				revalidations++
 				require.True(t, equal, "the owner came back unchanged")
 			}
@@ -1449,29 +1462,33 @@ func TestContractJobRetryWaitsWhileAnOwnerIsInFlight(t *testing.T) {
 				return
 			}
 			extractions++
-			if done != nil {
+			if release != nil {
 				return
 			}
-			done = make(chan struct{})
-			release := f.beginHeld("fixture/consts.go")
-			go func() {
-				defer close(done)
-				for range 3 {
-					time.Sleep(100 * time.Millisecond)
-					f.announce()
-				}
-				time.Sleep(100 * time.Millisecond)
+			release = f.beginHeld("fixture/consts.go")
+			held = true
+		},
+		beforeAsk: func() {
+			if !held {
+				return
+			}
+			blocked++
+			require.Zero(t, revalidations, "unrelated wakeups cannot re-read an in-flight owner")
+			if waits >= 3 {
+				// R0 already captured the open window. Closing it now must not
+				// license this pass's reads; the next pass sees acceptance.
 				release()
-			}()
+				held = false
+			}
 		},
 	}
 	report, err := f.job(hooks, nil)
-	require.NotNil(t, done)
-	<-done
+	require.NotNil(t, release)
 	require.NoError(t, err)
 	require.True(t, report.Published)
 	require.Equal(t, 1, extractions, "the route is not extracted again")
 	require.Equal(t, 1, revalidations, "no retry reads while the owner is in flight")
+	require.GreaterOrEqual(t, blocked, 3, "the actual retry scans observed the held owner across unrelated wakeups")
 	require.Contains(t, contractIDs(f.contracts()), "http::GET::/before")
 }
 
