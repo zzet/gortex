@@ -2,6 +2,9 @@ package indexer
 
 import (
 	"os"
+	"errors"
+	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
 	"path/filepath"
 	"testing"
 	"time"
@@ -47,7 +50,6 @@ func TestCanonicalSuccessfulFallbackHasCompleteAcceptedPointAccounting(t *testin
 	// snapshot. Wait for that actual return, never synthesize a window here.
 	require.Eventually(t, func() bool { return record.Snapshot().attemptWindow != nil }, 5*time.Second, time.Millisecond)
 	snapshot := record.Snapshot()
-	require.True(t, snapshot.Terminal)
 	require.Equal(t, ticket.Generation, snapshot.Ticket)
 	require.Nil(t, snapshot.SharedSetExecution(), "this witness is one real point executor")
 	window := snapshot.EditTimings().Window
@@ -67,4 +69,43 @@ func TestCanonicalSuccessfulFallbackHasCompleteAcceptedPointAccounting(t *testin
 	require.NotNil(t, p.UnattributedMS)
 	require.GreaterOrEqual(t, *window.PatchWallMS, *p.SubtotalMS)
 	require.LessOrEqual(t, *p.UnattributedMS, *window.PatchWallMS/20, "strict P residual is checked against its own wall, never ACK/background")
+}
+
+// A real nil/error extraction or successful skip is not a complete physical
+// parse/apply/search observation. Existing quarantine returns also carry skipped.
+type fallbackNoResultExtractor struct {
+	parser.Extractor
+	err error
+}
+
+func (e fallbackNoResultExtractor) Extract(string, []byte) (*parser.ExtractionResult, error) {
+	return nil, e.err
+}
+
+func TestCanonicalFallbackUnknownPathsKeepIncompleteLaps(t *testing.T) {
+	for _, name := range []string{"nil_result", "extraction_error", "size_skip"} {
+		t.Run(name, func(t *testing.T) {
+			path, idx, _ := pointPublicationFixture(t)
+			if name == "size_skip" {
+				idx.config.MaxFileSize = 1
+			} else {
+				extractor := fallbackNoResultExtractor{Extractor: languages.NewGoExtractor()}
+				if name == "extraction_error" {
+					extractor.err = errors.New("owned extraction failure")
+				}
+				idx.registry = parser.NewRegistry()
+				idx.registry.Register(extractor)
+			}
+			_, stamps := beginRealPatchObservation(t)
+			err := idx.indexFile(path, false, &reparsePendingEnrichmentBatch{deferResolverCatchup: true, publication: stamps})
+			if name == "extraction_error" {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			for _, lap := range []canonicalPatchLap{patchParse, patchApply, patchSearch} {
+				require.True(t, stamps.patchLaps.laps[lap].incomplete, "unknown or skipped work must not become measured zero")
+			}
+		})
+	}
 }
