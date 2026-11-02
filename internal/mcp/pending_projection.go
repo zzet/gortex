@@ -66,6 +66,9 @@ type projectionEntry struct {
 	graphPath  string
 	repoPrefix string
 	commitSeq  uint64
+	// Existing physical source version survives a checked read-only COW copy.
+	// A new physical execution supplies its own sequence; zero stays unavailable.
+	sourceCommitSeq uint64
 	// hash equals the store's FileMetaRow.ContentHash once the store holds
 	// these bytes; rawHash covers the bytes on disk for the suspect re-check.
 	hash          string
@@ -175,20 +178,21 @@ func newProjectionEntry(absPath, repoPrefix string, projection *indexer.Projecti
 		layer.AddEdge(e)
 	}
 	return &projectionEntry{
-		key:          pathkey.MutationKey(absPath),
-		absPath:      absPath,
-		graphPath:    projection.GraphPath,
-		repoPrefix:   repoPrefix,
-		commitSeq:    commitSeq,
-		hash:         projection.ContentHash,
-		rawHash:      blake3.Sum256(raw),
-		disk:         disk,
-		language:     projection.Language,
-		layer:        layer,
-		parseErrors:  projection.ParseErrors,
-		parseChecked: projection.ParseChecked,
-		buildTime:    projection.BuildTime,
-		size:         int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes + 16,
+		key:             pathkey.MutationKey(absPath),
+		absPath:         absPath,
+		graphPath:       projection.GraphPath,
+		repoPrefix:      repoPrefix,
+		commitSeq:       commitSeq,
+		sourceCommitSeq: commitSeq,
+		hash:            projection.ContentHash,
+		rawHash:         blake3.Sum256(raw),
+		disk:            disk,
+		language:        projection.Language,
+		layer:           layer,
+		parseErrors:     projection.ParseErrors,
+		parseChecked:    projection.ParseChecked,
+		buildTime:       projection.BuildTime,
+		size:            int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes + 24,
 	}
 }
 
@@ -196,9 +200,13 @@ func newProjectionEntry(absPath, repoPrefix string, projection *indexer.Projecti
 // The owned layer is immutable and may be shared; the suspect atomic and disk
 // identity must never be copied or rewritten on an already-published entry.
 func (e *projectionEntry) committedCopy(sequence uint64, disk diskStamp) *projectionEntry {
+	sourceSequence := e.sourceCommitSeq
+	if sequence != 0 {
+		sourceSequence = sequence
+	}
 	copy := &projectionEntry{
 		key: e.key, absPath: e.absPath, graphPath: e.graphPath, repoPrefix: e.repoPrefix,
-		commitSeq: sequence, hash: e.hash, rawHash: e.rawHash, contentSHA256: e.contentSHA256, disk: disk, language: e.language,
+		commitSeq: sequence, sourceCommitSeq: sourceSequence, hash: e.hash, rawHash: e.rawHash, contentSHA256: e.contentSHA256, disk: disk, language: e.language,
 		layer: e.layer, fileView: e.fileView, parseErrors: e.parseErrors, parseChecked: e.parseChecked,
 		buildTime: e.buildTime, size: e.size, tombstone: e.tombstone,
 	}
@@ -214,14 +222,15 @@ func newProjectionTombstone(absPath, graphPath, repoPrefix string, commitSeq uin
 	layer := graph.NewOverlayLayer()
 	layer.MarkFile(graphPath, true)
 	return &projectionEntry{
-		key:        pathkey.MutationKey(absPath),
-		absPath:    absPath,
-		graphPath:  graphPath,
-		repoPrefix: repoPrefix,
-		commitSeq:  commitSeq,
-		layer:      layer,
-		size:       16, // charge the source-event revision and checked-retirement hint
-		tombstone:  true,
+		key:             pathkey.MutationKey(absPath),
+		absPath:         absPath,
+		graphPath:       graphPath,
+		repoPrefix:      repoPrefix,
+		commitSeq:       commitSeq,
+		sourceCommitSeq: commitSeq,
+		layer:           layer,
+		size:            24, // source version, source-event revision and checked-retirement hint
+		tombstone:       true,
 	}
 }
 
