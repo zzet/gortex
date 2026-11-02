@@ -277,7 +277,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	if len(editors) != max(1, plan.Editors) || len(readers) != plan.Readers {
 		return nil, nil, fmt.Errorf("edit-and-probe plan has %d fixed editors and %d readers but %d editor and %d reader sessions", max(1, plan.Editors), plan.Readers, len(editors), len(readers))
 	}
-	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, requireAccounting: !o.editProbeBaseline}
+	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, requireAccounting: !o.editProbeBaseline && !plan.SearchReadbackAcceptance}
 	original, err := os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
 	if err != nil {
 		return nil, nil, err
@@ -306,7 +306,13 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		}
 	}
 	r.original = original
-	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, r.requireAccounting)
+	// The search-only profile requires actual immediate search witnesses, not
+	// the separate edit gate's full phase accounting. Binary role is unchanged.
+	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, !o.editProbeBaseline)
+	phase.EditProbe.AccountingRequired = r.requireAccounting
+	if plan.SearchReadbackAcceptance {
+		phase.EditProbe.Limitations = append(phase.EditProbe.Limitations, "search-readback acceptance covers immediate content/search correctness only; full A/P/B accounting is diagnostic and unclaimed, missing windows remain unavailable")
+	}
 	if len(p.Repos) > 1 {
 		r.originals = make(map[string][]byte, len(p.Repos))
 		for _, repo := range p.Repos {
