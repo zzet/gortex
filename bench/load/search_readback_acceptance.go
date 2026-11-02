@@ -127,6 +127,12 @@ func searchReadbackRequest(kind string, repo privateRepo, step editProbeStep) re
 	if kind == "old_search_absent" || kind == "old_text_absent" {
 		query = strings.TrimPrefix(step.BeforeSymbol, c.File+"::")
 	}
+	if kind == "text" {
+		// The marker alone is already a prefix of the original Before name.
+		// Include the new declaration boundary so old trigram postings cannot
+		// locate the file and accidentally satisfy the pending-write probe.
+		query = "func " + step.Marker + "("
+	}
 	options := map[string]any{"limit": 10000, "max_bytes": 0, "path": c.File, "repo": repo.Prefix}
 	if operation == "symbols" {
 		options["query_class"], options["expand"], options["max_per_file"] = "symbol", "off", 0
