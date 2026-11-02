@@ -97,6 +97,10 @@ var buildDaemonStateForStart = buildDaemonState
 // serverstack constructor and returns the long-lived daemonState the
 // warmup loop and controller share.
 func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObserver) (*daemonState, error) {
+	return buildDaemonStateWithUpgradeCheckpoint(logger, nil, observers...)
+}
+
+func buildDaemonStateWithUpgradeCheckpoint(logger *zap.Logger, checkpoint func(string, int), observers ...store_sqlite.MigrationObserver) (*daemonState, error) {
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
@@ -120,7 +124,7 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 			migrationObserver(progress)
 		}
 	}
-	ss, err := serverstack.NewSharedServer(serverstack.SharedServerConfig{
+	sharedConfig := serverstack.SharedServerConfig{
 		Lifecycle:         serverstack.LifecycleDaemon,
 		Backend:           daemonBackend,
 		BackendPath:       daemonBackendPath,
@@ -144,7 +148,9 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 			NotesRepo:    "daemon",
 			NotebookPath: filepath.Join(platform.DataDir(), "notebook-cache"),
 		},
-	})
+	}
+	configureDaemonUpgradeCheckpoint(&sharedConfig, checkpoint)
+	ss, err := serverstack.NewSharedServer(sharedConfig)
 	if err != nil {
 		return nil, fmt.Errorf("build server stack: %w", err)
 	}
@@ -251,9 +257,9 @@ func (r *daemonStartupReporter) ObserveMigration(progress store_sqlite.Migration
 		r.logger.Info("daemon: schema migration complete",
 			zap.Int("version", progress.Version), zap.String("name", progress.Name),
 			zap.Duration("elapsed", progress.Elapsed))
-		r.state.StartupPhase = daemon.StartupOpeningStore
-		r.state.MigrationVersion = 0
-		r.state.MigrationName = ""
+		// A step finishes before its transaction commits and before Open
+		// recreates indexes and stamps the schema. Keep the upgrade refusal
+		// phase until the successful builder return records StoreOpened.
 	case store_sqlite.MigrationFailed:
 		r.logger.Error("daemon: schema migration failed",
 			zap.Int("version", progress.Version), zap.String("name", progress.Name),
@@ -271,6 +277,18 @@ func (r *daemonStartupReporter) ObserveMigration(progress store_sqlite.Migration
 		r.logger.Warn("daemon: upgrading the store schema without a backup",
 			zap.Int("from_version", progress.Version), zap.String("reason", progress.Detail))
 	}
+	r.publishLocked()
+}
+
+// StoreOpened records successful completion of the actual daemon store builder,
+// after commit, index recreation and schema stamping. Remaining runtime wiring
+// retains the ordinary opening_store phase until Serving.
+func (r *daemonStartupReporter) StoreOpened() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.StartupPhase = daemon.StartupOpeningStore
+	r.state.MigrationVersion = 0
+	r.state.MigrationName = ""
 	r.publishLocked()
 }
 

@@ -68,11 +68,15 @@ type upgradeScenarioSample struct {
 }
 
 type upgradeScenarioRun struct {
-	PID             int   `json:"pid"`
-	Killed          bool  `json:"killed"`
-	KilledAtMillis  int64 `json:"killed_at_ms,omitempty"`
-	KilledInVersion int   `json:"killed_in_migration_version,omitempty"`
-	ServingAtMillis int64 `json:"serving_at_ms,omitempty"`
+	StdoutPath      string `json:"stdout_path"`
+	StderrPath      string `json:"stderr_path"`
+	WaitError       string `json:"wait_error,omitempty"`
+	ExitCode        *int   `json:"exit_code,omitempty"`
+	PID             int    `json:"pid"`
+	Killed          bool   `json:"killed"`
+	KilledAtMillis  int64  `json:"killed_at_ms,omitempty"`
+	KilledInVersion int    `json:"killed_in_migration_version,omitempty"`
+	ServingAtMillis int64  `json:"serving_at_ms,omitempty"`
 	// ReadyAtMillis is the first sample whose graph call answered.
 	ReadyAtMillis int64                   `json:"ready_at_ms,omitempty"`
 	BytesWritten  *int64                  `json:"bytes_written,omitempty"` // Linux /proc/<pid>/io only
@@ -214,15 +218,25 @@ func TestUpgradeKillScenario(t *testing.T) {
 // runScenarioDaemon starts the daemon in the foreground and samples its
 // startup until it serves and the tracked repository answers a graph call;
 // with kill set it SIGKILLs the daemon at the first migrating sample instead.
-func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket, repo string, origin time.Time, kill bool) upgradeScenarioRun {
+func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket, repo string, origin time.Time, kill bool) (run upgradeScenarioRun) {
 	t.Helper()
 	cmd := exec.Command(binary, "daemon", "start", "--no-progress", "--backend-path", store)
 	cmd.Env = env
-	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+	stdout, stderr, persist := scenarioCaptureOutput(t, kill, &run)
+	defer persist()
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	if err := cmd.Start(); err != nil {
+		run.WaitError = "start: " + err.Error()
 		t.Fatal(err)
 	}
-	run := upgradeScenarioRun{PID: cmd.Process.Pid}
+	run.PID = cmd.Process.Pid
+	recordWait := func(err error) {
+		code := cmd.ProcessState.ExitCode()
+		run.ExitCode = &code
+		if err != nil {
+			run.WaitError = err.Error()
+		}
+	}
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
 	var servingAt time.Time
@@ -250,7 +264,7 @@ func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket,
 		if kill && sample.Phase == string(daemon.StartupMigrating) {
 			run.BytesWritten = procBytesWritten(cmd.Process.Pid)
 			_ = cmd.Process.Signal(syscall.SIGKILL)
-			<-exited
+			recordWait(<-exited)
 			run.Killed, run.KilledAtMillis, run.KilledInVersion = true, sample.AtMillis, st.MigrationVersion
 			return run
 		}
@@ -270,25 +284,28 @@ func runScenarioDaemon(t *testing.T, binary string, env []string, store, socket,
 			stop.Env = env
 			_ = stop.Run()
 			select {
-			case <-exited:
+			case err := <-exited:
+				recordWait(err)
 			case <-time.After(2 * time.Minute):
 				_ = cmd.Process.Kill()
-				<-exited
+				recordWait(<-exited)
 			}
 			return run
 		}
 		if !servingAt.IsZero() && time.Since(servingAt) > upgradeScenarioReadyWait {
 			_ = cmd.Process.Kill()
-			<-exited
+			recordWait(<-exited)
 			t.Fatalf("the tracked repository answered no graph call within %s of serving; last answer: %s", upgradeScenarioReadyWait, sample.GraphCall)
 		}
 		select {
 		case err := <-exited:
+			recordWait(err)
 			t.Fatalf("daemon exited during startup: %v", err)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
 	_ = cmd.Process.Kill()
+	recordWait(<-exited)
 	t.Fatal("the daemon did not answer a graph call within the scenario deadline")
 	return run
 }
