@@ -33,6 +33,7 @@ func TestCanonicalSuccessfulFallbackHasCompleteAcceptedPointAccounting(t *testin
 	require.NotNil(t, ticket)
 	result := awaitMutationRetryResult(t, ticket)
 	require.NoError(t, result.Err)
+	require.Equal(t, ticket.Generation, result.AppliedGeneration, "the accepted physical attempt must serve this exact original ticket")
 	require.NotNil(t, nodeByName(t, idx, "edit.go", "After"))
 	after, err := os.ReadFile(path)
 	require.NoError(t, err)

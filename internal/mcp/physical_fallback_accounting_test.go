@@ -99,11 +99,21 @@ func TestPhysicalFallbackAccountingRequiresOriginalDiskCommit(t *testing.T) {
 			require.GreaterOrEqual(t, extractor.calls.Load(), int32(2), "the successful prepared extraction must be followed by actual fallback extraction")
 			if !physical {
 				require.Nil(t, s.committedPublicationRecord(ctx, path), "queued graph success cannot mint physical sequence/owner")
+				require.Nil(t, admission.receipt.ticket.PublicationRecord)
+				note := mutationCommitNoteFrom(ctx)
+				note.mu.Lock()
+				count := len(note.records)
+				note.mu.Unlock()
+				require.Zero(t, count, "read-built work has no physical commit sequence")
 				return
 			}
 			publication := s.openCommittedPublicationRecord(ctx, record)
 			require.NotNil(t, publication)
 			record.recordGraph(s.awaitSourceMutations(ctx, admission))
+			admission.receipt.mu.RLock()
+			applied := admission.receipt.result.AppliedGeneration
+			admission.receipt.mu.RUnlock()
+			require.Equal(t, publication.Snapshot().Ticket, applied)
 			var window indexer.EditTimingWindow
 			require.Eventually(t, func() bool {
 				status := s.mutationStatusPayload(record)
