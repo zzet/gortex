@@ -22,6 +22,7 @@ type privateRepo struct {
 }
 
 type privateRun struct {
+	editACKMode      string
 	discoveryCatalog map[string]discoveryCatalogIdentity // discovery-only observed seed identities
 	Root             string
 	SocketDir        string
