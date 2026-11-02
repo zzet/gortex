@@ -20,7 +20,8 @@ func sharedOwnerProofModel(t *testing.T) (*privateRun, *editProbeSharedBinding, 
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
 	statePath := filepath.Join(root, "cache", "gortex", "daemon.state.json")
-	for _, dir := range []string{repo, filepath.Dir(statePath)} {
+	// privateEnv points TMPDIR here; coverage finalizes before child Wait.
+	for _, dir := range []string{repo, filepath.Dir(statePath), filepath.Join(root, "tmp")} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}

@@ -30,7 +30,9 @@ func TestSharedOwnerBindingRequiresActualChildStartupAndArm(t *testing.T) {
 	cache := filepath.Join(root, "cache")
 	statePath := filepath.Join(cache, "gortex", "daemon.state.json")
 	repo := filepath.Join(root, "repos", "primary")
-	for _, path := range []string{filepath.Dir(statePath), repo} {
+	// The covered self-child needs TMPDIR through coverage finalization,
+	// which completes before this fixture's child-wait cleanup returns.
+	for _, path := range []string{filepath.Dir(statePath), repo, filepath.Join(root, "tmp")} {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
