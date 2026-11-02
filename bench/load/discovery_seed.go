@@ -38,28 +38,28 @@ type discoverySeedDescriptor struct {
 	TotalCount       int                 `json:"total_checkout_count"`
 }
 type discoverySeedLineage struct {
-	State                 string              `json:"state"`
-	Descriptor            string              `json:"descriptor"`
-	DescriptorSHA256      string              `json:"descriptor_sha256"`
-	OwnedRoot             string              `json:"owned_root"`
-	SourceGeneration      string              `json:"source_generation"`
-	OldVersion            string              `json:"old_version"`
-	OldBinarySHA256       string              `json:"old_binary_sha256"`
-	UpgradeSourceCommit   string              `json:"upgrade_source_commit"`
-	UpgradeBinarySHA256   string              `json:"upgrade_binary_sha256"`
-	Snapshot              string              `json:"snapshot"`
-	MainSHA256            string              `json:"main_sha256"`
-	WALSHA256             string              `json:"wal_sha256"`
-	SchemaVersion         int                 `json:"schema_version"`
-	NormalStop            bool                `json:"normal_stop"`
-	OwnersExited          bool                `json:"owners_exited"`
-	OwnerPID              int                 `json:"owner_pid"`
-	StopReceipt           string              `json:"stop_receipt"`
-	StopReceiptSHA256     string              `json:"stop_receipt_sha256"`
-	IdentityReceipt       string              `json:"identity_receipt"`
-	IdentityReceiptSHA256 string              `json:"identity_receipt_sha256"`
-	Repos                 []discoverySeedRepo `json:"repositories"`
-	NormalizationProof *discoveryNormalizationRef `json:"normalization_proof,omitempty"`
+	State                 string                     `json:"state"`
+	Descriptor            string                     `json:"descriptor"`
+	DescriptorSHA256      string                     `json:"descriptor_sha256"`
+	OwnedRoot             string                     `json:"owned_root"`
+	SourceGeneration      string                     `json:"source_generation"`
+	OldVersion            string                     `json:"old_version"`
+	OldBinarySHA256       string                     `json:"old_binary_sha256"`
+	UpgradeSourceCommit   string                     `json:"upgrade_source_commit"`
+	UpgradeBinarySHA256   string                     `json:"upgrade_binary_sha256"`
+	Snapshot              string                     `json:"snapshot"`
+	MainSHA256            string                     `json:"main_sha256"`
+	WALSHA256             string                     `json:"wal_sha256"`
+	SchemaVersion         int                        `json:"schema_version"`
+	NormalStop            bool                       `json:"normal_stop"`
+	OwnersExited          bool                       `json:"owners_exited"`
+	OwnerPID              int                        `json:"owner_pid"`
+	StopReceipt           string                     `json:"stop_receipt"`
+	StopReceiptSHA256     string                     `json:"stop_receipt_sha256"`
+	IdentityReceipt       string                     `json:"identity_receipt"`
+	IdentityReceiptSHA256 string                     `json:"identity_receipt_sha256"`
+	Repos                 []discoverySeedRepo        `json:"repositories"`
+	NormalizationProof    *discoveryNormalizationRef `json:"normalization_proof,omitempty"`
 }
 
 func discoveryFileSHA(path string) (string, error) {
@@ -278,18 +278,18 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 		owners = append(owners, normalization.NormalizerPID)
 	}
 	for _, ownerPID := range owners {
-	process, err := os.FindProcess(ownerPID)
-	if err != nil {
-		return nil, err
-	}
-	err = process.Signal(syscall.Signal(0))
-	_ = process.Release()
-	if !errors.Is(err, syscall.ESRCH) && !errors.Is(err, os.ErrProcessDone) {
-		if ownerPID != l.OwnerPID {
-			return nil, errors.New("discovery normalizer owner is live or cannot be proven exited")
+		process, err := os.FindProcess(ownerPID)
+		if err != nil {
+			return nil, err
 		}
-		return nil, errors.New("discovery upgrade owner is live or cannot be proven exited")
-	}
+		err = process.Signal(syscall.Signal(0))
+		_ = process.Release()
+		if !errors.Is(err, syscall.ESRCH) && !errors.Is(err, os.ErrProcessDone) {
+			if ownerPID != l.OwnerPID {
+				return nil, errors.New("discovery normalizer owner is live or cannot be proven exited")
+			}
+			return nil, errors.New("discovery upgrade owner is live or cannot be proven exited")
+		}
 	}
 	binaryPath, err := filepath.Abs(o.Binary)
 	if err != nil {
