@@ -42,6 +42,7 @@ type runOptions struct {
 	EditRepos         int
 	EditProbeRole     string
 	editProbeBaseline bool
+	Discovery         discoveryOptions
 	Startup           startupOptions
 	pairedDriver      func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
 	smokeState        *privateRun // only the fixed smoke entry lends its freshly owned store
@@ -74,7 +75,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.StringVar(&o.GitSHA, "git-sha", "", "full binary revision if absent from Go build metadata")
 	f.StringVar(&o.Profile, "profile", "agent", "agent (default) or explicit saturation")
 	f.StringVar(&o.Host, "host", "native", "native, reference, or floor (validated, never provisioned)")
-	f.StringVar(&o.Scenario, "scenario", "read", "read, edit, many, many-edit, worktrees, cold, restart, sweep, idle-stop, edit-and-probe, all")
+	f.StringVar(&o.Scenario, "scenario", "read", "read, edit, many, many-edit, worktrees, worktree-discovery, cold, restart, sweep, idle-stop, edit-and-probe, all")
 	f.IntVar(&o.Agents, "agents", 4, "pure reading agents (may be 0 for edit, many-edit, or edit-and-probe; idle-stop requires 0)")
 	f.IntVar(&o.Editors, "edit-agents", 4, "combined editing/readback/reading agents in edit scenarios, in addition to pure readers")
 	f.IntVar(&o.Worktrees, "worktrees", 4, "linked worktrees in addition to primary")
@@ -90,6 +91,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.DurationVar(&o.SweepBudget, "sweep-duration", 10*time.Minute, "separate total budget for the repeated paced sweep")
 	bindStartupFlags(f, &o.Startup)
 	f.IntVar(&o.EditRepos, "edit-repos", 1, "edit-and-probe: one repository (default), or exactly six distinct pinned repositories")
+	bindDiscoveryFlags(f, &o.Discovery)
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
@@ -106,6 +108,9 @@ func validateRunOptions(o runOptions) error {
 		return errors.New("run requires --binary, --manifest, --scratch and nonnegative counts and positive budgets")
 	}
 	if err := validateAgentCounts(o.Scenario, o.Agents, o.Editors); err != nil {
+		return err
+	}
+	if err := o.Discovery.validate(o.Scenario, o.Worktrees); err != nil {
 		return err
 	}
 	if err := o.Startup.validate(o.Scenario); err != nil {
@@ -153,6 +158,12 @@ func validateRunOptions(o runOptions) error {
 }
 
 func selectedScenarios(o runOptions) ([]string, error) {
+	if o.Scenario == checkoutDiscoveryScenario {
+		if o.Agents+o.Editors < 2 || o.Host == "floor" {
+			return nil, errors.New("worktree-discovery requires at least two reading/editing sessions and a native or reference host")
+		}
+		return []string{checkoutDiscoveryScenario}, nil
+	}
 	if o.Scenario == "idle-stop" {
 		return []string{"idle-stop"}, nil
 	}
@@ -217,6 +228,9 @@ func runCommand(ctx context.Context, args []string) error {
 	}
 	if err := validateOutputRoots(corpora, o.Scratch, o.Output); err != nil {
 		return err
+	}
+	if o.Discovery.Prepare != "" {
+		return prepareDiscoveryState(ctx, o, corpora)
 	}
 	sha, err := binaryRevision(o.Binary, o.GitSHA)
 	if err != nil {

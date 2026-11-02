@@ -83,20 +83,22 @@ type Host struct {
 // Every attempt is retained, including busy refusals and phase-censored calls.
 // Workload and readiness/visibility probes have distinct Role denominators.
 type Attempt struct {
-	Tool            string    `json:"tool"`
-	Role            string    `json:"role"`
-	Request         string    `json:"request_sha256"`
-	Agent           int       `json:"agent"`
-	Step            int       `json:"step"`
-	Slot            int       `json:"slot"`
-	Retry           int       `json:"retry"`
-	Started         time.Time `json:"started"`
-	DurationMS      float64   `json:"duration_ms"`
-	LogicalMS       float64   `json:"logical_ms"` // includes earlier refusals and backoff, excludes think time
-	Code            int       `json:"code"`
-	Error           string    `json:"error"`
-	ExpectedOutcome string    `json:"expected_outcome,omitempty"`
-	Outcome         string    `json:"outcome"` // success, error, busy, product_deadline, phase_censored
+	CWD             string         `json:"cwd,omitempty"`
+	ErrorData       map[string]any `json:"error_data,omitempty"`
+	Tool            string         `json:"tool"`
+	Role            string         `json:"role"`
+	Request         string         `json:"request_sha256"`
+	Agent           int            `json:"agent"`
+	Step            int            `json:"step"`
+	Slot            int            `json:"slot"`
+	Retry           int            `json:"retry"`
+	Started         time.Time      `json:"started"`
+	DurationMS      float64        `json:"duration_ms"`
+	LogicalMS       float64        `json:"logical_ms"` // includes earlier refusals and backoff, excludes think time
+	Code            int            `json:"code"`
+	Error           string         `json:"error"`
+	ExpectedOutcome string         `json:"expected_outcome,omitempty"`
+	Outcome         string         `json:"outcome"` // success, error, busy, product_deadline, phase_censored
 }
 
 type ToolMetrics struct {
