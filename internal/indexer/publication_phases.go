@@ -134,6 +134,8 @@ const (
 // the first instant the record reached it, which is the only reading a latency
 // breakdown can use when a coalesced cycle serves several records.
 type PublicationPhaseRecorder struct {
+ sharedInstance string
+ sharedSelf weak.Pointer[PublicationPhaseRecorder]
 	mu          sync.Mutex
 	perCheckout int
 	checkouts   int
@@ -152,13 +154,15 @@ func NewPublicationPhaseRecorder(perCheckout, checkouts int) *PublicationPhaseRe
 	if checkouts <= 0 {
 		checkouts = defaultPublicationCheckouts
 	}
-	return &PublicationPhaseRecorder{
+	r := &PublicationPhaseRecorder{
 		perCheckout: perCheckout,
 		checkouts:   checkouts,
 		byCheckout:  make(map[string][]*PublicationPhaseRecord),
 		byKey:       make(map[string]*PublicationPhaseRecord),
 		lastTouched: make(map[string]time.Time),
 	}
+ r.initializeSharedIdentity()
+ return r
 }
 
 var defaultPublicationPhases = NewPublicationPhaseRecorder(0, 0)
