@@ -150,6 +150,14 @@ const (
 // finalize anyway.
 const plannerStatsBulkWindowReason = "bulk_window_active"
 
+// plannerStatsDenseIndexesMissingReason is reported instead of a verdict while
+// a cold bulk window that closed unsealed still owes dense indexes (listed in
+// PlannerStatsFreshness.DenseIndexesMissing). Some of the critical indexes may
+// be among them, and every rule would read an absent index as a clean store,
+// so the probe names the real problem instead. No ANALYZE can fix it: the
+// maintenance lane's repair rebuilds the indexes and the reason clears with it.
+const plannerStatsDenseIndexesMissingReason = "dense_indexes_missing"
+
 // Reasons a stale verdict can come back UNREFRESHED. None of them is a
 // failure, and none of them stamps the ledger or arms the anti-loop guard: the
 // verdict stands, the resume cursor keeps the indexes already finished, and the
@@ -618,6 +626,13 @@ func (s *Store) plannerStatsHealth(ctx context.Context, probeReceivers bool) (gr
 
 	if s.bulkWindowOpen.Load() {
 		health.Reason = plannerStatsBulkWindowReason
+		return health, bases, nil
+	}
+	// Same shape as the window above: not a judgeable state, Stale stays
+	// false and Known stays false, so nothing is seeded from it.
+	if missing := s.denseIndexesMissingNames(); len(missing) > 0 {
+		health.Reason = plannerStatsDenseIndexesMissingReason
+		health.DenseIndexesMissing = missing
 		return health, bases, nil
 	}
 

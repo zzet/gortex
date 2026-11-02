@@ -778,3 +778,59 @@ Inspect a profile with
 `go tool pprof -sample_index=inuse_space -top worktrees.step3.heap-load-peak.pprof`,
 and what one more worktree retains with
 `go tool pprof -sample_index=inuse_space -top -base worktrees.step2.heap-idle.pprof worktrees.step3.heap-idle.pprof`.
+
+### Live checkout discovery containment
+
+`--scenario worktree-discovery` starts with the first two pinned repositories
+in the manifest. It keeps their reading/editing sessions open while adding
+`--worktrees` detached checkouts alternating the two repositories during the offered
+window. Each added checkout gets separate root and subdirectory query sessions.
+Use `--agents 0 --edit-agents 8` for eight combined edit/readback agents, or
+`--agents 8 --edit-agents 0` for a read-only control. Editing requires the same
+validated edit fixtures as the ordinary edit scenarios.
+
+`phase.gate.checkout_discovery` records every added root, first request, first
+observed exact worktree view, and the resulting visibility lag. That lag is an
+upper bound on catalog identity allocation; it does not claim an unobserved
+earlier allocation time. Each cwd has its class, call/error/refusal counts,
+complete-call read latency distribution and separately counted censored reads.
+Attempts retain the actual session cwd and structured RPC `error_data`, including
+the refused root, family, reason and retryability when supplied by the daemon.
+A refusal or completed error outside a currently pending checkout fails the run.
+
+Run an otherwise identical `--worktrees 0` control to compare primary read p95.
+Keep both reports and all refused/censored attempts. Zero refusals without any
+`pending_refusals` is not evidence of fault containment under a stuck discovery.
+A hung-discovery fixture, upgraded-store fixture and the reference-host runs
+remain separate acceptance cells; this scenario does not manufacture them.
+All measurements require an isolated host window and fresh owned clones/stores.
+
+
+Discovery additions alternate the primary and unrelated control families. Each
+new root keeps its own family query and prefix for the exact-view witness;
+foreign-family capacity refusals fail the containment gate even while that
+new root is pending. `--discovery-stall-first` installs a daemon-only Git shim
+for the first new primary-family checkout. Its child ignores TERM and retains
+stdout until explicit release or a 60-second bound. The harness releases it
+before daemon shutdown and retains child/root/operation events. A missing
+stall or pending-refusal observation fails this cell.
+
+For upgraded fixtures, `--discovery-prepare <descriptor.json>` prepares owned
+roots without opening a store or launching a daemon. Add
+`--discovery-existing-worktrees 20 --discovery-existing-nested 5` to create five
+in-repository and fifteen sibling checkouts of the first family. The unrelated
+control is retained, so descriptor counts are two primaries plus twenty linked
+checkouts; selected-family counts are one plus twenty. The descriptor records
+actual paths, Git common directories, commits, source and configuration hashes,
+and a random owner token. Preparation requires a separate exclusive fixture
+producer to populate and upgrade the store at those exact paths.
+
+`--discovery-resume <lineage.json>` consumes that prepared root once. Lineage
+must bind the descriptor, old and upgrade binary/source pins, schema-44 main
+and WAL hashes, and structured normal-stop/catalog-identity receipts. Unknown,
+live, changed or relocated identities are refused. The stopped immutable
+snapshot remains inside the owned root; the destination store must be absent.
+The existing seed copier copies only main/WAL files, then both source and
+copied hashes are checked again. There is no SQL or catalog path rewriting.
+These discovery-only flags preserve the startup scenario's `--seed-store`
+contract. A copied fixture or synthetic parser control is not upgrade acceptance.

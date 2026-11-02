@@ -118,6 +118,9 @@ type (
 	capBFSContext interface {
 		BFSContext(context.Context, []string, graph.Direction, []graph.EdgeKind, int, int) ([]graph.BFSHop, error)
 	}
+	capLastFirstIndexDrains interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}
 	capRepoPrefixes interface{ RepoPrefixes() []string }
 )
 
@@ -218,6 +221,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"NodeLightSequencer", capOf[graph.NodeLightSequencer], capDropped, "node-only streaming; graph.NodesLightSeq falls back to the AllNodesLight forwarder, the same rows materialised"},
 		{"Store", capOf[graph.Store], capDropped, "the whole backend contract; a request reader is never the store"},
 		{"local:WALReclaimStats", capOf[walReclaimSnapshotReader], capDropped, capReasonBackend + " (physical store counters, never selected graph state)"},
+		{"local:LastFirstIndexDrains", capOf[capLastFirstIndexDrains], capDropped, capReasonBackend + " (shared-store drain observations, never selected graph state)"},
 		{"AnalysisGenerationStore", capOf[graph.AnalysisGenerationStore], capDropped, capReasonBackend},
 		{"AnalysisQueryStore", capOf[graph.AnalysisQueryStore], capDropped, capReasonBackend},
 		{"TryAnalysisQueryStore", capOf[graph.TryAnalysisQueryStore], capDropped, capReasonBackend},
