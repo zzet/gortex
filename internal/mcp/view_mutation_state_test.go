@@ -188,11 +188,11 @@ func TestCheckoutMutationResolvedRootRejectsFoldedDistinctDirectory(t *testing.T
 func TestCheckoutMutationPathLockRefusesOtherCheckout(t *testing.T) {
 	root := t.TempDir()
 	ctx := withCheckoutMutation(context.Background(), &fakeCheckoutMutationLifecycle{}, root)
-	release, err := acquireMutationPath(ctx, filepath.Join(t.TempDir(), "file.go"))
+	_, release, err := acquireMutationPath(ctx, filepath.Join(t.TempDir(), "file.go"))
 	if err == nil || release != nil {
 		t.Fatalf("lock acquired outside selected checkout: release=%v err=%v", release != nil, err)
 	}
-	release, err = acquireMutationPath(ctx, filepath.Join(root, "file.go"))
+	_, release, err = acquireMutationPath(ctx, filepath.Join(root, "file.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestCheckoutMutationOutsideFinalSymlinkPreserved(t *testing.T) {
 	}}
 	ctx := withCheckoutMutation(context.Background(), lease, root)
 	s := &Server{}
-	record, err := s.commitFileMutation(ctx, "write_file", "", "test", "link.go", outsideLink, []byte("package changed\n"), 0o644)
+	record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "test", "link.go", outsideLink, []byte("package changed\n"), 0o644)
 	if !errors.Is(err, errMutationNotApplied) || prepared || record.diskStatus() != mutationDiskNotApplied {
 		t.Fatalf("outside link was admitted: prepared=%v receipt=%+v err=%v", prepared, record.snapshot(), err)
 	}
@@ -265,7 +265,7 @@ func TestCheckoutMutationCommitPreparesBeforeDisk(t *testing.T) {
 	}}
 	ctx := withCheckoutMutation(context.Background(), lease, root)
 	s := &Server{}
-	record, err := s.commitFileMutation(ctx, "write_file", "", "test", "file.go", path, []byte("package changed\n"), 0o644)
+	record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "test", "file.go", path, []byte("package changed\n"), 0o644)
 	if err != nil || !prepared || record.diskStatus() != mutationDiskCommitted {
 		t.Fatalf("commit prepared=%v record=%+v err=%v", prepared, record.snapshot(), err)
 	}
@@ -295,7 +295,7 @@ func TestCheckoutMutationPrepareFailureLeavesDiskUntouched(t *testing.T) {
 			}}
 			ctx = withCheckoutMutation(ctx, lease, root)
 			s := &Server{}
-			record, err := s.commitFileMutation(ctx, "write_file", "", "test", "file.go", path, []byte("package changed\n"), 0o644)
+			record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "test", "file.go", path, []byte("package changed\n"), 0o644)
 			if !errors.Is(err, errMutationNotApplied) || record.diskStatus() != mutationDiskNotApplied {
 				t.Fatalf("expected not-applied receipt: %+v, %v", record.snapshot(), err)
 			}

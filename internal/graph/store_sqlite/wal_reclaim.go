@@ -254,6 +254,13 @@ func resolveWALReclaimConfig() walReclaimConfig {
 // read gate was closed per attempt that closed it; ReaderWait is what readers
 // actually spent held at the gate (per held read), measured on their side.
 type WALReclaimStats struct {
+	// WriterHold covers each reclaim acquisition, including credit reacquisition.
+	// WriterWait measures the first queued foreground waiter per reclaim hold.
+	// Snapshots never wait on the current writer holder.
+	WriterHold, WriterWait DurationHistogram
+	// Closed admission before final reset, and from final-reset start until reopening.
+	PauseDrain, PauseTruncate DurationHistogram
+
 	// One first observed cause per final non-reset reclaim attempt, including
 	// writer-demand refusal. Parked writer precedes intent if both are seen.
 	CancelledWriterParked, CancelledWriteIntent, CancelledOther int64
@@ -263,6 +270,7 @@ type WALReclaimStats struct {
 	WALPeakObserved      bool
 	ThresholdBytes       int64
 	Attempts             int64 // attempts that passed the size check and the lease
+	UrgentAttempts       int64 // admitted attempts whose final urgency was set
 	Resets               int64 // TRUNCATE checkpoints that reset the log
 	OpenGateResets       int64 // resets reached without closing the read gate
 	// LastResortRuns counts attempts at walReclaimLastResortBytes (each may
@@ -325,10 +333,12 @@ type WALReclaimStats struct {
 }
 
 type walReclaimState struct {
-	observedPeak atomic.Int64
-	peakObserved atomic.Bool
-	mu           sync.Mutex
-	stats        WALReclaimStats
+	pauseDrain    durationHistogram
+	pauseTruncate durationHistogram
+	observedPeak  atomic.Int64
+	peakObserved  atomic.Bool
+	mu            sync.Mutex
+	stats         WALReclaimStats
 	// cycle is the build-lane yield shared by the reclaim and the PASSIVE
 	// loop (checkpoint_cycle_yield.go).
 	cycle checkpointCycleYield
@@ -342,6 +352,10 @@ func (s *Store) WALReclaimStats() WALReclaimStats {
 	s.walReclaim.mu.Lock()
 	out := s.walReclaim.stats
 	s.walReclaim.mu.Unlock()
+	out.PauseDrain = s.walReclaim.pauseDrain.snapshot()
+	out.PauseTruncate = s.walReclaim.pauseTruncate.snapshot()
+	out.WriterHold = s.writeMu.reclaimHold.snapshot()
+	out.WriterWait = s.writeMu.reclaimWait.snapshot()
 	out.WALPeakObserved = s.walReclaim.peakObserved.Load()
 	out.ObservedPeakWALBytes = s.walReclaim.observedPeak.Load()
 	cycle := &s.walReclaim.cycle
@@ -409,13 +423,15 @@ type walReclaimResetReaders struct {
 }
 
 type walReclaimResult struct {
-	attempt     *backgroundCheckpointAttempt // bounded cause witness, never a global registry
-	outcome     walReclaimOutcome
-	reason      string
-	frames      int
-	pause       time.Duration
-	pauseClosed bool
-	openGate    bool
+	attempt                   *backgroundCheckpointAttempt // bounded cause witness, never a global registry
+	outcome                   walReclaimOutcome
+	reason                    string
+	frames                    int
+	pause                     time.Duration
+	pauseClosed               bool
+	pauseDrain, pauseTruncate time.Duration
+	pauseResetStarted         time.Time
+	openGate                  bool
 	// writerHold is the longest single hold of the writer; writerHolds
 	// counts the holds (the in-lane stage may take several short ones).
 	writerHold     time.Duration
@@ -569,6 +585,8 @@ func (s *Store) reclaimWALOnce(cfg walReclaimConfig, ckptDB *sql.DB, walPath str
 		}
 		if res.pauseClosed {
 			st.notePause(res.pause)
+			s.walReclaim.pauseDrain.observe(res.pauseDrain)
+			s.walReclaim.pauseTruncate.observe(res.pauseTruncate)
 		}
 		switch res.outcome {
 		case walReclaimSkipped:
@@ -589,6 +607,9 @@ func (s *Store) reclaimWALOnce(cfg walReclaimConfig, ckptDB *sql.DB, walPath str
 			st.Failures++
 		}
 		st.Attempts++
+		if res.urgent {
+			st.UrgentAttempts++
+		}
 	})
 	return res
 }
@@ -1011,7 +1032,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	// open-gate stages disabled).
 	// 3. Writer quiescence, capped at walReclaimMaxWriterHold from here on.
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
-	err := s.writeMu.LockContext(wctx)
+	err := s.writeMu.lockReclaim(wctx)
 	wcancel()
 	if err != nil {
 		res.reason = "writer_gate"
@@ -1173,15 +1194,20 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 		var inFlight int
 		reopen, inFlight, err = s.readGate.quiesce(yctx, start.Add(cfg.drainDeadline))
 		if err != nil {
-			res.pause, res.pauseClosed = time.Since(start), true
+			if !errors.Is(err, errReadGateBusy) {
+				res.notePauseInterval(start, time.Now(), time.Time{})
+			}
 			return giveUp(fmt.Sprintf("readers_in_flight=%d", inFlight), nil)
 		}
 	}
 	tctx, tcancel := context.WithTimeout(yctx, cfg.truncateBudget)
+	resetStarted := time.Now()
 	result, err := s.resetWALForReclaim(tctx)
 	tcancel()
 	reopen()
-	res.pause, res.pauseClosed = time.Since(start), quiesce
+	if quiesce {
+		res.notePauseInterval(start, time.Now(), resetStarted)
+	}
 	if err != nil {
 		return giveUp(fmt.Sprintf("truncate busy=%d wal_frames=%d checkpointed=%d error=%v", result.Busy, result.WALFrames, result.CheckpointedFrames, err), err)
 	}
@@ -1254,7 +1280,9 @@ func (s *Store) writeWanted() bool {
 // mutation queued behind them upstream of the write gate is not held by them
 // either. The release is idempotent.
 func (s *Store) AnnounceWrite() (release func()) {
-	return s.announceWrite(true)
+	release = s.announceWrite(true)
+	editGateClosedReclaimSeed(s)
+	return release
 }
 
 // AnnounceCheckoutRefresh retains global mutation demand while a checkout
@@ -1768,7 +1796,7 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 		return false, demand
 	}
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
-	err = s.writeMu.LockContext(wctx)
+	err = s.writeMu.lockReclaim(wctx)
 	wcancel()
 	if err != nil {
 		res.reason = "writer_gate"
@@ -1926,4 +1954,23 @@ func (s *Store) watchWALMark(parent context.Context, walPath string, markBytes i
 		}
 	}()
 	return ctx, cancel
+}
+
+// notePauseInterval partitions actual closed admission. A timer may reopen the
+// gate while SQLite finishes: work after reopening never inflates either stage.
+func (r *walReclaimResult) notePauseInterval(start, end, reset time.Time) {
+	if end.Before(start) {
+		end = start
+	}
+	split := end
+	if !reset.IsZero() && reset.Before(end) {
+		split = reset
+	}
+	if split.Before(start) {
+		split = start
+	}
+	r.pauseDrain += split.Sub(start)
+	r.pauseTruncate += end.Sub(split)
+	r.pause += end.Sub(start)
+	r.pauseClosed = true
 }

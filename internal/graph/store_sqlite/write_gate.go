@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // sqliteWriteGate is a zero-value, context-aware binary semaphore. It keeps
@@ -27,7 +28,22 @@ type sqliteWriteGate struct {
 	// holds counts completed holds (measurement: how often a path takes the
 	// writer).
 	holds atomic.Int64
+	// A WAL reclaim takes the gate through lockReclaim. reclaimSince is when
+	// its hold began and reclaimQueued when another writer first queued
+	// behind it (gateClock readings, zero when unset); Unlock turns them into
+	// how long the reclaim held the writer and how long writers waited for it.
+	reclaimSince  atomic.Int64
+	reclaimQueued atomic.Int64
+	reclaimHold   durationHistogram
+	reclaimWait   durationHistogram
 }
+
+// gateEpoch anchors gateClock to the monotonic clock, so a wall-clock step
+// cannot bend a recorded hold or wait.
+var gateEpoch = time.Now()
+
+// gateClock is nanoseconds since gateEpoch, never zero.
+func gateClock() int64 { return int64(time.Since(gateEpoch)) + 1 }
 
 // held reports whether someone holds the gate right now (a racy snapshot).
 func (g *sqliteWriteGate) held() bool {
@@ -66,6 +82,9 @@ func (g *sqliteWriteGate) LockContext(ctx context.Context) error {
 	}
 	g.waiters.Add(1)
 	defer g.waiters.Add(-1)
+	if g.reclaimSince.Load() != 0 {
+		g.reclaimQueued.CompareAndSwap(0, gateClock())
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -77,6 +96,24 @@ func (g *sqliteWriteGate) LockContext(ctx context.Context) error {
 		g.holder.Store(newHoldRecord())
 		return nil
 	}
+}
+
+// lockReclaim takes the gate for a WAL reclaim. Its Unlock records how long
+// the reclaim held the writer and, when other writers queued meanwhile, how
+// long the first of them waited for it. Other holders record neither.
+func (g *sqliteWriteGate) lockReclaim(ctx context.Context) error {
+	if err := g.LockContext(ctx); err != nil {
+		return err
+	}
+	now := gateClock()
+	g.reclaimQueued.Store(0)
+	g.reclaimSince.Store(now)
+	// Writers parked before the reclaim got the gate wait on it from now.
+	// A writer that parks after the store above marks reclaimQueued itself.
+	if g.waiters.Load() > 0 {
+		g.reclaimQueued.CompareAndSwap(0, now)
+	}
+	return nil
 }
 
 func (g *sqliteWriteGate) TryLock() bool {
@@ -94,6 +131,16 @@ func (g *sqliteWriteGate) Unlock() {
 	g.init()
 	if f := g.onRelease.Load(); f != nil {
 		(*f)()
+	}
+	// Only the reclaim holding the gate sets reclaimSince, so an ordinary
+	// release pays one load here.
+	if since := g.reclaimSince.Load(); since != 0 {
+		g.reclaimSince.Store(0)
+		now := gateClock()
+		g.reclaimHold.observe(time.Duration(now - since))
+		if queued := g.reclaimQueued.Swap(0); queued != 0 {
+			g.reclaimWait.observe(time.Duration(now - max(since, queued)))
+		}
 	}
 	endHold(g.holder.Swap(nil), "write gate")
 	g.holds.Add(1)

@@ -551,6 +551,26 @@ func insertEdgeChunksTxLimitedContext(ctx context.Context, tx *sql.Tx, viewGen i
 	return rowsInserted, statements, insertedKeys, nil
 }
 
+// SetBatchWriteHookForTest installs a hook every AddBatch-family write on this
+// store calls inside its transaction, under the write gate and before any row
+// is written, with the batch's node and edge counts. A returned error fails the
+// batch exactly as a failed insert would (the transaction rolls back and the
+// error reaches the caller the way that caller reports storage errors); a panic
+// unwinds the batch the same way. The hook runs under the write gate, so it
+// must not call the store's write methods. restore puts the previous hook back.
+func (s *Store) SetBatchWriteHookForTest(hook func(nodeRows, edgeRows int) error) (restore func()) {
+	previous := s.batchWriteHook.Swap(&hook)
+	return func() { s.batchWriteHook.Store(previous) }
+}
+
+func (s *Store) runBatchWriteHook(nodeRows, edgeRows int) error {
+	hook := s.batchWriteHook.Load()
+	if hook == nil || *hook == nil {
+		return nil
+	}
+	return (*hook)(nodeRows, edgeRows)
+}
+
 func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (sqliteAddBatchStats, error) {
 	return s.addBatchSetOrientedContext(context.Background(), nodes, edges)
 }
@@ -708,6 +728,9 @@ func (s *Store) addBatchSetOrientedContext(ctx context.Context, nodes []*graph.N
 	}
 	defer owner.finish(&err)
 	tx := owner.tx
+	if err := s.runBatchWriteHook(len(nodes), len(edges)); err != nil {
+		return stats, err
+	}
 
 	var (
 		receiptDelta  *sqliteMutationReceiptAccumulator

@@ -210,6 +210,35 @@ func TestGenerationBulkLoadRefusesWhatItCannotProveEmpty(t *testing.T) {
 	})
 }
 
+// TestAbortCoordinatedBulkLoadLeavesAGenerationWindowToItsOwner: an owner that
+// aborts after its coordinated end failed may find the writer pinned by a
+// payload generation opened since. The abort must leave that window, and the
+// checkpoint lease only its own end releases, to the generation's owner.
+func TestAbortCoordinatedBulkLoadLeavesAGenerationWindowToItsOwner(t *testing.T) {
+	store, _ := openTempStore(t)
+	engaged, err := store.BeginGenerationBulkLoad(3)
+	if err != nil || !engaged {
+		t.Fatalf("BeginGenerationBulkLoad = (%v, %v), want engaged", engaged, err)
+	}
+	if err := store.AbortCoordinatedBulkLoad(); err != nil {
+		t.Fatalf("AbortCoordinatedBulkLoad: %v", err)
+	}
+	if id, open := store.InGenerationBulkLoad(); id != 3 || !open {
+		t.Fatalf("generation window after abort = (%d, %v), want (3, true)", id, open)
+	}
+	if err := store.EndGenerationBulkLoad(); err != nil {
+		t.Fatalf("EndGenerationBulkLoad: %v", err)
+	}
+	// The owner's end released the lease: the next generation can open.
+	engaged, err = store.BeginGenerationBulkLoad(4)
+	if err != nil || !engaged {
+		t.Fatalf("next BeginGenerationBulkLoad = (%v, %v), want engaged", engaged, err)
+	}
+	if err := store.EndGenerationBulkLoad(); err != nil {
+		t.Fatalf("EndGenerationBulkLoad: %v", err)
+	}
+}
+
 func TestGenerationBulkLoadLeavesBaseReadersAndIndexesAlone(t *testing.T) {
 	store, _ := openTempStore(t)
 	baseNodes, baseEdges := bulkFixture(256, 512)

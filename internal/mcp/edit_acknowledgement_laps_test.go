@@ -143,7 +143,7 @@ func TestEditAcknowledgementRealDiskAndCanonicalTicketBoundaries(t *testing.T) {
 		var record *mutationCommitRecord
 		h := s.boundToolHandler(func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			var err error
-			record, err = s.commitFileMutation(ctx, "write_file", "", "", "written.go", path, []byte("package p\n"), 0o600)
+			record, err = s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "", "written.go", path, []byte("package p\n"), 0o600)
 			if err != nil {
 				return nil, err
 			}
@@ -250,7 +250,7 @@ func TestEditAcknowledgementActualDiskFailureDoesNotInventAdmission(t *testing.T
 	var record *mutationCommitRecord
 	h := s.boundToolHandler(func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var err error
-		record, err = s.commitFileMutation(ctx, "write_file", "", "", "owned-directory", path, []byte("after"), 0o600)
+		record, err = s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "", "owned-directory", path, []byte("after"), 0o600)
 		return nil, err
 	})
 	result, err := h(canonicalTimingContext(), editOperationRequest("write_file", ""))

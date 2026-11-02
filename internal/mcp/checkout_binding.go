@@ -15,20 +15,21 @@ import (
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
-// The three request-level freshness knobs. They are arguments of the request
+// Request-level freshness knobs. They are arguments of the request
 // rather than of any one tool — the middleware reads them for every tool, no
 // handler ever does — so they are named once here.
 const (
-	requireExactArgName = "require_exact"
-	requireFreshArgName = "require_fresh"
-	waitDeadlineArgName = "wait_deadline"
+	requireExactArgName   = "require_exact"
+	requireFreshArgName   = "require_fresh"
+	waitDeadlineArgName   = "wait_deadline"
+	freshnessScopeArgName = "freshness_scope"
 )
 
 // requestFreshnessArgNames is the accepted set, in the order the guide states
 // them.
-var requestFreshnessArgNames = []string{requireExactArgName, requireFreshArgName, waitDeadlineArgName}
+var requestFreshnessArgNames = []string{requireExactArgName, requireFreshArgName, waitDeadlineArgName, freshnessScopeArgName}
 
-// requestFreshnessArgKeys is THE allowlist that makes the three knobs callable
+// requestFreshnessArgKeys is THE allowlist that makes these knobs callable
 // on every tool. It is the single place the set is enumerated for dispatch:
 // wrapToolArgGuard consults it (arg_schema_guard.go) so a guarded tool's closed
 // schema cannot refuse a knob the request middleware honours, and the tests
@@ -104,6 +105,7 @@ type requestFreshness struct {
 	// requireFresh asks for a bounded wait until the selected checkout route
 	// reflects the working copy as it is now.
 	requireFresh bool
+	scope        string
 	// deadline bounds that wait. It is absolute (RFC3339) so a retry carries
 	// the same ceiling rather than restarting the clock.
 	deadline    time.Time
@@ -154,7 +156,7 @@ func (f requestFreshness) effectiveDeadline(now time.Time, ctx context.Context) 
 	return deadline
 }
 
-// takeRequestFreshness parses the three request-level knobs.
+// takeRequestFreshness parses the request-level knobs.
 //
 // It deliberately does not strip them from the argument map: require_exact has
 // always travelled through to the handler and every tool ignores an argument
@@ -172,6 +174,15 @@ func takeRequestFreshness(req *mcp.CallToolRequest) requestFreshness {
 	freshness := requestFreshness{
 		requireExact: requestRequiresExactCheckoutView(req),
 		requireFresh: requestBoolArg(req, requireFreshArgName),
+	}
+	if raw, present := requestRawArg(req, freshnessScopeArgName); present {
+		value, ok := raw.(string)
+		if !ok || value != "file" && value != "relations" && value != "derived" {
+			freshness.err = graphview.NewViewError(graphview.CodeInvalidViewSelector,
+				"freshness_scope must be file, relations, or derived")
+			return freshness
+		}
+		freshness.scope = value
 	}
 	raw, present := requestRawArg(req, waitDeadlineArgName)
 	if !present || raw == nil {
@@ -759,6 +770,11 @@ func exactnessWithdrawnRefusal(reason string) error {
 // session scope and request view selection. A cache miss observes only this
 // checkout of an already known Git family; it never tracks a new repository or
 // waits for parsing. Existing identities take the catalog-only fast path.
+//
+// A path inside a registered root, its subdirectories included, is answered
+// by that root and is never refused for a discovery pending elsewhere. The one
+// exception is a path inside a nested worktree that discovery has not
+// registered yet: only such a path is observed, so only it can be refused.
 func (s *Server) checkoutForRequestPath(ctx context.Context, path string) (store_sqlite.Checkout, bool, error) {
 	checkout, found, err := s.registeredCheckoutForPath(ctx, path)
 	if err != nil {

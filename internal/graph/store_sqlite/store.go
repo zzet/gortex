@@ -66,6 +66,9 @@ type backgroundCheckpointCoordination struct {
 }
 
 type storeCore struct {
+	firstIndexDrainsMu sync.Mutex
+	firstIndexDrains   map[string]graph.FirstIndexDrain
+
 	// baseFTSPages retains only exact ranked rows keyed by same-transaction
 	// global FTS state and mutable base ownership revision.
 	baseFTSPages symbolFTSPageCache
@@ -83,6 +86,9 @@ type storeCore struct {
 	// walShrinkPending: the WAL reclaim reset a big log in place and its
 	// file still has to be shrunk in slices (wal_shrink.go).
 	walShrinkPending atomic.Bool
+	// A blocked warm producer can own the build lane while awaiting shrink.
+	// Its scoped wait permits shrink through that lane; writer demand still wins.
+	warmupWALWaiters atomic.Int64
 	// walLimitKept: an in-place reset gave up on this fully copied log and
 	// left the writer's journal_size_limit lifted; the shrink restores it
 	// once the log has restarted (wal_shrink.go).
@@ -123,6 +129,7 @@ type storeCore struct {
 	readGate *sqliteReadGate
 	// walReclaim holds the reclaim's counters (WALReclaimStats).
 	walReclaim walReclaimState
+	walPassive walPassiveState
 	// walCopy is the reclaim copy's budget and counters (wal_copy_pause.go).
 	walCopy walCopyState
 	// writerCache sums the writer connection's page-cache counters.
@@ -340,6 +347,22 @@ type storeCore struct {
 	maintenanceDrainRunning bool
 	maintenanceDrainReason  string
 
+	// Dense-index repair (dense_index_repair.go). denseRepairOwed is the
+	// one-slot request the lane worker consumes, posted by a bulk-window exit
+	// that left indexes missing or by the backoff timer; denseRepairDelay is
+	// the backoff the next retry waits and denseRepairTimer that pending
+	// retry. All three are guarded by maintenanceSched. The counters record
+	// attempts that reached their DDL, attempts skipped for free space, and
+	// completed repairs; denseRepairDiskAvail is a test override of the
+	// free-space probe.
+	denseRepairOwed          bool
+	denseRepairDelay         time.Duration
+	denseRepairTimer         *time.Timer
+	denseIndexRepairAttempts atomic.Int64
+	denseIndexRepairSkips    atomic.Int64
+	denseIndexRepairs        atomic.Int64
+	denseRepairDiskAvail     atomic.Pointer[func(dir string) (uint64, error)]
+
 	// Lane counters. Requests counts scheduling calls, passes counts lane
 	// passes actually started (so a burst of requests collapsing into one
 	// pass is observable), jobs counts actions that reached their SQL,
@@ -436,6 +459,11 @@ type storeCore struct {
 	// synchronously under writeMu on cold paths; live FTS finalize emits after
 	// releasing the gate. Cold observers must not call back into Store.
 	bulkFinalizeObserver func(bulkFinalizeEvent)
+	// bulkSealHook and batchWriteHook are SetBulkSealHookForTest's and
+	// SetBatchWriteHookForTest's hooks. Per store rather than package-wide so
+	// parallel tests that each own a store do not share them.
+	bulkSealHook   atomic.Pointer[func(index string) error]
+	batchWriteHook atomic.Pointer[func(nodeRows, edgeRows int) error]
 	// Live FTS-finalize statement trace for tests; invoked only on those two
 	// maintenance calls, never on ordinary graph/edit writes.
 	ftsMaintenanceObserver func(string, []any)
@@ -506,6 +534,16 @@ type storeCore struct {
 	// one reader that must not take writeMu to ask: the planner-statistics
 	// health probe. Written only under writeMu, by syncBulkWindowLocked.
 	bulkWindowOpen atomic.Bool
+
+	// denseIndexesMissing holds the dense indexes a cold bulk window closed
+	// without rebuilding (its seal failed, or it was aborted before sealing),
+	// in bulkDroppableIndexes order and each with the DDL that builds it; nil
+	// when none are owed. Written only under writeMu and replaced, never
+	// mutated in place, so the health probe reads it without a lock for the
+	// same reason it reads bulkWindowOpen, and the maintenance lane's repair
+	// builds from it rather than reading bulkDroppableIndexes itself.
+	// Not persisted: Open's createGraphCoreIndexes rebuilds them on restart.
+	denseIndexesMissing atomic.Pointer[[]bulkDroppableIndex]
 
 	// Prepared statements (compiled once in Open, closed in Close).
 	stmtInsertNode          *sql.Stmt
@@ -713,7 +751,7 @@ func Open(path string, opts ...Option) (*Store, error) {
 	for _, opt := range opts {
 		opt(&o)
 	}
-	return openWithObserver(path, currentSchemaVersion, schemaMigrations, o.allowRebuild, o.migrationObserver)
+	return openStore(path, currentSchemaVersion, schemaMigrations, o)
 }
 
 // Option configures Open.
@@ -722,6 +760,11 @@ type Option func(*openOptions)
 type openOptions struct {
 	allowRebuild      bool
 	migrationObserver MigrationObserver
+	upgradeBackup     bool
+	upgradeHook       upgradeHook
+	// diskAvail reports the free bytes on the volume holding a directory.
+	// nil means platform.DiskAvailBytes; tests inject a fixed figure.
+	diskAvail func(dir string) (uint64, error)
 }
 
 // WithRebuild permits Open to drop and recreate an on-disk database whose
@@ -742,6 +785,28 @@ func WithRebuild() Option { return func(o *openOptions) { o.allowRebuild = true 
 // return promptly. It is not called when the store is already current.
 func WithMigrationObserver(observer MigrationObserver) Option {
 	return func(o *openOptions) { o.migrationObserver = observer }
+}
+
+// WithUpgradeBackup makes Open copy an existing store to
+// UpgradeBackupPath(path, oldVersion) before the first pending in-place
+// schema step runs, when the volume has room for the copy on top of the
+// upgrade itself. Without room, or when the copy fails, the backup is
+// skipped and the reason reported to the migration observer (or the log);
+// the upgrade still runs. An existing backup of the same version is kept.
+//
+// Like WithRebuild, the caller MUST hold exclusive cross-process access to
+// the store: the copy is consistent only because no other process can write
+// the store while it is taken.
+func WithUpgradeBackup() Option { return func(o *openOptions) { o.upgradeBackup = true } }
+
+// withUpgradeHook installs the crash-test hook on the schema transition.
+func withUpgradeHook(hook upgradeHook) Option {
+	return func(o *openOptions) { o.upgradeHook = hook }
+}
+
+// withDiskAvail replaces the free-space probe the upgrade precheck uses.
+func withDiskAvail(fn func(dir string) (uint64, error)) Option {
+	return func(o *openOptions) { o.diskAvail = fn }
 }
 
 // ErrSchemaRebuildRequired is returned by Open when an on-disk database needs a
@@ -774,14 +839,37 @@ func configureConnectionPool(db *sql.DB) {
 }
 
 func openWith(path string, current int, migrations []schemaMigration, allowRebuild bool) (*Store, error) {
-	return openWithObserver(path, current, migrations, allowRebuild, nil)
+	return openStore(path, current, migrations, openOptions{allowRebuild: allowRebuild})
 }
 
 func openWithObserver(path string, current int, migrations []schemaMigration, allowRebuild bool, observe MigrationObserver) (*Store, error) {
+	return openStore(path, current, migrations, openOptions{allowRebuild: allowRebuild, migrationObserver: observe})
+}
+
+// openStore is Open with the target version, the migration registry and the
+// resolved options spelled out, so tests can drive any transition without
+// mutating package globals.
+func openStore(path string, current int, migrations []schemaMigration, o openOptions) (*Store, error) {
+	allowRebuild, observe, hook := o.allowRebuild, o.migrationObserver, o.upgradeHook
 	// Refuse unsupported newer schemas before a writer connection can change
 	// journal mode or checkpoint their WAL. WithRebuild does not override this.
-	if err := checkSchemaDowngrade(path, current); err != nil {
+	probe, err := probeStoreSchema(path)
+	if err != nil {
 		return nil, err
+	}
+	if err := probe.refuseNewer(current); err != nil {
+		return nil, err
+	}
+	// Size a pending in-place upgrade while the store is still untouched: a
+	// refusal here leaves the file byte-identical. The writer handle below
+	// re-plans from its own read of the version; this plan only sizes.
+	if space, pending := measureUpgradeSpace(probe, current, planSchemaMigrationWith(probe.stored, current, migrations), o.diskAvail); pending {
+		if err := space.refuseShort(); err != nil {
+			return nil, err
+		}
+		if o.upgradeBackup {
+			backupBeforeUpgrade(space, observe, hook)
+		}
 	}
 
 	// Pragmas: WAL + synchronous=NORMAL is the standard write-heavy
@@ -925,7 +1013,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// pass WithRebuild. A wipe plan carries no in-place steps, and after a wipe
 	// the store is empty and the daemon's normal indexing repopulates it.
 	if plan.stamp {
-		if err := applyInPlaceMigrations(db, plan.inPlace, observe); err != nil {
+		if err := applyInPlaceMigrationsWith(db, plan.inPlace, observe, hook); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite schema migrate: %w", err)
 		}
@@ -939,6 +1027,9 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	if err := createGraphCoreIndexes(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite core index: %w", err)
+	}
+	if plan.stamp {
+		hook.at(upgradeIndexRecreation, current)
 	}
 	if err := createSidecarIndexes(db); err != nil {
 		_ = db.Close()
@@ -961,6 +1052,7 @@ func openWithObserver(path string, current int, migrations []schemaMigration, al
 	// preceding operation is idempotent, so an interruption before this point
 	// leaves the old version and safely retries the transition on the next Open.
 	if plan.stamp {
+		hook.at(upgradeBeforeStamp, current)
 		if err := setUserVersion(db, current); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("sqlite stamp schema version: %w", err)
@@ -1300,61 +1392,15 @@ func (s *Store) releaseGenerationBulkCheckpointLease(lease generationBulkCheckpo
 }
 
 func (s *Store) checkpointWALPassiveBackgroundOutcomeContext(ctx context.Context, db *sql.DB) (complete, retry bool) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	result, err := checkpointWALOnceOn(ctx, db, "PASSIVE")
-	ctxErr := ctx.Err()
-	if cause := context.Cause(ctx); errors.Is(cause, errWALCheckpointDeferredBulk) || errors.Is(cause, errWALCheckpointYieldedToCycle) {
-		return false, true
-	}
-	if err == nil {
-		return true, false
-	}
-	select {
-	case <-s.stopCheckpoint:
-		return false, false
-	default:
-	}
-	log.Print(passiveCheckpointReport(result, err, ctxErr))
-	return false, shouldRetryPassiveCheckpoint(err, ctxErr)
+	out := s.passiveCheckpointResultContext(ctx, db)
+	return out.complete, out.retry
 }
 
 func (s *Store) runCheckpointLoop(interval time.Duration) {
 	walPath, pressureBytes := sqliteWALPressureTarget(s.db, s.dbPath, sqliteWALAutoCheckpointPages())
 	schedule := newWALCheckpointSchedule(time.Now(), interval, pressureBytes)
-	var checkpointDB *sql.DB
-	closeCheckpointDB := func() {
-		if checkpointDB == nil {
-			return
-		}
-		if err := checkpointDB.Close(); err != nil {
-			log.Printf("store_sqlite: close background WAL checkpoint pool: %v", err)
-		}
-	}
-	checkpoint := func(forced bool) (complete, retry bool) {
-		policy := checkpointYieldsToCycle
-		if forced {
-			policy = checkpointIgnoresCycle
-		}
-		return s.runBackgroundCheckpointAttemptWith(policy, func(ctx context.Context) (bool, bool) {
-			if ctx.Err() != nil {
-				return false, true
-			}
-			if checkpointDB == nil {
-				db, err := openSQLiteStoreDB(sqliteCheckpointDSN(s.dbPath))
-				if err != nil {
-					if ctx.Err() == nil {
-						log.Printf("store_sqlite: wal checkpoint deferred mode=PASSIVE reason=open error=%q", err)
-					}
-					return false, ctx.Err() != nil
-				}
-				configureWriterPool(db)
-				checkpointDB = db
-			}
-			return s.checkpointWALPassiveBackgroundOutcomeContext(ctx, checkpointDB)
-		})
-	}
+	schedule.passive = &s.walPassive
+	checkpoint := passiveCheckpointer{store: s}
 	// The bounded reclaim runs beside the PASSIVE loop on its own goroutine
 	// and is joined by this loop's cleanup, so Close's stopCheckpointLoop
 	// still guarantees no checkpoint of either kind is in flight.
@@ -1365,12 +1411,12 @@ func (s *Store) runCheckpointLoop(interval time.Duration) {
 		walCheckpointRetryInitial,
 		walCheckpointRetryMax,
 		func() bool {
-			return schedule.attemptYielding(time.Now(), walPath, s.cycleLane(), checkpoint)
+			return schedule.attemptYielding(time.Now(), walPath, s.cycleLane(), checkpoint.run)
 		},
 		func() {
 			stopReclaim()
 			stopLazyIndex()
-			closeCheckpointDB()
+			checkpoint.close()
 		},
 	)
 }
@@ -1457,7 +1503,8 @@ type walCheckpointSchedule struct {
 	interval     time.Duration
 	nextPeriodic time.Time
 	// cycle is the build-lane deferral episode (checkpoint_cycle_yield.go).
-	cycle cycleDeferral
+	cycle   cycleDeferral
+	passive *walPassiveState // installed only by the real background producer
 }
 
 func newWALCheckpointSchedule(now time.Time, interval time.Duration, thresholdBytes int64) walCheckpointSchedule {
@@ -1487,6 +1534,9 @@ func (s *walCheckpointSchedule) attemptYielding(now time.Time, walPath string, l
 		return false
 	}
 	if lane.reclaimOwns(walPath) {
+		if s.passive != nil {
+			s.passive.update(func(st *WALPassiveStats) { st.StoodAsideReclaim++; st.LastOutcome = "stood_aside_reclaim" })
+		}
 		// Over the reclaim's threshold the reclaim backfills and resets the
 		// log itself; a long PASSIVE here would only hold the one background
 		// checkpoint slot and refuse it (checkpoint_lease) for the length of
@@ -1496,6 +1546,9 @@ func (s *walCheckpointSchedule) attemptYielding(now time.Time, walPath string, l
 	run, forced := s.cycle.decide(now, lane.busy(), lane.maxDeferral, func() bool { return s.gate.over(walPath) })
 	if !run {
 		lane.noteDeferral()
+		if s.passive != nil {
+			s.passive.deferred(now, true)
+		}
 		logCycleDeferral(&s.cycle, now)
 		return false
 	}
@@ -1503,11 +1556,17 @@ func (s *walCheckpointSchedule) attemptYielding(now time.Time, walPath string, l
 		lane.noteForced()
 		logCycleForced(&s.cycle, now)
 	}
+	if s.passive != nil {
+		s.passive.endDeferral(now)
+	}
 	complete, retry := checkpoint(forced)
 	if !complete && !forced && lane.busy() {
 		// A cycle took the lane mid-attempt (or refused it at the start):
 		// neither a failure nor contention the checkpoint caused.
 		s.cycle.yielded(now)
+		if s.passive != nil {
+			s.passive.deferred(now, false)
+		}
 		return false
 	}
 	s.cycle.ran()

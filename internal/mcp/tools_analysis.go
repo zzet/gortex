@@ -352,12 +352,43 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	if scopeErr := s.repoPrefixInSessionScope(ctx, repoPrefix, repoPrefix); scopeErr != nil {
 		return mcp.NewToolResultError(scopeErr.Error()), nil
 	}
+	checkoutScoped := control != nil && control.CheckoutScoped
 	var pending bool
 	var freshnessErr error
-	if control != nil && control.CheckoutScoped {
+	var label relationFreshness
+	var diff *analysis.DiffResult
+	var freshness requestFreshness
+	var keys []string
+	var deadline time.Time
+	if checkoutScoped {
 		pending, freshnessErr = s.mutationFreshnessSummaryForRepos(ctx, repoPrefix)
-	} else if err := s.awaitMutationFreshnessForRepos(ctx, repoPrefix); err != nil {
-		return mcp.NewToolResultError("change detection refused a stale graph: " + err.Error()), nil
+	} else {
+		// Diff the files first: they are the relation scope the wait below
+		// is bounded to, so an edit elsewhere in the repository neither
+		// delays nor labels this answer.
+		files, err := analysis.MapGitDiffContext(ctx, nil, repoRoot, repoPrefix, scope, baseRef)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		keys = make([]string, len(files.ChangedFiles))
+		for i, file := range files.ChangedFiles {
+			keys[i] = analysis.GraphKey(repoPrefix, file, analysis.RepoRelativePath)
+		}
+		freshness = takeRequestFreshness(&req)
+		deadline = relationWaitDeadline(ctx, freshness)
+		label = s.awaitRelationFreshness(ctx, nil, keys, deadline)
+		if freshness.requireFresh && label.state != "" {
+			return label.requireFreshError(), nil
+		}
+		diff = files
+	}
+	respond := func(result map[string]any) (*mcp.CallToolResult, error) {
+		if !checkoutScoped {
+			result["barrier_wait_ms"] = label.waited.Milliseconds()
+			label.apply(result)
+		}
+		res, err := s.respondJSONOrTOON(ctx, req, result)
+		return label.decorate(res), err
 	}
 	reader := s.readerFor(ctx)
 	graphStatus, graphDetail := "ready", ""
@@ -381,7 +412,12 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		reader = nil
 	}
 
-	diff, err := analysis.MapGitDiffContext(ctx, reader, repoRoot, repoPrefix, scope, baseRef)
+	var err error
+	if diff == nil {
+		diff, err = analysis.MapGitDiffContext(ctx, reader, repoRoot, repoPrefix, scope, baseRef)
+	} else {
+		diff, err = analysis.JoinDiffSymbolsContext(ctx, reader, repoPrefix, diff)
+	}
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -398,7 +434,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		fileChanges = []analysis.FileChange{}
 	}
 	if graphStatus != "ready" {
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
+		return respond(map[string]any{
 			"changed_symbols": []any{}, "changed_files": changedFiles, "file_changes": fileChanges,
 			"risk": "UNKNOWN", "complete": false, "graph_status": graphStatus,
 			"summary": "Git file changes are available; symbol mapping and impact await an exact published graph",
@@ -407,7 +443,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	}
 
 	if len(diff.ChangedSymbols) == 0 {
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
+		return respond(map[string]any{
 			"changed_symbols": []any{},
 			"changed_files":   changedFiles,
 			"file_changes":    fileChanges,
@@ -431,6 +467,15 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	symbolIDs := make([]string, len(diff.ChangedSymbols))
 	for i, cs := range diff.ChangedSymbols {
 		symbolIDs[i] = cs.ID
+	}
+	if !checkoutScoped {
+		// The walk reads the changed symbols' callers, and an edit outside
+		// the diff (a staged or compare scope leaves the working tree out)
+		// can be changing those. They share what is left of the budget.
+		label = label.merge(s.awaitRelationFreshness(ctx, symbolIDs, keys, deadline))
+		if freshness.requireFresh && label.state != "" {
+			return label.requireFreshError(), nil
+		}
 	}
 
 	impact, err := s.analyzeDiffImpact(ctx, symbolIDs)
@@ -459,7 +504,7 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		req.GetBool("summary_only", false),
 		req.GetInt("offset", 0),
 		req.GetInt("limit", 100))
-	return s.respondJSONOrTOON(ctx, req, detectResult)
+	return respond(detectResult)
 }
 
 // tryImpactAnalysisSnapshots reads optional cached enrichments without waiting
@@ -489,8 +534,12 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 		ids[i] = strings.TrimSpace(ids[i])
 	}
 
-	if freshnessErr := s.awaitMutationFreshnessForRepos(ctx, s.mutationReposForSymbolIDs(ctx, ids)...); freshnessErr != nil {
-		return mcp.NewToolResultError("change impact refused a stale graph: " + freshnessErr.Error()), nil
+	// Wait briefly for the edits these symbols' relations depend on, then
+	// answer; whatever is still lagging is labelled, not refused.
+	freshness := takeRequestFreshness(&req)
+	label := s.awaitRelationFreshness(ctx, ids, nil, relationWaitDeadline(ctx, freshness))
+	if freshness.requireFresh && label.state != "" {
+		return label.requireFreshError(), nil
 	}
 
 	// Keep the mandatory pre-edit safety gate well below host transport
@@ -513,7 +562,9 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 		"test_files":           impact.TestFiles,
 		"total_affected":       impact.TotalAffected,
 		"cross_repo_impact":    impact.CrossRepoImpact,
+		"barrier_wait_ms":      label.waited.Milliseconds(),
 	}
+	label.apply(result)
 
 	// GNX-3: by_depth_counts is the headline; the heavy by_depth rows are
 	// paged (offset / limit) or dropped (summary_only) so the agent gets the
@@ -607,18 +658,20 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 		}
 	}
 
-	if s.isGCX(ctx, req) {
+	var res *mcp.CallToolResult
+	switch {
+	case s.isGCX(ctx, req):
 		// encodeChangeImpact reads the same map shape we'd return as
 		// JSON; routing through it keeps a single source of truth for
 		// field names and avoids divergence on the next analyzer
 		// addition.
-		return s.gcxResponseWithBudget(req)(encodeChangeImpact(result))
+		res, err = s.gcxResponseWithBudget(req)(encodeChangeImpact(result))
+	case s.isTOON(ctx, req):
+		res, err = returnTOON(result)
+	default:
+		res, err = s.respondJSONOrTOON(ctx, req, result)
 	}
-	if s.isTOON(ctx, req) {
-		return returnTOON(result)
-	}
-
-	return s.respondJSONOrTOON(ctx, req, result)
+	return label.decorate(res), err
 }
 
 func impactComplete(impact *analysis.ImpactResult) bool {

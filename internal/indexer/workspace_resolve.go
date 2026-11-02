@@ -6,7 +6,6 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"go.uber.org/zap"
 
@@ -543,9 +542,8 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 
 // runCrossRepoResolveFiles binds both outgoing and incoming unresolved edges
 // for one coordinated mutation frontier. Its caller owns the repository lane
-// and the topology-writer gates of every repository the mutation can affect, so
-// the graph cannot expose a half-resolved batch between same-repo, semantic,
-// and cross-repository phases.
+// and global topology-writer gate, so the graph cannot expose a half-resolved
+// batch between same-repo, semantic, and cross-repository phases.
 func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) {
 	mi.runCrossRepoResolveMutationFiles(filePaths, filePaths)
 }
@@ -555,10 +553,6 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materi
 }
 
 func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) {
-	mi.runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
-}
-
-func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) {
 	if len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
 		return
 	}
@@ -566,7 +560,7 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionF
 	if cr == nil {
 		return
 	}
-	cr.ResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, observe)
+	cr.ResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles)
 	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
 }

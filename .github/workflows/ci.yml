@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
   # Run on the merged commit to verify the extended parser regression gate (#991).
   workflow_dispatch:
@@ -87,7 +86,7 @@ jobs:
           cache-dependency-path: |
             go.sum
             go.mod
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: test-selection
       - name: Test

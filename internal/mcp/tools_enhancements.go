@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -26,6 +28,7 @@ import (
 	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/semantic"
@@ -425,7 +428,13 @@ func (s *Server) handleVerifyChange(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("changes array is empty"), nil
 	}
 
+	gaps := s.laggingMutationReceipts(ctx)
 	result := analysis.VerifyChanges(s.readerFor(ctx), s.engineFor(ctx), changes)
+	ids := make([]string, 0, len(changes))
+	for _, change := range changes {
+		ids = append(ids, change.SymbolID)
+	}
+	label := s.labelRelations(ctx, gaps, ids, nil)
 
 	if isCompact(req) {
 		var b strings.Builder
@@ -453,10 +462,11 @@ func (s *Server) handleVerifyChange(ctx context.Context, req mcp.CallToolRequest
 		if result.Clean {
 			fmt.Fprintf(&b, "clean: checked %d callers, %d implementors\n", result.CheckedCallers, result.CheckedImpls)
 		}
-		return mcp.NewToolResultText(b.String()), nil
+		return label.decorate(mcp.NewToolResultText(b.String())), nil
 	}
 
-	return s.respondJSONOrTOON(ctx, req, result)
+	res, err := s.respondJSONOrTOON(ctx, req, label.labelled(result))
+	return label.decorate(res), err
 }
 
 // ---------------------------------------------------------------------------
@@ -2574,6 +2584,7 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 		opts.SkipCrossRepoNodes = true
 	}
 
+	gaps := s.laggingMutationReceipts(ctx)
 	reader := s.readerFor(ctx)
 	opts.RepoPrefixes = s.deadCodeRepoPrefixes(ctx)
 	if scope, active := s.scopeOptionsWithRepoNarrow(ctx, repoAllowFromContext(ctx)); active {
@@ -2609,6 +2620,22 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 		entries = kept
 	}
 
+	// A pending definition or an unindexed caller cannot support a dead-code
+	// verdict. Keep those candidates separate in every output mode.
+	var label relationFreshness
+	var pendingUnknown []analysis.DeadCodeEntry
+	dead := make([]analysis.DeadCodeEntry, 0, len(entries))
+	for _, entry := range entries {
+		candidate := s.labelRelations(ctx, gaps, []string{entry.ID}, nil)
+		if candidate.state != "" {
+			pendingUnknown = append(pendingUnknown, entry)
+			label = label.merge(candidate)
+		} else {
+			dead = append(dead, entry)
+		}
+	}
+	entries = dead
+
 	// Cap response size — large repos surface thousands of dead-code
 	// candidates and the default JSON encoding spills past the MCP
 	// per-response token cap. Callers that need the full list can
@@ -2617,12 +2644,15 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 	if v, ok := args["limit"].(float64); ok && v > 0 {
 		limit = int(v)
 	}
-	totalEntries := len(entries)
-	deadTruncated := false
-	if len(entries) > limit {
-		entries = entries[:limit]
-		deadTruncated = true
+	totalEntries, totalUnknown := len(entries), len(pendingUnknown)
+	if len(pendingUnknown) > limit {
+		pendingUnknown = pendingUnknown[:limit]
 	}
+	remaining := limit - len(pendingUnknown)
+	if len(entries) > remaining {
+		entries = entries[:remaining]
+	}
+	deadTruncated := len(entries) < totalEntries || len(pendingUnknown) < totalUnknown
 
 	variablesNote := buildDeadCodeNote(opts)
 
@@ -2637,7 +2667,23 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 				Line: e.Line,
 			})
 		}
-		return s.gcxResponseWithBudget(req)(encodeAnalyze("dead_code", items))
+		data, err := encodeAnalyze("dead_code", items)
+		if err != nil {
+			return nil, err
+		}
+		if len(pendingUnknown) > 0 {
+			unknown := make([]deadCodeItem, 0, len(pendingUnknown))
+			for _, e := range pendingUnknown {
+				unknown = append(unknown, deadCodeItem{ID: e.ID, Kind: e.Kind, Name: e.Name, Path: e.FilePath, Line: e.Line})
+			}
+			section, err := encodeAnalyze("pending_unknown", unknown)
+			if err != nil {
+				return nil, err
+			}
+			data = append(data, section...)
+		}
+		res, err := s.gcxResponseWithBudget(req)(data, nil)
+		return label.decorate(res), err
 	}
 
 	if isCompact(req) {
@@ -2645,13 +2691,16 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 		for _, e := range entries {
 			fmt.Fprintf(&b, "%s %s %s:%d\n", e.Kind, e.ID, e.FilePath, e.Line)
 		}
-		if len(entries) == 0 {
+		for _, e := range pendingUnknown {
+			fmt.Fprintf(&b, "pending_unknown %s %s %s:%d\n", e.Kind, e.ID, e.FilePath, e.Line)
+		}
+		if len(entries) == 0 && len(pendingUnknown) == 0 {
 			b.WriteString("no dead code found\n")
 		}
 		if variablesNote != "" {
 			fmt.Fprintf(&b, "\nnote: %s\n", variablesNote)
 		}
-		return mcp.NewToolResultText(b.String()), nil
+		return label.decorate(mcp.NewToolResultText(b.String())), nil
 	}
 
 	result := map[string]any{
@@ -2659,13 +2708,19 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 		"total":     totalEntries,
 		"truncated": deadTruncated,
 	}
+	if totalUnknown > 0 {
+		result["pending_unknown"] = pendingUnknown
+		result["pending_unknown_count"] = totalUnknown
+	}
 	if deadTruncated {
 		result["limit"] = limit
 	}
 	if variablesNote != "" {
 		result["note"] = variablesNote
 	}
-	return s.respondJSONOrTOON(ctx, req, result)
+	label.apply(result)
+	res, err := s.respondJSONOrTOON(ctx, req, result)
+	return label.decorate(res), err
 }
 
 // buildDeadCodeNote summarises which low-signal kinds the analyzer
@@ -2840,13 +2895,38 @@ type scaffoldReader struct {
 	ctx context.Context
 }
 
-func (r scaffoldReader) Graph() graph.Store { return r.s.graph }
+func (r scaffoldReader) Graph() graph.Reader { return r.s.readerFor(r.ctx) }
 func (r scaffoldReader) ResolveFilePath(graphPath string) string {
 	abs, err := r.s.resolveGraphPath(r.ctx, graphPath)
 	if err != nil {
 		return ""
 	}
 	return abs
+}
+
+func (r scaffoldReader) ScaffoldNodeSource(node *graph.Node) (string, int, int, error) {
+	path := r.ResolveFilePath(node.FilePath)
+	if path == "" {
+		return "", 0, 0, fmt.Errorf("could not resolve %s", node.FilePath)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	var start, end int
+	if mutationPathAdmitted(r.ctx, pathkey.MutationKey(path)) {
+		start, end, err = r.s.symbolLinesUnderLock(r.ctx, node, path, raw)
+	} else {
+		start, end, err = r.s.nodeLinesIn(r.ctx, node, raw)
+	}
+	if err != nil {
+		return "", 0, 0, err
+	}
+	lines := strings.Split(string(indexer.DecodeUTF16Source(raw)), "\n")
+	if start < 1 || end < start || end > len(lines) {
+		return "", 0, 0, fmt.Errorf("invalid current source range for %s", node.ID)
+	}
+	return strings.Join(lines[start-1:end], "\n"), start, end, nil
 }
 
 func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -2865,7 +2945,7 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 		dryRun = v
 	}
 
-	result, err := analysis.GenerateScaffold(s.engine, scaffoldReader{s: s, ctx: ctx}, exampleID, newName)
+	result, err := analysis.GenerateScaffold(s.engineFor(ctx), scaffoldReader{s: s, ctx: ctx}, exampleID, newName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -2877,44 +2957,71 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 
 	if !dryRun && s.indexer != nil {
-		// Apply edits by writing files. Every write funnels through
-		// commitFileMutation — the UTF-16 refusal (#846), the cancellation
-		// gate, and the mutation receipt live there. A direct os.WriteFile
-		// used to splice UTF-8 into NUL-interleaved bytes and corrupt the
-		// file from the insertion point on.
+		paths := make([]string, 0, len(result.Edits))
 		for _, edit := range result.Edits {
-			absPath := edit.FilePath
-			if root := s.indexer.RootPath(); root != "" {
-				absPath = filepath.Join(root, edit.FilePath)
+			abs, err := s.resolveGraphPath(ctx, edit.FilePath)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
 			}
-			content, readErr := os.ReadFile(absPath)
+			paths = append(paths, abs)
+		}
+		ctx, release, err := acquireMutationPaths(ctx, paths)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		defer release()
+		// Rebuild under the complete source frontier: a queued edit must not
+		// resurrect an example removed while it waited for a source lock.
+		current, err := analysis.GenerateScaffold(s.engineFor(ctx), scaffoldReader{s: s, ctx: ctx}, exampleID, newName)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		grouped := make(map[string][]analysis.ScaffoldEdit)
+		for _, edit := range current.Edits {
+			path, err := s.resolveGraphPath(ctx, edit.FilePath)
+			if err != nil || !mutationPathAdmitted(ctx, pathkey.MutationKey(path)) {
+				return mcp.NewToolResultError("scaffold source paths changed while waiting; rebuild the preview"), nil
+			}
+			grouped[path] = append(grouped[path], edit)
+		}
+		var writes []committedSourceMutation
+		finish := sync.OnceFunc(func() { s.completeCommittedSourceMutations(ctx, writes, release) })
+		defer finish()
+		ordered := slices.Sorted(maps.Keys(grouped))
+		for _, path := range ordered {
+			edits := grouped[path]
+			content, readErr := os.ReadFile(path)
 			if readErr != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("could not read %s: %v", edit.FilePath, readErr)), nil
+				return mcp.NewToolResultError(fmt.Sprintf("could not read %s: %v", edits[0].FilePath, readErr)), nil
 			}
+			// Apply all positions against one source version, from the bottom
+			// up, then parse and commit just one final candidate for this file.
+			slices.SortStableFunc(edits, func(a, b analysis.ScaffoldEdit) int { return cmp.Compare(b.InsertionLine, a.InsertionLine) })
 			lines := strings.Split(string(content), "\n")
-			insertIdx := max(edit.InsertionLine-1, 0)
-			insertIdx = min(insertIdx, len(lines))
-			newLines := make([]string, 0, len(lines)+strings.Count(edit.Code, "\n")+2)
-			newLines = append(newLines, lines[:insertIdx]...)
-			newLines = append(newLines, "")
-			newLines = append(newLines, edit.Code)
-			newLines = append(newLines, lines[insertIdx:]...)
-			// Keep the file's existing mode: the atomic commit applies perm
-			// to the replacement, so a fixed 0o644 would strip a script's
-			// executable bit.
+			for _, edit := range edits {
+				at := min(max(edit.InsertionLine-1, 0), len(lines))
+				lines = append(slices.Clone(lines[:at]), append([]string{"", edit.Code}, lines[at:]...)...)
+			}
+			after := []byte(strings.Join(lines, "\n"))
+			projection, gate := s.prepareAcknowledgedProjection(ctx, edits[0].FilePath, path, content, after)
+			if gate.Blocked {
+				return mcp.NewToolResultError("scaffold refused: candidate introduces syntax errors"), nil
+			}
 			perm := os.FileMode(0o644)
-			if info, err := os.Stat(absPath); err == nil {
+			if info, statErr := os.Stat(path); statErr == nil {
 				perm = info.Mode().Perm()
 			}
-			commit, writeErr := s.commitFileMutation(ctx, "scaffold", "", "", edit.FilePath, absPath,
-				[]byte(strings.Join(newLines, "\n")), perm)
+			commit, writeErr := s.commitFileMutation(ctx, "scaffold", "", "", edits[0].FilePath, path,
+				after, perm, sourceMutationOperation{kind: sourceWrite, projection: projection})
+			if commit != nil && commit.snapshot().DiskStatus == mutationDiskCommitted {
+				writes = append(writes, captureCommittedSourceMutation(ctx, path, commit))
+			}
 			if writeErr != nil {
-				if errors.Is(writeErr, errMutationNotApplied) {
-					return mcp.NewToolResultError(mutationNotAppliedMessage("scaffold", commit, writeErr)), nil
-				}
-				return mcp.NewToolResultError(fmt.Sprintf("could not write %s: %v", edit.FilePath, writeErr)), nil
+				return mcp.NewToolResultError(mutationNotAppliedMessage("scaffold", commit, writeErr)), nil
 			}
 		}
+		finish()
+		resp["edits"], resp["notes"] = current.Edits, current.Notes
 		resp["applied"] = true
 	}
 
@@ -3698,6 +3805,19 @@ func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string
 			plannerStats["last_refresh_at"] = planner.LastRefreshAt.UTC().Format(time.RFC3339)
 			plannerStats["last_refresh_reason"] = planner.LastRefreshReason
 		}
+		// Named, not counted: they are what an operator checks the schema for,
+		// and the reason above alone does not say which lookups are scanning.
+		if len(planner.DenseIndexesMissing) > 0 {
+			plannerStats["dense_indexes_missing"] = planner.DenseIndexesMissing
+			msg := "A bulk index load ended without rebuilding these SQLite indexes: " + strings.Join(planner.DenseIndexesMissing, ", ") +
+				". Queries that use them scan instead until they are back. The store rebuilds them in the background once " +
+				"its volume has free space at least the size of the store, and a daemon restart rebuilds them too."
+			if recommendation == "" {
+				recommendation = msg
+			} else {
+				recommendation = msg + " " + recommendation
+			}
+		}
 		result["planner_stats"] = plannerStats
 		if planner.Stale {
 			msg := "SQLite planner statistics are stale (" + planner.Reason + "): the graph has grown past what the query " +
@@ -3708,6 +3828,13 @@ func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string
 			} else {
 				recommendation = msg + " " + recommendation
 			}
+		}
+	}
+	if reporter, ok := s.graph.(interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}); ok {
+		if observations := reporter.LastFirstIndexDrains(); len(observations) > 0 {
+			result["last_first_index_drain"] = observations
 		}
 	}
 	if prefixAuditOK {
@@ -4380,244 +4507,6 @@ func batchEditInvalidArgumentResult(err error) *mcp.CallToolResult {
 
 func (s *Server) handleBatchEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return s.handleAtomicBatchEdit(ctx, req)
-}
-
-// applyBatchSymbolEdit applies one edit_symbol operation: it locates the
-// symbol's source range, replaces old_source with new_source inside it, writes
-// the file, and re-indexes. Semantics match the legacy single-op batch_edit.
-func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem, write bool) batchEditResult {
-	res := batchEditResult{Op: "edit_symbol", SymbolID: edit.SymbolID}
-	if edit.OldSource == edit.NewSource {
-		res.Status, res.Error = "failed", "old_source and new_source are identical"
-		return res
-	}
-	node := s.engineFor(ctx).GetSymbol(edit.SymbolID)
-	if node == nil {
-		res.Status, res.Error = "failed", "symbol not found: "+edit.SymbolID
-		return res
-	}
-	res.FilePath = node.FilePath
-	if node.StartLine == 0 || node.EndLine == 0 {
-		res.Status, res.Error = "failed", "symbol has no line range"
-		return res
-	}
-	absPath, resolveErr := s.resolveNodePath(ctx, node)
-	if resolveErr != nil {
-		res.Status, res.Error = "failed", resolveErr.Error()
-		return res
-	}
-	if write {
-		releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
-		if lockErr != nil {
-			res.Status, res.Error = "failed", "edit cancelled while waiting for exclusive file access: "+lockErr.Error()
-			return res
-		}
-		defer releaseMutation()
-	}
-	content, readErr := os.ReadFile(absPath)
-	if readErr != nil {
-		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
-		return res
-	}
-	// Same UTF-16 refusal as edit_symbol: the match below would fail
-	// with a misleading "not found" against NUL-interleaved bytes (#846).
-	if indexer.LooksUTF16Source(content) {
-		res.Status, res.Error = "failed", refuseUTF16Edit("batch edit_symbol", node.FilePath).Error()
-		return res
-	}
-	fileStr := string(content)
-	lines := strings.Split(fileStr, "\n")
-
-	// Prefer the indexed symbol range, including preceding documentation. If a
-	// prior edit in this batch shifted line numbers while watcher reindex is
-	// pending, fall back only when old_source is unique in the current file.
-	regionMatches := findEOLMatches(fileStr, edit.OldSource)
-	symbolStart := 0
-	rangeMatched := false
-	if node.StartLine <= len(lines) && node.EndLine <= len(lines) {
-		symbolSource := strings.Join(lines[node.StartLine-1:node.EndLine], "\n")
-		effectiveStart := node.StartLine
-		if findEOLMatches(symbolSource, edit.OldSource).count == 0 {
-			expandedStart := node.StartLine - 1
-			for expandedStart > 0 {
-				trimmed := strings.TrimSpace(lines[expandedStart-1])
-				if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") ||
-					strings.HasPrefix(trimmed, "*") || trimmed == "" {
-					expandedStart--
-				} else {
-					break
-				}
-			}
-			if expandedStart < node.StartLine-1 {
-				expanded := strings.Join(lines[expandedStart:node.EndLine], "\n")
-				if findEOLMatches(expanded, edit.OldSource).count > 0 {
-					symbolSource = expanded
-					effectiveStart = expandedStart + 1
-				}
-			}
-		}
-		for i := 0; i < effectiveStart-1 && i < len(lines); i++ {
-			symbolStart += len(lines[i]) + 1
-		}
-		symbolEnd := min(symbolStart+len(symbolSource), len(fileStr))
-		candidate := findEOLMatches(fileStr[symbolStart:symbolEnd], edit.OldSource)
-		if candidate.count == 1 {
-			regionMatches = candidate
-			rangeMatched = true
-		}
-	}
-	if !rangeMatched {
-		symbolStart = 0
-		switch regionMatches.count {
-		case 0:
-			res.Status, res.Error = "failed", "old_source not found within symbol or current file"
-			return res
-		case 1:
-			// Safe stale-range fallback.
-		default:
-			res.Status, res.Error = "failed", "symbol range is stale and old_source is not unique in the current file"
-			return res
-		}
-	}
-	span := regionMatches.spans[0]
-	editStart := symbolStart + span.start
-	editEnd := symbolStart + span.end
-	effectiveNew := edit.NewSource
-	if regionMatches.normalized {
-		effectiveNew = adaptToDominantEOL(edit.NewSource, fileStr[editStart:editEnd])
-		res.EOLNormalized = true
-	}
-	newContent := fileStr[:editStart] + effectiveNew + fileStr[editEnd:]
-	if newContent == fileStr {
-		res.Status, res.Error = "failed", "old_source and new_source are identical after line-ending normalization"
-		return res
-	}
-	if !write {
-		res.Status = "validated"
-		return res
-	}
-	perm := os.FileMode(0o644)
-	if info, statErr := os.Stat(absPath); statErr == nil {
-		perm = info.Mode().Perm()
-	}
-	commit, writeErr := s.commitFileMutation(ctx, "batch_edit", "", "", node.FilePath, absPath, []byte(newContent), perm)
-	if writeErr != nil {
-		res.Status, res.Error = "failed", fmt.Sprintf("could not write file: %v", writeErr)
-		return res
-	}
-	sess := s.sessionFor(ctx)
-	sess.recordModified(node.FilePath)
-	sess.recordSymbol(edit.SymbolID)
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
-	commit.recordGraph(reindexOutcome)
-	res.Reindexed, res.ReindexPending = reindexOutcome.Reindexed, reindexOutcome.Pending
-	res.ReindexReceipt = reindexOutcome.Receipt
-	res.ReindexGeneration = reindexOutcome.Generation
-	res.ReindexAppliedGeneration = reindexOutcome.AppliedGeneration
-	if reindexOutcome.Err != nil {
-		res.ReindexError = reindexOutcome.Err.Error()
-	}
-	res.Status = "applied"
-	return res
-}
-
-// applyBatchFileEdit applies one edit_file operation: it replaces old_string
-// with new_string in the file at path, mirroring edit_file's uniqueness and
-// replace_all semantics, then re-indexes.
-func (s *Server) applyBatchFileEdit(ctx context.Context, edit batchEditItem, write bool) batchEditResult {
-	res := batchEditResult{Op: "edit_file", FilePath: edit.Path}
-	if edit.Path == "" {
-		res.Status, res.Error = "failed", "edit_file op requires path"
-		return res
-	}
-	if edit.OldString == edit.NewString {
-		res.Status, res.Error = "failed", "old_string and new_string are identical"
-		return res
-	}
-	absPath, relPath, resolveErr := s.resolveFilePath(ctx, edit.Path)
-	if resolveErr != nil {
-		res.Status, res.Error = "failed", resolveErr.Error()
-		return res
-	}
-	res.FilePath = relPath
-	if write {
-		releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
-		if lockErr != nil {
-			res.Status, res.Error = "failed", "edit cancelled while waiting for exclusive file access: "+lockErr.Error()
-			return res
-		}
-		defer releaseMutation()
-	}
-	content, readErr := os.ReadFile(absPath)
-	if readErr != nil {
-		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
-		return res
-	}
-	// Same UTF-16 refusal as edit_file: the match below would fail with a
-	// misleading "not found" against NUL-interleaved bytes (#846).
-	if indexer.LooksUTF16Source(content) {
-		res.Status, res.Error = "failed", refuseUTF16Edit("batch edit_file", relPath).Error()
-		return res
-	}
-	fileStr := string(content)
-	matches := findEOLMatches(fileStr, edit.OldString)
-	count := matches.count
-	if count == 0 {
-		res.Status, res.Error = "failed", "old_string not found in file"
-		return res
-	}
-	if count > 1 && !edit.ReplaceAll {
-		res.Status, res.Error = "failed", fmt.Sprintf(
-			"old_string matches %d locations%s. Provide a larger fragment for uniqueness or set replace_all=true.",
-			count, matchSpansHint(fileStr, matches.spans))
-		return res
-	}
-	var newContent string
-	switch {
-	case matches.normalized:
-		// The CRLF<->LF fallback matched: splice the real byte spans and
-		// write new_string with each region's own line terminators so the
-		// edit never introduces mixed endings.
-		limit := 1
-		if edit.ReplaceAll {
-			limit = -1
-		}
-		newContent = spliceSpansEOL(fileStr, matches.spans, edit.NewString, limit)
-		if newContent == fileStr {
-			res.Status, res.Error = "failed", "old_string and new_string are identical after line-ending normalization"
-			return res
-		}
-		res.EOLNormalized = true
-	case edit.ReplaceAll:
-		newContent = strings.ReplaceAll(fileStr, edit.OldString, edit.NewString)
-	default:
-		newContent = strings.Replace(fileStr, edit.OldString, edit.NewString, 1)
-	}
-	if !write {
-		res.Status = "validated"
-		return res
-	}
-	perm := os.FileMode(0o644)
-	if info, statErr := os.Stat(absPath); statErr == nil {
-		perm = info.Mode().Perm()
-	}
-	commit, writeErr := s.commitFileMutation(ctx, "batch_edit", "", "", relPath, absPath, []byte(newContent), perm)
-	if writeErr != nil {
-		res.Status, res.Error = "failed", fmt.Sprintf("could not write file: %v", writeErr)
-		return res
-	}
-	s.sessionFor(ctx).recordModified(relPath)
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
-	commit.recordGraph(reindexOutcome)
-	res.Reindexed, res.ReindexPending = reindexOutcome.Reindexed, reindexOutcome.Pending
-	res.ReindexReceipt = reindexOutcome.Receipt
-	res.ReindexGeneration = reindexOutcome.Generation
-	res.ReindexAppliedGeneration = reindexOutcome.AppliedGeneration
-	if reindexOutcome.Err != nil {
-		res.ReindexError = reindexOutcome.Err.Error()
-	}
-	res.Status = "applied"
-	return res
 }
 
 // ---------------------------------------------------------------------------

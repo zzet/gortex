@@ -1455,7 +1455,60 @@ func enrichBashWithProbe(toolInput map[string]any, cwd string, probe fileScopePr
 	if cmd == "" {
 		return enrichResult{}
 	}
+	return enrichBashCommand(cmd, cwd, probe, 0, time.Time{})
+}
 
+// enrichBashCommand answers one command at the given nesting depth: 0 for
+// the command the agent typed, 1 for a command it runs as text (`bash -c`,
+// a Python os.system), whose own nested commands are not examined.
+//
+// The shapes the hook has always answered come first, exactly as before:
+// their analysis and probes share nothing with what follows. Only a
+// command they do not deny is looked at again for what they cannot see —
+// os.open, scripts behind a wrapper, nested commands — in a second
+// analysis with its own budget, starting when it begins. A zero deadline
+// gives each part its own; a nested command gets the deadline of the
+// command it is nested in.
+func enrichBashCommand(cmd, cwd string, probe fileScopeProbe, depth int, deadline time.Time) enrichResult {
+	r := enrichBashShapes(cmd, cwd, probe, deadline)
+	if r.deny {
+		return r
+	}
+	if deadline.IsZero() {
+		deadline = time.Now().Add(inlineScriptTime)
+	}
+	pyScripts, shells := inlineScriptsAt(cmd, true)
+	scripts := analyzeInlineScripts(pyScripts, deadline, true)
+	if len(scripts) == 0 && len(shells) == 0 {
+		return r
+	}
+	dirs := newCommandDirs(cmd)
+	if extra, ok := scriptReadAnswer(scripts, true, dirs, cwd, probe, time.Now()); ok {
+		if extra.deny {
+			return extra
+		}
+		if r == (enrichResult{}) {
+			r = extra
+		}
+	}
+	// A Python os.open write is a write shape the patterns cannot see: it
+	// gets the shell-write answer.
+	if writes := scriptWrites(scripts, dirs); len(writes) > 0 {
+		if w, answered := enrichBashWrite(BashClassification{Action: BashActionWriteSource, Writes: writes}, cwd); answered {
+			if w.deny {
+				return w
+			}
+			r = w
+		}
+	}
+	if depth > 0 {
+		return r
+	}
+	return enrichNestedCommands(r, nestedCommands(shells, scripts, dirs, cwd), probe, depth, deadline)
+}
+
+// enrichBashShapes answers the shell shapes and inline Python of a command.
+func enrichBashShapes(cmd, cwd string, probe fileScopeProbe, deadline time.Time) enrichResult {
 	c := classifyBashCommand(cmd)
 	if c.Action == BashActionWriteSource {
 		if result, answered := enrichBashWrite(c, cwd); answered {
@@ -1488,7 +1541,7 @@ func enrichBashWithProbe(toolInput map[string]any, cwd string, probe fileScopePr
 	// read-only or loading allowance) must not cost the command a deny its
 	// shell read earns on its own, so the shell answer is taken first when
 	// it denies.
-	py, pyAnswered := enrichBashScriptRead(cmd, cwd, probe)
+	py, pyAnswered := enrichBashScriptRead(cmd, cwd, probe, deadline)
 	if pyAnswered && (py.deny || c.Action == BashActionPassthrough) {
 		return py
 	}

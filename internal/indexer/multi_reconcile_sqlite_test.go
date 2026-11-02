@@ -68,12 +68,14 @@ func TestReconcileRepoCtx_Sqlite_FullRetrackFlag(t *testing.T) {
 	// so ReconcileRepoCtx must report neither flag.
 	meta2 := mi2.GetMetadata("repo")
 	require.NotNil(t, meta2)
+	require.Nil(t, mi2.GetIndexer("repo").warmupWriteBoundary, "published edit indexer retained a startup wait")
 	unchangedMtimes := mi2.FileMtimes("repo")
 
 	mi3 := NewMultiIndexer(graph.Store(s), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
 	result2, err := mi3.ReconcileRepoCtx(context.Background(), config.RepoEntry{Path: repoPath, Name: "repo"}, unchangedMtimes)
 	require.NoError(t, err)
 	require.NotNil(t, result2)
+	require.Nil(t, mi3.GetIndexer("repo").warmupWriteBoundary, "clean-census publication retained a startup wait")
 
 	assert.False(t, result2.FullRetrack,
 		"an unchanged disk-backed repo must not be reported as a full re-track")

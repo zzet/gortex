@@ -66,7 +66,7 @@ func TestMutationPublicationRecordIsBoundBeforeAdmissionReturns(t *testing.T) {
 	ctx, _ = withMutationCommitNote(ctx)
 	ctx = withCheckoutMutation(ctx, mutation, filepath.Dir(path))
 	data := []byte("package committed\n")
-	record, err := s.commitFileMutation(ctx, "write_file", "", "", "edit.go", path, data, 0o600)
+	record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "", "edit.go", path, data, 0o600)
 	require.NoError(t, err)
 	sum := sha256.Sum256(data)
 	inner.ticket.ContentHash = hex.EncodeToString(sum[:])

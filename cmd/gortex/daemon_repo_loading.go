@@ -9,12 +9,16 @@ import (
 // either listener. It performs no filesystem validation of those roots; warmup
 // does that later so a hung mount cannot delay serving other configured repos.
 func listenConfiguredDaemon(srv *daemon.Server, state *daemonState) error {
+	declareConfiguredDaemonRepos(state)
+	return srv.Listen()
+}
+
+func declareConfiguredDaemonRepos(state *daemonState) {
 	if state != nil && state.multiIndexer != nil && state.configManager != nil {
 		if gc := state.configManager.Global(); gc != nil {
 			state.multiIndexer.DeclareRepos(gc.ReposSnapshot())
 		}
 	}
-	return srv.Listen()
 }
 
 // announceConfiguredRepos fills the declarations' filesystem identity before

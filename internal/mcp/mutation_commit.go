@@ -15,8 +15,11 @@ import (
 	"time"
 	"weak"
 
+	"github.com/zeebo/blake3"
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // The commit ledger exists because a tool call has two independent terminal
@@ -86,7 +89,7 @@ const mutationIDParamDescription = "Optional idempotency key. Retrying with the 
 	"replays the first result instead of writing twice — the safe way to retry an abandoned call. " +
 	"A different edit under the same key is refused."
 
-var mutationCommitSequence atomic.Uint64
+var mutationCommitSequence = epochMutationSequence()
 
 // mutationDiskCommitSequence orders disk commits. It is stamped after the
 // rename and before the commit's refresh ticket is admitted, so a fresh
@@ -117,6 +120,7 @@ type mutationCommitRecord struct {
 	pendingSourceRecovered bool
 
 	id      string
+	ackMode string
 	tool    string
 	key     string
 	relPath string
@@ -138,8 +142,10 @@ type mutationCommitRecord struct {
 	// terminality is the opposite in the two cases.
 	graphRecorded bool
 
+	contentSHA256       string
 	newSHA              string
 	bytesWritten        int
+	publicationReceipt  string
 	reindexReceipt      string
 	reindexGeneration   uint64
 	appliedGeneration   uint64
@@ -167,14 +173,22 @@ type mutationCommitRecord struct {
 	batchOwner       [32]byte
 	batchAfterSHA256 [32]byte
 	moveFile         *moveFileObservation
+	moveTimingOwner  weak.Pointer[mutationCommitRecord]
+	fileProjection   weak.Pointer[projectionEntry]
+	fileReason       string
+	readbackExact    bool
 
 	// response is the successful tool payload, retained only for records that
 	// carry a caller-chosen mutation_id. Without a key there is nothing to
 	// replay against, so ordinary edits pay no memory for this.
 	response map[string]any
+	// Keyed retries may arrive after path release but before the first reply.
+	// This bounded record owns their completion signal, never another ledger.
+	responseReady chan struct{}
 }
 
 type mutationCommitSnapshot struct {
+	AckMode     string `json:"ack_mode,omitempty"`
 	Receipt     string `json:"receipt"`
 	Tool        string `json:"tool,omitempty"`
 	MutationID  string `json:"mutation_id,omitempty"`
@@ -187,6 +201,7 @@ type mutationCommitSnapshot struct {
 	// snapshot the flag is derived from, so the two cannot disagree.
 	GraphRecorded       bool   `json:"-"`
 	CommitSeq           uint64 `json:"-"`
+	ContentSHA256       string `json:"content_sha256,omitempty"`
 	NewSHA              string `json:"new_sha,omitempty"`
 	BytesWritten        int    `json:"bytes_written,omitempty"`
 	Error               string `json:"error,omitempty"`
@@ -198,6 +213,7 @@ type mutationCommitSnapshot struct {
 	AppliedGeneration   uint64 `json:"applied_generation,omitempty"`
 	CheckoutID          string `json:"checkout_id,omitempty"`
 	CheckoutIncarnation string `json:"checkout_incarnation,omitempty"`
+	publicationReceipt  string
 	readRepair          *mutationReadRepairObservation
 }
 
@@ -208,6 +224,7 @@ func (r *mutationCommitRecord) snapshot() mutationCommitSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	snap := mutationCommitSnapshot{
+		AckMode:             r.ackMode,
 		Receipt:             r.id,
 		Tool:                r.tool,
 		MutationID:          r.key,
@@ -216,11 +233,13 @@ func (r *mutationCommitRecord) snapshot() mutationCommitSnapshot {
 		GraphStatus:         r.graph,
 		GraphRecorded:       r.graphRecorded,
 		CommitSeq:           r.commitSeq,
+		ContentSHA256:       r.contentSHA256,
 		NewSHA:              r.newSHA,
 		BytesWritten:        r.bytesWritten,
 		Error:               r.errText,
 		Reason:              r.graphReason,
 		ReindexReceipt:      r.reindexReceipt,
+		publicationReceipt:  r.publicationReceipt,
 		ReindexGeneration:   r.reindexGeneration,
 		AppliedGeneration:   r.appliedGeneration,
 		CheckoutID:          r.checkoutID,
@@ -287,6 +306,10 @@ func (r *mutationCommitRecord) markFailed(err error) {
 }
 
 func (r *mutationCommitRecord) markCommitted(newSHA string, bytesWritten int) {
+	r.markCommittedContent(newSHA, bytesWritten, "")
+}
+
+func (r *mutationCommitRecord) markCommittedContent(newSHA string, bytesWritten int, contentSHA256 string) {
 	if !r.isPhysicalCommit() {
 		return
 	}
@@ -296,6 +319,7 @@ func (r *mutationCommitRecord) markCommitted(newSHA string, bytesWritten int) {
 	if r.commitSeq == 0 {
 		r.commitSeq = mutationDiskCommitSequence.Add(1)
 	}
+	r.contentSHA256 = contentSHA256
 	r.newSHA = newSHA
 	r.bytesWritten = bytesWritten
 	r.committedAt = time.Now()
@@ -370,6 +394,14 @@ func (r *mutationCommitRecord) recordGraphForReceipt(expectedReceipt string, out
 			ledger.byReindexReceipt[outcome.Receipt] = r
 		}
 	}
+	r.publicationReceipt = ""
+	if r.owner != nil && outcome.publicationReceipt != "" {
+		if value, found := r.owner.mutationReceipts.Load(outcome.publicationReceipt); found {
+			if receipt, ok := value.(*mutationReceipt); ok && receipt.path == r.absPath && receipt.generation == outcome.Generation && receipt.checkoutID == r.checkoutID && receipt.checkoutIncarnation == r.checkoutIncarnation {
+				r.publicationReceipt = outcome.publicationReceipt
+			}
+		}
+	}
 	r.reindexReceipt = outcome.Receipt
 	r.reindexGeneration = outcome.Generation
 	r.appliedGeneration = outcome.AppliedGeneration
@@ -427,9 +459,13 @@ func (r *mutationCommitRecord) retainResponse(resp map[string]any) {
 	}
 	clone := make(map[string]any, len(resp)+1)
 	for key, value := range resp {
+		if key == "file_view" {
+			continue
+		} // the bounded registry alone retains delta strings
 		clone[key] = value
 	}
 	r.response = clone
+	r.closeResponseReadyLocked()
 }
 
 func (r *mutationCommitRecord) replayResponse() (map[string]any, bool) {
@@ -530,6 +566,7 @@ func (l *mutationCommitLedger) evictLocked(now time.Time) {
 		record.mu.RUnlock()
 		if expired {
 			record.mu.Lock()
+			record.closeResponseReadyLocked()
 			record.publication = nil
 			record.acknowledgement = nil
 			record.readRepair = nil
@@ -550,6 +587,7 @@ func (l *mutationCommitLedger) evictLocked(now time.Time) {
 		l.ordered = l.ordered[1:]
 		oldest.mu.Lock()
 		l.unbindFreshnessLocked(oldest)
+		oldest.closeResponseReadyLocked()
 		oldest.publication = nil
 		oldest.acknowledgement = nil
 		oldest.readRepair = nil
@@ -700,6 +738,7 @@ func (n *mutationCommitNote) verdict() mutationCommitVerdict {
 func (s *Server) beginMutationCommit(ctx context.Context, tool, mutationID, fingerprint, relPath, absPath string) *mutationCommitRecord {
 	record := &mutationCommitRecord{
 		owner:       s,
+		ackMode:     string(s.sourceAckPolicy(ctx).mode),
 		id:          fmt.Sprintf("commit-%d", mutationCommitSequence.Add(1)),
 		tool:        tool,
 		key:         mutationID,
@@ -713,6 +752,9 @@ func (s *Server) beginMutationCommit(ctx context.Context, tool, mutationID, fing
 		startedAt:       time.Now(),
 		acknowledgement: editAcknowledgementFrom(ctx, s),
 	}
+	if mutationID != "" {
+		record.responseReady = make(chan struct{})
+	}
 	if state := checkoutMutationFromContext(ctx); state != nil {
 		record.checkoutID = state.checkoutID
 		record.checkoutIncarnation = state.incarnation
@@ -721,6 +763,28 @@ func (s *Server) beginMutationCommit(ctx context.Context, tool, mutationID, fing
 	s.mutationCommits.put(record)
 	mutationCommitNoteFrom(ctx).observe(record)
 	return record
+}
+
+type sourceMutationOperationKind uint8
+
+const sourceWrite sourceMutationOperationKind = 0
+
+const (
+	batchForwardWrite sourceMutationOperationKind = iota + 1
+	batchForwardRemove
+	batchRestoreWrite
+	batchRestoreRemove
+	sourceRemove
+	sourceCohortWrite
+)
+
+// This private descriptor selects ordinary prepared source I/O or a durable
+// batch's existing terminal authority. Journal/backup metadata never enters
+// this boundary. Batch observation belongs exclusively to forward I/O.
+type sourceMutationOperation struct {
+	kind        sourceMutationOperationKind
+	observation *mutationCommitRecord
+	projection  *preparedFileProjection
 }
 
 // commitFileMutation is the single guarded disk-commit primitive for the
@@ -732,7 +796,49 @@ func (s *Server) commitFileMutation(
 	tool, mutationID, fingerprint, relPath, absPath string,
 	data []byte,
 	perm os.FileMode,
+	operations ...sourceMutationOperation,
 ) (*mutationCommitRecord, error) {
+	remove := len(operations) == 1 && operations[0].kind == sourceRemove
+	ordinarySource := len(operations) == 0 || len(operations) == 1 && (remove || operations[0].kind == sourceWrite || operations[0].kind == sourceCohortWrite)
+	if !ordinarySource {
+		// Branch before beginMutationCommit: it registers ordinary source
+		// authority even before markCommitted. The durable transaction is the
+		// sole authority for forward effects and restoration alike.
+		if len(operations) != 1 {
+			return nil, fmt.Errorf("%w: invalid source operation", errMutationNotApplied)
+		}
+		operation := operations[0]
+		if !mutationPathAdmitted(ctx, pathkey.MutationKey(absPath)) {
+			return nil, fmt.Errorf("%w: batch source path is not held for mutation", errMutationNotApplied)
+		}
+		if err := guardCheckoutMutationPath(ctx, absPath); err != nil {
+			return nil, err
+		}
+		// No cancellation or per-file Prepare here: the coordinator has crossed
+		// its existing commit boundary and must reach a durable terminal state.
+		ops := s.batchDurability()
+		switch operation.kind {
+		case batchForwardWrite:
+			writer := ops.writeFile
+			if s.batchWriteOverride != nil {
+				writer = s.batchWriteOverride
+			}
+			writer = s.observedBatchFileWriter(operation.observation, writer)
+			return nil, s.writeAcknowledgedBatchFile(ctx, writer, absPath, data, perm)
+		case batchForwardRemove:
+			remover := ops.removeFile
+			if s.batchRemoveOverride != nil {
+				remover = s.batchRemoveOverride
+			}
+			return nil, s.removeAcknowledgedBatchFile(ctx, remover, absPath)
+		case batchRestoreWrite:
+			return nil, ops.writeFile(absPath, data, perm)
+		case batchRestoreRemove:
+			return nil, ops.removeFile(absPath)
+		default:
+			return nil, fmt.Errorf("%w: invalid batch source operation", errMutationNotApplied)
+		}
+	}
 	record := s.beginMutationCommit(ctx, tool, mutationID, fingerprint, relPath, absPath)
 	if s.mutationPreCommitHook != nil {
 		s.mutationPreCommitHook(record)
@@ -745,14 +851,21 @@ func (s *Server) commitFileMutation(
 		record.markNotApplied(err)
 		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
 	}
+	if !mutationPathAdmitted(ctx, pathkey.MutationKey(absPath)) {
+		err := fmt.Errorf("%w: source path is not held for mutation", errMutationNotApplied)
+		record.markNotApplied(err)
+		return record, err
+	}
 	// UTF-16 sources refuse every write (#846): the indexer decodes them for
 	// extraction, so their symbols are discoverable and every tool that
 	// writes from graph positions — present or future — funnels here.
 	// Splicing UTF-8 into NUL-interleaved bytes corrupts the file; the
 	// refusal names the encoding and the re-encode escape hatch.
-	if err := guardUTF16SourceWrite(tool, relPath, absPath); err != nil {
-		record.markNotApplied(err)
-		return record, err
+	if !remove {
+		if err := guardUTF16SourceWrite(tool, relPath, absPath); err != nil {
+			record.markNotApplied(err)
+			return record, err
+		}
 	}
 	if err := prepareCheckoutMutation(ctx, absPath); err != nil {
 		record.markNotApplied(err)
@@ -772,23 +885,100 @@ func (s *Server) commitFileMutation(
 		record.markNotApplied(err)
 		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
 	}
+	var prepared *preparedFileProjection
+	var baseline *plannedSource
+	if remove || len(operations) == 0 || operations[0].projection == nil {
+		baseline = captureFileViewBaseline(ctx, absPath)
+	}
+	if remove {
+		prepared = s.buildRemovalProjection(ctx, relPath, absPath)
+	} else {
+		if len(operations) == 1 {
+			prepared = operations[0].projection
+		}
+		if prepared == nil {
+			if s.indexer == nil && s.multiIndexer == nil {
+				// There is no parser call to observe. Keep the explicit
+				// projection refusal without fabricating a parse-gate lap.
+				prepared, _ = s.buildFileProjection(ctx, absPath, data)
+			} else {
+				s.noteAcknowledgementParser(ctx, "source_projection")
+				lap := s.beginAcknowledgementLap(ctx, editAckParseGate)
+				prepared, _ = s.buildFileProjection(ctx, absPath, data)
+				lap.finish()
+			}
+		}
+		if prepared.key != pathkey.MutationKey(absPath) || prepared.rawHash != blake3.Sum256(data) {
+			err := fmt.Errorf("%w: prepared source identity changed", errMutationNotApplied)
+			record.markNotApplied(err)
+			return record, err
+		}
+	}
+	if prepared.entry != nil && prepared.entry.fileView == nil {
+		s.prepareFileViewEvidence(ctx, prepared, baseline, data)
+	}
+	// A bounded projection may have waited. Recheck cancellation and the live
+	// captured path proof before the first byte effect, never after writing.
+	if err := ctx.Err(); err != nil {
+		record.markNotApplied(err)
+		return record, fmt.Errorf("%w: %w", errMutationNotApplied, err)
+	}
+	if !mutationPathAdmitted(ctx, pathkey.MutationKey(absPath)) {
+		err := fmt.Errorf("%w: source identity changed during preparation", errMutationNotApplied)
+		record.markNotApplied(err)
+		return record, err
+	}
+	if err := guardCheckoutMutationPath(ctx, absPath); err != nil {
+		record.markNotApplied(err)
+		return record, err
+	}
 	record.mu.Lock()
 	record.diskWriteStartedAt = time.Now()
 	record.mu.Unlock()
 	indexer.StampPublicationPhase(ctx, indexer.PublicationDiskWriteStarted)
 	diskLap := s.beginAcknowledgementLap(ctx, editAckDiskWrite)
-	writeErr := agents.AtomicWriteFile(absPath, data, perm)
+	var writeErr error
+	if remove {
+		writeErr = platform.RemoveFile(absPath)
+		if errors.Is(writeErr, os.ErrNotExist) {
+			writeErr = nil
+		}
+	} else {
+		writeErr = agents.AtomicWriteFile(absPath, data, perm)
+	}
 	diskLap.finish() // actual call end, before committed-hash/receipt bookkeeping
 	if err := writeErr; err != nil {
 		record.markFailed(err)
 		return record, err
 	}
+	contentSHA256 := ""
+	if !remove {
+		// One actual raw-byte SHA256, shared by physical receipt and
+		// checkout publication identity. The graph's BLAKE3 is separate.
+		contentSHA256 = prepared.contentSHA256
+		if contentSHA256 == "" {
+			// Compatibility for explicitly modeled preparations: production
+			// preparations already hash their actual candidate bytes once.
+			sum := sha256.Sum256(data)
+			contentSHA256 = hex.EncodeToString(sum[:])
+		}
+	}
 	if state := checkoutMutationFromContext(ctx); state != nil {
-		sum := sha256.Sum256(data)
-		state.committedHash = hex.EncodeToString(sum[:])
+		state.committedHash = contentSHA256
 		state.committedPath = absPath
 	}
-	record.markCommitted(gitBlobSHA(data), len(data))
+	if remove {
+		record.markCommitted("", 0)
+	} else {
+		record.markCommittedContent(gitBlobSHA(data), len(data), contentSHA256)
+	}
+	if len(operations) == 1 && operations[0].kind == sourceCohortWrite {
+		record.mu.Lock()
+		record.fileReason = "frontier_not_published"
+		record.mu.Unlock()
+	} else {
+		s.publishCommittedFileProjection(ctx, record, prepared)
+	}
 	return record, nil
 }
 
@@ -834,8 +1024,10 @@ func attachMutationCommit(resp map[string]any, record *mutationCommitRecord) {
 	if !record.isPhysicalCommit() {
 		return
 	}
+	resp["ack_mode"] = record.ackMode
 	resp["mutation_receipt"] = record.id
 	resp["disk_status"] = record.diskStatus()
+	record.attachFileProjection(resp)
 	if record.key != "" {
 		resp["mutation_id"] = record.key
 	}
@@ -886,7 +1078,35 @@ func (s *Server) replayMutation(mutationID, fingerprint string) (map[string]any,
 			"mutation_id %q already committed but its response was not retained; query mutation_status for the receipt: %s",
 			mutationID, encoded), true
 	}
+	return s.renderMutationReplay(record, resp)
+}
+
+func (s *Server) renderMutationReplay(record *mutationCommitRecord, resp map[string]any) (map[string]any, string, bool) {
+	// The disk verdict and receipt remain historical. File-view facts are
+	// live observations and cannot be replayed after another commit replaced
+	// the registry entry. Refresh only those scalars on this response clone.
+	delete(resp, "file_reason")
+	s.refreshPendingSourceRecord(record)
+	snap := record.snapshot()
+	id := snap.ReindexReceipt
+	if id == "" {
+		id = snap.publicationReceipt
+	}
+	if outcome, found := s.mutationReceiptState(id); found {
+		if snap.ReindexReceipt == "" {
+			outcome.Receipt = ""
+		}
+		attachMutationFreshnessFields(resp, outcome)
+	} else {
+		attachMutationTierState(resp, indexer.MutationTierState{})
+		delete(resp, "reindex_pending")
+		delete(resp, "syntax_health")
+		resp["graph_status"] = snap.GraphStatus
+		resp["reindexed"] = snap.GraphStatus == mutationGraphFresh
+	}
+	record.attachFileProjection(resp)
 	resp["replayed"] = true
+	resp["ack_mode"] = record.ackMode
 	resp["mutation_receipt"] = record.id
 	return resp, "", true
 }

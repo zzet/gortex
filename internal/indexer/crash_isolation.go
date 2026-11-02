@@ -367,6 +367,9 @@ func (idx *Indexer) extractFileCtxWithRawLease(
 	// and has since been fixed, drop the stale entry.
 	q.Forget(relPath)
 	result = &parser.ExtractionResult{Nodes: res.Nodes, Edges: res.Edges}
+	if res.ParseChecked && res.ParseErrors >= 0 {
+		result.ParseChecked, result.ParseErrors = true, res.ParseErrors
+	}
 	if res.HasParseErr {
 		stampParseErrorCount(result.Nodes, res.ParseErrors)
 	}

@@ -89,9 +89,50 @@ func TestMigrationWindowMCPProxyHelper(t *testing.T) {
 	require.Equal(t, input.SpawnLock, daemon.SpawnLockPath())
 	require.Equal(t, input.GlobalPath, config.DefaultGlobalConfigPath())
 	witnessDir := input.Root
+	var trace []map[string]any
+	servingRecorded := false
+	defer func() {
+		body, err := json.Marshal(trace)
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "MIGRATION_WAIT_TRACE %s\n", body)
+		}
+	}()
+	waitForDaemonSpawnLock = func(ctx context.Context, lock spawnLockTryer, opts spawnLockWaitOptions) (bool, error) {
+		progress := opts.startupProgress
+		opts.startupProgress = func(now time.Time) bool {
+			fresh := progress(now)
+			state, ok := daemon.ReadRuntimeState()
+			trace = append(trace, map[string]any{"kind": "startup_progress", "at": time.Now(), "now": now, "fresh": fresh, "state_read": ok, "state": state})
+			if ok && state.StartupPhase == daemon.StartupServing && !servingRecorded {
+				event := map[string]any{"fresh": fresh, "state": state, "lock_contended": true, "at": time.Now()}
+				body, err := json.Marshal(event)
+				require.NoError(t, err)
+				require.NoError(t, os.WriteFile(filepath.Join(witnessDir, "serving-probe.json"), body, 0o600))
+				servingRecorded = true
+			}
+
+			return fresh
+		}
+		locked, err := waitForSpawnLock(ctx, lock, opts)
+		event := map[string]any{"kind": "wait_return", "at": time.Now(), "locked": locked}
+		if err != nil {
+			event["error"] = err.Error()
+		}
+		trace = append(trace, event)
+		body, marshalErr := json.Marshal(trace)
+		require.NoError(t, marshalErr)
+		require.NoError(t, os.WriteFile(filepath.Join(witnessDir, "wait-return.json"), body, 0o600))
+		return locked, err
+	}
 	checks := 0
 	isDaemonRunning = func() bool {
-		running := daemon.IsRunning()
+		probeErr := daemon.ProbeAvailability()
+		running := probeErr == nil
+		event := map[string]any{"kind": "availability", "at": time.Now(), "running": running}
+		if probeErr != nil {
+			event["error"] = probeErr.Error()
+		}
+		trace = append(trace, event)
 		checks++
 		if !running && checks >= 2 {
 			probe := flock.New(daemon.SpawnLockPath())
@@ -129,7 +170,10 @@ func TestMigrationWindowMCPProxyHelper(t *testing.T) {
 // proves renewal from a fresh PID-bound startup record, not the reporter's
 // two-second periodic heartbeat. Historical schema-v21 workload acceptance is
 // separate; this fixture deliberately replays the idempotent v40 step.
-func TestMCPWaitsThroughMigrationWindow(t *testing.T) {
+func TestMCPWaitsThroughMigrationWindow(t *testing.T) { testMCPStartupWindow(t, false) }
+func TestMCPWaitsThroughServingHandoff(t *testing.T)  { testMCPStartupWindow(t, true) }
+
+func testMCPStartupWindow(t *testing.T, holdServing bool) {
 	base := testenv.ShortTempDir(t)
 	// Keep this migration regression's config and actual child CWD under the
 	// same physical spelling. Alias admission is a separate unresolved case;
@@ -246,8 +290,17 @@ func TestMCPWaitsThroughMigrationWindow(t *testing.T) {
 		if !reaped {
 			select {
 			case <-exited:
+				reaped = true
 			case <-time.After(2 * time.Second):
 				t.Error("owned MCP helper did not reap")
+			}
+		}
+		if t.Failed() {
+			if reaped {
+				t.Logf("owned MCP helper stderr:\n%s", stderr.String())
+			}
+			if trace, err := os.ReadFile(filepath.Join(base, "wait-return.json")); err == nil {
+				t.Logf("actual startup wait decisions:\n%s", trace)
 			}
 		}
 	})
@@ -284,6 +337,13 @@ func TestMCPWaitsThroughMigrationWindow(t *testing.T) {
 		t.Fatalf("MCP produced output before migration release: %s (%v)", frame.frame, frame.err)
 	default:
 	}
+	// An embedded build can delay its first frame. Prove the real startup wait
+	// itself has not returned; absence of stdout alone cannot establish this.
+	if returned, readErr := os.ReadFile(filepath.Join(base, "wait-return.json")); readErr == nil {
+		t.Fatalf("startup wait returned while the actual migration and spawn lock remained held: %s", returned)
+	} else {
+		require.ErrorIs(t, readErr, os.ErrNotExist)
+	}
 	releaseOnce.Do(func() { close(release) })
 	select {
 	case result = <-built:
@@ -292,6 +352,35 @@ func TestMCPWaitsThroughMigrationWindow(t *testing.T) {
 		t.Fatal("migration did not complete after release")
 	}
 	require.NoError(t, result.err)
+	if holdServing {
+		// Metadata and endpoint visibility are separate operations. Keep the real
+		// spawn lock held after the real migration while observing the Serving
+		// record before an endpoint exists; an expired idle budget must not pick
+		// embedded mode during this fresh PID-bound handoff.
+		reporter.Serving(daemonBackendPath)
+		var observed struct {
+			Fresh         bool                `json:"fresh"`
+			LockContended bool                `json:"lock_contended"`
+			State         daemon.RuntimeState `json:"state"`
+		}
+		require.Eventually(t, func() bool {
+			body, err := os.ReadFile(filepath.Join(base, "serving-probe.json"))
+			return err == nil && json.Unmarshal(body, &observed) == nil
+		}, 5*time.Second, 5*time.Millisecond)
+		require.True(t, observed.LockContended)
+		require.Equal(t, os.Getpid(), observed.State.PID)
+		require.Equal(t, daemon.StartupServing, observed.State.StartupPhase)
+		select {
+		case frame := <-frames:
+			t.Fatalf("premature output during Serving handoff: %s (%v)", frame.frame, frame.err)
+		case <-time.After(3 * migrationProxyTestInactivity):
+		}
+		if returned, err := os.ReadFile(filepath.Join(base, "wait-return.json")); err == nil {
+			t.Fatalf("startup wait returned before handoff endpoint publication: %s", returned)
+		} else {
+			require.ErrorIs(t, err, os.ErrNotExist)
+		}
+	}
 	srv := daemon.New(os.Getenv("GORTEX_DAEMON_SOCKET"), "test", zap.NewNop())
 	srv.MCPDispatcher = newMCPDispatcher(result.state.mcpServer, result.state.multiIndexer, zap.NewNop())
 	require.NoError(t, listenConfiguredDaemon(srv, result.state))

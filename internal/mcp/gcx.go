@@ -1937,8 +1937,13 @@ func encodeChangeImpact(result map[string]any) ([]byte, error) {
 	communityNote, _ := result["community_note"].(string)
 	contractRiskUpgrade, _ := result["contract_risk_upgrade"].(string)
 
+	var meta []string
+	if waited, ok := result["barrier_wait_ms"].(int64); ok {
+		meta = append(meta, "barrier_wait_ms", strconv.FormatInt(waited, 10))
+	}
 	sumEnc := newGCX(&buf, "explain_change_impact.summary",
 		[]string{"risk", "summary", "total_affected", "cross_repo", "processes", "communities", "test_files", "warning", "note", "risk_upgrade"},
+		meta...,
 	)
 	if err := sumEnc.WriteRow(
 		string(risk),
