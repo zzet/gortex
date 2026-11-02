@@ -21,8 +21,9 @@ func TestCurrentPreparedDeltaRestagesNewBytesWithTheirOwnProbe(t *testing.T) {
 	require.True(t, ok)
 	oldTree := preparedTree(t, idx, path)
 	writeTestFile(t, path, refreshSourceB)
-	fresh, prepared, ok := idx.currentPreparedDelta(path, prior, false, nil)
+	fresh, prepared, reprepared, ok := idx.currentPreparedDelta(path, prior, false, nil)
 	require.Nil(t, oldTree.Tree(), "the stale parse must be physically released")
+	require.True(t, reprepared)
 	require.True(t, ok, "a single newer save should remain eligible for staged apply instead of legacy fallback")
 	require.NotNil(t, prepared)
 	defer prepared.release()
@@ -45,9 +46,10 @@ func TestCurrentPreparedDeltaStableReadReusesParse(t *testing.T) {
 	prior, ok := idx.prepareFileDelta(path)
 	require.True(t, ok)
 	oldTree := preparedTree(t, idx, path)
-	fresh, prepared, ok := idx.currentPreparedDelta(path, prior, false, nil)
+	fresh, prepared, reprepared, ok := idx.currentPreparedDelta(path, prior, false, nil)
 	require.True(t, ok)
 	defer prepared.release()
+	require.False(t, reprepared, "unchanged bytes must reuse the original parse")
 	require.Same(t, oldTree, prepared.result.Tree)
 	require.Equal(t, prior.fingerprints, fresh.fingerprints)
 }
@@ -66,10 +68,11 @@ func TestCurrentPreparedDeltaSecondMovementFallsBackWithoutStaleParse(t *testing
 	mover := &savingExtractor{Extractor: extractor, trigger: "main.go", path: path, line: "\nfunc Newer(){}\n"}
 	mover.armed.Store(true)
 	idx.registry.Register(mover)
-	_, prepared, ok := idx.currentPreparedDelta(path, prior, false, nil)
+	_, prepared, reprepared, ok := idx.currentPreparedDelta(path, prior, false, nil)
 	if prepared != nil {
 		prepared.release()
 	}
+	require.True(t, reprepared)
 	require.False(t, mover.armed.Load(), "the bounded fresh parse must actually consume B before its read moves again")
 	_, saveErr := mover.saved()
 	require.NoError(t, saveErr)
