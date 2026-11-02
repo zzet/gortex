@@ -321,7 +321,7 @@ type walShrinkSlice struct {
 // gate and SQLite's WAL write lock. done reports a file back at its floor.
 func (s *Store) shrinkWALSliceOnce(ctx context.Context, ckptDB *sql.DB, slice int64) (out walShrinkSlice, err error) {
 	walPath := s.dbPath + "-wal"
-	res := &walReclaimResult{}
+	res := &walReclaimResult{warmupShrink: true}
 	defer s.noteReclaimDeferral(res)
 	wctx, cancel := context.WithTimeout(ctx, walReclaimWriterWait)
 	err = s.lockWALReclaimCompletion(wctx, res)
@@ -487,7 +487,7 @@ func (s *Store) shrinkWAL(ctx context.Context, ckptDB *sql.DB) (slices int, shru
 // restarted. Decided under the write gate, which a reset that keeps a log
 // also holds.
 func (s *Store) restoreWriterJournalLimit(ctx context.Context) error {
-	res := &walReclaimResult{}
+	res := &walReclaimResult{warmupShrink: true}
 	defer s.noteReclaimDeferral(res)
 	wctx, cancel := context.WithTimeout(ctx, walReclaimWriterWait)
 	err := s.lockWALReclaimCompletion(wctx, res)

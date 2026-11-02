@@ -318,12 +318,19 @@ func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
 			var reclaimHeldAtEdit bool
 			beforeHold := s.WALReclaimStats().WriterHold.Count()
 			var wait time.Duration
+			resetFinished := make(chan struct{})
+			editCtx, cancelEdit := context.WithTimeout(t.Context(), time.Second)
+			defer cancelEdit()
 			var wg sync.WaitGroup
 			if queued {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					<-resetEntered
+					select {
+					case <-resetEntered:
+					case <-resetFinished: return
+					case <-editCtx.Done(): return
+					}
 					editCalls++
 					reclaimHeldAtEdit = s.writeMu.reclaimSince.Load() != 0
 					release := s.AnnounceWrite()
@@ -337,6 +344,7 @@ func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
 			}
 			var res walReclaimResult
 			err = s.reclaimWALPressureReset(context.Background(), ckpt, &res)
+			close(resetFinished)
 			wg.Wait()
 			t.Logf("slow pressure reset: err=%v reason=%q writer_hold=%s edit_wait=%s", err, res.reason, res.writerHold, wait)
 			require.ErrorIs(t, err, errWALPressureHold)
@@ -353,7 +361,7 @@ func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
 				require.Equal(t, 1, editAcquisitions)
 				require.True(t, reclaimHeldAtEdit)
 				require.EqualValues(t, 1, s.WALReclaimStats().WriterHold.Count()-beforeHold)
-				require.Greater(t, wait, time.Duration(0))
+				require.GreaterOrEqual(t, wait, time.Duration(0), "a witnessed acquisition can have a zero-duration clock sample")
 				require.Less(t, wait, limit, "the edit waited longer than the pressure hold")
 			}
 			require.Equal(t, int64(1), s.WALCopyStats().PressureGiveUps)

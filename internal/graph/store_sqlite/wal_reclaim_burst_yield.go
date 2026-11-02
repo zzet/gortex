@@ -72,7 +72,13 @@ func (s *Store) reclaimCompletionCause(ctx context.Context, r *walReclaimResult)
 	if err := s.reclaimYieldCause(ctx, r); err != nil {
 		return err
 	}
-	if !r.burstException() && s.editBurstActive() {
+	completionBurst := s.editBurstActive()
+	if r.warmupShrink && s.warmupWALWaiters.Load() > 0 {
+		// The producer holds no store lock while it waits for this shrink.
+		// Exempt only its build lane, never writer demand or interactive reads.
+		completionBurst = s.writeWanted() || s.editIntentActive()
+	}
+	if !r.burstException() && completionBurst {
 		r.deferredEditBurst = true
 		r.reason = "edit_burst"
 		return errWALReclaimEditBurst
