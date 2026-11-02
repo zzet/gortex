@@ -143,7 +143,7 @@ func (s *refreshMismatchSource) Open(path string) (io.ReadCloser, source.FileMet
 	return io.NopCloser(bytes.NewReader(data)), meta, nil
 }
 
-func TestCanonicalPatchRealCombinedFallbackCannotPublishPartialLapTotals(t *testing.T) {
+func TestCanonicalPatchRealCombinedFallbackObservesSuccessfulLapTotals(t *testing.T) {
 	path, idx, _ := pointPublicationFixture(t)
 	fs, err := source.NewFilesystemSource(filepath.Dir(path))
 	require.NoError(t, err)
@@ -161,7 +161,7 @@ func TestCanonicalPatchRealCombinedFallbackCannotPublishPartialLapTotals(t *test
 	require.Contains(t, reparsed, path)
 	require.GreaterOrEqual(t, changing.reads.Load(), int32(3), "probe, refresh rejection and actual legacy fallback must all run")
 	// Observe the real combined path, not just a fixture read count. The
-	// canonical not-observed assertions below still apply to its actual work.
+	// canonical measured assertions below must describe its actual work.
 	parsePhases, fallbackPhases := 0, 0
 	for _, entry := range logs.FilterMessage("indexer: reconcile phase complete").All() {
 		fields := entry.ContextMap()
@@ -181,10 +181,10 @@ func TestCanonicalPatchRealCombinedFallbackCannotPublishPartialLapTotals(t *test
 	require.NotNil(t, nodeByName(t, idx, "edit.go", "After"), "the fallback must actually parse and apply")
 	snapshot := finishRealPatchObservation(r, s)
 	for _, lap := range []canonicalPatchLap{patchParse, patchApply, patchSearch} {
-		require.True(t, snapshot.patchLaps.laps[lap].incomplete)
+		require.False(t, snapshot.patchLaps.laps[lap].incomplete)
 		name := canonicalPatchLapNames[lap]
-		require.Nil(t, snapshot.EditTimings().Milliseconds[name])
-		require.Equal(t, "not_observed", snapshot.EditTimings().States[name])
+		require.NotNil(t, snapshot.EditTimings().Milliseconds[name])
+		require.Equal(t, "measured", snapshot.EditTimings().States[name])
 	}
 	require.FileExists(t, path)
 	data, err := os.ReadFile(path)
