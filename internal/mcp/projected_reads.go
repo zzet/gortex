@@ -20,6 +20,21 @@ import (
 
 const projectedReadBudget = 150 * time.Millisecond
 
+var errProjectionStorm = errors.New("file projection deferred by queued source storm")
+
+func (s *Server) projectionStormActive(abs string) bool {
+	watcher, ok := s.currentWatcher().(interface{ StormActiveForFile(string) bool })
+	return ok && watcher.StormActiveForFile(abs)
+}
+
+func auditedSourceProjectionMismatch(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || projectionBudgetUnavailable(ctx, err) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	_, audited := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+	return audited && (errors.Is(err, errProjectionExternalWrite) || errors.Is(err, projectionSuperseded))
+}
+
 // Each request retains only the immutable file layers it actually checked in
 // its selected checkout. Editor buffers compose above these disk projections.
 type requestProjectionKey struct{}
@@ -84,12 +99,15 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 		if err != nil {
 			return ctx, err
 		}
-		if watcher, ok := s.currentWatcher().(interface{ StormActiveForFile(string) bool }); ok && watcher.StormActiveForFile(abs) {
-			markRequestProjectionStorm(ctx, graphPath)
-			continue
-		}
 		entry, err := s.projectCurrentTrackedFile(buildCtx, ctx, abs, graphPath, rel)
 		if err != nil {
+			if errors.Is(err, errProjectionStorm) {
+				markRequestProjectionStorm(ctx, graphPath)
+				continue
+			}
+			if auditedSourceProjectionMismatch(ctx, err) {
+				return ctx, errProjectedSourceMoved
+			}
 			if projectionBudgetUnavailable(ctx, err) || ctx.Err() == nil && (errors.Is(err, errProjectionExternalWrite) || errors.Is(err, projectionSuperseded)) {
 				markRequestProjectionDeferred(ctx, graphPath, "external_write")
 				continue
@@ -124,6 +142,9 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 			}
 			ctx, err = retainRequestProjection(ctx, entry)
 			if err != nil {
+				if auditedSourceProjectionMismatch(ctx, err) {
+					return ctx, errProjectedSourceMoved
+				}
 				// This entry was already selected for checked retirement/carry.
 				// A new owner forbids serving its old facts or falling back.
 				return ctx, err
@@ -178,6 +199,11 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	}
 	observed := pendingFileProjections.captureReadExpectation(key)
 	expected := observed.entry
+	// A current cached payload is reusable during queued work. Without an
+	// existing owner, a storm must not start disk projection work at all.
+	if expected == nil && s.projectionStormActive(abs) {
+		return nil, errProjectionStorm
+	}
 	before, err := statDiskStamp(abs)
 	if err != nil {
 		return nil, err
@@ -188,6 +214,9 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 		}
 		if !tracked && expected == nil {
 			return nil, nil
+		}
+		if s.projectionStormActive(abs) {
+			return nil, errProjectionStorm
 		}
 		entry := newProjectionTombstone(abs, graphPath, idx.RepoPrefix(), 0)
 		latest, err := statDiskStamp(abs)
@@ -250,6 +279,11 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 		// Actual concurrent watcher events advance its captured revision;
 		// read publication refuses them rather than clearing their evidence.
 		defer expected.suspect.Store(true)
+	}
+	// No fresh extraction during a queued storm. The matching-cache branch
+	// above reused only bounded, identity-checked bytes and immutable nodes.
+	if s.projectionStormActive(abs) {
+		return nil, errProjectionStorm
 	}
 	// Use the registered parser identity while retaining the physical
 	// checkout path as the registry key and disk identity.
