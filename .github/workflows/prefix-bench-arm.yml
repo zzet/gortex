@@ -1,0 +1,205 @@
+name: Prefix ownership ARM64 comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      before_sha:
+        description: Approved baseline full commit SHA (no branch or tag)
+        required: true
+        type: string
+      after_sha:
+        description: Approved candidate full commit SHA (no branch or tag)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prefix-arm64-comparison-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    env:
+      BEFORE_SHA: ${{ inputs.before_sha }}
+      AFTER_SHA: ${{ inputs.after_sha }}
+      CGO_ENABLED: '1'
+      CC: clang
+      CXX: clang++
+      CGO_CFLAGS: -O2 -g -fno-strict-aliasing
+      CGO_CXXFLAGS: -O2 -g -fno-strict-aliasing
+      GOMAXPROCS: '3'
+      GOMEMLIMIT: 4GiB
+      GOGC: '100'
+      GOFLAGS: -p=2
+    steps:
+      - name: Require explicit immutable source pair
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ && "$AFTER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BEFORE_SHA" != "$AFTER_SHA" ]]
+          [[ "$(uname -m)" == aarch64 ]]
+          root="$RUNNER_TEMP/prefix-pair-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$root"
+          mkdir -m 700 "$root"
+          mkdir "$root/bin" "$root/raw" "$root/tmp"
+          echo "PAIR_ROOT=$root" >> "$GITHUB_ENV"
+          echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.before_sha }}
+          path: prefix-before
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.after_sha }}
+          path: prefix-after
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.3'
+          cache: false
+
+      - name: Bind sources, host and identical benchmark definitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C prefix-before rev-parse HEAD)" = "$BEFORE_SHA"
+          test "$(git -C prefix-after rev-parse HEAD)" = "$AFTER_SHA"
+          for side in before after; do
+            git -C "prefix-$side" status --porcelain=v1 > "$PAIR_ROOT/$side.status"
+            test ! -s "$PAIR_ROOT/$side.status"
+            git -C "prefix-$side" rev-parse HEAD HEAD^{tree} > "$PAIR_ROOT/$side.source"
+            grep -qx 'go 1.27.3' "prefix-$side/go.mod"
+            test "$(git -C "prefix-$side" rev-parse HEAD:internal/indexer/prefix_latency_bench_test.go)" = ec77d09000b9496cc85aa2a9e6111d0b3e029b5f
+            test "$(git -C "prefix-$side" rev-parse HEAD:cmd/gortex/prefix_daemon_bench_test.go)" = 547f35397cbd4fe17c443a127a8f8b98de9d49b7
+            cp "prefix-$side/go.mod" "$PAIR_ROOT/$side.go.mod"
+            cp "prefix-$side/go.sum" "$PAIR_ROOT/$side.go.sum"
+          done
+          {
+            date -u --iso-8601=ns
+            uname -a
+            lscpu
+            free -b
+            df -B1 "$PAIR_ROOT"
+            cat /proc/self/status
+            for f in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max; do
+              if test -r "$f"; then cat "$f"; fi
+            done
+            go version
+            go env GOOS GOARCH GOVERSION CGO_ENABLED CC CXX CGO_CFLAGS CGO_CXXFLAGS GOFLAGS
+            env | sort | grep -E '^(GOMAXPROCS|GOMEMLIMIT|GOGC|GOFLAGS|RUNNER_ARCH|RUNNER_OS|ImageOS|ImageVersion|TMPDIR)='
+          } > "$PAIR_ROOT/host-and-profile.txt"
+
+      - name: Build both native ARM64 test executables before measurement
+        shell: bash
+        run: |
+          set -euo pipefail
+          for side in before after; do
+            (
+              cd "prefix-$side"
+              go test -c -o "$PAIR_ROOT/bin/$side-indexer.test" ./internal/indexer
+              go test -c -o "$PAIR_ROOT/bin/$side-warmup.test" ./cmd/gortex
+            ) > "$PAIR_ROOT/$side.build.stdout" 2> "$PAIR_ROOT/$side.build.stderr"
+            for package in indexer warmup; do
+              go version -m "$PAIR_ROOT/bin/$side-$package.test" > "$PAIR_ROOT/$side-$package.buildinfo"
+              sha256sum "$PAIR_ROOT/bin/$side-$package.test" >> "$PAIR_ROOT/binary-sha256.txt"
+            done
+          done
+          GOBIN="$PAIR_ROOT/bin" go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260409210113-8e83ce0f7b1c
+          go version -m "$PAIR_ROOT/bin/benchstat" > "$PAIR_ROOT/benchstat.buildinfo"
+          sha256sum "$PAIR_ROOT/bin/benchstat" >> "$PAIR_ROOT/binary-sha256.txt"
+
+      - name: Six balanced samples per side, all eight definitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          # One original 120-minute measured-body cap; no sample retry or selection.
+          end=$((SECONDS + 7200))
+          for round in 1 2 3 4 5 6; do
+            if (( round % 2 )); then order='before after'; else order='after before'; fi
+            for side in $order; do
+              for package in indexer warmup; do
+                remaining=$((end - SECONDS))
+                (( remaining > 0 ))
+                cap=$((remaining < 1800 ? remaining : 1800))
+                if [[ "$package" == indexer ]]; then
+                  bench='^BenchmarkPrefix(ReconcileRepo|CallChangingSave)$'
+                else
+                  bench='^BenchmarkPrefixDaemonWarmup$'
+                fi
+                stem="$PAIR_ROOT/raw/$round-$side-$package"
+                printf '%s round=%s side=%s package=%s timeout=%ss\n' "$(date -u --iso-8601=ns)" "$round" "$side" "$package" "$cap" >> "$PAIR_ROOT/order.txt"
+                set +e
+                "$PAIR_ROOT/bin/$side-$package.test" '-test.run=^$' "-test.bench=$bench" -test.benchmem -test.count=1 -test.benchtime=2s "-test.timeout=${cap}s" > "$stem.stdout" 2> "$stem.stderr"
+                rc=$?
+                set -e
+                printf '%s rc=%s\n' "$(date -u --iso-8601=ns)" "$rc" >> "$PAIR_ROOT/order.txt"
+                test "$rc" = 0
+              done
+            done
+          done
+
+      - name: Require all 96 observations before benchstat
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import collections, json, os, pathlib, re
+          root = pathlib.Path(os.environ['PAIR_ROOT'])
+          expected = {f'BenchmarkPrefix{k}/repos={n}' for k in ('ReconcileRepo', 'CallChangingSave') for n in (200, 1000)}
+          expected |= {f'BenchmarkPrefixDaemonWarmup/repos={n}/workspace={str(w).lower()}' for n in (200, 1000) for w in (False, True)}
+          evidence = {}
+          for side in ('before', 'after'):
+              counts = collections.Counter()
+              with (root / (side + '.raw')).open('x') as out:
+                  for round in range(1, 7):
+                      for package in ('indexer', 'warmup'):
+                          text = (root / 'raw' / f'{round}-{side}-{package}.stdout').read_text()
+                          out.write(text)
+                          for line in text.splitlines():
+                              if not line.startswith('Benchmark'):
+                                  continue
+                              cols = line.split()
+                              name = re.sub(r'-\d+$', '', cols[0])
+                              assert len(cols) >= 4 and int(cols[1]) > 0 and cols[3] == 'ns/op', line
+                              assert name in expected, name
+                              counts[name] += 1
+              assert set(counts) == expected and all(n == 6 for n in counts.values()), dict(counts)
+              evidence[side] = dict(counts)
+          (root / 'SAMPLE-COMPLETENESS.json').write_text(json.dumps(evidence, indent=2) + '\n')
+          PY
+          "$PAIR_ROOT/bin/benchstat" -alpha 0.05 "$PAIR_ROOT/before.raw" "$PAIR_ROOT/after.raw" > "$PAIR_ROOT/benchstat.txt"
+          {
+            echo 'Dataset complete: six observations per side for all eight definitions.'
+            echo 'Acceptance remains an explicit review of benchstat effects and p-values:'
+            echo '- ReconcileRepo/repos=1000: after/before ns/op must be <= 1.15.'
+            echo '- CallChangingSave/repos=200,1000 and all four DaemonWarmup variants: no positive slowdown with p < 0.05.'
+            echo 'No outlier removal, replacement baseline, missing-sample waiver or automatic rerun.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain every raw observation and source/tool/host pin, including failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: prefix-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.PAIR_ROOT }}/*.txt
+            ${{ env.PAIR_ROOT }}/*.raw
+            ${{ env.PAIR_ROOT }}/*.source
+            ${{ env.PAIR_ROOT }}/*.status
+            ${{ env.PAIR_ROOT }}/*.go.mod
+            ${{ env.PAIR_ROOT }}/*.go.sum
+            ${{ env.PAIR_ROOT }}/*.buildinfo
+            ${{ env.PAIR_ROOT }}/*.build.stdout
+            ${{ env.PAIR_ROOT }}/*.build.stderr
+            ${{ env.PAIR_ROOT }}/*.json
+            ${{ env.PAIR_ROOT }}/raw/*.stdout
+            ${{ env.PAIR_ROOT }}/raw/*.stderr
+          if-no-files-found: error
+          retention-days: 90
