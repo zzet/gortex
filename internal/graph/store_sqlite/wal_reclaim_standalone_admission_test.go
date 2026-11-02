@@ -57,11 +57,26 @@ func TestStandaloneBulkReclaimDefersBeforePassive(t *testing.T) {
 			passive.Add(1)
 		}
 	}
+	var releases atomic.Int64
+	oldRelease := s.writeMu.onRelease.Load()
+	releaseProbe := func() {
+		releases.Add(1)
+		if oldRelease != nil {
+			(*oldRelease)()
+		}
+	}
+	s.writeMu.onRelease.Store(&releaseProbe)
+	t.Cleanup(func() { s.writeMu.onRelease.Store(oldRelease) })
+	holdsBefore := s.writeMu.holds.Load()
 	beforeIO := vfsIOMark()
 	before := s.WALCopyStats().WrittenBytes
 	res := s.reclaimWALAttempt(cfg, db, path)
 	calls, copied := passive.Load(), s.WALCopyStats().WrittenBytes-before
 	walCheckpointCallObserver = old
+	s.writeMu.onRelease.Store(oldRelease)
+	require.EqualValues(t, 1, s.writeMu.holds.Load()-holdsBefore, "preflight is a real ordinary gate hold")
+	require.EqualValues(t, 1, releases.Load(), "existing release callback must run")
+	require.Zero(t, s.writeMu.reclaimSince.Load(), "preflight must not mint reclaim hold credit")
 	ioDelta := vfsIOMark().Since(beforeIO)
 	frontierAfter, frontierAfterOK := readWALIndexSnapshot(s.dbPath)
 	require.True(t, frontierAfterOK)
@@ -91,4 +106,48 @@ func TestStandaloneBulkReclaimDefersBeforePassive(t *testing.T) {
 	require.Zero(t, ioDelta.OtherMainWriteBytes, "known standalone refusal must precede actual checkpoint page writes")
 	require.Zero(t, calls, "known standalone refusal must precede actual PASSIVE copy")
 	require.Zero(t, copied, "known standalone refusal must not pay paced copy work")
+}
+
+// The negative control keeps the same real SQL/VFS witness live without bulk.
+func TestStandalonePreflightLeavesOrdinaryCopyEnabled(t *testing.T) {
+	s, db := finalBackfillFixture(t)
+	frontier, ok := readWALIndexSnapshot(s.dbPath)
+	require.True(t, ok)
+	require.Positive(t, frontier.PendingFrames())
+	before := vfsIOMark()
+	res := s.reclaimWALAttempt(walReclaimConfig{thresholdBytes: 1, ceilingBytes: 2 << 30, truncateBudget: walReclaimTruncateBudget}, db, s.dbPath+"-wal")
+	require.NotEqual(t, "bulk_writer", res.reason)
+	require.Positive(t, vfsIOMark().Since(before).OtherMainWriteBytes, "ordinary attempt must still perform real checkpoint page writes")
+	require.True(t, s.writeMu.TryLock(), "ordinary attempt must release its gate")
+	s.writeMu.Unlock()
+}
+
+// Unlock runs an existing callback while still holding the gate. Cancellation
+// observed there must not be hidden by a previously computed bulk shortcut.
+func TestStandalonePreflightPreservesCancellationDuringRelease(t *testing.T) {
+	s, db := finalBackfillFixture(t)
+	s.BeginBulkLoad()
+	defer func() { require.NoError(t, s.FlushBulk()) }()
+	oldRelease := s.writeMu.onRelease.Load()
+	var cancelled atomic.Bool
+	releaseProbe := func() {
+		if cancelled.CompareAndSwap(false, true) {
+			s.backgroundCheckpoint.mu.Lock()
+			attempt := s.backgroundCheckpoint.active
+			s.backgroundCheckpoint.mu.Unlock()
+			if attempt != nil {
+				attempt.cancel(context.Canceled)
+			}
+		}
+		if oldRelease != nil {
+			(*oldRelease)()
+		}
+	}
+	s.writeMu.onRelease.Store(&releaseProbe)
+	t.Cleanup(func() { s.writeMu.onRelease.Store(oldRelease) })
+	res := s.reclaimWALAttempt(walReclaimConfig{thresholdBytes: 1, ceilingBytes: 2 << 30, truncateBudget: walReclaimTruncateBudget}, db, s.dbPath+"-wal")
+	s.writeMu.onRelease.Store(oldRelease)
+	require.True(t, cancelled.Load(), "must exercise real probe release")
+	require.NotEqual(t, "bulk_writer", res.reason, "actual attempt cancellation must retain precedence")
+	require.ErrorIs(t, context.Cause(res.attempt.ctx), context.Canceled)
 }
