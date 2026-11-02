@@ -147,12 +147,15 @@ func assertAdaptiveCreditCommittedTailRefusalOn(t *testing.T, s *Store, db *sql.
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	completedCopy := make(chan struct{})
+	completedCopies := make(chan struct{}, 2)
 	written := make(chan error, 1)
-	var once sync.Once
 	walCheckpointCallObserver = func(mode string, _ time.Time, _ time.Duration) {
 		if mode == "PASSIVE" {
-			once.Do(func() { close(completedCopy) })
+			select {
+			case completedCopies <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			select {
 			case <-written:
 			case <-ctx.Done():
@@ -162,19 +165,33 @@ func assertAdaptiveCreditCommittedTailRefusalOn(t *testing.T, s *Store, db *sql.
 	t.Cleanup(func() { walCheckpointCallObserver = nil })
 	writerDone := make(chan error, 1)
 	go func() {
-		select {
-		case <-completedCopy:
-		case <-ctx.Done():
-			writerDone <- ctx.Err()
-			return
+		writes := 1
+		if syncDelay > 0 {
+			writes = 2
 		}
-		err := s.writeMu.LockContext(ctx)
-		if err == nil {
-			_, err = s.writerDB.ExecContext(ctx, `UPDATE wal_churn SET payload = 'after-adaptive-copy' WHERE id = 1`)
-			s.writeMu.Unlock()
+		for ordinal := 0; ordinal < writes; ordinal++ {
+			select {
+			case <-completedCopies:
+			case <-ctx.Done():
+				writerDone <- ctx.Err()
+				return
+			}
+			err := s.writeMu.LockContext(ctx)
+			if err == nil {
+				payload := "after-adaptive-copy"
+				if ordinal+1 < writes {
+					payload = "first-adaptive-tail"
+				}
+				_, err = s.writerDB.ExecContext(ctx, `UPDATE wal_churn SET payload = ? WHERE id = 1`, payload)
+				s.writeMu.Unlock()
+			}
+			written <- err
+			if err != nil {
+				writerDone <- err
+				return
+			}
 		}
-		written <- err
-		writerDone <- err
+		writerDone <- nil
 	}()
 	var joinOnce sync.Once
 	var writeErr error
@@ -194,7 +211,9 @@ func assertAdaptiveCreditCommittedTailRefusalOn(t *testing.T, s *Store, db *sql.
 	// context may legitimately have expired before a fresh admission slice.
 	require.NotErrorIs(t, err, context.DeadlineExceeded)
 	if syncDelay > 0 {
-		require.Positive(t, delayedSyncs.Load(), "the controlled checkpoint return was not exercised")
+		require.Equal(t, int64(2), delayedSyncs.Load(), "only one additional real PASSIVE may finish a committed tail")
+		require.True(t, writer.tailCopyTried)
+		require.LessOrEqual(t, writer.spent, budget)
 		require.True(t, writer.readmitted, "the expired hold did not use unused credit for fresh admission")
 		require.NotNil(t, writer.resetCtx, "fresh admission did not retain its effective scope")
 	}

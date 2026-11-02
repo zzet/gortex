@@ -130,6 +130,10 @@ func statDiskStamp(path string) (diskStamp, error) {
 	if err != nil {
 		return diskStamp{}, err
 	}
+	return freezeDiskStampIdentity(path, info)
+}
+
+func freezeDiskStampIdentity(path string, info os.FileInfo) (diskStamp, error) {
 	// Go's Windows Lstat may defer loading file IDs until SameFile. Freeze
 	// them while this stamp is taken, before a replacement can reuse the
 	// saved path. SameFile retains Lstat's no-follow semantics and performs
