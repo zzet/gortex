@@ -74,7 +74,7 @@ func TestReadFileCompressionRejectsHashABAAndNewPendingOwner(t *testing.T) {
 					stamp, statErr := statDiskStamp(path)
 					require.NoError(t, statErr)
 					published = syntheticProjectionEntry(path, "service.go", "new-owner", 1, stamp, content)
-					require.NoError(t, pendingFileProjections.publishExpected(published, nil))
+					require.NoError(t, pendingFileProjections.publish(published))
 					if mode == "pending_owner_aba" {
 						pendingFileProjections.drop(published)
 					}
