@@ -130,11 +130,14 @@ func TestSymbolSourceMixedRetryPathsShareTwoActualAttempts(t *testing.T) {
 		return result, err
 	}
 	args := map[string]any{"id": "sample.go::Probe", "context_lines": 0, "format": "json", requireExactArgName: true, requireFreshArgName: true, waitDeadlineArgName: time.Now().Add(time.Second).Format(time.RFC3339Nano)}
-	result, err := s.wrapToolHandler(leaf)(t.Context(), makeReq("get_symbol_source", args))
+	// Exercise both real replay controllers over the actual source handler.
+	// This flat fixture has no working-copy generation coordinator, so the
+	// public require_fresh route would correctly refuse before any leaf.
+	result, err := s.retryFreshSymbolSearch(s.retryProjectedSymbolSource(leaf))(t.Context(), makeReq("get_symbol_source", args))
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	require.True(t, result.IsError, "%s", resultText(result))
 	require.Equal(t, 2, calls, "typed mismatch plus late withdrawal cannot permit a third actual handler invocation")
+	require.True(t, result.IsError, "%s", resultText(result))
 	for _, deadline := range deadlines {
 		require.Equal(t, deadlines[0], deadline, "outer replay cannot renew the original projection budget")
 	}
@@ -165,7 +168,7 @@ func TestExternalWriteAfterToolEdit(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, result.IsError, "%s", resultText(result))
 	ack := extractTextResult(t, result)
-	require.Equal(t, true, ack["committed"])
+	require.Equal(t, "committed", ack["disk_status"])
 	require.Equal(t, "local", ack["ack_mode"])
 	old := pendingFileProjections.snap.Load().entries[pathkey.MutationKey(path)]
 	require.NotNil(t, old)

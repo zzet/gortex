@@ -129,6 +129,13 @@ func statDiskStamp(path string) (diskStamp, error) {
 	if err != nil {
 		return diskStamp{}, err
 	}
+	// Go's Windows Lstat may defer loading file IDs until SameFile. Freeze
+	// them while this stamp is taken, before a replacement can reuse the
+	// saved path. SameFile retains Lstat's no-follow semantics and performs
+	// no content open on Unix, including for FIFOs. Refuse an unknown ID.
+	if !os.SameFile(info, info) {
+		return diskStamp{}, &os.PathError{Op: "stat", Path: path, Err: errors.New("projection: file identity unavailable")}
+	}
 	return diskStamp{info: info}, nil
 }
 
