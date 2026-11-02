@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
@@ -21,7 +22,8 @@ func TestPendingTextSearchReadsCurrentBytesWithoutWatcherCacheSideEffects(t *tes
 	for _, scenario := range []struct {
 		name                 string
 		refused, readRefused bool
-	}{{"projected", false, false}, {"projection explicitly disabled", true, false}, {"projected but current read refused", false, true}, {"projection disabled and current read refused", true, true}} {
+		deleted              bool
+	}{{"projected", false, false, false}, {"projection explicitly disabled", true, false, false}, {"projected but current read refused", false, true, false}, {"projection disabled and current read refused", true, true, false}, {"projected then deleted", false, false, true}, {"projection disabled then deleted", true, false, true}} {
 		refused, name := scenario.refused, scenario.name
 		t.Run(name, func(t *testing.T) {
 			previous := pendingFileProjections
@@ -72,6 +74,9 @@ func TestPendingTextSearchReadsCurrentBytesWithoutWatcherCacheSideEffects(t *tes
 				require.NoError(t, os.Remove(path))
 				require.NoError(t, os.Mkdir(path, 0o700))
 			}
+			if scenario.deleted {
+				require.NoError(t, os.Remove(path))
+			}
 			result := callToolByName(t, server, t.Context(), "search_text", map[string]any{"query": unique, "limit": 100, "max_bytes": 0, "format": "json"})
 			if scenario.readRefused {
 				require.True(t, result.IsError, "a refused current-byte read must not fall back to canonical text: %v", result.Content)
@@ -83,6 +88,10 @@ func TestPendingTextSearchReadsCurrentBytesWithoutWatcherCacheSideEffects(t *tes
 			require.False(t, old.IsError, "%v", old.Content)
 			oldRows, _ := extractTextResult(t, old)["matches"].([]any)
 			require.Empty(t, oldRows, "old canonical postings must not survive the same pending physical write")
+			if scenario.deleted {
+				require.Empty(t, rows, "actual absence must mask both the pending text and old postings")
+				return
+			}
 			require.Len(t, rows, 1, "first search must scan the physical pending file even when no projection was admitted")
 			row := rows[0].(map[string]any)
 			require.Equal(t, "main.go", row["path"])
@@ -129,6 +138,49 @@ func TestPendingTextSearchIncludesActualUnsupportedAndOversizeProjections(t *tes
 			require.Len(t, rows, 1)
 			require.Equal(t, scenario.path, rows[0].(map[string]any)["path"])
 			require.Equal(t, float64(2), rows[0].(map[string]any)["line"])
+		})
+	}
+}
+
+func TestPendingTextAbsenceRequiresAnOwnedMissingPath(t *testing.T) {
+	for _, mode := range []string{"missing leaf", "missing directory", "broken final link", "escaping parent", "broken parent"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			parent := filepath.Join(root, "sub")
+			path := filepath.Join(parent, "main.go")
+			require.NoError(t, os.Mkdir(parent, 0o700))
+			require.NoError(t, os.WriteFile(path, []byte("package main\nfunc BeforeDeletion() {}\n"), 0o600))
+			idx := indexer.New(graph.New(), testRegistry(), config.Default().Index, zap.NewNop())
+			t.Cleanup(idx.Close)
+			_, err := idx.Index(root)
+			require.NoError(t, err)
+			require.NoError(t, os.Remove(path))
+			if mode != "missing leaf" && mode != "broken final link" {
+				require.NoError(t, os.Remove(parent))
+			}
+			switch mode {
+			case "broken final link":
+				if err := os.Symlink(filepath.Join(root, "absent.go"), path); err != nil {
+					t.Skipf("symlink fixture unavailable: %v", err)
+				}
+			case "escaping parent", "broken parent":
+				target := t.TempDir()
+				if mode == "broken parent" {
+					target = filepath.Join(target, "absent")
+				}
+				if err := os.Symlink(target, parent); err != nil {
+					t.Skipf("symlink fixture unavailable: %v", err)
+				}
+			}
+			server := &Server{}
+			rows, excluded, err := server.scanPendingTextFiles(t.Context(), []pendingTextFile{{abs: path, path: "sub/main.go", relative: "sub/main.go", indexer: idx}}, "BeforeDeletion", nil, 10)
+			if mode != "missing leaf" && mode != "missing directory" {
+				require.Error(t, err, "an unsafe unresolved path is not evidence of deletion")
+				return
+			}
+			require.NoError(t, err)
+			require.Empty(t, rows)
+			require.Contains(t, excluded[idx.RepoPrefix()], "sub/main.go", "actual absence must still hide old postings")
 		})
 	}
 }

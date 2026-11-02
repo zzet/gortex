@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"sort"
 
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
@@ -121,7 +123,7 @@ func (s *Server) scanPendingTextFiles(ctx context.Context, files []pendingTextFi
 			return nil, nil, fmt.Errorf("%w: pending byte bound", indexer.ErrSourceSearchBudget)
 		}
 		raw, evidence, err := readPhysicalFileEvidenceBounded(file.abs, budget)
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) && pendingTextPathAbsent(file.abs, file.indexer.RootPath()) {
 			continue
 		} // actual absence masks old postings too
 		if err != nil {
@@ -142,4 +144,23 @@ func (s *Server) scanPendingTextFiles(ctx context.Context, files []pendingTextFi
 		}
 	}
 	return matches, excluded, nil
+}
+
+// Missing bytes mask old postings only when the missing path is still owned.
+// A broken final link or a missing target behind an escaping parent is a read
+// refusal, not evidence that the repository's file has been deleted.
+func pendingTextPathAbsent(abs, root string) bool {
+	for current := abs; ; current = filepath.Dir(current) {
+		_, err := os.Lstat(current)
+		if err == nil {
+			if current == abs {
+				return false
+			}
+			resolved, resolveErr := filepath.EvalSymlinks(current)
+			return resolveErr == nil && pathguard.WithinRoot(resolved, pathguard.ResolveRoot(root))
+		}
+		if !errors.Is(err, os.ErrNotExist) || filepath.Dir(current) == current {
+			return false
+		}
+	}
 }
