@@ -104,9 +104,12 @@ func TestConcurrentRegisteredReadsRevalidateSameACKOwner(t *testing.T) {
 		result *mcplib.CallToolResult
 	}
 	answers := make(chan answer, 3)
+	allowances := make(map[string]*projectedSourceAllowance)
 	var workers sync.WaitGroup
 	t.Cleanup(func() { release(); workers.Wait() })
 	for i, tool := range []string{"get_file_summary", "get_editing_context", "get_symbol_source"} {
+		allowances[tool] = &projectedSourceAllowance{tool: tool}
+		allowance := allowances[tool]
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
@@ -114,7 +117,8 @@ func TestConcurrentRegisteredReadsRevalidateSameACKOwner(t *testing.T) {
 			if tool == "get_symbol_source" {
 				args = map[string]any{"id": "main.go::Target", "context_lines": 0, "compress_bodies": false, "format": "json"}
 			}
-			result := preselectionRegisteredCall(t, s, ctx, 20+i, tool, args)
+			requestCtx := context.WithValue(ctx, projectedSourceAllowanceKey{}, allowance)
+			result := preselectionRegisteredCall(t, s, requestCtx, 20+i, tool, args)
 			answers <- answer{tool: tool, result: result}
 		}()
 	}
@@ -147,7 +151,9 @@ func TestConcurrentRegisteredReadsRevalidateSameACKOwner(t *testing.T) {
 	require.Equal(t, 5, sql.GetNode("main.go::Neighbor").StartLine, "no canonical publication or fabricated Done result changed this control")
 	t.Logf("remaining original whole-call allowance=%s", time.Until(originalDeadline))
 	for _, tool := range []string{"get_file_summary", "get_editing_context", "get_symbol_source"} {
-		t.Logf("actual registered tool=%s result=%s", tool, resultText(results[tool]))
+		t.Logf("actual registered tool=%s attempts=%d result=%s", tool, allowances[tool].attempts.Load(), resultText(results[tool]))
+		require.GreaterOrEqual(t, allowances[tool].attempts.Load(), int32(1))
+		require.LessOrEqual(t, allowances[tool].attempts.Load(), int32(2), "all retry paths share the original two-attempt allowance")
 	}
 	source := results["get_symbol_source"]
 	require.False(t, source.IsError, resultText(source))

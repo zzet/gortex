@@ -2765,6 +2765,9 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 
 	ctx, err = s.ensureProjected(ctx, []string{fp})
 	if err != nil {
+		if errors.Is(err, errProjectedSourceMoved) {
+			return nil, err
+		}
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 

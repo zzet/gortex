@@ -32,8 +32,17 @@ func auditedSourceProjectionMismatch(ctx context.Context, err error) bool {
 		return false
 	}
 	allowance, audited := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
-	return audited && (allowance.tool == "" || allowance.tool == "get_symbol_source") &&
-		(errors.Is(err, errProjectionExternalWrite) || errors.Is(err, projectionSuperseded))
+	if !audited {
+		return false
+	}
+	// A competing read can replace the same suspect ACK owner with a checked
+	// same-byte COW entry before this request borrows it. All audited file
+	// reads must restart the whole attempt instead of losing their file layer
+	// and serving old base rows. No old facts or reader are rebound in place.
+	if errors.Is(err, projectionSuperseded) {
+		return true
+	}
+	return (allowance.tool == "" || allowance.tool == "get_symbol_source") && errors.Is(err, errProjectionExternalWrite)
 }
 
 // Each request retains only the immutable file layers it actually checked in
