@@ -11,7 +11,9 @@ type repositoryCleanupNotificationHooks struct{ notifications [][]string }
 func (*repositoryCleanupNotificationHooks) PurgeCheckoutLayers(context.Context, string, string) error {
 	return nil
 }
-func (*repositoryCleanupNotificationHooks) ReleaseGraph(context.Context, string) error { return nil }
+func (*repositoryCleanupNotificationHooks) ReleaseGraph(context.Context, string, string) error {
+	return nil
+}
 func (h *repositoryCleanupNotificationHooks) RepositoryCleanupAttemptFinished(graphs []string) {
 	h.notifications = append(h.notifications, append([]string(nil), graphs...))
 }

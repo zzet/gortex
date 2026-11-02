@@ -9,6 +9,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/reconcile"
 	"go.uber.org/zap"
 )
 
@@ -60,6 +61,7 @@ type repositoryCleanupPayload interface {
 type repositoryCleanupState struct {
 	mu            sync.Mutex
 	graphID       string
+	cause         string
 	identity      store_sqlite.RepositoryCleanupIdentity
 	owner         *graphview.RepositoryDrain
 	refs          *repositoryRefViewDrain
@@ -208,11 +210,16 @@ func (l *CheckoutLifecycle) waitRepositoryCleanup(runtime *repositoryCleanupRunt
 // The OUTERMOST saga invokes this captured completion after its final journal
 // write. Different cleanup IDs may finish across a same-identity re-registration;
 // an old callback therefore must not look up and signal the replacement state.
-func (h cleanupHooks) BeginGraphCleanupAttempt(ctx context.Context, graphID string) (func(), error) {
+func (h cleanupHooks) BeginGraphCleanupAttempt(ctx context.Context, graphID string, causes ...string) (func(), error) {
 	runtime, state, _, err := h.l.pendingRepositoryCleanup(ctx, graphID)
 	if runtime == nil || state == nil {
 		return nil, err
 	}
+	state.mu.Lock()
+	if len(causes) > 0 && (state.cause == "" || reconcile.ConfigRemovalAllowed(causes[0])) {
+		state.cause = causes[0]
+	}
+	state.mu.Unlock()
 	return func() {
 		runtime.mu.Lock()
 		changed := false
@@ -288,7 +295,7 @@ func (l *CheckoutLifecycle) releaseRepositoryGraph(ctx context.Context, graphID 
 		}
 	}
 	l.detachWatcherContext(ctx, state.identity.RepoPrefix)
-	finalize := l.repositoryConfigFinalizer(state.identity.RootPath)
+	finalize := l.repositoryConfigFinalizer(state.identity.RootPath, state.cause)
 	_, _, err = l.mi.purgeRepoForCleanup(ctx, state.identity.RepoPrefix, finalize)
 	if l.mi.GetMetadata(state.identity.RepoPrefix) == nil {
 		l.notifyTrackedSetChanged()
@@ -300,7 +307,7 @@ func (l *CheckoutLifecycle) releaseRepositoryGraph(ctx context.Context, graphID 
 	return nil
 }
 
-func (l *CheckoutLifecycle) repositoryConfigFinalizer(rootPath string) func(*RepoMetadata) error {
+func (l *CheckoutLifecycle) repositoryConfigFinalizer(rootPath, cause string) func(*RepoMetadata) error {
 	return func(meta *RepoMetadata) error {
 		if l.cfgMgr == nil {
 			return nil
@@ -312,7 +319,14 @@ func (l *CheckoutLifecycle) repositoryConfigFinalizer(rootPath string) func(*Rep
 		if path == "" {
 			return nil
 		}
-		_, err := l.cfgMgr.Global().RemoveRepoAndSaveIfPresent(path)
+		if !reconcile.ConfigRemovalAllowed(cause) {
+			l.logger.Info("config: kept tracked repo", zap.String("root", path), zap.String("cause", cause), zap.String("caller", "repository_cleanup"))
+			return nil
+		}
+		removed, err := l.cfgMgr.Global().RemoveRepoAndSaveIfPresent(path)
+		if err == nil && removed {
+			l.logger.Info("config: removed tracked repo", zap.String("root", path), zap.String("cause", cause), zap.String("caller", "repository_cleanup"))
+		}
 		return err
 	}
 }
