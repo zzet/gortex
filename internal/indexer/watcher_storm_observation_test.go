@@ -77,3 +77,18 @@ func TestMultiWatcherStormActiveForFileUsesStartedPathOwner(t *testing.T) {
  require.False(t,observesQueuedStorm((*Watcher)(nil),path))
  require.False(t,observesQueuedStorm((*MultiWatcher)(nil),path))
 }
+
+func TestStormActiveForFileRefusesSupersededQueuedGeneration(t *testing.T) {
+ root,_,w := inertMutationSetWatcher(t,"storm.go","package p\nfunc Storm(){}\n")
+ w.config.StormQuietPeriodMs = 60000
+ w.config.DebounceMs = 60000
+ t.Cleanup(func(){require.NoError(t,w.Stop())})
+ path := filepath.Join(root,"storm.go")
+ w.recordInStorm(path,ChangeModified)
+ require.True(t,observesQueuedStorm(w,path))
+ older := w.TierState(path).Generation
+ ticket,err := w.EnqueueFileMutation(context.Background(),path)
+ require.NoError(t,err)
+ require.Greater(t,ticket.Generation,older)
+ require.False(t,observesQueuedStorm(w,path),"an older queued storm cannot donate a reason to a newer point owner")
+}
