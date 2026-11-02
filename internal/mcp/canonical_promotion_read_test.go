@@ -26,7 +26,10 @@ func canonicalPromotionReadFixture(t *testing.T) (*Server, *store_sqlite.Store, 
 	root := t.TempDir()
 	path := filepath.Join(root, "main.go")
 	require.NoError(t, os.WriteFile(path, []byte("package probe\n\nfunc Target() int { return 1 }\n\nfunc Neighbor() int { return 9 }\n"), 0600))
-	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "canonical.sqlite"))
+	// This is a real SQLite publication/reader interleaving, not a persistence
+	// benchmark. Keep temporary-filesystem I/O outside the 150ms read oracle;
+	// the actual IndexFile, SQL rows, retirement and deadline checks stay intact.
+	store, err := store_sqlite.Open(":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	idx := newProjectionTestIndexer(t, store)

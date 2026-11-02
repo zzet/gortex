@@ -26,7 +26,9 @@ func TestUnchangedReadAfterRetirementCannotPoisonBorrowedRetryProof(t *testing.T
 	root := t.TempDir()
 	path := filepath.Join(root, "main.go")
 	require.NoError(t, os.WriteFile(path, []byte("package probe\n\nfunc Target() int { return 1 }\n\nfunc Neighbor() int { return 9 }\n"), 0600))
-	sql, err := store_sqlite.Open(filepath.Join(t.TempDir(), "retirement.sqlite"))
+	// Exercise the real SQLite publication/reader boundary without charging
+	// temporary-filesystem persistence to this 150ms interleaving oracle.
+	sql, err := store_sqlite.Open(":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, sql.Close()) })
 	backend := &preselectionRetirementStore{Store: sql}
