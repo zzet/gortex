@@ -319,7 +319,14 @@ func TestRenameReturnsTheDispatchSlotOnlyAtItsLastFile(t *testing.T) {
 		return true
 	}
 
-	results := s.commitRenameWrites(context.Background(), writes)
+	paths := make([]string, len(writes))
+	for i, w := range writes {
+		paths[i] = w.AbsPath
+	}
+	heldCtx, releasePaths, err := acquireMutationPaths(context.Background(), paths)
+	require.NoError(t, err)
+	defer releasePaths()
+	results := s.commitRenameWrites(heldCtx, writes, releasePaths)
 	require.Len(t, results, len(writes))
 	for _, result := range results {
 		require.Equal(t, "applied", result["status"])

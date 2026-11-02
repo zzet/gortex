@@ -855,6 +855,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	}
 	scopeIntentDefaults := conf.Scope.IntentDefaults
 	multiOpts := []gortexmcp.MultiRepoOptions{{
+		EditAckMode:         conf.Edit.Ack,
 		MultiIndexer:        mi,
 		ConfigManager:       cm,
 		CheckoutLifecycle:   s.CheckoutLifecycle,

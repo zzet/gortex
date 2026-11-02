@@ -1077,7 +1077,14 @@ func attachReceiptTiers(payload map[string]any, receipt *mutationReceipt) {
 	if receipt == nil || receipt.ticket == nil {
 		return
 	}
-	tiers := receipt.ticket.TierState()
+	attachMutationTierState(payload, receipt.ticket.TierState())
+}
+
+// Mutation status and source ACKs render the same immutable producer snapshot.
+func attachMutationTierState(payload map[string]any, tiers indexer.MutationTierState) {
+	for _, key := range []string{"tier_state", "ack_at", "file_graph_at", "relations_at", "derived_at"} {
+		delete(payload, key)
+	}
 	if tiers.AckAt.IsZero() {
 		return
 	}
@@ -1111,4 +1118,21 @@ func shortFreshSHA(sha string) string {
 		return sha[:12]
 	}
 	return sha
+}
+
+// File exactness is physical projection evidence, independent of the ticket's
+// graph/relations/derived producer. Copy the map so cached ACK snapshots remain
+// immutable when a later replay observes a replacement or invalidation.
+func attachMutationFileTier(payload map[string]any, exact bool) {
+	states := make(map[string]string, 4)
+	if previous, ok := payload["tier_state"].(map[string]string); ok {
+		for key, value := range previous {
+			states[key] = value
+		}
+	}
+	states["file"] = "pending"
+	if exact {
+		states["file"] = "fresh"
+	}
+	payload["tier_state"] = states
 }

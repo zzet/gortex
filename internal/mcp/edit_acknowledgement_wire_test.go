@@ -110,7 +110,7 @@ func TestMutationStatusAcknowledgementSharesRPCAndPreservesPublication(t *testin
 	h := s.boundToolHandler(func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		for _, name := range []string{"a.go", "b.go"} {
 			path := filepath.Join(root, name)
-			record, err := s.commitFileMutation(ctx, "write_file", "", "", name, path, []byte("package p\n"), 0o600)
+			record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "", name, path, []byte("package p\n"), 0o600)
 			if err != nil {
 				return nil, err
 			}

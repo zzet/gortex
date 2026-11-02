@@ -206,6 +206,7 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 	s.refreshPendingSourceRecord(record)
 	snap := record.snapshot()
 	payload := map[string]any{
+		"ack_mode":     snap.AckMode,
 		"found":        true,
 		"receipt":      snap.Receipt,
 		"tool":         snap.Tool,
@@ -219,6 +220,9 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 	}
 	if snap.MutationID != "" {
 		payload["mutation_id"] = snap.MutationID
+	}
+	if snap.ContentSHA256 != "" {
+		payload["content_sha256"] = snap.ContentSHA256
 	}
 	if snap.NewSHA != "" {
 		payload["new_sha"] = snap.NewSHA
@@ -252,11 +256,16 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 		acknowledgement = &snapshot
 	}
 	attachAcknowledgementPayload(payload, acknowledgement, "unavailable_recording_or_evicted")
-	if value, found := s.mutationReceipts.Load(snap.ReindexReceipt); found {
+	publicationReceipt := snap.ReindexReceipt
+	if publicationReceipt == "" {
+		publicationReceipt = snap.publicationReceipt
+	}
+	if value, found := s.mutationReceipts.Load(publicationReceipt); found {
 		if receipt, ok := value.(*mutationReceipt); ok {
 			attachReceiptTiers(payload, receipt)
 		}
 	}
+	record.attachFileProjection(payload)
 	return payload
 }
 
@@ -391,6 +400,9 @@ func mutationCommitListingPayload(records []*mutationCommitRecord) []map[string]
 			"graph_status_terminal": graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded),
 		}
 		attachMutationRefreshSnapshot(entry, snap)
+		if snap.AckMode != "" {
+			entry["ack_mode"] = snap.AckMode
+		}
 		// Every remaining field mirrors mutationCommitSnapshot's omitempty
 		// exactly. Rendering by hand is what dropped new_sha and
 		// bytes_written the first time, so the parity is asserted against the
@@ -404,6 +416,9 @@ func mutationCommitListingPayload(records []*mutationCommitRecord) []map[string]
 		}
 		if snap.MutationID != "" {
 			entry["mutation_id"] = snap.MutationID
+		}
+		if snap.ContentSHA256 != "" {
+			entry["content_sha256"] = snap.ContentSHA256
 		}
 		if snap.NewSHA != "" {
 			entry["new_sha"] = snap.NewSHA

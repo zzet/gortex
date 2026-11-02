@@ -131,6 +131,8 @@ func (sh *symbolHistory) All() map[string][]SymbolModification {
 
 // Server wraps the MCP server with Gortex-specific tools.
 type Server struct {
+	editAckMode      config.EditAckMode
+	editAckConfigErr error
 	// editOperations covers actual source-edit handler completions across this
 	// Server's sessions/views, including handlers that outlive their caller.
 	// Native filesystem stimuli remain harness-owned, not inferred from events.
@@ -1487,6 +1489,8 @@ func prependUnique(slice []string, item string, maxLen int) []string {
 // MultiRepoOptions holds optional multi-repo components for the Server.
 // When nil or zero-valued, the server operates in single-repo mode.
 type MultiRepoOptions struct {
+	// EditAckMode is startup policy; empty inherits global config, then full.
+	EditAckMode   config.EditAckMode
 	MultiIndexer  *indexer.MultiIndexer
 	ConfigManager *config.ConfigManager
 	// CheckoutLifecycle owns every side effect of tracking and forgetting a
@@ -1951,6 +1955,17 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	if watcher != nil {
 		s.watcher = watcher
 	}
+
+	ackConfig := config.EditConfig{}
+	if len(opts) > 0 {
+		if opts[0].ConfigManager != nil {
+			ackConfig = opts[0].ConfigManager.Global().Edit
+		}
+		if opts[0].EditAckMode != "" {
+			ackConfig.Ack = opts[0].EditAckMode
+		}
+	}
+	s.editAckMode, s.editAckConfigErr = ackConfig.AckMode()
 
 	// Apply multi-repo options if provided.
 	if len(opts) > 0 {
@@ -3772,6 +3787,11 @@ func (s *Server) SetWatcher(w watcherHistory) {
 	s.watcherMu.Lock()
 	s.watcher = w
 	s.watcherMu.Unlock()
+	if sourceEvents, ok := w.(interface{ OnSourceEvent(func(string)) }); ok {
+		sourceEvents.OnSourceEvent(func(path string) {
+			pendingFileProjections.markSuspect(path)
+		})
+	}
 
 	// Register callback to track symbol modifications for
 	// get_symbol_history AND fan stale_refs notifications to any

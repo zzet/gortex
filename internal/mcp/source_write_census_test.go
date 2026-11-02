@@ -20,7 +20,7 @@ const sourceWriteChokePoint = "Server.commitFileMutation"
 
 // sourceWriteCensusEnforced turns the census from a report into a gate once
 // every source writer routes through the choke point.
-const sourceWriteCensusEnforced = false
+const sourceWriteCensusEnforced = true
 
 // nonSourceWriters may reference a file writer without the choke point: they
 // write tool outputs, transaction journals and spill files, or they are a
@@ -29,7 +29,8 @@ var nonSourceWriters = map[string]string{
 	"durableAtomicWriteFile":      "the durable write primitive",
 	"Server.persistBatchManifest": "batch transaction manifest",
 	"Server.prepareBatchJournal":  "batch transaction backups",
-	"Server.rollbackBatchReceipt": "restores a failed batch from its backups",
+	"Server.batchDurability":      "selects the durable source primitive",
+	"Server.cleanupBatchBackups":  "removes transaction backups only",
 	"symbolPageStorage.close":     "symbol page spill directory",
 	"symbolPageStorage.spill":     "symbol page spill directory",
 	"Server.handleExportGraph":    "export output path",
@@ -51,10 +52,14 @@ func sourceWriteSink(n ast.Node) string {
 			return "os." + sel.Sel.Name
 		case x.Name == "agents" && sel.Sel.Name == "AtomicWriteFile":
 			return "agents.AtomicWriteFile"
+		case x.Name == "platform" && sel.Sel.Name == "RemoveFile":
+			return "platform.RemoveFile"
+		case sel.Sel.Name == "writeFile" || sel.Sel.Name == "removeFile":
+			return "durable." + sel.Sel.Name
 		}
 	case *ast.CallExpr:
-		if inner, ok := x.Fun.(*ast.SelectorExpr); ok && inner.Sel.Name == "batchDurability" && sel.Sel.Name == "writeFile" {
-			return "batchDurability().writeFile"
+		if inner, ok := x.Fun.(*ast.SelectorExpr); ok && inner.Sel.Name == "batchDurability" && (sel.Sel.Name == "writeFile" || sel.Sel.Name == "removeFile") {
+			return "batchDurability()." + sel.Sel.Name
 		}
 	}
 	return ""
@@ -133,11 +138,16 @@ func (s *Server) handleFixture() {
 	write := s.batchDurability().writeFile
 	_ = write
 	os.Remove("x")
+	ops := s.batchDurability()
+	_ = ops.removeFile
+	platform.RemoveFile("x")
 }
 `, parser.SkipObjectResolution)
 	require.NoError(t, err)
 	require.Equal(t, []string{
 		"fixture.go: Server.handleFixture -> batchDurability().writeFile",
+		"fixture.go: Server.handleFixture -> durable.removeFile",
 		"fixture.go: Server.handleFixture -> os.Remove",
+		"fixture.go: Server.handleFixture -> platform.RemoveFile",
 	}, sourceWriteBypasses(map[string]*ast.File{"fixture.go": fixture}))
 }

@@ -16,6 +16,8 @@ func editGateACKSeed(ctx context.Context, s *Server) error {
 	if os.Getenv("GORTEX_EDIT_GATE_SEED") != "ack-wait" {
 		return nil
 	}
+	resumeIntent := suspendSourceMutationWriteIntent(ctx)
+	defer resumeIntent()
 	// The synthetic legacy wait yields its existing dispatch permit, just
 	// like an ordinary publication wait. It owns no writer or extra lap.
 	waiting := make(chan struct{})
