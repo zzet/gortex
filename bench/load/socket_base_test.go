@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func shortPrivateSocketBase(t *testing.T) string {
@@ -71,4 +73,52 @@ func TestPrivateSocketBaseRefusesUnsafeOverride(t *testing.T) {
 			t.Fatalf("socket base followed alias: %q (%v)", got, err)
 		}
 	})
+}
+
+func TestPrivateRunSocketOverrideKeepsCleanupInsideOwnedDirectory(t *testing.T) {
+	base := shortPrivateSocketBase(t)
+	t.Setenv("GORTEX_LOAD_SOCKET_BASE", base)
+	before, err := os.Stat(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(base, "caller-owned-marker")
+	if err := os.WriteFile(marker, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	p, err := newPrivateRun(ctx, t.TempDir(), "/unused/binary", []Corpus{gitFixture(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(p.SocketDir); _ = p.removeState() })
+	if filepath.Dir(p.SocketDir) != base || filepath.Dir(p.Socket) != p.SocketDir || len(p.Socket) >= 104 {
+		t.Fatalf("socket escaped owned short root: %+v", p)
+	}
+	if err := os.RemoveAll(p.SocketDir); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(base)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("cleanup replaced caller root: %v", err)
+	}
+	value, err := os.ReadFile(marker)
+	if err != nil || string(value) != "keep" {
+		t.Fatalf("cleanup touched caller-owned sibling: %q %v", value, err)
+	}
+}
+
+func TestSearchAcceptanceOuterUsesActualOutputFlag(t *testing.T) {
+	for _, editors := range []int{1, 4, 8} {
+		args := searchAcceptanceArgs(editors, 1000)
+		args = append(args, "--search-readback-acceptance", "--edit-mean=1s", "--edit-ack=local", "--out=/owned/report.json")
+		parsed, err := parseRun(args)
+		if err != nil || parsed.Output != "/owned/report.json" || parsed.EditCount != 1000 || parsed.Editors != editors || !parsed.SearchReadbackAcceptance {
+			t.Fatalf("actual per-cell argv refused or altered: %+v %v", parsed, err)
+		}
+		if _, err := parseRun(append(args, "--output=/owned/invalid.json")); err == nil {
+			t.Fatal("obsolete unregistered --output flag unexpectedly accepted")
+		}
+	}
 }
