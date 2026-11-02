@@ -167,7 +167,19 @@ func exactSearchReadback(kind string, body map[string]any, repo privateRepo, ste
 	}
 	if kind == "old_search_absent" || kind == "old_text_absent" {
 		rows, complete := editProbeCompleteCount(body, key, total)
-		if !complete || body["truncated"] != false || body["_truncated_by_budget"] == true || body["next_cursor"] != nil && body["next_cursor"] != "" {
+		if !complete || kind == "old_search_absent" && body["truncated"] != false || body["next_cursor"] != nil && body["next_cursor"] != "" {
+			return false
+		}
+		// Symbol pages declare truncated:false. The actual text producer
+		// omits that field on a complete page, and discloses only a positive
+		// limit/budget cut. Never require a false field the tool did not emit,
+		// or credit a contradictory/malformed completeness declaration.
+		for _, flag := range []string{"truncated", "_truncated_by_limit", "_truncated_by_budget"} {
+			if value, present := body[flag]; present && value != false {
+				return false
+			}
+		}
+		if exact, present := body["count_is_exact"]; present && exact != true {
 			return false
 		}
 		for _, raw := range rows {
