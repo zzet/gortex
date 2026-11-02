@@ -3556,7 +3556,10 @@ func (mi *MultiIndexer) UntrackRepo(repoPrefix string) (int, int) {
 			if meta == nil || meta.RootPath == "" || mi.configMgr == nil {
 				return nil
 			}
-			_, err := mi.configMgr.Global().RemoveRepoAndSaveIfPresent(meta.RootPath)
+			removed, err := mi.configMgr.Global().RemoveRepoAndSaveIfPresent(meta.RootPath)
+			if err == nil && removed {
+				mi.logger.Info("config: removed tracked repo", zap.String("root", meta.RootPath), zap.String("cause", "untrack"), zap.String("caller", "UntrackRepo"))
+			}
 			return err
 		},
 	)

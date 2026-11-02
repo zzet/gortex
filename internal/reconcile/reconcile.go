@@ -97,7 +97,7 @@ type CleanupHooks interface {
 	// reader still holds the graph and they resume the saga once it drains,
 	// also implement CleanupDeferred(error) bool to tell that error apart from
 	// a failure.
-	ReleaseGraph(ctx context.Context, graphID string) error
+	ReleaseGraph(ctx context.Context, graphID, cause string) error
 }
 
 // InventoryFunc enumerates a checkout family. It has gitstate.Inventory's
@@ -221,6 +221,7 @@ type familyPass struct {
 	primaryGraphID string
 	now            time.Time
 	beforeAllocate func() error
+	commonFresh    PathEvidence
 }
 
 // ReconcileFamily brings one family's catalog rows in line with what git and
@@ -230,10 +231,16 @@ type familyPass struct {
 // and then validated against the family's recorded common-dir identity, so an
 // inventory of some other repository can never be read as this family's.
 //
-// The pass never deletes an identity by itself. Deletion happens when a
-// removal clock expires, which runs a saga, or when a caller enters one of
-// the saga entry points directly.
+// Only automatic checkouts may expire through a pass. An intended checkout
+// keeps its identity and configuration when its layers become unavailable;
+// removing tracking configuration requires an authorized cleanup cause.
 func (r *Reconciler) ReconcileFamily(ctx context.Context, familyID, probeDir string) (FamilyReport, error) {
+	return r.ReconcileFamilyCandidates(ctx, familyID, probeDir)
+}
+
+// ReconcileFamilyCandidates tries ordered probes without letting one damaged
+// checkout stand in for the availability of every checkout in its family.
+func (r *Reconciler) ReconcileFamilyCandidates(ctx context.Context, familyID string, probeDirs ...string) (FamilyReport, error) {
 	family, ok, err := r.catalog.GetRepositoryFamily(ctx, familyID)
 	if err != nil {
 		return FamilyReport{}, err
@@ -243,13 +250,26 @@ func (r *Reconciler) ReconcileFamily(ctx context.Context, familyID, probeDir str
 	}
 
 	started := time.Now()
-	inv, invErr := r.inventory(ctx, probeDir)
+	var inv *gitstate.FamilyInventory
+	invErr := gitstate.ErrInventoryUnavailable
+	for _, probeDir := range probeDirs {
+		if ctx.Err() != nil {
+			invErr = ctx.Err()
+			break
+		}
+		inv, invErr = r.inventory(ctx, probeDir)
+		invErr = ValidateInventory(inv, invErr, family.CommonDirIdentity)
+		if invErr == nil {
+			break
+		}
+	}
 	elapsed := time.Since(started)
 	pass := &familyPass{
 		family:       family,
 		inventory:    inv,
 		inventoryErr: ValidateInventory(inv, invErr, family.CommonDirIdentity),
 		now:          r.now(),
+		commonFresh:  SampledPathEvidence(r.samplePath(family.CommonDirIdentity)),
 	}
 	// The inventory is the pass's one unbounded cost — a git plumbing call
 	// against a directory that may be on a sleeping volume — so it is timed
@@ -337,6 +357,9 @@ func (r *Reconciler) reconcileKnown(
 	}
 	fresh := SampledPathEvidence(r.samplePath(root))
 	class := Classify(pass.inventoryErr, record, StoredPathEvidence(storedRow), fresh)
+	if pass.inventoryErr != nil && pass.commonFresh.RootMissing && pass.commonFresh.ancestorVolumeUsable() && storedRow.CommonDirVolumeKind == pass.commonFresh.AncestorVolumeKind && storedRow.CommonDirVolumeToken != "" && storedRow.CommonDirVolumeToken == pass.commonFresh.AncestorVolumeToken {
+		class = Classification{Disposition: DispositionRemoved, Evidence: EvidencePrunableConfirmed, Detail: "family common directory absent on its still-mounted volume"}
+	}
 	r.recordClassification(pass, existing, record, fresh, class)
 
 	entry := CheckoutReport{
@@ -358,8 +381,23 @@ func (r *Reconciler) reconcileKnown(
 	observeDiscoveryLag(pass.now, existing.LastSeen)
 
 	switch class.Disposition {
+	case DispositionUnknown:
+		entry.Action = ActionInventoryUnknown
+		req.LastError = class.Code + ": " + class.Detail
 	case DispositionPresent:
-		entry.Action = r.applyPresent(ctx, pass, existing, record, &req)
+		if record == nil {
+			// A fresh local marker proves this checkout is reachable, not that the
+			// failed family inventory is evidence about any other checkout or clock.
+			req.State = store_sqlite.CheckoutStateReady
+			req.LastError = ""
+			entry.Action = ActionReadyConfirmed
+			if existing.State != store_sqlite.CheckoutStateReady {
+				req.State = store_sqlite.CheckoutStateReconciling
+				entry.Action = ActionAvailabilityRecovered
+			}
+		} else {
+			entry.Action = r.applyPresent(ctx, pass, existing, record, &req)
+		}
 	case DispositionInaccessible:
 		action, gone, err := r.applyInaccessible(ctx, pass, existing, &req)
 		if err != nil {
@@ -398,6 +436,8 @@ func (r *Reconciler) reconcileKnown(
 		entry.RetryAt = req.AvailabilityDeadline
 	case ActionRemovalGraceStarted, ActionRemovalHeld:
 		entry.RetryAt = req.RemovalDeadline
+	case ActionMarkedUnavailable, ActionPrimaryRetirementRefused:
+		entry.RetryAt = pass.now.Add(r.cfg.AvailabilityGrace).Unix()
 	}
 
 	if err := r.catalog.UpdateCheckoutObservation(ctx, req); err != nil {
@@ -413,8 +453,17 @@ func (r *Reconciler) reconcileKnown(
 	entry.State = req.State
 	recordTransition(existing.State, req.State, class)
 
-	if class.Disposition == DispositionPresent {
-		row := fresh.CatalogRow(existing.CheckoutID, pass.now.Unix(), storedRow.SampleGeneration+1)
+	if class.Disposition == DispositionPresent || pass.inventoryErr == nil {
+		row := storedRow
+		if class.Disposition == DispositionPresent {
+			row = fresh.CatalogRow(existing.CheckoutID, pass.now.Unix(), storedRow.SampleGeneration+1)
+		}
+		row.CheckoutID = existing.CheckoutID
+		row.CommonDirVolumeKind, row.CommonDirVolumeToken = storedRow.CommonDirVolumeKind, storedRow.CommonDirVolumeToken
+		if pass.inventoryErr == nil {
+			row.CommonDirVolumeKind = pass.commonFresh.RootVolumeKind
+			row.CommonDirVolumeToken = pass.commonFresh.RootVolumeToken
+		}
 		if err := r.catalog.UpsertCheckoutPathEvidence(ctx, row); err != nil {
 			return entry, err
 		}
@@ -463,17 +512,18 @@ func (r *Reconciler) applyPresent(
 
 	switch {
 	case existing.RemovalDetectedAt != 0:
+		req.State = store_sqlite.CheckoutStateReconciling
 		return ActionRemovalCancelled
 	case existing.State != store_sqlite.CheckoutStateReady:
+		req.State = store_sqlite.CheckoutStateReconciling
 		return ActionAvailabilityRecovered
 	}
 	return ActionReadyConfirmed
 }
 
 // applyInaccessible advances the availability clock without starting a second
-// removal grace. Once the availability grace expires, the checkout is retired
-// exactly like an authoritatively removed worktree: an inaccessible worktree
-// must not leave a shadow graph or tracking state behind indefinitely.
+// removal grace. Expiry purges an intended checkout's layers and keeps its
+// tracking identity; automatic checkouts retain their ordinary retirement.
 func (r *Reconciler) applyInaccessible(
 	ctx context.Context,
 	pass *familyPass,
@@ -490,7 +540,10 @@ func (r *Reconciler) applyInaccessible(
 	if existing.AvailabilityDeadline == 0 || now < existing.AvailabilityDeadline {
 		return ActionAvailabilityHeld, false, nil
 	}
-	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing)
+	if action, retained, err := r.retainIntended(ctx, pass, existing, req); retained || err != nil {
+		return action, false, err
+	}
+	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing, CauseReconcileAvailability)
 }
 
 // applyRemoved advances the removal clock only, and runs the right teardown
@@ -523,7 +576,79 @@ func (r *Reconciler) applyRemoved(
 		return ActionRemovalHeld, false, nil
 	}
 
-	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing)
+	if action, retained, err := r.retainIntended(ctx, pass, existing, req); retained || err != nil {
+		return action, false, err
+	}
+	return r.retireCheckout(context.WithoutCancel(ctx), pass, existing, CauseReconcileRemoval)
+}
+
+// retainIntended expires serving layers without revoking the user's tracking
+// intent or deleting its graph/config identity. The purge journal is idempotent
+// and is cleared by recovery, so a later outage can purge rebuilt layers again.
+func (r *Reconciler) retainIntended(ctx context.Context, pass *familyPass, existing store_sqlite.Checkout, req *store_sqlite.UpdateCheckoutObservationRequest) (CheckoutAction, bool, error) {
+	owned, err := r.ownedGraph(ctx, existing.FamilyID, existing.CheckoutID)
+	if err != nil {
+		return "", false, err
+	}
+	// A user-authorized cleanup already owns this identity. Observations must
+	// not turn its withdrawn checkout back into ordinary unavailable state.
+	ids := []string{sagaTarget{Kind: sagaForgetCheckout, CheckoutID: existing.CheckoutID, Incarnation: existing.Incarnation}.cleanupID()}
+	if owned != nil && owned.IsPrimaryBase {
+		ids = append([]string{sagaTarget{Kind: sagaRetirePrimaryClosure, GraphID: owned.GraphID}.cleanupID()}, ids...)
+	}
+	for _, id := range ids {
+		target, found, err := r.loadSagaTarget(ctx, id)
+		if err != nil {
+			return "", false, err
+		}
+		if !found {
+			continue
+		}
+		cause, err := r.inferCleanupCause(ctx, target)
+		if err != nil {
+			return "", false, err
+		}
+		if !ConfigRemovalAllowed(cause) {
+			continue
+		}
+		err = r.runSaga(context.WithoutCancel(ctx), target)
+		if err != nil && !r.cleanupDeferred(err) {
+			return "", true, err
+		}
+		return ActionGuardLost, true, nil
+	}
+	intended := owned != nil
+	if !intended {
+		intents, err := r.catalog.ListTrackingIntents(ctx, existing.CheckoutID)
+		if err != nil {
+			return "", false, err
+		}
+		for _, intent := range intents {
+			if intent.Active && string(intent.SourceKind) != "implicit" {
+				intended = true
+				break
+			}
+		}
+	}
+	if !intended {
+		return "", false, nil
+	}
+	cause := CauseReconcileAvailability
+	if existing.RemovalDetectedAt != 0 {
+		cause = CauseReconcileRemoval
+	}
+	action := ActionMarkedUnavailable
+	if owned != nil && owned.IsPrimaryBase {
+		action = ActionPrimaryRetirementRefused
+		if existing.State != store_sqlite.CheckoutStateUnavailable && r.logger != nil {
+			r.logger.Warn("primary_retirement_refused", zap.String("family", existing.FamilyID), zap.String("checkout", existing.CheckoutID), zap.String("root", existing.RootPath), zap.String("cause", cause))
+		}
+	}
+	if err := r.purgeLayersOnce(context.WithoutCancel(ctx), existing, cause); err != nil {
+		return "", true, err
+	}
+	req.State = store_sqlite.CheckoutStateUnavailable
+	return action, true, nil
 }
 
 // retireCheckout runs the guarded teardown shared by authoritative removal and
@@ -541,6 +666,7 @@ func (r *Reconciler) retireCheckout(
 	ctx context.Context,
 	pass *familyPass,
 	existing store_sqlite.Checkout,
+	cause string,
 ) (CheckoutAction, bool, error) {
 	owned, err := r.ownedGraph(ctx, existing.FamilyID, existing.CheckoutID)
 	if err != nil {
@@ -548,11 +674,11 @@ func (r *Reconciler) retireCheckout(
 	}
 	action := ActionForgotten
 	target := sagaTarget{Kind: sagaForgetCheckout, CheckoutID: existing.CheckoutID, Incarnation: existing.Incarnation}
-	retire := func() error { return r.ForgetCheckout(ctx, existing.CheckoutID, existing.Incarnation) }
+	retire := func() error { return r.forgetCheckout(ctx, existing.CheckoutID, existing.Incarnation, cause) }
 	if owned != nil && owned.IsPrimaryBase {
 		action = ActionPrimaryClosureRetired
 		target = sagaTarget{Kind: sagaRetirePrimaryClosure, GraphID: owned.GraphID}
-		retire = func() error { return r.RetirePrimaryClosure(ctx, owned.GraphID, pass.family.PrimaryEpoch) }
+		retire = func() error { return r.retirePrimaryClosure(ctx, owned.GraphID, pass.family.PrimaryEpoch, cause) }
 	}
 	prior, journaled, err := r.loadSagaTarget(ctx, target.cleanupID())
 	if err != nil {
@@ -566,6 +692,15 @@ func (r *Reconciler) retireCheckout(
 		return "", false, err
 	case journaled && prior.Deferred:
 		return ActionGuardLost, false, nil
+	}
+	if err == nil {
+		// A late tracking intent can turn an automatic attempt into a retained
+		// unavailable checkout. Never report its identity as retired in that case.
+		if _, stillPresent, readErr := r.catalog.GetCheckout(ctx, existing.CheckoutID); readErr != nil {
+			return "", false, readErr
+		} else if stillPresent {
+			return ActionGuardLost, false, nil
+		}
 	}
 	return action, true, nil
 }
@@ -677,6 +812,8 @@ func (r *Reconciler) observeNew(
 		return entry, err
 	}
 	row := fresh.CatalogRow(checkout.CheckoutID, pass.now.Unix(), 1)
+	row.CommonDirVolumeKind = pass.commonFresh.RootVolumeKind
+	row.CommonDirVolumeToken = pass.commonFresh.RootVolumeToken
 	if err := r.catalog.UpsertCheckoutPathEvidence(ctx, row); err != nil {
 		return entry, err
 	}
@@ -758,9 +895,8 @@ func evidenceClass(class Classification) string {
 // prunable-confirmed proof, so a removal that surprises someone can be argued
 // with from the log rather than guessed at.
 //
-// It is a Debug line and it is per checkout per pass. That is deliberate: the
-// pass runs on the janitor's schedule, not per request, and a classification
-// nobody can reconstruct is the failure mode this exists to prevent.
+// Non-present verdicts are Info lines so an intended checkout's availability
+// can be reconstructed from ordinary logs. Healthy confirmations remain Debug.
 func (r *Reconciler) recordClassification(
 	pass *familyPass,
 	existing store_sqlite.Checkout,
@@ -789,7 +925,16 @@ func (r *Reconciler) recordClassification(
 			zap.Bool("git_root_accessible", record.RootAccessible),
 			zap.Bool("git_prunable", record.Prunable))
 	}
-	r.logger.Debug("checkout reconcile: classified", fields...)
+	if class.Disposition != DispositionPresent {
+		r.logger.Info("checkout reconcile: classified", append(fields, zap.String("cause", func() string {
+			if class.Disposition == DispositionRemoved {
+				return CauseReconcileRemoval
+			}
+			return CauseReconcileAvailability
+		}()))...)
+	} else {
+		r.logger.Debug("checkout reconcile: classified", fields...)
+	}
 }
 
 // headFor reads HEAD out of a reachable working tree, falling back to what the

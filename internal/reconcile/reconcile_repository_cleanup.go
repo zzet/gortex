@@ -24,7 +24,7 @@ type repositoryCleanupAttempt struct {
 // A nonnil callback returned with an initialization error is still retained:
 // the durable failed phase must wake that exact state's repair path.
 type repositoryCleanupAttemptHooks interface {
-	BeginGraphCleanupAttempt(context.Context, string) (func(), error)
+	BeginGraphCleanupAttempt(context.Context, string, ...string) (func(), error)
 }
 
 func (r *Reconciler) repositoryCleanupAttempt(ctx context.Context, graphID string) (context.Context, func()) {
@@ -76,12 +76,16 @@ func (a *repositoryCleanupAttempt) add(graphID string) {
 // precedes closure, so any interrupted local fencing is owned by the journal.
 // Closing at the first phase also fences producers before dependent checkout
 // teardown, rather than waiting until the last graph-release phase.
-func (r *Reconciler) beginRepositoryCleanup(ctx context.Context, graphID string) error {
+func (r *Reconciler) beginRepositoryCleanup(ctx context.Context, graphID string, causes ...string) error {
+	cause := CauseReconcileRemoval
+	if len(causes) > 0 {
+		cause = causes[0]
+	}
 	if graphID == "" {
 		return nil
 	}
 	if hook, ok := r.hooks.(repositoryCleanupAttemptHooks); ok {
-		finish, err := hook.BeginGraphCleanupAttempt(ctx, graphID)
+		finish, err := hook.BeginGraphCleanupAttempt(ctx, graphID, cause)
 		if attempt, ok := ctx.Value(repositoryCleanupAttemptKey{}).(*repositoryCleanupAttempt); ok && attempt.owner == r && finish != nil {
 			attempt.mu.Lock()
 			if attempt.finishes == nil {

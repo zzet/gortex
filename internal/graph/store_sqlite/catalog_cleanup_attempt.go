@@ -222,3 +222,56 @@ func authorizeCleanupAttemptTx(ctx context.Context, tx *sql.Tx, existing, propos
 	}
 	return upgraded, nil
 }
+
+// A pending automatic journal is not an explicit authorization receipt. It
+// must finish safely before a user retry creates a new authorized attempt;
+// changing its cause/token in place could let an older actor overwrite it.
+func requireExplicitCleanupCauseTx(ctx context.Context, tx *sql.Tx, entry CleanupEntry, checkoutID string) error {
+	var envelope struct {
+		Cause string `json:"cause"`
+	}
+	if err := json.Unmarshal([]byte(entry.OpaqueTargetIDs), &envelope); err != nil {
+		return err
+	}
+	active, err := activeIntentCountTx(ctx, tx, checkoutID)
+	if err != nil {
+		return err
+	}
+	if active != 0 {
+		return fmt.Errorf("%w: pending cleanup %s has active tracking intent", ErrCatalogStaleGuard, entry.CleanupID)
+	}
+	if CleanupCauseAllowsConfigRemoval(envelope.Cause) {
+		return nil
+	}
+	if envelope.Cause == "" {
+		var revoked int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tracking_intents WHERE checkout_id=? AND active=0 AND revoked_at>0`, checkoutID).Scan(&revoked); err != nil {
+			return err
+		}
+		if revoked > 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: pending cleanup %s does not authorize configuration removal", ErrCatalogStaleGuard, entry.CleanupID)
+}
+
+func explicitCleanupEntry(entry CleanupEntry) (CleanupEntry, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(entry.OpaqueTargetIDs), &payload); err != nil {
+		return entry, err
+	}
+	if payload == nil {
+		return entry, fmt.Errorf("%w: cleanup target is not an object", ErrCatalogInvalidValue)
+	}
+	value, err := json.Marshal(CleanupCauseUntrack)
+	if err != nil {
+		return entry, err
+	}
+	payload["cause"] = value
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return entry, err
+	}
+	entry.OpaqueTargetIDs = string(encoded)
+	return entry, nil
+}
