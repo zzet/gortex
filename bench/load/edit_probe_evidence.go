@@ -389,6 +389,15 @@ func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt,
 	} else {
 		out.A = &a
 	}
+	// Shared execution has a distinct owner/domain proof. Even malformed or
+	// unknown versions cannot fall through to valid-looking per-file numbers.
+	// Preserve the independently validated A window without borrowing P/B.
+	for name := range status {
+		if strings.HasPrefix(name, "shared_owner_accounting_v") {
+			fail("shared-owner claim requires explicit bound owner validation: " + name)
+			return out
+		}
+	}
 	original, _ := status["phase_timing"].(map[string]any)
 	publication, _ := status["publication_phases"].(map[string]any)
 	ownerKnown := status["receipt"] == receipt && requested > 0 && applied >= requested
