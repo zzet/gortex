@@ -124,8 +124,13 @@ func TestProjectedReadKeepsSuspectInvalidationAfterBoundedReuse(t *testing.T) {
 	pendingFileProjections.markSuspect(path)
 	current, err := s.projectCurrentTrackedFile(t.Context(), t.Context(), path, "main.go", "main.go")
 	require.NoError(t, err)
-	require.Same(t, entry, current)
+	require.NotSame(t, entry, current, "revalidation installs a freshly checked immutable owner")
+	require.Same(t, entry.layer, current.layer, "identical bytes reuse the parsed payload")
 	require.True(t, entry.suspect.Load(), "a checked request cannot consume a watcher's invalidation for other readers/ACKs")
+	require.False(t, current.suspect.Load())
+	require.Zero(t, current.commitSeq, "read revalidation cannot borrow a physical sequence")
+	require.True(t, liveProjectionForAcknowledgement(current))
+	require.False(t, liveProjectionForAcknowledgement(entry))
 }
 
 func TestProjectedReadReplacementDoesNotBorrowPhysicalSequence(t *testing.T) {
