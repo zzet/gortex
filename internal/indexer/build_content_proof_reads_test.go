@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -637,12 +636,8 @@ func TestAFileReadAgainAfterItsParseWentStaleIsRecorded(t *testing.T) {
 		t.Fatal("no Go extractor registered")
 	}
 	saver := &savingExtractor{Extractor: goExtractor, trigger: "a.go", path: filepath.Join(repoDir, "pkg", "a.go"), line: "\nfunc Later() {}\n"}
-	// The first extraction saves B. The bounded fresh extraction then saves
-	// C, exhausting that preparation so a stable legacy read reaches the
-	// late content-proof fence rather than the staged receipt's early refusal.
-	var extractions atomic.Int32
-	saver.early = "a.go"
-	saver.earlyEvery = func() bool { return extractions.Add(1) == 2 }
+	// The save makes the speculative parse stale; the stable legacy read
+	// must reach the late proof fence after the existing undo barrier.
 	saver.armed.Store(true)
 	registry.Register(saver)
 	refuted := readSetConfirmations.refuted.Load()
@@ -667,9 +662,6 @@ func TestAFileReadAgainAfterItsParseWentStaleIsRecorded(t *testing.T) {
 	})
 	if _, saveErr := saver.saved(); saver.armed.Load() || saveErr != nil {
 		t.Fatalf("the save never landed (err %v)", saveErr)
-	}
-	if saver.earlySaves.Load() != 1 {
-		t.Fatal("the second real save did not exhaust the fresh preparation")
 	}
 	parses, fallbacks := 0, 0
 	for _, entry := range logs.FilterMessage("indexer: reconcile phase complete").All() {
