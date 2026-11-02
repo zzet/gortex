@@ -8,6 +8,7 @@ on:
         type: choice
         default: benchmarks
         options:
+          - release-size-proof
           - benchmarks
           - performance
           - acceptance-helpers
@@ -220,3 +221,123 @@ jobs:
           name: acceptance-native-windows-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gortex-windows-readiness-artifacts
           retention-days: 90
+
+
+  release-size-build:
+    if: inputs.suite == 'release-size-proof'
+    name: Release size (${{ matrix.label }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: candidate
+            source: bed4c788445710f79f1c6d8218e41b5d5fa8637c
+            tree: 719e2a13213522c02c5fd33b7455017fd183c7b2
+          - label: control
+            source: a6573abafc416ab008120e3820b4eda182e347bf
+            tree: d0f619d85e3c6286ae8784b90b958bfe6b8597c5
+    env:
+      SOURCE_SHA: ${{ matrix.source }}
+      # Common fixed, equal-length metadata for attribution. This is a
+      # prospective release-shape build, never an official release artifact.
+      SOURCE_VERSION: 0.64.12
+      SOURCE_DATE: '2026-11-01T00:00:00Z'
+    steps:
+      - name: Check out dispatch tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+          persist-credentials: false
+      - name: Check out exact measurement source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.source }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source identity
+        env:
+          EXPECTED_TREE: ${{ matrix.tree }}
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C source rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test -z "$(git -C source status --porcelain)"
+          git -C source merge-base --is-ancestor a6573abafc416ab008120e3820b4eda182e347bf "$SOURCE_SHA"
+      - name: Build both Linux architectures in exact release image
+        env:
+          LABEL: ${{ matrix.label }}
+        run: |
+          set -euo pipefail
+          bash control/scripts/size-proof-driver.sh source "$RUNNER_TEMP/proof/$LABEL" control
+      - name: Retain binaries, logs and provenance
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-size-${{ matrix.label }}
+          path: ${{ runner.temp }}/proof/${{ matrix.label }}
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 90
+
+  release-size-compare:
+    if: always() && inputs.suite == 'release-size-proof'
+    needs: release-size-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch candidate measurement artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-size-candidate
+          path: ${{ runner.temp }}/proof/candidate
+      - name: Fetch matched parent measurement artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-size-control
+          path: ${{ runner.temp }}/proof/control
+      - name: Fetch fixed published baseline archives and checksums
+        if: needs.release-size-build.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/proof/baseline"
+          gh api repos/zzet/gortex/releases/tags/v0.64.10 > "$RUNNER_TEMP/proof/baseline/release.json"
+          gh release download v0.64.10 --repo zzet/gortex             --pattern checksums.txt --pattern gortex_linux_amd64.tar.gz             --pattern gortex_linux_arm64.tar.gz --dir "$RUNNER_TEMP/proof/baseline"
+      - name: Evaluate original two percent size gate
+        if: needs.release-size-build.result == 'success'
+        run: |
+          set -euo pipefail
+          printf 'workflow_source=%s\nrun_id=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/proof/compare-provenance.txt"
+          sha256sum scripts/size-proof-compare.py .github/workflows/bench-arm.yml >> "$RUNNER_TEMP/proof/compare-provenance.txt"
+          python3 scripts/size-proof-compare.py "$RUNNER_TEMP/proof"
+      - name: Publish measurement summary
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/proof/size-report.md"; then
+            cat "$RUNNER_TEMP/proof/size-report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Size proof incomplete: inspect retained build/fetch evidence. No acceptance credit.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Retain full comparison and published baseline evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-size-comparison
+          path: |
+            ${{ runner.temp }}/proof/size-report.json
+            ${{ runner.temp }}/proof/size-report.md
+            ${{ runner.temp }}/proof/compare-provenance.txt
+            ${{ runner.temp }}/proof/baseline
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 90
+      - name: Require both source builds
+        if: needs.release-size-build.result != 'success'
+        run: exit 1
