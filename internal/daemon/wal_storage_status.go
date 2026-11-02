@@ -10,14 +10,19 @@ import (
 // Both status and live index health use this conversion.
 func WALReclaimStatusFrom(st store_sqlite.WALReclaimStats) *WALReclaimStatus {
 	out := &WALReclaimStatus{
-		WriterHold:            walHistogramStatus(st.WriterHold),
-		WriterWait:            walHistogramStatus(st.WriterWait),
-		PauseDrain:            walHistogramStatus(st.PauseDrain),
-		PauseTruncate:         walHistogramStatus(st.PauseTruncate),
-		CancelledWriterParked: st.CancelledWriterParked,
-		CancelledWriteIntent:  st.CancelledWriteIntent,
-		CancelledOther:        st.CancelledOther,
-		WALPeakObserved:       st.WALPeakObserved,
+		EditBurstGateClosures:   st.EditBurstGateClosures,
+		DeferredEditBurst:       st.DeferredEditBurst,
+		DeferredInteractiveRead: st.DeferredInteractiveRead,
+		BulkExceptionHolds:      st.BulkExceptionHolds,
+		HardCapExceptionHolds:   st.HardCapExceptionHolds,
+		WriterHold:              walHistogramStatus(st.WriterHold),
+		WriterWait:              walHistogramStatus(st.WriterWait),
+		PauseDrain:              walHistogramStatus(st.PauseDrain),
+		PauseTruncate:           walHistogramStatus(st.PauseTruncate),
+		CancelledWriterParked:   st.CancelledWriterParked,
+		CancelledWriteIntent:    st.CancelledWriteIntent,
+		CancelledOther:          st.CancelledOther,
+		WALPeakObserved:         st.WALPeakObserved,
 
 		ThresholdBytes:   st.ThresholdBytes,
 		Attempts:         st.Attempts,
@@ -55,6 +60,10 @@ func WALReclaimStatusFrom(st store_sqlite.WALReclaimStats) *WALReclaimStatus {
 		ShrinkSlices:                st.ShrinkSlices,
 		ShrinkBytes:                 st.ShrinkBytes,
 		ShrinkSliceHoldMaxMS:        walDurationMS(st.ShrinkSliceHoldMax),
+	}
+	if st.EditBurstWriterHold.Count() > 0 {
+		burst := walHistogramStatus(st.EditBurstWriterHold)
+		out.EditBurstWriterHold = &burst
 	}
 	if st.WALPeakObserved {
 		peak := st.ObservedPeakWALBytes
