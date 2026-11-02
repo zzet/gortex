@@ -52,7 +52,7 @@ func TestReadFileCompressionSelectedGen0MutationCannotHideBehindLayerProof(t *te
 			require.NoError(t, base.SetFileMetas("repo", []graph.FileMetaRow{{FilePath: "repo/unowned.go", ContentHash: hex.EncodeToString(hash[:]), Size: len(content), NodeCount: 1}}))
 			ctx, view := routedEnrichmentView(t, stack)
 			for _, source := range view.materialized.GenerationSources() {
-				require.NotZero(t, source.GenerationID, "the actual leased source list omits shared gen0")
+				require.NotZero(t, source.Generation, "the actual leased source list omits shared gen0")
 			}
 			wrapped := &compressionSelectedBase{Reader: view.reader, unknown: mode == "unknown_base"}
 			view.reader = wrapped
@@ -64,7 +64,9 @@ func TestReadFileCompressionSelectedGen0MutationCannotHideBehindLayerProof(t *te
 					changed := *node
 					changed.StartLine += 100
 					base.AddNode(&changed)
+					require.Equal(t, changed.StartLine, base.GetNode(node.ID).StartLine)
 					base.AddNode(node)
+					require.Equal(t, node.StartLine, base.GetNode(node.ID).StartLine)
 					require.Greater(t, base.MutationRevision(), before)
 				}
 			}
