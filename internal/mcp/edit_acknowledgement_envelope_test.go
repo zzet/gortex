@@ -123,14 +123,14 @@ func TestAcknowledgementEnvelopeActualPreLeafRefusal(t *testing.T) {
 	s.ToolCallTimeout = -1
 	var a *editAcknowledgement
 	wrapped := s.wrapToolHandler(func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		t.Error("invalid freshness input must refuse before the leaf")
+		t.Error("invalid view input must refuse before the leaf")
 		return mcp.NewToolResultText("unexpected"), nil
 	})
 	capture := s.boundToolHandler(func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		a = editAcknowledgementFrom(ctx, s)
 		return wrapped(ctx, req)
 	})
-	result, err := capture(t.Context(), writeFileRequest(map[string]any{"wait_deadline": "invalid-duration"}))
+	result, err := capture(t.Context(), writeFileRequest(map[string]any{"view": map[string]any{"kind": "invalid-view"}}))
 	require.NoError(t, err)
 	require.True(t, result.IsError)
 	snapshot := a.snapshot()
@@ -222,4 +222,21 @@ func TestAcknowledgementEnvelopeUnobservedReadsHaveNoIdentityOrAllocation(t *tes
 	})
 	require.Zero(t, allocations, "nil observer must not allocate an envelope/token/closure")
 	require.Equal(t, before, editAcknowledgementSequence.Load())
+}
+
+// ACK policy captures freshness before the measured handler. Invalid policy
+// input must stop there, while a later middleware refusal is measured above.
+func TestAcknowledgementFreshnessPolicyRefusesBeforeMeasuredHandler(t *testing.T) {
+	s := fastPathTestServer(t)
+	s.ToolCallTimeout = -1
+	entered := false
+	handler := s.boundToolHandler(func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		entered = true
+		return mcp.NewToolResultText("unexpected"), nil
+	})
+	result, err := handler(t.Context(), writeFileRequest(map[string]any{"wait_deadline": "invalid-duration"}))
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	require.False(t, entered, "malformed policy must not invoke any mutation handler")
+	require.Contains(t, result.Content[0].(mcp.TextContent).Text, "wait_deadline")
 }

@@ -329,5 +329,43 @@ func (s *Server) refreshIndexHealthFileFailures(ctx context.Context, baseline ma
 		result["index_state_read_error"] = readErr.Error()
 		result["recommendation"] = strings.TrimSpace("Index failure state could not be read; index completeness is unknown. " + readErr.Error() + ". " + recommendation)
 	}
+	if section := pendingProjectionHealth(pendingFileProjections); section != nil {
+		result["pending_projection"] = section
+	}
 	return result
+}
+
+// pendingProjectionHealth reports the pending projections: live entries and
+// their estimated size, what publishing refused and why, and how many
+// retired entries disagreed with the store. It is nil until the registry has
+// done anything, and it reads only in-memory state.
+func pendingProjectionHealth(p *pendingProjections) map[string]any {
+	snap := p.snap.Load()
+	p.mu.Lock()
+	refused := make(map[string]int64, len(p.refused))
+	for reason, n := range p.refused {
+		refused[string(reason)] = n
+	}
+	p.mu.Unlock()
+	published := p.published.Load()
+	if len(snap.entries) == 0 && published == 0 && len(refused) == 0 {
+		return nil
+	}
+	tombstones := 0
+	for _, e := range snap.entries {
+		if e.tombstone {
+			tombstones++
+		}
+	}
+	return map[string]any{
+		"enabled":               p.enabled,
+		"files":                 len(snap.entries) - tombstones,
+		"tombstones":            tombstones,
+		"bytes":                 snap.bytes,
+		"published":             published,
+		"refused":               refused,
+		"retired":               p.retired.Load(),
+		"external_writes":       p.externalWrites.Load(),
+		"projection_divergence": p.divergence.Load(),
+	}
 }
