@@ -302,9 +302,11 @@ func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
 	defer close(release)
 	stuckRoot := pathkey.CanonicalExistingRoot(stuck)
 	var entered atomic.Int32
+	inventoryEntered := make(chan struct{}, 40)
 	lc.observationInventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
 		if pathkey.HasPathPrefix(path, stuckRoot) {
 			entered.Add(1)
+			inventoryEntered <- struct{}{}
 			<-release // Git or a mount that ignores cancellation.
 			return nil, context.Canceled
 		}
@@ -336,8 +338,20 @@ func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
 		}
 	}
 	var wg sync.WaitGroup
+	// Establish actual saturation before the surplus burst. On a loaded host,
+	// forty expired public-call budgets do not prove that eight jobs entered.
+	// Keep the production deadlines and all capacity/isolation oracles intact.
+	seedDeadline := time.NewTimer(30 * time.Second)
+	defer seedDeadline.Stop()
 	for i := range requests {
 		wg.Go(func() { _, _, errs[i] = lc.ObserveCheckoutPath(t.Context(), requests[i]) })
+		if i < checkoutObservationFamilyCapacity {
+			select {
+			case <-inventoryEntered:
+			case <-seedDeadline.C:
+				t.Fatal("public discoveries did not establish the family saturation precondition")
+			}
+		}
 	}
 	wg.Wait()
 	for i, err := range errs {
