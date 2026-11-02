@@ -29,6 +29,8 @@ func TestGoBodyCapturePlan_OrderedIndependentBodyParity(t *testing.T) {
 		{"late_closure_locals", "_=func(){ _=later; later:=payload; _=later; var shared int; _=shared; _=other.Field; _=pkg.Value }; return payload"},
 		{"closure_ranges", "_=func(){ for k,v:=range items {_=k;_=v;_=payload}; switch value:=any(other).(type){case int:_=value;default:_=payload} }; return payload"},
 		{"closure_params_results", "_=func(first,second int, rest ...int)(named int){ _=first;_=second;_=rest;_=named;_=payload; return }; return payload"},
+		{"closure_legacy_for_initializer", "_=func(){ for iter:=payload; iter<other.Limit; iter++ {_=iter}; _=payload; _=other }; return payload"},
+		{"closure_legacy_typeswitch_nested", "_=func(){ _=leaked; switch selected:=any(other).(type){case int:_=func(){pair:=leaked;_=pair};default:_=payload}; _=leaked }; return payload"},
 		{"closure_unicode", "_=func(){ 値:=payload; _=値; _=other; _=func(){_=値;_=hidden} }; return payload"},
 		{"closure_late_shadow", "_=func(){ _=payload; if true {payload:=other;_=payload}; _=payload }; return payload"},
 		{"method_body", "value:=outer(mid(payload)); ch <- value; _=func(){_=other}; return value"},
@@ -90,6 +92,13 @@ func TestGoBodyCapturePlan_OrderedIndependentBodyParity(t *testing.T) {
 					params := goParamNamesFromCapture(&parser.CapturedNode{Node: def.ChildByFieldName("parameters")}, src)
 					emitGoDataflow(owner.ID, owner.StartLine, body, params, map[string]string{"pkg": "some/pkg"}, src, "body_plan.go", oracle)
 				})
+				if tc.name == "closure_legacy_typeswitch_nested" {
+					for _, edge := range oracle.Edges {
+						if edge.Kind == graph.EdgeCaptures {
+							require.NotEqual(t, "leaked", edge.Meta["name"], "legacy nested type-switch exprlists suppress outer capture")
+						}
+					}
+				}
 				require.Equal(t, metricOracle.Meta, owner.Meta, "all body metrics and surrounding metadata retain old independent walkers")
 				var actualNodes []*graph.Node
 				for _, n := range actual.Nodes {
