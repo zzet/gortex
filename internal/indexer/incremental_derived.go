@@ -213,8 +213,7 @@ func (mi *MultiIndexer) RunIncrementalDerivedPasses(
 }
 
 // runIncrementalDerivedPassesTopologyHeld is the non-reentrant implementation
-// for mutation pipelines that already own the topology-writer gates of every
-// repository the mutation can affect.
+// for mutation pipelines that already own the global topology writer.
 func (mi *MultiIndexer) runIncrementalDerivedPassesTopologyHeld(
 	ctx context.Context,
 	plans map[string]DerivedInvalidationPlan,

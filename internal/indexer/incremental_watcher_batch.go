@@ -336,7 +336,7 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 				idx.incrementalResolveFilesHook(frontier)
 				return
 			}
-			idx.resolver.ResolveFilesAndIncomingObserved(frontier, eviction.batch.publicationStamps().mutationResolveMutexObserver())
+			idx.resolver.ResolveFilesAndIncoming(frontier)
 		})
 	} else if needed && !exact {
 		idx.observeIncrementalCatchup("resolve", nil)
@@ -395,7 +395,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 				idx.incrementalResolveFilesHook(frontier)
 				return
 			}
-			idx.resolver.ResolveFilesAndIncomingObserved(frontier, batch.publicationStamps().mutationResolveMutexObserver())
+			idx.resolver.ResolveFilesAndIncoming(frontier)
 		})
 		names := mode.publication.beginPatchLap(patchResolve)
 		idx.resolveReceiptNamePendings(receipt)
@@ -558,15 +558,13 @@ func (gw *GitWatcher) reindexChangedPaths(paths []string) (*IndexResult, error) 
 // when the store cannot certify its eviction shape, the indexer's conservative
 // successful-file frontier. A whole-graph fallback is reserved for the
 // exceptional case where neither source yields any safe scope.
-// It returns the files where passes may have rebound edges, or nil when a
-// name-based or whole-graph pass may have changed edges outside that frontier.
 func (mi *MultiIndexer) resolveIncrementalRepoMutation(
 	repoPrefix string,
 	result *IndexResult,
 	receipt *graph.MutationReceipt,
 	batch *reparsePendingEnrichmentBatch,
-) []string {
-	return mi.resolveIncrementalRepoMutationMode(repoPrefix, result, receipt, batch, false)
+) {
+	mi.resolveIncrementalRepoMutationMode(repoPrefix, result, receipt, batch, false)
 }
 
 func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
@@ -575,9 +573,8 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 	receipt *graph.MutationReceipt,
 	batch *reparsePendingEnrichmentBatch,
 	exactPointSemantic bool,
-) []string {
+) {
 	files, needed, _ := incrementalResolutionFrontier(result, receipt)
-	wide := false
 	if result == nil || result.DeletedFileCount > 0 {
 		batch.dropDeferredPriorBindings()
 	}
@@ -595,29 +592,24 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 				idx.incrementalResolveFilesHook(frontier)
 				return
 			}
-			mi.runMasterResolveFilesObserved(frontier, false, idx.resolver, batch.publicationStamps().mutationResolveMutexObserver())
+			mi.runMasterResolveFilesWithEvidence(frontier, false, idx.resolver)
 		})
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, resolvedFiles...)
 		if receipt != nil && receipt.Complete {
 			names := batch.publicationStamps().beginPatchLap(patchResolve)
-			vanished := vanishedReceiptNames(mi.graph, receipt)
-			wide = len(vanished) > 0
-			mi.runMasterResolveNames(vanished)
+			mi.runMasterResolveNames(vanishedReceiptNames(mi.graph, receipt))
 			names.end()
 		}
 	} else if needed && len(files) > 0 {
 		resolve := batch.publicationStamps().beginPatchLap(patchResolve)
-		mi.runMasterResolveFilesObserved(files, false, nil, batch.publicationStamps().mutationResolveMutexObserver())
+		mi.runMasterResolveFiles(files, false)
 		resolve.end()
 		if receipt != nil && receipt.Complete {
 			names := batch.publicationStamps().beginPatchLap(patchResolve)
-			vanished := vanishedReceiptNames(mi.graph, receipt)
-			wide = len(vanished) > 0
-			mi.runMasterResolveNames(vanished)
+			mi.runMasterResolveNames(vanishedReceiptNames(mi.graph, receipt))
 			names.end()
 		}
 	} else if needed {
-		wide = true
 		scope := map[string]struct{}{repoPrefix: {}}
 		if repoPrefix == "" {
 			scope = nil
@@ -652,15 +644,10 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		}
 		cross := batch.publicationStamps().beginPatchLap(patchResolve)
 		if len(crossRepoFiles) > 0 {
-			mi.runCrossRepoResolveMutationFrontiersObserved(crossRepoFiles, crossRepoFiles, crossRepoFiles, batch.publicationStamps().mutationResolveMutexObserver())
+			mi.runCrossRepoResolveFiles(crossRepoFiles)
 		} else {
-			wide = true
 			mi.runCrossRepoResolve(false)
 		}
 		cross.end()
 	}
-	if wide {
-		return nil
-	}
-	return crossRepoFiles
 }
