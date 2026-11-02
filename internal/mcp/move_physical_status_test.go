@@ -37,6 +37,8 @@ func TestMovePhysicalStatusMatchesExistingGuardedRecord(t *testing.T) {
 	require.NotContains(t, status, "graph_status_terminal", "the timing row does not become physical authority")
 	child := status["physical_commit"].(map[string]any)
 	require.Equal(t, physical.id, child["receipt"])
+	require.NotContains(t, status, "publication_phases", "physical publication is nested, never promoted to timing-row authority")
+	require.Equal(t, status["acknowledgement"].(acknowledgementPayload).RPCID, child["acknowledgement"].(acknowledgementPayload).RPCID, "the child shares the actual RPC ACK; it is not another additive interval")
 	child["graph_status"] = "fabricated-client-value"
 	again, _ := s.moveFileObservationPayload(ctx, timing.id)
 	require.NotEqual(t, "fabricated-client-value", again["physical_commit"].(map[string]any)["graph_status"])
