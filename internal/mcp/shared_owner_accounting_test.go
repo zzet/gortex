@@ -161,10 +161,20 @@ func TestSharedOwnerAccountingBindsBothActualPhysicalReceipts(t *testing.T) {
 	// A retained original publication is insufficient if its peer ledger entry
 	// points at another actual publication. All member projections fail closed.
 	peer := records[1]
-	peer.mu.Lock()
+	peer.mu.RLock()
 	originalPublication := peer.publication
-	peer.publication = records[0].publication
+	peer.mu.RUnlock()
+	foreignRecorder := indexer.NewPublicationPhaseRecorder(8, 2)
+	foreignPublication := foreignRecorder.Begin(peer.checkoutID, peer.id, indexer.PublicationSourceMCPEdit, time.Now())
+	peer.mu.Lock()
+	peer.publication = foreignPublication
 	peer.mu.Unlock()
+	// Copy the exact physical metadata through the existing owner binder.
+	// Scalars, current key and ticket cannot substitute for the weak object.
+	s.bindSharedPhysicalOwner(peer, foreignPublication)
+	foreignPublication.BindTicket(peer.snapshot().AppliedGeneration)
+	require.True(t, foreignRecorder.Rekey(peer.id, originalPublication.Key()))
+	foreignPublication.Mark(indexer.PublicationTicketCompleted)
 	for _, record := range records {
 		require.Nil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"])
 	}
