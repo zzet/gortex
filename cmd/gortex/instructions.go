@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/antigravity"
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/agents/copilotcli"
@@ -53,6 +54,7 @@ var hostSkillSyncs = []struct {
 	{"opencode", opencode.SyncSkills},
 	{"copilot cli", copilotcli.SyncSkills},
 	{"hermes", hermes.SyncSkills},
+	{"antigravity", antigravity.SyncSkills},
 }
 
 // instructions.go is the `gortex instructions` command tree — the CLI
@@ -186,16 +188,17 @@ func runInstructionsSwitch(cmd *cobra.Command, args []string) error {
 			cmd.Printf("Note: no Gortex rule block found in ~/.claude/CLAUDE.md — run `gortex install` to wire the @-include pointer.\n")
 		}
 
-		// Codex has no @-include: its rule block is a copy of the active
-		// profile body, so the switch has to rewrite it. Refresh only
-		// when a block is already installed — creation stays with
-		// `gortex install`, which is what decides Codex is set up at all.
-		if path := codex.GlobalInstructionsPath(home); fileContains(path, agents.GlobalRulesStartMarker) {
-			if _, err := agents.UpsertMarkedBlock(nil, path, agents.GlobalInlineBody(dir),
-				agents.GlobalRulesStartMarker, agents.GlobalRulesEndMarker, agents.ApplyOpts{}); err != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not refresh %s: %v\n", path, err)
-			} else {
-				cmd.Printf("Refreshed the Gortex rule block in %s.\n", path)
+		// Codex and Antigravity inline the active profile body into
+		// their user-level rule files, so the switch has to rewrite
+		// them when a block is already installed.
+		for _, path := range []string{codex.GlobalInstructionsPath(home), antigravity.GlobalInstructionsPath(home)} {
+			if fileContains(path, agents.GlobalRulesStartMarker) {
+				if _, err := agents.UpsertMarkedBlock(nil, path, agents.GlobalInlineBody(dir),
+					agents.GlobalRulesStartMarker, agents.GlobalRulesEndMarker, agents.ApplyOpts{}); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not refresh %s: %v\n", path, err)
+				} else {
+					cmd.Printf("Refreshed the Gortex rule block in %s.\n", path)
+				}
 			}
 		}
 	}
