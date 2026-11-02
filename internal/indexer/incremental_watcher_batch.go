@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -492,10 +493,17 @@ func (w *Watcher) reindexExplicitMutationPaths(paths []string, admitted ...map[s
 }
 
 func (w *Watcher) reindexMutationPaths(paths []string, force bool, frontier map[string]uint64) (*IndexResult, DerivedFanoutCompleteness, error) {
+	return w.reindexMutationPathsObserved(paths, force, frontier, nil)
+}
+
+func (w *Watcher) reindexMutationPathsObserved(paths []string, force bool, frontier map[string]uint64, stamps *PublicationStamps) (*IndexResult, DerivedFanoutCompleteness, error) {
 	var result *IndexResult
 	var fanout DerivedFanoutCompleteness
 	ctx, cancel := w.mutationLaneContext()
 	defer cancel()
+	if stamps != nil {
+		ctx = context.WithValue(ctx, publicationStampsKey{}, stamps)
+	}
 	err := w.indexer.coordinateRepositoryMutation(ctx, OutputEntryWatcherPatchGraph, func() error {
 		idx := w.currentMutationIndexer()
 		if idx == nil {
@@ -506,14 +514,16 @@ func (w *Watcher) reindexMutationPaths(paths []string, force bool, frontier map[
 		if !force && idx.deferGlobalPasses.Load() {
 			w.markDeferredMutationTiers(frontier)
 		}
-		mode := incrementalPathMode{detectDeletions: true, forceExplicitFiles: force,
+		mode := incrementalPathMode{detectDeletions: true, forceExplicitFiles: force, publication: stamps,
 			onRelations: func() { w.markRelationsFrontier(frontier) }}
 		var err error
+		stamps.switchAttemptControlAt(patchExecutorControl, markPointPublication(ctx, PublicationPatchExecutionStarted))
 		if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
 			result, err = owner.incrementalReindexRepoRawMode(idx.repoPrefix, paths, mode)
 		} else {
 			result, err = idx.incrementalWatcherPaths(idx.rootPath, paths, mode)
 		}
+		stamps.switchAttemptControlAt(patchAttemptFinalize, markPointPublication(ctx, PublicationPatchExecutionFinished))
 		measured := observation.close()
 		if err == nil {
 			fanout = measured

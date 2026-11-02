@@ -1167,6 +1167,7 @@ func (mw *MultiWatcher) enqueueFileMutation(ctx context.Context, filePath string
 // EnqueueFileMutations keeps a single owner's complete frontier together.
 // Mixed owners retain the existing point admission path in the caller.
 func (mw *MultiWatcher) EnqueueFileMutations(ctx context.Context, paths []string) (map[string]*MutationTicket, error) {
+	ctx, _ = canonicalSchedulingEntry(ctx)
 	if len(paths) == 1 {
 		ticket, err := mw.EnqueueToolMutation(ctx, paths[0])
 		if ticket == nil {

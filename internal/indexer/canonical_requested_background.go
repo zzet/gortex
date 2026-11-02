@@ -16,7 +16,7 @@ func canonicalSchedulingEntry(ctx context.Context) (context.Context, time.Time) 
 	if entered, ok := ctx.Value(canonicalSchedulingKey{}).(time.Time); ok {
 		return ctx, entered
 	}
-	if PublicationRecordFromContext(ctx) == nil {
+	if !hasFilePublicationRecords(ctx) {
 		return ctx, time.Time{}
 	}
 	entered := time.Now()

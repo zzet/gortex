@@ -192,6 +192,7 @@ type PublicationPhaseRecord struct {
 	coalescedLinked       bool
 	background            *canonicalBackgroundEvidence
 	backgroundUnavailable *RequestedBackgroundUnavailable
+	sharedSetExecution    *sharedMutationSetExecution // immutable actual shared executor; never independent P/B
 }
 
 type publicationMark struct {
@@ -463,20 +464,21 @@ type PublicationPhaseOffset struct {
 // PublicationPhaseSnapshot is a record rendered for a receipt or a status
 // answer. Phases are ordered by offset.
 type PublicationPhaseSnapshot struct {
-	Key               string                   `json:"key"`
-	CheckoutID        string                   `json:"checkout_id"`
-	Source            string                   `json:"source"`
-	Ticket            uint64                   `json:"ticket,omitempty"`
-	DirtyGenerationID int64                    `json:"dirty_generation_id,omitempty"`
-	OriginWall        string                   `json:"origin_wall"`
-	Clock             string                   `json:"clock"`
-	Terminal          bool                     `json:"terminal"`
-	Phases            []PublicationPhaseOffset `json:"phases"`
-	patchLaps         *canonicalPatchEvidence  // private; legacy timeline wire stays unchanged
-	laneWait          *canonicalLaneWaitEvidence
-	debounce          *canonicalDebounceEvidence
-	attemptWindow     *canonicalAttemptWindow
-	admissions        *canonicalAdmissionEvidence
+	Key                string                   `json:"key"`
+	CheckoutID         string                   `json:"checkout_id"`
+	Source             string                   `json:"source"`
+	Ticket             uint64                   `json:"ticket,omitempty"`
+	DirtyGenerationID  int64                    `json:"dirty_generation_id,omitempty"`
+	OriginWall         string                   `json:"origin_wall"`
+	Clock              string                   `json:"clock"`
+	Terminal           bool                     `json:"terminal"`
+	Phases             []PublicationPhaseOffset `json:"phases"`
+	patchLaps          *canonicalPatchEvidence  // private; legacy timeline wire stays unchanged
+	laneWait           *canonicalLaneWaitEvidence
+	debounce           *canonicalDebounceEvidence
+	attemptWindow      *canonicalAttemptWindow
+	admissions         *canonicalAdmissionEvidence
+	sharedSetExecution *sharedMutationSetExecution
 }
 
 // Snapshot renders the record.
@@ -488,16 +490,17 @@ func (p *PublicationPhaseRecord) Snapshot() PublicationPhaseSnapshot {
 	defer p.mu.Unlock()
 	out := PublicationPhaseSnapshot{
 		Key: p.key, CheckoutID: p.checkoutID, Source: p.source, Ticket: p.ticket,
-		DirtyGenerationID: p.generation,
-		OriginWall:        p.origin.UTC().Format(time.RFC3339Nano),
-		Clock:             "monotonic",
-		Terminal:          p.terminal,
-		Phases:            make([]PublicationPhaseOffset, 0, len(p.marks)),
-		patchLaps:         p.patchLaps,
-		laneWait:          p.laneWait,
-		debounce:          p.debounce,
-		attemptWindow:     p.attemptWindow,
-		admissions:        p.admissions,
+		DirtyGenerationID:  p.generation,
+		OriginWall:         p.origin.UTC().Format(time.RFC3339Nano),
+		Clock:              "monotonic",
+		Terminal:           p.terminal,
+		Phases:             make([]PublicationPhaseOffset, 0, len(p.marks)),
+		patchLaps:          p.patchLaps,
+		laneWait:           p.laneWait,
+		debounce:           p.debounce,
+		attemptWindow:      p.attemptWindow,
+		admissions:         p.admissions,
+		sharedSetExecution: p.sharedSetExecution,
 	}
 	for _, mark := range p.marks {
 		offset := mark.at.Sub(p.origin)
