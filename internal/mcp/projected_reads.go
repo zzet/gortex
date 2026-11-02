@@ -252,7 +252,7 @@ func validateRequestProjections(ctx context.Context) error {
 
 func withProjectedReadToolFacts(ctx context.Context, name string) context.Context {
 	switch name {
-	case "get_symbol", "get_symbol_source", "get_file_summary", "get_editing_context", "get_cfg":
+	case "get_symbol", "get_symbol_source", "get_file_summary", "get_editing_context", "get_cfg", "search_symbols":
 		return withRequestProjectionFacts(ctx)
 	default:
 		return ctx
