@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
   # Run on the merged commit to verify the extended parser regression gate (#991).
   workflow_dispatch:
