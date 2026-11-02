@@ -52,8 +52,45 @@ func (a *projectedSourceAllowance) claim() bool {
 	}
 }
 
-// Only this audited source read retries, once, for a typed byte mismatch. Each
-// attempt runs the whole middleware with fresh facts/layers and releases its
+// Permission to revalidate from scratch, not freshness authority for an old
+// response. Peer owners, invalidation and unchecked eviction remain refusals.
+func retrySourceAfterCheckedRetirement(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if _, ok := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); !ok {
+		return false
+	}
+	deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time)
+	if !ok || !time.Now().Before(deadline) {
+		return false
+	}
+	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	if !ok {
+		return false
+	}
+	facts.mu.RLock()
+	defer facts.mu.RUnlock()
+	retired := false
+	for _, entry := range facts.entries {
+		if entry == nil {
+			return false
+		}
+		current := pendingFileProjections.snap.Load().entries[entry.key]
+		if current == entry && liveProjectionForAcknowledgement(entry) {
+			continue
+		}
+		if current != nil || !entry.checkedRetired.Load() || entry.suspect.Load() {
+			return false
+		}
+		retired = true
+	}
+	return retired
+}
+
+// Only this audited source read retries, once, for a typed byte mismatch or
+// checked retirement. Each attempt runs the whole middleware with fresh
+// facts/layers and releases its
 // leases before the next; the first attempt's projection deadline is retained.
 func (s *Server) retryProjectedSymbolSource(attempt mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
