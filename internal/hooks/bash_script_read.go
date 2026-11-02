@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -625,4 +626,105 @@ func scriptReadAnswer(scripts []analyzedScript, second bool, dirs commandDirs, c
 	}
 
 	return enrichResult{}, false
+}
+
+// walkProbeLimit bounds the directory probes the walk pass makes per
+// command, nested commands included.
+const walkProbeLimit = 2
+
+// walkCandidate is an inline Python script the walk pass looks at, with
+// where it runs.
+type walkCandidate struct {
+	script inlineScript
+	dirs   commandDirs
+	cwd    string
+}
+
+// walkCandidates lists the scripts of a command and of the commands it
+// runs as text, within the nested-command bounds.
+func walkCandidates(scripts []inlineScript, dirs commandDirs, cwd string, nested []nestedCommand) []walkCandidate {
+	var out []walkCandidate
+	for _, s := range scripts {
+		out = append(out, walkCandidate{s, dirs, cwd})
+	}
+	for i, n := range nested {
+		if i >= maxNestedCommands || len(n.cmd) > maxNestedCommand {
+			continue
+		}
+		inner, _ := inlineScriptsAt(n.cmd, true)
+		innerDirs := newCommandDirs(n.cmd)
+		for _, s := range inner {
+			out = append(out, walkCandidate{s, innerDirs, n.cwd})
+		}
+	}
+	return out
+}
+
+// enrichBashWalks answers the scripts that walk an indexed tree and read
+// the files it yields, the shape of Grep with a `path:` scope, with Grep's
+// deny. It runs after every other answer, and only adds a deny: r is
+// returned unchanged unless a walk earns one.
+func enrichBashWalks(r enrichResult, candidates []walkCandidate, deadline time.Time) enrichResult {
+	if r.deny {
+		return r
+	}
+	probes := 0
+	for _, c := range candidates {
+		if probes >= walkProbeLimit || !time.Now().Before(deadline) {
+			break
+		}
+		walks, ok := analyzePythonWalks(c.script.code, deadline)
+		if !ok {
+			continue
+		}
+		for _, w := range walks {
+			if !w.denies() || probes >= walkProbeLimit || !time.Now().Before(deadline) {
+				continue
+			}
+			at, ok := c.dirs.resolve(c.script, w.root)
+			if !ok {
+				continue
+			}
+			probes++
+			if w.shallow && !holdsSourceFn(c.cwd, at) {
+				continue // only the directory's own files are read
+			}
+			if hasSource, probeOK := scopeTrackedFn(c.cwd, at); hasSource && probeOK {
+				return enrichResult{deny: true, reason: walkDeny(w.root)}
+			}
+		}
+	}
+	return r
+}
+
+// holdsSourceFn reports whether dir itself, not a subdirectory, holds a
+// source file: what a one-level walk of it can read.
+var holdsSourceFn = func(cwd, dir string) bool {
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(cwd, dir)
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	entries, _ := f.ReadDir(4096)
+	for _, e := range entries {
+		if e.Type().IsRegular() && looksLikeSourceFile(e.Name()) {
+			return true
+		}
+	}
+	return false
+}
+
+// walkDeny is the deny for a script that walks root and reads what it finds.
+func walkDeny(root string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[Gortex] BLOCKED: Bash Python script walks indexed source under %s and reads the files it finds. Use the indexed search surface instead:\n", root)
+	b.WriteString("  - `search(operation:\"text\", query:\"<literal>\")` — literal or regex-related source lookup\n")
+	b.WriteString("  - `search(operation:\"symbols\", query:\"<name>\")` — symbol lookup\n")
+	b.WriteString("  - `read(operation:\"summary\", target:{file:\"<path>\"})` — one file's overview\n")
+	b.WriteString(gcxTip)
+	b.WriteString(toolref.MCPRequiredLine())
+	return b.String()
 }
