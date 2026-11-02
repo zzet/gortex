@@ -90,7 +90,7 @@ func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 					cancel()
 					return
 				}
-				if ack["committed"] != true || ack["ack_mode"] != "full" || ack["graph_status"] != "fresh" {
+				if ack["disk_status"] != "committed" || ack["ack_mode"] != "full" || ack["graph_status"] != "fresh" {
 					result.err = fmt.Errorf("edit %d lacks actual committed/full ACK: %v", ordinal, ack)
 					cancel()
 					return
