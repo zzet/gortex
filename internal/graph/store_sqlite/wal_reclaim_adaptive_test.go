@@ -227,3 +227,41 @@ func assertAdaptiveCreditCommittedTailRefusalOn(t *testing.T, s *Store, db *sql.
 	require.NoError(t, s.db.QueryRow(`SELECT payload FROM wal_churn WHERE id = 1`).Scan(&payload))
 	require.Equal(t, "after-adaptive-copy", payload)
 }
+
+// A scheduler pause after writer admission cannot authorize a stale frontier.
+// Fake time makes the distinction between elapsed hold accounting and actual
+// adaptive-copy admission deterministic without delaying the host.
+func TestWALAdaptiveNewFrontierFenceAfterDelayedEntry(t *testing.T) {
+	s, db := finalBackfillFixture(t)
+	stopStoreBackgroundReaders(s)
+	frontier, ok := readWALReclaimFrontier(s.dbPath)
+	require.True(t, ok)
+	_, err := checkpointWALOnceOn(t.Context(), db, "TRUNCATE")
+	require.NoError(t, err)
+	s.writeMu.Lock()
+	_, err = s.writerDB.ExecContext(t.Context(), `UPDATE wal_churn SET payload = 'new-WAL-delayed' WHERE id = 1`)
+	s.writeMu.Unlock()
+	require.NoError(t, err)
+	var calls atomic.Int64
+	oldObserver := walCheckpointCallObserver
+	walCheckpointCallObserver = func(mode string, _ time.Time, _ time.Duration) {
+		if mode == "PASSIVE" {
+			calls.Add(1)
+		}
+	}
+	t.Cleanup(func() { walCheckpointCallObserver = oldObserver })
+	oldHook := walIdleResetHook
+	walIdleResetHook = func() { time.Sleep(75 * time.Millisecond) }
+	t.Cleanup(func() { walIdleResetHook = oldHook })
+	synctest.Test(t, func(t *testing.T) {
+		r := &walReclaimResult{urgent: true, slowTail: &walReclaimSlowTail{salt: frontier.salt, covered: frontier.backfill, copyElapsed: 300 * time.Millisecond}}
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		beforeIO := vfsIOMark()
+		done, err := s.reclaimWALResetHoldOnce(ctx, walReclaimConfig{}, db, r, false, true, r.takeAdaptiveWriterBudget())
+		t.Logf("done=%t err=%v adaptive_used=%t PASSIVE_calls=%d main_write_bytes=%d spent=%s", done, err, r.adaptiveUsed, calls.Load(), vfsIOMark().Since(beforeIO).OtherMainWriteBytes, r.writerSpent)
+		require.False(t, done)
+		require.ErrorIs(t, err, errWALReclaimReadersInFlight)
+		require.Less(t, r.writerSpent, walReclaimResetHold)
+	})
+}
