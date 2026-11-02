@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -212,8 +213,9 @@ func TestClientShutdownInterruptsAnActualBlockedPipeWriter(t *testing.T) {
 	ready := filepath.Join(t.TempDir(), "child-ready")
 	t.Setenv(helperReadyEnv, ready)
 	c, tr, _ := shutdownClientFixture(t, helperLSPNoRead)
-	require.Eventually(t, func() bool { _, err := os.Stat(ready); return err == nil }, 3*time.Second, time.Millisecond)
-	readyPID, err := os.ReadFile(ready)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	readyPID, err := waitShutdownHelperPID(ctx, ready, fmt.Sprint(tr.cmd.Process.Pid), os.ReadFile)
 	require.NoError(t, err)
 	require.Equal(t, fmt.Sprint(tr.cmd.Process.Pid), string(readyPID), "ready receipt must belong to this exact child")
 	writer := &observedShutdownWriter{WriteCloser: c.stdin, entered: make(chan struct{}), returned: make(chan struct{})}
