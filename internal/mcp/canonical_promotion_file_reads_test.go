@@ -88,21 +88,42 @@ func requireCanonicalDefinitionRows(t *testing.T, tool string, result *mcplib.Ca
 	require.Equal(t, 2, functions, "the independent source oracle includes target and shifted neighbor")
 }
 
+func canonicalReadFrecency(s *Server, id string) int {
+	s.frecency.mu.Lock()
+	defer s.frecency.mu.Unlock()
+	if index := s.frecency.findLocked(id); index >= 0 {
+		return len(s.frecency.store.Symbols[index].Times)
+	}
+	return 0
+}
+
 func TestCanonicalPromotionFileReadsKeepIndependentDefinitionOracle(t *testing.T) {
 	for _, tool := range []string{"get_file_summary", "get_editing_context"} {
-		for _, transition := range []string{"canonical_promotion", "peer_same_bytes", "same_bytes_event", "unchecked_eviction"} {
+		transitions := []string{"canonical_promotion", "peer_same_bytes", "same_bytes_event", "unchecked_eviction", "cancelled_promotion"}
+		if tool == "get_editing_context" {
+			transitions = append(transitions, "compression_not_audited")
+		}
+		for _, transition := range transitions {
 			t.Run(tool+"/"+transition, func(t *testing.T) {
 				selectedProjectionRegistry(t)
 				s, path, entry, raw := acknowledgedCanonicalFile(t)
+				s.InitFrecency("", "", ModeAI)
 				retirement := s.canonicalProjectionRetirement(path)
 				require.NotNil(t, retirement)
 				deadline := time.Now().Add(projectedReadBudget)
-				ctx := context.WithValue(t.Context(), projectedSourceDeadlineKey{}, deadline)
+				caller, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				ctx := context.WithValue(caller, projectedSourceDeadlineKey{}, deadline)
 				beforeCount := s.tokenStatsFor(t.Context()).snapshot()["calls_counted"].(int64)
+				beforeFrecency := canonicalReadFrecency(s, "main.go::Target")
 				calls := 0
 				var first context.Context
+				cancelledLeafDone := make(chan struct{})
 				leaf := func(ctx context.Context, request mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 					calls++
+					if transition == "cancelled_promotion" {
+						defer close(cancelledLeafDone)
+					}
 					require.Equal(t, deadline, ctx.Value(projectedSourceDeadlineKey{}))
 					var result *mcplib.CallToolResult
 					var err error
@@ -119,7 +140,7 @@ func TestCanonicalPromotionFileReadsKeepIndependentDefinitionOracle(t *testing.T
 					first = ctx
 					require.True(t, s.hasRequestProjectionFact(ctx, "main.go"))
 					switch transition {
-					case "canonical_promotion":
+					case "canonical_promotion", "compression_not_audited", "cancelled_promotion":
 						require.Equal(t, 5, s.graph.GetNode("main.go::Neighbor").StartLine)
 						require.NoError(t, s.indexer.IndexFile(path))
 						require.Equal(t, 8, s.graph.GetNode("main.go::Neighbor").StartLine)
@@ -141,13 +162,33 @@ func TestCanonicalPromotionFileReadsKeepIndependentDefinitionOracle(t *testing.T
 						require.False(t, entry.checkedRetired.Load())
 					}
 					require.ErrorIs(t, validateRequestProjections(first), projectionSuperseded)
+					if transition == "cancelled_promotion" {
+						cancel()
+					}
 					return result, nil
 				}
-				result, err := s.wrapToolHandler(leaf)(ctx, makeReq(tool, map[string]any{"path": "main.go", "format": "json"}))
+				args := map[string]any{"path": "main.go", "format": "json"}
+				if transition == "compression_not_audited" {
+					args["compress_bodies"] = true
+				}
+				result, err := s.wrapToolHandler(leaf)(ctx, makeReq(tool, args))
+				if transition == "cancelled_promotion" {
+					require.True(t, err != nil || result != nil && result.IsError)
+					select {
+					case <-cancelledLeafDone:
+					case <-time.After(3 * time.Second):
+						t.Fatal("owned canceled handler did not join")
+					}
+					require.Equal(t, 1, calls)
+					require.ErrorIs(t, caller.Err(), context.Canceled)
+					require.Equal(t, beforeCount, s.tokenStatsFor(t.Context()).snapshot()["calls_counted"])
+					return
+				}
 				require.NoError(t, err)
 				require.NotNil(t, result)
 				t.Logf("tool=%s transition=%s attempts=%d error=%v", tool, transition, calls, result.IsError)
 				require.LessOrEqual(t, calls, 2)
+				require.Error(t, validateRequestProjections(first), "the original selection must remain unusable")
 				facts := first.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
 				facts.mu.RLock()
 				borrowed := facts.entries[entry.key]
@@ -158,10 +199,20 @@ func TestCanonicalPromotionFileReadsKeepIndependentDefinitionOracle(t *testing.T
 					require.Equal(t, 2, calls)
 					afterCount := s.tokenStatsFor(t.Context()).snapshot()["calls_counted"].(int64)
 					require.Equal(t, int64(1), afterCount-beforeCount, "discarded attempts must not book a second accepted file read")
+					if tool == "get_editing_context" {
+						require.Equal(t, 1, canonicalReadFrecency(s, "main.go::Target")-beforeFrecency)
+					}
 				} else {
 					require.True(t, result.IsError)
 					require.Contains(t, resultText(result), "superseded")
 					require.Equal(t, 1, calls)
+					if transition != "compression_not_audited" {
+						afterCount := s.tokenStatsFor(t.Context()).snapshot()["calls_counted"].(int64)
+						require.Equal(t, int64(0), afterCount-beforeCount, "refused answers cannot book file savings")
+						if tool == "get_editing_context" {
+							require.Equal(t, beforeFrecency, canonicalReadFrecency(s, "main.go::Target"))
+						}
+					}
 				}
 			})
 		}
