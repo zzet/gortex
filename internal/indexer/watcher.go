@@ -269,6 +269,8 @@ type Watcher struct {
 	stormActive              bool                // true while waiting to drain
 	stormExplicit            bool                // admitted complete explicit frontier requires forced reads
 	stormStopped             bool                // Stop has closed storm admission
+	sharedOwnerLegacyFinalizing func(time.Time)
+ sharedOwnerBeforeProjection func(time.Time)
 	stormSharedInvocation *sharedSetInvocation
 	stormRetryAttempt        int                 // retry ordinal for the published storm timer
 	stormWork                sync.WaitGroup      // scheduled/running timer callbacks
@@ -2647,6 +2649,7 @@ func (w *Watcher) armStormTimerLocked(delay time.Duration) {
 		defer w.stormWork.Done()
 		attempt:=w.drainStormObserved(observation)
  returned:=time.Now()
+ if w.sharedOwnerBeforeProjection!=nil {w.sharedOwnerBeforeProjection(returned)}
  w.finishSharedOwnerProof(attempt,observation,returned)
 	})
 	if observation != nil {

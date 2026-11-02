@@ -165,19 +165,25 @@ func (f *sharedOwnerFrozen) definitionWire() map[string]any {
 }
 
 func (p *PublicationPhaseRecord) SharedOwnerProof(current *PublicationPhaseRecorder) *SharedOwnerProjection {
+ var out *SharedOwnerProjection
+ p.WithSharedOwnerProof(current,func(v *SharedOwnerProjection)bool{out=v;return true})
+ return out
+}
+
+func (p *PublicationPhaseRecord) WithSharedOwnerProof(current *PublicationPhaseRecorder, visit func(*SharedOwnerProjection) bool) bool {
  p.mu.Lock(); shared:=p.sharedSetExecution; var f *sharedOwnerFrozen;if shared!=nil{f=shared.ownerProof};p.mu.Unlock()
- if f==nil || current==nil || f.recorder.Value()!=current || current.sharedSelf.Value()!=current || current.sharedInstance!=f.recorderName || f.invocation.invalid.Load() { return nil }
+ if f==nil || current==nil || f.recorder.Value()!=current || current.sharedSelf.Value()!=current || current.sharedInstance!=f.recorderName || f.invocation.invalid.Load() { return false }
  current.mu.Lock();defer current.mu.Unlock()
  var selected *sharedOwnerMember
  physical:=make([]SharedPhysicalOwner,0,len(f.members))
  for i:=range f.members {
-  m:=&f.members[i];r:=m.record.Value();if r==nil || current.byKey[m.key]!=r || r.owner.Value()!=current {return nil}
+  m:=&f.members[i];r:=m.record.Value();if r==nil || current.byKey[m.key]!=r || r.owner.Value()!=current {return false}
   r.mu.Lock();valid:=r.key==m.key && r.ticket==m.ticket && r.sharedPhysical!=nil && *r.sharedPhysical==m.physical && r.sharedSetExecution!=nil && r.sharedSetExecution.ownerProof==f && r.terminal
   for _,mark:=range r.marks{if mark.phase==PublicationTicketFailed{valid=false}}
-  r.mu.Unlock();if !valid{return nil};if r==p{selected=m};physical=append(physical,m.physical)
+  r.mu.Unlock();if !valid{return false};if r==p{selected=m};physical=append(physical,m.physical)
  }
- if selected==nil{return nil}
- return &SharedOwnerProjection{Definition:f.definitionWire(),Owner:f.ownerWire(),Member:sharedMemberWire(*selected),PhysicalMembers:physical,Ticket:selected.ticket,originals:f.members}
+ if selected==nil{return false}
+ return visit(&SharedOwnerProjection{Definition:f.definitionWire(),Owner:f.ownerWire(),Member:sharedMemberWire(*selected),PhysicalMembers:physical,Ticket:selected.ticket,originals:f.members})
 }
 
 func (a *mutationSetPublicationAttempt) publishSharedOwnerUnavailable(reason string) {

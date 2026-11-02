@@ -27,25 +27,23 @@ func (s *Server) attachSharedOwnerAccounting(payload map[string]any, record *mut
  // Keep the actual current ledger fixed while checking ALL original members.
  s.mutationCommits.mu.Lock();defer s.mutationCommits.mu.Unlock()
  if s.mutationCommits.byID[record.id]!=record || record.owner!=s { return }
- proof:=publication.SharedOwnerProof(indexer.DefaultPublicationPhases())
- if proof==nil { return }
- for _,member:=range proof.PhysicalMembers {
-  current:=s.mutationCommits.byID[member.Receipt]
-  if current==nil || current.owner!=s { return }
-  current.mu.RLock()
-  valid:=current.isPhysicalCommit() && current.id==member.Receipt && current.commitSeq==member.Sequence && current.contentSHA256==member.Hash && current.absPath==member.Path && current.checkoutID==member.Checkout && current.checkoutIncarnation==member.Incarnation && current.disk==mutationDiskCommitted && member.Server==s.sharedIdentity.name && member.PID==s.sharedIdentity.pid && member.Birth==s.sharedIdentity.birth
-  retained:=current.publication
-  valid=valid && current.graphRecorded && current.graph==mutationGraphFresh && proof.MatchesPublication(member.Receipt,retained,current.appliedGeneration)
-  current.mu.RUnlock()
-  if !valid || retained==nil { return }
- }
- snap:=record.snapshot()
- if snap.AppliedGeneration!=proof.Ticket || snap.GraphStatus!=mutationGraphFresh { return }
- payload["shared_owner_accounting_v1"]=map[string]any{
-  "reference":map[string]any{"owner":proof.Owner,"member":proof.Member},
-  "definition":proof.Definition,
-  "membership":map[string]any{"owner":proof.Owner,"member":proof.Member,"applied_generation":proof.Ticket,"same_status_projection":true,"live_server_ledger_member":true,"live_recorder_member":true,"live_anchor":true,"full_membership_retained":true,"original_invocation_verified":true,"publication_terminal_success":true},
- }
- payload["shared_owner_accounting_v1_availability"]=map[string]any{"state":"frozen","reason":nil}
+ accepted:=publication.WithSharedOwnerProof(indexer.DefaultPublicationPhases(),func(proof *indexer.SharedOwnerProjection) bool {
+  peers:=make([]*mutationCommitRecord,0,len(proof.PhysicalMembers))
+  for _,member:=range proof.PhysicalMembers {current:=s.mutationCommits.byID[member.Receipt];if current==nil||current.owner!=s{return false};peers=append(peers,current)}
+  // All locks use the frozen sorted member order. No peer can rebind while
+  // the same-status ledger + recorder + complete peer witness is projected.
+  for _,peer:=range peers {peer.mu.RLock()}
+  defer func(){for i:=len(peers)-1;i>=0;i--{peers[i].mu.RUnlock()}}()
+  for i,member:=range proof.PhysicalMembers {
+   current:=peers[i]
+   if !current.isPhysicalCommit() || current.id!=member.Receipt || current.commitSeq!=member.Sequence || current.contentSHA256!=member.Hash || current.absPath!=member.Path || current.checkoutID!=member.Checkout || current.checkoutIncarnation!=member.Incarnation || current.disk!=mutationDiskCommitted || member.Server!=s.sharedIdentity.name || member.PID!=s.sharedIdentity.pid || member.Birth!=s.sharedIdentity.birth || !current.graphRecorded || current.graph!=mutationGraphFresh || !proof.MatchesPublication(member.Receipt,current.publication,current.appliedGeneration) {return false}
+  }
+  payload["shared_owner_accounting_v1"]=map[string]any{
+   "reference":map[string]any{"owner":proof.Owner,"member":proof.Member},
+   "definition":proof.Definition,
+   "membership":map[string]any{"owner":proof.Owner,"member":proof.Member,"applied_generation":proof.Ticket,"same_status_projection":true,"live_server_ledger_member":true,"live_recorder_member":true,"live_anchor":true,"full_membership_retained":true,"original_invocation_verified":true,"publication_terminal_success":true},
+  }
+  return true
+ })
+ if accepted {payload["shared_owner_accounting_v1_availability"]=map[string]any{"state":"frozen","reason":nil}} else if state=="frozen" {payload["shared_owner_accounting_v1_availability"]=map[string]any{"state":"unavailable","reason":"membership_changed"}}
 }
-

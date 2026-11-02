@@ -204,6 +204,7 @@ type SharedSetBackground struct {
 }
 
 func (w *Watcher) finishMutationSetBackground(attempt *mutationSetPublicationAttempt, timer *mutationSetTimerObservation, returned time.Time) {
+ if w.sharedOwnerLegacyFinalizing!=nil {w.sharedOwnerLegacyFinalizing(returned)}
 	if attempt == nil || timer == nil || timer.watcher.Value() != w || timer.invalid.Load() || attempt.retry != 0 || timer.armStarted.IsZero() || timer.armFinished.Before(timer.armStarted) || attempt.entered.Before(timer.armFinished) || returned.Before(attempt.entered) {
 		return
 	}
