@@ -182,17 +182,19 @@ func exactSearchReadback(kind string, body map[string]any, repo privateRepo, ste
 		if exact, present := body["count_is_exact"]; present && exact != true {
 			return false
 		}
+		if kind == "old_text_absent" {
+			// This query is the unique old literal. Any nonzero answer is
+			// inconsistent evidence, even if a malformed row omits that text.
+			return len(rows) == 0
+		}
 		for _, raw := range rows {
 			row, ok := raw.(map[string]any)
 			if !ok {
 				return false
 			}
-			if kind == "old_search_absent" {
-				id, _ := row["id"].(string)
-				if id == expectedPath+"::"+old || row["name"] == old {
-					return false
-				}
-			} else if text, _ := row["text"].(string); strings.Contains(text, old) {
+			id, hasID := row["id"].(string)
+			name, hasName := row["name"].(string)
+			if !hasID || id == "" || !hasName || name == "" || id == expectedPath+"::"+old || name == old {
 				return false
 			}
 		}
