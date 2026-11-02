@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -616,6 +617,9 @@ func TestTheDeletionWalkRecordsTheFilesItReadsAgain(t *testing.T) {
 func TestAFileReadAgainAfterItsParseWentStaleIsRecorded(t *testing.T) {
 	store := builderOpenStore(t, "base")
 	repoDir := sideInputCheckout(t, store)
+	// Keep this late-fence control to the moved Go file; the generic fixture
+	// also offers an independent JavaScript edit that would stage normally.
+	builderWriteFile(t, repoDir, "web/app.js", sideInputFiles["web/app.js"])
 	sampler, err := gitstate.NewDirtySampler(repoDir, "", "")
 	if err != nil {
 		t.Fatal(err)
@@ -633,10 +637,18 @@ func TestAFileReadAgainAfterItsParseWentStaleIsRecorded(t *testing.T) {
 		t.Fatal("no Go extractor registered")
 	}
 	saver := &savingExtractor{Extractor: goExtractor, trigger: "a.go", path: filepath.Join(repoDir, "pkg", "a.go"), line: "\nfunc Later() {}\n"}
+	// The first extraction saves B. The bounded fresh extraction then saves
+	// C, exhausting that preparation so a stable legacy read reaches the
+	// late content-proof fence rather than the staged receipt's early refusal.
+	var extractions atomic.Int32
+	saver.early = "a.go"
+	saver.earlyEvery = func() bool { return extractions.Add(1) == 2 }
 	saver.armed.Store(true)
 	registry.Register(saver)
 	refuted := readSetConfirmations.refuted.Load()
+	core, logs := observer.New(zap.InfoLevel)
 	builder := builderNewBuilder(store)
+	builder.Logger = zap.New(core)
 	builder.Registry = registry
 	builder.SetContractCoreRuntime(ContractCoreRuntimeHooks{})
 	generationID, _, err := builder.BuildDirtyLayer(context.Background(), DirtyLayerRequest{
@@ -655,6 +667,28 @@ func TestAFileReadAgainAfterItsParseWentStaleIsRecorded(t *testing.T) {
 	})
 	if _, saveErr := saver.saved(); saver.armed.Load() || saveErr != nil {
 		t.Fatalf("the save never landed (err %v)", saveErr)
+	}
+	if saver.earlySaves.Load() != 1 {
+		t.Fatal("the second real save did not exhaust the fresh preparation")
+	}
+	parses, fallbacks := 0, 0
+	for _, entry := range logs.FilterMessage("indexer: reconcile phase complete").All() {
+		fields := entry.ContextMap()
+		switch fields["phase"] {
+		case "chunk_parse":
+			parses++
+			if fields["fallback_files"] != int64(1) || fields["staged_files"] != int64(0) {
+				t.Fatalf("the moved file unexpectedly staged: %v", fields)
+			}
+		case "chunk_fallback_parse_apply":
+			if fields["files"] != int64(1) || fields["failed_files"] != int64(0) {
+				t.Fatalf("legacy parse/apply did not complete: %v", fields)
+			}
+			fallbacks++
+		}
+	}
+	if parses != 1 || fallbacks != 1 {
+		t.Fatalf("parse/legacy completion counts = %d/%d, want 1/1", parses, fallbacks)
 	}
 	if !errors.Is(err, ErrDirtySnapshotChanged) || readSetConfirmations.refuted.Load() == refuted {
 		published := false
