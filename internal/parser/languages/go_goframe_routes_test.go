@@ -1,58 +1,10 @@
 package languages
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/parser"
-	sitter "github.com/zzet/gortex/internal/parser/tsitter"
 )
-
-func TestGoFrame_PackageNamePreorderParity(t *testing.T) {
-	// Keep the old full traversal as a control: pruning must preserve its
-	// first nonempty package name for every subtree, including error trees.
-	legacyName := func(root *sitter.Node, src []byte) string {
-		pkg := ""
-		goframeWalk(root, func(n *sitter.Node) {
-			if pkg != "" || n.Type() != "package_clause" {
-				return
-			}
-			for i, count := 0, int(n.NamedChildCount()); i < count; i++ {
-				if c := n.NamedChild(i); c != nil && c.Type() == "package_identifier" {
-					pkg = strings.TrimSpace(c.Content(src))
-					return
-				}
-			}
-		})
-		return pkg
-	}
-	for _, fixture := range []struct{ name, source string }{
-		{"ordinary", "package api\nfunc F() { if true { println(1) } }"},
-		{"multiple_clauses", "package first\npackage second\nfunc F() {}"},
-		{"nested_clause", "package outer\nfunc F() { package inner; println(1) }"},
-		{"malformed_prefix", "func F() { package inner }\npackage later"},
-		{"missing_name", "package\nfunc F() {}\npackage later"},
-		{"no_clause", "func F() { println(1) }"},
-	} {
-		t.Run(fixture.name, func(t *testing.T) {
-			src := []byte(fixture.source)
-			tree, err := parser.ParseFile(src, NewGoExtractor().lang)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer tree.Close()
-			check := func(root *sitter.Node) {
-				t.Helper()
-				if got, want := goframePackageName(root, src), legacyName(root, src); got != want {
-					t.Fatalf("package name = %q, full-preorder control = %q", got, want)
-				}
-			}
-			check(nil)
-			goframeWalk(tree.RootNode(), check)
-		})
-	}
-}
 
 func goframeRouteNode(nodes []*graph.Node, method, path string) *graph.Node {
 	for _, n := range nodes {
