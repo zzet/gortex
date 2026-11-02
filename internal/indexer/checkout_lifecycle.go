@@ -137,6 +137,11 @@ type CheckoutLifecycleConfig struct {
 // A store with no catalog — or a repository git does not administer — still
 // works: the catalog steps are skipped and the real side effects (index,
 // watcher, config, invalidation) happen exactly as they did before.
+type familyInventoryRetry struct {
+	deadline int64
+	step     int
+}
+
 type familyRetry struct {
 	deadline int64
 	timer    *time.Timer
@@ -201,11 +206,12 @@ type CheckoutLifecycle struct {
 	// grace; these timers guarantee its expiry is reconciled even when Git is
 	// otherwise quiet. retryClosing rejects new timer and callback admission
 	// while Close joins callbacks that fired before the gate closed.
-	retryCloseMu  sync.Mutex
-	retryMu       sync.Mutex
-	retryClosing  bool
-	retryWG       sync.WaitGroup
-	familyRetries map[string]familyRetry
+	retryCloseMu           sync.Mutex
+	retryMu                sync.Mutex
+	retryClosing           bool
+	retryWG                sync.WaitGroup
+	familyRetries          map[string]familyRetry
+	familyInventoryRetries map[string]familyInventoryRetry
 	// familyRetryBarrier runs after a fired retry is admitted and counted.
 	// It is a deterministic shutdown test seam; nil in production.
 	familyRetryBarrier func()
@@ -1685,7 +1691,7 @@ func (l *CheckoutLifecycle) ApplyReload(ctx context.Context) (ReloadResult, erro
 	trackedByRoot := map[string]string{}
 	for prefix, meta := range l.mi.AllMetadata() {
 		if meta != nil {
-			trackedByRoot[meta.RootPath] = prefix
+			trackedByRoot[pathkey.CanonicalExistingRoot(meta.RootPath)] = prefix
 		}
 	}
 
@@ -1695,7 +1701,7 @@ func (l *CheckoutLifecycle) ApplyReload(ctx context.Context) (ReloadResult, erro
 		if err != nil {
 			abs = entry.Path
 		}
-		if prefix, ok := trackedByRoot[abs]; ok {
+		if prefix, ok := trackedByRoot[pathkey.CanonicalExistingRoot(abs)]; ok {
 			wanted[prefix] = true
 			continue
 		}
@@ -1783,7 +1789,7 @@ func (l *CheckoutLifecycle) retireOnReload(ctx context.Context, prefix string) (
 		// directory git does not administer. Keeping the pre-catalog
 		// behaviour is what stops such a repository from becoming
 		// impossible to remove.
-		if _, _, err := l.evictRepo(ctx, prefix); err != nil {
+		if _, _, err := l.evictRepo(ctx, prefix, reconcile.CauseReloadRemoved); err != nil {
 			return "", err
 		}
 		return reconcile.OutcomeForgotten, nil
@@ -1793,7 +1799,7 @@ func (l *CheckoutLifecycle) retireOnReload(ctx context.Context, prefix string) (
 		return "", err
 	}
 	if outcome == reconcile.OutcomeForgotten && l.mi.GetMetadata(prefix) != nil {
-		if _, _, err := l.evictRepo(ctx, prefix); err != nil {
+		if _, _, err := l.evictRepo(ctx, prefix, reconcile.CauseReloadRemoved); err != nil {
 			return outcome, err
 		}
 	}
@@ -1864,7 +1870,7 @@ func (l *CheckoutLifecycle) sweep(ctx context.Context, retirePayload bool) (Swee
 		errs = append(errs, err)
 	}
 	for _, fam := range l.knownFamilies(ctx) {
-		report, err := l.rec.ReconcileFamily(ctx, fam.familyID, fam.probeDir)
+		report, err := l.reconcileCatalogFamily(ctx, fam.familyID, fam.probeDir)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("family %s: %w", fam.familyID, err))
 			continue
@@ -1934,7 +1940,37 @@ func (l *CheckoutLifecycle) scheduleFamilyRetry(report reconcile.FamilyReport) {
 			deadline = checkout.RetryAt
 		}
 	}
+	unknown := l.inventoryUnknownRetryAt(report.FamilyID, report.InventoryUsable)
+	if unknown > 0 && (deadline == 0 || unknown < deadline) {
+		deadline = unknown
+	}
 	l.scheduleFamilyRetryAt(report.FamilyID, deadline)
+}
+
+// Only retry scheduling is process-local. Restart begins with the short first
+// interval; checkout clocks and cleanup authorization remain durable catalog data.
+func (l *CheckoutLifecycle) inventoryUnknownRetryAt(familyID string, usable bool) int64 {
+	l.retryMu.Lock()
+	defer l.retryMu.Unlock()
+	if usable {
+		delete(l.familyInventoryRetries, familyID)
+		return 0
+	}
+	if l.familyInventoryRetries == nil {
+		l.familyInventoryRetries = map[string]familyInventoryRetry{}
+	}
+	retry := l.familyInventoryRetries[familyID]
+	now := l.clock()
+	if retry.deadline > now.Unix() {
+		return retry.deadline
+	}
+	delays := [...]time.Duration{30 * time.Second, 2 * time.Minute, 8 * time.Minute, 30 * time.Minute}
+	retry.deadline = now.Add(delays[retry.step]).Unix()
+	if retry.step < len(delays)-1 {
+		retry.step++
+	}
+	l.familyInventoryRetries[familyID] = retry
+	return retry.deadline
 }
 
 func (l *CheckoutLifecycle) scheduleFamilyRetryAt(familyID string, deadline int64) {
@@ -2011,7 +2047,7 @@ func (l *CheckoutLifecycle) reconcileFamilyNow(ctx context.Context, familyID, fa
 		return errors.New("checkout lifecycle: family reconciliation is not wired")
 	}
 	baseline := l.repoSetFingerprint()
-	report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, fallbackDir))
+	report, err := l.reconcileCatalogFamily(ctx, familyID, fallbackDir)
 	if err != nil {
 		l.logger.Debug("checkout lifecycle: could not reconcile the family",
 			zap.String("family", familyID), zap.Error(err))
@@ -2060,7 +2096,7 @@ func (l *CheckoutLifecycle) knownFamilies(ctx context.Context) []familyProbe {
 		seen[familyID] = true
 		out = append(out, familyProbe{
 			familyID: familyID,
-			probeDir: l.probeDirFor(ctx, familyID, fallbackDir),
+			probeDir: fallbackDir,
 		})
 	}
 
@@ -2101,22 +2137,39 @@ func (l *CheckoutLifecycle) familyForPrefix(ctx context.Context, prefix string) 
 	return binding.FamilyID
 }
 
-// probeDirFor picks the directory a family's inventory is read from.
-func (l *CheckoutLifecycle) probeDirFor(ctx context.Context, familyID, fallback string) string {
+// probeDirFor prefers the primary, then shared Git data, then linked
+// checkouts. Every candidate is attempted before declaring inventory unavailable.
+func (l *CheckoutLifecycle) probeDirFor(ctx context.Context, familyID, fallback string) []string {
+	var dirs []string
+	seen := map[string]bool{}
+	add := func(path string) {
+		if path != "" && !seen[path] && dirExists(path) {
+			seen[path] = true
+			dirs = append(dirs, path)
+		}
+	}
 	checkouts, err := l.catalog.ListCheckouts(ctx, familyID)
 	if err == nil {
 		for _, checkout := range checkouts {
-			if checkout.RootPath != "" && dirExists(checkout.RootPath) {
-				return checkout.RootPath
+			if checkout.AdminName == gitstate.MainAdminName {
+				add(checkout.RootPath)
 			}
 		}
 	}
 	if family, ok, err := l.catalog.GetRepositoryFamily(ctx, familyID); err == nil && ok {
-		if dirExists(family.CommonDirIdentity) {
-			return family.CommonDirIdentity
+		add(family.CommonDirIdentity)
+	}
+	if err == nil {
+		for _, checkout := range checkouts {
+			add(checkout.RootPath)
 		}
 	}
-	return fallback
+	add(fallback)
+	return dirs
+}
+
+func (l *CheckoutLifecycle) reconcileCatalogFamily(ctx context.Context, familyID, fallback string) (reconcile.FamilyReport, error) {
+	return l.rec.ReconcileFamilyCandidates(ctx, familyID, l.probeDirFor(ctx, familyID, fallback)...)
 }
 
 // --- per-checkout coordinators ------------------------------------------
@@ -2142,9 +2195,19 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 	if l == nil || l.store == nil || l.catalog == nil {
 		return
 	}
-	for _, entry := range report.Checkouts {
+	for i, entry := range report.Checkouts {
 		if entry.CheckoutID == "" || !entry.Durable {
 			continue
+		}
+		if entry.State == store_sqlite.CheckoutStateReconciling && (entry.Action == reconcile.ActionAvailabilityRecovered || entry.Action == reconcile.ActionRemovalCancelled) {
+			if err := l.recoverCheckout(ctx, entry.CheckoutID); err != nil {
+				l.logger.Warn("checkout recovery failed", zap.String("checkout", entry.CheckoutID), zap.Error(err))
+				report.Checkouts[i].State = store_sqlite.CheckoutStateUnavailable
+				report.Checkouts[i].RetryAt = l.clock().Add(30 * time.Second).Unix()
+				continue
+			}
+			entry.State = store_sqlite.CheckoutStateReady
+			report.Checkouts[i].State = entry.State
 		}
 		if report.PrimaryGraphID == "" || entry.State != store_sqlite.CheckoutStateReady {
 			l.dropCoordinator(entry.CheckoutID)
@@ -2166,6 +2229,47 @@ func (l *CheckoutLifecycle) applyCoordinators(ctx context.Context, report reconc
 		}
 	}
 	l.markInitialInventory(report)
+}
+
+// recoverCheckout makes an outage recovery fresh before serving it again.
+// The retained metadata supplies the offline mtime snapshot and the existing
+// repository mutation lane still owns all indexing and publication.
+func (l *CheckoutLifecycle) recoverCheckout(ctx context.Context, checkoutID string) error {
+	checkout, found, err := l.catalog.GetCheckout(ctx, checkoutID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return store_sqlite.ErrCatalogNotFound
+	}
+	if err := l.rec.ResetRecoveredLayers(ctx, checkoutID, checkout.Incarnation); err != nil {
+		return err
+	}
+	prefix := l.prefixForCheckout(ctx, checkoutID)
+	if prefix != "" && checkout.EffectiveMode == store_sqlite.CheckoutModeDedicated {
+		meta, idx := l.mi.GetMetadata(prefix), l.mi.GetIndexer(prefix)
+		_, err = l.mi.ReconcileRepoCtx(ctx, config.RepoEntry{Path: checkout.RootPath, Name: prefix}, l.mi.FileMtimes(prefix))
+		// ReconcileRepoCtx restores a missing registration; an already registered
+		// identity is deliberately a no-op there. Its stable mutation owner performs
+		// the actual full-tree catch-up for this retained live registration.
+		if err == nil && meta != nil && idx != nil {
+			coordinator, current := l.mi.repositoryMutationCoordinatorForSnapshot(prefix, meta, idx)
+			if !current {
+				err = store_sqlite.ErrCatalogStaleGuard
+			} else {
+				_, err = coordinator.reconcile(ctx, nil)
+			}
+		}
+		if err != nil {
+			stateErr := l.catalog.UpdateCheckoutRecoveryState(ctx, checkoutID, checkout.Incarnation, store_sqlite.CheckoutStateReconciling, store_sqlite.CheckoutStateUnavailable, err.Error(), l.clock().Unix())
+			return errors.Join(err, stateErr)
+		}
+		l.attachWatcherContext(ctx, prefix)
+	}
+	if err := l.catalog.UpdateCheckoutRecoveryState(ctx, checkoutID, checkout.Incarnation, store_sqlite.CheckoutStateReconciling, store_sqlite.CheckoutStateReady, "", l.clock().Unix()); err != nil {
+		return err
+	}
+	return nil
 }
 
 // coordinatorAdmitted decides whether one ready, automatic, primary-backed
@@ -2190,7 +2294,7 @@ func (l *CheckoutLifecycle) coordinatorAdmitted(
 	inventoried := l.initialInventoryTaken[checkout.FamilyID]
 	l.admitMu.Unlock()
 	return inventoried &&
-		action == reconcile.ActionIdentityAllocated &&
+		(action == reconcile.ActionIdentityAllocated || action == reconcile.ActionAvailabilityRecovered || action == reconcile.ActionRemovalCancelled) &&
 		!l.cfgLazyWorktrees
 }
 
@@ -4351,7 +4455,7 @@ func (l *CheckoutLifecycle) Seed(ctx context.Context) error {
 		familyStarted := stageStarted("reconcile_family", zap.String("family", familyID))
 		reconcileStarted := stageStarted("reconcile_family_catalog", zap.String("family", familyID))
 		baseline := l.repoSetFingerprint()
-		report, err := l.rec.ReconcileFamily(ctx, familyID, l.probeDirFor(ctx, familyID, probeDir))
+		report, err := l.reconcileCatalogFamily(ctx, familyID, probeDir)
 		stageCompleted("reconcile_family_catalog", reconcileStarted, err, zap.String("family", familyID))
 		if err != nil {
 			logger.Debug("checkout lifecycle: could not reconcile the family",
@@ -4417,7 +4521,7 @@ func (h cleanupHooks) CleanupDeferred(err error) bool {
 // is the repository eviction the untrack path has always run — in the order
 // that path established: detach the watcher before evicting, so a late
 // filesystem event cannot re-index files whose nodes are already gone.
-func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID string) error {
+func (h cleanupHooks) ReleaseGraph(ctx context.Context, graphID, cause string) error {
 	// Read BEFORE the release: once the registry stops serving the prefix its
 	// workspace is unreadable, and the cohort consumers that just lost a member
 	// would then never be told. Read here rather than inside
@@ -4488,7 +4592,7 @@ func (l *CheckoutLifecycle) cohortSubjectForGraph(
 // that removal. Durable transitions use the returned save error to stay
 // retryable instead of completing with stale explicit configuration.
 func (l *CheckoutLifecycle) evictRepoChecked(
-	ctx context.Context, prefix, rootPath string,
+	ctx context.Context, prefix, rootPath, cause string,
 ) (nodesRemoved, edgesRemoved int, err error) {
 	if prefix == "" {
 		return 0, 0, nil
@@ -4498,24 +4602,7 @@ func (l *CheckoutLifecycle) evictRepoChecked(
 	// would then never be told.
 	workspaceID := l.workspaceForPrefix(prefix)
 	l.detachWatcherContext(ctx, prefix)
-	finalize := func(meta *RepoMetadata) error {
-		if l.cfgMgr == nil {
-			return nil
-		}
-		path := rootPath
-		if meta != nil && meta.RootPath != "" {
-			// Prefer the original configured spelling while this process still
-			// has it. A vanished macOS path can no longer resolve /var through
-			// /private/var, while the catalog deliberately keeps the canonical
-			// spelling; the configured spelling remains the exact durable key.
-			path = meta.RootPath
-		}
-		if path == "" {
-			return nil
-		}
-		_, err := l.cfgMgr.Global().RemoveRepoAndSaveIfPresent(path)
-		return err
-	}
+	finalize := l.repositoryConfigFinalizer(rootPath, cause)
 	nodesRemoved, edgesRemoved, err = l.mi.purgeRepoChecked(ctx, prefix, finalize)
 	if l.mi.GetMetadata(prefix) == nil {
 		l.implicitRoots.Delete(prefix)
@@ -4536,7 +4623,7 @@ func (l *CheckoutLifecycle) evictRepoChecked(
 // evictRepo runs the repository teardown every caller shares: watcher first,
 // then the graph, then the persisted configuration, then the sessions.
 func (l *CheckoutLifecycle) evictRepo(
-	ctx context.Context, prefix string,
+	ctx context.Context, prefix string, causes ...string,
 ) (nodesRemoved, edgesRemoved int, err error) {
 	if prefix == "" {
 		return 0, 0, nil
@@ -4545,7 +4632,11 @@ func (l *CheckoutLifecycle) evictRepo(
 	if meta := l.mi.GetMetadata(prefix); meta != nil {
 		rootPath = meta.RootPath
 	}
-	return l.evictRepoChecked(ctx, prefix, rootPath)
+	cause := reconcile.CauseUntrack
+	if len(causes) > 0 {
+		cause = causes[0]
+	}
+	return l.evictRepoChecked(ctx, prefix, rootPath, cause)
 }
 
 // attachWatcher wires a tracked prefix into the live file watcher. A failure
@@ -4750,7 +4841,10 @@ func (l *CheckoutLifecycle) prefixForCheckout(ctx context.Context, checkoutID st
 			}
 		}
 	}
-	return l.ResolvePrefix(checkout.RootPath)
+	if checkout.EffectiveMode == store_sqlite.CheckoutModeDedicated {
+		return l.registeredPrefixForRoot(checkout.RootPath)
+	}
+	return ""
 }
 
 // --- identifiers --------------------------------------------------------

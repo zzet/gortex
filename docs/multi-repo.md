@@ -24,6 +24,28 @@ Such a session has no single workspace slug, so `_meta.scope_applied` reports `r
 
 A directory that neither lies inside nor contains a tracked repo still fails closed with the structured `repo_not_tracked` error — tracking the parent of your repos is not required, and doing so would index every child a second time. The error preserves the attempted path and points to `gortex repos` to list tracked repositories. Reconnect MCP with its working directory inside the intended repository, or track the current directory if it is a new repository. Tool-level `path` or `repo` arguments do not change this session admission check. A configured repo that warmup has not registered yet after a daemon start is not "untracked": its sessions get `repo_loading` (retryable) until it is ready, then work in place without reconnecting — see [Startup states](mcp.md#startup-states). Over the HTTP surface (`gortex daemon start --http-addr ...`) the `/v1/graph` route accepts `?project=` and `?repo=` to narrow the dump, so a typo'd value returns an empty result for that request instead of bringing the whole index up empty.
 
+## Tracking and temporary outages
+
+The daemon never untracks a repository on its own. A failed Git family inventory
+freezes availability and removal clocks. A checkout whose root and `.git` marker
+remain reachable stays ready even if a linked worktree has damaged Git metadata.
+
+An explicitly tracked checkout that is genuinely unavailable after its grace
+period keeps its catalog identity, graph and configuration entry. Its serving
+layers become unavailable. When the root returns, the daemon reconciles edits
+made during the outage and reattaches its watcher before marking it ready.
+Automatic linked worktrees can still expire when removal is confirmed.
+
+Unknown family inventories retry after 30 seconds, 2 minutes, 8 minutes, then
+every 30 minutes. A successful inventory resets this process-local backoff;
+restarting begins with the 30-second interval. Tracking intent, lifecycle clocks,
+filesystem evidence and cleanup authorization remain durable.
+
+Configuration removal requires an explicit untrack or forget, a requested
+demotion, or removal from the configuration file. Ordinary logs record each
+removal with its cause. See the [upgrade notes](upgrade-v0.64.12.md) before
+running an older build against an unfinished cleanup journal.
+
 ## Repository prefixes
 
 Each indexed root needs a unique repository prefix. The default is its directory
