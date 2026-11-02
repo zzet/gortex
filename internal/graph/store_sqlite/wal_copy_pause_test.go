@@ -304,25 +304,34 @@ func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
 			_, _ = checkpointWALOnceOn(context.Background(), ckpt, "PASSIVE") // the copy is complete
 			lane.held.Store(true)
 			defer lane.held.Store(false)
+			resetEntered := make(chan struct{})
+			var resetEnteredOnce sync.Once
 			walPressureResetHook = func(ctx context.Context) { // a reset that would take 300 ms
+				resetEnteredOnce.Do(func() { close(resetEntered) })
 				select {
 				case <-ctx.Done():
 				case <-time.After(300 * time.Millisecond):
 				}
 			}
 			t.Cleanup(func() { walPressureResetHook = nil })
+			var editCalls, editAcquisitions int
+			var reclaimHeldAtEdit bool
+			beforeHold := s.WALReclaimStats().WriterHold.Count()
 			var wait time.Duration
 			var wg sync.WaitGroup
 			if queued {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					time.Sleep(10 * time.Millisecond)
+					<-resetEntered
+					editCalls++
+					reclaimHeldAtEdit = s.writeMu.reclaimSince.Load() != 0
 					release := s.AnnounceWrite()
 					defer release()
 					started := time.Now()
 					s.writeMu.Lock()
 					wait = time.Since(started)
+					editAcquisitions++
 					s.writeMu.Unlock()
 				}()
 			}
@@ -339,6 +348,11 @@ func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
 			}
 			require.Less(t, res.writerHold, limit)
 			if queued {
+				t.Logf("edit calls=%d acquisitions=%d reclaim_held_at_edit=%v hold_samples=%d wait=%s", editCalls, editAcquisitions, reclaimHeldAtEdit, s.WALReclaimStats().WriterHold.Count()-beforeHold, wait)
+				require.Equal(t, 1, editCalls)
+				require.Equal(t, 1, editAcquisitions)
+				require.True(t, reclaimHeldAtEdit)
+				require.EqualValues(t, 1, s.WALReclaimStats().WriterHold.Count()-beforeHold)
 				require.Greater(t, wait, time.Duration(0))
 				require.Less(t, wait, limit, "the edit waited longer than the pressure hold")
 			}
