@@ -29,6 +29,19 @@ var gatewayPresets = map[string]CustomProvider{
 		SchemaMode:    "json_schema",
 		PromptProfile: "frontier",
 	},
+	// cheapaimodel (https://cheapaimodel.ai/docs) serves DeepSeek, GLM,
+	// Kimi and Grok models over the OpenAI Chat Completions API; model ids
+	// are bare (list: https://cheapaimodel.ai/models). The default model
+	// reasons by default, which can spend the whole 192-token expand
+	// budget before any JSON; "none" turns that off.
+	"cheapaimodel": {
+		BaseURL:         "https://api.cheapaimodel.ai/v1",
+		Model:           "deepseek-v4-1-flash",
+		APIKeyEnv:       "CHEAPAIMODEL_API_KEY",
+		SchemaMode:      "json_schema",
+		PromptProfile:   "frontier",
+		ReasoningEffort: "none",
+	},
 	// Cheaper Inference (https://cheaperinference.com/docs) is an
 	// OpenAI-compatible gateway; model ids are bare (no vendor prefix).
 	"cheaperinference": {
