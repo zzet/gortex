@@ -63,7 +63,6 @@ func newBlockedLifecycleFixture(t testing.TB) (*realCheckoutMutationFixture, *li
 	// Unblock before the fixture's lifecycle cleanup waits for its real worker.
 	t.Cleanup(e.unblock)
 	f.srv.mutationReindexWait = 20 * time.Millisecond
-	f.srv.mutationSafetyWait = 20 * time.Millisecond
 	return f, e
 }
 

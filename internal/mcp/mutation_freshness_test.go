@@ -47,66 +47,20 @@ func freshnessToolResultText(result *mcpgo.CallToolResult) string {
 	return text.String()
 }
 
-func TestMutationFreshnessRepoScopeAggregatesPending(t *testing.T) {
-	s := &Server{mutationSafetyWait: time.Millisecond}
-	pendingFreshnessReceipt(s, "receipt-a1", "repo-a", "/repo-a/a.go", 3)
-	pendingFreshnessReceipt(s, "receipt-a2", "repo-a", "/repo-a/b.go", 8)
-	pendingFreshnessReceipt(s, "receipt-b", "repo-b", "/repo-b/c.go", 5)
-
-	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
-	if err == nil {
-		t.Fatal("repo-scoped freshness unexpectedly succeeded")
+func TestMutationFreshnessSummaryKeepsCheckoutRepoScope(t *testing.T) {
+	s := &Server{}
+	pendingFreshnessReceipt(s, "unrelated", "repo-b", "/repo-b/b.go", 2)
+	if pending, err := s.mutationFreshnessSummaryForRepos(context.Background(), "repo-a"); pending || err != nil {
+		t.Fatalf("unrelated repository affected summary: pending=%t err=%v", pending, err)
 	}
-	message := err.Error()
-	for _, want := range []string{"receipt-a1", "generation=3", "receipt-a2", "generation=8"} {
-		if !strings.Contains(message, want) {
-			t.Fatalf("freshness error %q does not contain %q", message, want)
-		}
-	}
-	if strings.Contains(message, "receipt-b") {
-		t.Fatalf("repo-scoped freshness included unrelated receipt: %s", message)
-	}
-}
-
-func TestMutationFreshnessScopeIncludesUnknownAndIgnoresUnrelated(t *testing.T) {
-	s := &Server{mutationSafetyWait: time.Millisecond}
-	pendingFreshnessReceipt(s, "receipt-b", "repo-b", "/repo-b/b.go", 2)
-	if err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a"); err != nil {
-		t.Fatalf("unrelated repository blocked repo-a: %v", err)
-	}
-
-	pendingFreshnessReceipt(s, "receipt-unknown", "", "/unknown/u.go", 4)
-	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
-	if err == nil || !strings.Contains(err.Error(), "receipt-unknown") {
-		t.Fatalf("unknown-owner receipt did not fail wide: %v", err)
-	}
-	if strings.Contains(err.Error(), "receipt-b") {
-		t.Fatalf("unknown-owner check also included unrelated known repo: %v", err)
-	}
-}
-
-func TestMutationFreshnessTerminalFailureFailsClosed(t *testing.T) {
-	s := &Server{mutationSafetyWait: time.Millisecond}
-	failed := pendingFreshnessReceipt(s, "receipt-failed", "repo-a", "/repo-a/broken.go", 9)
-	completeFreshnessReceipt(failed, indexer.MutationResult{
-		RequestedGeneration: 9,
-		AppliedGeneration:   9,
-		Err:                 errors.New("syntax patch failed"),
-	})
-
-	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
-	if err == nil {
-		t.Fatal("terminal patch failure did not fail closed")
-	}
-	for _, want := range []string{"failed", "receipt-failed", "generation=9", "syntax patch failed"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("terminal failure %q does not contain %q", err, want)
-		}
+	pendingFreshnessReceipt(s, "unknown", "", "/unknown/u.go", 4)
+	if pending, err := s.mutationFreshnessSummaryForRepos(context.Background(), "repo-a"); !pending || err != nil {
+		t.Fatalf("unknown-owner receipt missing from summary: pending=%t err=%v", pending, err)
 	}
 }
 
 func TestMutationFreshnessSuccessResolvesSupersededFailures(t *testing.T) {
-	s := &Server{mutationSafetyWait: time.Millisecond}
+	s := &Server{}
 	stale := pendingFreshnessReceipt(s, "receipt-stale-failed", "repo-a", "/repo-a/file.go", 6)
 	completeFreshnessReceipt(stale, indexer.MutationResult{
 		RequestedGeneration: 6,
@@ -146,23 +100,6 @@ func TestMutationFreshnessSuccessResolvesSupersededFailures(t *testing.T) {
 		t.Fatal("failure newer than the succeeded generation was resolved")
 	}
 
-	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
-	if err == nil {
-		t.Fatal("remaining failures did not fail closed")
-	}
-	message := err.Error()
-	if strings.Contains(message, "receipt-stale-failed") {
-		t.Fatalf("freshness error still reports the superseded receipt: %s", message)
-	}
-	for _, want := range []string{
-		"receipt-other-path",
-		"receipt-newer-failed",
-		"do not recover by waiting",
-	} {
-		if !strings.Contains(message, want) {
-			t.Fatalf("freshness error %q does not contain %q", message, want)
-		}
-	}
 }
 
 func TestTrackMutationTicketResolvesSupersededFailures(t *testing.T) {
@@ -197,7 +134,7 @@ func TestTrackMutationTicketResolvesSupersededFailures(t *testing.T) {
 }
 
 func TestMutationFreshnessSuccessKeepsPendingSamePathReceipts(t *testing.T) {
-	s := &Server{mutationSafetyWait: time.Millisecond}
+	s := &Server{}
 	inflight := pendingFreshnessReceipt(s, "receipt-inflight", "repo-a", "/repo-a/file.go", 4)
 
 	appliedResult := indexer.MutationResult{
@@ -215,14 +152,10 @@ func TestMutationFreshnessSuccessKeepsPendingSamePathReceipts(t *testing.T) {
 	if outcome := inflight.outcome(true); outcome.Pending != true {
 		t.Fatalf("a still-pending receipt was marked completed by the resolve: %+v", outcome)
 	}
-	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
-	if err == nil || !strings.Contains(err.Error(), "receipt-inflight") {
-		t.Fatalf("barrier no longer reports the in-flight receipt: %v", err)
-	}
 }
 
 func TestReindexedPathResolvesFailedReceiptsForThatPathOnly(t *testing.T) {
-	s := &Server{mutationSafetyWait: time.Millisecond}
+	s := &Server{}
 	failed := pendingFreshnessReceipt(s, "receipt-failed", "repo-a", "/repo-a/file.go", 6)
 	completeFreshnessReceipt(failed, indexer.MutationResult{
 		RequestedGeneration: 6,
@@ -257,18 +190,6 @@ func TestReindexedPathResolvesFailedReceiptsForThatPathOnly(t *testing.T) {
 		t.Fatal("the resolve stamped a result onto a receipt whose ticket is still in flight")
 	}
 
-	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
-	if err == nil {
-		t.Fatal("the remaining receipts did not fail closed")
-	}
-	if strings.Contains(err.Error(), "receipt-failed") {
-		t.Fatalf("the barrier still reports the resolved receipt: %v", err)
-	}
-	for _, want := range []string{"receipt-other-path", "receipt-inflight"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("barrier %q no longer reports %q", err, want)
-		}
-	}
 }
 
 func TestReindexedReceiptPathOnlyResolvesAProvenSinglePath(t *testing.T) {
@@ -326,7 +247,7 @@ func TestReindexedReceiptPathOnlyResolvesAProvenSinglePath(t *testing.T) {
 }
 
 func TestReindexResolveIgnoresReceiptsThatFailedDuringThePass(t *testing.T) {
-	s := &Server{mutationSafetyWait: time.Millisecond}
+	s := &Server{}
 	before := pendingFreshnessReceipt(s, "receipt-before", "repo-a", "/repo-a/file.go", 6)
 	completeFreshnessReceipt(before, indexer.MutationResult{
 		RequestedGeneration: 6,
@@ -354,17 +275,10 @@ func TestReindexResolveIgnoresReceiptsThatFailedDuringThePass(t *testing.T) {
 		t.Fatalf("a write that failed while the pass ran was stamped fresh: %+v", outcome)
 	}
 
-	err := s.awaitMutationFreshnessForRepos(context.Background(), "repo-a")
-	if err == nil || !strings.Contains(err.Error(), "receipt-during") {
-		t.Fatalf("the barrier stopped reporting the mid-pass failure: %v", err)
-	}
-	if strings.Contains(err.Error(), "receipt-before") {
-		t.Fatalf("the barrier still reports the resolved receipt: %v", err)
-	}
 }
 
 func TestFailedReceiptsBeforeRefusesToSnapshotAnUnattributablePass(t *testing.T) {
-	s := &Server{mutationSafetyWait: time.Millisecond}
+	s := &Server{}
 	failed := pendingFreshnessReceipt(s, "receipt-failed", "repo-a", "/repo-a/file.go", 6)
 	completeFreshnessReceipt(failed, indexer.MutationResult{
 		RequestedGeneration: 6,
@@ -394,43 +308,6 @@ func TestFailedReceiptsBeforeRefusesToSnapshotAnUnattributablePass(t *testing.T)
 	s.resolveReindexedPathReceipts("/repo-a/file.go", nil)
 	if outcome := failed.outcome(false); outcome.Err == nil {
 		t.Fatalf("a nil snapshot resolved a receipt: %+v", outcome)
-	}
-}
-
-func TestMutationReposForSymbolIDsUnresolvedWidensBarrier(t *testing.T) {
-	g := graph.New()
-	g.AddNode(&graph.Node{
-		ID:         "repo-a::known",
-		Kind:       graph.KindFunction,
-		Name:       "known",
-		FilePath:   "known.go",
-		StartLine:  1,
-		EndLine:    1,
-		Language:   "go",
-		RepoPrefix: "repo-a",
-	})
-	s := &Server{
-		graph:              g,
-		engine:             query.NewEngine(g),
-		session:            newSessionState(),
-		mutationSafetyWait: time.Millisecond,
-	}
-	pendingFreshnessReceipt(s, "receipt-other", "repo-b", "/repo-b/other.go", 6)
-
-	if repos := s.mutationReposForSymbolIDs(context.Background(), []string{"missing"}); repos != nil {
-		t.Fatalf("unresolved symbol scope = %v, want nil fail-wide scope", repos)
-	}
-	err := s.awaitMutationFreshnessForRepos(context.Background(), s.mutationReposForSymbolIDs(context.Background(), []string{"missing"})...)
-	if err == nil || !strings.Contains(err.Error(), "receipt-other") {
-		t.Fatalf("unresolved symbol did not widen the barrier: %v", err)
-	}
-
-	repos := s.mutationReposForSymbolIDs(context.Background(), []string{"repo-a::known"})
-	if len(repos) != 1 || repos[0] != "repo-a" {
-		t.Fatalf("resolved symbol scope = %v", repos)
-	}
-	if err := s.awaitMutationFreshnessForRepos(context.Background(), repos...); err != nil {
-		t.Fatalf("resolved repo-a scope was blocked by repo-b: %v", err)
 	}
 }
 

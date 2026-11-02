@@ -17,48 +17,8 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 )
 
-func TestFreshnessRefusalHintLists(t *testing.T) {
-	s := &Server{mutationSafetyWait: time.Nanosecond}
-	newID := func() string { return fmt.Sprintf("mutation-%d", mutationReceiptSequence.Add(1)) }
-	failed := pendingFreshnessReceipt(s, newID(), "fixture", "/fixture/failed.go", 1)
-	completeFreshnessReceipt(failed, indexer.MutationResult{Err: errors.New("patch failed")})
-	unkeyed := pendingFreshnessReceipt(s, newID(), "fixture", "/fixture/other.go", 2)
-	completeFreshnessReceipt(unkeyed, indexer.MutationResult{}) // No confirmed reindex.
-	pending := pendingFreshnessReceipt(s, newID(), "fixture", "/fixture/pending.go", 3)
-	for _, tc := range []struct {
-		receipt *mutationReceipt
-		key     string
-	}{{failed, "original-edit"}, {unkeyed, ""}} {
-		record := s.beginMutationCommit(context.Background(), "edit_file", tc.key, "", tc.receipt.path, tc.receipt.path)
-		record.recordGraph(mutationReindexOutcome{Receipt: tc.receipt.id, Err: errors.New("patch failed")})
-	}
-
-	err := s.awaitMutationFreshnessForRepos(context.Background(), "fixture")
-	require.Error(t, err)
-	message := err.Error()
-	require.True(t, strings.HasPrefix(message, "graph freshness unavailable"), message)
-	entries := strings.Split(message, "; ")
-	require.Len(t, entries, 4, "three receipt entries and one shared hint: %s", message)
-	for i, receipt := range []*mutationReceipt{failed, unkeyed, pending} {
-		require.Contains(t, entries[i], "receipt="+receipt.id+" ")
-		require.Equal(t, 1, strings.Count(message, "receipt="+receipt.id+" "))
-		require.Contains(t, entries[i], "(query: change.receipt options.receipt="+receipt.id+")")
-	}
-	require.Contains(t, entries[0], " commit=commit-")
-	require.Contains(t, entries[0], ` mutation_id="original-edit"`)
-	require.Contains(t, entries[1], " commit=commit-")
-	require.NotContains(t, entries[1], "mutation_id=")
-	require.NotContains(t, entries[2], "commit=")
-	for _, want := range []string{"later successful edit of the same path", "workspace_admin operation=reindex", "reindex_repository", "paths=[P]", "exactly that single file", "retention", "last resort"} {
-		require.Contains(t, entries[3], want)
-	}
-	for _, unavailable := range []string{"reconcile", "retry_exhausted", "retry-exhausted", "ETA"} {
-		require.NotContains(t, message, unavailable)
-	}
-}
-
-func TestFreshnessRefusalPublicationPhases(t *testing.T) {
-	s := &Server{mutationSafetyWait: time.Nanosecond}
+func TestFreshnessReceiptHintPublicationPhases(t *testing.T) {
+	s := &Server{}
 	id := fmt.Sprintf("mutation-%d", mutationReceiptSequence.Add(1))
 	receipt := pendingFreshnessReceipt(s, id, "fixture", "/fixture/phases.go", 7)
 	origin := time.Now()
@@ -70,10 +30,9 @@ func TestFreshnessRefusalPublicationPhases(t *testing.T) {
 		record.MarkAt(phase, origin.Add(time.Duration(i+1)*time.Millisecond))
 	}
 	completeFreshnessReceipt(receipt, indexer.MutationResult{Err: errors.New("failed publication")})
-	err := s.awaitMutationFreshnessForRepos(context.Background(), "fixture")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), `publication_phases=[...+3,"ticket_enqueued"@3.0ms,"admitted"@4.0ms,"ticket_failed"@5.0ms]`)
-	require.NotContains(t, err.Error(), `"handler_started"`)
+	hint := s.mutationFreshnessReceiptHint(context.Background(), id)
+	require.Contains(t, hint, `publication_phases=[...+3,"ticket_enqueued"@3.0ms,"admitted"@4.0ms,"ticket_failed"@5.0ms]`)
+	require.NotContains(t, hint, `"handler_started"`)
 }
 
 func TestFreshnessRefusalAnnotationBoundsAndScope(t *testing.T) {
