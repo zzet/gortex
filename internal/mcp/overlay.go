@@ -356,6 +356,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withContractCoreReadErrors(ctx)
 		}
 		indexer.StampPublicationPhase(ctx, indexer.PublicationHandlerStarted)
+		ctx, releaseExplicitFreshness := s.captureExplicitFreshness(ctx, req)
+		if releaseExplicitFreshness != nil {
+			defer releaseExplicitFreshness()
+		}
 		ctx = s.captureToolFreshness(ctx)
 		ctx, req = s.reserveToolFreshnessBudget(ctx, req.Params.Name, req)
 		res, hErr := s.invokeAcknowledgedLeaf(ctx, req, h)

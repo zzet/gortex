@@ -154,6 +154,7 @@ func (s *Server) loadOrCreateBatchTransaction(ctx context.Context, transactionID
 		return nil, "", fmt.Errorf("transaction %q not found", transactionID)
 	}
 	receipt := batchTransactionReceipt{
+		AckMode: string(s.sourceAckPolicy(ctx).mode),
 		Version: batchTransactionVersion, TransactionID: transactionID, Fingerprint: fingerprint,
 		Status: "preparing", DiskStatus: "unchanged", GraphStatus: "not_started", StartedAt: time.Now().UTC(),
 	}

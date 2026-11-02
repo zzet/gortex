@@ -29,6 +29,10 @@ import (
 // construction time — the daemon package deliberately doesn't depend
 // on internal/mcp to keep the direction of imports clean.
 type Server struct {
+	runtimeMu       sync.RWMutex
+	runtimeClosing  bool
+	startupMetadata bool
+
 	SocketPath string
 	Version    string
 	Logger     *zap.Logger
@@ -476,7 +480,7 @@ func (s *Server) runMaintenance() {
 			return
 		case <-t.C:
 			for _, sd := range s.sessions.SweepDead(platform.ProcessExists) {
-				if hook, ok := s.MCPDispatcher.(SessionEndedHook); ok && hook != nil {
+				if hook, ok := s.currentDispatcher().(SessionEndedHook); ok && hook != nil {
 					hook.SessionEnded(sd)
 				}
 				s.Logger.Info("daemon: swept dead session",
@@ -534,7 +538,7 @@ func (s *Server) handle(conn net.Conn) {
 		if sess := s.sessions.Remove(conn); sess != nil {
 			// Fire the optional disconnect hook so implementations can
 			// release per-session resources keyed by this ID.
-			if hook, ok := s.MCPDispatcher.(SessionEndedHook); ok && hook != nil {
+			if hook, ok := s.currentDispatcher().(SessionEndedHook); ok && hook != nil {
 				hook.SessionEnded(sess)
 			}
 			s.Logger.Debug("daemon: session closed",
@@ -618,8 +622,8 @@ func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*Session, error
 	}
 	// Stamp warmup state so the client can tell a still-warming daemon from a
 	// ready one. The session is established either way — Warming is advisory.
-	if s.Ready != nil {
-		ready, phase := s.Ready()
+	if readyFn := s.currentReadiness(); readyFn != nil {
+		ready, phase := readyFn()
 		ack.Warming = !ready
 		ack.WarmupPhase = phase
 	}
@@ -640,7 +644,7 @@ func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*Session, error
 // returns the raw reply to write back. Nil reply = no response (the
 // client sent a notification).
 func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
-	if s.MCPDispatcher == nil {
+	if s.currentDispatcher() == nil {
 		_ = WriteJSONLine(conn, map[string]any{
 			"jsonrpc": "2.0",
 			"error": map[string]any{
@@ -652,18 +656,18 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 		return
 	}
 
-	classifier, _ := s.MCPDispatcher.(MCPDispatchClassifier)
+	classifier, _ := s.currentDispatcher().(MCPDispatchClassifier)
 	hooks := &mcpConnectionHooks{
 		sessionID: sess.ID,
 		classify:  classifier,
 		onReady: func(write func([]byte) error) {
-			if hook, ok := s.MCPDispatcher.(SessionStartedHook); ok && hook != nil {
+			if hook, ok := s.currentDispatcher().(SessionStartedHook); ok && hook != nil {
 				hook.SessionStarted(sess, write)
 			}
 		},
 	}
 	serveMCPConnectionWithHooks(conn, reader, s.mcpToolCallTimeout(), func(ctx context.Context, line []byte) ([]byte, error) {
-		reply, err := DispatchMCPFrame(ctx, sess, line, s.MCPDispatcher)
+		reply, err := DispatchMCPFrame(ctx, sess, line, s.currentDispatcher())
 		if err != nil && s.Logger != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				outcome := "cancelled"
@@ -695,7 +699,7 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 // serveControl drains ControlRequest messages, invokes the Controller,
 // and writes paired ControlResponse messages.
 func (s *Server) serveControl(conn net.Conn, reader *bufio.Reader, sess *Session) {
-	if s.Controller == nil {
+	if controller, startup := s.currentController(); controller == nil && !startup {
 		_ = WriteJSONLine(conn, ControlResponse{
 			ErrorCode: ErrInternal,
 			ErrorMsg:  "daemon started without controller",
@@ -776,13 +780,45 @@ func (s *Server) handleControlBounded(sess *Session, req ControlRequest) Control
 }
 
 func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlRequest) ControlResponse {
+	controller, startup := s.currentController()
+	if controller == nil && startup {
+		if req.Kind == ControlShutdown {
+			return ControlResponse{OK: true}
+		}
+		return ControlResponse{ErrorCode: ErrRepoLoading, ErrorMsg: "store is opening or migrating; retry", Retryable: true}
+	}
 	switch req.Kind {
+	case ControlTrackPreflight:
+		// Separate from Track so an unsupported/older controller cannot
+		// accidentally register a root for a read-only ownership observation.
+		preflight, ok := s.Controller.(interface {
+			PreflightTrack(context.Context, TrackParams) error
+		})
+		if !ok {
+			return controlErr(ErrInternal, "track preflight is not supported")
+		}
+		var p TrackParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		if err := preflight.PreflightTrack(ctx, p); err != nil {
+			var collision *indexer.PrefixCollisionError
+			if errors.As(err, &collision) {
+				return controlErr(ErrPrefixCollision, err.Error())
+			}
+			if errors.Is(err, indexer.ErrRepoIdentityPending) {
+				return ControlResponse{ErrorCode: ErrRepoLoading, ErrorMsg: err.Error(), Retryable: true}
+			}
+			return controlErr(ErrInternal, err.Error())
+		}
+		return ControlResponse{OK: true}
+
 	case ControlTrack:
 		var p TrackParams
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.Track(ctx, p)
+		result, err := controller.Track(ctx, p)
 		if err != nil {
 			if errors.Is(err, indexer.ErrRepoIdentityPending) {
 				return ControlResponse{ErrorCode: ErrRepoLoading, ErrorMsg: err.Error(), Retryable: true}
@@ -800,28 +836,28 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.Untrack(ctx, p)
+		result, err := controller.Untrack(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
 		return ControlResponse{OK: true, Result: result}
 
 	case ControlProxy:
-		result, err := s.Controller.ReloadServers(ctx)
+		result, err := controller.ReloadServers(ctx)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
 		return ControlResponse{OK: true, Result: result}
 
 	case ControlReload:
-		result, err := s.Controller.Reload(ctx)
+		result, err := controller.Reload(ctx)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
 		return ControlResponse{OK: true, Result: result}
 
 	case ControlProbe:
-		pr, err := s.Controller.Probe(ctx)
+		pr, err := controller.Probe(ctx)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -840,12 +876,12 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 			// something else entirely, gets the routine counter-backed poll.
 			_ = json.Unmarshal(req.Params, &sp)
 		}
-		statusFn := s.Controller.Status
+		statusFn := controller.Status
 		if sp.Exact {
 			// Optional: a controller whose backend cannot recount simply does
 			// not implement this, and --exact degrades to the ordinary answer
 			// rather than failing.
-			if exact, ok := s.Controller.(StatusExactController); ok {
+			if exact, ok := controller.(StatusExactController); ok {
 				statusFn = exact.StatusExact
 			}
 		}
@@ -898,7 +934,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.SearchSymbols(ctx, p)
+		result, err := controller.SearchSymbols(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -909,7 +945,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		return ControlResponse{OK: true, Result: buf}
 
 	case ControlFileCoverage:
-		coverage, ok := s.Controller.(FileCoverageController)
+		coverage, ok := controller.(FileCoverageController)
 		if !ok {
 			return controlErr(ErrInternal, "this daemon cannot resolve a path to the view that serves it")
 		}
@@ -928,7 +964,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		return ControlResponse{OK: true, Result: buf}
 
 	case ControlDirCoverage:
-		coverage, ok := s.Controller.(DirCoverageController)
+		coverage, ok := controller.(DirCoverageController)
 		if !ok {
 			return controlErr(ErrInternal, "this daemon cannot resolve a path to the view that serves it")
 		}
@@ -948,7 +984,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 
 	case ControlShutdown:
 		resp := ControlResponse{OK: true}
-		if err := s.Controller.Shutdown(ctx); err != nil {
+		if err := controller.Shutdown(ctx); err != nil {
 			resp.Warnings = []string{err.Error()}
 		}
 		return resp
@@ -958,7 +994,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.EnrichChurn(ctx, p)
+		result, err := controller.EnrichChurn(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -973,7 +1009,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.EnrichReleases(ctx, p)
+		result, err := controller.EnrichReleases(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -988,7 +1024,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.EnrichBlame(ctx, p)
+		result, err := controller.EnrichBlame(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -1003,7 +1039,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.EnrichCoverage(ctx, p)
+		result, err := controller.EnrichCoverage(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -1018,7 +1054,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.EnrichCochange(ctx, p)
+		result, err := controller.EnrichCochange(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -1042,11 +1078,12 @@ func (s *Server) Shutdown() error {
 	}
 	// No producer callback runs under the once/admission mutex. Repeated
 	// callers cancel and join the same immutable writer lifetime.
-	if s.CancelShutdownOwners != nil {
-		s.CancelShutdownOwners()
+	cancelOwners, joinWriter := s.closeRuntimeAdmission()
+	if cancelOwners != nil {
+		cancelOwners()
 	}
-	if s.JoinRuntimeWriter != nil {
-		s.JoinRuntimeWriter()
+	if joinWriter != nil {
+		joinWriter()
 	}
 	ran := false
 	s.doneOnce.Do(func() {

@@ -1879,6 +1879,7 @@ func (w *Watcher) mutationAdmissionPath(ctx context.Context, filePath string) (s
 		return "", errWatcherStopped
 	default:
 	}
+	w.indexer.noteToolWrite(rel)
 	return absPath, nil
 }
 

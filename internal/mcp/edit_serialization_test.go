@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -370,4 +372,22 @@ func TestAtomicBatchSymbolEditFallsBackAfterPendingLineShift(t *testing.T) {
 	if string(got) != want {
 		t.Fatalf("stale-range fallback result:\n%s\nwant:\n%s", got, want)
 	}
+}
+
+func TestMutationFreshnessFieldsKeepActualFailureAndClearPreviousState(t *testing.T) {
+	resp := map[string]any{"reindex_error": "old failure", "reindex_pending": true, "reindex_receipt": "old", "syntax_health": "old"}
+	attachMutationFreshnessFields(resp, mutationReindexOutcome{Err: errors.New("current publication failure")})
+	require.Equal(t, "current publication failure", resp["reindex_error"])
+	require.Equal(t, mutationGraphFailed, resp["graph_status"])
+	require.NotContains(t, resp, "reindex_pending")
+	require.NotContains(t, resp, "reindex_receipt")
+	require.NotContains(t, resp, "syntax_health")
+	attachMutationFreshnessFields(resp, mutationReindexOutcome{Pending: true, Receipt: "current", Generation: 2})
+	require.NotContains(t, resp, "reindex_error")
+	require.Equal(t, true, resp["reindex_pending"])
+	require.Equal(t, "current", resp["reindex_receipt"])
+	attachMutationFreshnessFields(resp, mutationReindexOutcome{Reindexed: true, Generation: 2, AppliedGeneration: 2})
+	require.NotContains(t, resp, "reindex_error")
+	require.NotContains(t, resp, "reindex_pending")
+	require.Equal(t, mutationGraphFresh, resp["graph_status"])
 }

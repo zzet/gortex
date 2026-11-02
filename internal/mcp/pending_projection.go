@@ -68,15 +68,18 @@ type projectionEntry struct {
 	commitSeq  uint64
 	// hash equals the store's FileMetaRow.ContentHash once the store holds
 	// these bytes; rawHash covers the bytes on disk for the suspect re-check.
-	hash        string
-	rawHash     [32]byte
-	disk        diskStamp
-	language    string
-	layer       *graph.OverlayLayer
-	parseErrors int
-	buildTime   time.Duration
-	size        int64
-	tombstone   bool
+	hash          string
+	rawHash       [32]byte
+	contentSHA256 string
+	disk          diskStamp
+	language      string
+	layer         *graph.OverlayLayer
+	parseErrors   int
+	fileView      *fileViewEvidence
+	parseChecked  bool
+	buildTime     time.Duration
+	size          int64
+	tombstone     bool
 	// suspect is set by a watcher event for the path; the next lookup
 	// re-reads the file before serving the entry.
 	suspect atomic.Bool
@@ -125,6 +128,17 @@ func statDiskStamp(path string) (diskStamp, error) {
 	if err != nil {
 		return diskStamp{}, err
 	}
+	return freezeDiskStampIdentity(path, info)
+}
+
+func freezeDiskStampIdentity(path string, info os.FileInfo) (diskStamp, error) {
+	// Go's Windows Lstat may defer loading file IDs until SameFile. Freeze
+	// them while this stamp is taken, before a replacement can reuse the
+	// saved path. SameFile retains Lstat's no-follow semantics and performs
+	// no content open on Unix, including for FIFOs. Refuse an unknown ID.
+	if !os.SameFile(info, info) {
+		return diskStamp{}, &os.PathError{Op: "stat", Path: path, Err: errors.New("projection: file identity unavailable")}
+	}
 	return diskStamp{info: info}, nil
 }
 
@@ -158,20 +172,37 @@ func newProjectionEntry(absPath, repoPrefix string, projection *indexer.Projecti
 		layer.AddEdge(e)
 	}
 	return &projectionEntry{
-		key:         pathkey.MutationKey(absPath),
-		absPath:     absPath,
-		graphPath:   projection.GraphPath,
-		repoPrefix:  repoPrefix,
-		commitSeq:   commitSeq,
-		hash:        projection.ContentHash,
-		rawHash:     blake3.Sum256(raw),
-		disk:        disk,
-		language:    projection.Language,
-		layer:       layer,
-		parseErrors: projection.ParseErrors,
-		buildTime:   projection.BuildTime,
-		size:        int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes,
+		key:          pathkey.MutationKey(absPath),
+		absPath:      absPath,
+		graphPath:    projection.GraphPath,
+		repoPrefix:   repoPrefix,
+		commitSeq:    commitSeq,
+		hash:         projection.ContentHash,
+		rawHash:      blake3.Sum256(raw),
+		disk:         disk,
+		language:     projection.Language,
+		layer:        layer,
+		parseErrors:  projection.ParseErrors,
+		parseChecked: projection.ParseChecked,
+		buildTime:    projection.BuildTime,
+		size:         int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes,
 	}
+}
+
+// committedCopy gives each physical execution its own immutable entry.
+// The owned layer is immutable and may be shared; the suspect atomic and disk
+// identity must never be copied or rewritten on an already-published entry.
+func (e *projectionEntry) committedCopy(sequence uint64, disk diskStamp) *projectionEntry {
+	copy := &projectionEntry{
+		key: e.key, absPath: e.absPath, graphPath: e.graphPath, repoPrefix: e.repoPrefix,
+		commitSeq: sequence, hash: e.hash, rawHash: e.rawHash, contentSHA256: e.contentSHA256, disk: disk, language: e.language,
+		layer: e.layer, fileView: e.fileView, parseErrors: e.parseErrors, parseChecked: e.parseChecked,
+		buildTime: e.buildTime, size: e.size, tombstone: e.tombstone,
+	}
+	if e.suspect.Load() {
+		copy.suspect.Store(true)
+	}
+	return copy
 }
 
 // newProjectionTombstone is the entry for a file a tool removed: its layer
@@ -318,19 +349,40 @@ type projectionStore interface {
 	GetFileNodes(filePath string) []*graph.Node
 }
 
-// retire drops every entry whose bytes the store now holds, judged by content
-// alone: the store's content hash for the file equals the entry's, or, for a
-// tombstone, the store has no row for the file. A completed receipt is not
-// evidence, and a failed patch leaves the old hash, so its entry stays. The
-// store's nodes are compared with the entry's in between two hash reads, and
-// a mismatch the second read confirms is counted as divergence.
+// retirePaths verifies only the physical files in one publication frontier.
+// Filtering happens before store access: equal graph paths/prefixes/hashes in
+// another checkout are not evidence about that checkout's backend.
+func (p *pendingProjections) retirePaths(store projectionStore, absPaths []string) int {
+	if len(absPaths) == 0 {
+		return 0
+	}
+	selected := make(map[string]struct{}, len(absPaths))
+	for _, path := range absPaths {
+		selected[pathkey.MutationKey(path)] = struct{}{}
+	}
+	return p.retireSelected(store, selected)
+}
+
+// retire retains the explicit all-entry helper for tests/whole-owner callers.
+// Runtime publication callbacks use retirePaths with their physical frontier.
 func (p *pendingProjections) retire(store projectionStore) int {
+	return p.retireSelected(store, nil)
+}
+
+// A receipt alone is never retirement evidence. Both entry points preserve
+// durable hash -> node comparison -> durable hash and pointer-fenced COW drop.
+func (p *pendingProjections) retireSelected(store projectionStore, selected map[string]struct{}) int {
 	snap := p.snap.Load()
 	if len(snap.entries) == 0 {
 		return 0
 	}
 	byRepo := make(map[string][]*projectionEntry)
-	for _, e := range snap.entries {
+	for key, e := range snap.entries {
+		if selected != nil {
+			if _, ok := selected[key]; !ok {
+				continue
+			}
+		}
 		byRepo[e.repoPrefix] = append(byRepo[e.repoPrefix], e)
 	}
 	var caughtUp []*projectionEntry

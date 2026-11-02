@@ -537,6 +537,17 @@ func (s *Server) boundToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHan
 }
 
 func (s *Server) runAcknowledgedEdit(ctx context.Context, req mcp.CallToolRequest, h mcpserver.ToolHandlerFunc) (result *mcp.CallToolResult, err error) {
+	if s.editAckConfigErr != nil {
+		return mcp.NewToolResultError(s.editAckConfigErr.Error()), nil
+	}
+	if policy, captured := ctx.Value(sourceAckPolicyKey{}).(sourceAckPolicy); !captured || policy.owner != s {
+		policy = s.sourceAckPolicy(ctx)
+		policy.freshness = takeRequestFreshness(&req)
+		if policy.freshness.err != nil {
+			return mcp.NewToolResultError(policy.freshness.err.Error()), nil
+		}
+		ctx = context.WithValue(ctx, sourceAckPolicyKey{}, policy)
+	}
 	ctx, ack, owner := s.withEditAcknowledgement(ctx)
 	if owner {
 		defer func() { ack.finishReply(result, err) }()

@@ -19,6 +19,8 @@ type moveFileObservation struct {
 	operationID, sourceID, targetID, role string
 	moveSession, moveRequestKey           string
 	writeVerdict, directState             string
+	backgroundState                       string
+	backgroundWait                        bool
 	directClaimed                         bool
 	readClaimed                           bool
 	readState                             string
@@ -124,10 +126,86 @@ func linkedMovePhysicalLocked(ledger *mutationCommitLedger, s *Server, record *m
 	}
 	physical.mu.RLock()
 	defer physical.mu.RUnlock()
-	if ledger.byID[record.id] != record || ledger.byID[physical.id] != physical || record.owner != s || physical.owner != s || record.kind != moveFileObservationCommit || physical.kind != physicalMutationCommit || physical.moveTimingOwner.Value() != record || record.acknowledgement == nil || physical.acknowledgement != record.acknowledgement || physical.absPath != record.absPath || physical.disk != mutationDiskCommitted || physical.commitSeq == 0 || physical.commitSeq != record.commitSeq || physical.newSHA == "" || physical.newSHA != record.newSHA || !physical.committedAt.Equal(record.committedAt) || !physical.diskWriteStartedAt.Equal(record.diskWriteStartedAt) {
+	if ledger.byID[record.id] != record || ledger.byID[physical.id] != physical || record.owner != s || physical.owner != s || record.kind != moveFileObservationCommit || physical.kind != physicalMutationCommit || physical.moveTimingOwner.Value() != record || record.acknowledgement == nil || physical.acknowledgement != record.acknowledgement || physical.absPath != record.absPath || physical.checkoutID != record.checkoutID || physical.checkoutIncarnation != record.checkoutIncarnation || physical.disk != mutationDiskCommitted || physical.commitSeq == 0 || physical.commitSeq != record.commitSeq || physical.newSHA == "" || physical.newSHA != record.newSHA || !physical.committedAt.Equal(record.committedAt) || !physical.diskWriteStartedAt.Equal(record.diskWriteStartedAt) {
 		return nil
 	}
 	return physical
+}
+
+// A status witness adds no authority: it only authenticates the existing weak
+// physical child across rendering, which refreshes and reacquires the ledger.
+type movePhysicalStatusWitness struct {
+	ack                               *editAcknowledgement
+	path, blob, checkout, incarnation string
+	sequence                          uint64
+	committed, writeStarted           time.Time
+}
+
+// Caller holds ledger then timing record. Keep the existing newest-owner and
+// actual-write fences; never search past an unrelated newer same-path owner.
+func movePhysicalStatusLocked(ledger *mutationCommitLedger, s *Server, record *mutationCommitRecord) *mutationCommitRecord {
+	physical := linkedMovePhysicalLocked(ledger, s, record)
+	if physical == nil {
+		return nil
+	}
+	firstPath := true
+	for i := len(ledger.ordered) - 1; i >= 0; i-- {
+		candidate := ledger.ordered[i]
+		if candidate == physical || (!candidate.isPublicationOwner() && candidate.kind != moveFileObservationCommit) || candidate.absPath != record.absPath {
+			continue
+		}
+		if firstPath {
+			firstPath = false
+			if candidate != record {
+				return nil
+			}
+		}
+		if candidate == record {
+			continue
+		}
+		candidate.mu.RLock()
+		competing := candidate.disk == mutationDiskCommitted && candidate.commitSeq > record.commitSeq ||
+			candidate.disk == mutationDiskInFlight && !candidate.diskWriteStartedAt.IsZero()
+		candidate.mu.RUnlock()
+		if competing {
+			return nil
+		}
+	}
+	return physical
+}
+
+func (s *Server) movePhysicalStatusChild(record *mutationCommitRecord, checkout, incarnation string, render func(*mutationCommitRecord) map[string]any) map[string]any {
+	ledger := &s.mutationCommits
+	ledger.mu.Lock()
+	record.mu.RLock()
+	physical := movePhysicalStatusLocked(ledger, s, record)
+	if physical == nil || !mutationCheckoutScopeMatches(checkout, incarnation, record.checkoutID, record.checkoutIncarnation) {
+		record.mu.RUnlock()
+		ledger.mu.Unlock()
+		return nil
+	}
+	witness := movePhysicalStatusWitness{ack: record.acknowledgement, path: record.absPath, blob: record.newSHA,
+		checkout: record.checkoutID, incarnation: record.checkoutIncarnation, sequence: record.commitSeq,
+		committed: record.committedAt, writeStarted: record.diskWriteStartedAt}
+	record.mu.RUnlock()
+	ledger.mu.Unlock()
+
+	// This refresh may itself take ledger/record locks. No timing/ledger lock
+	// crosses it, and no P/B/graph fact is borrowed from the shared RPC clock.
+	child := render(physical)
+
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	record.mu.RLock()
+	defer record.mu.RUnlock()
+	if movePhysicalStatusLocked(ledger, s, record) != physical || record.acknowledgement != witness.ack ||
+		record.absPath != witness.path || record.newSHA != witness.blob || record.commitSeq != witness.sequence ||
+		record.checkoutID != witness.checkout || record.checkoutIncarnation != witness.incarnation ||
+		!record.committedAt.Equal(witness.committed) || !record.diskWriteStartedAt.Equal(witness.writeStarted) ||
+		!mutationCheckoutScopeMatches(checkout, incarnation, record.checkoutID, record.checkoutIncarnation) {
+		return nil
+	}
+	return child
 }
 
 func (o *moveObservation) finishWrites(success bool) {
@@ -422,11 +500,50 @@ func (o *moveObservation) noteDirectUnavailable(path, reason string) {
 	}
 }
 
+// Admission labels describe the route actually taken. They never manufacture
+// a direct publication interval or confer physical/freshness authority.
+func (o *moveObservation) observeAdmission(path string, admission *sourceMutationAdmission) {
+	if o == nil {
+		return
+	}
+	if admission.inlinePath != "" {
+		if admission.checkout == nil {
+			admission.move = o
+		} else {
+			o.noteDirectUnavailable(path, "unavailable_checkout_refresh_observer")
+		}
+		return
+	}
+	state := "not_observed"
+	if admission.receipt != nil || admission.immediate.Receipt != "" {
+		state = "admitted"
+	} else if admission.immediate.Err != nil {
+		state = "admission_failed"
+	}
+	record := o.records[path]
+	if record == nil {
+		return
+	}
+	ledger := &o.server.mutationCommits
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if ledger.byID[record.id] != record || record.moveFile == nil {
+		return
+	}
+	data := record.moveFile
+	data.backgroundState = state
+	data.backgroundWait = admission.receipt != nil && !admission.policy.local()
+	data.directClaimed, data.readClaimed = true, true
+	data.directState, data.readState = "unavailable_queued_publication", "unavailable_queued_publication"
+}
+
 func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map[string]any, bool) {
 	if !strings.HasPrefix(id, "move-file-") {
 		return nil, false
 	}
-	payload := map[string]any{"found": false, "receipt": id, "receipt_kind": "move_file_observation", "guidance": "observation only; source_id/target_id/touched and real write outcomes remain the move authority"}
+	payload := map[string]any{"found": false, "receipt": id, "receipt_kind": "move_file_observation", "guidance": "observation only; source_id/target_id/touched and real write outcomes remain the move authority", "physical_commit_state": "unavailable"}
 	checkout, incarnation := mutationCheckoutScope(ctx)
 	var ack *editAcknowledgement
 	var direct, readAssisted *moveDirectObservation
@@ -442,10 +559,21 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 			payload["direct_reconcile_state"], payload["requested_background_state"] = data.directState, "not_applicable_direct_reconcile"
 			payload["read_assisted_reconcile_state"] = data.readState
 			payload["move_request_cause"] = map[string]string{"session": data.moveSession, "request_id_key": data.moveRequestKey}
-			// This handler calls the existing synchronous reconcile, never queue
-			// admission/wait. Preserve raw ACK nulls/counts and name applicability
-			// explicitly instead of manufacturing measured zero scheduler work.
-			payload["acknowledgement_phase_applicability"] = map[string]string{"publish": "not_applicable_direct_reconcile", "reindex_wait": "not_applicable_direct_reconcile"}
+			applicability := map[string]string{"publish": "not_applicable_direct_reconcile", "reindex_wait": "not_applicable_direct_reconcile"}
+			if data.backgroundState != "" {
+				payload["requested_background_state"] = data.backgroundState
+				applicability["publish"], applicability["reindex_wait"] = "not_observed", "not_observed"
+				if data.backgroundState == "admitted" || data.backgroundState == "admission_failed" {
+					applicability["publish"] = "applicable"
+				}
+				if data.backgroundState == "admitted" {
+					applicability["reindex_wait"] = "not_applicable_fast_ack"
+					if data.backgroundWait {
+						applicability["reindex_wait"] = "applicable"
+					}
+				}
+			}
+			payload["acknowledgement_phase_applicability"] = applicability
 			timing := map[string]any{"scope": "move_file_write", "clock": "monotonic", "state": "not_observed", "outcome": record.disk}
 			if !record.diskWriteStartedAt.IsZero() && !record.committedAt.IsZero() {
 				timing["state"] = "invalid_order"
@@ -482,6 +610,14 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 		snapshot = &copy
 	}
 	payload["acknowledgement"] = buildAcknowledgementPayload(snapshot, "unavailable_ledger_entry_or_scope")
+	if payload["found"] == true && record != nil {
+		if child := s.movePhysicalStatusChild(record, checkout, incarnation, s.mutationStatusPayload); child != nil {
+			payload["physical_commit"] = child
+			payload["physical_commit_state"] = "observed"
+			payload["physical_commit_shared_acknowledgement"] = true
+			payload["physical_commit_additive_with_acknowledgement"] = false
+		}
+	}
 	return payload, true
 }
 

@@ -19,6 +19,7 @@ type phaseMonitor struct {
 	clientBefore map[string]Metric
 	groupBefore  map[string]Metric
 	peaks        map[string]Metric
+	walSamples   []float64 // every WAL size a sample found, for the p95
 	cancel       context.CancelFunc
 	done         sync.WaitGroup
 }
@@ -55,6 +56,9 @@ func (m *phaseMonitor) observe() {
 			values[key] = measured(float64(info.Size()), "bytes")
 		}
 	}
+	if wal := values["wal_bytes"]; wal.Value != nil {
+		m.walSamples = append(m.walSamples, *wal.Value)
+	}
 	for _, key := range []string{"rss_bytes", "pss_bytes", "rss_anon_bytes", "phys_footprint_bytes", "wal_bytes", "store_bytes"} {
 		value := values[key]
 		old, exists := m.peaks[key]
@@ -80,6 +84,9 @@ func (m *phaseMonitor) finish(phase *Phase) {
 	for key, value := range m.peaks {
 		phase.Metrics["peak_"+key] = value
 	}
+	// One reclaim-sized burst sets the peak; the p95 says where the WAL
+	// spent the phase.
+	phase.Metrics["p95_wal_bytes"] = distribution(m.walSamples, "bytes").P95
 	successes := 0
 	for _, row := range phase.Attempts {
 		if row.Role == "workload" && row.Outcome == "success" {

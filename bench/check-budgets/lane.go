@@ -41,31 +41,37 @@ type laneBuild struct {
 }
 
 type laneConfig struct {
-	Version          int                  `json:"schema_version"`
-	Lane             string               `json:"lane"`
-	HostClass        string               `json:"host_class"`
-	Machine          string               `json:"machine"`
-	Load             string               `json:"load_binary"`
-	Manifest         string               `json:"manifest"`
-	MainArtifact     string               `json:"main_artifact,omitempty"`
-	Builds           map[string]laneBuild `json:"builds"`
-	Repeats          int                  `json:"repeats"`
-	Duration         string               `json:"duration"`
-	Deadline         string               `json:"deadline"`
-	WarmTimeout      string               `json:"warm_timeout"`
-	StopTimeout      string               `json:"stop_timeout"`
-	SweepDuration    string               `json:"sweep_duration"`
-	SweepRepetitions int                  `json:"sweep_repetitions"`
-	PRSmokeDrain     string               `json:"pr_smoke_drain,omitempty"`
-	started          time.Time
+	EditGateSeed      string               `json:"edit_gate_seed,omitempty"`
+	Version           int                  `json:"schema_version"`
+	Lane              string               `json:"lane"`
+	HostClass         string               `json:"host_class"`
+	Machine           string               `json:"machine"`
+	Load              string               `json:"load_binary"`
+	Manifest          string               `json:"manifest"`
+	LargeFileManifest string               `json:"large_file_manifest,omitempty"`
+	MainArtifact      string               `json:"main_artifact,omitempty"`
+	Builds            map[string]laneBuild `json:"builds"`
+	Repeats           int                  `json:"repeats"`
+	Duration          string               `json:"duration"`
+	Deadline          string               `json:"deadline"`
+	WarmTimeout       string               `json:"warm_timeout"`
+	StopTimeout       string               `json:"stop_timeout"`
+	SweepDuration     string               `json:"sweep_duration"`
+	SweepRepetitions  int                  `json:"sweep_repetitions"`
+	PRSmokeDrain      string               `json:"pr_smoke_drain,omitempty"`
+	started           time.Time
 }
 
 type laneTask struct {
-	Scenario    string `json:"scenario"`
-	Role        string `json:"role"`
-	Repeat      int    `json:"repeat"`
-	Seed        int64  `json:"seed"`
-	Unavailable string `json:"unavailable,omitempty"`
+	EditGateSeed string   `json:"edit_gate_seed,omitempty"`
+	EditGate     bool     `json:"edit_gate,omitempty"`
+	EditCount    int      `json:"edit_count,omitempty"`
+	ProbeModes   []string `json:"probe_modes,omitempty"`
+	Scenario     string   `json:"scenario"`
+	Role         string   `json:"role"`
+	Repeat       int      `json:"repeat"`
+	Seed         int64    `json:"seed"`
+	Unavailable  string   `json:"unavailable,omitempty"`
 }
 
 type lanePlan struct {
@@ -99,7 +105,7 @@ type laneReceipt struct {
 	Smoke       *smokeProvenance   `json:"smoke_provenance,omitempty"`
 }
 
-func readLaneConfig(path string) (laneConfig, error) {
+func readLaneConfig(path string, editGate ...bool) (laneConfig, error) {
 	var c laneConfig
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -112,6 +118,9 @@ func readLaneConfig(path string) (laneConfig, error) {
 	}
 	if d.Decode(new(any)) != io.EOF {
 		return c, errors.New("lane config must contain exactly one JSON document")
+	}
+	if c.EditGateSeed != "" && (len(editGate) == 0 || !editGate[0] || c.Lane != "smoke" || c.EditGateSeed != "ack-wait" && c.EditGateSeed != "closed-read-gate") {
+		return c, errors.New("edit_gate_seed requires the explicit edit smoke collector and ack-wait or closed-read-gate")
 	}
 	if c.Version != 1 || !slices.Contains([]string{"smoke", "nightly", "release"}, c.Lane) || c.Repeats < 3 || c.Repeats > 100 || c.Machine == "" && c.HostClass != hostedSmokeClass {
 		return c, errors.New("lane config needs schema1, smoke/nightly/release, 3–100 repeats and reviewed machine binding")
@@ -159,10 +168,13 @@ func readLaneConfig(path string) (laneConfig, error) {
 		return filepath.Join(base, value)
 	}
 	c.Load, c.Manifest = resolve(c.Load), resolve(c.Manifest)
+	if c.LargeFileManifest != "" {
+		c.LargeFileManifest = resolve(c.LargeFileManifest)
+	}
 	if c.MainArtifact != "" {
 		c.MainArtifact = resolve(c.MainArtifact)
 	}
-	if c.Lane == "smoke" && c.MainArtifact == "" {
+	if c.Lane == "smoke" && c.MainArtifact == "" && (len(editGate) == 0 || !editGate[0]) {
 		return c, errors.New("smoke requires the verified exact-main artifact bundle")
 	}
 	for role, build := range c.Builds {
@@ -240,6 +252,8 @@ func policyDigest(p policy) string {
 }
 
 func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
+	editGate := strings.HasPrefix(command, "edit-")
+	command = strings.TrimPrefix(command, "edit-")
 	f := flag.NewFlagSet(command, flag.ContinueOnError)
 	f.SetOutput(stderr)
 	config := f.String("config", "", "strict pinned lane config")
@@ -270,7 +284,7 @@ func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
 	c := laneConfig{Lane: *lane, HostClass: *host, Repeats: 3}
 	var err error
 	if *config != "" {
-		c, err = readLaneConfig(*config)
+		c, err = readLaneConfig(*config, editGate)
 	} else if !slices.Contains([]string{"smoke", "nightly", "release"}, *lane) {
 		err = errors.New("unknown lane")
 	}
@@ -328,7 +342,12 @@ func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	plan, err := makeLanePlan(p, c)
+	var plan lanePlan
+	if editGate {
+		plan, err = makeEditLoopLanePlan(p, c)
+	} else {
+		plan, err = makeLanePlan(p, c)
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -391,7 +410,11 @@ func writeNewJSON(path string, value any) error {
 }
 
 func taskManifest(c laneConfig, task laneTask, root string) (string, error) {
-	data, err := os.ReadFile(c.Manifest)
+	manifest := c.Manifest
+	if task.EditGate && task.Scenario == "loadedit-4-largefile" {
+		manifest = c.LargeFileManifest
+	}
+	data, err := os.ReadFile(manifest)
 	if err != nil {
 		return "", err
 	}
@@ -400,6 +423,9 @@ func taskManifest(c laneConfig, task laneTask, root string) (string, error) {
 		return "", err
 	}
 	spec := scenarioSpecs[task.Scenario]
+	if task.EditGate && task.Scenario == "loadedit-4-largefile" {
+		spec.editors, spec.repos = 4, 1
+	}
 	if len(corpora) < spec.repos {
 		return "", fmt.Errorf("%s needs %d pinned corpora", task.Scenario, spec.repos)
 	}
@@ -429,12 +455,24 @@ func taskManifest(c laneConfig, task laneTask, root string) (string, error) {
 
 func taskArgs(c laneConfig, task laneTask, manifest, scratch, report string) []string {
 	spec := scenarioSpecs[task.Scenario]
+	if task.EditGate {
+		spec.wire, spec.agents = "edit-and-probe", 0
+		if task.Scenario == "loadedit-4-largefile" {
+			spec.editors, spec.repos = 4, 1
+		}
+	}
 	host := "native"
 	if c.HostClass == "reference_linux" {
 		host = "reference"
 	}
 	build := c.Builds[task.Role]
 	args := []string{"run", "--binary", build.Binary, "--git-sha", build.Revision, "--manifest", manifest, "--scratch", scratch, "--out", report, "--host", host, "--profile", "agent", "--scenario", spec.wire, "--agents", fmt.Sprint(spec.agents), "--edit-agents", fmt.Sprint(spec.editors), "--worktrees", fmt.Sprint(spec.worktrees), "--seed", fmt.Sprint(task.Seed), "--duration", c.Duration, "--deadline", c.Deadline, "--warm-timeout", c.WarmTimeout, "--stop-timeout", c.StopTimeout, "--sweep-repetitions", fmt.Sprint(c.SweepRepetitions), "--sweep-duration", c.SweepDuration}
+	if task.EditGate {
+		args = append(args, "--edit-gate-modes", "--edit-count", "100", "--edit-repos", fmt.Sprint(spec.repos))
+	}
+	if task.EditGate && task.EditGateSeed != "" {
+		args = append(args, "--edit-gate-seed", task.EditGateSeed)
+	}
 	if c.Lane == "smoke" && spec.wire == "read" && c.PRSmokeDrain != "" {
 		args = append(args, "--pr-smoke-drain", c.PRSmokeDrain)
 	}
@@ -463,7 +501,7 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 	if server, repo, id := os.Getenv("GITHUB_SERVER_URL"), os.Getenv("GITHUB_REPOSITORY"), os.Getenv("GITHUB_RUN_ID"); server != "" && repo != "" && id != "" {
 		receipt.Workflow.RunURL = server + "/" + repo + "/actions/runs/" + id
 	}
-	if c.Lane == "smoke" {
+	if c.Lane == "smoke" && plan.Execution != "edit-loop" {
 		proof, err := prepareSmokeProvenance(c, receipt.Workflow)
 		if err != nil {
 			receipt.Error = err.Error()
@@ -510,7 +548,18 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 			var log *os.File
 			log, err = os.OpenFile(filepath.Join(root, "client.log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 			if err == nil {
-				err = runProcess(ctx, c.Load, taskArgs(c, task, manifest, filepath.Join(root, "state"), reportPath), log)
+				taskCtx := ctx
+				cancel := func() {}
+				if task.EditGate && c.Lane == "smoke" {
+					// Interrupt the signal-aware client at 13m, preserving its
+					// independent <=2m owned cleanup inside the 15m per-run cap.
+					taskCtx, cancel = context.WithDeadline(ctx, tr.Started.Add(13*time.Minute))
+				}
+				err = runProcess(taskCtx, c.Load, taskArgs(c, task, manifest, filepath.Join(root, "state"), reportPath), log)
+				cancel()
+				if task.EditGate && c.Lane == "smoke" && time.Since(tr.Started) > 15*time.Minute {
+					err = errors.Join(err, errors.New("edit smoke run exceeded 15 minutes including startup and cleanup"))
+				}
 				err = errors.Join(err, log.Close())
 			}
 		}
@@ -522,6 +571,9 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 		}
 		tr.Finished = time.Now().UTC()
 		receipt.Tasks = append(receipt.Tasks, tr)
+	}
+	if plan.Execution == "edit-loop" {
+		return finishEditLoopLaneEvidence(c, p, plan, out, stdout, receipt, index, failures)
 	}
 	return finishLaneEvidence(c, p, plan, out, stdout, receipt, index, failures)
 }

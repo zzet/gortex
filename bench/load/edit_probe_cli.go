@@ -33,14 +33,18 @@ func (b *editProbeCappedBuffer) Write(data []byte) (int, error) {
 // The edit ACK, readbacks and receipt status stay MCP JSON; only oracle
 // requests go through the CLI, with the same lowered facade arguments.
 func (r *editProbeRuntime) performCLI(ctx context.Context, s *editProbeState, req request, purpose string, stream int) (json.RawMessage, wireCallIdentity, error) {
-	budget := min(r.options.Deadline, 20*time.Second)
-	callCtx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
-	args, err := json.Marshal(dispatchArgs(req, r.p.Repos[0]))
+	repo, err := r.repoFor(s.step)
 	if err != nil {
 		return nil, wireCallIdentity{}, err
 	}
-	argv := []string{"--config", r.p.Config, "call", req.Tool, "--json", string(args), "--format", "json", "--index", r.p.Repos[0].Path, "--quiet"}
+	budget := min(r.options.Deadline, 20*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	args, err := json.Marshal(dispatchArgs(req, repo))
+	if err != nil {
+		return nil, wireCallIdentity{}, err
+	}
+	argv := []string{"--config", r.p.Config, "call", req.Tool, "--json", string(args), "--format", "json", "--index", repo.Path, "--quiet"}
 	cmd := exec.CommandContext(callCtx, r.p.Binary, argv...)
 	configureOwnedProcess(cmd)
 	cmd.Cancel = func() error { return killOwnedProcess(cmd) }

@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // registerSafeDeleteSymbolTool wires safe_delete_symbol — atomic
@@ -118,7 +120,21 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	for _, site := range provisional {
 		refs = append(refs, safeDeleteReference{Kind: "provisional", FilePath: site.File, Line: site.Line})
 	}
+	var finishWrites func()
+	var primaryAbs string
+	var primaryCommit *mutationCommitRecord
+	var primaryOutcome mutationReindexOutcome
 	respond := func(result map[string]any) (*mcp.CallToolResult, error) {
+		if finishWrites != nil {
+			finishWrites()
+		}
+		if primaryCommit != nil {
+			if primaryOutcome.Err != nil {
+				result["reindex_error"] = primaryOutcome.Err.Error()
+			}
+			s.attachMutationFreshness(result, node.FilePath, primaryAbs, primaryOutcome)
+			attachMutationCommit(result, primaryCommit)
+		}
 		label := s.labelRelations(ctx, gaps, []string{id}, nil)
 		label.apply(result)
 		res, err := s.respondJSONOrTOON(ctx, req, result)
@@ -129,8 +145,14 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 	// refusing. Builds a per-caller plan, applies the removable standalone
 	// calls (parse-gate validated), and flags embedded references as manual.
 	var appliedPatches, failedPatches []callerPatch
+	var propagationPlan []callerPatch
 	if req.GetBool("propagate", false) && len(refs) > 0 {
-		plan := s.buildPropagationPlan(ctx, g, node)
+		var plan []callerPatch
+		if dryRun {
+			plan = s.buildPropagationPreview(ctx, g, node)
+		} else {
+			plan = s.buildPropagationPlan(ctx, g, node)
+		}
 		for _, site := range provisional {
 			reason := "provisional: named in a file whose edit the graph has not read yet — patch by hand"
 			if site.Line == 0 {
@@ -142,16 +164,25 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		}
 		manual := countManual(plan)
 		if dryRun {
+			needsRevalidation := false
+			for _, patch := range plan {
+				needsRevalidation = needsRevalidation || patch.NeedsSourceRevalidation
+			}
+			hint := "re-run with dry_run=false to apply the verified remove_line patches and delete the symbol; resolve manual patches first or pass force=true"
+			if needsRevalidation {
+				hint = "this is a source preview, not write authorization: publish or revalidate the changed source and scoped references before requesting apply"
+			}
 			return respond(map[string]any{
-				"status":          "propagation_plan",
-				"symbol":          id,
-				"file":            node.FilePath,
-				"caller_patches":  plan,
-				"removable":       len(plan) - manual,
-				"manual":          manual,
-				"reference_count": len(refs),
-				"dry_run":         true,
-				"hint":            "re-run with dry_run=false to apply the remove_line patches and delete the symbol; resolve manual patches first or pass force=true",
+				"status":                       "propagation_plan",
+				"source_revalidation_required": needsRevalidation,
+				"symbol":                       id,
+				"file":                         node.FilePath,
+				"caller_patches":               plan,
+				"removable":                    len(plan) - manual,
+				"manual":                       manual,
+				"reference_count":              len(refs),
+				"dry_run":                      true,
+				"hint":                         hint,
 			})
 		}
 		if manual > 0 && !force {
@@ -163,38 +194,10 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 				"hint":           fmt.Sprintf("%d call site(s) need manual patching; resolve them or pass force=true to delete anyway", manual),
 			})
 		}
-		applied, failed, perr := s.applyRemoveLinePatches(ctx, plan)
-		if perr != nil {
-			return mcp.NewToolResultError(perr.Error()), nil
-		}
-		appliedPatches, failedPatches = applied, failed
-		if len(failed) > 0 && !force {
-			return respond(map[string]any{
-				"status":          "propagation_partial",
-				"symbol":          id,
-				"patches_applied": applied,
-				"patches_failed":  failed,
-				"hint":            "some removals were refused (reason line_changed or line_out_of_range: the line no longer holds the planned call, re-run the plan; parse_errors: removing it would break the file's syntax); patch them by hand or pass force=true to delete the symbol anyway",
-			})
-		}
-		// Callers patched — proceed with the deletion. Re-fetch the node in
-		// case a same-file removal shifted its line range.
-		force = true
-		node = g.GetNode(id)
-		if node == nil {
-			return respond(map[string]any{
-				"status":          "deleted_by_propagation",
-				"symbol":          id,
-				"patches_applied": appliedPatches,
-				"note":            "the symbol's definition was removed as a side effect of patching (it no longer resolves in the graph)",
-			})
-		}
-		if node.StartLine == 0 || node.EndLine == 0 {
-			return mcp.NewToolResultError("symbol has no line range after propagation: " + id), nil
-		}
+		propagationPlan = plan
 	}
 
-	if len(refs) > 0 && !force {
+	if len(refs) > 0 && !force && len(propagationPlan) == 0 {
 		return respond(map[string]any{
 			"status":             "rejected_has_references",
 			"symbol":             id,
@@ -343,15 +346,104 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		}
 	}
 
-	deletedIDs, err := s.applyPendingDeletes(ctx, pending)
+	// One final union lock covers every source effect. A wait behind another
+	// writer cannot silently reuse the old reference/closure/patch authority.
+	paths := make([]string, 0, len(pending)+len(propagationPlan))
+	for _, item := range pending {
+		paths = append(paths, item.abs)
+	}
+	for _, patch := range propagationPlan {
+		if patch.Action == "remove_line" {
+			paths = append(paths, patch.abs)
+		}
+	}
+	ctx, releasePaths, lockErr := acquireMutationPaths(ctx, paths)
+	if lockErr != nil {
+		return mcp.NewToolResultError("lock delete frontier: " + lockErr.Error()), nil
+	}
+	defer releasePaths()
+	primaryAbs = absPath
+	primaryKey := pathkey.MutationKey(absPath)
+	var writes []committedSourceMutation
+	finished := false
+	finishWrites = func() {
+		if finished {
+			return
+		}
+		finished = true
+		final, outcomes := s.completeCommittedSourceMutations(ctx, writes, releasePaths)
+		for i, write := range final {
+			if write.target.key == primaryKey {
+				primaryCommit, primaryOutcome = write.record, outcomes[i]
+			}
+		}
+	}
+	defer finishWrites()
+	currentNode := g.GetNode(id)
+	if currentNode == nil || currentNode.FilePath != node.FilePath {
+		return respond(map[string]any{"status": "source_authority_changed", "symbol": id, "written": false, "hint": "the selected declaration changed while acquiring the complete source frontier; request a new plan"})
+	}
+	currentGaps := s.laggingMutationReceipts(ctx)
+	currentProvisional := s.provisionalSites(g, currentGaps, currentNode)
+	currentRefs := collectReferencingEdges(g, id)
+	for _, site := range currentProvisional {
+		currentRefs = append(currentRefs, safeDeleteReference{Kind: "provisional", FilePath: site.File, Line: site.Line})
+	}
+	if !sameSafeDeleteReferences(refs, currentRefs) || !reflect.DeepEqual(provisional, currentProvisional) {
+		return respond(map[string]any{"status": "source_authority_changed", "symbol": id, "written": false, "hint": "references or unpublished source changed while acquiring the complete source frontier; request a new plan"})
+	}
+	if cascadeMode != cascadeModeOff {
+		currentClosure, truncated := computeCascadeClosure(g, currentNode, cascadeIntoTests)
+		if truncated != cascadeTruncated || !reflect.DeepEqual(closure, currentClosure) {
+			return respond(map[string]any{"status": "source_authority_changed", "symbol": id, "written": false, "hint": "cascade membership changed while acquiring the complete source frontier; request a new plan"})
+		}
+		for _, member := range pending[1:] {
+			if len(s.provisionalSites(g, currentGaps, member.node)) > 0 {
+				return respond(map[string]any{"status": "rejected_has_references", "symbol": id, "written": false, "hint": "a cascade member gained an unpublished reference; publish it and request a new plan"})
+			}
+		}
+	}
+	if len(propagationPlan) > 0 {
+		// Original provisional rows stay manual. Compare exact graph-derived
+		// occurrences and accepted source identities before the first write.
+		currentPlan := s.buildPropagationPlan(ctx, g, currentNode)
+		var originalGraphPlan []callerPatch
+		for _, patch := range propagationPlan {
+			if patch.kind != "" {
+				originalGraphPlan = append(originalGraphPlan, patch)
+			}
+		}
+		if !reflect.DeepEqual(originalGraphPlan, currentPlan) {
+			return respond(map[string]any{"status": "source_authority_changed", "symbol": id, "written": false, "hint": "caller occurrences or accepted bytes changed while acquiring the complete source frontier; request a new plan"})
+		}
+		var callerWrites []committedSourceMutation
+		var propagationErr error
+		appliedPatches, failedPatches, callerWrites, propagationErr = s.applyRemoveLinePatchesHeld(ctx, propagationPlan)
+		writes = append(writes, callerWrites...)
+		if propagationErr != nil || len(failedPatches) > 0 && !force {
+			partial := map[string]any{"status": "propagation_partial", "symbol": id, "patches_applied": appliedPatches, "patches_failed": failedPatches, "hint": "some source patches committed but the complete removal did not finish; inspect these exact effects before retrying"}
+			if propagationErr != nil {
+				partial["error"] = propagationErr.Error()
+			}
+			return respond(partial)
+		}
+		refs = referencesAfterCommittedPatches(refs, appliedPatches, id)
+		if len(refs) > 0 && !force {
+			return respond(map[string]any{"status": "rejected_has_references", "symbol": id, "references": refs, "reference_count": len(refs), "patches_applied": appliedPatches, "patches_failed": failedPatches, "hint": "unplanned or unverified references remain; patch them or explicitly request force"})
+		}
+		result["references"], result["reference_count"] = refs, len(refs)
+	}
+	deletedIDs, definitionWrites, err := s.applyPendingDeletesHeld(ctx, pending)
+	writes = append(writes, definitionWrites...)
 	if err != nil {
-		if len(deletedIDs) == 0 {
+		if len(deletedIDs) == 0 && len(appliedPatches) == 0 {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		// Surface only source effects whose physical commit succeeded.
 		result["status"] = "partial_failure"
 		result["cascade_deleted"] = deletedIDs
 		result["error"] = err.Error()
+		result["patches_applied"], result["patches_failed"] = appliedPatches, failedPatches
 		return respond(result)
 	}
 
@@ -361,17 +453,12 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 
 	// Persist session state and re-index every touched file.
 	sess := s.sessionFor(ctx)
-	touchedFiles := make(map[string]struct{}, len(pending))
 	for _, p := range pending {
 		sess.recordModified(p.node.FilePath)
 		sess.recordSymbol(p.node.ID)
 		if s.symHistory != nil {
 			s.symHistory.Record(p.node.ID, true)
 		}
-		touchedFiles[p.abs] = struct{}{}
-	}
-	for abs := range touchedFiles {
-		s.reindexFile(abs)
 	}
 
 	result["status"] = "deleted"
@@ -418,7 +505,7 @@ type pendingDelete struct {
 // rewritten once. Returns the IDs of symbols whose bytes were
 // removed; on first error, the partial list rides alongside the
 // error.
-func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDelete) ([]string, error) {
+func (s *Server) applyPendingDeletesHeld(ctx context.Context, pending []*pendingDelete) ([]string, []committedSourceMutation, error) {
 	byFile := map[string][]*pendingDelete{}
 	order := []string{}
 	for _, p := range pending {
@@ -427,32 +514,25 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 		}
 		byFile[p.abs] = append(byFile[p.abs], p)
 	}
-	// The complete delete set is admitted before any file is read or written.
-	// Propagated caller locks have their own lifetime and cannot authorize the
-	// later definition delete (or another member of a cascade).
-	ctx, release, err := acquireMutationPaths(ctx, order)
-	if err != nil {
-		return nil, fmt.Errorf("lock delete files: %w", err)
-	}
-	defer release()
 
 	deleted := make([]string, 0, len(pending))
+	var writes []committedSourceMutation
 	for _, abs := range order {
 		bucket := byFile[abs]
 		content, err := os.ReadFile(abs)
 		if err != nil {
-			return deleted, fmt.Errorf("could not read %s: %v", abs, err)
+			return deleted, writes, fmt.Errorf("could not read %s: %v", abs, err)
 		}
 		// Refuse UTF-16 sources before splicing raw bytes (#846) — this is
 		// the shared delete writer, so cascade targets are covered too.
 		if indexer.LooksUTF16Source(content) {
-			return deleted, refuseUTF16Edit("safe_delete_symbol", abs)
+			return deleted, writes, refuseUTF16Edit("safe_delete_symbol", abs)
 		}
 		lines := strings.Split(string(content), "\n")
 		for _, p := range bucket {
 			start, end, err := s.symbolLinesUnderLock(ctx, p.node, abs, content)
 			if err != nil {
-				return deleted, err
+				return deleted, writes, err
 			}
 			resolved := *p.node
 			resolved.StartLine, resolved.EndLine = start, end
@@ -472,7 +552,7 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 		// failure surface clean.
 		for i := 0; i < len(bucket)-1; i++ {
 			if bucket[i].start <= bucket[i+1].end {
-				return deleted, fmt.Errorf("overlapping delete ranges in %s for %s and %s",
+				return deleted, writes, fmt.Errorf("overlapping delete ranges in %s for %s and %s",
 					abs, bucket[i].node.ID, bucket[i+1].node.ID)
 			}
 		}
@@ -500,14 +580,16 @@ func (s *Server) applyPendingDeletes(ctx context.Context, pending []*pendingDele
 		if info, err := os.Stat(abs); err == nil {
 			perm = info.Mode().Perm()
 		}
-		if _, werr := s.commitFileMutation(ctx, "safe_delete_symbol", "", "", rel, abs, []byte(newContent), perm); werr != nil {
-			return deleted, fmt.Errorf("could not write %s: %v", abs, werr)
+		commit, werr := s.commitFileMutation(ctx, "safe_delete_symbol", "", "", rel, abs, []byte(newContent), perm)
+		if werr != nil {
+			return deleted, writes, fmt.Errorf("could not write %s: %v", abs, werr)
 		}
+		writes = append(writes, captureCommittedSourceMutation(ctx, abs, commit))
 		for _, p := range bucket {
 			deleted = append(deleted, p.node.ID)
 		}
 	}
-	return deleted, nil
+	return deleted, writes, nil
 }
 
 // expandDeleteRange grows a symbol's [StartLine, EndLine] range to
@@ -733,15 +815,17 @@ func collectReferencingEdges(g graph.Reader, id string) []safeDeleteReference {
 		if !isReferencingEdgeKind(e.Kind) {
 			continue
 		}
-		key := e.From + "|" + string(e.Kind)
+		key := fmt.Sprintf("%s|%s|%s|%d", e.From, e.Kind, e.FilePath, e.Line)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		row := safeDeleteReference{FromID: e.From, Kind: string(e.Kind)}
+		row := safeDeleteReference{FromID: e.From, Kind: string(e.Kind), Line: e.Line, FilePath: e.FilePath}
 		if from := g.GetNode(e.From); from != nil {
 			row.FromName = from.Name
-			row.FilePath = from.FilePath
+			if row.FilePath == "" {
+				row.FilePath = from.FilePath
+			}
 		}
 		out = append(out, row)
 	}
@@ -778,4 +862,38 @@ func isCommentLine(trimmed string) bool {
 		return true
 	}
 	return false
+}
+
+func sameSafeDeleteReferences(a, b []safeDeleteReference) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[safeDeleteReference]int, len(a))
+	for _, ref := range a {
+		counts[ref]++
+	}
+	for _, ref := range b {
+		if counts[ref] == 0 {
+			return false
+		}
+		counts[ref]--
+	}
+	return true
+}
+
+func referencesAfterCommittedPatches(refs []safeDeleteReference, applied []callerPatch, target string) []safeDeleteReference {
+	var remaining []safeDeleteReference
+	for _, ref := range refs {
+		removed := false
+		for _, patch := range applied {
+			if patch.sourceHash != ([32]byte{}) && patch.target == target && patch.from == ref.FromID && string(patch.kind) == ref.Kind && patch.File == ref.FilePath && patch.Line == ref.Line && patch.Line > 0 {
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			remaining = append(remaining, ref)
+		}
+	}
+	return remaining
 }

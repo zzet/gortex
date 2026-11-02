@@ -771,9 +771,9 @@ func encodeFileSummary(sg *query.SubGraph, etag string) ([]byte, error) {
 func encodeAnalyze(kind string, payload any) ([]byte, error) {
 	var buf bytes.Buffer
 	switch kind {
-	case "dead_code", "pending_unknown":
+	case "dead_code":
 		items, _ := payload.([]deadCodeItem)
-		enc := newGCX(&buf, "analyze."+kind,
+		enc := newGCX(&buf, "analyze.dead_code",
 			[]string{"id", "kind", "name", "path", "line", "reason"},
 			"count", fmt.Sprintf("%d", len(items)),
 		)

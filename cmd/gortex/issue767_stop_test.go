@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"testing"
 )
 
@@ -62,5 +63,88 @@ func TestIssue767CleanupCancellationRequiresSuccessfulProcessState(t *testing.T)
 				t.Fatalf("clean=%t; want=%t", clean, tc.wantClean)
 			}
 		})
+	}
+}
+
+func TestIssue767StopOwnerSerializesOverlappingRequests(t *testing.T) {
+	var requests atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	stop := issue767GracefulStopOwner(func() error {
+		if requests.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		return nil
+	})
+	done := make(chan error, 2)
+	go func() { done <- stop() }()
+	<-entered
+	// Keep the first request in flight until the second caller is launched.
+	// Counting after both complete needs no scheduler or timing threshold.
+	secondStarted := make(chan struct{})
+	go func() { close(secondStarted); done <- stop() }()
+	<-secondStarted
+	close(release)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("graceful-stop requests = %d, want one per child", got)
+	}
+}
+
+func TestIssue767StopOwnerPreservesFirstFailure(t *testing.T) {
+	failure := errors.New("first graceful stop failed")
+	var requests int
+	stop := issue767GracefulStopOwner(func() error {
+		requests++
+		if requests == 1 {
+			return failure
+		}
+		return nil
+	})
+	for range 2 {
+		if err := stop(); err != failure {
+			t.Errorf("stop error = %v, want original failure", err)
+		}
+	}
+	if requests != 1 {
+		t.Errorf("stop requests = %d, want one", requests)
+	}
+}
+
+func TestIssue767StopOwnerIsPerChild(t *testing.T) {
+	var requests [2]int
+	for i := range requests {
+		stop := issue767GracefulStopOwner(func() error { requests[i]++; return nil })
+		for range 2 {
+			if err := stop(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if requests != [2]int{1, 1} {
+		t.Fatalf("requests per child = %v, want [1 1]", requests)
+	}
+}
+
+func TestIssue767CleanupUsesCapturedStopOwner(t *testing.T) {
+	// A real completed native child gives stop its actual successful exit
+	// state. No daemon is launched and no successful exit is invented.
+	cmd := exec.CommandContext(context.Background(), "git", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "--version")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	var requests int
+	cmd.Cancel = issue767GracefulStopOwner(func() error { requests++; return nil })
+	done := make(chan error, 1)
+	done <- nil
+	fixture := &issue767Fixture{t: t, cmd: cmd, done: done}
+	fixture.stop()
+	if requests != 1 {
+		t.Fatalf("cleanup used captured stop owner %d times, want one", requests)
 	}
 }

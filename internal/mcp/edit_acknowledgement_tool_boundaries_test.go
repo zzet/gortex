@@ -153,7 +153,7 @@ func TestAcknowledgementMoveRealParserAndSourceDurability(t *testing.T) {
 	require.GreaterOrEqual(t, snapshot.ParseGate.Completed, uint64(2), "real source and existing-target Go parser calls")
 	require.NotNil(t, snapshot.ParseGate.AckMS)
 	require.True(t, snapshot.LapsDisjoint)
-	require.Equal(t, "explicit_go_parser_calls_formatting_unattributed", snapshot.ParserScope)
+	require.Equal(t, "mixed_observed_parser_paths", snapshot.ParserScope, "explicit Go syntax calls and the committed file projection are both observed")
 	require.Zero(t, snapshot.TicketAdmission.Started, "synchronous move reindex is not a queue admission")
 }
 

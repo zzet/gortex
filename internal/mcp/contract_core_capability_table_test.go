@@ -118,6 +118,9 @@ type (
 	capBFSContext interface {
 		BFSContext(context.Context, []string, graph.Direction, []graph.EdgeKind, int, int) ([]graph.BFSHop, error)
 	}
+	capLastFirstIndexDrains interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}
 	capRepoPrefixes interface{ RepoPrefixes() []string }
 )
 
@@ -218,6 +221,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"NodeLightSequencer", capOf[graph.NodeLightSequencer], capDropped, "node-only streaming; graph.NodesLightSeq falls back to the AllNodesLight forwarder, the same rows materialised"},
 		{"Store", capOf[graph.Store], capDropped, "the whole backend contract; a request reader is never the store"},
 		{"local:WALReclaimStats", capOf[walReclaimSnapshotReader], capDropped, capReasonBackend + " (physical store counters, never selected graph state)"},
+		{"local:LastFirstIndexDrains", capOf[capLastFirstIndexDrains], capDropped, capReasonBackend + " (shared-store drain observations, never selected graph state)"},
 		{"local:WALPassiveStats", capOf[walPassiveSnapshotReader], capDropped, capReasonBackend + " (physical checkpoint counters, never selected graph state)"},
 		{"local:AnnounceInteractiveRead", capOf[interactiveReadAnnouncer], capDropped, capReasonBackend + " (call-scoped physical store cooperation, never selected graph authority)"},
 		{"AnalysisGenerationStore", capOf[graph.AnalysisGenerationStore], capDropped, capReasonBackend},
@@ -230,6 +234,8 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"ContractStateStore", capOf[graph.ContractStateStore], capDropped, capReasonBackend},
 		{"FileMetaReader", capOf[graph.FileMetaReader], capDropped, capReasonBackend},
 		{"FileMetaPathReader", capOf[graph.FileMetaPathReader], capDropped, "projection retirement reads durable content evidence on the backend, never a request reader"},
+		{"local:FileMetasByPaths+GetFileNodes", capOf[projectionStore], capDropped, capReasonBackend},
+		{"ConstantValueProjectionReader", capOf[graph.ConstantValueProjectionReader], capDropped, "selected retirement reads checked metadata through the same leased handoff; never forwarded through contract-core request readers"},
 		{"RepoIndexStateReader", capOf[graph.RepoIndexStateReader], capDropped, capReasonBackend},
 		{"StructuralIntegrityAuditor", capOf[graph.StructuralIntegrityAuditor], capDropped, capReasonBackend},
 		{"StructuralIntegritySnapshotter", capOf[graph.StructuralIntegritySnapshotter], capDropped, capReasonBackend},
@@ -272,7 +278,6 @@ func contractCoreUnprobedCapabilities() []contractCoreCapName {
 		{"CloneShingleWriter", capOf[graph.CloneShingleWriter]},
 		{"ConfigNodeBatchEvicter", capOf[graph.ConfigNodeBatchEvicter]},
 		{"ConstantValueContextReader", capOf[graph.ConstantValueContextReader]},
-		{"ConstantValueProjectionReader", capOf[graph.ConstantValueProjectionReader]},
 		{"ConstantValueReader", capOf[graph.ConstantValueReader]},
 		{"ConstantValueRepoReplacer", capOf[graph.ConstantValueRepoReplacer]},
 		{"ConstantValueWriter", capOf[graph.ConstantValueWriter]},

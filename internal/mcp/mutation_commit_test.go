@@ -733,7 +733,14 @@ func TestRenameStopsWritingOnceCancelled(t *testing.T) {
 		}
 	}
 
-	results := s.commitRenameWrites(ctx, writes)
+	paths := make([]string, len(writes))
+	for i, w := range writes {
+		paths[i] = w.AbsPath
+	}
+	heldCtx, releasePaths, err := acquireMutationPaths(ctx, paths)
+	require.NoError(t, err)
+	defer releasePaths()
+	results := s.commitRenameWrites(heldCtx, writes, releasePaths)
 	require.Len(t, results, 2, "the rename must stop instead of attempting every remaining file")
 	require.Equal(t, "applied", results[0]["status"])
 	require.Equal(t, mutationDiskCommitted, results[0]["disk_status"])

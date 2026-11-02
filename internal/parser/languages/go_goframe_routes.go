@@ -247,20 +247,16 @@ func goframeMethodParts(md *sitter.Node, src []byte) (name, recvType, reqType, r
 // goframePackageName returns the file's package name from its package_clause.
 func goframePackageName(root *sitter.Node, src []byte) string {
 	pkg := ""
-	walkAST(root, func(n *sitter.Node) bool {
-		if pkg != "" {
-			return false
-		}
-		if n.Type() != "package_clause" {
-			return true
+	goframeWalk(root, func(n *sitter.Node) {
+		if pkg != "" || n.Type() != "package_clause" {
+			return
 		}
 		for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
 			if c := n.NamedChild(i); c != nil && c.Type() == "package_identifier" {
 				pkg = strings.TrimSpace(c.Content(src))
-				return pkg == ""
+				return
 			}
 		}
-		return true
 	})
 	return pkg
 }

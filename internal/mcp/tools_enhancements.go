@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -26,6 +28,7 @@ import (
 	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/semantic"
@@ -2892,13 +2895,38 @@ type scaffoldReader struct {
 	ctx context.Context
 }
 
-func (r scaffoldReader) Graph() graph.Store { return r.s.graph }
+func (r scaffoldReader) Graph() graph.Reader { return r.s.readerFor(r.ctx) }
 func (r scaffoldReader) ResolveFilePath(graphPath string) string {
 	abs, err := r.s.resolveGraphPath(r.ctx, graphPath)
 	if err != nil {
 		return ""
 	}
 	return abs
+}
+
+func (r scaffoldReader) ScaffoldNodeSource(node *graph.Node) (string, int, int, error) {
+	path := r.ResolveFilePath(node.FilePath)
+	if path == "" {
+		return "", 0, 0, fmt.Errorf("could not resolve %s", node.FilePath)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	var start, end int
+	if mutationPathAdmitted(r.ctx, pathkey.MutationKey(path)) {
+		start, end, err = r.s.symbolLinesUnderLock(r.ctx, node, path, raw)
+	} else {
+		start, end, err = r.s.nodeLinesIn(r.ctx, node, raw)
+	}
+	if err != nil {
+		return "", 0, 0, err
+	}
+	lines := strings.Split(string(indexer.DecodeUTF16Source(raw)), "\n")
+	if start < 1 || end < start || end > len(lines) {
+		return "", 0, 0, fmt.Errorf("invalid current source range for %s", node.ID)
+	}
+	return strings.Join(lines[start-1:end], "\n"), start, end, nil
 }
 
 func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -2917,7 +2945,7 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 		dryRun = v
 	}
 
-	result, err := analysis.GenerateScaffold(s.engine, scaffoldReader{s: s, ctx: ctx}, exampleID, newName)
+	result, err := analysis.GenerateScaffold(s.engineFor(ctx), scaffoldReader{s: s, ctx: ctx}, exampleID, newName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -2942,41 +2970,58 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		defer release()
-		// Apply edits by writing files. Every write funnels through
-		// commitFileMutation — the UTF-16 refusal (#846), the cancellation
-		// gate, and the mutation receipt live there. A direct os.WriteFile
-		// used to splice UTF-8 into NUL-interleaved bytes and corrupt the
-		// file from the insertion point on.
-		for i, edit := range result.Edits {
-			absPath := paths[i]
-			content, readErr := os.ReadFile(absPath)
-			if readErr != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("could not read %s: %v", edit.FilePath, readErr)), nil
+		// Rebuild under the complete source frontier: a queued edit must not
+		// resurrect an example removed while it waited for a source lock.
+		current, err := analysis.GenerateScaffold(s.engineFor(ctx), scaffoldReader{s: s, ctx: ctx}, exampleID, newName)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		grouped := make(map[string][]analysis.ScaffoldEdit)
+		for _, edit := range current.Edits {
+			path, err := s.resolveGraphPath(ctx, edit.FilePath)
+			if err != nil || !mutationPathAdmitted(ctx, pathkey.MutationKey(path)) {
+				return mcp.NewToolResultError("scaffold source paths changed while waiting; rebuild the preview"), nil
 			}
+			grouped[path] = append(grouped[path], edit)
+		}
+		var writes []committedSourceMutation
+		finish := sync.OnceFunc(func() { s.completeCommittedSourceMutations(ctx, writes, release) })
+		defer finish()
+		ordered := slices.Sorted(maps.Keys(grouped))
+		for _, path := range ordered {
+			edits := grouped[path]
+			content, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("could not read %s: %v", edits[0].FilePath, readErr)), nil
+			}
+			// Apply all positions against one source version, from the bottom
+			// up, then parse and commit just one final candidate for this file.
+			slices.SortStableFunc(edits, func(a, b analysis.ScaffoldEdit) int { return cmp.Compare(b.InsertionLine, a.InsertionLine) })
 			lines := strings.Split(string(content), "\n")
-			insertIdx := max(edit.InsertionLine-1, 0)
-			insertIdx = min(insertIdx, len(lines))
-			newLines := make([]string, 0, len(lines)+strings.Count(edit.Code, "\n")+2)
-			newLines = append(newLines, lines[:insertIdx]...)
-			newLines = append(newLines, "")
-			newLines = append(newLines, edit.Code)
-			newLines = append(newLines, lines[insertIdx:]...)
-			// Keep the file's existing mode: the atomic commit applies perm
-			// to the replacement, so a fixed 0o644 would strip a script's
-			// executable bit.
+			for _, edit := range edits {
+				at := min(max(edit.InsertionLine-1, 0), len(lines))
+				lines = append(slices.Clone(lines[:at]), append([]string{"", edit.Code}, lines[at:]...)...)
+			}
+			after := []byte(strings.Join(lines, "\n"))
+			projection, gate := s.prepareAcknowledgedProjection(ctx, edits[0].FilePath, path, content, after)
+			if gate.Blocked {
+				return mcp.NewToolResultError("scaffold refused: candidate introduces syntax errors"), nil
+			}
 			perm := os.FileMode(0o644)
-			if info, err := os.Stat(absPath); err == nil {
+			if info, statErr := os.Stat(path); statErr == nil {
 				perm = info.Mode().Perm()
 			}
-			commit, writeErr := s.commitFileMutation(ctx, "scaffold", "", "", edit.FilePath, absPath,
-				[]byte(strings.Join(newLines, "\n")), perm)
+			commit, writeErr := s.commitFileMutation(ctx, "scaffold", "", "", edits[0].FilePath, path,
+				after, perm, sourceMutationOperation{kind: sourceWrite, projection: projection})
+			if commit != nil && commit.snapshot().DiskStatus == mutationDiskCommitted {
+				writes = append(writes, captureCommittedSourceMutation(ctx, path, commit))
+			}
 			if writeErr != nil {
-				if errors.Is(writeErr, errMutationNotApplied) {
-					return mcp.NewToolResultError(mutationNotAppliedMessage("scaffold", commit, writeErr)), nil
-				}
-				return mcp.NewToolResultError(fmt.Sprintf("could not write %s: %v", edit.FilePath, writeErr)), nil
+				return mcp.NewToolResultError(mutationNotAppliedMessage("scaffold", commit, writeErr)), nil
 			}
 		}
+		finish()
+		resp["edits"], resp["notes"] = current.Edits, current.Notes
 		resp["applied"] = true
 	}
 
@@ -3760,6 +3805,19 @@ func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string
 			plannerStats["last_refresh_at"] = planner.LastRefreshAt.UTC().Format(time.RFC3339)
 			plannerStats["last_refresh_reason"] = planner.LastRefreshReason
 		}
+		// Named, not counted: they are what an operator checks the schema for,
+		// and the reason above alone does not say which lookups are scanning.
+		if len(planner.DenseIndexesMissing) > 0 {
+			plannerStats["dense_indexes_missing"] = planner.DenseIndexesMissing
+			msg := "A bulk index load ended without rebuilding these SQLite indexes: " + strings.Join(planner.DenseIndexesMissing, ", ") +
+				". Queries that use them scan instead until they are back. The store rebuilds them in the background once " +
+				"its volume has free space at least the size of the store, and a daemon restart rebuilds them too."
+			if recommendation == "" {
+				recommendation = msg
+			} else {
+				recommendation = msg + " " + recommendation
+			}
+		}
 		result["planner_stats"] = plannerStats
 		if planner.Stale {
 			msg := "SQLite planner statistics are stale (" + planner.Reason + "): the graph has grown past what the query " +
@@ -3770,6 +3828,13 @@ func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string
 			} else {
 				recommendation = msg + " " + recommendation
 			}
+		}
+	}
+	if reporter, ok := s.graph.(interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}); ok {
+		if observations := reporter.LastFirstIndexDrains(); len(observations) > 0 {
+			result["last_first_index_drain"] = observations
 		}
 	}
 	if prefixAuditOK {

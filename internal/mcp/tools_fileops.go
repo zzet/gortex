@@ -935,7 +935,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	// old_string, so an un-replayed retry would fail the match check with a
 	// confusing "not found" instead of returning the original result.
 	fingerprint := mutationFingerprint("edit_file", absPath, oldString, newString, strconv.FormatBool(replaceAll))
-	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+	if replay, conflict, matched := s.replayMutationAfterPathRelease(ctx, mutationID, fingerprint, releaseMutation); matched {
 		if conflict != "" {
 			return mcp.NewToolResultError(conflict), nil
 		}
@@ -1016,8 +1016,9 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 	var gate parseGateResult
+	var prepared *preparedFileProjection
 	if parseGateEnabled() {
-		gate = s.checkAcknowledgedParseGate(ctx, relPath, content, newContentBytes)
+		prepared, gate = s.prepareAcknowledgedProjection(ctx, relPath, absPath, content, newContentBytes)
 		if gate.Blocked && !allowParseErrors && !dryRun {
 			return mcp.NewToolResultError(parseGateError(relPath, gate)), nil
 		}
@@ -1051,7 +1052,8 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if info, err := os.Stat(absPath); err == nil {
 		perm = info.Mode().Perm()
 	}
-	commit, writeErr := s.commitFileMutation(ctx, "edit_file", mutationID, fingerprint, relPath, absPath, newContentBytes, perm)
+	commit, writeErr := s.commitFileMutation(ctx, "edit_file", mutationID, fingerprint, relPath, absPath, newContentBytes, perm, sourceMutationOperation{kind: sourceWrite, projection: prepared})
+	defer commit.finishResponseWait()
 	if writeErr != nil {
 		if errors.Is(writeErr, errMutationNotApplied) {
 			return mcp.NewToolResultError(mutationNotAppliedMessage("edit", commit, writeErr)), nil
@@ -1132,7 +1134,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	// call waits for it and then sees a terminal record, rather than both
 	// deciding independently that they are the first.
 	fingerprint := mutationFingerprint("write_file", absPath, content)
-	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+	if replay, conflict, matched := s.replayMutationAfterPathRelease(ctx, mutationID, fingerprint, releaseMutation); matched {
 		if conflict != "" {
 			return mcp.NewToolResultError(conflict), nil
 		}
@@ -1194,8 +1196,9 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 	var gate parseGateResult
+	var prepared *preparedFileProjection
 	if parseGateEnabled() {
-		gate = s.checkAcknowledgedParseGate(ctx, relPath, priorContent, contentBytes)
+		prepared, gate = s.prepareAcknowledgedProjection(ctx, relPath, absPath, priorContent, contentBytes)
 		if gate.Blocked && !allowParseErrors && !dryRun {
 			return mcp.NewToolResultError(parseGateError(relPath, gate)), nil
 		}
@@ -1227,7 +1230,8 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		return s.respondJSONOrTOON(ctx, req, preview)
 	}
 
-	commit, writeErr := s.commitFileMutation(ctx, "write_file", mutationID, fingerprint, relPath, absPath, contentBytes, perm)
+	commit, writeErr := s.commitFileMutation(ctx, "write_file", mutationID, fingerprint, relPath, absPath, contentBytes, perm, sourceMutationOperation{kind: sourceWrite, projection: prepared})
+	defer commit.finishResponseWait()
 	if writeErr != nil {
 		if errors.Is(writeErr, errMutationNotApplied) {
 			return mcp.NewToolResultError(mutationNotAppliedMessage("write", commit, writeErr)), nil

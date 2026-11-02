@@ -44,12 +44,17 @@ type mutationPathLock struct {
 // mutation. A receipt identifies admitted publication work that can outlive the
 // request, either on a watcher or on the selected checkout's coordinator.
 type mutationReindexOutcome struct {
-	Reindexed         bool
-	Pending           bool
-	Receipt           string
-	Generation        uint64
-	AppliedGeneration uint64
-	Err               error
+	Reindexed bool
+	Pending   bool
+	Receipt   string
+	// Same existing receipt ID retained internally when full ACK omits it.
+	publicationReceipt string
+	Generation         uint64
+	AppliedGeneration  uint64
+	Err                error
+	// tiers is the immutable snapshot from the existing ticket owner. Never
+	// expose a mutable receipt (and its mutex/history) through an outcome.
+	tiers indexer.MutationTierState
 	// DerivedFanout is the completeness fact for the bounded derived passes
 	// the reindex ran. Additive and independent of Reindexed: the graph can
 	// have read these bytes while the affected-by re-resolution over them was
@@ -256,7 +261,7 @@ func (s *Server) trackMutationTicket(ticket *indexer.MutationTicket) *mutationRe
 	if s.multiIndexer != nil {
 		repo = s.multiIndexer.RepoForFile(ticket.Path)
 	}
-	return s.trackScopedMutationTicket(ticket, repo, "", "", nil)
+	return s.trackScopedMutationTicket(ticket, repo, "", "", nil, s.canonicalProjectionRetirement(ticket.Path))
 }
 
 func (s *Server) trackCheckoutRefreshTicket(ticket *indexer.CheckoutRefreshTicket) *mutationReceipt {
@@ -277,7 +282,7 @@ func (s *Server) trackCheckoutRecoveryTicket(ticket *indexer.CheckoutRefreshTick
 	return s.trackScopedMutationTicket(ticket.Ticket, ticket.RepoPrefix, ticket.CheckoutID, ticket.Incarnation, captured)
 }
 
-func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo, checkoutID, incarnation string, recoveryCandidates map[string]struct{}) *mutationReceipt {
+func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo, checkoutID, incarnation string, recoveryCandidates map[string]struct{}, retirements ...*sourceProjectionRetirement) *mutationReceipt {
 	receipt := &mutationReceipt{
 		ticket:              ticket,
 		id:                  fmt.Sprintf("mutation-%d", mutationReceiptSequence.Add(1)),
@@ -334,6 +339,12 @@ func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo,
 		}
 		s.scheduleMutationReceiptExpiry(receipt, retention)
 		close(receipt.done)
+		// Read-only content verification is outside ACK completion and the
+		// repository lane. Canonical backend ownership needs no departed view pin.
+		// A successful notification merely triggers verification, never proves it.
+		if result.Err == nil && len(retirements) == 1 {
+			retirements[0].run()
+		}
 	}()
 	return receipt
 }
@@ -526,10 +537,14 @@ func (r *mutationReceipt) outcome(pending bool) mutationReindexOutcome {
 	outcome := mutationReindexOutcome{
 		Pending:             pending,
 		Receipt:             r.id,
+		publicationReceipt:  r.id,
 		Generation:          r.generation,
 		checkoutScoped:      r.checkoutScoped,
 		checkoutID:          r.checkoutID,
 		checkoutIncarnation: r.checkoutIncarnation,
+	}
+	if r.ticket != nil {
+		outcome.tiers = r.ticket.TierState()
 	}
 	if r.completed {
 		outcome.Reindexed = r.result.Reindexed
@@ -561,9 +576,9 @@ func noDispatchSlotRelease(ctx context.Context) bool {
 	return marked
 }
 
-// releaseDispatchSlotForWait returns the completed source handler's dispatch
-// capacity before its passive publication wait. A refused test adapter keeps
-// the committed receipt pending; it never becomes a retryable busy result.
+// releaseDispatchSlotForWait returns mutation capacity and admits a passive
+// post-commit wait to the slow lane. False leaves the committed receipt pending;
+// it must never become a retryable busy result. Embedded calls are unchanged.
 func (s *Server) releaseDispatchSlotForWait(ctx context.Context, published <-chan struct{}) bool {
 	if noDispatchSlotRelease(ctx) {
 		return true
@@ -571,8 +586,7 @@ func (s *Server) releaseDispatchSlotForWait(ctx context.Context, published <-cha
 	if s.releaseDispatchSlot != nil {
 		return s.releaseDispatchSlot(ctx, published)
 	}
-	daemon.ReleaseMCPDispatchSlot(ctx)
-	return true
+	return daemon.MoveMCPDispatchToSlowLane(ctx, published) == nil
 }
 
 func (s *Server) mutationWaitDuration() time.Duration {
@@ -585,15 +599,18 @@ func (s *Server) mutationWaitDuration() time.Duration {
 // sourceMutationAdmission separates committing/admitting under the path lock
 // from passive graph waiting after the lock has been returned.
 type sourceMutationAdmission struct {
+	policy     sourceAckPolicy
 	receipt    *mutationReceipt
 	immediate  mutationReindexOutcome
 	inlinePath string
 	checkout   *checkoutMutationState
+	move       *moveObservation
 }
 
 // admitSourceMutations captures publication ownership before another writer
 // can commit this path. It never waits for a queued watcher publication.
-func (s *Server) admitSourceMutations(ctx context.Context, absPath string) sourceMutationAdmission {
+func (s *Server) admitSourceMutations(ctx context.Context, absPath string) (admission sourceMutationAdmission) {
+	defer func() { admission.policy = s.sourceAckPolicy(ctx) }()
 	if state := checkoutMutationFromContext(ctx); state != nil {
 		if _, queued := state.mutation.(checkoutMutationScheduler); queued {
 			return sourceMutationAdmission{immediate: s.refreshCheckoutMutation(ctx, absPath, state)}
@@ -631,19 +648,54 @@ func (s *Server) awaitSourceMutations(ctx context.Context, admission sourceMutat
 			return s.refreshCheckoutMutation(ctx, admission.inlinePath, admission.checkout)
 		}
 		if admission.inlinePath == "" {
-			return admission.immediate
+			outcome := admission.immediate
+			if outcome.Err == nil && outcome.Receipt != "" {
+				outcome.Err = editGateCheckoutACKSeed(ctx, s)
+			}
+			return outcome
 		}
 		if err := ctx.Err(); err != nil {
 			return mutationReindexOutcome{Err: err}
 		}
-		return mutationReindexOutcome{Reindexed: s.reindexFile(admission.inlinePath)}
+		retirement := s.canonicalProjectionRetirement(admission.inlinePath)
+		var reindexed bool
+		if admission.move != nil {
+			reindexed = admission.move.reindex(ctx, admission.inlinePath)
+		} else {
+			reindexed = s.reindexFile(admission.inlinePath)
+		}
+		if reindexed {
+			retirement.run()
+		}
+		return mutationReindexOutcome{Reindexed: reindexed}
 	}
 	receipt := admission.receipt
 	resumeIntent := suspendSourceMutationWriteIntent(ctx)
 	defer resumeIntent()
+	if admission.policy.freshness.requireFresh {
+		err := s.awaitSourceAckTier(ctx, admission.policy, []string{receipt.path}, receipt.done)
+		outcome := receipt.outcome(true)
+		if err != nil {
+			outcome.Err = err
+		}
+		return outcome
+	}
+	if admission.policy.local() {
+		outcome := receipt.outcome(true)
+		if err := editGateCheckoutACKSeed(ctx, s); err != nil {
+			outcome.Err = err
+		}
+		return outcome
+	}
+	waitLap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+	if err := editGateACKSeed(ctx, s); err != nil {
+		waitLap.finish()
+		outcome := receipt.outcome(true)
+		outcome.Err = err
+		return outcome
+	}
 	waitCtx, cancel := context.WithTimeout(ctx, s.mutationWaitDuration())
 	defer cancel()
-	waitLap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
 	if !s.releaseDispatchSlotForWait(waitCtx, receipt.done) {
 		waitLap.finish()
 		return receipt.outcome(true)
@@ -855,12 +907,22 @@ func (s *Server) mutationReceiptState(id string) (mutationReindexOutcome, bool) 
 // health is only authoritative after completed reindex; reading it while a
 // watcher patch is pending would surface stale parse errors and provoke an
 // unnecessary source re-read.
-func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath string, outcome mutationReindexOutcome) {
+func attachMutationFreshnessFields(resp map[string]any, outcome mutationReindexOutcome) {
+	for _, key := range []string{"reindex_pending", "reindex_error", "reindex_receipt", "reindex_generation", "applied_generation", "syntax_health", "derived_fanout"} {
+		delete(resp, key)
+	}
 	resp["reindexed"] = outcome.Reindexed
 	// graph_status is the freshness half of the mutation contract, named so it
 	// reads next to disk_status (mutation_commit.go) rather than having to be
 	// inferred from the reindexed / reindex_pending / reindex_error triple.
 	resp["graph_status"] = graphStatusFor(outcome)
+	if outcome.Err != nil {
+		resp["reindex_error"] = outcome.Err.Error()
+	}
+	if outcome.Pending {
+		resp["reindex_pending"] = true
+	}
+	attachMutationTierState(resp, outcome.tiers)
 	attachDerivedFanout(resp, outcome.DerivedFanout)
 	if outcome.Generation > 0 {
 		resp["reindex_generation"] = outcome.Generation
@@ -871,6 +933,10 @@ func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath s
 	if outcome.Receipt != "" {
 		resp["reindex_receipt"] = outcome.Receipt
 	}
+}
+
+func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath string, outcome mutationReindexOutcome) {
+	attachMutationFreshnessFields(resp, outcome)
 	if outcome.Pending {
 		resp["reindex_pending"] = true
 		return

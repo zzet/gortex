@@ -37,6 +37,7 @@ func TestPreparedProjectionSyntaxGateParsesCleanCandidateOnce(t *testing.T) {
 			entry, verdict := s.prepareAcknowledgedProjection(ctx, "main.go", path, old, []byte(test.source))
 			parses := parser.ParseCount() - count
 			require.NotNil(t, entry)
+			require.NotNil(t, entry.entry, entry.refusal)
 			require.True(t, verdict.Checked)
 			require.Equal(t, test.blocked, verdict.Blocked)
 			require.Equal(t, test.parses, parses, "projection and gate must share the exact candidate parse; only broken candidates parse old bytes")

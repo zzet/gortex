@@ -5,6 +5,7 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/zzet/gortex/internal/graph"
 	"io"
 	"time"
 )
@@ -128,9 +129,11 @@ type ControlResponse struct {
 
 // Control operation kinds. One constant per kind so callers can't typo.
 const (
-	ControlTrack   = "track"
-	ControlUntrack = "untrack"
-	ControlReload  = "reload"
+	ControlTrack = "track"
+	// ControlTrackPreflight observes ownership without registering or saving.
+	ControlTrackPreflight = "track_preflight"
+	ControlUntrack        = "untrack"
+	ControlReload         = "reload"
 	// ControlProxy reloads servers.toml and rebuilds + atomically swaps
 	// the daemon's multi-server Router, then invalidates the roster
 	// cache — so `gortex proxy on/off/add/remove` apply to a running
@@ -525,8 +528,10 @@ type PublicationPhaseOffset struct {
 
 // StorageStatus is the store's write-ahead-log state for daemon status.
 type StorageStatus struct {
-	DBBytes  int64 `json:"db_bytes"`
-	WALBytes int64 `json:"wal_bytes"`
+	DenseIndexesMissing []string                         `json:"dense_indexes_missing,omitempty"`
+	LastFirstIndexDrain map[string]graph.FirstIndexDrain `json:"last_first_index_drain,omitempty"`
+	DBBytes             int64                            `json:"db_bytes"`
+	WALBytes            int64                            `json:"wal_bytes"`
 	// WALPendingFrames is the backlog not yet copied into the database
 	// (mxFrame - nBackfill), -1 when the wal-index could not be read.
 	WALPendingFrames int64 `json:"wal_pending_frames"`

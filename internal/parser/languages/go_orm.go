@@ -288,6 +288,10 @@ func rewireORMTableNameOverrides(root *sitter.Node, src []byte, result *parser.E
 	if root == nil || result == nil {
 		return
 	}
+	overrides := collectGoTableNameOverrides(root, src)
+	if len(overrides) == 0 {
+		return
+	}
 	// Build a quick `<owner-type-name> → existing edge` index over
 	// EdgeModelsTable edges so we can patch them by receiver.
 	type modelEdge struct {
@@ -303,12 +307,6 @@ func rewireORMTableNameOverrides(root *sitter.Node, src []byte, result *parser.E
 		modelEdges = append(modelEdges, modelEdge{edge: e, ownerName: ownerName})
 	}
 	if len(modelEdges) == 0 {
-		return
-	}
-	// An override cannot affect output without an existing model edge.
-	// Avoid walking the AST for the common non-model file.
-	overrides := collectGoTableNameOverrides(root, src)
-	if len(overrides) == 0 {
 		return
 	}
 	for ownerName, tableName := range overrides {

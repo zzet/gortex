@@ -14,6 +14,7 @@ import (
 // every configured repo as watched and the graph aged behind a green status.
 func TestMultiWatcherReportsRepoThatNeverStarted(t *testing.T) {
 	mw, _, repoADir, _ := setupMultiWatcherTest(t)
+	require.False(t, mw.TierAuthority("repo-a"), "configured is not yet watching")
 
 	// Repo A's root disappears before the watchers come up — a checkout
 	// removed under a running daemon.
@@ -24,6 +25,9 @@ func TestMultiWatcherReportsRepoThatNeverStarted(t *testing.T) {
 	live, configured := mw.WatchedRepos()
 	require.Equal(t, 2, configured)
 	require.Equal(t, 1, live, "only repo-b can be watched once repo-a's root is gone")
+	require.False(t, mw.TierAuthority("repo-a"), "a failed startup cannot certify an empty tier set")
+	require.True(t, mw.TierAuthority("repo-b"))
+	require.False(t, mw.TierAuthority("unknown-repo"))
 
 	reason := mw.DegradedReason()
 	require.NotEmpty(t, reason, "an unwatched repository must not read as healthy")
@@ -37,10 +41,15 @@ func TestMultiWatcherHealthyWhenAllReposStart(t *testing.T) {
 	mw, _, _, _ := setupMultiWatcherTest(t)
 
 	require.NoError(t, mw.Start())
-	t.Cleanup(func() { _ = mw.Stop() })
+	t.Cleanup(func() {
+		_ = mw.Stop()
+		require.False(t, mw.TierAuthority("repo-a"), "a stopped watcher cannot certify a tier")
+	})
 
 	live, configured := mw.WatchedRepos()
 	require.Equal(t, configured, live)
 	require.Equal(t, 2, live)
 	require.Empty(t, mw.DegradedReason())
+	require.True(t, mw.TierAuthority("repo-a"))
+	require.True(t, mw.TierAuthority("repo-b"))
 }

@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/zeebo/blake3"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -43,10 +45,7 @@ func (s *Server) nodeLinesIn(ctx context.Context, node *graph.Node, content []by
 			return node.StartLine, node.EndLine, nil
 		}
 	}
-	_, local, ok := strings.Cut(node.ID, "::")
-	if !ok {
-		return 0, 0, fmt.Errorf("symbol %s has no file-local id", node.ID)
-	}
+
 	s.noteAcknowledgementParser(ctx, "source_extraction_for_symbol_location")
 	parseLap := s.beginAcknowledgementLap(ctx, editAckParseGate)
 	extracted, err := owner.ExtractSource(ctx, rel, content)
@@ -55,12 +54,20 @@ func (s *Server) nodeLinesIn(ctx context.Context, node *graph.Node, content []by
 		return 0, 0, fmt.Errorf("locate %s in the current file: %w", node.ID, err)
 	}
 	defer extracted.ReleaseTree()
+	return s.declarationLinesIn(ctx, node, extracted.Nodes)
+}
+
+func (s *Server) declarationLinesIn(ctx context.Context, node *graph.Node, nodes []*graph.Node) (int, int, error) {
+	_, local, ok := strings.Cut(node.ID, "::")
+	if !ok {
+		return 0, 0, fmt.Errorf("symbol %s has no file-local id", node.ID)
+	}
 	// A declaration is located by its order among the declarations that
 	// share its ID base, as the reader that produced node listed them. An
 	// ID with no position in it is unique, so that is an exact match; a
 	// positional one pairs only while the count holds.
 	base := declarationBase(local)
-	current := declarationsSharing(extracted.Nodes, base)
+	current := declarationsSharing(nodes, base)
 	if len(current) == 0 {
 		return 0, 0, errSymbolRemoved
 	}
@@ -138,6 +145,14 @@ func (s *Server) readNodeSource(ctx context.Context, node *graph.Node, absPath s
 func (s *Server) symbolLinesUnderLock(ctx context.Context, node *graph.Node, absPath string, content []byte) (int, int, error) {
 	if !mutationPathAdmitted(ctx, pathkey.MutationKey(absPath)) {
 		return 0, 0, fmt.Errorf("%w: symbol path is not held", errMutationNotApplied)
+	}
+	key := pathkey.MutationKey(absPath)
+	entry := pendingFileProjections.snap.Load().entries[key]
+	if entry != nil && !entry.tombstone && entry.graphPath == node.FilePath && entry.rawHash == blake3.Sum256(content) {
+		start, end, err := s.declarationLinesIn(ctx, node, entry.layer.FileNodes(node.FilePath))
+		if pendingFileProjections.snap.Load().entries[key] == entry {
+			return start, end, err
+		}
 	}
 	return s.nodeLinesIn(ctx, node, content)
 }
