@@ -1298,10 +1298,13 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 	// map key/value, channel element. These positions are dropped by the
 	// bare-name type passes, so without this find_usages of a type misses
 	// every place it appears only as an argument/element type.
-	root.WithScratch(func() { emitGoTypeArgReferences(root, src, filePath, fileID, funcRanges, result) })
+	root.WithScratch(func() {
+		work := collectGoTailWork(root, src)
+		emitGoTypeArgReferences(work, src, filePath, fileID, funcRanges, result)
 
-	// GoFrame reflective routes: g.Meta-tagged request structs → controllers.
-	root.WithScratch(func() { captureGoFrameRoutes(result, root, filePath, src) })
+		// GoFrame reflective routes retain their original tail emission order.
+		captureGoFrameRoutes(result, root, work, filePath, src)
+	})
 
 	return result, nil
 }

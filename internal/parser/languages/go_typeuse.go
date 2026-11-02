@@ -41,11 +41,8 @@ import (
 // a reference to a phantom type `T`. Edges are deduped per
 // (owner, type, line, ref_context) and attributed to the enclosing
 // function (or the file node for package-level declarations).
-func emitGoTypeArgReferences(root *sitter.Node, src []byte, filePath, fileID string, funcRanges []funcRange, result *parser.ExtractionResult) {
-	if root == nil {
-		return
-	}
-	typeParams, containers := collectGoTypeReferenceWork(root, src)
+func emitGoTypeArgReferences(work goTailWork, src []byte, filePath, fileID string, funcRanges []funcRange, result *parser.ExtractionResult) {
+	typeParams, containers := work.typeParams, work.typeContainers
 	seen := map[string]bool{}
 	emit := func(name string, line int) {
 		t := canonicalizeGoTypeRef(name)
@@ -138,47 +135,4 @@ func emitGoTypeArgReferences(root *sitter.Node, src []byte, filePath, fileID str
 			}
 		}
 	}
-}
-
-// collectGoTypeReferenceWork collects every type-parameter name
-// declared anywhere in the file (function, method, or type generic
-// parameter lists). These names are NOT real types — a generic
-// instantiation `List[T]` inside `func F[T any]` must not emit a
-// reference to a phantom type `T` — so the type-arg pass skips them.
-// Containers keep the original preorder, but emission waits until every name
-// is known, including later declarations. Their wrappers remain within the
-// caller's existing scratch lifetime.
-func collectGoTypeReferenceWork(root *sitter.Node, src []byte) (map[string]bool, []*sitter.Node) {
-	out := map[string]bool{}
-	var containers []*sitter.Node
-	walkNodes(root, func(n *sitter.Node) {
-		t := n.Type()
-		if t == "type_arguments" || t == "map_type" || t == "channel_type" {
-			containers = append(containers, n)
-			return
-		}
-		if t != "type_parameter_declaration" && t != "parameter_declaration" {
-			return
-		}
-		// type_parameter_declaration is the modern grammar shape; older
-		// grammars reuse parameter_declaration inside type_parameter_list.
-		// Only the latter, when its parent is a type_parameter_list,
-		// declares type parameters.
-		if t == "parameter_declaration" {
-			parent := n.Parent()
-			if parent == nil || parent.Type() != "type_parameter_list" {
-				return
-			}
-		}
-		for i, _nc := 0, int(n.NamedChildCount()); i < _nc; i++ {
-			c := n.NamedChild(i)
-			if c == nil {
-				continue
-			}
-			if ct := c.Type(); ct == "identifier" || ct == "type_identifier" {
-				out[c.Content(src)] = true
-			}
-		}
-	})
-	return out, containers
 }
