@@ -268,7 +268,13 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	rawHash := blake3.Sum256(raw)
 	if expected != nil {
 		if !expected.tombstone && expected.rawHash == rawHash && expected.disk.matches(after) &&
-			pathkey.MutationKey(abs) == key && pendingFileProjections.snap.Load().entries[key] == expected {
+			pathkey.MutationKey(abs) == key {
+			// Ownership can move while metadata is read even though these
+			// bounded bytes did not change. Refuse this selection without
+			// inventing source invalidation on a checked historical owner.
+			if pendingFileProjections.snap.Load().entries[key] != expected {
+				return nil, projectionSuperseded
+			}
 			if !expected.suspect.Load() {
 				return expected, nil
 			}
