@@ -3023,7 +3023,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	// landed old_source no longer matches, so an un-replayed retry would be
 	// refused rather than answered with the original result.
 	fingerprint := mutationFingerprint("edit_symbol", id, absPath, oldSource, newSource)
-	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+	if replay, conflict, matched := s.replayMutationAfterPathRelease(ctx, mutationID, fingerprint, releaseMutation); matched {
 		if conflict != "" {
 			return mcp.NewToolResultError(conflict), nil
 		}
@@ -3114,6 +3114,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		perm = info.Mode().Perm()
 	}
 	commit, writeErr := s.commitFileMutation(ctx, "edit_symbol", mutationID, fingerprint, node.FilePath, absPath, newContentBytes, perm)
+	defer commit.finishResponseWait()
 	if writeErr != nil {
 		if errors.Is(writeErr, errMutationNotApplied) {
 			return mcp.NewToolResultError(mutationNotAppliedMessage("edit", commit, writeErr)), nil

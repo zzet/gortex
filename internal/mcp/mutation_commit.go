@@ -182,6 +182,9 @@ type mutationCommitRecord struct {
 	// carry a caller-chosen mutation_id. Without a key there is nothing to
 	// replay against, so ordinary edits pay no memory for this.
 	response map[string]any
+	// Keyed retries may arrive after path release but before the first reply.
+	// This bounded record owns their completion signal, never another ledger.
+	responseReady chan struct{}
 }
 
 type mutationCommitSnapshot struct {
@@ -462,6 +465,7 @@ func (r *mutationCommitRecord) retainResponse(resp map[string]any) {
 		clone[key] = value
 	}
 	r.response = clone
+	r.closeResponseReadyLocked()
 }
 
 func (r *mutationCommitRecord) replayResponse() (map[string]any, bool) {
@@ -562,6 +566,7 @@ func (l *mutationCommitLedger) evictLocked(now time.Time) {
 		record.mu.RUnlock()
 		if expired {
 			record.mu.Lock()
+			record.closeResponseReadyLocked()
 			record.publication = nil
 			record.acknowledgement = nil
 			record.readRepair = nil
@@ -582,6 +587,7 @@ func (l *mutationCommitLedger) evictLocked(now time.Time) {
 		l.ordered = l.ordered[1:]
 		oldest.mu.Lock()
 		l.unbindFreshnessLocked(oldest)
+		oldest.closeResponseReadyLocked()
 		oldest.publication = nil
 		oldest.acknowledgement = nil
 		oldest.readRepair = nil
@@ -745,6 +751,9 @@ func (s *Server) beginMutationCommit(ctx context.Context, tool, mutationID, fing
 		graph:           mutationGraphStale,
 		startedAt:       time.Now(),
 		acknowledgement: editAcknowledgementFrom(ctx, s),
+	}
+	if mutationID != "" {
+		record.responseReady = make(chan struct{})
 	}
 	if state := checkoutMutationFromContext(ctx); state != nil {
 		record.checkoutID = state.checkoutID
@@ -1069,6 +1078,10 @@ func (s *Server) replayMutation(mutationID, fingerprint string) (map[string]any,
 			"mutation_id %q already committed but its response was not retained; query mutation_status for the receipt: %s",
 			mutationID, encoded), true
 	}
+	return s.renderMutationReplay(record, resp)
+}
+
+func (s *Server) renderMutationReplay(record *mutationCommitRecord, resp map[string]any) (map[string]any, string, bool) {
 	// The disk verdict and receipt remain historical. File-view facts are
 	// live observations and cannot be replayed after another commit replaced
 	// the registry entry. Refresh only those scalars on this response clone.
