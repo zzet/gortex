@@ -10,6 +10,7 @@ var (
 	hookPort  int
 	hookMode  string
 	hookAgent string
+	hookEvent string
 )
 
 var hookCmd = &cobra.Command{
@@ -64,6 +65,12 @@ var hookCmd = &cobra.Command{
 			// hookSpecificOutput.permissionDecision shape.
 			hooks.RunKimi(hookPort, hooks.ParseMode(hookMode))
 			return
+		case "antigravity":
+			// Google Antigravity (agy CLI / Antigravity 2.0 / IDE):
+			// protojson stdin with workspacePaths + toolCall, call_mcp_tool
+			// unwrapping, and per-event injectSteps / decision stdout.
+			hooks.RunAntigravity(hookPort, hooks.ParseMode(hookMode), hookEvent)
+			return
 		case "", "claude":
 			// Claude Code — handled below.
 		default:
@@ -79,6 +86,8 @@ func init() {
 	hookCmd.Flags().StringVar(&hookMode, "mode", "",
 		"hook posture: Claude defaults to deny and accepts deny|enrich|consult-unlock|nudge; Codex defaults to enrich and accepts enrich|deny|rewrite|suppress")
 	hookCmd.Flags().StringVar(&hookAgent, "agent", "",
-		"hook wire protocol: empty/'claude' (Claude Code lifecycle hooks), 'codex' (Codex Bash/MCP/apply_patch hooks), 'copilot-cli' (GitHub Copilot CLI hooks), 'kimi' (Kimi Code CLI hooks), 'hermes' (NousResearch hermes-agent hooks), 'pi' (Pi extension bridge), 'opencode' (OpenCode plugin bridge), or 'gemini'/'antigravity'. Default (empty) is Claude Code.")
+		"hook wire protocol: empty/'claude' (Claude Code lifecycle hooks), 'codex' (Codex Bash/MCP/apply_patch hooks), 'copilot-cli' (GitHub Copilot CLI hooks), 'kimi' (Kimi Code CLI hooks), 'hermes' (NousResearch hermes-agent hooks), 'pi' (Pi extension bridge), 'opencode' (OpenCode plugin bridge), 'antigravity' (Google Antigravity hooks), or 'gemini'. Default (empty) is Claude Code.")
+	hookCmd.Flags().StringVar(&hookEvent, "event", "",
+		"lifecycle event name when the host omits it from stdin (e.g. Antigravity SessionStart|PreInvocation|PreToolUse|PostToolUse|Stop)")
 	rootCmd.AddCommand(hookCmd)
 }
