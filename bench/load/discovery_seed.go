@@ -303,11 +303,6 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 	if err := discoveryOwnedFile(root, l.Snapshot); err != nil {
 		return nil, err
 	}
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if _, err := os.Lstat(p.Store + suffix); !errors.Is(err, os.ErrNotExist) {
-			return nil, errors.New("discovery destination store must be absent before one-shot resume")
-		}
-	}
 	before, err := discoverySeedPair(l.Snapshot)
 	if err != nil || before[0] != l.MainSHA256 || before[1] != l.WALSHA256 {
 		return nil, errors.New("discovery quiescent snapshot digest mismatch")
@@ -322,7 +317,25 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 	if err != nil || string(header[:16]) != "SQLite format 3\x00" || binary.BigEndian.Uint32(header[60:64]) != 44 {
 		return nil, errors.New("discovery snapshot is not a checkpointed schema44 SQLite main")
 	}
-	if err := discoveryWriteJSON(filepath.Join(root, "discovery-consumed.json"), map[string]string{"descriptor_sha256": sha, "upgrade_binary_sha256": l.UpgradeBinarySHA256}); err != nil {
+	if o.Discovery.RuntimeRoot != "" {
+		if err := validateOutputRoots(corpora, o.Discovery.RuntimeRoot); err != nil {
+			return nil, err
+		}
+		lease, err := newDiscoveryRuntimeRoot(scratch, o.Discovery.RuntimeRoot, d, sha)
+		if err != nil {
+			return nil, err
+		}
+		p.discoveryRuntime = lease
+		p.Root = lease.identity.Root
+		p.Store = filepath.Join(p.Root, "store.db")
+		p.Config = filepath.Join(p.Root, "config.yaml")
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if _, err := os.Lstat(p.Store + suffix); !errors.Is(err, os.ErrNotExist) {
+			return nil, errors.New("discovery destination store must be absent before one-shot resume")
+		}
+	}
+	if err := discoveryWriteJSON(filepath.Join(p.Root, "discovery-consumed.json"), map[string]string{"descriptor_sha256": sha, "upgrade_binary_sha256": l.UpgradeBinarySHA256}); err != nil {
 		return nil, err
 	}
 	if err := copySeedStore(l.Snapshot, p.Store); err != nil {
@@ -342,7 +355,7 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 		return nil, err
 	}
 	p.Socket = filepath.Join(p.SocketDir, "d.sock")
-	p.Env = privateEnv(root, p.Socket, filepath.Join(root, "gitconfig"))
+	p.Env = privateEnv(p.Root, p.Socket, filepath.Join(p.Root, "gitconfig"))
 	return p, nil
 }
 func discoverySeedPair(path string) ([2]string, error) {
