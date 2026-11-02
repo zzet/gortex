@@ -27,7 +27,7 @@ func (mutationTestWatcher) HistorySince(time.Time) []indexer.GraphChangeEvent {
 	return nil
 }
 func (mutationTestWatcher) OnSymbolChange(indexer.SymbolChangeCallback) {}
-func (w mutationTestWatcher) EnqueueFileMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
+func (w mutationTestWatcher) EnqueueToolMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

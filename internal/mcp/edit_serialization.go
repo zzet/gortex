@@ -119,7 +119,7 @@ func (r *mutationReceipt) releaseViewPin() {
 }
 
 type mutationScheduler interface {
-	EnqueueFileMutation(context.Context, string) (*indexer.MutationTicket, error)
+	EnqueueToolMutation(context.Context, string) (*indexer.MutationTicket, error)
 }
 
 // mutationSetScheduler optionally admits a complete primary file frontier.
@@ -553,7 +553,7 @@ func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutat
 			pin := handoffRequestView(ctx, viewmetrics.HandoffFileMutation)
 			publication := s.committedPublicationRecord(ctx, absPath)
 			admissionLap := s.beginAcknowledgementLap(ctx, editAckTicketAdmission)
-			ticket, scheduleErr := scheduler.EnqueueFileMutation(indexer.WithPublicationRecord(context.WithoutCancel(ctx), publication), absPath)
+			ticket, scheduleErr := scheduler.EnqueueToolMutation(indexer.WithPublicationRecord(context.WithoutCancel(ctx), publication), absPath)
 			admissionLap.finish()
 			if scheduleErr != nil {
 				failMutationPhases(publication)
