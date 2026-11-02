@@ -17,15 +17,14 @@ type EditPhaseTimings struct {
 // identify the acknowledgement's default reindex wait. It is not a phase
 // measurement or a claim of complete phase accounting.
 type EditTimingWindow struct {
-	ResolveMutexWait              *EditResolveMutexWait `json:"resolve_mutex_wait,omitempty"`
-	Clock                         string                `json:"clock"`
-	Coverage                      string                `json:"coverage"`
-	AcknowledgementWallMS         *float64              `json:"ack_wall_ms"`
-	PatchWallMS                   *float64              `json:"patch_wall_ms"`
-	PatchAccounting               *EditPatchAccounting  `json:"patch_accounting,omitempty"`
-	SharedSetExecution            *SharedSetExecution   `json:"shared_set_execution,omitempty"`
-	PublicationWallMS             *float64              `json:"publication_wall_ms"`
-	PublicationUnattributedWallMS *float64              `json:"publication_unattributed_ms"`
+	Clock                         string               `json:"clock"`
+	Coverage                      string               `json:"coverage"`
+	AcknowledgementWallMS         *float64             `json:"ack_wall_ms"`
+	PatchWallMS                   *float64             `json:"patch_wall_ms"`
+	PatchAccounting               *EditPatchAccounting `json:"patch_accounting,omitempty"`
+	SharedSetExecution            *SharedSetExecution  `json:"shared_set_execution,omitempty"`
+	PublicationWallMS             *float64             `json:"publication_wall_ms"`
+	PublicationUnattributedWallMS *float64             `json:"publication_unattributed_ms"`
 }
 
 var editAckPhaseNames = [...]string{
