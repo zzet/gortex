@@ -132,7 +132,7 @@ func (w *Watcher) finishSharedOwnerProof(a *mutationSetPublicationAttempt, timer
  owner.mu.Lock(); defer owner.mu.Unlock()
  for _,m:=range members {
   r:=m.record.Value(); if r==nil || owner.byKey[m.key]!=r { return }
-  r.mu.Lock(); valid:=r.key==m.key && r.ticket==m.ticket && r.sharedSetExecution!=nil && r.sharedSetExecution.generation==m.ticket && r.sharedPhysical!=nil && *r.sharedPhysical==m.physical
+  r.mu.Lock(); valid:=!r.sharedProofRevoked && r.key==m.key && r.ticket==m.ticket && r.sharedSetExecution!=nil && r.sharedSetExecution.generation==m.ticket && r.sharedPhysical!=nil && *r.sharedPhysical==m.physical
   for _,mark:=range r.marks { if mark.phase==PublicationTicketFailed { valid=false } }
   r.mu.Unlock(); if !valid { return }
  }
@@ -151,7 +151,7 @@ func intervalWire(phase string,start,end int64) map[string]any { return map[stri
 func (f *sharedOwnerFrozen) definitionWire() map[string]any {
  accounting:=f.execution.projectAccountingScope(true)
  phases:=make(map[string]any,len(accounting.PhasesMS));states:=make(map[string]string,len(accounting.PhaseStates))
- for name,value:=range accounting.PhasesMS { phases[name]=value;states[name]=accounting.PhaseStates[name]; if value==nil && (name=="patch_analysis" || name=="batch_admission") { states[name]="not_applicable" } }
+ for name,value:=range accounting.PhasesMS { phases[name]=value;states[name]=accounting.PhaseStates[name] }
  intervals:=make([]map[string]any,0,len(f.intervals));for _,v:=range f.intervals { intervals=append(intervals,intervalWire(v.Phase,v.Start,v.End)) }
  execution:=map[string]any{"entry_disposition":"direct_shared_set","clock":"monotonic","origin":"actual_callback_entry","start_ns":int64(0),"end_ns":f.execution.endNS,"observed_partition_complete":accounting.PartitionComplete,"phases_ms":phases,"phase_states":states,"intervals":intervals}
  members:=make([]map[string]any,0,len(f.members));for _,m:=range f.members { members=append(members,sharedMemberWire(m)) }
@@ -178,7 +178,7 @@ func (p *PublicationPhaseRecord) WithSharedOwnerProof(current *PublicationPhaseR
  physical:=make([]SharedPhysicalOwner,0,len(f.members))
  for i:=range f.members {
   m:=&f.members[i];r:=m.record.Value();if r==nil || current.byKey[m.key]!=r || r.owner.Value()!=current {return false}
-  r.mu.Lock();valid:=r.key==m.key && r.ticket==m.ticket && r.sharedPhysical!=nil && *r.sharedPhysical==m.physical && r.sharedSetExecution!=nil && r.sharedSetExecution.ownerProof==f && r.terminal
+  r.mu.Lock();valid:=!r.sharedProofRevoked && r.key==m.key && r.ticket==m.ticket && r.sharedPhysical!=nil && *r.sharedPhysical==m.physical && r.sharedSetExecution!=nil && r.sharedSetExecution.ownerProof==f && r.terminal
   for _,mark:=range r.marks{if mark.phase==PublicationTicketFailed{valid=false}}
   r.mu.Unlock();if !valid{return false};if r==p{selected=m};physical=append(physical,m.physical)
  }

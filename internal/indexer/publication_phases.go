@@ -176,6 +176,7 @@ func DefaultPublicationPhases() *PublicationPhaseRecorder { return defaultPublic
 // publication.
 type PublicationPhaseRecord struct {
  sharedPhysical *SharedPhysicalOwner
+ sharedProofRevoked bool
 	mu                    sync.Mutex
 	key                   string
 	checkoutID            string
@@ -294,6 +295,10 @@ func (r *PublicationPhaseRecorder) Rekey(oldKey, newKey string) bool {
 	delete(r.byKey, oldKey)
 	r.byKey[newKey] = record
 	record.mu.Lock()
+	// A frozen anchor is immutable, even if a later alias is restored.
+	if record.sharedSetExecution != nil && record.sharedSetExecution.ownerProof != nil {
+		record.sharedProofRevoked = true
+	}
 	record.key = newKey
 	record.mu.Unlock()
 	return true

@@ -137,6 +137,27 @@ func TestSharedOwnerAccountingBindsBothActualPhysicalReceipts(t *testing.T) {
 		require.Nil(t, phase["patch_accounting"])
 		require.Nil(t, wire["requested_background"])
 	}
+	if artifact := os.Getenv("SHARED_OWNER_WIRE_ARTIFACT"); artifact != "" {
+		data, err := json.MarshalIndent(s.mutationStatusPayload(records[0]), "", "  ")
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(artifact, append(data, '\n'), 0600))
+	}
+	// A retained original publication is insufficient if its peer ledger entry
+	// points at another actual publication. All member projections fail closed.
+	peer := records[1]
+	peer.mu.Lock()
+	originalPublication := peer.publication
+	peer.publication = records[0].publication
+	peer.mu.Unlock()
+	for _, record := range records {
+		require.Nil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"])
+	}
+	peer.mu.Lock()
+	peer.publication = originalPublication
+	peer.mu.Unlock()
+	for _, record := range records {
+		require.NotNil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"])
+	}
 	// An aliased ledger in another actual Server cannot borrow the proof.
 	other := NewServer(s.engine, s.graph, s.indexer, nil, zap.NewNop(), nil)
 	other.mutationCommits.put(records[0])
@@ -146,4 +167,13 @@ func TestSharedOwnerAccountingBindsBothActualPhysicalReceipts(t *testing.T) {
 	literal := newMutationServer()
 	literal.mutationCommits.put(records[0])
 	require.Nil(t, literal.mutationStatusPayload(records[0])["shared_owner_accounting_v1"], "literal/unnamed Server cannot gain proof from retained records")
+	// Restoring an old key after a post-freeze alias must not revive an anchor.
+	key := originalPublication.Key()
+	recorder := indexer.DefaultPublicationPhases()
+	require.True(t, recorder.Rekey(key, key+"-post-freeze"))
+	require.True(t, recorder.Rekey(key+"-post-freeze", key))
+	for _, record := range records {
+		require.Nil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"])
+	}
+
 }
