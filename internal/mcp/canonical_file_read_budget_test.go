@@ -21,9 +21,15 @@ func (r *remainingFileReadBudget) WithFileEditingContextReader(ctx context.Conte
 	return ctx.Err()
 }
 
-func TestFileStoreScopeCannotRenewOriginalProjectionDeadline(t *testing.T) {
+func TestFileStoreScopeCannotRenewOriginalCallerDeadline(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Millisecond)
-	ctx := context.WithValue(t.Context(), projectedSourceDeadlineKey{}, deadline)
+	caller, cancel := context.WithDeadline(t.Context(), deadline)
+	defer cancel()
+	projectionDeadline := time.Now().Add(-time.Second)
+	ctx := context.WithValue(caller, projectedSourceDeadlineKey{}, projectionDeadline)
+	allowance := &projectedSourceAllowance{tool: "get_file_summary"}
+	allowance.attempts.Store(2)
+	ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, allowance)
 	reader := &remainingFileReadBudget{Store: graph.New()}
 	consumed := false
 	err := withFileStoreRows(ctx, reader, func(graph.FileEditingContextRows) error {
@@ -31,6 +37,9 @@ func TestFileStoreScopeCannotRenewOriginalProjectionDeadline(t *testing.T) {
 		return nil
 	})
 	require.ErrorIs(t, err, context.DeadlineExceeded)
-	require.Equal(t, deadline, reader.observed, "a second 30ms store scope cannot extend the original remaining allowance")
+	require.Equal(t, deadline, reader.observed, "a 30ms canonical SQL scope cannot extend the caller's original hard deadline")
+	require.Equal(t, projectionDeadline, ctx.Value(projectedSourceDeadlineKey{}))
+	require.False(t, allowance.claim(), "canonical SQL cannot revive an exhausted projection allowance")
+	require.EqualValues(t, 2, allowance.attempts.Load())
 	require.False(t, consumed, "an unavailable scope cannot supply partial canonical rows")
 }
