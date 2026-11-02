@@ -40,10 +40,8 @@ func TestTrackedExternalReadAdmitsOnceWithoutWaiting(t *testing.T) {
 	entry := pendingFileProjections.snap.Load().entries[pathkey.MutationKey(path)]
 	require.NotNil(t, entry)
 	require.Zero(t, entry.commitSeq, "a read-built projection is not a physical source commit")
-	if s.mutationCommits != nil {
-		_, committed := s.mutationCommits.recentForPath(path)
-		require.False(t, committed)
-	}
+	_, committed := s.mutationCommits.recentForPath(path)
+	require.False(t, committed)
 	result, err = handler(ctx, req)
 	require.NoError(t, err)
 	require.False(t, result.IsError, "%s", resultText(result))
