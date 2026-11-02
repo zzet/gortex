@@ -14,8 +14,10 @@ func (s *Server) bindSharedPhysicalOwner(record *mutationCommitRecord, publicati
 }
 
 func (s *Server) attachSharedOwnerAccounting(payload map[string]any, record *mutationCommitRecord, publication *indexer.PublicationPhaseRecord) {
- if publication==nil || record==nil || !record.isPhysicalCommit() || !s.validSharedIdentity() { return }
+ if publication==nil || record==nil || !record.isPhysicalCommit() { return }
  state,reason:=publication.SharedOwnerProofAvailability()
+ if state=="" { return }
+ if !s.validSharedIdentity() { return }
  if state!="" {var why any;if reason!=""{why=reason};payload["shared_owner_accounting_v1_availability"]=map[string]any{"state":state,"reason":why}}
  preliminary:=publication.SharedOwnerProof(indexer.DefaultPublicationPhases())
  if preliminary!=nil {

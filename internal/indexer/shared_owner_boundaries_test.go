@@ -59,3 +59,53 @@ func TestSharedOwnerC1IncludesLegacyFinalizationExcludesProjection(t *testing.T)
  for _,ticket:=range tickets {require.NoError(t,awaitMutationSetTicket(t,ticket).Err)}
  require.Nil(t,first.SharedOwnerProof(owner),"unit records have no physical MCP ownership")
 }
+
+// Scalar controls are not runtime timing receipts: repeated real collector
+// events must remain separate, and overflow must discard the entire vector.
+func TestSharedOwnerIntervalCaptureBoundedAndPointUnallocated(t *testing.T) {
+ origin:=time.Now()
+ for _,limit:=range []int{0,2} {
+  laps:=&canonicalPatchLaps{origin:origin,sharedIntervalLimit:limit}
+  for n:=0;n<2;n++ {
+   start:=origin.Add(time.Duration(n*3+1)*time.Millisecond)
+   laps.beginLapLocked(patchParse,start)
+   laps.endLapLocked(patchParse,start,start.Add(time.Millisecond))
+  }
+  if limit==0 {require.Nil(t,laps.sharedIntervals);continue}
+  require.Len(t,laps.sharedIntervals,2)
+  require.Equal(t,int64(time.Millisecond),laps.sharedIntervals[0].End-laps.sharedIntervals[0].Start)
+  require.Less(t,laps.sharedIntervals[0].End,laps.sharedIntervals[1].Start,"do not replace repeated work with first-to-last wall")
+  start:=origin.Add(8*time.Millisecond)
+  laps.beginLapLocked(patchParse,start);laps.endLapLocked(patchParse,start,start.Add(time.Millisecond))
+  require.Negative(t,laps.sharedIntervalLimit)
+  require.Nil(t,laps.sharedIntervals,"overflow cannot leave a trimmed proof")
+ }
+}
+
+func TestSharedOwnerMissingOptionalPhasesStayUnknown(t *testing.T) {
+ f:=&sharedOwnerFrozen{members:[]sharedOwnerMember{{}},invocation:&sharedSetInvocation{},backgroundReason:"unobserved"}
+ execution:=f.definitionWire()["execution"].(map[string]any)
+ states:=execution["phase_states"].(map[string]string)
+ phases:=execution["phases_ms"].(map[string]any)
+ for _,name:=range []string{"patch_analysis","batch_admission"} {
+  require.Equal(t,"not_observed",states[name],"direct entry does not prove optional branch applicability")
+  require.Nil(t,phases[name])
+ }
+}
+
+func TestSharedOwnerBatchApplicabilityUsesActualCoordinatorBranch(t *testing.T) {
+ for _,condition:=range []string{"absent","gate","hook","point"} {
+  t.Run(condition,func(t *testing.T){
+   stamps:=&PublicationStamps{patchLaps:&canonicalPatchLaps{origin:time.Now(),sharedIntervalLimit:32}}
+   if condition!="point" {stamps.markDirectSharedOwnerEntry()}
+   coordinator:=newRepositoryMutationCoordinator(nil)
+   if condition=="gate" {coordinator.batchMutationGate=&sync.RWMutex{}}
+   if condition=="hook" {coordinator.batchAdmissionHook=func(){}}
+   ctx:=context.WithValue(t.Context(),publicationStampsKey{},stamps)
+   require.NoError(t,coordinator.runExclusive(ctx,func()error{return nil}))
+   stamps.mu.Lock();defer stamps.mu.Unlock()
+   if condition=="absent" {require.Equal(t,"no_batch_gate_or_hook",stamps.patchLaps.sharedOptionalDispositions["batch_admission"])} else {require.Empty(t,stamps.patchLaps.sharedOptionalDispositions)}
+   if condition=="gate"||condition=="hook" {require.Equal(t,uint64(1),stamps.patchLaps.laps[patchBatchAdmission].done)}
+  })
+ }
+}

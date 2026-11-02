@@ -62,6 +62,7 @@ type sharedOwnerFrozen struct {
  retry int
  execution canonicalAttemptWindow
  intervals []sharedOwnerInterval
+ optionalDispositions map[string]string
  callbackEntry, executionReturn, drainReturn time.Time
  timerStart, timerEnd time.Time
  backgroundReason string
@@ -111,6 +112,7 @@ func (w *Watcher) finishSharedOwnerProof(a *mutationSetPublicationAttempt, timer
  a.stamps.mu.Lock()
  if a.stamps.patchLaps.sharedIntervalLimit<=0 || !a.stamps.patchLaps.sharedDirectEntry { a.stamps.mu.Unlock(); return }
  intervals:=append([]sharedOwnerInterval(nil),a.stamps.patchLaps.sharedIntervals...)
+ dispositions:=make(map[string]string,len(a.stamps.patchLaps.sharedOptionalDispositions));for name,reason:=range a.stamps.patchLaps.sharedOptionalDispositions {dispositions[name]=reason}
  a.stamps.mu.Unlock()
  members:=make([]sharedOwnerMember,0,len(a.members))
  var owner *PublicationPhaseRecorder
@@ -127,7 +129,7 @@ func (w *Watcher) finishSharedOwnerProof(a *mutationSetPublicationAttempt, timer
  for i,m:=range members {
   if m.physical.Server!=first.Server || m.physical.PID!=first.PID || m.physical.Birth!=first.Birth || m.physical.Checkout!="" || m.physical.Incarnation!="" || i>0 && (m.path==members[i-1].path || m.key==members[i-1].key) { return }
  }
- frozen:=&sharedOwnerFrozen{members:members,recorder:weak.Make(owner),recorderName:owner.sharedInstance,invocation:call,arm:timer.frontier,retry:a.retry,execution:a.sharedWindow,intervals:intervals,callbackEntry:a.entered,executionReturn:a.executionReturned,drainReturn:returned,timerStart:timer.armStarted,timerEnd:timer.armFinished}
+ frozen:=&sharedOwnerFrozen{members:members,recorder:weak.Make(owner),recorderName:owner.sharedInstance,invocation:call,arm:timer.frontier,retry:a.retry,execution:a.sharedWindow,intervals:intervals,optionalDispositions:dispositions,callbackEntry:a.entered,executionReturn:a.executionReturned,drainReturn:returned,timerStart:timer.armStarted,timerEnd:timer.armFinished}
  if timer.armStarted.Before(call.entered) || timer.armFinished.Before(timer.armStarted) || a.entered.Before(timer.armFinished) { frozen.backgroundReason="overlapping_or_invalid_arm" }
  owner.mu.Lock(); defer owner.mu.Unlock()
  for _,m:=range members {
@@ -152,13 +154,20 @@ func (f *sharedOwnerFrozen) definitionWire() map[string]any {
  accounting:=f.execution.projectAccountingScope(true)
  phases:=make(map[string]any,len(accounting.PhasesMS));states:=make(map[string]string,len(accounting.PhaseStates))
  for name,value:=range accounting.PhasesMS { phases[name]=value;states[name]=accounting.PhaseStates[name] }
+ complete:=accounting.PartitionComplete
+ dispositions:=make(map[string]string,len(f.optionalDispositions))
+ for _,name:=range []string{"patch_analysis","batch_admission"} {
+  reason:=f.optionalDispositions[name]
+  expected:="resolution_catchup_not_entered";if name=="batch_admission"{expected="no_batch_gate_or_hook"}
+  if phases[name]==nil && reason==expected {states[name]="not_applicable";dispositions[name]=reason} else if phases[name]==nil || reason!="" {complete=false}
+ }
  intervals:=make([]map[string]any,0,len(f.intervals));for _,v:=range f.intervals { intervals=append(intervals,intervalWire(v.Phase,v.Start,v.End)) }
- execution:=map[string]any{"entry_disposition":"direct_shared_set","clock":"monotonic","origin":"actual_callback_entry","start_ns":int64(0),"end_ns":f.execution.endNS,"observed_partition_complete":accounting.PartitionComplete,"phases_ms":phases,"phase_states":states,"intervals":intervals}
+ execution:=map[string]any{"entry_disposition":"direct_shared_set","clock":"monotonic","origin":"actual_callback_entry","start_ns":int64(0),"end_ns":f.execution.endNS,"observed_partition_complete":complete,"phases_ms":phases,"phase_states":states,"phase_dispositions":dispositions,"intervals":intervals}
  members:=make([]map[string]any,0,len(f.members));for _,m:=range f.members { members=append(members,sharedMemberWire(m)) }
  var background any
  if f.backgroundReason=="" {
   origin:=f.invocation.entered; t0:=f.timerStart.Sub(origin).Nanoseconds();t1:=f.timerEnd.Sub(origin).Nanoseconds();e0:=f.callbackEntry.Sub(origin).Nanoseconds();e1:=f.executionReturn.Sub(origin).Nanoseconds();c1:=f.drainReturn.Sub(origin).Nanoseconds()
-  background=map[string]any{"clock":"monotonic","origin":"actual_original_set_scheduler_entry","start_ns":int64(0),"end_ns":c1,"end_boundary":"drain_return","excluded_work":[]string{"owner_proof_projection","outer_timer_work_done"},"observed_partition_complete":accounting.PartitionComplete,"local_intervals":[]map[string]any{intervalWire("scheduling_control",0,t0),intervalWire("timer_arm",t0,t1),intervalWire("quiet_wait",t1,e0)},"execution_ref":map[string]any{"owner":f.ownerWire(),"window":"execution","start_ns":e0,"end_ns":e1},"post_execution_control":map[string]any{"start_ns":e1,"end_ns":c1}}
+  background=map[string]any{"clock":"monotonic","origin":"actual_original_set_scheduler_entry","start_ns":int64(0),"end_ns":c1,"end_boundary":"drain_return","excluded_work":[]string{"owner_proof_projection","outer_timer_work_done"},"observed_partition_complete":complete,"local_intervals":[]map[string]any{intervalWire("scheduling_control",0,t0),intervalWire("timer_arm",t0,t1),intervalWire("quiet_wait",t1,e0)},"execution_ref":map[string]any{"owner":f.ownerWire(),"window":"execution","start_ns":e0,"end_ns":e1},"post_execution_control":map[string]any{"start_ns":e1,"end_ns":c1}}
  }
  var reason any;if f.backgroundReason!=""{reason=f.backgroundReason}
  return map[string]any{"scope":"shared_mutation_set_executor","owner":f.ownerWire(),"frontier_count":len(f.members),"members":members,"execution":execution,"background":background,"background_unavailable_reason":reason}
@@ -211,4 +220,14 @@ func (s *PublicationStamps) markDirectSharedOwnerEntry() {
  if s.patchLaps==nil || s.patchLaps.sharedIntervalLimit<=0 {return}
  if s.patchLaps.sharedDirectEntry {s.patchLaps.sharedIntervalLimit=-1;s.patchLaps.sharedIntervals=nil;return}
  s.patchLaps.sharedDirectEntry=true
+}
+
+// Only the actual branch owner may supply these fixed source dispositions.
+// Point collectors do not allocate a map or acquire new timing readings.
+func (s *PublicationStamps) markSharedOptionalDisposition(name, reason string) {
+ if s==nil {return};s.mu.Lock();defer s.mu.Unlock()
+ p:=s.patchLaps;if p==nil||p.sharedIntervalLimit<=0||!p.sharedDirectEntry{return}
+ if p.sharedOptionalDispositions==nil {p.sharedOptionalDispositions=make(map[string]string,2)}
+ if old:=p.sharedOptionalDispositions[name];old!=""&&old!=reason {p.sharedIntervalLimit=-1;p.sharedIntervals=nil;return}
+ p.sharedOptionalDispositions[name]=reason
 }

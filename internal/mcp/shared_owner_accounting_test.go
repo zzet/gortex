@@ -158,6 +158,20 @@ func TestSharedOwnerAccountingBindsBothActualPhysicalReceipts(t *testing.T) {
 	for _, record := range records {
 		require.NotNil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"])
 	}
+	peer.mu.Lock()
+	originalApplied := peer.appliedGeneration
+	peer.appliedGeneration++
+	peer.mu.Unlock()
+	for _, record := range records { require.Nil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"]) }
+	peer.mu.Lock()
+	peer.appliedGeneration = originalApplied
+	peer.graphRecorded = false
+	peer.mu.Unlock()
+	for _, record := range records { require.Nil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"]) }
+	peer.mu.Lock()
+	peer.graphRecorded = true
+	peer.mu.Unlock()
+	for _, record := range records { require.NotNil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"]) }
 	// An aliased ledger in another actual Server cannot borrow the proof.
 	other := NewServer(s.engine, s.graph, s.indexer, nil, zap.NewNop(), nil)
 	other.mutationCommits.put(records[0])

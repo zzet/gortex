@@ -390,6 +390,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 	if result == nil || result.DeletedFileCount > 0 {
 		batch.dropDeferredPriorBindings()
 	}
+	if !(needed && len(files) > 0) { mode.publication.markSharedOptionalDisposition("patch_analysis", "resolution_catchup_not_entered") }
 	if needed && len(files) > 0 {
 		idx.runIncrementalResolutionCatchup(files, batch, func(frontier []string) {
 			if idx.incrementalResolveFilesHook != nil {
@@ -597,6 +598,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, result.DerivedInvalidation.Files...)
 	}
 	idx := mi.GetIndexer(repoPrefix)
+	if !(needed && len(files) > 0 && idx != nil) { batch.publicationStamps().markSharedOptionalDisposition("patch_analysis", "resolution_catchup_not_entered") }
 	if needed && len(files) > 0 && idx != nil {
 		resolvedFiles := idx.runIncrementalResolutionCatchup(files, batch, func(frontier []string) {
 			if idx.incrementalResolveFilesHook != nil {
