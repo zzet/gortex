@@ -327,6 +327,10 @@ type Indexer struct {
 	// the whole corpus, which is what an index-generation bump used to
 	// force after a single edit.
 	trigramDirty map[string]struct{}
+	// toolWrites are the paths tools wrote that the text index has not read
+	// yet (grep.go). It has its own lock: noting a write must not wait out a
+	// trigram build, which holds trigramMu for a whole corpus read.
+	toolWrites toolWriteSet
 	// trigramBudgetOverride scopes the idle/LRU eviction budget to one
 	// test rather than the process-wide default. Nil in production.
 	trigramBudgetOverride *trigramBudget
@@ -7095,6 +7099,7 @@ type incrementalPathMode struct {
 	// mutable Indexer tracing state is installed by this per-call observation.
 	publication *PublicationStamps
 	readRepair  *ReadRepairObservation
+	onRelations func() // resolver and file publication complete, before derived work
 }
 
 // indexedFilesAbsentFromDisk returns the repo-relative keys of files the graph

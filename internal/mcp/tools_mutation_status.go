@@ -42,10 +42,11 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 				return s.respondJSONOrTOON(ctx, req, payload)
 			}
 		}
-		if !ok || !mutationCommitInScope(ctx, record) {
-			return mcp.NewToolResultError(
-				"no mutation receipt " + receipt + " — receipts are kept for " + mutationCommitRetention.String() +
-					"; query by path instead, or read the file to see its current state"), nil
+		if ok && !mutationCommitInScope(ctx, record) {
+			return mcp.NewToolResultError("no mutation receipt " + receipt), nil
+		}
+		if !ok {
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("receipt", receipt))
 		}
 		return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 
@@ -56,11 +57,13 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 				payload["note"] = "this is a graph freshness receipt id, not a caller mutation_id"
 				return s.respondJSONOrTOON(ctx, req, payload)
 			}
-			return mcp.NewToolResultError("no mutation recorded for mutation_id " + mutationID +
-				" — use change.receipt options.receipt=" + mutationID + " to query a graph freshness receipt"), nil
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("mutation_id", mutationID))
 		}
-		if !ok || !mutationCommitInScope(ctx, record) {
+		if ok && !mutationCommitInScope(ctx, record) {
 			return mcp.NewToolResultError("no mutation recorded for mutation_id " + mutationID), nil
+		}
+		if !ok {
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("mutation_id", mutationID))
 		}
 		return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 
@@ -163,6 +166,7 @@ func (s *Server) graphRefreshReceiptPayload(ctx context.Context, id string) (map
 	}
 	attachMutationPhaseTimings(payload, receipt.id, time.Time{}, indexer.PublicationSourceFreshRequest, retained)
 	attachAcknowledgementPayload(payload, acknowledgement, acknowledgementState)
+	attachReceiptTiers(payload, receipt)
 	return payload, true
 }
 
@@ -202,6 +206,7 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 	s.refreshPendingSourceRecord(record)
 	snap := record.snapshot()
 	payload := map[string]any{
+		"ack_mode":     snap.AckMode,
 		"found":        true,
 		"receipt":      snap.Receipt,
 		"tool":         snap.Tool,
@@ -215,6 +220,9 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 	}
 	if snap.MutationID != "" {
 		payload["mutation_id"] = snap.MutationID
+	}
+	if snap.ContentSHA256 != "" {
+		payload["content_sha256"] = snap.ContentSHA256
 	}
 	if snap.NewSHA != "" {
 		payload["new_sha"] = snap.NewSHA
@@ -248,6 +256,16 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 		acknowledgement = &snapshot
 	}
 	attachAcknowledgementPayload(payload, acknowledgement, "unavailable_recording_or_evicted")
+	publicationReceipt := snap.ReindexReceipt
+	if publicationReceipt == "" {
+		publicationReceipt = snap.publicationReceipt
+	}
+	if value, found := s.mutationReceipts.Load(publicationReceipt); found {
+		if receipt, ok := value.(*mutationReceipt); ok {
+			attachReceiptTiers(payload, receipt)
+		}
+	}
+	record.attachFileProjection(payload)
 	return payload
 }
 
@@ -382,6 +400,9 @@ func mutationCommitListingPayload(records []*mutationCommitRecord) []map[string]
 			"graph_status_terminal": graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded),
 		}
 		attachMutationRefreshSnapshot(entry, snap)
+		if snap.AckMode != "" {
+			entry["ack_mode"] = snap.AckMode
+		}
 		// Every remaining field mirrors mutationCommitSnapshot's omitempty
 		// exactly. Rendering by hand is what dropped new_sha and
 		// bytes_written the first time, so the parity is asserted against the
@@ -395,6 +416,9 @@ func mutationCommitListingPayload(records []*mutationCommitRecord) []map[string]
 		}
 		if snap.MutationID != "" {
 			entry["mutation_id"] = snap.MutationID
+		}
+		if snap.ContentSHA256 != "" {
+			entry["content_sha256"] = snap.ContentSHA256
 		}
 		if snap.NewSHA != "" {
 			entry["new_sha"] = snap.NewSHA

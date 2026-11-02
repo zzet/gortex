@@ -1,8 +1,15 @@
 package mcp
 
 import (
+	"context"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	mcplib "github.com/mark3labs/mcp-go/mcp"
+	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/parser"
 )
 
 func TestParseGateLanguage(t *testing.T) {
@@ -156,4 +163,32 @@ func TestParseGateInfo(t *testing.T) {
 	if info == nil || info["blocked"] != true || info["became_binary"] != true {
 		t.Errorf("binary gate info = %v, want blocked:true became_binary:true", info)
 	}
+}
+
+// TestEditParsesOncePerCleanEdit pins what the gate costs on the edit ack
+// path: a candidate with no parse errors is parsed once, and the prior bytes
+// are parsed only when there are candidate errors to compare against. The
+// watcher admits the reindex, so the counted parses are the gate's own.
+func TestEditParsesOncePerCleanEdit(t *testing.T) {
+	srv, dir := setupTestServer(t)
+	srv.SetWatcher(mutationTestWatcher{})
+	mainGo := filepath.Join(dir, "main.go")
+
+	edit := func(oldString, newString string) (uint64, *mcplib.CallToolResult) {
+		t.Helper()
+		req := mcplib.CallToolRequest{}
+		req.Params.Arguments = map[string]any{"path": mainGo, "old_string": oldString, "new_string": newString}
+		before := parser.ParseCount()
+		res, err := srv.handleEditFile(context.Background(), req)
+		require.NoError(t, err)
+		return parser.ParseCount() - before, res
+	}
+
+	parses, res := edit("func helper() {}", "func helper() { _ = 1 }")
+	require.False(t, res.IsError, "clean edit refused: %v", res.Content)
+	require.EqualValues(t, 1, parses, "a clean edit parses only the candidate")
+
+	parses, res = edit("func helper() { _ = 1 }", "func helper() { _ = }")
+	require.True(t, res.IsError, "the gate must refuse a syntax regression")
+	require.EqualValues(t, 2, parses, "a broken candidate is compared against the prior bytes")
 }

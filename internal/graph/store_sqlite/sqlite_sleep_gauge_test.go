@@ -51,7 +51,10 @@ func TestSQLiteSleepGaugeCountsBusyHandlerSleeps(t *testing.T) {
 	require.Positive(t, split.BusySleeps)
 	require.GreaterOrEqual(t, split.BusySleep, 150*time.Millisecond, "the busy handler's sleep was not counted")
 	require.Positive(t, split.ReadTxns)
-	require.Positive(t, split.ReadTxn)
+	// Windows can finish every short transaction in the same wall-clock
+	// cell. Completed transaction count above proves real read work; only
+	// the deliberately blocked busy-handler interval has a positive floor.
+	require.GreaterOrEqual(t, split.ReadTxn, time.Duration(0))
 }
 
 // The wrapper classifies whole-millisecond delays as the busy handler's and
@@ -66,4 +69,12 @@ func TestSQLiteSleepGaugeClassifiesDelays(t *testing.T) {
 	require.Equal(t, int64(1), after.BusyCalls-before.BusyCalls)
 	require.Equal(t, int64(2), after.WALRetryCalls-before.WALRetryCalls)
 	require.GreaterOrEqual(t, after.BusyNanos-before.BusyNanos, int64(time.Millisecond))
+}
+
+func TestReaderWaitSplitKeepsCompletedReadsAtZeroClockPrecision(t *testing.T) {
+	before := ReaderWaitMark{ReadTxns: 7, ReadTxnNanos: 1000}
+	after := ReaderWaitMark{ReadTxns: 10, ReadTxnNanos: 1000}
+	split := after.Split(before)
+	require.EqualValues(t, 3, split.ReadTxns)
+	require.Zero(t, split.ReadTxn, "equal clock cells remain measured zero, not fabricated positive time")
 }

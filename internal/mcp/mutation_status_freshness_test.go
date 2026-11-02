@@ -40,19 +40,16 @@ func TestMutationStatusFallsThroughFreshnessReceiptID(t *testing.T) {
 		}
 	})
 
-	t.Run("missing receipt keeps error and adds field hint", func(t *testing.T) {
+	t.Run("missing receipt reports lost", func(t *testing.T) {
 		s := newMutationServer()
 		id := newID()
 		res, err := s.handleMutationStatus(context.Background(), request(id))
 		require.NoError(t, err)
-		require.True(t, res.IsError)
-		require.Contains(t, resultText(res), "no mutation recorded for mutation_id "+id)
-		require.Contains(t, resultText(res), "change.receipt options.receipt="+id)
+		require.Equal(t, "lost", resultJSON(t, res)["state"])
 		for _, callerKey := range []string{"mutation-", "mutation-abc", "mutation-1suffix", "mutation-１２", "prefix-mutation-1"} {
 			res, err = s.handleMutationStatus(context.Background(), request(callerKey))
 			require.NoError(t, err)
-			require.True(t, res.IsError)
-			require.Equal(t, "no mutation recorded for mutation_id "+callerKey, resultText(res))
+			require.Equal(t, "lost", resultJSON(t, res)["state"])
 		}
 	})
 
@@ -87,7 +84,7 @@ func TestMutationStatusFallsThroughFreshnessReceiptID(t *testing.T) {
 			if scope.checkoutID == "selected" && scope.incarnation == "current" {
 				require.Equal(t, id, resultJSON(t, res)["receipt"])
 			} else {
-				require.True(t, res.IsError)
+				require.Equal(t, "lost", resultJSON(t, res)["state"])
 				require.NotContains(t, resultText(res), receipt.path)
 			}
 		}

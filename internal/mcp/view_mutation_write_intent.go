@@ -7,10 +7,9 @@ import (
 
 type sourceMutationWriteIntentKey struct{}
 
-// sourceMutationWriteIntent belongs to one handler. Publication waits suspend
-// its store announcement; mutation lane/cycle admission and disk writes retain
-// ordinary writer preemption. The selected route is still revalidated by the
-// existing mutation admission after each wait.
+// sourceMutationWriteIntent belongs to one store-writing checkout handler.
+// Publication waits suspend its announcement. The selected route is still
+// revalidated by mutation admission after each wait.
 type sourceMutationWriteIntent struct {
 	mu        sync.Mutex
 	announce  func() func()
@@ -22,6 +21,21 @@ type sourceMutationWriteIntent struct {
 func (s *Server) withSourceMutationWriteIntent(ctx context.Context, tool string) (context.Context, func()) {
 	if s == nil || s.facades == nil || !s.facades.mutatesSource(tool) ||
 		s.materializer == nil || s.materializer.Store == nil {
+		return ctx, func() {}
+	}
+	// Canonical source edits only write the working file; the watcher owns
+	// its store writes. Checkout mutation/capture paths do write the view
+	// store and retain foreground preemption during their admission.
+	view := requestViewFromContext(ctx)
+	storeWriting := checkoutMutationFromContext(ctx) != nil ||
+		(view.routed() && view.rider != nil && view.rider.Exact && view.viewRoot != "" &&
+			view.files == nil && view.materialized != nil && s.lifecycle != nil)
+	if !storeWriting {
+		return ctx, func() {}
+	}
+	switch tool {
+	case "edit_file", "write_file", "edit_symbol", "batch_edit":
+	default:
 		return ctx, func() {}
 	}
 	intent := &sourceMutationWriteIntent{announce: s.materializer.Store.AnnounceWrite}

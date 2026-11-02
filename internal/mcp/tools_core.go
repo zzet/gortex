@@ -1549,6 +1549,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		// the cutoff declines some safe resolutions, which is the right way
 		// to be wrong here.
 		eligible map[string]struct{}
+		repair   func()
 	)
 
 	// Multi-repo mode: route through the per-repo indexer so nodes keep
@@ -1580,6 +1581,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 			return mcp.NewToolResultError(scopeErr.Error()), nil
 		}
 		eligible = s.failedReceiptsBefore(paths, reindexRoot)
+		repair = s.captureWatcherTierRepair(paths, reindexRoot)
 		result, err = s.multiIndexer.IncrementalReindexRepo(prefix, paths)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -1602,6 +1604,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		}
 		reindexRoot = root
 		eligible = s.failedReceiptsBefore(paths, reindexRoot)
+		repair = s.captureWatcherTierRepair(paths, reindexRoot)
 		result, err = s.indexer.IncrementalReindexPaths(root, paths)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -1622,6 +1625,9 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 	// prevent — so anything wider is left alone.
 	if resolved, ok := reindexedReceiptPath(paths, reindexRoot, result); ok {
 		s.resolveReindexedPathReceipts(resolved, eligible)
+		if repair != nil {
+			repair()
+		}
 	}
 
 	s.startBackgroundAnalysis("reindex")

@@ -14,6 +14,14 @@ import (
 )
 
 func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corpus, group, outputRoot string) (phase Phase, sweep []SweepEntry, artifacts map[string]string, crashes map[string]int, version string, resultErr error) {
+	seedEnv, err := editGateSeedEnvironment(o)
+	if err != nil {
+		return phase, nil, nil, nil, "", err
+	}
+	var gateWallStart time.Time
+	if o.EditGateModes {
+		gateWallStart = time.Now()
+	}
 	if scenario == startupScenario {
 		return runStartupPhase(ctx, o, corpora, outputRoot)
 	}
@@ -62,6 +70,16 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 		if resultErr == nil && len(phase.Errors) > 0 {
 			resultErr = errors.New(strings.Join(phase.Errors, "; "))
+		}
+		if o.EditGateModes {
+			// This first-registered defer runs after owned cleanup, so readiness,
+			// measurement and normal stop all remain in the wall denominator.
+			wall := struct {
+				Clock    string `json:"clock"`
+				NS       int64  `json:"wall_ns"`
+				Complete bool   `json:"complete"`
+			}{"monotonic", time.Since(gateWallStart).Nanoseconds(), resultErr == nil && len(phase.Errors) == 0}
+			phase.Gate["edit_loop_wall"], _ = json.Marshal(wall)
 		}
 	}()
 	worktreeViews := scenario == "worktrees" || scenario == editProbeScenario && o.Worktrees > 0
@@ -116,7 +134,6 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		phase.SessionModel = plan.SessionModel
 	}
 	p := o.smokeState
-	var err error
 	if p == nil {
 		if scenario == checkoutDiscoveryScenario && o.Discovery.Resume != "" {
 			p, err = resumeDiscoveryState(ctx, o, selected)
@@ -129,6 +146,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	if err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
+	p.Env = append(p.Env, seedEnv...)
 	artifacts["private_root"] = p.Root
 	if scenario == checkoutDiscoveryScenario && o.Discovery.Resume != "" {
 		raw, err := os.ReadFile(o.Discovery.Resume)
@@ -195,6 +213,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	}
 	warmCtx, cancelWarm := context.WithTimeout(ctx, o.WarmTimeout)
 	defer cancelWarm()
+	p.editACKMode = o.EditACKMode
 	var configured []privateRepo
 	if scenario == checkoutDiscoveryScenario {
 		configured, err = p.writeDiscoveryBootRepos()

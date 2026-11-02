@@ -25,7 +25,6 @@ func mutationFreshnessRecoveryHint() string {
 		reserved.operatorReconcile,
 		reserved.automaticReconcile,
 		reserved.retryExhausted,
-		"receipt retention lapsing as a last resort",
 	}
 	available := hints[:0]
 	for _, hint := range hints {
