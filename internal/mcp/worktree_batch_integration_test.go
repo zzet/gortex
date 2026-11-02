@@ -165,7 +165,11 @@ func TestWorktreeBatchFacadeGuardedTwoFileEdit(t *testing.T) {
 			require.Equal(t, "observed", ack.State)
 			require.NotNil(t, ack.Snapshot)
 			require.EqualValues(t, 3, ack.Snapshot.DiskWrite.Completed, "two physical files and one forward directory-sync envelope")
-			require.Equal(t, "not_applicable", ack.Snapshot.ParseGate.State)
+			require.Equal(t, "measured", ack.Snapshot.ParseGate.State, "the committed cohort now builds actual file projections")
+			require.EqualValues(t, 1, ack.Snapshot.ParseGate.Started, "parallel file parses share one actual ACK wall interval")
+			require.EqualValues(t, 1, ack.Snapshot.ParseGate.Completed)
+			require.NotNil(t, ack.Snapshot.ParseGate.ObservedMS)
+			require.Positive(t, *ack.Snapshot.ParseGate.ObservedMS)
 			if root == f.worktree {
 				require.EqualValues(t, 1, ack.Snapshot.TicketAdmission.Completed, "one actual checkout batch admission, not one per file")
 			}

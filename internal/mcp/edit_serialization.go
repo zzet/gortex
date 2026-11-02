@@ -916,6 +916,12 @@ func attachMutationFreshnessFields(resp map[string]any, outcome mutationReindexO
 	// reads next to disk_status (mutation_commit.go) rather than having to be
 	// inferred from the reindexed / reindex_pending / reindex_error triple.
 	resp["graph_status"] = graphStatusFor(outcome)
+	if outcome.Err != nil {
+		resp["reindex_error"] = outcome.Err.Error()
+	}
+	if outcome.Pending {
+		resp["reindex_pending"] = true
+	}
 	attachMutationTierState(resp, outcome.tiers)
 	attachDerivedFanout(resp, outcome.DerivedFanout)
 	if outcome.Generation > 0 {
