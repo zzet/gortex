@@ -236,7 +236,8 @@ func TestKimiSubagentStartDaemonDownStaysSilent(t *testing.T) {
 	}
 }
 
-func TestPiToolCallDaemonDownEmptyDecision(t *testing.T) {
+func TestPiToolCallDaemonDownStandsDownWithOneNotice(t *testing.T) {
+	t.Setenv(hookSessionDirEnvVar, t.TempDir())
 	stubIndexedFile(t, true, 4)
 	ev := PiEvent{
 		Event:     "tool_call",
@@ -252,8 +253,61 @@ func TestPiToolCallDaemonDownEmptyDecision(t *testing.T) {
 	}
 
 	daemonReachableFn = func() bool { return false }
-	if d := piToolCall(ev, 0, ModeDeny); d.Block || d.Reason != "" || d.AdditionalContext != "" {
-		t.Fatalf("Pi must return an empty decision during an outage: %#v", d)
+	first := piToolCall(ev, 0, ModeDeny)
+	if first.Block || first.Reason != "" {
+		t.Fatalf("Pi must not block during an outage: %#v", first)
+	}
+	if first.AdditionalContext != daemonDownNotice {
+		t.Fatalf("first degraded call should carry the once-per-session notice: %#v", first)
+	}
+	if second := piToolCall(ev, 0, ModeDeny); second != (BridgeDecision{}) {
+		t.Fatalf("degraded tool_call must go quiet after the one notice: %#v", second)
+	}
+}
+
+func TestPiDaemonDownNoticeOnGortexToolCall(t *testing.T) {
+	t.Setenv(hookSessionDirEnvVar, t.TempDir())
+	withDaemonReachable(t, false)
+	ev := PiEvent{Event: "tool_call", ToolName: "search_symbols", CWD: repoFixtureRoot, SessionID: "sess-gortex", IsGortexTool: true}
+
+	if d := piToolCall(ev, 0, ModeDeny); d.AdditionalContext != daemonDownNotice {
+		t.Fatalf("a graph call about to fail should explain the outage: %#v", d)
+	}
+
+	ev.SessionID = "sess-consult"
+	if d := piToolCall(ev, 0, ModeConsultUnlock); d != (BridgeDecision{}) {
+		t.Fatalf("consult-unlock passes a graph call through untouched, as on Claude: %#v", d)
+	}
+	if !loadSessionState("sess-consult").GraphConsulted {
+		t.Fatal("consult-unlock must still record the marker during an outage")
+	}
+}
+
+func TestPiDaemonDownNoticeScopedToTrackedRepos(t *testing.T) {
+	t.Setenv(hookSessionDirEnvVar, t.TempDir())
+	withDaemonReachable(t, false)
+	oldRepos := hookTrackedReposFn
+	hookTrackedReposFn = func() []daemon.TrackedRepoStatus {
+		return []daemon.TrackedRepoStatus{{Path: repoFixtureRoot, Name: "repo"}}
+	}
+	t.Cleanup(func() { hookTrackedReposFn = oldRepos })
+
+	untracked := PiEvent{
+		Event:     "tool_call",
+		ToolName:  "Read",
+		ToolInput: map[string]any{"file_path": filepath.Join(elsewhereFixtureRoot, "scratch.go")},
+		CWD:       elsewhereFixtureRoot,
+		SessionID: "sess-scoped",
+	}
+	if d := piToolCall(untracked, 0, ModeDeny); d != (BridgeDecision{}) {
+		t.Fatalf("the notice must not fire outside tracked repos: %#v", d)
+	}
+
+	tracked := untracked
+	tracked.ToolInput = map[string]any{"file_path": filepath.Join(repoFixtureRoot, "internal", "server.go")}
+	tracked.CWD = repoFixtureRoot
+	if d := piToolCall(tracked, 0, ModeDeny); d.AdditionalContext != daemonDownNotice {
+		t.Fatalf("the untracked call must not burn the session's notice: %#v", d)
 	}
 }
 
@@ -428,8 +482,8 @@ func TestPiAdaptiveNudgeStreakFrozenDuringOutage(t *testing.T) {
 	}
 
 	withDaemonReachable(t, false)
-	if d := piToolCall(ev, 0, ModeAdaptiveNudge); d.Block || d.AdditionalContext != "" {
-		t.Fatalf("gortex call must pass through untouched: %#v", d)
+	if d := piToolCall(ev, 0, ModeAdaptiveNudge); d.Block || d.AdditionalContext != daemonDownNotice {
+		t.Fatalf("gortex call must pass through with only the outage notice: %#v", d)
 	}
 	if got := loadSessionState(session).NonSymbolicStreak; got != 2 {
 		t.Fatalf("outage must freeze the streak like every other adapter, got %d", got)
