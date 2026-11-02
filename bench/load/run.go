@@ -14,6 +14,7 @@ import (
 )
 
 type runOptions struct {
+	EditACKMode       string
 	Binary            string
 	Manifest          string
 	Scratch           string
@@ -71,6 +72,7 @@ func parseRun(args []string) (runOptions, error) {
 }
 
 func bindRunFlags(f *flag.FlagSet, o *runOptions) {
+	f.StringVar(&o.EditACKMode, "edit-ack", "", "owned daemon edit.ack policy: local or full; omit to preserve the full default")
 	f.StringVar(&o.Binary, "binary", "", "Gortex binary (never an existing daemon)")
 	f.StringVar(&o.Manifest, "manifest", "", "pinned JSON corpus manifest; source roots are read-only")
 	f.StringVar(&o.Scratch, "scratch", "", "artifact/private-clone parent outside all source roots")
@@ -103,6 +105,9 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 }
 
 func validateRunOptions(o runOptions) error {
+	if o.EditACKMode != "" && o.EditACKMode != "local" && o.EditACKMode != "full" {
+		return errors.New("--edit-ack must be local or full when explicitly set")
+	}
 	if o.EditGateSeed != "" && (!o.EditGateModes || o.EditGateSeed != "ack-wait" && o.EditGateSeed != "closed-read-gate") {
 		return errors.New("--edit-gate-seed requires --edit-gate-modes and ack-wait or closed-read-gate")
 	}
@@ -316,6 +321,7 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 		report.Workload.SessionModel = plan.SessionModel
 	}
 	report.Workload.EditGateSeed = o.EditGateSeed
+	report.Workload.EditACKMode = o.EditACKMode
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees
 	report.Workload.DurationSec, report.Workload.DeadlineSec, report.Workload.Seed, report.Workload.Profile = o.Duration.Seconds(), o.Deadline.Seconds(), o.Seed, o.Profile
 	if o.PRSmokeDrain > 0 {

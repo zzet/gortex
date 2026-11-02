@@ -63,6 +63,7 @@ type request struct {
 // Workload is the complete normalized offered load. Binary paths, private
 // clone paths and revisions belong to the run identity, never the plan hash.
 type Workload struct {
+	EditACKMode      string         `json:"edit_ack_mode,omitempty"`
 	EditGateSeed     string         `json:"edit_gate_seed,omitempty"`
 	PRSmokeDrain     *PRSmokeDrain  `json:"pr_smoke_drain,omitempty"`
 	Scenario         string         `json:"scenario"`
