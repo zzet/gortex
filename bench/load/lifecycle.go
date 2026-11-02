@@ -22,6 +22,7 @@ type privateRepo struct {
 }
 
 type privateRun struct {
+	editACKMode              string
 	searchReadbackAcceptance bool                                // explicit owned-daemon policy; ordinary runs omit it
 	discoveryCatalog         map[string]discoveryCatalogIdentity // discovery-only observed seed identities
 	Root                     string

@@ -3908,6 +3908,9 @@
               "duration_seconds": {
                 "type": "number"
               },
+              "edit_ack_mode": {
+                "type": "string"
+              },
               "edit_agents": {
                 "type": "integer"
               },

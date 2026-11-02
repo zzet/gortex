@@ -128,6 +128,9 @@ func (p *privateRun) writeBootRepos(worktrees bool) ([]privateRepo, error) {
 		entries = append(entries, map[string]string{"path": repo.Path, "name": repo.Corpus.Label})
 	}
 	payload := map[string]any{"repos": entries}
+	if p.editACKMode != "" {
+		payload["edit"] = map[string]string{"ack": p.editACKMode}
+	}
 	if p.searchReadbackAcceptance {
 		payload["edit"] = map[string]string{"ack": "local"}
 	}
